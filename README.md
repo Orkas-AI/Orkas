@@ -42,8 +42,8 @@
 
 - **Direct local file access** — drop files into the chat as attachments; agents can read and write files in your workspace, run scripts, and generate PDFs / images / code; produced files appear as cards in the chat, one click to reveal in Finder / Explorer
 - **Visual operations** — agents, skills, and knowledge bases are all managed visually; view images, videos, and generated documents directly in the chat without switching to a CLI
-- **Use your own subscription or API key** — log in via OAuth or paste an API key for DeepSeek · Kimi · GLM · MiniMax · Doubao · Qwen · Claude · OpenAI · Gemini, and pick per-conversation; requests don't go through Orkas and aren't archived
-- **Cross-platform** — macOS (Apple Silicon + Intel) and Windows are first-class; Linux is community-supported
+- **Use your own subscription or API key** — log in via OAuth or paste an API key for DeepSeek · Kimi · GLM · MiniMax · Doubao · Qwen · Claude · OpenAI · Gemini; requests don't go through Orkas and aren't archived
+- **Cross-platform** — macOS (Apple Silicon + Intel), Windows, and Linux
 
 ---
 
@@ -91,19 +91,6 @@ The other evolution path is the `skill_manage` tool: an agent can crystallize "t
 
 ## Quick start
 
-Two paths, pick what fits.
-
-### Option 1: Download the installer (recommended)
-
-Grab the latest tag from [GitHub Releases](https://github.com/Orkas-AI/Orkas/releases) and download the installer for your platform:
-
-- **macOS** — `.dmg` (universal: Apple Silicon + Intel)
-- **Windows** — `.exe` (NSIS installer)
-
-Open the app once installed, then go to **Settings → AI Providers** to configure an API key or OAuth.
-
-### Option 2: Run from source (developers)
-
 **Requirements**: Node 20+ · Python 3 · macOS / Windows 10+ / recent Linux
 
 ```bash
@@ -114,16 +101,18 @@ npm install        # postinstall fetches the embedding model + rebuilds sqlite f
 run.cmd            # Windows
 ```
 
-First launch creates a workspace under `~/.orkas/` (macOS / Linux) or `<smallest non-system drive>:\.orkas\` (Windows).
+First launch creates a workspace under `~/.orkas/` (macOS / Linux) or `<smallest non-system drive>:\.orkas\` (Windows). Then go to **Settings → AI Providers** to configure an API key or OAuth.
+
+> Pre-built installers will be published to [GitHub Releases](https://github.com/Orkas-AI/Orkas/releases) once builds stabilize.
 
 ---
 
 ## Acknowledgments
 
-Several core mechanisms in Orkas are inspired by the following open-source projects — special thanks to:
+Some core modules in this project draw on the following open-source projects — special thanks to:
 
-- **[OpenClaw](https://github.com/openclaw/openclaw)** — `src/core-agent/` is a simplified extraction of OpenClaw's core modules; session management (`PersistentSession`), the run loop (`AgentRunner`), and the memory-indexing layer all draw on its design
-- **[Hermes-Agent](https://github.com/NousResearch/hermes-agent)** — the `skill_manage` tool is modeled on its `skill_manager_tool`, letting agents create and edit their own private skills at runtime
+- [OpenClaw](https://github.com/openclaw/openclaw)
+- [Hermes-Agent](https://github.com/NousResearch/hermes-agent)
 
 ---
 
