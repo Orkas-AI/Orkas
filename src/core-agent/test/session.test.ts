@@ -1,0 +1,125 @@
+import { describe, it, expect } from "vitest";
+import { Session } from "../src/agent/session.js";
+
+describe("Session", () => {
+  it("starts empty", () => {
+    const session = new Session();
+    expect(session.length).toBe(0);
+    expect(session.getMessages()).toEqual([]);
+  });
+
+  it("adds user messages", () => {
+    const session = new Session();
+    session.addUserMessage("Hello");
+
+    expect(session.length).toBe(1);
+    expect(session.getMessages()[0]).toEqual({
+      role: "user",
+      content: [{ type: "text", text: "Hello" }],
+    });
+  });
+
+  it("adds assistant messages", () => {
+    const session = new Session();
+    session.addAssistantMessage([{ type: "text", text: "Hi there" }]);
+
+    expect(session.length).toBe(1);
+    expect(session.getMessages()[0].role).toBe("assistant");
+  });
+
+  it("adds tool results", () => {
+    const session = new Session();
+    session.addToolResult("tool-123", "result text", undefined, false);
+
+    const msgs = session.getMessages();
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].content[0]).toEqual({
+      type: "tool_result",
+      toolUseId: "tool-123",
+      content: "result text",
+      isError: false,
+    });
+  });
+
+  it("appends image user message when addToolResult carries images", () => {
+    const session = new Session();
+    session.addToolResult("tool-img", "Image loaded.", [
+      { data: "aGVsbG8=", mediaType: "image/jpeg" },
+    ]);
+
+    const msgs = session.getMessages();
+    expect(msgs).toHaveLength(2);
+    expect(msgs[0].content[0]).toMatchObject({ type: "tool_result", toolUseId: "tool-img" });
+    expect(msgs[1].role).toBe("user");
+    expect(msgs[1].content[0]).toEqual({ type: "image", data: "aGVsbG8=", mediaType: "image/jpeg" });
+  });
+
+  it("trims history to exactly maxHistoryTurns and keeps the newest turns", () => {
+    const session = new Session({ maxHistoryTurns: 2 });
+    for (let i = 0; i < 4; i++) {
+      session.addUserMessage(`User message ${i}`);
+      session.addAssistantMessage([{ type: "text", text: `Response ${i}` }]);
+    }
+    // 2 turns = 4 messages exactly
+    expect(session.length).toBe(4);
+    const msgs = session.getMessages();
+    // Newest two turns (i=2, i=3) must survive; older ones must be dropped
+    expect((msgs[0].content[0] as { text: string }).text).toBe("User message 2");
+    expect((msgs[3].content[0] as { text: string }).text).toBe("Response 3");
+  });
+
+  it("compacts session with summary", () => {
+    const session = new Session();
+
+    // Add several messages
+    for (let i = 0; i < 6; i++) {
+      session.addUserMessage(`Message ${i}`);
+      session.addAssistantMessage([{ type: "text", text: `Response ${i}` }]);
+    }
+
+    const beforeLength = session.length;
+    session.compact("This is a summary of the conversation.");
+
+    expect(session.length).toBeLessThan(beforeLength);
+    // First message should contain the summary
+    const msgs = session.getMessages();
+    const firstText = msgs[0].content[0];
+    expect(firstText.type).toBe("text");
+    expect((firstText as { text: string }).text).toContain("summary");
+  });
+
+  it("clear removes all messages", () => {
+    const session = new Session();
+    session.addUserMessage("test");
+    expect(session.length).toBe(1);
+
+    session.clear();
+    expect(session.length).toBe(0);
+  });
+
+  // estimateTokens: CJK-aware heuristic. Anchors the fix for the latent
+  // under-estimation bug that let the runner's 80% compaction guard skip
+  // pure-Chinese sessions even when they were well over budget.
+  it("estimateTokens: ASCII follows the ~4 chars/token rule", () => {
+    const session = new Session();
+    session.addUserMessage("a".repeat(4000));
+    // 4000 non-CJK / 4 = 1000
+    expect(session.estimateTokens()).toBe(1000);
+  });
+
+  it("estimateTokens: CJK counts ~1.5 tokens per char, not 0.25", () => {
+    const session = new Session();
+    // 1000 Chinese chars — old impl returned ~250, real tokenizer gives ~1000-1500
+    session.addUserMessage("中".repeat(1000));
+    const est = session.estimateTokens();
+    expect(est).toBeGreaterThanOrEqual(1400);
+    expect(est).toBeLessThanOrEqual(1600);
+  });
+
+  it("estimateTokens: mixed CJK + ASCII sums both buckets", () => {
+    const session = new Session();
+    // 100 CJK + 400 ASCII → 100*1.5 + 400/4 = 150 + 100 = 250
+    session.addUserMessage("中".repeat(100) + "a".repeat(400));
+    expect(session.estimateTokens()).toBe(250);
+  });
+});

@@ -1,0 +1,57 @@
+{
+  "agent_id": "658c22c66861",
+  "name": "Software Implementation Engineer",
+  "description_zh": "基于需求文档一站式产出技术方案 + 落地高质量代码——从架构 / 技术选型 / 模块划分 / 接口设计到代码骨架 / 核心实现 / 单测 / 端到端验证全包。每个模块写一个跑一个，避免大爆炸提交。适合\"按这份需求把代码写出来\"\"实现 X 项目\"\"把 requirements.md 变成可跑的系统\"；触发词：实现、编码、开发、build、写代码、做出来、设计加实现、按需求实现、scaffold",
+  "description_en": "Take a requirements doc and deliver both the technical design and high-quality working code in one sweep — from architecture, tech selection, module split and interface contracts to scaffolding, core logic, unit tests, and end-to-end smoke verification. Writes-then-verifies one module at a time to avoid big-bang commits. For: 'turn this requirements doc into running code', 'build out the X project', 'design and implement what's described in requirements.md'; Triggers: implement, build, code, develop, design and implement, deliver, ship, write code, scaffold",
+  "workflow": "### 1. Read requirements, settle on a design\n- `read_file(requirements.md)` — read the requirements doc end to end\n- If info is insufficient for design (perf targets / deployment env / scale / hard tech constraints) → `agent-input-form` to ask in one go\n- Internally settle the design: architecture (frontend / backend / data / third-party deps) → tech selection (**prefer mature + community-backed + consistent with project style**, only introduce new tech where actually needed) → module split + responsibilities → key interface contracts → execution order (skeleton → core → edges)\n- `write_file(design.md)` — concise design: architecture sketch + tech selection + module split + interface contracts + main risks\n\n**Output**: `design.md` + internally ordered execution plan\n\n### 2. Scaffold and verify\n- `bash(<project init command: npm init / git init / framework CLI / pnpm install ...>)` — kick off in `$working_dir`\n- `write_file(<placeholder per module>)` — function signatures + one-line docstring. **No fake-stub bodies returning dummy data** (e.g. `return {ok: true}` with empty fields); if you can't write a real minimal impl, leave the body empty or `throw NotImplemented`\n- `bash(<empty-start verification: build / lint / start>)` — confirm toolchain is healthy; fix toolchain first if anything breaks\n\n**Output**: project skeleton + working toolchain\n\n### 3. Implement core modules\n- **One module at a time** — avoid big-bang commits (finish one fully before moving on)\n- Per-module flow: `write_file(<module core impl>)` → `write_file(<key-path unit test>)` → `bash(npm test / pytest / cargo test ...)` to run tests → only proceed when green\n- Code style: single responsibility, clear naming, avoid over-abstraction, comments only for non-obvious why (never restate what), don't add abstraction layers for imagined future needs\n\n**Output**: module impl files + green unit tests\n\n### 4. End-to-end smoke + report\n- `bash(<end-to-end smoke: launch entrypoint + trigger main flow>)` — verify against the requirements acceptance criteria\n- `write_file(README.md)` — how to run / dependencies / entrypoint / known limitations / next steps\n- In the final reply: project structure summary + run commands + acceptance matrix (which requirements met / which skipped and why) + known limitations\n\n**Output**: working code + `README.md` + acceptance report to user",
+  "skill_list": [],
+  "inputs": [
+    {
+      "id": "requirements_path",
+      "label": "Requirements doc path",
+      "type": "text",
+      "default": "requirements.md",
+      "placeholder": "requirements.md",
+      "required": true,
+      "description": "Path read via `read_file`, relative to current working directory"
+    },
+    {
+      "id": "scope",
+      "label": "Implementation scope",
+      "type": "select",
+      "default": "mvp",
+      "options": [
+        {
+          "value": "mvp",
+          "label": "MVP only (minimal runnable)"
+        },
+        {
+          "value": "full",
+          "label": "Full design"
+        }
+      ],
+      "description": "MVP mode implements only items tagged MVP in requirements; gets the system running first"
+    },
+    {
+      "id": "language_pref",
+      "label": "Language / stack preference",
+      "type": "text",
+      "default": "",
+      "placeholder": "empty = pick best from requirements",
+      "description": "Hard constraints go here; otherwise auto-pick from requirements + project conventions"
+    },
+    {
+      "id": "subdir",
+      "label": "Subdirectory for code",
+      "type": "text",
+      "default": "",
+      "placeholder": "empty = working dir root",
+      "description": "Subpath relative to working dir; empty drops code at the working dir root"
+    }
+  ],
+  "interactive": false,
+  "icon": "code",
+  "color": "sage",
+  "created_at": "2026-04-29T10:00:00",
+  "updated_at": "2026-04-29T10:00:00"
+}

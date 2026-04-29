@@ -1,0 +1,110 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
+// skill-registry.ts wraps core-agent's SkillLoader. To test allowlist
+// filtering without pulling in the real core-agent import, we write fake
+// SKILL.md files under the new skills layout and let the real SkillLoader
+// scan them — the loader is pure FS + frontmatter parsing, no network/LLM.
+//
+// Post-refactor layout:
+//   builtin skills → `<WS_ROOT>/builtin/skills/<id>/SKILL.md`
+//   custom skills  → `<WS_ROOT>/<uid>/cloud/skills/<id>/SKILL.md`
+// The loader scans `[userSkillsDir(activeUid), BUILTIN_SKILLS_DIR]`, with
+// custom listed first so same-id custom overrides builtin.
+
+let tmpDir: string;
+let prevWs: string | undefined;
+const TEST_UID = 'u1';
+
+function builtinDir(): string {
+  return path.join(tmpDir, 'builtin', 'skills');
+}
+function customDir(): string {
+  return path.join(tmpDir, TEST_UID, 'cloud', 'skills');
+}
+
+function writeSkill(root: string, id: string, name: string, description: string) {
+  const skillDir = path.join(root, id);
+  fs.mkdirSync(skillDir, { recursive: true });
+  const md = `---\nname: ${name}\ndescription: ${description}\n---\nbody`;
+  fs.writeFileSync(path.join(skillDir, 'SKILL.md'), md);
+}
+
+beforeEach(async () => {
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-skillreg-'));
+  prevWs = process.env.ORKAS_WORKSPACE_ROOT;
+  process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
+  vi.resetModules();
+  const users = await import('../../../src/main/features/users');
+  users.activateUser(TEST_UID);
+});
+
+afterEach(() => {
+  process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+async function loadRegistry() {
+  return import('../../../src/main/model/core-agent/skill-registry');
+}
+
+describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
+  it('returns full listing when allowlist is undefined (legacy behavior)', async () => {
+    writeSkill(builtinDir(), 'translate', 'Translate', 'T');
+    writeSkill(customDir(), 'summarize', 'Summarize', 'S');
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock();
+    expect(text).toContain('translate');
+    expect(text).toContain('summarize');
+  });
+
+  it('renders only allowlisted skills when allowlist is provided', async () => {
+    writeSkill(builtinDir(), 'translate', 'Translate', 'T');
+    writeSkill(builtinDir(), 'summarize', 'Summarize', 'S');
+    writeSkill(builtinDir(), 'search', 'Search', 'X');
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock({ allowlist: ['translate', 'search'] });
+    expect(text).toContain('translate');
+    expect(text).toContain('search');
+    expect(text).not.toContain('summarize');
+  });
+
+  it('returns empty string when allowlist is [] (agent opting out of all skills)', async () => {
+    writeSkill(builtinDir(), 'translate', 'Translate', 'T');
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock({ allowlist: [] });
+    expect(text).toBe('');
+  });
+
+  it('silently drops unknown ids in the allowlist', async () => {
+    writeSkill(builtinDir(), 'translate', 'Translate', 'T');
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock({ allowlist: ['translate', 'nonexistent'] });
+    expect(text).toContain('translate');
+    expect(text).not.toContain('nonexistent');
+  });
+
+  it('returns empty string when allowlist provided but no matching skills exist', async () => {
+    writeSkill(builtinDir(), 'translate', 'Translate', 'T');
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock({ allowlist: ['nonexistent'] });
+    expect(text).toBe('');
+  });
+
+  // Regression: per-uid migration (CLAUDE.md §4) made both skill roots end
+  // in `/skills`, so deriving the `来源` tag from basename collapses to
+  // `skills` for every entry. `chat_commander.md` / `chat_agent_in_group.md`
+  // tell the LLM to pick a root by `来源: builtin|custom` — a degenerate label
+  // sends it guessing and half the SKILL.md reads ENOENT on first try.
+  it('labels `来源` as builtin vs custom by root path, not basename', async () => {
+    writeSkill(builtinDir(), 'shipped', 'Shipped', 'desc-builtin');
+    writeSkill(customDir(), 'mine', 'Mine', 'desc-custom');
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock();
+    expect(text).toContain('来源: builtin');
+    expect(text).toContain('来源: custom');
+    expect(text).not.toContain('来源: skills');
+  });
+});

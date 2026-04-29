@@ -1,0 +1,37 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true,
+    "strict": false,
+    "noImplicitAny": false,
+    "strictNullChecks": false,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": false,
+    "types": ["node"]
+  },
+  "include": [
+    "src/main/**/*.ts",
+    "src/main/**/*.js",
+    "src/main/**/*.mjs"
+  ],
+  "exclude": [
+    "node_modules",
+    "data",
+    "src/core-agent",
+    "src/builtin",
+    "src/resources",
+    "src/renderer",
+    "dist",
+    "build"
+  ]
+}

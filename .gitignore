@@ -1,0 +1,5 @@
+.DS_Store
+/data
+/node_modules
+/resources/embedding-model
+/userWorkSpace

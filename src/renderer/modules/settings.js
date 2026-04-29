@@ -1,0 +1,1159 @@
+// ─── Settings (entries-based: picker + priority list) ────────────────────
+// The page is split in two:
+//   1. "添加模型授权": pick provider + model, then "+ 添加账号" → either an
+//      API Key form or the OAuth flow, depending on what the provider
+//      supports. On success we auto-create a priority-list entry pointing
+//      at the new credential.
+//   2. "已配置（按优先级）": ordered list of (provider, model, profile)
+//      entries. First = default model; later items are the fallback chain.
+//      Rows are drag-reorderable.
+
+const _settingsLog = createLogger('settings');
+
+let _settingsState = {
+  providers: [],      // from auth.listProviders  [{id, label, supportsApiKey, supportsOAuth, profiles, ...}]
+  entries: [],        // from auth.listEntries
+  modelsCache: {},    // provider → [{id, name}]
+  pickerProviderSel: null,
+  pickerModelSel: null,
+  addBtnBound: false,
+  dragState: null,
+};
+
+async function loadSettings() {
+  _settingsBindLanguageOnce();
+  _settingsSyncLanguageRadio();
+  await Promise.all([
+    _settingsRefreshProviders(),
+    _settingsRefreshEntries(),
+    _settingsRefreshLocalExec(),
+    _settingsRefreshSearchProfiles(),
+    _settingsRefreshImageProfiles(),
+    _settingsRefreshCommanderAvatar(),
+    _settingsRefreshMetacognition(),
+  ]);
+  _settingsRenderPicker();
+  _settingsRenderEntries();
+  _settingsRenderLocalExec();
+  _settingsRenderSearchSection();
+  _settingsRenderImageSection();
+  _settingsRenderCommanderAvatar();
+  _settingsRenderMetacognition();
+}
+
+// ── Commander avatar ──
+// 指挥官头像走 prefs IPC，存到 preferences.json。修改后立即推回缓存
+// （conversation.js 的 _commanderAvatarCache）以便聊天行立即用上新头像，
+// 不用等下次 view 切换。
+
+async function _settingsRefreshCommanderAvatar() {
+  try {
+    const res = await window.orkas.invoke('prefs.getCommanderAvatar');
+    _settingsState.commanderAvatar = (res && res.ok && res.avatar)
+      ? { icon: res.avatar.icon, color: res.avatar.color }
+      : { ...COMMANDER_DEFAULT };
+  } catch (_) {
+    _settingsState.commanderAvatar = { ...COMMANDER_DEFAULT };
+  }
+}
+
+function _settingsRenderCommanderAvatar() {
+  const slot = document.getElementById('settings-commander-avatar');
+  if (!slot) return;
+  const cur = _settingsState.commanderAvatar || { ...COMMANDER_DEFAULT };
+  slot.innerHTML = renderAvatarHtml(cur.icon, cur.color, {
+    size: 44, seed: 'commander', clickable: true,
+  });
+  const trigger = slot.querySelector('.avatar-circle');
+  if (!trigger) return;
+  trigger.title = t('avatar.change');
+  trigger.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (isAvatarPickerOpenFor(trigger)) { closeAvatarPicker(); return; }
+    // 指挥官头像图标固定 crown，picker 只显示颜色行。后端校验依然两个 token
+    // 都要带，所以保存时强制写 crown。
+    openAvatarPicker(trigger, cur, { allowCommanderCombo: true, hideIcons: true }, async (next) => {
+      const icon = COMMANDER_DEFAULT.icon;
+      _settingsState.commanderAvatar = { icon, color: next.color };
+      cur.icon = icon; cur.color = next.color;
+      // 就地更新，保留 trigger 上的 click 监听 —— 用户可以连点几次直到满意。
+      applyAvatarToElement(trigger, icon, next.color, 'commander');
+      try {
+        const res = await window.orkas.invoke('prefs.setCommanderAvatar', { icon, color: next.color });
+        if (res?.ok && res.avatar) {
+          if (typeof setCommanderAvatarCache === 'function') setCommanderAvatarCache(res.avatar);
+        }
+      } catch (err) {
+        _settingsLog.warn('save commander avatar failed', err);
+      }
+    });
+  });
+}
+
+// ── Local execution permission (bash / write_file / md_to_pdf / html_to_pdf) ──
+
+async function _settingsRefreshLocalExec() {
+  const res = await window.orkas.invoke('permissions.getLocalExec');
+  _settingsState.localExec = (res && res.ok) ? {
+    granted: !!res.granted,
+    grantedAt: res.grantedAt || null,
+    revokedAt: res.revokedAt || null,
+  } : { granted: false, grantedAt: null, revokedAt: null };
+}
+
+function _settingsRenderLocalExec() {
+  const statusEl = document.getElementById('settings-localexec-status');
+  const btn = document.getElementById('settings-localexec-toggle');
+  if (!statusEl || !btn) return;
+  const s = _settingsState.localExec || { granted: false };
+  if (s.granted) {
+    statusEl.textContent = s.grantedAt
+      ? t('settings.localexec.status_granted_with_date', { date: s.grantedAt })
+      : t('settings.localexec.status_granted');
+    statusEl.className = 'settings-status muted';
+    btn.textContent = t('settings.localexec.btn_revoke');
+    btn.className = 'btn btn-sm btn-danger';
+  } else {
+    statusEl.textContent = s.revokedAt
+      ? t('settings.localexec.status_revoked_with_date', { date: s.revokedAt })
+      : t('settings.localexec.status_revoked');
+    statusEl.className = 'settings-status muted';
+    btn.textContent = t('settings.localexec.btn_grant');
+    btn.className = 'btn btn-sm btn-primary';
+  }
+  if (!btn.dataset.bound) {
+    btn.addEventListener('click', async () => {
+      const state = _settingsState.localExec || { granted: false };
+      const channel = state.granted ? 'permissions.revokeLocalExec' : 'permissions.grantLocalExec';
+      try {
+        const res = await window.orkas.invoke(channel);
+        if (res && res.ok) {
+          _settingsState.localExec = {
+            granted: !!res.granted,
+            grantedAt: res.grantedAt || null,
+            revokedAt: res.revokedAt || null,
+          };
+          _settingsRenderLocalExec();
+        }
+      } catch (err) {
+        _settingsLog.warn('local exec toggle failed', err);
+      }
+    });
+    btn.dataset.bound = '1';
+  }
+}
+
+// ── Metacognition (Agent 元认知自演进) ──
+// 落到 preferences.json::metacognition_enabled，env `ORKAS_METACOGNITION='0'` 仍是
+// 更高优先级的 kill switch（`envForcedOff`），命中时 UI 把开关锁灰并提示。
+
+async function _settingsRefreshMetacognition() {
+  try {
+    const res = await window.orkas.invoke('prefs.getMetacognition');
+    _settingsState.metacognition = (res && res.ok)
+      ? { enabled: !!res.enabled, envForcedOff: !!res.envForcedOff }
+      : { enabled: true, envForcedOff: false };
+  } catch (_) {
+    _settingsState.metacognition = { enabled: true, envForcedOff: false };
+  }
+}
+
+function _settingsRenderMetacognition() {
+  const cb = document.getElementById('settings-metacognition-toggle');
+  const status = document.getElementById('settings-metacognition-status');
+  if (!cb) return;
+  const s = _settingsState.metacognition || { enabled: true, envForcedOff: false };
+  cb.checked = s.envForcedOff ? false : !!s.enabled;
+  cb.disabled = !!s.envForcedOff;
+  if (status) {
+    status.textContent = s.envForcedOff ? t('settings.metacognition.env_forced_off') : '';
+  }
+  if (!cb.dataset.bound) {
+    cb.addEventListener('change', async () => {
+      if (cb.disabled) return;
+      const next = !!cb.checked;
+      try {
+        const res = await window.orkas.invoke('prefs.setMetacognition', { enabled: next });
+        if (res && res.ok) {
+          _settingsState.metacognition = { ..._settingsState.metacognition, enabled: !!res.enabled };
+        } else {
+          // 写失败时回滚 UI
+          cb.checked = !next;
+          _settingsLog.warn('setMetacognition rejected', res);
+        }
+      } catch (err) {
+        cb.checked = !next;
+        _settingsLog.warn('setMetacognition failed', err);
+      }
+    });
+    cb.dataset.bound = '1';
+  }
+}
+
+// ── Language radio (zh / en) ──
+// Bound once; `loadSettings` just re-syncs the checked state each time the
+// panel is opened so the radio reflects whatever setLang() last persisted.
+
+let _settingsLanguageBound = false;
+
+function _settingsBindLanguageOnce() {
+  if (_settingsLanguageBound) return;
+  const row = document.getElementById('settings-language-row');
+  if (!row) return;
+  row.addEventListener('change', async (e) => {
+    const target = e.target;
+    if (!target || target.name !== 'settings-language') return;
+    const next = target.value;
+    if (next !== 'zh' && next !== 'en') return;
+    try {
+      await setLang(next);
+      _settingsLog.info('language changed', { lang: next });
+    } catch (err) {
+      _settingsLog.warn('setLang failed', { error: (err && err.message) || String(err) });
+    }
+  });
+  _settingsLanguageBound = true;
+}
+
+function _settingsSyncLanguageRadio() {
+  const cur = typeof getLang === 'function' ? getLang() : 'en';
+  document.querySelectorAll('input[name="settings-language"]').forEach((el) => {
+    el.checked = (el.value === cur);
+  });
+}
+
+// Keep the radio in sync if some other code path changes language, and
+// re-render sections whose text is written by JS (so their content
+// isn't refreshed by applyDomI18n's data-i18n sweep).
+window.addEventListener('i18n-change', () => {
+  _settingsSyncLanguageRadio();
+  _settingsRenderLocalExec();
+  _settingsRenderPicker();
+  _settingsRenderEntries();
+  _settingsRenderSearchSection();
+  _settingsRenderImageSection();
+  _settingsRenderMetacognition();
+});
+
+async function _settingsRefreshProviders() {
+  const res = await window.orkas.invoke('auth.listProviders');
+  _settingsState.providers = (res && res.ok && Array.isArray(res.providers)) ? res.providers : [];
+}
+
+async function _settingsRefreshEntries() {
+  const res = await window.orkas.invoke('auth.listEntries');
+  _settingsState.entries = (res && res.ok && Array.isArray(res.entries)) ? res.entries : [];
+}
+
+async function _settingsGetModels(providerId) {
+  if (!providerId) return [];
+  if (_settingsState.modelsCache[providerId]) return _settingsState.modelsCache[providerId];
+  const res = await window.orkas.invoke('auth.listModels', { provider: providerId });
+  const list = (res && res.ok && Array.isArray(res.models)) ? res.models : [];
+  _settingsState.modelsCache[providerId] = list;
+  return list;
+}
+
+// ── Picker (provider + model + add button) ──
+
+async function _settingsRenderPicker() {
+  const providerEl = document.getElementById('settings-picker-provider');
+  const modelEl    = document.getElementById('settings-picker-model');
+  if (!providerEl || !modelEl) return;
+
+  const providerOptions = _settingsState.providers.map((p) => {
+    const baseLabel = p.label || p.id;
+    const label = p.recommended ? `${baseLabel} ${t('settings.picker.recommended_suffix')}` : baseLabel;
+    let authHint = '';
+    if (p.supportsOAuth && p.supportsApiKey)       authHint = t('settings.oauth.support_api_and_oauth');
+    else if (p.supportsOAuth && !p.supportsApiKey) authHint = t('settings.oauth.support_oauth_only');
+    else if (p.supportsApiKey)                     authHint = t('settings.oauth.support_api_only');
+    // subscriptionNote 是"用错了会 401 白白浪费 key"级别的关键前提，
+    // 优先展示；授权方式能力次之。两条都有就用 ' · ' 串起来。
+    // subscriptionNote 是 i18n key（见 provider_catalog.ts 字段注释），渲染时翻译。
+    const subNote = p.subscriptionNote ? t(p.subscriptionNote) : '';
+    const hint = [subNote, authHint].filter(Boolean).join(' · ');
+    return { value: p.id, label, hint };
+  });
+
+  if (!_settingsState.pickerProviderSel) {
+    _settingsState.pickerProviderSel = _aiSelectMount(providerEl, {
+      placeholder: t('settings.picker.select_provider'),
+    });
+    _settingsState.pickerProviderSel.onChange(async (val) => {
+      await _settingsPopulatePickerModel(val, '');
+      _settingsSetStatus('settings-picker-status', '', '');
+    });
+  }
+  const prevProvider = _settingsState.pickerProviderSel.getValue();
+  _settingsState.pickerProviderSel.setOptions(providerOptions, {
+    value: prevProvider,
+    placeholder: t('settings.picker.select_provider'),
+  });
+
+  if (!_settingsState.pickerModelSel) {
+    _settingsState.pickerModelSel = _aiSelectMount(modelEl, {
+      placeholder: t('settings.picker.pick_provider_first'),
+    });
+    _settingsState.pickerModelSel.onChange(() => {
+      _settingsSetStatus('settings-picker-status', '', '');
+    });
+  }
+  await _settingsPopulatePickerModel(
+    _settingsState.pickerProviderSel.getValue(),
+    _settingsState.pickerModelSel.getValue(),
+  );
+
+  const addBtn = document.getElementById('settings-add-entry-btn');
+  if (addBtn && !_settingsState.addBtnBound) {
+    _settingsState.addBtnBound = true;
+    addBtn.addEventListener('click', _settingsClickAddEntry);
+  }
+}
+
+async function _settingsPopulatePickerModel(providerId, selected) {
+  const sel = _settingsState.pickerModelSel;
+  if (!sel) return;
+  const models = await _settingsGetModels(providerId);
+  sel.setOptions(
+    models.map((m) => ({ value: m.id, label: m.name || m.id })),
+    { value: selected || '', placeholder: providerId ? t('settings.picker.select_model') : t('settings.picker.pick_provider_first') },
+  );
+}
+
+async function _settingsClickAddEntry() {
+  const providerId = _settingsState.pickerProviderSel?.getValue() || '';
+  const modelId    = _settingsState.pickerModelSel?.getValue() || '';
+  if (!providerId) { _settingsSetStatus('settings-picker-status', 'error', t('settings.picker.error_provider_needed')); return; }
+  if (!modelId)    { _settingsSetStatus('settings-picker-status', 'error', t('settings.picker.error_model_needed')); return; }
+
+  const provider = _settingsState.providers.find((p) => p.id === providerId);
+  if (!provider) { _settingsSetStatus('settings-picker-status', 'error', t('settings.picker.error_provider_missing')); return; }
+
+  _settingsSetStatus('settings-picker-status', '', '');
+  _settingsChooseAccountMethod(provider, modelId);
+}
+
+// ── Method chooser + credential forms ──
+
+function _settingsChooseAccountMethod(provider, modelId) {
+  const hasApi   = !!provider.supportsApiKey;
+  const hasOAuth = !!provider.supportsOAuth;
+
+  if (hasApi && hasOAuth) {
+    // Present the two-tile chooser first.
+    const overlay = document.getElementById('add-account-modal');
+    const title   = document.getElementById('add-account-title');
+    const body    = document.getElementById('add-account-body');
+    const actions = document.getElementById('add-account-actions');
+    if (!overlay || !title || !body || !actions) return;
+
+    title.textContent = t('settings.modal.add_account_title_with_provider', { provider: provider.label || provider.id });
+    body.innerHTML = `
+      <div class="method-chooser">
+        <div class="method-tile" data-method="api_key">
+          <div class="method-title">${escapeHtml(t('settings.modal.method_api_title'))}</div>
+          <div class="method-hint">${escapeHtml(t('settings.modal.method_api_hint'))}</div>
+        </div>
+        <div class="method-tile" data-method="oauth">
+          <div class="method-title">${escapeHtml(t('settings.modal.method_oauth_title'))}</div>
+          <div class="method-hint">${escapeHtml(t('settings.modal.method_oauth_hint'))}</div>
+        </div>
+      </div>
+    `;
+    actions.innerHTML = '';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn';
+    cancelBtn.textContent = t('common.cancel');
+    cancelBtn.onclick = () => _settingsCloseModal(overlay);
+    actions.appendChild(cancelBtn);
+
+    body.querySelector('.method-chooser').addEventListener('click', (e) => {
+      const tile = e.target.closest('.method-tile');
+      if (!tile) return;
+      const method = tile.dataset.method;
+      _settingsCloseModal(overlay);
+      if (method === 'api_key') _settingsShowApiKeyForm(provider, modelId);
+      else _settingsStartOAuthFlow(provider, modelId);
+    });
+
+    _settingsOpenModal(overlay);
+    return;
+  }
+
+  if (hasOAuth && !hasApi) { _settingsStartOAuthFlow(provider, modelId); return; }
+  _settingsShowApiKeyForm(provider, modelId);
+}
+
+function _settingsShowApiKeyForm(provider, modelId) {
+  const overlay = document.getElementById('add-account-modal');
+  const title   = document.getElementById('add-account-title');
+  const body    = document.getElementById('add-account-body');
+  const actions = document.getElementById('add-account-actions');
+  if (!overlay || !title || !body || !actions) return;
+
+  title.textContent = t('settings.modal.api_key_form_title', { provider: provider.label || provider.id });
+  // docs_prefix has `{url}` which we fill with a marked-up span; escape the
+  // surrounding text but keep the span as raw HTML.
+  const docsUrlMarkup = `<span class="form-hint-url">${escapeHtml(provider.docsUrl || '')}</span>`;
+  const docsRaw = t('settings.modal.docs_prefix', { url: '\u0001URL\u0001' });
+  const docsHtml = provider.docsUrl
+    ? `<div class="form-hint">${escapeHtml(docsRaw).replace(escapeHtml('\u0001URL\u0001'), docsUrlMarkup)}</div>`
+    : '';
+  const subNoteHtml = provider.subscriptionNote
+    ? `<div class="form-hint form-hint-warn">${escapeHtml(t(provider.subscriptionNote))}</div>`
+    : '';
+  body.innerHTML = `
+    ${subNoteHtml}
+    <div class="form-row">
+      <label>${escapeHtml(t('settings.modal.label'))}</label>
+      <input type="text" class="api-label-input form-input" placeholder="${escapeHtml(t('settings.modal.label_placeholder'))}" autocomplete="off" spellcheck="false" />
+    </div>
+    <div class="form-row">
+      <label>API Key</label>
+      <input type="text" class="api-key-input form-input" placeholder="sk-…" autocomplete="off" spellcheck="false" />
+    </div>
+    ${docsHtml}
+    <div class="form-msg"></div>
+  `;
+  actions.innerHTML = '';
+
+  const labelInput = body.querySelector('.api-label-input');
+  const keyInput   = body.querySelector('.api-key-input');
+  const msg        = body.querySelector('.form-msg');
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'btn';
+  cancelBtn.textContent = t('common.cancel');
+  cancelBtn.onclick = () => _settingsCloseModal(overlay);
+
+  const saveBtn = document.createElement('button');
+  saveBtn.className = 'btn btn-primary';
+  saveBtn.textContent = t('settings.save');
+  const save = async () => {
+    const label  = (labelInput.value || '').trim();
+    const apiKey = (keyInput.value || '').trim();
+    if (!apiKey) { msg.textContent = t('settings.paste_key_first'); msg.className = 'form-msg error'; return; }
+    saveBtn.disabled = true;
+    msg.textContent = t('settings.save_loading'); msg.className = 'form-msg';
+    _settingsLog.info('add api key', { provider: provider.id, model: modelId, has_label: !!label });
+    const addRes = await window.orkas.invoke('auth.addApiKey', {
+      provider: provider.id,
+      apiKey,
+      label: label || undefined,
+    });
+    if (!addRes || !addRes.ok) {
+      saveBtn.disabled = false;
+      msg.textContent = (addRes && addRes.error) || t('settings.save_failed');
+      msg.className = 'form-msg error';
+      _settingsLog.warn('add api key failed', { provider: provider.id, error: addRes && addRes.error });
+      return;
+    }
+    const entryRes = await window.orkas.invoke('auth.addEntry', {
+      provider: provider.id,
+      model: modelId,
+      profileId: addRes.profileId,
+    });
+    saveBtn.disabled = false;
+    if (!entryRes || !entryRes.ok) {
+      msg.textContent = (entryRes && entryRes.error) || t('settings.add_entry_failed');
+      msg.className = 'form-msg error';
+      return;
+    }
+    _settingsCloseModal(overlay);
+    await _settingsReload();
+  };
+  saveBtn.onclick = save;
+  labelInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { keyInput.focus(); e.preventDefault(); } });
+  keyInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { save(); e.preventDefault(); } });
+
+  actions.appendChild(cancelBtn);
+  actions.appendChild(saveBtn);
+  _settingsOpenModal(overlay);
+  setTimeout(() => labelInput.focus(), 0);
+}
+
+function _settingsOpenModal(overlay) {
+  overlay.classList.add('open');
+  const onKey = (e) => { if (e.key === 'Escape') _settingsCloseModal(overlay, onKey); };
+  overlay._onKey = onKey;
+  document.addEventListener('keydown', onKey, true);
+}
+
+function _settingsCloseModal(overlay) {
+  overlay.classList.remove('open');
+  if (overlay._onKey) {
+    document.removeEventListener('keydown', overlay._onKey, true);
+    delete overlay._onKey;
+  }
+}
+
+// ── OAuth flow modal ──
+
+let _oauthFlowPollTimer = null;
+let _oauthFlowId        = null;
+let _oauthFlowTarget    = null; // { provider, modelId }
+
+async function _settingsStartOAuthFlow(provider, modelId) {
+  const overlay   = document.getElementById('oauth-flow-modal');
+  const title     = document.getElementById('oauth-flow-title');
+  const body      = document.getElementById('oauth-flow-body');
+  const cancelBtn = document.getElementById('oauth-flow-cancel-btn');
+  if (!overlay || !title || !body || !cancelBtn) return;
+
+  // OAuth back-end may be different from the user-picked provider (e.g.
+  // openai → openai-codex). `oauthProvider` is the id we actually log into.
+  const oauthProviderId = provider.oauthProvider || provider.id;
+  const aliased = oauthProviderId !== provider.id;
+
+  _oauthFlowTarget = { provider, modelId, oauthProviderId };
+  title.textContent = t('settings.oauth.title_prefix', { provider: provider.label || provider.id });
+  const aliasTip = aliased
+    ? `<div class="oauth-flow-hint">${escapeHtml(t('settings.oauth.alias_tip', { provider: oauthProviderId }))}</div>`
+    : '';
+  body.innerHTML = `<div class="oauth-flow-stage">${escapeHtml(t('settings.oauth.starting'))}</div>${aliasTip}`;
+  overlay.classList.add('open');
+
+  const closeFlow = () => {
+    if (_oauthFlowPollTimer) { clearInterval(_oauthFlowPollTimer); _oauthFlowPollTimer = null; }
+    if (_oauthFlowId) {
+      window.orkas.invoke('auth.cancelOAuthFlow', { flowId: _oauthFlowId }).catch(() => {});
+    }
+    _oauthFlowId = null;
+    _oauthFlowTarget = null;
+    overlay.classList.remove('open');
+    document.removeEventListener('keydown', onKey, true);
+  };
+  const onKey = (e) => { if (e.key === 'Escape') closeFlow(); };
+  cancelBtn.onclick = closeFlow;
+  document.addEventListener('keydown', onKey, true);
+
+  _settingsLog.info('oauth start', { provider: oauthProviderId });
+  const startRes = await window.orkas.invoke('auth.startOAuth', { provider: oauthProviderId });
+  if (!startRes || !startRes.ok) {
+    body.innerHTML = `<div class="oauth-flow-stage error">${escapeHtml((startRes && startRes.error) || t('settings.oauth.start_failed'))}</div>`;
+    _settingsLog.warn('oauth start failed', { provider: oauthProviderId, error: startRes && startRes.error });
+    return;
+  }
+  _oauthFlowId = startRes.flowId;
+
+  let lastKind = '';
+  _oauthFlowPollTimer = setInterval(async () => {
+    if (!_oauthFlowId) return;
+    const res = await window.orkas.invoke('auth.pollOAuthFlow', { flowId: _oauthFlowId });
+    if (!res || !res.ok) return;
+    const status = res.status || {};
+    if (status.kind === lastKind && status.kind !== 'done' && status.kind !== 'error') return;
+    lastKind = status.kind;
+    _oauthFlowRender(provider, status, closeFlow);
+  }, 400);
+}
+
+function _oauthFlowRender(provider, status, closeFlow) {
+  const body = document.getElementById('oauth-flow-body');
+  if (!body) return;
+
+  if (status.kind === 'starting' || status.kind === 'progress') {
+    body.innerHTML = `<div class="oauth-flow-stage">${escapeHtml(status.message || t('settings.oauth.processing'))}</div>`;
+    return;
+  }
+
+  if (status.kind === 'awaiting_auth') {
+    const url = status.url || '';
+    const instructions = status.instructions || '';
+    // Device-code flows (e.g. MiniMax) don't run a local callback server,
+    // so the "paste callback URL" box doesn't apply — the user_code in
+    // instructions is what carries the flow forward.
+    const usesCallbackServer = status.usesCallbackServer !== false;
+    const topHint = usesCallbackServer
+      ? t('settings.oauth.top_hint_browser')
+      : t('settings.oauth.top_hint_page');
+    const subHint = usesCallbackServer
+      ? t('settings.oauth.sub_hint_callback')
+      : t('settings.oauth.sub_hint_devicecode');
+    body.innerHTML = `
+      <div class="oauth-flow-stage">${escapeHtml(topHint)}</div>
+      <div class="oauth-flow-hint">${escapeHtml(subHint)}</div>
+      <div class="oauth-auth-url">${escapeHtml(url)}</div>
+      <div class="oauth-flow-actions">
+        <button class="btn oauth-open-btn">${escapeHtml(t('settings.oauth.reopen'))}</button>
+        <button class="btn oauth-copy-btn">${escapeHtml(t('settings.oauth.copy_link'))}</button>
+      </div>
+      ${instructions ? `<div class="oauth-flow-tip oauth-flow-tip-multiline">${escapeHtml(instructions)}</div>` : ''}
+      ${usesCallbackServer ? `
+      <div class="form-row" style="margin-top:16px">
+        <input type="text" class="oauth-manual-input form-input" placeholder="${escapeHtml(t('settings.oauth.manual_placeholder'))}" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="oauth-flow-actions">
+        <button class="btn oauth-manual-submit-btn">${escapeHtml(t('settings.oauth.submit'))}</button>
+      </div>` : ''}
+    `;
+    body.querySelector('.oauth-open-btn').onclick = () => {
+      window.orkas.invoke('auth.openExternal', { url }).catch(() => {});
+    };
+    body.querySelector('.oauth-copy-btn').onclick = async () => {
+      try { await navigator.clipboard.writeText(url); } catch (_) {}
+    };
+    if (usesCallbackServer) {
+      const input = body.querySelector('.oauth-manual-input');
+      const submit = async () => {
+        const val = (input.value || '').trim();
+        if (!val) return;
+        body.innerHTML = `<div class="oauth-flow-stage">${escapeHtml(t('settings.oauth.submitting'))}</div>`;
+        await window.orkas.invoke('auth.submitOAuthInput', { flowId: _oauthFlowId, value: val });
+      };
+      body.querySelector('.oauth-manual-submit-btn').onclick = submit;
+      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { submit(); e.preventDefault(); } });
+    }
+    return;
+  }
+
+  if (status.kind === 'awaiting_input') {
+    const prompt = status.prompt || {};
+    const msg = prompt.message || t('settings.oauth.enter_prompt_fallback');
+    const placeholder = prompt.placeholder || '';
+    body.innerHTML = `
+      <div class="oauth-flow-stage">${escapeHtml(msg)}</div>
+      <div class="form-row">
+        <input type="text" class="oauth-input form-input" placeholder="${escapeHtml(placeholder)}" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="oauth-flow-actions">
+        <button class="btn btn-primary oauth-submit-btn">${escapeHtml(t('settings.oauth.submit'))}</button>
+      </div>
+    `;
+    const input = body.querySelector('.oauth-input');
+    const submit = async () => {
+      const val = input.value || '';
+      if (!val && !prompt.allowEmpty) return;
+      body.innerHTML = `<div class="oauth-flow-stage">${escapeHtml(t('settings.oauth.submitting'))}</div>`;
+      await window.orkas.invoke('auth.submitOAuthInput', { flowId: _oauthFlowId, value: val });
+    };
+    body.querySelector('.oauth-submit-btn').onclick = submit;
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { submit(); e.preventDefault(); } });
+    setTimeout(() => input.focus(), 0);
+    return;
+  }
+
+  if (status.kind === 'done') {
+    const target = _oauthFlowTarget;
+    const profileId = status.profileId || '';
+    body.innerHTML = `<div class="oauth-flow-stage ok">${escapeHtml(t('settings.oauth.success_writing'))}</div>`;
+    if (_oauthFlowPollTimer) { clearInterval(_oauthFlowPollTimer); _oauthFlowPollTimer = null; }
+    (async () => {
+      if (target && target.modelId && profileId) {
+        // profileId is namespaced with the OAuth back-end provider (e.g.
+        // `openai-codex:default`), so the entry must use the same provider
+        // or addEntry will reject it as a cross-provider mismatch.
+        const entryProvider = target.oauthProviderId || target.provider.id;
+        // The user picked a model from the user-facing provider (e.g.
+        // `openai`), but OAuth's back-end (e.g. `openai-codex`) may expose
+        // a different model list. Remap to a supported model if needed, or
+        // the chat-time call will throw "model not found".
+        let model = target.modelId;
+        if (entryProvider !== target.provider.id) {
+          const modelsRes = await window.orkas.invoke('auth.listModels', { provider: entryProvider });
+          const supported = (modelsRes && modelsRes.ok && Array.isArray(modelsRes.models)) ? modelsRes.models : [];
+          const hit = supported.find(m => m.id === model);
+          if (!hit && supported.length) model = supported[0].id;
+        }
+        await window.orkas.invoke('auth.addEntry', {
+          provider: entryProvider,
+          model,
+          profileId,
+        });
+      }
+      closeFlow();
+      await _settingsReload();
+    })();
+    return;
+  }
+
+  if (status.kind === 'error') {
+    body.innerHTML = `<div class="oauth-flow-stage error">${escapeHtml(status.error || t('settings.oauth.auth_failed'))}</div>`;
+    if (_oauthFlowPollTimer) { clearInterval(_oauthFlowPollTimer); _oauthFlowPollTimer = null; }
+    return;
+  }
+}
+
+// ── Entries list (priority, drag-reorderable) ──
+
+function _settingsRenderEntries() {
+  const container = document.getElementById('settings-entries');
+  if (!container) return;
+  container.innerHTML = '';
+
+  if (!_settingsState.entries.length) {
+    container.innerHTML = `<div class="settings-empty" data-i18n="settings.entries.empty">${escapeHtml(t('settings.entries.empty'))}</div>`;
+    return;
+  }
+
+  _settingsState.entries.forEach((entry, idx) => {
+    container.appendChild(_settingsRenderEntryRow(entry, idx));
+  });
+}
+
+function _settingsRenderEntryRow(entry, idx) {
+  const row = document.createElement('div');
+  row.className = 'entry-row' + (idx === 0 ? ' is-default' : '');
+  row.dataset.entryId = entry.entryId;
+  row.draggable = true;
+
+  const handle = document.createElement('div');
+  handle.className = 'entry-drag-handle';
+  handle.title = t('settings.entries.drag_title');
+  handle.textContent = '⋮⋮';
+  row.appendChild(handle);
+
+  const rank = document.createElement('div');
+  rank.className = 'entry-rank';
+  rank.textContent = idx === 0 ? t('settings.entries.default_tag') : `#${idx + 1}`;
+  row.appendChild(rank);
+
+  const main = document.createElement('div');
+  main.className = 'entry-main';
+  const primary = document.createElement('div');
+  primary.className = 'entry-primary';
+  primary.innerHTML = `
+    <span class="entry-provider">${escapeHtml(entry.providerLabel || entry.provider)}</span>
+    <span class="entry-sep">·</span>
+    <div class="ai-select ai-select-compact entry-model-select"></div>
+    <span class="entry-account-chip" title="${escapeHtml(t('settings.entries.account_title'))}">@ ${escapeHtml(entry.profileLabel || '')}</span>
+  `;
+  main.appendChild(primary);
+
+  // Inline model picker — lets users switch the entry's model without
+  // deleting + re-adding. The list is the provider's valid model set
+  // (auth.listModels applies the curated whitelist for OAuth-backed
+  // providers so users can't pick something the API will reject).
+  const modelEl = primary.querySelector('.entry-model-select');
+  const modelSel = _aiSelectMount(modelEl, { placeholder: entry.modelName || entry.model });
+  // Prevent drag from starting when interacting with the picker.
+  modelEl.addEventListener('mousedown', (e) => e.stopPropagation());
+  modelEl.setAttribute('draggable', 'false');
+  (async () => {
+    const res = await window.orkas.invoke('auth.listModels', { provider: entry.provider });
+    const list = (res && res.ok && Array.isArray(res.models)) ? res.models : [];
+    const options = list.map(m => ({ value: m.id, label: m.name || m.id }));
+    // Fall back: include the current model even if it's no longer in the
+    // curated list, so we don't visually drop what the entry points at.
+    if (!options.some(o => o.value === entry.model)) {
+      options.unshift({ value: entry.model, label: entry.modelName || entry.model });
+    }
+    modelSel.setOptions(options, { value: entry.model });
+    modelSel.onChange(async (val) => {
+      if (!val || val === entry.model) return;
+      const up = await window.orkas.invoke('auth.updateEntryModel', { entryId: entry.entryId, model: val });
+      if (!up || !up.ok) {
+        await uiAlert((up && up.error) || t('settings.entries.switch_model_failed'));
+        modelSel.setValue(entry.model);
+        return;
+      }
+      await _settingsReload();
+    });
+  })();
+
+  const meta = document.createElement('div');
+  meta.className = 'entry-meta';
+  const badge = document.createElement('span');
+  if (entry.profileType === 'oauth') {
+    badge.className = 'account-type-badge oauth' + (entry.oauthExpired ? ' expired' : '');
+    badge.textContent = entry.oauthExpired ? t('settings.entries.oauth_expired') : t('settings.entries.oauth_badge');
+  } else {
+    badge.className = 'account-type-badge';
+    badge.textContent = 'API Key';
+  }
+  meta.appendChild(badge);
+
+  if (entry.profileMasked) {
+    const mask = document.createElement('span');
+    mask.className = 'account-mask';
+    mask.textContent = entry.profileMasked;
+    meta.appendChild(mask);
+  }
+  main.appendChild(meta);
+
+  const status = document.createElement('div');
+  status.className = 'entry-status';
+  main.appendChild(status);
+  row.appendChild(main);
+
+  const actions = document.createElement('div');
+  actions.className = 'entry-actions';
+
+  const testBtn = document.createElement('button');
+  testBtn.className = 'icon-btn';
+  testBtn.textContent = t('settings.entries.test');
+  testBtn.onclick = () => _settingsTestEntry(entry, status);
+  actions.appendChild(testBtn);
+
+  const delBtn = document.createElement('button');
+  delBtn.className = 'icon-btn danger';
+  delBtn.textContent = t('common.delete');
+  delBtn.onclick = () => _settingsRemoveEntry(entry);
+  actions.appendChild(delBtn);
+
+  row.appendChild(actions);
+
+  // Drag + drop for reordering
+  row.addEventListener('dragstart', (e) => {
+    _settingsState.dragState = { entryId: entry.entryId, startIdx: idx };
+    row.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    try { e.dataTransfer.setData('text/plain', entry.entryId); } catch (_) {}
+  });
+  row.addEventListener('dragend', () => {
+    row.classList.remove('dragging');
+    row.parentElement?.querySelectorAll('.entry-row').forEach((r) => r.classList.remove('drop-before', 'drop-after'));
+    _settingsState.dragState = null;
+  });
+  row.addEventListener('dragover', (e) => {
+    if (!_settingsState.dragState) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const rect = row.getBoundingClientRect();
+    const before = (e.clientY - rect.top) < rect.height / 2;
+    row.classList.toggle('drop-before', before);
+    row.classList.toggle('drop-after', !before);
+  });
+  row.addEventListener('dragleave', () => {
+    row.classList.remove('drop-before', 'drop-after');
+  });
+  row.addEventListener('drop', async (e) => {
+    if (!_settingsState.dragState) return;
+    e.preventDefault();
+    row.classList.remove('drop-before', 'drop-after');
+    const srcId = _settingsState.dragState.entryId;
+    if (srcId === entry.entryId) return;
+    const rect = row.getBoundingClientRect();
+    const before = (e.clientY - rect.top) < rect.height / 2;
+    await _settingsReorderAfterDrop(srcId, entry.entryId, before);
+  });
+
+  return row;
+}
+
+async function _settingsReorderAfterDrop(srcId, refId, insertBefore) {
+  const ids = _settingsState.entries.map((e) => e.entryId);
+  const srcIdx = ids.indexOf(srcId);
+  if (srcIdx < 0) return;
+  ids.splice(srcIdx, 1);
+  let refIdx = ids.indexOf(refId);
+  if (refIdx < 0) refIdx = ids.length;
+  ids.splice(insertBefore ? refIdx : refIdx + 1, 0, srcId);
+  const res = await window.orkas.invoke('auth.reorderEntries', { orderedIds: ids });
+  if (res && res.ok) {
+    _settingsState.entries = Array.isArray(res.entries) ? res.entries : _settingsState.entries;
+    _settingsRenderEntries();
+  } else {
+    await uiAlert((res && res.error) || t('settings.entries.reorder_failed'));
+  }
+}
+
+async function _settingsTestEntry(entry, statusEl) {
+  _settingsSetRowStatus(statusEl, 'busy', t('settings.entries.testing'), 'entry-status');
+  const res = await window.orkas.invoke('auth.testConnection', {
+    provider: entry.provider,
+    model: entry.model,
+    profileId: entry.profileId,
+  });
+  if (res && res.ok) {
+    const ms = typeof res.durationMs === 'number' ? `${res.durationMs}ms` : '';
+    _settingsSetRowStatus(statusEl, 'ok', t('settings.entries.conn_ok', { ms }).trim(), 'entry-status');
+  } else {
+    const msg = (res && res.error) || t('settings.entries.conn_failed');
+    _settingsSetRowStatus(statusEl, 'error', msg.slice(0, 160), 'entry-status');
+  }
+}
+
+async function _settingsRemoveEntry(entry) {
+  const title = `${entry.providerLabel || entry.provider} · ${entry.modelName || entry.model} · ${entry.profileLabel}`;
+  if (!(await uiConfirm(t('settings.entries.delete_confirm', { title })))) return;
+  _settingsLog.info('remove entry', {
+    entry_id: entry.entryId,
+    provider: entry.provider,
+    model: entry.model,
+  });
+  const res = await window.orkas.invoke('auth.removeEntry', { entryId: entry.entryId });
+  if (!res || !res.ok) {
+    _settingsLog.warn('remove entry failed', { entry_id: entry.entryId, error: res && res.error });
+    await uiAlert((res && res.error) || t('settings.entries.delete_failed'));
+    return;
+  }
+  await _settingsReload();
+}
+
+// ── Helpers ──
+
+async function _settingsReload() {
+  await Promise.all([_settingsRefreshProviders(), _settingsRefreshEntries()]);
+  _settingsRenderPicker();
+  _settingsRenderEntries();
+  // The priority list just changed — re-check the model-guard flag so the
+  // top banner and gated actions unlock (or re-lock, after removing the
+  // last entry) without waiting for a reload.
+  if (typeof refreshModelGuard === 'function') {
+    refreshModelGuard().catch(() => {});
+  }
+}
+
+function _settingsSetStatus(id, kind, text) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = 'settings-status' + (kind ? ` ${kind}` : '');
+}
+
+function _settingsSetRowStatus(el, kind, text, baseCls = 'account-row-status') {
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = baseCls + (kind ? ` ${kind}` : '');
+}
+
+// ── Search API key section ──────────────────────────────────────────────
+//
+// Shape mirrors the chat-entries list visually but uses simpler rows
+// (provider + label + delete). Provider list is fixed (Tavily / Serper /
+// Brave Search API / 百度 AI 搜索); see search-adapters.ts for the
+// canonical registry.
+
+const _SEARCH_PROVIDER_OPTIONS = [
+  { id: 'tavily',            label: 'Tavily', docs: 'https://tavily.com/' },
+  { id: 'serper',            label: 'Serper', docs: 'https://serper.dev/' },
+  { id: 'brave-search',      label: 'Brave', docs: 'https://brave.com/search/api/' },
+  { id: 'baidu-ai-search',   label: '百度', docs: 'https://cloud.baidu.com/doc/qianfan-api/s/em82g4tlk' },
+  { id: 'metaso',            label: '秘塔', docs: 'https://metaso.cn/' },
+];
+
+function _searchProviderLabel(id) {
+  const hit = _SEARCH_PROVIDER_OPTIONS.find((p) => p.id === id);
+  return hit ? hit.label : id;
+}
+
+async function _settingsRefreshSearchProfiles() {
+  const res = await window.orkas.invoke('searchAuth.list');
+  _settingsState.searchProfiles = (res && res.ok && Array.isArray(res.profiles)) ? res.profiles : [];
+}
+
+function _settingsRenderSearchSection() {
+  _settingsRenderSearchPicker();
+  _settingsRenderSearchEntries();
+}
+
+function _settingsRenderSearchPicker() {
+  const el = document.getElementById('settings-search-provider');
+  if (!el) return;
+  if (!_settingsState.searchProviderSel) {
+    _settingsState.searchProviderSel = _aiSelectMount(el, {
+      placeholder: t('settings.search.pick_provider'),
+    });
+  }
+  // setOptions on every call — the second arg refreshes the placeholder so a
+  // mid-session language switch updates the dropdown header text.
+  const prev = _settingsState.searchProviderSel.getValue();
+  _settingsState.searchProviderSel.setOptions(
+    _SEARCH_PROVIDER_OPTIONS.map((p) => ({ value: p.id, label: p.label, hint: p.docs })),
+    { value: prev || '', placeholder: t('settings.search.pick_provider') },
+  );
+  const addBtn = document.getElementById('settings-search-add-btn');
+  if (addBtn && !addBtn.dataset.bound) {
+    addBtn.dataset.bound = '1';
+    addBtn.addEventListener('click', _settingsClickAddSearchKey);
+  }
+}
+
+async function _settingsClickAddSearchKey() {
+  const provider = _settingsState.searchProviderSel?.getValue() || '';
+  const input = document.getElementById('settings-search-key-input');
+  const apiKey = (input?.value || '').trim();
+  if (!provider) { _settingsSetStatus('settings-search-status', 'error', t('settings.search.error_provider_needed')); return; }
+  if (!apiKey)   { _settingsSetStatus('settings-search-status', 'error', t('settings.search.error_key_needed')); return; }
+  _settingsSetStatus('settings-search-status', 'busy', t('settings.search.adding'));
+  try {
+    const res = await window.orkas.invoke('searchAuth.add', { provider, apiKey, label: 'default' });
+    if (!res || !res.ok) {
+      _settingsSetStatus('settings-search-status', 'error', (res && res.error) || t('settings.search.add_failed'));
+      return;
+    }
+    if (input) input.value = '';
+    _settingsSetStatus('settings-search-status', 'ok', t('settings.search.add_ok'));
+    await _settingsRefreshSearchProfiles();
+    _settingsRenderSearchEntries();
+  } catch (err) {
+    _settingsSetStatus('settings-search-status', 'error', (err && err.message) || String(err));
+  }
+}
+
+function _settingsRenderSearchEntries() {
+  const container = document.getElementById('settings-search-entries');
+  if (!container) return;
+  container.innerHTML = '';
+  const list = _settingsState.searchProfiles || [];
+  if (!list.length) {
+    container.innerHTML = `<div class="settings-empty">${escapeHtml(t('settings.search.empty'))}</div>`;
+    return;
+  }
+  list.forEach((p, idx) => {
+    const row = document.createElement('div');
+    row.className = 'entry-row' + (idx === 0 ? ' is-default' : '');
+    row.dataset.profileId = p.id;
+
+    const rank = document.createElement('div');
+    rank.className = 'entry-rank';
+    rank.textContent = idx === 0 ? t('settings.search.active_tag') : `#${idx + 1}`;
+    row.appendChild(rank);
+
+    const main = document.createElement('div');
+    main.className = 'entry-main';
+    const primary = document.createElement('div');
+    primary.className = 'entry-primary';
+    primary.innerHTML = `
+      <span class="entry-provider">${escapeHtml(_searchProviderLabel(p.provider))}</span>
+      <span class="entry-sep">·</span>
+      <span class="entry-account-chip">@ ${escapeHtml(p.label || 'default')}</span>
+      ${p.apiKeyMasked ? `<span class="account-mask">${escapeHtml(p.apiKeyMasked)}</span>` : ''}
+    `;
+    main.appendChild(primary);
+    row.appendChild(main);
+
+    const actions = document.createElement('div');
+    actions.className = 'entry-actions';
+    const delBtn = document.createElement('button');
+    delBtn.className = 'btn btn-sm btn-danger';
+    delBtn.textContent = t('settings.delete');
+    delBtn.addEventListener('click', async () => {
+      const ok = await uiConfirm(t('settings.search.confirm_delete', { provider: _searchProviderLabel(p.provider) }));
+      if (!ok) return;
+      const res = await window.orkas.invoke('searchAuth.remove', { id: p.id });
+      if (res && res.ok) {
+        await _settingsRefreshSearchProfiles();
+        _settingsRenderSearchEntries();
+      }
+    });
+    actions.appendChild(delBtn);
+    row.appendChild(actions);
+
+    container.appendChild(row);
+  });
+}
+
+// ── Image generation API key section ────────────────────────────────────
+//
+// Same pattern as the search section but the provider list is the
+// image-gen capability map (provider_catalog.IMAGE_GEN_BY_PROVIDER).
+// Model id is fixed per-provider on the main side — never user-overridable.
+
+const _IMAGE_PROVIDER_OPTIONS = [
+  { id: 'openai',  label: 'OpenAI · GPT Image 2', docs: 'https://platform.openai.com/api-keys' },
+  { id: 'google',  label: 'Google · Nano Banana 2', docs: 'https://aistudio.google.com/app/apikey' },
+  { id: 'doubao',  label: 'DouBao · Seedream 3.0', docs: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey' },
+];
+
+function _imageProviderLabel(id) {
+  const hit = _IMAGE_PROVIDER_OPTIONS.find((p) => p.id === id);
+  return hit ? hit.label : id;
+}
+
+async function _settingsRefreshImageProfiles() {
+  const res = await window.orkas.invoke('imageAuth.list');
+  _settingsState.imageProfiles = (res && res.ok && Array.isArray(res.profiles)) ? res.profiles : [];
+}
+
+function _settingsRenderImageSection() {
+  _settingsRenderImagePicker();
+  _settingsRenderImageEntries();
+}
+
+function _settingsRenderImagePicker() {
+  const el = document.getElementById('settings-image-provider');
+  if (!el) return;
+  if (!_settingsState.imageProviderSel) {
+    _settingsState.imageProviderSel = _aiSelectMount(el, {
+      placeholder: t('settings.image.pick_provider'),
+    });
+  }
+  const prev = _settingsState.imageProviderSel.getValue();
+  _settingsState.imageProviderSel.setOptions(
+    _IMAGE_PROVIDER_OPTIONS.map((p) => ({ value: p.id, label: p.label, hint: p.docs })),
+    { value: prev || '', placeholder: t('settings.image.pick_provider') },
+  );
+  const addBtn = document.getElementById('settings-image-add-btn');
+  if (addBtn && !addBtn.dataset.bound) {
+    addBtn.dataset.bound = '1';
+    addBtn.addEventListener('click', _settingsClickAddImageKey);
+  }
+}
+
+async function _settingsClickAddImageKey() {
+  const provider = _settingsState.imageProviderSel?.getValue() || '';
+  const input = document.getElementById('settings-image-key-input');
+  const apiKey = (input?.value || '').trim();
+  if (!provider) { _settingsSetStatus('settings-image-status', 'error', t('settings.image.error_provider_needed')); return; }
+  if (!apiKey)   { _settingsSetStatus('settings-image-status', 'error', t('settings.image.error_key_needed')); return; }
+  _settingsSetStatus('settings-image-status', 'busy', t('settings.image.adding'));
+  try {
+    const res = await window.orkas.invoke('imageAuth.add', { provider, apiKey, label: 'default' });
+    if (!res || !res.ok) {
+      _settingsSetStatus('settings-image-status', 'error', (res && res.error) || t('settings.image.add_failed'));
+      return;
+    }
+    if (input) input.value = '';
+    _settingsSetStatus('settings-image-status', 'ok', t('settings.image.add_ok'));
+    await _settingsRefreshImageProfiles();
+    _settingsRenderImageEntries();
+  } catch (err) {
+    _settingsSetStatus('settings-image-status', 'error', (err && err.message) || String(err));
+  }
+}
+
+function _settingsRenderImageEntries() {
+  const container = document.getElementById('settings-image-entries');
+  if (!container) return;
+  container.innerHTML = '';
+  const list = _settingsState.imageProfiles || [];
+  if (!list.length) {
+    container.innerHTML = `<div class="settings-empty">${escapeHtml(t('settings.image.empty'))}</div>`;
+    return;
+  }
+  list.forEach((p, idx) => {
+    const row = document.createElement('div');
+    row.className = 'entry-row' + (idx === 0 ? ' is-default' : '');
+    row.dataset.profileId = p.id;
+
+    const rank = document.createElement('div');
+    rank.className = 'entry-rank';
+    rank.textContent = idx === 0 ? t('settings.image.active_tag') : `#${idx + 1}`;
+    row.appendChild(rank);
+
+    const main = document.createElement('div');
+    main.className = 'entry-main';
+    const primary = document.createElement('div');
+    primary.className = 'entry-primary';
+    primary.innerHTML = `
+      <span class="entry-provider">${escapeHtml(_imageProviderLabel(p.provider))}</span>
+      <span class="entry-sep">·</span>
+      <span class="entry-account-chip">@ ${escapeHtml(p.label || 'default')}</span>
+      ${p.apiKeyMasked ? `<span class="account-mask">${escapeHtml(p.apiKeyMasked)}</span>` : ''}
+    `;
+    main.appendChild(primary);
+    row.appendChild(main);
+
+    const actions = document.createElement('div');
+    actions.className = 'entry-actions';
+    const delBtn = document.createElement('button');
+    delBtn.className = 'btn btn-sm btn-danger';
+    delBtn.textContent = t('settings.delete');
+    delBtn.addEventListener('click', async () => {
+      const ok = await uiConfirm(t('settings.image.confirm_delete', { provider: _imageProviderLabel(p.provider) }));
+      if (!ok) return;
+      const res = await window.orkas.invoke('imageAuth.remove', { id: p.id });
+      if (res && res.ok) {
+        await _settingsRefreshImageProfiles();
+        _settingsRenderImageEntries();
+      }
+    });
+    actions.appendChild(delBtn);
+    row.appendChild(actions);
+
+    container.appendChild(row);
+  });
+}
