@@ -125,17 +125,18 @@ export const agentMetaDir        = (uid: string, agentId: string) => path.join(a
 export const agentCompetenceFile = (uid: string, agentId: string) => path.join(agentMetaDir(uid, agentId), 'COMPETENCE.md');
 export const agentStrategiesFile = (uid: string, agentId: string) => path.join(agentMetaDir(uid, agentId), 'LEARNING_STRATEGIES.md');
 
-// Agent 自演进 skill 仓库（System B —— core-agent 的 SkillStore 写入；
-// `skill_manage` 工具创建 / patch / delete）。**只对所属 agent 可见**，
-// 不进 SkillLoader 的 `## 可用技能` system prompt block；外部 agent /
-// commander 看不到。详见 CLAUDE.md §6 双 system 边界。
+// Agent self-evolved skill store (System B — written by core-agent's SkillStore;
+// `skill_manage` tool creates / patches / deletes). **Visible only to the owning
+// agent**; not included in the SkillLoader's `## Available skills` system prompt
+// block; other agents / commander cannot see it. See CLAUDE.md §6 (dual system
+// boundary).
 export const agentEvolvedSkillsDir = (uid: string, agentId: string) => path.join(agentDir(uid, agentId), 'skills');
 
-// 跨设备一致的用户偏好（language 等）
+// Cross-device user preferences (language, etc.)
 export const userCloudConfigDir  = (uid: string) => path.join(userCloudRoot(uid), 'config');
 export const userPreferencesFile = (uid: string) => path.join(userCloudConfigDir(uid), 'preferences.json');
-// 个人启用/禁用配置（agents + skills）。schema 见 features/component_enabled.ts。
-// 与 preferences.json 同目录、同云同步策略；只存 false 覆盖。
+// Per-user enable/disable config (agents + skills). Schema in features/component_enabled.ts.
+// Same dir + cloud-sync policy as preferences.json; only `false` is stored.
 export const userComponentEnabledFile = (uid: string) => path.join(userCloudConfigDir(uid), 'component-enabled.json');
 
 // ── Local-only per-user (不同步) ─────────────────────────────────────────

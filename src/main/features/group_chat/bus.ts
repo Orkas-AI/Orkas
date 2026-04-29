@@ -47,6 +47,7 @@ import { userChatsDir, BUILTIN_SKILLS_DIR, userSkillsDir } from '../../paths';
 import * as agentsFeat from '../agents';
 import * as userWorkspace from '../user_workspace';
 import { isAgentEnabled } from '../component_enabled';
+import { buildLanguageDirective, t } from '../../i18n';
 
 const log = createLogger('group_chat.bus');
 
@@ -1020,8 +1021,9 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       outcome = { kind: 'persist', text: '' };
     }
     if (outcome.kind === 'persist') {
+      const aborted = t('model.aborted');
       const body = outcome.text && outcome.text.trim()
-        ? `${outcome.text}\n\n（已中断）` : '（已中断）';
+        ? `${outcome.text}\n\n${aborted}` : aborted;
       outcome = { ...outcome, text: body };
     }
   }
@@ -1119,8 +1121,8 @@ async function buildCommanderSystemPrompt(uid: string, cid: string): Promise<str
   const permState = (() => {
     try {
       const s = require('../permissions').getLocalExecState() as { granted: boolean };
-      return s.granted ? '**已授权**（可自由执行）' : '**未授权**（需用户在「设置 → 本机执行」开启）';
-    } catch { return '**未授权**'; }
+      return s.granted ? '**Granted** (free to execute)' : '**Not granted** (the user must enable it under "Settings → Local execution")';
+    } catch { return '**Not granted**'; }
   })();
   // Stable sections first (cache-friendly), runtime injection last.
   // chat_shared_rules.md is appended BEFORE the runtime block in
@@ -1138,20 +1140,27 @@ async function buildCommanderSystemPrompt(uid: string, cid: string): Promise<str
     local_exec_state: permState,
   });
   const shared = prompts.load('chat_shared_rules', {});
-  return concatSharedRules(main, shared);
+  return appendLanguageDirective(concatSharedRules(main, shared));
 }
 
 /** Merge shared_rules into the per-role prompt. The shared block carries
  *  PDF / search / file-output rules that BOTH commander and agent need;
  *  duplicating them in two .md files would drift. We append them right
- *  before the `## 运行态注入` divider so the runtime-variable section
+ *  before the `## Runtime injection` divider so the runtime-variable section
  *  (the only mutable part) stays last for KV cache stability. */
 function concatSharedRules(main: string, shared: string): string {
   if (!shared.trim()) return main;
-  const marker = '## 运行态注入';
+  const marker = '## Runtime injection';
   const idx = main.indexOf(marker);
   if (idx < 0) return `${main}\n\n---\n\n${shared}`;
   return `${main.slice(0, idx)}---\n\n${shared}\n\n${main.slice(idx)}`;
+}
+
+/** Append the user-language directive at the very tail. Kept last (after
+ *  runtime injection) because it is the most volatile per-user variable;
+ *  putting it last keeps the cached prefix stable. */
+function appendLanguageDirective(prompt: string): string {
+  return `${prompt}\n\n---\n\n${buildLanguageDirective()}`;
 }
 
 async function buildAgentsIndexBlock(_uid: string): Promise<string> {
@@ -1162,7 +1171,7 @@ async function buildAgentsIndexBlock(_uid: string): Promise<string> {
   const lang = getCurrentLang();
   try {
     const list = (await agentsFeat.listAgents()).filter((a: any) => a.enabled !== false);
-    if (!list.length) return '（暂无智能体）';
+    if (!list.length) return '(no agents)';
     return list.map((a: any) => {
       const name = a.name || a.agent_id;
       const description = pickDescription(a, lang);
@@ -1170,7 +1179,7 @@ async function buildAgentsIndexBlock(_uid: string): Promise<string> {
       // Lead with `@<name>` so the LLM picks up the calling convention
       // visually; id is hidden — exposing hex strings in prompts trains
       // the LLM to leak them in user-visible text too.
-      const head = `- @${name} (来源: ${a.source})${desc}`;
+      const head = `- @${name} (Source: ${a.source})${desc}`;
       // Inline a slimmed inputs_schema (id / type / required / default /
       // label / options / min / max / accept) so commander knows what
       // params each agent expects when phrasing its `@<name>` dispatch
@@ -1187,7 +1196,7 @@ async function buildAgentsIndexBlock(_uid: string): Promise<string> {
       }
       return head;
     }).join('\n');
-  } catch { return '（暂无智能体）'; }
+  } catch { return '(no agents)'; }
 }
 
 async function buildAgentInGroupSystemPrompt(
@@ -1213,15 +1222,15 @@ async function buildAgentInGroupSystemPrompt(
   const main = prompts.load('chat_agent_in_group', {
     name: agent.name || '',
     agent_id: agent.agent_id,
-    description: agent.description || '(未填写)',
-    workflow: (agent.workflow || '').trim() || '(未填写)',
-    inputs_schema: inputsSchemaJson || '（无）',
+    description: agent.description || '(not provided)',
+    workflow: (agent.workflow || '').trim() || '(not provided)',
+    inputs_schema: inputsSchemaJson || '(none)',
     builtin_skills_dir: path_.resolve(paths_.BUILTIN_SKILLS_DIR),
     custom_skills_dir: path_.resolve(paths_.userSkillsDir(uid)),
     working_dir: workingDir,
   });
   const shared = prompts.load('chat_shared_rules', {});
-  return concatSharedRules(main, shared);
+  return appendLanguageDirective(concatSharedRules(main, shared));
 }
 
 // ── Commander tools (plan_set / plan_update) ────────────────────────────
@@ -1232,17 +1241,17 @@ async function buildCommanderExtraTools(state: CidState, w: WorkerState): Promis
   tools.push({
     name: 'plan_set',
     description: [
-      '落档完整执行计划——bus 会按 plan 自动派活、跟踪状态、串/并行调度，**不需要你后续手动 @ 派**。',
-      '每个 step 必须写明 `assignee`（user / commander / 智能体名字）和 `input`（派活文本，可用 `{{user_initial_message}}` 和 `{{step_N.output_summary}}` 模板变量引用上下文）。',
-      'step 之间默认串行（每步等上一步 done），用 `wait_for: []` 让该步立即跑、用 `wait_for: [N]` 显式声明依赖、用 `parallel_group: "g"` 把多步标成同组并行。',
-      '第一次调用同步在群里发一条公告让用户看到大致路径；后续覆盖只更新文件。step 数 1-15。',
+      'Record the full execution plan — the bus auto-dispatches per the plan, tracks state, and runs steps in series/parallel; **you do NOT need to @ dispatch anything afterwards**.',
+      'Every step must specify `assignee` (user / commander / agent name) and `input` (dispatch text; can reference `{{user_initial_message}}` and `{{step_N.output_summary}}` template variables to pull in context).',
+      'Steps default to serial (each waits for the previous to be done); use `wait_for: []` to run a step immediately, `wait_for: [N]` to declare explicit dependencies, and `parallel_group: "g"` to mark multiple steps as a parallel group.',
+      'The first call also posts a group announcement so the user sees the rough path; later overwrites just update the file. Step count 1–15.',
     ].join(' '),
     inputSchema: {
       type: 'object',
       properties: {
         initial_message: {
           type: 'string',
-          description: '可选：触发本 plan 的 user 原始消息文本，会被存到 plan 里供 `{{user_initial_message}}` 变量引用。第一次写 plan 时强烈建议填——否则下游 step 的 input 模板拿不到 user 原话',
+          description: 'Optional: the original user message that triggered this plan; stored in the plan for `{{user_initial_message}}` references. Strongly recommended on first plan write — otherwise downstream step input templates cannot pull the user\'s original wording.',
         },
         steps: {
           type: 'array',
@@ -1250,30 +1259,30 @@ async function buildCommanderExtraTools(state: CidState, w: WorkerState): Promis
           items: {
             type: 'object',
             properties: {
-              title: { type: 'string', description: '一句话步骤目标（祈使语气）' },
+              title: { type: 'string', description: 'One-line step goal (imperative).' },
               assignee: {
                 type: 'string',
-                description: '执行者：智能体名字 / commander（自己干，常用于汇总）/ user（向用户提问，等用户回话）',
+                description: 'Executor: agent name / commander (you yourself, typical for synthesis) / user (ask the user a question and wait for the reply).',
               },
               input: {
                 type: 'string',
-                description: '派给 assignee 的派活文本（模板）。bus 会渲染变量后**原样**作为消息发给 assignee。可用 `{{user_initial_message}}`、`{{step_1.output_summary}}`、`{{step_2.output_files}}` 等。这是 plan 真正的"派活脚本"',
+                description: 'Dispatch text (template) sent to the assignee. The bus renders the variables and forwards the result **verbatim** as a message. Variables include `{{user_initial_message}}`, `{{step_1.output_summary}}`, `{{step_2.output_files}}`, etc. This is the actual "dispatch script" of the plan.',
               },
               wait_for: {
                 type: 'array',
                 items: { type: 'number' },
-                description: '可选：依赖的 step 编号列表（1-based）。默认 = [上一步]（线性串行）。`[]` 表示无依赖，立即跑。多个依赖表示要等他们都 done。',
+                description: 'Optional: list of step indices (1-based) this step depends on. Default = [previous step] (linear serial). `[]` = no dependency, run immediately. Multiple deps means wait for all of them to be done.',
               },
               parallel_group: {
                 type: 'string',
-                description: '可选：标记同一并行组。同组的 step 同时 dispatch（fork）。常用于"多个智能体独立分析同一问题"',
+                description: 'Optional: marks a parallel group. Steps in the same group are dispatched simultaneously (fork). Typical use: "multiple agents analyze the same problem independently".',
               },
               on_failure: {
                 type: 'string',
                 enum: ['abort_plan', 'continue', 'ask_commander'],
-                description: '可选失败策略：abort_plan 整盘停 / continue 跳过这步继续 / ask_commander（默认）唤醒指挥官决断',
+                description: 'Optional failure policy: `abort_plan` stops the whole plan / `continue` skips this step and proceeds / `ask_commander` (default) wakes the commander to decide.',
               },
-              notes: { type: 'string', description: '可选补充说明（不影响执行）' },
+              notes: { type: 'string', description: 'Optional supplementary notes (does not affect execution).' },
             },
             required: ['title', 'assignee'],
             additionalProperties: false,
@@ -1333,22 +1342,22 @@ async function buildCommanderExtraTools(state: CidState, w: WorkerState): Promis
   tools.push({
     name: 'dispatch_to',
     description: [
-      '派活给单个 agent —— 单 agent 派活的**唯一通道**。多 agent 协作走 `plan_set`。',
-      '调用本 tool **只是记录**派活意图；recipient agent 不会立即开干，要等你这一回合的文本回复完整发完、placeholder 清理后才被唤醒（避免抢跑）。',
-      '`to` 可以是 agent 名字（推荐，跟"智能体列表"里的 name 一致）或 agent_id，commander/user 别名也支持。',
-      '`message` 是要原样发给目标 agent 的派活文本。',
-      '**注意**：散文里的 `@<X>` 是 markdown 装饰，系统已不识别为派活信号；想派活就调本工具。',
+      'Dispatch a task to a single agent — the **sole channel** for single-agent dispatch. Multi-agent coordination goes through `plan_set`.',
+      'Calling this tool **only records intent**; the recipient agent does not start immediately — it is woken up only after this turn\'s text reply is fully sent and placeholders are cleared (avoiding races).',
+      '`to` can be the agent name (recommended, matching the `name` in the "Agents list") or the agent_id; the `commander` / `user` aliases are also accepted.',
+      '`message` is the dispatch text to send verbatim to the target agent.',
+      '**Note**: `@<X>` written in prose is markdown decoration; the system no longer recognizes it as a dispatch signal — to dispatch, call this tool.',
     ].join(' '),
     inputSchema: {
       type: 'object',
       properties: {
         to: {
           type: 'string',
-          description: '目标 actor —— agent 名字或 agent_id；commander / user / 指挥官 / 用户 也可',
+          description: 'Target actor — agent name or agent_id; the aliases `commander` / `user` / 指挥官 / 用户 are also accepted.',
         },
         message: {
           type: 'string',
-          description: '派活文本，原样发给目标',
+          description: 'Dispatch text, sent verbatim to the target.',
         },
       },
       required: ['to', 'message'],
@@ -1392,7 +1401,7 @@ async function buildCommanderExtraTools(state: CidState, w: WorkerState): Promis
       }
       if (!resolvedId) {
         return {
-          content: JSON.stringify({ ok: false, error: `unknown actor: "${toRaw}" — 名字要跟"智能体列表"里的 name 一致；或检查 agent 是否禁用` }),
+          content: JSON.stringify({ ok: false, error: t('errors.unknown_actor', { name: toRaw }) }),
           isError: true,
         };
       }
@@ -1403,7 +1412,7 @@ async function buildCommanderExtraTools(state: CidState, w: WorkerState): Promis
           ok: true,
           dispatched_to: resolvedId,
           when: 'after-turn-end',
-          note: '已记录派活，等你这一回合发完再投递',
+          note: 'Dispatch recorded; will be delivered after you finish this turn.',
         }),
       };
     },
@@ -1411,11 +1420,11 @@ async function buildCommanderExtraTools(state: CidState, w: WorkerState): Promis
 
   tools.push({
     name: 'plan_update',
-    description: '更新某一步的状态（in_progress / done / failed）。不会发消息，只更新文件并通知前端面板。',
+    description: 'Update a step\'s status (`in_progress` / `done` / `failed`). Sends no message; only updates the file and notifies the front-end panel.',
     inputSchema: {
       type: 'object',
       properties: {
-        step_index: { type: 'number', description: '1-based 步骤编号' },
+        step_index: { type: 'number', description: '1-based step index.' },
         status: { type: 'string', enum: ['in_progress', 'done', 'failed'] },
         notes: { type: 'string' },
       },

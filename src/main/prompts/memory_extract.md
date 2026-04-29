@@ -1,18 +1,18 @@
-以下是一段对话的压缩摘要。请从中提取值得长期记忆的关键事实。
+Below is a compressed summary of a conversation. Extract the key facts that are worth remembering long-term.
 
-只提取以下类型的信息：
-- 用户明确表达的偏好或纠正（"我喜欢…"、"不要…"、"以后请…"）
-- 重要决策或里程碑（"我们决定用 X"、"已完成 Y"）
-- 项目约定或环境信息（"项目用 Z 框架"、"部署在 W 上"）
-- 用户的角色、专业领域、沟通风格
+Only extract the following types of information:
+- Preferences or corrections the user has explicitly stated ("I like…", "don't…", "from now on…")
+- Important decisions or milestones ("we decided to use X", "Y is done")
+- Project conventions or environmental info ("this project uses framework Z", "deployed on W")
+- The user's role, area of expertise, communication style
 
-不要提取：
-- 对话细节或临时调试信息
-- 显而易见的常识
-- 原始代码或日志内容
-- 已在当前对话中解决的一次性问题
+Do NOT extract:
+- Conversation details or temporary debugging info
+- Obvious common knowledge
+- Raw code or log content
+- One-off problems already resolved earlier in this conversation
 
-输出格式：每条事实一行，以 "- " 开头。如果没有值得提取的事实，输出空行即可。
+Output format: one fact per line, starting with "- ". If there is nothing worth extracting, output a blank line.
 
-摘要内容：
+Summary:
 $summary

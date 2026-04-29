@@ -81,12 +81,12 @@ export class SkillLoader {
   renderSystemPromptBlock(lang: 'zh' | 'en' = 'en'): string {
     const skills = this.list();
     if (!skills.length) return "";
-    const lines = ["## 可用技能 (skills)", ""];
+    const lines = ["## Available skills (skills)", ""];
     for (const s of skills) {
       const source = path.basename(s.source);
       const description = pickDescription(s, lang);
       const desc = description ? ` — ${description}` : "";
-      lines.push(`- **${s.id}** (来源: ${source})${desc}`);
+      lines.push(`- **${s.id}** (Source: ${source})${desc}`);
     }
     return lines.join("\n");
   }

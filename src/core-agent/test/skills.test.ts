@@ -150,11 +150,11 @@ describe("SkillLoader", () => {
 
     const loader = new SkillLoader({ dirs: [customDir, builtinDir] });
     const block = loader.renderSystemPromptBlock();
-    expect(block).toContain("## 可用技能");
-    // Each entry carries a `来源` tag (dir basename) so the LLM can pick
+    expect(block).toContain("## Available skills");
+    // Each entry carries a `Source` tag (dir basename) so the LLM can pick
     // the right path prefix without probing both roots.
-    expect(block).toContain("**alpha** (来源: custom) — alpha desc");
-    expect(block).toContain("**beta** (来源: builtin) — beta desc");
+    expect(block).toContain("**alpha** (Source: custom) — alpha desc");
+    expect(block).toContain("**beta** (Source: builtin) — beta desc");
     // id must never be shown twice — the name==id invariant holds.
     expect(block).not.toMatch(/\(`/);
   });

@@ -238,13 +238,13 @@ export class SkillStore {
       ...lines,
       "",
       // Scope this instruction explicitly to the list above. Other skill
-      // surfaces (e.g. the regular `## 可用技能 (skills)` block injected by
+      // surfaces (e.g. the regular `## Available skills (skills)` block injected by
       // the host app) live in different stores and are loaded differently
       // (read_file on the path constants the host gives you) — picking the
       // wrong path here returns "Skill not found" and leads the model to
       // fabricate reasons (we've seen "skill is in a 'pending' state" on a
       // perfectly populated regular skill).
-      `Use skill_manage(action='read', id='<id>') ONLY for the Learned Skills listed in this section. Regular skills shown elsewhere (e.g. under "## 可用技能 (skills)") are NOT in this store — load them with read_file using the path constants in the host's prompt instead.`,
+      `Use skill_manage(action='read', id='<id>') ONLY for the Learned Skills listed in this section. Regular skills shown elsewhere (e.g. under "## Available skills (skills)") are NOT in this store — load them with read_file using the path constants in the host's prompt instead.`,
     ].join("\n");
   }
 

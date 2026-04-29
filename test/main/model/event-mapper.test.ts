@@ -73,11 +73,11 @@ describe('event-mapper › tool_start forwards input + summarizes progress', () 
       { type: 'done', result: { text: '', meta: { error: null } } },
     ]);
     const retryProgress = out.find(
-      (e) => e.type === 'progress' && typeof e.text === 'string' && e.text.startsWith('正在重试'),
+      (e) => e.type === 'progress' && typeof e.text === 'string' && e.text.startsWith('Retrying'),
     );
     expect(retryProgress).toBeDefined();
-    expect(retryProgress.text).toBe('正在重试·连接中断');
-    // Raw English reason must not survive into user-visible text.
+    expect(retryProgress.text).toBe('Retrying·Connection dropped');
+    // Raw English error sentinel must not survive into user-visible text.
     expect(retryProgress.text).not.toContain('terminated');
     expect(retryProgress.text).not.toContain('retry #');
   });
@@ -88,9 +88,9 @@ describe('event-mapper › tool_start forwards input + summarizes progress', () 
       { type: 'done', result: { text: '', meta: { error: null } } },
     ]);
     const retryProgress = out.find(
-      (e) => e.type === 'progress' && typeof e.text === 'string' && e.text.includes('重试'),
+      (e) => e.type === 'progress' && typeof e.text === 'string' && e.text.includes('Retry attempt'),
     );
-    expect(retryProgress.text).toBe('正在第 2 次重试·连接中断');
+    expect(retryProgress.text).toBe('Retry attempt 2·Connection dropped');
   });
 
   it('tool_end with isError → progress uses ✗ marker and carries preview', async () => {
@@ -108,32 +108,32 @@ describe('event-mapper › tool_start forwards input + summarizes progress', () 
 });
 
 describe('event-mapper › friendlyRetryReason', () => {
-  it('maps undici mid-stream cutoff to 连接中断', () => {
-    expect(friendlyRetryReason('terminated')).toBe('连接中断');
-    expect(friendlyRetryReason('socket hang up')).toBe('连接中断');
-    expect(friendlyRetryReason('fetch failed')).toBe('连接中断');
-    expect(friendlyRetryReason('ECONNRESET')).toBe('连接中断');
+  it('maps undici mid-stream cutoff to "Connection dropped"', () => {
+    expect(friendlyRetryReason('terminated')).toBe('Connection dropped');
+    expect(friendlyRetryReason('socket hang up')).toBe('Connection dropped');
+    expect(friendlyRetryReason('fetch failed')).toBe('Connection dropped');
+    expect(friendlyRetryReason('ECONNRESET')).toBe('Connection dropped');
   });
 
-  it('maps timeouts to 响应超时', () => {
-    expect(friendlyRetryReason('Request timeout')).toBe('响应超时');
-    expect(friendlyRetryReason('ETIMEDOUT')).toBe('响应超时');
-    expect(friendlyRetryReason('UND_ERR_HEADERS_TIMEOUT')).toBe('响应超时');
+  it('maps timeouts to "Response timed out"', () => {
+    expect(friendlyRetryReason('Request timeout')).toBe('Response timed out');
+    expect(friendlyRetryReason('ETIMEDOUT')).toBe('Response timed out');
+    expect(friendlyRetryReason('UND_ERR_HEADERS_TIMEOUT')).toBe('Response timed out');
   });
 
-  it('maps rate limiting to 服务限流', () => {
-    expect(friendlyRetryReason('429 Too Many Requests')).toBe('服务限流');
-    expect(friendlyRetryReason('Rate limit exceeded')).toBe('服务限流');
+  it('maps rate limiting to "Service rate-limited"', () => {
+    expect(friendlyRetryReason('429 Too Many Requests')).toBe('Service rate-limited');
+    expect(friendlyRetryReason('Rate limit exceeded')).toBe('Service rate-limited');
   });
 
-  it('maps 5xx gateway errors to 服务暂时不可用', () => {
-    expect(friendlyRetryReason('502 Bad Gateway')).toBe('服务暂时不可用');
-    expect(friendlyRetryReason('503 Service Unavailable')).toBe('服务暂时不可用');
-    expect(friendlyRetryReason('504 Gateway Timeout')).toBe('服务暂时不可用');
+  it('maps 5xx gateway errors to "Service temporarily unavailable"', () => {
+    expect(friendlyRetryReason('502 Bad Gateway')).toBe('Service temporarily unavailable');
+    expect(friendlyRetryReason('503 Service Unavailable')).toBe('Service temporarily unavailable');
+    expect(friendlyRetryReason('504 Gateway Timeout')).toBe('Service temporarily unavailable');
   });
 
-  it('empty or unknown reason → generic 网络异常', () => {
-    expect(friendlyRetryReason('')).toBe('网络异常');
-    expect(friendlyRetryReason('some brand-new SDK error we have not seen')).toBe('网络异常');
+  it('empty or unknown reason → generic "Network error"', () => {
+    expect(friendlyRetryReason('')).toBe('Network error');
+    expect(friendlyRetryReason('some brand-new SDK error we have not seen')).toBe('Network error');
   });
 });

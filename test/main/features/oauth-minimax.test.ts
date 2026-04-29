@@ -271,7 +271,7 @@ describe('oauth-minimax › loginMiniMaxPortal', () => {
         _now:   () => tick,
         _sleep: sleepMock,
       }),
-    ).rejects.toThrow(/超时/);
+    ).rejects.toThrow(/timed out|超时/);
     expect(sleepMock.mock.calls.length).toBeGreaterThanOrEqual(1);
   });
 });
@@ -323,7 +323,7 @@ describe('oauth-minimax › provider.refreshToken', () => {
     const provider = buildMinimaxPortalProvider('cn');
     await expect(
       provider.refreshToken({ access: 'x', refresh: 'y', expires: 0 }),
-    ).rejects.toThrow(/refresh[_ ]token 失败/);
+    ).rejects.toThrow(/refresh_token failed|refresh[_ ]token 失败/);
   });
 });
 

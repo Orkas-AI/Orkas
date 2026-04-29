@@ -543,7 +543,7 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     );
     expect(r.images).toHaveLength(3);
     expect(r.skipped.length).toBe(4);
-    expect(r.skipped.every((s) => /图片上限/.test(s.reason))).toBe(true);
+    expect(r.skipped.every((s) => /image cap|图片上限/.test(s.reason))).toBe(true);
   });
 
   it('skips missing files gracefully', async () => {
@@ -551,6 +551,6 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     const r = await m.buildAttachmentManifest(UID, CID, ['ghost.txt']);
     expect(r.manifest).toBe('');
     expect(r.skipped.length).toBe(1);
-    expect(r.skipped[0].reason).toMatch(/不存在/);
+    expect(r.skipped[0].reason).toMatch(/no longer exists|不存在/);
   });
 });

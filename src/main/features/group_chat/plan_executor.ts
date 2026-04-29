@@ -24,6 +24,7 @@
 import { Mutex } from 'async-mutex';
 
 import { createLogger } from '../../logger';
+import { t } from '../../i18n';
 import { COMMANDER_ID, USER_ID, readMembers } from './state';
 import {
   readPlan, updateStep, markPlanCompletedSignaled,
@@ -453,7 +454,7 @@ async function reconcileAfterStepTransition(uid: string, cid: string): Promise<v
 }
 
 function errorBubble(msg: string): string {
-  return `<span style="color:var(--danger)">⚠️ 模型调用失败：${escapeHtmlForBubble(msg)}</span>`;
+  return `<span style="color:var(--danger)">${escapeHtmlForBubble(t('model.call_failed', { message: msg }))}</span>`;
 }
 
 /** Outcome for an aborted turn. Returns the salvageable content (partial
@@ -742,7 +743,7 @@ async function firePlanComplete(uid: string, cid: string, plan: PlanFile): Promi
     `Step results:`,
     summary,
     ``,
-    `所有计划步骤已终止。请基于上面各步骤的产出，给用户写一条收尾报告：产出 + 过程要点 + 后续可选动作（如有）。如果有 failed 步骤，必须诚实告诉 user 哪一步失败了 + 原因。`,
+    `All plan steps have terminated. Based on each step's output above, write a wrap-up report for the user: deliverables + key process points + suggested follow-up actions (if any). If any step failed, you must honestly tell the user which step failed and why.`,
     `</plan-complete>`,
   ].join('\n');
   await _hooks.pushCommanderTurn(uid, cid, {

@@ -98,7 +98,7 @@ function safeAttachmentName(name: unknown): string {
   if (s.length > MAX_FILENAME_LEN) throw new Error('filename too long');
   const ext = path.extname(s).toLowerCase();
   if (!ALLOWED_EXTENSIONS.has(ext)) {
-    throw new Error(`不支持的文件类型（${ext || '无扩展名'}）`);
+    throw new Error(t('errors.unsupported_file_ext', { ext: ext || t('errors.unsupported_file_no_ext') }));
   }
   return s;
 }
@@ -515,18 +515,18 @@ export async function buildAttachmentManifest(
     try { nm = safeAttachmentName(rawName); }
     catch (err) { skipped.push({ name: String(rawName), reason: (err as Error).message }); continue; }
     const abs = path.join(dir, nm);
-    if (!fs.existsSync(abs)) { skipped.push({ name: nm, reason: '文件已不存在' }); continue; }
+    if (!fs.existsSync(abs)) { skipped.push({ name: nm, reason: t('attachments.skipped.missing') }); continue; }
     const ext = path.extname(nm).toLowerCase();
     const kind = kindOf(ext);
 
     if (kind === 'image') {
-      if (images.length >= maxImages) { skipped.push({ name: nm, reason: `超过单条消息图片上限（${maxImages} 张）` }); continue; }
+      if (images.length >= maxImages) { skipped.push({ name: nm, reason: t('attachments.skipped.too_many_images', { max: maxImages }) }); continue; }
       try {
         const buf = fs.readFileSync(abs);
         const compressed = await toCompressedGrayJpeg(buf, { maxDim: 1024, quality: 70, grayscale: true });
         images.push({ data: compressed.buf.toString('base64'), mediaType: 'image/jpeg' });
       } catch (err) {
-        skipped.push({ name: nm, reason: `图片压缩失败：${(err as Error).message}` });
+        skipped.push({ name: nm, reason: t('attachments.skipped.compress_failed', { message: (err as Error).message }) });
       }
       continue;
     }
@@ -535,7 +535,7 @@ export async function buildAttachmentManifest(
       // Videos are display-only: no vision support + no text extraction. The
       // renderer streams bytes through the `chat-media://` protocol directly;
       // nothing to surface to the model.
-      skipped.push({ name: nm, reason: '视频文件仅供展示，模型不读取' });
+      skipped.push({ name: nm, reason: t('attachments.skipped.video_for_display') });
       continue;
     }
 

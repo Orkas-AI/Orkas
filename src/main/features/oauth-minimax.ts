@@ -42,6 +42,7 @@
 
 import { createHash, randomBytes } from 'node:crypto';
 import type { OAuthCredentials, OAuthProviderInterface, OAuthLoginCallbacks } from '@mariozechner/pi-ai';
+import { t } from '../i18n';
 
 // ── Endpoint config ──────────────────────────────────────────────────────
 
@@ -151,15 +152,15 @@ async function requestAuthorization(opts: {
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    throw new Error(`MiniMax OAuth 授权申请失败 (${res.status}): ${body || res.statusText}`);
+    throw new Error(t('oauth.minimax.auth_request_failed', { status: res.status, body: body || res.statusText }));
   }
 
   const payload = (await res.json()) as AuthorizationResponse;
   if (!payload?.user_code || !payload?.verification_uri) {
-    throw new Error(payload?.error || 'MiniMax OAuth 响应缺少 user_code / verification_uri');
+    throw new Error(payload?.error || t('oauth.minimax.response_missing_fields'));
   }
   if (payload.state !== opts.state) {
-    throw new Error('MiniMax OAuth state 校验失败（可能遭到 CSRF 攻击或会话损坏）');
+    throw new Error(t('oauth.minimax.state_mismatch'));
   }
   return payload;
 }
@@ -228,16 +229,16 @@ async function refreshTokenCall(opts: {
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    throw new Error(`MiniMax refresh_token 失败 (${res.status}): ${body || res.statusText}`);
+    throw new Error(t('oauth.minimax.refresh_failed_status', { status: res.status, body: body || res.statusText }));
   }
   const payload = (await res.json()) as TokenPayload;
   if (payload.status !== 'success') {
-    const msg = (payload as any)?.base_resp?.status_msg || '刷新失败';
-    throw new Error(`MiniMax refresh_token 失败: ${msg}`);
+    const msg = (payload as any)?.base_resp?.status_msg || t('oauth.minimax.refresh_failed_default');
+    throw new Error(t('oauth.minimax.refresh_failed', { message: msg }));
   }
   const ok = payload as TokenSuccessPayload;
   if (!ok.access_token || !ok.refresh_token || typeof ok.expired_in !== 'number') {
-    throw new Error('MiniMax refresh_token 响应缺字段');
+    throw new Error(t('oauth.minimax.refresh_missing_fields'));
   }
   return ok;
 }
@@ -276,16 +277,10 @@ export async function loginMiniMaxPortal(opts: LoginOptions): Promise<OAuthCrede
   const { region, callbacks } = opts;
 
   const { verifier, challenge, state } = generatePkce();
-  callbacks.onProgress?.('向 MiniMax 申请授权…');
+  callbacks.onProgress?.(t('oauth.minimax.requesting'));
   const auth = await requestAuthorization({ region, challenge, state, signal: callbacks.signal });
 
-  const instructions = [
-    `请在打开的页面中输入验证码：`,
-    ``,
-    `    ${auth.user_code}`,
-    ``,
-    `完成授权后 Orkas 会自动拉取凭证，无需回到本窗口复制任何内容。`,
-  ].join('\n');
+  const instructions = t('oauth.minimax.instructions', { code: auth.user_code });
 
   callbacks.onAuth({ url: auth.verification_uri, instructions });
 
@@ -298,7 +293,7 @@ export async function loginMiniMaxPortal(opts: LoginOptions): Promise<OAuthCrede
   while (now() < expireAt) {
     if (callbacks.signal?.aborted) throw new Error('cancelled');
 
-    callbacks.onProgress?.('等待 MiniMax 授权完成…');
+    callbacks.onProgress?.(t('oauth.minimax.waiting'));
     const result = await pollToken({
       region,
       userCode: auth.user_code,
@@ -320,15 +315,15 @@ export async function loginMiniMaxPortal(opts: LoginOptions): Promise<OAuthCrede
     }
 
     if (result.status === 'error') {
-      const msg = (result as any)?.base_resp?.status_msg || '授权失败';
-      throw new Error(`MiniMax OAuth 失败: ${msg}`);
+      const msg = (result as any)?.base_resp?.status_msg || t('oauth.minimax.failed_default');
+      throw new Error(t('oauth.minimax.failed', { message: msg }));
     }
 
     // status === 'pending' → keep polling
     await sleep(pollIntervalMs);
   }
 
-  throw new Error('MiniMax OAuth 已超时，请重试。');
+  throw new Error(t('oauth.minimax.timeout'));
 }
 
 // ── pi-ai OAuthProviderInterface factory ─────────────────────────────────
@@ -384,7 +379,7 @@ export async function registerMinimaxOAuthProviders(): Promise<void> {
     oauth.registerOAuthProvider(p);
     const readback = oauth.getOAuthProvider(p.id as any);
     if (!readback) {
-      throw new Error(`pi-ai oauth registry 自验证失败: registerOAuthProvider('${p.id}') 后读不回，ESM/CJS registry 可能分裂`);
+      throw new Error(`pi-ai oauth registry self-check failed: registerOAuthProvider('${p.id}') was not readable afterwards — the ESM/CJS registry may be split`);
     }
   }
 }

@@ -29,7 +29,7 @@ import {
 import { evictSession } from '../model/core-agent/session-store';
 import { getActiveUserId } from './users';
 import { createLogger } from '../logger';
-import { t } from '../i18n';
+import { t, buildLanguageDirective } from '../i18n';
 
 // Custom skills live per-user at `<uid>/cloud/skills/`. Resolved lazily
 // from the active uid.
@@ -429,10 +429,10 @@ export async function listSkillTree(
 // ═══════════════════════════════════════════════════════════════════════
 
 export function validateSkillName(name: string): string {
-  if (!name) return '请填写技能名称';
-  if (name.length > 64) return '技能名称过长（最多 64 个字符）';
+  if (!name) return t('skills.errors.name_required');
+  if (name.length > 64) return t('skills.errors.name_too_long');
   if (!SKILL_NAME_RE.test(name)) {
-    return '技能名称需以字母开头，只能包含英文字母、数字、下划线（_）、连字符（-），字母之间可以用单个空格分隔';
+    return t('skills.errors.name_invalid');
   }
   return '';
 }
@@ -526,12 +526,12 @@ export async function createCustomSkill(name: string, description: string): Prom
   const err = validateSkillName(name);
   if (err) throw new Error(err);
   const d = customSkillDir(name);
-  if (fs.existsSync(d)) throw new Error(`技能「${name}」已存在，请换一个名称`);
+  if (fs.existsSync(d)) throw new Error(t('skills.errors.skill_exists', { name }));
   // Custom skills would silently shadow a same-named builtin in the
   // skill-registry first-wins resolution. Reject the create so the user
   // renames up front.
   if (fs.existsSync(path.join(BUILTIN_SKILLS_DIR, name))) {
-    throw new Error(`技能名「${name}」与内置技能冲突，请换一个名称`);
+    throw new Error(t('skills.errors.builtin_conflict', { name }));
   }
   fs.mkdirSync(d, { recursive: true });
   writeTextAtomicSync(path.join(d, 'SKILL.md'), skillMdContent(name, description));
@@ -575,9 +575,9 @@ export async function updateCustomSkill(
     const err = validateSkillName(newName);
     if (err) throw new Error(err);
     const target = customSkillDir(newName);
-    if (fs.existsSync(target)) throw new Error(`技能「${newName}」已存在，请换一个名称`);
+    if (fs.existsSync(target)) throw new Error(t('skills.errors.skill_exists', { name: newName }));
     if (fs.existsSync(path.join(BUILTIN_SKILLS_DIR, newName))) {
-      throw new Error(`技能名「${newName}」与内置技能冲突，请换一个名称`);
+      throw new Error(t('skills.errors.builtin_conflict', { name: newName }));
     }
     fs.renameSync(d, target);
     d = target;
@@ -796,19 +796,19 @@ export async function createFromUrl(
 ): Promise<ImportResult> {
   const trimmedUrl = (url || '').trim();
   if (!/^https?:\/\//i.test(trimmedUrl)) {
-    return { ok: false, error: 'URL 必须以 http(s):// 开头' };
+    return { ok: false, error: t('skills.errors.url_scheme') };
   }
 
   const effectiveName = (name || '').trim() || _defaultSkillNameFromUrl(trimmedUrl);
-  const effectiveDesc = (description || '').trim() || `从 ${trimmedUrl} 导入的技能（待整理）`;
+  const effectiveDesc = (description || '').trim() || t('skills.import.default_desc_url', { url: trimmedUrl });
 
   const created = await createCustomSkill(effectiveName, effectiveDesc);
-  if (!created) return { ok: false, error: '创建技能失败' };
+  if (!created) return { ok: false, error: t('skills.errors.create_failed') };
 
   return {
     ok: true,
     skill: created,
-    seedMessage: `帮我安装技能：${trimmedUrl}`,
+    seedMessage: t('skills.import.seed_url', { url: trimmedUrl }),
   };
 }
 
@@ -820,35 +820,35 @@ export async function createFromDir(
   srcDir: string,
 ): Promise<ImportResult> {
   if (!srcDir || !path.isAbsolute(srcDir)) {
-    return { ok: false, error: '请选择一个绝对路径的目录' };
+    return { ok: false, error: t('skills.errors.path_not_absolute') };
   }
   let realSrc: string;
   try { realSrc = fs.realpathSync(srcDir); }
-  catch { return { ok: false, error: '目录不存在' }; }
+  catch { return { ok: false, error: t('errors.dir_not_exists') }; }
 
   let st: fs.Stats;
   try { st = fs.statSync(realSrc); }
-  catch { return { ok: false, error: '目录无法访问' }; }
-  if (!st.isDirectory()) return { ok: false, error: '请选择目录（不是文件）' };
+  catch { return { ok: false, error: t('skills.errors.dir_inaccessible') }; }
+  if (!st.isDirectory()) return { ok: false, error: t('skills.errors.path_not_dir') };
 
   const black = _isBlacklistedImportSource(realSrc);
-  if (black.blocked) return { ok: false, error: `拒绝导入：${black.reason}` };
+  if (black.blocked) return { ok: false, error: t('skills.errors.import_refused', { reason: black.reason || '' }) };
 
   // Stats walk first so we fail fast before any copy.
   const { files, totalBytes } = _walkImportSource(realSrc);
-  if (files.length === 0) return { ok: false, error: '目录为空或全是被过滤的文件' };
+  if (files.length === 0) return { ok: false, error: t('skills.errors.dir_empty') };
   if (files.length > IMPORT_MAX_FILES) {
-    return { ok: false, error: `文件数超限（${files.length} > ${IMPORT_MAX_FILES}）` };
+    return { ok: false, error: t('skills.errors.too_many_files', { count: files.length, max: IMPORT_MAX_FILES }) };
   }
   if (totalBytes > IMPORT_MAX_BYTES) {
-    return { ok: false, error: `总大小超限（${(totalBytes / 1024 / 1024).toFixed(1)} MiB > 50 MiB）` };
+    return { ok: false, error: t('skills.errors.too_large', { mb: (totalBytes / 1024 / 1024).toFixed(1) }) };
   }
 
   const effectiveName = (name || '').trim() || _defaultSkillNameFromDir(realSrc);
-  const effectiveDesc = (description || '').trim() || `从本地目录导入的技能（待整理）`;
+  const effectiveDesc = (description || '').trim() || t('skills.import.default_desc_dir');
 
   const created = await createCustomSkill(effectiveName, effectiveDesc);
-  if (!created) return { ok: false, error: '创建技能失败' };
+  if (!created) return { ok: false, error: t('skills.errors.create_failed') };
 
   const skillDir = customSkillDir(created.id);
   try {
@@ -864,7 +864,7 @@ export async function createFromDir(
     log.warn(`import-dir copy failed skill=${created.id}: ${(err as Error).message}`);
     // Best-effort rollback: delete partially-copied skill
     try { await deleteCustomSkill(created.id); } catch { /* ignore */ }
-    return { ok: false, error: `复制文件失败：${(err as Error).message}` };
+    return { ok: false, error: t('skills.errors.copy_failed', { message: (err as Error).message }) };
   }
 
   // SKILL.md may have been overwritten by the import; drop cache either way.
@@ -876,7 +876,7 @@ export async function createFromDir(
   return {
     ok: true,
     skill: created,
-    seedMessage: `帮我安装技能：${realSrc}`,
+    seedMessage: t('skills.import.seed_dir', { path: realSrc }),
   };
 }
 
@@ -1027,7 +1027,7 @@ export function extractSkillFileBlocks(text: string): { cleanText: string; files
 }
 
 function skillFilesBlock(files: SkillFileInfo[]): string {
-  if (!files.length) return '  (空)';
+  if (!files.length) return '  (empty)';
   return files.map((f) => `  - ${f.path}  (${f.bytes || 0} B)`).join('\n');
 }
 
@@ -1054,14 +1054,15 @@ export async function buildSkillEditSystemPrompt(skill: {
   const zh = (skill.description_zh || '').trim() || (legacy && isChinese ? legacy : '');
   const en = (skill.description_en || '').trim() || (legacy && !isChinese ? legacy : '');
   const display = legacy || zh || en;
-  return prompts.load('chat_skill_setup', {
+  const body = prompts.load('chat_skill_setup', {
     skill_name: skill.name || '',
-    skill_description: display || '(未填写)',
-    skill_description_zh: zh || '(未填写)',
-    skill_description_en: en || '(未填写)',
+    skill_description: display || '(not provided)',
+    skill_description_zh: zh || '(not provided)',
+    skill_description_en: en || '(not provided)',
     skill_dir: skill.dir || '',
     skill_files: skillFilesBlock(files),
   });
+  return `${body}\n\n---\n\n${buildLanguageDirective()}`;
 }
 
 export interface SkillChatResult {

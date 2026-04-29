@@ -346,7 +346,7 @@ export function uploadContextFile(relpath: string, raw: Buffer | Uint8Array | nu
   const ext = extOf(p);
   if (!ALLOWED_EXTS.has(ext)) {
     const allowed = [...ALLOWED_EXTS].sort().join(', ');
-    return { ok: false, error: `仅支持以下格式（${allowed}）` };
+    return { ok: false, error: t('errors.contexts.formats_only', { allowed }) };
   }
   if (path.basename(p) === CONTEXTS_INDEX_FILENAME) {
     return { ok: false, error: t('errors.cant_edit_index') };

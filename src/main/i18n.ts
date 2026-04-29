@@ -111,6 +111,26 @@ export function getCurrentLang(): Lang {
   return _current;
 }
 
+// ── LLM language directive ───────────────────────────────────────────────
+// Appended at the tail of every conversational system prompt so the model
+// replies in the user's chosen UI language. Lives at the very end (after
+// runtime injection) — this is the most volatile part of the prompt, so
+// keeping it last avoids invalidating the KV-cache prefix.
+
+const LANG_NAMES: Record<Lang, string> = {
+  zh: 'Chinese (简体中文)',
+  en: 'English',
+};
+
+export function buildLanguageDirective(lang: Lang = _current): string {
+  const name = LANG_NAMES[lang] ?? LANG_NAMES.en;
+  return [
+    '## User language',
+    '',
+    `The user's UI language is set to **${name}**. All natural-language replies you write to the user (final text, form lead-ins, announcements, status notes) MUST be in ${name}. Tool calls, code, JSON payloads, structured tags (e.g. \`<agent>\`, \`<agent-input-form>\`), filenames and paths stay in their native form regardless of language.`,
+  ].join('\n');
+}
+
 // ── Lookup ───────────────────────────────────────────────────────────────
 
 /**

@@ -2,16 +2,17 @@
  * SkillRegistry — a single `SkillLoader` over Orkas's two skill roots,
  * shared by every core-agent chat request.
  *
- * Resolution order (见 CLAUDE.md §6)：
- *   1. <uid>/cloud/skills/      (用户自定义，同 id 覆盖 builtin)
- *   2. data/builtin/skills/     (内置，启动时按 hash 同步自 src/builtin/skills)
+ * Resolution order (see CLAUDE.md §6):
+ *   1. <uid>/cloud/skills/      (user-custom; same id overrides builtin)
+ *   2. data/builtin/skills/     (built-in; hash-synced from src/builtin/skills at startup)
  *
  * The loader caches by per-dir mtime, so `list()` is effectively free
  * between CRUD events. `features/skills.ts` can call `invalidateSkills()`
  * after a create/update/delete to force a re-scan before the next chat.
  *
- * `来源` 标签在本层计算（`skillSourceLabel`），不依赖 loader 的 basename
- * 推断——per-uid 迁移后两个根都以 `/skills` 结尾，basename 已不可用。
+ * The `Source` label is computed in this layer (`skillSourceLabel`), not
+ * by the loader's basename inference — after the per-uid migration both
+ * roots end in `/skills`, so basename is no longer distinguishing.
  */
 
 import * as path from 'node:path';
@@ -32,9 +33,10 @@ async function getPickDescription(): Promise<PickDescription> {
   return _pickDescription;
 }
 
-// `来源` 标签按根路径判定，而不是 `path.basename(source)` —— per-uid 迁移后两个
-// skill 根都以 `/skills` 结尾，basename 已失去区分力（见 CLAUDE.md §4）。只有
-// `BUILTIN_SKILLS_DIR` 是 builtin，其它（= `userSkillsDir(uid)`）一律 custom。
+// `Source` is decided by root path, not by `path.basename(source)` — after the
+// per-uid migration both skill roots end in `/skills`, so basename loses its
+// discrimination (see CLAUDE.md §4). Only `BUILTIN_SKILLS_DIR` counts as
+// builtin; everything else (= `userSkillsDir(uid)`) is custom.
 const BUILTIN_ROOT_RESOLVED = path.resolve(BUILTIN_SKILLS_DIR);
 function skillSourceLabel(source: string): 'builtin' | 'custom' {
   return path.resolve(source) === BUILTIN_ROOT_RESOLVED ? 'builtin' : 'custom';
@@ -44,12 +46,12 @@ async function renderSkillLines(specs: SkillSpec[]): Promise<string> {
   if (!specs.length) return '';
   const lang = getCurrentLang();
   const pick = await getPickDescription();
-  const lines = ['## 可用技能 (skills)', ''];
+  const lines = ['## Available skills (skills)', ''];
   for (const s of specs) {
     const source = skillSourceLabel(s.source);
     const description = pick(s, lang);
     const desc = description ? ` — ${description}` : '';
-    lines.push(`- **${s.name}** (来源: ${source})${desc}`);
+    lines.push(`- **${s.name}** (Source: ${source})${desc}`);
   }
   return lines.join('\n');
 }
@@ -103,7 +105,7 @@ export interface SystemPromptBlockOptions {
  *
  * When `opts.allowlist` is provided, only skills whose `id` is in the
  * allowlist are rendered. Rendering always goes through
- * `renderSkillLines` so the `来源` label is derived from the exact root
+ * `renderSkillLines` so the `Source` label is derived from the exact root
  * path rather than basename.
  */
 export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}): Promise<string> {

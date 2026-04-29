@@ -134,11 +134,11 @@ describe('prompts › default singleton', () => {
 // CJK font behavior of low-level PDF libs) so they're worth locking
 // against the canonical shared file.
 
-describe('prompts › chat_shared_rules 联网规则 invariants', () => {
+describe('prompts › chat_shared_rules web-search invariants', () => {
   it('empty search results require ≥2 alternate-strategy retries before declaring failure', () => {
     const body = prompts.load('chat_shared_rules', {});
-    expect(body).toMatch(/单次搜索空结果不代表放弃/);
-    expect(body).toMatch(/2\s*种以上不同策略/);
+    expect(body).toMatch(/single empty result is not a reason to give up/i);
+    expect(body).toMatch(/at least two different strategies/i);
   });
 
   it('distinguishes native search (no extra fetch) from internal/skill search (must fetch 3-5)', () => {
@@ -146,8 +146,8 @@ describe('prompts › chat_shared_rules 联网规则 invariants', () => {
     // is a real token-saving rule — locking the distinction so a future
     // rewrite doesn't collapse them back into a single "always fetch" line.
     const body = prompts.load('chat_shared_rules', {});
-    expect(body).toMatch(/原生搜索.*不要再.*web_fetch/s);
-    expect(body).toMatch(/3-5 个/);
+    expect(body).toMatch(/native model search[\s\S]*don't `web_fetch` again/i);
+    expect(body).toMatch(/3[–-]5 URLs/i);
   });
 });
 
@@ -156,15 +156,15 @@ describe('prompts › chat_shared_rules PDF toolchain invariants', () => {
 
   it('forbids hand-rolling reportlab / wkhtmltopdf / pypdf / pdfkit / LaTeX for PDFs', () => {
     const body = load();
-    expect(body).toMatch(/禁止.*reportlab/);
+    expect(body).toMatch(/Do not.*reportlab/);
     expect(body).toContain('wkhtmltopdf');
     expect(body).toContain('pypdf');
     // CJK font issue is the concrete reason — lock the justification in.
-    expect(body).toMatch(/CJK 字体/);
+    expect(body).toMatch(/CJK fonts/i);
   });
 
   it('forbids silent fallback from the built-in PDF tools to lower-level libs on error', () => {
     const body = load();
-    expect(body).toMatch(/不许\s*fallback/);
+    expect(body).toMatch(/do not fall back/i);
   });
 });

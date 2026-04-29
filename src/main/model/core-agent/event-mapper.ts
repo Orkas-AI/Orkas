@@ -22,6 +22,7 @@
  */
 
 import { createLogger } from '../../logger';
+import { t } from '../../i18n';
 import type { StreamEvent } from '../client';
 
 const log = createLogger('model');
@@ -79,24 +80,24 @@ function inputSummary(name: string, input: unknown, max = 80): string {
  */
 export function friendlyRetryReason(reason: string): string {
   const r = (reason || '').toLowerCase();
-  if (!r) return '网络异常';
+  if (!r) return t('errors.network');
   // 5xx gateway/upstream failures first — "504 Gateway Timeout" contains
   // the word "timeout" but is really an upstream problem, not our client.
   if (/\b(502|503|504)\b|bad gateway|service unavailable|gateway timeout/.test(r)) {
-    return '服务暂时不可用';
+    return t('errors.network.unavailable');
   }
   if (/\btimeout\b|etimedout|und_err_connect_timeout|und_err_headers_timeout|und_err_body_timeout/.test(r)) {
-    return '响应超时';
+    return t('errors.network.timeout');
   }
   if (/\bterminated\b|socket hang up|fetch failed|econnreset|epipe|und_err_socket/.test(r)) {
-    return '连接中断';
+    return t('errors.network.connection_dropped');
   }
-  if (/rate.?limit|429|too many requests/.test(r)) return '服务限流';
-  if (/\b500\b|internal server error/.test(r)) return '服务端错误';
-  if (/\b529\b|overloaded/.test(r)) return '服务繁忙';
-  if (/econnrefused/.test(r)) return '连接被拒绝';
-  if (/enetunreach|enetdown|eai_again/.test(r)) return '网络不可达';
-  return '网络异常';
+  if (/rate.?limit|429|too many requests/.test(r)) return t('errors.network.rate_limited');
+  if (/\b500\b|internal server error/.test(r)) return t('errors.network.server_error');
+  if (/\b529\b|overloaded/.test(r)) return t('errors.network.overloaded');
+  if (/econnrefused/.test(r)) return t('errors.network.refused');
+  if (/enetunreach|enetdown|eai_again/.test(r)) return t('errors.network.unreachable');
+  return t('errors.network');
 }
 
 /**
@@ -179,7 +180,7 @@ export async function* mapCoreAgentEvents(
 
       case 'retry': {
         const friendly = friendlyRetryReason(ev.reason);
-        const prefix = ev.attempt <= 1 ? '正在重试' : `正在第 ${ev.attempt} 次重试`;
+        const prefix = ev.attempt <= 1 ? t('model.retrying') : t('model.retrying_n', { attempt: ev.attempt });
         yield { type: 'progress', text: `${prefix}·${friendly}` };
         break;
       }

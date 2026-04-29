@@ -1066,8 +1066,6 @@ function _ensureConvCreateAgentInline() {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.setAttribute('data-i18n', 'chat.create_agent_inline');
-    btn.setAttribute('data-i18n-title', 'chat.create_agent_btn_title');
-    btn.title = '把这次对话沉淀成一个新的智能体';
     btn.textContent = t('chat.create_agent_inline');
     btn.addEventListener('click', () => {
       if (!currentCid) return;

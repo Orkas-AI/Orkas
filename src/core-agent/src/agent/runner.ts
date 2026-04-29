@@ -827,8 +827,8 @@ function buildSkillsGuidance(skillsIndex: string): string {
   if (skillsIndex) {
     // `skillsIndex` already opens with its own `## Available Learned Skills`
     // H2 (see SkillStore.renderSkillsIndex). Don't wrap it in another header
-    // — historically we used `### 可用技能` here, which collided semantically
-    // with the host's regular `## 可用技能 (skills)` block and led models to
+    // — historically we used `### Available skills` here, which collided semantically
+    // with the host's regular `## Available skills (skills)` block and led models to
     // confuse the two skill surfaces (using `skill_manage` for regular host
     // skills and getting "Skill not found").
     parts.push("", skillsIndex);

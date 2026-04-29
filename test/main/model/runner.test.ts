@@ -32,19 +32,19 @@ async function loadRunner() {
 }
 
 describe('runner › buildRunner auth gate', () => {
-  it('throws a clear 未配置模型 error when no entries exist and no env fallback', async () => {
+  it('throws a clear "no model configured" error when no entries exist and no env fallback', async () => {
     // Fresh tmpDir → no workspace/auth/auth-profiles.json → pickChatEntry
     // returns null. ANTHROPIC_API_KEY cleared in beforeEach.
     const { buildRunner } = await loadRunner();
     await expect(buildRunner({ sessionId: 'u1-gconv-x' })).rejects.toThrow(
-      /未配置模型/,
+      /No model configured/,
     );
   });
 
   it('includes a hint pointing the user to the settings page', async () => {
     const { buildRunner } = await loadRunner();
     await expect(buildRunner({ sessionId: 'u1-gconv-x' })).rejects.toThrow(
-      /设置.*API 密钥/,
+      /API key.*Settings|Settings.*API key/i,
     );
   });
 
@@ -63,10 +63,10 @@ describe('runner › buildRunner auth gate', () => {
     }
     // Either it succeeded (unlikely in unit test) or failed for a reason
     // OTHER than the auth gate.
-    if (err) expect((err as Error).message).not.toMatch(/未配置模型/);
+    if (err) expect((err as Error).message).not.toMatch(/No model configured/);
   });
 
-  it('throws the 未配置模型 error when auth-profiles.json has empty entries', async () => {
+  it('throws the "no model configured" error when auth-profiles.json has empty entries', async () => {
     // Simulate a user who opened settings, saved nothing, ended up with an
     // empty profiles file — pickChatEntry still returns null.
     const authDir = path.join(tmpDir, 'auth');
@@ -77,7 +77,7 @@ describe('runner › buildRunner auth gate', () => {
     );
     const { buildRunner } = await loadRunner();
     await expect(buildRunner({ sessionId: 'u1-gconv-x' })).rejects.toThrow(
-      /未配置模型/,
+      /No model configured/,
     );
   });
 });

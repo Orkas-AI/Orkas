@@ -95,7 +95,7 @@ async function _scanUid(uid: string): Promise<void> {
     if (now - prev < PING_COOLDOWN_MS) continue;
 
     const idleMin = Math.round((now - lastActive) / 60_000);
-    const reason = `任务已沉寂 ${idleMin} 分钟未推进。当前 in_progress 步骤：Step ${inProgress.index}「${inProgress.title}」${inProgress.assignee ? `（派给 ${inProgress.assignee}）` : ''}。请检查状态并决定继续推进、向用户确认、或标记失败。`;
+    const reason = `The task has been idle for ${idleMin} minutes with no progress. Current in_progress step: Step ${inProgress.index} "${inProgress.title}"${inProgress.assignee ? ` (assigned to ${inProgress.assignee})` : ''}. Please review the state and decide whether to keep going, confirm with the user, or mark it failed.`;
     try {
       const fired = await pingCommanderForWatchdog(uid, cid, reason);
       if (fired) _lastPingedAt.set(key, now);

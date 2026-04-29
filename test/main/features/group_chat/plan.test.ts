@@ -77,7 +77,7 @@ describe('group_chat plan', () => {
     });
     const ann = plan.formatPlanAnnouncement(r.plan);
     expect(ann).toContain('1. gather data（@Writer）');
-    expect(ann).toContain('2. analyze（我自己）');
+    expect(ann).toMatch(/2\. analyze（(我自己|me)）/);
   });
 
   it('formatPlanForPrompt encodes status icons + assignee + output_summary', async () => {
@@ -94,7 +94,7 @@ describe('group_chat plan', () => {
     expect(text).toContain('✓ Step 1: a [done]');
     expect(text).toContain('完成 a');
     expect(text).toContain('○ Step 2: b [pending]');
-    expect(text).toContain('派给 Writer');
+    expect(text).toContain('→ Writer');
   });
 
   it('round-trips full schema through JSON', async () => {

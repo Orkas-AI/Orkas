@@ -21,6 +21,7 @@ import type { AgentTool, LLMProvider } from '#core-agent';
 
 import { pickChatEntryGroup, bumpEntryLastUsed, type ChatEntryChoice } from '../../features/auth';
 import { getSystemPromptBlock } from './skill-registry';
+import { t } from '../../i18n';
 // tool-catalog.ts: TOOL_CATALOG kept as the source of truth for the drift
 // test (tool-catalog.test.ts asserts injected names ⊆ catalog) and for any
 // future targeted use; runtime no longer renders the prompt block from it.
@@ -129,11 +130,11 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const group = await pickChatEntryGroup();
   const primary: ChatEntryChoice | undefined = group[0];
   if (!primary && !process.env.ANTHROPIC_API_KEY) {
-    throw new Error('未配置模型，请到「设置」页添加 API 密钥或登录账号');
+    throw new Error(t('errors.no_model_configured'));
   }
 
   // Per-user disabled-skill set; passed into getSystemPromptBlock so the
-  // rendered `## 可用技能` block excludes user-disabled skills regardless
+  // rendered `## Available skills` block excludes user-disabled skills regardless
   // of agent-level allowlist. Resolved off the active uid (we don't have
   // params.userId yet for early auth-gate paths but session_id always carries
   // it). Falls back to empty set when uid can't be parsed (ad-hoc/test).

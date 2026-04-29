@@ -94,17 +94,17 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
   });
 
   // Regression: per-uid migration (CLAUDE.md §4) made both skill roots end
-  // in `/skills`, so deriving the `来源` tag from basename collapses to
+  // in `/skills`, so deriving the `Source` tag from basename collapses to
   // `skills` for every entry. `chat_commander.md` / `chat_agent_in_group.md`
-  // tell the LLM to pick a root by `来源: builtin|custom` — a degenerate label
+  // tell the LLM to pick a root by `Source: builtin|custom` — a degenerate label
   // sends it guessing and half the SKILL.md reads ENOENT on first try.
-  it('labels `来源` as builtin vs custom by root path, not basename', async () => {
+  it('labels `Source` as builtin vs custom by root path, not basename', async () => {
     writeSkill(builtinDir(), 'shipped', 'Shipped', 'desc-builtin');
     writeSkill(customDir(), 'mine', 'Mine', 'desc-custom');
     const { getSystemPromptBlock } = await loadRegistry();
     const text = await getSystemPromptBlock();
-    expect(text).toContain('来源: builtin');
-    expect(text).toContain('来源: custom');
-    expect(text).not.toContain('来源: skills');
+    expect(text).toContain('Source: builtin');
+    expect(text).toContain('Source: custom');
+    expect(text).not.toContain('Source: skills');
   });
 });

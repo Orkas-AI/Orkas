@@ -74,6 +74,7 @@ import {
 } from '../model/provider_catalog';
 import { isCooledDown, clearCooldown } from '../model/core-agent/profile-cooldown';
 import { createLogger } from '../logger';
+import { t } from '../i18n';
 
 const log = createLogger('auth');
 
@@ -1012,7 +1013,7 @@ export function submitOAuthInput(flowId: string, value: string): { ok: boolean }
   // against the browser callback).
   const resolver = flow.pendingInputResolver || flow.manualInputResolver;
   if (!resolver) return { ok: false };
-  flow.status = { kind: 'progress', message: '处理中…' };
+  flow.status = { kind: 'progress', message: t('auth.progress.processing') };
   resolver(val);
   return { ok: true };
 }

@@ -161,8 +161,8 @@ describe('skills › validateSkillName', () => {
 
   it('rejects empty/too-long', async () => {
     const s = await loadSkills();
-    expect(s.validateSkillName('')).toContain('填写');
-    expect(s.validateSkillName('a'.repeat(65))).toContain('过长');
+    expect(s.validateSkillName('')).toMatch(/Please enter|填写/);
+    expect(s.validateSkillName('a'.repeat(65))).toMatch(/too long|过长/);
   });
 
   it('rejects non-letter start', async () => {
@@ -346,14 +346,14 @@ describe('skills › createCustomSkill', () => {
   it('throws on duplicate custom id', async () => {
     writeCustomSkill('dup');
     const s = await loadSkills();
-    await expect(s.createCustomSkill('dup', '')).rejects.toThrow(/已存在/);
+    await expect(s.createCustomSkill('dup', '')).rejects.toThrow(/already exists|已存在/);
   });
 
   it('throws when name collides with builtin', async () => {
     const builtinDir = path.join(builtinSkillsDir(), 'fixed');
     fs.mkdirSync(builtinDir, { recursive: true });
     const s = await loadSkills();
-    await expect(s.createCustomSkill('fixed', '')).rejects.toThrow(/内置技能冲突/);
+    await expect(s.createCustomSkill('fixed', '')).rejects.toThrow(/conflicts with a built-in|内置技能冲突/);
   });
 });
 

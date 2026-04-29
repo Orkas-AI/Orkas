@@ -1,335 +1,336 @@
-# Orkas 架构与分层规范
-只放 LLM 读代码读不出来的内容——硬约束 / 反直觉决策的 Why / 踩过的坑。架构描述指向源码,不复述实现。
+# Orkas architecture and layering
+
+Only contents the LLM cannot derive from the source — hard constraints / the Why behind counter-intuitive decisions / pitfalls already hit. Architecture descriptions point at source, they do not restate the implementation.
 
 ---
 
-## 1. 项目形态
+## 1. Project shape
 
-单进程 Electron 桌面应用:main = Node 后端,renderer = vanilla HTML/CSS/JS,IPC 通信,本地文件存储。启动 `bootstrap.cjs` → tsx loader → `src/main/index.ts`,无 build。
+Single-process Electron desktop app: main = Node backend, renderer = vanilla HTML/CSS/JS, IPC for communication, local file storage. Startup: `bootstrap.cjs` → tsx loader → `src/main/index.ts`; no build step.
 
-**硬约束**:
-- main 不跑 HTTP / 不占端口 / 无鉴权
-- renderer 走 `contextBridge` 暴露的 `window.orkas.{invoke, stream}` 白名单 API;**不引** TS / JSX / webpack / vite
-- preload **必须 `.js`**(preload loader 不跑 tsx hook),路径 `src/main/preload.js`
-- 所有 LLM 调用走 in-process `core-agent`(`import('#core-agent')` 动态加载),无子进程。**Why**:避开 IPC 序列化,锁/取消/事件流共享内存
-- 存储以 JSON / JSONL 为主;sqlite 仅 KB 向量库一处。**Why**:用户数据要可读、可移植、对云同步友好(单文件 = 单同步单元)
-- **skill / agent / contexts 是三个一等公民**;多 agent 协同走 §5 群聊架构,**不再有"主 agent 调 RPC 子 agent"**
-- npm 依赖白名单见 `PC/package.json`(关键:`electron / pi-ai / better-sqlite3 / sqlite-vec / fastembed / onnxruntime-node / pdfjs-dist / pdf-lib / mammoth / jimp`)。**加新依赖需讨论**
-- renderer 第三方 JS/CSS 走 `src/renderer/vendor/<name>/` 静态资源,不进 npm。**Why**:contextBridge 沙盒里 `require` 不可用;走 npm 反而绕路
-- **跨平台**:macOS + Windows 双主力(Linux 社区级)。新代码优先跨平台方案(Node stdlib);需平台分支必须每分支真机验证,不得只跑通单平台
+**Hard constraints**:
+- main runs no HTTP / occupies no port / has no auth.
+- The renderer talks through the `contextBridge`-exposed `window.orkas.{invoke, stream}` allow-list API; **do not introduce** TS / JSX / webpack / vite.
+- Preload **must be `.js`** (the preload loader does not run the tsx hook); path is `src/main/preload.js`.
+- All LLM calls go through the in-process `core-agent` (`import('#core-agent')` dynamic load); no subprocesses. **Why:** avoid IPC serialization; locks / cancellation / event streams share memory.
+- Storage is JSON / JSONL primarily; sqlite is used in exactly one place — the KB vector store. **Why:** user data must stay readable, portable, and friendly to cloud sync (single file = single sync unit).
+- **skill / agent / contexts are three first-class citizens**; multi-agent collaboration follows the §5 group-chat architecture, with **no more "main agent calls subagent over RPC"**.
+- npm dependency allow-list is in `PC/package.json` (key entries: `electron / pi-ai / better-sqlite3 / sqlite-vec / fastembed / onnxruntime-node / pdfjs-dist / pdf-lib / mammoth / jimp`). **New dependencies require a discussion first.**
+- Renderer-side third-party JS/CSS goes through static assets at `src/renderer/vendor/<name>/`; not via npm. **Why:** `require` is unavailable inside the contextBridge sandbox; routing through npm is actually a detour.
+- **Cross-platform**: macOS + Windows are both primary (Linux is community-grade). New code prefers cross-platform implementations (Node stdlib); platform branches must be verified on real machines for each branch — getting one platform working is not enough.
 
 ---
 
-## 2. 目录布局
+## 2. Directory layout
 
 ```
-PC/                          Electron 项目根,唯一开发与打包入口
-├── bootstrap.cjs            tsx loader 注册 → require('./src/main')
-├── data/                    运行时数据(gitignored,详见 §4)
-├── userWorkSpace/           主对话默认 workspace(gitignored)
-├── src/main/                Node 后端(TS,tsx 运行态转译)
-│   ├── index.ts             Electron 生命周期 + IPC 注册
-│   ├── preload.js           contextBridge → window.orkas(必须 .js)
-│   ├── paths.ts             **唯一路径来源**,严禁散落硬编码
-│   ├── ipc/                 IPC handler(详见 §3)
-│   ├── features/            业务层(users / chats / group_chat / skills / agents / contexts / kb_* / auth / permissions / ...)
-│   ├── model/               模型调用层(in-process core-agent)
-│   ├── prompts/             *.md 模板
-│   └── util/                纯函数(locks / path-sandbox / extract-* / file_to_chunks / ...)
-├── src/renderer/            前端 UI(vanilla,详见 §8)
+PC/                          Electron project root, sole dev and packaging entry
+├── bootstrap.cjs            Registers the tsx loader → require('./src/main')
+├── data/                    Runtime data (gitignored, see §4)
+├── userWorkSpace/           Default workspace for the main conversation (gitignored)
+├── src/main/                Node backend (TS, transpiled at runtime by tsx)
+│   ├── index.ts             Electron lifecycle + IPC registration
+│   ├── preload.js           contextBridge → window.orkas (must be .js)
+│   ├── paths.ts             **Single source of truth for paths**; never scatter hard-coded paths
+│   ├── ipc/                 IPC handlers (see §3)
+│   ├── features/            Business layer (users / chats / group_chat / skills / agents / contexts / kb_* / auth / permissions / ...)
+│   ├── model/               Model-call layer (in-process core-agent)
+│   ├── prompts/             *.md templates
+│   └── util/                Pure functions (locks / path-sandbox / extract-* / file_to_chunks / ...)
+├── src/renderer/            Frontend UI (vanilla, see §8)
 ├── src/core-agent/          AgentRunner / providers / PersistentSession / SkillLoader
-└── src/builtin/skills/      内置技能源(启动按 hash 同步到 data/builtin/skills/)
+└── src/builtin/skills/      Built-in skill source (synced by hash to data/builtin/skills/ on startup)
 ```
 
-**运行态数据位置**:dev = `PC/data/` + `PC/userWorkSpace/`;打包后 = `<container>/{data,userWorkSpace}/`,container 选址 macOS/Linux → `~/.orkas/`,Windows → 字母最小的非系统固定盘 `<drive>:\.orkas\`(无则 `C:\`)。完整选盘逻辑详见 `src/main/packaged-data-root.ts`。
+**Runtime data location**: dev = `PC/data/` + `PC/userWorkSpace/`; packaged = `<container>/{data,userWorkSpace}/`, where the container is chosen as macOS/Linux → `~/.orkas/`, Windows → the lowest-letter non-system fixed drive `<drive>:\.orkas\` (falling back to `C:\` if none). Full drive selection logic lives in `src/main/packaged-data-root.ts`.
 
 ---
 
-## 3. 分层约束
+## 3. Layering constraints
 
 ```
-ipc/                IPC handler:参数校验 + 调 features;不做 IO、不做业务
-features/           业务层:编排 storage + model + prompts;不知道 IPC
-model/              模型调用层;client.ts re-export,实现在 model/core-agent/
-model/core-agent/   本地适配 + 工具覆盖
-storage.ts          文件 IO helper(只能用标准库)
-prompts/            模板加载器(只能用标准库)
-i18n.ts             UI 语言表 lookup(只能标准库 + locales/*.json,严禁 import features / model)
-util/               纯函数工具(只能用标准库或单一第三方依赖,**禁反向 import features/model**)
+ipc/                IPC handlers: arg validation + call into features; no IO, no business logic
+features/           Business layer: orchestrates storage + model + prompts; knows nothing about IPC
+model/              Model-call layer; client.ts re-exports, implementation in model/core-agent/
+model/core-agent/   Local adapters + tool overrides
+storage.ts          File IO helpers (stdlib only)
+prompts/            Template loader (stdlib only)
+i18n.ts             UI language table lookup (stdlib + locales/*.json only; never imports features / model)
+util/               Pure-function utilities (stdlib only or single third-party dep; **never reverse-import features/model**)
 ```
 
-**require 规则**:
+**Require rules**:
 - `index.ts` / `ipc/` → `features/` / `storage` / `paths` / `prompts`
-- `features/` → `storage` / `paths` / `prompts` / `model` / `util` / 同级 features
-- `model/core-agent/` → 动态 `import('#core-agent')`;锁走 `util/locks`;**禁读写 data/ 下业务数据**(仅 session jsonl)。**Why**:模型层无状态,业务编排只在 features;模型层动业务数据 = 双写 = 状态错乱
+- `features/` → `storage` / `paths` / `prompts` / `model` / `util` / sibling features
+- `model/core-agent/` → dynamic `import('#core-agent')`; locks via `util/locks`; **never read or write business data under data/** (only session jsonl). **Why:** the model layer is stateless; orchestration of business state lives only in features. The model layer touching business data = double-write = state desync.
 
-**model/core-agent 关键约束**(实现详见各 *-tool.ts 头注释):
-- **新增工具** = `tool-catalog.ts::TOOL_CATALOG` 加条目(反漂移测试要用) + runner 注册;system prompt 顺序固定 `[systemPrompt → skillsBlock]`(KV cache 稳定前缀在前)。**工具说明只走 SDK tool-use 协议的 API tools 字段**(完整 description + JSON schema),**禁止再注入"## 可用工具"块到 prompt** —— 重复且消耗 input token + 可变前缀污染 cache
-- **文件类工具** 入口统一过 `util/path-sandbox.isPathAllowed`
-- **`sdk-timeout-patch.ts`** 必须在 `index.ts` 中 logger init 后、任何 feature import 前调,顺序不能改
-- **`#core-agent` 只能 dynamic `await import('#core-agent')`,不能顶层 `import { x } from '#core-agent'`**——顶层静态 import 在 main 启动早期同步加载 core-agent + 它依赖的 pi-ai,先于 `sdk-timeout-patch` 跑;且 pi-ai package.json 没 `exports` 字段,ESM 解析路径会 `ERR_PACKAGE_PATH_NOT_EXPORTED` 直接挂掉。所有从 `#core-agent` 拿值的地方按 `getLoader()` / `getPickDescription()` 的 lazy 单例模式,首次使用时 `await import` + 缓存
-- **工具产出** 经 `util/tool-result-cap.ts::wrapToolWithCap` 过 per-tool 上限(默认 100K,`read_file`/`kb_read` 豁免,超 50K 落盘 `tool-results/<sid>/`)
+**Key model/core-agent constraints** (each *-tool.ts has a header comment with the implementation details):
+- **Adding a new tool** = entry in `tool-catalog.ts::TOOL_CATALOG` (the anti-drift test relies on this) + register with the runner; system-prompt order is fixed `[systemPrompt → skillsBlock]` (KV-cache stable prefix first). **Tool descriptions go only through the SDK tool-use protocol's API tools field** (full description + JSON schema); **do not inject a "## Available tools" block into the prompt** — that's both duplication and a variable prefix that pollutes the cache.
+- **File-class tools** must funnel through `util/path-sandbox.isPathAllowed` at the entrypoint.
+- **`sdk-timeout-patch.ts`** must be invoked in `index.ts` after logger init and before any feature import; the order cannot change.
+- **`#core-agent` may only be loaded with dynamic `await import('#core-agent')`, never with top-level `import { x } from '#core-agent'`** — a top-level static import would synchronously load core-agent + its `pi-ai` dependency early in main startup, before `sdk-timeout-patch` runs; and the pi-ai package.json lacks an `exports` field, so ESM resolution dies with `ERR_PACKAGE_PATH_NOT_EXPORTED`. Every place that pulls a value from `#core-agent` follows the lazy singleton pattern of `getLoader()` / `getPickDescription()` — `await import` on first use, then cache.
+- **Tool output** is wrapped through `util/tool-result-cap.ts::wrapToolWithCap` enforcing per-tool caps (default 100K; `read_file`/`kb_read` exempted; over 50K spills to disk under `tool-results/<sid>/`).
 
-**features 函数约定**:返回对象 + 错误用 `{ok:false, error}` 或 throw(IPC handler 统一包装);涉及用户私域的函数 `userId` 必须是第一参数。
+**features function conventions**: return objects + represent errors as `{ok:false, error}` or throw (the IPC handler unifies wrapping); for any function dealing with user-private data, `userId` must be the first argument.
 
-**IPC 通道**:`orkas.invoke`(请求/响应)/ `orkas.streamStart`(事件流 `stream:<requestId>`,以 `{type:'done'}` 终止)/ `orkas.streamCancel`。
+**IPC channels**: `orkas.invoke` (request/response) / `orkas.streamStart` (event stream `stream:<requestId>`, terminated by `{type:'done'}`) / `orkas.streamCancel`.
 
-**Prompt md 内容卫生**(`src/main/prompts/*.md` 注入 LLM,**禁止**):
-1. 项目名 / 品牌字样(`Orkas` 等,改"本系统"中性词)
-2. OS 真实路径字面量(`/Users/...` / `C:\Users\...`,改抽象描述或 `<abs-path>` 占位;`prompts.load(name, vars)` 注入的 `$variable` 允许)
-3. 项目特定目录名(`PC/data` / `userWorkSpace`)
+**Prompt-md content hygiene** (`src/main/prompts/*.md` is injected into the LLM, **prohibited**):
+1. Project name / brand strings (`Orkas` etc.; replace with neutral wording such as "this system").
+2. Real OS path literals (`/Users/...` / `C:\Users\...`; replace with abstract descriptions or the `<abs-path>` placeholder; `$variable` placeholders injected via `prompts.load(name, vars)` are allowed).
+3. Project-specific directory names (`PC/data` / `userWorkSpace`).
 
-例外:环境变量名带项目前缀(`ORKAS_NODE` / `ORKAS_PC_DIR`)在 bash 里实际引用时允许。新增/改 prompt 前 `grep "Orkas\|/Users/\|/home/\|PC/data\|PC/src" src/main/prompts/*.md` 应当干净。
+Exception: env-var names with the project prefix (`ORKAS_NODE` / `ORKAS_PC_DIR`) are allowed when actually referenced in bash. Before adding/changing a prompt, `grep "Orkas\|/Users/\|/home/\|PC/data\|PC/src" src/main/prompts/*.md` should come back clean.
 
-**跨 prompt 共享核心规则的同步约束**:同一领域概念在多个 prompt md 出现时(典型:`<agent>` 容器创建在 `chat_agent_setup.md`(迭代式编辑)和 `chat_commander.md`(一次性沉淀)都有),认 1 个权威 prompt 作真理源(如 `<agent>` 真理源 = `chat_agent_setup.md`),下游侧只带共性原则(workflow 拆"输入→动作→产出" / 工具优先级 / `<interactive>` 判定 / 散文禁词等),字段细则 / schema 表 / 完整翻译表不照搬。**动真理源前** `grep -E "<agent>|<workflow>|<skills>|<inputs>|<interactive>|<description_zh>|<description_en>|<<<skill-file>>>|agent-input-form|agent-input-submission" src/main/prompts/*.md` 找下游核对;新增规则若与下游相关必须同步过去。loader 不做模板组合(只 `$variable` 替换),靠 caller 主动同步 + git review 卡漏。
+**Cross-prompt sync constraint for shared core rules**: when the same domain concept appears across multiple prompt mds (typical example: `<agent>` container creation appears in both `chat_agent_setup.md` (iterative editing) and `chat_commander.md` (one-shot finalization)), pick one authoritative prompt as the source of truth (e.g. `<agent>` truth source = `chat_agent_setup.md`); downstream sites carry only the shared principles (workflow split into "input → action → output" / tool priority / `<interactive>` decision rules / forbidden prose tokens), and **do not** copy field details / schema tables / full translation tables. **Before touching the truth source**, run `grep -E "<agent>|<workflow>|<skills>|<inputs>|<interactive>|<description_zh>|<description_en>|<<<skill-file>>>|agent-input-form|agent-input-submission" src/main/prompts/*.md` to find downstream sites and reconcile; new rules that affect downstream must be propagated. The loader does not do template composition (only `$variable` substitution), so consistency relies on the caller actively syncing + git review catching gaps.
 
 ---
 
-## 4. data 同步域
+## 4. data sync domains
 
-顶层三分:**☁️ cloud**(用户私域,跨设备同步)/ **🔒 local**(本机私域,永不同步)/ **🌐 top-level**(全局公共)。
+Top-level three-way split: **☁️ cloud** (user-private, synced across devices) / **🔒 local** (machine-private, never synced) / **🌐 top-level** (globally shared).
 
 ```
 PC/data/
-├── users.json                 🌐 本机 uid 注册表 + current_user_id
-├── logs/                      🌐 本机日志(按天滚动,多 uid 共享)
-├── builtin/{agents,skills}/   🌐 启动时按 hash 同步自 src/builtin/(运行时副本,手改会被覆盖)
+├── users.json                 🌐 Local uid registry + current_user_id
+├── logs/                      🌐 Local logs (rolled daily, shared across uids)
+├── builtin/{agents,skills}/   🌐 Synced by hash from src/builtin/ at startup (runtime copy; manual edits get overwritten)
 └── <user_id>/
-    ├── cloud/                 ☁️ 云同步域
-    │   ├── chats/<cid>.jsonl  + chats/<cid>/{members,state,plan,visibility/}  群聊运行态(详见 §5)
-    │   ├── chats/{skill,agent}/<id>/chat.{json,jsonl}                          编辑会话
-    │   ├── chat_attachments/<cid>/    主对话附件池(零预处理)
+    ├── cloud/                 ☁️ Cloud-sync domain
+    │   ├── chats/<cid>.jsonl  + chats/<cid>/{members,state,plan,visibility/}  group-chat runtime state (see §5)
+    │   ├── chats/{skill,agent}/<id>/chat.{json,jsonl}                          edit sessions
+    │   ├── chat_attachments/<cid>/    Main-conversation attachment pool (zero pre-processing)
     │   ├── sessions/<sid>.jsonl       core-agent PersistentSession
-    │   ├── contexts/                  KB 用户直管目录树 + .kb/vector.db(详见 §7)
+    │   ├── contexts/                  KB user-managed directory tree + .kb/vector.db (see §7)
     │   ├── memory/MEMORY.md + USER.md
-    │   ├── agents/<aid>/              自定义 agent: agent.json(spec) + meta/(元认知) + skills/(自演进 SkillStore)
-    │   ├── skills/<sid>/              自定义 skill(System A,SkillLoader 扫描)
+    │   ├── agents/<aid>/              Custom agent: agent.json (spec) + meta/ (metacognition) + skills/ (self-evolved SkillStore)
+    │   ├── skills/<sid>/              Custom skills (System A, scanned by SkillLoader)
     │   └── config/{preferences,component-enabled}.json
-    └── local/                 🔒 本机域(永不同步)
+    └── local/                 🔒 Machine-private domain (never synced)
         ├── config/            auth-profiles / permissions / reflection-state / web-search-cache
-        ├── search/            派生索引(contexts / chats / skill_chats / agent_chats)
-        ├── file_cache/<hash>/ 所有文件 lazy 缓存(详见 features/file_indexer.ts)
-        └── tool-results/<sid>/ 超大工具输出落盘
+        ├── search/            Derived indexes (contexts / chats / skill_chats / agent_chats)
+        ├── file_cache/<hash>/ Lazy cache for all files (see features/file_indexer.ts)
+        └── tool-results/<sid>/ Spill for oversized tool outputs
 ```
 
-**五点强约束**:
-1. **顶层只能** `users.json` / `logs/` / `builtin/` / `<uid>/`,单用户数据必须落 `<uid>/{cloud,local}/`
-2. **`data/builtin/{agents,skills}/` 是运行时副本**:启动按 hash 同步自 `src/builtin/`;agent 走目录形态(`<aid>/agent.json`),skill 走目录形态(`<sid>/SKILL.md`);loader 扫描 `[<uid>/cloud/, data/builtin/]`,custom 优先覆盖同 id builtin;`kind` 由 spec 的 root 判断(目录里**无** `custom/` / `builtin/` 层)
-3. **agent 目录形态(per-agent 资产聚合)**:`<uid>/cloud/agents/<aid>/` 内含 `agent.json`(UI 唯一展示来源,纯 spec)+ `meta/`(元认知:COMPETENCE.md + LEARNING_STRATEGIES.md)+ `skills/`(SkillStore 自演进 skill,只对该 agent 可见,不进 SkillLoader system prompt block)。删 agent = `rm -rf <aid>/` 一刀切,不再 cascade。详见 docs/plans/agent-as-directory.md。**禁**回到旧的顶层 `meta/` 或 `PC/skills/`(SkillStore 默认 cwd)
-4. **`search/` 索引纯派生**:永不同步;查询前 mtime+size reconcile 自愈;1s 防抖 flush + `before-quit` 强 flush;schema 变化或损坏自动 rebuild
-5. **KB 向量库纳入云同步**:冲突取较新 mtime,失败方启动期 `kb_indexer.reconcile(uid)` 按 sha1 对账自愈。**journal 模式 DELETE 不 WAL**(避免 `.db-wal` / `.db-shm` 旁落文件需要也同步,实测会撕裂)
+**Five hard constraints**:
+1. **At top level**, only `users.json` / `logs/` / `builtin/` / `<uid>/` are allowed; per-user data must land under `<uid>/{cloud,local}/`.
+2. **`data/builtin/{agents,skills}/` is a runtime copy**: synced by hash from `src/builtin/` at startup. Agents are directories (`<aid>/agent.json`); skills are directories (`<sid>/SKILL.md`). The loader scans `[<uid>/cloud/, data/builtin/]`; custom takes precedence over a builtin with the same id. `kind` is decided by the spec's root (there is **no** `custom/` / `builtin/` layer inside the directory).
+3. **Agent directory shape (per-agent asset aggregation)**: `<uid>/cloud/agents/<aid>/` contains `agent.json` (the sole UI display source — pure spec) + `meta/` (metacognition: COMPETENCE.md + LEARNING_STRATEGIES.md) + `skills/` (SkillStore self-evolved skills, visible only to this agent, not injected into the SkillLoader system-prompt block). Deleting an agent = `rm -rf <aid>/`, no cascade. See `docs/plans/agent-as-directory.md`. **Do not** revert to the old top-level `meta/` or `PC/skills/` (the SkillStore default cwd).
+4. **`search/` indexes are purely derived**: never synced; mtime+size reconcile self-heals before each query; 1-second debounced flush + force flush on `before-quit`; rebuild automatically on schema change or corruption.
+5. **The KB vector store is part of cloud sync**: on conflict take the newer mtime; the loser's startup `kb_indexer.reconcile(uid)` reconciles by sha1. **Journal mode is DELETE, not WAL** (avoiding `.db-wal` / `.db-shm` sidecar files that would themselves need syncing — empirically that tears).
 
-**uid 生命周期**(`features/users.ts`):启动时 `initActiveUser()` 读/建 `users.json`(8 位数字 uid);`activateUser(uid)` 负责骨架 mkdir + 注入 `process.env.CORE_AGENT_AUTH_DIR` + 清缓存。所有 user-scoped feature 通过 `getActiveUserId()` 取 uid(未激活 throw)。本期单活跃 uid。
+**uid lifecycle** (`features/users.ts`): on startup, `initActiveUser()` reads or creates `users.json` (8-digit numeric uids); `activateUser(uid)` is responsible for skeleton mkdir + injecting `process.env.CORE_AGENT_AUTH_DIR` + clearing caches. All user-scoped features get the uid via `getActiveUserId()` (throws if not activated). One active uid at a time for now.
 
 ---
 
-## 5. 对话 / session 隔离(核心安全约束)
+## 5. Conversation / session isolation (core security invariant)
 
-| 对话类型 | UI 消息列表 | session_id |
+| Conversation type | UI message list | session_id |
 |---|---|---|
-| 主对话(群聊)— commander | `<uid>/cloud/chats/<cid>.jsonl` | `<uid>-gconv-<cid>` |
-| 主对话(群聊)— agent worker | `<uid>/cloud/chats/<cid>/visibility/<aid>.jsonl` | `<uid>-gmember-<cid>-<aid>` |
-| 技能编辑 | `<uid>/cloud/chats/skill/<sid>/chat.jsonl` | `<uid>-skill-<sid>` |
-| 智能体编辑 | `<uid>/cloud/chats/agent/<aid>/chat.jsonl` | `<uid>-agent-<aid>` |
-| KB 图片理解 | (无 UI) | `<uid>-extract-img-<hex>` |
+| Main conversation (group chat) — commander | `<uid>/cloud/chats/<cid>.jsonl` | `<uid>-gconv-<cid>` |
+| Main conversation (group chat) — agent worker | `<uid>/cloud/chats/<cid>/visibility/<aid>.jsonl` | `<uid>-gmember-<cid>-<aid>` |
+| Skill editing | `<uid>/cloud/chats/skill/<sid>/chat.jsonl` | `<uid>-skill-<sid>` |
+| Agent editing | `<uid>/cloud/chats/agent/<aid>/chat.jsonl` | `<uid>-agent-<aid>` |
+| KB image understanding | (no UI) | `<uid>-extract-img-<hex>` |
 
-session jsonl 落 `<uid>/cloud/sessions/<session_id>.jsonl`,与 UI 消息列表是**两份独立文件**。
+session jsonl files land at `<uid>/cloud/sessions/<session_id>.jsonl` — they are **two independent files** from the UI message list.
 
-**安全不变量**:`session_id` 必为 `<uid>-<kind>-<tail>`,uid 必在第一段,`<kind>` ∈ `gconv | gmember | skill | agent | extract-img | reflect | memory-extract | anon`(`sub` / `organizer` / `conv` 是历史 kind,新代码不再生成,但 `migrate-session-ids` 会保留这些老文件)。`session-store.ts::sessionFileFor()` 强制断言,防止跨 uid 泄漏。**禁止**把品牌名 / 任何 app 名编进 session_id —— 改名 / 分叉时会直接断历史,启动期 `migrateLegacySessionIds(uid)` 一次性剥旧前缀,新代码绝不再加。新增 kind 必须追加本表。
+**Security invariant**: `session_id` must be `<uid>-<kind>-<tail>`, with the uid in the first segment, and `<kind>` ∈ `gconv | gmember | skill | agent | extract-img | reflect | memory-extract | anon` (`sub` / `organizer` / `conv` are legacy kinds; new code does not generate them, but `migrate-session-ids` preserves these older files). `session-store.ts::sessionFileFor()` enforces this with hard assertions to prevent cross-uid leakage. **Do not** encode brand names (`orkas-` / `aiteam-` / any app name) into session_id — we hit the renaming-breaks-history pitfall once, the startup `migrateLegacySessionIds(uid)` strips legacy prefixes once, and new code never adds them again. Adding a new kind requires extending this table.
 
-**skill 注入策略**:编辑会话 + 群聊 commander = 不过滤(注入全部);群聊 agent worker = 按 `agent.skill_list` 三态过滤(详见 §6)。
+**Skill injection policy**: edit conversations + group-chat commander = no filtering (inject all); group-chat agent worker = filter by `agent.skill_list` three-state (see §6).
 
-**prompt cache 约定**:连续会话(`gconv-* / gmember-* / skill-* / agent-*`)默认 `cacheRetention: 'short'`;一次性调用(memory / 反思 / KB 图片)不传。pi-ai 已封装 provider 差异(features 层不做分支)。`'long'` 默认不启用(Anthropic 1h 有 2× write 溢价)。
+**Prompt-cache convention**: continuous sessions (`gconv-* / gmember-* / skill-* / agent-*`) default to `cacheRetention: 'short'`; one-shot calls (memory / reflection / KB image) do not pass it. pi-ai already abstracts provider differences (the features layer does no branching). `'long'` is off by default (Anthropic's 1h has a 2× write surcharge).
 
-**加新对话类型**:UI 路径含 `user_id` 段 + session_id 用 `<uid>-<kind>-<tail>` 三段格式(uid 在第一段,**不加任何品牌前缀**)+ 对话级规则走 `ChatOptions.systemPrompt`(每次重构造,**不要拼到用户消息首条前缀**)+ 更新本表。
+**Adding a new conversation type**: UI path must contain a `user_id` segment + session_id uses the `<uid>-<kind>-<tail>` three-segment format (uid first segment, **no brand prefix**) + conversation-level rules go through `ChatOptions.systemPrompt` (rebuilt every time, **don't splice them into the first user message as a prefix**) + update this table.
 
-### 群聊架构(`features/group_chat/`)
+### Group-chat architecture (`features/group_chat/`)
 
-成员 = `commander` + `user` + N 个 `agent` actor(首次被 `dispatch_to` / `plan_set` 派活的 agent 自动入群)。每 actor 独立 worker loop,**无 RPC**。
+Members = `commander` + `user` + N `agent` actors (any agent first targeted by `dispatch_to` / `plan_set` is auto-added to the group). Each actor runs an independent worker loop, **no RPC**.
 
-**派活通道**(LLM → 系统的控制流必走结构化通道,跟 `<agent>` / `agent-input-form` 风格一致):
-- 单 agent → `dispatch_to({to, message})` 工具(commander / agent 都能用)
-- 多 actor 协作 → `plan_set({steps})` 工具
-- user 发的消息 → 文本 `@<name>` 仍解析(user UX 不变)
-- **commander / agent 写在散文里的 `@<name>` 系统不识别为派活信号**(LLM 训练惯性常把 `@` 当 markdown 装饰,以前误触发反复出 bug)
-- `dispatch_to` 调用时只 stage,recipient worker 在 commander turn 完整收尾后才被唤醒(避免抢跑;同 `plan_set` 的 `pendingPlanAnnouncement` + 延迟 reconcile 模式)
+**Dispatch channels** (LLM → system control flow always goes through structured channels, consistent with the `<agent>` / `agent-input-form` style):
+- Single agent → `dispatch_to({to, message})` tool (usable by both commander and agents).
+- Multi-actor coordination → `plan_set({steps})` tool.
+- User-sent messages → text `@<name>` is still parsed (user UX unchanged).
+- **`@<name>` written into prose by commander / agents is NOT recognized as a dispatch signal** (LLM training tends to use `@` as markdown decoration; this used to mis-trigger and produced recurring bugs).
+- `dispatch_to` calls only stage; the recipient worker is woken up only after the commander turn fully wraps up (avoiding races; same `pendingPlanAnnouncement` + delayed reconcile pattern as `plan_set`).
 
-**单一调度原语**:`bus.ts::enqueue(uid, cid, fromActorId, text, [forceTo], ...)` 是 group_chat 唯一对外控制流入口。`dispatch_to` / `plan_executor` / 文本 @ (仅 user) 都最终落到这一个 enqueue。**不准新建并行 enqueue 函数**;新派活路径必须经过它。
+**Single dispatch primitive**: `bus.ts::enqueue(uid, cid, fromActorId, text, [forceTo], ...)` is the only external control-flow entry point for group_chat. `dispatch_to` / `plan_executor` / text @ (user only) all funnel into this single enqueue. **Do not** introduce parallel enqueue functions; new dispatch paths must go through it.
 
-**关键约束**:
-- **可见性切片**(安全不变量):agent X 只看 `from==X ∨ to∋X ∨ mentions∋X`;worker 必须只走 `visibility.readSlice`,**禁止读全量 `<cid>.jsonl`**(会跨 actor 泄漏私有上下文)
-- **plan**:commander 用 `plan_set` 工具写 `<cid>/plan.md`;**禁工具外手改**(破坏首次公告语义 + UI `plan_changed` 事件链)
-- **abort**:`groupChat.abort(cid)` = 唯一群级停止(清所有 actor queue + abort in-flight + 标 `state.json.status='aborted'`,plan.md 保留作进度);**无 per-stream 终止按钮**
-- **死循环兜底**:`MAX_WORKER_TURNS=100`(轮次维度,**不是时间**),与外层 `idleTimeout=600s` 两层独立兜底
-- **结构化输出**:commander 的 `<agent>...</agent>` 容器(创建/编辑 agent)、agent 的 ```agent-input-form` fenced 块(表单);格式与流水线详见 `bus.ts::runTurn` + `prompts/chat_*.md`
-- **删除级联**:`chats.deleteConversation` → `groupChat.dropConv` 一站式
+**Key constraints**:
+- **Visibility slice** (security invariant): agent X sees only messages where `from==X ∨ to∋X ∨ mentions∋X`; workers must go through `visibility.readSlice` and **never read the full `<cid>.jsonl`** (which would leak other actors' private context).
+- **plan**: the commander writes `<cid>/plan.md` only via the `plan_set` tool; **no out-of-tool hand edits** (which would break the first-announcement semantics + UI `plan_changed` event chain).
+- **abort**: `groupChat.abort(cid)` is the sole group-level stop (clears every actor queue + aborts in-flight + sets `state.json.status='aborted'`; plan.md is preserved as a progress record); **no per-stream stop button**.
+- **Infinite-loop guard**: `MAX_WORKER_TURNS=100` (turns dimension, **not time**); paired with the outer `idleTimeout=600s`, two independent fallbacks.
+- **Structured outputs**: the commander's `<agent>...</agent>` container (create/edit agent), and the agent's ```agent-input-form``` fenced block (forms); format and pipeline details are in `bus.ts::runTurn` + `prompts/chat_*.md`.
+- **Delete cascade**: `chats.deleteConversation` → `groupChat.dropConv` is the one-stop call.
 
-### 附件(仅主对话)
+### Attachments (main conversation only)
 
-存 `<uid>/cloud/chat_attachments/<cid>/<file>`,**零预处理**;extract / 压缩 lazy 走 `<uid>/local/file_cache/<hash>/`(详见 `features/file_indexer.ts`)。
+Stored at `<uid>/cloud/chat_attachments/<cid>/<file>`, **zero pre-processing**; extract / compression are lazy under `<uid>/local/file_cache/<hash>/` (see `features/file_indexer.ts`).
 
-**关键约束**:
-- file-tools scope = active workspace ∪ 当前 cid 附件目录,越界 `E_PATH_OUT_OF_SCOPE`
-- pdf/docx 必须**先 `stat_file` 再 `read_file`**(read_file 返 `E_NEED_STAT`,职责单一,见 §9 不要做)
-- `chat-media://cid/<encCid>/<encName>` per-conv 附件;`chat-media://local/<abs>` 任意本地媒体(扩展名白名单 + 大小上限,**不做目录白名单**——威胁模型是"用户跑自己的 LLM")
-- 视频白名单 `.mp4/.webm/.mov/.m4v/.ogv`(200MB 上限),**纯展示不喂模型**
+**Key constraints**:
+- file-tools scope = active workspace ∪ the attachment dir of the current cid; out-of-bounds → `E_PATH_OUT_OF_SCOPE`.
+- For pdf/docx, **`stat_file` must run before `read_file`** (read_file returns `E_NEED_STAT` — single responsibility, see §9 Don't do).
+- `chat-media://cid/<encCid>/<encName>` is a per-conv attachment URL; `chat-media://local/<abs>` references arbitrary local media (extension allow-list + size cap; **no directory allow-list** — the threat model is "users running their own LLM").
+- Video allow-list is `.mp4/.webm/.mov/.m4v/.ogv` (200 MB cap), **for display only, not fed to the model**.
 
-### 本机执行工具
+### Local execution tools
 
-`bash / write_file / markdown_to_pdf / html_to_pdf / generate_image` 共用 `localExec.granted` 权限门(设置页 grant/revoke,每次 `execute()` 重读,mid-conv 即时生效);未授权 → `isError=true`。`web_search` 走 `searchProfiles[0]` → 付费 API → fallback builtin。产出经 `ChatOptions.onFileWritten` 收集,renderer 绿色 chip → IPC `workspace.revealPath`(严格校验落 workspace 内)。详见 `model/core-agent/{local-tools, image-gen-tool, search-tools}.ts`。
+`bash / write_file / markdown_to_pdf / html_to_pdf / generate_image` share the `localExec.granted` permission gate (grant/revoke from the settings page, re-read on every `execute()` so it takes effect mid-conversation); unauthorized → `isError=true`. `web_search` goes through `searchProfiles[0]` → paid API → fallback built-in. Outputs are collected via `ChatOptions.onFileWritten`; the renderer shows green chips → IPC `workspace.revealPath` (strictly validated to stay inside the workspace). See `model/core-agent/{local-tools, image-gen-tool, search-tools}.ts`.
 
-**写文件防冲突**(`util/uniquify-path.ts`):`write_file / markdown_to_pdf / html_to_pdf / generate_image` 默认按模型给的路径写;**冲突时 uniquify**(basename 末尾插 `-N`)并通过 tool result 的 `<file-renamed>` 块显式回传。判定"我的"靠 caller 注入的 `ChatOptions.hasProducedPath`(group_chat 用 producedSet 当 turn 维度)——本 turn 自己写过的路径再写视为 refinement 直接覆盖,其它已存在文件视为外部冲突。**`bash` 不在保护范围**(shell 重定向是黑盒)。`read_file` ENOENT 时扫同目录 `<name>-N<ext>` 兄弟文件,有命中追加 `<file-renamed-earlier>` 提示作为第二层防护。
-
----
-
-## 6. 技能(skill)
-
-来源 = `src/builtin/skills/`(git 追踪,启动按 hash 同步到 `data/builtin/skills/`)+ `<uid>/cloud/skills/`。`SkillLoader` 扫描 `[user, builtin]` 注入 system prompt,**custom 优先覆盖同 id builtin**。内置不可编辑。
-
-**内置 skill / agent 源文件主体统一英文**(`src/builtin/` 下的 SKILL.md 正文 / 示例 / 内置 agent spec 的 system / persona / workflow 等):面向多语言用户分发,LLM 调用时自动按对话语言回复,源文件不需要中文兜底;混用中文会让英文用户读到夹生内容。custom skill / agent 由用户自建,语言不限。
-
-**例外:`description` 必须双语化**——SKILL.md frontmatter 用 `description_zh` + `description_en` 两份(legacy 单 `description` 字段在 loader / normalizeAgent 里按 CJK 启发式分桶迁移,但**新写一律双字段**),agent spec JSON 同样 `description_zh` + `description_en`。**Why**:简介是 commander / 主对话 LLM 的选中信号(`chat_commander.md:91/96/325`),内置 skill/agent 走全球分发,如果只英文,中文 UI 用户列表里看到的就是英文简介,误判匹配。运行时 `getSystemPromptBlock` / `_buildAgentsIndexBlock` / UI 渲染都按 `getCurrentLang()` 选哪份注入(`pickDescription` resolver 在 core-agent + renderer utils 各一份保持同步)。**双写不实时翻译**——简介质量必须可控,运行时翻译有质量波动 + 延迟成本。
-
-**SKILL.md frontmatter 只有两个字段**:`name` + `description`。**没有** `requires` / `external_deps` / `tags` 等任何其它字段。skill 之间硬性互不依赖(无传递闭包、无跨 skill 写),外部依赖在正文"外部依赖"小节文字说明,运行时不预检不自动安装。
-
-**`agent.skill_list` 三态**:`undefined` = 不过滤(老 agent 兼容)/ `[]` = 零 skill / 非空 = 仅子集。`updateCustomAgent` 落盘前**只**做"未知 id 过滤",不做闭包展开。字段由 agent-edit LLM 通过 `<agent><skills>` 子标签自动维护,**前端不暴露手编**。
-
-**skill scripts 默认 `.py`**(Python 3,覆盖最广),其它允许:`.ts / .mjs / .js`(走 tsx + Node)、`.sh`(bash)、`.rb`(ruby)。**Why**:外部生态绝大多数 skill 都是 py 写的,强制改写门槛高、易引 bug;py 在 macOS/Linux 自带,Windows 安装一次即可。**调用入口统一**走 `bin/run-skill.cjs <id> <basename>`(不带扩展名),runner 按 ext 派发:`.py` → `python3`(Win: `py -3` → `python`);`.ts/.mjs/.js` → require + 默认导出;`.sh` → `bash`;`.rb` → `ruby`。子进程模式注入 `ORKAS_SKILL_ID` / `ORKAS_SKILL_DIR` env,stdio 直通退出码透传。skill 目录禁 `node_modules / package.json / requirements.txt / Gemfile` 等包管理产物;`.ts` 用 PC 已有 npm 白名单(新依赖走 §1),其它语言只用对应 runtime stdlib。
-
-**个人启用/禁用**(agent + skill 共用,`<uid>/cloud/config/component-enabled.json`,**只存 false**):resolver 单一入口 `features/component_enabled.ts::isAgentEnabled / isSkillEnabled`。**仅 4 处 filter 应用点**(其它地方不要再判):
-1. `listAgents() / listSkills()` 给 UI 挂 `enabled`(不过滤,让 UI 显示开关)
-2. `chats.ts::_buildAgentsIndex` — agent picker 列表
-3. `chats.ts::stream/sendToConversation` — 已绑 disabled agent 直接 `errors.agent_disabled`
-4. `skill-registry.getSystemPromptBlock({disabledIds})` — render 阶段过滤
-
-**写入入口**(改名 / URL/目录导入):详见 `features/skills.ts`。任何写入口必须调 `invalidateSkills()`。`<<<skill-file>>>` 块只能写当前 skill 目录(无跨 skill `skill=Y` 属性)。
-
-**双 system 边界(skill 有两套)**:
-- **System A — 用户/UI 管的 skill**:`<uid>/cloud/skills/<sid>/` + `data/builtin/skills/<sid>/`,`SkillLoader` 扫描后注入 system prompt 的 `## 可用技能` block;SKILL.md frontmatter 仅 `name + description`;UI / skill-edit chat / 导入流程 都改这套
-- **System B — agent 自演进 skill**:`<uid>/cloud/agents/<aid>/skills/<sid>/`,core-agent SDK 的 `SkillStore` 写,`skill_manage` 工具(create / read / patch / list / delete)管;**只对所属 agent 可见**(通过 `skill_manage(list/read)` 自取),不进 SkillLoader 的 system prompt block。frontmatter 含 `id / patchCount / createdAt / updatedAt / tags` 等运行时字段
-- runner.ts 给 `createConfig` 的 `evolution.skillsDir` 显式指向 `agentEvolvedSkillsDir(uid, agentId)`;**禁止**让 SkillStore 用 cwd 默认值落进 `PC/skills/`(已加 `.gitignore` 防御)
+**Write-file conflict avoidance** (`util/uniquify-path.ts`): `write_file / markdown_to_pdf / html_to_pdf / generate_image` write to the path the model gives by default; **on conflict, uniquify** (insert `-N` before the basename suffix) and pass it back explicitly via the `<file-renamed>` block in the tool result. "Mine vs not mine" is decided by the caller-injected `ChatOptions.hasProducedPath` (group_chat uses producedSet at turn granularity) — paths this turn already wrote are treated as refinement (overwrite); other pre-existing files are external conflicts. **`bash` is not in the protected scope** (shell redirection is a black box). When `read_file` hits ENOENT, it scans sibling `<name>-N<ext>` files in the same directory; on a hit it appends a `<file-renamed-earlier>` hint as a second layer of defense.
 
 ---
 
-## 7. 知识库(contexts)
+## 6. Skills
 
-`<uid>/cloud/contexts/` 是用户直管目录树(md/txt/pdf/docx/image 混合,云同步)+ `.kb/vector.db`(派生向量库,纳入云同步)。详见 `features/{contexts, kb_indexer, vec_store, kb_vector}.ts`。
+Sources = `src/builtin/skills/` (git-tracked, hash-synced into `data/builtin/skills/` at startup) + `<uid>/cloud/skills/`. `SkillLoader` scans `[user, builtin]` and injects them into the system prompt; **custom takes precedence over a builtin with the same id**. Built-ins are not editable.
 
-**关键约束**:
-- **embedder 固定 `bge-small-zh-v1.5` 512 维**,换模型需全量重建(`config.json` 锁防误换)。模型 ~95MB 随 installer `extraResources` 出厂,零下载零网络
-- **journal 模式 DELETE 不 WAL**(`.db-wal/.db-shm` 旁落文件会撕裂同步,见 §4)
-- **禁用 `worker_threads` 起多 ONNX session**:实测原生层 SIGSEGV(OpenMP threadpool + 分配器并发初始化是已知危险组合);需真并行用 `child_process`
-- 模型侧只能用 `kb_search` / `kb_read` 两个工具;**禁止 `cat` / `rg` 访问 `$contexts_dir/`**(写在 `chat_core.md`)
-- 切块上限 `EMBED_MAX_CHARS=400` 字符(贴合 512 token 窗口);跨段不 overlap 避免主题污染
-- `_INDEX.md` 仅根目录一份,自动生成给用户 Finder 浏览,**模型不读**
-- 云同步冲突取 mtime 较新,失败方启动期 `reconcile` 按 sha1 补齐;`kb_files` 表即清单,无需单独 manifest
+**Built-in skill / agent source files keep their primary text in English** (SKILL.md body / examples under `src/builtin/`, and the system / persona / workflow of built-in agent specs): they ship to a multilingual user base, the LLM auto-replies in the conversation language, and there is no need for a Chinese fallback in the source files; mixing in Chinese makes English-speaking users see half-translated content. Custom skills / agents are user-authored and have no language restriction.
 
-**通用向量库工具**(新场景可复用,详见各文件头注释):`util/file_to_chunks.ts`(纯函数切块)+ `features/vec_store.ts`(`openVecStore(dbDir)` 工厂,高低层双 API)+ `features/kb_vector.ts`(uid → dbDir 适配器)。
+**Exception: `description` must be bilingual** — SKILL.md frontmatter uses both `description_zh` + `description_en` (the legacy single `description` field is migrated by CJK heuristic in the loader / normalizeAgent buckets, but **new entries always use both fields**); agent spec JSON likewise uses `description_zh` + `description_en`. **Why:** the description is the selection signal seen by the commander / main-conversation LLM (`chat_commander.md:91/96/325`); built-in skills / agents are distributed globally, and an English-only description means a Chinese UI user sees an English description in the list, leading to mis-matches. At runtime, `getSystemPromptBlock` / `_buildAgentsIndexBlock` / UI rendering all pick the right one based on `getCurrentLang()` (the `pickDescription` resolver lives in core-agent + renderer utils, kept in sync). **Pre-translated, not at runtime** — description quality must be controllable, and runtime translation has both quality variance and latency cost.
 
----
+**SKILL.md frontmatter has only two fields**: `name` + `description`. **No** `requires` / `external_deps` / `tags` / any other field. Skills have no hard inter-dependencies (no transitive closure, no cross-skill writes); external deps are stated in the body's "External dependencies" section as plain text — runtime does not pre-check or auto-install.
 
-## 8. 前端(`src/renderer/`)
+**`agent.skill_list` three-state**: `undefined` = no filtering (legacy compatibility) / `[]` = zero skills / non-empty = a strict subset. `updateCustomAgent` only does "filter unknown ids" before saving; it does not expand a closure. The field is auto-maintained by the agent-edit LLM via the `<agent><skills>` sub-tag; **the frontend does not expose hand-editing**.
 
-vanilla HTML/CSS/JS,classic `<script>` 多文件(非 ESM 非 build)。跨文件符号靠顶层 `let/const`,**不写** `export/import`;不挂 `window.*`(除非 HTML `onclick` 需要)。
+**Skill scripts default to `.py`** (Python 3, broadest coverage); also allowed: `.ts / .mjs / .js` (via tsx + Node), `.sh` (bash), `.rb` (ruby). **Why:** the vast majority of external-ecosystem skills are written in py; forcing rewrites is a high bar and bug-prone; py ships with macOS/Linux and Windows installs once. **All invocation goes through** `bin/run-skill.cjs <id> <basename>` (no extension); the runner dispatches by extension: `.py` → `python3` (Win: `py -3` → `python`); `.ts/.mjs/.js` → require + default export; `.sh` → `bash`; `.rb` → `ruby`. The subprocess gets `ORKAS_SKILL_ID` / `ORKAS_SKILL_DIR` env injected; stdio passthrough; exit code propagated. Skill directories must not contain `node_modules / package.json / requirements.txt / Gemfile` or other package-manager artifacts; `.ts` may use the existing PC npm allow-list (new deps follow §1), other languages use only the corresponding runtime stdlib.
 
-**关键约束**:
-- 加新文件 → 同时在 `index.html` 的 `<script>` 列表插入(多数排在 `ipc-shim` 之后)
-- 新增 `window.orkas.*` API → 必须在 `ipc/index.ts` 加 handler;新 `/api/*` → 只能在 `modules/ipc-shim.js::_IPC_ROUTES` 追加(不写真 HTTP)
-- Markdown 渲染唯一接口 `renderMarkdown(str)`(`modules/utils.js`),**不要写"简易版"**。LaTeX 公式由 `modules/math.js::typesetMath` 异步排版,**流式 delta 不排版**(避免半截 LaTeX 抖动)。具体占位/正则细节详见两文件头注释
-- `index.html` 资源**不带 `?v=`**:dev `Cmd/Ctrl+R` 走 `reloadIgnoringCache()`;prod 禁 reload
-- `src/renderer/` **不参与 typecheck**(vanilla + DOM,checkJs 误报多);main/ 保持 `checkJs: true`
-- 过程信息行图标只用 Unicode Geometric Shapes(`▶ ● ◆ ◇ ■ ▣ ▷ ◐ ◉ ○ ◯ ▪`),**禁彩色 emoji**
-- UI 共用一套 class(`.btn / .btn-sm / .btn-primary / .btn-danger / .detail-actions / .empty / .muted`),差异用 `.is-*` 修饰符,**禁开近似类**
+**Per-user enable/disable** (shared by agent + skill, stored at `<uid>/cloud/config/component-enabled.json`, **only `false` is recorded**): the single resolver entrypoint is `features/component_enabled.ts::isAgentEnabled / isSkillEnabled`. **Only 4 filter application sites** (do not add filtering elsewhere):
+1. `listAgents() / listSkills()` attaches `enabled` for the UI (no filtering — let the UI render the toggle).
+2. `chats.ts::_buildAgentsIndex` — agent picker list.
+3. `chats.ts::stream/sendToConversation` — bound disabled agents return `errors.agent_disabled` directly.
+4. `skill-registry.getSystemPromptBlock({disabledIds})` — render-stage filtering.
 
-### i18n(中/英双语)
+**Write entry points** (rename / URL/dir import): see `features/skills.ts`. Every write entry must call `invalidateSkills()`. The `<<<skill-file>>>` block can only write into the current skill directory (no cross-skill `skill=Y` attribute).
 
-文案在 `src/{renderer,main}/locales/{zh,en}.json`,lookup 走 `i18n.{js,ts}::t(key, vars?)`(扁平点分 key,缺失 fallback `en` → raw key)。语言偏好 `<uid>/cloud/config/preferences.json`,运行时切换派发 `i18n-change` 事件。
-
-**硬性要求**:
-- 所有用户可见文案(按钮/标题/状态/占位符/tooltip/空态/toast/dialog)**必须走 i18n** + zh/en 双份 key
-- 静态 HTML 用 `data-i18n*`(`applyDomI18n()` 自动扫填);**JS 注入文本必须挂 `i18n-change` 监听重绘**——常漏:sidebar 列表 / settings 动态行 / 状态切换的按钮
-- 先决定 i18n key 再写代码,**不允许中文硬编码"以后补"**
-- **不 i18n 化**:LLM prompts(`prompts/*.md` 中文是 prompt 本身)、日志、用户内容
+**Two system boundaries (skills have two sets)**:
+- **System A — user/UI-managed skills**: `<uid>/cloud/skills/<sid>/` + `data/builtin/skills/<sid>/`, scanned by `SkillLoader` and injected into the system prompt's "## Available skills" block; SKILL.md frontmatter is `name + description` only; this is the set the UI / skill-edit chat / import flow change.
+- **System B — agent self-evolved skills**: `<uid>/cloud/agents/<aid>/skills/<sid>/`, written by core-agent SDK's `SkillStore`, managed via the `skill_manage` tool (create / read / patch / list / delete); **visible only to the owning agent** (fetched via `skill_manage(list/read)`), NOT injected into the SkillLoader system-prompt block. The frontmatter contains runtime fields like `id / patchCount / createdAt / updatedAt / tags`.
+- runner.ts explicitly points the `evolution.skillsDir` of the `createConfig` call at `agentEvolvedSkillsDir(uid, agentId)`; **never** let SkillStore fall back to the cwd default and land under `PC/skills/` (we already added that to `.gitignore` as a defense).
 
 ---
 
-## 9. 开发流程
+## 7. Knowledge base (contexts)
 
-### 启动
+`<uid>/cloud/contexts/` is the user-managed directory tree (mixed md/txt/pdf/docx/image, cloud-synced) + `.kb/vector.db` (derived vector store, also cloud-synced). See `features/{contexts, kb_indexer, vec_store, kb_vector}.ts`.
 
-`cd PC && ./run.sh`(唯一入口,kill 旧实例 + 前台启动)。F12 仍可手开 renderer DevTools(Chromium 自带,非 dev 也开)。
+**Key constraints**:
+- **Embedder is fixed at `bge-small-zh-v1.5`, 512 dims**; switching models requires a full rebuild (`config.json` lock prevents accidental swaps). The model is ~95 MB and ships via the installer's `extraResources`, so zero download / zero network at runtime.
+- **Journal mode is DELETE, not WAL** (the `.db-wal/.db-shm` sidecar files would tear cloud sync — see §4).
+- **No `worker_threads` for multiple ONNX sessions**: empirically the native layer SIGSEGVs (OpenMP threadpool + concurrent allocator init is a known dangerous combination); for true parallelism use `child_process`.
+- The model side may use only `kb_search` / `kb_read` tools; **`cat` / `rg` access to `$contexts_dir/` is forbidden** (stated in `chat_core.md`).
+- Chunk cap is `EMBED_MAX_CHARS=400` chars (matching the 512-token window); no overlap across segments to avoid topic pollution.
+- `_INDEX.md` is generated only at the root of contexts for users browsing in Finder; **the model does not read it**.
+- Cloud-sync conflicts take the newer mtime; the loser runs `reconcile` at startup to backfill via sha1; the `kb_files` table is the manifest, no separate manifest file is needed.
+
+**Reusable vector-store utilities** (good for new scenarios; each file's header has the details): `util/file_to_chunks.ts` (pure function chunker) + `features/vec_store.ts` (`openVecStore(dbDir)` factory, both high- and low-level APIs) + `features/kb_vector.ts` (uid → dbDir adapter).
+
+---
+
+## 8. Frontend (`src/renderer/`)
+
+Vanilla HTML/CSS/JS, classic `<script>` multi-file (no ESM, no build). Cross-file symbols share top-level `let/const`; **don't use** `export/import`; don't hang things on `window.*` (unless an HTML `onclick` requires it).
+
+**Key constraints**:
+- Adding a new file → also insert it into `index.html`'s `<script>` list (most additions go after `ipc-shim`).
+- Adding `window.orkas.*` API → must add a handler in `ipc/index.ts`; new `/api/*` → only added to `modules/ipc-shim.js::_IPC_ROUTES` (no real HTTP).
+- Markdown rendering has a single interface, `renderMarkdown(str)` (`modules/utils.js`); **don't write a "lite version"**. LaTeX is typeset asynchronously by `modules/math.js::typesetMath`; **no typesetting of streaming deltas** (avoids half-formed LaTeX flickering). Placeholder/regex specifics live in those two files' headers.
+- `index.html` resources **don't carry `?v=`**: dev `Cmd/Ctrl+R` goes through `reloadIgnoringCache()`; reload is disabled in prod.
+- `src/renderer/` **does not participate in typecheck** (vanilla + DOM gives too many checkJs false positives); main/ stays at `checkJs: true`.
+- Process-info-row icons use only Unicode Geometric Shapes (`▶ ● ◆ ◇ ■ ▣ ▷ ◐ ◉ ○ ◯ ▪`); **no colored emoji**.
+- The UI shares one set of classes (`.btn / .btn-sm / .btn-primary / .btn-danger / .detail-actions / .empty / .muted`); differences are expressed via `.is-*` modifiers; **don't open near-duplicate classes**.
+
+### i18n (zh / en)
+
+Strings live in `src/{renderer,main}/locales/{zh,en}.json`; lookup goes through `i18n.{js,ts}::t(key, vars?)` (flat dot-separated keys, fallback `en` → raw key on miss). Language preference is stored in `<uid>/cloud/config/preferences.json`; runtime switches dispatch the `i18n-change` event.
+
+**Hard requirements**:
+- All user-visible strings (button / title / status / placeholder / tooltip / empty state / toast / dialog) **must go through i18n** with both zh and en keys.
+- Static HTML uses `data-i18n*` (`applyDomI18n()` auto-fills); **JS-injected text must subscribe to `i18n-change` and re-render** — common misses: sidebar lists / settings dynamic rows / status-toggle buttons.
+- Decide the i18n key first, then write the code; **no hard-coded Chinese with "I'll backfill later"**.
+- **Not i18n-ed**: LLM prompts (`prompts/*.md` — the source language IS the prompt), logs, user content.
+
+---
+
+## 9. Dev workflow
+
+### Startup
+
+`cd PC && ./run.sh` (sole entry, kills the old instance + foreground start). F12 opens renderer DevTools (Chromium-built-in, available in non-dev too).
 
 ### Git commit
 
-提交信息**一律英文**——标题 + 正文 + 任何 footer。**Why**:开源仓库面向全球协作者,中文 commit 在 GitHub 历史里阅读不连贯,贡献者追溯改动 / 写 release notes / 跑自动化工具都不友好。新代码遵守即可,历史中文提交不必返工。
+Commit messages **must be in English** — title + body + any footer. **Why:** the open-source repo has a global audience; Chinese commits read incoherently in GitHub history and break traceability for contributors writing release notes / running automation. Existing Chinese commits don't need to be rewritten; new code follows the rule. **Exception:** sync commits mirroring a Chinese-titled `PC/` source commit may keep the source title verbatim (per `OpenSource/SyncCode/PC-to-OrkasOpen.md` §3) — translation would break grep traceability against the source SHA.
 
-### 改动后必做
+### After a change
 
-- main TS / core-agent → `./run.sh` 重启(<1s,tsx 转译)
-- renderer → `Cmd+R` 刷新(自动忽略缓存)
-- 改存储路径 / session_id / 分层职责 / 外部依赖 → 同步更新本文件
+- main TS / core-agent → `./run.sh` restart (<1s, tsx transpile).
+- renderer → `Cmd+R` refresh (cache automatically ignored).
+- Storage paths / session_id / layering responsibilities / external deps changed → update this file as well.
 
-### 单元测试
+### Unit tests
 
-**唯一目的**:锁住易被误改的行为,**不是**凑覆盖率、不是文档、不是壮胆。
+**Sole purpose**: lock down behavior that is easy to break by accident — **not** to chase coverage, **not** to function as docs, **not** to act as a confidence blanket.
 
-**跑测一律 `npm test`**,**禁** `npx vitest` / IDE 右键 Run。`scripts/run-tests.mjs` 跑测前 swap `better-sqlite3` 到 Node ABI、跑完无条件 swap 回 Electron。**故障恢复**(MODULE_VERSION 不匹配 / 启动 SIGKILL 无 stack):跑 `npm run rebuild:sqlite:electron`。诊断单行与详细成因见 `scripts/swap-sqlite-abi.mjs` 头注释。
+**Tests must be run via `npm test`**, **never** `npx vitest` / IDE right-click Run. `scripts/run-tests.mjs` swaps `better-sqlite3` to the Node ABI before tests, and unconditionally swaps it back to Electron afterwards. **Recovery** (MODULE_VERSION mismatch / startup SIGKILL with no stack): run `npm run rebuild:sqlite:electron`. Diagnostic one-liner and full causation are documented in `scripts/swap-sqlite-abi.mjs` headers.
 
-**写测分级**:
-- **必须写**:业务不变量(uid 隔离 / session_id 前缀 / 路径遍历 / 域边界)、故障恢复路径(损坏/并发/索引失配 → rebuild、回滚)、多分支决策函数、跨层契约、文本坑位
-- **不写**:纯类型即正确的函数、薄封装、UI/DOM、getter/setter、库已保证的行为
-- **禁止写**:同分支换数据反复断言、断内部实现、tautology、只换参数不换分支、测"类型/签名/存在性"、全 happy path
+**Test triage**:
+- **Must write**: business invariants (uid isolation / session_id prefixes / path traversal / domain boundaries), recovery paths (corruption / concurrency / index mismatch → rebuild, rollback), multi-branch decision functions, cross-layer contracts, text trap spots.
+- **Don't write**: functions that are correct by typing alone, thin wrappers, UI/DOM, getter/setter, library-guaranteed behavior.
+- **Forbidden**: same-branch repeat assertions with different data, asserting internals, tautologies, just-change-args-not-branches, "type/signature/existence" tests, all-happy-path.
 
-**组织**:`test/main/` 镜像 `src/main/`,一文件一被测模块,`describe` 嵌一层。
+**Organization**: `test/main/` mirrors `src/main/`; one file per module under test; one level of nested `describe`.
 
-### 不要做
+### Don't do
 
-**分层 / 路径**:
-- `ipc/` 写业务(跳层);`features/` 直接调 core-agent / spawn 进程
-- 存储路径不含 `<uid>` 段;session_id 第二段不是 uid
-- feature 模块用模块级 const 缓存 uid 路径(必须 `getActiveUserId()` 每次取)
-- renderer 加 `window.orkas.*` 不在 `ipc/index.ts` 加 handler
-- 绕过 `util/locks.ts` / `util/path-sandbox.isPathAllowed` / `features/file_indexer.ts`
-- 给 `chat_attachments.uploadAttachment` 加 eager 预处理(extract / preview / 切块)
+**Layering / paths**:
+- Write business in `ipc/` (skipping a layer); call core-agent directly / spawn processes from `features/`.
+- Storage paths missing the `<uid>` segment; session_id where the second segment isn't the uid.
+- Cache uid paths as a module-level `const` in a feature module (must call `getActiveUserId()` each time).
+- Add `window.orkas.*` in the renderer without adding a handler in `ipc/index.ts`.
+- Bypass `util/locks.ts` / `util/path-sandbox.isPathAllowed` / `features/file_indexer.ts`.
+- Add eager pre-processing (extract / preview / chunking) to `chat_attachments.uploadAttachment`.
 
-**超时 / 锁**:
-- 给 LLM 调用加"总时长超时"(`timeout: N` / `setTimeout→abort`)。应用层唯一看门狗是 `client.ts::streamChatWithModel` 的 `idleTimeout=600s`(真空闲);SDK 1h 由 `sdk-timeout-patch.ts` 兜底;群聊死循环防护是 `bus.ts::MAX_WORKER_TURNS=100`(**轮次,不要改 timeout**)
-- 给 `sessionLock.acquire()` / `globalSlots.acquire()` 加等待超时。长 LLM 任务本该无限期排队,加超时 = 伪失败
+**Timeouts / locks**:
+- Add a "total wall-clock timeout" to LLM calls (`timeout: N` / `setTimeout→abort`). The single application-layer watchdog is `client.ts::streamChatWithModel`'s `idleTimeout=600s` (true idle); the SDK 1h limit is backstopped by `sdk-timeout-patch.ts`; group-chat infinite-loop protection is `bus.ts::MAX_WORKER_TURNS=100` (**turns, do not change to a timeout**).
+- Add a wait timeout to `sessionLock.acquire()` / `globalSlots.acquire()`. Long LLM tasks should queue indefinitely; adding a timeout = fake failures.
 
-**测试 / sqlite ABI**:
-- `npx vitest` / `vitest run` / IDE 右键 Run / 直接调 `scripts/swap-sqlite-abi.mjs node`(无失败回滚,网络中断会留半覆盖 `.node` → Electron 静默 SIGKILL)。一律 `npm test`,故障跑 `npm run rebuild:sqlite:electron`
+**Tests / sqlite ABI**:
+- `npx vitest` / `vitest run` / IDE right-click Run / call `scripts/swap-sqlite-abi.mjs node` directly (no failure rollback; if the network drops mid-way you end up with a half-overwritten `.node`, and Electron silently SIGKILLs). Always `npm test`; on failure run `npm run rebuild:sqlite:electron`.
 
-**依赖 / 配置**:
-- 加 npm 依赖(见 §1 白名单)
-- 手改 `data/builtin/{agents,skills}/`(启动按 hash 覆盖)
-- 手改 `<uid>/local/config/*.json`(走设置页 UI;`auth-profiles.json` 写入口会触发 runner 失效)
+**Dependencies / config**:
+- Add an npm dep (see §1 allow-list).
+- Hand-edit `data/builtin/{agents,skills}/` (overwritten by hash on startup).
+- Hand-edit `<uid>/local/config/*.json` (go through the settings UI; `auth-profiles.json` write-entry triggers runner invalidation).
 
-**file-tools 误用**:
-- `read_file` 对 pdf/docx 自动 fallback 抽取(职责单一,必须先 `stat_file`,搜 `NeedStatError` 看强制 throw)
-- `search_files` / manifest 触发 extract(必须 `getCachedMeta` peek)
-- `bash grep -r` 扫 pdf/docx(走 `grep_files`)
+**file-tools misuse**:
+- `read_file` doing automatic fallback extraction for pdf/docx (single responsibility — `stat_file` first, see `NeedStatError` for the forced throw).
+- `search_files` / manifest triggering extraction (must `getCachedMeta` peek).
+- `bash grep -r` scanning pdf/docx (use `grep_files`).
 
-**prompt md / 工具清单**:
-- 在 `prompts/*.md` 写项目名 / OS 真实路径 / 项目源码目录字面量(详见 §3 末"内容卫生")
-- 在 `chat_*.md` 硬编码工具名;新增工具用法说明 → 加 `tool-catalog.ts::TOOL_CATALOG.summary`,只有"何时用 X / X 特殊约束"才进 prompt
+**Prompt md / tool listing**:
+- Write project name / real OS path / project source-dir literals into `prompts/*.md` (see §3 "content hygiene").
+- Hard-code tool names in `chat_*.md`; new tool descriptions go to `tool-catalog.ts::TOOL_CATALOG.summary` — only "when to use X / X-specific constraint" belongs in the prompt.
 
-**skill / agent enabled**:
-- 在 §6 4 处 filter 应用点之外判 `isAgentEnabled / isSkillEnabled`;把 disabled 写进 spec JSON / SKILL.md frontmatter(违反"用户偏好不擦写 spec");在 `expandSkillClosure` 内提前 filter disabled
+**Skill / agent enabled**:
+- Check `isAgentEnabled / isSkillEnabled` outside the 4 filter sites in §6; write disabled into spec JSON / SKILL.md frontmatter (violates "user preferences must not overwrite spec"); filter disabled inside `expandSkillClosure` early.
 
-**群聊**:
-- 绕过 `bus.enqueue` 直接写 `<cid>.jsonl` 或 `visibility/<aid>.jsonl`(消息路由 / 切片 / worker 唤醒一体)
-- 在 agent worker 里读全量 `<cid>.jsonl`(必须 `visibility.readSlice`,否则跨 actor 私有上下文泄漏)
-- 重新引入 `call_subagent` / `subagents.ts`(已废弃;LLM 派活走 `dispatch_to`(单)/`plan_set`(多 actor)工具,无 RPC)
-- 在 commander/agent 散文里写 `@<X>` 期望它派活——已不识别,只会让 user 看到一段没人接的文字
-- 新建跟 `bus.enqueue` 并行的 enqueue / 调度函数——单一原语原则,任何派活路径必须经过它
-- 在 `plan.ts` 工具外手改 `<cid>/plan.md`
+**Group chat**:
+- Bypass `bus.enqueue` and write `<cid>.jsonl` or `visibility/<aid>.jsonl` directly (message routing / slicing / worker wake are bundled together).
+- Read full `<cid>.jsonl` from inside an agent worker (must use `visibility.readSlice`, otherwise other actors' private context leaks across).
+- Re-introduce `call_subagent` / `subagents.ts` (deprecated; LLM dispatch is `dispatch_to` (single) / `plan_set` (multi-actor) tools, no RPC).
+- Write `@<X>` in commander/agent prose expecting a dispatch — it's no longer recognized; the user just sees text nobody picked up.
+- Build a new enqueue / scheduling function in parallel to `bus.enqueue` — single-primitive principle, every dispatch path must go through it.
+- Hand-edit `<cid>/plan.md` outside the `plan.ts` tools.
 
 ---
 
-## 10. 日志
+## 10. Logging
 
-**日志** `src/main/logger.ts`(electron-log 薄封装):main + renderer 共写 `data/logs/YYYY-MM-DD.log`(>10MB 切 `.old.log`,启动期 `sweepLogs()` 按 ≥7 天 / ≤100MB 清理,今天的永不删)。renderer 走 IPC 转发以 `renderer/<module>` scope 落盘。脱敏 hook + REDACT_KEYS 名单见 `logger.ts`。调级 `ORKAS_LOG_LEVEL=debug`。
+**Logging** is `src/main/logger.ts` (a thin wrapper over electron-log): main + renderer both write `data/logs/YYYY-MM-DD.log` (rolls to `.old.log` past 10 MB; startup `sweepLogs()` cleans up by ≥7 days / ≤100 MB; today's file is never deleted). The renderer forwards via IPC and lands as `renderer/<module>` scope. Redaction hook + `REDACT_KEYS` list live in `logger.ts`. Set log level via `ORKAS_LOG_LEVEL=debug`.
 
-**新代码必须**:用 `createLogger('<module>')` 而非 `console.log`;主流程入口落 `log.info`(start + 关键字段 userId/path/ms);**catch / 失败 return 之前必须 `log.warn`(可恢复)或 `log.error`(不变量破坏)**——只 `return {ok:false}` 不留日志 = 上层无法定位;敏感信息走 REDACT_KEYS。
+**New code must**: use `createLogger('<module>')` instead of `console.log`; key entry points in main flows emit `log.info` (start + key fields userId/path/ms); **before catch / failure return, you must `log.warn` (recoverable) or `log.error` (invariant broken)** — only returning `{ok:false}` without a log = the upstream can't locate the issue; sensitive fields go through `REDACT_KEYS`.
 
-开源版本不内置任何远程埋点 / 第三方分析,也不内置应用内调试面板;诊断走日志 + Chromium DevTools(F12)。
+The open-source build has **no built-in remote telemetry / third-party analytics, and no in-app debug panel**; diagnose via logs + Chromium DevTools (F12).

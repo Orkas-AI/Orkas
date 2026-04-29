@@ -28,7 +28,7 @@ import {
 import { evictSession } from '../model/core-agent/session-store';
 import { getActiveUserId } from './users';
 import { createLogger } from '../logger';
-import { t } from '../i18n';
+import { t, buildLanguageDirective } from '../i18n';
 
 const log = createLogger('agents');
 
@@ -983,14 +983,15 @@ export function buildAgentEditSystemPrompt(agent: {
   const zh = (agent.description_zh || '').trim() || (legacy && isChinese ? legacy : '');
   const en = (agent.description_en || '').trim() || (legacy && !isChinese ? legacy : '');
   const display = legacy || zh || en;
-  return prompts.load('chat_agent_setup', {
+  const body = prompts.load('chat_agent_setup', {
     name: agent.name || '',
-    description: display || '(未填写)',
-    description_zh: zh || '(未填写)',
-    description_en: en || '(未填写)',
-    workflow: (agent.workflow || '').trim() || '(未填写)',
+    description: display || '(not provided)',
+    description_zh: zh || '(not provided)',
+    description_en: en || '(not provided)',
+    workflow: (agent.workflow || '').trim() || '(not provided)',
     interactive: agent.interactive === true ? 'true' : 'false',
   });
+  return `${body}\n\n---\n\n${buildLanguageDirective()}`;
 }
 
 export interface AgentEditResult {

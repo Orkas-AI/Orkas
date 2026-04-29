@@ -871,10 +871,10 @@ describe('agents › buildAgentEditSystemPrompt', () => {
     expect(sys).not.toMatch(/##\s*用户的输入/);
   });
 
-  it('falls back to (未填写) when fields are empty', async () => {
+  it('falls back to (not provided) when fields are empty', async () => {
     const a = await loadAgents();
     const sys = a.buildAgentEditSystemPrompt({});
-    expect(sys).toContain('(未填写)');
+    expect(sys).toContain('(not provided)');
   });
 });
 

@@ -68,13 +68,13 @@ describe('prompts ↔ code contract', () => {
     // it harmlessly anyway, an outright ban makes the LLM avoid even
     // legitimate `@-mention` patterns). It SHOULD say `@user` is unneeded.
     // Two acceptable phrasings:
-    //   - "不需要写 @user"  (positive: no need)
-    //   - "禁止出现@user"   (legacy: outright forbid; flagged as audit #10)
+    //   - "no need to write `@user`"  (positive: no need)
+    //   - "do NOT write `@user`"      (legacy: outright forbid; flagged as audit #10)
     // The audit recommended the soft form; we lock the structural rule
     // "agent prompt mentions `@user` policy in some form" so a future
     // refactor can't silently drop it.
     expect(agentPrompt).toMatch(/@user/);
-    expect(agentPrompt).toMatch(/不需要写\s*`?@user`?|禁止.*@user/);
+    expect(agentPrompt).toMatch(/no need to write\s*`?@user`?|do NOT write\s*`?@user`?/i);
   });
 
   // ─────────────────────────────────────────────────────────────────────
@@ -120,7 +120,7 @@ describe('prompts ↔ code contract', () => {
     // passing — we only care that the structural source-of-truth is one.)
     const shared = fs.readFileSync(sharedFile, 'utf-8');
     expect(shared).toMatch(/markdown_to_pdf/);
-    expect(shared).toMatch(/搜索铁律|web_search|web_fetch/);
+    expect(shared).toMatch(/Web search rules|web_search|web_fetch/);
     expect(shared).toMatch(/chat-media:\/\/local/);
 
     // The commander/agent prompts should NOT redundantly contain the full
@@ -130,10 +130,10 @@ describe('prompts ↔ code contract', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
     const agentPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_agent_in_group.md'), 'utf-8');
     // Distinctive search rule phrase only in shared:
-    expect(commanderPrompt).not.toMatch(/单次搜索空结果不代表放弃/);
-    expect(agentPrompt).not.toMatch(/单次搜索空结果不代表放弃/);
+    expect(commanderPrompt).not.toMatch(/single empty result is not a reason to give up/i);
+    expect(agentPrompt).not.toMatch(/single empty result is not a reason to give up/i);
     // Distinctive PDF fallback phrase only in shared:
-    expect(commanderPrompt).not.toMatch(/内置 PDF 工具报错也不许 fallback/);
-    expect(agentPrompt).not.toMatch(/内置 PDF 工具报错也不许 fallback/);
+    expect(commanderPrompt).not.toMatch(/Even when the built-in PDF tools error, do not fall back/i);
+    expect(agentPrompt).not.toMatch(/Even when the built-in PDF tools error, do not fall back/i);
   });
 });

@@ -23,6 +23,7 @@ import * as fsp from 'node:fs/promises';
 import { groupChatDir, groupChatPlanFile } from '../../paths';
 import { nowIso } from '../../storage';
 import { createLogger } from '../../logger';
+import { t } from '../../i18n';
 
 const log = createLogger('group_chat.plan');
 
@@ -235,9 +236,11 @@ export async function markPlanCompletedSignaled(uid: string, cid: string): Promi
 /** Format the plan as a commander-emitted announcement message body. Used
  *  by bus on the first plan_set so the user sees the outline. */
 export function formatPlanAnnouncement(plan: PlanFile): string {
-  const lines = ['我准备按下面的步骤推进：', ''];
+  const lines = [t('plan.announcement.heading'), ''];
   for (const s of plan.steps) {
-    const who = s.assignee === 'commander' ? '我自己' : s.assignee === 'user' ? '请你' : `@${s.assignee}`;
+    const who = s.assignee === 'commander' ? t('plan.announcement.assignee_self')
+      : s.assignee === 'user' ? t('plan.announcement.assignee_user')
+      : `@${s.assignee}`;
     lines.push(`${s.index}. ${s.title}（${who}）`);
   }
   return lines.join('\n');
@@ -246,7 +249,7 @@ export function formatPlanAnnouncement(plan: PlanFile): string {
 /** Format the plan as a system-prompt block fed back to the commander each
  *  turn so it knows where it is. */
 export function formatPlanForPrompt(plan: PlanFile | null): string {
-  if (!plan || !plan.steps.length) return '（暂无执行计划）';
+  if (!plan || !plan.steps.length) return '(no active plan)';
   const lines: string[] = [];
   for (const s of plan.steps) {
     const mark = s.status === 'done' ? '✓'
@@ -255,7 +258,7 @@ export function formatPlanForPrompt(plan: PlanFile | null): string {
       : s.status === 'skipped' ? '⊘'
       : s.status === 'blocked' ? '⏸'
       : '○';
-    const who = ` 派给 ${s.assignee}`;
+    const who = ` → ${s.assignee}`;
     const out = s.output_summary ? ` — ${s.output_summary.slice(0, 80)}` : '';
     lines.push(`${mark} Step ${s.index}: ${s.title} [${s.status}]${who}${out}`);
   }
