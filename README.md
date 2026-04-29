@@ -49,10 +49,10 @@
 
 ## Screenshots
 
-| ![Commander dispatch](./resources/app-ui/指挥官.jpg)<br>**Commander dispatch** | ![Parallel agent collaboration](./resources/app-ui/智能体并行调度.jpg)<br>**Parallel agent collaboration** |
+| ![Commander dispatch](./resources/app-ui/commander.jpg)<br>**Commander dispatch** | ![Parallel agent collaboration](./resources/app-ui/call_agents.jpg)<br>**Parallel agent collaboration** |
 |:---:|:---:|
-| ![Serial agent collaboration](./resources/app-ui/智能体串行调度.jpg)<br>**Serial agent collaboration** | ![Agent management](./resources/app-ui/智能体.jpg)<br>**Agent management** |
-| ![Skill library](./resources/app-ui/技能库.jpg)<br>**Skill library** | |
+| ![Serial agent collaboration](./resources/app-ui/call_agent.jpg)<br>**Serial agent collaboration** | ![Agent management](./resources/app-ui/agents.jpg)<br>**Agent management** |
+| ![Skill library](./resources/app-ui/skills.jpg)<br>**Skill library** | |
 
 ---
 
