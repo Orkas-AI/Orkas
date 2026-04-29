@@ -121,5 +121,8 @@
       "target": "AppImage",
       "category": "Utility"
     }
+  },
+  "optionalDependencies": {
+    "@esbuild/darwin-arm64": "^0.27.7"
   }
 }
