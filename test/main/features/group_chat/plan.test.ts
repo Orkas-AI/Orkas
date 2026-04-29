@@ -23,7 +23,7 @@ afterEach(() => {
 });
 
 describe('group_chat plan', () => {
-  it('setPlan firstTime=true on first write, false on second', async () => {
+  it('setPlan replaces the plan and preserves created_at across re-plans', async () => {
     const plan = await import('../../../../src/main/features/group_chat/plan');
     const r1 = await plan.setPlan(TEST_UID, TEST_CID, {
       steps: [
@@ -31,9 +31,9 @@ describe('group_chat plan', () => {
         { title: 'analyze', assignee: 'commander' },
       ],
     });
-    expect(r1.firstTime).toBe(true);
     expect(r1.plan.steps).toHaveLength(2);
     expect(r1.plan.steps[0].title).toBe('gather data');
+    const createdAt = r1.plan.created_at;
 
     const r2 = await plan.setPlan(TEST_UID, TEST_CID, {
       steps: [
@@ -42,8 +42,8 @@ describe('group_chat plan', () => {
         { title: 'report', assignee: 'commander' },
       ],
     });
-    expect(r2.firstTime).toBe(false);
     expect(r2.plan.steps).toHaveLength(3);
+    expect(r2.plan.created_at).toBe(createdAt);
   });
 
   it('updateStep flips status + applies patch fields', async () => {

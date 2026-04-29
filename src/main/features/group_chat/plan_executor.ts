@@ -246,10 +246,12 @@ function outcomeForSynthTurn(evt: TurnFinishedEvent): TurnOutcome {
  * user submits" (which arrives here as trigger=user_direct since the user
  * enqueue triggered the agent worker, not the executor).
  *
- * commander empty-final special-case:
- *   - tool-only turn (`activityEvents > 0` + 'empty response') → silent
- *   - zero-activity empty + 'empty response' → ⚠️ failure (config / auth)
- *   - plain empty without errText → silent
+ * commander empty-final policy: user_direct means the user is actively
+ * waiting on commander, so silent is forbidden — even a tool-only turn
+ * (e.g. only called dispatch_to / kb_search without writing a final)
+ * must persist an empty bubble carrying the process rail. Otherwise the
+ * user sees nothing after their message lands. Real config / auth errors
+ * still surface as an errorBubble.
  *
  * agent empty-final → always persist '（无回复）'.
  */
@@ -294,11 +296,14 @@ async function outcomeForUserDirectTurn(uid: string, cid: string, evt: TurnFinis
   }
   // Empty final, no side effects.
   if (evt.actor.kind === 'commander') {
-    const isSpuriousEmpty = evt.errText === 'empty response';
-    if (!evt.errText) return { kind: 'silent' };
-    if (isSpuriousEmpty && evt.activityEvents > 0) return { kind: 'silent' };
-    // Real failure (errText other than spurious, or zero-activity empty).
-    return { kind: 'persist', text: errorBubble(evt.errText || 'empty response') };
+    // User pinged commander → must respond. Empty bubble still carries
+    // the process rail (tool calls, dispatch_to progress) attached by bus.
+    if (!evt.errText) return { kind: 'persist', text: '' };
+    if (evt.errText === 'empty response' && evt.activityEvents > 0) {
+      return { kind: 'persist', text: '' };
+    }
+    // Real failure (zero-activity empty, or other err).
+    return { kind: 'persist', text: errorBubble(evt.errText) };
   }
   // agent empty + no side effects.
   if (evt.errText) return { kind: 'persist', text: errorBubble(evt.errText) };

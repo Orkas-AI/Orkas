@@ -161,13 +161,13 @@ async function writePlanRaw(uid: string, cid: string, plan: PlanFile): Promise<v
 }
 
 /**
- * Replace the entire plan. Returns whether this is the FIRST set for this
- * conversation (used by bus to decide whether to also emit a group
- * announcement message).
+ * Replace the entire plan. Bus always emits an announcement on every
+ * `plan_set` call (not just the first) — silent re-plans break the
+ * "user pings commander → must respond" invariant.
  */
 export async function setPlan(
   uid: string, cid: string, input: PlanSetInput,
-): Promise<{ plan: PlanFile; firstTime: boolean }> {
+): Promise<{ plan: PlanFile }> {
   const file = groupChatPlanFile(uid, cid);
   const existed = fs.existsSync(file);
   let created_at = nowIso();
@@ -197,8 +197,8 @@ export async function setPlan(
     steps,
   };
   await writePlanRaw(uid, cid, plan);
-  log.info(`plan-set user=${uid} cid=${cid} steps=${steps.length} firstTime=${!existed}`);
-  return { plan, firstTime: !existed };
+  log.info(`plan-set user=${uid} cid=${cid} steps=${steps.length} replan=${existed}`);
+  return { plan };
 }
 
 export async function updateStep(

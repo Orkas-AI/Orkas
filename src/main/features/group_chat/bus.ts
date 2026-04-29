@@ -1308,14 +1308,15 @@ async function buildCommanderExtraTools(state: CidState, w: WorkerState): Promis
       if (!stepsIn.steps.length) {
         return { content: JSON.stringify({ ok: false, error: 'empty or invalid steps (each step needs `title` + `assignee`)' }), isError: true };
       }
-      const { plan, firstTime } = await setPlan(uid, cid, stepsIn);
+      const { plan } = await setPlan(uid, cid, stepsIn);
       emit(state, { type: 'plan_changed', cid });
-      if (firstTime) {
-        // Stage the announcement on the worker; runTurn end merges it into
-        // commander's turn-end message so thinking rail + plan card share
-        // a single bubble. See WorkerState.pendingPlanAnnouncement.
-        w.pendingPlanAnnouncement = formatPlanAnnouncement(plan);
-      }
+      // Stage the announcement on the worker; runTurn end merges it into
+      // commander's turn-end message so thinking rail + plan card share
+      // a single bubble. See WorkerState.pendingPlanAnnouncement.
+      // Always announce, including on re-plans — a silent re-plan would
+      // leave the user with only the process rail (the "user pings
+      // commander → must respond" invariant).
+      w.pendingPlanAnnouncement = formatPlanAnnouncement(plan);
       // NOTE: dispatch is DEFERRED to runTurn-end (see bus.runTurn for the
       // post-outcome `planExecutor.reconcile` call). Doing it here would
       // mean the agent worker starts running while commander's own LLM
