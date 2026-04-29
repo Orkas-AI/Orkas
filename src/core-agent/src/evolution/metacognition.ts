@@ -165,7 +165,9 @@ export function shouldReflect(
  * listed in COMPETENCE.md. Simple keyword matching.
  */
 function hitsKnownWeakness(metrics: RunMetrics, competence: string): boolean {
-  // Look for a "已知弱点" or "weaknesses" section in competence
+  // Look for a "weaknesses" section (or its Chinese equivalent "已知弱点",
+  // kept so user-authored COMPETENCE.md from earlier zh-default builds still
+  // matches without a migration pass).
   const weaknessSection = extractSection(competence, ['已知弱点', 'weaknesses', 'weak']);
   if (!weaknessSection) return false;
 
@@ -218,83 +220,83 @@ export function buildAdaptiveReviewPrompt(
   skillHealthReport?: string,
   conversationDigest?: string,
 ): string {
-  const base = '根据以下对话摘要，考虑改进你的技能和自我认知。\n\n'
-    + '**重要：网络超时、连接中断、速率限制等瞬态错误是环境问题，不是技能或能力缺陷。'
-    + '遇到这类错误时不要在 COMPETENCE.md 标记为弱点，不要修改或删除相关技能，'
-    + '不要在 LEARNING_STRATEGIES.md 建议回避该工具。**\n\n';
+  const base = 'Based on the conversation digest below, consider improving your skills and self-awareness.\n\n'
+    + '**Important: transient errors (network timeouts, dropped connections, rate limits) are environmental issues, not skill or capability deficits. '
+    + 'Do not mark them as weaknesses in COMPETENCE.md, do not modify or delete the related skills, '
+    + 'and do not advise avoiding the tool in LEARNING_STRATEGIES.md.**\n\n';
 
   let focus: string;
   switch (primaryFocus) {
     case 'error_recovery':
-      focus = '你在这个任务中从错误中恢复了。'
-            + '请把解决方法提取为可复用的技能，重点记录让恢复成功的非显而易见的步骤。';
+      focus = 'You recovered from an error during this task. '
+            + 'Extract the resolution into a reusable skill, focusing on the non-obvious steps that made recovery succeed.';
       break;
     case 'user_correction':
-      focus = '用户纠正了你的做法。'
-            + '请识别你做错了什么，创建/更新技能来记录正确的做法。'
-            + '同时更新 COMPETENCE.md 记录这个弱点。';
+      focus = 'The user corrected your approach. '
+            + 'Identify what you got wrong, then create or update a skill that captures the correct way. '
+            + 'Also update COMPETENCE.md to record this weakness.';
       break;
     case 'skill_ineffective':
-      focus = '你加载的技能没有帮到这个任务。'
-            + '分析原因：技能过时了？太泛化？还是不匹配？'
-            + '请修补或删除无效的技能。';
+      focus = 'A skill you loaded did not help on this task. '
+            + 'Diagnose why: outdated? too generic? mismatched? '
+            + 'Patch or delete the ineffective skill.';
       break;
     case 'known_weakness':
-      focus = '这个任务命中了你的已知弱点。'
-            + '重点加强这个领域。如果你成功了，更新 COMPETENCE.md 反映进步。';
+      focus = 'This task hit one of your known weaknesses. '
+            + 'Strengthen this area. If you succeeded, update COMPETENCE.md to reflect the progress.';
       break;
     case 'weakness_succeeded':
-      focus = '你之前标记为弱点的能力在这次任务中表现正常。'
-            + '请更新 COMPETENCE.md：移除或降级该弱点条目。'
-            + '不要修改或删除相关技能——它们工作正常。';
+      focus = 'A capability you previously flagged as a weakness performed normally on this task. '
+            + 'Update COMPETENCE.md: remove or downgrade that weakness entry. '
+            + 'Do not modify or delete the related skills — they are working as expected.';
       break;
     case 'periodic_review':
-      focus = '距离上次反思已经过了一段时间，做一次定期回顾。'
-            + '查看 COMPETENCE.md 和 LEARNING_STRATEGIES.md：'
-            + '合并相近条目、删除已经不再适用或重复的内容、'
-            + '把近期反复出现的稳定模式提炼成新技能。'
-            + '如果近期没有新的可保存内容，直接说"无需保存"，不要为了反思而反思。';
+      focus = 'Some time has passed since the last reflection — do a periodic review. '
+            + 'Look at COMPETENCE.md and LEARNING_STRATEGIES.md: '
+            + 'merge similar entries, drop content that no longer applies or is duplicated, '
+            + 'and distill recently-recurring stable patterns into new skills. '
+            + 'If there is nothing new worth saving, just say "nothing to save" — do not reflect for the sake of reflecting.';
       break;
     case 'complexity':
     default:
-      focus = '这是一个复杂的任务。'
-            + '考虑是否有值得保存为技能的方法或模式。';
+      focus = 'This is a complex task. '
+            + 'Consider whether any approach or pattern is worth saving as a skill.';
       break;
   }
 
   const parts = [
     base,
-    `**重点**: ${focus}`,
+    `**Focus**: ${focus}`,
   ];
 
   if (conversationDigest) {
     parts.push(
       '',
-      '**对话摘要**:',
+      '**Conversation digest**:',
       conversationDigest,
     );
   }
 
   parts.push(
     '',
-    '**当前自我评估 (COMPETENCE.md)**:',
-    competence || '（尚无自我评估 — 请考虑创建一份。）',
+    '**Current self-assessment (COMPETENCE.md)**:',
+    competence || '(No self-assessment yet — consider creating one.)',
     '',
-    '**可用学习策略 (LEARNING_STRATEGIES.md)**:',
-    strategies || '（尚无策略记录 — 请自行判断。）',
+    '**Available learning strategies (LEARNING_STRATEGIES.md)**:',
+    strategies || '(No strategy log yet — use your own judgment.)',
   );
 
   if (skillHealthReport) {
-    parts.push('', '**技能健康度报告**:', skillHealthReport);
+    parts.push('', '**Skill health report**:', skillHealthReport);
   }
 
   parts.push(
     '',
-    '反思完成后，你可以：',
-    '1. 通过 skill_manage 工具创建/修补/删除技能',
-    '2. 通过 metacognition 工具更新 COMPETENCE.md',
-    '3. 通过 metacognition 工具更新 LEARNING_STRATEGIES.md',
-    '4. 如果没有值得保存的内容，直接说"无需保存"',
+    'After reflecting, you can:',
+    '1. Create / patch / delete skills via the skill_manage tool',
+    '2. Update COMPETENCE.md via the metacognition tool',
+    '3. Update LEARNING_STRATEGIES.md via the metacognition tool',
+    '4. If nothing is worth saving, just say "nothing to save"',
   );
 
   return parts.join('\n');

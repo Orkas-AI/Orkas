@@ -92,25 +92,25 @@ export function aggregateSession(messages: any[], into: SessionMetrics): void {
 
 export function formatDigest(metrics: SessionMetrics, sinceMs: number, nowMs: number): string {
   if (metrics.sessionsAnalyzed === 0) {
-    return `近期 (${isoDate(sinceMs)} 至 ${isoDate(nowMs)}) 无新增对话活动。`;
+    return `No new conversation activity in the range ${isoDate(sinceMs)} to ${isoDate(nowMs)}.`;
   }
 
   const parts: string[] = [];
-  const range = `${isoDate(metrics.earliestTs ?? sinceMs)} 至 ${isoDate(metrics.latestTs ?? nowMs)}`;
-  parts.push(`基于 ${metrics.sessionsAnalyzed} 个会话 (${range}):`);
+  const range = `${isoDate(metrics.earliestTs ?? sinceMs)} to ${isoDate(metrics.latestTs ?? nowMs)}`;
+  parts.push(`Based on ${metrics.sessionsAnalyzed} session(s) (${range}):`);
 
   const sortedTools = Object.entries(metrics.toolCalls).sort((a, b) => b[1] - a[1]).slice(0, TOOL_TOP_N);
   if (sortedTools.length) {
     parts.push('');
-    parts.push('**工具调用**:');
-    for (const [name, n] of sortedTools) parts.push(`- ${name}: ${n} 次`);
+    parts.push('**Tool calls**:');
+    for (const [name, n] of sortedTools) parts.push(`- ${name}: ${n}`);
   }
 
   if (metrics.errorCount > 0) {
     parts.push('');
-    parts.push(`**错误总数**: ${metrics.errorCount}`);
+    parts.push(`**Total errors**: ${metrics.errorCount}`);
     if (metrics.errorSamples.length) {
-      parts.push('**错误样本**:');
+      parts.push('**Error samples**:');
       for (const s of metrics.errorSamples) parts.push(`- ${s}`);
     }
   }
@@ -118,7 +118,7 @@ export function formatDigest(metrics: SessionMetrics, sinceMs: number, nowMs: nu
   const sortedSkills = Object.entries(metrics.skillsLoaded).sort((a, b) => b[1] - a[1]).slice(0, SKILLS_TOP_N);
   if (sortedSkills.length) {
     parts.push('');
-    parts.push('**加载的技能**:');
+    parts.push('**Skills loaded**:');
     for (const [id, n] of sortedSkills) parts.push(`- ${id}${n > 1 ? ` (${n}x)` : ''}`);
   }
 

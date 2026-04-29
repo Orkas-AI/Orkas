@@ -128,7 +128,7 @@ describe('reflection-digest › formatDigest', () => {
   it('returns "no activity" when nothing was analyzed', async () => {
     const mod = await loadModule();
     const out = mod.formatDigest(mod.emptyMetrics(), Date.parse('2026-04-21'), Date.parse('2026-04-23'));
-    expect(out).toMatch(/无新增对话活动/);
+    expect(out).toMatch(/No new conversation activity/);
   });
 
   it('formats a populated digest with all sections', async () => {
@@ -143,10 +143,10 @@ describe('reflection-digest › formatDigest', () => {
     m.latestTs = Date.parse('2026-04-23T10:00:00Z');
 
     const out = mod.formatDigest(m, m.earliestTs, Date.now());
-    expect(out).toContain('3 个会话');
-    expect(out).toContain('bash: 5 次');
-    expect(out).toContain('web_search: 2 次');
-    expect(out).toContain('错误总数**: 2');
+    expect(out).toContain('3 session');
+    expect(out).toContain('bash: 5');
+    expect(out).toContain('web_search: 2');
+    expect(out).toContain('Total errors**: 2');
     expect(out).toContain('rate limit');
     expect(out).toContain('recover-foo (3x)');
   });
@@ -157,8 +157,8 @@ describe('reflection-digest › formatDigest', () => {
     m.sessionsAnalyzed = 1;
     m.toolCalls = { bash: 1 };
     const out = mod.formatDigest(m, Date.now() - 1000, Date.now());
-    expect(out).not.toContain('错误总数');
-    expect(out).not.toContain('错误样本');
+    expect(out).not.toContain('Total errors');
+    expect(out).not.toContain('Error samples');
   });
 
   it('caps tool list at top-N most-called', async () => {
@@ -208,7 +208,7 @@ describe('reflection-digest › buildAgentReflectionDigest', () => {
   it('returns "no activity" when no matching conversations exist', async () => {
     const mod = await loadModule();
     const out = await mod.buildAgentReflectionDigest(TEST_UID, '_default', Date.now() - 86400000);
-    expect(out).toMatch(/无新增对话活动/);
+    expect(out).toMatch(/No new conversation activity/);
   });
 
   it('aggregates only conversations matching the target agent_id', async () => {
@@ -243,7 +243,7 @@ describe('reflection-digest › buildAgentReflectionDigest', () => {
     const mod = await loadModule();
     const since = Date.now() - 86400000; // last 24h
     const digest = await mod.buildAgentReflectionDigest(TEST_UID, '_default', since);
-    expect(digest).toMatch(/无新增对话活动/);
+    expect(digest).toMatch(/No new conversation activity/);
   });
 
   it('tolerates malformed jsonl lines and missing files', async () => {

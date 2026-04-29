@@ -292,86 +292,86 @@ describe('shouldReflect', () => {
 describe('buildAdaptiveReviewPrompt', () => {
   it('builds error_recovery focused prompt', () => {
     const prompt = buildAdaptiveReviewPrompt('error_recovery', '', '');
-    expect(prompt).toContain('从错误中恢复');
+    expect(prompt).toContain('recovered from an error');
     expect(prompt).toContain('skill_manage');
     expect(prompt).toContain('metacognition');
   });
 
   it('builds user_correction focused prompt', () => {
     const prompt = buildAdaptiveReviewPrompt('user_correction', '', '');
-    expect(prompt).toContain('纠正');
+    expect(prompt).toContain('corrected your approach');
     expect(prompt).toContain('COMPETENCE');
   });
 
   it('builds skill_ineffective focused prompt', () => {
     const prompt = buildAdaptiveReviewPrompt('skill_ineffective', '', '');
-    expect(prompt).toContain('没有帮到');
-    expect(prompt).toContain('修补或删除');
+    expect(prompt).toContain('did not help');
+    expect(prompt).toContain('Patch or delete');
   });
 
   it('builds known_weakness focused prompt', () => {
     const prompt = buildAdaptiveReviewPrompt('known_weakness', '', '');
-    expect(prompt).toContain('已知弱点');
-    expect(prompt).toContain('加强');
+    expect(prompt).toContain('known weaknesses');
+    expect(prompt).toContain('Strengthen');
   });
 
   it('builds complexity default prompt', () => {
     const prompt = buildAdaptiveReviewPrompt('complexity', '', '');
-    expect(prompt).toContain('复杂');
+    expect(prompt).toContain('complex task');
   });
 
   it('includes competence content', () => {
-    const prompt = buildAdaptiveReviewPrompt('complexity', '我擅长 Python', '');
-    expect(prompt).toContain('我擅长 Python');
-    expect(prompt).not.toContain('尚无自我评估');
+    const prompt = buildAdaptiveReviewPrompt('complexity', 'I am strong at Python', '');
+    expect(prompt).toContain('I am strong at Python');
+    expect(prompt).not.toContain('No self-assessment yet');
   });
 
   it('shows placeholder when no competence', () => {
     const prompt = buildAdaptiveReviewPrompt('complexity', '', '');
-    expect(prompt).toContain('尚无自我评估');
+    expect(prompt).toContain('No self-assessment yet');
   });
 
   it('includes strategies content', () => {
-    const prompt = buildAdaptiveReviewPrompt('complexity', '', '错误提取法');
-    expect(prompt).toContain('错误提取法');
-    expect(prompt).not.toContain('尚无策略记录');
+    const prompt = buildAdaptiveReviewPrompt('complexity', '', 'Error extraction pattern');
+    expect(prompt).toContain('Error extraction pattern');
+    expect(prompt).not.toContain('No strategy log yet');
   });
 
   it('includes skill health report when provided', () => {
     const report = '- docker-debug: effectiveness 0.83, healthy';
     const prompt = buildAdaptiveReviewPrompt('complexity', '', '', report);
-    expect(prompt).toContain('技能健康度报告');
+    expect(prompt).toContain('Skill health report');
     expect(prompt).toContain('docker-debug');
   });
 
   it('omits skill health section when not provided', () => {
     const prompt = buildAdaptiveReviewPrompt('complexity', '', '');
-    expect(prompt).not.toContain('技能健康度报告');
+    expect(prompt).not.toContain('Skill health report');
   });
 
   it('includes conversation digest when provided', () => {
-    const digest = '使用的工具: bash, read_file\n加载的技能: docker-debug\n--- 对话最终回复 ---\n修复了 Docker 容器无法启动的问题';
+    const digest = 'Tools used: bash, read_file\nSkills loaded: docker-debug\n--- final reply ---\nFixed Docker container that failed to start';
     const prompt = buildAdaptiveReviewPrompt('error_recovery', '', '', undefined, digest);
     expect(prompt).toContain('docker-debug');
-    expect(prompt).toContain('Docker 容器');
-    expect(prompt).toContain('对话最终回复');
+    expect(prompt).toContain('Docker container');
+    expect(prompt).toContain('final reply');
   });
 
   it('omits conversation digest content when not provided', () => {
     const prompt = buildAdaptiveReviewPrompt('complexity', '', '');
-    expect(prompt).not.toContain('对话最终回复');
+    expect(prompt).not.toContain('final reply');
   });
 
   it('builds weakness_succeeded focused prompt', () => {
     const prompt = buildAdaptiveReviewPrompt('weakness_succeeded', '', '');
-    expect(prompt).toContain('表现正常');
-    expect(prompt).toContain('移除或降级');
-    expect(prompt).toContain('不要修改或删除相关技能');
+    expect(prompt).toContain('performed normally');
+    expect(prompt).toContain('remove or downgrade');
+    expect(prompt).toContain('Do not modify or delete the related skills');
   });
 
   it('includes transient error guidance in all prompts', () => {
     const prompt = buildAdaptiveReviewPrompt('complexity', '', '');
-    expect(prompt).toContain('瞬态错误是环境问题');
-    expect(prompt).toContain('不要在 COMPETENCE.md 标记为弱点');
+    expect(prompt).toContain('transient errors');
+    expect(prompt).toContain('Do not mark them as weaknesses in COMPETENCE.md');
   });
 });
