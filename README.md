@@ -96,12 +96,11 @@ The other evolution path is the `skill_manage` tool: an agent can crystallize "t
 ```bash
 git clone https://github.com/Orkas-AI/Orkas.git
 cd Orkas
-npm install        # postinstall fetches the embedding model + rebuilds sqlite for Electron's ABI
 ./run.sh           # macOS / Linux
 run.cmd            # Windows
 ```
 
-First launch creates a workspace under `~/.orkas/` (macOS / Linux) or `<smallest non-system drive>:\.orkas\` (Windows). Then go to **Settings → AI Providers** to configure an API key or OAuth.
+`run.sh` / `run.cmd` auto-installs dependencies and downloads the embedding model (~95 MB). First launch creates a workspace under `~/.orkas/` (macOS / Linux) or `<smallest non-system drive>:\.orkas\` (Windows). Then go to **Settings → AI Providers** to configure an API key or OAuth.
 
 > Pre-built installers will be published to [GitHub Releases](https://github.com/Orkas-AI/Orkas/releases) once builds stabilize.
 
