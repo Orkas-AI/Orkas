@@ -98,9 +98,10 @@
         ]
       }
     ],
+    "afterPack": "scripts/codesign-adhoc.cjs",
     "mac": {
       "category": "public.app-category.productivity",
-      "identity": "-",
+      "identity": null,
       "target": [
         {
           "target": "dmg",
