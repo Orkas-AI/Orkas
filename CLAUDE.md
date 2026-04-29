@@ -262,7 +262,9 @@ Strings live in `src/{renderer,main}/locales/{zh,en}.json`; lookup goes through 
 
 ### Git commit
 
-Commit messages **must be in English** — title + body + any footer. **Why:** the open-source repo has a global audience; Chinese commits read incoherently in GitHub history and break traceability for contributors writing release notes / running automation. Existing Chinese commits don't need to be rewritten; new code follows the rule. **Exception:** sync commits mirroring a Chinese-titled `PC/` source commit may keep the source title verbatim (per `OpenSource/SyncCode/PC-to-OrkasOpen.md` §3) — translation would break grep traceability against the source SHA.
+Commit messages **must be in English** — title + body + any footer — **no exceptions**. **Why:** the open-source repo has a global audience; Chinese commits read incoherently in GitHub history and break traceability for contributors writing release notes / running automation.
+
+The commit message is **about the change**, not about how it got here. Sync provenance (e.g. "this came from a PC commit") belongs in `OpenSource/SyncCode/sync-state.json`, **not** in the commit body. Write the message exactly as you would for a fresh OrkasOpen-native change.
 
 ### After a change
 
