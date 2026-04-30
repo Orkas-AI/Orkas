@@ -102,8 +102,6 @@ run.cmd            # Windows
 
 `run.sh` / `run.cmd` 会自动安装依赖并下载嵌入模型（约 95 MB）。首次启动后会在 `~/.orkas/`（macOS / Linux）或 `<字母最小的非系统盘>:\.orkas\`（Windows）创建工作目录，然后**设置 → AI 模型供应商**配置 API key 或 OAuth。
 
-> 打包安装包稳定后会发布到 [GitHub Releases](https://github.com/Orkas-AI/Orkas/releases)。
-
 ---
 
 ## 致谢

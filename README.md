@@ -102,8 +102,6 @@ run.cmd            # Windows
 
 `run.sh` / `run.cmd` auto-installs dependencies and downloads the embedding model (~95 MB). First launch creates a workspace under `~/.orkas/` (macOS / Linux) or `<smallest non-system drive>:\.orkas\` (Windows). Then go to **Settings → AI Providers** to configure an API key or OAuth.
 
-> Pre-built installers will be published to [GitHub Releases](https://github.com/Orkas-AI/Orkas/releases) once builds stabilize.
-
 ---
 
 ## Acknowledgments
