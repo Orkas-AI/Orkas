@@ -172,9 +172,11 @@ if (typeof window !== 'undefined') {
 
 // ─── Recipient chip — per-cid for conversations, ephemeral for new-chat ──
 // Each persisted conversation remembers its own last-picked recipient (so
-// switching between conversations restores their distinct contexts). The
-// new-chat ("指挥官") landing is a fresh slate every visit — it always
-// starts as commander; mid-session picks aren't persisted.
+// switching between conversations restores their distinct contexts) and
+// stays sticky on view-enter — the only thing that overrides it is the
+// auto-switch to a live interactive agent (see `_evaluateAutoRecipient`).
+// The new-chat ("指挥官") landing resets to commander only when its input
+// box is empty; otherwise the user's in-progress draft keeps its target.
 const _COMMANDER = { kind: 'commander', id: '', name: '' };
 const _RECIPIENT_LS_KEY = 'chat.recipientByCid';
 let _recipientByCid = {};       // { [cid]: {kind,id,name} } — agents only; commander = absence
@@ -209,13 +211,7 @@ function _activeRecipient(target) {
 
 function getChatRecipient(target) { return { ..._activeRecipient(target) }; }
 
-// Per-cid flag: once the user manually picks a recipient during a plan run,
-// we stop auto-switching them around as interactive agents come and go. The
-// flag clears when the plan finishes (no more interactive in_progress steps
-// AND no agent currently auto-targeted) — see `_evaluateAutoRecipient`.
-const _autoSwitchSuppressed = new Set();
-
-function setChatRecipient(target, next, { auto = false } = {}) {
+function setChatRecipient(target, next, _opts = {}) {
   const r = _normRecipient(next);
   if (!r) return;
   if (target === 'new-chat') {
@@ -224,10 +220,6 @@ function setChatRecipient(target, next, { auto = false } = {}) {
     if (r.kind === 'commander') delete _recipientByCid[currentCid];
     else _recipientByCid[currentCid] = r;
     _saveRecipientMap();
-    // Manual pick during a running plan — silence auto-switching for this cid
-    // until the plan settles. Auto-switch callers pass `{ auto: true }` and
-    // never trip this flag.
-    if (!auto) _autoSwitchSuppressed.add(currentCid);
   }
   _renderRecipientChip(target);
 }
@@ -265,18 +257,21 @@ function _renderRecipientChip(target) {
 
 // Hooks called by setView (boot.js) so the chip mirrors the active context.
 function onEnterNewChatView() {
-  _newChatRecipient = { ..._COMMANDER };
+  // The new-chat input is the only place the recipient is ephemeral. Reset
+  // to commander only when the textarea is empty — if the user has typed
+  // anything, treat that as an in-progress message whose target they
+  // already chose, and leave the chip alone.
+  const input = document.getElementById('new-chat-input');
+  const hasDraft = !!(input && input.value);
+  if (!hasDraft) _newChatRecipient = { ..._COMMANDER };
   _renderRecipientChip('new-chat');
 }
 function onEnterConversationView() {
   _renderRecipientChip('conversation');
-  // Re-arm auto-switching for this cid — switching views is a fresh slate
-  // for the suppression flag (any past manual pick is already persisted in
-  // localStorage as the chip's starting state).
-  if (currentCid) _autoSwitchSuppressed.delete(currentCid);
   // Kick a one-shot evaluation so that a cid mid-plan picks up its current
   // interactive assignee even if no plan_changed/state_changed event fires
-  // before the user types.
+  // before the user types. View-enter never reverts to commander (see
+  // `_evaluateAutoRecipient`); the persisted per-cid pick stays sticky.
   if (currentCid) _evaluateAutoRecipient(currentCid);
 }
 
@@ -286,7 +281,6 @@ function _forgetCidRecipient(cid) {
   if (!cid || !_recipientByCid[cid]) return;
   delete _recipientByCid[cid];
   _saveRecipientMap();
-  _autoSwitchSuppressed.delete(cid);
   _latestInFlight.delete(cid);
   _lastInteractiveTurnAgent.delete(cid);
 }
@@ -295,22 +289,23 @@ function _forgetCidRecipient(cid) {
 // Goal: when a plan step assigned to an `interactive: true` agent enters
 // `in_progress`, default the input box recipient to that agent so the user's
 // next reply lands there without manual @-mention. When no interactive step
-// is in flight, revert to commander. Manual user picks suppress this until
-// the plan settles back to commander (then we re-arm).
+// is in flight, leave the recipient alone — the persisted per-cid pick is
+// the source of truth. Auto-switching to a live interactive agent always
+// wins, even over a manual pick (the user explicitly asked for this).
 //
 // Concurrency notes:
 //   - Multiple interactive in_progress steps → take the latest plan index
 //     ("most recently dispatched" matches user intent in linear chains; in
 //     true fan-out interactive agents are a degenerate case the user can
-//     correct manually, which then trips _autoSwitchSuppressed).
+//     correct manually).
 //   - Re-entrancy guarded by `_autoEvalInflight` so back-to-back plan_changed
 //     + state_changed events coalesce into one fetch round.
 //   - Sticky beyond `in_progress`: an interactive agent's step often ends
 //     `blocked` (form pause) or even `done` (back-and-forth tutoring with
-//     no form) before the user has typed a single character. Reverting to
-//     commander the instant the agent's turn settles erases the auto-target
-//     before it has any value. Logic widens to "blocked and done count too,
-//     last terminal step's assignee wins when no live step is running".
+//     no form) before the user has typed a single character. Reverting away
+//     the instant the agent's turn settles erases the auto-target before it
+//     has any value. Logic widens to "blocked and done count too, last
+//     terminal step's assignee wins when no live step is running".
 const _autoEvalInflight = new Set(); // cid set
 const _latestInFlight = new Map();   // cid → string[] (mirrors state_changed.state.in_flight)
 // cid → most recent interactive agent that produced an end-of-turn message.
@@ -331,22 +326,11 @@ async function _evaluateAutoRecipient(cid) {
     if (cid !== currentCid) return; // user navigated away mid-fetch
     const inFlight = _latestInFlight.get(cid) || [];
     const interactiveAgent = _pickInteractiveAgent(plan, members || [], inFlight);
+    if (!interactiveAgent) return; // no live interactive target — keep the persisted pick
     const cur = _activeRecipient('conversation');
-    if (interactiveAgent) {
-      if (_autoSwitchSuppressed.has(cid)) return; // user picked manually; respect
-      if (cur.kind === 'agent' && cur.id === interactiveAgent.id) return;
-      setChatRecipient('conversation',
-        { kind: 'agent', id: interactiveAgent.id, name: interactiveAgent.name },
-        { auto: true });
-    } else {
-      // No interactive step in flight → revert to commander, and re-arm
-      // auto-switch (suppression only meant to last for the active dispatch
-      // window the user pushed back on).
-      _autoSwitchSuppressed.delete(cid);
-      if (cur.kind !== 'commander') {
-        setChatRecipient('conversation', { kind: 'commander' }, { auto: true });
-      }
-    }
+    if (cur.kind === 'agent' && cur.id === interactiveAgent.id) return;
+    setChatRecipient('conversation',
+      { kind: 'agent', id: interactiveAgent.id, name: interactiveAgent.name });
   } catch (err) {
     _convLog?.warn?.('auto-recipient evaluate failed', err);
   } finally {
@@ -364,7 +348,8 @@ async function _fetchPlanForAutoRecipient(cid) {
 }
 
 function _pickInteractiveAgent(plan, members, inFlight) {
-  // Commander mid-turn → it's about to speak, give it the chip back.
+  // Commander mid-turn → don't auto-switch to an agent (commander's reply is
+  // about to land); leave the persisted recipient as-is.
   if (Array.isArray(inFlight) && inFlight.includes('commander')) return null;
 
   const byName = new Map();
