@@ -1001,6 +1001,19 @@ export async function clearSkillChat(userId: string, skillId: string): Promise<b
   }
   invalidateLineCount(skillChatMsgsPath(userId, skillId));
   search.dropSkillChat(userId, skillId);
+  // Also evict + drop the core-agent persistent session jsonl. Without this
+  // the LLM retains its full prior context (tool calls, paths, file contents)
+  // even though the UI history is empty — visible as the LLM "remembering"
+  // pre-clear state, e.g. trying to read paths that no longer exist after a
+  // promote-to-builtin. Session id is id-keyed so it survives source changes.
+  const sessionId = defaultSkillSessionId(userId, skillId);
+  try { evictSession(sessionId); } catch { /* not in cache */ }
+  try { await fsp.unlink(userSessionFile(userId, sessionId)); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn(`session unlink user=${userId} skill=${skillId}: ${(err as Error).message}`);
+    }
+  }
   log.info(`cleared user=${userId} skill=${skillId}`);
   return true;
 }

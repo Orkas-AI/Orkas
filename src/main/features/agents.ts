@@ -956,6 +956,18 @@ export async function clearAgentChat(userId: string, agentId: string): Promise<b
   }
   invalidateLineCount(agentChatMsgsPath(userId, agentId));
   search.dropAgentChat(userId, agentId);
+  // Also evict + drop the core-agent persistent session jsonl. Without this
+  // the LLM retains its full prior context even though the UI history is
+  // empty — same bug pattern as clearSkillChat (paths from before a
+  // promote-to-builtin survive in the LLM's memory).
+  const sessionId = defaultAgentEditSessionId(userId, agentId);
+  try { evictSession(sessionId); } catch { /* not in cache */ }
+  try { await fsp.unlink(userSessionFile(userId, sessionId)); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn(`session unlink user=${userId} agent=${agentId}: ${(err as Error).message}`);
+    }
+  }
   log.info(`cleared user=${userId} agent=${agentId}`);
   return true;
 }

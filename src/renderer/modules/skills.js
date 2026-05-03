@@ -981,7 +981,10 @@ async function clearSkillChat() {
 async function _refreshSkillView() {
   if (!_skillEditSkillId) return;
   const sid = _skillEditSkillId;
-  const source = 'custom';
+  // Source must come from the active selection, not be hardcoded — dev-mode
+  // built-in editing reuses this same path and was previously bailing here
+  // because of a 'custom'-only equality check.
+  const source = _selectedSkill?.source || 'custom';
 
   // Refresh the skill list cache (in case name/description in SKILL.md changed)
   _skillsCache = null;
