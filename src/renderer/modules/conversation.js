@@ -539,6 +539,12 @@ async function _refreshGroupMembers(cid) {
     const data = await res.json();
     if (data?.ok && Array.isArray(data.actors)) {
       _groupMembersCache.set(cid, data.actors);
+      // Roster change can flip the inline "create agent" button visibility:
+      // a freshly @-mentioned agent joins members.json before it streams a
+      // reply, and the button must hide as soon as that happens.
+      if (cid === currentCid) {
+        try { _ensureConvCreateAgentInline(); } catch (_) { /* non-fatal */ }
+      }
       return data.actors;
     }
   } catch (_) { /* non-fatal */ }
@@ -1072,13 +1078,17 @@ function _ensureConvCreateAgentInline() {
   }
   const hasUserMsg = !!container.querySelector('.chat-message.user');
   const isStreaming = !!spacer;
-  // 调度过 agent 后这条入口就不再展示 —— 多 agent 流里"沉淀单一 agent"的
-  // 语义已不成立。判定：assistant 消息里出现过 _from 既非空、又非 commander
-  // 的（即真正 agent 的发言）。
-  const hasAgentMsg = Array.from(
-    container.querySelectorAll('.chat-message.assistant[data-from]'),
+  // 一旦有非 commander/user 的 agent 进入对话就隐藏入口 —— 多 agent 流里
+  // "沉淀单一 agent" 的语义已不成立。两路证据都算：
+  //   1) 群成员名册里出现 kind==='agent'（最权威：包含被 @ 但还没回话的）；
+  //   2) DOM 里出现过 _from / fromActor 既非空也非 commander/user 的发言
+  //      （兜底：成员缓存还没拉到时也能触发）。
+  const members = _groupMembersCache.get(currentCid) || [];
+  const hasAgentMember = members.some((a) => a && a.kind === 'agent');
+  const hasAgentMsg = hasAgentMember || Array.from(
+    container.querySelectorAll('.chat-message.assistant'),
   ).some((m) => {
-    const f = m.dataset.from;
+    const f = m.dataset.from || m.dataset.fromActor;
     return f && f !== 'commander' && f !== 'user';
   });
   el.style.display = (hasUserMsg && !isStreaming && !hasAgentMsg) ? '' : 'none';
