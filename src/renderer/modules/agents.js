@@ -690,7 +690,11 @@ async function _flushAgentFieldSave() {
     });
     const data = await res.json();
     if (!data.ok) throw new Error(data.error || 'save failed');
-    _agentsCache = null; // list may need a name refresh
+    // Eagerly refresh — name changes feed the chat-bubble @-mention regex
+    // (`_buildMentionRe` reads `_agentsCache`); leaving the cache null until
+    // the next picker open means freshly-typed `@<multi-word-name>` only
+    // gets the fallback char class, which stops at the first whitespace.
+    await loadAgents(true);
   } catch (e) {
     _agentsLog.warn('save agent field failed', e);
     if (field === 'name') {

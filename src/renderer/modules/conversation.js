@@ -493,37 +493,39 @@ function _renderActorAvatarHtml(fromId) {
     const a = _commanderAvatar();
     return renderAvatarHtml(a.icon, a.color, { size: 28, seed: 'commander' });
   }
-  // agent_id：先看群成员缓存（带 icon/color 字段），再看全局 agents 缓存。
+  // 全局 agents registry 优先 —— 它始终是当前真相;群成员缓存只是入会时
+  // 的快照,改名 / 改头像后不会跟着动,作为兜底覆盖"agent 已被删除、
+  // registry 查不到"的旧会话场景。
   let icon, color;
-  const members = _groupMembersCache.get(currentCid);
-  if (members) {
-    const m = members.find((x) => x.id === fromId);
-    if (m) { icon = m.icon; color = m.color; }
-  }
-  if ((!icon || !color) && typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
+  if (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
     const a = _agentsCache.find((x) => x && x.agent_id === fromId);
-    if (a) { icon = icon || a.icon; color = color || a.color; }
+    if (a) { icon = a.icon; color = a.color; }
+  }
+  if (!icon || !color) {
+    const members = _groupMembersCache.get(currentCid);
+    if (members) {
+      const m = members.find((x) => x.id === fromId);
+      if (m) { icon = icon || m.icon; color = color || m.color; }
+    }
   }
   return renderAvatarHtml(icon, color, { size: 28, seed: fromId || 'agent' });
 }
 /** Resolve an actor id (commander / user / agent_id) to a human-readable
  *  display name. **Never returns the raw agent_id** — UI shouldn't expose
- *  hex strings to the user. Falls back to the global agents cache when
- *  the per-conv members roster hasn't loaded yet, then to a localized
- *  "智能体" placeholder as last resort. */
+ *  hex strings to the user. Global registry is checked first so renames
+ *  reflect immediately in old conversations; per-conv roster (a join-time
+ *  snapshot) is the fallback for agents the registry no longer knows about
+ *  (deleted agents whose old chats still need a label). */
 function _groupActorLabel(fromId) {
   if (fromId === 'user') return null;
   if (fromId === 'commander') return t('chat.from_commander') || '指挥官';
+  if (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
+    const a = _agentsCache.find((x) => x && x.agent_id === fromId);
+    if (a && a.name) return a.name;
+  }
   const cached = _groupMembersCache.get(currentCid);
   if (cached) {
     const a = cached.find((x) => x.id === fromId);
-    if (a && a.name) return a.name;
-  }
-  // Fall back to the global agents cache (loaded on view-mount by
-  // agents.js::loadAgents) — covers the window between history load and
-  // the per-conv members roster being fetched.
-  if (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
-    const a = _agentsCache.find((x) => x && x.agent_id === fromId);
     if (a && a.name) return a.name;
   }
   // Last resort: never leak the id. Show a neutral placeholder; the chip
@@ -1112,6 +1114,14 @@ async function loadConversationHistory(cid) {
   container.innerHTML = `<div class="empty">${escapeHtml(t('chat.loading'))}</div>`;
   _ensureCreateAgentInlineObserver();
   try {
+    // Warm `_agentsCache` if a chat-first session never visited the agents
+    // tab — `_buildMentionRe` / `_groupActorLabel` both read it for current
+    // names. Without this, a user who lands straight in a conversation gets
+    // multi-word `@<name>` highlighting truncated to the first whitespace.
+    if (typeof loadAgents === 'function'
+        && typeof _agentsCache !== 'undefined' && !_agentsCache) {
+      try { await loadAgents(); } catch (_) { /* non-fatal */ }
+    }
     const res = await apiFetch(`/api/conversations/${cid}/history?limit=500`);
     const data = await res.json();
     if (!data.ok) throw new Error(data.error || 'load failed');
