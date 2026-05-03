@@ -484,15 +484,43 @@ function _aiSelectMount(el, config) {
     });
   };
 
+  // Portal the popover to <body> while open so an ancestor with
+  // `overflow: auto / hidden` (modals, settings panes) can't clip it.
+  // We set `position: fixed` + viewport coords from the trigger's
+  // bounding rect; on scroll/resize we re-measure. This replaces the
+  // earlier "popover lives inside .ai-select" layout — the markup
+  // still renders the popover inside .ai-select for first paint, but
+  // open/close moves it back and forth.
+  let portalParent = null;
+  let portalNextSibling = null;
+  const reposition = () => {
+    if (!state.open) return;
+    const rect = trigger.getBoundingClientRect();
+    popover.style.position = 'fixed';
+    popover.style.left = rect.left + 'px';
+    popover.style.top = (rect.bottom + 4) + 'px';
+    popover.style.width = rect.width + 'px';
+    // Flip up if the popover would overflow the viewport bottom.
+    const popH = popover.offsetHeight || 260;
+    if (rect.bottom + 4 + popH > window.innerHeight - 8 && rect.top - 4 - popH > 8) {
+      popover.style.top = (rect.top - 4 - popH) + 'px';
+    }
+  };
   const open = () => {
     if (state.open) return;
     state.open = true;
     el.classList.add('open');
     popover.hidden = false;
+    portalParent = popover.parentNode;
+    portalNextSibling = popover.nextSibling;
+    document.body.appendChild(popover);
     state.activeIdx = Math.max(0, state.options.findIndex(o => o.value === state.value));
     renderPopover();
+    reposition();
     setTimeout(() => document.addEventListener('mousedown', onDocDown, true), 0);
     document.addEventListener('keydown', onKey, true);
+    window.addEventListener('scroll', reposition, true);
+    window.addEventListener('resize', reposition, true);
   };
 
   const close = () => {
@@ -500,8 +528,27 @@ function _aiSelectMount(el, config) {
     state.open = false;
     el.classList.remove('open');
     popover.hidden = true;
+    popover.style.position = '';
+    popover.style.left = '';
+    popover.style.top = '';
+    popover.style.width = '';
+    // Restore popover to its original parent if that parent is still
+    // attached to the document. If the host widget got removed mid-open
+    // (e.g., the detail page re-rendered and replaced our slot), just
+    // detach the popover so it doesn't dangle on document.body.
+    if (portalParent) {
+      if (portalParent.isConnected) {
+        portalParent.insertBefore(popover, portalNextSibling);
+      } else if (popover.parentNode) {
+        popover.parentNode.removeChild(popover);
+      }
+      portalParent = null;
+      portalNextSibling = null;
+    }
     document.removeEventListener('mousedown', onDocDown, true);
     document.removeEventListener('keydown', onKey, true);
+    window.removeEventListener('scroll', reposition, true);
+    window.removeEventListener('resize', reposition, true);
   };
 
   const onDocDown = (e) => { if (!el.contains(e.target)) close(); };

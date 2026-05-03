@@ -1530,11 +1530,14 @@ body.model-not-configured .main-content { flex-direction: column; }
      spacer (`.chat-scroll-spacer`, 100vh) doesn't bloat the flex child past
      its parent and break internal overflow scrolling. */
   min-height: 0;
-  /* Bottom: breathing room for the last bubble — the old 160px cushion is
-     now provided by `margin-bottom` below (which also shrinks the scrollbar
-     track clear of the floating input so the thumb stays visible when
-     scrolled to the end). */
-  padding: 24px 10%;
+  /* Bottom: 80px **inside** the scroll viewport so when the user
+     scrolls all the way down the last bubble has breathing room above
+     the floating input area / attachment chips. The 140px margin-bottom
+     keeps the scrollbar track clear of the floating input so the thumb
+     stays visible at the end. We use padding-bottom (NOT bigger margin)
+     because the goal is more whitespace inside the scroll view, not
+     pushing the viewport upward — that was the wrong fix earlier. */
+  padding: 24px 10% 80px;
   margin-bottom: 140px;
   overflow-y: auto;
   display: flex;
@@ -4004,8 +4007,12 @@ body.model-not-configured .main-content { flex-direction: column; }
 .agent-card-actions {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: space-between;
+  gap: 8px;
 }
+/* When no chip is present, the play button still hugs the right edge.
+   `margin-left: auto` plays nice with the absent-chip case. */
+.agent-card-actions > .agent-card-use { margin-left: auto; }
 
 /* `.agent-card-use` shared with `.skill-card-use` / `.btn-icon-use` above. */
 
@@ -4103,7 +4110,6 @@ body.model-not-configured .main-content { flex-direction: column; }
 }
 
 .agents-detail-name {
-  flex: 1;
   min-width: 0;
   font-size: 17px;
   font-weight: 600;
@@ -4123,14 +4129,17 @@ body.model-not-configured .main-content { flex-direction: column; }
   box-shadow: 0 0 0 2px var(--primary) inset;
 }
 
+/* Sits on the same row as the agent name, mirroring the skill detail
+   header layout (.skills-doc-source). The title row is already a
+   wrapping flex container; this chip rides along with it. */
 .agents-detail-source {
-  margin-top: 8px;
   font-size: 11px;
   font-weight: 600;
   display: inline-block;
   padding: 2px 8px;
   border-radius: 10px;
   letter-spacing: 0.4px;
+  align-self: center;
 }
 .agents-detail-source.is-builtin { background: rgba(148, 163, 184, 0.15); color: #475569; }
 .agents-detail-source.is-custom  { background: rgba(37, 99, 235, 0.12); color: var(--primary); }
@@ -4506,7 +4515,12 @@ body.model-not-configured .main-content { flex-direction: column; }
   top: calc(100% + 4px);
   left: 0;
   right: 0;
-  z-index: 40;
+  /* Popovers portal to <body> at open time (see _aiSelectMount) so
+     they can escape parent overflow:auto. They must therefore beat
+     every overlay they could appear inside. `.modal-overlay` is 100,
+     `.ui-dialog-overlay` is 200, the avatar picker is 300, common
+     toasts top out at 1000 — pick a value above all of them. */
+  z-index: 1200;
   background: #fff;
   border: 1px solid var(--border, #e5e7eb);
   border-radius: 8px;
@@ -5037,3 +5051,23 @@ body.model-not-configured .main-content { flex-direction: column; }
   outline-offset: 2px;
   transform: scale(1.05);
 }
+
+/* Agent CLI badge — both grid card chip and detail header pill share
+   .is-cli; per-CLI tints are layered through .is-cli-<type> so future
+   styling can pick brand-specific accents without touching markup. */
+.agent-card-chip.is-cli {
+  display: inline-block;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: #3730a3;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+/* Runtime selector lives at the top of the detail body; widget is
+   wider than a chip so it sits on its own row. Capped width keeps
+   the dropdown from spanning the entire body. */
+.agents-detail-runtime { display: block; }
+.agents-detail-runtime-select { max-width: 280px; }

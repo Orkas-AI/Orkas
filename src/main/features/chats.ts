@@ -209,6 +209,17 @@ export async function deleteConversation(userId: string, cid: string): Promise<b
     if (typeof att?.purgeByCid === 'function') await att.purgeByCid(userId, cid);
   } catch (err) { log.warn(`purge attachments user=${userId} cid=${cid}: ${(err as Error).message}`); }
 
+  // Drop CLI session bindings — the next time this cid is reused (or
+  // a same-id collision, defensive), CLI agents start fresh. Their
+  // own machine-local session files (~/.claude/...) are left alone;
+  // claude self-GCs.
+  try {
+    const cliSessions = require('./local_agents/sessions');
+    if (typeof cliSessions?.clearForConversation === 'function') {
+      await cliSessions.clearForConversation(userId, cid);
+    }
+  } catch (err) { log.warn(`purge cli sessions user=${userId} cid=${cid}: ${(err as Error).message}`); }
+
   log.info(`deleted user=${userId} cid=${cid}`);
   return true;
 }

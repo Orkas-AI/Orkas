@@ -120,6 +120,15 @@ export interface Agent {
    * to manually @-mention every reply. Maintained by the agent-edit LLM
    * via the `<interactive>` child of `<agent>`; missing = false. */
   interactive?: boolean;
+  /** Execution backend. Missing / `kind === 'in_process'` (the default)
+   *  means the agent runs through `core-agent` like every existing
+   *  agent. `kind === 'cli'` routes the worker turn through
+   *  `features/local_agents/runner.ts` to spawn a local coding CLI
+   *  (claude code / codex / openclaw / opencode / hermes). The field is
+   *  set at create time from the modal's runtime selector and edited
+   *  via the dedicated `chat_agent_setup_cli.md` prompt; the LLM
+   *  doesn't author it directly. */
+  runtime?: AgentRuntime;
   source: AgentSource;
   created_at: string;
   updated_at: string;
@@ -144,7 +153,24 @@ interface AgentRaw {
   icon?: unknown;
   color?: unknown;
   interactive?: unknown;
+  runtime?: unknown;
 }
+
+/** Per-agent execution backend. See `Agent.runtime`. */
+export type AgentRuntime =
+  | { kind: 'in_process' }
+  | {
+      kind: 'cli';
+      /** Canonical CLI type — must match `LOCAL_CLI_TYPES` in
+       *  `features/local_agents/registry.ts`. Validated on read; an
+       *  unknown value drops the runtime field entirely. */
+      cli: string;
+      /** Optional model id; empty means "let the CLI pick its default". */
+      model?: string;
+      /** Extra CLI flags appended after our own args. Strings only;
+       *  not shell-parsed by us. */
+      custom_args?: string[];
+    };
 
 // 头像 token 校验走 catalog 白名单（src/main/data/avatars.json 是单一真相源）。
 // renderer/modules/avatar.js 也从同一份文件拉数据，前后端不再有任何重复。
@@ -417,7 +443,37 @@ export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSo
   } else if (raw.interactive === 'false') {
     agent.interactive = false;
   }
+  const rt = _normalizeRuntime(raw.runtime);
+  if (rt) agent.runtime = rt;
   return agent;
+}
+
+/** Validate / coerce a raw `runtime` field. Unknown shapes return null
+ *  (= drop the field; the agent falls back to the in-process default).
+ *  Kept loose on purpose: front-end and edit-prompt may both write here
+ *  and a malformed value mustn't poison reads. */
+function _normalizeRuntime(raw: unknown): AgentRuntime | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const kind = r.kind;
+  if (kind === 'in_process') return { kind: 'in_process' };
+  if (kind !== 'cli') return null;
+  const cli = typeof r.cli === 'string' ? r.cli.trim() : '';
+  if (!cli) return null;
+  const out: AgentRuntime = { kind: 'cli', cli };
+  if (typeof r.model === 'string' && r.model.trim()) out.model = r.model.trim();
+  if (Array.isArray(r.custom_args)) {
+    const args = r.custom_args.filter((s): s is string => typeof s === 'string');
+    if (args.length) out.custom_args = args;
+  }
+  return out;
+}
+
+/** True when this agent runs via a local CLI rather than in-process
+ *  core-agent. Single source of truth — group_chat / chats / renderer
+ *  all import this rather than re-checking `runtime?.kind` directly. */
+export function isCliAgent(agent: Pick<Agent, 'runtime'> | null | undefined): boolean {
+  return !!agent && agent.runtime?.kind === 'cli';
 }
 
 interface AgentListCache { stamp: string; data: Agent[] }
@@ -528,6 +584,9 @@ export interface CreateAgentOptions {
   icon?: string;
   color?: string;
   interactive?: boolean;
+  /** Picked at create time from the modal's runtime selector. Stored as
+   *  authored — `normalizeAgent` validates on read. */
+  runtime?: AgentRuntime;
 }
 
 /** Route a legacy `description` input into the matching language slot.
@@ -555,7 +614,7 @@ function resolveBilingualDescription(
  * manual edit. Returns the created agent.
  */
 export async function createCustomAgent(
-  { name = '', description = '', description_zh, description_en, workflow = '', icon, color, interactive }: CreateAgentOptions = {},
+  { name = '', description = '', description_zh, description_en, workflow = '', icon, color, interactive, runtime }: CreateAgentOptions = {},
 ): Promise<Agent | null> {
   assertAgentNameAllowed(name);
   fs.mkdirSync(CUSTOM_AGENTS_DIR(), { recursive: true });
@@ -578,6 +637,11 @@ export async function createCustomAgent(
   if (avatars.isKnownIcon(icon)) data.icon = icon;
   if (avatars.isKnownColor(color)) data.color = color;
   if (typeof interactive === 'boolean') data.interactive = interactive;
+  // Persist runtime only when it survives validation; an in_process
+  // selection is the implicit default and not written to disk so old
+  // tooling diffs cleanly.
+  const rt = _normalizeRuntime(runtime);
+  if (rt && rt.kind === 'cli') data.runtime = rt;
   await writeJson(customAgentFile(agentId), data);
   _invalidateAgentListCache();
   log.info(`created id=${agentId} name=${data.name}`);
@@ -608,6 +672,12 @@ export interface UpdateAgentFields {
    *   null  → drop the field (revert to "missing" = false at read time)
    *   omitted → untouched */
   interactive?: boolean | null;
+  /** Three-way update:
+   *   AgentRuntime → replace (validated; in_process collapses to "drop")
+   *   null         → drop runtime (revert to in_process default)
+   *   omitted      → untouched
+   *  Authored by the create modal + edit UI, not the LLM edit prompt. */
+  runtime?: AgentRuntime | null;
 }
 
 /**
@@ -623,6 +693,21 @@ export async function updateCustomAgent(
   const data = await readJson<AgentRaw>(f);
   if (Object.prototype.hasOwnProperty.call(updates || {}, 'name')) {
     assertAgentNameAllowed(typeof updates.name === 'string' ? updates.name : '');
+  }
+  // CLI-backed agents have no authored workflow / skill_list — the
+  // edit prompt forbids the LLM from emitting those tags, but if it
+  // slips up we silently drop the field so the spec stays clean.
+  // Compute on the post-update runtime: a runtime change in the same
+  // turn (in_process → cli) takes effect first, then the strip runs.
+  const incomingRuntime = Object.prototype.hasOwnProperty.call(updates || {}, 'runtime')
+    ? _normalizeRuntime((updates as any).runtime)
+    : null;
+  const effectiveCli = incomingRuntime
+    ? incomingRuntime.kind === 'cli'
+    : (_normalizeRuntime((data as any).runtime)?.kind === 'cli');
+  if (effectiveCli) {
+    if ('workflow' in (updates || {})) delete (updates as any).workflow;
+    if ('skill_list' in (updates || {})) delete (updates as any).skill_list;
   }
   for (const k of ['name', 'workflow'] as const) {
     if (Object.prototype.hasOwnProperty.call(updates || {}, k)) {
@@ -715,6 +800,30 @@ export async function updateCustomAgent(
       delete data.interactive;
     } else if (typeof v === 'boolean') {
       data.interactive = v;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'runtime')) {
+    const v = updates.runtime;
+    // The runtime *kind* is locked at create time. Once an agent is
+    // CLI-backed, post-create updates may only swap which CLI backs
+    // it (cli → cli with a different `cli` field); reverting to
+    // in-process would orphan the description / inputs that were
+    // authored for a CLI runtime. The renderer enforces this in the
+    // detail-page selector; we mirror it here so the rule survives
+    // any other update path (tests, future scripts, IPC misuse).
+    const existingKind: 'cli' | 'in_process' = data.runtime &&
+      _normalizeRuntime(data.runtime)?.kind === 'cli' ? 'cli' : 'in_process';
+    const incomingKind: 'cli' | 'in_process' | null = v === null
+      ? 'in_process'
+      : (_normalizeRuntime(v)?.kind === 'cli' ? 'cli' : 'in_process');
+    if (incomingKind !== null && incomingKind !== existingKind) {
+      log.warn(`agent ${agentId}: ignored runtime kind switch ${existingKind} → ${incomingKind}`);
+    } else if (v === null) {
+      delete data.runtime;
+    } else {
+      const rt = _normalizeRuntime(v);
+      if (!rt || rt.kind === 'in_process') delete data.runtime;
+      else data.runtime = rt;
     }
   }
   if (!data.name) data.name = '未命名智能体';
@@ -986,6 +1095,10 @@ export function buildAgentEditSystemPrompt(agent: {
   description_en?: string;
   workflow?: string;
   interactive?: boolean;
+  /** When the agent is CLI-backed, switch to `chat_agent_setup_cli.md`
+   *  which omits workflow/skills authoring and tells the LLM not to
+   *  emit those sub-tags. */
+  runtime?: AgentRuntime;
 }): string {
   // Resolve all three forms into a single legacy `$description` placeholder
   // (template still uses $description in this phase) plus the bilingual
@@ -995,14 +1108,30 @@ export function buildAgentEditSystemPrompt(agent: {
   const zh = (agent.description_zh || '').trim() || (legacy && isChinese ? legacy : '');
   const en = (agent.description_en || '').trim() || (legacy && !isChinese ? legacy : '');
   const display = legacy || zh || en;
-  const body = prompts.load('chat_agent_setup', {
-    name: agent.name || '',
-    description: display || '(not provided)',
-    description_zh: zh || '(not provided)',
-    description_en: en || '(not provided)',
-    workflow: (agent.workflow || '').trim() || '(not provided)',
-    interactive: agent.interactive === true ? 'true' : 'false',
-  });
+  const isCli = agent.runtime?.kind === 'cli';
+  // Pick the right template + the placeholder set it expects. The CLI
+  // template doesn't reference `$workflow` (workflow is hidden for CLI
+  // agents) but does reference the runtime cli + model so the LLM can
+  // talk concretely about which CLI it is.
+  const body = isCli
+    ? prompts.load('chat_agent_setup_cli', {
+        // Runtime cli + model are deliberately NOT passed: the LLM is
+        // told to stay CLI-agnostic in the description, and surfacing
+        // the current binding tempts it to name the CLI inline (which
+        // forbiddenly bakes a brand into the description).
+        name: agent.name || '',
+        description_zh: zh || '(not provided)',
+        description_en: en || '(not provided)',
+        interactive: agent.interactive === true ? 'true' : 'false',
+      })
+    : prompts.load('chat_agent_setup', {
+        name: agent.name || '',
+        description: display || '(not provided)',
+        description_zh: zh || '(not provided)',
+        description_en: en || '(not provided)',
+        workflow: (agent.workflow || '').trim() || '(not provided)',
+        interactive: agent.interactive === true ? 'true' : 'false',
+      });
   return `${body}\n\n---\n\n${buildLanguageDirective()}`;
 }
 

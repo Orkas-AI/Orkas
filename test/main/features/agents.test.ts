@@ -70,6 +70,7 @@ function writeCustomAgent(agentId: string, fields: Partial<Record<string, any>> 
     updated_at: '2026-04-18T10:00:00',
   };
   if ('skill_list' in fields) data.skill_list = fields.skill_list;
+  if ('runtime' in fields) data.runtime = fields.runtime;
   fs.writeFileSync(path.join(dir, 'agent.json'), JSON.stringify(data));
 }
 
@@ -178,6 +179,55 @@ describe('agents › normalizeAgent', () => {
       expect(norm).toBeTruthy();
       expect('skill_list' in (norm as any)).toBe(false);
     }
+  });
+
+  it('passes through a valid CLI runtime', async () => {
+    const a = await loadAgents();
+    const norm = a.normalizeAgent({
+      agent_id: 'x', name: 'N',
+      runtime: { kind: 'cli', cli: 'claude', model: 'claude-sonnet-4-6', custom_args: ['--debug'] },
+    } as any, 'custom');
+    expect(norm?.runtime).toEqual({
+      kind: 'cli', cli: 'claude', model: 'claude-sonnet-4-6', custom_args: ['--debug'],
+    });
+    expect(a.isCliAgent(norm)).toBe(true);
+  });
+
+  it('drops malformed runtime entries (no field set)', async () => {
+    const a = await loadAgents();
+    for (const bad of [
+      null,
+      'cli',
+      { kind: 'wat' },
+      { kind: 'cli' },          // missing cli name
+      { kind: 'cli', cli: '' }, // empty cli name
+    ]) {
+      const norm = a.normalizeAgent({ agent_id: 'x', name: 'N', runtime: bad } as any, 'custom');
+      expect(norm).toBeTruthy();
+      expect('runtime' in (norm as any)).toBe(false);
+      expect(a.isCliAgent(norm)).toBe(false);
+    }
+  });
+
+  it('normalizes in_process runtime but does not flag as CLI', async () => {
+    const a = await loadAgents();
+    const norm = a.normalizeAgent({
+      agent_id: 'x', name: 'N',
+      runtime: { kind: 'in_process' },
+    } as any, 'custom');
+    expect(norm?.runtime).toEqual({ kind: 'in_process' });
+    expect(a.isCliAgent(norm)).toBe(false);
+  });
+
+  it('drops non-string custom_args entries', async () => {
+    const a = await loadAgents();
+    const norm = a.normalizeAgent({
+      agent_id: 'x', name: 'N',
+      runtime: { kind: 'cli', cli: 'claude', custom_args: ['--ok', 42, null, '--other'] as any },
+    } as any, 'custom');
+    expect(norm?.runtime).toEqual({
+      kind: 'cli', cli: 'claude', custom_args: ['--ok', '--other'],
+    });
   });
 });
 
@@ -584,6 +634,57 @@ describe('agents › updateCustomAgent', () => {
     // File on disk should still hold the old name.
     const after = await a.getAgent('abc');
     expect(after?.name).toBe('Old');
+  });
+
+  it('allows swapping which CLI backs a CLI agent (cli → cli)', async () => {
+    writeCustomAgent('abc', {
+      name: 'N',
+      runtime: { kind: 'cli', cli: 'claude' },
+    } as any);
+    const a = await loadAgents();
+    const updated = await a.updateCustomAgent('abc', {
+      runtime: { kind: 'cli', cli: 'codex' },
+    } as any);
+    expect(updated?.runtime).toEqual({ kind: 'cli', cli: 'codex' });
+  });
+
+  it('locks runtime kind: cli agent cannot revert to in_process', async () => {
+    writeCustomAgent('abc', {
+      name: 'N',
+      runtime: { kind: 'cli', cli: 'claude' },
+    } as any);
+    const a = await loadAgents();
+    // Attempt with explicit null (drop) — should be ignored.
+    const r1 = await a.updateCustomAgent('abc', { runtime: null } as any);
+    expect(r1?.runtime).toEqual({ kind: 'cli', cli: 'claude' });
+    // Attempt with kind:'in_process' — also ignored.
+    const r2 = await a.updateCustomAgent('abc', {
+      runtime: { kind: 'in_process' },
+    } as any);
+    expect(r2?.runtime).toEqual({ kind: 'cli', cli: 'claude' });
+  });
+
+  it('locks runtime kind: in_process agent cannot become cli post-create', async () => {
+    writeCustomAgent('abc', { name: 'N' });
+    const a = await loadAgents();
+    const r = await a.updateCustomAgent('abc', {
+      runtime: { kind: 'cli', cli: 'claude' },
+    } as any);
+    expect(r?.runtime).toBeUndefined();
+  });
+
+  it('strips workflow / skill_list updates on a CLI agent', async () => {
+    writeCustomAgent('abc', {
+      name: 'N',
+      runtime: { kind: 'cli', cli: 'claude' },
+    } as any);
+    const a = await loadAgents();
+    const updated = await a.updateCustomAgent('abc', {
+      workflow: 'should be ignored',
+      skill_list: ['x'],
+    });
+    expect(updated?.workflow).toBe('');
+    expect('skill_list' in (updated as any)).toBe(false);
   });
 
   it('coerces non-string values to empty string', async () => {

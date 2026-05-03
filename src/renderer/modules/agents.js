@@ -9,6 +9,17 @@ let _agentFieldSaveTimer = null;
 // Mirror of `agents.ts::RESERVED_AGENT_NAMES` so the renderer can fail fast
 // without a round-trip. Server is still authoritative — this is just UX.
 const _RESERVED_AGENT_NAMES = new Set(['指挥官', '总指挥', 'commander']);
+/** Look up the localized "CLI · <Brand>" label for an agent runtime
+ *  type, with a guaranteed-readable fallback when the locale key is
+ *  missing. Orkas's `t()` returns the key itself on miss (so a naive
+ *  `t(key) || fallback` never falls back); we explicitly compare. */
+function _cliBadgeLabel(type) {
+  const key = 'agent.cli_badge.' + type;
+  const v = t(key);
+  if (!v || v === key) return 'CLI · ' + type;
+  return v;
+}
+
 function _isReservedAgentName(name) {
   const key = String(name || '').replace(/\s+/g, '').toLowerCase();
   return _RESERVED_AGENT_NAMES.has(key);
@@ -94,6 +105,11 @@ function renderAgentsGrid(agents) {
     // the grid cards stay clean and use the ⋯ menu for actions.
     const moreBtn = `<button type="button" class="agent-card-more" data-agent-more title="${moreTitle}" aria-label="${moreTitle}">⋯</button>`;
     const avatarHtml = renderAvatarHtml(a.icon, a.color, { size: 32, seed: a.agent_id, extraClass: 'agent-card-avatar' });
+    // Show a small "CLI · <Brand>" chip on the bottom row, left-aligned,
+    // sharing the line with the play button on the right.
+    const cliChip = (a.runtime && a.runtime.kind === 'cli')
+      ? `<span class="agent-card-chip is-cli is-cli-${escapeHtml(a.runtime.cli)}">${escapeHtml(_cliBadgeLabel(a.runtime.cli))}</span>`
+      : '';
     return `
       <div class="agent-card${enabled ? '' : ' is-disabled'}" data-id="${escapeHtml(a.agent_id)}" data-source="${a.source}">
         <div class="agent-card-header">
@@ -103,6 +119,7 @@ function renderAgentsGrid(agents) {
         </div>
         <div class="${descClass}">${escapeHtml(descText)}</div>
         <div class="agent-card-actions">
+          ${cliChip}
           <button type="button" class="agent-card-use" data-agent-use title="${useTitle}" aria-label="${useTitle}">
             <svg class="icon-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><polygon points="5,3 5,13 13,8" fill="currentColor"/></svg>
           </button>
@@ -379,10 +396,22 @@ function _renderAgentDetail(agent, editing) {
   nameEl.textContent = agent.name || '';
   sourceEl.textContent = agent.source === 'builtin' ? t('agents.source_builtin') : t('agents.source_custom');
   sourceEl.className = 'agents-detail-source ' + (agent.source === 'builtin' ? 'is-builtin' : 'is-custom');
+  // Runtime slot lives at the top of the body now (not the header):
+  // an always-editable dropdown so the user can flip Orkas ↔ local CLI
+  // without entering edit mode. The header chip was removed because
+  // it duplicated information the dropdown already exposes.
+  _renderAgentDetailRuntime(agent);
   const localizedDesc = pickDesc(agent, getLang()).trim();
   descEl.textContent = localizedDesc;
 
   _renderAgentDetailAvatar(agent);
+
+  // CLI-backed agents have no authored workflow / skill_list — the
+  // external CLI brings its own behavior. Hide the entire workflow
+  // section so the detail page doesn't show an empty editor block.
+  const workflowSection = document.querySelector('.agents-detail-section-workflow');
+  const isCliRuntime = !!(agent.runtime && agent.runtime.kind === 'cli');
+  if (workflowSection) workflowSection.style.display = isCliRuntime ? 'none' : '';
 
   const unsetHtml = `<span class="agents-detail-placeholder">${escapeHtml(t('agents.placeholder_unset'))}</span>`;
   // Workflow renders markdown in readonly mode; raw text in edit mode so user
@@ -414,6 +443,89 @@ function _renderAgentDetail(agent, editing) {
   _renderAgentEnabledButton({ id: agent.agent_id, enabled: agent.enabled !== false });
 
   _toggleAgentFieldEditable(editing);
+}
+
+/** Render the runtime control in the detail body.
+ *
+ *  The runtime "kind" is locked at create time:
+ *  - `in_process` (Orkas) agents → never show the selector here. The
+ *    runtime row stays hidden; user has no need to see it.
+ *  - `cli` agents → show a selector with **CLI options only** (no
+ *    Orkas / in_process option). User can swap which CLI backs the
+ *    agent at any time, but can't revert to Orkas — that would
+ *    invalidate the description and inputs which were authored
+ *    specifically for a CLI runtime.
+ *
+ *  Reuses `_aiSelectMount` (see CLAUDE.md "Reuse UI components") and
+ *  persists each change via `agents.update({ runtime })`. */
+async function _renderAgentDetailRuntime(agent) {
+  const section = document.getElementById('agents-detail-runtime-section');
+  const slot = document.getElementById('agents-detail-runtime');
+  if (!slot || !section) return;
+  slot.innerHTML = '';
+
+  // In-process agents: section stays hidden. No selector, no
+  // information to surface.
+  if (agent.runtime?.kind !== 'cli') {
+    section.style.display = 'none';
+    return;
+  }
+
+  const entries = (typeof loadLocalCliEntries === 'function') ? await loadLocalCliEntries() : [];
+  const available = entries.filter(e => e.available);
+  const seen = new Set(available.map(e => e.type));
+  const currentType = agent.runtime.cli;
+
+  // Build CLI-only options: every detected CLI + the bound one if it's
+  // missing (with a warning suffix so the user can flip away in one
+  // click). Orkas / in_process is intentionally absent — see fn doc.
+  const options = [];
+  for (const e of available) {
+    options.push({
+      value: `cli:${e.type}`,
+      label: `${t('agent_modal.runtime_cli_' + e.type)}${e.version ? ` (${e.version})` : ''}`,
+    });
+  }
+  if (!seen.has(currentType)) {
+    const baseLabel = t('agent_modal.runtime_cli_' + currentType);
+    const labelText = (baseLabel && baseLabel !== 'agent_modal.runtime_cli_' + currentType)
+      ? baseLabel : currentType;
+    options.push({
+      value: `cli:${currentType}`,
+      label: `${labelText} ${t('agent.cli_missing')}`,
+    });
+  }
+  if (options.length === 0) {
+    // Defensive — shouldn't happen since we always add the bound CLI
+    // above. Hide the row instead of rendering an empty dropdown.
+    section.style.display = 'none';
+    return;
+  }
+  section.style.display = '';
+
+  const mount = document.createElement('div');
+  mount.className = 'ai-select agents-detail-runtime-select';
+  slot.appendChild(mount);
+  _aiSelectMount(mount, {
+    options, value: `cli:${currentType}`,
+    onChange: async (next) => {
+      const m = /^cli:(.+)$/.exec(next);
+      if (!m) return;
+      try {
+        const res = await window.orkas.invoke('agents.update', {
+          agent_id: agent.agent_id, updates: { runtime: { kind: 'cli', cli: m[1] } },
+        });
+        if (res?.ok && res.agent) {
+          _agentsCache = null;
+          const fetched = await apiFetch(`/api/agents/${encodeURIComponent(agent.agent_id)}`);
+          const data = await fetched.json();
+          if (data.ok && data.agent) _renderAgentDetail(data.agent, _agentEditing);
+        }
+      } catch (err) {
+        _agentsLog.warn('agents.update runtime failed', err);
+      }
+    },
+  });
 }
 
 /** Render the detail-page avatar slot. Custom agents get a clickable avatar
@@ -600,6 +712,11 @@ function openAgentModal() {
   descInput.value = '';
   msgEl.textContent = '';
   msgEl.className = 'form-msg';
+  // Refresh runtime selector each open — local CLI install state can
+  // change between opens (user installs claude during the session).
+  if (typeof mountLocalAgentRuntimeRow === 'function') {
+    mountLocalAgentRuntimeRow().catch(() => { /* falls through to hidden row */ });
+  }
   modal.classList.add('open');
   setTimeout(() => nameInput.focus(), 50);
 }
@@ -638,10 +755,13 @@ async function saveAgentModal() {
     // 创建时本地随机一对头像，让每个新智能体一上来就有不同的视觉锚点。
     // 不让 LLM 介入 —— 头像是 UI 元数据，不影响 prompt 行为。
     const avatar = randomAgentAvatar();
+    const runtime = (typeof getRuntimeFormValue === 'function') ? getRuntimeFormValue() : null;
+    const body = { name, description, icon: avatar.icon, color: avatar.color };
+    if (runtime) body.runtime = runtime;
     const res = await apiFetch('/api/agents/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, description, icon: avatar.icon, color: avatar.color }),
+      body: JSON.stringify(body),
     });
     const data = await res.json();
     if (!data.ok || !data.agent) {

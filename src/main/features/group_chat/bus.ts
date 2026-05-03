@@ -750,6 +750,10 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   let systemPrompt: string;
   let extraTools: AgentTool[] = [];
   let skillList: string[] | undefined;
+  // CLI-backed agents fetch the spec but skip systemPrompt / skillList /
+  // extraTools — the LLM stream is replaced below by `runCliAgentTurn`.
+  // Hoisted here so the branch below can read it without re-fetching.
+  let cliAgent: import('../agents').Agent | null = null;
   if (isCommander) {
     systemPrompt = await buildCommanderSystemPrompt(uid, cid);
     extraTools = await buildCommanderExtraTools(state, w);
@@ -762,8 +766,13 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       // when this returns. We DON'T touch it here.
       return;
     }
-    systemPrompt = await buildAgentInGroupSystemPrompt(uid, agent, workingDir);
-    skillList = Array.isArray(agent.skill_list) ? agent.skill_list : undefined;
+    if (agentsFeat.isCliAgent(agent)) {
+      cliAgent = agent;
+      systemPrompt = ''; // unused on CLI path
+    } else {
+      systemPrompt = await buildAgentInGroupSystemPrompt(uid, agent, workingDir);
+      skillList = Array.isArray(agent.skill_list) ? agent.skill_list : undefined;
+    }
   }
 
   // Streaming.
@@ -818,6 +827,51 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // in features/skills.ts). Builtin first to match the prompt's "按来源
   // 定位" guidance.
   const skillRoots = [BUILTIN_SKILLS_DIR, userSkillsDir(uid)];
+  if (cliAgent) {
+    // CLI-backed agent path: spawn the local CLI in the user's workspace
+    // and forward its events as `process` events so the same UI rail
+    // renders. The output text becomes finalText; failures populate
+    // errText so the existing post-stream logic surfaces a ⚠️ bubble.
+    try {
+      const slice = await readSlice(uid, cid, actor.id);
+      const cliOut = await _runCliAgentTurn({
+        uid, cid, actor, agent: cliAgent,
+        item, slice, workingDir,
+        signal: w.abortController.signal,
+        onProcess: data => {
+          // Mirror the LLM path: count every event for activity, but
+          // persist only `progress` and `event` shapes into processItems
+          // — `delta` text streams into the live bubble and is recovered
+          // from the final body, not the rail.
+          activityEvents += 1;
+          if (processItems.length < MAX_PROCESS_ITEMS_PER_TURN) {
+            if (data.type === 'progress' && typeof data.text === 'string' && data.text) {
+              processItems.push({ type: 'progress', text: data.text });
+            } else if (data.type === 'event' && data.event && typeof data.event === 'object') {
+              const inner = data.event as { stream?: string; data?: unknown };
+              if (inner.stream) processItems.push({ type: 'event', event: { stream: inner.stream, data: inner.data } });
+            }
+          }
+          // For the live wire: `delta` streams into the placeholder
+          // bubble (token-by-token); other shapes feed the process
+          // rail. Renderer dispatch lives in conversation.js process
+          // event handler — see `data.type === 'delta'` branch.
+          emit(state, { type: 'process', cid, actor: actor.id, data: data as unknown as Record<string, unknown> });
+        },
+      });
+      finalText = cliOut.text;
+      streamingText = cliOut.text;
+      if (cliOut.error) errText = cliOut.error;
+      if (cliOut.aborted) aborted = true;
+    } catch (err) {
+      errText = (err as Error).message || String(err);
+      log.warn(`cli stream threw cid=${cid} actor=${actor.id}: ${errText}`);
+    } finally {
+      w.abortController = null;
+      await markInFlight(uid, cid, actor.id, false);
+      emit(state, { type: 'state_changed', cid, state: await readState(uid, cid) });
+    }
+  } else {
   try {
     for await (const ev of streamChatWithModel({
       userId: uid,
@@ -900,6 +954,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     // the worker's perspective).
     emit(state, { type: 'state_changed', cid, state: await readState(uid, cid) });
   }
+  } // end LLM branch (paired with `if (cliAgent) { ... } else {` above)
 
   // ── Post-stream parsing (pure data extraction; no decisions) ──────────
   // Form / <agent> container extraction stays in bus because they're pure
@@ -1619,3 +1674,223 @@ planExecutor.bindBusHooks({
     if (state) emit(state, { type: 'plan_changed', cid });
   },
 });
+
+// ── CLI agent turn ────────────────────────────────────────────────────────
+//
+// CLI-backed agents replace the LLM stream loop in runTurn. We pack the
+// agent's full visibility slice + the dispatched message + any user
+// attachments into a single prompt, spawn the configured CLI in the
+// user's workspace, and stream events into the same `process` rail the
+// renderer already understands. The final body is the CLI's last
+// "result" text — assigned into runTurn's `finalText` so plan_executor /
+// post-turn enqueue keep working unchanged.
+//
+// Stateless on purpose: every dispatch starts a fresh CLI run. Session
+// continuity (`--resume`) is a future optimisation; for now the slice is
+// the source of truth.
+
+const CLI_PROMPT_MAX_BYTES = 200 * 1024;
+
+async function _runCliAgentTurn(opts: {
+  uid: string;
+  cid: string;
+  actor: { id: string; kind: 'agent' | 'commander' | 'user' };
+  agent: import('../agents').Agent;
+  item: QueueItem;
+  slice: GroupMessage[];
+  workingDir: string;
+  signal: AbortSignal;
+  onProcess: (data: Record<string, unknown>) => void;
+}): Promise<{ text: string; error?: string; aborted?: boolean }> {
+  const runtime = opts.agent.runtime as Extract<NonNullable<import('../agents').AgentRuntime>, { kind: 'cli' }>;
+  // Look up any prior CLI session bound to this (cid, aid, cli). If
+  // present, we ask the CLI to resume it (claude: `--resume <id>`)
+  // and skip replaying the visibility slice in the prompt — the CLI
+  // already remembers the prior turns. First dispatch / fresh CLI
+  // swap → null → we replay the slice as before. Saves significant
+  // tokens and round-trip latency on long conversations.
+  const cliSessions = await import('../local_agents/sessions');
+  const resumeSessionId = await cliSessions.getSessionId(
+    opts.uid, opts.cid, opts.agent.agent_id, runtime.cli,
+  );
+  const promptText = await _buildCliPrompt(
+    opts.uid, opts.cid, opts.agent, opts.item, opts.slice, !!resumeSessionId,
+  );
+  const runner = await import('../local_agents/runner');
+
+  let accText = '';
+  let resultText = '';
+  let aborted = false;
+  let backendSessionId: string | undefined;
+
+  const result = await runner.run({
+    uid: opts.uid,
+    cid: opts.cid,
+    agentId: opts.agent.agent_id,
+    cli: runtime.cli as import('../local_agents/registry').LocalCliType,
+    model: runtime.model,
+    customArgs: runtime.custom_args,
+    resumeSessionId: resumeSessionId || undefined,
+    prompt: promptText,
+    cwd: opts.workingDir,
+    signal: opts.signal,
+    onEvent: e => {
+      // Translate each LocalEvent into the `process` event shape the
+      // renderer's group-chat listener expects so output streams live
+      // into the placeholder bubble (text-delta) and the process rail
+      // (tool-event, stderr, process-info). Without this, the renderer
+      // treats every event as an unrecognized shape and only the final
+      // text appears at turn-end.
+      switch (e.type) {
+        case 'text-delta':
+          if (typeof (e as any).text === 'string') {
+            accText += (e as any).text as string;
+            opts.onProcess({ type: 'delta', text: (e as any).text });
+          }
+          break;
+        case 'thinking':
+          if (typeof (e as any).text === 'string') {
+            opts.onProcess({ type: 'progress', text: (e as any).text });
+          }
+          break;
+        case 'tool-event':
+        case 'process-info':
+        case 'status':
+        case 'stderr-line':
+          opts.onProcess({ type: 'event', event: { stream: 'cli', data: e as unknown as Record<string, unknown> } });
+          break;
+        case 'done':
+          if (typeof (e as any).output === 'string') resultText = (e as any).output as string;
+          if ((e as any).status === 'cancelled') aborted = true;
+          if (typeof (e as any).sessionId === 'string') backendSessionId = (e as any).sessionId as string;
+          break;
+        default:
+          opts.onProcess({ type: 'event', event: { stream: 'cli', data: e as unknown as Record<string, unknown> } });
+      }
+    },
+  });
+
+  if (result.status === 'missing_cli') {
+    const msg = t('cli_agent.missing', { name: opts.agent.name || runtime.cli, cli: runtime.cli });
+    return { text: '', error: msg, aborted: false };
+  }
+  if (result.status === 'cancelled') {
+    return { text: resultText || accText, aborted: true };
+  }
+  if (result.status === 'failed' || result.status === 'timeout') {
+    const detail = result.error || (result.status === 'timeout' ? 'timeout' : 'failed');
+    return { text: resultText || accText, error: detail };
+  }
+  // Successful turn — persist the (possibly new) session id so the
+  // next dispatch can resume. Claude reports its session id every
+  // turn; if a `--resume` lands on an expired session, claude
+  // silently allocates a new one and reports that as `sessionId` in
+  // the system/init record. Either way we save what's freshest. The
+  // write is fire-and-forget — failures only affect the next turn's
+  // optimisation, not correctness.
+  if (backendSessionId) {
+    cliSessions
+      .setSessionId(opts.uid, opts.cid, opts.agent.agent_id, runtime.cli, backendSessionId)
+      .catch(() => { /* logged inside sessions.ts */ });
+  }
+  return { text: resultText || accText };
+}
+
+async function _buildCliPrompt(
+  uid: string,
+  cid: string,
+  agent: import('../agents').Agent,
+  item: QueueItem,
+  slice: GroupMessage[],
+  /** When true, the CLI is resuming a prior session and already has
+   *  the conversation history in its own memory — we skip the slice
+   *  block entirely and just send "head + new task". Drops massive
+   *  redundancy on long convs. */
+  resuming: boolean,
+): Promise<string> {
+  // Build head + tail separately so truncation can throw away the
+  // middle of the conversation slice (oldest entries) while preserving
+  // the agent identity preamble + the actual task. The naive "trim
+  // from the head of the byte buffer" approach we used first dropped
+  // the role preamble — leaving the CLI without context about who it
+  // is or what it owns.
+  const headLines: string[] = [];
+  headLines.push(`You are "${agent.name || agent.agent_id}".`);
+  const desc = (agent.description_en || agent.description_zh || '').trim();
+  if (desc) headLines.push(desc);
+  headLines.push('');
+
+  // Attachments come from the dispatched message AND from prior slice
+  // messages — the agent might be expected to "look at the report you
+  // uploaded last turn", so we collect across the whole visibility
+  // slice. De-duplicate by absolute path; preserve oldest-first order.
+  const { chatAttachmentDir } = await import('../../paths');
+  const attDir = chatAttachmentDir(uid, cid);
+  const allAtts: string[] = [];
+  const seenAtts = new Set<string>();
+  const collect = (names: string[] | undefined) => {
+    if (!Array.isArray(names)) return;
+    for (const n of names) {
+      const abs = path.join(attDir, n);
+      if (!seenAtts.has(abs)) { seenAtts.add(abs); allAtts.push(abs); }
+    }
+  };
+  for (const m of slice) collect(m.attachments);
+  collect(item.attachments);
+  if (allAtts.length) {
+    headLines.push('## Attachments');
+    for (const abs of allAtts) headLines.push(`- ${abs}`);
+    headLines.push('');
+  }
+
+  const tailLines: string[] = [];
+  tailLines.push('## Your task');
+  tailLines.push(item.llmPayload);
+
+  const head = headLines.join('\n');
+  const tail = tailLines.join('\n');
+
+  // Resuming a CLI-side session: the CLI already remembers the prior
+  // turns. Skip the slice block entirely and let the model rely on
+  // its own session memory. Preamble + new task is enough.
+  if (resuming) {
+    return `${head}\n${tail}`;
+  }
+
+  // Conversation slice, oldest → newest. Empty-text rows skipped.
+  const sliceLines: string[] = [];
+  for (const m of slice) {
+    const to = (m.to || []).join(',') || '-';
+    const text = (m.text || '').replace(/\r/g, '').trim();
+    if (!text) continue;
+    sliceLines.push(`[${m.from} → ${to}] ${text}`);
+  }
+
+  // Reserve the head + tail bytes; what's left is the conversation
+  // budget. If even head+tail exceed the cap, fall back to a minimal
+  // prompt without history (better than truncating the task body).
+  const reserveBytes = Buffer.byteLength(head, 'utf8') + Buffer.byteLength(tail, 'utf8') + 64; // 64 = headers + newlines slack
+  if (reserveBytes >= CLI_PROMPT_MAX_BYTES) {
+    log.warn(`cli prompt: head+tail exceed cap; sending minimal prompt cid=${cid} agent=${agent.agent_id}`);
+    return `${head}\n${tail}`;
+  }
+  const sliceBudget = CLI_PROMPT_MAX_BYTES - reserveBytes;
+  // Walk the slice from newest backward; keep messages while we have
+  // budget. If the oldest messages don't fit, drop them.
+  const kept: string[] = [];
+  let used = 0;
+  for (let i = sliceLines.length - 1; i >= 0; i--) {
+    const lineBytes = Buffer.byteLength(sliceLines[i] + '\n', 'utf8');
+    if (used + lineBytes > sliceBudget) break;
+    kept.unshift(sliceLines[i]);
+    used += lineBytes;
+  }
+  const truncated = kept.length < sliceLines.length;
+  if (truncated) {
+    log.warn(`cli prompt: trimmed ${sliceLines.length - kept.length}/${sliceLines.length} oldest slice rows cid=${cid} agent=${agent.agent_id}`);
+  }
+  const sliceBlock = kept.length
+    ? `## Conversation so far${truncated ? ' (truncated)' : ''}\n${kept.join('\n')}\n`
+    : '';
+  return `${head}\n${sliceBlock}\n${tail}`;
+}

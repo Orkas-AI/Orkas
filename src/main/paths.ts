@@ -170,6 +170,27 @@ export const sessionToolResultsDir = (uid: string, sessionId: string) =>
 // 永不同步 —— 源路径是本机绝对路径。
 export const userFileCacheDir = (uid: string) => path.join(userLocalRoot(uid), 'file_cache');
 
+// Run-history root for local CLI agent dispatches
+// (features/local_agents/runner.ts). One subdirectory per dispatch:
+// <uid>/local/file_cache/local-agent-runs/<runId>/{meta.json,
+// prompt.txt, events.jsonl, output.txt}. Lives under file_cache so the
+// existing local-domain GC sweep covers it (7-day default per plan).
+export const userLocalAgentRunsDir = (uid: string) =>
+  path.join(userFileCacheDir(uid), 'local-agent-runs');
+export const localAgentRunDir = (uid: string, runId: string) =>
+  path.join(userLocalAgentRunsDir(uid), runId);
+
+// CLI agent session bindings (features/local_agents/sessions.ts) —
+// per-conversation map `{aid → {cli, sessionId}}` so the next dispatch
+// can `--resume` instead of re-replaying the whole visibility slice.
+// Lives under `local/` (NOT cloud-synced) because the session id
+// references claude's machine-local session files (`~/.claude/...`)
+// which aren't valid on a different device.
+export const userLocalCliSessionsDir = (uid: string) =>
+  path.join(userLocalRoot(uid), 'cli-sessions');
+export const localCliSessionsFile = (uid: string, cid: string) =>
+  path.join(userLocalCliSessionsDir(uid), `${cid}.json`);
+
 // 用户本机工作区选择（features/user_workspace.ts）：用户挑的文件夹绝对路径 +
 // 最近列表。绝对路径本机相关，不同步。
 export const userWorkspaceConfigFile = (uid: string) => path.join(userLocalRoot(uid), 'workspace.json');

@@ -257,6 +257,7 @@
                 <div class="agents-detail-title-row">
                   <span class="agents-detail-avatar-slot" id="agents-detail-avatar"></span>
                   <div class="agents-detail-name" id="agents-detail-name" contenteditable="false"></div>
+                  <span class="agents-detail-source" id="agents-detail-source"></span>
                   <div class="detail-actions" id="agents-detail-actions">
                     <button class="btn-icon-use" id="agent-use-btn" data-i18n-title="agents.use_tooltip" data-i18n-aria-label="agents.use_tooltip" aria-label="使用">
                       <svg class="icon-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><polygon points="5,3 5,13 13,8" fill="currentColor"/></svg>
@@ -267,9 +268,12 @@
                     <button class="btn btn-sm btn-danger" id="agent-delete-btn" data-i18n="agents.delete">删除</button>
                   </div>
                 </div>
-                <div class="agents-detail-source" id="agents-detail-source"></div>
               </div>
               <div class="agents-detail-body">
+                <div class="agents-detail-section" id="agents-detail-runtime-section" style="display:none">
+                  <div class="agents-detail-label" data-i18n="agents.label_runtime">运行环境</div>
+                  <div class="agents-detail-runtime" id="agents-detail-runtime"></div>
+                </div>
                 <div class="agents-detail-section">
                   <div class="agents-detail-label" data-i18n="agents.label_desc">简介</div>
                   <div class="agents-detail-desc" id="agents-detail-desc" contenteditable="false"></div>
@@ -500,6 +504,10 @@
         <label><span data-i18n="agent_modal.desc">简介</span> <span class="form-hint" data-i18n="agent_modal.desc_hint">一句话说明用途，创建后 AI 会基于此生成工作流程</span></label>
         <textarea id="agent-desc-input" rows="4" data-i18n-placeholder="agent_modal.desc_placeholder" placeholder="例如：帮我在提交前审查代码，重点看逻辑漏洞和安全问题..."></textarea>
       </div>
+      <div class="form-row" id="agent-modal-runtime-row" style="display:none">
+        <label><span data-i18n="agent_modal.runtime_label">运行环境</span> <span class="form-hint" data-i18n="agent_modal.runtime_hint">选择本地 CLI 则由该 CLI 来运行智能体</span></label>
+        <div class="ai-select" id="agent-modal-runtime-select"></div>
+      </div>
       <div class="form-msg" id="agent-form-msg"></div>
       <div class="modal-actions">
         <button class="btn" onclick="closeAgentModal()" data-i18n="common.cancel">取消</button>
@@ -699,6 +707,7 @@
   <script src="./modules/kb-picker.js"></script>
   <script src="./modules/search.js"></script>
   <script src="./modules/user-workspace.js"></script>
+  <script src="./modules/local-agents.js"></script>
   <script src="./modules/agents.js"></script>
   <script src="./modules/utils.js"></script>
 

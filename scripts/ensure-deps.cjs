@@ -110,6 +110,82 @@ function runModelFetch() {
   }
 }
 
+// In macOS dev mode the Dock tooltip + Cmd-Tab name + menu bar header
+// all come from `Electron.app/Contents/Info.plist` (`CFBundleName` /
+// `CFBundleDisplayName`). `app.setName()` only changes the first menu
+// bar item -- it does NOT change the Dock.
+//
+// Editing the plist alone is not enough: macOS Launch Services keeps a
+// persistent cache keyed by bundle id `com.github.Electron`, and even
+// `lsregister -f` often refuses to refresh. The only reliable approach
+// is to rename the .app directory itself (so macOS treats it as a new
+// app and re-registers), and update `electron/path.txt` alongside (the
+// npm electron launcher reads that to locate the binary). Rename +
+// plist edit + ad-hoc resign + lsregister + killall Dock are all
+// required for the change to stick.
+//
+// Idempotent: skip when node_modules/electron/dist/Orkas.app already
+// exists. `npm install` re-lands Electron.app (overwriting Orkas.app
+// is fine -- the next launch redoes the patch).
+function patchElectronAppName() {
+  if (process.platform !== 'darwin') return;
+  const distDir = path.join(NODE_MODULES, 'electron', 'dist');
+  const oldApp = path.join(distDir, 'Electron.app');
+  const newApp = path.join(distDir, 'Orkas.app');
+  const pathTxt = path.join(NODE_MODULES, 'electron', 'path.txt');
+  if (!fs.existsSync(distDir)) return;
+
+  // Already patched: bail out. Verify Orkas.app exists + path.txt is updated.
+  if (fs.existsSync(newApp) && !fs.existsSync(oldApp)) {
+    let pathTxtContent = '';
+    try { pathTxtContent = fs.readFileSync(pathTxt, 'utf8').trim(); } catch { /* */ }
+    if (pathTxtContent.startsWith('Orkas.app/')) return;
+  }
+
+  // Rename Electron.app -> Orkas.app. If both exist, drop the new one first so the rename does not collide.
+  if (fs.existsSync(oldApp)) {
+    if (fs.existsSync(newApp)) fs.rmSync(newApp, { recursive: true, force: true });
+    try { fs.renameSync(oldApp, newApp); }
+    catch (err) {
+      console.warn('[Orkas] rename Electron.app failed (' + err.message + '): a process may still be holding it; skipping this patch pass');
+      return;
+    }
+  } else if (!fs.existsSync(newApp)) {
+    return; // Neither old nor new -- Electron install is broken; leave it for npm install to handle.
+  }
+
+  // Set the plist keys.
+  const plistPath = path.join(newApp, 'Contents', 'Info.plist');
+  for (const [key, val] of [
+    ['CFBundleName', 'Orkas'],
+    ['CFBundleDisplayName', 'Orkas'],
+  ]) {
+    const r = spawnSync('plutil', ['-replace', key, '-string', val, plistPath], { stdio: 'pipe' });
+    if (r.status !== 0) {
+      console.warn('[Orkas] plutil -replace ' + key + ' failed:', (r.stderr || '').toString().trim());
+    }
+  }
+
+  // Editing the plist invalidates the existing signature; ad-hoc resign.
+  const cs = spawnSync('codesign', ['--force', '--deep', '--sign', '-', newApp], { stdio: 'pipe' });
+  if (cs.status !== 0) {
+    console.warn('[Orkas] Orkas.app ad-hoc resign failed (manual fix: codesign --force --deep --sign - "' + newApp + '"):', (cs.stderr || '').toString().trim());
+  }
+
+  // The electron npm launcher uses path.txt to locate the binary; point it at the new name.
+  try { fs.writeFileSync(pathTxt, 'Orkas.app/Contents/MacOS/Electron'); }
+  catch (err) {
+    console.warn('[Orkas] update electron/path.txt failed (' + err.message + '): the electron CLI may fail to find the binary');
+  }
+
+  // Launch Services: unregister the old path + register the new one. Restart Dock to drop any running-instance cache.
+  const lsregister = '/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister';
+  spawnSync(lsregister, ['-u', oldApp], { stdio: 'pipe' });
+  spawnSync(lsregister, ['-f', newApp], { stdio: 'pipe' });
+  spawnSync('killall', ['Dock'], { stdio: 'pipe' });
+  console.log('[Orkas] Dock name set to Orkas (renamed Electron.app -> Orkas.app; effective next launch)');
+}
+
 function main() {
   if (!fs.existsSync(PKG)) {
     console.error('[Orkas] 找不到 package.json：', PKG);
@@ -126,6 +202,7 @@ function main() {
       console.log('[Orkas] 知识库 embedding 模型缺失，补下载（约 90MB）...');
       runModelFetch();
     }
+    patchElectronAppName();
     return;
   }
 
@@ -151,6 +228,9 @@ function main() {
   } catch (err) {
     console.warn('[Orkas] 警告：写入依赖 stamp 失败（不影响启动）：', err.message);
   }
+  // npm install re-lands an Electron with the upstream "Electron"
+  // Info.plist; re-patch immediately or the Dock reverts.
+  patchElectronAppName();
 }
 
 main();

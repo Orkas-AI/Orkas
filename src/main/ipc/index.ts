@@ -36,6 +36,7 @@ import * as appConfig from '../features/config';
 import * as avatars from '../features/avatars';
 import { getRendererTables, isLang, t } from '../i18n';
 import * as userWorkspace from '../features/user_workspace';
+import { invokeHandlers as localAgentsHandlers } from './local_agents';
 import { safeId } from '../storage';
 import { createLogger, logFromRenderer } from '../logger';
 import * as path from 'node:path';
@@ -176,8 +177,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { agent };
   },
 
-  'agents.create': async ({ name = '', description = '', workflow = '', icon, color } = {}) => {
-    return { agent: await agents.createCustomAgent({ name, description, workflow, icon, color }) };
+  'agents.create': async ({ name = '', description = '', workflow = '', icon, color, runtime } = {}) => {
+    return { agent: await agents.createCustomAgent({ name, description, workflow, icon, color, runtime }) };
   },
 
   'agents.update': async ({ agent_id, updates }) => {
@@ -574,6 +575,11 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     shell.showItemInFolder(norm);
     return { path: norm };
   },
+
+  // Local CLI agent discovery (claude / codex / openclaw / opencode / hermes).
+  // Discovery + model catalogs only; actual spawning happens inside group_chat
+  // dispatch via `features/local_agents/runner.ts`, never as a standalone IPC.
+  ...localAgentsHandlers,
 };
 
 // ── Stream handlers ──────────────────────────────────────────────────────

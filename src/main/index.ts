@@ -23,6 +23,15 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { app, BrowserWindow, Menu, ipcMain, nativeImage, protocol, shell } from 'electron';
 
+// Force the user-visible app name to "Orkas" before anything else
+// reads it. In dev (running `electron .`) Electron defaults to the
+// `name` field in package.json (lowercase "orkas") or — when launched
+// without that being effective — to literally "Electron", which leaks
+// to the macOS Dock tooltip and the menu bar. Packaged builds set this
+// via electron-builder's `productName`; this call covers dev + any
+// edge case where productName isn't picked up early.
+app.setName('Orkas');
+
 // Register the KB file protocol BEFORE `app.whenReady()` — privileged
 // schemes can't be added after. `kb-file:///<relpath>` serves a single
 // file out of the current active user's `<uid>/cloud/contexts/`. Used by
