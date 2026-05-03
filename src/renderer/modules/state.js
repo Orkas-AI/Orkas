@@ -201,6 +201,9 @@ function bindStaticHandlers() {
   });
   document.getElementById('agent-edit-btn')?.addEventListener('click', toggleAgentEditMode);
   document.getElementById('agent-delete-btn')?.addEventListener('click', deleteSelectedAgent);
+  document.getElementById('agent-promote-btn')?.addEventListener('click', () => {
+    if (_selectedAgent?.source === 'custom') promoteCustomAgent(_selectedAgent.id);
+  });
   document.getElementById('agent-chat-clear-btn')?.addEventListener('click', clearAgentChat);
   // Agent inline chat: only bind auto-grow here. Send/abort/Cmd+Enter are
   // wired lazily by createChatController in _ensureAgentChatController.
@@ -229,6 +232,9 @@ function bindStaticHandlers() {
   });
   document.getElementById('skill-edit-btn')?.addEventListener('click', toggleSkillEditMode);
   document.getElementById('skill-delete-btn')?.addEventListener('click', deleteSelectedSkill);
+  document.getElementById('skill-promote-btn')?.addEventListener('click', () => {
+    if (_selectedSkill?.source === 'custom') promoteCustomSkill(_selectedSkill.id);
+  });
   document.getElementById('skills-detail-name')?.addEventListener('click', _handleSkillNameClick);
   document.getElementById('skill-chat-clear-btn')?.addEventListener('click', clearSkillChat);
 

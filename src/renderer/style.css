@@ -1075,26 +1075,35 @@ body.model-not-configured .main-content { flex-direction: column; }
   justify-content: flex-end;
 }
 
-.skill-card-use {
+.skill-card-use,
+.agent-card-use,
+.btn-icon-use {
   flex-shrink: 0;
   width: 26px;
   height: 26px;
-  padding: 0 0 0 1px;
+  padding: 0;
   border: none;
   border-radius: 50%;
   background: rgba(37, 99, 235, 0.1);
   color: var(--primary);
-  font-size: 10px;
-  line-height: 1;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   transition: background 0.12s, transform 0.12s;
 }
-.skill-card-use:hover {
+.skill-card-use:hover,
+.agent-card-use:hover,
+.btn-icon-use:hover {
   background: rgba(37, 99, 235, 0.2);
   transform: scale(1.05);
+}
+/* Centered SVG triangle inside the round play button. The SVG path itself
+   is balanced; the wrapper is plain flex-center, so no padding hacks needed. */
+.skill-card-use .icon-play,
+.agent-card-use .icon-play,
+.btn-icon-use .icon-play {
+  display: block;
 }
 
 /* ─── Per-card ⋯ popover menu ─── */
@@ -3995,27 +4004,7 @@ body.model-not-configured .main-content { flex-direction: column; }
   justify-content: flex-end;
 }
 
-.agent-card-use {
-  flex-shrink: 0;
-  width: 26px;
-  height: 26px;
-  padding: 0 0 0 1px;
-  border: none;
-  border-radius: 50%;
-  background: rgba(37, 99, 235, 0.1);
-  color: var(--primary);
-  font-size: 10px;
-  line-height: 1;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  transition: background 0.12s, transform 0.12s;
-}
-.agent-card-use:hover {
-  background: rgba(37, 99, 235, 0.2);
-  transform: scale(1.05);
-}
+/* `.agent-card-use` shared with `.skill-card-use` / `.btn-icon-use` above. */
 
 /* ─── Agents detail view (replaces grid) ────────────────────────────── */
 

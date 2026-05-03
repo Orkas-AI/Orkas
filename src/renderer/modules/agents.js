@@ -90,26 +90,22 @@ function renderAgentsGrid(agents) {
     const desc = pickDesc(a, getLang()).trim();
     const descClass = desc ? 'agent-card-desc' : 'agent-card-desc is-empty';
     const descText = desc || t('agents.placeholder_unset');
-    const sourceLabel = a.source === 'custom' ? t('agents.source_custom') : t('agents.source_builtin');
-    const sourceCls = a.source === 'custom' ? 'is-custom' : 'is-builtin';
+    // Source label (custom / builtin) is shown on the detail page only;
+    // the grid cards stay clean and use the ⋯ menu for actions.
     const moreBtn = `<button type="button" class="agent-card-more" data-agent-more title="${moreTitle}" aria-label="${moreTitle}">⋯</button>`;
-    const toggleTitle = escapeHtml(enabled ? t('component.toggle_disable_hint') : t('component.toggle_enable_hint'));
-    const toggle = `<label class="toggle-switch is-compact" data-agent-toggle title="${toggleTitle}" aria-label="${toggleTitle}">
-        <input type="checkbox" data-agent-toggle-input ${enabled ? 'checked' : ''} />
-      </label>`;
     const avatarHtml = renderAvatarHtml(a.icon, a.color, { size: 32, seed: a.agent_id, extraClass: 'agent-card-avatar' });
     return `
       <div class="agent-card${enabled ? '' : ' is-disabled'}" data-id="${escapeHtml(a.agent_id)}" data-source="${a.source}">
         <div class="agent-card-header">
           ${avatarHtml}
           <span class="agent-card-name">${escapeHtml(a.name || t('agents.unnamed'))}</span>
-          <span class="agent-card-source ${sourceCls}">${escapeHtml(sourceLabel)}</span>
-          ${toggle}
           ${moreBtn}
         </div>
         <div class="${descClass}">${escapeHtml(descText)}</div>
         <div class="agent-card-actions">
-          <button type="button" class="agent-card-use" data-agent-use title="${useTitle}" aria-label="${useTitle}">▶</button>
+          <button type="button" class="agent-card-use" data-agent-use title="${useTitle}" aria-label="${useTitle}">
+            <svg class="icon-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><polygon points="5,3 5,13 13,8" fill="currentColor"/></svg>
+          </button>
         </div>
       </div>
     `;
@@ -126,10 +122,6 @@ function renderAgentsGrid(agents) {
   for (const card of document.querySelectorAll('.agent-card')) {
     const id = card.dataset.id;
     card.addEventListener('click', (e) => {
-      if (e.target.closest('[data-agent-toggle]')) {
-        e.stopPropagation();
-        return;
-      }
       if (e.target.closest('[data-agent-use]')) {
         e.stopPropagation();
         useAgent(id);
@@ -142,34 +134,29 @@ function renderAgentsGrid(agents) {
       }
       _showAgentsDetailView(id);
     });
-    const toggleInput = card.querySelector('[data-agent-toggle-input]');
-    toggleInput?.addEventListener('change', async (e) => {
-      e.stopPropagation();
-      await _flipAgentEnabledFromCard(id, toggleInput);
-    });
   }
 }
 
-async function _flipAgentEnabledFromCard(agentId, input) {
-  const next = input.checked;
-  input.disabled = true;
+/** Flip an agent's enabled override (used by both the ⋯ menu's toggle item
+ *  and the detail-page enable/disable button). On failure, alerts; on
+ *  success, refreshes the grid + detail page. */
+async function _flipAgentEnabled(agentId, nextEnabled) {
   try {
-    const res = await window.orkas.invoke('agents.setEnabled', { agent_id: agentId, enabled: next });
+    const res = await window.orkas.invoke('agents.setEnabled', { agent_id: agentId, enabled: nextEnabled });
     if (!res || !res.ok) {
-      input.checked = !next;
       await uiAlert(t('component.toggle_failed'));
-      return;
+      return false;
     }
-    const card = input.closest('.agent-card');
-    if (card) card.classList.toggle('is-disabled', !next);
     const cached = _agentsCache?.find((a) => a.agent_id === agentId);
-    if (cached) cached.enabled = next;
+    if (cached) cached.enabled = nextEnabled;
     await loadAgents(true);
+    if (_selectedAgent?.id === agentId) {
+      _renderAgentEnabledButton({ id: agentId, enabled: nextEnabled });
+    }
+    return true;
   } catch (err) {
-    input.checked = !next;
     await uiAlert(t('component.toggle_failed'));
-  } finally {
-    input.disabled = false;
+    return false;
   }
 }
 
@@ -290,13 +277,19 @@ function _renderAgentRowMenuItems(menu, agentId) {
   const a = _agentsCache?.find((x) => x.agent_id === agentId);
   const enabled = a ? a.enabled !== false : true;
   const isCustom = a?.source === 'custom';
+  // Dev mode lifts the source guard for built-in edit / delete; custom adds
+  // a "promote to built-in" item too.
+  const canEdit = isCustom || (a?.source === 'builtin' && isDevMode());
   const toggleLabel = enabled ? t('component.disable') : t('component.enable');
   const items = [];
-  if (isCustom) {
+  if (canEdit) {
     items.push(`<div class="agent-row-menu-item" data-action="edit">${escapeHtml(t('agents.edit'))}</div>`);
   }
+  if (isCustom && isDevMode()) {
+    items.push(`<div class="agent-row-menu-item" data-action="promote">${escapeHtml(t('agents.promote_to_builtin'))}</div>`);
+  }
   items.push(`<div class="agent-row-menu-item" data-action="toggle-enabled">${escapeHtml(toggleLabel)}</div>`);
-  if (isCustom) {
+  if (canEdit) {
     items.push(`<div class="agent-row-menu-item is-danger" data-action="delete">${escapeHtml(t('agents.delete'))}</div>`);
   }
   menu.innerHTML = items.join('');
@@ -313,6 +306,8 @@ function _renderAgentRowMenuItems(menu, agentId) {
       } else if (action === 'delete') {
         if (_selectedAgent?.id !== aid) await selectAgent(aid);
         await deleteSelectedAgent();
+      } else if (action === 'promote') {
+        await promoteCustomAgent(aid);
       } else if (action === 'toggle-enabled') {
         await _flipAgentEnabledFromMenu(aid);
       }
@@ -320,21 +315,29 @@ function _renderAgentRowMenuItems(menu, agentId) {
   }
 }
 
+/** Dev-only: promote a custom agent to built-in. Copies agent.json to
+ *  src+data trees, removes the custom dir (meta/ + skills/ dropped),
+ *  refreshes the grid. */
+async function promoteCustomAgent(agentId) {
+  if (!isDevMode()) return;
+  const cached = _agentsCache?.find((x) => x.agent_id === agentId);
+  if (!(await uiConfirm(t('agents.promote_confirm', { name: cached?.name || agentId })))) return;
+  try {
+    const result = await window.orkas.invoke('agents.promoteToBuiltin', { agent_id: agentId });
+    if (!result.ok) {
+      await uiAlert(t('agents.promote_failed_with', { reason: result.error || '' }));
+      return;
+    }
+    await loadAgents(true);
+  } catch (e) {
+    await uiAlert(t('agents.promote_failed_with', { reason: e.message || e }));
+  }
+}
+
 async function _flipAgentEnabledFromMenu(agentId) {
   const cached = _agentsCache?.find((x) => x.agent_id === agentId);
   const next = !(cached?.enabled !== false);
-  try {
-    const res = await window.orkas.invoke('agents.setEnabled', { agent_id: agentId, enabled: next });
-    if (!res || !res.ok) {
-      await uiAlert(t('component.toggle_failed'));
-      return;
-    }
-    if (cached) cached.enabled = next;
-    await loadAgents(true);
-  } catch (err) {
-    _agentsLog.warn('agents.setEnabled failed', err);
-    await uiAlert(t('component.toggle_failed'));
-  }
+  await _flipAgentEnabled(agentId, next);
 }
 
 async function selectAgent(agentId) {
@@ -391,20 +394,24 @@ function _renderAgentDetail(agent, editing) {
   }
   if (!editing && !localizedDesc) descEl.innerHTML = unsetHtml;
 
-  // Detail header actions: 使用 / 编辑 / 删除 + 启用 toggle. Builtin agents
-  // hide 编辑 and 删除 (spec-immutable); 编辑 button doubles as 完成 while
-  // in edit mode and 使用/删除 hide so the user can't accidentally launch
-  // or destroy a half-edited agent.
+  // Detail header actions, fixed order:
+  //   使用(icon) / 编辑 / 启用-禁用 / 内置(custom+dev) / 删除
+  // Edit mode hides everything except the 完成 button (the relabeled 编辑).
   const useBtn = document.getElementById('agent-use-btn');
+  const enableBtn = document.getElementById('agent-enabled-btn');
+  const promoteBtn = document.getElementById('agent-promote-btn');
   const delBtn = document.getElementById('agent-delete-btn');
   const isCustom = agent.source === 'custom';
+  const canEdit = isCustom || (agent.source === 'builtin' && isDevMode());
   if (useBtn) useBtn.style.display = editing ? 'none' : '';
-  if (delBtn) delBtn.style.display = (isCustom && !editing) ? '' : 'none';
+  if (enableBtn) enableBtn.style.display = editing ? 'none' : '';
+  if (promoteBtn) promoteBtn.style.display = (isCustom && isDevMode() && !editing) ? '' : 'none';
+  if (delBtn) delBtn.style.display = (canEdit && !editing) ? '' : 'none';
   if (editBtn) {
-    editBtn.style.display = isCustom ? '' : 'none';
+    editBtn.style.display = canEdit ? '' : 'none';
     editBtn.textContent = editing ? t('agents.edit_btn_done') : t('agents.edit_btn_edit');
   }
-  _renderAgentEnabledToggle({ id: agent.agent_id, enabled: agent.enabled !== false });
+  _renderAgentEnabledButton({ id: agent.agent_id, enabled: agent.enabled !== false });
 
   _toggleAgentFieldEditable(editing);
 }
@@ -454,43 +461,24 @@ function _renderAgentDetailAvatar(agent) {
   });
 }
 
-function _renderAgentEnabledToggle(agent) {
-  const wrap = document.getElementById('agent-enabled-toggle-wrap');
-  const oldInput = document.getElementById('agent-enabled-toggle');
-  const label = document.getElementById('agent-enabled-label');
-  if (!wrap || !oldInput || !label) return;
+/** Per-agent 启用 / 禁用 button in the detail header. Clone-replace to drop
+ *  any prior click handler bound to a stale agent id. The button label
+ *  flips between 启用 / 禁用 (whichever the click would do). */
+function _renderAgentEnabledButton(agent) {
+  const oldBtn = document.getElementById('agent-enabled-btn');
+  if (!oldBtn) return;
   const enabled = agent.enabled !== false;
-  // Clone-replace to drop any prior change listener bound for a different agent.
-  const input = oldInput.cloneNode(true);
-  input.checked = enabled;
-  oldInput.parentNode.replaceChild(input, oldInput);
-  label.textContent = enabled ? t('component.enabled') : t('component.disabled');
-  wrap.classList.toggle('is-disabled', !enabled);
-  wrap.title = enabled ? t('component.toggle_disable_hint') : t('component.toggle_enable_hint');
-  input.addEventListener('change', async () => {
-    const next = input.checked;
-    input.disabled = true;
-    try {
-      const res = await window.orkas.invoke('agents.setEnabled', { agent_id: agent.id, enabled: next });
-      if (!res || !res.ok) {
-        input.checked = !next;
-        await uiAlert(t('component.toggle_failed'));
-        return;
-      }
-      label.textContent = next ? t('component.enabled') : t('component.disabled');
-      wrap.classList.toggle('is-disabled', !next);
-      wrap.title = next ? t('component.toggle_disable_hint') : t('component.toggle_enable_hint');
-      const cached = _agentsCache?.find((a) => a.agent_id === agent.id);
-      if (cached) cached.enabled = next;
-      await loadAgents(true);
-    } catch (err) {
-      input.checked = !next;
-      await uiAlert(t('component.toggle_failed'));
-    } finally {
-      input.disabled = false;
-    }
+  const btn = oldBtn.cloneNode(true);
+  oldBtn.parentNode.replaceChild(btn, oldBtn);
+  btn.textContent = enabled ? t('component.disable') : t('component.enable');
+  btn.title = enabled ? t('component.toggle_disable_hint') : t('component.toggle_enable_hint');
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    try { await _flipAgentEnabled(agent.id, !enabled); }
+    finally { btn.disabled = false; }
   });
 }
+
 
 function _toggleAgentFieldEditable(on) {
   const nameEl = document.getElementById('agents-detail-name');
@@ -504,7 +492,8 @@ function _toggleAgentFieldEditable(on) {
 
 async function toggleAgentEditMode() {
   if (!_selectedAgent) return;
-  if (_selectedAgent.source === 'builtin') return;
+  // Built-in editing is dev-only; lift the source guard accordingly.
+  if (_selectedAgent.source === 'builtin' && !isDevMode()) return;
   if (_agentEditing) {
     await _exitAgentEditMode();
   } else {

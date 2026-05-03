@@ -30,6 +30,13 @@ async function _stampSettingsVersion() {
   } catch (_) { /* ignore — non-critical */ }
 }
 
+// Dev-mode editing of built-in skills / agents is stripped from the
+// open-source build (the underlying `isDevEnv()` / built-in dual-write IPC
+// stack lives in the in-app debug panel that's only present in PC).
+// Renderer modules still branch on `isDevMode()` for those entry points,
+// so we stub it to false here.
+function isDevMode() { return false; }
+
 // 一次性把带历史品牌前缀的 localStorage key 迁移到无前缀形态。盖章后再
 // 启动 no-op，写在 boot 最前免得后面任何模块抢着读旧 key。
 function _migrateLegacyLocalStorageKeys() {

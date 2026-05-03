@@ -163,13 +163,12 @@
                 <h1 class="skills-doc-title" id="skills-detail-name" data-editable="false"></h1>
                 <span class="skills-doc-source" id="skills-detail-source"></span>
                 <div class="skills-doc-actions" id="skills-detail-actions">
-                  <label class="toggle-switch" id="skill-enabled-toggle-wrap" title="">
-                    <input type="checkbox" id="skill-enabled-toggle" />
-                    <span class="toggle-slider"></span>
-                    <span class="toggle-label" id="skill-enabled-label" data-i18n="component.enabled">已启用</span>
-                  </label>
-                  <button class="btn btn-sm" id="skill-use-btn" data-i18n="skills.use">使用</button>
+                  <button class="btn-icon-use" id="skill-use-btn" data-i18n-title="skills.use_tooltip" data-i18n-aria-label="skills.use_tooltip" aria-label="使用">
+                    <svg class="icon-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><polygon points="5,3 5,13 13,8" fill="currentColor"/></svg>
+                  </button>
                   <button class="btn btn-sm" id="skill-edit-btn" data-i18n="skills.edit">编辑</button>
+                  <button class="btn btn-sm" id="skill-enabled-btn" data-i18n="component.disable">禁用</button>
+                  <button class="btn btn-sm" id="skill-promote-btn" style="display:none" data-i18n="skills.promote_to_builtin">设为内置</button>
                   <button class="btn btn-sm btn-danger" id="skill-delete-btn" data-i18n="skills.delete">删除</button>
                 </div>
               </div>
@@ -259,13 +258,12 @@
                   <span class="agents-detail-avatar-slot" id="agents-detail-avatar"></span>
                   <div class="agents-detail-name" id="agents-detail-name" contenteditable="false"></div>
                   <div class="detail-actions" id="agents-detail-actions">
-                    <label class="toggle-switch" id="agent-enabled-toggle-wrap" title="">
-                      <input type="checkbox" id="agent-enabled-toggle" />
-                      <span class="toggle-slider"></span>
-                      <span class="toggle-label" id="agent-enabled-label" data-i18n="component.enabled">已启用</span>
-                    </label>
-                    <button class="btn btn-sm" id="agent-use-btn" data-i18n="agents.use">使用</button>
+                    <button class="btn-icon-use" id="agent-use-btn" data-i18n-title="agents.use_tooltip" data-i18n-aria-label="agents.use_tooltip" aria-label="使用">
+                      <svg class="icon-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><polygon points="5,3 5,13 13,8" fill="currentColor"/></svg>
+                    </button>
                     <button class="btn btn-sm" id="agent-edit-btn" data-i18n="agents.edit_btn_edit">编辑</button>
+                    <button class="btn btn-sm" id="agent-enabled-btn" data-i18n="component.disable">禁用</button>
+                    <button class="btn btn-sm" id="agent-promote-btn" style="display:none" data-i18n="agents.promote_to_builtin">设为内置</button>
                     <button class="btn btn-sm btn-danger" id="agent-delete-btn" data-i18n="agents.delete">删除</button>
                   </div>
                 </div>
