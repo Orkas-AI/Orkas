@@ -516,6 +516,10 @@ async function _enterAgentEditMode() {
 
 async function _exitAgentEditMode() {
   _agentEditing = false;
+  // Abort any in-flight reply so 完成 stops the stream immediately. The
+  // agent chat controller is a singleton; leaving it pending also leaks the
+  // streaming-button state into the next agent's edit panel.
+  try { _agentChatCtrl?.abort(); } catch (_) { /* ignore */ }
   // Flush any pending save and then re-render in readonly mode.
   await _flushAgentFieldSave();
   document.getElementById('agents-chat-col').style.display = 'none';

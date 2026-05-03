@@ -1221,11 +1221,14 @@ body.model-not-configured .main-content { flex-direction: column; }
 .skills-source-tree::-webkit-scrollbar { width: 4px; }
 .skills-source-tree::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 3px; }
 
-/* Inline file editor (skill edit mode) */
+/* Inline file editor (skill edit mode). No L/R padding here — the textarea
+ * owns its visual border + inner padding and sits flush with the section
+ * edge, the same way `.skills-source-panel` above it does. T/B padding is
+ * kept tiny so the toolbar status row has a little breathing room. */
 .skills-detail-body.skills-detail-editing {
   display: flex;
   flex-direction: column;
-  padding: 16px 20px 20px;
+  padding: 4px 0 0;
 }
 .skill-file-toolbar {
   display: flex;

@@ -197,6 +197,9 @@ function _showSkillsGridView() {
   const detail = document.getElementById('skills-detail-view');
   // Exit edit mode if active so chat panel is hidden too.
   if (_skillEditMode) {
+    // Abort any in-flight reply (same reason as toggleSkillEditMode exit
+    // branch — singleton controller, leaving pending leaks streaming UI).
+    try { _skillChatCtrl?.abort(); } catch (_) { /* ignore */ }
     _skillEditMode = false;
     _skillEditSkillId = null;
     const chatCol = document.getElementById('skills-chat-col');
@@ -633,6 +636,12 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   if (_skillEditMode && _skillEditSkillId === id && canEditThisSkill) {
     chatCol.style.display = 'flex';
   } else {
+    // Switching skill mid-stream needs to abort, otherwise the singleton
+    // controller's pending state bleeds into the next skill's edit panel
+    // (the send button shows streaming for a fresh chat).
+    if (_skillEditMode) {
+      try { _skillChatCtrl?.abort(); } catch (_) { /* ignore */ }
+    }
     _skillEditMode = false;
     _skillEditSkillId = null;
     chatCol.style.display = 'none';
@@ -889,6 +898,11 @@ async function toggleSkillEditMode(opts = {}) {
   if (_selectedSkill.source !== 'custom'
       && !(_selectedSkill.source === 'builtin' && isDevMode())) return;
   if (_skillEditMode && _skillEditSkillId === _selectedSkill.id) {
+    // Abort any in-flight reply so 完成 is "stop + exit", not "exit but
+    // keep streaming". The chat controller is a singleton; leaving it
+    // pending also leaks the streaming-button state into the next skill's
+    // edit panel when the user clicks 编辑 elsewhere.
+    try { _skillChatCtrl?.abort(); } catch (_) { /* ignore */ }
     _skillEditMode = false;
     _skillEditSkillId = null;
     document.getElementById('skills-chat-col').style.display = 'none';
