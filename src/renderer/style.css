@@ -4103,7 +4103,7 @@ body.model-not-configured .main-content { flex-direction: column; }
 
 .agents-detail-title-row {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
   flex-wrap: wrap;
@@ -4130,8 +4130,8 @@ body.model-not-configured .main-content { flex-direction: column; }
 }
 
 /* Sits on the same row as the agent name, mirroring the skill detail
-   header layout (.skills-doc-source). The title row is already a
-   wrapping flex container; this chip rides along with it. */
+   header layout (.skills-doc-source). The title row centers all
+   children, so no per-chip align-self override is needed. */
 .agents-detail-source {
   font-size: 11px;
   font-weight: 600;
@@ -4139,7 +4139,6 @@ body.model-not-configured .main-content { flex-direction: column; }
   padding: 2px 8px;
   border-radius: 10px;
   letter-spacing: 0.4px;
-  align-self: center;
 }
 .agents-detail-source.is-builtin { background: rgba(148, 163, 184, 0.15); color: #475569; }
 .agents-detail-source.is-custom  { background: rgba(37, 99, 235, 0.12); color: var(--primary); }
