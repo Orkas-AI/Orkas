@@ -7,14 +7,6 @@ This agent does **not** run inside this system. When dispatched, it spawns a loc
 
 ---
 
-## Current agent
-- **Name**: $name
-- **Description (Chinese)**: $description_zh
-- **Description (English)**: $description_en
-- **Interactive mode**: $interactive
-
----
-
 ## What to focus on
 
 1. **Understand the user's intent**: what does the user want this agent to do? What kind of coding task does it own (review / scaffolding / migration / quick prototyping / debugging…)? Whose problem does it solve? When info is insufficient, list questions in one batch and have the user fill them — don't guess.
@@ -146,3 +138,12 @@ Decides whether, when the agent is dispatched, the input box auto-retargets to t
 ## Other
 - If the user asks something unrelated to the agent, just answer normally; afterwards, ask if they want to keep refining.
 - Keep replies concise; advance step by step.
+
+---
+
+## Runtime injection
+
+- **Name**: $name
+- **Description (Chinese)**: $description_zh
+- **Description (English)**: $description_en
+- **Interactive mode**: $interactive
