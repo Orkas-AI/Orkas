@@ -67,6 +67,73 @@ describe('group_chat state › addMember + ensureAgentMember', () => {
   });
 });
 
+describe('group_chat state › renameAgentInMembers', () => {
+  // Drive the rename sweep through a seeded `_index.json` + a couple of
+  // pre-populated members.json files. The bug this guards: members.name is a
+  // join-time snapshot the @-router resolves on first, so without the sweep
+  // old conversations would keep matching `@<old-name>` after a rename.
+  async function seedConv(uid: string, cid: string, actors: any[]): Promise<void> {
+    const paths = await import('../../../../src/main/paths');
+    const dir = path.join(paths.userChatsDir(uid), cid);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'members.json'), JSON.stringify({ version: 1, actors }));
+  }
+  async function seedIndex(uid: string, cids: string[]): Promise<void> {
+    const paths = await import('../../../../src/main/paths');
+    const dir = paths.userChatsDir(uid);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, '_index.json'),
+      JSON.stringify({ items: cids.map((c) => ({ conversation_id: c })) }),
+    );
+  }
+
+  it('updates the name on every roster carrying the agent and skips others', async () => {
+    const s = await import('../../../../src/main/features/group_chat/state');
+    await seedConv(TEST_UID, 'cidA', [
+      { kind: 'agent', id: 'writer', name: 'OldWriter', joined_at: 't' },
+      { kind: 'commander', id: 'commander', name: 'Commander', joined_at: 't' },
+    ]);
+    await seedConv(TEST_UID, 'cidB', [
+      { kind: 'agent', id: 'reviewer', name: 'Reviewer', joined_at: 't' },
+    ]);
+    await seedConv(TEST_UID, 'cidC', [
+      { kind: 'agent', id: 'writer', name: 'OldWriter', joined_at: 't' },
+    ]);
+    await seedIndex(TEST_UID, ['cidA', 'cidB', 'cidC']);
+
+    const touched = await s.renameAgentInMembers(TEST_UID, 'writer', 'NewWriter');
+    expect(touched).toBe(2);
+
+    const a = await s.readMembers(TEST_UID, 'cidA');
+    expect(a.actors.find((x) => x.id === 'writer')?.name).toBe('NewWriter');
+    expect(a.actors.find((x) => x.id === 'commander')?.name).toBe('Commander');
+
+    const b = await s.readMembers(TEST_UID, 'cidB');
+    expect(b.actors.find((x) => x.id === 'reviewer')?.name).toBe('Reviewer');
+
+    const c = await s.readMembers(TEST_UID, 'cidC');
+    expect(c.actors.find((x) => x.id === 'writer')?.name).toBe('NewWriter');
+  });
+
+  it('rejects reserved ids and non-safeId tokens', async () => {
+    const s = await import('../../../../src/main/features/group_chat/state');
+    await seedIndex(TEST_UID, ['cidA']);
+    expect(await s.renameAgentInMembers(TEST_UID, 'commander', 'X')).toBe(0);
+    expect(await s.renameAgentInMembers(TEST_UID, 'user', 'X')).toBe(0);
+    expect(await s.renameAgentInMembers(TEST_UID, '../etc', 'X')).toBe(0);
+  });
+
+  it('returns 0 when the same name is already on the roster (no-op write)', async () => {
+    const s = await import('../../../../src/main/features/group_chat/state');
+    await seedConv(TEST_UID, 'cidA', [
+      { kind: 'agent', id: 'writer', name: 'Writer', joined_at: 't' },
+    ]);
+    await seedIndex(TEST_UID, ['cidA']);
+    expect(await s.renameAgentInMembers(TEST_UID, 'writer', 'Writer')).toBe(0);
+  });
+});
+
 describe('group_chat state › markInFlight does NOT touch status', () => {
   it('flipping in_flight on/off leaves status untouched (status is owned by bus)', async () => {
     const s = await import('../../../../src/main/features/group_chat/state');

@@ -23,7 +23,7 @@ import * as path from 'node:path';
 import { Mutex } from 'async-mutex';
 
 import {
-  groupChatDir, groupChatMembersFile, groupChatStateFile,
+  groupChatDir, groupChatMembersFile, groupChatStateFile, userChatsDir,
 } from '../../paths';
 import { nowIso, readJson, writeJson, safeId } from '../../storage';
 import { createLogger } from '../../logger';
@@ -143,6 +143,50 @@ export async function ensureAgentMember(
 ): Promise<boolean> {
   if (!safeId(agentId) || RESERVED_IDS.has(agentId)) return false;
   return addMember(uid, cid, { kind: 'agent', id: agentId, ...(name ? { name } : {}) });
+}
+
+/** Sync an agent's display name into every conversation roster that already
+ *  has it as a member. Called by `agents.updateCustomAgent` when the name
+ *  changes — without it, the @-router's roster-first lookup keeps resolving
+ *  on the snapshot copied at member-join time, so old conversations would
+ *  still respond to `@<old-name>`. Returns the number of rosters touched. */
+export async function renameAgentInMembers(
+  uid: string, agentId: string, newName: string,
+): Promise<number> {
+  if (!uid || !safeId(agentId) || RESERVED_IDS.has(agentId) || !newName) return 0;
+  const indexFile = path.join(userChatsDir(uid), '_index.json');
+  if (!fs.existsSync(indexFile)) return 0;
+  let cids: string[] = [];
+  try {
+    const data: any = await readJson(indexFile);
+    const items: any[] = Array.isArray(data) ? data
+      : (data && Array.isArray(data.items) ? data.items : []);
+    cids = items
+      .map((c) => c && typeof c.conversation_id === 'string' ? c.conversation_id : '')
+      .filter((s) => s && safeId(s));
+  } catch (err) {
+    log.warn(`read conv index failed user=${uid}: ${(err as Error).message}`);
+    return 0;
+  }
+  let touched = 0;
+  for (const cid of cids) {
+    const file = groupChatMembersFile(uid, cid);
+    if (!fs.existsSync(file)) continue;
+    let m: MembersFile;
+    try { m = await readMembers(uid, cid); }
+    catch { continue; }
+    const actor = m.actors.find((a) => a.id === agentId);
+    if (!actor || actor.name === newName) continue;
+    actor.name = newName;
+    try {
+      await writeMembers(uid, cid, m);
+      touched += 1;
+    } catch (err) {
+      log.warn(`write members failed user=${uid} cid=${cid}: ${(err as Error).message}`);
+    }
+  }
+  if (touched > 0) log.info(`renamed agent=${agentId} → "${newName}" in ${touched} conv(s) user=${uid}`);
+  return touched;
 }
 
 // ── State IO ─────────────────────────────────────────────────────────────

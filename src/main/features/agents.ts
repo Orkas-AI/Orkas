@@ -43,6 +43,7 @@ import {
 } from '../storage';
 import { listSkillSpecs } from '../model/core-agent/skill-registry';
 import { readDisabledSets, setAgentEnabled } from './component_enabled';
+import { renameAgentInMembers } from './group_chat/state';
 import * as search from './search';
 
 export type AgentSource = 'builtin' | 'custom';
@@ -691,6 +692,7 @@ export async function updateCustomAgent(
   const f = customAgentFile(agentId);
   if (!fs.existsSync(f)) return null;
   const data = await readJson<AgentRaw>(f);
+  const oldName = typeof (data as any).name === 'string' ? (data as any).name : '';
   if (Object.prototype.hasOwnProperty.call(updates || {}, 'name')) {
     assertAgentNameAllowed(typeof updates.name === 'string' ? updates.name : '');
   }
@@ -831,6 +833,15 @@ export async function updateCustomAgent(
   await writeJson(f, data);
   _invalidateAgentListCache();
   log.info(`updated id=${agentId}`);
+  // Propagate a name change into every conversation roster that already
+  // lists this agent. members.json snapshots the name at join time and the
+  // @-router resolves on roster-first, so without this sweep `@<old-name>`
+  // would keep matching in old chats.
+  const newName = typeof (data as any).name === 'string' ? (data as any).name : '';
+  if (newName && newName !== oldName) {
+    try { await renameAgentInMembers(getActiveUserId(), agentId, newName); }
+    catch (err) { log.warn(`rename roster sweep failed id=${agentId}: ${(err as Error).message}`); }
+  }
   return normalizeAgent(data, 'custom');
 }
 
