@@ -695,6 +695,13 @@ async function _flushAgentFieldSave() {
     // the next picker open means freshly-typed `@<multi-word-name>` only
     // gets the fallback char class, which stops at the first whitespace.
     await loadAgents(true);
+    // Repaint the input-box recipient chip if it's bound to this agent —
+    // its `name` field is a localStorage snapshot taken at picker time, so
+    // without an explicit re-render the chip keeps showing the old name
+    // until the next view switch.
+    if (field === 'name' && typeof _renderRecipientChip === 'function') {
+      try { _renderRecipientChip(); } catch (_) { /* non-fatal */ }
+    }
   } catch (e) {
     _agentsLog.warn('save agent field failed', e);
     if (field === 'name') {
@@ -853,6 +860,11 @@ function _ensureAgentChatController() {
               _renderAgentDetail(freshData.agent, true);
               _agentsCache = null;
               await loadAgents(true);
+              // Repaint the chat input recipient chip in case its bound
+              // agent was the one just renamed by the edit chat.
+              if (typeof _renderRecipientChip === 'function') {
+                try { _renderRecipientChip(); } catch (_) { /* non-fatal */ }
+              }
             }
           } catch (e) {
             _agentsLog.warn('refresh after updated fields failed', e);

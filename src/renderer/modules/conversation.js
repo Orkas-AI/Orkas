@@ -245,8 +245,18 @@ function _renderRecipientChip(target) {
     const nameEl = document.getElementById(id);
     if (!nameEl) continue;
     const r = _activeRecipient(tg);
-    if (r.kind === 'agent' && r.name) {
-      nameEl.textContent = '@' + r.name;
+    if (r.kind === 'agent' && r.id) {
+      // Resolve name from the live registry first — the `r.name` field is
+      // a snapshot taken at picker time and stays stale after rename. Fall
+      // back to the snapshot only when the registry doesn't know the agent
+      // (e.g. it was deleted), then to the id as a last resort.
+      let display = '';
+      if (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
+        const a = _agentsCache.find((x) => x && x.agent_id === r.id);
+        if (a && a.name) display = a.name;
+      }
+      if (!display) display = r.name || r.id;
+      nameEl.textContent = '@' + display;
       nameEl.removeAttribute('data-i18n');
     } else {
       nameEl.setAttribute('data-i18n', 'chat.recipient_commander');
@@ -441,10 +451,21 @@ const _LEADING_MENTION_RE = /^@([A-Za-z0-9_一-鿿-]+)\s?/u;
 
 function applyRecipientPrefix(raw, target) {
   const r = _activeRecipient(target || 'conversation');
-  if (r.kind !== 'agent' || !r.name) return raw;
+  if (r.kind !== 'agent' || !r.id) return raw;
   const text = String(raw || '');
   if (_LEADING_MENTION_RE.exec(text)) return text;
-  const tag = '@' + String(r.name).replace(/\s+/g, '');
+  // Resolve from the live registry by id — `r.name` is a localStorage
+  // snapshot taken at picker time, so a rename leaves it stale and the
+  // outgoing `@<token>` would still carry the old name. Fall back to the
+  // snapshot when the registry doesn't know the agent (deleted), then to
+  // the id as last resort.
+  let display = '';
+  if (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
+    const a = _agentsCache.find((x) => x && x.agent_id === r.id);
+    if (a && a.name) display = a.name;
+  }
+  if (!display) display = r.name || r.id;
+  const tag = '@' + String(display).replace(/\s+/g, '');
   return tag + ' ' + text;
 }
 

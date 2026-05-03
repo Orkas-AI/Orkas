@@ -5,6 +5,7 @@ function makeHandlers() {
   return {
     onSessionNew: vi.fn(),
     onTextDelta: vi.fn(),
+    onThinking: vi.fn(),
     onToolUse: vi.fn(),
     onToolResult: vi.fn(),
     onPromptResult: vi.fn(),
@@ -19,7 +20,7 @@ describe('local_agents/backends/_acp › handleAcpMessage', () => {
     expect(h.onSessionNew).toHaveBeenCalledWith('sess-x');
   });
 
-  it('routes session/update agent_message_chunk to onTextDelta', () => {
+  it('routes session/update agent_message_chunk to onTextDelta (kind field)', () => {
     const h = makeHandlers();
     handleAcpMessage({
       jsonrpc: '2.0',
@@ -27,6 +28,34 @@ describe('local_agents/backends/_acp › handleAcpMessage', () => {
       params: { sessionId: 's', update: { kind: 'agent_message_chunk', content: { text: 'hello' } } },
     }, h);
     expect(h.onTextDelta).toHaveBeenCalledWith('hello');
+  });
+
+  it('routes session/update agent_message_chunk via sessionUpdate field (Hermes wire format)', () => {
+    const h = makeHandlers();
+    handleAcpMessage({
+      method: 'session/update',
+      params: { sessionId: 's', update: { sessionUpdate: 'agent_message_chunk', content: { text: 'hi' } } },
+    }, h);
+    expect(h.onTextDelta).toHaveBeenCalledWith('hi');
+  });
+
+  it('routes agent_thought_chunk to onThinking', () => {
+    const h = makeHandlers();
+    handleAcpMessage({
+      method: 'session/update',
+      params: { update: { sessionUpdate: 'agent_thought_chunk', content: { text: '(◔_◔) mulling' } } },
+    }, h);
+    expect(h.onThinking).toHaveBeenCalledWith('(◔_◔) mulling');
+  });
+
+  it('available_commands_update goes to onUnknown (not pretending to be a tool)', () => {
+    const h = makeHandlers();
+    handleAcpMessage({
+      method: 'session/update',
+      params: { update: { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'help' }] } },
+    }, h);
+    expect(h.onToolUse).not.toHaveBeenCalled();
+    expect(h.onUnknown).toHaveBeenCalled();
   });
 
   it('routes tool_call to onToolUse', () => {

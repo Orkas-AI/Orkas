@@ -11,11 +11,33 @@
  * routes CLI agents into `features/local_agents/runner.ts` (Step 6).
  */
 
-import { detectAll, detectOne, invalidateCache, LOCAL_CLI_TYPES, type LocalCliType } from '../features/local_agents/registry.js';
+import { detectAll, detectOne, invalidateCache, LOCAL_CLI_TYPES, type LocalCliType, type LocalCliEntry } from '../features/local_agents/registry.js';
 import { listModels } from '../features/local_agents/models.js';
 
 function isLocalCliType(v: unknown): v is LocalCliType {
   return typeof v === 'string' && (LOCAL_CLI_TYPES as readonly string[]).includes(v);
+}
+
+// Set of CLI types we have a working dispatch backend for. Detection
+// is independent (registry probes PATH + --version regardless), but
+// the create-modal / detail-page selectors shouldn't let users pick a
+// CLI we can't actually dispatch through. As of today every detected
+// CLI has a backend — left as a guard for future additions where the
+// dispatch path lags detection.
+const DISPATCHABLE: ReadonlySet<LocalCliType> = new Set<LocalCliType>(
+  ['claude', 'codex', 'openclaw', 'opencode', 'hermes'],
+);
+
+function maskUnsupported(entries: LocalCliEntry[]): LocalCliEntry[] {
+  return entries.map(e => {
+    if (DISPATCHABLE.has(e.type)) return e;
+    return {
+      ...e,
+      available: false,
+      error: e.error ?? 'version_unknown',
+      errorDetail: 'backend not yet implemented in Orkas',
+    };
+  });
 }
 
 export const invokeHandlers = {
@@ -26,7 +48,7 @@ export const invokeHandlers = {
    */
   'localAgents.list': async ({ force = false }: { force?: boolean } = {}) => {
     const entries = await detectAll({ force: !!force });
-    return { entries };
+    return { entries: maskUnsupported(entries) };
   },
 
   /**
@@ -39,7 +61,7 @@ export const invokeHandlers = {
     if (!isLocalCliType(type)) throw new Error('invalid CLI type');
     invalidateCache();
     const entry = await detectOne(type);
-    return { entry };
+    return { entry: maskUnsupported([entry])[0] };
   },
 
   /**

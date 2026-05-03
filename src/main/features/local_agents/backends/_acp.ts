@@ -51,6 +51,13 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
       let resultText = '';
       let resultStatus: 'completed' | 'failed' | undefined;
       let resultError: string | undefined;
+      // Captured upstream-provider error text from stderr. ACP servers
+      // (notably hermes 0.9) treat upstream HTTP 400/auth errors as
+      // "non-retryable" and still return `stopReason: end_turn` with
+      // an empty body — looking only at the JSON-RPC envelope makes a
+      // failed turn look successful. We sniff stderr for these and
+      // promote them to the run-level error if no text streamed.
+      let stderrErrorHint: string | undefined;
 
       const PROMPT_REQ_ID = 100;
 
@@ -84,6 +91,16 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         },
       });
 
+      // Pre-build session/new params: include model up front (Hermes
+      // accepts it; CLIs that don't honor model in session/new ignore
+      // it). The set_model fallback below covers servers that need
+      // an explicit setter.
+      const sessionNewParams: Record<string, unknown> = {
+        cwd: opts.cwd,
+        mcpServers: [],
+      };
+      if (opts.model) sessionNewParams.model = opts.model;
+
       const splitter = new LineSplitter();
       child.stdout.setEncoding('utf8');
       child.stdout.on('data', chunk => {
@@ -114,12 +131,21 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
               resultText += text;
               opts.onEvent({ type: 'text-delta', text });
             },
+            onThinking: text => opts.onEvent({ type: 'thinking', text }),
             onToolUse: tool => opts.onEvent({ type: 'tool-event', tool: tool.name, callId: tool.callId, phase: 'use', input: tool.input }),
             onToolResult: tool => opts.onEvent({ type: 'tool-event', tool: tool.name, callId: tool.callId, phase: 'result', output: tool.output }),
             onPromptResult: r => {
               resultStatus = r.ok ? 'completed' : 'failed';
               if (r.ok && r.text) resultText = r.text;
               if (!r.ok) resultError = r.error;
+              // ACP servers (hermes / kimi / kiro) keep stdin open
+              // ready for the next prompt — they're long-running.
+              // We're a one-shot dispatcher; closing stdin signals
+              // them to shut down so the close handler below fires
+              // and the outer Promise resolves. Without this we hang
+              // forever waiting on a child that's perfectly happy to
+              // sit idle.
+              try { child.stdin.end(); } catch { /* */ }
             },
             onUnknown: raw => {
               opts.onEvent({ type: 'tool-event', tool: 'acp', phase: 'use', input: raw, callId: '' });
@@ -141,7 +167,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
       // any post-initialize state.
       const sendSessionNew = () => send({
         jsonrpc: '2.0', id: 2, method: 'session/new',
-        params: { cwd: opts.cwd, mcpServers: [] },
+        params: sessionNewParams,
       });
       // Fire-and-forget timeout to be sure session/new goes; some CLIs
       // ack initialize without printing anything we'd recognize as the
@@ -154,6 +180,16 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         tail.push(chunk);
         for (const line of chunk.split(/\r?\n/)) {
           if (line) opts.onEvent({ type: 'stderr-line', line });
+          // Sniff for upstream-provider failures hermes prints just
+          // before silently returning end_turn. The most useful line
+          // is the "Error: HTTP 400: ..." one with the API's message;
+          // we keep the FIRST hit so retries don't overwrite the root
+          // cause. Pattern is intentionally loose because hermes log
+          // formatting drifts version-to-version.
+          if (!stderrErrorHint) {
+            const m = /(HTTP\s+\d{3}[^\n]*|Non-retryable[^\n]*|Error code:\s+\d{3}[^\n]*)/.exec(line);
+            if (m) stderrErrorHint = m[1].trim();
+          }
         }
       });
 
@@ -180,7 +216,22 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         child.on('close', code => {
           if (opts.signal.aborted) return finish('cancelled', { output: resultText });
           if (timedOut) return finish('timeout', { error: `cli exceeded ${opts.timeoutMs}ms`, output: resultText, stderrTail: tail.toString() });
-          if (code === 0 && resultStatus === 'completed') return finish('completed', { output: resultText });
+          if (code === 0 && resultStatus === 'completed') {
+            // Demote silent failure: server claimed success via
+            // stopReason=end_turn but never streamed any text AND
+            // stderr contained an upstream-provider error. Hermes
+            // does this on auth/model misconfig (HTTP 400). Surface
+            // the captured error so the chat shows a real reason
+            // instead of an empty bubble.
+            if (!resultText && stderrErrorHint) {
+              return finish('failed', {
+                error: `${def.logName.replace('local-agents:', '')} reported success but produced no text — upstream: ${stderrErrorHint}`,
+                output: '',
+                stderrTail: tail.toString(),
+              });
+            }
+            return finish('completed', { output: resultText });
+          }
           const err = resultError || (code !== 0 ? `cli exited with code ${code}` : 'cli closed without prompt result');
           finish('failed', { error: err, output: resultText, stderrTail: tail.toString() });
         });
@@ -192,6 +243,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
 interface AcpHandlers {
   onSessionNew(sessionId: string): void;
   onTextDelta(text: string): void;
+  onThinking(text: string): void;
   onToolUse(tool: { name: string; callId: string; input: unknown }): void;
   onToolResult(tool: { name: string; callId: string; output: string }): void;
   onPromptResult(r: { ok: boolean; text?: string; error?: string }): void;
@@ -201,6 +253,14 @@ interface AcpHandlers {
 /**
  * Pure dispatcher — given a parsed ACP message envelope, invokes the
  * matching handler. Exposed for unit testing without spawning the CLI.
+ *
+ * Field-name reality check (vs ACP spec drafts):
+ *   - Hermes 0.9 uses `update.sessionUpdate` as the discriminator
+ *     (string like `agent_message_chunk` / `agent_thought_chunk` /
+ *     `tool_call` / `tool_call_update` / `available_commands_update`),
+ *     and puts text under `update.content.text`.
+ *   - Some older / draft variants use `update.kind` instead.
+ *   We check `sessionUpdate` first, then `kind` so both work.
  */
 export function handleAcpMessage(env: any, h: AcpHandlers): void {
   if (!env || typeof env !== 'object') return;
@@ -208,12 +268,24 @@ export function handleAcpMessage(env: any, h: AcpHandlers): void {
   if (env.method === 'session/update') {
     const upd = env.params?.update;
     if (!upd || typeof upd !== 'object') return;
-    // Common kinds (per ACP spec): agent_message_chunk, tool_call, tool_call_update, finished.
-    if (upd.kind === 'agent_message_chunk' && typeof upd.content?.text === 'string') {
-      h.onTextDelta(upd.content.text);
+    const kind: string = (typeof upd.sessionUpdate === 'string' && upd.sessionUpdate)
+      || (typeof upd.kind === 'string' && upd.kind)
+      || '';
+    if (!kind) return;
+    if (kind === 'agent_message_chunk') {
+      const text = upd.content?.text;
+      if (typeof text === 'string' && text.length) h.onTextDelta(text);
       return;
     }
-    if (upd.kind === 'tool_call' && upd.tool) {
+    if (kind === 'agent_thought_chunk') {
+      // Thinking/internal monologue — hermes uses these for its
+      // "(◔_◔) mulling..." status messages and any planning the
+      // model emits before the actual reply.
+      const text = upd.content?.text;
+      if (typeof text === 'string' && text.length) h.onThinking(text);
+      return;
+    }
+    if (kind === 'tool_call' && upd.tool) {
       h.onToolUse({
         name: String(upd.tool.name || 'tool'),
         callId: String(upd.tool.id || upd.tool.callId || ''),
@@ -221,12 +293,19 @@ export function handleAcpMessage(env: any, h: AcpHandlers): void {
       });
       return;
     }
-    if (upd.kind === 'tool_call_update' && upd.tool) {
+    if (kind === 'tool_call_update' && upd.tool) {
       h.onToolResult({
         name: String(upd.tool.name || 'tool'),
         callId: String(upd.tool.id || upd.tool.callId || ''),
         output: typeof upd.tool.output === 'string' ? upd.tool.output : JSON.stringify(upd.tool.output ?? ''),
       });
+      return;
+    }
+    if (kind === 'available_commands_update') {
+      // Hermes broadcasts its slash-command list right after session
+      // creation. Surface as unknown so it lands in the debug rail
+      // but doesn't pretend to be a tool/result event.
+      h.onUnknown({ method: env.method, params: env.params });
       return;
     }
     h.onUnknown({ method: env.method, params: env.params });
