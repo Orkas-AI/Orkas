@@ -176,11 +176,42 @@ export async function createDeepSeekProvider(config: CreateDeepSeekProviderConfi
     provider: 'deepseek',
     apiKey: config.apiKey,
     customModel: model,
-    // DeepSeek V4 Pro 的 server-side 校验：只要 model.reasoning=true，请求里就
-    // 必须带 `reasoning_effort`，否则任何在历史里出现 `reasoning_content` 的
-    // 后续轮次都会被拒（错误信息 "reasoning_content in the thinking mode must
-    // be passed back" 是误导，真因是 effort 缺失）。给推理档位一个保守的
-    // `'low'` 默认值；调用方仍能通过 `thinkingLevel: 'off' | 'high'` 覆盖。
+    // DeepSeek V4 server-side 校验有两个对称失效模式,误导性错误信息相同
+    // ("reasoning_content in the thinking mode must be passed back to the API"):
+    //   A. `reasoning_effort` 缺失 + 历史里有 assistant.reasoning_content → 400
+    //   B. `reasoning_effort` 存在 + 历史里有 assistant 缺 reasoning_content → 400
+    // 真正的规则是:`reasoning_effort` 的存在必须与 history 的 reasoning_content
+    // 保持一致(全有 / 全无),不能"半开半关"。
+    //
+    // 实测场景 B:rotating-provider 把主候选 openai-codex 失败后 fallback 到
+    // deepseek,pi-ai/transform-messages.js 在 cross-provider 时把 codex 的
+    // `thinking` 块降级成纯文本(丢 thinkingSignature),history 里 assistant
+    // 没有 reasoning_content。我们再带 reasoning_effort 就触发 B。
+    //
+    // 修法:`onPayload` 动态决定 reasoning_effort —— 检查所有 prior assistant
+    // 是否都带 reasoning_content(即"reasoning consistent"):
+    //   - 都有  → 保留 reasoning_effort  (反向治 A)
+    //   - 不全有 → 删掉 reasoning_effort (治 B)
+    onPayload: (params) => {
+      try {
+        const p = params as { reasoning_effort?: string; messages?: Array<{ role?: string; reasoning_content?: unknown; reasoning?: unknown }> };
+        const priorAssistants = (p.messages || []).filter((m) => m && m.role === 'assistant');
+        if (priorAssistants.length === 0) {
+          // No prior turns — nothing to be inconsistent with. Default
+          // direction: keep reasoning_effort if model.reasoning=true so a
+          // fresh thinking-mode session works.
+          return params;
+        }
+        const allHaveReasoning = priorAssistants.every(
+          (m) => (typeof m.reasoning_content === 'string' && m.reasoning_content.length > 0)
+            || (typeof m.reasoning === 'string' && (m.reasoning as string).length > 0),
+        );
+        if (!allHaveReasoning && p.reasoning_effort !== undefined) {
+          delete p.reasoning_effort;
+        }
+      } catch { /* never let onPayload throw — pi-ai treats throw as fatal */ }
+      return params;
+    },
     ...(model.reasoning ? { defaultReasoning: 'low' as const } : {}),
   });
 }
