@@ -74,6 +74,7 @@
   "model.retrying_n": "正在第 {attempt} 次重试",
   "model.aborted": "（已中断）",
   "cli_agent.missing": "⚠️ 智能体「{name}」依赖的本地 CLI「{cli}」未安装。请安装该 CLI 后重试，或在编辑面板换成其他类型。",
+  "chat.commander_dispatch_only": "已转给 {agents}。",
   "plan.announcement.heading": "我准备按下面的步骤推进：",
   "plan.announcement.assignee_self": "我自己",
   "plan.announcement.assignee_user": "请你",

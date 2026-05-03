@@ -1056,6 +1056,36 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     }
   }
 
+  // Same UX rationale as the plan announcement merge: a commander turn
+  // that ONLY emitted dispatch_to(s) leaves an empty bubble below the
+  // process rail, which reads as "broken" to the user. Surface a brief
+  // summary line so the bubble is informative. Skipped when there's
+  // already a body (the LLM wrote prose alongside the dispatch — common
+  // for fallback flows), and when the bubble already carries the plan
+  // card from the merge above.
+  // "Visually empty" — also strips zero-width chars some LLMs emit as the
+  // body of a tool-only turn to dodge the framework's "empty response"
+  // detection (we've seen U+200B as a single-char body alongside a
+  // dispatch_to call). `.trim()` alone wouldn't catch them.
+  // U+200B–U+200D (ZWSP / ZWNJ / ZWJ) + U+FEFF (BOM).
+  const _isVisuallyEmpty = (s: string | undefined): boolean =>
+    !s || !s.replace(/[​-‍﻿]/g, '').trim();
+  if (actor.kind === 'commander'
+      && w.pendingDispatches && w.pendingDispatches.length
+      && outcome.kind === 'persist'
+      && _isVisuallyEmpty(outcome.text)) {
+    const tags: string[] = [];
+    for (const d of w.pendingDispatches) {
+      let name = d.to;
+      try {
+        const ag = await agentsFeat.getAgent(d.to);
+        if (ag && (ag as any).name) name = (ag as any).name;
+      } catch { /* fall back to raw id */ }
+      tags.push('@' + String(name).replace(/\s+/g, ''));
+    }
+    outcome = { ...outcome, text: t('chat.commander_dispatch_only', { agents: tags.join(', ') }) };
+  }
+
   // Abort post-processing — single source of truth for both "promote silent
   // to persist when there's still something visible to keep" AND the
   // "（已中断）" suffix.

@@ -74,6 +74,7 @@
   "model.retrying_n": "Retry attempt {attempt}",
   "model.aborted": "(stopped)",
   "cli_agent.missing": "⚠️ Agent “{name}” needs the local CLI “{cli}” which isn’t installed. Install it and retry, or switch the agent to another type.",
+  "chat.commander_dispatch_only": "Forwarded to {agents}.",
   "plan.announcement.heading": "I'll proceed with the following steps:",
   "plan.announcement.assignee_self": "me",
   "plan.announcement.assignee_user": "you",
