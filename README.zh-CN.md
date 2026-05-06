@@ -1,10 +1,12 @@
-# Orkas
+# Orkas — 开源多智能体 AI 桌面客户端
+
+**用一段对话组建你的 AI 团队。Orkas 是一个多智能体系统 (multi-agent system)，做 AI 工作流编排 (AI workflow orchestration)：指挥官组建智能体团队 (agent team)，调度子智能体，通过智能体编排 (agents orchestration) 执行任务。本地优先，跨平台，自带 LLM 密钥。**
 
 [English](./README.md) · [简体中文](./README.zh-CN.md)
 
 > 用对话，指挥你的 AI 团队 —— 做给那些想要一支团队、而不是一个聊天框的人。
 
-**多智能体协作 · 智能体自我演进 · 本地存储 · 桌面应用**
+**多智能体系统 · AI 团队 · 智能体编排 · 智能体自我演进 · 本地存储 · 跨平台桌面应用**
 
 🌐 想要团队协作、专家 Agent 等更多功能？→ [专业版](https://aiservice.fun)
 

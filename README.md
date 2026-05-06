@@ -1,10 +1,12 @@
-# Orkas
+# Orkas — Open-Source Multi-Agent AI Desktop Client
+
+**Build your AI team in one conversation. Orkas is a multi-agent system for AI workflow orchestration: a commander assembles an agent team, dispatches sub-agents, and runs tasks through agents orchestration. Local-first, cross-platform, BYO LLM keys.**
 
 [English](./README.md) · [简体中文](./README.zh-CN.md)
 
 > Command your AI team through conversation — made for people who want a team, not a chat box.
 
-**Multi-agent collaboration · Self-evolving agents · Local storage · Desktop app**
+**Multi-agent system · AI team · Agent orchestration · Self-evolving agents · Local-first storage · Cross-platform desktop app**
 
 🌐 Want team collaboration, expert agents, and more? → [Pro edition](https://aiservice.fun)
 
