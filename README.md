@@ -1,12 +1,14 @@
 # Orkas — Open-Source Multi-Agent AI Desktop Client
 
-**Build your AI team in one conversation. Orkas is a multi-agent system for AI workflow orchestration: a commander assembles an agent team, dispatches sub-agents, and runs tasks through agents orchestration. Local-first, cross-platform, BYO LLM keys.**
+**Open-source multi-agent AI desktop client for AI workflow orchestration. Build your AI team in one chat: a commander LLM assembles an agent team, dispatches sub-agents in parallel or in series, and lets agents self-evolve through reflection and skill crystallization. Local-first storage, BYO LLM API keys (Claude · OpenAI · Gemini · DeepSeek · Kimi · GLM · Qwen · MiniMax · Doubao), cross-platform on macOS, Windows, and Linux. A no-code, GUI-native team layer for local agents — OpenClaw, Hermes-Agent, Claude Code, Codex, and other local CLI agents all plug in seamlessly.**
 
 [English](./README.md) · [简体中文](./README.zh-CN.md)
 
 > Command your AI team through conversation — made for people who want a team, not a chat box.
 
-**Multi-agent system · AI team · Agent orchestration · Self-evolving agents · Local-first storage · Cross-platform desktop app**
+**Multi-agent collaboration · Self-evolving agents · Local-first storage · Cross-platform desktop app**
+
+<sub>multi-agent system · AI team · agent team · AI workflow · agents orchestration</sub>
 
 🌐 Want team collaboration, expert agents, and more? → [Pro edition](https://aiservice.fun)
 
@@ -88,6 +90,20 @@ Each agent maintains two kinds of self-knowledge in its own directory, written b
 After each task, the agent reflects and updates these two files; on the next task, `meta/` is fed in as part of the system prompt, **so experience actually shapes the next run**.
 
 The other evolution path is the `skill_manage` tool: an agent can crystallize "this is how I solved X" into a skill that **only belongs to itself** (a private SkillStore, independent of the global skill library). The next similar task calls it directly — no need to re-derive it every time.
+
+---
+
+## Why Orkas?
+
+Orkas isn't a single personal AI assistant that follows you across messaging channels, and isn't a hosted SaaS — it's a desktop app where you assemble a team of specialized agents and command them through one chat.
+
+| Tool | What it is | Where Orkas differs |
+| --- | --- | --- |
+| **OpenClaw** | A personal AI assistant you run on your own devices, reaching you across the messaging channels you already use. Single-user, always-on, channel-native. | Orkas is a desktop multi-agent client: instead of one assistant on every channel, you build a team of specialized agents and direct them through a single desktop chat — visibility-sliced collaboration, a shared `plan.md`, and per-agent self-evolution. OpenClaw also plugs in as an Orkas CLI backend, so an Orkas agent can hand work off to your OpenClaw. |
+| **Hermes-Agent** | Nous Research's self-improving personal AI agent — a TUI plus multi-channel gateway, with a built-in learning loop, scheduled automations, and the ability to run on a cheap VPS or serverless infra. | Orkas is desktop-GUI and team-shaped: a commander LLM dispatches a *team* of agents in parallel or in series through one chat; each agent has its own private skill library and meta-cognition, and the entire stack runs locally on your machine. Hermes-Agent is also pluggable as an Orkas CLI backend. |
+| **Cloud agent platforms** (SaaS multi-agent orchestrators) | Server-hosted; conversations, files, and API keys live on the vendor's infrastructure. | Orkas is local-first: conversations, files, API keys, knowledge bases, custom agents / skills / memory all stay on your machine. Model API calls go straight from your machine to the provider — never through Orkas servers, and never archived. |
+
+**Orkas is for you if**: you want a *team* of agents, not a single personal assistant; you want a desktop GUI with file drop-in and visual agent management; and you want your data, keys, and agents on your own disk rather than in a vendor cloud.
 
 ---
 
