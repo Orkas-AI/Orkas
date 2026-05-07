@@ -44,7 +44,6 @@ import {
 import { listSkillSpecs } from '../model/core-agent/skill-registry';
 import { readDisabledSets, setAgentEnabled } from './component_enabled';
 import { renameAgentInMembers } from './group_chat/state';
-import * as search from './search';
 
 export type AgentSource = 'builtin' | 'custom';
 
@@ -894,7 +893,6 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
         try { await fsp.rm(chatDir, { recursive: true, force: true }); }
         catch (err) { log.warn(`rm failed user=${uid} agent=${agentId}: ${(err as Error).message}`); }
         invalidateLineCount(path.join(chatDir, 'chat.jsonl'));
-        search.dropAgentChat(uid, agentId);
       }
       const sessionId = defaultAgentEditSessionId(uid, agentId);
       try { evictSession(sessionId); } catch { /* cache may not hold it */ }
@@ -1061,8 +1059,7 @@ export async function getAgentChatMessages(userId: string, agentId: string, limi
 
 async function _appendAgentChatMessage(userId: string, agentId: string, record: any): Promise<void> {
   const file = agentChatMsgsPath(userId, agentId);
-  const { msgIndex } = await appendJsonlAtomic(file, record);
-  search.indexAgentChatMessage(userId, agentId, msgIndex, record);
+  await appendJsonlAtomic(file, record);
 }
 
 export async function clearAgentChat(userId: string, agentId: string): Promise<boolean> {
@@ -1075,7 +1072,6 @@ export async function clearAgentChat(userId: string, agentId: string): Promise<b
     }
   }
   invalidateLineCount(agentChatMsgsPath(userId, agentId));
-  search.dropAgentChat(userId, agentId);
   // Also evict + drop the core-agent persistent session jsonl. Without this
   // the LLM retains its full prior context even though the UI history is
   // empty — same bug pattern as clearSkillChat (paths from before a

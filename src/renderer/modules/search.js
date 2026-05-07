@@ -9,7 +9,7 @@ const _SEARCH_FETCH_LIMIT = 200;   // backend cap; we filter/slice locally per t
 const _SEARCH_ALL_PER_SECTION = 10; // "all" tab shows up to N per section, overflow → 查看更多
 let _searchTimer = null;
 let _searchSeq = 0;
-let _searchTab = 'all';             // 'all' | 'chat' | 'context'
+let _searchTab = 'all';             // 'all' | 'chat' | 'agent' | 'skill' | 'context'
 let _searchResults = [];
 let _searchActiveIdx = -1;
 let _searchLastQuery = '';
@@ -33,19 +33,28 @@ function _bindGlobalSearch() {
   overlay?.addEventListener('click', (e) => {
     if (e.target === overlay) closeGlobalSearch();
   });
-  // Global Cmd/Ctrl+K shortcut
+  // Global Cmd/Ctrl+K shortcut. Toggle behaviour: if the overlay is already
+  // open, a second Cmd+K closes it (parity with Cmd+K-style command palettes
+  // in VS Code / Notion / etc.) — without this, the keystroke would re-call
+  // openGlobalSearch() and reset query + tab state mid-typing.
   document.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
       e.preventDefault();
-      openGlobalSearch();
+      const overlay = document.getElementById('search-overlay');
+      if (overlay && overlay.style.display !== 'none') {
+        closeGlobalSearch();
+      } else {
+        openGlobalSearch();
+      }
     } else if (e.key === 'Escape' && document.getElementById('search-overlay').style.display !== 'none') {
       closeGlobalSearch();
     }
   });
 }
 
+const _SEARCH_VALID_TABS = new Set(['all', 'chat', 'agent', 'skill', 'context']);
 function _setSearchTab(tab) {
-  if (!tab || (tab !== 'all' && tab !== 'chat' && tab !== 'context')) return;
+  if (!tab || !_SEARCH_VALID_TABS.has(tab)) return;
   _searchTab = tab;
   document.querySelectorAll('.search-tab').forEach((b) => {
     b.classList.toggle('is-active', b.dataset.tab === tab);
@@ -117,17 +126,28 @@ async function _runSearchNow(queryArg) {
   }
 }
 
-// Split results into 2 buckets per the tab-grouping spec:
-//   - chats: chat + skill_chat + agent_chat, sorted by time DESC
-//   - contexts: context kind only, sorted by path-segment count ASC then path alpha
-// Chats sort by time (recency is the useful signal); contexts sort by
-// "shortest directory path first" so root-level files come before deeply
-// nested ones.
+// Split results into 4 buckets per the tab-grouping spec:
+//   - chats:    main-conversation messages, sorted by time DESC (recency)
+//   - agents:   agent body matches, sorted by score DESC then name
+//   - skills:   skill body matches, sorted by score DESC then name
+//   - contexts: KB path matches, sorted by directory depth ASC then path
+// Skill/agent EDIT conversations were removed from search — only the
+// main-conversation jsonls feed the chats bucket.
 function _partitionSearchResults(results) {
   const chats = results
-    .filter((r) => r.kind === 'chat' || r.kind === 'skill_chat' || r.kind === 'agent_chat')
+    .filter((r) => r.kind === 'chat')
     .slice()
     .sort((a, b) => String(b.time || '').localeCompare(String(a.time || '')));
+  const agents = results
+    .filter((r) => r.kind === 'agent')
+    .slice()
+    .sort((a, b) => (b.score || 0) - (a.score || 0)
+      || String(a.name || '').localeCompare(String(b.name || '')));
+  const skills = results
+    .filter((r) => r.kind === 'skill')
+    .slice()
+    .sort((a, b) => (b.score || 0) - (a.score || 0)
+      || String(a.name || '').localeCompare(String(b.name || '')));
   const contexts = results
     .filter((r) => r.kind === 'context')
     .slice()
@@ -137,7 +157,7 @@ function _partitionSearchResults(results) {
       if (da !== db) return da - db;
       return pa.localeCompare(pb);
     });
-  return { chats, contexts };
+  return { chats, agents, skills, contexts };
 }
 
 function _renderSearchEmptyState() {
@@ -184,10 +204,15 @@ function _highlightSnippet(snippet, query) {
 
 // Labels resolved lazily via t() so switching lang re-labels future renders.
 const _SEARCH_KIND_META = {
-  context:    { labelKey: 'search.scope.context',    cls: 'is-context' },
-  chat:       { labelKey: 'search.scope.chat',       cls: 'is-chat' },
-  skill_chat: { labelKey: 'search.scope.skill_chat', cls: 'is-skill' },
-  agent_chat: { labelKey: 'search.scope.agent_chat', cls: 'is-agent' },
+  context: { labelKey: 'search.scope.context', cls: 'is-context' },
+  chat:    { labelKey: 'search.scope.chat',    cls: 'is-chat' },
+  agent:   { labelKey: 'search.scope.agent',   cls: 'is-agent' },
+  skill:   { labelKey: 'search.scope.skill',   cls: 'is-skill' },
+};
+
+const _SEARCH_SOURCE_LABEL = {
+  custom:  'search.source.custom',
+  builtin: 'search.source.builtin',
 };
 
 // Render one result into HTML. Uses the shared `_renderSearchRow` helper for
@@ -204,18 +229,10 @@ function _renderSearchRow(r, dataIdx, query) {
   } else if (r.kind === 'chat') {
     title = r.conv_title || t('chat.new_conv_title');
     sub = `${roleLabel(r.role)} · ${formatTime(r.time || '')}`;
-  } else if (r.kind === 'skill_chat') {
-    title = r.skill_id;
-    sub = `${roleLabel(r.role)} · ${formatTime(r.time || '')}`;
-  } else if (r.kind === 'agent_chat') {
-    // agent_id is an opaque hex (e.g. "51bc903ae443") — never show that
-    // to the user. Resolve through the global agents cache loaded on
-    // view-mount; fall back to the id only if the cache hasn't filled.
-    const agent = (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache))
-      ? _agentsCache.find((a) => a && a.agent_id === r.agent_id)
-      : null;
-    title = (agent && agent.name) || r.agent_id;
-    sub = `${roleLabel(r.role)} · ${formatTime(r.time || '')}`;
+  } else if (r.kind === 'agent' || r.kind === 'skill') {
+    title = r.name || r.id;
+    const srcKey = _SEARCH_SOURCE_LABEL[r.source] || '';
+    sub = srcKey ? t(srcKey) : '';
   }
   const active = dataIdx === _searchActiveIdx ? ' active' : '';
   return `
@@ -243,30 +260,26 @@ function _renderSearchResults(query) {
     body.innerHTML = `<div class="search-empty">${escapeHtml(t('search.no_results', { query }))}</div>`;
     return;
   }
-  const { chats, contexts } = _partitionSearchResults(_searchResults);
+  const { chats, agents, skills, contexts } = _partitionSearchResults(_searchResults);
   const parts = [];
   const visible = [];
 
-  // "全部" 显示 chats (前 10) + contexts (前 10)，超出给"查看更多"→对应 tab。
-  // "对话" 只显示 chats；"知识库" 只显示 contexts。
-  if (_searchTab === 'all' || _searchTab === 'chat') {
-    const slice = _searchTab === 'all' ? chats.slice(0, _SEARCH_ALL_PER_SECTION) : chats;
-    if (slice.length) {
-      parts.push(`<div class="search-section-label">${escapeHtml(t('search.section.chat'))}</div>`);
-      for (const r of slice) { parts.push(_renderSearchRow(r, visible.length, query)); visible.push(r); }
-      if (_searchTab === 'all' && chats.length > slice.length) {
-        parts.push(`<button class="search-show-more" data-goto="chat">${escapeHtml(t('search.show_more'))} (${chats.length})</button>`);
-      }
-    }
-  }
-  if (_searchTab === 'all' || _searchTab === 'context') {
-    const slice = _searchTab === 'all' ? contexts.slice(0, _SEARCH_ALL_PER_SECTION) : contexts;
-    if (slice.length) {
-      parts.push(`<div class="search-section-label">${escapeHtml(t('search.section.context'))}</div>`);
-      for (const r of slice) { parts.push(_renderSearchRow(r, visible.length, query)); visible.push(r); }
-      if (_searchTab === 'all' && contexts.length > slice.length) {
-        parts.push(`<button class="search-show-more" data-goto="context">${escapeHtml(t('search.show_more'))} (${contexts.length})</button>`);
-      }
+  // "全部" tab 顺序：对话 → 智能体 → 技能 → 知识库；每段最多 _SEARCH_ALL_PER_SECTION 条，
+  // 超出给"查看更多"按钮跳到对应 tab。其它 tab 只显示自己那段（不截顶，让用户能滚完）。
+  const sections = [
+    { tab: 'chat',    bucket: chats,    labelKey: 'search.section.chat' },
+    { tab: 'agent',   bucket: agents,   labelKey: 'search.section.agent' },
+    { tab: 'skill',   bucket: skills,   labelKey: 'search.section.skill' },
+    { tab: 'context', bucket: contexts, labelKey: 'search.section.context' },
+  ];
+  for (const s of sections) {
+    if (_searchTab !== 'all' && _searchTab !== s.tab) continue;
+    const slice = _searchTab === 'all' ? s.bucket.slice(0, _SEARCH_ALL_PER_SECTION) : s.bucket;
+    if (!slice.length) continue;
+    parts.push(`<div class="search-section-label">${escapeHtml(t(s.labelKey))}</div>`);
+    for (const r of slice) { parts.push(_renderSearchRow(r, visible.length, query)); visible.push(r); }
+    if (_searchTab === 'all' && s.bucket.length > slice.length) {
+      parts.push(`<button class="search-show-more" data-goto="${s.tab}">${escapeHtml(t('search.show_more'))} (${s.bucket.length})</button>`);
     }
   }
 
@@ -331,31 +344,27 @@ function _gotoSearchResult(r) {
     setView('conversation', r.cid);
     // Scroll to the matched message after history loads.
     setTimeout(() => _scrollToMsgIndex('chat-history', r.msg_index), 300);
-  } else if (r.kind === 'skill_chat') {
-    // Navigate to skills, select that skill, enter edit mode.
-    setView('skills');
-    setTimeout(async () => {
-      const cached = (_skillsCache || []).find((s) => s.id === r.skill_id);
-      if (cached && typeof _showSkillsDetailView === 'function') {
-        await _showSkillsDetailView(cached.source, cached.id);
-        if (typeof toggleSkillEditMode === 'function' && !_skillEditMode) {
-          await toggleSkillEditMode();
-        }
-        setTimeout(() => _scrollToMsgIndex('skills-chat-messages', r.msg_index), 300);
-      }
-    }, 100);
-  } else if (r.kind === 'agent_chat') {
+  } else if (r.kind === 'agent') {
+    // Open the agent detail view in read mode. Edit mode is intentionally
+    // NOT auto-toggled — the user is looking up "this agent", not editing.
     setView('agents');
     setTimeout(async () => {
-      // Use _showAgentsDetailView (not selectAgent) so the grid → detail
-      // view swap actually happens — selectAgent only fills the detail
-      // pane's content, leaving grid-view on top.
       if (typeof _showAgentsDetailView === 'function') {
-        await _showAgentsDetailView(r.agent_id);
-        if (typeof toggleAgentEditMode === 'function' && !_agentEditing) {
-          await toggleAgentEditMode();
-        }
-        setTimeout(() => _scrollToMsgIndex('agents-chat-messages', r.msg_index), 300);
+        await _showAgentsDetailView(r.id);
+      }
+    }, 100);
+  } else if (r.kind === 'skill') {
+    setView('skills');
+    setTimeout(async () => {
+      const cached = (typeof _skillsCache !== 'undefined' && Array.isArray(_skillsCache))
+        ? _skillsCache.find((s) => s.id === r.id)
+        : null;
+      if (cached && typeof _showSkillsDetailView === 'function') {
+        await _showSkillsDetailView(cached.source, cached.id);
+      } else if (typeof _showSkillsDetailView === 'function') {
+        // Cache may not be primed yet — fall back to the search result's
+        // own source field so we still land on the right card.
+        await _showSkillsDetailView(r.source, r.id);
       }
     }, 100);
   }

@@ -22,9 +22,8 @@
  *           agents/<agent_id>/  skills/<skill_id>/  meta/<agent_id>/
  *           config/preferences.json
  *         local/                  ← 🔒 本机域（永不同步）
- *           contexts_tmp/
  *           config/               ← auth-profiles.json + web-search-cache.json
- *           search/               ← contexts / chats / skill_chats / agent_chats idx
+ *           search/               ← contexts / chats inverted idx (agent / skill bodies queried in-memory at request time)
  *
  * Runtime overrides:
  *   ORKAS_WORKSPACE_ROOT   point data root elsewhere (src/main/index.ts sets this in packaged builds; env var name predates the dir rename — kept for stability)
@@ -140,8 +139,6 @@ export const userPreferencesFile = (uid: string) => path.join(userCloudConfigDir
 export const userComponentEnabledFile = (uid: string) => path.join(userCloudConfigDir(uid), 'component-enabled.json');
 
 // ── Local-only per-user (不同步) ─────────────────────────────────────────
-// 待整理中转区（本地工作区，不云同步）
-export const userContextsTmpDir = (uid: string) => path.join(userLocalRoot(uid), 'contexts_tmp');
 
 // 本机凭证 + provider 缓存：CORE_AGENT_AUTH_DIR 由 activateUser() pin 到这里，
 // core-agent 的 auth store 与 web-search provider cache 都落在同一目录。
@@ -150,12 +147,12 @@ export const userAuthProfilesFile = (uid: string) => path.join(userLocalConfigDi
 export const userWebSearchCache   = (uid: string) => path.join(userLocalConfigDir(uid), 'web-search-cache.json');
 export const userReflectionStateFile = (uid: string) => path.join(userLocalConfigDir(uid), 'reflection-state.json');
 
-// 本地搜索索引（派生数据，reconcile 自愈，永不同步）
+// 本地搜索索引（派生数据，reconcile 自愈，永不同步）。
+// 当前只为主对话 + 知识库建持久化倒排；智能体 / 技能本体改成 listAgents /
+// listSkills 内存即查（数据集小、UI 语言切换不用重建索引）。
 export const userSearchDir           = (uid: string) => path.join(userLocalRoot(uid), 'search');
 export const userContextsIndexPath   = (uid: string) => path.join(userSearchDir(uid), 'contexts.idx.json');
 export const userChatsIndexPath      = (uid: string) => path.join(userSearchDir(uid), 'chats.idx.json');
-export const userSkillChatsIndexPath = (uid: string) => path.join(userSearchDir(uid), 'skill_chats.idx.json');
-export const userAgentChatsIndexPath = (uid: string) => path.join(userSearchDir(uid), 'agent_chats.idx.json');
 
 // 超大工具输出（>50K 字符）落盘副本：tool_result 里只留 preview + 文件引用，
 // 模型真要看完整原文时调 read_file(path) 拉回。按 session_id 分子目录，
@@ -259,11 +256,17 @@ export function ensureUserLayout(uid: string): void {
     // userMetaDir 已废弃 —— per-agent meta 落 `agents/<aid>/meta/` 子目录,
     // agent 创建时按需 mkdir,不需要顶层占位。
     userCloudConfigDir(uid),
-    userContextsTmpDir(uid),
     userLocalConfigDir(uid),
     userSearchDir(uid),
     userFileCacheDir(uid),
     userToolResultsDir(uid),
   ];
   for (const d of dirs) fs.mkdirSync(d, { recursive: true });
+
+  // Legacy sweep: `contexts_tmp/` was the staging area for the retired
+  // two-region KB design (see features/contexts.ts header). Older builds
+  // created the empty dir on every activate; remove it once if still
+  // present + empty, leave it alone if a user somehow stuffed files there.
+  const legacyContextsTmp = path.join(userLocalRoot(uid), 'contexts_tmp');
+  try { fs.rmdirSync(legacyContextsTmp); } catch { /* ENOENT or ENOTEMPTY — both fine */ }
 }

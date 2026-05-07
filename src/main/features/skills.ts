@@ -43,7 +43,6 @@ import {
   nowIso, readJson, writeJson, writeTextAtomicSync,
   appendJsonlAtomic, invalidateLineCount, readJsonl,
 } from '../storage';
-import * as search from './search';
 import { invalidateSkills as invalidateCoreAgentSkills } from '../model/core-agent/skill-registry';
 import { readDisabledSets, setSkillEnabled } from './component_enabled';
 
@@ -601,8 +600,6 @@ export async function updateCustomSkill(
             const m = await loadSkillChatMeta(uid, newName);
             m.session_id = defaultSkillSessionId(uid, newName);
             await saveSkillChatMeta(uid, newName, m);
-            search.dropSkillChat(uid, skillId);
-            search.reindexSkillChatFile(uid, newName);
           } catch (err) {
             log.warn(`rename user=${uid} ${oldChatDir} -> ${newChatDir} failed: ${(err as Error).message}`);
           }
@@ -648,7 +645,6 @@ export async function deleteCustomSkill(skillId: string): Promise<boolean> {
         try { fs.rmSync(chatDir, { recursive: true, force: true }); }
         catch (err) { log.warn(`rm failed user=${uid} skill=${skillId}: ${(err as Error).message}`); }
         invalidateLineCount(path.join(chatDir, 'chat.jsonl'));
-        search.dropSkillChat(uid, skillId);
       }
       const sessionId = defaultSkillSessionId(uid, skillId);
       try { evictSession(sessionId); } catch { /* cache may not hold it */ }
@@ -987,8 +983,7 @@ export async function getSkillChatMessages(userId: string, skillId: string, limi
 
 async function _appendSkillChatMessage(userId: string, skillId: string, record: any): Promise<void> {
   const file = skillChatMsgsPath(userId, skillId);
-  const { msgIndex } = await appendJsonlAtomic(file, record);
-  search.indexSkillChatMessage(userId, skillId, msgIndex, record);
+  await appendJsonlAtomic(file, record);
 }
 
 export async function clearSkillChat(userId: string, skillId: string): Promise<boolean> {
@@ -1000,7 +995,6 @@ export async function clearSkillChat(userId: string, skillId: string): Promise<b
     }
   }
   invalidateLineCount(skillChatMsgsPath(userId, skillId));
-  search.dropSkillChat(userId, skillId);
   // Also evict + drop the core-agent persistent session jsonl. Without this
   // the LLM retains its full prior context (tool calls, paths, file contents)
   // even though the UI history is empty — visible as the LLM "remembering"

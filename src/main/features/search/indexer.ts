@@ -20,9 +20,8 @@ import * as path from 'node:path';
 import { Mutex } from 'async-mutex';
 
 import {
-  userContextsDir, userChatsDir, userSkillChatDir, userAgentChatDir,
+  userContextsDir, userChatsDir,
   userContextsIndexPath, userChatsIndexPath,
-  userSkillChatsIndexPath, userAgentChatsIndexPath,
 } from '../../paths';
 import { getActiveUserId } from '../users';
 import { createLogger } from '../../logger';
@@ -282,29 +281,14 @@ export function dropContext(userId: string, relPath: string): void {
   })().catch((err) => log.warn(`dropContext failed: ${err.message}`));
 }
 
-// ── Chat-style indexes (chat / skill_chat / agent_chat) ──────────────────
-// Each jsonl line is a doc; fileKey identifies the conversation.
+// ── Chat index (main conversations only) ────────────────────────────────
+// Each jsonl line is a doc; fileKey is the conversation id (cid). Skill /
+// agent edit conversations used to share this code path through a
+// `_CHAT_KINDS` registry; that was removed when those scopes were dropped
+// from search — agent / skill bodies are now queried in-memory at request
+// time via `listAgents` / `listSkills` (see features/search/index.ts).
 
-type ChatStyleKind = 'chat' | 'skill_chat' | 'agent_chat';
-
-interface ChatKindConfig {
-  idField: string;
-  idxPathFn: (uid: string) => string;
-  fileFn: (uid: string, key: string) => string;
-  listFn: (uid: string) => Promise<ChatFileInfo[]>;
-}
-
-const _CHAT_KINDS: Record<ChatStyleKind, ChatKindConfig> = {
-  chat:       { idField: 'cid',      idxPathFn: userChatsIndexPath,
-                fileFn: (uid, key) => path.join(userChatsDir(uid), `${key}.jsonl`),
-                listFn: _listUserChats },
-  skill_chat: { idField: 'skill_id', idxPathFn: userSkillChatsIndexPath,
-                fileFn: (uid, key) => path.join(userSkillChatDir(uid, key), 'chat.jsonl'),
-                listFn: _listSkillChats },
-  agent_chat: { idField: 'agent_id', idxPathFn: userAgentChatsIndexPath,
-                fileFn: (uid, key) => path.join(userAgentChatDir(uid, key), 'chat.jsonl'),
-                listFn: _listAgentChats },
-};
+type ChatStyleKind = 'chat';
 
 async function _listUserChats(userId: string): Promise<ChatFileInfo[]> {
   const root = userChatsDir(userId);
@@ -320,31 +304,9 @@ async function _listUserChats(userId: string): Promise<ChatFileInfo[]> {
   }));
 }
 
-async function _listChatStyleSubdirs(base: string, fileFn: (name: string) => string): Promise<ChatFileInfo[]> {
-  let dirs;
-  try { dirs = await fsp.readdir(base, { withFileTypes: true }); }
-  catch { return []; }
-  const out = await Promise.all(dirs.map(async (d) => {
-    if (!d.isDirectory()) return null;
-    const file = fileFn(d.name);
-    try {
-      const st = await fsp.stat(file);
-      return { fileKey: d.name, file, mtime: st.mtimeMs, size: st.size } as ChatFileInfo;
-    } catch { return null; }
-  }));
-  return out.filter((x): x is ChatFileInfo => x !== null);
-}
-
-function _listSkillChats(userId: string): Promise<ChatFileInfo[]> {
-  return _listChatStyleSubdirs(
-    path.join(userChatsDir(userId), 'skill'),
-    (name) => path.join(userSkillChatDir(userId, name), 'chat.jsonl'));
-}
-
-function _listAgentChats(userId: string): Promise<ChatFileInfo[]> {
-  return _listChatStyleSubdirs(
-    path.join(userChatsDir(userId), 'agent'),
-    (name) => path.join(userAgentChatDir(userId, name), 'chat.jsonl'));
+function _chatIdxPath(uid: string): string { return userChatsIndexPath(uid); }
+function _chatJsonlFile(uid: string, cid: string): string {
+  return path.join(userChatsDir(uid), `${cid}.jsonl`);
 }
 
 function _docId(kind: IndexKind, fileKey: string, msgIndex: number): string {
@@ -352,31 +314,27 @@ function _docId(kind: IndexKind, fileKey: string, msgIndex: number): string {
 }
 
 async function _reindexChatFile(
-  idx: RuntimeIndex, kind: ChatStyleKind, fileKey: string,
-  file: string, mtimeMs: number, size: number,
+  idx: RuntimeIndex, fileKey: string, file: string, mtimeMs: number, size: number,
 ): Promise<void> {
-  const cfg = _CHAT_KINDS[kind];
   _dropDocsByFileKey(idx, fileKey);
   const msgs = await _readJsonl(file);
   msgs.forEach((m, i) => {
     const text = _msgText(m);
     if (!text) return;
     const doc: Doc = {
-      fileKey, kind, msg_index: i,
-      [cfg.idField]: fileKey,
+      fileKey, kind: 'chat', msg_index: i, cid: fileKey,
       role: m.role || '', time: m.time || '', len: text.length,
     };
-    _putDoc(idx, _docId(kind, fileKey, i), doc, text);
+    _putDoc(idx, _docId('chat', fileKey, i), doc, text);
   });
   idx.files[fileKey] = { mtime: mtimeMs, size };
 }
 
-async function _reconcileChatStyle(userId: string, kind: ChatStyleKind): Promise<void> {
-  const cfg = _CHAT_KINDS[kind];
-  const idxPath = cfg.idxPathFn(userId);
-  const files = await cfg.listFn(userId);
+export async function reconcileChatsIndex(userId: string): Promise<void> {
+  const idxPath = _chatIdxPath(userId);
+  const files = await _listUserChats(userId);
   await _getLock(idxPath).runExclusive(async () => {
-    const entry = await _getEntry(idxPath, kind);
+    const entry = await _getEntry(idxPath, 'chat');
     const seen = new Set<string>();
     let dirty = false;
     const toUpdate: ChatFileInfo[] = [];
@@ -387,7 +345,7 @@ async function _reconcileChatStyle(userId: string, kind: ChatStyleKind): Promise
       toUpdate.push(f);
     }
     for (const f of toUpdate) {
-      await _reindexChatFile(entry.idx, kind, f.fileKey, f.file, f.mtime, f.size);
+      await _reindexChatFile(entry.idx, f.fileKey, f.file, f.mtime, f.size);
       dirty = true;
     }
     for (const fk of Object.keys(entry.idx.files)) {
@@ -397,10 +355,6 @@ async function _reconcileChatStyle(userId: string, kind: ChatStyleKind): Promise
   });
 }
 
-export const reconcileChatsIndex      = (uid: string) => _reconcileChatStyle(uid, 'chat');
-export const reconcileSkillChatsIndex = (uid: string) => _reconcileChatStyle(uid, 'skill_chat');
-export const reconcileAgentChatsIndex = (uid: string) => _reconcileChatStyle(uid, 'agent_chat');
-
 /**
  * Upsert a single chat message doc — the hot path on every appended message.
  *
@@ -409,73 +363,36 @@ export const reconcileAgentChatsIndex = (uid: string) => _reconcileChatStyle(uid
  * and posting update — independent of conversation length.
  */
 async function _upsertChatMessageDoc(
-  userId: string, kind: ChatStyleKind, fileKey: string,
-  msgIndex: number, msg: ChatMessage,
+  userId: string, fileKey: string, msgIndex: number, msg: ChatMessage,
 ): Promise<void> {
-  const cfg = _CHAT_KINDS[kind];
   const text = _msgText(msg);
   if (!text) return;
-  const idxPath = cfg.idxPathFn(userId);
-  const file = cfg.fileFn(userId, fileKey);
+  const idxPath = _chatIdxPath(userId);
+  const file = _chatJsonlFile(userId, fileKey);
   let st: fs.Stats | undefined;
   try { st = await fsp.stat(file); } catch { /* file may have been deleted */ }
   await _getLock(idxPath).runExclusive(async () => {
-    const entry = await _getEntry(idxPath, kind);
+    const entry = await _getEntry(idxPath, 'chat');
     const doc: Doc = {
-      fileKey, kind, msg_index: msgIndex,
-      [cfg.idField]: fileKey,
+      fileKey, kind: 'chat', msg_index: msgIndex, cid: fileKey,
       role: msg.role || '', time: msg.time || '', len: text.length,
     };
-    _putDoc(entry.idx, _docId(kind, fileKey, msgIndex), doc, text);
+    _putDoc(entry.idx, _docId('chat', fileKey, msgIndex), doc, text);
     if (st) entry.idx.files[fileKey] = { mtime: st.mtimeMs, size: st.size };
     entry.dirty = true;
   });
   _markDirty(idxPath);
 }
 
-/**
- * Bulk re-index one chat file (used by reconcile + rename cascade). Drops
- * every doc under `fileKey`, reads the jsonl, re-inserts each non-empty line.
- * Callers already hold the per-idx lock.
- */
-async function _reindexOneChat(userId: string, kind: ChatStyleKind, fileKey: string): Promise<void> {
-  const cfg = _CHAT_KINDS[kind];
-  const idxPath = cfg.idxPathFn(userId);
-  const file = cfg.fileFn(userId, fileKey);
-  let st: fs.Stats;
-  try { st = await fsp.stat(file); } catch { return; }
-  await _getLock(idxPath).runExclusive(async () => {
-    const entry = await _getEntry(idxPath, kind);
-    await _reindexChatFile(entry.idx, kind, fileKey, file, st.mtimeMs, st.size);
-    entry.dirty = true;
-  });
-  _markDirty(idxPath);
-}
-
 export function indexChatMessage(userId: string, cid: string, msgIndex: number, msg: ChatMessage): void {
-  _upsertChatMessageDoc(userId, 'chat', cid, msgIndex, msg)
+  _upsertChatMessageDoc(userId, cid, msgIndex, msg)
     .catch((err) => log.warn(`index chat msg failed: ${err.message}`));
 }
-export function indexSkillChatMessage(userId: string, skillId: string, msgIndex: number, msg: ChatMessage): void {
-  _upsertChatMessageDoc(userId, 'skill_chat', skillId, msgIndex, msg)
-    .catch((err) => log.warn(`index skill chat msg failed: ${err.message}`));
-}
-export function indexAgentChatMessage(userId: string, agentId: string, msgIndex: number, msg: ChatMessage): void {
-  _upsertChatMessageDoc(userId, 'agent_chat', agentId, msgIndex, msg)
-    .catch((err) => log.warn(`index agent chat msg failed: ${err.message}`));
-}
 
-// Bulk rebuild for a renamed conversation (no per-message context available).
-export function reindexSkillChatFile(userId: string, skillId: string): void {
-  _reindexOneChat(userId, 'skill_chat', skillId)
-    .catch((err) => log.warn(`reindex skill chat failed: ${err.message}`));
-}
-
-async function _dropChatStyleFile(userId: string, kind: ChatStyleKind, fileKey: string): Promise<void> {
-  const cfg = _CHAT_KINDS[kind];
-  const idxPath = cfg.idxPathFn(userId);
+async function _dropChatFile(userId: string, fileKey: string): Promise<void> {
+  const idxPath = _chatIdxPath(userId);
   await _getLock(idxPath).runExclusive(async () => {
-    const entry = await _getEntry(idxPath, kind);
+    const entry = await _getEntry(idxPath, 'chat');
     if (!entry.idx.files[fileKey]) return;
     _dropDocsByFileKey(entry.idx, fileKey);
     entry.dirty = true;
@@ -484,13 +401,7 @@ async function _dropChatStyleFile(userId: string, kind: ChatStyleKind, fileKey: 
 }
 
 export function dropChatConversation(userId: string, cid: string): void {
-  _dropChatStyleFile(userId, 'chat', cid).catch(() => {});
-}
-export function dropSkillChat(userId: string, skillId: string): void {
-  _dropChatStyleFile(userId, 'skill_chat', skillId).catch(() => {});
-}
-export function dropAgentChat(userId: string, agentId: string): void {
-  _dropChatStyleFile(userId, 'agent_chat', agentId).catch(() => {});
+  _dropChatFile(userId, cid).catch(() => {});
 }
 
 // ── Internal handle for query-side reads ─────────────────────────────────
