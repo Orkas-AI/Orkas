@@ -712,7 +712,9 @@ async function _exitAgentEditMode() {
   // streaming-button state into the next agent's edit panel.
   try { _agentChatCtrl?.abort(); } catch (_) { /* ignore */ }
   // Flush any pending save and then re-render in readonly mode.
-  await _flushAgentFieldSave();
+  // The Done button is the explicit commit point — validate name here so
+  // a bad value alerts + reverts rather than silently lingering.
+  await _flushAgentFieldSave({ validate: true });
   document.getElementById('agents-chat-col').style.display = 'none';
   const aid = _selectedAgent?.id;
   if (aid) {
@@ -746,27 +748,28 @@ function _scheduleAgentFieldSave(field, value) {
 }
 
 let _pendingAgentField = null;
-async function _flushAgentFieldSave() {
+// `validate` is only true when the user explicitly commits (clicks 完成 →
+// `_exitAgentEditMode`). Typing-debounced and blur-triggered flushes pass
+// false: a bad name silently skips the save (the DOM keeps the user's
+// in-progress text) instead of popping a uiAlert mid-keystroke.
+async function _flushAgentFieldSave({ validate = false } = {}) {
   clearTimeout(_agentFieldSaveTimer);
   _agentFieldSaveTimer = null;
   if (!_pendingAgentField || !_selectedAgent) return;
   const { field, value } = _pendingAgentField;
+  if (field === 'name') {
+    const reserved = _isReservedAgentName(value);
+    const invalid = !reserved && !_isValidAgentNameCharset(value);
+    if (reserved || invalid) {
+      if (!validate) return;
+      _pendingAgentField = null;
+      await uiAlert(t(reserved ? 'agents.name_reserved' : 'agents.name_invalid'));
+      const nameEl = document.getElementById('agents-detail-name');
+      if (nameEl && _selectedAgent.name) nameEl.innerText = _selectedAgent.name;
+      return;
+    }
+  }
   _pendingAgentField = null;
-  // Block reserved names locally — otherwise the PUT silently fails server-
-  // side and the renderer DOM keeps the bad value until the next reload.
-  if (field === 'name' && _isReservedAgentName(value)) {
-    await uiAlert(t('agents.name_reserved'));
-    // Revert the inline editor to the last known-good name and refresh list.
-    const nameEl = document.getElementById('agents-detail-name');
-    if (nameEl && _selectedAgent.name) nameEl.innerText = _selectedAgent.name;
-    return;
-  }
-  if (field === 'name' && !_isValidAgentNameCharset(value)) {
-    await uiAlert(t('agents.name_invalid'));
-    const nameEl = document.getElementById('agents-detail-name');
-    if (nameEl && _selectedAgent.name) nameEl.innerText = _selectedAgent.name;
-    return;
-  }
   try {
     const res = await apiFetch(`/api/agents/${encodeURIComponent(_selectedAgent.id)}/update`, {
       method: 'PUT',

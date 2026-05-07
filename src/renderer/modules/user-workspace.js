@@ -246,12 +246,4 @@ async function initUserWorkspace() {
       toolbar.appendChild(_createWorkspaceChip());
     }
   }
-
-  const agentInputArea = document.querySelector('.agents-chat-input-area');
-  if (agentInputArea) {
-    const toolbar = document.createElement('div');
-    toolbar.className = 'chat-input-toolbar agents-chat-workspace-toolbar';
-    toolbar.appendChild(_createWorkspaceChip());
-    agentInputArea.parentNode.insertBefore(toolbar, agentInputArea);
-  }
 }

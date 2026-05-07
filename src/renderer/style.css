@@ -2989,12 +2989,6 @@ body.model-not-configured .main-content { flex-direction: column; }
   margin: 4px 12px;
 }
 
-.agents-chat-workspace-toolbar {
-  max-width: 100%;
-  margin: 0 0 6px;
-  padding: 0 2px;
-}
-
 .skill-picker {
   position: fixed;
   width: 300px;
