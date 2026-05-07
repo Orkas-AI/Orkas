@@ -473,7 +473,7 @@ function applyRecipientPrefix(raw, target) {
     if (a && a.name) display = a.name;
   }
   if (!display) display = r.name || r.id;
-  const tag = '@' + String(display).replace(/\s+/g, '');
+  const tag = '@' + String(display);
   return tag + ' ' + text;
 }
 
