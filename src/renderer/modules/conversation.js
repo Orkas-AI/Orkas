@@ -993,6 +993,28 @@ function _hydrateMessageAttachmentThumbs(msgDiv, _cid) {
   });
 }
 
+// Wire `paste` on a textarea to the same upload pipeline as the "+" button.
+// Triggers when the clipboard contains any File entries — screenshots from
+// the OS clipboard (Cmd/Ctrl+Shift+screenshot) and files copied from Finder
+// / Explorer both land in `clipboardData.files`. Plain-text pastes have an
+// empty FileList and fall through to the textarea's native paste handler.
+function _bindChatPasteAttach(inputElId, getCid) {
+  const el = document.getElementById(inputElId);
+  if (!el || el.dataset.pasteBound === '1') return;
+  el.addEventListener('paste', (e) => {
+    const cid = getCid();
+    if (!cid) return;
+    const cd = e.clipboardData;
+    if (!cd || !cd.files || !cd.files.length) return;
+    e.preventDefault();
+    // Fire-and-forget — _chatAttachUpload paints placeholder chips
+    // synchronously before any network IO, so the user sees the chip
+    // appear at the top of the input area as soon as the paste lands.
+    _chatAttachUpload(cid, cd.files);
+  });
+  el.dataset.pasteBound = '1';
+}
+
 function _initChatAttachInput() {
   const btn = document.getElementById('chat-attach-btn');
   const input = document.getElementById('chat-attach-input');
@@ -1006,6 +1028,7 @@ function _initChatAttachInput() {
     await _chatAttachUpload(currentCid, input.files);
     input.value = '';
   });
+  _bindChatPasteAttach('chat-input', () => currentCid);
   btn.dataset.bound = '1';
 }
 
@@ -1022,6 +1045,7 @@ function _initNewChatAttachInput() {
     await _chatAttachUpload(DRAFT_CID, input.files);
     input.value = '';
   });
+  _bindChatPasteAttach('new-chat-input', () => DRAFT_CID);
   btn.dataset.bound = '1';
 }
 
