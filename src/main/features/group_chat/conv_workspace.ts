@@ -31,7 +31,6 @@
  */
 
 import * as fs from 'node:fs';
-import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 
 import { getWorkspacePath } from '../user_workspace';
@@ -137,14 +136,21 @@ function uniquifySlug(workspaceRoot: string, slug: string): string {
 /**
  * Resolve the absolute working directory for `(uid, cid)`. Lazy + frozen:
  * - if `state.json::workspace_dir` is already set → return `<workspace>/<dir>`
- *   (mkdir if the dir got deleted in the meantime; hot path is the existence-
- *   check fast path)
  * - else if the conv has no entry yet (genuinely a legacy conv without a
  *   conversation record, or `state.json` not yet written) → return the
  *   user-level workspace verbatim, do NOT persist anything (legacy behaviour)
  * - else → derive slug from current title, fall back to date-based name on
- *   placeholder, uniquify against sibling dirs, mkdir, persist to
+ *   placeholder, uniquify against sibling dirs, persist the slug choice to
  *   `state.json::workspace_dir`, return the absolute path
+ *
+ * **Does NOT mkdir** — the directory is materialised lazily by the producing
+ * tool (write_file mkdirs parent before write; markdown_to_pdf / image gen
+ * follow the same pattern). For tools that need cwd-as-existing-directory
+ * (bash via child_process.spawn), the wrapped `bash` tool mkdirs `cwd`
+ * defensively before delegating. Skipping the eager mkdir here means a
+ * commander turn that only chats (no file output, no bash) leaves zero
+ * footprint on disk — which is what users expect when the conversation
+ * never produced anything.
  */
 export async function getConversationWorkspacePath(uid: string, cid: string): Promise<string> {
   const root = getWorkspacePath(uid);
@@ -152,9 +158,7 @@ export async function getConversationWorkspacePath(uid: string, cid: string): Pr
   // Fast path: state already has a workspace_dir baked in.
   const cur = await readState(uid, cid);
   if (cur.workspace_dir) {
-    const abs = path.join(root, cur.workspace_dir);
-    try { await fsp.mkdir(abs, { recursive: true }); } catch { /* race with self / fs hiccup */ }
-    return abs;
+    return path.join(root, cur.workspace_dir);
   }
 
   // No workspace_dir yet. Decide one.
@@ -180,18 +184,11 @@ export async function getConversationWorkspacePath(uid: string, cid: string): Pr
   if (!slug) slug = pickFallbackSlug(root);
   else slug = uniquifySlug(root, slug);
 
-  const abs = path.join(root, slug);
-  try { await fsp.mkdir(abs, { recursive: true }); }
-  catch (err) {
-    log.warn(`mkdir ${abs} failed: ${(err as Error).message} — falling back to root`);
-    return root;
-  }
-
   // Persist the choice. setWorkspaceDirOnce is idempotent: if a concurrent
-  // call beat us to it, our slug is dropped and we re-read the winner —
-  // mkdir is forgiving about the duplicate dir.
+  // call beat us to it, our slug is dropped and we re-read the winner. The
+  // directory is NOT created here — see the function-level comment above.
   const persisted = await setWorkspaceDirOnce(uid, cid, slug);
   const finalSlug = persisted.workspace_dir || slug;
-  log.info(`cid=${cid} workspace_dir=${finalSlug} (title="${title}")`);
+  log.info(`cid=${cid} workspace_dir=${finalSlug} (title="${title}", lazy-mkdir)`);
   return path.join(root, finalSlug);
 }

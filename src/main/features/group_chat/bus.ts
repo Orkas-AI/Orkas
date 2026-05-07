@@ -838,11 +838,22 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     // and forward its events as `process` events so the same UI rail
     // renders. The output text becomes finalText; failures populate
     // errText so the existing post-stream logic surfaces a ⚠️ bubble.
+    //
+    // **CLI cwd = root workspace** (NOT the per-conv subdir used by the
+    // in-process branch). CLI session stores are cwd-hashed —
+    // `claude code` keeps sessions under `~/.claude/projects/<encoded-cwd>/`
+    // — so changing cwd between dispatches breaks `--resume <id>` with
+    // "No conversation found with session ID …". The per-conv subdir
+    // exists to group repeat-run artefacts from the in-process LLM's
+    // `write_file` tool; CLI agents have their own product-side
+    // conventions and don't need that scoping. Override here:
+    const userWorkspace = await import('../user_workspace');
+    const cliWorkingDir = userWorkspace.getWorkspacePath(uid);
     try {
       const slice = await readSlice(uid, cid, actor.id);
       const cliOut = await _runCliAgentTurn({
         uid, cid, actor, agent: cliAgent,
-        item, slice, workingDir,
+        item, slice, workingDir: cliWorkingDir,
         signal: w.abortController.signal,
         onProcess: data => {
           // Mirror the LLM path: count every event for activity, but
@@ -1759,6 +1770,18 @@ async function _runCliAgentTurn(opts: {
   let resultText = '';
   let aborted = false;
   let backendSessionId: string | undefined;
+  // Set when the CLI rejects our `--resume <id>` (e.g. claude code's
+  // "No conversation found with session ID …"). Triggers a one-time
+  // cleanup of the cliSessions binding so the next dispatch starts
+  // fresh instead of replaying the same broken resume forever. Detect
+  // by stderr-line pattern because there is no structured signal —
+  // each CLI phrases it slightly differently but they all carry the
+  // session-id hex.
+  let resumeRejected = false;
+  const _RESUME_REJECTED_PATTERNS = [
+    /No conversation found with session ID/i,
+    /session.*(not found|does not exist|expired|invalid)/i,
+  ];
 
   const result = await runner.run({
     uid: opts.uid,
@@ -1793,7 +1816,13 @@ async function _runCliAgentTurn(opts: {
         case 'tool-event':
         case 'process-info':
         case 'status':
+          opts.onProcess({ type: 'event', event: { stream: 'cli', data: e as unknown as Record<string, unknown> } });
+          break;
         case 'stderr-line':
+          if (resumeSessionId && typeof (e as any).line === 'string') {
+            const line = (e as any).line as string;
+            if (_RESUME_REJECTED_PATTERNS.some((re) => re.test(line))) resumeRejected = true;
+          }
           opts.onProcess({ type: 'event', event: { stream: 'cli', data: e as unknown as Record<string, unknown> } });
           break;
         case 'done':
@@ -1807,6 +1836,18 @@ async function _runCliAgentTurn(opts: {
     },
   });
 
+  // Drop the stale resume binding before returning so a user-initiated
+  // retry starts a fresh CLI session instead of looping on the same
+  // expired id. Done unconditionally on rejection — even if the CLI
+  // somehow finished successfully, the resume id we sent is gone, and
+  // the binding is at best useless / at worst will fail again.
+  if (resumeRejected) {
+    log.warn(`cli session expired cid=${opts.cid} agent=${opts.agent.agent_id} cli=${runtime.cli} — clearing resume binding`);
+    cliSessions
+      .clearForAgent(opts.uid, opts.cid, opts.agent.agent_id)
+      .catch(() => { /* logged inside sessions.ts */ });
+  }
+
   if (result.status === 'missing_cli') {
     const msg = t('cli_agent.missing', { name: opts.agent.name || runtime.cli, cli: runtime.cli });
     return { text: '', error: msg, aborted: false };
@@ -1816,7 +1857,10 @@ async function _runCliAgentTurn(opts: {
   }
   if (result.status === 'failed' || result.status === 'timeout') {
     const detail = result.error || (result.status === 'timeout' ? 'timeout' : 'failed');
-    return { text: resultText || accText, error: detail };
+    // When the failure was a stale resume id, hint the user that a
+    // simple resend will recover (the binding has been cleared above).
+    const hint = resumeRejected ? ' — session expired; retry will start fresh.' : '';
+    return { text: resultText || accText, error: detail + hint };
   }
   // Successful turn — persist the (possibly new) session id so the
   // next dispatch can resume. Claude reports its session id every

@@ -166,6 +166,18 @@ function createBashTool(): AgentTool {
     inputSchema: coreBashTool.inputSchema,
     async execute(input, ctx) {
       if (!getLocalExecGranted()) return deniedResult();
+      // Defensive mkdir on cwd before delegating: `conv_workspace.ts`
+      // intentionally defers materialising the per-conversation workspace
+      // dir until something actually needs it on disk (so empty-output
+      // conversations don't litter the user's workspace with empty
+      // subdirs). `child_process.spawn` fails ENOENT if cwd doesn't
+      // exist, so this is the natural materialisation point — mkdir
+      // -p the cwd, then run the command. Failures here fall through;
+      // spawn will surface a clearer error if it really can't proceed.
+      if (ctx.workingDir) {
+        try { fs.mkdirSync(ctx.workingDir, { recursive: true }); }
+        catch { /* let spawn produce the canonical error */ }
+      }
       return coreBashTool.execute(input, ctx);
     },
   };
