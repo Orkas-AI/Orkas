@@ -957,7 +957,8 @@ function _hydrateMessageCreatedAgentChip(msgDiv) {
     const aid = chip.dataset.agentId;
     if (!aid) return;
     setView('agents');
-    if (typeof selectAgent === 'function') selectAgent(aid);
+    if (typeof _showAgentsDetailView === 'function') _showAgentsDetailView(aid);
+    else if (typeof selectAgent === 'function') selectAgent(aid);
   });
 }
 
