@@ -121,9 +121,12 @@ export interface TurnFinishedEvent {
   form?: ChatFormPayload;
   /** Files written via local-exec tools during this turn. */
   produced: string[];
-  /** Quick-create agent meta extracted from `<agent>...</agent>` (commander
-   * only). When present, executor records but doesn't drive on it. */
-  createdAgent?: { agent_id: string; name: string };
+  /** Agent created or updated from `<agent>...</agent>` (commander only).
+   * `kind: 'created'` is the original quick-create flow; `kind: 'updated'`
+   * means an existing custom agent was patched in place — same chip slot,
+   * different label on the renderer side. Executor records but doesn't
+   * drive on it. */
+  createdAgent?: { agent_id: string; name: string; kind: 'created' | 'updated' };
   /** What kind of trigger caused this turn. Drives the state transition. */
   trigger: TurnTrigger;
   /** Number of non-error, non-final, non-done events the LLM stream emitted.
@@ -142,7 +145,7 @@ export interface TurnFinishedEvent {
  *   turn produces no user-visible output.
  */
 export type TurnOutcome =
-  | { kind: 'persist'; text: string; form?: ChatFormPayload; produced?: string[]; createdAgent?: { agent_id: string; name: string } }
+  | { kind: 'persist'; text: string; form?: ChatFormPayload; produced?: string[]; createdAgent?: { agent_id: string; name: string; kind: 'created' | 'updated' } }
   | { kind: 'silent' };
 
 export interface ReconcileCtx {

@@ -937,6 +937,11 @@ function _renderMessageProducedHtml(absPaths) {
 function _renderMessageCreatedAgentHtml(payload) {
   if (!payload || !payload.agent_id) return '';
   const name = payload.name || payload.agent_id;
+  // Label is intentionally neutral ("查看详情 / Open: …") — works for both
+  // `kind: 'created'` and `kind: 'updated'`; the commander's surrounding
+  // prose tells the user which one happened. Don't split the i18n key just
+  // to track the verb — the chip is a CTA into the agent panel, not a
+  // status badge.
   return `<div class="chat-msg-created-agent">
     <span class="chat-msg-created-agent-chip" data-agent-id="${escapeHtml(payload.agent_id)}" title="${escapeHtml(name)}">
       <span class="chat-msg-created-agent-icon">◆</span>

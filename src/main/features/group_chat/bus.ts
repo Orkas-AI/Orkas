@@ -999,7 +999,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // failed) live in plan_executor.onTurnFinished.
   let workingText = finalText || '';
   let form: ChatFormPayload | undefined;
-  let createdAgent: { agent_id: string; name: string } | undefined;
+  let createdAgent: { agent_id: string; name: string; kind: 'created' | 'updated' } | undefined;
 
   if (actor.kind === 'agent' && workingText) {
     const r = extractFormFromFinal(workingText, actor.id);
@@ -1017,18 +1017,46 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     const r = extractAgentFieldBlocks(workingText);
     if (Object.keys(r.fields).length) {
       workingText = r.cleanText;
+      // `<agent_id>` present → edit an existing custom agent;
+      // absent → create a new one. Same `<agent>` container shape;
+      // the dispatch decision is single-bit.
+      const editId = r.fields.agent_id;
       try {
-        const ag = await agentsFeat.createAgentFromBlocks(r.fields);
-        if (ag) {
-          createdAgent = { agent_id: ag.agent_id, name: ag.name };
+        if (editId) {
+          const target = await agentsFeat.getAgent(editId);
+          if (!target) {
+            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ 智能体编辑失败：找不到智能体 (id=${editId})。</span>`;
+          } else if (target.source !== 'custom') {
+            // Built-in agent — read-only here; the dev-mode inline edit chat
+            // remains the only path that can mutate builtins (per §6).
+            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ 内置智能体不能在主对话里改;请在右侧详情面板里 fork 一份再改。</span>`;
+          } else if (agentsFeat.isCliAgent(target)) {
+            // CLI-backed agent — runtime / model / args are owned by the
+            // create-modal + edit-form, not the LLM. Same constraint as
+            // chat_agent_setup_cli.md applies to the commander flow.
+            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ 外接智能体只能在右侧详情面板里改。</span>`;
+          } else {
+            const updated = await agentsFeat.updateCustomAgent(editId, r.fields);
+            if (updated) {
+              createdAgent = { agent_id: updated.agent_id, name: updated.name, kind: 'updated' };
+            } else {
+              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ 智能体更新失败。</span>`;
+            }
+          }
         } else {
-          // Append failure marker to text — onTurnFinished will surface
-          // it as a normal `persist` outcome.
-          workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ 智能体创建失败：缺少必要字段（name / workflow）。</span>`;
+          const ag = await agentsFeat.createAgentFromBlocks(r.fields);
+          if (ag) {
+            createdAgent = { agent_id: ag.agent_id, name: ag.name, kind: 'created' };
+          } else {
+            // Append failure marker to text — onTurnFinished will surface
+            // it as a normal `persist` outcome.
+            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ 智能体创建失败：缺少必要字段（name / workflow）。</span>`;
+          }
         }
       } catch (err) {
-        log.error(`create-agent failed cid=${cid}: ${(err as Error).message}`);
-        workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ 智能体创建失败：${(err as Error).message}</span>`;
+        const verb = editId ? '编辑' : '创建';
+        log.error(`${editId ? 'edit' : 'create'}-agent failed cid=${cid}: ${(err as Error).message}`);
+        workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ 智能体${verb}失败：${(err as Error).message}</span>`;
       }
     }
   }
