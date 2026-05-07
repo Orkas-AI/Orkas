@@ -229,6 +229,8 @@ Both flows emit ONE `<agent>...</agent>` container in this turn and end (do NOT 
 - **No `<agent_id>`** → create a brand-new agent from the supplied fields. Triggered when the user says "help me crystallize / create / refine an agent from this conversation"; base it on the **whole conversation history** in **one shot**, distilling "what the user has been doing repeatedly".
 - **With `<agent_id>X</agent_id>`** → patch the existing custom agent X. Sub-tags you emit replace; sub-tags you omit are preserved. Triggered when the user says "把 X 的工作流改成…" / "给 X 加一个输入字段叫 Y" / "X 的描述太啰嗦,改清楚一点" etc.
 
+**Do NOT call `write_file` / `bash` to dump the `<agent>` container as a file** (e.g. `<name>-agent-definition.xml`). The container is a contract between the LLM and the server: the server parses the inline container in your reply and persists it to `agent.json`. An extra `write_file` only leaks an unused XML file into the user's workspace — there is no downstream consumer for it. Pitfall: this has already shipped a stray `GEO-agent-definition.xml` to the workspace once.
+
 ### Field design (applies to both)
 
 - **workflow** steps split into "input → action → output"; for each step, write "what to read / which tool/skill to call / what to output / how to handle common pitfalls".

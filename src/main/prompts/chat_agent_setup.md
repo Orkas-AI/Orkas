@@ -127,6 +127,7 @@ Rules:
 - The `<agent>` container is auto-hidden in the user-visible message (along with all its sub-tags) and won't pollute the conversation. In the conversation prose **outside the container**, write one or two sentences in **user-perspective language** about the substantive change (per the "User-perspective output" hard rule above — **no field names**).
 - **Do NOT** put `## Workflow` / `# Workflow` top-level headings inside `<workflow>...</workflow>` — the UI already labels it externally. Likewise, no "Description" heading inside `<description>`. Just write the content.
 - **Do NOT** insert anything other than sub-tags inside the `<agent>` container; user-facing text goes into the prose outside the container.
+- **Do NOT call `write_file` / `bash` to dump the `<agent>` container as a file** (e.g. `<name>-agent-definition.xml`). The container is a contract between the LLM and the server: the server parses the inline container in your reply and persists it to `agent.json`. An extra `write_file` only leaks an unused XML file into the user's workspace — there is no downstream consumer for it. Pitfall: this has already shipped a stray `GEO-agent-definition.xml` to the workspace once.
 
 ---
 
