@@ -1073,6 +1073,20 @@ async function loadConversations() {
   }
 }
 
+// Move a conversation to the top of the sidebar list and re-render.
+// Called whenever a non-internal message lands on a cid so the list stays
+// ordered by last activity (matches backend listConversations sort, which
+// reads <cid>.jsonl mtime on the next full reload).
+function _bumpConvToTop(cid) {
+  if (!cid || !Array.isArray(conversations) || !conversations.length) return;
+  const idx = conversations.findIndex((c) => c && c.conversation_id === cid);
+  if (idx <= 0) return;
+  const [c] = conversations.splice(idx, 1);
+  c.last_active_at = new Date().toISOString();
+  conversations.unshift(c);
+  renderConversationList();
+}
+
 function renderConversationList() {
   const container = document.getElementById('conversation-list');
   if (!conversations.length) {
@@ -1667,6 +1681,16 @@ async function handleNewChatSubmit() {
 
   input.value = '';
   autoGrow(input, 260);
+  // Also clear the conversation-view input. setView with skipLoad:true
+  // bypasses _restoreDraft, so without this the new conv would inherit
+  // whatever draft text the previously-active conversation left behind in
+  // #chat-input — and the next keystroke would save that stale text under
+  // the new cid's draft key.
+  const chatInput = document.getElementById('chat-input');
+  if (chatInput) {
+    chatInput.value = '';
+    autoGrow(chatInput, 200);
+  }
   setView('conversation', convId, { skipLoad: true });
   // Carry the new-chat recipient pick into the new conv's per-cid state so
   // the chip stays "@<agent>" instead of snapping back to commander.
@@ -2860,6 +2884,14 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
 //   { type: 'aborted', cid }
 function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {}) {
   if (!evData || typeof evData !== 'object') return;
+  // Bump the conv to the top of the sidebar list whenever a user-visible
+  // message lands — applies to both currently-viewed and background convs,
+  // so the sidebar stays ordered by last activity in real time. Skip
+  // internal commander→agent dispatch records (they're not visible in the
+  // user's view; visible end-of-turn replies will bump shortly after).
+  if (evData.type === 'message' && evData.msg && !evData.msg.dispatch) {
+    _bumpConvToTop(cid);
+  }
   // Cross-cid leakage guard: per-cid controllers stay alive when the user
   // navigates away mid-stream (a legit pattern — let the conv finish in
   // the background, sidebar badge tracks completion). But all cids share

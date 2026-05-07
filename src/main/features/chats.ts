@@ -56,6 +56,9 @@ export interface Conversation {
    * the index. */
   processing?: boolean;
   processing_since?: string | null;
+  /** Derived: max(<cid>.jsonl mtime, updated_at). Drives sidebar
+   * last-activity ordering; never persisted. */
+  last_active_at?: string;
 }
 
 /** Persisted record on `<cid>.jsonl`. Aliased for legacy callers; the new
@@ -93,6 +96,7 @@ export async function listConversations(userId: string): Promise<Conversation[]>
   //      this window (Cmd+R right after stop) and we say processing=false,
   //      it stops polling and never picks up the late abort message — user
   //      sees only their own msg, "everything I watched stream is gone".
+  const dir = ensureUserDir(userId);
   const out: Conversation[] = [];
   for (const c of items) {
     let processing = false;
@@ -103,14 +107,23 @@ export async function listConversations(userId: string): Promise<Conversation[]>
       processing = s.status === 'running' || busBusy;
       since = processing ? s.last_active_at : null;
     } catch { /* missing state file = idle */ }
-    out.push({ ...c, processing, processing_since: since });
+    // Last-activity timestamp for sidebar ordering. <cid>.jsonl mtime is
+    // touched whenever the bus appends a message; falls back to the
+    // index's updated_at / created_at when the file isn't there yet.
+    let lastActiveAt = c.updated_at || c.created_at || '';
+    try {
+      const mtime = fs.statSync(path.join(dir, `${c.conversation_id}.jsonl`)).mtime.toISOString();
+      if (mtime > lastActiveAt) lastActiveAt = mtime;
+    } catch { /* missing jsonl — keep updated_at */ }
+    out.push({ ...c, processing, processing_since: since, last_active_at: lastActiveAt });
   }
+  out.sort((a, b) => (b.last_active_at || '').localeCompare(a.last_active_at || ''));
   return out;
 }
 
 export async function saveConversations(userId: string, items: Conversation[]): Promise<void> {
   const cleaned = items.map((c) => {
-    const { processing, processing_since, ...rest } = c;
+    const { processing, processing_since, last_active_at, ...rest } = c;
     return rest;
   });
   await writeJson(path.join(ensureUserDir(userId), CONVERSATION_INDEX_NAME), cleaned);
