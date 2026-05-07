@@ -33,9 +33,10 @@ const CATALOG: Record<LocalCliType, LocalModel[]> = {
     { id: 'claude-sonnet-4-5', label: 'Claude Sonnet 4.5' },
   ],
   codex: [
-    { id: 'gpt-5.4', label: 'GPT-5.4', default: true },
+    { id: 'gpt-5.5', label: 'GPT-5.5', default: true },
+    { id: 'gpt-5.5-pro', label: 'GPT-5.5 Pro' },
+    { id: 'gpt-5.4', label: 'GPT-5.4' },
     { id: 'gpt-5.4-mini', label: 'GPT-5.4 mini' },
-    { id: 'gpt-5.3-codex', label: 'GPT-5.3 Codex' },
     { id: 'gpt-5', label: 'GPT-5' },
     { id: 'o3', label: 'o3' },
     { id: 'o3-mini', label: 'o3-mini' },

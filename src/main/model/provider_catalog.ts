@@ -113,19 +113,23 @@ export const CURATED_MODELS: Readonly<Record<string, readonly { id: string; name
   // https://chatgpt.com/backend-api/codex/responses. Most codex variants
   // pi-ai lists (-codex-spark / -mini / -max / gpt-5.1 / gpt-5.2-codex)
   // are rejected by OpenAI with "not supported when using Codex with a
-  // ChatGPT account". Only these two are currently accepted:
+  // ChatGPT account". gpt-5.5 was added 2026-05-06 alongside the pi-ai
+  // 0.73.0 bump — re-probe before relying on it in production; if the
+  // Codex backend rejects it, drop the entry like the other 5.x variants.
   'openai-codex': [
-    { id: 'gpt-5.4',       name: 'GPT-5.4' },
-    { id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex' },
+    { id: 'gpt-5.5', name: 'GPT-5.5' },
+    { id: 'gpt-5.4', name: 'GPT-5.4' },
   ],
 
-  // OpenAI 直连。pi-ai 0.68.1 没有 `gpt-5.3` 纯 chat id（只有
-  // gpt-5.3-codex / gpt-5.3-codex-spark），已剔除。
+  // OpenAI direct. pi-ai 0.73.0 ships gpt-5.5 / 5.5-pro. The 5.3 family
+  // (only -codex / -codex-spark exist, no plain chat id) was dropped on
+  // 2026-05-06 — keep this list to the 5.4 + 5.5 generations only.
   openai: [
-    { id: 'gpt-5.4',       name: 'GPT-5.4' },
-    { id: 'gpt-5.4-pro',   name: 'GPT-5.4 Pro' },
-    { id: 'gpt-5.4-mini',  name: 'GPT-5.4 Mini' },
-    { id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex' },
+    { id: 'gpt-5.5',      name: 'GPT-5.5' },
+    { id: 'gpt-5.5-pro',  name: 'GPT-5.5 Pro' },
+    { id: 'gpt-5.4',      name: 'GPT-5.4' },
+    { id: 'gpt-5.4-pro',  name: 'GPT-5.4 Pro' },
+    { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
   ],
 
   // Google Gemini 直连。pi-ai 0.68.1 的 provider="google" 只列出带 -preview
@@ -200,20 +204,22 @@ export const CURATED_MODELS: Readonly<Record<string, readonly { id: string; name
     { id: 'doubao-seed-2-0-lite-260215', name: 'Doubao Seed 2.0 Lite' },
   ],
 
-  // OpenRouter 聚合。pi-ai 0.68.1 下 openrouter 没有
-  // anthropic/claude-sonnet-4.7 / haiku-4.7 / google/gemini-3.1-pro（无 preview
-  // 后缀）这几个 id —— 已换成真实存在的。
-  // 2026-04-28 升级：deepseek/v3.2 + r1 换成 v4-pro + v4-flash（v4 系列已发布）；
-  // 加入 xiaomi/mimo-v2.5 系列。pi-ai 0.68.1 还没把这些 id 收进 generated registry，
-  // 但 OpenRouter API /v1/models 实测都存在，下次 pi-ai 升级时核对。
+  // OpenRouter aggregator. Notes against pi-ai 0.73.0 (2026-05-06):
+  //   - openai/gpt-5.5 / 5.5-pro added; openai/gpt-5.3-codex dropped.
+  //   - anthropic/claude-sonnet-4.7 / haiku-4.7 and google/gemini-3.1-pro
+  //     (no -preview suffix) still aren't in pi-ai's generated registry —
+  //     keep using the real ids below.
+  //   - xiaomi/mimo-v2.5 series is now registered in pi-ai 0.73.0
+  //     (previously kept ahead-of-registry against OpenRouter /v1/models).
   openrouter: [
     { id: 'anthropic/claude-opus-4.7',      name: 'Claude Opus 4.7' },
     { id: 'anthropic/claude-opus-4.6-fast', name: 'Claude Opus 4.6 Fast' },
     { id: 'anthropic/claude-sonnet-4.6',    name: 'Claude Sonnet 4.6' },
     { id: 'anthropic/claude-haiku-4.5',     name: 'Claude Haiku 4.5' },
+    { id: 'openai/gpt-5.5',                 name: 'GPT-5.5' },
+    { id: 'openai/gpt-5.5-pro',             name: 'GPT-5.5 Pro' },
     { id: 'openai/gpt-5.4',                 name: 'GPT-5.4' },
     { id: 'openai/gpt-5.4-pro',             name: 'GPT-5.4 Pro' },
-    { id: 'openai/gpt-5.3-codex',           name: 'GPT-5.3 Codex' },
     { id: 'google/gemini-3.1-pro-preview',  name: 'Gemini 3.1 Pro (preview)' },
     { id: 'google/gemini-3-pro-preview',    name: 'Gemini 3 Pro (preview)' },
     { id: 'deepseek/deepseek-v4-pro',       name: 'DeepSeek V4 Pro' },
