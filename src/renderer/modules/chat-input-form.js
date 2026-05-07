@@ -396,14 +396,17 @@
       onChange: () => _refreshSubmitState(),
     };
     for (const f of form.fields) {
-      const presetValue = submitted && form.values
-        && Object.prototype.hasOwnProperty.call(form.values, f.id)
-        ? form.values[f.id]
-        : undefined;
-      const built = _buildField(f, fieldCtx, {
-        presetValue,
-        disabled: submitted,
-      });
+      // Only attach `presetValue` when we actually have one — `_buildField`
+      // checks `hasOwnProperty('presetValue')` to distinguish "user explicitly
+      // cleared this field" (preset = '' / 0 / false / []) from "no preset,
+      // fall back to field.default". Passing the key with value `undefined`
+      // would defeat that and hide the schema-defined defaults.
+      const buildOpts = { disabled: submitted };
+      if (submitted && form.values
+          && Object.prototype.hasOwnProperty.call(form.values, f.id)) {
+        buildOpts.presetValue = form.values[f.id];
+      }
+      const built = _buildField(f, fieldCtx, buildOpts);
       fields.push(built);
       bodyEl.appendChild(built.el);
     }
