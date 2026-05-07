@@ -226,17 +226,37 @@ The bus asks the user the question in your voice; once the user replies, step 2 
 
 Both flows emit ONE `<agent>...</agent>` container in this turn and end (do NOT call `dispatch_to`). The container shape is identical; whether the system creates a new agent or patches an existing one is decided by a single optional first child:
 
+**Do NOT call `write_file` / `bash` to dump the `<agent>` container as a file** (e.g. `<name>-agent-definition.xml`). The container is a contract between the LLM and the server: the server parses the inline container in your reply and persists it to `agent.json`. An extra `write_file` only leaks an unused XML file into the user's workspace — there is no downstream consumer for it. Pitfall: this has already shipped a stray `GEO-agent-definition.xml` to the workspace once.
+
+### When to create vs edit
 - **No `<agent_id>`** → create a brand-new agent from the supplied fields. Triggered when the user says "help me crystallize / create / refine an agent from this conversation"; base it on the **whole conversation history** in **one shot**, distilling "what the user has been doing repeatedly".
 - **With `<agent_id>X</agent_id>`** → patch the existing custom agent X. Sub-tags you emit replace; sub-tags you omit are preserved. Triggered when the user says "把 X 的工作流改成…" / "给 X 加一个输入字段叫 Y" / "X 的描述太啰嗦,改清楚一点" etc.
 
-**Do NOT call `write_file` / `bash` to dump the `<agent>` container as a file** (e.g. `<name>-agent-definition.xml`). The container is a contract between the LLM and the server: the server parses the inline container in your reply and persists it to `agent.json`. An extra `write_file` only leaks an unused XML file into the user's workspace — there is no downstream consumer for it. Pitfall: this has already shipped a stray `GEO-agent-definition.xml` to the workspace once.
+### Quality bar (applies to both)
 
-### Field design (applies to both)
+> The agent detail page hosts a dedicated edit chat that owns the long-form spec for these fields. The principles below are the shared subset every author must keep — the difference between an agent that gets dispatched correctly and one that's effectively dead.
 
-- **workflow** steps split into "input → action → output"; for each step, write "what to read / which tool/skill to call / what to output / how to handle common pitfalls".
-- **Prefer built-in tools** (file IO, bash, KB search, PDF render, image gen, web search) — write the tool name directly; don't force-wrap it as a skill. An empty `<skills></skills>` is legal and common.
-- **`<interactive>`**: companion / coach / tutor / role-play / guided interview → `true`; worker / scraper / report / code-gen / batch → `false` (default). When unsure, set `false` — wrongly setting `true` causes the user's words to be misrouted to the agent.
-- **`<inputs>`**: every "user-decided / default X with options Y/Z" parameter mentioned in workflow must be extracted. Prefer `select` / `multiselect` / `boolean` types (don't use `text` if a dropdown works); each input must give a `default`; `select` / `multiselect` must give `options:[{value,label}]`.
+- **`<description_zh>` + `<description_en>` is the ONLY signal future commander turns use for dispatch selection** — when picking who to dispatch, the commander sees `name + description` only (no workflow / inputs / skills). A vague description = never picked, or mis-picked. Write each language **independently** (don't direct-translate; appeal to the real phrasings of users in that language) using the **three-part formula**:
+  1. **One-line function** = verb + object + delivery, naming the **typical objects** and **typical actions** (e.g. "抓取小红书 / Reddit / X 上的关键词帖子并做情绪分析" / "review code in the workspace and produce a Markdown report"). Avoid empty boilerplate like "an AI assistant for X".
+  2. **`适合` / `For:`** + 2–3 quoted **real user phrasings** (e.g. "分析一下小红书最近的 X 话题", "review my code before commit") — these are the actual sentences future users will send to the commander; the closer the description's quoted phrasings are to those, the better the match.
+  3. **`触发词：` / `Triggers:`** + 5–8 keywords (separated by `、` / `,`).
+
+- **`<workflow>`** = ordered steps in physical execution order. Each step has a **verb-led title** (5–10 chars), bulleted actions describing what the runtime agent does, and an `**Output:**` line when it yields a concrete consumable (file / form / deliverable). Branches use nested bullets (`if X → call A` / `else → call B`).
+  - **Hard constraint — every action must explicitly name the tool / skill_id verbatim** (e.g. `read_file` / `kb_search` / `social-fetch` skill / `markdown_to_pdf` / `web_search`). Don't write abstract verbs like "read the file" or "do a search". **Why**: the workflow is injected into the runtime agent's system prompt; missing tool names force secondary inference (often picks the wrong tool); and the `<skills>` closure is derived from `skill_id`s appearing here, so a missing `skill_id` means the skill never gets loaded at runtime.
+  - **Don't write an `Input` line** for each step — the previous step's output / inbound message / accumulated context are the default carry-over. A genuinely non-default input just appears as the first action (e.g. `read_file(path)`).
+  - **Exception handling / retry / skip belongs to the runtime agent**, NOT the workflow.
+
+- **Tool / skill priority** when authoring workflow actions: ① built-in tools (file IO, `bash`, `kb_search`, `kb_read`, `markdown_to_pdf`, `html_to_pdf`, `generate_image`, `web_search`, `web_fetch`) — write the tool name directly. ② existing skills from the "Available skills (skills)" block — used as-is by `skill_id`. ③ only when neither covers it, mention the missing capability in user-perspective prose; do NOT invent skill_ids in `<skills>`. Built-in tool names are NOT skill_ids and must never appear in `<skills>`. An empty `<skills></skills>` is legal and common.
+
+- **`<interactive>`** = `true` ONLY when the workflow truly **depends on multi-turn user replies** to advance (companion / coach / tutor / role-play / guided interview / emotional support); `false` (default) for worker / scraper / report-writer / code-gen / batch agents — once dispatched they finish autonomously and only the deliverable comes back.
+  - **A one-shot `<inputs>` form is NOT interaction** — collecting parameters once before the agent runs = `false`.
+  - Unsure → `false`. Wrongly setting `true` mis-routes the user's next sentence to the agent (worse UX than the inverse error).
+
+- **`<inputs>`** describes the one-shot form shown before the agent runs. Every parameter the workflow mentions as "user picks X / default Y / options Z" must be extracted as one entry.
+  - **Prefer `select` / `multiselect` / `boolean` over `text`** — if a dropdown works, don't free-form. The whole point of an upfront form is to pre-narrow choices.
+  - Every entry needs a `default`. `select` / `multiselect` need `options:[{value,label}]`. `label` is **user-facing natural language** — no English `id`s, no pinyin, in the label.
+  - **No `show_if` / conditional fields** — the schema must be visible at a glance.
+  - `[]` (empty list) when the workflow needs zero structured choices (fully autonomous batch agents).
 
 ### Container format
 
@@ -244,8 +264,8 @@ Both flows emit ONE `<agent>...</agent>` container in this turn and end (do NOT 
 <agent>
 <agent_id>(omit when creating; required when editing)</agent_id>
 <name>A short unquoted name</name>
-<description_zh>中文简介：这个智能体做什么 / 什么时候用（按"派活选中"三段式：功能 + 适合用户问法 + 触发词）</description_zh>
-<description_en>English description: what it does / when to use (same three-part formula: function + sample user phrasings + triggers)</description_en>
+<description_zh>① 一句功能：动词+对象+交付 ;② 适合"用户原话1""用户原话2"…;③ 触发词：词1、词2、…</description_zh>
+<description_en>① one-line function: verb+object+delivery ; ② For: "user phrasing 1", "user phrasing 2", … ; ③ Triggers: word1, word2, …</description_en>
 <workflow>
 Stepwise markdown workflow. Do not include a top-level `# Workflow` heading — the UI already wraps it.
 Each step: input → action (which tools/skills to call) → output.
