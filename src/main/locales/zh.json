@@ -7,6 +7,7 @@
   "errors.cant_delete_index": "不能删除系统索引",
   "errors.file_already_exists": "同名文件已存在",
   "errors.kb_duplicate_sha1": "相同内容的文件已存在于知识库：{existingPath}",
+  "errors.kb_name_too_long": "文件名太长：「{name}」。请缩短到中文 50 字 / 英文 100 字符以内。",
   "errors.builtin_agent_not_editable": "内置智能体不可通过对话编辑",
   "errors.agent_disabled": "本对话绑定的智能体已被禁用，请重新启用或换一个对话",
   "errors.no_files_to_organize": "无可整理的文件",

@@ -293,6 +293,7 @@
   "kb_picker.name_hint": "不含扩展名将自动补 .md",
   "kb_picker.name_needed": "请填写文件名",
   "kb_picker.name_bad_chars": "文件名不能包含 / \\ 或 ..",
+  "kb_picker.name_too_long": "文件名太长：「{name}」。请缩短到中文 50 字 / 英文 100 字符以内。",
   "kb_picker.folder": "选择目录",
   "kb_picker.target": "保存到：{rel}",
   "chat.archive_picker_title": "存档对话到知识库",

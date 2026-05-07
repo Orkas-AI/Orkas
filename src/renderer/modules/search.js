@@ -306,6 +306,16 @@ function _renderSearchResults(query) {
 }
 
 function _onSearchKey(e) {
+  // Skip every shortcut while an IME composition is active (pinyin / kana /
+  // hangul input). Without this guard, pressing Enter to commit an English
+  // candidate from the IME panel — common when the primary suggestion is
+  // already an English word — is interpreted as "submit the active result"
+  // and navigates away mid-typing. Arrow keys are also IME-owned during
+  // composition (they move the candidate cursor), so the same guard
+  // prevents them from moving our selection. Mirrors `conversation.js` /
+  // `state.js` chat input handlers (`!e.isComposing` + keyCode 229 belt-
+  // and-suspenders for older Electron / Safari).
+  if (e.isComposing || e.keyCode === 229) return;
   if (e.key === 'ArrowDown') {
     e.preventDefault();
     _moveSearchSelection(1);

@@ -248,6 +248,7 @@ Vanilla HTML/CSS/JS, classic `<script>` multi-file (no ESM, no build). Cross-fil
 - `src/renderer/` **does not participate in typecheck** (vanilla + DOM gives too many checkJs false positives); main/ stays at `checkJs: true`.
 - Process-info-row icons use only Unicode Geometric Shapes (`▶ ● ◆ ◇ ■ ▣ ▷ ◐ ◉ ○ ◯ ▪`); **no colored emoji**.
 - The UI shares one set of classes (`.btn / .btn-sm / .btn-primary / .btn-danger / .detail-actions / .empty / .muted`); differences are expressed via `.is-*` modifiers; **don't open near-duplicate classes**.
+- **IME composition guard on Enter / Arrow shortcuts**: every keydown handler on an `<input>` / `<textarea>` that triggers an action (Enter→submit / search-jump / form-confirm; Arrow→list selection) **must early-return when `e.isComposing || e.keyCode === 229`**. **Why:** Chinese / Japanese / Korean IMEs use Enter to commit a composition candidate; without this guard, "Enter to confirm an English candidate when the primary suggestion is already English" silently fires the action and the user navigates away mid-typing. We've already hit this on the global search overlay; the chat input (`modules/conversation.js`) and the new-chat input (`modules/state.js`) had it from the start, the search input was missing it. Pattern to copy: `if (e.isComposing || e.keyCode === 229) return;` at the top of the handler. The `keyCode === 229` arm covers older Electron / Safari builds where `isComposing` is occasionally inaccurate.
 
 ### i18n (zh / en)
 

@@ -64,6 +64,32 @@ const BINARY_EXTS: ReadonlySet<string> = new Set([
 const ALLOWED_EXTS: ReadonlySet<string> = new Set([...TEXT_EXTS, ...BINARY_EXTS]);
 const MAX_FILE_BYTES = 200 * 1024 * 1024; // 200MB — defensive cap per plan §3.3
 
+/** Max basename / dirname length in **weighted code points**: CJK / Hangul /
+ *  Kana count as 2, everything else (ASCII, Latin-extended, Cyrillic, emoji…)
+ *  counts as 1. The split prevents a single uniform cap from either
+ *  squashing English to a few words OR letting Chinese filenames balloon
+ *  past readable. Budget 100:
+ *    - pure Chinese: ~50 chars (a long sentence)
+ *    - pure English: ~100 chars (descriptive long filename)
+ *    - mixed:        weights add up
+ *  Real FS basename limits (HFS+ / NTFS = 255 UTF-16 units) are far higher;
+ *  this is a UX bound, not a FS bound. Applied to every path segment in
+ *  `resolvePath`, so it covers writes / uploads / mkdir / rename through
+ *  one chokepoint. */
+const MAX_BASENAME_WEIGHT = 100;
+
+/** Char-class regex for the "double-width" group: CJK Unified Ideographs
+ *  (incl. extension A), Hangul, Hiragana, Katakana. Tested per code point. */
+const DOUBLE_WIDTH_CHAR = /[㐀-鿿가-힯぀-ゟ゠-ヿ]/;
+
+function _filenameWeight(s: string): number {
+  let w = 0;
+  for (const ch of s) {
+    w += DOUBLE_WIDTH_CHAR.test(ch) ? 2 : 1;
+  }
+  return w;
+}
+
 export type Result<T = Record<string, unknown>> = ({ ok: true } & T) | { ok: false; error: string };
 
 export interface ContextNode {
@@ -106,6 +132,14 @@ function resolvePath(relpath: string, { mustExist = false }: ResolveOpts = {}): 
   // Reject any segment starting with '.' — keeps `.kb/` (vector db) and other
   // hidden dirs off-limits to user mutations.
   if (parts.some((p) => p.startsWith('.'))) throw new Error('hidden entries are reserved');
+  // Length cap (per-segment, weighted — see MAX_BASENAME_WEIGHT).
+  // The first offending segment is surfaced verbatim so the user knows which
+  // part of the path is too long (file basename vs. some parent dir).
+  for (const p of parts) {
+    if (_filenameWeight(p) > MAX_BASENAME_WEIGHT) {
+      throw new Error(t('errors.kb_name_too_long', { name: p }));
+    }
+  }
   const root = path.resolve(contextsRoot());
   const target = path.resolve(root, s);
   const rel = path.relative(root, target);

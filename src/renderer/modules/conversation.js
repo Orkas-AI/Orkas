@@ -884,10 +884,25 @@ function _iconForProduced(name) {
   const ext = (name.split('.').pop() || '').toLowerCase();
   if (ext === 'pdf') return '📄';
   if (ext === 'docx' || ext === 'doc') return '📝';
-  if (['png', 'jpg', 'jpeg', 'webp', 'gif'].includes(ext)) return '🖼';
-  if (['md', 'markdown', 'txt', 'log'].includes(ext)) return '📃';
-  if (['json', 'yaml', 'yml', 'csv', 'tsv'].includes(ext)) return '📊';
-  return '📁';
+  if (['png', 'jpg', 'jpeg', 'webp', 'gif', 'svg', 'bmp', 'ico'].includes(ext)) return '🖼';
+  if (['mp4', 'webm', 'mov', 'm4v', 'ogv', 'avi', 'mkv'].includes(ext)) return '🎬';
+  if (['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac'].includes(ext)) return '🎵';
+  if (['md', 'markdown', 'txt', 'log', 'rst', 'tex'].includes(ext)) return '📃';
+  if (['json', 'yaml', 'yml', 'toml', 'csv', 'tsv', 'xlsx', 'xls', 'xml', 'ini', 'conf'].includes(ext)) return '📊';
+  if (['zip', 'tar', 'gz', 'tgz', 'bz2', 'xz', '7z', 'rar'].includes(ext)) return '📦';
+  // Source code / scripts — covers .py / .ts / web / shell / mainstream langs.
+  // Anything else falls through to the generic "file" icon below.
+  if ([
+    'py', 'pyi', 'ipynb',
+    'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs',
+    'html', 'htm', 'css', 'scss', 'sass', 'less',
+    'sh', 'bash', 'zsh', 'fish', 'ps1', 'bat', 'cmd',
+    'rb', 'go', 'rs', 'java', 'kt', 'kts', 'scala',
+    'c', 'cpp', 'cc', 'cxx', 'h', 'hpp', 'hxx',
+    'php', 'swift', 'lua', 'pl', 'pm', 'r', 'dart',
+    'sql', 'graphql', 'gql', 'proto',
+  ].includes(ext)) return '📜';
+  return '📄';
 }
 
 function _renderMessageProducedHtml(absPaths) {

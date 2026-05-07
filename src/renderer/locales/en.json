@@ -293,6 +293,7 @@
   "kb_picker.name_hint": "Missing extension will be auto-filled as .md",
   "kb_picker.name_needed": "Filename is required",
   "kb_picker.name_bad_chars": "Filename cannot contain / \\ or ..",
+  "kb_picker.name_too_long": "Filename too long: \"{name}\". Keep it within ~100 ASCII chars or ~50 CJK chars.",
   "kb_picker.folder": "Choose folder",
   "kb_picker.target": "Saving to: {rel}",
   "chat.archive_picker_title": "Archive message to knowledge base",

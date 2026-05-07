@@ -7,6 +7,7 @@
   "errors.cant_delete_index": "Cannot delete the system index",
   "errors.file_already_exists": "A file with this name already exists",
   "errors.kb_duplicate_sha1": "A file with identical content already exists in the knowledge base: {existingPath}",
+  "errors.kb_name_too_long": "Filename too long: \"{name}\". Keep it within ~100 ASCII chars or ~50 CJK chars.",
   "errors.builtin_agent_not_editable": "Built-in agents cannot be edited through chat",
   "errors.agent_disabled": "The agent bound to this conversation is disabled — re-enable it or switch conversation.",
   "errors.no_files_to_organize": "No files to organize",

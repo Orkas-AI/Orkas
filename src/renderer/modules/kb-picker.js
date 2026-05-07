@@ -157,6 +157,21 @@ function closeKbPicker() {
 }
 window.closeKbPicker = closeKbPicker;
 
+// Mirror of `features/contexts.ts::MAX_BASENAME_WEIGHT` + `_filenameWeight`.
+// Re-implemented in JS because main and renderer don't share modules; the
+// values must stay in lockstep — bump together. CJK / Hangul / Kana are
+// double-weight so a single budget gives ~50 chars to Chinese filenames and
+// ~100 chars to English filenames.
+const _KB_NAME_MAX_WEIGHT = 100;
+const _KB_NAME_DOUBLE_WIDTH_RE = /[㐀-鿿가-힯぀-ゟ゠-ヿ]/;
+function _kbNameWeight(s) {
+  let w = 0;
+  for (const ch of s) {
+    w += _KB_NAME_DOUBLE_WIDTH_RE.test(ch) ? 2 : 1;
+  }
+  return w;
+}
+
 async function confirmKbPicker() {
   const rawName = (document.getElementById('kb-picker-name').value || '').trim();
   const msg = document.getElementById('kb-picker-msg');
@@ -173,6 +188,14 @@ async function confirmKbPicker() {
   }
   let name = rawName;
   if (!/\.[a-z0-9]+$/i.test(name)) name += '.md';
+  // Length cap (post-extension). Server enforces the same rule via
+  // resolvePath; this branch is the early-feedback for the user so we
+  // don't burn a network round-trip on a guaranteed-fail case.
+  if (_kbNameWeight(name) > _KB_NAME_MAX_WEIGHT) {
+    msg.textContent = t('kb_picker.name_too_long', { name });
+    msg.className = 'form-msg err';
+    return;
+  }
   const fullPath = _kbPickerCurrentDir ? `${_kbPickerCurrentDir}/${name}` : name;
 
   try {
@@ -189,10 +212,18 @@ async function confirmKbPicker() {
 window.confirmKbPicker = confirmKbPicker;
 
 /**
- * Derive a ≤20-char filename stem from message content. Strips markdown
- * decorations + path-hostile characters so the result is filesystem-safe.
- * Used by conversation.js to seed the picker input when archiving.
+ * Derive a default filename stem from message content. Strips markdown
+ * decorations + path-hostile characters so the result is filesystem-safe,
+ * then truncates by **weight** (CJK = 2, others = 1) so Chinese gets ~30
+ * chars and English gets ~60 chars from the same budget. Without the
+ * weight split, "first N code points" gives English a useless prefix
+ * like "This is the way to" (20 chars ≈ 3-4 words). Caller seeds the
+ * picker input; the user can edit before confirm. Final length is
+ * server-validated against `MAX_BASENAME_WEIGHT` (=100), so the seed
+ * always fits with headroom for edits.
  */
+const _KB_DEFAULT_NAME_WEIGHT = 60;
+
 function deriveKbArchiveName(text) {
   const cleaned = String(text || '')
     .replace(/```[\s\S]*?```/g, ' ')
@@ -203,8 +234,26 @@ function deriveKbArchiveName(text) {
     .replace(/[\\\/:*?"<>|]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  const first = Array.from(cleaned).slice(0, 20).join('').trim();
-  if (first) return first;
+  // Walk by code point so emoji / surrogate pairs aren't split mid-glyph.
+  let w = 0;
+  let out = '';
+  for (const ch of cleaned) {
+    const cw = _KB_NAME_DOUBLE_WIDTH_RE.test(ch) ? 2 : 1;
+    if (w + cw > _KB_DEFAULT_NAME_WEIGHT) break;
+    w += cw;
+    out += ch;
+  }
+  // For ASCII text we likely cut mid-word; round back to the last space if
+  // it's within 12 chars (= one short word's worth) so the seed reads
+  // naturally instead of "the meet" → "the". CJK has no word boundaries,
+  // so skip the rounding (the last space might be 30+ chars back).
+  const lastSpace = out.lastIndexOf(' ');
+  const tailHasNoCjk = lastSpace > 0 && !_KB_NAME_DOUBLE_WIDTH_RE.test(out);
+  if (tailHasNoCjk && out.length - lastSpace <= 12 && out.length - lastSpace > 0) {
+    out = out.slice(0, lastSpace);
+  }
+  out = out.trim();
+  if (out) return out;
   const n = new Date();
   const p = (x) => String(x).padStart(2, '0');
   return `archive-${n.getFullYear()}${p(n.getMonth() + 1)}${p(n.getDate())}-${p(n.getHours())}${p(n.getMinutes())}`;
