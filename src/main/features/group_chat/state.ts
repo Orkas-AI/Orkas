@@ -56,6 +56,14 @@ export interface StateFile {
   last_active_at: string;
   /** Actor ids currently running their worker loop. */
   in_flight: string[];
+  /** Per-conversation workspace subdirectory basename (relative to the
+   *  user's root workspace). Lazily filled by `conv_workspace.ts` on the
+   *  first write_file in this conversation; **empty / missing → legacy
+   *  conversations stay at the root workspace** (no migration). Once set
+   *  it is **frozen** — renaming the conv title afterwards does not move
+   *  the directory or update this field. See `conv_workspace.ts` for the
+   *  slug rules and the placeholder fallback. */
+  workspace_dir?: string;
 }
 
 export const COMMANDER_ID = 'commander';
@@ -204,6 +212,9 @@ export async function readState(uid: string, cid: string): Promise<StateFile> {
         status: (data.status as GroupStatus) || 'idle',
         last_active_at: typeof data.last_active_at === 'string' ? data.last_active_at : nowIso(),
         in_flight: Array.isArray(data.in_flight) ? data.in_flight.filter((s: unknown) => typeof s === 'string') : [],
+        ...(typeof data.workspace_dir === 'string' && data.workspace_dir
+          ? { workspace_dir: data.workspace_dir }
+          : {}),
       };
     }
   } catch (err) {
@@ -282,6 +293,20 @@ export async function markInFlight(uid: string, cid: string, actorId: string, ru
     const have = s.in_flight.includes(actorId);
     if (running && !have) s.in_flight.push(actorId);
     if (!running && have) s.in_flight = s.in_flight.filter((id) => id !== actorId);
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return s;
+  });
+}
+
+/** Atomically lock in the per-conversation workspace subdirectory basename.
+ *  No-op if the field is already set (frozen-on-first-write semantics — see
+ *  `conv_workspace.ts`). Returns the resulting state. */
+export async function setWorkspaceDirOnce(uid: string, cid: string, dir: string): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    if (s.workspace_dir) return s;
+    s.workspace_dir = dir;
     s.last_active_at = nowIso();
     await writeStateRaw(uid, cid, s);
     return s;

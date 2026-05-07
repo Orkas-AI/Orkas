@@ -45,7 +45,6 @@ import {
 import * as planExecutor from './plan_executor';
 import { userChatsDir, BUILTIN_SKILLS_DIR, userSkillsDir } from '../../paths';
 import * as agentsFeat from '../agents';
-import * as userWorkspace from '../user_workspace';
 import { isAgentEnabled } from '../component_enabled';
 import { buildLanguageDirective, t } from '../../i18n';
 
@@ -710,7 +709,14 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
 
   const sessionId = actorSessionId(uid, cid, actor);
   const isCommander = actor.kind === 'commander';
-  const workingDir = userWorkspace.getWorkspacePath(uid);
+  // Per-conv subdir under the user's root workspace — keeps repeat
+  // agent runs writing the same basename grouped together instead of
+  // littering the root with `requirements-2.md / -3.md / ...`. Lazy:
+  // first call mkdirs + persists `state.json::workspace_dir`. Old convs
+  // with no `workspace_dir` field fall back to the root workspace, so
+  // there's no migration story.
+  const { getConversationWorkspacePath } = await import('./conv_workspace');
+  const workingDir = await getConversationWorkspacePath(uid, cid);
 
   // First-turn replay: if the persistent session jsonl doesn't exist yet,
   // prepend a `<group-chat-history>` block built from the visibility slice
@@ -1202,7 +1208,8 @@ async function buildCommanderSystemPrompt(uid: string, cid: string): Promise<str
   const paths_ = await import('../../paths');
   const plan = await readPlan(uid, cid);
   const allAgentsList = await buildAgentsIndexBlock(uid);
-  const workingDir = userWorkspace.getWorkspacePath(uid);
+  const { getConversationWorkspacePath } = await import('./conv_workspace');
+  const workingDir = await getConversationWorkspacePath(uid, cid);
   const permState = (() => {
     try {
       const s = require('../permissions').getLocalExecState() as { granted: boolean };

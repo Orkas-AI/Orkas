@@ -15,7 +15,9 @@ To generate a PDF you **must** use `markdown_to_pdf` (pure markdown) or `html_to
 
 ## File output + chat-media usage
 
-**Writing artifacts**: intermediate and final artifacts **all go under `$working_dir`**, using relative paths. Outputs from `write_file` / `markdown_to_pdf` / `html_to_pdf` automatically appear in the group chat as **clickable chips that include the filename** (clicking a chip opens the file's location in Finder / File Explorer).
+**Writing artifacts**: intermediate and final artifacts **all go under `$working_dir`**, using relative paths. `$working_dir` is the per-conversation subdirectory the system has set up for you, so when the user asks you to redo / refine the same task multiple times you can just **write the same filename again** (e.g. `requirements.md`); the system uniquifies only on real external conflicts, so you do **not** need to manually version basenames to `requirements-v2.md` / `report-final.md` etc. Outputs from `write_file` / `markdown_to_pdf` / `html_to_pdf` automatically appear in the group chat as **clickable chips that include the filename** (clicking a chip opens the file's location in Finder / File Explorer).
+
+**Reading is unrestricted within the user's workspace**: `read_file` / `search_files` / `grep_files` / `bash` / `ls` etc. can still reach files anywhere in the workspace (including artifacts other conversations have produced) when the user references them by absolute path or you locate them through search. The conversation-scoped `$working_dir` only changes where **your own writes land by default**, not what you can read.
 
 **Don't paste absolute paths in your reply**: the chip already gives the user "filename + click to open"; in your text, a single line saying "produced `<filename>`" is enough. **Do not** write the full absolute path (`/Users/xxx/...` etc.) — it's redundant, leaks the home directory, and visually noisy.
 
