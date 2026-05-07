@@ -128,6 +128,16 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return groupChat.readPlanForCid(ctx.userId, cid);
   },
 
+  'groupChat.retryStep': async ({ cid, stepIndex }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return groupChat.retryStep(ctx.userId, cid, Number(stepIndex));
+  },
+
+  'groupChat.skipStep': async ({ cid, stepIndex }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return groupChat.skipStep(ctx.userId, cid, Number(stepIndex));
+  },
+
   'groupChat.markFormSubmitted': async ({ cid, msgId, formId, values }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
     if (typeof msgId !== 'string' || !msgId) throw new Error('invalid msgId');

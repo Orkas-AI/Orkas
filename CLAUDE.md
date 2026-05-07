@@ -160,11 +160,15 @@ Members = `commander` + `user` + N `agent` actors (any agent first targeted by `
 - **`@<name>` written into prose by commander / agents is NOT recognized as a dispatch signal** (LLM training tends to use `@` as markdown decoration; this used to mis-trigger and produced recurring bugs).
 - `dispatch_to` calls only stage; the recipient worker is woken up only after the commander turn fully wraps up (avoiding races; same `pendingPlanAnnouncement` + delayed reconcile pattern as `plan_set`).
 
-**Single dispatch primitive**: `bus.ts::enqueue(uid, cid, fromActorId, text, [forceTo], ...)` is the only external control-flow entry point for group_chat. `dispatch_to` / `plan_executor` / text @ (user only) / **CLI-backed agent worker turns** (their post-CLI reply still goes back through `bus.enqueue`, no shortcut) all funnel into this single enqueue. **Do not** introduce parallel enqueue functions; new dispatch paths must go through it.
+**Single dispatch primitive**: `bus.ts::enqueue(uid, cid, fromActorId, text, [forceTo], ...)` is the only external control-flow entry point for group_chat. `dispatch_to` / `plan_executor` / text @ (user only) / **CLI-backed agent worker turns** (their post-CLI reply still goes back through `bus.enqueue`, no shortcut) all funnel into this single enqueue. **Do not** introduce parallel enqueue functions; new dispatch paths must go through it. **`groupChat.retryStep / skipStep` are not exceptions** — they only mutate plan state, never enqueue directly; redispatch happens via `planExecutor.reconcileAfterStepTransition → dispatchReady → enqueue`.
+
+**Plan rail (user-facing visualization)**: `<cid>/plan.json` is rendered as a sticky-top rail above `#chat-history` (renderer `modules/plan-rail.js`). The rail is the SOLE frontend display for plan state (the legacy `📋 执行计划` bubble label is just a one-line announcement, not a view of step status). Failed steps surface 重试/跳过/放弃 buttons that route to `groupChat.retryStep / skipStep / abort` IPC. Action buttons hide whenever `state.in_flight` is non-empty to avoid racing user actions against an in-progress turn. Status icon set is FIXED in `plan-rail.js::STATUS_ICON` — single source of truth, no LLM input, no backend / locale duplicates.
+
+**Plan-level transient retry**: `PlanStep.transient_attempts` + `TRANSIENT_ERR_PATTERNS` (in `plan_executor.ts`) form a 2-tier retry stack with core-agent's `maxRetries=3` inner stream-level retry. Pattern matches undici `terminated` / `ECONNRESET` / `ETIMEDOUT` etc.; on hit, the failed step is folded back to `pending` + `transient_attempts++` + immediately redispatched via reconcile. Cap = `MAX_TRANSIENT_RETRIES` (2). **Never include `aborted` / `cancelled` in the pattern** — user-initiated abort must not be silently retried; the literal `'aborted by user'` string is also explicitly excluded by the guard. The plan layer only does state recovery — do NOT add sleep / backoff / socket-reconnect logic here (that's core-agent's job).
 
 **Key constraints**:
 - **Visibility slice** (security invariant): agent X sees only messages where `from==X ∨ to∋X ∨ mentions∋X`; workers must go through `visibility.readSlice` and **never read the full `<cid>.jsonl`** (which would leak other actors' private context).
-- **plan**: the commander writes `<cid>/plan.md` only via the `plan_set` tool; **no out-of-tool hand edits** (which would break the first-announcement semantics + UI `plan_changed` event chain).
+- **plan**: the commander writes `<cid>/plan.md` only via the `plan_set` tool; **no out-of-tool hand edits** (which would break the first-announcement semantics + UI `plan_changed` event chain). User-initiated `retryStep` / `skipStep` go through `plan_executor` (which `updateStep`s + reconciles), NOT through hand-editing `plan.json`.
 - **abort**: `groupChat.abort(cid)` is the sole group-level stop (clears every actor queue + aborts in-flight + sets `state.json.status='aborted'`; plan.md is preserved as a progress record); **no per-stream stop button**.
 - **Infinite-loop guard**: `MAX_WORKER_TURNS=100` (turns dimension, **not time**); paired with the outer `idleTimeout=600s`, two independent fallbacks.
 - **Structured outputs**: the commander's `<agent>...</agent>` container (create/edit agent), and the agent's ```agent-input-form``` fenced block (forms); format and pipeline details are in `bus.ts::runTurn` + `prompts/chat_*.md`.
@@ -334,6 +338,10 @@ The commit message is **about the change**, not about how it got here. Sync prov
 - Write `@<X>` in commander/agent prose expecting a dispatch — it's no longer recognized; the user just sees text nobody picked up.
 - Build a new enqueue / scheduling function in parallel to `bus.enqueue` — single-primitive principle, every dispatch path must go through it.
 - Hand-edit `<cid>/plan.md` outside the `plan.ts` tools.
+- Make `retryStep` / `skipStep` enqueue directly (must go through reconcile so the dispatch primitive stays singular).
+- Wire the rail's "重试" button to "send the user message again" — that double-writes user history; the action must go through the dedicated IPC (`groupChat.retryStep`) which only mutates plan state.
+- Add `aborted` / `cancelled` / `Run aborted` to `TRANSIENT_ERR_PATTERNS` — silently retrying user-initiated abort is the wrong behavior. Net new patterns must come from the network layer (undici / fetch / DNS / socket), not from intent layers.
+- Duplicate the plan rail status icon set (`plan-rail.js::STATUS_ICON`) into prompts / locales / backend. Single source of truth; downstream surfaces just read the rendered output.
 
 ---
 

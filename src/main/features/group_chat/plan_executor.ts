@@ -55,6 +55,42 @@ const log = createLogger('group_chat.plan_executor');
 const COMMANDER_ALIASES = new Set(['commander', '指挥官']);
 const USER_ALIASES = new Set(['user', '用户']);
 
+/** Plan-level safety net for transient failures. core-agent's runner already
+ *  has its own `maxRetries=3` exponential-backoff retry inside a single
+ *  stream call; this kicks in only AFTER that bubbles up — i.e. the network
+ *  was down long enough that even the inner retries failed. We then fold
+ *  the step back to `pending` so reconcile re-dispatches the whole turn
+ *  (fresh stream, fresh provider connection). Capped to avoid infinite
+ *  loops when the user is just genuinely offline.
+ *
+ *  IMPORTANT — never include `aborted` or `cancelled` in this pattern:
+ *  user-initiated abort must not be silently retried; the literal string
+ *  `'aborted by user'` is also explicitly excluded by the guard. */
+const TRANSIENT_ERR_PATTERNS = /\b(terminated|fetch failed|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|socket hang up|EPIPE|network error|Connection closed)\b/i;
+const MAX_TRANSIENT_RETRIES = 2;
+
+/** Returns true when `reason` matches a transient network-error pattern AND
+ *  this step still has plan-level retry budget. Caller should bail out
+ *  (return early) — we've already flipped the step back to `pending` so the
+ *  next reconcile will redispatch. */
+async function maybeRetryTransient(
+  uid: string, cid: string, step: PlanStep, reason: string,
+): Promise<boolean> {
+  if (!reason) return false;
+  if (reason === 'aborted by user') return false;
+  if (!TRANSIENT_ERR_PATTERNS.test(reason)) return false;
+  const attempts = step.transient_attempts ?? 0;
+  if (attempts >= MAX_TRANSIENT_RETRIES) return false;
+  await updateStep(uid, cid, step.index, 'pending', {
+    transient_attempts: attempts + 1,
+    failure_reason: '',
+    output_msg_id: '',
+  });
+  log.info(`plan-step transient-retry cid=${cid} step=${step.index} attempts=${attempts + 1}/${MAX_TRANSIENT_RETRIES} reason=${reason}`);
+  _hooks!.emitPlanChanged(uid, cid);
+  return true;
+}
+
 // ── Public API ───────────────────────────────────────────────────────────
 
 /** Trigger context attached to a worker QueueItem. Identifies which step (if
@@ -401,6 +437,7 @@ async function transitionStepDone(
     output_summary: summary,
     output_files: files,
     output_msg_id: outputMsgId,
+    transient_attempts: 0,
   });
   _hooks!.emitPlanChanged(uid, cid);
   log.info(`plan-step done cid=${cid} step=${step.index} assignee=${step.assignee}`);
@@ -409,6 +446,7 @@ async function transitionStepDone(
 async function transitionStepFailed(
   uid: string, cid: string, step: PlanStep, reason: string, outputMsgId: string,
 ): Promise<void> {
+  if (await maybeRetryTransient(uid, cid, step, reason)) return;
   const policy: FailurePolicy = step.on_failure || 'ask_commander';
   if (policy === 'continue') {
     await updateStep(uid, cid, step.index, 'skipped', {
@@ -442,8 +480,10 @@ async function transitionStepFailed(
   _hooks!.emitPlanChanged(uid, cid);
 }
 
-/** Fired after a step transition to dispatch downstream + check terminal. */
-async function reconcileAfterStepTransition(uid: string, cid: string): Promise<void> {
+/** Fired after a step transition to dispatch downstream + check terminal.
+ *  Exported so user-driven recovery actions (`retryStep` / `skipStep`) can
+ *  reuse the exact same dispatch path the bus uses internally. */
+export async function reconcileAfterStepTransition(uid: string, cid: string): Promise<void> {
   const plan = await readPlan(uid, cid);
   if (!plan?.steps?.length) return;
   await dispatchReady(uid, cid, plan);
@@ -488,6 +528,84 @@ function escapeHtmlForBubble(s: string): string {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+/** User-initiated recovery for a `failed` step. Sets the step back to
+ *  `pending`, clears `failure_reason` and resets `transient_attempts`,
+ *  then unblocks any downstream steps that were cascade-skipped specifically
+ *  because of THIS step's failure (under `abort_plan` policy). Finally calls
+ *  the same `reconcileAfterStepTransition` the bus uses internally so
+ *  redispatch goes through one path.
+ *
+ *  IMPORTANT — never enqueues directly. The single dispatch primitive remains
+ *  `bus.enqueue`, and we reach it only via `reconcileAfterStepTransition →
+ *  dispatchReady → enqueue`. */
+export async function retryStep(
+  uid: string, cid: string, stepIndex: number,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!_hooks) return { ok: false, error: 'executor not bound' };
+  return _planLock(uid, cid).runExclusive(async () => {
+    const plan = await readPlan(uid, cid);
+    if (!plan) return { ok: false, error: 'no plan' };
+    const step = plan.steps.find((s) => s.index === stepIndex);
+    if (!step) return { ok: false, error: 'step not found' };
+    if (step.status !== 'failed') {
+      return { ok: false, error: `step is not in failed state (current: ${step.status})` };
+    }
+    await updateStep(uid, cid, stepIndex, 'pending', {
+      failure_reason: '',
+      output_msg_id: '',
+      transient_attempts: 0,
+    });
+    // Unblock cascade-skipped downstream: when step N failed under
+    // `abort_plan` policy, applyTermination marked all not-yet-terminal
+    // steps `skipped` with reason `aborted by step N failure`. Retrying
+    // step N should also re-arm those cascade victims; users explicitly
+    // skipped via the rail's "skip" button keep their reason and are NOT
+    // re-armed (their reason is the original failure_reason verbatim).
+    const cascadeReason = `aborted by step ${stepIndex} failure`;
+    const fresh = await readPlan(uid, cid);
+    if (fresh) {
+      for (const s of fresh.steps) {
+        if (s.status === 'skipped' && s.failure_reason === cascadeReason) {
+          await updateStep(uid, cid, s.index, 'pending', {
+            failure_reason: '',
+          });
+        }
+      }
+    }
+    log.info(`plan-step retry-requested cid=${cid} step=${stepIndex}`);
+    _hooks!.emitPlanChanged(uid, cid);
+    await reconcileAfterStepTransition(uid, cid);
+    return { ok: true };
+  });
+}
+
+/** User-initiated skip for a `failed` step. Marks it `skipped` while keeping
+ *  `failure_reason` (so the rail can still show why). Downstream that wasn't
+ *  in cascade now becomes ready (skipped is treated as terminal in
+ *  `findReadySteps`). Cascade-victims of THIS step keep their `skipped`
+ *  state — the user opted not to retry, downstream cascade stays. */
+export async function skipStep(
+  uid: string, cid: string, stepIndex: number,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!_hooks) return { ok: false, error: 'executor not bound' };
+  return _planLock(uid, cid).runExclusive(async () => {
+    const plan = await readPlan(uid, cid);
+    if (!plan) return { ok: false, error: 'no plan' };
+    const step = plan.steps.find((s) => s.index === stepIndex);
+    if (!step) return { ok: false, error: 'step not found' };
+    if (step.status !== 'failed') {
+      return { ok: false, error: `step is not in failed state (current: ${step.status})` };
+    }
+    await updateStep(uid, cid, stepIndex, 'skipped', {
+      transient_attempts: 0,
+    });
+    log.info(`plan-step skip-requested cid=${cid} step=${stepIndex}`);
+    _hooks!.emitPlanChanged(uid, cid);
+    await reconcileAfterStepTransition(uid, cid);
+    return { ok: true };
+  });
 }
 
 /** Main entry point. Mark the finished step done (if any), then dispatch
@@ -572,6 +690,7 @@ async function applyTermination(
   }
   if (failed) {
     const reason = ctx.finishedMessage?.failureReason || '(unknown)';
+    if (await maybeRetryTransient(uid, cid, step, reason)) return;
     const policy: FailurePolicy = step.on_failure || 'ask_commander';
     if (policy === 'continue') {
       await updateStep(uid, cid, step.index, 'skipped', {
@@ -606,6 +725,7 @@ async function applyTermination(
     }
   } else {
     await updateStep(uid, cid, step.index, 'done', {
+      transient_attempts: 0,
       output_summary: captureOutput(ctx.finishedMessage?.text || ''),
       output_files: ctx.finishedMessage?.files || [],
       output_msg_id: ctx.finishedMessage?.id,

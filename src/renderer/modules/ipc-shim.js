@@ -59,6 +59,8 @@ const _IPC_ROUTES = [
   ['POST',   /^\/api\/conversations\/([^/]+)\/abort$/,     'groupChat.abort',            ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/members$/,   'groupChat.listMembers',      ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/plan$/,      'groupChat.readPlan',         ['cid']],
+  ['POST',   /^\/api\/conversations\/([^/]+)\/plan\/steps\/(\d+)\/retry$/, 'groupChat.retryStep', ['cid', 'stepIndex']],
+  ['POST',   /^\/api\/conversations\/([^/]+)\/plan\/steps\/(\d+)\/skip$/,  'groupChat.skipStep',  ['cid', 'stepIndex']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/events\/stream$/, 'groupChat.events',      ['cid'], { stream: true }],
   ['POST',   /^\/api\/conversations\/([^/]+)\/form-submitted$/, 'groupChat.markFormSubmitted', ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/attachments$/,      'conversations.attachments.list',   ['cid']],

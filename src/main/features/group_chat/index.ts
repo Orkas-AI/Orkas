@@ -19,6 +19,7 @@ import {
   USER_ID, readMembers, seedReservedActors, purgeGroupDir,
 } from './state';
 import { readPlan, type PlanFile } from './plan';
+import * as planExecutor from './plan_executor';
 import {
   abort as busAbort, dropConv as busDropConv, enqueue, subscribe, isQuiescent,
   type GroupEvent,
@@ -132,6 +133,24 @@ export async function readPlanForCid(
   if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
   const plan = await readPlan(userId, cid);
   return { ok: true, plan: plan || null };
+}
+
+/** User-initiated retry of a failed plan step (rail "Retry" button). */
+export async function retryStep(
+  userId: string, cid: string, stepIndex: number,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
+  if (!Number.isFinite(stepIndex) || stepIndex < 1) return { ok: false, error: 'invalid stepIndex' };
+  return planExecutor.retryStep(userId, cid, stepIndex);
+}
+
+/** User-initiated skip of a failed plan step (rail "Skip" button). */
+export async function skipStep(
+  userId: string, cid: string, stepIndex: number,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
+  if (!Number.isFinite(stepIndex) || stepIndex < 1) return { ok: false, error: 'invalid stepIndex' };
+  return planExecutor.skipStep(userId, cid, stepIndex);
 }
 
 // ── Streaming events ─────────────────────────────────────────────────────

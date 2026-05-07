@@ -283,6 +283,11 @@ function onEnterConversationView() {
   // before the user types. View-enter never reverts to commander (see
   // `_evaluateAutoRecipient`); the persisted per-cid pick stays sticky.
   if (currentCid) _evaluateAutoRecipient(currentCid);
+  // Bind the plan rail to the active cid on EVERY conversation-view enter,
+  // including the `skipLoad: true` path used by fresh conversations (where
+  // loadConversationHistory is intentionally skipped). Without this hook,
+  // the rail would keep displaying the previous cid's plan content.
+  if (window.PlanRail) window.PlanRail.bind(currentCid || null);
 }
 
 // Called by queue-draft.js::_forgetConvLocal when a conv is deleted so we
@@ -1149,6 +1154,8 @@ async function loadConversationHistory(cid) {
   container.classList.remove('has-scroll-offset');
   container.innerHTML = `<div class="empty">${escapeHtml(t('chat.loading'))}</div>`;
   _ensureCreateAgentInlineObserver();
+  // (Plan rail bind happens in onEnterConversationView — covers both this
+  // load path AND the skipLoad freshly-created-conv path.)
   try {
     // Warm `_agentsCache` if a chat-first session never visited the agents
     // tab — `_buildMentionRe` / `_groupActorLabel` both read it for current
@@ -2926,6 +2933,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     // when an interactive agent's step enters in_progress, the user's next
     // reply should default to that agent without them having to @-mention.
     _evaluateAutoRecipient(cid);
+    if (window.PlanRail) window.PlanRail.refresh(cid);
   } else if (evData.type === 'state_changed') {
     // Each in_flight actor gets a placeholder so its delta tokens / tool
     // calls render in its own bubble even before its `message` arrives.
@@ -2945,6 +2953,11 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     // the auto-target so the chip matches the current dispatch state even
     // when a plan_changed event was missed (e.g. on first connect).
     _evaluateAutoRecipient(cid);
+    // Plan rail hides retry/skip/abort buttons whenever any worker is in
+    // flight (avoids racing user actions against an in-progress turn).
+    if (window.PlanRail) {
+      window.PlanRail.setInFlight(cid, Array.isArray(st.in_flight) ? st.in_flight : []);
+    }
   } else if (evData.type === 'aborted') {
     // Only drop EMPTY placeholders here (queued-but-not-yet-running workers
     // whose queue got cleared by bus.abort never fire runTurn → no follow-up

@@ -3769,6 +3769,142 @@ body.model-not-configured .main-content { flex-direction: column; }
 
 .btn-sm { padding: 4px 10px; font-size: 12px; }
 
+/* ────────────────────────────────────────────────────────────────────────
+   Plan rail — pinned to the LEFT of the .chat-input-overlay strip
+   (mirrors the workspace chip pinned right). Collapsed = a compact pill
+   chip sitting just above the input bubble; expanded = a fixed-width,
+   max-height panel that opens UPWARD over the chat history. The whole
+   header is the toggle. Status icon set is fixed; do not theme-swap.
+   See modules/plan-rail.js.
+   ──────────────────────────────────────────────────────────────────── */
+.plan-rail {
+  position: relative;          /* anchor for the absolute body */
+  flex: 0 0 auto;              /* leftmost item in chat-input-overlay flex row */
+  pointer-events: auto;        /* overlay parent has pointer-events:none */
+  font-size: 13px;
+  user-select: none;
+  z-index: 11;                 /* above chat-input-wrapper (z:10) */
+}
+.plan-rail-header {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+  cursor: pointer;
+  font-weight: 500;
+  transition: box-shadow 0.15s, background 0.15s;
+}
+.plan-rail-header:hover { background: #f8fafc; box-shadow: 0 2px 6px rgba(15, 23, 42, 0.12); }
+.plan-rail-title { flex: 0 0 auto; }
+.plan-rail-progress {
+  flex: 0 0 auto;
+  color: var(--text);
+  opacity: 0.55;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+.plan-rail-toggle {
+  margin-left: 2px;
+  font-size: 11px;
+  color: var(--text);
+  opacity: 0.55;
+  pointer-events: none; /* the whole header handles the click */
+}
+.plan-rail-body {
+  position: absolute;
+  bottom: calc(100% + 6px);    /* opens UPWARD from the chip */
+  left: 0;
+  width: 380px;
+  max-width: calc(100vw - 48px);
+  max-height: 50vh;
+  overflow-y: auto;
+  padding: 8px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 6px 20px rgba(15, 23, 42, 0.12);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.plan-rail.is-collapsed .plan-rail-body { display: none; }
+
+/* Two-row step layout: row 1 is icon + num + title (title may wrap so
+   long Chinese sentences keep readable); row 2 is the assignee chip
+   indented under the title. Reason / actions stack below in their own
+   blocks. Avoids the title-vs-assignee column squish. */
+.plan-rail-step {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.plan-rail-step:hover { background: rgba(148, 163, 184, 0.08); }
+.plan-rail-step-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.plan-rail-step-icon { font-size: 14px; line-height: 1; flex: 0 0 auto; }
+.plan-rail-step-num {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.6;
+  flex: 0 0 auto;
+}
+.plan-rail-step-title {
+  color: var(--text);
+  flex: 1 1 auto;
+  word-break: break-word;
+  line-height: 1.4;
+}
+.plan-rail-step-transient {
+  font-size: 12px;
+  color: var(--text);
+  opacity: 0.7;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+/* Assignee on its own line, indented under the title text (icon + num
+   take ~32px). Smaller font, primary color, single line with ellipsis. */
+.plan-rail-step-meta {
+  margin-left: 32px;
+  font-size: 11px;
+  color: var(--primary);
+  opacity: 0.8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.plan-rail-step-reason {
+  margin-left: 32px;
+  font-size: 12px;
+  color: var(--danger);
+  opacity: 0.85;
+  word-break: break-word;
+}
+.plan-rail-step-actions {
+  margin-left: 32px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 4px;
+}
+
+/* Per-status accents — only on the title to avoid icon recoloring (the
+   emoji carries its own color). */
+.plan-rail-step.is-done    .plan-rail-step-title { opacity: 0.65; text-decoration: line-through; text-decoration-color: rgba(0,0,0,0.2); }
+.plan-rail-step.is-skipped .plan-rail-step-title { opacity: 0.55; }
+.plan-rail-step.is-failed  .plan-rail-step-title { color: var(--danger); }
+.plan-rail-step.is-blocked .plan-rail-step-title { color: var(--text); /* neutral — the 📝 icon already conveys "awaiting input" */ }
+.plan-rail-step.is-in_progress .plan-rail-step-title { color: var(--primary); font-weight: 500; }
+
 /* Detail-page action button row (shared across skills / agents / contexts).
    `margin-left: auto` keeps buttons right-aligned even after flex-wrap. */
 .detail-actions {

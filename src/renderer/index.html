@@ -102,6 +102,18 @@
                    pinned right. Chip stays anchored to input-area's top
                    regardless of attachment count. -->
               <div class="chat-input-overlay">
+                <!-- Plan rail floats at left, mirroring the workspace chip
+                     on the right. Self-hides when current cid has no plan.
+                     Expanded body opens UPWARD (bottom: 100%) over the
+                     chat-history. See modules/plan-rail.js. -->
+                <div id="plan-rail" class="plan-rail" style="display:none">
+                  <div class="plan-rail-header" data-i18n-title="plan.toggle_title" title="折叠/展开">
+                    <span class="plan-rail-title">📋 <span data-i18n="plan.title">执行计划</span></span>
+                    <span class="plan-rail-progress" id="plan-rail-progress"></span>
+                    <span class="plan-rail-toggle" id="plan-rail-toggle">▴</span>
+                  </div>
+                  <div class="plan-rail-body" id="plan-rail-body"></div>
+                </div>
                 <div class="chat-attachments" id="chat-attachments" style="display:none"></div>
                 <div class="chat-input-toolbar"></div>
               </div>
@@ -703,6 +715,7 @@
   <script src="./modules/chat-input-form.js"></script>
   <script src="./modules/chat-lightbox.js"></script>
   <script src="./modules/conversation.js"></script>
+  <script src="./modules/plan-rail.js"></script>
   <script src="./modules/queue-draft.js"></script>
   <script src="./modules/skills.js"></script>
   <script src="./modules/contexts.js"></script>
