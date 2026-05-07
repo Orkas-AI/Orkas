@@ -85,13 +85,21 @@ function _render(plan) {
   const body = document.getElementById('plan-rail-body');
   const progress = document.getElementById('plan-rail-progress');
   if (!root || !body || !progress) return;
+  // Mirror visibility onto the wrapper so .chat-queue can reserve left-side
+  // room for the rail's pill chip (chip floats above the input bubble's
+  // left shoulder; without this the queue panel's bottom-left would
+  // overlap the chip — symmetric to the workspace-chip reservation on the
+  // right).
+  const wrap = root.closest('.chat-input-wrapper');
   if (!plan || !Array.isArray(plan.steps) || plan.steps.length === 0) {
     root.style.display = 'none';
     body.innerHTML = '';
     progress.textContent = '';
+    if (wrap) wrap.classList.remove('has-plan-rail');
     return;
   }
   root.style.display = '';
+  if (wrap) wrap.classList.add('has-plan-rail');
   progress.textContent = _buildProgressText(plan);
   body.innerHTML = plan.steps.map(_buildStepHtml).join('');
 }

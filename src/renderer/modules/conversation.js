@@ -1798,8 +1798,15 @@ function _makeConvChatController(cid) {
       },
       onDone(_msgEl, id) {
         // Unconditional cleanup — safe even if polling already resolved.
+        // `_finishStreamingMsg` synchronously drains the next queued
+        // message (via `_dispatchNextQueued` → new `ctrl.send`), which
+        // appends the user bubble + RE-ARMS the scroll-pin spacer for the
+        // new turn. We must NOT call `_setChatScrollOffset(false)` here —
+        // the controller finally block already removed the OLD spacer
+        // before invoking us, so a second removal would strip the spacer
+        // the new turn just added and the queued user message would render
+        // off-screen until later layout shifts pushed it into view.
         _finishStreamingMsg(id);
-        _setChatScrollOffset(false);
         // Only drop the map entry if it still refers to *this* controller.
         // On abort we dispatch the next queued message synchronously from
         // `onAbort`, which assigns a new controller into `_convChatCtrls`

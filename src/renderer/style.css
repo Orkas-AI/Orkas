@@ -1714,11 +1714,18 @@ body.model-not-configured .main-content { flex-direction: column; }
 .chat-send-btn.streaming .send-icon { display: none; }
 .chat-send-btn.streaming .stop-icon { display: block; }
 
-/* Queue panel above the input area */
+/* Queue panel above the input area.
+   Aligned with .chat-input-area's centered 80% layout BUT with the right
+   edge shrunken to clear the workspace chip floating above the input
+   bubble (chip is anchored to input-area's right shoulder, up to ~218px
+   wide; without this it overlaps the queue's bottom-right corner). The
+   shared `--ws-chip-reserve` lives next to `.chat-input-overlay` so any
+   future chip-width tweak only needs one site update. */
 .chat-queue {
   pointer-events: auto;
-  max-width: 80%;
-  margin: 0 auto 8px;
+  width: 80%;
+  max-width: max(160px, calc(80% - var(--ws-chip-reserve, 232px)));
+  margin: 0 0 8px 10%;
   background: rgba(255, 255, 255, 0.96);
   backdrop-filter: blur(6px);
   border: 1px solid var(--border);
@@ -1727,11 +1734,27 @@ body.model-not-configured .main-content { flex-direction: column; }
   box-shadow: 0 6px 20px rgba(15, 23, 42, 0.08);
 }
 
+/* Plan-rail pill chip floats above the input bubble's LEFT shoulder, the
+   mirror of the workspace chip on the right. When a plan exists,
+   plan-rail.js stamps `has-plan-rail` on .chat-input-wrapper; reserve
+   ~188px on the queue's left so the chip clears the queue's bottom-left.
+   Symmetric to the right-side workspace reserve above. */
+.chat-input-wrapper.has-plan-rail .chat-queue {
+  margin-left: calc(10% + var(--plan-rail-reserve, 188px));
+  max-width: max(
+    120px,
+    calc(80% - var(--ws-chip-reserve, 232px) - var(--plan-rail-reserve, 188px))
+  );
+}
+
 /* Narrower panels (skill / agent edit) don't have the 80%-centered shape
    of the main chat input; let the queue span the full panel width so it
-   aligns with the message list / input above. */
+   aligns with the message list / input above. They also have no
+   workspace chip floating above the input area, so no right-side
+   reservation is needed. */
 .skills-chat-col .chat-queue,
 .agents-chat-col .chat-queue {
+  width: auto;
   max-width: none;
   margin: 0 12px 8px;
 }
