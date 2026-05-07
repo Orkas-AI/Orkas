@@ -1,24 +1,76 @@
 // ─── Local CLI agents (renderer side) ─────────────────────────────────
 //
-// One dropdown in the create-agent modal:
-//   Orkas (default, in-process) | Claude Code | Codex | OpenClaw | OpenCode | Hermes
-// Anything not detected on this machine is omitted from the list.
+// Two surfaces share this module:
+//   1. The agent-modal "外接" tab — selector lists every detected CLI
+//      (default: 未选择). Selecting one auto-fills name + description
+//      from CLI_DEFAULTS so a single click is enough to ship an
+//      external-agent shell.
+//   2. The agent-detail runtime selector (existing CLI-bound agents)
+//      lives in agents.js; this module just supplies the registry list.
 //
-// Model + custom_args are intentionally NOT exposed in the modal — the
-// CLI picks its own default model (closer to what the user's account
-// actually supports), and most users never need extra flags. The spec
-// still supports both fields; advanced users can hand-edit `agent.json`
-// or we add a "details" toggle later when there's real demand.
+// CLI_DEFAULTS holds the bilingual seed values used by both create
+// and edit. `description_zh` + `description_en` are stored side-by-
+// side on the agent so locale switches are zero-cost; `name` is a
+// single brand label (the user can rename to disambiguate two
+// instances of the same CLI bound to different project_dirs).
 //
-// Detection pre-warms 500ms after the first agents-page render so the
-// 60s registry cache is warm by the time the user opens the modal —
-// the first cold detection runs `which` + `--version` for each CLI in
-// parallel and can take ~200ms; this avoids the layout-shift flash
-// that comes from awaiting it inside `openAgentModal`.
+// Detection pre-warms 500ms after script load so the first modal
+// open doesn't pay the cold detection cost.
 
 const _localAgentsLog = createLogger('local-agents');
 
-let _localCliEntries = null;          // cached availability list
+// Single source of truth for default name + description per CLI type.
+// English-source (per CLAUDE.md "English-only project text") with the
+// Chinese variant carried alongside for the agent description pair.
+const CLI_DEFAULTS = {
+  claude: {
+    name: 'Claude Code',
+    description_zh: 'Anthropic 出品的本地编码智能体 CLI，擅长代码理解、重构与多文件改动；支持工程上下文感知、工具调用与流式回复。',
+    description_en: "Anthropic's local coding agent CLI — strong at code understanding, refactoring, and multi-file edits; project-aware context, tool use, streaming output.",
+    isCoding: true,
+  },
+  codex: {
+    name: 'Codex',
+    description_zh: 'OpenAI 出品的本地编码智能体 CLI，擅长代码生成与补丁式改写；支持沙箱执行与会话续接。',
+    description_en: "OpenAI's local coding agent CLI — strong at code generation and patch-style edits; sandboxed execution and session resume.",
+    isCoding: true,
+  },
+  openclaw: {
+    name: 'OpenClaw',
+    description_zh: '开源多模型聚合智能体 CLI，可在多家模型/工具间切换；适合通用任务编排与轻量自动化。',
+    description_en: 'Open-source multi-model agent CLI; routes across providers and tools — good for general orchestration and lightweight automation.',
+    isCoding: false,
+  },
+  opencode: {
+    name: 'OpenCode',
+    description_zh: '开源编码智能体 CLI，支持多模型切换;侧重代码生成、文件改写与终端任务。',
+    description_en: 'Open-source coding agent CLI with multi-model support; focused on code generation, file editing, and terminal tasks.',
+    isCoding: false,
+  },
+  hermes: {
+    name: 'Hermes',
+    description_zh: '通过 ACP 协议接入的智能体 CLI，可执行多步任务与工具调用；以会话粒度协同。',
+    description_en: 'Agent CLI integrated over the ACP protocol; runs multi-step tasks with tool use; session-scoped collaboration.',
+    isCoding: false,
+  },
+};
+
+/** Defaults for a given CLI type, or null when the type is unknown. */
+function getCliDefaults(cliType) {
+  return cliType && Object.prototype.hasOwnProperty.call(CLI_DEFAULTS, cliType)
+    ? CLI_DEFAULTS[cliType]
+    : null;
+}
+
+/** True when the CLI is one of claude / codex (the coding agents that
+ *  expose a project-dir form input). Mirrors `cliSupportsProjectDir`
+ *  in features/agents.ts — keep in sync. */
+function cliIsCodingAgent(cliType) {
+  const d = getCliDefaults(cliType);
+  return !!(d && d.isCoding);
+}
+
+let _localCliEntries = null;
 
 async function loadLocalCliEntries({ force = false } = {}) {
   if (_localCliEntries && !force) return _localCliEntries;
@@ -32,69 +84,73 @@ async function loadLocalCliEntries({ force = false } = {}) {
   return _localCliEntries;
 }
 
-let _runtimeSelectApi = null;
+// ── External-tab CLI selector (create modal) ───────────────────────────
+//
+// Sentinel value for "未选择" — distinct from empty string so a user who
+// genuinely empties the selector still re-routes through this branch.
+const EXT_CLI_NONE = '__none__';
+
+let _extCliSelectApi = null;
 
 /**
- * Render the runtime selector inside the create-agent modal.
- * - No CLIs detected → row stays hidden, selector treated as Orkas.
- * - At least one detected → fills with "Orkas" (default) + each
- *   available CLI; defaults to Orkas.
- * Idempotent: calling again rebuilds the row from current detection.
+ * Mount the External-tab CLI selector. Default option is 未选择;
+ * detected CLIs follow. `onChange` fires with the chosen `LocalCliType`
+ * (string) or null when the user reverts to 未选择 — agents.js wires
+ * this to the auto-fill / project-dir-row toggling logic.
+ *
+ * Idempotent: re-mounting just resets options + value so a re-open of
+ * the modal picks up newly-installed CLIs.
  */
-async function mountLocalAgentRuntimeRow() {
-  const row = document.getElementById('agent-modal-runtime-row');
-  const mount = document.getElementById('agent-modal-runtime-select');
-  if (!row || !mount) return false;
-
+async function mountExternalCliSelect(onChange) {
+  const mount = document.getElementById('agent-modal-ext-cli-select');
+  if (!mount) return null;
   const entries = await loadLocalCliEntries();
   const available = entries.filter(e => e.available);
-  if (available.length === 0) {
-    row.style.display = 'none';
-    if (_runtimeSelectApi) _runtimeSelectApi.setOptions([], { value: 'in_process' });
-    return false;
-  }
-
-  row.style.display = '';
+  const noneLabel = t('agent_modal.ext_cli_none') || '未选择';
   const options = [
-    { value: 'in_process', label: t('agent_modal.runtime_in_process') },
+    { value: EXT_CLI_NONE, label: noneLabel },
     ...available.map(e => ({
-      value: `cli:${e.type}`,
-      label: `${t('agent_modal.runtime_cli_' + e.type)}${e.version ? ` (${e.version})` : ''}`,
+      value: e.type,
+      label: `${(getCliDefaults(e.type)?.name) || e.type}${e.version ? ` (${e.version})` : ''}`,
     })),
   ];
-  // Mount once, re-set options on subsequent opens. Keeps the API
-  // instance stable so `getRuntimeFormValue` reads the same widget.
-  if (!_runtimeSelectApi) {
-    _runtimeSelectApi = _aiSelectMount(mount, {
-      options, value: 'in_process',
-      placeholder: t('agent_modal.runtime_in_process'),
-      onChange: () => { /* read on save */ },
+  const handleChange = (v) => {
+    const cli = (!v || v === EXT_CLI_NONE) ? null : v;
+    if (typeof onChange === 'function') onChange(cli);
+  };
+  if (!_extCliSelectApi) {
+    _extCliSelectApi = _aiSelectMount(mount, {
+      options, value: EXT_CLI_NONE,
+      placeholder: noneLabel,
+      onChange: handleChange,
     });
   } else {
-    _runtimeSelectApi.setOptions(options, { value: 'in_process' });
+    _extCliSelectApi.setOptions(options, { value: EXT_CLI_NONE });
   }
-  return true;
+  return _extCliSelectApi;
 }
 
-/**
- * Read the current selector state into a runtime spec, or null when
- * the user kept "Orkas" (so the caller doesn't write a runtime field
- * at all and the agent stays in-process by default). Model + custom
- * args are not collected here — backends fall back to their own
- * defaults, which is usually what users want.
- */
-function getRuntimeFormValue() {
-  const v = _runtimeSelectApi ? _runtimeSelectApi.getValue() : 'in_process';
-  if (!v || v === 'in_process') return null;
-  const m = /^cli:(.+)$/.exec(v);
-  if (!m) return null;
-  return { kind: 'cli', cli: m[1] };
+/** Read the currently-selected CLI type from the External tab, or null
+ *  when the user kept "未选择". */
+function getExternalCliValue() {
+  const v = _extCliSelectApi ? _extCliSelectApi.getValue() : EXT_CLI_NONE;
+  if (!v || v === EXT_CLI_NONE) return null;
+  return v;
 }
 
-// Pre-warm the registry cache shortly after script load so the first
-// modal open doesn't pay the cold detection cost. Fire-and-forget.
+/** Programmatically set the External-tab selector (used by edit form
+ *  to seed from the bound CLI). Pass null to revert to 未选择. */
+function setExternalCliValue(cliType) {
+  if (!_extCliSelectApi) return;
+  _extCliSelectApi.setValue(cliType || EXT_CLI_NONE);
+}
+
+// Pre-warm the registry cache.
 setTimeout(() => { loadLocalCliEntries().catch(() => { /* warm-up best-effort */ }); }, 500);
 
-window.mountLocalAgentRuntimeRow = mountLocalAgentRuntimeRow;
-window.getRuntimeFormValue = getRuntimeFormValue;
 window.loadLocalCliEntries = loadLocalCliEntries;
+window.getCliDefaults = getCliDefaults;
+window.cliIsCodingAgent = cliIsCodingAgent;
+window.mountExternalCliSelect = mountExternalCliSelect;
+window.getExternalCliValue = getExternalCliValue;
+window.setExternalCliValue = setExternalCliValue;

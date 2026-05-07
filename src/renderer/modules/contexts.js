@@ -247,6 +247,9 @@ function _bindCtxTreeHandlers(container) {
       await _commitInlineRename(rel, next);
     };
     input.addEventListener('keydown', (e) => {
+      // IME guard (CLAUDE.md §8) — Enter while composing should commit
+      // the candidate to the rename input, not finalise the rename.
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === 'Enter') { e.preventDefault(); commit(true); }
       else if (e.key === 'Escape') { e.preventDefault(); commit(false); }
     });

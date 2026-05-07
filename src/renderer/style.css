@@ -1483,6 +1483,7 @@ body.model-not-configured .main-content { flex-direction: column; }
   position: relative;
 }
 
+
 /* Inline "创建智能体" entry pinned to the end of #chat-history — divider
    lines on both sides with a small button in the middle. Hidden during
    streaming via inline display:none toggled in conversation.js. */
@@ -2148,6 +2149,26 @@ body.model-not-configured .main-content { flex-direction: column; }
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+.chat-input-form .form-field-dir {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.chat-input-form .form-field-dir-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text);
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-input-form .form-field-dir-path.is-empty {
+  font-family: inherit;
+  color: var(--muted);
 }
 .chat-input-form .form-field-file-chips {
   display: flex;

@@ -283,7 +283,7 @@
               </div>
               <div class="agents-detail-body">
                 <div class="agents-detail-section" id="agents-detail-runtime-section" style="display:none">
-                  <div class="agents-detail-label" data-i18n="agents.label_runtime">运行环境</div>
+                  <div class="agents-detail-label" data-i18n="agents.label_runtime">外接智能体</div>
                   <div class="agents-detail-runtime" id="agents-detail-runtime"></div>
                 </div>
                 <div class="agents-detail-section">
@@ -508,18 +508,47 @@
   <div class="modal-overlay" id="agent-modal">
     <div class="modal">
       <h3 data-i18n="agent_modal.title">新建智能体</h3>
-      <div class="form-row">
-        <label data-i18n="agent_modal.name">名称</label>
-        <input type="text" id="agent-name-input" data-i18n-placeholder="agent_modal.name_placeholder" placeholder="例如：代码审查助手" />
+
+      <!-- Mode tabs: 创建 (in-process) / 外接 (cli runtime). Mirrors the
+           skill-modal tab pattern; reuses the same .skill-modal-tab styles
+           via the agent-modal-tab class for consistent chrome. -->
+      <div class="skill-modal-tabs" id="agent-modal-tabs">
+        <button type="button" class="skill-modal-tab is-active" data-agent-tab="create" data-i18n="agent_modal.tab_create">创建</button>
+        <button type="button" class="skill-modal-tab" data-agent-tab="external" data-i18n="agent_modal.tab_external">外接</button>
       </div>
-      <div class="form-row">
-        <label><span data-i18n="agent_modal.desc">简介</span> <span class="form-hint" data-i18n="agent_modal.desc_hint">一句话说明用途，创建后 AI 会基于此生成工作流程</span></label>
-        <textarea id="agent-desc-input" rows="4" data-i18n-placeholder="agent_modal.desc_placeholder" placeholder="例如：帮我在提交前审查代码，重点看逻辑漏洞和安全问题..."></textarea>
+
+      <!-- Create panel (default): manual authoring. Runtime selector is
+           intentionally absent here — that flow lives in the External tab. -->
+      <div class="skill-modal-panel is-active" data-agent-panel="create">
+        <div class="form-row">
+          <label data-i18n="agent_modal.name">名称</label>
+          <input type="text" id="agent-name-input" data-i18n-placeholder="agent_modal.name_placeholder" placeholder="例如：代码审查助手" />
+        </div>
+        <div class="form-row">
+          <label><span data-i18n="agent_modal.desc">简介</span> <span class="form-hint" data-i18n="agent_modal.desc_hint">一句话说明用途，创建后 AI 会基于此生成工作流程</span></label>
+          <textarea id="agent-desc-input" rows="4" data-i18n-placeholder="agent_modal.desc_placeholder" placeholder="例如：帮我在提交前审查代码，重点看逻辑漏洞和安全问题..."></textarea>
+        </div>
       </div>
-      <div class="form-row" id="agent-modal-runtime-row" style="display:none">
-        <label><span data-i18n="agent_modal.runtime_label">运行环境</span> <span class="form-hint" data-i18n="agent_modal.runtime_hint">选择本地 CLI 则由该 CLI 来运行智能体</span></label>
-        <div class="ai-select" id="agent-modal-runtime-select"></div>
+
+      <!-- External panel: bind a local CLI as the runtime. CLI selector
+           appears first; name + description are pre-filled from the chosen
+           CLI's defaults but stay editable. claude / codex additionally
+           expose a project-directory input. -->
+      <div class="skill-modal-panel" data-agent-panel="external">
+        <div class="form-row">
+          <label data-i18n="agent_modal.ext_cli_label">智能体</label>
+          <div class="ai-select" id="agent-modal-ext-cli-select"></div>
+        </div>
+        <div class="form-row">
+          <label data-i18n="agent_modal.ext_name">名称</label>
+          <input type="text" id="agent-ext-name-input" data-i18n-placeholder="agent_modal.ext_name_placeholder" placeholder="例如：Claude Code" />
+        </div>
+        <div class="form-row">
+          <label data-i18n="agent_modal.ext_desc">简介</label>
+          <textarea id="agent-ext-desc-input" rows="4" data-i18n-placeholder="agent_modal.ext_desc_placeholder" placeholder="（选择 CLI 后自动填入，可手动覆盖）"></textarea>
+        </div>
       </div>
+
       <div class="form-msg" id="agent-form-msg"></div>
       <div class="modal-actions">
         <button class="btn" onclick="closeAgentModal()" data-i18n="common.cancel">取消</button>

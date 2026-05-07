@@ -464,8 +464,16 @@ function _settingsShowApiKeyForm(provider, modelId) {
     await _settingsReload();
   };
   saveBtn.onclick = save;
-  labelInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { keyInput.focus(); e.preventDefault(); } });
-  keyInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { save(); e.preventDefault(); } });
+  // IME guard (CLAUDE.md §8): Enter on these inputs advances focus / saves;
+  // skip while a Chinese / Japanese / Korean candidate is being composed.
+  labelInput.addEventListener('keydown', (e) => {
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === 'Enter') { keyInput.focus(); e.preventDefault(); }
+  });
+  keyInput.addEventListener('keydown', (e) => {
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === 'Enter') { save(); e.preventDefault(); }
+  });
 
   actions.appendChild(cancelBtn);
   actions.appendChild(saveBtn);
@@ -603,7 +611,10 @@ function _oauthFlowRender(provider, status, closeFlow) {
         await window.orkas.invoke('auth.submitOAuthInput', { flowId: _oauthFlowId, value: val });
       };
       body.querySelector('.oauth-manual-submit-btn').onclick = submit;
-      input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { submit(); e.preventDefault(); } });
+      input.addEventListener('keydown', (e) => {
+        if (e.isComposing || e.keyCode === 229) return;
+        if (e.key === 'Enter') { submit(); e.preventDefault(); }
+      });
     }
     return;
   }
@@ -629,7 +640,10 @@ function _oauthFlowRender(provider, status, closeFlow) {
       await window.orkas.invoke('auth.submitOAuthInput', { flowId: _oauthFlowId, value: val });
     };
     body.querySelector('.oauth-submit-btn').onclick = submit;
-    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { submit(); e.preventDefault(); } });
+    input.addEventListener('keydown', (e) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === 'Enter') { submit(); e.preventDefault(); }
+    });
     setTimeout(() => input.focus(), 0);
     return;
   }

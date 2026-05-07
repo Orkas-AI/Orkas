@@ -9,14 +9,18 @@ let _agentFieldSaveTimer = null;
 // Mirror of `agents.ts::RESERVED_AGENT_NAMES` so the renderer can fail fast
 // without a round-trip. Server is still authoritative — this is just UX.
 const _RESERVED_AGENT_NAMES = new Set(['指挥官', '总指挥', 'commander']);
-/** Look up the localized "CLI · <Brand>" label for an agent runtime
- *  type, with a guaranteed-readable fallback when the locale key is
- *  missing. Orkas's `t()` returns the key itself on miss (so a naive
- *  `t(key) || fallback` never falls back); we explicitly compare. */
+/** Look up the localized "外接 · <Brand>" label for an agent runtime
+ *  type. The external badge (formerly "CLI · X") is the single
+ *  user-facing tag for cli-runtime agents — name surfaces consistently
+ *  in cards, detail page, and edit form. */
 function _cliBadgeLabel(type) {
-  const key = 'agent.cli_badge.' + type;
+  const key = 'agent.external_badge.' + type;
   const v = t(key);
-  if (!v || v === key) return 'CLI · ' + type;
+  if (!v || v === key) {
+    const externalWord = t('agent.external_word');
+    const word = (externalWord && externalWord !== 'agent.external_word') ? externalWord : 'External';
+    return word + ' · ' + type;
+  }
   return v;
 }
 
@@ -511,11 +515,46 @@ async function _renderAgentDetailRuntime(agent) {
     onChange: async (next) => {
       const m = /^cli:(.+)$/.exec(next);
       if (!m) return;
+      const newCli = m[1];
+      // Mirror the create-modal behaviour: if the user's current name /
+      // description are still the defaults of the previous CLI (or empty),
+      // follow the new CLI's defaults. Otherwise, leave their edits alone.
+      const updates = { runtime: { kind: 'cli', cli: newCli } };
+      const lang = (typeof getLang === 'function') ? getLang() : 'zh';
+      const prev = (typeof getCliDefaults === 'function') ? getCliDefaults(currentType) : null;
+      const next2 = (typeof getCliDefaults === 'function') ? getCliDefaults(newCli) : null;
+      const prevDescLocal = prev ? (lang === 'en' ? prev.description_en : prev.description_zh) : '';
+      const curName = (agent.name || '').trim();
+      const curDescLocal = pickDesc(agent, lang).trim();
+      // Same default-like detection as the create modal: bare default OR
+      // dedup-style "<default> 2" / "(2)" suffixes count as untouched.
+      const nameUntouched = _isDefaultlikeName(curName, prev?.name);
+      const descUntouched = !curDescLocal || (prev && curDescLocal === prevDescLocal);
+      if (next2 && nameUntouched) updates.name = next2.name;
+      if (next2) {
+        if (descUntouched) {
+          updates.description_zh = next2.description_zh;
+          updates.description_en = next2.description_en;
+        }
+      }
       try {
         const res = await window.orkas.invoke('agents.update', {
-          agent_id: agent.agent_id, updates: { runtime: { kind: 'cli', cli: m[1] } },
+          agent_id: agent.agent_id, updates,
         });
         if (res?.ok && res.agent) {
+          _agentsCache = null;
+          const fetched = await apiFetch(`/api/agents/${encodeURIComponent(agent.agent_id)}`);
+          const data = await fetched.json();
+          if (data.ok && data.agent) _renderAgentDetail(data.agent, _agentEditing);
+        } else if (res?.code === 'E_AGENT_NAME_TAKEN') {
+          // Name we tried to auto-apply already belongs to another
+          // agent. Re-issue the update without the name override so
+          // the runtime swap still goes through.
+          const safeUpdates = { ...updates };
+          delete safeUpdates.name;
+          await window.orkas.invoke('agents.update', {
+            agent_id: agent.agent_id, updates: safeUpdates,
+          });
           _agentsCache = null;
           const fetched = await apiFetch(`/api/agents/${encodeURIComponent(agent.agent_id)}`);
           const data = await fetched.json();
@@ -619,9 +658,19 @@ async function _enterAgentEditMode() {
   const res = await apiFetch(`/api/agents/${encodeURIComponent(_selectedAgent.id)}`);
   const data = await res.json();
   if (data.ok && data.agent) _renderAgentDetail(data.agent, true);
-  document.getElementById('agents-chat-col').style.display = '';
-  await _loadAgentChatHistory(_selectedAgent.id);
-  setTimeout(() => document.getElementById('agents-chat-input')?.focus(), 50);
+  // External (cli-runtime) agents have no LLM-driven authoring — the
+  // CLI brings its own behaviour, and the edit chat would just sit
+  // empty. Hide the chat column so the user only sees the manual
+  // name + description editors. In-process agents keep the chat.
+  const isExternal = !!(data.ok && data.agent && data.agent.runtime?.kind === 'cli');
+  const chatCol = document.getElementById('agents-chat-col');
+  if (chatCol) chatCol.style.display = isExternal ? 'none' : '';
+  if (!isExternal) {
+    await _loadAgentChatHistory(_selectedAgent.id);
+    setTimeout(() => document.getElementById('agents-chat-input')?.focus(), 50);
+  } else {
+    setTimeout(() => document.getElementById('agents-detail-name')?.focus(), 50);
+  }
   // Wire field blur-save (one-time attach)
   _bindAgentFieldSave();
 }
@@ -689,7 +738,12 @@ async function _flushAgentFieldSave() {
       body: JSON.stringify({ [field]: value }),
     });
     const data = await res.json();
-    if (!data.ok) throw new Error(data.error || 'save failed');
+    if (!data.ok) {
+      // Surface duplicate-name / reserved-name with their localised messages
+      // instead of the raw English server text.
+      const localised = _agentCreateErrorMessage(data);
+      throw new Error(localised || data.error || 'save failed');
+    }
     // Eagerly refresh — name changes feed the chat-bubble @-mention regex
     // (`_buildMentionRe` reads `_agentsCache`); leaving the cache null until
     // the next picker open means freshly-typed `@<multi-word-name>` only
@@ -712,24 +766,133 @@ async function _flushAgentFieldSave() {
   }
 }
 
-// ─── Create agent (modal-first, mirrors skill flow) ───
+// ─── Create agent (modal-first, two tabs: 创建 / 外接) ───
+//
+// "创建" (default tab) — manual authoring of an in-process agent. The
+// LLM-driven edit chat opens immediately on save so the workflow can
+// be refined.
+//
+// "外接" — bind a local CLI as the runtime. CLI selector is at the top
+// (default 未选择); selecting a CLI auto-fills name + description from
+// CLI_DEFAULTS. The user can override either; subsequent CLI swaps
+// only re-fill fields that still match the previous CLI's defaults
+// (so a user-edited value is never clobbered).
+//
+// Track the last-applied CLI defaults so that "switch CLI → fields
+// follow" can detect "did the user touch this field?". `null` =
+// nothing applied yet (untouched-default state, or 创建 tab).
+
+function _switchAgentTab(tab) {
+  const tabs = document.querySelectorAll('#agent-modal-tabs [data-agent-tab]');
+  tabs.forEach((el) => el.classList.toggle('is-active', el.dataset.agentTab === tab));
+  const panels = document.querySelectorAll('#agent-modal [data-agent-panel]');
+  panels.forEach((el) => el.classList.toggle('is-active', el.dataset.agentPanel === tab));
+  const msgEl = document.getElementById('agent-form-msg');
+  if (msgEl) { msgEl.textContent = ''; msgEl.className = 'form-msg'; }
+  setTimeout(() => {
+    const focusId = tab === 'external' ? 'agent-modal-ext-cli-select' : 'agent-name-input';
+    const el = document.getElementById(focusId);
+    // ai-select wrapper isn't focusable directly; just leave it alone.
+    if (el && typeof el.focus === 'function' && el.tagName !== 'DIV') el.focus();
+  }, 30);
+}
+window._switchAgentTab = _switchAgentTab;
+
+// Track which CLI defaults are currently reflected in the External-tab
+// inputs. When a user types over a default, the field key drops out of
+// this set so subsequent CLI swaps don't overwrite the typed value.
+let _extActiveCli = null;
+let _extDefaultFieldsAtMount = { name: false, desc: false };
+
+/** Decide whether a current `name` value still counts as "the default
+ *  for `defaultName`" — meaning a CLI swap should overwrite it. We
+ *  recognise the bare default plus the dedup-style suffixes a user
+ *  is likely to add when fighting the name-taken error: "Claude Code",
+ *  "Claude Code 2", "Claude Code-2", "Claude Code (2)", etc. Anything
+ *  with non-digit text after the default ("Claude Code Pro") counts as
+ *  user-edited and is kept. */
+function _isDefaultlikeName(value, defaultName) {
+  if (!value) return true;
+  if (!defaultName) return false;
+  if (value === defaultName) return true;
+  const escaped = defaultName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp('^' + escaped + '\\s*(?:[-_]\\s*)?(?:\\(\\s*\\d+\\s*\\)|\\d+)$');
+  return re.test(value);
+}
+
+function _applyExternalCliDefaults(cliType, { force = false } = {}) {
+  const defaults = (typeof getCliDefaults === 'function') ? getCliDefaults(cliType) : null;
+  const nameEl = document.getElementById('agent-ext-name-input');
+  const descEl = document.getElementById('agent-ext-desc-input');
+  if (!nameEl || !descEl) return;
+
+  const lang = (typeof getLang === 'function') ? getLang() : 'zh';
+  const localizedDesc = defaults
+    ? (lang === 'en' ? defaults.description_en : defaults.description_zh)
+    : '';
+  const targetName = defaults ? defaults.name : '';
+  const targetDesc = localizedDesc;
+
+  // Decide per field whether to overwrite. The two checks are independent —
+  // a user who edits the name but leaves the description alone keeps their
+  // name and gets a refreshed description. "Default-like name" also covers
+  // dedup suffixes like "Claude Code 2" (added to dodge name-taken errors).
+  const prev = (typeof getCliDefaults === 'function') ? getCliDefaults(_extActiveCli) : null;
+  const prevDescLocalized = prev ? (lang === 'en' ? prev.description_en : prev.description_zh) : '';
+
+  const nameUntouched = force || _isDefaultlikeName(nameEl.value, prev?.name);
+  const descUntouched = force
+    || descEl.value === ''
+    || (prev && descEl.value === prevDescLocalized);
+
+  if (cliType === null) {
+    // Reverted to 未选择 — only clear fields that still hold the
+    // previous CLI's defaults. Keep user-typed text.
+    if (nameUntouched) nameEl.value = '';
+    if (descUntouched) descEl.value = '';
+  } else {
+    if (nameUntouched) nameEl.value = targetName;
+    if (descUntouched) descEl.value = targetDesc;
+  }
+  _extActiveCli = cliType;
+}
 
 function openAgentModal() {
   const modal = document.getElementById('agent-modal');
-  const nameInput = document.getElementById('agent-name-input');
-  const descInput = document.getElementById('agent-desc-input');
   const msgEl = document.getElementById('agent-form-msg');
-  nameInput.value = '';
-  descInput.value = '';
   msgEl.textContent = '';
   msgEl.className = 'form-msg';
-  // Refresh runtime selector each open — local CLI install state can
-  // change between opens (user installs claude during the session).
-  if (typeof mountLocalAgentRuntimeRow === 'function') {
-    mountLocalAgentRuntimeRow().catch(() => { /* falls through to hidden row */ });
+
+  // Reset both panels' inputs.
+  const nameInput = document.getElementById('agent-name-input');
+  const descInput = document.getElementById('agent-desc-input');
+  const extName = document.getElementById('agent-ext-name-input');
+  const extDesc = document.getElementById('agent-ext-desc-input');
+  if (nameInput) nameInput.value = '';
+  if (descInput) descInput.value = '';
+  if (extName) extName.value = '';
+  if (extDesc) extDesc.value = '';
+  _extActiveCli = null;
+  _extDefaultFieldsAtMount = { name: true, desc: true };
+
+  // Wire tabs (idempotent).
+  const tabBar = document.getElementById('agent-modal-tabs');
+  if (tabBar && !tabBar.dataset.wired) {
+    tabBar.querySelectorAll('[data-agent-tab]').forEach((btn) => {
+      btn.addEventListener('click', () => _switchAgentTab(btn.dataset.agentTab));
+    });
+    tabBar.dataset.wired = '1';
   }
+  _switchAgentTab('create');
+
+  // Refresh the External-tab CLI selector. Re-mount each open so newly-
+  // installed CLIs surface without an app restart.
+  if (typeof mountExternalCliSelect === 'function') {
+    mountExternalCliSelect((cli) => _applyExternalCliDefaults(cli)).catch(() => {});
+  }
+
   modal.classList.add('open');
-  setTimeout(() => nameInput.focus(), 50);
+  setTimeout(() => document.getElementById('agent-name-input')?.focus(), 50);
 }
 window.openAgentModal = openAgentModal;
 
@@ -739,9 +902,16 @@ function closeAgentModal() {
 window.closeAgentModal = closeAgentModal;
 
 async function saveAgentModal() {
+  const msgEl = document.getElementById('agent-form-msg');
+  const activeTab = document.querySelector('#agent-modal-tabs .is-active')?.dataset.agentTab || 'create';
+  if (activeTab === 'external') return _saveExternalAgent({ msgEl });
+  return _saveCreateAgent({ msgEl });
+}
+window.saveAgentModal = saveAgentModal;
+
+async function _saveCreateAgent({ msgEl }) {
   const name = document.getElementById('agent-name-input').value.trim();
   const description = document.getElementById('agent-desc-input').value.trim();
-  const msgEl = document.getElementById('agent-form-msg');
 
   if (!name) {
     msgEl.textContent = t('agents.input_name_needed');
@@ -763,12 +933,8 @@ async function saveAgentModal() {
   }
 
   try {
-    // 创建时本地随机一对头像，让每个新智能体一上来就有不同的视觉锚点。
-    // 不让 LLM 介入 —— 头像是 UI 元数据，不影响 prompt 行为。
     const avatar = randomAgentAvatar();
-    const runtime = (typeof getRuntimeFormValue === 'function') ? getRuntimeFormValue() : null;
     const body = { name, description, icon: avatar.icon, color: avatar.color };
-    if (runtime) body.runtime = runtime;
     const res = await apiFetch('/api/agents/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -776,7 +942,7 @@ async function saveAgentModal() {
     });
     const data = await res.json();
     if (!data.ok || !data.agent) {
-      msgEl.textContent = data.error || t('agents.create_failed');
+      msgEl.textContent = _agentCreateErrorMessage(data) || t('agents.create_failed');
       msgEl.className = 'form-msg err';
       return;
     }
@@ -785,8 +951,6 @@ async function saveAgentModal() {
     await loadAgents(true);
     await _showAgentsDetailView(data.agent.agent_id);
     await _enterAgentEditMode();
-    // Auto-seed: use the user's description as context for the LLM so it
-    // starts refining the workflow without the user having to restate it.
     const seed = t('agents.seed_workflow', { description });
     await _autoSendAgentChat(seed);
   } catch (e) {
@@ -794,7 +958,89 @@ async function saveAgentModal() {
     msgEl.className = 'form-msg err';
   }
 }
-window.saveAgentModal = saveAgentModal;
+
+async function _saveExternalAgent({ msgEl }) {
+  const cli = (typeof getExternalCliValue === 'function') ? getExternalCliValue() : null;
+  const name = document.getElementById('agent-ext-name-input').value.trim();
+  const desc = document.getElementById('agent-ext-desc-input').value.trim();
+
+  if (!cli) {
+    msgEl.textContent = t('agents.ext_cli_needed');
+    msgEl.className = 'form-msg err';
+    return;
+  }
+  if (!name) {
+    msgEl.textContent = t('agents.input_name_needed');
+    msgEl.className = 'form-msg err';
+    document.getElementById('agent-ext-name-input').focus();
+    return;
+  }
+  if (_isReservedAgentName(name)) {
+    msgEl.textContent = t('agents.name_reserved');
+    msgEl.className = 'form-msg err';
+    document.getElementById('agent-ext-name-input').focus();
+    return;
+  }
+  if (!desc) {
+    msgEl.textContent = t('agents.input_desc_needed');
+    msgEl.className = 'form-msg err';
+    document.getElementById('agent-ext-desc-input').focus();
+    return;
+  }
+
+  // Both `description_zh` + `description_en` are stored so locale switches
+  // are zero-cost. The locale we're currently editing in goes into that
+  // side; the other side gets the canonical CLI default. Users who want
+  // both fully-translated can edit each side later.
+  const defaults = (typeof getCliDefaults === 'function') ? getCliDefaults(cli) : null;
+  const lang = (typeof getLang === 'function') ? getLang() : 'zh';
+  const description_zh = lang === 'zh' ? desc : (defaults ? defaults.description_zh : desc);
+  const description_en = lang === 'en' ? desc : (defaults ? defaults.description_en : desc);
+
+  try {
+    const avatar = randomAgentAvatar();
+    const body = {
+      name,
+      description: desc,
+      description_zh, description_en,
+      icon: avatar.icon, color: avatar.color,
+      runtime: { kind: 'cli', cli },
+    };
+    const res = await apiFetch('/api/agents/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!data.ok || !data.agent) {
+      msgEl.textContent = _agentCreateErrorMessage(data) || t('agents.create_failed');
+      msgEl.className = 'form-msg err';
+      return;
+    }
+    closeAgentModal();
+    setView('agents');
+    await loadAgents(true);
+    // External agents go straight to the detail view but skip the LLM
+    // edit-chat — there's nothing to author. The user can still rename
+    // or reword the description through the inline name/desc editors.
+    await _showAgentsDetailView(data.agent.agent_id);
+  } catch (e) {
+    msgEl.textContent = t('agents.network_error', { reason: e.message || e });
+    msgEl.className = 'form-msg err';
+  }
+}
+
+/** Normalise IPC-shim error replies into a user-facing message. The
+ *  backend tags duplicate-name / reserved-name failures with a `code`
+ *  so we surface the localised string instead of the raw "agent name
+ *  ... is already in use" English text. */
+function _agentCreateErrorMessage(data) {
+  if (!data) return '';
+  const code = data.code;
+  if (code === 'E_AGENT_NAME_TAKEN') return t('agents.name_taken');
+  if (code === 'E_AGENT_NAME_RESERVED') return t('agents.name_reserved');
+  return data.error || '';
+}
 
 async function _autoSendAgentChat(content) {
   if (!_selectedAgent) return;
@@ -1182,6 +1428,11 @@ function bindAgentPickers() {
     _renderAgentPickerList(searchInput.value);
   });
   searchInput?.addEventListener('keydown', (e) => {
+    // IME composition guard (CLAUDE.md §8): Enter / Arrow keys belong to
+    // the IME while a Chinese / Japanese / Korean candidate is being
+    // composed; without this early-return, pressing Enter to commit an
+    // English candidate would also fire our select-active-item handler.
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Escape') { _atKeyMark = null; _closeAgentPicker(); e.preventDefault(); return; }
     if (e.key === 'ArrowDown') { _moveAgentPickerActive(1); e.preventDefault(); return; }
     if (e.key === 'ArrowUp')   { _moveAgentPickerActive(-1); e.preventDefault(); return; }

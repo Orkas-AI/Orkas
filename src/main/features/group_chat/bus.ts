@@ -36,7 +36,7 @@ import {
 import {
   resolveRecipients, parseMentions,
   extractFormFromFinal, computeFormId, ChatFormPayload,
-  extractAgentFieldBlocks,
+  extractAgentFieldBlocks, decodeSubmission,
 } from './router';
 import {
   setPlan, updateStep, readPlan, formatPlanAnnouncement, formatPlanForPrompt,
@@ -848,7 +848,27 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     // `write_file` tool; CLI agents have their own product-side
     // conventions and don't need that scoping. Override here:
     const userWorkspace = await import('../user_workspace');
-    const cliWorkingDir = userWorkspace.getWorkspacePath(uid);
+    const wsRoot = userWorkspace.getWorkspacePath(uid);
+    // Coding agents (claude / codex) honour the per-conversation
+    // `coding_project_dir` when set so the CLI runs inside the user's
+    // actual project; non-coding CLIs always use the workspace. The
+    // chip in the conversation surface lets the user set/change the
+    // dir mid-conversation. We also defensively check the directory
+    // exists and is a real dir — if it vanished between picker and
+    // dispatch we fall back rather than failing the run.
+    const agentsFeat = await import('../agents');
+    let cliWorkingDir = wsRoot;
+    if (agentsFeat.cliIsCodingAgent(cliAgent.runtime?.kind === 'cli' ? cliAgent.runtime.cli : '')) {
+      const st = await import('./state');
+      const stateFile = await st.readState(uid, cid);
+      const projDir = stateFile.coding_project_dir;
+      if (projDir) {
+        try {
+          const fs = await import('node:fs');
+          if (fs.statSync(projDir).isDirectory()) cliWorkingDir = projDir;
+        } catch { /* missing → fall through to wsRoot */ }
+      }
+    }
     try {
       const slice = await readSlice(uid, cid, actor.id);
       const cliOut = await _runCliAgentTurn({
@@ -1739,6 +1759,40 @@ planExecutor.bindBusHooks({
 
 const CLI_PROMPT_MAX_BYTES = 200 * 1024;
 
+/** Build an `<agent-input-form>` block listing the agent's required
+ *  inputs that are still unfulfilled, or return `null` when nothing is
+ *  missing. Currently the only auto-injected input is `project_dir`
+ *  (coding agents only); we read its fulfilment from `state.coding_project_dir`.
+ *  Other required inputs the user has authored on the agent flow through
+ *  here too — for those we have no per-conv storage yet, so they're
+ *  re-asked on every dispatch (matches the "prompt every turn until
+ *  collected" behaviour the in-process branch already has). */
+async function _maybeBuildCliInputForm(
+  uid: string, cid: string, agent: import('../agents').Agent,
+): Promise<string | null> {
+  const inputs = Array.isArray(agent.inputs) ? agent.inputs : [];
+  if (!inputs.length) return null;
+  const required = inputs.filter((f) => f.required);
+  if (!required.length) return null;
+
+  const state = await readState(uid, cid);
+  const projectDir = state.coding_project_dir || '';
+
+  const isFulfilled = (fieldId: string): boolean => {
+    if (fieldId === 'project_dir') return !!projectDir;
+    return false;
+  };
+
+  const missing = required.filter((f) => !isFulfilled(f.id));
+  if (!missing.length) return null;
+
+  const body = JSON.stringify({
+    agent_id: agent.agent_id,
+    fields: missing,
+  });
+  return `<agent-input-form>\n${body}\n</agent-input-form>`;
+}
+
 async function _runCliAgentTurn(opts: {
   uid: string;
   cid: string;
@@ -1751,6 +1805,20 @@ async function _runCliAgentTurn(opts: {
   onProcess: (data: Record<string, unknown>) => void;
 }): Promise<{ text: string; error?: string; aborted?: boolean }> {
   const runtime = opts.agent.runtime as Extract<NonNullable<import('../agents').AgentRuntime>, { kind: 'cli' }>;
+
+  // Required-input gate: a CLI agent never runs an LLM, so the form-emit
+  // logic in `chat_agent_in_group.md` (where in-process agents check their
+  // inputs_schema and emit `<agent-input-form>` themselves) doesn't fire.
+  // We mirror that here: if any required input is unfulfilled, return a
+  // synthetic body containing the form block — runTurn's
+  // `extractFormFromFinal` then lifts it into a `form` payload, the
+  // renderer shows the picker, and the user's submission re-dispatches
+  // through the standard pipeline. Only the `project_dir` input is
+  // currently auto-injected, but the gate is generic so future required
+  // inputs reuse the same path.
+  const formBlock = await _maybeBuildCliInputForm(opts.uid, opts.cid, opts.agent);
+  if (formBlock) return { text: formBlock };
+
   // Look up any prior CLI session bound to this (cid, aid, cli). If
   // present, we ask the CLI to resume it (claude: `--resume <id>`)
   // and skip replaying the visibility slice in the prompt — the CLI
@@ -1926,7 +1994,41 @@ async function _buildCliPrompt(
 
   const tailLines: string[] = [];
   tailLines.push('## Your task');
-  tailLines.push(item.llmPayload);
+  // When the dispatched item is just a form submission (the user
+  // confirmed the input form, not a fresh ask), the task body is
+  // metadata — `- 项目目录：…` summary + an `<agent-input-submission>`
+  // XML tag — with the original user request now sitting upstream in
+  // the slice. A coding CLI handed only that metadata has nothing
+  // actionable: claude / codex sit idle until killed (observed:
+  // 2+ min "processing" with 0 bytes of output). Walk the slice
+  // backward to recover the most recent user message that ISN'T
+  // another submission and use it as the real task; append the
+  // confirmed values as extra context. The cwd is already routed
+  // via `state.coding_project_dir`, so we don't need to re-state
+  // `project_dir` to the CLI.
+  const submission = decodeSubmission(item.llmPayload);
+  if (submission) {
+    let originalTask = '';
+    for (let i = slice.length - 1; i >= 0; i--) {
+      const m = slice[i];
+      const txt = (m.text || '').trim();
+      if (m.from !== 'user' || !txt) continue;
+      if (decodeSubmission(txt)) continue;
+      originalTask = txt;
+      break;
+    }
+    tailLines.push(originalTask || item.llmPayload);
+    const extraValues = Object.entries(submission.values)
+      .filter(([k]) => k !== 'project_dir')
+      .map(([k, v]) => `- ${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`);
+    if (extraValues.length) {
+      tailLines.push('');
+      tailLines.push('## Confirmed parameters');
+      tailLines.push(...extraValues);
+    }
+  } else {
+    tailLines.push(item.llmPayload);
+  }
 
   const head = headLines.join('\n');
   const tail = tailLines.join('\n');

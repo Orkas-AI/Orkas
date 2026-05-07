@@ -380,6 +380,19 @@ document.addEventListener('click', (e) => {
   window.orkas.invoke('auth.openExternal', { url: href }).catch(() => {});
 });
 
+/** Renderer-side mirror of `storage.ts::nowIso()` — local-time ISO8601
+ *  truncated to seconds, no TZ suffix. Optimistic / placeholder timestamps
+ *  must use this format so they sort identically with persisted ts strings
+ *  produced server-side. Mixing `new Date().toISOString()` (UTC + ms) with
+ *  the server's second-precision local-time string parses to a 0–999ms
+ *  drift that makes a same-second user msg test as "later than" the agent
+ *  reply, flipping bubble order in the chat (CLAUDE.md §8). */
+function nowIsoLocal() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
 function formatTime(iso) {
   if (!iso) return '-';
   try {
@@ -553,6 +566,11 @@ function _aiSelectMount(el, config) {
 
   const onDocDown = (e) => { if (!el.contains(e.target)) close(); };
   const onKey = (e) => {
+    // IME composition guard (CLAUDE.md §8): the popover keydown listener
+    // is on `document`, so a Chinese / Japanese / Korean composition in an
+    // adjacent input would otherwise commit its Enter into "pick the
+    // active option" of this select.
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Escape') { close(); e.preventDefault(); }
     else if (e.key === 'ArrowDown') {
       state.activeIdx = Math.min(state.options.length - 1, state.activeIdx + 1);

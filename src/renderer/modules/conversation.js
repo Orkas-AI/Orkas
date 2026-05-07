@@ -211,6 +211,8 @@ function _activeRecipient(target) {
 
 function getChatRecipient(target) { return { ..._activeRecipient(target) }; }
 
+function _onRecipientChanged(_target) { /* reserved for future hooks */ }
+
 function setChatRecipient(target, next, _opts = {}) {
   const r = _normRecipient(next);
   if (!r) return;
@@ -222,6 +224,7 @@ function setChatRecipient(target, next, _opts = {}) {
     _saveRecipientMap();
   }
   _renderRecipientChip(target);
+  _onRecipientChanged(target);
 }
 
 // Called by the new-chat send path *after* the new conv id is known so the
@@ -1243,7 +1246,7 @@ async function loadConversationHistory(cid) {
       const loadingEl = appendChatMessage({
         role: 'assistant',
         content: `<span class="chat-replying">${escapeHtml(t('chat.thinking'))}</span>`,
-        time: new Date().toISOString(),
+        time: nowIsoLocal(),
       });
       pendingConvs.set(cid, { loadingEl, needsIndicator: false });
       _updateConvSendUI(cid);
@@ -1267,7 +1270,7 @@ async function loadConversationHistory(cid) {
         const loadingEl = appendChatMessage({
           role: 'assistant',
           content: `<span class="chat-replying">${escapeHtml(t('chat.thinking'))}</span>`,
-          time: new Date().toISOString(),
+          time: nowIsoLocal(),
         });
         state.loadingEl = loadingEl;
       }
@@ -2459,7 +2462,12 @@ function createChatController(config) {
       {
         role: 'user',
         content,
-        time: new Date().toISOString(),
+        // Match server's `nowIso()` format (local-time, second-precision).
+        // Using `new Date().toISOString()` here would ms-bump the user
+        // bubble past the server-stamped agent reply within the same
+        // second and `_insertByTimestamp` would render the agent's
+        // reply before the user message.
+        time: nowIsoLocal(),
         ...(attachmentsForBubble ? { attachments: attachmentsForBubble } : {}),
       },
       false,
@@ -2611,8 +2619,11 @@ function createChatController(config) {
     if (inputEl && !inputEl.dataset.ctrlBound) {
       inputEl.dataset.ctrlBound = '1';
       inputEl.addEventListener('keydown', (e) => {
-        // Enter sends; Shift+Enter newline; Ctrl/Cmd+Enter also sends. Skip IME.
-        if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+        // Enter sends; Shift+Enter newline; Ctrl/Cmd+Enter also sends. Skip IME
+        // (CLAUDE.md §8 — keyCode 229 catches older Electron / Safari builds
+        // where `isComposing` is occasionally inaccurate).
+        if (e.isComposing || e.keyCode === 229) return;
+        if (e.key === 'Enter' && !e.shiftKey) {
           e.preventDefault();
           _submitFromInput();
         }

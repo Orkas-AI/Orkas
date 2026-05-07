@@ -129,6 +129,72 @@
       ctrlWrap.appendChild(fileWidget.el);
       read = fileWidget.read;
       isReady = fileWidget.isReady;
+    } else if (field.type === 'directory') {
+      // Directory picker: native dialog through `common.pickDirectory`.
+      // The widget shows the picked absolute path; the value submitted is
+      // the path string (or empty when nothing picked). Used by external
+      // coding agents (claude / codex) to collect their cwd via the
+      // standard input-form pipeline.
+      const dirWrap = document.createElement('div');
+      dirWrap.className = 'form-field-dir';
+      const pathLabel = document.createElement('span');
+      pathLabel.className = 'form-field-dir-path';
+      let value = (typeof initial === 'string' && initial) ? initial : '';
+      const renderPath = () => {
+        if (value) {
+          pathLabel.textContent = value;
+          pathLabel.title = value;
+          pathLabel.classList.remove('is-empty');
+        } else {
+          pathLabel.textContent = t('input.dir.none') || '（未选择）';
+          pathLabel.removeAttribute('title');
+          pathLabel.classList.add('is-empty');
+        }
+      };
+      renderPath();
+      const pickBtn = document.createElement('button');
+      pickBtn.type = 'button';
+      pickBtn.className = 'btn btn-sm form-field-dir-pick';
+      pickBtn.textContent = t('input.dir.pick') || '选择目录…';
+      const clearBtn = document.createElement('button');
+      clearBtn.type = 'button';
+      clearBtn.className = 'btn btn-sm form-field-dir-clear';
+      clearBtn.textContent = t('input.dir.clear') || '清除';
+      pickBtn.disabled = disabled;
+      clearBtn.disabled = disabled;
+      pickBtn.addEventListener('click', async () => {
+        try {
+          const res = await window.orkas.invoke('common.pickDirectory', {
+            title: field.label || '选择目录',
+          });
+          if (res && !res.cancelled && res.path) {
+            value = String(res.path);
+            renderPath();
+            pickBtn.textContent = t('input.dir.change') || '更换…';
+            // Notify the form so the submit button re-evaluates `isReady`
+            // — without this the button stays disabled (and shows the
+            // "请等待文件上传完成" hint) even after the user picks a dir.
+            if (ctx && typeof ctx.onChange === 'function') ctx.onChange();
+          }
+        } catch (_) { /* user cancelled or no permission */ }
+      });
+      clearBtn.addEventListener('click', () => {
+        value = '';
+        renderPath();
+        pickBtn.textContent = t('input.dir.pick') || '选择目录…';
+        if (ctx && typeof ctx.onChange === 'function') ctx.onChange();
+      });
+      if (value) pickBtn.textContent = t('input.dir.change') || '更换…';
+      dirWrap.appendChild(pickBtn);
+      dirWrap.appendChild(clearBtn);
+      dirWrap.appendChild(pathLabel);
+      ctrlWrap.appendChild(dirWrap);
+      read = () => value;
+      // No `isReady` override: `isReady` is reserved for "in-flight"
+      // states (e.g. file upload still going) which gate the submit
+      // button + show the "请等待文件上传完成" hint. Required-empty for a
+      // directory is reported by `_validate` on submit click, matching
+      // text / number / select.
     } else {
       // Unknown type — shouldn't happen (main validated) but degrade gracefully.
       const note = document.createElement('div');
@@ -312,6 +378,8 @@
           ? !Array.isArray(value) || value.length === 0
           : !value;
         if (empty) return t('chat.form.required_file');
+      } else if (field.type === 'directory') {
+        if (!String(value || '').trim()) return t('chat.form.required_directory');
       }
     }
     if (field.type === 'number' && typeof value === 'number') {

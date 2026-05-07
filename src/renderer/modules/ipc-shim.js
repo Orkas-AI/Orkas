@@ -46,6 +46,7 @@ const _IPC_ROUTES = [
   ['POST',   '/api/contexts/reveal',          'contexts.reveal'],
   ['POST',   '/api/search/global',            'search.global'],
   ['POST',   '/api/conversations/attachments/adopt', 'conversations.attachments.adopt'],
+  ['POST',   '/api/common/pick-directory',    'common.pickDirectory'],
   ['GET',    '/api/kb/status',                'kb.status'],
   ['POST',   '/api/kb/reconcile',             'kb.reconcile'],
   ['POST',   '/api/kb/reprocess',             'kb.reprocess'],

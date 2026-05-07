@@ -16,7 +16,8 @@ import { readJsonl, rewriteJsonlLine, nowIso, safeId } from '../../storage';
 import { createLogger } from '../../logger';
 
 import {
-  USER_ID, readMembers, seedReservedActors, purgeGroupDir,
+  USER_ID, readMembers, readState, seedReservedActors, purgeGroupDir,
+  setCodingProjectDir,
 } from './state';
 import { readPlan, type PlanFile } from './plan';
 import * as planExecutor from './plan_executor';
@@ -255,6 +256,28 @@ export async function markFormSubmittedAndDispatch(
     return { ok: false, error: r.error };
   }
   log.info(`form-submitted user=${userId} cid=${cid} msgId=${msgId} agent=${agentId} fields=${target.form.fields.length}`);
+
+  // Coding-agent contract: when a `project_dir` field is present in the
+  // submitted form for an external claude / codex agent, persist it to
+  // conv state so `_runCliAgentTurn` can spawn the CLI inside that
+  // directory. Other form values stay only in the message log — the
+  // agent extracts them from the encoded submission text.
+  try {
+    const projDir = values && typeof (values as any).project_dir === 'string'
+      ? String((values as any).project_dir).trim()
+      : '';
+    if (projDir) {
+      const agentsFeat = await import('../agents');
+      const ag = await agentsFeat.getAgent(agentId);
+      const cli = ag?.runtime?.kind === 'cli' ? ag.runtime.cli : '';
+      if (agentsFeat.cliIsCodingAgent(cli)) {
+        await setCodingProjectDir(userId, cid, projDir);
+        log.info(`coding project_dir set user=${userId} cid=${cid} agent=${agentId} dir=${projDir}`);
+      }
+    }
+  } catch (err) {
+    log.warn(`form-submit project_dir hook failed: ${(err as Error).message}`);
+  }
 
   const sliceFile = groupChatVisibilityFile(userId, cid, agentId);
   if (fs.existsSync(sliceFile)) {

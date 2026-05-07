@@ -154,7 +154,9 @@ function bindStaticHandlers() {
     // Enter sends; Shift+Enter newline; Ctrl/Cmd+Enter also sends (kept for
     // muscle memory). Skip while IME is composing — Chinese pinyin commit
     // also fires Enter and would otherwise send a half-typed message.
-    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    // keyCode 229 catches older Electron / Safari builds (CLAUDE.md §8).
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleNewChatSubmit();
     }
@@ -176,8 +178,10 @@ function bindStaticHandlers() {
     }
   });
   chatInput.addEventListener('keydown', (e) => {
-    // Enter sends; Shift+Enter newline; Ctrl/Cmd+Enter also sends. Skip IME.
-    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    // Enter sends; Shift+Enter newline; Ctrl/Cmd+Enter also sends. Skip IME
+    // (CLAUDE.md §8 — keyCode 229 belt-and-suspenders for older builds).
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleChatSubmit();
     }

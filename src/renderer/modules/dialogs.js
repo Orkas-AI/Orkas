@@ -30,6 +30,9 @@ function _uiShowDialog({ message, showCancel }) {
     const okBtn = overlay.querySelector('[data-act="ok"]');
     const cancelBtn = overlay.querySelector('[data-act="cancel"]');
     const onKey = (e) => {
+      // IME guard (CLAUDE.md §8) — Enter while composing should commit
+      // the IME candidate, not auto-confirm the dialog.
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === 'Escape') finish(false);
       else if (e.key === 'Enter') finish(true);
     };
@@ -84,6 +87,9 @@ function uiPrompt(message, defaultValue = '') {
     const okBtn = overlay.querySelector('[data-act="ok"]');
     const cancelBtn = overlay.querySelector('[data-act="cancel"]');
     const onKey = (e) => {
+      // IME guard (CLAUDE.md §8) — Enter while composing in the prompt
+      // input belongs to the IME, not to the dialog confirm action.
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === 'Escape') finish(null);
       else if (e.key === 'Enter' && e.target === input) finish(input.value);
     };

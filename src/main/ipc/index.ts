@@ -152,6 +152,22 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     });
   },
 
+  // Generic native directory picker. Used by the agent-input-form
+  // `directory` type so coding agents (claude / codex) collect their
+  // project directory through the standard input-form pipeline.
+  'common.pickDirectory': async ({ title } = {}) => {
+    const parent = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
+    const opts: Electron.OpenDialogOptions = {
+      properties: ['openDirectory'],
+      title: typeof title === 'string' && title ? title : '选择目录',
+    };
+    const res = parent
+      ? await dialog.showOpenDialog(parent, opts)
+      : await dialog.showOpenDialog(opts);
+    if (res.canceled || !res.filePaths?.length) return { cancelled: true };
+    return { cancelled: false, path: res.filePaths[0] };
+  },
+
   // ── Chat attachments (per-cid file pool for main chat) ──
   'conversations.attachments.list': async ({ cid }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
@@ -187,9 +203,10 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { agent };
   },
 
-  'agents.create': async ({ name = '', description = '', workflow = '', icon, color, runtime } = {}) => {
-    return { agent: await agents.createCustomAgent({ name, description, workflow, icon, color, runtime }) };
+  'agents.create': async ({ name = '', description = '', description_zh, description_en, workflow = '', icon, color, runtime } = {}) => {
+    return { agent: await agents.createCustomAgent({ name, description, description_zh, description_en, workflow, icon, color, runtime }) };
   },
+
 
   'agents.update': async ({ agent_id, updates }) => {
     if (!agents.isValidAgentId(agent_id)) throw new Error('invalid agent_id');
@@ -766,7 +783,13 @@ export function register(): void {
       return { ok: true, ...(result || {}) };
     } catch (err) {
       log.error(`invoke ${channel} failed`, { error: (err as Error)?.message || String(err) });
-      return { ok: false, error: (err as Error).message || String(err) };
+      const out: { ok: false; error: string; code?: string } = {
+        ok: false,
+        error: (err as Error).message || String(err),
+      };
+      const code = (err as { code?: unknown }).code;
+      if (typeof code === 'string') out.code = code;
+      return out;
     }
   });
 

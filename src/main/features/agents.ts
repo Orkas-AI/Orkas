@@ -47,7 +47,7 @@ import { renameAgentInMembers } from './group_chat/state';
 
 export type AgentSource = 'builtin' | 'custom';
 
-export type AgentInputType = 'text' | 'textarea' | 'select' | 'multiselect' | 'number' | 'boolean' | 'file';
+export type AgentInputType = 'text' | 'textarea' | 'select' | 'multiselect' | 'number' | 'boolean' | 'file' | 'directory';
 
 export interface AgentInputOption {
   value: string;
@@ -262,7 +262,7 @@ function agentBaseDir(source: AgentSource): string {
 }
 
 const INPUT_ID_RE = /^[a-z_][a-z0-9_]{0,31}$/;
-const ALLOWED_INPUT_TYPES: readonly AgentInputType[] = ['text', 'textarea', 'select', 'multiselect', 'number', 'boolean', 'file'];
+const ALLOWED_INPUT_TYPES: readonly AgentInputType[] = ['text', 'textarea', 'select', 'multiselect', 'number', 'boolean', 'file', 'directory'];
 
 // Reserved agent display names — collide with the commander role surfaced in
 // the chat-recipient chip ("指挥官") and the sidebar tab ("总指挥"). The bus
@@ -280,6 +280,28 @@ function assertAgentNameAllowed(name: string): void {
     const err: any = new Error(`agent name "${name}" is reserved`);
     err.code = 'E_AGENT_NAME_RESERVED';
     throw err;
+  }
+}
+
+/** Reject names already in use by another agent (custom OR builtin).
+ *  Matches `_agentNameKey` (case-insensitive, all whitespace stripped) so
+ *  "Code Helper" and "codehelper" collide. `excludeAgentId` lets the
+ *  update path keep its own name. Caller owns the check at every write
+ *  entry — IPC create / IPC update / LLM-driven create+edit — so neither
+ *  the UI form nor the LLM can land a duplicate. */
+async function assertAgentNameUnique(
+  name: string, excludeAgentId?: string,
+): Promise<void> {
+  const key = _agentNameKey(name);
+  if (!key) return;
+  const all = await listAgents();
+  for (const a of all) {
+    if (excludeAgentId && a.agent_id === excludeAgentId) continue;
+    if (_agentNameKey(a.name || '') === key) {
+      const err: any = new Error(`agent name "${name}" is already in use`);
+      err.code = 'E_AGENT_NAME_TAKEN';
+      throw err;
+    }
   }
 }
 
@@ -367,6 +389,9 @@ export function validateAgentInputs(raw: unknown): AgentInput[] {
       const allowed = new Set(options!.map((o) => o.value));
       const filtered = arr.filter((v) => allowed.has(v));
       def = filtered;
+    } else if (type === 'directory') {
+      // Directory — default is always empty; the user picks via native dialog.
+      def = '';
     } else { // file — default is always empty (the model can't pre-pick a file)
       def = fileMultiple ? [] : '';
     }
@@ -467,6 +492,16 @@ function _normalizeRuntime(raw: unknown): AgentRuntime | null {
     if (args.length) out.custom_args = args;
   }
   return out;
+}
+
+/** True when this CLI is a coding agent (claude code / codex). Coding
+ *  agents are dispatched with a per-conversation project directory as
+ *  cwd instead of the user workspace; the chip in the conversation
+ *  surface lets the user set it. Single source of truth for both UI
+ *  visibility and dispatch routing. */
+export const CODING_CLIS = new Set<string>(['claude', 'codex']);
+export function cliIsCodingAgent(cli: string | undefined): boolean {
+  return !!cli && CODING_CLIS.has(cli);
 }
 
 /** True when this agent runs via a local CLI rather than in-process
@@ -617,6 +652,7 @@ export async function createCustomAgent(
   { name = '', description = '', description_zh, description_en, workflow = '', icon, color, interactive, runtime }: CreateAgentOptions = {},
 ): Promise<Agent | null> {
   assertAgentNameAllowed(name);
+  await assertAgentNameUnique(String(name || '').trim());
   fs.mkdirSync(CUSTOM_AGENTS_DIR(), { recursive: true });
   let agentId: string;
   do { agentId = genAgentId(); }
@@ -641,12 +677,34 @@ export async function createCustomAgent(
   // selection is the implicit default and not written to disk so old
   // tooling diffs cleanly.
   const rt = _normalizeRuntime(runtime);
-  if (rt && rt.kind === 'cli') data.runtime = rt;
+  if (rt && rt.kind === 'cli') {
+    data.runtime = rt;
+    // Coding CLIs (claude / codex) need a working directory. We inject
+    // a `project_dir` input dependency so the standard agent-input-form
+    // pipeline collects it before the first dispatch — same UX as any
+    // other required input. The agent worker reads the submitted
+    // value to set CLI cwd.
+    if (cliIsCodingAgent(rt.cli)) {
+      data.inputs = [PROJECT_DIR_INPUT];
+    }
+  }
   await writeJson(customAgentFile(agentId), data);
   _invalidateAgentListCache();
   log.info(`created id=${agentId} name=${data.name}`);
   return normalizeAgent(data, 'custom');
 }
+
+/** Required-input schema injected on every external coding agent. The
+ *  field id `project_dir` is a contract — the dispatch path looks for
+ *  exactly this id when extracting the cwd from a form submission. */
+export const PROJECT_DIR_INPUT_ID = 'project_dir';
+const PROJECT_DIR_INPUT: AgentInput = {
+  id: PROJECT_DIR_INPUT_ID,
+  type: 'directory',
+  label: '项目目录',
+  required: true,
+  default: '',
+};
 
 export interface UpdateAgentFields {
   name?: string;
@@ -693,7 +751,10 @@ export async function updateCustomAgent(
   const data = await readJson<AgentRaw>(f);
   const oldName = typeof (data as any).name === 'string' ? (data as any).name : '';
   if (Object.prototype.hasOwnProperty.call(updates || {}, 'name')) {
-    assertAgentNameAllowed(typeof updates.name === 'string' ? updates.name : '');
+    const incomingName = typeof updates.name === 'string' ? updates.name : '';
+    assertAgentNameAllowed(incomingName);
+    const trimmed = incomingName.trim();
+    if (trimmed) await assertAgentNameUnique(trimmed, agentId);
   }
   // CLI-backed agents have no authored workflow / skill_list — the
   // edit prompt forbids the LLM from emitting those tags, but if it
@@ -826,6 +887,19 @@ export async function updateCustomAgent(
       if (!rt || rt.kind === 'in_process') delete data.runtime;
       else data.runtime = rt;
     }
+    // Reconcile the project_dir input with the (post-update) cli kind.
+    // Coding cli ↔ project_dir input is a contract, not a user-authored
+    // schema: swap claude → codex keeps it, swap to a non-coding cli
+    // drops it, etc. We don't touch any other input the user defined.
+    const finalCli = data.runtime && _normalizeRuntime(data.runtime)?.kind === 'cli'
+      ? (_normalizeRuntime(data.runtime) as Extract<AgentRuntime, { kind: 'cli' }>).cli
+      : '';
+    const wantsProjectDir = cliIsCodingAgent(finalCli);
+    const inputs = Array.isArray(data.inputs) ? validateAgentInputs(data.inputs) : [];
+    const without = inputs.filter((i) => i.id !== PROJECT_DIR_INPUT_ID);
+    if (wantsProjectDir) data.inputs = [PROJECT_DIR_INPUT, ...without];
+    else if (without.length) data.inputs = without;
+    else delete data.inputs;
   }
   if (!data.name) data.name = '未命名智能体';
   data.updated_at = nowIso();
@@ -934,6 +1008,13 @@ const AGENT_CONTAINER_RE = /<agent>([\s\S]*?)<\/agent>/g;
 const AGENT_CHILD_RE = (tag: string) => new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`);
 
 export interface ExtractedFields {
+  /** Parsed from `<agent_id>` inside `<agent>`. Present → commander wants to
+   * patch this existing custom agent (main-chat edit flow); absent → create
+   * a brand-new agent. The agent-edit-chat surface ignores this field — the
+   * target id is supplied by URL context, the LLM never writes it. Body
+   * must pass `safeId`; otherwise the key is dropped (mis-spelled id should
+   * NOT silently fall through to the create branch). */
+  agent_id?: string;
   name?: string;
   description?: string;
   description_zh?: string;
@@ -960,6 +1041,11 @@ export function extractAgentFieldBlocks(text: string): { cleanText: string; fiel
   const first = text.match(/<agent>([\s\S]*?)<\/agent>/);
   if (first) {
     const inner = first[1];
+    const aidM = inner.match(AGENT_CHILD_RE('agent_id'));
+    if (aidM) {
+      const v = aidM[1].trim();
+      if (safeId(v)) fields.agent_id = v;
+    }
     const nameM = inner.match(AGENT_CHILD_RE('name'));
     if (nameM) {
       const v = nameM[1].trim();
