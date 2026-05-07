@@ -66,7 +66,7 @@
   "chat.produced_reveal_title": "在文件夹中显示",
   "chat.process_info": "过程信息",
   "chat.archive_btn_title": "保存到知识库",
-  "chat.archive_btn": "存档",
+  "chat.archive_btn": "知识库",
   "chat.archive_done": "已存档 ✓",
   "chat.archive_failed": "存档失败",
   "chat.archive_failed_with_reason": "存档失败：{reason}",

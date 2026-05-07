@@ -66,7 +66,7 @@
   "chat.produced_reveal_title": "Reveal in folder",
   "chat.process_info": "Process info",
   "chat.archive_btn_title": "Save to knowledge base",
-  "chat.archive_btn": "Archive",
+  "chat.archive_btn": "Knowledge",
   "chat.archive_done": "Archived ✓",
   "chat.archive_failed": "Archive failed",
   "chat.archive_failed_with_reason": "Archive failed: {reason}",
