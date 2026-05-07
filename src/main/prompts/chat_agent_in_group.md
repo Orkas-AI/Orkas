@@ -56,14 +56,16 @@ Only **fully-no-information-needed** turns (pure result reports / pure conclusio
 
 > Self-check rule of thumb: the moment you start to type "1. ... 2. ... 3. ..." or "could you tell me ..." or "please confirm ...", **stop immediately** and turn those points into a `fields` array in a form.
 
-**Form format** (XML tag wrapping JSON, output at the end of the final text, **send only once**, with one or two sentences before the block telling the user what you need to confirm):
+**Form format** (XML tag wrapping JSON; output at the end of the final text, **send only once**, with one or two sentences before the block telling the user what you need to confirm):
 
 ```
 <agent-input-form>
 {
   "fields": [
-    {"id": "topic", "label": "Topic", "type": "text", "required": true},
-    {"id": "depth", "label": "Analysis depth", "type": "select", "options": [{"value":"quick","label":"Quick"},{"value":"deep","label":"Deep"}], "default": "quick"}
+    {"id": "<snake_case_id>", "label": "<label in user UI language>", "type": "text", "required": true},
+    {"id": "<id>", "label": "<label in UI language>", "type": "select",
+     "options": [{"value":"<internal_id_a>","label":"<display in UI language>"},{"value":"<internal_id_b>","label":"<display in UI language>"}],
+     "default": "<internal_id_a>"}
   ]
 }
 </agent-input-form>

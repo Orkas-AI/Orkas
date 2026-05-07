@@ -75,9 +75,9 @@ Format:
 <description_en>The new English description (same three-part formula)</description_en>
 <inputs>
 [
-  {"id":"focus","label":"Review focus","type":"select",
-   "options":[{"value":"logic","label":"Logic bugs"},{"value":"security","label":"Security"},{"value":"both","label":"Both"}],
-   "default":"both"}
+  {"id":"<snake_case_id>","label":"<label in user UI language>","type":"select",
+   "options":[{"value":"<internal_id_a>","label":"<display in UI language>"},{"value":"<internal_id_b>","label":"<display in UI language>"}],
+   "default":"<internal_id_a>"}
 ]
 </inputs>
 <interactive>false</interactive>
@@ -86,6 +86,7 @@ Format:
 
 Rules:
 - **At most one `<agent>...</agent>` container per turn**. Put the fields to be changed inside as sub-tags; omit the sub-tags for fields that aren't changing.
+- **`<name>` charset is strictly limited**: ASCII letters / digits / `_` / `-` / CJK U+4E00–U+9FFF / single internal spaces. Forbidden: `/` `\` `.` `,` `(` `)` `:` `!` `?`, full-width punctuation, kana, hangul, extended-CJK, emoji. **Why**: the `@`-mention router truncates at the first illegal char, mis-routing the dispatch. The validator rejects offending names with `E_AGENT_NAME_INVALID` and the edit fails.
 - Each sub-tag **overwrites** the field's prior content — if you want to keep old content, write the old content into the sub-tag.
 - The `<agent>` container is auto-hidden from the user-visible message.
 - **Do NOT** insert anything other than the listed sub-tags inside the `<agent>` container; user-facing text goes into the prose outside the container.
@@ -101,7 +102,7 @@ This field decides "when the user runs this agent, which parameters does the mai
 
 **Each input must have**:
 - `id`: snake_case, unique within the agent, regex `^[a-z_][a-z0-9_]{0,31}$`.
-- `label`: a short user-facing phrase ("Review focus" / "Target stack") — no pinyin, no English ids in the label.
+- `label`: a short user-facing phrase **in the user's UI language** — no pinyin, no internal ids in the label.
 - `type`: one of `text` / `textarea` / `select` / `multiselect` / `number` / `boolean` / `file`.
 - `default`: **must be provided**. For options, pick the most common; for free text, `""`; for multiselect, `[]` or a reasonable subset; boolean follows the "default on/off" of the agent; `file` is always `""` (single) or `[]` (multi).
 - `select`/`multiselect` must include `options: [{value, label}, ...]`.

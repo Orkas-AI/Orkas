@@ -193,6 +193,8 @@ Messages to the user (the conversation prose **outside** `<<<skill-file>>>` bloc
 - Writing `scripts/foo.py` → "I added a script `foo.py` that does ..."
 - Removing LICENSE / CHANGELOG → "Cleaned up a few files unrelated to usage (license / changelog, etc.)."
 
+The wrong / right examples below illustrate **prose style** — write your actual user-facing reply in the user's UI language (filenames, code identifiers, and quoted user phrasings stay as-is).
+
 Wrong example:
 > I wrote the `SKILL.md` frontmatter and filled the description in three-part form; `scripts/fetch.py` is an executable skeleton.
 

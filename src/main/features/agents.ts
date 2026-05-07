@@ -310,7 +310,21 @@ function assertAgentNameCharsetValid(name: string): void {
     throw err;
   }
   if (!NAME_TOKEN_RE.test(trimmed)) {
-    const err: any = new Error(`agent name contains unsupported characters (only letters, digits, hyphen, underscore, CJK, and single internal spaces are allowed)`);
+    // Surface the offending literal + the specific bad chars so a streamed
+    // error feeds the LLM enough signal to self-correct on the next turn,
+    // instead of repeating the same forbidden character.
+    const SINGLE_TOKEN_CHAR_RE = /[A-Za-z0-9_一-鿿-]/;
+    const bad: string[] = [];
+    const seen = new Set<string>();
+    for (const ch of trimmed) {
+      if (ch === ' ') continue;
+      if (SINGLE_TOKEN_CHAR_RE.test(ch)) continue;
+      if (!seen.has(ch)) { seen.add(ch); bad.push(ch); }
+    }
+    const detail = bad.length
+      ? `forbidden character${bad.length > 1 ? 's' : ''}: ${bad.map(c => `\`${c}\``).join(' ')}`
+      : 'multiple consecutive spaces are not allowed (only single internal spaces between tokens)';
+    const err: any = new Error(`agent name "${trimmed}" contains unsupported characters — ${detail}. Allowed: ASCII letters / digits / \`_\` / \`-\` / CJK U+4E00–U+9FFF / single internal spaces. Forbidden include \`/\` \`\\\` \`.\` \`,\` \`(\` \`)\` \`:\` \`!\` \`?\`, full-width punctuation, kana, hangul, extended-CJK, emoji.`);
     err.code = 'E_AGENT_NAME_INVALID';
     throw err;
   }

@@ -127,7 +127,11 @@ export function buildLanguageDirective(lang: Lang = _current): string {
   return [
     '## User language',
     '',
-    `The user's UI language is set to **${name}**. All natural-language replies you write to the user (final text, form lead-ins, announcements, status notes) MUST be in ${name}. Tool calls, code, JSON payloads, structured tags (e.g. \`<agent>\`, \`<agent-input-form>\`), filenames and paths stay in their native form regardless of language.`,
+    `The user's UI language is set to **${name}**. Every piece of human-readable prose you produce — final replies, form lead-ins, announcements, status notes, AND **the natural-language content inside any structured tag or JSON field** (e.g. \`<workflow>\` step titles and step body descriptions, \`<inputs>\` / \`<agent-input-form>\` field \`label\` values, \`plan_set\` step \`title\` and \`input\` strings, \`<agent>\` container prose) — MUST be in ${name}.`,
+    '',
+    `What stays in its native form regardless of language: XML tag names themselves (\`<agent>\` / \`<workflow>\` / \`<inputs>\` etc.; do not translate the tag), tool names and skill_ids written in backticks (\`read_file\` / \`kb_search\` / \`web_fetch\` / etc.), JSON object keys (\`"id"\` / \`"type"\` / \`"options"\` / \`"value"\`), file paths, code snippets, and \`value\` strings inside \`select\` / \`multiselect\` options (the value is an internal id; the matching \`label\` is what gets translated).`,
+    '',
+    `Bilingual description fields are pinned by suffix and ignore the UI language: \`<description_zh>\` / \`description_zh\` always carries Chinese; \`<description_en>\` / \`description_en\` always carries English. Examples in this system prompt may be written in English to illustrate shape — when you produce the actual content, write it in ${name}, not by copying the example's language.`,
   ].join('\n');
 }
 
