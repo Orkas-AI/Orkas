@@ -189,6 +189,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // overrides `bash` and `write_file` with the permission-gated versions.
   const localTools = createLocalTools({
     ...(uid ? { userId: uid } : {}),
+    ...(params.cid ? { cid: params.cid } : {}),
+    ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
     ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
     ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
   });

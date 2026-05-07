@@ -1,17 +1,20 @@
 /**
- * ToolCatalog — 注入式内建工具清单。
+ * ToolCatalog — registry of injected built-in tools.
  *
- * 角色与 `skill-registry.ts` 对称：把"当前会话可用的内建工具"以 markdown 块
- * 形式注入到 system prompt，让 prompt 模板（chat_agent_setup.md 等）不必
- * 硬编码工具名字。
+ * Symmetric to `skill-registry.ts`: emits an "available tools" markdown
+ * block injected into setup-LLM prompts, so that prompt templates
+ * (`chat_agent_setup.md` etc.) don't have to hard-code tool names.
  *
- * 数据来源：**手写中央常量表** `TOOL_CATALOG`。不从 `AgentTool` 实例派生——
- * 工具自身的 `description` 是写给 runtime-LLM 的英文长文档，而 catalog 的
- * `summary` 是写给 setup-LLM 看的中文短句，受众不同；`group` / `permission`
- * 是人脑判断的元数据，没法从代码自动推。
+ * Source of truth: a hand-written central constant table `TOOL_CATALOG`.
+ * NOT derived from `AgentTool` instances — the runtime `description` on
+ * each tool is a long English doc aimed at the runtime LLM, while the
+ * catalog `summary` is a short blurb aimed at the setup LLM; the two
+ * audiences are different. `group` / `permission` are human-judged
+ * metadata and cannot be inferred from code.
  *
- * 反漂移：测试 `tool-catalog.test.ts` 断言"runner.ts 实际注入的工具 name
- * 集合 ⊆ `TOOL_CATALOG` name 集合"。漏写一条 catalog entry → 测试红。
+ * Anti-drift: `tool-catalog.test.ts` asserts that the set of tool names
+ * runner.ts actually injects is a subset of `TOOL_CATALOG`. Forgetting
+ * a catalog entry → test red.
  */
 
 import { createLogger } from '../../logger';
@@ -19,77 +22,81 @@ import { createLogger } from '../../logger';
 const log = createLogger('tool-catalog');
 
 export type ToolGroup =
-  | 'fs'        // 文件 / 工作区
-  | 'shell'     // 命令行
-  | 'pdf'       // PDF 渲染
-  | 'kb'        // 知识库
-  | 'image'     // 图像生成
-  | 'web'       // 联网
-  | 'meta'      // 跨会话状态
-  | 'group';    // 群聊调度（commander only）
+  | 'fs'        // files / workspace
+  | 'shell'     // command line
+  | 'pdf'       // PDF rendering
+  | 'kb'        // knowledge base
+  | 'image'     // image generation
+  | 'web'       // web access
+  | 'meta'      // cross-session state
+  | 'group';    // group-chat dispatch (commander only)
 
 export interface ToolCatalogEntry {
-  /** 工具名，必须与 `AgentTool.name` 严格一致。 */
+  /** Tool name. Must match `AgentTool.name` exactly. */
   name: string;
-  /** 一句话描述，写给 setup-LLM 看的中文。 */
+  /** One-line English description aimed at the setup LLM. */
   summary: string;
-  /** 用途分组，决定渲染时落入哪个小节。 */
+  /** Render group; decides which section the entry lands in. */
   group: ToolGroup;
-  /** 受运行时权限门控制时填入。当前唯一值是 `localExec`。 */
+  /** Filled when the tool is gated by a runtime permission. Currently
+   *  the only value is `localExec`. */
   permission?: 'localExec';
 }
 
 /**
- * 中央常量表。新增工具时**必须**在此追加一条；漏加由测试兜底。
+ * The central constant table. **Always** append a row when adding a new
+ * tool; the anti-drift test catches omissions.
  *
- * 顺序在每个 group 内部按"使用频率从高到低"手动排列，以稳定 KV cache 前缀。
+ * Within each group the order is "most frequently used first", kept stable
+ * to keep the rendered KV-cache prefix stable.
  */
 export const TOOL_CATALOG: ToolCatalogEntry[] = [
-  // 文件 / 工作区
-  { name: 'read_file',     group: 'fs', summary: '读工作区或附件里的文本/PDF/DOCX 切片，或图片（多模态）' },
-  { name: 'write_file',    group: 'fs', permission: 'localExec', summary: '向工作区写文本/代码/markdown 等，自动落到 $working_dir' },
-  { name: 'list_files',    group: 'fs', summary: '列工作区目录树' },
-  { name: 'stat_file',     group: 'fs', summary: '触发 PDF/DOCX 抽取并返回 total_chars，read_file 之前用' },
-  { name: 'search_files',  group: 'fs', summary: '按名字 / glob 在工作区+附件域里找文件' },
-  { name: 'grep_files',    group: 'fs', summary: '在工作区+附件域里 grep 文本（PDF/DOCX 自动抽取后搜）' },
+  // Files / workspace
+  { name: 'read_file',     group: 'fs', summary: 'Read a slice of text from a workspace or attachment file (PDF/DOCX text or image as multimodal).' },
+  { name: 'write_file',    group: 'fs', permission: 'localExec', summary: 'Write text/code/markdown into the workspace; resolves under $working_dir.' },
+  { name: 'edit_file',     group: 'fs', permission: 'localExec', summary: 'In-place `old_string → new_string` replacement on an existing text file (instead of rewriting the whole file).' },
+  { name: 'list_files',    group: 'fs', summary: 'List the workspace directory tree.' },
+  { name: 'stat_file',     group: 'fs', summary: 'Trigger PDF/DOCX extraction and return total_chars; call before read_file.' },
+  { name: 'search_files',  group: 'fs', summary: 'Find files by name / glob across the workspace + attachment scope.' },
+  { name: 'grep_files',    group: 'fs', summary: 'Grep text across the workspace + attachment scope (PDF/DOCX auto-extracted, then searched).' },
 
-  // 命令行
-  { name: 'bash',          group: 'shell', permission: 'localExec', summary: '在用户机器上执行 shell 命令（cwd = $working_dir）' },
+  // Shell
+  { name: 'bash',          group: 'shell', permission: 'localExec', summary: 'Execute a shell command on the user\'s machine (cwd = $working_dir).' },
 
   // PDF
-  { name: 'markdown_to_pdf', group: 'pdf', permission: 'localExec', summary: 'markdown → PDF（CJK 友好，零外部依赖）' },
-  { name: 'html_to_pdf',     group: 'pdf', permission: 'localExec', summary: 'HTML → PDF（同上）' },
+  { name: 'markdown_to_pdf', group: 'pdf', permission: 'localExec', summary: 'Markdown → PDF (CJK-friendly, zero external dependency).' },
+  { name: 'html_to_pdf',     group: 'pdf', permission: 'localExec', summary: 'HTML → PDF (same renderer).' },
 
-  // 知识库
-  { name: 'kb_search',     group: 'kb', summary: '用户知识库语义检索' },
-  { name: 'kb_read',       group: 'kb', summary: '读 kb_search 命中过的 KB 文件分块原文' },
+  // Knowledge base
+  { name: 'kb_search',     group: 'kb', summary: 'Semantic search over the user\'s knowledge base.' },
+  { name: 'kb_read',       group: 'kb', summary: 'Read source-text chunks from a KB file that kb_search has hit.' },
 
-  // 图像
-  { name: 'generate_image', group: 'image', permission: 'localExec', summary: '调厂商图像 API 生成图片，落到工作区' },
+  // Image
+  { name: 'generate_image', group: 'image', permission: 'localExec', summary: 'Call the configured image-generation API and save the result into the workspace.' },
 
-  // 联网（厂商原生搜索可用时框架自动优先用原生，下面两个是兜底）
-  { name: 'web_search',    group: 'web', summary: '内置兜底联网搜索（厂商原生搜索可用时框架自动优先用原生）' },
-  { name: 'web_fetch',     group: 'web', summary: '抓取 URL 正文，配合 web_search 使用' },
+  // Web (when a vendor-native search is available the framework picks it automatically; the two below are the fallback channel)
+  { name: 'web_search',    group: 'web', summary: 'Built-in fallback web search (vendor-native search is preferred automatically when available).' },
+  { name: 'web_fetch',     group: 'web', summary: 'Fetch the body of a URL; pairs with web_search.' },
 
-  // 跨会话状态
-  { name: 'cross_session_memory', group: 'meta', summary: '跨会话 user / agent memory 读写' },
-  { name: 'metacognition',        group: 'meta', summary: '元认知（COMPETENCE / LEARNING_STRATEGIES）读写，env 开关控制' },
+  // Cross-session state
+  { name: 'cross_session_memory', group: 'meta', summary: 'Read/write user / agent memory that persists across sessions.' },
+  { name: 'metacognition',        group: 'meta', summary: 'Read/write metacognition (COMPETENCE / LEARNING_STRATEGIES); env-flag gated.' },
 
-  // 群聊调度（commander 专用，普通 agent 不会注入）
-  { name: 'plan_set',    group: 'group', summary: '落档整体执行计划；首次同步在群里发公告，后续覆盖只更文件' },
-  { name: 'plan_update', group: 'group', summary: '更新某一步的状态（in_progress / done / failed）' },
+  // Group-chat dispatch (commander only — never injected for ordinary agents)
+  { name: 'plan_set',    group: 'group', summary: 'Persist the overall execution plan; the first call announces in the group, subsequent overwrites only update the file.' },
+  { name: 'plan_update', group: 'group', summary: 'Update the status of one step (in_progress / done / failed).' },
 ];
 
-/** 渲染时各 group 的固定输出顺序与 section 标题。 */
+/** Fixed render order + section heading per group. */
 const GROUP_ORDER: ReadonlyArray<{ group: ToolGroup; title: string }> = [
-  { group: 'fs',    title: '文件 / 工作区' },
-  { group: 'shell', title: '命令行' },
+  { group: 'fs',    title: 'Files / workspace' },
+  { group: 'shell', title: 'Shell' },
   { group: 'pdf',   title: 'PDF' },
-  { group: 'kb',    title: '知识库' },
-  { group: 'image', title: '图像' },
-  { group: 'web',   title: '联网' },
-  { group: 'meta',  title: '跨会话状态' },
-  { group: 'group', title: '群聊调度' },
+  { group: 'kb',    title: 'Knowledge base' },
+  { group: 'image', title: 'Image' },
+  { group: 'web',   title: 'Web' },
+  { group: 'meta',  title: 'Cross-session state' },
+  { group: 'group', title: 'Group-chat dispatch' },
 ];
 
 const CATALOG_BY_NAME: ReadonlyMap<string, ToolCatalogEntry> = new Map(
@@ -97,23 +104,28 @@ const CATALOG_BY_NAME: ReadonlyMap<string, ToolCatalogEntry> = new Map(
 );
 
 const PREAMBLE =
-  '按用途分组列出当前会话可用的内建工具。**调用工具不需要任何 skill 包装**——' +
-  '能直接做完的事情就直接调，别为单步任务设计 skill。skill 的真正用武之地是' +
-  '多步逻辑封装、第三方 API 凭证管理、重复性高的复合流程。';
+  'Built-in tools available in the current session, grouped by purpose. ' +
+  '**Calling a tool does NOT require a skill wrapper** — if a tool can do the job in one call, just call it; ' +
+  'do not design a skill for a single-step task. The real value of a skill is encapsulating multi-step logic, ' +
+  'managing third-party API credentials, or reusing a high-frequency composite flow.';
 
 /**
- * 渲染 `## 可用工具 (tools)` 块。
+ * Render the `## Available tools` block.
  *
- * `names` 应当来自 runner.ts 实际组装出的 `allTools.map(t => t.name)`——这样
- * 受运行态条件控制的工具（memory / metacognition / plan_* / 按 uid 启用
- * 的 fileTools 等）会自动跟随实际注入情况，不会出现"清单写了但实际没注入"
- * 的漂移。
+ * `names` should be sourced from runner.ts's actual assembled
+ * `allTools.map(t => t.name)` — that way runtime-conditional tools
+ * (memory / metacognition / plan_* / uid-gated fileTools, ...) follow
+ * the actual injection state automatically; no "listed but not
+ * actually injected" drift.
  *
- * 行为：
- * - `names` 为空 → 返回 `""`（core-agent 把空字符串视为"跳过该段"）
- * - `names` 中存在但 `TOOL_CATALOG` 里查不到 → warn 日志 + 跳过该 name，不抛
- * - 输出按 `GROUP_ORDER` 固定顺序拼装，每个 group 内按 catalog 数组里出现的
- *   原始顺序——保证同样输入产生同样输出，KV cache 友好
+ * Behaviour:
+ * - empty `names` → return `""` (core-agent treats empty string as "skip
+ *   this section")
+ * - a name in `names` that is missing from `TOOL_CATALOG` → warn log +
+ *   skip that name; never throws
+ * - output is assembled in fixed `GROUP_ORDER`; within each group the
+ *   order matches the catalog array — same input → same output, KV
+ *   cache friendly
  */
 export function getToolsSystemPromptBlock(names: string[]): string {
   if (!names.length) return '';
@@ -134,7 +146,7 @@ export function getToolsSystemPromptBlock(names: string[]): string {
   if (!present.length) return '';
 
   const presentSet = new Set(present.map((e) => e.name));
-  const lines: string[] = ['## 可用工具 (tools)', '', PREAMBLE, ''];
+  const lines: string[] = ['## Available tools', '', PREAMBLE, ''];
 
   for (const { group, title } of GROUP_ORDER) {
     const groupEntries = TOOL_CATALOG.filter(
@@ -143,7 +155,7 @@ export function getToolsSystemPromptBlock(names: string[]): string {
     if (!groupEntries.length) continue;
     lines.push(`### ${title}`);
     for (const e of groupEntries) {
-      const perm = e.permission === 'localExec' ? '（受本机执行权限控制）' : '';
+      const perm = e.permission === 'localExec' ? ' (gated by local-execution permission)' : '';
       lines.push(`- **${e.name}** — ${e.summary}${perm}`);
     }
     lines.push('');

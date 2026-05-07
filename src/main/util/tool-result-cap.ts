@@ -46,6 +46,7 @@ export const MAX_RESULT_CHARS_BY_TOOL: Record<string, number> = {
   markdown_to_pdf: 4_000,
   html_to_pdf: 4_000,
   write_file: 4_000,
+  edit_file: 4_000,
   generate_image: 4_000,
 };
 

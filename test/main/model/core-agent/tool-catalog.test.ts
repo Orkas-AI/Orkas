@@ -86,23 +86,23 @@ describe('tool-catalog', () => {
   it('输出按 group 顺序分节，且只含命中分组', () => {
     // read_file (fs) + bash (shell) + kb_search (kb) → 三个分节按 fs/shell/kb 序
     const out = getToolsSystemPromptBlock(['kb_search', 'bash', 'read_file']);
-    const fsIdx = out.indexOf('### 文件 / 工作区');
-    const shellIdx = out.indexOf('### 命令行');
-    const kbIdx = out.indexOf('### 知识库');
+    const fsIdx = out.indexOf('### Files / workspace');
+    const shellIdx = out.indexOf('### Shell');
+    const kbIdx = out.indexOf('### Knowledge base');
     expect(fsIdx).toBeGreaterThan(-1);
     expect(shellIdx).toBeGreaterThan(fsIdx);
     expect(kbIdx).toBeGreaterThan(shellIdx);
     // 没命中的分组不出现
     expect(out).not.toContain('### PDF');
-    expect(out).not.toContain('### 图像');
+    expect(out).not.toContain('### Image');
   });
 
-  it('权限门工具有 (受本机执行权限控制) 后缀', () => {
+  it('权限门工具有 local-execution permission 后缀', () => {
     const out = getToolsSystemPromptBlock(['bash', 'read_file']);
     // bash 有 permission='localExec'，read_file 没有
     const bashLine = out.split('\n').find((l) => l.includes('**bash**'));
     const readLine = out.split('\n').find((l) => l.includes('**read_file**'));
-    expect(bashLine).toContain('受本机执行权限控制');
-    expect(readLine).not.toContain('受本机执行权限控制');
+    expect(bashLine).toContain('local-execution permission');
+    expect(readLine).not.toContain('local-execution permission');
   });
 });
