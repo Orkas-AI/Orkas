@@ -231,6 +231,8 @@
   "agents.input_desc_needed": "请输入简介",
   "agents.name_reserved": "该名称为系统保留（指挥官 / 总指挥），请换一个",
   "agents.name_taken": "该名称已被其他智能体使用，请换一个",
+  "agents.name_invalid": "名称只支持字母、数字、下划线、横线、中文，词之间允许单个空格",
+  "agents.name_too_long": "名称过长（最多 50 个字符）",
   "agents.ext_cli_needed": "请先选择外接智能体",
   "agents.create_failed": "创建失败",
   "agents.seed_workflow": "帮我完善这个智能体",

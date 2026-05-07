@@ -29,6 +29,22 @@ function _isReservedAgentName(name) {
   return _RESERVED_AGENT_NAMES.has(key);
 }
 
+// Mirror of `agents.ts::NAME_TOKEN_RE` so the form rejects junk before
+// the round-trip. Charset must round-trip through the bus's @-mention
+// regex; see backend for the full reasoning. UIs may still surface
+// server errors (E_AGENT_NAME_INVALID / E_AGENT_NAME_TOO_LONG) when
+// the LLM-driven path produces a bad name.
+const _NAME_TOKEN_RE = /^[A-Za-z0-9_一-鿿-]+(?: [A-Za-z0-9_一-鿿-]+)*$/;
+const _NAME_MAX_LENGTH = 50;
+function _isValidAgentNameCharset(name) {
+  const v = String(name || '');
+  const trimmed = v.trim();
+  if (!trimmed) return true;
+  if (v !== trimmed) return false;
+  if (trimmed.length > _NAME_MAX_LENGTH) return false;
+  return _NAME_TOKEN_RE.test(trimmed);
+}
+
 async function loadAgents(forceRefresh) {
   if (_agentsCache && !forceRefresh) { renderAgentsList(_agentsCache); return; }
   try {
@@ -731,6 +747,12 @@ async function _flushAgentFieldSave() {
     if (nameEl && _selectedAgent.name) nameEl.innerText = _selectedAgent.name;
     return;
   }
+  if (field === 'name' && !_isValidAgentNameCharset(value)) {
+    await uiAlert(t('agents.name_invalid'));
+    const nameEl = document.getElementById('agents-detail-name');
+    if (nameEl && _selectedAgent.name) nameEl.innerText = _selectedAgent.name;
+    return;
+  }
   try {
     const res = await apiFetch(`/api/agents/${encodeURIComponent(_selectedAgent.id)}/update`, {
       method: 'PUT',
@@ -925,6 +947,12 @@ async function _saveCreateAgent({ msgEl }) {
     document.getElementById('agent-name-input').focus();
     return;
   }
+  if (!_isValidAgentNameCharset(name)) {
+    msgEl.textContent = t('agents.name_invalid');
+    msgEl.className = 'form-msg err';
+    document.getElementById('agent-name-input').focus();
+    return;
+  }
   if (!description) {
     msgEl.textContent = t('agents.input_desc_needed');
     msgEl.className = 'form-msg err';
@@ -977,6 +1005,12 @@ async function _saveExternalAgent({ msgEl }) {
   }
   if (_isReservedAgentName(name)) {
     msgEl.textContent = t('agents.name_reserved');
+    msgEl.className = 'form-msg err';
+    document.getElementById('agent-ext-name-input').focus();
+    return;
+  }
+  if (!_isValidAgentNameCharset(name)) {
+    msgEl.textContent = t('agents.name_invalid');
     msgEl.className = 'form-msg err';
     document.getElementById('agent-ext-name-input').focus();
     return;
@@ -1039,6 +1073,8 @@ function _agentCreateErrorMessage(data) {
   const code = data.code;
   if (code === 'E_AGENT_NAME_TAKEN') return t('agents.name_taken');
   if (code === 'E_AGENT_NAME_RESERVED') return t('agents.name_reserved');
+  if (code === 'E_AGENT_NAME_INVALID') return t('agents.name_invalid');
+  if (code === 'E_AGENT_NAME_TOO_LONG') return t('agents.name_too_long');
   return data.error || '';
 }
 

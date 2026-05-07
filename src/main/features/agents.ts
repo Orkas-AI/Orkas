@@ -281,6 +281,39 @@ function assertAgentNameAllowed(name: string): void {
     err.code = 'E_AGENT_NAME_RESERVED';
     throw err;
   }
+  assertAgentNameCharsetValid(name);
+}
+
+// Agent names must round-trip through the @-mention regex used by the
+// router (`router.ts::TOKEN_CLASS = [A-Za-z0-9_一-鿿-]`) — slashes,
+// backslashes, dots, parens, control chars etc. either truncate the
+// match (so `@Agent/Skill搜罗大师` only matches `Agent`) or escape the
+// alternation arm at the regex stage. We additionally cap length and
+// allow a single internal space so multi-word display names
+// ("Code Review Helper") still resolve via the alternation. Leading /
+// trailing whitespace is rejected because UIs render names raw — stray
+// whitespace looks like a typo nobody can see to fix.
+const NAME_TOKEN_RE = /^[A-Za-z0-9_一-鿿-]+(?: [A-Za-z0-9_一-鿿-]+)*$/;
+const NAME_MAX_LENGTH = 50;
+function assertAgentNameCharsetValid(name: string): void {
+  if (name == null) return;
+  const trimmed = String(name);
+  if (!trimmed.trim()) return;
+  if (trimmed !== trimmed.trim()) {
+    const err: any = new Error(`agent name has leading or trailing whitespace`);
+    err.code = 'E_AGENT_NAME_INVALID';
+    throw err;
+  }
+  if (trimmed.length > NAME_MAX_LENGTH) {
+    const err: any = new Error(`agent name longer than ${NAME_MAX_LENGTH} characters`);
+    err.code = 'E_AGENT_NAME_TOO_LONG';
+    throw err;
+  }
+  if (!NAME_TOKEN_RE.test(trimmed)) {
+    const err: any = new Error(`agent name contains unsupported characters (only letters, digits, hyphen, underscore, CJK, and single internal spaces are allowed)`);
+    err.code = 'E_AGENT_NAME_INVALID';
+    throw err;
+  }
 }
 
 /** Reject names already in use by another agent (custom OR builtin).
