@@ -3133,6 +3133,93 @@ function _stripSubmissionTagForDisplay(text) {
     .trimEnd();
 }
 
+// Split a markdown buffer into alternating prose / code segments. "Code" =
+// fenced ``` / ~~~ blocks (≤3-space indent, info-string allowed) plus inline
+// backtick spans; everything else is prose. Used by the `<agent>` container
+// strippers so coding scenarios — where the LLM legitimately quotes `<agent>`
+// inside a code sample to explain how this app's structured-output protocol
+// works — don't see the bubble silently truncated. Mid-stream unclosed fences
+// are treated as code through end-of-buffer, matching how the markdown
+// renderer would paint them.
+function _splitMarkdownProseCode(text) {
+  const segs = [];
+  if (!text) return segs;
+  const n = text.length;
+  let proseStart = 0;
+  const flushProse = (end) => {
+    if (end > proseStart) segs.push({ kind: 'prose', text: text.slice(proseStart, end) });
+  };
+  let i = 0;
+  while (i < n) {
+    const lineStart = i === 0 || text[i - 1] === '\n';
+    if (lineStart) {
+      let j = i;
+      let indent = 0;
+      while (indent < 3 && text[j] === ' ') { j++; indent++; }
+      const ch = text[j];
+      if (ch === '`' || ch === '~') {
+        let count = 0;
+        while (text[j + count] === ch) count++;
+        if (count >= 3) {
+          let k = j + count;
+          while (k < n && text[k] !== '\n') k++;
+          let scan = k < n ? k + 1 : n;
+          let close = -1;
+          while (scan < n) {
+            let s = scan;
+            let pad = 0;
+            while (pad < 3 && text[s] === ' ') { s++; pad++; }
+            if (text[s] === ch) {
+              let cc = 0;
+              while (text[s + cc] === ch) cc++;
+              if (cc >= count) {
+                let lineEnd = s + cc;
+                while (lineEnd < n && text[lineEnd] !== '\n') lineEnd++;
+                close = lineEnd;
+                break;
+              }
+            }
+            while (scan < n && text[scan] !== '\n') scan++;
+            if (scan < n) scan++;
+          }
+          flushProse(i);
+          const endIdx = close >= 0 ? close : n;
+          segs.push({ kind: 'code', text: text.slice(i, endIdx) });
+          proseStart = endIdx;
+          i = endIdx;
+          continue;
+        }
+      }
+    }
+    if (text[i] === '`') {
+      let count = 0;
+      while (text[i + count] === '`') count++;
+      let j = i + count;
+      let close = -1;
+      while (j < n) {
+        if (text[j] === '`') {
+          let cc = 0;
+          while (text[j + cc] === '`') cc++;
+          if (cc === count) { close = j + cc; break; }
+          j += cc;
+        } else {
+          j++;
+        }
+      }
+      if (close > 0) {
+        flushProse(i);
+        segs.push({ kind: 'code', text: text.slice(i, close) });
+        proseStart = close;
+        i = close;
+        continue;
+      }
+    }
+    i++;
+  }
+  flushProse(n);
+  return segs;
+}
+
 // Collapse any ```agent-input-form fenced block in a streaming buffer to a
 // single-line placeholder so the user never sees the raw JSON being typed
 // char-by-char. Closed blocks get the placeholder inline; unclosed blocks
@@ -3146,11 +3233,22 @@ function _stripSubmissionTagForDisplay(text) {
 // a format variant and (b) streaming-time placeholders accidentally sticking
 // around. Both closed and unclosed containers get removed; consecutive blank
 // lines collapse to one.
+// Code-fence guard: only strip `<agent>` matches that fall in PROSE segments —
+// matches inside fenced code blocks or inline backtick spans are preserved so
+// the LLM can quote `<agent>` literally when explaining this app's structured-
+// output protocol. Without this guard, a coding-explanation reply that
+// mentioned `<agent>` ate the rest of the bubble (the unclosed-tag fallback
+// would match `<agent>[\s\S]*$` against the literal token and wipe the tail).
 function _stripSurvivingAgentBlocks(text) {
   if (!text || text.indexOf('<agent>') < 0) return text;
-  return text
-    .replace(/<agent>[\s\S]*?<\/agent>/g, '')
-    .replace(/<agent>[\s\S]*$/, '')
+  const out = _splitMarkdownProseCode(text)
+    .map((s) => s.kind === 'code'
+      ? s.text
+      : s.text
+          .replace(/<agent>[\s\S]*?<\/agent>/g, '')
+          .replace(/<agent>[\s\S]*$/, ''))
+    .join('');
+  return out
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
@@ -3176,9 +3274,16 @@ function _streamPlaceholderHtml(key) {
 function _stripAgentCreateBlocksForStream(buf) {
   if (!buf || buf.indexOf('<agent>') < 0) return buf;
   const placeholder = _streamPlaceholderHtml('chat.create_agent_streaming_placeholder');
-  let out = buf.replace(/<agent>[\s\S]*?<\/agent>/g, placeholder);
-  out = out.replace(/<agent>[\s\S]*$/, placeholder);
-  return out;
+  // Same code-fence guard as `_stripSurvivingAgentBlocks` — leave `<agent>`
+  // inside fenced blocks / backtick spans alone so coding explanations stream
+  // through verbatim.
+  return _splitMarkdownProseCode(buf)
+    .map((s) => s.kind === 'code'
+      ? s.text
+      : s.text
+          .replace(/<agent>[\s\S]*?<\/agent>/g, placeholder)
+          .replace(/<agent>[\s\S]*$/, placeholder))
+    .join('');
 }
 
 function _stripAgentFormBlockForStream(buf) {
