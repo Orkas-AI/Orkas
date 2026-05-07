@@ -43,7 +43,7 @@ import {
   PlanSetInput, StepStatus, PlanFile,
 } from './plan';
 import * as planExecutor from './plan_executor';
-import { userChatsDir, BUILTIN_SKILLS_DIR, userSkillsDir } from '../../paths';
+import { userChatsDir, BUILTIN_SKILLS_DIR, userSkillsDir, BUILTIN_AGENTS_DIR, userAgentsDir } from '../../paths';
 import * as agentsFeat from '../agents';
 import { isAgentEnabled } from '../component_enabled';
 import { buildLanguageDirective, t } from '../../i18n';
@@ -833,6 +833,14 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // in features/skills.ts). Builtin first to match the prompt's "按来源
   // 定位" guidance.
   const skillRoots = [BUILTIN_SKILLS_DIR, userSkillsDir(uid)];
+  // Same shape for agent directories: chat_commander.md tells the
+  // commander to `search_files` for an agent.json under
+  // `$custom_agents_dir/` and then `read_file` the matching agent.json
+  // before emitting an `<agent>` edit container — without these roots
+  // the read trips E_PATH_OUT_OF_SCOPE and the LLM falls back to
+  // rewriting from the slim `agents_index` view, which silently drops
+  // workflow / description / skill_list (the prompt warns about this).
+  const agentRoots = [BUILTIN_AGENTS_DIR, userAgentsDir(uid)];
   if (cliAgent) {
     // CLI-backed agent path: spawn the local CLI in the user's workspace
     // and forward its events as `process` events so the same UI rail
@@ -923,7 +931,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       hasProducedPath,
       cacheRetention: 'short',
       abortSignal: w.abortController.signal,
-      extraRoots: skillRoots,
+      extraRoots: [...skillRoots, ...agentRoots],
       ...(extraTools.length ? { extraTools } : {}),
       ...(skillList !== undefined ? { skillList } : {}),
     })) {
