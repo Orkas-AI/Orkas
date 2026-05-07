@@ -114,10 +114,9 @@ describe('paths › cloud-synced per-user', () => {
 });
 
 describe('paths › local (per-user, not synced)', () => {
-  it('contexts_tmp / auth / web-search / search / test land under <uid>/local/', async () => {
+  it('auth / web-search / search / test land under <uid>/local/', async () => {
     const p = await import('../../src/main/paths');
     const uid = 'u1';
-    expect(p.userContextsTmpDir(uid)).toBe(path.join(p.WS_ROOT, uid, 'local', 'contexts_tmp'));
     expect(p.userAuthProfilesFile(uid))
       .toBe(path.join(p.WS_ROOT, uid, 'local', 'config', 'auth-profiles.json'));
     expect(p.userWebSearchCache(uid))
@@ -173,12 +172,14 @@ describe('paths › ensureTopLevelLayout side effect', () => {
       path.join(tmpDir, 'u1', 'cloud', 'chats'),
       path.join(tmpDir, 'u1', 'cloud', 'sessions'),
       path.join(tmpDir, 'u1', 'cloud', 'config'),
-      path.join(tmpDir, 'u1', 'local', 'contexts_tmp'),
       path.join(tmpDir, 'u1', 'local', 'config'),
       path.join(tmpDir, 'u1', 'local', 'search'),
       path.join(tmpDir, 'u1', 'local', 'test'),
     ]) {
       expect(fs.existsSync(d), `expected ${d} to exist`).toBe(true);
     }
+    // contexts_tmp/ is retired — ensureUserLayout sweeps it on every
+    // activate; assert it is NOT present after layout init.
+    expect(fs.existsSync(path.join(tmpDir, 'u1', 'local', 'contexts_tmp'))).toBe(false);
   });
 });
