@@ -1901,13 +1901,12 @@ function _createStreamingAssistantMessage(container) {
         </summary>
         <div class="stream-process-body" data-role="process"></div>
       </details>
-      <div class="stream-thinking" data-role="thinking">
-        <span class="stream-thinking-dot"></span>
-        <span class="stream-thinking-dot"></span>
-        <span class="stream-thinking-dot"></span>
-        <span class="stream-thinking-label">${escapeHtml(t('chat.thinking_short'))}</span>
-      </div>
       <div class="stream-final" data-role="final" style="display:none"></div>
+      <div class="stream-thinking" data-role="thinking" aria-label="${escapeHtml(t('chat.thinking_short'))}">
+        <span class="stream-thinking-dot"></span>
+        <span class="stream-thinking-dot"></span>
+        <span class="stream-thinking-dot"></span>
+      </div>
     </div>
   `;
   msg.dataset.placeholder = '1';
@@ -3140,9 +3139,13 @@ function _stripAgentFormBlockForStream(buf) {
 }
 
 // Progressive renderer — append an assistant text delta into the final
-// bubble and re-render markdown. The first delta hides the "思考中" row and
-// reveals the `[data-role=final]` container. `_streamingSetFinal` is still
-// called at the terminal `final` event to guarantee a clean final render.
+// bubble and re-render markdown. The first delta reveals the `[data-role=final]`
+// container; the "思考中" row stays visible BELOW the body until the terminal
+// `final` / error / aborted event lands (so the user sees "partial reply +
+// still typing" instead of "partial reply + nothing happening"; the row is
+// rendered after `.stream-final` in `_createStreamingAssistantMessage`).
+// `_streamingSetFinal` is still called at the terminal `final` event to
+// guarantee a clean final render.
 //
 // Render throttling: every delta accumulates into `dataset.streamBuf`
 // synchronously, but the actual `renderMarkdownFull` + DOM swap only runs
@@ -3154,7 +3157,6 @@ function _stripAgentFormBlockForStream(buf) {
 // reader loop stays cheap and the browser paints between frames.
 function _streamingAppendFinalDelta(msg, piece) {
   if (!piece) return;
-  _hideThinking(msg);
   const finalEl = msg.querySelector('[data-role="final"]');
   if (!finalEl) return;
   const prev = msg.dataset.streamBuf || '';

@@ -2538,7 +2538,6 @@ body.model-not-configured .main-content { flex-direction: column; }
   font-size: 12.5px;
   padding: 2px 0;
 }
-.stream-thinking-label { margin-left: 4px; }
 .stream-thinking-dot {
   width: 5px;
   height: 5px;
@@ -2620,7 +2619,14 @@ body.model-not-configured .main-content { flex-direction: column; }
 .stream-final {
   /* Appears below process section with a subtle divider when process is open */
 }
-.stream-process[open] + .stream-final:not([style*="display:none"]) {
+/* Divider between the process trail and the final body — only when the
+   process section is actually visible. The placeholder bubble starts with
+   `.stream-process` carrying both `[open]` and inline `display:none` (so it
+   expands automatically the first time a process event arrives), and we
+   must NOT paint the dashed border above the body while the process row
+   is still hidden — otherwise the bubble shows a stray top divider above
+   the streaming text with nothing above it to separate from. */
+.stream-process[open]:not([style*="display:none"]) + .stream-final:not([style*="display:none"]) {
   margin-top: 8px;
   padding-top: 10px;
   border-top: 1px dashed var(--border);
