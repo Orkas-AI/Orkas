@@ -718,7 +718,7 @@ export async function createCustomAgent(
     // other required input. The agent worker reads the submitted
     // value to set CLI cwd.
     if (cliIsCodingAgent(rt.cli)) {
-      data.inputs = [PROJECT_DIR_INPUT];
+      data.inputs = [_buildProjectDirInput()];
     }
   }
   await writeJson(customAgentFile(agentId), data);
@@ -729,15 +729,20 @@ export async function createCustomAgent(
 
 /** Required-input schema injected on every external coding agent. The
  *  field id `project_dir` is a contract — the dispatch path looks for
- *  exactly this id when extracting the cwd from a form submission. */
+ *  exactly this id when extracting the cwd from a form submission.
+ *  Built at injection time so the persisted `label` follows the user's
+ *  current UI language (single-language per agent.json — bilingual lives
+ *  only in the locale table, not in the persisted schema). */
 export const PROJECT_DIR_INPUT_ID = 'project_dir';
-const PROJECT_DIR_INPUT: AgentInput = {
-  id: PROJECT_DIR_INPUT_ID,
-  type: 'directory',
-  label: '项目目录',
-  required: true,
-  default: '',
-};
+function _buildProjectDirInput(): AgentInput {
+  return {
+    id: PROJECT_DIR_INPUT_ID,
+    type: 'directory',
+    label: t('agent.cli.project_dir.label'),
+    required: true,
+    default: '',
+  };
+}
 
 export interface UpdateAgentFields {
   name?: string;
@@ -930,7 +935,7 @@ export async function updateCustomAgent(
     const wantsProjectDir = cliIsCodingAgent(finalCli);
     const inputs = Array.isArray(data.inputs) ? validateAgentInputs(data.inputs) : [];
     const without = inputs.filter((i) => i.id !== PROJECT_DIR_INPUT_ID);
-    if (wantsProjectDir) data.inputs = [PROJECT_DIR_INPUT, ...without];
+    if (wantsProjectDir) data.inputs = [_buildProjectDirInput(), ...without];
     else if (without.length) data.inputs = without;
     else delete data.inputs;
   }

@@ -51,7 +51,21 @@ async function loadAgents(forceRefresh) {
     const res = await apiFetch('/api/agents/list');
     const data = await res.json();
     if (data.ok) {
-      _agentsCache = data.agents || [];
+      // Sort once on cache fill so picker + grid share the order.
+      // Order: custom 组在前,组内按"汉字按拼音首字母 + 拉丁/数字/符号原样"
+      // 拼成 sort key 后字符串字典序。Electron 自带 small ICU,Intl.Collator
+      // 不识别 zh pinyin tailoring(co-pinyin / zh-Hans-CN 都不行),会让中
+      // 文堆一起、英文堆一起,所以靠 vendor/pinyin-firstletter 的查表把
+      // '悲观'→'bg' / 'Claude'→'claude' / 'Orkas'→'orkas' 后再比,得到
+      // 'agent < 悲(b) < 本(b) < claude < 乐(l) < orkas < 全(q)' 这种
+      // 用户预期的混排。后端 listAgents 内部按 agent_id(12 位随机 nanoid)
+      // 排,用户感知里等于"乱",这里覆盖掉。
+      _agentsCache = (data.agents || []).slice().sort((a, b) => {
+        if (a.source !== b.source) return a.source === 'custom' ? -1 : 1;
+        const ka = pinyinSortKey(a.name || a.agent_id || '');
+        const kb = pinyinSortKey(b.name || b.agent_id || '');
+        return ka < kb ? -1 : ka > kb ? 1 : 0;
+      });
       renderAgentsList(_agentsCache);
       // 老 spec 没存头像时回填到磁盘 —— 跨设备一致用 seed 派生（同一
       // agent_id 在任何机器都派生出同一组合，避免云同步时两端各写不同
@@ -1355,15 +1369,15 @@ function _renderAgentPickerList(filterText) {
         const aDesc = pickDesc(a, lang).trim();
         return `
         <div class="skill-picker-item" data-id="${escapeHtml(a.agent_id)}" data-name="${escapeHtml(a.name || a.agent_id)}">
-          <div>${escapeHtml(a.name || t('agents.unnamed'))}</div>
-          ${aDesc ? `<div style="font-size:11px;color:#9ca3af;margin-top:2px">${escapeHtml(aDesc)}</div>` : ''}
+          <div class="skill-picker-item-name">${escapeHtml(a.name || t('agents.unnamed'))}</div>
+          ${aDesc ? `<div class="skill-picker-item-desc">${escapeHtml(aDesc)}</div>` : ''}
         </div>`;
       }).join('');
   };
   const commanderHtml = (isRecipientPicker && commanderMatchesFilter)
     ? `<div class="skill-picker-item" data-id="__commander__" data-name="${escapeHtml(commanderName)}">
-         <div>${escapeHtml(commanderName)}</div>
-         <div style="font-size:11px;color:#9ca3af;margin-top:2px">${escapeHtml(t('chat.recipient_commander_hint'))}</div>
+         <div class="skill-picker-item-name">${escapeHtml(commanderName)}</div>
+         <div class="skill-picker-item-desc">${escapeHtml(t('chat.recipient_commander_hint'))}</div>
        </div>`
     : '';
   listEl.innerHTML = commanderHtml + groupHtml(t('agents.source_custom'), groups.custom) + groupHtml(t('agents.source_builtin'), groups.builtin);
