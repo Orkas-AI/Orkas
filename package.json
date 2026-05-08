@@ -1,6 +1,6 @@
 {
   "name": "orkas",
-  "version": "2026.4.30",
+  "version": "2026.5.8",
   "private": true,
   "license": "MIT",
   "description": "Orkas desktop — Electron + Node one-piece app",
