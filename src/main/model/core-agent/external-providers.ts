@@ -70,6 +70,23 @@ function moonshotContextWindow(modelId: string): number {
   return MOONSHOT_CONTEXT_WINDOW[modelId] ?? 131072;
 }
 
+// Per-model max output tokens. Why this needs a per-model table: pi-ai's
+// `simple-options.buildBaseOptions` reads `model.maxTokens` as the default
+// `max_tokens` request param (clamped at 32000 ceiling); a single hard-coded
+// value caps every model at the lowest common denominator and complex
+// structured replies get cut mid-stream with `stopReason: "length"` while
+// the renderer just shows whatever streamed before the cap. Numbers from
+// platform.kimi.com/docs/models (2026-04). Unknown ids fall back to 8192
+// to stay safe against providers that 400 on over-cap requests.
+const MOONSHOT_MAX_OUTPUT_TOKENS: Record<string, number> = {
+  'kimi-k2.6': 16384,
+  'kimi-k2.5': 16384,
+};
+
+function moonshotMaxOutputTokens(modelId: string): number {
+  return MOONSHOT_MAX_OUTPUT_TOKENS[modelId] ?? 8192;
+}
+
 /**
  * Build a `Model<"openai-completions">` object for a Moonshot model.
  * Exported for tests — production code usually goes through
@@ -94,7 +111,7 @@ export function buildMoonshotModel(modelId: string): Model<'openai-completions'>
     // users check the actual price on their Moonshot bill.
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: moonshotContextWindow(modelId),
-    maxTokens: 8192,
+    maxTokens: moonshotMaxOutputTokens(modelId),
   };
 }
 
@@ -141,6 +158,18 @@ function deepseekContextWindow(modelId: string): number {
   return DEEPSEEK_CONTEXT_WINDOW[modelId] ?? 131072;
 }
 
+// V4 reasoner series streams long reasoning + final answer; 32K matches
+// pi-ai's clamp ceiling in simple-options. Older `deepseek-chat` /
+// `deepseek-reasoner` and unknown ids fall back to the conservative 8192.
+const DEEPSEEK_MAX_OUTPUT_TOKENS: Record<string, number> = {
+  'deepseek-v4-pro':   32768,
+  'deepseek-v4-flash': 16384,
+};
+
+function deepseekMaxOutputTokens(modelId: string): number {
+  return DEEPSEEK_MAX_OUTPUT_TOKENS[modelId] ?? 8192;
+}
+
 export function buildDeepSeekModel(modelId: string): Model<'openai-completions'> {
   const curated = curatedModelsFor('deepseek').find((m) => m.id === modelId);
   return {
@@ -163,7 +192,7 @@ export function buildDeepSeekModel(modelId: string): Model<'openai-completions'>
     input: ['text'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: deepseekContextWindow(modelId),
-    maxTokens: 8192,
+    maxTokens: deepseekMaxOutputTokens(modelId),
   };
 }
 
@@ -245,6 +274,18 @@ function doubaoContextWindow(modelId: string): number {
   return DOUBAO_CONTEXT_WINDOW[modelId] ?? 131072;
 }
 
+// 火山方舟 Seed 2.0 系列官方 max_tokens 上限 16K（控制台接入点配置可见）。
+// 用户填的可能是 endpoint id（ep-xxxx）也可能是模型 id；endpoint id 形式
+// 走 fallback 8192 兜底，不会撞到上游 400。
+const DOUBAO_MAX_OUTPUT_TOKENS: Record<string, number> = {
+  'doubao-seed-2-0-pro-260215':  16384,
+  'doubao-seed-2-0-lite-260215': 16384,
+};
+
+function doubaoMaxOutputTokens(modelId: string): number {
+  return DOUBAO_MAX_OUTPUT_TOKENS[modelId] ?? 8192;
+}
+
 export function buildDoubaoModel(modelId: string): Model<'openai-completions'> {
   const curated = curatedModelsFor('doubao').find((m) => m.id === modelId);
   return {
@@ -266,7 +307,7 @@ export function buildDoubaoModel(modelId: string): Model<'openai-completions'> {
     input: ['text', 'image'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: doubaoContextWindow(modelId),
-    maxTokens: 8192,
+    maxTokens: doubaoMaxOutputTokens(modelId),
   };
 }
 
