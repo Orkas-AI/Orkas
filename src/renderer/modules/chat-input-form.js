@@ -76,18 +76,29 @@
       ctrlWrap.appendChild(ta);
       read = () => ta.value;
     } else if (field.type === 'select') {
-      const sel = document.createElement('select');
-      sel.className = 'form-field-input form-field-select';
-      for (const opt of (field.options || [])) {
-        const o = document.createElement('option');
-        o.value = opt.value;
-        o.textContent = opt.label || opt.value;
-        if (opt.value === initial) o.selected = true;
-        sel.appendChild(o);
-      }
-      if (disabled) sel.disabled = true;
+      // Use the shared `_aiSelectMount` widget instead of native <select>.
+      // Native chrome looks dated next to the rest of the app, and the
+      // settings/agent-edit pages already standardised on AiSelect.
+      // The submit-time form lock (`f.el.querySelectorAll('button')` →
+      // `disabled = true`) catches the trigger button, so no extra
+      // disabled wiring is needed beyond the initial-state branch below.
+      const sel = document.createElement('div');
       ctrlWrap.appendChild(sel);
-      read = () => sel.value;
+      const aiSel = _aiSelectMount(sel, {
+        placeholder: field.placeholder || undefined,
+      });
+      const options = (field.options || []).map((o) => ({
+        value: o.value,
+        label: o.label || o.value,
+      }));
+      aiSel.setOptions(options, {
+        value: typeof initial === 'string' ? initial : '',
+      });
+      if (disabled) {
+        const trigger = sel.querySelector('.ai-select-trigger');
+        if (trigger) trigger.disabled = true;
+      }
+      read = () => aiSel.getValue();
     } else if (field.type === 'multiselect') {
       // Checkbox group — clearer than <select multiple>, also better on mobile.
       const wrap = document.createElement('div');

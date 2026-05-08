@@ -2136,6 +2136,15 @@ body.model-not-configured .main-content { flex-direction: column; }
 }
 .chat-input-form .form-field-textarea { min-height: 56px; resize: vertical; }
 .chat-input-form .form-field-select { cursor: pointer; }
+/* form fields use the shared AiSelect for dropdowns; default is
+ * inline-block + min-width:180px which leaves it narrower than the
+ * sibling textarea/text-input. Make it block-level so it fills the
+ * form-field-ctrl column. */
+.chat-input-form .form-field-ctrl > .ai-select {
+  display: block;
+  min-width: 0;
+  width: 100%;
+}
 .chat-input-form .form-field-checkgroup {
   display: flex;
   flex-wrap: wrap;
@@ -2153,7 +2162,8 @@ body.model-not-configured .main-content { flex-direction: column; }
   cursor: pointer;
   accent-color: var(--primary);
 }
-.chat-input-form .form-field.is-error .form-field-input {
+.chat-input-form .form-field.is-error .form-field-input,
+.chat-input-form .form-field.is-error .ai-select .ai-select-trigger {
   border-color: var(--danger);
 }
 .chat-input-form .form-error {
@@ -2253,7 +2263,9 @@ body.model-not-configured .main-content { flex-direction: column; }
   border-color: rgba(148, 163, 184, 0.35);
 }
 .chat-input-form.is-submitted .form-field-input,
-.chat-input-form.is-submitted .form-field-input:focus {
+.chat-input-form.is-submitted .form-field-input:focus,
+.chat-input-form.is-submitted .ai-select .ai-select-trigger,
+.chat-input-form.is-submitted .ai-select .ai-select-trigger:focus {
   background: rgba(255, 255, 255, 0.6);
   color: var(--text);
   cursor: default;
