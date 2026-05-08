@@ -186,9 +186,11 @@ describe('search › re-exports from indexer', () => {
     expect(typeof s.upsertContext).toBe('function');
     expect(typeof s.dropContext).toBe('function');
     expect(typeof s.indexChatMessage).toBe('function');
-    expect(typeof s.indexSkillChatMessage).toBe('function');
-    expect(typeof s.indexAgentChatMessage).toBe('function');
     expect(typeof s.dropChatConversation).toBe('function');
     expect(typeof s.flushAll).toBe('function');
+    // skill / agent chat-message indexers were removed alongside the
+    // skill_chats / agent_chats search scopes (see `_unlinkLegacyIndexes`).
+    // Don't add assertions for them back — those scopes are intentionally
+    // out of search.
   });
 });

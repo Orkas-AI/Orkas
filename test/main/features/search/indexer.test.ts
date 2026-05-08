@@ -43,12 +43,6 @@ function writeChat(uid: string, cid: string, messages: unknown[]): void {
   fs.writeFileSync(file, messages.map((m) => JSON.stringify(m)).join('\n') + '\n');
 }
 
-function writeSkillChat(uid: string, sid: string, messages: unknown[]): void {
-  const dir = path.join(tmpDir, uid, 'cloud', 'chats', 'skill', sid);
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, 'chat.jsonl'), messages.map((m) => JSON.stringify(m)).join('\n') + '\n');
-}
-
 describe('search/indexer › reconcileContextsIndex', () => {
   it('returns silently when CONTEXTS_DIR is missing', async () => {
     const ix = await loadIndexer();
@@ -237,16 +231,18 @@ describe('search/indexer › upsertContext / dropContext', () => {
   });
 });
 
-describe('search/indexer › reconcileSkillChatsIndex', () => {
-  it('indexes per-skill chat.jsonl files', async () => {
-    writeSkillChat('u1', 's1', [{ role: 'user', content: 'skill keyword', time: 't' }]);
-    writeSkillChat('u1', 's2', [{ role: 'assistant', content: 'another skill', time: 't' }]);
+// 锁住 `9529d52c` 改的 spec:技能编辑 / 智能体编辑会话**不**进 search 索引。
+// 之前老版本有 reconcileSkillChatsIndex / reconcileAgentChatsIndex 会按 skill_id
+// 建索引,现在被剔除——search 只索引 contexts + 主对话 + agent/skill 本体规格。
+// 下次如有人把这两条索引函数复活,或者新人改 reconcileAll 时不小心把 skill_chats
+// 加回扫描列表,这里负责拦截。
+describe('search/indexer › skill / agent edit chats are out of search scope', () => {
+  it('does not expose `reconcileSkillChatsIndex` / `reconcileAgentChatsIndex`', async () => {
     const ix = await loadIndexer();
-    await ix.reconcileSkillChatsIndex('u1');
-    const paths = await import('../../../../src/main/paths');
-    const entry = await ix.getEntry(paths.userSkillChatsIndexPath('u1'), 'skill_chat');
-    expect(Object.keys(entry.idx.files).sort()).toEqual(['s1', 's2']);
-    expect(entry.idx.docs['skill_chat:s1:0']).toMatchObject({ skill_id: 's1' });
+    expect((ix as Record<string, unknown>).reconcileSkillChatsIndex).toBeUndefined();
+    expect((ix as Record<string, unknown>).reconcileAgentChatsIndex).toBeUndefined();
+    expect((ix as Record<string, unknown>).indexSkillChatMessage).toBeUndefined();
+    expect((ix as Record<string, unknown>).indexAgentChatMessage).toBeUndefined();
   });
 });
 

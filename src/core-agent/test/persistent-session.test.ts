@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PersistentSession } from "../src/agent/persistent-session.js";
+import type { MessageContent } from "../src/shared/types.js";
 
 // Mirrors the constant in persistent-session.ts; kept inline (not exported)
 // so the heal contract is testable without leaking an internal sentinel.
@@ -108,15 +109,56 @@ describe("PersistentSession", () => {
     expect(fs.statSync(file).size).toBe(0);
   });
 
-  it("tool result messages round-trip", () => {
+  it("paired tool_use + tool_result round-trip through reload", () => {
+    // 验证 valid pair 完整保留:assistant.tool_use 后接 user.tool_result。
+    // 这是 healOrphanToolUses 不会动的 happy path。
     const s1 = new PersistentSession({ sessionFile: file });
+    s1.addAssistantMessage([
+      { type: "tool_use", id: "call-123", name: "test_tool", input: {} } as MessageContent,
+    ]);
     s1.addToolResult("call-123", "tool output", undefined, false);
 
     const s2 = new PersistentSession({ sessionFile: file });
-    expect(s2.length).toBe(1);
-    const c = s2.getMessages()[0].content[0];
+    expect(s2.length).toBe(2);
+    const toolResultMsg = s2.getMessages()[1];
+    expect(toolResultMsg.role).toBe("user");
+    const c = toolResultMsg.content[0];
     expect(c.type).toBe("tool_result");
     expect((c as { toolUseId: string }).toolUseId).toBe("call-123");
+  });
+
+  it("orphan tool_result (no preceding tool_use) is dropped at load", () => {
+    // 锁住 `4773be73` 修的不变量:孤儿 tool_result 在 load 时被
+    // healOrphanToolUses 丢弃。否则下一次 provider 调用会被拒
+    // ("No tool call found for function call output with call_id ...")。
+    // 之前生产报这个错频繁,fix 是在 load 时主动清理;这条测试守住"清"
+    // 这个动作不能被未来的重构撤回。
+    const s1 = new PersistentSession({ sessionFile: file });
+    s1.addToolResult("call-orphan", "tool output", undefined, false);
+    expect(s1.length).toBe(1); // 写入时不拦,刚 add 还在内存里
+
+    const s2 = new PersistentSession({ sessionFile: file });
+    expect(s2.length).toBe(0); // load 时 healOrphanToolUses 把它丢了
+  });
+
+  it("orphan tool_result mixed with valid pair: orphan dropped, pair kept", () => {
+    // 一条 user 消息可以同时携带多个 tool_result block——只丢孤儿那个,
+    // 不要把整条 message 全删掉(否则会误伤同 message 里的合法 result)。
+    const s1 = new PersistentSession({ sessionFile: file });
+    s1.addAssistantMessage([
+      { type: "tool_use", id: "call-good", name: "t1", input: {} } as MessageContent,
+    ]);
+    // 手工拼一条同时包含合法 + 孤儿两个 tool_result 的 user 消息
+    s1.addMessage("user", [
+      { type: "tool_result", toolUseId: "call-good",   content: "ok",     isError: false } as MessageContent,
+      { type: "tool_result", toolUseId: "call-orphan", content: "stray",  isError: false } as MessageContent,
+    ]);
+
+    const s2 = new PersistentSession({ sessionFile: file });
+    expect(s2.length).toBe(2);
+    const blocks = s2.getMessages()[1].content;
+    expect(blocks).toHaveLength(1);
+    expect((blocks[0] as { toolUseId: string }).toolUseId).toBe("call-good");
   });
 
   it("creates parent directories if missing", () => {

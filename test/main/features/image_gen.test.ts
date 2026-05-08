@@ -123,7 +123,7 @@ describe('image_gen › pickImageGenProfile', () => {
     expect(picked).not.toBeNull();
     expect(picked!.entry.provider).toBe('openai');
     expect(picked!.entry.apiKey).toBe('sk-openai-xxx');
-    expect(picked!.capability.model).toBe('gpt-image-1');
+    expect(picked!.capability.model).toBe('gpt-image-2');
     expect(picked!.capability.api).toBe('openai');
   });
 
@@ -144,7 +144,7 @@ describe('image_gen › pickImageGenProfile', () => {
     const m = await import('../../../src/main/features/image_gen');
     const picked = m.pickImageGenProfile();
     expect(picked!.entry.profileId).toBe('google:studio');
-    expect(picked!.capability.model).toBe('gemini-2.5-flash-image-preview');
+    expect(picked!.capability.model).toBe('gemini-3.1-flash-image-preview');
     expect(picked!.capability.api).toBe('gemini');
   });
 });
