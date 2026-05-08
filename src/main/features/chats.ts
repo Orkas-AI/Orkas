@@ -110,11 +110,23 @@ export async function listConversations(userId: string): Promise<Conversation[]>
     // Last-activity timestamp for sidebar ordering. <cid>.jsonl mtime is
     // touched whenever the bus appends a message; falls back to the
     // index's updated_at / created_at when the file isn't there yet.
-    let lastActiveAt = c.updated_at || c.created_at || '';
+    //
+    // CAREFUL: `nowIso()` returns local-time ISO without `Z` suffix
+    // ("2026-05-07T15:00:00") while `mtime.toISOString()` is UTC with `Z`
+    // ("2026-05-07T07:00:00.000Z"). String-comparing the two formats
+    // ignores the timezone offset — at UTC+8 a local-time string compares
+    // 8h "ahead" of the same instant in UTC, so updated_at would always
+    // appear newer than mtime and the sidebar would order by creation
+    // time instead of actual last activity. Compare on numeric ms and
+    // emit a UTC ISO so the downstream sort can string-compare safely.
+    const updatedMs = c.updated_at ? new Date(c.updated_at).getTime() : 0;
+    const createdMs = c.created_at ? new Date(c.created_at).getTime() : 0;
+    let lastActiveMs = Math.max(updatedMs || 0, createdMs || 0);
     try {
-      const mtime = fs.statSync(path.join(dir, `${c.conversation_id}.jsonl`)).mtime.toISOString();
-      if (mtime > lastActiveAt) lastActiveAt = mtime;
+      const mtimeMs = fs.statSync(path.join(dir, `${c.conversation_id}.jsonl`)).mtime.getTime();
+      if (mtimeMs > lastActiveMs) lastActiveMs = mtimeMs;
     } catch { /* missing jsonl — keep updated_at */ }
+    const lastActiveAt = lastActiveMs ? new Date(lastActiveMs).toISOString() : (c.updated_at || c.created_at || '');
     out.push({ ...c, processing, processing_since: since, last_active_at: lastActiveAt });
   }
   out.sort((a, b) => (b.last_active_at || '').localeCompare(a.last_active_at || ''));
