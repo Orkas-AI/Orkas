@@ -32,6 +32,7 @@ import {
   type PlanFile, type PlanStep, type FailurePolicy,
 } from './plan';
 import type { ChatFormPayload } from './router';
+import { buildMention } from './router';
 
 /** Per-cid mutex guarding plan-state transitions. Without this, when N
  * parallel-group agents finish nearly simultaneously, their reconcile
@@ -854,9 +855,9 @@ async function dispatchStep(
 function assigneeDisplayPrefix(assignee: string): string {
   // The bus's @<id> → @<name> rewrite handles the case where assignee was an
   // id; here we just ensure the message starts with `@<assignee>` so the
-  // user sees who got dispatched.
-  const stripped = assignee.replace(/^@+/, '').trim();
-  return `@${stripped.replace(/\s+/g, '')}`;
+  // user sees who got dispatched. `buildMention` preserves whitespace (see
+  // its header).
+  return buildMention(assignee.replace(/^@+/, ''));
 }
 
 // ── Plan-complete signal ─────────────────────────────────────────────────

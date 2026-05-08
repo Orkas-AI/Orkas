@@ -41,7 +41,7 @@ export const subscribeBus = subscribe;
 export { startWatchdog, stopWatchdog } from './watchdog';
 import type { GroupMessage } from './visibility';
 import {
-  type ChatFormPayload, encodeSubmission,
+  type ChatFormPayload, encodeSubmission, buildMention,
 } from './router';
 
 const log = createLogger('group_chat.facade');
@@ -295,19 +295,23 @@ export async function markFormSubmittedAndDispatch(
     { form_id: formId, agent_id: agentId, fields: target.form.fields },
     values,
   );
-  // Prepend `@<agent-name>` (not the hex id) so the bubble reads naturally.
-  // Bus's name → id resolver still routes correctly via `agentNameToId`,
-  // and falling back to the id keeps the dispatch working if the agent
-  // was renamed/disabled between form emit and submit.
-  let mention = `@${agentId}`;
+  // `buildMention` keeps the display name verbatim (whitespace included);
+  // falling back to the id keeps the dispatch working if the agent was
+  // renamed/disabled between form emit and submit.
+  let mention = buildMention(agentId);
   try {
     const agentsFeat = await import('../agents');
     const ag = await agentsFeat.getAgent(agentId);
-    if (ag && ag.name) mention = `@${ag.name.replace(/\s+/g, '')}`;
+    if (ag && ag.name) mention = buildMention(ag.name);
   } catch (err) {
     log.warn(`form-submit name lookup failed agent=${agentId}: ${(err as Error).message}`);
   }
-  return { ok: true, submission: { text: `${mention} ${encoded}`, agent_id: agentId } };
+  // Newline (not space) between the @-mention and the bullet list so the
+  // markdown renderer treats them as a paragraph followed by a list. With a
+  // space, the leading `- ` of the first bullet sits inline with the mention
+  // and gets parsed as a hyphen in prose, dropping the first field out of
+  // the list and leaving subsequent bullets visually orphaned.
+  return { ok: true, submission: { text: `${mention}\n${encoded}`, agent_id: agentId } };
 }
 
 // ── Read messages (UI initial load) ──────────────────────────────────────

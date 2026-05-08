@@ -34,7 +34,7 @@ import {
   GroupMessage, appendVisible, readSlice, buildReplayPrefix,
 } from './visibility';
 import {
-  resolveRecipients, parseMentions,
+  resolveRecipients, parseMentions, buildMention,
   extractFormFromFinal, computeFormId, ChatFormPayload,
   extractAgentFieldBlocks, decodeSubmission,
 } from './router';
@@ -471,13 +471,14 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   // turns in its own session jsonl and mimics that pattern; cleaning the
   // output stream is more reliable than keeping the prompt perfectly tuned.
   // Only rewrites whole-token matches (regex word boundary) so embedded
-  // ids inside other content don't get touched.
+  // ids inside other content don't get touched. `buildMention` preserves
+  // whitespace in multi-word display names (see its header).
   let rewrittenText = text;
   for (const [aid, name] of idToName) {
     if (!name || name === aid) continue;
     const safeAid = aid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const re = new RegExp(`@${safeAid}\\b`, 'g');
-    rewrittenText = rewrittenText.replace(re, `@${name.replace(/\s+/g, '')}`);
+    rewrittenText = rewrittenText.replace(re, buildMention(name));
   }
 
   // Strip ALL `@user` / `@commander` mentions when they're the routed
@@ -1154,7 +1155,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
         const ag = await agentsFeat.getAgent(d.to);
         if (ag && (ag as any).name) name = (ag as any).name;
       } catch { /* fall back to raw id */ }
-      tags.push('@' + String(name).replace(/\s+/g, ''));
+      tags.push(buildMention(name));
     }
     outcome = { ...outcome, text: t('chat.commander_dispatch_only', { agents: tags.join(', ') }) };
   }
@@ -1338,7 +1339,7 @@ async function buildAgentsIndexBlock(_uid: string): Promise<string> {
       // Lead with `@<name>` so the LLM picks up the calling convention
       // visually; id is hidden — exposing hex strings in prompts trains
       // the LLM to leak them in user-visible text too.
-      const head = `- @${name} (Source: ${a.source})${desc}`;
+      const head = `- ${buildMention(name)} (Source: ${a.source})${desc}`;
       // Inline a slimmed inputs_schema (id / type / required / default /
       // label / options / min / max / accept) so commander knows what
       // params each agent expects when phrasing its `@<name>` dispatch

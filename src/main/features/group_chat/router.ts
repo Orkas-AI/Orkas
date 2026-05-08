@@ -79,6 +79,33 @@ export function parseMentions(
   return out;
 }
 
+/**
+ * Build an `@<name>` token for output (user bubbles, dispatch prefixes,
+ * `@<id>` → `@<name>` rewrites, form-submission text, pendingDispatch
+ * synthesis — every place code constructs an at-mention that ends up in a
+ * persisted message).
+ *
+ * Whitespace inside `name` is preserved verbatim. The parser side
+ * (`_buildMentionRe`) handles multi-word names via a longest-first named-alt
+ * regex, so stripping whitespace at construction time only mangles the
+ * display ("Agent Skill X" → "AgentSkillX") without buying any routing
+ * safety. Lookup-key normalisation (lower + strip-whitespace) lives in
+ * `_normalizeNameKey` and is its own concern — do not conflate with this.
+ *
+ * **Use this helper everywhere you would otherwise write `` `@${name}` ``**:
+ * having a single construction point is the only durable fix for the
+ * recurring "agent name with spaces gets mangled" class of bug
+ * (commits `ebf76e80` → `2eeee2f6` → `98ff0d2d` → form-submission round —
+ * each round only patched the discovered call site, leaving siblings to
+ * resurface the same regression). Future contributors who reach for the
+ * helper inherit the invariant for free; reviewing for inline
+ * `'@' + name.replace(/\s+/g, '')` is still recommended but no longer
+ * load-bearing once every existing site is migrated.
+ */
+export function buildMention(name: string): string {
+  return `@${String(name || '').trim()}`;
+}
+
 // ── Routing ──────────────────────────────────────────────────────────────
 
 export interface RouteResolution {
