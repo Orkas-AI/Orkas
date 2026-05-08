@@ -1,8 +1,8 @@
 // ─── Local CLI agents (renderer side) ─────────────────────────────────
 //
 // Two surfaces share this module:
-//   1. The agent-modal "外接" tab — selector lists every detected CLI
-//      (default: 未选择). Selecting one auto-fills name + description
+//   1. The agent-modal "external" tab — selector lists every detected CLI
+//      (default: "not selected"). Selecting one auto-fills name + description
 //      from CLI_DEFAULTS so a single click is enough to ship an
 //      external-agent shell.
 //   2. The agent-detail runtime selector (existing CLI-bound agents)
@@ -86,16 +86,17 @@ async function loadLocalCliEntries({ force = false } = {}) {
 
 // ── External-tab CLI selector (create modal) ───────────────────────────
 //
-// Sentinel value for "未选择" — distinct from empty string so a user who
+// Sentinel value for "not selected" — distinct from empty string so a user who
 // genuinely empties the selector still re-routes through this branch.
 const EXT_CLI_NONE = '__none__';
 
 let _extCliSelectApi = null;
 
 /**
- * Mount the External-tab CLI selector. Default option is 未选择;
- * detected CLIs follow. `onChange` fires with the chosen `LocalCliType`
- * (string) or null when the user reverts to 未选择 — agents.js wires
+ * Mount the External-tab CLI selector. Default option is "not
+ * selected"; detected CLIs follow. `onChange` fires with the chosen
+ * `LocalCliType` (string) or null when the user reverts to the "not
+ * selected" sentinel — agents.js wires
  * this to the auto-fill / project-dir-row toggling logic.
  *
  * Idempotent: re-mounting just resets options + value so a re-open of
@@ -106,7 +107,7 @@ async function mountExternalCliSelect(onChange) {
   if (!mount) return null;
   const entries = await loadLocalCliEntries();
   const available = entries.filter(e => e.available);
-  const noneLabel = t('agent_modal.ext_cli_none') || '未选择';
+  const noneLabel = t('agent_modal.ext_cli_none') || '(none)';
   const options = [
     { value: EXT_CLI_NONE, label: noneLabel },
     ...available.map(e => ({
@@ -131,7 +132,7 @@ async function mountExternalCliSelect(onChange) {
 }
 
 /** Read the currently-selected CLI type from the External tab, or null
- *  when the user kept "未选择". */
+ *  when the user kept the "not selected" sentinel. */
 function getExternalCliValue() {
   const v = _extCliSelectApi ? _extCliSelectApi.getValue() : EXT_CLI_NONE;
   if (!v || v === EXT_CLI_NONE) return null;
@@ -139,7 +140,8 @@ function getExternalCliValue() {
 }
 
 /** Programmatically set the External-tab selector (used by edit form
- *  to seed from the bound CLI). Pass null to revert to 未选择. */
+ *  to seed from the bound CLI). Pass null to revert to the "not
+ *  selected" sentinel. */
 function setExternalCliValue(cliType) {
   if (!_extCliSelectApi) return;
   _extCliSelectApi.setValue(cliType || EXT_CLI_NONE);

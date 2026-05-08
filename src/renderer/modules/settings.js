@@ -1,10 +1,11 @@
 // ─── Settings (entries-based: picker + priority list) ────────────────────
 // The page is split in two:
-//   1. "添加模型授权": pick provider + model, then "+ 添加账号" → either an
-//      API Key form or the OAuth flow, depending on what the provider
-//      supports. On success we auto-create a priority-list entry pointing
-//      at the new credential.
-//   2. "已配置（按优先级）": ordered list of (provider, model, profile)
+//   1. "Add model auth": pick provider + model, then "+ Add account" →
+//      either an API Key form or the OAuth flow, depending on what the
+//      provider supports. On success we auto-create a priority-list
+//      entry pointing at the new credential.
+//   2. "Configured (by priority)": ordered list of
+//      (provider, model, profile)
 //      entries. First = default model; later items are the fallback chain.
 //      Rows are drag-reorderable.
 
@@ -42,9 +43,10 @@ async function loadSettings() {
 }
 
 // ── Commander avatar ──
-// 指挥官头像走 prefs IPC，存到 preferences.json。修改后立即推回缓存
-// （conversation.js 的 _commanderAvatarCache）以便聊天行立即用上新头像，
-// 不用等下次 view 切换。
+// Commander avatar goes through the prefs IPC and lands in
+// preferences.json. After a change we immediately push it back to the
+// cache (conversation.js's _commanderAvatarCache) so chat rows pick up
+// the new avatar without waiting for the next view switch.
 
 async function _settingsRefreshCommanderAvatar() {
   try {
@@ -70,13 +72,15 @@ function _settingsRenderCommanderAvatar() {
   trigger.addEventListener('click', (e) => {
     e.stopPropagation();
     if (isAvatarPickerOpenFor(trigger)) { closeAvatarPicker(); return; }
-    // 指挥官头像图标固定 crown，picker 只显示颜色行。后端校验依然两个 token
-    // 都要带，所以保存时强制写 crown。
+    // The commander avatar's icon is fixed at crown, so the picker
+    // only shows the color row. Backend validation still requires both
+    // tokens, so we force-write crown on save.
     openAvatarPicker(trigger, cur, { allowCommanderCombo: true, hideIcons: true }, async (next) => {
       const icon = COMMANDER_DEFAULT.icon;
       _settingsState.commanderAvatar = { icon, color: next.color };
       cur.icon = icon; cur.color = next.color;
-      // 就地更新，保留 trigger 上的 click 监听 —— 用户可以连点几次直到满意。
+      // Update in place — the trigger's click listener is preserved so
+      // the user can click a few times in a row until satisfied.
       applyAvatarToElement(trigger, icon, next.color, 'commander');
       try {
         const res = await window.orkas.invoke('prefs.setCommanderAvatar', { icon, color: next.color });
@@ -143,9 +147,11 @@ function _settingsRenderLocalExec() {
   }
 }
 
-// ── Metacognition (Agent 元认知自演进) ──
-// 落到 preferences.json::metacognition_enabled，env `ORKAS_METACOGNITION='0'` 仍是
-// 更高优先级的 kill switch（`envForcedOff`），命中时 UI 把开关锁灰并提示。
+// ── Metacognition (agent self-evolution) ──
+// Stored at preferences.json::metacognition_enabled. The env var
+// `ORKAS_METACOGNITION='0'` is still a higher-priority kill switch
+// (surfaced as `envForcedOff`); when active, the UI greys out the
+// toggle and shows an explanatory hint.
 
 async function _settingsRefreshMetacognition() {
   try {
@@ -177,7 +183,7 @@ function _settingsRenderMetacognition() {
         if (res && res.ok) {
           _settingsState.metacognition = { ..._settingsState.metacognition, enabled: !!res.enabled };
         } else {
-          // 写失败时回滚 UI
+          // Roll back the UI on write failure.
           cb.checked = !next;
           _settingsLog.warn('setMetacognition rejected', res);
         }
@@ -268,9 +274,11 @@ async function _settingsRenderPicker() {
     if (p.supportsOAuth && p.supportsApiKey)       authHint = t('settings.oauth.support_api_and_oauth');
     else if (p.supportsOAuth && !p.supportsApiKey) authHint = t('settings.oauth.support_oauth_only');
     else if (p.supportsApiKey)                     authHint = t('settings.oauth.support_api_only');
-    // subscriptionNote 是"用错了会 401 白白浪费 key"级别的关键前提，
-    // 优先展示；授权方式能力次之。两条都有就用 ' · ' 串起来。
-    // subscriptionNote 是 i18n key（见 provider_catalog.ts 字段注释），渲染时翻译。
+    // subscriptionNote is the "wrong-account → 401 wastes the key"
+    // class of critical prerequisite, so it goes first; the auth
+    // capability hint comes second. Join with ' · ' when both exist.
+    // subscriptionNote is an i18n key (see the field comment in
+    // provider_catalog.ts) — translated on render.
     const subNote = p.subscriptionNote ? t(p.subscriptionNote) : '';
     const hint = [subNote, authHint].filter(Boolean).join(' · ');
     return { value: p.id, label, hint };
@@ -943,15 +951,15 @@ function _settingsSetRowStatus(el, kind, text, baseCls = 'account-row-status') {
 //
 // Shape mirrors the chat-entries list visually but uses simpler rows
 // (provider + label + delete). Provider list is fixed (Tavily / Serper /
-// Brave Search API / 百度 AI 搜索); see search-adapters.ts for the
+// Brave Search API / Baidu AI Search); see search-adapters.ts for the
 // canonical registry.
 
 const _SEARCH_PROVIDER_OPTIONS = [
   { id: 'tavily',            label: 'Tavily', docs: 'https://tavily.com/' },
   { id: 'serper',            label: 'Serper', docs: 'https://serper.dev/' },
   { id: 'brave-search',      label: 'Brave', docs: 'https://brave.com/search/api/' },
-  { id: 'baidu-ai-search',   label: '百度', docs: 'https://cloud.baidu.com/doc/qianfan-api/s/em82g4tlk' },
-  { id: 'metaso',            label: '秘塔', docs: 'https://metaso.cn/' },
+  { id: 'baidu-ai-search',   label: 'Baidu', docs: 'https://cloud.baidu.com/doc/qianfan-api/s/em82g4tlk' },
+  { id: 'metaso',            label: 'Metaso', docs: 'https://metaso.cn/' },
 ];
 
 function _searchProviderLabel(id) {

@@ -153,9 +153,12 @@ async function realReflectForAgent(uid: string, agentId: string, sinceMs: number
 
   // `runReflection` swallows provider/LLM/loop-exhaustion errors and returns
   // `''` instead of throwing (see core-agent runner.ts: line 687/745/749).
-  // 空串 = 实际什么都没跑成功，不应消耗 48h 冷却。LLM 真的判断"无需改动"
-  // 也会回至少一句话的解释（非空），所以 trim 后空白视作失败。具体失败原因
-  // 在 core-agent 日志里（log.error / log.warn 都打了），这里抛 generic 错。
+  // Empty string = nothing actually succeeded, so it must not burn the
+  // 48h cooldown. Even when the LLM concludes "no change needed", it
+  // returns at least one sentence of explanation (non-empty), so a
+  // post-trim blank is treated as failure. The specific failure reason
+  // is in the core-agent logs (log.error / log.warn both fire); we
+  // throw a generic error here.
   const responseText = await runner.runReflection(prompt);
   if (!responseText || !responseText.trim()) {
     throw new Error('reflection returned empty (provider/LLM error or max loops; see core-agent log)');

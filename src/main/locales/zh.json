@@ -101,5 +101,7 @@
   "skills.import_block.system_dir": "系统目录",
   "skills.import_block.credentials_dir": "用户凭证目录",
   "oauth.minimax.unparseable_response": "MiniMax OAuth 响应无法解析",
-  "oauth.minimax.register_error_hint": "（MiniMax OAuth 注册时报错：{message}）"
+  "oauth.minimax.register_error_hint": "（MiniMax OAuth 注册时报错：{message}）",
+  "provider.moonshot.note_paygo": "按量付费开放平台 API key，与 Kimi Coding Plan 月付订阅独立计费、不通用",
+  "provider.kimi_coding.note_subscription": "Kimi Coding Plan 月付订阅专用，走 Anthropic 协议端点，与 Moonshot 按量付费 API key 独立"
 }

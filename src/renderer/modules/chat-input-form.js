@@ -182,7 +182,7 @@
           pathLabel.title = value;
           pathLabel.classList.remove('is-empty');
         } else {
-          pathLabel.textContent = t('input.dir.none') || '（未选择）';
+          pathLabel.textContent = t('input.dir.none') || '(none selected)';
           pathLabel.removeAttribute('title');
           pathLabel.classList.add('is-empty');
         }
@@ -191,25 +191,25 @@
       const pickBtn = document.createElement('button');
       pickBtn.type = 'button';
       pickBtn.className = 'btn btn-sm form-field-dir-pick';
-      pickBtn.textContent = t('input.dir.pick') || '选择目录…';
+      pickBtn.textContent = t('input.dir.pick') || 'Choose directory…';
       const clearBtn = document.createElement('button');
       clearBtn.type = 'button';
       clearBtn.className = 'btn btn-sm form-field-dir-clear';
-      clearBtn.textContent = t('input.dir.clear') || '清除';
+      clearBtn.textContent = t('input.dir.clear') || 'Clear';
       pickBtn.disabled = disabled;
       clearBtn.disabled = disabled;
       pickBtn.addEventListener('click', async () => {
         try {
           const res = await window.orkas.invoke('common.pickDirectory', {
-            title: field.label || '选择目录',
+            title: field.label || 'Choose a directory',
           });
           if (res && !res.cancelled && res.path) {
             value = String(res.path);
             renderPath();
-            pickBtn.textContent = t('input.dir.change') || '更换…';
+            pickBtn.textContent = t('input.dir.change') || 'Change…';
             // Notify the form so the submit button re-evaluates `isReady`
             // — without this the button stays disabled (and shows the
-            // "请等待文件上传完成" hint) even after the user picks a dir.
+            // "please wait for upload to finish" hint) even after the user picks a dir.
             if (ctx && typeof ctx.onChange === 'function') ctx.onChange();
           }
         } catch (_) { /* user cancelled or no permission */ }
@@ -217,10 +217,10 @@
       clearBtn.addEventListener('click', () => {
         value = '';
         renderPath();
-        pickBtn.textContent = t('input.dir.pick') || '选择目录…';
+        pickBtn.textContent = t('input.dir.pick') || 'Choose directory…';
         if (ctx && typeof ctx.onChange === 'function') ctx.onChange();
       });
-      if (value) pickBtn.textContent = t('input.dir.change') || '更换…';
+      if (value) pickBtn.textContent = t('input.dir.change') || 'Change…';
       dirWrap.appendChild(pickBtn);
       dirWrap.appendChild(clearBtn);
       dirWrap.appendChild(pathLabel);
@@ -228,7 +228,7 @@
       read = () => value;
       // No `isReady` override: `isReady` is reserved for "in-flight"
       // states (e.g. file upload still going) which gate the submit
-      // button + show the "请等待文件上传完成" hint. Required-empty for a
+      // button + show the "please wait for upload to finish" hint. Required-empty for a
       // directory is reported by `_validate` on submit click, matching
       // text / number / select.
     } else {
@@ -428,7 +428,7 @@
   function _formatSummaryLine(field, value) {
     const fallback = t('chat.form.empty_value');
     if (value === undefined || value === null) return fallback;
-    if (field.type === 'boolean') return value === true ? '是' : '否';
+    if (field.type === 'boolean') return value === true ? 'yes' : 'no';
     if (field.type === 'select') {
       const opt = (field.options || []).find((o) => o.value === value);
       return opt ? (opt.label || opt.value) : String(value);
@@ -477,7 +477,7 @@
   //
   // Submitted/readonly forms render *the same* widget — same fields, same
   // controls, same layout — just with every input disabled and the
-  // submit/reset buttons replaced by a "已提交 · time" stamp. This way the
+  // submit/reset buttons replaced by a "submitted · time" stamp. This way the
   // bubble looks identical before and after submit, and the user always
   // sees the structured form (not a degraded text summary) on refresh.
   function renderChatInputForm(container, message, opts = {}) {
@@ -535,7 +535,7 @@
     }
     container.appendChild(bodyEl);
 
-    // Submitted forms get a "已提交 · time" stamp instead of action buttons.
+    // Submitted forms get a "submitted · time" stamp instead of action buttons.
     if (submitted) {
       const stamp = document.createElement('div');
       stamp.className = 'form-submitted-stamp';

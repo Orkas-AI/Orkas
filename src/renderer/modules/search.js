@@ -6,7 +6,7 @@
 const _SEARCH_HISTORY_KEY = 'search_history';
 const _SEARCH_HISTORY_MAX = 12;
 const _SEARCH_FETCH_LIMIT = 200;   // backend cap; we filter/slice locally per tab
-const _SEARCH_ALL_PER_SECTION = 10; // "all" tab shows up to N per section, overflow → 查看更多
+const _SEARCH_ALL_PER_SECTION = 10; // "all" tab shows up to N per section, overflow → "view more"
 let _searchTimer = null;
 let _searchSeq = 0;
 let _searchTab = 'all';             // 'all' | 'chat' | 'agent' | 'skill' | 'context'
@@ -264,8 +264,11 @@ function _renderSearchResults(query) {
   const parts = [];
   const visible = [];
 
-  // "全部" tab 顺序：对话 → 智能体 → 技能 → 知识库；每段最多 _SEARCH_ALL_PER_SECTION 条，
-  // 超出给"查看更多"按钮跳到对应 tab。其它 tab 只显示自己那段（不截顶，让用户能滚完）。
+  // "All" tab order: chats → agents → skills → knowledge base; each
+  // section caps at _SEARCH_ALL_PER_SECTION rows, with overflow
+  // surfacing a "view more" button that jumps to the matching tab.
+  // Other tabs render their own section only (no cap, so the user can
+  // scroll through everything).
   const sections = [
     { tab: 'chat',    bucket: chats,    labelKey: 'search.section.chat' },
     { tab: 'agent',   bucket: agents,   labelKey: 'search.section.agent' },

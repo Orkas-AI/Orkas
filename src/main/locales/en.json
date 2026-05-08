@@ -101,5 +101,7 @@
   "skills.import_block.system_dir": "System directory",
   "skills.import_block.credentials_dir": "User credentials directory",
   "oauth.minimax.unparseable_response": "MiniMax OAuth response could not be parsed",
-  "oauth.minimax.register_error_hint": " (MiniMax OAuth registration error: {message})"
+  "oauth.minimax.register_error_hint": " (MiniMax OAuth registration error: {message})",
+  "provider.moonshot.note_paygo": "Pay-as-you-go open-platform API key — billed separately from the Kimi Coding Plan subscription; the two keys are not interchangeable",
+  "provider.kimi_coding.note_subscription": "Kimi Coding Plan monthly subscription only — uses the Anthropic-protocol endpoint, separate from the pay-as-you-go Moonshot API key"
 }

@@ -9,7 +9,7 @@ let _agentFieldSaveTimer = null;
 // Mirror of `agents.ts::RESERVED_AGENT_NAMES` so the renderer can fail fast
 // without a round-trip. Server is still authoritative — this is just UX.
 const _RESERVED_AGENT_NAMES = new Set(['指挥官', '总指挥', 'commander']);
-/** Look up the localized "外接 · <Brand>" label for an agent runtime
+/** Look up the localized "External · <Brand>" label for an agent runtime
  *  type. The external badge (formerly "CLI · X") is the single
  *  user-facing tag for cli-runtime agents — name surfaces consistently
  *  in cards, detail page, and edit form. */
@@ -52,14 +52,19 @@ async function loadAgents(forceRefresh) {
     const data = await res.json();
     if (data.ok) {
       // Sort once on cache fill so picker + grid share the order.
-      // Order: custom 组在前,组内按"汉字按拼音首字母 + 拉丁/数字/符号原样"
-      // 拼成 sort key 后字符串字典序。Electron 自带 small ICU,Intl.Collator
-      // 不识别 zh pinyin tailoring(co-pinyin / zh-Hans-CN 都不行),会让中
-      // 文堆一起、英文堆一起,所以靠 vendor/pinyin-firstletter 的查表把
-      // '悲观'→'bg' / 'Claude'→'claude' / 'Orkas'→'orkas' 后再比,得到
-      // 'agent < 悲(b) < 本(b) < claude < 乐(l) < orkas < 全(q)' 这种
-      // 用户预期的混排。后端 listAgents 内部按 agent_id(12 位随机 nanoid)
-      // 排,用户感知里等于"乱",这里覆盖掉。
+      // Order: custom group first, then within each group sort by a key
+      // built from "Chinese chars → pinyin first letter, Latin / digits
+      // / punctuation pass through unchanged" and compare as a plain
+      // string. Electron ships small ICU; Intl.Collator does not
+      // recognize zh pinyin tailoring (neither co-pinyin nor
+      // zh-Hans-CN works), so Chinese ends up clumped together and
+      // Latin clumped together. We use vendor/pinyin-firstletter's
+      // table to map e.g. '悲观' → 'bg' / 'Claude' → 'claude' /
+      // 'Orkas' → 'orkas' before comparing, yielding the user-expected
+      // mixed-script ordering ('agent < 悲(b) < 本(b) < claude < 乐(l)
+      // < orkas < 全(q)'). Without this, the backend's listAgents
+      // internal sort (by agent_id, a 12-char nanoid) feels random to
+      // users. The override here fixes that.
       _agentsCache = (data.agents || []).slice().sort((a, b) => {
         if (a.source !== b.source) return a.source === 'custom' ? -1 : 1;
         const ka = pinyinSortKey(a.name || a.agent_id || '');
@@ -67,11 +72,15 @@ async function loadAgents(forceRefresh) {
         return ka < kb ? -1 : ka > kb ? 1 : 0;
       });
       renderAgentsList(_agentsCache);
-      // 老 spec 没存头像时回填到磁盘 —— 跨设备一致用 seed 派生（同一
-      // agent_id 在任何机器都派生出同一组合，避免云同步时两端各写不同
-      // 值导致冲突）。已经有 icon+color 的 entry 直接跳过，所以反复
-      // 调用 loadAgents 不会重复写。后台异步即可，不阻塞渲染：渲染层
-      // 自己也会用 seed 兜底，跟回填值一致，所以肉眼不会看到任何变化。
+      // Backfill avatars to disk when older specs lack them — derive
+      // from the seed for cross-device consistency (the same agent_id
+      // produces the same icon/color combination on every machine, so
+      // cloud sync won't see two ends writing different values and
+      // colliding). Entries that already have icon + color are
+      // skipped, so repeated loadAgents calls don't re-write.
+      // Asynchronous so it doesn't block rendering — the render layer
+      // also seeds an avatar fallback whose value matches what we
+      // backfill, so the user sees no visual change.
       _backfillMissingAvatars(_agentsCache).catch((e) => {
         _agentsLog.warn('avatar backfill failed', e);
       });
@@ -100,8 +109,9 @@ async function _backfillMissingAvatars(agents) {
         a.color = res.agent.color;
       }
     } catch (e) {
-      // 失败也无所谓 —— 渲染层 seed 兜底依然会出同一组合，
-      // 下次 loadAgents 再尝试。
+      // Failure here doesn't matter — the render layer's seed-based
+      // fallback still produces the same combination, and the next
+      // loadAgents call will retry.
       _agentsLog.warn(`backfill ${a.agent_id} failed`, e);
     }
   }
@@ -458,8 +468,10 @@ function _renderAgentDetail(agent, editing) {
   if (!editing && !localizedDesc) descEl.innerHTML = unsetHtml;
 
   // Detail header actions, fixed order:
-  //   使用(icon) / 编辑 / 启用-禁用 / 内置(custom+dev) / 删除
-  // Edit mode hides everything except the 完成 button (the relabeled 编辑).
+  //   use (icon) / edit / enable-disable / promote-to-builtin
+  //   (custom + dev) / delete
+  // Edit mode hides everything except the "done" button (the relabeled
+  // "edit" button).
   const useBtn = document.getElementById('agent-use-btn');
   const enableBtn = document.getElementById('agent-enabled-btn');
   const promoteBtn = document.getElementById('agent-promote-btn');
@@ -642,9 +654,10 @@ function _renderAgentDetailAvatar(agent) {
   });
 }
 
-/** Per-agent 启用 / 禁用 button in the detail header. Clone-replace to drop
- *  any prior click handler bound to a stale agent id. The button label
- *  flips between 启用 / 禁用 (whichever the click would do). */
+/** Per-agent enable / disable button in the detail header.
+ *  Clone-replace to drop any prior click handler bound to a stale
+ *  agent id. The button label flips between "enable" and "disable"
+ *  (whichever the click would do). */
 function _renderAgentEnabledButton(agent) {
   const oldBtn = document.getElementById('agent-enabled-btn');
   if (!oldBtn) return;
@@ -707,7 +720,7 @@ async function _enterAgentEditMode() {
 
 async function _exitAgentEditMode() {
   _agentEditing = false;
-  // Abort any in-flight reply so 完成 stops the stream immediately. The
+  // Abort any in-flight reply so the "done" button stops the stream immediately. The
   // agent chat controller is a singleton; leaving it pending also leaks the
   // streaming-button state into the next agent's edit panel.
   try { _agentChatCtrl?.abort(); } catch (_) { /* ignore */ }
@@ -748,7 +761,7 @@ function _scheduleAgentFieldSave(field, value) {
 }
 
 let _pendingAgentField = null;
-// `validate` is only true when the user explicitly commits (clicks 完成 →
+// `validate` is only true when the user explicitly commits (clicks "done" →
 // `_exitAgentEditMode`). Typing-debounced and blur-triggered flushes pass
 // false: a bad name silently skips the save (the DOM keeps the user's
 // in-progress text) instead of popping a uiAlert mid-keystroke.
@@ -805,21 +818,22 @@ async function _flushAgentFieldSave({ validate = false } = {}) {
   }
 }
 
-// ─── Create agent (modal-first, two tabs: 创建 / 外接) ───
+// ─── Create agent (modal-first, two tabs: Create / External) ───
 //
-// "创建" (default tab) — manual authoring of an in-process agent. The
-// LLM-driven edit chat opens immediately on save so the workflow can
-// be refined.
+// "Create" (default tab) — manual authoring of an in-process agent.
+// The LLM-driven edit chat opens immediately on save so the workflow
+// can be refined.
 //
-// "外接" — bind a local CLI as the runtime. CLI selector is at the top
-// (default 未选择); selecting a CLI auto-fills name + description from
+// "External" — bind a local CLI as the runtime. The CLI selector sits
+// at the top (default "not selected"); selecting a CLI auto-fills
+// name + description from
 // CLI_DEFAULTS. The user can override either; subsequent CLI swaps
 // only re-fill fields that still match the previous CLI's defaults
 // (so a user-edited value is never clobbered).
 //
 // Track the last-applied CLI defaults so that "switch CLI → fields
 // follow" can detect "did the user touch this field?". `null` =
-// nothing applied yet (untouched-default state, or 创建 tab).
+// nothing applied yet (untouched-default state, or the "create" tab).
 
 function _switchAgentTab(tab) {
   const tabs = document.querySelectorAll('#agent-modal-tabs [data-agent-tab]');
@@ -885,8 +899,8 @@ function _applyExternalCliDefaults(cliType, { force = false } = {}) {
     || (prev && descEl.value === prevDescLocalized);
 
   if (cliType === null) {
-    // Reverted to 未选择 — only clear fields that still hold the
-    // previous CLI's defaults. Keep user-typed text.
+    // Reverted to "not selected" — only clear fields that still hold
+    // the previous CLI's defaults. Keep user-typed text.
     if (nameUntouched) nameEl.value = '';
     if (descUntouched) descEl.value = '';
   } else {
@@ -1179,7 +1193,7 @@ async function _loadAgentChatHistory(agentId) {
   _ensureAgentChatController();
   await _agentChatCtrl.loadHistory();
   // Custom empty-state message for fresh agents — controller's default is
-  // "无对话记录..."; replace it with an agent-specific prompt when empty.
+  // "no messages..."; replace it with an agent-specific prompt when empty.
   const container = document.getElementById('agents-chat-messages');
   const empty = container?.querySelector('.empty');
   const defaultEmptyText = t('chat.empty');
@@ -1195,15 +1209,16 @@ async function clearAgentChat() {
   await _agentChatCtrl.clear();
 }
 
-// ─── "使用" flow: new normal conversation seeded with "运行 <name>" ───
+// ─── "Use" flow: new normal conversation seeded with "run <name>" ───
 
 /**
- * Run an agent: creates a fresh normal conversation, navigates to it, then
- * auto-sends a short user-visible message ("运行 <name>"). The model sees
- * the same visible text and recognises it as a run-agent directive per
- * chat_commander.md rule 0 (instruction following) — no hidden backend injection.
+ * Run an agent: creates a fresh normal conversation, navigates to it,
+ * then auto-sends a short user-visible message ("run <name>"). The
+ * model sees the same visible text and recognises it as a run-agent
+ * directive per chat_commander.md rule 0 (instruction following) — no
+ * hidden backend injection.
  *
- * `seedText` is the user-visible content. Defaults to "运行 <name>".
+ * `seedText` is the user-visible content. Defaults to "run <name>".
  */
 async function useAgent(agentId, seedText) {
   if (!ensureModelConfigured()) return;
@@ -1221,7 +1236,7 @@ async function useAgent(agentId, seedText) {
     // from the first user message, same rule as every other conv-creation
     // entry point (new-chat panel, commander @-mention). Optimistic title
     // is the run-prefix message itself so the sidebar entry shows the
-    // user's intent ("运行 <name>") instead of bare agent name; this
+    // user's intent ("run <name>") instead of bare agent name; this
     // matches what backend `autoTitle` will persist on the same `visible`.
     const res = await apiFetch('/api/conversations/create', {
       method: 'POST',
@@ -1248,7 +1263,8 @@ async function useAgent(agentId, seedText) {
 }
 
 async function useSkill(skillId, skillName) {
-  // Skill 使用：跳转到新对话页，预选该技能，等用户输入。
+  // Skill "use" flow: navigate to the new-chat page with the skill
+  // pre-selected and wait for user input.
   _agentsLog.info('use skill', { skill_id: skillId, skill_name: skillName || skillId });
   setView('new-chat');
   setChatSkill('new-chat', skillName || skillId);
@@ -1430,7 +1446,7 @@ function _moveAgentPickerActive(delta) {
 
 // Route an agent selection to the right behaviour based on which button
 // triggered the picker:
-//   - conversation toolbar → send/queue "运行 <name>" in the CURRENT conv.
+//   - conversation toolbar → send/queue "run <name>" in the CURRENT conv.
 //     Never opens a new conv. No hidden backend injection — the model reads
 //     the visible message and follows chat_commander.md rule 0.
 //   - new-chat toolbar → create a new normal conv + run agent (useAgent)
@@ -1541,9 +1557,9 @@ function bindAgentPickers() {
   };
   // Backspace right after a `@<name>` token (with or without the trailing
   // space the picker inserts) should remove the whole mention as one unit
-  // — character-by-character deletion of `@张三 ` is annoying when the
-  // user picked the wrong agent. Match the same charset as the bus
-  // mention regex so `@中文名字` works.
+  // — character-by-character deletion of a mention like `@<CJK-name> `
+  // is annoying when the user picked the wrong agent. Match the same
+  // charset as the bus mention regex so CJK names work.
   const MENTION_DELETE_RE = /@[A-Za-z0-9_一-鿿-]+ ?$/u;
   const onBackspaceMention = (e) => {
     if (e.key !== 'Backspace') return;

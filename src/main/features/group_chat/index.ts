@@ -115,7 +115,8 @@ export async function listMembers(userId: string, cid: string) {
   // can decide on its own whether to auto-target the input box at this agent
   // when its plan step goes in_progress. Read from the live agent file each
   // call (no caching) — agents.ts maintains its own list cache so the read
-  // is cheap, and "interactive 跟随 agent 当前配置" is the contract.
+  // is cheap, and "interactive follows the agent's current spec" is the
+  // contract.
   const agentsFeat = await import('../agents');
   const enriched = await Promise.all(m.actors.map(async (a) => {
     if (a.kind !== 'agent') return a;

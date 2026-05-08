@@ -476,7 +476,7 @@ function _aiSelectMount(el, config) {
   const state = {
     options: [],        // [{value, label, hint?}]
     value: '',
-    placeholder: (typeof t === 'function' ? t('ai_select.placeholder') : '— 请选择 —'),
+    placeholder: (typeof t === 'function' ? t('ai_select.placeholder') : '— Select —'),
     onChange: () => {},
     open: false,
     activeIdx: -1,

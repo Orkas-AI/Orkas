@@ -5,7 +5,7 @@
  * Resolution order on every call:
  *   1. If the user configured ANY paid search API key (`searchProfiles`),
  *      route the query through the first usable adapter (Tavily / Serper /
- *      Brave / 百度 AI 搜索). On success → return; on failure → fall
+ *      Brave / Baidu AI Search). On success → return; on failure → fall
  *      through to step 2 with a noted error.
  *   2. Otherwise, delegate to the keyless Brave/Bing HTML scraper exposed
  *      by core-agent as `runBuiltinWebSearch` — same behavior as before

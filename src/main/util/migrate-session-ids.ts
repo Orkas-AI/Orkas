@@ -1,19 +1,27 @@
 /**
- * 一次性数据迁移：把 session jsonl 文件名上的历史品牌前缀剥掉。
+ * One-shot data migration: strip the legacy brand prefix from session jsonl
+ * filenames.
  *
- * 旧版本曾把 session_id 写成 `<brand>-<uid>-<kind>-<tail>` 的形式；当前规范
- * 统一为 `<uid>-<kind>-<tail>`（无品牌前缀，避免任何分叉/改名再断历史）。
+ * Older builds wrote session_ids as `<brand>-<uid>-<kind>-<tail>`; the
+ * current canonical form is `<uid>-<kind>-<tail>` (no brand prefix, so any
+ * future fork or rename can't break history again).
  *
- * 迁移策略：
- *   1. 扫 `<uid>/cloud/sessions/*.jsonl`
- *   2. 命中 `^<legacy-prefix>-<uid>-(.+)\.jsonl$` 重命名为 `<uid>-$1.jsonl`
- *   3. 已经是新格式的 → 跳过
- *   4. 同名冲突（极罕见，理论上同一 sid 不会两份）→ log.warn 后跳过，让人工处理
- *   5. `<uid>/local/.migrations` 写一行 `decouple-session-id-from-brand-v1` 防重跑
+ * Migration strategy:
+ *   1. Scan `<uid>/cloud/sessions/*.jsonl`
+ *   2. Match `^<legacy-prefix>-<uid>-(.+)\.jsonl$` and rename to
+ *      `<uid>-$1.jsonl`
+ *   3. Already-new-format files are skipped
+ *   4. Same-name conflicts (extremely rare — in theory there should not
+ *      be two copies of one sid) are log.warn'd and skipped for manual
+ *      handling
+ *   5. `<uid>/local/.migrations` is stamped with a single line
+ *      `decouple-session-id-from-brand-v1` to prevent re-runs
  *
- * 历史 kind（`organizer` / `sub` / `conv`）不在白名单，但迁移仅看前缀不看 kind，
- * 所以这些老会话也会被一并去前缀。它们的 jsonl 内容仍然有效（用户可以打开
- * 历史群聊看记录），只是新代码不会再生成这种 kind。
+ * Legacy kinds (`organizer` / `sub` / `conv`) aren't on the whitelist, but
+ * since the migration only looks at the prefix and not the kind, those
+ * sessions also get the prefix stripped. Their jsonl content is still
+ * valid (users can open old group-chat history); new code just no
+ * longer generates those kinds.
  */
 
 import * as fs from 'node:fs';

@@ -92,7 +92,7 @@ export async function listConversations(userId: string): Promise<Conversation[]>
   //   2. bus is mid-flush — e.g. user clicked abort while a tool was in
   //      flight; state.json flips to 'aborted' immediately but the worker's
   //      runTurn still has to unwind (await tool finish → outcome → enqueue
-  //      the "（已中断）" + processItems message). On-disk status looks
+  //      the "(stopped)" + processItems message). On-disk status looks
   //      terminal but jsonl is still growing. If the renderer reloads in
   //      this window (Cmd+R right after stop) and we say processing=false,
   //      it stops polling and never picks up the late abort message — user

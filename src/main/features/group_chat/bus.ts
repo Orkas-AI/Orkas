@@ -77,7 +77,7 @@ export type GroupEvent =
    * append a new bubble alongside (turn_end=false). Without this distinction,
    * a tool-emitted mid-turn message wrongly consumes commander's placeholder
    * and a NEW placeholder gets recreated by post-tool process events, ending
-   * up as a stuck "思考中" bubble when commander's turn ends silently. */
+   * up as a stuck "thinking" bubble when commander's turn ends silently. */
   | { type: 'message'; cid: string; msg: GroupMessage; turn_end?: boolean }
   | { type: 'process'; cid: string; actor: string; data: Record<string, unknown> }
   | { type: 'plan_changed'; cid: string }
@@ -143,7 +143,7 @@ interface WorkerState {
   pendingPlanAnnouncement?: string;
   /** Single-agent dispatches staged by `dispatch_to` mid-turn; flushed via
    * `bus.enqueue(forceTo=[X], dispatch:true)` at runTurn end so the recipient
-   * worker can't抢跑 — it only wakes after commander's text reply persisted +
+   * worker can't jump the gun — it only wakes after commander's text reply persisted +
    * placeholder cleaned. Same staging pattern as pendingPlanAnnouncement +
    * deferred planExecutor.reconcile, just for direct dispatches. */
   pendingDispatches?: Array<{ to: string; message: string }>;
@@ -231,7 +231,7 @@ export function isQuiescent(uid: string, cid: string): boolean {
 /** Recompute the on-disk `status` field based on actual worker / queue
  *  state. Honors the sticky `aborted` flag — once aborted, ONLY an
  *  explicit USER `enqueue` clears it (so a follow-up worker reply
- *  triggered by the abort itself, like the "（已中断）" message,
+ *  triggered by the abort itself, like the "(stopped)" message,
  *  doesn't surreptitiously revert status to 'idle'). The whole
  *  read-decide-write is mutex-guarded via `transitionStatus`, so a
  *  concurrent `setStatus('aborted')` (from `bus.abort`) cannot land
@@ -336,7 +336,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
 
   // Reset the sticky `aborted` flag ONLY when the human (user) sends
   // a fresh message. Worker-emitted enqueues (commander/agent post-turn
-  // replies, including the abort-cleanup "（已中断）") must NOT clear
+  // replies, including the abort-cleanup "(stopped)" message) must NOT clear
   // the abort — otherwise a worker's own post-abort message would silently
   // un-stick the conversation and the next state_changed would flip back
   // to 'idle'/'running'.
@@ -360,7 +360,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     to = params.forceTo.slice();
   } else {
     // Build a global name → id map from the enabled agent registry so the
-    // router can resolve `@<人类可读名字>` mentions. Keys are normalized
+    // router can resolve `@<human-readable-name>` mentions. Keys are normalized
     // (lowercase + whitespace stripped) to match router's normalization,
     // so display names containing spaces ("Writing Helper") or mixed case
     // resolve correctly against the user's `@WritingHelper` token.
@@ -484,12 +484,12 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   // Strip ALL `@user` / `@commander` mentions when they're the routed
   // recipient — not just leading. The addressee lives in `to`; any literal
   // `@<recipient>` in the body is redundant noise. Mid-prose mentions
-  // ("好的 @user，关于...") are common LLM filler that users find annoying.
+  // (e.g. "ok @user, about...") are common LLM filler that users find annoying.
   // Why ONLY user/commander and not agents: `@<agent>` from commander is
   // informational (shows observers which agent got dispatched), so we keep
   // those. Agents addressing user/commander gain nothing from the literal.
-  // Aliases (`@指挥官` / `@用户`) get the same treatment so Chinese-form
-  // mentions don't slip through.
+  // The Chinese aliases (`@指挥官` / `@用户`) get the same treatment so
+  // Chinese-form mentions don't slip through.
   const stripTokens = new Set<string>();
   for (const r of to) {
     if (r === USER_ID) {
@@ -504,8 +504,8 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     // Strip the `@<token>` itself (preserving any preceding separator), then
     // run a tidy pass to fix the whitespace/punctuation orphans the strip
     // creates. This 2-step keeps prose punctuation around the mention
-    // intact: "收到 @user，关于" → "收到，关于" (comma stays), but
-    // "好 @user 的" → "好 的" (space-bounded mid-word).
+    // intact: "received @user, about" → "received, about" (comma stays),
+    // but "ok @user end" → "ok end" (space-bounded mid-word).
     for (const tok of stripTokens) {
       const safeTok = tok.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const re = new RegExp(
@@ -593,7 +593,8 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   // orchestration role at all — letting it stay asleep keeps the chat
   // clean and avoids prompt-driven mistakes (the model second-guessing the
   // agent's form / re-dispatching for "polish").
-  // Edge case: agent explicitly `@指挥官` to escalate. That message has
+  // Edge case: an agent explicitly mentions the commander to escalate
+  // (e.g. `@commander` / `@指挥官`). That message has
   // commander in `to`, so it goes through the regular dispatch loop above.
 
   // User-driven reconcile: when user enqueues, plan_executor needs a chance
@@ -802,7 +803,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // Used as the salvage source when the user aborts mid-stream — the
   // event-mapper emits `error` (not `final`) on abort, so without this
   // accumulator the partial reply the user already saw rendering would be
-  // discarded and we'd persist a bare "（已中断）" placeholder. Same pattern
+  // discarded and we'd persist a bare "(stopped)" placeholder. Same pattern
   // as `agents.ts::streamSendToAgentEditChat` (skill / agent edit chats).
   let streamingText = '';
   let errText: string | null = null;
@@ -831,8 +832,8 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // skill body before executing. Path-sandbox blocks anything outside
   // workspace + attachment dir by default, so we have to expose the two
   // skill roots here as `extraRoots` (mirrors the skill-edit chat pattern
-  // in features/skills.ts). Builtin first to match the prompt's "按来源
-  // 定位" guidance.
+  // in features/skills.ts). Builtin first to match the prompt's
+  // "locate by source" guidance.
   const skillRoots = [BUILTIN_SKILLS_DIR, userSkillsDir(uid)];
   // Same shape for agent directories: chat_commander.md tells the
   // commander to `search_files` for an agent.json under
@@ -984,7 +985,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     // `final`) when the user hits stop, so `finalText` is empty even though
     // `streamingText` holds whatever the renderer was already rendering.
     // Push it into finalText so plan_executor's abort branches can preserve
-    // it instead of throwing away visible work as a bare "（已中断）" stub.
+    // it instead of throwing away visible work as a bare "(stopped)" stub.
     if (!finalText && streamingText) {
       finalText = streamingText;
     }
@@ -1162,7 +1163,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
 
   // Abort post-processing — single source of truth for both "promote silent
   // to persist when there's still something visible to keep" AND the
-  // "（已中断）" suffix.
+  // "(stopped)" suffix.
   //
   // plan_executor's abortOutcome can only see partial text + form / created
   // agent / produced files; it goes silent for anything else. But process
@@ -1209,7 +1210,8 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     // Any placeholder the renderer parked for this actor (e.g. a fresh one
     // created by post-tool process events after the original was consumed
     // by a mid-turn message) needs an explicit signal to clean up; otherwise
-    // a "思考中 + 过程信息" bubble lingers, vanishes only on page refresh.
+    // a "thinking + process info" bubble lingers, vanishing only on
+    // page refresh.
     emit(state, { type: 'turn_silent', cid, actor: actor.id });
   }
 
@@ -1232,7 +1234,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   }
 
   // Flush any `dispatch_to` calls staged during commander's turn. Same
-  // anti-抢跑 reasoning as the plan reconcile above: recipient workers are
+  // anti-jump-the-gun reasoning as the plan reconcile above: recipient workers are
   // only woken after commander's own turn fully settled (text persisted +
   // placeholder cleaned), so the user sees commander's reply before any
   // dispatched agent's reply. See WorkerState.pendingDispatches.
@@ -1631,7 +1633,7 @@ export async function abort(uid: string, cid: string): Promise<void> {
     emit(state, { type: 'state_changed', cid, state: await readState(uid, cid) });
     // Wait for every aborted worker's runTurn to finish unwinding (stream
     // error → finally → abortOutcome → enqueue). Without this the bus's
-    // "（已中断）" + processItems message is still being persisted when
+    // "(stopped)" + processItems message is still being persisted when
     // abort() resolves; an external observer (renderer Cmd+R, an automation
     // script, a test) that re-reads `<cid>.jsonl` immediately after
     // groupChat.abort returns sees a truncated history and never picks up
@@ -2033,7 +2035,8 @@ async function _buildCliPrompt(
   tailLines.push('## Your task');
   // When the dispatched item is just a form submission (the user
   // confirmed the input form, not a fresh ask), the task body is
-  // metadata — `- 项目目录：…` summary + an `<agent-input-submission>`
+  // metadata — a `- project_dir: …` style summary + an
+  // `<agent-input-submission>`
   // XML tag — with the original user request now sitting upstream in
   // the slice. A coding CLI handed only that metadata has nothing
   // actionable: claude / codex sit idle until killed (observed:

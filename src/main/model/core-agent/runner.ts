@@ -11,7 +11,7 @@
  *     materialize the single provider we picked.
  *
  * When `pickChatEntry()` returns null we fail fast with a user-facing
- * "未配置模型" error so the renderer doesn't surface the Anthropic SDK's
+ * "no model configured" error so the renderer doesn't surface the Anthropic SDK's
  * cryptic "Could not resolve authentication method" message. Dev escape
  * hatch: set `ANTHROPIC_API_KEY` in the environment and we pass through
  * to the SDK's default-provider + env-var auth path.
@@ -265,7 +265,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // (read_file/write_file/bash/list_files/web_search/web_fetch) merged with
   // our wrappedTools via last-write-wins. Used by the snapshot below and by
   // the catalog-drift test (`tool-catalog.test.ts`); we no longer render a
-  // `## 可用工具 (tools)` block into the system prompt because the model
+  // `## Available tools` block into the system prompt because the model
   // already receives every tool's full description + JSON schema via the
   // SDK tool-use protocol — the prompt block was an information subset
   // duplicating ~800 chars per call without giving the model anything new.
@@ -308,11 +308,16 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   if (skillsBlock) parts.push(skillsBlock.trim());
   const resolvedSystemPrompt = parts.join('\n\n');
 
-  // Evolution(自演进 skill 仓库)按 agent 隔离:有 agentId 时落到该 agent 的
-  // 私有目录 `<uid>/cloud/agents/<aid>/skills/`,核心 default 对话(无 agentId)
-  // 关闭演进——commander 不该自动产 skill,要写就走 user UI 的 System A 路径。
-  // 不传 evolution 段时 core-agent 默认 enabled=true + skillsDir="skills" 相对
-  // cwd → 会落进 `PC/skills/`(见 docs/plans/agent-as-directory.md 修复点)。
+  // Evolution (the self-evolving skill store) is per-agent: when an
+  // agentId is present we write into that agent's private directory
+  // `<uid>/cloud/agents/<aid>/skills/`. The core default conversation
+  // (no agentId) has evolution disabled — the commander shouldn't be
+  // auto-producing skills; user-authored skills go through the
+  // System A path in the user UI.
+  // When the evolution stanza is not passed, core-agent defaults to
+  // enabled=true + skillsDir="skills" relative to cwd, which would
+  // dump into `PC/skills/` (see the fix point in
+  // docs/plans/agent-as-directory.md).
   const evolutionConfig = (agentId && earlyUid)
     ? { enabled: true, skillsDir: agentEvolvedSkillsDir(earlyUid, agentId) }
     : { enabled: false };
@@ -324,13 +329,17 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       ...(resolvedSystemPrompt ? { systemPrompt: resolvedSystemPrompt } : {}),
     },
     evolution: evolutionConfig,
-    // 故意不填 `models.providers` —— ProviderRegistry 构造时会对里面每个
-    // 条目调默认 factory（anthropic / openai / pi-ai），直接把 provider 实例
-    // 塞进 `providers` cache；后续 `providers.get(id)` 优先走 cache，
-    // 永远跳不到下面 registerFactory 注入的 rotating-provider（包括单把 key
-    // 的情况——之前的 "group.length===1 走原路径" 分支就是这么错过冷却/
-    // 错误分类的）。把 provider 创建完全交给 rotating-provider 管，wrapper
-    // 对单把 key 也只是一层 closure，开销可忽略，换来统一的错误路径。
+    // We deliberately do NOT populate `models.providers` —
+    // ProviderRegistry's constructor runs the default factory
+    // (anthropic / openai / pi-ai) on every entry and stuffs the
+    // provider instance into the `providers` cache; subsequent
+    // `providers.get(id)` calls hit the cache first and never reach
+    // the registerFactory-injected rotating-provider below (this
+    // includes the single-key case — the old "group.length===1 → take
+    // the legacy path" branch missed cooldown / error classification
+    // for exactly this reason). Hand all provider creation to
+    // rotating-provider; for a single key the wrapper is just one
+    // closure (negligible cost) and we get a uniform error path.
   });
 
   const providers = new mod.ProviderRegistry(config);
@@ -447,10 +456,11 @@ async function buildRotatingProvider(
         if (isExternal) {
           return buildExternalProvider(candProviderId, choice.apiKey, candModelId);
         }
-        // pi-ai catalog 没有 OAuth 变体（`minimax-portal[-cn]`），但 OAuth 端
-        // 与对应 API-key 端（`minimax[-cn]`）走同一 baseUrl + api 协议，access
-        // token 直接当 Bearer 用。借 API-key 的 Model 元数据当 customModel，
-        // 跳过 catalog 查询。
+        // The pi-ai catalog has no OAuth variant (`minimax-portal[-cn]`),
+        // but the OAuth endpoint shares baseUrl + api protocol with the
+        // corresponding API-key endpoint (`minimax[-cn]`); the access
+        // token can be used directly as a Bearer. Reuse the API-key
+        // Model metadata as customModel and skip the catalog lookup.
         const customModel = aliasedPiModel(mod, candProviderId, candModelId);
         return mod.createPiProvider({
           provider: candProviderId,
@@ -474,9 +484,12 @@ async function buildRotatingProvider(
 }
 
 /**
- * pi-ai catalog 不识别的 OAuth provider 别名 → API-key 同源 provider。
- * 同源 = 同 baseUrl + 同 api 协议;OAuth access token 走 Bearer，与 API key
- * 在 HTTP 层无差。映射为空时返回 undefined，让原路径走 catalog 查询。
+ * Aliases for OAuth provider ids that are unknown to the pi-ai catalog →
+ * the same-origin API-key provider. Same origin = same baseUrl + same api
+ * protocol; an OAuth access token rides as a Bearer, indistinguishable
+ * from an API key at the HTTP layer. Returns undefined when no alias is
+ * registered, letting the caller fall through to the original catalog
+ * lookup.
  */
 const PI_PROVIDER_ALIAS: Readonly<Record<string, string>> = {
   'minimax-portal-cn': 'minimax-cn',
@@ -506,11 +519,14 @@ export function isMetacognitionEnabled(): boolean {
 }
 
 /**
- * 构造 pi-ai `onPayload` 回调：pi-ai 把 `buildParams` 产物交上来之后、发请求
- * 之前触发。命中"model.api 属于支持列表 + 用户没配付费搜索"时，往 `params.tools`
- * 追加模型原生 web search tool schema；同时写 info 日志。
+ * Builds a pi-ai `onPayload` callback: pi-ai invokes it after handing us
+ * the result of `buildParams` and before sending the request. When both
+ * "model.api is in the supported list" and "the user has no paid search
+ * profile configured" hold, we append the model's native web search tool
+ * schema to `params.tools` and write an info log.
  *
- * 不命中就原封返回 params（pi-ai 看到 undefined 也不会覆盖，所以空操作也合法）。
+ * On a miss we return params unchanged (pi-ai treats an undefined return
+ * as no-op, so a no-op return is also legal).
  */
 function buildNativeSearchOnPayload(
   providerId: string,

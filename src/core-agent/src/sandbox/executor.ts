@@ -81,7 +81,8 @@ export class SandboxExecutor {
     this.config = {
       timeoutMs: 30_000,
       maxOutputBytes: 1024 * 1024, // 1MB
-      // Windows 走 cmd.exe（COMSPEC 变量指向）；POSIX 走 /bin/sh。
+      // Windows uses cmd.exe (resolved via the COMSPEC env var);
+      // POSIX uses /bin/sh.
       shell: process.platform === "win32"
         ? (process.env.COMSPEC || "cmd.exe")
         : "/bin/sh",

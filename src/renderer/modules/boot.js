@@ -9,7 +9,7 @@ async function bootApp() {
   await initI18n();
   await initUser();
   await initUserWorkspace();
-  // 头像 catalog —— 必须在 loadAgents（会触发卡片渲染）之前就绪。
+  // Avatar catalog must be ready before loadAgents (which triggers card rendering).
   await initAvatarCatalog();
   await refreshModelGuard();
   await loadConversations();
@@ -37,8 +37,10 @@ async function _stampSettingsVersion() {
 // so we stub it to false here.
 function isDevMode() { return false; }
 
-// 一次性把带历史品牌前缀的 localStorage key 迁移到无前缀形态。盖章后再
-// 启动 no-op，写在 boot 最前免得后面任何模块抢着读旧 key。
+// One-shot rename of legacy brand-prefixed localStorage keys
+// (`orkas_*` / `orkas.*`) to the unprefixed form. After stamping,
+// subsequent boots are no-ops. Placed at the very start of boot so no
+// other module reads a stale key first.
 function _migrateLegacyLocalStorageKeys() {
   try {
     if (localStorage.getItem('_ls_brand_migration_v1')) return;
@@ -151,7 +153,7 @@ function setView(view, cid, opts = {}) {
     // If this conversation has an in-flight stream and its bubble is still
     // attached to #chat-history (sidebar tab toggle didn't wipe it), skip
     // the reload — wiping would orphan the bubble while the active stream
-    // closure keeps writing into the detached node, leaving "思考中…" stuck.
+    // closure keeps writing into the detached node, leaving the "thinking…" indicator stuck.
     const pendingState = pendingConvs.get(cid);
     const streamBubbleAlive = !!pendingState?.loadingEl?.isConnected;
 
@@ -194,7 +196,7 @@ function setView(view, cid, opts = {}) {
     // the landing page is entered — the user explicitly asked for a clean
     // slate here, so prior in-session picks don't leak forward.
     if (typeof onEnterNewChatView === 'function') onEnterNewChatView();
-    // Draft attachment chips (总指挥 pool under `main_chat/`): re-paint from
+    // Draft attachment chips (commander tab's pool under `main_chat/`): re-paint from
     // the in-memory Map immediately, and re-sync with disk in case a prior
     // session left files on disk without a dataUrl.
     if (typeof _chatAttachRenderChips === 'function') _chatAttachRenderChips(DRAFT_CID);

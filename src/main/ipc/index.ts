@@ -414,7 +414,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return contexts.openContextFileInSystem(path || '');
   },
 
-  // ── Knowledge base (向量库) ──
+  // ── Knowledge base (vector store) ──
   // Snapshot of what's in `kb_files`: status summary + per-file rows.
   // Renderer subscribes to the `kb.events` stream (below) for incremental
   // updates; this endpoint is the initial-load / full-refresh fetch.
@@ -440,8 +440,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { result: r };
   },
 
-  // Re-enqueue a single file (typically the UI's "重新处理" button after a
-  // failed extraction).
+  // Re-enqueue a single file (typically the UI's "reprocess" button after
+  // a failed extraction).
   'kb.reprocess': async ({ path }, ctx) => {
     if (typeof path !== 'string' || !path) throw new Error('path required');
     kbIndexer.enqueue(ctx.userId, path, 'upsert');
@@ -464,20 +464,24 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
   'config.getLocales': async () => ({ tables: getRendererTables() }),
 
-  // 头像 catalog（图标 + 颜色 + 指挥官默认）—— 单一真相源在
-  // src/main/data/avatars.json。renderer 启动时拉一次，自此用本地缓存。
+  // Avatar catalog (icons + colors + commander default) — single source of
+  // truth lives in src/main/data/avatars.json. The renderer fetches once at
+  // startup, then uses its local cache.
   'avatars.getCatalog': async () => ({ catalog: avatars.getCatalog() }),
 
-  // 指挥官头像偏好（云同步）。avatar = { icon, color }，token 走 catalog
-  // 白名单校验；缺省时 renderer 用 commander 默认（crown + gold）兜底。
+  // Commander avatar preference (cloud-synced). avatar = { icon, color };
+  // tokens are validated against the catalog allow-list. When absent the
+  // renderer falls back to the commander default (crown + gold).
   'prefs.getCommanderAvatar': async () => ({ avatar: appConfig.getCommanderAvatar() }),
   'prefs.setCommanderAvatar': async ({ icon, color }) => {
     return { avatar: appConfig.setCommanderAvatar({ icon, color }) };
   },
 
-  // 元认知级别的 agent 自演进开关。落 preferences.json::metacognition_enabled，
-  // 真正的 gate 单点真相在 features/metacognition.isFeatureEnabled（叠加 env
-  // kill switch）。env `ORKAS_METACOGNITION='0'` 永远压过 UI 设置。
+  // Metacognition-level agent self-evolution toggle. Stored at
+  // preferences.json::metacognition_enabled; the actual gate's single
+  // source of truth is features/metacognition.isFeatureEnabled (with the
+  // env kill switch on top). The env var `ORKAS_METACOGNITION='0'` always
+  // overrides the UI setting.
   'prefs.getMetacognition': async () => ({
     enabled: appConfig.getMetacognitionEnabled(),
     envForcedOff: process.env.ORKAS_METACOGNITION === '0',

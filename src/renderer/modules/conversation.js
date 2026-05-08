@@ -175,7 +175,7 @@ if (typeof window !== 'undefined') {
 // switching between conversations restores their distinct contexts) and
 // stays sticky on view-enter — the only thing that overrides it is the
 // auto-switch to a live interactive agent (see `_evaluateAutoRecipient`).
-// The new-chat ("指挥官") landing resets to commander only when its input
+// The new-chat (commander landing) resets to commander only when its input
 // box is empty; otherwise the user's in-progress draft keeps its target.
 const _COMMANDER = { kind: 'commander', id: '', name: '' };
 const _RECIPIENT_LS_KEY = 'chat.recipientByCid';
@@ -270,7 +270,7 @@ function _renderRecipientChip(target) {
       nameEl.removeAttribute('data-i18n');
     } else {
       nameEl.setAttribute('data-i18n', 'chat.recipient_commander');
-      nameEl.textContent = (typeof t === 'function') ? t('chat.recipient_commander') : '指挥官';
+      nameEl.textContent = (typeof t === 'function') ? t('chat.recipient_commander') : 'Commander';
     }
   }
 }
@@ -516,8 +516,10 @@ if (typeof window !== 'undefined') {
 // "from-name" label rendered as a header chip on the bubble.
 const GROUP_RESERVED = new Set(['user', 'commander']);
 
-// 指挥官头像偏好，懒加载缓存。聊天行渲染要用到 —— 第一次渲染前发一次 IPC，
-// 之后任何更新都同步刷这里。`null` = 未加载 / 取不到，渲染层自己回退到默认。
+// Commander avatar preference, lazy-loaded cache. Used by the chat row
+// renderer — fire one IPC before the first render, then refresh this
+// cache on every subsequent update. `null` = not loaded / unavailable;
+// the render layer falls back to the default itself.
 let _commanderAvatarCache = null;
 function _commanderAvatar() {
   return _commanderAvatarCache || COMMANDER_DEFAULT;
@@ -529,7 +531,7 @@ async function _ensureCommanderAvatarLoaded() {
     if (res?.ok && res.avatar) {
       _commanderAvatarCache = { icon: res.avatar.icon, color: res.avatar.color };
     }
-  } catch (_) { /* 走默认 */ }
+  } catch (_) { /* fall back to default */ }
   return _commanderAvatarCache || COMMANDER_DEFAULT;
 }
 function setCommanderAvatarCache(avatar) {
@@ -537,15 +539,17 @@ function setCommanderAvatarCache(avatar) {
     _commanderAvatarCache = { icon: avatar.icon, color: avatar.color };
   }
 }
-/** 渲染消息行头像。fromId 已知非 'user'。 */
+/** Render the message row avatar. `fromId` is known to be non-'user'. */
 function _renderActorAvatarHtml(fromId) {
   if (fromId === 'commander') {
     const a = _commanderAvatar();
     return renderAvatarHtml(a.icon, a.color, { size: 28, seed: 'commander' });
   }
-  // 全局 agents registry 优先 —— 它始终是当前真相;群成员缓存只是入会时
-  // 的快照,改名 / 改头像后不会跟着动,作为兜底覆盖"agent 已被删除、
-  // registry 查不到"的旧会话场景。
+  // The global agents registry takes priority — it's always the current
+  // truth. The per-group member cache is just a join-time snapshot and
+  // does not follow rename / avatar changes, so it serves as fallback
+  // for legacy conversations whose agent has since been deleted from
+  // the registry.
   let icon, color;
   if (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
     const a = _agentsCache.find((x) => x && x.agent_id === fromId);
@@ -568,7 +572,7 @@ function _renderActorAvatarHtml(fromId) {
  *  (deleted agents whose old chats still need a label). */
 function _groupActorLabel(fromId) {
   if (fromId === 'user') return null;
-  if (fromId === 'commander') return t('chat.from_commander') || '指挥官';
+  if (fromId === 'commander') return t('chat.from_commander') || 'Commander';
   if (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
     const a = _agentsCache.find((x) => x && x.agent_id === fromId);
     if (a && a.name) return a.name;
@@ -581,7 +585,7 @@ function _groupActorLabel(fromId) {
   // Last resort: never leak the id. Show a neutral placeholder; the chip
   // will repaint as soon as the cache catches up (state_changed handler
   // refreshes _groupMembersCache).
-  return t('chat.from_agent_unknown') || '智能体';
+  return t('chat.from_agent_unknown') || 'Agent';
 }
 const _groupMembersCache = new Map(); // cid → Actor[]
 async function _refreshGroupMembers(cid) {
@@ -635,11 +639,11 @@ function _groupMsgToLegacy(gm) {
 // ─── Chat attachments (pending-send pool per cid) ─────────────────────────
 // User picks files via "+" → we upload them to `<cid>/` and remember them in
 // this Map. On send we hand the filenames to the server; on success the list
-// for that cid is cleared (消息粒度). Each entry is {name, kind, bytes, dataUrl?}.
+// for that cid is cleared (per-message granularity). Each entry is {name, kind, bytes, dataUrl?}.
 
 const _chatAttachments = new Map();   // cid → Array<{name, kind, bytes, dataUrl?}>
 
-// Draft cid used by 总指挥 (new-chat) tab — files land under
+// Draft cid used by the commander (new-chat) tab — files land under
 // `data/<uid>/chat_attachments/main_chat/` until the user hits send, at which
 // point the backend renames that dir to the freshly-minted conversation cid
 // (see `adoptDraftAttachments`).
@@ -689,7 +693,7 @@ function _chatAttachClear(cid) {
   _chatAttachRenderChips(cid);
 }
 
-// cid → DOM host id for the chip row. Draft cid (总指挥) renders into the
+// cid → DOM host id for the chip row. Draft cid (commander tab) renders into the
 // new-chat panel; any real cid renders into the active conversation panel
 // only when it matches currentCid (stale states for other cids stay in the
 // Map but aren't painted).
@@ -937,9 +941,10 @@ function _iconForProduced(name) {
 function _renderMessageProducedHtml(absPaths) {
   // Chip shows just the filename. The full absolute path lives only in
   // `data-produced-path` for the click handler; tooltip is a static
-  // localised "在文件夹中显示" hint instead of the raw OS path (which
-  // exposes the user's home dir and is hostile UX in Chinese mixed-case).
-  const hint = t('chat.produced_reveal_title') || '在文件夹中显示';
+  // localized "show in folder" hint instead of the raw OS path (which
+  // exposes the user's home directory and is hostile UX in mixed-locale
+  // contexts).
+  const hint = t('chat.produced_reveal_title') || 'Show in folder';
   const items = absPaths.map((p) => {
     const base = p.split(/[\\/]/).pop() || p;
     const icon = _iconForProduced(base);
@@ -951,14 +956,14 @@ function _renderMessageProducedHtml(absPaths) {
   return `<div class="chat-msg-produced">${items.join('')}</div>`;
 }
 
-// Render a "查看详情" chip on an assistant bubble when a new agent was
+// Render a "view details" chip on an assistant bubble when a new agent was
 // quick-created from that turn. Click → jump to agents tab + select the new
 // agent. Same visual slot as produced chips (inside the bubble, below
 // content), but in .is-custom green to signal "new custom artifact created".
 function _renderMessageCreatedAgentHtml(payload) {
   if (!payload || !payload.agent_id) return '';
   const name = payload.name || payload.agent_id;
-  // Label is intentionally neutral ("查看详情 / Open: …") — works for both
+  // Label is intentionally neutral ("view details / Open: …") — works for both
   // `kind: 'created'` and `kind: 'updated'`; the commander's surrounding
   // prose tells the user which one happened. Don't split the i18n key just
   // to track the verb — the chip is a CTA into the agent panel, not a
@@ -1062,9 +1067,12 @@ function _initChatAttachInput() {
   btn.dataset.bound = '1';
 }
 
-// 总指挥 (new-chat) tab 的 "+" 按钮走同一套上传链路，只是传 DRAFT_CID 而不
-// 是某个会话的 cid。用户点发送后 handleNewChatSubmit 会调 adopt 把整个
-// `main_chat/` 目录改名成新会话的 cid，预处理缓存原地跟随无需重跑。
+// The commander (new-chat) tab's "+" button uses the same upload
+// pipeline; the only difference is that it passes DRAFT_CID instead of
+// a real conversation cid. After the user clicks send,
+// handleNewChatSubmit calls adopt to rename the whole `main_chat/`
+// directory to the freshly-minted cid; the pre-processing cache
+// follows in place and doesn't need to be rerun.
 
 function _initNewChatAttachInput() {
   const btn = document.getElementById('new-chat-attach-btn');
@@ -1151,7 +1159,7 @@ function renderConversationList() {
 
 // ─── Conversation history render ───
 
-// Inline "创建智能体" entry that lives at the very end of the conversation
+// Inline "create agent" entry that lives at the very end of the conversation
 // history — visually a divider with a small button in the middle, anchored
 // to the last message. Hidden while a stream is in flight (the scroll-pin
 // spacer is present then) so it doesn't tempt the user to sediment a
@@ -1189,11 +1197,15 @@ function _ensureConvCreateAgentInline() {
   }
   const hasUserMsg = !!container.querySelector('.chat-message.user');
   const isStreaming = !!spacer;
-  // 一旦有非 commander/user 的 agent 进入对话就隐藏入口 —— 多 agent 流里
-  // "沉淀单一 agent" 的语义已不成立。两路证据都算：
-  //   1) 群成员名册里出现 kind==='agent'（最权威：包含被 @ 但还没回话的）；
-  //   2) DOM 里出现过 _from / fromActor 既非空也非 commander/user 的发言
-  //      （兜底：成员缓存还没拉到时也能触发）。
+  // Once any agent (other than commander / user) joins the conversation,
+  // hide the entry — in a multi-agent flow the "promote a single agent"
+  // semantic no longer holds. Either signal counts:
+  //   1) The roster contains a member with kind === 'agent' (most
+  //      authoritative — includes agents that were @-mentioned but
+  //      haven't spoken yet).
+  //   2) The DOM contains an utterance whose _from / fromActor is
+  //      non-empty and not commander/user (fallback that fires before
+  //      the member cache loads).
   const members = _groupMembersCache.get(currentCid) || [];
   const hasAgentMember = members.some((a) => a && a.kind === 'agent');
   const hasAgentMsg = hasAgentMember || Array.from(
@@ -1239,7 +1251,7 @@ async function loadConversationHistory(cid) {
     // Members cache MUST be populated before we render history bubbles —
     // appendChatMessage calls _groupActorLabel which uses this cache to
     // resolve agent_id → name. Without the await we'd briefly show
-    // "智能体" placeholders on first paint and repaint on refresh, ugly.
+    // generic "agent" placeholders on first paint and have to repaint on refresh, which is ugly.
     await _refreshGroupMembers(cid);
     // Conversation switch: drop any stale per-actor placeholders from a
     // previous conv so they don't leak into this view (their DOM nodes
@@ -1250,7 +1262,7 @@ async function loadConversationHistory(cid) {
     }
     // Drop internal plan-step dispatch messages (commander → agent
     // hand-off). The user already saw the plan announcement; surfacing
-    // these adds noise like "@需求挖掘师 我要开发一个应用" in the user's view.
+    // these adds noise (e.g. "@<agent-name> <user request>") in the user's view.
     // The agent's visibility slice still carries them so the agent has
     // the dispatch text in its own context.
     const history = (data.history || [])
@@ -1268,7 +1280,7 @@ async function loadConversationHistory(cid) {
     }
 
     // Detect unanswered user message (e.g. after page refresh while server was processing).
-    // Only show the "思考中…" bubble if the server *really* still has this
+    // Only show the "thinking…" bubble if the server *really* still has this
     // conversation in processing state AND the work started recently — a stale
     // `processing: true` from a crashed prior run is swept on boot, but we
     // also belt-and-braces check the flag here so no flash occurs.
@@ -1299,7 +1311,7 @@ async function loadConversationHistory(cid) {
       // in closure and keeps dispatching deltas/final to that *specific* node
       // — so we must re-attach the original node, not mint a fresh bubble.
       // Minting a new one here (as before) stranded the stream: events kept
-      // landing on the orphaned node and the new bubble stayed at "思考中…"
+      // landing on the orphaned node and the new bubble stayed at "thinking…"
       // until stream end / polling rescue.
       const state = pendingConvs.get(cid);
       pollMsgCounts.set(cid, history.length);
@@ -1319,7 +1331,7 @@ async function loadConversationHistory(cid) {
       startPolling(cid); // ensure polling is running as backup
     }
 
-    // Re-add the inline "创建智能体" entry BEFORE scrolling so it's part of
+    // Re-add the inline "create agent" entry BEFORE scrolling so it's part of
     // scrollHeight when we jump to the bottom — otherwise the MutationObserver
     // adds it post-scroll and it ends up below the visible area.
     _ensureConvCreateAgentInline();
@@ -1400,13 +1412,13 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     ? ''
     : _groupActorLabel(message._from || (message._from_label ? '' : ''))
       || message._from_label
-      || (t('chat.from_agent_unknown') || '智能体');
+      || (t('chat.from_agent_unknown') || 'Agent');
   const avatarHtml = role === 'user' ? '' : _renderActorAvatarHtml(message._from);
   const headerHtml = role === 'user'
     ? `<div class="chat-msg-header chat-msg-header-user"><span class="chat-msg-time">${formatTime(message.time || new Date().toISOString())}</span></div>`
     : `<div class="chat-msg-header">${avatarHtml}<span class="chat-msg-from">${escapeHtml(headerName)}</span><span class="chat-msg-time">${formatTime(message.time || new Date().toISOString())}</span></div>`;
   const planAnnHtml = message._plan_announcement
-    ? `<div class="chat-plan-announce">📋 ${escapeHtml(t('chat.plan_announce') || '执行计划')}</div>` : '';
+    ? `<div class="chat-plan-announce">📋 ${escapeHtml(t('chat.plan_announce') || 'Plan')}</div>` : '';
   // Below-bubble action row holds produced-file chips + created-agent chip
   // + archive button (the legacy `.chat-meta` slot). Lives OUTSIDE the
   // bubble so chips read as a footer, not as inline body content.
@@ -1447,7 +1459,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     }
   }
   // Archive button + persisted-process block only make sense for finalised
-  // assistant replies (raw markdown, not an HTML placeholder like "思考中...").
+  // assistant replies (raw markdown, not an HTML placeholder like "thinking...").
   if (role === 'assistant' && !isHtmlSnippet) {
     if (archive) _attachBubbleArchiveBtn(msgDiv, () => rawContent);
     if (Array.isArray(message.process) && message.process.length) {
@@ -1455,7 +1467,10 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
       // trail IS the content the user already saw, hiding it behind a fold
       // makes refresh look like "everything I watched stream is gone".
       const bodyText = String(displayContent || '').trim();
-      const isAbortStub = bodyText === '（已中断）' || bodyText === '';
+      // Match both possible forms — jsonl history can carry either depending
+      // on the UI language at the time of write (i18n key `model.aborted` →
+      // '(stopped)' in en, '（已中断）' in zh).
+      const isAbortStub = bodyText === '（已中断）' || bodyText === '(stopped)' || bodyText === '';
       _renderPersistedProcess(msgDiv, message.process, { expanded: isAbortStub });
     }
   }
@@ -1518,13 +1533,14 @@ function _mountChatInputForm(host, msgDiv, message, opts) {
   });
 }
 
-// Insert a "过程信息" block above the assistant bubble content using the
-// items we stored at stream time. Collapsed by default so old threads
-// stay tidy; user can click ▶ to expand. Exception: when the bubble's
-// text body has no real reply (only "（已中断）" / empty abort placeholder
-// for a turn that never produced final text), the process trail IS the
-// content — auto-open it so refreshing doesn't appear to erase what the
-// user already watched stream in (tool calls / progress lines).
+// Insert a "process info" block above the assistant bubble content
+// using the items we stored at stream time. Collapsed by default so
+// old threads stay tidy; the user can click ▶ to expand. Exception:
+// when the bubble's text body has no real reply (only the "(stopped)"
+// abort placeholder or empty content for a turn that never produced
+// final text), the process trail IS the content — auto-open it so
+// refreshing doesn't appear to erase what the user already watched
+// stream in (tool calls / progress lines).
 function _renderPersistedProcess(msgDiv, items, { expanded = false } = {}) {
   const bubble = msgDiv.querySelector('.chat-bubble');
   if (!bubble) return;
@@ -1643,7 +1659,7 @@ function applyQuotePrefix(raw, target) {
   return raw ? `${block}\n\n${raw}` : block;
 }
 
-// Attach a small "存档" button next to the time in the chat-meta row. Kept
+// Attach a small "archive" button next to the time in the chat-meta row. Kept
 // outside the bubble so it never overlaps bubble content. `getContent` is a
 // callback so it can return the latest text after streaming completes.
 function _attachBubbleArchiveBtn(msgDiv, getContent) {
@@ -2009,10 +2025,13 @@ function _setChatScrollOffset(on, containerOrId = 'chat-history') {
     spacer.className = 'chat-scroll-spacer';
     container.appendChild(spacer);
   }
-  // 只补足"让最后一条 user 消息能滚到顶部"所需的高度——视口高度减去
-  // (user 消息及其下方已有兄弟节点)。一律给一整屏会在回复尚短时留下
-  // 大片空白；这里精算所需余量，回复短时就只剩一点点空白。-24 与
-  // _scrollToMessageTop 的偏移对齐，给 floating 删除按钮留出位置。
+  // Only top up enough height to "let the last user message scroll to
+  // the top" — viewport height minus (the user message and any
+  // siblings already after it). Always reserving a full viewport leaves
+  // a big blank when the reply is short; this exact-fit calculation
+  // makes the blank shrink to almost nothing for short replies. The
+  // -24 matches _scrollToMessageTop's offset, leaving room for the
+  // floating delete button.
   const userMsgs = container.querySelectorAll(':scope > .chat-message.user');
   const lastUser = userMsgs[userMsgs.length - 1];
   let needed = container.clientHeight - 24;
@@ -2102,7 +2121,7 @@ function _createStreamingAssistantMessage(container) {
   // with a freshly-rendered one carrying the right name.
   // Header is intentionally empty until we know who's actually working.
   // The bus may route the user's `@<name>` message to commander OR an
-  // agent depending on resolution; hard-coding "指挥官" misled the user
+  // agent depending on resolution; hard-coding "commander" misled the user
   // when @-routing succeeded. Once the first state_changed event
   // identifies the in-flight actor we'll fill the chip in (see
   // _handleGroupBusEvent's state_changed branch).
@@ -2157,7 +2176,7 @@ function _processKindOf(text) {
 }
 
 function _streamingAppendProgress(msg, text) {
-  // Keep the "思考中…" row visible alongside the process trace — hiding it
+  // Keep the "thinking…" row visible alongside the process trace — hiding it
   // while only process info shows makes long tool runs look stuck. The row
   // is cleared when the final reply (or an error) arrives.
   const container = msg.querySelector('[data-role="process-container"]');
@@ -2191,7 +2210,7 @@ function _cancelPendingStreamRaf(msg) {
 }
 
 // Paint the final reply into a streaming bubble. Caller controls whether
-// to attach the 存档 button afterwards (not all scenes want it — skill and
+// to attach the archive button afterwards (not all scenes want it — skill and
 // agent edit chats skip it by design).
 function _streamingSetFinal(msg, text, { archive = false } = {}) {
   _hideThinking(msg);
@@ -2221,18 +2240,26 @@ function _streamingSetFinal(msg, text, { archive = false } = {}) {
     live.textContent = t('chat.stream_done');
   }
 
-  // Auto-collapse the process section so the finalised reply reads cleanly；
-  // 但若整轮流式从未产生过 progress 行（比如模型直接一句回答，无推理 / 工具调
-  // 用），保留起始的 display:none，不在气泡里显示空的「过程信息」起泡。
-  // **例外**：如果 final body 只是 "（已中断）" 这种无实质内容的中断占位符，
-  // 过程信息就是用户实际看到的全部输出——保持展开，否则 finalize 后视觉上
-  // 等同于"流式时看的过程都没了"（用户原话），刷新更看不到。
+  // Auto-collapse the process section so the finalised reply reads
+  // cleanly. But if the entire streaming turn never produced a progress
+  // line (e.g. the model answered in one shot with no reasoning / tool
+  // calls), keep the initial display:none so we don't render an empty
+  // "process info" bubble.
+  // **Exception**: when the final body is just an empty/abort stub
+  // (i.e. the "(stopped)" placeholder for a turn that never produced
+  // real text), the process trail IS the user-visible output — keep
+  // it expanded; otherwise the user perceives it as "the process I
+  // just watched stream is gone after finalize", which gets worse on
+  // refresh.
   const details = msg.querySelector('.stream-process');
   if (details) {
     const body = details.querySelector('.stream-process-body');
     const hasProcess = !!body && body.children.length > 0;
     const bodyText = String(display || '').trim();
-    const isAbortStub = bodyText === '（已中断）' || bodyText === '';
+    // Match both possible forms — jsonl history can carry either depending
+    // on the UI language at the time of write (i18n key `model.aborted` →
+    // '(stopped)' in en, '（已中断）' in zh).
+    const isAbortStub = bodyText === '（已中断）' || bodyText === '(stopped)' || bodyText === '';
     if (hasProcess && isAbortStub) {
       details.open = true;
       details.style.display = '';
@@ -2241,7 +2268,7 @@ function _streamingSetFinal(msg, text, { archive = false } = {}) {
       details.style.display = '';
     } else {
       details.removeAttribute('open');
-      // else: 保留 display:none（_createStreamingAssistantMessage 的初始值）
+      // else: keep display:none (the initial value set by _createStreamingAssistantMessage).
     }
   }
 }
@@ -2255,9 +2282,11 @@ function _streamingSetError(msg, text) {
     live.classList.remove('stream-process-live');
     live.textContent = (live.textContent || '').replace(/^◐ /, '◯ ') || t('chat.stream_done');
   }
-  // 出错时也要保留已累积的过程信息：若 body 非空就显示（与 _streamingSetFinal /
-  // _streamingMarkAborted 一致），不再等用户重进对话才从持久化 message.process
-  // 补画出来。
+  // On error we also preserve the accumulated process info: if the
+  // body is non-empty we display it (matching _streamingSetFinal /
+  // _streamingMarkAborted), so the user no longer has to reopen the
+  // conversation to see it backfilled from the persisted
+  // message.process.
   const details = msg.querySelector('.stream-process');
   if (details) {
     const body = details.querySelector('.stream-process-body');
@@ -2287,7 +2316,7 @@ function _streamingSetError(msg, text) {
 }
 
 // Mark the assistant bubble as user-interrupted. Preserves whatever partial
-// content streamed into the process pane; just stamps a "已中断" note.
+// content streamed into the process pane; just stamps a "stopped" note.
 function _streamingMarkAborted(msg) {
   _hideThinking(msg);
   // Freeze any live preview line so it's not misread as still generating.
@@ -2327,8 +2356,10 @@ function _scrollToMessageTop(msgEl, containerId = 'chat-history') {
   requestAnimationFrame(() => requestAnimationFrame(() => {
     const containerRect = container.getBoundingClientRect();
     const msgRect = msgEl.getBoundingClientRect();
-    // 仅预留能让 floating 删除按钮（top:20px + ~33px 高）不贴住消息的最小
-    // 间距；留白太大时容易看到上一条消息产生干扰。24px = 贴着删除按钮底沿。
+    // Reserve only enough margin so the floating delete button
+    // (top:20px + ~33px tall) doesn't sit flush against the message;
+    // a larger blank exposes the previous message and feels noisy.
+    // 24px lines up with the bottom of the delete button.
     const offset = msgRect.top - containerRect.top + container.scrollTop - 24;
     // Force auto behavior so the jump is immediate — the CSS default of
     // scroll-behavior:smooth would otherwise animate and get interrupted by
@@ -2357,7 +2388,7 @@ function _scrollToMessageTop(msgEl, containerId = 'chat-history') {
 //   historyEndpoint(id): returns the URL for GET history
 //   clearEndpoint(id):   (optional) URL for DELETE history
 //   features: {
-//     archive:    bool  // attach 存档 button on final
+//     archive:    bool  // attach archive button on final
 //     scrollPin:  bool  // pin newly-sent user message to top of viewport
 //   }
 //   hooks: {
@@ -2685,10 +2716,13 @@ function createChatController(config) {
     const msgEl = _createStreamingAssistantMessage(historyEl);
     if (hooks.onAssistantStart) hooks.onAssistantStart(msgEl, id);
 
-    // 发送时把用户消息顶到可视区顶部就行；流式过程中和结束后都不要再主动
-    // 滚动，否则会把用户中途上滑查看的位置强行拽回初始位置。
-    // 配合 `has-scroll-offset` 预留 100vh 底部空间，保证短消息也能滚到顶部；
-    // 由 controller 统一负责开关，避免各 scene 各自抄一份。
+    // On send, pin the user's message to the top of the viewport once;
+    // do NOT scroll during or after streaming — that would yank a user
+    // who scrolled up mid-stream back to the initial position.
+    // Paired with `has-scroll-offset` reserving 100vh of bottom
+    // space so even short messages can be scrolled to the top; the
+    // controller is responsible for toggling it so each scene doesn't
+    // copy-paste the same logic.
     if (features.scrollPin) {
       _setChatScrollOffset(true, historyEl);
       _scrollToMessageTop(userMsgEl, historyEl.id);
@@ -2725,7 +2759,7 @@ function createChatController(config) {
           try {
             const ev = JSON.parse(dataLines.join('\n'));
             // Post-abort events can still arrive while main's for-await drains
-            // its buffer — drop them so the bubble stays frozen at "已中断"
+            // its buffer — drop them so the bubble stays frozen at the "stopped" state
             // instead of accumulating more deltas / a final reply behind it.
             if (pending?.aborted) continue;
             _handleStreamEvent(id, msgEl, ev, { archive: features.archive });
@@ -2754,7 +2788,8 @@ function createChatController(config) {
       _updateSendUI();
       if (features.scrollPin) _setChatScrollOffset(false, historyEl);
       if (hooks.onDone) hooks.onDone(msgEl, id, { aborted: wasAborted, errored: wasErrored });
-      // 不再在流式结束时 re-pin — 尊重用户中途上滑后的阅读位置。
+      // No re-pin at stream end — respect the user's scroll position
+      // if they scrolled up mid-stream.
       // Drain one queued message if any, matching main-chat behaviour.
       if (features.queue) _qDispatchNext();
     }
@@ -2766,7 +2801,7 @@ function createChatController(config) {
     try { pending.controller.abort(); } catch (_) {}
     // Main's for-await loop only checks `cancelled` between yields, so it
     // can take a while to emit `done` — that means _streamingMarkAborted
-    // (called from the catch block) runs late and the "思考中…" row stays
+    // (called from the catch block) runs late and the "thinking…" row stays
     // visible. Mark the bubble now so the UI terminates on click, and rely
     // on reader-loop gating (pending.aborted) to drop any stragglers.
     if (pending.msgEl) {
@@ -2905,8 +2940,8 @@ function _setPlaceholderActor(ph, actorId) {
   const chip = ph.querySelector('[data-role="from-chip"]');
   if (chip && !chip.textContent) {
     const label = actorId === 'commander'
-      ? (t('chat.from_commander') || '指挥官')
-      : (_groupActorLabel(actorId) || (t('chat.from_agent_unknown') || '智能体'));
+      ? (t('chat.from_commander') || 'Commander')
+      : (_groupActorLabel(actorId) || (t('chat.from_agent_unknown') || 'Agent'));
     chip.textContent = label;
   }
   const avatarSlot = ph.querySelector('[data-role="from-avatar"]');
@@ -2995,7 +3030,7 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
     if (bubble && !bubble.querySelector('.chat-plan-announce')) {
       const lbl = document.createElement('div');
       lbl.className = 'chat-plan-announce';
-      lbl.textContent = `📋 ${t('chat.plan_announce') || '执行计划'}`;
+      lbl.textContent = `📋 ${t('chat.plan_announce') || 'Plan'}`;
       bubble.insertBefore(lbl, bubble.firstChild);
     }
   }
@@ -3256,7 +3291,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
         const hasProcess = !!processBody && processBody.children.length > 0;
         if (hasProcess) {
           // Freeze the bubble: hide thinking dots, leave process rail as
-          // a folded "已完成思考" bubble. Empty final body = no main text.
+          // a folded "completed thinking" bubble. Empty final body = no main text.
           if (typeof _streamingSetFinal === 'function') {
             _streamingSetFinal(ph, '', { archive: false });
           }
@@ -3274,7 +3309,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
   }
 }
 
-// Append the "查看详情" chip into a streaming bubble. Idempotent: duplicate
+// Append the "view details" chip into a streaming bubble. Idempotent: duplicate
 // calls (relay event + final-event payload) are de-duped by checking for an
 // existing `.chat-msg-created-agent` child.
 function _mountCreatedAgentChip(msg, payload) {
@@ -3325,7 +3360,7 @@ function _stripSubmissionTagForDisplay(text) {
 // Wrap placeholder text in an HTML `<em>` instead of markdown `_text_`:
 // standard markdown requires word-boundary chars on each side of `_` for
 // italic emphasis, and CJK glyphs don't count as word boundaries, so
-// `_中文占位_` renders with the underscores visible. `<em>` passes through
+// `_<CJK placeholder>_` renders with the underscores visible. `<em>` passes through
 // renderMarkdownFull as-is (HTML inline tags are preserved by the markdown
 // pipeline) and actually italicises the CJK text.
 function _streamPlaceholderHtml(key) {
@@ -3380,7 +3415,7 @@ function _stripAgentFormBlockForStream(buf) {
 
 // Progressive renderer — append an assistant text delta into the final
 // bubble and re-render markdown. The first delta reveals the `[data-role=final]`
-// container; the "思考中" row stays visible BELOW the body until the terminal
+// container; the "thinking" row stays visible BELOW the body until the terminal
 // `final` / error / aborted event lands (so the user sees "partial reply +
 // still typing" instead of "partial reply + nothing happening"; the row is
 // rendered after `.stream-final` in `_createStreamingAssistantMessage`).
@@ -3432,13 +3467,13 @@ function _streamingAppendFinalDelta(msg, piece) {
 // Icon palette (Unicode Geometric Shapes per CLAUDE.md §8). Each glyph has
 // exactly one semantic role — stick to this table when adding new streams:
 //
-//   ▶   推理开始          ●   推理完成
-//   ◆   思考              ◇   回复（最终）
-//   ◐   正在生成（live）
-//   ■   工具调用          ▣   计划
-//   ▷   命令输出          ◉   文件改动
-//   ○   等待确认          ◯   错误
-//   ▪   其他/兜底
+//   ▶   reasoning start      ●   reasoning done
+//   ◆   thinking              ◇   reply (final)
+//   ◐   generating (live)
+//   ■   tool call             ▣   plan
+//   ▷   command output        ◉   file change
+//   ○   awaiting confirmation ◯   error
+//   ▪   other / fallback
 function _formatEventLine(evt) {
   if (!evt || typeof evt !== 'object') return null;
   const { stream, data } = evt;
@@ -3576,7 +3611,7 @@ function _renderAgentEvent(msg, evt) {
 // Used for streaming text (assistant deltas) that grows over time.
 function _streamingUpdateLive(msg, prefix, text, appendDelta) {
   // Assistant deltas are still "in progress" from the user's perspective —
-  // leave the 思考中 row alone; it's cleared by _streamingSetFinal.
+  // leave the "thinking" row alone; it's cleared by _streamingSetFinal.
   const container = msg.querySelector('[data-role="process-container"]');
   if (container) container.style.display = '';
   const body = msg.querySelector('[data-role="process"]');
@@ -3721,7 +3756,7 @@ function _updateConvSidebarBadge(cid, _unused) {
   item.querySelector('.conv-status-badge')?.remove();
   // Treat aborted-but-still-draining as not streaming. `pendingConvs` only
   // clears when main emits `done`, which can trail the stop click; until then
-  // the bubble already shows "已中断" so the streaming badge would lie.
+  // the bubble already shows the "stopped" state so the streaming badge would lie.
   const state = pendingConvs.get(cid);
   const pending = !!state && !state.aborted;
   // Use _getQueue so a queue persisted in localStorage is picked up even if
@@ -3737,7 +3772,7 @@ function _updateConvSidebarBadge(cid, _unused) {
   let html = '';
   if (pending) {
     html += '<span class="conv-status-dot"></span>';
-    // html += '<span class="conv-status-text">回复中</span>';
+    // html += '<span class="conv-status-text">replying</span>';
     if (queued > 0) html += `<span class="conv-status-count">+${queued}</span>`;
   } else {
     html += `<span class="conv-status-text">${escapeHtml(t('chat.status.pending_short'))}</span>`;

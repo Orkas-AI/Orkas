@@ -7,7 +7,7 @@ let _selectedSkill = null;    // { source, id }
 // Re-render the skill grid + currently selected detail page when the UI
 // language changes — descriptions are bilingual now and `pickDesc` returns
 // a different string after the locale flip. Detail re-render goes through
-// `selectSkillFile` so the SKILL.md frontmatter re-parses and 简介 picks the
+// `selectSkillFile` so the SKILL.md frontmatter re-parses and the description picks the
 // right locale via `_renderSkillSections`.
 window.addEventListener('i18n-change', () => {
   if (_skillsCache) renderSkillsGrid(_skillsCache);
@@ -41,7 +41,7 @@ async function loadSkills() {
 // The chip pill is still used to display a skill that was attached
 // programmatically by the "use skill" flow (▶ on a skill card → useSkill →
 // setChatSkill). Clicking × removes the chip. On send, the chip's name is
-// prepended to the message as `使用 <name> skill：<content>`.
+// prepended to the message as `use skill <name>: <content>`.
 
 const _chatSkill = { 'new-chat': '', 'conversation': '' };
 
@@ -543,15 +543,18 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   const sourceLabel = source === 'custom' ? t('skills.source_custom') : t('skills.source_builtin');
   document.getElementById('skills-detail-source').textContent = sourceLabel;
 
-  // Doc sections (简介 / 外部依赖 / 依赖技能 / 其他属性) — seed with the
-  // cached description so the page isn't blank on first paint; refined
-  // once SKILL.md frontmatter parses.
+  // Doc sections (description / external dependencies / dependent
+  // skills / other attributes) — seed with the cached description so
+  // the page isn't blank on first paint; refined once SKILL.md
+  // frontmatter parses.
   const seedDesc = pickDesc(skill, getLang()).trim();
   _renderSkillSections(seedDesc ? [['description', seedDesc]] : []);
 
   // Actions bar: visible when a skill is selected.
-  // Order: 使用 (icon) / 编辑 / 启用-禁用 / 内置(custom+dev) / 删除.
-  // In edit mode only 完成 (relabeled 编辑) is shown; everything else hides.
+  // Order: use (icon) / edit / enable-disable / promote-to-builtin
+  //        (custom + dev) / delete.
+  // In edit mode only the "done" button (the relabeled "edit") is
+  // shown; everything else hides.
   const actions = document.getElementById('skills-detail-actions');
   const canEditThisSkill = source === 'custom' || (source === 'builtin' && isDevMode());
   if (actions) {
@@ -700,9 +703,10 @@ function _parseSkillFrontmatterPairs(content) {
 
 // Single source of truth for rendering frontmatter fields into the
 // document. Splits known fields into their own dedicated sections (with
-// labels) and tucks any unknown leftover keys under "其他属性". Hides any
-// section whose content is empty (except 简介 which always renders so the
-// reader sees a placeholder when missing).
+// labels) and tucks any unknown leftover keys under "other
+// attributes". Hides any section whose content is empty (except the
+// description, which always renders so the reader sees a placeholder
+// when missing).
 function _renderSkillSections(pairs) {
   const map = new Map();
   for (const [k, v] of (pairs || [])) {
@@ -710,10 +714,10 @@ function _renderSkillSections(pairs) {
   }
   // `description_zh` / `description_en` are the canonical bilingual fields;
   // legacy single `description` is kept in `known` so it doesn't bleed into
-  // "其他属性" when reading older SKILL.md files.
+  // the "other attributes" bucket when reading older SKILL.md files.
   const known = new Set(['description', 'description_zh', 'description_en']);
 
-  // — 简介 — pick by current UI language with cross-language fallback (so a
+  // — Description — pick by current UI language with cross-language fallback (so a
   // single-language skill still shows something instead of going blank).
   const summaryEl = document.getElementById('skills-detail-summary');
   if (summaryEl) {
@@ -731,7 +735,7 @@ function _renderSkillSections(pairs) {
     }
   }
 
-  // — 其他属性 (catch-all for anything we don't render explicitly) —
+  // — Other attributes (catch-all for anything we don't render explicitly) —
   const extraSection = document.getElementById('skills-section-extra');
   const extraBody = document.getElementById('skills-detail-extra');
   if (extraSection && extraBody) {
@@ -753,7 +757,7 @@ function _renderSkillSections(pairs) {
 
 // Read-only view of a skill file. Markdown renders, other formats get a
 // code block. Stores the raw content on the element so the editor variant
-// can reset on "放弃修改" without re-fetching.
+// can reset on "discard changes" without re-fetching.
 function _renderSkillFileView(body, content, ext) {
   body.className = 'skills-detail-body';
   body.dataset.rawContent = content;
@@ -886,11 +890,12 @@ function _updateEditButtonLabel() {
   btn.textContent = _skillEditMode ? t('skills.edit_btn_done') : t('skills.edit_btn_edit');
 }
 
-// When called with {autoSeed: true} (e.g. right after skill creation), sends
-// a short "帮我完善这个技能" message to kick off the LLM. When autoSeed is a
-// non-empty string, sends that exact string instead — used by URL / Dir
-// import flows to inject their own "帮我安装技能：<...>" seed. In plain edit
-// mode (user clicks "编辑" on an existing skill) no message is sent
+// When called with {autoSeed: true} (e.g. right after skill creation),
+// sends a short "help me refine this skill" message to kick off the
+// LLM. When autoSeed is a non-empty string, sends that exact string
+// instead — used by URL / Dir import flows to inject their own
+// "help me install this skill: <...>" seed. In plain edit mode (user
+// clicks "edit" on an existing skill) no message is sent
 // automatically — the user drives the conversation from a blank input.
 async function toggleSkillEditMode(opts = {}) {
   if (!_selectedSkill) return;
@@ -898,10 +903,11 @@ async function toggleSkillEditMode(opts = {}) {
   if (_selectedSkill.source !== 'custom'
       && !(_selectedSkill.source === 'builtin' && isDevMode())) return;
   if (_skillEditMode && _skillEditSkillId === _selectedSkill.id) {
-    // Abort any in-flight reply so 完成 is "stop + exit", not "exit but
-    // keep streaming". The chat controller is a singleton; leaving it
-    // pending also leaks the streaming-button state into the next skill's
-    // edit panel when the user clicks 编辑 elsewhere.
+    // Abort any in-flight reply so "done" means "stop + exit", not
+    // "exit but keep streaming". The chat controller is a singleton;
+    // leaving it pending also leaks the streaming-button state into
+    // the next skill's edit panel when the user clicks "edit"
+    // elsewhere.
     try { _skillChatCtrl?.abort(); } catch (_) { /* ignore */ }
     _skillEditMode = false;
     _skillEditSkillId = null;
@@ -1012,10 +1018,11 @@ async function _refreshSkillView() {
   if (!_selectedSkill || _selectedSkill.id !== sid || _selectedSkill.source !== source) return;
 
   // Re-render the whole detail page via selectSkillFile so the header
-  // (name) and the doc sections (description / 外部依赖 / 依赖技能 / ...)
-  // pick up SKILL.md frontmatter changes the LLM just made — without
-  // this, the description chip stayed on the pre-edit value until the
-  // user clicked 完成. selectSkillFile also re-reads the body, so we
+  // (name) and the doc sections (description / external deps /
+  // dependent skills / ...) pick up SKILL.md frontmatter changes the
+  // LLM just made — without this, the description chip stayed on the
+  // pre-edit value until the user clicked "done". selectSkillFile
+  // also re-reads the body, so we
   // don't need a separate body refetch here.
   const filepath = _selectedSkill.filepath || 'SKILL.md';
   await selectSkillFile(source, sid, filepath, null);
@@ -1074,7 +1081,7 @@ async function openSkillModal(editId) {
     if (el) el.value = '';
   }
   const sel = document.getElementById('skill-dir-selected');
-  if (sel) sel.textContent = t('skill_modal.dir_none') || '（未选择）';
+  if (sel) sel.textContent = t('skill_modal.dir_none') || '(none selected)';
 
   if (editId) {
     title.textContent = t('skills.modal_edit_title');
@@ -1250,7 +1257,7 @@ async function _saveSkillFromDir({ msgEl }) {
 // Shared "after create" tail: close modal, refresh list, jump to edit view.
 // `seedMessage` — custom first message to seed the skill edit chat with.
 //                 Pass null to let toggleSkillEditMode use its default seed
-//                 ("帮我完善这个技能"). Ignored in edit mode (isNew=false).
+//                 ("help me refine this skill"). Ignored in edit mode (isNew=false).
 async function _afterSkillCreated(sid, isNew, seedMessage) {
   closeSkillModal();
   _skillsCache = null;
@@ -1325,9 +1332,10 @@ async function promoteCustomSkill(id) {
 }
 
 /**
- * Per-skill 启用 / 禁用 button in the detail header. Clone-replace the node
- * each render to drop any prior click handler bound to a stale skill id.
- * The button label flips between 启用 / 禁用 (whichever the click would do).
+ * Per-skill enable / disable button in the detail header.
+ * Clone-replace the node each render to drop any prior click handler
+ * bound to a stale skill id. The button label flips between "enable"
+ * and "disable" (whichever the click would do).
  */
 function _renderSkillEnabledButton(skill) {
   const oldBtn = document.getElementById('skill-enabled-btn');

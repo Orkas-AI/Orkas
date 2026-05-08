@@ -104,9 +104,11 @@ function piOauth(): Promise<PiOauthModule> {
         const { registerMinimaxOAuthProviders } = await import('./oauth-minimax');
         await registerMinimaxOAuthProviders();
       } catch (err) {
-        // 失败不 swallow：把信息同时塞进 log + 缓存里的模块对象，让后续
-        // listProviders / startOAuth 都能看到"MiniMax 没注册成功"并给出
-        // 明确提示，而不是用户点了 OAuth 才撞到 "does not support OAuth"。
+        // Don't swallow the failure: stash the message into both the log
+        // and the cached module object so subsequent listProviders /
+        // startOAuth calls can surface a clear "MiniMax registration
+        // failed" hint, instead of the user only finding out via the
+        // generic "does not support OAuth" error after clicking OAuth.
         const msg = (err as Error)?.message || String(err);
         log.warn('failed to register custom OAuth providers:', msg);
         _minimaxRegisterError = msg;
@@ -117,7 +119,8 @@ function piOauth(): Promise<PiOauthModule> {
   return _oauthPromise;
 }
 
-/** 最近一次 MiniMax 注册失败原因；供 startOAuth 给用户兜底提示。 */
+/** Last MiniMax registration failure reason; used by startOAuth to
+ *  surface a fallback hint to the user. */
 let _minimaxRegisterError: string | null = null;
 
 /**
@@ -432,7 +435,7 @@ export interface ProviderEntry {
    *  Renderer shows it as a warning-tinted hint on the card + the add-key
    *  form so users can verify they have the right kind of account. */
   subscriptionNote?: string;
-  /** Cosmetic hint — renderer appends a "(推荐 / Recommended)" suffix on the
+  /** Cosmetic hint — renderer appends a "(Recommended)" suffix on the
    *  picker label. Source of truth is `CatalogEntry.recommended`. */
   recommended?: boolean;
   profiles: ProfileView[];
@@ -465,10 +468,13 @@ export async function listProviders(): Promise<{ providers: ProviderEntry[] }> {
   try { mod = await ca(); } catch (e) {
     log.warn('core-agent unavailable for listProviders; falling back to static catalog', { error: (e as Error).message });
   }
-  // OAuth 能力来源 = pi-ai 运行时注册表。自定义 provider（如 MiniMax
-  // Portal）由 `piOauth()` 启动时同步注册完毕；若注册失败会在日志打 warn。
-  // `OAUTH_PROVIDERS` 常量只在 pi-ai 整个 oauth 模块加载失败时做兜底，
-  // 不做 UNION —— 否则会在 UI 上显示根本无法走通的 OAuth 按钮。
+  // OAuth capability source = pi-ai's runtime registry. Custom
+  // providers (e.g. MiniMax Portal) are registered synchronously by
+  // `piOauth()` at startup; registration failures get a warn-level log.
+  // The `OAUTH_PROVIDERS` constant is only a fallback for the case
+  // where pi-ai's entire oauth module fails to load — we deliberately
+  // do NOT union it in, otherwise the UI would show OAuth buttons that
+  // can never actually work.
   let oauthIds: Set<string>;
   try {
     const oauth = await piOauth();
@@ -485,9 +491,11 @@ export async function listProviders(): Promise<{ providers: ProviderEntry[] }> {
     byProvider.set(prof.provider, list);
   }
 
-  // OAuth 别名合并：把挂在 OAuth 后端下的 profile 折叠到父级 provider 的卡片
-  // 上，这样用户在"MiniMax"卡上通过 OAuth 登录后，拿到的 profile 就展示在
-  // 同一张卡片里（而不是突然又冒出一张"MiniMax 订阅 (CN)"卡）。
+  // OAuth alias merge: profiles attached to an OAuth backend get folded
+  // into the parent provider's card, so a user who logs in via OAuth on
+  // the "MiniMax" card sees the resulting profile displayed on the
+  // same card (instead of a surprise extra "MiniMax Subscription (CN)"
+  // card appearing).
   for (const [parent, alias] of Object.entries(OAUTH_ALIAS_FOR)) {
     const aliasProfiles = byProvider.get(alias);
     if (aliasProfiles && aliasProfiles.length) {
@@ -872,9 +880,10 @@ export function openExternalUrl(url: string): { ok: boolean; error?: string } {
   const target = String(url || '').trim();
   if (!target) return { ok: false, error: 'url required' };
   if (!/^https?:\/\//i.test(target)) return { ok: false, error: 'url must be http(s)' };
-  // Electron 的 shell.openExternal 是跨平台的官方 API：macOS 走 open(1)、
-  // Windows 走 ShellExecuteW、Linux 走 xdg-open —— 替代了以前自己拼 shell
-  // 命令（Windows cmd 的 `start "" "url"` 引号嵌套在 exec() 下容易崩）。
+  // Electron's shell.openExternal is the official cross-platform API:
+  // macOS uses open(1), Windows uses ShellExecuteW, Linux uses
+  // xdg-open — supersedes our old hand-rolled shell commands (Windows
+  // cmd's `start "" "url"` quoting was prone to breaking under exec()).
   shell.openExternal(target).catch((err: unknown) => {
     log.warn('openExternal failed:', (err as Error)?.message || String(err));
   });
@@ -921,7 +930,7 @@ export async function startOAuth(
           usesCallbackServer,
         };
         // Auto-open the user's system default browser. If this fails the
-        // renderer still shows the URL + 复制链接 button as a fallback.
+        // renderer still shows the URL + "copy link" button as a fallback.
         openExternalUrl(info.url);
       },
       onPrompt: async (prompt) => {

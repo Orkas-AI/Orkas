@@ -1,16 +1,22 @@
 // ─── Avatar picker (combined icon + color popover) ───────────────────────
 //
-// 单一弹窗，里面两行：图标 grid + 颜色 grid。每选一项就触发回调，UI 立刻
-// 反映新组合。复用 `window.positionPickerPopover` 做定位（智能体/技能/agent
-// picker 用的同一套），保持视觉一致。
+// Single popover containing two rows: icon grid + color grid. Each
+// selection fires the callback and the UI updates immediately to
+// reflect the new combination. Reuses `window.positionPickerPopover`
+// for layout (the same helper agent/skill/agent picker uses), so the
+// visual style stays consistent.
 //
-// 入口：openAvatarPicker(anchorEl, current, opts, onChange)
-//   anchorEl:  锚点元素，用于定位
-//   current:   { icon, color }，用于高亮当前选中
+// Entry: openAvatarPicker(anchorEl, current, opts, onChange)
+//   anchorEl:  the anchor element used for positioning.
+//   current:   { icon, color }, used to highlight the current pick.
 //   opts:
-//     allowCommanderCombo: false —— true 时不过滤 crown / gold（指挥官设置）
-//     hideIcons: false           —— true 时只展示颜色行（指挥官头像图标固定为 crown）
-//   onChange:  ({ icon, color }) => void，每次选择都会触发
+//     allowCommanderCombo: false — when true, crown / gold are not
+//                                  filtered out (used by the
+//                                  commander avatar settings).
+//     hideIcons: false           — when true, only the color row is
+//                                  rendered (the commander avatar's
+//                                  icon is always crown).
+//   onChange:  ({ icon, color }) => void, fires on every selection.
 
 let _avatarPickerEl = null;
 let _avatarPickerCurrent = null;
@@ -26,11 +32,11 @@ function _ensureAvatarPickerDom() {
   el.style.display = 'none';
   el.innerHTML = `
     <div class="avatar-picker-section" data-role="icon-section">
-      <div class="avatar-picker-label" data-i18n="avatar.icon_label">图标</div>
+      <div class="avatar-picker-label" data-i18n="avatar.icon_label">Icon</div>
       <div class="avatar-picker-grid" data-role="icon-grid"></div>
     </div>
     <div class="avatar-picker-section">
-      <div class="avatar-picker-label" data-i18n="avatar.color_label">颜色</div>
+      <div class="avatar-picker-label" data-i18n="avatar.color_label">Color</div>
       <div class="avatar-picker-grid" data-role="color-grid"></div>
     </div>
   `;

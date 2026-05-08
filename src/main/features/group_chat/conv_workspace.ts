@@ -23,7 +23,8 @@
  * navigation (CJK preserved, English lowercased, no opaque cid hex).
  *
  * Placeholder fallback: when the title is missing / equals the i18n
- * placeholder ("新对话" / "New conversation") / slug-ifies to empty / hits
+ * placeholder (English "New conversation" or its localized form
+ * "新对话") / slug-ifies to empty / hits
  * a Windows reserved name, we fall back to `chat-{YYYY-MM-DD}-{N}`. The
  * fallback is also frozen on first use, so a write that fired before the
  * conv got its real auto-generated title locks in the date-based name —
@@ -44,7 +45,7 @@ const MAX_SLUG_LEN = 32;
 
 // Match the literal default titles `chats.createConversation` writes when
 // no title is supplied (currently `t('chat.default_title')` resolved at
-// creation time → '新对话' for zh UI / 'New conversation' for en UI) AND
+// creation time → '新对话' for zh UI, 'New conversation' for en UI) AND
 // any historical / capitalization variant. Match by string equality, not
 // lang lookup, because state can carry whatever the conv was named at
 // creation regardless of the current UI language.

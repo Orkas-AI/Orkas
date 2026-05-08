@@ -367,10 +367,13 @@ export function buildMinimaxPortalProvider(region: MiniMaxRegion): OAuthProvider
  * Register both region variants with pi-ai. Idempotent — safe to call
  * multiple times (pi-ai's registry uses id as key).
  *
- * **Registry 一致性**：pi-ai 是 ESM-only 的 package，但 Orkas 主进程经
- * `tsx/cjs` 运行态转译；早先遇到过"register 能调通、`getOAuthProvider`
- * 取回 undefined"的诡异行为（可能的 ESM/CJS interop 导致两份 registry
- * 实例）。这里注册完立即读一次做自验证，若不一致立刻抛错便于定位。
+ * **Registry consistency**: pi-ai is an ESM-only package, but the
+ * Orkas main process is transpiled at runtime via `tsx/cjs`. We've
+ * previously hit weird behavior where `register` succeeded yet
+ * `getOAuthProvider` returned undefined (likely an ESM/CJS interop
+ * issue producing two registry instances). After registering, we
+ * immediately read back to self-verify and throw on mismatch so the
+ * cause is locatable.
  */
 export async function registerMinimaxOAuthProviders(): Promise<void> {
   const oauth = await import('@mariozechner/pi-ai/oauth');

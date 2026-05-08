@@ -380,7 +380,7 @@ async function applyPlanStepTurn(
   // the partial reply bus accumulated from delta events); if there's nothing
   // to salvage AND no side effect, go silent so the renderer's turn_silent
   // handler can either freeze the process rail as a "thinking trail" bubble
-  // or remove the placeholder entirely. Avoids the orphan "（已中断）" bubble
+  // or remove the placeholder entirely. Avoids the orphan "(stopped)" bubble
   // for turns that aborted before producing anything visible.
   if (evt.aborted) {
     await transitionStepFailed(uid, cid, step, 'aborted by user', '');
@@ -515,7 +515,7 @@ function errorBubble(msg: string): string {
 }
 
 /** Outcome for an aborted turn. Returns the salvageable content (partial
- * streamed reply + any user-visible side effects), with NO "（已中断）"
+ * streamed reply + any user-visible side effects), with NO "(stopped)"
  * suffix — bus appends that once, after merging in any staged plan
  * announcement, so the marker always lands at the end regardless of which
  * pieces survived.
@@ -523,7 +523,7 @@ function errorBubble(msg: string): string {
  * No salvageable content AND no side effect → silent. The renderer's
  * `turn_silent` handler then either freezes the process rail (tool calls
  * etc.) as a thinking-trail bubble or removes the placeholder entirely.
- * Skipping the persist here is what prevents the orphan "（已中断）" bubble
+ * Skipping the persist here is what prevents the orphan "(stopped)" bubble
  * for turns that aborted before producing anything visible.
  */
 function abortOutcome(evt: TurnFinishedEvent): TurnOutcome {
