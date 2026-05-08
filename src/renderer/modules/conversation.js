@@ -2112,8 +2112,24 @@ function _streamingSetError(msg, text) {
   }
   const finalEl = msg.querySelector('[data-role="final"]');
   if (!finalEl) return;
-  finalEl.innerHTML = `<span style="color:var(--danger)">${escapeHtml(t('chat.send_failed', { msg: text }))}</span>`;
+  // Preserve any partial reply that streamed in before the error so the
+  // user keeps the assistant's in-flight prose / process info, then append
+  // the error pill underneath. Without this, mid-stream errors wipe the
+  // visible turn entirely and the user only sees the error pill.
+  const partial = String(msg.dataset.streamBuf || '');
+  let bodyHtml = '';
+  if (partial) {
+    const display = _stripSurvivingAgentBlocks(partial);
+    if (display) {
+      bodyHtml = `<div class="markdown-body">${_renderMessageMarkdown(display)}</div>`;
+      msg.dataset.finalText = display;
+    }
+  }
+  const errPill = `<div class="msg-error" style="color:var(--danger);margin-top:6px">${escapeHtml(t('chat.send_failed', { msg: text }))}</div>`;
+  finalEl.innerHTML = bodyHtml + errPill;
   finalEl.style.display = '';
+  delete msg.dataset.streamBuf;
+  if (bodyHtml && typeof typesetMath === 'function') typesetMath(finalEl);
 }
 
 // Mark the assistant bubble as user-interrupted. Preserves whatever partial

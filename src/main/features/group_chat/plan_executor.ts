@@ -262,15 +262,21 @@ function outcomeForSynthTurn(evt: TurnFinishedEvent): TurnOutcome {
   if (evt.aborted) {
     return abortOutcome(evt);
   }
-  if (evt.errText) {
-    return { kind: 'persist', text: errorBubble(evt.errText) };
-  }
   if (evt.finalText && evt.finalText.trim()) {
+    // Keep the partial reply and append the error pill underneath when
+    // the stream errored mid-turn — otherwise the user loses everything
+    // the model already produced and only sees the error.
+    const body = evt.errText
+      ? `${evt.finalText}\n\n${errorBubble(evt.errText)}`
+      : evt.finalText;
     return {
       kind: 'persist',
-      text: evt.finalText,
+      text: body,
       ...(evt.produced.length ? { produced: evt.produced } : {}),
     };
+  }
+  if (evt.errText) {
+    return { kind: 'persist', text: errorBubble(evt.errText) };
   }
   // Empty final on a synth turn = user gets a placeholder so they at least
   // see "the plan finished but I had nothing more to add".
@@ -326,9 +332,16 @@ async function outcomeForUserDirectTurn(uid: string, cid: string, evt: TurnFinis
   // the form widget entirely (the user-reported bug).
   const hasSideEffect = !!evt.form || !!evt.createdAgent || (evt.produced && evt.produced.length > 0);
   if ((evt.finalText && evt.finalText.trim()) || hasSideEffect) {
+    // When the stream errored mid-turn but partial text / side effects
+    // already landed, append the error pill instead of dropping the
+    // partial — same intent as outcomeForSynthTurn's branch above.
+    const partial = evt.finalText || '';
+    const body = evt.errText
+      ? (partial ? `${partial}\n\n${errorBubble(evt.errText)}` : errorBubble(evt.errText))
+      : partial;
     return {
       kind: 'persist',
-      text: evt.finalText || '',
+      text: body,
       ...(evt.form ? { form: evt.form } : {}),
       ...(evt.produced.length ? { produced: evt.produced } : {}),
       ...(evt.createdAgent ? { createdAgent: evt.createdAgent } : {}),
