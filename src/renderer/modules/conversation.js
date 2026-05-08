@@ -3220,6 +3220,15 @@ function _splitMarkdownProseCode(text) {
         i = close;
         continue;
       }
+      // Mid-stream unclosed inline backticks — mirror the fenced-block branch
+      // above and tentatively classify [backtick, EOF] as code so a literal
+      // `<agent>` typed inside the span isn't stripped while we wait for the
+      // closing backtick to stream in.
+      flushProse(i);
+      segs.push({ kind: 'code', text: text.slice(i, n) });
+      proseStart = n;
+      i = n;
+      continue;
     }
     i++;
   }
