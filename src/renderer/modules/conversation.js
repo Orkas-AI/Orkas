@@ -1611,9 +1611,9 @@ function _renderQuotePreview() {
   // capture flow through naturally; fall back to the click-time snapshot
   // when the actor was deleted between capture and render.
   const liveName = q.fromActor === 'commander'
-    ? (t('chat.from_commander') || '指挥官')
+    ? (t('chat.from_commander') || 'Commander')
     : _groupActorLabel(q.fromActor);
-  const fromName = liveName || q.fromName || (t('chat.from_agent_unknown') || '智能体');
+  const fromName = liveName || q.fromName || (t('chat.from_agent_unknown') || 'Agent');
   const trunc = String(q.text || '');
   const fileChips = (q.produced || []).map((p) => {
     const base = String(p || '').split(/[\\/]/).pop() || p;
@@ -1697,12 +1697,11 @@ function _attachBubbleArchiveBtn(msgDiv, getContent) {
       if (!Array.isArray(produced)) produced = [];
     } catch (_) { produced = []; }
     const fromName = fromActor === 'commander'
-      ? (t('chat.from_commander') || '指挥官')
+      ? (t('chat.from_commander') || 'Commander')
       : (_groupActorLabel(fromActor) || '');
     _setQuote(currentCid, { fromActor, fromName, msgId, text, produced });
     const input = document.getElementById('chat-input');
     if (input) { input.focus(); }
-    if (window.Monitor) Monitor.click('bubble_quote', { cid: currentCid, has_files: produced.length > 0 });
   });
   copyBtn.addEventListener('click', async (e) => {
     e.stopPropagation();
