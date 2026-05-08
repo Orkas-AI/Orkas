@@ -2508,26 +2508,37 @@ body.model-not-configured .main-content { flex-direction: column; }
 .chat-msg-actions:empty {
   display: none;
 }
+/* Knowledge-base + Copy buttons live in this inline-flex container that
+ * gets appended to .chat-msg-actions. `order: -1` pins them to the
+ * leading edge of the actions row regardless of how many produced-file
+ * / created-agent chips follow — siblings default to 0 and fall in
+ * after, so the user always finds these two buttons at the same spot
+ * under every bubble. */
 .chat-bubble-actions {
   display: inline-flex;
   align-items: center;
+  gap: 4px;
+  order: -1;
 }
 .bubble-archive-btn,
 .bubble-copy-btn {
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--muted);
   font-size: 11px;
-  color: var(--text-muted, #6b7280);
-  background: transparent;
-  border: 1px solid var(--border-soft, #e5e7eb);
-  border-radius: 999px;
   padding: 2px 10px;
+  border-radius: 10px;
   cursor: pointer;
-  transition: background 0.12s, color 0.12s, border-color 0.12s;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+  transition: all 0.12s;
+  font-family: inherit;
 }
 .bubble-archive-btn:hover,
 .bubble-copy-btn:hover {
-  background: var(--bg-soft, #f3f4f6);
-  color: var(--text, #1f2937);
-  border-color: var(--border, #d1d5db);
+  color: var(--primary);
+  border-color: rgba(37, 99, 235, 0.25);
+  background: rgba(37, 99, 235, 0.04);
+  box-shadow: 0 2px 6px rgba(37, 99, 235, 0.15);
 }
 .bubble-archive-btn:disabled,
 .bubble-copy-btn:disabled {
@@ -3493,35 +3504,6 @@ body.model-not-configured .main-content { flex-direction: column; }
 .ctx-viewer-editor:focus {
   border-color: var(--primary, #3b82f6);
   box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.12);
-}
-
-/* Archive button lives inside .chat-meta (to the right of the timestamp) so
-   it never overlaps the bubble. Only attached for finalised assistant replies. */
-.chat-bubble-actions {
-  display: inline-flex;
-  gap: 4px;
-}
-
-.bubble-archive-btn,
-.bubble-copy-btn {
-  border: 1px solid var(--border);
-  background: #fff;
-  color: var(--muted);
-  font-size: 11px;
-  padding: 2px 10px;
-  border-radius: 10px;
-  cursor: pointer;
-  box-shadow: 0 1px 2px rgba(0,0,0,0.05);
-  transition: all 0.12s;
-  font-family: inherit;
-}
-
-.bubble-archive-btn:hover,
-.bubble-copy-btn:hover {
-  color: var(--primary);
-  border-color: rgba(37, 99, 235, 0.25);
-  background: rgba(37, 99, 235, 0.04);
-  box-shadow: 0 2px 6px rgba(37, 99, 235, 0.15);
 }
 
 /* ─── Agents ─── */
