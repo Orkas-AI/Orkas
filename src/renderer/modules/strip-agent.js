@@ -1,15 +1,28 @@
 // Pure string functions for atomic-container stripping of LLM-emitted
-// XML tags surfacing in renderer text. Three tag families share these
-// helpers via `tagName` parameter:
+// structural blocks surfacing in renderer text. Two delimiter families:
+//
+// **XML-tag containers** (handled via `tagName` parameter):
 //   - `<agent>`               — commander create / edit container
 //   - `<agent-input-form>`    — agent's form widget (streaming placeholder)
 //   - `<agent-input-submission>` — user form-reply tag (display strip)
 //
-// All three need the same prose/code guard — if any of them is mentioned
-// literally inside a fenced code block or inline backtick span (e.g., a
-// protocol explanation), the literal mention must survive; the real
-// container must still be stripped/replaced atomically even when its body
-// contains backticks / fences / quotes (otherwise the prose/code split
+// **Custom-fence blocks** (`<<<delim ... \n>>>`):
+//   - `<<<skill-file path=X ... >>>` — skill edit chat's file-write block
+//
+// The two families coexist because their **content shapes differ**: XML-tag
+// containers wrap structured LLM-generated prose (sub-fields like
+// `<workflow>` / `<inputs>`) and balanced-tag parsing is the natural fit;
+// the skill-file block wraps **arbitrary file content** (Python, TypeScript,
+// HTML, JSX, configs) that routinely contains naked `<` / `>` characters,
+// so a literal three-char fence is required to avoid colliding with body
+// content. Same justification as the LLM-side prompts (`chat_agent_setup.md`
+// chose XML, `chat_skill_setup.md` chose `<<<>>>`).
+//
+// Both families share the same prose/code guard — if any of them is
+// mentioned literally inside a fenced code block or inline backtick span
+// (e.g., a protocol explanation), the literal mention must survive; the
+// real container must still be stripped/replaced atomically even when its
+// body contains backticks / fences / quotes (otherwise the prose/code split
 // fragments the container and the post-fragment suffix leaks past — the
 // 34e27fcb / a3110e61 / follow-up cycle on `<agent>`).
 //
@@ -250,12 +263,103 @@ function _replaceOuterAgentBlocks(buf, placeholder) {
 // fenced block / inline backtick survives all three. After all three
 // strip passes, collapse blank-line runs and trim, identical to the
 // `<agent>`-only post-processing.
+// `<<<skill-file path=X attr=V\n...content...\n>>>` block ranges. Different
+// from XML-tag containers: the body is **arbitrary file content** (Python,
+// TypeScript, HTML, JSX, configs) which routinely contains naked `<` / `>`
+// characters, so we use a literal three-char fence instead of a balanced
+// XML tag — same reason `chat_skill_setup.md` chose this shape on the LLM
+// side. The opener is `<<<skill-file` followed by attribute pairs and a
+// newline; the closer is `\n>>>` (must be at line start, mirrors backend
+// `SKILL_FILE_BLOCK_RE` in `features/skills.ts`).
+//
+// Outer-context check (prose vs code segment) is shared with the tag
+// finder: a literal `<<<skill-file` mentioned inside a fenced code block
+// or inline backtick (LLM showing the protocol to a user) must NOT be
+// recognised as a real block.
+const SKILL_FILE_OPEN = '<<<skill-file';
+const SKILL_FILE_CLOSE = '\n>>>';
+
+function _findOuterSkillFileRanges(text) {
+  if (!text || text.indexOf(SKILL_FILE_OPEN) < 0) return [];
+  const segs = _splitMarkdownProseCode(text);
+  const ranges = [];
+  let pos = 0;
+  for (const seg of segs) {
+    const segStart = pos;
+    pos += seg.text.length;
+    if (seg.kind !== 'prose') continue;
+    let from = segStart;
+    while (from < pos) {
+      const last = ranges.length ? ranges[ranges.length - 1] : null;
+      if (last && from < last[1]) from = last[1];
+      if (from >= pos) break;
+      const openIdx = text.indexOf(SKILL_FILE_OPEN, from);
+      if (openIdx < 0 || openIdx >= pos) break;
+      // Mirror agent's atomic-container guarantee: once the opener is in an
+      // outer prose segment, walk to `\n>>>` regardless of what's inside
+      // (file content can contain backticks, inline code, fences, anything).
+      // Unclosed opener mid-stream → swallow rest of buffer atomically so
+      // partial file content doesn't leak into the bubble.
+      const closeIdx = text.indexOf(SKILL_FILE_CLOSE, openIdx + SKILL_FILE_OPEN.length);
+      const endPos = closeIdx < 0 ? text.length : closeIdx + SKILL_FILE_CLOSE.length;
+      ranges.push([openIdx, endPos]);
+      from = endPos;
+    }
+  }
+  return ranges;
+}
+
+function _stripOuterSkillFileBlocks(text) {
+  if (!text) return text;
+  const ranges = _findOuterSkillFileRanges(text);
+  if (!ranges.length) return text;
+  let out = '';
+  let cursor = 0;
+  for (const [s, e] of ranges) {
+    out += text.slice(cursor, s);
+    cursor = e;
+  }
+  out += text.slice(cursor);
+  return out;
+}
+
+// Pull the `path=X` attribute value out of a captured block — used by the
+// streaming placeholder so the user sees "writing <basename>…" instead of
+// a generic "writing file…". Tolerant of attribute order; quotes are not
+// expected (LLM emits `path=SKILL.md` per the spec) but stripped if found.
+function _extractSkillFilePath(blockText) {
+  const m = /\bpath=("([^"]*)"|'([^']*)'|(\S+))/.exec(blockText || '');
+  if (!m) return '';
+  return m[2] || m[3] || m[4] || '';
+}
+
+function _replaceOuterSkillFileBlocks(buf, makePlaceholder) {
+  if (!buf) return buf;
+  const ranges = _findOuterSkillFileRanges(buf);
+  if (!ranges.length) return buf;
+  let out = '';
+  let cursor = 0;
+  for (const [s, e] of ranges) {
+    out += buf.slice(cursor, s);
+    out += makePlaceholder(_extractSkillFilePath(buf.slice(s, e)));
+    cursor = e;
+  }
+  out += buf.slice(cursor);
+  return out;
+}
+
 function _stripSurvivingStructuralBlocks(text) {
   if (!text) return text;
   let out = text;
   for (const tag of ['agent', 'agent-input-form', 'agent-input-submission']) {
     out = _stripOuterTagBlocks(out, tag);
   }
+  // `<<<skill-file>>>` blocks: backend `extractSkillFileBlocks` strips them
+  // server-side at final-event time, but a stream aborted mid-block leaves
+  // the closing `\n>>>` absent → backend regex won't match → raw delimiters
+  // would otherwise reach the bubble. Final-time renderer safety strip
+  // covers that edge.
+  out = _stripOuterSkillFileBlocks(out);
   if (out === text) return text;
   return out.replace(/\n{3,}/g, '\n\n').trim();
 }
@@ -270,6 +374,10 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     _findOuterAgentRanges,
     _stripSurvivingAgentBlocks,
     _replaceOuterAgentBlocks,
+    _findOuterSkillFileRanges,
+    _stripOuterSkillFileBlocks,
+    _replaceOuterSkillFileBlocks,
+    _extractSkillFilePath,
     _stripSurvivingStructuralBlocks,
   };
 }

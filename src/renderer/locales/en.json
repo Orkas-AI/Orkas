@@ -160,6 +160,8 @@
   "chat.created_agent_chip": "Open: {name}",
   "chat.create_agent_failed": "Failed to create agent: {reason}",
   "chat.create_agent_streaming_placeholder": "Assembling agent config…",
+  "chat.skill_file_streaming_placeholder": "Writing {path}…",
+  "chat.skill_file_streaming_placeholder_unknown": "Writing file…",
   "skills.title": "Skills",
   "skills.add": "+ Add",
   "skills.custom_group": "Custom",

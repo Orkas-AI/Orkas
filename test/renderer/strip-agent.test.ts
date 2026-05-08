@@ -408,6 +408,214 @@ describe('_stripSurvivingStructuralBlocks (final-time safety strip)', () => {
   });
 });
 
+// --- Custom-fence blocks: `<<<skill-file path=X ... >>>` ----------------
+// Different delimiter family from XML tags above (see strip-agent.js
+// header). The skill-file block wraps **arbitrary file content** that may
+// contain naked `<` / `>` chars (Python, TypeScript, HTML, JSX, configs);
+// using XML tags would force the LLM to escape — instead the LLM-side
+// prompt (`chat_skill_setup.md`) declares a literal `<<<` / `\n>>>` fence
+// pair. The renderer must still apply the same prose/code outer-context
+// guard so a literal `<<<skill-file ...>>>` mention inside a fenced code
+// block / inline backtick (LLM explaining the protocol to the user)
+// survives, while a real block (containing arbitrary file content with
+// naked backticks / fences inside) is stripped/replaced atomically.
+
+const skill = require('../../src/renderer/modules/strip-agent.js');
+const {
+  _findOuterSkillFileRanges,
+  _stripOuterSkillFileBlocks,
+  _replaceOuterSkillFileBlocks,
+  _extractSkillFilePath,
+} = skill as {
+  _findOuterSkillFileRanges: (text: string) => Array<[number, number]>;
+  _stripOuterSkillFileBlocks: (text: string) => string;
+  _replaceOuterSkillFileBlocks: (buf: string, makePlaceholder: (path: string) => string) => string;
+  _extractSkillFilePath: (blockText: string) => string;
+};
+
+const SKILL_PH = (path: string) => `⟨SKILL:${path || '?'}⟩`;
+
+describe('skill-file — set A (real <<<skill-file>>> blocks must be replaced)', () => {
+  it('A1. plain closed block, SKILL.md frontmatter body', () => {
+    const buf = [
+      'wrote it for you.',
+      '<<<skill-file path=SKILL.md',
+      '---',
+      'name: foo',
+      'description_zh: 中文',
+      'description_en: English',
+      '---',
+      '',
+      '# body',
+      '>>>',
+      'done.',
+    ].join('\n');
+    expect(_stripOuterSkillFileBlocks(buf)).toBe('wrote it for you.\n\ndone.');
+    expect(_replaceOuterSkillFileBlocks(buf, SKILL_PH)).toBe('wrote it for you.\n⟨SKILL:SKILL.md⟩\ndone.');
+  });
+
+  it('A2. block body contains naked `<` `>` (HTML / JSX / generic types) — atomic strip', () => {
+    // The whole reason we use a literal fence instead of XML tags: file
+    // content routinely has these chars. Strip must not be confused by them.
+    const buf = [
+      'before',
+      '<<<skill-file path=scripts/render.tsx',
+      'function Foo(): JSX.Element { return <div>{x < y && y > z}</div>; }',
+      'type Bag<T> = Array<T>;',
+      '>>>',
+      'after',
+    ].join('\n');
+    expect(_stripOuterSkillFileBlocks(buf)).toBe('before\n\nafter');
+    expect(_replaceOuterSkillFileBlocks(buf, SKILL_PH)).toBe('before\n⟨SKILL:scripts/render.tsx⟩\nafter');
+  });
+
+  it('A3. block body contains a fenced code block (markdown SKILL.md with ``` examples)', () => {
+    const buf = [
+      'before',
+      '<<<skill-file path=SKILL.md',
+      '# Usage',
+      '```bash',
+      'python3 scripts/run.py "topic"',
+      '```',
+      '>>>',
+      'after',
+    ].join('\n');
+    expect(_stripOuterSkillFileBlocks(buf)).toBe('before\n\nafter');
+    expect(_replaceOuterSkillFileBlocks(buf, SKILL_PH)).toBe('before\n⟨SKILL:SKILL.md⟩\nafter');
+  });
+
+  it('A4. unclosed block mid-stream — swallow to EOF', () => {
+    const buf = 'streaming…\n<<<skill-file path=SKILL.md\n---\nname: foo\n# partial body still arr';
+    expect(_stripOuterSkillFileBlocks(buf)).toBe('streaming…\n');
+    expect(_replaceOuterSkillFileBlocks(buf, SKILL_PH)).toBe('streaming…\n⟨SKILL:SKILL.md⟩');
+  });
+
+  it('A5. two closed blocks in one buffer (e.g., SKILL.md + scripts/foo.py written same turn)', () => {
+    const buf = [
+      'wrote two files.',
+      '<<<skill-file path=SKILL.md',
+      'a',
+      '>>>',
+      'and',
+      '<<<skill-file path=scripts/foo.py',
+      'print("hi")',
+      '>>>',
+      'done.',
+    ].join('\n');
+    expect(_stripOuterSkillFileBlocks(buf)).toBe('wrote two files.\n\nand\n\ndone.');
+    const replaced = _replaceOuterSkillFileBlocks(buf, SKILL_PH);
+    expect(replaced).toContain('⟨SKILL:SKILL.md⟩');
+    expect(replaced).toContain('⟨SKILL:scripts/foo.py⟩');
+    expect(replaced.match(/⟨SKILL:/g)?.length).toBe(2);
+  });
+});
+
+describe('skill-file — set B (literal <<<skill-file>>> mentions must survive)', () => {
+  it('B1. inside a fenced ```text block (LLM showing the protocol to the user)', () => {
+    const buf = [
+      'Use this format to write a file:',
+      '```',
+      '<<<skill-file path=SKILL.md',
+      'content',
+      '>>>',
+      '```',
+      'after',
+    ].join('\n');
+    expect(_stripOuterSkillFileBlocks(buf)).toBe(buf);
+    expect(_replaceOuterSkillFileBlocks(buf, SKILL_PH)).toBe(buf);
+  });
+
+  it('B2. inside an inline backtick span', () => {
+    const buf = 'Wrap content in `<<<skill-file path=X>>>...>>>` to write it.';
+    expect(_stripOuterSkillFileBlocks(buf)).toBe(buf);
+    expect(_replaceOuterSkillFileBlocks(buf, SKILL_PH)).toBe(buf);
+  });
+
+  it('B3. inside an UNCLOSED inline backtick (mid-stream code-explanation)', () => {
+    const buf = 'You can write `<<<skill-file path=SKILL.md';
+    expect(_stripOuterSkillFileBlocks(buf)).toBe(buf);
+    expect(_replaceOuterSkillFileBlocks(buf, SKILL_PH)).toBe(buf);
+  });
+});
+
+describe('skill-file — mixed (real block + literal mention coexisting)', () => {
+  it('only the real block goes; quoted protocol example stays', () => {
+    const buf = [
+      'Format reference:',
+      '```',
+      '<<<skill-file path=PATH',
+      'content',
+      '>>>',
+      '```',
+      'And here is the actual write:',
+      '<<<skill-file path=SKILL.md',
+      'real body',
+      '>>>',
+      'done.',
+    ].join('\n');
+    const stripped = _stripOuterSkillFileBlocks(buf);
+    expect(stripped).toContain('```');
+    expect(stripped).toContain('<<<skill-file path=PATH');  // literal mention preserved
+    expect(stripped).not.toContain('real body');
+    expect(stripped).toContain('done.');
+
+    const replaced = _replaceOuterSkillFileBlocks(buf, SKILL_PH);
+    expect(replaced).toContain('<<<skill-file path=PATH');  // literal mention preserved
+    expect(replaced).toContain('⟨SKILL:SKILL.md⟩');
+    expect(replaced).not.toContain('real body');
+    // Exactly one placeholder (only the real block; the in-fence example doesn't count).
+    expect(replaced.match(/⟨SKILL:/g)?.length).toBe(1);
+  });
+});
+
+describe('skill-file — _extractSkillFilePath', () => {
+  it('extracts the path attribute regardless of trailing attrs', () => {
+    expect(_extractSkillFilePath('<<<skill-file path=SKILL.md')).toBe('SKILL.md');
+    expect(_extractSkillFilePath('<<<skill-file path=scripts/foo.py extra=1')).toBe('scripts/foo.py');
+  });
+
+  it('tolerates quoted forms even though the spec says unquoted', () => {
+    expect(_extractSkillFilePath('<<<skill-file path="SKILL.md"')).toBe('SKILL.md');
+    expect(_extractSkillFilePath("<<<skill-file path='scripts/run.sh'")).toBe('scripts/run.sh');
+  });
+
+  it('returns empty string when path attr is missing', () => {
+    expect(_extractSkillFilePath('<<<skill-file')).toBe('');
+    expect(_extractSkillFilePath('')).toBe('');
+  });
+});
+
+describe('skill-file — _stripSurvivingStructuralBlocks final-time safety', () => {
+  it('strips a surviving <<<skill-file>>> block (backend extractor missed it: stream aborted before \\n>>>)', () => {
+    const buf = 'lead\n<<<skill-file path=SKILL.md\n# partial body never closed';
+    expect(_stripSurvivingStructuralBlocks(buf)).toBe('lead');
+  });
+
+  it('coexists with XML-tag strip: real <agent> + real <<<skill-file>>> + literal mentions', () => {
+    const buf = [
+      'before',
+      '<agent><name>A</name></agent>',
+      'mid',
+      '<<<skill-file path=SKILL.md',
+      'real body',
+      '>>>',
+      'after',
+      '```',
+      '<agent><name>QuotedExample</name></agent>',  // literal in code stays
+      '<<<skill-file path=Q>>>...>>>',              // inline-ish in code stays
+      '```',
+      'end',
+    ].join('\n');
+    const out = _stripSurvivingStructuralBlocks(buf);
+    expect(out).not.toContain('<name>A</name>');
+    expect(out).not.toContain('real body');
+    expect(out).toContain('<name>QuotedExample</name>');  // protected by ``` fence
+    expect(out).toContain('mid');
+    expect(out).toContain('after');
+    expect(out).toContain('end');
+  });
+});
+
 describe('_splitMarkdownProseCode sanity', () => {
   it('keeps inline backtick spans as code segments', () => {
     const segs = _splitMarkdownProseCode('a `b` c');

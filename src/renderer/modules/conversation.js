@@ -3336,6 +3336,21 @@ function _stripAgentCreateBlocksForStream(buf) {
   return _replaceOuterAgentBlocks(buf, _streamPlaceholderHtml('chat.create_agent_streaming_placeholder'));
 }
 
+// `<<<skill-file path=X ... >>>` blocks (skill edit chat). Different fence
+// shape from `<agent>` (see strip-agent.js header) but same user-facing
+// contract: streaming placeholder hides the raw block + reveals the file
+// being written. The path attribute (when present) flows into the
+// localised "Writing X…" label so the placeholder is informative;
+// unattributed blocks fall back to a generic "Writing file…" label.
+function _stripSkillFileBlocksForStream(buf) {
+  return _replaceOuterSkillFileBlocks(buf, (path) => {
+    const label = path
+      ? t('chat.skill_file_streaming_placeholder', { path })
+      : t('chat.skill_file_streaming_placeholder_unknown');
+    return `\n<em class="stream-placeholder">${escapeHtml(label)}</em>\n`;
+  });
+}
+
 function _stripAgentFormBlockForStream(buf) {
   // Primary: XML `<agent-input-form>...</agent-input-form>` (symmetric
   // with submission reply tag, token-stable). Legacy: fenced
@@ -3395,7 +3410,11 @@ function _streamingAppendFinalDelta(msg, piece) {
     msg._streamRafScheduled = false;
     msg._streamRafHandle = null;
     const buf = msg.dataset.streamBuf || '';
-    const display = _stripAgentCreateBlocksForStream(_stripAgentFormBlockForStream(buf));
+    const display = _stripAgentCreateBlocksForStream(
+      _stripAgentFormBlockForStream(
+        _stripSkillFileBlocksForStream(buf),
+      ),
+    );
     finalEl.innerHTML = `<div class="markdown-body">${_renderMessageMarkdown(display)}</div>`;
   };
   if (typeof requestAnimationFrame === 'function') {

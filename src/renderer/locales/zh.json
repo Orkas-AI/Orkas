@@ -160,6 +160,8 @@
   "chat.created_agent_chip": "查看详情：{name}",
   "chat.create_agent_failed": "智能体创建失败：{reason}",
   "chat.create_agent_streaming_placeholder": "正在整理智能体配置…",
+  "chat.skill_file_streaming_placeholder": "正在写入 {path}…",
+  "chat.skill_file_streaming_placeholder_unknown": "正在写入文件…",
   "skills.title": "技能库",
   "skills.add": "+ 添加",
   "skills.custom_group": "自定义",
