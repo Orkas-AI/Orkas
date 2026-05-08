@@ -1829,6 +1829,78 @@ body.model-not-configured .main-content { flex-direction: column; }
   to { transform: rotate(360deg); }
 }
 
+/* Quote-reply preview — a Feishu-style block that sits above the textarea
+   inside .chat-input-area when the user clicks 引用 on an assistant bubble.
+   The block is a normal flex-column child, so adding it just pushes the
+   textarea down; the input area visually grows to fit. */
+.chat-quote-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 10px 8px;
+  margin-top: 2px;
+  background: rgba(37, 99, 235, 0.04);
+  border-left: 3px solid rgba(37, 99, 235, 0.45);
+  border-radius: 4px;
+  font-size: 12.5px;
+  color: #475569;
+}
+.chat-quote-preview .chat-quote-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.chat-quote-preview .chat-quote-from {
+  flex: 1 1 auto;
+  font-weight: 500;
+  color: #2563eb;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-quote-preview .chat-quote-close {
+  flex: 0 0 auto;
+  cursor: pointer;
+  background: transparent;
+  border: none;
+  color: #94a3b8;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 4px;
+}
+.chat-quote-preview .chat-quote-close:hover { color: #ef4444; }
+.chat-quote-preview .chat-quote-body {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #475569;
+  line-height: 1.45;
+}
+.chat-quote-preview .chat-quote-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  margin-top: 2px;
+}
+.chat-quote-preview .chat-quote-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 11.5px;
+  color: #475569;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* "+" button — sits left of the textarea inside .chat-input-area */
 .chat-attach-btn {
   flex-shrink: 0;
@@ -2533,7 +2605,8 @@ body.model-not-configured .main-content { flex-direction: column; }
   order: -1;
 }
 .bubble-archive-btn,
-.bubble-copy-btn {
+.bubble-copy-btn,
+.bubble-quote-btn {
   border: 1px solid var(--border);
   background: #fff;
   color: var(--muted);
@@ -2546,14 +2619,16 @@ body.model-not-configured .main-content { flex-direction: column; }
   font-family: inherit;
 }
 .bubble-archive-btn:hover,
-.bubble-copy-btn:hover {
+.bubble-copy-btn:hover,
+.bubble-quote-btn:hover {
   color: var(--primary);
   border-color: rgba(37, 99, 235, 0.25);
   background: rgba(37, 99, 235, 0.04);
   box-shadow: 0 2px 6px rgba(37, 99, 235, 0.15);
 }
 .bubble-archive-btn:disabled,
-.bubble-copy-btn:disabled {
+.bubble-copy-btn:disabled,
+.bubble-quote-btn:disabled {
   cursor: default;
   opacity: 0.7;
 }
@@ -2726,6 +2801,22 @@ body.model-not-configured .main-content { flex-direction: column; }
      横向滚用户极易以为被截断；气泡宽度有限，阅读体验上换行也明显更好。 */
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* Forward-quote blockquotes in user bubbles — clamp to 2 lines to keep the
+   sent-message bubble compact. The receiving agent still gets the full text
+   (the markdown is sent intact via bus.enqueue); this only affects the
+   sender's view of their own outgoing bubble. Why user bubbles only:
+   `applyQuotePrefix` is the sole producer of these blockquotes, and it
+   only runs on the renderer's send path → the result always lands in a
+   user-role bubble. Assistant blockquotes (citations, web fetches, etc.)
+   stay unclamped so the model's quoted content remains fully readable. */
+.chat-message.user .chat-bubble blockquote {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
 }
 
 /* 其它易撑破气泡的块级内容（表格、长 URL/图片）也约束到气泡宽度以内。 */

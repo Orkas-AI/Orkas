@@ -197,6 +197,13 @@ function _saveRecipientMap() {
   try { localStorage.setItem(_RECIPIENT_LS_KEY, JSON.stringify(_recipientByCid)); } catch (_) {}
 }
 
+// Quote-reply state (per-cid, in-memory). Declared early so the
+// DOMContentLoaded init branch below — which may invoke _renderQuotePreview
+// synchronously when the document is already loaded — doesn't hit a TDZ on
+// the binding. The helper functions live further down with the rest of the
+// quote infrastructure (_setQuote / _getQuote / _clearQuote / _renderQuotePreview).
+const _quoteByCid = new Map();   // cid → { fromActor, fromName, msgId, text, produced[] } | undefined
+
 function _normRecipient(next) {
   if (!next || (next.kind !== 'commander' && next.kind !== 'agent')) return null;
   if (next.kind === 'commander') return { ..._COMMANDER };
@@ -291,16 +298,24 @@ function onEnterConversationView() {
   // loadConversationHistory is intentionally skipped). Without this hook,
   // the rail would keep displaying the previous cid's plan content.
   if (window.PlanRail) window.PlanRail.bind(currentCid || null);
+  // Quote preview is per-cid; rerender so a quote captured in another conv
+  // doesn't bleed into this one (and a quote left in this conv reappears
+  // when the user navigates back).
+  _renderQuotePreview();
 }
 
 // Called by queue-draft.js::_forgetConvLocal when a conv is deleted so we
 // don't accumulate dead entries in localStorage forever.
 function _forgetCidRecipient(cid) {
-  if (!cid || !_recipientByCid[cid]) return;
-  delete _recipientByCid[cid];
-  _saveRecipientMap();
+  if (!cid) return;
+  if (_recipientByCid[cid]) {
+    delete _recipientByCid[cid];
+    _saveRecipientMap();
+  }
   _latestInFlight.delete(cid);
   _lastInteractiveTurnAgent.delete(cid);
+  // Drop any pending quote for the deleted conv (memory only — no localStorage).
+  _quoteByCid.delete(cid);
 }
 
 // ─── Auto-recipient: follow the interactive agent on plan dispatch ───────
@@ -474,17 +489,23 @@ function applyRecipientPrefix(raw, target) {
   }
   if (!display) display = r.name || r.id;
   const tag = '@' + String(display);
-  return tag + ' ' + text;
+  // When the raw body starts with a blockquote (e.g. the quote-reply prefix
+  // injected by applyQuotePrefix), use a newline separator so the @-mention
+  // ends up on its own line — markdown only treats `>` as a blockquote when
+  // it sits at column 0, and `@AgentB > ...` on one line collapses the
+  // blockquote into plain prose. Plain-text bodies keep the original space.
+  const sep = /^>/.test(text) ? '\n' : ' ';
+  return tag + sep + text;
 }
 
 if (typeof window !== 'undefined') {
-  const initChip = () => _renderRecipientChip();
+  const initChip = () => { _renderRecipientChip(); _renderQuotePreview(); };
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', initChip, { once: true });
   } else {
     initChip();
   }
-  window.addEventListener('i18n-change', () => _renderRecipientChip());
+  window.addEventListener('i18n-change', () => { _renderRecipientChip(); _renderQuotePreview(); });
 }
 
 // ─── Group-chat translation layer ─────────────────────────────────────────
@@ -1398,6 +1419,14 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   if (message._msg_id) msgDiv.dataset.msgId = String(message._msg_id);
   if (message._from) msgDiv.dataset.fromActor = String(message._from);
   msgDiv.dataset.ts = String(_msTs(message.time));
+  // Stash chip-tracked produced paths on the DOM so the 引用 handler can
+  // attach them to the quote payload without plumbing message into every
+  // _attachBubbleArchiveBtn call site. Only chip-tracked files belong here
+  // (write_file / edit_file / markdown_to_pdf / html_to_pdf / generate_image);
+  // bash scratch is intentionally outside this set.
+  if (Array.isArray(message.produced) && message.produced.length) {
+    msgDiv.dataset.produced = JSON.stringify(message.produced);
+  }
   _insertByTimestamp(container, msgDiv);
   if (!isHtmlSnippet && typeof typesetMath === 'function') {
     const md = msgDiv.querySelector('.markdown-body');
@@ -1524,6 +1553,96 @@ function _renderPersistedProcess(msgDiv, items, { expanded = false } = {}) {
   bubble.insertBefore(details, bubble.firstChild);
 }
 
+// ─── Quote-reply (per-cid) ───────────────────────────────────────────────
+// Feishu-style: clicking 引用 on an assistant bubble captures its text +
+// chip-tracked produced files into a per-cid payload. The payload renders as
+// a preview block above the textarea (with × to drop), survives conv switch
+// (in-memory, not localStorage — drafts are ephemeral), and is prepended as
+// a markdown blockquote when the user finally hits send. Routing reuses the
+// existing 给：picker — quote does NOT change the recipient.
+//
+// Why dataset-driven: produced[] sits on the message object during render but
+// the bubble action row only sees `msgDiv` + a getContent closure. Putting
+// produced on `msgDiv.dataset.produced` (set in appendChatMessage and the
+// stream-finalize path) lets the quote handler stay zero-arg without
+// plumbing message into every _attachBubbleArchiveBtn call site.
+//
+// `_quoteByCid` itself is declared early (above `_recipientByCid`'s neighbour
+// block) so the DOMContentLoaded init can call _renderQuotePreview before
+// this section evaluates without hitting a TDZ.
+
+function _setQuote(cid, payload) {
+  if (!cid) return;
+  if (!payload) _quoteByCid.delete(cid);
+  else _quoteByCid.set(cid, payload);
+  if (cid === currentCid) _renderQuotePreview();
+}
+function _getQuote(cid) { return cid ? _quoteByCid.get(cid) || null : null; }
+function _clearQuote(cid) { _setQuote(cid, null); }
+
+// Render (or hide) the preview block for the active cid. Idempotent — safe
+// to call on conv switch / i18n change / quote set / quote clear.
+function _renderQuotePreview() {
+  const wrap = document.getElementById('chat-quote-preview');
+  if (!wrap) return;
+  const q = _getQuote(currentCid);
+  if (!q) {
+    wrap.style.display = 'none';
+    wrap.innerHTML = '';
+    return;
+  }
+  // fromName resolved at render time (not at click time) so renames after
+  // capture flow through naturally; fall back to the click-time snapshot
+  // when the actor was deleted between capture and render.
+  const liveName = q.fromActor === 'commander'
+    ? (t('chat.from_commander') || '指挥官')
+    : _groupActorLabel(q.fromActor);
+  const fromName = liveName || q.fromName || (t('chat.from_agent_unknown') || '智能体');
+  const trunc = String(q.text || '');
+  const fileChips = (q.produced || []).map((p) => {
+    const base = String(p || '').split(/[\\/]/).pop() || p;
+    return `<span class="chat-quote-file" title="${escapeHtml(p)}">📎 ${escapeHtml(base)}</span>`;
+  }).join('');
+  wrap.innerHTML = `
+    <div class="chat-quote-header">
+      <span class="chat-quote-from">${escapeHtml(t('chat.quote_from', { name: fromName }))}</span>
+      <button type="button" class="chat-quote-close" title="${escapeHtml(t('chat.quote_remove_title'))}">×</button>
+    </div>
+    <div class="chat-quote-body">${escapeHtml(trunc)}</div>
+    ${fileChips ? `<div class="chat-quote-files">${fileChips}</div>` : ''}
+  `;
+  wrap.style.display = '';
+  const closeBtn = wrap.querySelector('.chat-quote-close');
+  if (closeBtn) closeBtn.addEventListener('click', () => _clearQuote(currentCid));
+}
+
+// Prepend the active quote as a markdown blockquote so the receiving agent
+// sees it as inbound message body (no special parsing needed). File paths
+// land as absolute paths — same shape `produced[]` already stores; the agent
+// can `read_file('<abs>')` directly without any cwd assumptions.
+//
+// **No `引用自 @<sender>` attribution line in the persisted text.** Earlier
+// versions prefixed the block with `> **引用自 @<name>：**` for context, but
+// `bus.ts::resolveRecipients` scans the message body for `@<token>` mentions
+// (including aliases `@指挥官` / `@user`) and union-routes to every match —
+// so the attribution `@<sender>` was being parsed as a second recipient,
+// re-triggering the original agent / commander on every quote-forward. The
+// sender's name is still shown in the input-area preview (renderer-only,
+// never serialised), which is enough context for the user pressing send.
+function applyQuotePrefix(raw, target) {
+  if (target !== 'conversation') return raw;
+  const q = _getQuote(currentCid);
+  if (!q) return raw;
+  const bodyLines = String(q.text || '').split('\n').map((l) => `> ${l}`).join('\n');
+  let block = bodyLines;
+  if (Array.isArray(q.produced) && q.produced.length) {
+    const filesHead = t('chat.quote_files_label');
+    const fileLines = q.produced.map((p) => `> - \`${p}\``).join('\n');
+    block += `\n>\n> ${filesHead}\n${fileLines}`;
+  }
+  return raw ? `${block}\n\n${raw}` : block;
+}
+
 // Attach a small "存档" button next to the time in the chat-meta row. Kept
 // outside the bubble so it never overlaps bubble content. `getContent` is a
 // callback so it can return the latest text after streaming completes.
@@ -1544,9 +1663,31 @@ function _attachBubbleArchiveBtn(msgDiv, getContent) {
   actions.innerHTML = `
     <button class="bubble-archive-btn" title="${escapeHtml(t('chat.archive_btn_title'))}">${escapeHtml(t('chat.archive_btn'))}</button>
     <button class="bubble-copy-btn" title="${escapeHtml(t('chat.copy_btn_title'))}">${escapeHtml(t('chat.copy_btn'))}</button>
+    <button class="bubble-quote-btn" title="${escapeHtml(t('chat.quote_btn_title'))}">${escapeHtml(t('chat.quote_btn'))}</button>
   `;
   const btn = actions.querySelector('.bubble-archive-btn');
   const copyBtn = actions.querySelector('.bubble-copy-btn');
+  const quoteBtn = actions.querySelector('.bubble-quote-btn');
+  quoteBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const text = typeof getContent === 'function' ? (getContent() || '') : '';
+    if (!text.trim()) return;
+    const fromActor = msgDiv.dataset.fromActor || '';
+    const msgId = msgDiv.dataset.msgId || '';
+    let produced = [];
+    try {
+      const raw = msgDiv.dataset.produced || '';
+      if (raw) produced = JSON.parse(raw);
+      if (!Array.isArray(produced)) produced = [];
+    } catch (_) { produced = []; }
+    const fromName = fromActor === 'commander'
+      ? (t('chat.from_commander') || '指挥官')
+      : (_groupActorLabel(fromActor) || '');
+    _setQuote(currentCid, { fromActor, fromName, msgId, text, produced });
+    const input = document.getElementById('chat-input');
+    if (input) { input.focus(); }
+    if (window.Monitor) Monitor.click('bubble_quote', { cid: currentCid, has_files: produced.length > 0 });
+  });
   copyBtn.addEventListener('click', async (e) => {
     e.stopPropagation();
     const text = typeof getContent === 'function' ? (getContent() || '') : '';
@@ -1706,7 +1847,10 @@ async function handleNewChatSubmit() {
 async function handleChatSubmit() {
   const input = document.getElementById('chat-input');
   const raw = (input.value || '').trim();
-  if (!raw || !currentCid) return;
+  if (!currentCid) return;
+  // A bare quote with no extra text is a legitimate "look at this" forward;
+  // only reject when both the textarea AND the quote are empty.
+  if (!raw && !_getQuote(currentCid)) return;
   if (!ensureModelConfigured()) return;
   const cid = currentCid;
   const skill = _chatSkill['conversation'] || '';
@@ -1721,19 +1865,26 @@ async function handleChatSubmit() {
   // If this conversation is already streaming OR has queued items waiting,
   // enqueue the new message instead of sending it now. Keep the raw text +
   // skill so the prefix is applied fresh when it's actually sent.
+  // Quote is baked into the queued content here (rather than carried as a
+  // sidecar field on the queue entry) — by the time the queue dispatches,
+  // the user may have already cleared/replaced the quote in the preview;
+  // capture-at-enqueue keeps each queued message tied to the quote that was
+  // visible when the user pressed send.
   if (isConvPending(cid) || (messageQueues.get(cid) || []).length) {
     if (attachments.length) {
       await uiAlert(t('chat.attach_queue_blocked'));
       return;
     }
-    enqueueMessage(cid, raw, skill);
+    enqueueMessage(cid, applyQuotePrefix(raw, 'conversation'), skill);
+    _clearQuote(cid);
     input.value = '';
     autoGrow(input, 200);
     _clearDraft(cid);
     return;
   }
 
-  const content = applyRecipientPrefix(transformWithSkill(raw, skill), 'conversation');
+  const content = applyRecipientPrefix(applyQuotePrefix(transformWithSkill(raw, skill), 'conversation'), 'conversation');
+  _clearQuote(cid);
   input.value = '';
   autoGrow(input, 200);
   _clearDraft(cid);
@@ -2878,6 +3029,10 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
         _hydrateMessageProducedChips(ph);
       }
     }
+    // Mirror dataset.produced so the 引用 button can read it (same contract
+    // as appendChatMessage above; without this, post-stream finalize would
+    // leave the chip row in place but the quote payload would carry no files).
+    ph.dataset.produced = JSON.stringify(gm.produced);
   }
 
   // Created-agent chip (commander quick-create) — same actions row.
