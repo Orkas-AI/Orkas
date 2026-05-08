@@ -238,7 +238,7 @@ Both flows emit ONE `<agent>...</agent>` container in this turn and end (do NOT 
   3. **`触发词：` / `Triggers:`** + 5–8 keywords (separated by `、` / `,`).
 
 - **`<workflow>`** = ordered steps in physical execution order. Each step is a **verb-led title** (5–10 chars) followed by bulleted actions describing what the runtime agent does; bullets carry the action and (where relevant) its result inline. Branches use nested bullets (`if X → call A` / `else → call B`). The previous step's result / inbound message / accumulated context are the default carry-over and need not be restated. Exception handling / retry / skip belongs to the runtime agent, not the workflow.
-  - **Hard constraint — every action must explicitly name the tool / skill_id verbatim in backticks** (e.g. `read_file` / `kb_search` / `social-fetch` skill / `markdown_to_pdf` / `web_search`). Don't write abstract verbs like "read the file" or "do a search". **Why**: the workflow is injected into the runtime agent's system prompt; missing tool names force secondary inference (often picks the wrong tool); and the `<skills>` closure is derived from `skill_id`s appearing here, so a missing `skill_id` means the skill never gets loaded at runtime.
+  - **Tool / skill names: required in backticks where invoked, forbidden where not.** Every invoked tool / skill_id appears in backticks (`read_file` / `kb_search` / `social-fetch` skill / `markdown_to_pdf` / `web_search` — no abstract verbs like "read the file"). Reasoning / decision / synthesis bullets that don't invoke a tool stay in plain prose; don't fake-attach `write_file` to mean "I produced this conceptually". **Why**: workflow is injected into the runtime agent's system prompt (invoked tools need canonical names so the runtime picks right) and `<skills>` closure is derived from skill_ids appearing here.
 
 - **Tool / skill priority** when authoring workflow actions: ① built-in tools (file IO, `bash`, `kb_search`, `kb_read`, `markdown_to_pdf`, `html_to_pdf`, `generate_image`, `web_search`, `web_fetch`) — write the tool name directly. ② existing skills from the "Available skills (skills)" block — used as-is by `skill_id`. ③ only when neither covers it, mention the missing capability in user-perspective prose; do NOT invent skill_ids in `<skills>`. Built-in tool names are NOT skill_ids and must never appear in `<skills>`. An empty `<skills></skills>` is legal and common.
 
@@ -262,7 +262,7 @@ Both flows emit ONE `<agent>...</agent>` container in this turn and end (do NOT 
 <description_en>① one-line function: verb+object+delivery ; ② For: "user phrasing 1", "user phrasing 2", … ; ③ Triggers: word1, word2, …</description_en>
 <workflow>
 Stepwise markdown workflow. Do not include a top-level `# Workflow` heading — the UI already wraps it.
-Step format = `### N. <title>` followed by bulleted actions; each bullet carries the tool / skill_id call in backticks plus its inline purpose / result.
+Step format = `### N. <title>` followed by bulleted actions; bullets that invoke a tool / skill name it in backticks with inline purpose / result. Reasoning / decision / synthesis bullets go in plain prose without forcing a tool name.
 </workflow>
 <skills>
 skill_id_a
