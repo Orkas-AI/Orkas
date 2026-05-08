@@ -240,7 +240,9 @@ function bindStaticHandlers() {
   document.getElementById('skill-promote-btn')?.addEventListener('click', () => {
     if (_selectedSkill?.source === 'custom') promoteCustomSkill(_selectedSkill.id);
   });
-  document.getElementById('skills-detail-name')?.addEventListener('click', _handleSkillNameClick);
+  // Skill name editing is now wired inline by `_toggleSkillNameEditable`
+  // (input + blur listeners attached on first edit-mode entry, gated by
+  // `_skillEditMode`) — no top-level click handler.
   document.getElementById('skill-chat-clear-btn')?.addEventListener('click', clearSkillChat);
 
   // Detail-view chrome: "← Back to skill library" + collapsible-section

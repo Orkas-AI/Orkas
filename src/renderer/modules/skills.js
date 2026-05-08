@@ -526,22 +526,16 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   nameEl.textContent = skill?.name || id;
   nameEl.dataset.skillId = id;
   nameEl.dataset.source = source;
-  // Click-to-rename stays custom-only — built-in renames in dev would need
-  // a dual-tree dir rename + per-user chat dir migration; out of scope for
-  // dev edit. (LLM-driven SKILL.md edits to the `name:` field are also
-  // ignored for built-ins; see features/skills.ts auto-rename guard.)
-  if (source === 'custom') {
-    nameEl.classList.add('editable');
-    nameEl.setAttribute('title', t('skills.rename_title'));
-  } else {
-    nameEl.classList.remove('editable');
-    nameEl.removeAttribute('title');
-  }
+  // Name is editable ONLY in edit mode (req: "non-edit state must not allow rename").
+  // Editability is wired below alongside the description-section toggle —
+  // both depend on `editingThis` which is computed a few lines down.
+  nameEl.classList.remove('editable');
+  nameEl.removeAttribute('title');
 
-  // Source label: just the source kind. File path is already conveyed by
-  // the active highlight inside the source tree below.
-  const sourceLabel = source === 'custom' ? t('skills.source_custom') : t('skills.source_builtin');
-  document.getElementById('skills-detail-source').textContent = sourceLabel;
+  // Source label + colored tag — mirrors `.agents-detail-source.is-builtin/.is-custom`.
+  const sourceEl = document.getElementById('skills-detail-source');
+  sourceEl.textContent = source === 'custom' ? t('skills.source_custom') : t('skills.source_builtin');
+  sourceEl.className = 'skills-doc-source ' + (source === 'builtin' ? 'is-builtin' : 'is-custom');
 
   // Doc sections (description / external dependencies / dependent
   // skills / other attributes) — seed with the cached description so
@@ -555,8 +549,9 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   //        (custom + dev) / delete.
   // In edit mode only the "done" button (the relabeled "edit") is
   // shown; everything else hides.
-  const actions = document.getElementById('skills-detail-actions');
   const canEditThisSkill = source === 'custom' || (source === 'builtin' && isDevMode());
+  const editingThis = _skillEditMode && _skillEditSkillId === id && canEditThisSkill;
+  const actions = document.getElementById('skills-detail-actions');
   if (actions) {
     actions.classList.remove('is-hidden');
     const useBtn = document.getElementById('skill-use-btn');
@@ -564,13 +559,23 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
     const enableBtn = document.getElementById('skill-enabled-btn');
     const promoteBtn = document.getElementById('skill-promote-btn');
     const delBtn = document.getElementById('skill-delete-btn');
-    const editingThis = _skillEditMode && _skillEditSkillId === id && canEditThisSkill;
     if (useBtn) useBtn.style.display = editingThis ? 'none' : '';
     if (editBtn) editBtn.style.display = canEditThisSkill ? '' : 'none';
     if (enableBtn) enableBtn.style.display = editingThis ? 'none' : '';
     if (promoteBtn) promoteBtn.style.display = (source === 'custom' && isDevMode() && !editingThis) ? '' : 'none';
     if (delBtn) delBtn.style.display = (canEditThisSkill && !editingThis) ? '' : 'none';
   }
+
+  // Wire name editability (edit mode + custom only) and hide the
+  // description section while editing (req #3: edit description by editing
+  // the `description_*:` frontmatter in SKILL.md, not via a separate UI
+  // block). Built-in skills' name is **never** directly editable here even
+  // under dev mode — direct rename would skip the dual-tree dir rename +
+  // per-user chat dir migration that LLM-driven SKILL.md edits go through.
+  const nameEditable = editingThis && source === 'custom';
+  _toggleSkillNameEditable(nameEl, nameEditable);
+  const summarySection = document.getElementById('skills-section-summary');
+  if (summarySection) summarySection.style.display = editingThis ? 'none' : '';
 
   // Refresh the per-skill enable/disable button label + click handler.
   _renderSkillEnabledButton({ id, enabled: skill?.enabled !== false });
@@ -844,38 +849,120 @@ function _renderSkillFileEditor(body, content, _ext) {
   ta.addEventListener('input', scheduleSave);
 }
 
-// Click the skill name in detail header to rename (custom skills only).
-async function _handleSkillNameClick(e) {
-  const el = e.currentTarget;
-  if (!el.classList.contains('editable')) return;
+// ─── Skill name inline edit (mirrors agents.js's name editor) ───
+//
+// Replaces the older click-to-prompt rename path. The name field is now
+// only editable inside Skill detail's edit mode (req: non-edit state must
+// not allow rename). Wire-up:
+//   - Enter edit  → contenteditable + bind input/blur (one-time per element)
+//   - Type        → debounce 800ms → save SKILL.md frontmatter `name:`
+//                   via `skipRename:true` (no dir rename mid-typing)
+//   - Blur        → flush pending save
+//   - Done click  → flush + validate; if invalid alert + revert DOM;
+//                   if valid AND name actually changed, fire one final
+//                   `skipRename:false` to commit the directory rename.
 
-  const currentId = el.dataset.skillId;
-  const currentName = el.textContent.trim();
-  const input = await uiPrompt(t('skills.rename_prompt'), currentName);
-  if (input === null) return;
-  const newName = input.trim();
-  if (!newName || newName === currentName) return;
+const SKILL_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]*(?: [A-Za-z0-9_-]+)*$/;
+function _isValidSkillNameCharset(name) {
+  return typeof name === 'string' && name.length > 0 && name.length <= 64 && SKILL_NAME_RE.test(name);
+}
 
+function _toggleSkillNameEditable(nameEl, on) {
+  if (!nameEl) return;
+  nameEl.setAttribute('contenteditable', on ? 'plaintext-only' : 'false');
+  nameEl.classList.toggle('is-editing', !!on);
+  if (on) _bindSkillNameSave(nameEl);
+}
+
+function _bindSkillNameSave(nameEl) {
+  if (nameEl.dataset.bound === '1') return;
+  nameEl.dataset.bound = '1';
+  nameEl.addEventListener('input', () => _scheduleSkillFieldSave('name', nameEl.innerText));
+  nameEl.addEventListener('blur', () => _flushSkillFieldSave());
+}
+
+let _pendingSkillField = null;
+let _skillFieldSaveTimer = null;
+function _scheduleSkillFieldSave(field, value) {
+  if (!_selectedSkill || _selectedSkill.source !== 'custom') return;
+  _pendingSkillField = { field, value };
+  clearTimeout(_skillFieldSaveTimer);
+  _skillFieldSaveTimer = setTimeout(_flushSkillFieldSave, 800);
+}
+
+// `validate` is true ONLY when the user explicitly commits (clicks Done);
+// typing-debounced and blur-triggered flushes pass false — bad names
+// silently skip the save (DOM keeps the in-progress text) instead of
+// popping a uiAlert mid-keystroke. Mirrors agents.js::_flushAgentFieldSave.
+//
+// During typing we use `skipRename:true` so the directory id stays as the
+// original until Done; that keeps the URL / cache keyed by the same id and
+// avoids a flurry of dir renames per keystroke. The Done branch fires a
+// final `skipRename:false` update to commit the directory rename when the
+// new name passed validation and actually differs from the original id.
+async function _flushSkillFieldSave({ validate = false } = {}) {
+  clearTimeout(_skillFieldSaveTimer);
+  _skillFieldSaveTimer = null;
+  if (!_pendingSkillField || !_selectedSkill) return;
+  const { field, value } = _pendingSkillField;
+  if (field === 'name') {
+    const name = String(value || '').trim();
+    const invalid = !_isValidSkillNameCharset(name);
+    if (invalid) {
+      if (!validate) return;
+      _pendingSkillField = null;
+      await uiAlert(t('skills.name_invalid'));
+      const nameEl = document.getElementById('skills-detail-name');
+      if (nameEl) nameEl.innerText = _selectedSkill.id;
+      // Roll the SKILL.md frontmatter back to the original id too — the
+      // skipRename:true writes during typing left a possibly-invalid name
+      // on disk; revert so the next listSkills auto-heal doesn't misfire.
+      try {
+        await apiFetch(`/api/skills/${encodeURIComponent(_selectedSkill.id)}/update?skipRename=1`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: _selectedSkill.id }),
+        });
+      } catch (_) { /* best-effort revert */ }
+      return;
+    }
+  }
+  _pendingSkillField = null;
+  const currentId = _selectedSkill.id;
+  const newName = String(value || '').trim();
+  const skipRename = !validate || newName === currentId;
+  // ipc-shim's `wrapAsUpdates` wraps the body under `updates`, so the
+  // request body holds only field values; `skipRename` rides on the URL
+  // query string so it lands as a sibling of `updates` in the IPC payload.
+  const url = `/api/skills/${encodeURIComponent(currentId)}/update${skipRename ? '?skipRename=1' : ''}`;
   try {
-    const res = await apiFetch(`/api/skills/${encodeURIComponent(currentId)}/update`, {
+    const res = await apiFetch(url, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: newName }),
+      body: JSON.stringify({ [field]: value }),
     });
     const data = await res.json();
     if (!data.ok) {
-      await uiAlert(t('skills.rename_failed', { reason: data.error || '' }));
-      return;
+      throw new Error(data.error || 'save failed');
     }
-    const resultId = data.skill?.id || newName;
-    _skillsCache = null;
-    _skillTreeCache.clear();
-    _expandedDirs.delete(`custom:${currentId}`);
-    await loadSkills();
-    _selectedSkill = { source: 'custom', id: resultId, filepath: 'SKILL.md' };
-    await selectSkillFile('custom', resultId, 'SKILL.md', null);
+    if (validate && field === 'name' && !skipRename) {
+      // Directory was renamed — refresh caches + update _selectedSkill.id
+      // so subsequent calls (selectSkillFile / chat dir lookup) hit the
+      // new id, not the stale one.
+      const resultId = data.skill?.id || newName;
+      _skillsCache = null;
+      _skillTreeCache.clear();
+      _expandedDirs.delete(`custom:${currentId}`);
+      await loadSkills();
+      _selectedSkill = { ..._selectedSkill, id: resultId };
+      _skillEditSkillId = resultId;
+    }
   } catch (e) {
-    await uiAlert(t('skills.network_error', { reason: e.message || e }));
+    if (validate && field === 'name') {
+      await uiAlert(t('skills.rename_failed', { reason: e.message || e }));
+      const nameEl = document.getElementById('skills-detail-name');
+      if (nameEl) nameEl.innerText = _selectedSkill.id;
+    }
   }
 }
 
@@ -909,6 +996,13 @@ async function toggleSkillEditMode(opts = {}) {
     // the next skill's edit panel when the user clicks "edit"
     // elsewhere.
     try { _skillChatCtrl?.abort(); } catch (_) { /* ignore */ }
+    // Done click is the explicit commit point: flush any pending name
+    // edit + validate. Invalid name → alert + revert DOM (and roll the
+    // SKILL.md frontmatter back to the original id, see the validate
+    // branch in `_flushSkillFieldSave`). Valid + actually-changed name
+    // → fires a `skipRename:false` update which commits the directory
+    // rename + refreshes caches before we re-render readonly view.
+    await _flushSkillFieldSave({ validate: true });
     _skillEditMode = false;
     _skillEditSkillId = null;
     document.getElementById('skills-chat-col').style.display = 'none';

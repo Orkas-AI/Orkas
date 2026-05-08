@@ -727,6 +727,8 @@ body.model-not-configured .main-content { flex-direction: column; }
   color: var(--primary);
 }
 
+/* Source tag in the skill detail header — matches `.agents-detail-source`
+   palette so the two detail pages read as one chrome family. */
 .skills-doc-source {
   font-size: 11px;
   font-weight: 600;
@@ -735,6 +737,19 @@ body.model-not-configured .main-content { flex-direction: column; }
   border-radius: 10px;
   background: rgba(148, 163, 184, 0.15);
   color: #475569;
+}
+.skills-doc-source.is-builtin { background: rgba(148, 163, 184, 0.15); color: #475569; }
+.skills-doc-source.is-custom  { background: rgba(37, 99, 235, 0.12); color: var(--primary); }
+/* Editing-state chrome on the title — mirrors `.agents-detail-name.is-editing`
+   so both detail pages read as one chrome family. */
+.skills-doc-title.is-editing {
+  outline: none;
+  background: #fff;
+  box-shadow: 0 0 0 1px var(--border-strong) inset;
+  cursor: text;
+}
+.skills-doc-title.is-editing:focus {
+  box-shadow: 0 0 0 2px var(--primary) inset;
 }
 
 .skills-doc-actions {

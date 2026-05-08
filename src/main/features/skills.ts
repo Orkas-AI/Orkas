@@ -543,6 +543,7 @@ export async function createCustomSkill(name: string, description: string): Prom
 export async function updateCustomSkill(
   skillId: string,
   updates: { name?: string; description?: string; description_zh?: string; description_en?: string },
+  options: { skipRename?: boolean } = {},
 ): Promise<CustomSkill | null> {
   let d = customSkillDir(skillId);
   if (!fs.existsSync(d) || !fs.statSync(d).isDirectory()) return null;
@@ -570,7 +571,14 @@ export async function updateCustomSkill(
   }
 
   let currentId = skillId;
-  if (newName !== skillId) {
+  // `skipRename` is the in-progress-edit hook used by the skill detail name
+  // editor: while the user is typing, write the new `name:` into SKILL.md
+  // frontmatter but DO NOT rename the directory yet. The Done click fires a
+  // second update with `skipRename: false` to commit the rename. Same write
+  // path takes care of both passes — no separate IPC. Auto-heal on next
+  // listSkills (`_renameSkillByFrontmatterIfNeeded`) is the safety net for
+  // the edge case where the user crashes mid-edit before clicking Done.
+  if (newName !== skillId && !options.skipRename) {
     const err = validateSkillName(newName);
     if (err) throw new Error(err);
     const target = customSkillDir(newName);

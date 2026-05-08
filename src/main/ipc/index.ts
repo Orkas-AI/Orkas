@@ -303,9 +303,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { skill: r.skill, seedMessage: r.seedMessage };
   },
 
-  'skills.update': async ({ id, updates }) => {
+  'skills.update': async ({ id, updates, skipRename }) => {
     if (!skills.isValidSkillId(id)) throw new Error('invalid skill id');
-    const data = await skills.updateCustomSkill(id, updates || {});
+    const data = await skills.updateCustomSkill(id, updates || {}, { skipRename: !!skipRename });
     if (!data) throw new Error('skill not found');
     return { skill: data };
   },
