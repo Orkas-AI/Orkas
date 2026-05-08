@@ -303,8 +303,8 @@ export const OAUTH_PROVIDERS: readonly ProviderMeta[] = [
   { id: 'google-antigravity', label: 'Google Antigravity' },
   { id: 'github-copilot',     label: 'GitHub Copilot' },
   // Custom providers registered at runtime (features/oauth-minimax.ts).
-  { id: 'minimax-portal',     label: 'MiniMax 订阅 (Global)' },
-  { id: 'minimax-portal-cn',  label: 'MiniMax 订阅 (CN)' },
+  { id: 'minimax-portal',     label: 'MiniMax Subscription (Global)' },
+  { id: 'minimax-portal-cn',  label: 'MiniMax Subscription (CN)' },
 ];
 
 /**

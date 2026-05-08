@@ -114,7 +114,7 @@ interface QueueItem {
    * them as an observer (e.g. commander wakes on every agent → user reply
    * so it can advance the plan). If the LLM produces an empty final, the
    * post-turn enqueue is suppressed — otherwise every silent observation
-   * would emit a "（无回复）" placeholder bubble and pollute the chat. */
+   * would emit a "(no reply)" placeholder bubble and pollute the chat. */
   tap?: boolean;
   /** Plan-executor stamp: the plan step (1-based index) whose dispatch
    * created this turn. When the turn ends, `plan_executor.reconcile` uses
@@ -1034,22 +1034,22 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
         if (editId) {
           const target = await agentsFeat.getAgent(editId);
           if (!target) {
-            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ 智能体编辑失败：找不到智能体 (id=${editId})。</span>`;
+            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent edit failed: agent not found (id=${editId}).</span>`;
           } else if (target.source !== 'custom') {
             // Built-in agent — read-only here; the dev-mode inline edit chat
             // remains the only path that can mutate builtins (per §6).
-            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ 内置智能体不能在主对话里改;请在右侧详情面板里 fork 一份再改。</span>`;
+            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Built-in agents can't be edited from the main chat; fork one in the right-hand detail panel and edit there.</span>`;
           } else if (agentsFeat.isCliAgent(target)) {
             // CLI-backed agent — runtime / model / args are owned by the
             // create-modal + edit-form, not the LLM. Same constraint as
             // chat_agent_setup_cli.md applies to the commander flow.
-            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ 外接智能体只能在右侧详情面板里改。</span>`;
+            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ External agents can only be edited from the right-hand detail panel.</span>`;
           } else {
             const updated = await agentsFeat.updateCustomAgent(editId, r.fields);
             if (updated) {
               createdAgent = { agent_id: updated.agent_id, name: updated.name, kind: 'updated' };
             } else {
-              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ 智能体更新失败。</span>`;
+              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent update failed.</span>`;
             }
           }
         } else {
@@ -1059,13 +1059,13 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
           } else {
             // Append failure marker to text — onTurnFinished will surface
             // it as a normal `persist` outcome.
-            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ 智能体创建失败：缺少必要字段（name / workflow）。</span>`;
+            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent creation failed: missing required field(s) (name / workflow).</span>`;
           }
         }
       } catch (err) {
-        const verb = editId ? '编辑' : '创建';
-        log.error(`${editId ? 'edit' : 'create'}-agent failed cid=${cid}: ${(err as Error).message}`);
-        workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ 智能体${verb}失败：${(err as Error).message}</span>`;
+        const verb = editId ? 'edit' : 'create';
+        log.error(`${verb}-agent failed cid=${cid}: ${(err as Error).message}`);
+        workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent ${verb} failed: ${(err as Error).message}</span>`;
       }
     }
   }
@@ -1106,7 +1106,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     // a stalled chat.
     outcome = {
       kind: 'persist',
-      text: workingText || '（无回复）',
+      text: workingText || '(no reply)',
       ...(form ? { form } : {}),
       ...(produced.length ? { produced } : {}),
       ...(createdAgent ? { createdAgent } : {}),

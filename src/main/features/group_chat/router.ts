@@ -350,9 +350,9 @@ export function decodeSubmission(text: string): DecodedSubmission | null {
  *  travels above the XML tag. Same logic as the legacy chat had — kept here
  *  so the renderer can call it without depending on agent_input_form.ts. */
 export function formatValueForSummary(field: AgentInput, raw: unknown): string {
-  const fallback = '（未填）';
+  const fallback = '(unfilled)';
   if (raw === undefined || raw === null) return fallback;
-  if (field.type === 'boolean') return raw === true ? '是' : '否';
+  if (field.type === 'boolean') return raw === true ? 'yes' : 'no';
   if (field.type === 'select') {
     const opt = (field.options || []).find((o) => o.value === raw);
     return opt ? opt.label : String(raw);

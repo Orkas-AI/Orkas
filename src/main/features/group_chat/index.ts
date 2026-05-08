@@ -19,6 +19,7 @@ import {
   USER_ID, readMembers, readState, seedReservedActors, purgeGroupDir,
   setCodingProjectDir,
 } from './state';
+import { isPlaceholderTitle } from './conv_workspace';
 import { readPlan, type PlanFile } from './plan';
 import * as planExecutor from './plan_executor';
 import {
@@ -66,13 +67,13 @@ export async function send(
   if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
   if (!text || !text.trim()) return { ok: false, error: 'empty message' };
   await seedReservedActors(userId, cid);
-  // Auto-title: the first real user message in a fresh "新对话" / unnamed
+  // Auto-title: the first real user message in a fresh / unnamed
   // conversation overwrites the placeholder title so the sidebar item
   // becomes scannable. Lazy-imported to avoid a chats↔group_chat circular.
   try {
     const chats = await import('../chats');
     const conv = await chats.getConversation(userId, cid);
-    if (conv && (!conv.title || conv.title === '新对话')) {
+    if (conv && isPlaceholderTitle(conv.title)) {
       await chats.updateConversation(userId, cid, { title: chats.autoTitle(text) });
     }
   } catch (err) {

@@ -234,7 +234,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       // for the short-circuit; tag the stream as aborted for the client.
       yield { type: 'error', text: 'aborted', aborted: true };
     } else if (idleHit) {
-      errText = errText || `模型超过 ${idleTimeout}s 无响应（已中止）`;
+      errText = errText || `Model exceeded ${idleTimeout}s with no response (aborted)`;
       yield { type: 'error', text: errText };
     }
   } catch (err) {

@@ -33,6 +33,7 @@ import {
 } from '../../paths';
 import { getActiveUserId } from '../users';
 import { createLogger } from '../../logger';
+import { t } from '../../i18n';
 
 const log = createLogger('search');
 
@@ -219,7 +220,7 @@ export async function searchChats(userId: string, query: string): Promise<Search
       kind: 'chat',
       cid: doc.cid,
       msg_index: doc.msg_index,
-      conv_title: titles[String(doc.cid)] || '新对话',
+      conv_title: titles[String(doc.cid)] || t('chat.default_title'),
       role: doc.role,
       time: doc.time,
       snippet: _makeSnippet(msg && typeof msg.content === 'string' ? msg.content : '', q),

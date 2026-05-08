@@ -27,6 +27,7 @@ import {
   readJson, writeJson, invalidateLineCount, readJsonl,
 } from '../storage';
 import { createLogger } from '../logger';
+import { t } from '../i18n';
 
 const log = createLogger('chats');
 import * as search from './search';
@@ -160,7 +161,7 @@ export async function createConversation(userId: string, {
   const cid = genConversationId();
   const conv: Conversation = {
     conversation_id: cid,
-    title: title || '新对话',
+    title: title || t('chat.default_title'),
     kind,
     agent_id: agentId || '',
     skill_id: skillId || '',
@@ -281,9 +282,9 @@ export async function deleteConversationsByAgent(agentId: string): Promise<numbe
 }
 
 export function autoTitle(content: string): string {
-  let t = (content || '').trim().replace(/\n/g, ' ');
-  if (t.length > 40) t = t.slice(0, 40) + '…';
-  return t || '新对话';
+  let text = (content || '').trim().replace(/\n/g, ' ');
+  if (text.length > 40) text = text.slice(0, 40) + '…';
+  return text || t('chat.default_title');
 }
 
 // ── Boot-time stale state sweep ──────────────────────────────────────────

@@ -141,7 +141,7 @@ describe('search › searchChats', () => {
     const ix = await import('../../../../src/main/features/search/indexer');
     await ix.reconcileChatsIndex('u1');
     const results = await s.searchChats('u1', 'thingamajig');
-    expect(results[0].conv_title).toBe('新对话');
+    expect(results[0].conv_title).toBe('New conversation');
   });
 });
 

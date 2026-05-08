@@ -692,14 +692,14 @@ function _isBlacklistedImportSource(realDir: string): { blocked: true; reason: s
   // the source/data.
   for (const root of [path.resolve(BUILTIN_SKILLS_SOURCE, '..', '..'), WS_ROOT]) {
     if (root && (dir === root || dir.startsWith(root + path.sep))) {
-      return { blocked: true, reason: 'Orkas 自身目录' };
+      return { blocked: true, reason: t('skills.import_block.self_dir') };
     }
   }
 
   // Home-dir root exactly — would trigger the 50 MiB cap only after
   // hoovering plenty of sensitive files.
   const home = os.homedir();
-  if (home && dir === home) return { blocked: true, reason: '用户家目录根' };
+  if (home && dir === home) return { blocked: true, reason: t('skills.import_block.home_root') };
 
   // Platform blacklists (absolute or prefix match).
   const mac = ['/System', '/private', '/etc', '/var', '/usr'];
@@ -713,11 +713,11 @@ function _isBlacklistedImportSource(realDir: string): { blocked: true; reason: s
 
   if (process.platform === 'darwin' || process.platform === 'linux') {
     if (hitsPrefix(mac) && !hitsException(macExcept)) {
-      return { blocked: true, reason: '系统目录' };
+      return { blocked: true, reason: t('skills.import_block.system_dir') };
     }
   }
   if (process.platform === 'win32') {
-    if (hitsPrefix(win)) return { blocked: true, reason: '系统目录' };
+    if (hitsPrefix(win)) return { blocked: true, reason: t('skills.import_block.system_dir') };
   }
 
   // User-sensitive subdirs (SSH / GPG / AWS creds).
@@ -726,7 +726,7 @@ function _isBlacklistedImportSource(realDir: string): { blocked: true; reason: s
     path.join(home, '.gnupg'),
     path.join(home, '.aws'),
   ];
-  if (hitsPrefix(sensitive)) return { blocked: true, reason: '用户凭证目录' };
+  if (hitsPrefix(sensitive)) return { blocked: true, reason: t('skills.import_block.credentials_dir') };
 
   return { blocked: false };
 }
@@ -1099,7 +1099,7 @@ export async function sendToSkillChat(userId: string, skillId: string, content: 
   });
 
   if (!result.ok) {
-    const errMsg = `模型响应失败: ${result.error || 'unknown'}`;
+    const errMsg = `Model response failed: ${result.error || 'unknown'}`;
     await _appendSkillChatMessage(userId, skillId,
       { time: nowIso(), role: 'assistant', content: errMsg });
     return { ok: false, message: errMsg, error: result.error || '' };
@@ -1226,7 +1226,7 @@ export async function* streamSendToSkillChat(
         finalText = cleanText;
         event = { type: 'final', text: cleanText, written };
       } else if (etype === 'error') {
-        errMsg = `模型响应失败: ${event.text || 'unknown'}`;
+        errMsg = `Model response failed: ${event.text || 'unknown'}`;
       }
 
       for (const text of synthesizedProgress) {
@@ -1252,7 +1252,7 @@ export async function* streamSendToSkillChat(
   } catch (err) {
     log.error('stream failed:', err);
     const msg = (err as Error).message || String(err);
-    errMsg = `模型响应失败: ${msg}`;
+    errMsg = `Model response failed: ${msg}`;
     yield { type: 'error', text: msg };
   } finally {
     // Must live in finally: on user abort the IPC layer breaks out of the
@@ -1272,8 +1272,8 @@ export async function* streamSendToSkillChat(
           { time: nowIso(), role: 'assistant', content, ...(saved ? { process: saved } : {}) });
       } else if (streamingText.trim() || processItems.length) {
         const content = streamingText.trim()
-          ? `${streamingText}\n\n（回复已中断）`
-          : '（回复已中断）';
+          ? `${streamingText}\n\n(reply interrupted)`
+          : '(reply interrupted)';
         await _appendSkillChatMessage(userId, skillId,
           { time: nowIso(), role: 'assistant', content, ...(saved ? { process: saved } : {}) });
       }

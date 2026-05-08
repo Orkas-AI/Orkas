@@ -1,20 +1,29 @@
 /**
  * Avatar catalog — single source of truth for icon / color tokens.
  *
- * 数据本身在 `src/main/data/avatars.json`：
+ * Data lives at `src/main/data/avatars.json`:
  *   - icons[]:  { id, label, svg }
  *   - colors[]: { id, label, bg, fg }
- *   - commander_default: { icon, color }   （指挥官固定图标 + 默认颜色）
+ *   - commander_default: { icon, color }   (commander's fixed icon + default color)
  *
- * 后端只用 id 做白名单校验（agents.ts / config.ts 写入前过这里），
- * 不感知 SVG / hex —— 那两份是渲染数据，靠 `avatars.getCatalog` IPC 一次性
- * 喂给 renderer 缓存。新增/改名/换 SVG 全在 JSON 一处改。
+ * `label` values in the JSON are English defaults; the renderer resolves a
+ * localized name via `t('avatar.icon.<id>')` / `t('avatar.color.<id>')` and
+ * falls back to the JSON `label` when no locale key exists.
  *
- * **Why** 一份数据：之前后端为做随机回填复制了一份 token 池，立刻就和
- * 前端的 `avatar.js` 出现了双写风险（改一处忘另一处）。统一到 JSON 后：
- *   - 后端只校验 id；不需要颜色 hex / svg；
- *   - 前端拿 catalog 时也拿到全套（含 SVG / hex），不再硬编码；
- *   - 所有"是否合法 token"的真相都源自这一份文件。
+ * The backend only validates by `id` (agents.ts / config.ts pass writes
+ * through here) — it doesn't care about SVG / hex; those exist as render
+ * data and are pushed to the renderer once via the `avatars.getCatalog` IPC,
+ * which caches them. Add / rename / re-style happens in the JSON, in one
+ * place.
+ *
+ * **Why** one source of truth: an earlier version kept a duplicate token
+ * pool on the backend for random backfill, which immediately invited the
+ * "edit one, forget the other" failure mode with the renderer's `avatar.js`.
+ * After unification to the JSON:
+ *   - the backend only validates `id`; no color hex / svg awareness;
+ *   - the renderer receives the full catalog (incl. SVG / hex) once, no
+ *     hard-coding;
+ *   - the canonical "is this token valid" truth lives in this one file.
  */
 
 import * as fs from 'node:fs';

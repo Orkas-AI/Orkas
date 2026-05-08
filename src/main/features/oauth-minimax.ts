@@ -200,7 +200,7 @@ async function pollToken(opts: {
     return { status: 'error', base_resp: { status_msg: msg } };
   }
   if (!parsed) {
-    return { status: 'error', base_resp: { status_msg: 'MiniMax OAuth 响应无法解析' } };
+    return { status: 'error', base_resp: { status_msg: t('oauth.minimax.unparseable_response') } };
   }
   return parsed;
 }

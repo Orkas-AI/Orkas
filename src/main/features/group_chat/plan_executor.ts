@@ -281,7 +281,7 @@ function outcomeForSynthTurn(evt: TurnFinishedEvent): TurnOutcome {
   }
   // Empty final on a synth turn = user gets a placeholder so they at least
   // see "the plan finished but I had nothing more to add".
-  return { kind: 'persist', text: '（无回复）' };
+  return { kind: 'persist', text: '(no reply)' };
 }
 
 /** User-direct (or non-plan) turn outcome decision.
@@ -300,7 +300,7 @@ function outcomeForSynthTurn(evt: TurnFinishedEvent): TurnOutcome {
  * user sees nothing after their message lands. Real config / auth errors
  * still surface as an errorBubble.
  *
- * agent empty-final → always persist '（无回复）'.
+ * agent empty-final → always persist '(no reply)'.
  */
 async function outcomeForUserDirectTurn(uid: string, cid: string, evt: TurnFinishedEvent): Promise<TurnOutcome> {
   // Form-pause unblock: if this agent has a blocked step, treat THIS turn
@@ -329,7 +329,7 @@ async function outcomeForUserDirectTurn(uid: string, cid: string, evt: TurnFinis
   // case: agent emits ONLY an `agent-input-form` fenced block — bus's
   // form extraction strips the block, leaving finalText empty. Without
   // checking these signals first we'd fall through to the "agent empty"
-  // branch below and replace the actor's form with "（无回复）", losing
+  // branch below and replace the actor's form with "(no reply)", losing
   // the form widget entirely (the user-reported bug).
   const hasSideEffect = !!evt.form || !!evt.createdAgent || (evt.produced && evt.produced.length > 0);
   if ((evt.finalText && evt.finalText.trim()) || hasSideEffect) {
@@ -361,7 +361,7 @@ async function outcomeForUserDirectTurn(uid: string, cid: string, evt: TurnFinis
   }
   // agent empty + no side effects.
   if (evt.errText) return { kind: 'persist', text: errorBubble(evt.errText) };
-  return { kind: 'persist', text: '（无回复）' };
+  return { kind: 'persist', text: '(no reply)' };
 }
 
 /** Plan-step turn — apply state transition + return outcome for bus. */
@@ -434,7 +434,7 @@ async function applyPlanStepTurn(
     if (evt.actor.kind === 'commander') return { kind: 'silent' };
     // agent empty: persist placeholder, mark done so plan can advance.
     await transitionStepDone(uid, cid, step, '', evt.produced, '');
-    return { kind: 'persist', text: '（无回复）' };
+    return { kind: 'persist', text: '(no reply)' };
   }
 
   // Normal success.

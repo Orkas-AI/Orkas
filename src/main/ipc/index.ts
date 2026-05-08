@@ -159,7 +159,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const parent = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
     const opts: Electron.OpenDialogOptions = {
       properties: ['openDirectory'],
-      title: typeof title === 'string' && title ? title : '选择目录',
+      title: typeof title === 'string' && title ? title : t('dialog.choose_directory'),
     };
     const res = parent
       ? await dialog.showOpenDialog(parent, opts)
@@ -282,7 +282,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const parent = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
     const opts: Electron.OpenDialogOptions = {
       properties: ['openDirectory'],
-      title: '选择要导入的技能源目录',
+      title: t('dialog.choose_skill_source_directory'),
     };
     const res = parent
       ? await dialog.showOpenDialog(parent, opts)

@@ -538,10 +538,10 @@ describe('agents › createCustomAgent', () => {
     expect(fs.existsSync(file)).toBe(true);
   });
 
-  it('defaults empty name to 未命名智能体', async () => {
+  it('defaults empty name to the localized "Untitled agent" fallback', async () => {
     const a = await loadAgents();
     const agent = await a.createCustomAgent();
-    expect(agent?.name).toBe('未命名智能体');
+    expect(agent?.name).toBe('Untitled agent');
   });
 
   it('rejects reserved names (collide with commander role / sidebar tab)', async () => {
@@ -620,11 +620,11 @@ describe('agents › updateCustomAgent', () => {
     expect(updated?.workflow).toBe('wf');  // preserved
   });
 
-  it('backfills empty name to 未命名智能体', async () => {
+  it('backfills empty name to the localized "Untitled agent" fallback', async () => {
     writeCustomAgent('abc', { name: 'Old' });
     const a = await loadAgents();
     const updated = await a.updateCustomAgent('abc', { name: '' });
-    expect(updated?.name).toBe('未命名智能体');
+    expect(updated?.name).toBe('Untitled agent');
   });
 
   it('rejects renaming to a reserved name', async () => {

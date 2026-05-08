@@ -245,8 +245,8 @@ export const SEARCH_PROVIDER_LABEL: Record<string, string> = {
   tavily:            'Tavily',
   serper:            'Serper',
   'brave-search':    'Brave',
-  'baidu-ai-search': '百度',
-  metaso:            '秘塔',
+  'baidu-ai-search': 'Baidu',
+  metaso:            'Metaso',
 };
 
 /** Documentation URL shown next to the API-key input in the settings UI. */

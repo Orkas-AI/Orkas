@@ -275,7 +275,7 @@ function _agentNameKey(name: string): string {
 }
 function assertAgentNameAllowed(name: string): void {
   const key = _agentNameKey(name);
-  if (!key) return; // empty handled elsewhere (defaults to "未命名智能体")
+  if (!key) return; // empty handled elsewhere (defaults to t('agent.default_name'))
   if (RESERVED_AGENT_NAMES.has(key)) {
     const err: any = new Error(`agent name "${name}" is reserved`);
     err.code = 'E_AGENT_NAME_RESERVED';
@@ -710,7 +710,7 @@ export async function createCustomAgent(
   const desc = resolveBilingualDescription(description, description_zh, description_en);
   const data: AgentRaw = {
     agent_id: agentId,
-    name: String(name || '').trim() || '未命名智能体',
+    name: String(name || '').trim() || t('agent.default_name'),
     description_zh: desc.description_zh,
     description_en: desc.description_en,
     workflow: String(workflow || ''),
@@ -953,7 +953,7 @@ export async function updateCustomAgent(
     else if (without.length) data.inputs = without;
     else delete data.inputs;
   }
-  if (!data.name) data.name = '未命名智能体';
+  if (!data.name) data.name = t('agent.default_name');
   data.updated_at = nowIso();
   await writeJson(f, data);
   _invalidateAgentListCache();
@@ -1307,7 +1307,7 @@ export async function sendToAgentEditChat(userId: string, agentId: string, conte
   });
 
   if (!result.ok) {
-    const errMsg = `模型响应失败: ${result.error || 'unknown'}`;
+    const errMsg = `Model response failed: ${result.error || 'unknown'}`;
     await _appendAgentChatMessage(userId, agentId,
       { time: nowIso(), role: 'assistant', content: errMsg });
     return { ok: false, message: errMsg, error: result.error || '' };
@@ -1416,7 +1416,7 @@ export async function* streamSendToAgentEditChat(
         finalText = cleanText;
         event = { type: 'final', text: cleanText, updated };
       } else if (etype === 'error') {
-        errMsg = `模型响应失败: ${event.text || 'unknown'}`;
+        errMsg = `Model response failed: ${event.text || 'unknown'}`;
       }
 
       for (const text of synthesizedProgress) {
@@ -1442,7 +1442,7 @@ export async function* streamSendToAgentEditChat(
   } catch (err) {
     log.error('stream failed:', err);
     const msg = (err as Error).message || String(err);
-    errMsg = `模型响应失败: ${msg}`;
+    errMsg = `Model response failed: ${msg}`;
     yield { type: 'error', text: msg };
   } finally {
     // Must live in finally: on user abort the IPC layer breaks out of the
@@ -1462,8 +1462,8 @@ export async function* streamSendToAgentEditChat(
           { time: nowIso(), role: 'assistant', content, ...(saved ? { process: saved } : {}) });
       } else if (streamingText.trim() || processItems.length) {
         const content = streamingText.trim()
-          ? `${streamingText}\n\n（回复已中断）`
-          : '（回复已中断）';
+          ? `${streamingText}\n\n(reply interrupted)`
+          : '(reply interrupted)';
         await _appendAgentChatMessage(userId, agentId,
           { time: nowIso(), role: 'assistant', content, ...(saved ? { process: saved } : {}) });
       }

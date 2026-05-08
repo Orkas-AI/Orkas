@@ -75,14 +75,24 @@ function _renderAvatarPicker() {
   const icons = AVATAR_ICONS.filter((i) => allowCommander || i.id !== COMMANDER_DEFAULT.icon);
   const colors = AVATAR_COLORS.filter((c) => allowCommander || c.id !== COMMANDER_DEFAULT.color);
 
+  // i18n.t returns the raw key if no entry exists in either locale, so fall
+  // back to the JSON-side English `label` for forward compatibility when a
+  // new icon/color is added to avatars.json without a matching locale key.
+  const _avatarLabel = (key, fallback) => {
+    const r = t(key);
+    return r === key ? fallback : r;
+  };
+
   iconGrid.innerHTML = icons.map((i) => {
     const active = i.id === cur.icon ? ' is-active' : '';
-    return `<button type="button" class="avatar-picker-cell avatar-picker-icon-cell${active}" data-icon="${i.id}" title="${i.label}" aria-label="${i.label}">${i.svg}</button>`;
+    const label = _avatarLabel('avatar.icon.' + i.id, i.label);
+    return `<button type="button" class="avatar-picker-cell avatar-picker-icon-cell${active}" data-icon="${i.id}" title="${label}" aria-label="${label}">${i.svg}</button>`;
   }).join('');
 
   colorGrid.innerHTML = colors.map((c) => {
     const active = c.id === cur.color ? ' is-active' : '';
-    return `<button type="button" class="avatar-picker-cell avatar-picker-color-cell${active}" data-color="${c.id}" style="background:${c.bg};color:${c.fg}" title="${c.label}" aria-label="${c.label}"></button>`;
+    const label = _avatarLabel('avatar.color.' + c.id, c.label);
+    return `<button type="button" class="avatar-picker-cell avatar-picker-color-cell${active}" data-color="${c.id}" style="background:${c.bg};color:${c.fg}" title="${label}" aria-label="${label}"></button>`;
   }).join('');
 
   iconGrid.querySelectorAll('[data-icon]').forEach((btn) => {

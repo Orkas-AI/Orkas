@@ -891,7 +891,7 @@ export async function startOAuth(
   const provider = oauth.getOAuthProvider(id as any);
   if (!provider) {
     const hint = _minimaxRegisterError && id.startsWith('minimax-portal')
-      ? `（MiniMax OAuth 注册时报错：${_minimaxRegisterError}）`
+      ? t('oauth.minimax.register_error_hint', { message: _minimaxRegisterError })
       : '';
     throw new Error(`provider "${id}" does not support OAuth${hint}`);
   }
