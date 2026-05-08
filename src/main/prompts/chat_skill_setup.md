@@ -120,7 +120,7 @@ The body (after the frontmatter) follows this structure:
    - **Executable** (has `scripts/*`): a bash command template (the unified invocation form in §6), parameter explanations, required prerequisites.
    - **Guide** (only SKILL.md, no scripts): list 3–7 **actionable steps**, each describing "what to do" (e.g. "fetch the page body", "find related news from the last 7 days", "write the result to a file in the workspace") — **do not write specific tool names** — the main conversation LLM picks paths using whatever tools it has loaded.
 3. **Return format**: the success / failure JSON shape (executable); or the output shape the main conversation LLM should give back to the user (guide).
-4. **External dependencies**: runtime (e.g. Python 3 / Node), CLIs, network services, API keys, login state, etc. One per line, describing "id — behavior when missing; how to obtain". **Do not use frontmatter fields**; this is a body section.
+4. **External dependencies**: runtime (e.g. Python 3 / Node), CLIs, network services, API keys, login state, etc. One per line: dependency name + what fails when it's missing + how to obtain. **Do not use frontmatter fields**; this is a body section.
 5. **Limits / known issues**: timeouts, platform differences, login-state dependencies, etc.
 6. **Full examples**: one or two of the most typical "input → invocation → output" snippets.
 
