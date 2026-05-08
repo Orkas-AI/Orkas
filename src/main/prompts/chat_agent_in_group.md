@@ -94,7 +94,7 @@ Send form → bus marks the step `blocked` (plan paused) → user fills it in th
 
 - **Do not** re-send a form before the previous one has been answered.
 
-### Mandatory confirmation triggered by `inputs_schema`
+### Handling `inputs_schema` (extract first, form only when info is missing)
 
 The "Runtime injection" section at the end lists your `inputs_schema`. If it is **non-empty**, the first time the user / commander dispatches you:
 
@@ -103,8 +103,8 @@ The "Runtime injection" section at the end lists your `inputs_schema`. If it is 
    - **Commander dispatch**: the commander writes parameters in natural prose; pick them up by phrase matching against `label`.
 2. **Self-check** each candidate: strong evidence (the inbound literally states the term or an obvious synonym) vs. guessing.
 3. **Decision branches**:
-   - **Every required field filled with strong evidence** → don't send a form, just start the work; the extracted values are enough to keep in your head.
-   - **Otherwise** → send **one** form. **Every value you extracted — even one token, even one field — MUST be copied into that field's `default` before the form goes out.** A field's `default` stays empty / unchanged ONLY when the inbound carries zero signal for it. The lead-in line before the form must call out what you inferred: "I inferred these — please confirm: X=...; Y=...".
+   - **Every required field has a usable value — strong-evidence extraction from the inbound OR a non-empty `default` declared in the schema** → **execute directly, no form**. A schema `default` is the agent author's declared safe fallback for "user didn't specify"; don't re-route through a confirmation form just to re-show defaults. Lead with one short line listing what you used (e.g. "Inferred: keyword=…; defaults: source=…; output_dir=…") and **start the work in the same turn** — no "please confirm" / "shall I start" pause.
+   - **Otherwise — a required field has neither extraction NOR a non-empty `default`** → send **one** form for just that gap. **Every value you did extract — even one token — MUST be copied into that field's `default`.** A `default` stays empty ONLY when both the inbound carries zero signal AND the schema didn't declare one. The lead-in names what's missing AND what's inferred: "Need: <missing field>. Inferred: X=…; Y=…".
 4. After the user replies with `<agent-input-submission>`, do the work — **do not** send a second form.
 
 ---
@@ -135,7 +135,7 @@ The "Runtime injection" section at the end lists your `inputs_schema`. If it is 
 $workflow
 ```
 
-### inputs_schema (fields the user confirms each time they run you; the trigger logic is in the "Interacting with the user" section above)
+### inputs_schema (fields you may need from the user; trigger logic above in "Interacting with the user")
 $inputs_schema
 
 ### Working directory
