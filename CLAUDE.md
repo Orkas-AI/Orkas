@@ -295,7 +295,21 @@ The commit message is **about the change**, not about how it got here. Sync prov
 - **Don't write**: functions that are correct by typing alone, thin wrappers, UI/DOM, getter/setter, library-guaranteed behavior.
 - **Forbidden**: same-branch repeat assertions with different data, asserting internals, tautologies, just-change-args-not-branches, "type/signature/existence" tests, all-happy-path.
 
-**Organization**: `test/main/` mirrors `src/main/`; one file per module under test; one level of nested `describe`.
+**Organization**: `test/main/` mirrors `src/main/`; `test/renderer/` mirrors `src/renderer/modules/` for the small set of pure renderer-side functions that have fixture coverage (see below). One file per module under test; one level of nested `describe`.
+
+**Hard rule for LLM-output text munging** (regex / parser / classifier / segmenter / sanitizer that consumes streamed or final assistant text — `<agent>` strippers, `<agent-input-form>` strippers, prose/code splitters, mention parsers, code-fence handlers, etc.): these MUST have fixture tests pinning **set A (real shapes the matcher must handle)** AND **set B (look-alike shapes the matcher must NOT handle)**. Adding a guard / branch / segmentation step requires extending the fixture set with the new motivating shape — the patch isn't done until the new fixture is green AND every previous fixture still passes. Reason: this category is whack-a-mole prone — fixing one shape silently breaks another via guard granularity mismatch (we have shipped the same `<agent>` stripper regression three rounds in a row because each round only verified the new case). Typecheck and review can't catch granularity mismatches; only fixtures can.
+
+To make pure renderer-side functions testable under vitest without violating §8's "no export/import" rule, extract them into a standalone `src/renderer/modules/<name>.js` and end the file with a guarded CommonJS bridge:
+
+```js
+if (typeof module !== 'undefined' && typeof module.exports === 'object') {
+  module.exports = { _fnA, _fnB };
+}
+```
+
+The renderer evaluates `<script>`-loaded files where `module` is undefined, so the guard is a no-op there. Test side `require()`s the file. **This is the only allowed escape from §8's no-import/export rule, and only for pure functions** — anything that touches `window` / DOM / i18n / IPC stays inline.
+
+**Modifying existing code: existing behavior is the spec.** Adding a guard / branch / segmentation to existing code reorders its matrix of accepted inputs. If the previously-accepted shapes aren't actively re-checked, the change silently breaks them — this is the failure mode behind "fix here, break there" cycles. Before changing existing code: read recent `fix` commits on the file (they encode invariants nothing else documents), grep callers, run existing tests; for text-processing functions in particular, "mentally trace" is not enough — extend the fixture set first, then change the code.
 
 ### Don't do
 

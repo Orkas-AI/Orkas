@@ -1344,13 +1344,14 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   // User messages carrying an `<agent-input-submission>` tag (form submit
   // replay) strip the XML tag for display — the bullet list above it
   // describes the same values, and the LLM still parses the tag from the
-  // stored raw text. Assistant messages get the defensive agent-block
-  // strip in case the backend's extractor missed a format variant (see
-  // `_stripSurvivingAgentBlocks`).
+  // stored raw text. Assistant messages get a defensive structural-block
+  // strip covering `<agent>` / `<agent-input-form>` / `<agent-input-submission>`
+  // in case the backend's extractor missed a format variant (see
+  // `_stripSurvivingStructuralBlocks` in strip-agent.js).
   let displayContent = rawContent;
   if (!isHtmlSnippet) {
     if (role === 'user') displayContent = _stripSubmissionTagForDisplay(rawContent);
-    else if (role === 'assistant') displayContent = _stripSurvivingAgentBlocks(rawContent);
+    else if (role === 'assistant') displayContent = _stripSurvivingStructuralBlocks(rawContent);
   }
   const contentHtml = isHtmlSnippet
     ? rawContent
@@ -2054,7 +2055,7 @@ function _streamingSetFinal(msg, text, { archive = false } = {}) {
   // the final text for reasons unrelated to cleanliness — the safer
   // default is to always paint the final text (same DOM node, minor
   // reflow, no visible flash in practice).
-  const display = _stripSurvivingAgentBlocks(text);
+  const display = _stripSurvivingStructuralBlocks(text);
   finalEl.innerHTML = `<div class="markdown-body">${_renderMessageMarkdown(display)}</div>`;
   finalEl.style.display = '';
   msg.dataset.finalText = display || '';
@@ -2121,7 +2122,7 @@ function _streamingSetError(msg, text) {
   const partial = String(msg.dataset.streamBuf || '');
   let bodyHtml = '';
   if (partial) {
-    const display = _stripSurvivingAgentBlocks(partial);
+    const display = _stripSurvivingStructuralBlocks(partial);
     if (display) {
       bodyHtml = `<div class="markdown-body">${_renderMessageMarkdown(display)}</div>`;
       msg.dataset.finalText = display;
@@ -3152,149 +3153,20 @@ function _mountCreatedAgentChip(msg, payload) {
 // bulleted summary above it already tells them what they confirmed.
 function _stripSubmissionTagForDisplay(text) {
   if (!text || text.indexOf('<agent-input-submission') < 0) return text;
-  return text
-    .replace(/\n*<agent-input-submission\b[^>]*>[\s\S]*?<\/agent-input-submission>\s*/gi, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trimEnd();
+  // Atomic-container strip with prose/code guard via strip-agent.js.
+  // Same class of fragmentation / set-B leak as `<agent>` — see that
+  // file's header for the invariant matrix.
+  const out = _stripOuterTagBlocks(text, 'agent-input-submission');
+  if (out === text) return text;
+  return out.replace(/\n{3,}/g, '\n\n').trimEnd();
 }
 
-// Split a markdown buffer into alternating prose / code segments. "Code" =
-// fenced ``` / ~~~ blocks (≤3-space indent, info-string allowed) plus inline
-// backtick spans; everything else is prose. Used by the `<agent>` container
-// strippers so coding scenarios — where the LLM legitimately quotes `<agent>`
-// inside a code sample to explain how this app's structured-output protocol
-// works — don't see the bubble silently truncated. Mid-stream unclosed fences
-// are treated as code through end-of-buffer, matching how the markdown
-// renderer would paint them.
-function _splitMarkdownProseCode(text) {
-  const segs = [];
-  if (!text) return segs;
-  const n = text.length;
-  let proseStart = 0;
-  const flushProse = (end) => {
-    if (end > proseStart) segs.push({ kind: 'prose', text: text.slice(proseStart, end) });
-  };
-  let i = 0;
-  while (i < n) {
-    const lineStart = i === 0 || text[i - 1] === '\n';
-    if (lineStart) {
-      let j = i;
-      let indent = 0;
-      while (indent < 3 && text[j] === ' ') { j++; indent++; }
-      const ch = text[j];
-      if (ch === '`' || ch === '~') {
-        let count = 0;
-        while (text[j + count] === ch) count++;
-        if (count >= 3) {
-          let k = j + count;
-          while (k < n && text[k] !== '\n') k++;
-          let scan = k < n ? k + 1 : n;
-          let close = -1;
-          while (scan < n) {
-            let s = scan;
-            let pad = 0;
-            while (pad < 3 && text[s] === ' ') { s++; pad++; }
-            if (text[s] === ch) {
-              let cc = 0;
-              while (text[s + cc] === ch) cc++;
-              if (cc >= count) {
-                let lineEnd = s + cc;
-                while (lineEnd < n && text[lineEnd] !== '\n') lineEnd++;
-                close = lineEnd;
-                break;
-              }
-            }
-            while (scan < n && text[scan] !== '\n') scan++;
-            if (scan < n) scan++;
-          }
-          flushProse(i);
-          const endIdx = close >= 0 ? close : n;
-          segs.push({ kind: 'code', text: text.slice(i, endIdx) });
-          proseStart = endIdx;
-          i = endIdx;
-          continue;
-        }
-      }
-    }
-    if (text[i] === '`') {
-      let count = 0;
-      while (text[i + count] === '`') count++;
-      let j = i + count;
-      let close = -1;
-      while (j < n) {
-        if (text[j] === '`') {
-          let cc = 0;
-          while (text[j + cc] === '`') cc++;
-          if (cc === count) { close = j + cc; break; }
-          j += cc;
-        } else {
-          j++;
-        }
-      }
-      if (close > 0) {
-        flushProse(i);
-        segs.push({ kind: 'code', text: text.slice(i, close) });
-        proseStart = close;
-        i = close;
-        continue;
-      }
-      // Mid-stream unclosed inline backticks — mirror the fenced-block branch
-      // above and tentatively classify [backtick, EOF] as code so a literal
-      // `<agent>` typed inside the span isn't stripped while we wait for the
-      // closing backtick to stream in.
-      flushProse(i);
-      segs.push({ kind: 'code', text: text.slice(i, n) });
-      proseStart = n;
-      i = n;
-      continue;
-    }
-    i++;
-  }
-  flushProse(n);
-  return segs;
-}
-
-// Collapse any ```agent-input-form fenced block in a streaming buffer to a
-// single-line placeholder so the user never sees the raw JSON being typed
-// char-by-char. Closed blocks get the placeholder inline; unclosed blocks
-// (we're still mid-stream inside one) get everything from the fence onward
-// replaced with the placeholder. When `final` arrives main has already
-// stripped the block and mounts the real form widget.
-// Final-time safety strip: drop any surviving `<agent>...</agent>` update
-// container from a message body entirely (no placeholder) before it's
-// rendered into the bubble. Used by `_streamingSetFinal` and the
-// persisted-message renderer to guard against (a) backend extractor missing
-// a format variant and (b) streaming-time placeholders accidentally sticking
-// around. Both closed and unclosed containers get removed; consecutive blank
-// lines collapse to one.
-// Code-fence guard: only strip `<agent>` matches that fall in PROSE segments —
-// matches inside fenced code blocks or inline backtick spans are preserved so
-// the LLM can quote `<agent>` literally when explaining this app's structured-
-// output protocol. Without this guard, a coding-explanation reply that
-// mentioned `<agent>` ate the rest of the bubble (the unclosed-tag fallback
-// would match `<agent>[\s\S]*$` against the literal token and wipe the tail).
-function _stripSurvivingAgentBlocks(text) {
-  if (!text || text.indexOf('<agent>') < 0) return text;
-  const out = _splitMarkdownProseCode(text)
-    .map((s) => s.kind === 'code'
-      ? s.text
-      : s.text
-          .replace(/<agent>[\s\S]*?<\/agent>/g, '')
-          .replace(/<agent>[\s\S]*$/, ''))
-    .join('');
-  return out
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-// Collapse the `<agent>...</agent>` update container (closed or mid-stream)
-// in a streaming buffer into **exactly one** italicized placeholder — so the
-// user never sees raw XML-ish tags / workflow JSON / inputs JSON typed
-// char-by-char. Container layout (see `chat_agent_setup.md` / `chat_commander.md`
-// § 创建智能体) is `<agent>...children...</agent>`; the whole container is
-// one unit, so we just replace the closed form with a placeholder and collapse
-// any unclosed trailing container the same way. `_streamingSetFinal` strips
-// the container for real at final time, so no placeholder survives.
+// `_splitMarkdownProseCode`, `_findOuterAgentRanges`, `_stripSurvivingAgentBlocks`,
+// `_replaceOuterAgentBlocks` are defined in `./strip-agent.js` (loaded earlier
+// in `index.html`). They live in their own file so vitest can pin the set-A /
+// set-B fixtures (`test/renderer/strip-agent.test.ts`) — see that file for
+// the invariant matrix. Wrap the i18n-aware placeholder here and delegate.
+//
 // Wrap placeholder text in an HTML `<em>` instead of markdown `_text_`:
 // standard markdown requires word-boundary chars on each side of `_` for
 // italic emphasis, and CJK glyphs don't count as word boundaries, so
@@ -3306,18 +3178,7 @@ function _streamPlaceholderHtml(key) {
 }
 
 function _stripAgentCreateBlocksForStream(buf) {
-  if (!buf || buf.indexOf('<agent>') < 0) return buf;
-  const placeholder = _streamPlaceholderHtml('chat.create_agent_streaming_placeholder');
-  // Same code-fence guard as `_stripSurvivingAgentBlocks` — leave `<agent>`
-  // inside fenced blocks / backtick spans alone so coding explanations stream
-  // through verbatim.
-  return _splitMarkdownProseCode(buf)
-    .map((s) => s.kind === 'code'
-      ? s.text
-      : s.text
-          .replace(/<agent>[\s\S]*?<\/agent>/g, placeholder)
-          .replace(/<agent>[\s\S]*$/, placeholder))
-    .join('');
+  return _replaceOuterAgentBlocks(buf, _streamPlaceholderHtml('chat.create_agent_streaming_placeholder'));
 }
 
 function _stripAgentFormBlockForStream(buf) {
@@ -3325,22 +3186,19 @@ function _stripAgentFormBlockForStream(buf) {
   // with submission reply tag, token-stable). Legacy: fenced
   // ```agent-input-form block — tolerated with `[\s\-]*` inside the
   // header to also catch "```agent\n-input-form" token-split outputs.
-  // Both are stripped to the same streaming placeholder; main's final
-  // pass mounts the actual form widget.
+  // Both stream to the same placeholder; main's final pass mounts the
+  // actual form widget.
   if (!buf) return buf;
-  const hasXml = buf.indexOf('<agent-input-form>') >= 0;
-  const hasLegacy = /```\s*agent[\s\-]*input[\s\-]*form/.test(buf);
-  if (!hasXml && !hasLegacy) return buf;
   const placeholder = _streamPlaceholderHtml('chat.form.streaming_placeholder');
-  let out = buf;
-  if (hasXml) {
-    out = out.replace(
-      /(?:^|\n)[ \t]*<agent-input-form>[ \t]*\r?\n[\s\S]*?\r?\n[ \t]*<\/agent-input-form>[ \t]*(?=\n|$)/g,
-      placeholder,
-    );
-    out = out.replace(/(?:^|\n)[ \t]*<agent-input-form>[\s\S]*$/, placeholder);
-  }
-  if (hasLegacy) {
+  // XML branch: atomic-container handling via strip-agent.js — same
+  // prose/code guard as `<agent>` so a fenced ```xml example or inline
+  // backtick mention of `<agent-input-form>` survives instead of being
+  // eaten as a real form.
+  let out = _replaceOuterTagBlocks(buf, 'agent-input-form', placeholder);
+  // Legacy fenced-block branch — kept for old-protocol compatibility.
+  // No prose/code guard here: the legacy fence IS itself a code fence,
+  // and outer fenced quoting of legacy form blocks is implausible.
+  if (/```\s*agent[\s\-]*input[\s\-]*form/.test(out)) {
     out = out.replace(
       /(?:^|\n)```\s*agent[\s\-]*input[\s\-]*form[ \t]*\r?\n[\s\S]*?\n```(?=\n|$)/g,
       placeholder,
