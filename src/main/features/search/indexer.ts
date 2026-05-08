@@ -55,10 +55,28 @@ interface ChatFileInfo {
   size: number;
 }
 
+// Persisted chat message can take two shapes:
+//   - **Legacy single-actor**: `{ role, content, time }` (pre-bus refactor;
+//     still on disk in older conversations).
+//   - **Group chat (current)**: `{ id, ts, from, to, mentions, text, ... }`
+//     — the `GroupMessage` shape persisted by `features/group_chat/visibility.ts`
+//     since the bus rewrite. Field names differ (`text` ↔ `content`,
+//     `from` ↔ `role`, `ts` ↔ `time`).
+//
+// `_msgText` / `_msgRole` / `_msgTime` read whichever pair is present so the
+// index covers both old and new conversations. Without this fallback the
+// new-format jsonl reads `content === undefined` → `_reindexChatFile`
+// skips every message → user reports "conversation messages can't be
+// searched" (only old conversations would still surface).
 interface ChatMessage {
+  // Legacy fields
   role?: string;
   time?: string;
   content?: unknown;
+  // Group-chat fields (current persistence format)
+  from?: string;
+  ts?: string;
+  text?: unknown;
 }
 
 // ── In-memory state ──────────────────────────────────────────────────────
@@ -187,8 +205,27 @@ async function _readJsonl(file: string): Promise<ChatMessage[]> {
 }
 
 function _msgText(msg: ChatMessage | null | undefined): string {
-  return (msg && typeof msg.content === 'string') ? msg.content : '';
+  if (!msg) return '';
+  // Group-chat shape (current) wins when present; legacy `content` is the
+  // fallback for older jsonl that predates the bus refactor.
+  if (typeof msg.text === 'string') return msg.text;
+  if (typeof msg.content === 'string') return msg.content;
+  return '';
 }
+
+function _msgRole(msg: ChatMessage | null | undefined): string {
+  if (!msg) return '';
+  return msg.from || msg.role || '';
+}
+
+function _msgTime(msg: ChatMessage | null | undefined): string {
+  if (!msg) return '';
+  return msg.ts || msg.time || '';
+}
+
+// Exported so `search/index.ts::searchChats` can use the same field-shape
+// fallback when extracting the snippet from the live jsonl record.
+export { _msgText as readMsgText };
 
 // ── Contexts (shared knowledge base) ─────────────────────────────────────
 // Content is NOT indexed — only the relPath (directory segments + filename)
@@ -323,7 +360,7 @@ async function _reindexChatFile(
     if (!text) return;
     const doc: Doc = {
       fileKey, kind: 'chat', msg_index: i, cid: fileKey,
-      role: m.role || '', time: m.time || '', len: text.length,
+      role: _msgRole(m), time: _msgTime(m), len: text.length,
     };
     _putDoc(idx, _docId('chat', fileKey, i), doc, text);
   });
@@ -375,7 +412,7 @@ async function _upsertChatMessageDoc(
     const entry = await _getEntry(idxPath, 'chat');
     const doc: Doc = {
       fileKey, kind: 'chat', msg_index: msgIndex, cid: fileKey,
-      role: msg.role || '', time: msg.time || '', len: text.length,
+      role: _msgRole(msg), time: _msgTime(msg), len: text.length,
     };
     _putDoc(entry.idx, _docId('chat', fileKey, msgIndex), doc, text);
     if (st) entry.idx.files[fileKey] = { mtime: st.mtimeMs, size: st.size };

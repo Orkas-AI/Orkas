@@ -188,6 +188,93 @@ describe('search/indexer › indexChatMessage (hot path)', () => {
   });
 });
 
+// Persistence shape changed during the bus refactor: legacy `<cid>.jsonl`
+// stored `{ role, content, time }`; current group-chat jsonl stores
+// `{ id, ts, from, to, mentions, text, ... }` (GroupMessage). The chat
+// indexer must read both — without the fallback, every post-refactor
+// conversation gets `_msgText() === ''` and is silently skipped, surfacing
+// to the user as "conversation messages can't be searched". This describe
+// pins both shapes so the fallback in `_msgText` / `_msgRole` / `_msgTime`
+// can't regress unnoticed.
+describe('search/indexer › chat message shapes (legacy + group-chat)', () => {
+  it('reconcileChatsIndex indexes group-chat shape (`{from, ts, text, ...}`)', async () => {
+    writeChat('u1', 'c1', [
+      { id: 'm0', ts: '2026-01-01T00:00:00Z', from: 'user',      to: ['commander'], mentions: [], text: 'pangolin sighting' },
+      { id: 'm1', ts: '2026-01-01T00:00:01Z', from: 'commander', to: ['user'],      text: 'noted' },
+    ]);
+    const ix = await loadIndexer();
+    await ix.reconcileChatsIndex('u1');
+    const paths = await import('../../../../src/main/paths');
+    const entry = await ix.getEntry(paths.userChatsIndexPath('u1'), 'chat');
+    // Both messages indexed — `from` becomes role, `ts` becomes time, `text` is the body.
+    expect(entry.idx.docs['chat:c1:0']).toMatchObject({ role: 'user', time: '2026-01-01T00:00:00Z' });
+    expect(entry.idx.docs['chat:c1:1']).toMatchObject({ role: 'commander', time: '2026-01-01T00:00:01Z' });
+    // Body tokens reachable via the postings list.
+    expect(entry.idx.postings['pangolin']).toBeDefined();
+    expect(entry.idx.postings['noted']).toBeDefined();
+  });
+
+  it('indexChatMessage hot-path accepts group-chat shape', async () => {
+    const ix = await loadIndexer();
+    ix.indexChatMessage('u1', 'c1', 0, {
+      from: 'user', ts: 't', text: 'fresh group message',
+    } as any);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const paths = await import('../../../../src/main/paths');
+    const entry = await ix.getEntry(paths.userChatsIndexPath('u1'), 'chat');
+    expect(entry.idx.docs['chat:c1:0']).toMatchObject({ role: 'user', time: 't' });
+    expect(entry.idx.postings['fresh']).toBeDefined();
+  });
+
+  it('legacy shape still works (regression guard for `{role, content, time}`)', async () => {
+    // Old conversations written before the bus refactor stay searchable.
+    writeChat('u1', 'c2', [
+      { role: 'user',      content: 'legacy alpha', time: 't1' },
+      { role: 'assistant', content: 'legacy beta',  time: 't2' },
+    ]);
+    const ix = await loadIndexer();
+    await ix.reconcileChatsIndex('u1');
+    const paths = await import('../../../../src/main/paths');
+    const entry = await ix.getEntry(paths.userChatsIndexPath('u1'), 'chat');
+    expect(entry.idx.docs['chat:c2:0']).toMatchObject({ role: 'user', time: 't1' });
+    expect(entry.idx.postings['legacy']).toBeDefined();
+  });
+});
+
+describe('search/indexer › on-disk schema bump triggers rebuild', () => {
+  it('stale-version idx (e.g. v3 chat idx built by the broken `_msgText`) is discarded on load and reconcile rebuilds from jsonl', async () => {
+    // Simulate the field-state that's actually on every existing user's
+    // disk after the bus refactor: idx file written by an earlier schema
+    // version, with `files` claiming the jsonl was already indexed but
+    // `docs` empty (since the old `_msgText` returned '' for group-chat
+    // shape and `_reindexChatFile` skipped every message).
+    writeChat('u1', 'cstale', [
+      { id: 'm0', ts: 't', from: 'user', to: ['commander'], text: 'searchable token zebrafish' },
+    ]);
+    const paths = await import('../../../../src/main/paths');
+    const idxPath = paths.userChatsIndexPath('u1');
+    const stalePayload = {
+      version: 3,                          // <— old version
+      kind: 'chat',
+      files: { cstale: { mtime: 0, size: 0 } }, // claims indexed
+      docs: {},                            // but no docs (bug state)
+      postings: {},
+    };
+    fs.mkdirSync(path.dirname(idxPath), { recursive: true });
+    fs.writeFileSync(idxPath, JSON.stringify(stalePayload));
+
+    const ix = await loadIndexer();
+    await ix.reconcileChatsIndex('u1');
+
+    const entry = await ix.getEntry(idxPath, 'chat');
+    // Stale index discarded by `loadIndex` (version mismatch → emptyIndex),
+    // reconcile then sees no known files → re-walks the jsonl from scratch
+    // → group-chat shape now correctly tokenized.
+    expect(entry.idx.docs['chat:cstale:0']).toBeDefined();
+    expect(entry.idx.postings['zebrafish']).toBeDefined();
+  });
+});
+
 describe('search/indexer › dropChatConversation', () => {
   it('removes every doc under the conversation id', async () => {
     writeChat('u1', 'c1', [

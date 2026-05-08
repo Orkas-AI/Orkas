@@ -27,7 +27,14 @@ const fsp = fs.promises;
 // relPath (directory + filename) only; content lookup goes through the
 // vector KB. Bumping the version forces old body-tokenized indexes to
 // rebuild on next reconcile.
-export const SCHEMA_VERSION = 3;
+// v4 fixes the chat indexer's silent skip on group-chat jsonl — `_msgText`
+// only read the legacy `content` field, missing the current `text` field
+// (and `from`/`ts` for role/time). Indexes built by v3 against post-bus
+// jsonl have empty docs (every message skipped); bumping forces a rebuild
+// so existing users get their chat history searchable again on next launch
+// (the alternative — leaving v3 — would only fix newly-modified jsonl files
+// because reconcile keys off mtime+size, not schema correctness).
+export const SCHEMA_VERSION = 4;
 
 export type IndexKind = 'context' | 'chat';
 

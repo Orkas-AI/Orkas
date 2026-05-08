@@ -120,6 +120,28 @@ describe('search › searchContexts', () => {
   });
 });
 
+describe('search › searchChats — group-chat shape end-to-end', () => {
+  it('finds a query token in current group-chat jsonl shape and returns a snippet', async () => {
+    // Pin the bug-fix path: bus refactor changed `<cid>.jsonl` from
+    // `{role, content, time}` to `{id, ts, from, to, mentions, text}`.
+    // `searchChats` must (a) read text via `text` field for snippet, and
+    // (b) `searchAll` with scope=chat must surface the result.
+    writeChat('u1', 'cgroup', [
+      { id: 'm0', ts: '2026-01-01T00:00:00Z', from: 'user', to: ['commander'], mentions: [], text: 'discussing pangolin habitat' },
+    ]);
+    const s = await loadSearch();
+    const ix = await import('../../../../src/main/features/search/indexer');
+    await ix.reconcileChatsIndex('u1');
+    const results = await s.searchChats('u1', 'pangolin');
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0].cid).toBe('cgroup');
+    expect(results[0].role).toBe('user');
+    // Snippet must include the matched token (proves `text` field is being
+    // read, not the absent `content`).
+    expect(results[0].snippet).toMatch(/pangolin/);
+  });
+});
+
 describe('search › searchChats', () => {
   it('fills conv_title from _index.json when present', async () => {
     writeChat('u1', 'c1', [{ role: 'user', content: 'widget question', time: 't' }]);

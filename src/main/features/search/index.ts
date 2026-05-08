@@ -223,7 +223,7 @@ export async function searchChats(userId: string, query: string): Promise<Search
       conv_title: titles[String(doc.cid)] || t('chat.default_title'),
       role: doc.role,
       time: doc.time,
-      snippet: _makeSnippet(msg && typeof msg.content === 'string' ? msg.content : '', q),
+      snippet: _makeSnippet(indexer.readMsgText(msg as any), q),
       score,
     };
   });
