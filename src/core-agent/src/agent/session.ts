@@ -82,6 +82,16 @@ export class Session {
   /**
    * Compact the session by summarizing older messages.
    * Returns a summary of the compacted context.
+   *
+   * Pairing invariant: the kept tail must NOT begin with a tool_result-only
+   * user message — its corresponding tool_use is in the older slice that's
+   * about to be replaced by the summary, leaving it orphaned. The next
+   * provider call after compaction would then send a function_call_output
+   * with no matching function_call and the API rejects with
+   * "No tool call found for function call output with call_id ...". Drop
+   * leading tool_result-only user messages from `kept` until the first
+   * message is either a non-tool-result user message or an assistant
+   * message — that point is a safe cut boundary.
    */
   compact(summary: string): void {
     if (this.messages.length <= 2) return;
@@ -89,6 +99,16 @@ export class Session {
     // Keep the last few messages and replace older ones with a summary
     const keepCount = Math.min(4, this.messages.length);
     const kept = this.messages.slice(-keepCount);
+
+    while (kept.length > 0) {
+      const head = kept[0];
+      if (head.role !== "user") break;
+      const allToolResults = head.content.every(
+        (c) => (c as { type?: string }).type === "tool_result",
+      );
+      if (!allToolResults) break;
+      kept.shift();
+    }
 
     this.messages = [
       { role: "user", content: [{ type: "text", text: `[Previous conversation summary]\n${summary}` }] },
