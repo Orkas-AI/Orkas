@@ -1,4 +1,4 @@
-# Orkas — 开源多智能体 AI 桌面客户端
+# Orkas — 开源多智能体 AI 桌面客户端，用对话组建并指挥你的 AI 智能体团队
 
 **开源的多智能体 AI 桌面客户端，做 AI 工作流编排：用一段对话组建你的 AI 团队 —— 指挥官 LLM 组装智能体团队，并行或串行调度子智能体，并让智能体通过自我反思与技能沉淀持续演进。本地优先存储，自带 LLM 密钥（Claude · OpenAI · Gemini · DeepSeek · Kimi · GLM · Qwen · MiniMax · 豆包），跨 macOS / Windows / Linux 三端。给本地 agent 加一层零代码、图形化的团队编排 —— OpenClaw、Hermes-Agent、Claude Code、Codex 等本地 CLI agent 都可以无缝接入。**
 
@@ -11,6 +11,8 @@
 <sub>多智能体系统 · AI 团队 · 智能体团队 · AI 工作流 · 智能体编排</sub>
 
 🌐 想要团队协作、专家 Agent 等更多功能？→ [专业版](https://aiservice.fun)
+
+> ⭐ 如果 Orkas 帮你做出了更好的 AI 工作流，欢迎点个 star，让更多人看到这个项目。
 
 ---
 
@@ -119,6 +121,8 @@ run.cmd            # Windows
 ```
 
 `run.sh` / `run.cmd` 会自动安装依赖并下载嵌入模型（约 95 MB）。首次启动后会在 `~/.orkas/`（macOS / Linux）或 `<字母最小的非系统盘>:\.orkas\`（Windows）创建工作目录，然后**设置 → AI 模型供应商**配置 API key 或 OAuth。
+
+> ⭐ 把 Orkas 跑起来了？给仓库点个 star 吧，能帮项目走得更远。
 
 ---
 
