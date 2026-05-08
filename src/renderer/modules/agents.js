@@ -1217,14 +1217,21 @@ async function useAgent(agentId, seedText) {
 
     const visible = (seedText || '').trim() || t('agents.run_prefix', { name: agent.name || agent.agent_id });
 
+    // Don't pass a custom title — let backend `groupChat.send` auto-title
+    // from the first user message, same rule as every other conv-creation
+    // entry point (new-chat panel, commander @-mention). Optimistic title
+    // is the run-prefix message itself so the sidebar entry shows the
+    // user's intent ("运行 <name>") instead of bare agent name; this
+    // matches what backend `autoTitle` will persist on the same `visible`.
     const res = await apiFetch('/api/conversations/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: agent.name || '' }),
+      body: JSON.stringify({}),
     });
     const data = await res.json();
     if (!data.ok) throw new Error(data.error || t('agents.create_conv_failed'));
     const conv = data.conversation;
+    conv.title = _autoTitle(visible);
     conversations.unshift(conv);
     renderConversationList();
     setView('conversation', conv.conversation_id, { skipLoad: true });

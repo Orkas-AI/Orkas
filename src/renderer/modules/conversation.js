@@ -1640,9 +1640,11 @@ async function handleNewChatSubmit() {
     if (!data.ok) throw new Error(data.error || t('chat.create_conv_failed'));
     const conv = data.conversation;
     convId = conv.conversation_id;
-    // Optimistic title from the user-visible text (raw, not the transformed form)
-    const optimistic = raw.replace(/\s+/g, ' ').trim();
-    conv.title = optimistic.length > 40 ? optimistic.slice(0, 40) + '…' : optimistic;
+    // Optimistic title from the user-visible text (raw, not the transformed form).
+    // Use the shared `_autoTitle` so this matches backend `autoTitle` —
+    // otherwise the optimistic + backend-refreshed titles disagree and
+    // the sidebar entry flips on the next loadConversations.
+    conv.title = _autoTitle(raw);
     conversations.unshift(conv);
     renderConversationList();
   } catch (e) {

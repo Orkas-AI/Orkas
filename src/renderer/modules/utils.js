@@ -393,6 +393,19 @@ function nowIsoLocal() {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
+/** Compose a sidebar title from arbitrary user-message text. Mirrors
+ *  backend `chats.ts::autoTitle` so the optimistic renderer-side title
+ *  and the backend-persisted title agree — without this match the new
+ *  conv first paints the optimistic value, then `loadConversations`
+ *  refreshes with backend's value and the sidebar entry visibly flips.
+ *  Empty input returns '' so the caller can fall back to its own
+ *  placeholder (`t('chat.new_conv_title')` for the conv list). */
+function _autoTitle(text) {
+  let s = String(text == null ? '' : text).trim().replace(/\n/g, ' ');
+  if (s.length > 40) s = s.slice(0, 40) + '…';
+  return s;
+}
+
 function formatTime(iso) {
   if (!iso) return '-';
   try {
