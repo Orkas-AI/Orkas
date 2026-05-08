@@ -1,4 +1,4 @@
-# Orkas — Open-Source Multi-Agent AI Desktop Client
+# Orkas — Open-Source Multi-Agent AI Desktop Client, Build and command your AI agent team through conversation
 
 **Open-source multi-agent AI desktop client for AI workflow orchestration. Build your AI team in one chat: a commander LLM assembles an agent team, dispatches sub-agents in parallel or in series, and lets agents self-evolve through reflection and skill crystallization. Local-first storage, BYO LLM API keys (Claude · OpenAI · Gemini · DeepSeek · Kimi · GLM · Qwen · MiniMax · Doubao), cross-platform on macOS, Windows, and Linux. A no-code, GUI-native team layer for local agents — OpenClaw, Hermes-Agent, Claude Code, Codex, and other local CLI agents all plug in seamlessly.**
 
@@ -11,6 +11,8 @@
 <sub>multi-agent system · AI team · agent team · AI workflow · agents orchestration</sub>
 
 🌐 Want team collaboration, expert agents, and more? → [Pro edition](https://aiservice.fun)
+
+> ⭐ If Orkas helps you build better AI workflows, please consider giving it a star — it helps more people find the project.
 
 ---
 
@@ -119,6 +121,8 @@ run.cmd            # Windows
 ```
 
 `run.sh` / `run.cmd` auto-installs dependencies and downloads the embedding model (~95 MB). First launch creates a workspace under `~/.orkas/` (macOS / Linux) or `<smallest non-system drive>:\.orkas\` (Windows). Then go to **Settings → AI Providers** to configure an API key or OAuth.
+
+> ⭐ Got Orkas running? A star on the repo goes a long way toward keeping the project moving.
 
 ---
 
