@@ -15,7 +15,8 @@ import { safeId } from '../../storage';
 // ── Mention parsing ──────────────────────────────────────────────────────
 
 // `@token` where token is `[A-Za-z0-9_一-鿿-]+` — ASCII word chars
-// plus CJK Unified Ideographs so users can `@张三` an agent by name. Token
+// plus CJK Unified Ideographs so users can mention agents whose display
+// names use CJK characters. Token
 // boundaries:
 //   - leading: start-of-string or any non-token char
 //   - trailing: matched greedily up to the first non-token char
@@ -48,17 +49,22 @@ function _buildMentionRe(names?: readonly string[]): RegExp {
 /** Scan a message body for `@token` mentions. Deduped, in first-occurrence
  *  order.
  *
- *  `fromKind` 决定是否把 `@` 当 dispatch 信号:
- *    - `'user'` (或 undefined,向后兼容) — 走完整扫描;真人用户敲 `@A` 是真心要找 A
- *    - `'commander'` / `'agent'` — 直接返回 `[]`;LLM 散文里 `**@A**` `@A / @B`
- *      这类是训练数据带来的 markdown 装饰习惯,系统不识别为派活信号。LLM 派活
- *      的唯一通道是 `dispatch_to` (单 agent) 或 `plan_set` (多 actor) 工具。
- *  详见 docs/plans/dispatch-via-tool-call.md 与 CLAUDE.md §5。
+ *  `fromKind` decides whether `@` counts as a dispatch signal:
+ *    - `'user'` (or undefined, for back-compat) — full scan; a real
+ *      user typing `@A` actually means "send to A".
+ *    - `'commander'` / `'agent'` — return `[]` immediately; LLM prose
+ *      like `**@A**` or `@A / @B` is training-data markdown decoration,
+ *      not a dispatch signal. The only LLM-side dispatch channels are
+ *      the `dispatch_to` (single agent) and `plan_set` (multi-actor)
+ *      tools.
+ *  See docs/plans/dispatch-via-tool-call.md and CLAUDE.md §5.
  *
- *  `names` 启用多词名字精确匹配:用户敲 "@Software Requirements Analyst" 这种
- *  带空格的显示名,fallback 字符类只能截到 "@Software"(白名单不含空格);names
- *  里有该 agent 名时 alternation 会一次匹完整段。caller 应传入 roster +
- *  registry 的所有 agent name(原文,大小写敏感保留)。
+ *  `names` enables exact multi-word name matching: when a user types
+ *  "@Software Requirements Analyst", the fallback char class only
+ *  captures "@Software" (the allow-list excludes spaces); when that
+ *  agent name is in `names`, the alternation matches the full segment
+ *  in one shot. Callers should pass every roster + registry agent name
+ *  as-is (case-sensitive preserved).
  */
 export function parseMentions(
   text: string,
@@ -77,6 +83,33 @@ export function parseMentions(
     out.push(token);
   }
   return out;
+}
+
+/**
+ * Build an `@<name>` token for output (user bubbles, dispatch prefixes,
+ * `@<id>` → `@<name>` rewrites, form-submission text, pendingDispatch
+ * synthesis — every place code constructs an at-mention that ends up in a
+ * persisted message).
+ *
+ * Whitespace inside `name` is preserved verbatim. The parser side
+ * (`_buildMentionRe`) handles multi-word names via a longest-first named-alt
+ * regex, so stripping whitespace at construction time only mangles the
+ * display ("Agent Skill X" → "AgentSkillX") without buying any routing
+ * safety. Lookup-key normalisation (lower + strip-whitespace) lives in
+ * `_normalizeNameKey` and is its own concern — do not conflate with this.
+ *
+ * **Use this helper everywhere you would otherwise write `` `@${name}` ``**:
+ * having a single construction point is the only durable fix for the
+ * recurring "agent name with spaces gets mangled" class of bug
+ * (commits `ebf76e80` → `2eeee2f6` → `98ff0d2d` → form-submission round —
+ * each round only patched the discovered call site, leaving siblings to
+ * resurface the same regression). Future contributors who reach for the
+ * helper inherit the invariant for free; reviewing for inline
+ * `'@' + name.replace(/\s+/g, '')` is still recommended but no longer
+ * load-bearing once every existing site is migrated.
+ */
+export function buildMention(name: string): string {
+  return `@${String(name || '').trim()}`;
 }
 
 // ── Routing ──────────────────────────────────────────────────────────────
@@ -126,7 +159,8 @@ export interface ResolveOpts {
  */
 /** Normalize a token / agent name for lookup: lowercase + strip all
  *  whitespace. The mention-regex already disallows whitespace inside tokens
- *  (so the user can never type `@张 三`); the lowercase + strip pair makes
+ *  (so users can never type a mention with internal whitespace); the
+ *  lowercase + strip pair makes
  *  match keys robust to display names that contain spaces ("Writing Helper"
  *  → "writinghelper") and to Latin-script case differences. */
 function _normalizeNameKey(s: string): string {
@@ -136,15 +170,17 @@ function _normalizeNameKey(s: string): string {
 export function resolveRecipients(opts: ResolveOpts): RouteResolution {
   // Build the name list for the mention parser — roster agents + registry
   // display names + reserved aliases. Without this, multi-word names get
-  // truncated at the first whitespace by the fallback regex (see日志:
-  // user typed "@Socratic Learning Coach 运行" and got `mentions: ['Socratic']`
+  // truncated at the first whitespace by the fallback regex (observed
+  // in logs: a user typed something like
+  // "@Socratic Learning Coach <imperative>" and got `mentions: ['Socratic']`
   // → unknown_token → fell back to commander default routing).
   const namesForParser: string[] = [];
   for (const m of opts.members) {
     if (m.kind === 'agent' && m.name) namesForParser.push(m.name);
   }
   if (opts.agentDisplayNames) namesForParser.push(...opts.agentDisplayNames);
-  // Reserved-actor aliases — let `@指挥官` / `@用户` route too. Cheap (4 strings).
+  // Reserved-actor aliases — also accept the Chinese forms
+  // (`@指挥官` / `@用户`). Cheap (4 strings).
   namesForParser.push('指挥官', '用户', 'commander', 'user');
   const tokens = parseMentions(opts.text, { fromKind: opts.fromKind, names: namesForParser });
   const memberIds = new Set(opts.members.map((m) => m.id));
@@ -195,7 +231,8 @@ export function resolveRecipients(opts: ResolveOpts): RouteResolution {
   //   - commander → user (its replies are user-facing summaries)
   //   - agent → user (default surface output to the human; agents only
   //     reach commander via an explicit `@<commander-name>` mention)
-  // See `chat_agent_in_group.md` § 群聊机制 + `chat_commander.md`.
+  // See the "Group-chat mechanics" section of `chat_agent_in_group.md`
+  // and `chat_commander.md`.
   let def: string;
   if (opts.fromKind === 'user') def = COMMANDER_ID;
   else def = USER_ID;
@@ -323,9 +360,9 @@ export function decodeSubmission(text: string): DecodedSubmission | null {
  *  travels above the XML tag. Same logic as the legacy chat had — kept here
  *  so the renderer can call it without depending on agent_input_form.ts. */
 export function formatValueForSummary(field: AgentInput, raw: unknown): string {
-  const fallback = '（未填）';
+  const fallback = '(unfilled)';
   if (raw === undefined || raw === null) return fallback;
-  if (field.type === 'boolean') return raw === true ? '是' : '否';
+  if (field.type === 'boolean') return raw === true ? 'yes' : 'no';
   if (field.type === 'select') {
     const opt = (field.options || []).find((o) => o.value === raw);
     return opt ? opt.label : String(raw);

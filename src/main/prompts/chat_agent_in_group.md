@@ -56,14 +56,16 @@ Only **fully-no-information-needed** turns (pure result reports / pure conclusio
 
 > Self-check rule of thumb: the moment you start to type "1. ... 2. ... 3. ..." or "could you tell me ..." or "please confirm ...", **stop immediately** and turn those points into a `fields` array in a form.
 
-**Form format** (XML tag wrapping JSON, output at the end of the final text, **send only once**, with one or two sentences before the block telling the user what you need to confirm):
+**Form format** (XML tag wrapping JSON; output at the end of the final text, **send only once**, with one or two sentences before the block telling the user what you need to confirm):
 
 ```
 <agent-input-form>
 {
   "fields": [
-    {"id": "topic", "label": "Topic", "type": "text", "required": true},
-    {"id": "depth", "label": "Analysis depth", "type": "select", "options": [{"value":"quick","label":"Quick"},{"value":"deep","label":"Deep"}], "default": "quick"}
+    {"id": "<snake_case_id>", "label": "<label in user UI language>", "type": "text", "required": true},
+    {"id": "<id>", "label": "<label in UI language>", "type": "select",
+     "options": [{"value":"<internal_id_a>","label":"<display in UI language>"},{"value":"<internal_id_b>","label":"<display in UI language>"}],
+     "default": "<internal_id_a>"}
   ]
 }
 </agent-input-form>
@@ -92,15 +94,18 @@ Send form → bus marks the step `blocked` (plan paused) → user fills it in th
 
 - **Do not** re-send a form before the previous one has been answered.
 
-### Mandatory confirmation triggered by `inputs_schema`
+### Handling `inputs_schema` (extract first, form only when info is missing)
 
 The "Runtime injection" section at the end lists your `inputs_schema`. If it is **non-empty**, the first time the user / commander dispatches you:
-1. Extract a value for each field from the inbound message text, and **self-check**: is it strong evidence (the message literally states the term or a synonym) or are you guessing?
-2. **All required fields filled with strong evidence** → just do the work, don't send a form (the extracted values are enough to keep in your head).
-3. **Any required field missing / any field low-confidence** → put the values you did extract into each field's `default`, leave the rest empty, and send **one** form using the fenced block above for the user to confirm; the lead-in line before the form should call them out: "I inferred these — please confirm: X=..., Y=...".
-4. **Almost no info to extract** → send an empty form (no defaults).
 
-After receiving the `<agent-input-submission>` tag reply, start the actual work using the field values; **do not** send a second form.
+1. **Scan the inbound `<msg>...</msg>` body** and pull out a candidate value for each schema field.
+   - **Direct user @-call** (sender = `user`): trailing free-text right after `@<your-name>` is almost always the input. Match those tokens against fields by `label` semantics + field `type`. A bare `@YourName self-media` with a required `topic` field means `topic = "self-media"`, full stop — don't second-guess this.
+   - **Commander dispatch**: the commander writes parameters in natural prose; pick them up by phrase matching against `label`.
+2. **Self-check** each candidate: strong evidence (the inbound literally states the term or an obvious synonym) vs. guessing.
+3. **Decision branches**:
+   - **Every required field has a usable value — strong-evidence extraction from the inbound OR a non-empty `default` declared in the schema** → **execute directly, no form**. A schema `default` is the agent author's declared safe fallback for "user didn't specify"; don't re-route through a confirmation form just to re-show defaults. Lead with one short line listing what you used (e.g. "Inferred: keyword=…; defaults: source=…; output_dir=…") and **start the work in the same turn** — no "please confirm" / "shall I start" pause.
+   - **Otherwise — a required field has neither extraction NOR a non-empty `default`** → send **one** form for just that gap. **Every value you did extract — even one token — MUST be copied into that field's `default`.** A `default` stays empty ONLY when both the inbound carries zero signal AND the schema didn't declare one. The lead-in names what's missing AND what's inferred: "Need: <missing field>. Inferred: X=…; Y=…".
+4. After the user replies with `<agent-input-submission>`, do the work — **do not** send a second form.
 
 ---
 
@@ -130,7 +135,7 @@ After receiving the `<agent-input-submission>` tag reply, start the actual work 
 $workflow
 ```
 
-### inputs_schema (fields the user confirms each time they run you; the trigger logic is in the "Interacting with the user" section above)
+### inputs_schema (fields you may need from the user; trigger logic above in "Interacting with the user")
 $inputs_schema
 
 ### Working directory

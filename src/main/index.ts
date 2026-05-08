@@ -13,15 +13,25 @@
  *   4. Create BrowserWindow loading renderer/index.html.
  *   5. IPC handlers serve invoke + stream calls from the renderer.
  *
- * 文件位置：`PC/src/main/index.ts`。`bootstrap.cjs` 的
- * `require('./src/main')` 会自动解析到这里（Node 的 folder → index 解析规则）。
- * `__dirname` 指向 `PC/src/main/`，跨层引用 renderer / builtin / resources
- * 时统一经过 `paths.SRC_ROOT` 换算，不要再对 `__dirname` 拼。
+ * File location: `PC/src/main/index.ts`. `bootstrap.cjs`'s
+ * `require('./src/main')` resolves here automatically via Node's
+ * folder → index resolution rule. `__dirname` points at `PC/src/main/`;
+ * cross-tree references to renderer / builtin / resources go through
+ * `paths.SRC_ROOT` — never splice `__dirname` directly.
  */
 
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { app, BrowserWindow, Menu, ipcMain, nativeImage, protocol, shell } from 'electron';
+
+// Force the user-visible app name to "Orkas" before anything else
+// reads it. In dev (running `electron .`) Electron defaults to the
+// `name` field in package.json (lowercase "orkas") or — when launched
+// without that being effective — to literally "Electron", which leaks
+// to the macOS Dock tooltip and the menu bar. Packaged builds set this
+// via electron-builder's `productName`; this call covers dev + any
+// edge case where productName isn't picked up early.
+app.setName('Orkas');
 
 // Register the KB file protocol BEFORE `app.whenReady()` — privileged
 // schemes can't be added after. `kb-file:///<relpath>` serves a single
@@ -45,10 +55,12 @@ protocol.registerSchemesAsPrivileged([
   },
 ]);
 
-// Packaged 模式 WS_ROOT 重定向(`~/.orkas/data` 或 Windows 容器盘)已经在
-// `bootstrap.cjs` 完成,**必须**那时做 —— TypeScript 的 import 提升会把
-// `paths.ts` 的 require 提到这块代码之前,放到这里设置 env 已来不及。
-// 详细选盘规则见 `packaged-data-root.cjs`,被 `bootstrap.cjs` 直接 require。
+// Packaged-mode WS_ROOT redirect (`~/.orkas/data` or a Windows container
+// drive) is already done in `bootstrap.cjs`, and **must** happen there —
+// TypeScript's import hoisting would pull `paths.ts`'s require ahead of
+// any env-setting block here, so doing it later is too late. Drive
+// selection rules live in `packaged-data-root.cjs`, required directly by
+// `bootstrap.cjs`.
 import * as paths from './paths';
 
 // `CORE_AGENT_AUTH_DIR` is pinned per-uid by `features/users.activateUser()`
@@ -100,7 +112,7 @@ function createWindow(): BrowserWindow {
     backgroundColor: '#ffffff',
     icon: path.join(paths.SRC_ROOT, 'resources', 'icons', 'icon.png'),
     webPreferences: {
-      // preload 和 index.ts 同在 PC/src/main/ 下 —— 直接 __dirname + 'preload.js'
+      // preload sits next to index.ts in PC/src/main/ — just __dirname + 'preload.js'.
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
@@ -120,11 +132,13 @@ function createWindow(): BrowserWindow {
   // frame-only look (drag works, but no label across the top).
   win.on('page-title-updated', (e) => e.preventDefault());
 
-  // 对话气泡 / 知识库 / 设置页里的外链，一律交给系统默认浏览器打开 ——
-  //   - `target="_blank"` / `window.open()`  走 setWindowOpenHandler
-  //   - 无 target 的 `<a href>` 点击  走 will-navigate（否则 Electron 会
-  //     把当前窗口整个导航走，把应用界面替换掉）
-  // 非 http(s) 一律拒绝（`file://` 初始加载走 loadFile，不触发这里）。
+  // External links in chat bubbles / knowledge base / settings always open
+  // in the system default browser:
+  //   - `target="_blank"` / `window.open()`  → setWindowOpenHandler
+  //   - `<a href>` clicks without a target   → will-navigate (otherwise
+  //     Electron navigates the current window away and replaces the UI).
+  // Non-http(s) is always rejected (`file://` only fires through the
+  // initial loadFile, which doesn't reach this handler).
   const openIfExternal = (raw: string): boolean => {
     const url = String(raw || '').trim();
     if (!/^https?:\/\//i.test(url)) return false;
@@ -141,11 +155,11 @@ function createWindow(): BrowserWindow {
     if (openIfExternal(url)) event.preventDefault();
   });
 
-  // 统一接管 Cmd/Ctrl+R / F5：
-  //   - 打包后：禁止刷新（App 不需要重载）
-  //   - dev：强制走 reloadIgnoringCache —— 这样改了 renderer/*.css 或 *.js
-  //     后 Cmd+R 直接拿到新版本，renderer 里的 `?v=` cache-busting 后缀
-  //     就不再需要人工 bump。
+  // Hijack Cmd/Ctrl+R / F5 uniformly:
+  //   - Packaged: refresh disabled (the App doesn't need reload).
+  //   - Dev: force reloadIgnoringCache so that after editing
+  //     renderer/*.css or *.js, Cmd+R picks up the new version directly —
+  //     no need to hand-bump the `?v=` cache-busting suffix in renderer.
   win.webContents.on('before-input-event', (event, input) => {
     if (input.type !== 'keyDown') return;
     if (input.shift) return;
@@ -469,17 +483,21 @@ if (!gotLock) {
 } else {
   app.whenReady().then(async () => {
     await runBootSelfCheck();
-    // Dev 态 dock 图标：打包后 macOS 走 .icns（Info.plist），dev 态运行的是
-    // Electron.app 自带 Info.plist，必须运行时 setIcon 才能看到自家 logo。
-    // Windows 任务栏直接吃 BrowserWindow.icon，不用这条；Linux 同理。
+    // Dev-mode dock icon: packaged macOS picks up .icns from Info.plist,
+    // but dev runs the bundled Electron.app's own Info.plist — we must
+    // setIcon at runtime to see our logo. The Windows taskbar reads
+    // BrowserWindow.icon directly so this branch isn't needed there
+    // (same on Linux).
     if (process.platform === 'darwin' && app.dock) {
       const iconPath = path.join(paths.SRC_ROOT, 'resources', 'icons', 'icon.png');
       const img = nativeImage.createFromPath(iconPath);
       if (!img.isEmpty()) app.dock.setIcon(img);
     }
-    // Windows 任务栏：Electron dev 进程默认归到 electron.exe 的 AppUserModelID，
-    // 任务栏会按那个 ID 取图标 → 显示成 Electron 默认 logo。手动设成自家 ID
-    // 后，Windows 就改用 BrowserWindow.icon。打包态 NSIS 也会写入同一 ID。
+    // Windows taskbar: by default the Electron dev process inherits
+    // electron.exe's AppUserModelID, and the taskbar uses that ID to look
+    // up the icon → it ends up showing the default Electron logo. Setting
+    // our own ID here makes Windows fall back to BrowserWindow.icon.
+    // Packaged NSIS writes the same ID.
     if (process.platform === 'win32') {
       app.setAppUserModelId('com.orkas.desktop');
     }

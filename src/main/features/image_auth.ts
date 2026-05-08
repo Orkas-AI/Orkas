@@ -100,7 +100,7 @@ export interface TestImageProfileResult {
 /**
  * Connectivity probe — sends a minimal generation request to the picked
  * provider's image API. Costs ≈ one cheap image. Caller should only invoke
- * on explicit user action (e.g. "测试" button), not on every save.
+ * on explicit user action (e.g. a "test" button), not on every save.
  */
 export async function testImageProfile(id: string): Promise<TestImageProfileResult> {
   const list = loadImageProfiles();

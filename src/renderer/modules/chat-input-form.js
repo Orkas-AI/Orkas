@@ -10,6 +10,16 @@
 // `encodeChatFormSubmission` are exposed to other modules.
 
 (function () {
+  // In-progress (un-submitted) field values, keyed by `${cid}::${form_id}`.
+  // Hydrated back when re-rendering an unsubmitted form so switching
+  // conversations and coming back doesn't wipe what the user already typed.
+  // Cleared on successful submit, on reset, and whenever the form re-renders
+  // as already-submitted (server-side values are authoritative then).
+  const _formDrafts = new Map();
+  function _draftKey(cid, formId) {
+    return `${cid || ''}::${formId || ''}`;
+  }
+
   // Build DOM for a single field. Returns { el, read, isReady, field }.
   //
   // `opts.presetValue` overrides `field.default` for the initial control
@@ -58,6 +68,9 @@
       }
       input.value = initial === undefined || initial === null ? '' : String(initial);
       if (disabled) input.disabled = true;
+      input.addEventListener('input', () => {
+        if (ctx && typeof ctx.onChange === 'function') ctx.onChange();
+      });
       ctrlWrap.appendChild(input);
       read = () => {
         if (field.type === 'number') {
@@ -73,21 +86,38 @@
       ta.rows = 3;
       ta.value = typeof initial === 'string' ? initial : '';
       if (disabled) ta.disabled = true;
+      ta.addEventListener('input', () => {
+        if (ctx && typeof ctx.onChange === 'function') ctx.onChange();
+      });
       ctrlWrap.appendChild(ta);
       read = () => ta.value;
     } else if (field.type === 'select') {
-      const sel = document.createElement('select');
-      sel.className = 'form-field-input form-field-select';
-      for (const opt of (field.options || [])) {
-        const o = document.createElement('option');
-        o.value = opt.value;
-        o.textContent = opt.label || opt.value;
-        if (opt.value === initial) o.selected = true;
-        sel.appendChild(o);
-      }
-      if (disabled) sel.disabled = true;
+      // Use the shared `_aiSelectMount` widget instead of native <select>.
+      // Native chrome looks dated next to the rest of the app, and the
+      // settings/agent-edit pages already standardised on AiSelect.
+      // The submit-time form lock (`f.el.querySelectorAll('button')` →
+      // `disabled = true`) catches the trigger button, so no extra
+      // disabled wiring is needed beyond the initial-state branch below.
+      const sel = document.createElement('div');
       ctrlWrap.appendChild(sel);
-      read = () => sel.value;
+      const aiSel = _aiSelectMount(sel, {
+        placeholder: field.placeholder || undefined,
+      });
+      const options = (field.options || []).map((o) => ({
+        value: o.value,
+        label: o.label || o.value,
+      }));
+      aiSel.setOptions(options, {
+        value: typeof initial === 'string' ? initial : '',
+      });
+      if (disabled) {
+        const trigger = sel.querySelector('.ai-select-trigger');
+        if (trigger) trigger.disabled = true;
+      }
+      aiSel.onChange(() => {
+        if (ctx && typeof ctx.onChange === 'function') ctx.onChange();
+      });
+      read = () => aiSel.getValue();
     } else if (field.type === 'multiselect') {
       // Checkbox group — clearer than <select multiple>, also better on mobile.
       const wrap = document.createElement('div');
@@ -102,6 +132,9 @@
         box.value = opt.value;
         if (initialSet.has(opt.value)) box.checked = true;
         if (disabled) box.disabled = true;
+        box.addEventListener('change', () => {
+          if (ctx && typeof ctx.onChange === 'function') ctx.onChange();
+        });
         checks.push(box);
         labelEl.appendChild(box);
         const text = document.createElement('span');
@@ -118,6 +151,9 @@
       box.type = 'checkbox';
       if (initial === true) box.checked = true;
       if (disabled) box.disabled = true;
+      box.addEventListener('change', () => {
+        if (ctx && typeof ctx.onChange === 'function') ctx.onChange();
+      });
       labelEl.appendChild(box);
       const text = document.createElement('span');
       text.textContent = ' ' + t('chat.form.boolean_on');
@@ -129,6 +165,72 @@
       ctrlWrap.appendChild(fileWidget.el);
       read = fileWidget.read;
       isReady = fileWidget.isReady;
+    } else if (field.type === 'directory') {
+      // Directory picker: native dialog through `common.pickDirectory`.
+      // The widget shows the picked absolute path; the value submitted is
+      // the path string (or empty when nothing picked). Used by external
+      // coding agents (claude / codex) to collect their cwd via the
+      // standard input-form pipeline.
+      const dirWrap = document.createElement('div');
+      dirWrap.className = 'form-field-dir';
+      const pathLabel = document.createElement('span');
+      pathLabel.className = 'form-field-dir-path';
+      let value = (typeof initial === 'string' && initial) ? initial : '';
+      const renderPath = () => {
+        if (value) {
+          pathLabel.textContent = value;
+          pathLabel.title = value;
+          pathLabel.classList.remove('is-empty');
+        } else {
+          pathLabel.textContent = t('input.dir.none') || '(none selected)';
+          pathLabel.removeAttribute('title');
+          pathLabel.classList.add('is-empty');
+        }
+      };
+      renderPath();
+      const pickBtn = document.createElement('button');
+      pickBtn.type = 'button';
+      pickBtn.className = 'btn btn-sm form-field-dir-pick';
+      pickBtn.textContent = t('input.dir.pick') || 'Choose directory…';
+      const clearBtn = document.createElement('button');
+      clearBtn.type = 'button';
+      clearBtn.className = 'btn btn-sm form-field-dir-clear';
+      clearBtn.textContent = t('input.dir.clear') || 'Clear';
+      pickBtn.disabled = disabled;
+      clearBtn.disabled = disabled;
+      pickBtn.addEventListener('click', async () => {
+        try {
+          const res = await window.orkas.invoke('common.pickDirectory', {
+            title: field.label || 'Choose a directory',
+          });
+          if (res && !res.cancelled && res.path) {
+            value = String(res.path);
+            renderPath();
+            pickBtn.textContent = t('input.dir.change') || 'Change…';
+            // Notify the form so the submit button re-evaluates `isReady`
+            // — without this the button stays disabled (and shows the
+            // "please wait for upload to finish" hint) even after the user picks a dir.
+            if (ctx && typeof ctx.onChange === 'function') ctx.onChange();
+          }
+        } catch (_) { /* user cancelled or no permission */ }
+      });
+      clearBtn.addEventListener('click', () => {
+        value = '';
+        renderPath();
+        pickBtn.textContent = t('input.dir.pick') || 'Choose directory…';
+        if (ctx && typeof ctx.onChange === 'function') ctx.onChange();
+      });
+      if (value) pickBtn.textContent = t('input.dir.change') || 'Change…';
+      dirWrap.appendChild(pickBtn);
+      dirWrap.appendChild(clearBtn);
+      dirWrap.appendChild(pathLabel);
+      ctrlWrap.appendChild(dirWrap);
+      read = () => value;
+      // No `isReady` override: `isReady` is reserved for "in-flight"
+      // states (e.g. file upload still going) which gate the submit
+      // button + show the "please wait for upload to finish" hint. Required-empty for a
+      // directory is reported by `_validate` on submit click, matching
+      // text / number / select.
     } else {
       // Unknown type — shouldn't happen (main validated) but degrade gracefully.
       const note = document.createElement('div');
@@ -312,6 +414,8 @@
           ? !Array.isArray(value) || value.length === 0
           : !value;
         if (empty) return t('chat.form.required_file');
+      } else if (field.type === 'directory') {
+        if (!String(value || '').trim()) return t('chat.form.required_directory');
       }
     }
     if (field.type === 'number' && typeof value === 'number') {
@@ -324,7 +428,7 @@
   function _formatSummaryLine(field, value) {
     const fallback = t('chat.form.empty_value');
     if (value === undefined || value === null) return fallback;
-    if (field.type === 'boolean') return value === true ? '是' : '否';
+    if (field.type === 'boolean') return value === true ? 'yes' : 'no';
     if (field.type === 'select') {
       const opt = (field.options || []).find((o) => o.value === value);
       return opt ? (opt.label || opt.value) : String(value);
@@ -373,13 +477,21 @@
   //
   // Submitted/readonly forms render *the same* widget — same fields, same
   // controls, same layout — just with every input disabled and the
-  // submit/reset buttons replaced by a "已提交 · time" stamp. This way the
+  // submit/reset buttons replaced by a "submitted · time" stamp. This way the
   // bubble looks identical before and after submit, and the user always
   // sees the structured form (not a degraded text summary) on refresh.
   function renderChatInputForm(container, message, opts = {}) {
     if (!message || !message.form || !Array.isArray(message.form.fields)) return;
     const form = message.form;
     const submitted = !!(opts.readonly || form.submitted);
+
+    // Draft hydration: an unsubmitted form re-rendered after a tab switch
+    // pulls the user's in-progress values out of `_formDrafts` so they
+    // don't lose their typing. A submitted form drops any stale draft —
+    // server-side `form.values` is authoritative now.
+    const draftKey = _draftKey(opts.cid, form.form_id);
+    const draftValues = !submitted ? _formDrafts.get(draftKey) : null;
+    if (submitted) _formDrafts.delete(draftKey);
 
     container.classList.add('chat-input-form');
     if (submitted) container.classList.add('is-submitted');
@@ -393,23 +505,37 @@
     const fields = [];
     const fieldCtx = {
       cid: opts.cid,
-      onChange: () => _refreshSubmitState(),
+      onChange: () => {
+        _refreshSubmitState();
+        if (submitted) return;
+        const snap = {};
+        for (const f of fields) {
+          try { snap[f.field.id] = f.read(); } catch (_) { /* skip */ }
+        }
+        _formDrafts.set(draftKey, snap);
+      },
     };
     for (const f of form.fields) {
-      const presetValue = submitted && form.values
-        && Object.prototype.hasOwnProperty.call(form.values, f.id)
-        ? form.values[f.id]
-        : undefined;
-      const built = _buildField(f, fieldCtx, {
-        presetValue,
-        disabled: submitted,
-      });
+      // Only attach `presetValue` when we actually have one — `_buildField`
+      // checks `hasOwnProperty('presetValue')` to distinguish "user explicitly
+      // cleared this field" (preset = '' / 0 / false / []) from "no preset,
+      // fall back to field.default". Passing the key with value `undefined`
+      // would defeat that and hide the schema-defined defaults.
+      const buildOpts = { disabled: submitted };
+      if (submitted && form.values
+          && Object.prototype.hasOwnProperty.call(form.values, f.id)) {
+        buildOpts.presetValue = form.values[f.id];
+      } else if (!submitted && draftValues
+          && Object.prototype.hasOwnProperty.call(draftValues, f.id)) {
+        buildOpts.presetValue = draftValues[f.id];
+      }
+      const built = _buildField(f, fieldCtx, buildOpts);
       fields.push(built);
       bodyEl.appendChild(built.el);
     }
     container.appendChild(bodyEl);
 
-    // Submitted forms get a "已提交 · time" stamp instead of action buttons.
+    // Submitted forms get a "submitted · time" stamp instead of action buttons.
     if (submitted) {
       const stamp = document.createElement('div');
       stamp.className = 'form-submitted-stamp';
@@ -449,6 +575,9 @@
     _refreshSubmitState();
 
     resetBtn.addEventListener('click', () => {
+      // Clear the draft so re-render falls back to schema defaults rather
+      // than re-hydrating the in-progress values we just wiped from the DOM.
+      _formDrafts.delete(draftKey);
       container.innerHTML = '';
       renderChatInputForm(container, message, opts);
     });
@@ -493,6 +622,11 @@
       const dedupAttachments = Array.from(new Set(attachmentNames));
       try {
         opts.onSubmit && opts.onSubmit(encoded, values, dedupAttachments);
+        // Submission left our hands; once the bubble re-renders as
+        // submitted the draft is moot anyway, but drop it now so a fast
+        // tab switch before the re-render arrives doesn't re-hydrate the
+        // already-sent values into a stale form.
+        _formDrafts.delete(draftKey);
       } catch (err) {
         delete submitBtn.dataset.locked;
         submitBtn.disabled = false;

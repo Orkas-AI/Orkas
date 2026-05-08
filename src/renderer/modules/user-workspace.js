@@ -97,7 +97,8 @@ function _createWorkspaceChip() {
   const chip = document.createElement('button');
   chip.type = 'button';
   chip.className = 'workspace-chip';
-  chip.title = _wsInfo.currentPath || '点击选择工作区';
+  chip.title = _wsInfo.currentPath
+    || (typeof t === 'function' ? t('workspace.chip_title') : 'Click to pick a workspace');
   chip.innerHTML =
     '<svg class="workspace-chip-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">' +
     '<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>' +
@@ -245,13 +246,5 @@ async function initUserWorkspace() {
     if (toolbar) {
       toolbar.appendChild(_createWorkspaceChip());
     }
-  }
-
-  const agentInputArea = document.querySelector('.agents-chat-input-area');
-  if (agentInputArea) {
-    const toolbar = document.createElement('div');
-    toolbar.className = 'chat-input-toolbar agents-chat-workspace-toolbar';
-    toolbar.appendChild(_createWorkspaceChip());
-    agentInputArea.parentNode.insertBefore(toolbar, agentInputArea);
   }
 }

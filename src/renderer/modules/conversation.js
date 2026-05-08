@@ -172,9 +172,11 @@ if (typeof window !== 'undefined') {
 
 // ─── Recipient chip — per-cid for conversations, ephemeral for new-chat ──
 // Each persisted conversation remembers its own last-picked recipient (so
-// switching between conversations restores their distinct contexts). The
-// new-chat ("指挥官") landing is a fresh slate every visit — it always
-// starts as commander; mid-session picks aren't persisted.
+// switching between conversations restores their distinct contexts) and
+// stays sticky on view-enter — the only thing that overrides it is the
+// auto-switch to a live interactive agent (see `_evaluateAutoRecipient`).
+// The new-chat (commander landing) resets to commander only when its input
+// box is empty; otherwise the user's in-progress draft keeps its target.
 const _COMMANDER = { kind: 'commander', id: '', name: '' };
 const _RECIPIENT_LS_KEY = 'chat.recipientByCid';
 let _recipientByCid = {};       // { [cid]: {kind,id,name} } — agents only; commander = absence
@@ -195,6 +197,13 @@ function _saveRecipientMap() {
   try { localStorage.setItem(_RECIPIENT_LS_KEY, JSON.stringify(_recipientByCid)); } catch (_) {}
 }
 
+// Quote-reply state (per-cid, in-memory). Declared early so the
+// DOMContentLoaded init branch below — which may invoke _renderQuotePreview
+// synchronously when the document is already loaded — doesn't hit a TDZ on
+// the binding. The helper functions live further down with the rest of the
+// quote infrastructure (_setQuote / _getQuote / _clearQuote / _renderQuotePreview).
+const _quoteByCid = new Map();   // cid → { fromActor, fromName, msgId, text, produced[] } | undefined
+
 function _normRecipient(next) {
   if (!next || (next.kind !== 'commander' && next.kind !== 'agent')) return null;
   if (next.kind === 'commander') return { ..._COMMANDER };
@@ -209,13 +218,9 @@ function _activeRecipient(target) {
 
 function getChatRecipient(target) { return { ..._activeRecipient(target) }; }
 
-// Per-cid flag: once the user manually picks a recipient during a plan run,
-// we stop auto-switching them around as interactive agents come and go. The
-// flag clears when the plan finishes (no more interactive in_progress steps
-// AND no agent currently auto-targeted) — see `_evaluateAutoRecipient`.
-const _autoSwitchSuppressed = new Set();
+function _onRecipientChanged(_target) { /* reserved for future hooks */ }
 
-function setChatRecipient(target, next, { auto = false } = {}) {
+function setChatRecipient(target, next, _opts = {}) {
   const r = _normRecipient(next);
   if (!r) return;
   if (target === 'new-chat') {
@@ -224,12 +229,9 @@ function setChatRecipient(target, next, { auto = false } = {}) {
     if (r.kind === 'commander') delete _recipientByCid[currentCid];
     else _recipientByCid[currentCid] = r;
     _saveRecipientMap();
-    // Manual pick during a running plan — silence auto-switching for this cid
-    // until the plan settles. Auto-switch callers pass `{ auto: true }` and
-    // never trip this flag.
-    if (!auto) _autoSwitchSuppressed.add(currentCid);
   }
   _renderRecipientChip(target);
+  _onRecipientChanged(target);
 }
 
 // Called by the new-chat send path *after* the new conv id is known so the
@@ -253,64 +255,90 @@ function _renderRecipientChip(target) {
     const nameEl = document.getElementById(id);
     if (!nameEl) continue;
     const r = _activeRecipient(tg);
-    if (r.kind === 'agent' && r.name) {
-      nameEl.textContent = '@' + r.name;
+    if (r.kind === 'agent' && r.id) {
+      // Resolve name from the live registry first — the `r.name` field is
+      // a snapshot taken at picker time and stays stale after rename. Fall
+      // back to the snapshot only when the registry doesn't know the agent
+      // (e.g. it was deleted), then to the id as a last resort.
+      let display = '';
+      if (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
+        const a = _agentsCache.find((x) => x && x.agent_id === r.id);
+        if (a && a.name) display = a.name;
+      }
+      if (!display) display = r.name || r.id;
+      nameEl.textContent = '@' + display;
       nameEl.removeAttribute('data-i18n');
     } else {
       nameEl.setAttribute('data-i18n', 'chat.recipient_commander');
-      nameEl.textContent = (typeof t === 'function') ? t('chat.recipient_commander') : '指挥官';
+      nameEl.textContent = (typeof t === 'function') ? t('chat.recipient_commander') : 'Commander';
     }
   }
 }
 
 // Hooks called by setView (boot.js) so the chip mirrors the active context.
 function onEnterNewChatView() {
-  _newChatRecipient = { ..._COMMANDER };
+  // The new-chat input is the only place the recipient is ephemeral. Reset
+  // to commander only when the textarea is empty — if the user has typed
+  // anything, treat that as an in-progress message whose target they
+  // already chose, and leave the chip alone.
+  const input = document.getElementById('new-chat-input');
+  const hasDraft = !!(input && input.value);
+  if (!hasDraft) _newChatRecipient = { ..._COMMANDER };
   _renderRecipientChip('new-chat');
 }
 function onEnterConversationView() {
   _renderRecipientChip('conversation');
-  // Re-arm auto-switching for this cid — switching views is a fresh slate
-  // for the suppression flag (any past manual pick is already persisted in
-  // localStorage as the chip's starting state).
-  if (currentCid) _autoSwitchSuppressed.delete(currentCid);
   // Kick a one-shot evaluation so that a cid mid-plan picks up its current
   // interactive assignee even if no plan_changed/state_changed event fires
-  // before the user types.
+  // before the user types. View-enter never reverts to commander (see
+  // `_evaluateAutoRecipient`); the persisted per-cid pick stays sticky.
   if (currentCid) _evaluateAutoRecipient(currentCid);
+  // Bind the plan rail to the active cid on EVERY conversation-view enter,
+  // including the `skipLoad: true` path used by fresh conversations (where
+  // loadConversationHistory is intentionally skipped). Without this hook,
+  // the rail would keep displaying the previous cid's plan content.
+  if (window.PlanRail) window.PlanRail.bind(currentCid || null);
+  // Quote preview is per-cid; rerender so a quote captured in another conv
+  // doesn't bleed into this one (and a quote left in this conv reappears
+  // when the user navigates back).
+  _renderQuotePreview();
 }
 
 // Called by queue-draft.js::_forgetConvLocal when a conv is deleted so we
 // don't accumulate dead entries in localStorage forever.
 function _forgetCidRecipient(cid) {
-  if (!cid || !_recipientByCid[cid]) return;
-  delete _recipientByCid[cid];
-  _saveRecipientMap();
-  _autoSwitchSuppressed.delete(cid);
+  if (!cid) return;
+  if (_recipientByCid[cid]) {
+    delete _recipientByCid[cid];
+    _saveRecipientMap();
+  }
   _latestInFlight.delete(cid);
   _lastInteractiveTurnAgent.delete(cid);
+  // Drop any pending quote for the deleted conv (memory only — no localStorage).
+  _quoteByCid.delete(cid);
 }
 
 // ─── Auto-recipient: follow the interactive agent on plan dispatch ───────
 // Goal: when a plan step assigned to an `interactive: true` agent enters
 // `in_progress`, default the input box recipient to that agent so the user's
 // next reply lands there without manual @-mention. When no interactive step
-// is in flight, revert to commander. Manual user picks suppress this until
-// the plan settles back to commander (then we re-arm).
+// is in flight, leave the recipient alone — the persisted per-cid pick is
+// the source of truth. Auto-switching to a live interactive agent always
+// wins, even over a manual pick (the user explicitly asked for this).
 //
 // Concurrency notes:
 //   - Multiple interactive in_progress steps → take the latest plan index
 //     ("most recently dispatched" matches user intent in linear chains; in
 //     true fan-out interactive agents are a degenerate case the user can
-//     correct manually, which then trips _autoSwitchSuppressed).
+//     correct manually).
 //   - Re-entrancy guarded by `_autoEvalInflight` so back-to-back plan_changed
 //     + state_changed events coalesce into one fetch round.
 //   - Sticky beyond `in_progress`: an interactive agent's step often ends
 //     `blocked` (form pause) or even `done` (back-and-forth tutoring with
-//     no form) before the user has typed a single character. Reverting to
-//     commander the instant the agent's turn settles erases the auto-target
-//     before it has any value. Logic widens to "blocked and done count too,
-//     last terminal step's assignee wins when no live step is running".
+//     no form) before the user has typed a single character. Reverting away
+//     the instant the agent's turn settles erases the auto-target before it
+//     has any value. Logic widens to "blocked and done count too, last
+//     terminal step's assignee wins when no live step is running".
 const _autoEvalInflight = new Set(); // cid set
 const _latestInFlight = new Map();   // cid → string[] (mirrors state_changed.state.in_flight)
 // cid → most recent interactive agent that produced an end-of-turn message.
@@ -331,22 +359,11 @@ async function _evaluateAutoRecipient(cid) {
     if (cid !== currentCid) return; // user navigated away mid-fetch
     const inFlight = _latestInFlight.get(cid) || [];
     const interactiveAgent = _pickInteractiveAgent(plan, members || [], inFlight);
+    if (!interactiveAgent) return; // no live interactive target — keep the persisted pick
     const cur = _activeRecipient('conversation');
-    if (interactiveAgent) {
-      if (_autoSwitchSuppressed.has(cid)) return; // user picked manually; respect
-      if (cur.kind === 'agent' && cur.id === interactiveAgent.id) return;
-      setChatRecipient('conversation',
-        { kind: 'agent', id: interactiveAgent.id, name: interactiveAgent.name },
-        { auto: true });
-    } else {
-      // No interactive step in flight → revert to commander, and re-arm
-      // auto-switch (suppression only meant to last for the active dispatch
-      // window the user pushed back on).
-      _autoSwitchSuppressed.delete(cid);
-      if (cur.kind !== 'commander') {
-        setChatRecipient('conversation', { kind: 'commander' }, { auto: true });
-      }
-    }
+    if (cur.kind === 'agent' && cur.id === interactiveAgent.id) return;
+    setChatRecipient('conversation',
+      { kind: 'agent', id: interactiveAgent.id, name: interactiveAgent.name });
   } catch (err) {
     _convLog?.warn?.('auto-recipient evaluate failed', err);
   } finally {
@@ -364,7 +381,8 @@ async function _fetchPlanForAutoRecipient(cid) {
 }
 
 function _pickInteractiveAgent(plan, members, inFlight) {
-  // Commander mid-turn → it's about to speak, give it the chip back.
+  // Commander mid-turn → don't auto-switch to an agent (commander's reply is
+  // about to land); leave the persisted recipient as-is.
   if (Array.isArray(inFlight) && inFlight.includes('commander')) return null;
 
   const byName = new Map();
@@ -456,21 +474,38 @@ const _LEADING_MENTION_RE = /^@([A-Za-z0-9_一-鿿-]+)\s?/u;
 
 function applyRecipientPrefix(raw, target) {
   const r = _activeRecipient(target || 'conversation');
-  if (r.kind !== 'agent' || !r.name) return raw;
+  if (r.kind !== 'agent' || !r.id) return raw;
   const text = String(raw || '');
   if (_LEADING_MENTION_RE.exec(text)) return text;
-  const tag = '@' + String(r.name).replace(/\s+/g, '');
-  return tag + ' ' + text;
+  // Resolve from the live registry by id — `r.name` is a localStorage
+  // snapshot taken at picker time, so a rename leaves it stale and the
+  // outgoing `@<token>` would still carry the old name. Fall back to the
+  // snapshot when the registry doesn't know the agent (deleted), then to
+  // the id as last resort.
+  let display = '';
+  if (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
+    const a = _agentsCache.find((x) => x && x.agent_id === r.id);
+    if (a && a.name) display = a.name;
+  }
+  if (!display) display = r.name || r.id;
+  const tag = '@' + String(display);
+  // When the raw body starts with a blockquote (e.g. the quote-reply prefix
+  // injected by applyQuotePrefix), use a newline separator so the @-mention
+  // ends up on its own line — markdown only treats `>` as a blockquote when
+  // it sits at column 0, and `@AgentB > ...` on one line collapses the
+  // blockquote into plain prose. Plain-text bodies keep the original space.
+  const sep = /^>/.test(text) ? '\n' : ' ';
+  return tag + sep + text;
 }
 
 if (typeof window !== 'undefined') {
-  const initChip = () => _renderRecipientChip();
+  const initChip = () => { _renderRecipientChip(); _renderQuotePreview(); };
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', initChip, { once: true });
   } else {
     initChip();
   }
-  window.addEventListener('i18n-change', () => _renderRecipientChip());
+  window.addEventListener('i18n-change', () => { _renderRecipientChip(); _renderQuotePreview(); });
 }
 
 // ─── Group-chat translation layer ─────────────────────────────────────────
@@ -481,8 +516,10 @@ if (typeof window !== 'undefined') {
 // "from-name" label rendered as a header chip on the bubble.
 const GROUP_RESERVED = new Set(['user', 'commander']);
 
-// 指挥官头像偏好，懒加载缓存。聊天行渲染要用到 —— 第一次渲染前发一次 IPC，
-// 之后任何更新都同步刷这里。`null` = 未加载 / 取不到，渲染层自己回退到默认。
+// Commander avatar preference, lazy-loaded cache. Used by the chat row
+// renderer — fire one IPC before the first render, then refresh this
+// cache on every subsequent update. `null` = not loaded / unavailable;
+// the render layer falls back to the default itself.
 let _commanderAvatarCache = null;
 function _commanderAvatar() {
   return _commanderAvatarCache || COMMANDER_DEFAULT;
@@ -494,7 +531,7 @@ async function _ensureCommanderAvatarLoaded() {
     if (res?.ok && res.avatar) {
       _commanderAvatarCache = { icon: res.avatar.icon, color: res.avatar.color };
     }
-  } catch (_) { /* 走默认 */ }
+  } catch (_) { /* fall back to default */ }
   return _commanderAvatarCache || COMMANDER_DEFAULT;
 }
 function setCommanderAvatarCache(avatar) {
@@ -502,49 +539,53 @@ function setCommanderAvatarCache(avatar) {
     _commanderAvatarCache = { icon: avatar.icon, color: avatar.color };
   }
 }
-/** 渲染消息行头像。fromId 已知非 'user'。 */
+/** Render the message row avatar. `fromId` is known to be non-'user'. */
 function _renderActorAvatarHtml(fromId) {
   if (fromId === 'commander') {
     const a = _commanderAvatar();
     return renderAvatarHtml(a.icon, a.color, { size: 28, seed: 'commander' });
   }
-  // agent_id：先看群成员缓存（带 icon/color 字段），再看全局 agents 缓存。
+  // The global agents registry takes priority — it's always the current
+  // truth. The per-group member cache is just a join-time snapshot and
+  // does not follow rename / avatar changes, so it serves as fallback
+  // for legacy conversations whose agent has since been deleted from
+  // the registry.
   let icon, color;
-  const members = _groupMembersCache.get(currentCid);
-  if (members) {
-    const m = members.find((x) => x.id === fromId);
-    if (m) { icon = m.icon; color = m.color; }
-  }
-  if ((!icon || !color) && typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
+  if (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
     const a = _agentsCache.find((x) => x && x.agent_id === fromId);
-    if (a) { icon = icon || a.icon; color = color || a.color; }
+    if (a) { icon = a.icon; color = a.color; }
+  }
+  if (!icon || !color) {
+    const members = _groupMembersCache.get(currentCid);
+    if (members) {
+      const m = members.find((x) => x.id === fromId);
+      if (m) { icon = icon || m.icon; color = color || m.color; }
+    }
   }
   return renderAvatarHtml(icon, color, { size: 28, seed: fromId || 'agent' });
 }
 /** Resolve an actor id (commander / user / agent_id) to a human-readable
  *  display name. **Never returns the raw agent_id** — UI shouldn't expose
- *  hex strings to the user. Falls back to the global agents cache when
- *  the per-conv members roster hasn't loaded yet, then to a localized
- *  "智能体" placeholder as last resort. */
+ *  hex strings to the user. Global registry is checked first so renames
+ *  reflect immediately in old conversations; per-conv roster (a join-time
+ *  snapshot) is the fallback for agents the registry no longer knows about
+ *  (deleted agents whose old chats still need a label). */
 function _groupActorLabel(fromId) {
   if (fromId === 'user') return null;
-  if (fromId === 'commander') return t('chat.from_commander') || '指挥官';
+  if (fromId === 'commander') return t('chat.from_commander') || 'Commander';
+  if (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
+    const a = _agentsCache.find((x) => x && x.agent_id === fromId);
+    if (a && a.name) return a.name;
+  }
   const cached = _groupMembersCache.get(currentCid);
   if (cached) {
     const a = cached.find((x) => x.id === fromId);
     if (a && a.name) return a.name;
   }
-  // Fall back to the global agents cache (loaded on view-mount by
-  // agents.js::loadAgents) — covers the window between history load and
-  // the per-conv members roster being fetched.
-  if (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
-    const a = _agentsCache.find((x) => x && x.agent_id === fromId);
-    if (a && a.name) return a.name;
-  }
   // Last resort: never leak the id. Show a neutral placeholder; the chip
   // will repaint as soon as the cache catches up (state_changed handler
   // refreshes _groupMembersCache).
-  return t('chat.from_agent_unknown') || '智能体';
+  return t('chat.from_agent_unknown') || 'Agent';
 }
 const _groupMembersCache = new Map(); // cid → Actor[]
 async function _refreshGroupMembers(cid) {
@@ -554,6 +595,12 @@ async function _refreshGroupMembers(cid) {
     const data = await res.json();
     if (data?.ok && Array.isArray(data.actors)) {
       _groupMembersCache.set(cid, data.actors);
+      // Roster change can flip the inline "create agent" button visibility:
+      // a freshly @-mentioned agent joins members.json before it streams a
+      // reply, and the button must hide as soon as that happens.
+      if (cid === currentCid) {
+        try { _ensureConvCreateAgentInline(); } catch (_) { /* non-fatal */ }
+      }
       return data.actors;
     }
   } catch (_) { /* non-fatal */ }
@@ -592,11 +639,11 @@ function _groupMsgToLegacy(gm) {
 // ─── Chat attachments (pending-send pool per cid) ─────────────────────────
 // User picks files via "+" → we upload them to `<cid>/` and remember them in
 // this Map. On send we hand the filenames to the server; on success the list
-// for that cid is cleared (消息粒度). Each entry is {name, kind, bytes, dataUrl?}.
+// for that cid is cleared (per-message granularity). Each entry is {name, kind, bytes, dataUrl?}.
 
 const _chatAttachments = new Map();   // cid → Array<{name, kind, bytes, dataUrl?}>
 
-// Draft cid used by 总指挥 (new-chat) tab — files land under
+// Draft cid used by the commander (new-chat) tab — files land under
 // `data/<uid>/chat_attachments/main_chat/` until the user hits send, at which
 // point the backend renames that dir to the freshly-minted conversation cid
 // (see `adoptDraftAttachments`).
@@ -646,7 +693,7 @@ function _chatAttachClear(cid) {
   _chatAttachRenderChips(cid);
 }
 
-// cid → DOM host id for the chip row. Draft cid (总指挥) renders into the
+// cid → DOM host id for the chip row. Draft cid (commander tab) renders into the
 // new-chat panel; any real cid renders into the active conversation panel
 // only when it matches currentCid (stale states for other cids stay in the
 // Map but aren't painted).
@@ -870,18 +917,34 @@ function _iconForProduced(name) {
   const ext = (name.split('.').pop() || '').toLowerCase();
   if (ext === 'pdf') return '📄';
   if (ext === 'docx' || ext === 'doc') return '📝';
-  if (['png', 'jpg', 'jpeg', 'webp', 'gif'].includes(ext)) return '🖼';
-  if (['md', 'markdown', 'txt', 'log'].includes(ext)) return '📃';
-  if (['json', 'yaml', 'yml', 'csv', 'tsv'].includes(ext)) return '📊';
-  return '📁';
+  if (['png', 'jpg', 'jpeg', 'webp', 'gif', 'svg', 'bmp', 'ico'].includes(ext)) return '🖼';
+  if (['mp4', 'webm', 'mov', 'm4v', 'ogv', 'avi', 'mkv'].includes(ext)) return '🎬';
+  if (['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac'].includes(ext)) return '🎵';
+  if (['md', 'markdown', 'txt', 'log', 'rst', 'tex'].includes(ext)) return '📃';
+  if (['json', 'yaml', 'yml', 'toml', 'csv', 'tsv', 'xlsx', 'xls', 'xml', 'ini', 'conf'].includes(ext)) return '📊';
+  if (['zip', 'tar', 'gz', 'tgz', 'bz2', 'xz', '7z', 'rar'].includes(ext)) return '📦';
+  // Source code / scripts — covers .py / .ts / web / shell / mainstream langs.
+  // Anything else falls through to the generic "file" icon below.
+  if ([
+    'py', 'pyi', 'ipynb',
+    'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs',
+    'html', 'htm', 'css', 'scss', 'sass', 'less',
+    'sh', 'bash', 'zsh', 'fish', 'ps1', 'bat', 'cmd',
+    'rb', 'go', 'rs', 'java', 'kt', 'kts', 'scala',
+    'c', 'cpp', 'cc', 'cxx', 'h', 'hpp', 'hxx',
+    'php', 'swift', 'lua', 'pl', 'pm', 'r', 'dart',
+    'sql', 'graphql', 'gql', 'proto',
+  ].includes(ext)) return '📜';
+  return '📄';
 }
 
 function _renderMessageProducedHtml(absPaths) {
   // Chip shows just the filename. The full absolute path lives only in
   // `data-produced-path` for the click handler; tooltip is a static
-  // localised "在文件夹中显示" hint instead of the raw OS path (which
-  // exposes the user's home dir and is hostile UX in Chinese mixed-case).
-  const hint = t('chat.produced_reveal_title') || '在文件夹中显示';
+  // localized "show in folder" hint instead of the raw OS path (which
+  // exposes the user's home directory and is hostile UX in mixed-locale
+  // contexts).
+  const hint = t('chat.produced_reveal_title') || 'Show in folder';
   const items = absPaths.map((p) => {
     const base = p.split(/[\\/]/).pop() || p;
     const icon = _iconForProduced(base);
@@ -893,13 +956,18 @@ function _renderMessageProducedHtml(absPaths) {
   return `<div class="chat-msg-produced">${items.join('')}</div>`;
 }
 
-// Render a "查看详情" chip on an assistant bubble when a new agent was
+// Render a "view details" chip on an assistant bubble when a new agent was
 // quick-created from that turn. Click → jump to agents tab + select the new
 // agent. Same visual slot as produced chips (inside the bubble, below
 // content), but in .is-custom green to signal "new custom artifact created".
 function _renderMessageCreatedAgentHtml(payload) {
   if (!payload || !payload.agent_id) return '';
   const name = payload.name || payload.agent_id;
+  // Label is intentionally neutral ("view details / Open: …") — works for both
+  // `kind: 'created'` and `kind: 'updated'`; the commander's surrounding
+  // prose tells the user which one happened. Don't split the i18n key just
+  // to track the verb — the chip is a CTA into the agent panel, not a
+  // status badge.
   return `<div class="chat-msg-created-agent">
     <span class="chat-msg-created-agent-chip" data-agent-id="${escapeHtml(payload.agent_id)}" title="${escapeHtml(name)}">
       <span class="chat-msg-created-agent-icon">◆</span>
@@ -915,7 +983,8 @@ function _hydrateMessageCreatedAgentChip(msgDiv) {
     const aid = chip.dataset.agentId;
     if (!aid) return;
     setView('agents');
-    if (typeof selectAgent === 'function') selectAgent(aid);
+    if (typeof _showAgentsDetailView === 'function') _showAgentsDetailView(aid);
+    else if (typeof selectAgent === 'function') selectAgent(aid);
   });
 }
 
@@ -959,6 +1028,28 @@ function _hydrateMessageAttachmentThumbs(msgDiv, _cid) {
   });
 }
 
+// Wire `paste` on a textarea to the same upload pipeline as the "+" button.
+// Triggers when the clipboard contains any File entries — screenshots from
+// the OS clipboard (Cmd/Ctrl+Shift+screenshot) and files copied from Finder
+// / Explorer both land in `clipboardData.files`. Plain-text pastes have an
+// empty FileList and fall through to the textarea's native paste handler.
+function _bindChatPasteAttach(inputElId, getCid) {
+  const el = document.getElementById(inputElId);
+  if (!el || el.dataset.pasteBound === '1') return;
+  el.addEventListener('paste', (e) => {
+    const cid = getCid();
+    if (!cid) return;
+    const cd = e.clipboardData;
+    if (!cd || !cd.files || !cd.files.length) return;
+    e.preventDefault();
+    // Fire-and-forget — _chatAttachUpload paints placeholder chips
+    // synchronously before any network IO, so the user sees the chip
+    // appear at the top of the input area as soon as the paste lands.
+    _chatAttachUpload(cid, cd.files);
+  });
+  el.dataset.pasteBound = '1';
+}
+
 function _initChatAttachInput() {
   const btn = document.getElementById('chat-attach-btn');
   const input = document.getElementById('chat-attach-input');
@@ -972,12 +1063,16 @@ function _initChatAttachInput() {
     await _chatAttachUpload(currentCid, input.files);
     input.value = '';
   });
+  _bindChatPasteAttach('chat-input', () => currentCid);
   btn.dataset.bound = '1';
 }
 
-// 总指挥 (new-chat) tab 的 "+" 按钮走同一套上传链路，只是传 DRAFT_CID 而不
-// 是某个会话的 cid。用户点发送后 handleNewChatSubmit 会调 adopt 把整个
-// `main_chat/` 目录改名成新会话的 cid，预处理缓存原地跟随无需重跑。
+// The commander (new-chat) tab's "+" button uses the same upload
+// pipeline; the only difference is that it passes DRAFT_CID instead of
+// a real conversation cid. After the user clicks send,
+// handleNewChatSubmit calls adopt to rename the whole `main_chat/`
+// directory to the freshly-minted cid; the pre-processing cache
+// follows in place and doesn't need to be rerun.
 
 function _initNewChatAttachInput() {
   const btn = document.getElementById('new-chat-attach-btn');
@@ -988,6 +1083,7 @@ function _initNewChatAttachInput() {
     await _chatAttachUpload(DRAFT_CID, input.files);
     input.value = '';
   });
+  _bindChatPasteAttach('new-chat-input', () => DRAFT_CID);
   btn.dataset.bound = '1';
 }
 
@@ -1004,6 +1100,20 @@ async function loadConversations() {
   } catch (e) {
     _convLog.error('load conversations failed', e);
   }
+}
+
+// Move a conversation to the top of the sidebar list and re-render.
+// Called whenever a non-internal message lands on a cid so the list stays
+// ordered by last activity (matches backend listConversations sort, which
+// reads <cid>.jsonl mtime on the next full reload).
+function _bumpConvToTop(cid) {
+  if (!cid || !Array.isArray(conversations) || !conversations.length) return;
+  const idx = conversations.findIndex((c) => c && c.conversation_id === cid);
+  if (idx <= 0) return;
+  const [c] = conversations.splice(idx, 1);
+  c.last_active_at = new Date().toISOString();
+  conversations.unshift(c);
+  renderConversationList();
 }
 
 function renderConversationList() {
@@ -1049,7 +1159,7 @@ function renderConversationList() {
 
 // ─── Conversation history render ───
 
-// Inline "创建智能体" entry that lives at the very end of the conversation
+// Inline "create agent" entry that lives at the very end of the conversation
 // history — visually a divider with a small button in the middle, anchored
 // to the last message. Hidden while a stream is in flight (the scroll-pin
 // spacer is present then) so it doesn't tempt the user to sediment a
@@ -1087,13 +1197,21 @@ function _ensureConvCreateAgentInline() {
   }
   const hasUserMsg = !!container.querySelector('.chat-message.user');
   const isStreaming = !!spacer;
-  // 调度过 agent 后这条入口就不再展示 —— 多 agent 流里"沉淀单一 agent"的
-  // 语义已不成立。判定：assistant 消息里出现过 _from 既非空、又非 commander
-  // 的（即真正 agent 的发言）。
-  const hasAgentMsg = Array.from(
-    container.querySelectorAll('.chat-message.assistant[data-from]'),
+  // Once any agent (other than commander / user) joins the conversation,
+  // hide the entry — in a multi-agent flow the "promote a single agent"
+  // semantic no longer holds. Either signal counts:
+  //   1) The roster contains a member with kind === 'agent' (most
+  //      authoritative — includes agents that were @-mentioned but
+  //      haven't spoken yet).
+  //   2) The DOM contains an utterance whose _from / fromActor is
+  //      non-empty and not commander/user (fallback that fires before
+  //      the member cache loads).
+  const members = _groupMembersCache.get(currentCid) || [];
+  const hasAgentMember = members.some((a) => a && a.kind === 'agent');
+  const hasAgentMsg = hasAgentMember || Array.from(
+    container.querySelectorAll('.chat-message.assistant'),
   ).some((m) => {
-    const f = m.dataset.from;
+    const f = m.dataset.from || m.dataset.fromActor;
     return f && f !== 'commander' && f !== 'user';
   });
   el.style.display = (hasUserMsg && !isStreaming && !hasAgentMsg) ? '' : 'none';
@@ -1116,14 +1234,24 @@ async function loadConversationHistory(cid) {
   container.classList.remove('has-scroll-offset');
   container.innerHTML = `<div class="empty">${escapeHtml(t('chat.loading'))}</div>`;
   _ensureCreateAgentInlineObserver();
+  // (Plan rail bind happens in onEnterConversationView — covers both this
+  // load path AND the skipLoad freshly-created-conv path.)
   try {
+    // Warm `_agentsCache` if a chat-first session never visited the agents
+    // tab — `_buildMentionRe` / `_groupActorLabel` both read it for current
+    // names. Without this, a user who lands straight in a conversation gets
+    // multi-word `@<name>` highlighting truncated to the first whitespace.
+    if (typeof loadAgents === 'function'
+        && typeof _agentsCache !== 'undefined' && !_agentsCache) {
+      try { await loadAgents(); } catch (_) { /* non-fatal */ }
+    }
     const res = await apiFetch(`/api/conversations/${cid}/history?limit=500`);
     const data = await res.json();
     if (!data.ok) throw new Error(data.error || 'load failed');
     // Members cache MUST be populated before we render history bubbles —
     // appendChatMessage calls _groupActorLabel which uses this cache to
     // resolve agent_id → name. Without the await we'd briefly show
-    // "智能体" placeholders on first paint and repaint on refresh, ugly.
+    // generic "agent" placeholders on first paint and have to repaint on refresh, which is ugly.
     await _refreshGroupMembers(cid);
     // Conversation switch: drop any stale per-actor placeholders from a
     // previous conv so they don't leak into this view (their DOM nodes
@@ -1134,7 +1262,7 @@ async function loadConversationHistory(cid) {
     }
     // Drop internal plan-step dispatch messages (commander → agent
     // hand-off). The user already saw the plan announcement; surfacing
-    // these adds noise like "@需求挖掘师 我要开发一个应用" in the user's view.
+    // these adds noise (e.g. "@<agent-name> <user request>") in the user's view.
     // The agent's visibility slice still carries them so the agent has
     // the dispatch text in its own context.
     const history = (data.history || [])
@@ -1152,7 +1280,7 @@ async function loadConversationHistory(cid) {
     }
 
     // Detect unanswered user message (e.g. after page refresh while server was processing).
-    // Only show the "思考中…" bubble if the server *really* still has this
+    // Only show the "thinking…" bubble if the server *really* still has this
     // conversation in processing state AND the work started recently — a stale
     // `processing: true` from a crashed prior run is swept on boot, but we
     // also belt-and-braces check the flag here so no flash occurs.
@@ -1171,7 +1299,7 @@ async function loadConversationHistory(cid) {
       const loadingEl = appendChatMessage({
         role: 'assistant',
         content: `<span class="chat-replying">${escapeHtml(t('chat.thinking'))}</span>`,
-        time: new Date().toISOString(),
+        time: nowIsoLocal(),
       });
       pendingConvs.set(cid, { loadingEl, needsIndicator: false });
       _updateConvSendUI(cid);
@@ -1183,7 +1311,7 @@ async function loadConversationHistory(cid) {
       // in closure and keeps dispatching deltas/final to that *specific* node
       // — so we must re-attach the original node, not mint a fresh bubble.
       // Minting a new one here (as before) stranded the stream: events kept
-      // landing on the orphaned node and the new bubble stayed at "思考中…"
+      // landing on the orphaned node and the new bubble stayed at "thinking…"
       // until stream end / polling rescue.
       const state = pendingConvs.get(cid);
       pollMsgCounts.set(cid, history.length);
@@ -1195,7 +1323,7 @@ async function loadConversationHistory(cid) {
         const loadingEl = appendChatMessage({
           role: 'assistant',
           content: `<span class="chat-replying">${escapeHtml(t('chat.thinking'))}</span>`,
-          time: new Date().toISOString(),
+          time: nowIsoLocal(),
         });
         state.loadingEl = loadingEl;
       }
@@ -1203,7 +1331,7 @@ async function loadConversationHistory(cid) {
       startPolling(cid); // ensure polling is running as backup
     }
 
-    // Re-add the inline "创建智能体" entry BEFORE scrolling so it's part of
+    // Re-add the inline "create agent" entry BEFORE scrolling so it's part of
     // scrollHeight when we jump to the bottom — otherwise the MutationObserver
     // adds it post-scroll and it ends up below the visible area.
     _ensureConvCreateAgentInline();
@@ -1249,13 +1377,14 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   // User messages carrying an `<agent-input-submission>` tag (form submit
   // replay) strip the XML tag for display — the bullet list above it
   // describes the same values, and the LLM still parses the tag from the
-  // stored raw text. Assistant messages get the defensive agent-block
-  // strip in case the backend's extractor missed a format variant (see
-  // `_stripSurvivingAgentBlocks`).
+  // stored raw text. Assistant messages get a defensive structural-block
+  // strip covering `<agent>` / `<agent-input-form>` / `<agent-input-submission>`
+  // in case the backend's extractor missed a format variant (see
+  // `_stripSurvivingStructuralBlocks` in strip-agent.js).
   let displayContent = rawContent;
   if (!isHtmlSnippet) {
     if (role === 'user') displayContent = _stripSubmissionTagForDisplay(rawContent);
-    else if (role === 'assistant') displayContent = _stripSurvivingAgentBlocks(rawContent);
+    else if (role === 'assistant') displayContent = _stripSurvivingStructuralBlocks(rawContent);
   }
   const contentHtml = isHtmlSnippet
     ? rawContent
@@ -1283,13 +1412,13 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     ? ''
     : _groupActorLabel(message._from || (message._from_label ? '' : ''))
       || message._from_label
-      || (t('chat.from_agent_unknown') || '智能体');
+      || (t('chat.from_agent_unknown') || 'Agent');
   const avatarHtml = role === 'user' ? '' : _renderActorAvatarHtml(message._from);
   const headerHtml = role === 'user'
     ? `<div class="chat-msg-header chat-msg-header-user"><span class="chat-msg-time">${formatTime(message.time || new Date().toISOString())}</span></div>`
     : `<div class="chat-msg-header">${avatarHtml}<span class="chat-msg-from">${escapeHtml(headerName)}</span><span class="chat-msg-time">${formatTime(message.time || new Date().toISOString())}</span></div>`;
   const planAnnHtml = message._plan_announcement
-    ? `<div class="chat-plan-announce">📋 ${escapeHtml(t('chat.plan_announce') || '执行计划')}</div>` : '';
+    ? `<div class="chat-plan-announce">📋 ${escapeHtml(t('chat.plan_announce') || 'Plan')}</div>` : '';
   // Below-bubble action row holds produced-file chips + created-agent chip
   // + archive button (the legacy `.chat-meta` slot). Lives OUTSIDE the
   // bubble so chips read as a footer, not as inline body content.
@@ -1302,6 +1431,14 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   if (message._msg_id) msgDiv.dataset.msgId = String(message._msg_id);
   if (message._from) msgDiv.dataset.fromActor = String(message._from);
   msgDiv.dataset.ts = String(_msTs(message.time));
+  // Stash chip-tracked produced paths on the DOM so the 引用 handler can
+  // attach them to the quote payload without plumbing message into every
+  // _attachBubbleArchiveBtn call site. Only chip-tracked files belong here
+  // (write_file / edit_file / markdown_to_pdf / html_to_pdf / generate_image);
+  // bash scratch is intentionally outside this set.
+  if (Array.isArray(message.produced) && message.produced.length) {
+    msgDiv.dataset.produced = JSON.stringify(message.produced);
+  }
   _insertByTimestamp(container, msgDiv);
   if (!isHtmlSnippet && typeof typesetMath === 'function') {
     const md = msgDiv.querySelector('.markdown-body');
@@ -1322,7 +1459,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     }
   }
   // Archive button + persisted-process block only make sense for finalised
-  // assistant replies (raw markdown, not an HTML placeholder like "思考中...").
+  // assistant replies (raw markdown, not an HTML placeholder like "thinking...").
   if (role === 'assistant' && !isHtmlSnippet) {
     if (archive) _attachBubbleArchiveBtn(msgDiv, () => rawContent);
     if (Array.isArray(message.process) && message.process.length) {
@@ -1330,7 +1467,10 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
       // trail IS the content the user already saw, hiding it behind a fold
       // makes refresh look like "everything I watched stream is gone".
       const bodyText = String(displayContent || '').trim();
-      const isAbortStub = bodyText === '（已中断）' || bodyText === '';
+      // Match both possible forms — jsonl history can carry either depending
+      // on the UI language at the time of write (i18n key `model.aborted` →
+      // '(stopped)' in en, '（已中断）' in zh).
+      const isAbortStub = bodyText === '（已中断）' || bodyText === '(stopped)' || bodyText === '';
       _renderPersistedProcess(msgDiv, message.process, { expanded: isAbortStub });
     }
   }
@@ -1393,13 +1533,14 @@ function _mountChatInputForm(host, msgDiv, message, opts) {
   });
 }
 
-// Insert a "过程信息" block above the assistant bubble content using the
-// items we stored at stream time. Collapsed by default so old threads
-// stay tidy; user can click ▶ to expand. Exception: when the bubble's
-// text body has no real reply (only "（已中断）" / empty abort placeholder
-// for a turn that never produced final text), the process trail IS the
-// content — auto-open it so refreshing doesn't appear to erase what the
-// user already watched stream in (tool calls / progress lines).
+// Insert a "process info" block above the assistant bubble content
+// using the items we stored at stream time. Collapsed by default so
+// old threads stay tidy; the user can click ▶ to expand. Exception:
+// when the bubble's text body has no real reply (only the "(stopped)"
+// abort placeholder or empty content for a turn that never produced
+// final text), the process trail IS the content — auto-open it so
+// refreshing doesn't appear to erase what the user already watched
+// stream in (tool calls / progress lines).
 function _renderPersistedProcess(msgDiv, items, { expanded = false } = {}) {
   const bubble = msgDiv.querySelector('.chat-bubble');
   if (!bubble) return;
@@ -1428,7 +1569,97 @@ function _renderPersistedProcess(msgDiv, items, { expanded = false } = {}) {
   bubble.insertBefore(details, bubble.firstChild);
 }
 
-// Attach a small "存档" button next to the time in the chat-meta row. Kept
+// ─── Quote-reply (per-cid) ───────────────────────────────────────────────
+// Feishu-style: clicking 引用 on an assistant bubble captures its text +
+// chip-tracked produced files into a per-cid payload. The payload renders as
+// a preview block above the textarea (with × to drop), survives conv switch
+// (in-memory, not localStorage — drafts are ephemeral), and is prepended as
+// a markdown blockquote when the user finally hits send. Routing reuses the
+// existing 给：picker — quote does NOT change the recipient.
+//
+// Why dataset-driven: produced[] sits on the message object during render but
+// the bubble action row only sees `msgDiv` + a getContent closure. Putting
+// produced on `msgDiv.dataset.produced` (set in appendChatMessage and the
+// stream-finalize path) lets the quote handler stay zero-arg without
+// plumbing message into every _attachBubbleArchiveBtn call site.
+//
+// `_quoteByCid` itself is declared early (above `_recipientByCid`'s neighbour
+// block) so the DOMContentLoaded init can call _renderQuotePreview before
+// this section evaluates without hitting a TDZ.
+
+function _setQuote(cid, payload) {
+  if (!cid) return;
+  if (!payload) _quoteByCid.delete(cid);
+  else _quoteByCid.set(cid, payload);
+  if (cid === currentCid) _renderQuotePreview();
+}
+function _getQuote(cid) { return cid ? _quoteByCid.get(cid) || null : null; }
+function _clearQuote(cid) { _setQuote(cid, null); }
+
+// Render (or hide) the preview block for the active cid. Idempotent — safe
+// to call on conv switch / i18n change / quote set / quote clear.
+function _renderQuotePreview() {
+  const wrap = document.getElementById('chat-quote-preview');
+  if (!wrap) return;
+  const q = _getQuote(currentCid);
+  if (!q) {
+    wrap.style.display = 'none';
+    wrap.innerHTML = '';
+    return;
+  }
+  // fromName resolved at render time (not at click time) so renames after
+  // capture flow through naturally; fall back to the click-time snapshot
+  // when the actor was deleted between capture and render.
+  const liveName = q.fromActor === 'commander'
+    ? (t('chat.from_commander') || 'Commander')
+    : _groupActorLabel(q.fromActor);
+  const fromName = liveName || q.fromName || (t('chat.from_agent_unknown') || 'Agent');
+  const trunc = String(q.text || '');
+  const fileChips = (q.produced || []).map((p) => {
+    const base = String(p || '').split(/[\\/]/).pop() || p;
+    return `<span class="chat-quote-file" title="${escapeHtml(p)}">📎 ${escapeHtml(base)}</span>`;
+  }).join('');
+  wrap.innerHTML = `
+    <div class="chat-quote-header">
+      <span class="chat-quote-from">${escapeHtml(t('chat.quote_from', { name: fromName }))}</span>
+      <button type="button" class="chat-quote-close" title="${escapeHtml(t('chat.quote_remove_title'))}">×</button>
+    </div>
+    <div class="chat-quote-body">${escapeHtml(trunc)}</div>
+    ${fileChips ? `<div class="chat-quote-files">${fileChips}</div>` : ''}
+  `;
+  wrap.style.display = '';
+  const closeBtn = wrap.querySelector('.chat-quote-close');
+  if (closeBtn) closeBtn.addEventListener('click', () => _clearQuote(currentCid));
+}
+
+// Prepend the active quote as a markdown blockquote so the receiving agent
+// sees it as inbound message body (no special parsing needed). File paths
+// land as absolute paths — same shape `produced[]` already stores; the agent
+// can `read_file('<abs>')` directly without any cwd assumptions.
+//
+// **No `引用自 @<sender>` attribution line in the persisted text.** Earlier
+// versions prefixed the block with `> **引用自 @<name>：**` for context, but
+// `bus.ts::resolveRecipients` scans the message body for `@<token>` mentions
+// (including aliases `@指挥官` / `@user`) and union-routes to every match —
+// so the attribution `@<sender>` was being parsed as a second recipient,
+// re-triggering the original agent / commander on every quote-forward. The
+// sender's name is still shown in the input-area preview (renderer-only,
+// never serialised), which is enough context for the user pressing send.
+function applyQuotePrefix(raw, target) {
+  if (target !== 'conversation') return raw;
+  const q = _getQuote(currentCid);
+  if (!q) return raw;
+  const bodyLines = String(q.text || '').split('\n').map((l) => `> ${l}`).join('\n');
+  let block = bodyLines;
+  if (Array.isArray(q.produced) && q.produced.length) {
+    const filesHead = t('chat.quote_files_label');
+    const fileLines = q.produced.map((p) => `> - \`${p}\``).join('\n');
+    block += `\n>\n> ${filesHead}\n${fileLines}`;
+  }
+  return raw ? `${block}\n\n${raw}` : block;
+}
+
+// Attach a small "archive" button next to the time in the chat-meta row. Kept
 // outside the bubble so it never overlaps bubble content. `getContent` is a
 // callback so it can return the latest text after streaming completes.
 function _attachBubbleArchiveBtn(msgDiv, getContent) {
@@ -1448,9 +1679,30 @@ function _attachBubbleArchiveBtn(msgDiv, getContent) {
   actions.innerHTML = `
     <button class="bubble-archive-btn" title="${escapeHtml(t('chat.archive_btn_title'))}">${escapeHtml(t('chat.archive_btn'))}</button>
     <button class="bubble-copy-btn" title="${escapeHtml(t('chat.copy_btn_title'))}">${escapeHtml(t('chat.copy_btn'))}</button>
+    <button class="bubble-quote-btn" title="${escapeHtml(t('chat.quote_btn_title'))}">${escapeHtml(t('chat.quote_btn'))}</button>
   `;
   const btn = actions.querySelector('.bubble-archive-btn');
   const copyBtn = actions.querySelector('.bubble-copy-btn');
+  const quoteBtn = actions.querySelector('.bubble-quote-btn');
+  quoteBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const text = typeof getContent === 'function' ? (getContent() || '') : '';
+    if (!text.trim()) return;
+    const fromActor = msgDiv.dataset.fromActor || '';
+    const msgId = msgDiv.dataset.msgId || '';
+    let produced = [];
+    try {
+      const raw = msgDiv.dataset.produced || '';
+      if (raw) produced = JSON.parse(raw);
+      if (!Array.isArray(produced)) produced = [];
+    } catch (_) { produced = []; }
+    const fromName = fromActor === 'commander'
+      ? (t('chat.from_commander') || 'Commander')
+      : (_groupActorLabel(fromActor) || '');
+    _setQuote(currentCid, { fromActor, fromName, msgId, text, produced });
+    const input = document.getElementById('chat-input');
+    if (input) { input.focus(); }
+  });
   copyBtn.addEventListener('click', async (e) => {
     e.stopPropagation();
     const text = typeof getContent === 'function' ? (getContent() || '') : '';
@@ -1545,9 +1797,11 @@ async function handleNewChatSubmit() {
     if (!data.ok) throw new Error(data.error || t('chat.create_conv_failed'));
     const conv = data.conversation;
     convId = conv.conversation_id;
-    // Optimistic title from the user-visible text (raw, not the transformed form)
-    const optimistic = raw.replace(/\s+/g, ' ').trim();
-    conv.title = optimistic.length > 40 ? optimistic.slice(0, 40) + '…' : optimistic;
+    // Optimistic title from the user-visible text (raw, not the transformed form).
+    // Use the shared `_autoTitle` so this matches backend `autoTitle` —
+    // otherwise the optimistic + backend-refreshed titles disagree and
+    // the sidebar entry flips on the next loadConversations.
+    conv.title = _autoTitle(raw);
     conversations.unshift(conv);
     renderConversationList();
   } catch (e) {
@@ -1586,6 +1840,16 @@ async function handleNewChatSubmit() {
 
   input.value = '';
   autoGrow(input, 260);
+  // Also clear the conversation-view input. setView with skipLoad:true
+  // bypasses _restoreDraft, so without this the new conv would inherit
+  // whatever draft text the previously-active conversation left behind in
+  // #chat-input — and the next keystroke would save that stale text under
+  // the new cid's draft key.
+  const chatInput = document.getElementById('chat-input');
+  if (chatInput) {
+    chatInput.value = '';
+    autoGrow(chatInput, 200);
+  }
   setView('conversation', convId, { skipLoad: true });
   // Carry the new-chat recipient pick into the new conv's per-cid state so
   // the chip stays "@<agent>" instead of snapping back to commander.
@@ -1598,7 +1862,10 @@ async function handleNewChatSubmit() {
 async function handleChatSubmit() {
   const input = document.getElementById('chat-input');
   const raw = (input.value || '').trim();
-  if (!raw || !currentCid) return;
+  if (!currentCid) return;
+  // A bare quote with no extra text is a legitimate "look at this" forward;
+  // only reject when both the textarea AND the quote are empty.
+  if (!raw && !_getQuote(currentCid)) return;
   if (!ensureModelConfigured()) return;
   const cid = currentCid;
   const skill = _chatSkill['conversation'] || '';
@@ -1613,19 +1880,26 @@ async function handleChatSubmit() {
   // If this conversation is already streaming OR has queued items waiting,
   // enqueue the new message instead of sending it now. Keep the raw text +
   // skill so the prefix is applied fresh when it's actually sent.
+  // Quote is baked into the queued content here (rather than carried as a
+  // sidecar field on the queue entry) — by the time the queue dispatches,
+  // the user may have already cleared/replaced the quote in the preview;
+  // capture-at-enqueue keeps each queued message tied to the quote that was
+  // visible when the user pressed send.
   if (isConvPending(cid) || (messageQueues.get(cid) || []).length) {
     if (attachments.length) {
       await uiAlert(t('chat.attach_queue_blocked'));
       return;
     }
-    enqueueMessage(cid, raw, skill);
+    enqueueMessage(cid, applyQuotePrefix(raw, 'conversation'), skill);
+    _clearQuote(cid);
     input.value = '';
     autoGrow(input, 200);
     _clearDraft(cid);
     return;
   }
 
-  const content = applyRecipientPrefix(transformWithSkill(raw, skill), 'conversation');
+  const content = applyRecipientPrefix(applyQuotePrefix(transformWithSkill(raw, skill), 'conversation'), 'conversation');
+  _clearQuote(cid);
   input.value = '';
   autoGrow(input, 200);
   _clearDraft(cid);
@@ -1693,8 +1967,15 @@ function _makeConvChatController(cid) {
       },
       onDone(_msgEl, id) {
         // Unconditional cleanup — safe even if polling already resolved.
+        // `_finishStreamingMsg` synchronously drains the next queued
+        // message (via `_dispatchNextQueued` → new `ctrl.send`), which
+        // appends the user bubble + RE-ARMS the scroll-pin spacer for the
+        // new turn. We must NOT call `_setChatScrollOffset(false)` here —
+        // the controller finally block already removed the OLD spacer
+        // before invoking us, so a second removal would strip the spacer
+        // the new turn just added and the queued user message would render
+        // off-screen until later layout shifts pushed it into view.
         _finishStreamingMsg(id);
-        _setChatScrollOffset(false);
         // Only drop the map entry if it still refers to *this* controller.
         // On abort we dispatch the next queued message synchronously from
         // `onAbort`, which assigns a new controller into `_convChatCtrls`
@@ -1743,10 +2024,13 @@ function _setChatScrollOffset(on, containerOrId = 'chat-history') {
     spacer.className = 'chat-scroll-spacer';
     container.appendChild(spacer);
   }
-  // 只补足"让最后一条 user 消息能滚到顶部"所需的高度——视口高度减去
-  // (user 消息及其下方已有兄弟节点)。一律给一整屏会在回复尚短时留下
-  // 大片空白；这里精算所需余量，回复短时就只剩一点点空白。-24 与
-  // _scrollToMessageTop 的偏移对齐，给 floating 删除按钮留出位置。
+  // Only top up enough height to "let the last user message scroll to
+  // the top" — viewport height minus (the user message and any
+  // siblings already after it). Always reserving a full viewport leaves
+  // a big blank when the reply is short; this exact-fit calculation
+  // makes the blank shrink to almost nothing for short replies. The
+  // -24 matches _scrollToMessageTop's offset, leaving room for the
+  // floating delete button.
   const userMsgs = container.querySelectorAll(':scope > .chat-message.user');
   const lastUser = userMsgs[userMsgs.length - 1];
   let needed = container.clientHeight - 24;
@@ -1836,7 +2120,7 @@ function _createStreamingAssistantMessage(container) {
   // with a freshly-rendered one carrying the right name.
   // Header is intentionally empty until we know who's actually working.
   // The bus may route the user's `@<name>` message to commander OR an
-  // agent depending on resolution; hard-coding "指挥官" misled the user
+  // agent depending on resolution; hard-coding "commander" misled the user
   // when @-routing succeeded. Once the first state_changed event
   // identifies the in-flight actor we'll fill the chip in (see
   // _handleGroupBusEvent's state_changed branch).
@@ -1853,13 +2137,12 @@ function _createStreamingAssistantMessage(container) {
         </summary>
         <div class="stream-process-body" data-role="process"></div>
       </details>
-      <div class="stream-thinking" data-role="thinking">
-        <span class="stream-thinking-dot"></span>
-        <span class="stream-thinking-dot"></span>
-        <span class="stream-thinking-dot"></span>
-        <span class="stream-thinking-label">${escapeHtml(t('chat.thinking_short'))}</span>
-      </div>
       <div class="stream-final" data-role="final" style="display:none"></div>
+      <div class="stream-thinking" data-role="thinking" aria-label="${escapeHtml(t('chat.thinking_short'))}">
+        <span class="stream-thinking-dot"></span>
+        <span class="stream-thinking-dot"></span>
+        <span class="stream-thinking-dot"></span>
+      </div>
     </div>
   `;
   msg.dataset.placeholder = '1';
@@ -1892,7 +2175,7 @@ function _processKindOf(text) {
 }
 
 function _streamingAppendProgress(msg, text) {
-  // Keep the "思考中…" row visible alongside the process trace — hiding it
+  // Keep the "thinking…" row visible alongside the process trace — hiding it
   // while only process info shows makes long tool runs look stuck. The row
   // is cleared when the final reply (or an error) arrives.
   const container = msg.querySelector('[data-role="process-container"]');
@@ -1926,7 +2209,7 @@ function _cancelPendingStreamRaf(msg) {
 }
 
 // Paint the final reply into a streaming bubble. Caller controls whether
-// to attach the 存档 button afterwards (not all scenes want it — skill and
+// to attach the archive button afterwards (not all scenes want it — skill and
 // agent edit chats skip it by design).
 function _streamingSetFinal(msg, text, { archive = false } = {}) {
   _hideThinking(msg);
@@ -1941,7 +2224,7 @@ function _streamingSetFinal(msg, text, { archive = false } = {}) {
   // the final text for reasons unrelated to cleanliness — the safer
   // default is to always paint the final text (same DOM node, minor
   // reflow, no visible flash in practice).
-  const display = _stripSurvivingAgentBlocks(text);
+  const display = _stripSurvivingStructuralBlocks(text);
   finalEl.innerHTML = `<div class="markdown-body">${_renderMessageMarkdown(display)}</div>`;
   finalEl.style.display = '';
   msg.dataset.finalText = display || '';
@@ -1956,18 +2239,26 @@ function _streamingSetFinal(msg, text, { archive = false } = {}) {
     live.textContent = t('chat.stream_done');
   }
 
-  // Auto-collapse the process section so the finalised reply reads cleanly；
-  // 但若整轮流式从未产生过 progress 行（比如模型直接一句回答，无推理 / 工具调
-  // 用），保留起始的 display:none，不在气泡里显示空的「过程信息」起泡。
-  // **例外**：如果 final body 只是 "（已中断）" 这种无实质内容的中断占位符，
-  // 过程信息就是用户实际看到的全部输出——保持展开，否则 finalize 后视觉上
-  // 等同于"流式时看的过程都没了"（用户原话），刷新更看不到。
+  // Auto-collapse the process section so the finalised reply reads
+  // cleanly. But if the entire streaming turn never produced a progress
+  // line (e.g. the model answered in one shot with no reasoning / tool
+  // calls), keep the initial display:none so we don't render an empty
+  // "process info" bubble.
+  // **Exception**: when the final body is just an empty/abort stub
+  // (i.e. the "(stopped)" placeholder for a turn that never produced
+  // real text), the process trail IS the user-visible output — keep
+  // it expanded; otherwise the user perceives it as "the process I
+  // just watched stream is gone after finalize", which gets worse on
+  // refresh.
   const details = msg.querySelector('.stream-process');
   if (details) {
     const body = details.querySelector('.stream-process-body');
     const hasProcess = !!body && body.children.length > 0;
     const bodyText = String(display || '').trim();
-    const isAbortStub = bodyText === '（已中断）' || bodyText === '';
+    // Match both possible forms — jsonl history can carry either depending
+    // on the UI language at the time of write (i18n key `model.aborted` →
+    // '(stopped)' in en, '（已中断）' in zh).
+    const isAbortStub = bodyText === '（已中断）' || bodyText === '(stopped)' || bodyText === '';
     if (hasProcess && isAbortStub) {
       details.open = true;
       details.style.display = '';
@@ -1976,7 +2267,7 @@ function _streamingSetFinal(msg, text, { archive = false } = {}) {
       details.style.display = '';
     } else {
       details.removeAttribute('open');
-      // else: 保留 display:none（_createStreamingAssistantMessage 的初始值）
+      // else: keep display:none (the initial value set by _createStreamingAssistantMessage).
     }
   }
 }
@@ -1990,9 +2281,11 @@ function _streamingSetError(msg, text) {
     live.classList.remove('stream-process-live');
     live.textContent = (live.textContent || '').replace(/^◐ /, '◯ ') || t('chat.stream_done');
   }
-  // 出错时也要保留已累积的过程信息：若 body 非空就显示（与 _streamingSetFinal /
-  // _streamingMarkAborted 一致），不再等用户重进对话才从持久化 message.process
-  // 补画出来。
+  // On error we also preserve the accumulated process info: if the
+  // body is non-empty we display it (matching _streamingSetFinal /
+  // _streamingMarkAborted), so the user no longer has to reopen the
+  // conversation to see it backfilled from the persisted
+  // message.process.
   const details = msg.querySelector('.stream-process');
   if (details) {
     const body = details.querySelector('.stream-process-body');
@@ -2001,12 +2294,28 @@ function _streamingSetError(msg, text) {
   }
   const finalEl = msg.querySelector('[data-role="final"]');
   if (!finalEl) return;
-  finalEl.innerHTML = `<span style="color:var(--danger)">${escapeHtml(t('chat.send_failed', { msg: text }))}</span>`;
+  // Preserve any partial reply that streamed in before the error so the
+  // user keeps the assistant's in-flight prose / process info, then append
+  // the error pill underneath. Without this, mid-stream errors wipe the
+  // visible turn entirely and the user only sees the error pill.
+  const partial = String(msg.dataset.streamBuf || '');
+  let bodyHtml = '';
+  if (partial) {
+    const display = _stripSurvivingStructuralBlocks(partial);
+    if (display) {
+      bodyHtml = `<div class="markdown-body">${_renderMessageMarkdown(display)}</div>`;
+      msg.dataset.finalText = display;
+    }
+  }
+  const errPill = `<div class="msg-error" style="color:var(--danger);margin-top:6px">${escapeHtml(t('chat.send_failed', { msg: text }))}</div>`;
+  finalEl.innerHTML = bodyHtml + errPill;
   finalEl.style.display = '';
+  delete msg.dataset.streamBuf;
+  if (bodyHtml && typeof typesetMath === 'function') typesetMath(finalEl);
 }
 
 // Mark the assistant bubble as user-interrupted. Preserves whatever partial
-// content streamed into the process pane; just stamps a "已中断" note.
+// content streamed into the process pane; just stamps a "stopped" note.
 function _streamingMarkAborted(msg) {
   _hideThinking(msg);
   // Freeze any live preview line so it's not misread as still generating.
@@ -2046,8 +2355,10 @@ function _scrollToMessageTop(msgEl, containerId = 'chat-history') {
   requestAnimationFrame(() => requestAnimationFrame(() => {
     const containerRect = container.getBoundingClientRect();
     const msgRect = msgEl.getBoundingClientRect();
-    // 仅预留能让 floating 删除按钮（top:20px + ~33px 高）不贴住消息的最小
-    // 间距；留白太大时容易看到上一条消息产生干扰。24px = 贴着删除按钮底沿。
+    // Reserve only enough margin so the floating delete button
+    // (top:20px + ~33px tall) doesn't sit flush against the message;
+    // a larger blank exposes the previous message and feels noisy.
+    // 24px lines up with the bottom of the delete button.
     const offset = msgRect.top - containerRect.top + container.scrollTop - 24;
     // Force auto behavior so the jump is immediate — the CSS default of
     // scroll-behavior:smooth would otherwise animate and get interrupted by
@@ -2076,7 +2387,7 @@ function _scrollToMessageTop(msgEl, containerId = 'chat-history') {
 //   historyEndpoint(id): returns the URL for GET history
 //   clearEndpoint(id):   (optional) URL for DELETE history
 //   features: {
-//     archive:    bool  // attach 存档 button on final
+//     archive:    bool  // attach archive button on final
 //     scrollPin:  bool  // pin newly-sent user message to top of viewport
 //   }
 //   hooks: {
@@ -2388,7 +2699,12 @@ function createChatController(config) {
       {
         role: 'user',
         content,
-        time: new Date().toISOString(),
+        // Match server's `nowIso()` format (local-time, second-precision).
+        // Using `new Date().toISOString()` here would ms-bump the user
+        // bubble past the server-stamped agent reply within the same
+        // second and `_insertByTimestamp` would render the agent's
+        // reply before the user message.
+        time: nowIsoLocal(),
         ...(attachmentsForBubble ? { attachments: attachmentsForBubble } : {}),
       },
       false,
@@ -2399,10 +2715,13 @@ function createChatController(config) {
     const msgEl = _createStreamingAssistantMessage(historyEl);
     if (hooks.onAssistantStart) hooks.onAssistantStart(msgEl, id);
 
-    // 发送时把用户消息顶到可视区顶部就行；流式过程中和结束后都不要再主动
-    // 滚动，否则会把用户中途上滑查看的位置强行拽回初始位置。
-    // 配合 `has-scroll-offset` 预留 100vh 底部空间，保证短消息也能滚到顶部；
-    // 由 controller 统一负责开关，避免各 scene 各自抄一份。
+    // On send, pin the user's message to the top of the viewport once;
+    // do NOT scroll during or after streaming — that would yank a user
+    // who scrolled up mid-stream back to the initial position.
+    // Paired with `has-scroll-offset` reserving 100vh of bottom
+    // space so even short messages can be scrolled to the top; the
+    // controller is responsible for toggling it so each scene doesn't
+    // copy-paste the same logic.
     if (features.scrollPin) {
       _setChatScrollOffset(true, historyEl);
       _scrollToMessageTop(userMsgEl, historyEl.id);
@@ -2439,7 +2758,7 @@ function createChatController(config) {
           try {
             const ev = JSON.parse(dataLines.join('\n'));
             // Post-abort events can still arrive while main's for-await drains
-            // its buffer — drop them so the bubble stays frozen at "已中断"
+            // its buffer — drop them so the bubble stays frozen at the "stopped" state
             // instead of accumulating more deltas / a final reply behind it.
             if (pending?.aborted) continue;
             _handleStreamEvent(id, msgEl, ev, { archive: features.archive });
@@ -2468,7 +2787,8 @@ function createChatController(config) {
       _updateSendUI();
       if (features.scrollPin) _setChatScrollOffset(false, historyEl);
       if (hooks.onDone) hooks.onDone(msgEl, id, { aborted: wasAborted, errored: wasErrored });
-      // 不再在流式结束时 re-pin — 尊重用户中途上滑后的阅读位置。
+      // No re-pin at stream end — respect the user's scroll position
+      // if they scrolled up mid-stream.
       // Drain one queued message if any, matching main-chat behaviour.
       if (features.queue) _qDispatchNext();
     }
@@ -2480,7 +2800,7 @@ function createChatController(config) {
     try { pending.controller.abort(); } catch (_) {}
     // Main's for-await loop only checks `cancelled` between yields, so it
     // can take a while to emit `done` — that means _streamingMarkAborted
-    // (called from the catch block) runs late and the "思考中…" row stays
+    // (called from the catch block) runs late and the "thinking…" row stays
     // visible. Mark the bubble now so the UI terminates on click, and rely
     // on reader-loop gating (pending.aborted) to drop any stragglers.
     if (pending.msgEl) {
@@ -2540,8 +2860,11 @@ function createChatController(config) {
     if (inputEl && !inputEl.dataset.ctrlBound) {
       inputEl.dataset.ctrlBound = '1';
       inputEl.addEventListener('keydown', (e) => {
-        // Enter sends; Shift+Enter newline; Ctrl/Cmd+Enter also sends. Skip IME.
-        if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+        // Enter sends; Shift+Enter newline; Ctrl/Cmd+Enter also sends. Skip IME
+        // (CLAUDE.md §8 — keyCode 229 catches older Electron / Safari builds
+        // where `isComposing` is occasionally inaccurate).
+        if (e.isComposing || e.keyCode === 229) return;
+        if (e.key === 'Enter' && !e.shiftKey) {
           e.preventDefault();
           _submitFromInput();
         }
@@ -2616,8 +2939,8 @@ function _setPlaceholderActor(ph, actorId) {
   const chip = ph.querySelector('[data-role="from-chip"]');
   if (chip && !chip.textContent) {
     const label = actorId === 'commander'
-      ? (t('chat.from_commander') || '指挥官')
-      : (_groupActorLabel(actorId) || (t('chat.from_agent_unknown') || '智能体'));
+      ? (t('chat.from_commander') || 'Commander')
+      : (_groupActorLabel(actorId) || (t('chat.from_agent_unknown') || 'Agent'));
     chip.textContent = label;
   }
   const avatarSlot = ph.querySelector('[data-role="from-avatar"]');
@@ -2706,7 +3029,7 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
     if (bubble && !bubble.querySelector('.chat-plan-announce')) {
       const lbl = document.createElement('div');
       lbl.className = 'chat-plan-announce';
-      lbl.textContent = `📋 ${t('chat.plan_announce') || '执行计划'}`;
+      lbl.textContent = `📋 ${t('chat.plan_announce') || 'Plan'}`;
       bubble.insertBefore(lbl, bubble.firstChild);
     }
   }
@@ -2740,6 +3063,10 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
         _hydrateMessageProducedChips(ph);
       }
     }
+    // Mirror dataset.produced so the 引用 button can read it (same contract
+    // as appendChatMessage above; without this, post-stream finalize would
+    // leave the chip row in place but the quote payload would carry no files).
+    ph.dataset.produced = JSON.stringify(gm.produced);
   }
 
   // Created-agent chip (commander quick-create) — same actions row.
@@ -2772,6 +3099,14 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
 //   { type: 'aborted', cid }
 function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {}) {
   if (!evData || typeof evData !== 'object') return;
+  // Bump the conv to the top of the sidebar list whenever a user-visible
+  // message lands — applies to both currently-viewed and background convs,
+  // so the sidebar stays ordered by last activity in real time. Skip
+  // internal commander→agent dispatch records (they're not visible in the
+  // user's view; visible end-of-turn replies will bump shortly after).
+  if (evData.type === 'message' && evData.msg && !evData.msg.dispatch) {
+    _bumpConvToTop(cid);
+  }
   // Cross-cid leakage guard: per-cid controllers stay alive when the user
   // navigates away mid-stream (a legit pattern — let the conv finish in
   // the background, sidebar badge tracks completion). But all cids share
@@ -2885,6 +3220,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     // when an interactive agent's step enters in_progress, the user's next
     // reply should default to that agent without them having to @-mention.
     _evaluateAutoRecipient(cid);
+    if (window.PlanRail) window.PlanRail.refresh(cid);
   } else if (evData.type === 'state_changed') {
     // Each in_flight actor gets a placeholder so its delta tokens / tool
     // calls render in its own bubble even before its `message` arrives.
@@ -2904,6 +3240,11 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     // the auto-target so the chip matches the current dispatch state even
     // when a plan_changed event was missed (e.g. on first connect).
     _evaluateAutoRecipient(cid);
+    // Plan rail hides retry/skip/abort buttons whenever any worker is in
+    // flight (avoids racing user actions against an in-progress turn).
+    if (window.PlanRail) {
+      window.PlanRail.setInFlight(cid, Array.isArray(st.in_flight) ? st.in_flight : []);
+    }
   } else if (evData.type === 'aborted') {
     // Only drop EMPTY placeholders here (queued-but-not-yet-running workers
     // whose queue got cleared by bus.abort never fire runTurn → no follow-up
@@ -2949,7 +3290,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
         const hasProcess = !!processBody && processBody.children.length > 0;
         if (hasProcess) {
           // Freeze the bubble: hide thinking dots, leave process rail as
-          // a folded "已完成思考" bubble. Empty final body = no main text.
+          // a folded "completed thinking" bubble. Empty final body = no main text.
           if (typeof _streamingSetFinal === 'function') {
             _streamingSetFinal(ph, '', { archive: false });
           }
@@ -2967,7 +3308,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
   }
 }
 
-// Append the "查看详情" chip into a streaming bubble. Idempotent: duplicate
+// Append the "view details" chip into a streaming bubble. Idempotent: duplicate
 // calls (relay event + final-event payload) are de-duped by checking for an
 // existing `.chat-msg-created-agent` child.
 function _mountCreatedAgentChip(msg, payload) {
@@ -3001,46 +3342,24 @@ function _mountCreatedAgentChip(msg, payload) {
 // bulleted summary above it already tells them what they confirmed.
 function _stripSubmissionTagForDisplay(text) {
   if (!text || text.indexOf('<agent-input-submission') < 0) return text;
-  return text
-    .replace(/\n*<agent-input-submission\b[^>]*>[\s\S]*?<\/agent-input-submission>\s*/gi, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trimEnd();
+  // Atomic-container strip with prose/code guard via strip-agent.js.
+  // Same class of fragmentation / set-B leak as `<agent>` — see that
+  // file's header for the invariant matrix.
+  const out = _stripOuterTagBlocks(text, 'agent-input-submission');
+  if (out === text) return text;
+  return out.replace(/\n{3,}/g, '\n\n').trimEnd();
 }
 
-// Collapse any ```agent-input-form fenced block in a streaming buffer to a
-// single-line placeholder so the user never sees the raw JSON being typed
-// char-by-char. Closed blocks get the placeholder inline; unclosed blocks
-// (we're still mid-stream inside one) get everything from the fence onward
-// replaced with the placeholder. When `final` arrives main has already
-// stripped the block and mounts the real form widget.
-// Final-time safety strip: drop any surviving `<agent>...</agent>` update
-// container from a message body entirely (no placeholder) before it's
-// rendered into the bubble. Used by `_streamingSetFinal` and the
-// persisted-message renderer to guard against (a) backend extractor missing
-// a format variant and (b) streaming-time placeholders accidentally sticking
-// around. Both closed and unclosed containers get removed; consecutive blank
-// lines collapse to one.
-function _stripSurvivingAgentBlocks(text) {
-  if (!text || text.indexOf('<agent>') < 0) return text;
-  return text
-    .replace(/<agent>[\s\S]*?<\/agent>/g, '')
-    .replace(/<agent>[\s\S]*$/, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-// Collapse the `<agent>...</agent>` update container (closed or mid-stream)
-// in a streaming buffer into **exactly one** italicized placeholder — so the
-// user never sees raw XML-ish tags / workflow JSON / inputs JSON typed
-// char-by-char. Container layout (see `chat_agent_setup.md` / `chat_commander.md`
-// § 创建智能体) is `<agent>...children...</agent>`; the whole container is
-// one unit, so we just replace the closed form with a placeholder and collapse
-// any unclosed trailing container the same way. `_streamingSetFinal` strips
-// the container for real at final time, so no placeholder survives.
+// `_splitMarkdownProseCode`, `_findOuterAgentRanges`, `_stripSurvivingAgentBlocks`,
+// `_replaceOuterAgentBlocks` are defined in `./strip-agent.js` (loaded earlier
+// in `index.html`). They live in their own file so vitest can pin the set-A /
+// set-B fixtures (`test/renderer/strip-agent.test.ts`) — see that file for
+// the invariant matrix. Wrap the i18n-aware placeholder here and delegate.
+//
 // Wrap placeholder text in an HTML `<em>` instead of markdown `_text_`:
 // standard markdown requires word-boundary chars on each side of `_` for
 // italic emphasis, and CJK glyphs don't count as word boundaries, so
-// `_中文占位_` renders with the underscores visible. `<em>` passes through
+// `_<CJK placeholder>_` renders with the underscores visible. `<em>` passes through
 // renderMarkdownFull as-is (HTML inline tags are preserved by the markdown
 // pipeline) and actually italicises the CJK text.
 function _streamPlaceholderHtml(key) {
@@ -3048,11 +3367,22 @@ function _streamPlaceholderHtml(key) {
 }
 
 function _stripAgentCreateBlocksForStream(buf) {
-  if (!buf || buf.indexOf('<agent>') < 0) return buf;
-  const placeholder = _streamPlaceholderHtml('chat.create_agent_streaming_placeholder');
-  let out = buf.replace(/<agent>[\s\S]*?<\/agent>/g, placeholder);
-  out = out.replace(/<agent>[\s\S]*$/, placeholder);
-  return out;
+  return _replaceOuterAgentBlocks(buf, _streamPlaceholderHtml('chat.create_agent_streaming_placeholder'));
+}
+
+// `<<<skill-file path=X ... >>>` blocks (skill edit chat). Different fence
+// shape from `<agent>` (see strip-agent.js header) but same user-facing
+// contract: streaming placeholder hides the raw block + reveals the file
+// being written. The path attribute (when present) flows into the
+// localised "Writing X…" label so the placeholder is informative;
+// unattributed blocks fall back to a generic "Writing file…" label.
+function _stripSkillFileBlocksForStream(buf) {
+  return _replaceOuterSkillFileBlocks(buf, (path) => {
+    const label = path
+      ? t('chat.skill_file_streaming_placeholder', { path })
+      : t('chat.skill_file_streaming_placeholder_unknown');
+    return `\n<em class="stream-placeholder">${escapeHtml(label)}</em>\n`;
+  });
 }
 
 function _stripAgentFormBlockForStream(buf) {
@@ -3060,22 +3390,19 @@ function _stripAgentFormBlockForStream(buf) {
   // with submission reply tag, token-stable). Legacy: fenced
   // ```agent-input-form block — tolerated with `[\s\-]*` inside the
   // header to also catch "```agent\n-input-form" token-split outputs.
-  // Both are stripped to the same streaming placeholder; main's final
-  // pass mounts the actual form widget.
+  // Both stream to the same placeholder; main's final pass mounts the
+  // actual form widget.
   if (!buf) return buf;
-  const hasXml = buf.indexOf('<agent-input-form>') >= 0;
-  const hasLegacy = /```\s*agent[\s\-]*input[\s\-]*form/.test(buf);
-  if (!hasXml && !hasLegacy) return buf;
   const placeholder = _streamPlaceholderHtml('chat.form.streaming_placeholder');
-  let out = buf;
-  if (hasXml) {
-    out = out.replace(
-      /(?:^|\n)[ \t]*<agent-input-form>[ \t]*\r?\n[\s\S]*?\r?\n[ \t]*<\/agent-input-form>[ \t]*(?=\n|$)/g,
-      placeholder,
-    );
-    out = out.replace(/(?:^|\n)[ \t]*<agent-input-form>[\s\S]*$/, placeholder);
-  }
-  if (hasLegacy) {
+  // XML branch: atomic-container handling via strip-agent.js — same
+  // prose/code guard as `<agent>` so a fenced ```xml example or inline
+  // backtick mention of `<agent-input-form>` survives instead of being
+  // eaten as a real form.
+  let out = _replaceOuterTagBlocks(buf, 'agent-input-form', placeholder);
+  // Legacy fenced-block branch — kept for old-protocol compatibility.
+  // No prose/code guard here: the legacy fence IS itself a code fence,
+  // and outer fenced quoting of legacy form blocks is implausible.
+  if (/```\s*agent[\s\-]*input[\s\-]*form/.test(out)) {
     out = out.replace(
       /(?:^|\n)```\s*agent[\s\-]*input[\s\-]*form[ \t]*\r?\n[\s\S]*?\n```(?=\n|$)/g,
       placeholder,
@@ -3086,9 +3413,13 @@ function _stripAgentFormBlockForStream(buf) {
 }
 
 // Progressive renderer — append an assistant text delta into the final
-// bubble and re-render markdown. The first delta hides the "思考中" row and
-// reveals the `[data-role=final]` container. `_streamingSetFinal` is still
-// called at the terminal `final` event to guarantee a clean final render.
+// bubble and re-render markdown. The first delta reveals the `[data-role=final]`
+// container; the "thinking" row stays visible BELOW the body until the terminal
+// `final` / error / aborted event lands (so the user sees "partial reply +
+// still typing" instead of "partial reply + nothing happening"; the row is
+// rendered after `.stream-final` in `_createStreamingAssistantMessage`).
+// `_streamingSetFinal` is still called at the terminal `final` event to
+// guarantee a clean final render.
 //
 // Render throttling: every delta accumulates into `dataset.streamBuf`
 // synchronously, but the actual `renderMarkdownFull` + DOM swap only runs
@@ -3100,7 +3431,6 @@ function _stripAgentFormBlockForStream(buf) {
 // reader loop stays cheap and the browser paints between frames.
 function _streamingAppendFinalDelta(msg, piece) {
   if (!piece) return;
-  _hideThinking(msg);
   const finalEl = msg.querySelector('[data-role="final"]');
   if (!finalEl) return;
   const prev = msg.dataset.streamBuf || '';
@@ -3114,7 +3444,11 @@ function _streamingAppendFinalDelta(msg, piece) {
     msg._streamRafScheduled = false;
     msg._streamRafHandle = null;
     const buf = msg.dataset.streamBuf || '';
-    const display = _stripAgentCreateBlocksForStream(_stripAgentFormBlockForStream(buf));
+    const display = _stripAgentCreateBlocksForStream(
+      _stripAgentFormBlockForStream(
+        _stripSkillFileBlocksForStream(buf),
+      ),
+    );
     finalEl.innerHTML = `<div class="markdown-body">${_renderMessageMarkdown(display)}</div>`;
   };
   if (typeof requestAnimationFrame === 'function') {
@@ -3132,13 +3466,13 @@ function _streamingAppendFinalDelta(msg, piece) {
 // Icon palette (Unicode Geometric Shapes per CLAUDE.md §8). Each glyph has
 // exactly one semantic role — stick to this table when adding new streams:
 //
-//   ▶   推理开始          ●   推理完成
-//   ◆   思考              ◇   回复（最终）
-//   ◐   正在生成（live）
-//   ■   工具调用          ▣   计划
-//   ▷   命令输出          ◉   文件改动
-//   ○   等待确认          ◯   错误
-//   ▪   其他/兜底
+//   ▶   reasoning start      ●   reasoning done
+//   ◆   thinking              ◇   reply (final)
+//   ◐   generating (live)
+//   ■   tool call             ▣   plan
+//   ▷   command output        ◉   file change
+//   ○   awaiting confirmation ◯   error
+//   ▪   other / fallback
 function _formatEventLine(evt) {
   if (!evt || typeof evt !== 'object') return null;
   const { stream, data } = evt;
@@ -3276,7 +3610,7 @@ function _renderAgentEvent(msg, evt) {
 // Used for streaming text (assistant deltas) that grows over time.
 function _streamingUpdateLive(msg, prefix, text, appendDelta) {
   // Assistant deltas are still "in progress" from the user's perspective —
-  // leave the 思考中 row alone; it's cleared by _streamingSetFinal.
+  // leave the "thinking" row alone; it's cleared by _streamingSetFinal.
   const container = msg.querySelector('[data-role="process-container"]');
   if (container) container.style.display = '';
   const body = msg.querySelector('[data-role="process"]');
@@ -3421,7 +3755,7 @@ function _updateConvSidebarBadge(cid, _unused) {
   item.querySelector('.conv-status-badge')?.remove();
   // Treat aborted-but-still-draining as not streaming. `pendingConvs` only
   // clears when main emits `done`, which can trail the stop click; until then
-  // the bubble already shows "已中断" so the streaming badge would lie.
+  // the bubble already shows the "stopped" state so the streaming badge would lie.
   const state = pendingConvs.get(cid);
   const pending = !!state && !state.aborted;
   // Use _getQueue so a queue persisted in localStorage is picked up even if
@@ -3437,7 +3771,7 @@ function _updateConvSidebarBadge(cid, _unused) {
   let html = '';
   if (pending) {
     html += '<span class="conv-status-dot"></span>';
-    // html += '<span class="conv-status-text">回复中</span>';
+    // html += '<span class="conv-status-text">replying</span>';
     if (queued > 0) html += `<span class="conv-status-count">+${queued}</span>`;
   } else {
     html += `<span class="conv-status-text">${escapeHtml(t('chat.status.pending_short'))}</span>`;

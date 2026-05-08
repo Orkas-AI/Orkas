@@ -32,6 +32,7 @@ import {
   type PlanFile, type PlanStep, type FailurePolicy,
 } from './plan';
 import type { ChatFormPayload } from './router';
+import { buildMention } from './router';
 
 /** Per-cid mutex guarding plan-state transitions. Without this, when N
  * parallel-group agents finish nearly simultaneously, their reconcile
@@ -54,6 +55,42 @@ const log = createLogger('group_chat.plan_executor');
 
 const COMMANDER_ALIASES = new Set(['commander', '指挥官']);
 const USER_ALIASES = new Set(['user', '用户']);
+
+/** Plan-level safety net for transient failures. core-agent's runner already
+ *  has its own `maxRetries=3` exponential-backoff retry inside a single
+ *  stream call; this kicks in only AFTER that bubbles up — i.e. the network
+ *  was down long enough that even the inner retries failed. We then fold
+ *  the step back to `pending` so reconcile re-dispatches the whole turn
+ *  (fresh stream, fresh provider connection). Capped to avoid infinite
+ *  loops when the user is just genuinely offline.
+ *
+ *  IMPORTANT — never include `aborted` or `cancelled` in this pattern:
+ *  user-initiated abort must not be silently retried; the literal string
+ *  `'aborted by user'` is also explicitly excluded by the guard. */
+const TRANSIENT_ERR_PATTERNS = /\b(terminated|fetch failed|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|socket hang up|EPIPE|network error|Connection closed)\b/i;
+const MAX_TRANSIENT_RETRIES = 2;
+
+/** Returns true when `reason` matches a transient network-error pattern AND
+ *  this step still has plan-level retry budget. Caller should bail out
+ *  (return early) — we've already flipped the step back to `pending` so the
+ *  next reconcile will redispatch. */
+async function maybeRetryTransient(
+  uid: string, cid: string, step: PlanStep, reason: string,
+): Promise<boolean> {
+  if (!reason) return false;
+  if (reason === 'aborted by user') return false;
+  if (!TRANSIENT_ERR_PATTERNS.test(reason)) return false;
+  const attempts = step.transient_attempts ?? 0;
+  if (attempts >= MAX_TRANSIENT_RETRIES) return false;
+  await updateStep(uid, cid, step.index, 'pending', {
+    transient_attempts: attempts + 1,
+    failure_reason: '',
+    output_msg_id: '',
+  });
+  log.info(`plan-step transient-retry cid=${cid} step=${step.index} attempts=${attempts + 1}/${MAX_TRANSIENT_RETRIES} reason=${reason}`);
+  _hooks!.emitPlanChanged(uid, cid);
+  return true;
+}
 
 // ── Public API ───────────────────────────────────────────────────────────
 
@@ -85,9 +122,12 @@ export interface TurnFinishedEvent {
   form?: ChatFormPayload;
   /** Files written via local-exec tools during this turn. */
   produced: string[];
-  /** Quick-create agent meta extracted from `<agent>...</agent>` (commander
-   * only). When present, executor records but doesn't drive on it. */
-  createdAgent?: { agent_id: string; name: string };
+  /** Agent created or updated from `<agent>...</agent>` (commander only).
+   * `kind: 'created'` is the original quick-create flow; `kind: 'updated'`
+   * means an existing custom agent was patched in place — same chip slot,
+   * different label on the renderer side. Executor records but doesn't
+   * drive on it. */
+  createdAgent?: { agent_id: string; name: string; kind: 'created' | 'updated' };
   /** What kind of trigger caused this turn. Drives the state transition. */
   trigger: TurnTrigger;
   /** Number of non-error, non-final, non-done events the LLM stream emitted.
@@ -106,7 +146,7 @@ export interface TurnFinishedEvent {
  *   turn produces no user-visible output.
  */
 export type TurnOutcome =
-  | { kind: 'persist'; text: string; form?: ChatFormPayload; produced?: string[]; createdAgent?: { agent_id: string; name: string } }
+  | { kind: 'persist'; text: string; form?: ChatFormPayload; produced?: string[]; createdAgent?: { agent_id: string; name: string; kind: 'created' | 'updated' } }
   | { kind: 'silent' };
 
 export interface ReconcileCtx {
@@ -223,19 +263,25 @@ function outcomeForSynthTurn(evt: TurnFinishedEvent): TurnOutcome {
   if (evt.aborted) {
     return abortOutcome(evt);
   }
-  if (evt.errText) {
-    return { kind: 'persist', text: errorBubble(evt.errText) };
-  }
   if (evt.finalText && evt.finalText.trim()) {
+    // Keep the partial reply and append the error pill underneath when
+    // the stream errored mid-turn — otherwise the user loses everything
+    // the model already produced and only sees the error.
+    const body = evt.errText
+      ? `${evt.finalText}\n\n${errorBubble(evt.errText)}`
+      : evt.finalText;
     return {
       kind: 'persist',
-      text: evt.finalText,
+      text: body,
       ...(evt.produced.length ? { produced: evt.produced } : {}),
     };
   }
+  if (evt.errText) {
+    return { kind: 'persist', text: errorBubble(evt.errText) };
+  }
   // Empty final on a synth turn = user gets a placeholder so they at least
   // see "the plan finished but I had nothing more to add".
-  return { kind: 'persist', text: '（无回复）' };
+  return { kind: 'persist', text: '(no reply)' };
 }
 
 /** User-direct (or non-plan) turn outcome decision.
@@ -254,7 +300,7 @@ function outcomeForSynthTurn(evt: TurnFinishedEvent): TurnOutcome {
  * user sees nothing after their message lands. Real config / auth errors
  * still surface as an errorBubble.
  *
- * agent empty-final → always persist '（无回复）'.
+ * agent empty-final → always persist '(no reply)'.
  */
 async function outcomeForUserDirectTurn(uid: string, cid: string, evt: TurnFinishedEvent): Promise<TurnOutcome> {
   // Form-pause unblock: if this agent has a blocked step, treat THIS turn
@@ -283,13 +329,20 @@ async function outcomeForUserDirectTurn(uid: string, cid: string, evt: TurnFinis
   // case: agent emits ONLY an `agent-input-form` fenced block — bus's
   // form extraction strips the block, leaving finalText empty. Without
   // checking these signals first we'd fall through to the "agent empty"
-  // branch below and replace the actor's form with "（无回复）", losing
+  // branch below and replace the actor's form with "(no reply)", losing
   // the form widget entirely (the user-reported bug).
   const hasSideEffect = !!evt.form || !!evt.createdAgent || (evt.produced && evt.produced.length > 0);
   if ((evt.finalText && evt.finalText.trim()) || hasSideEffect) {
+    // When the stream errored mid-turn but partial text / side effects
+    // already landed, append the error pill instead of dropping the
+    // partial — same intent as outcomeForSynthTurn's branch above.
+    const partial = evt.finalText || '';
+    const body = evt.errText
+      ? (partial ? `${partial}\n\n${errorBubble(evt.errText)}` : errorBubble(evt.errText))
+      : partial;
     return {
       kind: 'persist',
-      text: evt.finalText || '',
+      text: body,
       ...(evt.form ? { form: evt.form } : {}),
       ...(evt.produced.length ? { produced: evt.produced } : {}),
       ...(evt.createdAgent ? { createdAgent: evt.createdAgent } : {}),
@@ -308,7 +361,7 @@ async function outcomeForUserDirectTurn(uid: string, cid: string, evt: TurnFinis
   }
   // agent empty + no side effects.
   if (evt.errText) return { kind: 'persist', text: errorBubble(evt.errText) };
-  return { kind: 'persist', text: '（无回复）' };
+  return { kind: 'persist', text: '(no reply)' };
 }
 
 /** Plan-step turn — apply state transition + return outcome for bus. */
@@ -327,7 +380,7 @@ async function applyPlanStepTurn(
   // the partial reply bus accumulated from delta events); if there's nothing
   // to salvage AND no side effect, go silent so the renderer's turn_silent
   // handler can either freeze the process rail as a "thinking trail" bubble
-  // or remove the placeholder entirely. Avoids the orphan "（已中断）" bubble
+  // or remove the placeholder entirely. Avoids the orphan "(stopped)" bubble
   // for turns that aborted before producing anything visible.
   if (evt.aborted) {
     await transitionStepFailed(uid, cid, step, 'aborted by user', '');
@@ -381,7 +434,7 @@ async function applyPlanStepTurn(
     if (evt.actor.kind === 'commander') return { kind: 'silent' };
     // agent empty: persist placeholder, mark done so plan can advance.
     await transitionStepDone(uid, cid, step, '', evt.produced, '');
-    return { kind: 'persist', text: '（无回复）' };
+    return { kind: 'persist', text: '(no reply)' };
   }
 
   // Normal success.
@@ -401,6 +454,7 @@ async function transitionStepDone(
     output_summary: summary,
     output_files: files,
     output_msg_id: outputMsgId,
+    transient_attempts: 0,
   });
   _hooks!.emitPlanChanged(uid, cid);
   log.info(`plan-step done cid=${cid} step=${step.index} assignee=${step.assignee}`);
@@ -409,6 +463,7 @@ async function transitionStepDone(
 async function transitionStepFailed(
   uid: string, cid: string, step: PlanStep, reason: string, outputMsgId: string,
 ): Promise<void> {
+  if (await maybeRetryTransient(uid, cid, step, reason)) return;
   const policy: FailurePolicy = step.on_failure || 'ask_commander';
   if (policy === 'continue') {
     await updateStep(uid, cid, step.index, 'skipped', {
@@ -442,8 +497,10 @@ async function transitionStepFailed(
   _hooks!.emitPlanChanged(uid, cid);
 }
 
-/** Fired after a step transition to dispatch downstream + check terminal. */
-async function reconcileAfterStepTransition(uid: string, cid: string): Promise<void> {
+/** Fired after a step transition to dispatch downstream + check terminal.
+ *  Exported so user-driven recovery actions (`retryStep` / `skipStep`) can
+ *  reuse the exact same dispatch path the bus uses internally. */
+export async function reconcileAfterStepTransition(uid: string, cid: string): Promise<void> {
   const plan = await readPlan(uid, cid);
   if (!plan?.steps?.length) return;
   await dispatchReady(uid, cid, plan);
@@ -458,7 +515,7 @@ function errorBubble(msg: string): string {
 }
 
 /** Outcome for an aborted turn. Returns the salvageable content (partial
- * streamed reply + any user-visible side effects), with NO "（已中断）"
+ * streamed reply + any user-visible side effects), with NO "(stopped)"
  * suffix — bus appends that once, after merging in any staged plan
  * announcement, so the marker always lands at the end regardless of which
  * pieces survived.
@@ -466,7 +523,7 @@ function errorBubble(msg: string): string {
  * No salvageable content AND no side effect → silent. The renderer's
  * `turn_silent` handler then either freezes the process rail (tool calls
  * etc.) as a thinking-trail bubble or removes the placeholder entirely.
- * Skipping the persist here is what prevents the orphan "（已中断）" bubble
+ * Skipping the persist here is what prevents the orphan "(stopped)" bubble
  * for turns that aborted before producing anything visible.
  */
 function abortOutcome(evt: TurnFinishedEvent): TurnOutcome {
@@ -488,6 +545,84 @@ function escapeHtmlForBubble(s: string): string {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+/** User-initiated recovery for a `failed` step. Sets the step back to
+ *  `pending`, clears `failure_reason` and resets `transient_attempts`,
+ *  then unblocks any downstream steps that were cascade-skipped specifically
+ *  because of THIS step's failure (under `abort_plan` policy). Finally calls
+ *  the same `reconcileAfterStepTransition` the bus uses internally so
+ *  redispatch goes through one path.
+ *
+ *  IMPORTANT — never enqueues directly. The single dispatch primitive remains
+ *  `bus.enqueue`, and we reach it only via `reconcileAfterStepTransition →
+ *  dispatchReady → enqueue`. */
+export async function retryStep(
+  uid: string, cid: string, stepIndex: number,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!_hooks) return { ok: false, error: 'executor not bound' };
+  return _planLock(uid, cid).runExclusive(async () => {
+    const plan = await readPlan(uid, cid);
+    if (!plan) return { ok: false, error: 'no plan' };
+    const step = plan.steps.find((s) => s.index === stepIndex);
+    if (!step) return { ok: false, error: 'step not found' };
+    if (step.status !== 'failed') {
+      return { ok: false, error: `step is not in failed state (current: ${step.status})` };
+    }
+    await updateStep(uid, cid, stepIndex, 'pending', {
+      failure_reason: '',
+      output_msg_id: '',
+      transient_attempts: 0,
+    });
+    // Unblock cascade-skipped downstream: when step N failed under
+    // `abort_plan` policy, applyTermination marked all not-yet-terminal
+    // steps `skipped` with reason `aborted by step N failure`. Retrying
+    // step N should also re-arm those cascade victims; users explicitly
+    // skipped via the rail's "skip" button keep their reason and are NOT
+    // re-armed (their reason is the original failure_reason verbatim).
+    const cascadeReason = `aborted by step ${stepIndex} failure`;
+    const fresh = await readPlan(uid, cid);
+    if (fresh) {
+      for (const s of fresh.steps) {
+        if (s.status === 'skipped' && s.failure_reason === cascadeReason) {
+          await updateStep(uid, cid, s.index, 'pending', {
+            failure_reason: '',
+          });
+        }
+      }
+    }
+    log.info(`plan-step retry-requested cid=${cid} step=${stepIndex}`);
+    _hooks!.emitPlanChanged(uid, cid);
+    await reconcileAfterStepTransition(uid, cid);
+    return { ok: true };
+  });
+}
+
+/** User-initiated skip for a `failed` step. Marks it `skipped` while keeping
+ *  `failure_reason` (so the rail can still show why). Downstream that wasn't
+ *  in cascade now becomes ready (skipped is treated as terminal in
+ *  `findReadySteps`). Cascade-victims of THIS step keep their `skipped`
+ *  state — the user opted not to retry, downstream cascade stays. */
+export async function skipStep(
+  uid: string, cid: string, stepIndex: number,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!_hooks) return { ok: false, error: 'executor not bound' };
+  return _planLock(uid, cid).runExclusive(async () => {
+    const plan = await readPlan(uid, cid);
+    if (!plan) return { ok: false, error: 'no plan' };
+    const step = plan.steps.find((s) => s.index === stepIndex);
+    if (!step) return { ok: false, error: 'step not found' };
+    if (step.status !== 'failed') {
+      return { ok: false, error: `step is not in failed state (current: ${step.status})` };
+    }
+    await updateStep(uid, cid, stepIndex, 'skipped', {
+      transient_attempts: 0,
+    });
+    log.info(`plan-step skip-requested cid=${cid} step=${stepIndex}`);
+    _hooks!.emitPlanChanged(uid, cid);
+    await reconcileAfterStepTransition(uid, cid);
+    return { ok: true };
+  });
 }
 
 /** Main entry point. Mark the finished step done (if any), then dispatch
@@ -572,6 +707,7 @@ async function applyTermination(
   }
   if (failed) {
     const reason = ctx.finishedMessage?.failureReason || '(unknown)';
+    if (await maybeRetryTransient(uid, cid, step, reason)) return;
     const policy: FailurePolicy = step.on_failure || 'ask_commander';
     if (policy === 'continue') {
       await updateStep(uid, cid, step.index, 'skipped', {
@@ -606,6 +742,7 @@ async function applyTermination(
     }
   } else {
     await updateStep(uid, cid, step.index, 'done', {
+      transient_attempts: 0,
       output_summary: captureOutput(ctx.finishedMessage?.text || ''),
       output_files: ctx.finishedMessage?.files || [],
       output_msg_id: ctx.finishedMessage?.id,
@@ -718,9 +855,9 @@ async function dispatchStep(
 function assigneeDisplayPrefix(assignee: string): string {
   // The bus's @<id> → @<name> rewrite handles the case where assignee was an
   // id; here we just ensure the message starts with `@<assignee>` so the
-  // user sees who got dispatched.
-  const stripped = assignee.replace(/^@+/, '').trim();
-  return `@${stripped.replace(/\s+/g, '')}`;
+  // user sees who got dispatched. `buildMention` preserves whitespace (see
+  // its header).
+  return buildMention(assignee.replace(/^@+/, ''));
 }
 
 // ── Plan-complete signal ─────────────────────────────────────────────────

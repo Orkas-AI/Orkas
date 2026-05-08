@@ -188,37 +188,37 @@ export function clearMemory(userId: string, target: 'memory' | 'user'): void {
 // ── System prompt guidance (always injected) ─────────────────────────────
 
 const MEMORY_GUIDANCE = [
-  '## 跨会话记忆',
+  '## Cross-session memory',
   '',
-  '你拥有跨会话持久记忆能力，通过 `cross_session_memory` 工具实现。记忆在不同对话之间保持。',
+  'You have persistent memory across sessions via the `cross_session_memory` tool. Memory persists across conversations.',
   '',
-  '⚠️ 核心原则：当用户分享任何个人信息时，你必须立即调用 cross_session_memory tool 保存，而不是仅口头回应。不调用 tool 等于遗忘。',
+  '⚠️ Core principle: when the user shares any personal information, you MUST immediately call the cross_session_memory tool to save it — not just acknowledge it verbally. Not calling the tool = forgetting.',
   '',
-  '**必须调用 tool 的场景（不调用 = 遗忘，严禁只口头回应）：**',
-  '- 用户明确说"记住/记一下/remember/别忘了"',
-  '- 用户纠正你的行为（"不要这样做"、"以后请..."）',
-  '- 用户分享个人喜好、兴趣、习惯 -> target="user"',
-  '  例："我喜欢打篮球"、"我爱喝咖啡"、"我的爱好是游泳"、"我习惯早起"、"我不喜欢加班"',
-  '- 用户透露角色、职业、身份 -> target="user"',
-  '  例："我是产品经理"、"我在创业"、"我是学生"',
-  '- 用户提到技术偏好或工具选择 -> target="user"',
-  '  例："我习惯用 VS Code"、"我更喜欢 TypeScript"、"我们用 React"',
-  '- 用户描述自己的性格、沟通风格 -> target="user"',
-  '  例："我比较直接"、"我喜欢简洁的回答"',
+  '**You MUST call the tool in these situations (verbal acknowledgment alone = forgetting, strictly forbidden):**',
+  '- User explicitly says "remember", "make a note", "don\'t forget"',
+  '- User corrects your behavior ("don\'t do that", "from now on please…")',
+  '- User shares personal preferences, interests, or habits → target="user"',
+  '  e.g. "I like basketball", "I love coffee", "my hobby is swimming", "I\'m an early riser", "I dislike overtime"',
+  '- User reveals their role, profession, or identity → target="user"',
+  '  e.g. "I\'m a product manager", "I\'m a founder", "I\'m a student"',
+  '- User mentions tech preferences or tool choices → target="user"',
+  '  e.g. "I use VS Code", "I prefer TypeScript", "we use React"',
+  '- User describes their personality or communication style → target="user"',
+  '  e.g. "I\'m direct", "I prefer concise answers"',
   '',
-  '**判断规则：只要用户的话包含"我喜欢/我爱/我习惯/我偏好/我不喜欢/我讨厌/我是/我在做/我的爱好/我平时"等表达个人信息的句式，就必须调用 tool 保存到 target="user"。宁可多存也不要漏存。**',
+  '**Rule of thumb: whenever the user\'s words contain a self-disclosing phrase like "I like / I love / I prefer / I usually / I dislike / I hate / I am / I\'m working on / my hobby / I tend to" — or its equivalent in any other language — you MUST call the tool with target="user". Better to over-save than to miss.**',
   '',
-  '**应该主动调用 tool 的场景（target="memory"）：**',
-  '- 重要决策或里程碑（"我们决定用 X"、"项目已上线"）',
-  '- 项目约定或环境信息（"部署在 AWS"、"用 PostgreSQL"）',
+  '**You should proactively call the tool in these situations (target="memory"):**',
+  '- Important decisions or milestones ("we decided to use X", "the project has shipped")',
+  '- Project conventions or environment info ("deployed on AWS", "uses PostgreSQL")',
   '',
-  '**不要保存：**',
-  '- 一次性调试细节',
-  '- 大段代码或日志原文',
+  '**Do NOT save:**',
+  '- One-off debugging details',
+  '- Large code blocks or raw log dumps',
   '',
-  '两个 target：',
-  '- `memory`：你的笔记（事实、决策、里程碑、项目约定）',
-  '- `user`：用户画像（角色、偏好、兴趣爱好、沟通风格、技术栈）',
+  'Two targets:',
+  '- `memory`: your notes (facts, decisions, milestones, project conventions)',
+  '- `user`: user profile (role, preferences, interests, communication style, tech stack)',
 ].join('\n');
 
 /**
@@ -233,16 +233,16 @@ export function formatForSystemPrompt(userId: string): string {
   const parts: string[] = [MEMORY_GUIDANCE];
 
   if (memEntries.length > 0) {
-    parts.push('### 当前 MEMORY 条目');
+    parts.push('### Current MEMORY entries');
     parts.push(memEntries.map(e => e.text).join(ENTRY_SEPARATOR));
   }
   if (userEntries.length > 0) {
-    parts.push('### 当前 USER 条目');
+    parts.push('### Current USER entries');
     parts.push(userEntries.map(e => e.text).join(ENTRY_SEPARATOR));
   }
 
   if (memEntries.length === 0 && userEntries.length === 0) {
-    parts.push('_(暂无记忆条目)_');
+    parts.push('_(no memory entries yet)_');
   }
 
   return parts.join('\n\n');
@@ -275,7 +275,7 @@ export async function extractAndSaveCompactFacts(
     userId,
     message: extractPrompt,
     sessionId: `${userId}-memory-extract-${Date.now()}`,
-    systemPrompt: '你是一个事实提取助手。严格按照指示输出，不要添加任何额外内容。',
+    systemPrompt: 'You are a fact extraction assistant. Follow the instructions strictly and do not add any extra content.',
   });
 
   if (!result.ok || !result.text.trim()) {

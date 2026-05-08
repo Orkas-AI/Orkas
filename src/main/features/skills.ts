@@ -43,7 +43,6 @@ import {
   nowIso, readJson, writeJson, writeTextAtomicSync,
   appendJsonlAtomic, invalidateLineCount, readJsonl,
 } from '../storage';
-import * as search from './search';
 import { invalidateSkills as invalidateCoreAgentSkills } from '../model/core-agent/skill-registry';
 import { readDisabledSets, setSkillEnabled } from './component_enabled';
 
@@ -544,6 +543,7 @@ export async function createCustomSkill(name: string, description: string): Prom
 export async function updateCustomSkill(
   skillId: string,
   updates: { name?: string; description?: string; description_zh?: string; description_en?: string },
+  options: { skipRename?: boolean } = {},
 ): Promise<CustomSkill | null> {
   let d = customSkillDir(skillId);
   if (!fs.existsSync(d) || !fs.statSync(d).isDirectory()) return null;
@@ -571,7 +571,14 @@ export async function updateCustomSkill(
   }
 
   let currentId = skillId;
-  if (newName !== skillId) {
+  // `skipRename` is the in-progress-edit hook used by the skill detail name
+  // editor: while the user is typing, write the new `name:` into SKILL.md
+  // frontmatter but DO NOT rename the directory yet. The Done click fires a
+  // second update with `skipRename: false` to commit the rename. Same write
+  // path takes care of both passes — no separate IPC. Auto-heal on next
+  // listSkills (`_renameSkillByFrontmatterIfNeeded`) is the safety net for
+  // the edge case where the user crashes mid-edit before clicking Done.
+  if (newName !== skillId && !options.skipRename) {
     const err = validateSkillName(newName);
     if (err) throw new Error(err);
     const target = customSkillDir(newName);
@@ -601,8 +608,6 @@ export async function updateCustomSkill(
             const m = await loadSkillChatMeta(uid, newName);
             m.session_id = defaultSkillSessionId(uid, newName);
             await saveSkillChatMeta(uid, newName, m);
-            search.dropSkillChat(uid, skillId);
-            search.reindexSkillChatFile(uid, newName);
           } catch (err) {
             log.warn(`rename user=${uid} ${oldChatDir} -> ${newChatDir} failed: ${(err as Error).message}`);
           }
@@ -648,7 +653,6 @@ export async function deleteCustomSkill(skillId: string): Promise<boolean> {
         try { fs.rmSync(chatDir, { recursive: true, force: true }); }
         catch (err) { log.warn(`rm failed user=${uid} skill=${skillId}: ${(err as Error).message}`); }
         invalidateLineCount(path.join(chatDir, 'chat.jsonl'));
-        search.dropSkillChat(uid, skillId);
       }
       const sessionId = defaultSkillSessionId(uid, skillId);
       try { evictSession(sessionId); } catch { /* cache may not hold it */ }
@@ -696,14 +700,14 @@ function _isBlacklistedImportSource(realDir: string): { blocked: true; reason: s
   // the source/data.
   for (const root of [path.resolve(BUILTIN_SKILLS_SOURCE, '..', '..'), WS_ROOT]) {
     if (root && (dir === root || dir.startsWith(root + path.sep))) {
-      return { blocked: true, reason: 'Orkas 自身目录' };
+      return { blocked: true, reason: t('skills.import_block.self_dir') };
     }
   }
 
   // Home-dir root exactly — would trigger the 50 MiB cap only after
   // hoovering plenty of sensitive files.
   const home = os.homedir();
-  if (home && dir === home) return { blocked: true, reason: '用户家目录根' };
+  if (home && dir === home) return { blocked: true, reason: t('skills.import_block.home_root') };
 
   // Platform blacklists (absolute or prefix match).
   const mac = ['/System', '/private', '/etc', '/var', '/usr'];
@@ -717,11 +721,11 @@ function _isBlacklistedImportSource(realDir: string): { blocked: true; reason: s
 
   if (process.platform === 'darwin' || process.platform === 'linux') {
     if (hitsPrefix(mac) && !hitsException(macExcept)) {
-      return { blocked: true, reason: '系统目录' };
+      return { blocked: true, reason: t('skills.import_block.system_dir') };
     }
   }
   if (process.platform === 'win32') {
-    if (hitsPrefix(win)) return { blocked: true, reason: '系统目录' };
+    if (hitsPrefix(win)) return { blocked: true, reason: t('skills.import_block.system_dir') };
   }
 
   // User-sensitive subdirs (SSH / GPG / AWS creds).
@@ -730,7 +734,7 @@ function _isBlacklistedImportSource(realDir: string): { blocked: true; reason: s
     path.join(home, '.gnupg'),
     path.join(home, '.aws'),
   ];
-  if (hitsPrefix(sensitive)) return { blocked: true, reason: '用户凭证目录' };
+  if (hitsPrefix(sensitive)) return { blocked: true, reason: t('skills.import_block.credentials_dir') };
 
   return { blocked: false };
 }
@@ -987,8 +991,7 @@ export async function getSkillChatMessages(userId: string, skillId: string, limi
 
 async function _appendSkillChatMessage(userId: string, skillId: string, record: any): Promise<void> {
   const file = skillChatMsgsPath(userId, skillId);
-  const { msgIndex } = await appendJsonlAtomic(file, record);
-  search.indexSkillChatMessage(userId, skillId, msgIndex, record);
+  await appendJsonlAtomic(file, record);
 }
 
 export async function clearSkillChat(userId: string, skillId: string): Promise<boolean> {
@@ -1000,7 +1003,19 @@ export async function clearSkillChat(userId: string, skillId: string): Promise<b
     }
   }
   invalidateLineCount(skillChatMsgsPath(userId, skillId));
-  search.dropSkillChat(userId, skillId);
+  // Also evict + drop the core-agent persistent session jsonl. Without this
+  // the LLM retains its full prior context (tool calls, paths, file contents)
+  // even though the UI history is empty — visible as the LLM "remembering"
+  // pre-clear state, e.g. trying to read paths that no longer exist after a
+  // promote-to-builtin. Session id is id-keyed so it survives source changes.
+  const sessionId = defaultSkillSessionId(userId, skillId);
+  try { evictSession(sessionId); } catch { /* not in cache */ }
+  try { await fsp.unlink(userSessionFile(userId, sessionId)); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn(`session unlink user=${userId} skill=${skillId}: ${(err as Error).message}`);
+    }
+  }
   log.info(`cleared user=${userId} skill=${skillId}`);
   return true;
 }
@@ -1092,7 +1107,7 @@ export async function sendToSkillChat(userId: string, skillId: string, content: 
   });
 
   if (!result.ok) {
-    const errMsg = `模型响应失败: ${result.error || 'unknown'}`;
+    const errMsg = `Model response failed: ${result.error || 'unknown'}`;
     await _appendSkillChatMessage(userId, skillId,
       { time: nowIso(), role: 'assistant', content: errMsg });
     return { ok: false, message: errMsg, error: result.error || '' };
@@ -1219,7 +1234,7 @@ export async function* streamSendToSkillChat(
         finalText = cleanText;
         event = { type: 'final', text: cleanText, written };
       } else if (etype === 'error') {
-        errMsg = `模型响应失败: ${event.text || 'unknown'}`;
+        errMsg = `Model response failed: ${event.text || 'unknown'}`;
       }
 
       for (const text of synthesizedProgress) {
@@ -1245,7 +1260,7 @@ export async function* streamSendToSkillChat(
   } catch (err) {
     log.error('stream failed:', err);
     const msg = (err as Error).message || String(err);
-    errMsg = `模型响应失败: ${msg}`;
+    errMsg = `Model response failed: ${msg}`;
     yield { type: 'error', text: msg };
   } finally {
     // Must live in finally: on user abort the IPC layer breaks out of the
@@ -1265,8 +1280,8 @@ export async function* streamSendToSkillChat(
           { time: nowIso(), role: 'assistant', content, ...(saved ? { process: saved } : {}) });
       } else if (streamingText.trim() || processItems.length) {
         const content = streamingText.trim()
-          ? `${streamingText}\n\n（回复已中断）`
-          : '（回复已中断）';
+          ? `${streamingText}\n\n(reply interrupted)`
+          : '(reply interrupted)';
         await _appendSkillChatMessage(userId, skillId,
           { time: nowIso(), role: 'assistant', content, ...(saved ? { process: saved } : {}) });
       }

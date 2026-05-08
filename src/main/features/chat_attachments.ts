@@ -388,7 +388,8 @@ function imageMimeFromExt(ext: string): ImageMimeType {
 }
 
 /**
- * Move an entire draft attachment dir (e.g. `main_chat/`, used by 总指挥 tab
+ * Move an entire draft attachment dir (e.g. `main_chat/`, used by the
+ * commander tab
  * before a conversation exists) into a freshly-minted `<cid>/`. No caches
  * need to follow — cache entries are keyed by absolute path and will simply
  * point at the old draft location until next access, at which point

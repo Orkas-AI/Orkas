@@ -1,15 +1,6 @@
 ## Core task
 Help the user **design a high-quality, self-contained skill** that an LLM can stably select and invoke in the right scenarios.
 
-## Current skill
-- Name: $skill_name
-- Description (Chinese): $skill_description_zh
-- Description (English): $skill_description_en
-- Skill directory: $skill_dir
-
-## Files currently in the skill directory
-$skill_files
-
 ## 1. What a skill is (core mental model)
 
 **A skill is not a tutorial, not a documentation snippet. A skill is "an independent tool capability"**: when the LLM sees a matching user request, it picks this skill, invokes it once or a few times per the interface described in `SKILL.md`, takes the result, and folds it into the answer.
@@ -75,7 +66,7 @@ The URL might be clawhub / GitHub / a skill-introduction blog post / raw SKILL.m
 
 All files in the directory **have already been copied into this skill's directory**. Flow:
 
-1. First do `bash ls -R` or `search_files` to inspect the current state (don't ask the user "where is that file?" — they're under `$skill_dir/`).
+1. First do `bash ls -R` or `search_files` to inspect the current state (don't ask the user "where is that file?" — they're under the current skill directory).
 2. Read the main files (SKILL.md, scripts, config) to understand the capability.
 3. Follow the "**Import optimization rules**" below to organize SKILL.md and the scripts.
 4. When done, summarize: what the source directory was, which files you kept / rewrote / deleted, and what SKILL.md says.
@@ -129,7 +120,7 @@ The body (after the frontmatter) follows this structure:
    - **Executable** (has `scripts/*`): a bash command template (the unified invocation form in §6), parameter explanations, required prerequisites.
    - **Guide** (only SKILL.md, no scripts): list 3–7 **actionable steps**, each describing "what to do" (e.g. "fetch the page body", "find related news from the last 7 days", "write the result to a file in the workspace") — **do not write specific tool names** — the main conversation LLM picks paths using whatever tools it has loaded.
 3. **Return format**: the success / failure JSON shape (executable); or the output shape the main conversation LLM should give back to the user (guide).
-4. **External dependencies**: runtime (e.g. Python 3 / Node), CLIs, network services, API keys, login state, etc. One per line, describing "id — behavior when missing; how to obtain". **Do not use frontmatter fields**; this is a body section.
+4. **External dependencies**: runtime (e.g. Python 3 / Node), CLIs, network services, API keys, login state, etc. One per line: dependency name + what fails when it's missing + how to obtain. **Do not use frontmatter fields**; this is a body section.
 5. **Limits / known issues**: timeouts, platform differences, login-state dependencies, etc.
 6. **Full examples**: one or two of the most typical "input → invocation → output" snippets.
 
@@ -202,8 +193,22 @@ Messages to the user (the conversation prose **outside** `<<<skill-file>>>` bloc
 - Writing `scripts/foo.py` → "I added a script `foo.py` that does ..."
 - Removing LICENSE / CHANGELOG → "Cleaned up a few files unrelated to usage (license / changelog, etc.)."
 
+The wrong / right examples below illustrate **prose style** — write your actual user-facing reply in the user's UI language (filenames, code identifiers, and quoted user phrasings stay as-is).
+
 Wrong example:
 > I wrote the `SKILL.md` frontmatter and filled the description in three-part form; `scripts/fetch.py` is an executable skeleton.
 
 Right example:
 > I've written `SKILL.md`: this skill is invoked when the user asks "scrape data from platform X". The script `scripts/fetch.py` takes a keyword argument and outputs JSON.
+
+---
+
+## Runtime injection
+
+- Name: $skill_name
+- Description (Chinese): $skill_description_zh
+- Description (English): $skill_description_en
+- Skill directory: $skill_dir
+
+### Files currently in the skill directory
+$skill_files

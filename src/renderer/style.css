@@ -727,6 +727,8 @@ body.model-not-configured .main-content { flex-direction: column; }
   color: var(--primary);
 }
 
+/* Source tag in the skill detail header — matches `.agents-detail-source`
+   palette so the two detail pages read as one chrome family. */
 .skills-doc-source {
   font-size: 11px;
   font-weight: 600;
@@ -735,6 +737,19 @@ body.model-not-configured .main-content { flex-direction: column; }
   border-radius: 10px;
   background: rgba(148, 163, 184, 0.15);
   color: #475569;
+}
+.skills-doc-source.is-builtin { background: rgba(148, 163, 184, 0.15); color: #475569; }
+.skills-doc-source.is-custom  { background: rgba(37, 99, 235, 0.12); color: var(--primary); }
+/* Editing-state chrome on the title — mirrors `.agents-detail-name.is-editing`
+   so both detail pages read as one chrome family. */
+.skills-doc-title.is-editing {
+  outline: none;
+  background: #fff;
+  box-shadow: 0 0 0 1px var(--border-strong) inset;
+  cursor: text;
+}
+.skills-doc-title.is-editing:focus {
+  box-shadow: 0 0 0 2px var(--primary) inset;
 }
 
 .skills-doc-actions {
@@ -1075,26 +1090,35 @@ body.model-not-configured .main-content { flex-direction: column; }
   justify-content: flex-end;
 }
 
-.skill-card-use {
+.skill-card-use,
+.agent-card-use,
+.btn-icon-use {
   flex-shrink: 0;
   width: 26px;
   height: 26px;
-  padding: 0 0 0 1px;
+  padding: 0;
   border: none;
   border-radius: 50%;
   background: rgba(37, 99, 235, 0.1);
   color: var(--primary);
-  font-size: 10px;
-  line-height: 1;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   transition: background 0.12s, transform 0.12s;
 }
-.skill-card-use:hover {
+.skill-card-use:hover,
+.agent-card-use:hover,
+.btn-icon-use:hover {
   background: rgba(37, 99, 235, 0.2);
   transform: scale(1.05);
+}
+/* Centered SVG triangle inside the round play button. The SVG path itself
+   is balanced; the wrapper is plain flex-center, so no padding hacks needed. */
+.skill-card-use .icon-play,
+.agent-card-use .icon-play,
+.btn-icon-use .icon-play {
+  display: block;
 }
 
 /* ─── Per-card ⋯ popover menu ─── */
@@ -1212,11 +1236,14 @@ body.model-not-configured .main-content { flex-direction: column; }
 .skills-source-tree::-webkit-scrollbar { width: 4px; }
 .skills-source-tree::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 3px; }
 
-/* Inline file editor (skill edit mode) */
+/* Inline file editor (skill edit mode). No L/R padding here — the textarea
+ * owns its visual border + inner padding and sits flush with the section
+ * edge, the same way `.skills-source-panel` above it does. T/B padding is
+ * kept tiny so the toolbar status row has a little breathing room. */
 .skills-detail-body.skills-detail-editing {
   display: flex;
   flex-direction: column;
-  padding: 16px 20px 20px;
+  padding: 4px 0 0;
 }
 .skill-file-toolbar {
   display: flex;
@@ -1471,6 +1498,7 @@ body.model-not-configured .main-content { flex-direction: column; }
   position: relative;
 }
 
+
 /* Inline "创建智能体" entry pinned to the end of #chat-history — divider
    lines on both sides with a small button in the middle. Hidden during
    streaming via inline display:none toggled in conversation.js. */
@@ -1518,11 +1546,14 @@ body.model-not-configured .main-content { flex-direction: column; }
      spacer (`.chat-scroll-spacer`, 100vh) doesn't bloat the flex child past
      its parent and break internal overflow scrolling. */
   min-height: 0;
-  /* Bottom: breathing room for the last bubble — the old 160px cushion is
-     now provided by `margin-bottom` below (which also shrinks the scrollbar
-     track clear of the floating input so the thumb stays visible when
-     scrolled to the end). */
-  padding: 24px 10%;
+  /* Bottom: 80px **inside** the scroll viewport so when the user
+     scrolls all the way down the last bubble has breathing room above
+     the floating input area / attachment chips. The 140px margin-bottom
+     keeps the scrollbar track clear of the floating input so the thumb
+     stays visible at the end. We use padding-bottom (NOT bigger margin)
+     because the goal is more whitespace inside the scroll view, not
+     pushing the viewport upward — that was the wrong fix earlier. */
+  padding: 24px 10% 80px;
   margin-bottom: 140px;
   overflow-y: auto;
   display: flex;
@@ -1698,11 +1729,18 @@ body.model-not-configured .main-content { flex-direction: column; }
 .chat-send-btn.streaming .send-icon { display: none; }
 .chat-send-btn.streaming .stop-icon { display: block; }
 
-/* Queue panel above the input area */
+/* Queue panel above the input area.
+   Aligned with .chat-input-area's centered 80% layout BUT with the right
+   edge shrunken to clear the workspace chip floating above the input
+   bubble (chip is anchored to input-area's right shoulder, up to ~218px
+   wide; without this it overlaps the queue's bottom-right corner). The
+   shared `--ws-chip-reserve` lives next to `.chat-input-overlay` so any
+   future chip-width tweak only needs one site update. */
 .chat-queue {
   pointer-events: auto;
-  max-width: 80%;
-  margin: 0 auto 8px;
+  width: 80%;
+  max-width: max(160px, calc(80% - var(--ws-chip-reserve, 232px)));
+  margin: 0 0 8px 10%;
   background: rgba(255, 255, 255, 0.96);
   backdrop-filter: blur(6px);
   border: 1px solid var(--border);
@@ -1711,11 +1749,27 @@ body.model-not-configured .main-content { flex-direction: column; }
   box-shadow: 0 6px 20px rgba(15, 23, 42, 0.08);
 }
 
+/* Plan-rail pill chip floats above the input bubble's LEFT shoulder, the
+   mirror of the workspace chip on the right. When a plan exists,
+   plan-rail.js stamps `has-plan-rail` on .chat-input-wrapper; reserve
+   ~188px on the queue's left so the chip clears the queue's bottom-left.
+   Symmetric to the right-side workspace reserve above. */
+.chat-input-wrapper.has-plan-rail .chat-queue {
+  margin-left: calc(10% + var(--plan-rail-reserve, 188px));
+  max-width: max(
+    120px,
+    calc(80% - var(--ws-chip-reserve, 232px) - var(--plan-rail-reserve, 188px))
+  );
+}
+
 /* Narrower panels (skill / agent edit) don't have the 80%-centered shape
    of the main chat input; let the queue span the full panel width so it
-   aligns with the message list / input above. */
+   aligns with the message list / input above. They also have no
+   workspace chip floating above the input area, so no right-side
+   reservation is needed. */
 .skills-chat-col .chat-queue,
 .agents-chat-col .chat-queue {
+  width: auto;
   max-width: none;
   margin: 0 12px 8px;
 }
@@ -1788,6 +1842,78 @@ body.model-not-configured .main-content { flex-direction: column; }
 }
 @keyframes chat-attach-spin {
   to { transform: rotate(360deg); }
+}
+
+/* Quote-reply preview — a Feishu-style block that sits above the textarea
+   inside .chat-input-area when the user clicks 引用 on an assistant bubble.
+   The block is a normal flex-column child, so adding it just pushes the
+   textarea down; the input area visually grows to fit. */
+.chat-quote-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 10px 8px;
+  margin-top: 2px;
+  background: rgba(37, 99, 235, 0.04);
+  border-left: 3px solid rgba(37, 99, 235, 0.45);
+  border-radius: 4px;
+  font-size: 12.5px;
+  color: #475569;
+}
+.chat-quote-preview .chat-quote-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.chat-quote-preview .chat-quote-from {
+  flex: 1 1 auto;
+  font-weight: 500;
+  color: #2563eb;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-quote-preview .chat-quote-close {
+  flex: 0 0 auto;
+  cursor: pointer;
+  background: transparent;
+  border: none;
+  color: #94a3b8;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 4px;
+}
+.chat-quote-preview .chat-quote-close:hover { color: #ef4444; }
+.chat-quote-preview .chat-quote-body {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #475569;
+  line-height: 1.45;
+}
+.chat-quote-preview .chat-quote-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  margin-top: 2px;
+}
+.chat-quote-preview .chat-quote-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 11.5px;
+  color: #475569;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* "+" button — sits left of the textarea inside .chat-input-area */
@@ -2097,6 +2223,15 @@ body.model-not-configured .main-content { flex-direction: column; }
 }
 .chat-input-form .form-field-textarea { min-height: 56px; resize: vertical; }
 .chat-input-form .form-field-select { cursor: pointer; }
+/* form fields use the shared AiSelect for dropdowns; default is
+ * inline-block + min-width:180px which leaves it narrower than the
+ * sibling textarea/text-input. Make it block-level so it fills the
+ * form-field-ctrl column. */
+.chat-input-form .form-field-ctrl > .ai-select {
+  display: block;
+  min-width: 0;
+  width: 100%;
+}
 .chat-input-form .form-field-checkgroup {
   display: flex;
   flex-wrap: wrap;
@@ -2114,7 +2249,8 @@ body.model-not-configured .main-content { flex-direction: column; }
   cursor: pointer;
   accent-color: var(--primary);
 }
-.chat-input-form .form-field.is-error .form-field-input {
+.chat-input-form .form-field.is-error .form-field-input,
+.chat-input-form .form-field.is-error .ai-select .ai-select-trigger {
   border-color: var(--danger);
 }
 .chat-input-form .form-error {
@@ -2133,6 +2269,26 @@ body.model-not-configured .main-content { flex-direction: column; }
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+.chat-input-form .form-field-dir {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.chat-input-form .form-field-dir-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text);
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-input-form .form-field-dir-path.is-empty {
+  font-family: inherit;
+  color: var(--muted);
 }
 .chat-input-form .form-field-file-chips {
   display: flex;
@@ -2194,7 +2350,9 @@ body.model-not-configured .main-content { flex-direction: column; }
   border-color: rgba(148, 163, 184, 0.35);
 }
 .chat-input-form.is-submitted .form-field-input,
-.chat-input-form.is-submitted .form-field-input:focus {
+.chat-input-form.is-submitted .form-field-input:focus,
+.chat-input-form.is-submitted .ai-select .ai-select-trigger,
+.chat-input-form.is-submitted .ai-select .ai-select-trigger:focus {
   background: rgba(255, 255, 255, 0.6);
   color: var(--text);
   cursor: default;
@@ -2449,29 +2607,43 @@ body.model-not-configured .main-content { flex-direction: column; }
 .chat-msg-actions:empty {
   display: none;
 }
+/* Knowledge-base + Copy buttons live in this inline-flex container that
+ * gets appended to .chat-msg-actions. `order: -1` pins them to the
+ * leading edge of the actions row regardless of how many produced-file
+ * / created-agent chips follow — siblings default to 0 and fall in
+ * after, so the user always finds these two buttons at the same spot
+ * under every bubble. */
 .chat-bubble-actions {
   display: inline-flex;
   align-items: center;
+  gap: 4px;
+  order: -1;
 }
 .bubble-archive-btn,
-.bubble-copy-btn {
+.bubble-copy-btn,
+.bubble-quote-btn {
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--muted);
   font-size: 11px;
-  color: var(--text-muted, #6b7280);
-  background: transparent;
-  border: 1px solid var(--border-soft, #e5e7eb);
-  border-radius: 999px;
   padding: 2px 10px;
+  border-radius: 10px;
   cursor: pointer;
-  transition: background 0.12s, color 0.12s, border-color 0.12s;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+  transition: all 0.12s;
+  font-family: inherit;
 }
 .bubble-archive-btn:hover,
-.bubble-copy-btn:hover {
-  background: var(--bg-soft, #f3f4f6);
-  color: var(--text, #1f2937);
-  border-color: var(--border, #d1d5db);
+.bubble-copy-btn:hover,
+.bubble-quote-btn:hover {
+  color: var(--primary);
+  border-color: rgba(37, 99, 235, 0.25);
+  background: rgba(37, 99, 235, 0.04);
+  box-shadow: 0 2px 6px rgba(37, 99, 235, 0.15);
 }
 .bubble-archive-btn:disabled,
-.bubble-copy-btn:disabled {
+.bubble-copy-btn:disabled,
+.bubble-quote-btn:disabled {
   cursor: default;
   opacity: 0.7;
 }
@@ -2523,7 +2695,6 @@ body.model-not-configured .main-content { flex-direction: column; }
   font-size: 12.5px;
   padding: 2px 0;
 }
-.stream-thinking-label { margin-left: 4px; }
 .stream-thinking-dot {
   width: 5px;
   height: 5px;
@@ -2605,7 +2776,14 @@ body.model-not-configured .main-content { flex-direction: column; }
 .stream-final {
   /* Appears below process section with a subtle divider when process is open */
 }
-.stream-process[open] + .stream-final:not([style*="display:none"]) {
+/* Divider between the process trail and the final body — only when the
+   process section is actually visible. The placeholder bubble starts with
+   `.stream-process` carrying both `[open]` and inline `display:none` (so it
+   expands automatically the first time a process event arrives), and we
+   must NOT paint the dashed border above the body while the process row
+   is still hidden — otherwise the bubble shows a stray top divider above
+   the streaming text with nothing above it to separate from. */
+.stream-process[open]:not([style*="display:none"]) + .stream-final:not([style*="display:none"]) {
   margin-top: 8px;
   padding-top: 10px;
   border-top: 1px dashed var(--border);
@@ -2638,6 +2816,22 @@ body.model-not-configured .main-content { flex-direction: column; }
      横向滚用户极易以为被截断；气泡宽度有限，阅读体验上换行也明显更好。 */
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* Forward-quote blockquotes in user bubbles — clamp to 2 lines to keep the
+   sent-message bubble compact. The receiving agent still gets the full text
+   (the markdown is sent intact via bus.enqueue); this only affects the
+   sender's view of their own outgoing bubble. Why user bubbles only:
+   `applyQuotePrefix` is the sole producer of these blockquotes, and it
+   only runs on the renderer's send path → the result always lands in a
+   user-role bubble. Assistant blockquotes (citations, web fetches, etc.)
+   stay unclamped so the model's quoted content remains fully readable. */
+.chat-message.user .chat-bubble blockquote {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
 }
 
 /* 其它易撑破气泡的块级内容（表格、长 URL/图片）也约束到气泡宽度以内。 */
@@ -2922,12 +3116,6 @@ body.model-not-configured .main-content { flex-direction: column; }
   height: 1px;
   background: var(--border);
   margin: 4px 12px;
-}
-
-.agents-chat-workspace-toolbar {
-  max-width: 100%;
-  margin: 0 0 6px;
-  padding: 0 2px;
 }
 
 .skill-picker {
@@ -3436,35 +3624,6 @@ body.model-not-configured .main-content { flex-direction: column; }
   box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.12);
 }
 
-/* Archive button lives inside .chat-meta (to the right of the timestamp) so
-   it never overlaps the bubble. Only attached for finalised assistant replies. */
-.chat-bubble-actions {
-  display: inline-flex;
-  gap: 4px;
-}
-
-.bubble-archive-btn,
-.bubble-copy-btn {
-  border: 1px solid var(--border);
-  background: #fff;
-  color: var(--muted);
-  font-size: 11px;
-  padding: 2px 10px;
-  border-radius: 10px;
-  cursor: pointer;
-  box-shadow: 0 1px 2px rgba(0,0,0,0.05);
-  transition: all 0.12s;
-  font-family: inherit;
-}
-
-.bubble-archive-btn:hover,
-.bubble-copy-btn:hover {
-  color: var(--primary);
-  border-color: rgba(37, 99, 235, 0.25);
-  background: rgba(37, 99, 235, 0.04);
-  box-shadow: 0 2px 6px rgba(37, 99, 235, 0.15);
-}
-
 /* ─── Agents ─── */
 .agents-container {
   flex: 1;
@@ -3754,6 +3913,142 @@ body.model-not-configured .main-content { flex-direction: column; }
 
 .btn-sm { padding: 4px 10px; font-size: 12px; }
 
+/* ────────────────────────────────────────────────────────────────────────
+   Plan rail — pinned to the LEFT of the .chat-input-overlay strip
+   (mirrors the workspace chip pinned right). Collapsed = a compact pill
+   chip sitting just above the input bubble; expanded = a fixed-width,
+   max-height panel that opens UPWARD over the chat history. The whole
+   header is the toggle. Status icon set is fixed; do not theme-swap.
+   See modules/plan-rail.js.
+   ──────────────────────────────────────────────────────────────────── */
+.plan-rail {
+  position: relative;          /* anchor for the absolute body */
+  flex: 0 0 auto;              /* leftmost item in chat-input-overlay flex row */
+  pointer-events: auto;        /* overlay parent has pointer-events:none */
+  font-size: 13px;
+  user-select: none;
+  z-index: 11;                 /* above chat-input-wrapper (z:10) */
+}
+.plan-rail-header {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
+  cursor: pointer;
+  font-weight: 500;
+  transition: box-shadow 0.15s, background 0.15s;
+}
+.plan-rail-header:hover { background: #f8fafc; box-shadow: 0 2px 6px rgba(15, 23, 42, 0.12); }
+.plan-rail-title { flex: 0 0 auto; }
+.plan-rail-progress {
+  flex: 0 0 auto;
+  color: var(--text);
+  opacity: 0.55;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+.plan-rail-toggle {
+  margin-left: 2px;
+  font-size: 11px;
+  color: var(--text);
+  opacity: 0.55;
+  pointer-events: none; /* the whole header handles the click */
+}
+.plan-rail-body {
+  position: absolute;
+  bottom: calc(100% + 6px);    /* opens UPWARD from the chip */
+  left: 0;
+  width: 380px;
+  max-width: calc(100vw - 48px);
+  max-height: 50vh;
+  overflow-y: auto;
+  padding: 8px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 6px 20px rgba(15, 23, 42, 0.12);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.plan-rail.is-collapsed .plan-rail-body { display: none; }
+
+/* Two-row step layout: row 1 is icon + num + title (title may wrap so
+   long Chinese sentences keep readable); row 2 is the assignee chip
+   indented under the title. Reason / actions stack below in their own
+   blocks. Avoids the title-vs-assignee column squish. */
+.plan-rail-step {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.plan-rail-step:hover { background: rgba(148, 163, 184, 0.08); }
+.plan-rail-step-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.plan-rail-step-icon { font-size: 14px; line-height: 1; flex: 0 0 auto; }
+.plan-rail-step-num {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.6;
+  flex: 0 0 auto;
+}
+.plan-rail-step-title {
+  color: var(--text);
+  flex: 1 1 auto;
+  word-break: break-word;
+  line-height: 1.4;
+}
+.plan-rail-step-transient {
+  font-size: 12px;
+  color: var(--text);
+  opacity: 0.7;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+/* Assignee on its own line, indented under the title text (icon + num
+   take ~32px). Smaller font, primary color, single line with ellipsis. */
+.plan-rail-step-meta {
+  margin-left: 32px;
+  font-size: 11px;
+  color: var(--primary);
+  opacity: 0.8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.plan-rail-step-reason {
+  margin-left: 32px;
+  font-size: 12px;
+  color: var(--danger);
+  opacity: 0.85;
+  word-break: break-word;
+}
+.plan-rail-step-actions {
+  margin-left: 32px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 4px;
+}
+
+/* Per-status accents — only on the title to avoid icon recoloring (the
+   emoji carries its own color). */
+.plan-rail-step.is-done    .plan-rail-step-title { opacity: 0.65; text-decoration: line-through; text-decoration-color: rgba(0,0,0,0.2); }
+.plan-rail-step.is-skipped .plan-rail-step-title { opacity: 0.55; }
+.plan-rail-step.is-failed  .plan-rail-step-title { color: var(--danger); }
+.plan-rail-step.is-blocked .plan-rail-step-title { color: var(--text); /* neutral — the 📝 icon already conveys "awaiting input" */ }
+.plan-rail-step.is-in_progress .plan-rail-step-title { color: var(--primary); font-weight: 500; }
+
 /* Detail-page action button row (shared across skills / agents / contexts).
    `margin-left: auto` keeps buttons right-aligned even after flex-wrap. */
 .detail-actions {
@@ -3992,30 +4287,14 @@ body.model-not-configured .main-content { flex-direction: column; }
 .agent-card-actions {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: space-between;
+  gap: 8px;
 }
+/* When no chip is present, the play button still hugs the right edge.
+   `margin-left: auto` plays nice with the absent-chip case. */
+.agent-card-actions > .agent-card-use { margin-left: auto; }
 
-.agent-card-use {
-  flex-shrink: 0;
-  width: 26px;
-  height: 26px;
-  padding: 0 0 0 1px;
-  border: none;
-  border-radius: 50%;
-  background: rgba(37, 99, 235, 0.1);
-  color: var(--primary);
-  font-size: 10px;
-  line-height: 1;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  transition: background 0.12s, transform 0.12s;
-}
-.agent-card-use:hover {
-  background: rgba(37, 99, 235, 0.2);
-  transform: scale(1.05);
-}
+/* `.agent-card-use` shared with `.skill-card-use` / `.btn-icon-use` above. */
 
 /* ─── Agents detail view (replaces grid) ────────────────────────────── */
 
@@ -4104,14 +4383,13 @@ body.model-not-configured .main-content { flex-direction: column; }
 
 .agents-detail-title-row {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
   flex-wrap: wrap;
 }
 
 .agents-detail-name {
-  flex: 1;
   min-width: 0;
   font-size: 17px;
   font-weight: 600;
@@ -4131,8 +4409,10 @@ body.model-not-configured .main-content { flex-direction: column; }
   box-shadow: 0 0 0 2px var(--primary) inset;
 }
 
+/* Sits on the same row as the agent name, mirroring the skill detail
+   header layout (.skills-doc-source). The title row centers all
+   children, so no per-chip align-self override is needed. */
 .agents-detail-source {
-  margin-top: 8px;
   font-size: 11px;
   font-weight: 600;
   display: inline-block;
@@ -4514,7 +4794,12 @@ body.model-not-configured .main-content { flex-direction: column; }
   top: calc(100% + 4px);
   left: 0;
   right: 0;
-  z-index: 40;
+  /* Popovers portal to <body> at open time (see _aiSelectMount) so
+     they can escape parent overflow:auto. They must therefore beat
+     every overlay they could appear inside. `.modal-overlay` is 100,
+     `.ui-dialog-overlay` is 200, the avatar picker is 300, common
+     toasts top out at 1000 — pick a value above all of them. */
+  z-index: 1200;
   background: #fff;
   border: 1px solid var(--border, #e5e7eb);
   border-radius: 8px;
@@ -5045,3 +5330,23 @@ body.model-not-configured .main-content { flex-direction: column; }
   outline-offset: 2px;
   transform: scale(1.05);
 }
+
+/* Agent CLI badge — both grid card chip and detail header pill share
+   .is-cli; per-CLI tints are layered through .is-cli-<type> so future
+   styling can pick brand-specific accents without touching markup. */
+.agent-card-chip.is-cli {
+  display: inline-block;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: #3730a3;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+/* Runtime selector lives at the top of the detail body; widget is
+   wider than a chip so it sits on its own row. Capped width keeps
+   the dropdown from spanning the entire body. */
+.agents-detail-runtime { display: block; }
+.agents-detail-runtime-select { max-width: 280px; }

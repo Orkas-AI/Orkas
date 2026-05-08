@@ -269,4 +269,44 @@ describe('file_indexer › invalidate + purge + prune', () => {
     expect(r.deleted).toBe(1);
     expect(fs.readdirSync(userFileCacheRoot()).length).toBe(0);
   });
+
+  it('pruneOrphans with workspacePath drops workspace entries outside the new workspace', async () => {
+    const m = await loadMod();
+
+    // Two workspaces: ws-a and ws-b. Cache an entry sourced from ws-a,
+    // then switch to ws-b and assert ws-a's entry gets dropped while
+    // ws-b's entry stays.
+    const wsA = path.join(tmpDir, 'ws-a'); fs.mkdirSync(wsA, { recursive: true });
+    const wsB = path.join(tmpDir, 'ws-b'); fs.mkdirSync(wsB, { recursive: true });
+    const aFile = path.join(wsA, 'a.pdf');
+    const bFile = path.join(wsB, 'b.pdf');
+    fs.writeFileSync(aFile, makeMinimalPdf(['A']));
+    fs.writeFileSync(bFile, makeMinimalPdf(['B']));
+
+    await m.statFile(UID, aFile);
+    await m.statFile(UID, bFile);
+    expect(fs.readdirSync(userFileCacheRoot()).length).toBe(2);
+
+    const r = await m.pruneOrphans(UID, { workspacePath: wsB });
+    expect(r.deleted).toBe(1);
+    expect(fs.readdirSync(userFileCacheRoot()).length).toBe(1);
+  });
+
+  it('pruneOrphans with workspacePath spares attachment-source entries even when outside', async () => {
+    const m = await loadMod();
+    const cid = 'cattach';
+    const att = attachmentFile(cid, 'a.pdf', makeMinimalPdf(['X']));
+    // source/cid are auto-derived from the absPath being inside chat_attachments
+    await m.statFile(UID, att);
+    expect(fs.readdirSync(userFileCacheRoot()).length).toBe(1);
+
+    // Pick a workspacePath that doesn't contain the attachment dir;
+    // attachments live in <uid>/cloud/chat_attachments/, not in the
+    // workspace, but they must NOT be pruned by the workspace check.
+    const wsElsewhere = path.join(tmpDir, 'ws-elsewhere');
+    fs.mkdirSync(wsElsewhere, { recursive: true });
+    const r = await m.pruneOrphans(UID, { workspacePath: wsElsewhere });
+    expect(r.deleted).toBe(0);
+    expect(fs.readdirSync(userFileCacheRoot()).length).toBe(1);
+  });
 });

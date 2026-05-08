@@ -133,16 +133,18 @@ async function braveApiSearch(profile: SearchProfile, query: string, count: numb
   };
 }
 
-// ── 百度 AI 搜索 (千帆) ─────────────────────────────────────────────────
+// ── Baidu AI Search (Qianfan) ───────────────────────────────────────────
 
 /**
- * 百度智能云千帆 AI 搜索：
+ * Baidu Cloud Qianfan AI Search:
  * Endpoint: POST https://qianfan.baidubce.com/v2/ai_search
- * 鉴权：Authorization: Bearer <API Key>（千帆 API Key，控制台「API Key 管理」获取）
- * 文档：https://cloud.baidu.com/doc/qianfan-api/s/em82g4tlk
+ * Auth: Authorization: Bearer <API Key> (Qianfan API Key, obtained from
+ *       the "API Key Management" page of the console).
+ * Docs: https://cloud.baidu.com/doc/qianfan-api/s/em82g4tlk
  *
- * 注：百度该接口请求体里只需要 `messages`（用户 query），返回结构是
- * `references[]`，每项 `{title, url, snippet}` —— 直接映射即可。
+ * Note: this endpoint only needs `messages` (the user query) in the
+ * request body; the response shape is `references[]`, each entry
+ * `{title, url, snippet}` — a direct mapping.
  */
 async function baiduAiSearch(profile: SearchProfile, query: string, count: number): Promise<SearchAdapterResult> {
   const body = JSON.stringify({
@@ -174,23 +176,25 @@ async function baiduAiSearch(profile: SearchProfile, query: string, count: numbe
   };
 }
 
-// ── 秘塔 AI 搜索 (Metaso) ───────────────────────────────────────────────
+// ── Metaso AI Search ────────────────────────────────────────────────────
 
 /**
- * 秘塔 AI 搜索：
+ * Metaso AI Search:
  * Endpoint: POST https://api.metaso.cn/search
- * 鉴权：Authorization: Bearer <api-key>
- * 文档/控制台：https://metaso.cn/
+ * Auth: Authorization: Bearer <api-key>
+ * Docs / console: https://metaso.cn/
  *
- * 请求体核心字段（核对 2026-04）：
+ * Request body core fields (verified 2026-04):
  *   - q (string, required)
  *   - scope: 'webpage' | 'document' | 'scholar' | 'podcast' | 'video' | 'image'
- *            默认 'webpage'
+ *            (default 'webpage')
  *   - size (number, optional)
  *   - includeSummary (boolean, optional)
  *
- * 响应字段名秘塔不同环境下不完全一致（references / results / data 都能见到；
- * 单条里 title/url/snippet/content/summary 也存在简写差异），所以做多键 fallback。
+ * Response field names vary across Metaso environments (references /
+ * results / data are all observed; per-entry title/url/snippet/content/
+ * summary also have abbreviation differences), so we do multi-key
+ * fallback.
  */
 async function metasoSearch(profile: SearchProfile, query: string, count: number): Promise<SearchAdapterResult> {
   const body = JSON.stringify({
@@ -245,8 +249,8 @@ export const SEARCH_PROVIDER_LABEL: Record<string, string> = {
   tavily:            'Tavily',
   serper:            'Serper',
   'brave-search':    'Brave',
-  'baidu-ai-search': '百度',
-  metaso:            '秘塔',
+  'baidu-ai-search': 'Baidu',
+  metaso:            'Metaso',
 };
 
 /** Documentation URL shown next to the API-key input in the settings UI. */

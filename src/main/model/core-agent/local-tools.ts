@@ -2,7 +2,7 @@
  * Local-machine tool wrappers injected into every AgentRunner built by
  * this app.
  *
- * Four tools:
+ * Five tools:
  *   - `bash`          — overrides core-agent's builtin (last-write-wins in
  *                       AgentRunner's tool map). Same schema; tighter
  *                       English description; permission-gated.
@@ -15,6 +15,14 @@
  *                       does not claim it (i.e. it's not our own prior
  *                       write being refined). The rename is surfaced via a
  *                       `<file-renamed>` block in the tool result.
+ *   - `edit_file`     — in-place `old_string → new_string` replacement on
+ *                       an existing text file. Sandbox-checked
+ *                       (workspace + current attachment dir + extraRoots);
+ *                       does NOT uniquify (semantics are "modify
+ *                       existing"); pdf/docx/image kinds rejected; on
+ *                       success fires `onFileWritten` so the UI can show
+ *                       the green chip. Companion to `write_file` for
+ *                       cheap targeted edits without a full overwrite.
  *   - `markdown_to_pdf` — built-in PDF channel (no pandoc/wkhtmltopdf
  *                       dependency). Renders via util/md-to-pdf +
  *                       Electron's webContents.printToPDF.
@@ -32,6 +40,7 @@
  * wrapper's perspective. Prompts shouldn't claim otherwise.
  */
 
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import type { AgentTool, ToolContext, ToolResult } from '#core-agent';
@@ -39,25 +48,41 @@ import { bashTool as coreBashTool, writeFileTool as coreWriteFileTool } from '..
 import { getLocalExecGranted } from '../../features/permissions';
 import { markdownToPdf, htmlToPdf } from '../../util/md-to-pdf';
 import { uniquifyPath, renderRenameSignal } from '../../util/uniquify-path';
+import { isPathAllowed } from '../../util/path-sandbox';
+import { kindOf } from '../../features/file_indexer';
+import { getWorkspacePath } from '../../features/user_workspace';
+import { chatAttachmentDir } from '../../paths';
 import { createLogger } from '../../logger';
 
 const log = createLogger('local-tools');
 
 export interface LocalToolsOpts {
-  /** Active uid. Reserved for tools that need user-scoped resolution
-   *  (none currently — kept on the signature for forward compatibility
-   *  and so existing callers don't have to change). */
+  /** Active uid. Used by `edit_file` to resolve workspace + attachment
+   *  sandbox roots; also reserved for future tools that need user-scoped
+   *  resolution. Optional so the catalog drift test can call
+   *  `createLocalTools({})` without runtime user state. */
   userId?: string;
+  /** Current conversation id. Used by `edit_file` to add the current
+   *  conv's attachment dir to the sandbox. Without it, only the workspace
+   *  (+ extraRoots) is editable. */
+  cid?: string;
+  /** Extra absolute directory roots `edit_file` should treat as in-scope
+   *  on top of workspace + attachment. Used by skill-edit / agent-edit
+   *  chats so the LLM can edit files inside the skill / agent dir. */
+  extraRoots?: readonly string[];
   /** Fires with absolute path after every successful write (write_file,
-   * markdown_to_pdf, html_to_pdf). Lets chats.ts surface produced files
-   * to the UI. */
+   * edit_file, markdown_to_pdf, html_to_pdf). Lets chats.ts surface
+   * produced files to the UI. */
   onFileWritten?: (absPath: string) => void;
   /** Predicate: returns true when the given absolute path was already
    *  written by this caller in the current scope (typically: a Set
    *  populated by `onFileWritten` this turn). When true, the wrapped
    *  tool overwrites in place — the refinement pattern. When false /
    *  absent, an existing file at the target is treated as a foreign
-   *  collision and uniquify (`-2 / -3 / ...`) kicks in. */
+   *  collision and uniquify (`-2 / -3 / ...`) kicks in. Consumed by
+   *  `write_file` / `markdown_to_pdf` / `html_to_pdf`; `edit_file`
+   *  ignores it (its semantics is "modify existing", uniquify would be
+   *  wrong). */
   hasProducedPath?: (absPath: string) => boolean;
 }
 
@@ -78,6 +103,57 @@ function isMineFor(opts: LocalToolsOpts): (p: string) => boolean {
   return fn ? (p) => fn(p) : () => false;
 }
 
+function errText(code: string, msg: string): string {
+  return `${code}: ${msg}`;
+}
+
+/** Assemble the edit-time sandbox roots for the current (uid, cid). Mirrors
+ *  `file-tools.ts::allowedRoots` so the read-side and edit-side share the
+ *  same visible scope. Returns [] when uid is missing — guardPath then
+ *  rejects with E_NO_SCOPE rather than silently allowing an unscoped edit. */
+function allowedRootsFor(opts: LocalToolsOpts): string[] {
+  const roots: string[] = [];
+  if (opts.userId) {
+    try {
+      const ws = getWorkspacePath(opts.userId);
+      if (ws) roots.push(ws);
+    } catch (err) { log.warn(`edit_file resolve workspace: ${(err as Error).message}`); }
+    if (opts.cid) {
+      try { roots.push(chatAttachmentDir(opts.userId, opts.cid)); }
+      catch (err) { log.warn(`edit_file resolve attachment dir: ${(err as Error).message}`); }
+    }
+  }
+  if (opts.extraRoots?.length) {
+    for (const r of opts.extraRoots) if (r) roots.push(r);
+  }
+  return roots;
+}
+
+function guardEditPath(opts: LocalToolsOpts, abs: string): string | null {
+  const roots = allowedRootsFor(opts);
+  if (!roots.length) {
+    return errText('E_NO_SCOPE', 'no visible roots for this conversation');
+  }
+  if (!isPathAllowed(abs, roots)) {
+    return errText(
+      'E_PATH_OUT_OF_SCOPE',
+      `path is outside the current conversation's visible scope (workspace + attachments): ${abs}`,
+    );
+  }
+  return null;
+}
+
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let idx = 0;
+  while ((idx = haystack.indexOf(needle, idx)) !== -1) {
+    count++;
+    idx += needle.length;
+  }
+  return count;
+}
+
 /** Wrapped `bash` tool — identical schema, permission-gated, host-shell wording. */
 function createBashTool(): AgentTool {
   return {
@@ -90,6 +166,18 @@ function createBashTool(): AgentTool {
     inputSchema: coreBashTool.inputSchema,
     async execute(input, ctx) {
       if (!getLocalExecGranted()) return deniedResult();
+      // Defensive mkdir on cwd before delegating: `conv_workspace.ts`
+      // intentionally defers materialising the per-conversation workspace
+      // dir until something actually needs it on disk (so empty-output
+      // conversations don't litter the user's workspace with empty
+      // subdirs). `child_process.spawn` fails ENOENT if cwd doesn't
+      // exist, so this is the natural materialisation point — mkdir
+      // -p the cwd, then run the command. Failures here fall through;
+      // spawn will surface a clearer error if it really can't proceed.
+      if (ctx.workingDir) {
+        try { fs.mkdirSync(ctx.workingDir, { recursive: true }); }
+        catch { /* let spawn produce the canonical error */ }
+      }
       return coreBashTool.execute(input, ctx);
     },
   };
@@ -131,6 +219,135 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
         };
       }
       return result;
+    },
+  };
+}
+
+/** Wrapped `edit_file` tool — in-place string replacement on existing text files.
+ *  Sandbox-checked, permission-gated, no uniquify (semantics is "modify in place").
+ *  pdf/docx/image kinds rejected — those are extracted-only. */
+function createEditFileTool(opts: LocalToolsOpts): AgentTool {
+  return {
+    name: 'edit_file',
+    description:
+      'Replace `old_string` with `new_string` inside an existing text file. ' +
+      'Cheaper and safer than rewriting the whole file via `write_file`; the rest of the file is preserved verbatim.\n' +
+      '\n' +
+      'Parameters:\n' +
+      '  path        — required. Absolute or workspace-relative path. The file MUST already exist.\n' +
+      '  old_string  — required. Exact text to find. Must be unique in the file unless `replace_all=true`.\n' +
+      '  new_string  — required. Replacement text. May be empty (deletes `old_string`).\n' +
+      '  replace_all — optional, default false. When true, every occurrence of `old_string` is replaced.\n' +
+      '\n' +
+      'How to use:\n' +
+      '  - Prefer this over `write_file` for targeted edits to existing files.\n' +
+      '  - To CREATE a new file, use `write_file` instead — `edit_file` does not create files.\n' +
+      '  - Make `old_string` long enough to be unique. On `E_MULTIPLE_MATCHES`, expand `old_string` with surrounding context, or set `replace_all=true` if every occurrence should change.\n' +
+      '  - Cannot edit pdf / docx / image files (text from those is extracted, not the source). Use `write_file` if you really need to overwrite the binary.\n' +
+      '\n' +
+      'Permission: requires local execution permission (same gate as `write_file` / `bash`).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute or workspace-relative path to an existing file.' },
+        old_string: { type: 'string', description: 'Exact text to find. Must be unique unless replace_all=true.' },
+        new_string: { type: 'string', description: 'Replacement text. May be empty.' },
+        replace_all: { type: 'boolean', description: 'Default false. When true, every occurrence of old_string is replaced.' },
+      },
+      required: ['path', 'old_string', 'new_string'],
+    },
+    async execute(input, ctx) {
+      if (!getLocalExecGranted()) return deniedResult();
+
+      const rawPath = String(input.path ?? '');
+      if (!rawPath) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
+      const oldStr = typeof input.old_string === 'string' ? input.old_string : null;
+      const newStr = typeof input.new_string === 'string' ? input.new_string : null;
+      if (oldStr === null || newStr === null) {
+        return { content: errText('E_BAD_INPUT', '`old_string` and `new_string` are both required strings'), isError: true };
+      }
+      if (oldStr.length === 0) {
+        return { content: errText('E_BAD_INPUT', '`old_string` must be non-empty'), isError: true };
+      }
+      if (oldStr === newStr) {
+        return { content: errText('E_BAD_INPUT', '`old_string` and `new_string` are identical — no-op rejected'), isError: true };
+      }
+      const replaceAll = input.replace_all === true;
+
+      const abs = resolveAbs(ctx, rawPath);
+      const scopeErr = guardEditPath(opts, abs);
+      if (scopeErr) {
+        log.warn(`edit_file scope reject user=${opts.userId ?? '?'} path=${abs}`);
+        return { content: scopeErr, isError: true };
+      }
+
+      let st: fs.Stats;
+      try { st = fs.statSync(abs); }
+      catch (err) {
+        log.warn(`edit_file not-found user=${opts.userId ?? '?'} path=${abs}: ${(err as Error).message}`);
+        return {
+          content: errText('E_NOT_FOUND', `${abs}: file does not exist (use write_file to create new files)`),
+          isError: true,
+        };
+      }
+      if (!st.isFile()) {
+        return { content: errText('E_NOT_FOUND', `${abs}: not a regular file`), isError: true };
+      }
+
+      const kind = kindOf(abs);
+      if (kind === 'pdf' || kind === 'docx' || kind === 'image') {
+        return {
+          content: errText(
+            'E_NOT_EDITABLE',
+            `${abs}: kind=${kind} is not editable in place (extracted format). Use write_file to overwrite the file if you really need to.`,
+          ),
+          isError: true,
+        };
+      }
+
+      let body: string;
+      try { body = fs.readFileSync(abs, 'utf8'); }
+      catch (err) {
+        const msg = (err as Error).message;
+        log.warn(`edit_file read failed user=${opts.userId ?? '?'} path=${abs}: ${msg}`);
+        return { content: errText('E_EDIT_FAILED', `${abs}: read failed: ${msg}`), isError: true };
+      }
+
+      const count = countOccurrences(body, oldStr);
+      if (count === 0) {
+        return { content: errText('E_NO_MATCH', `${abs}: \`old_string\` not found in file`), isError: true };
+      }
+      if (count > 1 && !replaceAll) {
+        return {
+          content: errText(
+            'E_MULTIPLE_MATCHES',
+            `${abs}: \`old_string\` matches ${count} occurrences. Provide more surrounding context to make it unique, or set replace_all=true.`,
+          ),
+          isError: true,
+        };
+      }
+
+      const next = replaceAll ? body.split(oldStr).join(newStr) : body.replace(oldStr, newStr);
+
+      try {
+        fs.writeFileSync(abs, next, 'utf8');
+      } catch (err) {
+        const msg = (err as Error).message;
+        log.warn(`edit_file write failed user=${opts.userId ?? '?'} path=${abs}: ${msg}`);
+        return { content: errText('E_EDIT_FAILED', `${abs}: write failed: ${msg}`), isError: true };
+      }
+
+      const replaced = replaceAll ? count : 1;
+      log.info(`edit_file user=${opts.userId ?? '?'} replaced=${replaced} path=${abs}`);
+
+      if (opts.onFileWritten) {
+        try { opts.onFileWritten(abs); }
+        catch (err) { log.warn(`onFileWritten callback failed: ${(err as Error).message}`); }
+      }
+
+      return {
+        content: `<file path="${abs}" edited="${replaced}" kind="${kind}"/>`,
+      };
     },
   };
 }
@@ -228,6 +445,7 @@ export function createLocalTools(opts: LocalToolsOpts = {}): AgentTool[] {
   return [
     createBashTool(),
     createWriteFileTool(opts),
+    createEditFileTool(opts),
     createMarkdownToPdfTool(opts),
     createHtmlToPdfTool(opts),
   ];

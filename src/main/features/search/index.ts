@@ -10,22 +10,30 @@
  * one stat per source file plus a re-tokenize for any whose mtime/size
  * moved.
  *
- * Contexts (KB) are indexed by relPath only — directory + filename, not
- * body. Full-text content lookup goes through the vector KB (kb_search
- * tool). Chat-style kinds still tokenize message bodies and generate
- * snippets lazily at query time.
+ * Indexed kinds:
+ *   - `context` — KB tree, by relPath only (directory + filename, not
+ *     body). Full-text content goes through the vector KB.
+ *   - `chat`    — main-conversation jsonl message bodies.
+ *
+ * Agents and skills are NOT indexed — `searchAgents` / `searchSkills`
+ * call the existing list APIs and run an in-memory substring match at
+ * query time. The list cardinality is small (typically < 50) so a token
+ * inverted index would be over-engineered, and it sidesteps i18n
+ * invalidation (description picks per current UI lang at query time).
  */
 
 import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 
 import {
-  WS_ROOT, userChatsDir, userSkillChatDir, userAgentChatDir,
+  WS_ROOT, userChatsDir,
   userContextsIndexPath, userChatsIndexPath,
-  userSkillChatsIndexPath, userAgentChatsIndexPath,
+  userSearchDir,
 } from '../../paths';
 import { getActiveUserId } from '../users';
 import { createLogger } from '../../logger';
+import { t } from '../../i18n';
 
 const log = createLogger('search');
 
@@ -35,9 +43,8 @@ import * as indexer from './indexer';
 
 export {
   upsertContext, dropContext,
-  indexChatMessage, indexSkillChatMessage, indexAgentChatMessage,
-  reindexSkillChatFile,
-  dropChatConversation, dropSkillChat, dropAgentChat,
+  indexChatMessage,
+  dropChatConversation,
   flushAll,
 } from './indexer';
 
@@ -56,7 +63,7 @@ interface SourceCache {
 }
 
 export interface SearchResult {
-  kind: 'context' | 'chat' | 'skill_chat' | 'agent_chat';
+  kind: 'context' | 'chat' | 'agent' | 'skill';
   score: number;
   snippet: string;
   [extra: string]: unknown;
@@ -213,67 +220,127 @@ export async function searchChats(userId: string, query: string): Promise<Search
       kind: 'chat',
       cid: doc.cid,
       msg_index: doc.msg_index,
-      conv_title: titles[String(doc.cid)] || '新对话',
+      conv_title: titles[String(doc.cid)] || t('chat.default_title'),
       role: doc.role,
       time: doc.time,
-      snippet: _makeSnippet(msg && typeof msg.content === 'string' ? msg.content : '', q),
+      snippet: _makeSnippet(indexer.readMsgText(msg as any), q),
       score,
     };
   });
 }
 
-export async function searchSkillChats(userId: string, query: string): Promise<SearchResult[]> {
-  const q = (query || '').trim();
-  if (!q) return [];
-  const entry = await indexer.getEntry(userSkillChatsIndexPath(userId), 'skill_chat');
-  const tokens = tokenize(q);
-  const scores = _scoreIndex(entry.idx as RuntimeIndex, tokens);
-  const cache = _makeSourceCache();
-  return _topN<SearchResult>(scores, MAX_PER_KIND, (docId, score) => {
-    const doc = entry.idx.docs[docId] as Doc & { skill_id?: string; msg_index?: number; role?: string; time?: string };
-    if (!doc) return null;
-    const file = path.join(userSkillChatDir(userId, String(doc.skill_id)), 'chat.jsonl');
-    const msg = cache.jsonlMessage(file, Number(doc.msg_index));
-    return {
-      kind: 'skill_chat',
-      skill_id: doc.skill_id,
-      msg_index: doc.msg_index,
-      role: doc.role,
-      time: doc.time,
-      snippet: _makeSnippet(msg && typeof msg.content === 'string' ? msg.content : '', q),
-      score,
-    };
-  });
+// ── Agent / skill body search (in-memory, no persistent index) ──────────
+//
+// Score scheme (shared across both):
+//   name === q                  : 100
+//   name startsWith q           : 50
+//   name includes q             : 30
+//   description includes q      : 10
+//   else                        : 0   (filtered out)
+//
+// All comparisons are case-insensitive. Description picks the current UI
+// language via the renderer-side `pickDescription` resolver — we do the
+// same lookup here against the bilingual fields directly to avoid a
+// circular dep into core-agent.
+
+function _matchScore(name: string, description: string, qLower: string): number {
+  const n = (name || '').toLowerCase();
+  const d = (description || '').toLowerCase();
+  if (!qLower) return 0;
+  if (n === qLower)         return 100;
+  if (n.startsWith(qLower)) return 50;
+  if (n.includes(qLower))   return 30;
+  if (d.includes(qLower))   return 10;
+  return 0;
 }
 
-export async function searchAgentChats(userId: string, query: string): Promise<SearchResult[]> {
+function _descSnippet(description: string, qLower: string): string {
+  if (!description) return '';
+  const flat = description.replace(/\s+/g, ' ');
+  const lower = flat.toLowerCase();
+  const idx = qLower ? lower.indexOf(qLower) : -1;
+  if (idx < 0) return flat.slice(0, SNIPPET_RADIUS * 2);
+  const start = Math.max(0, idx - SNIPPET_RADIUS);
+  const end = Math.min(flat.length, idx + qLower.length + SNIPPET_RADIUS);
+  return (start > 0 ? '…' : '') + flat.slice(start, end) + (end < flat.length ? '…' : '');
+}
+
+async function _currentLang(): Promise<'zh' | 'en'> {
+  try {
+    const { getCurrentLang } = await import('../../i18n');
+    return getCurrentLang() === 'zh' ? 'zh' : 'en';
+  } catch { return 'en'; }
+}
+
+function _pickDesc(item: { description_zh?: string; description_en?: string }, lang: 'zh' | 'en'): string {
+  const primary = lang === 'zh' ? item.description_zh : item.description_en;
+  if (primary && primary.trim()) return primary;
+  const fallback = lang === 'zh' ? item.description_en : item.description_zh;
+  return fallback || '';
+}
+
+export async function searchAgents(_userId: string, query: string): Promise<SearchResult[]> {
   const q = (query || '').trim();
   if (!q) return [];
-  const entry = await indexer.getEntry(userAgentChatsIndexPath(userId), 'agent_chat');
-  const tokens = tokenize(q);
-  const scores = _scoreIndex(entry.idx as RuntimeIndex, tokens);
-  const cache = _makeSourceCache();
-  return _topN<SearchResult>(scores, MAX_PER_KIND, (docId, score) => {
-    const doc = entry.idx.docs[docId] as Doc & { agent_id?: string; msg_index?: number; role?: string; time?: string };
-    if (!doc) return null;
-    const file = path.join(userAgentChatDir(userId, String(doc.agent_id)), 'chat.jsonl');
-    const msg = cache.jsonlMessage(file, Number(doc.msg_index));
-    return {
-      kind: 'agent_chat',
-      agent_id: doc.agent_id,
-      msg_index: doc.msg_index,
-      role: doc.role,
-      time: doc.time,
-      snippet: _makeSnippet(msg && typeof msg.content === 'string' ? msg.content : '', q),
+  const qLower = q.toLowerCase();
+  const lang = await _currentLang();
+  const { listAgents } = await import('../agents');
+  const list = await listAgents();
+  const scored: SearchResult[] = [];
+  for (const a of list) {
+    const desc = _pickDesc(a, lang);
+    const score = _matchScore(a.name || '', desc, qLower);
+    if (score <= 0) continue;
+    scored.push({
+      kind: 'agent',
+      id: a.agent_id,
+      name: a.name || a.agent_id,
+      description: desc,
+      source: a.source,
+      snippet: _descSnippet(desc, qLower) || (a.name || ''),
       score,
-    };
-  });
+    });
+  }
+  scored.sort((a, b) =>
+    b.score - a.score || String(a.name).localeCompare(String(b.name)));
+  return scored.slice(0, MAX_PER_KIND);
+}
+
+export async function searchSkills(_userId: string, query: string): Promise<SearchResult[]> {
+  const q = (query || '').trim();
+  if (!q) return [];
+  const qLower = q.toLowerCase();
+  const lang = await _currentLang();
+  const { listSkills } = await import('../skills');
+  const list = await listSkills();
+  const scored: SearchResult[] = [];
+  for (const s of list) {
+    const desc = _pickDesc(s, lang);
+    const score = _matchScore(s.name || s.id, desc, qLower);
+    if (score <= 0) continue;
+    scored.push({
+      kind: 'skill',
+      id: s.id,
+      name: s.name || s.id,
+      description: desc,
+      source: s.source,
+      snippet: _descSnippet(desc, qLower) || (s.name || s.id),
+      score,
+    });
+  }
+  scored.sort((a, b) =>
+    b.score - a.score || String(a.name).localeCompare(String(b.name)));
+  return scored.slice(0, MAX_PER_KIND);
 }
 
 /**
  * Run every kind's reconcile once — intended for startup or post-sync hooks.
  * Walks every user dir under WS_ROOT for per-user indexes. Runs in parallel
  * and logs progress so a long first-boot build shows up in the log.
+ *
+ * Also unlinks legacy `skill_chats.idx.json` / `agent_chats.idx.json` files
+ * left behind by older builds — those scopes were dropped from search and
+ * the files would otherwise sit forever as orphaned ~MBs in local/search/.
  */
 export async function reconcileAll(): Promise<void> {
   const t0 = Date.now();
@@ -286,8 +353,7 @@ export async function reconcileAll(): Promise<void> {
       if (uid === 'logs' || uid === 'builtin') continue;
       tasks.push(indexer.reconcileContextsIndex(uid));
       tasks.push(indexer.reconcileChatsIndex(uid));
-      tasks.push(indexer.reconcileSkillChatsIndex(uid));
-      tasks.push(indexer.reconcileAgentChatsIndex(uid));
+      tasks.push(_unlinkLegacyIndexes(uid));
     }
   }
   const results = await Promise.allSettled(tasks);
@@ -295,7 +361,18 @@ export async function reconcileAll(): Promise<void> {
   log.info(`reconcileAll done in ${Date.now() - t0}ms (${tasks.length} idx, ${failed} failed)`);
 }
 
-export interface SearchAllOptions { limit?: number; scope?: 'all' | 'context' | 'chat' | 'skill' | 'agent' }
+async function _unlinkLegacyIndexes(uid: string): Promise<void> {
+  for (const name of ['skill_chats.idx.json', 'agent_chats.idx.json']) {
+    const p = path.join(userSearchDir(uid), name);
+    try { await fsp.unlink(p); }
+    catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT') log.warn(`legacy idx unlink ${p}: ${(err as Error).message}`);
+    }
+  }
+}
+
+export interface SearchAllOptions { limit?: number; scope?: 'all' | 'context' | 'chat' | 'agent' | 'skill' }
 
 export async function searchAll(
   userId: string, query: string, { limit = 30, scope = 'all' }: SearchAllOptions = {},
@@ -306,8 +383,8 @@ export async function searchAll(
   const tasks: Array<Promise<void>> = [];
   if (scope === 'all' || scope === 'context') tasks.push(searchContexts(q).then((r) => { buckets.push(...r); }));
   if (scope === 'all' || scope === 'chat')    tasks.push(searchChats(userId, q).then((r) => { buckets.push(...r); }));
-  if (scope === 'all' || scope === 'skill')   tasks.push(searchSkillChats(userId, q).then((r) => { buckets.push(...r); }));
-  if (scope === 'all' || scope === 'agent')   tasks.push(searchAgentChats(userId, q).then((r) => { buckets.push(...r); }));
+  if (scope === 'all' || scope === 'agent')   tasks.push(searchAgents(userId, q).then((r) => { buckets.push(...r); }));
+  if (scope === 'all' || scope === 'skill')   tasks.push(searchSkills(userId, q).then((r) => { buckets.push(...r); }));
   await Promise.all(tasks);
   buckets.sort((a, b) => b.score - a.score);
   return { results: buckets.slice(0, limit), total: buckets.length };

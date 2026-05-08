@@ -19,6 +19,7 @@ import { dialog, BrowserWindow, shell } from 'electron';
 import { DEFAULT_USER_WORKSPACE, userWorkspaceConfigFile } from '../paths';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
+import { pruneOrphans } from './file_indexer';
 
 const log = createLogger('user-workspace');
 
@@ -127,6 +128,7 @@ export function setWorkspacePath(
     recentPaths: recents.slice(0, MAX_RECENT),
   });
   log.info('workspace path updated', { userId, path: resolved });
+  _sweepFileCacheForWorkspace(userId, resolved);
   return { ok: true, path: resolved };
 }
 
@@ -148,7 +150,23 @@ export function resetWorkspacePath(userId: string): { ok: true; path: string } {
     recentPaths: recents.slice(0, MAX_RECENT),
   });
   log.info('workspace path reset to default', { userId });
+  _sweepFileCacheForWorkspace(userId, DEFAULT_USER_WORKSPACE);
   return { ok: true, path: DEFAULT_USER_WORKSPACE };
+}
+
+/** Workspace switched — drop file_cache entries whose source lives outside
+ *  the new workspace. Fire-and-forget; cache pruning failure must not
+ *  fail the user-visible "switch workspace" action. */
+function _sweepFileCacheForWorkspace(userId: string, workspacePath: string): void {
+  pruneOrphans(userId, { workspacePath })
+    .then((r) => {
+      if (r.deleted > 0) {
+        log.info(`file_cache sweep on workspace switch deleted=${r.deleted}`, { userId, workspacePath });
+      }
+    })
+    .catch((err) => {
+      log.warn(`file_cache sweep on workspace switch failed: ${(err as Error).message}`, { userId, workspacePath });
+    });
 }
 
 /**

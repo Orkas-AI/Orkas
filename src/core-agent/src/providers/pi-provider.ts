@@ -279,15 +279,17 @@ export function createPiProvider(config: {
   apiKey?: string;
   baseUrl?: string;
   /** Pre-built pi-ai Model object. Bypasses `getModel()` lookup — use for
-   *  providers not registered in pi-ai's catalog (e.g. Moonshot 开放平台)
-   *  where the `Model<"openai-completions">` shape is hand-constructed in
-   *  the caller. When set, `config.model` / `config.baseUrl` are ignored
-   *  (the Model already carries them). */
+   *  providers not registered in pi-ai's catalog (e.g. Moonshot's open
+   *  platform), where the `Model<"openai-completions">` shape is
+   *  hand-constructed by the caller. When set, `config.model` /
+   *  `config.baseUrl` are ignored (the Model already carries them). */
   customModel?: Model<Api>;
-  /** pi-ai 每个 provider 在 `buildParams` 之后、发请求之前都会调
-   *  `options.onPayload?(params, model)`，允许返回新 params 覆盖原 params。
-   *  透传到 pi-ai 的同名 hook，上层可借此注入厂商 server-side tools（如
-   *  `{type:"web_search_preview"}`）而不改 pi-ai 源码。 */
+  /** Each pi-ai provider invokes `options.onPayload?(params, model)`
+   *  after `buildParams` and before sending the request, allowing the
+   *  callback to return new params that overwrite the originals.
+   *  Forwarded directly to pi-ai's hook of the same name; the upper
+   *  layer can use it to inject vendor server-side tools (e.g.
+   *  `{type:"web_search_preview"}`) without modifying pi-ai source. */
   onPayload?: (params: unknown, model: Model<Api>) => unknown | Promise<unknown>;
   /** Default thinking level applied when the caller does not pass
    *  `params.reasoning`. Set this for models whose API requires

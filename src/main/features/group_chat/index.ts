@@ -16,9 +16,12 @@ import { readJsonl, rewriteJsonlLine, nowIso, safeId } from '../../storage';
 import { createLogger } from '../../logger';
 
 import {
-  USER_ID, readMembers, seedReservedActors, purgeGroupDir,
+  USER_ID, readMembers, readState, seedReservedActors, purgeGroupDir,
+  setCodingProjectDir,
 } from './state';
+import { isPlaceholderTitle } from './conv_workspace';
 import { readPlan, type PlanFile } from './plan';
+import * as planExecutor from './plan_executor';
 import {
   abort as busAbort, dropConv as busDropConv, enqueue, subscribe, isQuiescent,
   type GroupEvent,
@@ -39,7 +42,7 @@ export const subscribeBus = subscribe;
 export { startWatchdog, stopWatchdog } from './watchdog';
 import type { GroupMessage } from './visibility';
 import {
-  type ChatFormPayload, encodeSubmission,
+  type ChatFormPayload, encodeSubmission, buildMention,
 } from './router';
 
 const log = createLogger('group_chat.facade');
@@ -64,13 +67,13 @@ export async function send(
   if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
   if (!text || !text.trim()) return { ok: false, error: 'empty message' };
   await seedReservedActors(userId, cid);
-  // Auto-title: the first real user message in a fresh "新对话" / unnamed
+  // Auto-title: the first real user message in a fresh / unnamed
   // conversation overwrites the placeholder title so the sidebar item
   // becomes scannable. Lazy-imported to avoid a chats↔group_chat circular.
   try {
     const chats = await import('../chats');
     const conv = await chats.getConversation(userId, cid);
-    if (conv && (!conv.title || conv.title === '新对话')) {
+    if (conv && isPlaceholderTitle(conv.title)) {
       await chats.updateConversation(userId, cid, { title: chats.autoTitle(text) });
     }
   } catch (err) {
@@ -112,7 +115,8 @@ export async function listMembers(userId: string, cid: string) {
   // can decide on its own whether to auto-target the input box at this agent
   // when its plan step goes in_progress. Read from the live agent file each
   // call (no caching) — agents.ts maintains its own list cache so the read
-  // is cheap, and "interactive 跟随 agent 当前配置" is the contract.
+  // is cheap, and "interactive follows the agent's current spec" is the
+  // contract.
   const agentsFeat = await import('../agents');
   const enriched = await Promise.all(m.actors.map(async (a) => {
     if (a.kind !== 'agent') return a;
@@ -132,6 +136,24 @@ export async function readPlanForCid(
   if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
   const plan = await readPlan(userId, cid);
   return { ok: true, plan: plan || null };
+}
+
+/** User-initiated retry of a failed plan step (rail "Retry" button). */
+export async function retryStep(
+  userId: string, cid: string, stepIndex: number,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
+  if (!Number.isFinite(stepIndex) || stepIndex < 1) return { ok: false, error: 'invalid stepIndex' };
+  return planExecutor.retryStep(userId, cid, stepIndex);
+}
+
+/** User-initiated skip of a failed plan step (rail "Skip" button). */
+export async function skipStep(
+  userId: string, cid: string, stepIndex: number,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
+  if (!Number.isFinite(stepIndex) || stepIndex < 1) return { ok: false, error: 'invalid stepIndex' };
+  return planExecutor.skipStep(userId, cid, stepIndex);
 }
 
 // ── Streaming events ─────────────────────────────────────────────────────
@@ -237,6 +259,28 @@ export async function markFormSubmittedAndDispatch(
   }
   log.info(`form-submitted user=${userId} cid=${cid} msgId=${msgId} agent=${agentId} fields=${target.form.fields.length}`);
 
+  // Coding-agent contract: when a `project_dir` field is present in the
+  // submitted form for an external claude / codex agent, persist it to
+  // conv state so `_runCliAgentTurn` can spawn the CLI inside that
+  // directory. Other form values stay only in the message log — the
+  // agent extracts them from the encoded submission text.
+  try {
+    const projDir = values && typeof (values as any).project_dir === 'string'
+      ? String((values as any).project_dir).trim()
+      : '';
+    if (projDir) {
+      const agentsFeat = await import('../agents');
+      const ag = await agentsFeat.getAgent(agentId);
+      const cli = ag?.runtime?.kind === 'cli' ? ag.runtime.cli : '';
+      if (agentsFeat.cliIsCodingAgent(cli)) {
+        await setCodingProjectDir(userId, cid, projDir);
+        log.info(`coding project_dir set user=${userId} cid=${cid} agent=${agentId} dir=${projDir}`);
+      }
+    }
+  } catch (err) {
+    log.warn(`form-submit project_dir hook failed: ${(err as Error).message}`);
+  }
+
   const sliceFile = groupChatVisibilityFile(userId, cid, agentId);
   if (fs.existsSync(sliceFile)) {
     const slice = await readJsonl<GroupMessage>(sliceFile, 100_000);
@@ -253,19 +297,23 @@ export async function markFormSubmittedAndDispatch(
     { form_id: formId, agent_id: agentId, fields: target.form.fields },
     values,
   );
-  // Prepend `@<agent-name>` (not the hex id) so the bubble reads naturally.
-  // Bus's name → id resolver still routes correctly via `agentNameToId`,
-  // and falling back to the id keeps the dispatch working if the agent
-  // was renamed/disabled between form emit and submit.
-  let mention = `@${agentId}`;
+  // `buildMention` keeps the display name verbatim (whitespace included);
+  // falling back to the id keeps the dispatch working if the agent was
+  // renamed/disabled between form emit and submit.
+  let mention = buildMention(agentId);
   try {
     const agentsFeat = await import('../agents');
     const ag = await agentsFeat.getAgent(agentId);
-    if (ag && ag.name) mention = `@${ag.name.replace(/\s+/g, '')}`;
+    if (ag && ag.name) mention = buildMention(ag.name);
   } catch (err) {
     log.warn(`form-submit name lookup failed agent=${agentId}: ${(err as Error).message}`);
   }
-  return { ok: true, submission: { text: `${mention} ${encoded}`, agent_id: agentId } };
+  // Newline (not space) between the @-mention and the bullet list so the
+  // markdown renderer treats them as a paragraph followed by a list. With a
+  // space, the leading `- ` of the first bullet sits inline with the mention
+  // and gets parsed as a hyphen in prose, dropping the first field out of
+  // the list and leaving subsequent bullets visually orphaned.
+  return { ok: true, submission: { text: `${mention}\n${encoded}`, agent_id: agentId } };
 }
 
 // ── Read messages (UI initial load) ──────────────────────────────────────

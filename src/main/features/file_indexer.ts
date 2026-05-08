@@ -436,13 +436,25 @@ export function invalidateFileCache(userId: string, absPath: string): void {
 }
 
 /** Startup sweep: drop cache dirs whose source is gone, whose version is
- *  obsolete, or whose meta is malformed. Cheap (stat per dir), no network. */
-export async function pruneOrphans(userId: string): Promise<{ deleted: number }> {
+ *  obsolete, or whose meta is malformed. Cheap (stat per dir), no network.
+ *
+ *  Optional `workspacePath`: when supplied, additionally drops
+ *  `source==='workspace'` entries whose `absPath` is no longer inside the
+ *  current workspace (e.g. user switched workspace dir, or moved the file
+ *  out of it). Attachment-source entries are NOT subject to this check —
+ *  they live in `<uid>/cloud/chat_attachments/`, separate from workspace.
+ *  Without `workspacePath` the call behaves exactly as before. */
+export async function pruneOrphans(
+  userId: string,
+  opts?: { workspacePath?: string },
+): Promise<{ deleted: number }> {
   const root = userFileCacheDir(userId);
   let deleted = 0;
   let items: fs.Dirent[];
   try { items = fs.readdirSync(root, { withFileTypes: true }); }
   catch { return { deleted: 0 }; }
+
+  const wsRoot = opts?.workspacePath ? path.resolve(opts.workspacePath) : '';
 
   for (const e of items) {
     if (!e.isDirectory()) continue;
@@ -452,6 +464,7 @@ export async function pruneOrphans(userId: string): Promise<{ deleted: number }>
       !meta ? 'no-meta' :
       meta.cacheVersion !== EXTRACT_CACHE_VERSION ? 'version' :
       !safeExistsSync(meta.absPath) ? 'orphan' :
+      (wsRoot && meta.source === 'workspace' && !_isUnder(meta.absPath, wsRoot)) ? 'out-of-workspace' :
       null;
     if (reason) {
       removeDir(dir);
@@ -461,6 +474,13 @@ export async function pruneOrphans(userId: string): Promise<{ deleted: number }>
   }
   if (deleted) log.info(`pruneOrphans user=${userId} deleted=${deleted}`);
   return { deleted };
+}
+
+/** True iff `abs` is `root` itself or any descendant of it. Uses
+ *  `path.relative` so it's robust against trailing slashes and `..`. */
+function _isUnder(abs: string, root: string): boolean {
+  const rel = path.relative(root, path.resolve(abs));
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 }
 
 /** Drop all cache entries tagged with the given cid. Called from

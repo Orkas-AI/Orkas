@@ -34,18 +34,17 @@ import {
   GroupMessage, appendVisible, readSlice, buildReplayPrefix,
 } from './visibility';
 import {
-  resolveRecipients, parseMentions,
+  resolveRecipients, parseMentions, buildMention,
   extractFormFromFinal, computeFormId, ChatFormPayload,
-  extractAgentFieldBlocks,
+  extractAgentFieldBlocks, decodeSubmission,
 } from './router';
 import {
   setPlan, updateStep, readPlan, formatPlanAnnouncement, formatPlanForPrompt,
   PlanSetInput, StepStatus, PlanFile,
 } from './plan';
 import * as planExecutor from './plan_executor';
-import { userChatsDir, BUILTIN_SKILLS_DIR, userSkillsDir } from '../../paths';
+import { userChatsDir, BUILTIN_SKILLS_DIR, userSkillsDir, BUILTIN_AGENTS_DIR, userAgentsDir } from '../../paths';
 import * as agentsFeat from '../agents';
-import * as userWorkspace from '../user_workspace';
 import { isAgentEnabled } from '../component_enabled';
 import { buildLanguageDirective, t } from '../../i18n';
 
@@ -78,7 +77,7 @@ export type GroupEvent =
    * append a new bubble alongside (turn_end=false). Without this distinction,
    * a tool-emitted mid-turn message wrongly consumes commander's placeholder
    * and a NEW placeholder gets recreated by post-tool process events, ending
-   * up as a stuck "思考中" bubble when commander's turn ends silently. */
+   * up as a stuck "thinking" bubble when commander's turn ends silently. */
   | { type: 'message'; cid: string; msg: GroupMessage; turn_end?: boolean }
   | { type: 'process'; cid: string; actor: string; data: Record<string, unknown> }
   | { type: 'plan_changed'; cid: string }
@@ -115,7 +114,7 @@ interface QueueItem {
    * them as an observer (e.g. commander wakes on every agent → user reply
    * so it can advance the plan). If the LLM produces an empty final, the
    * post-turn enqueue is suppressed — otherwise every silent observation
-   * would emit a "（无回复）" placeholder bubble and pollute the chat. */
+   * would emit a "(no reply)" placeholder bubble and pollute the chat. */
   tap?: boolean;
   /** Plan-executor stamp: the plan step (1-based index) whose dispatch
    * created this turn. When the turn ends, `plan_executor.reconcile` uses
@@ -144,7 +143,7 @@ interface WorkerState {
   pendingPlanAnnouncement?: string;
   /** Single-agent dispatches staged by `dispatch_to` mid-turn; flushed via
    * `bus.enqueue(forceTo=[X], dispatch:true)` at runTurn end so the recipient
-   * worker can't抢跑 — it only wakes after commander's text reply persisted +
+   * worker can't jump the gun — it only wakes after commander's text reply persisted +
    * placeholder cleaned. Same staging pattern as pendingPlanAnnouncement +
    * deferred planExecutor.reconcile, just for direct dispatches. */
   pendingDispatches?: Array<{ to: string; message: string }>;
@@ -232,7 +231,7 @@ export function isQuiescent(uid: string, cid: string): boolean {
 /** Recompute the on-disk `status` field based on actual worker / queue
  *  state. Honors the sticky `aborted` flag — once aborted, ONLY an
  *  explicit USER `enqueue` clears it (so a follow-up worker reply
- *  triggered by the abort itself, like the "（已中断）" message,
+ *  triggered by the abort itself, like the "(stopped)" message,
  *  doesn't surreptitiously revert status to 'idle'). The whole
  *  read-decide-write is mutex-guarded via `transitionStatus`, so a
  *  concurrent `setStatus('aborted')` (from `bus.abort`) cannot land
@@ -337,7 +336,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
 
   // Reset the sticky `aborted` flag ONLY when the human (user) sends
   // a fresh message. Worker-emitted enqueues (commander/agent post-turn
-  // replies, including the abort-cleanup "（已中断）") must NOT clear
+  // replies, including the abort-cleanup "(stopped)" message) must NOT clear
   // the abort — otherwise a worker's own post-abort message would silently
   // un-stick the conversation and the next state_changed would flip back
   // to 'idle'/'running'.
@@ -361,7 +360,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     to = params.forceTo.slice();
   } else {
     // Build a global name → id map from the enabled agent registry so the
-    // router can resolve `@<人类可读名字>` mentions. Keys are normalized
+    // router can resolve `@<human-readable-name>` mentions. Keys are normalized
     // (lowercase + whitespace stripped) to match router's normalization,
     // so display names containing spaces ("Writing Helper") or mixed case
     // resolve correctly against the user's `@WritingHelper` token.
@@ -472,24 +471,25 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   // turns in its own session jsonl and mimics that pattern; cleaning the
   // output stream is more reliable than keeping the prompt perfectly tuned.
   // Only rewrites whole-token matches (regex word boundary) so embedded
-  // ids inside other content don't get touched.
+  // ids inside other content don't get touched. `buildMention` preserves
+  // whitespace in multi-word display names (see its header).
   let rewrittenText = text;
   for (const [aid, name] of idToName) {
     if (!name || name === aid) continue;
     const safeAid = aid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const re = new RegExp(`@${safeAid}\\b`, 'g');
-    rewrittenText = rewrittenText.replace(re, `@${name.replace(/\s+/g, '')}`);
+    rewrittenText = rewrittenText.replace(re, buildMention(name));
   }
 
   // Strip ALL `@user` / `@commander` mentions when they're the routed
   // recipient — not just leading. The addressee lives in `to`; any literal
   // `@<recipient>` in the body is redundant noise. Mid-prose mentions
-  // ("好的 @user，关于...") are common LLM filler that users find annoying.
+  // (e.g. "ok @user, about...") are common LLM filler that users find annoying.
   // Why ONLY user/commander and not agents: `@<agent>` from commander is
   // informational (shows observers which agent got dispatched), so we keep
   // those. Agents addressing user/commander gain nothing from the literal.
-  // Aliases (`@指挥官` / `@用户`) get the same treatment so Chinese-form
-  // mentions don't slip through.
+  // The Chinese aliases (`@指挥官` / `@用户`) get the same treatment so
+  // Chinese-form mentions don't slip through.
   const stripTokens = new Set<string>();
   for (const r of to) {
     if (r === USER_ID) {
@@ -504,8 +504,8 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     // Strip the `@<token>` itself (preserving any preceding separator), then
     // run a tidy pass to fix the whitespace/punctuation orphans the strip
     // creates. This 2-step keeps prose punctuation around the mention
-    // intact: "收到 @user，关于" → "收到，关于" (comma stays), but
-    // "好 @user 的" → "好 的" (space-bounded mid-word).
+    // intact: "received @user, about" → "received, about" (comma stays),
+    // but "ok @user end" → "ok end" (space-bounded mid-word).
     for (const tok of stripTokens) {
       const safeTok = tok.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const re = new RegExp(
@@ -593,7 +593,8 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   // orchestration role at all — letting it stay asleep keeps the chat
   // clean and avoids prompt-driven mistakes (the model second-guessing the
   // agent's form / re-dispatching for "polish").
-  // Edge case: agent explicitly `@指挥官` to escalate. That message has
+  // Edge case: an agent explicitly mentions the commander to escalate
+  // (e.g. `@commander` / `@指挥官`). That message has
   // commander in `to`, so it goes through the regular dispatch loop above.
 
   // User-driven reconcile: when user enqueues, plan_executor needs a chance
@@ -710,7 +711,14 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
 
   const sessionId = actorSessionId(uid, cid, actor);
   const isCommander = actor.kind === 'commander';
-  const workingDir = userWorkspace.getWorkspacePath(uid);
+  // Per-conv subdir under the user's root workspace — keeps repeat
+  // agent runs writing the same basename grouped together instead of
+  // littering the root with `requirements-2.md / -3.md / ...`. Lazy:
+  // first call mkdirs + persists `state.json::workspace_dir`. Old convs
+  // with no `workspace_dir` field fall back to the root workspace, so
+  // there's no migration story.
+  const { getConversationWorkspacePath } = await import('./conv_workspace');
+  const workingDir = await getConversationWorkspacePath(uid, cid);
 
   // First-turn replay: if the persistent session jsonl doesn't exist yet,
   // prepend a `<group-chat-history>` block built from the visibility slice
@@ -750,6 +758,10 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   let systemPrompt: string;
   let extraTools: AgentTool[] = [];
   let skillList: string[] | undefined;
+  // CLI-backed agents fetch the spec but skip systemPrompt / skillList /
+  // extraTools — the LLM stream is replaced below by `runCliAgentTurn`.
+  // Hoisted here so the branch below can read it without re-fetching.
+  let cliAgent: import('../agents').Agent | null = null;
   if (isCommander) {
     systemPrompt = await buildCommanderSystemPrompt(uid, cid);
     extraTools = await buildCommanderExtraTools(state, w);
@@ -762,8 +774,13 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       // when this returns. We DON'T touch it here.
       return;
     }
-    systemPrompt = await buildAgentInGroupSystemPrompt(uid, agent, workingDir);
-    skillList = Array.isArray(agent.skill_list) ? agent.skill_list : undefined;
+    if (agentsFeat.isCliAgent(agent)) {
+      cliAgent = agent;
+      systemPrompt = ''; // unused on CLI path
+    } else {
+      systemPrompt = await buildAgentInGroupSystemPrompt(uid, agent, workingDir);
+      skillList = Array.isArray(agent.skill_list) ? agent.skill_list : undefined;
+    }
   }
 
   // Streaming.
@@ -786,7 +803,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // Used as the salvage source when the user aborts mid-stream — the
   // event-mapper emits `error` (not `final`) on abort, so without this
   // accumulator the partial reply the user already saw rendering would be
-  // discarded and we'd persist a bare "（已中断）" placeholder. Same pattern
+  // discarded and we'd persist a bare "(stopped)" placeholder. Same pattern
   // as `agents.ts::streamSendToAgentEditChat` (skill / agent edit chats).
   let streamingText = '';
   let errText: string | null = null;
@@ -815,9 +832,93 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // skill body before executing. Path-sandbox blocks anything outside
   // workspace + attachment dir by default, so we have to expose the two
   // skill roots here as `extraRoots` (mirrors the skill-edit chat pattern
-  // in features/skills.ts). Builtin first to match the prompt's "按来源
-  // 定位" guidance.
+  // in features/skills.ts). Builtin first to match the prompt's
+  // "locate by source" guidance.
   const skillRoots = [BUILTIN_SKILLS_DIR, userSkillsDir(uid)];
+  // Same shape for agent directories: chat_commander.md tells the
+  // commander to `search_files` for an agent.json under
+  // `$custom_agents_dir/` and then `read_file` the matching agent.json
+  // before emitting an `<agent>` edit container — without these roots
+  // the read trips E_PATH_OUT_OF_SCOPE and the LLM falls back to
+  // rewriting from the slim `agents_index` view, which silently drops
+  // workflow / description / skill_list (the prompt warns about this).
+  const agentRoots = [BUILTIN_AGENTS_DIR, userAgentsDir(uid)];
+  if (cliAgent) {
+    // CLI-backed agent path: spawn the local CLI in the user's workspace
+    // and forward its events as `process` events so the same UI rail
+    // renders. The output text becomes finalText; failures populate
+    // errText so the existing post-stream logic surfaces a ⚠️ bubble.
+    //
+    // **CLI cwd = root workspace** (NOT the per-conv subdir used by the
+    // in-process branch). CLI session stores are cwd-hashed —
+    // `claude code` keeps sessions under `~/.claude/projects/<encoded-cwd>/`
+    // — so changing cwd between dispatches breaks `--resume <id>` with
+    // "No conversation found with session ID …". The per-conv subdir
+    // exists to group repeat-run artefacts from the in-process LLM's
+    // `write_file` tool; CLI agents have their own product-side
+    // conventions and don't need that scoping. Override here:
+    const userWorkspace = await import('../user_workspace');
+    const wsRoot = userWorkspace.getWorkspacePath(uid);
+    // Coding agents (claude / codex) honour the per-conversation
+    // `coding_project_dir` when set so the CLI runs inside the user's
+    // actual project; non-coding CLIs always use the workspace. The
+    // chip in the conversation surface lets the user set/change the
+    // dir mid-conversation. We also defensively check the directory
+    // exists and is a real dir — if it vanished between picker and
+    // dispatch we fall back rather than failing the run.
+    const agentsFeat = await import('../agents');
+    let cliWorkingDir = wsRoot;
+    if (agentsFeat.cliIsCodingAgent(cliAgent.runtime?.kind === 'cli' ? cliAgent.runtime.cli : '')) {
+      const st = await import('./state');
+      const stateFile = await st.readState(uid, cid);
+      const projDir = stateFile.coding_project_dir;
+      if (projDir) {
+        try {
+          const fs = await import('node:fs');
+          if (fs.statSync(projDir).isDirectory()) cliWorkingDir = projDir;
+        } catch { /* missing → fall through to wsRoot */ }
+      }
+    }
+    try {
+      const slice = await readSlice(uid, cid, actor.id);
+      const cliOut = await _runCliAgentTurn({
+        uid, cid, actor, agent: cliAgent,
+        item, slice, workingDir: cliWorkingDir,
+        signal: w.abortController.signal,
+        onProcess: data => {
+          // Mirror the LLM path: count every event for activity, but
+          // persist only `progress` and `event` shapes into processItems
+          // — `delta` text streams into the live bubble and is recovered
+          // from the final body, not the rail.
+          activityEvents += 1;
+          if (processItems.length < MAX_PROCESS_ITEMS_PER_TURN) {
+            if (data.type === 'progress' && typeof data.text === 'string' && data.text) {
+              processItems.push({ type: 'progress', text: data.text });
+            } else if (data.type === 'event' && data.event && typeof data.event === 'object') {
+              const inner = data.event as { stream?: string; data?: unknown };
+              if (inner.stream) processItems.push({ type: 'event', event: { stream: inner.stream, data: inner.data } });
+            }
+          }
+          // For the live wire: `delta` streams into the placeholder
+          // bubble (token-by-token); other shapes feed the process
+          // rail. Renderer dispatch lives in conversation.js process
+          // event handler — see `data.type === 'delta'` branch.
+          emit(state, { type: 'process', cid, actor: actor.id, data: data as unknown as Record<string, unknown> });
+        },
+      });
+      finalText = cliOut.text;
+      streamingText = cliOut.text;
+      if (cliOut.error) errText = cliOut.error;
+      if (cliOut.aborted) aborted = true;
+    } catch (err) {
+      errText = (err as Error).message || String(err);
+      log.warn(`cli stream threw cid=${cid} actor=${actor.id}: ${errText}`);
+    } finally {
+      w.abortController = null;
+      await markInFlight(uid, cid, actor.id, false);
+      emit(state, { type: 'state_changed', cid, state: await readState(uid, cid) });
+    }
+  } else {
   try {
     for await (const ev of streamChatWithModel({
       userId: uid,
@@ -832,7 +933,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       hasProducedPath,
       cacheRetention: 'short',
       abortSignal: w.abortController.signal,
-      extraRoots: skillRoots,
+      extraRoots: [...skillRoots, ...agentRoots],
       ...(extraTools.length ? { extraTools } : {}),
       ...(skillList !== undefined ? { skillList } : {}),
     })) {
@@ -884,7 +985,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     // `final`) when the user hits stop, so `finalText` is empty even though
     // `streamingText` holds whatever the renderer was already rendering.
     // Push it into finalText so plan_executor's abort branches can preserve
-    // it instead of throwing away visible work as a bare "（已中断）" stub.
+    // it instead of throwing away visible work as a bare "(stopped)" stub.
     if (!finalText && streamingText) {
       finalText = streamingText;
     }
@@ -900,6 +1001,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     // the worker's perspective).
     emit(state, { type: 'state_changed', cid, state: await readState(uid, cid) });
   }
+  } // end LLM branch (paired with `if (cliAgent) { ... } else {` above)
 
   // ── Post-stream parsing (pure data extraction; no decisions) ──────────
   // Form / <agent> container extraction stays in bus because they're pure
@@ -907,7 +1009,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // failed) live in plan_executor.onTurnFinished.
   let workingText = finalText || '';
   let form: ChatFormPayload | undefined;
-  let createdAgent: { agent_id: string; name: string } | undefined;
+  let createdAgent: { agent_id: string; name: string; kind: 'created' | 'updated' } | undefined;
 
   if (actor.kind === 'agent' && workingText) {
     const r = extractFormFromFinal(workingText, actor.id);
@@ -925,18 +1027,46 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     const r = extractAgentFieldBlocks(workingText);
     if (Object.keys(r.fields).length) {
       workingText = r.cleanText;
+      // `<agent_id>` present → edit an existing custom agent;
+      // absent → create a new one. Same `<agent>` container shape;
+      // the dispatch decision is single-bit.
+      const editId = r.fields.agent_id;
       try {
-        const ag = await agentsFeat.createAgentFromBlocks(r.fields);
-        if (ag) {
-          createdAgent = { agent_id: ag.agent_id, name: ag.name };
+        if (editId) {
+          const target = await agentsFeat.getAgent(editId);
+          if (!target) {
+            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent edit failed: agent not found (id=${editId}).</span>`;
+          } else if (target.source !== 'custom') {
+            // Built-in agent — read-only here; the dev-mode inline edit chat
+            // remains the only path that can mutate builtins (per §6).
+            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Built-in agents can't be edited from the main chat; fork one in the right-hand detail panel and edit there.</span>`;
+          } else if (agentsFeat.isCliAgent(target)) {
+            // CLI-backed agent — runtime / model / args are owned by the
+            // create-modal + edit-form, not the LLM. Same constraint as
+            // chat_agent_setup_cli.md applies to the commander flow.
+            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ External agents can only be edited from the right-hand detail panel.</span>`;
+          } else {
+            const updated = await agentsFeat.updateCustomAgent(editId, r.fields);
+            if (updated) {
+              createdAgent = { agent_id: updated.agent_id, name: updated.name, kind: 'updated' };
+            } else {
+              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent update failed.</span>`;
+            }
+          }
         } else {
-          // Append failure marker to text — onTurnFinished will surface
-          // it as a normal `persist` outcome.
-          workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ 智能体创建失败：缺少必要字段（name / workflow）。</span>`;
+          const ag = await agentsFeat.createAgentFromBlocks(r.fields);
+          if (ag) {
+            createdAgent = { agent_id: ag.agent_id, name: ag.name, kind: 'created' };
+          } else {
+            // Append failure marker to text — onTurnFinished will surface
+            // it as a normal `persist` outcome.
+            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent creation failed: missing required field(s) (name / workflow).</span>`;
+          }
         }
       } catch (err) {
-        log.error(`create-agent failed cid=${cid}: ${(err as Error).message}`);
-        workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ 智能体创建失败：${(err as Error).message}</span>`;
+        const verb = editId ? 'edit' : 'create';
+        log.error(`${verb}-agent failed cid=${cid}: ${(err as Error).message}`);
+        workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent ${verb} failed: ${(err as Error).message}</span>`;
       }
     }
   }
@@ -977,7 +1107,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     // a stalled chat.
     outcome = {
       kind: 'persist',
-      text: workingText || '（无回复）',
+      text: workingText || '(no reply)',
       ...(form ? { form } : {}),
       ...(produced.length ? { produced } : {}),
       ...(createdAgent ? { createdAgent } : {}),
@@ -1001,9 +1131,39 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     }
   }
 
+  // Same UX rationale as the plan announcement merge: a commander turn
+  // that ONLY emitted dispatch_to(s) leaves an empty bubble below the
+  // process rail, which reads as "broken" to the user. Surface a brief
+  // summary line so the bubble is informative. Skipped when there's
+  // already a body (the LLM wrote prose alongside the dispatch — common
+  // for fallback flows), and when the bubble already carries the plan
+  // card from the merge above.
+  // "Visually empty" — also strips zero-width chars some LLMs emit as the
+  // body of a tool-only turn to dodge the framework's "empty response"
+  // detection (we've seen U+200B as a single-char body alongside a
+  // dispatch_to call). `.trim()` alone wouldn't catch them.
+  // U+200B–U+200D (ZWSP / ZWNJ / ZWJ) + U+FEFF (BOM).
+  const _isVisuallyEmpty = (s: string | undefined): boolean =>
+    !s || !s.replace(/[​-‍﻿]/g, '').trim();
+  if (actor.kind === 'commander'
+      && w.pendingDispatches && w.pendingDispatches.length
+      && outcome.kind === 'persist'
+      && _isVisuallyEmpty(outcome.text)) {
+    const tags: string[] = [];
+    for (const d of w.pendingDispatches) {
+      let name = d.to;
+      try {
+        const ag = await agentsFeat.getAgent(d.to);
+        if (ag && (ag as any).name) name = (ag as any).name;
+      } catch { /* fall back to raw id */ }
+      tags.push(buildMention(name));
+    }
+    outcome = { ...outcome, text: t('chat.commander_dispatch_only', { agents: tags.join(', ') }) };
+  }
+
   // Abort post-processing — single source of truth for both "promote silent
   // to persist when there's still something visible to keep" AND the
-  // "（已中断）" suffix.
+  // "(stopped)" suffix.
   //
   // plan_executor's abortOutcome can only see partial text + form / created
   // agent / produced files; it goes silent for anything else. But process
@@ -1050,7 +1210,8 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     // Any placeholder the renderer parked for this actor (e.g. a fresh one
     // created by post-tool process events after the original was consumed
     // by a mid-turn message) needs an explicit signal to clean up; otherwise
-    // a "思考中 + 过程信息" bubble lingers, vanishes only on page refresh.
+    // a "thinking + process info" bubble lingers, vanishing only on
+    // page refresh.
     emit(state, { type: 'turn_silent', cid, actor: actor.id });
   }
 
@@ -1073,7 +1234,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   }
 
   // Flush any `dispatch_to` calls staged during commander's turn. Same
-  // anti-抢跑 reasoning as the plan reconcile above: recipient workers are
+  // anti-jump-the-gun reasoning as the plan reconcile above: recipient workers are
   // only woken after commander's own turn fully settled (text persisted +
   // placeholder cleaned), so the user sees commander's reply before any
   // dispatched agent's reply. See WorkerState.pendingDispatches.
@@ -1117,7 +1278,8 @@ async function buildCommanderSystemPrompt(uid: string, cid: string): Promise<str
   const paths_ = await import('../../paths');
   const plan = await readPlan(uid, cid);
   const allAgentsList = await buildAgentsIndexBlock(uid);
-  const workingDir = userWorkspace.getWorkspacePath(uid);
+  const { getConversationWorkspacePath } = await import('./conv_workspace');
+  const workingDir = await getConversationWorkspacePath(uid, cid);
   const permState = (() => {
     try {
       const s = require('../permissions').getLocalExecState() as { granted: boolean };
@@ -1179,7 +1341,7 @@ async function buildAgentsIndexBlock(_uid: string): Promise<string> {
       // Lead with `@<name>` so the LLM picks up the calling convention
       // visually; id is hidden — exposing hex strings in prompts trains
       // the LLM to leak them in user-visible text too.
-      const head = `- @${name} (Source: ${a.source})${desc}`;
+      const head = `- ${buildMention(name)} (Source: ${a.source})${desc}`;
       // Inline a slimmed inputs_schema (id / type / required / default /
       // label / options / min / max / accept) so commander knows what
       // params each agent expects when phrasing its `@<name>` dispatch
@@ -1471,7 +1633,7 @@ export async function abort(uid: string, cid: string): Promise<void> {
     emit(state, { type: 'state_changed', cid, state: await readState(uid, cid) });
     // Wait for every aborted worker's runTurn to finish unwinding (stream
     // error → finally → abortOutcome → enqueue). Without this the bus's
-    // "（已中断）" + processItems message is still being persisted when
+    // "(stopped)" + processItems message is still being persisted when
     // abort() resolves; an external observer (renderer Cmd+R, an automation
     // script, a test) that re-reads `<cid>.jsonl` immediately after
     // groupChat.abort returns sees a truncated history and never picks up
@@ -1619,3 +1781,339 @@ planExecutor.bindBusHooks({
     if (state) emit(state, { type: 'plan_changed', cid });
   },
 });
+
+// ── CLI agent turn ────────────────────────────────────────────────────────
+//
+// CLI-backed agents replace the LLM stream loop in runTurn. We pack the
+// agent's full visibility slice + the dispatched message + any user
+// attachments into a single prompt, spawn the configured CLI in the
+// user's workspace, and stream events into the same `process` rail the
+// renderer already understands. The final body is the CLI's last
+// "result" text — assigned into runTurn's `finalText` so plan_executor /
+// post-turn enqueue keep working unchanged.
+//
+// Stateless on purpose: every dispatch starts a fresh CLI run. Session
+// continuity (`--resume`) is a future optimisation; for now the slice is
+// the source of truth.
+
+const CLI_PROMPT_MAX_BYTES = 200 * 1024;
+
+/** Build an `<agent-input-form>` block listing the agent's required
+ *  inputs that are still unfulfilled, or return `null` when nothing is
+ *  missing. Currently the only auto-injected input is `project_dir`
+ *  (coding agents only); we read its fulfilment from `state.coding_project_dir`.
+ *  Other required inputs the user has authored on the agent flow through
+ *  here too — for those we have no per-conv storage yet, so they're
+ *  re-asked on every dispatch (matches the "prompt every turn until
+ *  collected" behaviour the in-process branch already has). */
+async function _maybeBuildCliInputForm(
+  uid: string, cid: string, agent: import('../agents').Agent,
+): Promise<string | null> {
+  const inputs = Array.isArray(agent.inputs) ? agent.inputs : [];
+  if (!inputs.length) return null;
+  const required = inputs.filter((f) => f.required);
+  if (!required.length) return null;
+
+  const state = await readState(uid, cid);
+  const projectDir = state.coding_project_dir || '';
+
+  const isFulfilled = (fieldId: string): boolean => {
+    if (fieldId === 'project_dir') return !!projectDir;
+    return false;
+  };
+
+  const missing = required.filter((f) => !isFulfilled(f.id));
+  if (!missing.length) return null;
+
+  const body = JSON.stringify({
+    agent_id: agent.agent_id,
+    fields: missing,
+  });
+  return `<agent-input-form>\n${body}\n</agent-input-form>`;
+}
+
+async function _runCliAgentTurn(opts: {
+  uid: string;
+  cid: string;
+  actor: { id: string; kind: 'agent' | 'commander' | 'user' };
+  agent: import('../agents').Agent;
+  item: QueueItem;
+  slice: GroupMessage[];
+  workingDir: string;
+  signal: AbortSignal;
+  onProcess: (data: Record<string, unknown>) => void;
+}): Promise<{ text: string; error?: string; aborted?: boolean }> {
+  const runtime = opts.agent.runtime as Extract<NonNullable<import('../agents').AgentRuntime>, { kind: 'cli' }>;
+
+  // Required-input gate: a CLI agent never runs an LLM, so the form-emit
+  // logic in `chat_agent_in_group.md` (where in-process agents check their
+  // inputs_schema and emit `<agent-input-form>` themselves) doesn't fire.
+  // We mirror that here: if any required input is unfulfilled, return a
+  // synthetic body containing the form block — runTurn's
+  // `extractFormFromFinal` then lifts it into a `form` payload, the
+  // renderer shows the picker, and the user's submission re-dispatches
+  // through the standard pipeline. Only the `project_dir` input is
+  // currently auto-injected, but the gate is generic so future required
+  // inputs reuse the same path.
+  const formBlock = await _maybeBuildCliInputForm(opts.uid, opts.cid, opts.agent);
+  if (formBlock) return { text: formBlock };
+
+  // Look up any prior CLI session bound to this (cid, aid, cli). If
+  // present, we ask the CLI to resume it (claude: `--resume <id>`)
+  // and skip replaying the visibility slice in the prompt — the CLI
+  // already remembers the prior turns. First dispatch / fresh CLI
+  // swap → null → we replay the slice as before. Saves significant
+  // tokens and round-trip latency on long conversations.
+  const cliSessions = await import('../local_agents/sessions');
+  const resumeSessionId = await cliSessions.getSessionId(
+    opts.uid, opts.cid, opts.agent.agent_id, runtime.cli,
+  );
+  const promptText = await _buildCliPrompt(
+    opts.uid, opts.cid, opts.agent, opts.item, opts.slice, !!resumeSessionId,
+  );
+  const runner = await import('../local_agents/runner');
+
+  let accText = '';
+  let resultText = '';
+  let aborted = false;
+  let backendSessionId: string | undefined;
+  // Set when the CLI rejects our `--resume <id>` (e.g. claude code's
+  // "No conversation found with session ID …"). Triggers a one-time
+  // cleanup of the cliSessions binding so the next dispatch starts
+  // fresh instead of replaying the same broken resume forever. Detect
+  // by stderr-line pattern because there is no structured signal —
+  // each CLI phrases it slightly differently but they all carry the
+  // session-id hex.
+  let resumeRejected = false;
+  const _RESUME_REJECTED_PATTERNS = [
+    /No conversation found with session ID/i,
+    /session.*(not found|does not exist|expired|invalid)/i,
+  ];
+
+  const result = await runner.run({
+    uid: opts.uid,
+    cid: opts.cid,
+    agentId: opts.agent.agent_id,
+    cli: runtime.cli as import('../local_agents/registry').LocalCliType,
+    model: runtime.model,
+    customArgs: runtime.custom_args,
+    resumeSessionId: resumeSessionId || undefined,
+    prompt: promptText,
+    cwd: opts.workingDir,
+    signal: opts.signal,
+    onEvent: e => {
+      // Translate each LocalEvent into the `process` event shape the
+      // renderer's group-chat listener expects so output streams live
+      // into the placeholder bubble (text-delta) and the process rail
+      // (tool-event, stderr, process-info). Without this, the renderer
+      // treats every event as an unrecognized shape and only the final
+      // text appears at turn-end.
+      switch (e.type) {
+        case 'text-delta':
+          if (typeof (e as any).text === 'string') {
+            accText += (e as any).text as string;
+            opts.onProcess({ type: 'delta', text: (e as any).text });
+          }
+          break;
+        case 'thinking':
+          if (typeof (e as any).text === 'string') {
+            opts.onProcess({ type: 'progress', text: (e as any).text });
+          }
+          break;
+        case 'tool-event':
+        case 'process-info':
+        case 'status':
+          opts.onProcess({ type: 'event', event: { stream: 'cli', data: e as unknown as Record<string, unknown> } });
+          break;
+        case 'stderr-line':
+          if (resumeSessionId && typeof (e as any).line === 'string') {
+            const line = (e as any).line as string;
+            if (_RESUME_REJECTED_PATTERNS.some((re) => re.test(line))) resumeRejected = true;
+          }
+          opts.onProcess({ type: 'event', event: { stream: 'cli', data: e as unknown as Record<string, unknown> } });
+          break;
+        case 'done':
+          if (typeof (e as any).output === 'string') resultText = (e as any).output as string;
+          if ((e as any).status === 'cancelled') aborted = true;
+          if (typeof (e as any).sessionId === 'string') backendSessionId = (e as any).sessionId as string;
+          break;
+        default:
+          opts.onProcess({ type: 'event', event: { stream: 'cli', data: e as unknown as Record<string, unknown> } });
+      }
+    },
+  });
+
+  // Drop the stale resume binding before returning so a user-initiated
+  // retry starts a fresh CLI session instead of looping on the same
+  // expired id. Done unconditionally on rejection — even if the CLI
+  // somehow finished successfully, the resume id we sent is gone, and
+  // the binding is at best useless / at worst will fail again.
+  if (resumeRejected) {
+    log.warn(`cli session expired cid=${opts.cid} agent=${opts.agent.agent_id} cli=${runtime.cli} — clearing resume binding`);
+    cliSessions
+      .clearForAgent(opts.uid, opts.cid, opts.agent.agent_id)
+      .catch(() => { /* logged inside sessions.ts */ });
+  }
+
+  if (result.status === 'missing_cli') {
+    const msg = t('cli_agent.missing', { name: opts.agent.name || runtime.cli, cli: runtime.cli });
+    return { text: '', error: msg, aborted: false };
+  }
+  if (result.status === 'cancelled') {
+    return { text: resultText || accText, aborted: true };
+  }
+  if (result.status === 'failed' || result.status === 'timeout') {
+    const detail = result.error || (result.status === 'timeout' ? 'timeout' : 'failed');
+    // When the failure was a stale resume id, hint the user that a
+    // simple resend will recover (the binding has been cleared above).
+    const hint = resumeRejected ? ' — session expired; retry will start fresh.' : '';
+    return { text: resultText || accText, error: detail + hint };
+  }
+  // Successful turn — persist the (possibly new) session id so the
+  // next dispatch can resume. Claude reports its session id every
+  // turn; if a `--resume` lands on an expired session, claude
+  // silently allocates a new one and reports that as `sessionId` in
+  // the system/init record. Either way we save what's freshest. The
+  // write is fire-and-forget — failures only affect the next turn's
+  // optimisation, not correctness.
+  if (backendSessionId) {
+    cliSessions
+      .setSessionId(opts.uid, opts.cid, opts.agent.agent_id, runtime.cli, backendSessionId)
+      .catch(() => { /* logged inside sessions.ts */ });
+  }
+  return { text: resultText || accText };
+}
+
+async function _buildCliPrompt(
+  uid: string,
+  cid: string,
+  agent: import('../agents').Agent,
+  item: QueueItem,
+  slice: GroupMessage[],
+  /** When true, the CLI is resuming a prior session and already has
+   *  the conversation history in its own memory — we skip the slice
+   *  block entirely and just send "head + new task". Drops massive
+   *  redundancy on long convs. */
+  resuming: boolean,
+): Promise<string> {
+  // Build head + tail separately so truncation can throw away the
+  // middle of the conversation slice (oldest entries) while preserving
+  // the agent identity preamble + the actual task. The naive "trim
+  // from the head of the byte buffer" approach we used first dropped
+  // the role preamble — leaving the CLI without context about who it
+  // is or what it owns.
+  const headLines: string[] = [];
+  headLines.push(`You are "${agent.name || agent.agent_id}".`);
+  const desc = (agent.description_en || agent.description_zh || '').trim();
+  if (desc) headLines.push(desc);
+  headLines.push('');
+
+  // Attachments come from the dispatched message AND from prior slice
+  // messages — the agent might be expected to "look at the report you
+  // uploaded last turn", so we collect across the whole visibility
+  // slice. De-duplicate by absolute path; preserve oldest-first order.
+  const { chatAttachmentDir } = await import('../../paths');
+  const attDir = chatAttachmentDir(uid, cid);
+  const allAtts: string[] = [];
+  const seenAtts = new Set<string>();
+  const collect = (names: string[] | undefined) => {
+    if (!Array.isArray(names)) return;
+    for (const n of names) {
+      const abs = path.join(attDir, n);
+      if (!seenAtts.has(abs)) { seenAtts.add(abs); allAtts.push(abs); }
+    }
+  };
+  for (const m of slice) collect(m.attachments);
+  collect(item.attachments);
+  if (allAtts.length) {
+    headLines.push('## Attachments');
+    for (const abs of allAtts) headLines.push(`- ${abs}`);
+    headLines.push('');
+  }
+
+  const tailLines: string[] = [];
+  tailLines.push('## Your task');
+  // When the dispatched item is just a form submission (the user
+  // confirmed the input form, not a fresh ask), the task body is
+  // metadata — a `- project_dir: …` style summary + an
+  // `<agent-input-submission>`
+  // XML tag — with the original user request now sitting upstream in
+  // the slice. A coding CLI handed only that metadata has nothing
+  // actionable: claude / codex sit idle until killed (observed:
+  // 2+ min "processing" with 0 bytes of output). Walk the slice
+  // backward to recover the most recent user message that ISN'T
+  // another submission and use it as the real task; append the
+  // confirmed values as extra context. The cwd is already routed
+  // via `state.coding_project_dir`, so we don't need to re-state
+  // `project_dir` to the CLI.
+  const submission = decodeSubmission(item.llmPayload);
+  if (submission) {
+    let originalTask = '';
+    for (let i = slice.length - 1; i >= 0; i--) {
+      const m = slice[i];
+      const txt = (m.text || '').trim();
+      if (m.from !== 'user' || !txt) continue;
+      if (decodeSubmission(txt)) continue;
+      originalTask = txt;
+      break;
+    }
+    tailLines.push(originalTask || item.llmPayload);
+    const extraValues = Object.entries(submission.values)
+      .filter(([k]) => k !== 'project_dir')
+      .map(([k, v]) => `- ${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`);
+    if (extraValues.length) {
+      tailLines.push('');
+      tailLines.push('## Confirmed parameters');
+      tailLines.push(...extraValues);
+    }
+  } else {
+    tailLines.push(item.llmPayload);
+  }
+
+  const head = headLines.join('\n');
+  const tail = tailLines.join('\n');
+
+  // Resuming a CLI-side session: the CLI already remembers the prior
+  // turns. Skip the slice block entirely and let the model rely on
+  // its own session memory. Preamble + new task is enough.
+  if (resuming) {
+    return `${head}\n${tail}`;
+  }
+
+  // Conversation slice, oldest → newest. Empty-text rows skipped.
+  const sliceLines: string[] = [];
+  for (const m of slice) {
+    const to = (m.to || []).join(',') || '-';
+    const text = (m.text || '').replace(/\r/g, '').trim();
+    if (!text) continue;
+    sliceLines.push(`[${m.from} → ${to}] ${text}`);
+  }
+
+  // Reserve the head + tail bytes; what's left is the conversation
+  // budget. If even head+tail exceed the cap, fall back to a minimal
+  // prompt without history (better than truncating the task body).
+  const reserveBytes = Buffer.byteLength(head, 'utf8') + Buffer.byteLength(tail, 'utf8') + 64; // 64 = headers + newlines slack
+  if (reserveBytes >= CLI_PROMPT_MAX_BYTES) {
+    log.warn(`cli prompt: head+tail exceed cap; sending minimal prompt cid=${cid} agent=${agent.agent_id}`);
+    return `${head}\n${tail}`;
+  }
+  const sliceBudget = CLI_PROMPT_MAX_BYTES - reserveBytes;
+  // Walk the slice from newest backward; keep messages while we have
+  // budget. If the oldest messages don't fit, drop them.
+  const kept: string[] = [];
+  let used = 0;
+  for (let i = sliceLines.length - 1; i >= 0; i--) {
+    const lineBytes = Buffer.byteLength(sliceLines[i] + '\n', 'utf8');
+    if (used + lineBytes > sliceBudget) break;
+    kept.unshift(sliceLines[i]);
+    used += lineBytes;
+  }
+  const truncated = kept.length < sliceLines.length;
+  if (truncated) {
+    log.warn(`cli prompt: trimmed ${sliceLines.length - kept.length}/${sliceLines.length} oldest slice rows cid=${cid} agent=${agent.agent_id}`);
+  }
+  const sliceBlock = kept.length
+    ? `## Conversation so far${truncated ? ' (truncated)' : ''}\n${kept.join('\n')}\n`
+    : '';
+  return `${head}\n${sliceBlock}\n${tail}`;
+}

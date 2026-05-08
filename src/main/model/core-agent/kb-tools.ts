@@ -8,7 +8,8 @@
  *
  * These tools are read-only and need no localExec permission. They replace
  * the pre-kb-vector flow of `cat _INDEX.md` → drill into subdirs → cat files
- * (see `prompts/chat_commander.md` § 知识库 (KB) for the routing rule).
+ * (see the "Knowledge base (KB)" section of `prompts/chat_commander.md`
+ * for the routing rule).
  *
  * Uses the currently-active user via `getActiveUserId()` — the tool's `uid` is
  * captured at runner build time and stays stable for the runner's lifetime

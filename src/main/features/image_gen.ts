@@ -42,8 +42,9 @@ export interface PickedImageGenProfile {
  * image generation call.
  *
  * Priority:
- *   1. The user's dedicated `imageProfiles` list (from settings → 图片生成
- *      API Key 卡片). First entry whose provider has a capability wins.
+ *   1. The user's dedicated `imageProfiles` list (from the "Image
+ *      Generation API Key" card in settings). First entry whose
+ *      provider has a capability wins.
  *      Multiple entries on the same provider just shadow each other —
  *      first wins, no rotation (image gen calls are rare; rotation isn't
  *      worth the surprise factor).
@@ -343,22 +344,31 @@ export async function callGeminiImage(req: AdapterRequest): Promise<AdapterResul
 }
 
 /**
- * 火山方舟（豆包） Seedream 文生图 + 图生图（4.5+）。
- * Endpoint: POST /api/v3/images/generations，OpenAI 兼容请求体。
- * 返回 `{ data: [{ url: "..." }] }` 形式（默认）或可请求 base64；
- * 一期走 url 模式，再二次 fetch 取 bytes（避免账户级 base64 配额限制）。
+ * Volcengine Ark (Doubao) Seedream text-to-image + image-to-image (4.5+).
+ * Endpoint: POST /api/v3/images/generations, OpenAI-compatible request body.
+ * Returns `{ data: [{ url: "..." }] }` by default (base64 also available
+ * on request); we use the URL mode and re-fetch the bytes ourselves so
+ * we don't bump into account-level base64 quotas.
  *
- * 图生图：在请求体加 `image: string | string[]`，每项是公网 HTTPS URL
- * 或 data URI（`data:<mime>;base64,<b64>`）。本地参考图统一编 data URI。
- * 参考图 + 输出图总数 ≤ 15，工具层另行限到 4 张参考。
+ * Image-to-image: add `image: string | string[]` to the body; each entry
+ * is either a public HTTPS URL or a data URI
+ * (`data:<mime>;base64,<b64>`). Local reference images are encoded as
+ * data URIs uniformly.
+ * Reference images + outputs total ≤ 15; the tool layer additionally
+ * caps references to 4.
  *
- * Size 注意：Seedream 4.5 的 `size` 不像 OpenAI 接受任意 `WxH`——必须满足
- *   1. 像素 ≥ 3,686,400 (≈ 1920×1920)
- *   2. 形式是 `WIDTHxHEIGHT` 或关键字 `1k` / `2k` / `4k`
- * 调用方默认传 `1024x1024`（OpenAI 风格），低于 Seedream 下限。这里做一层
- * 翻译：像素不足时升到 `2k`；已经够大或本来就是关键字的原样透传。
- * 图生图模式下若调用方没显式给非默认 size，传 `adaptive` 让模型按参考图
- * 比例决定，避免硬塞 2k 跟参考图比例冲突。
+ * Size note: Seedream 4.5's `size` does NOT accept arbitrary `WxH` like
+ * OpenAI — the value must satisfy both:
+ *   1. Pixels ≥ 3,686,400 (≈ 1920×1920).
+ *   2. Form must be `WIDTHxHEIGHT` or one of the keywords
+ *      `1k` / `2k` / `4k`.
+ * Callers default to `1024x1024` (OpenAI-style), which is under
+ * Seedream's lower bound, so we translate here: bump to `2k` when below
+ * the pixel floor; pass through anything already large enough or
+ * already a keyword. In image-to-image mode, when the caller hasn't
+ * explicitly set a non-default size, we pass `adaptive` so the model
+ * picks dimensions from the reference image, avoiding aspect-ratio
+ * conflicts when forcing 2k.
  */
 const SEEDREAM_MIN_PIXELS = 3_686_400;
 const SEEDREAM_DEFAULT_SIZE = '1024x1024';

@@ -10,9 +10,10 @@
  *                + a {type:'progress'} line so the UI's log shows it even if
  *                  the process panel filters events
  *   tool_end   → {type:'event', event:{stream:'tool', data:{phase:'end', id, name, isError, result_preview}}}
- *   retry      → {type:'progress', text: '正在重试·<friendly reason>'} — raw
- *                reason (e.g. undici "terminated", "fetch failed", "ECONNRESET")
- *                is mapped to user-facing Chinese via `friendlyRetryReason`
+ *   retry      → {type:'progress', text: 'retrying · <friendly reason>'} —
+ *                the raw reason (e.g. undici "terminated", "fetch failed",
+ *                "ECONNRESET") is mapped to a user-facing string via
+ *                `friendlyRetryReason`
  *   compaction → {type:'progress', text: 'compacted <before>→<after> tokens'}
  *   done (ok)  → {type:'final', text} then {type:'done'}
  *   done (err) → {type:'error', text: meta.error.message} then {type:'done'}
@@ -71,12 +72,13 @@ function inputSummary(name: string, input: unknown, max = 80): string {
 
 /**
  * Translate a raw retry reason (usually `err.message` from core-agent) into
- * a short Chinese phrase the user can actually read. The raw strings come
- * from undici / pi-ai / provider SDKs and are English / code-like; the
- * process panel is user-facing so we map the common families here.
+ * a short user-facing phrase. The raw strings come from undici / pi-ai /
+ * provider SDKs and are English / code-like; the process panel is
+ * user-facing so we map the common families here. The actual user-visible
+ * string is resolved via i18n (`t()`).
  *
- * Unknown reasons fall back to a generic "网络异常" — the full message is
- * still in `data/logs/` for debugging.
+ * Unknown reasons fall back to a generic "network error" — the full
+ * message is still in `data/logs/` for debugging.
  */
 export function friendlyRetryReason(reason: string): string {
   const r = (reason || '').toLowerCase();

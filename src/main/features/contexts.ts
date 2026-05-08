@@ -64,6 +64,32 @@ const BINARY_EXTS: ReadonlySet<string> = new Set([
 const ALLOWED_EXTS: ReadonlySet<string> = new Set([...TEXT_EXTS, ...BINARY_EXTS]);
 const MAX_FILE_BYTES = 200 * 1024 * 1024; // 200MB — defensive cap per plan §3.3
 
+/** Max basename / dirname length in **weighted code points**: CJK / Hangul /
+ *  Kana count as 2, everything else (ASCII, Latin-extended, Cyrillic, emoji…)
+ *  counts as 1. The split prevents a single uniform cap from either
+ *  squashing English to a few words OR letting Chinese filenames balloon
+ *  past readable. Budget 100:
+ *    - pure Chinese: ~50 chars (a long sentence)
+ *    - pure English: ~100 chars (descriptive long filename)
+ *    - mixed:        weights add up
+ *  Real FS basename limits (HFS+ / NTFS = 255 UTF-16 units) are far higher;
+ *  this is a UX bound, not a FS bound. Applied to every path segment in
+ *  `resolvePath`, so it covers writes / uploads / mkdir / rename through
+ *  one chokepoint. */
+const MAX_BASENAME_WEIGHT = 100;
+
+/** Char-class regex for the "double-width" group: CJK Unified Ideographs
+ *  (incl. extension A), Hangul, Hiragana, Katakana. Tested per code point. */
+const DOUBLE_WIDTH_CHAR = /[㐀-鿿가-힯぀-ゟ゠-ヿ]/;
+
+function _filenameWeight(s: string): number {
+  let w = 0;
+  for (const ch of s) {
+    w += DOUBLE_WIDTH_CHAR.test(ch) ? 2 : 1;
+  }
+  return w;
+}
+
 export type Result<T = Record<string, unknown>> = ({ ok: true } & T) | { ok: false; error: string };
 
 export interface ContextNode {
@@ -106,6 +132,14 @@ function resolvePath(relpath: string, { mustExist = false }: ResolveOpts = {}): 
   // Reject any segment starting with '.' — keeps `.kb/` (vector db) and other
   // hidden dirs off-limits to user mutations.
   if (parts.some((p) => p.startsWith('.'))) throw new Error('hidden entries are reserved');
+  // Length cap (per-segment, weighted — see MAX_BASENAME_WEIGHT).
+  // The first offending segment is surfaced verbatim so the user knows which
+  // part of the path is too long (file basename vs. some parent dir).
+  for (const p of parts) {
+    if (_filenameWeight(p) > MAX_BASENAME_WEIGHT) {
+      throw new Error(t('errors.kb_name_too_long', { name: p }));
+    }
+  }
   const root = path.resolve(contextsRoot());
   const target = path.resolve(root, s);
   const rel = path.relative(root, target);
@@ -550,22 +584,22 @@ export function rebuildIndex(): IndexCache {
   const pad = (n: number) => String(n).padStart(2, '0');
   const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
   const lines: string[] = [];
-  lines.push('# 知识库索引', '');
-  lines.push(`_自动维护，请勿手动编辑。最后更新：${stamp}_`, '');
-  lines.push('> 模型通过 `kb_search` / `kb_read` 工具访问；本文件仅供在 Finder / 资源管理器里浏览。', '');
+  lines.push(`# ${t('contexts.index.heading')}`, '');
+  lines.push(`_${t('contexts.index.maintained_note', { stamp })}_`, '');
+  lines.push(`> ${t('contexts.index.model_access_note')}`, '');
   if (!rootDirs.length && !rootFiles.length) {
-    lines.push('（暂无内容）');
+    lines.push(t('contexts.index.empty_section'));
   } else {
     if (rootDirs.length) {
-      lines.push('## 目录');
+      lines.push(`## ${t('contexts.index.dirs_heading')}`);
       for (const d of rootDirs) {
         const n = dirCounts.get(d.name) || 0;
-        lines.push(`- 📁 \`${d.name}/\` — ${n} 篇`);
+        lines.push(`- 📁 \`${d.name}/\` — ${t('contexts.index.file_count', { count: n })}`);
       }
       lines.push('');
     }
     if (rootFiles.length) {
-      lines.push('## 根目录文件');
+      lines.push(`## ${t('contexts.index.root_files_heading')}`);
       for (const f of rootFiles) {
         const entry = allEntries.find((e) => e.path === f.name);
         lines.push(`- \`${f.name}\`${entry?.title ? ` — ${entry.title}` : ''}`);
@@ -584,11 +618,11 @@ export function rebuildIndex(): IndexCache {
   // Full root markdown — re-read what we just wrote, for getContextIndexMarkdown.
   let rootMd = '';
   try { rootMd = fs.readFileSync(path.join(contextsRoot(), CONTEXTS_INDEX_FILENAME), 'utf8'); }
-  catch { rootMd = '（知识库为空）'; }
+  catch { rootMd = t('contexts.index.empty_kb'); }
 
   const flatLines = allEntries.length
     ? allEntries.map((e) => `- \`${e.path}\`${e.title ? ` — ${e.title}` : ''}`).join('\n')
-    : '（知识库为空）';
+    : t('contexts.index.empty_kb');
 
   indexCache.mtime = Date.now();
   indexCache.rootMarkdown = rootMd;

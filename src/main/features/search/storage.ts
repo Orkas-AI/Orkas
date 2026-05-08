@@ -4,7 +4,7 @@
  * Schema (JSON, one file per kind):
  *   {
  *     "version":  2,
- *     "kind":     "context" | "chat" | "skill_chat" | "agent_chat",
+ *     "kind":     "context" | "chat",
  *     "files":    { "<fileKey>": { "mtime": number, "size": number } },
  *     "docs":     { "<docId>":   { kind, fileKey, ...kindFields, len } },
  *     "postings": { "<token>":   [[docId, tf], ...] }
@@ -12,7 +12,9 @@
  *
  * The shape is intentionally hand-rollable JSON — no FTS engine, no native
  * dep. Reconciliation by mtime+size makes this self-healing if an edit
- * happens out-of-band (sync, manual touch).
+ * happens out-of-band (sync, manual touch). `skill_chat` / `agent_chat`
+ * kinds existed in earlier builds; their .idx.json files are now stale and
+ * unlinked at startup by `reconcileAll` in features/search/index.ts.
  */
 
 import * as fs from 'node:fs';
@@ -25,9 +27,16 @@ const fsp = fs.promises;
 // relPath (directory + filename) only; content lookup goes through the
 // vector KB. Bumping the version forces old body-tokenized indexes to
 // rebuild on next reconcile.
-export const SCHEMA_VERSION = 3;
+// v4 fixes the chat indexer's silent skip on group-chat jsonl — `_msgText`
+// only read the legacy `content` field, missing the current `text` field
+// (and `from`/`ts` for role/time). Indexes built by v3 against post-bus
+// jsonl have empty docs (every message skipped); bumping forces a rebuild
+// so existing users get their chat history searchable again on next launch
+// (the alternative — leaving v3 — would only fix newly-modified jsonl files
+// because reconcile keys off mtime+size, not schema correctness).
+export const SCHEMA_VERSION = 4;
 
-export type IndexKind = 'context' | 'chat' | 'skill_chat' | 'agent_chat';
+export type IndexKind = 'context' | 'chat';
 
 export interface FileMeta { mtime: number; size: number }
 

@@ -58,11 +58,11 @@ function makeCtx(): any {
 // ── Tool identity ─────────────────────────────────────────────────────────
 
 describe('local-tools › identity', () => {
-  it('exposes exactly four tools, named bash / write_file / markdown_to_pdf / html_to_pdf', async () => {
+  it('exposes exactly five tools, named bash / write_file / edit_file / markdown_to_pdf / html_to_pdf', async () => {
     const { lt } = await loadModules();
     const tools = lt.createLocalTools({});
     expect(tools.map((t) => t.name).sort()).toEqual(
-      ['bash', 'html_to_pdf', 'markdown_to_pdf', 'write_file'],
+      ['bash', 'edit_file', 'html_to_pdf', 'markdown_to_pdf', 'write_file'],
     );
   });
 

@@ -9,9 +9,40 @@ let _agentFieldSaveTimer = null;
 // Mirror of `agents.ts::RESERVED_AGENT_NAMES` so the renderer can fail fast
 // without a round-trip. Server is still authoritative — this is just UX.
 const _RESERVED_AGENT_NAMES = new Set(['指挥官', '总指挥', 'commander']);
+/** Look up the localized "External · <Brand>" label for an agent runtime
+ *  type. The external badge (formerly "CLI · X") is the single
+ *  user-facing tag for cli-runtime agents — name surfaces consistently
+ *  in cards, detail page, and edit form. */
+function _cliBadgeLabel(type) {
+  const key = 'agent.external_badge.' + type;
+  const v = t(key);
+  if (!v || v === key) {
+    const externalWord = t('agent.external_word');
+    const word = (externalWord && externalWord !== 'agent.external_word') ? externalWord : 'External';
+    return word + ' · ' + type;
+  }
+  return v;
+}
+
 function _isReservedAgentName(name) {
   const key = String(name || '').replace(/\s+/g, '').toLowerCase();
   return _RESERVED_AGENT_NAMES.has(key);
+}
+
+// Mirror of `agents.ts::NAME_TOKEN_RE` so the form rejects junk before
+// the round-trip. Charset must round-trip through the bus's @-mention
+// regex; see backend for the full reasoning. UIs may still surface
+// server errors (E_AGENT_NAME_INVALID / E_AGENT_NAME_TOO_LONG) when
+// the LLM-driven path produces a bad name.
+const _NAME_TOKEN_RE = /^[A-Za-z0-9_一-鿿-]+(?: [A-Za-z0-9_一-鿿-]+)*$/;
+const _NAME_MAX_LENGTH = 50;
+function _isValidAgentNameCharset(name) {
+  const v = String(name || '');
+  const trimmed = v.trim();
+  if (!trimmed) return true;
+  if (v !== trimmed) return false;
+  if (trimmed.length > _NAME_MAX_LENGTH) return false;
+  return _NAME_TOKEN_RE.test(trimmed);
 }
 
 async function loadAgents(forceRefresh) {
@@ -20,13 +51,36 @@ async function loadAgents(forceRefresh) {
     const res = await apiFetch('/api/agents/list');
     const data = await res.json();
     if (data.ok) {
-      _agentsCache = data.agents || [];
+      // Sort once on cache fill so picker + grid share the order.
+      // Order: custom group first, then within each group sort by a key
+      // built from "Chinese chars → pinyin first letter, Latin / digits
+      // / punctuation pass through unchanged" and compare as a plain
+      // string. Electron ships small ICU; Intl.Collator does not
+      // recognize zh pinyin tailoring (neither co-pinyin nor
+      // zh-Hans-CN works), so Chinese ends up clumped together and
+      // Latin clumped together. We use vendor/pinyin-firstletter's
+      // table to map e.g. '悲观' → 'bg' / 'Claude' → 'claude' /
+      // 'Orkas' → 'orkas' before comparing, yielding the user-expected
+      // mixed-script ordering ('agent < 悲(b) < 本(b) < claude < 乐(l)
+      // < orkas < 全(q)'). Without this, the backend's listAgents
+      // internal sort (by agent_id, a 12-char nanoid) feels random to
+      // users. The override here fixes that.
+      _agentsCache = (data.agents || []).slice().sort((a, b) => {
+        if (a.source !== b.source) return a.source === 'custom' ? -1 : 1;
+        const ka = pinyinSortKey(a.name || a.agent_id || '');
+        const kb = pinyinSortKey(b.name || b.agent_id || '');
+        return ka < kb ? -1 : ka > kb ? 1 : 0;
+      });
       renderAgentsList(_agentsCache);
-      // 老 spec 没存头像时回填到磁盘 —— 跨设备一致用 seed 派生（同一
-      // agent_id 在任何机器都派生出同一组合，避免云同步时两端各写不同
-      // 值导致冲突）。已经有 icon+color 的 entry 直接跳过，所以反复
-      // 调用 loadAgents 不会重复写。后台异步即可，不阻塞渲染：渲染层
-      // 自己也会用 seed 兜底，跟回填值一致，所以肉眼不会看到任何变化。
+      // Backfill avatars to disk when older specs lack them — derive
+      // from the seed for cross-device consistency (the same agent_id
+      // produces the same icon/color combination on every machine, so
+      // cloud sync won't see two ends writing different values and
+      // colliding). Entries that already have icon + color are
+      // skipped, so repeated loadAgents calls don't re-write.
+      // Asynchronous so it doesn't block rendering — the render layer
+      // also seeds an avatar fallback whose value matches what we
+      // backfill, so the user sees no visual change.
       _backfillMissingAvatars(_agentsCache).catch((e) => {
         _agentsLog.warn('avatar backfill failed', e);
       });
@@ -55,8 +109,9 @@ async function _backfillMissingAvatars(agents) {
         a.color = res.agent.color;
       }
     } catch (e) {
-      // 失败也无所谓 —— 渲染层 seed 兜底依然会出同一组合，
-      // 下次 loadAgents 再尝试。
+      // Failure here doesn't matter — the render layer's seed-based
+      // fallback still produces the same combination, and the next
+      // loadAgents call will retry.
       _agentsLog.warn(`backfill ${a.agent_id} failed`, e);
     }
   }
@@ -90,26 +145,28 @@ function renderAgentsGrid(agents) {
     const desc = pickDesc(a, getLang()).trim();
     const descClass = desc ? 'agent-card-desc' : 'agent-card-desc is-empty';
     const descText = desc || t('agents.placeholder_unset');
-    const sourceLabel = a.source === 'custom' ? t('agents.source_custom') : t('agents.source_builtin');
-    const sourceCls = a.source === 'custom' ? 'is-custom' : 'is-builtin';
+    // Source label (custom / builtin) is shown on the detail page only;
+    // the grid cards stay clean and use the ⋯ menu for actions.
     const moreBtn = `<button type="button" class="agent-card-more" data-agent-more title="${moreTitle}" aria-label="${moreTitle}">⋯</button>`;
-    const toggleTitle = escapeHtml(enabled ? t('component.toggle_disable_hint') : t('component.toggle_enable_hint'));
-    const toggle = `<label class="toggle-switch is-compact" data-agent-toggle title="${toggleTitle}" aria-label="${toggleTitle}">
-        <input type="checkbox" data-agent-toggle-input ${enabled ? 'checked' : ''} />
-      </label>`;
     const avatarHtml = renderAvatarHtml(a.icon, a.color, { size: 32, seed: a.agent_id, extraClass: 'agent-card-avatar' });
+    // Show a small "CLI · <Brand>" chip on the bottom row, left-aligned,
+    // sharing the line with the play button on the right.
+    const cliChip = (a.runtime && a.runtime.kind === 'cli')
+      ? `<span class="agent-card-chip is-cli is-cli-${escapeHtml(a.runtime.cli)}">${escapeHtml(_cliBadgeLabel(a.runtime.cli))}</span>`
+      : '';
     return `
       <div class="agent-card${enabled ? '' : ' is-disabled'}" data-id="${escapeHtml(a.agent_id)}" data-source="${a.source}">
         <div class="agent-card-header">
           ${avatarHtml}
           <span class="agent-card-name">${escapeHtml(a.name || t('agents.unnamed'))}</span>
-          <span class="agent-card-source ${sourceCls}">${escapeHtml(sourceLabel)}</span>
-          ${toggle}
           ${moreBtn}
         </div>
         <div class="${descClass}">${escapeHtml(descText)}</div>
         <div class="agent-card-actions">
-          <button type="button" class="agent-card-use" data-agent-use title="${useTitle}" aria-label="${useTitle}">▶</button>
+          ${cliChip}
+          <button type="button" class="agent-card-use" data-agent-use title="${useTitle}" aria-label="${useTitle}">
+            <svg class="icon-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><polygon points="5,3 5,13 13,8" fill="currentColor"/></svg>
+          </button>
         </div>
       </div>
     `;
@@ -126,10 +183,6 @@ function renderAgentsGrid(agents) {
   for (const card of document.querySelectorAll('.agent-card')) {
     const id = card.dataset.id;
     card.addEventListener('click', (e) => {
-      if (e.target.closest('[data-agent-toggle]')) {
-        e.stopPropagation();
-        return;
-      }
       if (e.target.closest('[data-agent-use]')) {
         e.stopPropagation();
         useAgent(id);
@@ -142,34 +195,29 @@ function renderAgentsGrid(agents) {
       }
       _showAgentsDetailView(id);
     });
-    const toggleInput = card.querySelector('[data-agent-toggle-input]');
-    toggleInput?.addEventListener('change', async (e) => {
-      e.stopPropagation();
-      await _flipAgentEnabledFromCard(id, toggleInput);
-    });
   }
 }
 
-async function _flipAgentEnabledFromCard(agentId, input) {
-  const next = input.checked;
-  input.disabled = true;
+/** Flip an agent's enabled override (used by both the ⋯ menu's toggle item
+ *  and the detail-page enable/disable button). On failure, alerts; on
+ *  success, refreshes the grid + detail page. */
+async function _flipAgentEnabled(agentId, nextEnabled) {
   try {
-    const res = await window.orkas.invoke('agents.setEnabled', { agent_id: agentId, enabled: next });
+    const res = await window.orkas.invoke('agents.setEnabled', { agent_id: agentId, enabled: nextEnabled });
     if (!res || !res.ok) {
-      input.checked = !next;
       await uiAlert(t('component.toggle_failed'));
-      return;
+      return false;
     }
-    const card = input.closest('.agent-card');
-    if (card) card.classList.toggle('is-disabled', !next);
     const cached = _agentsCache?.find((a) => a.agent_id === agentId);
-    if (cached) cached.enabled = next;
+    if (cached) cached.enabled = nextEnabled;
     await loadAgents(true);
+    if (_selectedAgent?.id === agentId) {
+      _renderAgentEnabledButton({ id: agentId, enabled: nextEnabled });
+    }
+    return true;
   } catch (err) {
-    input.checked = !next;
     await uiAlert(t('component.toggle_failed'));
-  } finally {
-    input.disabled = false;
+    return false;
   }
 }
 
@@ -290,13 +338,19 @@ function _renderAgentRowMenuItems(menu, agentId) {
   const a = _agentsCache?.find((x) => x.agent_id === agentId);
   const enabled = a ? a.enabled !== false : true;
   const isCustom = a?.source === 'custom';
+  // Dev mode lifts the source guard for built-in edit / delete; custom adds
+  // a "promote to built-in" item too.
+  const canEdit = isCustom || (a?.source === 'builtin' && isDevMode());
   const toggleLabel = enabled ? t('component.disable') : t('component.enable');
   const items = [];
-  if (isCustom) {
+  if (canEdit) {
     items.push(`<div class="agent-row-menu-item" data-action="edit">${escapeHtml(t('agents.edit'))}</div>`);
   }
+  if (isCustom && isDevMode()) {
+    items.push(`<div class="agent-row-menu-item" data-action="promote">${escapeHtml(t('agents.promote_to_builtin'))}</div>`);
+  }
   items.push(`<div class="agent-row-menu-item" data-action="toggle-enabled">${escapeHtml(toggleLabel)}</div>`);
-  if (isCustom) {
+  if (canEdit) {
     items.push(`<div class="agent-row-menu-item is-danger" data-action="delete">${escapeHtml(t('agents.delete'))}</div>`);
   }
   menu.innerHTML = items.join('');
@@ -313,6 +367,8 @@ function _renderAgentRowMenuItems(menu, agentId) {
       } else if (action === 'delete') {
         if (_selectedAgent?.id !== aid) await selectAgent(aid);
         await deleteSelectedAgent();
+      } else if (action === 'promote') {
+        await promoteCustomAgent(aid);
       } else if (action === 'toggle-enabled') {
         await _flipAgentEnabledFromMenu(aid);
       }
@@ -320,21 +376,29 @@ function _renderAgentRowMenuItems(menu, agentId) {
   }
 }
 
+/** Dev-only: promote a custom agent to built-in. Copies agent.json to
+ *  src+data trees, removes the custom dir (meta/ + skills/ dropped),
+ *  refreshes the grid. */
+async function promoteCustomAgent(agentId) {
+  if (!isDevMode()) return;
+  const cached = _agentsCache?.find((x) => x.agent_id === agentId);
+  if (!(await uiConfirm(t('agents.promote_confirm', { name: cached?.name || agentId })))) return;
+  try {
+    const result = await window.orkas.invoke('agents.promoteToBuiltin', { agent_id: agentId });
+    if (!result.ok) {
+      await uiAlert(t('agents.promote_failed_with', { reason: result.error || '' }));
+      return;
+    }
+    await loadAgents(true);
+  } catch (e) {
+    await uiAlert(t('agents.promote_failed_with', { reason: e.message || e }));
+  }
+}
+
 async function _flipAgentEnabledFromMenu(agentId) {
   const cached = _agentsCache?.find((x) => x.agent_id === agentId);
   const next = !(cached?.enabled !== false);
-  try {
-    const res = await window.orkas.invoke('agents.setEnabled', { agent_id: agentId, enabled: next });
-    if (!res || !res.ok) {
-      await uiAlert(t('component.toggle_failed'));
-      return;
-    }
-    if (cached) cached.enabled = next;
-    await loadAgents(true);
-  } catch (err) {
-    _agentsLog.warn('agents.setEnabled failed', err);
-    await uiAlert(t('component.toggle_failed'));
-  }
+  await _flipAgentEnabled(agentId, next);
 }
 
 async function selectAgent(agentId) {
@@ -376,10 +440,22 @@ function _renderAgentDetail(agent, editing) {
   nameEl.textContent = agent.name || '';
   sourceEl.textContent = agent.source === 'builtin' ? t('agents.source_builtin') : t('agents.source_custom');
   sourceEl.className = 'agents-detail-source ' + (agent.source === 'builtin' ? 'is-builtin' : 'is-custom');
+  // Runtime slot lives at the top of the body now (not the header):
+  // an always-editable dropdown so the user can flip Orkas ↔ local CLI
+  // without entering edit mode. The header chip was removed because
+  // it duplicated information the dropdown already exposes.
+  _renderAgentDetailRuntime(agent);
   const localizedDesc = pickDesc(agent, getLang()).trim();
   descEl.textContent = localizedDesc;
 
   _renderAgentDetailAvatar(agent);
+
+  // CLI-backed agents have no authored workflow / skill_list — the
+  // external CLI brings its own behavior. Hide the entire workflow
+  // section so the detail page doesn't show an empty editor block.
+  const workflowSection = document.querySelector('.agents-detail-section-workflow');
+  const isCliRuntime = !!(agent.runtime && agent.runtime.kind === 'cli');
+  if (workflowSection) workflowSection.style.display = isCliRuntime ? 'none' : '';
 
   const unsetHtml = `<span class="agents-detail-placeholder">${escapeHtml(t('agents.placeholder_unset'))}</span>`;
   // Workflow renders markdown in readonly mode; raw text in edit mode so user
@@ -391,22 +467,146 @@ function _renderAgentDetail(agent, editing) {
   }
   if (!editing && !localizedDesc) descEl.innerHTML = unsetHtml;
 
-  // Detail header actions: 使用 / 编辑 / 删除 + 启用 toggle. Builtin agents
-  // hide 编辑 and 删除 (spec-immutable); 编辑 button doubles as 完成 while
-  // in edit mode and 使用/删除 hide so the user can't accidentally launch
-  // or destroy a half-edited agent.
+  // Detail header actions, fixed order:
+  //   use (icon) / edit / enable-disable / promote-to-builtin
+  //   (custom + dev) / delete
+  // Edit mode hides everything except the "done" button (the relabeled
+  // "edit" button).
   const useBtn = document.getElementById('agent-use-btn');
+  const enableBtn = document.getElementById('agent-enabled-btn');
+  const promoteBtn = document.getElementById('agent-promote-btn');
   const delBtn = document.getElementById('agent-delete-btn');
   const isCustom = agent.source === 'custom';
+  const canEdit = isCustom || (agent.source === 'builtin' && isDevMode());
   if (useBtn) useBtn.style.display = editing ? 'none' : '';
-  if (delBtn) delBtn.style.display = (isCustom && !editing) ? '' : 'none';
+  if (enableBtn) enableBtn.style.display = editing ? 'none' : '';
+  if (promoteBtn) promoteBtn.style.display = (isCustom && isDevMode() && !editing) ? '' : 'none';
+  if (delBtn) delBtn.style.display = (canEdit && !editing) ? '' : 'none';
   if (editBtn) {
-    editBtn.style.display = isCustom ? '' : 'none';
+    editBtn.style.display = canEdit ? '' : 'none';
     editBtn.textContent = editing ? t('agents.edit_btn_done') : t('agents.edit_btn_edit');
   }
-  _renderAgentEnabledToggle({ id: agent.agent_id, enabled: agent.enabled !== false });
+  _renderAgentEnabledButton({ id: agent.agent_id, enabled: agent.enabled !== false });
 
   _toggleAgentFieldEditable(editing);
+}
+
+/** Render the runtime control in the detail body.
+ *
+ *  The runtime "kind" is locked at create time:
+ *  - `in_process` (Orkas) agents → never show the selector here. The
+ *    runtime row stays hidden; user has no need to see it.
+ *  - `cli` agents → show a selector with **CLI options only** (no
+ *    Orkas / in_process option). User can swap which CLI backs the
+ *    agent at any time, but can't revert to Orkas — that would
+ *    invalidate the description and inputs which were authored
+ *    specifically for a CLI runtime.
+ *
+ *  Reuses `_aiSelectMount` (see CLAUDE.md "Reuse UI components") and
+ *  persists each change via `agents.update({ runtime })`. */
+async function _renderAgentDetailRuntime(agent) {
+  const section = document.getElementById('agents-detail-runtime-section');
+  const slot = document.getElementById('agents-detail-runtime');
+  if (!slot || !section) return;
+  slot.innerHTML = '';
+
+  // In-process agents: section stays hidden. No selector, no
+  // information to surface.
+  if (agent.runtime?.kind !== 'cli') {
+    section.style.display = 'none';
+    return;
+  }
+
+  const entries = (typeof loadLocalCliEntries === 'function') ? await loadLocalCliEntries() : [];
+  const available = entries.filter(e => e.available);
+  const seen = new Set(available.map(e => e.type));
+  const currentType = agent.runtime.cli;
+
+  // Build CLI-only options: every detected CLI + the bound one if it's
+  // missing (with a warning suffix so the user can flip away in one
+  // click). Orkas / in_process is intentionally absent — see fn doc.
+  const options = [];
+  for (const e of available) {
+    options.push({
+      value: `cli:${e.type}`,
+      label: `${t('agent_modal.runtime_cli_' + e.type)}${e.version ? ` (${e.version})` : ''}`,
+    });
+  }
+  if (!seen.has(currentType)) {
+    const baseLabel = t('agent_modal.runtime_cli_' + currentType);
+    const labelText = (baseLabel && baseLabel !== 'agent_modal.runtime_cli_' + currentType)
+      ? baseLabel : currentType;
+    options.push({
+      value: `cli:${currentType}`,
+      label: `${labelText} ${t('agent.cli_missing')}`,
+    });
+  }
+  if (options.length === 0) {
+    // Defensive — shouldn't happen since we always add the bound CLI
+    // above. Hide the row instead of rendering an empty dropdown.
+    section.style.display = 'none';
+    return;
+  }
+  section.style.display = '';
+
+  const mount = document.createElement('div');
+  mount.className = 'ai-select agents-detail-runtime-select';
+  slot.appendChild(mount);
+  _aiSelectMount(mount, {
+    options, value: `cli:${currentType}`,
+    onChange: async (next) => {
+      const m = /^cli:(.+)$/.exec(next);
+      if (!m) return;
+      const newCli = m[1];
+      // Mirror the create-modal behaviour: if the user's current name /
+      // description are still the defaults of the previous CLI (or empty),
+      // follow the new CLI's defaults. Otherwise, leave their edits alone.
+      const updates = { runtime: { kind: 'cli', cli: newCli } };
+      const lang = (typeof getLang === 'function') ? getLang() : 'zh';
+      const prev = (typeof getCliDefaults === 'function') ? getCliDefaults(currentType) : null;
+      const next2 = (typeof getCliDefaults === 'function') ? getCliDefaults(newCli) : null;
+      const prevDescLocal = prev ? (lang === 'en' ? prev.description_en : prev.description_zh) : '';
+      const curName = (agent.name || '').trim();
+      const curDescLocal = pickDesc(agent, lang).trim();
+      // Same default-like detection as the create modal: bare default OR
+      // dedup-style "<default> 2" / "(2)" suffixes count as untouched.
+      const nameUntouched = _isDefaultlikeName(curName, prev?.name);
+      const descUntouched = !curDescLocal || (prev && curDescLocal === prevDescLocal);
+      if (next2 && nameUntouched) updates.name = next2.name;
+      if (next2) {
+        if (descUntouched) {
+          updates.description_zh = next2.description_zh;
+          updates.description_en = next2.description_en;
+        }
+      }
+      try {
+        const res = await window.orkas.invoke('agents.update', {
+          agent_id: agent.agent_id, updates,
+        });
+        if (res?.ok && res.agent) {
+          _agentsCache = null;
+          const fetched = await apiFetch(`/api/agents/${encodeURIComponent(agent.agent_id)}`);
+          const data = await fetched.json();
+          if (data.ok && data.agent) _renderAgentDetail(data.agent, _agentEditing);
+        } else if (res?.code === 'E_AGENT_NAME_TAKEN') {
+          // Name we tried to auto-apply already belongs to another
+          // agent. Re-issue the update without the name override so
+          // the runtime swap still goes through.
+          const safeUpdates = { ...updates };
+          delete safeUpdates.name;
+          await window.orkas.invoke('agents.update', {
+            agent_id: agent.agent_id, updates: safeUpdates,
+          });
+          _agentsCache = null;
+          const fetched = await apiFetch(`/api/agents/${encodeURIComponent(agent.agent_id)}`);
+          const data = await fetched.json();
+          if (data.ok && data.agent) _renderAgentDetail(data.agent, _agentEditing);
+        }
+      } catch (err) {
+        _agentsLog.warn('agents.update runtime failed', err);
+      }
+    },
+  });
 }
 
 /** Render the detail-page avatar slot. Custom agents get a clickable avatar
@@ -454,43 +654,25 @@ function _renderAgentDetailAvatar(agent) {
   });
 }
 
-function _renderAgentEnabledToggle(agent) {
-  const wrap = document.getElementById('agent-enabled-toggle-wrap');
-  const oldInput = document.getElementById('agent-enabled-toggle');
-  const label = document.getElementById('agent-enabled-label');
-  if (!wrap || !oldInput || !label) return;
+/** Per-agent enable / disable button in the detail header.
+ *  Clone-replace to drop any prior click handler bound to a stale
+ *  agent id. The button label flips between "enable" and "disable"
+ *  (whichever the click would do). */
+function _renderAgentEnabledButton(agent) {
+  const oldBtn = document.getElementById('agent-enabled-btn');
+  if (!oldBtn) return;
   const enabled = agent.enabled !== false;
-  // Clone-replace to drop any prior change listener bound for a different agent.
-  const input = oldInput.cloneNode(true);
-  input.checked = enabled;
-  oldInput.parentNode.replaceChild(input, oldInput);
-  label.textContent = enabled ? t('component.enabled') : t('component.disabled');
-  wrap.classList.toggle('is-disabled', !enabled);
-  wrap.title = enabled ? t('component.toggle_disable_hint') : t('component.toggle_enable_hint');
-  input.addEventListener('change', async () => {
-    const next = input.checked;
-    input.disabled = true;
-    try {
-      const res = await window.orkas.invoke('agents.setEnabled', { agent_id: agent.id, enabled: next });
-      if (!res || !res.ok) {
-        input.checked = !next;
-        await uiAlert(t('component.toggle_failed'));
-        return;
-      }
-      label.textContent = next ? t('component.enabled') : t('component.disabled');
-      wrap.classList.toggle('is-disabled', !next);
-      wrap.title = next ? t('component.toggle_disable_hint') : t('component.toggle_enable_hint');
-      const cached = _agentsCache?.find((a) => a.agent_id === agent.id);
-      if (cached) cached.enabled = next;
-      await loadAgents(true);
-    } catch (err) {
-      input.checked = !next;
-      await uiAlert(t('component.toggle_failed'));
-    } finally {
-      input.disabled = false;
-    }
+  const btn = oldBtn.cloneNode(true);
+  oldBtn.parentNode.replaceChild(btn, oldBtn);
+  btn.textContent = enabled ? t('component.disable') : t('component.enable');
+  btn.title = enabled ? t('component.toggle_disable_hint') : t('component.toggle_enable_hint');
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    try { await _flipAgentEnabled(agent.id, !enabled); }
+    finally { btn.disabled = false; }
   });
 }
+
 
 function _toggleAgentFieldEditable(on) {
   const nameEl = document.getElementById('agents-detail-name');
@@ -504,7 +686,8 @@ function _toggleAgentFieldEditable(on) {
 
 async function toggleAgentEditMode() {
   if (!_selectedAgent) return;
-  if (_selectedAgent.source === 'builtin') return;
+  // Built-in editing is dev-only; lift the source guard accordingly.
+  if (_selectedAgent.source === 'builtin' && !isDevMode()) return;
   if (_agentEditing) {
     await _exitAgentEditMode();
   } else {
@@ -518,17 +701,33 @@ async function _enterAgentEditMode() {
   const res = await apiFetch(`/api/agents/${encodeURIComponent(_selectedAgent.id)}`);
   const data = await res.json();
   if (data.ok && data.agent) _renderAgentDetail(data.agent, true);
-  document.getElementById('agents-chat-col').style.display = '';
-  await _loadAgentChatHistory(_selectedAgent.id);
-  setTimeout(() => document.getElementById('agents-chat-input')?.focus(), 50);
+  // External (cli-runtime) agents have no LLM-driven authoring — the
+  // CLI brings its own behaviour, and the edit chat would just sit
+  // empty. Hide the chat column so the user only sees the manual
+  // name + description editors. In-process agents keep the chat.
+  const isExternal = !!(data.ok && data.agent && data.agent.runtime?.kind === 'cli');
+  const chatCol = document.getElementById('agents-chat-col');
+  if (chatCol) chatCol.style.display = isExternal ? 'none' : '';
+  if (!isExternal) {
+    await _loadAgentChatHistory(_selectedAgent.id);
+    setTimeout(() => document.getElementById('agents-chat-input')?.focus(), 50);
+  } else {
+    setTimeout(() => document.getElementById('agents-detail-name')?.focus(), 50);
+  }
   // Wire field blur-save (one-time attach)
   _bindAgentFieldSave();
 }
 
 async function _exitAgentEditMode() {
   _agentEditing = false;
+  // Abort any in-flight reply so the "done" button stops the stream immediately. The
+  // agent chat controller is a singleton; leaving it pending also leaks the
+  // streaming-button state into the next agent's edit panel.
+  try { _agentChatCtrl?.abort(); } catch (_) { /* ignore */ }
   // Flush any pending save and then re-render in readonly mode.
-  await _flushAgentFieldSave();
+  // The Done button is the explicit commit point — validate name here so
+  // a bad value alerts + reverts rather than silently lingering.
+  await _flushAgentFieldSave({ validate: true });
   document.getElementById('agents-chat-col').style.display = 'none';
   const aid = _selectedAgent?.id;
   if (aid) {
@@ -562,21 +761,28 @@ function _scheduleAgentFieldSave(field, value) {
 }
 
 let _pendingAgentField = null;
-async function _flushAgentFieldSave() {
+// `validate` is only true when the user explicitly commits (clicks "done" →
+// `_exitAgentEditMode`). Typing-debounced and blur-triggered flushes pass
+// false: a bad name silently skips the save (the DOM keeps the user's
+// in-progress text) instead of popping a uiAlert mid-keystroke.
+async function _flushAgentFieldSave({ validate = false } = {}) {
   clearTimeout(_agentFieldSaveTimer);
   _agentFieldSaveTimer = null;
   if (!_pendingAgentField || !_selectedAgent) return;
   const { field, value } = _pendingAgentField;
-  _pendingAgentField = null;
-  // Block reserved names locally — otherwise the PUT silently fails server-
-  // side and the renderer DOM keeps the bad value until the next reload.
-  if (field === 'name' && _isReservedAgentName(value)) {
-    await uiAlert(t('agents.name_reserved'));
-    // Revert the inline editor to the last known-good name and refresh list.
-    const nameEl = document.getElementById('agents-detail-name');
-    if (nameEl && _selectedAgent.name) nameEl.innerText = _selectedAgent.name;
-    return;
+  if (field === 'name') {
+    const reserved = _isReservedAgentName(value);
+    const invalid = !reserved && !_isValidAgentNameCharset(value);
+    if (reserved || invalid) {
+      if (!validate) return;
+      _pendingAgentField = null;
+      await uiAlert(t(reserved ? 'agents.name_reserved' : 'agents.name_invalid'));
+      const nameEl = document.getElementById('agents-detail-name');
+      if (nameEl && _selectedAgent.name) nameEl.innerText = _selectedAgent.name;
+      return;
+    }
   }
+  _pendingAgentField = null;
   try {
     const res = await apiFetch(`/api/agents/${encodeURIComponent(_selectedAgent.id)}/update`, {
       method: 'PUT',
@@ -584,8 +790,24 @@ async function _flushAgentFieldSave() {
       body: JSON.stringify({ [field]: value }),
     });
     const data = await res.json();
-    if (!data.ok) throw new Error(data.error || 'save failed');
-    _agentsCache = null; // list may need a name refresh
+    if (!data.ok) {
+      // Surface duplicate-name / reserved-name with their localised messages
+      // instead of the raw English server text.
+      const localised = _agentCreateErrorMessage(data);
+      throw new Error(localised || data.error || 'save failed');
+    }
+    // Eagerly refresh — name changes feed the chat-bubble @-mention regex
+    // (`_buildMentionRe` reads `_agentsCache`); leaving the cache null until
+    // the next picker open means freshly-typed `@<multi-word-name>` only
+    // gets the fallback char class, which stops at the first whitespace.
+    await loadAgents(true);
+    // Repaint the input-box recipient chip if it's bound to this agent —
+    // its `name` field is a localStorage snapshot taken at picker time, so
+    // without an explicit re-render the chip keeps showing the old name
+    // until the next view switch.
+    if (field === 'name' && typeof _renderRecipientChip === 'function') {
+      try { _renderRecipientChip(); } catch (_) { /* non-fatal */ }
+    }
   } catch (e) {
     _agentsLog.warn('save agent field failed', e);
     if (field === 'name') {
@@ -596,19 +818,134 @@ async function _flushAgentFieldSave() {
   }
 }
 
-// ─── Create agent (modal-first, mirrors skill flow) ───
+// ─── Create agent (modal-first, two tabs: Create / External) ───
+//
+// "Create" (default tab) — manual authoring of an in-process agent.
+// The LLM-driven edit chat opens immediately on save so the workflow
+// can be refined.
+//
+// "External" — bind a local CLI as the runtime. The CLI selector sits
+// at the top (default "not selected"); selecting a CLI auto-fills
+// name + description from
+// CLI_DEFAULTS. The user can override either; subsequent CLI swaps
+// only re-fill fields that still match the previous CLI's defaults
+// (so a user-edited value is never clobbered).
+//
+// Track the last-applied CLI defaults so that "switch CLI → fields
+// follow" can detect "did the user touch this field?". `null` =
+// nothing applied yet (untouched-default state, or the "create" tab).
+
+function _switchAgentTab(tab) {
+  const tabs = document.querySelectorAll('#agent-modal-tabs [data-agent-tab]');
+  tabs.forEach((el) => el.classList.toggle('is-active', el.dataset.agentTab === tab));
+  const panels = document.querySelectorAll('#agent-modal [data-agent-panel]');
+  panels.forEach((el) => el.classList.toggle('is-active', el.dataset.agentPanel === tab));
+  const msgEl = document.getElementById('agent-form-msg');
+  if (msgEl) { msgEl.textContent = ''; msgEl.className = 'form-msg'; }
+  setTimeout(() => {
+    const focusId = tab === 'external' ? 'agent-modal-ext-cli-select' : 'agent-name-input';
+    const el = document.getElementById(focusId);
+    // ai-select wrapper isn't focusable directly; just leave it alone.
+    if (el && typeof el.focus === 'function' && el.tagName !== 'DIV') el.focus();
+  }, 30);
+}
+window._switchAgentTab = _switchAgentTab;
+
+// Track which CLI defaults are currently reflected in the External-tab
+// inputs. When a user types over a default, the field key drops out of
+// this set so subsequent CLI swaps don't overwrite the typed value.
+let _extActiveCli = null;
+let _extDefaultFieldsAtMount = { name: false, desc: false };
+
+/** Decide whether a current `name` value still counts as "the default
+ *  for `defaultName`" — meaning a CLI swap should overwrite it. We
+ *  recognise the bare default plus the dedup-style suffixes a user
+ *  is likely to add when fighting the name-taken error: "Claude Code",
+ *  "Claude Code 2", "Claude Code-2", "Claude Code (2)", etc. Anything
+ *  with non-digit text after the default ("Claude Code Pro") counts as
+ *  user-edited and is kept. */
+function _isDefaultlikeName(value, defaultName) {
+  if (!value) return true;
+  if (!defaultName) return false;
+  if (value === defaultName) return true;
+  const escaped = defaultName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp('^' + escaped + '\\s*(?:[-_]\\s*)?(?:\\(\\s*\\d+\\s*\\)|\\d+)$');
+  return re.test(value);
+}
+
+function _applyExternalCliDefaults(cliType, { force = false } = {}) {
+  const defaults = (typeof getCliDefaults === 'function') ? getCliDefaults(cliType) : null;
+  const nameEl = document.getElementById('agent-ext-name-input');
+  const descEl = document.getElementById('agent-ext-desc-input');
+  if (!nameEl || !descEl) return;
+
+  const lang = (typeof getLang === 'function') ? getLang() : 'zh';
+  const localizedDesc = defaults
+    ? (lang === 'en' ? defaults.description_en : defaults.description_zh)
+    : '';
+  const targetName = defaults ? defaults.name : '';
+  const targetDesc = localizedDesc;
+
+  // Decide per field whether to overwrite. The two checks are independent —
+  // a user who edits the name but leaves the description alone keeps their
+  // name and gets a refreshed description. "Default-like name" also covers
+  // dedup suffixes like "Claude Code 2" (added to dodge name-taken errors).
+  const prev = (typeof getCliDefaults === 'function') ? getCliDefaults(_extActiveCli) : null;
+  const prevDescLocalized = prev ? (lang === 'en' ? prev.description_en : prev.description_zh) : '';
+
+  const nameUntouched = force || _isDefaultlikeName(nameEl.value, prev?.name);
+  const descUntouched = force
+    || descEl.value === ''
+    || (prev && descEl.value === prevDescLocalized);
+
+  if (cliType === null) {
+    // Reverted to "not selected" — only clear fields that still hold
+    // the previous CLI's defaults. Keep user-typed text.
+    if (nameUntouched) nameEl.value = '';
+    if (descUntouched) descEl.value = '';
+  } else {
+    if (nameUntouched) nameEl.value = targetName;
+    if (descUntouched) descEl.value = targetDesc;
+  }
+  _extActiveCli = cliType;
+}
 
 function openAgentModal() {
   const modal = document.getElementById('agent-modal');
-  const nameInput = document.getElementById('agent-name-input');
-  const descInput = document.getElementById('agent-desc-input');
   const msgEl = document.getElementById('agent-form-msg');
-  nameInput.value = '';
-  descInput.value = '';
   msgEl.textContent = '';
   msgEl.className = 'form-msg';
+
+  // Reset both panels' inputs.
+  const nameInput = document.getElementById('agent-name-input');
+  const descInput = document.getElementById('agent-desc-input');
+  const extName = document.getElementById('agent-ext-name-input');
+  const extDesc = document.getElementById('agent-ext-desc-input');
+  if (nameInput) nameInput.value = '';
+  if (descInput) descInput.value = '';
+  if (extName) extName.value = '';
+  if (extDesc) extDesc.value = '';
+  _extActiveCli = null;
+  _extDefaultFieldsAtMount = { name: true, desc: true };
+
+  // Wire tabs (idempotent).
+  const tabBar = document.getElementById('agent-modal-tabs');
+  if (tabBar && !tabBar.dataset.wired) {
+    tabBar.querySelectorAll('[data-agent-tab]').forEach((btn) => {
+      btn.addEventListener('click', () => _switchAgentTab(btn.dataset.agentTab));
+    });
+    tabBar.dataset.wired = '1';
+  }
+  _switchAgentTab('create');
+
+  // Refresh the External-tab CLI selector. Re-mount each open so newly-
+  // installed CLIs surface without an app restart.
+  if (typeof mountExternalCliSelect === 'function') {
+    mountExternalCliSelect((cli) => _applyExternalCliDefaults(cli)).catch(() => {});
+  }
+
   modal.classList.add('open');
-  setTimeout(() => nameInput.focus(), 50);
+  setTimeout(() => document.getElementById('agent-name-input')?.focus(), 50);
 }
 window.openAgentModal = openAgentModal;
 
@@ -618,9 +955,16 @@ function closeAgentModal() {
 window.closeAgentModal = closeAgentModal;
 
 async function saveAgentModal() {
+  const msgEl = document.getElementById('agent-form-msg');
+  const activeTab = document.querySelector('#agent-modal-tabs .is-active')?.dataset.agentTab || 'create';
+  if (activeTab === 'external') return _saveExternalAgent({ msgEl });
+  return _saveCreateAgent({ msgEl });
+}
+window.saveAgentModal = saveAgentModal;
+
+async function _saveCreateAgent({ msgEl }) {
   const name = document.getElementById('agent-name-input').value.trim();
   const description = document.getElementById('agent-desc-input').value.trim();
-  const msgEl = document.getElementById('agent-form-msg');
 
   if (!name) {
     msgEl.textContent = t('agents.input_name_needed');
@@ -634,6 +978,12 @@ async function saveAgentModal() {
     document.getElementById('agent-name-input').focus();
     return;
   }
+  if (!_isValidAgentNameCharset(name)) {
+    msgEl.textContent = t('agents.name_invalid');
+    msgEl.className = 'form-msg err';
+    document.getElementById('agent-name-input').focus();
+    return;
+  }
   if (!description) {
     msgEl.textContent = t('agents.input_desc_needed');
     msgEl.className = 'form-msg err';
@@ -642,17 +992,16 @@ async function saveAgentModal() {
   }
 
   try {
-    // 创建时本地随机一对头像，让每个新智能体一上来就有不同的视觉锚点。
-    // 不让 LLM 介入 —— 头像是 UI 元数据，不影响 prompt 行为。
     const avatar = randomAgentAvatar();
+    const body = { name, description, icon: avatar.icon, color: avatar.color };
     const res = await apiFetch('/api/agents/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, description, icon: avatar.icon, color: avatar.color }),
+      body: JSON.stringify(body),
     });
     const data = await res.json();
     if (!data.ok || !data.agent) {
-      msgEl.textContent = data.error || t('agents.create_failed');
+      msgEl.textContent = _agentCreateErrorMessage(data) || t('agents.create_failed');
       msgEl.className = 'form-msg err';
       return;
     }
@@ -661,8 +1010,6 @@ async function saveAgentModal() {
     await loadAgents(true);
     await _showAgentsDetailView(data.agent.agent_id);
     await _enterAgentEditMode();
-    // Auto-seed: use the user's description as context for the LLM so it
-    // starts refining the workflow without the user having to restate it.
     const seed = t('agents.seed_workflow', { description });
     await _autoSendAgentChat(seed);
   } catch (e) {
@@ -670,7 +1017,97 @@ async function saveAgentModal() {
     msgEl.className = 'form-msg err';
   }
 }
-window.saveAgentModal = saveAgentModal;
+
+async function _saveExternalAgent({ msgEl }) {
+  const cli = (typeof getExternalCliValue === 'function') ? getExternalCliValue() : null;
+  const name = document.getElementById('agent-ext-name-input').value.trim();
+  const desc = document.getElementById('agent-ext-desc-input').value.trim();
+
+  if (!cli) {
+    msgEl.textContent = t('agents.ext_cli_needed');
+    msgEl.className = 'form-msg err';
+    return;
+  }
+  if (!name) {
+    msgEl.textContent = t('agents.input_name_needed');
+    msgEl.className = 'form-msg err';
+    document.getElementById('agent-ext-name-input').focus();
+    return;
+  }
+  if (_isReservedAgentName(name)) {
+    msgEl.textContent = t('agents.name_reserved');
+    msgEl.className = 'form-msg err';
+    document.getElementById('agent-ext-name-input').focus();
+    return;
+  }
+  if (!_isValidAgentNameCharset(name)) {
+    msgEl.textContent = t('agents.name_invalid');
+    msgEl.className = 'form-msg err';
+    document.getElementById('agent-ext-name-input').focus();
+    return;
+  }
+  if (!desc) {
+    msgEl.textContent = t('agents.input_desc_needed');
+    msgEl.className = 'form-msg err';
+    document.getElementById('agent-ext-desc-input').focus();
+    return;
+  }
+
+  // Both `description_zh` + `description_en` are stored so locale switches
+  // are zero-cost. The locale we're currently editing in goes into that
+  // side; the other side gets the canonical CLI default. Users who want
+  // both fully-translated can edit each side later.
+  const defaults = (typeof getCliDefaults === 'function') ? getCliDefaults(cli) : null;
+  const lang = (typeof getLang === 'function') ? getLang() : 'zh';
+  const description_zh = lang === 'zh' ? desc : (defaults ? defaults.description_zh : desc);
+  const description_en = lang === 'en' ? desc : (defaults ? defaults.description_en : desc);
+
+  try {
+    const avatar = randomAgentAvatar();
+    const body = {
+      name,
+      description: desc,
+      description_zh, description_en,
+      icon: avatar.icon, color: avatar.color,
+      runtime: { kind: 'cli', cli },
+    };
+    const res = await apiFetch('/api/agents/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!data.ok || !data.agent) {
+      msgEl.textContent = _agentCreateErrorMessage(data) || t('agents.create_failed');
+      msgEl.className = 'form-msg err';
+      return;
+    }
+    closeAgentModal();
+    setView('agents');
+    await loadAgents(true);
+    // External agents go straight to the detail view but skip the LLM
+    // edit-chat — there's nothing to author. The user can still rename
+    // or reword the description through the inline name/desc editors.
+    await _showAgentsDetailView(data.agent.agent_id);
+  } catch (e) {
+    msgEl.textContent = t('agents.network_error', { reason: e.message || e });
+    msgEl.className = 'form-msg err';
+  }
+}
+
+/** Normalise IPC-shim error replies into a user-facing message. The
+ *  backend tags duplicate-name / reserved-name failures with a `code`
+ *  so we surface the localised string instead of the raw "agent name
+ *  ... is already in use" English text. */
+function _agentCreateErrorMessage(data) {
+  if (!data) return '';
+  const code = data.code;
+  if (code === 'E_AGENT_NAME_TAKEN') return t('agents.name_taken');
+  if (code === 'E_AGENT_NAME_RESERVED') return t('agents.name_reserved');
+  if (code === 'E_AGENT_NAME_INVALID') return t('agents.name_invalid');
+  if (code === 'E_AGENT_NAME_TOO_LONG') return t('agents.name_too_long');
+  return data.error || '';
+}
 
 async function _autoSendAgentChat(content) {
   if (!_selectedAgent) return;
@@ -736,6 +1173,11 @@ function _ensureAgentChatController() {
               _renderAgentDetail(freshData.agent, true);
               _agentsCache = null;
               await loadAgents(true);
+              // Repaint the chat input recipient chip in case its bound
+              // agent was the one just renamed by the edit chat.
+              if (typeof _renderRecipientChip === 'function') {
+                try { _renderRecipientChip(); } catch (_) { /* non-fatal */ }
+              }
             }
           } catch (e) {
             _agentsLog.warn('refresh after updated fields failed', e);
@@ -751,7 +1193,7 @@ async function _loadAgentChatHistory(agentId) {
   _ensureAgentChatController();
   await _agentChatCtrl.loadHistory();
   // Custom empty-state message for fresh agents — controller's default is
-  // "无对话记录..."; replace it with an agent-specific prompt when empty.
+  // "no messages..."; replace it with an agent-specific prompt when empty.
   const container = document.getElementById('agents-chat-messages');
   const empty = container?.querySelector('.empty');
   const defaultEmptyText = t('chat.empty');
@@ -767,15 +1209,16 @@ async function clearAgentChat() {
   await _agentChatCtrl.clear();
 }
 
-// ─── "使用" flow: new normal conversation seeded with "运行 <name>" ───
+// ─── "Use" flow: new normal conversation seeded with "run <name>" ───
 
 /**
- * Run an agent: creates a fresh normal conversation, navigates to it, then
- * auto-sends a short user-visible message ("运行 <name>"). The model sees
- * the same visible text and recognises it as a run-agent directive per
- * chat_commander.md rule 0 (instruction following) — no hidden backend injection.
+ * Run an agent: creates a fresh normal conversation, navigates to it,
+ * then auto-sends a short user-visible message ("run <name>"). The
+ * model sees the same visible text and recognises it as a run-agent
+ * directive per chat_commander.md rule 0 (instruction following) — no
+ * hidden backend injection.
  *
- * `seedText` is the user-visible content. Defaults to "运行 <name>".
+ * `seedText` is the user-visible content. Defaults to "run <name>".
  */
 async function useAgent(agentId, seedText) {
   if (!ensureModelConfigured()) return;
@@ -789,14 +1232,21 @@ async function useAgent(agentId, seedText) {
 
     const visible = (seedText || '').trim() || t('agents.run_prefix', { name: agent.name || agent.agent_id });
 
+    // Don't pass a custom title — let backend `groupChat.send` auto-title
+    // from the first user message, same rule as every other conv-creation
+    // entry point (new-chat panel, commander @-mention). Optimistic title
+    // is the run-prefix message itself so the sidebar entry shows the
+    // user's intent ("run <name>") instead of bare agent name; this
+    // matches what backend `autoTitle` will persist on the same `visible`.
     const res = await apiFetch('/api/conversations/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title: agent.name || '' }),
+      body: JSON.stringify({}),
     });
     const data = await res.json();
     if (!data.ok) throw new Error(data.error || t('agents.create_conv_failed'));
     const conv = data.conversation;
+    conv.title = _autoTitle(visible);
     conversations.unshift(conv);
     renderConversationList();
     setView('conversation', conv.conversation_id, { skipLoad: true });
@@ -813,7 +1263,8 @@ async function useAgent(agentId, seedText) {
 }
 
 async function useSkill(skillId, skillName) {
-  // Skill 使用：跳转到新对话页，预选该技能，等用户输入。
+  // Skill "use" flow: navigate to the new-chat page with the skill
+  // pre-selected and wait for user input.
   _agentsLog.info('use skill', { skill_id: skillId, skill_name: skillName || skillId });
   setView('new-chat');
   setChatSkill('new-chat', skillName || skillId);
@@ -944,15 +1395,15 @@ function _renderAgentPickerList(filterText) {
         const aDesc = pickDesc(a, lang).trim();
         return `
         <div class="skill-picker-item" data-id="${escapeHtml(a.agent_id)}" data-name="${escapeHtml(a.name || a.agent_id)}">
-          <div>${escapeHtml(a.name || t('agents.unnamed'))}</div>
-          ${aDesc ? `<div style="font-size:11px;color:#9ca3af;margin-top:2px">${escapeHtml(aDesc)}</div>` : ''}
+          <div class="skill-picker-item-name">${escapeHtml(a.name || t('agents.unnamed'))}</div>
+          ${aDesc ? `<div class="skill-picker-item-desc">${escapeHtml(aDesc)}</div>` : ''}
         </div>`;
       }).join('');
   };
   const commanderHtml = (isRecipientPicker && commanderMatchesFilter)
     ? `<div class="skill-picker-item" data-id="__commander__" data-name="${escapeHtml(commanderName)}">
-         <div>${escapeHtml(commanderName)}</div>
-         <div style="font-size:11px;color:#9ca3af;margin-top:2px">${escapeHtml(t('chat.recipient_commander_hint'))}</div>
+         <div class="skill-picker-item-name">${escapeHtml(commanderName)}</div>
+         <div class="skill-picker-item-desc">${escapeHtml(t('chat.recipient_commander_hint'))}</div>
        </div>`
     : '';
   listEl.innerHTML = commanderHtml + groupHtml(t('agents.source_custom'), groups.custom) + groupHtml(t('agents.source_builtin'), groups.builtin);
@@ -995,7 +1446,7 @@ function _moveAgentPickerActive(delta) {
 
 // Route an agent selection to the right behaviour based on which button
 // triggered the picker:
-//   - conversation toolbar → send/queue "运行 <name>" in the CURRENT conv.
+//   - conversation toolbar → send/queue "run <name>" in the CURRENT conv.
 //     Never opens a new conv. No hidden backend injection — the model reads
 //     the visible message and follows chat_commander.md rule 0.
 //   - new-chat toolbar → create a new normal conv + run agent (useAgent)
@@ -1053,6 +1504,11 @@ function bindAgentPickers() {
     _renderAgentPickerList(searchInput.value);
   });
   searchInput?.addEventListener('keydown', (e) => {
+    // IME composition guard (CLAUDE.md §8): Enter / Arrow keys belong to
+    // the IME while a Chinese / Japanese / Korean candidate is being
+    // composed; without this early-return, pressing Enter to commit an
+    // English candidate would also fire our select-active-item handler.
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Escape') { _atKeyMark = null; _closeAgentPicker(); e.preventDefault(); return; }
     if (e.key === 'ArrowDown') { _moveAgentPickerActive(1); e.preventDefault(); return; }
     if (e.key === 'ArrowUp')   { _moveAgentPickerActive(-1); e.preventDefault(); return; }
@@ -1101,9 +1557,9 @@ function bindAgentPickers() {
   };
   // Backspace right after a `@<name>` token (with or without the trailing
   // space the picker inserts) should remove the whole mention as one unit
-  // — character-by-character deletion of `@张三 ` is annoying when the
-  // user picked the wrong agent. Match the same charset as the bus
-  // mention regex so `@中文名字` works.
+  // — character-by-character deletion of a mention like `@<CJK-name> `
+  // is annoying when the user picked the wrong agent. Match the same
+  // charset as the bus mention regex so CJK names work.
   const MENTION_DELETE_RE = /@[A-Za-z0-9_一-鿿-]+ ?$/u;
   const onBackspaceMention = (e) => {
     if (e.key !== 'Backspace') return;

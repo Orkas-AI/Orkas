@@ -7,7 +7,7 @@ let _selectedSkill = null;    // { source, id }
 // Re-render the skill grid + currently selected detail page when the UI
 // language changes — descriptions are bilingual now and `pickDesc` returns
 // a different string after the locale flip. Detail re-render goes through
-// `selectSkillFile` so the SKILL.md frontmatter re-parses and 简介 picks the
+// `selectSkillFile` so the SKILL.md frontmatter re-parses and the description picks the
 // right locale via `_renderSkillSections`.
 window.addEventListener('i18n-change', () => {
   if (_skillsCache) renderSkillsGrid(_skillsCache);
@@ -41,7 +41,7 @@ async function loadSkills() {
 // The chip pill is still used to display a skill that was attached
 // programmatically by the "use skill" flow (▶ on a skill card → useSkill →
 // setChatSkill). Clicking × removes the chip. On send, the chip's name is
-// prepended to the message as `使用 <name> skill：<content>`.
+// prepended to the message as `use skill <name>: <content>`.
 
 const _chatSkill = { 'new-chat': '', 'conversation': '' };
 
@@ -117,28 +117,21 @@ function renderSkillsGrid(skills) {
     const desc = pickDesc(s, getLang()).trim();
     const descClass = desc ? 'skill-card-desc' : 'skill-card-desc is-empty';
     const descText = desc || t('skills.no_desc');
-    const sourceLabel = s.source === 'custom' ? t('skills.source_custom') : t('skills.source_builtin');
-    const sourceCls = s.source === 'custom' ? 'is-custom' : 'is-builtin';
-    const moreBtn = s.source === 'custom'
-      ? `<button type="button" class="skill-card-more" data-skill-more title="${moreTitle}" aria-label="${moreTitle}">⋯</button>`
-      : '';
+    // Source label (custom / builtin) is shown on the detail page only;
+    // the grid cards stay clean and use the ⋯ menu for actions.
+    const moreBtn = `<button type="button" class="skill-card-more" data-skill-more title="${moreTitle}" aria-label="${moreTitle}">⋯</button>`;
     const enabled = s.enabled !== false;
-    const toggleTitle = escapeHtml(enabled ? t('component.toggle_disable_hint') : t('component.toggle_enable_hint'));
-    // Pure switch (no label) per UX spec — full label lives in the detail page.
-    const toggle = `<label class="toggle-switch is-compact" data-skill-toggle title="${toggleTitle}" aria-label="${toggleTitle}">
-        <input type="checkbox" data-skill-toggle-input ${enabled ? 'checked' : ''} />
-      </label>`;
     return `
       <div class="skill-card${enabled ? '' : ' is-disabled'}" data-id="${escapeHtml(s.id)}" data-source="${s.source}">
         <div class="skill-card-header">
           <span class="skill-card-name">${escapeHtml(s.name)}</span>
-          <span class="skill-card-source ${sourceCls}">${escapeHtml(sourceLabel)}</span>
-          ${toggle}
           ${moreBtn}
         </div>
         <div class="${descClass}">${escapeHtml(descText)}</div>
         <div class="skill-card-actions">
-          <button type="button" class="skill-card-use" data-skill-use title="${useTitle}" aria-label="${useTitle}">▶</button>
+          <button type="button" class="skill-card-use" data-skill-use title="${useTitle}" aria-label="${useTitle}">
+            <svg class="icon-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><polygon points="5,3 5,13 13,8" fill="currentColor"/></svg>
+          </button>
         </div>
       </div>
     `;
@@ -152,17 +145,12 @@ function renderSkillsGrid(skills) {
   renderGroup(custom, customGroup, customGrid);
   renderGroup(builtin, builtinGroup, builtinGrid);
 
-  // Wire card / ▶ / ⋯ / toggle click handlers.
+  // Wire card / ▶ / ⋯ click handlers. (Enable/disable lives in the ⋯ menu
+  // now — no toggle switch on the card.)
   for (const card of document.querySelectorAll('.skill-card')) {
     const id = card.dataset.id;
     const source = card.dataset.source;
     card.addEventListener('click', (e) => {
-      // Toggle and its <input>: swallow card-click navigation. The change
-      // event below handles the actual flip.
-      if (e.target.closest('[data-skill-toggle]')) {
-        e.stopPropagation();
-        return;
-      }
       if (e.target.closest('[data-skill-use]')) {
         e.stopPropagation();
         const skill = _skillsCache?.find(s => s.id === id && s.source === source);
@@ -176,39 +164,29 @@ function renderSkillsGrid(skills) {
       }
       _showSkillsDetailView(source, id);
     });
-    const toggleInput = card.querySelector('[data-skill-toggle-input]');
-    toggleInput?.addEventListener('change', async (e) => {
-      e.stopPropagation();
-      await _flipSkillEnabledFromCard(id, toggleInput);
-    });
   }
 }
 
-/** Flip a skill's enabled override from the list-card toggle. Mirrors the
- *  detail-page toggle helper but doesn't touch any detail DOM — just updates
- *  the card class and refreshes the cached list. Failure rolls the input back. */
-async function _flipSkillEnabledFromCard(skillId, input) {
-  const next = input.checked;
-  input.disabled = true;
+/** Flip a skill's enabled override (used by both the ⋯ menu's toggle item
+ *  and the detail-page enable/disable button). On failure, alerts and does
+ *  not mutate UI state; on success, refreshes the grid + detail page. */
+async function _flipSkillEnabled(skillId, nextEnabled) {
   try {
-    const res = await window.orkas.invoke('skills.setEnabled', { id: skillId, enabled: next });
+    const res = await window.orkas.invoke('skills.setEnabled', { id: skillId, enabled: nextEnabled });
     if (!res || !res.ok) {
-      input.checked = !next;
       await uiAlert(t('component.toggle_failed'));
-      return;
+      return false;
     }
-    const card = input.closest('.skill-card');
-    if (card) card.classList.toggle('is-disabled', !next);
     const cached = _skillsCache?.find((s) => s.id === skillId);
-    if (cached) cached.enabled = next;
-    // Reload so detail page (if open for this skill) and other consumers see
-    // the new state without page refresh.
+    if (cached) cached.enabled = nextEnabled;
     await loadSkills();
+    if (_selectedSkill?.id === skillId) {
+      _renderSkillEnabledButton({ id: skillId, enabled: nextEnabled });
+    }
+    return true;
   } catch (err) {
-    input.checked = !next;
     await uiAlert(t('component.toggle_failed'));
-  } finally {
-    input.disabled = false;
+    return false;
   }
 }
 
@@ -219,6 +197,9 @@ function _showSkillsGridView() {
   const detail = document.getElementById('skills-detail-view');
   // Exit edit mode if active so chat panel is hidden too.
   if (_skillEditMode) {
+    // Abort any in-flight reply (same reason as toggleSkillEditMode exit
+    // branch — singleton controller, leaving pending leaks streaming UI).
+    try { _skillChatCtrl?.abort(); } catch (_) { /* ignore */ }
     _skillEditMode = false;
     _skillEditSkillId = null;
     const chatCol = document.getElementById('skills-chat-col');
@@ -304,10 +285,28 @@ function _openSkillRowMenu(anchorBtn, id, source) {
   _closeSkillRowMenu();
   menu.dataset.skillId = id;
   menu.dataset.source = source;
-  menu.innerHTML = [
-    `<div class="skill-row-menu-item" data-action="edit">${escapeHtml(t('skills.edit'))}</div>`,
-    `<div class="skill-row-menu-item is-danger" data-action="delete">${escapeHtml(t('skills.delete'))}</div>`,
-  ].join('');
+  // Edit/delete are gated: custom always allowed; built-in only in dev mode.
+  // Enable/disable is always shown (lives in this menu now since cards no
+  // longer carry a toggle).
+  const cached = _skillsCache?.find((s) => s.id === id && s.source === source);
+  const enabled = cached ? cached.enabled !== false : true;
+  const canEdit = source === 'custom' || (source === 'builtin' && isDevMode());
+  const items = [];
+  if (canEdit) {
+    items.push(`<div class="skill-row-menu-item" data-action="edit">${escapeHtml(t('skills.edit'))}</div>`);
+  }
+  items.push(
+    `<div class="skill-row-menu-item" data-action="toggle-enabled">${escapeHtml(enabled ? t('component.disable') : t('component.enable'))}</div>`,
+  );
+  if (source === 'custom' && isDevMode()) {
+    items.push(
+      `<div class="skill-row-menu-item" data-action="promote">${escapeHtml(t('skills.promote_to_builtin'))}</div>`,
+    );
+  }
+  if (canEdit) {
+    items.push(`<div class="skill-row-menu-item is-danger" data-action="delete">${escapeHtml(t('skills.delete'))}</div>`);
+  }
+  menu.innerHTML = items.join('');
   // While menu open, force the source card's ⋯ visible.
   for (const c of document.querySelectorAll('.skill-card.is-menu-open')) c.classList.remove('is-menu-open');
   anchorBtn.closest('.skill-card')?.classList.add('is-menu-open');
@@ -326,6 +325,12 @@ function _openSkillRowMenu(anchorBtn, id, source) {
         // Mimic the existing delete flow (from detail page) but for any card.
         _selectedSkill = { source, id, filepath: 'SKILL.md', name: '' };
         await deleteSelectedSkill();
+      } else if (action === 'promote') {
+        await promoteCustomSkill(id);
+      } else if (action === 'toggle-enabled') {
+        const cur = _skillsCache?.find((s) => s.id === id && s.source === source);
+        const nextEnabled = !(cur ? cur.enabled !== false : true);
+        await _flipSkillEnabled(id, nextEnabled);
       }
     });
   }
@@ -521,43 +526,59 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   nameEl.textContent = skill?.name || id;
   nameEl.dataset.skillId = id;
   nameEl.dataset.source = source;
-  // Only custom skills allow click-to-edit on the name
-  if (source === 'custom') {
-    nameEl.classList.add('editable');
-    nameEl.setAttribute('title', t('skills.rename_title'));
-  } else {
-    nameEl.classList.remove('editable');
-    nameEl.removeAttribute('title');
-  }
+  // Name is editable ONLY in edit mode (req: "non-edit state must not allow rename").
+  // Editability is wired below alongside the description-section toggle —
+  // both depend on `editingThis` which is computed a few lines down.
+  nameEl.classList.remove('editable');
+  nameEl.removeAttribute('title');
 
-  // Source label: just the source kind. File path is already conveyed by
-  // the active highlight inside the source tree below.
-  const sourceLabel = source === 'custom' ? t('skills.source_custom') : t('skills.source_builtin');
-  document.getElementById('skills-detail-source').textContent = sourceLabel;
+  // Source label + colored tag — mirrors `.agents-detail-source.is-builtin/.is-custom`.
+  const sourceEl = document.getElementById('skills-detail-source');
+  sourceEl.textContent = source === 'custom' ? t('skills.source_custom') : t('skills.source_builtin');
+  sourceEl.className = 'skills-doc-source ' + (source === 'builtin' ? 'is-builtin' : 'is-custom');
 
-  // Doc sections (简介 / 外部依赖 / 依赖技能 / 其他属性) — seed with the
-  // cached description so the page isn't blank on first paint; refined
-  // once SKILL.md frontmatter parses.
+  // Doc sections (description / external dependencies / dependent
+  // skills / other attributes) — seed with the cached description so
+  // the page isn't blank on first paint; refined once SKILL.md
+  // frontmatter parses.
   const seedDesc = pickDesc(skill, getLang()).trim();
   _renderSkillSections(seedDesc ? [['description', seedDesc]] : []);
 
   // Actions bar: visible when a skill is selected.
-  // In edit mode only 完成 (the relabeled 编辑 button) is shown; 使用/删除 hide.
-  // Builtin skills never show 编辑/删除.
+  // Order: use (icon) / edit / enable-disable / promote-to-builtin
+  //        (custom + dev) / delete.
+  // In edit mode only the "done" button (the relabeled "edit") is
+  // shown; everything else hides.
+  const canEditThisSkill = source === 'custom' || (source === 'builtin' && isDevMode());
+  const editingThis = _skillEditMode && _skillEditSkillId === id && canEditThisSkill;
   const actions = document.getElementById('skills-detail-actions');
   if (actions) {
     actions.classList.remove('is-hidden');
     const useBtn = document.getElementById('skill-use-btn');
     const editBtn = document.getElementById('skill-edit-btn');
+    const enableBtn = document.getElementById('skill-enabled-btn');
+    const promoteBtn = document.getElementById('skill-promote-btn');
     const delBtn = document.getElementById('skill-delete-btn');
-    const editingThis = _skillEditMode && _skillEditSkillId === id && source === 'custom';
     if (useBtn) useBtn.style.display = editingThis ? 'none' : '';
-    if (editBtn) editBtn.style.display = source === 'custom' ? '' : 'none';
-    if (delBtn) delBtn.style.display = (source === 'custom' && !editingThis) ? '' : 'none';
+    if (editBtn) editBtn.style.display = canEditThisSkill ? '' : 'none';
+    if (enableBtn) enableBtn.style.display = editingThis ? 'none' : '';
+    if (promoteBtn) promoteBtn.style.display = (source === 'custom' && isDevMode() && !editingThis) ? '' : 'none';
+    if (delBtn) delBtn.style.display = (canEditThisSkill && !editingThis) ? '' : 'none';
   }
 
-  // Per-user 已启用 / 已禁用 toggle. Available for both custom + builtin.
-  _renderSkillEnabledToggle({ id, name: skill?.name || id, enabled: skill?.enabled !== false });
+  // Wire name editability (edit mode + custom only) and hide the
+  // description section while editing (req #3: edit description by editing
+  // the `description_*:` frontmatter in SKILL.md, not via a separate UI
+  // block). Built-in skills' name is **never** directly editable here even
+  // under dev mode — direct rename would skip the dual-tree dir rename +
+  // per-user chat dir migration that LLM-driven SKILL.md edits go through.
+  const nameEditable = editingThis && source === 'custom';
+  _toggleSkillNameEditable(nameEl, nameEditable);
+  const summarySection = document.getElementById('skills-section-summary');
+  if (summarySection) summarySection.style.display = editingThis ? 'none' : '';
+
+  // Refresh the per-skill enable/disable button label + click handler.
+  _renderSkillEnabledButton({ id, enabled: skill?.enabled !== false });
 
   const body = document.getElementById('skills-detail-body');
   // Don't show a loading placeholder — it would collapse body height
@@ -603,7 +624,7 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   try {
     const data = await mainPromise;
     if (data.ok) {
-      const editable = _skillEditMode && _skillEditSkillId === id && source === 'custom';
+      const editable = _skillEditMode && _skillEditSkillId === id && canEditThisSkill;
       if (editable) _renderSkillFileEditor(body, data.content || '', data.ext);
       else _renderSkillFileView(body, data.content || '', data.ext);
     } else {
@@ -620,9 +641,15 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   // Chat column visibility is driven by edit-mode toggle.
   // Selecting a different skill resets edit mode off.
   const chatCol = document.getElementById('skills-chat-col');
-  if (_skillEditMode && _skillEditSkillId === id && source === 'custom') {
+  if (_skillEditMode && _skillEditSkillId === id && canEditThisSkill) {
     chatCol.style.display = 'flex';
   } else {
+    // Switching skill mid-stream needs to abort, otherwise the singleton
+    // controller's pending state bleeds into the next skill's edit panel
+    // (the send button shows streaming for a fresh chat).
+    if (_skillEditMode) {
+      try { _skillChatCtrl?.abort(); } catch (_) { /* ignore */ }
+    }
     _skillEditMode = false;
     _skillEditSkillId = null;
     chatCol.style.display = 'none';
@@ -681,9 +708,10 @@ function _parseSkillFrontmatterPairs(content) {
 
 // Single source of truth for rendering frontmatter fields into the
 // document. Splits known fields into their own dedicated sections (with
-// labels) and tucks any unknown leftover keys under "其他属性". Hides any
-// section whose content is empty (except 简介 which always renders so the
-// reader sees a placeholder when missing).
+// labels) and tucks any unknown leftover keys under "other
+// attributes". Hides any section whose content is empty (except the
+// description, which always renders so the reader sees a placeholder
+// when missing).
 function _renderSkillSections(pairs) {
   const map = new Map();
   for (const [k, v] of (pairs || [])) {
@@ -691,10 +719,10 @@ function _renderSkillSections(pairs) {
   }
   // `description_zh` / `description_en` are the canonical bilingual fields;
   // legacy single `description` is kept in `known` so it doesn't bleed into
-  // "其他属性" when reading older SKILL.md files.
+  // the "other attributes" bucket when reading older SKILL.md files.
   const known = new Set(['description', 'description_zh', 'description_en']);
 
-  // — 简介 — pick by current UI language with cross-language fallback (so a
+  // — Description — pick by current UI language with cross-language fallback (so a
   // single-language skill still shows something instead of going blank).
   const summaryEl = document.getElementById('skills-detail-summary');
   if (summaryEl) {
@@ -712,7 +740,7 @@ function _renderSkillSections(pairs) {
     }
   }
 
-  // — 其他属性 (catch-all for anything we don't render explicitly) —
+  // — Other attributes (catch-all for anything we don't render explicitly) —
   const extraSection = document.getElementById('skills-section-extra');
   const extraBody = document.getElementById('skills-detail-extra');
   if (extraSection && extraBody) {
@@ -734,7 +762,7 @@ function _renderSkillSections(pairs) {
 
 // Read-only view of a skill file. Markdown renders, other formats get a
 // code block. Stores the raw content on the element so the editor variant
-// can reset on "放弃修改" without re-fetching.
+// can reset on "discard changes" without re-fetching.
 function _renderSkillFileView(body, content, ext) {
   body.className = 'skills-detail-body';
   body.dataset.rawContent = content;
@@ -821,38 +849,120 @@ function _renderSkillFileEditor(body, content, _ext) {
   ta.addEventListener('input', scheduleSave);
 }
 
-// Click the skill name in detail header to rename (custom skills only).
-async function _handleSkillNameClick(e) {
-  const el = e.currentTarget;
-  if (!el.classList.contains('editable')) return;
+// ─── Skill name inline edit (mirrors agents.js's name editor) ───
+//
+// Replaces the older click-to-prompt rename path. The name field is now
+// only editable inside Skill detail's edit mode (req: non-edit state must
+// not allow rename). Wire-up:
+//   - Enter edit  → contenteditable + bind input/blur (one-time per element)
+//   - Type        → debounce 800ms → save SKILL.md frontmatter `name:`
+//                   via `skipRename:true` (no dir rename mid-typing)
+//   - Blur        → flush pending save
+//   - Done click  → flush + validate; if invalid alert + revert DOM;
+//                   if valid AND name actually changed, fire one final
+//                   `skipRename:false` to commit the directory rename.
 
-  const currentId = el.dataset.skillId;
-  const currentName = el.textContent.trim();
-  const input = await uiPrompt(t('skills.rename_prompt'), currentName);
-  if (input === null) return;
-  const newName = input.trim();
-  if (!newName || newName === currentName) return;
+const SKILL_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]*(?: [A-Za-z0-9_-]+)*$/;
+function _isValidSkillNameCharset(name) {
+  return typeof name === 'string' && name.length > 0 && name.length <= 64 && SKILL_NAME_RE.test(name);
+}
 
+function _toggleSkillNameEditable(nameEl, on) {
+  if (!nameEl) return;
+  nameEl.setAttribute('contenteditable', on ? 'plaintext-only' : 'false');
+  nameEl.classList.toggle('is-editing', !!on);
+  if (on) _bindSkillNameSave(nameEl);
+}
+
+function _bindSkillNameSave(nameEl) {
+  if (nameEl.dataset.bound === '1') return;
+  nameEl.dataset.bound = '1';
+  nameEl.addEventListener('input', () => _scheduleSkillFieldSave('name', nameEl.innerText));
+  nameEl.addEventListener('blur', () => _flushSkillFieldSave());
+}
+
+let _pendingSkillField = null;
+let _skillFieldSaveTimer = null;
+function _scheduleSkillFieldSave(field, value) {
+  if (!_selectedSkill || _selectedSkill.source !== 'custom') return;
+  _pendingSkillField = { field, value };
+  clearTimeout(_skillFieldSaveTimer);
+  _skillFieldSaveTimer = setTimeout(_flushSkillFieldSave, 800);
+}
+
+// `validate` is true ONLY when the user explicitly commits (clicks Done);
+// typing-debounced and blur-triggered flushes pass false — bad names
+// silently skip the save (DOM keeps the in-progress text) instead of
+// popping a uiAlert mid-keystroke. Mirrors agents.js::_flushAgentFieldSave.
+//
+// During typing we use `skipRename:true` so the directory id stays as the
+// original until Done; that keeps the URL / cache keyed by the same id and
+// avoids a flurry of dir renames per keystroke. The Done branch fires a
+// final `skipRename:false` update to commit the directory rename when the
+// new name passed validation and actually differs from the original id.
+async function _flushSkillFieldSave({ validate = false } = {}) {
+  clearTimeout(_skillFieldSaveTimer);
+  _skillFieldSaveTimer = null;
+  if (!_pendingSkillField || !_selectedSkill) return;
+  const { field, value } = _pendingSkillField;
+  if (field === 'name') {
+    const name = String(value || '').trim();
+    const invalid = !_isValidSkillNameCharset(name);
+    if (invalid) {
+      if (!validate) return;
+      _pendingSkillField = null;
+      await uiAlert(t('skills.name_invalid'));
+      const nameEl = document.getElementById('skills-detail-name');
+      if (nameEl) nameEl.innerText = _selectedSkill.id;
+      // Roll the SKILL.md frontmatter back to the original id too — the
+      // skipRename:true writes during typing left a possibly-invalid name
+      // on disk; revert so the next listSkills auto-heal doesn't misfire.
+      try {
+        await apiFetch(`/api/skills/${encodeURIComponent(_selectedSkill.id)}/update?skipRename=1`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: _selectedSkill.id }),
+        });
+      } catch (_) { /* best-effort revert */ }
+      return;
+    }
+  }
+  _pendingSkillField = null;
+  const currentId = _selectedSkill.id;
+  const newName = String(value || '').trim();
+  const skipRename = !validate || newName === currentId;
+  // ipc-shim's `wrapAsUpdates` wraps the body under `updates`, so the
+  // request body holds only field values; `skipRename` rides on the URL
+  // query string so it lands as a sibling of `updates` in the IPC payload.
+  const url = `/api/skills/${encodeURIComponent(currentId)}/update${skipRename ? '?skipRename=1' : ''}`;
   try {
-    const res = await apiFetch(`/api/skills/${encodeURIComponent(currentId)}/update`, {
+    const res = await apiFetch(url, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: newName }),
+      body: JSON.stringify({ [field]: value }),
     });
     const data = await res.json();
     if (!data.ok) {
-      await uiAlert(t('skills.rename_failed', { reason: data.error || '' }));
-      return;
+      throw new Error(data.error || 'save failed');
     }
-    const resultId = data.skill?.id || newName;
-    _skillsCache = null;
-    _skillTreeCache.clear();
-    _expandedDirs.delete(`custom:${currentId}`);
-    await loadSkills();
-    _selectedSkill = { source: 'custom', id: resultId, filepath: 'SKILL.md' };
-    await selectSkillFile('custom', resultId, 'SKILL.md', null);
+    if (validate && field === 'name' && !skipRename) {
+      // Directory was renamed — refresh caches + update _selectedSkill.id
+      // so subsequent calls (selectSkillFile / chat dir lookup) hit the
+      // new id, not the stale one.
+      const resultId = data.skill?.id || newName;
+      _skillsCache = null;
+      _skillTreeCache.clear();
+      _expandedDirs.delete(`custom:${currentId}`);
+      await loadSkills();
+      _selectedSkill = { ..._selectedSkill, id: resultId };
+      _skillEditSkillId = resultId;
+    }
   } catch (e) {
-    await uiAlert(t('skills.network_error', { reason: e.message || e }));
+    if (validate && field === 'name') {
+      await uiAlert(t('skills.rename_failed', { reason: e.message || e }));
+      const nameEl = document.getElementById('skills-detail-name');
+      if (nameEl) nameEl.innerText = _selectedSkill.id;
+    }
   }
 }
 
@@ -867,15 +977,32 @@ function _updateEditButtonLabel() {
   btn.textContent = _skillEditMode ? t('skills.edit_btn_done') : t('skills.edit_btn_edit');
 }
 
-// When called with {autoSeed: true} (e.g. right after skill creation), sends
-// a short "帮我完善这个技能" message to kick off the LLM. When autoSeed is a
-// non-empty string, sends that exact string instead — used by URL / Dir
-// import flows to inject their own "帮我安装技能：<...>" seed. In plain edit
-// mode (user clicks "编辑" on an existing skill) no message is sent
+// When called with {autoSeed: true} (e.g. right after skill creation),
+// sends a short "help me refine this skill" message to kick off the
+// LLM. When autoSeed is a non-empty string, sends that exact string
+// instead — used by URL / Dir import flows to inject their own
+// "help me install this skill: <...>" seed. In plain edit mode (user
+// clicks "edit" on an existing skill) no message is sent
 // automatically — the user drives the conversation from a blank input.
 async function toggleSkillEditMode(opts = {}) {
-  if (!_selectedSkill || _selectedSkill.source !== 'custom') return;
+  if (!_selectedSkill) return;
+  // Built-in editing is dev-only; lift the source guard accordingly.
+  if (_selectedSkill.source !== 'custom'
+      && !(_selectedSkill.source === 'builtin' && isDevMode())) return;
   if (_skillEditMode && _skillEditSkillId === _selectedSkill.id) {
+    // Abort any in-flight reply so "done" means "stop + exit", not
+    // "exit but keep streaming". The chat controller is a singleton;
+    // leaving it pending also leaks the streaming-button state into
+    // the next skill's edit panel when the user clicks "edit"
+    // elsewhere.
+    try { _skillChatCtrl?.abort(); } catch (_) { /* ignore */ }
+    // Done click is the explicit commit point: flush any pending name
+    // edit + validate. Invalid name → alert + revert DOM (and roll the
+    // SKILL.md frontmatter back to the original id, see the validate
+    // branch in `_flushSkillFieldSave`). Valid + actually-changed name
+    // → fires a `skipRename:false` update which commits the directory
+    // rename + refreshes caches before we re-render readonly view.
+    await _flushSkillFieldSave({ validate: true });
     _skillEditMode = false;
     _skillEditSkillId = null;
     document.getElementById('skills-chat-col').style.display = 'none';
@@ -968,7 +1095,10 @@ async function clearSkillChat() {
 async function _refreshSkillView() {
   if (!_skillEditSkillId) return;
   const sid = _skillEditSkillId;
-  const source = 'custom';
+  // Source must come from the active selection, not be hardcoded — dev-mode
+  // built-in editing reuses this same path and was previously bailing here
+  // because of a 'custom'-only equality check.
+  const source = _selectedSkill?.source || 'custom';
 
   // Refresh the skill list cache (in case name/description in SKILL.md changed)
   _skillsCache = null;
@@ -982,10 +1112,11 @@ async function _refreshSkillView() {
   if (!_selectedSkill || _selectedSkill.id !== sid || _selectedSkill.source !== source) return;
 
   // Re-render the whole detail page via selectSkillFile so the header
-  // (name) and the doc sections (description / 外部依赖 / 依赖技能 / ...)
-  // pick up SKILL.md frontmatter changes the LLM just made — without
-  // this, the description chip stayed on the pre-edit value until the
-  // user clicked 完成. selectSkillFile also re-reads the body, so we
+  // (name) and the doc sections (description / external deps /
+  // dependent skills / ...) pick up SKILL.md frontmatter changes the
+  // LLM just made — without this, the description chip stayed on the
+  // pre-edit value until the user clicked "done". selectSkillFile
+  // also re-reads the body, so we
   // don't need a separate body refetch here.
   const filepath = _selectedSkill.filepath || 'SKILL.md';
   await selectSkillFile(source, sid, filepath, null);
@@ -1044,7 +1175,7 @@ async function openSkillModal(editId) {
     if (el) el.value = '';
   }
   const sel = document.getElementById('skill-dir-selected');
-  if (sel) sel.textContent = t('skill_modal.dir_none') || '（未选择）';
+  if (sel) sel.textContent = t('skill_modal.dir_none') || '(none selected)';
 
   if (editId) {
     title.textContent = t('skills.modal_edit_title');
@@ -1220,7 +1351,7 @@ async function _saveSkillFromDir({ msgEl }) {
 // Shared "after create" tail: close modal, refresh list, jump to edit view.
 // `seedMessage` — custom first message to seed the skill edit chat with.
 //                 Pass null to let toggleSkillEditMode use its default seed
-//                 ("帮我完善这个技能"). Ignored in edit mode (isNew=false).
+//                 ("help me refine this skill"). Ignored in edit mode (isNew=false).
 async function _afterSkillCreated(sid, isNew, seedMessage) {
   closeSkillModal();
   _skillsCache = null;
@@ -1248,15 +1379,18 @@ function editSelectedSkill() {
 }
 
 async function deleteSelectedSkill() {
-  if (!_selectedSkill || _selectedSkill.source !== 'custom') return;
+  if (!_selectedSkill) return;
+  const src = _selectedSkill.source;
+  if (src !== 'custom' && !(src === 'builtin' && isDevMode())) return;
   const sid = _selectedSkill.id;
-  const cached = _skillsCache?.find(s => s.id === sid && s.source === 'custom');
+  const cached = _skillsCache?.find(s => s.id === sid && s.source === src);
   if (!(await uiConfirm(t('skills.delete_confirm', { name: cached?.name || sid })))) return;
   try {
-    const res = await apiFetch(`/api/skills/${sid}`, { method: 'DELETE' });
-    const data = await res.json();
-    if (!data.ok) {
-      await uiAlert(t('skills.delete_failed_with', { reason: data.error || '' }));
+    const result = src === 'builtin'
+      ? await window.orkas.invoke('skills.builtin.delete', { id: sid })
+      : await (await apiFetch(`/api/skills/${sid}`, { method: 'DELETE' })).json();
+    if (!result.ok) {
+      await uiAlert(t('skills.delete_failed_with', { reason: result.error || '' }));
       return;
     }
     _selectedSkill = null;
@@ -1271,46 +1405,44 @@ async function deleteSelectedSkill() {
   }
 }
 
-/**
- * Per-user 已启用 / 已禁用 toggle in the skill detail header. Same shape
- * as agents.js's helper — clone-replace to drop prior listener, then bind
- * a fresh change handler that flips the state and refreshes the list.
- */
-function _renderSkillEnabledToggle(skill) {
-  const wrap = document.getElementById('skill-enabled-toggle-wrap');
-  const oldInput = document.getElementById('skill-enabled-toggle');
-  const label = document.getElementById('skill-enabled-label');
-  if (!wrap || !oldInput || !label) return;
-  const enabled = skill.enabled !== false;
-  const input = oldInput.cloneNode(true);
-  input.checked = enabled;
-  oldInput.parentNode.replaceChild(input, oldInput);
-  label.textContent = enabled ? t('component.enabled') : t('component.disabled');
-  wrap.classList.toggle('is-disabled', !enabled);
-  wrap.title = enabled ? t('component.toggle_disable_hint') : t('component.toggle_enable_hint');
-  input.addEventListener('change', async () => {
-    const next = input.checked;
-    input.disabled = true;
-    try {
-      const res = await window.orkas.invoke('skills.setEnabled', { id: skill.id, enabled: next });
-      if (!res || !res.ok) {
-        input.checked = !next;
-        await uiAlert(t('component.toggle_failed'));
-        return;
-      }
-      label.textContent = next ? t('component.enabled') : t('component.disabled');
-      wrap.classList.toggle('is-disabled', !next);
-      wrap.title = next ? t('component.toggle_disable_hint') : t('component.toggle_enable_hint');
-      // Refresh local cache so subsequent renders reflect new state.
-      const cached = _skillsCache?.find((s) => s.id === skill.id);
-      if (cached) cached.enabled = next;
-      await loadSkills();
-    } catch (err) {
-      input.checked = !next;
-      await uiAlert(t('component.toggle_failed'));
-    } finally {
-      input.disabled = false;
+/** Dev-only: promote a custom skill to built-in. Copies to src+data trees,
+ *  removes the custom dir, refreshes the grid. */
+async function promoteCustomSkill(id) {
+  if (!isDevMode()) return;
+  const cached = _skillsCache?.find(s => s.id === id && s.source === 'custom');
+  if (!(await uiConfirm(t('skills.promote_confirm', { name: cached?.name || id })))) return;
+  try {
+    const result = await window.orkas.invoke('skills.promoteToBuiltin', { id });
+    if (!result.ok) {
+      await uiAlert(t('skills.promote_failed_with', { reason: result.error || '' }));
+      return;
     }
+    _skillsCache = null;
+    _skillTreeCache.clear();
+    await loadSkills();
+  } catch (e) {
+    await uiAlert(t('skills.promote_failed_with', { reason: e.message || e }));
+  }
+}
+
+/**
+ * Per-skill enable / disable button in the detail header.
+ * Clone-replace the node each render to drop any prior click handler
+ * bound to a stale skill id. The button label flips between "enable"
+ * and "disable" (whichever the click would do).
+ */
+function _renderSkillEnabledButton(skill) {
+  const oldBtn = document.getElementById('skill-enabled-btn');
+  if (!oldBtn) return;
+  const enabled = skill.enabled !== false;
+  const btn = oldBtn.cloneNode(true);
+  oldBtn.parentNode.replaceChild(btn, oldBtn);
+  btn.textContent = enabled ? t('component.disable') : t('component.enable');
+  btn.title = enabled ? t('component.toggle_disable_hint') : t('component.toggle_enable_hint');
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    try { await _flipSkillEnabled(skill.id, !enabled); }
+    finally { btn.disabled = false; }
   });
 }
 

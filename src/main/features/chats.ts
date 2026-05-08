@@ -27,6 +27,7 @@ import {
   readJson, writeJson, invalidateLineCount, readJsonl,
 } from '../storage';
 import { createLogger } from '../logger';
+import { t } from '../i18n';
 
 const log = createLogger('chats');
 import * as search from './search';
@@ -56,6 +57,9 @@ export interface Conversation {
    * the index. */
   processing?: boolean;
   processing_since?: string | null;
+  /** Derived: max(<cid>.jsonl mtime, updated_at). Drives sidebar
+   * last-activity ordering; never persisted. */
+  last_active_at?: string;
 }
 
 /** Persisted record on `<cid>.jsonl`. Aliased for legacy callers; the new
@@ -88,11 +92,12 @@ export async function listConversations(userId: string): Promise<Conversation[]>
   //   2. bus is mid-flush — e.g. user clicked abort while a tool was in
   //      flight; state.json flips to 'aborted' immediately but the worker's
   //      runTurn still has to unwind (await tool finish → outcome → enqueue
-  //      the "（已中断）" + processItems message). On-disk status looks
+  //      the "(stopped)" + processItems message). On-disk status looks
   //      terminal but jsonl is still growing. If the renderer reloads in
   //      this window (Cmd+R right after stop) and we say processing=false,
   //      it stops polling and never picks up the late abort message — user
   //      sees only their own msg, "everything I watched stream is gone".
+  const dir = ensureUserDir(userId);
   const out: Conversation[] = [];
   for (const c of items) {
     let processing = false;
@@ -103,14 +108,35 @@ export async function listConversations(userId: string): Promise<Conversation[]>
       processing = s.status === 'running' || busBusy;
       since = processing ? s.last_active_at : null;
     } catch { /* missing state file = idle */ }
-    out.push({ ...c, processing, processing_since: since });
+    // Last-activity timestamp for sidebar ordering. <cid>.jsonl mtime is
+    // touched whenever the bus appends a message; falls back to the
+    // index's updated_at / created_at when the file isn't there yet.
+    //
+    // CAREFUL: `nowIso()` returns local-time ISO without `Z` suffix
+    // ("2026-05-07T15:00:00") while `mtime.toISOString()` is UTC with `Z`
+    // ("2026-05-07T07:00:00.000Z"). String-comparing the two formats
+    // ignores the timezone offset — at UTC+8 a local-time string compares
+    // 8h "ahead" of the same instant in UTC, so updated_at would always
+    // appear newer than mtime and the sidebar would order by creation
+    // time instead of actual last activity. Compare on numeric ms and
+    // emit a UTC ISO so the downstream sort can string-compare safely.
+    const updatedMs = c.updated_at ? new Date(c.updated_at).getTime() : 0;
+    const createdMs = c.created_at ? new Date(c.created_at).getTime() : 0;
+    let lastActiveMs = Math.max(updatedMs || 0, createdMs || 0);
+    try {
+      const mtimeMs = fs.statSync(path.join(dir, `${c.conversation_id}.jsonl`)).mtime.getTime();
+      if (mtimeMs > lastActiveMs) lastActiveMs = mtimeMs;
+    } catch { /* missing jsonl — keep updated_at */ }
+    const lastActiveAt = lastActiveMs ? new Date(lastActiveMs).toISOString() : (c.updated_at || c.created_at || '');
+    out.push({ ...c, processing, processing_since: since, last_active_at: lastActiveAt });
   }
+  out.sort((a, b) => (b.last_active_at || '').localeCompare(a.last_active_at || ''));
   return out;
 }
 
 export async function saveConversations(userId: string, items: Conversation[]): Promise<void> {
   const cleaned = items.map((c) => {
-    const { processing, processing_since, ...rest } = c;
+    const { processing, processing_since, last_active_at, ...rest } = c;
     return rest;
   });
   await writeJson(path.join(ensureUserDir(userId), CONVERSATION_INDEX_NAME), cleaned);
@@ -135,7 +161,7 @@ export async function createConversation(userId: string, {
   const cid = genConversationId();
   const conv: Conversation = {
     conversation_id: cid,
-    title: title || '新对话',
+    title: title || t('chat.default_title'),
     kind,
     agent_id: agentId || '',
     skill_id: skillId || '',
@@ -209,6 +235,17 @@ export async function deleteConversation(userId: string, cid: string): Promise<b
     if (typeof att?.purgeByCid === 'function') await att.purgeByCid(userId, cid);
   } catch (err) { log.warn(`purge attachments user=${userId} cid=${cid}: ${(err as Error).message}`); }
 
+  // Drop CLI session bindings — the next time this cid is reused (or
+  // a same-id collision, defensive), CLI agents start fresh. Their
+  // own machine-local session files (~/.claude/...) are left alone;
+  // claude self-GCs.
+  try {
+    const cliSessions = require('./local_agents/sessions');
+    if (typeof cliSessions?.clearForConversation === 'function') {
+      await cliSessions.clearForConversation(userId, cid);
+    }
+  } catch (err) { log.warn(`purge cli sessions user=${userId} cid=${cid}: ${(err as Error).message}`); }
+
   log.info(`deleted user=${userId} cid=${cid}`);
   return true;
 }
@@ -245,9 +282,9 @@ export async function deleteConversationsByAgent(agentId: string): Promise<numbe
 }
 
 export function autoTitle(content: string): string {
-  let t = (content || '').trim().replace(/\n/g, ' ');
-  if (t.length > 40) t = t.slice(0, 40) + '…';
-  return t || '新对话';
+  let text = (content || '').trim().replace(/\n/g, ' ');
+  if (text.length > 40) text = text.slice(0, 40) + '…';
+  return text || t('chat.default_title');
 }
 
 // ── Boot-time stale state sweep ──────────────────────────────────────────

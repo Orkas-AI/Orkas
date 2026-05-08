@@ -83,10 +83,13 @@ describe('chats › deleteConversation', () => {
 });
 
 describe('chats › autoTitle on first send', () => {
-  it('groupChat.send updates 新对话 title to message text on first user msg', async () => {
+  it('groupChat.send updates the placeholder title to message text on first user msg', async () => {
     vi.resetModules();
     const groupChat = await import('../../../src/main/features/group_chat');
     const chats = await loadChats();
+    // Pass the zh placeholder explicitly so the test exercises the
+    // multilingual `isPlaceholderTitle` detection path regardless of the
+    // test process's i18n default.
     const conv = await chats.createConversation(TEST_UID, { title: '新对话' });
     expect(conv.title).toBe('新对话');
 

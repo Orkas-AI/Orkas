@@ -8,7 +8,7 @@
  * Schema (one JSON per agent):
  *   { agent_id, name, description, workflow, created_at, updated_at }
  *
- * The inline "编辑" chat lets the LLM refine an agent by emitting one
+ * The inline "edit" chat lets the LLM refine an agent by emitting one
  * `<agent>...</agent>` container per turn, whose children are the fields
  * to update: `<name>` / `<description>` / `<workflow>` / `<skills>` /
  * `<inputs>`. Each child is a full-replacement update for that field.
@@ -43,11 +43,11 @@ import {
 } from '../storage';
 import { listSkillSpecs } from '../model/core-agent/skill-registry';
 import { readDisabledSets, setAgentEnabled } from './component_enabled';
-import * as search from './search';
+import { renameAgentInMembers } from './group_chat/state';
 
 export type AgentSource = 'builtin' | 'custom';
 
-export type AgentInputType = 'text' | 'textarea' | 'select' | 'multiselect' | 'number' | 'boolean' | 'file';
+export type AgentInputType = 'text' | 'textarea' | 'select' | 'multiselect' | 'number' | 'boolean' | 'file' | 'directory';
 
 export interface AgentInputOption {
   value: string;
@@ -58,7 +58,7 @@ export interface AgentInputOption {
  * Populated by the agent-edit LLM (or commander quick-create) via the
  * `<inputs>` child of the `<agent>` update container; consumed at run
  * time by the agent itself per `chat_agent_in_group.md` § inputs_schema
- * 触发的强制确认 (it emits a fenced `agent-input-form` block when fields
+ * mandatory-confirmation trigger (it emits a fenced `agent-input-form` block when fields
  * are missing or low-confidence) and by the chat-bubble form widget
  * (renderer renders it). */
 export interface AgentInput {
@@ -120,6 +120,15 @@ export interface Agent {
    * to manually @-mention every reply. Maintained by the agent-edit LLM
    * via the `<interactive>` child of `<agent>`; missing = false. */
   interactive?: boolean;
+  /** Execution backend. Missing / `kind === 'in_process'` (the default)
+   *  means the agent runs through `core-agent` like every existing
+   *  agent. `kind === 'cli'` routes the worker turn through
+   *  `features/local_agents/runner.ts` to spawn a local coding CLI
+   *  (claude code / codex / openclaw / opencode / hermes). The field is
+   *  set at create time from the modal's runtime selector and edited
+   *  via the dedicated `chat_agent_setup_cli.md` prompt; the LLM
+   *  doesn't author it directly. */
+  runtime?: AgentRuntime;
   source: AgentSource;
   created_at: string;
   updated_at: string;
@@ -144,10 +153,29 @@ interface AgentRaw {
   icon?: unknown;
   color?: unknown;
   interactive?: unknown;
+  runtime?: unknown;
 }
 
-// 头像 token 校验走 catalog 白名单（src/main/data/avatars.json 是单一真相源）。
-// renderer/modules/avatar.js 也从同一份文件拉数据，前后端不再有任何重复。
+/** Per-agent execution backend. See `Agent.runtime`. */
+export type AgentRuntime =
+  | { kind: 'in_process' }
+  | {
+      kind: 'cli';
+      /** Canonical CLI type — must match `LOCAL_CLI_TYPES` in
+       *  `features/local_agents/registry.ts`. Validated on read; an
+       *  unknown value drops the runtime field entirely. */
+      cli: string;
+      /** Optional model id; empty means "let the CLI pick its default". */
+      model?: string;
+      /** Extra CLI flags appended after our own args. Strings only;
+       *  not shell-parsed by us. */
+      custom_args?: string[];
+    };
+
+// Avatar tokens are validated against the catalog allow-list
+// (src/main/data/avatars.json is the single source of truth).
+// renderer/modules/avatar.js pulls from the same file, so frontend and
+// backend never duplicate it.
 import * as avatars from './avatars';
 
 export interface AgentChatMeta { session_id?: string; [k: string]: unknown }
@@ -236,24 +264,94 @@ function agentBaseDir(source: AgentSource): string {
 }
 
 const INPUT_ID_RE = /^[a-z_][a-z0-9_]{0,31}$/;
-const ALLOWED_INPUT_TYPES: readonly AgentInputType[] = ['text', 'textarea', 'select', 'multiselect', 'number', 'boolean', 'file'];
+const ALLOWED_INPUT_TYPES: readonly AgentInputType[] = ['text', 'textarea', 'select', 'multiselect', 'number', 'boolean', 'file', 'directory'];
 
 // Reserved agent display names — collide with the commander role surfaced in
-// the chat-recipient chip ("指挥官") and the sidebar tab ("总指挥"). The bus
-// router also keys "commander" as a member id, so we guard the English form
-// too. Comparison is case-insensitive after stripping all whitespace, so
-// "  Commander " or "总 指挥" all resolve to the same canonical key.
+// the chat-recipient chip and the sidebar tab (Chinese localizations are
+// "指挥官" and "总指挥" respectively). The bus router also keys "commander"
+// as a member id, so we guard the English form too. Comparison is
+// case-insensitive after stripping all whitespace, so "  Commander " or
+// the spaced Chinese form "总 指挥" all resolve to the same canonical key.
 const RESERVED_AGENT_NAMES = new Set(['指挥官', '总指挥', 'commander']);
 function _agentNameKey(name: string): string {
   return String(name || '').replace(/\s+/g, '').toLowerCase();
 }
 function assertAgentNameAllowed(name: string): void {
   const key = _agentNameKey(name);
-  if (!key) return; // empty handled elsewhere (defaults to "未命名智能体")
+  if (!key) return; // empty handled elsewhere (defaults to t('agent.default_name'))
   if (RESERVED_AGENT_NAMES.has(key)) {
     const err: any = new Error(`agent name "${name}" is reserved`);
     err.code = 'E_AGENT_NAME_RESERVED';
     throw err;
+  }
+  assertAgentNameCharsetValid(name);
+}
+
+// Agent names must round-trip through the @-mention regex used by the
+// router (`router.ts::TOKEN_CLASS = [A-Za-z0-9_一-鿿-]`) — slashes,
+// backslashes, dots, parens, control chars etc. either truncate the
+// match (e.g. `@Agent/SkillSomeName` only matches `Agent`) or escape the
+// alternation arm at the regex stage. We additionally cap length and
+// allow a single internal space so multi-word display names
+// ("Code Review Helper") still resolve via the alternation. Leading /
+// trailing whitespace is rejected because UIs render names raw — stray
+// whitespace looks like a typo nobody can see to fix.
+const NAME_TOKEN_RE = /^[A-Za-z0-9_一-鿿-]+(?: [A-Za-z0-9_一-鿿-]+)*$/;
+const NAME_MAX_LENGTH = 50;
+function assertAgentNameCharsetValid(name: string): void {
+  if (name == null) return;
+  const trimmed = String(name);
+  if (!trimmed.trim()) return;
+  if (trimmed !== trimmed.trim()) {
+    const err: any = new Error(`agent name has leading or trailing whitespace`);
+    err.code = 'E_AGENT_NAME_INVALID';
+    throw err;
+  }
+  if (trimmed.length > NAME_MAX_LENGTH) {
+    const err: any = new Error(`agent name longer than ${NAME_MAX_LENGTH} characters`);
+    err.code = 'E_AGENT_NAME_TOO_LONG';
+    throw err;
+  }
+  if (!NAME_TOKEN_RE.test(trimmed)) {
+    // Surface the offending literal + the specific bad chars so a streamed
+    // error feeds the LLM enough signal to self-correct on the next turn,
+    // instead of repeating the same forbidden character.
+    const SINGLE_TOKEN_CHAR_RE = /[A-Za-z0-9_一-鿿-]/;
+    const bad: string[] = [];
+    const seen = new Set<string>();
+    for (const ch of trimmed) {
+      if (ch === ' ') continue;
+      if (SINGLE_TOKEN_CHAR_RE.test(ch)) continue;
+      if (!seen.has(ch)) { seen.add(ch); bad.push(ch); }
+    }
+    const detail = bad.length
+      ? `forbidden character${bad.length > 1 ? 's' : ''}: ${bad.map(c => `\`${c}\``).join(' ')}`
+      : 'multiple consecutive spaces are not allowed (only single internal spaces between tokens)';
+    const err: any = new Error(`agent name "${trimmed}" contains unsupported characters — ${detail}. Allowed: ASCII letters / digits / \`_\` / \`-\` / CJK U+4E00–U+9FFF / single internal spaces. Forbidden include \`/\` \`\\\` \`.\` \`,\` \`(\` \`)\` \`:\` \`!\` \`?\`, full-width punctuation, kana, hangul, extended-CJK, emoji.`);
+    err.code = 'E_AGENT_NAME_INVALID';
+    throw err;
+  }
+}
+
+/** Reject names already in use by another agent (custom OR builtin).
+ *  Matches `_agentNameKey` (case-insensitive, all whitespace stripped) so
+ *  "Code Helper" and "codehelper" collide. `excludeAgentId` lets the
+ *  update path keep its own name. Caller owns the check at every write
+ *  entry — IPC create / IPC update / LLM-driven create+edit — so neither
+ *  the UI form nor the LLM can land a duplicate. */
+async function assertAgentNameUnique(
+  name: string, excludeAgentId?: string,
+): Promise<void> {
+  const key = _agentNameKey(name);
+  if (!key) return;
+  const all = await listAgents();
+  for (const a of all) {
+    if (excludeAgentId && a.agent_id === excludeAgentId) continue;
+    if (_agentNameKey(a.name || '') === key) {
+      const err: any = new Error(`agent name "${name}" is already in use`);
+      err.code = 'E_AGENT_NAME_TAKEN';
+      throw err;
+    }
   }
 }
 
@@ -325,10 +423,14 @@ export function validateAgentInputs(raw: unknown): AgentInput[] {
       }
       def = b;
     } else if (type === 'select') {
-      // prompt(chat_agent_in_group.md)明示运行时弹的 form 允许"空表单(不带 default)"。
-      // 旧逻辑对缺/非法 default 直接 drop 整个 field,fields 全空 → form 不挂 →
-      // raw <agent-input-form> XML 被 markdown 当未知 HTML 渲染 = 用户看到样式崩。
-      // 优雅降级:fallback 到 options[0].value(对应浏览器 <select> 默认显示首项的行为)。
+      // The prompt (chat_agent_in_group.md) explicitly allows the runtime
+      // form to render an "empty form" (one without a default selection).
+      // The old logic dropped the whole field on a missing/invalid
+      // default, so all-empty fields → no form rendered → the raw
+      // `<agent-input-form>` XML got rendered by markdown as unknown
+      // HTML, breaking the user's styling. Graceful fallback: use
+      // options[0].value (matching the browser's default-first-option
+      // behavior for `<select>`).
       const v = typeof e.default === 'string' ? e.default : '';
       if (v && options!.some((o) => o.value === v)) {
         def = v;
@@ -341,6 +443,9 @@ export function validateAgentInputs(raw: unknown): AgentInput[] {
       const allowed = new Set(options!.map((o) => o.value));
       const filtered = arr.filter((v) => allowed.has(v));
       def = filtered;
+    } else if (type === 'directory') {
+      // Directory — default is always empty; the user picks via native dialog.
+      def = '';
     } else { // file — default is always empty (the model can't pre-pick a file)
       def = fileMultiple ? [] : '';
     }
@@ -417,7 +522,47 @@ export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSo
   } else if (raw.interactive === 'false') {
     agent.interactive = false;
   }
+  const rt = _normalizeRuntime(raw.runtime);
+  if (rt) agent.runtime = rt;
   return agent;
+}
+
+/** Validate / coerce a raw `runtime` field. Unknown shapes return null
+ *  (= drop the field; the agent falls back to the in-process default).
+ *  Kept loose on purpose: front-end and edit-prompt may both write here
+ *  and a malformed value mustn't poison reads. */
+function _normalizeRuntime(raw: unknown): AgentRuntime | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const kind = r.kind;
+  if (kind === 'in_process') return { kind: 'in_process' };
+  if (kind !== 'cli') return null;
+  const cli = typeof r.cli === 'string' ? r.cli.trim() : '';
+  if (!cli) return null;
+  const out: AgentRuntime = { kind: 'cli', cli };
+  if (typeof r.model === 'string' && r.model.trim()) out.model = r.model.trim();
+  if (Array.isArray(r.custom_args)) {
+    const args = r.custom_args.filter((s): s is string => typeof s === 'string');
+    if (args.length) out.custom_args = args;
+  }
+  return out;
+}
+
+/** True when this CLI is a coding agent (claude code / codex). Coding
+ *  agents are dispatched with a per-conversation project directory as
+ *  cwd instead of the user workspace; the chip in the conversation
+ *  surface lets the user set it. Single source of truth for both UI
+ *  visibility and dispatch routing. */
+export const CODING_CLIS = new Set<string>(['claude', 'codex']);
+export function cliIsCodingAgent(cli: string | undefined): boolean {
+  return !!cli && CODING_CLIS.has(cli);
+}
+
+/** True when this agent runs via a local CLI rather than in-process
+ *  core-agent. Single source of truth — group_chat / chats / renderer
+ *  all import this rather than re-checking `runtime?.kind` directly. */
+export function isCliAgent(agent: Pick<Agent, 'runtime'> | null | undefined): boolean {
+  return !!agent && agent.runtime?.kind === 'cli';
 }
 
 interface AgentListCache { stamp: string; data: Agent[] }
@@ -528,6 +673,9 @@ export interface CreateAgentOptions {
   icon?: string;
   color?: string;
   interactive?: boolean;
+  /** Picked at create time from the modal's runtime selector. Stored as
+   *  authored — `normalizeAgent` validates on read. */
+  runtime?: AgentRuntime;
 }
 
 /** Route a legacy `description` input into the matching language slot.
@@ -555,9 +703,10 @@ function resolveBilingualDescription(
  * manual edit. Returns the created agent.
  */
 export async function createCustomAgent(
-  { name = '', description = '', description_zh, description_en, workflow = '', icon, color, interactive }: CreateAgentOptions = {},
+  { name = '', description = '', description_zh, description_en, workflow = '', icon, color, interactive, runtime }: CreateAgentOptions = {},
 ): Promise<Agent | null> {
   assertAgentNameAllowed(name);
+  await assertAgentNameUnique(String(name || '').trim());
   fs.mkdirSync(CUSTOM_AGENTS_DIR(), { recursive: true });
   let agentId: string;
   do { agentId = genAgentId(); }
@@ -568,7 +717,7 @@ export async function createCustomAgent(
   const desc = resolveBilingualDescription(description, description_zh, description_en);
   const data: AgentRaw = {
     agent_id: agentId,
-    name: String(name || '').trim() || '未命名智能体',
+    name: String(name || '').trim() || t('agent.default_name'),
     description_zh: desc.description_zh,
     description_en: desc.description_en,
     workflow: String(workflow || ''),
@@ -578,10 +727,42 @@ export async function createCustomAgent(
   if (avatars.isKnownIcon(icon)) data.icon = icon;
   if (avatars.isKnownColor(color)) data.color = color;
   if (typeof interactive === 'boolean') data.interactive = interactive;
+  // Persist runtime only when it survives validation; an in_process
+  // selection is the implicit default and not written to disk so old
+  // tooling diffs cleanly.
+  const rt = _normalizeRuntime(runtime);
+  if (rt && rt.kind === 'cli') {
+    data.runtime = rt;
+    // Coding CLIs (claude / codex) need a working directory. We inject
+    // a `project_dir` input dependency so the standard agent-input-form
+    // pipeline collects it before the first dispatch — same UX as any
+    // other required input. The agent worker reads the submitted
+    // value to set CLI cwd.
+    if (cliIsCodingAgent(rt.cli)) {
+      data.inputs = [_buildProjectDirInput()];
+    }
+  }
   await writeJson(customAgentFile(agentId), data);
   _invalidateAgentListCache();
   log.info(`created id=${agentId} name=${data.name}`);
   return normalizeAgent(data, 'custom');
+}
+
+/** Required-input schema injected on every external coding agent. The
+ *  field id `project_dir` is a contract — the dispatch path looks for
+ *  exactly this id when extracting the cwd from a form submission.
+ *  Built at injection time so the persisted `label` follows the user's
+ *  current UI language (single-language per agent.json — bilingual lives
+ *  only in the locale table, not in the persisted schema). */
+export const PROJECT_DIR_INPUT_ID = 'project_dir';
+function _buildProjectDirInput(): AgentInput {
+  return {
+    id: PROJECT_DIR_INPUT_ID,
+    type: 'directory',
+    label: t('agent.cli.project_dir.label'),
+    required: true,
+    default: '',
+  };
 }
 
 export interface UpdateAgentFields {
@@ -608,6 +789,12 @@ export interface UpdateAgentFields {
    *   null  → drop the field (revert to "missing" = false at read time)
    *   omitted → untouched */
   interactive?: boolean | null;
+  /** Three-way update:
+   *   AgentRuntime → replace (validated; in_process collapses to "drop")
+   *   null         → drop runtime (revert to in_process default)
+   *   omitted      → untouched
+   *  Authored by the create modal + edit UI, not the LLM edit prompt. */
+  runtime?: AgentRuntime | null;
 }
 
 /**
@@ -621,8 +808,27 @@ export async function updateCustomAgent(
   const f = customAgentFile(agentId);
   if (!fs.existsSync(f)) return null;
   const data = await readJson<AgentRaw>(f);
+  const oldName = typeof (data as any).name === 'string' ? (data as any).name : '';
   if (Object.prototype.hasOwnProperty.call(updates || {}, 'name')) {
-    assertAgentNameAllowed(typeof updates.name === 'string' ? updates.name : '');
+    const incomingName = typeof updates.name === 'string' ? updates.name : '';
+    assertAgentNameAllowed(incomingName);
+    const trimmed = incomingName.trim();
+    if (trimmed) await assertAgentNameUnique(trimmed, agentId);
+  }
+  // CLI-backed agents have no authored workflow / skill_list — the
+  // edit prompt forbids the LLM from emitting those tags, but if it
+  // slips up we silently drop the field so the spec stays clean.
+  // Compute on the post-update runtime: a runtime change in the same
+  // turn (in_process → cli) takes effect first, then the strip runs.
+  const incomingRuntime = Object.prototype.hasOwnProperty.call(updates || {}, 'runtime')
+    ? _normalizeRuntime((updates as any).runtime)
+    : null;
+  const effectiveCli = incomingRuntime
+    ? incomingRuntime.kind === 'cli'
+    : (_normalizeRuntime((data as any).runtime)?.kind === 'cli');
+  if (effectiveCli) {
+    if ('workflow' in (updates || {})) delete (updates as any).workflow;
+    if ('skill_list' in (updates || {})) delete (updates as any).skill_list;
   }
   for (const k of ['name', 'workflow'] as const) {
     if (Object.prototype.hasOwnProperty.call(updates || {}, k)) {
@@ -717,11 +923,57 @@ export async function updateCustomAgent(
       data.interactive = v;
     }
   }
-  if (!data.name) data.name = '未命名智能体';
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'runtime')) {
+    const v = updates.runtime;
+    // The runtime *kind* is locked at create time. Once an agent is
+    // CLI-backed, post-create updates may only swap which CLI backs
+    // it (cli → cli with a different `cli` field); reverting to
+    // in-process would orphan the description / inputs that were
+    // authored for a CLI runtime. The renderer enforces this in the
+    // detail-page selector; we mirror it here so the rule survives
+    // any other update path (tests, future scripts, IPC misuse).
+    const existingKind: 'cli' | 'in_process' = data.runtime &&
+      _normalizeRuntime(data.runtime)?.kind === 'cli' ? 'cli' : 'in_process';
+    const incomingKind: 'cli' | 'in_process' | null = v === null
+      ? 'in_process'
+      : (_normalizeRuntime(v)?.kind === 'cli' ? 'cli' : 'in_process');
+    if (incomingKind !== null && incomingKind !== existingKind) {
+      log.warn(`agent ${agentId}: ignored runtime kind switch ${existingKind} → ${incomingKind}`);
+    } else if (v === null) {
+      delete data.runtime;
+    } else {
+      const rt = _normalizeRuntime(v);
+      if (!rt || rt.kind === 'in_process') delete data.runtime;
+      else data.runtime = rt;
+    }
+    // Reconcile the project_dir input with the (post-update) cli kind.
+    // Coding cli ↔ project_dir input is a contract, not a user-authored
+    // schema: swap claude → codex keeps it, swap to a non-coding cli
+    // drops it, etc. We don't touch any other input the user defined.
+    const finalCli = data.runtime && _normalizeRuntime(data.runtime)?.kind === 'cli'
+      ? (_normalizeRuntime(data.runtime) as Extract<AgentRuntime, { kind: 'cli' }>).cli
+      : '';
+    const wantsProjectDir = cliIsCodingAgent(finalCli);
+    const inputs = Array.isArray(data.inputs) ? validateAgentInputs(data.inputs) : [];
+    const without = inputs.filter((i) => i.id !== PROJECT_DIR_INPUT_ID);
+    if (wantsProjectDir) data.inputs = [_buildProjectDirInput(), ...without];
+    else if (without.length) data.inputs = without;
+    else delete data.inputs;
+  }
+  if (!data.name) data.name = t('agent.default_name');
   data.updated_at = nowIso();
   await writeJson(f, data);
   _invalidateAgentListCache();
   log.info(`updated id=${agentId}`);
+  // Propagate a name change into every conversation roster that already
+  // lists this agent. members.json snapshots the name at join time and the
+  // @-router resolves on roster-first, so without this sweep `@<old-name>`
+  // would keep matching in old chats.
+  const newName = typeof (data as any).name === 'string' ? (data as any).name : '';
+  if (newName && newName !== oldName) {
+    try { await renameAgentInMembers(getActiveUserId(), agentId, newName); }
+    catch (err) { log.warn(`rename roster sweep failed id=${agentId}: ${(err as Error).message}`); }
+  }
   return normalizeAgent(data, 'custom');
 }
 
@@ -755,8 +1007,9 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
   if (!agentId) return false;
   const dir = agentDir(getActiveUserId(), agentId);
   if (!fs.existsSync(dir)) return false;
-  // 一刀切 `agents/<aid>/` 整个目录:agent.json + meta/ + skills/ 都在里面,
-  // 不再需要单独 cascade metacognition.purgeAgent / SkillStore.delete。
+  // Wipe the whole `agents/<aid>/` directory in one shot — agent.json,
+  // meta/, and skills/ all live inside it, so we no longer need separate
+  // cascades for metacognition.purgeAgent / SkillStore.delete.
   try { await fsp.rm(dir, { recursive: true, force: true }); }
   catch (err) { log.warn(`rm failed ${dir}: ${(err as Error).message}`); return false; }
   _invalidateAgentListCache();
@@ -774,7 +1027,6 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
         try { await fsp.rm(chatDir, { recursive: true, force: true }); }
         catch (err) { log.warn(`rm failed user=${uid} agent=${agentId}: ${(err as Error).message}`); }
         invalidateLineCount(path.join(chatDir, 'chat.jsonl'));
-        search.dropAgentChat(uid, agentId);
       }
       const sessionId = defaultAgentEditSessionId(uid, agentId);
       try { evictSession(sessionId); } catch { /* cache may not hold it */ }
@@ -796,8 +1048,9 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
   } catch (err) {
     log.warn(`cascade chat cleanup failed for ${agentId}: ${(err as Error).message}`);
   }
-  // Metacognition + evolved skills 已随 `rm -rf agents/<aid>/` 一并删除——
-  // meta / skills 子目录就在这棵树里。无需单独 purge。
+  // Metacognition + evolved skills are already wiped by the
+  // `rm -rf agents/<aid>/` above — meta / skills sub-directories live
+  // inside that tree. No separate purge is needed.
 
   log.info(`deleted id=${agentId}`);
   return true;
@@ -811,11 +1064,19 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
 // `<description>`, `<workflow>`, `<skills>`, `<inputs>`. One container per
 // turn gives us atomic extraction (all fields in or none) and a single
 // placeholder to stream-hide. Shared between agent-edit chat and main-chat
-// quick-create; see `chat_agent_setup.md` / `chat_commander.md` § 创建智能体.
+// quick-create; see the "Create agent" section of
+// `chat_agent_setup.md` / `chat_commander.md`.
 const AGENT_CONTAINER_RE = /<agent>([\s\S]*?)<\/agent>/g;
 const AGENT_CHILD_RE = (tag: string) => new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`);
 
 export interface ExtractedFields {
+  /** Parsed from `<agent_id>` inside `<agent>`. Present → commander wants to
+   * patch this existing custom agent (main-chat edit flow); absent → create
+   * a brand-new agent. The agent-edit-chat surface ignores this field — the
+   * target id is supplied by URL context, the LLM never writes it. Body
+   * must pass `safeId`; otherwise the key is dropped (mis-spelled id should
+   * NOT silently fall through to the create branch). */
+  agent_id?: string;
   name?: string;
   description?: string;
   description_zh?: string;
@@ -842,6 +1103,11 @@ export function extractAgentFieldBlocks(text: string): { cleanText: string; fiel
   const first = text.match(/<agent>([\s\S]*?)<\/agent>/);
   if (first) {
     const inner = first[1];
+    const aidM = inner.match(AGENT_CHILD_RE('agent_id'));
+    if (aidM) {
+      const v = aidM[1].trim();
+      if (safeId(v)) fields.agent_id = v;
+    }
     const nameM = inner.match(AGENT_CHILD_RE('name'));
     if (nameM) {
       const v = nameM[1].trim();
@@ -941,8 +1207,7 @@ export async function getAgentChatMessages(userId: string, agentId: string, limi
 
 async function _appendAgentChatMessage(userId: string, agentId: string, record: any): Promise<void> {
   const file = agentChatMsgsPath(userId, agentId);
-  const { msgIndex } = await appendJsonlAtomic(file, record);
-  search.indexAgentChatMessage(userId, agentId, msgIndex, record);
+  await appendJsonlAtomic(file, record);
 }
 
 export async function clearAgentChat(userId: string, agentId: string): Promise<boolean> {
@@ -955,7 +1220,18 @@ export async function clearAgentChat(userId: string, agentId: string): Promise<b
     }
   }
   invalidateLineCount(agentChatMsgsPath(userId, agentId));
-  search.dropAgentChat(userId, agentId);
+  // Also evict + drop the core-agent persistent session jsonl. Without this
+  // the LLM retains its full prior context even though the UI history is
+  // empty — same bug pattern as clearSkillChat (paths from before a
+  // promote-to-builtin survive in the LLM's memory).
+  const sessionId = defaultAgentEditSessionId(userId, agentId);
+  try { evictSession(sessionId); } catch { /* not in cache */ }
+  try { await fsp.unlink(userSessionFile(userId, sessionId)); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn(`session unlink user=${userId} agent=${agentId}: ${(err as Error).message}`);
+    }
+  }
   log.info(`cleared user=${userId} agent=${agentId}`);
   return true;
 }
@@ -974,6 +1250,10 @@ export function buildAgentEditSystemPrompt(agent: {
   description_en?: string;
   workflow?: string;
   interactive?: boolean;
+  /** When the agent is CLI-backed, switch to `chat_agent_setup_cli.md`
+   *  which omits workflow/skills authoring and tells the LLM not to
+   *  emit those sub-tags. */
+  runtime?: AgentRuntime;
 }): string {
   // Resolve all three forms into a single legacy `$description` placeholder
   // (template still uses $description in this phase) plus the bilingual
@@ -983,14 +1263,30 @@ export function buildAgentEditSystemPrompt(agent: {
   const zh = (agent.description_zh || '').trim() || (legacy && isChinese ? legacy : '');
   const en = (agent.description_en || '').trim() || (legacy && !isChinese ? legacy : '');
   const display = legacy || zh || en;
-  const body = prompts.load('chat_agent_setup', {
-    name: agent.name || '',
-    description: display || '(not provided)',
-    description_zh: zh || '(not provided)',
-    description_en: en || '(not provided)',
-    workflow: (agent.workflow || '').trim() || '(not provided)',
-    interactive: agent.interactive === true ? 'true' : 'false',
-  });
+  const isCli = agent.runtime?.kind === 'cli';
+  // Pick the right template + the placeholder set it expects. The CLI
+  // template doesn't reference `$workflow` (workflow is hidden for CLI
+  // agents) but does reference the runtime cli + model so the LLM can
+  // talk concretely about which CLI it is.
+  const body = isCli
+    ? prompts.load('chat_agent_setup_cli', {
+        // Runtime cli + model are deliberately NOT passed: the LLM is
+        // told to stay CLI-agnostic in the description, and surfacing
+        // the current binding tempts it to name the CLI inline (which
+        // forbiddenly bakes a brand into the description).
+        name: agent.name || '',
+        description_zh: zh || '(not provided)',
+        description_en: en || '(not provided)',
+        interactive: agent.interactive === true ? 'true' : 'false',
+      })
+    : prompts.load('chat_agent_setup', {
+        name: agent.name || '',
+        description: display || '(not provided)',
+        description_zh: zh || '(not provided)',
+        description_en: en || '(not provided)',
+        workflow: (agent.workflow || '').trim() || '(not provided)',
+        interactive: agent.interactive === true ? 'true' : 'false',
+      });
   return `${body}\n\n---\n\n${buildLanguageDirective()}`;
 }
 
@@ -1021,7 +1317,7 @@ export async function sendToAgentEditChat(userId: string, agentId: string, conte
   });
 
   if (!result.ok) {
-    const errMsg = `模型响应失败: ${result.error || 'unknown'}`;
+    const errMsg = `Model response failed: ${result.error || 'unknown'}`;
     await _appendAgentChatMessage(userId, agentId,
       { time: nowIso(), role: 'assistant', content: errMsg });
     return { ok: false, message: errMsg, error: result.error || '' };
@@ -1105,8 +1401,8 @@ export async function* streamSendToAgentEditChat(
             }
           }
           // Collapse description / description_zh / description_en into one
-          // user-facing progress event — the user sees "简介更新" regardless
-          // of which language slot the LLM filled this turn.
+          // user-facing progress event — the user sees "description updated"
+          // regardless of which language slot the LLM filled this turn.
           const descTouched = fields.description !== undefined
             || fields.description_zh !== undefined
             || fields.description_en !== undefined;
@@ -1130,7 +1426,7 @@ export async function* streamSendToAgentEditChat(
         finalText = cleanText;
         event = { type: 'final', text: cleanText, updated };
       } else if (etype === 'error') {
-        errMsg = `模型响应失败: ${event.text || 'unknown'}`;
+        errMsg = `Model response failed: ${event.text || 'unknown'}`;
       }
 
       for (const text of synthesizedProgress) {
@@ -1156,7 +1452,7 @@ export async function* streamSendToAgentEditChat(
   } catch (err) {
     log.error('stream failed:', err);
     const msg = (err as Error).message || String(err);
-    errMsg = `模型响应失败: ${msg}`;
+    errMsg = `Model response failed: ${msg}`;
     yield { type: 'error', text: msg };
   } finally {
     // Must live in finally: on user abort the IPC layer breaks out of the
@@ -1176,8 +1472,8 @@ export async function* streamSendToAgentEditChat(
           { time: nowIso(), role: 'assistant', content, ...(saved ? { process: saved } : {}) });
       } else if (streamingText.trim() || processItems.length) {
         const content = streamingText.trim()
-          ? `${streamingText}\n\n（回复已中断）`
-          : '（回复已中断）';
+          ? `${streamingText}\n\n(reply interrupted)`
+          : '(reply interrupted)';
         await _appendAgentChatMessage(userId, agentId,
           { time: nowIso(), role: 'assistant', content, ...(saved ? { process: saved } : {}) });
       }

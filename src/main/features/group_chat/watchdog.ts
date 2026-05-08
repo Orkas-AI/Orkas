@@ -3,12 +3,15 @@
  * commander for self-diagnosis when a long task has gone silent.
  *
  * Triggers a ping when ALL of:
- *   - state.json says the conversation is `running` (some worker active or
- *     just finished and waiting on the next dispatch)
- *   - plan.md has at least one `in_progress` step (a long task is in
- *     flight, not a one-shot reply)
+ *   - plan.md has at least one unfinished step (pending or in_progress —
+ *     i.e. the plan as a whole is not yet finished). This covers both
+ *     "task in flight" and "agent waiting on the user" stalls; we don't
+ *     gate on `state.status` because a conv that's quietly waiting for
+ *     a human reply is `idle`, and that's exactly the case we want to
+ *     bring back to commander's attention.
  *   - `state.last_active_at` is older than `STALE_THRESHOLD_MS` (default
- *     10 minutes — tunable)
+ *     30 minutes — tunable)
+ *   - `state.status !== 'aborted'` (a stopped conversation stays stopped)
  *
  * Implementation notes:
  *   - **One global interval** for the whole process (not per-cid). Each
@@ -39,11 +42,12 @@ const log = createLogger('group_chat.watchdog');
  *  60s gives prompt response without flooding the disk. */
 const WATCHDOG_INTERVAL_MS = 60_000;
 
-/** Conversation must have been silent at least this long while a plan
- *  step is `in_progress` for the ping to fire. 10 minutes is the
- *  user-facing default; shorter values risk pinging during legit slow
- *  network ops, longer values delay recovery on real stalls. */
-const STALE_THRESHOLD_MS = 10 * 60 * 1000;
+/** Conversation must have been silent at least this long while the plan
+ *  is still unfinished (any step pending / in_progress) for the ping to
+ *  fire. 30 minutes is the user-facing default; shorter values risk
+ *  pinging during a user's legit thinking pause, longer values delay
+ *  recovery on real stalls. */
+const STALE_THRESHOLD_MS = 30 * 60 * 1000;
 
 /** Cooldown between consecutive watchdog pings for the same cid so a
  *  conversation that's genuinely user-paused doesn't get pinged on every
@@ -80,22 +84,25 @@ async function _scanUid(uid: string): Promise<void> {
     let s;
     try { s = await readState(uid, cid); }
     catch { continue; }
-    if (s.status !== 'running') continue;
+    if (s.status === 'aborted') continue;
     const lastActive = Date.parse(s.last_active_at);
     if (!Number.isFinite(lastActive)) continue;
     if (now - lastActive < STALE_THRESHOLD_MS) continue;
 
     const plan = await readPlan(uid, cid);
     if (!plan) continue;
-    const inProgress = plan.steps.find((step) => step.status === 'in_progress');
-    if (!inProgress) continue;
+    const unfinished = plan.steps.find(
+      (step) => step.status === 'pending' || step.status === 'in_progress',
+    );
+    if (!unfinished) continue;
 
     const key = `${uid}:${cid}`;
     const prev = _lastPingedAt.get(key) || 0;
     if (now - prev < PING_COOLDOWN_MS) continue;
 
     const idleMin = Math.round((now - lastActive) / 60_000);
-    const reason = `The task has been idle for ${idleMin} minutes with no progress. Current in_progress step: Step ${inProgress.index} "${inProgress.title}"${inProgress.assignee ? ` (assigned to ${inProgress.assignee})` : ''}. Please review the state and decide whether to keep going, confirm with the user, or mark it failed.`;
+    const stepLabel = unfinished.status === 'in_progress' ? 'in_progress step' : 'pending step';
+    const reason = `The conversation has been idle for ${idleMin} minutes while the plan is still unfinished. Current ${stepLabel}: Step ${unfinished.index} "${unfinished.title}"${unfinished.assignee ? ` (assigned to ${unfinished.assignee})` : ''}. Please review the state and decide whether to keep going, nudge the user / assignee, or mark it failed.`;
     try {
       const fired = await pingCommanderForWatchdog(uid, cid, reason);
       if (fired) _lastPingedAt.set(key, now);

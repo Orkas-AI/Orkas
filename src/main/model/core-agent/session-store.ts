@@ -3,19 +3,25 @@
  * `PersistentSession` backed by a JSONL file under
  * `data/<user_id>/cloud/sessions/<session_id>.jsonl`.
  *
- * session_id 统一规则（见 CLAUDE.md §5）：
+ * session_id format (see CLAUDE.md §5):
  *   `<uid>-<kind>-<tail>`
- *   uid 必在第一段；不符合格式的 id 一律拒绝，防止 extract/organizer 早期那种
- *   "第一段塞成 feature 名" 的 bug 再复发。
- *   当前在用 kind：gconv（群聊指挥官）/ gmember（群内 agent）/ skill / agent /
- *                 extract-img / reflect / memory-extract / anon
- *   builders：features/group_chat/state.ts 的 buildGconvSessionId / buildGmemberSessionId、
- *             features/agents.ts 的 defaultAgentEditSessionId、features/skills.ts 的 skill chat 同理。
- *   历史品牌前缀在启动期由 features/users.ts 的迁移工具一次性剥掉，
- *   到这里时不应再出现；任何带前缀的 id 都视作非法。
+ *   uid MUST be the first segment; ids that don't fit are rejected
+ *   outright, to prevent regressions like the early extract/organizer
+ *   bug where the first segment was stuffed with a feature name.
+ *   Currently-used kinds: gconv (group-chat commander) / gmember
+ *     (group-chat agent) / skill / agent / extract-img / reflect /
+ *     memory-extract / anon.
+ *   Builders: features/group_chat/state.ts's buildGconvSessionId /
+ *     buildGmemberSessionId; features/agents.ts's
+ *     defaultAgentEditSessionId; features/skills.ts's skill chat is
+ *     analogous.
+ *   Legacy brand prefixes are stripped once at startup by the
+ *   migration tool in features/users.ts and should not appear here;
+ *   any id carrying such a prefix is treated as illegal.
  *
- * session jsonl 仅承载 LLM 视角（含 tool_use / tool_result / compaction），与
- * `<uid>/cloud/chats/<cid>.jsonl`（UI 视角）是两份独立文件。
+ * session jsonl only carries the LLM-facing view (including tool_use /
+ * tool_result / compaction); it's a separate file from
+ * `<uid>/cloud/chats/<cid>.jsonl` (the UI-facing view).
  */
 
 import * as path from 'node:path';

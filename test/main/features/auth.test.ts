@@ -62,21 +62,25 @@ describe('auth › maskKey', () => {
 describe('auth › FEATURED_PROVIDERS', () => {
   it('lists the curated API-key providers in CATALOG order', async () => {
     const a = await import('../../../src/main/features/auth');
-    // Global frontier labs → China mainstream → aggregators. Must match
-    // `CATALOG` in provider_catalog.ts (minus `oauthOnly: true` entries).
+    // DeepSeek 直连先（pi-ai 不带，自建适配）→ 全球前沿 OpenAI / Google /
+    // Anthropic（去掉 oauthOnly 的 OpenAI Codex）→ CN 主流（Zhipu / Moonshot
+    // / Kimi-Coding / MiniMax / Doubao；去掉 oauthOnly 的 minimax-portal*）
+    // → 聚合器 OpenRouter。必须严格跟 CATALOG 对齐（减 oauthOnly 项）。
     expect(a.FEATURED_PROVIDERS).toEqual([
-      'anthropic',
+      'deepseek',
       'openai',
       'google',
+      'anthropic',
       'zai',
       'moonshot',
       'kimi-coding',
       'minimax-cn',
+      'doubao',
       'openrouter',
     ]);
-    // minimax-portal / minimax-portal-cn are oauthOnly and excluded from
-    // the API-key docs list (FEATURED_PROVIDERS). They still appear in
-    // CATALOG / VISIBLE_PROVIDERS.
+    // openai-codex / minimax-portal / minimax-portal-cn are oauthOnly and
+    // excluded from the API-key docs list (FEATURED_PROVIDERS). They still
+    // appear in CATALOG / VISIBLE_PROVIDERS.
   });
 });
 
@@ -162,11 +166,14 @@ describe('auth › multi-profile store (addApiKey / removeCredential / renamePro
 describe('auth › listProviders grouping', () => {
   it('returns providers in catalog order regardless of insertion order', async () => {
     const a = await import('../../../src/main/features/auth');
-    await a.addApiKey('openai', 'k-xxxxxxxxxxxx');
+    // 插入顺序：anthropic → openai。CATALOG 顺序：openai 在 anthropic 之前。
+    // listProviders 必须按 CATALOG 排，所以即便先插 anthropic、再插 openai，
+    // 也要 openai.indexOf < anthropic.indexOf（CATALOG 排序压过插入顺序）。
     await a.addApiKey('anthropic', 'k-xxxxxxxxxxxx');
+    await a.addApiKey('openai', 'k-xxxxxxxxxxxx');
     const { providers } = await a.listProviders();
     const ids = providers.map((p) => p.id);
-    expect(ids.indexOf('anthropic')).toBeLessThan(ids.indexOf('openai'));
+    expect(ids.indexOf('openai')).toBeLessThan(ids.indexOf('anthropic'));
   });
 
   it('exposes supportsApiKey / supportsOAuth flags consistent with the catalog', async () => {

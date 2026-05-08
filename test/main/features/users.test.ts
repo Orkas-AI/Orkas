@@ -51,7 +51,6 @@ describe('features/users › activateUser', () => {
       // 顶层 cloud/meta/ 已废弃,per-agent meta 落 agents/<aid>/meta/(详见
       // docs/plans/agent-as-directory.md)
       path.join(tmpDir, 'u1', 'cloud', 'config'),
-      path.join(tmpDir, 'u1', 'local', 'contexts_tmp'),
       path.join(tmpDir, 'u1', 'local', 'config'),
       path.join(tmpDir, 'u1', 'local', 'search'),
       path.join(tmpDir, 'u1', 'local', 'test'),

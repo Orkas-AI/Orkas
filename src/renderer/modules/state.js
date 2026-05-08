@@ -92,7 +92,7 @@ function _onPolledResponse(cid, content, isError = false) {
   // created-agent chip. The historical "patch the bubble's content
   // directly" path lost all of those because polling only had access to
   // `last.content` (a string), so an aborted commander turn that was
-  // recovered by polling rendered as bare "（已中断）" without the process
+  // recovered by polling rendered as bare "(stopped)" without the process
   // info that the user already watched stream in.
   if (el && el.isConnected) {
     const finalEl = el.querySelector('[data-role="final"]');
@@ -154,7 +154,9 @@ function bindStaticHandlers() {
     // Enter sends; Shift+Enter newline; Ctrl/Cmd+Enter also sends (kept for
     // muscle memory). Skip while IME is composing — Chinese pinyin commit
     // also fires Enter and would otherwise send a half-typed message.
-    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    // keyCode 229 catches older Electron / Safari builds (CLAUDE.md §8).
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleNewChatSubmit();
     }
@@ -176,8 +178,10 @@ function bindStaticHandlers() {
     }
   });
   chatInput.addEventListener('keydown', (e) => {
-    // Enter sends; Shift+Enter newline; Ctrl/Cmd+Enter also sends. Skip IME.
-    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    // Enter sends; Shift+Enter newline; Ctrl/Cmd+Enter also sends. Skip IME
+    // (CLAUDE.md §8 — keyCode 229 belt-and-suspenders for older builds).
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleChatSubmit();
     }
@@ -190,10 +194,11 @@ function bindStaticHandlers() {
   // Quick-create-agent button (conversation toolbar). Pushes a canned
   // request through handleChatSubmit so it honors queue / pending /
   // attachments state — we don't bypass the send pipeline.
-  // 创建智能体 inline 入口在 conversation.js 内动态创建并自带 click 绑定。
+  // The "Create agent" inline entry is dynamically created inside
+  // conversation.js and binds its own click handler.
 
   // Agents (grid + detail)
-  // 完成 button (only visible while editing) — exits edit mode.
+  // "Done" button (only visible while editing) — exits edit mode.
   document.getElementById('create-agent-btn')?.addEventListener('click', () => openAgentModal());
   document.getElementById('agents-back-btn')?.addEventListener('click', () => _showAgentsGridView());
   document.getElementById('agent-use-btn')?.addEventListener('click', () => {
@@ -201,6 +206,9 @@ function bindStaticHandlers() {
   });
   document.getElementById('agent-edit-btn')?.addEventListener('click', toggleAgentEditMode);
   document.getElementById('agent-delete-btn')?.addEventListener('click', deleteSelectedAgent);
+  document.getElementById('agent-promote-btn')?.addEventListener('click', () => {
+    if (_selectedAgent?.source === 'custom') promoteCustomAgent(_selectedAgent.id);
+  });
   document.getElementById('agent-chat-clear-btn')?.addEventListener('click', clearAgentChat);
   // Agent inline chat: only bind auto-grow here. Send/abort/Cmd+Enter are
   // wired lazily by createChatController in _ensureAgentChatController.
@@ -229,10 +237,16 @@ function bindStaticHandlers() {
   });
   document.getElementById('skill-edit-btn')?.addEventListener('click', toggleSkillEditMode);
   document.getElementById('skill-delete-btn')?.addEventListener('click', deleteSelectedSkill);
-  document.getElementById('skills-detail-name')?.addEventListener('click', _handleSkillNameClick);
+  document.getElementById('skill-promote-btn')?.addEventListener('click', () => {
+    if (_selectedSkill?.source === 'custom') promoteCustomSkill(_selectedSkill.id);
+  });
+  // Skill name editing is now wired inline by `_toggleSkillNameEditable`
+  // (input + blur listeners attached on first edit-mode entry, gated by
+  // `_skillEditMode`) — no top-level click handler.
   document.getElementById('skill-chat-clear-btn')?.addEventListener('click', clearSkillChat);
 
-  // Detail-view chrome: 「← 返回技能库」 + 折叠区开关 + Esc 返回 + 外点关 ⋯ 菜单
+  // Detail-view chrome: "← Back to skill library" + collapsible-section
+  // toggle + Esc to return + outside-click to close the ⋯ menu.
   document.getElementById('skills-back-btn')?.addEventListener('click', () => _showSkillsGridView());
   document.getElementById('skills-source-toggle')?.addEventListener('click', () => _toggleSkillsSource());
   document.addEventListener('keydown', (e) => {

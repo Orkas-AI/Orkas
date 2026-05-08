@@ -43,12 +43,6 @@ function writeChat(uid: string, cid: string, messages: unknown[]): void {
   fs.writeFileSync(file, messages.map((m) => JSON.stringify(m)).join('\n') + '\n');
 }
 
-function writeSkillChat(uid: string, sid: string, messages: unknown[]): void {
-  const dir = path.join(tmpDir, uid, 'cloud', 'chats', 'skill', sid);
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, 'chat.jsonl'), messages.map((m) => JSON.stringify(m)).join('\n') + '\n');
-}
-
 describe('search/indexer › reconcileContextsIndex', () => {
   it('returns silently when CONTEXTS_DIR is missing', async () => {
     const ix = await loadIndexer();
@@ -194,6 +188,93 @@ describe('search/indexer › indexChatMessage (hot path)', () => {
   });
 });
 
+// Persistence shape changed during the bus refactor: legacy `<cid>.jsonl`
+// stored `{ role, content, time }`; current group-chat jsonl stores
+// `{ id, ts, from, to, mentions, text, ... }` (GroupMessage). The chat
+// indexer must read both — without the fallback, every post-refactor
+// conversation gets `_msgText() === ''` and is silently skipped, surfacing
+// to the user as "conversation messages can't be searched". This describe
+// pins both shapes so the fallback in `_msgText` / `_msgRole` / `_msgTime`
+// can't regress unnoticed.
+describe('search/indexer › chat message shapes (legacy + group-chat)', () => {
+  it('reconcileChatsIndex indexes group-chat shape (`{from, ts, text, ...}`)', async () => {
+    writeChat('u1', 'c1', [
+      { id: 'm0', ts: '2026-01-01T00:00:00Z', from: 'user',      to: ['commander'], mentions: [], text: 'pangolin sighting' },
+      { id: 'm1', ts: '2026-01-01T00:00:01Z', from: 'commander', to: ['user'],      text: 'noted' },
+    ]);
+    const ix = await loadIndexer();
+    await ix.reconcileChatsIndex('u1');
+    const paths = await import('../../../../src/main/paths');
+    const entry = await ix.getEntry(paths.userChatsIndexPath('u1'), 'chat');
+    // Both messages indexed — `from` becomes role, `ts` becomes time, `text` is the body.
+    expect(entry.idx.docs['chat:c1:0']).toMatchObject({ role: 'user', time: '2026-01-01T00:00:00Z' });
+    expect(entry.idx.docs['chat:c1:1']).toMatchObject({ role: 'commander', time: '2026-01-01T00:00:01Z' });
+    // Body tokens reachable via the postings list.
+    expect(entry.idx.postings['pangolin']).toBeDefined();
+    expect(entry.idx.postings['noted']).toBeDefined();
+  });
+
+  it('indexChatMessage hot-path accepts group-chat shape', async () => {
+    const ix = await loadIndexer();
+    ix.indexChatMessage('u1', 'c1', 0, {
+      from: 'user', ts: 't', text: 'fresh group message',
+    } as any);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const paths = await import('../../../../src/main/paths');
+    const entry = await ix.getEntry(paths.userChatsIndexPath('u1'), 'chat');
+    expect(entry.idx.docs['chat:c1:0']).toMatchObject({ role: 'user', time: 't' });
+    expect(entry.idx.postings['fresh']).toBeDefined();
+  });
+
+  it('legacy shape still works (regression guard for `{role, content, time}`)', async () => {
+    // Old conversations written before the bus refactor stay searchable.
+    writeChat('u1', 'c2', [
+      { role: 'user',      content: 'legacy alpha', time: 't1' },
+      { role: 'assistant', content: 'legacy beta',  time: 't2' },
+    ]);
+    const ix = await loadIndexer();
+    await ix.reconcileChatsIndex('u1');
+    const paths = await import('../../../../src/main/paths');
+    const entry = await ix.getEntry(paths.userChatsIndexPath('u1'), 'chat');
+    expect(entry.idx.docs['chat:c2:0']).toMatchObject({ role: 'user', time: 't1' });
+    expect(entry.idx.postings['legacy']).toBeDefined();
+  });
+});
+
+describe('search/indexer › on-disk schema bump triggers rebuild', () => {
+  it('stale-version idx (e.g. v3 chat idx built by the broken `_msgText`) is discarded on load and reconcile rebuilds from jsonl', async () => {
+    // Simulate the field-state that's actually on every existing user's
+    // disk after the bus refactor: idx file written by an earlier schema
+    // version, with `files` claiming the jsonl was already indexed but
+    // `docs` empty (since the old `_msgText` returned '' for group-chat
+    // shape and `_reindexChatFile` skipped every message).
+    writeChat('u1', 'cstale', [
+      { id: 'm0', ts: 't', from: 'user', to: ['commander'], text: 'searchable token zebrafish' },
+    ]);
+    const paths = await import('../../../../src/main/paths');
+    const idxPath = paths.userChatsIndexPath('u1');
+    const stalePayload = {
+      version: 3,                          // <— old version
+      kind: 'chat',
+      files: { cstale: { mtime: 0, size: 0 } }, // claims indexed
+      docs: {},                            // but no docs (bug state)
+      postings: {},
+    };
+    fs.mkdirSync(path.dirname(idxPath), { recursive: true });
+    fs.writeFileSync(idxPath, JSON.stringify(stalePayload));
+
+    const ix = await loadIndexer();
+    await ix.reconcileChatsIndex('u1');
+
+    const entry = await ix.getEntry(idxPath, 'chat');
+    // Stale index discarded by `loadIndex` (version mismatch → emptyIndex),
+    // reconcile then sees no known files → re-walks the jsonl from scratch
+    // → group-chat shape now correctly tokenized.
+    expect(entry.idx.docs['chat:cstale:0']).toBeDefined();
+    expect(entry.idx.postings['zebrafish']).toBeDefined();
+  });
+});
+
 describe('search/indexer › dropChatConversation', () => {
   it('removes every doc under the conversation id', async () => {
     writeChat('u1', 'c1', [
@@ -237,16 +318,18 @@ describe('search/indexer › upsertContext / dropContext', () => {
   });
 });
 
-describe('search/indexer › reconcileSkillChatsIndex', () => {
-  it('indexes per-skill chat.jsonl files', async () => {
-    writeSkillChat('u1', 's1', [{ role: 'user', content: 'skill keyword', time: 't' }]);
-    writeSkillChat('u1', 's2', [{ role: 'assistant', content: 'another skill', time: 't' }]);
+// 锁住 `9529d52c` 改的 spec:技能编辑 / 智能体编辑会话**不**进 search 索引。
+// 之前老版本有 reconcileSkillChatsIndex / reconcileAgentChatsIndex 会按 skill_id
+// 建索引,现在被剔除——search 只索引 contexts + 主对话 + agent/skill 本体规格。
+// 下次如有人把这两条索引函数复活,或者新人改 reconcileAll 时不小心把 skill_chats
+// 加回扫描列表,这里负责拦截。
+describe('search/indexer › skill / agent edit chats are out of search scope', () => {
+  it('does not expose `reconcileSkillChatsIndex` / `reconcileAgentChatsIndex`', async () => {
     const ix = await loadIndexer();
-    await ix.reconcileSkillChatsIndex('u1');
-    const paths = await import('../../../../src/main/paths');
-    const entry = await ix.getEntry(paths.userSkillChatsIndexPath('u1'), 'skill_chat');
-    expect(Object.keys(entry.idx.files).sort()).toEqual(['s1', 's2']);
-    expect(entry.idx.docs['skill_chat:s1:0']).toMatchObject({ skill_id: 's1' });
+    expect((ix as Record<string, unknown>).reconcileSkillChatsIndex).toBeUndefined();
+    expect((ix as Record<string, unknown>).reconcileAgentChatsIndex).toBeUndefined();
+    expect((ix as Record<string, unknown>).indexSkillChatMessage).toBeUndefined();
+    expect((ix as Record<string, unknown>).indexAgentChatMessage).toBeUndefined();
   });
 });
 

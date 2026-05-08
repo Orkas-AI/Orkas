@@ -9,10 +9,11 @@ let _ctxTree = [];                  // tree of {name, path, type:'dir'|'file', c
 let _ctxExpanded = new Set();       // dir paths that are open
 let _ctxActive = null;              // {id, content} — currently opened file in right-pane
 let _ctxPendingRename = null;       // {path} — flagged for inline-rename on the
-                                    // next renderCtxTree() (set by "新建文本"
-                                    // after creating an untitled file so the
-                                    // user can rename immediately, and by the
-                                    // ⋯ menu's "重命名" item).
+                                    // next renderCtxTree() (set by the "new
+                                    // text file" action after creating an
+                                    // untitled file so the user can rename
+                                    // immediately, and by the ⋯ menu's
+                                    // "rename" item).
 let _kbStatusByPath = {};           // {[path]: {status, chunks?, error?, kind?}}
 let _kbEventsAbort = null;
 
@@ -199,7 +200,7 @@ function _renderCtxNodes(nodes, depth = 0) {
     const active = _ctxActive && _ctxActive.id === n.path ? ' active' : '';
     const ext = (n.name.split('.').pop() || '').toLowerCase();
     const chip = _kbStatusChipHtml(n.path);
-    // Inline-rename mode for a freshly-created "未命名.md" or for the rename
+    // Inline-rename mode for a freshly-created "untitled.md" or for the rename
     // menu item — the label becomes an input autofocused with the stem
     // selected. Committed on Enter / blur; Esc keeps the file as-is. See
     // `_bindCtxTreeHandlers` for the handlers.
@@ -230,7 +231,7 @@ function _bindCtxTreeHandlers(container) {
     const rel = wrap.dataset.path;
     input.addEventListener('click', (e) => e.stopPropagation());
     // Auto-select the stem (without extension) so the user overwrites the
-    // "未命名" part but keeps ".md" if they just type.
+    // "untitled" stem but keeps ".md" if they just type.
     const v = input.value;
     const dot = v.lastIndexOf('.');
     setTimeout(() => {
@@ -247,6 +248,9 @@ function _bindCtxTreeHandlers(container) {
       await _commitInlineRename(rel, next);
     };
     input.addEventListener('keydown', (e) => {
+      // IME guard (CLAUDE.md §8) — Enter while composing should commit
+      // the candidate to the rename input, not finalise the rename.
+      if (e.isComposing || e.keyCode === 229) return;
       if (e.key === 'Enter') { e.preventDefault(); commit(true); }
       else if (e.key === 'Escape') { e.preventDefault(); commit(false); }
     });
@@ -380,7 +384,7 @@ async function deleteCtxEntry(rel, kind) {
 // Triggers in-place rename: flag the path and re-render so the label slot
 // becomes an editable input. Commit handled by the existing inline-rename
 // listeners in `_bindCtxTreeHandlers` → `_commitInlineRename`. Used by the
-// row ⋯ menu's "重命名" item.
+// row ⋯ menu's "rename" item.
 function renameCtxEntry(rel /*, kind */) {
   // For dirs being renamed: must be expanded so the row is rendered as an
   // input. (Collapsed dirs whose ancestor is also collapsed wouldn't show.)
@@ -392,7 +396,7 @@ function renameCtxEntry(rel /*, kind */) {
 
 // Open the per-row ⋯ popover menu. `kind` ∈ 'root' | 'dir' | 'file'.
 // Menu items are dynamic per kind — file kind further subdivides on whether
-// the file is a text-editable type (controls the "编辑" item).
+// the file is a text-editable type (controls the "edit" item).
 function _openCtxRowMenu(anchorBtn, kind, relPath) {
   let menu = document.getElementById('ctx-row-menu');
   if (!menu) {
@@ -568,9 +572,9 @@ async function _commitInlineRename(rel, nextBase) {
 }
 
 // Opens the "new directory" modal scoped to `parentDir` (relative, '' for
-// root). The old "新建" modal had tabs (dir / text) + a content textarea;
-// it's now directory-only — + 文本 creates a file inline (see
-// `createCtxNewTextFile`) without any modal.
+// root). The old "new" modal had tabs (dir / text) + a content
+// textarea; it's now directory-only — the "+ text" action creates a
+// file inline (see `createCtxNewTextFile`) without any modal.
 async function promptCtxNewInDir(parentDir) {
   _ctxNewTargetDir = parentDir || '';
   document.getElementById('ctx-new-name').value = '';
@@ -619,12 +623,12 @@ async function saveCtxNew() {
 }
 window.saveCtxNew = saveCtxNew;
 
-// + 文本 handler — no modal. Writes an empty "未命名.md" (disambiguated if
+// "+ text" handler — no modal. Writes an empty "untitled.md" (disambiguated if
 // one already exists in that dir), opens it in the right pane, flags it
 // for inline rename on the next tree render, and immediately drops the
 // viewer into edit mode so the user can start typing content.
 async function createCtxNewTextFile(parentDir = '') {
-  const stemBase = t('contexts.new.untitled_stem') || '未命名';
+  const stemBase = t('contexts.new.untitled_stem') || 'untitled';
   // Collect sibling file names so we can uniquify if a conflict exists.
   const siblings = _ctxListChildren(parentDir).map(n => n.name);
   let stem = stemBase;
@@ -654,7 +658,7 @@ async function createCtxNewTextFile(parentDir = '') {
 }
 
 // Collect direct children of a dir path in the cached tree — used by
-// `createCtxNewTextFile` to uniquify "未命名.md" when a collision exists.
+// `createCtxNewTextFile` to uniquify "untitled.md" when a collision exists.
 function _ctxListChildren(dirPath) {
   if (!dirPath) return _ctxTree;
   const parts = dirPath.split('/');
@@ -770,7 +774,7 @@ function _kindOfPath(rel) {
 }
 
 // Add every ancestor directory of `rel` to the expanded set. Called from
-// `openCtxFile` so deep-link navigation (global search → 知识库 file) unrolls
+// `openCtxFile` so deep-link navigation (global search → KB file) unrolls
 // the tree to show where the file lives and why its row is marked active.
 function _ctxExpandAncestors(rel) {
   const parts = String(rel || '').split('/');
@@ -1035,8 +1039,8 @@ function initCtxBindings() {
     e.stopPropagation();
     _openCtxRowMenu(e.currentTarget, 'root', '');
   });
-  // Hidden file input — both root menu's "上传文件" and any folder row's
-  // "上传文件" route through here. Target dir is stashed on dataset before
+  // Hidden file input — both the root menu's "upload file" item and any
+  // folder row's "upload file" route through here. Target dir is stashed on dataset before
   // .click() so this single handler routes correctly.
   document.getElementById('ctx-file-input')?.addEventListener('change', async (ev) => {
     const input = ev.target;

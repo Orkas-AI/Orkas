@@ -36,6 +36,7 @@ import * as appConfig from '../features/config';
 import * as avatars from '../features/avatars';
 import { getRendererTables, isLang, t } from '../i18n';
 import * as userWorkspace from '../features/user_workspace';
+import { invokeHandlers as localAgentsHandlers } from './local_agents';
 import { safeId } from '../storage';
 import { createLogger, logFromRenderer } from '../logger';
 import * as path from 'node:path';
@@ -127,6 +128,16 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return groupChat.readPlanForCid(ctx.userId, cid);
   },
 
+  'groupChat.retryStep': async ({ cid, stepIndex }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return groupChat.retryStep(ctx.userId, cid, Number(stepIndex));
+  },
+
+  'groupChat.skipStep': async ({ cid, stepIndex }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return groupChat.skipStep(ctx.userId, cid, Number(stepIndex));
+  },
+
   'groupChat.markFormSubmitted': async ({ cid, msgId, formId, values }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
     if (typeof msgId !== 'string' || !msgId) throw new Error('invalid msgId');
@@ -139,6 +150,22 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return groupChat.markFormSubmittedAndDispatch({
       userId: ctx.userId, cid, msgId, formId, values: values as Record<string, unknown>,
     });
+  },
+
+  // Generic native directory picker. Used by the agent-input-form
+  // `directory` type so coding agents (claude / codex) collect their
+  // project directory through the standard input-form pipeline.
+  'common.pickDirectory': async ({ title } = {}) => {
+    const parent = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
+    const opts: Electron.OpenDialogOptions = {
+      properties: ['openDirectory'],
+      title: typeof title === 'string' && title ? title : t('dialog.choose_directory'),
+    };
+    const res = parent
+      ? await dialog.showOpenDialog(parent, opts)
+      : await dialog.showOpenDialog(opts);
+    if (res.canceled || !res.filePaths?.length) return { cancelled: true };
+    return { cancelled: false, path: res.filePaths[0] };
   },
 
   // ── Chat attachments (per-cid file pool for main chat) ──
@@ -176,9 +203,10 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { agent };
   },
 
-  'agents.create': async ({ name = '', description = '', workflow = '', icon, color } = {}) => {
-    return { agent: await agents.createCustomAgent({ name, description, workflow, icon, color }) };
+  'agents.create': async ({ name = '', description = '', description_zh, description_en, workflow = '', icon, color, runtime } = {}) => {
+    return { agent: await agents.createCustomAgent({ name, description, description_zh, description_en, workflow, icon, color, runtime }) };
   },
+
 
   'agents.update': async ({ agent_id, updates }) => {
     if (!agents.isValidAgentId(agent_id)) throw new Error('invalid agent_id');
@@ -254,7 +282,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const parent = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
     const opts: Electron.OpenDialogOptions = {
       properties: ['openDirectory'],
-      title: '选择要导入的技能源目录',
+      title: t('dialog.choose_skill_source_directory'),
     };
     const res = parent
       ? await dialog.showOpenDialog(parent, opts)
@@ -275,9 +303,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { skill: r.skill, seedMessage: r.seedMessage };
   },
 
-  'skills.update': async ({ id, updates }) => {
+  'skills.update': async ({ id, updates, skipRename }) => {
     if (!skills.isValidSkillId(id)) throw new Error('invalid skill id');
-    const data = await skills.updateCustomSkill(id, updates || {});
+    const data = await skills.updateCustomSkill(id, updates || {}, { skipRename: !!skipRename });
     if (!data) throw new Error('skill not found');
     return { skill: data };
   },
@@ -386,7 +414,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return contexts.openContextFileInSystem(path || '');
   },
 
-  // ── Knowledge base (向量库) ──
+  // ── Knowledge base (vector store) ──
   // Snapshot of what's in `kb_files`: status summary + per-file rows.
   // Renderer subscribes to the `kb.events` stream (below) for incremental
   // updates; this endpoint is the initial-load / full-refresh fetch.
@@ -412,8 +440,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { result: r };
   },
 
-  // Re-enqueue a single file (typically the UI's "重新处理" button after a
-  // failed extraction).
+  // Re-enqueue a single file (typically the UI's "reprocess" button after
+  // a failed extraction).
   'kb.reprocess': async ({ path }, ctx) => {
     if (typeof path !== 'string' || !path) throw new Error('path required');
     kbIndexer.enqueue(ctx.userId, path, 'upsert');
@@ -436,20 +464,24 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
   'config.getLocales': async () => ({ tables: getRendererTables() }),
 
-  // 头像 catalog（图标 + 颜色 + 指挥官默认）—— 单一真相源在
-  // src/main/data/avatars.json。renderer 启动时拉一次，自此用本地缓存。
+  // Avatar catalog (icons + colors + commander default) — single source of
+  // truth lives in src/main/data/avatars.json. The renderer fetches once at
+  // startup, then uses its local cache.
   'avatars.getCatalog': async () => ({ catalog: avatars.getCatalog() }),
 
-  // 指挥官头像偏好（云同步）。avatar = { icon, color }，token 走 catalog
-  // 白名单校验；缺省时 renderer 用 commander 默认（crown + gold）兜底。
+  // Commander avatar preference (cloud-synced). avatar = { icon, color };
+  // tokens are validated against the catalog allow-list. When absent the
+  // renderer falls back to the commander default (crown + gold).
   'prefs.getCommanderAvatar': async () => ({ avatar: appConfig.getCommanderAvatar() }),
   'prefs.setCommanderAvatar': async ({ icon, color }) => {
     return { avatar: appConfig.setCommanderAvatar({ icon, color }) };
   },
 
-  // 元认知级别的 agent 自演进开关。落 preferences.json::metacognition_enabled，
-  // 真正的 gate 单点真相在 features/metacognition.isFeatureEnabled（叠加 env
-  // kill switch）。env `ORKAS_METACOGNITION='0'` 永远压过 UI 设置。
+  // Metacognition-level agent self-evolution toggle. Stored at
+  // preferences.json::metacognition_enabled; the actual gate's single
+  // source of truth is features/metacognition.isFeatureEnabled (with the
+  // env kill switch on top). The env var `ORKAS_METACOGNITION='0'` always
+  // overrides the UI setting.
   'prefs.getMetacognition': async () => ({
     enabled: appConfig.getMetacognitionEnabled(),
     envForcedOff: process.env.ORKAS_METACOGNITION === '0',
@@ -574,6 +606,11 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     shell.showItemInFolder(norm);
     return { path: norm };
   },
+
+  // Local CLI agent discovery (claude / codex / openclaw / opencode / hermes).
+  // Discovery + model catalogs only; actual spawning happens inside group_chat
+  // dispatch via `features/local_agents/runner.ts`, never as a standalone IPC.
+  ...localAgentsHandlers,
 };
 
 // ── Stream handlers ──────────────────────────────────────────────────────
@@ -750,7 +787,13 @@ export function register(): void {
       return { ok: true, ...(result || {}) };
     } catch (err) {
       log.error(`invoke ${channel} failed`, { error: (err as Error)?.message || String(err) });
-      return { ok: false, error: (err as Error).message || String(err) };
+      const out: { ok: false; error: string; code?: string } = {
+        ok: false,
+        error: (err as Error).message || String(err),
+      };
+      const code = (err as { code?: unknown }).code;
+      if (typeof code === 'string') out.code = code;
+      return out;
     }
   });
 

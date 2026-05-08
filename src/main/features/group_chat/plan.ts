@@ -46,7 +46,8 @@ export interface PlanStep {
   /** Human-readable; what the user will see in the UI plan panel. */
   title: string;
   /** Required. Resolves to: 'user' / 'commander' / agent name (or id).
-   * Empty = invalid. Aliases: '指挥官' → commander, '用户' → user. */
+   * Empty = invalid. Aliases: the Chinese forms '指挥官' → commander
+   * and '用户' → user are also accepted. */
   assignee: string;
   /** Dispatch payload template. Bus renders this and sends it as the message
    * body when this step fires. Variables: `{{user_initial_message}}` and
@@ -69,6 +70,11 @@ export interface PlanStep {
   output_files?: string[];
   output_msg_id?: string;
   failure_reason?: string;
+  /** Plan-level safety net: count of times the executor folded a transient
+   * failure (undici `terminated`, ECONNRESET, etc.) back to `pending` for
+   * an automatic redispatch. Cap = `MAX_TRANSIENT_RETRIES` in plan_executor.
+   * Reset to 0 on user-initiated retry / step success. */
+  transient_attempts?: number;
 
   /** Legacy free-form notes (kept for tools that still use it). */
   notes?: string;
@@ -131,6 +137,8 @@ function normalizeStep(raw: any, i: number): PlanStep {
     ...(Array.isArray(raw?.output_files) ? { output_files: raw.output_files.map(String) } : {}),
     ...(typeof raw?.output_msg_id === 'string' ? { output_msg_id: raw.output_msg_id } : {}),
     ...(typeof raw?.failure_reason === 'string' ? { failure_reason: raw.failure_reason } : {}),
+    ...(Number.isFinite(Number(raw?.transient_attempts)) && Number(raw.transient_attempts) > 0
+      ? { transient_attempts: Number(raw.transient_attempts) } : {}),
     ...(typeof raw?.notes === 'string' && raw.notes.trim() ? { notes: String(raw.notes) } : {}),
   };
 }
@@ -204,7 +212,7 @@ export async function setPlan(
 
 export async function updateStep(
   uid: string, cid: string, stepIndex: number, status: StepStatus,
-  patch?: { notes?: string; output_summary?: string; output_files?: string[]; output_msg_id?: string; failure_reason?: string },
+  patch?: { notes?: string; output_summary?: string; output_files?: string[]; output_msg_id?: string; failure_reason?: string; transient_attempts?: number },
 ): Promise<PlanFile | null> {
   const cur = await readPlan(uid, cid);
   if (!cur) return null;
@@ -218,7 +226,14 @@ export async function updateStep(
   if (patch?.output_summary !== undefined) cur.steps[idx].output_summary = patch.output_summary;
   if (patch?.output_files !== undefined) cur.steps[idx].output_files = patch.output_files;
   if (patch?.output_msg_id !== undefined) cur.steps[idx].output_msg_id = patch.output_msg_id;
-  if (patch?.failure_reason !== undefined) cur.steps[idx].failure_reason = patch.failure_reason;
+  if (patch?.failure_reason !== undefined) {
+    if (patch.failure_reason) cur.steps[idx].failure_reason = patch.failure_reason;
+    else delete cur.steps[idx].failure_reason;
+  }
+  if (patch?.transient_attempts !== undefined) {
+    if (patch.transient_attempts > 0) cur.steps[idx].transient_attempts = patch.transient_attempts;
+    else delete cur.steps[idx].transient_attempts;
+  }
   await writePlanRaw(uid, cid, cur);
   log.info(`plan-update user=${uid} cid=${cid} step=${stepIndex} status=${status}`);
   return cur;
