@@ -10,6 +10,16 @@
 // `encodeChatFormSubmission` are exposed to other modules.
 
 (function () {
+  // In-progress (un-submitted) field values, keyed by `${cid}::${form_id}`.
+  // Hydrated back when re-rendering an unsubmitted form so switching
+  // conversations and coming back doesn't wipe what the user already typed.
+  // Cleared on successful submit, on reset, and whenever the form re-renders
+  // as already-submitted (server-side values are authoritative then).
+  const _formDrafts = new Map();
+  function _draftKey(cid, formId) {
+    return `${cid || ''}::${formId || ''}`;
+  }
+
   // Build DOM for a single field. Returns { el, read, isReady, field }.
   //
   // `opts.presetValue` overrides `field.default` for the initial control
@@ -58,6 +68,9 @@
       }
       input.value = initial === undefined || initial === null ? '' : String(initial);
       if (disabled) input.disabled = true;
+      input.addEventListener('input', () => {
+        if (ctx && typeof ctx.onChange === 'function') ctx.onChange();
+      });
       ctrlWrap.appendChild(input);
       read = () => {
         if (field.type === 'number') {
@@ -73,6 +86,9 @@
       ta.rows = 3;
       ta.value = typeof initial === 'string' ? initial : '';
       if (disabled) ta.disabled = true;
+      ta.addEventListener('input', () => {
+        if (ctx && typeof ctx.onChange === 'function') ctx.onChange();
+      });
       ctrlWrap.appendChild(ta);
       read = () => ta.value;
     } else if (field.type === 'select') {
@@ -98,6 +114,9 @@
         const trigger = sel.querySelector('.ai-select-trigger');
         if (trigger) trigger.disabled = true;
       }
+      aiSel.onChange(() => {
+        if (ctx && typeof ctx.onChange === 'function') ctx.onChange();
+      });
       read = () => aiSel.getValue();
     } else if (field.type === 'multiselect') {
       // Checkbox group — clearer than <select multiple>, also better on mobile.
@@ -113,6 +132,9 @@
         box.value = opt.value;
         if (initialSet.has(opt.value)) box.checked = true;
         if (disabled) box.disabled = true;
+        box.addEventListener('change', () => {
+          if (ctx && typeof ctx.onChange === 'function') ctx.onChange();
+        });
         checks.push(box);
         labelEl.appendChild(box);
         const text = document.createElement('span');
@@ -129,6 +151,9 @@
       box.type = 'checkbox';
       if (initial === true) box.checked = true;
       if (disabled) box.disabled = true;
+      box.addEventListener('change', () => {
+        if (ctx && typeof ctx.onChange === 'function') ctx.onChange();
+      });
       labelEl.appendChild(box);
       const text = document.createElement('span');
       text.textContent = ' ' + t('chat.form.boolean_on');
@@ -460,6 +485,14 @@
     const form = message.form;
     const submitted = !!(opts.readonly || form.submitted);
 
+    // Draft hydration: an unsubmitted form re-rendered after a tab switch
+    // pulls the user's in-progress values out of `_formDrafts` so they
+    // don't lose their typing. A submitted form drops any stale draft —
+    // server-side `form.values` is authoritative now.
+    const draftKey = _draftKey(opts.cid, form.form_id);
+    const draftValues = !submitted ? _formDrafts.get(draftKey) : null;
+    if (submitted) _formDrafts.delete(draftKey);
+
     container.classList.add('chat-input-form');
     if (submitted) container.classList.add('is-submitted');
     const title = document.createElement('div');
@@ -472,7 +505,15 @@
     const fields = [];
     const fieldCtx = {
       cid: opts.cid,
-      onChange: () => _refreshSubmitState(),
+      onChange: () => {
+        _refreshSubmitState();
+        if (submitted) return;
+        const snap = {};
+        for (const f of fields) {
+          try { snap[f.field.id] = f.read(); } catch (_) { /* skip */ }
+        }
+        _formDrafts.set(draftKey, snap);
+      },
     };
     for (const f of form.fields) {
       // Only attach `presetValue` when we actually have one — `_buildField`
@@ -484,6 +525,9 @@
       if (submitted && form.values
           && Object.prototype.hasOwnProperty.call(form.values, f.id)) {
         buildOpts.presetValue = form.values[f.id];
+      } else if (!submitted && draftValues
+          && Object.prototype.hasOwnProperty.call(draftValues, f.id)) {
+        buildOpts.presetValue = draftValues[f.id];
       }
       const built = _buildField(f, fieldCtx, buildOpts);
       fields.push(built);
@@ -531,6 +575,9 @@
     _refreshSubmitState();
 
     resetBtn.addEventListener('click', () => {
+      // Clear the draft so re-render falls back to schema defaults rather
+      // than re-hydrating the in-progress values we just wiped from the DOM.
+      _formDrafts.delete(draftKey);
       container.innerHTML = '';
       renderChatInputForm(container, message, opts);
     });
@@ -575,6 +622,11 @@
       const dedupAttachments = Array.from(new Set(attachmentNames));
       try {
         opts.onSubmit && opts.onSubmit(encoded, values, dedupAttachments);
+        // Submission left our hands; once the bubble re-renders as
+        // submitted the draft is moot anyway, but drop it now so a fast
+        // tab switch before the re-render arrives doesn't re-hydrate the
+        // already-sent values into a stale form.
+        _formDrafts.delete(draftKey);
       } catch (err) {
         delete submitBtn.dataset.locked;
         submitBtn.disabled = false;
