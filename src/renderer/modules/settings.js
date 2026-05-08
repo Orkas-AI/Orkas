@@ -712,12 +712,6 @@ function _settingsRenderEntryRow(entry, idx) {
   row.dataset.entryId = entry.entryId;
   row.draggable = true;
 
-  const handle = document.createElement('div');
-  handle.className = 'entry-drag-handle';
-  handle.title = t('settings.entries.drag_title');
-  handle.textContent = '⋮⋮';
-  row.appendChild(handle);
-
   const rank = document.createElement('div');
   rank.className = 'entry-rank';
   rank.textContent = idx === 0 ? t('settings.entries.default_tag') : `#${idx + 1}`;
@@ -808,12 +802,39 @@ function _settingsRenderEntryRow(entry, idx) {
 
   row.appendChild(actions);
 
-  // Drag + drop for reordering
+  _settingsAttachReorderDnd(row, {
+    kind: 'chat',
+    id: entry.entryId,
+    getIds: () => _settingsState.entries.map((e) => e.entryId),
+    ipcName: 'auth.reorderEntries',
+    onSuccess: (res) => {
+      _settingsState.entries = Array.isArray(res.entries) ? res.entries : _settingsState.entries;
+      _settingsRenderEntries();
+    },
+  });
+
+  return row;
+}
+
+// Shared row drag-and-drop reorder. `kind` discriminates between the three
+// lists (chat / search / image) so a drag started in one list can't drop
+// into another — without the check, dragover would still highlight foreign
+// rows and the drop handler would feed a stranger's id to the wrong reorder
+// IPC. `getIds` is read at drop time (not bound at attach time) so each row
+// sees the current state's id order even after re-renders.
+async function _settingsAttachReorderDnd(row, opts) {
+  const { kind, id, getIds, ipcName, onSuccess } = opts;
+  row.draggable = true;
+  const handle = document.createElement('div');
+  handle.className = 'entry-drag-handle';
+  handle.title = t('settings.entries.drag_title');
+  handle.textContent = '⋮⋮';
+  row.prepend(handle);
   row.addEventListener('dragstart', (e) => {
-    _settingsState.dragState = { entryId: entry.entryId, startIdx: idx };
+    _settingsState.dragState = { kind, id };
     row.classList.add('dragging');
     e.dataTransfer.effectAllowed = 'move';
-    try { e.dataTransfer.setData('text/plain', entry.entryId); } catch (_) {}
+    try { e.dataTransfer.setData('text/plain', id); } catch (_) {}
   });
   row.addEventListener('dragend', () => {
     row.classList.remove('dragging');
@@ -821,7 +842,8 @@ function _settingsRenderEntryRow(entry, idx) {
     _settingsState.dragState = null;
   });
   row.addEventListener('dragover', (e) => {
-    if (!_settingsState.dragState) return;
+    const ds = _settingsState.dragState;
+    if (!ds || ds.kind !== kind) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
     const rect = row.getBoundingClientRect();
@@ -833,34 +855,28 @@ function _settingsRenderEntryRow(entry, idx) {
     row.classList.remove('drop-before', 'drop-after');
   });
   row.addEventListener('drop', async (e) => {
-    if (!_settingsState.dragState) return;
+    const ds = _settingsState.dragState;
+    if (!ds || ds.kind !== kind) return;
     e.preventDefault();
     row.classList.remove('drop-before', 'drop-after');
-    const srcId = _settingsState.dragState.entryId;
-    if (srcId === entry.entryId) return;
+    const srcId = ds.id;
+    if (srcId === id) return;
     const rect = row.getBoundingClientRect();
     const before = (e.clientY - rect.top) < rect.height / 2;
-    await _settingsReorderAfterDrop(srcId, entry.entryId, before);
+    const ids = [...getIds()];
+    const srcIdx = ids.indexOf(srcId);
+    if (srcIdx < 0) return;
+    ids.splice(srcIdx, 1);
+    let refIdx = ids.indexOf(id);
+    if (refIdx < 0) refIdx = ids.length;
+    ids.splice(before ? refIdx : refIdx + 1, 0, srcId);
+    const res = await window.orkas.invoke(ipcName, { orderedIds: ids });
+    if (res && res.ok) {
+      await onSuccess(res);
+    } else {
+      await uiAlert((res && res.error) || t('settings.entries.reorder_failed'));
+    }
   });
-
-  return row;
-}
-
-async function _settingsReorderAfterDrop(srcId, refId, insertBefore) {
-  const ids = _settingsState.entries.map((e) => e.entryId);
-  const srcIdx = ids.indexOf(srcId);
-  if (srcIdx < 0) return;
-  ids.splice(srcIdx, 1);
-  let refIdx = ids.indexOf(refId);
-  if (refIdx < 0) refIdx = ids.length;
-  ids.splice(insertBefore ? refIdx : refIdx + 1, 0, srcId);
-  const res = await window.orkas.invoke('auth.reorderEntries', { orderedIds: ids });
-  if (res && res.ok) {
-    _settingsState.entries = Array.isArray(res.entries) ? res.entries : _settingsState.entries;
-    _settingsRenderEntries();
-  } else {
-    await uiAlert((res && res.error) || t('settings.entries.reorder_failed'));
-  }
 }
 
 async function _settingsTestEntry(entry, statusEl) {
@@ -1046,6 +1062,17 @@ function _settingsRenderSearchEntries() {
     actions.appendChild(delBtn);
     row.appendChild(actions);
 
+    _settingsAttachReorderDnd(row, {
+      kind: 'search',
+      id: p.id,
+      getIds: () => (_settingsState.searchProfiles || []).map((x) => x.id),
+      ipcName: 'searchAuth.reorder',
+      onSuccess: async () => {
+        await _settingsRefreshSearchProfiles();
+        _settingsRenderSearchEntries();
+      },
+    });
+
     container.appendChild(row);
   });
 }
@@ -1167,6 +1194,17 @@ function _settingsRenderImageEntries() {
     });
     actions.appendChild(delBtn);
     row.appendChild(actions);
+
+    _settingsAttachReorderDnd(row, {
+      kind: 'image',
+      id: p.id,
+      getIds: () => (_settingsState.imageProfiles || []).map((x) => x.id),
+      ipcName: 'imageAuth.reorder',
+      onSuccess: async () => {
+        await _settingsRefreshImageProfiles();
+        _settingsRenderImageEntries();
+      },
+    });
 
     container.appendChild(row);
   });
