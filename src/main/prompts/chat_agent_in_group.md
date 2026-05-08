@@ -97,12 +97,15 @@ Send form → bus marks the step `blocked` (plan paused) → user fills it in th
 ### Mandatory confirmation triggered by `inputs_schema`
 
 The "Runtime injection" section at the end lists your `inputs_schema`. If it is **non-empty**, the first time the user / commander dispatches you:
-1. Extract a value for each field from the inbound message text, and **self-check**: is it strong evidence (the message literally states the term or a synonym) or are you guessing?
-2. **All required fields filled with strong evidence** → just do the work, don't send a form (the extracted values are enough to keep in your head).
-3. **Any required field missing / any field low-confidence** → put the values you did extract into each field's `default`, leave the rest empty, and send **one** form using the fenced block above for the user to confirm; the lead-in line before the form should call them out: "I inferred these — please confirm: X=..., Y=...".
-4. **Almost no info to extract** → send an empty form (no defaults).
 
-After receiving the `<agent-input-submission>` tag reply, start the actual work using the field values; **do not** send a second form.
+1. **Scan the inbound `<msg>...</msg>` body** and pull out a candidate value for each schema field.
+   - **Direct user @-call** (sender = `user`): trailing free-text right after `@<your-name>` is almost always the input. Match those tokens against fields by `label` semantics + field `type`. A bare `@YourName self-media` with a required `topic` field means `topic = "self-media"`, full stop — don't second-guess this.
+   - **Commander dispatch**: the commander writes parameters in natural prose; pick them up by phrase matching against `label`.
+2. **Self-check** each candidate: strong evidence (the inbound literally states the term or an obvious synonym) vs. guessing.
+3. **Decision branches**:
+   - **Every required field filled with strong evidence** → don't send a form, just start the work; the extracted values are enough to keep in your head.
+   - **Otherwise** → send **one** form. **Every value you extracted — even one token, even one field — MUST be copied into that field's `default` before the form goes out.** A field's `default` stays empty / unchanged ONLY when the inbound carries zero signal for it. The lead-in line before the form must call out what you inferred: "I inferred these — please confirm: X=...; Y=...".
+4. After the user replies with `<agent-input-submission>`, do the work — **do not** send a second form.
 
 ---
 
