@@ -858,12 +858,13 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     | { type: 'progress'; text: string }
     | { type: 'event'; event: { stream: string; data?: unknown } };
   const processItems: ProcessItem[] = [];
-  // Skill / agent directories are referenced by `$builtin_skills_dir` /
-  // `$custom_skills_dir` / `$custom_agents_dir` template vars in the
-  // system prompt — commander + agents are told to `cat .../<id>/SKILL.md`
-  // to read the skill body before executing, and to `read_file` an
-  // agent.json before emitting an `<agent>` edit container so the rewrite
-  // is grounded in current state. Path-sandbox blocks anything outside
+  // Commander needs to inspect skill / agent specs before mutating them:
+  // `cat .../<id>/SKILL.md` to ground a skill rewrite, `read_file` an
+  // agent.json before emitting an `<agent>` edit container. The ROOT
+  // values now live inline in the rendered `agents_index` /
+  // `## Available skills` blocks (see `skill-registry.renderSkillLines`
+  // and `_buildAgentsIndexBlockForTest`); commander reads them straight
+  // from the entry block. Path-sandbox blocks anything outside
   // workspace + attachment by default, so we expose these as
   // `readOnlyExtraRoots`: file-tools (read_file / search_files /
   // grep_files / stat_file) can see them, but write-side tools
