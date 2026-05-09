@@ -3339,6 +3339,15 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
         const legacy = _groupMsgToLegacy(gm);
         const bubble = appendChatMessage(legacy, true, { cid, archive });
         if (bubble) bubble.dataset.fromActor = String(gm.from || '');
+        // Cache-refresh parity with `_mountCreatedAgentChip`: the placeholder
+        // path goes through it (which calls loadAgents/loadSkills(true)),
+        // but this fallback runs appendChatMessage directly which only
+        // paints the chip — without this hop, fast turns that emit zero
+        // process events leave _agentsCache / _skillsCache stale, so the
+        // newly-created agent is missing from the agents tab and the @
+        // picker until a manual refresh.
+        if (_normalizeCreatedAgents(gm)) { try { loadAgents?.(true); } catch (_) {} }
+        if (_normalizeCreatedSkills(gm)) { try { loadSkills?.(true); } catch (_) {} }
       }
     } else {
       // Mid-turn message — append a new bubble alongside, leave the

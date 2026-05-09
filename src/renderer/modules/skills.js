@@ -21,8 +21,8 @@ window.addEventListener('i18n-change', () => {
 let _expandedDirs = new Set(); // keys like "source:id" or "source:id/subdir"
 let _skillTreeCache = new Map(); // key: "source:id" → tree array
 
-async function loadSkills() {
-  if (_skillsCache) { renderSkillsList(_skillsCache); return; }
+async function loadSkills(forceRefresh) {
+  if (_skillsCache && !forceRefresh) { renderSkillsList(_skillsCache); return; }
   try {
     const res = await apiFetch('/api/skills/list');
     const data = await res.json();
