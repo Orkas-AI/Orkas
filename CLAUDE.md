@@ -121,10 +121,12 @@ PC/data/
     │   ├── memory/MEMORY.md + USER.md
     │   ├── agents/<aid>/              Custom agent: agent.json (spec) + meta/ (metacognition) + skills/ (self-evolved SkillStore)
     │   ├── skills/<sid>/              Custom skills (System A, scanned by SkillLoader)
+    │   ├── projects/_index.json + projects/<pid>/  Logical groups of conversations + reserved per-project asset slot (KB/permissions later)
     │   └── config/{preferences,component-enabled}.json
     └── local/                 🔒 Machine-private domain (never synced)
         ├── config/            auth-profiles / permissions / reflection-state / web-search-cache
         ├── search/            Derived indexes (contexts / chats / skill_chats / agent_chats)
+        ├── workspace.json     Scoped workspace selection: `{default, projects:{<pid>:…}}` (legacy flat shape auto-promoted on first read)
         ├── file_cache/<hash>/ Lazy cache for all files (see features/file_indexer.ts)
         └── tool-results/<sid>/ Spill for oversized tool outputs
 ```
@@ -152,6 +154,8 @@ PC/data/
 | CLI agent dispatch | (no jsonl — per-run files only) | `<uid>-cli-<cli>-<runId>` |
 
 session jsonl files land at `<uid>/cloud/sessions/<session_id>.jsonl` — they are **two independent files** from the UI message list.
+
+**Project membership** is an index-level field on the conv record (`Conversation.project_id`), **not** part of any path or session_id. cid stays globally unique; `<cid>.jsonl` / `groupChatDir` / `chat_attachments/<cid>/` / `session_id = <uid>-gconv-<cid>` paths are independent of project membership. Workspace resolution is the only place project membership has effect: `getWorkspacePath(uid, projectId?)` (sync) picks the project-scoped selection from `<uid>/local/workspace.json::projects[pid]` when set, falling through to `default.selectedPath` then `DEFAULT_USER_WORKSPACE`. group_chat resolves cid → projectId once at the top of `runTurn` and threads `projectId` through `ChatOptions` → `LocalToolsOpts` / `FileToolsOpts` / `ImageGenToolOpts`. **Do not** re-read the conv index per tool call to look up project membership — the resolved value travels with the turn.
 
 **Security invariant**: `session_id` must be `<uid>-<kind>-<tail>`, with the uid in the first segment, and `<kind>` ∈ `gconv | gmember | skill | agent | extract-img | reflect | memory-extract | anon | cli` (`sub` / `organizer` / `conv` are legacy kinds; new code does not generate them, but `migrate-session-ids` preserves these older files). `session-store.ts::sessionFileFor()` enforces this with hard assertions to prevent cross-uid leakage. **Do not** encode brand names (`orkas-` / `aiteam-` / any app name) into session_id — we hit the renaming-breaks-history pitfall once, the startup `migrateLegacySessionIds(uid)` strips legacy prefixes once, and new code never adds them again. Adding a new kind requires extending this table. The `cli` kind has no `sessions/*.jsonl` (CLI dispatches do not run through core-agent); the id exists purely to give per-run records a stable, kind-tagged identifier.
 
@@ -334,6 +338,8 @@ The renderer evaluates `<script>`-loaded files where `module` is undefined, so t
 - Add `window.orkas.*` in the renderer without adding a handler in `ipc/index.ts`.
 - Bypass `util/locks.ts` / `util/path-sandbox.isPathAllowed` / `features/file_indexer.ts`.
 - Add eager pre-processing (extract / preview / chunking) to `chat_attachments.uploadAttachment`.
+- Treat `<uid>/local/workspace.json` as a flat `{selectedPath, recentPaths}` after the projects scope upgrade — the file is now `{default, projects:{<pid>:…}, updatedAt}`. Always go through `getWorkspacePath(uid, projectId?)` / `setWorkspacePath` / `resetWorkspacePath`; reading the JSON directly skips legacy-shape promotion + project-scope fallback.
+- Encode `project_id` into a path / cid / session_id segment. Project membership is an index-level field on the conv record only — see §5.
 
 **Timeouts / locks**:
 - Add a "total wall-clock timeout" to LLM calls (`timeout: N` / `setTimeout→abort`). The single application-layer watchdog is `client.ts::streamChatWithModel`'s `idleTimeout=600s` (true idle); the SDK 1h limit is backstopped by `sdk-timeout-patch.ts`; group-chat infinite-loop protection is `bus.ts::MAX_WORKER_TURNS=100` (**turns, do not change to a timeout**).

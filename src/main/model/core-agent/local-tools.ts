@@ -66,6 +66,11 @@ export interface LocalToolsOpts {
    *  conv's attachment dir to the sandbox. Without it, only the workspace
    *  (+ extraRoots) is editable. */
   cid?: string;
+  /** Project id of the current conversation, when it belongs to one.
+   *  Threaded through from group_chat at runTurn so workspace resolution
+   *  picks up the project-scoped selection (per CLAUDE.md projects feature).
+   *  Empty / missing → default-scope workspace. */
+  projectId?: string;
   /** Extra absolute directory roots `edit_file` should treat as in-scope
    *  on top of workspace + attachment. Used by skill-edit / agent-edit
    *  chats so the LLM can edit files inside the skill / agent dir. */
@@ -115,7 +120,7 @@ function allowedRootsFor(opts: LocalToolsOpts): string[] {
   const roots: string[] = [];
   if (opts.userId) {
     try {
-      const ws = getWorkspacePath(opts.userId);
+      const ws = getWorkspacePath(opts.userId, opts.projectId);
       if (ws) roots.push(ws);
     } catch (err) { log.warn(`edit_file resolve workspace: ${(err as Error).message}`); }
     if (opts.cid) {

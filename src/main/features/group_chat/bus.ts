@@ -722,6 +722,17 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // there's no migration story.
   const { getConversationWorkspacePath } = await import('./conv_workspace');
   const workingDir = await getConversationWorkspacePath(uid, cid);
+  // Project membership is decided at conv create time and frozen, so we
+  // can resolve it once per turn and thread it through to every workspace
+  // consumer below (CLI cwd fallback, streamChatWithModel, etc.) without
+  // re-reading the conv index per tool call.
+  let turnProjectId: string | undefined;
+  try {
+    const { getConversation } = await import('../chats');
+    const _conv = await getConversation(uid, cid);
+    const _pid = (_conv as any)?.project_id;
+    if (typeof _pid === 'string' && _pid) turnProjectId = _pid;
+  } catch { /* default scope */ }
 
   // First-turn replay: if the persistent session jsonl doesn't exist yet,
   // prepend a `<group-chat-history>` block built from the visibility slice
@@ -881,7 +892,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     // `write_file` tool; CLI agents have their own product-side
     // conventions and don't need that scoping. Override here:
     const userWorkspace = await import('../user_workspace');
-    const wsRoot = userWorkspace.getWorkspacePath(uid);
+    const wsRoot = userWorkspace.getWorkspacePath(uid, turnProjectId);
     // Coding agents (claude / codex) honour the per-conversation
     // `coding_project_dir` when set so the CLI runs inside the user's
     // actual project; non-coding CLIs always use the workspace. The
@@ -952,6 +963,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       agentName: 'orkas_chat',
       ...(actor.kind === 'agent' ? { agentId: actor.id } : {}),
       cid,
+      ...(turnProjectId ? { projectId: turnProjectId } : {}),
       onFileWritten,
       hasProducedPath,
       cacheRetention: 'short',

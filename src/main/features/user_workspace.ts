@@ -1,15 +1,37 @@
 /**
- * User Workspace — manages the user-facing working directory.
+ * User Workspace — manages the user-facing working directory(s).
  *
  * Each user can select a local directory as their "workspace" where agent
  * output, intermediate products, and final deliverables are stored. If no
  * directory has been chosen, the default `userWorkSpace/` folder (created at
  * startup by paths.ensureLayout) is used.
  *
- * The per-user selection is persisted in a JSON file under
- * `data/user_workspaces/<user_id>.json` so it survives restarts. The
- * Electron dialog for folder selection is triggered from IPC; this module
- * owns the config read/write + validation logic.
+ * **Scoped selection** (per CLAUDE.md §4 sync-domain split):
+ *   - The default scope (no project) keeps using the existing
+ *     `<uid>/local/workspace.json` config.
+ *   - Each project optionally pins its own workspace; conversations under a
+ *     project share that scope. Effective resolution:
+ *       conv.project_id → projects[pid]?.selectedPath
+ *                       ?? default.selectedPath
+ *                       ?? DEFAULT_USER_WORKSPACE
+ *
+ * The on-disk file goes from a flat
+ *   `{ selectedPath, recentPaths, updatedAt }`
+ * to a scoped object
+ *   `{ default: {selectedPath, recentPaths}, projects: {<pid>: {...}}, updatedAt }`
+ * — `_normaliseConfig` migrates the legacy shape on first read (no
+ * schema_version field; absence of `default` key is the migration signal).
+ *
+ * **Resolver shape**: `getWorkspacePath(uid, projectId?)` is **synchronous**.
+ * Callers that have a cid (file-tools, group_chat bus, etc.) thread the
+ * `project_id` through their opts pipeline rather than re-reading the conv
+ * index per tool call — group_chat resolves the projectId once at the top
+ * of `runTurn` and passes it down. IPC handlers that take `{cid?}` from the
+ * renderer perform the cid → projectId lookup at the IPC boundary (async
+ * there is fine — single hop) before calling the sync resolver.
+ *
+ * The Electron dialog for folder selection is triggered from IPC; this
+ * module owns the config read/write + validation logic.
  */
 
 import * as fs from 'node:fs';
@@ -20,42 +42,76 @@ import { DEFAULT_USER_WORKSPACE, userWorkspaceConfigFile } from '../paths';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
 import { pruneOrphans } from './file_indexer';
+import { getConversation } from './chats';
 
 const log = createLogger('user-workspace');
 
 // ── Config persistence ──────────────────────────────────────────────────
 
-/** Shape of the per-user workspace config file. */
-interface WorkspaceConfig {
-  /** Absolute path to the chosen directory (or empty → use default). */
+/** A single workspace selection entry — used for both the default scope and
+ *  per-project scopes. `selectedPath` empty means "fall back to next level"
+ *  (project → default → DEFAULT_USER_WORKSPACE). */
+interface ScopeEntry {
   selectedPath: string;
-  /** ISO timestamp of last change. */
-  updatedAt: string;
-  /** Recently used workspace paths (most recent first, excludes current & default). */
-  recentPaths?: string[];
+  recentPaths: string[];
 }
 
-// "Which folder did you pick" — stored in the user's local (non-synced) domain
-// at `<uid>/local/workspace.json`. Absolute paths are host-specific so this
-// must never leave the machine.
+interface WorkspaceConfig {
+  default: ScopeEntry;
+  projects: Record<string, ScopeEntry>;
+  updatedAt: string;
+}
+
 function configPath(userId: string): string {
   return userWorkspaceConfigFile(userId);
 }
 
 const MAX_RECENT = 5;
+const EMPTY_ENTRY: ScopeEntry = { selectedPath: '', recentPaths: [] };
+
+function _normaliseEntry(raw: any): ScopeEntry {
+  if (!raw || typeof raw !== 'object') return { ...EMPTY_ENTRY };
+  return {
+    selectedPath: typeof raw.selectedPath === 'string' ? raw.selectedPath : '',
+    recentPaths: Array.isArray(raw.recentPaths)
+      ? raw.recentPaths.filter((p: unknown) => typeof p === 'string')
+      : [],
+  };
+}
+
+/** Promote legacy flat `{selectedPath, recentPaths}` → scoped shape. */
+function _normaliseConfig(raw: any): WorkspaceConfig {
+  if (!raw || typeof raw !== 'object') {
+    return { default: { ...EMPTY_ENTRY }, projects: {}, updatedAt: '' };
+  }
+  if (raw.default && typeof raw.default === 'object') {
+    const projects: Record<string, ScopeEntry> = {};
+    if (raw.projects && typeof raw.projects === 'object') {
+      for (const [pid, entry] of Object.entries(raw.projects)) {
+        if (typeof pid === 'string') projects[pid] = _normaliseEntry(entry);
+      }
+    }
+    return {
+      default: _normaliseEntry(raw.default),
+      projects,
+      updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : '',
+    };
+  }
+  // Legacy flat shape — promote into `default`.
+  return {
+    default: _normaliseEntry(raw),
+    projects: {},
+    updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : '',
+  };
+}
 
 function readConfig(userId: string): WorkspaceConfig {
   const p = configPath(userId);
   try {
     const raw = fs.readFileSync(p, 'utf-8');
-    const obj = JSON.parse(raw);
-    return {
-      selectedPath: typeof obj.selectedPath === 'string' ? obj.selectedPath : '',
-      updatedAt: typeof obj.updatedAt === 'string' ? obj.updatedAt : '',
-      recentPaths: Array.isArray(obj.recentPaths) ? obj.recentPaths.filter((p: unknown) => typeof p === 'string') : [],
-    };
+    return _normaliseConfig(JSON.parse(raw));
   } catch {
-    return { selectedPath: '', updatedAt: '', recentPaths: [] };
+    return { default: { ...EMPTY_ENTRY }, projects: {}, updatedAt: '' };
   }
 }
 
@@ -67,96 +123,152 @@ function writeConfig(userId: string, cfg: WorkspaceConfig): void {
   fs.renameSync(tmp, p);
 }
 
-// ── Public API ──────────────────────────────────────────────────────────
+// ── Scope helpers ────────────────────────────────────────────────────────
 
-/**
- * Return the effective workspace path for a user. Falls back to the
- * default directory if nothing was selected or the selected path no longer
- * exists.
- */
-export function getWorkspacePath(userId: string): string {
-  const cfg = readConfig(userId);
-  if (cfg.selectedPath) {
+function _readEntry(cfg: WorkspaceConfig, projectId?: string): ScopeEntry {
+  if (projectId) {
+    return cfg.projects[projectId] || { ...EMPTY_ENTRY };
+  }
+  return cfg.default;
+}
+
+function _writeEntry(cfg: WorkspaceConfig, projectId: string | undefined, entry: ScopeEntry): WorkspaceConfig {
+  if (projectId) {
+    return {
+      ...cfg,
+      projects: { ...cfg.projects, [projectId]: entry },
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  return { ...cfg, default: entry, updatedAt: new Date().toISOString() };
+}
+
+/** Effective path for a given scope: project's selection (if any) → default's
+ *  selection (if any) → DEFAULT_USER_WORKSPACE. Validates each step exists
+ *  on disk; vanished selections fall through. */
+function _effectivePath(cfg: WorkspaceConfig, projectId?: string): string {
+  if (projectId) {
+    const entry = cfg.projects[projectId];
+    if (entry?.selectedPath) {
+      try {
+        if (fs.statSync(entry.selectedPath).isDirectory()) return entry.selectedPath;
+      } catch {
+        log.warn('project workspace path missing — falling back to default', {
+          projectId, path: entry.selectedPath,
+        });
+      }
+    }
+  }
+  if (cfg.default.selectedPath) {
     try {
-      const stat = fs.statSync(cfg.selectedPath);
-      if (stat.isDirectory()) return cfg.selectedPath;
+      if (fs.statSync(cfg.default.selectedPath).isDirectory()) return cfg.default.selectedPath;
     } catch {
-      // selected path is gone — fall through to default
-      log.warn('selected workspace path no longer exists, falling back to default', {
-        userId,
-        path: cfg.selectedPath,
+      log.warn('default workspace path missing — using DEFAULT_USER_WORKSPACE', {
+        path: cfg.default.selectedPath,
       });
     }
   }
   return DEFAULT_USER_WORKSPACE;
 }
 
+// ── Public API ──────────────────────────────────────────────────────────
+
 /**
- * Persist a user-chosen workspace path. The directory must exist.
- * Returns `{ ok: true, path }` or `{ ok: false, error }`.
+ * Synchronous resolver. `projectId` is optional — when omitted the default
+ * scope is used. Callers with a cid in scope should resolve cid → project_id
+ * once via `chats.getConversation` (async) and pass `projectId` through
+ * their downstream opts (group_chat does this at the top of runTurn,
+ * threading through ChatOptions / LocalToolsOpts / FileToolsOpts).
+ */
+export function getWorkspacePath(userId: string, projectId?: string): string {
+  const cfg = readConfig(userId);
+  return _effectivePath(cfg, projectId);
+}
+
+/**
+ * Async helper that does the cid → project_id lookup before calling the
+ * sync resolver. IPC handlers that take `{cid?}` from the renderer use
+ * this; main-side feature code that already knows the projectId should
+ * call `getWorkspacePath` directly.
+ */
+export async function resolveProjectIdForCid(userId: string, cid?: string): Promise<string | undefined> {
+  if (!cid) return undefined;
+  try {
+    const conv = await getConversation(userId, cid);
+    const pid = (conv as any)?.project_id;
+    return typeof pid === 'string' && pid ? pid : undefined;
+  } catch (err) {
+    log.warn(`resolveProjectIdForCid cid=${cid}: ${(err as Error).message}`);
+    return undefined;
+  }
+}
+
+/**
+ * Persist a user-chosen workspace path for a given scope. The directory
+ * must exist. Returns `{ ok: true, path }` or `{ ok: false, error }`.
  */
 export function setWorkspacePath(
   userId: string,
   dirPath: string,
+  projectId?: string,
 ): { ok: true; path: string } | { ok: false; error: string } {
   const resolved = path.resolve(dirPath);
   try {
     const stat = fs.statSync(resolved);
-    if (!stat.isDirectory()) {
-      return { ok: false, error: t('errors.path_not_dir') };
-    }
+    if (!stat.isDirectory()) return { ok: false, error: t('errors.path_not_dir') };
   } catch {
     return { ok: false, error: t('errors.dir_not_exists') };
   }
 
-  // Track the old path in recents (if it's not the default)
-  const oldCfg = readConfig(userId);
-  const recents = (oldCfg.recentPaths || []).slice();
-  if (oldCfg.selectedPath && oldCfg.selectedPath !== resolved) {
-    // Remove if already in recents, then prepend
-    const idx = recents.indexOf(oldCfg.selectedPath);
+  const cfg = readConfig(userId);
+  const oldEntry = _readEntry(cfg, projectId);
+
+  const recents = (oldEntry.recentPaths || []).slice();
+  if (oldEntry.selectedPath && oldEntry.selectedPath !== resolved) {
+    const idx = recents.indexOf(oldEntry.selectedPath);
     if (idx !== -1) recents.splice(idx, 1);
-    recents.unshift(oldCfg.selectedPath);
+    recents.unshift(oldEntry.selectedPath);
   }
-  // Also remove the new path from recents if present
   const newIdx = recents.indexOf(resolved);
   if (newIdx !== -1) recents.splice(newIdx, 1);
 
-  writeConfig(userId, {
+  const next = _writeEntry(cfg, projectId, {
     selectedPath: resolved,
-    updatedAt: new Date().toISOString(),
     recentPaths: recents.slice(0, MAX_RECENT),
   });
-  log.info('workspace path updated', { userId, path: resolved });
+  writeConfig(userId, next);
+  log.info('workspace path updated', { userId, projectId: projectId || '(default)', path: resolved });
   _sweepFileCacheForWorkspace(userId, resolved);
   return { ok: true, path: resolved };
 }
 
 /**
- * Reset to the default workspace directory.
+ * Reset the given scope's selection. After reset, the effective path falls
+ * through to the parent scope (project → default → DEFAULT_USER_WORKSPACE).
  */
-export function resetWorkspacePath(userId: string): { ok: true; path: string } {
-  const oldCfg = readConfig(userId);
-  const recents = (oldCfg.recentPaths || []).slice();
-  // Track old selection in recents if non-default
-  if (oldCfg.selectedPath) {
-    const idx = recents.indexOf(oldCfg.selectedPath);
+export function resetWorkspacePath(userId: string, projectId?: string): { ok: true; path: string } {
+  const cfg = readConfig(userId);
+  const oldEntry = _readEntry(cfg, projectId);
+
+  const recents = (oldEntry.recentPaths || []).slice();
+  if (oldEntry.selectedPath) {
+    const idx = recents.indexOf(oldEntry.selectedPath);
     if (idx !== -1) recents.splice(idx, 1);
-    recents.unshift(oldCfg.selectedPath);
+    recents.unshift(oldEntry.selectedPath);
   }
-  writeConfig(userId, {
+
+  const next = _writeEntry(cfg, projectId, {
     selectedPath: '',
-    updatedAt: new Date().toISOString(),
     recentPaths: recents.slice(0, MAX_RECENT),
   });
-  log.info('workspace path reset to default', { userId });
-  _sweepFileCacheForWorkspace(userId, DEFAULT_USER_WORKSPACE);
-  return { ok: true, path: DEFAULT_USER_WORKSPACE };
+  writeConfig(userId, next);
+
+  const effective = _effectivePath(next, projectId);
+  log.info('workspace path reset', { userId, projectId: projectId || '(default)', effective });
+  _sweepFileCacheForWorkspace(userId, effective);
+  return { ok: true, path: effective };
 }
 
-/** Workspace switched — drop file_cache entries whose source lives outside
- *  the new workspace. Fire-and-forget; cache pruning failure must not
- *  fail the user-visible "switch workspace" action. */
 function _sweepFileCacheForWorkspace(userId: string, workspacePath: string): void {
   pruneOrphans(userId, { workspacePath })
     .then((r) => {
@@ -170,24 +282,34 @@ function _sweepFileCacheForWorkspace(userId: string, workspacePath: string): voi
 }
 
 /**
- * Return full workspace info for rendering the dropdown:
- * current effective path, default path, and recent paths (validated).
+ * Return full workspace info for rendering the dropdown. `scope` tells the
+ * UI which bucket the chip is acting on so the chip tooltip can show
+ * context.
  */
-export function getWorkspaceInfo(userId: string): {
+export function getWorkspaceInfo(userId: string, projectId?: string): {
   currentPath: string;
   defaultPath: string;
   isDefault: boolean;
   recentPaths: string[];
+  scope: 'default' | 'project';
+  projectId?: string;
 } {
   const cfg = readConfig(userId);
-  const currentPath = getWorkspacePath(userId);
-  const isDefault = !cfg.selectedPath || currentPath === DEFAULT_USER_WORKSPACE;
-  // Filter recents: only keep directories that still exist and aren't current/default
-  const recentPaths = (cfg.recentPaths || []).filter(p => {
+  const entry = _readEntry(cfg, projectId);
+  const currentPath = _effectivePath(cfg, projectId);
+  const isDefault = !entry.selectedPath;
+  const recentPaths = (entry.recentPaths || []).filter((p) => {
     if (p === currentPath || p === DEFAULT_USER_WORKSPACE) return false;
     try { return fs.statSync(p).isDirectory(); } catch { return false; }
   });
-  return { currentPath, defaultPath: DEFAULT_USER_WORKSPACE, isDefault, recentPaths };
+  return {
+    currentPath,
+    defaultPath: DEFAULT_USER_WORKSPACE,
+    isDefault,
+    recentPaths,
+    scope: projectId ? 'project' : 'default',
+    ...(projectId ? { projectId } : {}),
+  };
 }
 
 /**
@@ -205,34 +327,42 @@ export async function selectDirectory(): Promise<string | null> {
 }
 
 /**
- * Sweep the active workspace root, removing any empty top-level
- * subdirectory. Existing empty per-conversation slug dirs (legacy from
- * before bash's cold-path rmdir-if-empty was added in `local-tools.ts`,
- * or any future tool that mkdir'd then produced nothing) get cleaned up
- * on every boot. Best-effort: any rmdir failure (non-empty / EACCES /
- * concurrent in-flight bash) is silently swallowed.
+ * Sweep every workspace root the user has selected (default + each
+ * per-project), removing any empty top-level subdirectory. Existing empty
+ * per-conversation slug dirs (legacy from before bash's cold-path
+ * rmdir-if-empty was added in `local-tools.ts`, or any future tool that
+ * mkdir'd then produced nothing) get cleaned up on every boot. Best-effort:
+ * any rmdir failure (non-empty / EACCES / concurrent in-flight bash) is
+ * silently swallowed.
  *
- * Only the immediate top level of the workspace is scanned; deeper
- * empty subdirs are the user's own scaffolding and out of scope.
+ * Only the immediate top level of each workspace is scanned; deeper empty
+ * subdirs are the user's own scaffolding and out of scope.
  */
 export function sweepEmptyConvDirs(userId: string): { swept: number } {
-  const root = getWorkspacePath(userId);
-  let swept = 0;
-  let entries: string[];
-  try { entries = fs.readdirSync(root); }
-  catch { return { swept: 0 }; }
-  for (const name of entries) {
-    if (name.startsWith('.')) continue;  // .DS_Store, .git, etc.
-    const sub = path.join(root, name);
-    try {
-      const st = fs.statSync(sub);
-      if (!st.isDirectory()) continue;
-      if (fs.readdirSync(sub).length !== 0) continue;
-      fs.rmdirSync(sub);
-      swept++;
-    } catch { /* best-effort */ }
+  const cfg = readConfig(userId);
+  const roots = new Set<string>();
+  roots.add(_effectivePath(cfg, undefined));
+  for (const pid of Object.keys(cfg.projects)) {
+    roots.add(_effectivePath(cfg, pid));
   }
-  if (swept > 0) log.info('swept empty workspace subdirs', { userId, swept, root });
+  let swept = 0;
+  for (const root of roots) {
+    let entries: string[];
+    try { entries = fs.readdirSync(root); }
+    catch { continue; }
+    for (const name of entries) {
+      if (name.startsWith('.')) continue;  // .DS_Store, .git, etc.
+      const sub = path.join(root, name);
+      try {
+        const st = fs.statSync(sub);
+        if (!st.isDirectory()) continue;
+        if (fs.readdirSync(sub).length !== 0) continue;
+        fs.rmdirSync(sub);
+        swept++;
+      } catch { /* best-effort */ }
+    }
+  }
+  if (swept > 0) log.info('swept empty workspace subdirs', { userId, swept, roots: Array.from(roots) });
   return { swept };
 }
 
@@ -243,8 +373,9 @@ export function sweepEmptyConvDirs(userId: string): { swept: number } {
  */
 export async function openWorkspaceInFileManager(
   userId: string,
+  projectId?: string,
 ): Promise<{ ok: true; path: string } | { ok: false; error: string }> {
-  const target = getWorkspacePath(userId);
+  const target = getWorkspacePath(userId, projectId);
   try {
     const stat = fs.statSync(target);
     if (!stat.isDirectory()) return { ok: false, error: t('errors.target_not_dir') };
@@ -257,4 +388,16 @@ export async function openWorkspaceInFileManager(
     return { ok: false, error: err };
   }
   return { ok: true, path: target };
+}
+
+/** Drop a project's per-project workspace entry from this user's
+ *  workspace.json. Called by `projects.deleteProject` cascade so deleting a
+ *  project doesn't leave a dangling pid → path entry on disk. */
+export function purgeProjectWorkspace(userId: string, projectId: string): void {
+  const cfg = readConfig(userId);
+  if (!cfg.projects[projectId]) return;
+  const next: WorkspaceConfig = { ...cfg, projects: { ...cfg.projects }, updatedAt: new Date().toISOString() };
+  delete next.projects[projectId];
+  try { writeConfig(userId, next); }
+  catch (err) { log.warn(`purge project ws user=${userId} pid=${projectId}: ${(err as Error).message}`); }
 }

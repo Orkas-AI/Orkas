@@ -63,6 +63,58 @@ function uiAlert(message) {
   return _uiShowDialog({ message, showCancel: false }).then(() => {});
 }
 
+// Danger-styled confirm: title + multi-line message + custom danger button
+// label. The primary button uses .btn-danger (red) so the user sees the
+// destructive action signed by the action wording itself. Used by the
+// project delete flow ("delete project + N conversations") — generic enough
+// to adopt for other irreversible actions later.
+//
+// Returns true if the user confirmed (clicked the danger button), false on
+// cancel / outside click / Esc.
+function uiConfirmDanger({ title, message, dangerLabel, cancelLabel } = {}) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay ui-dialog-overlay open';
+    const titleHtml = title ? `<div class="ui-dialog-title">${escapeHtml(String(title))}</div>` : '';
+    const msgHtml = escapeHtml(String(message || '')).replace(/\n/g, '<br />');
+    const cancelText = escapeHtml(cancelLabel || _dialogLabel('common.cancel', 'Cancel'));
+    const dangerText = escapeHtml(dangerLabel || _dialogLabel('common.confirm', 'Confirm'));
+    overlay.innerHTML = `
+      <div class="modal ui-dialog ui-dialog-danger" role="dialog" aria-modal="true">
+        ${titleHtml}
+        <div class="ui-dialog-message">${msgHtml}</div>
+        <div class="modal-actions">
+          <button class="btn" data-act="cancel">${cancelText}</button>
+          <button class="btn btn-danger" data-act="ok">${dangerText}</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    const okBtn = overlay.querySelector('[data-act="ok"]');
+    const cancelBtn = overlay.querySelector('[data-act="cancel"]');
+    const onKey = (e) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === 'Escape') finish(false);
+      // Enter does NOT auto-fire danger — the user must explicitly click
+      // the red button. Reduces accidental confirmation on irreversible
+      // actions. (Standard uiConfirm keeps Enter-to-confirm.)
+    };
+    const finish = (val) => {
+      document.removeEventListener('keydown', onKey, true);
+      overlay.remove();
+      resolve(val);
+    };
+    okBtn.addEventListener('click', () => finish(true));
+    cancelBtn.addEventListener('click', () => finish(false));
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) finish(false);
+    });
+    document.addEventListener('keydown', onKey, true);
+    setTimeout(() => cancelBtn.focus(), 0);  // focus cancel by default — safer
+  });
+}
+
 // Text-input prompt with cancel / confirm buttons. Returns the entered string, or
 // null on cancel. Mirrors native `prompt()` semantics.
 function uiPrompt(message, defaultValue = '') {

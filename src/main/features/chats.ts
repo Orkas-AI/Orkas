@@ -51,6 +51,12 @@ export interface Conversation {
    * agents in the group have their own per-(conv,agent) session ids derived
    * via state.buildGmemberSessionId. */
   session_id: string;
+  /** Optional project membership. Frozen at create time; not mutable after
+   *  creation. Empty / absent → conversation lives outside any project (the
+   *  default sidebar group). The project itself is just metadata —
+   *  `<cid>.jsonl`, `groupChatDir`, `chat_attachments`, and `session_id`
+   *  paths stay verbatim, so cid uniqueness + §5 isolation are unaffected. */
+  project_id?: string;
   created_at: string;
   updated_at: string;
   /** Derived from group_chat state.json at read time; never persisted on
@@ -153,10 +159,14 @@ export interface CreateConversationOptions {
   agentId?: string;
   skillId?: string;
   title?: string;
+  /** Optional project membership. Caller (IPC layer) is responsible for
+   *  validating the projectId exists for this user — chats.ts persists it
+   *  verbatim. */
+  projectId?: string;
 }
 
 export async function createConversation(userId: string, {
-  kind = 'normal', agentId = '', skillId = '', title = '',
+  kind = 'normal', agentId = '', skillId = '', title = '', projectId = '',
 }: CreateConversationOptions = {}): Promise<Conversation> {
   const cid = genConversationId();
   const conv: Conversation = {
@@ -166,6 +176,7 @@ export async function createConversation(userId: string, {
     agent_id: agentId || '',
     skill_id: skillId || '',
     session_id: buildGconvSessionId(userId, cid),
+    ...(projectId ? { project_id: projectId } : {}),
     created_at: nowIso(),
     updated_at: nowIso(),
   };
@@ -174,7 +185,7 @@ export async function createConversation(userId: string, {
   await saveConversations(userId, items);
   // Touch jsonl so subsequent reads don't 404.
   await fsp.writeFile(path.join(ensureUserDir(userId), `${cid}.jsonl`), '', { flag: 'a' });
-  log.info(`created user=${userId} cid=${cid} kind=${kind} agent=${agentId || '-'} skill=${skillId || '-'}`);
+  log.info(`created user=${userId} cid=${cid} kind=${kind} agent=${agentId || '-'} skill=${skillId || '-'} project=${projectId || '-'}`);
   return conv;
 }
 

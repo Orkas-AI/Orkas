@@ -18,6 +18,7 @@ import { ipcMain, dialog, BrowserWindow, type WebContents } from 'electron';
 
 import * as users from '../features/users';
 import * as chats from '../features/chats';
+import * as projects from '../features/projects';
 import * as groupChat from '../features/group_chat';
 import type { GroupEvent } from '../features/group_chat/bus';
 import * as agents from '../features/agents';
@@ -58,6 +59,23 @@ type StreamHandler = (
   signal: AbortSignal,
 ) => AsyncGenerator<any, void, unknown>;
 
+// Resolve the workspace scope hint a renderer payload carries. cid is
+// authoritative (conv.project_id is the truth, so a cid uniquely picks a
+// project); projectId is the fallback for commander-tab clicks where no cid
+// exists yet. Returns `undefined` for default scope.
+async function _resolveWorkspaceScope(
+  userId: string,
+  payload: any,
+): Promise<string | undefined> {
+  if (payload && typeof payload.cid === 'string' && payload.cid && safeId(payload.cid)) {
+    return await userWorkspace.resolveProjectIdForCid(userId, payload.cid);
+  }
+  if (payload && typeof payload.projectId === 'string' && payload.projectId && safeId(payload.projectId)) {
+    return payload.projectId;
+  }
+  return undefined;
+}
+
 // ── Invoke handlers ──────────────────────────────────────────────────────
 // Contract: `(payload, { userId, sender }) => result` where result is
 // merged into a `{ ok: true, ...result }` response. Throw to signal error.
@@ -93,8 +111,22 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     };
   },
 
-  'conversations.create': async ({ title = '' } = {}, ctx) => {
-    const conv = await chats.createConversation(ctx.userId, { kind: 'normal', title });
+  'conversations.create': async ({ title = '', projectId = '' } = {}, ctx) => {
+    // Validate the projectId belongs to this user before persisting it on
+    // the conv record. Unknown / invalid projectIds are dropped silently
+    // (the conv lands without project membership) — the renderer should
+    // not be able to put a conv into a project the backend doesn't know
+    // about, but a stale / since-deleted pid coming from the commander chip
+    // shouldn't fail the create either.
+    let validProjectId = '';
+    if (projectId && typeof projectId === 'string' && safeId(projectId)) {
+      if (await projects.projectExists(ctx.userId, projectId)) validProjectId = projectId;
+    }
+    const conv = await chats.createConversation(ctx.userId, {
+      kind: 'normal',
+      title,
+      ...(validProjectId ? { projectId: validProjectId } : {}),
+    });
     return { conversation: conv };
   },
 
@@ -107,6 +139,31 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'conversations.deleteAll': async (_args, ctx) => {
     const deleted = await chats.deleteAllConversations(ctx.userId);
     return { deleted };
+  },
+
+  // ── Projects (logical groups of conversations + scoped workspace) ──
+  'projects.list': async (_payload, ctx) => {
+    return { projects: await projects.listProjects(ctx.userId) };
+  },
+
+  'projects.create': async ({ name }, ctx) => {
+    const result = await projects.createProject(ctx.userId, name);
+    if (!result.ok) throw new Error((result as { error: string }).error);
+    return { project: result.project };
+  },
+
+  'projects.rename': async ({ projectId, name }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    const result = await projects.renameProject(ctx.userId, projectId, name);
+    if (!result.ok) throw new Error((result as { error: string }).error);
+    return { project: result.project };
+  },
+
+  'projects.delete': async ({ projectId }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    const result = await projects.deleteProject(ctx.userId, projectId);
+    if (!result.ok) throw new Error((result as { error: string }).error);
+    return { deleted_convs: result.deleted_convs };
   },
 
   // ── Group chat (replaces legacy conversations.send / .stream / .markFormSubmitted) ──
@@ -567,28 +624,42 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // ── User workspace (working directory) ──
-  'workspace.get': async (_payload, ctx) => {
-    return { path: userWorkspace.getWorkspacePath(ctx.userId) };
+  // Workspace handlers accept an optional scope hint:
+  //   `{ cid }`        → main resolves cid → conv.project_id → scope
+  //   `{ projectId }`  → renderer-supplied scope (commander tab project chip,
+  //                      where there's no cid yet)
+  //   neither          → default scope
+  // When both are passed, cid takes precedence (it's the authoritative source
+  // — conv.project_id is the truth). Project membership is frozen at conv
+  // create time, so `cid → projectId` is a stable mapping.
+  'workspace.get': async (payload, ctx) => {
+    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
+    return { path: userWorkspace.getWorkspacePath(ctx.userId, projectId) };
   },
-  'workspace.getInfo': async (_payload, ctx) => {
-    return userWorkspace.getWorkspaceInfo(ctx.userId);
+  'workspace.getInfo': async (payload, ctx) => {
+    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
+    return userWorkspace.getWorkspaceInfo(ctx.userId, projectId);
   },
-  'workspace.set': async ({ path }, ctx) => {
-    if (!path || typeof path !== 'string') throw new Error('missing path');
-    const result = userWorkspace.setWorkspacePath(ctx.userId, path);
+  'workspace.set': async (payload, ctx) => {
+    const target = payload?.path;
+    if (!target || typeof target !== 'string') throw new Error('missing path');
+    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
+    const result = userWorkspace.setWorkspacePath(ctx.userId, target, projectId);
     if (!result.ok) throw new Error((result as any).error);
     return { path: result.path };
   },
-  'workspace.reset': async (_payload, ctx) => {
-    const result = userWorkspace.resetWorkspacePath(ctx.userId);
+  'workspace.reset': async (payload, ctx) => {
+    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
+    const result = userWorkspace.resetWorkspacePath(ctx.userId, projectId);
     return { path: result.path };
   },
   'workspace.selectDirectory': async () => {
     const selected = await userWorkspace.selectDirectory();
     return { path: selected };
   },
-  'workspace.openPath': async (_payload, ctx) => {
-    const result = await userWorkspace.openWorkspaceInFileManager(ctx.userId);
+  'workspace.openPath': async (payload, ctx) => {
+    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
+    const result = await userWorkspace.openWorkspaceInFileManager(ctx.userId, projectId);
     if (!result.ok) throw new Error((result as { ok: false; error: string }).error);
     return { path: result.path };
   },
@@ -597,11 +668,13 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // Explorer on Windows, default file manager on Linux). The path MUST
   // sit inside the active user's workspace — outside paths are refused
   // so a malicious / buggy LLM-emitted path can't pop arbitrary folders.
-  'workspace.revealPath': async ({ path: target }, ctx) => {
+  'workspace.revealPath': async (payload, ctx) => {
+    const target = payload?.path;
     if (typeof target !== 'string' || !target) {
       throw new Error('missing path');
     }
-    const ws = userWorkspace.getWorkspacePath(ctx.userId);
+    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
+    const ws = userWorkspace.getWorkspacePath(ctx.userId, projectId);
     const norm = path.resolve(target);
     const wsNorm = path.resolve(ws);
     if (!norm.startsWith(wsNorm + path.sep) && norm !== wsNorm) {

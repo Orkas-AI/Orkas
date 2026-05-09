@@ -285,9 +285,21 @@ function onEnterNewChatView() {
   const hasDraft = !!(input && input.value);
   if (!hasDraft) _newChatRecipient = { ..._COMMANDER };
   _renderRecipientChip('new-chat');
+  // Project chip lives in projects.js — restore the last manual pick
+  // (lastProject localStorage) and refresh the workspace chip's scope.
+  if (typeof onEnterCommanderProjectChip === 'function') onEnterCommanderProjectChip();
 }
 function onEnterConversationView() {
   _renderRecipientChip('conversation');
+  // Workspace chip scope follows the active conv's project (resolved on
+  // main side via cid → conv.project_id). Refresh whenever a conv mounts.
+  if (typeof refreshWorkspaceChip === 'function') refreshWorkspaceChip();
+  // One-shot auto-expand: if the conv we just entered belongs to a
+  // project, surface the project's row in the sidebar. Skipped when the
+  // project is already expanded; manual user collapse on subsequent
+  // renders is preserved (the auto-expand does not run inside
+  // renderProjectsSection — see comments in projects.js).
+  if (typeof autoExpandActiveConvProject === 'function') autoExpandActiveConvProject();
   // Kick a one-shot evaluation so that a cid mid-plan picks up its current
   // interactive assignee even if no plan_changed/state_changed event fires
   // before the user types. View-enter never reverts to commander (see
@@ -1169,12 +1181,21 @@ function _bumpConvToTop(cid) {
 
 function renderConversationList() {
   const container = document.getElementById('conversation-list');
-  if (!conversations.length) {
+  // Conversations with a project_id are rendered nested under their project
+  // by `projects.js::renderProjectsSection`. The "Conversations" section
+  // here only shows the unprojected ones — same data model as the user's
+  // mental picture (projected convs live "inside" their project, the rest
+  // sit in the catch-all section).
+  const unprojected = (conversations || []).filter((c) => !c || !c.project_id);
+  if (!unprojected.length) {
     container.innerHTML = `<div class="conv-empty" data-i18n="sidebar.conv_empty">${escapeHtml(t('sidebar.conv_empty'))}</div>`;
+    // Still re-render the projects section so its badges refresh (the call
+    // is cheap when the cache is already loaded).
+    if (typeof renderProjectsSection === 'function') renderProjectsSection();
     return;
   }
   const delTitle = escapeHtml(t('chat.conv_del_title'));
-  container.innerHTML = conversations.map(c => {
+  container.innerHTML = unprojected.map(c => {
     // All conversations are now the single `normal` kind — no type badge.
     const title = escapeHtml(c.title || t('chat.new_conv_title'));
     return `
@@ -1204,7 +1225,13 @@ function renderConversationList() {
     });
   });
 
-  // Reapply pending / queued status badges after the DOM was re-rendered.
+  // Re-render the projects section (it consumes the same `conversations`
+  // global to group projected items by project).
+  if (typeof renderProjectsSection === 'function') renderProjectsSection();
+
+  // Reapply pending / queued status badges after the DOM was re-rendered
+  // (covers both the unprojected list and the projects section's nested
+  // conv items, since the helper queries by cid only).
   _refreshAllConvBadges();
 }
 
@@ -1929,6 +1956,11 @@ async function handleNewChatSubmit() {
   // Snapshot the new-chat recipient *now* so a stray view-change between
   // here and conv-create doesn't reset it before we can transfer.
   _pendingNewChatRecipient = { ..._newChatRecipient };
+  // Same pattern for the commander project chip — capture before any
+  // view-change so the freshly-created conv inherits the picked project.
+  if (typeof _captureCommanderProjectForNewChat === 'function') {
+    _captureCommanderProjectForNewChat();
+  }
   const content = applyRecipientPrefix(transformWithSkill(raw, skill), 'new-chat');
   const draftItems = _chatAttachList(DRAFT_CID);
   if (draftItems.some((a) => a.status === 'uploading')) {
@@ -1950,10 +1982,13 @@ async function handleNewChatSubmit() {
   if (newBtn) newBtn.disabled = true;
   let convId;
   try {
+    const projectId = (typeof _consumeCommanderProjectForNewChat === 'function')
+      ? _consumeCommanderProjectForNewChat()
+      : '';
     const res = await apiFetch('/api/conversations/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ kind: 'normal' }),
+      body: JSON.stringify({ kind: 'normal', ...(projectId ? { projectId } : {}) }),
     });
     const data = await res.json();
     if (!data.ok) throw new Error(data.error || t('chat.create_conv_failed'));
@@ -1966,6 +2001,9 @@ async function handleNewChatSubmit() {
     conv.title = _autoTitle(raw);
     conversations.unshift(conv);
     renderConversationList();
+    // The new conv may have landed inside a project — refresh the projects
+    // cache so its conv_count reflects the new total. Cheap (single IPC).
+    if (projectId && typeof loadProjects === 'function') loadProjects(true);
   } catch (e) {
     await uiAlert(t('chat.create_conv_failed_with_reason', { reason: e.message || e }));
     if (newBtn) newBtn.disabled = false;

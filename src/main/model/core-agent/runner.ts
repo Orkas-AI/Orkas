@@ -75,6 +75,11 @@ export interface BuildRunnerParams {
    *  / process_file_full calls whose path targets the attachment dir of the
    *  current conv. */
   cid?: string;
+  /** Project id of the conversation, when it belongs to one. Threaded
+   *  through to local-tools / file-tools / image-gen-tool so workspace
+   *  resolution picks up the project-scoped selection. Resolved once at
+   *  the top of group_chat::runTurn from `conv.project_id`. */
+  projectId?: string;
   /** Agent id bound to the conversation. Empty/undefined = default scope. */
   agentId?: string;
 
@@ -199,6 +204,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const localTools = createLocalTools({
     ...(uid ? { userId: uid } : {}),
     ...(params.cid ? { cid: params.cid } : {}),
+    ...(params.projectId ? { projectId: params.projectId } : {}),
     ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
     ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
     ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
@@ -216,6 +222,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ? createFileTools({
         userId: uid,
         ...(params.cid ? { cid: params.cid } : {}),
+        ...(params.projectId ? { projectId: params.projectId } : {}),
         ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
         ...(params.readOnlyExtraRoots?.length ? { readOnlyExtraRoots: params.readOnlyExtraRoots } : {}),
       })
@@ -236,6 +243,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ? [createImageGenTool({
         userId: uid,
         ...(params.cid ? { cid: params.cid } : {}),
+        ...(params.projectId ? { projectId: params.projectId } : {}),
         ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
         ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
       })]

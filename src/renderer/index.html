@@ -27,7 +27,17 @@
         <button class="sidebar-btn" id="skills-btn" data-i18n="sidebar.skills">Skills</button>
         <button class="sidebar-btn" id="contexts-btn" data-i18n="sidebar.contexts">Knowledge</button>
       </div>
-      <div class="sidebar-section">
+      <div class="sidebar-section sidebar-projects-section">
+        <div class="sidebar-section-title-row">
+          <span class="sidebar-section-title" data-i18n="sidebar.projects">Projects</span>
+          <button class="sidebar-section-add" id="projects-add-btn"
+                  data-i18n-title="sidebar.project_create_title"
+                  data-i18n-aria-label="sidebar.project_create_title"
+                  title="New project" aria-label="New project">+</button>
+        </div>
+        <div class="projects-list" id="projects-list"></div>
+      </div>
+      <div class="sidebar-section sidebar-conversations-section">
         <div class="sidebar-section-title" data-i18n="sidebar.conversations">Conversations</div>
         <div class="conversation-list" id="conversation-list">
           <div class="conv-empty" data-i18n="sidebar.conv_empty">No conversations yet</div>
@@ -52,13 +62,12 @@
           <div class="new-chat-subtitle" data-i18n="new_chat.subtitle">Type your question or task</div>
           <div class="new-chat-input-wrapper">
             <div class="new-chat-input-area">
-              <!-- Floats above the input box. Attachments + workspace chip
-                   share one flex row: attachments wrap on the left, chip
-                   pinned right. Chip stays anchored to input-area's top
-                   regardless of attachment count. -->
+              <!-- Floats above the input box. Attachments wrap on the left;
+                   the workspace chip moved into .chat-bottom-bar below
+                   (next to recipient / project chips) so the overlay only
+                   carries attachments now. -->
               <div class="chat-input-overlay">
                 <div class="chat-attachments" id="new-chat-attachments" style="display:none"></div>
-                <div class="chat-input-toolbar"></div>
               </div>
               <textarea id="new-chat-input" data-i18n-placeholder="new_chat.input_placeholder" placeholder="Type a message..." rows="2"></textarea>
               <div class="chat-bottom-bar">
@@ -66,6 +75,13 @@
                 <button type="button" class="chat-recipient-chip" id="new-chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Switch recipient (commander / agent)">
                   <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
                   <span class="chat-recipient-name" id="new-chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
+                </button>
+                <button type="button" class="chat-project-chip" id="new-chat-project-chip" data-i18n-title="chat.project_picker_title" title="Pick project">
+                  <span class="chat-project-prefix" data-i18n="chat.project_label">Project: </span>
+                  <span class="chat-project-name" id="new-chat-project-name" data-i18n="chat.project_none">None</span>
+                  <svg class="chat-project-chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5">
+                    <polyline points="6 9 12 15 18 9"/>
+                  </svg>
                 </button>
                 <div class="chat-skill-chip" id="new-chat-skill-chip" data-target="new-chat" style="display:none">
                   <span class="chip-label"></span>
@@ -97,15 +113,14 @@
               <div class="chat-queue-list" id="chat-queue-list"></div>
             </div>
             <div class="chat-input-area">
-              <!-- Floats above the input box. Attachments + workspace chip
-                   share one flex row: attachments wrap on the left, chip
-                   pinned right. Chip stays anchored to input-area's top
-                   regardless of attachment count. -->
+              <!-- Floats above the input box. Plan rail anchors left, attachments
+                   wrap to its right. The workspace chip moved into
+                   .chat-bottom-bar below (next to the recipient chip) so
+                   the overlay no longer holds it. -->
               <div class="chat-input-overlay">
-                <!-- Plan rail floats at left, mirroring the workspace chip
-                     on the right. Self-hides when current cid has no plan.
-                     Expanded body opens UPWARD (bottom: 100%) over the
-                     chat-history. See modules/plan-rail.js. -->
+                <!-- Plan rail floats at left. Self-hides when current cid has
+                     no plan. Expanded body opens UPWARD (bottom: 100%) over
+                     the chat-history. See modules/plan-rail.js. -->
                 <div id="plan-rail" class="plan-rail" style="display:none">
                   <div class="plan-rail-header" data-i18n-title="plan.toggle_title" title="Collapse / Expand">
                     <span class="plan-rail-title">📋 <span data-i18n="plan.title">Execution Plan</span></span>
@@ -115,7 +130,6 @@
                   <div class="plan-rail-body" id="plan-rail-body"></div>
                 </div>
                 <div class="chat-attachments" id="chat-attachments" style="display:none"></div>
-                <div class="chat-input-toolbar"></div>
               </div>
               <div class="chat-quote-preview" id="chat-quote-preview" style="display:none"></div>
               <textarea id="chat-input" data-i18n-placeholder="chat.input_placeholder" placeholder="Continue the conversation..." rows="2"></textarea>
@@ -759,6 +773,7 @@
   <script src="./modules/chat-input-form.js"></script>
   <script src="./modules/chat-lightbox.js"></script>
   <script src="./modules/strip-structural-blocks.js"></script>
+  <script src="./modules/projects.js"></script>
   <script src="./modules/conversation.js"></script>
   <script src="./modules/plan-rail.js"></script>
   <script src="./modules/queue-draft.js"></script>

@@ -12,6 +12,7 @@ async function bootApp() {
   // Avatar catalog must be ready before loadAgents (which triggers card rendering).
   await initAvatarCatalog();
   await refreshModelGuard();
+  await loadProjects();
   await loadConversations();
   await loadAgents();
   // Warm the commander avatar cache so the first chat render doesn't fall

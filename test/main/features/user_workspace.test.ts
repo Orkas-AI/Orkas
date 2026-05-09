@@ -164,6 +164,134 @@ describe('user_workspace › selectDirectory (mocked)', () => {
   });
 });
 
+// ── Scoped workspace (default vs per-project) — added with the projects
+//    feature. workspace.json moved from flat
+//    `{selectedPath, recentPaths, updatedAt}` → scoped
+//    `{default:{...}, projects:{<pid>:{...}}, updatedAt}`. Legacy flat is
+//    promoted into `default` on first read; project scope falls back to
+//    default when not set; deleting a project must remove its bucket.
+describe('user_workspace › scoped (projects)', () => {
+  it('legacy flat config is promoted into `default` on first read', async () => {
+    const ws = await import('../../../src/main/features/user_workspace');
+    const cfgFile = path.join(tmpDir, 'userMig', 'local', 'workspace.json');
+    fs.mkdirSync(path.dirname(cfgFile), { recursive: true });
+    const dir = path.join(tmpDir, 'legacy-ws');
+    fs.mkdirSync(dir, { recursive: true });
+    // Hand-craft a legacy flat shape (pre-projects schema).
+    fs.writeFileSync(cfgFile, JSON.stringify({
+      selectedPath: dir,
+      updatedAt: '2026-01-01T00:00:00',
+      recentPaths: [],
+    }));
+    // Default scope must read the promoted value back.
+    expect(ws.getWorkspacePath('userMig')).toBe(dir);
+    // Trigger a write so the file is rewritten in scoped shape, then
+    // assert the on-disk schema upgraded.
+    const dir2 = path.join(tmpDir, 'legacy-ws2');
+    fs.mkdirSync(dir2, { recursive: true });
+    const r = ws.setWorkspacePath('userMig', dir2);
+    expect(r.ok).toBe(true);
+    const after = JSON.parse(fs.readFileSync(cfgFile, 'utf-8'));
+    expect(after.default.selectedPath).toBe(dir2);
+    // Legacy `selectedPath` at the root is gone — value lives under
+    // `default` now.
+    expect(after.selectedPath).toBeUndefined();
+    expect(after.projects).toEqual({});
+  });
+
+  it('project scope falls through to default when no project selection is set', async () => {
+    const ws = await import('../../../src/main/features/user_workspace');
+    const defaultDir = path.join(tmpDir, 'def-ws');
+    fs.mkdirSync(defaultDir, { recursive: true });
+    ws.setWorkspacePath('userScope', defaultDir);
+    // No call yet for projectId='p_aaaa1111' → effective path is the
+    // default selection (which itself falls through to DEFAULT_USER_WORKSPACE
+    // only when default is also unset).
+    expect(ws.getWorkspacePath('userScope', 'p_aaaa1111')).toBe(defaultDir);
+  });
+
+  it('project scope wins over default when explicitly set', async () => {
+    const ws = await import('../../../src/main/features/user_workspace');
+    const defaultDir = path.join(tmpDir, 'def');
+    const projDir = path.join(tmpDir, 'proj');
+    fs.mkdirSync(defaultDir, { recursive: true });
+    fs.mkdirSync(projDir, { recursive: true });
+
+    ws.setWorkspacePath('userScope2', defaultDir);
+    ws.setWorkspacePath('userScope2', projDir, 'p_b0b0');
+
+    expect(ws.getWorkspacePath('userScope2')).toBe(defaultDir);
+    expect(ws.getWorkspacePath('userScope2', 'p_b0b0')).toBe(projDir);
+  });
+
+  it('per-scope recents are independent', async () => {
+    const ws = await import('../../../src/main/features/user_workspace');
+    const defA = path.join(tmpDir, 'defA');
+    const defB = path.join(tmpDir, 'defB');
+    const projA = path.join(tmpDir, 'projA');
+    const projB = path.join(tmpDir, 'projB');
+    [defA, defB, projA, projB].forEach((d) => fs.mkdirSync(d, { recursive: true }));
+
+    ws.setWorkspacePath('userR', defA);
+    ws.setWorkspacePath('userR', defB);                 // defA → default.recents
+    ws.setWorkspacePath('userR', projA, 'p_recents');
+    ws.setWorkspacePath('userR', projB, 'p_recents');   // projA → projects[p_recents].recents
+
+    const defInfo = ws.getWorkspaceInfo('userR');
+    const projInfo = ws.getWorkspaceInfo('userR', 'p_recents');
+    expect(defInfo.recentPaths).toContain(defA);
+    expect(defInfo.recentPaths).not.toContain(projA);
+    expect(projInfo.recentPaths).toContain(projA);
+    expect(projInfo.recentPaths).not.toContain(defA);
+  });
+
+  it('reset on project scope falls through to default; default scope intact', async () => {
+    const ws = await import('../../../src/main/features/user_workspace');
+    const defaultDir = path.join(tmpDir, 'reset-def');
+    const projDir = path.join(tmpDir, 'reset-proj');
+    fs.mkdirSync(defaultDir, { recursive: true });
+    fs.mkdirSync(projDir, { recursive: true });
+
+    ws.setWorkspacePath('userReset', defaultDir);
+    ws.setWorkspacePath('userReset', projDir, 'p_reset0');
+    expect(ws.getWorkspacePath('userReset', 'p_reset0')).toBe(projDir);
+
+    ws.resetWorkspacePath('userReset', 'p_reset0');
+    // Project scope now falls through to default.
+    expect(ws.getWorkspacePath('userReset', 'p_reset0')).toBe(defaultDir);
+    // Default scope unchanged.
+    expect(ws.getWorkspacePath('userReset')).toBe(defaultDir);
+  });
+
+  it('getWorkspaceInfo returns scope=project when projectId given, default otherwise', async () => {
+    const ws = await import('../../../src/main/features/user_workspace');
+    const defInfo = ws.getWorkspaceInfo('userS');
+    expect(defInfo.scope).toBe('default');
+    expect(defInfo.projectId).toBeUndefined();
+    const projInfo = ws.getWorkspaceInfo('userS', 'p_scope1');
+    expect(projInfo.scope).toBe('project');
+    expect(projInfo.projectId).toBe('p_scope1');
+  });
+
+  it('purgeProjectWorkspace removes only that project bucket', async () => {
+    const ws = await import('../../../src/main/features/user_workspace');
+    const dir1 = path.join(tmpDir, 'pwA');
+    const dir2 = path.join(tmpDir, 'pwB');
+    fs.mkdirSync(dir1, { recursive: true });
+    fs.mkdirSync(dir2, { recursive: true });
+    ws.setWorkspacePath('userPurge', dir1, 'p_keep');
+    ws.setWorkspacePath('userPurge', dir2, 'p_drop');
+
+    ws.purgeProjectWorkspace('userPurge', 'p_drop');
+
+    expect(ws.getWorkspacePath('userPurge', 'p_keep')).toBe(dir1);
+    // p_drop's bucket gone — falls through to default (which is unset →
+    // DEFAULT_USER_WORKSPACE).
+    const p = await import('../../../src/main/paths');
+    expect(ws.getWorkspacePath('userPurge', 'p_drop')).toBe(p.DEFAULT_USER_WORKSPACE);
+  });
+});
+
 describe('user_workspace › openWorkspaceInFileManager', () => {
   it('invokes shell.openPath with the current workspace directory', async () => {
     const { shell } = await import('electron');

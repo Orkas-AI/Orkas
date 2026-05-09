@@ -81,6 +81,11 @@ export interface ChatOptions {
    *  read_file / search_files / grep_files scope to this conv's attachment
    *  dir in addition to the user's active workspace. */
   cid?: string;
+  /** Project id of the conversation, when it belongs to one. Threaded
+   *  through to local-tools / file-tools / image-gen-tool so workspace
+   *  resolution picks up the project-scoped selection. Caller (group_chat
+   *  or skill/agent edit) resolves it once before invoking. */
+  projectId?: string;
   /** Extra absolute directory roots whitelisted for file-tools on top of
    *  workspace + attachment. Read AND write are permitted under these roots.
    *  Per-skill edit chats pass the skill dir so the LLM can read / search /

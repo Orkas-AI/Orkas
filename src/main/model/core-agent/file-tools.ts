@@ -85,6 +85,11 @@ export interface FileToolsOpts {
    *  channels for those resources, and a sandbox-level lock keeps the LLM
    *  honest even when its prompt strays. */
   readOnlyExtraRoots?: readonly string[];
+  /** Project id of the current conversation, when it belongs to one.
+   *  Threaded through from group_chat at runTurn so workspace resolution
+   *  picks up the project-scoped selection (per CLAUDE.md projects feature).
+   *  Empty / missing → default-scope workspace. */
+  projectId?: string;
 }
 
 /** Assemble the allowed-roots list for the current (uid, cid). File-tools
@@ -92,7 +97,7 @@ export interface FileToolsOpts {
 function allowedRoots(opts: FileToolsOpts): string[] {
   const roots: string[] = [];
   try {
-    const ws = getWorkspacePath(opts.userId);
+    const ws = getWorkspacePath(opts.userId, opts.projectId);
     if (ws) roots.push(ws);
   } catch (err) { log.warn(`resolve workspace: ${(err as Error).message}`); }
   if (opts.cid) {
@@ -404,7 +409,7 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
 
       const rootKinds: Array<{ root: string; source: 'attachment' | 'workspace' }> = [];
       try {
-        rootKinds.push({ root: getWorkspacePath(opts.userId), source: 'workspace' });
+        rootKinds.push({ root: getWorkspacePath(opts.userId, opts.projectId), source: 'workspace' });
       } catch { /* workspace unavailable → skip */ }
       if (opts.cid) {
         rootKinds.push({ root: chatAttachmentDir(opts.userId, opts.cid), source: 'attachment' });
@@ -526,7 +531,7 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
       }
 
       const rootKinds: Array<{ root: string; source: 'attachment' | 'workspace' }> = [];
-      try { rootKinds.push({ root: getWorkspacePath(opts.userId), source: 'workspace' }); }
+      try { rootKinds.push({ root: getWorkspacePath(opts.userId, opts.projectId), source: 'workspace' }); }
       catch { /* workspace unavailable */ }
       if (opts.cid) rootKinds.push({ root: chatAttachmentDir(opts.userId, opts.cid), source: 'attachment' });
       if (!rootKinds.length) {
