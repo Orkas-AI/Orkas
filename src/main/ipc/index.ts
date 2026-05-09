@@ -104,6 +104,11 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { deleted: ok };
   },
 
+  'conversations.deleteAll': async (_args, ctx) => {
+    const deleted = await chats.deleteAllConversations(ctx.userId);
+    return { deleted };
+  },
+
   // ── Group chat (replaces legacy conversations.send / .stream / .markFormSubmitted) ──
   'groupChat.send': async ({ cid, content, attachments }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');

@@ -256,6 +256,26 @@ export async function getMessages(userId: string, cid: string, limit = 200): Pro
   return readJsonl<MessageRecord>(path.join(ensureUserDir(userId), `${cid}.jsonl`), limit);
 }
 
+/** Drop every conversation belonging to `userId`. Loops `deleteConversation`
+ *  so the full cascade (group dir / main jsonl / sessions / attachments / CLI
+ *  / search index) runs per cid; one cid's failure doesn't abort the rest.
+ *  Returns the number actually removed. Used by Settings → "Clear all
+ *  conversations". */
+export async function deleteAllConversations(userId: string): Promise<number> {
+  const items = await listConversations(userId);
+  if (!items.length) return 0;
+  let deleted = 0;
+  for (const c of items) {
+    try {
+      if (await deleteConversation(userId, c.conversation_id)) deleted++;
+    } catch (err) {
+      log.warn(`bulk-delete failed user=${userId} cid=${c.conversation_id}: ${(err as Error).message}`);
+    }
+  }
+  log.info(`deleted-all user=${userId} count=${deleted}`);
+  return deleted;
+}
+
 /** Drop every conversation tied to `agentId` across every user. Called when
  *  a custom agent is deleted. */
 export async function deleteConversationsByAgent(agentId: string): Promise<number> {
