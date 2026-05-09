@@ -518,6 +518,16 @@
 
             <div class="settings-group">
               <div class="settings-group-head">
+                <div class="settings-group-title" data-i18n="settings.data_root.title">Data root</div>
+                <div class="settings-group-sub" data-i18n="settings.data_root.sub">All conversations, agents, skills, and KB content live under this directory. Click the path to open it in the OS file manager.</div>
+              </div>
+              <div class="settings-row">
+                <button class="btn btn-sm" id="settings-data-root-btn" type="button" title="" data-i18n-title="settings.data_root.open_tooltip"><span id="settings-data-root-path" class="muted"></span></button>
+              </div>
+            </div>
+
+            <div class="settings-group">
+              <div class="settings-group-head">
                 <div class="settings-group-title" data-i18n="settings.clear_all_convs.title">Clear all conversations</div>
                 <div class="settings-group-sub" data-i18n="settings.clear_all_convs.sub">Removes every conversation and its associated message history, attachments, plan, sessions, and search index entries — same cascade as clicking × on a single conversation, applied to all of them. Skills and agents are NOT touched.</div>
               </div>

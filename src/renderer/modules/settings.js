@@ -33,6 +33,7 @@ async function loadSettings() {
     _settingsRefreshImageProfiles(),
     _settingsRefreshCommanderAvatar(),
     _settingsRefreshMetacognition(),
+    _settingsRefreshDataRoot(),
   ]);
   _settingsRenderPicker();
   _settingsRenderEntries();
@@ -41,6 +42,7 @@ async function loadSettings() {
   _settingsRenderImageSection();
   _settingsRenderCommanderAvatar();
   _settingsRenderMetacognition();
+  _settingsRenderDataRoot();
 }
 
 // ── Commander avatar ──
@@ -194,6 +196,36 @@ function _settingsRenderMetacognition() {
       }
     });
     cb.dataset.bound = '1';
+  }
+}
+
+// ── Data root row ──
+// Read-only display of the unified data root path; click to open it in
+// the OS file manager via the `app.openDataRoot` IPC.
+
+async function _settingsRefreshDataRoot() {
+  try {
+    const res = await window.orkas.invoke('app.dataRootPath');
+    _settingsState.dataRoot = (res && res.ok && res.path) ? String(res.path) : '';
+  } catch (_) {
+    _settingsState.dataRoot = '';
+  }
+}
+
+function _settingsRenderDataRoot() {
+  const btn = document.getElementById('settings-data-root-btn');
+  const span = document.getElementById('settings-data-root-path');
+  if (!btn || !span) return;
+  span.textContent = _settingsState.dataRoot || '';
+  if (!btn.dataset.bound) {
+    btn.addEventListener('click', async () => {
+      try {
+        await window.orkas.invoke('app.openDataRoot');
+      } catch (err) {
+        _settingsLog.warn('open data root failed', { error: (err && err.message) || String(err) });
+      }
+    });
+    btn.dataset.bound = '1';
   }
 }
 

@@ -43,6 +43,7 @@ import { createLogger, logFromRenderer } from '../logger';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { shell } from 'electron';
+import { WS_ROOT } from '../paths';
 
 const log = createLogger('ipc');
 
@@ -683,6 +684,20 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!fs.existsSync(norm)) throw new Error('file not found');
     shell.showItemInFolder(norm);
     return { path: norm };
+  },
+
+  // Read the install data root (`<container>/data`) — read-only display
+  // for the settings page "Data root" row. WS_ROOT is process-stable so
+  // no async work is needed.
+  'app.dataRootPath': async () => ({ ok: true, path: WS_ROOT }),
+
+  // Open the install data root in the OS file manager. WS_ROOT is the
+  // only path this opens — no caller-supplied path, so no sandbox check.
+  'app.openDataRoot': async () => {
+    const target = WS_ROOT;
+    if (!fs.existsSync(target)) throw new Error('data root not found');
+    shell.openPath(target);
+    return { ok: true, path: target };
   },
 
   // Local CLI agent discovery (claude / codex / openclaw / opencode / hermes).
