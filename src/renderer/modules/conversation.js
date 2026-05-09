@@ -1304,13 +1304,19 @@ async function loadConversationHistory(cid) {
     // resolve agent_id → name. Without the await we'd briefly show
     // generic "agent" placeholders on first paint and have to repaint on refresh, which is ugly.
     await _refreshGroupMembers(cid);
-    // Conversation switch: drop any stale per-actor placeholders from a
-    // previous conv so they don't leak into this view (their DOM nodes
-    // are also gone since we're about to clear chat-history below).
-    for (const k of Array.from(_groupPlaceholders.keys())) {
-      if (k.startsWith(`${cid}:`)) continue; // keep this cid's; clear others
-      _groupPlaceholders.delete(k);
-    }
+    // History reload: drop ALL per-actor placeholder map entries — the
+    // `container.innerHTML=''` below detaches every placeholder DOM node,
+    // including the ones for this cid. Keeping `${cid}:*` entries leaves
+    // the map pointing at orphan nodes; the next `_consumeActorPlaceholder`
+    // would find an entry whose `parentElement` is null, fall through to
+    // the `appendChatMessage` fallback, and any deltas accumulated on
+    // that orphan during the in-flight stream are lost (the symptom users
+    // see as "the in-flight reply bubble disappears + a duplicate final
+    // appears below"). After clearing, the next `_ensureActorPlaceholder`
+    // re-adopts `state.loadingEl` (re-attached below via the
+    // `isConvPending` branch) for the first actor and mints fresh
+    // placeholders for any additional actors — no orphan window.
+    _groupPlaceholders.clear();
     // Drop internal plan-step dispatch messages (commander → agent
     // hand-off). The user already saw the plan announcement; surfacing
     // these adds noise (e.g. "@<agent-name> <user request>") in the user's view.
@@ -1482,6 +1488,25 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     : document.getElementById('chat-history');
   if (!container) return null;
   const archive = opts.archive !== false;   // default on for backwards compat
+
+  // Dedupe by `_msg_id`: when the user switches conv tabs during a
+  // streaming turn, the same persisted message can reach the renderer
+  // twice — once via `loadConversationHistory` reading jsonl on
+  // switch-back, once via the trailing group-bus `message` event whose
+  // cid-mismatch guard had dropped its DOM update on the way out and
+  // now arrives after `currentCid` has flipped back. Without this
+  // guard, the second arrival's fallback `appendChatMessage` (used
+  // when the stale per-actor placeholder no longer has a
+  // `parentElement`) prints a duplicate bubble below the history-painted
+  // one. Idempotent re-render is the right contract — return the
+  // existing node so callers that want to mutate it (chip mounting /
+  // dataset writes) still find the right target.
+  if (message && message._msg_id) {
+    const existing = container.querySelector(
+      `.chat-message[data-msg-id="${CSS.escape(String(message._msg_id))}"]`,
+    );
+    if (existing) return existing;
+  }
 
   const emptyEl = container.querySelector('.empty');
   if (emptyEl) emptyEl.remove();
