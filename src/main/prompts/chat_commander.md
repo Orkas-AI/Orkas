@@ -137,6 +137,8 @@ plan_set({
 
 Variables that don't exist are left literal (handy for debugging).
 
+**Hard rule for upstream dependencies**: when a later step needs data produced by an earlier one, the dependency MUST appear as `{{step_N.output_summary}}` / `{{step_N.output_files}}` inside that step's `input`. Prose like "对上一步采集到的数据 / based on the previous output" substitutes nothing — the assignee receives your literal text and the downstream agent re-prompts the user via `<agent-input-form>` for data the plan was supposed to thread automatically.
+
 ### Three typical shapes
 
 The skeletons below show JSON structure only. Field rules: `title` and `input` are user-facing and must be written in the user's UI language; `assignee` is an exact agent name from the Agents list (or `commander` / `user`); template tokens `{{user_initial_message}}` / `{{step_N.output_summary}}` / `{{step_N.output_files}}` stay literal.
