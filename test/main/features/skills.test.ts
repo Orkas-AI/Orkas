@@ -231,6 +231,268 @@ describe('skills › extractSkillFileBlocks', () => {
   });
 });
 
+describe('skills › extractSkillContainers', () => {
+  // Pure text-munging regex around the commander's `<skill>` container.
+  // Hard rule (PC/CLAUDE.md §9): set A pins real shapes the matcher must
+  // accept; set B pins look-alike shapes the matcher must NOT process.
+  // Adding a guard / branch later requires extending both sets — silent
+  // regressions in this file have shipped before through the `<agent>`
+  // strip-regex path.
+
+  // ── Set A: real shapes (must extract) ──────────────────────────────────
+  it('A1: edit container with skill_id + single SKILL.md block', async () => {
+    const s = await loadSkills();
+    const text = 'prose before\n<skill>\n<skill_id>foo</skill_id>\n<<<skill-file path=SKILL.md\n---\nname: "foo"\n---\n\n# body\n>>>\n</skill>\nprose after';
+    const r = s.extractSkillContainers(text);
+    expect(r.containers).toHaveLength(1);
+    expect(r.containers[0].skillId).toBe('foo');
+    expect(r.containers[0].files.map((f: any) => f.path)).toEqual(['SKILL.md']);
+    expect(r.containers[0].files[0].content).toContain('name: "foo"');
+    expect(r.cleanText).toContain('prose before');
+    expect(r.cleanText).toContain('prose after');
+    expect(r.cleanText).not.toContain('<skill>');
+    expect(r.cleanText).not.toContain('<<<skill-file');
+  });
+
+  it('A2: create container (no skill_id) with multiple blocks', async () => {
+    const s = await loadSkills();
+    const text = '<skill>\n<<<skill-file path=SKILL.md\n---\nname: "abc"\ndescription_en: "desc"\n---\n\n# body\n>>>\n<<<skill-file path=scripts/foo.py\nprint("hi")\n>>>\n</skill>';
+    const r = s.extractSkillContainers(text);
+    expect(r.containers).toHaveLength(1);
+    expect(r.containers[0].skillId).toBeUndefined();
+    expect(r.containers[0].files.map((f: any) => f.path)).toEqual(['SKILL.md', 'scripts/foo.py']);
+  });
+
+  it('A3: skill_id with whitespace + leading blank line is trimmed', async () => {
+    const s = await loadSkills();
+    const text = '<skill>\n<skill_id>\n   bar  \n</skill_id>\n<<<skill-file path=SKILL.md\nbody\n>>>\n</skill>';
+    const r = s.extractSkillContainers(text);
+    expect(r.containers[0].skillId).toBe('bar');
+  });
+
+  it('A4: every container is parsed in emission order; all stripped from cleanText', async () => {
+    const s = await loadSkills();
+    const text = '<skill>\n<skill_id>first</skill_id>\n<<<skill-file path=SKILL.md\nA\n>>>\n</skill>\nmid\n<skill>\n<skill_id>second</skill_id>\n<<<skill-file path=SKILL.md\nB\n>>>\n</skill>';
+    const r = s.extractSkillContainers(text);
+    expect(r.containers).toHaveLength(2);
+    expect(r.containers[0].skillId).toBe('first');
+    expect(r.containers[1].skillId).toBe('second');
+    expect(r.cleanText).toContain('mid');
+    expect(r.cleanText).not.toContain('<skill>');
+  });
+
+  // ── Set B: look-alike shapes (must NOT extract / must NOT mis-route) ───
+  it('B1: bare prose without `<skill>` returns empty containers, untouched cleanText', async () => {
+    const s = await loadSkills();
+    const r = s.extractSkillContainers('I will write a skill that does X');
+    expect(r.containers).toEqual([]);
+    expect(r.cleanText).toBe('I will write a skill that does X');
+  });
+
+  it('B2: agent <skills> sub-tag must NOT match skill container', async () => {
+    const s = await loadSkills();
+    // The <skills> tag inside an <agent> container is a list, not the
+    // commander's <skill>. Matching it would silently treat agent edits
+    // as skill writes.
+    const text = '<agent>\n<skills>\nfoo-skill\n</skills>\n</agent>';
+    const r = s.extractSkillContainers(text);
+    expect(r.containers).toEqual([]);
+    expect(r.cleanText).toBe(text);
+  });
+
+  it('B3: stray `<<<skill-file>>>` outside any `<skill>` container is left visible (LLM feedback)', async () => {
+    const s = await loadSkills();
+    // The block is visible prose, NOT processed. cleanText should still
+    // contain it so the LLM sees it didn't take effect and self-corrects
+    // next turn. Pre-emptive global stripping would silently swallow the
+    // mistake.
+    const text = 'before\n<<<skill-file path=foo.md\nbody\n>>>\nafter';
+    const r = s.extractSkillContainers(text);
+    expect(r.containers).toEqual([]);
+    expect(r.cleanText).toContain('<<<skill-file');
+  });
+
+  it('B4: unclosed `<skill>` tag is stripped from cleanText but not extracted', async () => {
+    const s = await loadSkills();
+    // Final-event text shouldn't have unclosed containers, but if one
+    // slips through (mid-stream truncation / abort), don't extract it
+    // (no closing tag = container intent unclear). Range-based clean
+    // still removes the half-open tokens so naked `<skill>` doesn't
+    // pollute the bubble.
+    const text = '<skill>\n<skill_id>x</skill_id>\nno closing tag here';
+    const r = s.extractSkillContainers(text);
+    expect(r.containers).toEqual([]);
+    expect(r.cleanText).not.toContain('<skill>');
+    expect(r.cleanText).not.toContain('<skill_id>');
+  });
+
+  // ── Set B (prose/code guard): containers inside code regions ──────────
+  // Without this guard the LLM teaching/quoting the protocol to the user
+  // — by emitting a fenced ```...``` example or an inline `<skill>...</skill>`
+  // span — would falsely trigger a real skill write. This is the "agent
+  // section line 229 / chat_skill_setup.md showing protocol" risk surface.
+
+  it('B5: `<skill>` inside fenced ```xml block must NOT match', async () => {
+    const s = await loadSkills();
+    const text = 'Here is the format:\n```xml\n<skill>\n<skill_id>example</skill_id>\n<<<skill-file path=SKILL.md\nname: "example"\n>>>\n</skill>\n```\nThat is the shape.';
+    const r = s.extractSkillContainers(text);
+    expect(r.containers).toEqual([]);
+    expect(r.cleanText).toBe(text); // Untouched — it's prose teaching, not a real op.
+  });
+
+  it('B6: `<skill>` inside inline backtick span must NOT match', async () => {
+    const s = await loadSkills();
+    const text = 'Wrap your spec inside `<skill>...</skill>` and the system will pick it up.';
+    const r = s.extractSkillContainers(text);
+    expect(r.containers).toEqual([]);
+    expect(r.cleanText).toBe(text);
+  });
+
+  it('B7: real container AFTER a code-fence example — only the real one is extracted', async () => {
+    const s = await loadSkills();
+    // Critical: this is the failure mode the guard prevents — a naive
+    // regex would match the FIRST `<skill>` (the fenced example) and
+    // try to write fictional files, ignoring the real container below.
+    const text = 'Format:\n```xml\n<skill>\n<skill_id>example</skill_id>\n</skill>\n```\nAnd here is the real one:\n<skill>\n<skill_id>real</skill_id>\n<<<skill-file path=SKILL.md\nbody\n>>>\n</skill>';
+    const r = s.extractSkillContainers(text);
+    expect(r.containers).toHaveLength(1);
+    expect(r.containers[0].skillId).toBe('real');
+    expect(r.cleanText).toContain('```xml');
+    expect(r.cleanText).toContain('<skill>\n<skill_id>example</skill_id>'); // fenced example survives
+  });
+});
+
+describe('skills › applySkillContainerFromCommander › create', () => {
+  it('creates skill from frontmatter `name`, writes all blocks', async () => {
+    const s = await loadSkills();
+    const skillMdContent = '---\nname: "social-fetch"\ndescription_zh: "抓取并分析"\ndescription_en: "Fetch and analyze"\n---\n\n# When to use\n…\n';
+    const r = await s.applySkillContainerFromCommander({
+      files: [
+        { path: 'SKILL.md', content: skillMdContent },
+        { path: 'scripts/fetch.py', content: 'print("hi")\n' },
+      ],
+    });
+    expect(r.ok).toBe(true);
+    expect(r.kind).toBe('created');
+    expect(r.skillId).toBe('social-fetch');
+    expect(r.written).toEqual(['SKILL.md', 'scripts/fetch.py']);
+    const md = fs.readFileSync(path.join(customSkillsDir(), 'social-fetch', 'SKILL.md'), 'utf8');
+    expect(md).toContain('description_en: "Fetch and analyze"');
+    expect(md).toContain('# When to use');
+  });
+
+  it('rejects create when SKILL.md block is missing', async () => {
+    const s = await loadSkills();
+    const r = await s.applySkillContainerFromCommander({
+      files: [{ path: 'scripts/x.py', content: 'pass' }],
+    });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/SKILL.md|缺少/);
+  });
+
+  it('rejects create when frontmatter has no `name`', async () => {
+    const s = await loadSkills();
+    const r = await s.applySkillContainerFromCommander({
+      files: [{ path: 'SKILL.md', content: '---\ndescription_en: "x"\n---\n\nbody\n' }],
+    });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/name|缺少/);
+  });
+
+  it('rejects create when name has Chinese characters (charset gate)', async () => {
+    const s = await loadSkills();
+    // Hard requirement from product: skill name must be ASCII only.
+    const r = await s.applySkillContainerFromCommander({
+      files: [{ path: 'SKILL.md', content: '---\nname: "中文技能"\n---\n\nbody\n' }],
+    });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/name|invalid|名称/);
+  });
+
+  it('rejects create on collision with existing custom skill', async () => {
+    writeCustomSkill('dup');
+    const s = await loadSkills();
+    const r = await s.applySkillContainerFromCommander({
+      files: [{ path: 'SKILL.md', content: '---\nname: "dup"\n---\n\nbody\n' }],
+    });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/already exists|已存在/);
+  });
+});
+
+describe('skills › applySkillContainerFromCommander › edit', () => {
+  it('writes blocks to existing custom skill', async () => {
+    writeCustomSkill('beta', 'name: "beta"\ndescription_en: "old"', 'old body');
+    const s = await loadSkills();
+    const r = await s.applySkillContainerFromCommander({
+      skillId: 'beta',
+      files: [{ path: 'scripts/run.py', content: 'pass\n' }],
+    });
+    expect(r.ok).toBe(true);
+    expect(r.kind).toBe('updated');
+    expect(r.skillId).toBe('beta');
+    expect(r.written).toEqual(['scripts/run.py']);
+    expect(fs.existsSync(path.join(customSkillsDir(), 'beta', 'scripts/run.py'))).toBe(true);
+  });
+
+  it('rejects edit on builtin skill (read-only outside dev panel)', async () => {
+    fs.mkdirSync(path.join(builtinSkillsDir(), 'shipped'), { recursive: true });
+    fs.writeFileSync(
+      path.join(builtinSkillsDir(), 'shipped', 'SKILL.md'),
+      '---\nname: "shipped"\n---\n\nbody\n',
+    );
+    const s = await loadSkills();
+    const r = await s.applySkillContainerFromCommander({
+      skillId: 'shipped',
+      files: [{ path: 'SKILL.md', content: '---\nname: "shipped"\n---\n\ntampered\n' }],
+    });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/built-in|内置/i);
+    // Original body preserved.
+    expect(fs.readFileSync(path.join(builtinSkillsDir(), 'shipped', 'SKILL.md'), 'utf8'))
+      .toContain('body');
+  });
+
+  it('rejects edit when skill does not exist', async () => {
+    const s = await loadSkills();
+    const r = await s.applySkillContainerFromCommander({
+      skillId: 'nonexistent',
+      files: [{ path: 'SKILL.md', content: '---\nname: "nonexistent"\n---\n\nbody\n' }],
+    });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/not found|不存在/i);
+  });
+
+  it('auto-renames the dir when SKILL.md `name` changes', async () => {
+    writeCustomSkill('oldname', 'name: "oldname"\ndescription_en: "x"', 'body');
+    const s = await loadSkills();
+    const r = await s.applySkillContainerFromCommander({
+      skillId: 'oldname',
+      files: [{ path: 'SKILL.md', content: '---\nname: "newname"\ndescription_en: "x"\n---\n\nbody\n' }],
+    });
+    expect(r.ok).toBe(true);
+    expect(r.skillId).toBe('newname');
+    expect(fs.existsSync(path.join(customSkillsDir(), 'oldname'))).toBe(false);
+    expect(fs.existsSync(path.join(customSkillsDir(), 'newname'))).toBe(true);
+  });
+
+  it('best-effort: one rejected path does not roll back successful writes', async () => {
+    writeCustomSkill('keep', 'name: "keep"\ndescription_en: "x"', 'body');
+    const s = await loadSkills();
+    const r = await s.applySkillContainerFromCommander({
+      skillId: 'keep',
+      files: [
+        { path: 'good.txt', content: 'kept' },
+        { path: '../escape', content: 'should reject' },
+      ],
+    });
+    expect(r.ok).toBe(true);
+    expect(r.written).toEqual(['good.txt']);
+    expect(r.rejected).toEqual(['../escape']);
+    expect(fs.readFileSync(path.join(customSkillsDir(), 'keep', 'good.txt'), 'utf8')).toBe('kept');
+  });
+});
+
 describe('skills › hashTree', () => {
   it('returns empty string for missing dir', async () => {
     const s = await loadSkills();

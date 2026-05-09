@@ -402,3 +402,8 @@ export function encodeSubmission(
 
 export type { ExtractedFields };
 export { extractAgentFieldBlocks } from '../agents';
+
+// ── Skill-container parser (re-exported from features/skills) ────────────
+
+export type { SkillContainerExtracted, SkillContainerResult } from '../skills';
+export { extractSkillContainers } from '../skills';

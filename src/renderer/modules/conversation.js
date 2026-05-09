@@ -606,6 +606,22 @@ async function _refreshGroupMembers(cid) {
   } catch (_) { /* non-fatal */ }
   return _groupMembersCache.get(cid) || [];
 }
+// Read-side normalizer: jsonl records written before the multi-edit
+// migration carry singular `created_agent`; new ones carry plural
+// `created_agents`. Returns the array, or `null` when neither field is set.
+function _normalizeCreatedAgents(gm) {
+  if (!gm) return null;
+  if (Array.isArray(gm.created_agents) && gm.created_agents.length) return gm.created_agents;
+  if (gm.created_agent && gm.created_agent.agent_id) return [gm.created_agent];
+  return null;
+}
+function _normalizeCreatedSkills(gm) {
+  if (!gm) return null;
+  if (Array.isArray(gm.created_skills) && gm.created_skills.length) return gm.created_skills;
+  if (gm.created_skill && gm.created_skill.skill_id) return [gm.created_skill];
+  return null;
+}
+
 function _groupMsgToLegacy(gm) {
   if (!gm || typeof gm !== 'object') return gm;
   if (gm.role !== undefined) return gm; // already legacy shape
@@ -629,7 +645,8 @@ function _groupMsgToLegacy(gm) {
     ...(Array.isArray(gm.attachments) && gm.attachments.length ? { attachments: gm.attachments } : {}),
     ...(Array.isArray(gm.produced) && gm.produced.length ? { produced: gm.produced } : {}),
     ...(gm.form ? { form: gm.form } : {}),
-    ...(gm.created_agent ? { created_agent: gm.created_agent } : {}),
+    ...(_normalizeCreatedAgents(gm) ? { created_agents: _normalizeCreatedAgents(gm) } : {}),
+    ...(_normalizeCreatedSkills(gm) ? { created_skills: _normalizeCreatedSkills(gm) } : {}),
     ...(gm.plan_announcement ? { _plan_announcement: true } : {}),
     ...(Array.isArray(gm.process) && gm.process.length ? { process: gm.process } : {}),
   };
@@ -956,36 +973,70 @@ function _renderMessageProducedHtml(absPaths) {
   return `<div class="chat-msg-produced">${items.join('')}</div>`;
 }
 
-// Render a "view details" chip on an assistant bubble when a new agent was
-// quick-created from that turn. Click → jump to agents tab + select the new
-// agent. Same visual slot as produced chips (inside the bubble, below
-// content), but in .is-custom green to signal "new custom artifact created".
-function _renderMessageCreatedAgentHtml(payload) {
-  if (!payload || !payload.agent_id) return '';
-  const name = payload.name || payload.agent_id;
-  // Label is intentionally neutral ("view details / Open: …") — works for both
-  // `kind: 'created'` and `kind: 'updated'`; the commander's surrounding
-  // prose tells the user which one happened. Don't split the i18n key just
-  // to track the verb — the chip is a CTA into the agent panel, not a
-  // status badge.
-  return `<div class="chat-msg-created-agent">
-    <span class="chat-msg-created-agent-chip" data-agent-id="${escapeHtml(payload.agent_id)}" title="${escapeHtml(name)}">
+// Render one or more "view details" chips on an assistant bubble — one chip
+// per agent quick-created or quick-edited in that turn. Same visual slot as
+// produced chips (inside the bubble, below content), in .is-custom green.
+// Label is neutral ("view details") for both `kind: 'created'` and
+// `kind: 'updated'`; the commander's surrounding prose tells the user which.
+function _renderMessageCreatedAgentHtml(list) {
+  const arr = Array.isArray(list) ? list : (list ? [list] : []);
+  const chips = arr
+    .filter((p) => p && p.agent_id)
+    .map((p) => {
+      const name = p.name || p.agent_id;
+      return `<span class="chat-msg-created-agent-chip" data-agent-id="${escapeHtml(p.agent_id)}" title="${escapeHtml(name)}">
       <span class="chat-msg-created-agent-icon">◆</span>
       <span class="chat-msg-created-agent-label">${escapeHtml(t('chat.created_agent_chip', { name }))}</span>
-    </span>
-  </div>`;
+    </span>`;
+    })
+    .join('');
+  return chips ? `<div class="chat-msg-created-agent">${chips}</div>` : '';
 }
 
 function _hydrateMessageCreatedAgentChip(msgDiv) {
-  const chip = msgDiv.querySelector('.chat-msg-created-agent-chip');
-  if (!chip) return;
-  chip.addEventListener('click', () => {
-    const aid = chip.dataset.agentId;
-    if (!aid) return;
-    setView('agents');
-    if (typeof _showAgentsDetailView === 'function') _showAgentsDetailView(aid);
-    else if (typeof selectAgent === 'function') selectAgent(aid);
-  });
+  const chips = msgDiv.querySelectorAll('.chat-msg-created-agent-chip');
+  for (const chip of chips) {
+    if (chip.dataset.bound === '1') continue;
+    chip.dataset.bound = '1';
+    chip.addEventListener('click', () => {
+      const aid = chip.dataset.agentId;
+      if (!aid) return;
+      setView('agents');
+      if (typeof _showAgentsDetailView === 'function') _showAgentsDetailView(aid);
+      else if (typeof selectAgent === 'function') selectAgent(aid);
+    });
+  }
+}
+
+// Skill mirror of the agent chip. Commander writes only custom skills,
+// so the chip always opens the custom-source detail view.
+function _renderMessageCreatedSkillHtml(list) {
+  const arr = Array.isArray(list) ? list : (list ? [list] : []);
+  const chips = arr
+    .filter((p) => p && p.skill_id)
+    .map((p) => {
+      const name = p.name || p.skill_id;
+      return `<span class="chat-msg-created-agent-chip" data-skill-id="${escapeHtml(p.skill_id)}" title="${escapeHtml(name)}">
+      <span class="chat-msg-created-agent-icon">◆</span>
+      <span class="chat-msg-created-agent-label">${escapeHtml(t('chat.created_skill_chip', { name }))}</span>
+    </span>`;
+    })
+    .join('');
+  return chips ? `<div class="chat-msg-created-agent">${chips}</div>` : '';
+}
+
+function _hydrateMessageCreatedSkillChip(msgDiv) {
+  const chips = msgDiv.querySelectorAll('.chat-msg-created-agent-chip[data-skill-id]');
+  for (const chip of chips) {
+    if (chip.dataset.bound === '1') continue;
+    chip.dataset.bound = '1';
+    chip.addEventListener('click', () => {
+      const sid = chip.dataset.skillId;
+      if (!sid) return;
+      setView('skills');
+      if (typeof _showSkillsDetailView === 'function') _showSkillsDetailView('custom', sid);
+    });
+  }
 }
 
 function _hydrateMessageProducedChips(msgDiv) {
@@ -1442,7 +1493,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   // stored raw text. Assistant messages get a defensive structural-block
   // strip covering `<agent>` / `<agent-input-form>` / `<agent-input-submission>`
   // in case the backend's extractor missed a format variant (see
-  // `_stripSurvivingStructuralBlocks` in strip-agent.js).
+  // `_stripSurvivingStructuralBlocks` in strip-structural-blocks.js).
   let displayContent = rawContent;
   if (!isHtmlSnippet) {
     if (role === 'user') displayContent = _stripSubmissionTagForDisplay(rawContent);
@@ -1458,8 +1509,13 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   const producedHtml = (role === 'assistant' && Array.isArray(message.produced) && message.produced.length)
     ? _renderMessageProducedHtml(message.produced)
     : '';
-  const createdAgentHtml = (role === 'assistant' && message.created_agent)
-    ? _renderMessageCreatedAgentHtml(message.created_agent)
+  const createdAgentsList = role === 'assistant' ? _normalizeCreatedAgents(message) : null;
+  const createdAgentHtml = createdAgentsList
+    ? _renderMessageCreatedAgentHtml(createdAgentsList)
+    : '';
+  const createdSkillsList = role === 'assistant' ? _normalizeCreatedSkills(message) : null;
+  const createdSkillHtml = createdSkillsList
+    ? _renderMessageCreatedSkillHtml(createdSkillsList)
     : '';
   // Group-chat header sits **above** the bubble, outside it: sender name +
   // timestamp on one row. Same DOM strip for historical (loaded via
@@ -1487,7 +1543,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   msgDiv.innerHTML = `
     ${headerHtml}
     <div class="chat-bubble">${planAnnHtml}${contentHtml}${attachmentsHtml}</div>
-    <div class="chat-msg-actions" data-role="msg-actions">${producedHtml}${createdAgentHtml}</div>
+    <div class="chat-msg-actions" data-role="msg-actions">${producedHtml}${createdAgentHtml}${createdSkillHtml}</div>
   `;
   if (typeof opts.msgIndex === 'number') msgDiv.dataset.msgIndex = String(opts.msgIndex);
   if (message._msg_id) msgDiv.dataset.msgId = String(message._msg_id);
@@ -1509,6 +1565,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   if (attachmentsHtml) _hydrateMessageAttachmentThumbs(msgDiv, opts.cid || currentCid);
   if (producedHtml) _hydrateMessageProducedChips(msgDiv);
   if (createdAgentHtml) _hydrateMessageCreatedAgentChip(msgDiv);
+  if (createdSkillHtml) _hydrateMessageCreatedSkillChip(msgDiv);
   // Interactive input-form widget (assistant messages only). Appended inside
   // the bubble after markdown + chips so it reads as "reply text → confirm
   // this form". See chat-input-form.js for the widget implementation.
@@ -2999,10 +3056,11 @@ function _handleStreamEvent(cid, msg, ev, { archive = false } = {}) {
         _mountChatInputForm(host, msg, { role: 'assistant', form: ev.form }, { cid });
       }
     }
-    // Created-agent chip also arrives on the final event payload — attach
+    // Created-agent chips also arrive on the final event payload — attach
     // here in case the relay event was missed (e.g. on reconnect / replay).
-    if (ev.created_agent && ev.created_agent.agent_id) {
-      _mountCreatedAgentChip(msg, ev.created_agent);
+    const finalCreated = _normalizeCreatedAgents(ev);
+    if (finalCreated) {
+      for (const payload of finalCreated) _mountCreatedAgentChip(msg, payload);
     }
   } else if (ev.type === 'error') {
     _streamingSetError(msg, ev.text);
@@ -3156,9 +3214,15 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
     ph.dataset.produced = JSON.stringify(gm.produced);
   }
 
-  // Created-agent chip (commander quick-create) — same actions row.
-  if (gm.created_agent && gm.created_agent.agent_id) {
-    _mountCreatedAgentChip(ph, gm.created_agent);
+  // Created-agent chips (commander quick-create / quick-edit) — same actions row.
+  const gmCreated = _normalizeCreatedAgents(gm);
+  if (gmCreated) {
+    for (const payload of gmCreated) _mountCreatedAgentChip(ph, payload);
+  }
+  // Created-skill chip (commander skill create / edit).
+  const gmSkills = _normalizeCreatedSkills(gm);
+  if (gmSkills) {
+    for (const payload of gmSkills) _mountCreatedSkillChip(ph, payload);
   }
 
   // Form widget (agent → user input form).
@@ -3395,14 +3459,11 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
   }
 }
 
-// Append the "view details" chip into a streaming bubble. Idempotent: duplicate
-// calls (relay event + final-event payload) are de-duped by checking for an
-// existing `.chat-msg-created-agent` child.
+// Append a "view details" chip into a streaming bubble. Idempotent per
+// agent_id — repeat calls for the same id no-op; calls for different ids
+// accumulate into the same `.chat-msg-created-agent` row.
 function _mountCreatedAgentChip(msg, payload) {
   if (!msg || !payload || !payload.agent_id) return;
-  // Chip lives in the below-bubble action row alongside produced files +
-  // archive button (same visual footer slot). Lazily allocate the row
-  // for streaming placeholders that didn't get one at creation.
   let actionsRow = msg.querySelector('[data-role="msg-actions"]');
   if (!actionsRow) {
     actionsRow = document.createElement('div');
@@ -3410,16 +3471,56 @@ function _mountCreatedAgentChip(msg, payload) {
     actionsRow.dataset.role = 'msg-actions';
     msg.appendChild(actionsRow);
   }
-  if (actionsRow.querySelector('.chat-msg-created-agent')) return;
-  const wrap = document.createElement('div');
-  wrap.innerHTML = _renderMessageCreatedAgentHtml(payload);
-  const node = wrap.firstElementChild;
-  if (!node) return;
-  actionsRow.appendChild(node);
+  const aid = payload.agent_id;
+  if (actionsRow.querySelector(`.chat-msg-created-agent-chip[data-agent-id="${CSS.escape(aid)}"]`)) return;
+  let wrap = actionsRow.querySelector('.chat-msg-created-agent');
+  if (!wrap) {
+    wrap = document.createElement('div');
+    wrap.className = 'chat-msg-created-agent';
+    actionsRow.appendChild(wrap);
+  }
+  // Render an array of one + extract the inner chip(s) so we append into
+  // the existing wrap rather than nesting `.chat-msg-created-agent` rows.
+  const tmp = document.createElement('div');
+  tmp.innerHTML = _renderMessageCreatedAgentHtml([payload]);
+  const newChips = tmp.querySelectorAll('.chat-msg-created-agent-chip');
+  for (const chip of newChips) wrap.appendChild(chip);
   _hydrateMessageCreatedAgentChip(msg);
   // Refresh the agents-cache lazily so the user sees the new agent in the
   // sidebar list when they jump over. Non-fatal if it fails.
   try { if (typeof loadAgents === 'function') loadAgents(true); } catch (_) {}
+}
+
+// Skill mirror of `_mountCreatedAgentChip`. Idempotent per skill_id;
+// repeat calls for the same id no-op, calls for different ids accumulate
+// into the same chip row. Skill chips and agent chips share CSS but are
+// distinguished by `data-agent-id` vs `data-skill-id`, so they coexist in
+// separate `.chat-msg-created-agent` wrappers.
+function _mountCreatedSkillChip(msg, payload) {
+  if (!msg || !payload || !payload.skill_id) return;
+  let actionsRow = msg.querySelector('[data-role="msg-actions"]');
+  if (!actionsRow) {
+    actionsRow = document.createElement('div');
+    actionsRow.className = 'chat-msg-actions';
+    actionsRow.dataset.role = 'msg-actions';
+    msg.appendChild(actionsRow);
+  }
+  const sid = payload.skill_id;
+  if (actionsRow.querySelector(`.chat-msg-created-agent-chip[data-skill-id="${CSS.escape(sid)}"]`)) return;
+  // Find or create a wrapper that already holds skill chips. `:has(...)`
+  // keeps us from accidentally appending into the agent-chip wrapper.
+  let wrap = actionsRow.querySelector('.chat-msg-created-agent:has(.chat-msg-created-agent-chip[data-skill-id])');
+  if (!wrap) {
+    wrap = document.createElement('div');
+    wrap.className = 'chat-msg-created-agent';
+    actionsRow.appendChild(wrap);
+  }
+  const tmp = document.createElement('div');
+  tmp.innerHTML = _renderMessageCreatedSkillHtml([payload]);
+  const newChips = tmp.querySelectorAll('.chat-msg-created-agent-chip');
+  for (const chip of newChips) wrap.appendChild(chip);
+  _hydrateMessageCreatedSkillChip(msg);
+  try { if (typeof loadSkills === 'function') loadSkills(true); } catch (_) {}
 }
 
 // Hide the `<agent-input-submission form_id=... agent_id=...>{json}
@@ -3429,7 +3530,7 @@ function _mountCreatedAgentChip(msg, payload) {
 // bulleted summary above it already tells them what they confirmed.
 function _stripSubmissionTagForDisplay(text) {
   if (!text || text.indexOf('<agent-input-submission') < 0) return text;
-  // Atomic-container strip with prose/code guard via strip-agent.js.
+  // Atomic-container strip with prose/code guard via strip-structural-blocks.js.
   // Same class of fragmentation / set-B leak as `<agent>` — see that
   // file's header for the invariant matrix.
   const out = _stripOuterTagBlocks(text, 'agent-input-submission');
@@ -3438,9 +3539,9 @@ function _stripSubmissionTagForDisplay(text) {
 }
 
 // `_splitMarkdownProseCode`, `_findOuterAgentRanges`, `_stripSurvivingAgentBlocks`,
-// `_replaceOuterAgentBlocks` are defined in `./strip-agent.js` (loaded earlier
+// `_replaceOuterAgentBlocks` are defined in `./strip-structural-blocks.js` (loaded earlier
 // in `index.html`). They live in their own file so vitest can pin the set-A /
-// set-B fixtures (`test/renderer/strip-agent.test.ts`) — see that file for
+// set-B fixtures (`test/renderer/strip-structural-blocks.test.ts`) — see that file for
 // the invariant matrix. Wrap the i18n-aware placeholder here and delegate.
 //
 // Wrap placeholder text in an HTML `<em>` instead of markdown `_text_`:
@@ -3458,7 +3559,7 @@ function _stripAgentCreateBlocksForStream(buf) {
 }
 
 // `<<<skill-file path=X ... >>>` blocks (skill edit chat). Different fence
-// shape from `<agent>` (see strip-agent.js header) but same user-facing
+// shape from `<agent>` (see strip-structural-blocks.js header) but same user-facing
 // contract: streaming placeholder hides the raw block + reveals the file
 // being written. The path attribute (when present) flows into the
 // localised "Writing X…" label so the placeholder is informative;
@@ -3472,6 +3573,20 @@ function _stripSkillFileBlocksForStream(buf) {
   });
 }
 
+// `<skill>` container (commander create / edit). Pure logic lives in
+// `strip-structural-blocks.js::_stripSkillCreateContainer` — see that header for the
+// closed-vs-unclosed mode rules. This wrapper only builds the i18n-aware
+// fallback placeholder and delegates so DOM / i18n / escapeHtml stay out
+// of the pure-function module (parallel to how `_stripAgentCreateBlocksForStream`
+// composes `_replaceOuterAgentBlocks`). Set A / set B fixtures pinned in
+// `test/renderer/strip-structural-blocks.test.ts`.
+function _stripSkillCreateBlocksForStream(buf) {
+  return _stripSkillCreateContainer(
+    buf,
+    _streamPlaceholderHtml('chat.create_skill_streaming_placeholder'),
+  );
+}
+
 function _stripAgentFormBlockForStream(buf) {
   // Primary: XML `<agent-input-form>...</agent-input-form>` (symmetric
   // with submission reply tag, token-stable). Legacy: fenced
@@ -3481,7 +3596,7 @@ function _stripAgentFormBlockForStream(buf) {
   // actual form widget.
   if (!buf) return buf;
   const placeholder = _streamPlaceholderHtml('chat.form.streaming_placeholder');
-  // XML branch: atomic-container handling via strip-agent.js — same
+  // XML branch: atomic-container handling via strip-structural-blocks.js — same
   // prose/code guard as `<agent>` so a fenced ```xml example or inline
   // backtick mention of `<agent-input-form>` survives instead of being
   // eaten as a real form.
@@ -3531,9 +3646,11 @@ function _streamingAppendFinalDelta(msg, piece) {
     msg._streamRafScheduled = false;
     msg._streamRafHandle = null;
     const buf = msg.dataset.streamBuf || '';
-    const display = _stripAgentCreateBlocksForStream(
-      _stripAgentFormBlockForStream(
-        _stripSkillFileBlocksForStream(buf),
+    const display = _stripSkillCreateBlocksForStream(
+      _stripAgentCreateBlocksForStream(
+        _stripAgentFormBlockForStream(
+          _stripSkillFileBlocksForStream(buf),
+        ),
       ),
     );
     finalEl.innerHTML = `<div class="markdown-body">${_renderMessageMarkdown(display)}</div>`;

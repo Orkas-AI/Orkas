@@ -45,6 +45,7 @@ import {
 } from '../storage';
 import { invalidateSkills as invalidateCoreAgentSkills } from '../model/core-agent/skill-registry';
 import { readDisabledSets, setSkillEnabled } from './component_enabled';
+import { findOuterTagRanges } from '../util/markdown-prose-code';
 
 const SKILL_TREE_IGNORE: ReadonlySet<string> = new Set(['.DS_Store', '__pycache__', '.git', 'node_modules']);
 // Starts with a letter, then letters/digits/_/-; single spaces are allowed
@@ -1039,6 +1040,189 @@ export function extractSkillFileBlocks(text: string): { cleanText: string; files
   });
   const compact = cleaned.replace(/\n{3,}/g, '\n\n').trim();
   return { cleanText: compact, files };
+}
+
+// ── Commander `<skill>` container ────────────────────────────────────────
+// Outer container the commander emits to create / patch a skill mid-turn
+// (parallel to `extractAgentFieldBlocks`). Only the inner `<<<skill-file>>>`
+// blocks are processed; stray blocks outside the container stay visible as
+// prose so the LLM gets feedback on its own malformed output rather than
+// silently writing files.
+//
+// **Prose/code guard**: `findOuterTagRanges` skips `<skill>` mentions that
+// fall inside fenced ``` code blocks or inline backtick spans, so an LLM
+// teaching the user the protocol (e.g. "the format is `<skill>...</skill>`"
+// or showing it in a fenced example) doesn't accidentally trigger a real
+// skill write. Same guard the renderer uses (`strip-structural-blocks.js`).
+const OPEN_TAG = '<skill>';
+const CLOSE_TAG = '</skill>';
+const SKILL_ID_RE = /<skill_id>\s*([\s\S]*?)\s*<\/skill_id>/;
+
+export interface SkillContainerExtracted {
+  /** Empty/undefined → create flow; non-empty → edit flow targeting this id. */
+  skillId?: string;
+  /** All `<<<skill-file>>>` blocks parsed from inside the container. */
+  files: SkillFileBlock[];
+}
+
+function _parseSkillContainer(inner: string): SkillContainerExtracted {
+  const idM = inner.match(SKILL_ID_RE);
+  const skillId = idM ? idM[1].trim() : '';
+  const { files } = extractSkillFileBlocks(inner);
+  return { ...(skillId ? { skillId } : {}), files };
+}
+
+/**
+ * Extract every `<skill>...</skill>` container in emission order. Each
+ * container is parsed independently. Returns `containers: []` when none
+ * is present.
+ *
+ * Containers inside fenced code blocks / inline backtick spans are
+ * NOT extracted (prose/code guard); unclosed containers (no `</skill>`
+ * before EOF — should not happen on final-event text but guarded
+ * defensively) are skipped from `containers` but stripped from
+ * `cleanText` so half-baked tokens don't leak into the bubble.
+ */
+export function extractSkillContainers(
+  text: string,
+): { cleanText: string; containers: SkillContainerExtracted[] } {
+  if (!text || text.indexOf(OPEN_TAG) < 0) return { cleanText: text, containers: [] };
+  const ranges = findOuterTagRanges(text, 'skill');
+  if (!ranges.length) return { cleanText: text, containers: [] };
+  const containers: SkillContainerExtracted[] = [];
+  let cleaned = '';
+  let cursor = 0;
+  for (const [s, e] of ranges) {
+    cleaned += text.slice(cursor, s);
+    const block = text.slice(s, e);
+    if (block.startsWith(OPEN_TAG) && block.endsWith(CLOSE_TAG)) {
+      const inner = block.slice(OPEN_TAG.length, block.length - CLOSE_TAG.length);
+      containers.push(_parseSkillContainer(inner));
+    }
+    cursor = e;
+  }
+  cleaned += text.slice(cursor);
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
+  return { cleanText: cleaned, containers };
+}
+
+export interface SkillContainerResult {
+  ok: boolean;
+  /** 'created' for the no-skill-id branch; 'updated' for the edit branch.
+   *  Undefined on `ok: false`. */
+  kind?: 'created' | 'updated';
+  /** Resolved skill id after the operation — for `created`: the id we
+   *  allocated; for `updated`: the post-rename id when SKILL.md frontmatter
+   *  changed `name`, otherwise the original id. */
+  skillId?: string;
+  /** Display name from SKILL.md frontmatter (post-write). */
+  name?: string;
+  /** Paths successfully written, in container order. */
+  written?: string[];
+  /** Paths whose write was rejected (path-escape, missing dir, etc.). Never
+   *  causes total failure — best-effort policy mirrors the skill-edit chat. */
+  rejected?: string[];
+  /** Total-failure cause when `ok: false`. Already localized via `t()`. */
+  error?: string;
+}
+
+/** Apply a parsed `<skill>` container from commander. Routes to create vs
+ *  edit by `container.skillId`. Built-in skills are read-only here — same
+ *  policy as the per-skill edit chat outside dev mode. Best-effort writes
+ *  per-file: a single rejected path doesn't roll back earlier successes
+ *  (matches `streamSendToSkillChat`'s file-by-file outcome). */
+export async function applySkillContainerFromCommander(
+  container: SkillContainerExtracted,
+): Promise<SkillContainerResult> {
+  if (!container.files.length && !container.skillId) {
+    return { ok: false, error: t('skills.errors.container_empty') };
+  }
+  if (container.skillId) {
+    return _applySkillContainerEdit(container.skillId, container.files);
+  }
+  return _applySkillContainerCreate(container.files);
+}
+
+async function _applySkillContainerCreate(files: SkillFileBlock[]): Promise<SkillContainerResult> {
+  // SKILL.md is mandatory in the create branch — that's where the skill id
+  // (frontmatter `name`) and bilingual descriptions are sourced from.
+  const skillMd = files.find((f) => f.path.toUpperCase() === 'SKILL.MD');
+  if (!skillMd) return { ok: false, error: t('skills.errors.create_missing_skill_md') };
+  const { meta } = splitSkillMd(skillMd.content || '');
+  const name = (meta.name || '').trim();
+  if (!name) return { ok: false, error: t('skills.errors.create_missing_name') };
+  const validateErr = validateSkillName(name);
+  if (validateErr) return { ok: false, error: validateErr };
+  // Collision checks — same gates as the IPC create path so commander and
+  // detail panel produce identical failure modes.
+  if (fs.existsSync(customSkillDir(name))) {
+    return { ok: false, error: t('skills.errors.skill_exists', { name }) };
+  }
+  if (fs.existsSync(path.join(BUILTIN_SKILLS_DIR, name))) {
+    return { ok: false, error: t('skills.errors.builtin_conflict', { name }) };
+  }
+  // Seed description from the frontmatter so the registry never sees a
+  // transient empty-description state between createCustomSkill (which
+  // writes boilerplate SKILL.md) and the SKILL.md block write below.
+  const desc = migrateDescriptionPair(meta as any);
+  const seedDescription = desc.description_zh || desc.description_en || '';
+  const created = await createCustomSkill(name, seedDescription);
+  if (!created) return { ok: false, error: t('skills.errors.create_failed') };
+
+  const written: string[] = [];
+  const rejected: string[] = [];
+  for (const fb of files) {
+    if (writeCustomSkillFile(name, fb.path, fb.content)) written.push(fb.path);
+    else rejected.push(fb.path);
+  }
+  if (written.length) log.info(`commander created skill=${name} files=${written.length}`);
+  return {
+    ok: true,
+    kind: 'created',
+    skillId: name,
+    name,
+    written,
+    ...(rejected.length ? { rejected } : {}),
+  };
+}
+
+async function _applySkillContainerEdit(skillId: string, files: SkillFileBlock[]): Promise<SkillContainerResult> {
+  const skill = await getSkillForEdit(skillId);
+  if (!skill) return { ok: false, error: t('skills.errors.skill_not_found', { id: skillId }) };
+  // Built-in skills are dev-mode-only via the detail-panel edit chat; the
+  // commander flow always rejects regardless of dev mode (mirrors the agent
+  // edit policy at `bus.ts` post-stream parsing).
+  if (skill.source !== 'custom') {
+    return { ok: false, error: t('errors.builtin_skill_not_editable') };
+  }
+  const written: string[] = [];
+  const rejected: string[] = [];
+  let touchedSkillMd = false;
+  for (const fb of files) {
+    if (await writeSkillFileForEdit(skillId, fb.path, fb.content)) {
+      written.push(fb.path);
+      if (fb.path.toUpperCase() === 'SKILL.MD') touchedSkillMd = true;
+    } else {
+      rejected.push(fb.path);
+    }
+  }
+  // Auto-rename when SKILL.md frontmatter `name` differs from the dir id —
+  // same hook as the per-skill edit chat (`streamSendToSkillChat`).
+  let resolvedId = skillId;
+  if (touchedSkillMd) {
+    const newId = await _renameSkillByFrontmatterIfNeeded(skillId);
+    if (newId && newId !== skillId) resolvedId = newId;
+  }
+  const post = await getSkillForEdit(resolvedId);
+  if (written.length) log.info(`commander updated skill=${skillId}${resolvedId !== skillId ? ` -> ${resolvedId}` : ''} files=${written.length}`);
+  return {
+    ok: true,
+    kind: 'updated',
+    skillId: resolvedId,
+    name: post?.name || resolvedId,
+    written,
+    ...(rejected.length ? { rejected } : {}),
+  };
 }
 
 function skillFilesBlock(files: SkillFileInfo[]): string {

@@ -122,12 +122,16 @@ export interface TurnFinishedEvent {
   form?: ChatFormPayload;
   /** Files written via local-exec tools during this turn. */
   produced: string[];
-  /** Agent created or updated from `<agent>...</agent>` (commander only).
-   * `kind: 'created'` is the original quick-create flow; `kind: 'updated'`
-   * means an existing custom agent was patched in place — same chip slot,
-   * different label on the renderer side. Executor records but doesn't
-   * drive on it. */
-  createdAgent?: { agent_id: string; name: string; kind: 'created' | 'updated' };
+  /** Agents created or updated from `<agent>...</agent>` containers
+   * (commander only). One entry per successfully applied container.
+   * `kind: 'created'` is the quick-create flow; `kind: 'updated'` means an
+   * existing custom agent was patched. Executor records but doesn't drive
+   * on it. */
+  createdAgents?: Array<{ agent_id: string; name: string; kind: 'created' | 'updated' }>;
+  /** Skills created or updated from `<skill>...</skill>` containers
+   * (commander only). One entry per successfully applied container.
+   * Same shape as `createdAgents` entries; rendered as separate chips. */
+  createdSkills?: Array<{ skill_id: string; name: string; kind: 'created' | 'updated' }>;
   /** What kind of trigger caused this turn. Drives the state transition. */
   trigger: TurnTrigger;
   /** Number of non-error, non-final, non-done events the LLM stream emitted.
@@ -146,7 +150,14 @@ export interface TurnFinishedEvent {
  *   turn produces no user-visible output.
  */
 export type TurnOutcome =
-  | { kind: 'persist'; text: string; form?: ChatFormPayload; produced?: string[]; createdAgent?: { agent_id: string; name: string; kind: 'created' | 'updated' } }
+  | {
+      kind: 'persist';
+      text: string;
+      form?: ChatFormPayload;
+      produced?: string[];
+      createdAgents?: Array<{ agent_id: string; name: string; kind: 'created' | 'updated' }>;
+      createdSkills?: Array<{ skill_id: string; name: string; kind: 'created' | 'updated' }>;
+    }
   | { kind: 'silent' };
 
 export interface ReconcileCtx {
@@ -331,7 +342,7 @@ async function outcomeForUserDirectTurn(uid: string, cid: string, evt: TurnFinis
   // checking these signals first we'd fall through to the "agent empty"
   // branch below and replace the actor's form with "(no reply)", losing
   // the form widget entirely (the user-reported bug).
-  const hasSideEffect = !!evt.form || !!evt.createdAgent || (evt.produced && evt.produced.length > 0);
+  const hasSideEffect = !!evt.form || (!!evt.createdAgents && evt.createdAgents.length > 0) || (!!evt.createdSkills && evt.createdSkills.length > 0) || (evt.produced && evt.produced.length > 0);
   if ((evt.finalText && evt.finalText.trim()) || hasSideEffect) {
     // When the stream errored mid-turn but partial text / side effects
     // already landed, append the error pill instead of dropping the
@@ -345,7 +356,8 @@ async function outcomeForUserDirectTurn(uid: string, cid: string, evt: TurnFinis
       text: body,
       ...(evt.form ? { form: evt.form } : {}),
       ...(evt.produced.length ? { produced: evt.produced } : {}),
-      ...(evt.createdAgent ? { createdAgent: evt.createdAgent } : {}),
+      ...(evt.createdAgents && evt.createdAgents.length ? { createdAgents: evt.createdAgents } : {}),
+      ...(evt.createdSkills && evt.createdSkills.length ? { createdSkills: evt.createdSkills } : {}),
     };
   }
   // Empty final, no side effects.
@@ -443,7 +455,8 @@ async function applyPlanStepTurn(
     kind: 'persist',
     text: evt.finalText,
     ...(evt.produced.length ? { produced: evt.produced } : {}),
-    ...(evt.createdAgent ? { createdAgent: evt.createdAgent } : {}),
+    ...(evt.createdAgents && evt.createdAgents.length ? { createdAgents: evt.createdAgents } : {}),
+    ...(evt.createdSkills && evt.createdSkills.length ? { createdSkills: evt.createdSkills } : {}),
   };
 }
 
@@ -528,14 +541,15 @@ function errorBubble(msg: string): string {
  */
 function abortOutcome(evt: TurnFinishedEvent): TurnOutcome {
   const partial = (evt.finalText || '').trim();
-  const hasSideEffect = !!evt.form || !!evt.createdAgent || (evt.produced && evt.produced.length > 0);
+  const hasSideEffect = !!evt.form || (!!evt.createdAgents && evt.createdAgents.length > 0) || (!!evt.createdSkills && evt.createdSkills.length > 0) || (evt.produced && evt.produced.length > 0);
   if (!partial && !hasSideEffect) return { kind: 'silent' };
   return {
     kind: 'persist',
     text: evt.finalText || '',
     ...(evt.form ? { form: evt.form } : {}),
     ...(evt.produced && evt.produced.length ? { produced: evt.produced } : {}),
-    ...(evt.createdAgent ? { createdAgent: evt.createdAgent } : {}),
+    ...(evt.createdAgents && evt.createdAgents.length ? { createdAgents: evt.createdAgents } : {}),
+    ...(evt.createdSkills && evt.createdSkills.length ? { createdSkills: evt.createdSkills } : {}),
   };
 }
 

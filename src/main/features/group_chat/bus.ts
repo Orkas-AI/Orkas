@@ -36,8 +36,9 @@ import {
 import {
   resolveRecipients, parseMentions, buildMention,
   extractFormFromFinal, computeFormId, ChatFormPayload,
-  extractAgentFieldBlocks, decodeSubmission,
+  extractAgentFieldBlocks, extractSkillContainers, decodeSubmission,
 } from './router';
+import * as skillsFeat from '../skills';
 import {
   setPlan, updateStep, readPlan, formatPlanAnnouncement, formatPlanForPrompt,
   PlanSetInput, StepStatus, PlanFile,
@@ -269,7 +270,8 @@ export interface EnqueueParams {
   attachments?: string[];
   produced?: string[];
   form?: ChatFormPayload;
-  created_agent?: { agent_id: string; name: string };
+  created_agents?: Array<{ agent_id: string; name: string; kind?: 'created' | 'updated' }>;
+  created_skills?: Array<{ skill_id: string; name: string; kind?: 'created' | 'updated' }>;
   plan_announcement?: boolean;
   /** Override resolved recipients (commander emitting plan announcement
    *  uses this to force `to=[user]`). Otherwise router decides. */
@@ -533,7 +535,8 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     ...(params.attachments && params.attachments.length ? { attachments: params.attachments } : {}),
     ...(params.produced && params.produced.length ? { produced: params.produced } : {}),
     ...(params.form ? { form: params.form } : {}),
-    ...(params.created_agent ? { created_agent: params.created_agent } : {}),
+    ...(params.created_agents && params.created_agents.length ? { created_agents: params.created_agents } : {}),
+    ...(params.created_skills && params.created_skills.length ? { created_skills: params.created_skills } : {}),
     ...(params.plan_announcement ? { plan_announcement: true } : {}),
     ...(params.dispatch ? { dispatch: true } : {}),
     ...(params.process && params.process.length ? { process: params.process } : {}),
@@ -1009,7 +1012,8 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // failed) live in plan_executor.onTurnFinished.
   let workingText = finalText || '';
   let form: ChatFormPayload | undefined;
-  let createdAgent: { agent_id: string; name: string; kind: 'created' | 'updated' } | undefined;
+  const createdAgents: Array<{ agent_id: string; name: string; kind: 'created' | 'updated' }> = [];
+  const createdSkills: Array<{ skill_id: string; name: string; kind: 'created' | 'updated' }> = [];
 
   if (actor.kind === 'agent' && workingText) {
     const r = extractFormFromFinal(workingText, actor.id);
@@ -1025,48 +1029,79 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     }
   } else if (isCommander && workingText) {
     const r = extractAgentFieldBlocks(workingText);
-    if (Object.keys(r.fields).length) {
+    if (r.blocks.length) {
       workingText = r.cleanText;
-      // `<agent_id>` present → edit an existing custom agent;
-      // absent → create a new one. Same `<agent>` container shape;
-      // the dispatch decision is single-bit.
-      const editId = r.fields.agent_id;
-      try {
-        if (editId) {
-          const target = await agentsFeat.getAgent(editId);
-          if (!target) {
-            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent edit failed: agent not found (id=${editId}).</span>`;
-          } else if (target.source !== 'custom') {
-            // Built-in agent — read-only here; the dev-mode inline edit chat
-            // remains the only path that can mutate builtins (per §6).
-            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Built-in agents can't be edited from the main chat; fork one in the right-hand detail panel and edit there.</span>`;
-          } else if (agentsFeat.isCliAgent(target)) {
-            // CLI-backed agent — runtime / model / args are owned by the
-            // create-modal + edit-form, not the LLM. Same constraint as
-            // chat_agent_setup_cli.md applies to the commander flow.
-            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ External agents can only be edited from the right-hand detail panel.</span>`;
-          } else {
-            const updated = await agentsFeat.updateCustomAgent(editId, r.fields);
-            if (updated) {
-              createdAgent = { agent_id: updated.agent_id, name: updated.name, kind: 'updated' };
+      // Apply each `<agent>` block independently. A failed block appends
+      // its own warning span to workingText and is omitted from
+      // createdAgents — the chip slot only fills when the spec was
+      // actually written. Subsequent blocks still attempt their own apply.
+      for (const fields of r.blocks) {
+        if (!Object.keys(fields).length) continue;
+        const editId = fields.agent_id;
+        try {
+          if (editId) {
+            const target = await agentsFeat.getAgent(editId);
+            if (!target) {
+              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent edit failed: agent not found (id=${editId}).</span>`;
+            } else if (target.source !== 'custom') {
+              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Built-in agents can't be edited from the main chat; fork one in the right-hand detail panel and edit there.</span>`;
+            } else if (agentsFeat.isCliAgent(target)) {
+              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ External agents can only be edited from the right-hand detail panel.</span>`;
             } else {
-              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent update failed.</span>`;
+              const updated = await agentsFeat.updateCustomAgent(editId, fields);
+              if (updated) {
+                createdAgents.push({ agent_id: updated.agent_id, name: updated.name, kind: 'updated' });
+              } else {
+                workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent update failed.</span>`;
+              }
+            }
+          } else {
+            const ag = await agentsFeat.createAgentFromBlocks(fields);
+            if (ag) {
+              createdAgents.push({ agent_id: ag.agent_id, name: ag.name, kind: 'created' });
+            } else {
+              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent creation failed: missing required field(s) (name / workflow).</span>`;
             }
           }
-        } else {
-          const ag = await agentsFeat.createAgentFromBlocks(r.fields);
-          if (ag) {
-            createdAgent = { agent_id: ag.agent_id, name: ag.name, kind: 'created' };
-          } else {
-            // Append failure marker to text — onTurnFinished will surface
-            // it as a normal `persist` outcome.
-            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent creation failed: missing required field(s) (name / workflow).</span>`;
-          }
+        } catch (err) {
+          const verb = editId ? 'edit' : 'create';
+          log.error(`${verb}-agent failed cid=${cid}: ${(err as Error).message}`);
+          workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent ${verb} failed: ${(err as Error).message}</span>`;
         }
-      } catch (err) {
-        const verb = editId ? 'edit' : 'create';
-        log.error(`${verb}-agent failed cid=${cid}: ${(err as Error).message}`);
-        workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent ${verb} failed: ${(err as Error).message}</span>`;
+      }
+    }
+
+    // `<skill>` container — parallel to `<agent>` above. Commander only.
+    // The container is independent of `<agent>`; both can co-exist in one
+    // turn in principle, though the prompt encourages one-at-a-time. Best-
+    // effort: a rejected file path within the container does not abort the
+    // remaining writes, mirroring the per-skill edit chat. The localized
+    // error string returned by `applySkillContainerFromCommander` already
+    // covers built-in / not-found / charset / collision cases — bus only
+    // appends the pill.
+    const skillR = extractSkillContainers(workingText);
+    if (skillR.containers.length) {
+      workingText = skillR.cleanText;
+      // Apply each `<skill>` container independently. A failed container
+      // appends its own warning span and is omitted from createdSkills —
+      // the chip slot only fills when the spec was actually written.
+      for (const container of skillR.containers) {
+        try {
+          const result = await skillsFeat.applySkillContainerFromCommander(container);
+          if (result.ok && result.skillId && result.name && result.kind) {
+            createdSkills.push({ skill_id: result.skillId, name: result.name, kind: result.kind });
+            if (result.rejected && result.rejected.length) {
+              const list = result.rejected.map((p) => `\`${p}\``).join(', ');
+              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Some skill files were rejected: ${list}</span>`;
+            }
+          } else {
+            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ ${result.error || 'Skill operation failed.'}</span>`;
+          }
+        } catch (err) {
+          const verb = container.skillId ? 'edit' : 'create';
+          log.error(`${verb}-skill failed cid=${cid}: ${(err as Error).message}`);
+          workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Skill ${verb} failed: ${(err as Error).message}</span>`;
+        }
       }
     }
   }
@@ -1097,7 +1132,8 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       aborted,
       ...(form ? { form } : {}),
       produced,
-      ...(createdAgent ? { createdAgent } : {}),
+      ...(createdAgents.length ? { createdAgents } : {}),
+      ...(createdSkills.length ? { createdSkills } : {}),
       trigger,
       activityEvents,
     });
@@ -1110,7 +1146,8 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       text: workingText || '(no reply)',
       ...(form ? { form } : {}),
       ...(produced.length ? { produced } : {}),
-      ...(createdAgent ? { createdAgent } : {}),
+      ...(createdAgents.length ? { createdAgents } : {}),
+      ...(createdSkills.length ? { createdSkills } : {}),
     };
   }
 
@@ -1195,7 +1232,10 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       text: outcome.text,
       ...(outcome.form ? { form: outcome.form } : {}),
       ...(outcome.produced && outcome.produced.length ? { produced: outcome.produced } : {}),
-      ...(outcome.createdAgent ? { created_agent: outcome.createdAgent } : {}),
+      ...(outcome.createdAgents && outcome.createdAgents.length ? { created_agents: outcome.createdAgents } : {}),
+      ...(outcome.createdSkills && outcome.createdSkills.length
+        ? { created_skills: outcome.createdSkills.map((s) => ({ skill_id: s.skill_id, name: s.name })) }
+        : {}),
       ...(pendingPlan && actor.kind === 'commander'
         ? { plan_announcement: true, forceTo: [USER_ID] } : {}),
       ...(processItems.length ? { process: processItems } : {}),
@@ -1262,7 +1302,8 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     + ` outcome=${outcome.kind}`
     + ` events=${activityEvents}`
     + (form ? ' form=1' : '')
-    + (createdAgent ? ` created_agent=${createdAgent.agent_id}` : '')
+    + (createdAgents.length ? ` created_agents=${createdAgents.map(a => a.agent_id).join(',')}` : '')
+    + (createdSkills.length ? ` created_skills=${createdSkills.map(s => s.skill_id).join(',')}` : '')
     + (produced.length ? ` produced=${produced.length}` : '')
     + (item.triggered_step !== undefined ? ` step=${item.triggered_step}` : '')
     + (errText ? ` err=${errText}` : '')

@@ -220,7 +220,7 @@ plan_set({
 
 ## Creating or editing an agent
 
-Both flows emit ONE `<agent>...</agent>` container in this turn and end (do NOT call `dispatch_to`). The container shape is identical; whether the system creates a new agent or patches an existing one is decided by a single optional first child:
+Emit one `<agent>...</agent>` container per agent being created or edited this turn — typically one; emit several only when a single user request spans distinct agents (e.g. "tighten the workflow on A and B"). Each container is parsed and applied independently. End the turn after (do NOT call `dispatch_to`). The container shape is identical; whether the system creates a new agent or patches an existing one is decided by a single optional first child:
 
 **Do NOT call `write_file` / `bash` to dump the `<agent>` container as a file** (e.g. `<name>-agent-definition.xml`). The container is a contract between the LLM and the server: the server parses the inline container in your reply and persists it to `agent.json`. An extra `write_file` only leaks an unused XML file into the user's workspace — there is no downstream consumer for it. Pitfall: this has already shipped a stray `GEO-agent-definition.xml` to the workspace once.
 
@@ -321,6 +321,76 @@ When you need to express the corresponding concept, write a sentence in the user
 - skills → describe as "what capabilities the agent uses".
 
 Pattern (also written in user UI language): briefly state what was crystallized, what it does, and where to refine further — without exposing field names.
+
+---
+
+## Creating or editing a skill
+
+Emit one `<skill>...</skill>` container per skill being created or edited this turn — typically one; emit several only when a single user request spans distinct skills. Each container is parsed and applied independently. The container wraps an optional `<skill_id>` plus one or more `<<<skill-file>>>` blocks; the `<skill_id>` decides create vs edit. End the turn after (do NOT call `dispatch_to`).
+
+**Do NOT call `write_file` / `bash` to dump the container or any inner block as a file** — the server parses them inline and persists each block to `<skill_dir>/<path>`. An extra `write_file` only leaks an unused scratch file into the workspace.
+
+### When to create vs edit
+
+- **No `<skill_id>`** → create a brand-new skill. Triggered by "make / write me a skill that does X" / "把这个能力封装成 skill". The new skill's id comes from the SKILL.md frontmatter `name` field; you choose it.
+- **With `<skill_id>X</skill_id>`** → patch an existing custom skill X. Triggered when the user asks to adjust some specific skill — `X` MUST come from the `## Available skills` block; do NOT invent.
+
+### Quality bar (applies to both)
+
+> The skill detail panel hosts a dedicated edit chat that owns the long-form authoring rules for SKILL.md. The principles below are the shared subset every author must keep — the difference between a skill the LLM picks at runtime and one that's effectively dead.
+
+- **SKILL.md frontmatter has exactly three fields, all required**: `name`, `description_zh`, `description_en`. No `requires` / `external_deps` / `tags` / `version` / single-language `description`. External dependencies go in the body's "External dependencies" section as plain text.
+- **`name` is the skill id AND the directory name** — strict ASCII charset: letters / digits / `_` / `-` (single internal spaces between word groups allowed). No Chinese / pinyin / `.` / `/`. Pick a short descriptive English slug (e.g. `social-fetch`, `code-reviewer`). The validator rejects any other charset and the create fails. **`name` is NOT translated to the user's UI language** — it's an identifier, not display copy.
+- **`description_zh` + `description_en`** decide whether the LLM picks the skill at runtime. Write each independently in the **same three-part formula** described in the agent section above (① one-line function ; ② quoted real user phrasings ; ③ trigger keywords). Don't direct-translate.
+- **SKILL.md body** is API-doc style: when to use / how to call / return format / external dependencies / examples. **Prefer guide-type (no script)**: if the task can be done with main-conversation generic tools (file IO / `kb_search` / `web_fetch` / `bash` / etc.), the body lists 3–7 actionable steps and `scripts/` is empty. Add `scripts/<basename>.<ext>` ONLY when the task needs dedicated code (complex parsing / signature verification / third-party API state). Each skill stands alone — do NOT reference other skill ids inside the body.
+- **Script invocation template** (when you do write one): `$ORKAS_NODE $ORKAS_PC_DIR/bin/run-skill.cjs <skill-id> <basename> [-- args...]` (no `bash` prefix; the bash tool runs `command` itself). Default extension `.py` (also allowed: `.ts/.mjs/.js/.sh/.rb`); cross-platform required.
+
+### `<<<skill-file>>>` block + container format
+
+Each file under the skill directory is written via:
+
+```
+<<<skill-file path=<rel-path>
+…full file content…
+>>>
+```
+
+- `path=` is **relative to the skill directory** (e.g. `SKILL.md` / `scripts/fetch.py`); `..` and absolute paths are rejected.
+- Each block is a **whole-file replacement** of `path`; partial edits → read the file first, then write the full new version.
+- A single `<skill>` container may contain multiple blocks (SKILL.md + scripts + examples). Failures within one block do not roll back earlier successful writes; the rejected paths surface as an error pill in this turn's reply.
+
+Container shape:
+
+```
+<skill>
+<skill_id>(omit when creating; required when editing)</skill_id>
+<<<skill-file path=SKILL.md
+---
+name: short-ascii-id
+description_zh: ① 一句功能 ;② 适合"用户原话1""用户原话2";③ 触发词:词1、词2、…
+description_en: ① one-line function ; ② For: "user phrasing 1", "user phrasing 2" ; ③ Triggers: word1, word2, …
+---
+
+# Body sections per the Quality bar above
+>>>
+<<<skill-file path=scripts/<basename>.py
+…optional implementation script…
+>>>
+</skill>
+```
+
+### Editing an existing skill — required loop
+
+1. **Read the current SKILL.md** via the `read_file(<ROOT>/<id>/SKILL.md)` pattern in the `## Available skills` block header. Never rewrite from memory — `<<<skill-file>>>` is whole-file replacement; emitting a partial SKILL.md wipes the rest of the body.
+2. **If `Source: builtin`** → reply with one prose line in the user's UI language saying built-in skills can't be edited from the main conversation; the user can fork a custom copy from the detail panel. Then stop. **Do not emit `<skill>`**.
+3. **Emit `<skill>` with `<skill_id>` first**, then only the `<<<skill-file>>>` blocks you're changing. SKILL.md edits may change `name`; the system auto-renames the directory to match.
+
+### The conversation prose outside the container is what the user sees
+
+Talk about what the skill does / when it gets invoked / what you adjusted this round, in the user's UI language. **The conversation prose must NOT contain** any of: `frontmatter` / `description` field / `description_zh` / `description_en` / `<skill>` / `<skill_id>` / `<<<skill-file>>>` / "three-part formula" / "guide-type" / "executable" / id / hex strings.
+
+Wrong: "I wrote `SKILL.md` frontmatter with `description_zh` + `description_en` in three-part form."
+Right: "I wrote a skill `social-fetch` that scrapes posts on the platforms you mentioned and produces a sentiment summary. It gets invoked when you ask things like 分析一下小红书最近的 X 话题."
 
 ---
 

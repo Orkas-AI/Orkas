@@ -1094,80 +1094,91 @@ export interface ExtractedFields {
   interactive?: boolean;
 }
 
-export function extractAgentFieldBlocks(text: string): { cleanText: string; fields: ExtractedFields } {
-  if (!text || text.indexOf('<agent>') < 0) return { cleanText: text, fields: {} };
+function _parseAgentBlock(inner: string): ExtractedFields {
   const fields: ExtractedFields = {};
-  // Only parse the FIRST container in a turn — the LLM is instructed to
-  // emit one per reply. Subsequent containers (shouldn't happen) still get
-  // stripped below via the global-flag replace.
-  const first = text.match(/<agent>([\s\S]*?)<\/agent>/);
-  if (first) {
-    const inner = first[1];
-    const aidM = inner.match(AGENT_CHILD_RE('agent_id'));
-    if (aidM) {
-      const v = aidM[1].trim();
-      if (safeId(v)) fields.agent_id = v;
-    }
-    const nameM = inner.match(AGENT_CHILD_RE('name'));
-    if (nameM) {
-      const v = nameM[1].trim();
-      if (v) fields.name = v;
-    }
-    const descM = inner.match(AGENT_CHILD_RE('description'));
-    if (descM) {
-      const v = descM[1].trim();
-      if (v) fields.description = v;
-    }
-    const descZhM = inner.match(AGENT_CHILD_RE('description_zh'));
-    if (descZhM) {
-      const v = descZhM[1].trim();
-      if (v) fields.description_zh = v;
-    }
-    const descEnM = inner.match(AGENT_CHILD_RE('description_en'));
-    if (descEnM) {
-      const v = descEnM[1].trim();
-      if (v) fields.description_en = v;
-    }
-    const wfM = inner.match(AGENT_CHILD_RE('workflow'));
-    if (wfM) {
-      const v = wfM[1].trim();
-      if (v) fields.workflow = v;
-    }
-    const skM = inner.match(AGENT_CHILD_RE('skills'));
-    if (skM) {
-      // One skill_id per line; empty body / all-blanks → explicit []
-      // (zero skills). Non-safeId entries are dropped with no warning.
-      fields.skill_list = skM[1]
-        .split(/\r?\n/)
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0 && safeId(s));
-    }
-    const inM = inner.match(AGENT_CHILD_RE('inputs'));
-    if (inM) {
-      const trimmed = inM[1].trim();
-      if (trimmed === '' || trimmed === '[]') {
-        fields.inputs = [];
-      } else {
-        try {
-          const parsed = JSON.parse(trimmed);
-          fields.inputs = validateAgentInputs(parsed);
-        } catch (err) {
-          log.warn(`<inputs> JSON parse failed: ${(err as Error).message}`);
-          // Leave fields.inputs unset — malformed JSON shouldn't erase the
-          // previous schema; let the next turn re-emit and fix it.
-        }
+  const aidM = inner.match(AGENT_CHILD_RE('agent_id'));
+  if (aidM) {
+    const v = aidM[1].trim();
+    if (safeId(v)) fields.agent_id = v;
+  }
+  const nameM = inner.match(AGENT_CHILD_RE('name'));
+  if (nameM) {
+    const v = nameM[1].trim();
+    if (v) fields.name = v;
+  }
+  const descM = inner.match(AGENT_CHILD_RE('description'));
+  if (descM) {
+    const v = descM[1].trim();
+    if (v) fields.description = v;
+  }
+  const descZhM = inner.match(AGENT_CHILD_RE('description_zh'));
+  if (descZhM) {
+    const v = descZhM[1].trim();
+    if (v) fields.description_zh = v;
+  }
+  const descEnM = inner.match(AGENT_CHILD_RE('description_en'));
+  if (descEnM) {
+    const v = descEnM[1].trim();
+    if (v) fields.description_en = v;
+  }
+  const wfM = inner.match(AGENT_CHILD_RE('workflow'));
+  if (wfM) {
+    const v = wfM[1].trim();
+    if (v) fields.workflow = v;
+  }
+  const skM = inner.match(AGENT_CHILD_RE('skills'));
+  if (skM) {
+    // One skill_id per line; empty body / all-blanks → explicit []
+    // (zero skills). Non-safeId entries are dropped with no warning.
+    fields.skill_list = skM[1]
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0 && safeId(s));
+  }
+  const inM = inner.match(AGENT_CHILD_RE('inputs'));
+  if (inM) {
+    const trimmed = inM[1].trim();
+    if (trimmed === '' || trimmed === '[]') {
+      fields.inputs = [];
+    } else {
+      try {
+        const parsed = JSON.parse(trimmed);
+        fields.inputs = validateAgentInputs(parsed);
+      } catch (err) {
+        log.warn(`<inputs> JSON parse failed: ${(err as Error).message}`);
+        // Leave fields.inputs unset — malformed JSON shouldn't erase the
+        // previous schema; let the next turn re-emit and fix it.
       }
     }
-    const itM = inner.match(AGENT_CHILD_RE('interactive'));
-    if (itM) {
-      const v = itM[1].trim().toLowerCase();
-      if (v === 'true') fields.interactive = true;
-      else if (v === 'false') fields.interactive = false;
-      // Any other body → leave key omitted; previous flag survives.
-    }
+  }
+  const itM = inner.match(AGENT_CHILD_RE('interactive'));
+  if (itM) {
+    const v = itM[1].trim().toLowerCase();
+    if (v === 'true') fields.interactive = true;
+    else if (v === 'false') fields.interactive = false;
+    // Any other body → leave key omitted; previous flag survives.
+  }
+  return fields;
+}
+
+/**
+ * Extract every `<agent>...</agent>` container in emission order. Each
+ * block is parsed independently; a malformed sub-tag in one block does
+ * not affect the others. Returns `blocks: []` when no container exists.
+ */
+export function extractAgentFieldBlocks(
+  text: string,
+): { cleanText: string; blocks: ExtractedFields[] } {
+  if (!text || text.indexOf('<agent>') < 0) return { cleanText: text, blocks: [] };
+  const blocks: ExtractedFields[] = [];
+  // Iterate every container with the global-flag regex (NOT just the
+  // first). `AGENT_CONTAINER_RE` carries `/g` so successive `.exec` calls
+  // walk forward; we use `matchAll` for a flat collection.
+  for (const m of text.matchAll(AGENT_CONTAINER_RE)) {
+    blocks.push(_parseAgentBlock(m[1]));
   }
   const cleaned = text.replace(AGENT_CONTAINER_RE, '').replace(/\n{3,}/g, '\n\n').trim();
-  return { cleanText: cleaned, fields };
+  return { cleanText: cleaned, blocks };
 }
 
 function agentChatDir(userId: string, agentId: string): string {
@@ -1323,7 +1334,9 @@ export async function sendToAgentEditChat(userId: string, agentId: string, conte
     return { ok: false, message: errMsg, error: result.error || '' };
   }
 
-  const { cleanText, fields } = extractAgentFieldBlocks(result.text);
+  const { cleanText, blocks } = extractAgentFieldBlocks(result.text);
+  // Inline edit chat is bound to one agent; apply only the first block.
+  const fields = blocks[0] || {};
   const updated: ExtractedFields = {};
   if (Object.keys(fields).length) {
     await updateCustomAgent(agentId, fields);
@@ -1391,7 +1404,9 @@ export async function* streamSendToAgentEditChat(
       const synthesizedProgress: string[] = [];
       if (etype === 'final') {
         const raw = event.text || '';
-        const { cleanText, fields } = extractAgentFieldBlocks(raw);
+        const { cleanText, blocks } = extractAgentFieldBlocks(raw);
+        // Inline edit chat is bound to one agent; apply only the first block.
+        const fields = blocks[0] || {};
         if (Object.keys(fields).length) {
           await updateCustomAgent(agentId, fields);
           Object.assign(updated, fields);
