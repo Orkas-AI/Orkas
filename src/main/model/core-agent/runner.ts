@@ -86,8 +86,17 @@ export interface BuildRunnerParams {
   extraTools?: AgentTool[];
   /** Extra absolute directory roots whitelisted for file-tools (read_file /
    *  stat_file / search_files / grep_files) on top of workspace + attachment.
-   *  Used by skill-edit chats to expose the skill dir. */
+   *  Read AND write are permitted under these roots. Used by per-skill
+   *  edit chats to expose the skill dir. */
   extraRoots?: readonly string[];
+  /** Read-only extra roots: read tools (read_file / search_files /
+   *  grep_files / stat_file) can see them, but write-side tools
+   *  (edit_file / write_file / bash / markdown_to_pdf / html_to_pdf /
+   *  generate_image) cannot mutate paths inside. Used by group-chat
+   *  commander to inspect agent / skill specs without giving direct-write
+   *  access — the structured `<agent>` / `<skill>` containers are the
+   *  only sanctioned mutation channels for those resources. */
+  readOnlyExtraRoots?: readonly string[];
   /** Fires with the absolute path after each successful `write_file` /
    * `markdown_to_pdf` / `html_to_pdf` call. See `model/client.ts`
    * `ChatOptions.onFileWritten` for the caller-facing contract. */
@@ -199,11 +208,16 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // Same last-write-wins rule — placed after localTools so `read_file` wins
   // over core-agent's builtin `read_file`. Skipped when uid is unknown
   // (e.g. ad-hoc test runs) since file-tools need it for cache scoping.
+  // `readOnlyExtraRoots` is intentionally only threaded HERE — write-side
+  // localTools / image-gen-tool stay limited to workspace + attachment +
+  // (read-write) extraRoots, so paths the caller marks read-only physically
+  // can't be mutated by the LLM.
   const fileTools = uid
     ? createFileTools({
         userId: uid,
         ...(params.cid ? { cid: params.cid } : {}),
         ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
+        ...(params.readOnlyExtraRoots?.length ? { readOnlyExtraRoots: params.readOnlyExtraRoots } : {}),
       })
     : [];
 

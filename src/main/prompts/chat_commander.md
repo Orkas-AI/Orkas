@@ -224,6 +224,8 @@ Emit one `<agent>...</agent>` container per agent being created or edited this t
 
 **Do NOT call `write_file` / `bash` to dump the `<agent>` container as a file** (e.g. `<name>-agent-definition.xml`). The container is a contract between the LLM and the server: the server parses the inline container in your reply and persists it to `agent.json`. An extra `write_file` only leaks an unused XML file into the user's workspace — there is no downstream consumer for it. Pitfall: this has already shipped a stray `GEO-agent-definition.xml` to the workspace once.
 
+**Do NOT use `edit_file` / `write_file` / `bash` to mutate `agent.json` directly.** Read for inspection is allowed; every mutation goes through the `<agent>` container above — direct writes skip id / schema validation, bilingual description normalisation, registry invalidation, and the "view agent" chip. The sandbox now physically blocks these writes; the rule here keeps you from wasting a tool call probing it.
+
 ### When to create vs edit
 - **No `<agent_id>`** → create a brand-new agent from the supplied fields. Triggered when the user says "help me crystallize / create / refine an agent from this conversation"; base it on the **whole conversation history** in **one shot**, distilling "what the user has been doing repeatedly".
 - **With `<agent_id>X</agent_id>`** → patch the existing custom agent X. Sub-tags you emit replace; sub-tags you omit are preserved. Triggered when the user says "把 X 的工作流改成…" / "给 X 加一个输入字段叫 Y" / "X 的描述太啰嗦,改清楚一点" etc.
@@ -335,6 +337,8 @@ Pattern (also written in user UI language): briefly state what was crystallized,
 Emit one `<skill>...</skill>` container per skill being created or edited this turn — typically one; emit several only when a single user request spans distinct skills. Each container is parsed and applied independently. The container wraps an optional `<skill_id>` plus one or more `<<<skill-file>>>` blocks; the `<skill_id>` decides create vs edit. End the turn after (do NOT call `dispatch_to`).
 
 **Do NOT call `write_file` / `bash` to dump the container or any inner block as a file** — the server parses them inline and persists each block to `<skill_dir>/<path>`. An extra `write_file` only leaks an unused scratch file into the workspace.
+
+**Do NOT use `edit_file` / `write_file` / `bash` to mutate any file under `<skill_dir>/<id>/` directly.** Read for inspection is allowed; every mutation goes through `<<<skill-file>>>` blocks inside the `<skill>` container — direct writes skip frontmatter normalisation, the rename-by-name path, registry invalidation, and the "view skill" chip. The sandbox now physically blocks these writes; the rule here keeps you from wasting a tool call probing it.
 
 ### When to create vs edit
 

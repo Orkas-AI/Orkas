@@ -73,12 +73,22 @@ export interface FileToolsOpts {
    *  attachment scope (workspace-only). */
   cid?: string;
   /** Extra absolute directory roots to allow on top of workspace + attachment.
-   *  Used by skill-edit chats to expose the skill dir for read_file /
-   *  search_files / grep_files / stat_file. */
+   *  Read AND write are permitted under these roots — used by per-skill edit
+   *  chats to expose the skill dir for the `<<<skill-file>>>` tooling. */
   extraRoots?: readonly string[];
+  /** Read-only extra roots: file-tools (read_file / search_files / grep_files
+   *  / stat_file) can see these, but write-side tools (edit_file / write_file
+   *  / bash / markdown_to_pdf / html_to_pdf / generate_image) cannot mutate
+   *  paths inside. Used by the group-chat commander to inspect agent.json /
+   *  built-in agents / skill specs without giving direct-write access — the
+   *  `<agent>` / `<skill>` containers are the only sanctioned mutation
+   *  channels for those resources, and a sandbox-level lock keeps the LLM
+   *  honest even when its prompt strays. */
+  readOnlyExtraRoots?: readonly string[];
 }
 
-/** Assemble the allowed-roots list for the current (uid, cid). */
+/** Assemble the allowed-roots list for the current (uid, cid). File-tools
+ *  read side: workspace + attachment + extraRoots + readOnlyExtraRoots. */
 function allowedRoots(opts: FileToolsOpts): string[] {
   const roots: string[] = [];
   try {
@@ -91,6 +101,9 @@ function allowedRoots(opts: FileToolsOpts): string[] {
   }
   if (opts.extraRoots?.length) {
     for (const r of opts.extraRoots) if (r) roots.push(r);
+  }
+  if (opts.readOnlyExtraRoots?.length) {
+    for (const r of opts.readOnlyExtraRoots) if (r) roots.push(r);
   }
   return roots;
 }

@@ -847,22 +847,24 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     | { type: 'progress'; text: string }
     | { type: 'event'; event: { stream: string; data?: unknown } };
   const processItems: ProcessItem[] = [];
-  // Skill directories are referenced by `$builtin_skills_dir` /
-  // `$custom_skills_dir` template vars in the system prompt — commander +
-  // agents are explicitly told to `cat .../<id>/SKILL.md` to read the
-  // skill body before executing. Path-sandbox blocks anything outside
-  // workspace + attachment dir by default, so we have to expose the two
-  // skill roots here as `extraRoots` (mirrors the skill-edit chat pattern
-  // in features/skills.ts). Builtin first to match the prompt's
-  // "locate by source" guidance.
+  // Skill / agent directories are referenced by `$builtin_skills_dir` /
+  // `$custom_skills_dir` / `$custom_agents_dir` template vars in the
+  // system prompt — commander + agents are told to `cat .../<id>/SKILL.md`
+  // to read the skill body before executing, and to `read_file` an
+  // agent.json before emitting an `<agent>` edit container so the rewrite
+  // is grounded in current state. Path-sandbox blocks anything outside
+  // workspace + attachment by default, so we expose these as
+  // `readOnlyExtraRoots`: file-tools (read_file / search_files /
+  // grep_files / stat_file) can see them, but write-side tools
+  // (edit_file / write_file / bash / markdown_to_pdf / generate_image)
+  // cannot mutate paths inside. The structured `<agent>` / `<skill>`
+  // containers are the only sanctioned mutation channels — any direct
+  // edit_file would skip safeId / validateAgentInputs / bilingual
+  // description normalisation / cache invalidation / the "view detail"
+  // chip, so the sandbox-level lock keeps the LLM honest even if the
+  // prompt strays. Builtin first to match the prompt's "locate by
+  // source" guidance.
   const skillRoots = [BUILTIN_SKILLS_DIR, userSkillsDir(uid)];
-  // Same shape for agent directories: chat_commander.md tells the
-  // commander to `search_files` for an agent.json under
-  // `$custom_agents_dir/` and then `read_file` the matching agent.json
-  // before emitting an `<agent>` edit container — without these roots
-  // the read trips E_PATH_OUT_OF_SCOPE and the LLM falls back to
-  // rewriting from the slim `agents_index` view, which silently drops
-  // workflow / description / skill_list (the prompt warns about this).
   const agentRoots = [BUILTIN_AGENTS_DIR, userAgentsDir(uid)];
   if (cliAgent) {
     // CLI-backed agent path: spawn the local CLI in the user's workspace
@@ -954,7 +956,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       hasProducedPath,
       cacheRetention: 'short',
       abortSignal: w.abortController.signal,
-      extraRoots: [...skillRoots, ...agentRoots],
+      readOnlyExtraRoots: [...skillRoots, ...agentRoots],
       ...(extraTools.length ? { extraTools } : {}),
       ...(skillList !== undefined ? { skillList } : {}),
     })) {

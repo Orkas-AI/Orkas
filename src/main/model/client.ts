@@ -82,9 +82,18 @@ export interface ChatOptions {
    *  dir in addition to the user's active workspace. */
   cid?: string;
   /** Extra absolute directory roots whitelisted for file-tools on top of
-   *  workspace + attachment. Skill-edit chats pass the skill dir so the LLM
-   *  can read / search files it's about to overwrite via <<<skill-file>>>. */
+   *  workspace + attachment. Read AND write are permitted under these roots.
+   *  Per-skill edit chats pass the skill dir so the LLM can read / search /
+   *  overwrite files it manages. */
   extraRoots?: readonly string[];
+  /** Read-only extra roots: read tools (read_file / search_files /
+   *  grep_files / stat_file) can see these, but write-side tools
+   *  (edit_file / write_file / bash / markdown_to_pdf / html_to_pdf /
+   *  generate_image) cannot mutate paths inside. Used by group-chat
+   *  commander to inspect agent / skill specs while the structured
+   *  `<agent>` / `<skill>` containers remain the only sanctioned mutation
+   *  channels. */
+  readOnlyExtraRoots?: readonly string[];
   /** Fired with the absolute path of every file produced by the local-exec
    * tools (`write_file`, `markdown_to_pdf`, `html_to_pdf`) during this run.
    * `features/chats` uses this to attach a `produced[]` list to the

@@ -84,6 +84,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     skillList,
     extraTools,
     extraRoots,
+    readOnlyExtraRoots,
     agentId,
     cid,
     onFileWritten,
@@ -178,6 +179,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(skillList !== undefined ? { skillList } : {}),
       ...(extraTools && extraTools.length ? { extraTools } : {}),
       ...(extraRoots && extraRoots.length ? { extraRoots } : {}),
+      ...(readOnlyExtraRoots && readOnlyExtraRoots.length ? { readOnlyExtraRoots } : {}),
       ...(onFileWritten ? { onFileWritten } : {}),
       ...(hasProducedPath ? { hasProducedPath } : {}),
     });
