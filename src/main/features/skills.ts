@@ -1287,7 +1287,14 @@ export async function sendToSkillChat(userId: string, skillId: string, content: 
   const result = await chatWithModel({
     userId, message: content, sessionId, systemPrompt,
     agentName: 'orkas_chat', timeout: 300,
-    ...(skill.dir ? { extraRoots: [skill.dir] } : {}),
+    // Read-only: the LLM in per-skill edit chat sees the skill dir for
+    // inspection (read_file / search_files / grep_files / stat_file), but
+    // every mutation goes through `<<<skill-file>>>` blocks parsed
+    // post-stream (which routes through `writeSkillFileForEdit` →
+    // rename-by-frontmatter / registry invalidation / progress events).
+    // Direct edit_file / write_file / bash on this dir would skip all
+    // that, so it's blocked at the sandbox level.
+    ...(skill.dir ? { readOnlyExtraRoots: [skill.dir] } : {}),
   });
 
   if (!result.ok) {
@@ -1370,7 +1377,7 @@ export async function* streamSendToSkillChat(
       userId, message: content, sessionId, systemPrompt,
       agentName: 'orkas_chat',
       cacheRetention: 'short',
-      ...(skill.dir ? { extraRoots: [skill.dir] } : {}),
+      ...(skill.dir ? { readOnlyExtraRoots: [skill.dir] } : {}),
       ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
     }) as AsyncIterable<any>) {
       const etype = event.type;
