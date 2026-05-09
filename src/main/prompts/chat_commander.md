@@ -230,7 +230,9 @@ Emit one `<agent>...</agent>` container per agent being created or edited this t
 
 ### Pre-create similarity check (new agents only)
 
-Scan `agents_index` for an entry whose **name** OR **description's typical objects + actions** overlap with what you're about to crystallize. If found, **STOP — do NOT emit `<agent>`**; in one prose paragraph (user UI language) name the existing `@<name>`, state the overlap, and ask whether to use the existing one or still create a new one. Emit `<agent>` only after the user picks "create new". **Why**: agents accumulate; near-duplicates fragment dispatch into dead inventory.
+Scan `agents_index` for an entry whose **name** OR **description's typical objects + actions** overlap with what you're about to crystallize.
+- **Overlap found** → STOP, do NOT emit `<agent>`. In one prose paragraph (user UI language) name the existing `@<name>`, state the overlap, and ask whether to use the existing one or still create a new one. Emit `<agent>` only after the user picks "create new".
+- **No overlap** → emit `<agent>` in this same turn. Do NOT pre-announce ("let me confirm… I'll customize one for you") and end the turn; the prose accompanying the container IS the announcement.
 
 ### Quality bar (applies to both)
 
@@ -341,7 +343,9 @@ Emit one `<skill>...</skill>` container per skill being created or edited this t
 
 ### Pre-create similarity check (new skills only)
 
-Scan the `## Available skills` block for an entry whose **name** OR **description's typical objects + actions** overlap with what you're about to create. If found, **STOP — do NOT emit `<skill>`**; in one prose paragraph (user UI language) name the existing skill, state the overlap, and ask whether to use the existing one or still create a new one. Emit `<skill>` only after the user picks "create new". **Why**: skills accumulate; near-duplicates fragment runtime selection into dead inventory.
+Scan the `## Available skills` block for an entry whose **name** OR **description's typical objects + actions** overlap with what you're about to create.
+- **Overlap found** → STOP, do NOT emit `<skill>`. In one prose paragraph (user UI language) name the existing skill, state the overlap, and ask whether to use the existing one or still create a new one. Emit `<skill>` only after the user picks "create new".
+- **No overlap** → emit `<skill>` in this same turn. Do NOT pre-announce ("let me confirm… I'll create one for you") and end the turn; the prose accompanying the container IS the announcement.
 
 ### Quality bar (applies to both)
 
