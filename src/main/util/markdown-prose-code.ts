@@ -7,12 +7,13 @@
 // the backend to falsely "extract" the example as a real container and
 // persist nonexistent files.
 //
-// Logic mirror is intentional — the renderer already pins set A / set B
-// fixtures (`test/renderer/strip-structural-blocks.test.ts`); the backend port has
-// its own fixtures (`test/main/util/markdown-prose-code.test.ts`) that
-// cross-check the same shapes against this TS implementation. Both
-// copies must stay in sync; if you change one, change the other and
-// extend BOTH fixture sets.
+// Logic mirror is intentional — the renderer pins set A / set B fixtures
+// directly in `test/renderer/strip-structural-blocks.test.ts`; the
+// backend port is exercised indirectly through
+// `test/main/features/skills.test.ts` (B5/B6/B7 cover the prose/code
+// guard against `extractSkillContainers`). Both copies must stay in
+// sync; if you change one, change the other and extend BOTH fixture
+// sets.
 //
 // Why duplicated rather than shared: renderer is vanilla JS without
 // imports (PC/CLAUDE.md §8); main is TS with strict layering (§3, no
