@@ -584,12 +584,12 @@ describe("Evolution: AgentRunner integration", () => {
     const evaluation = runner.evaluateReflection(result);
     expect(evaluation).not.toBeNull();
     expect(evaluation!.primaryFocus).toBe("error_recovery");
-    // Adaptive review prompt is now English-headed (`buildAdaptiveReviewPrompt`
-    // in metacognition.ts), but `buildConversationDigest` still emits zh
-    // lines (`结果: 从错误中恢复，任务完成` etc.) in the body. Assert both:
-    // the English head + the zh recovery line + the user-supplied result.text.
+    // Adaptive review prompt = English head (buildAdaptiveReviewPrompt) +
+    // English digest body (buildConversationDigest's "Outcome: recovered
+    // from the error and completed the task") + the user-supplied
+    // result.text appended verbatim.
     expect(evaluation!.prompt).toContain("conversation digest");
-    expect(evaluation!.prompt).toContain("从错误中恢复");
+    expect(evaluation!.prompt).toContain("recovered from the error");
     expect(evaluation!.prompt).toContain("Task completed");
   });
 
