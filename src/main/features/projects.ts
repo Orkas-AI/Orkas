@@ -17,6 +17,7 @@
  * but no writes happen yet.
  */
 
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
@@ -45,8 +46,7 @@ export interface ProjectWithStats extends Project {
 // ── id helper ─────────────────────────────────────────────────────────────
 
 function genProjectId(): string {
-  // 8-hex; collision-safe enough for per-user project counts.
-  return 'p_' + Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, '0');
+  return 'p_' + crypto.randomBytes(6).toString('hex');
 }
 
 // ── index IO ──────────────────────────────────────────────────────────────
