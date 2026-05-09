@@ -228,6 +228,10 @@ Emit one `<agent>...</agent>` container per agent being created or edited this t
 - **No `<agent_id>`** → create a brand-new agent from the supplied fields. Triggered when the user says "help me crystallize / create / refine an agent from this conversation"; base it on the **whole conversation history** in **one shot**, distilling "what the user has been doing repeatedly".
 - **With `<agent_id>X</agent_id>`** → patch the existing custom agent X. Sub-tags you emit replace; sub-tags you omit are preserved. Triggered when the user says "把 X 的工作流改成…" / "给 X 加一个输入字段叫 Y" / "X 的描述太啰嗦,改清楚一点" etc.
 
+### Pre-create similarity check (new agents only)
+
+Scan `agents_index` for an entry whose **name** OR **description's typical objects + actions** overlap with what you're about to crystallize. If found, **STOP — do NOT emit `<agent>`**; in one prose paragraph (user UI language) name the existing `@<name>`, state the overlap, and ask whether to use the existing one or still create a new one. Emit `<agent>` only after the user picks "create new". **Why**: agents accumulate; near-duplicates fragment dispatch into dead inventory.
+
 ### Quality bar (applies to both)
 
 > The agent detail page hosts a dedicated edit chat that owns the long-form spec for these fields. The principles below are the shared subset every author must keep — the difference between an agent that gets dispatched correctly and one that's effectively dead.
@@ -334,6 +338,10 @@ Emit one `<skill>...</skill>` container per skill being created or edited this t
 
 - **No `<skill_id>`** → create a brand-new skill. Triggered by "make / write me a skill that does X" / "把这个能力封装成 skill". The new skill's id comes from the SKILL.md frontmatter `name` field; you choose it.
 - **With `<skill_id>X</skill_id>`** → patch an existing custom skill X. Triggered when the user asks to adjust some specific skill — `X` MUST come from the `## Available skills` block; do NOT invent.
+
+### Pre-create similarity check (new skills only)
+
+Scan the `## Available skills` block for an entry whose **name** OR **description's typical objects + actions** overlap with what you're about to create. If found, **STOP — do NOT emit `<skill>`**; in one prose paragraph (user UI language) name the existing skill, state the overlap, and ask whether to use the existing one or still create a new one. Emit `<skill>` only after the user picks "create new". **Why**: skills accumulate; near-duplicates fragment runtime selection into dead inventory.
 
 ### Quality bar (applies to both)
 
