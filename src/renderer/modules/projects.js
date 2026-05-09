@@ -412,6 +412,7 @@ function _openProjectRowMenu(anchorBtn, pid) {
   _closeProjectRowMenu();
 
   const items = [
+    { action: 'new_conv', label: t('project.menu.new_conv') },
     { action: 'rename', label: t('project.menu.rename') },
     { action: 'delete', label: t('project.menu.delete'), danger: true },
   ];
@@ -462,8 +463,18 @@ function _closeProjectRowMenu() {
 }
 
 async function _runProjectMenuAction(action, pid) {
+  if (action === 'new_conv') return _newConvWithProject(pid);
   if (action === 'rename') return _startProjectInlineRename(pid);
   if (action === 'delete') return _confirmDeleteProject(pid);
+}
+
+// Pin pid into the commander chip's localStorage key BEFORE switching view —
+// onEnterCommanderProjectChip (fired from boot.js view-change) reads the same
+// key and re-validates against _projectsCache, so by the time the new-chat
+// panel mounts the chip is already showing this project.
+function _newConvWithProject(pid) {
+  try { localStorage.setItem(_COMMANDER_LAST_PROJECT_KEY, pid); } catch (_) {}
+  setView('new-chat');
 }
 
 // ── Delete flow ─────────────────────────────────────────────────────────
