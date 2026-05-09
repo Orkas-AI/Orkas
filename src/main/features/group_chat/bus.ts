@@ -1781,41 +1781,6 @@ export function dropConv(uid: string, cid: string): void {
   _cids.delete(k);
 }
 
-/**
- * Watchdog hook — synthesise a system message into commander's worker
- * queue so it gets a turn to self-diagnose when a long-running plan has
- * gone silent. Bypasses `enqueue` (no main jsonl write, no visibility
- * slice, no UI message event) on purpose: the ping is a backend
- * mechanism, not group content. Commander's reply (if any) goes through
- * the normal `enqueue` path inside its `runTurn` post-turn → user sees
- * commander's actual response, never the ping itself.
- *
- * Idempotent / cheap: if the commander worker has anything queued, we
- * skip — no point doubling up. If state already aborted, also skip.
- */
-export async function pingCommanderForWatchdog(uid: string, cid: string, reason: string): Promise<boolean> {
-  const state = getOrInitCid(uid, cid);
-  await seedReservedActors(uid, cid);
-  const cur = await readState(uid, cid);
-  if (cur.status === 'aborted') return false;
-  // Find or seed commander actor in the roster.
-  const members = await readMembers(uid, cid);
-  const commander = members.actors.find((a) => a.id === COMMANDER_ID);
-  if (!commander) return false;
-  const w = ensureWorker(state, commander);
-  if (w.queue.length > 0 || w.running) return false; // already busy / pending
-  const llmPayload = `<msg from="system" to="commander">\n[watchdog] ${reason}\n</msg>`;
-  w.queue.push({
-    msgId: genId12(),
-    fromActorId: 'system',
-    llmPayload,
-  });
-  const wake = w.wake; w.wake = null;
-  wake?.();
-  log.info(`watchdog ping user=${uid} cid=${cid} reason=${reason}`);
-  return true;
-}
-
 export function _cidStateForTest(uid: string, cid: string): CidState | null {
   return _cids.get(cidKey(uid, cid)) || null;
 }

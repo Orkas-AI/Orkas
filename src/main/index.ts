@@ -280,15 +280,6 @@ async function runBootSelfCheck(): Promise<void> {
   try { await chatsFeature.sweepStaleProcessing(); }
   catch (err) { log.warn('chats sweep failed', { error: (err as Error).message }); }
 
-  // Stage 3.5: start the group-chat watchdog. Self-paced 60s scan; pings
-  // commander when a `running` conv with an `in_progress` plan step has
-  // been silent past STALE_THRESHOLD_MS (10min default). See
-  // features/group_chat/watchdog.ts.
-  try {
-    const groupChat = await import('./features/group_chat');
-    groupChat.startWatchdog();
-  } catch (err) { log.warn('watchdog start failed', { error: (err as Error).message }); }
-
   // Stage 4: file_cache orphan sweep — cheap stat-based scan.
   try {
     const uid = users.getActiveUserId();

@@ -39,7 +39,6 @@ export const busIsQuiescent = isQuiescent;
  *  if subscribe runs after send, those first events are lost. */
 export const subscribeBus = subscribe;
 
-export { startWatchdog, stopWatchdog } from './watchdog';
 import type { GroupMessage } from './visibility';
 import {
   type ChatFormPayload, encodeSubmission, buildMention,
