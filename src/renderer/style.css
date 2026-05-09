@@ -2711,7 +2711,7 @@ body.model-not-configured .main-content { flex-direction: column; }
 
 .stream-process {
   margin-bottom: 8px;
-  border-left: 2px solid #e5e7eb;
+  border-left: 2px solid #cbd5e1;
   padding-left: 10px;
 }
 .stream-process:not([open]) { margin-bottom: 0; }
@@ -2719,7 +2719,7 @@ body.model-not-configured .main-content { flex-direction: column; }
   cursor: pointer;
   list-style: none;
   font-size: 12px;
-  color: #6b7280;
+  color: #475569;
   padding: 2px 0;
   user-select: none;
   display: flex;
@@ -2736,7 +2736,7 @@ body.model-not-configured .main-content { flex-direction: column; }
   width: 16px;
   font-size: 13px;
   line-height: 1;
-  color: #6b7280;
+  color: #475569;
   transition: transform 0.15s;
 }
 .stream-process[open] .stream-process-summary::before {
@@ -2751,6 +2751,9 @@ body.model-not-configured .main-content { flex-direction: column; }
   padding: 4px 0;
   font-size: 11.5px;
   line-height: 1.55;
+  /* Default body color = the Normal tier (see ramp below). Lines whose
+     leading glyph isn't recognized by `_processKindOf` fall through to
+     this baseline and read as supporting context. */
   color: #94a3b8;
   font-family: ui-monospace, SFMono-Regular, monospace;
   /* Force text-style rendering for symbols like ▶ ✓ ◆ ⚙ ▸ ✎ — otherwise
@@ -2765,13 +2768,37 @@ body.model-not-configured .main-content { flex-direction: column; }
   white-space: pre-wrap;
   word-break: break-all;
 }
-.stream-process-line.kind-err   { color: #b91c1c; }
-.stream-process-line.kind-warn  { color: #b45309; }
-.stream-process-line.kind-patch { color: #047857; }
-.stream-process-line.kind-tool  { color: #475569; }
-.stream-process-line.kind-out   { color: #64748b; }
-.stream-process-line.kind-think { color: #6366f1; }
-.stream-process-line.kind-bound { color: #334155; font-weight: 500; }
+/* Four-tier hierarchy. The constraint: every content line must be
+   visually LIGHTER than the section header (`.stream-process-summary`,
+   slate-600 #475569 + 600) — content is supporting detail, the header
+   is the label. An earlier pass had bound/tool lines at slate-900 + 600
+   which inverted the hierarchy (content darker than its own label).
+   Tiers:
+     1. Core    — milestones / tool calls / plans / file edits;
+                  slate-500 + 500 weight. Distinguishable at a glance
+                  but still a notch below the header.
+     2. Normal  — reasoning, live preview, stdout, meta; slate-400.
+                  Same as the body baseline so unrecognized lines
+                  read as plain text, not "missing styling".
+     3. Warn    — awaiting approval / cli stderr. Kept as its own
+                  hue (light amber) because (a) red would over-alarm
+                  benign cli progress messages routed through stderr,
+                  and (b) folding into Normal loses the "someone is
+                  waiting on you" signal at the rail level.
+     4. Error   — hard error / failed tool; red-500 + 500 weight.
+   Glyphs in `_processKindOf` map into these classes — adding a new
+   glyph there needs a matching rule here, otherwise the line falls
+   back to the Normal baseline. */
+.stream-process-line.kind-bound { color: #64748b; font-weight: 500; }   /* ▶ ●  lifecycle milestones */
+.stream-process-line.kind-tool  { color: #64748b; font-weight: 500; }   /* ■    tool call */
+.stream-process-line.kind-plan  { color: #64748b; font-weight: 500; }   /* ▣    plan announcement */
+.stream-process-line.kind-patch { color: #64748b; font-weight: 500; }   /* ◉    file change */
+.stream-process-line.kind-think { color: #94a3b8; }                      /* ◆ ◇  reasoning / reply markers */
+.stream-process-line.kind-live  { color: #94a3b8; }                      /* ◐    live generating */
+.stream-process-line.kind-out   { color: #94a3b8; }                      /* ▷    command stdout */
+.stream-process-line.kind-meta  { color: #94a3b8; }                      /* ▪    fallback / lifecycle meta */
+.stream-process-line.kind-warn  { color: #d97706; }                      /* ○    awaiting approval / cli stderr */
+.stream-process-line.kind-err   { color: #ef4444; font-weight: 500; }   /* ◯ ✗  hard error / failed tool */
 
 .stream-final {
   /* Appears below process section with a subtle divider when process is open */

@@ -43,34 +43,6 @@ function resultPreview(s: string, max = 300): string {
 }
 
 /**
- * Pick the most human-readable slice of a tool's input for the single-line
- * progress log: bash → command, read/write/list → path, otherwise JSON.
- * The full `input` is still forwarded on the structured event so the UI
- * can render it richer if it wants to.
- */
-function inputSummary(name: string, input: unknown, max = 80): string {
-  if (input == null) return '';
-  const pick = (v: unknown): string => {
-    if (typeof v === 'string') return v;
-    if (typeof v === 'number' || typeof v === 'boolean') return String(v);
-    return '';
-  };
-  let raw = '';
-  if (input && typeof input === 'object') {
-    const rec = input as Record<string, unknown>;
-    if (name === 'bash') raw = pick(rec.command);
-    else if (name === 'read_file' || name === 'write_file' || name === 'list_files') raw = pick(rec.path);
-    if (!raw) {
-      try { raw = JSON.stringify(input); } catch { raw = String(input); }
-    }
-  } else {
-    raw = String(input);
-  }
-  const oneLine = raw.replace(/\s+/g, ' ').trim();
-  return oneLine.length > max ? oneLine.slice(0, max) + '…' : oneLine;
-}
-
-/**
  * Translate a raw retry reason (usually `err.message` from core-agent) into
  * a short user-facing phrase. The raw strings come from undici / pi-ai /
  * provider SDKs and are English / code-like; the process panel is
@@ -137,7 +109,6 @@ export async function* mapCoreAgentEvents(
       }
 
       case 'tool_start': {
-        const argStr = inputSummary(ev.name, ev.input);
         yield {
           type: 'event',
           event: {
@@ -145,10 +116,12 @@ export async function* mapCoreAgentEvents(
             data: { phase: 'start', id: ev.id, name: ev.name, arguments: ev.input },
           },
         };
-        yield {
-          type: 'progress',
-          text: argStr ? `▶ ${ev.name} · ${argStr}` : `▶ ${ev.name}`,
-        };
+        // The renderer formats the `tool` stream event into a single
+        // `■ ${name} · ${phase} · ${detail}` line via `_formatEventLine`.
+        // We used to also yield a parallel `progress: ▶ ${name} · ${arg}`
+        // line that carried the same info — that produced duplicate rows
+        // (one ■ and one ▶) for every tool call. Trust the event-stream
+        // rendering as the single source of truth.
         break;
       }
 
@@ -167,13 +140,11 @@ export async function* mapCoreAgentEvents(
             },
           },
         };
-        const shortPreview = preview.length > 80 ? preview.slice(0, 80) + '…' : preview;
-        const marker = ev.isError ? '✗' : '✓';
-        const tail = shortPreview ? ` · ${shortPreview}` : (ev.isError ? ' failed' : '');
-        yield {
-          type: 'progress',
-          text: `${marker} ${ev.name}${tail}`,
-        };
+        // Same dedupe rationale as `tool_start`: the renderer renders the
+        // `tool` end event as `■ name · <phase_end> · preview` (or
+        // `✗ ...` on isError), where <phase_end> is i18n-resolved by
+        // `_formatEventLine::phaseCn`, so the parallel
+        // `✓ ${name} · ${preview}` progress yield was a duplicate. Removed.
         // Next assistant text turn (if any) should be visually separated
         // from the previous one — matches the old "join turns with \n\n" rule.
         if (turnStarted) pendingSeparator = true;

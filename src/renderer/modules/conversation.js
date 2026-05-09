@@ -1348,8 +1348,70 @@ function _scrollToBottomNoAnim(container) {
   const prev = container.style.scrollBehavior;
   container.style.scrollBehavior = 'auto';
   container.scrollTop = container.scrollHeight;
+  // Explicit jump-to-bottom = the user is now pinned to the bottom; arm
+  // the sticky-follow flag so subsequent stream content keeps tracking.
+  container._stickyEnabled = true;
+  _bindStickToBottom(container);
   requestAnimationFrame(() => {
     container.style.scrollBehavior = prev || '';
+  });
+}
+
+// ─── Sticky-bottom auto-scroll ─────────────────────────────────────────────
+// Track per-container "is the user pinned to the bottom?" so streaming
+// content (process info / token deltas / new bubbles) auto-scrolls down
+// only while the user wants to follow. Mid-stream scroll-up suspends
+// auto-stick; scrolling back to (near) bottom resumes it. Tab-switch back
+// re-applies the stick if it was on at the moment of going hidden.
+//
+// Why a threshold (32 px) instead of strict equality: programmatic scrolls
+// (`scrollTop = scrollHeight`) and Chromium's sub-pixel rounding leave a
+// 1–2 px gap that would otherwise toggle the flag off on the first scroll
+// event. 32 px is comfortable for the user too — being "almost at bottom"
+// counts as following.
+const STICKY_BOTTOM_THRESHOLD = 32;
+function _isNearBottom(el) {
+  if (!el) return true;
+  return (el.scrollHeight - el.scrollTop - el.clientHeight) <= STICKY_BOTTOM_THRESHOLD;
+}
+function _bindStickToBottom(el) {
+  if (!el || el._stickyBound) return;
+  el._stickyBound = true;
+  if (el._stickyEnabled === undefined) el._stickyEnabled = true;
+  el.addEventListener('scroll', () => {
+    el._stickyEnabled = _isNearBottom(el);
+  }, { passive: true });
+}
+// Scroll the container to the bottom, but only if the user hasn't scrolled
+// up. Safe to call after every DOM mutation that adds height — the no-op
+// branch (sticky off) lets the user keep reading process info undisturbed.
+function _stickBottomIfPinned(el) {
+  if (!el) return;
+  if (el._stickyEnabled === false) return;
+  el.scrollTop = el.scrollHeight;
+}
+// Convenience for stream handlers that hold a `msg` element. The container
+// is whatever element the bubble lives in (chat-history for the main conv,
+// or a skill/agent edit chat's messages box) — same generic stickiness
+// applies to all of them.
+function _stickBottomFromMsg(msg) {
+  if (!msg) return;
+  _stickBottomIfPinned(msg.parentElement);
+}
+
+// Tab visibility: while the renderer is hidden, scroll events don't fire
+// and stream content piles up below the fold. On return, if the user was
+// pinned to the bottom before going hidden, jump to the latest content so
+// the conversation tracks live again.
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    // Cover every chat history surface (main conv + skill/agent edit chats).
+    const ids = ['chat-history', 'skills-chat-messages', 'agents-chat-messages'];
+    for (const id of ids) {
+      const el = document.getElementById(id);
+      if (el && el._stickyEnabled !== false) _stickBottomIfPinned(el);
+    }
   });
 }
 
@@ -1475,7 +1537,15 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     }
   }
 
-  if (autoScroll) container.scrollTop = container.scrollHeight;
+  if (autoScroll) {
+    // Respect the user's scroll position: only follow if they were already
+    // pinned to the bottom (sticky on). This preserves the legacy "new
+    // message arrives → snap to bottom" behaviour for users who were
+    // following, without yanking users who scrolled up to read older
+    // process info. _bindStickToBottom is a no-op after first bind.
+    _bindStickToBottom(container);
+    _stickBottomIfPinned(container);
+  }
   return msgDiv;
 }
 
@@ -2161,16 +2231,24 @@ function _hideThinking(msg) {
 }
 
 // Map the leading glyph of a formatted line to a semantic CSS class so the
-// stylesheet can tone errors red, approvals amber, etc.
+// stylesheet can tone errors red, tool calls blue, etc. The full glyph
+// palette + which event each one comes from is documented at the top of
+// `_formatEventLine`. Keep the two in sync — adding a new glyph there
+// without an entry here means the line renders in the default body color
+// (the muted slate baseline), which is what produced the "everything is
+// gray" look users complained about for CLI output.
 function _processKindOf(text) {
   const g = (text || '').trimStart().charAt(0);
-  if (g === '◯') return 'err';
-  if (g === '○') return 'warn';
-  if (g === '◉') return 'patch';
-  if (g === '■') return 'tool';
-  if (g === '▷') return 'out';
-  if (g === '◆' || g === '◇') return 'think';
-  if (g === '▶' || g === '●') return 'bound';
+  if (g === '◯' || g === '✗') return 'err';     // hard error / failed tool end
+  if (g === '○') return 'warn';                  // awaiting approval / soft warn
+  if (g === '◉') return 'patch';                 // file change
+  if (g === '■') return 'tool';                  // tool call (start / end ok)
+  if (g === '▷') return 'out';                   // command / cli stdout-or-stderr
+  if (g === '◆' || g === '◇') return 'think';   // reasoning / reply marker
+  if (g === '▶' || g === '●') return 'bound';   // lifecycle start / end
+  if (g === '▣') return 'plan';                  // plan announcement
+  if (g === '◐') return 'live';                  // live generating preview
+  if (g === '▪') return 'meta';                  // lifecycle / fallback meta
   return '';
 }
 
@@ -2189,6 +2267,10 @@ function _streamingAppendProgress(msg, text) {
   body.appendChild(line);
   // Auto-scroll only within the process area
   body.scrollTop = body.scrollHeight;
+  // Outer chat-history follows too, so the user can read the latest line
+  // without manually scrolling. _stickBottomIfPinned no-ops when the user
+  // has scrolled up to read older process output.
+  _stickBottomFromMsg(msg);
 }
 
 // Cancel any rAF queued by `_streamingAppendFinalDelta`. Callers that are
@@ -2216,6 +2298,11 @@ function _streamingSetFinal(msg, text, { archive = false } = {}) {
   const finalEl = msg.querySelector('[data-role="final"]');
   if (!finalEl) return;
   _cancelPendingStreamRaf(msg);
+  // Keep the user pinned through the placeholder → final-markdown swap
+  // (collapsing the process pane changes scrollHeight). The helper no-ops
+  // when the user has scrolled up to read; here that's the expected
+  // behaviour — finalize shouldn't yank a reader back to the bottom.
+  _stickBottomFromMsg(msg);
   // Always repaint on final: during streaming the DOM may contain
   // placeholder markers (from `_stripAgentCreateBlocksForStream` etc.)
   // that need to be replaced with the backend-cleaned prose. A previous
@@ -3450,6 +3537,9 @@ function _streamingAppendFinalDelta(msg, piece) {
       ),
     );
     finalEl.innerHTML = `<div class="markdown-body">${_renderMessageMarkdown(display)}</div>`;
+    // Token deltas grow the bubble; keep the user pinned to the latest
+    // text if they were following along (no-op once they scroll up).
+    _stickBottomFromMsg(msg);
   };
   if (typeof requestAnimationFrame === 'function') {
     msg._streamRafHandle = requestAnimationFrame(flush);
@@ -3548,8 +3638,19 @@ function _formatEventLine(evt) {
   }
 
   if (stream === 'command_output') {
-    const text = data?.text || data?.stdout || data?.stderr || '';
-    return text ? `▷ ${text}` : t('chat.stream.command_empty');
+    // Distinguish stderr from stdout so CLI agents (claude code / codex /
+    // openclaw / opencode / hermes) don't render their entire spool in a
+    // single muted slate. We keep ▷ for stdout, swap to ○ (kind-warn,
+    // amber) for stderr — many CLIs route progress and prompts to stderr,
+    // so we stop short of treating it as a hard error (◯) which would dye
+    // the whole sub-stream red. Falls back to stdout styling if the event
+    // doesn't disambiguate via separate stdout/stderr fields.
+    const stdout = data?.stdout;
+    const stderr = data?.stderr;
+    const text = data?.text || stdout || stderr || '';
+    if (!text) return t('chat.stream.command_empty');
+    const isStderrOnly = !stdout && stderr;
+    return isStderrOnly ? `○ ${text}` : `▷ ${text}`;
   }
 
   if (stream === 'patch') {
@@ -3578,6 +3679,59 @@ function _formatEventLine(evt) {
       }).filter(Boolean).join('; ');
       return detail ? t('chat.stream.attachment_skipped', { items: detail }) : null;
     }
+    return null;
+  }
+
+  // CLI-backed agents (claude code / codex / openclaw / opencode / hermes)
+  // emit `LocalEvent`s that bus.ts wraps verbatim as `{stream:'cli', data:e}`.
+  // Without this branch the catch-all below dumped them as
+  // `▪ cli {json}` which is (a) unreadable JSON and (b) lands in
+  // kind-meta — exactly the "all gray" symptom users see for CLI runs.
+  // Field shapes mirror `local_agents/backends/base.ts::LocalEvent`.
+  if (stream === 'cli') {
+    const cliType = String(data?.type || '').toLowerCase();
+    if (cliType === 'tool-event') {
+      const name = String(data?.tool || 'tool');
+      const isResult = data?.phase === 'result';
+      const phase = phaseCn(isResult ? 'end' : 'start');
+      let detail = '';
+      if (isResult && data?.output != null) {
+        detail = typeof data.output === 'string' ? data.output : JSON.stringify(data.output);
+      } else if (data?.input != null) {
+        detail = typeof data.input === 'string' ? data.input : JSON.stringify(data.input);
+      }
+      detail = detail.replace(/\s+/g, ' ').trim();
+      if (detail.length > 160) detail = detail.slice(0, 160) + '…';
+      const detailStr = detail ? ' · ' + detail : '';
+      return `■ ${name}${phase ? ' · ' + phase : ''}${detailStr}`;
+    }
+    if (cliType === 'process-info') {
+      // Fired once at CLI spawn; surface as a milestone so the user sees
+      // the run starting. cmd/args is enough — full cwd is noisy.
+      const cmd = String(data?.cmd || '').trim();
+      return cmd ? `▶ ${cmd}` : null;
+    }
+    if (cliType === 'status') {
+      // Bucket statuses into milestone (▶/●), warn (○) and error (◯) so
+      // they pick up the right kind class downstream.
+      const st = String(data?.status || '').toLowerCase();
+      if (!st) return null;
+      if (st === 'session_ready' || st === 'running') return `▶ ${st}`;
+      if (st === 'result' || st === 'completed') return `● ${st}`;
+      if (st === 'error' || st === 'failed' || st === 'timeout') return `◯ ${st}`;
+      if (st === 'cancelled' || st === 'aborted') return `○ ${st}`;
+      return `▪ ${st}`;
+    }
+    if (cliType === 'stderr-line') {
+      // CLIs route progress + diagnostics to stderr — treat as soft warn
+      // (○, kind-warn amber) rather than a hard error (◯, kind-err red),
+      // matching the heuristic we use for `command_output` stderr above.
+      const line = String(data?.line || '').replace(/\s+/g, ' ').trim();
+      if (!line) return null;
+      const trimmed = line.length > 160 ? line.slice(0, 160) + '…' : line;
+      return `○ ${trimmed}`;
+    }
+    // Unknown CLI event types: hide rather than dump JSON.
     return null;
   }
 
@@ -3629,6 +3783,7 @@ function _streamingUpdateLive(msg, prefix, text, appendDelta) {
   const preview = msg._liveBuf.length > 200 ? '…' + msg._liveBuf.slice(-200) : msg._liveBuf;
   line.textContent = prefix + preview;
   body.scrollTop = body.scrollHeight;
+  _stickBottomFromMsg(msg);
 }
 
 // Update the loading element (wherever it currently lives in DOM) with the reply.
