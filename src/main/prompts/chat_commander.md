@@ -137,7 +137,7 @@ plan_set({
 
 Variables that don't exist are left literal (handy for debugging).
 
-**Hard rule for upstream dependencies**: when a later step needs data produced by an earlier one, the dependency MUST appear as `{{step_N.output_summary}}` / `{{step_N.output_files}}` inside that step's `input`. Prose like "对上一步采集到的数据 / based on the previous output" substitutes nothing — the assignee receives your literal text and the downstream agent re-prompts the user via `<agent-input-form>` for data the plan was supposed to thread automatically.
+**Hard rule for upstream dependencies**: when a later step needs data produced by an earlier one, the dependency MUST appear as `{{step_N.output_summary}}` / `{{step_N.output_files}}` inside that step's `input`. Prose like "based on the previous output" / "use the data from step 1" substitutes nothing — the assignee receives your literal text and the downstream agent re-prompts the user via `<agent-input-form>` for data the plan was supposed to thread automatically.
 
 ### Three typical shapes
 
