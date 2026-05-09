@@ -772,7 +772,25 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     const agent = await agentsFeat.getAgent(actor.id);
     if (!agent) {
       log.warn(`agent ${actor.id} disappeared mid-turn`);
+      // User-visible signal — without this the user's @-dispatch hangs
+      // forever with no feedback (in-flight cleared, no bubble surfaces).
+      // Spec was unloadable (deleted / corrupt JSON / missing file); the
+      // members roster still carries the human-readable name, so we
+      // surface that to the user.
+      const roster = await readMembers(uid, cid).catch(() => null);
+      const member = roster?.actors.find((a) => a.id === actor.id);
+      const name = member?.name || actor.id;
+      const errBubble = `<span style="color:var(--danger)">${escapeHtmlForBubble(t('chat.agent_load_failed', { name }))}</span>`;
+      await enqueue({
+        uid, cid,
+        fromActorId: actor.id,
+        text: errBubble,
+        forceTo: [USER_ID],
+        turn_end: true,
+        ...(typeof item.triggered_step === 'number' ? { triggered_step: item.triggered_step } : {}),
+      });
       await markInFlight(uid, cid, actor.id, false);
+      emit(state, { type: 'state_changed', cid, state: await readState(uid, cid) });
       // Note: runWorkerLoop owns w.running — its finally clears the flag
       // when this returns. We DON'T touch it here.
       return;
