@@ -1436,10 +1436,20 @@ function _bindStickToBottom(el) {
 // Scroll the container to the bottom, but only if the user hasn't scrolled
 // up. Safe to call after every DOM mutation that adds height — the no-op
 // branch (sticky off) lets the user keep reading process info undisturbed.
+//
+// `scroll-behavior: smooth` is set on every chat history surface so the
+// scrollbar drag / search-jump feels animated. Honouring that on a stream
+// hot path queues overlapping ~300 ms animated scrolls per delta and the
+// view visibly shakes; force `auto` for this programmatic stick so each
+// call lands instantly without fighting the previous animation.
 function _stickBottomIfPinned(el) {
   if (!el) return;
   if (el._stickyEnabled === false) return;
+  const prev = el.style.scrollBehavior;
+  el.style.scrollBehavior = 'auto';
   el.scrollTop = el.scrollHeight;
+  if (prev) el.style.scrollBehavior = prev;
+  else el.style.removeProperty('scroll-behavior');
 }
 // Convenience for stream handlers that hold a `msg` element. The container
 // is whatever element the bubble lives in (chat-history for the main conv,
@@ -2493,6 +2503,11 @@ function _scrollToMessageTop(msgEl, containerId = 'chat-history') {
   if (!msgEl) return;
   const container = document.getElementById(containerId);
   if (!container) return;
+  // Pin-to-top intentionally moves the user away from the bottom; if
+  // sticky-bottom were left armed, the first stream delta would race the
+  // pin and yank the view back down. Disarm synchronously here — the
+  // user has to scroll back to bottom themselves to re-arm following.
+  container._stickyEnabled = false;
   // Instant scroll to avoid the animation getting clobbered by streaming DOM
   // mutations that land during the send. Use rAF twice to make sure layout
   // has settled (style recalc after appendChild, then paint).
