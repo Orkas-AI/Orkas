@@ -298,6 +298,18 @@ async function runBootSelfCheck(): Promise<void> {
       if (deleted) log.info('file_cache pruned', { deleted });
     }
   } catch (err) { log.warn('file_cache sweep failed', { error: (err as Error).message }); }
+
+  // Stage 5: workspace empty-subdir sweep — clean up legacy per-conv slug
+  // dirs that were materialised by bash's defensive mkdir on a turn that
+  // produced nothing. Boot-time is the safe moment: no in-flight bash
+  // process is holding cwd open. Top-level scan only.
+  try {
+    const uid = users.getActiveUserId();
+    if (uid) {
+      const userWs = await import('./features/user_workspace');
+      userWs.sweepEmptyConvDirs(uid);
+    }
+  } catch (err) { log.warn('workspace empty-dir sweep failed', { error: (err as Error).message }); }
 }
 
 // `kb-file://<relpath>` — maps a KB-relative path to the active user's

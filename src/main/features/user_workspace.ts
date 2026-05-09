@@ -205,6 +205,38 @@ export async function selectDirectory(): Promise<string | null> {
 }
 
 /**
+ * Sweep the active workspace root, removing any empty top-level
+ * subdirectory. Existing empty per-conversation slug dirs (legacy from
+ * before bash's cold-path rmdir-if-empty was added in `local-tools.ts`,
+ * or any future tool that mkdir'd then produced nothing) get cleaned up
+ * on every boot. Best-effort: any rmdir failure (non-empty / EACCES /
+ * concurrent in-flight bash) is silently swallowed.
+ *
+ * Only the immediate top level of the workspace is scanned; deeper
+ * empty subdirs are the user's own scaffolding and out of scope.
+ */
+export function sweepEmptyConvDirs(userId: string): { swept: number } {
+  const root = getWorkspacePath(userId);
+  let swept = 0;
+  let entries: string[];
+  try { entries = fs.readdirSync(root); }
+  catch { return { swept: 0 }; }
+  for (const name of entries) {
+    if (name.startsWith('.')) continue;  // .DS_Store, .git, etc.
+    const sub = path.join(root, name);
+    try {
+      const st = fs.statSync(sub);
+      if (!st.isDirectory()) continue;
+      if (fs.readdirSync(sub).length !== 0) continue;
+      fs.rmdirSync(sub);
+      swept++;
+    } catch { /* best-effort */ }
+  }
+  if (swept > 0) log.info('swept empty workspace subdirs', { userId, swept, root });
+  return { swept };
+}
+
+/**
  * Reveal a user's current workspace directory in the OS file manager
  * (Finder / Explorer / Nautilus). Falls back to the default directory if the
  * selection is gone.
