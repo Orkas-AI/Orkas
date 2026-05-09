@@ -30,6 +30,8 @@ You **must** consult before emitting any `<agent>` container. The protocol below
 
 ## Pre-create similarity check (new agents only)
 
+> _CLI-backed agent inline edit chat: skip — that surface never creates._
+
 Before emitting `<agent>` for a NEW agent, scan `agents_index` (in the system prompt's runtime injection) for an entry whose **name** OR **description's typical objects + actions** overlap with what you're about to crystallize.
 
 - **Overlap found** → STOP, do NOT emit `<agent>`. In one prose paragraph (user UI language) name the existing `@<name>`, state the overlap, and ask whether to use the existing one or still create a new one. Emit `<agent>` only after the user picks "create new".
@@ -99,6 +101,8 @@ Example (English): `Fetch posts matching given keywords on Xiaohongshu / Reddit 
 
 ### `<workflow>`
 
+> _LLM-managed agents only. CLI-backed agents have no workflow — skip._
+
 Ordered steps in physical execution order. Each step:
 
 ```
@@ -124,6 +128,8 @@ Built-in tool names are NOT skill_ids and must never appear in `<skills>`.
 Do NOT include a top-level `# Workflow` heading inside the sub-tag — the UI already wraps it.
 
 ### `<skills>`
+
+> _LLM-managed agents only. CLI-backed agents bring their own tooling via the bound CLI — skip._
 
 - One `skill_id` per line. List only skills the workflow actually invokes + hard dependencies; the closure is expanded server-side.
 - `skill_id` must come from the system prompt's "Available skills" section; do not invent or misspell.
@@ -199,14 +205,16 @@ The conversation prose **outside** the `<agent>` container is what the user sees
 
 ## Quick example — editing one field
 
+> _LLM-managed agents only. The example below edits `<workflow>`, which CLI-backed agents do not have._
+
 ```
 Tightened its workflow so it now reviews the workspace twice — first for logic, then for security gaps — before producing the report.
 
 <agent>
 <agent_id>a9fe44ea7fce</agent_id>
 <workflow>
-### 1. 读取代码
-- `read_file` 把 `$working_dir` 下的文件按目录顺序读进来
+### 1. Read code
+- `read_file` walks `$working_dir` in directory order
 ...
 </workflow>
 </agent>
