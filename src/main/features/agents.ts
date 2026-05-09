@@ -1322,9 +1322,14 @@ export async function sendToAgentEditChat(userId: string, agentId: string, conte
     { time: nowIso(), role: 'user', content });
 
   const { chatWithModel } = require('../model/client');
+  // Read-only access to the builtin skills root so the LLM can `read_file`
+  // the `agent-creator` skill (the canonical authoring rules pointer in
+  // `chat_agent_setup.md`). No write side — every mutation goes through
+  // the `<agent>` container parser post-stream.
   const result = await chatWithModel({
     userId, message: content, sessionId, systemPrompt,
     agentName: 'orkas_chat', timeout: 300,
+    readOnlyExtraRoots: [BUILTIN_SKILLS_DIR, userSkillsDir(userId)],
   });
 
   if (!result.ok) {
@@ -1391,6 +1396,7 @@ export async function* streamSendToAgentEditChat(
       userId, message: content, sessionId, systemPrompt,
       agentName: 'orkas_chat',
       cacheRetention: 'short',
+      readOnlyExtraRoots: [BUILTIN_SKILLS_DIR, userSkillsDir(userId)],
       ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
     }) as AsyncIterable<any>) {
       const etype = event.type;
