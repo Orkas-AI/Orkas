@@ -1421,9 +1421,9 @@ function _scrollToBottomNoAnim(container) {
 // event. 32 px is comfortable for the user too — being "almost at bottom"
 // counts as following.
 const STICKY_BOTTOM_THRESHOLD = 32;
-function _isNearBottom(el) {
+function _isNearBottom(el, threshold = STICKY_BOTTOM_THRESHOLD) {
   if (!el) return true;
-  return (el.scrollHeight - el.scrollTop - el.clientHeight) <= STICKY_BOTTOM_THRESHOLD;
+  return (el.scrollHeight - el.scrollTop - el.clientHeight) <= threshold;
 }
 function _bindStickToBottom(el) {
   if (!el || el._stickyBound) return;
@@ -2327,16 +2327,21 @@ function _streamingAppendProgress(msg, text) {
   if (container) container.style.display = '';
   const body = msg.querySelector('[data-role="process"]');
   if (!body) return;
+  // Decide auto-scroll on the inner body BEFORE appending the line —
+  // once the new line lands, scrollHeight grows and "near bottom" would
+  // misread as false even when the user was tracking the latest output.
+  // Threshold is 10 px (one-line tolerance) so the slightest manual
+  // scroll-up suspends auto-scroll, letting the user read older entries
+  // without being yanked back.
+  const innerWasAtBottom = _isNearBottom(body, 10);
   const line = document.createElement('div');
   const kind = _processKindOf(text);
   line.className = 'stream-process-line' + (kind ? ' kind-' + kind : '');
   line.textContent = text;
   body.appendChild(line);
-  // Auto-scroll only within the process area
-  body.scrollTop = body.scrollHeight;
-  // Outer chat-history follows too, so the user can read the latest line
-  // without manually scrolling. _stickBottomIfPinned no-ops when the user
-  // has scrolled up to read older process output.
+  if (innerWasAtBottom) body.scrollTop = body.scrollHeight;
+  // Outer chat-history follows independently — its own sticky-bottom
+  // logic respects user scroll on the conversation level.
   _stickBottomFromMsg(msg);
 }
 
@@ -3902,6 +3907,11 @@ function _streamingUpdateLive(msg, prefix, text, appendDelta) {
   const body = msg.querySelector('[data-role="process"]');
   if (!body) return;
 
+  // Decide auto-scroll BEFORE mutating the live row — text growth changes
+  // scrollHeight and would otherwise misread "near bottom" as false even
+  // when the user was tracking the latest output. 10 px tolerance treats
+  // any manual scroll-up as "user wants to read older entries".
+  const innerWasAtBottom = _isNearBottom(body, 10);
   let line = body.querySelector('.stream-process-live');
   if (!line) {
     line = document.createElement('div');
@@ -3914,7 +3924,7 @@ function _streamingUpdateLive(msg, prefix, text, appendDelta) {
   // Show last ~200 chars to keep the row compact
   const preview = msg._liveBuf.length > 200 ? '…' + msg._liveBuf.slice(-200) : msg._liveBuf;
   line.textContent = prefix + preview;
-  body.scrollTop = body.scrollHeight;
+  if (innerWasAtBottom) body.scrollTop = body.scrollHeight;
   _stickBottomFromMsg(msg);
 }
 
