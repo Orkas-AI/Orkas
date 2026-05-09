@@ -42,11 +42,40 @@ function skillSourceLabel(source: string): 'builtin' | 'custom' {
   return path.resolve(source) === BUILTIN_ROOT_RESOLVED ? 'builtin' : 'custom';
 }
 
-async function renderSkillLines(specs: SkillSpec[]): Promise<string> {
+// Render the system-prompt block listing every skill the LLM can use.
+//
+// Format:
+//   `## Available skills (skills)\n\n` +
+//   `\`read_file(<ROOT>/<id>/SKILL.md)\` — ROOT by Source:\n` +
+//   `- custom:  <abs path>\n` +
+//   `- builtin: <abs path>\n` +
+//   `Use these ROOT values verbatim; do NOT use training-prior layouts (e.g. \`/data/custom/skills/\`).\n\n` +
+//   per-entry lines `- **<id>** (Source: custom|builtin) — desc`
+//
+// Why the inline ROOT header (added 2026-05): putting only `(Source: ...)` on
+// each entry and listing the path constants in a separate `## Resource locations`
+// section let the LLM ignore the resolved absolute paths and pattern-match its
+// training prior to fabricate `/data/custom/skills/<id>/SKILL.md` (a Claude Code
+// layout that doesn't exist here), which then trips E_PATH_OUT_OF_SCOPE on
+// `read_file`. The roots-in-block form puts the actual values right next to the
+// entry list so the LLM can't miss them.
+async function renderSkillLines(
+  specs: SkillSpec[],
+  customRoot: string,
+  builtinRoot: string,
+): Promise<string> {
   if (!specs.length) return '';
   const lang = getCurrentLang();
   const pick = await getPickDescription();
-  const lines = ['## Available skills (skills)', ''];
+  const lines: string[] = [
+    '## Available skills (skills)',
+    '',
+    '`read_file(<ROOT>/<id>/SKILL.md)` — ROOT by Source:',
+    `- custom:  ${customRoot}`,
+    `- builtin: ${builtinRoot}`,
+    'Use these ROOT values verbatim; do NOT use training-prior layouts (e.g. `/data/custom/skills/`).',
+    '',
+  ];
   for (const s of specs) {
     const source = skillSourceLabel(s.source);
     const description = pick(s, lang);
@@ -114,14 +143,20 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
   const disabled = opts.disabledIds ? new Set(opts.disabledIds) : null;
   const filterDisabled = (list: typeof specs) =>
     disabled && disabled.size ? list.filter((s) => !disabled.has(s.id)) : list;
+  // Resolve roots once per call — `getActiveUserId` may have rotated since
+  // `getLoader` (cached) was first instantiated; users.ts switches uid via
+  // `activateUser` which calls `invalidateSkills` to drop the loader cache,
+  // but the ROOT values must reflect the CURRENT uid regardless of cache age.
+  const customRoot = path.resolve(userSkillsDir(getActiveUserId()));
+  const builtinRoot = path.resolve(BUILTIN_SKILLS_DIR);
 
-  if (opts.allowlist === undefined) return renderSkillLines(filterDisabled(specs));
+  if (opts.allowlist === undefined) return renderSkillLines(filterDisabled(specs), customRoot, builtinRoot);
 
   const rawAllow = opts.allowlist.filter((id) => typeof id === 'string' && id.length > 0);
   if (rawAllow.length === 0) return '';
 
   const allow = new Set(rawAllow);
-  return renderSkillLines(filterDisabled(specs.filter((s) => allow.has(s.id))));
+  return renderSkillLines(filterDisabled(specs.filter((s) => allow.has(s.id))), customRoot, builtinRoot);
 }
 
 /** Drop the internal mtime cache so the next `list()` rescans. */

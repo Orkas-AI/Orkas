@@ -1289,12 +1289,15 @@ async function buildCommanderSystemPrompt(uid: string, cid: string): Promise<str
   // Stable sections first (cache-friendly), runtime injection last.
   // chat_shared_rules.md is appended BEFORE the runtime block in
   // chat_commander.md so it stays in the cached prefix.
+  // Note: skill / agent ROOT path constants are NOT passed in here anymore —
+  // they live inline in the rendered `agents_index` block (built by
+  // `buildAgentsIndexBlock`) and the `## Available skills` block (built by
+  // `skill-registry.renderSkillLines`), so the LLM sees ROOT values right
+  // next to the entries that consume them. Reintroducing $*_dir vars would
+  // recreate the cross-section path-constants design that mis-fires under
+  // training-prior layouts.
   const main = prompts.load('chat_commander', {
     contexts_dir: path_.resolve(paths_.userContextsDir(uid)),
-    builtin_agents_dir: path_.resolve(paths_.BUILTIN_AGENTS_DIR),
-    custom_agents_dir: path_.resolve(paths_.userAgentsDir(uid)),
-    builtin_skills_dir: path_.resolve(paths_.BUILTIN_SKILLS_DIR),
-    custom_skills_dir: path_.resolve(paths_.userSkillsDir(uid)),
     agents_index: allAgentsList,
     plan_state: formatPlanForPrompt(plan),
     os: process.platform === 'darwin' ? 'macOS' : process.platform === 'win32' ? 'Windows' : process.platform,
@@ -1325,29 +1328,59 @@ function appendLanguageDirective(prompt: string): string {
   return `${prompt}\n\n---\n\n${buildLanguageDirective()}`;
 }
 
-async function buildAgentsIndexBlock(_uid: string): Promise<string> {
-  // listAgents() reads from the active uid context (set by activateUser at boot
-  // / on user switch); no uid arg needed.
+// Render the agents-index block injected into commander's system prompt.
+//
+// Format:
+//   `\`read_file(<ROOT>/<id>/agent.json)\` — ROOT by Source:\n` +
+//   `- custom:  <abs path>\n` +
+//   `- builtin: <abs path>\n` +
+//   `Use these ROOT values verbatim. \`id:\` is tool-call input only — prose mentions agents as @<name>.\n\n` +
+//   per-entry lines `- @<name> (Source: custom|builtin, id: <agent_id>) — desc` + optional `\n  inputs_schema: <slim json>`
+//
+// Why expose id and ROOT inline (changed 2026-05): the prior layout hid
+// agent_id (to discourage hex-id leak in user prose) and put paths in a
+// separate `## Resource locations` section. That forced commander to run
+// `search_files` for the matching agent.json, extract id from the dir
+// segment, then `read_file` — two LLM round-trips. The hidden-id design
+// also relied on the LLM to navigate path constants between sections.
+// Now: id is shown next to its entry (one round-trip read), and the ROOT
+// values live right next to the entries so there is nothing to construct.
+// Hex-id leak prevention shifts to (a) the explicit "prose uses @<name>"
+// hint here, and (b) the existing `@<id>` → `@<name>` rewrite in router.
+// Exported (with `_…ForTest` suffix mirroring `_cidStateForTest` below) so
+// the agents-index format can be pinned by fixture without spinning up the
+// full bus pipeline. Treat as test-only — production callers stay inside
+// `buildCommanderSystemPrompt`.
+export async function _buildAgentsIndexBlockForTest(uid: string): Promise<string> {
+  return buildAgentsIndexBlock(uid);
+}
+
+async function buildAgentsIndexBlock(uid: string): Promise<string> {
   const { getCurrentLang } = await import('../../i18n');
   const { pickDescription } = await import('#core-agent');
   const lang = getCurrentLang();
+  const customRoot = path.resolve(userAgentsDir(uid));
+  const builtinRoot = path.resolve(BUILTIN_AGENTS_DIR);
+  const header = [
+    '`read_file(<ROOT>/<id>/agent.json)` — ROOT by Source:',
+    `- custom:  ${customRoot}`,
+    `- builtin: ${builtinRoot}`,
+    'Use these ROOT values verbatim. `id:` is tool-call input only — prose mentions agents as @<name>.',
+    '',
+  ].join('\n');
   try {
     const list = (await agentsFeat.listAgents()).filter((a: any) => a.enabled !== false);
-    if (!list.length) return '(no agents)';
-    return list.map((a: any) => {
+    if (!list.length) return `${header}(no agents)`;
+    const entries = list.map((a: any) => {
       const name = a.name || a.agent_id;
       const description = pickDescription(a, lang);
       const desc = description ? ` — ${description}` : '';
-      // Lead with `@<name>` so the LLM picks up the calling convention
-      // visually; id is hidden — exposing hex strings in prompts trains
-      // the LLM to leak them in user-visible text too.
-      const head = `- ${buildMention(name)} (Source: ${a.source})${desc}`;
+      const head = `- ${buildMention(name)} (Source: ${a.source}, id: ${a.agent_id})${desc}`;
       // Inline a slimmed inputs_schema (id / type / required / default /
       // label / options / min / max / accept) so commander knows what
       // params each agent expects when phrasing its `@<name>` dispatch
       // text. Stripped of UI-only narrative fields (description /
-      // placeholder) — those bloat the prompt without helping the LLM
-      // extract values.
+      // placeholder) — those bloat the prompt without helping extraction.
       const inputs = Array.isArray(a.inputs) ? a.inputs : null;
       if (inputs && inputs.length) {
         const slim = inputs.map((f: any) => {
@@ -1358,17 +1391,16 @@ async function buildAgentsIndexBlock(_uid: string): Promise<string> {
       }
       return head;
     }).join('\n');
-  } catch { return '(no agents)'; }
+    return `${header}${entries}`;
+  } catch { return `${header}(no agents)`; }
 }
 
 async function buildAgentInGroupSystemPrompt(
-  uid: string,
+  _uid: string,
   agent: { name?: string; description?: string; workflow?: string; agent_id: string; inputs?: unknown },
   workingDir: string,
 ): Promise<string> {
   const { prompts } = await import('../../prompts/loader');
-  const path_ = await import('node:path');
-  const paths_ = await import('../../paths');
   // Render the agent's declared inputs schema so the LLM knows when to
   // emit a fenced agent-input-form block. UI-only narrative fields
   // (description, placeholder) are stripped — the model needs id / type
@@ -1381,14 +1413,15 @@ async function buildAgentInGroupSystemPrompt(
     return rest;
   });
   const inputsSchemaJson = slimmed.length ? JSON.stringify(slimmed) : '';
+  // Skill ROOT path constants are NOT passed in here either — the
+  // skill-registry render block embeds them inline, see commander
+  // counterpart above.
   const main = prompts.load('chat_agent_in_group', {
     name: agent.name || '',
     agent_id: agent.agent_id,
     description: agent.description || '(not provided)',
     workflow: (agent.workflow || '').trim() || '(not provided)',
     inputs_schema: inputsSchemaJson || '(none)',
-    builtin_skills_dir: path_.resolve(paths_.BUILTIN_SKILLS_DIR),
-    custom_skills_dir: path_.resolve(paths_.userSkillsDir(uid)),
     working_dir: workingDir,
   });
   const shared = prompts.load('chat_shared_rules', {});

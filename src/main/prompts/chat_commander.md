@@ -290,13 +290,12 @@ skill_id_b
 
 When `<agent_id>` is the right move (the user is asking to change an agent that already exists), follow this loop **before** emitting the container — skipping any step risks silent data loss:
 
-1. **Find the agent's id**. The `agents_index` block above does NOT carry ids — **don't fabricate**. Use `search_files` for an `agent.json` whose `name` matches under `$custom_agents_dir/`, or an equivalent `bash` grep; the directory segment after `$custom_agents_dir/` IS the agent_id.
-2. **Read the current spec**: `read_file($custom_agents_dir/<agent_id>/agent.json)`. Never rewrite from memory — `agents_index` only carries a slim view of `inputs_schema`, with no workflow / description / skill_list. Skipping this step ⇒ silently wiping fields you didn't intend to touch.
-3. **Confirm the agent is editable here**:
-   - `source !== 'custom'` (built-in agent, lives under `$builtin_agents_dir/`) → reply with one prose line in the user's UI language explaining that this is a built-in agent and can't be edited through the main conversation; the user can fork a custom copy from the detail panel. Then stop. **Do not emit `<agent>`**.
+1. **Read the current spec**: take the `id` field from the `agents_index` entry and `read_file` per the Read pattern shown in that block's header. Never rewrite from memory — `agents_index` only carries a slim view of `inputs_schema`, with no workflow / description / skill_list; skipping this step ⇒ silently wiping fields you didn't intend to touch.
+2. **Confirm the agent is editable here**:
+   - `Source: builtin` → reply with one prose line in the user's UI language explaining that this is a built-in agent and can't be edited through the main conversation; the user can fork a custom copy from the detail panel. Then stop. **Do not emit `<agent>`**.
    - `runtime.kind === 'cli'` (external CLI agent: claude code / codex / openclaw / opencode / hermes — they bring their own prompt; the runtime / model / args are owned by the create-modal + edit-form, not the LLM) → reply with one prose line in the user's UI language explaining that this is an external CLI-backed agent and that its working directory / model / launch args / name / description are only editable from the detail panel. Then stop. **Do not emit `<agent>`**.
-4. **Emit `<agent>` with `<agent_id>` first**, and only the sub-tags you're changing. Absent sub-tags preserve the current value. Empty body (e.g. `<inputs></inputs>` or `<skills></skills>`) is the explicit "clear this list" signal — use deliberately.
-5. **`<inputs>` is full-list replace, NOT per-id merge**. If the user is "adding a new input field", you must emit the entire updated list (every existing input + the new one). Emitting only the new one wipes the rest. Same rule for `<skills>`.
+3. **Emit `<agent>` with `<agent_id>` first**, and only the sub-tags you're changing. Absent sub-tags preserve the current value. Empty body (e.g. `<inputs></inputs>` or `<skills></skills>`) is the explicit "clear this list" signal — use deliberately.
+4. **`<inputs>` is full-list replace, NOT per-id merge**. If the user is "adding a new input field", you must emit the entire updated list (every existing input + the new one). Emitting only the new one wipes the rest. Same rule for `<skills>`.
 
 Example shape (only the workflow changes; the prose line above the container is in the user's UI language):
 
@@ -349,8 +348,7 @@ When a user message has an `<attachments>` prefix, each `<file name=... path=...
 
 ### Resource path constants
 
-- Agent definitions: builtin → `$builtin_agents_dir/<id>/`; custom → `$custom_agents_dir/<id>/`. **Don't** `cat` an agent's JSON and impersonate it — dispatch by id to the real agent.
-- Skill definitions: builtin → `$builtin_skills_dir/<id>/SKILL.md`; custom → `$custom_skills_dir/<id>/SKILL.md`. Locate by `Source`; don't try both roots.
+- Agent / skill ROOT paths: see the headers of the `## Available skills` and `### Agents list` blocks below for `read_file(<ROOT>/<id>/...)` patterns and resolved ROOT values per Source. **Don't `cat` an agent's JSON and impersonate it** — dispatch by id to the real agent.
 
 ---
 
@@ -372,6 +370,6 @@ $plan_state
 
 ### Agents list
 
-> The list contains only name / source / description; an entry with `inputs_schema: [...]` indicates that the agent has structured input parameters — when dispatching via `dispatch_to`, write the field values into `message` in natural language.
+> Each entry shows `name / source / id / description` plus optional `inputs_schema: [...]` (structured input params — when dispatching via `dispatch_to`, write the field values into `message` in natural language). The block header lists the `read_file(<ROOT>/<id>/agent.json)` pattern + resolved ROOT values per Source.
 
 $agents_index
