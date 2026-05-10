@@ -272,8 +272,7 @@ export async function markFormSubmittedAndDispatch(
       const ag = await agentsFeat.getAgent(agentId);
       const cli = ag?.runtime?.kind === 'cli' ? ag.runtime.cli : '';
       if (agentsFeat.cliIsCodingAgent(cli)) {
-        const { readState: rs } = await import('./state');
-        const prev = await rs(userId, cid);
+        const prev = await readState(userId, cid);
         const oldDir = prev.coding_project_dir || '';
         await setCodingProjectDir(userId, cid, projDir, { explicit: true });
         if (oldDir && oldDir !== projDir) {
