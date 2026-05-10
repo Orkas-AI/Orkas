@@ -28,7 +28,7 @@ import * as fs from 'node:fs';
 import {
   Actor, ActorKind, COMMANDER_ID, USER_ID, RESERVED_IDS,
   actorSessionId, addMember, ensureAgentMember, readMembers, seedReservedActors,
-  setStatus, markInFlight, readState, transitionStatus,
+  setStatus, markInFlight, readState, transitionStatus, setCodingProjectDir,
 } from './state';
 import {
   GroupMessage, appendVisible, readSlice, buildReplayPrefix,
@@ -1994,7 +1994,6 @@ async function _syncCodingProjectDirWithWorkspace(
   if (cur.coding_project_dir_explicit) return;            // sticky
   if (cur.coding_project_dir === wsPath) return;          // already in sync
   const oldDir = cur.coding_project_dir || '';
-  const { setCodingProjectDir } = await import('./state');
   await setCodingProjectDir(uid, cid, wsPath, { explicit: false });
   if (oldDir && oldDir !== wsPath) {
     // CLI session bindings reference the OLD cwd. claude code keys
