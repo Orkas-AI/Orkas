@@ -223,12 +223,16 @@ function _renderSearchRow(r, dataIdx, query) {
   const label = metaCfg.labelKey ? t(metaCfg.labelKey) : r.kind;
   const roleLabel = (role) => (role === 'user' ? t('search.role.user') : t('search.role.ai'));
   let title = ''; let sub = '';
+  let projectChip = '';
   if (r.kind === 'context') {
     title = r.title || r.path;
     sub = r.path;
   } else if (r.kind === 'chat') {
     title = r.conv_title || t('chat.new_conv_title');
     sub = `${roleLabel(r.role)} · ${formatTime(r.time || '')}`;
+    if (r.project_name) {
+      projectChip = `<span class="search-result-project" title="${escapeHtml(r.project_name)}">${escapeHtml(r.project_name)}</span>`;
+    }
   } else if (r.kind === 'agent' || r.kind === 'skill') {
     title = r.name || r.id;
     const srcKey = _SEARCH_SOURCE_LABEL[r.source] || '';
@@ -240,6 +244,7 @@ function _renderSearchRow(r, dataIdx, query) {
       <div class="search-result-head">
         <span class="search-result-kind ${metaCfg.cls}">${escapeHtml(label)}</span>
         <span class="search-result-title">${escapeHtml(title)}</span>
+        ${projectChip}
         <span class="search-result-meta">${escapeHtml(sub)}</span>
       </div>
       <div class="search-result-snippet">${_highlightSnippet(r.snippet, query)}</div>

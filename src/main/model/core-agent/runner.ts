@@ -67,6 +67,16 @@ async function ca(): Promise<CA> {
 /** No-op retained for backward compat; nothing is cached anymore. */
 export function invalidateConfig(): void {}
 
+function _intersectRenderAllowlist(
+  agentList: readonly string[] | undefined,
+  projectList: readonly string[] | undefined,
+): readonly string[] | undefined {
+  if (projectList === undefined) return agentList;
+  if (agentList === undefined) return projectList;
+  const agentSet = new Set(agentList);
+  return projectList.filter((id) => agentSet.has(id));
+}
+
 export interface BuildRunnerParams {
   sessionId: string;
   systemPrompt?: string;
@@ -86,6 +96,13 @@ export interface BuildRunnerParams {
   /** Optional subset of skill ids; undefined = full global listing. See
    * `skill-registry.getSystemPromptBlock` for the exact semantics. */
   skillList?: string[];
+  /** Project-scope skill allowlist applied ONLY to the System A render
+   *  block (`getSystemPromptBlock`). When present, the rendered allowlist
+   *  is `intersect(skillList, projectAllowedSkillIds)`; SkillStore (System
+   *  B, agent self-evolved skills) stays gated by `skillList` alone so
+   *  agents in projects retain access to their own evolved skills. See
+   *  CLAUDE.md §6 + `features/projects.ts::resolveProjectScope`. */
+  projectAllowedSkillIds?: readonly string[];
   /** Extra tools added to core-agent's builtins (e.g. group_chat commander
    * gets `plan_set` + agent-management tools). */
   extraTools?: AgentTool[];
@@ -155,11 +172,19 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const earlyUid = params.userId || extractUidFromSessionId(params.sessionId);
   const disabledSkillIds = earlyUid ? readDisabledSets(earlyUid).skills : new Set<string>();
 
+  // System A render allowlist = intersect(skillList, project bindings).
+  //   - no project scope (`projectAllowedSkillIds` undefined) → legacy
+  //     `skillList`-only behavior
+  //   - commander in a project (`skillList` undefined, project list set) →
+  //     project list governs the render block
+  //   - agent in a project (both set) → intersection
+  // SkillStore (System B) stays gated by `skillList` alone — see line ~429.
+  const renderAllowlist = _intersectRenderAllowlist(params.skillList, params.projectAllowedSkillIds);
   const [mod, session, skillsBlock] = await Promise.all([
     ca(),
     getSession(params.sessionId),
     getSystemPromptBlock({
-      ...(params.skillList === undefined ? {} : { allowlist: params.skillList }),
+      ...(renderAllowlist === undefined ? {} : { allowlist: [...renderAllowlist] }),
       disabledIds: disabledSkillIds,
     }),
   ]);

@@ -125,16 +125,24 @@ export const userProfileFile = (uid: string) => path.join(userMemoryDir(uid), 'U
 export const userAgentsDir = (uid: string) => path.join(userCloudRoot(uid), 'agents');
 export const userSkillsDir = (uid: string) => path.join(userCloudRoot(uid), 'skills');
 
-// Per-user projects (logical group of conversations + scoped workspace).
-// `_index.json` is the project list; `<pid>/` reserves space for future
-// per-project assets (knowledge base, access permissions, etc.) — empty in
-// the current round. See `features/projects.ts`. Project membership of a
-// conversation is recorded as a `project_id` field on the conv index entry,
-// NOT as a path component (cid stays globally unique; session_id schema is
-// untouched — see CLAUDE.md §5).
+// Per-user projects (logical group of conversations + bindings + scoped
+// workspace). Each project is a self-contained directory:
+//   `<pid>/project.json`   metadata (project_id, name, owner_uid, timestamps)
+//   `<pid>/bindings.json`  agent/skill ids the project pins (strict scope)
+// **No aggregate `_index.json`** — listing scans `projects/*/project.json`.
+// **Why:** future server-mediated collaboration adds/removes a project from
+// a user's view by writing/removing the per-pid directory; an aggregate
+// index would force every membership change to be a multi-file
+// transactional update and would conflict on multi-device sync. See
+// `features/projects.ts` and `PC/CLAUDE.md` §4 / §5 / §9.
+//
+// Project membership of a conversation stays as a `project_id` field on the
+// conv index entry, NOT as a path component (cid stays globally unique;
+// session_id schema is untouched — see CLAUDE.md §5).
 export const userProjectsDir       = (uid: string) => path.join(userCloudRoot(uid), 'projects');
-export const userProjectsIndexFile = (uid: string) => path.join(userProjectsDir(uid), '_index.json');
 export const projectDir            = (uid: string, pid: string) => path.join(userProjectsDir(uid), pid);
+export const projectMetaFile       = (uid: string, pid: string) => path.join(projectDir(uid, pid), 'project.json');
+export const projectBindingsFile   = (uid: string, pid: string) => path.join(projectDir(uid, pid), 'bindings.json');
 export const agentDir            = (uid: string, agentId: string) => path.join(userAgentsDir(uid), agentId || '_default');
 export const agentDefinitionFile = (uid: string, agentId: string) => path.join(agentDir(uid, agentId), 'agent.json');
 

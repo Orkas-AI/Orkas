@@ -69,6 +69,14 @@ export interface ChatOptions {
    * `skill_list: []`. Sourced from the target agent's `skill_list` field
    * (see `features/agents.ts`). */
   skillList?: string[];
+  /** Project-scope skill allowlist applied ONLY to the System A render
+   *  block (`getSystemPromptBlock`). Resolved from the conversation's
+   *  project bindings at the top of `runTurn`. The runner intersects this
+   *  with `skillList` for prompt rendering but leaves SkillStore (System B,
+   *  agent's self-evolved skills) constrained by `skillList` alone — so
+   *  agents in projects retain access to their own evolved skills.
+   *  Undefined = orphan conversation, no project filter. */
+  projectAllowedSkillIds?: readonly string[];
   /** Extra tools merged into core-agent's builtin tool set for this call.
    * Currently used by group_chat commander to surface `plan_set` and
    * agent-management tools alongside the builtin set. */

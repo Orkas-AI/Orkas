@@ -167,6 +167,91 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { deleted_convs: result.deleted_convs };
   },
 
+  'projects.get': async ({ projectId }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    const project = await projects.getProject(ctx.userId, projectId);
+    if (!project) throw new Error('not_found');
+    return { project };
+  },
+
+  // ── Project bindings (the strict scope of agents/skills visible inside
+  // a project conversation; see CLAUDE.md §6 outer-intersection rule) ──
+  // `bindings.list` returns the bound ids JOINED with name/description so
+  // the renderer can paint the detail page in one round-trip; unknown ids
+  // (referent deleted) are filtered out of the joined view but kept in the
+  // raw `agents` / `skills` arrays so the user can see + clean up stale
+  // bindings.
+  'projects.bindings.list': async ({ projectId }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (!await projects.projectExists(ctx.userId, projectId)) throw new Error('not_found');
+    const bindings = await projects.getBindings(ctx.userId, projectId);
+    const [agentList, skillList] = await Promise.all([
+      agents.listAgents(),
+      skills.listSkills(),
+    ]);
+    const agentById = new Map(agentList.map((a: any) => [a.agent_id, a]));
+    const skillById = new Map(skillList.map((s: any) => [s.id, s]));
+    return {
+      bindings,
+      agentDetails: bindings.agents
+        .map((id) => agentById.get(id))
+        .filter(Boolean),
+      skillDetails: bindings.skills
+        .map((id) => skillById.get(id))
+        .filter(Boolean),
+    };
+  },
+
+  'projects.bindings.add': async ({ projectId, kind, id }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (typeof id !== 'string' || !id) throw new Error('invalid id');
+    let result;
+    if (kind === 'agent') {
+      if (!agents.isValidAgentId(id)) throw new Error('invalid id');
+      result = await projects.addAgentBinding(ctx.userId, projectId, id);
+    } else if (kind === 'skill') {
+      result = await projects.addSkillBinding(ctx.userId, projectId, id);
+    } else {
+      throw new Error('invalid kind');
+    }
+    if (!result.ok) throw new Error((result as { error: string }).error);
+    return { bindings: result.bindings };
+  },
+
+  'projects.bindings.remove': async ({ projectId, kind, id }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (typeof id !== 'string' || !id) throw new Error('invalid id');
+    let result;
+    if (kind === 'agent') {
+      result = await projects.removeAgentBinding(ctx.userId, projectId, id);
+    } else if (kind === 'skill') {
+      result = await projects.removeSkillBinding(ctx.userId, projectId, id);
+    } else {
+      throw new Error('invalid kind');
+    }
+    if (!result.ok) throw new Error((result as { error: string }).error);
+    return { bindings: result.bindings };
+  },
+
+  // Candidates = full [builtin + custom] minus already-bound. Powers the
+  // "Add" picker on the project detail page so the renderer doesn't have
+  // to subtract client-side.
+  'projects.bindings.candidates': async ({ projectId }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (!await projects.projectExists(ctx.userId, projectId)) throw new Error('not_found');
+    const bindings = await projects.getBindings(ctx.userId, projectId);
+    const boundAgents = new Set(bindings.agents);
+    const boundSkills = new Set(bindings.skills);
+    const [agentList, skillList] = await Promise.all([
+      agents.listAgents(),
+      skills.listSkills(),
+    ]);
+    return {
+      agents: agentList.filter((a: any) => !boundAgents.has(a.agent_id)),
+      skills: skillList.filter((s: any) => !boundSkills.has(s.id)),
+    };
+  },
+
   // ── Group chat (replaces legacy conversations.send / .stream / .markFormSubmitted) ──
   'groupChat.send': async ({ cid, content, attachments }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');

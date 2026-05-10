@@ -102,6 +102,16 @@ function _restoreLastView() {
     setView('conversation', cid);
     return;
   }
+  // Project detail page: cid slot carries the pid (see boot.js setView).
+  // Verify the project still exists (might have been deleted on another
+  // device since last save) before restoring; fall through to new-chat
+  // otherwise.
+  if (view === 'project' && cid
+      && Array.isArray(_projectsCache)
+      && _projectsCache.some((p) => p && p.project_id === cid)) {
+    setView('project', cid);
+    return;
+  }
   if (view === 'agents' || view === 'skills' || view === 'contexts' || view === 'new-chat') {
     setView(view);
     return;
@@ -136,6 +146,7 @@ function setView(view, cid, opts = {}) {
                 : view === 'skills' ? 'panel-skills'
                 : view === 'contexts' ? 'panel-contexts'
                 : view === 'settings' ? 'panel-settings'
+                : view === 'project' ? 'panel-project'
                 : 'panel-conversation';
   document.getElementById(panelId).classList.add('active');
 
@@ -215,6 +226,11 @@ function setView(view, cid, opts = {}) {
   } else if (view === 'settings') {
     currentCid = null;
     loadSettings();
+  } else if (view === 'project') {
+    // `cid` arg is repurposed as `pid` for this view (single second-arg
+    // slot kept; the function only inspects it for 'conversation' above).
+    currentCid = null;
+    if (typeof loadProjectDetail === 'function') loadProjectDetail(cid || '');
   } else {
     currentCid = null;
   }

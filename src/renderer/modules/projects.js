@@ -5,7 +5,8 @@
 // project; conversations without `project_id` stay in the existing
 // "Conversations" section (rendered by `conversation.js::renderConversationList`).
 //
-// Storage layout (cloud-synced): `<uid>/cloud/projects/_index.json`. See
+// Storage layout (cloud-synced): `<uid>/cloud/projects/<pid>/{project.json,
+// bindings.json}` — no aggregate index, list = directory scan. See
 // `features/projects.ts`. The renderer never persists projects state directly —
 // every mutation goes through `projects.*` IPC channels.
 //
@@ -203,9 +204,9 @@ function _bindProjectsHandlers(container) {
     _bindInlineRenameInput(input);
   });
 
-  // Project rows: caret / icon / name → toggle expand;
-  // ⋯ button → open menu (stopPropagation);
-  // .project-rename-input → swallow click (don't toggle).
+  // Project rows: any click → BOTH open the detail page AND toggle the
+  // expand state of nested conversations (per design — single click does
+  // both). Exceptions: ⋯ opens its menu; rename input swallows click.
   container.querySelectorAll('.project-row[data-pid]').forEach((row) => {
     const pid = row.dataset.pid;
     row.addEventListener('click', (e) => {
@@ -219,6 +220,7 @@ function _bindProjectsHandlers(container) {
         return;
       }
       _toggleProjectExpand(pid);
+      if (typeof setView === 'function') setView('project', pid);
     });
   });
 

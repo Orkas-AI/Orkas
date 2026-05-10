@@ -303,6 +303,19 @@ body {
   color: #94a3b8;
   flex-shrink: 0;
 }
+.search-result-project {
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: #f0fdf4;
+  color: #047857;
+  flex-shrink: 0;
+  font-weight: 500;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .search-result-snippet {
   font-size: 12px;
   color: #64748b;
@@ -555,6 +568,224 @@ body {
   padding: 4px 8px 8px 16px;
   font-size: 11.5px;
   color: #94a3b8;
+}
+
+/* ── Project detail panel ─────────────────────────────────────────────── */
+
+.project-detail-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  background: #f5f6f8;  /* page-tinted, lets card sections pop */
+}
+.project-detail-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 22px 32px 32px 32px;
+  max-width: 880px;
+  width: 100%;
+  margin: 0 auto;
+  box-sizing: border-box;
+}
+.project-detail-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 22px;
+}
+.project-detail-title {
+  flex: 1;
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-detail-title-input {
+  flex: 1;
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--text);
+  border: 1px solid var(--primary);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-family: inherit;
+  background: #fff;
+  outline: none;
+}
+.project-detail-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* Card-style section. Mirrors the look in shipping-product references —
+   white card on neutral page bg, rounded corners, subtle border. */
+.project-detail-card {
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 16px 18px;
+  margin-bottom: 14px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
+}
+.project-detail-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.project-detail-card-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.project-detail-card-desc {
+  font-size: 12.5px;
+  margin-top: 6px;
+  line-height: 1.5;
+}
+
+.project-bindings-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+}
+.project-binding-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  background: #f8fafc;
+  border: 1px solid #eef2f7;
+  border-radius: 8px;
+}
+.project-binding-row--stale { opacity: 0.6; }
+.project-binding-main { flex: 1; min-width: 0; }
+.project-binding-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.project-binding-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+}
+.project-binding-source {
+  font-size: 11px;
+  color: #64748b;
+  background: #e2e8f0;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.project-binding-source--stale { color: #b45309; background: #fef3c7; }
+.project-binding-desc {
+  font-size: 12px;
+  margin-top: 4px;
+  line-height: 1.4;
+}
+
+/* Modal picker for "+ Add agent / skill". Reuses .modal-overlay shell so
+   it sits above the panel + dims the rest of the UI; never gets clipped
+   at the panel edge like the prior popover. */
+.project-binding-picker-modal {
+  width: 560px;
+  max-width: 92vw;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  max-height: 80vh;
+}
+.project-binding-picker-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px 10px 14px;
+  border-bottom: 1px solid #eef2f7;
+}
+.project-binding-picker-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.project-binding-picker-close {
+  background: transparent;
+  border: none;
+  font-size: 20px;
+  color: #94a3b8;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+.project-binding-picker-close:hover { color: var(--text); }
+.project-binding-picker-search {
+  padding: 10px 14px 6px 14px;
+}
+.project-binding-picker-search input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--text);
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  outline: none;
+  transition: border-color 0.12s, background 0.12s;
+}
+.project-binding-picker-search input:focus {
+  border-color: var(--primary);
+  background: #fff;
+}
+.project-binding-picker-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 14px 14px 14px;
+}
+.project-binding-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.project-binding-picker-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid #eef2f7;
+  border-radius: 8px;
+  background: #fff;
+}
+/* Clamp picker descriptions to 3 lines so a long builtin description
+   (Software Implementation Engineer etc.) doesn't blow the row height
+   and force the user to scroll past one card to see the next. */
+.project-binding-picker-item .project-binding-desc {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* Empty-bindings banner inside an in-project conversation. */
+.conv-project-empty-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  background: #fef3c7;
+  border-bottom: 1px solid #fde68a;
+  font-size: 12.5px;
 }
 
 /* Danger-styled confirm modal ornaments. */

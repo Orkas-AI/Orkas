@@ -734,6 +734,22 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     if (typeof _pid === 'string' && _pid) turnProjectId = _pid;
   } catch { /* default scope */ }
 
+  // Project bindings (strict scope of agents/skills visible to the LLM).
+  // `null` = orphan conversation OR stale projectId — falls back to legacy
+  // global visibility. Resolved once per turn alongside the workspace
+  // resolver and threaded into commander prompt + agent skillList. See
+  // CLAUDE.md §6: project scope is the outer intersection BEFORE the 4
+  // enable-filter sites; do not add a 5th.
+  let turnProjectScope: import('../projects').ProjectBindings | null = null;
+  if (turnProjectId) {
+    try {
+      const projectsFeat = await import('../projects');
+      turnProjectScope = await projectsFeat.resolveProjectScope(uid, turnProjectId);
+    } catch (err) {
+      log.warn(`resolve project scope cid=${cid} pid=${turnProjectId}: ${(err as Error).message}`);
+    }
+  }
+
   // First-turn replay: if the persistent session jsonl doesn't exist yet,
   // prepend a `<group-chat-history>` block built from the visibility slice
   // so the agent / commander has context. After the first turn, the
@@ -777,8 +793,12 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // Hoisted here so the branch below can read it without re-fetching.
   let cliAgent: import('../agents').Agent | null = null;
   if (isCommander) {
-    systemPrompt = await buildCommanderSystemPrompt(uid, cid);
+    systemPrompt = await buildCommanderSystemPrompt(uid, cid, turnProjectScope?.agents ?? null);
     extraTools = await buildCommanderExtraTools(state, w);
+    // skillList stays undefined for commander — the project filter is
+    // applied via `projectAllowedSkillIds` below so the runner can fold
+    // it into `getSystemPromptBlock`'s allowlist without disturbing
+    // SkillStore (System B; commander has none anyway).
   } else {
     const agent = await agentsFeat.getAgent(actor.id);
     if (!agent) {
@@ -811,6 +831,11 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       systemPrompt = ''; // unused on CLI path
     } else {
       systemPrompt = await buildAgentInGroupSystemPrompt(uid, agent, workingDir);
+      // Pass agent.skill_list verbatim — it carries System A + System B
+      // ids the agent owns. The project filter is applied via
+      // `projectAllowedSkillIds` on the streamChatWithModel call so it
+      // only narrows the System A render block (`getSystemPromptBlock`),
+      // never blocks the agent's own evolved-skill SkillStore (System B).
       skillList = Array.isArray(agent.skill_list) ? agent.skill_list : undefined;
     }
   }
@@ -972,6 +997,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       readOnlyExtraRoots: [...skillRoots, ...agentRoots],
       ...(extraTools.length ? { extraTools } : {}),
       ...(skillList !== undefined ? { skillList } : {}),
+      ...(turnProjectScope ? { projectAllowedSkillIds: turnProjectScope.skills } : {}),
     })) {
       // Stream events → process channel.
       if (ev.type === 'final') {
@@ -1346,12 +1372,14 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
 
 // ── System prompts ───────────────────────────────────────────────────────
 
-async function buildCommanderSystemPrompt(uid: string, cid: string): Promise<string> {
+async function buildCommanderSystemPrompt(
+  uid: string, cid: string, allowedAgentIds?: readonly string[] | null,
+): Promise<string> {
   const { prompts } = await import('../../prompts/loader');
   const path_ = await import('node:path');
   const paths_ = await import('../../paths');
   const plan = await readPlan(uid, cid);
-  const allAgentsList = await buildAgentsIndexBlock(uid);
+  const allAgentsList = await buildAgentsIndexBlock(uid, allowedAgentIds);
   const { getConversationWorkspacePath } = await import('./conv_workspace');
   const workingDir = await getConversationWorkspacePath(uid, cid);
   const permState = (() => {
@@ -1429,7 +1457,13 @@ export async function _buildAgentsIndexBlockForTest(uid: string): Promise<string
   return buildAgentsIndexBlock(uid);
 }
 
-async function buildAgentsIndexBlock(uid: string): Promise<string> {
+/** Render the agents-index block. When `allowedIds` is provided, only those
+ *  agent ids are rendered (project-scoped commander view). `null` /
+ *  `undefined` = no filter (legacy global view, used for orphan
+ *  conversations). Empty array = render `(no agents)` block — the project
+ *  has zero bound agents. Unknown ids in the allowlist are silently
+ *  dropped (loader is the source of truth). */
+async function buildAgentsIndexBlock(uid: string, allowedIds?: readonly string[] | null): Promise<string> {
   const { getCurrentLang } = await import('../../i18n');
   const { pickDescription } = await import('#core-agent');
   const lang = getCurrentLang();
@@ -1443,7 +1477,10 @@ async function buildAgentsIndexBlock(uid: string): Promise<string> {
     '',
   ].join('\n');
   try {
-    const list = (await agentsFeat.listAgents()).filter((a: any) => a.enabled !== false);
+    const allow = (allowedIds === null || allowedIds === undefined) ? null : new Set(allowedIds);
+    const list = (await agentsFeat.listAgents())
+      .filter((a: any) => a.enabled !== false)
+      .filter((a: any) => (allow ? allow.has(a.agent_id) : true));
     if (!list.length) return `${header}(no agents)`;
     const entries = list.map((a: any) => {
       const name = a.name || a.agent_id;

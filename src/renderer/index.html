@@ -101,6 +101,10 @@
       <!-- Conversation Detail -->
       <section class="panel" id="panel-conversation">
         <div class="chat-container">
+          <div id="conv-project-empty-banner" class="conv-project-empty-banner" style="display:none">
+            <span class="muted" data-i18n="project.bindings.empty_in_chat">This project has no agents or skills bound. Open the project page to add some.</span>
+            <button type="button" class="btn btn-sm" id="conv-project-empty-banner-open" data-i18n="project.bindings.open_settings">Open project page</button>
+          </div>
           <div id="chat-history" class="chat-history">
             <div class="empty" data-i18n="chat.empty">No messages yet...</div>
           </div>
@@ -332,6 +336,38 @@
                 <svg class="stop-icon" viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>
               </button>
             </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Project detail (bindings + future per-project assets) -->
+      <section class="panel" id="panel-project">
+        <div class="project-detail-view">
+          <div class="project-detail-content" id="project-detail-content">
+            <div class="project-detail-header">
+              <h2 class="project-detail-title" id="project-detail-title"></h2>
+              <input type="text" class="project-detail-title-input" id="project-detail-title-input"
+                     style="display:none" autocomplete="off" spellcheck="false" />
+              <div class="project-detail-actions">
+                <button type="button" class="btn btn-sm" id="project-action-new-conv" data-i18n="project.action.new_conv">+ New chat</button>
+                <button type="button" class="btn btn-sm" id="project-action-rename" data-i18n="project.action.rename">Rename</button>
+                <button type="button" class="btn btn-sm btn-danger" id="project-action-delete" data-i18n="project.action.delete">Delete</button>
+              </div>
+            </div>
+            <section class="project-detail-card" id="project-detail-agents-section">
+              <div class="project-detail-card-head">
+                <span class="project-detail-card-title" data-i18n="project.bindings.agents_title">Agents</span>
+                <button type="button" class="btn btn-sm" id="project-add-agent-btn" data-i18n="project.bindings.add_agent">+ Add</button>
+              </div>
+              <div class="project-bindings-list" id="project-agents-list"></div>
+            </section>
+            <section class="project-detail-card" id="project-detail-skills-section">
+              <div class="project-detail-card-head">
+                <span class="project-detail-card-title" data-i18n="project.bindings.skills_title">Skills</span>
+                <button type="button" class="btn btn-sm" id="project-add-skill-btn" data-i18n="project.bindings.add_skill">+ Add</button>
+              </div>
+              <div class="project-bindings-list" id="project-skills-list"></div>
+            </section>
           </div>
         </div>
       </section>
@@ -784,6 +820,7 @@
   <script src="./modules/chat-lightbox.js"></script>
   <script src="./modules/strip-structural-blocks.js"></script>
   <script src="./modules/projects.js"></script>
+  <script src="./modules/project-detail.js"></script>
   <script src="./modules/conversation.js"></script>
   <script src="./modules/plan-rail.js"></script>
   <script src="./modules/queue-draft.js"></script>

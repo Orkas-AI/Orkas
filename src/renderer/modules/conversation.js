@@ -294,6 +294,11 @@ function onEnterConversationView() {
   // Workspace chip scope follows the active conv's project (resolved on
   // main side via cid → conv.project_id). Refresh whenever a conv mounts.
   if (typeof refreshWorkspaceChip === 'function') refreshWorkspaceChip();
+  // Empty-bindings banner: when this conv belongs to a project and the
+  // project has zero agents + zero skills bound, surface a one-line
+  // notice + "Open project page" affordance. Cheap IPC; only fires for
+  // in-project conversations.
+  if (typeof refreshConvProjectEmptyBanner === 'function') refreshConvProjectEmptyBanner(currentCid);
   // One-shot auto-expand: if the conv we just entered belongs to a
   // project, surface the project's row in the sidebar. Skipped when the
   // project is already expanded; manual user collapse on subsequent

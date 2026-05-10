@@ -121,7 +121,7 @@ PC/data/
     │   ├── memory/MEMORY.md + USER.md
     │   ├── agents/<aid>/              Custom agent: agent.json (spec) + meta/ (metacognition) + skills/ (self-evolved SkillStore)
     │   ├── skills/<sid>/              Custom skills (System A, scanned by SkillLoader)
-    │   ├── projects/_index.json + projects/<pid>/  Logical groups of conversations + reserved per-project asset slot (KB/permissions later)
+    │   ├── projects/<pid>/{project.json, bindings.json}  Logical groups of conversations + per-project agent/skill scope (no aggregate index — list = directory scan)
     │   └── config/{preferences,component-enabled}.json
     └── local/                 🔒 Machine-private domain (never synced)
         ├── config/            auth-profiles / permissions / reflection-state / web-search-cache
@@ -155,7 +155,7 @@ PC/data/
 
 session jsonl files land at `<uid>/cloud/sessions/<session_id>.jsonl` — they are **two independent files** from the UI message list.
 
-**Project membership** is an index-level field on the conv record (`Conversation.project_id`), **not** part of any path or session_id. cid stays globally unique; `<cid>.jsonl` / `groupChatDir` / `chat_attachments/<cid>/` / `session_id = <uid>-gconv-<cid>` paths are independent of project membership. Workspace resolution is the only place project membership has effect: `getWorkspacePath(uid, projectId?)` (sync) picks the project-scoped selection from `<uid>/local/workspace.json::projects[pid]` when set, falling through to `default.selectedPath` then `DEFAULT_USER_WORKSPACE`. group_chat resolves cid → projectId once at the top of `runTurn` and threads `projectId` through `ChatOptions` → `LocalToolsOpts` / `FileToolsOpts` / `ImageGenToolOpts`. **Do not** re-read the conv index per tool call to look up project membership — the resolved value travels with the turn.
+**Project membership** is an index-level field on the conv record (`Conversation.project_id`), **not** part of any path or session_id. cid stays globally unique; `<cid>.jsonl` / `groupChatDir` / `chat_attachments/<cid>/` / `session_id = <uid>-gconv-<cid>` paths are independent of project membership. Project membership has effect in two places, both resolved once at the top of `runTurn` and threaded through `ChatOptions`: (1) **workspace** — `getWorkspacePath(uid, projectId?)` (sync) picks the project-scoped selection from `<uid>/local/workspace.json::projects[pid]` when set, falling through to `default.selectedPath` then `DEFAULT_USER_WORKSPACE`; (2) **agent/skill scope** — `projects.resolveProjectScope(uid, projectId)` returns the project's `bindings.json` (`{agents, skills}`), which restricts the commander's agents-index render and the System A skill render to those ids only. Orphan conversations (no `project_id`) keep legacy global visibility. group_chat threads `projectId` + `projectAllowedSkillIds` through `ChatOptions` → `LocalToolsOpts` / `FileToolsOpts` / `ImageGenToolOpts` / `getSystemPromptBlock`. **Do not** re-read the conv index or bindings per tool call — the resolved values travel with the turn.
 
 **Security invariant**: `session_id` must be `<uid>-<kind>-<tail>`, with the uid in the first segment, and `<kind>` ∈ `gconv | gmember | skill | agent | extract-img | reflect | memory-extract | anon | cli` (`sub` / `organizer` / `conv` are legacy kinds; new code does not generate them, but `migrate-session-ids` preserves these older files). `session-store.ts::sessionFileFor()` enforces this with hard assertions to prevent cross-uid leakage. **Do not** encode brand names (`orkas-` / `aiteam-` / any app name) into session_id — we hit the renaming-breaks-history pitfall once, the startup `migrateLegacySessionIds(uid)` strips legacy prefixes once, and new code never adds them again. Adding a new kind requires extending this table. The `cli` kind has no `sessions/*.jsonl` (CLI dispatches do not run through core-agent); the id exists purely to give per-run records a stable, kind-tagged identifier.
 
@@ -228,9 +228,11 @@ Sources = `src/builtin/skills/` (git-tracked, hash-synced into `data/builtin/ski
 
 **Per-user enable/disable** (shared by agent + skill, stored at `<uid>/cloud/config/component-enabled.json`, **only `false` is recorded**): the single resolver entrypoint is `features/component_enabled.ts::isAgentEnabled / isSkillEnabled`. **Only 4 filter application sites** (do not add filtering elsewhere):
 1. `listAgents() / listSkills()` attaches `enabled` for the UI (no filtering — let the UI render the toggle).
-2. `chats.ts::_buildAgentsIndex` — agent picker list.
+2. `group_chat/bus.ts::buildAgentsIndexBlock` — commander's agent picker list.
 3. `chats.ts::stream/sendToConversation` — bound disabled agents return `errors.agent_disabled` directly.
 4. `skill-registry.getSystemPromptBlock({disabledIds})` — render-stage filtering.
+
+**Project scope** is the OUTER intersection — applied BEFORE the 4 enable filters above, NOT a 5th site. The two existing render entry points (`buildAgentsIndexBlock` for agents, `getSystemPromptBlock` for skills) accept an `allowedIds` / `allowlist` parameter; group_chat resolves `projects.resolveProjectScope(uid, projectId)` once at the top of `runTurn` and threads `bindings.agents` into the agent picker call and `bindings.skills` (intersected with `agent.skill_list` for the System A render only) via `ChatOptions.projectAllowedSkillIds`. SkillStore (System B, agent self-evolved skills) is gated by `skillList` alone — project bindings must NOT block an agent from accessing its own evolved skills. Order: `project bindings ∩ skill_list ∩ enabled` for System A; `skill_list ∩ enabled` for System B. Orphan conversations (no `project_id`) skip the project step entirely (legacy behavior).
 
 **Write entry points** (rename / URL/dir import): see `features/skills.ts`. Every write entry must call `invalidateSkills()`. The `<<<skill-file>>>` block can only write into the current skill directory (no cross-skill `skill=Y` attribute).
 
@@ -340,6 +342,8 @@ The renderer evaluates `<script>`-loaded files where `module` is undefined, so t
 - Add eager pre-processing (extract / preview / chunking) to `chat_attachments.uploadAttachment`.
 - Treat `<uid>/local/workspace.json` as a flat `{selectedPath, recentPaths}` after the projects scope upgrade — the file is now `{default, projects:{<pid>:…}, updatedAt}`. Always go through `getWorkspacePath(uid, projectId?)` / `setWorkspacePath` / `resetWorkspacePath`; reading the JSON directly skips legacy-shape promotion + project-scope fallback.
 - Encode `project_id` into a path / cid / session_id segment. Project membership is an index-level field on the conv record only — see §5.
+- Reintroduce an aggregate `projects/_index.json`. Project existence is the set of `projects/<pid>/project.json` files on disk; listing scans the directory. **Why:** an aggregate index re-creates the multi-device sync conflict surface this round was designed to avoid (every membership change becomes a multi-file transactional write), and once a server-mediated collab story lands, server-side sync of project directories is a directory-level operation — clients only ever scan. See `features/projects.ts` header.
+- Apply the project agent/skill scope as a 5th `component_enabled` filter site. Project scope is an OUTER intersection plumbed through the existing render entry points (`buildAgentsIndexBlock` `allowedIds` / `getSystemPromptBlock` `allowlist`) — see §6.
 
 **Timeouts / locks**:
 - Add a "total wall-clock timeout" to LLM calls (`timeout: N` / `setTimeout→abort`). The single application-layer watchdog is `client.ts::streamChatWithModel`'s `idleTimeout=600s` (true idle); the SDK 1h limit is backstopped by `sdk-timeout-patch.ts`; group-chat infinite-loop protection is `bus.ts::MAX_WORKER_TURNS=100` (**turns, do not change to a timeout**).
