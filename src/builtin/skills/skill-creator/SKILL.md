@@ -33,6 +33,7 @@ A skill is **an independent tool capability**, not a tutorial. When the LLM sees
 - **Do NOT dump the container or any inner block as a workspace file.** The server parses them inline and persists to `<skill_dir>/<path>`.
 - **Cross-skill writes are no longer supported.** Inside an inline edit chat, only the current skill's directory is writable. Do not try `<<<skill-file skill=...>>>` (deprecated).
 - **One `<skill>` container per skill being created/edited this turn.** Several only when the user's request spans distinct skills. End the turn after — do NOT call `dispatch_to`.
+- **Output language follows the user's UI language** — every human-readable part of the SKILL.md you author (section titles, body prose, example labels, `## When to use` / `## How to call` / etc. — write them in the user's UI language, e.g. `## 何时使用` / `## 如何调用` for Chinese UI) plus the conversation prose around the `<skill>` container all go in the user's current UI language (per the "User language" directive in the system prompt; that directive's coverage applies even though this file reaches you as a `read_file` result). `description_zh` / `description_en` frontmatter fields are pinned by suffix. Code blocks, file paths, frontmatter field names (`name` / `description_zh` / `description_en`), `<<<skill-file>>>` syntax, and skill_id strings stay as-is. The English used in this file (including the section names listed in "Quality bar — SKILL.md body" below) is illustrative shape, not literal text to copy.
 
 ## Create vs edit decision
 

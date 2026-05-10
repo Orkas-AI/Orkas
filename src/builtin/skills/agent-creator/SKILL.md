@@ -22,6 +22,7 @@ You **must** consult before emitting any `<agent>` container. The protocol below
 - **Mutation only via `<agent>` container.** Do NOT use `edit_file` / `write_file` / `bash` to mutate `agent.json` directly. Read for inspection is allowed; every write goes through the container — the sandbox physically blocks direct writes, the rule here keeps you from wasting tool calls probing it.
 - **Do NOT dump the container as a workspace file** (e.g. `<name>-agent-definition.xml`). The container is a contract between the LLM and the server; the server parses it inline. An extra `write_file` only leaks an unused XML file.
 - **One container per agent being created/edited this turn.** Several containers in one turn are legal only when the user's request spans distinct agents ("tighten the workflow on A and B"). Each container is parsed and applied independently. End the turn after — do NOT call `dispatch_to`.
+- **Output language follows the user's UI language** — `<name>`, `<workflow>` step titles + body, `<inputs>` `label` values, and the prose around the container all go in the user's current UI language (per the "User language" directive in the system prompt; that directive's coverage applies even though this file reaches you as a `read_file` result). `<description_zh>` / `<description_en>` are pinned by suffix. XML tag names, backticked tool / skill names, JSON keys, file paths, and `select` `value` strings stay as-is. The English used in this file is illustrative shape, not literal text to copy.
 
 ## Create vs edit decision
 
