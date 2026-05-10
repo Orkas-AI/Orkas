@@ -431,11 +431,12 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
 
   // Project scope at dispatch time: if the conversation belongs to a
   // project, drop any recipient agent_id that isn't bound to the project
-  // (CLAUDE.md §6 — "不可用则交给指挥官处理"). Reserved ids (user /
-  // commander) always pass through. After filtering, an empty `to` falls
-  // through to the sender-default rule below — for user-initiated text
-  // that means "go to commander", which is the explicit hand-off the
-  // requirement asks for. Cheap: one project.json + bindings.json read,
+  // (CLAUDE.md §6 — "if recipient unavailable, hand off to commander").
+  // Reserved ids (user / commander) always pass through. After filtering,
+  // an empty `to` falls through to the sender-default rule below — for
+  // user-initiated text that means "go to commander", which is the
+  // explicit hand-off the requirement asks for. Cheap: one project.json
+  // + bindings.json read,
   // resolveProjectScope already memoises file existence checks. Skipped
   // when the conv has no project_id (orphan = unrestricted).
   try {
