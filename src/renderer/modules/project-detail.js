@@ -80,8 +80,9 @@ function _renderProjectDetail() {
 function _renderBindingsRows(kind, items, staleIds) {
   const lang = _activeLang();
   const removeLabel = escapeHtml(t('project.bindings.remove'));
+  const sorted = (items || []).slice().sort(_byDisplayName);
   const rows = [];
-  for (const it of items) {
+  for (const it of sorted) {
     const id = (kind === 'agent') ? it.agent_id : it.id;
     const name = escapeHtml(it.name || id);
     const desc = _pickItemDescription(it, lang);
@@ -125,6 +126,17 @@ function _activeLang() {
   return 'en';
 }
 
+/** Stable A→Z order by display name (case + diacritic insensitive,
+ *  numeric-aware so "Item 2" precedes "Item 10"). Falls back to id when
+ *  a name is missing. Used in both the bound-items rail and the candidate
+ *  picker so user-facing lists stay legible regardless of insertion
+ *  order. zh + en mix sorts reasonably under default locale collation. */
+function _byDisplayName(a, b) {
+  const na = (a && (a.name || a.agent_id || a.id)) || '';
+  const nb = (b && (b.name || b.agent_id || b.id)) || '';
+  return na.localeCompare(nb, undefined, { sensitivity: 'base', numeric: true });
+}
+
 function _pickItemDescription(item, lang) {
   // Centralised across the renderer: `utils.js::pickDesc` does the
   // cross-locale fallback (zh ?? en ?? '') so a one-language entry never
@@ -164,7 +176,7 @@ async function _openAddPicker(kind) {
       projectId: _projectDetailPid,
     });
     if (!res?.ok) throw new Error(res?.error || 'load_failed');
-    candidates = (kind === 'agent') ? (res.agents || []) : (res.skills || []);
+    candidates = ((kind === 'agent') ? (res.agents || []) : (res.skills || [])).slice().sort(_byDisplayName);
   } catch (err) {
     _projectDetailLog.warn('load candidates failed', err);
     return;
