@@ -220,6 +220,28 @@ function getChatRecipient(target) { return { ..._activeRecipient(target) }; }
 
 function _onRecipientChanged(_target) { /* reserved for future hooks */ }
 
+/** When the active project's bindings change (commander chip → switch
+ *  project, or project rename/binding edit while a chat is open), the
+ *  current recipient may no longer be a valid agent for the new scope.
+ *  Reset to commander silently — the user will see the chip flip and the
+ *  recipient picker collapse to commander-only on next open. Called from
+ *  `projects.js` post project-pick. No-op for `commander` recipients and
+ *  for orphan contexts (pid empty). */
+async function validateRecipientAgainstProject(target, pid) {
+  const cur = _activeRecipient(target);
+  if (!cur || cur.kind !== 'agent') return;
+  if (!pid) return;
+  try {
+    const res = await window.orkas.invoke('projects.bindings.list', { projectId: pid });
+    if (!res || !res.ok) return;
+    const bound = new Set((res.bindings && res.bindings.agents) || []);
+    if (!bound.has(cur.id)) {
+      setChatRecipient(target, { kind: 'commander' });
+      _renderRecipientChip(target);
+    }
+  } catch (_) { /* leave as-is on failure */ }
+}
+
 function setChatRecipient(target, next, _opts = {}) {
   const r = _normRecipient(next);
   if (!r) return;
@@ -294,10 +316,21 @@ function onEnterConversationView() {
   // Workspace chip scope follows the active conv's project (resolved on
   // main side via cid → conv.project_id). Refresh whenever a conv mounts.
   if (typeof refreshWorkspaceChip === 'function') refreshWorkspaceChip();
+  // Recipient validation: bindings may have changed since this conv was
+  // last open (user removed the agent from the project). If the sticky
+  // recipient is no longer in the project's agents, drop back to commander
+  // so the chip matches what the dispatch path will actually route to.
+  if (currentCid && Array.isArray(conversations)) {
+    const conv = conversations.find((c) => c && c.conversation_id === currentCid);
+    const pid = (conv && conv.project_id) || '';
+    if (pid && typeof validateRecipientAgainstProject === 'function') {
+      validateRecipientAgainstProject('conversation', pid);
+    }
+  }
   // Empty-bindings banner: when this conv belongs to a project and the
-  // project has zero agents + zero skills bound, surface a one-line
-  // notice + "Open project page" affordance. Cheap IPC; only fires for
-  // in-project conversations.
+  // project has zero agents bound, surface a one-line notice + "Open
+  // project page" affordance. Cheap IPC; only fires for in-project
+  // conversations.
   if (typeof refreshConvProjectEmptyBanner === 'function') refreshConvProjectEmptyBanner(currentCid);
   // One-shot auto-expand: if the conv we just entered belongs to a
   // project, surface the project's row in the sidebar. Skipped when the

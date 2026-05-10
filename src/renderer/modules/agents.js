@@ -1342,10 +1342,43 @@ if (typeof window !== 'undefined') {
   window.positionPickerPopover = _positionPopoverAboveOrBelow;
 }
 
-function _openAgentPicker(anchorBtn) {
+// Project scope state for the active picker session: when the anchor's
+// active context (commander tab / current conv) belongs to a project, the
+// picker collapses to that project's bound agents. `null` = no project
+// scope active (orphan conv / no project picked) → unrestricted listing.
+// Set on every `_openAgentPicker`; consumed by `_renderAgentPickerList` and
+// the search-input change handler so live filtering stays scoped.
+let _pickerBoundAgentIds = null;
+
+function _resolveActiveProjectId(anchorId) {
+  if (anchorId === 'new-chat-recipient-chip') {
+    return (typeof getCommanderProjectId === 'function') ? getCommanderProjectId() : '';
+  }
+  if (anchorId === 'chat-recipient-chip') {
+    if (typeof currentCid !== 'undefined' && currentCid
+        && typeof conversations !== 'undefined' && Array.isArray(conversations)) {
+      const conv = conversations.find((c) => c && c.conversation_id === currentCid);
+      return (conv && conv.project_id) || '';
+    }
+  }
+  return '';
+}
+
+async function _openAgentPicker(anchorBtn) {
   const picker = document.getElementById('agent-picker');
   if (!anchorBtn || !picker) return;
   picker.dataset.anchorId = anchorBtn.id;
+  // Refresh project-scope bindings on every open so the picker reflects
+  // whatever project the user just picked (commander chip) or whatever
+  // project the active conv belongs to.
+  _pickerBoundAgentIds = null;
+  const pid = _resolveActiveProjectId(anchorBtn.id);
+  if (pid) {
+    try {
+      const res = await window.orkas.invoke('projects.bindings.list', { projectId: pid });
+      if (res?.ok) _pickerBoundAgentIds = new Set((res.bindings && res.bindings.agents) || []);
+    } catch (_) { /* fall back to global listing */ }
+  }
   // Render first so measurement in _positionPopoverAboveOrBelow reflects
   // the real list height (not stale content from a previous open).
   _renderAgentPickerList('');
@@ -1368,7 +1401,13 @@ function _renderAgentPickerList(filterText) {
   const anchorId = picker?.dataset.anchorId || '';
   // Disabled agents are filtered out — picker is a "what can I dispatch right
   // now" UI, and re-enabling lives in the management page (Agents view + ⋯ menu).
-  const agents = (_agentsCache || []).filter((a) => a.enabled !== false);
+  let agents = (_agentsCache || []).filter((a) => a.enabled !== false);
+  // Project scope: only show agents bound to the active context's project.
+  // Applied AFTER the enabled filter (per CLAUDE.md §6 outer-intersection
+  // rule). `null` = no project scope, full listing.
+  if (_pickerBoundAgentIds) {
+    agents = agents.filter((a) => _pickerBoundAgentIds.has(a.agent_id));
+  }
   const q = (filterText || '').toLowerCase();
   // Search matches across the active locale description; cross-language
   // fallback via pickDesc lets users find a single-locale agent regardless
@@ -1421,7 +1460,15 @@ function _renderAgentPickerList(filterText) {
          <div class="skill-picker-item-desc">${escapeHtml(t('chat.recipient_commander_hint'))}</div>
        </div>`
     : '';
-  listEl.innerHTML = commanderHtml + groupHtml(t('agents.source_custom'), groups.custom) + groupHtml(t('agents.source_builtin'), groups.builtin);
+  // When the active context is a project AND the project has zero agents
+  // bound, surface a hint above the commander entry so the user knows
+  // "this isn't broken — go bind an agent first". Suppressed on user search
+  // (they're explicitly typing) so the search "no match" message owns the
+  // empty rendering.
+  const projectEmptyHint = (!q && _pickerBoundAgentIds && _pickerBoundAgentIds.size === 0)
+    ? `<div class="skill-picker-empty-hint">${escapeHtml(t('agents.no_project_agents'))}</div>`
+    : '';
+  listEl.innerHTML = projectEmptyHint + commanderHtml + groupHtml(t('agents.source_custom'), groups.custom) + groupHtml(t('agents.source_builtin'), groups.builtin);
   for (const el of listEl.querySelectorAll('[data-id]')) {
     el.addEventListener('click', async () => {
       _closeAgentPicker();

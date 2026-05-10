@@ -429,6 +429,36 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   }
   to = Array.from(new Set(to));
 
+  // Project scope at dispatch time: if the conversation belongs to a
+  // project, drop any recipient agent_id that isn't bound to the project
+  // (CLAUDE.md §6 — "不可用则交给指挥官处理"). Reserved ids (user /
+  // commander) always pass through. After filtering, an empty `to` falls
+  // through to the sender-default rule below — for user-initiated text
+  // that means "go to commander", which is the explicit hand-off the
+  // requirement asks for. Cheap: one project.json + bindings.json read,
+  // resolveProjectScope already memoises file existence checks. Skipped
+  // when the conv has no project_id (orphan = unrestricted).
+  try {
+    const { getConversation } = await import('../chats');
+    const conv = await getConversation(uid, cid);
+    const projectId = (conv as any)?.project_id;
+    if (typeof projectId === 'string' && projectId) {
+      const projectsFeat = await import('../projects');
+      const scope = await projectsFeat.resolveProjectScope(uid, projectId);
+      if (scope) {
+        const bound = new Set(scope.agents);
+        const before = to;
+        to = to.filter((id) => RESERVED_IDS.has(id) || bound.has(id));
+        if (to.length !== before.length) {
+          const dropped = before.filter((id) => !to.includes(id));
+          log.info(`dispatch project-scope drop cid=${cid} pid=${projectId} from=${fromActorId} dropped=${dropped.join(',')}`);
+        }
+      }
+    }
+  } catch (err) {
+    log.warn(`project-scope filter cid=${cid}: ${(err as Error).message}`);
+  }
+
   // Default fallback: if nothing resolved (and no force), use sender-default.
   // Mirror router.ts's rule: user → commander; commander/agent → user.
   if (!to.length) {
@@ -795,10 +825,8 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   if (isCommander) {
     systemPrompt = await buildCommanderSystemPrompt(uid, cid, turnProjectScope?.agents ?? null);
     extraTools = await buildCommanderExtraTools(state, w);
-    // skillList stays undefined for commander — the project filter is
-    // applied via `projectAllowedSkillIds` below so the runner can fold
-    // it into `getSystemPromptBlock`'s allowlist without disturbing
-    // SkillStore (System B; commander has none anyway).
+    // skillList stays undefined for commander — every skill is globally
+    // visible (skills are NOT project-scoped this round; see CLAUDE.md §6).
   } else {
     const agent = await agentsFeat.getAgent(actor.id);
     if (!agent) {
@@ -832,10 +860,9 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     } else {
       systemPrompt = await buildAgentInGroupSystemPrompt(uid, agent, workingDir);
       // Pass agent.skill_list verbatim — it carries System A + System B
-      // ids the agent owns. The project filter is applied via
-      // `projectAllowedSkillIds` on the streamChatWithModel call so it
-      // only narrows the System A render block (`getSystemPromptBlock`),
-      // never blocks the agent's own evolved-skill SkillStore (System B).
+      // ids the agent owns. Skills are NOT project-scoped this round
+      // (see CLAUDE.md §6); the runner's `projectAllowedSkillIds` hook is
+      // preserved for future re-enable but bus does not pass it.
       skillList = Array.isArray(agent.skill_list) ? agent.skill_list : undefined;
     }
   }
@@ -1001,7 +1028,10 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       readOnlyExtraRoots: [...skillRoots, ...agentRoots],
       ...(extraTools.length ? { extraTools } : {}),
       ...(skillList !== undefined ? { skillList } : {}),
-      ...(turnProjectScope ? { projectAllowedSkillIds: turnProjectScope.skills } : {}),
+      // Skills are NOT project-scoped this round — every conversation sees
+      // every skill (gated only by per-user enable + agent.skill_list).
+      // The runner's `projectAllowedSkillIds` plumbing is preserved for
+      // a future re-enable; bus just doesn't pass it.
     })) {
       // Stream events → process channel.
       if (ev.type === 'final') {

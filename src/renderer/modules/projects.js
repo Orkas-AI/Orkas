@@ -688,6 +688,13 @@ function _showCommanderProjectPicker(anchor) {
       } catch (_) {}
       _renderCommanderProjectChip();
       if (typeof refreshWorkspaceChip === 'function') refreshWorkspaceChip();
+      // Recipient validation: switching to a project that doesn't include
+      // the currently-picked agent must drop the chip back to commander
+      // (otherwise the user sends @<unbound-agent> + commander has nothing
+      // to dispatch to). No-op when commander or orphan project.
+      if (typeof validateRecipientAgainstProject === 'function') {
+        validateRecipientAgainstProject('new-chat', _commanderProjectId);
+      }
       _closeMenu();
     });
     menu.appendChild(row);

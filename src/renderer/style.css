@@ -3713,6 +3713,19 @@ body.model-not-configured .main-content { flex-direction: column; }
   -webkit-line-clamp: 2;
 }
 
+/* Banner shown above the picker list when the active context is a project
+   with zero bound agents — anchors the empty state without hiding the
+   commander entry below. */
+.skill-picker-empty-hint {
+  padding: 8px 10px;
+  font-size: 11.5px;
+  color: #b45309;
+  background: #fef3c7;
+  border-radius: 6px;
+  margin: 4px 6px 6px 6px;
+  line-height: 1.4;
+}
+
 .skill-picker-empty {
   padding: 18px 10px;
   text-align: center;

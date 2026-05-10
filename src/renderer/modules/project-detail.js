@@ -397,7 +397,9 @@ async function refreshConvProjectEmptyBanner(cid) {
   try {
     const res = await window.orkas.invoke('projects.bindings.list', { projectId: pid });
     const b = res && res.bindings ? res.bindings : { agents: [], skills: [] };
-    const isEmpty = !(b.agents || []).length && !(b.skills || []).length;
+    // Skills aren't project-scoped this round — only the agents bucket
+    // gates whether the user can do anything inside this project.
+    const isEmpty = !(b.agents || []).length;
     banner.style.display = isEmpty ? '' : 'none';
     banner.dataset.pid = pid;
   } catch (_) {
