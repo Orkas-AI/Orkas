@@ -59,6 +59,14 @@ function skillSourceLabel(source: string): 'builtin' | 'custom' {
 // layout that doesn't exist here), which then trips E_PATH_OUT_OF_SCOPE on
 // `read_file`. The roots-in-block form puts the actual values right next to the
 // entry list so the LLM can't miss them.
+//
+// 2026-05-09 follow-up: the warning line previously read
+// `do NOT use training-prior layouts (e.g. /data/custom/skills/)` — the negative
+// example string itself primed the model and we observed retries hitting exactly
+// `/data/custom/skills/<id>/SKILL.md` verbatim. Removed the negative example so
+// the warning is just `Use these ROOT values verbatim.` (matches the agents-index
+// block in `bus.ts::buildAgentsIndexBlock`, which has no example string and does
+// not see this failure). Do NOT re-add the negative example.
 async function renderSkillLines(
   specs: SkillSpec[],
   customRoot: string,
@@ -73,7 +81,7 @@ async function renderSkillLines(
     '`read_file(<ROOT>/<id>/SKILL.md)` — ROOT by Source:',
     `- custom:  ${customRoot}`,
     `- builtin: ${builtinRoot}`,
-    'Use these ROOT values verbatim; do NOT use training-prior layouts (e.g. `/data/custom/skills/`).',
+    'Use these ROOT values verbatim.',
     '',
   ];
   for (const s of specs) {
