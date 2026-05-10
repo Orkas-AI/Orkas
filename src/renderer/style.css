@@ -1887,6 +1887,8 @@ body.model-not-configured .main-content { flex-direction: column; }
   height: 100%;
   background: #f8fafc;
   position: relative;
+  /* Used by `.chat-input-form { width: 40cqw }`. */
+  container-type: inline-size;
 }
 
 
@@ -2580,6 +2582,10 @@ body.model-not-configured .main-content { flex-direction: column; }
 .chat-input-form {
   margin-top: 10px;
   padding: 10px 12px;
+  /* Stable 40% of chat pane, not bubble width. */
+  width: 40cqw;
+  max-width: 100%;
+  min-width: 280px;
   background: rgba(14, 165, 233, 0.06);
   border: 1px solid rgba(14, 165, 233, 0.25);
   border-radius: 10px;
@@ -2659,25 +2665,78 @@ body.model-not-configured .main-content { flex-direction: column; }
   flex-direction: column;
   gap: 6px;
 }
-.chat-input-form .form-field-dir {
+/* Card-style directory picker — single clickable surface that
+   replaces the old "[Choose…] [Clear] /path" three-button row.
+   See chat-input-form.js `field.type === 'directory'` for the DOM
+   it builds: card → icon + path/hint + change pill. */
+.chat-input-form .form-field-dir-card {
   display: flex;
   align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.6);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, box-shadow 0.15s;
+  min-width: 0;
+}
+.chat-input-form .form-field-dir-card:not(.is-empty) {
+  /* Filled state: solid border + opaque background to read as
+     "value held" rather than "drop zone". */
+  border-style: solid;
+  background: rgba(255, 255, 255, 0.85);
+}
+.chat-input-form .form-field-dir-card:hover:not(.is-disabled) {
+  border-color: var(--primary);
+  background: rgba(14, 165, 233, 0.04);
+}
+.chat-input-form .form-field-dir-card:focus-visible {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(14, 165, 233, 0.15);
+}
+.chat-input-form .form-field-dir-card.is-disabled {
+  cursor: default;
+  border-style: solid;
+}
+.chat-input-form .form-field-dir-icon {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  color: var(--muted);
+}
+.chat-input-form .form-field-dir-card:not(.is-empty) .form-field-dir-icon,
+.chat-input-form .form-field-dir-card:hover:not(.is-disabled) .form-field-dir-icon {
+  color: var(--primary);
 }
 .chat-input-form .form-field-dir-path {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
-  color: var(--text);
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text);
 }
 .chat-input-form .form-field-dir-path.is-empty {
   font-family: inherit;
+  font-size: 13px;
   color: var(--muted);
+}
+.chat-input-form .form-field-dir-change {
+  flex-shrink: 0;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(14, 165, 233, 0.1);
+  color: var(--primary);
+  font-weight: 500;
+}
+.chat-input-form.is-submitted .form-field-dir-card {
+  cursor: default;
+  border-style: solid;
 }
 .chat-input-form .form-field-file-chips {
   display: flex;

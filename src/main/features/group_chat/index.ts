@@ -272,8 +272,21 @@ export async function markFormSubmittedAndDispatch(
       const ag = await agentsFeat.getAgent(agentId);
       const cli = ag?.runtime?.kind === 'cli' ? ag.runtime.cli : '';
       if (agentsFeat.cliIsCodingAgent(cli)) {
-        await setCodingProjectDir(userId, cid, projDir);
-        log.info(`coding project_dir set user=${userId} cid=${cid} agent=${agentId} dir=${projDir}`);
+        const { readState: rs } = await import('./state');
+        const prev = await rs(userId, cid);
+        const oldDir = prev.coding_project_dir || '';
+        await setCodingProjectDir(userId, cid, projDir, { explicit: true });
+        if (oldDir && oldDir !== projDir) {
+          // cwd is about to change — claude code's sessions are cwd-keyed,
+          // so the existing binding would fail with "No conversation
+          // found" on resume. Drop it; next dispatch replays the full
+          // slice so the user-visible conversation continues seamlessly.
+          const cliSessions = await import('../local_agents/sessions');
+          await cliSessions.clearForConversation(userId, cid);
+          log.info(`coding cwd changed (form) user=${userId} cid=${cid} ${oldDir} → ${projDir} — cleared cli sessions`);
+        } else {
+          log.info(`coding project_dir set (explicit) user=${userId} cid=${cid} agent=${agentId} dir=${projDir}`);
+        }
       }
     }
   } catch (err) {

@@ -926,15 +926,19 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     // dir mid-conversation. We also defensively check the directory
     // exists and is a real dir — if it vanished between picker and
     // dispatch we fall back rather than failing the run.
-    const agentsFeat = await import('../agents');
     let cliWorkingDir = wsRoot;
     if (agentsFeat.cliIsCodingAgent(cliAgent.runtime?.kind === 'cli' ? cliAgent.runtime.cli : '')) {
+      // Default + workspace-sync: on the first coding-agent turn the
+      // user shouldn't have to pick a directory just to start; default
+      // to their effective workspace. On later turns, follow workspace
+      // changes silently — unless the user has explicitly picked
+      // something different through the input-form (sticky).
+      await _syncCodingProjectDirWithWorkspace(uid, cid, wsRoot);
       const st = await import('./state');
       const stateFile = await st.readState(uid, cid);
       const projDir = stateFile.coding_project_dir;
       if (projDir) {
         try {
-          const fs = await import('node:fs');
           if (fs.statSync(projDir).isDirectory()) cliWorkingDir = projDir;
         } catch { /* missing → fall through to wsRoot */ }
       }
@@ -1907,6 +1911,46 @@ planExecutor.bindBusHooks({
 
 const CLI_PROMPT_MAX_BYTES = 200 * 1024;
 
+/** Default + workspace-sync for the coding-agent project directory.
+ *
+ *  Two cases the user expects to "just work":
+ *    1. First dispatch in a fresh conv: we shouldn't pop a directory
+ *       picker just to start — the user already chose a workspace,
+ *       use that.
+ *    2. User switches the workspace mid-conversation (chip in the
+ *       chat surface): the next coding-agent turn should follow.
+ *
+ *  Either case = "auto-set" with `explicit=false`. Once the user
+ *  picks a different directory through the input-form picker
+ *  (form-submit hook flips `explicit=true`), workspace switches no
+ *  longer override their choice. Caller must already have established
+ *  this is a coding agent (the explicit flag is meaningless for
+ *  non-coding CLIs that don't honour `coding_project_dir`). */
+async function _syncCodingProjectDirWithWorkspace(
+  uid: string, cid: string, wsPath: string,
+): Promise<void> {
+  const cur = await readState(uid, cid);
+  if (cur.coding_project_dir_explicit) return;            // sticky
+  if (cur.coding_project_dir === wsPath) return;          // already in sync
+  const oldDir = cur.coding_project_dir || '';
+  const { setCodingProjectDir } = await import('./state');
+  await setCodingProjectDir(uid, cid, wsPath, { explicit: false });
+  if (oldDir && oldDir !== wsPath) {
+    // CLI session bindings reference the OLD cwd. claude code keys
+    // sessions by cwd (`~/.claude/projects/<encoded-cwd>/<id>.jsonl`),
+    // so resuming a stale id at the new cwd fails with
+    // "No conversation found". Drop bindings preemptively so the
+    // next dispatch goes through the full-slice replay path —
+    // user-visible conversation continues seamlessly because
+    // `_buildCliPrompt` includes the slice when `resuming=false`.
+    const cliSessions = await import('../local_agents/sessions');
+    await cliSessions.clearForConversation(uid, cid);
+    log.info(`coding cwd changed cid=${cid} ${oldDir} → ${wsPath} — cleared cli sessions`);
+  } else {
+    log.info(`coding project_dir auto-set cid=${cid} → ${wsPath}`);
+  }
+}
+
 /** Build an `<agent-input-form>` block listing the agent's required
  *  inputs that are still unfulfilled, or return `null` when nothing is
  *  missing. Currently the only auto-injected input is `project_dir`
@@ -2101,27 +2145,38 @@ async function _buildCliPrompt(
   slice: GroupMessage[],
   /** When true, the CLI is resuming a prior session and already has
    *  the conversation history in its own memory — we skip the slice
-   *  block entirely and just send "head + new task". Drops massive
-   *  redundancy on long convs. */
+   *  block entirely and just send the static frame + new task. Drops
+   *  massive redundancy on long convs. */
   resuming: boolean,
 ): Promise<string> {
-  // Build head + tail separately so truncation can throw away the
-  // middle of the conversation slice (oldest entries) while preserving
-  // the agent identity preamble + the actual task. The naive "trim
-  // from the head of the byte buffer" approach we used first dropped
-  // the role preamble — leaving the CLI without context about who it
-  // is or what it owns.
-  const headLines: string[] = [];
-  headLines.push(`You are "${agent.name || agent.agent_id}".`);
-  const desc = (agent.description_en || agent.description_zh || '').trim();
-  if (desc) headLines.push(desc);
-  headLines.push('');
-
-  // Attachments come from the dispatched message AND from prior slice
-  // messages — the agent might be expected to "look at the report you
-  // uploaded last turn", so we collect across the whole visibility
-  // slice. De-duplicate by absolute path; preserve oldest-first order.
+  // Layout = `chat_cli_agent.md` (static frame) + `chat_cli_coding_protocol.md`
+  // (coding-only). The static-first / runtime-last split keeps the
+  // CLI's prompt cache stable across turns: identity + protocol stay
+  // byte-identical, attachments / slice / task body all change.
+  const { prompts } = await import('../../prompts/loader');
   const { chatAttachmentDir } = await import('../../paths');
+
+  // ── Output protocol — coding agents only ────────────────────────
+  // Non-coding CLIs (openclaw / opencode / hermes) get an empty block
+  // and never see the project-dir-switching rules — the host doesn't
+  // route their cwd through `coding_project_dir` and the form
+  // wouldn't fire on their submissions anyway.
+  const cli = agent.runtime?.kind === 'cli' ? agent.runtime.cli : '';
+  let outputProtocolBlock = '';
+  if (agentsFeat.cliIsCodingAgent(cli)) {
+    const inputs = Array.isArray(agent.inputs) ? agent.inputs : [];
+    const projectDirInput = inputs.find((f: any) => f.id === agentsFeat.PROJECT_DIR_INPUT_ID);
+    const projectDirLabel = (projectDirInput && typeof projectDirInput.label === 'string' && projectDirInput.label.trim())
+      ? projectDirInput.label
+      : 'Project directory';
+    outputProtocolBlock = prompts.load('chat_cli_coding_protocol', {
+      agent_id: agent.agent_id,
+      project_dir_label: projectDirLabel,
+    }).trim();
+  }
+
+  // ── Attachments — collected across the whole slice + this dispatch
+  // De-duplicate by absolute path; preserve oldest-first order.
   const attDir = chatAttachmentDir(uid, cid);
   const allAtts: string[] = [];
   const seenAtts = new Set<string>();
@@ -2134,28 +2189,21 @@ async function _buildCliPrompt(
   };
   for (const m of slice) collect(m.attachments);
   collect(item.attachments);
-  if (allAtts.length) {
-    headLines.push('## Attachments');
-    for (const abs of allAtts) headLines.push(`- ${abs}`);
-    headLines.push('');
-  }
+  const attachmentsBlock = allAtts.length
+    ? `## Attachments\n${allAtts.map(a => `- ${a}`).join('\n')}`
+    : '';
 
-  const tailLines: string[] = [];
-  tailLines.push('## Your task');
-  // When the dispatched item is just a form submission (the user
-  // confirmed the input form, not a fresh ask), the task body is
-  // metadata — a `- project_dir: …` style summary + an
-  // `<agent-input-submission>`
-  // XML tag — with the original user request now sitting upstream in
-  // the slice. A coding CLI handed only that metadata has nothing
-  // actionable: claude / codex sit idle until killed (observed:
-  // 2+ min "processing" with 0 bytes of output). Walk the slice
+  // ── Task body — submission unwrap if the dispatch was a form-submit.
+  // When the user confirmed the input form, the dispatched payload is
+  // metadata (`<agent-input-submission>` + a values summary) — handing
+  // that to a coding CLI gives it nothing actionable. Walk the slice
   // backward to recover the most recent user message that ISN'T
   // another submission and use it as the real task; append the
-  // confirmed values as extra context. The cwd is already routed
-  // via `state.coding_project_dir`, so we don't need to re-state
-  // `project_dir` to the CLI.
+  // confirmed values as extra context. cwd is already routed via
+  // `state.coding_project_dir`, so we strip `project_dir` from the
+  // confirmed-parameters block.
   const submission = decodeSubmission(item.llmPayload);
+  let taskBody: string;
   if (submission) {
     let originalTask = '';
     for (let i = slice.length - 1; i >= 0; i--) {
@@ -2166,28 +2214,32 @@ async function _buildCliPrompt(
       originalTask = txt;
       break;
     }
-    tailLines.push(originalTask || item.llmPayload);
+    const lines: string[] = [originalTask || item.llmPayload];
     const extraValues = Object.entries(submission.values)
       .filter(([k]) => k !== 'project_dir')
       .map(([k, v]) => `- ${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`);
     if (extraValues.length) {
-      tailLines.push('');
-      tailLines.push('## Confirmed parameters');
-      tailLines.push(...extraValues);
+      lines.push('', '## Confirmed parameters', ...extraValues);
     }
+    taskBody = lines.join('\n');
   } else {
-    tailLines.push(item.llmPayload);
+    taskBody = item.llmPayload;
   }
 
-  const head = headLines.join('\n');
-  const tail = tailLines.join('\n');
+  // Render the template with a candidate conversation block. The
+  // truncation pass below sizes the block against the byte cap.
+  const render = (conversationBlock: string) => prompts.load('chat_cli_agent', {
+    agent_name: agent.name || agent.agent_id,
+    agent_description: (agent.description_en || agent.description_zh || '').trim(),
+    output_protocol_block: outputProtocolBlock,
+    attachments_block: attachmentsBlock,
+    conversation_block: conversationBlock,
+    task_body: taskBody,
+  });
 
-  // Resuming a CLI-side session: the CLI already remembers the prior
-  // turns. Skip the slice block entirely and let the model rely on
-  // its own session memory. Preamble + new task is enough.
-  if (resuming) {
-    return `${head}\n${tail}`;
-  }
+  // Resuming → CLI already has the slice in its own memory; skip
+  // replay entirely. Static frame + new task is enough.
+  if (resuming) return render('');
 
   // Conversation slice, oldest → newest. Empty-text rows skipped.
   const sliceLines: string[] = [];
@@ -2198,17 +2250,18 @@ async function _buildCliPrompt(
     sliceLines.push(`[${m.from} → ${to}] ${text}`);
   }
 
-  // Reserve the head + tail bytes; what's left is the conversation
-  // budget. If even head+tail exceed the cap, fall back to a minimal
-  // prompt without history (better than truncating the task body).
-  const reserveBytes = Buffer.byteLength(head, 'utf8') + Buffer.byteLength(tail, 'utf8') + 64; // 64 = headers + newlines slack
-  if (reserveBytes >= CLI_PROMPT_MAX_BYTES) {
-    log.warn(`cli prompt: head+tail exceed cap; sending minimal prompt cid=${cid} agent=${agent.agent_id}`);
-    return `${head}\n${tail}`;
+  // Size the slice against the byte cap by rendering once with an
+  // empty block — gives an exact base size including the protocol /
+  // attachments / task. If even the base exceeds the cap, fall back
+  // to a no-history prompt rather than truncating the task body.
+  const baseBytes = Buffer.byteLength(render(''), 'utf8');
+  if (baseBytes >= CLI_PROMPT_MAX_BYTES) {
+    log.warn(`cli prompt: base exceeds cap; sending minimal prompt cid=${cid} agent=${agent.agent_id}`);
+    return render('');
   }
-  const sliceBudget = CLI_PROMPT_MAX_BYTES - reserveBytes;
-  // Walk the slice from newest backward; keep messages while we have
-  // budget. If the oldest messages don't fit, drop them.
+  const sliceBudget = CLI_PROMPT_MAX_BYTES - baseBytes;
+  // Walk newest-backward, keep lines while we have budget. Oldest
+  // lines that don't fit are dropped.
   const kept: string[] = [];
   let used = 0;
   for (let i = sliceLines.length - 1; i >= 0; i--) {
@@ -2221,8 +2274,8 @@ async function _buildCliPrompt(
   if (truncated) {
     log.warn(`cli prompt: trimmed ${sliceLines.length - kept.length}/${sliceLines.length} oldest slice rows cid=${cid} agent=${agent.agent_id}`);
   }
-  const sliceBlock = kept.length
-    ? `## Conversation so far${truncated ? ' (truncated)' : ''}\n${kept.join('\n')}\n`
+  const conversationBlock = kept.length
+    ? `## Conversation so far${truncated ? ' (truncated)' : ''}\n${kept.join('\n')}`
     : '';
-  return `${head}\n${sliceBlock}\n${tail}`;
+  return render(conversationBlock);
 }

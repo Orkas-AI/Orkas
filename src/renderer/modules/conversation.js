@@ -1660,21 +1660,24 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
       _mountChatInputForm(formHost, msgDiv, message, opts);
     }
   }
-  // Archive button + persisted-process block only make sense for finalised
-  // assistant replies (raw markdown, not an HTML placeholder like "thinking...").
-  if (role === 'assistant' && !isHtmlSnippet) {
-    if (archive) _attachBubbleArchiveBtn(msgDiv, () => rawContent);
-    if (Array.isArray(message.process) && message.process.length) {
-      // Auto-expand when the body is just an abort placeholder: the process
-      // trail IS the content the user already saw, hiding it behind a fold
-      // makes refresh look like "everything I watched stream is gone".
-      const bodyText = String(displayContent || '').trim();
-      // Match both possible forms — jsonl history can carry either depending
-      // on the UI language at the time of write (i18n key `model.aborted` →
-      // '(stopped)' in en, '（已中断）' in zh).
-      const isAbortStub = bodyText === '（已中断）' || bodyText === '(stopped)' || bodyText === '';
-      _renderPersistedProcess(msgDiv, message.process, { expanded: isAbortStub });
-    }
+  // Archive button is only for finalised assistant replies (raw markdown,
+  // not an HTML placeholder / status stub).
+  if (role === 'assistant' && !isHtmlSnippet && archive) {
+    _attachBubbleArchiveBtn(msgDiv, () => rawContent);
+  }
+  // Persisted-process trail is independent of body type — it must render
+  // for HTML-stub bodies too (e.g. CLI errors like `<span>⚠️ ...</span>`),
+  // otherwise after a refresh the only visible signal of a failed run is
+  // the red error line and "what happened" is gone. Auto-expand for any
+  // empty / abort-stub / HTML-stub body so the rail IS the content.
+  if (role === 'assistant' && Array.isArray(message.process) && message.process.length) {
+    const bodyText = String(displayContent || '').trim();
+    // Match both possible forms — jsonl history can carry either depending
+    // on the UI language at the time of write (i18n key `model.aborted` →
+    // '(stopped)' in en, '（已中断）' in zh).
+    const isAbortStub = bodyText === '（已中断）' || bodyText === '(stopped)' || bodyText === '';
+    const expanded = isAbortStub || isHtmlSnippet;
+    _renderPersistedProcess(msgDiv, message.process, { expanded });
   }
 
   if (autoScroll) {
