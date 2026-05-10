@@ -1152,6 +1152,22 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
             const ag = await agentsFeat.createAgentFromBlocks(fields);
             if (ag) {
               createdAgents.push({ agent_id: ag.agent_id, name: ag.name, kind: 'created' });
+              // Project-scoped conv: auto-bind the new agent into the project's
+              // bindings.json so it's actually reachable from this conversation
+              // (commander picker filters by `_pickerBoundAgentIds`; LLM
+              // dispatch is gated by the same project scope per CLAUDE.md §5).
+              // Without this hop the user creates an agent and immediately
+              // can't @-mention it from the same conv — observed bug shape
+              // when the project's bindings predate the new agent.
+              if (turnProjectId) {
+                try {
+                  const projectsFeatBind = await import('../projects');
+                  await projectsFeatBind.addAgentBinding(uid, turnProjectId, ag.agent_id);
+                  log.info(`auto-bound agent ${ag.agent_id} to project ${turnProjectId} after commander creation`);
+                } catch (err) {
+                  log.warn(`auto-bind agent failed cid=${cid} pid=${turnProjectId} aid=${ag.agent_id}: ${(err as Error).message}`);
+                }
+              }
             } else {
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent creation failed: missing required field(s) (name / workflow).</span>`;
             }
@@ -1186,6 +1202,20 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
             if (result.rejected && result.rejected.length) {
               const list = result.rejected.map((p) => `\`${p}\``).join(', ');
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Some skill files were rejected: ${list}</span>`;
+            }
+            // Project-scoped conv: auto-bind the new skill so the LLM in this
+            // conv actually sees it via getSystemPromptBlock allowlist. Same
+            // bug shape as the agent auto-bind above — without this the user
+            // creates a skill, the file lands on disk, but the LLM in this
+            // project conv can never invoke it (allowlist excludes it).
+            if (turnProjectId && result.kind === 'created') {
+              try {
+                const projectsFeatBind = await import('../projects');
+                await projectsFeatBind.addSkillBinding(uid, turnProjectId, result.skillId);
+                log.info(`auto-bound skill ${result.skillId} to project ${turnProjectId} after commander creation`);
+              } catch (err) {
+                log.warn(`auto-bind skill failed cid=${cid} pid=${turnProjectId} sid=${result.skillId}: ${(err as Error).message}`);
+              }
             }
           } else {
             workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ ${result.error || 'Skill operation failed.'}</span>`;

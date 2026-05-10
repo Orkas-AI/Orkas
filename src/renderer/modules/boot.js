@@ -216,10 +216,20 @@ function setView(view, cid, opts = {}) {
     setTimeout(() => document.getElementById('new-chat-input')?.focus(), 50);
   } else if (view === 'agents') {
     currentCid = null;
-    loadAgents();
+    // Force-refresh on every tab visit. The mid-stream chip handler in
+    // `conversation.js::_mountCreatedAgentChip` already calls `loadAgents(true)`
+    // when an agent is created via commander, but that only fires while the
+    // user is on the conversation view. If the user navigates to the agents
+    // tab between or during creation streams, the chip path may not run /
+    // may have raced, leaving `_agentsCache` stale and the tab missing the
+    // newly-created agents. Cheap (one IPC + dir scan), and the tab is the
+    // user's recovery path when something looks off — making it always show
+    // ground truth.
+    loadAgents(true);
   } else if (view === 'skills') {
     currentCid = null;
-    loadSkills();
+    // Same reasoning as the agents branch above.
+    loadSkills(true);
   } else if (view === 'contexts') {
     currentCid = null;
     loadContexts();
