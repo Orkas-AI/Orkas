@@ -1134,6 +1134,39 @@ function _bindChatPasteAttach(inputElId, getCid) {
   el.dataset.pasteBound = '1';
 }
 
+// Same upload pipeline, drop variant. Binds on the input-area wrapper so
+// the user has a generous target — dropping on the textarea, the chip
+// row, or the toolbar all land here. dragover/dragenter must preventDefault
+// to mark the area as a drop target (otherwise the browser refuses the
+// drop and falls through to the page-level navigate-to-file behaviour).
+function _bindChatDropAttach(wrapSelector, getCid) {
+  const el = document.querySelector(wrapSelector);
+  if (!el || el.dataset.dropBound === '1') return;
+  const isFileDrag = (e) => {
+    const types = e.dataTransfer && e.dataTransfer.types;
+    if (!types) return false;
+    for (let i = 0; i < types.length; i++) {
+      if (types[i] === 'Files') return true;
+    }
+    return false;
+  };
+  const allow = (e) => {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  };
+  el.addEventListener('dragover', allow);
+  el.addEventListener('dragenter', allow);
+  el.addEventListener('drop', (e) => {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    const cid = getCid();
+    if (!cid) return;
+    _chatAttachUpload(cid, e.dataTransfer.files);
+  });
+  el.dataset.dropBound = '1';
+}
+
 function _initChatAttachInput() {
   const btn = document.getElementById('chat-attach-btn');
   const input = document.getElementById('chat-attach-input');
@@ -1148,6 +1181,7 @@ function _initChatAttachInput() {
     input.value = '';
   });
   _bindChatPasteAttach('chat-input', () => currentCid);
+  _bindChatDropAttach('.chat-input-area', () => currentCid);
   btn.dataset.bound = '1';
 }
 
@@ -1168,6 +1202,7 @@ function _initNewChatAttachInput() {
     input.value = '';
   });
   _bindChatPasteAttach('new-chat-input', () => DRAFT_CID);
+  _bindChatDropAttach('.new-chat-input-area', () => DRAFT_CID);
   btn.dataset.bound = '1';
 }
 
