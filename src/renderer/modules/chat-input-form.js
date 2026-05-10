@@ -210,7 +210,7 @@
           changePill.style.display = '';
           card.classList.remove('is-empty');
         } else {
-          pathLabel.textContent = t('input.dir.pick') || 'Click to choose a directory';
+          pathLabel.textContent = t('input.dir.pick') || 'Pick directory…';
           pathLabel.removeAttribute('title');
           pathLabel.classList.add('is-empty');
           changePill.style.display = 'none';
