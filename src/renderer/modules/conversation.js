@@ -1006,14 +1006,22 @@ function _renderMessageCreatedAgentHtml(list) {
 }
 
 function _hydrateMessageCreatedAgentChip(msgDiv) {
-  const chips = msgDiv.querySelectorAll('.chat-msg-created-agent-chip');
+  const chips = msgDiv.querySelectorAll('.chat-msg-created-agent-chip[data-agent-id]');
   for (const chip of chips) {
     if (chip.dataset.bound === '1') continue;
     chip.dataset.bound = '1';
-    chip.addEventListener('click', () => {
+    chip.addEventListener('click', async () => {
       const aid = chip.dataset.agentId;
       if (!aid) return;
       setView('agents');
+      // Pre-check the agent is still loadable; if it was deleted (or its
+      // record is broken) the detail view would render an empty shell —
+      // bail to the grid instead.
+      try {
+        const res = await apiFetch(`/api/agents/${encodeURIComponent(aid)}`);
+        const data = await res.json();
+        if (!data?.ok || !data?.agent) return;
+      } catch { return; }
       if (typeof _showAgentsDetailView === 'function') _showAgentsDetailView(aid);
       else if (typeof selectAgent === 'function') selectAgent(aid);
     });
@@ -1042,10 +1050,18 @@ function _hydrateMessageCreatedSkillChip(msgDiv) {
   for (const chip of chips) {
     if (chip.dataset.bound === '1') continue;
     chip.dataset.bound = '1';
-    chip.addEventListener('click', () => {
+    chip.addEventListener('click', async () => {
       const sid = chip.dataset.skillId;
       if (!sid) return;
       setView('skills');
+      // Pre-check SKILL.md is readable; covers both "skill was deleted" and
+      // "skill row exists but its files are missing" (entering the detail
+      // would render a 'file not found' shell otherwise).
+      try {
+        const res = await apiFetch(`/api/skills/read?source=custom&id=${encodeURIComponent(sid)}&file=SKILL.md`);
+        const data = await res.json();
+        if (!data?.ok) return;
+      } catch { return; }
       if (typeof _showSkillsDetailView === 'function') _showSkillsDetailView('custom', sid);
     });
   }
