@@ -1368,6 +1368,18 @@ async function _openAgentPicker(anchorBtn) {
   const picker = document.getElementById('agent-picker');
   if (!anchorBtn || !picker) return;
   picker.dataset.anchorId = anchorBtn.id;
+  // Force-refresh `_agentsCache` on every open. The cache's only background
+  // refresh source is `_mountCreatedAgentChip` / fallback in conversation.js,
+  // which fires when the user is sitting on the conversation view at the
+  // moment a `<agent>` container result message arrives. If the user creates
+  // an agent in conversation A then immediately opens the picker in
+  // conversation B (or just after a renderer reload that refilled cache from
+  // an older state), the picker filter still uses fresh project bindings
+  // (refreshed below) but reads against a stale `_agentsCache` and the new
+  // agent silently disappears from the list. Mirror the `setView('agents')`
+  // force-refresh in `boot.js` here so the picker is also a ground-truth
+  // surface; cost is one IPC + dir scan per picker open (sub-ms in practice).
+  await loadAgents(true);
   // Refresh project-scope bindings on every open so the picker reflects
   // whatever project the user just picked (commander chip) or whatever
   // project the active conv belongs to.
