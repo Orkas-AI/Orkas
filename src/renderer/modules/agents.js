@@ -1373,9 +1373,24 @@ function _renderAgentPickerList(filterText) {
   // Search matches across the active locale description; cross-language
   // fallback via pickDesc lets users find a single-locale agent regardless
   // of which side they typed in.
+  // Match-quality ranking: name-exact (0) < name-prefix (1) < name-substring (2)
+  // < description-only (3). Stable sort within ties preserves the source-group
+  // order computed below. Without this, an agent whose description happens to
+  // mention the query (e.g. "Agent Skill 搜集" mentioning "Claude Code subagents"
+  // in passing) outranks the actual `Claude Code` agent because the original
+  // list is sorted by hex agent_id, not by relevance.
   const lang = getLang();
+  const matchScore = (a) => {
+    const name = (a.name || '').toLowerCase();
+    if (name === q) return 0;
+    if (name.startsWith(q)) return 1;
+    if (name.includes(q)) return 2;
+    return 3;
+  };
   const filtered = q
-    ? agents.filter(a => (a.name || '').toLowerCase().includes(q) || pickDesc(a, lang).toLowerCase().includes(q))
+    ? agents
+        .filter(a => (a.name || '').toLowerCase().includes(q) || pickDesc(a, lang).toLowerCase().includes(q))
+        .sort((a, b) => matchScore(a) - matchScore(b))
     : agents;
   // Recipient chip exposes "commander" as a virtual top entry so the user can
   // switch back without an empty-state. Other anchors keep agent-only listing.
