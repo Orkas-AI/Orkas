@@ -564,37 +564,37 @@ export class AgentRunner {
 
     // What tools were used
     if (metrics.toolNames.length > 0) {
-      lines.push(`使用的工具: ${metrics.toolNames.join(', ')}`);
+      lines.push(`Tools used: ${metrics.toolNames.join(', ')}`);
     }
 
     // Which skills were loaded
     if (metrics.skillsLoaded.length > 0) {
-      lines.push(`加载的技能: ${metrics.skillsLoaded.join(', ')}`);
+      lines.push(`Skills loaded: ${metrics.skillsLoaded.join(', ')}`);
     }
 
     // Error info with classification
     if (result.meta.error) {
-      lines.push(`错误: [${result.meta.error.kind}] ${result.meta.error.message}`);
-      if (metrics.recovered) lines.push('结果: 从错误中恢复，任务完成');
+      lines.push(`Error: [${result.meta.error.kind}] ${result.meta.error.message}`);
+      if (metrics.recovered) lines.push('Outcome: recovered from the error and completed the task');
     }
     if (metrics.errorKind !== 'none') {
-      const label = metrics.errorKind === 'transient' ? '瞬态（网络/超时/速率限制）'
-        : metrics.errorKind === 'mixed' ? '混合（含瞬态 + 永久）'
-        : '永久（非瞬态）';
-      lines.push(`错误类型: ${label}（瞬态 ${metrics.transientErrorCount} 次）`);
+      const label = metrics.errorKind === 'transient' ? 'transient (network / timeout / rate limit)'
+        : metrics.errorKind === 'mixed' ? 'mixed (transient + permanent)'
+        : 'permanent (non-transient)';
+      lines.push(`Error kind: ${label} (${metrics.transientErrorCount} transient occurrence(s))`);
     }
 
     // Trigger signals
-    lines.push(`触发信号: ${signals.map(s => `${s.name}(${s.reason})`).join('; ')}`);
+    lines.push(`Trigger signals: ${signals.map(s => `${s.name}(${s.reason})`).join('; ')}`);
 
     // The agent's final response (truncated) — this is the most important
     // context for understanding what actually happened
     if (result.text) {
       const maxLen = 1500;
       const text = result.text.length > maxLen
-        ? result.text.slice(0, maxLen) + '\n…(截断)'
+        ? result.text.slice(0, maxLen) + '\n…(truncated)'
         : result.text;
-      lines.push('', '--- 对话最终回复 ---', text);
+      lines.push('', '--- Final assistant reply ---', text);
     }
 
     // Session message history (user messages only, for additional context)
@@ -611,7 +611,7 @@ export class AgentRunner {
       .filter(t => t.length > 0);
 
     if (userMessages.length > 0) {
-      lines.push('', '--- 用户消息 ---');
+      lines.push('', '--- User messages ---');
       // Include last few user messages (most relevant)
       const recent = userMessages.slice(-3);
       for (const msg of recent) {
@@ -702,7 +702,7 @@ export class AgentRunner {
         const result = await provider.complete({
           model: modelId,
           messages: reflectSession.getMessages(),
-          systemPrompt: '你是一个自我改进助手。根据对话摘要反思并改进技能和自我认知。可用工具：skill_manage（创建/修补/删除技能）、metacognition（更新 COMPETENCE.md / LEARNING_STRATEGIES.md）。',
+          systemPrompt: 'You are a self-improvement assistant. Reflect on the conversation summary and refine your skills and self-knowledge. Available tools: skill_manage (create / patch / delete skills) and metacognition (update COMPETENCE.md / LEARNING_STRATEGIES.md).',
           tools: toolDefs.length > 0 ? toolDefs : undefined,
           maxTokens: 2048,
           signal,
@@ -808,20 +808,20 @@ function sleep(ms: number): Promise<void> {
  */
 function buildSkillsGuidance(skillsIndex: string): string {
   const parts: string[] = [
-    "## 自我改进：技能 & 元认知",
+    "## Self-improvement: skills & metacognition",
     "",
-    "你拥有 skill_manage 和 metacognition 两个工具来持续提升自己。",
+    "You have two tools — `skill_manage` and `metacognition` — for continuously improving yourself.",
     "",
-    "### 技能管理 (skill_manage)",
-    "- 完成复杂任务（5+ 工具调用）、修复棘手错误、或发现非显而易见的工作流后，保存为技能",
-    "- 使用技能时发现过时或不完整，立即 patch — 不要等用户要求",
-    "- 简单一次性任务不需要保存。创建或删除前先和用户确认",
+    "### Skill management (skill_manage)",
+    "- After finishing a complex task (5+ tool calls), fixing a tricky bug, or discovering a non-obvious workflow, save it as a skill",
+    "- If you find a skill outdated or incomplete while using it, patch it immediately — don't wait for the user to ask",
+    "- Simple one-off tasks don't need to be saved. Confirm with the user before creating or deleting a skill",
     "",
-    "### 元认知 (metacognition)",
-    "- COMPETENCE.md: 记录你的擅长领域和已知弱点，每次有重要发现时更新",
-    "- LEARNING_STRATEGIES.md: 记录有效的学习策略和解决问题的方法论",
-    "- 被用户纠正后，更新 COMPETENCE.md 记录弱点",
-    "- 成功解决已知弱点领域的问题后，更新 COMPETENCE.md 记录进步",
+    "### Metacognition",
+    "- COMPETENCE.md: record your strong areas and known weaknesses; update whenever you make an important discovery",
+    "- LEARNING_STRATEGIES.md: record effective learning strategies and problem-solving methodologies",
+    "- After being corrected by the user, update COMPETENCE.md to log the weakness",
+    "- After successfully solving a problem in a previously weak area, update COMPETENCE.md to log the improvement",
   ];
 
   if (skillsIndex) {

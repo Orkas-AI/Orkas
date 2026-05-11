@@ -18,6 +18,7 @@ import { ipcMain, dialog, BrowserWindow, type WebContents } from 'electron';
 
 import * as users from '../features/users';
 import * as chats from '../features/chats';
+import * as projects from '../features/projects';
 import * as groupChat from '../features/group_chat';
 import type { GroupEvent } from '../features/group_chat/bus';
 import * as agents from '../features/agents';
@@ -42,6 +43,7 @@ import { createLogger, logFromRenderer } from '../logger';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { shell } from 'electron';
+import { WS_ROOT } from '../paths';
 
 const log = createLogger('ipc');
 
@@ -57,6 +59,23 @@ type StreamHandler = (
   ctx: IpcContext,
   signal: AbortSignal,
 ) => AsyncGenerator<any, void, unknown>;
+
+// Resolve the workspace scope hint a renderer payload carries. cid is
+// authoritative (conv.project_id is the truth, so a cid uniquely picks a
+// project); projectId is the fallback for commander-tab clicks where no cid
+// exists yet. Returns `undefined` for default scope.
+async function _resolveWorkspaceScope(
+  userId: string,
+  payload: any,
+): Promise<string | undefined> {
+  if (payload && typeof payload.cid === 'string' && payload.cid && safeId(payload.cid)) {
+    return await userWorkspace.resolveProjectIdForCid(userId, payload.cid);
+  }
+  if (payload && typeof payload.projectId === 'string' && payload.projectId && safeId(payload.projectId)) {
+    return payload.projectId;
+  }
+  return undefined;
+}
 
 // ── Invoke handlers ──────────────────────────────────────────────────────
 // Contract: `(payload, { userId, sender }) => result` where result is
@@ -93,8 +112,22 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     };
   },
 
-  'conversations.create': async ({ title = '' } = {}, ctx) => {
-    const conv = await chats.createConversation(ctx.userId, { kind: 'normal', title });
+  'conversations.create': async ({ title = '', projectId = '' } = {}, ctx) => {
+    // Validate the projectId belongs to this user before persisting it on
+    // the conv record. Unknown / invalid projectIds are dropped silently
+    // (the conv lands without project membership) — the renderer should
+    // not be able to put a conv into a project the backend doesn't know
+    // about, but a stale / since-deleted pid coming from the commander chip
+    // shouldn't fail the create either.
+    let validProjectId = '';
+    if (projectId && typeof projectId === 'string' && safeId(projectId)) {
+      if (await projects.projectExists(ctx.userId, projectId)) validProjectId = projectId;
+    }
+    const conv = await chats.createConversation(ctx.userId, {
+      kind: 'normal',
+      title,
+      ...(validProjectId ? { projectId: validProjectId } : {}),
+    });
     return { conversation: conv };
   },
 
@@ -102,6 +135,121 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!safeId(cid)) throw new Error('invalid cid');
     const ok = await chats.deleteConversation(ctx.userId, cid);
     return { deleted: ok };
+  },
+
+  'conversations.deleteAll': async (_args, ctx) => {
+    const deleted = await chats.deleteAllConversations(ctx.userId);
+    return { deleted };
+  },
+
+  // ── Projects (logical groups of conversations + scoped workspace) ──
+  'projects.list': async (_payload, ctx) => {
+    return { projects: await projects.listProjects(ctx.userId) };
+  },
+
+  'projects.create': async ({ name }, ctx) => {
+    const result = await projects.createProject(ctx.userId, name);
+    if (!result.ok) throw new Error((result as { error: string }).error);
+    return { project: result.project };
+  },
+
+  'projects.rename': async ({ projectId, name }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    const result = await projects.renameProject(ctx.userId, projectId, name);
+    if (!result.ok) throw new Error((result as { error: string }).error);
+    return { project: result.project };
+  },
+
+  'projects.delete': async ({ projectId }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    const result = await projects.deleteProject(ctx.userId, projectId);
+    if (!result.ok) throw new Error((result as { error: string }).error);
+    return { deleted_convs: result.deleted_convs };
+  },
+
+  'projects.get': async ({ projectId }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    const project = await projects.getProject(ctx.userId, projectId);
+    if (!project) throw new Error('not_found');
+    return { project };
+  },
+
+  // ── Project bindings (the strict scope of agents/skills visible inside
+  // a project conversation; see CLAUDE.md §6 outer-intersection rule) ──
+  // `bindings.list` returns the bound ids JOINED with name/description so
+  // the renderer can paint the detail page in one round-trip; unknown ids
+  // (referent deleted) are filtered out of the joined view but kept in the
+  // raw `agents` / `skills` arrays so the user can see + clean up stale
+  // bindings.
+  'projects.bindings.list': async ({ projectId }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (!await projects.projectExists(ctx.userId, projectId)) throw new Error('not_found');
+    const bindings = await projects.getBindings(ctx.userId, projectId);
+    const [agentList, skillList] = await Promise.all([
+      agents.listAgents(),
+      skills.listSkills(),
+    ]);
+    const agentById = new Map(agentList.map((a: any) => [a.agent_id, a]));
+    const skillById = new Map(skillList.map((s: any) => [s.id, s]));
+    return {
+      bindings,
+      agentDetails: bindings.agents
+        .map((id) => agentById.get(id))
+        .filter(Boolean),
+      skillDetails: bindings.skills
+        .map((id) => skillById.get(id))
+        .filter(Boolean),
+    };
+  },
+
+  'projects.bindings.add': async ({ projectId, kind, id }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (typeof id !== 'string' || !id) throw new Error('invalid id');
+    let result;
+    if (kind === 'agent') {
+      if (!agents.isValidAgentId(id)) throw new Error('invalid id');
+      result = await projects.addAgentBinding(ctx.userId, projectId, id);
+    } else if (kind === 'skill') {
+      result = await projects.addSkillBinding(ctx.userId, projectId, id);
+    } else {
+      throw new Error('invalid kind');
+    }
+    if (!result.ok) throw new Error((result as { error: string }).error);
+    return { bindings: result.bindings };
+  },
+
+  'projects.bindings.remove': async ({ projectId, kind, id }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (typeof id !== 'string' || !id) throw new Error('invalid id');
+    let result;
+    if (kind === 'agent') {
+      result = await projects.removeAgentBinding(ctx.userId, projectId, id);
+    } else if (kind === 'skill') {
+      result = await projects.removeSkillBinding(ctx.userId, projectId, id);
+    } else {
+      throw new Error('invalid kind');
+    }
+    if (!result.ok) throw new Error((result as { error: string }).error);
+    return { bindings: result.bindings };
+  },
+
+  // Candidates = full [builtin + custom] minus already-bound. Powers the
+  // "Add" picker on the project detail page so the renderer doesn't have
+  // to subtract client-side.
+  'projects.bindings.candidates': async ({ projectId }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (!await projects.projectExists(ctx.userId, projectId)) throw new Error('not_found');
+    const bindings = await projects.getBindings(ctx.userId, projectId);
+    const boundAgents = new Set(bindings.agents);
+    const boundSkills = new Set(bindings.skills);
+    const [agentList, skillList] = await Promise.all([
+      agents.listAgents(),
+      skills.listSkills(),
+    ]);
+    return {
+      agents: agentList.filter((a: any) => !boundAgents.has(a.agent_id)),
+      skills: skillList.filter((s: any) => !boundSkills.has(s.id)),
+    };
   },
 
   // ── Group chat (replaces legacy conversations.send / .stream / .markFormSubmitted) ──
@@ -159,7 +307,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const parent = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
     const opts: Electron.OpenDialogOptions = {
       properties: ['openDirectory'],
-      title: typeof title === 'string' && title ? title : '选择目录',
+      title: typeof title === 'string' && title ? title : t('dialog.choose_directory'),
     };
     const res = parent
       ? await dialog.showOpenDialog(parent, opts)
@@ -282,7 +430,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const parent = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
     const opts: Electron.OpenDialogOptions = {
       properties: ['openDirectory'],
-      title: '选择要导入的技能源目录',
+      title: t('dialog.choose_skill_source_directory'),
     };
     const res = parent
       ? await dialog.showOpenDialog(parent, opts)
@@ -303,9 +451,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { skill: r.skill, seedMessage: r.seedMessage };
   },
 
-  'skills.update': async ({ id, updates }) => {
+  'skills.update': async ({ id, updates, skipRename }) => {
     if (!skills.isValidSkillId(id)) throw new Error('invalid skill id');
-    const data = await skills.updateCustomSkill(id, updates || {});
+    const data = await skills.updateCustomSkill(id, updates || {}, { skipRename: !!skipRename });
     if (!data) throw new Error('skill not found');
     return { skill: data };
   },
@@ -414,7 +562,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return contexts.openContextFileInSystem(path || '');
   },
 
-  // ── Knowledge base (向量库) ──
+  // ── Knowledge base (vector store) ──
   // Snapshot of what's in `kb_files`: status summary + per-file rows.
   // Renderer subscribes to the `kb.events` stream (below) for incremental
   // updates; this endpoint is the initial-load / full-refresh fetch.
@@ -440,8 +588,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { result: r };
   },
 
-  // Re-enqueue a single file (typically the UI's "重新处理" button after a
-  // failed extraction).
+  // Re-enqueue a single file (typically the UI's "reprocess" button after
+  // a failed extraction).
   'kb.reprocess': async ({ path }, ctx) => {
     if (typeof path !== 'string' || !path) throw new Error('path required');
     kbIndexer.enqueue(ctx.userId, path, 'upsert');
@@ -464,20 +612,24 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
   'config.getLocales': async () => ({ tables: getRendererTables() }),
 
-  // 头像 catalog（图标 + 颜色 + 指挥官默认）—— 单一真相源在
-  // src/main/data/avatars.json。renderer 启动时拉一次，自此用本地缓存。
+  // Avatar catalog (icons + colors + commander default) — single source of
+  // truth lives in src/main/data/avatars.json. The renderer fetches once at
+  // startup, then uses its local cache.
   'avatars.getCatalog': async () => ({ catalog: avatars.getCatalog() }),
 
-  // 指挥官头像偏好（云同步）。avatar = { icon, color }，token 走 catalog
-  // 白名单校验；缺省时 renderer 用 commander 默认（crown + gold）兜底。
+  // Commander avatar preference (cloud-synced). avatar = { icon, color };
+  // tokens are validated against the catalog allow-list. When absent the
+  // renderer falls back to the commander default (crown + gold).
   'prefs.getCommanderAvatar': async () => ({ avatar: appConfig.getCommanderAvatar() }),
   'prefs.setCommanderAvatar': async ({ icon, color }) => {
     return { avatar: appConfig.setCommanderAvatar({ icon, color }) };
   },
 
-  // 元认知级别的 agent 自演进开关。落 preferences.json::metacognition_enabled，
-  // 真正的 gate 单点真相在 features/metacognition.isFeatureEnabled（叠加 env
-  // kill switch）。env `ORKAS_METACOGNITION='0'` 永远压过 UI 设置。
+  // Metacognition-level agent self-evolution toggle. Stored at
+  // preferences.json::metacognition_enabled; the actual gate's single
+  // source of truth is features/metacognition.isFeatureEnabled (with the
+  // env kill switch on top). The env var `ORKAS_METACOGNITION='0'` always
+  // overrides the UI setting.
   'prefs.getMetacognition': async () => ({
     enabled: appConfig.getMetacognitionEnabled(),
     envForcedOff: process.env.ORKAS_METACOGNITION === '0',
@@ -558,28 +710,42 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // ── User workspace (working directory) ──
-  'workspace.get': async (_payload, ctx) => {
-    return { path: userWorkspace.getWorkspacePath(ctx.userId) };
+  // Workspace handlers accept an optional scope hint:
+  //   `{ cid }`        → main resolves cid → conv.project_id → scope
+  //   `{ projectId }`  → renderer-supplied scope (commander tab project chip,
+  //                      where there's no cid yet)
+  //   neither          → default scope
+  // When both are passed, cid takes precedence (it's the authoritative source
+  // — conv.project_id is the truth). Project membership is frozen at conv
+  // create time, so `cid → projectId` is a stable mapping.
+  'workspace.get': async (payload, ctx) => {
+    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
+    return { path: userWorkspace.getWorkspacePath(ctx.userId, projectId) };
   },
-  'workspace.getInfo': async (_payload, ctx) => {
-    return userWorkspace.getWorkspaceInfo(ctx.userId);
+  'workspace.getInfo': async (payload, ctx) => {
+    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
+    return userWorkspace.getWorkspaceInfo(ctx.userId, projectId);
   },
-  'workspace.set': async ({ path }, ctx) => {
-    if (!path || typeof path !== 'string') throw new Error('missing path');
-    const result = userWorkspace.setWorkspacePath(ctx.userId, path);
+  'workspace.set': async (payload, ctx) => {
+    const target = payload?.path;
+    if (!target || typeof target !== 'string') throw new Error('missing path');
+    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
+    const result = userWorkspace.setWorkspacePath(ctx.userId, target, projectId);
     if (!result.ok) throw new Error((result as any).error);
     return { path: result.path };
   },
-  'workspace.reset': async (_payload, ctx) => {
-    const result = userWorkspace.resetWorkspacePath(ctx.userId);
+  'workspace.reset': async (payload, ctx) => {
+    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
+    const result = userWorkspace.resetWorkspacePath(ctx.userId, projectId);
     return { path: result.path };
   },
   'workspace.selectDirectory': async () => {
     const selected = await userWorkspace.selectDirectory();
     return { path: selected };
   },
-  'workspace.openPath': async (_payload, ctx) => {
-    const result = await userWorkspace.openWorkspaceInFileManager(ctx.userId);
+  'workspace.openPath': async (payload, ctx) => {
+    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
+    const result = await userWorkspace.openWorkspaceInFileManager(ctx.userId, projectId);
     if (!result.ok) throw new Error((result as { ok: false; error: string }).error);
     return { path: result.path };
   },
@@ -588,11 +754,13 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // Explorer on Windows, default file manager on Linux). The path MUST
   // sit inside the active user's workspace — outside paths are refused
   // so a malicious / buggy LLM-emitted path can't pop arbitrary folders.
-  'workspace.revealPath': async ({ path: target }, ctx) => {
+  'workspace.revealPath': async (payload, ctx) => {
+    const target = payload?.path;
     if (typeof target !== 'string' || !target) {
       throw new Error('missing path');
     }
-    const ws = userWorkspace.getWorkspacePath(ctx.userId);
+    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
+    const ws = userWorkspace.getWorkspacePath(ctx.userId, projectId);
     const norm = path.resolve(target);
     const wsNorm = path.resolve(ws);
     if (!norm.startsWith(wsNorm + path.sep) && norm !== wsNorm) {
@@ -601,6 +769,20 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!fs.existsSync(norm)) throw new Error('file not found');
     shell.showItemInFolder(norm);
     return { path: norm };
+  },
+
+  // Read the install data root (`<container>/data`) — read-only display
+  // for the settings page "Data root" row. WS_ROOT is process-stable so
+  // no async work is needed.
+  'app.dataRootPath': async () => ({ ok: true, path: WS_ROOT }),
+
+  // Open the install data root in the OS file manager. WS_ROOT is the
+  // only path this opens — no caller-supplied path, so no sandbox check.
+  'app.openDataRoot': async () => {
+    const target = WS_ROOT;
+    if (!fs.existsSync(target)) throw new Error('data root not found');
+    shell.openPath(target);
+    return { ok: true, path: target };
   },
 
   // Local CLI agent discovery (claude / codex / openclaw / opencode / hermes).

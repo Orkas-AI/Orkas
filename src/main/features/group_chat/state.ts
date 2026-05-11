@@ -65,12 +65,24 @@ export interface StateFile {
    *  slug rules and the placeholder fallback. */
   workspace_dir?: string;
   /** Project directory for coding-agent (claude / codex) dispatches in
-   *  this conversation. User-set via the project-dir chip in the chat
-   *  surface; absolute path. Missing / empty → coding agents fall back
-   *  to the conv's workspace root (matches the prior behaviour). The
-   *  field is per-conversation, NOT per-agent: one project for the
-   *  whole conversation across however many coding agents it has. */
+   *  this conversation. Auto-set on the first coding-agent turn to the
+   *  user's effective workspace path (so the user doesn't have to pick
+   *  manually for the common case), and re-synced to follow workspace
+   *  switches as long as `coding_project_dir_explicit` is false. Once
+   *  the user picks a different directory through the input-form
+   *  (`coding_project_dir_explicit=true`), workspace changes no longer
+   *  override their choice. Absolute path. Missing / empty → coding
+   *  agents fall back to the conv's workspace root. The field is
+   *  per-conversation, NOT per-agent: one project for the whole
+   *  conversation across however many coding agents it has. */
   coding_project_dir?: string;
+  /** True when the user picked `coding_project_dir` explicitly via the
+   *  `<agent-input-form>` directory picker (form-submit hook in
+   *  `group_chat/index.ts`). False / missing means the dir was
+   *  auto-set by the workspace-sync path in `bus.ts` and is allowed to
+   *  follow future workspace switches. Cleared whenever
+   *  `coding_project_dir` is cleared. */
+  coding_project_dir_explicit?: boolean;
 }
 
 export const COMMANDER_ID = 'commander';
@@ -225,6 +237,9 @@ export async function readState(uid: string, cid: string): Promise<StateFile> {
         ...(typeof data.coding_project_dir === 'string' && data.coding_project_dir
           ? { coding_project_dir: data.coding_project_dir }
           : {}),
+        ...(typeof data.coding_project_dir_explicit === 'boolean'
+          ? { coding_project_dir_explicit: data.coding_project_dir_explicit }
+          : {}),
       };
     }
   } catch (err) {
@@ -326,13 +341,29 @@ export async function setWorkspaceDirOnce(uid: string, cid: string, dir: string)
 /** Set / clear the per-conversation coding-agent project directory.
  *  Pass `''` (or missing) to clear; an absolute path otherwise.
  *  Caller is responsible for absolute-path validation — we only do
- *  string handling here. Returns the resulting state. */
-export async function setCodingProjectDir(uid: string, cid: string, dir: string): Promise<StateFile> {
+ *  string handling here. Returns the resulting state.
+ *
+ *  `opts.explicit` records whether the user actively chose this
+ *  directory through the `<agent-input-form>` picker. The flag is
+ *  consulted by the workspace-sync path in `bus.ts`: explicit picks
+ *  are sticky (workspace switches don't override them), auto-set
+ *  values track the workspace. Clearing `dir` also clears the flag
+ *  so the next auto-set doesn't accidentally inherit a stale `true`. */
+export async function setCodingProjectDir(
+  uid: string, cid: string, dir: string,
+  opts: { explicit: boolean },
+): Promise<StateFile> {
   return _stateLock(uid, cid).runExclusive(async () => {
     const s = await readState(uid, cid);
     const trimmed = String(dir || '').trim();
-    if (trimmed) s.coding_project_dir = trimmed;
-    else delete s.coding_project_dir;
+    if (trimmed) {
+      s.coding_project_dir = trimmed;
+      if (opts.explicit) s.coding_project_dir_explicit = true;
+      else delete s.coding_project_dir_explicit;
+    } else {
+      delete s.coding_project_dir;
+      delete s.coding_project_dir_explicit;
+    }
     s.last_active_at = nowIso();
     await writeStateRaw(uid, cid, s);
     return s;

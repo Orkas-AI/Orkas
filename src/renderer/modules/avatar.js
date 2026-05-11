@@ -1,25 +1,31 @@
 // ─── Avatar (icon + color) for AI actors ─────────────────────────────────
 //
-// 头像 catalog（15 图标 + 16 颜色 + 指挥官默认）的真相源在
-// `src/main/data/avatars.json`，启动时一次性走 IPC 拉过来缓存。所有渲染
-// helper 都从缓存读，**不再硬编码任何 SVG 或 hex**。
+// The avatar catalog (15 icons + 16 colors + commander default) has its
+// single source of truth at `src/main/data/avatars.json`; we fetch it
+// once via IPC at startup and cache it locally. Every render helper
+// reads the cache — **no SVG or hex is hardcoded anywhere else**.
 //
-// 缺省回退：某 agent 还没存头像时按 `agent_id` 哈希出确定性组合 ——
-// 跨设备同一 agent_id 派生同一组合，云同步不会因两端各自随机而冲突。
+// Default fallback: when an agent has no stored avatar yet, derive a
+// deterministic combination by hashing `agent_id`. The same agent_id
+// derives the same combination on every device, so cloud sync does not
+// see two ends pick differently and collide.
 //
-// 渲染统一走 renderAvatarHtml(...)，DOM / .avatar-circle 样式一份，卡片、
-// 详情、聊天行、设置页都用同一 helper。
+// Rendering goes through renderAvatarHtml(...). The DOM and
+// .avatar-circle CSS are shared, so cards, detail pages, chat rows,
+// and the settings page all use the same helper.
 
 let AVATAR_ICONS = [];
 let AVATAR_COLORS = [];
-let COMMANDER_DEFAULT = { icon: 'crown', color: 'gold' }; // 兜底，IPC 完成后会被覆盖
+let COMMANDER_DEFAULT = { icon: 'crown', color: 'gold' }; // fallback, overwritten once the IPC fetch lands
 
 let _avatarCatalogReady = false;
 let _avatarCatalogPromise = null;
 
-/** 启动期调用一次 —— 拉 catalog 缓存到本地。boot.js 在渲染任何头像之前
- *  await 它，确保 sync helper（renderAvatarHtml / randomAgentAvatar / …）
- *  调用时已就绪。重复调用安全，第二次起直接 resolve。 */
+/** Call once at startup — fetch the catalog and cache it locally.
+ *  boot.js awaits this before rendering any avatar so the sync helpers
+ *  (renderAvatarHtml / randomAgentAvatar / …) are ready by the time
+ *  they're called. Safe to call multiple times — subsequent calls
+ *  resolve immediately. */
 async function initAvatarCatalog() {
   if (_avatarCatalogReady) return;
   if (_avatarCatalogPromise) { await _avatarCatalogPromise; return; }
@@ -36,7 +42,8 @@ async function initAvatarCatalog() {
         _avatarCatalogReady = true;
       }
     } catch (_) {
-      // 拉不到就继续用空数组 —— 渲染层会全部走 seed 兜底（视觉降级）。
+      // On fetch failure, leave the arrays empty — the render layer
+      // will fall back to seed-based avatars (a visual degradation).
     } finally {
       _avatarCatalogPromise = null;
     }
@@ -48,7 +55,8 @@ function _isCommanderCombo(icon, color) {
   return icon === COMMANDER_DEFAULT.icon || color === COMMANDER_DEFAULT.color;
 }
 
-/** 智能体随机头像：从非指挥官池里挑一对 (icon, color)。 */
+/** Random agent avatar: pick a (icon, color) pair from the
+ *  non-commander pool. */
 function randomAgentAvatar() {
   const icons = AVATAR_ICONS.filter((i) => i.id !== COMMANDER_DEFAULT.icon);
   const colors = AVATAR_COLORS.filter((c) => c.id !== COMMANDER_DEFAULT.color);
@@ -58,7 +66,8 @@ function randomAgentAvatar() {
   return { icon: i.id, color: c.id };
 }
 
-// 简单 djb2，足够给 agent_id 散开到非指挥官的图标 / 颜色池上。
+// Simple djb2 hash — sufficient to spread agent_id across the
+// non-commander icon / color pools.
 function _hash(str) {
   let h = 5381;
   const s = String(str || '');
@@ -66,8 +75,10 @@ function _hash(str) {
   return h >>> 0;
 }
 
-/** 由 seed 派生稳定的 (icon, color)。同一 seed 任何机器都得到同一组合，
- *  适合做"老 spec 缺字段时的回填"以及渲染兜底。 */
+/** Derive a stable (icon, color) from a seed. The same seed produces
+ *  the same combination on every machine, which is good for both
+ *  "backfill when an old spec lacks the fields" and as a render
+ *  fallback. */
 function avatarFromSeed(seed) {
   const icons = AVATAR_ICONS.filter((i) => i.id !== COMMANDER_DEFAULT.icon);
   const colors = AVATAR_COLORS.filter((c) => c.id !== COMMANDER_DEFAULT.color);
@@ -79,9 +90,11 @@ function avatarFromSeed(seed) {
   };
 }
 
-/** 解析任意 (iconId, colorId) 到可渲染的视觉数据。catalog 里查不到的
- *  字段（脏数据 / 未来重命名 token）按 fallbackSeed 派生；都没给就退化成
- *  指挥官默认色（极端情况，正常路径不会触发）。 */
+/** Resolve any (iconId, colorId) to renderable visual data. Fields
+ *  that aren't in the catalog (dirty data / future-renamed tokens)
+ *  derive from fallbackSeed; if neither side is given, fall back to
+ *  the commander default (an edge case — never triggered on the
+ *  normal path). */
 function resolveAvatar(iconId, colorId, fallbackSeed) {
   let resolvedIcon = AVATAR_ICONS.find((i) => i.id === iconId);
   let resolvedColor = AVATAR_COLORS.find((c) => c.id === colorId);
@@ -91,7 +104,8 @@ function resolveAvatar(iconId, colorId, fallbackSeed) {
     if (!resolvedColor) resolvedColor = AVATAR_COLORS.find((c) => c.id === fb.color);
   }
   if (!resolvedIcon || !resolvedColor) {
-    // catalog 还没拉到（极端情况）——返回个空壳，渲染层至少不会崩。
+    // catalog hasn't been fetched yet (edge case) — return an empty
+    // shell so the render layer at least doesn't crash.
     return { icon: '', color: '', iconSvg: '', bg: '#e5e7eb', fg: '#475569' };
   }
   return {
@@ -103,7 +117,8 @@ function resolveAvatar(iconId, colorId, fallbackSeed) {
   };
 }
 
-/** 就地把已有 .avatar-circle 元素的视觉换掉，不替换节点（保留点击监听）。 */
+/** Swap the visual data of an existing .avatar-circle element in
+ *  place, without replacing the node (keeps click listeners). */
 function applyAvatarToElement(el, iconId, colorId, seed) {
   if (!el) return;
   const a = resolveAvatar(iconId, colorId, seed || '');
@@ -117,7 +132,8 @@ function applyAvatarToElement(el, iconId, colorId, seed) {
     : '';
 }
 
-/** 生成头像 HTML 片段。用于卡片 / 详情 / 聊天行 / 设置页。
+/** Generate an avatar HTML fragment. Used by cards, the detail view,
+ *  chat rows, and the settings page.
  *  opts: { size=28, seed='', clickable=false, extraClass='', dataAttrs={} } */
 function renderAvatarHtml(iconId, colorId, opts = {}) {
   const a = resolveAvatar(iconId, colorId, opts.seed || '');

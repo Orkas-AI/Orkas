@@ -307,8 +307,59 @@ function _isVideoSrc(src) {
   return _VIDEO_EXT_RE.test(String(src || ''));
 }
 
+// Bare URL autolink termination set. URLs per RFC 3986 are ASCII; CJK
+// ideographs / kana / hangul / CJK punctuation never appear in a real URL
+// (IRIs encode the host as punycode and the path as percent-encoded UTF-8).
+// Without these ranges in the regex's negated char class, a URL embedded
+// in a CJK sentence is matched through the trailing CJK run and the link
+// visually swallows the prose. Reported case: a fullwidth comma after a
+// URL pulled the rest of the Chinese sentence into the anchor.
+const _URL_NON_TERMINATOR =
+  '\u4e00-\u9fff' +   // CJK Unified Ideographs
+  '\u3000-\u303f' +   // CJK Symbols and Punctuation
+  '\uff00-\uffef' +   // Halfwidth and Fullwidth Forms (incl. fullwidth ASCII punct)
+  '\u3040-\u309f' +   // Hiragana
+  '\u30a0-\u30ff' +   // Katakana
+  '\uac00-\ud7af';    // Hangul Syllables
+
+// Bare URL autolink. Negative lookbehind keeps us out of:
+//   1) URLs already inside an HTML attr (preceded by `"` / `'` / `=`) from
+//      earlier phases (markdown links / image src / `<url>` autolinks) —
+//      must NOT double-wrap;
+//   2) mid-string positions (preceded by URL-internal chars) that look
+//      like the tail of a longer URL.
+// Termination set excludes ASCII URL-incompatible chars + the CJK ranges
+// so the URL ends at the first non-URL boundary.
+const _BARE_URL_RE = new RegExp(
+  '(?<![a-zA-Z0-9._\\-:/?=&#%+"\'>])' +
+  '(https?:\\/\\/[^\\s<>"\'`)\\]' + _URL_NON_TERMINATOR + ']+)',
+  'g'
+);
+
+const _BARE_EMAIL_RE = new RegExp(
+  '(?<![a-zA-Z0-9._\\-:/?=&#%+"\'>])' +
+  '([\\w.+-]+@[\\w.-]+\\.[A-Za-z]{2,})',
+  'g'
+);
+
+// Replace bare http(s) URLs with `<a>` tags. Trailing ASCII sentence punct
+// (`.,;:!?)`) is trimmed off the link and emitted as plain text after it,
+// so "see https://x.com." renders with the period outside the link.
+function _linkifyBareUrls(text) {
+  return text.replace(_BARE_URL_RE, (_, url) => {
+    const trail = (url.match(/[.,;:!?)]+$/) || [''])[0];
+    const clean = trail ? url.slice(0, -trail.length) : url;
+    return `<a href="${clean}" target="_blank" rel="noopener">${clean}</a>${trail}`;
+  });
+}
+
+function _linkifyBareEmails(text) {
+  return text.replace(_BARE_EMAIL_RE, (_, email) => `<a href="mailto:${email}">${email}</a>`);
+}
+
 function inlineFormat(text) {
-  return text
+  // Phase 1: media + markdown links + `<url>` / `<email>` autolinks + emphasis.
+  const phase1 = text
     // Media: ![alt](src) — dispatch to <video> when src looks like a video
     // file, else <img>. Must run before link syntax.
     .replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g,
@@ -333,28 +384,12 @@ function inlineFormat(text) {
     // Emphasis
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/\*([^*]+)\*/g, '<em>$1</em>')
-    .replace(/~~([^~]+)~~/g, '<del>$1</del>')
-    // Bare URL autolink — negative lookbehind keeps us out of two cases:
-    //   1) the URL is already inside an HTML attr (preceded by `"`/`'`/`=`)
-    //      from earlier phases (markdown links, image src, etc.) — must NOT
-    //      double-wrap;
-    //   2) the URL is mid-string (preceded by URL-internal chars) — looks
-    //      like the tail of a longer URL, skip to avoid splicing.
-    // Everything else (CJK punctuation like `：`/`，`/`（`, ASCII letters,
-    // line start) is allowed — the old `[\s([]` whitelist missed CJK
-    // punctuation which is the most common case in Chinese chat output.
-    .replace(/(?<![a-zA-Z0-9._\-:\/?=&#%+"'>])(https?:\/\/[^\s<>"'`)\]]+)/g, (_, url) => {
-      const trail = (url.match(/[.,;:!?)]+$/) || [''])[0];
-      const clean = trail ? url.slice(0, -trail.length) : url;
-      return `<a href="${clean}" target="_blank" rel="noopener">${clean}</a>${trail}`;
-    })
-    // Bare email autolink — uses the same exclusion set as bare URL so that
-    // an email already wrapped in an earlier `<a href="mailto:...">` (where
-    // the address is preceded by `:`) doesn't get re-wrapped, and that an
-    // address sitting inside a URL query like `?email=x@y.com` (preceded by
-    // `=`) is left alone too.
-    .replace(/(?<![a-zA-Z0-9._\-:\/?=&#%+"'>])([\w.+-]+@[\w.-]+\.[A-Za-z]{2,})/g,
-      (_, email) => `<a href="mailto:${email}">${email}</a>`);
+    .replace(/~~([^~]+)~~/g, '<del>$1</del>');
+  // Phase 2: bare URL + bare email autolinks. Split out so set-A
+  // (real URLs in CJK / ASCII contexts must end at the right boundary) and
+  // set-B (URLs inside attrs / already-wrapped links must not be re-wrapped)
+  // are pinned by `test/renderer/utils-autolink.test.ts`.
+  return _linkifyBareEmails(_linkifyBareUrls(phase1));
 }
 
 // Unified entrypoint: all chat bubbles, skill detail pages, streaming finals
@@ -370,7 +405,9 @@ const renderMarkdown = renderMarkdownFull;
 // setWindowOpenHandler / will-navigate (see main/index.ts) is the safety net
 // for clicks that arrive before this script evaluates or when window.orkas
 // hasn't been wired yet (then we don't preventDefault and let main handle it).
-document.addEventListener('click', (e) => {
+// Guarded for Node test env where `document` is undefined; the click router
+// is a renderer-only side effect and irrelevant to the autolink fixtures.
+if (typeof document !== 'undefined') document.addEventListener('click', (e) => {
   const a = e.target && e.target.closest && e.target.closest('a[href]');
   if (!a) return;
   const href = a.getAttribute('href');
@@ -391,6 +428,19 @@ function nowIsoLocal() {
   const d = new Date();
   const pad = (n) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+/** Compose a sidebar title from arbitrary user-message text. Mirrors
+ *  backend `chats.ts::autoTitle` so the optimistic renderer-side title
+ *  and the backend-persisted title agree — without this match the new
+ *  conv first paints the optimistic value, then `loadConversations`
+ *  refreshes with backend's value and the sidebar entry visibly flips.
+ *  Empty input returns '' so the caller can fall back to its own
+ *  placeholder (`t('chat.new_conv_title')` for the conv list). */
+function _autoTitle(text) {
+  let s = String(text == null ? '' : text).trim().replace(/\n/g, ' ');
+  if (s.length > 40) s = s.slice(0, 40) + '…';
+  return s;
 }
 
 function formatTime(iso) {
@@ -426,7 +476,7 @@ function _aiSelectMount(el, config) {
   const state = {
     options: [],        // [{value, label, hint?}]
     value: '',
-    placeholder: (typeof t === 'function' ? t('ai_select.placeholder') : '— 请选择 —'),
+    placeholder: (typeof t === 'function' ? t('ai_select.placeholder') : '— Select —'),
     onChange: () => {},
     open: false,
     activeIdx: -1,
@@ -636,3 +686,18 @@ function _aiSelectPick(api, value) {
   }
 }
 
+// Test bridge — guarded CommonJS export of the pure helpers used by the
+// markdown autolink phase. No-op in the browser (`module` undefined). Per
+// PC/CLAUDE.md §9 only pure functions go through this bridge; the rest of
+// utils.js (DOM-coupled helpers like `_aiSelectMount`) stays unexported.
+// Matching test file: `test/renderer/utils-autolink.test.ts`.
+if (typeof module !== 'undefined' && typeof module.exports === 'object') {
+  module.exports = {
+    _BARE_URL_RE,
+    _BARE_EMAIL_RE,
+    _linkifyBareUrls,
+    _linkifyBareEmails,
+    inlineFormat,
+    escapeHtml,
+  };
+}

@@ -88,6 +88,70 @@ describe("Session", () => {
     expect((firstText as { text: string }).text).toContain("summary");
   });
 
+  // Pairing invariant — compact's slice(-keepCount) can land its head on a
+  // tool_result-only user message whose tool_use is in the about-to-be-
+  // discarded older slice. Without the leading-orphan drop in compact(),
+  // the next provider call sends a function_call_output with no matching
+  // function_call and OpenAI / Anthropic reject with
+  // "No tool call found for function call output with call_id ...".
+  // Reproduced as the user-reported bug at runner.ts:374 (mid-turn
+  // compaction triggered by the 60% context guard) where post-compact
+  // heal hadn't run yet.
+  it("compact drops leading orphan tool_result whose tool_use was sliced off", () => {
+    const session = new Session();
+    // Build a 6-message history: text round + 2 tool rounds + final text.
+    // Slice(-4) lands head on the tool_result for call-X whose tool_use is
+    // at position 1 (about to be dropped).
+    session.addUserMessage("kick off");                                          // 0
+    session.addAssistantMessage([{ type: "tool_use", id: "call-X", name: "a", input: {} }]); // 1
+    session.addToolResult("call-X", "ok-X", undefined, false);                   // 2
+    session.addAssistantMessage([{ type: "tool_use", id: "call-Y", name: "b", input: {} }]); // 3
+    session.addToolResult("call-Y", "ok-Y", undefined, false);                   // 4
+    session.addAssistantMessage([{ type: "text", text: "done" }]);               // 5
+
+    session.compact("summary");
+
+    const msgs = session.getMessages();
+    // Layout: [summary, understood, ...kept (orphan tool_result-X dropped)].
+    // Expected kept = [3, 4, 5] = [tool_use(Y), tool_result(Y), text].
+    expect(msgs).toHaveLength(5);
+    expect(msgs[0].role).toBe("user");
+    expect((msgs[0].content[0] as { text: string }).text).toContain("summary");
+    expect(msgs[1].role).toBe("assistant");
+    // The third message must NOT be the orphan tool_result for call-X.
+    expect(msgs[2].role).toBe("assistant");
+    expect((msgs[2].content[0] as { type: string }).type).toBe("tool_use");
+    expect((msgs[2].content[0] as { id: string }).id).toBe("call-Y");
+    // No tool_result for call-X anywhere — its tool_use was sliced away.
+    const allContent = msgs.flatMap((m) => m.content);
+    const orphanX = allContent.find(
+      (c) => (c as { type?: string }).type === "tool_result"
+        && (c as { toolUseId?: string }).toolUseId === "call-X",
+    );
+    expect(orphanX).toBeUndefined();
+  });
+
+  it("compact preserves tool_result whose tool_use IS within kept window", () => {
+    const session = new Session();
+    // Slice(-4) here lands on the tool_use itself, so the pair is intact.
+    session.addUserMessage("kick off");                                          // 0
+    session.addAssistantMessage([{ type: "text", text: "ack" }]);                // 1
+    session.addAssistantMessage([{ type: "tool_use", id: "call-Z", name: "a", input: {} }]); // 2
+    session.addToolResult("call-Z", "ok-Z", undefined, false);                   // 3
+    session.addAssistantMessage([{ type: "text", text: "done" }]);               // 4
+
+    session.compact("summary");
+
+    const msgs = session.getMessages();
+    // kept = [1, 2, 3, 4] — all four tail messages survive because none
+    // of them is a tool_result-only user message at the head boundary.
+    expect(msgs.length).toBe(6);
+    // tool_use(Z) and its tool_result(Z) both present, in order.
+    const flat = msgs.flatMap((m) => m.content);
+    expect(flat.some((c) => (c as { type?: string }).type === "tool_use" && (c as { id?: string }).id === "call-Z")).toBe(true);
+    expect(flat.some((c) => (c as { type?: string }).type === "tool_result" && (c as { toolUseId?: string }).toolUseId === "call-Z")).toBe(true);
+  });
+
   it("clear removes all messages", () => {
     const session = new Session();
     session.addUserMessage("test");

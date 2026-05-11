@@ -1,10 +1,11 @@
 /**
- * 个人启用/禁用配置 — agents + skills 的"用户级开关"。
+ * Per-user enable/disable config — the "user-level toggle" for agents +
+ * skills.
  *
- * 落点：`<uid>/cloud/config/component-enabled.json`，与 preferences.json 同目录，
- * 走同一份云同步策略。
+ * Lives at `<uid>/cloud/config/component-enabled.json`, alongside
+ * preferences.json and following the same cloud-sync policy.
  *
- * **schema**（v1）：
+ * **Schema** (v1):
  * ```
  * {
  *   "version": 1,
@@ -13,19 +14,25 @@
  * }
  * ```
  *
- * **存储约定 — 只存 false 覆盖**：
- *   - 缺 key = 走 spec 默认值（当前所有 spec 默认 = enabled，所以缺 key = enabled）
- *   - 显式 `true` 不会被 setEnabled 写入（写 true 时直接 delete 该 key）
- *   - 这样新增组件天然 enabled，不需要迁移；后期 spec 引入 `default_enabled: false`
- *     时同一份 file 立即生效，单 resolver `overrides[id] ?? specDefault ?? true`
+ * **Storage convention — only `false` overrides are stored**:
+ *   - Missing key = use the spec default (every spec is currently
+ *     `enabled`, so missing key = enabled).
+ *   - Explicit `true` is never written by setEnabled (writing `true`
+ *     deletes the key instead).
+ *   - This way new components are naturally enabled without a
+ *     migration; if a future spec ships `default_enabled: false`, the
+ *     same file works immediately under the single resolver
+ *     `overrides[id] ?? specDefault ?? true`.
  *
- * **resolver**（单一函数）：
+ * **Resolver** (single function):
  *   `isEnabled(uid, kind, id, specDefault?) = overrides[kind][id] ?? specDefault ?? true`
  *
- * **invalidate 由调用方负责**：本模块只管文件 IO，setAgentEnabled / setSkillEnabled
- * 写完返回，调用 IPC handler 自行触发各自的缓存失效（_invalidateAgentsCache /
- * _invalidateSkillListCache + invalidateCoreAgentSkills）。这样模块边界干净，
- * 不反向 import features/agents.ts / features/skills.ts。
+ * **Invalidation is the caller's responsibility**: this module only
+ * does file IO. setAgentEnabled / setSkillEnabled return after writing,
+ * and the calling IPC handler triggers the relevant cache invalidations
+ * (_invalidateAgentsCache / _invalidateSkillListCache +
+ * invalidateCoreAgentSkills). This keeps module boundaries clean — no
+ * reverse imports of features/agents.ts / features/skills.ts from here.
  */
 
 import * as fs from 'node:fs';
@@ -72,7 +79,7 @@ function sanitiseMap(raw: Record<string, unknown>): Record<string, boolean> {
   for (const [k, v] of Object.entries(raw)) {
     if (typeof k !== 'string' || !k) continue;
     if (typeof v !== 'boolean') continue;
-    if (v === true) continue; // 只保留 false 覆盖
+    if (v === true) continue; // only false-overrides are persisted
     out[k] = false;
   }
   return out;

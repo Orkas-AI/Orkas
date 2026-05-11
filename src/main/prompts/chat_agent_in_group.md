@@ -94,15 +94,18 @@ Send form → bus marks the step `blocked` (plan paused) → user fills it in th
 
 - **Do not** re-send a form before the previous one has been answered.
 
-### Mandatory confirmation triggered by `inputs_schema`
+### Handling `inputs_schema` (extract first, form only when info is missing)
 
 The "Runtime injection" section at the end lists your `inputs_schema`. If it is **non-empty**, the first time the user / commander dispatches you:
-1. Extract a value for each field from the inbound message text, and **self-check**: is it strong evidence (the message literally states the term or a synonym) or are you guessing?
-2. **All required fields filled with strong evidence** → just do the work, don't send a form (the extracted values are enough to keep in your head).
-3. **Any required field missing / any field low-confidence** → put the values you did extract into each field's `default`, leave the rest empty, and send **one** form using the fenced block above for the user to confirm; the lead-in line before the form should call them out: "I inferred these — please confirm: X=..., Y=...".
-4. **Almost no info to extract** → send an empty form (no defaults).
 
-After receiving the `<agent-input-submission>` tag reply, start the actual work using the field values; **do not** send a second form.
+1. **Scan the inbound `<msg>...</msg>` body** and pull out a candidate value for each schema field.
+   - **Direct user @-call** (sender = `user`): trailing free-text right after `@<your-name>` is almost always the input. Match those tokens against fields by `label` semantics + field `type`. A bare `@YourName self-media` with a required `topic` field means `topic = "self-media"`, full stop — don't second-guess this.
+   - **Commander dispatch**: the commander writes parameters in natural prose; pick them up by phrase matching against `label`.
+2. **Self-check** each candidate: strong evidence (the inbound literally states the term or an obvious synonym) vs. guessing.
+3. **Decision branches**:
+   - **Every required field has a usable value — strong-evidence extraction from the inbound OR a non-empty `default` declared in the schema** → **execute directly, no form**. A schema `default` is the agent author's declared safe fallback for "user didn't specify"; don't re-route through a confirmation form just to re-show defaults. Lead with one short line listing what you used (e.g. "Inferred: keyword=…; defaults: source=…; output_dir=…") and **start the work in the same turn** — no "please confirm" / "shall I start" pause.
+   - **Otherwise — a required field has neither extraction NOR a non-empty `default`** → send **one** form for just that gap. **Every value you did extract — even one token — MUST be copied into that field's `default`.** A `default` stays empty ONLY when both the inbound carries zero signal AND the schema didn't declare one. The lead-in names what's missing AND what's inferred: "Need: <missing field>. Inferred: X=…; Y=…".
+4. After the user replies with `<agent-input-submission>`, do the work — **do not** send a second form.
 
 ---
 
@@ -116,7 +119,7 @@ After receiving the `<agent-input-submission>` tag reply, start the actual work 
 
 ## Resource locations (path constants)
 
-- Skill definitions: `Source: builtin` → `$builtin_skills_dir/<id>/SKILL.md`; `Source: custom` → `$custom_skills_dir/<id>/SKILL.md`.
+- Skill paths: see the header of the `## Available skills (skills)` block below for the `read_file(<ROOT>/<id>/SKILL.md)` pattern and resolved ROOT values per Source.
 - Tool default cwd = `$working_dir`; all relative paths land here. To go out of this scope, the dispatcher must **explicitly include** a path in the inbound message.
 
 ---
@@ -132,7 +135,7 @@ After receiving the `<agent-input-submission>` tag reply, start the actual work 
 $workflow
 ```
 
-### inputs_schema (fields the user confirms each time they run you; the trigger logic is in the "Interacting with the user" section above)
+### inputs_schema (fields you may need from the user; trigger logic above in "Interacting with the user")
 $inputs_schema
 
 ### Working directory

@@ -82,10 +82,13 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     idleTimeout = 600,
     abortSignal = null,
     skillList,
+    projectAllowedSkillIds,
     extraTools,
     extraRoots,
+    readOnlyExtraRoots,
     agentId,
     cid,
+    projectId,
     onFileWritten,
     hasProducedPath,
     cacheRetention,
@@ -134,7 +137,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   // implementations (observed with pi-ai's WebSocket/SSE transports) don't
   // respond to `signal.aborted` promptly, so the `await iter.next()` stays
   // parked and the generator's `finally` never runs — which would leave the
-  // session lock permanently held and the next turn stuck in "思考中". Since
+  // session lock permanently held and the next turn stuck in "thinking". Since
   // `releaseXxxOnce` is idempotent, the `finally` block calling it again
   // is a no-op.
   const controller = new AbortController();
@@ -175,9 +178,12 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       userId,
       agentId,
       ...(cid ? { cid } : {}),
+      ...(projectId ? { projectId } : {}),
       ...(skillList !== undefined ? { skillList } : {}),
+      ...(projectAllowedSkillIds !== undefined ? { projectAllowedSkillIds } : {}),
       ...(extraTools && extraTools.length ? { extraTools } : {}),
       ...(extraRoots && extraRoots.length ? { extraRoots } : {}),
+      ...(readOnlyExtraRoots && readOnlyExtraRoots.length ? { readOnlyExtraRoots } : {}),
       ...(onFileWritten ? { onFileWritten } : {}),
       ...(hasProducedPath ? { hasProducedPath } : {}),
     });
@@ -234,7 +240,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       // for the short-circuit; tag the stream as aborted for the client.
       yield { type: 'error', text: 'aborted', aborted: true };
     } else if (idleHit) {
-      errText = errText || `模型超过 ${idleTimeout}s 无响应（已中止）`;
+      errText = errText || `Model exceeded ${idleTimeout}s with no response (aborted)`;
       yield { type: 'error', text: errText };
     }
   } catch (err) {
@@ -251,7 +257,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     // mid-tool-execution. Without this, the next turn would reuse a
     // memory-resident session whose last assistant message has an
     // unmatched tool_use — provider APIs silently hang on that shape,
-    // which surfaces as "思考中" that never ends. Heal is idempotent and
+    // which surfaces as a "thinking" state that never ends. Heal is idempotent and
     // a no-op on healthy sessions, so running it unconditionally every
     // turn is safe.
     try {

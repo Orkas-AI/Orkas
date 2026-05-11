@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -13,33 +13,43 @@
         <img class="logo-icon" src="../resources/icons/logo.png" alt="" draggable="false" />
         <div class="logo-text">Orkas</div>
       </div>
-      <button class="sidebar-search-btn" id="sidebar-search-btn" data-i18n-title="sidebar.search_title" title="全局搜索 (⌘K)">
+      <button class="sidebar-search-btn" id="sidebar-search-btn" data-i18n-title="sidebar.search_title" title="Global search (⌘K)">
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
           <circle cx="11" cy="11" r="7"></circle>
           <path d="m21 21-4.3-4.3"></path>
         </svg>
-        <span class="sidebar-search-label" data-i18n="sidebar.search">搜索</span>
+        <span class="sidebar-search-label" data-i18n="sidebar.search">Search</span>
         <span class="sidebar-search-kbd">⌘K</span>
       </button>
       <div class="sidebar-actions">
-        <button class="sidebar-btn primary" id="new-chat-btn" data-i18n="sidebar.new_chat">总指挥</button>
-        <button class="sidebar-btn" id="agents-btn" data-i18n="sidebar.agents">智能体</button>
-        <button class="sidebar-btn" id="skills-btn" data-i18n="sidebar.skills">技能库</button>
-        <button class="sidebar-btn" id="contexts-btn" data-i18n="sidebar.contexts">知识库</button>
+        <button class="sidebar-btn primary" id="new-chat-btn" data-i18n="sidebar.new_chat">Commander</button>
+        <button class="sidebar-btn" id="agents-btn" data-i18n="sidebar.agents">Agents</button>
+        <button class="sidebar-btn" id="skills-btn" data-i18n="sidebar.skills">Skills</button>
+        <button class="sidebar-btn" id="contexts-btn" data-i18n="sidebar.contexts">Knowledge</button>
       </div>
-      <div class="sidebar-section">
-        <div class="sidebar-section-title" data-i18n="sidebar.conversations">对话记录</div>
+      <div class="sidebar-section sidebar-projects-section">
+        <div class="sidebar-section-title-row">
+          <span class="sidebar-section-title" data-i18n="sidebar.projects">Projects</span>
+          <button class="sidebar-section-add" id="projects-add-btn"
+                  data-i18n-title="sidebar.project_create_title"
+                  data-i18n-aria-label="sidebar.project_create_title"
+                  title="New project" aria-label="New project">+</button>
+        </div>
+        <div class="projects-list" id="projects-list"></div>
+      </div>
+      <div class="sidebar-section sidebar-conversations-section">
+        <div class="sidebar-section-title" data-i18n="sidebar.conversations">Conversations</div>
         <div class="conversation-list" id="conversation-list">
-          <div class="conv-empty" data-i18n="sidebar.conv_empty">暂无对话</div>
+          <div class="conv-empty" data-i18n="sidebar.conv_empty">No conversations yet</div>
         </div>
       </div>
       <div class="sidebar-footer-actions">
-        <button class="sidebar-footer-btn" id="settings-btn" data-i18n-title="sidebar.settings_title" title="设置">
+        <button class="sidebar-footer-btn" id="settings-btn" data-i18n-title="sidebar.settings_title" title="Settings">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="12" r="3"></circle>
             <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
           </svg>
-          <span data-i18n="sidebar.settings">设置</span>
+          <span data-i18n="sidebar.settings">Settings</span>
         </button>
       </div>
     </aside>
@@ -48,32 +58,38 @@
       <!-- New Chat Landing -->
       <section class="panel active" id="panel-new-chat">
         <div class="new-chat-center">
-          <div class="new-chat-title" data-i18n="new_chat.title">指挥智能体为你干活</div>
-          <div class="new-chat-subtitle" data-i18n="new_chat.subtitle">输入你的问题或任务</div>
+          <div class="new-chat-title" data-i18n="new_chat.title">Command agents to get things done</div>
+          <div class="new-chat-subtitle" data-i18n="new_chat.subtitle">Type your question or task</div>
           <div class="new-chat-input-wrapper">
             <div class="new-chat-input-area">
-              <!-- Floats above the input box. Attachments + workspace chip
-                   share one flex row: attachments wrap on the left, chip
-                   pinned right. Chip stays anchored to input-area's top
-                   regardless of attachment count. -->
+              <!-- Floats above the input box. Attachments wrap on the left;
+                   the workspace chip moved into .chat-bottom-bar below
+                   (next to recipient / project chips) so the overlay only
+                   carries attachments now. -->
               <div class="chat-input-overlay">
                 <div class="chat-attachments" id="new-chat-attachments" style="display:none"></div>
-                <div class="chat-input-toolbar"></div>
               </div>
-              <textarea id="new-chat-input" data-i18n-placeholder="new_chat.input_placeholder" placeholder="输入消息..." rows="2"></textarea>
+              <textarea id="new-chat-input" data-i18n-placeholder="new_chat.input_placeholder" placeholder="Type a message..." rows="2"></textarea>
               <div class="chat-bottom-bar">
-                <button type="button" class="chat-attach-btn" id="new-chat-attach-btn" data-i18n-title="new_chat.attach_title" title="上传附件（文本/PDF/Word/图片）">+</button>
-                <button type="button" class="chat-recipient-chip" id="new-chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="切换接收者">
-                  <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">给：</span>
-                  <span class="chat-recipient-name" id="new-chat-recipient-name" data-i18n="chat.recipient_commander">指挥官</span>
+                <button type="button" class="chat-attach-btn" id="new-chat-attach-btn" data-i18n-title="new_chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
+                <button type="button" class="chat-recipient-chip" id="new-chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Switch recipient (commander / agent)">
+                  <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
+                  <span class="chat-recipient-name" id="new-chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
+                </button>
+                <button type="button" class="chat-project-chip" id="new-chat-project-chip" data-i18n-title="chat.project_picker_title" title="Pick project">
+                  <span class="chat-project-prefix" data-i18n="chat.project_label">Project: </span>
+                  <span class="chat-project-name" id="new-chat-project-name" data-i18n="chat.project_none">None</span>
+                  <svg class="chat-project-chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5">
+                    <polyline points="6 9 12 15 18 9"/>
+                  </svg>
                 </button>
                 <div class="chat-skill-chip" id="new-chat-skill-chip" data-target="new-chat" style="display:none">
                   <span class="chip-label"></span>
-                  <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="移除">×</span>
+                  <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
                 </div>
                 <input type="file" id="new-chat-attach-input" multiple style="display:none"
                        accept=".md,.markdown,.txt,.csv,.tsv,.json,.yaml,.yml,.log,.pdf,.docx,.png,.jpg,.jpeg,.webp,.gif,text/plain,text/markdown,text/csv,application/json,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/png,image/jpeg,image/webp,image/gif" />
-                <button id="new-chat-send-btn" class="chat-send-btn" data-i18n-title="new_chat.send_title" title="发送">
+                <button id="new-chat-send-btn" class="chat-send-btn" data-i18n-title="new_chat.send_title" title="Send">
                   <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"></path></svg>
                 </button>
               </div>
@@ -85,52 +101,55 @@
       <!-- Conversation Detail -->
       <section class="panel" id="panel-conversation">
         <div class="chat-container">
+          <div id="conv-project-empty-banner" class="conv-project-empty-banner" style="display:none">
+            <span class="muted" data-i18n="project.bindings.empty_in_chat">This project has no agents or skills bound. Open the project page to add some.</span>
+            <button type="button" class="btn btn-sm" id="conv-project-empty-banner-open" data-i18n="project.bindings.open_settings">Open project page</button>
+          </div>
           <div id="chat-history" class="chat-history">
-            <div class="empty" data-i18n="chat.empty">无对话记录...</div>
+            <div class="empty" data-i18n="chat.empty">No messages yet...</div>
           </div>
           <div class="chat-input-wrapper">
             <div class="chat-queue" id="chat-queue" style="display:none">
               <div class="chat-queue-header">
-                <span class="chat-queue-label"><span data-i18n="chat.queue_label">待发送</span> <span class="chat-queue-count" id="chat-queue-count">0</span></span>
-                <span class="chat-queue-hint" data-i18n="chat.queue_hint">可拖动排序 · 编辑 · 删除</span>
+                <span class="chat-queue-label"><span data-i18n="chat.queue_label">Queued</span> <span class="chat-queue-count" id="chat-queue-count">0</span></span>
+                <span class="chat-queue-hint" data-i18n="chat.queue_hint">Drag to reorder · Edit · Delete</span>
               </div>
               <div class="chat-queue-list" id="chat-queue-list"></div>
             </div>
             <div class="chat-input-area">
-              <!-- Floats above the input box. Attachments + workspace chip
-                   share one flex row: attachments wrap on the left, chip
-                   pinned right. Chip stays anchored to input-area's top
-                   regardless of attachment count. -->
+              <!-- Floats above the input box. Plan rail anchors left, attachments
+                   wrap to its right. The workspace chip moved into
+                   .chat-bottom-bar below (next to the recipient chip) so
+                   the overlay no longer holds it. -->
               <div class="chat-input-overlay">
-                <!-- Plan rail floats at left, mirroring the workspace chip
-                     on the right. Self-hides when current cid has no plan.
-                     Expanded body opens UPWARD (bottom: 100%) over the
-                     chat-history. See modules/plan-rail.js. -->
+                <!-- Plan rail floats at left. Self-hides when current cid has
+                     no plan. Expanded body opens UPWARD (bottom: 100%) over
+                     the chat-history. See modules/plan-rail.js. -->
                 <div id="plan-rail" class="plan-rail" style="display:none">
-                  <div class="plan-rail-header" data-i18n-title="plan.toggle_title" title="折叠/展开">
-                    <span class="plan-rail-title">📋 <span data-i18n="plan.title">执行计划</span></span>
+                  <div class="plan-rail-header" data-i18n-title="plan.toggle_title" title="Collapse / Expand">
+                    <span class="plan-rail-title">📋 <span data-i18n="plan.title">Execution Plan</span></span>
                     <span class="plan-rail-progress" id="plan-rail-progress"></span>
                     <span class="plan-rail-toggle" id="plan-rail-toggle">▴</span>
                   </div>
                   <div class="plan-rail-body" id="plan-rail-body"></div>
                 </div>
                 <div class="chat-attachments" id="chat-attachments" style="display:none"></div>
-                <div class="chat-input-toolbar"></div>
               </div>
-              <textarea id="chat-input" data-i18n-placeholder="chat.input_placeholder" placeholder="继续对话..." rows="2"></textarea>
+              <div class="chat-quote-preview" id="chat-quote-preview" style="display:none"></div>
+              <textarea id="chat-input" data-i18n-placeholder="chat.input_placeholder" placeholder="Continue the conversation..." rows="2"></textarea>
               <div class="chat-bottom-bar">
-                <button type="button" class="chat-attach-btn" id="chat-attach-btn" data-i18n-title="chat.attach_title" title="上传附件（文本/PDF/Word/图片）">+</button>
-                <button type="button" class="chat-recipient-chip" id="chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="切换接收者">
-                  <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">给：</span>
-                  <span class="chat-recipient-name" id="chat-recipient-name" data-i18n="chat.recipient_commander">指挥官</span>
+                <button type="button" class="chat-attach-btn" id="chat-attach-btn" data-i18n-title="chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
+                <button type="button" class="chat-recipient-chip" id="chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Switch recipient (commander / agent)">
+                  <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
+                  <span class="chat-recipient-name" id="chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
                 </button>
                 <div class="chat-skill-chip" id="chat-skill-chip" data-target="conversation" style="display:none">
                   <span class="chip-label"></span>
-                  <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="移除">×</span>
+                  <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
                 </div>
                 <input type="file" id="chat-attach-input" multiple style="display:none"
                        accept=".md,.markdown,.txt,.csv,.tsv,.json,.yaml,.yml,.log,.pdf,.docx,.png,.jpg,.jpeg,.webp,.gif,text/plain,text/markdown,text/csv,application/json,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/png,image/jpeg,image/webp,image/gif" />
-                <button id="chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="发送">
+                <button id="chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="Send">
                   <svg class="send-icon" viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"></path></svg>
                   <svg class="stop-icon" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>
                 </button>
@@ -145,19 +164,19 @@
         <!-- Grid view (default) -->
         <div class="skills-grid-view" id="skills-grid-view">
           <div class="skills-grid-header">
-            <span data-i18n="skills.title">技能库</span>
-            <button class="btn btn-sm" id="create-skill-btn" data-i18n="skills.add">+ 添加</button>
+            <span data-i18n="skills.title">Skills</span>
+            <button class="btn btn-sm" id="create-skill-btn" data-i18n="skills.add">+ Add</button>
           </div>
           <div class="skills-grid-scroll">
             <div class="skills-group" id="skills-grid-custom-group" style="display:none">
-              <div class="skills-group-label" data-i18n="skills.custom_group">自定义</div>
+              <div class="skills-group-label" data-i18n="skills.custom_group">Custom</div>
               <div class="skills-grid" id="skills-grid-custom"></div>
             </div>
             <div class="skills-group" id="skills-grid-builtin-group" style="display:none">
-              <div class="skills-group-label" data-i18n="skills.builtin_group">内置</div>
+              <div class="skills-group-label" data-i18n="skills.builtin_group">Built-in</div>
               <div class="skills-grid" id="skills-grid-builtin"></div>
             </div>
-            <div class="skills-empty" id="skills-empty" data-i18n="skills.empty">暂无技能</div>
+            <div class="skills-empty" id="skills-empty" data-i18n="skills.empty">No skills yet</div>
           </div>
         </div>
 
@@ -167,7 +186,7 @@
             <div class="skills-detail-breadcrumb">
               <button type="button" class="skills-back-btn" id="skills-back-btn">
                 <span aria-hidden="true">←</span>
-                <span data-i18n="skills.back">返回技能库</span>
+                <span data-i18n="skills.back">Back to skills</span>
               </button>
             </div>
             <div class="skills-detail-content" id="skills-detail-content" style="display:none">
@@ -175,32 +194,32 @@
                 <h1 class="skills-doc-title" id="skills-detail-name" data-editable="false"></h1>
                 <span class="skills-doc-source" id="skills-detail-source"></span>
                 <div class="skills-doc-actions" id="skills-detail-actions">
-                  <button class="btn-icon-use" id="skill-use-btn" data-i18n-title="skills.use_tooltip" data-i18n-aria-label="skills.use_tooltip" aria-label="使用">
+                  <button class="btn-icon-use" id="skill-use-btn" data-i18n-title="skills.use_tooltip" data-i18n-aria-label="skills.use_tooltip" aria-label="Use this skill">
                     <svg class="icon-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><polygon points="5,3 5,13 13,8" fill="currentColor"/></svg>
                   </button>
-                  <button class="btn btn-sm" id="skill-edit-btn" data-i18n="skills.edit">编辑</button>
-                  <button class="btn btn-sm" id="skill-enabled-btn" data-i18n="component.disable">禁用</button>
-                  <button class="btn btn-sm" id="skill-promote-btn" style="display:none" data-i18n="skills.promote_to_builtin">设为内置</button>
-                  <button class="btn btn-sm btn-danger" id="skill-delete-btn" data-i18n="skills.delete">删除</button>
+                  <button class="btn btn-sm" id="skill-edit-btn" data-i18n="skills.edit">Edit</button>
+                  <button class="btn btn-sm" id="skill-enabled-btn" data-i18n="component.disable">Disable</button>
+                  <button class="btn btn-sm" id="skill-promote-btn" style="display:none" data-i18n="skills.promote_to_builtin">Make built-in (dev)</button>
+                  <button class="btn btn-sm btn-danger" id="skill-delete-btn" data-i18n="skills.delete">Delete</button>
                 </div>
               </div>
 
               <section class="skills-doc-section" id="skills-section-summary">
-                <h3 class="skills-doc-section-label" data-i18n="skills.label_summary">简介</h3>
+                <h3 class="skills-doc-section-label" data-i18n="skills.label_summary">Summary</h3>
                 <div class="skills-doc-section-body" id="skills-detail-summary"></div>
               </section>
 
               <section class="skills-doc-section" id="skills-section-extra" style="display:none">
-                <h3 class="skills-doc-section-label" data-i18n="skills.label_extra">其他属性</h3>
+                <h3 class="skills-doc-section-label" data-i18n="skills.label_extra">Other attributes</h3>
                 <div class="skills-doc-section-body" id="skills-detail-extra"></div>
               </section>
 
               <section class="skills-doc-section skills-usage-section">
                 <h3 class="skills-doc-section-label skills-usage-label">
-                  <span data-i18n="skills.label_usage">使用说明</span>
+                  <span data-i18n="skills.label_usage">Usage</span>
                   <button type="button" class="skills-source-toggle" id="skills-source-toggle" aria-expanded="false">
                     <span class="skills-source-toggle-caret" aria-hidden="true">▶</span>
-                    <span data-i18n="skills.label_source">查看源码</span>
+                    <span data-i18n="skills.label_source">View source</span>
                   </button>
                 </h3>
                 <div class="skills-source-panel" id="skills-source-panel" style="display:none">
@@ -213,19 +232,19 @@
           <!-- Inline chat for custom skill editing -->
           <div class="skills-chat-col" id="skills-chat-col" style="display:none">
             <div class="skills-chat-toolbar">
-              <button id="skill-chat-clear-btn" class="skill-chat-link" data-i18n-title="skills.clear_chat_title" title="清空当前技能的对话记录" data-i18n="skills.clear_chat">清空</button>
+              <button id="skill-chat-clear-btn" class="skill-chat-link" data-i18n-title="skills.clear_chat_title" title="Clear the edit chat for this skill" data-i18n="skills.clear_chat">Clear</button>
             </div>
             <div class="skills-chat-messages" id="skills-chat-messages"></div>
             <div class="chat-queue" id="skills-chat-queue" style="display:none">
               <div class="chat-queue-header">
-                <span class="chat-queue-label"><span data-i18n="chat.queue_label">待发送</span> <span class="chat-queue-count" id="skills-chat-queue-count">0</span></span>
-                <span class="chat-queue-hint" data-i18n="chat.queue_hint">可拖动排序 · 编辑 · 删除</span>
+                <span class="chat-queue-label"><span data-i18n="chat.queue_label">Queued</span> <span class="chat-queue-count" id="skills-chat-queue-count">0</span></span>
+                <span class="chat-queue-hint" data-i18n="chat.queue_hint">Drag to reorder · Edit · Delete</span>
               </div>
               <div class="chat-queue-list" id="skills-chat-queue-list"></div>
             </div>
             <div class="skills-chat-input-area">
-              <textarea id="skills-chat-input" data-i18n-placeholder="skills.chat_input_placeholder" placeholder="描述需要修改的内容..." rows="1"></textarea>
-              <button id="skills-chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="发送">
+              <textarea id="skills-chat-input" data-i18n-placeholder="skills.chat_input_placeholder" placeholder="Describe what to change..." rows="1"></textarea>
+              <button id="skills-chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="Send">
                 <svg class="send-icon" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"></path></svg>
                 <svg class="stop-icon" viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>
               </button>
@@ -239,19 +258,19 @@
         <!-- Grid view (default) -->
         <div class="agents-grid-view" id="agents-grid-view">
           <div class="agents-grid-header">
-            <span data-i18n="agents.title">智能体</span>
-            <button class="btn btn-sm" id="create-agent-btn" data-i18n="agents.create_btn">+ 创建</button>
+            <span data-i18n="agents.title">Agents</span>
+            <button class="btn btn-sm" id="create-agent-btn" data-i18n="agents.create_btn">+ Create</button>
           </div>
           <div class="agents-grid-scroll">
             <div class="agents-group" id="agents-grid-custom-group" style="display:none">
-              <div class="agents-group-label" data-i18n="agents.custom_group">自定义</div>
+              <div class="agents-group-label" data-i18n="agents.custom_group">Custom</div>
               <div class="agents-grid" id="agents-grid-custom"></div>
             </div>
             <div class="agents-group" id="agents-grid-builtin-group" style="display:none">
-              <div class="agents-group-label" data-i18n="agents.builtin_group">内置</div>
+              <div class="agents-group-label" data-i18n="agents.builtin_group">Built-in</div>
               <div class="agents-grid" id="agents-grid-builtin"></div>
             </div>
-            <div class="agents-empty" id="agents-empty" data-i18n="agents.empty">暂无智能体</div>
+            <div class="agents-empty" id="agents-empty" data-i18n="agents.empty">No agents yet</div>
           </div>
         </div>
 
@@ -261,7 +280,7 @@
             <div class="agents-detail-breadcrumb">
               <button type="button" class="agents-back-btn" id="agents-back-btn">
                 <span aria-hidden="true">←</span>
-                <span data-i18n="agents.back">返回智能体</span>
+                <span data-i18n="agents.back">Back to agents</span>
               </button>
             </div>
             <div class="agents-detail-content" id="agents-detail-content" style="display:none">
@@ -271,27 +290,27 @@
                   <div class="agents-detail-name" id="agents-detail-name" contenteditable="false"></div>
                   <span class="agents-detail-source" id="agents-detail-source"></span>
                   <div class="detail-actions" id="agents-detail-actions">
-                    <button class="btn-icon-use" id="agent-use-btn" data-i18n-title="agents.use_tooltip" data-i18n-aria-label="agents.use_tooltip" aria-label="使用">
+                    <button class="btn-icon-use" id="agent-use-btn" data-i18n-title="agents.use_tooltip" data-i18n-aria-label="agents.use_tooltip" aria-label="Use this agent">
                       <svg class="icon-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><polygon points="5,3 5,13 13,8" fill="currentColor"/></svg>
                     </button>
-                    <button class="btn btn-sm" id="agent-edit-btn" data-i18n="agents.edit_btn_edit">编辑</button>
-                    <button class="btn btn-sm" id="agent-enabled-btn" data-i18n="component.disable">禁用</button>
-                    <button class="btn btn-sm" id="agent-promote-btn" style="display:none" data-i18n="agents.promote_to_builtin">设为内置</button>
-                    <button class="btn btn-sm btn-danger" id="agent-delete-btn" data-i18n="agents.delete">删除</button>
+                    <button class="btn btn-sm" id="agent-edit-btn" data-i18n="agents.edit_btn_edit">Edit</button>
+                    <button class="btn btn-sm" id="agent-enabled-btn" data-i18n="component.disable">Disable</button>
+                    <button class="btn btn-sm" id="agent-promote-btn" style="display:none" data-i18n="agents.promote_to_builtin">Make built-in (dev)</button>
+                    <button class="btn btn-sm btn-danger" id="agent-delete-btn" data-i18n="agents.delete">Delete</button>
                   </div>
                 </div>
               </div>
               <div class="agents-detail-body">
                 <div class="agents-detail-section" id="agents-detail-runtime-section" style="display:none">
-                  <div class="agents-detail-label" data-i18n="agents.label_runtime">外接智能体</div>
+                  <div class="agents-detail-label" data-i18n="agents.label_runtime">External agent</div>
                   <div class="agents-detail-runtime" id="agents-detail-runtime"></div>
                 </div>
                 <div class="agents-detail-section">
-                  <div class="agents-detail-label" data-i18n="agents.label_desc">简介</div>
+                  <div class="agents-detail-label" data-i18n="agents.label_desc">Summary</div>
                   <div class="agents-detail-desc" id="agents-detail-desc" contenteditable="false"></div>
                 </div>
                 <div class="agents-detail-section agents-detail-section-workflow">
-                  <div class="agents-detail-label" data-i18n="agents.label_workflow">工作流程</div>
+                  <div class="agents-detail-label" data-i18n="agents.label_workflow">Workflow</div>
                   <div class="agents-detail-workflow markdown-body" id="agents-detail-workflow" contenteditable="false"></div>
                 </div>
               </div>
@@ -300,23 +319,60 @@
           <!-- Inline chat for agent editing -->
           <div class="agents-chat-col" id="agents-chat-col" style="display:none">
             <div class="agents-chat-toolbar">
-              <button id="agent-chat-clear-btn" class="agent-chat-link" data-i18n-title="agents.clear_chat_title" title="清空当前智能体的对话记录" data-i18n="agents.clear_chat">清空</button>
+              <button id="agent-chat-clear-btn" class="agent-chat-link" data-i18n-title="agents.clear_chat_title" title="Clear the edit chat for this agent" data-i18n="agents.clear_chat">Clear</button>
             </div>
             <div class="agents-chat-messages" id="agents-chat-messages"></div>
             <div class="chat-queue" id="agents-chat-queue" style="display:none">
               <div class="chat-queue-header">
-                <span class="chat-queue-label"><span data-i18n="chat.queue_label">待发送</span> <span class="chat-queue-count" id="agents-chat-queue-count">0</span></span>
-                <span class="chat-queue-hint" data-i18n="chat.queue_hint">可拖动排序 · 编辑 · 删除</span>
+                <span class="chat-queue-label"><span data-i18n="chat.queue_label">Queued</span> <span class="chat-queue-count" id="agents-chat-queue-count">0</span></span>
+                <span class="chat-queue-hint" data-i18n="chat.queue_hint">Drag to reorder · Edit · Delete</span>
               </div>
               <div class="chat-queue-list" id="agents-chat-queue-list"></div>
             </div>
             <div class="agents-chat-input-area">
-              <textarea id="agents-chat-input" data-i18n-placeholder="agents.chat_input_placeholder" placeholder="描述需要调整的内容..." rows="1"></textarea>
-              <button id="agents-chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="发送">
+              <textarea id="agents-chat-input" data-i18n-placeholder="agents.chat_input_placeholder" placeholder="Describe what to adjust..." rows="1"></textarea>
+              <button id="agents-chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="Send">
                 <svg class="send-icon" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"></path></svg>
                 <svg class="stop-icon" viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>
               </button>
             </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Project detail (bindings + future per-project assets) -->
+      <section class="panel" id="panel-project">
+        <div class="project-detail-view">
+          <div class="project-detail-content" id="project-detail-content">
+            <div class="project-detail-header">
+              <h2 class="project-detail-title" id="project-detail-title"></h2>
+              <input type="text" class="project-detail-title-input" id="project-detail-title-input"
+                     style="display:none" autocomplete="off" spellcheck="false" />
+              <div class="project-detail-actions">
+                <button type="button" class="btn btn-sm" id="project-action-new-conv" data-i18n="project.action.new_conv">+ New chat</button>
+                <button type="button" class="btn btn-sm" id="project-action-rename" data-i18n="project.action.rename">Rename</button>
+                <button type="button" class="btn btn-sm btn-danger" id="project-action-delete" data-i18n="project.action.delete">Delete</button>
+              </div>
+            </div>
+            <section class="project-detail-card" id="project-detail-agents-section">
+              <div class="project-detail-card-head">
+                <span class="project-detail-card-title" data-i18n="project.bindings.agents_title">Agents</span>
+                <button type="button" class="btn btn-sm" id="project-add-agent-btn" data-i18n="project.bindings.add_agent">Add</button>
+              </div>
+              <div class="project-bindings-list" id="project-agents-list"></div>
+            </section>
+            <!-- Skills section intentionally hidden this round: skills are
+                 globally available regardless of project membership. The
+                 storage + IPC + runner plumbing for skill bindings stays in
+                 place so this card can be re-introduced without a schema
+                 change later. -->
+            <section class="project-detail-card" id="project-detail-skills-section" style="display:none">
+              <div class="project-detail-card-head">
+                <span class="project-detail-card-title" data-i18n="project.bindings.skills_title">Skills</span>
+                <button type="button" class="btn btn-sm" id="project-add-skill-btn" data-i18n="project.bindings.add_skill">Add</button>
+              </div>
+              <div class="project-bindings-list" id="project-skills-list"></div>
+            </section>
           </div>
         </div>
       </section>
@@ -326,10 +382,10 @@
         <div class="contexts-layout">
           <div class="contexts-tree-col" id="contexts-tree-col">
             <div class="contexts-section-header">
-              <span class="contexts-section-title" data-i18n="contexts.title">知识库</span>
+              <span class="contexts-section-title" data-i18n="contexts.title">Knowledge Base</span>
               <button type="button" class="ctx-row-menu-btn ctx-root-menu-btn" id="ctx-root-menu-btn"
-                      data-i18n-title="contexts.menu.more_actions" title="更多操作"
-                      data-i18n-aria-label="contexts.menu.more_actions" aria-label="更多操作">⋯</button>
+                      data-i18n-title="contexts.menu.more_actions" title="More actions"
+                      data-i18n-aria-label="contexts.menu.more_actions" aria-label="More actions">⋯</button>
               <input type="file" id="ctx-file-input" multiple
                      accept=".md,.markdown,.txt,.csv,.tsv,.json,.yaml,.yml,.log,.pdf,.docx,.png,.jpg,.jpeg,.webp,.gif,text/markdown,text/plain,text/csv,application/json,application/x-yaml,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/png,image/jpeg,image/webp,image/gif"
                      style="display:none" />
@@ -339,12 +395,12 @@
               <span id="ctx-upload-status-label"></span>
             </div>
             <div class="contexts-tree" id="contexts-tree">
-              <div class="empty" data-i18n="contexts.empty">知识库为空</div>
+              <div class="empty" data-i18n="contexts.empty">Knowledge base is empty</div>
             </div>
           </div>
           <div class="contexts-editor-col" id="contexts-editor-col">
             <div class="contexts-editor-empty" id="contexts-editor-empty">
-              <div data-i18n="contexts.editor_empty">选择左侧文件查看</div>
+              <div data-i18n="contexts.editor_empty">Select a file on the left</div>
             </div>
             <div class="contexts-viewer-wrap" id="contexts-viewer-wrap" style="display:none">
               <div class="contexts-editor-header">
@@ -361,11 +417,11 @@
       <section class="panel" id="panel-settings">
         <div class="settings-container">
           <div class="settings-header">
-            <h2 data-i18n="settings.title">设置</h2>
+            <h2 data-i18n="settings.title">Settings</h2>
             <div class="settings-version" id="settings-version"></div>
           </div>
           <div class="settings-body">
-            <div class="settings-section-head" data-i18n="settings.section.general">通用</div>
+            <div class="settings-section-head" data-i18n="settings.section.general">General</div>
 
             <div class="settings-group">
               <div class="settings-group-head">
@@ -385,82 +441,82 @@
 
             <div class="settings-group">
               <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.commander_avatar.title">指挥官头像</div>
-                <div class="settings-group-sub" data-i18n="settings.commander_avatar.sub">点击头像选择新的图标和颜色。</div>
+                <div class="settings-group-title" data-i18n="settings.commander_avatar.title">Commander avatar</div>
+                <div class="settings-group-sub" data-i18n="settings.commander_avatar.sub">Click the avatar to pick a new icon and color.</div>
               </div>
               <div class="settings-row">
                 <span class="settings-commander-avatar-slot" id="settings-commander-avatar"></span>
-                <span class="settings-status muted" id="settings-commander-avatar-hint" data-i18n="settings.commander_avatar.hint">点击左侧头像修改</span>
+                <span class="settings-status muted" id="settings-commander-avatar-hint" data-i18n="settings.commander_avatar.hint">Click the avatar on the left to change it</span>
               </div>
             </div>
 
             <div class="settings-group">
               <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.localexec.title">本机执行 (Local Execution)</div>
-                <div class="settings-group-sub" data-i18n="settings.localexec.sub">授权后，智能体可以在你的电脑上执行 shell 命令、读写工作区内的文件、以及使用内置的 Markdown/HTML → PDF 生成能力。用于安装命令行工具（brew/npm/pip）、运行构建、转换文件等。未授权时以上工具会自动拒绝执行。</div>
+                <div class="settings-group-title" data-i18n="settings.localexec.title">Local Execution</div>
+                <div class="settings-group-sub" data-i18n="settings.localexec.sub">Once granted, agents may run shell commands, read/write workspace files, and generate PDFs. Without permission those tools refuse to run.</div>
               </div>
               <div class="settings-row">
-                <span class="settings-status" id="settings-localexec-status" data-i18n="settings.localexec.status_loading">加载中…</span>
-                <button class="btn btn-sm btn-primary" id="settings-localexec-toggle" data-i18n="settings.localexec.btn_grant">授权本机执行</button>
+                <span class="settings-status" id="settings-localexec-status" data-i18n="settings.localexec.status_loading">Loading…</span>
+                <button class="btn btn-sm btn-primary" id="settings-localexec-toggle" data-i18n="settings.localexec.btn_grant">Grant local execution</button>
               </div>
             </div>
 
             <div class="settings-group">
               <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.metacognition.title">元认知级别的 Agent 自演进</div>
-                <div class="settings-group-sub" data-i18n="settings.metacognition.sub">开启后，每个 Agent 会在工作一段时间后自动复盘最近的表现，总结经验、调整自己的工作方式，下次接到任务时表现更好。称为「元认知」是因为 Agent 不只在做任务，还会反思「自己做得怎样、下次怎么做更好」——这种对自身认知过程的认知就是元认知。关闭后 Agent 不再自动复盘。</div>
+                <div class="settings-group-title" data-i18n="settings.metacognition.title">Metacognition-level Agent Self-Evolution</div>
+                <div class="settings-group-sub" data-i18n="settings.metacognition.sub">When on, each agent periodically reviews its recent performance, draws lessons, and adjusts how it works so it does better next time. We call it "meta-cognitive" because the agent doesn't just do tasks — it also reasons about "how am I doing, and how could I do better next time?" That cognition about its own cognition is metacognition. Turn off to stop the self-review.</div>
               </div>
               <div class="settings-row">
                 <label class="settings-toggle">
                   <input type="checkbox" id="settings-metacognition-toggle" />
-                  <span data-i18n="settings.metacognition.toggle">启动</span>
+                  <span data-i18n="settings.metacognition.toggle">Enable</span>
                 </label>
                 <span class="settings-status muted" id="settings-metacognition-status"></span>
               </div>
             </div>
 
-            <div class="settings-section-head" data-i18n="settings.section.models">模型与凭证</div>
-            <div class="settings-section-note" data-i18n="settings.section.models_note">所有 API Key 与 OAuth 令牌只保存在本机，不上云、不外发。</div>
+            <div class="settings-section-head" data-i18n="settings.section.models">Models & credentials</div>
+            <div class="settings-section-note" data-i18n="settings.section.models_note">API keys and OAuth tokens are stored locally only — never synced or sent off-device.</div>
 
             <div class="settings-group">
               <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.add_auth_title">添加模型授权</div>
-                <div class="settings-group-sub" data-i18n="settings.add_auth_sub">选择提供商和模型，然后添加一个 API Key 或 OAuth 账号。</div>
+                <div class="settings-group-title" data-i18n="settings.add_auth_title">Add model authorization</div>
+                <div class="settings-group-sub" data-i18n="settings.add_auth_sub">Pick a provider and model, then add an API key or OAuth account.</div>
               </div>
               <div class="settings-row">
-                <label data-i18n="settings.provider">提供商</label>
+                <label data-i18n="settings.provider">Provider</label>
                 <div class="ai-select" id="settings-picker-provider"></div>
               </div>
               <div class="settings-row">
-                <label data-i18n="settings.model">模型</label>
+                <label data-i18n="settings.model">Model</label>
                 <div class="ai-select" id="settings-picker-model"></div>
               </div>
               <div class="settings-row">
-                <button class="btn btn-primary" id="settings-add-entry-btn" data-i18n="settings.add_account">+ 添加账号</button>
+                <button class="btn btn-primary" id="settings-add-entry-btn" data-i18n="settings.add_account">+ Add account</button>
                 <span class="settings-status" id="settings-picker-status"></span>
               </div>
             </div>
 
             <div class="settings-group">
               <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.configured_title">已配置（按优先级）</div>
-                <div class="settings-group-sub" data-i18n="settings.configured_sub">第一项是默认模型；当前一项不可用时自动兜底到下一项。拖动调整顺序。</div>
+                <div class="settings-group-title" data-i18n="settings.configured_title">Configured (by priority)</div>
+                <div class="settings-group-sub" data-i18n="settings.configured_sub">The first entry is the default model; later entries are the fallback chain. Drag to reorder.</div>
               </div>
               <div class="settings-entries" id="settings-entries">
-                <div class="settings-empty" data-i18n="settings.loading">加载中…</div>
+                <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
               </div>
             </div>
 
-            <div class="settings-section-head" data-i18n="settings.section.tools">工具能力</div>
-            <div class="settings-section-note" data-i18n="settings.section.tools_note">搜索与图片 API Key 只保存在本机，不上云、不外发。</div>
+            <div class="settings-section-head" data-i18n="settings.section.tools">Tool capabilities</div>
+            <div class="settings-section-note" data-i18n="settings.section.tools_note">Search and image-gen API keys are stored locally only — never synced or sent off-device.</div>
 
             <div class="settings-group">
               <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.search.title">搜索 API Key</div>
-                <div class="settings-group-sub" data-i18n="settings.search.sub">优先级：搜索 API &gt; 模型原生搜索 &gt; 内置免费搜索。</div>
+                <div class="settings-group-title" data-i18n="settings.search.title">Search API Key</div>
+                <div class="settings-group-sub" data-i18n="settings.search.sub">Priority: paid API &gt; model-native search &gt; built-in keyless scraper.</div>
               </div>
               <div class="settings-row">
-                <label data-i18n="settings.search.provider">服务商</label>
+                <label data-i18n="settings.search.provider">Provider</label>
                 <div class="ai-select" id="settings-search-provider"></div>
               </div>
               <div class="settings-row">
@@ -468,21 +524,21 @@
                 <input type="text" class="form-input" id="settings-search-key-input" autocomplete="off" spellcheck="false" />
               </div>
               <div class="settings-row">
-                <button class="btn btn-primary" id="settings-search-add-btn" data-i18n="settings.search.add">+ 添加搜索 Key</button>
+                <button class="btn btn-primary" id="settings-search-add-btn" data-i18n="settings.search.add">+ Add search key</button>
                 <span class="settings-status" id="settings-search-status"></span>
               </div>
               <div class="settings-entries" id="settings-search-entries">
-                <div class="settings-empty" data-i18n="settings.loading">加载中…</div>
+                <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
               </div>
             </div>
 
             <div class="settings-group">
               <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.image.title">图片生成 API Key</div>
-                <div class="settings-group-sub" data-i18n="settings.image.sub">用于对话中的 generate_image 工具。与"模型与凭证"区域相互独立——这里填的 Key 只用于图片生成，不影响聊天模型。未配置时自动回退到聊天 Key（若聊天 Key 是 OpenAI / Google）。</div>
+                <div class="settings-group-title" data-i18n="settings.image.title">Image generation API Key</div>
+                <div class="settings-group-sub" data-i18n="settings.image.sub">API for the generate_image tool. Falls back to chat keys when those target OpenAI or Google.</div>
               </div>
               <div class="settings-row">
-                <label data-i18n="settings.image.provider">服务商</label>
+                <label data-i18n="settings.image.provider">Provider</label>
                 <div class="ai-select" id="settings-image-provider"></div>
               </div>
               <div class="settings-row">
@@ -490,11 +546,35 @@
                 <input type="text" class="form-input" id="settings-image-key-input" autocomplete="off" spellcheck="false" />
               </div>
               <div class="settings-row">
-                <button class="btn btn-primary" id="settings-image-add-btn" data-i18n="settings.image.add">+ 添加图片 Key</button>
+                <button class="btn btn-primary" id="settings-image-add-btn" data-i18n="settings.image.add">+ Add image key</button>
                 <span class="settings-status" id="settings-image-status"></span>
               </div>
               <div class="settings-entries" id="settings-image-entries">
-                <div class="settings-empty" data-i18n="settings.loading">加载中…</div>
+                <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
+              </div>
+            </div>
+
+            <div class="settings-section-head" data-i18n="settings.section.data">Data</div>
+            <div class="settings-section-note" data-i18n="settings.section.data_note">Maintenance actions on local data. These cannot be undone.</div>
+
+            <div class="settings-group">
+              <div class="settings-group-head">
+                <div class="settings-group-title" data-i18n="settings.data_root.title">Data root</div>
+                <div class="settings-group-sub" data-i18n="settings.data_root.sub">All conversations, agents, skills, and KB content live under this directory. Click the path to open it in the OS file manager.</div>
+              </div>
+              <div class="settings-row">
+                <button class="btn btn-sm" id="settings-data-root-btn" type="button" title="" data-i18n-title="settings.data_root.open_tooltip"><span id="settings-data-root-path" class="muted"></span></button>
+              </div>
+            </div>
+
+            <div class="settings-group">
+              <div class="settings-group-head">
+                <div class="settings-group-title" data-i18n="settings.clear_all_convs.title">Clear all conversations</div>
+                <div class="settings-group-sub" data-i18n="settings.clear_all_convs.sub">Removes every conversation and its associated message history, attachments, plan, sessions, and search index entries — same cascade as clicking × on a single conversation, applied to all of them. Skills and agents are NOT touched.</div>
+              </div>
+              <div class="settings-row">
+                <button class="btn btn-sm btn-danger" id="settings-clear-all-convs-btn" data-i18n="settings.clear_all_convs.btn">Clear all conversations</button>
+                <span class="settings-status muted" id="settings-clear-all-convs-status"></span>
               </div>
             </div>
           </div>
@@ -507,26 +587,26 @@
   <!-- Create Agent Modal -->
   <div class="modal-overlay" id="agent-modal">
     <div class="modal">
-      <h3 data-i18n="agent_modal.title">新建智能体</h3>
+      <h3 data-i18n="agent_modal.title">New agent</h3>
 
-      <!-- Mode tabs: 创建 (in-process) / 外接 (cli runtime). Mirrors the
+      <!-- Mode tabs: Create (in-process) / External (cli runtime). Mirrors the
            skill-modal tab pattern; reuses the same .skill-modal-tab styles
            via the agent-modal-tab class for consistent chrome. -->
       <div class="skill-modal-tabs" id="agent-modal-tabs">
-        <button type="button" class="skill-modal-tab is-active" data-agent-tab="create" data-i18n="agent_modal.tab_create">创建</button>
-        <button type="button" class="skill-modal-tab" data-agent-tab="external" data-i18n="agent_modal.tab_external">外接</button>
+        <button type="button" class="skill-modal-tab is-active" data-agent-tab="create" data-i18n="agent_modal.tab_create">Create</button>
+        <button type="button" class="skill-modal-tab" data-agent-tab="external" data-i18n="agent_modal.tab_external">External</button>
       </div>
 
       <!-- Create panel (default): manual authoring. Runtime selector is
            intentionally absent here — that flow lives in the External tab. -->
       <div class="skill-modal-panel is-active" data-agent-panel="create">
         <div class="form-row">
-          <label data-i18n="agent_modal.name">名称</label>
-          <input type="text" id="agent-name-input" data-i18n-placeholder="agent_modal.name_placeholder" placeholder="例如：代码审查助手" />
+          <label data-i18n="agent_modal.name">Name</label>
+          <input type="text" id="agent-name-input" data-i18n-placeholder="agent_modal.name_placeholder" placeholder="e.g. Code Review Assistant" />
         </div>
         <div class="form-row">
-          <label><span data-i18n="agent_modal.desc">简介</span> <span class="form-hint" data-i18n="agent_modal.desc_hint">一句话说明用途，创建后 AI 会基于此生成工作流程</span></label>
-          <textarea id="agent-desc-input" rows="4" data-i18n-placeholder="agent_modal.desc_placeholder" placeholder="例如：帮我在提交前审查代码，重点看逻辑漏洞和安全问题..."></textarea>
+          <label><span data-i18n="agent_modal.desc">Summary</span> <span class="form-hint" data-i18n="agent_modal.desc_hint">One line on what it does — the AI will generate a workflow from this</span></label>
+          <textarea id="agent-desc-input" rows="4" data-i18n-placeholder="agent_modal.desc_placeholder" placeholder="e.g. Review my code before commit, focus on logic bugs and security issues..."></textarea>
         </div>
       </div>
 
@@ -536,23 +616,23 @@
            expose a project-directory input. -->
       <div class="skill-modal-panel" data-agent-panel="external">
         <div class="form-row">
-          <label data-i18n="agent_modal.ext_cli_label">智能体</label>
+          <label data-i18n="agent_modal.ext_cli_label">Agent</label>
           <div class="ai-select" id="agent-modal-ext-cli-select"></div>
         </div>
         <div class="form-row">
-          <label data-i18n="agent_modal.ext_name">名称</label>
-          <input type="text" id="agent-ext-name-input" data-i18n-placeholder="agent_modal.ext_name_placeholder" placeholder="例如：Claude Code" />
+          <label data-i18n="agent_modal.ext_name">Name</label>
+          <input type="text" id="agent-ext-name-input" data-i18n-placeholder="agent_modal.ext_name_placeholder" placeholder="e.g. Claude Code" />
         </div>
         <div class="form-row">
-          <label data-i18n="agent_modal.ext_desc">简介</label>
-          <textarea id="agent-ext-desc-input" rows="4" data-i18n-placeholder="agent_modal.ext_desc_placeholder" placeholder="（选择 CLI 后自动填入，可手动覆盖）"></textarea>
+          <label data-i18n="agent_modal.ext_desc">Summary</label>
+          <textarea id="agent-ext-desc-input" rows="4" data-i18n-placeholder="agent_modal.ext_desc_placeholder" placeholder="(auto-filled when a CLI is picked; can be overridden)"></textarea>
         </div>
       </div>
 
       <div class="form-msg" id="agent-form-msg"></div>
       <div class="modal-actions">
-        <button class="btn" onclick="closeAgentModal()" data-i18n="common.cancel">取消</button>
-        <button class="btn btn-primary" id="agent-save-btn" onclick="saveAgentModal()" data-i18n="common.confirm">确认</button>
+        <button class="btn" onclick="closeAgentModal()" data-i18n="common.cancel">Cancel</button>
+        <button class="btn btn-primary" id="agent-save-btn" onclick="saveAgentModal()" data-i18n="common.confirm">Confirm</button>
       </div>
     </div>
   </div>
@@ -560,43 +640,43 @@
   <!-- Create/Edit Skill Modal -->
   <div class="modal-overlay" id="skill-modal">
     <div class="modal">
-      <h3 id="skill-modal-title" data-i18n="skill_modal.title_create">新建技能</h3>
+      <h3 id="skill-modal-title" data-i18n="skill_modal.title_create">New skill</h3>
       <input type="hidden" id="skill-edit-id" value="" />
 
       <!-- Import-method tabs. Only shown in create mode (hidden when editing). -->
       <div class="skill-modal-tabs" id="skill-modal-tabs">
-        <button type="button" class="skill-modal-tab is-active" data-skill-tab="manual" data-i18n="skill_modal.tab_manual">手动</button>
-        <button type="button" class="skill-modal-tab" data-skill-tab="url" data-i18n="skill_modal.tab_url">从 URL 导入</button>
-        <button type="button" class="skill-modal-tab" data-skill-tab="dir" data-i18n="skill_modal.tab_dir">从文件夹导入</button>
+        <button type="button" class="skill-modal-tab is-active" data-skill-tab="manual" data-i18n="skill_modal.tab_manual">Manual</button>
+        <button type="button" class="skill-modal-tab" data-skill-tab="url" data-i18n="skill_modal.tab_url">From URL</button>
+        <button type="button" class="skill-modal-tab" data-skill-tab="dir" data-i18n="skill_modal.tab_dir">From folder</button>
       </div>
 
       <!-- Manual panel (default) -->
       <div class="skill-modal-panel is-active" data-skill-panel="manual">
         <div class="form-row">
-          <label><span data-i18n="skill_modal.name">名称（英文）</span><span class="form-hint" data-i18n="skill_modal.name_hint">字母开头，可含数字/-/_ 和单个空格</span></label>
-          <input type="text" id="skill-name" data-i18n-placeholder="skill_modal.name_placeholder" placeholder="例如：web-summary" />
+          <label><span data-i18n="skill_modal.name">Name (English)</span><span class="form-hint" data-i18n="skill_modal.name_hint">Starts with a letter; digits, -, _, and one space allowed</span></label>
+          <input type="text" id="skill-name" data-i18n-placeholder="skill_modal.name_placeholder" placeholder="e.g. web-summary" />
         </div>
         <div class="form-row">
-          <label data-i18n="skill_modal.description">简介</label>
-          <textarea id="skill-description" rows="4" data-i18n-placeholder="skill_modal.desc_placeholder" placeholder="一句话说明这个技能做什么、什么时候用..."></textarea>
+          <label data-i18n="skill_modal.description">Summary</label>
+          <textarea id="skill-description" rows="4" data-i18n-placeholder="skill_modal.desc_placeholder" placeholder="One line on what this skill does and when to use it..."></textarea>
         </div>
       </div>
 
-      <!-- URL import panel: name/简介 由模型在导入会话里自动产出 -->
+      <!-- URL import panel: name/summary are produced by the model during the import chat -->
       <div class="skill-modal-panel" data-skill-panel="url">
         <div class="form-row">
-          <label><span data-i18n="skill_modal.url">URL</span><span class="form-hint" data-i18n="skill_modal.url_hint">clawhub、github、技能介绍等链接</span></label>
+          <label><span data-i18n="skill_modal.url">URL</span><span class="form-hint" data-i18n="skill_modal.url_hint">clawhub / GitHub / skill intro pages, etc.</span></label>
           <input type="text" id="skill-url-input" data-i18n-placeholder="skill_modal.url_placeholder" placeholder="https://..." />
         </div>
       </div>
 
-      <!-- Dir import panel: name/简介 由模型在导入会话里自动产出 -->
+      <!-- Dir import panel: name/summary are produced by the model during the import chat -->
       <div class="skill-modal-panel" data-skill-panel="dir">
         <div class="form-row">
-          <label><span data-i18n="skill_modal.dir">源目录</span><span class="form-hint" data-i18n="skill_modal.dir_hint">文件最多 100 个 / 总大小最多 50 MiB</span></label>
+          <label><span data-i18n="skill_modal.dir">Source folder</span><span class="form-hint" data-i18n="skill_modal.dir_hint">Max 100 files / 50 MiB total</span></label>
           <div class="skill-dir-pick-row">
-            <button type="button" class="btn btn-sm" id="skill-dir-pick-btn" onclick="pickSkillImportDir()" data-i18n="skill_modal.dir_pick_btn">选择文件夹</button>
-            <span class="skill-dir-selected" id="skill-dir-selected" data-i18n="skill_modal.dir_none">（未选择）</span>
+            <button type="button" class="btn btn-sm" id="skill-dir-pick-btn" onclick="pickSkillImportDir()" data-i18n="skill_modal.dir_pick_btn">Pick folder</button>
+            <span class="skill-dir-selected" id="skill-dir-selected" data-i18n="skill_modal.dir_none">(not picked)</span>
           </div>
           <input type="hidden" id="skill-dir-path" value="" />
         </div>
@@ -604,8 +684,8 @@
 
       <div class="form-msg" id="skill-form-msg"></div>
       <div class="modal-actions">
-        <button class="btn" onclick="closeSkillModal()" data-i18n="common.cancel">取消</button>
-        <button class="btn btn-primary" id="skill-save-btn" onclick="saveSkill()" data-i18n="common.confirm">确认</button>
+        <button class="btn" onclick="closeSkillModal()" data-i18n="common.cancel">Cancel</button>
+        <button class="btn btn-primary" id="skill-save-btn" onclick="saveSkill()" data-i18n="common.confirm">Confirm</button>
       </div>
     </div>
   </div>
@@ -613,31 +693,31 @@
   <!-- Agent picker popup (new-chat only) -->
   <div class="skill-picker" id="agent-picker" style="display:none">
     <div class="skill-picker-header">
-      <input type="text" id="agent-picker-search" data-i18n-placeholder="agent_picker.search_placeholder" placeholder="搜索智能体..." autocomplete="off" />
+      <input type="text" id="agent-picker-search" data-i18n-placeholder="agent_picker.search_placeholder" placeholder="Search agents..." autocomplete="off" />
     </div>
     <div class="skill-picker-list" id="agent-picker-list"></div>
   </div>
 
   <div class="agent-row-menu" id="agent-row-menu" style="display:none">
-    <div class="agent-row-menu-item" data-action="edit" data-i18n="agents.edit">编辑</div>
-    <div class="agent-row-menu-item is-danger" data-action="delete" data-i18n="agents.delete">删除</div>
+    <div class="agent-row-menu-item" data-action="edit" data-i18n="agents.edit">Edit</div>
+    <div class="agent-row-menu-item is-danger" data-action="delete" data-i18n="agents.delete">Delete</div>
   </div>
 
   <!-- Knowledge-base "new directory" modal. Text-file creation no longer
-       goes through this modal — + 文本 creates an "未命名.md" inline and
+       goes through this modal — + Text creates an "Untitled.md" inline and
        drops the tree into rename mode + the viewer into edit mode. -->
   <div class="modal-overlay" id="ctx-new-modal">
     <div class="modal">
-      <h3 data-i18n="contexts.new.modal_title_dir">新建目录</h3>
+      <h3 data-i18n="contexts.new.modal_title_dir">New Folder</h3>
       <div class="form-row ctx-new-target" id="ctx-new-target"></div>
       <div class="form-row">
-        <label data-i18n="contexts.new.dir_name">目录名</label>
+        <label data-i18n="contexts.new.dir_name">Folder name</label>
         <input type="text" id="ctx-new-name" placeholder="notes" autocomplete="off" />
       </div>
       <div class="form-msg" id="ctx-new-msg"></div>
       <div class="modal-actions">
-        <button class="btn" onclick="closeCtxNewModal()" data-i18n="common.cancel">取消</button>
-        <button class="btn btn-primary" onclick="saveCtxNew()" data-i18n="common.confirm">确认</button>
+        <button class="btn" onclick="closeCtxNewModal()" data-i18n="common.cancel">Cancel</button>
+        <button class="btn btn-primary" onclick="saveCtxNew()" data-i18n="common.confirm">Confirm</button>
       </div>
     </div>
   </div>
@@ -645,10 +725,10 @@
   <!-- Unauthorized banner -->
   <div class="access-denied" id="access-denied">
     <div class="access-denied-box">
-      <div class="access-denied-title">无权访问</div>
+      <div class="access-denied-title">Access denied</div>
       <div class="access-denied-msg">
-        请在访问地址后追加 <code>?password=&lt;访问密码&gt;</code><br />
-        密码在服务启动日志或 <code>data/users/_password.json</code> 中。
+        Append <code>?password=&lt;access-password&gt;</code> to the URL.<br />
+        The password is in the server startup log or <code>data/users/_password.json</code>.
       </div>
     </div>
   </div>
@@ -656,20 +736,20 @@
   <!-- KB location picker (chat archive + any future drop-to-KB flow) -->
   <div class="modal-overlay" id="kb-picker-modal">
     <div class="modal kb-picker">
-      <h3 id="kb-picker-title" data-i18n="kb_picker.title">保存到知识库</h3>
+      <h3 id="kb-picker-title" data-i18n="kb_picker.title">Save to knowledge base</h3>
       <div class="form-row">
-        <label><span data-i18n="kb_picker.name">文件名</span> <span class="form-hint" data-i18n="kb_picker.name_hint">不含扩展名将自动补 .md</span></label>
+        <label><span data-i18n="kb_picker.name">Filename</span> <span class="form-hint" data-i18n="kb_picker.name_hint">Missing extension will be auto-filled as .md</span></label>
         <input type="text" id="kb-picker-name" autocomplete="off" />
       </div>
       <div class="form-row">
-        <label data-i18n="kb_picker.folder">选择目录</label>
+        <label data-i18n="kb_picker.folder">Choose folder</label>
         <div class="kb-picker-tree" id="kb-picker-tree"></div>
         <div class="kb-picker-target" id="kb-picker-target"></div>
       </div>
       <div class="form-msg" id="kb-picker-msg"></div>
       <div class="modal-actions">
-        <button class="btn" onclick="closeKbPicker()" data-i18n="common.cancel">取消</button>
-        <button class="btn btn-primary" onclick="confirmKbPicker()" data-i18n="common.confirm">确认</button>
+        <button class="btn" onclick="closeKbPicker()" data-i18n="common.cancel">Cancel</button>
+        <button class="btn btn-primary" onclick="confirmKbPicker()" data-i18n="common.confirm">Confirm</button>
       </div>
     </div>
   </div>
@@ -677,7 +757,7 @@
   <!-- Add-account modal (settings page) -->
   <div class="modal-overlay" id="add-account-modal">
     <div class="modal add-account-modal">
-      <h3 id="add-account-title" data-i18n="add_account.title">新增账号</h3>
+      <h3 id="add-account-title" data-i18n="add_account.title">Add account</h3>
       <div class="add-account-body" id="add-account-body"></div>
       <div class="modal-actions" id="add-account-actions"></div>
     </div>
@@ -686,12 +766,12 @@
   <!-- OAuth login flow modal -->
   <div class="modal-overlay" id="oauth-flow-modal">
     <div class="modal oauth-flow-modal">
-      <h3 id="oauth-flow-title" data-i18n="oauth_flow.title">OAuth 登录</h3>
+      <h3 id="oauth-flow-title" data-i18n="oauth_flow.title">OAuth sign-in</h3>
       <div class="oauth-flow-body" id="oauth-flow-body">
-        <div class="oauth-flow-stage" data-i18n="oauth_flow.preparing">正在准备授权…</div>
+        <div class="oauth-flow-stage" data-i18n="oauth_flow.preparing">Preparing authorization…</div>
       </div>
       <div class="modal-actions">
-        <button class="btn" id="oauth-flow-cancel-btn" data-i18n="common.cancel">取消</button>
+        <button class="btn" id="oauth-flow-cancel-btn" data-i18n="common.cancel">Cancel</button>
       </div>
     </div>
   </div>
@@ -704,22 +784,22 @@
           <circle cx="11" cy="11" r="7"></circle>
           <path d="m21 21-4.3-4.3"></path>
         </svg>
-        <input type="text" id="search-input" data-i18n-placeholder="search.input_placeholder" placeholder="搜索聊天记录、知识库内容…" autocomplete="off" spellcheck="false" />
-        <button class="search-close-btn" id="search-close-btn" data-i18n-title="search.close_title" title="关闭 (Esc)">
+        <input type="text" id="search-input" data-i18n-placeholder="search.input_placeholder" placeholder="Search chats and knowledge base…" autocomplete="off" spellcheck="false" />
+        <button class="search-close-btn" id="search-close-btn" data-i18n-title="search.close_title" title="Close (Esc)">
           <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M18 6 6 18M6 6l12 12"></path>
           </svg>
         </button>
       </div>
       <div class="search-tabs" id="search-tabs" role="tablist">
-        <button class="search-tab is-active" data-tab="all" data-i18n="search.tab.all">全部</button>
-        <button class="search-tab" data-tab="chat" data-i18n="search.tab.chat">对话</button>
-        <button class="search-tab" data-tab="agent" data-i18n="search.tab.agent">智能体</button>
-        <button class="search-tab" data-tab="skill" data-i18n="search.tab.skill">技能</button>
-        <button class="search-tab" data-tab="context" data-i18n="search.tab.context">知识库</button>
+        <button class="search-tab is-active" data-tab="all" data-i18n="search.tab.all">All</button>
+        <button class="search-tab" data-tab="chat" data-i18n="search.tab.chat">Chats</button>
+        <button class="search-tab" data-tab="agent" data-i18n="search.tab.agent">Agents</button>
+        <button class="search-tab" data-tab="skill" data-i18n="search.tab.skill">Skills</button>
+        <button class="search-tab" data-tab="context" data-i18n="search.tab.context">Knowledge</button>
       </div>
       <div class="search-body" id="search-body">
-        <div class="search-empty" data-i18n="search.empty_hint">输入关键词开始搜索</div>
+        <div class="search-empty" data-i18n="search.empty_hint">Type a keyword to start searching</div>
       </div>
     </div>
   </div>
@@ -743,6 +823,9 @@
   <script src="./modules/avatar-picker.js"></script>
   <script src="./modules/chat-input-form.js"></script>
   <script src="./modules/chat-lightbox.js"></script>
+  <script src="./modules/strip-structural-blocks.js"></script>
+  <script src="./modules/projects.js"></script>
+  <script src="./modules/project-detail.js"></script>
   <script src="./modules/conversation.js"></script>
   <script src="./modules/plan-rail.js"></script>
   <script src="./modules/queue-draft.js"></script>

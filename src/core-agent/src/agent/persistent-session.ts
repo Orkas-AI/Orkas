@@ -142,9 +142,54 @@ export class PersistentSession extends Session {
    * already-healed history is a no-op.
    */
   healOrphanToolUses(): boolean {
-    const messages = super.getMessages();
-    const fixed: Message[] = [];
+    const original = super.getMessages();
     let changed = false;
+
+    // Pre-pass — drop orphan tool_results whose toolUseId never appears as
+    // a tool_use in any assistant message. Provider APIs reject these with
+    // "No tool call found for function call output with call_id ...".
+    // Common shape that triggered it: assistant message with only text
+    // (the tool_use was lost / never persisted), followed by user messages
+    // carrying tool_result blocks — the cluster scan in pass 2 only walks
+    // assistant→tool_result clusters, so it won't even visit these orphans.
+    const validToolUseIds = new Set<string>();
+    for (const m of original) {
+      if (m.role !== 'assistant') continue;
+      for (const c of m.content) {
+        if ((c as { type?: string }).type === 'tool_use') {
+          const id = (c as ToolUseContent).id;
+          if (id) validToolUseIds.add(id);
+        }
+      }
+    }
+    const messages: Message[] = [];
+    for (const m of original) {
+      if (m.role !== 'user') {
+        messages.push(m);
+        continue;
+      }
+      const hasToolResult = m.content.some(
+        (c) => (c as { type?: string }).type === 'tool_result',
+      );
+      if (!hasToolResult) {
+        messages.push(m);
+        continue;
+      }
+      const kept = m.content.filter((c) => {
+        if ((c as { type?: string }).type !== 'tool_result') return true;
+        const id = (c as ToolResultContent).toolUseId;
+        return validToolUseIds.has(id);
+      });
+      if (kept.length === m.content.length) {
+        messages.push(m);
+      } else {
+        changed = true;
+        if (kept.length > 0) messages.push({ ...m, content: kept });
+        // else: message had ONLY orphan tool_results — drop it entirely
+      }
+    }
+
+    const fixed: Message[] = [];
 
     let i = 0;
     while (i < messages.length) {
@@ -221,14 +266,18 @@ export class PersistentSession extends Session {
       }
 
       // Order results to match the assistant's tool_use declaration order;
-      // append any extras (defensive — shouldn't occur in practice).
+      // tool_results whose toolUseId has no matching tool_use in this
+      // assistant message are dropped — keeping them produces a
+      // function_call_output without function_call, which providers reject
+      // with "No tool call found for function call output with call_id ...".
       const orderedResults: MessageContent[] = [];
+      let droppedOrphanResults = 0;
       for (const id of allCallIds) {
         const r = resultsByCallId.get(id);
         if (r) orderedResults.push(r);
       }
-      for (const [id, r] of resultsByCallId) {
-        if (!allCallIds.includes(id)) orderedResults.push(r);
+      for (const id of resultsByCallId.keys()) {
+        if (!allCallIds.includes(id)) droppedOrphanResults++;
       }
 
       // Detect whether the rewrite changes anything observable: orphan
@@ -244,6 +293,7 @@ export class PersistentSession extends Session {
       );
       if (
         orphanIds.length > 0 ||
+        droppedOrphanResults > 0 ||
         originalToolResultMsgs.length > 1 ||
         originalToolResultCount !== orderedResults.length
       ) {

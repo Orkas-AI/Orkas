@@ -7,7 +7,7 @@
  *   - Render every step with status icon + index + title + assignee
  *   - Show progress count `done/total` in the header
  *   - On `failed` steps (and only when state.in_flight is empty),
- *     surface 重试 / 跳过 / 放弃 actions wired to IPC
+ *     surface retry / skip / abort actions wired to IPC
  *   - On `pending` steps with `transient_attempts > 0`, render a small
  *     `🔁 N/2` badge so users see the auto-retry in flight (otherwise the
  *     transient retry would silently look like the step is just stuck)
@@ -57,9 +57,9 @@ function _buildStepHtml(step) {
     : '';
   const actions = _isStepActionable(step, _currentInFlight)
     ? `<div class="plan-rail-step-actions">
-         <button type="button" class="btn btn-sm" data-action="retry" data-i18n="plan.action.retry">${escapeHtml(t('plan.action.retry') || '重试')}</button>
-         <button type="button" class="btn btn-sm" data-action="skip"  data-i18n="plan.action.skip">${escapeHtml(t('plan.action.skip')  || '跳过')}</button>
-         <button type="button" class="btn btn-sm btn-danger" data-action="abort" data-i18n="plan.action.abort">${escapeHtml(t('plan.action.abort') || '放弃整个计划')}</button>
+         <button type="button" class="btn btn-sm" data-action="retry" data-i18n="plan.action.retry">${escapeHtml(t('plan.action.retry') || 'Retry')}</button>
+         <button type="button" class="btn btn-sm" data-action="skip"  data-i18n="plan.action.skip">${escapeHtml(t('plan.action.skip')  || 'Skip')}</button>
+         <button type="button" class="btn btn-sm btn-danger" data-action="abort" data-i18n="plan.action.abort">${escapeHtml(t('plan.action.abort') || 'Abandon plan')}</button>
        </div>`
     : '';
   return `<div class="plan-rail-step is-${step.status}" data-step-index="${step.index}" ${step.output_msg_id ? `data-msg-id="${escapeHtml(step.output_msg_id)}"` : ''}>
@@ -213,15 +213,15 @@ document.addEventListener('click', async (ev) => {
         );
         const data = await res.json().catch(() => ({}));
         if (!data?.ok) {
-          uiAlert(t('plan.error.retry_failed', { reason: data?.error || 'unknown' }) || `重试失败: ${data?.error || 'unknown'}`);
+          uiAlert(t('plan.error.retry_failed', { reason: data?.error || 'unknown' }) || `Retry failed: ${data?.error || 'unknown'}`);
         }
       } catch (err) {
-        uiAlert(t('plan.error.retry_failed', { reason: err && err.message }) || `重试失败: ${err && err.message}`);
+        uiAlert(t('plan.error.retry_failed', { reason: err && err.message }) || `Retry failed: ${err && err.message}`);
       }
       return;
     }
     if (action === 'skip') {
-      const ok = await uiConfirm(t('plan.confirm.skip') || '确认跳过此步骤?');
+      const ok = await uiConfirm(t('plan.confirm.skip') || 'Skip this step?');
       if (!ok) return;
       try {
         const res = await apiFetch(
@@ -230,15 +230,15 @@ document.addEventListener('click', async (ev) => {
         );
         const data = await res.json().catch(() => ({}));
         if (!data?.ok) {
-          uiAlert(t('plan.error.skip_failed', { reason: data?.error || 'unknown' }) || `跳过失败: ${data?.error || 'unknown'}`);
+          uiAlert(t('plan.error.skip_failed', { reason: data?.error || 'unknown' }) || `Skip failed: ${data?.error || 'unknown'}`);
         }
       } catch (err) {
-        uiAlert(t('plan.error.skip_failed', { reason: err && err.message }) || `跳过失败: ${err && err.message}`);
+        uiAlert(t('plan.error.skip_failed', { reason: err && err.message }) || `Skip failed: ${err && err.message}`);
       }
       return;
     }
     if (action === 'abort') {
-      const ok = await uiConfirm(t('plan.confirm.abort') || '确认放弃整个执行计划?');
+      const ok = await uiConfirm(t('plan.confirm.abort') || 'Abandon the entire plan?');
       if (!ok) return;
       try {
         await apiFetch(
@@ -246,7 +246,7 @@ document.addEventListener('click', async (ev) => {
           { method: 'POST' },
         );
       } catch (err) {
-        uiAlert(t('plan.error.abort_failed', { reason: err && err.message }) || `放弃失败: ${err && err.message}`);
+        uiAlert(t('plan.error.abort_failed', { reason: err && err.message }) || `Abort failed: ${err && err.message}`);
       }
       return;
     }

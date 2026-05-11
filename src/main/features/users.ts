@@ -1,16 +1,22 @@
 /**
- * 本机用户注册表 + 活跃 uid 生命周期。
+ * Local-machine user registry + active uid lifecycle.
  *
- * `data/users.json` 存 `{ current_user_id, users: [{user_id, created_at}, ...] }`，
- * 是唯一的顶层本机元数据。所有 uid 私域数据都在 `data/<uid>/{cloud,local}/` 下
- * （见 paths.ts）。
+ * `data/users.json` holds
+ * `{ current_user_id, users: [{user_id, created_at}, ...] }` — the sole
+ * top-level local metadata. All per-uid private data lives under
+ * `data/<uid>/{cloud,local}/` (see paths.ts).
  *
- * 启动流程：
- *   1. 读 users.json；不存在 → 创建首个 uid（`genUserId`），current_user_id 指向它
- *   2. `activateUser(uid)` 建 uid 子目录骨架 + pin CORE_AGENT_AUTH_DIR + 清相关缓存
- *   3. 之后所有 feature 调用用 `getActiveUserId()` 拿当前 uid
+ * Boot sequence:
+ *   1. Read users.json; if absent, create the first uid (`genUserId`)
+ *      and point current_user_id at it.
+ *   2. `activateUser(uid)` mkdir's the uid sub-tree, pins
+ *      CORE_AGENT_AUTH_DIR, and clears the relevant caches.
+ *   3. From there, every feature uses `getActiveUserId()` to obtain the
+ *      current uid.
  *
- * 本期仅支持单活跃 uid（UI 级切换下期另起 plan）。但注册表结构已预留多 uid 场景。
+ * Currently only one uid is active at a time (a UI-level switcher is
+ * planned for a later iteration). The registry shape already
+ * accommodates multi-uid scenarios.
  */
 
 import * as fs from 'node:fs';
@@ -86,13 +92,16 @@ function writeRegistry(reg: UsersRegistry): void {
 
 /**
  * Activate `uid` as the live user for this process:
- *   - mkdir 完整的 `<uid>/{cloud,local}/*` 骨架
- *   - 把 `CORE_AGENT_AUTH_DIR` 指向 `<uid>/local/config/`（core-agent 的
- *     `resolveAuthDir()` 每次调用读 env，运行时切换安全）
- *   - 清相关模块的内存缓存（session-store、auth、config）
- *   - 把 `current_user_id` 写回 users.json
+ *   - mkdir the full `<uid>/{cloud,local}/*` skeleton.
+ *   - Point `CORE_AGENT_AUTH_DIR` at `<uid>/local/config/`. core-agent's
+ *     `resolveAuthDir()` reads the env var on every call, so runtime
+ *     switching is safe.
+ *   - Clear the relevant module-level caches (session-store, auth,
+ *     config).
+ *   - Write `current_user_id` back to users.json.
  *
- * 调用方通常是 `boot` 与（下一期的）UI 切换入口。
+ * Callers are typically `boot` and (in a future iteration) the UI
+ * switcher.
  */
 export function activateUser(uid: string): void {
   if (!safeId(uid)) throw new Error(`invalid user id: ${String(uid)}`);
@@ -109,14 +118,16 @@ export function activateUser(uid: string): void {
   try { sweepToolResults(userToolResultsDir(uid), 7); }
   catch (err) { log.warn(`sweepToolResults uid=${uid}: ${(err as Error).message}`); }
 
-  // 历史 session_id 上的品牌前缀一次性剥掉。idempotent：盖章后再
-  // 启动直接 no-op。详见 util/migrate-session-ids.ts。
+  // Strip legacy session_id brand prefixes once.
+  // Idempotent: after the stamp lands, subsequent startups are no-ops.
+  // See util/migrate-session-ids.ts for details.
   try { migrateLegacySessionIds(uid); }
   catch (err) { log.warn(`migrateLegacySessionIds uid=${uid}: ${(err as Error).message}`); }
 
-  // Agent 布局迁移:`agents/<aid>.json` → `agents/<aid>/agent.json`,
-  // `meta/<aid>/*` → `agents/<aid>/meta/*`。同样 idempotent + 盖章。
-  // 详见 util/migrate-agent-layout.ts + docs/plans/agent-as-directory.md。
+  // Agent layout migration: `agents/<aid>.json` →
+  // `agents/<aid>/agent.json`, and `meta/<aid>/*` →
+  // `agents/<aid>/meta/*`. Likewise idempotent + stamped. See
+  // util/migrate-agent-layout.ts + docs/plans/agent-as-directory.md.
   try { migrateAgentLayout(uid); }
   catch (err) { log.warn(`migrateAgentLayout uid=${uid}: ${(err as Error).message}`); }
 

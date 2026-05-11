@@ -20,18 +20,22 @@ describe('provider_catalog › CATALOG', () => {
   it('holds unique provider ids in display order', () => {
     const ids = CATALOG.map((p) => p.id);
     expect(new Set(ids).size).toBe(ids.length);
-    // Global frontier labs first, then CN mainstream, then aggregators.
+    // DeepSeek 直连先（pi-ai 不带，自建适配），然后全球前沿（OpenAI Codex /
+    // OpenAI / Google / Anthropic），CN 主流（Zhipu / Moonshot / Kimi-Coding /
+    // MiniMax × 3 / Doubao），最后聚合器（OpenRouter）。
     expect(ids).toEqual([
-      'anthropic',
+      'deepseek',
       'openai-codex',
       'openai',
       'google',
+      'anthropic',
       'zai',
       'moonshot',
       'kimi-coding',
       'minimax-portal',
       'minimax-portal-cn',
       'minimax-cn',
+      'doubao',
       'openrouter',
     ]);
   });
@@ -59,6 +63,7 @@ describe('provider_catalog › CATALOG', () => {
       'minimax-portal',
       'minimax-portal-cn',
       'minimax-cn',
+      'doubao',
     ]);
   });
 
@@ -145,18 +150,19 @@ describe('provider_catalog › labels and docs', () => {
   it('providerSubscriptionNote 在两条 Moonshot endpoint 上都给出明确前提', () => {
     // 用户反馈：开放平台按量付费和 Moonshot Coding Plan 订阅是两套独立账户，
     // 一张 key 不能两边通用。UI 必须在卡片/表单上把前提标清楚。
-    const moonshotNote = providerSubscriptionNote('moonshot');
-    const codingNote   = providerSubscriptionNote('kimi-coding');
-    expect(moonshotNote).toMatch(/开放平台/);
-    expect(moonshotNote).toMatch(/按量|付费/);
-    expect(codingNote).toMatch(/Coding Plan/);
-    expect(codingNote).toMatch(/订阅|月付/);
+    // catalog 把前提存成 i18n key（renderer 端 t() 翻译），这里验 key 命名
+    // 语义自带"paygo / subscription"区分，避免上线时两条混淆。
+    expect(providerSubscriptionNote('moonshot')).toBe('provider.moonshot.note_paygo');
+    expect(providerSubscriptionNote('kimi-coding')).toBe('provider.kimi_coding.note_subscription');
   });
 
-  it('providerSubscriptionNote 对没前提要求的 provider 返 undefined', () => {
+  it('providerSubscriptionNote 对没前提要求的 provider 返 undefined / 空串', () => {
+    // anthropic / openai 没声明 subscriptionNote → undefined；
+    // doubao 在 catalog 里显式写了空串占位 → 空串。两种都视为"无前提"。
     expect(providerSubscriptionNote('anthropic')).toBeUndefined();
     expect(providerSubscriptionNote('openai')).toBeUndefined();
     expect(providerSubscriptionNote('totally-unknown')).toBeUndefined();
+    expect(providerSubscriptionNote('doubao') || undefined).toBeUndefined();
   });
 });
 
@@ -166,7 +172,9 @@ describe('provider_catalog › EXTERNAL_API_PROVIDERS', () => {
     // `auth.ts::testConnection` 的分发依据——名单必须和 CATALOG 里真实
     // 标记为"外部"的 provider 严格一致，否则会出现"能选但调用报
     // No model found for provider"。
-    expect([...EXTERNAL_API_PROVIDERS]).toEqual(['moonshot']);
+    // 当前外部适配层支持：moonshot（OpenAI 兼容 endpoint）+ deepseek（pi-ai
+    // 0.68.1 不带）+ doubao（火山方舟）。
+    expect([...EXTERNAL_API_PROVIDERS]).toEqual(['moonshot', 'deepseek', 'doubao']);
   });
 
   it('每个外部 provider 都在 CATALOG + CURATED_MODELS 有对应条目', () => {

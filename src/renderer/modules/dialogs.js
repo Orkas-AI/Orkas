@@ -1,10 +1,14 @@
 // ─── Custom dialogs (replace native confirm/alert) ──────────────────────
 // Native `confirm()` / `alert()` render OS-locale buttons ("OK"/"Cancel").
-// These helpers give us 取消 / 确认 every time and match the rest of the
-// modal UI. Both return a Promise — callers must `await`.
+// These helpers give us a localized cancel / confirm pair every time
+// and match the rest of the modal UI. Both return a Promise — callers
+// must `await`.
 
-// Pre-boot, `t()` may not yet have tables loaded — fall back to Chinese
-// source strings so the dialog never renders blank if triggered early.
+// Pre-boot, `t()` may not yet have tables loaded — fall back to a
+// Chinese source string so the dialog never renders blank if triggered
+// early. (The fallback string itself is intentionally left as Chinese
+// to match the historical default; the i18n key takes over once tables
+// load.)
 function _dialogLabel(key, zhFallback) {
   try { const v = t(key); return v === key ? zhFallback : v; } catch (_) { return zhFallback; }
 }
@@ -14,8 +18,8 @@ function _uiShowDialog({ message, showCancel }) {
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay ui-dialog-overlay open';
     const msgHtml = escapeHtml(String(message || '')).replace(/\n/g, '<br />');
-    const cancelText = escapeHtml(_dialogLabel('common.cancel', '取消'));
-    const okText = escapeHtml(_dialogLabel('common.confirm', '确认'));
+    const cancelText = escapeHtml(_dialogLabel('common.cancel', 'Cancel'));
+    const okText = escapeHtml(_dialogLabel('common.confirm', 'Confirm'));
     overlay.innerHTML = `
       <div class="modal ui-dialog" role="dialog" aria-modal="true">
         <div class="ui-dialog-message">${msgHtml}</div>
@@ -59,15 +63,67 @@ function uiAlert(message) {
   return _uiShowDialog({ message, showCancel: false }).then(() => {});
 }
 
-// Text-input prompt with 取消 / 确认 buttons. Returns the entered string, or
+// Danger-styled confirm: title + multi-line message + custom danger button
+// label. The primary button uses .btn-danger (red) so the user sees the
+// destructive action signed by the action wording itself. Used by the
+// project delete flow ("delete project + N conversations") — generic enough
+// to adopt for other irreversible actions later.
+//
+// Returns true if the user confirmed (clicked the danger button), false on
+// cancel / outside click / Esc.
+function uiConfirmDanger({ title, message, dangerLabel, cancelLabel } = {}) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay ui-dialog-overlay open';
+    const titleHtml = title ? `<div class="ui-dialog-title">${escapeHtml(String(title))}</div>` : '';
+    const msgHtml = escapeHtml(String(message || '')).replace(/\n/g, '<br />');
+    const cancelText = escapeHtml(cancelLabel || _dialogLabel('common.cancel', 'Cancel'));
+    const dangerText = escapeHtml(dangerLabel || _dialogLabel('common.confirm', 'Confirm'));
+    overlay.innerHTML = `
+      <div class="modal ui-dialog ui-dialog-danger" role="dialog" aria-modal="true">
+        ${titleHtml}
+        <div class="ui-dialog-message">${msgHtml}</div>
+        <div class="modal-actions">
+          <button class="btn" data-act="cancel">${cancelText}</button>
+          <button class="btn btn-danger" data-act="ok">${dangerText}</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    const okBtn = overlay.querySelector('[data-act="ok"]');
+    const cancelBtn = overlay.querySelector('[data-act="cancel"]');
+    const onKey = (e) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === 'Escape') finish(false);
+      // Enter does NOT auto-fire danger — the user must explicitly click
+      // the red button. Reduces accidental confirmation on irreversible
+      // actions. (Standard uiConfirm keeps Enter-to-confirm.)
+    };
+    const finish = (val) => {
+      document.removeEventListener('keydown', onKey, true);
+      overlay.remove();
+      resolve(val);
+    };
+    okBtn.addEventListener('click', () => finish(true));
+    cancelBtn.addEventListener('click', () => finish(false));
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) finish(false);
+    });
+    document.addEventListener('keydown', onKey, true);
+    setTimeout(() => cancelBtn.focus(), 0);  // focus cancel by default — safer
+  });
+}
+
+// Text-input prompt with cancel / confirm buttons. Returns the entered string, or
 // null on cancel. Mirrors native `prompt()` semantics.
 function uiPrompt(message, defaultValue = '') {
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay ui-dialog-overlay open';
     const msgHtml = escapeHtml(String(message || '')).replace(/\n/g, '<br />');
-    const cancelText = escapeHtml(_dialogLabel('common.cancel', '取消'));
-    const okText = escapeHtml(_dialogLabel('common.confirm', '确认'));
+    const cancelText = escapeHtml(_dialogLabel('common.cancel', 'Cancel'));
+    const okText = escapeHtml(_dialogLabel('common.confirm', 'Confirm'));
     overlay.innerHTML = `
       <div class="modal ui-dialog" role="dialog" aria-modal="true">
         <div class="ui-dialog-message">${msgHtml}</div>

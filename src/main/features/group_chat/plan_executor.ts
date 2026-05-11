@@ -32,6 +32,7 @@ import {
   type PlanFile, type PlanStep, type FailurePolicy,
 } from './plan';
 import type { ChatFormPayload } from './router';
+import { buildMention } from './router';
 
 /** Per-cid mutex guarding plan-state transitions. Without this, when N
  * parallel-group agents finish nearly simultaneously, their reconcile
@@ -121,12 +122,16 @@ export interface TurnFinishedEvent {
   form?: ChatFormPayload;
   /** Files written via local-exec tools during this turn. */
   produced: string[];
-  /** Agent created or updated from `<agent>...</agent>` (commander only).
-   * `kind: 'created'` is the original quick-create flow; `kind: 'updated'`
-   * means an existing custom agent was patched in place — same chip slot,
-   * different label on the renderer side. Executor records but doesn't
-   * drive on it. */
-  createdAgent?: { agent_id: string; name: string; kind: 'created' | 'updated' };
+  /** Agents created or updated from `<agent>...</agent>` containers
+   * (commander only). One entry per successfully applied container.
+   * `kind: 'created'` is the quick-create flow; `kind: 'updated'` means an
+   * existing custom agent was patched. Executor records but doesn't drive
+   * on it. */
+  createdAgents?: Array<{ agent_id: string; name: string; kind: 'created' | 'updated' }>;
+  /** Skills created or updated from `<skill>...</skill>` containers
+   * (commander only). One entry per successfully applied container.
+   * Same shape as `createdAgents` entries; rendered as separate chips. */
+  createdSkills?: Array<{ skill_id: string; name: string; kind: 'created' | 'updated' }>;
   /** What kind of trigger caused this turn. Drives the state transition. */
   trigger: TurnTrigger;
   /** Number of non-error, non-final, non-done events the LLM stream emitted.
@@ -145,7 +150,14 @@ export interface TurnFinishedEvent {
  *   turn produces no user-visible output.
  */
 export type TurnOutcome =
-  | { kind: 'persist'; text: string; form?: ChatFormPayload; produced?: string[]; createdAgent?: { agent_id: string; name: string; kind: 'created' | 'updated' } }
+  | {
+      kind: 'persist';
+      text: string;
+      form?: ChatFormPayload;
+      produced?: string[];
+      createdAgents?: Array<{ agent_id: string; name: string; kind: 'created' | 'updated' }>;
+      createdSkills?: Array<{ skill_id: string; name: string; kind: 'created' | 'updated' }>;
+    }
   | { kind: 'silent' };
 
 export interface ReconcileCtx {
@@ -262,19 +274,25 @@ function outcomeForSynthTurn(evt: TurnFinishedEvent): TurnOutcome {
   if (evt.aborted) {
     return abortOutcome(evt);
   }
-  if (evt.errText) {
-    return { kind: 'persist', text: errorBubble(evt.errText) };
-  }
   if (evt.finalText && evt.finalText.trim()) {
+    // Keep the partial reply and append the error pill underneath when
+    // the stream errored mid-turn — otherwise the user loses everything
+    // the model already produced and only sees the error.
+    const body = evt.errText
+      ? `${evt.finalText}\n\n${errorBubble(evt.errText)}`
+      : evt.finalText;
     return {
       kind: 'persist',
-      text: evt.finalText,
+      text: body,
       ...(evt.produced.length ? { produced: evt.produced } : {}),
     };
   }
+  if (evt.errText) {
+    return { kind: 'persist', text: errorBubble(evt.errText) };
+  }
   // Empty final on a synth turn = user gets a placeholder so they at least
   // see "the plan finished but I had nothing more to add".
-  return { kind: 'persist', text: '（无回复）' };
+  return { kind: 'persist', text: '(no reply)' };
 }
 
 /** User-direct (or non-plan) turn outcome decision.
@@ -293,7 +311,7 @@ function outcomeForSynthTurn(evt: TurnFinishedEvent): TurnOutcome {
  * user sees nothing after their message lands. Real config / auth errors
  * still surface as an errorBubble.
  *
- * agent empty-final → always persist '（无回复）'.
+ * agent empty-final → always persist '(no reply)'.
  */
 async function outcomeForUserDirectTurn(uid: string, cid: string, evt: TurnFinishedEvent): Promise<TurnOutcome> {
   // Form-pause unblock: if this agent has a blocked step, treat THIS turn
@@ -322,16 +340,24 @@ async function outcomeForUserDirectTurn(uid: string, cid: string, evt: TurnFinis
   // case: agent emits ONLY an `agent-input-form` fenced block — bus's
   // form extraction strips the block, leaving finalText empty. Without
   // checking these signals first we'd fall through to the "agent empty"
-  // branch below and replace the actor's form with "（无回复）", losing
+  // branch below and replace the actor's form with "(no reply)", losing
   // the form widget entirely (the user-reported bug).
-  const hasSideEffect = !!evt.form || !!evt.createdAgent || (evt.produced && evt.produced.length > 0);
+  const hasSideEffect = !!evt.form || (!!evt.createdAgents && evt.createdAgents.length > 0) || (!!evt.createdSkills && evt.createdSkills.length > 0) || (evt.produced && evt.produced.length > 0);
   if ((evt.finalText && evt.finalText.trim()) || hasSideEffect) {
+    // When the stream errored mid-turn but partial text / side effects
+    // already landed, append the error pill instead of dropping the
+    // partial — same intent as outcomeForSynthTurn's branch above.
+    const partial = evt.finalText || '';
+    const body = evt.errText
+      ? (partial ? `${partial}\n\n${errorBubble(evt.errText)}` : errorBubble(evt.errText))
+      : partial;
     return {
       kind: 'persist',
-      text: evt.finalText || '',
+      text: body,
       ...(evt.form ? { form: evt.form } : {}),
       ...(evt.produced.length ? { produced: evt.produced } : {}),
-      ...(evt.createdAgent ? { createdAgent: evt.createdAgent } : {}),
+      ...(evt.createdAgents && evt.createdAgents.length ? { createdAgents: evt.createdAgents } : {}),
+      ...(evt.createdSkills && evt.createdSkills.length ? { createdSkills: evt.createdSkills } : {}),
     };
   }
   // Empty final, no side effects.
@@ -347,7 +373,7 @@ async function outcomeForUserDirectTurn(uid: string, cid: string, evt: TurnFinis
   }
   // agent empty + no side effects.
   if (evt.errText) return { kind: 'persist', text: errorBubble(evt.errText) };
-  return { kind: 'persist', text: '（无回复）' };
+  return { kind: 'persist', text: '(no reply)' };
 }
 
 /** Plan-step turn — apply state transition + return outcome for bus. */
@@ -366,7 +392,7 @@ async function applyPlanStepTurn(
   // the partial reply bus accumulated from delta events); if there's nothing
   // to salvage AND no side effect, go silent so the renderer's turn_silent
   // handler can either freeze the process rail as a "thinking trail" bubble
-  // or remove the placeholder entirely. Avoids the orphan "（已中断）" bubble
+  // or remove the placeholder entirely. Avoids the orphan "(stopped)" bubble
   // for turns that aborted before producing anything visible.
   if (evt.aborted) {
     await transitionStepFailed(uid, cid, step, 'aborted by user', '');
@@ -420,7 +446,7 @@ async function applyPlanStepTurn(
     if (evt.actor.kind === 'commander') return { kind: 'silent' };
     // agent empty: persist placeholder, mark done so plan can advance.
     await transitionStepDone(uid, cid, step, '', evt.produced, '');
-    return { kind: 'persist', text: '（无回复）' };
+    return { kind: 'persist', text: '(no reply)' };
   }
 
   // Normal success.
@@ -429,7 +455,8 @@ async function applyPlanStepTurn(
     kind: 'persist',
     text: evt.finalText,
     ...(evt.produced.length ? { produced: evt.produced } : {}),
-    ...(evt.createdAgent ? { createdAgent: evt.createdAgent } : {}),
+    ...(evt.createdAgents && evt.createdAgents.length ? { createdAgents: evt.createdAgents } : {}),
+    ...(evt.createdSkills && evt.createdSkills.length ? { createdSkills: evt.createdSkills } : {}),
   };
 }
 
@@ -501,7 +528,7 @@ function errorBubble(msg: string): string {
 }
 
 /** Outcome for an aborted turn. Returns the salvageable content (partial
- * streamed reply + any user-visible side effects), with NO "（已中断）"
+ * streamed reply + any user-visible side effects), with NO "(stopped)"
  * suffix — bus appends that once, after merging in any staged plan
  * announcement, so the marker always lands at the end regardless of which
  * pieces survived.
@@ -509,19 +536,20 @@ function errorBubble(msg: string): string {
  * No salvageable content AND no side effect → silent. The renderer's
  * `turn_silent` handler then either freezes the process rail (tool calls
  * etc.) as a thinking-trail bubble or removes the placeholder entirely.
- * Skipping the persist here is what prevents the orphan "（已中断）" bubble
+ * Skipping the persist here is what prevents the orphan "(stopped)" bubble
  * for turns that aborted before producing anything visible.
  */
 function abortOutcome(evt: TurnFinishedEvent): TurnOutcome {
   const partial = (evt.finalText || '').trim();
-  const hasSideEffect = !!evt.form || !!evt.createdAgent || (evt.produced && evt.produced.length > 0);
+  const hasSideEffect = !!evt.form || (!!evt.createdAgents && evt.createdAgents.length > 0) || (!!evt.createdSkills && evt.createdSkills.length > 0) || (evt.produced && evt.produced.length > 0);
   if (!partial && !hasSideEffect) return { kind: 'silent' };
   return {
     kind: 'persist',
     text: evt.finalText || '',
     ...(evt.form ? { form: evt.form } : {}),
     ...(evt.produced && evt.produced.length ? { produced: evt.produced } : {}),
-    ...(evt.createdAgent ? { createdAgent: evt.createdAgent } : {}),
+    ...(evt.createdAgents && evt.createdAgents.length ? { createdAgents: evt.createdAgents } : {}),
+    ...(evt.createdSkills && evt.createdSkills.length ? { createdSkills: evt.createdSkills } : {}),
   };
 }
 
@@ -841,9 +869,9 @@ async function dispatchStep(
 function assigneeDisplayPrefix(assignee: string): string {
   // The bus's @<id> → @<name> rewrite handles the case where assignee was an
   // id; here we just ensure the message starts with `@<assignee>` so the
-  // user sees who got dispatched.
-  const stripped = assignee.replace(/^@+/, '').trim();
-  return `@${stripped.replace(/\s+/g, '')}`;
+  // user sees who got dispatched. `buildMention` preserves whitespace (see
+  // its header).
+  return buildMention(assignee.replace(/^@+/, ''));
 }
 
 // ── Plan-complete signal ─────────────────────────────────────────────────

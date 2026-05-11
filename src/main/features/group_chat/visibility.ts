@@ -50,9 +50,13 @@ export interface GroupMessage {
   /** Form widget payload — only on agent messages whose final text contained
    * a fenced agent-input-form block. */
   form?: import('./router').ChatFormPayload;
-  /** Quick-created agent meta — only on commander messages whose final text
-   * contained an `<agent>` container. */
-  created_agent?: { agent_id: string; name: string };
+  /** Quick-created / quick-edited agent meta — populated when the commander's
+   * final text contained one or more `<agent>` containers. One entry per
+   * successfully applied container; failed applications are not recorded. */
+  created_agents?: Array<{ agent_id: string; name: string; kind?: 'created' | 'updated' }>;
+  /** Mirror of `created_agents` for skills — populated when the commander's
+   * final text contained one or more `<skill>` containers. */
+  created_skills?: Array<{ skill_id: string; name: string; kind?: 'created' | 'updated' }>;
   /** Marks this message as a plan announcement (rendered with a folded
    * plan card in UI). Set by `plan_set` first-time emission. */
   plan_announcement?: boolean;

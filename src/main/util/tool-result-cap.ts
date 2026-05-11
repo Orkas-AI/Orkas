@@ -1,20 +1,21 @@
 /**
- * Tool-result size cap + oversized-output persistence (仿 Claude Code 的
- * `maxResultSizeChars` + `<persisted-output>` 机制)。
+ * Tool-result size cap + oversized-output persistence (mirrors Claude Code's
+ * `maxResultSizeChars` + `<persisted-output>` mechanism).
  *
- * 每个 AgentTool 在 runner.ts 工具组装的最后一步统一过 `wrapToolWithCap`。
- * 三级处理：
- *   len ≤ maxChars            → 原样透传
- *   maxChars < len ≤ PERSIST  → 就地截断 + 尾标
- *   len > PERSIST             → 落盘到 tool-results/<sid>/<name>.<id>.txt，
- *                                tool_result 改写成 <persisted-output> 包
- *                                的 preview + 引用；模型真要看原文调
- *                                read_file(path) 拉回
+ * Every AgentTool is wrapped by `wrapToolWithCap` as the last step of tool
+ * assembly in runner.ts. Three-tier handling:
+ *   len ≤ maxChars            → pass through unchanged
+ *   maxChars < len ≤ PERSIST  → in-place truncation + trailing marker
+ *   len > PERSIST             → spill to tool-results/<sid>/<name>.<id>.txt,
+ *                                rewrite tool_result into a <persisted-output>
+ *                                wrapper (preview + reference); the model can
+ *                                pull the original back via read_file(path)
  *
- * Read-类工具（`read_file` / `kb_read`）上限 = Infinity，装饰器直接返回原工具
- * 不介入 —— 这些输出的文件内容模型可能反复核对，不能被清掉。
+ * Read-class tools (`read_file` / `kb_read`) have a cap of Infinity and the
+ * decorator returns the original tool untouched — the model may re-inspect
+ * file content repeatedly, so it must not be wiped.
  *
- * 纯函数 util：只用 Node stdlib，不 import features/ / model/。
+ * Pure-function util: Node stdlib only, never imports features/ or model/.
  */
 
 import * as fs from 'fs';
@@ -27,13 +28,15 @@ const log = createLogger('util/tool-result-cap');
 
 // ── Config ───────────────────────────────────────────────────────────────
 
-/** 每工具允许回灌上下文的最大字符数。表外走 DEFAULT_MAX_RESULT_CHARS。
- *  Infinity = 豁免装饰器，直接透传。常量照抄 Claude Code 源码：
+/** Per-tool maximum characters allowed back into the context. Tools not in the
+ *  table use DEFAULT_MAX_RESULT_CHARS.
+ *  Infinity = decorator exempt, pass-through. Constants copied from Claude Code:
  *    src/tools/BashTool/BashTool.tsx:424 = 30_000
  *    src/tools/GrepTool/GrepTool.ts:164  = 20_000
  *    src/tools/FileReadTool/FileReadTool.ts:342 = Infinity
- *    其它 = 100_000
- *  PDF / write_file 设小值因为它们只返回路径/状态字符串，没必要给 100K 余量。
+ *    others = 100_000
+ *  PDF / write_file get small values because they only return path/status
+ *  strings — no point giving them 100K headroom.
  */
 export const MAX_RESULT_CHARS_BY_TOOL: Record<string, number> = {
   read_file: Infinity,
@@ -52,35 +55,41 @@ export const MAX_RESULT_CHARS_BY_TOOL: Record<string, number> = {
 
 export const DEFAULT_MAX_RESULT_CHARS = 100_000;
 
-/** 超过此阈值触发落盘（仿 Claude Code src/constants/toolLimits.ts:13 = 50_000）。
- *  阈值 < maxChars 的工具（bash 30K / grep 20K）永远不会走落盘分支——
- *  它们在 maxChars 就截断了。只有 maxChars ≥ 50K 的工具（web_fetch 100K 等）
- *  才有机会落盘。 */
+/** Threshold above which we spill to disk (mirrors Claude Code
+ *  src/constants/toolLimits.ts:13 = 50_000).
+ *  Tools whose maxChars < threshold (bash 30K / grep 20K) never reach the
+ *  spill branch — they get truncated at maxChars. Only tools with
+ *  maxChars ≥ 50K (web_fetch 100K etc.) can ever spill. */
 export const PERSIST_THRESHOLD = 50_000;
 
-/** 落盘后回灌给模型的 preview：开头 + 结尾（中间用 `[N chars omitted]` 占位）。
- *  2000 / 500 的比例偏向头部——tool 输出大多前缀信息量密度高。 */
+/** Preview returned to the model after a spill: head + tail (with
+ *  `[N chars omitted]` placeholder in the middle). The 2000 / 500 ratio
+ *  favors the head — tool outputs usually have higher information density
+ *  near the start. */
 const PREVIEW_HEAD = 2000;
 const PREVIEW_TAIL = 500;
 
 // ── Wrapping ─────────────────────────────────────────────────────────────
 
 export interface WrapOpts {
-  /** 该工具的 maxChars 上限。Infinity → 装饰器直接返回原工具。 */
+  /** maxChars cap for this tool. Infinity → decorator returns the original
+   *  tool directly. */
   maxChars: number;
-  /** 落盘目录（一般是 `sessionToolResultsDir(uid, sessionId)`）。
-   *  装饰器不关心 uid / sessionId，调用方组装好传进来。
-   *  目录按需 mkdir，不预先强制存在。 */
+  /** Spill directory (typically `sessionToolResultsDir(uid, sessionId)`).
+   *  The decorator does not care about uid / sessionId; the caller assembles
+   *  the path and passes it in. The directory is mkdir'd on demand, not
+   *  required to exist beforehand. */
   toolResultsDir: string;
 }
 
 export function wrapToolWithCap(tool: AgentTool, opts: WrapOpts): AgentTool {
-  // Infinity = 豁免（read_file / kb_read）：模型可能对同一文件内容反复核对，
-  // 不能被截 / 落盘。
+  // Infinity = exempt (read_file / kb_read): the model may repeatedly
+  // re-check the same file contents, so they must not be truncated / spilled.
   if (!Number.isFinite(opts.maxChars)) return tool;
 
-  // per-session 目录的 basename 正好是 session_id —— 不额外传 sessionId
-  // 参数保持装饰器接口最小，日志里又能标明来源。
+  // The per-session directory's basename IS the session_id — keeping the
+  // decorator interface minimal (no extra sessionId parameter) while still
+  // letting the logs identify the source.
   const sid = path.basename(opts.toolResultsDir);
 
   return {
@@ -93,28 +102,32 @@ export function wrapToolWithCap(tool: AgentTool, opts: WrapOpts): AgentTool {
       const len = content.length;
       if (len <= opts.maxChars) return result;
 
-      // 错误结果：只截断不落盘 —— 错误 stderr 值得回灌一段给模型定位，但整条
-      // 大文本落盘成孤儿文件没价值。
+      // Error result: truncate only, never spill — error stderr is worth
+      // feeding back a slice for the model to triage, but spilling huge
+      // error text as orphan files has no value.
       if (result.isError) {
         log.info(`truncated (error) tool=${tool.name} session=${sid} len=${len} cap=${opts.maxChars} removed=${len - opts.maxChars}`);
         return { ...result, content: truncate(content, opts.maxChars, tool.name) };
       }
 
-      // 正常结果但超阈值未到落盘线：就地截断 + 尾标。
+      // Normal result over cap but below the spill threshold: in-place
+      // truncation + trailing marker.
       if (len <= PERSIST_THRESHOLD) {
         log.info(`truncated tool=${tool.name} session=${sid} len=${len} cap=${opts.maxChars} removed=${len - opts.maxChars}`);
         return { ...result, content: truncate(content, opts.maxChars, tool.name) };
       }
 
-      // 正常结果超过落盘线：原文落盘，返回 <persisted-output> 引用。
+      // Normal result over the spill threshold: spill the full text and
+      // return a <persisted-output> reference.
       try {
         const absPath = persistToolResult(opts.toolResultsDir, tool.name, content);
         log.info(`persisted tool=${tool.name} session=${sid} size=${len} path=${absPath}`);
         return { ...result, content: buildPersistedOutputMarker(absPath, tool.name, content) };
       } catch (err) {
-        // 磁盘写入失败降级为就地截断 —— 模型至少拿到前 maxChars 字符，
-        // 比彻底截断更有用。warn 级别是因为这是实际的 I/O 异常（磁盘满 /
-        // 权限丢），用户能从日志里追根溯源。
+        // Disk-write failure degrades to in-place truncation — the model
+        // at least gets the first maxChars characters, which is more useful
+        // than a hard cut. warn level because this is a real I/O exception
+        // (disk full / permission lost) and the user can trace it from logs.
         log.warn(`persist failed, falling back to truncate tool=${tool.name} session=${sid} size=${len}: ${(err as Error).message}`);
         return {
           ...result,
@@ -169,9 +182,10 @@ export function buildPersistedOutputMarker(
 
 // ── Sweep ────────────────────────────────────────────────────────────────
 
-/** 启动期清扫：删除 mtime 超过 `maxAgeDays` 的子目录 / 文件。Best-effort
- *  (nothrow)：目录不存在、某个文件读不到 stat，都安静跳过。每个 uid
- *  激活时调一次（users.ts::activateUser）。 */
+/** Startup sweep: deletes sub-directories / files whose mtime is older than
+ *  `maxAgeDays`. Best-effort (nothrow): missing directory or unstattable
+ *  entries are silently skipped. Called once per uid activation
+ *  (users.ts::activateUser). */
 export function sweepToolResults(userToolResultsDir: string, maxAgeDays = 7): void {
   if (!fs.existsSync(userToolResultsDir)) return;
   const cutoffMs = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;

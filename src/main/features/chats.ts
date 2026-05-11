@@ -27,6 +27,7 @@ import {
   readJson, writeJson, invalidateLineCount, readJsonl,
 } from '../storage';
 import { createLogger } from '../logger';
+import { t } from '../i18n';
 
 const log = createLogger('chats');
 import * as search from './search';
@@ -50,6 +51,12 @@ export interface Conversation {
    * agents in the group have their own per-(conv,agent) session ids derived
    * via state.buildGmemberSessionId. */
   session_id: string;
+  /** Optional project membership. Frozen at create time; not mutable after
+   *  creation. Empty / absent → conversation lives outside any project (the
+   *  default sidebar group). The project itself is just metadata —
+   *  `<cid>.jsonl`, `groupChatDir`, `chat_attachments`, and `session_id`
+   *  paths stay verbatim, so cid uniqueness + §5 isolation are unaffected. */
+  project_id?: string;
   created_at: string;
   updated_at: string;
   /** Derived from group_chat state.json at read time; never persisted on
@@ -91,7 +98,7 @@ export async function listConversations(userId: string): Promise<Conversation[]>
   //   2. bus is mid-flush — e.g. user clicked abort while a tool was in
   //      flight; state.json flips to 'aborted' immediately but the worker's
   //      runTurn still has to unwind (await tool finish → outcome → enqueue
-  //      the "（已中断）" + processItems message). On-disk status looks
+  //      the "(stopped)" + processItems message). On-disk status looks
   //      terminal but jsonl is still growing. If the renderer reloads in
   //      this window (Cmd+R right after stop) and we say processing=false,
   //      it stops polling and never picks up the late abort message — user
@@ -110,11 +117,23 @@ export async function listConversations(userId: string): Promise<Conversation[]>
     // Last-activity timestamp for sidebar ordering. <cid>.jsonl mtime is
     // touched whenever the bus appends a message; falls back to the
     // index's updated_at / created_at when the file isn't there yet.
-    let lastActiveAt = c.updated_at || c.created_at || '';
+    //
+    // CAREFUL: `nowIso()` returns local-time ISO without `Z` suffix
+    // ("2026-05-07T15:00:00") while `mtime.toISOString()` is UTC with `Z`
+    // ("2026-05-07T07:00:00.000Z"). String-comparing the two formats
+    // ignores the timezone offset — at UTC+8 a local-time string compares
+    // 8h "ahead" of the same instant in UTC, so updated_at would always
+    // appear newer than mtime and the sidebar would order by creation
+    // time instead of actual last activity. Compare on numeric ms and
+    // emit a UTC ISO so the downstream sort can string-compare safely.
+    const updatedMs = c.updated_at ? new Date(c.updated_at).getTime() : 0;
+    const createdMs = c.created_at ? new Date(c.created_at).getTime() : 0;
+    let lastActiveMs = Math.max(updatedMs || 0, createdMs || 0);
     try {
-      const mtime = fs.statSync(path.join(dir, `${c.conversation_id}.jsonl`)).mtime.toISOString();
-      if (mtime > lastActiveAt) lastActiveAt = mtime;
+      const mtimeMs = fs.statSync(path.join(dir, `${c.conversation_id}.jsonl`)).mtime.getTime();
+      if (mtimeMs > lastActiveMs) lastActiveMs = mtimeMs;
     } catch { /* missing jsonl — keep updated_at */ }
+    const lastActiveAt = lastActiveMs ? new Date(lastActiveMs).toISOString() : (c.updated_at || c.created_at || '');
     out.push({ ...c, processing, processing_since: since, last_active_at: lastActiveAt });
   }
   out.sort((a, b) => (b.last_active_at || '').localeCompare(a.last_active_at || ''));
@@ -140,19 +159,24 @@ export interface CreateConversationOptions {
   agentId?: string;
   skillId?: string;
   title?: string;
+  /** Optional project membership. Caller (IPC layer) is responsible for
+   *  validating the projectId exists for this user — chats.ts persists it
+   *  verbatim. */
+  projectId?: string;
 }
 
 export async function createConversation(userId: string, {
-  kind = 'normal', agentId = '', skillId = '', title = '',
+  kind = 'normal', agentId = '', skillId = '', title = '', projectId = '',
 }: CreateConversationOptions = {}): Promise<Conversation> {
   const cid = genConversationId();
   const conv: Conversation = {
     conversation_id: cid,
-    title: title || '新对话',
+    title: title || t('chat.default_title'),
     kind,
     agent_id: agentId || '',
     skill_id: skillId || '',
     session_id: buildGconvSessionId(userId, cid),
+    ...(projectId ? { project_id: projectId } : {}),
     created_at: nowIso(),
     updated_at: nowIso(),
   };
@@ -161,7 +185,7 @@ export async function createConversation(userId: string, {
   await saveConversations(userId, items);
   // Touch jsonl so subsequent reads don't 404.
   await fsp.writeFile(path.join(ensureUserDir(userId), `${cid}.jsonl`), '', { flag: 'a' });
-  log.info(`created user=${userId} cid=${cid} kind=${kind} agent=${agentId || '-'} skill=${skillId || '-'}`);
+  log.info(`created user=${userId} cid=${cid} kind=${kind} agent=${agentId || '-'} skill=${skillId || '-'} project=${projectId || '-'}`);
   return conv;
 }
 
@@ -243,6 +267,26 @@ export async function getMessages(userId: string, cid: string, limit = 200): Pro
   return readJsonl<MessageRecord>(path.join(ensureUserDir(userId), `${cid}.jsonl`), limit);
 }
 
+/** Drop every conversation belonging to `userId`. Loops `deleteConversation`
+ *  so the full cascade (group dir / main jsonl / sessions / attachments / CLI
+ *  / search index) runs per cid; one cid's failure doesn't abort the rest.
+ *  Returns the number actually removed. Used by Settings → "Clear all
+ *  conversations". */
+export async function deleteAllConversations(userId: string): Promise<number> {
+  const items = await listConversations(userId);
+  if (!items.length) return 0;
+  let deleted = 0;
+  for (const c of items) {
+    try {
+      if (await deleteConversation(userId, c.conversation_id)) deleted++;
+    } catch (err) {
+      log.warn(`bulk-delete failed user=${userId} cid=${c.conversation_id}: ${(err as Error).message}`);
+    }
+  }
+  log.info(`deleted-all user=${userId} count=${deleted}`);
+  return deleted;
+}
+
 /** Drop every conversation tied to `agentId` across every user. Called when
  *  a custom agent is deleted. */
 export async function deleteConversationsByAgent(agentId: string): Promise<number> {
@@ -269,9 +313,9 @@ export async function deleteConversationsByAgent(agentId: string): Promise<numbe
 }
 
 export function autoTitle(content: string): string {
-  let t = (content || '').trim().replace(/\n/g, ' ');
-  if (t.length > 40) t = t.slice(0, 40) + '…';
-  return t || '新对话';
+  let text = (content || '').trim().replace(/\n/g, ' ');
+  if (text.length > 40) text = text.slice(0, 40) + '…';
+  return text || t('chat.default_title');
 }
 
 // ── Boot-time stale state sweep ──────────────────────────────────────────

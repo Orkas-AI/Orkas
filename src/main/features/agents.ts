@@ -8,7 +8,7 @@
  * Schema (one JSON per agent):
  *   { agent_id, name, description, workflow, created_at, updated_at }
  *
- * The inline "编辑" chat lets the LLM refine an agent by emitting one
+ * The inline "edit" chat lets the LLM refine an agent by emitting one
  * `<agent>...</agent>` container per turn, whose children are the fields
  * to update: `<name>` / `<description>` / `<workflow>` / `<skills>` /
  * `<inputs>`. Each child is a full-replacement update for that field.
@@ -58,7 +58,7 @@ export interface AgentInputOption {
  * Populated by the agent-edit LLM (or commander quick-create) via the
  * `<inputs>` child of the `<agent>` update container; consumed at run
  * time by the agent itself per `chat_agent_in_group.md` § inputs_schema
- * 触发的强制确认 (it emits a fenced `agent-input-form` block when fields
+ * mandatory-confirmation trigger (it emits a fenced `agent-input-form` block when fields
  * are missing or low-confidence) and by the chat-bubble form widget
  * (renderer renders it). */
 export interface AgentInput {
@@ -172,8 +172,10 @@ export type AgentRuntime =
       custom_args?: string[];
     };
 
-// 头像 token 校验走 catalog 白名单（src/main/data/avatars.json 是单一真相源）。
-// renderer/modules/avatar.js 也从同一份文件拉数据，前后端不再有任何重复。
+// Avatar tokens are validated against the catalog allow-list
+// (src/main/data/avatars.json is the single source of truth).
+// renderer/modules/avatar.js pulls from the same file, so frontend and
+// backend never duplicate it.
 import * as avatars from './avatars';
 
 export interface AgentChatMeta { session_id?: string; [k: string]: unknown }
@@ -265,17 +267,18 @@ const INPUT_ID_RE = /^[a-z_][a-z0-9_]{0,31}$/;
 const ALLOWED_INPUT_TYPES: readonly AgentInputType[] = ['text', 'textarea', 'select', 'multiselect', 'number', 'boolean', 'file', 'directory'];
 
 // Reserved agent display names — collide with the commander role surfaced in
-// the chat-recipient chip ("指挥官") and the sidebar tab ("总指挥"). The bus
-// router also keys "commander" as a member id, so we guard the English form
-// too. Comparison is case-insensitive after stripping all whitespace, so
-// "  Commander " or "总 指挥" all resolve to the same canonical key.
+// the chat-recipient chip and the sidebar tab (Chinese localizations are
+// "指挥官" and "总指挥" respectively). The bus router also keys "commander"
+// as a member id, so we guard the English form too. Comparison is
+// case-insensitive after stripping all whitespace, so "  Commander " or
+// the spaced Chinese form "总 指挥" all resolve to the same canonical key.
 const RESERVED_AGENT_NAMES = new Set(['指挥官', '总指挥', 'commander']);
 function _agentNameKey(name: string): string {
   return String(name || '').replace(/\s+/g, '').toLowerCase();
 }
 function assertAgentNameAllowed(name: string): void {
   const key = _agentNameKey(name);
-  if (!key) return; // empty handled elsewhere (defaults to "未命名智能体")
+  if (!key) return; // empty handled elsewhere (defaults to t('agent.default_name'))
   if (RESERVED_AGENT_NAMES.has(key)) {
     const err: any = new Error(`agent name "${name}" is reserved`);
     err.code = 'E_AGENT_NAME_RESERVED';
@@ -287,7 +290,7 @@ function assertAgentNameAllowed(name: string): void {
 // Agent names must round-trip through the @-mention regex used by the
 // router (`router.ts::TOKEN_CLASS = [A-Za-z0-9_一-鿿-]`) — slashes,
 // backslashes, dots, parens, control chars etc. either truncate the
-// match (so `@Agent/Skill搜罗大师` only matches `Agent`) or escape the
+// match (e.g. `@Agent/SkillSomeName` only matches `Agent`) or escape the
 // alternation arm at the regex stage. We additionally cap length and
 // allow a single internal space so multi-word display names
 // ("Code Review Helper") still resolve via the alternation. Leading /
@@ -420,10 +423,14 @@ export function validateAgentInputs(raw: unknown): AgentInput[] {
       }
       def = b;
     } else if (type === 'select') {
-      // prompt(chat_agent_in_group.md)明示运行时弹的 form 允许"空表单(不带 default)"。
-      // 旧逻辑对缺/非法 default 直接 drop 整个 field,fields 全空 → form 不挂 →
-      // raw <agent-input-form> XML 被 markdown 当未知 HTML 渲染 = 用户看到样式崩。
-      // 优雅降级:fallback 到 options[0].value(对应浏览器 <select> 默认显示首项的行为)。
+      // The prompt (chat_agent_in_group.md) explicitly allows the runtime
+      // form to render an "empty form" (one without a default selection).
+      // The old logic dropped the whole field on a missing/invalid
+      // default, so all-empty fields → no form rendered → the raw
+      // `<agent-input-form>` XML got rendered by markdown as unknown
+      // HTML, breaking the user's styling. Graceful fallback: use
+      // options[0].value (matching the browser's default-first-option
+      // behavior for `<select>`).
       const v = typeof e.default === 'string' ? e.default : '';
       if (v && options!.some((o) => o.value === v)) {
         def = v;
@@ -710,7 +717,7 @@ export async function createCustomAgent(
   const desc = resolveBilingualDescription(description, description_zh, description_en);
   const data: AgentRaw = {
     agent_id: agentId,
-    name: String(name || '').trim() || '未命名智能体',
+    name: String(name || '').trim() || t('agent.default_name'),
     description_zh: desc.description_zh,
     description_en: desc.description_en,
     workflow: String(workflow || ''),
@@ -953,7 +960,7 @@ export async function updateCustomAgent(
     else if (without.length) data.inputs = without;
     else delete data.inputs;
   }
-  if (!data.name) data.name = '未命名智能体';
+  if (!data.name) data.name = t('agent.default_name');
   data.updated_at = nowIso();
   await writeJson(f, data);
   _invalidateAgentListCache();
@@ -1000,8 +1007,9 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
   if (!agentId) return false;
   const dir = agentDir(getActiveUserId(), agentId);
   if (!fs.existsSync(dir)) return false;
-  // 一刀切 `agents/<aid>/` 整个目录:agent.json + meta/ + skills/ 都在里面,
-  // 不再需要单独 cascade metacognition.purgeAgent / SkillStore.delete。
+  // Wipe the whole `agents/<aid>/` directory in one shot — agent.json,
+  // meta/, and skills/ all live inside it, so we no longer need separate
+  // cascades for metacognition.purgeAgent / SkillStore.delete.
   try { await fsp.rm(dir, { recursive: true, force: true }); }
   catch (err) { log.warn(`rm failed ${dir}: ${(err as Error).message}`); return false; }
   _invalidateAgentListCache();
@@ -1040,8 +1048,9 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
   } catch (err) {
     log.warn(`cascade chat cleanup failed for ${agentId}: ${(err as Error).message}`);
   }
-  // Metacognition + evolved skills 已随 `rm -rf agents/<aid>/` 一并删除——
-  // meta / skills 子目录就在这棵树里。无需单独 purge。
+  // Metacognition + evolved skills are already wiped by the
+  // `rm -rf agents/<aid>/` above — meta / skills sub-directories live
+  // inside that tree. No separate purge is needed.
 
   log.info(`deleted id=${agentId}`);
   return true;
@@ -1055,7 +1064,8 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
 // `<description>`, `<workflow>`, `<skills>`, `<inputs>`. One container per
 // turn gives us atomic extraction (all fields in or none) and a single
 // placeholder to stream-hide. Shared between agent-edit chat and main-chat
-// quick-create; see `chat_agent_setup.md` / `chat_commander.md` § 创建智能体.
+// quick-create; see the "Create agent" section of
+// `chat_agent_setup.md` / `chat_commander.md`.
 const AGENT_CONTAINER_RE = /<agent>([\s\S]*?)<\/agent>/g;
 const AGENT_CHILD_RE = (tag: string) => new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`);
 
@@ -1084,80 +1094,91 @@ export interface ExtractedFields {
   interactive?: boolean;
 }
 
-export function extractAgentFieldBlocks(text: string): { cleanText: string; fields: ExtractedFields } {
-  if (!text || text.indexOf('<agent>') < 0) return { cleanText: text, fields: {} };
+function _parseAgentBlock(inner: string): ExtractedFields {
   const fields: ExtractedFields = {};
-  // Only parse the FIRST container in a turn — the LLM is instructed to
-  // emit one per reply. Subsequent containers (shouldn't happen) still get
-  // stripped below via the global-flag replace.
-  const first = text.match(/<agent>([\s\S]*?)<\/agent>/);
-  if (first) {
-    const inner = first[1];
-    const aidM = inner.match(AGENT_CHILD_RE('agent_id'));
-    if (aidM) {
-      const v = aidM[1].trim();
-      if (safeId(v)) fields.agent_id = v;
-    }
-    const nameM = inner.match(AGENT_CHILD_RE('name'));
-    if (nameM) {
-      const v = nameM[1].trim();
-      if (v) fields.name = v;
-    }
-    const descM = inner.match(AGENT_CHILD_RE('description'));
-    if (descM) {
-      const v = descM[1].trim();
-      if (v) fields.description = v;
-    }
-    const descZhM = inner.match(AGENT_CHILD_RE('description_zh'));
-    if (descZhM) {
-      const v = descZhM[1].trim();
-      if (v) fields.description_zh = v;
-    }
-    const descEnM = inner.match(AGENT_CHILD_RE('description_en'));
-    if (descEnM) {
-      const v = descEnM[1].trim();
-      if (v) fields.description_en = v;
-    }
-    const wfM = inner.match(AGENT_CHILD_RE('workflow'));
-    if (wfM) {
-      const v = wfM[1].trim();
-      if (v) fields.workflow = v;
-    }
-    const skM = inner.match(AGENT_CHILD_RE('skills'));
-    if (skM) {
-      // One skill_id per line; empty body / all-blanks → explicit []
-      // (zero skills). Non-safeId entries are dropped with no warning.
-      fields.skill_list = skM[1]
-        .split(/\r?\n/)
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0 && safeId(s));
-    }
-    const inM = inner.match(AGENT_CHILD_RE('inputs'));
-    if (inM) {
-      const trimmed = inM[1].trim();
-      if (trimmed === '' || trimmed === '[]') {
-        fields.inputs = [];
-      } else {
-        try {
-          const parsed = JSON.parse(trimmed);
-          fields.inputs = validateAgentInputs(parsed);
-        } catch (err) {
-          log.warn(`<inputs> JSON parse failed: ${(err as Error).message}`);
-          // Leave fields.inputs unset — malformed JSON shouldn't erase the
-          // previous schema; let the next turn re-emit and fix it.
-        }
+  const aidM = inner.match(AGENT_CHILD_RE('agent_id'));
+  if (aidM) {
+    const v = aidM[1].trim();
+    if (safeId(v)) fields.agent_id = v;
+  }
+  const nameM = inner.match(AGENT_CHILD_RE('name'));
+  if (nameM) {
+    const v = nameM[1].trim();
+    if (v) fields.name = v;
+  }
+  const descM = inner.match(AGENT_CHILD_RE('description'));
+  if (descM) {
+    const v = descM[1].trim();
+    if (v) fields.description = v;
+  }
+  const descZhM = inner.match(AGENT_CHILD_RE('description_zh'));
+  if (descZhM) {
+    const v = descZhM[1].trim();
+    if (v) fields.description_zh = v;
+  }
+  const descEnM = inner.match(AGENT_CHILD_RE('description_en'));
+  if (descEnM) {
+    const v = descEnM[1].trim();
+    if (v) fields.description_en = v;
+  }
+  const wfM = inner.match(AGENT_CHILD_RE('workflow'));
+  if (wfM) {
+    const v = wfM[1].trim();
+    if (v) fields.workflow = v;
+  }
+  const skM = inner.match(AGENT_CHILD_RE('skills'));
+  if (skM) {
+    // One skill_id per line; empty body / all-blanks → explicit []
+    // (zero skills). Non-safeId entries are dropped with no warning.
+    fields.skill_list = skM[1]
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0 && safeId(s));
+  }
+  const inM = inner.match(AGENT_CHILD_RE('inputs'));
+  if (inM) {
+    const trimmed = inM[1].trim();
+    if (trimmed === '' || trimmed === '[]') {
+      fields.inputs = [];
+    } else {
+      try {
+        const parsed = JSON.parse(trimmed);
+        fields.inputs = validateAgentInputs(parsed);
+      } catch (err) {
+        log.warn(`<inputs> JSON parse failed: ${(err as Error).message}`);
+        // Leave fields.inputs unset — malformed JSON shouldn't erase the
+        // previous schema; let the next turn re-emit and fix it.
       }
     }
-    const itM = inner.match(AGENT_CHILD_RE('interactive'));
-    if (itM) {
-      const v = itM[1].trim().toLowerCase();
-      if (v === 'true') fields.interactive = true;
-      else if (v === 'false') fields.interactive = false;
-      // Any other body → leave key omitted; previous flag survives.
-    }
+  }
+  const itM = inner.match(AGENT_CHILD_RE('interactive'));
+  if (itM) {
+    const v = itM[1].trim().toLowerCase();
+    if (v === 'true') fields.interactive = true;
+    else if (v === 'false') fields.interactive = false;
+    // Any other body → leave key omitted; previous flag survives.
+  }
+  return fields;
+}
+
+/**
+ * Extract every `<agent>...</agent>` container in emission order. Each
+ * block is parsed independently; a malformed sub-tag in one block does
+ * not affect the others. Returns `blocks: []` when no container exists.
+ */
+export function extractAgentFieldBlocks(
+  text: string,
+): { cleanText: string; blocks: ExtractedFields[] } {
+  if (!text || text.indexOf('<agent>') < 0) return { cleanText: text, blocks: [] };
+  const blocks: ExtractedFields[] = [];
+  // Iterate every container with the global-flag regex (NOT just the
+  // first). `AGENT_CONTAINER_RE` carries `/g` so successive `.exec` calls
+  // walk forward; we use `matchAll` for a flat collection.
+  for (const m of text.matchAll(AGENT_CONTAINER_RE)) {
+    blocks.push(_parseAgentBlock(m[1]));
   }
   const cleaned = text.replace(AGENT_CONTAINER_RE, '').replace(/\n{3,}/g, '\n\n').trim();
-  return { cleanText: cleaned, fields };
+  return { cleanText: cleaned, blocks };
 }
 
 function agentChatDir(userId: string, agentId: string): string {
@@ -1301,19 +1322,26 @@ export async function sendToAgentEditChat(userId: string, agentId: string, conte
     { time: nowIso(), role: 'user', content });
 
   const { chatWithModel } = require('../model/client');
+  // Read-only access to the builtin skills root so the LLM can `read_file`
+  // the `agent-creator` skill (the canonical authoring rules pointer in
+  // `chat_agent_setup.md`). No write side — every mutation goes through
+  // the `<agent>` container parser post-stream.
   const result = await chatWithModel({
     userId, message: content, sessionId, systemPrompt,
     agentName: 'orkas_chat', timeout: 300,
+    readOnlyExtraRoots: [BUILTIN_SKILLS_DIR, userSkillsDir(userId)],
   });
 
   if (!result.ok) {
-    const errMsg = `模型响应失败: ${result.error || 'unknown'}`;
+    const errMsg = `Model response failed: ${result.error || 'unknown'}`;
     await _appendAgentChatMessage(userId, agentId,
       { time: nowIso(), role: 'assistant', content: errMsg });
     return { ok: false, message: errMsg, error: result.error || '' };
   }
 
-  const { cleanText, fields } = extractAgentFieldBlocks(result.text);
+  const { cleanText, blocks } = extractAgentFieldBlocks(result.text);
+  // Inline edit chat is bound to one agent; apply only the first block.
+  const fields = blocks[0] || {};
   const updated: ExtractedFields = {};
   if (Object.keys(fields).length) {
     await updateCustomAgent(agentId, fields);
@@ -1368,6 +1396,7 @@ export async function* streamSendToAgentEditChat(
       userId, message: content, sessionId, systemPrompt,
       agentName: 'orkas_chat',
       cacheRetention: 'short',
+      readOnlyExtraRoots: [BUILTIN_SKILLS_DIR, userSkillsDir(userId)],
       ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
     }) as AsyncIterable<any>) {
       const etype = event.type;
@@ -1381,7 +1410,9 @@ export async function* streamSendToAgentEditChat(
       const synthesizedProgress: string[] = [];
       if (etype === 'final') {
         const raw = event.text || '';
-        const { cleanText, fields } = extractAgentFieldBlocks(raw);
+        const { cleanText, blocks } = extractAgentFieldBlocks(raw);
+        // Inline edit chat is bound to one agent; apply only the first block.
+        const fields = blocks[0] || {};
         if (Object.keys(fields).length) {
           await updateCustomAgent(agentId, fields);
           Object.assign(updated, fields);
@@ -1391,8 +1422,8 @@ export async function* streamSendToAgentEditChat(
             }
           }
           // Collapse description / description_zh / description_en into one
-          // user-facing progress event — the user sees "简介更新" regardless
-          // of which language slot the LLM filled this turn.
+          // user-facing progress event — the user sees "description updated"
+          // regardless of which language slot the LLM filled this turn.
           const descTouched = fields.description !== undefined
             || fields.description_zh !== undefined
             || fields.description_en !== undefined;
@@ -1416,7 +1447,7 @@ export async function* streamSendToAgentEditChat(
         finalText = cleanText;
         event = { type: 'final', text: cleanText, updated };
       } else if (etype === 'error') {
-        errMsg = `模型响应失败: ${event.text || 'unknown'}`;
+        errMsg = `Model response failed: ${event.text || 'unknown'}`;
       }
 
       for (const text of synthesizedProgress) {
@@ -1442,7 +1473,7 @@ export async function* streamSendToAgentEditChat(
   } catch (err) {
     log.error('stream failed:', err);
     const msg = (err as Error).message || String(err);
-    errMsg = `模型响应失败: ${msg}`;
+    errMsg = `Model response failed: ${msg}`;
     yield { type: 'error', text: msg };
   } finally {
     // Must live in finally: on user abort the IPC layer breaks out of the
@@ -1462,8 +1493,8 @@ export async function* streamSendToAgentEditChat(
           { time: nowIso(), role: 'assistant', content, ...(saved ? { process: saved } : {}) });
       } else if (streamingText.trim() || processItems.length) {
         const content = streamingText.trim()
-          ? `${streamingText}\n\n（回复已中断）`
-          : '（回复已中断）';
+          ? `${streamingText}\n\n(reply interrupted)`
+          : '(reply interrupted)';
         await _appendAgentChatMessage(userId, agentId,
           { time: nowIso(), role: 'assistant', content, ...(saved ? { process: saved } : {}) });
       }

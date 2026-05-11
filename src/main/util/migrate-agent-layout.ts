@@ -1,23 +1,28 @@
 /**
- * 一次性数据迁移:把每个 agent 的 spec(原 `<uid>/cloud/agents/<aid>.json`)+
- * 元认知输出(原 `<uid>/cloud/meta/<aid>/{COMPETENCE,LEARNING_STRATEGIES}.md`)
- * 搬到统一的 agent 目录 `<uid>/cloud/agents/<aid>/`:
+ * One-shot data migration: move each agent's spec (was
+ * `<uid>/cloud/agents/<aid>.json`) plus its metacognition output (was
+ * `<uid>/cloud/meta/<aid>/{COMPETENCE,LEARNING_STRATEGIES}.md`) into the
+ * unified agent directory `<uid>/cloud/agents/<aid>/`:
  *
  *   <uid>/cloud/agents/<aid>/
- *   ├── agent.json                           ← 来自 <uid>/cloud/agents/<aid>.json
+ *   ├── agent.json                           ← from <uid>/cloud/agents/<aid>.json
  *   └── meta/
- *       ├── COMPETENCE.md                    ← 来自 <uid>/cloud/meta/<aid>/COMPETENCE.md
- *       └── LEARNING_STRATEGIES.md           ← 同上
+ *       ├── COMPETENCE.md                    ← from <uid>/cloud/meta/<aid>/COMPETENCE.md
+ *       └── LEARNING_STRATEGIES.md           ← same
  *
- * 最后删空的顶层 `meta/` 目录。
+ * Finally remove the now-empty top-level `meta/` directory.
  *
- * 详见 docs/plans/agent-as-directory.md。
+ * See docs/plans/agent-as-directory.md for the full design.
  *
- * 设计要点:
- *   - 启动期 idempotent:`<uid>/local/.migrations` 盖章 `agent-as-directory-v1` 防重跑
- *   - 旧 `<aid>.json` 与新 `<aid>/agent.json` 共存时优先认新格式(说明上一次跑了一半)
- *   - 找不到对应 agent 的 meta 子目录会 log.warn 但不阻塞迁移
- *   - 迁移失败任意一项不会卡住别的;盖章只在整个流程跑完后落盘
+ * Design notes:
+ *   - Idempotent at startup: stamps `<uid>/local/.migrations` with
+ *     `agent-as-directory-v1` to prevent re-runs.
+ *   - When the old `<aid>.json` coexists with the new `<aid>/agent.json`
+ *     (last run was interrupted), the new format wins.
+ *   - A missing meta sub-directory for an agent emits log.warn but does not
+ *     block the migration.
+ *   - Per-item failures don't block the rest; the stamp is only written
+ *     after the whole flow completes.
  */
 
 import * as fs from 'node:fs';
@@ -31,8 +36,8 @@ const log = createLogger('migrate');
 const MIGRATION_TAG = 'agent-as-directory-v1';
 
 function migrationsFile(uid: string): string {
-  // userLocalConfigDir = <uid>/local/config;上一层就是 <uid>/local/。
-  // 与 migrate-session-ids 共用同一个 .migrations 文件,多 tag 一行一条。
+  // userLocalConfigDir = <uid>/local/config; one level up is <uid>/local/.
+  // Shares the .migrations file with migrate-session-ids — one tag per line.
   return path.join(path.dirname(userLocalConfigDir(uid)), '.migrations');
 }
 
@@ -70,7 +75,7 @@ export function migrateAgentLayout(uid: string): MigrationStats {
   const agentsRoot = userAgentsDir(uid);
   const oldMetaRoot = path.join(userCloudRoot(uid), 'meta');
 
-  // 1. 扫 agents/<aid>.json,搬到 agents/<aid>/agent.json
+  // 1. Scan agents/<aid>.json and move it to agents/<aid>/agent.json
   if (fs.existsSync(agentsRoot)) {
     let entries: fs.Dirent[] = [];
     try {
@@ -85,7 +90,8 @@ export function migrateAgentLayout(uid: string): MigrationStats {
       const newDir = path.join(agentsRoot, aid);
       const newFile = path.join(newDir, 'agent.json');
       if (fs.existsSync(newFile)) {
-        // 上一次跑了一半 / 用户手动建过新格式 → 认新格式,删旧 flat file
+        // Previous run was interrupted, or the user hand-created the new
+        // format → keep the new format, drop the old flat file.
         try {
           fs.unlinkSync(oldFile);
           log.info(`migrate: dropped redundant flat ${oldFile} (new agent.json already exists)`);
@@ -106,7 +112,8 @@ export function migrateAgentLayout(uid: string): MigrationStats {
     }
   }
 
-  // 2. 扫旧的 cloud/meta/<aid>/,搬到 cloud/agents/<aid>/meta/
+  // 2. Scan the old cloud/meta/<aid>/ tree and move it to
+  //    cloud/agents/<aid>/meta/.
   if (fs.existsSync(oldMetaRoot)) {
     let entries: fs.Dirent[] = [];
     try {
@@ -132,15 +139,16 @@ export function migrateAgentLayout(uid: string): MigrationStats {
           fs.renameSync(src, dst);
           stats.metaMoved += 1;
         }
-        // src 空了 → 删 src 目录
+        // src is now empty → remove the src directory.
         try { fs.rmdirSync(srcDir); }
-        catch { /* 残留留着,下一次再清 */ }
+        catch { /* leave the leftover for the next run to clean up */ }
       } catch (err) {
         log.warn(`migrate: meta agent ${aid} failed: ${(err as Error).message}`);
         stats.warnings += 1;
       }
     }
-    // 顶层 meta/ 整体删除(rmdirSync 只在空时成功,有残留会保留;无碍)
+    // Remove the top-level meta/ directory wholesale (rmdirSync only succeeds
+    // when empty; leftovers are kept silently — fine).
     try { fs.rmdirSync(oldMetaRoot); }
     catch { /* keep */ }
   }

@@ -653,6 +653,6 @@ describe.skip('group_chat bus integration › no shadow-tap on agent → user', 
     // Exactly 3 messages: user→commander, commander→agent, agent→user.
     expect(lines).toHaveLength(3);
     expect(lines[2]).toMatchObject({ from: AGENT_ID, to: ['user'] });
-    expect(lines.find((l: any) => l.text === '（无回复）')).toBeUndefined();
+    expect(lines.find((l: any) => l.text === '(no reply)')).toBeUndefined();
   }, 10_000);
 });

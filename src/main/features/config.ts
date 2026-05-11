@@ -1,14 +1,18 @@
 /**
  * User preferences bag — `<uid>/cloud/config/preferences.json`.
  *
- * 跨设备一致的用户偏好（云同步）。目前仅存 UI 语言（`language: 'zh' | 'en'`）。
+ * Cross-device user preferences (cloud-synced). Currently stores the
+ * UI language only (`language: 'zh' | 'en'`).
  *
- * 历史：原 `data/config/config.json` 还存有 legacy `provider` / `model` 字段
- * （`auth.saveConfig` 写入的默认模型对）—— 这份 fallback 已废弃，默认模型由
- * `auth-profiles.json` 的 priority entries 唯一决定（`auth.getConfig()` 读
- * `entries[0]`）。迁移时丢弃这两个字段。
+ * History: the old `data/config/config.json` also held legacy
+ * `provider` / `model` fields (the default model pair written by
+ * `auth.saveConfig`). That fallback is deprecated — the default model
+ * is solely determined by the priority entries in
+ * `auth-profiles.json` (`auth.getConfig()` reads `entries[0]`). The
+ * migration drops those two fields.
  *
- * 写入走 merge；key 显式置 undefined 时忽略（等效 no-op）。
+ * Writes merge into the existing file; explicit `undefined` values are
+ * ignored (equivalent to no-op).
  */
 
 import { app } from 'electron';
@@ -31,18 +35,20 @@ export interface CommanderAvatar {
 
 export interface UserPreferences {
   language?: Lang;
-  /** Per-user 指挥官 avatar (icon id + color id). Tokens come from
+  /** Per-user commander avatar (icon id + color id). Tokens come from
    * `renderer/modules/avatar.js`. Missing → renderer falls back to the
    * commander default (crown + gold). */
   commander_avatar?: CommanderAvatar;
-  /** 元认知级别的 agent 自演进开关。undefined / 任意非 false 值 → 视为开启
-   * （保留历史默认行为）；显式 false → 关闭。env `ORKAS_METACOGNITION='0'`
-   * 仍是更高优先级的 kill switch。读取走 `features/metacognition.isFeatureEnabled`. */
+  /** Metacognition-level agent self-evolution toggle. undefined / any
+   * non-false value → treated as enabled (preserving the historical
+   * default); explicit false → disabled. The env var
+   * `ORKAS_METACOGNITION='0'` remains a higher-priority kill switch.
+   * Reads go through `features/metacognition.isFeatureEnabled`. */
   metacognition_enabled?: boolean;
   [key: string]: unknown;
 }
 
-// 头像 token 校验沿用同一份 catalog（src/main/data/avatars.json）。
+// Avatar tokens reuse the same catalog (src/main/data/avatars.json).
 import { isKnownIcon, isKnownColor } from './avatars';
 
 function preferencesFile(): string {
@@ -65,7 +71,8 @@ export function writePreferences(partial: Partial<UserPreferences>): UserPrefere
 }
 
 // ── Back-compat aliases for older callers ────────────────────────────────
-// 新代码应使用 read/writePreferences。这些别名给还没迁移完的调用点用。
+// New code should use read/writePreferences directly. These aliases
+// remain for call sites that haven't been migrated yet.
 export const readConfig = readPreferences;
 export const writeConfig = writePreferences;
 export type AppConfig = UserPreferences;
@@ -126,9 +133,10 @@ export function setCommanderAvatar(avatar: CommanderAvatar): CommanderAvatar {
 }
 
 // ── Metacognition (self-evolution) toggle ────────────────────────────────
-// 默认 ON：未写过 = undefined → 视为 true，与历史行为一致。
-// 显式 false 才关闭。读取统一走 features/metacognition.isFeatureEnabled，
-// 那里再叠加 env `ORKAS_METACOGNITION='0'` kill switch。
+// Defaults to ON: never-written = undefined → treated as true, matching
+// historical behavior. Only an explicit false disables it. Reads go
+// through features/metacognition.isFeatureEnabled, which additionally
+// layers the env `ORKAS_METACOGNITION='0'` kill switch on top.
 
 export function getMetacognitionEnabled(): boolean {
   const v = readPreferences().metacognition_enabled;

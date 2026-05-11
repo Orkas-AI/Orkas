@@ -78,6 +78,15 @@ export class SkillLoader {
    * `lang` selects which description (zh / en) is rendered; falls back per
    * `pickDescription`. Defaults to `'en'` for safety in non-UI callers.
    */
+  // Default convenience renderer for hosts without their own block builder.
+  // **Orkas does NOT use this in production** — it ships its own renderer
+  // at `src/main/model/core-agent/skill-registry.ts::renderSkillLines` that
+  // (a) decides Source label by the resolved root path (basename collides
+  // when both roots end in `/skills`) and (b) inlines `<ROOT>/<id>/SKILL.md`
+  // patterns + resolved ROOT values right in the block so the LLM doesn't
+  // need to consult a separate path-constants section. Other hosts may use
+  // this default helper, in which case Source is taken from the dirs[]
+  // basename.
   renderSystemPromptBlock(lang: 'zh' | 'en' = 'en'): string {
     const skills = this.list();
     if (!skills.length) return "";

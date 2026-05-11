@@ -584,22 +584,22 @@ export function rebuildIndex(): IndexCache {
   const pad = (n: number) => String(n).padStart(2, '0');
   const stamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
   const lines: string[] = [];
-  lines.push('# 知识库索引', '');
-  lines.push(`_自动维护，请勿手动编辑。最后更新：${stamp}_`, '');
-  lines.push('> 模型通过 `kb_search` / `kb_read` 工具访问；本文件仅供在 Finder / 资源管理器里浏览。', '');
+  lines.push(`# ${t('contexts.index.heading')}`, '');
+  lines.push(`_${t('contexts.index.maintained_note', { stamp })}_`, '');
+  lines.push(`> ${t('contexts.index.model_access_note')}`, '');
   if (!rootDirs.length && !rootFiles.length) {
-    lines.push('（暂无内容）');
+    lines.push(t('contexts.index.empty_section'));
   } else {
     if (rootDirs.length) {
-      lines.push('## 目录');
+      lines.push(`## ${t('contexts.index.dirs_heading')}`);
       for (const d of rootDirs) {
         const n = dirCounts.get(d.name) || 0;
-        lines.push(`- 📁 \`${d.name}/\` — ${n} 篇`);
+        lines.push(`- 📁 \`${d.name}/\` — ${t('contexts.index.file_count', { count: n })}`);
       }
       lines.push('');
     }
     if (rootFiles.length) {
-      lines.push('## 根目录文件');
+      lines.push(`## ${t('contexts.index.root_files_heading')}`);
       for (const f of rootFiles) {
         const entry = allEntries.find((e) => e.path === f.name);
         lines.push(`- \`${f.name}\`${entry?.title ? ` — ${entry.title}` : ''}`);
@@ -618,11 +618,11 @@ export function rebuildIndex(): IndexCache {
   // Full root markdown — re-read what we just wrote, for getContextIndexMarkdown.
   let rootMd = '';
   try { rootMd = fs.readFileSync(path.join(contextsRoot(), CONTEXTS_INDEX_FILENAME), 'utf8'); }
-  catch { rootMd = '（知识库为空）'; }
+  catch { rootMd = t('contexts.index.empty_kb'); }
 
   const flatLines = allEntries.length
     ? allEntries.map((e) => `- \`${e.path}\`${e.title ? ` — ${e.title}` : ''}`).join('\n')
-    : '（知识库为空）';
+    : t('contexts.index.empty_kb');
 
   indexCache.mtime = Date.now();
   indexCache.rootMarkdown = rootMd;

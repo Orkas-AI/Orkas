@@ -1,10 +1,11 @@
 // ─── Settings (entries-based: picker + priority list) ────────────────────
 // The page is split in two:
-//   1. "添加模型授权": pick provider + model, then "+ 添加账号" → either an
-//      API Key form or the OAuth flow, depending on what the provider
-//      supports. On success we auto-create a priority-list entry pointing
-//      at the new credential.
-//   2. "已配置（按优先级）": ordered list of (provider, model, profile)
+//   1. "Add model auth": pick provider + model, then "+ Add account" →
+//      either an API Key form or the OAuth flow, depending on what the
+//      provider supports. On success we auto-create a priority-list
+//      entry pointing at the new credential.
+//   2. "Configured (by priority)": ordered list of
+//      (provider, model, profile)
 //      entries. First = default model; later items are the fallback chain.
 //      Rows are drag-reorderable.
 
@@ -23,6 +24,7 @@ let _settingsState = {
 async function loadSettings() {
   _settingsBindLanguageOnce();
   _settingsSyncLanguageRadio();
+  _settingsBindClearAllConvsOnce();
   await Promise.all([
     _settingsRefreshProviders(),
     _settingsRefreshEntries(),
@@ -31,6 +33,7 @@ async function loadSettings() {
     _settingsRefreshImageProfiles(),
     _settingsRefreshCommanderAvatar(),
     _settingsRefreshMetacognition(),
+    _settingsRefreshDataRoot(),
   ]);
   _settingsRenderPicker();
   _settingsRenderEntries();
@@ -39,12 +42,14 @@ async function loadSettings() {
   _settingsRenderImageSection();
   _settingsRenderCommanderAvatar();
   _settingsRenderMetacognition();
+  _settingsRenderDataRoot();
 }
 
 // ── Commander avatar ──
-// 指挥官头像走 prefs IPC，存到 preferences.json。修改后立即推回缓存
-// （conversation.js 的 _commanderAvatarCache）以便聊天行立即用上新头像，
-// 不用等下次 view 切换。
+// Commander avatar goes through the prefs IPC and lands in
+// preferences.json. After a change we immediately push it back to the
+// cache (conversation.js's _commanderAvatarCache) so chat rows pick up
+// the new avatar without waiting for the next view switch.
 
 async function _settingsRefreshCommanderAvatar() {
   try {
@@ -70,13 +75,15 @@ function _settingsRenderCommanderAvatar() {
   trigger.addEventListener('click', (e) => {
     e.stopPropagation();
     if (isAvatarPickerOpenFor(trigger)) { closeAvatarPicker(); return; }
-    // 指挥官头像图标固定 crown，picker 只显示颜色行。后端校验依然两个 token
-    // 都要带，所以保存时强制写 crown。
+    // The commander avatar's icon is fixed at crown, so the picker
+    // only shows the color row. Backend validation still requires both
+    // tokens, so we force-write crown on save.
     openAvatarPicker(trigger, cur, { allowCommanderCombo: true, hideIcons: true }, async (next) => {
       const icon = COMMANDER_DEFAULT.icon;
       _settingsState.commanderAvatar = { icon, color: next.color };
       cur.icon = icon; cur.color = next.color;
-      // 就地更新，保留 trigger 上的 click 监听 —— 用户可以连点几次直到满意。
+      // Update in place — the trigger's click listener is preserved so
+      // the user can click a few times in a row until satisfied.
       applyAvatarToElement(trigger, icon, next.color, 'commander');
       try {
         const res = await window.orkas.invoke('prefs.setCommanderAvatar', { icon, color: next.color });
@@ -143,9 +150,11 @@ function _settingsRenderLocalExec() {
   }
 }
 
-// ── Metacognition (Agent 元认知自演进) ──
-// 落到 preferences.json::metacognition_enabled，env `ORKAS_METACOGNITION='0'` 仍是
-// 更高优先级的 kill switch（`envForcedOff`），命中时 UI 把开关锁灰并提示。
+// ── Metacognition (agent self-evolution) ──
+// Stored at preferences.json::metacognition_enabled. The env var
+// `ORKAS_METACOGNITION='0'` is still a higher-priority kill switch
+// (surfaced as `envForcedOff`); when active, the UI greys out the
+// toggle and shows an explanatory hint.
 
 async function _settingsRefreshMetacognition() {
   try {
@@ -177,7 +186,7 @@ function _settingsRenderMetacognition() {
         if (res && res.ok) {
           _settingsState.metacognition = { ..._settingsState.metacognition, enabled: !!res.enabled };
         } else {
-          // 写失败时回滚 UI
+          // Roll back the UI on write failure.
           cb.checked = !next;
           _settingsLog.warn('setMetacognition rejected', res);
         }
@@ -187,6 +196,36 @@ function _settingsRenderMetacognition() {
       }
     });
     cb.dataset.bound = '1';
+  }
+}
+
+// ── Data root row ──
+// Read-only display of the unified data root path; click to open it in
+// the OS file manager via the `app.openDataRoot` IPC.
+
+async function _settingsRefreshDataRoot() {
+  try {
+    const res = await window.orkas.invoke('app.dataRootPath');
+    _settingsState.dataRoot = (res && res.ok && res.path) ? String(res.path) : '';
+  } catch (_) {
+    _settingsState.dataRoot = '';
+  }
+}
+
+function _settingsRenderDataRoot() {
+  const btn = document.getElementById('settings-data-root-btn');
+  const span = document.getElementById('settings-data-root-path');
+  if (!btn || !span) return;
+  span.textContent = _settingsState.dataRoot || '';
+  if (!btn.dataset.bound) {
+    btn.addEventListener('click', async () => {
+      try {
+        await window.orkas.invoke('app.openDataRoot');
+      } catch (err) {
+        _settingsLog.warn('open data root failed', { error: (err && err.message) || String(err) });
+      }
+    });
+    btn.dataset.bound = '1';
   }
 }
 
@@ -220,6 +259,74 @@ function _settingsSyncLanguageRadio() {
   document.querySelectorAll('input[name="settings-language"]').forEach((el) => {
     el.checked = (el.value === cur);
   });
+}
+
+// ── Clear all conversations ──
+// One-shot bind: button click takes a snapshot of the current conv list
+// (the global `conversations` array, kept in sync by `loadConversations`),
+// runs the same per-cid renderer cleanup the × button does (abortConvStream
+// + _forgetConvLocal) for every cid in the snapshot, then fires the bulk
+// IPC `conversations.deleteAll` (server runs the full delete cascade per
+// cid: group dir / main jsonl / sessions / attachments / CLI / search idx
+// — see chats.deleteConversation). If the user was viewing one of the
+// deleted conversations, switch to new-chat. Reload the sidebar list.
+
+let _settingsClearAllConvsBound = false;
+
+function _settingsBindClearAllConvsOnce() {
+  if (_settingsClearAllConvsBound) return;
+  const btn = document.getElementById('settings-clear-all-convs-btn');
+  if (!btn) return;
+  btn.addEventListener('click', async () => {
+    // Snapshot BEFORE the bulk delete — once the server returns, the global
+    // `conversations` is about to be reloaded as empty and we'll lose the
+    // per-cid info needed for renderer cleanup.
+    const snapshot = (Array.isArray(conversations) ? conversations : []).slice();
+    const status = document.getElementById('settings-clear-all-convs-status');
+    if (!snapshot.length) {
+      if (typeof uiAlert === 'function') {
+        await uiAlert(t('settings.clear_all_convs.empty'));
+      }
+      return;
+    }
+    const ok = await uiConfirm(t('settings.clear_all_convs.confirm', { count: snapshot.length }));
+    if (!ok) return;
+
+    btn.disabled = true;
+    if (status) status.textContent = t('settings.clear_all_convs.in_progress');
+
+    const wasActiveDeleted = currentCid
+      && snapshot.some((c) => c.conversation_id === currentCid);
+    for (const c of snapshot) {
+      try { if (typeof abortConvStream === 'function') abortConvStream(c.conversation_id); } catch (_) {}
+      try { if (typeof _forgetConvLocal === 'function') _forgetConvLocal(c.conversation_id); } catch (_) {}
+    }
+
+    let deleted = 0;
+    try {
+      const res = await window.orkas.invoke('conversations.deleteAll');
+      if (res && typeof res.deleted === 'number') deleted = res.deleted;
+      _settingsLog.info('cleared all conversations', { count: deleted });
+    } catch (err) {
+      _settingsLog.warn('clear-all failed', { error: (err && err.message) || String(err) });
+      btn.disabled = false;
+      if (status) status.textContent = '';
+      if (typeof uiAlert === 'function') {
+        uiAlert(t('settings.clear_all_convs.failed', {
+          message: (err && err.message) || String(err),
+        }));
+      }
+      return;
+    }
+
+    if (wasActiveDeleted && typeof setView === 'function') setView('new-chat');
+    try { await loadConversations(); } catch (_) {}
+
+    btn.disabled = false;
+    if (status) status.textContent = t('settings.clear_all_convs.success', { count: deleted });
+    setTimeout(() => { if (status) status.textContent = ''; }, 4000);
+  });
+  _settingsClearAllConvsBound = true;
 }
 
 // Keep the radio in sync if some other code path changes language, and
@@ -268,9 +375,11 @@ async function _settingsRenderPicker() {
     if (p.supportsOAuth && p.supportsApiKey)       authHint = t('settings.oauth.support_api_and_oauth');
     else if (p.supportsOAuth && !p.supportsApiKey) authHint = t('settings.oauth.support_oauth_only');
     else if (p.supportsApiKey)                     authHint = t('settings.oauth.support_api_only');
-    // subscriptionNote 是"用错了会 401 白白浪费 key"级别的关键前提，
-    // 优先展示；授权方式能力次之。两条都有就用 ' · ' 串起来。
-    // subscriptionNote 是 i18n key（见 provider_catalog.ts 字段注释），渲染时翻译。
+    // subscriptionNote is the "wrong-account → 401 wastes the key"
+    // class of critical prerequisite, so it goes first; the auth
+    // capability hint comes second. Join with ' · ' when both exist.
+    // subscriptionNote is an i18n key (see the field comment in
+    // provider_catalog.ts) — translated on render.
     const subNote = p.subscriptionNote ? t(p.subscriptionNote) : '';
     const hint = [subNote, authHint].filter(Boolean).join(' · ');
     return { value: p.id, label, hint };
@@ -712,12 +821,6 @@ function _settingsRenderEntryRow(entry, idx) {
   row.dataset.entryId = entry.entryId;
   row.draggable = true;
 
-  const handle = document.createElement('div');
-  handle.className = 'entry-drag-handle';
-  handle.title = t('settings.entries.drag_title');
-  handle.textContent = '⋮⋮';
-  row.appendChild(handle);
-
   const rank = document.createElement('div');
   rank.className = 'entry-rank';
   rank.textContent = idx === 0 ? t('settings.entries.default_tag') : `#${idx + 1}`;
@@ -808,12 +911,39 @@ function _settingsRenderEntryRow(entry, idx) {
 
   row.appendChild(actions);
 
-  // Drag + drop for reordering
+  _settingsAttachReorderDnd(row, {
+    kind: 'chat',
+    id: entry.entryId,
+    getIds: () => _settingsState.entries.map((e) => e.entryId),
+    ipcName: 'auth.reorderEntries',
+    onSuccess: (res) => {
+      _settingsState.entries = Array.isArray(res.entries) ? res.entries : _settingsState.entries;
+      _settingsRenderEntries();
+    },
+  });
+
+  return row;
+}
+
+// Shared row drag-and-drop reorder. `kind` discriminates between the three
+// lists (chat / search / image) so a drag started in one list can't drop
+// into another — without the check, dragover would still highlight foreign
+// rows and the drop handler would feed a stranger's id to the wrong reorder
+// IPC. `getIds` is read at drop time (not bound at attach time) so each row
+// sees the current state's id order even after re-renders.
+async function _settingsAttachReorderDnd(row, opts) {
+  const { kind, id, getIds, ipcName, onSuccess } = opts;
+  row.draggable = true;
+  const handle = document.createElement('div');
+  handle.className = 'entry-drag-handle';
+  handle.title = t('settings.entries.drag_title');
+  handle.textContent = '⋮⋮';
+  row.prepend(handle);
   row.addEventListener('dragstart', (e) => {
-    _settingsState.dragState = { entryId: entry.entryId, startIdx: idx };
+    _settingsState.dragState = { kind, id };
     row.classList.add('dragging');
     e.dataTransfer.effectAllowed = 'move';
-    try { e.dataTransfer.setData('text/plain', entry.entryId); } catch (_) {}
+    try { e.dataTransfer.setData('text/plain', id); } catch (_) {}
   });
   row.addEventListener('dragend', () => {
     row.classList.remove('dragging');
@@ -821,7 +951,8 @@ function _settingsRenderEntryRow(entry, idx) {
     _settingsState.dragState = null;
   });
   row.addEventListener('dragover', (e) => {
-    if (!_settingsState.dragState) return;
+    const ds = _settingsState.dragState;
+    if (!ds || ds.kind !== kind) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
     const rect = row.getBoundingClientRect();
@@ -833,34 +964,28 @@ function _settingsRenderEntryRow(entry, idx) {
     row.classList.remove('drop-before', 'drop-after');
   });
   row.addEventListener('drop', async (e) => {
-    if (!_settingsState.dragState) return;
+    const ds = _settingsState.dragState;
+    if (!ds || ds.kind !== kind) return;
     e.preventDefault();
     row.classList.remove('drop-before', 'drop-after');
-    const srcId = _settingsState.dragState.entryId;
-    if (srcId === entry.entryId) return;
+    const srcId = ds.id;
+    if (srcId === id) return;
     const rect = row.getBoundingClientRect();
     const before = (e.clientY - rect.top) < rect.height / 2;
-    await _settingsReorderAfterDrop(srcId, entry.entryId, before);
+    const ids = [...getIds()];
+    const srcIdx = ids.indexOf(srcId);
+    if (srcIdx < 0) return;
+    ids.splice(srcIdx, 1);
+    let refIdx = ids.indexOf(id);
+    if (refIdx < 0) refIdx = ids.length;
+    ids.splice(before ? refIdx : refIdx + 1, 0, srcId);
+    const res = await window.orkas.invoke(ipcName, { orderedIds: ids });
+    if (res && res.ok) {
+      await onSuccess(res);
+    } else {
+      await uiAlert((res && res.error) || t('settings.entries.reorder_failed'));
+    }
   });
-
-  return row;
-}
-
-async function _settingsReorderAfterDrop(srcId, refId, insertBefore) {
-  const ids = _settingsState.entries.map((e) => e.entryId);
-  const srcIdx = ids.indexOf(srcId);
-  if (srcIdx < 0) return;
-  ids.splice(srcIdx, 1);
-  let refIdx = ids.indexOf(refId);
-  if (refIdx < 0) refIdx = ids.length;
-  ids.splice(insertBefore ? refIdx : refIdx + 1, 0, srcId);
-  const res = await window.orkas.invoke('auth.reorderEntries', { orderedIds: ids });
-  if (res && res.ok) {
-    _settingsState.entries = Array.isArray(res.entries) ? res.entries : _settingsState.entries;
-    _settingsRenderEntries();
-  } else {
-    await uiAlert((res && res.error) || t('settings.entries.reorder_failed'));
-  }
 }
 
 async function _settingsTestEntry(entry, statusEl) {
@@ -927,15 +1052,15 @@ function _settingsSetRowStatus(el, kind, text, baseCls = 'account-row-status') {
 //
 // Shape mirrors the chat-entries list visually but uses simpler rows
 // (provider + label + delete). Provider list is fixed (Tavily / Serper /
-// Brave Search API / 百度 AI 搜索); see search-adapters.ts for the
+// Brave Search API / Baidu AI Search); see search-adapters.ts for the
 // canonical registry.
 
 const _SEARCH_PROVIDER_OPTIONS = [
   { id: 'tavily',            label: 'Tavily', docs: 'https://tavily.com/' },
   { id: 'serper',            label: 'Serper', docs: 'https://serper.dev/' },
   { id: 'brave-search',      label: 'Brave', docs: 'https://brave.com/search/api/' },
-  { id: 'baidu-ai-search',   label: '百度', docs: 'https://cloud.baidu.com/doc/qianfan-api/s/em82g4tlk' },
-  { id: 'metaso',            label: '秘塔', docs: 'https://metaso.cn/' },
+  { id: 'baidu-ai-search',   label: 'Baidu', docs: 'https://cloud.baidu.com/doc/qianfan-api/s/em82g4tlk' },
+  { id: 'metaso',            label: 'Metaso', docs: 'https://metaso.cn/' },
 ];
 
 function _searchProviderLabel(id) {
@@ -1045,6 +1170,17 @@ function _settingsRenderSearchEntries() {
     });
     actions.appendChild(delBtn);
     row.appendChild(actions);
+
+    _settingsAttachReorderDnd(row, {
+      kind: 'search',
+      id: p.id,
+      getIds: () => (_settingsState.searchProfiles || []).map((x) => x.id),
+      ipcName: 'searchAuth.reorder',
+      onSuccess: async () => {
+        await _settingsRefreshSearchProfiles();
+        _settingsRenderSearchEntries();
+      },
+    });
 
     container.appendChild(row);
   });
@@ -1167,6 +1303,17 @@ function _settingsRenderImageEntries() {
     });
     actions.appendChild(delBtn);
     row.appendChild(actions);
+
+    _settingsAttachReorderDnd(row, {
+      kind: 'image',
+      id: p.id,
+      getIds: () => (_settingsState.imageProfiles || []).map((x) => x.id),
+      ipcName: 'imageAuth.reorder',
+      onSuccess: async () => {
+        await _settingsRefreshImageProfiles();
+        _settingsRenderImageEntries();
+      },
+    });
 
     container.appendChild(row);
   });

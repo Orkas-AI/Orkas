@@ -46,7 +46,8 @@ export interface PlanStep {
   /** Human-readable; what the user will see in the UI plan panel. */
   title: string;
   /** Required. Resolves to: 'user' / 'commander' / agent name (or id).
-   * Empty = invalid. Aliases: '指挥官' → commander, '用户' → user. */
+   * Empty = invalid. Aliases: the Chinese forms '指挥官' → commander
+   * and '用户' → user are also accepted. */
   assignee: string;
   /** Dispatch payload template. Bus renders this and sends it as the message
    * body when this step fires. Variables: `{{user_initial_message}}` and

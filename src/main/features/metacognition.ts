@@ -2,13 +2,14 @@
  * Metacognition persistence — per-agent self-assessment (COMPETENCE.md)
  * and learning strategies (LEARNING_STRATEGIES.md).
  *
- * Storage(随 agent 目录形态,落在 `<uid>/cloud/agents/<aid>/meta/`):
+ * Storage (follows the agent directory layout, lives at `<uid>/cloud/agents/<aid>/meta/`):
  *   <uid>/cloud/agents/<aid>/meta/COMPETENCE.md          — free-form markdown
  *   <uid>/cloud/agents/<aid>/meta/LEARNING_STRATEGIES.md — free-form markdown
  *   <uid>/cloud/agents/_default/meta/...                 — for unbound conversations
  *
- * 删 agent → `agents.deleteCustomAgent` 直接 `rm -rf agents/<aid>/`,
- * meta/ 子目录随之消失;`purgeAgent` 留作显式清理入口(测试 / 异常恢复用)。
+ * Deleting an agent → `agents.deleteCustomAgent` runs `rm -rf agents/<aid>/`
+ * directly, so the `meta/` subdirectory disappears with it; `purgeAgent`
+ * remains as an explicit cleanup entry point (used by tests / recovery).
  *
  * Unlike memory.ts (which uses §-separated entries), metacognition files
  * are free-form markdown that the agent writes and reads as a whole.
@@ -33,15 +34,17 @@ export const COMPETENCE_CHAR_LIMIT = 3000;   // ~1000 tokens
 export const STRATEGIES_CHAR_LIMIT = 4000;   // ~1300 tokens — strategies is a play-library, naturally grows; competence is a self-check, stays small
 
 // ── Feature gate (single source of truth) ────────────────────────────────
-// 元认知/自演进总开关。两层串联：
-//   1. env `ORKAS_METACOGNITION='0'`：dev/CI kill switch，硬关
-//   2. 用户偏好 `preferences.json::metacognition_enabled`：UI 设置项；
-//      undefined（未写过）→ 视为 on，保留历史默认行为
-// runner.ts 与 reflection-trigger.ts 都从这里读，不要再到处复制 env 判断。
+// Master switch for metacognition / self-evolution. Two layers ANDed together:
+//   1. env `ORKAS_METACOGNITION='0'` — dev/CI kill switch, hard off.
+//   2. user preference `preferences.json::metacognition_enabled` — UI setting;
+//      undefined (never written) → treated as on, preserving historical default.
+// runner.ts and reflection-trigger.ts both read from here; don't sprinkle the
+// env check around again.
 export function isFeatureEnabled(): boolean {
   if (process.env.ORKAS_METACOGNITION === '0') return false;
-  // 延迟 require 避开循环：features/config -> features/avatars -> ... 链路都很轻，
-  // 但元认知在启动早期路径上被调用，保守起见用 require 落到模块缓存。
+  // Lazy-require to break a potential cycle: features/config -> features/avatars
+  // -> ... is light, but metacognition is called early during startup; play
+  // safe and use require so it lands in the module cache.
   try {
     const cfg = require('./config') as typeof import('./config');
     return cfg.getMetacognitionEnabled();
@@ -176,14 +179,14 @@ export function formatForSystemPrompt(agentId: string): string {
 
   if (!comp.content && !strat.content) return '';
 
-  const parts: string[] = ['## 元认知（自我评估与学习策略）'];
+  const parts: string[] = ['## Metacognition (self-assessment & learning strategies)'];
 
   if (comp.content) {
-    parts.push('### 能力画像 (COMPETENCE)');
+    parts.push('### Competence profile (COMPETENCE)');
     parts.push(comp.content);
   }
   if (strat.content) {
-    parts.push('### 学习策略 (STRATEGIES)');
+    parts.push('### Learning strategies (STRATEGIES)');
     parts.push(strat.content);
   }
 

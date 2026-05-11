@@ -23,7 +23,8 @@
  * navigation (CJK preserved, English lowercased, no opaque cid hex).
  *
  * Placeholder fallback: when the title is missing / equals the i18n
- * placeholder ("新对话" / "New conversation") / slug-ifies to empty / hits
+ * placeholder (English "New conversation" or its localized form
+ * "新对话") / slug-ifies to empty / hits
  * a Windows reserved name, we fall back to `chat-{YYYY-MM-DD}-{N}`. The
  * fallback is also frozen on first use, so a write that fired before the
  * conv got its real auto-generated title locks in the date-based name —
@@ -43,17 +44,26 @@ const log = createLogger('group_chat.conv_workspace');
 const MAX_SLUG_LEN = 32;
 
 // Match the literal default titles `chats.createConversation` writes when
-// no title is supplied (currently '新对话') AND any zh / en variant we may
-// localize into. Match by string equality, not lang lookup, because state
-// can carry whatever the conv was named at creation regardless of current
-// UI language.
-const PLACEHOLDER_TITLES: ReadonlySet<string> = new Set([
+// no title is supplied (currently `t('chat.default_title')` resolved at
+// creation time → '新对话' for zh UI, 'New conversation' for en UI) AND
+// any historical / capitalization variant. Match by string equality, not
+// lang lookup, because state can carry whatever the conv was named at
+// creation regardless of the current UI language.
+export const PLACEHOLDER_TITLES: ReadonlySet<string> = new Set([
   '新对话',
   'New conversation',
   'New Conversation',
   'New chat',
   'New Chat',
 ]);
+
+/** True when `title` is a placeholder default written at conversation
+ *  creation, i.e. the user hasn't named the chat yet. Locale-agnostic — it
+ *  recognises every default form the title generator can emit. */
+export function isPlaceholderTitle(title: string | undefined | null): boolean {
+  if (!title) return true;
+  return PLACEHOLDER_TITLES.has(title);
+}
 
 // Windows reserved device names (case-insensitive). A directory bearing
 // any of these names cannot be created on Windows — fall back rather than
@@ -153,31 +163,37 @@ function uniquifySlug(workspaceRoot: string, slug: string): string {
  * never produced anything.
  */
 export async function getConversationWorkspacePath(uid: string, cid: string): Promise<string> {
-  const root = getWorkspacePath(uid);
+  // Resolve the conv's project membership ONCE so workspace resolution
+  // picks up the project-scoped selection (per CLAUDE.md projects feature).
+  // For convs without a project this is a no-op (projectId stays undefined).
+  let projectId: string | undefined;
+  let title = '';
+  try {
+    const conv = await getConversation(uid, cid);
+    if (conv) {
+      title = conv.title || '';
+      const pid = (conv as any).project_id;
+      if (typeof pid === 'string' && pid) projectId = pid;
+    } else {
+      // Legacy convs (created before this feature shipped) keep using the root
+      // workspace verbatim — we detect them by absence of a conversation record:
+      // if the conv index has nothing for cid, the bus is operating on a phantom
+      // and we don't want to spawn a directory off it. In practice every active
+      // bus path runs after `chats.createConversation`, so this branch is rare.
+      log.warn(`no conv record for cid=${cid} — falling back to root workspace`);
+      return getWorkspacePath(uid);
+    }
+  } catch (err) {
+    log.warn(`getConversation failed cid=${cid}: ${(err as Error).message} — falling back to root`);
+    return getWorkspacePath(uid);
+  }
+
+  const root = getWorkspacePath(uid, projectId);
 
   // Fast path: state already has a workspace_dir baked in.
   const cur = await readState(uid, cid);
   if (cur.workspace_dir) {
     return path.join(root, cur.workspace_dir);
-  }
-
-  // No workspace_dir yet. Decide one.
-  // Legacy convs (created before this feature shipped) keep using the root
-  // workspace verbatim — we detect them by absence of a conversation record:
-  // if the conv index has nothing for cid, the bus is operating on a phantom
-  // and we don't want to spawn a directory off it. In practice every active
-  // bus path runs after `chats.createConversation`, so this branch is rare.
-  let title = '';
-  try {
-    const conv = await getConversation(uid, cid);
-    if (conv) title = conv.title || '';
-    else {
-      log.warn(`no conv record for cid=${cid} — falling back to root workspace`);
-      return root;
-    }
-  } catch (err) {
-    log.warn(`getConversation failed cid=${cid}: ${(err as Error).message} — falling back to root`);
-    return root;
   }
 
   let slug = slugifyConvTitle(title);

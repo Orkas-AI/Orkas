@@ -36,14 +36,15 @@ export interface CatalogEntry {
   oauthOnly?: boolean;        // if true, hide the API-key path entirely
   /** Per-provider prerequisite note shown on the card + the add-key form.
    *  Used when the same "brand" has two independent billing/auth surfaces
-   *  (e.g. Moonshot 开放平台按量付费 vs. Kimi Coding Plan 月付订阅) so users
+   *  (e.g. Moonshot pay-as-you-go open platform vs. Kimi Coding Plan
+   *  monthly subscription) so users
    *  can tell which one they have before wasting a key. Keep it short —
    *  one sentence max, UI shows it with a warning-style accent.
    *
    *  **Value is an i18n key** (e.g. `provider.moonshot.note_paygo`), not raw
    *  text. Renderer resolves via `t()` so the hint follows UI language. */
   subscriptionNote?: string;
-  /** Mark a provider as the recommended default. UI shows a "推荐 / Recommended"
+  /** Mark a provider as the recommended default. UI shows a "Recommended"
    *  suffix on the picker label. Purely cosmetic — does not change selection
    *  defaults or routing. */
   recommended?: boolean;
@@ -51,13 +52,14 @@ export interface CatalogEntry {
 
 // ── Ordered catalog (dropdown order = array order) ──────────────────────
 //
-// Group 0: recommended default (DeepSeek 直连 — 国内速度 + 价格优势)
+// Group 0: recommended default (DeepSeek direct — best China latency + price)
 // Group 1: global frontier labs (Anthropic, OpenAI, Google)
 // Group 2: China mainstream (Zhipu GLM, Moonshot Kimi, MiniMax)
 // Group 3: aggregators (OpenRouter)
 
 export const CATALOG: readonly CatalogEntry[] = [
-  // DeepSeek 直连（pi-ai 0.68.1 不带，走 external-providers.ts 的 openai-completions 适配）
+  // DeepSeek direct (not in pi-ai 0.68.1; routed through the
+  // openai-completions adapter in external-providers.ts).
   { id: 'deepseek',     label: 'DeepSeek',      docsUrl: 'https://platform.deepseek.com/api_keys', recommended: true },
 
   { id: 'openai-codex', label: 'OpenAI Codex',  oauthOnly: true },
@@ -66,11 +68,14 @@ export const CATALOG: readonly CatalogEntry[] = [
   { id: 'anthropic',    label: 'Anthropic',     docsUrl: 'https://console.anthropic.com/settings/keys' },
 
   { id: 'zai',                label: 'Zhipu GLM',     docsUrl: 'https://open.bigmodel.cn/usercenter/proj-mgmt/apikeys',      region: 'cn' },
-  // Moonshot 有两条独立计费的 endpoint：
-  //   - `moonshot` → https://api.moonshot.cn/v1 （OpenAI 兼容，按量付费开放平台）
-  //   - `kimi-coding` → https://api.kimi.com/coding （Anthropic 协议，Kimi 编程订阅月付专用）
-  // 两条都绑在同一 Moonshot 账号上但鉴权/额度完全独立，一张 key 不能两边通用。
-  // UI 上分成两张独立卡片，各自带 `subscriptionNote` 提示前提条件。
+  // Moonshot has two independently-billed endpoints:
+  //   - `moonshot` → https://api.moonshot.cn/v1 (OpenAI-compatible,
+  //     pay-as-you-go open platform).
+  //   - `kimi-coding` → https://api.kimi.com/coding (Anthropic protocol,
+  //     monthly subscription for Kimi Coding only).
+  // Both bind to the same Moonshot account but have separate auth and
+  // quota — a single key cannot be used on both. The UI shows them as
+  // two separate cards, each with its own `subscriptionNote`.
   { id: 'moonshot',           label: 'Moonshot',      docsUrl: 'https://platform.moonshot.cn/console/api-keys',              region: 'cn',
     subscriptionNote: 'provider.moonshot.note_paygo' },
   { id: 'kimi-coding',        label: 'Moonshot Coding Plan', docsUrl: 'https://platform.moonshot.cn/console/api-keys',           region: 'cn',
@@ -82,7 +87,7 @@ export const CATALOG: readonly CatalogEntry[] = [
   { id: 'minimax-portal-cn',  label: 'MiniMax (CN)',     oauthOnly: true, region: 'cn' },
   { id: 'minimax-cn',         label: 'MiniMax',       docsUrl: 'https://platform.minimaxi.com/user-center/basic-information/interface-key', region: 'cn' },
 
-  // 豆包 / 火山方舟
+  // Doubao / Volcengine Ark
   { id: 'doubao',             label: 'Doubao',  docsUrl: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey', region: 'cn',
     subscriptionNote: '' },
 
@@ -99,10 +104,11 @@ export const CATALOG: readonly CatalogEntry[] = [
 // which keeps the last 2 version bands from pi-ai's raw list.
 
 export const CURATED_MODELS: Readonly<Record<string, readonly { id: string; name: string }[]>> = {
-  // Anthropic 直连：id 用 dash 形式（pi-ai 0.68.1 的 provider="anthropic" 用
-  // claude-<tier>-<major>-<minor>）。Opus 4.5–4.7、Sonnet 4.5/4.6、Haiku 4.5
-  // 是 pi-ai 0.68.1 实际存在的 id；sonnet-4-7 / haiku-4-6/4-7 在 pi-ai 里不
-  // 存在（2026-04 核对），已剔除。
+  // Anthropic direct: ids use dash form (pi-ai 0.68.1's
+  // provider="anthropic" uses claude-<tier>-<major>-<minor>). Opus 4.5–4.7,
+  // Sonnet 4.5/4.6 and Haiku 4.5 are real ids in pi-ai 0.68.1; sonnet-4-7
+  // and haiku-4-6/4-7 do not exist in pi-ai (verified 2026-04) and have
+  // been removed.
   anthropic: [
     { id: 'claude-opus-4-7',   name: 'Claude Opus 4.7' },
     { id: 'claude-opus-4-6',   name: 'Claude Opus 4.6' },
@@ -132,10 +138,11 @@ export const CURATED_MODELS: Readonly<Record<string, readonly { id: string; name
     { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
   ],
 
-  // Google Gemini 直连。pi-ai 0.68.1 的 provider="google" 只列出带 -preview
-  // 后缀的 3.x 条目（Google 当前 3.x 仍在预览阶段），稳定版最高到 2.5。旧
-  // 版 catalog 写的 `gemini-3.1-pro` / `gemini-3-pro` / `gemini-3.0-flash`
-  // 是幻觉 id（pi-ai 不认），已全部改为真实 id。
+  // Google Gemini direct. pi-ai 0.68.1's provider="google" only lists 3.x
+  // entries with the -preview suffix (Google's 3.x is still in preview);
+  // the stable line caps at 2.5. The old catalog had hallucinated ids
+  // `gemini-3.1-pro` / `gemini-3-pro` / `gemini-3.0-flash` which pi-ai
+  // does not recognize — all replaced with real ids.
   google: [
     { id: 'gemini-3.1-pro-preview',        name: 'Gemini 3.1 Pro (preview)' },
     { id: 'gemini-3.1-flash-lite-preview', name: 'Gemini 3.1 Flash Lite (preview)' },
@@ -151,19 +158,23 @@ export const CURATED_MODELS: Readonly<Record<string, readonly { id: string; name
     { id: 'glm-5v-turbo',   name: 'GLM-5V Turbo' },
   ],
 
-  // Moonshot 开放平台 — https://api.moonshot.cn/v1 (OpenAI 兼容，按量付费)。
-  // pi-ai 0.68.1 没注册这个 provider，我们通过 `model/core-agent/external-providers.ts`
-  // 手构 `Model<"openai-completions">` 直接调 pi-ai 的低阶 API。
-  // id 取自 platform.kimi.com/docs/models（2026-04 核对）。
-  // 只收录当代主力 K2.5 / K2.6（id 带点）；上一代 K2 preview 系列 2026-05-25 EOL
-  // 不再列出，避免新建凭证默认选到将停服的模型。
+  // Moonshot open platform — https://api.moonshot.cn/v1 (OpenAI-compatible,
+  // pay-as-you-go). pi-ai 0.68.1 does not register this provider; we
+  // hand-build a `Model<"openai-completions">` via
+  // `model/core-agent/external-providers.ts` and call pi-ai's low-level API
+  // directly. Ids are sourced from platform.kimi.com/docs/models
+  // (verified 2026-04). Only the current flagship K2.5 / K2.6 are listed
+  // (their ids contain a dot); the previous-gen K2 preview series EOLs
+  // 2026-05-25 and is intentionally omitted so new credentials don't default
+  // to a model that is about to be retired.
   moonshot: [
     { id: 'kimi-k2.6', name: 'Kimi K2.6' },
     { id: 'kimi-k2.5', name: 'Kimi K2.5' },
   ],
 
-  // Kimi Coding Plan — https://api.kimi.com/coding (Anthropic 协议，月付订阅专用)
-  // pi-ai 0.68.1 的 provider id 是 `kimi-coding`；新增 `k2p6` (K2.6)。
+  // Kimi Coding Plan — https://api.kimi.com/coding (Anthropic protocol,
+  // monthly subscription only). pi-ai 0.68.1's provider id is
+  // `kimi-coding`; `k2p6` (K2.6) was added.
   'kimi-coding': [
     { id: 'k2p6',             name: 'Kimi K2.6' },
     { id: 'kimi-for-coding',  name: 'Kimi For Coding' },
@@ -186,19 +197,25 @@ export const CURATED_MODELS: Readonly<Record<string, readonly { id: string; name
     { id: 'MiniMax-M2.7-highspeed', name: 'MiniMax M2.7 Highspeed' },
   ],
 
-  // DeepSeek V4 直连（OpenAI 兼容协议，base url https://api.deepseek.com/v1）。
-  // 2026-04-24 发布；旧 id `deepseek-chat` / `deepseek-reasoner` 官方明确将
-  // deprecate，分别对应 v4-flash 的非推理 / 推理模式。这里只收正式 id。
-  // 来源：https://api-docs.deepseek.com/quick_start/pricing （2026-04 核对）。
+  // DeepSeek V4 direct (OpenAI-compatible protocol, base url
+  // https://api.deepseek.com/v1). Released 2026-04-24; the old ids
+  // `deepseek-chat` / `deepseek-reasoner` are explicitly deprecated by the
+  // vendor — they map to v4-flash's non-reasoning / reasoning modes
+  // respectively. We only list the official ids here.
+  // Source: https://api-docs.deepseek.com/quick_start/pricing (verified 2026-04).
   deepseek: [
     { id: 'deepseek-v4-pro',   name: 'DeepSeek V4 Pro' },
     { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
   ],
 
-  // 豆包 Seed 2.0（火山方舟，OpenAI 兼容协议，base url https://ark.cn-beijing.volces.com/api/v3）。
-  // 2026-02-15 发布。Pro = 旗舰多模态，Lite = 性价比档。Mini / Code 子档暂
-  // 不收（Mini 边缘场景、Code 编程专用，常规 chat 主线列两档够了）。
-  // 火山方舟也支持用户自建接入点（ep-xxxx）—— 自建 id 直接在 entry 表手填覆盖即可。
+  // Doubao Seed 2.0 (Volcengine Ark, OpenAI-compatible, base url
+  // https://ark.cn-beijing.volces.com/api/v3). Released 2026-02-15.
+  // Pro = flagship multimodal, Lite = budget tier. Mini / Code subtiers
+  // are intentionally not listed (Mini is edge-only, Code is programming-
+  // specific; two tiers are enough for the chat main line).
+  // Volcengine Ark also supports user-defined endpoints (ep-xxxx) —
+  // those custom ids can be entered directly in the credential form to
+  // override.
   doubao: [
     { id: 'doubao-seed-2-0-pro-260215',  name: 'Doubao Seed 2.0 Pro' },
     { id: 'doubao-seed-2-0-lite-260215', name: 'Doubao Seed 2.0 Lite' },
@@ -303,8 +320,8 @@ export const OAUTH_PROVIDERS: readonly ProviderMeta[] = [
   { id: 'google-antigravity', label: 'Google Antigravity' },
   { id: 'github-copilot',     label: 'GitHub Copilot' },
   // Custom providers registered at runtime (features/oauth-minimax.ts).
-  { id: 'minimax-portal',     label: 'MiniMax 订阅 (Global)' },
-  { id: 'minimax-portal-cn',  label: 'MiniMax 订阅 (CN)' },
+  { id: 'minimax-portal',     label: 'MiniMax Subscription (Global)' },
+  { id: 'minimax-portal-cn',  label: 'MiniMax Subscription (CN)' },
 ];
 
 /**
@@ -385,18 +402,22 @@ export interface ImageGenCapability {
 }
 
 export const IMAGE_GEN_BY_PROVIDER: Readonly<Record<string, ImageGenCapability>> = {
-  // OpenAI GPT Image 2（2026-04-21 发布；HTTP 接口与 gpt-image-1 完全兼容，
-  // 仍走 /v1/images/generations + /v1/images/edits）。
+  // OpenAI GPT Image 2 (released 2026-04-21; HTTP interface is fully
+  // compatible with gpt-image-1 and still uses /v1/images/generations +
+  // /v1/images/edits).
   openai: { model: 'gpt-image-2',                     api: 'openai', supportsEdit: true },
-  // Google Nano Banana 2 = `gemini-3.1-flash-image-preview`（preview 后缀
-  // 是官方 model id 的一部分，不能去掉）。Pro 版叫 Nano Banana Pro
-  // (`gemini-3-pro-image-preview`)，本期先收 Flash —— 速度 + 价格更平衡。
+  // Google Nano Banana 2 = `gemini-3.1-flash-image-preview` (the -preview
+  // suffix is part of the official model id and must not be stripped).
+  // The Pro variant is Nano Banana Pro (`gemini-3-pro-image-preview`); we
+  // currently only ship Flash — better balance of speed and cost.
   google: { model: 'gemini-3.1-flash-image-preview',  api: 'gemini', supportsEdit: true },
-  // 火山方舟 Seedream 4.5（doubao-seedream-4-5-251128，2025-11-28 production）。
-  // OpenAI-compatible images endpoint (POST /api/v3/images/generations)，
-  // 文生图 / 图生图 / 多图组合都共用这一个 endpoint：body 不带 `image` 字段
-  // 就是文生图，带 `image: string | string[]`（URL 或 data URI）就是图生图。
-  // 旧的 seedream-3-0-t2i-250415 已下线（404）。
+  // Volcengine Ark Seedream 4.5 (doubao-seedream-4-5-251128, production
+  // 2025-11-28). OpenAI-compatible images endpoint
+  // (POST /api/v3/images/generations); text-to-image, image-to-image and
+  // multi-image composition all share this endpoint — without an `image`
+  // field in the body it's text-to-image, with `image: string | string[]`
+  // (URL or data URI) it's image-to-image. The old
+  // seedream-3-0-t2i-250415 has been retired (404).
   doubao: { model: 'doubao-seedream-4-5-251128',      api: 'doubao', supportsEdit: true },
 };
 

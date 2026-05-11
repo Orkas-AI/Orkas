@@ -6,7 +6,7 @@ import * as path from 'node:path';
 // Mock the model client so `runTurn` doesn't try to do a real LLM call.
 // `streamChatWithModel` returns an async iterator that yields one final
 // event with empty text + a done event; bus interprets that as "done,
-// no reply" and emits a "（无回复）" message. Good enough for the
+// no reply" and emits a "(no reply)" message. Good enough for the
 // integration assertions here — we're testing routing / persistence /
 // state, not actual model output.
 vi.mock('../../../../src/main/model/client', () => ({

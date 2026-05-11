@@ -4,7 +4,7 @@
 // sent immediately. Queue is per-cid, persisted in localStorage so a refresh
 // mid-stream doesn't drop pending messages. Drained one-by-one when the
 // current reply finishes (or is aborted). Each entry records the raw user
-// text plus the selected skill — the `使用 X skill：` prefix is applied at
+// text plus the selected skill — the "use skill X" prefix is applied at
 // dispatch time so a later skill change is reflected correctly.
 
 function _loadQueueFromStorage(cid) {
@@ -104,7 +104,7 @@ function _dispatchNextQueued(cid) {
   _updateConvSidebarBadge(cid);
   renderMessageQueue(cid);
   // Skill is an inline text prefix (applied at dispatch time so later skill
-  // changes take effect). Agent runs are just "运行 <name>" text — no flag.
+  // changes take effect). Agent runs are just "run <name>" text — no flag.
   // Recipient prefix (`@<agent>`) is also applied at dispatch time so the
   // message routes to whoever is currently selected in the chip.
   const withSkill = next.skill ? transformWithSkill(next.content, next.skill) : next.content;

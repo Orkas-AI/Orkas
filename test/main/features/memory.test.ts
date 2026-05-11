@@ -237,14 +237,14 @@ describe('memory › formatForSystemPrompt', () => {
     const mem = await loadMemory();
     const block = mem.formatForSystemPrompt('nobody');
     expect(block).toContain('cross_session_memory');
-    expect(block).toContain('暂无记忆条目');
+    expect(block).toContain('no memory entries yet');
   });
 
   it('includes guidance about when to call the tool', async () => {
     const mem = await loadMemory();
     const block = mem.formatForSystemPrompt('nobody');
-    expect(block).toContain('必须调用 tool');
-    expect(block).toContain('记住');
+    expect(block).toContain('MUST call');
+    expect(block).toContain('persistent memory');
     expect(block).toContain('target');
   });
 
@@ -256,7 +256,7 @@ describe('memory › formatForSystemPrompt', () => {
     expect(block).toContain('MEMORY');
     expect(block).toContain('fact one');
     expect(block).toContain('fact two');
-    expect(block).not.toContain('暂无记忆条目');
+    expect(block).not.toContain('no memory entries yet');
   });
 
   it('formats USER entries', async () => {

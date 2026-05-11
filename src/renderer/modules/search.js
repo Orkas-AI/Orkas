@@ -6,7 +6,7 @@
 const _SEARCH_HISTORY_KEY = 'search_history';
 const _SEARCH_HISTORY_MAX = 12;
 const _SEARCH_FETCH_LIMIT = 200;   // backend cap; we filter/slice locally per tab
-const _SEARCH_ALL_PER_SECTION = 10; // "all" tab shows up to N per section, overflow → 查看更多
+const _SEARCH_ALL_PER_SECTION = 10; // "all" tab shows up to N per section, overflow → "view more"
 let _searchTimer = null;
 let _searchSeq = 0;
 let _searchTab = 'all';             // 'all' | 'chat' | 'agent' | 'skill' | 'context'
@@ -223,12 +223,16 @@ function _renderSearchRow(r, dataIdx, query) {
   const label = metaCfg.labelKey ? t(metaCfg.labelKey) : r.kind;
   const roleLabel = (role) => (role === 'user' ? t('search.role.user') : t('search.role.ai'));
   let title = ''; let sub = '';
+  let projectChip = '';
   if (r.kind === 'context') {
     title = r.title || r.path;
     sub = r.path;
   } else if (r.kind === 'chat') {
     title = r.conv_title || t('chat.new_conv_title');
     sub = `${roleLabel(r.role)} · ${formatTime(r.time || '')}`;
+    if (r.project_name) {
+      projectChip = `<span class="search-result-project" title="${escapeHtml(r.project_name)}">${escapeHtml(r.project_name)}</span>`;
+    }
   } else if (r.kind === 'agent' || r.kind === 'skill') {
     title = r.name || r.id;
     const srcKey = _SEARCH_SOURCE_LABEL[r.source] || '';
@@ -240,6 +244,7 @@ function _renderSearchRow(r, dataIdx, query) {
       <div class="search-result-head">
         <span class="search-result-kind ${metaCfg.cls}">${escapeHtml(label)}</span>
         <span class="search-result-title">${escapeHtml(title)}</span>
+        ${projectChip}
         <span class="search-result-meta">${escapeHtml(sub)}</span>
       </div>
       <div class="search-result-snippet">${_highlightSnippet(r.snippet, query)}</div>
@@ -264,8 +269,11 @@ function _renderSearchResults(query) {
   const parts = [];
   const visible = [];
 
-  // "全部" tab 顺序：对话 → 智能体 → 技能 → 知识库；每段最多 _SEARCH_ALL_PER_SECTION 条，
-  // 超出给"查看更多"按钮跳到对应 tab。其它 tab 只显示自己那段（不截顶，让用户能滚完）。
+  // "All" tab order: chats → agents → skills → knowledge base; each
+  // section caps at _SEARCH_ALL_PER_SECTION rows, with overflow
+  // surfacing a "view more" button that jumps to the matching tab.
+  // Other tabs render their own section only (no cap, so the user can
+  // scroll through everything).
   const sections = [
     { tab: 'chat',    bucket: chats,    labelKey: 'search.section.chat' },
     { tab: 'agent',   bucket: agents,   labelKey: 'search.section.agent' },

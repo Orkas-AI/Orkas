@@ -33,6 +33,7 @@ import {
 } from '../../paths';
 import { getActiveUserId } from '../users';
 import { createLogger } from '../../logger';
+import { t } from '../../i18n';
 
 const log = createLogger('search');
 
@@ -174,6 +175,8 @@ export async function searchContexts(query: string, userId?: string): Promise<Se
   const q = (query || '').trim();
   if (!q) return [];
   const uid = userId || getActiveUserId();
+  // See `searchChats` for why we reconcile per-query.
+  await indexer.reconcileContextsIndex(uid);
   const entry = await indexer.getEntry(userContextsIndexPath(uid), 'context');
   const tokens = tokenize(q);
   const scores = _scoreIndex(entry.idx as RuntimeIndex, tokens);
@@ -194,20 +197,43 @@ export async function searchContexts(query: string, userId?: string): Promise<Se
 export async function searchChats(userId: string, query: string): Promise<SearchResult[]> {
   const q = (query || '').trim();
   if (!q) return [];
+  // Per the file-header invariant ("every query first calls reconcileX"):
+  // reconcile picks up jsonl files that grew or were created since the last
+  // reconcile (boot or prior query). Bus does NOT live-index — without this
+  // call, conversations created after startup are unsearchable until the
+  // next boot. Cheap: one stat per chat jsonl + re-tokenize only for those
+  // whose mtime/size changed.
+  await indexer.reconcileChatsIndex(userId);
   const entry = await indexer.getEntry(userChatsIndexPath(userId), 'chat');
   const tokens = tokenize(q);
   const scores = _scoreIndex(entry.idx as RuntimeIndex, tokens);
 
-  // Conversation titles for display.
+  // Conversation display data: title + project membership. Read from
+  // `_index.json` once per query so each result row gets cheap O(1) lookups.
   const indexFile = path.join(userChatsDir(userId), '_index.json');
   const titles: Record<string, string> = {};
+  const cidToPid: Record<string, string> = {};
   try {
     if (fs.existsSync(indexFile)) {
       const items = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
       const arr = Array.isArray(items) ? items : (items?.items || []);
-      for (const c of arr) titles[c.conversation_id] = c.title || '';
+      for (const c of arr) {
+        titles[c.conversation_id] = c.title || '';
+        if (c.project_id) cidToPid[c.conversation_id] = c.project_id;
+      }
     }
   } catch { /* ignore */ }
+
+  // Project name lookup — cheap (a few file reads). Only build when at
+  // least one indexed conv has a project_id.
+  const pidToName: Record<string, string> = {};
+  if (Object.keys(cidToPid).length) {
+    try {
+      const projects = await import('../projects');
+      const list = await projects.listProjects(userId);
+      for (const p of list) pidToName[p.project_id] = p.name || '';
+    } catch { /* ignore — chip just won't show */ }
+  }
 
   const cache = _makeSourceCache();
   return _topN<SearchResult>(scores, MAX_PER_KIND, (docId, score) => {
@@ -215,16 +241,24 @@ export async function searchChats(userId: string, query: string): Promise<Search
     if (!doc) return null;
     const file = path.join(userChatsDir(userId), `${doc.cid}.jsonl`);
     const msg = cache.jsonlMessage(file, Number(doc.msg_index));
-    return {
+    const cid = String(doc.cid);
+    const pid = cidToPid[cid] || '';
+    const result: SearchResult = {
       kind: 'chat',
       cid: doc.cid,
       msg_index: doc.msg_index,
-      conv_title: titles[String(doc.cid)] || '新对话',
+      conv_title: titles[cid] || t('chat.default_title'),
       role: doc.role,
       time: doc.time,
-      snippet: _makeSnippet(msg && typeof msg.content === 'string' ? msg.content : '', q),
+      snippet: _makeSnippet(indexer.readMsgText(msg as any), q),
       score,
     };
+    if (pid) {
+      (result as any).project_id = pid;
+      const name = pidToName[pid];
+      if (name) (result as any).project_name = name;
+    }
+    return result;
   });
 }
 

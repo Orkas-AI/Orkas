@@ -178,7 +178,16 @@ export async function uploadAttachment(
   const target = uniqueTarget(dir, safeName);
   const finalName = path.basename(target);
   try { fs.writeFileSync(target, buf); }
-  catch (err) { return { ok: false, error: (err as Error).message }; }
+  catch (err) {
+    // Roll back the mkdir from `ensureDir` if the directory ended up empty
+    // (i.e., this was the first attachment for the cid and the write failed
+    // before producing anything). Best-effort: a non-empty dir means a
+    // previous successful upload owns it and must not be touched.
+    try {
+      if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
+    } catch { /* best-effort */ }
+    return { ok: false, error: (err as Error).message };
+  }
 
   // No upload-time preprocessing: extract / grayscale happen lazily in
   // features/file_indexer when the model's tools first touch this file.
@@ -278,6 +287,12 @@ export function deleteAttachment(userId: string, cid: string, name: string): Res
   // Drop the lazy file_cache entry for this source (if any was materialised).
   try { invalidateFileCache(userId, p); }
   catch (err) { log.warn(`invalidate cache ${p}: ${(err as Error).message}`); }
+  // Remove the per-cid directory if this was the last attachment — leaving
+  // empty `chat_attachments/<cid>/` shells around violates the "no payload,
+  // no directory" expectation, and the user has no UI to clean them up.
+  try {
+    if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
+  } catch { /* best-effort */ }
   return { ok: true };
 }
 
@@ -388,7 +403,8 @@ function imageMimeFromExt(ext: string): ImageMimeType {
 }
 
 /**
- * Move an entire draft attachment dir (e.g. `main_chat/`, used by 总指挥 tab
+ * Move an entire draft attachment dir (e.g. `main_chat/`, used by the
+ * commander tab
  * before a conversation exists) into a freshly-minted `<cid>/`. No caches
  * need to follow — cache entries are keyed by absolute path and will simply
  * point at the old draft location until next access, at which point

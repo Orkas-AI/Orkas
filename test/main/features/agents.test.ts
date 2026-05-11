@@ -248,10 +248,10 @@ describe('agents › isValidAgentId', () => {
 });
 
 describe('agents › extractAgentFieldBlocks', () => {
-  it('returns original text with empty fields when no marker', async () => {
+  it('returns original text with empty blocks when no marker', async () => {
     const a = await loadAgents();
     const r = a.extractAgentFieldBlocks('just prose');
-    expect(r.fields).toEqual({});
+    expect(r.blocks).toEqual([]);
     expect(r.cleanText).toBe('just prose');
   });
 
@@ -270,7 +270,8 @@ describe('agents › extractAgentFieldBlocks', () => {
       'after',
     ].join('\n');
     const r = a.extractAgentFieldBlocks(text);
-    expect(r.fields).toEqual({
+    expect(r.blocks).toHaveLength(1);
+    expect(r.blocks[0]).toEqual({
       name: 'Planner',
       description: 'Plans things',
       workflow: 'step 1\nstep 2',
@@ -281,17 +282,64 @@ describe('agents › extractAgentFieldBlocks', () => {
     expect(r.cleanText).not.toContain('</agent>');
   });
 
+  it('extracts every <agent> container in emission order (multi-agent turn)', async () => {
+    const a = await loadAgents();
+    const text = [
+      'prose',
+      '<agent>',
+      '<agent_id>aaaaaaaaaaaa</agent_id>',
+      '<workflow>w-A</workflow>',
+      '</agent>',
+      'middle',
+      '<agent>',
+      '<agent_id>bbbbbbbbbbbb</agent_id>',
+      '<workflow>w-B</workflow>',
+      '</agent>',
+      'tail',
+    ].join('\n');
+    const r = a.extractAgentFieldBlocks(text);
+    expect(r.blocks).toHaveLength(2);
+    expect(r.blocks[0].agent_id).toBe('aaaaaaaaaaaa');
+    expect(r.blocks[0].workflow).toBe('w-A');
+    expect(r.blocks[1].agent_id).toBe('bbbbbbbbbbbb');
+    expect(r.blocks[1].workflow).toBe('w-B');
+    expect(r.cleanText).not.toContain('<agent>');
+    expect(r.cleanText).toContain('prose');
+    expect(r.cleanText).toContain('middle');
+    expect(r.cleanText).toContain('tail');
+  });
+
+  it('parses each block independently — a malformed sub-tag in one does not affect the other', async () => {
+    const a = await loadAgents();
+    const text = [
+      '<agent>',
+      '<agent_id>aaaaaaaaaaaa</agent_id>',
+      '<workflow>good-A</workflow>',
+      '<inputs>not-json{</inputs>',
+      '</agent>',
+      '<agent>',
+      '<agent_id>bbbbbbbbbbbb</agent_id>',
+      '<workflow>good-B</workflow>',
+      '</agent>',
+    ].join('\n');
+    const r = a.extractAgentFieldBlocks(text);
+    expect(r.blocks).toHaveLength(2);
+    expect(r.blocks[0].workflow).toBe('good-A');
+    expect('inputs' in r.blocks[0]).toBe(false);  // malformed JSON → key omitted
+    expect(r.blocks[1].workflow).toBe('good-B');
+  });
+
   it('ignores child tags with empty body', async () => {
     const a = await loadAgents();
     const r = a.extractAgentFieldBlocks('<agent><name>   </name></agent>');
-    expect(r.fields).toEqual({});
+    expect(r.blocks).toEqual([{}]);
   });
 
   it('extracts <skills> child into string[] (one id per line)', async () => {
     const a = await loadAgents();
     const text = '<agent><skills>\nsocial-fetch\nmulti-analysis\n</skills></agent>';
     const r = a.extractAgentFieldBlocks(text);
-    expect(r.fields.skill_list).toEqual(['social-fetch', 'multi-analysis']);
+    expect(r.blocks[0].skill_list).toEqual(['social-fetch', 'multi-analysis']);
   });
 
   it('treats empty <skills> child as explicit [] (zero skills)', async () => {
@@ -299,20 +347,20 @@ describe('agents › extractAgentFieldBlocks', () => {
     // Empty tag must be distinguishable from an absent tag — the former
     // means "this agent needs NO skills", the latter means "leave unchanged".
     const r = a.extractAgentFieldBlocks('<agent><skills>\n\n</skills></agent>');
-    expect(r.fields.skill_list).toEqual([]);
+    expect(r.blocks[0].skill_list).toEqual([]);
   });
 
   it('filters non-safeId entries from <skills> child', async () => {
     const a = await loadAgents();
     const text = '<agent><skills>\nok-1\n../evil\n  \ngood_2\n</skills></agent>';
     const r = a.extractAgentFieldBlocks(text);
-    expect(r.fields.skill_list).toEqual(['ok-1', 'good_2']);
+    expect(r.blocks[0].skill_list).toEqual(['ok-1', 'good_2']);
   });
 
   it('does not set skill_list when no <skills> child present', async () => {
     const a = await loadAgents();
     const r = a.extractAgentFieldBlocks('<agent><name>A</name></agent>');
-    expect('skill_list' in r.fields).toBe(false);
+    expect('skill_list' in r.blocks[0]).toBe(false);
   });
 
   // <interactive> drives the input-box auto-target. Each branch matters:
@@ -322,34 +370,34 @@ describe('agents › extractAgentFieldBlocks', () => {
   it('extracts <interactive>true</interactive> as boolean true', async () => {
     const a = await loadAgents();
     const r = a.extractAgentFieldBlocks('<agent><interactive>true</interactive></agent>');
-    expect(r.fields.interactive).toBe(true);
+    expect(r.blocks[0].interactive).toBe(true);
   });
 
   it('extracts <interactive>false</interactive> as boolean false', async () => {
     const a = await loadAgents();
     const r = a.extractAgentFieldBlocks('<agent><interactive>false</interactive></agent>');
-    expect(r.fields.interactive).toBe(false);
+    expect(r.blocks[0].interactive).toBe(false);
   });
 
   it('accepts case-insensitive TRUE/False', async () => {
     const a = await loadAgents();
     expect(a.extractAgentFieldBlocks('<agent><interactive>TRUE</interactive></agent>')
-      .fields.interactive).toBe(true);
+      .blocks[0].interactive).toBe(true);
     expect(a.extractAgentFieldBlocks('<agent><interactive>False</interactive></agent>')
-      .fields.interactive).toBe(false);
+      .blocks[0].interactive).toBe(false);
   });
 
   it('omits interactive key when child is absent', async () => {
     const a = await loadAgents();
     const r = a.extractAgentFieldBlocks('<agent><name>A</name></agent>');
-    expect('interactive' in r.fields).toBe(false);
+    expect('interactive' in r.blocks[0]).toBe(false);
   });
 
   it('omits interactive key for non-boolean bodies (no silent flip)', async () => {
     const a = await loadAgents();
-    expect('interactive' in a.extractAgentFieldBlocks('<agent><interactive>yes</interactive></agent>').fields).toBe(false);
-    expect('interactive' in a.extractAgentFieldBlocks('<agent><interactive>1</interactive></agent>').fields).toBe(false);
-    expect('interactive' in a.extractAgentFieldBlocks('<agent><interactive></interactive></agent>').fields).toBe(false);
+    expect('interactive' in a.extractAgentFieldBlocks('<agent><interactive>yes</interactive></agent>').blocks[0]).toBe(false);
+    expect('interactive' in a.extractAgentFieldBlocks('<agent><interactive>1</interactive></agent>').blocks[0]).toBe(false);
+    expect('interactive' in a.extractAgentFieldBlocks('<agent><interactive></interactive></agent>').blocks[0]).toBe(false);
   });
 });
 
@@ -480,7 +528,7 @@ describe('agents › extractAgentFieldBlocks › inputs', () => {
       'tail',
     ].join('\n');
     const r = a.extractAgentFieldBlocks(txt);
-    expect(r.fields.inputs).toEqual([
+    expect(r.blocks[0].inputs).toEqual([
       { id: 'kw', label: '关键词', type: 'text', default: '' },
     ]);
     expect(r.cleanText).not.toContain('<agent>');
@@ -490,19 +538,19 @@ describe('agents › extractAgentFieldBlocks › inputs', () => {
   it('treats empty inputs child as explicit []', async () => {
     const a = await loadAgents();
     const r = a.extractAgentFieldBlocks('<agent><inputs>\n\n</inputs></agent>');
-    expect(r.fields.inputs).toEqual([]);
+    expect(r.blocks[0].inputs).toEqual([]);
   });
 
   it('omits inputs key when JSON is malformed (does NOT erase existing schema)', async () => {
     const a = await loadAgents();
     const r = a.extractAgentFieldBlocks('<agent><inputs>\nnot-json{\n</inputs></agent>');
-    expect('inputs' in r.fields).toBe(false);
+    expect('inputs' in r.blocks[0]).toBe(false);
   });
 
   it('does not set inputs when no <inputs> child present', async () => {
     const a = await loadAgents();
     const r = a.extractAgentFieldBlocks('<agent><name>A</name></agent>');
-    expect('inputs' in r.fields).toBe(false);
+    expect('inputs' in r.blocks[0]).toBe(false);
   });
 });
 
@@ -538,10 +586,10 @@ describe('agents › createCustomAgent', () => {
     expect(fs.existsSync(file)).toBe(true);
   });
 
-  it('defaults empty name to 未命名智能体', async () => {
+  it('defaults empty name to the localized "Untitled agent" fallback', async () => {
     const a = await loadAgents();
     const agent = await a.createCustomAgent();
-    expect(agent?.name).toBe('未命名智能体');
+    expect(agent?.name).toBe('Untitled agent');
   });
 
   it('rejects reserved names (collide with commander role / sidebar tab)', async () => {
@@ -620,11 +668,11 @@ describe('agents › updateCustomAgent', () => {
     expect(updated?.workflow).toBe('wf');  // preserved
   });
 
-  it('backfills empty name to 未命名智能体', async () => {
+  it('backfills empty name to the localized "Untitled agent" fallback', async () => {
     writeCustomAgent('abc', { name: 'Old' });
     const a = await loadAgents();
     const updated = await a.updateCustomAgent('abc', { name: '' });
-    expect(updated?.name).toBe('未命名智能体');
+    expect(updated?.name).toBe('Untitled agent');
   });
 
   it('rejects renaming to a reserved name', async () => {
