@@ -152,7 +152,10 @@ describe("SkillLoader", () => {
     const block = loader.renderSystemPromptBlock();
     expect(block).toContain("## Available skills");
     // Each entry carries a `Source` tag (dir basename) so the LLM can pick
-    // the right path prefix without probing both roots.
+    // the right path prefix without probing both roots. (Note: Orkas's
+    // production renderer in skill-registry.ts uses richer formatting with
+    // inline ROOT path headers; this default helper stays minimal and is
+    // only consumed by other hosts / by these tests.)
     expect(block).toContain("**alpha** (Source: custom) — alpha desc");
     expect(block).toContain("**beta** (Source: builtin) — beta desc");
     // id must never be shown twice — the name==id invariant holds.

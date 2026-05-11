@@ -54,6 +54,26 @@ describe('group_chat router › parseMentions', () => {
     // 缺省 fromKind 等价老行为(向后兼容)
     expect(parseMentions(text)).toEqual(['需求挖掘师', '全面评估师']);
   });
+
+  // Quote-reply prepends the quoted bubble's body as `> ...` blockquote
+  // lines. `@<name>` inside that quote refers to the original author's
+  // dispatch — re-routing to it whenever someone forwards the bubble
+  // is wrong (the user's intent is in their own typed prose, not in the
+  // pasted-in context). Lines starting with `>` are stripped from the
+  // routing-relevant view.
+  it('ignores @-mentions inside `>` blockquote lines (quote-reply context)', () => {
+    // Pure quote, no body → no mentions parsed (default routing applies upstream).
+    expect(parseMentions('> hi @alice')).toEqual([]);
+    // Quote contains @, body has its own @ → only the body's @ counts.
+    expect(parseMentions('> previous reply mentioned @alice\n@bob please review'))
+      .toEqual(['bob']);
+    // Multi-line quote, multiple @s ignored; user's plain @ kept.
+    expect(parseMentions('> line one @x\n> line two @y\nfinal: @z'))
+      .toEqual(['z']);
+    // Leading whitespace before `>` (some clients indent quotes).
+    expect(parseMentions('   > @alice from somewhere\nplain @bob'))
+      .toEqual(['bob']);
+  });
 });
 
 describe('group_chat router › resolveRecipients', () => {

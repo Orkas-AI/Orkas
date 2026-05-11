@@ -1,22 +1,29 @@
 // Pure string functions for atomic-container stripping of LLM-emitted
-// structural blocks surfacing in renderer text. Two delimiter families:
+// structural blocks surfacing in renderer text. Two delimiter families,
+// both Agent and Skill flows:
 //
 // **XML-tag containers** (handled via `tagName` parameter):
-//   - `<agent>`               — commander create / edit container
+//   - `<agent>`               — commander create / edit agent container
 //   - `<agent-input-form>`    — agent's form widget (streaming placeholder)
 //   - `<agent-input-submission>` — user form-reply tag (display strip)
+//   - `<skill>`               — commander create / edit skill container
+//                               (`_stripSkillCreateContainer`: closed →
+//                                strip outer + `<skill_id>`, keep inner
+//                                per-file placeholders; unclosed → fallback)
 //
 // **Custom-fence blocks** (`<<<delim ... \n>>>`):
-//   - `<<<skill-file path=X ... >>>` — skill edit chat's file-write block
+//   - `<<<skill-file path=X ... >>>` — file-write block, used by BOTH the
+//     per-skill edit chat AND the commander's `<skill>` container body.
 //
 // The two families coexist because their **content shapes differ**: XML-tag
 // containers wrap structured LLM-generated prose (sub-fields like
-// `<workflow>` / `<inputs>`) and balanced-tag parsing is the natural fit;
-// the skill-file block wraps **arbitrary file content** (Python, TypeScript,
-// HTML, JSX, configs) that routinely contains naked `<` / `>` characters,
-// so a literal three-char fence is required to avoid colliding with body
-// content. Same justification as the LLM-side prompts (`chat_agent_setup.md`
-// chose XML, `chat_skill_setup.md` chose `<<<>>>`).
+// `<workflow>` / `<inputs>` / `<skill_id>`) and balanced-tag parsing is the
+// natural fit; the skill-file block wraps **arbitrary file content**
+// (Python, TypeScript, HTML, JSX, configs) that routinely contains naked
+// `<` / `>` characters, so a literal three-char fence is required to avoid
+// colliding with body content. Same justification as the LLM-side prompts
+// (`chat_agent_setup.md` / `chat_commander.md` chose XML for `<agent>` / `<skill>`,
+// `chat_skill_setup.md` chose `<<<>>>` for file blocks).
 //
 // Both families share the same prose/code guard — if any of them is
 // mentioned literally inside a fenced code block or inline backtick span
@@ -29,7 +36,7 @@
 // Lives in a standalone file so vitest can `require()` it under Node and
 // pin the set-A vs set-B invariants — regressions in this category aren't
 // catchable by typecheck or eyeball review. Matching test file:
-// `test/renderer/strip-agent.test.ts`.
+// `test/renderer/strip-structural-blocks.test.ts`.
 //
 // CommonJS-export tail at the bottom is the ONLY allowed escape from the
 // renderer's "no export/import" rule (PC/CLAUDE.md §8) — it's guarded by
@@ -348,10 +355,46 @@ function _replaceOuterSkillFileBlocks(buf, makePlaceholder) {
   return out;
 }
 
+// Streaming-time strip for the commander's `<skill>` container. Two modes:
+//   - **Closed** `<skill>...</skill>` → strip outer tags + any `<skill_id>`
+//     sub-tag, keep the inner content. The inner `<<<skill-file>>>` blocks
+//     have already been transformed into per-file placeholders by an
+//     earlier pipeline pass; surfacing those gives the user "Writing X…"
+//     progress that matches the per-skill edit chat.
+//   - **Unclosed** (LLM still streaming the container) → replace the whole
+//     half-open range with `fallbackPlaceholder` so naked `<skill>` /
+//     `<skill_id>` tokens never bleed into the bubble.
+// Pure function: no DOM / i18n / escapeHtml. Caller passes the
+// already-built placeholder string. Companion `_stripSurvivingSkillContainer`
+// below is the final-time safety net (no placeholder; just removes raw
+// containers a buggy LLM might leak past the backend extractor).
+function _stripSkillCreateContainer(buf, fallbackPlaceholder) {
+  if (!buf || buf.indexOf('<skill>') < 0) return buf;
+  const ranges = _findOuterTagRanges(buf, 'skill');
+  if (!ranges.length) return buf;
+  let out = '';
+  let cursor = 0;
+  for (const [s, e] of ranges) {
+    out += buf.slice(cursor, s);
+    const block = buf.slice(s, e);
+    if (block.endsWith('</skill>')) {
+      out += block
+        .replace(/^<skill>\s*/, '')
+        .replace(/\s*<\/skill>$/, '')
+        .replace(/<skill_id>[\s\S]*?<\/skill_id>\s*/g, '');
+    } else {
+      out += fallbackPlaceholder;
+    }
+    cursor = e;
+  }
+  out += buf.slice(cursor);
+  return out.replace(/\n{3,}/g, '\n\n');
+}
+
 function _stripSurvivingStructuralBlocks(text) {
   if (!text) return text;
   let out = text;
-  for (const tag of ['agent', 'agent-input-form', 'agent-input-submission']) {
+  for (const tag of ['agent', 'agent-input-form', 'agent-input-submission', 'skill']) {
     out = _stripOuterTagBlocks(out, tag);
   }
   // `<<<skill-file>>>` blocks: backend `extractSkillFileBlocks` strips them
@@ -378,6 +421,7 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     _stripOuterSkillFileBlocks,
     _replaceOuterSkillFileBlocks,
     _extractSkillFilePath,
+    _stripSkillCreateContainer,
     _stripSurvivingStructuralBlocks,
   };
 }

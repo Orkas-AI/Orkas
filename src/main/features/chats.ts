@@ -51,6 +51,12 @@ export interface Conversation {
    * agents in the group have their own per-(conv,agent) session ids derived
    * via state.buildGmemberSessionId. */
   session_id: string;
+  /** Optional project membership. Frozen at create time; not mutable after
+   *  creation. Empty / absent → conversation lives outside any project (the
+   *  default sidebar group). The project itself is just metadata —
+   *  `<cid>.jsonl`, `groupChatDir`, `chat_attachments`, and `session_id`
+   *  paths stay verbatim, so cid uniqueness + §5 isolation are unaffected. */
+  project_id?: string;
   created_at: string;
   updated_at: string;
   /** Derived from group_chat state.json at read time; never persisted on
@@ -153,10 +159,14 @@ export interface CreateConversationOptions {
   agentId?: string;
   skillId?: string;
   title?: string;
+  /** Optional project membership. Caller (IPC layer) is responsible for
+   *  validating the projectId exists for this user — chats.ts persists it
+   *  verbatim. */
+  projectId?: string;
 }
 
 export async function createConversation(userId: string, {
-  kind = 'normal', agentId = '', skillId = '', title = '',
+  kind = 'normal', agentId = '', skillId = '', title = '', projectId = '',
 }: CreateConversationOptions = {}): Promise<Conversation> {
   const cid = genConversationId();
   const conv: Conversation = {
@@ -166,6 +176,7 @@ export async function createConversation(userId: string, {
     agent_id: agentId || '',
     skill_id: skillId || '',
     session_id: buildGconvSessionId(userId, cid),
+    ...(projectId ? { project_id: projectId } : {}),
     created_at: nowIso(),
     updated_at: nowIso(),
   };
@@ -174,7 +185,7 @@ export async function createConversation(userId: string, {
   await saveConversations(userId, items);
   // Touch jsonl so subsequent reads don't 404.
   await fsp.writeFile(path.join(ensureUserDir(userId), `${cid}.jsonl`), '', { flag: 'a' });
-  log.info(`created user=${userId} cid=${cid} kind=${kind} agent=${agentId || '-'} skill=${skillId || '-'}`);
+  log.info(`created user=${userId} cid=${cid} kind=${kind} agent=${agentId || '-'} skill=${skillId || '-'} project=${projectId || '-'}`);
   return conv;
 }
 
@@ -254,6 +265,26 @@ export async function deleteConversation(userId: string, cid: string): Promise<b
  *  history load; subsequent updates flow through group_chat.streamEvents. */
 export async function getMessages(userId: string, cid: string, limit = 200): Promise<MessageRecord[]> {
   return readJsonl<MessageRecord>(path.join(ensureUserDir(userId), `${cid}.jsonl`), limit);
+}
+
+/** Drop every conversation belonging to `userId`. Loops `deleteConversation`
+ *  so the full cascade (group dir / main jsonl / sessions / attachments / CLI
+ *  / search index) runs per cid; one cid's failure doesn't abort the rest.
+ *  Returns the number actually removed. Used by Settings → "Clear all
+ *  conversations". */
+export async function deleteAllConversations(userId: string): Promise<number> {
+  const items = await listConversations(userId);
+  if (!items.length) return 0;
+  let deleted = 0;
+  for (const c of items) {
+    try {
+      if (await deleteConversation(userId, c.conversation_id)) deleted++;
+    } catch (err) {
+      log.warn(`bulk-delete failed user=${userId} cid=${c.conversation_id}: ${(err as Error).message}`);
+    }
+  }
+  log.info(`deleted-all user=${userId} count=${deleted}`);
+  return deleted;
 }
 
 /** Drop every conversation tied to `agentId` across every user. Called when

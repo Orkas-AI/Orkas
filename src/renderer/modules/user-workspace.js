@@ -1,14 +1,30 @@
 // ─── User Workspace selector ────────────────────────────────────────
-// Adds a "workspace" chip to the bottom-left of chat input toolbars
-// (new-chat + conversation + agent-edit). Clicking it opens a dropdown
-// with Default workspace, recently used workspaces, and a folder picker.
+// Adds a "workspace" chip to the bottom bar of chat input toolbars
+// (new-chat + conversation). Clicking it opens a dropdown with Default
+// workspace, recently used workspaces, and a folder picker.
+//
+// **Scoped resolution** (per CLAUDE.md projects feature):
+//   - On the conversation panel, the chip resolves scope from the active
+//     `currentCid` — main looks up `conv.project_id` and operates on the
+//     project's per-scope workspace entry. Changes apply to every conv in
+//     that project.
+//   - On the commander (new-chat) panel, the chip reads the current
+//     project pick from `getCommanderProjectId()` (managed by
+//     modules/projects.js / conversation.js commander chip). When the
+//     commander has no project picked, scope falls back to default.
 //
 // Depends on: ipc-shim.js (apiFetch / window.orkas.invoke)
 
 const _wsLog = createLogger('user-workspace');
 
-/** Cached workspace info. */
-let _wsInfo = { currentPath: '', defaultPath: '', isDefault: true, recentPaths: [] };
+/** Cached workspace info, keyed by chip target. The chip on the conversation
+ *  panel and the chip on the commander panel may show different paths when
+ *  they resolve to different scopes (e.g. conv belongs to project A, commander
+ *  has project B picked). */
+const _wsInfoByTarget = {
+  'new-chat': { currentPath: '', defaultPath: '', isDefault: true, recentPaths: [], scope: 'default' },
+  'conversation': { currentPath: '', defaultPath: '', isDefault: true, recentPaths: [], scope: 'default' },
+};
 
 // ── Workspace display helpers ───────────────────────────────────────
 
@@ -19,28 +35,62 @@ function _wsFolderName(fullPath) {
   return parts[parts.length - 1] || fullPath;
 }
 
-/** Update all workspace chip labels on the page. */
-function _updateAllChips() {
-  const name = _wsFolderName(_wsInfo.currentPath);
-  const chips = document.querySelectorAll('.workspace-chip');
-  for (const chip of chips) {
-    const label = chip.querySelector('.workspace-chip-label');
-    if (label) label.textContent = name;
-    chip.title = _wsInfo.currentPath || t('workspace.chip_title');
+/** Build the scope hint payload for a given chip target. The conversation
+ *  panel passes `cid` (main resolves cid → conv.project_id); the commander
+ *  panel passes `projectId` from the current commander chip pick. */
+function _wsScopeHintFor(target) {
+  if (target === 'conversation') {
+    return currentCid ? { cid: currentCid } : {};
   }
+  // new-chat / commander panel
+  if (typeof getCommanderProjectId === 'function') {
+    const pid = getCommanderProjectId();
+    if (pid) return { projectId: pid };
+  }
+  return {};
+}
+
+/** Update workspace chip label for one or both targets. */
+function _updateChipForTarget(target) {
+  const info = _wsInfoByTarget[target] || _wsInfoByTarget['conversation'];
+  const sel = target === 'new-chat'
+    ? '#panel-new-chat .workspace-chip'
+    : '#panel-conversation .workspace-chip';
+  const chip = document.querySelector(sel);
+  if (!chip) return;
+  const label = chip.querySelector('.workspace-chip-label');
+  if (label) label.textContent = _wsFolderName(info.currentPath);
+  // Tooltip carries the full path + scope context (project vs default).
+  let tooltip = info.currentPath || t('workspace.chip_title');
+  if (info.scope === 'project' && typeof getCommanderProjectIdName === 'function') {
+    // Resolve a friendly project name when available; fallback to the id.
+    const name = getCommanderProjectIdName(info.projectId);
+    if (name) tooltip += ` · ${t('workspace.scope_project', { name })}`;
+  } else if (info.scope === 'project') {
+    tooltip += ` · ${t('workspace.scope_project_generic')}`;
+  }
+  chip.title = tooltip;
+}
+
+function _updateAllChips() {
+  _updateChipForTarget('new-chat');
+  _updateChipForTarget('conversation');
 }
 
 // ── Core actions ────────────────────────────────────────────────────
 
-async function _fetchWorkspaceInfo() {
+async function _fetchWorkspaceInfo(target) {
+  const hint = _wsScopeHintFor(target);
   try {
-    const result = await window.orkas.invoke('workspace.getInfo', {});
+    const result = await window.orkas.invoke('workspace.getInfo', hint);
     if (result && result.ok) {
-      _wsInfo = {
+      _wsInfoByTarget[target] = {
         currentPath: result.currentPath || '',
         defaultPath: result.defaultPath || '',
         isDefault: !!result.isDefault,
         recentPaths: result.recentPaths || [],
+        scope: result.scope || 'default',
+        ...(result.projectId ? { projectId: result.projectId } : {}),
       };
     }
   } catch (err) {
@@ -48,7 +98,15 @@ async function _fetchWorkspaceInfo() {
   }
 }
 
-async function _selectAndSetWorkspace(dirPath) {
+/** Refetch info for both targets — called on boot, on commander chip change,
+ *  and on conversation switch. */
+async function _refreshAllWorkspaceInfo() {
+  await Promise.all([_fetchWorkspaceInfo('new-chat'), _fetchWorkspaceInfo('conversation')]);
+  _updateAllChips();
+}
+
+async function _selectAndSetWorkspace(target, dirPath) {
+  const hint = _wsScopeHintFor(target);
   try {
     let selectedPath = dirPath;
     if (!selectedPath) {
@@ -56,33 +114,33 @@ async function _selectAndSetWorkspace(dirPath) {
       if (!dirResult || !dirResult.ok || !dirResult.path) return;
       selectedPath = dirResult.path;
     }
-    const setResult = await window.orkas.invoke('workspace.set', { path: selectedPath });
+    const setResult = await window.orkas.invoke('workspace.set', { path: selectedPath, ...hint });
     if (setResult && setResult.ok && setResult.path) {
-      await _fetchWorkspaceInfo();
-      _updateAllChips();
-      _wsLog.info('workspace selected', setResult.path);
+      await _refreshAllWorkspaceInfo();
+      _wsLog.info('workspace selected', { target, path: setResult.path });
     }
   } catch (err) {
     _wsLog.error('workspace selection failed', err);
   }
 }
 
-async function _resetWorkspace() {
+async function _resetWorkspace(target) {
+  const hint = _wsScopeHintFor(target);
   try {
-    const result = await window.orkas.invoke('workspace.reset', {});
+    const result = await window.orkas.invoke('workspace.reset', hint);
     if (result && result.ok && result.path) {
-      await _fetchWorkspaceInfo();
-      _updateAllChips();
-      _wsLog.info('workspace reset to default', result.path);
+      await _refreshAllWorkspaceInfo();
+      _wsLog.info('workspace reset', { target, path: result.path });
     }
   } catch (err) {
     _wsLog.error('workspace reset failed', err);
   }
 }
 
-async function _openWorkspaceFolder() {
+async function _openWorkspaceFolder(target) {
+  const hint = _wsScopeHintFor(target);
   try {
-    const result = await window.orkas.invoke('workspace.openPath', {});
+    const result = await window.orkas.invoke('workspace.openPath', hint);
     if (result && result.ok) {
       _wsLog.info('workspace opened', result.path);
     }
@@ -93,24 +151,26 @@ async function _openWorkspaceFolder() {
 
 // ── Chip creation ───────────────────────────────────────────────────
 
-function _createWorkspaceChip() {
+function _createWorkspaceChip(target) {
   const chip = document.createElement('button');
   chip.type = 'button';
   chip.className = 'workspace-chip';
-  chip.title = _wsInfo.currentPath
-    || (typeof t === 'function' ? t('workspace.chip_title') : 'Click to pick a workspace');
+  chip.dataset.wsTarget = target;
+  chip.title = (typeof t === 'function' ? t('workspace.chip_title') : 'Click to pick a workspace');
+  // Text-prefix layout matches the recipient / project chip pattern
+  // ("给:" / "项目:" / "工作区:") — the folder icon was replaced per UX
+  // feedback so all three left-side chips read as "[label]: [value]".
+  const prefix = (typeof t === 'function' ? t('workspace.chip_label') : 'Workspace: ');
   chip.innerHTML =
-    '<svg class="workspace-chip-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">' +
-    '<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>' +
-    '</svg>' +
-    '<span class="workspace-chip-label">' + _wsFolderName(_wsInfo.currentPath) + '</span>' +
+    `<span class="workspace-chip-prefix">${escapeHtml(prefix)}</span>` +
+    '<span class="workspace-chip-label"></span>' +
     '<svg class="workspace-chip-chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5">' +
     '<polyline points="6 9 12 15 18 9"/>' +
     '</svg>';
 
   chip.addEventListener('click', (e) => {
     e.stopPropagation();
-    _showWorkspaceDropdown(chip);
+    _showWorkspaceDropdown(chip, target);
   });
 
   return chip;
@@ -118,18 +178,17 @@ function _createWorkspaceChip() {
 
 // ── Dropdown menu ───────────────────────────────────────────────────
 
-function _showWorkspaceDropdown(anchor) {
-  // Remove any existing dropdown
+function _showWorkspaceDropdown(anchor, target) {
   const old = document.getElementById('workspace-menu');
   if (old) { old.remove(); return; }
+
+  const info = _wsInfoByTarget[target] || _wsInfoByTarget['conversation'];
 
   const menu = document.createElement('div');
   menu.id = 'workspace-menu';
   menu.className = 'workspace-menu';
 
-  // Flip chevron
-  const chevron = anchor.querySelector('.workspace-chip-chevron');
-  if (chevron) anchor.classList.add('workspace-chip--open');
+  anchor.classList.add('workspace-chip--open');
 
   // ── Default section ──
   const defaultHeader = document.createElement('div');
@@ -138,20 +197,19 @@ function _showWorkspaceDropdown(anchor) {
   menu.appendChild(defaultHeader);
 
   const defaultItem = _createMenuItem(
-    _wsFolderName(_wsInfo.defaultPath),
-    _wsInfo.isDefault,
-    () => { _closeMenu(); _resetWorkspace(); }
+    _wsFolderName(info.defaultPath),
+    info.isDefault,
+    () => { _closeMenu(); _resetWorkspace(target); }
   );
   menu.appendChild(defaultItem);
 
   // ── Recently section ──
-  // If current is not default, show it first in recents with checkmark
   const showRecents = [];
-  if (!_wsInfo.isDefault) {
-    showRecents.push({ path: _wsInfo.currentPath, active: true });
+  if (!info.isDefault) {
+    showRecents.push({ path: info.currentPath, active: true });
   }
-  for (const rp of _wsInfo.recentPaths) {
-    if (rp !== _wsInfo.currentPath) {
+  for (const rp of (info.recentPaths || [])) {
+    if (rp !== info.currentPath) {
       showRecents.push({ path: rp, active: false });
     }
   }
@@ -165,7 +223,7 @@ function _showWorkspaceDropdown(anchor) {
       const item = _createMenuItem(
         _wsFolderName(entry.path),
         entry.active,
-        entry.active ? () => { _closeMenu(); } : () => { _closeMenu(); _selectAndSetWorkspace(entry.path); }
+        entry.active ? () => { _closeMenu(); } : () => { _closeMenu(); _selectAndSetWorkspace(target, entry.path); }
       );
       item.title = entry.path;
       menu.appendChild(item);
@@ -182,7 +240,7 @@ function _showWorkspaceDropdown(anchor) {
   selectItem.textContent = t('workspace.pick_folder');
   selectItem.addEventListener('click', () => {
     _closeMenu();
-    _selectAndSetWorkspace();
+    _selectAndSetWorkspace(target);
   });
   menu.appendChild(selectItem);
 
@@ -191,11 +249,10 @@ function _showWorkspaceDropdown(anchor) {
   openItem.textContent = t('workspace.open_folder');
   openItem.addEventListener('click', () => {
     _closeMenu();
-    _openWorkspaceFolder();
+    _openWorkspaceFolder(target);
   });
   menu.appendChild(openItem);
 
-  // Position above the anchor
   const rect = anchor.getBoundingClientRect();
   menu.style.position = 'fixed';
   menu.style.left = rect.left + 'px';
@@ -235,16 +292,30 @@ function _createMenuItem(text, isActive, onClick) {
 // ── Init ────────────────────────────────────────────────────────────
 
 async function initUserWorkspace() {
-  await _fetchWorkspaceInfo();
-
-  const toolbarIds = [
-    '.new-chat-input-wrapper .chat-input-toolbar',
-    '#panel-conversation .chat-input-toolbar',
-  ];
-  for (const sel of toolbarIds) {
-    const toolbar = document.querySelector(sel);
-    if (toolbar) {
-      toolbar.appendChild(_createWorkspaceChip());
-    }
+  // Insert one chip per panel into the bottom-bar (right of the recipient /
+  // project / skill chips, left of the send button). Mirroring the recipient
+  // chip's lifecycle so visuals stay consistent across panels.
+  const newBar = document.querySelector('#panel-new-chat .chat-bottom-bar');
+  if (newBar) {
+    const sendBtn = newBar.querySelector('.chat-send-btn');
+    const chip = _createWorkspaceChip('new-chat');
+    if (sendBtn) newBar.insertBefore(chip, sendBtn);
+    else newBar.appendChild(chip);
   }
+  const convBar = document.querySelector('#panel-conversation .chat-bottom-bar');
+  if (convBar) {
+    const sendBtn = convBar.querySelector('.chat-send-btn');
+    const chip = _createWorkspaceChip('conversation');
+    if (sendBtn) convBar.insertBefore(chip, sendBtn);
+    else convBar.appendChild(chip);
+  }
+
+  await _refreshAllWorkspaceInfo();
+}
+
+/** Public: called by conversation.js when the active cid changes (entering a
+ *  conversation, or switching tabs while one is mounted). Also called by
+ *  projects.js when the commander chip's project pick changes. */
+async function refreshWorkspaceChip() {
+  await _refreshAllWorkspaceInfo();
 }

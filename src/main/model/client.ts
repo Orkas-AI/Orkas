@@ -69,6 +69,14 @@ export interface ChatOptions {
    * `skill_list: []`. Sourced from the target agent's `skill_list` field
    * (see `features/agents.ts`). */
   skillList?: string[];
+  /** Project-scope skill allowlist applied ONLY to the System A render
+   *  block (`getSystemPromptBlock`). Resolved from the conversation's
+   *  project bindings at the top of `runTurn`. The runner intersects this
+   *  with `skillList` for prompt rendering but leaves SkillStore (System B,
+   *  agent's self-evolved skills) constrained by `skillList` alone — so
+   *  agents in projects retain access to their own evolved skills.
+   *  Undefined = orphan conversation, no project filter. */
+  projectAllowedSkillIds?: readonly string[];
   /** Extra tools merged into core-agent's builtin tool set for this call.
    * Currently used by group_chat commander to surface `plan_set` and
    * agent-management tools alongside the builtin set. */
@@ -81,10 +89,24 @@ export interface ChatOptions {
    *  read_file / search_files / grep_files scope to this conv's attachment
    *  dir in addition to the user's active workspace. */
   cid?: string;
+  /** Project id of the conversation, when it belongs to one. Threaded
+   *  through to local-tools / file-tools / image-gen-tool so workspace
+   *  resolution picks up the project-scoped selection. Caller (group_chat
+   *  or skill/agent edit) resolves it once before invoking. */
+  projectId?: string;
   /** Extra absolute directory roots whitelisted for file-tools on top of
-   *  workspace + attachment. Skill-edit chats pass the skill dir so the LLM
-   *  can read / search files it's about to overwrite via <<<skill-file>>>. */
+   *  workspace + attachment. Read AND write are permitted under these roots.
+   *  Per-skill edit chats pass the skill dir so the LLM can read / search /
+   *  overwrite files it manages. */
   extraRoots?: readonly string[];
+  /** Read-only extra roots: read tools (read_file / search_files /
+   *  grep_files / stat_file) can see these, but write-side tools
+   *  (edit_file / write_file / bash / markdown_to_pdf / html_to_pdf /
+   *  generate_image) cannot mutate paths inside. Used by group-chat
+   *  commander to inspect agent / skill specs while the structured
+   *  `<agent>` / `<skill>` containers remain the only sanctioned mutation
+   *  channels. */
+  readOnlyExtraRoots?: readonly string[];
   /** Fired with the absolute path of every file produced by the local-exec
    * tools (`write_file`, `markdown_to_pdf`, `html_to_pdf`) during this run.
    * `features/chats` uses this to attach a `produced[]` list to the

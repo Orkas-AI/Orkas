@@ -60,6 +60,27 @@ describe('chats › createConversation', () => {
     expect(fs.existsSync(path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`)))
       .toBe(true);
   });
+
+  // Project membership wiring (added with the projects feature). The field
+  // is persisted on the conv record only — `<cid>.jsonl` / session_id /
+  // groupChatDir paths are unchanged (CLAUDE.md §5 invariant). When a
+  // projectId is omitted the record must NOT carry a stale empty string.
+  it('persists project_id when supplied; omits the field when absent', async () => {
+    const chats = await loadChats();
+    const c1 = await chats.createConversation(TEST_UID, { projectId: 'p_aabbccdd' });
+    expect(c1.project_id).toBe('p_aabbccdd');
+    // session_id MUST stay independent of project_id.
+    expect(c1.session_id).toBe(`${TEST_UID}-gconv-${c1.conversation_id}`);
+    const c2 = await chats.createConversation(TEST_UID);
+    expect(c2.project_id).toBeUndefined();
+
+    const idx = JSON.parse(fs.readFileSync(
+      path.join(tmpDir, TEST_UID, 'cloud', 'chats', '_index.json'), 'utf-8'));
+    const persistedC1 = idx.find((c: any) => c.conversation_id === c1.conversation_id);
+    const persistedC2 = idx.find((c: any) => c.conversation_id === c2.conversation_id);
+    expect(persistedC1.project_id).toBe('p_aabbccdd');
+    expect(persistedC2.project_id).toBeUndefined();
+  });
 });
 
 describe('chats › deleteConversation', () => {

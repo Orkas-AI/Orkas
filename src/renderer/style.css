@@ -303,6 +303,19 @@ body {
   color: #94a3b8;
   flex-shrink: 0;
 }
+.search-result-project {
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: #f0fdf4;
+  color: #047857;
+  flex-shrink: 0;
+  font-weight: 500;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .search-result-snippet {
   font-size: 12px;
   color: #64748b;
@@ -400,6 +413,35 @@ body {
   margin-top: 4px;
 }
 
+/* Projects section sits on top of conversations; let it stay intrinsic-sized
+   (rows are short, even ~20 projects fit in a small slab) while the
+   conversations section underneath takes the remaining height. Cap so a user
+   with dozens of projects doesn't push the conv list off-screen — internal
+   scroll engages. */
+.sidebar-projects-section {
+  flex: 0 0 auto;
+  max-height: 40vh;
+  border-top: 1px solid var(--border);
+}
+
+/* Conversations section under Projects — share the same conceptual area as
+   Projects (per UX feedback "可以认为是同样的区域"). The divider stays as
+   a hairline visual cue but in a much lighter tone so the two sections
+   read as related rather than partitioned. Falls back to var(--border)
+   on platforms / themes where the muted variant isn't defined. */
+.sidebar-conversations-section {
+  flex: 1 1 auto;
+  border-top: 1px solid rgba(15, 23, 42, 0.05);
+  margin-top: 0;
+}
+
+.sidebar-section-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 4px 6px;
+}
+
 .sidebar-section-title {
   padding: 12px 4px 6px;
   font-size: 11px;
@@ -407,6 +449,355 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.6px;
   color: #9ca3af;
+}
+
+/* When the title sits inside a row, its own padding is owned by the row;
+   collapse the per-element padding so the row's vertical rhythm stays clean. */
+.sidebar-section-title-row .sidebar-section-title { padding: 0 4px; }
+
+.sidebar-section-add {
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  font-size: 18px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: inherit;
+  transition: background 0.12s, color 0.12s;
+}
+.sidebar-section-add:hover { background: #f1f5f9; color: var(--text); }
+
+/* ─── Projects list ─── */
+
+.projects-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding-right: 2px;
+}
+.projects-list::-webkit-scrollbar { width: 4px; }
+.projects-list::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 3px; }
+
+.project-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 8px;
+  border-radius: 7px;
+  cursor: pointer;
+  color: #374151;
+  font-size: 13px;
+  line-height: 1.35;
+  transition: background 0.12s;
+  position: relative;
+}
+.project-row:hover { background: #f1f5f9; color: var(--text); }
+.project-row.is-menu-open { background: #f1f5f9; }
+
+.project-icon {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  color: #94a3b8;
+}
+/* Make sure clicks on the SVG / its paths bubble cleanly to .project-row's
+   click handler (otherwise nested <path> targets can confuse `closest()`
+   queries downstream). The icon itself is purely decorative — collapse /
+   expand is driven by clicking anywhere on the row except the menu /
+   rename input. */
+.project-icon svg { pointer-events: none; }
+
+.project-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-rename-input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--primary);
+  background: #fff;
+  color: var(--text);
+  font-size: 13px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: inherit;
+  outline: none;
+}
+.project-rename-input.is-error { border-color: #dc2626; box-shadow: 0 0 0 2px rgba(220,38,38,0.12); }
+
+.project-inline-error {
+  font-size: 11px;
+  color: #dc2626;
+  padding: 2px 8px 4px 26px;  /* align below the name (caret + icon offset) */
+  line-height: 1.3;
+}
+
+/* ⋯ button styling: hidden by default, surfaces on row hover or while the
+   menu is open. Mirrors the KB tree pattern (.ctx-row-menu-btn). */
+.project-row-menu-btn {
+  visibility: hidden;
+}
+.project-row:hover .project-row-menu-btn,
+.project-row.is-menu-open .project-row-menu-btn {
+  visibility: visible;
+}
+
+/* Nested conv items inside a project — slight indent so the hierarchy reads. */
+.project-conv-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding-left: 16px;
+}
+.conv-item-nested { font-size: 12.5px; padding: 5px 8px; }
+.project-conv-empty {
+  padding: 4px 8px 8px 16px;
+  font-size: 11.5px;
+  color: #94a3b8;
+}
+
+/* ── Project detail panel ─────────────────────────────────────────────── */
+
+.project-detail-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+  background: #f5f6f8;  /* page-tinted, lets card sections pop */
+}
+.project-detail-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 22px 32px 32px 32px;
+  max-width: 880px;
+  width: 100%;
+  margin: 0 auto;
+  box-sizing: border-box;
+}
+.project-detail-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 22px;
+}
+.project-detail-title {
+  flex: 1;
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-detail-title-input {
+  flex: 1;
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--text);
+  border: 1px solid var(--primary);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-family: inherit;
+  background: #fff;
+  outline: none;
+}
+.project-detail-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* Card-style section. Mirrors the look in shipping-product references —
+   white card on neutral page bg, rounded corners, subtle border. */
+.project-detail-card {
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 16px 18px;
+  margin-bottom: 14px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
+}
+.project-detail-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.project-detail-card-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.project-detail-card-desc {
+  font-size: 12.5px;
+  margin-top: 6px;
+  line-height: 1.5;
+}
+
+.project-bindings-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+}
+.project-binding-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  background: #f8fafc;
+  border: 1px solid #eef2f7;
+  border-radius: 8px;
+}
+.project-binding-row--stale { opacity: 0.6; }
+.project-binding-main { flex: 1; min-width: 0; }
+.project-binding-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.project-binding-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+}
+.project-binding-source {
+  font-size: 11px;
+  color: #64748b;
+  background: #e2e8f0;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.project-binding-source--stale { color: #b45309; background: #fef3c7; }
+.project-binding-desc {
+  font-size: 12px;
+  margin-top: 4px;
+  line-height: 1.4;
+}
+
+/* Modal picker for "+ Add agent / skill". Reuses .modal-overlay shell so
+   it sits above the panel + dims the rest of the UI; never gets clipped
+   at the panel edge like the prior popover. */
+.project-binding-picker-modal {
+  width: 560px;
+  max-width: 92vw;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  max-height: 80vh;
+}
+.project-binding-picker-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px 10px 14px;
+  border-bottom: 1px solid #eef2f7;
+}
+.project-binding-picker-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.project-binding-picker-close {
+  background: transparent;
+  border: none;
+  font-size: 20px;
+  color: #94a3b8;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+.project-binding-picker-close:hover { color: var(--text); }
+.project-binding-picker-search {
+  padding: 10px 14px 6px 14px;
+}
+.project-binding-picker-search input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--text);
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  outline: none;
+  transition: border-color 0.12s, background 0.12s;
+}
+.project-binding-picker-search input:focus {
+  border-color: var(--primary);
+  background: #fff;
+}
+.project-binding-picker-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 14px 14px 14px;
+}
+.project-binding-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.project-binding-picker-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid #eef2f7;
+  border-radius: 8px;
+  background: #fff;
+}
+/* Clamp picker descriptions to 3 lines so a long builtin description
+   (Software Implementation Engineer etc.) doesn't blow the row height
+   and force the user to scroll past one card to see the next. */
+.project-binding-picker-item .project-binding-desc {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* Empty-bindings banner inside an in-project conversation. */
+.conv-project-empty-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  background: #fef3c7;
+  border-bottom: 1px solid #fde68a;
+  font-size: 12.5px;
+}
+
+/* Danger-styled confirm modal ornaments. */
+.ui-dialog-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+.ui-dialog-danger .ui-dialog-message {
+  white-space: pre-wrap;
+  color: #475569;
 }
 
 .conversation-list {
@@ -1496,6 +1887,8 @@ body.model-not-configured .main-content { flex-direction: column; }
   height: 100%;
   background: #f8fafc;
   position: relative;
+  /* Used by `.chat-input-form { width: 40cqw }`. */
+  container-type: inline-size;
 }
 
 
@@ -1614,10 +2007,8 @@ body.model-not-configured .main-content { flex-direction: column; }
   padding: 7px 16px;
   box-shadow: 0 8px 32px rgba(15, 23, 42, 0.1);
   transition: all 0.2s;
-  /* Anchor for the absolutely-positioned `.chat-input-toolbar` (workspace
-     chip floats above the right shoulder of this box). Decouples the chip
-     from the attachments row so adding/removing attachments never shifts
-     the chip's vertical position. */
+  /* Anchor for the absolutely-positioned `.chat-input-overlay` (attachments
+     strip floats above this box). Plan rail lives inside the overlay too. */
   position: relative;
 }
 
@@ -1730,16 +2121,14 @@ body.model-not-configured .main-content { flex-direction: column; }
 .chat-send-btn.streaming .stop-icon { display: block; }
 
 /* Queue panel above the input area.
-   Aligned with .chat-input-area's centered 80% layout BUT with the right
-   edge shrunken to clear the workspace chip floating above the input
-   bubble (chip is anchored to input-area's right shoulder, up to ~218px
-   wide; without this it overlaps the queue's bottom-right corner). The
-   shared `--ws-chip-reserve` lives next to `.chat-input-overlay` so any
-   future chip-width tweak only needs one site update. */
+   Aligned with .chat-input-area's centered 80% layout. The workspace chip
+   no longer floats above the input bubble (it moved into .chat-bottom-bar
+   inside the input area), so the queue's right edge can use the full 80%
+   width without a reserved gutter. */
 .chat-queue {
   pointer-events: auto;
   width: 80%;
-  max-width: max(160px, calc(80% - var(--ws-chip-reserve, 232px)));
+  max-width: 80%;
   margin: 0 0 8px 10%;
   background: rgba(255, 255, 255, 0.96);
   backdrop-filter: blur(6px);
@@ -1749,17 +2138,15 @@ body.model-not-configured .main-content { flex-direction: column; }
   box-shadow: 0 6px 20px rgba(15, 23, 42, 0.08);
 }
 
-/* Plan-rail pill chip floats above the input bubble's LEFT shoulder, the
-   mirror of the workspace chip on the right. When a plan exists,
-   plan-rail.js stamps `has-plan-rail` on .chat-input-wrapper; reserve
-   ~188px on the queue's left so the chip clears the queue's bottom-left.
-   Symmetric to the right-side workspace reserve above. */
+/* Plan-rail pill chip still floats above the input bubble's LEFT shoulder
+   (the workspace chip moved into the bottom-bar but the plan rail stayed
+   in the overlay because it expands UPWARD over chat-history). When a
+   plan exists, plan-rail.js stamps `has-plan-rail` on .chat-input-wrapper;
+   reserve ~188px on the queue's left so the chip clears the queue's
+   bottom-left. */
 .chat-input-wrapper.has-plan-rail .chat-queue {
   margin-left: calc(10% + var(--plan-rail-reserve, 188px));
-  max-width: max(
-    120px,
-    calc(80% - var(--ws-chip-reserve, 232px) - var(--plan-rail-reserve, 188px))
-  );
+  max-width: calc(80% - var(--plan-rail-reserve, 188px));
 }
 
 /* Narrower panels (skill / agent edit) don't have the 80%-centered shape
@@ -1938,10 +2325,14 @@ body.model-not-configured .main-content { flex-direction: column; }
   color: #334155;
 }
 
-/* Bottom row inside the input area: [+] [agent] [skill] [chip] ... [send] */
+/* Bottom row inside the input area: [+] [recipient] [project] [skill]
+   [workspace] ... [send]. Wraps row-by-row on narrow windows so chips
+   never overflow the input box. */
 .chat-bottom-bar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  row-gap: 6px;
   gap: 8px;
   width: 100%;
 }
@@ -2191,6 +2582,10 @@ body.model-not-configured .main-content { flex-direction: column; }
 .chat-input-form {
   margin-top: 10px;
   padding: 10px 12px;
+  /* Stable 40% of chat pane, not bubble width. */
+  width: 40cqw;
+  max-width: 100%;
+  min-width: 280px;
   background: rgba(14, 165, 233, 0.06);
   border: 1px solid rgba(14, 165, 233, 0.25);
   border-radius: 10px;
@@ -2270,25 +2665,78 @@ body.model-not-configured .main-content { flex-direction: column; }
   flex-direction: column;
   gap: 6px;
 }
-.chat-input-form .form-field-dir {
+/* Card-style directory picker — single clickable surface that
+   replaces the old "[Choose…] [Clear] /path" three-button row.
+   See chat-input-form.js `field.type === 'directory'` for the DOM
+   it builds: card → icon + path/hint + change pill. */
+.chat-input-form .form-field-dir-card {
   display: flex;
   align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.6);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, box-shadow 0.15s;
+  min-width: 0;
+}
+.chat-input-form .form-field-dir-card:not(.is-empty) {
+  /* Filled state: solid border + opaque background to read as
+     "value held" rather than "drop zone". */
+  border-style: solid;
+  background: rgba(255, 255, 255, 0.85);
+}
+.chat-input-form .form-field-dir-card:hover:not(.is-disabled) {
+  border-color: var(--primary);
+  background: rgba(14, 165, 233, 0.04);
+}
+.chat-input-form .form-field-dir-card:focus-visible {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(14, 165, 233, 0.15);
+}
+.chat-input-form .form-field-dir-card.is-disabled {
+  cursor: default;
+  border-style: solid;
+}
+.chat-input-form .form-field-dir-icon {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  color: var(--muted);
+}
+.chat-input-form .form-field-dir-card:not(.is-empty) .form-field-dir-icon,
+.chat-input-form .form-field-dir-card:hover:not(.is-disabled) .form-field-dir-icon {
+  color: var(--primary);
 }
 .chat-input-form .form-field-dir-path {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
-  color: var(--text);
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text);
 }
 .chat-input-form .form-field-dir-path.is-empty {
   font-family: inherit;
+  font-size: 13px;
   color: var(--muted);
+}
+.chat-input-form .form-field-dir-change {
+  flex-shrink: 0;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(14, 165, 233, 0.1);
+  color: var(--primary);
+  font-weight: 500;
+}
+.chat-input-form.is-submitted .form-field-dir-card {
+  cursor: default;
+  border-style: solid;
 }
 .chat-input-form .form-field-file-chips {
   display: flex;
@@ -2711,7 +3159,7 @@ body.model-not-configured .main-content { flex-direction: column; }
 
 .stream-process {
   margin-bottom: 8px;
-  border-left: 2px solid #e5e7eb;
+  border-left: 2px solid #cbd5e1;
   padding-left: 10px;
 }
 .stream-process:not([open]) { margin-bottom: 0; }
@@ -2719,7 +3167,7 @@ body.model-not-configured .main-content { flex-direction: column; }
   cursor: pointer;
   list-style: none;
   font-size: 12px;
-  color: #6b7280;
+  color: #475569;
   padding: 2px 0;
   user-select: none;
   display: flex;
@@ -2736,7 +3184,7 @@ body.model-not-configured .main-content { flex-direction: column; }
   width: 16px;
   font-size: 13px;
   line-height: 1;
-  color: #6b7280;
+  color: #475569;
   transition: transform 0.15s;
 }
 .stream-process[open] .stream-process-summary::before {
@@ -2751,6 +3199,9 @@ body.model-not-configured .main-content { flex-direction: column; }
   padding: 4px 0;
   font-size: 11.5px;
   line-height: 1.55;
+  /* Default body color = the Normal tier (see ramp below). Lines whose
+     leading glyph isn't recognized by `_processKindOf` fall through to
+     this baseline and read as supporting context. */
   color: #94a3b8;
   font-family: ui-monospace, SFMono-Regular, monospace;
   /* Force text-style rendering for symbols like ▶ ✓ ◆ ⚙ ▸ ✎ — otherwise
@@ -2765,13 +3216,37 @@ body.model-not-configured .main-content { flex-direction: column; }
   white-space: pre-wrap;
   word-break: break-all;
 }
-.stream-process-line.kind-err   { color: #b91c1c; }
-.stream-process-line.kind-warn  { color: #b45309; }
-.stream-process-line.kind-patch { color: #047857; }
-.stream-process-line.kind-tool  { color: #475569; }
-.stream-process-line.kind-out   { color: #64748b; }
-.stream-process-line.kind-think { color: #6366f1; }
-.stream-process-line.kind-bound { color: #334155; font-weight: 500; }
+/* Four-tier hierarchy. The constraint: every content line must be
+   visually LIGHTER than the section header (`.stream-process-summary`,
+   slate-600 #475569 + 600) — content is supporting detail, the header
+   is the label. An earlier pass had bound/tool lines at slate-900 + 600
+   which inverted the hierarchy (content darker than its own label).
+   Tiers:
+     1. Core    — milestones / tool calls / plans / file edits;
+                  slate-500 + 500 weight. Distinguishable at a glance
+                  but still a notch below the header.
+     2. Normal  — reasoning, live preview, stdout, meta; slate-400.
+                  Same as the body baseline so unrecognized lines
+                  read as plain text, not "missing styling".
+     3. Warn    — awaiting approval / cli stderr. Kept as its own
+                  hue (light amber) because (a) red would over-alarm
+                  benign cli progress messages routed through stderr,
+                  and (b) folding into Normal loses the "someone is
+                  waiting on you" signal at the rail level.
+     4. Error   — hard error / failed tool; red-500 + 500 weight.
+   Glyphs in `_processKindOf` map into these classes — adding a new
+   glyph there needs a matching rule here, otherwise the line falls
+   back to the Normal baseline. */
+.stream-process-line.kind-bound { color: #64748b; font-weight: 500; }   /* ▶ ●  lifecycle milestones */
+.stream-process-line.kind-tool  { color: #64748b; font-weight: 500; }   /* ■    tool call */
+.stream-process-line.kind-plan  { color: #64748b; font-weight: 500; }   /* ▣    plan announcement */
+.stream-process-line.kind-patch { color: #64748b; font-weight: 500; }   /* ◉    file change */
+.stream-process-line.kind-think { color: #94a3b8; }                      /* ◆ ◇  reasoning / reply markers */
+.stream-process-line.kind-live  { color: #94a3b8; }                      /* ◐    live generating */
+.stream-process-line.kind-out   { color: #94a3b8; }                      /* ▷    command stdout */
+.stream-process-line.kind-meta  { color: #94a3b8; }                      /* ▪    fallback / lifecycle meta */
+.stream-process-line.kind-warn  { color: #d97706; }                      /* ○    awaiting approval / cli stderr */
+.stream-process-line.kind-err   { color: #ef4444; font-weight: 500; }   /* ◯ ✗  hard error / failed tool */
 
 .stream-final {
   /* Appears below process section with a subtle divider when process is open */
@@ -2873,26 +3348,16 @@ body.model-not-configured .main-content { flex-direction: column; }
   50% { opacity: 0.5; }
 }
 
-/* ─── Skill picker (used by chat inputs) ─── */
+/* Overlay strip floating above the input bubble. Now holds attachments
+   only (and the plan-rail in the conversation panel, which is itself
+   absolutely positioned and anchors left). The workspace chip moved into
+   `.chat-bottom-bar` next to the recipient/project chips, so this strip's
+   geometry simplified — attachments take the full width and wrap freely;
+   no right-side reservation needed.
 
-.chat-input-toolbar {
-  pointer-events: auto;
-  display: flex;
-  gap: 6px;
-}
-
-/* Overlay strip floating above the input bubble. Holds the attachments
-   chips (left, wrap-aware) and the workspace toolbar (right, intrinsic).
-   Absolutely positioned so it doesn't push the input box; anchored to
-   input-area's top via translateY based on the strip's own height — the
-   strip's bottom edge is always 6px above input-area's top, regardless
-   of how many attachment rows wrap inside. The workspace chip therefore
-   never shifts when attachments are added/removed.
-
-   align-items:flex-end keeps the workspace chip anchored to the strip's
-   bottom edge (= input-area top - 6px) on all wrap counts; min-width:0 on
-   the attachments child lets flex actually shrink it so chips wrap
-   instead of pushing the toolbar off the right edge. */
+   `pointer-events: none` on the wrapper keeps clicks falling through to
+   the input box while still letting individual chip children (which set
+   `pointer-events: auto` via .chat-attachments) receive hits. */
 .chat-input-overlay {
   position: absolute;
   top: 0;
@@ -2908,11 +3373,6 @@ body.model-not-configured .main-content { flex-direction: column; }
 .chat-input-overlay > .chat-attachments {
   flex: 1 1 auto;
   min-width: 0;
-}
-
-.chat-input-overlay > .chat-input-toolbar {
-  flex: 0 0 auto;
-  margin-left: auto;
 }
 
 
@@ -2990,6 +3450,55 @@ body.model-not-configured .main-content { flex-direction: column; }
   white-space: nowrap;
 }
 
+/* Project chip on the commander tab (right of recipient chip). Visually
+   matches the workspace chip — solid white pill with a hairline border
+   and a chevron — so the two "secondary picker" chips read as a pair.
+   Distinguishes from the recipient chip (filled blue, primary action) by
+   surface, and from each other only by content. Both open a popover. */
+.chat-project-chip {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  background: rgba(255, 255, 255, 0.9);
+  backdrop-filter: blur(6px);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 14px;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.4;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.15s;
+}
+.chat-project-chip:hover,
+.chat-project-chip.chat-project-chip--open {
+  border-color: rgba(37, 99, 235, 0.25);
+  background: #fff;
+}
+.chat-project-chip .chat-project-prefix {
+  color: var(--muted);
+  font-weight: 400;
+  white-space: nowrap;
+}
+.chat-project-chip .chat-project-name {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.chat-project-chevron {
+  flex-shrink: 0;
+  color: var(--muted);
+  transition: transform 0.2s;
+}
+.chat-project-chip.chat-project-chip--open .chat-project-chevron {
+  transform: rotate(180deg);
+}
+
 .chat-skill-chip .chip-label {
   max-width: 160px;
   overflow: hidden;
@@ -3025,17 +3534,20 @@ body.model-not-configured .main-content { flex-direction: column; }
   background: rgba(255, 255, 255, 0.9);
   backdrop-filter: blur(6px);
   color: var(--text);
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 500;
-  padding: 5px 10px;
-  border-radius: 16px;
+  padding: 4px 10px;
+  border-radius: 14px;
   cursor: pointer;
   font-family: inherit;
   transition: all 0.15s;
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  margin-left: auto;
+  gap: 4px;
+  /* No `margin-left: auto` — the chip used to be pushed to the right edge
+     of the bottom-bar (where the floating-overlay version lived). Now the
+     bottom-bar layout is `[+] [给:] [项目:] [工作区:] … [send]` and `+send`
+     itself owns the right-pin via its own `margin-left: auto`. */
 }
 
 .workspace-chip:hover {
@@ -3043,9 +3555,10 @@ body.model-not-configured .main-content { flex-direction: column; }
   background: #fff;
 }
 
-.workspace-chip-icon {
-  flex-shrink: 0;
+.workspace-chip-prefix {
   color: var(--muted);
+  font-weight: 400;
+  white-space: nowrap;
 }
 
 .workspace-chip-label {
@@ -3053,6 +3566,7 @@ body.model-not-configured .main-content { flex-direction: column; }
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--text);
 }
 
 .workspace-chip-chevron {
@@ -3197,6 +3711,19 @@ body.model-not-configured .main-content { flex-direction: column; }
   display: -webkit-box;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
+}
+
+/* Banner shown above the picker list when the active context is a project
+   with zero bound agents — anchors the empty state without hiding the
+   commander entry below. */
+.skill-picker-empty-hint {
+  padding: 8px 10px;
+  font-size: 11.5px;
+  color: #b45309;
+  background: #fef3c7;
+  border-radius: 6px;
+  margin: 4px 6px 6px 6px;
+  line-height: 1.4;
 }
 
 .skill-picker-empty {

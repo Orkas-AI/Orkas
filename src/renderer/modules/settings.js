@@ -24,6 +24,7 @@ let _settingsState = {
 async function loadSettings() {
   _settingsBindLanguageOnce();
   _settingsSyncLanguageRadio();
+  _settingsBindClearAllConvsOnce();
   await Promise.all([
     _settingsRefreshProviders(),
     _settingsRefreshEntries(),
@@ -32,6 +33,7 @@ async function loadSettings() {
     _settingsRefreshImageProfiles(),
     _settingsRefreshCommanderAvatar(),
     _settingsRefreshMetacognition(),
+    _settingsRefreshDataRoot(),
   ]);
   _settingsRenderPicker();
   _settingsRenderEntries();
@@ -40,6 +42,7 @@ async function loadSettings() {
   _settingsRenderImageSection();
   _settingsRenderCommanderAvatar();
   _settingsRenderMetacognition();
+  _settingsRenderDataRoot();
 }
 
 // ── Commander avatar ──
@@ -196,6 +199,36 @@ function _settingsRenderMetacognition() {
   }
 }
 
+// ── Data root row ──
+// Read-only display of the unified data root path; click to open it in
+// the OS file manager via the `app.openDataRoot` IPC.
+
+async function _settingsRefreshDataRoot() {
+  try {
+    const res = await window.orkas.invoke('app.dataRootPath');
+    _settingsState.dataRoot = (res && res.ok && res.path) ? String(res.path) : '';
+  } catch (_) {
+    _settingsState.dataRoot = '';
+  }
+}
+
+function _settingsRenderDataRoot() {
+  const btn = document.getElementById('settings-data-root-btn');
+  const span = document.getElementById('settings-data-root-path');
+  if (!btn || !span) return;
+  span.textContent = _settingsState.dataRoot || '';
+  if (!btn.dataset.bound) {
+    btn.addEventListener('click', async () => {
+      try {
+        await window.orkas.invoke('app.openDataRoot');
+      } catch (err) {
+        _settingsLog.warn('open data root failed', { error: (err && err.message) || String(err) });
+      }
+    });
+    btn.dataset.bound = '1';
+  }
+}
+
 // ── Language radio (zh / en) ──
 // Bound once; `loadSettings` just re-syncs the checked state each time the
 // panel is opened so the radio reflects whatever setLang() last persisted.
@@ -226,6 +259,74 @@ function _settingsSyncLanguageRadio() {
   document.querySelectorAll('input[name="settings-language"]').forEach((el) => {
     el.checked = (el.value === cur);
   });
+}
+
+// ── Clear all conversations ──
+// One-shot bind: button click takes a snapshot of the current conv list
+// (the global `conversations` array, kept in sync by `loadConversations`),
+// runs the same per-cid renderer cleanup the × button does (abortConvStream
+// + _forgetConvLocal) for every cid in the snapshot, then fires the bulk
+// IPC `conversations.deleteAll` (server runs the full delete cascade per
+// cid: group dir / main jsonl / sessions / attachments / CLI / search idx
+// — see chats.deleteConversation). If the user was viewing one of the
+// deleted conversations, switch to new-chat. Reload the sidebar list.
+
+let _settingsClearAllConvsBound = false;
+
+function _settingsBindClearAllConvsOnce() {
+  if (_settingsClearAllConvsBound) return;
+  const btn = document.getElementById('settings-clear-all-convs-btn');
+  if (!btn) return;
+  btn.addEventListener('click', async () => {
+    // Snapshot BEFORE the bulk delete — once the server returns, the global
+    // `conversations` is about to be reloaded as empty and we'll lose the
+    // per-cid info needed for renderer cleanup.
+    const snapshot = (Array.isArray(conversations) ? conversations : []).slice();
+    const status = document.getElementById('settings-clear-all-convs-status');
+    if (!snapshot.length) {
+      if (typeof uiAlert === 'function') {
+        await uiAlert(t('settings.clear_all_convs.empty'));
+      }
+      return;
+    }
+    const ok = await uiConfirm(t('settings.clear_all_convs.confirm', { count: snapshot.length }));
+    if (!ok) return;
+
+    btn.disabled = true;
+    if (status) status.textContent = t('settings.clear_all_convs.in_progress');
+
+    const wasActiveDeleted = currentCid
+      && snapshot.some((c) => c.conversation_id === currentCid);
+    for (const c of snapshot) {
+      try { if (typeof abortConvStream === 'function') abortConvStream(c.conversation_id); } catch (_) {}
+      try { if (typeof _forgetConvLocal === 'function') _forgetConvLocal(c.conversation_id); } catch (_) {}
+    }
+
+    let deleted = 0;
+    try {
+      const res = await window.orkas.invoke('conversations.deleteAll');
+      if (res && typeof res.deleted === 'number') deleted = res.deleted;
+      _settingsLog.info('cleared all conversations', { count: deleted });
+    } catch (err) {
+      _settingsLog.warn('clear-all failed', { error: (err && err.message) || String(err) });
+      btn.disabled = false;
+      if (status) status.textContent = '';
+      if (typeof uiAlert === 'function') {
+        uiAlert(t('settings.clear_all_convs.failed', {
+          message: (err && err.message) || String(err),
+        }));
+      }
+      return;
+    }
+
+    if (wasActiveDeleted && typeof setView === 'function') setView('new-chat');
+    try { await loadConversations(); } catch (_) {}
+
+    btn.disabled = false;
+    if (status) status.textContent = t('settings.clear_all_convs.success', { count: deleted });
+    setTimeout(() => { if (status) status.textContent = ''; }, 4000);
+  });
+  _settingsClearAllConvsBound = true;
 }
 
 // Keep the radio in sync if some other code path changes language, and

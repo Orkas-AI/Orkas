@@ -220,6 +220,28 @@ function getChatRecipient(target) { return { ..._activeRecipient(target) }; }
 
 function _onRecipientChanged(_target) { /* reserved for future hooks */ }
 
+/** When the active project's bindings change (commander chip → switch
+ *  project, or project rename/binding edit while a chat is open), the
+ *  current recipient may no longer be a valid agent for the new scope.
+ *  Reset to commander silently — the user will see the chip flip and the
+ *  recipient picker collapse to commander-only on next open. Called from
+ *  `projects.js` post project-pick. No-op for `commander` recipients and
+ *  for orphan contexts (pid empty). */
+async function validateRecipientAgainstProject(target, pid) {
+  const cur = _activeRecipient(target);
+  if (!cur || cur.kind !== 'agent') return;
+  if (!pid) return;
+  try {
+    const res = await window.orkas.invoke('projects.bindings.list', { projectId: pid });
+    if (!res || !res.ok) return;
+    const bound = new Set((res.bindings && res.bindings.agents) || []);
+    if (!bound.has(cur.id)) {
+      setChatRecipient(target, { kind: 'commander' });
+      _renderRecipientChip(target);
+    }
+  } catch (_) { /* leave as-is on failure */ }
+}
+
 function setChatRecipient(target, next, _opts = {}) {
   const r = _normRecipient(next);
   if (!r) return;
@@ -285,9 +307,37 @@ function onEnterNewChatView() {
   const hasDraft = !!(input && input.value);
   if (!hasDraft) _newChatRecipient = { ..._COMMANDER };
   _renderRecipientChip('new-chat');
+  // Project chip lives in projects.js — restore the last manual pick
+  // (lastProject localStorage) and refresh the workspace chip's scope.
+  if (typeof onEnterCommanderProjectChip === 'function') onEnterCommanderProjectChip();
 }
 function onEnterConversationView() {
   _renderRecipientChip('conversation');
+  // Workspace chip scope follows the active conv's project (resolved on
+  // main side via cid → conv.project_id). Refresh whenever a conv mounts.
+  if (typeof refreshWorkspaceChip === 'function') refreshWorkspaceChip();
+  // Recipient validation: bindings may have changed since this conv was
+  // last open (user removed the agent from the project). If the sticky
+  // recipient is no longer in the project's agents, drop back to commander
+  // so the chip matches what the dispatch path will actually route to.
+  if (currentCid && Array.isArray(conversations)) {
+    const conv = conversations.find((c) => c && c.conversation_id === currentCid);
+    const pid = (conv && conv.project_id) || '';
+    if (pid && typeof validateRecipientAgainstProject === 'function') {
+      validateRecipientAgainstProject('conversation', pid);
+    }
+  }
+  // Empty-bindings banner: when this conv belongs to a project and the
+  // project has zero agents bound, surface a one-line notice + "Open
+  // project page" affordance. Cheap IPC; only fires for in-project
+  // conversations.
+  if (typeof refreshConvProjectEmptyBanner === 'function') refreshConvProjectEmptyBanner(currentCid);
+  // One-shot auto-expand: if the conv we just entered belongs to a
+  // project, surface the project's row in the sidebar. Skipped when the
+  // project is already expanded; manual user collapse on subsequent
+  // renders is preserved (the auto-expand does not run inside
+  // renderProjectsSection — see comments in projects.js).
+  if (typeof autoExpandActiveConvProject === 'function') autoExpandActiveConvProject();
   // Kick a one-shot evaluation so that a cid mid-plan picks up its current
   // interactive assignee even if no plan_changed/state_changed event fires
   // before the user types. View-enter never reverts to commander (see
@@ -606,6 +656,22 @@ async function _refreshGroupMembers(cid) {
   } catch (_) { /* non-fatal */ }
   return _groupMembersCache.get(cid) || [];
 }
+// Read-side normalizer: jsonl records written before the multi-edit
+// migration carry singular `created_agent`; new ones carry plural
+// `created_agents`. Returns the array, or `null` when neither field is set.
+function _normalizeCreatedAgents(gm) {
+  if (!gm) return null;
+  if (Array.isArray(gm.created_agents) && gm.created_agents.length) return gm.created_agents;
+  if (gm.created_agent && gm.created_agent.agent_id) return [gm.created_agent];
+  return null;
+}
+function _normalizeCreatedSkills(gm) {
+  if (!gm) return null;
+  if (Array.isArray(gm.created_skills) && gm.created_skills.length) return gm.created_skills;
+  if (gm.created_skill && gm.created_skill.skill_id) return [gm.created_skill];
+  return null;
+}
+
 function _groupMsgToLegacy(gm) {
   if (!gm || typeof gm !== 'object') return gm;
   if (gm.role !== undefined) return gm; // already legacy shape
@@ -629,7 +695,8 @@ function _groupMsgToLegacy(gm) {
     ...(Array.isArray(gm.attachments) && gm.attachments.length ? { attachments: gm.attachments } : {}),
     ...(Array.isArray(gm.produced) && gm.produced.length ? { produced: gm.produced } : {}),
     ...(gm.form ? { form: gm.form } : {}),
-    ...(gm.created_agent ? { created_agent: gm.created_agent } : {}),
+    ...(_normalizeCreatedAgents(gm) ? { created_agents: _normalizeCreatedAgents(gm) } : {}),
+    ...(_normalizeCreatedSkills(gm) ? { created_skills: _normalizeCreatedSkills(gm) } : {}),
     ...(gm.plan_announcement ? { _plan_announcement: true } : {}),
     ...(Array.isArray(gm.process) && gm.process.length ? { process: gm.process } : {}),
   };
@@ -956,36 +1023,86 @@ function _renderMessageProducedHtml(absPaths) {
   return `<div class="chat-msg-produced">${items.join('')}</div>`;
 }
 
-// Render a "view details" chip on an assistant bubble when a new agent was
-// quick-created from that turn. Click → jump to agents tab + select the new
-// agent. Same visual slot as produced chips (inside the bubble, below
-// content), but in .is-custom green to signal "new custom artifact created".
-function _renderMessageCreatedAgentHtml(payload) {
-  if (!payload || !payload.agent_id) return '';
-  const name = payload.name || payload.agent_id;
-  // Label is intentionally neutral ("view details / Open: …") — works for both
-  // `kind: 'created'` and `kind: 'updated'`; the commander's surrounding
-  // prose tells the user which one happened. Don't split the i18n key just
-  // to track the verb — the chip is a CTA into the agent panel, not a
-  // status badge.
-  return `<div class="chat-msg-created-agent">
-    <span class="chat-msg-created-agent-chip" data-agent-id="${escapeHtml(payload.agent_id)}" title="${escapeHtml(name)}">
+// Render one or more "view details" chips on an assistant bubble — one chip
+// per agent quick-created or quick-edited in that turn. Same visual slot as
+// produced chips (inside the bubble, below content), in .is-custom green.
+// Label is neutral ("view details") for both `kind: 'created'` and
+// `kind: 'updated'`; the commander's surrounding prose tells the user which.
+function _renderMessageCreatedAgentHtml(list) {
+  const arr = Array.isArray(list) ? list : (list ? [list] : []);
+  const chips = arr
+    .filter((p) => p && p.agent_id)
+    .map((p) => {
+      const name = p.name || p.agent_id;
+      return `<span class="chat-msg-created-agent-chip" data-agent-id="${escapeHtml(p.agent_id)}" title="${escapeHtml(name)}">
       <span class="chat-msg-created-agent-icon">◆</span>
       <span class="chat-msg-created-agent-label">${escapeHtml(t('chat.created_agent_chip', { name }))}</span>
-    </span>
-  </div>`;
+    </span>`;
+    })
+    .join('');
+  return chips ? `<div class="chat-msg-created-agent">${chips}</div>` : '';
 }
 
 function _hydrateMessageCreatedAgentChip(msgDiv) {
-  const chip = msgDiv.querySelector('.chat-msg-created-agent-chip');
-  if (!chip) return;
-  chip.addEventListener('click', () => {
-    const aid = chip.dataset.agentId;
-    if (!aid) return;
-    setView('agents');
-    if (typeof _showAgentsDetailView === 'function') _showAgentsDetailView(aid);
-    else if (typeof selectAgent === 'function') selectAgent(aid);
-  });
+  const chips = msgDiv.querySelectorAll('.chat-msg-created-agent-chip[data-agent-id]');
+  for (const chip of chips) {
+    if (chip.dataset.bound === '1') continue;
+    chip.dataset.bound = '1';
+    chip.addEventListener('click', async () => {
+      const aid = chip.dataset.agentId;
+      if (!aid) return;
+      setView('agents');
+      // Pre-check the agent is still loadable; if it was deleted (or its
+      // record is broken) the detail view would render an empty shell —
+      // bail to the grid instead.
+      try {
+        const res = await apiFetch(`/api/agents/${encodeURIComponent(aid)}`);
+        const data = await res.json();
+        if (!data?.ok || !data?.agent) return;
+      } catch { return; }
+      if (typeof _showAgentsDetailView === 'function') _showAgentsDetailView(aid);
+      else if (typeof selectAgent === 'function') selectAgent(aid);
+    });
+  }
+}
+
+// Skill mirror of the agent chip. Commander writes only custom skills,
+// so the chip always opens the custom-source detail view.
+function _renderMessageCreatedSkillHtml(list) {
+  const arr = Array.isArray(list) ? list : (list ? [list] : []);
+  const chips = arr
+    .filter((p) => p && p.skill_id)
+    .map((p) => {
+      const name = p.name || p.skill_id;
+      return `<span class="chat-msg-created-agent-chip" data-skill-id="${escapeHtml(p.skill_id)}" title="${escapeHtml(name)}">
+      <span class="chat-msg-created-agent-icon">◆</span>
+      <span class="chat-msg-created-agent-label">${escapeHtml(t('chat.created_skill_chip', { name }))}</span>
+    </span>`;
+    })
+    .join('');
+  return chips ? `<div class="chat-msg-created-agent">${chips}</div>` : '';
+}
+
+function _hydrateMessageCreatedSkillChip(msgDiv) {
+  const chips = msgDiv.querySelectorAll('.chat-msg-created-agent-chip[data-skill-id]');
+  for (const chip of chips) {
+    if (chip.dataset.bound === '1') continue;
+    chip.dataset.bound = '1';
+    chip.addEventListener('click', async () => {
+      const sid = chip.dataset.skillId;
+      if (!sid) return;
+      setView('skills');
+      // Pre-check SKILL.md is readable; covers both "skill was deleted" and
+      // "skill row exists but its files are missing" (entering the detail
+      // would render a 'file not found' shell otherwise).
+      try {
+        const res = await apiFetch(`/api/skills/read?source=custom&id=${encodeURIComponent(sid)}&file=SKILL.md`);
+        const data = await res.json();
+        if (!data?.ok) return;
+      } catch { return; }
+      if (typeof _showSkillsDetailView === 'function') _showSkillsDetailView('custom', sid);
+    });
+  }
 }
 
 function _hydrateMessageProducedChips(msgDiv) {
@@ -1050,6 +1167,39 @@ function _bindChatPasteAttach(inputElId, getCid) {
   el.dataset.pasteBound = '1';
 }
 
+// Same upload pipeline, drop variant. Binds on the input-area wrapper so
+// the user has a generous target — dropping on the textarea, the chip
+// row, or the toolbar all land here. dragover/dragenter must preventDefault
+// to mark the area as a drop target (otherwise the browser refuses the
+// drop and falls through to the page-level navigate-to-file behaviour).
+function _bindChatDropAttach(wrapSelector, getCid) {
+  const el = document.querySelector(wrapSelector);
+  if (!el || el.dataset.dropBound === '1') return;
+  const isFileDrag = (e) => {
+    const types = e.dataTransfer && e.dataTransfer.types;
+    if (!types) return false;
+    for (let i = 0; i < types.length; i++) {
+      if (types[i] === 'Files') return true;
+    }
+    return false;
+  };
+  const allow = (e) => {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  };
+  el.addEventListener('dragover', allow);
+  el.addEventListener('dragenter', allow);
+  el.addEventListener('drop', (e) => {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    const cid = getCid();
+    if (!cid) return;
+    _chatAttachUpload(cid, e.dataTransfer.files);
+  });
+  el.dataset.dropBound = '1';
+}
+
 function _initChatAttachInput() {
   const btn = document.getElementById('chat-attach-btn');
   const input = document.getElementById('chat-attach-input');
@@ -1064,6 +1214,7 @@ function _initChatAttachInput() {
     input.value = '';
   });
   _bindChatPasteAttach('chat-input', () => currentCid);
+  _bindChatDropAttach('.chat-input-area', () => currentCid);
   btn.dataset.bound = '1';
 }
 
@@ -1084,6 +1235,7 @@ function _initNewChatAttachInput() {
     input.value = '';
   });
   _bindChatPasteAttach('new-chat-input', () => DRAFT_CID);
+  _bindChatDropAttach('.new-chat-input-area', () => DRAFT_CID);
   btn.dataset.bound = '1';
 }
 
@@ -1118,12 +1270,21 @@ function _bumpConvToTop(cid) {
 
 function renderConversationList() {
   const container = document.getElementById('conversation-list');
-  if (!conversations.length) {
+  // Conversations with a project_id are rendered nested under their project
+  // by `projects.js::renderProjectsSection`. The "Conversations" section
+  // here only shows the unprojected ones — same data model as the user's
+  // mental picture (projected convs live "inside" their project, the rest
+  // sit in the catch-all section).
+  const unprojected = (conversations || []).filter((c) => !c || !c.project_id);
+  if (!unprojected.length) {
     container.innerHTML = `<div class="conv-empty" data-i18n="sidebar.conv_empty">${escapeHtml(t('sidebar.conv_empty'))}</div>`;
+    // Still re-render the projects section so its badges refresh (the call
+    // is cheap when the cache is already loaded).
+    if (typeof renderProjectsSection === 'function') renderProjectsSection();
     return;
   }
   const delTitle = escapeHtml(t('chat.conv_del_title'));
-  container.innerHTML = conversations.map(c => {
+  container.innerHTML = unprojected.map(c => {
     // All conversations are now the single `normal` kind — no type badge.
     const title = escapeHtml(c.title || t('chat.new_conv_title'));
     return `
@@ -1153,7 +1314,13 @@ function renderConversationList() {
     });
   });
 
-  // Reapply pending / queued status badges after the DOM was re-rendered.
+  // Re-render the projects section (it consumes the same `conversations`
+  // global to group projected items by project).
+  if (typeof renderProjectsSection === 'function') renderProjectsSection();
+
+  // Reapply pending / queued status badges after the DOM was re-rendered
+  // (covers both the unprojected list and the projects section's nested
+  // conv items, since the helper queries by cid only).
   _refreshAllConvBadges();
 }
 
@@ -1253,13 +1420,19 @@ async function loadConversationHistory(cid) {
     // resolve agent_id → name. Without the await we'd briefly show
     // generic "agent" placeholders on first paint and have to repaint on refresh, which is ugly.
     await _refreshGroupMembers(cid);
-    // Conversation switch: drop any stale per-actor placeholders from a
-    // previous conv so they don't leak into this view (their DOM nodes
-    // are also gone since we're about to clear chat-history below).
-    for (const k of Array.from(_groupPlaceholders.keys())) {
-      if (k.startsWith(`${cid}:`)) continue; // keep this cid's; clear others
-      _groupPlaceholders.delete(k);
-    }
+    // History reload: drop ALL per-actor placeholder map entries — the
+    // `container.innerHTML=''` below detaches every placeholder DOM node,
+    // including the ones for this cid. Keeping `${cid}:*` entries leaves
+    // the map pointing at orphan nodes; the next `_consumeActorPlaceholder`
+    // would find an entry whose `parentElement` is null, fall through to
+    // the `appendChatMessage` fallback, and any deltas accumulated on
+    // that orphan during the in-flight stream are lost (the symptom users
+    // see as "the in-flight reply bubble disappears + a duplicate final
+    // appears below"). After clearing, the next `_ensureActorPlaceholder`
+    // re-adopts `state.loadingEl` (re-attached below via the
+    // `isConvPending` branch) for the first actor and mints fresh
+    // placeholders for any additional actors — no orphan window.
+    _groupPlaceholders.clear();
     // Drop internal plan-step dispatch messages (commander → agent
     // hand-off). The user already saw the plan announcement; surfacing
     // these adds noise (e.g. "@<agent-name> <user request>") in the user's view.
@@ -1348,8 +1521,80 @@ function _scrollToBottomNoAnim(container) {
   const prev = container.style.scrollBehavior;
   container.style.scrollBehavior = 'auto';
   container.scrollTop = container.scrollHeight;
+  // Explicit jump-to-bottom = the user is now pinned to the bottom; arm
+  // the sticky-follow flag so subsequent stream content keeps tracking.
+  container._stickyEnabled = true;
+  _bindStickToBottom(container);
   requestAnimationFrame(() => {
     container.style.scrollBehavior = prev || '';
+  });
+}
+
+// ─── Sticky-bottom auto-scroll ─────────────────────────────────────────────
+// Track per-container "is the user pinned to the bottom?" so streaming
+// content (process info / token deltas / new bubbles) auto-scrolls down
+// only while the user wants to follow. Mid-stream scroll-up suspends
+// auto-stick; scrolling back to (near) bottom resumes it. Tab-switch back
+// re-applies the stick if it was on at the moment of going hidden.
+//
+// Why a threshold (32 px) instead of strict equality: programmatic scrolls
+// (`scrollTop = scrollHeight`) and Chromium's sub-pixel rounding leave a
+// 1–2 px gap that would otherwise toggle the flag off on the first scroll
+// event. 32 px is comfortable for the user too — being "almost at bottom"
+// counts as following.
+const STICKY_BOTTOM_THRESHOLD = 32;
+function _isNearBottom(el, threshold = STICKY_BOTTOM_THRESHOLD) {
+  if (!el) return true;
+  return (el.scrollHeight - el.scrollTop - el.clientHeight) <= threshold;
+}
+function _bindStickToBottom(el) {
+  if (!el || el._stickyBound) return;
+  el._stickyBound = true;
+  if (el._stickyEnabled === undefined) el._stickyEnabled = true;
+  el.addEventListener('scroll', () => {
+    el._stickyEnabled = _isNearBottom(el);
+  }, { passive: true });
+}
+// Scroll the container to the bottom, but only if the user hasn't scrolled
+// up. Safe to call after every DOM mutation that adds height — the no-op
+// branch (sticky off) lets the user keep reading process info undisturbed.
+//
+// `scroll-behavior: smooth` is set on every chat history surface so the
+// scrollbar drag / search-jump feels animated. Honouring that on a stream
+// hot path queues overlapping ~300 ms animated scrolls per delta and the
+// view visibly shakes; force `auto` for this programmatic stick so each
+// call lands instantly without fighting the previous animation.
+function _stickBottomIfPinned(el) {
+  if (!el) return;
+  if (el._stickyEnabled === false) return;
+  const prev = el.style.scrollBehavior;
+  el.style.scrollBehavior = 'auto';
+  el.scrollTop = el.scrollHeight;
+  if (prev) el.style.scrollBehavior = prev;
+  else el.style.removeProperty('scroll-behavior');
+}
+// Convenience for stream handlers that hold a `msg` element. The container
+// is whatever element the bubble lives in (chat-history for the main conv,
+// or a skill/agent edit chat's messages box) — same generic stickiness
+// applies to all of them.
+function _stickBottomFromMsg(msg) {
+  if (!msg) return;
+  _stickBottomIfPinned(msg.parentElement);
+}
+
+// Tab visibility: while the renderer is hidden, scroll events don't fire
+// and stream content piles up below the fold. On return, if the user was
+// pinned to the bottom before going hidden, jump to the latest content so
+// the conversation tracks live again.
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    // Cover every chat history surface (main conv + skill/agent edit chats).
+    const ids = ['chat-history', 'skills-chat-messages', 'agents-chat-messages'];
+    for (const id of ids) {
+      const el = document.getElementById(id);
+      if (el && el._stickyEnabled !== false) _stickBottomIfPinned(el);
+    }
   });
 }
 
@@ -1359,6 +1604,25 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     : document.getElementById('chat-history');
   if (!container) return null;
   const archive = opts.archive !== false;   // default on for backwards compat
+
+  // Dedupe by `_msg_id`: when the user switches conv tabs during a
+  // streaming turn, the same persisted message can reach the renderer
+  // twice — once via `loadConversationHistory` reading jsonl on
+  // switch-back, once via the trailing group-bus `message` event whose
+  // cid-mismatch guard had dropped its DOM update on the way out and
+  // now arrives after `currentCid` has flipped back. Without this
+  // guard, the second arrival's fallback `appendChatMessage` (used
+  // when the stale per-actor placeholder no longer has a
+  // `parentElement`) prints a duplicate bubble below the history-painted
+  // one. Idempotent re-render is the right contract — return the
+  // existing node so callers that want to mutate it (chip mounting /
+  // dataset writes) still find the right target.
+  if (message && message._msg_id) {
+    const existing = container.querySelector(
+      `.chat-message[data-msg-id="${CSS.escape(String(message._msg_id))}"]`,
+    );
+    if (existing) return existing;
+  }
 
   const emptyEl = container.querySelector('.empty');
   if (emptyEl) emptyEl.remove();
@@ -1380,7 +1644,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   // stored raw text. Assistant messages get a defensive structural-block
   // strip covering `<agent>` / `<agent-input-form>` / `<agent-input-submission>`
   // in case the backend's extractor missed a format variant (see
-  // `_stripSurvivingStructuralBlocks` in strip-agent.js).
+  // `_stripSurvivingStructuralBlocks` in strip-structural-blocks.js).
   let displayContent = rawContent;
   if (!isHtmlSnippet) {
     if (role === 'user') displayContent = _stripSubmissionTagForDisplay(rawContent);
@@ -1396,8 +1660,13 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   const producedHtml = (role === 'assistant' && Array.isArray(message.produced) && message.produced.length)
     ? _renderMessageProducedHtml(message.produced)
     : '';
-  const createdAgentHtml = (role === 'assistant' && message.created_agent)
-    ? _renderMessageCreatedAgentHtml(message.created_agent)
+  const createdAgentsList = role === 'assistant' ? _normalizeCreatedAgents(message) : null;
+  const createdAgentHtml = createdAgentsList
+    ? _renderMessageCreatedAgentHtml(createdAgentsList)
+    : '';
+  const createdSkillsList = role === 'assistant' ? _normalizeCreatedSkills(message) : null;
+  const createdSkillHtml = createdSkillsList
+    ? _renderMessageCreatedSkillHtml(createdSkillsList)
     : '';
   // Group-chat header sits **above** the bubble, outside it: sender name +
   // timestamp on one row. Same DOM strip for historical (loaded via
@@ -1425,7 +1694,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   msgDiv.innerHTML = `
     ${headerHtml}
     <div class="chat-bubble">${planAnnHtml}${contentHtml}${attachmentsHtml}</div>
-    <div class="chat-msg-actions" data-role="msg-actions">${producedHtml}${createdAgentHtml}</div>
+    <div class="chat-msg-actions" data-role="msg-actions">${producedHtml}${createdAgentHtml}${createdSkillHtml}</div>
   `;
   if (typeof opts.msgIndex === 'number') msgDiv.dataset.msgIndex = String(opts.msgIndex);
   if (message._msg_id) msgDiv.dataset.msgId = String(message._msg_id);
@@ -1447,6 +1716,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   if (attachmentsHtml) _hydrateMessageAttachmentThumbs(msgDiv, opts.cid || currentCid);
   if (producedHtml) _hydrateMessageProducedChips(msgDiv);
   if (createdAgentHtml) _hydrateMessageCreatedAgentChip(msgDiv);
+  if (createdSkillHtml) _hydrateMessageCreatedSkillChip(msgDiv);
   // Interactive input-form widget (assistant messages only). Appended inside
   // the bubble after markdown + chips so it reads as "reply text → confirm
   // this form". See chat-input-form.js for the widget implementation.
@@ -1458,24 +1728,35 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
       _mountChatInputForm(formHost, msgDiv, message, opts);
     }
   }
-  // Archive button + persisted-process block only make sense for finalised
-  // assistant replies (raw markdown, not an HTML placeholder like "thinking...").
-  if (role === 'assistant' && !isHtmlSnippet) {
-    if (archive) _attachBubbleArchiveBtn(msgDiv, () => rawContent);
-    if (Array.isArray(message.process) && message.process.length) {
-      // Auto-expand when the body is just an abort placeholder: the process
-      // trail IS the content the user already saw, hiding it behind a fold
-      // makes refresh look like "everything I watched stream is gone".
-      const bodyText = String(displayContent || '').trim();
-      // Match both possible forms — jsonl history can carry either depending
-      // on the UI language at the time of write (i18n key `model.aborted` →
-      // '(stopped)' in en, '（已中断）' in zh).
-      const isAbortStub = bodyText === '（已中断）' || bodyText === '(stopped)' || bodyText === '';
-      _renderPersistedProcess(msgDiv, message.process, { expanded: isAbortStub });
-    }
+  // Archive button is only for finalised assistant replies (raw markdown,
+  // not an HTML placeholder / status stub).
+  if (role === 'assistant' && !isHtmlSnippet && archive) {
+    _attachBubbleArchiveBtn(msgDiv, () => rawContent);
+  }
+  // Persisted-process trail is independent of body type — it must render
+  // for HTML-stub bodies too (e.g. CLI errors like `<span>⚠️ ...</span>`),
+  // otherwise after a refresh the only visible signal of a failed run is
+  // the red error line and "what happened" is gone. Auto-expand for any
+  // empty / abort-stub / HTML-stub body so the rail IS the content.
+  if (role === 'assistant' && Array.isArray(message.process) && message.process.length) {
+    const bodyText = String(displayContent || '').trim();
+    // Match both possible forms — jsonl history can carry either depending
+    // on the UI language at the time of write (i18n key `model.aborted` →
+    // '(stopped)' in en, '（已中断）' in zh).
+    const isAbortStub = bodyText === '（已中断）' || bodyText === '(stopped)' || bodyText === '';
+    const expanded = isAbortStub || isHtmlSnippet;
+    _renderPersistedProcess(msgDiv, message.process, { expanded });
   }
 
-  if (autoScroll) container.scrollTop = container.scrollHeight;
+  if (autoScroll) {
+    // Respect the user's scroll position: only follow if they were already
+    // pinned to the bottom (sticky on). This preserves the legacy "new
+    // message arrives → snap to bottom" behaviour for users who were
+    // following, without yanking users who scrolled up to read older
+    // process info. _bindStickToBottom is a no-op after first bind.
+    _bindStickToBottom(container);
+    _stickBottomIfPinned(container);
+  }
   return msgDiv;
 }
 
@@ -1767,6 +2048,11 @@ async function handleNewChatSubmit() {
   // Snapshot the new-chat recipient *now* so a stray view-change between
   // here and conv-create doesn't reset it before we can transfer.
   _pendingNewChatRecipient = { ..._newChatRecipient };
+  // Same pattern for the commander project chip — capture before any
+  // view-change so the freshly-created conv inherits the picked project.
+  if (typeof _captureCommanderProjectForNewChat === 'function') {
+    _captureCommanderProjectForNewChat();
+  }
   const content = applyRecipientPrefix(transformWithSkill(raw, skill), 'new-chat');
   const draftItems = _chatAttachList(DRAFT_CID);
   if (draftItems.some((a) => a.status === 'uploading')) {
@@ -1788,10 +2074,13 @@ async function handleNewChatSubmit() {
   if (newBtn) newBtn.disabled = true;
   let convId;
   try {
+    const projectId = (typeof _consumeCommanderProjectForNewChat === 'function')
+      ? _consumeCommanderProjectForNewChat()
+      : '';
     const res = await apiFetch('/api/conversations/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ kind: 'normal' }),
+      body: JSON.stringify({ kind: 'normal', ...(projectId ? { projectId } : {}) }),
     });
     const data = await res.json();
     if (!data.ok) throw new Error(data.error || t('chat.create_conv_failed'));
@@ -1804,6 +2093,9 @@ async function handleNewChatSubmit() {
     conv.title = _autoTitle(raw);
     conversations.unshift(conv);
     renderConversationList();
+    // The new conv may have landed inside a project — refresh the projects
+    // cache so its conv_count reflects the new total. Cheap (single IPC).
+    if (projectId && typeof loadProjects === 'function') loadProjects(true);
   } catch (e) {
     await uiAlert(t('chat.create_conv_failed_with_reason', { reason: e.message || e }));
     if (newBtn) newBtn.disabled = false;
@@ -2161,16 +2453,24 @@ function _hideThinking(msg) {
 }
 
 // Map the leading glyph of a formatted line to a semantic CSS class so the
-// stylesheet can tone errors red, approvals amber, etc.
+// stylesheet can tone errors red, tool calls blue, etc. The full glyph
+// palette + which event each one comes from is documented at the top of
+// `_formatEventLine`. Keep the two in sync — adding a new glyph there
+// without an entry here means the line renders in the default body color
+// (the muted slate baseline), which is what produced the "everything is
+// gray" look users complained about for CLI output.
 function _processKindOf(text) {
   const g = (text || '').trimStart().charAt(0);
-  if (g === '◯') return 'err';
-  if (g === '○') return 'warn';
-  if (g === '◉') return 'patch';
-  if (g === '■') return 'tool';
-  if (g === '▷') return 'out';
-  if (g === '◆' || g === '◇') return 'think';
-  if (g === '▶' || g === '●') return 'bound';
+  if (g === '◯' || g === '✗') return 'err';     // hard error / failed tool end
+  if (g === '○') return 'warn';                  // awaiting approval / soft warn
+  if (g === '◉') return 'patch';                 // file change
+  if (g === '■') return 'tool';                  // tool call (start / end ok)
+  if (g === '▷') return 'out';                   // command / cli stdout-or-stderr
+  if (g === '◆' || g === '◇') return 'think';   // reasoning / reply marker
+  if (g === '▶' || g === '●') return 'bound';   // lifecycle start / end
+  if (g === '▣') return 'plan';                  // plan announcement
+  if (g === '◐') return 'live';                  // live generating preview
+  if (g === '▪') return 'meta';                  // lifecycle / fallback meta
   return '';
 }
 
@@ -2182,13 +2482,22 @@ function _streamingAppendProgress(msg, text) {
   if (container) container.style.display = '';
   const body = msg.querySelector('[data-role="process"]');
   if (!body) return;
+  // Decide auto-scroll on the inner body BEFORE appending the line —
+  // once the new line lands, scrollHeight grows and "near bottom" would
+  // misread as false even when the user was tracking the latest output.
+  // Threshold is 10 px (one-line tolerance) so the slightest manual
+  // scroll-up suspends auto-scroll, letting the user read older entries
+  // without being yanked back.
+  const innerWasAtBottom = _isNearBottom(body, 10);
   const line = document.createElement('div');
   const kind = _processKindOf(text);
   line.className = 'stream-process-line' + (kind ? ' kind-' + kind : '');
   line.textContent = text;
   body.appendChild(line);
-  // Auto-scroll only within the process area
-  body.scrollTop = body.scrollHeight;
+  if (innerWasAtBottom) body.scrollTop = body.scrollHeight;
+  // Outer chat-history follows independently — its own sticky-bottom
+  // logic respects user scroll on the conversation level.
+  _stickBottomFromMsg(msg);
 }
 
 // Cancel any rAF queued by `_streamingAppendFinalDelta`. Callers that are
@@ -2216,6 +2525,11 @@ function _streamingSetFinal(msg, text, { archive = false } = {}) {
   const finalEl = msg.querySelector('[data-role="final"]');
   if (!finalEl) return;
   _cancelPendingStreamRaf(msg);
+  // Keep the user pinned through the placeholder → final-markdown swap
+  // (collapsing the process pane changes scrollHeight). The helper no-ops
+  // when the user has scrolled up to read; here that's the expected
+  // behaviour — finalize shouldn't yank a reader back to the bottom.
+  _stickBottomFromMsg(msg);
   // Always repaint on final: during streaming the DOM may contain
   // placeholder markers (from `_stripAgentCreateBlocksForStream` etc.)
   // that need to be replaced with the backend-cleaned prose. A previous
@@ -2349,6 +2663,11 @@ function _scrollToMessageTop(msgEl, containerId = 'chat-history') {
   if (!msgEl) return;
   const container = document.getElementById(containerId);
   if (!container) return;
+  // Pin-to-top intentionally moves the user away from the bottom; if
+  // sticky-bottom were left armed, the first stream delta would race the
+  // pin and yank the view back down. Disarm synchronously here — the
+  // user has to scroll back to bottom themselves to re-arm following.
+  container._stickyEnabled = false;
   // Instant scroll to avoid the animation getting clobbered by streaming DOM
   // mutations that land during the send. Use rAF twice to make sure layout
   // has settled (style recalc after appendChild, then paint).
@@ -2912,10 +3231,11 @@ function _handleStreamEvent(cid, msg, ev, { archive = false } = {}) {
         _mountChatInputForm(host, msg, { role: 'assistant', form: ev.form }, { cid });
       }
     }
-    // Created-agent chip also arrives on the final event payload — attach
+    // Created-agent chips also arrive on the final event payload — attach
     // here in case the relay event was missed (e.g. on reconnect / replay).
-    if (ev.created_agent && ev.created_agent.agent_id) {
-      _mountCreatedAgentChip(msg, ev.created_agent);
+    const finalCreated = _normalizeCreatedAgents(ev);
+    if (finalCreated) {
+      for (const payload of finalCreated) _mountCreatedAgentChip(msg, payload);
     }
   } else if (ev.type === 'error') {
     _streamingSetError(msg, ev.text);
@@ -3069,9 +3389,15 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
     ph.dataset.produced = JSON.stringify(gm.produced);
   }
 
-  // Created-agent chip (commander quick-create) — same actions row.
-  if (gm.created_agent && gm.created_agent.agent_id) {
-    _mountCreatedAgentChip(ph, gm.created_agent);
+  // Created-agent chips (commander quick-create / quick-edit) — same actions row.
+  const gmCreated = _normalizeCreatedAgents(gm);
+  if (gmCreated) {
+    for (const payload of gmCreated) _mountCreatedAgentChip(ph, payload);
+  }
+  // Created-skill chip (commander skill create / edit).
+  const gmSkills = _normalizeCreatedSkills(gm);
+  if (gmSkills) {
+    for (const payload of gmSkills) _mountCreatedSkillChip(ph, payload);
   }
 
   // Form widget (agent → user input form).
@@ -3168,6 +3494,15 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
         const legacy = _groupMsgToLegacy(gm);
         const bubble = appendChatMessage(legacy, true, { cid, archive });
         if (bubble) bubble.dataset.fromActor = String(gm.from || '');
+        // Cache-refresh parity with `_mountCreatedAgentChip`: the placeholder
+        // path goes through it (which calls loadAgents/loadSkills(true)),
+        // but this fallback runs appendChatMessage directly which only
+        // paints the chip — without this hop, fast turns that emit zero
+        // process events leave _agentsCache / _skillsCache stale, so the
+        // newly-created agent is missing from the agents tab and the @
+        // picker until a manual refresh.
+        if (_normalizeCreatedAgents(gm)) { try { loadAgents?.(true); } catch (_) {} }
+        if (_normalizeCreatedSkills(gm)) { try { loadSkills?.(true); } catch (_) {} }
       }
     } else {
       // Mid-turn message — append a new bubble alongside, leave the
@@ -3308,14 +3643,11 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
   }
 }
 
-// Append the "view details" chip into a streaming bubble. Idempotent: duplicate
-// calls (relay event + final-event payload) are de-duped by checking for an
-// existing `.chat-msg-created-agent` child.
+// Append a "view details" chip into a streaming bubble. Idempotent per
+// agent_id — repeat calls for the same id no-op; calls for different ids
+// accumulate into the same `.chat-msg-created-agent` row.
 function _mountCreatedAgentChip(msg, payload) {
   if (!msg || !payload || !payload.agent_id) return;
-  // Chip lives in the below-bubble action row alongside produced files +
-  // archive button (same visual footer slot). Lazily allocate the row
-  // for streaming placeholders that didn't get one at creation.
   let actionsRow = msg.querySelector('[data-role="msg-actions"]');
   if (!actionsRow) {
     actionsRow = document.createElement('div');
@@ -3323,16 +3655,56 @@ function _mountCreatedAgentChip(msg, payload) {
     actionsRow.dataset.role = 'msg-actions';
     msg.appendChild(actionsRow);
   }
-  if (actionsRow.querySelector('.chat-msg-created-agent')) return;
-  const wrap = document.createElement('div');
-  wrap.innerHTML = _renderMessageCreatedAgentHtml(payload);
-  const node = wrap.firstElementChild;
-  if (!node) return;
-  actionsRow.appendChild(node);
+  const aid = payload.agent_id;
+  if (actionsRow.querySelector(`.chat-msg-created-agent-chip[data-agent-id="${CSS.escape(aid)}"]`)) return;
+  let wrap = actionsRow.querySelector('.chat-msg-created-agent');
+  if (!wrap) {
+    wrap = document.createElement('div');
+    wrap.className = 'chat-msg-created-agent';
+    actionsRow.appendChild(wrap);
+  }
+  // Render an array of one + extract the inner chip(s) so we append into
+  // the existing wrap rather than nesting `.chat-msg-created-agent` rows.
+  const tmp = document.createElement('div');
+  tmp.innerHTML = _renderMessageCreatedAgentHtml([payload]);
+  const newChips = tmp.querySelectorAll('.chat-msg-created-agent-chip');
+  for (const chip of newChips) wrap.appendChild(chip);
   _hydrateMessageCreatedAgentChip(msg);
   // Refresh the agents-cache lazily so the user sees the new agent in the
   // sidebar list when they jump over. Non-fatal if it fails.
   try { if (typeof loadAgents === 'function') loadAgents(true); } catch (_) {}
+}
+
+// Skill mirror of `_mountCreatedAgentChip`. Idempotent per skill_id;
+// repeat calls for the same id no-op, calls for different ids accumulate
+// into the same chip row. Skill chips and agent chips share CSS but are
+// distinguished by `data-agent-id` vs `data-skill-id`, so they coexist in
+// separate `.chat-msg-created-agent` wrappers.
+function _mountCreatedSkillChip(msg, payload) {
+  if (!msg || !payload || !payload.skill_id) return;
+  let actionsRow = msg.querySelector('[data-role="msg-actions"]');
+  if (!actionsRow) {
+    actionsRow = document.createElement('div');
+    actionsRow.className = 'chat-msg-actions';
+    actionsRow.dataset.role = 'msg-actions';
+    msg.appendChild(actionsRow);
+  }
+  const sid = payload.skill_id;
+  if (actionsRow.querySelector(`.chat-msg-created-agent-chip[data-skill-id="${CSS.escape(sid)}"]`)) return;
+  // Find or create a wrapper that already holds skill chips. `:has(...)`
+  // keeps us from accidentally appending into the agent-chip wrapper.
+  let wrap = actionsRow.querySelector('.chat-msg-created-agent:has(.chat-msg-created-agent-chip[data-skill-id])');
+  if (!wrap) {
+    wrap = document.createElement('div');
+    wrap.className = 'chat-msg-created-agent';
+    actionsRow.appendChild(wrap);
+  }
+  const tmp = document.createElement('div');
+  tmp.innerHTML = _renderMessageCreatedSkillHtml([payload]);
+  const newChips = tmp.querySelectorAll('.chat-msg-created-agent-chip');
+  for (const chip of newChips) wrap.appendChild(chip);
+  _hydrateMessageCreatedSkillChip(msg);
+  try { if (typeof loadSkills === 'function') loadSkills(true); } catch (_) {}
 }
 
 // Hide the `<agent-input-submission form_id=... agent_id=...>{json}
@@ -3342,7 +3714,7 @@ function _mountCreatedAgentChip(msg, payload) {
 // bulleted summary above it already tells them what they confirmed.
 function _stripSubmissionTagForDisplay(text) {
   if (!text || text.indexOf('<agent-input-submission') < 0) return text;
-  // Atomic-container strip with prose/code guard via strip-agent.js.
+  // Atomic-container strip with prose/code guard via strip-structural-blocks.js.
   // Same class of fragmentation / set-B leak as `<agent>` — see that
   // file's header for the invariant matrix.
   const out = _stripOuterTagBlocks(text, 'agent-input-submission');
@@ -3351,9 +3723,9 @@ function _stripSubmissionTagForDisplay(text) {
 }
 
 // `_splitMarkdownProseCode`, `_findOuterAgentRanges`, `_stripSurvivingAgentBlocks`,
-// `_replaceOuterAgentBlocks` are defined in `./strip-agent.js` (loaded earlier
+// `_replaceOuterAgentBlocks` are defined in `./strip-structural-blocks.js` (loaded earlier
 // in `index.html`). They live in their own file so vitest can pin the set-A /
-// set-B fixtures (`test/renderer/strip-agent.test.ts`) — see that file for
+// set-B fixtures (`test/renderer/strip-structural-blocks.test.ts`) — see that file for
 // the invariant matrix. Wrap the i18n-aware placeholder here and delegate.
 //
 // Wrap placeholder text in an HTML `<em>` instead of markdown `_text_`:
@@ -3371,7 +3743,7 @@ function _stripAgentCreateBlocksForStream(buf) {
 }
 
 // `<<<skill-file path=X ... >>>` blocks (skill edit chat). Different fence
-// shape from `<agent>` (see strip-agent.js header) but same user-facing
+// shape from `<agent>` (see strip-structural-blocks.js header) but same user-facing
 // contract: streaming placeholder hides the raw block + reveals the file
 // being written. The path attribute (when present) flows into the
 // localised "Writing X…" label so the placeholder is informative;
@@ -3385,6 +3757,20 @@ function _stripSkillFileBlocksForStream(buf) {
   });
 }
 
+// `<skill>` container (commander create / edit). Pure logic lives in
+// `strip-structural-blocks.js::_stripSkillCreateContainer` — see that header for the
+// closed-vs-unclosed mode rules. This wrapper only builds the i18n-aware
+// fallback placeholder and delegates so DOM / i18n / escapeHtml stay out
+// of the pure-function module (parallel to how `_stripAgentCreateBlocksForStream`
+// composes `_replaceOuterAgentBlocks`). Set A / set B fixtures pinned in
+// `test/renderer/strip-structural-blocks.test.ts`.
+function _stripSkillCreateBlocksForStream(buf) {
+  return _stripSkillCreateContainer(
+    buf,
+    _streamPlaceholderHtml('chat.create_skill_streaming_placeholder'),
+  );
+}
+
 function _stripAgentFormBlockForStream(buf) {
   // Primary: XML `<agent-input-form>...</agent-input-form>` (symmetric
   // with submission reply tag, token-stable). Legacy: fenced
@@ -3394,7 +3780,7 @@ function _stripAgentFormBlockForStream(buf) {
   // actual form widget.
   if (!buf) return buf;
   const placeholder = _streamPlaceholderHtml('chat.form.streaming_placeholder');
-  // XML branch: atomic-container handling via strip-agent.js — same
+  // XML branch: atomic-container handling via strip-structural-blocks.js — same
   // prose/code guard as `<agent>` so a fenced ```xml example or inline
   // backtick mention of `<agent-input-form>` survives instead of being
   // eaten as a real form.
@@ -3444,12 +3830,17 @@ function _streamingAppendFinalDelta(msg, piece) {
     msg._streamRafScheduled = false;
     msg._streamRafHandle = null;
     const buf = msg.dataset.streamBuf || '';
-    const display = _stripAgentCreateBlocksForStream(
-      _stripAgentFormBlockForStream(
-        _stripSkillFileBlocksForStream(buf),
+    const display = _stripSkillCreateBlocksForStream(
+      _stripAgentCreateBlocksForStream(
+        _stripAgentFormBlockForStream(
+          _stripSkillFileBlocksForStream(buf),
+        ),
       ),
     );
     finalEl.innerHTML = `<div class="markdown-body">${_renderMessageMarkdown(display)}</div>`;
+    // Token deltas grow the bubble; keep the user pinned to the latest
+    // text if they were following along (no-op once they scroll up).
+    _stickBottomFromMsg(msg);
   };
   if (typeof requestAnimationFrame === 'function') {
     msg._streamRafHandle = requestAnimationFrame(flush);
@@ -3548,8 +3939,19 @@ function _formatEventLine(evt) {
   }
 
   if (stream === 'command_output') {
-    const text = data?.text || data?.stdout || data?.stderr || '';
-    return text ? `▷ ${text}` : t('chat.stream.command_empty');
+    // Distinguish stderr from stdout so CLI agents (claude code / codex /
+    // openclaw / opencode / hermes) don't render their entire spool in a
+    // single muted slate. We keep ▷ for stdout, swap to ○ (kind-warn,
+    // amber) for stderr — many CLIs route progress and prompts to stderr,
+    // so we stop short of treating it as a hard error (◯) which would dye
+    // the whole sub-stream red. Falls back to stdout styling if the event
+    // doesn't disambiguate via separate stdout/stderr fields.
+    const stdout = data?.stdout;
+    const stderr = data?.stderr;
+    const text = data?.text || stdout || stderr || '';
+    if (!text) return t('chat.stream.command_empty');
+    const isStderrOnly = !stdout && stderr;
+    return isStderrOnly ? `○ ${text}` : `▷ ${text}`;
   }
 
   if (stream === 'patch') {
@@ -3578,6 +3980,59 @@ function _formatEventLine(evt) {
       }).filter(Boolean).join('; ');
       return detail ? t('chat.stream.attachment_skipped', { items: detail }) : null;
     }
+    return null;
+  }
+
+  // CLI-backed agents (claude code / codex / openclaw / opencode / hermes)
+  // emit `LocalEvent`s that bus.ts wraps verbatim as `{stream:'cli', data:e}`.
+  // Without this branch the catch-all below dumped them as
+  // `▪ cli {json}` which is (a) unreadable JSON and (b) lands in
+  // kind-meta — exactly the "all gray" symptom users see for CLI runs.
+  // Field shapes mirror `local_agents/backends/base.ts::LocalEvent`.
+  if (stream === 'cli') {
+    const cliType = String(data?.type || '').toLowerCase();
+    if (cliType === 'tool-event') {
+      const name = String(data?.tool || 'tool');
+      const isResult = data?.phase === 'result';
+      const phase = phaseCn(isResult ? 'end' : 'start');
+      let detail = '';
+      if (isResult && data?.output != null) {
+        detail = typeof data.output === 'string' ? data.output : JSON.stringify(data.output);
+      } else if (data?.input != null) {
+        detail = typeof data.input === 'string' ? data.input : JSON.stringify(data.input);
+      }
+      detail = detail.replace(/\s+/g, ' ').trim();
+      if (detail.length > 160) detail = detail.slice(0, 160) + '…';
+      const detailStr = detail ? ' · ' + detail : '';
+      return `■ ${name}${phase ? ' · ' + phase : ''}${detailStr}`;
+    }
+    if (cliType === 'process-info') {
+      // Fired once at CLI spawn; surface as a milestone so the user sees
+      // the run starting. cmd/args is enough — full cwd is noisy.
+      const cmd = String(data?.cmd || '').trim();
+      return cmd ? `▶ ${cmd}` : null;
+    }
+    if (cliType === 'status') {
+      // Bucket statuses into milestone (▶/●), warn (○) and error (◯) so
+      // they pick up the right kind class downstream.
+      const st = String(data?.status || '').toLowerCase();
+      if (!st) return null;
+      if (st === 'session_ready' || st === 'running') return `▶ ${st}`;
+      if (st === 'result' || st === 'completed') return `● ${st}`;
+      if (st === 'error' || st === 'failed' || st === 'timeout') return `◯ ${st}`;
+      if (st === 'cancelled' || st === 'aborted') return `○ ${st}`;
+      return `▪ ${st}`;
+    }
+    if (cliType === 'stderr-line') {
+      // CLIs route progress + diagnostics to stderr — treat as soft warn
+      // (○, kind-warn amber) rather than a hard error (◯, kind-err red),
+      // matching the heuristic we use for `command_output` stderr above.
+      const line = String(data?.line || '').replace(/\s+/g, ' ').trim();
+      if (!line) return null;
+      const trimmed = line.length > 160 ? line.slice(0, 160) + '…' : line;
+      return `○ ${trimmed}`;
+    }
+    // Unknown CLI event types: hide rather than dump JSON.
     return null;
   }
 
@@ -3616,6 +4071,11 @@ function _streamingUpdateLive(msg, prefix, text, appendDelta) {
   const body = msg.querySelector('[data-role="process"]');
   if (!body) return;
 
+  // Decide auto-scroll BEFORE mutating the live row — text growth changes
+  // scrollHeight and would otherwise misread "near bottom" as false even
+  // when the user was tracking the latest output. 10 px tolerance treats
+  // any manual scroll-up as "user wants to read older entries".
+  const innerWasAtBottom = _isNearBottom(body, 10);
   let line = body.querySelector('.stream-process-live');
   if (!line) {
     line = document.createElement('div');
@@ -3628,7 +4088,8 @@ function _streamingUpdateLive(msg, prefix, text, appendDelta) {
   // Show last ~200 chars to keep the row compact
   const preview = msg._liveBuf.length > 200 ? '…' + msg._liveBuf.slice(-200) : msg._liveBuf;
   line.textContent = prefix + preview;
-  body.scrollTop = body.scrollHeight;
+  if (innerWasAtBottom) body.scrollTop = body.scrollHeight;
+  _stickBottomFromMsg(msg);
 }
 
 // Update the loading element (wherever it currently lives in DOM) with the reply.

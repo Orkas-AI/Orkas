@@ -107,4 +107,29 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     expect(text).toContain('Source: custom');
     expect(text).not.toContain('Source: skills');
   });
+
+  // The block embeds a Read-pattern header with resolved ROOT values for
+  // both sources + an anti-prior warning. Without these, the LLM falls back
+  // on training-prior layouts (e.g. `/data/custom/skills/<id>/`) and trips
+  // E_PATH_OUT_OF_SCOPE on `read_file`. See bus.ts substitution map cleanup
+  // — `$builtin_skills_dir / $custom_skills_dir` no longer flow through the
+  // prompt template, so this header IS the only place the LLM learns the
+  // real root paths.
+  it('block header carries Read pattern + resolved ROOT values + anti-prior warning', async () => {
+    writeSkill(builtinDir(), 'shipped', 'Shipped', 'desc-b');
+    writeSkill(customDir(), 'mine', 'Mine', 'desc-c');
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock();
+    expect(text).toContain('`read_file(<ROOT>/<id>/SKILL.md)`');
+    expect(text).toContain(`- custom:  ${path.resolve(customDir())}`);
+    expect(text).toContain(`- builtin: ${path.resolve(builtinDir())}`);
+    expect(text).toContain('Use these ROOT values verbatim');
+    expect(text).toContain('training-prior');
+  });
+
+  it('block omits ROOT header when no skills are present (renderSkillLines short-circuits empty)', async () => {
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock();
+    expect(text).toBe('');
+  });
 });

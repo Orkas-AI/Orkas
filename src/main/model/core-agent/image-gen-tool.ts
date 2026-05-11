@@ -39,6 +39,10 @@ export interface ImageGenToolOpts {
   /** Conversation id — extends the path sandbox to allow writing into
    *  the conv's attachment dir (and reading reference images from it). */
   cid?: string;
+  /** Project id of the current conversation, when it belongs to one.
+   *  Threaded through from group_chat so workspace resolution picks up
+   *  the project-scoped selection (per CLAUDE.md projects feature). */
+  projectId?: string;
   /** Same contract as `local-tools.LocalToolsOpts.onFileWritten`. */
   onFileWritten?: (absPath: string) => void;
   /** Same contract as `local-tools.LocalToolsOpts.hasProducedPath`:
@@ -51,7 +55,7 @@ export interface ImageGenToolOpts {
 function allowedRoots(opts: ImageGenToolOpts): string[] {
   const roots: string[] = [];
   try {
-    const ws = getWorkspacePath(opts.userId);
+    const ws = getWorkspacePath(opts.userId, opts.projectId);
     if (ws) roots.push(ws);
   } catch (err) { log.warn(`resolve workspace: ${(err as Error).message}`); }
   if (opts.cid) {

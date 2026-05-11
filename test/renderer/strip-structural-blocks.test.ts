@@ -33,7 +33,7 @@
 
 import { describe, it, expect } from 'vitest';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const strip = require('../../src/renderer/modules/strip-agent.js');
+const strip = require('../../src/renderer/modules/strip-structural-blocks.js');
 const {
   _splitMarkdownProseCode,
   _findOuterTagRanges,
@@ -42,6 +42,7 @@ const {
   _findOuterAgentRanges,
   _stripSurvivingAgentBlocks,
   _replaceOuterAgentBlocks,
+  _stripSkillCreateContainer,
   _stripSurvivingStructuralBlocks,
 } = strip as {
   _splitMarkdownProseCode: (text: string) => Array<{ kind: 'prose' | 'code'; text: string }>;
@@ -51,6 +52,7 @@ const {
   _findOuterAgentRanges: (text: string) => Array<[number, number]>;
   _stripSurvivingAgentBlocks: (text: string) => string;
   _replaceOuterAgentBlocks: (buf: string, placeholder: string) => string;
+  _stripSkillCreateContainer: (buf: string, fallbackPlaceholder: string) => string;
   _stripSurvivingStructuralBlocks: (text: string) => string;
 };
 
@@ -409,7 +411,7 @@ describe('_stripSurvivingStructuralBlocks (final-time safety strip)', () => {
 });
 
 // --- Custom-fence blocks: `<<<skill-file path=X ... >>>` ----------------
-// Different delimiter family from XML tags above (see strip-agent.js
+// Different delimiter family from XML tags above (see strip-structural-blocks.js
 // header). The skill-file block wraps **arbitrary file content** that may
 // contain naked `<` / `>` chars (Python, TypeScript, HTML, JSX, configs);
 // using XML tags would force the LLM to escape — instead the LLM-side
@@ -420,7 +422,7 @@ describe('_stripSurvivingStructuralBlocks (final-time safety strip)', () => {
 // survives, while a real block (containing arbitrary file content with
 // naked backticks / fences inside) is stripped/replaced atomically.
 
-const skill = require('../../src/renderer/modules/strip-agent.js');
+const skill = require('../../src/renderer/modules/strip-structural-blocks.js');
 const {
   _findOuterSkillFileRanges,
   _stripOuterSkillFileBlocks,
@@ -613,6 +615,106 @@ describe('skill-file — _stripSurvivingStructuralBlocks final-time safety', () 
     expect(out).toContain('mid');
     expect(out).toContain('after');
     expect(out).toContain('end');
+  });
+});
+
+// Streaming-time skill-container stripper. Unique surface vs `<agent>`:
+// closed containers must keep their inner content (per-file placeholders)
+// while still hiding outer `<skill>` / `<skill_id>` scaffolding; unclosed
+// containers must collapse to a single fallback placeholder. Adding a
+// guard / branch here later requires extending the fixture set with the
+// new motivating shape — patch isn't done until the new fixture is green
+// AND every previous fixture still passes (PC/CLAUDE.md §9 hard rule).
+describe('_stripSkillCreateContainer — set A (real shapes)', () => {
+  it('A1. closed container with skill_id + per-file placeholder body', () => {
+    // The earlier pipeline pass replaces `<<<skill-file>>>` with the
+    // per-file placeholder; we feed the post-pass shape and expect the
+    // outer `<skill>` shell + `<skill_id>` to vanish, body retained.
+    const buf = 'preface\n<skill>\n<skill_id>foo</skill_id>\n[Writing SKILL.md…]\n</skill>\ntail';
+    const out = _stripSkillCreateContainer(buf, '⟨FALLBACK⟩');
+    expect(out).toContain('preface');
+    expect(out).toContain('[Writing SKILL.md…]');
+    expect(out).toContain('tail');
+    expect(out).not.toContain('<skill>');
+    expect(out).not.toContain('</skill>');
+    expect(out).not.toContain('<skill_id>');
+    expect(out).not.toContain('foo');
+    expect(out).not.toContain('⟨FALLBACK⟩');
+  });
+
+  it('A2. closed container WITHOUT skill_id (create flow)', () => {
+    const buf = '<skill>\n[Writing SKILL.md…]\n[Writing scripts/foo.py…]\n</skill>';
+    const out = _stripSkillCreateContainer(buf, '⟨FALLBACK⟩');
+    expect(out).toContain('[Writing SKILL.md…]');
+    expect(out).toContain('[Writing scripts/foo.py…]');
+    expect(out).not.toContain('<skill>');
+  });
+
+  it('A3. unclosed container collapses to fallback placeholder', () => {
+    // Mid-stream: `<skill>` opened, no `</skill>` yet. Inner content may
+    // still be raw `<skill_id>` / token fragments — the fallback hides
+    // ALL of it until the closer arrives.
+    const buf = 'before\n<skill>\n<skill_id>foo</skill_id>\nhalf-stre';
+    const out = _stripSkillCreateContainer(buf, '⟨FALLBACK⟩');
+    expect(out).toContain('before');
+    expect(out).toContain('⟨FALLBACK⟩');
+    expect(out).not.toContain('<skill_id>');
+    expect(out).not.toContain('half-stre');
+  });
+
+  it('A4. multiple closed containers in one buffer (rare; both stripped)', () => {
+    const buf = '<skill>\n<skill_id>a</skill_id>\nA-body\n</skill>\nmid\n<skill>\nB-body\n</skill>';
+    const out = _stripSkillCreateContainer(buf, '⟨FALLBACK⟩');
+    expect(out).toContain('A-body');
+    expect(out).toContain('mid');
+    expect(out).toContain('B-body');
+    expect(out).not.toContain('<skill>');
+    expect(out).not.toContain('<skill_id>');
+  });
+
+  it('A5. interior whitespace trim — opening newline + closing newline both eaten', () => {
+    const buf = '<skill>\n\nINNER\n\n</skill>';
+    const out = _stripSkillCreateContainer(buf, '⟨FALLBACK⟩');
+    expect(out).toContain('INNER');
+    // The `\s*` strips on both sides should keep the line count tame —
+    // no triple-newline runs left over from the surgery.
+    expect(/\n{3,}/.test(out)).toBe(false);
+  });
+});
+
+describe('_stripSkillCreateContainer — set B (look-alikes must NOT match)', () => {
+  it('B1. agent <skills> sub-tag must NOT trigger skill-container handling', () => {
+    // The agent flow's `<skills>` list lives inside an `<agent>` container.
+    // The boundary check (`<skill>` open token) must reject `<skills>` —
+    // matching it would silently swallow the agent's skill list.
+    const buf = '<agent>\n<skills>\nfoo-skill\n</skills>\n</agent>';
+    const out = _stripSkillCreateContainer(buf, '⟨FALLBACK⟩');
+    expect(out).toBe(buf);
+  });
+
+  it('B2. literal `<skill>` inside a fenced ```xml block (protocol explanation)', () => {
+    // LLM showing the user the protocol shape inside a code fence must
+    // not be processed as a real container.
+    const buf = 'See:\n```xml\n<skill>\n<skill_id>foo</skill_id>\n</skill>\n```\nend';
+    const out = _stripSkillCreateContainer(buf, '⟨FALLBACK⟩');
+    expect(out).toBe(buf);
+  });
+
+  it('B3. literal `<skill>` inside an inline backtick span', () => {
+    const buf = 'use the `<skill>` container to wrap things';
+    const out = _stripSkillCreateContainer(buf, '⟨FALLBACK⟩');
+    expect(out).toBe(buf);
+  });
+
+  it('B4. bare prose with no `<skill>` token returns input unchanged', () => {
+    const buf = 'I will write a skill that does X';
+    const out = _stripSkillCreateContainer(buf, '⟨FALLBACK⟩');
+    expect(out).toBe(buf);
+  });
+
+  it('B5. empty / falsy input', () => {
+    expect(_stripSkillCreateContainer('', '⟨FALLBACK⟩')).toBe('');
+    expect(_stripSkillCreateContainer(undefined as any, '⟨FALLBACK⟩')).toBe(undefined);
   });
 });
 

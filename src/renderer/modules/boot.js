@@ -12,6 +12,7 @@ async function bootApp() {
   // Avatar catalog must be ready before loadAgents (which triggers card rendering).
   await initAvatarCatalog();
   await refreshModelGuard();
+  await loadProjects();
   await loadConversations();
   await loadAgents();
   // Warm the commander avatar cache so the first chat render doesn't fall
@@ -101,6 +102,16 @@ function _restoreLastView() {
     setView('conversation', cid);
     return;
   }
+  // Project detail page: cid slot carries the pid (see boot.js setView).
+  // Verify the project still exists (might have been deleted on another
+  // device since last save) before restoring; fall through to new-chat
+  // otherwise.
+  if (view === 'project' && cid
+      && Array.isArray(_projectsCache)
+      && _projectsCache.some((p) => p && p.project_id === cid)) {
+    setView('project', cid);
+    return;
+  }
   if (view === 'agents' || view === 'skills' || view === 'contexts' || view === 'new-chat') {
     setView(view);
     return;
@@ -135,6 +146,7 @@ function setView(view, cid, opts = {}) {
                 : view === 'skills' ? 'panel-skills'
                 : view === 'contexts' ? 'panel-contexts'
                 : view === 'settings' ? 'panel-settings'
+                : view === 'project' ? 'panel-project'
                 : 'panel-conversation';
   document.getElementById(panelId).classList.add('active');
 
@@ -204,16 +216,31 @@ function setView(view, cid, opts = {}) {
     setTimeout(() => document.getElementById('new-chat-input')?.focus(), 50);
   } else if (view === 'agents') {
     currentCid = null;
-    loadAgents();
+    // Force-refresh on every tab visit. The mid-stream chip handler in
+    // `conversation.js::_mountCreatedAgentChip` already calls `loadAgents(true)`
+    // when an agent is created via commander, but that only fires while the
+    // user is on the conversation view. If the user navigates to the agents
+    // tab between or during creation streams, the chip path may not run /
+    // may have raced, leaving `_agentsCache` stale and the tab missing the
+    // newly-created agents. Cheap (one IPC + dir scan), and the tab is the
+    // user's recovery path when something looks off — making it always show
+    // ground truth.
+    loadAgents(true);
   } else if (view === 'skills') {
     currentCid = null;
-    loadSkills();
+    // Same reasoning as the agents branch above.
+    loadSkills(true);
   } else if (view === 'contexts') {
     currentCid = null;
     loadContexts();
   } else if (view === 'settings') {
     currentCid = null;
     loadSettings();
+  } else if (view === 'project') {
+    // `cid` arg is repurposed as `pid` for this view (single second-arg
+    // slot kept; the function only inspects it for 'conversation' above).
+    currentCid = null;
+    if (typeof loadProjectDetail === 'function') loadProjectDetail(cid || '');
   } else {
     currentCid = null;
   }

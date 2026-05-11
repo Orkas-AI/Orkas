@@ -23,8 +23,15 @@ async function collect(events: AgentRunEvent[]) {
   return out;
 }
 
-describe('event-mapper › tool_start forwards input + summarizes progress', () => {
-  it('bash tool → progress shows the command, event carries full arguments', async () => {
+describe('event-mapper › tool_start / tool_end emit a single structured event', () => {
+  // The mapper used to yield both a `progress` text (▶ name · arg / ✓ name ·
+  // preview) AND a structured `event` with the same info; the renderer
+  // formatted both, producing duplicate rows in the process pane (one ■ from
+  // the event branch, one ▶ or ✓ from the progress branch). The contract is
+  // now: `tool_start` / `tool_end` yield ONE `event` only — formatting is the
+  // renderer's job (`_formatEventLine`'s `tool` branch).
+
+  it('bash tool → single event carries the full input + result preview', async () => {
     const out = await collect([
       { type: 'tool_start', name: 'bash', id: 'c1', input: { command: 'curl -sSL https://example.com/article' } },
       { type: 'tool_end', name: 'bash', id: 'c1', result: 'HTTP/1.1 200 OK\n\n<html>…</html>' },
@@ -39,32 +46,28 @@ describe('event-mapper › tool_start forwards input + summarizes progress', () 
     expect(startEvent.event.data.name).toBe('bash');
     expect(startEvent.event.data.arguments).toEqual({ command: 'curl -sSL https://example.com/article' });
 
-    const startProgress = out.find(
-      (e) => e.type === 'progress' && typeof e.text === 'string' && e.text.startsWith('▶ bash'),
-    );
-    expect(startProgress).toBeDefined();
-    expect(startProgress.text).toContain('curl -sSL https://example.com/article');
-
     const endEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'end');
     expect(endEvent.event.data.result_preview).toContain('HTTP/1.1 200 OK');
     expect(endEvent.event.data.isError).toBe(false);
 
-    const endProgress = out.find(
-      (e) => e.type === 'progress' && typeof e.text === 'string' && e.text.startsWith('✓ bash'),
+    // No parallel `progress` rows for tool_start / tool_end. (Other yields
+    // like `retry` still produce progress text — they're tested below.)
+    const toolProgress = out.filter(
+      (e) => e.type === 'progress' && typeof e.text === 'string'
+        && (e.text.startsWith('▶ bash') || e.text.startsWith('✓ bash') || e.text.startsWith('✗ bash')),
     );
-    expect(endProgress.text).toContain('HTTP/1.1 200 OK');
+    expect(toolProgress).toEqual([]);
   });
 
-  it('read_file tool → progress shows the path', async () => {
+  it('read_file tool → start event carries the path on `arguments`', async () => {
     const out = await collect([
       { type: 'tool_start', name: 'read_file', id: 'c2', input: { path: '/tmp/foo.md' } },
       { type: 'tool_end', name: 'read_file', id: 'c2', result: 'hello' },
       { type: 'done', result: { text: '', meta: { error: null } } },
     ]);
-    const startProgress = out.find(
-      (e) => e.type === 'progress' && typeof e.text === 'string' && e.text.startsWith('▶ read_file'),
-    );
-    expect(startProgress.text).toContain('/tmp/foo.md');
+    const startEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'start');
+    expect(startEvent.event.data.name).toBe('read_file');
+    expect(startEvent.event.data.arguments).toEqual({ path: '/tmp/foo.md' });
   });
 
   it('retry event → friendly Chinese progress, raw reason not leaked', async () => {
@@ -93,17 +96,15 @@ describe('event-mapper › tool_start forwards input + summarizes progress', () 
     expect(retryProgress.text).toBe('Retry attempt 2·Connection dropped');
   });
 
-  it('tool_end with isError → progress uses ✗ marker and carries preview', async () => {
+  it('tool_end with isError → end event flags isError + carries preview', async () => {
     const out = await collect([
       { type: 'tool_start', name: 'bash', id: 'c3', input: { command: 'false' } },
       { type: 'tool_end', name: 'bash', id: 'c3', result: 'exit 1: command failed', isError: true },
       { type: 'done', result: { text: '', meta: { error: null } } },
     ]);
-    const endProgress = out.find(
-      (e) => e.type === 'progress' && typeof e.text === 'string' && e.text.startsWith('✗ bash'),
-    );
-    expect(endProgress).toBeDefined();
-    expect(endProgress.text).toContain('exit 1');
+    const endEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'end');
+    expect(endEvent.event.data.isError).toBe(true);
+    expect(endEvent.event.data.result_preview).toContain('exit 1');
   });
 });
 

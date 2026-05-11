@@ -66,6 +66,11 @@ export interface LocalToolsOpts {
    *  conv's attachment dir to the sandbox. Without it, only the workspace
    *  (+ extraRoots) is editable. */
   cid?: string;
+  /** Project id of the current conversation, when it belongs to one.
+   *  Threaded through from group_chat at runTurn so workspace resolution
+   *  picks up the project-scoped selection (per CLAUDE.md projects feature).
+   *  Empty / missing → default-scope workspace. */
+  projectId?: string;
   /** Extra absolute directory roots `edit_file` should treat as in-scope
    *  on top of workspace + attachment. Used by skill-edit / agent-edit
    *  chats so the LLM can edit files inside the skill / agent dir. */
@@ -115,7 +120,7 @@ function allowedRootsFor(opts: LocalToolsOpts): string[] {
   const roots: string[] = [];
   if (opts.userId) {
     try {
-      const ws = getWorkspacePath(opts.userId);
+      const ws = getWorkspacePath(opts.userId, opts.projectId);
       if (ws) roots.push(ws);
     } catch (err) { log.warn(`edit_file resolve workspace: ${(err as Error).message}`); }
     if (opts.cid) {
@@ -166,19 +171,41 @@ function createBashTool(): AgentTool {
     inputSchema: coreBashTool.inputSchema,
     async execute(input, ctx) {
       if (!getLocalExecGranted()) return deniedResult();
-      // Defensive mkdir on cwd before delegating: `conv_workspace.ts`
-      // intentionally defers materialising the per-conversation workspace
-      // dir until something actually needs it on disk (so empty-output
-      // conversations don't litter the user's workspace with empty
-      // subdirs). `child_process.spawn` fails ENOENT if cwd doesn't
-      // exist, so this is the natural materialisation point — mkdir
-      // -p the cwd, then run the command. Failures here fall through;
-      // spawn will surface a clearer error if it really can't proceed.
-      if (ctx.workingDir) {
-        try { fs.mkdirSync(ctx.workingDir, { recursive: true }); }
-        catch { /* let spawn produce the canonical error */ }
+      // `conv_workspace.ts` intentionally defers materialising the
+      // per-conversation workspace dir; bash is a frequent first toucher
+      // because `child_process.spawn` fails ENOENT if cwd doesn't exist.
+      // Two distinct paths so the rmdir-if-empty cleanup only runs on
+      // the cold path (this call is the FIRST to need the dir):
+      //
+      //   hot path  — `ctx.workingDir` already exists (a prior write_file
+      //               or earlier bash call materialised it). Skip mkdir,
+      //               skip post-check, just delegate. This is every bash
+      //               call from the second one onward in a productive
+      //               conversation, and stays zero-overhead.
+      //
+      //   cold path — `ctx.workingDir` doesn't exist yet. We create it,
+      //               run bash, then if the command produced nothing
+      //               (`ls` / `cat` / `pwd` / `gh search` / pure python
+      //               heredoc returning via stdout) the dir is rmdir'd
+      //               so a read-only conversation leaves no footprint.
+      //               Best-effort cleanup: any rmdir failure (concurrent
+      //               bash on same cwd, ENOTEMPTY, EACCES) is silently
+      //               swallowed.
+      if (!ctx.workingDir) return coreBashTool.execute(input, ctx);
+      if (fs.existsSync(ctx.workingDir)) {
+        return coreBashTool.execute(input, ctx);
       }
-      return coreBashTool.execute(input, ctx);
+      try { fs.mkdirSync(ctx.workingDir, { recursive: true }); }
+      catch { /* let spawn produce the canonical error */ }
+      try {
+        return await coreBashTool.execute(input, ctx);
+      } finally {
+        try {
+          if (fs.readdirSync(ctx.workingDir).length === 0) {
+            fs.rmdirSync(ctx.workingDir);
+          }
+        } catch { /* best-effort */ }
+      }
     },
   };
 }

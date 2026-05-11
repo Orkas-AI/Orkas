@@ -119,7 +119,7 @@ The "Runtime injection" section at the end lists your `inputs_schema`. If it is 
 
 ## Resource locations (path constants)
 
-- Skill definitions: `Source: builtin` → `$builtin_skills_dir/<id>/SKILL.md`; `Source: custom` → `$custom_skills_dir/<id>/SKILL.md`.
+- Skill paths: see the header of the `## Available skills (skills)` block below for the `read_file(<ROOT>/<id>/SKILL.md)` pattern and resolved ROOT values per Source.
 - Tool default cwd = `$working_dir`; all relative paths land here. To go out of this scope, the dispatcher must **explicitly include** a path in the inbound message.
 
 ---

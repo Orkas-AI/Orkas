@@ -28,7 +28,7 @@ import * as fs from 'node:fs';
 import {
   Actor, ActorKind, COMMANDER_ID, USER_ID, RESERVED_IDS,
   actorSessionId, addMember, ensureAgentMember, readMembers, seedReservedActors,
-  setStatus, markInFlight, readState, transitionStatus,
+  setStatus, markInFlight, readState, transitionStatus, setCodingProjectDir,
 } from './state';
 import {
   GroupMessage, appendVisible, readSlice, buildReplayPrefix,
@@ -36,8 +36,9 @@ import {
 import {
   resolveRecipients, parseMentions, buildMention,
   extractFormFromFinal, computeFormId, ChatFormPayload,
-  extractAgentFieldBlocks, decodeSubmission,
+  extractAgentFieldBlocks, extractSkillContainers, decodeSubmission,
 } from './router';
+import * as skillsFeat from '../skills';
 import {
   setPlan, updateStep, readPlan, formatPlanAnnouncement, formatPlanForPrompt,
   PlanSetInput, StepStatus, PlanFile,
@@ -269,7 +270,8 @@ export interface EnqueueParams {
   attachments?: string[];
   produced?: string[];
   form?: ChatFormPayload;
-  created_agent?: { agent_id: string; name: string };
+  created_agents?: Array<{ agent_id: string; name: string; kind?: 'created' | 'updated' }>;
+  created_skills?: Array<{ skill_id: string; name: string; kind?: 'created' | 'updated' }>;
   plan_announcement?: boolean;
   /** Override resolved recipients (commander emitting plan announcement
    *  uses this to force `to=[user]`). Otherwise router decides. */
@@ -427,6 +429,37 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   }
   to = Array.from(new Set(to));
 
+  // Project scope at dispatch time: if the conversation belongs to a
+  // project, drop any recipient agent_id that isn't bound to the project
+  // (CLAUDE.md §6 — "if recipient unavailable, hand off to commander").
+  // Reserved ids (user / commander) always pass through. After filtering,
+  // an empty `to` falls through to the sender-default rule below — for
+  // user-initiated text that means "go to commander", which is the
+  // explicit hand-off the requirement asks for. Cheap: one project.json
+  // + bindings.json read,
+  // resolveProjectScope already memoises file existence checks. Skipped
+  // when the conv has no project_id (orphan = unrestricted).
+  try {
+    const { getConversation } = await import('../chats');
+    const conv = await getConversation(uid, cid);
+    const projectId = (conv as any)?.project_id;
+    if (typeof projectId === 'string' && projectId) {
+      const projectsFeat = await import('../projects');
+      const scope = await projectsFeat.resolveProjectScope(uid, projectId);
+      if (scope) {
+        const bound = new Set(scope.agents);
+        const before = to;
+        to = to.filter((id) => RESERVED_IDS.has(id) || bound.has(id));
+        if (to.length !== before.length) {
+          const dropped = before.filter((id) => !to.includes(id));
+          log.info(`dispatch project-scope drop cid=${cid} pid=${projectId} from=${fromActorId} dropped=${dropped.join(',')}`);
+        }
+      }
+    }
+  } catch (err) {
+    log.warn(`project-scope filter cid=${cid}: ${(err as Error).message}`);
+  }
+
   // Default fallback: if nothing resolved (and no force), use sender-default.
   // Mirror router.ts's rule: user → commander; commander/agent → user.
   if (!to.length) {
@@ -533,7 +566,8 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     ...(params.attachments && params.attachments.length ? { attachments: params.attachments } : {}),
     ...(params.produced && params.produced.length ? { produced: params.produced } : {}),
     ...(params.form ? { form: params.form } : {}),
-    ...(params.created_agent ? { created_agent: params.created_agent } : {}),
+    ...(params.created_agents && params.created_agents.length ? { created_agents: params.created_agents } : {}),
+    ...(params.created_skills && params.created_skills.length ? { created_skills: params.created_skills } : {}),
     ...(params.plan_announcement ? { plan_announcement: true } : {}),
     ...(params.dispatch ? { dispatch: true } : {}),
     ...(params.process && params.process.length ? { process: params.process } : {}),
@@ -719,6 +753,33 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // there's no migration story.
   const { getConversationWorkspacePath } = await import('./conv_workspace');
   const workingDir = await getConversationWorkspacePath(uid, cid);
+  // Project membership is decided at conv create time and frozen, so we
+  // can resolve it once per turn and thread it through to every workspace
+  // consumer below (CLI cwd fallback, streamChatWithModel, etc.) without
+  // re-reading the conv index per tool call.
+  let turnProjectId: string | undefined;
+  try {
+    const { getConversation } = await import('../chats');
+    const _conv = await getConversation(uid, cid);
+    const _pid = (_conv as any)?.project_id;
+    if (typeof _pid === 'string' && _pid) turnProjectId = _pid;
+  } catch { /* default scope */ }
+
+  // Project bindings (strict scope of agents/skills visible to the LLM).
+  // `null` = orphan conversation OR stale projectId — falls back to legacy
+  // global visibility. Resolved once per turn alongside the workspace
+  // resolver and threaded into commander prompt + agent skillList. See
+  // CLAUDE.md §6: project scope is the outer intersection BEFORE the 4
+  // enable-filter sites; do not add a 5th.
+  let turnProjectScope: import('../projects').ProjectBindings | null = null;
+  if (turnProjectId) {
+    try {
+      const projectsFeat = await import('../projects');
+      turnProjectScope = await projectsFeat.resolveProjectScope(uid, turnProjectId);
+    } catch (err) {
+      log.warn(`resolve project scope cid=${cid} pid=${turnProjectId}: ${(err as Error).message}`);
+    }
+  }
 
   // First-turn replay: if the persistent session jsonl doesn't exist yet,
   // prepend a `<group-chat-history>` block built from the visibility slice
@@ -763,13 +824,33 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // Hoisted here so the branch below can read it without re-fetching.
   let cliAgent: import('../agents').Agent | null = null;
   if (isCommander) {
-    systemPrompt = await buildCommanderSystemPrompt(uid, cid);
+    systemPrompt = await buildCommanderSystemPrompt(uid, cid, turnProjectScope?.agents ?? null);
     extraTools = await buildCommanderExtraTools(state, w);
+    // skillList stays undefined for commander — every skill is globally
+    // visible (skills are NOT project-scoped this round; see CLAUDE.md §6).
   } else {
     const agent = await agentsFeat.getAgent(actor.id);
     if (!agent) {
       log.warn(`agent ${actor.id} disappeared mid-turn`);
+      // User-visible signal — without this the user's @-dispatch hangs
+      // forever with no feedback (in-flight cleared, no bubble surfaces).
+      // Spec was unloadable (deleted / corrupt JSON / missing file); the
+      // members roster still carries the human-readable name, so we
+      // surface that to the user.
+      const roster = await readMembers(uid, cid).catch(() => null);
+      const member = roster?.actors.find((a) => a.id === actor.id);
+      const name = member?.name || actor.id;
+      const errBubble = `<span style="color:var(--danger)">${escapeHtmlForBubble(t('chat.agent_load_failed', { name }))}</span>`;
+      await enqueue({
+        uid, cid,
+        fromActorId: actor.id,
+        text: errBubble,
+        forceTo: [USER_ID],
+        turn_end: true,
+        ...(typeof item.triggered_step === 'number' ? { triggered_step: item.triggered_step } : {}),
+      });
       await markInFlight(uid, cid, actor.id, false);
+      emit(state, { type: 'state_changed', cid, state: await readState(uid, cid) });
       // Note: runWorkerLoop owns w.running — its finally clears the flag
       // when this returns. We DON'T touch it here.
       return;
@@ -779,6 +860,10 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       systemPrompt = ''; // unused on CLI path
     } else {
       systemPrompt = await buildAgentInGroupSystemPrompt(uid, agent, workingDir);
+      // Pass agent.skill_list verbatim — it carries System A + System B
+      // ids the agent owns. Skills are NOT project-scoped this round
+      // (see CLAUDE.md §6); the runner's `projectAllowedSkillIds` hook is
+      // preserved for future re-enable but bus does not pass it.
       skillList = Array.isArray(agent.skill_list) ? agent.skill_list : undefined;
     }
   }
@@ -826,22 +911,25 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     | { type: 'progress'; text: string }
     | { type: 'event'; event: { stream: string; data?: unknown } };
   const processItems: ProcessItem[] = [];
-  // Skill directories are referenced by `$builtin_skills_dir` /
-  // `$custom_skills_dir` template vars in the system prompt — commander +
-  // agents are explicitly told to `cat .../<id>/SKILL.md` to read the
-  // skill body before executing. Path-sandbox blocks anything outside
-  // workspace + attachment dir by default, so we have to expose the two
-  // skill roots here as `extraRoots` (mirrors the skill-edit chat pattern
-  // in features/skills.ts). Builtin first to match the prompt's
-  // "locate by source" guidance.
+  // Commander needs to inspect skill / agent specs before mutating them:
+  // `cat .../<id>/SKILL.md` to ground a skill rewrite, `read_file` an
+  // agent.json before emitting an `<agent>` edit container. The ROOT
+  // values now live inline in the rendered `agents_index` /
+  // `## Available skills` blocks (see `skill-registry.renderSkillLines`
+  // and `_buildAgentsIndexBlockForTest`); commander reads them straight
+  // from the entry block. Path-sandbox blocks anything outside
+  // workspace + attachment by default, so we expose these as
+  // `readOnlyExtraRoots`: file-tools (read_file / search_files /
+  // grep_files / stat_file) can see them, but write-side tools
+  // (edit_file / write_file / bash / markdown_to_pdf / generate_image)
+  // cannot mutate paths inside. The structured `<agent>` / `<skill>`
+  // containers are the only sanctioned mutation channels — any direct
+  // edit_file would skip safeId / validateAgentInputs / bilingual
+  // description normalisation / cache invalidation / the "view detail"
+  // chip, so the sandbox-level lock keeps the LLM honest even if the
+  // prompt strays. Builtin first to match the prompt's "locate by
+  // source" guidance.
   const skillRoots = [BUILTIN_SKILLS_DIR, userSkillsDir(uid)];
-  // Same shape for agent directories: chat_commander.md tells the
-  // commander to `search_files` for an agent.json under
-  // `$custom_agents_dir/` and then `read_file` the matching agent.json
-  // before emitting an `<agent>` edit container — without these roots
-  // the read trips E_PATH_OUT_OF_SCOPE and the LLM falls back to
-  // rewriting from the slim `agents_index` view, which silently drops
-  // workflow / description / skill_list (the prompt warns about this).
   const agentRoots = [BUILTIN_AGENTS_DIR, userAgentsDir(uid)];
   if (cliAgent) {
     // CLI-backed agent path: spawn the local CLI in the user's workspace
@@ -858,7 +946,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     // `write_file` tool; CLI agents have their own product-side
     // conventions and don't need that scoping. Override here:
     const userWorkspace = await import('../user_workspace');
-    const wsRoot = userWorkspace.getWorkspacePath(uid);
+    const wsRoot = userWorkspace.getWorkspacePath(uid, turnProjectId);
     // Coding agents (claude / codex) honour the per-conversation
     // `coding_project_dir` when set so the CLI runs inside the user's
     // actual project; non-coding CLIs always use the workspace. The
@@ -866,15 +954,19 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     // dir mid-conversation. We also defensively check the directory
     // exists and is a real dir — if it vanished between picker and
     // dispatch we fall back rather than failing the run.
-    const agentsFeat = await import('../agents');
     let cliWorkingDir = wsRoot;
     if (agentsFeat.cliIsCodingAgent(cliAgent.runtime?.kind === 'cli' ? cliAgent.runtime.cli : '')) {
+      // Default + workspace-sync: on the first coding-agent turn the
+      // user shouldn't have to pick a directory just to start; default
+      // to their effective workspace. On later turns, follow workspace
+      // changes silently — unless the user has explicitly picked
+      // something different through the input-form (sticky).
+      await _syncCodingProjectDirWithWorkspace(uid, cid, wsRoot);
       const st = await import('./state');
       const stateFile = await st.readState(uid, cid);
       const projDir = stateFile.coding_project_dir;
       if (projDir) {
         try {
-          const fs = await import('node:fs');
           if (fs.statSync(projDir).isDirectory()) cliWorkingDir = projDir;
         } catch { /* missing → fall through to wsRoot */ }
       }
@@ -929,13 +1021,18 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       agentName: 'orkas_chat',
       ...(actor.kind === 'agent' ? { agentId: actor.id } : {}),
       cid,
+      ...(turnProjectId ? { projectId: turnProjectId } : {}),
       onFileWritten,
       hasProducedPath,
       cacheRetention: 'short',
       abortSignal: w.abortController.signal,
-      extraRoots: [...skillRoots, ...agentRoots],
+      readOnlyExtraRoots: [...skillRoots, ...agentRoots],
       ...(extraTools.length ? { extraTools } : {}),
       ...(skillList !== undefined ? { skillList } : {}),
+      // Skills are NOT project-scoped this round — every conversation sees
+      // every skill (gated only by per-user enable + agent.skill_list).
+      // The runner's `projectAllowedSkillIds` plumbing is preserved for
+      // a future re-enable; bus just doesn't pass it.
     })) {
       // Stream events → process channel.
       if (ev.type === 'final') {
@@ -1009,7 +1106,8 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // failed) live in plan_executor.onTurnFinished.
   let workingText = finalText || '';
   let form: ChatFormPayload | undefined;
-  let createdAgent: { agent_id: string; name: string; kind: 'created' | 'updated' } | undefined;
+  const createdAgents: Array<{ agent_id: string; name: string; kind: 'created' | 'updated' }> = [];
+  const createdSkills: Array<{ skill_id: string; name: string; kind: 'created' | 'updated' }> = [];
 
   if (actor.kind === 'agent' && workingText) {
     const r = extractFormFromFinal(workingText, actor.id);
@@ -1025,48 +1123,109 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     }
   } else if (isCommander && workingText) {
     const r = extractAgentFieldBlocks(workingText);
-    if (Object.keys(r.fields).length) {
+    if (r.blocks.length) {
       workingText = r.cleanText;
-      // `<agent_id>` present → edit an existing custom agent;
-      // absent → create a new one. Same `<agent>` container shape;
-      // the dispatch decision is single-bit.
-      const editId = r.fields.agent_id;
-      try {
-        if (editId) {
-          const target = await agentsFeat.getAgent(editId);
-          if (!target) {
-            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent edit failed: agent not found (id=${editId}).</span>`;
-          } else if (target.source !== 'custom') {
-            // Built-in agent — read-only here; the dev-mode inline edit chat
-            // remains the only path that can mutate builtins (per §6).
-            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Built-in agents can't be edited from the main chat; fork one in the right-hand detail panel and edit there.</span>`;
-          } else if (agentsFeat.isCliAgent(target)) {
-            // CLI-backed agent — runtime / model / args are owned by the
-            // create-modal + edit-form, not the LLM. Same constraint as
-            // chat_agent_setup_cli.md applies to the commander flow.
-            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ External agents can only be edited from the right-hand detail panel.</span>`;
-          } else {
-            const updated = await agentsFeat.updateCustomAgent(editId, r.fields);
-            if (updated) {
-              createdAgent = { agent_id: updated.agent_id, name: updated.name, kind: 'updated' };
+      // Apply each `<agent>` block independently. A failed block appends
+      // its own warning span to workingText and is omitted from
+      // createdAgents — the chip slot only fills when the spec was
+      // actually written. Subsequent blocks still attempt their own apply.
+      for (const fields of r.blocks) {
+        if (!Object.keys(fields).length) continue;
+        const editId = fields.agent_id;
+        try {
+          if (editId) {
+            const target = await agentsFeat.getAgent(editId);
+            if (!target) {
+              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent edit failed: agent not found (id=${editId}).</span>`;
+            } else if (target.source !== 'custom') {
+              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Built-in agents can't be edited from the main chat; fork one in the right-hand detail panel and edit there.</span>`;
+            } else if (agentsFeat.isCliAgent(target)) {
+              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ External agents can only be edited from the right-hand detail panel.</span>`;
             } else {
-              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent update failed.</span>`;
+              const updated = await agentsFeat.updateCustomAgent(editId, fields);
+              if (updated) {
+                createdAgents.push({ agent_id: updated.agent_id, name: updated.name, kind: 'updated' });
+              } else {
+                workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent update failed.</span>`;
+              }
+            }
+          } else {
+            const ag = await agentsFeat.createAgentFromBlocks(fields);
+            if (ag) {
+              createdAgents.push({ agent_id: ag.agent_id, name: ag.name, kind: 'created' });
+              // Project-scoped conv: auto-bind the new agent into the project's
+              // bindings.json so it's actually reachable from this conversation
+              // (commander picker filters by `_pickerBoundAgentIds`; LLM
+              // dispatch is gated by the same project scope per CLAUDE.md §5).
+              // Without this hop the user creates an agent and immediately
+              // can't @-mention it from the same conv — observed bug shape
+              // when the project's bindings predate the new agent.
+              if (turnProjectId) {
+                try {
+                  const projectsFeatBind = await import('../projects');
+                  await projectsFeatBind.addAgentBinding(uid, turnProjectId, ag.agent_id);
+                  log.info(`auto-bound agent ${ag.agent_id} to project ${turnProjectId} after commander creation`);
+                } catch (err) {
+                  log.warn(`auto-bind agent failed cid=${cid} pid=${turnProjectId} aid=${ag.agent_id}: ${(err as Error).message}`);
+                }
+              }
+            } else {
+              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent creation failed: missing required field(s) (name / workflow).</span>`;
             }
           }
-        } else {
-          const ag = await agentsFeat.createAgentFromBlocks(r.fields);
-          if (ag) {
-            createdAgent = { agent_id: ag.agent_id, name: ag.name, kind: 'created' };
-          } else {
-            // Append failure marker to text — onTurnFinished will surface
-            // it as a normal `persist` outcome.
-            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent creation failed: missing required field(s) (name / workflow).</span>`;
-          }
+        } catch (err) {
+          const verb = editId ? 'edit' : 'create';
+          log.error(`${verb}-agent failed cid=${cid}: ${(err as Error).message}`);
+          workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent ${verb} failed: ${(err as Error).message}</span>`;
         }
-      } catch (err) {
-        const verb = editId ? 'edit' : 'create';
-        log.error(`${verb}-agent failed cid=${cid}: ${(err as Error).message}`);
-        workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent ${verb} failed: ${(err as Error).message}</span>`;
+      }
+    }
+
+    // `<skill>` container — parallel to `<agent>` above. Commander only.
+    // The container is independent of `<agent>`; both can co-exist in one
+    // turn in principle, though the prompt encourages one-at-a-time. Best-
+    // effort: a rejected file path within the container does not abort the
+    // remaining writes, mirroring the per-skill edit chat. The localized
+    // error string returned by `applySkillContainerFromCommander` already
+    // covers built-in / not-found / charset / collision cases — bus only
+    // appends the pill.
+    const skillR = extractSkillContainers(workingText);
+    if (skillR.containers.length) {
+      workingText = skillR.cleanText;
+      // Apply each `<skill>` container independently. A failed container
+      // appends its own warning span and is omitted from createdSkills —
+      // the chip slot only fills when the spec was actually written.
+      for (const container of skillR.containers) {
+        try {
+          const result = await skillsFeat.applySkillContainerFromCommander(container);
+          if (result.ok && result.skillId && result.name && result.kind) {
+            createdSkills.push({ skill_id: result.skillId, name: result.name, kind: result.kind });
+            if (result.rejected && result.rejected.length) {
+              const list = result.rejected.map((p) => `\`${p}\``).join(', ');
+              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Some skill files were rejected: ${list}</span>`;
+            }
+            // Project-scoped conv: auto-bind the new skill so the LLM in this
+            // conv actually sees it via getSystemPromptBlock allowlist. Same
+            // bug shape as the agent auto-bind above — without this the user
+            // creates a skill, the file lands on disk, but the LLM in this
+            // project conv can never invoke it (allowlist excludes it).
+            if (turnProjectId && result.kind === 'created') {
+              try {
+                const projectsFeatBind = await import('../projects');
+                await projectsFeatBind.addSkillBinding(uid, turnProjectId, result.skillId);
+                log.info(`auto-bound skill ${result.skillId} to project ${turnProjectId} after commander creation`);
+              } catch (err) {
+                log.warn(`auto-bind skill failed cid=${cid} pid=${turnProjectId} sid=${result.skillId}: ${(err as Error).message}`);
+              }
+            }
+          } else {
+            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ ${result.error || 'Skill operation failed.'}</span>`;
+          }
+        } catch (err) {
+          const verb = container.skillId ? 'edit' : 'create';
+          log.error(`${verb}-skill failed cid=${cid}: ${(err as Error).message}`);
+          workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Skill ${verb} failed: ${(err as Error).message}</span>`;
+        }
       }
     }
   }
@@ -1097,7 +1256,8 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       aborted,
       ...(form ? { form } : {}),
       produced,
-      ...(createdAgent ? { createdAgent } : {}),
+      ...(createdAgents.length ? { createdAgents } : {}),
+      ...(createdSkills.length ? { createdSkills } : {}),
       trigger,
       activityEvents,
     });
@@ -1110,7 +1270,8 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       text: workingText || '(no reply)',
       ...(form ? { form } : {}),
       ...(produced.length ? { produced } : {}),
-      ...(createdAgent ? { createdAgent } : {}),
+      ...(createdAgents.length ? { createdAgents } : {}),
+      ...(createdSkills.length ? { createdSkills } : {}),
     };
   }
 
@@ -1195,7 +1356,10 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       text: outcome.text,
       ...(outcome.form ? { form: outcome.form } : {}),
       ...(outcome.produced && outcome.produced.length ? { produced: outcome.produced } : {}),
-      ...(outcome.createdAgent ? { created_agent: outcome.createdAgent } : {}),
+      ...(outcome.createdAgents && outcome.createdAgents.length ? { created_agents: outcome.createdAgents } : {}),
+      ...(outcome.createdSkills && outcome.createdSkills.length
+        ? { created_skills: outcome.createdSkills.map((s) => ({ skill_id: s.skill_id, name: s.name })) }
+        : {}),
       ...(pendingPlan && actor.kind === 'commander'
         ? { plan_announcement: true, forceTo: [USER_ID] } : {}),
       ...(processItems.length ? { process: processItems } : {}),
@@ -1262,7 +1426,8 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     + ` outcome=${outcome.kind}`
     + ` events=${activityEvents}`
     + (form ? ' form=1' : '')
-    + (createdAgent ? ` created_agent=${createdAgent.agent_id}` : '')
+    + (createdAgents.length ? ` created_agents=${createdAgents.map(a => a.agent_id).join(',')}` : '')
+    + (createdSkills.length ? ` created_skills=${createdSkills.map(s => s.skill_id).join(',')}` : '')
     + (produced.length ? ` produced=${produced.length}` : '')
     + (item.triggered_step !== undefined ? ` step=${item.triggered_step}` : '')
     + (errText ? ` err=${errText}` : '')
@@ -1272,12 +1437,14 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
 
 // ── System prompts ───────────────────────────────────────────────────────
 
-async function buildCommanderSystemPrompt(uid: string, cid: string): Promise<string> {
+async function buildCommanderSystemPrompt(
+  uid: string, cid: string, allowedAgentIds?: readonly string[] | null,
+): Promise<string> {
   const { prompts } = await import('../../prompts/loader');
   const path_ = await import('node:path');
   const paths_ = await import('../../paths');
   const plan = await readPlan(uid, cid);
-  const allAgentsList = await buildAgentsIndexBlock(uid);
+  const allAgentsList = await buildAgentsIndexBlock(uid, allowedAgentIds);
   const { getConversationWorkspacePath } = await import('./conv_workspace');
   const workingDir = await getConversationWorkspacePath(uid, cid);
   const permState = (() => {
@@ -1289,12 +1456,15 @@ async function buildCommanderSystemPrompt(uid: string, cid: string): Promise<str
   // Stable sections first (cache-friendly), runtime injection last.
   // chat_shared_rules.md is appended BEFORE the runtime block in
   // chat_commander.md so it stays in the cached prefix.
+  // Note: skill / agent ROOT path constants are NOT passed in here anymore —
+  // they live inline in the rendered `agents_index` block (built by
+  // `buildAgentsIndexBlock`) and the `## Available skills` block (built by
+  // `skill-registry.renderSkillLines`), so the LLM sees ROOT values right
+  // next to the entries that consume them. Reintroducing $*_dir vars would
+  // recreate the cross-section path-constants design that mis-fires under
+  // training-prior layouts.
   const main = prompts.load('chat_commander', {
     contexts_dir: path_.resolve(paths_.userContextsDir(uid)),
-    builtin_agents_dir: path_.resolve(paths_.BUILTIN_AGENTS_DIR),
-    custom_agents_dir: path_.resolve(paths_.userAgentsDir(uid)),
-    builtin_skills_dir: path_.resolve(paths_.BUILTIN_SKILLS_DIR),
-    custom_skills_dir: path_.resolve(paths_.userSkillsDir(uid)),
     agents_index: allAgentsList,
     plan_state: formatPlanForPrompt(plan),
     os: process.platform === 'darwin' ? 'macOS' : process.platform === 'win32' ? 'Windows' : process.platform,
@@ -1325,29 +1495,68 @@ function appendLanguageDirective(prompt: string): string {
   return `${prompt}\n\n---\n\n${buildLanguageDirective()}`;
 }
 
-async function buildAgentsIndexBlock(_uid: string): Promise<string> {
-  // listAgents() reads from the active uid context (set by activateUser at boot
-  // / on user switch); no uid arg needed.
+// Render the agents-index block injected into commander's system prompt.
+//
+// Format:
+//   `\`read_file(<ROOT>/<id>/agent.json)\` — ROOT by Source:\n` +
+//   `- custom:  <abs path>\n` +
+//   `- builtin: <abs path>\n` +
+//   `Use these ROOT values verbatim. \`id:\` is tool-call input only — prose mentions agents as @<name>.\n\n` +
+//   per-entry lines `- @<name> (Source: custom|builtin, id: <agent_id>) — desc` + optional `\n  inputs_schema: <slim json>`
+//
+// Why expose id and ROOT inline (changed 2026-05): the prior layout hid
+// agent_id (to discourage hex-id leak in user prose) and put paths in a
+// separate `## Resource locations` section. That forced commander to run
+// `search_files` for the matching agent.json, extract id from the dir
+// segment, then `read_file` — two LLM round-trips. The hidden-id design
+// also relied on the LLM to navigate path constants between sections.
+// Now: id is shown next to its entry (one round-trip read), and the ROOT
+// values live right next to the entries so there is nothing to construct.
+// Hex-id leak prevention shifts to (a) the explicit "prose uses @<name>"
+// hint here, and (b) the existing `@<id>` → `@<name>` rewrite in router.
+// Exported (with `_…ForTest` suffix mirroring `_cidStateForTest` below) so
+// the agents-index format can be pinned by fixture without spinning up the
+// full bus pipeline. Treat as test-only — production callers stay inside
+// `buildCommanderSystemPrompt`.
+export async function _buildAgentsIndexBlockForTest(uid: string): Promise<string> {
+  return buildAgentsIndexBlock(uid);
+}
+
+/** Render the agents-index block. When `allowedIds` is provided, only those
+ *  agent ids are rendered (project-scoped commander view). `null` /
+ *  `undefined` = no filter (legacy global view, used for orphan
+ *  conversations). Empty array = render `(no agents)` block — the project
+ *  has zero bound agents. Unknown ids in the allowlist are silently
+ *  dropped (loader is the source of truth). */
+async function buildAgentsIndexBlock(uid: string, allowedIds?: readonly string[] | null): Promise<string> {
   const { getCurrentLang } = await import('../../i18n');
   const { pickDescription } = await import('#core-agent');
   const lang = getCurrentLang();
+  const customRoot = path.resolve(userAgentsDir(uid));
+  const builtinRoot = path.resolve(BUILTIN_AGENTS_DIR);
+  const header = [
+    '`read_file(<ROOT>/<id>/agent.json)` — ROOT by Source:',
+    `- custom:  ${customRoot}`,
+    `- builtin: ${builtinRoot}`,
+    'Use these ROOT values verbatim. `id:` is tool-call input only — prose mentions agents as @<name>.',
+    '',
+  ].join('\n');
   try {
-    const list = (await agentsFeat.listAgents()).filter((a: any) => a.enabled !== false);
-    if (!list.length) return '(no agents)';
-    return list.map((a: any) => {
+    const allow = (allowedIds === null || allowedIds === undefined) ? null : new Set(allowedIds);
+    const list = (await agentsFeat.listAgents())
+      .filter((a: any) => a.enabled !== false)
+      .filter((a: any) => (allow ? allow.has(a.agent_id) : true));
+    if (!list.length) return `${header}(no agents)`;
+    const entries = list.map((a: any) => {
       const name = a.name || a.agent_id;
       const description = pickDescription(a, lang);
       const desc = description ? ` — ${description}` : '';
-      // Lead with `@<name>` so the LLM picks up the calling convention
-      // visually; id is hidden — exposing hex strings in prompts trains
-      // the LLM to leak them in user-visible text too.
-      const head = `- ${buildMention(name)} (Source: ${a.source})${desc}`;
+      const head = `- ${buildMention(name)} (Source: ${a.source}, id: ${a.agent_id})${desc}`;
       // Inline a slimmed inputs_schema (id / type / required / default /
       // label / options / min / max / accept) so commander knows what
       // params each agent expects when phrasing its `@<name>` dispatch
       // text. Stripped of UI-only narrative fields (description /
-      // placeholder) — those bloat the prompt without helping the LLM
-      // extract values.
+      // placeholder) — those bloat the prompt without helping extraction.
       const inputs = Array.isArray(a.inputs) ? a.inputs : null;
       if (inputs && inputs.length) {
         const slim = inputs.map((f: any) => {
@@ -1358,17 +1567,16 @@ async function buildAgentsIndexBlock(_uid: string): Promise<string> {
       }
       return head;
     }).join('\n');
-  } catch { return '(no agents)'; }
+    return `${header}${entries}`;
+  } catch { return `${header}(no agents)`; }
 }
 
 async function buildAgentInGroupSystemPrompt(
-  uid: string,
+  _uid: string,
   agent: { name?: string; description?: string; workflow?: string; agent_id: string; inputs?: unknown },
   workingDir: string,
 ): Promise<string> {
   const { prompts } = await import('../../prompts/loader');
-  const path_ = await import('node:path');
-  const paths_ = await import('../../paths');
   // Render the agent's declared inputs schema so the LLM knows when to
   // emit a fenced agent-input-form block. UI-only narrative fields
   // (description, placeholder) are stripped — the model needs id / type
@@ -1381,14 +1589,15 @@ async function buildAgentInGroupSystemPrompt(
     return rest;
   });
   const inputsSchemaJson = slimmed.length ? JSON.stringify(slimmed) : '';
+  // Skill ROOT path constants are NOT passed in here either — the
+  // skill-registry render block embeds them inline, see commander
+  // counterpart above.
   const main = prompts.load('chat_agent_in_group', {
     name: agent.name || '',
     agent_id: agent.agent_id,
     description: agent.description || '(not provided)',
     workflow: (agent.workflow || '').trim() || '(not provided)',
     inputs_schema: inputsSchemaJson || '(none)',
-    builtin_skills_dir: path_.resolve(paths_.BUILTIN_SKILLS_DIR),
-    custom_skills_dir: path_.resolve(paths_.userSkillsDir(uid)),
     working_dir: workingDir,
   });
   const shared = prompts.load('chat_shared_rules', {});
@@ -1675,41 +1884,6 @@ export function dropConv(uid: string, cid: string): void {
   _cids.delete(k);
 }
 
-/**
- * Watchdog hook — synthesise a system message into commander's worker
- * queue so it gets a turn to self-diagnose when a long-running plan has
- * gone silent. Bypasses `enqueue` (no main jsonl write, no visibility
- * slice, no UI message event) on purpose: the ping is a backend
- * mechanism, not group content. Commander's reply (if any) goes through
- * the normal `enqueue` path inside its `runTurn` post-turn → user sees
- * commander's actual response, never the ping itself.
- *
- * Idempotent / cheap: if the commander worker has anything queued, we
- * skip — no point doubling up. If state already aborted, also skip.
- */
-export async function pingCommanderForWatchdog(uid: string, cid: string, reason: string): Promise<boolean> {
-  const state = getOrInitCid(uid, cid);
-  await seedReservedActors(uid, cid);
-  const cur = await readState(uid, cid);
-  if (cur.status === 'aborted') return false;
-  // Find or seed commander actor in the roster.
-  const members = await readMembers(uid, cid);
-  const commander = members.actors.find((a) => a.id === COMMANDER_ID);
-  if (!commander) return false;
-  const w = ensureWorker(state, commander);
-  if (w.queue.length > 0 || w.running) return false; // already busy / pending
-  const llmPayload = `<msg from="system" to="commander">\n[watchdog] ${reason}\n</msg>`;
-  w.queue.push({
-    msgId: genId12(),
-    fromActorId: 'system',
-    llmPayload,
-  });
-  const wake = w.wake; w.wake = null;
-  wake?.();
-  log.info(`watchdog ping user=${uid} cid=${cid} reason=${reason}`);
-  return true;
-}
-
 export function _cidStateForTest(uid: string, cid: string): CidState | null {
   return _cids.get(cidKey(uid, cid)) || null;
 }
@@ -1797,6 +1971,45 @@ planExecutor.bindBusHooks({
 // the source of truth.
 
 const CLI_PROMPT_MAX_BYTES = 200 * 1024;
+
+/** Default + workspace-sync for the coding-agent project directory.
+ *
+ *  Two cases the user expects to "just work":
+ *    1. First dispatch in a fresh conv: we shouldn't pop a directory
+ *       picker just to start — the user already chose a workspace,
+ *       use that.
+ *    2. User switches the workspace mid-conversation (chip in the
+ *       chat surface): the next coding-agent turn should follow.
+ *
+ *  Either case = "auto-set" with `explicit=false`. Once the user
+ *  picks a different directory through the input-form picker
+ *  (form-submit hook flips `explicit=true`), workspace switches no
+ *  longer override their choice. Caller must already have established
+ *  this is a coding agent (the explicit flag is meaningless for
+ *  non-coding CLIs that don't honour `coding_project_dir`). */
+async function _syncCodingProjectDirWithWorkspace(
+  uid: string, cid: string, wsPath: string,
+): Promise<void> {
+  const cur = await readState(uid, cid);
+  if (cur.coding_project_dir_explicit) return;            // sticky
+  if (cur.coding_project_dir === wsPath) return;          // already in sync
+  const oldDir = cur.coding_project_dir || '';
+  await setCodingProjectDir(uid, cid, wsPath, { explicit: false });
+  if (oldDir && oldDir !== wsPath) {
+    // CLI session bindings reference the OLD cwd. claude code keys
+    // sessions by cwd (`~/.claude/projects/<encoded-cwd>/<id>.jsonl`),
+    // so resuming a stale id at the new cwd fails with
+    // "No conversation found". Drop bindings preemptively so the
+    // next dispatch goes through the full-slice replay path —
+    // user-visible conversation continues seamlessly because
+    // `_buildCliPrompt` includes the slice when `resuming=false`.
+    const cliSessions = await import('../local_agents/sessions');
+    await cliSessions.clearForConversation(uid, cid);
+    log.info(`coding cwd changed cid=${cid} ${oldDir} → ${wsPath} — cleared cli sessions`);
+  } else {
+    log.info(`coding project_dir auto-set cid=${cid} → ${wsPath}`);
+  }
+}
 
 /** Build an `<agent-input-form>` block listing the agent's required
  *  inputs that are still unfulfilled, or return `null` when nothing is
@@ -1992,27 +2205,38 @@ async function _buildCliPrompt(
   slice: GroupMessage[],
   /** When true, the CLI is resuming a prior session and already has
    *  the conversation history in its own memory — we skip the slice
-   *  block entirely and just send "head + new task". Drops massive
-   *  redundancy on long convs. */
+   *  block entirely and just send the static frame + new task. Drops
+   *  massive redundancy on long convs. */
   resuming: boolean,
 ): Promise<string> {
-  // Build head + tail separately so truncation can throw away the
-  // middle of the conversation slice (oldest entries) while preserving
-  // the agent identity preamble + the actual task. The naive "trim
-  // from the head of the byte buffer" approach we used first dropped
-  // the role preamble — leaving the CLI without context about who it
-  // is or what it owns.
-  const headLines: string[] = [];
-  headLines.push(`You are "${agent.name || agent.agent_id}".`);
-  const desc = (agent.description_en || agent.description_zh || '').trim();
-  if (desc) headLines.push(desc);
-  headLines.push('');
-
-  // Attachments come from the dispatched message AND from prior slice
-  // messages — the agent might be expected to "look at the report you
-  // uploaded last turn", so we collect across the whole visibility
-  // slice. De-duplicate by absolute path; preserve oldest-first order.
+  // Layout = `chat_cli_agent.md` (static frame) + `chat_cli_coding_protocol.md`
+  // (coding-only). The static-first / runtime-last split keeps the
+  // CLI's prompt cache stable across turns: identity + protocol stay
+  // byte-identical, attachments / slice / task body all change.
+  const { prompts } = await import('../../prompts/loader');
   const { chatAttachmentDir } = await import('../../paths');
+
+  // ── Output protocol — coding agents only ────────────────────────
+  // Non-coding CLIs (openclaw / opencode / hermes) get an empty block
+  // and never see the project-dir-switching rules — the host doesn't
+  // route their cwd through `coding_project_dir` and the form
+  // wouldn't fire on their submissions anyway.
+  const cli = agent.runtime?.kind === 'cli' ? agent.runtime.cli : '';
+  let outputProtocolBlock = '';
+  if (agentsFeat.cliIsCodingAgent(cli)) {
+    const inputs = Array.isArray(agent.inputs) ? agent.inputs : [];
+    const projectDirInput = inputs.find((f: any) => f.id === agentsFeat.PROJECT_DIR_INPUT_ID);
+    const projectDirLabel = (projectDirInput && typeof projectDirInput.label === 'string' && projectDirInput.label.trim())
+      ? projectDirInput.label
+      : 'Project directory';
+    outputProtocolBlock = prompts.load('chat_cli_coding_protocol', {
+      agent_id: agent.agent_id,
+      project_dir_label: projectDirLabel,
+    }).trim();
+  }
+
+  // ── Attachments — collected across the whole slice + this dispatch
+  // De-duplicate by absolute path; preserve oldest-first order.
   const attDir = chatAttachmentDir(uid, cid);
   const allAtts: string[] = [];
   const seenAtts = new Set<string>();
@@ -2025,28 +2249,21 @@ async function _buildCliPrompt(
   };
   for (const m of slice) collect(m.attachments);
   collect(item.attachments);
-  if (allAtts.length) {
-    headLines.push('## Attachments');
-    for (const abs of allAtts) headLines.push(`- ${abs}`);
-    headLines.push('');
-  }
+  const attachmentsBlock = allAtts.length
+    ? `## Attachments\n${allAtts.map(a => `- ${a}`).join('\n')}`
+    : '';
 
-  const tailLines: string[] = [];
-  tailLines.push('## Your task');
-  // When the dispatched item is just a form submission (the user
-  // confirmed the input form, not a fresh ask), the task body is
-  // metadata — a `- project_dir: …` style summary + an
-  // `<agent-input-submission>`
-  // XML tag — with the original user request now sitting upstream in
-  // the slice. A coding CLI handed only that metadata has nothing
-  // actionable: claude / codex sit idle until killed (observed:
-  // 2+ min "processing" with 0 bytes of output). Walk the slice
+  // ── Task body — submission unwrap if the dispatch was a form-submit.
+  // When the user confirmed the input form, the dispatched payload is
+  // metadata (`<agent-input-submission>` + a values summary) — handing
+  // that to a coding CLI gives it nothing actionable. Walk the slice
   // backward to recover the most recent user message that ISN'T
   // another submission and use it as the real task; append the
-  // confirmed values as extra context. The cwd is already routed
-  // via `state.coding_project_dir`, so we don't need to re-state
-  // `project_dir` to the CLI.
+  // confirmed values as extra context. cwd is already routed via
+  // `state.coding_project_dir`, so we strip `project_dir` from the
+  // confirmed-parameters block.
   const submission = decodeSubmission(item.llmPayload);
+  let taskBody: string;
   if (submission) {
     let originalTask = '';
     for (let i = slice.length - 1; i >= 0; i--) {
@@ -2057,28 +2274,32 @@ async function _buildCliPrompt(
       originalTask = txt;
       break;
     }
-    tailLines.push(originalTask || item.llmPayload);
+    const lines: string[] = [originalTask || item.llmPayload];
     const extraValues = Object.entries(submission.values)
       .filter(([k]) => k !== 'project_dir')
       .map(([k, v]) => `- ${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`);
     if (extraValues.length) {
-      tailLines.push('');
-      tailLines.push('## Confirmed parameters');
-      tailLines.push(...extraValues);
+      lines.push('', '## Confirmed parameters', ...extraValues);
     }
+    taskBody = lines.join('\n');
   } else {
-    tailLines.push(item.llmPayload);
+    taskBody = item.llmPayload;
   }
 
-  const head = headLines.join('\n');
-  const tail = tailLines.join('\n');
+  // Render the template with a candidate conversation block. The
+  // truncation pass below sizes the block against the byte cap.
+  const render = (conversationBlock: string) => prompts.load('chat_cli_agent', {
+    agent_name: agent.name || agent.agent_id,
+    agent_description: (agent.description_en || agent.description_zh || '').trim(),
+    output_protocol_block: outputProtocolBlock,
+    attachments_block: attachmentsBlock,
+    conversation_block: conversationBlock,
+    task_body: taskBody,
+  });
 
-  // Resuming a CLI-side session: the CLI already remembers the prior
-  // turns. Skip the slice block entirely and let the model rely on
-  // its own session memory. Preamble + new task is enough.
-  if (resuming) {
-    return `${head}\n${tail}`;
-  }
+  // Resuming → CLI already has the slice in its own memory; skip
+  // replay entirely. Static frame + new task is enough.
+  if (resuming) return render('');
 
   // Conversation slice, oldest → newest. Empty-text rows skipped.
   const sliceLines: string[] = [];
@@ -2089,17 +2310,18 @@ async function _buildCliPrompt(
     sliceLines.push(`[${m.from} → ${to}] ${text}`);
   }
 
-  // Reserve the head + tail bytes; what's left is the conversation
-  // budget. If even head+tail exceed the cap, fall back to a minimal
-  // prompt without history (better than truncating the task body).
-  const reserveBytes = Buffer.byteLength(head, 'utf8') + Buffer.byteLength(tail, 'utf8') + 64; // 64 = headers + newlines slack
-  if (reserveBytes >= CLI_PROMPT_MAX_BYTES) {
-    log.warn(`cli prompt: head+tail exceed cap; sending minimal prompt cid=${cid} agent=${agent.agent_id}`);
-    return `${head}\n${tail}`;
+  // Size the slice against the byte cap by rendering once with an
+  // empty block — gives an exact base size including the protocol /
+  // attachments / task. If even the base exceeds the cap, fall back
+  // to a no-history prompt rather than truncating the task body.
+  const baseBytes = Buffer.byteLength(render(''), 'utf8');
+  if (baseBytes >= CLI_PROMPT_MAX_BYTES) {
+    log.warn(`cli prompt: base exceeds cap; sending minimal prompt cid=${cid} agent=${agent.agent_id}`);
+    return render('');
   }
-  const sliceBudget = CLI_PROMPT_MAX_BYTES - reserveBytes;
-  // Walk the slice from newest backward; keep messages while we have
-  // budget. If the oldest messages don't fit, drop them.
+  const sliceBudget = CLI_PROMPT_MAX_BYTES - baseBytes;
+  // Walk newest-backward, keep lines while we have budget. Oldest
+  // lines that don't fit are dropped.
   const kept: string[] = [];
   let used = 0;
   for (let i = sliceLines.length - 1; i >= 0; i--) {
@@ -2112,8 +2334,8 @@ async function _buildCliPrompt(
   if (truncated) {
     log.warn(`cli prompt: trimmed ${sliceLines.length - kept.length}/${sliceLines.length} oldest slice rows cid=${cid} agent=${agent.agent_id}`);
   }
-  const sliceBlock = kept.length
-    ? `## Conversation so far${truncated ? ' (truncated)' : ''}\n${kept.join('\n')}\n`
+  const conversationBlock = kept.length
+    ? `## Conversation so far${truncated ? ' (truncated)' : ''}\n${kept.join('\n')}`
     : '';
-  return `${head}\n${sliceBlock}\n${tail}`;
+  return render(conversationBlock);
 }

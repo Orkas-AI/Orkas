@@ -163,31 +163,37 @@ function uniquifySlug(workspaceRoot: string, slug: string): string {
  * never produced anything.
  */
 export async function getConversationWorkspacePath(uid: string, cid: string): Promise<string> {
-  const root = getWorkspacePath(uid);
+  // Resolve the conv's project membership ONCE so workspace resolution
+  // picks up the project-scoped selection (per CLAUDE.md projects feature).
+  // For convs without a project this is a no-op (projectId stays undefined).
+  let projectId: string | undefined;
+  let title = '';
+  try {
+    const conv = await getConversation(uid, cid);
+    if (conv) {
+      title = conv.title || '';
+      const pid = (conv as any).project_id;
+      if (typeof pid === 'string' && pid) projectId = pid;
+    } else {
+      // Legacy convs (created before this feature shipped) keep using the root
+      // workspace verbatim — we detect them by absence of a conversation record:
+      // if the conv index has nothing for cid, the bus is operating on a phantom
+      // and we don't want to spawn a directory off it. In practice every active
+      // bus path runs after `chats.createConversation`, so this branch is rare.
+      log.warn(`no conv record for cid=${cid} — falling back to root workspace`);
+      return getWorkspacePath(uid);
+    }
+  } catch (err) {
+    log.warn(`getConversation failed cid=${cid}: ${(err as Error).message} — falling back to root`);
+    return getWorkspacePath(uid);
+  }
+
+  const root = getWorkspacePath(uid, projectId);
 
   // Fast path: state already has a workspace_dir baked in.
   const cur = await readState(uid, cid);
   if (cur.workspace_dir) {
     return path.join(root, cur.workspace_dir);
-  }
-
-  // No workspace_dir yet. Decide one.
-  // Legacy convs (created before this feature shipped) keep using the root
-  // workspace verbatim — we detect them by absence of a conversation record:
-  // if the conv index has nothing for cid, the bus is operating on a phantom
-  // and we don't want to spawn a directory off it. In practice every active
-  // bus path runs after `chats.createConversation`, so this branch is rare.
-  let title = '';
-  try {
-    const conv = await getConversation(uid, cid);
-    if (conv) title = conv.title || '';
-    else {
-      log.warn(`no conv record for cid=${cid} — falling back to root workspace`);
-      return root;
-    }
-  } catch (err) {
-    log.warn(`getConversation failed cid=${cid}: ${(err as Error).message} — falling back to root`);
-    return root;
   }
 
   let slug = slugifyConvTitle(title);

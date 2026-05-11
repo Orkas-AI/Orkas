@@ -72,11 +72,24 @@ export function parseMentions(
 ): string[] {
   if (!text) return [];
   if (opts?.fromKind && opts.fromKind !== 'user') return [];
+  // Markdown blockquote lines (`> ...`) are context the user pulled in
+  // from another bubble via the quote-reply feature. `@<name>` tokens
+  // inside the quote belong to the original author's outgoing routing,
+  // not the current user's — counting them as dispatch signals
+  // re-triggers whoever the original message addressed every time
+  // someone forwards it. Strip those lines from the routing-relevant
+  // view; the original `text` still flows through the bus unchanged so
+  // the persisted bubble keeps the quote intact.
+  const routingText = text
+    .split('\n')
+    .filter((line) => !/^\s*>/.test(line))
+    .join('\n');
+  if (!routingText) return [];
   const re = _buildMentionRe(opts?.names);
   const out: string[] = [];
   const seen = new Set<string>();
   let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
+  while ((m = re.exec(routingText)) !== null) {
     const token = m[2];
     if (!token || seen.has(token)) continue;
     seen.add(token);
@@ -402,3 +415,8 @@ export function encodeSubmission(
 
 export type { ExtractedFields };
 export { extractAgentFieldBlocks } from '../agents';
+
+// ── Skill-container parser (re-exported from features/skills) ────────────
+
+export type { SkillContainerExtracted, SkillContainerResult } from '../skills';
+export { extractSkillContainers } from '../skills';

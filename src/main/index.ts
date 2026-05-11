@@ -280,15 +280,6 @@ async function runBootSelfCheck(): Promise<void> {
   try { await chatsFeature.sweepStaleProcessing(); }
   catch (err) { log.warn('chats sweep failed', { error: (err as Error).message }); }
 
-  // Stage 3.5: start the group-chat watchdog. Self-paced 60s scan; pings
-  // commander when a `running` conv with an `in_progress` plan step has
-  // been silent past STALE_THRESHOLD_MS (10min default). See
-  // features/group_chat/watchdog.ts.
-  try {
-    const groupChat = await import('./features/group_chat');
-    groupChat.startWatchdog();
-  } catch (err) { log.warn('watchdog start failed', { error: (err as Error).message }); }
-
   // Stage 4: file_cache orphan sweep — cheap stat-based scan.
   try {
     const uid = users.getActiveUserId();
@@ -298,6 +289,18 @@ async function runBootSelfCheck(): Promise<void> {
       if (deleted) log.info('file_cache pruned', { deleted });
     }
   } catch (err) { log.warn('file_cache sweep failed', { error: (err as Error).message }); }
+
+  // Stage 5: workspace empty-subdir sweep — clean up legacy per-conv slug
+  // dirs that were materialised by bash's defensive mkdir on a turn that
+  // produced nothing. Boot-time is the safe moment: no in-flight bash
+  // process is holding cwd open. Top-level scan only.
+  try {
+    const uid = users.getActiveUserId();
+    if (uid) {
+      const userWs = await import('./features/user_workspace');
+      userWs.sweepEmptyConvDirs(uid);
+    }
+  } catch (err) { log.warn('workspace empty-dir sweep failed', { error: (err as Error).message }); }
 }
 
 // `kb-file://<relpath>` — maps a KB-relative path to the active user's

@@ -67,6 +67,16 @@ async function ca(): Promise<CA> {
 /** No-op retained for backward compat; nothing is cached anymore. */
 export function invalidateConfig(): void {}
 
+function _intersectRenderAllowlist(
+  agentList: readonly string[] | undefined,
+  projectList: readonly string[] | undefined,
+): readonly string[] | undefined {
+  if (projectList === undefined) return agentList;
+  if (agentList === undefined) return projectList;
+  const agentSet = new Set(agentList);
+  return projectList.filter((id) => agentSet.has(id));
+}
+
 export interface BuildRunnerParams {
   sessionId: string;
   systemPrompt?: string;
@@ -75,19 +85,40 @@ export interface BuildRunnerParams {
    *  / process_file_full calls whose path targets the attachment dir of the
    *  current conv. */
   cid?: string;
+  /** Project id of the conversation, when it belongs to one. Threaded
+   *  through to local-tools / file-tools / image-gen-tool so workspace
+   *  resolution picks up the project-scoped selection. Resolved once at
+   *  the top of group_chat::runTurn from `conv.project_id`. */
+  projectId?: string;
   /** Agent id bound to the conversation. Empty/undefined = default scope. */
   agentId?: string;
 
   /** Optional subset of skill ids; undefined = full global listing. See
    * `skill-registry.getSystemPromptBlock` for the exact semantics. */
   skillList?: string[];
+  /** Project-scope skill allowlist applied ONLY to the System A render
+   *  block (`getSystemPromptBlock`). When present, the rendered allowlist
+   *  is `intersect(skillList, projectAllowedSkillIds)`; SkillStore (System
+   *  B, agent self-evolved skills) stays gated by `skillList` alone so
+   *  agents in projects retain access to their own evolved skills. See
+   *  CLAUDE.md §6 + `features/projects.ts::resolveProjectScope`. */
+  projectAllowedSkillIds?: readonly string[];
   /** Extra tools added to core-agent's builtins (e.g. group_chat commander
    * gets `plan_set` + agent-management tools). */
   extraTools?: AgentTool[];
   /** Extra absolute directory roots whitelisted for file-tools (read_file /
    *  stat_file / search_files / grep_files) on top of workspace + attachment.
-   *  Used by skill-edit chats to expose the skill dir. */
+   *  Read AND write are permitted under these roots. Used by per-skill
+   *  edit chats to expose the skill dir. */
   extraRoots?: readonly string[];
+  /** Read-only extra roots: read tools (read_file / search_files /
+   *  grep_files / stat_file) can see them, but write-side tools
+   *  (edit_file / write_file / bash / markdown_to_pdf / html_to_pdf /
+   *  generate_image) cannot mutate paths inside. Used by group-chat
+   *  commander to inspect agent / skill specs without giving direct-write
+   *  access — the structured `<agent>` / `<skill>` containers are the
+   *  only sanctioned mutation channels for those resources. */
+  readOnlyExtraRoots?: readonly string[];
   /** Fires with the absolute path after each successful `write_file` /
    * `markdown_to_pdf` / `html_to_pdf` call. See `model/client.ts`
    * `ChatOptions.onFileWritten` for the caller-facing contract. */
@@ -141,11 +172,19 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const earlyUid = params.userId || extractUidFromSessionId(params.sessionId);
   const disabledSkillIds = earlyUid ? readDisabledSets(earlyUid).skills : new Set<string>();
 
+  // System A render allowlist = intersect(skillList, project bindings).
+  //   - no project scope (`projectAllowedSkillIds` undefined) → legacy
+  //     `skillList`-only behavior
+  //   - commander in a project (`skillList` undefined, project list set) →
+  //     project list governs the render block
+  //   - agent in a project (both set) → intersection
+  // SkillStore (System B) stays gated by `skillList` alone — see line ~429.
+  const renderAllowlist = _intersectRenderAllowlist(params.skillList, params.projectAllowedSkillIds);
   const [mod, session, skillsBlock] = await Promise.all([
     ca(),
     getSession(params.sessionId),
     getSystemPromptBlock({
-      ...(params.skillList === undefined ? {} : { allowlist: params.skillList }),
+      ...(renderAllowlist === undefined ? {} : { allowlist: [...renderAllowlist] }),
       disabledIds: disabledSkillIds,
     }),
   ]);
@@ -190,6 +229,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const localTools = createLocalTools({
     ...(uid ? { userId: uid } : {}),
     ...(params.cid ? { cid: params.cid } : {}),
+    ...(params.projectId ? { projectId: params.projectId } : {}),
     ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
     ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
     ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
@@ -199,11 +239,17 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // Same last-write-wins rule — placed after localTools so `read_file` wins
   // over core-agent's builtin `read_file`. Skipped when uid is unknown
   // (e.g. ad-hoc test runs) since file-tools need it for cache scoping.
+  // `readOnlyExtraRoots` is intentionally only threaded HERE — write-side
+  // localTools / image-gen-tool stay limited to workspace + attachment +
+  // (read-write) extraRoots, so paths the caller marks read-only physically
+  // can't be mutated by the LLM.
   const fileTools = uid
     ? createFileTools({
         userId: uid,
         ...(params.cid ? { cid: params.cid } : {}),
+        ...(params.projectId ? { projectId: params.projectId } : {}),
         ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
+        ...(params.readOnlyExtraRoots?.length ? { readOnlyExtraRoots: params.readOnlyExtraRoots } : {}),
       })
     : [];
 
@@ -222,6 +268,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ? [createImageGenTool({
         userId: uid,
         ...(params.cid ? { cid: params.cid } : {}),
+        ...(params.projectId ? { projectId: params.projectId } : {}),
         ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
         ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
       })]
