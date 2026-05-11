@@ -10,7 +10,7 @@
 
 <sub>多智能体系统 · AI 团队 · 智能体团队 · AI 工作流 · 智能体编排</sub>
 
-🌐 想要团队协作、专家 Agent 等更多功能？→ [专业版](https://aiservice.fun)
+🌐 想要团队协作、专家 Agent 等更多功能？→ [专业版](https://orkas.ai)
 
 > ⭐ 如果 Orkas 帮你做出了更好的 AI 工作流，欢迎点个 star，让更多人看到这个项目。
 
