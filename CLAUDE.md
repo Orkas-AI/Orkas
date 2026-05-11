@@ -43,7 +43,7 @@ PC/                          Electron project root, sole dev and packaging entry
 └── src/builtin/skills/      Built-in skill source (synced by hash to data/builtin/skills/ on startup)
 ```
 
-**Runtime data location**: dev = `PC/data/` + `PC/userWorkSpace/`; packaged = `<container>/{data,userWorkSpace}/`, where the container is chosen as macOS/Linux → `~/.orkas/`, Windows → the lowest-letter non-system fixed drive `<drive>:\.orkas\` (falling back to `C:\` if none). Full drive selection logic lives in `src/main/packaged-data-root.ts`.
+**Runtime data location**: dev source-run and packaged builds use the SAME `<container>/{data,userWorkSpace}/` tree — no dev-vs-packaged data split. Container = `~/.orkas/` on macOS/Linux; on Windows it's the drive recorded in `%LOCALAPPDATA%\Orkas\install-pin.json` — chosen on first launch (lowest-letter non-system fixed drive, fallback `C:`) and reused on subsequent launches. The pin lives in LocalAppData (machine-private), not Roaming, because it records a drive choice on this specific machine. Full container resolution + pin handling logic lives in `src/main/install-data-root.cjs`. Pre-unification source-run `<repoRoot>/data` + `<repoRoot>/userWorkSpace` are migrated into the container by `src/main/util/migrate-source-data-root.cjs` on first launch (overlay merge: src wins per-file conflict, target-only paths preserved, `users.json::users[]` unioned with a `current_user_id` dangling-pointer guard).
 
 ---
 
@@ -333,6 +333,9 @@ The renderer evaluates `<script>`-loaded files where `module` is undefined, so t
 **Modifying existing code: existing behavior is the spec.** Adding a guard / branch / segmentation to existing code reorders its matrix of accepted inputs. If the previously-accepted shapes aren't actively re-checked, the change silently breaks them — this is the failure mode behind "fix here, break there" cycles. Before changing existing code: read recent `fix` commits on the file (they encode invariants nothing else documents), grep callers, run existing tests; for text-processing functions in particular, "mentally trace" is not enough — extend the fixture set first, then change the code.
 
 ### Don't do
+
+**Dev environment / OSS strip**:
+- Branch business behavior on `app.isPackaged` / `process.env.NODE_ENV` / `isDevMode` / `isDevEnv`. Dev (source-run via `./run.sh`) and packaged builds must be functionally identical; the only `app.isPackaged` branches allowed are pure-infrastructure (data-root path, devTools toggle, `app.asar.unpacked` rewrite). **Why:** OrkasOpen ships from a synced upstream tree where the closed-source dev-only branches were stripped; reintroducing a dev branch here re-creates the divergence the strip rules exist to prevent. Enforcement: forbidden symbols + `isPackaged_allowed_files` allowlist live in `OpenSource/SyncCode/strip-rules.json`; `node OpenSource/SyncCode/bin/oss-sync-postcheck.mjs` must exit 0 after every sync.
 
 **Layering / paths**:
 - Write business in `ipc/` (skipping a layer); call core-agent directly / spawn processes from `features/`.

@@ -9,8 +9,8 @@
  * UI instead of going silently blank).
  *
  * Used by features/* to produce localized `error` fields returned to the
- * renderer. LLM prompts, logs, and telemetry remain in their source language
- * and are NOT routed through here.
+ * renderer. LLM prompts and logs remain in their source language and are
+ * NOT routed through here.
  */
 
 import * as path from 'node:path';

@@ -164,10 +164,8 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   log.info('end', {
     runId: handle.runId, cli: opts.cli, status: terminal.status, bytes: finalOutput?.length ?? 0,
   });
-  // The PC build also archives the run into the in-app debug panel
-  // (`devtools.archiveLlmCall`); the open-source build has no debug
-  // panel, so the per-run jsonl under `local-agent-runs/<runId>/`
-  // (written by `persist`) is the only artifact.
+  // The per-run jsonl under `local-agent-runs/<runId>/` (written by
+  // `persist`) is the only post-run artifact.
   return { runId: handle.runId, status: terminal.status, output: finalOutput, error: terminal.error };
 }
 

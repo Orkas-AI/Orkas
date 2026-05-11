@@ -1,28 +1,23 @@
 // Electron entry shim: register tsx so the main process can
 // `require('./src/main')` and resolve to src/main/index.ts (Node folder →
 // index.ts rule + tsx/cjs transpilation). Keeps __dirname semantics identical
-// to running plain JS — no compile step in dev.
+// to running plain JS — no compile step.
 //
 // 两件事必须在 tsx 注册前完成:
-//   1. Hooks:`tsx/cjs` 处理 src/main/**/*.ts 的同步 require;`tsx/esm/api`
+//   1. **WS_ROOT env 注入**:require('./src/main/install-data-root.cjs') 的
+//      模块加载副作用解析容器目录、跑一次性 source-run → container 迁移、
+//      mkdir、写入 process.env.ORKAS_WORKSPACE_ROOT。**必须在 tsx 加载任何
+//      .ts 前完成** —— paths.ts 把 ORKAS_WORKSPACE_ROOT 在 import 时
+//      snapshot 成 WS_ROOT,任何先加载 paths.ts 的路径都会读到空。CJS require
+//      没有 hoist 问题,这层在 .cjs 里做最稳。
+//   2. Hooks:`tsx/cjs` 处理 src/main/**/*.ts 的同步 require;`tsx/esm/api`
 //      处理动态 `import()`(尤其 `import('#core-agent')`)。
-//   2. **packaged 模式 WS_ROOT env 重定向**:必须在任何 TS 加载前完成 ——
-//      TypeScript 把 `import * as paths from './paths'` 提升到所有非 import
-//      语句之前,index.ts 内"先 set env 再 import paths"的写法在编译后会被
-//      打乱顺序,paths.ts 在 env 还没设置时就快照了空值,WS_ROOT 落到
-//      .app 包内。CJS 的 require 没有提升问题,所以这层必须在 .cjs 里做。
+//
+// dev (源码运行) 和 packaged 走同一条路径 —— 无 isPackaged 分叉,容器解析、
+// 迁移、env 注入对两种入口形态行为完全一致。
 'use strict';
 
-(function pinPackagedWorkspaceRoot() {
-  const { app } = require('electron');
-  if (!app.isPackaged || process.env.ORKAS_WORKSPACE_ROOT) return;
-  const path = require('path');
-  const fs = require('fs');
-  const { resolvePackagedContainer } = require('./src/main/packaged-data-root.cjs');
-  const ws = path.join(resolvePackagedContainer(), 'data');
-  fs.mkdirSync(ws, { recursive: true });
-  process.env.ORKAS_WORKSPACE_ROOT = ws;
-})();
+require('./src/main/install-data-root.cjs');
 
 require('tsx/cjs');
 require('tsx/esm/api').register();

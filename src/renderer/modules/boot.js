@@ -31,13 +31,6 @@ async function _stampSettingsVersion() {
   } catch (_) { /* ignore — non-critical */ }
 }
 
-// Dev-mode editing of built-in skills / agents is stripped from the
-// open-source build (the underlying `isDevEnv()` / built-in dual-write IPC
-// stack lives in the in-app debug panel that's only present in PC).
-// Renderer modules still branch on `isDevMode()` for those entry points,
-// so we stub it to false here.
-function isDevMode() { return false; }
-
 // One-shot rename of legacy brand-prefixed localStorage keys
 // (`orkas_*` / `orkas.*`) to the unprefixed form. After stamping,
 // subsequent boots are no-ops. Placed at the very start of boot so no

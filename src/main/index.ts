@@ -55,12 +55,13 @@ protocol.registerSchemesAsPrivileged([
   },
 ]);
 
-// Packaged-mode WS_ROOT redirect (`~/.orkas/data` or a Windows container
-// drive) is already done in `bootstrap.cjs`, and **must** happen there —
-// TypeScript's import hoisting would pull `paths.ts`'s require ahead of
-// any env-setting block here, so doing it later is too late. Drive
-// selection rules live in `packaged-data-root.cjs`, required directly by
-// `bootstrap.cjs`.
+// WS_ROOT env injection (`~/.orkas/data` on mac/linux; Windows pinned
+// drive's `<drive>:\.orkas\data`) is already done in `bootstrap.cjs` via
+// `install-data-root.cjs`, and **must** happen there — TypeScript's
+// import hoisting would pull `paths.ts`'s require ahead of any
+// env-setting block here, so doing it later is too late. Container
+// resolution + Windows pin + source-run migration logic lives in
+// `src/main/install-data-root.cjs`.
 import * as paths from './paths';
 
 // `CORE_AGENT_AUTH_DIR` is pinned per-uid by `features/users.activateUser()`
@@ -84,9 +85,9 @@ const log = createLogger('orkas');
 import { installSdkTimeoutPatch } from './model/core-agent/sdk-timeout-patch';
 installSdkTimeoutPatch();
 
-// Opt-in provider-fetch diagnostics (gated by ORKAS_FETCH_DIAG=1).
-// Default off — zero overhead for end users. Set the env var when
-// investigating fetch-level failures to dump the real undici cause chain.
+// Provider-fetch diagnostics — always on. Dumps the real undici cause
+// chain (the cause that pi-ai's internal retry loop would otherwise
+// swallow) into data/logs/. See fetch-diag.ts.
 import { installFetchDiag } from './model/core-agent/fetch-diag';
 installFetchDiag();
 

@@ -3,52 +3,70 @@
  *
  * All path constants live here — never hardcode paths elsewhere.
  *
- * Layout (dev and packaged both use this tree; only WS_ROOT differs):
+ * Layout (dev source-run and packaged builds both use the same tree —
+ * `WS_ROOT` is identical in both modes, pinned by `install-data-root.cjs`):
  *
- *   PC_ROOT/                      ← source + per-install binaries (asar-packed in prod)
+ *   APP_ROOT/                     ← source + per-install binaries (asar-packed in prod)
  *     bootstrap.cjs package.json node_modules/ test/ docs/
  *     src/
  *       main/                     ← index.ts + preload.js + features/...
  *       renderer/ builtin/ resources/ core-agent/
- *     data/                       ← WS_ROOT (dev default); userData/data in prod
- *       users.json                ← Local uid registry + current_user_id
- *       logs/                     ← Local logs (rolled daily, global)
- *       builtin/                  ← Local public builtin runtime copy (hash-synced from src/builtin/ at startup)
- *         agents/<agent_id>/
- *         skills/<skill_id>/
- *       <user_id>/
- *         cloud/                  ← Cloud-sync domain (synced per uid / org / team once accounts are integrated)
- *           chats/  chat_attachments/  sessions/  contexts/  memory/
- *           agents/<agent_id>/  skills/<skill_id>/  meta/<agent_id>/
- *           config/preferences.json
- *         local/                  ← Machine-private domain (never synced)
- *           config/               ← auth-profiles.json + web-search-cache.json
- *           search/               ← contexts / chats inverted idx (agent / skill bodies queried in-memory at request time)
+ *
+ *   WS_ROOT (= <container>/data)  ← `<container>` = `~/.orkas` on mac/linux,
+ *                                    pinned drive `<drive>:\.orkas` on win
+ *     users.json                  ← Local uid registry + current_user_id
+ *     logs/                       ← Local logs (rolled daily, global)
+ *     builtin/                    ← Builtin runtime copy (hash-synced from src/builtin/ at startup)
+ *       agents/<agent_id>/
+ *       skills/<skill_id>/
+ *     <user_id>/
+ *       cloud/                    ← Cloud-sync domain (synced per uid / org / team once accounts are integrated)
+ *         chats/  chat_attachments/  sessions/  contexts/  memory/
+ *         agents/<agent_id>/  skills/<skill_id>/  meta/<agent_id>/
+ *         config/preferences.json
+ *       local/                    ← Machine-private domain (never synced)
+ *         config/                 ← auth-profiles.json + web-search-cache.json
+ *         search/                 ← contexts / chats inverted idx (agent / skill bodies queried in-memory at request time)
  *
  * Runtime overrides:
- *   ORKAS_WORKSPACE_ROOT   point data root elsewhere (src/main/index.ts sets this in packaged builds; env var name predates the dir rename — kept for stability)
+ *   ORKAS_WORKSPACE_ROOT   point data root elsewhere; tests pre-set this in setup-env.ts.
+ *                          In normal boot, `install-data-root.cjs` sets it from bootstrap.cjs
+ *                          before any TS module loads (`paths.ts` reads it at import time —
+ *                          the env var MUST be set before the first `import * as paths` call).
  *   ORKAS_BUILTIN_ROOT     optional override for the builtin source dir
- *   CORE_AGENT_AUTH_DIR     pinned by `activateUser()` to the active user's `<uid>/local/config/`
+ *   CORE_AGENT_AUTH_DIR    pinned by `activateUser()` to the active user's `<uid>/local/config/`
  */
 
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 
 // ── Roots ────────────────────────────────────────────────────────────────
-// __dirname = PC/src/main → parents[0]=main, [1]=src, [2]=PC.
-export const SRC_ROOT      = path.resolve(__dirname, '..');            // PC/src
-export const PC_ROOT       = path.resolve(__dirname, '..', '..');      // PC
+// __dirname = <app-root>/src/main → parents[0]=main, [1]=src, [2]=app-root.
+export const SRC_ROOT      = path.resolve(__dirname, '..');            // <app-root>/src
+export const PC_ROOT       = path.resolve(__dirname, '..', '..');      // <app-root> — name predates OrkasOpen rename, kept as internal symbol
 export const APP_ROOT      = PC_ROOT;
-export const PROJECT_ROOT  = path.resolve(PC_ROOT, '..');              // Orkas
+export const PROJECT_ROOT  = path.resolve(PC_ROOT, '..');
 
-// ── Data root (env > dev default) ────────────────────────────────────────
-// The on-disk directory name is `data/`; the constant is still named WS_ROOT
-// (a historical abbreviation of "workspace root" — it's an internal TS symbol
-// and not part of any user-facing naming). The env var `ORKAS_WORKSPACE_ROOT`
-// likewise keeps its old name so deployments upgrade transparently.
-export const WS_ROOT = process.env.ORKAS_WORKSPACE_ROOT
-  ? path.resolve(process.env.ORKAS_WORKSPACE_ROOT)
-  : path.join(PC_ROOT, 'data');
+// ── Data root (env required) ─────────────────────────────────────────────
+// `ORKAS_WORKSPACE_ROOT` is set unconditionally by `install-data-root.cjs`
+// before any TS module loads (see bootstrap.cjs). Tests pre-set it in
+// setup-env.ts. The on-disk directory name is `data/`; the constant is
+// still named WS_ROOT (a historical abbreviation of "workspace root" —
+// internal TS symbol, not user-facing). The env var name likewise keeps
+// its old form so deployments upgrade transparently.
+//
+// If the env var is missing here, something has gone wrong in the boot
+// sequence (e.g. a TS module was loaded before bootstrap.cjs's
+// install-data-root.cjs require). Fail loudly rather than silently
+// falling back to `<app-root>/data` and forking dev vs packaged data.
+if (!process.env.ORKAS_WORKSPACE_ROOT) {
+  throw new Error(
+    'paths.ts: ORKAS_WORKSPACE_ROOT is not set. ' +
+    'bootstrap.cjs must require install-data-root.cjs before any .ts module loads. ' +
+    'Tests must use test/setup-env.ts.',
+  );
+}
+export const WS_ROOT = path.resolve(process.env.ORKAS_WORKSPACE_ROOT);
 
 // ── Top-level (machine-global, shared across uids) ───────────────────────
 // Machine-local uid registry: { current_user_id, users: [{user_id, created_at}, ...] }

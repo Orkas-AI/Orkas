@@ -338,16 +338,11 @@ function _renderAgentRowMenuItems(menu, agentId) {
   const a = _agentsCache?.find((x) => x.agent_id === agentId);
   const enabled = a ? a.enabled !== false : true;
   const isCustom = a?.source === 'custom';
-  // Dev mode lifts the source guard for built-in edit / delete; custom adds
-  // a "promote to built-in" item too.
-  const canEdit = isCustom || (a?.source === 'builtin' && isDevMode());
+  const canEdit = isCustom;
   const toggleLabel = enabled ? t('component.disable') : t('component.enable');
   const items = [];
   if (canEdit) {
     items.push(`<div class="agent-row-menu-item" data-action="edit">${escapeHtml(t('agents.edit'))}</div>`);
-  }
-  if (isCustom && isDevMode()) {
-    items.push(`<div class="agent-row-menu-item" data-action="promote">${escapeHtml(t('agents.promote_to_builtin'))}</div>`);
   }
   items.push(`<div class="agent-row-menu-item" data-action="toggle-enabled">${escapeHtml(toggleLabel)}</div>`);
   if (canEdit) {
@@ -367,31 +362,10 @@ function _renderAgentRowMenuItems(menu, agentId) {
       } else if (action === 'delete') {
         if (_selectedAgent?.id !== aid) await selectAgent(aid);
         await deleteSelectedAgent();
-      } else if (action === 'promote') {
-        await promoteCustomAgent(aid);
       } else if (action === 'toggle-enabled') {
         await _flipAgentEnabledFromMenu(aid);
       }
     });
-  }
-}
-
-/** Dev-only: promote a custom agent to built-in. Copies agent.json to
- *  src+data trees, removes the custom dir (meta/ + skills/ dropped),
- *  refreshes the grid. */
-async function promoteCustomAgent(agentId) {
-  if (!isDevMode()) return;
-  const cached = _agentsCache?.find((x) => x.agent_id === agentId);
-  if (!(await uiConfirm(t('agents.promote_confirm', { name: cached?.name || agentId })))) return;
-  try {
-    const result = await window.orkas.invoke('agents.promoteToBuiltin', { agent_id: agentId });
-    if (!result.ok) {
-      await uiAlert(t('agents.promote_failed_with', { reason: result.error || '' }));
-      return;
-    }
-    await loadAgents(true);
-  } catch (e) {
-    await uiAlert(t('agents.promote_failed_with', { reason: e.message || e }));
   }
 }
 
@@ -467,20 +441,16 @@ function _renderAgentDetail(agent, editing) {
   }
   if (!editing && !localizedDesc) descEl.innerHTML = unsetHtml;
 
-  // Detail header actions, fixed order:
-  //   use (icon) / edit / enable-disable / promote-to-builtin
-  //   (custom + dev) / delete
+  // Detail header actions, fixed order: use (icon) / edit / enable-disable / delete.
   // Edit mode hides everything except the "done" button (the relabeled
   // "edit" button).
   const useBtn = document.getElementById('agent-use-btn');
   const enableBtn = document.getElementById('agent-enabled-btn');
-  const promoteBtn = document.getElementById('agent-promote-btn');
   const delBtn = document.getElementById('agent-delete-btn');
   const isCustom = agent.source === 'custom';
-  const canEdit = isCustom || (agent.source === 'builtin' && isDevMode());
+  const canEdit = isCustom;
   if (useBtn) useBtn.style.display = editing ? 'none' : '';
   if (enableBtn) enableBtn.style.display = editing ? 'none' : '';
-  if (promoteBtn) promoteBtn.style.display = (isCustom && isDevMode() && !editing) ? '' : 'none';
   if (delBtn) delBtn.style.display = (canEdit && !editing) ? '' : 'none';
   if (editBtn) {
     editBtn.style.display = canEdit ? '' : 'none';
@@ -686,8 +656,7 @@ function _toggleAgentFieldEditable(on) {
 
 async function toggleAgentEditMode() {
   if (!_selectedAgent) return;
-  // Built-in editing is dev-only; lift the source guard accordingly.
-  if (_selectedAgent.source === 'builtin' && !isDevMode()) return;
+  if (_selectedAgent.source === 'builtin') return;
   if (_agentEditing) {
     await _exitAgentEditMode();
   } else {

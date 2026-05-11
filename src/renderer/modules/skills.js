@@ -285,12 +285,12 @@ function _openSkillRowMenu(anchorBtn, id, source) {
   _closeSkillRowMenu();
   menu.dataset.skillId = id;
   menu.dataset.source = source;
-  // Edit/delete are gated: custom always allowed; built-in only in dev mode.
+  // Edit/delete are gated: custom always allowed; built-ins are read-only.
   // Enable/disable is always shown (lives in this menu now since cards no
   // longer carry a toggle).
   const cached = _skillsCache?.find((s) => s.id === id && s.source === source);
   const enabled = cached ? cached.enabled !== false : true;
-  const canEdit = source === 'custom' || (source === 'builtin' && isDevMode());
+  const canEdit = source === 'custom';
   const items = [];
   if (canEdit) {
     items.push(`<div class="skill-row-menu-item" data-action="edit">${escapeHtml(t('skills.edit'))}</div>`);
@@ -298,11 +298,6 @@ function _openSkillRowMenu(anchorBtn, id, source) {
   items.push(
     `<div class="skill-row-menu-item" data-action="toggle-enabled">${escapeHtml(enabled ? t('component.disable') : t('component.enable'))}</div>`,
   );
-  if (source === 'custom' && isDevMode()) {
-    items.push(
-      `<div class="skill-row-menu-item" data-action="promote">${escapeHtml(t('skills.promote_to_builtin'))}</div>`,
-    );
-  }
   if (canEdit) {
     items.push(`<div class="skill-row-menu-item is-danger" data-action="delete">${escapeHtml(t('skills.delete'))}</div>`);
   }
@@ -325,8 +320,6 @@ function _openSkillRowMenu(anchorBtn, id, source) {
         // Mimic the existing delete flow (from detail page) but for any card.
         _selectedSkill = { source, id, filepath: 'SKILL.md', name: '' };
         await deleteSelectedSkill();
-      } else if (action === 'promote') {
-        await promoteCustomSkill(id);
       } else if (action === 'toggle-enabled') {
         const cur = _skillsCache?.find((s) => s.id === id && s.source === source);
         const nextEnabled = !(cur ? cur.enabled !== false : true);
@@ -545,11 +538,10 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   _renderSkillSections(seedDesc ? [['description', seedDesc]] : []);
 
   // Actions bar: visible when a skill is selected.
-  // Order: use (icon) / edit / enable-disable / promote-to-builtin
-  //        (custom + dev) / delete.
+  // Order: use (icon) / edit / enable-disable / delete.
   // In edit mode only the "done" button (the relabeled "edit") is
   // shown; everything else hides.
-  const canEditThisSkill = source === 'custom' || (source === 'builtin' && isDevMode());
+  const canEditThisSkill = source === 'custom';
   const editingThis = _skillEditMode && _skillEditSkillId === id && canEditThisSkill;
   const actions = document.getElementById('skills-detail-actions');
   if (actions) {
@@ -557,21 +549,16 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
     const useBtn = document.getElementById('skill-use-btn');
     const editBtn = document.getElementById('skill-edit-btn');
     const enableBtn = document.getElementById('skill-enabled-btn');
-    const promoteBtn = document.getElementById('skill-promote-btn');
     const delBtn = document.getElementById('skill-delete-btn');
     if (useBtn) useBtn.style.display = editingThis ? 'none' : '';
     if (editBtn) editBtn.style.display = canEditThisSkill ? '' : 'none';
     if (enableBtn) enableBtn.style.display = editingThis ? 'none' : '';
-    if (promoteBtn) promoteBtn.style.display = (source === 'custom' && isDevMode() && !editingThis) ? '' : 'none';
     if (delBtn) delBtn.style.display = (canEditThisSkill && !editingThis) ? '' : 'none';
   }
 
   // Wire name editability (edit mode + custom only) and hide the
   // description section while editing (req #3: edit description by editing
-  // the `description_*:` frontmatter in SKILL.md, not via a separate UI
-  // block). Built-in skills' name is **never** directly editable here even
-  // under dev mode — direct rename would skip the dual-tree dir rename +
-  // per-user chat dir migration that LLM-driven SKILL.md edits go through.
+  // the `description_*:` frontmatter in SKILL.md, not via a separate UI block).
   const nameEditable = editingThis && source === 'custom';
   _toggleSkillNameEditable(nameEl, nameEditable);
   const summarySection = document.getElementById('skills-section-summary');
@@ -986,9 +973,7 @@ function _updateEditButtonLabel() {
 // automatically — the user drives the conversation from a blank input.
 async function toggleSkillEditMode(opts = {}) {
   if (!_selectedSkill) return;
-  // Built-in editing is dev-only; lift the source guard accordingly.
-  if (_selectedSkill.source !== 'custom'
-      && !(_selectedSkill.source === 'builtin' && isDevMode())) return;
+  if (_selectedSkill.source !== 'custom') return;
   if (_skillEditMode && _skillEditSkillId === _selectedSkill.id) {
     // Abort any in-flight reply so "done" means "stop + exit", not
     // "exit but keep streaming". The chat controller is a singleton;
@@ -1380,15 +1365,12 @@ function editSelectedSkill() {
 
 async function deleteSelectedSkill() {
   if (!_selectedSkill) return;
-  const src = _selectedSkill.source;
-  if (src !== 'custom' && !(src === 'builtin' && isDevMode())) return;
+  if (_selectedSkill.source !== 'custom') return;
   const sid = _selectedSkill.id;
-  const cached = _skillsCache?.find(s => s.id === sid && s.source === src);
+  const cached = _skillsCache?.find(s => s.id === sid && s.source === 'custom');
   if (!(await uiConfirm(t('skills.delete_confirm', { name: cached?.name || sid })))) return;
   try {
-    const result = src === 'builtin'
-      ? await window.orkas.invoke('skills.builtin.delete', { id: sid })
-      : await (await apiFetch(`/api/skills/${sid}`, { method: 'DELETE' })).json();
+    const result = await (await apiFetch(`/api/skills/${sid}`, { method: 'DELETE' })).json();
     if (!result.ok) {
       await uiAlert(t('skills.delete_failed_with', { reason: result.error || '' }));
       return;
@@ -1402,26 +1384,6 @@ async function deleteSelectedSkill() {
     _showSkillsGridView();
   } catch (e) {
     await uiAlert(t('skills.delete_failed_with', { reason: e.message || e }));
-  }
-}
-
-/** Dev-only: promote a custom skill to built-in. Copies to src+data trees,
- *  removes the custom dir, refreshes the grid. */
-async function promoteCustomSkill(id) {
-  if (!isDevMode()) return;
-  const cached = _skillsCache?.find(s => s.id === id && s.source === 'custom');
-  if (!(await uiConfirm(t('skills.promote_confirm', { name: cached?.name || id })))) return;
-  try {
-    const result = await window.orkas.invoke('skills.promoteToBuiltin', { id });
-    if (!result.ok) {
-      await uiAlert(t('skills.promote_failed_with', { reason: result.error || '' }));
-      return;
-    }
-    _skillsCache = null;
-    _skillTreeCache.clear();
-    await loadSkills();
-  } catch (e) {
-    await uiAlert(t('skills.promote_failed_with', { reason: e.message || e }));
   }
 }
 
