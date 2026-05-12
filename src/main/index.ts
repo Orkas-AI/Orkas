@@ -22,6 +22,7 @@
 
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import { Readable } from 'node:stream';
 import { app, BrowserWindow, Menu, ipcMain, nativeImage, protocol, shell } from 'electron';
 
 // Force the user-visible app name to "Orkas" before anything else
@@ -46,9 +47,11 @@ protocol.registerSchemesAsPrivileged([
   },
   // `chat-media://cid/<encCid>/<encName>` — serves image + video bytes out
   // of the active user's `<uid>/cloud/chat_attachments/<cid>/`. `stream:true`
-  // lets Chromium do byte-range requests on `<video>` seek without us
-  // manually implementing Range handling (we hand back a normal Response
-  // and Chromium / Electron handles scroll + seek over it).
+  // only enables a streamed Response body — it does NOT make Chromium issue
+  // byte-range requests on its own; the handler must advertise
+  // `Accept-Ranges: bytes` and serve `206` itself (see `serveFileRange`).
+  // Without that, `<video preload="metadata">` freezes a few seconds in
+  // because Chromium can't resume past the cancelled metadata-probe fetch.
   {
     scheme: 'chat-media',
     privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true },
@@ -63,6 +66,7 @@ protocol.registerSchemesAsPrivileged([
 // resolution + Windows pin + source-run migration logic lives in
 // `src/main/install-data-root.cjs`.
 import * as paths from './paths';
+import { parseByteRange } from './util/http-range';
 
 // `CORE_AGENT_AUTH_DIR` is pinned per-uid by `features/users.activateUser()`
 // (runs inside `runBootSelfCheck` below). `resolveAuthDir()` in core-agent
@@ -326,6 +330,70 @@ const _KB_FILE_MIME: Record<string, string> = {
   '.json': 'application/json',
 };
 
+/**
+ * Stream a file on disk back through a `protocol.handle` callback with HTTP
+ * Range support — shared by `kb-file://` and `chat-media://`.
+ *
+ * Why this exists: a `protocol.handle` reply that returns `200` + a
+ * `Content-Length` but no `Accept-Ranges` makes Chromium treat the resource
+ * as non-seekable. For `<video preload="metadata">` that is fatal — Chromium's
+ * metadata probe fetches only the head of the file and then *cancels* its
+ * request; when playback later runs past that prefetched head buffer it has no
+ * way to resume (the resource is "not range-capable" and the original request
+ * is gone), so the `<video>` freezes a few seconds in with no error in the UI.
+ * Advertising `Accept-Ranges: bytes` + honouring `206` requests is the fix; it
+ * also makes seeking work and lets PDFium fetch only the pages it shows.
+ *
+ * Also switches the body from `fs.readFileSync` — the old handlers buffered the
+ * whole file into memory, so a 200 MB video spiked RSS by 200 MB — to a lazy
+ * `fs.createReadStream`.
+ *
+ * `totalSize` is the caller's already-statted byte length, so we don't `stat`
+ * the file a second time.
+ */
+function serveFileRange(
+  request: Request,
+  absPath: string,
+  contentType: string,
+  totalSize: number,
+): Response {
+  const baseHeaders: Record<string, string> = {
+    'Content-Type': contentType,
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'private, max-age=60',
+  };
+  const range = parseByteRange(request.headers.get('Range'), totalSize);
+
+  if (range === 'unsatisfiable') {
+    return new Response('requested range not satisfiable', {
+      status: 416,
+      headers: { ...baseHeaders, 'Content-Range': `bytes */${totalSize}` },
+    });
+  }
+
+  const nodeStream = range
+    ? fs.createReadStream(absPath, { start: range.start, end: range.end })
+    : fs.createReadStream(absPath);
+  nodeStream.on('error', (err) => {
+    log.warn('media stream error', { absPath, error: (err as Error).message });
+  });
+  const body = Readable.toWeb(nodeStream) as unknown as ReadableStream;
+
+  if (range) {
+    return new Response(body, {
+      status: 206,
+      headers: {
+        ...baseHeaders,
+        'Content-Range': `bytes ${range.start}-${range.end}/${totalSize}`,
+        'Content-Length': String(range.end - range.start + 1),
+      },
+    });
+  }
+  return new Response(body, {
+    headers: { ...baseHeaders, 'Content-Length': String(totalSize) },
+  });
+}
+
 function registerKbFileProtocol(): void {
   protocol.handle('kb-file', async (request) => {
     const reqUrl = request.url;
@@ -357,22 +425,16 @@ function registerKbFileProtocol(): void {
         log.warn('kb-file: traversal blocked', { reqUrl, rel });
         return new Response('forbidden', { status: 403 });
       }
-      if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) {
+      let st: fs.Stats | undefined;
+      try { st = fs.statSync(abs); } catch { /* falls through to 404 below */ }
+      if (!st || !st.isFile()) {
         log.warn('kb-file: not found', { reqUrl, rel, abs });
         return new Response('not found', { status: 404 });
       }
-      log.info('kb-file: serving', { reqUrl, abs });
+      log.info('kb-file: serving', { reqUrl, abs, bytes: st.size });
       const ext = path.extname(abs).toLowerCase();
       const contentType = _KB_FILE_MIME[ext] || 'application/octet-stream';
-      const buf = fs.readFileSync(abs);
-      return new Response(buf, {
-        headers: {
-          'Content-Type': contentType,
-          'Content-Length': String(buf.length),
-          // Let Chromium's PDFium cache range fetches for scroll.
-          'Cache-Control': 'private, max-age=60',
-        },
-      });
+      return serveFileRange(request, abs, contentType, st.size);
     } catch (err) {
       log.warn('kb-file serve failed', { reqUrl, error: (err as Error).message });
       return new Response('error', { status: 500 });
@@ -442,14 +504,9 @@ function registerChatMediaProtocol(): void {
           log.warn('chat-media/cid: reject', { reqUrl, code, error: (resolved as { error?: string }).error });
           return new Response(String((resolved as { error?: string }).error || code || 'error'), { status: _statusFor(code) });
         }
-        const buf = fs.readFileSync(resolved.absPath);
-        return new Response(buf, {
-          headers: {
-            'Content-Type': chatAttachments.mediaMimeFor(name),
-            'Content-Length': String(buf.length),
-            'Cache-Control': 'private, max-age=60',
-          },
-        });
+        const st = fs.statSync(resolved.absPath);
+        log.info('chat-media/cid: serving', { abs: resolved.absPath, kind: resolved.kind, bytes: st.size });
+        return serveFileRange(request, resolved.absPath, chatAttachments.mediaMimeFor(name), st.size);
       }
 
       if (host === 'local') {
@@ -461,15 +518,9 @@ function registerChatMediaProtocol(): void {
           log.warn('chat-media/local: reject', { reqUrl, code: resolved.code, error: resolved.error });
           return new Response(resolved.error, { status: _statusFor(resolved.code) });
         }
-        const buf = fs.readFileSync(resolved.absPath);
-        log.info('chat-media/local: serving', { abs: resolved.absPath, kind: resolved.kind, bytes: buf.length });
-        return new Response(buf, {
-          headers: {
-            'Content-Type': chatAttachments.mediaMimeFor(resolved.absPath),
-            'Content-Length': String(buf.length),
-            'Cache-Control': 'private, max-age=60',
-          },
-        });
+        const st = fs.statSync(resolved.absPath);
+        log.info('chat-media/local: serving', { abs: resolved.absPath, kind: resolved.kind, bytes: st.size });
+        return serveFileRange(request, resolved.absPath, chatAttachments.mediaMimeFor(resolved.absPath), st.size);
       }
 
       log.warn('chat-media: unknown host', { reqUrl, host });
