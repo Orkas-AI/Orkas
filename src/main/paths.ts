@@ -185,6 +185,10 @@ export const userPreferencesFile = (uid: string) => path.join(userCloudConfigDir
 // Per-user enable/disable config (agents + skills). Schema in features/component_enabled.ts.
 // Same dir + cloud-sync policy as preferences.json; only `false` is stored.
 export const userComponentEnabledFile = (uid: string) => path.join(userCloudConfigDir(uid), 'component-enabled.json');
+// Per-user scheduled agent tasks. Schema in features/scheduled_tasks.ts.
+// Same dir + cloud-sync policy as preferences.json; user-orchestration
+// config, NOT per-agent runtime asset (those live under agents/<aid>/).
+export const userScheduledTasksFile = (uid: string) => path.join(userCloudConfigDir(uid), 'scheduled_tasks.json');
 
 // ── Local-only per-user (never synced) ───────────────────────────────────
 

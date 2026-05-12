@@ -22,6 +22,7 @@ import * as projects from '../features/projects';
 import * as groupChat from '../features/group_chat';
 import type { GroupEvent } from '../features/group_chat/bus';
 import * as agents from '../features/agents';
+import * as scheduledTasks from '../features/scheduled_tasks';
 import { isAgentEnabled } from '../features/component_enabled';
 import * as skills from '../features/skills';
 import * as contexts from '../features/contexts';
@@ -250,6 +251,47 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       agents: agentList.filter((a: any) => !boundAgents.has(a.agent_id)),
       skills: skillList.filter((s: any) => !boundSkills.has(s.id)),
     };
+  },
+
+  // ── Scheduled agent tasks (per-user JSON; see features/scheduled_tasks.ts) ──
+  'scheduledTasks.list': async ({ agentId } = {}, ctx) => {
+    const aid = typeof agentId === 'string' && agentId ? agentId : undefined;
+    const tasks = await scheduledTasks.listTasks(ctx.userId, aid);
+    return { tasks };
+  },
+
+  'scheduledTasks.create': async ({ agentId, schedule, default_input, title, enabled }, ctx) => {
+    if (typeof agentId !== 'string' || !agentId) throw new Error('invalid agentId');
+    const result = await scheduledTasks.createTask(ctx.userId, {
+      agent_id: agentId,
+      schedule,
+      default_input: typeof default_input === 'string' ? default_input : '',
+      title: typeof title === 'string' ? title : undefined,
+      enabled: enabled !== false,
+    });
+    if (!result.ok) throw new Error((result as { error: string }).error);
+    return { task: result.task };
+  },
+
+  'scheduledTasks.update': async ({ taskId, updates }, ctx) => {
+    if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
+    if (!updates || typeof updates !== 'object') throw new Error('invalid updates');
+    const result = await scheduledTasks.updateTask(ctx.userId, taskId, updates as any);
+    if (!result.ok) throw new Error((result as { error: string }).error);
+    return { task: result.task };
+  },
+
+  'scheduledTasks.delete': async ({ taskId }, ctx) => {
+    if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
+    const res = await scheduledTasks.deleteTask(ctx.userId, taskId);
+    return { deleted: res.ok };
+  },
+
+  'scheduledTasks.setEnabled': async ({ taskId, enabled }, ctx) => {
+    if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
+    const result = await scheduledTasks.setTaskEnabled(ctx.userId, taskId, !!enabled);
+    if (!result.ok) throw new Error((result as { error: string }).error);
+    return { task: result.task };
   },
 
   // ── Group chat (replaces legacy conversations.send / .stream / .markFormSubmitted) ──
@@ -876,6 +918,36 @@ const streamHandlers: Record<string, StreamHandler> = {
     }
     for await (const ev of groupChat.streamEvents(ctx.userId, cid, { abortSignal: signal })) {
       yield ev;
+    }
+  },
+
+  // Long-lived global stream the renderer opens once on boot. Each
+  // scheduled-task fire produces a `conv_created` event so the sidebar
+  // can reload its conv list (manual runs mutate the list locally, but
+  // scheduled fires create the conv from main with no other notification
+  // path).
+  'scheduledTasks.events': async function* (_payload, _ctx, signal) {
+    const buf: scheduledTasks.ScheduledFireEvent[] = [];
+    let wake: (() => void) | null = null;
+    let cancelled = signal.aborted;
+    const onAbort = () => { cancelled = true; const w = wake; wake = null; w?.(); };
+    if (!cancelled) signal.addEventListener('abort', onAbort, { once: true });
+    const unsub = scheduledTasks.subscribeFires((ev) => {
+      buf.push(ev);
+      const w = wake; wake = null; w?.();
+    });
+    try {
+      while (!cancelled) {
+        while (buf.length) {
+          const ev = buf.shift()!;
+          yield { type: 'event', event: ev };
+        }
+        if (cancelled) break;
+        await new Promise<void>((resolve) => { wake = resolve; });
+      }
+    } finally {
+      try { unsub(); } catch { /* ignore */ }
+      try { signal.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
     }
   },
 

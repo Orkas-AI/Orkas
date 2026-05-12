@@ -4204,6 +4204,22 @@ body.model-not-configured .main-content { flex-direction: column; }
   overflow: auto;
 }
 
+/* KB todo list — interactive checkboxes inside the read-mode markdown view.
+   `renderMarkdown` already emits `<li class="task-item"><input type=checkbox>
+   …</li>`; contexts.js layers click handling + the `is-done` toggle on top. */
+.ctx-viewer-md li.task-item { list-style: none; margin-left: -16px; }
+.ctx-viewer-md li.task-item input[type="checkbox"] {
+  margin-right: 6px;
+  vertical-align: middle;
+}
+.ctx-viewer-md li.task-item input[type="checkbox"]:not([disabled]) {
+  cursor: pointer;
+}
+.ctx-viewer-md li.task-item.is-done {
+  color: var(--muted, #94a3b8);
+  text-decoration: line-through;
+}
+
 /* ─── Agents ─── */
 .agents-container {
   flex: 1;
@@ -5930,3 +5946,145 @@ body.model-not-configured .main-content { flex-direction: column; }
    the dropdown from spanning the entire body. */
 .agents-detail-runtime { display: block; }
 .agents-detail-runtime-select { max-width: 280px; }
+
+/* ─── Scheduled-tasks dialog (modules/agent-schedule.js) ─────────────── */
+.agent-schedule-dialog { min-width: 480px; max-width: 560px; }
+.agent-schedule-title { margin-bottom: 12px; }
+.agent-schedule-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.agent-schedule-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+.agent-schedule-empty {
+  padding: 18px 0;
+  text-align: center;
+}
+.agent-schedule-row {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: #fafafa;
+}
+.agent-schedule-row.is-disabled { opacity: 0.55; }
+.agent-schedule-row-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.agent-schedule-row-toggle {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+}
+.agent-schedule-row-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.agent-schedule-row-summary {
+  font-size: 13px;
+  font-weight: 600;
+}
+.agent-schedule-row-title {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-schedule-row-lastrun {
+  font-size: 11px;
+  margin-top: 4px;
+}
+.agent-schedule-row-input {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text);
+  background: #fff;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.agent-schedule-row-actions {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.agent-schedule-actions-row {
+  display: flex;
+  justify-content: flex-start;
+}
+
+.agent-schedule-form {
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+  margin-top: 4px;
+}
+.agent-schedule-form input[type="number"],
+.agent-schedule-form input[type="time"],
+.agent-schedule-form input[type="text"],
+.agent-schedule-form textarea {
+  width: 100%;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 14px;
+  font-family: inherit;
+  color: var(--text);
+  background: #fafafa;
+  box-sizing: border-box;
+}
+.agent-schedule-form input:focus,
+.agent-schedule-form textarea:focus {
+  outline: none;
+  border-color: var(--primary);
+  background-color: #fff;
+}
+.agent-schedule-interval-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.agent-schedule-interval-input { max-width: 120px; }
+.agent-schedule-time-input { max-width: 160px; }
+.agent-schedule-type-select { max-width: 220px; }
+
+.agent-schedule-weekdays {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.agent-schedule-weekday-chip {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: #fafafa;
+  color: var(--text);
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+.agent-schedule-weekday-chip:hover { border-color: #cbd5e1; }
+.agent-schedule-weekday-chip.is-on {
+  background: #eef2ff;
+  border-color: #c7d2fe;
+  color: #3730a3;
+}
+.agent-schedule-enabled-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500 !important;
+  margin-bottom: 0 !important;
+}

@@ -344,6 +344,10 @@ function _renderAgentRowMenuItems(menu, agentId) {
   if (canEdit) {
     items.push(`<div class="agent-row-menu-item" data-action="edit">${escapeHtml(t('agents.edit'))}</div>`);
   }
+  // Scheduled tasks: available for every agent (custom + builtin) — a
+  // schedule is a user-orchestration concern that only references the
+  // agent and doesn't mutate its spec.
+  items.push(`<div class="agent-row-menu-item" data-action="schedule">${escapeHtml(t('agents.schedule.menu'))}</div>`);
   items.push(`<div class="agent-row-menu-item" data-action="toggle-enabled">${escapeHtml(toggleLabel)}</div>`);
   if (canEdit) {
     items.push(`<div class="agent-row-menu-item is-danger" data-action="delete">${escapeHtml(t('agents.delete'))}</div>`);
@@ -364,6 +368,8 @@ function _renderAgentRowMenuItems(menu, agentId) {
         await deleteSelectedAgent();
       } else if (action === 'toggle-enabled') {
         await _flipAgentEnabledFromMenu(aid);
+      } else if (action === 'schedule') {
+        if (typeof openAgentScheduleDialog === 'function') await openAgentScheduleDialog(aid);
       }
     });
   }

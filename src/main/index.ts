@@ -102,6 +102,7 @@ import * as searchFeature from './features/search';
 import * as authFeature from './features/auth';
 import * as appConfig from './features/config';
 import * as reflectionTrigger from './features/reflection-trigger';
+import * as scheduledTasks from './features/scheduled_tasks';
 import * as chatAttachments from './features/chat_attachments';
 
 function createWindow(): BrowserWindow {
@@ -561,6 +562,12 @@ if (!gotLock) {
         reflectLog.error('startup reflection batch failed', { error: err?.message || String(err) });
       });
     }, reflectionTrigger.STARTUP_DELAY_MS);
+
+    // Background: scheduled-agent-tasks tick (every 30s). Reads
+    // <uid>/cloud/config/scheduled_tasks.json on each tick and dispatches
+    // due tasks through the same bus entry point a manual run takes
+    // (chats.createConversation + groupChat.send). Idempotent.
+    scheduledTasks.startScheduler();
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();

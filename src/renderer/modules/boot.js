@@ -18,6 +18,12 @@ async function bootApp() {
   // Warm the commander avatar cache so the first chat render doesn't fall
   // back to the default for a frame.
   if (typeof _ensureCommanderAvatarLoaded === 'function') _ensureCommanderAvatarLoaded();
+  // Long-lived subscription to scheduled-task fires (main pushes
+  // `conv_created` whenever a tick dispatches an agent); renderer reloads
+  // its conv list. Fire-and-forget: stream owns its own lifetime.
+  if (typeof startScheduledTaskEventsSubscription === 'function') {
+    startScheduledTaskEventsSubscription();
+  }
   _stampSettingsVersion();
   _restoreLastView();
 }
