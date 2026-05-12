@@ -469,6 +469,7 @@ function _ctxMenuItemsFor(kind, relPath) {
   if (kind === 'root') {
     return [
       { action: 'new_text',   label: t('contexts.menu.new_text') },
+      { action: 'new_todo',   label: t('contexts.menu.new_todo') },
       { action: 'new_folder', label: t('contexts.menu.new_folder') },
       { action: 'upload',     label: t('contexts.menu.upload') },
     ];
@@ -476,6 +477,7 @@ function _ctxMenuItemsFor(kind, relPath) {
   if (kind === 'dir') {
     return [
       { action: 'new_text',   label: t('contexts.menu.new_text') },
+      { action: 'new_todo',   label: t('contexts.menu.new_todo') },
       { action: 'new_folder', label: t('contexts.menu.new_folder') },
       { action: 'upload',     label: t('contexts.menu.upload') },
       { action: 'rename',     label: t('contexts.menu.rename') },
@@ -494,9 +496,10 @@ function _ctxMenuItemsFor(kind, relPath) {
 }
 
 async function _runCtxMenuAction(action, kind, relPath) {
-  const dirArg = kind === 'root' ? '' : relPath;  // for new_text / new_folder / upload
+  const dirArg = kind === 'root' ? '' : relPath;  // for new_text / new_todo / new_folder / upload
   switch (action) {
     case 'new_text':   return createCtxNewTextFile(dirArg);
+    case 'new_todo':   return createCtxNewTodoFile(dirArg);
     case 'new_folder': return promptCtxNewInDir(dirArg);
     case 'upload': {
       const input = document.getElementById('ctx-file-input');
@@ -651,6 +654,39 @@ async function createCtxNewTextFile(parentDir = '') {
     // + Save/Cancel actions). `_ctxPendingRename` will be consumed by the
     // next renderCtxTree() call.
     _showCtxTextViewer(fullPath, '');
+    _enterCtxEdit();
+  } catch (e) {
+    await uiAlert(t('contexts.network_error', { reason: e.message || e }));
+  }
+}
+
+// "+ todo list" handler — mirrors `createCtxNewTextFile` but seeds the file
+// with a minimal task-list template so the user lands on something usable.
+// Stored as plain .md (GitHub-style `- [ ]` syntax) — interactive checkbox
+// behavior is layered on by the KB viewer; the file itself stays portable
+// and indexable like any other md note.
+async function createCtxNewTodoFile(parentDir = '') {
+  const stemBase = t('contexts.new.todo_stem') || 'todo list';
+  const siblings = _ctxListChildren(parentDir).map(n => n.name);
+  let stem = stemBase;
+  let i = 2;
+  while (siblings.includes(`${stem}.md`)) { stem = `${stemBase} ${i++}`; }
+  const name = `${stem}.md`;
+  const fullPath = parentDir ? `${parentDir}/${name}` : name;
+  const heading = t('contexts.new.todo_template_heading') || 'Todo';
+  const template = `# ${heading}\n\n- [ ] \n- [ ] \n- [ ] \n`;
+  try {
+    const res = await apiFetch('/api/contexts/write', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: fullPath, content: template }),
+    });
+    const data = await res.json();
+    if (!data.ok) { await uiAlert(data.error || t('contexts.file.create_failed')); return; }
+    if (parentDir) _ctxExpanded.add(parentDir);
+    _ctxPendingRename = { path: fullPath };
+    await loadContexts();
+    _showCtxTextViewer(fullPath, template);
     _enterCtxEdit();
   } catch (e) {
     await uiAlert(t('contexts.network_error', { reason: e.message || e }));
@@ -961,6 +997,11 @@ function _renderCtxViewerMd(bodyEl, actionsEl) {
   actionsEl = actionsEl || document.getElementById('contexts-viewer-actions');
   const content = _ctxActive.content || '';
   bodyEl.innerHTML = `<div class="ctx-viewer-md markdown-body">${renderMarkdown(content)}</div>`;
+  // After md render, walk the emitted `.task-item` checkboxes (renderMarkdown
+  // emits them `disabled`) and wire them up to write back to the file. Order
+  // of `.task-item` lis in DOM matches the order of `^(\s*)- \[( |x|X)\] `
+  // lines in source by construction (renderMarkdown does not reorder).
+  _ctxBindTaskCheckboxes(bodyEl);
   actionsEl.innerHTML = `
     <button class="btn btn-sm" id="ctx-viewer-edit">${escapeHtml(t('contexts.viewer.edit'))}</button>
     <button class="btn btn-sm" id="ctx-viewer-reveal">${escapeHtml(t('contexts.viewer.open_system'))}</button>
@@ -969,6 +1010,67 @@ function _renderCtxViewerMd(bodyEl, actionsEl) {
   actionsEl.querySelector('#ctx-viewer-edit').addEventListener('click', _enterCtxEdit);
   actionsEl.querySelector('#ctx-viewer-reveal').addEventListener('click', () => revealCtxFile(_ctxActive.id));
   actionsEl.querySelector('#ctx-viewer-del').addEventListener('click', _deleteCtxFromViewer);
+}
+
+// Regex shared by checkbox-binding (preview side) and the editor's Todo
+// toolbar button. Captures: 1=indent, 2=mark ( /x/X), 3=rest of line.
+const _CTX_TODO_LINE_RE = /^(\s*)- \[( |x|X)\] (.*)$/;
+
+// Scan source content for task-list lines. Returns `[{ lineIdx, checked }, ...]`
+// in source order. The Nth entry corresponds to the Nth `.task-item` in the
+// rendered DOM (renderMarkdown preserves source order for list items).
+function _ctxScanTaskLines(content) {
+  const lines = content.split('\n');
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(_CTX_TODO_LINE_RE);
+    if (m) out.push({ lineIdx: i, checked: m[2].toLowerCase() === 'x' });
+  }
+  return out;
+}
+
+function _ctxBindTaskCheckboxes(rootEl) {
+  if (!rootEl || !_ctxActive) return;
+  const tasks = _ctxScanTaskLines(_ctxActive.content || '');
+  const boxes = rootEl.querySelectorAll('.task-item input[type="checkbox"]');
+  // Defensive: if the two counts diverge (e.g., user has malformed markdown
+  // that renderMarkdown rescued differently), bail out rather than mis-wire.
+  if (boxes.length !== tasks.length) return;
+  boxes.forEach((box, i) => {
+    box.removeAttribute('disabled');
+    const li = box.closest('li.task-item');
+    if (tasks[i].checked && li) li.classList.add('is-done');
+    box.addEventListener('change', () => _ctxToggleTask(tasks[i].lineIdx, li, box));
+  });
+}
+
+async function _ctxToggleTask(lineIdx, liEl, boxEl) {
+  if (!_ctxActive) return;
+  const lines = (_ctxActive.content || '').split('\n');
+  const m = (lines[lineIdx] || '').match(_CTX_TODO_LINE_RE);
+  if (!m) return;
+  const wasChecked = m[2].toLowerCase() === 'x';
+  const nextMark = wasChecked ? ' ' : 'x';
+  lines[lineIdx] = `${m[1]}- [${nextMark}] ${m[3]}`;
+  const next = lines.join('\n');
+  // Optimistic UI — flip the `is-done` style + the box state immediately;
+  // revert if the save round-trip fails.
+  if (liEl) liEl.classList.toggle('is-done', !wasChecked);
+  if (boxEl) boxEl.checked = !wasChecked;
+  try {
+    const res = await apiFetch('/api/contexts/update', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: _ctxActive.id, content: next }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || 'save_failed');
+    _ctxActive.content = next;
+  } catch (e) {
+    if (liEl) liEl.classList.toggle('is-done', wasChecked);
+    if (boxEl) boxEl.checked = wasChecked;
+    await uiAlert(t('contexts.todo.save_failed', { reason: e.message || e }));
+  }
 }
 
 // Editor mode = textarea + markdown toolbar; preview mode = renderMarkdown of
@@ -999,6 +1101,8 @@ const _CTX_EDITOR_TOOLBAR = [
   { kind: 'sep' },
   { kind: 'link', icon: '↗', label: 'contexts.editor.tb.link' },
   { kind: 'image', icon: '▣', label: 'contexts.editor.tb.image' },
+  { kind: 'sep' },
+  { kind: 'todo', icon: '☐', label: 'contexts.editor.tb.todo' },
 ];
 
 function _enterCtxEdit() {
@@ -1150,6 +1254,44 @@ function _ctxApplyHeading(ta, level) {
   _ctxReplaceRange(ta, lineStart, lineEnd, rebuilt, lineStart, lineStart + rebuilt.length);
 }
 
+// Todo three-state cycle (line-batch). The first non-empty selected line
+// decides the target state for the whole batch:
+//   - `- [ ] foo`  → `- [x] foo`        (mark batch as done)
+//   - `- [x] foo`  → `foo`              (strip todo prefix entirely)
+//   - anything else → `- [ ] foo`        (turn into a todo; first strips any
+//                                         existing `- ` bullet so `- foo`
+//                                         doesn't become `- [ ] - foo`)
+function _ctxApplyTodo(ta) {
+  const value = ta.value;
+  const { lineStart, lineEnd } = _ctxLineSpan(value, ta.selectionStart, ta.selectionEnd);
+  const block = value.slice(lineStart, lineEnd);
+  const lines = block.split('\n');
+  const placeholder = t('contexts.editor.placeholder.todo') || 'task';
+  // Pick the mode from the first non-empty line.
+  const firstNonEmpty = lines.find(l => l.trim().length > 0) || '';
+  let mode;
+  if (/^(\s*)- \[ \] /.test(firstNonEmpty)) mode = 'check';
+  else if (/^(\s*)- \[[xX]\] /.test(firstNonEmpty)) mode = 'strip';
+  else mode = 'mark';
+  const rebuilt = lines.map(line => {
+    if (line.trim().length === 0) return line;
+    const indent = (line.match(/^(\s*)/) || ['', ''])[1];
+    const rest = line.slice(indent.length);
+    if (mode === 'check') {
+      const m = rest.match(/^- \[ \] (.*)$/);
+      return m ? `${indent}- [x] ${m[1]}` : line;
+    }
+    if (mode === 'strip') {
+      return `${indent}${rest.replace(/^- \[[ xX]\] /, '')}`;
+    }
+    // mode === 'mark': turn the line into a todo. Drop any existing bullet
+    // prefix (`- ` / `* ` / `+ ` / `1. `) so we don't double up.
+    const body = rest.replace(/^([-*+]|\d+\.) +/, '') || placeholder;
+    return `${indent}- [ ] ${body}`;
+  }).join('\n');
+  _ctxReplaceRange(ta, lineStart, lineEnd, rebuilt, lineStart, lineStart + rebuilt.length);
+}
+
 // Line-prefix ops: apply `prefix(idx)` to each selected line (or the caret
 // line); toggle off if every line already carries the same prefix.
 function _ctxLinePrefix(ta, prefixFn) {
@@ -1197,6 +1339,7 @@ function _ctxApplyMd(ta, kind) {
     case 'quote':     return _ctxLinePrefix(ta, () => '> ');
     case 'ul':        return _ctxLinePrefix(ta, () => '- ');
     case 'ol':        return _ctxLinePrefix(ta, (i) => `${i + 1}. `);
+    case 'todo':      return _ctxApplyTodo(ta);
     case 'codeblock': {
       const start = ta.selectionStart, end = ta.selectionEnd;
       const sel = ta.value.slice(start, end);
