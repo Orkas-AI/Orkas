@@ -4133,7 +4133,7 @@ body.model-not-configured .main-content { flex-direction: column; }
 
 .ctx-viewer-editor {
   width: 100%;
-  min-height: 420px;
+  min-height: 380px;
   height: 100%;
   box-sizing: border-box;
   padding: 14px 16px;
@@ -4149,6 +4149,59 @@ body.model-not-configured .main-content { flex-direction: column; }
 .ctx-viewer-editor:focus {
   border-color: var(--primary, #3b82f6);
   box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.12);
+}
+
+/* KB new-text markdown editor — toolbar above the textarea / preview */
+.ctx-editor-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 8px;
+  margin-bottom: 8px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.ctx-editor-toolbar .btn-icon {
+  min-width: 30px;
+  height: 28px;
+  padding: 0 8px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, monospace;
+  font-size: 12px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.ctx-editor-toolbar .btn-icon.is-bold { font-weight: 700; }
+.ctx-editor-toolbar .btn-icon.is-italic { font-style: italic; }
+.ctx-editor-toolbar .btn-icon.is-strike { text-decoration: line-through; }
+.ctx-editor-toolbar .btn-icon[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.ctx-editor-toolbar-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--border);
+  margin: 0 4px;
+}
+.ctx-editor-toolbar-spacer { flex: 1; }
+.ctx-editor-toggle { font-size: 12px; }
+.ctx-editor-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 380px;
+}
+.ctx-editor-body .ctx-viewer-editor { flex: 1; }
+.ctx-editor-preview {
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  padding: 14px 16px;
+  background: #fff;
+  min-height: 380px;
+  overflow: auto;
 }
 
 /* ─── Agents ─── */

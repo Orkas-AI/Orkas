@@ -971,26 +971,363 @@ function _renderCtxViewerMd(bodyEl, actionsEl) {
   actionsEl.querySelector('#ctx-viewer-del').addEventListener('click', _deleteCtxFromViewer);
 }
 
+// Editor mode = textarea + markdown toolbar; preview mode = renderMarkdown of
+// the current draft. The draft is only persisted to disk on Save — the
+// in-memory _ctxActive.content stays at the last-saved value, so Cancel can
+// revert without re-fetch.
+let _ctxEditPreview = false;
+let _ctxEditDraft = '';
+
+// Toolbar definition. `kind` keys map to `_ctxApplyMd()` cases; `icon` uses
+// Unicode glyphs only (CLAUDE.md §8 — no colored emoji on process-info-style
+// rails); `label` is the i18n key for the title tooltip.
+const _CTX_EDITOR_TOOLBAR = [
+  { kind: 'h1', icon: 'H1', label: 'contexts.editor.tb.h1' },
+  { kind: 'h2', icon: 'H2', label: 'contexts.editor.tb.h2' },
+  { kind: 'h3', icon: 'H3', label: 'contexts.editor.tb.h3' },
+  { kind: 'sep' },
+  { kind: 'bold', icon: 'B', label: 'contexts.editor.tb.bold', cls: 'is-bold' },
+  { kind: 'italic', icon: 'I', label: 'contexts.editor.tb.italic', cls: 'is-italic' },
+  { kind: 'strike', icon: 'S', label: 'contexts.editor.tb.strike', cls: 'is-strike' },
+  { kind: 'sep' },
+  { kind: 'ul', icon: '•', label: 'contexts.editor.tb.ul' },
+  { kind: 'ol', icon: '1.', label: 'contexts.editor.tb.ol' },
+  { kind: 'quote', icon: '“', label: 'contexts.editor.tb.quote' },
+  { kind: 'sep' },
+  { kind: 'code', icon: '<>', label: 'contexts.editor.tb.code' },
+  { kind: 'codeblock', icon: '{ }', label: 'contexts.editor.tb.codeblock' },
+  { kind: 'sep' },
+  { kind: 'link', icon: '↗', label: 'contexts.editor.tb.link' },
+  { kind: 'image', icon: '▣', label: 'contexts.editor.tb.image' },
+];
+
 function _enterCtxEdit() {
   if (!_ctxActive) return;
+  _ctxEditPreview = false;
+  _ctxEditDraft = _ctxActive.content || '';
+  _ctxRenderEditor();
+}
+
+function _ctxRenderEditor() {
   const bodyEl = document.getElementById('contexts-viewer-body');
   const actionsEl = document.getElementById('contexts-viewer-actions');
-  const content = _ctxActive.content || '';
-  bodyEl.innerHTML = `<textarea class="ctx-viewer-editor" id="ctx-viewer-textarea" spellcheck="false">${escapeHtml(content)}</textarea>`;
+  if (!bodyEl || !actionsEl) return;
+  const toolbarHtml = _CTX_EDITOR_TOOLBAR.map(item => {
+    if (item.kind === 'sep') return `<span class="ctx-editor-toolbar-sep" aria-hidden="true"></span>`;
+    const disabled = _ctxEditPreview ? 'disabled' : '';
+    const extraCls = item.cls ? ` ${item.cls}` : '';
+    return `<button type="button" class="btn btn-sm btn-icon ctx-editor-tb-btn${extraCls}" data-kind="${item.kind}" title="${escapeHtml(t(item.label))}" ${disabled}>${escapeHtml(item.icon)}</button>`;
+  }).join('');
+  const toggleKey = _ctxEditPreview ? 'contexts.editor.tb.edit_back' : 'contexts.editor.tb.preview';
+  const toggleIcon = _ctxEditPreview ? '✎' : '◐';
+  const draft = _ctxEditDraft;
+  const bodyHtml = _ctxEditPreview
+    ? `<div class="ctx-viewer-md markdown-body ctx-editor-preview">${draft.trim() ? renderMarkdown(draft) : `<div class="ctx-viewer-msg">${escapeHtml(t('contexts.editor.preview_empty'))}</div>`}</div>`
+    : `<textarea class="ctx-viewer-editor" id="ctx-viewer-textarea" spellcheck="false">${escapeHtml(draft)}</textarea>`;
+  bodyEl.innerHTML = `
+    <div class="ctx-editor-toolbar" role="toolbar">
+      ${toolbarHtml}
+      <span class="ctx-editor-toolbar-spacer"></span>
+      <button type="button" class="btn btn-sm ctx-editor-toggle" id="ctx-editor-toggle" title="${escapeHtml(t(toggleKey))}">${toggleIcon} ${escapeHtml(t(toggleKey))}</button>
+    </div>
+    <div class="ctx-editor-body">${bodyHtml}</div>
+  `;
   actionsEl.innerHTML = `
     <button class="btn btn-sm btn-primary" id="ctx-viewer-save">${escapeHtml(t('contexts.viewer.save'))}</button>
     <button class="btn btn-sm" id="ctx-viewer-cancel">${escapeHtml(t('contexts.viewer.cancel'))}</button>
   `;
   actionsEl.querySelector('#ctx-viewer-save').addEventListener('click', _saveCtxEdit);
-  actionsEl.querySelector('#ctx-viewer-cancel').addEventListener('click', () => _renderCtxViewerMd());
-  document.getElementById('ctx-viewer-textarea')?.focus();
+  actionsEl.querySelector('#ctx-viewer-cancel').addEventListener('click', () => {
+    _ctxEditPreview = false;
+    _ctxEditDraft = '';
+    _renderCtxViewerMd();
+  });
+  bodyEl.querySelector('#ctx-editor-toggle').addEventListener('click', _ctxTogglePreview);
+  bodyEl.querySelectorAll('.ctx-editor-tb-btn').forEach(btn => {
+    btn.addEventListener('mousedown', (e) => {
+      // Prevent the textarea from losing focus on click (otherwise the cursor
+      // position is lost and the inserted snippet lands at the end).
+      e.preventDefault();
+    });
+    btn.addEventListener('click', () => {
+      if (_ctxEditPreview) return;
+      const ta = document.getElementById('ctx-viewer-textarea');
+      if (!ta) return;
+      _ctxApplyMd(ta, btn.dataset.kind);
+    });
+  });
+  const ta = bodyEl.querySelector('#ctx-viewer-textarea');
+  if (ta) {
+    ta.addEventListener('keydown', (e) => _ctxOnKey(ta, e));
+    ta.addEventListener('input', () => { _ctxEditDraft = ta.value; });
+    ta.focus();
+  }
+}
+
+function _ctxTogglePreview() {
+  const ta = document.getElementById('ctx-viewer-textarea');
+  if (ta) _ctxEditDraft = ta.value;
+  _ctxEditPreview = !_ctxEditPreview;
+  _ctxRenderEditor();
+}
+
+// Wrap-style ops toggle: if the selection is already wrapped with `mark`,
+// unwrap it; otherwise insert the wrap (with the placeholder pre-selected
+// when the selection is empty).
+function _ctxWrapSelection(ta, mark, placeholder) {
+  const start = ta.selectionStart;
+  let end = ta.selectionEnd;
+  const value = ta.value;
+  // Trailing-newline clamp: when a user "selects a line" (triple-click /
+  // Shift+Down) the selection often includes the trailing `\n`. Wrapping
+  // that range would emit `**Hello\n**`, leaving the closing mark stranded
+  // on the next line.
+  while (end > start && value[end - 1] === '\n') end -= 1;
+  const sel = value.slice(start, end);
+  const before = value.slice(0, start);
+  const after = value.slice(end);
+  const markLen = mark.length;
+  // Unwrap if the selection itself is wrapped, OR if the wrap marks are
+  // immediately around the selection.
+  if (sel.startsWith(mark) && sel.endsWith(mark) && sel.length >= markLen * 2) {
+    const inner = sel.slice(markLen, sel.length - markLen);
+    _ctxReplaceRange(ta, start, end, inner, start, start + inner.length);
+    return;
+  }
+  if (
+    before.endsWith(mark) &&
+    after.startsWith(mark)
+  ) {
+    const newStart = start - markLen;
+    const newEnd = end + markLen;
+    _ctxReplaceRange(ta, newStart, newEnd, sel, newStart, newStart + sel.length);
+    return;
+  }
+  const inner = sel || placeholder;
+  const wrapped = `${mark}${inner}${mark}`;
+  // If the selection was empty, leave the caret in the middle so the
+  // placeholder is selected — the next keystroke replaces it.
+  const innerStart = start + markLen;
+  const innerEnd = innerStart + inner.length;
+  _ctxReplaceRange(ta, start, end, wrapped, innerStart, innerEnd);
+}
+
+// Compute the line span (lineStart..lineEnd) covered by the current selection.
+// **Trailing-newline clamp**: if the selection ends right after a `\n`, treat
+// the selection as ending at the position before that `\n`. Without this,
+// double-clicking / triple-clicking / Shift+Down to select a single line
+// (which on most platforms grabs the trailing newline too) makes
+// `indexOf('\n', selEnd)` find the NEXT line's terminator and the operation
+// silently affects the line below.
+function _ctxLineSpan(value, selStart, selEnd) {
+  let effEnd = selEnd;
+  if (effEnd > selStart && value[effEnd - 1] === '\n') effEnd -= 1;
+  const lineStart = value.lastIndexOf('\n', selStart - 1) + 1;
+  let lineEnd = value.indexOf('\n', effEnd);
+  if (lineEnd === -1) lineEnd = value.length;
+  return { lineStart, lineEnd };
+}
+
+// Heading op: replace any existing `^#+ ` prefix with the target level, or
+// strip the prefix entirely if every line is already at the target level.
+// Without this, applying H2 to a line that's already H1 would prepend a
+// second `## ` and produce `## # Hello`.
+function _ctxApplyHeading(ta, level) {
+  const target = '#'.repeat(level) + ' ';
+  const value = ta.value;
+  const { lineStart, lineEnd } = _ctxLineSpan(value, ta.selectionStart, ta.selectionEnd);
+  const block = value.slice(lineStart, lineEnd);
+  const lines = block.split('\n');
+  const stripHeading = (line) => line.replace(/^#{1,6} /, '');
+  const isTarget = (line) => line === '' || line.startsWith(target);
+  // Toggle: every line already at this level → strip headings entirely.
+  if (lines.every(isTarget)) {
+    const rebuilt = lines.map(stripHeading).join('\n');
+    _ctxReplaceRange(ta, lineStart, lineEnd, rebuilt, lineStart, lineStart + rebuilt.length);
+    return;
+  }
+  const rebuilt = lines.map(line => line === '' ? line : `${target}${stripHeading(line)}`).join('\n');
+  _ctxReplaceRange(ta, lineStart, lineEnd, rebuilt, lineStart, lineStart + rebuilt.length);
+}
+
+// Line-prefix ops: apply `prefix(idx)` to each selected line (or the caret
+// line); toggle off if every line already carries the same prefix.
+function _ctxLinePrefix(ta, prefixFn) {
+  const value = ta.value;
+  const { lineStart, lineEnd } = _ctxLineSpan(value, ta.selectionStart, ta.selectionEnd);
+  const block = value.slice(lineStart, lineEnd);
+  const lines = block.split('\n');
+  // Toggle: if every non-empty line starts with the prefix (idx 0), strip it.
+  const firstPrefix = prefixFn(0);
+  const allMatch = lines.every(line => line.length === 0 || line.startsWith(firstPrefix));
+  let rebuilt;
+  if (allMatch && firstPrefix) {
+    rebuilt = lines.map(line => line.startsWith(firstPrefix) ? line.slice(firstPrefix.length) : line).join('\n');
+  } else {
+    rebuilt = lines.map((line, idx) => `${prefixFn(idx)}${line}`).join('\n');
+  }
+  _ctxReplaceRange(ta, lineStart, lineEnd, rebuilt, lineStart, lineStart + rebuilt.length);
+}
+
+// Drop-in block insert (codeblock / link / image).
+function _ctxInsertBlock(ta, opts) {
+  const { text, selStart, selEnd } = opts;
+  const start = ta.selectionStart;
+  const end = ta.selectionEnd;
+  _ctxReplaceRange(ta, start, end, text, start + selStart, start + selEnd);
+}
+
+function _ctxReplaceRange(ta, from, to, replacement, newSelStart, newSelEnd) {
+  ta.setRangeText(replacement, from, to, 'preserve');
+  ta.selectionStart = newSelStart;
+  ta.selectionEnd = newSelEnd;
+  _ctxEditDraft = ta.value;
+  ta.focus();
+}
+
+function _ctxApplyMd(ta, kind) {
+  switch (kind) {
+    case 'bold':      return _ctxWrapSelection(ta, '**', t('contexts.editor.placeholder.bold'));
+    case 'italic':    return _ctxWrapSelection(ta, '*',  t('contexts.editor.placeholder.italic'));
+    case 'strike':    return _ctxWrapSelection(ta, '~~', t('contexts.editor.placeholder.strike'));
+    case 'code':      return _ctxWrapSelection(ta, '`',  t('contexts.editor.placeholder.code'));
+    case 'h1':        return _ctxApplyHeading(ta, 1);
+    case 'h2':        return _ctxApplyHeading(ta, 2);
+    case 'h3':        return _ctxApplyHeading(ta, 3);
+    case 'quote':     return _ctxLinePrefix(ta, () => '> ');
+    case 'ul':        return _ctxLinePrefix(ta, () => '- ');
+    case 'ol':        return _ctxLinePrefix(ta, (i) => `${i + 1}. `);
+    case 'codeblock': {
+      const start = ta.selectionStart, end = ta.selectionEnd;
+      const sel = ta.value.slice(start, end);
+      const body = sel || t('contexts.editor.placeholder.code');
+      // Ensure surrounding blank lines when the caret is mid-paragraph.
+      const before = ta.value.slice(0, start);
+      const after = ta.value.slice(end);
+      const leadNl = before.length === 0 || before.endsWith('\n\n') ? '' : (before.endsWith('\n') ? '\n' : '\n\n');
+      const tailNl = after.length === 0 || after.startsWith('\n\n') ? '' : (after.startsWith('\n') ? '\n' : '\n\n');
+      const text = `${leadNl}\`\`\`\n${body}\n\`\`\`${tailNl}`;
+      const innerStart = start + leadNl.length + 4; // after ```\n
+      const innerEnd = innerStart + body.length;
+      return _ctxInsertBlock(ta, { text, selStart: innerStart - start, selEnd: innerEnd - start });
+    }
+    case 'link': {
+      const start = ta.selectionStart, end = ta.selectionEnd;
+      const sel = ta.value.slice(start, end);
+      const linkText = sel || t('contexts.editor.placeholder.link_text');
+      const url = t('contexts.editor.placeholder.link_url');
+      const text = `[${linkText}](${url})`;
+      // Select the URL placeholder so the user can paste / type their URL.
+      const urlStart = 1 + linkText.length + 2; // after "[text]("
+      const urlEnd = urlStart + url.length;
+      return _ctxInsertBlock(ta, { text, selStart: urlStart, selEnd: urlEnd });
+    }
+    case 'image': {
+      const start = ta.selectionStart, end = ta.selectionEnd;
+      const sel = ta.value.slice(start, end);
+      const alt = sel || t('contexts.editor.placeholder.image_alt');
+      const url = t('contexts.editor.placeholder.image_url');
+      const text = `![${alt}](${url})`;
+      const urlStart = 2 + alt.length + 2;
+      const urlEnd = urlStart + url.length;
+      return _ctxInsertBlock(ta, { text, selStart: urlStart, selEnd: urlEnd });
+    }
+  }
+}
+
+// Strip a leading list/quote marker; return null if the line isn't a list line.
+function _ctxParseListPrefix(line) {
+  const m = line.match(/^(\s*)([-*+]|\d+\.)(\s+)/);
+  if (!m) return null;
+  return { indent: m[1], marker: m[2], gap: m[3], total: m[0] };
+}
+
+function _ctxOnKey(ta, e) {
+  // IME composition guard (CLAUDE.md §8) — Chinese / Japanese / Korean Enter
+  // commits a candidate; don't fire shortcuts or list-continuation while a
+  // composition is active.
+  if (e.isComposing || e.keyCode === 229) return;
+
+  const mod = e.metaKey || e.ctrlKey;
+  if (mod && !e.shiftKey && !e.altKey) {
+    const k = (e.key || '').toLowerCase();
+    if (k === 'b') { e.preventDefault(); return _ctxApplyMd(ta, 'bold'); }
+    if (k === 'i') { e.preventDefault(); return _ctxApplyMd(ta, 'italic'); }
+    if (k === 'k') { e.preventDefault(); return _ctxApplyMd(ta, 'link'); }
+    if (k === 's') { e.preventDefault(); return _saveCtxEdit(); }
+  }
+
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    const value = ta.value;
+    const multiLine = value.slice(start, end).includes('\n');
+    if (multiLine) {
+      // Use the same trailing-newline-clamped span as the toolbar line ops,
+      // so selecting "row1\nrow2\n" doesn't drag row3's leading column into
+      // the indent batch.
+      const { lineStart, lineEnd } = _ctxLineSpan(value, start, end);
+      const block = value.slice(lineStart, lineEnd);
+      const lines = block.split('\n');
+      let rebuilt;
+      if (e.shiftKey) {
+        rebuilt = lines.map(l => l.replace(/^( {1,2}|\t)/, '')).join('\n');
+      } else {
+        rebuilt = lines.map(l => `  ${l}`).join('\n');
+      }
+      _ctxReplaceRange(ta, lineStart, lineEnd, rebuilt, lineStart, lineStart + rebuilt.length);
+      return;
+    }
+    if (e.shiftKey) {
+      const lineStart = value.lastIndexOf('\n', start - 1) + 1;
+      const head = value.slice(lineStart, lineStart + 2);
+      const strip = head === '  ' ? 2 : (head[0] === '\t' ? 1 : 0);
+      if (strip) {
+        const newStart = Math.max(lineStart, start - strip);
+        _ctxReplaceRange(ta, lineStart, lineStart + strip, '', newStart, Math.max(newStart, end - strip));
+      }
+      return;
+    }
+    _ctxReplaceRange(ta, start, end, '  ', start + 2, start + 2);
+    return;
+  }
+
+  if (e.key === 'Enter') {
+    const value = ta.value;
+    const start = ta.selectionStart;
+    const end = ta.selectionEnd;
+    if (start !== end) return; // non-empty selection: default behavior (replace)
+    const lineStart = value.lastIndexOf('\n', start - 1) + 1;
+    const lineSoFar = value.slice(lineStart, start);
+    const parsed = _ctxParseListPrefix(lineSoFar);
+    if (!parsed) return;
+    // Empty list line → break out (remove the marker entirely).
+    if (lineSoFar === parsed.total) {
+      e.preventDefault();
+      _ctxReplaceRange(ta, lineStart, start, '', lineStart, lineStart);
+      return;
+    }
+    e.preventDefault();
+    let nextMarker = parsed.marker;
+    if (/^\d+\.$/.test(parsed.marker)) {
+      const n = parseInt(parsed.marker, 10);
+      nextMarker = `${n + 1}.`;
+    }
+    const insert = `\n${parsed.indent}${nextMarker}${parsed.gap}`;
+    _ctxReplaceRange(ta, start, start, insert, start + insert.length, start + insert.length);
+    return;
+  }
 }
 
 async function _saveCtxEdit() {
   if (!_ctxActive) return;
   const ta = document.getElementById('ctx-viewer-textarea');
-  if (!ta) return;
-  const next = ta.value;
+  // Textarea is only present in edit mode; preview mode saves from the draft
+  // captured at the toggle point. Always sync the textarea value into the
+  // draft first so the two paths converge.
+  if (ta) _ctxEditDraft = ta.value;
+  const next = _ctxEditDraft;
   try {
     const res = await apiFetch('/api/contexts/update', {
       method: 'PUT',
@@ -1000,6 +1337,8 @@ async function _saveCtxEdit() {
     const data = await res.json();
     if (!data.ok) { await uiAlert(data.error || t('contexts.save_failed')); return; }
     _ctxActive.content = next;
+    _ctxEditPreview = false;
+    _ctxEditDraft = '';
     _renderCtxViewerMd();
     await loadContexts();
   } catch (e) {
