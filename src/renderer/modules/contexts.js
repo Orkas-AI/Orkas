@@ -375,6 +375,13 @@ async function deleteCtxEntry(rel, kind) {
     if (_ctxActive && (_ctxActive.id === rel || _ctxActive.id.startsWith(rel + '/'))) {
       _clearCtxViewer();
     }
+    // Drop drafts under the deleted path (file or whole dir subtree); a
+    // stale draft pointing at a no-longer-existing file would silently
+    // re-create itself on the next click into a same-named freshly-made
+    // file.
+    for (const key of Array.from(_ctxDrafts.keys())) {
+      if (key === rel || key.startsWith(rel + '/')) _ctxDrafts.delete(key);
+    }
     await loadContexts();
   } catch (e) {
     await uiAlert(t('contexts.delete_failed_with', { reason: e.message || e }));
@@ -567,6 +574,18 @@ async function _commitInlineRename(rel, nextBase) {
     const data = await res.json();
     if (!data.ok) { await uiAlert(data.error || t('contexts.entry.rename_failed')); await loadContexts(); return; }
     if (_ctxActive && _ctxActive.id === rel) _ctxActive.id = dst;
+    // Re-key any drafts (file rename: one entry; dir rename: every entry
+    // under the old prefix) so the draft survives the rename. Iterate a
+    // snapshot since we're mutating the map.
+    for (const [key, val] of Array.from(_ctxDrafts.entries())) {
+      if (key === rel) {
+        _ctxDrafts.set(dst, val);
+        _ctxDrafts.delete(rel);
+      } else if (key.startsWith(rel + '/')) {
+        _ctxDrafts.set(dst + key.slice(rel.length), val);
+        _ctxDrafts.delete(key);
+      }
+    }
     await loadContexts();
   } catch (e) {
     await uiAlert(t('contexts.entry.rename_failed_with', { reason: e.message || e }));
@@ -945,7 +964,14 @@ function _showCtxTextViewer(rel, content) {
   const els = _prepCtxViewerShell(rel);
   if (!els) return;
   _ctxActive.content = content;
-  _renderCtxViewerMd(els.bodyEl, els.actionsEl);
+  if (_ctxDrafts.has(rel)) {
+    // There's an in-progress edit for this file from earlier in the
+    // session — restore it (textarea or preview, whichever the user was
+    // in) instead of dropping to read mode and clobbering the draft.
+    _enterCtxEdit();
+  } else {
+    _renderCtxViewerMd(els.bodyEl, els.actionsEl);
+  }
   els.bodyEl.scrollTop = 0;
 }
 
@@ -1079,6 +1105,22 @@ async function _ctxToggleTask(lineIdx, liEl, boxEl) {
 // revert without re-fetch.
 let _ctxEditPreview = false;
 let _ctxEditDraft = '';
+// Per-file in-progress edit state, keyed by relpath. Survives switching to
+// another KB file or to another sidebar tab — coming back to the file
+// restores edit mode + the unsaved draft instead of dropping to read mode.
+// Lifetime = renderer session (cleared on Save / Cancel / Delete; re-keyed
+// on Rename). Not persisted across app restarts.
+const _ctxDrafts = new Map();
+
+function _ctxStashDraft() {
+  if (!_ctxActive) return;
+  _ctxDrafts.set(_ctxActive.id, { content: _ctxEditDraft, isPreview: _ctxEditPreview });
+}
+
+function _ctxClearDraft(path) {
+  const key = path || (_ctxActive && _ctxActive.id);
+  if (key) _ctxDrafts.delete(key);
+}
 
 // Toolbar definition. `kind` keys map to `_ctxApplyMd()` cases; `icon` uses
 // Unicode glyphs only (CLAUDE.md §8 — no colored emoji on process-info-style
@@ -1107,8 +1149,20 @@ const _CTX_EDITOR_TOOLBAR = [
 
 function _enterCtxEdit() {
   if (!_ctxActive) return;
-  _ctxEditPreview = false;
-  _ctxEditDraft = _ctxActive.content || '';
+  const draft = _ctxDrafts.get(_ctxActive.id);
+  if (draft) {
+    // Returning to a file we were editing — restore the unsaved draft +
+    // whichever sub-mode (textarea vs preview) the user was in.
+    _ctxEditPreview = !!draft.isPreview;
+    _ctxEditDraft = draft.content || '';
+  } else {
+    _ctxEditPreview = false;
+    _ctxEditDraft = _ctxActive.content || '';
+    // Stash an empty-changes entry so "I clicked Edit but typed nothing"
+    // also survives a file/tab switch — the user explicitly entered edit
+    // mode and the round-trip back should land them right where they were.
+    _ctxStashDraft();
+  }
   _ctxRenderEditor();
 }
 
@@ -1142,6 +1196,7 @@ function _ctxRenderEditor() {
   `;
   actionsEl.querySelector('#ctx-viewer-save').addEventListener('click', _saveCtxEdit);
   actionsEl.querySelector('#ctx-viewer-cancel').addEventListener('click', () => {
+    _ctxClearDraft();
     _ctxEditPreview = false;
     _ctxEditDraft = '';
     _renderCtxViewerMd();
@@ -1163,7 +1218,7 @@ function _ctxRenderEditor() {
   const ta = bodyEl.querySelector('#ctx-viewer-textarea');
   if (ta) {
     ta.addEventListener('keydown', (e) => _ctxOnKey(ta, e));
-    ta.addEventListener('input', () => { _ctxEditDraft = ta.value; });
+    ta.addEventListener('input', () => { _ctxEditDraft = ta.value; _ctxStashDraft(); });
     ta.focus();
   }
 }
@@ -1172,6 +1227,7 @@ function _ctxTogglePreview() {
   const ta = document.getElementById('ctx-viewer-textarea');
   if (ta) _ctxEditDraft = ta.value;
   _ctxEditPreview = !_ctxEditPreview;
+  _ctxStashDraft();
   _ctxRenderEditor();
 }
 
@@ -1324,6 +1380,9 @@ function _ctxReplaceRange(ta, from, to, replacement, newSelStart, newSelEnd) {
   ta.selectionStart = newSelStart;
   ta.selectionEnd = newSelEnd;
   _ctxEditDraft = ta.value;
+  // setRangeText doesn't fire `input`, so toolbar ops bypass the input
+  // handler's draft stash — capture explicitly.
+  _ctxStashDraft();
   ta.focus();
 }
 
@@ -1480,6 +1539,7 @@ async function _saveCtxEdit() {
     const data = await res.json();
     if (!data.ok) { await uiAlert(data.error || t('contexts.save_failed')); return; }
     _ctxActive.content = next;
+    _ctxClearDraft();
     _ctxEditPreview = false;
     _ctxEditDraft = '';
     _renderCtxViewerMd();
@@ -1497,6 +1557,7 @@ async function _deleteCtxFromViewer() {
     const res = await apiFetch(`/api/contexts/delete?path=${encodeURIComponent(rel)}`, { method: 'DELETE' });
     const data = await res.json();
     if (!data.ok) { await uiAlert(data.error || t('contexts.delete_failed')); return; }
+    _ctxClearDraft(rel);
     _clearCtxViewer();
     await loadContexts();
   } catch (e) {
