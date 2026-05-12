@@ -1150,8 +1150,8 @@ function _hydrateMessageAttachmentThumbs(msgDiv, _cid) {
 // the OS clipboard (Cmd/Ctrl+Shift+screenshot) and files copied from Finder
 // / Explorer both land in `clipboardData.files`. Plain-text pastes have an
 // empty FileList and fall through to the textarea's native paste handler.
-function _bindChatPasteAttach(inputElId, getCid) {
-  const el = document.getElementById(inputElId);
+function _bindChatPasteAttach(inputSelector, getCid) {
+  const el = document.querySelector(inputSelector);
   if (!el || el.dataset.pasteBound === '1') return;
   el.addEventListener('paste', (e) => {
     const cid = getCid();
@@ -1213,7 +1213,7 @@ function _initChatAttachInput() {
     await _chatAttachUpload(currentCid, input.files);
     input.value = '';
   });
-  _bindChatPasteAttach('chat-input', () => currentCid);
+  _bindChatPasteAttach('#chat-input', () => currentCid);
   _bindChatDropAttach('.chat-input-area', () => currentCid);
   btn.dataset.bound = '1';
 }
@@ -1234,7 +1234,7 @@ function _initNewChatAttachInput() {
     await _chatAttachUpload(DRAFT_CID, input.files);
     input.value = '';
   });
-  _bindChatPasteAttach('new-chat-input', () => DRAFT_CID);
+  _bindChatPasteAttach('#new-chat-input', () => DRAFT_CID);
   _bindChatDropAttach('.new-chat-input-area', () => DRAFT_CID);
   btn.dataset.bound = '1';
 }

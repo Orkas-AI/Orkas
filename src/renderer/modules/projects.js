@@ -653,14 +653,17 @@ function onEnterCommanderProjectChip() {
 }
 
 /** User clicked the commander chip → show a small popover listing
- *  None + every existing project. Style mirrors the workspace dropdown. */
+ *  None + every existing project. Reuses `.workspace-menu` (not
+ *  `_aiSelectMount`) because this is a chip-row popover anchored next to
+ *  the workspace chip — `_aiSelectMount` targets in-form dropdowns with
+ *  different chrome (border / hover state / row height). */
 function _showCommanderProjectPicker(anchor) {
   const old = document.getElementById('commander-project-picker');
   if (old) { old.remove(); return; }
 
   const menu = document.createElement('div');
   menu.id = 'commander-project-picker';
-  menu.className = 'workspace-menu';  // reuse styling
+  menu.className = 'workspace-menu';
   anchor.classList.add('chat-project-chip--open');
 
   const items = [
