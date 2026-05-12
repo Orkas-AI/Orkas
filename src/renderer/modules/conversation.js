@@ -4188,7 +4188,23 @@ function abortConvStream(cid) {
   // queues. Cancelling just the IPC stream would leave agents running in the
   // background. Fire-and-forget — no need to block the UI on the response.
   try { apiFetch(`/api/conversations/${cid}/abort`, { method: 'POST' }); } catch (_) {}
-  if (!state || !state.controller) return;
+  if (!state) return;
+  // No-controller case: the pendingConvs entry was minted by
+  // `loadConversationHistory`'s polling-rescue branch (user opened a conv
+  // whose worker was started from outside this renderer — scheduled-task
+  // fire, or a refresh mid-turn). There's no in-process stream to cancel;
+  // the bus.abort POST above does the actual work. Clear the placeholder
+  // and the pending entry so the send button flips back to "send" and the
+  // sidebar badge drops. Without this, the button stayed pinned as "stop"
+  // and re-clicks were no-ops.
+  if (!state.controller) {
+    pendingConvs.delete(cid);
+    stopPolling(cid);
+    if (state.loadingEl && state.loadingEl.isConnected) state.loadingEl.remove();
+    _updateConvSidebarBadge(cid, false);
+    if (cid === currentCid) _updateConvSendUI(cid);
+    return;
+  }
   state.aborted = true;
   try { state.controller.abort(); } catch (_) {}
   // Repaint the sidebar badge now — `_updateConvSidebarBadge` reads

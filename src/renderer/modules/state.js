@@ -31,6 +31,20 @@ const pollMsgCounts = new Map(); // cid → last known message count
 // `loadConversationHistory` call. True for conversations with no agent_id.
 const convAgentEnabledByCid = new Map();
 
+// Backend `/api/conversations/<cid>/history` returns raw GroupMessage
+// records (`{id, ts, from, to, text, ...}`) — NOT the legacy
+// `{role, content, time}` shape. `loadConversationHistory` translates via
+// `_groupMsgToLegacy`; the polling rescue path forgot to. Polling now
+// looks at `from` directly: anything not `'user'` is an assistant-side
+// reply (commander or any agent), and `from === 'user'` is a user
+// message. Without this, polling never recognised the agent's reply, so
+// the "thinking…" loadingEl created for mid-turn opens stayed pinned
+// forever (visible as a stuck `智能体 思考中…` bubble below the actual
+// reply — the symptom that surfaced once scheduled-task fires made the
+// "open conv mid-turn without a local ctrl" path common).
+function _isPolledAssistantMsg(m) { return !!(m && m.from && m.from !== 'user'); }
+function _isPolledUserMsg(m) { return !!(m && m.from === 'user'); }
+
 function startPolling(cid) {
   if (pollTimers.has(cid)) return;
   const timer = setInterval(async () => {
@@ -43,16 +57,16 @@ function startPolling(cid) {
       const last = msgs[msgs.length - 1];
       const known = pollMsgCounts.get(cid) || 0;
 
-      if (msgs.length > known && last?.role === 'assistant') {
+      if (msgs.length > known && _isPolledAssistantMsg(last)) {
         // New assistant message arrived
         pollMsgCounts.set(cid, msgs.length);
         stopPolling(cid);
-        _onPolledResponse(cid, last.content);
+        _onPolledResponse(cid, last.text);
         return;
       }
 
       // If server is no longer processing but last message is still user → request was lost
-      if (last?.role === 'user' && data.conversation?.processing === false) {
+      if (_isPolledUserMsg(last) && data.conversation?.processing === false) {
         stopPolling(cid);
         _onPolledResponse(cid, t('chat.reply_interrupted'), true);
         return;
@@ -62,7 +76,7 @@ function startPolling(cid) {
       // model idle watchdog (10 min) + a small buffer. Shorter thresholds would
       // trip on genuine long agent runs.
       const since = data.conversation?.processing_since;
-      if (last?.role === 'user' && data.conversation?.processing === true && since) {
+      if (_isPolledUserMsg(last) && data.conversation?.processing === true && since) {
         const elapsedSec = (Date.now() - new Date(since).getTime()) / 1000;
         if (elapsedSec > 720) {
           stopPolling(cid);
