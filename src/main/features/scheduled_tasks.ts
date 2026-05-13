@@ -55,6 +55,9 @@ const TICK_MS = 30_000;
 const MAX_INTERVAL_MIN = 60 * 24 * 30; // 30 days cap
 const MAX_TITLE_LEN = 80;
 const MAX_INPUT_LEN = 4000;
+// Per-user task cap — every tick scans + serializes the file, so a runaway
+// task count can't be allowed to push a tick past TICK_MS.
+const MAX_TASKS_PER_USER = 100;
 
 export type ScheduleInterval = { type: 'interval'; minutes: number };
 export type ScheduleDaily    = { type: 'daily';    hour: number; minute: number };
@@ -160,7 +163,8 @@ export type TaskError =
   | 'agent_missing'
   | 'invalid_schedule'
   | 'invalid_input'
-  | 'not_found';
+  | 'not_found'
+  | 'too_many_tasks';
 
 // Validated common fields ready to be merged into a new or existing task
 // (caller owns id / created_at / updated_at).
@@ -214,6 +218,10 @@ export async function createTask(
   const fields = norm.fields;
   return _runExclusive(uid, async () => {
     const f = await _read(uid);
+    if (f.tasks.length >= MAX_TASKS_PER_USER) {
+      log.warn(`task create rejected uid=${uid} reason=too_many_tasks count=${f.tasks.length} cap=${MAX_TASKS_PER_USER}`);
+      return { ok: false as const, error: 'too_many_tasks' as const };
+    }
     const now = nowIso();
     const task: ScheduledTask = {
       id: genTaskId(),
@@ -361,10 +369,17 @@ async function _fireTask(uid: string, task: ScheduledTask): Promise<void> {
     return;
   }
   const text = _buildSeedText(agent.name || task.agent_id, task.default_input);
+  // Drop the just-created (still empty) conv when send fails; otherwise each
+  // scheduled-fire failure leaves a `⏱ <agent>` ghost row in the sidebar.
+  const rollbackEmptyConv = async (reason: string): Promise<void> => {
+    try { await chats.deleteConversation(uid, cid); }
+    catch (e) { log.warn(`fire rollback failed uid=${uid} id=${task.id} cid=${cid} reason=${reason}: ${(e as Error).message}`); }
+  };
   try {
     const res = await groupChat.send({ userId: uid, cid, text });
     if (!res.ok) {
       log.warn(`fire send failed uid=${uid} id=${task.id} cid=${cid}: ${res.error || 'unknown'}`);
+      await rollbackEmptyConv('send_not_ok');
       return;
     }
     log.info(`fired uid=${uid} id=${task.id} agent=${task.agent_id} cid=${cid}`);
@@ -374,6 +389,7 @@ async function _fireTask(uid: string, task: ScheduledTask): Promise<void> {
     _emitFire({ type: 'conv_created', cid, task_id: task.id, agent_id: task.agent_id });
   } catch (err) {
     log.error(`fire send threw uid=${uid} id=${task.id} cid=${cid}: ${(err as Error).message}`);
+    await rollbackEmptyConv('send_threw');
   }
 }
 
