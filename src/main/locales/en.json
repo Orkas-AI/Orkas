@@ -79,6 +79,7 @@
   "model.retrying_n": "Retry attempt {attempt}",
   "model.aborted": "(stopped)",
   "cli_agent.missing": "⚠️ Agent “{name}” needs the local CLI “{cli}” which isn’t installed. Install it and retry, or switch the agent to another type.",
+  "cli_agent.slash_no_output": "Sent command `{cmd}`.",
   "chat.agent_load_failed": "⚠️ Agent “{name}” failed to load — its config file may be corrupt or removed. Visit the agents page to inspect, repair, or rebuild it.",
   "agent.cli.project_dir.label": "Project directory",
   "chat.commander_dispatch_only": "Forwarded to {agents}.",

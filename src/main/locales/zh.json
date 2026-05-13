@@ -79,6 +79,7 @@
   "model.retrying_n": "正在第 {attempt} 次重试",
   "model.aborted": "（已中断）",
   "cli_agent.missing": "⚠️ 智能体「{name}」依赖的本地 CLI「{cli}」未安装。请安装该 CLI 后重试，或在编辑面板换成其他类型。",
+  "cli_agent.slash_no_output": "已发送命令 `{cmd}`。",
   "chat.agent_load_failed": "⚠️ 智能体「{name}」加载失败：配置文件可能损坏或已被删除。请前往智能体页面检查、修复或重建。",
   "agent.cli.project_dir.label": "项目目录",
   "chat.commander_dispatch_only": "已转给 {agents}。",

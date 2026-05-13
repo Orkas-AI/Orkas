@@ -654,6 +654,53 @@ function composeLlmTurnPayload(fromActorId: string, msg: GroupMessage): string {
   return `${head}\n${msg.text}\n${tail}`;
 }
 
+/** Reverse of `composeLlmTurnPayload`: extract the user-visible text from
+ *  a `<msg from=… to=…>\nTEXT\n</msg>` envelope. Returns `null` for any
+ *  payload that doesn't match the exact shape (defensive — keeps callers
+ *  from treating an unwrapped or differently-encoded payload as raw text). */
+function _unwrapLlmTurnPayload(payload: string): string | null {
+  const m = /^<msg from="[^"]*" to="[^"]*">\n([\s\S]*)\n<\/msg>$/.exec(payload);
+  return m ? m[1] : null;
+}
+
+/** True when `text` looks like a CLI slash command (`/foo`, `/my-cmd …`).
+ *  Matches a leading `/` followed by an alphanumeric command name on the
+ *  first line; trailing args / newlines are fine. Used to bypass the
+ *  chat_cli_agent template wrap so the CLI's own slash dispatcher sees
+ *  the `/` at position 0 of its user message content. */
+function _isSlashCommand(text: string): boolean {
+  return /^\/[A-Za-z][A-Za-z0-9_-]*(?=\s|$)/.test(text);
+}
+
+/** Treat the CLI's reply as "no useful text" when it's empty / whitespace
+ *  or the literal "(no content)" sentinel some CLIs (claude code in
+ *  particular) emit for slash commands that have no -p-mode effect. The
+ *  slash-command success-return path uses this to swap an empty bubble
+ *  for a confirmation note. */
+function _looksLikeNoOutput(text: string): boolean {
+  const t = (text || '').trim();
+  return t === '' || /^\(\s*no\s+content\s*\)$/i.test(t);
+}
+
+/** Strip a leading `@<recipient>` mention (display name or id form) and
+ *  the whitespace separator that follows it. Used by the slash-command
+ *  fast-path so `@Claude Code /new` collapses to `/new` before slash
+ *  detection — the `@<agent>` token is routing metadata, not part of the
+ *  command. Only the very first leading mention is stripped; other
+ *  `@<name>` tokens elsewhere in the body stay untouched. */
+function _stripLeadingRecipientMention(
+  text: string, agentName: string, agentId: string,
+): string {
+  if (!text) return text;
+  for (const tok of [agentName, agentId]) {
+    if (!tok) continue;
+    const esc = tok.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`^@${esc}(?:\\s+|$)`);
+    if (re.test(text)) return text.replace(re, '');
+  }
+  return text;
+}
+
 // ── Worker loop ──────────────────────────────────────────────────────────
 
 function ensureWorker(state: CidState, actor: Actor): WorkerState {
@@ -2084,6 +2131,14 @@ async function _runCliAgentTurn(opts: {
   const promptText = await _buildCliPrompt(
     opts.uid, opts.cid, opts.agent, opts.item, opts.slice, !!resumeSessionId,
   );
+  // When `_buildCliPrompt` took the slash-command fast-path, promptText is
+  // the raw `/cmd …` we forwarded. Remember the command name so the
+  // success-return path below can swap CLI's (no content)/empty result
+  // for a helpful note instead of leaving an empty bubble — common with
+  // session-control slashes like `/new` / `/clear` that no-op in -p mode.
+  const slashCommandName = _isSlashCommand(promptText)
+    ? (/^(\/[A-Za-z][A-Za-z0-9_-]*)/.exec(promptText)?.[1] ?? null)
+    : null;
   const runner = await import('../local_agents/runner');
 
   let accText = '';
@@ -2125,7 +2180,16 @@ async function _runCliAgentTurn(opts: {
         case 'text-delta':
           if (typeof (e as any).text === 'string') {
             accText += (e as any).text as string;
-            opts.onProcess({ type: 'delta', text: (e as any).text });
+            // Slash-command turns: buffer text-delta in `accText` instead
+            // of streaming to the bubble. The success-return path below
+            // either swaps the body for "已发送命令 …" (CLI returned
+            // empty / "(no content)") or hands the accumulated text in
+            // one shot as the final msg.text. Streaming would otherwise
+            // flash the CLI's "(no content)" before our substitution
+            // lands, since renderer commits each delta to the bubble.
+            if (!slashCommandName) {
+              opts.onProcess({ type: 'delta', text: (e as any).text });
+            }
           }
           break;
         case 'thinking':
@@ -2194,7 +2258,13 @@ async function _runCliAgentTurn(opts: {
       .setSessionId(opts.uid, opts.cid, opts.agent.agent_id, runtime.cli, backendSessionId)
       .catch(() => { /* logged inside sessions.ts */ });
   }
-  return { text: resultText || accText };
+  const finalText = resultText || accText;
+  if (slashCommandName && _looksLikeNoOutput(finalText)) {
+    return {
+      text: t('cli_agent.slash_no_output', { cmd: slashCommandName }),
+    };
+  }
+  return { text: finalText };
 }
 
 async function _buildCliPrompt(
@@ -2209,6 +2279,25 @@ async function _buildCliPrompt(
    *  massive redundancy on long convs. */
   resuming: boolean,
 ): Promise<string> {
+  // Slash-command fast-path: when the user sends `/foo …` to a CLI agent,
+  // forward the raw text so the CLI's own slash dispatcher (built-ins +
+  // project `.claude/commands/*.md`) sees the leading `/`. Without this,
+  // the chat_cli_agent.md frame buries the slash beneath the agent
+  // identity + output-protocol + history block, and the CLI parser never
+  // fires. Only applies to direct user → CLI dispatch — form submissions
+  // and agent-to-agent forwards keep the full frame.
+  if (item.fromActorId === USER_ID && !decodeSubmission(item.llmPayload)) {
+    const rawUserText = _unwrapLlmTurnPayload(item.llmPayload);
+    if (rawUserText) {
+      const stripped = _stripLeadingRecipientMention(
+        rawUserText, agent.name || '', agent.agent_id,
+      );
+      if (_isSlashCommand(stripped)) {
+        return stripped;
+      }
+    }
+  }
+
   // Layout = `chat_cli_agent.md` (static frame) + `chat_cli_coding_protocol.md`
   // (coding-only). The static-first / runtime-last split keeps the
   // CLI's prompt cache stable across turns: identity + protocol stay
