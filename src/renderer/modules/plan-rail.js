@@ -40,17 +40,27 @@ function _isStepActionable(step, inFlight) {
   return step.status === 'failed' && (!inFlight || inFlight.length === 0);
 }
 
+function _formatAssigneeMeta(raw) {
+  const a = (raw || '').trim();
+  if (!a) return '';
+  // Mirror plan.ts::formatPlanAnnouncement (commander/user are role tokens, not @-mentions).
+  if (a === 'commander') return `<div class="plan-rail-step-meta">${escapeHtml(t('chat.recipient_commander'))}</div>`;
+  if (a === 'user')      return `<div class="plan-rail-step-meta">${escapeHtml(t('chat.from_user'))}</div>`;
+  return `<div class="plan-rail-step-meta">@${escapeHtml(a)}</div>`;
+}
+
 function _buildStepHtml(step) {
   const icon = STATUS_ICON[step.status] || STATUS_ICON.pending;
   const num  = `${step.index}.`;
   const title = escapeHtml(step.title || '');
-  const assignee = step.assignee ? escapeHtml(step.assignee) : '';
+  // assignee literals `commander` / `user` are role tokens (commander wrote them via
+  // plan_set), not real agent names — route them through i18n so a zh user sees
+  // 指挥官/用户 instead of the raw English token. Agent names are user-authored single-
+  // language strings (Agent spec has no name_zh/_en) and pass through verbatim with `@`.
+  const meta = _formatAssigneeMeta(step.assignee);
   const transient = (step.status === 'pending' || step.status === 'in_progress')
     && Number(step.transient_attempts) > 0
     ? `<span class="plan-rail-step-transient">${TRANSIENT_BADGE_ICON} ${step.transient_attempts}/${MAX_TRANSIENT_RETRIES}</span>`
-    : '';
-  const meta = assignee
-    ? `<div class="plan-rail-step-meta">@${assignee}</div>`
     : '';
   const reason = step.failure_reason
     ? `<div class="plan-rail-step-reason">${escapeHtml(step.failure_reason)}</div>`
@@ -177,6 +187,13 @@ const PlanRail = {
 // Expose on the global namespace for conversation.js to hook.
 window.PlanRail = PlanRail;
 
+// Re-render on language change so commander/user labels swap zh↔en immediately (the rail
+// is JS-injected HTML — applyDomI18n doesn't reach inside it). Refresh is no-op when
+// unbound or when the cid switched meanwhile.
+document.addEventListener('i18n-change', () => {
+  if (_currentCid) PlanRail.refresh(_currentCid);
+});
+
 // ── Action wiring ────────────────────────────────────────────────────────
 
 document.addEventListener('click', async (ev) => {
@@ -260,6 +277,24 @@ document.addEventListener('click', async (ev) => {
     if (target && typeof target.scrollIntoView === 'function') {
       target.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
+  }
+});
+
+// Outside-click dismiss: collapse an expanded rail when the user clicks anywhere outside it.
+// Companion to the header toggle above — that handler returns early on in-rail clicks, so
+// this one only ever fires when the click is somewhere else on the page. Persists the
+// collapsed state so it survives view re-bind, same as a manual toggle.
+document.addEventListener('click', (ev) => {
+  const root = document.getElementById('plan-rail');
+  if (!root || root.style.display === 'none') return;
+  if (root.classList.contains('is-collapsed')) return;
+  if (root.contains(ev.target)) return;
+  root.classList.add('is-collapsed');
+  const toggle = document.getElementById('plan-rail-toggle');
+  if (toggle) toggle.textContent = '▴';
+  if (_currentCid) {
+    try { localStorage.setItem(`plan-rail-collapsed-${_currentCid}`, '1'); }
+    catch { /* ignore */ }
   }
 });
 
