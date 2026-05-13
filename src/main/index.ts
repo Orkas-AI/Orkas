@@ -529,8 +529,12 @@ function registerChatMediaProtocol(): void {
         const abs = _pathnameToAbsPath(u.pathname || '');
         const resolved = chatAttachments.resolveLocalMediaPath(abs);
         if (!resolved.ok) {
-          log.warn('chat-media/local: reject', { reqUrl, code: resolved.code, error: resolved.error });
-          return new Response(resolved.error, { status: _statusFor(resolved.code) });
+          // Same `(x as {field?: T}).field` access pattern as the cid branch above —
+          // tsc's narrow on `if (!resolved.ok)` doesn't always propagate to the
+          // error-branch fields here, so go through the type-assertion escape hatch.
+          const err = resolved as { code?: string; error?: string };
+          log.warn('chat-media/local: reject', { reqUrl, code: err.code, error: err.error });
+          return new Response(String(err.error || ''), { status: _statusFor(err.code) });
         }
         const st = fs.statSync(resolved.absPath);
         log.info('chat-media/local: serving', { abs: resolved.absPath, kind: resolved.kind, bytes: st.size });

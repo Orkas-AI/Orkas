@@ -1881,7 +1881,8 @@ async function buildCommanderExtraTools(state: CidState, w: WorkerState): Promis
       if (!Number.isFinite(idx) || !['in_progress', 'done', 'failed'].includes(status)) {
         return { content: JSON.stringify({ ok: false, error: 'invalid input' }), isError: true };
       }
-      const updated = await updateStep(uid, cid, idx, status, notes);
+      // updateStep's 5th arg is a `patch` object, not a bare notes string — wrap.
+      const updated = await updateStep(uid, cid, idx, status, notes !== undefined ? { notes } : undefined);
       if (!updated) {
         return { content: JSON.stringify({ ok: false, error: 'step not found or no plan yet' }), isError: true };
       }

@@ -726,19 +726,20 @@ export class AgentRunner {
           const tool = this.tools.get(call.name);
           if (!tool) {
             log.warn(`Reflection: unknown tool "${call.name}"`);
-            reflectSession.addToolResult(call.id, `Unknown tool: ${call.name}`, true);
+            // addToolResult signature: (id, result, images?, isError?) — pass undefined for images.
+            reflectSession.addToolResult(call.id, `Unknown tool: ${call.name}`, undefined, true);
             continue;
           }
           try {
             log.info(`Reflection tool: ${call.name}(${JSON.stringify(call.input).slice(0, 200)})`);
             const toolResult = await tool.execute(call.input, toolCtx);
-            reflectSession.addToolResult(call.id, toolResult.content, toolResult.isError);
+            reflectSession.addToolResult(call.id, toolResult.content, toolResult.images, toolResult.isError);
             if (toolResult.isError) {
               log.warn(`Reflection tool ${call.name} returned error: ${toolResult.content.slice(0, 200)}`);
             }
           } catch (err) {
             log.error(`Reflection tool ${call.name} threw: ${formatError(err)}`);
-            reflectSession.addToolResult(call.id, `Error: ${formatError(err)}`, true);
+            reflectSession.addToolResult(call.id, `Error: ${formatError(err)}`, undefined, true);
           }
         }
       } catch (err) {
