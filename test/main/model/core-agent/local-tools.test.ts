@@ -222,3 +222,70 @@ describe('local-tools › edit_file › onFileWritten', () => {
     expect(written).toEqual([]);
   });
 });
+
+// ── create_artifact ──────────────────────────────────────────────────────
+// Deep input validation lives in `chat_artifacts.test.ts`; here we pin the
+// runner-side wiring: the gate, the cid+sink presence condition, the
+// onArtifactCreated callback, and that backend rejections surface as isError.
+
+async function buildCreateArtifactTool(opts: { cid?: string | null; onArtifactCreated?: (a: { id: string; title: string }) => void; agentId?: string } = {}) {
+  const localTools = await import('../../../../src/main/model/core-agent/local-tools');
+  const tools = localTools.createLocalTools({
+    userId: UID,
+    ...(opts.cid === undefined ? { cid: CID } : opts.cid ? { cid: opts.cid } : {}),
+    ...(opts.agentId ? { agentId: opts.agentId } : {}),
+    ...(opts.onArtifactCreated ? { onArtifactCreated: opts.onArtifactCreated } : {}),
+  });
+  return tools.find((t) => t.name === 'create_artifact') || null;
+}
+
+const MIN_FILES = [{ path: 'index.html', content: '<!doctype html><h1>hi</h1>' }];
+
+describe('local-tools › create_artifact › availability', () => {
+  it('is offered only when both cid and onArtifactCreated are present', async () => {
+    expect(await buildCreateArtifactTool({ cid: CID, onArtifactCreated: () => {} })).toBeTruthy();
+    // no sink → not offered (edit chats / ad-hoc runs)
+    expect(await buildCreateArtifactTool({ cid: CID })).toBeNull();
+    // no cid → not offered
+    expect(await buildCreateArtifactTool({ cid: null, onArtifactCreated: () => {} })).toBeNull();
+  });
+});
+
+describe('local-tools › create_artifact › permission gate', () => {
+  it('rejects when localExec not granted', async () => {
+    const tool = await buildCreateArtifactTool({ onArtifactCreated: () => {} });
+    expect(tool).toBeTruthy();
+    const r = await run(tool, { title: 'X', files: MIN_FILES });
+    expect(r.isError).toBe(true);
+    expect(r.content).toMatch(/Local execution is not authorised/i);
+  });
+});
+
+describe('local-tools › create_artifact › success + callback', () => {
+  it('writes the bundle, fires onArtifactCreated, and tells the model not to paste HTML', async () => {
+    await grant();
+    const created: Array<{ id: string; title: string }> = [];
+    const tool = await buildCreateArtifactTool({ agentId: 'helper', onArtifactCreated: (a) => created.push(a) });
+    const r = await run(tool, { title: 'Tip calc', files: MIN_FILES });
+    expect(r.isError).toBeFalsy();
+    expect(created.length).toBe(1);
+    expect(created[0].title).toBe('Tip calc');
+    expect(created[0].id).toMatch(/^[A-Za-z0-9_-]{8,}$/);
+    expect(r.content).toMatch(/do NOT paste/i);
+    const dir = path.join(tmpDir, UID, 'cloud', 'chat_artifacts', CID, created[0].id);
+    expect(fs.readFileSync(path.join(dir, 'index.html'), 'utf8')).toContain('<h1>hi</h1>');
+    expect(JSON.parse(fs.readFileSync(path.join(dir, '__orkas-meta.json'), 'utf8')).agentId).toBe('helper');
+  });
+});
+
+describe('local-tools › create_artifact › backend rejection surfaces as isError', () => {
+  it('missing index.html → isError, no callback', async () => {
+    await grant();
+    const created: unknown[] = [];
+    const tool = await buildCreateArtifactTool({ onArtifactCreated: (a) => created.push(a) });
+    const r = await run(tool, { files: [{ path: 'main.html', content: 'x' }] });
+    expect(r.isError).toBe(true);
+    expect(r.content).toMatch(/index\.html/);
+    expect(created).toEqual([]);
+  });
+});

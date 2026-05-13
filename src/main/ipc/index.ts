@@ -29,6 +29,8 @@ import * as contexts from '../features/contexts';
 import * as kbVector from '../features/kb_vector';
 import * as kbIndexer from '../features/kb_indexer';
 import * as chatAttachments from '../features/chat_attachments';
+import * as chatArtifacts from '../features/chat_artifacts';
+import * as savedApps from '../features/saved_apps';
 import * as search from '../features/search';
 import * as auth from '../features/auth';
 import * as imageAuth from '../features/image_auth';
@@ -381,6 +383,64 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!safeId(from_cid)) throw new Error('invalid from_cid');
     if (!safeId(to_cid)) throw new Error('invalid to_cid');
     return chatAttachments.adoptDraftAttachments(ctx.userId, from_cid, to_cid);
+  },
+
+  // ── Chat artifacts (interactive web-app bundles, served via chat-app://) ──
+  // Open the artifact's index.html in the OS default browser (a `file://`
+  // URL via `shell.openPath`). Path is resolved through
+  // `chatArtifacts.resolveArtifactFilePath` so caller-supplied cid /
+  // artifactId can only ever reach a file inside that artifact's pool.
+  'conversations.artifacts.openExternal': async ({ cid, artifactId }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    const r = chatArtifacts.resolveArtifactFilePath(ctx.userId, String(cid), String(artifactId || ''), 'index.html');
+    if (!r.ok) throw new Error((r as { error?: string }).error || 'artifact not found');
+    const absPath = (r as { absPath: string }).absPath;
+    const err = await shell.openPath(absPath);
+    if (err) throw new Error(err);
+    return { ok: true, path: absPath };
+  },
+  // Copy a chat artifact into the persistent "My Apps" pool
+  // (`<uid>/cloud/saved_apps/<appId>/`). Surfaced as the artifact card's
+  // `⋯` → "保存".
+  'conversations.artifacts.save': async ({ cid, artifactId }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    const r = savedApps.saveFromArtifact(ctx.userId, String(cid), String(artifactId || ''));
+    if (!r.ok) throw new Error((r as { error?: string }).error || 'failed to save app');
+    return { ok: true, id: (r as { id: string }).id, title: (r as { title: string }).title };
+  },
+
+  // ── Saved apps ("My Apps" — user-kept copies of create_artifact bundles) ──
+  'savedApps.list': async (_payload, ctx) => ({ apps: savedApps.listSavedApps(ctx.userId) }),
+  'savedApps.openExternal': async ({ appId }, ctx) => {
+    const r = savedApps.resolveSavedAppIndex(ctx.userId, String(appId || ''));
+    if (!r.ok) throw new Error((r as { error?: string }).error || 'app not found');
+    const absPath = (r as { absPath: string }).absPath;
+    const err = await shell.openPath(absPath);
+    if (err) throw new Error(err);
+    return { ok: true, path: absPath };
+  },
+  // Open a saved app for editing — creates a fresh conversation with the
+  // app's source bundled in as an `app-source.md` attachment. The renderer
+  // navigates to it + pre-fills a draft.
+  'savedApps.openForEditing': async ({ appId }, ctx) => {
+    const r = await savedApps.openForEditing(ctx.userId, String(appId || ''));
+    if (!r.ok) throw new Error((r as { error?: string }).error || 'failed to open the app for editing');
+    return {
+      ok: true,
+      conversation: (r as { conversation: unknown }).conversation,
+      title: (r as { title: string }).title,
+      sourceFileName: (r as { sourceFileName: string }).sourceFileName,
+    };
+  },
+  'savedApps.rename': async ({ appId, title }, ctx) => {
+    const r = savedApps.renameSavedApp(ctx.userId, String(appId || ''), title);
+    if (!r.ok) throw new Error((r as { error?: string }).error || 'failed to rename');
+    return { ok: true, title: (r as { title: string }).title };
+  },
+  'savedApps.delete': async ({ appId }, ctx) => {
+    const r = savedApps.deleteSavedApp(ctx.userId, String(appId || ''));
+    if (!r.ok) throw new Error((r as { error?: string }).error || 'failed to delete');
+    return { ok: true };
   },
 
   // ── Agents ──

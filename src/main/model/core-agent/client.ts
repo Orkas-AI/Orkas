@@ -91,6 +91,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     projectId,
     onFileWritten,
     hasProducedPath,
+    onArtifactCreated,
     cacheRetention,
     thinkingLevel,
   } = opts;
@@ -186,6 +187,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(readOnlyExtraRoots && readOnlyExtraRoots.length ? { readOnlyExtraRoots } : {}),
       ...(onFileWritten ? { onFileWritten } : {}),
       ...(hasProducedPath ? { hasProducedPath } : {}),
+      ...(onArtifactCreated ? { onArtifactCreated } : {}),
     });
     const { runner, providerId, modelId } = built;
 

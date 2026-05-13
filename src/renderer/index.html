@@ -26,6 +26,7 @@
         <button class="sidebar-btn" id="agents-btn" data-i18n="sidebar.agents">Agents</button>
         <button class="sidebar-btn" id="skills-btn" data-i18n="sidebar.skills">Skills</button>
         <button class="sidebar-btn" id="contexts-btn" data-i18n="sidebar.contexts">Knowledge</button>
+        <button class="sidebar-btn" id="apps-btn" data-i18n="sidebar.apps">My Apps</button>
       </div>
       <div class="sidebar-section sidebar-projects-section">
         <div class="sidebar-section-title-row">
@@ -407,6 +408,19 @@
               </div>
               <div class="contexts-viewer-body markdown-body" id="contexts-viewer-body"></div>
             </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- My Apps — user-kept copies of create_artifact bundles (see modules/saved-apps.js) -->
+      <section class="panel" id="panel-apps">
+        <div class="agents-grid-view">
+          <div class="agents-grid-header">
+            <span data-i18n="apps.title">Apps you've created</span>
+          </div>
+          <div class="agents-grid-scroll">
+            <div class="apps-grid" id="apps-grid"></div>
+            <div class="agents-empty" id="apps-empty" data-i18n="apps.empty">No saved apps yet</div>
           </div>
         </div>
       </section>
@@ -825,6 +839,7 @@
   <script src="./modules/projects.js"></script>
   <script src="./modules/project-detail.js"></script>
   <script src="./modules/conversation.js"></script>
+  <script src="./modules/chat-artifact.js"></script>
   <script src="./modules/plan-rail.js"></script>
   <script src="./modules/queue-draft.js"></script>
   <script src="./modules/skills.js"></script>
@@ -836,6 +851,7 @@
   <script src="./vendor/pinyin-firstletter/data.js"></script>
   <script src="./modules/pinyin-firstletter.js"></script>
   <script src="./modules/agents.js"></script>
+  <script src="./modules/saved-apps.js"></script>
   <script src="./modules/agent-schedule.js"></script>
   <script src="./modules/utils.js"></script>
 

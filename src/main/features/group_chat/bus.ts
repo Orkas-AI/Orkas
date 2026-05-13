@@ -272,6 +272,10 @@ export interface EnqueueParams {
   form?: ChatFormPayload;
   created_agents?: Array<{ agent_id: string; name: string; kind?: 'created' | 'updated' }>;
   created_skills?: Array<{ skill_id: string; name: string; kind?: 'created' | 'updated' }>;
+  /** Interactive web-app artifacts produced this turn (via `create_artifact`).
+   * `agent_id` is the producing actor — the renderer routes a user→artifact
+   * interaction result back to it. */
+  artifacts?: Array<{ id: string; title: string; agent_id: string }>;
   plan_announcement?: boolean;
   /** Override resolved recipients (commander emitting plan announcement
    *  uses this to force `to=[user]`). Otherwise router decides. */
@@ -568,6 +572,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     ...(params.form ? { form: params.form } : {}),
     ...(params.created_agents && params.created_agents.length ? { created_agents: params.created_agents } : {}),
     ...(params.created_skills && params.created_skills.length ? { created_skills: params.created_skills } : {}),
+    ...(params.artifacts && params.artifacts.length ? { artifacts: params.artifacts } : {}),
     ...(params.plan_announcement ? { plan_announcement: true } : {}),
     ...(params.dispatch ? { dispatch: true } : {}),
     ...(params.process && params.process.length ? { process: params.process } : {}),
@@ -930,6 +935,12 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // "ours" → overwrite in place. Files the user pre-created remain foreign
   // and still get `-2 / -3 / ...` suffixed via `util/uniquify-path`.
   const hasProducedPath = (absPath: string) => state.producedPaths.has(absPath);
+  // Interactive web-app artifacts created via `create_artifact` this turn.
+  // Attached to the actor's end-of-turn message so the renderer embeds each
+  // one as a sandboxed `<iframe>` (`chat-app://`); `agent_id` = this actor,
+  // the routing target for a user→artifact interaction result.
+  const turnArtifacts: Array<{ id: string; title: string }> = [];
+  const onArtifactCreated = (a: { id: string; title: string }) => { turnArtifacts.push(a); };
   let finalText = '';
   // Mirror of every text delta we forwarded to the renderer this turn.
   // Used as the salvage source when the user aborts mid-stream — the
@@ -1071,6 +1082,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       ...(turnProjectId ? { projectId: turnProjectId } : {}),
       onFileWritten,
       hasProducedPath,
+      onArtifactCreated,
       cacheRetention: 'short',
       abortSignal: w.abortController.signal,
       readOnlyExtraRoots: [...skillRoots, ...agentRoots],
@@ -1384,6 +1396,16 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // user clearly saw it during streaming. Promoting to persist here lets
   // the enqueue carry `processItems` into the persisted message so reload
   // / history view still surfaces what the actor did before stopping.
+  // A `create_artifact` call is a user-visible side effect the plan executor
+  // doesn't know about (it never sees the artifact list). If the turn would
+  // otherwise be silent — e.g. a commander turn that only produced an
+  // artifact — promote it to persist so the embedded iframe surfaces. Same
+  // rationale as the abort/process-trail promotion below; the artifact list
+  // itself is attached at enqueue time, independent of the executor outcome.
+  if (turnArtifacts.length > 0 && outcome.kind === 'silent') {
+    outcome = { kind: 'persist', text: '' };
+  }
+
   if (aborted) {
     if (outcome.kind === 'silent' && processItems.length > 0) {
       outcome = { kind: 'persist', text: '' };
@@ -1406,6 +1428,9 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       ...(outcome.createdAgents && outcome.createdAgents.length ? { created_agents: outcome.createdAgents } : {}),
       ...(outcome.createdSkills && outcome.createdSkills.length
         ? { created_skills: outcome.createdSkills.map((s) => ({ skill_id: s.skill_id, name: s.name })) }
+        : {}),
+      ...(turnArtifacts.length
+        ? { artifacts: turnArtifacts.map((a) => ({ id: a.id, title: a.title, agent_id: actor.id })) }
         : {}),
       ...(pendingPlan && actor.kind === 'commander'
         ? { plan_announcement: true, forceTo: [USER_ID] } : {}),

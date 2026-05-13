@@ -119,6 +119,11 @@ export interface ChatOptions {
    * collision (rename to `-2 / -3 / ...`). When undefined, every
    * pre-existing path at the target is treated as a foreign collision. */
   hasProducedPath?: (absPath: string) => boolean;
+  /** Fired after each successful `create_artifact` call with the new
+   *  artifact's id + title. `features/group_chat` collects these per turn
+   *  and attaches a `artifacts[]` list to the assistant message so the
+   *  renderer embeds each interactive web-app artifact in the bubble. */
+  onArtifactCreated?: (a: { id: string; title: string }) => void;
   /** Prompt-cache TTL policy. Undefined lets pi-ai pick its default
    * (`"short"` = Anthropic 5m / OpenAI in-memory). `"long"` opts into
    * extended retention (Anthropic 1h with 2x write premium / OpenAI 24h).

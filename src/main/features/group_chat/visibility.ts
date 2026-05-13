@@ -57,6 +57,12 @@ export interface GroupMessage {
   /** Mirror of `created_agents` for skills — populated when the commander's
    * final text contained one or more `<skill>` containers. */
   created_skills?: Array<{ skill_id: string; name: string; kind?: 'created' | 'updated' }>;
+  /** Interactive web-app artifacts produced this turn via `create_artifact`.
+   * `id` keys `chat_artifacts/<cid>/<id>/`; `agent_id` is the producing actor
+   * (`'commander'` or an agent id) — the renderer routes a user→artifact
+   * interaction result back to it. Rendered as a sandboxed `<iframe>`
+   * (`chat-app://`) at the bottom of the bubble. */
+  artifacts?: Array<{ id: string; title: string; agent_id: string }>;
   /** Marks this message as a plan announcement (rendered with a folded
    * plan card in UI). Set by `plan_set` first-time emission. */
   plan_announcement?: boolean;

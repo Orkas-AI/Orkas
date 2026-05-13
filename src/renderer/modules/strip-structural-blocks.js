@@ -394,7 +394,10 @@ function _stripSkillCreateContainer(buf, fallbackPlaceholder) {
 function _stripSurvivingStructuralBlocks(text) {
   if (!text) return text;
   let out = text;
-  for (const tag of ['agent', 'agent-input-form', 'agent-input-submission', 'skill']) {
+  // `artifact-result` is a user→artifact result tag (user-side render strips
+  // it via `_stripArtifactResultTagForDisplay`); included here so it's also
+  // removed if it ever leaks into assistant text (LLM quoting / hallucination).
+  for (const tag of ['agent', 'agent-input-form', 'agent-input-submission', 'artifact-result', 'skill']) {
     out = _stripOuterTagBlocks(out, tag);
   }
   // `<<<skill-file>>>` blocks: backend `extractSkillFileBlocks` strips them

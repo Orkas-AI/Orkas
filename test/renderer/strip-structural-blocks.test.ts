@@ -294,6 +294,43 @@ describe('<agent-input-submission> — set B (literal mentions survive)', () => 
   });
 });
 
+// `<artifact-result>` — the machine tag a renderer composes when an
+// interactive artifact posts a result back; carried in a user message so
+// the agent can parse it, stripped from the user bubble's display via
+// `_stripArtifactResultTagForDisplay` (which delegates to `_stripOuterTagBlocks`).
+// Same whack-a-mole class as the submission tag — pin set A + set B.
+describe('<artifact-result> — set A (real result tags stripped from display)', () => {
+  it('A1. result tag with attributes and a JSON payload body', () => {
+    const buf = 'Result from "Tip calc"\n\n<artifact-result artifact_id="abc123" agent_id="helper">\n{"payload":{"tip":18,"total":118}}\n</artifact-result>';
+    expect(_stripOuterTagBlocks(buf, 'artifact-result')).toBe('Result from "Tip calc"\n\n');
+  });
+
+  it('A2. payload JSON value contains backticks / angle brackets — still atomic', () => {
+    const buf = 'Result from "Editor"\n\n<artifact-result artifact_id="x" agent_id="a">\n{"payload":{"code":"a `b` <c>"}}\n</artifact-result>\nthanks';
+    const out = _stripOuterTagBlocks(buf, 'artifact-result');
+    expect(out).not.toContain('artifact-result');
+    expect(out).not.toContain('`b`');
+    expect(out).toBe('Result from "Editor"\n\n\nthanks');
+  });
+});
+
+describe('<artifact-result> — set B (literal mentions survive)', () => {
+  it('B1. inside a fenced ```xml block (e.g. the tool description quoting the protocol)', () => {
+    const buf = 'Format:\n```xml\n<artifact-result artifact_id="x" agent_id="y">\n{...}\n</artifact-result>\n```';
+    expect(_stripOuterTagBlocks(buf, 'artifact-result')).toBe(buf);
+  });
+
+  it('B2. inside an inline backtick span', () => {
+    const buf = 'The renderer posts a `<artifact-result ...>` tag back to you.';
+    expect(_stripOuterTagBlocks(buf, 'artifact-result')).toBe(buf);
+  });
+
+  it('B3. UNCLOSED inline backtick', () => {
+    const buf = 'see `<artifact-result';
+    expect(_stripOuterTagBlocks(buf, 'artifact-result')).toBe(buf);
+  });
+});
+
 // --- Boundary check: tagName lookup must not bleed across siblings -------
 
 describe('boundary check — `<agent>` lookup must not match `<agent-input-form>`', () => {
@@ -342,6 +379,13 @@ describe('_stripSurvivingStructuralBlocks (final-time safety strip)', () => {
   it('strips a hallucinated <agent-input-submission> in assistant text', () => {
     const buf = 'lead\n<agent-input-submission form_id="f" agent_id="a">{}</agent-input-submission>\ntail';
     expect(_stripSurvivingStructuralBlocks(buf)).toBe('lead\n\ntail');
+  });
+
+  it('strips a leaked <artifact-result> in assistant text but preserves a literal mention in code', () => {
+    const real = 'lead\n<artifact-result artifact_id="x" agent_id="a">{"payload":1}</artifact-result>\ntail';
+    expect(_stripSurvivingStructuralBlocks(real)).toBe('lead\n\ntail');
+    const literal = 'Post back a `<artifact-result ...>` tag.';
+    expect(_stripSurvivingStructuralBlocks(literal)).toBe(literal);
   });
 
   it('strips all three tags coexisting in one buffer', () => {

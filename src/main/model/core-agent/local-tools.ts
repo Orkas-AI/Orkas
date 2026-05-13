@@ -52,6 +52,7 @@ import { isPathAllowed } from '../../util/path-sandbox';
 import { kindOf } from '../../features/file_indexer';
 import { getWorkspacePath } from '../../features/user_workspace';
 import { chatAttachmentDir } from '../../paths';
+import * as chatArtifacts from '../../features/chat_artifacts';
 import { createLogger } from '../../logger';
 
 const log = createLogger('local-tools');
@@ -64,8 +65,15 @@ export interface LocalToolsOpts {
   userId?: string;
   /** Current conversation id. Used by `edit_file` to add the current
    *  conv's attachment dir to the sandbox. Without it, only the workspace
-   *  (+ extraRoots) is editable. */
+   *  (+ extraRoots) is editable. Also the storage key for `create_artifact`
+   *  (artifacts live under `chat_artifacts/<cid>/`); the tool errors out
+   *  when it's missing. */
   cid?: string;
+  /** The actor id producing this turn (an agent's id, or `''` for the
+   *  group-chat commander / edit chats). Stamped into `create_artifact`'s
+   *  metadata so the renderer knows which actor to route an interaction
+   *  result back to. */
+  agentId?: string;
   /** Project id of the current conversation, when it belongs to one.
    *  Threaded through from group_chat at runTurn so workspace resolution
    *  picks up the project-scoped selection (per CLAUDE.md projects feature).
@@ -79,6 +87,10 @@ export interface LocalToolsOpts {
    * edit_file, markdown_to_pdf, html_to_pdf). Lets chats.ts surface
    * produced files to the UI. */
   onFileWritten?: (absPath: string) => void;
+  /** Fires after a successful `create_artifact` call. The caller (group_chat
+   *  bus) collects these per turn and attaches `message.artifacts` to the
+   *  assistant record so the renderer embeds each one in the bubble. */
+  onArtifactCreated?: (a: { id: string; title: string }) => void;
   /** Predicate: returns true when the given absolute path was already
    *  written by this caller in the current scope (typically: a Set
    *  populated by `onFileWritten` this turn). When true, the wrapped
@@ -467,15 +479,105 @@ function createHtmlToPdfTool(opts: LocalToolsOpts): AgentTool {
   };
 }
 
+/** `create_artifact` — build an interactive multi-file web app shown live
+ *  inside the chat bubble (sandboxed `<iframe>` over the `chat-app://`
+ *  protocol). Permission-gated like the other write-style tools; writes only
+ *  into the current conversation's artifact pool (`chat_artifacts/<cid>/`),
+ *  never the workspace. On success fires `onArtifactCreated` so the caller
+ *  attaches it to the assistant message record. */
+function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
+  return {
+    name: 'create_artifact',
+    description:
+      'Build a small interactive web app (self-contained HTML/CSS/JS) that is rendered LIVE and clickable inside this chat reply, embedded in a sandboxed iframe.\n' +
+      '\n' +
+      'Use it for: dashboards, calculators, data visualizations, configurators, simulators, quizzes, mini-games — anything the user should interact with directly. Do NOT use it for static documents (use `html_to_pdf`) or images (use `generate_image`).\n' +
+      '\n' +
+      'Input: `{ title?, files: [{ path, content, encoding? }, ...] }`\n' +
+      '  - `files` MUST include a top-level `index.html` (the entry point). Up to 20 files, 256 KB per file, 1 MB total.\n' +
+      '  - `path` is a forward-slash relative path (e.g. `index.html`, `assets/app.js`). No `..`, no leading `/`, no dotfiles, no `__orkas/...`.\n' +
+      '  - Allowed extensions: text — `.html .htm .js .mjs .css .json .svg .xml .txt .csv`; binary (base64 only) — `.png .jpg .jpeg .gif .webp .ico .wasm .woff .woff2 .ttf .otf`.\n' +
+      '  - `content` is UTF-8 text by default; for a binary extension set `"encoding":"base64"` and pass base64 bytes.\n' +
+      '\n' +
+      'Constraints: the app runs OFFLINE — no network, no external CDN. Inline your CSS/JS or split into sibling files referenced by RELATIVE URL. The iframe is sandboxed (scripts + forms allowed; it cannot reach the host app).\n' +
+      '\n' +
+      'To get what the user does back: the app sends a message to its parent —\n' +
+      '  `parent.postMessage({ __orkasArtifact: true, type: "submit", payload: <json-serialisable value> }, "*")`\n' +
+      'and that arrives as the user\'s next message to you (a readable summary plus a machine tag). Optionally include `<script src="__orkas/bridge.js"></script>` to get `window.orkasArtifact.send(payload)` plus automatic iframe height — without the bridge the iframe is a fixed height (call `window.orkasArtifact.resize(px)` or post `{type:"resize",height:px}` to change it).\n' +
+      '\n' +
+      'After calling this tool, do NOT also paste the artifact\'s HTML in your reply — it is already shown.\n' +
+      '\n' +
+      'Permission: requires local execution permission (same gate as `write_file` / `html_to_pdf`).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: 'Short title shown above the embedded app. Optional; defaults to "Interactive app".' },
+        files: {
+          type: 'array',
+          description: 'The app files. Must include a top-level "index.html". Max 20 files, 256KB/file, 1MB total.',
+          items: {
+            type: 'object',
+            properties: {
+              path: { type: 'string', description: 'Forward-slash relative path, e.g. "index.html" or "assets/app.js". No "..", no leading "/", no dotfiles, no "__orkas/...".' },
+              content: { type: 'string', description: 'File contents. UTF-8 text by default; for a binary extension set "encoding":"base64" and pass base64.' },
+              encoding: { type: 'string', enum: ['utf8', 'base64'], description: 'Default "utf8". Use "base64" for image / font / wasm files.' },
+            },
+            required: ['path', 'content'],
+          },
+        },
+      },
+      required: ['files'],
+    },
+    async execute(input) {
+      if (!getLocalExecGranted()) return deniedResult();
+      const uid = opts.userId;
+      const cid = opts.cid;
+      if (!uid || !cid) {
+        return { content: errText('E_NO_CONVERSATION', 'create_artifact is only available inside a conversation.'), isError: true };
+      }
+      const r = chatArtifacts.createArtifact(uid, cid, opts.agentId || '', {
+        title: (input as { title?: unknown }).title,
+        files: (input as { files?: unknown }).files,
+      });
+      if (!r.ok) {
+        // Cast in the error branch — `strictNullChecks: false` keeps the
+        // whole `Result<>` union here (codebase-wide workaround).
+        const errMsg = (r as { error?: string }).error || 'invalid artifact';
+        log.warn(`create_artifact reject user=${uid} cid=${cid}: ${errMsg}`);
+        return { content: errText('E_BAD_ARTIFACT', errMsg), isError: true };
+      }
+      if (opts.onArtifactCreated) {
+        try { opts.onArtifactCreated({ id: r.artifactId, title: r.title }); }
+        catch (err) { log.warn(`onArtifactCreated callback failed: ${(err as Error).message}`); }
+      }
+      log.info(`create_artifact user=${uid} cid=${cid} id=${r.artifactId} agent=${opts.agentId || ''}`);
+      return {
+        content:
+          `Artifact "${r.title}" created (id ${r.artifactId}) — it is now shown to the user inside this reply, so do NOT paste its HTML in your message. ` +
+          `To receive what the user does in it, the app calls ` +
+          `parent.postMessage({ __orkasArtifact: true, type: "submit", payload: <json-serialisable value> }, "*") ` +
+          `(or, with <script src="__orkas/bridge.js"></script>, window.orkasArtifact.send(payload)); ` +
+          `that becomes the user's next message to you.`,
+      };
+    },
+  };
+}
+
 /** Build the array of local-machine tools for a single runner. */
 export function createLocalTools(opts: LocalToolsOpts = {}): AgentTool[] {
-  return [
+  const tools: AgentTool[] = [
     createBashTool(),
     createWriteFileTool(opts),
     createEditFileTool(opts),
     createMarkdownToPdfTool(opts),
     createHtmlToPdfTool(opts),
   ];
+  // `create_artifact` only makes sense on a conversation surface that
+  // renders the embedded result and routes interactions back — i.e. a `cid`
+  // plus an `onArtifactCreated` sink (group chat). Edit chats / ad-hoc runs
+  // don't pass the sink, so the tool isn't offered there.
+  if (opts.cid && opts.onArtifactCreated) tools.push(createCreateArtifactTool(opts));
+  return tools;
 }
 
 export { createFileTools } from './file-tools';

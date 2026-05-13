@@ -111,6 +111,26 @@ export const groupChatVisibilityFile = (uid: string, cid: string, actorId: strin
 export const userChatAttachmentsDir = (uid: string) => path.join(userCloudRoot(uid), 'chat_attachments');
 export const chatAttachmentDir      = (uid: string, cid: string) => path.join(userChatAttachmentsDir(uid), cid);
 
+// LLM-generated interactive web-app bundles (artifacts). Layout:
+// `<uid>/cloud/chat_artifacts/<cid>/<artifactId>/{index.html, ...assets, __orkas-meta.json}`.
+// Served read-only via the `chat-app://` protocol (see index.ts). Cloud-synced
+// with the conversation; purged by cid on conversation delete. Kept as a
+// separate pool from chat_attachments/ on purpose — attachments are user
+// uploads with an extension whitelist that `buildAttachmentManifest` scans to
+// feed the model; artifacts are arbitrary directory trees that must not.
+export const userChatArtifactsDir = (uid: string) => path.join(userCloudRoot(uid), 'chat_artifacts');
+export const chatArtifactCidDir   = (uid: string, cid: string) => path.join(userChatArtifactsDir(uid), cid);
+export const artifactDir          = (uid: string, cid: string, artifactId: string) =>
+  path.join(chatArtifactCidDir(uid, cid), artifactId);
+
+// User-kept copies of `create_artifact` apps ("My Apps"). Layout:
+// `<uid>/cloud/saved_apps/<appId>/{index.html, ...siblings, __orkas-meta.json}`.
+// Cloud-synced; never auto-purged (conversation-independent — only the user's
+// explicit delete from the My Apps tab removes one). Opened via `shell.openPath`
+// (a `file://` view). See `features/saved_apps.ts`.
+export const userSavedAppsDir = (uid: string) => path.join(userCloudRoot(uid), 'saved_apps');
+export const savedAppDir      = (uid: string, appId: string) => path.join(userSavedAppsDir(uid), appId);
+
 // core-agent session jsonl (LLM-view) — all session kinds land here:
 // conv (legacy) / gconv / gmember / skill / agent / extract-img.
 export const userSessionsDir        = (uid: string) => path.join(userCloudRoot(uid), 'sessions');
@@ -311,6 +331,8 @@ export function ensureUserLayout(uid: string): void {
   const dirs = [
     userChatsDir(uid),
     userChatAttachmentsDir(uid),
+    userChatArtifactsDir(uid),
+    userSavedAppsDir(uid),
     userSessionsDir(uid),
     userContextsDir(uid),
     userKbDir(uid),

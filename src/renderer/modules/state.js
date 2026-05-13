@@ -154,6 +154,7 @@ function bindStaticHandlers() {
   document.getElementById('new-chat-btn').addEventListener('click', () => setView('new-chat'));
   document.getElementById('agents-btn').addEventListener('click', () => setView('agents'));
   document.getElementById('skills-btn').addEventListener('click', () => setView('skills'));
+  document.getElementById('apps-btn')?.addEventListener('click', () => setView('apps'));
   document.getElementById('contexts-btn').addEventListener('click', () => setView('contexts'));
   document.getElementById('settings-btn')?.addEventListener('click', () => setView('settings'));
 

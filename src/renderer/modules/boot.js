@@ -144,6 +144,7 @@ function setView(view, cid, opts = {}) {
                 : view === 'agents' ? 'panel-agents'
                 : view === 'skills' ? 'panel-skills'
                 : view === 'contexts' ? 'panel-contexts'
+                : view === 'apps' ? 'panel-apps'
                 : view === 'settings' ? 'panel-settings'
                 : view === 'project' ? 'panel-project'
                 : 'panel-conversation';
@@ -153,6 +154,7 @@ function setView(view, cid, opts = {}) {
   document.getElementById('agents-btn').classList.toggle('active', view === 'agents');
   document.getElementById('skills-btn').classList.toggle('active', view === 'skills');
   document.getElementById('contexts-btn')?.classList.toggle('active', view === 'contexts');
+  document.getElementById('apps-btn')?.classList.toggle('active', view === 'apps');
   document.getElementById('settings-btn')?.classList.toggle('active', view === 'settings');
   document.querySelectorAll('.conv-item').forEach(it => {
     it.classList.toggle('active', view === 'conversation' && it.dataset.cid === cid);
@@ -232,6 +234,13 @@ function setView(view, cid, opts = {}) {
   } else if (view === 'contexts') {
     currentCid = null;
     loadContexts();
+  } else if (view === 'apps') {
+    currentCid = null;
+    // Force-refresh on every visit (same rationale as agents/skills): a
+    // "保存" can land while the user is on another tab — the tab is the
+    // recovery path, so it should always show ground truth. Cheap (one IPC
+    // + dir scan).
+    if (typeof loadSavedApps === 'function') loadSavedApps(true);
   } else if (view === 'settings') {
     currentCid = null;
     loadSettings();

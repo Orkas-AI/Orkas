@@ -39,8 +39,10 @@ function enumerateAllInjectedToolNames(): Set<string> {
     }).name,
   );
 
-  // local + file + kb + image gen
-  for (const t of createLocalTools({})) names.add(t.name);
+  // local + file + kb + image gen.
+  // Pass cid + onArtifactCreated so `create_artifact` is included — runner.ts
+  // wires both through for group-chat turns (see local-tools.createLocalTools).
+  for (const t of createLocalTools({ userId: 'testuid', cid: 'testcid', onArtifactCreated: () => {} })) names.add(t.name);
   for (const t of createFileTools({ userId: 'testuid', cid: 'testcid' })) names.add(t.name);
   for (const t of createKbTools({ userId: 'testuid' })) names.add(t.name);
   names.add(createImageGenTool({ userId: 'testuid', cid: 'testcid' }).name);

@@ -697,6 +697,7 @@ function _groupMsgToLegacy(gm) {
     ...(gm.form ? { form: gm.form } : {}),
     ...(_normalizeCreatedAgents(gm) ? { created_agents: _normalizeCreatedAgents(gm) } : {}),
     ...(_normalizeCreatedSkills(gm) ? { created_skills: _normalizeCreatedSkills(gm) } : {}),
+    ...(Array.isArray(gm.artifacts) && gm.artifacts.length ? { artifacts: gm.artifacts } : {}),
     ...(gm.plan_announcement ? { _plan_announcement: true } : {}),
     ...(Array.isArray(gm.process) && gm.process.length ? { process: gm.process } : {}),
   };
@@ -1647,7 +1648,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   // `_stripSurvivingStructuralBlocks` in strip-structural-blocks.js).
   let displayContent = rawContent;
   if (!isHtmlSnippet) {
-    if (role === 'user') displayContent = _stripSubmissionTagForDisplay(rawContent);
+    if (role === 'user') displayContent = _stripArtifactResultTagForDisplay(_stripSubmissionTagForDisplay(rawContent));
     else if (role === 'assistant') displayContent = _stripSurvivingStructuralBlocks(rawContent);
   }
   const contentHtml = isHtmlSnippet
@@ -1727,6 +1728,14 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
       bubble.appendChild(formHost);
       _mountChatInputForm(formHost, msgDiv, message, opts);
     }
+  }
+  // Interactive web-app artifacts (assistant messages only) — sandboxed
+  // `<iframe>` over the `chat-app://` protocol, appended after the form so it
+  // reads as "reply text → embedded app". See chat-artifact.js.
+  if (role === 'assistant' && Array.isArray(message.artifacts) && message.artifacts.length
+      && typeof window.mountMessageArtifacts === 'function') {
+    const bubble = msgDiv.querySelector('.chat-bubble');
+    if (bubble) window.mountMessageArtifacts(bubble, message.artifacts, opts.cid || currentCid);
   }
   // Archive button is only for finalised assistant replies (raw markdown,
   // not an HTML placeholder / status stub).
@@ -3414,6 +3423,13 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
       _mountChatInputForm(host, ph, formMessage, { cid });
     }
   }
+
+  // Interactive web-app artifacts (chat-app:// iframe). Idempotent — skips
+  // ids already mounted in this bubble.
+  if (Array.isArray(gm.artifacts) && gm.artifacts.length && typeof window.mountMessageArtifacts === 'function') {
+    const bubble = ph.querySelector('.chat-bubble');
+    if (bubble) window.mountMessageArtifacts(bubble, gm.artifacts, cid);
+  }
 }
 
 // Group-chat bus event router. Each event is one of:
@@ -3718,6 +3734,18 @@ function _stripSubmissionTagForDisplay(text) {
   // Same class of fragmentation / set-B leak as `<agent>` — see that
   // file's header for the invariant matrix.
   const out = _stripOuterTagBlocks(text, 'agent-input-submission');
+  if (out === text) return text;
+  return out.replace(/\n{3,}/g, '\n\n').trimEnd();
+}
+
+// Hide the `<artifact-result artifact_id=... agent_id=...>{json}
+// </artifact-result>` tag from a user message body at render time. The tag
+// is the machine payload an interactive artifact posted back (the LLM parses
+// it); the human reader only needs the one-line summary above it. Same
+// atomic-container strip + prose/code guard as the submission tag.
+function _stripArtifactResultTagForDisplay(text) {
+  if (!text || text.indexOf('<artifact-result') < 0) return text;
+  const out = _stripOuterTagBlocks(text, 'artifact-result');
   if (out === text) return text;
   return out.replace(/\n{3,}/g, '\n\n').trimEnd();
 }

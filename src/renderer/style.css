@@ -2821,6 +2821,149 @@ body.model-not-configured .main-content { flex-direction: column; }
   color: var(--muted);
 }
 
+/* Interactive web-app artifact card — sandboxed `<iframe>` over the
+   `chat-app://` protocol, embedded inside the assistant `.chat-bubble`.
+   See modules/chat-artifact.js. Understated chrome (a title bar + reload)
+   so it reads as an inline panel, not a separate window. */
+.chat-artifact-host { margin-top: 10px; }
+.chat-artifact-card {
+  width: 40cqw;
+  max-width: 100%;
+  min-width: 280px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--bg);
+}
+.chat-artifact-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 6px 10px;
+  background: rgba(127, 127, 127, 0.06);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.chat-artifact-title {
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 0 1 auto;
+}
+.chat-artifact-spacer { flex: 1 1 auto; }
+.chat-artifact-header .btn-sm { flex: 0 0 auto; }
+.chat-artifact-more {
+  /* A compact `⋯` button — slimmer than the default `.btn-sm` padding so it
+     reads as a quiet header affordance. */
+  padding: 2px 8px;
+  font-size: 15px;
+  line-height: 1;
+}
+.chat-artifact-more.is-menu-open { background: rgba(15, 23, 42, 0.08); }
+.chat-artifact-frame {
+  display: block;
+  width: 100%;
+  border: 0;
+  background: #fff;
+}
+/* Card-header `⋯` popover (reload / open in browser / save) + the My Apps
+   panel's per-card `⋯` popover — both mirror `.agent-row-menu`'s look. */
+.chat-artifact-menu,
+.app-row-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 120px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(15, 23, 42, 0.12);
+  padding: 4px 0;
+}
+.chat-artifact-menu-item,
+.app-row-menu-item {
+  padding: 6px 14px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+.chat-artifact-menu-item:hover,
+.app-row-menu-item:hover { background: #f1f5f9; }
+.app-row-menu-item.is-danger { color: #dc2626; }
+.app-row-menu-item.is-danger:hover { background: #fef2f2; }
+
+/* ─── "My Apps" panel — user-kept create_artifact bundles (saved-apps.js) ───
+   Reuses the agents-tab layout shells (`.agents-grid-view` / `-header` /
+   `-scroll` / `.agents-empty`); only the card grid + card need their own
+   classes (the agents tab binds a global `.agent-card` click handler). */
+.apps-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 16px;
+  padding: 8px 0 16px;
+}
+.app-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: border-color 0.12s, box-shadow 0.12s;
+  min-height: 84px;
+}
+.app-card:hover {
+  border-color: rgba(37, 99, 235, 0.45);
+  box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
+}
+.app-card.is-menu-open { border-color: rgba(37, 99, 235, 0.45); }
+.app-card-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 22px;
+}
+.app-card-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.app-card-more {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  margin-right: -4px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1;
+  border-radius: 4px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  visibility: hidden;
+}
+.app-card:hover .app-card-more,
+.app-card.is-menu-open .app-card-more { visibility: visible; }
+.app-card-more:hover { background: rgba(15, 23, 42, 0.08); color: #334155; }
+.app-card-hint {
+  font-size: 12px;
+  color: #94a3b8;
+}
+
 .chat-queue-header {
   display: flex;
   align-items: center;

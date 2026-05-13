@@ -59,6 +59,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   { name: 'stat_file',     group: 'fs', summary: 'Trigger PDF/DOCX extraction and return total_chars; call before read_file.' },
   { name: 'search_files',  group: 'fs', summary: 'Find files by name / glob across the workspace + attachment scope.' },
   { name: 'grep_files',    group: 'fs', summary: 'Grep text across the workspace + attachment scope (PDF/DOCX auto-extracted, then searched).' },
+  { name: 'create_artifact', group: 'fs', permission: 'localExec', summary: 'Build an interactive multi-file web app (HTML/CSS/JS) rendered live & clickable inside the chat bubble; for dashboards / calculators / visualizations / mini-tools — not documents (html_to_pdf) or images (generate_image).' },
 
   // Shell
   { name: 'bash',          group: 'shell', permission: 'localExec', summary: 'Execute a shell command on the user\'s machine (cwd = $working_dir).' },

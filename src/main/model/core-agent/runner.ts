@@ -126,6 +126,9 @@ export interface BuildRunnerParams {
   /** Caller-supplied predicate consumed by write-style tools' uniquify
    *  logic. See `model/client.ts` `ChatOptions.hasProducedPath`. */
   hasProducedPath?: (absPath: string) => boolean;
+  /** Fires after each successful `create_artifact` call. See `model/client.ts`
+   *  `ChatOptions.onArtifactCreated`. */
+  onArtifactCreated?: (a: { id: string; title: string }) => void;
 }
 
 /** Tool definition snapshot used to log "what tools did the LLM actually see
@@ -229,10 +232,12 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const localTools = createLocalTools({
     ...(uid ? { userId: uid } : {}),
     ...(params.cid ? { cid: params.cid } : {}),
+    ...(agentId ? { agentId } : {}),
     ...(params.projectId ? { projectId: params.projectId } : {}),
     ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
     ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
     ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
+    ...(params.onArtifactCreated ? { onArtifactCreated: params.onArtifactCreated } : {}),
   });
 
   // File-scoped tools (read_file override + search_files + grep_files).

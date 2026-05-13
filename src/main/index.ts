@@ -56,6 +56,19 @@ protocol.registerSchemesAsPrivileged([
     scheme: 'chat-media',
     privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true },
   },
+  // `chat-app://cid/<encCid>/<encArtifactId>/<relpath>` — serves the files of
+  // an LLM-generated interactive web-app artifact out of
+  // `<uid>/cloud/chat_artifacts/<cid>/<artifactId>/`, embedded in a sandboxed
+  // `<iframe>` in the chat bubble (renderer `modules/chat-artifact.js`).
+  // `standard:true` gives the iframe a real origin (`chat-app://cid`) so it
+  // can use `<script type="module">` / same-origin `fetch` of sibling files /
+  // `localStorage`; `secure:true` lets the `file://` renderer frame it
+  // without a mixed-content block (same as `kb-file://`). `stream:true` for
+  // the Range-aware streamed body (see `serveFileRange`).
+  {
+    scheme: 'chat-app',
+    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true },
+  },
 ]);
 
 // WS_ROOT env injection (`~/.orkas/data` on mac/linux; Windows pinned
@@ -108,6 +121,7 @@ import * as appConfig from './features/config';
 import * as reflectionTrigger from './features/reflection-trigger';
 import * as scheduledTasks from './features/scheduled_tasks';
 import * as chatAttachments from './features/chat_attachments';
+import * as chatArtifacts from './features/chat_artifacts';
 
 function createWindow(): BrowserWindow {
   const dev = !app.isPackaged;
@@ -532,6 +546,81 @@ function registerChatMediaProtocol(): void {
   });
 }
 
+// `chat-app://cid/<encCid>/<encArtifactId>/<relpath...>` — streams the files
+// of an LLM-generated interactive web-app artifact out of the active user's
+// `<uid>/cloud/chat_artifacts/<cid>/<artifactId>/`. Read-only; every request
+// is filtered through `chatArtifacts.resolveArtifactFilePath` (safe-cid /
+// safe-artifactId / safe-relpath + `path.relative` traversal guard + served
+// extension allowlist + regular-file check). The reserved virtual relpath
+// `__orkas/bridge.js` is served from the in-memory `BRIDGE_JS` constant, not
+// from disk. Fixed host (`cid`) sidesteps URL-parser divergence the same way
+// `chat-media://cid/...` does. `Access-Control-Allow-Origin: *` is set
+// defensively — `chat-app://` URLs are only issuable from inside this app.
+function _withArtifactCors(resp: Response): Response {
+  // Re-wrap so we can add the header without mutating the shared
+  // `serveFileRange` helper (kb-file / chat-media must not change). The body
+  // stream is passed through untouched — Chromium consumes it once.
+  const headers = new Headers(resp.headers);
+  headers.set('Access-Control-Allow-Origin', '*');
+  return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers });
+}
+
+function registerChatAppProtocol(): void {
+  protocol.handle('chat-app', async (request) => {
+    const reqUrl = request.url;
+    try {
+      let u: URL;
+      try { u = new URL(reqUrl); }
+      catch {
+        log.warn('chat-app: unparseable URL', { reqUrl });
+        return new Response('bad request', { status: 400 });
+      }
+      if (u.host.toLowerCase() !== 'cid') {
+        log.warn('chat-app: unknown host', { reqUrl, host: u.host });
+        return new Response('bad request', { status: 400 });
+      }
+      // pathname is `/<encCid>/<encArtifactId>/<relpath...>` (always leading
+      // slash, URL-encoded). Decode the whole thing then split — decoding
+      // first then splitting on `/` is wrong if a relpath segment contained
+      // an encoded slash, but artifact file paths never do (safeRelPath
+      // rejects `\0` / `\`, and an encoded `/` would just be a path
+      // separator anyway); decode per-segment to be precise.
+      const rawSegs = (u.pathname || '').replace(/^\/+/, '').split('/');
+      const cid = rawSegs[0] ? decodeURIComponent(rawSegs[0]) : '';
+      const artifactId = rawSegs[1] ? decodeURIComponent(rawSegs[1]) : '';
+      const relPath = rawSegs.slice(2).map((s) => (s ? decodeURIComponent(s) : '')).join('/');
+      if (!cid || !artifactId) {
+        log.warn('chat-app: bad URL (need cid + artifactId)', { reqUrl });
+        return new Response('bad request', { status: 400 });
+      }
+
+      // Reserved virtual path: the runtime bridge script (not on disk).
+      if (relPath === chatArtifacts.BRIDGE_RELPATH) {
+        return _withArtifactCors(new Response(chatArtifacts.BRIDGE_JS, {
+          headers: { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'private, max-age=60' },
+        }));
+      }
+
+      const uid = users.getActiveUserId();
+      const resolved = chatArtifacts.resolveArtifactFilePath(uid, cid, artifactId, relPath);
+      if (!resolved.ok) {
+        // Cast in the error branch — `strictNullChecks: false` keeps the
+        // whole union here (same workaround as the chat-media handler above).
+        const code = (resolved as { code?: string }).code;
+        const errMsg = (resolved as { error?: string }).error;
+        log.warn('chat-app: reject', { reqUrl, code, error: errMsg });
+        return new Response(String(errMsg || code || 'error'), { status: _statusFor(code) });
+      }
+      const st = fs.statSync(resolved.absPath);
+      log.info('chat-app: serving', { abs: resolved.absPath, mime: resolved.mime, bytes: st.size });
+      return _withArtifactCors(serveFileRange(request, resolved.absPath, resolved.mime, st.size));
+    } catch (err) {
+      log.warn('chat-app serve failed', { reqUrl, error: (err as Error).message });
+      return new Response('error', { status: 500 });
+    }
+  });
+}
+
 // Single-instance lock prevents double-launch from duplicating the backend.
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
@@ -571,6 +660,7 @@ if (!gotLock) {
     }
     registerKbFileProtocol();
     registerChatMediaProtocol();
+    registerChatAppProtocol();
     registerIpc();
     createWindow();
 
