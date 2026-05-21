@@ -348,6 +348,10 @@ function _renderAgentRowMenuItems(menu, agentId) {
   // schedule is a user-orchestration concern that only references the
   // agent and doesn't mutate its spec.
   items.push(`<div class="agent-row-menu-item" data-action="schedule">${escapeHtml(t('agents.schedule.menu'))}</div>`);
+  if (isCustom && isDevMode()) {
+    items.push(`<div class="agent-row-menu-item" data-action="promote">${escapeHtml(t('agents.promote_to_builtin'))}</div>`);
+    items.push(`<div class="agent-row-menu-item" data-action="upload-marketplace">${escapeHtml(t('marketplace.upload'))}</div>`);
+  }
   items.push(`<div class="agent-row-menu-item" data-action="toggle-enabled">${escapeHtml(toggleLabel)}</div>`);
   if (canEdit) {
     items.push(`<div class="agent-row-menu-item is-danger" data-action="delete">${escapeHtml(t('agents.delete'))}</div>`);
@@ -366,6 +370,11 @@ function _renderAgentRowMenuItems(menu, agentId) {
       } else if (action === 'delete') {
         if (_selectedAgent?.id !== aid) await selectAgent(aid);
         await deleteSelectedAgent();
+
+      } else if (action === 'promote') {
+        await promoteCustomAgent(aid);
+      } else if (action === 'upload-marketplace') {
+        if (typeof openMarketplaceUpload === 'function') await openMarketplaceUpload('agent', aid);
       } else if (action === 'toggle-enabled') {
         await _flipAgentEnabledFromMenu(aid);
       } else if (action === 'schedule') {

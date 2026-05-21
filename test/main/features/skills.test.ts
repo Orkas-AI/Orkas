@@ -830,3 +830,78 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
     expect(events.filter((e) => e.type === 'progress')).toHaveLength(0);
   });
 });
+
+// Marketplace-installed skills share BUILTIN_SKILLS_DIR with shipped built-ins, distinguished by
+// a top-level `_marketplace.json` sentinel. Sync must leave them alone and the sentinel itself
+// must not influence the hash.
+describe('skills › marketplace sentinel', () => {
+  function builtinSrcSkillsDir(): string {
+    return path.join(tmpDir, 'skills');  // ORKAS_BUILTIN_ROOT = tmpDir, so SRC = tmpDir/skills
+  }
+  function writeMarketplaceSkill(id: string, body = '# from marketplace'): string {
+    const dir = path.join(builtinSkillsDir(), id);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'SKILL.md'), `---\nname: ${id}\ndescription: mp\n---\n${body}`);
+    fs.writeFileSync(path.join(dir, '_marketplace.json'), JSON.stringify({
+      server_id: id, version: '1.0.0', category: 'general', installed_at: 1700000000000,
+    }));
+    return dir;
+  }
+  function writePlainBuiltinSkillDst(id: string): string {
+    const dir = path.join(builtinSkillsDir(), id);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'SKILL.md'), `---\nname: ${id}\ndescription: plain\n---\n`);
+    return dir;
+  }
+  function writeSrcBuiltinSkill(id: string, body = '# from src builtin'): void {
+    const dir = path.join(builtinSrcSkillsDir(), id);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'SKILL.md'), `---\nname: ${id}\ndescription: shipped\n---\n${body}`);
+  }
+
+  it('hashTree ignores _marketplace.json at any level', async () => {
+    const s = await loadSkills();
+    const root = path.join(tmpDir, 'mp-hash');
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(root, 'SKILL.md'), 'baseline');
+    const baseline = s.hashTree(root);
+
+    // Adding the sentinel must NOT change the hash (otherwise every startup would re-sync).
+    fs.writeFileSync(path.join(root, '_marketplace.json'), '{"v":"1.0.0"}');
+    expect(s.hashTree(root)).toBe(baseline);
+
+    // Mutating SKILL.md still does change it (sanity).
+    fs.writeFileSync(path.join(root, 'SKILL.md'), 'baseline-modified');
+    expect(s.hashTree(root)).not.toBe(baseline);
+  });
+
+  it('syncBuiltinSkills preserves marketplace dirs but still removes plain stale dirs', async () => {
+    const s = await loadSkills();
+    fs.mkdirSync(builtinSkillsDir(), { recursive: true });
+    fs.mkdirSync(builtinSrcSkillsDir(), { recursive: true });
+
+    const mpDir    = writeMarketplaceSkill('mp-skill-1');
+    const plainDir = writePlainBuiltinSkillDst('stale-skill-1');
+
+    s.syncBuiltinSkills();
+
+    expect(fs.existsSync(mpDir)).toBe(true);
+    expect(fs.existsSync(path.join(mpDir, '_marketplace.json'))).toBe(true);
+    expect(fs.existsSync(plainDir)).toBe(false);
+  });
+
+  it('syncBuiltinSkills does not overwrite a marketplace dir with a same-name shipped skill', async () => {
+    const s = await loadSkills();
+    fs.mkdirSync(builtinSkillsDir(), { recursive: true });
+    fs.mkdirSync(builtinSrcSkillsDir(), { recursive: true });
+    const id = 'shared-id';
+    writeSrcBuiltinSkill(id, '# from src builtin');
+    writeMarketplaceSkill(id, '# from marketplace');
+
+    s.syncBuiltinSkills();
+
+    const dst = fs.readFileSync(path.join(builtinSkillsDir(), id, 'SKILL.md'), 'utf8');
+    expect(dst).toContain('from marketplace');
+    expect(fs.existsSync(path.join(builtinSkillsDir(), id, '_marketplace.json'))).toBe(true);
+  });
+});

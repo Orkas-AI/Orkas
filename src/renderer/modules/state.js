@@ -215,6 +215,7 @@ function bindStaticHandlers() {
   // Agents (grid + detail)
   // "Done" button (only visible while editing) — exits edit mode.
   document.getElementById('create-agent-btn')?.addEventListener('click', () => openAgentModal());
+  document.getElementById('agents-more-btn')?.addEventListener('click', () => openMarketplace('agent'));
   document.getElementById('agents-back-btn')?.addEventListener('click', () => _showAgentsGridView());
   document.getElementById('agent-use-btn')?.addEventListener('click', () => {
     if (_selectedAgent) useAgent(_selectedAgent.id);
@@ -247,6 +248,7 @@ function bindStaticHandlers() {
 
   // Skill buttons
   document.getElementById('create-skill-btn')?.addEventListener('click', () => openSkillModal());
+  document.getElementById('skills-more-btn')?.addEventListener('click', () => openMarketplace('skill'));
   document.getElementById('skill-use-btn')?.addEventListener('click', () => {
     if (_selectedSkill) useSkill(_selectedSkill.id, _selectedSkill.name);
   });

@@ -25,6 +25,7 @@ import * as agents from '../features/agents';
 import * as scheduledTasks from '../features/scheduled_tasks';
 import { isAgentEnabled } from '../features/component_enabled';
 import * as skills from '../features/skills';
+import * as marketplace from '../features/marketplace';
 import * as contexts from '../features/contexts';
 import * as kbVector from '../features/kb_vector';
 import * as kbIndexer from '../features/kb_indexer';
@@ -599,6 +600,25 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const text = (content || '').trim();
     if (!text) throw new Error('empty message');
     return skills.sendToSkillChat(ctx.userId, id, text);
+  },
+
+  // ── Marketplace ──
+  // Listing + install endpoints hit the public Server catalog; no auth wiring needed on the
+  // client side. Upload endpoints live in `dev_handlers.ts` (dev builds only).
+  'marketplace.categories': async ({ kind } = {}) => ({ list: await marketplace.listCategories(kind) }),
+
+  'marketplace.listAgents': async (opts = {}) => marketplace.listMarketplaceAgents(opts),
+
+  'marketplace.listSkills': async (opts = {}) => marketplace.listMarketplaceSkills(opts),
+
+  'marketplace.installAgent': async ({ id }) => {
+    if (!id || typeof id !== 'string') throw new Error('id required');
+    return marketplace.installMarketplaceAgent(id);
+  },
+
+  'marketplace.installSkill': async ({ id }) => {
+    if (!id || typeof id !== 'string') throw new Error('id required');
+    return marketplace.installMarketplaceSkill(id);
   },
 
   // ── Contexts (user-owned directory tree; vectorized via kb_indexer) ──

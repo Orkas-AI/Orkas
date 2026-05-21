@@ -129,6 +129,16 @@ export interface SkillChatMeta { session_id?: string; [k: string]: unknown }
 // 1. Builtin skill sync (startup)
 // ═══════════════════════════════════════════════════════════════════════
 
+/** A skill dir is marketplace-installed iff it carries a `_marketplace.json` sentinel — see
+ *  `features/marketplace.ts::writeSentinel`. Marketplace items aren't in `src/builtin/skills/`,
+ *  so the startup sync must leave them alone: they're filtered out of the stale-removal step,
+ *  and a marketplace install of the same id wins over a same-named built-in (built-in does NOT
+ *  overwrite). The sentinel itself is also excluded from `hashTree` so it doesn't trip the
+ *  per-startup short-circuit. */
+function _isMarketplaceInstalled(dir: string): boolean {
+  return fs.existsSync(path.join(dir, '_marketplace.json'));
+}
+
 /**
  * Stable content hash of every file under `root`. Mirrors the Python
  * `_hash_tree`: relative posix paths + NUL + bytes + newline per file,
@@ -145,6 +155,7 @@ export function hashTree(root: string): string {
       const rel = relBase ? `${relBase}/${e.name}` : e.name;
       const parts = rel.split('/');
       if (parts.some((p) => SKILL_TREE_IGNORE.has(p) || p.startsWith('.'))) continue;
+      if (e.name === '_marketplace.json') continue;
       const full = path.join(dir, e.name);
       if (e.isDirectory()) walk(full, rel);
       else if (e.isFile()) {
@@ -173,8 +184,13 @@ export function syncBuiltinSkills(): boolean {
   const srcNames = new Set(fs.readdirSync(BUILTIN_SKILLS_SOURCE, { withFileTypes: true })
     .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
     .map((e) => e.name));
+  // Marketplace-installed dirs are filtered out so they neither contribute to "stale" detection
+  // (would be deleted because src/builtin doesn't ship them) nor get overwritten by a same-named
+  // built-in during the content-diff pass.
   const dstNames = new Set(fs.readdirSync(BUILTIN_SKILLS_DIR, { withFileTypes: true })
-    .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+    .filter((e) => e.isDirectory()
+      && !e.name.startsWith('.')
+      && !_isMarketplaceInstalled(path.join(BUILTIN_SKILLS_DIR, e.name)))
     .map((e) => e.name));
 
   let changed = false;
@@ -190,10 +206,11 @@ export function syncBuiltinSkills(): boolean {
     }
   }
 
-  // Content-diff sync
+  // Content-diff sync. Skip names where dst is a marketplace install (preserve user choice).
   for (const name of [...srcNames].sort()) {
     const src = path.join(BUILTIN_SKILLS_SOURCE, name);
     const dst = path.join(BUILTIN_SKILLS_DIR, name);
+    if (fs.existsSync(dst) && _isMarketplaceInstalled(dst)) continue;
     const srcHash = hashTree(src);
     const dstHash = fs.existsSync(dst) && fs.statSync(dst).isDirectory() ? hashTree(dst) : '';
     if (srcHash === dstHash) continue;

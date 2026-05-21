@@ -184,6 +184,15 @@ export interface AgentChatMeta { session_id?: string; [k: string]: unknown }
 // 1. Builtin agent sync (startup)
 // ─────────────────────────────────────────────────────────────────────────
 
+/** A dir is marketplace-installed iff it carries a `_marketplace.json` sentinel — see
+ *  `features/marketplace.ts::writeSentinel`. Such dirs are owned by the user via the marketplace
+ *  install flow, NOT by `PC/src/builtin/`, so the startup sync must ignore them: they don't
+ *  contribute to the hash (otherwise the per-startup short-circuit would never fire when any
+ *  marketplace item is installed), and they're never garbage-collected. */
+function _isMarketplaceInstalled(dir: string): boolean {
+  return fs.existsSync(path.join(dir, '_marketplace.json'));
+}
+
 /** Hash all agent definitions under `root` (directory form: `<aid>/agent.json`).
  * Used by `syncBuiltinAgents` to detect upstream changes. Skipped: dot-prefixed
  * dirs and any subdir without `agent.json` (so the hash is stable against
@@ -196,7 +205,9 @@ export function hashTree(root: string): string {
     .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
     .sort((a, b) => a.name.localeCompare(b.name));
   for (const e of entries) {
-    const specFile = path.join(root, e.name, 'agent.json');
+    const dir = path.join(root, e.name);
+    if (_isMarketplaceInstalled(dir)) continue;
+    const specFile = path.join(dir, 'agent.json');
     if (!fs.existsSync(specFile)) continue;
     h.update(e.name, 'utf8');
     h.update(Buffer.from([0]));
@@ -220,7 +231,8 @@ export function syncBuiltinAgents(): boolean {
     fs.readdirSync(root, { withFileTypes: true })
       .filter((e) => e.isDirectory()
         && !e.name.startsWith('.')
-        && fs.existsSync(path.join(root, e.name, 'agent.json')))
+        && fs.existsSync(path.join(root, e.name, 'agent.json'))
+        && !_isMarketplaceInstalled(path.join(root, e.name)))
       .map((e) => e.name),
   );
   const srcIds = listAgentDirs(BUILTIN_AGENTS_SOURCE);
@@ -237,6 +249,9 @@ export function syncBuiltinAgents(): boolean {
     }
   }
   for (const id of [...srcIds].sort()) {
+    // Marketplace install of the same id wins (the sentinel signals a user-driven choice that
+    // overrides the shipped built-in — same contract as skills.ts::syncBuiltinSkills).
+    if (_isMarketplaceInstalled(builtinAgentDir(id))) continue;
     const src = path.join(BUILTIN_AGENTS_SOURCE, id, 'agent.json');
     const dst = builtinAgentDefinitionFile(id);
     try {

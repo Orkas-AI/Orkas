@@ -51,6 +51,11 @@ const _IPC_ROUTES = [
   ['POST',   '/api/kb/reconcile',             'kb.reconcile'],
   ['POST',   '/api/kb/reprocess',             'kb.reprocess'],
   ['POST',   '/api/kb/events/stream',         'kb.events',                  null, { stream: true }],
+  ['POST',   '/api/marketplace/categories',   'marketplace.categories'],
+  ['POST',   '/api/marketplace/agents/list',  'marketplace.listAgents'],
+  ['POST',   '/api/marketplace/skills/list',  'marketplace.listSkills'],
+  ['POST',   '/api/marketplace/agents/install', 'marketplace.installAgent'],
+  ['POST',   '/api/marketplace/skills/install', 'marketplace.installSkill'],
 
   // Pattern routes (with path parameters)
   ['DELETE', /^\/api\/conversations\/([^/]+)$/,            'conversations.delete',       ['cid']],

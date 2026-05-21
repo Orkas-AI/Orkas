@@ -298,6 +298,15 @@ function _openSkillRowMenu(anchorBtn, id, source) {
   items.push(
     `<div class="skill-row-menu-item" data-action="toggle-enabled">${escapeHtml(enabled ? t('component.disable') : t('component.enable'))}</div>`,
   );
+
+  if (source === 'custom' && isDevMode()) {
+    items.push(
+      `<div class="skill-row-menu-item" data-action="promote">${escapeHtml(t('skills.promote_to_builtin'))}</div>`,
+    );
+    items.push(
+      `<div class="skill-row-menu-item" data-action="upload-marketplace">${escapeHtml(t('marketplace.upload'))}</div>`,
+    );
+  }
   if (canEdit) {
     items.push(`<div class="skill-row-menu-item is-danger" data-action="delete">${escapeHtml(t('skills.delete'))}</div>`);
   }
@@ -320,6 +329,11 @@ function _openSkillRowMenu(anchorBtn, id, source) {
         // Mimic the existing delete flow (from detail page) but for any card.
         _selectedSkill = { source, id, filepath: 'SKILL.md', name: '' };
         await deleteSelectedSkill();
+
+      } else if (action === 'promote') {
+        await promoteCustomSkill(id);
+      } else if (action === 'upload-marketplace') {
+        if (typeof openMarketplaceUpload === 'function') await openMarketplaceUpload('skill', id);
       } else if (action === 'toggle-enabled') {
         const cur = _skillsCache?.find((s) => s.id === id && s.source === source);
         const nextEnabled = !(cur ? cur.enabled !== false : true);
