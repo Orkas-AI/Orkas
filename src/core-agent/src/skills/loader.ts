@@ -111,16 +111,13 @@ export class SkillLoader {
       return null;
     }
     const { data } = parseFrontmatter(raw);
+    // `id` = dir basename (always unique within the loader's roots, used as the read_file
+    // path component). `name` = frontmatter human-readable display label; falls back to
+    // the id when frontmatter is missing one. Decoupled because marketplace installs land
+    // under `<server-id>/` (hex string) but should still surface their authored name to
+    // the LLM picker — see PC CLAUDE.md §6 and `skill-registry::renderSkillLines`.
     const id = path.basename(dir);
-    // Invariant: frontmatter `name` must equal the directory name (id).
-    // The edit UI (`features/skills.ts::updateCustomSkill`) already renames
-    // dir + rewrites frontmatter atomically, so divergence only happens
-    // when a SKILL.md is hand-edited. Override silently here and log so
-    // the drift surfaces in dev logs without breaking the load.
-    const declaredName = data.name && data.name.trim();
-    if (declaredName && declaredName !== id) {
-      log.warn(`skill ${id}: frontmatter name "${declaredName}" differs from dir; using dir name`);
-    }
+    const declaredName = (data.name && data.name.trim()) || id;
     // Migrate legacy single-`description` into the matching language slot.
     // Heuristic: if it contains any CJK ideograph it lands in `_zh`, else
     // `_en`. Explicit `description_zh` / `description_en` always win, even
@@ -131,7 +128,7 @@ export class SkillLoader {
     const legacyHasChinese = /[一-鿿]/.test(legacy);
     return {
       id,
-      name: id,
+      name: declaredName,
       description_zh: explicitZh || (legacy && legacyHasChinese ? legacy : ""),
       description_en: explicitEn || (legacy && !legacyHasChinese ? legacy : ""),
       dir,

@@ -77,6 +77,10 @@
                   <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
                   <span class="chat-recipient-name" id="new-chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
                 </button>
+                <div class="chat-skill-chip" id="new-chat-skill-chip" data-target="new-chat" style="display:none">
+                  <span class="chip-label"></span>
+                  <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
+                </div>
                 <button type="button" class="chat-project-chip" id="new-chat-project-chip" data-i18n-title="chat.project_picker_title" title="Pick project">
                   <span class="chat-project-prefix" data-i18n="chat.project_label">Project: </span>
                   <span class="chat-project-name" id="new-chat-project-name" data-i18n="chat.project_none">None</span>
@@ -84,10 +88,6 @@
                     <polyline points="6 9 12 15 18 9"/>
                   </svg>
                 </button>
-                <div class="chat-skill-chip" id="new-chat-skill-chip" data-target="new-chat" style="display:none">
-                  <span class="chip-label"></span>
-                  <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
-                </div>
                 <input type="file" id="new-chat-attach-input" multiple style="display:none"
                        accept=".md,.markdown,.txt,.csv,.tsv,.json,.yaml,.yml,.log,.pdf,.docx,.png,.jpg,.jpeg,.webp,.gif,text/plain,text/markdown,text/csv,application/json,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/png,image/jpeg,image/webp,image/gif" />
                 <button id="new-chat-send-btn" class="chat-send-btn" data-i18n-title="new_chat.send_title" title="Send">
@@ -166,9 +166,12 @@
         <div class="skills-grid-view" id="skills-grid-view">
           <div class="skills-grid-header">
             <span data-i18n="skills.title">Skills</span>
-            <button class="btn btn-sm" id="skills-more-btn" data-i18n="skills.more_btn">More</button>
-            <button class="btn btn-sm" id="create-skill-btn" data-i18n="skills.add">+ Add</button>
+            <div class="header-actions">
+              <button class="btn btn-sm" id="create-skill-btn" data-i18n="skills.add">+ Add</button>
+              <button class="btn btn-sm" id="skills-more-btn" data-i18n="skills.more_btn">More</button>
+            </div>
           </div>
+          <div class="marketplace-reconcile-banner" data-reconcile-banner style="display:none"></div>
           <div class="skills-grid-scroll">
             <div class="skills-group" id="skills-grid-custom-group" style="display:none">
               <div class="skills-group-label" data-i18n="skills.custom_group">Custom</div>
@@ -185,14 +188,9 @@
         <!-- Detail view (replaces grid when a card is opened) -->
         <div class="skills-detail-view" id="skills-detail-view" style="display:none">
           <div class="skills-detail-col" id="skills-detail-col">
-            <div class="skills-detail-breadcrumb">
-              <button type="button" class="skills-back-btn" id="skills-back-btn">
-                <span aria-hidden="true">←</span>
-                <span data-i18n="skills.back">Back to skills</span>
-              </button>
-            </div>
             <div class="skills-detail-content" id="skills-detail-content" style="display:none">
               <div class="skills-doc-headline">
+                <button type="button" class="btn btn-sm" id="skills-back-btn" data-i18n="common.back">Back</button>
                 <h1 class="skills-doc-title" id="skills-detail-name" data-editable="false"></h1>
                 <span class="skills-doc-source" id="skills-detail-source"></span>
                 <div class="skills-doc-actions" id="skills-detail-actions">
@@ -201,6 +199,9 @@
                   </button>
                   <button class="btn btn-sm" id="skill-edit-btn" data-i18n="skills.edit">Edit</button>
                   <button class="btn btn-sm" id="skill-enabled-btn" data-i18n="component.disable">Disable</button>
+
+                  <button class="btn btn-sm" id="skill-promote-btn" style="display:none" data-i18n="skills.promote_to_builtin">Make built-in (dev)</button>
+                  <button class="btn btn-sm" id="skill-upload-marketplace-btn" style="display:none" data-i18n="marketplace.upload">Upload to marketplace (dev)</button>
                   <button class="btn btn-sm btn-danger" id="skill-delete-btn" data-i18n="skills.delete">Delete</button>
                 </div>
               </div>
@@ -260,9 +261,12 @@
         <div class="agents-grid-view" id="agents-grid-view">
           <div class="agents-grid-header">
             <span data-i18n="agents.title">Agents</span>
-            <button class="btn btn-sm" id="agents-more-btn" data-i18n="agents.more_btn">More</button>
-            <button class="btn btn-sm" id="create-agent-btn" data-i18n="agents.create_btn">+ Create</button>
+            <div class="header-actions">
+              <button class="btn btn-sm" id="create-agent-btn" data-i18n="agents.create_btn">+ Create</button>
+              <button class="btn btn-sm" id="agents-more-btn" data-i18n="agents.more_btn">More</button>
+            </div>
           </div>
+          <div class="marketplace-reconcile-banner" data-reconcile-banner style="display:none"></div>
           <div class="agents-grid-scroll">
             <div class="agents-group" id="agents-grid-custom-group" style="display:none">
               <div class="agents-group-label" data-i18n="agents.custom_group">Custom</div>
@@ -279,15 +283,10 @@
         <!-- Detail view (replaces grid when a card is opened) -->
         <div class="agents-detail-view" id="agents-detail-view" style="display:none">
           <div class="agents-detail-col" id="agents-detail-col">
-            <div class="agents-detail-breadcrumb">
-              <button type="button" class="agents-back-btn" id="agents-back-btn">
-                <span aria-hidden="true">←</span>
-                <span data-i18n="agents.back">Back to agents</span>
-              </button>
-            </div>
             <div class="agents-detail-content" id="agents-detail-content" style="display:none">
               <div class="agents-detail-header">
                 <div class="agents-detail-title-row">
+                  <button type="button" class="btn btn-sm" id="agents-back-btn" data-i18n="common.back">Back</button>
                   <span class="agents-detail-avatar-slot" id="agents-detail-avatar"></span>
                   <div class="agents-detail-name" id="agents-detail-name" contenteditable="false"></div>
                   <span class="agents-detail-source" id="agents-detail-source"></span>
@@ -297,6 +296,9 @@
                     </button>
                     <button class="btn btn-sm" id="agent-edit-btn" data-i18n="agents.edit_btn_edit">Edit</button>
                     <button class="btn btn-sm" id="agent-enabled-btn" data-i18n="component.disable">Disable</button>
+
+                    <button class="btn btn-sm" id="agent-promote-btn" style="display:none" data-i18n="agents.promote_to_builtin">Make built-in (dev)</button>
+                    <button class="btn btn-sm" id="agent-upload-marketplace-btn" style="display:none" data-i18n="marketplace.upload">Upload to marketplace (dev)</button>
                     <button class="btn btn-sm btn-danger" id="agent-delete-btn" data-i18n="agents.delete">Delete</button>
                   </div>
                 </div>
@@ -338,6 +340,40 @@
               </button>
             </div>
           </div>
+        </div>
+      </section>
+
+      <!-- Marketplace (entered via the More button on agents / skills tabs;
+           closes back to its origin view via openMarketplace's return-stack).
+           Two sub-views — grid (browse + categories) and detail (full content + install). -->
+      <section class="panel" id="panel-marketplace">
+        <!-- Grid view (default) -->
+        <div class="marketplace-grid-view" id="marketplace-grid-view">
+          <div class="marketplace-header">
+            <button type="button" class="btn btn-sm" data-mp-close data-i18n="common.back">Back</button>
+            <div class="marketplace-tabs">
+              <button type="button" class="marketplace-tab" data-mp-tab="agent" data-i18n="marketplace.tab_agent">Agents</button>
+              <button type="button" class="marketplace-tab" data-mp-tab="skill" data-i18n="marketplace.tab_skill">Skills</button>
+            </div>
+            <input type="text" class="marketplace-search" data-mp-search data-i18n-placeholder="marketplace.search_ph" />
+          </div>
+          <div class="marketplace-categories" data-mp-categories></div>
+          <div class="marketplace-body" data-mp-body></div>
+        </div>
+
+        <!-- Detail view (replaces grid when a card is clicked) -->
+        <div class="marketplace-detail-view" id="marketplace-detail-view" style="display:none">
+          <div class="marketplace-detail-header">
+            <button type="button" class="btn btn-sm" data-mp-detail-back data-i18n="common.back">Back</button>
+            <span class="marketplace-detail-avatar-slot" data-mp-detail-avatar></span>
+            <div class="marketplace-detail-title-wrap">
+              <span class="marketplace-detail-title" data-mp-detail-name></span>
+              <span class="marketplace-detail-meta-row" data-mp-detail-meta></span>
+            </div>
+            <button type="button" class="btn btn-sm btn-primary" data-mp-detail-install></button>
+            <button type="button" class="btn btn-sm btn-danger" data-mp-detail-delete style="display:none" data-i18n="marketplace.delete">Delete (dev)</button>
+          </div>
+          <div class="marketplace-detail-body" data-mp-detail-body></div>
         </div>
       </section>
 
@@ -619,6 +655,10 @@
           <input type="text" id="agent-name-input" data-i18n-placeholder="agent_modal.name_placeholder" placeholder="e.g. Code Review Assistant" />
         </div>
         <div class="form-row">
+          <label data-i18n="agent_modal.category">Category</label>
+          <div class="ai-select" id="agent-category-select"></div>
+        </div>
+        <div class="form-row">
           <label><span data-i18n="agent_modal.desc">Summary</span> <span class="form-hint" data-i18n="agent_modal.desc_hint">One line on what it does — the AI will generate a workflow from this</span></label>
           <textarea id="agent-desc-input" rows="4" data-i18n-placeholder="agent_modal.desc_placeholder" placeholder="e.g. Review my code before commit, focus on logic bugs and security issues..."></textarea>
         </div>
@@ -636,6 +676,10 @@
         <div class="form-row">
           <label data-i18n="agent_modal.ext_name">Name</label>
           <input type="text" id="agent-ext-name-input" data-i18n-placeholder="agent_modal.ext_name_placeholder" placeholder="e.g. Claude Code" />
+        </div>
+        <div class="form-row">
+          <label data-i18n="agent_modal.category">Category</label>
+          <div class="ai-select" id="agent-ext-category-select"></div>
         </div>
         <div class="form-row">
           <label data-i18n="agent_modal.ext_desc">Summary</label>
@@ -669,6 +713,10 @@
         <div class="form-row">
           <label><span data-i18n="skill_modal.name">Name (English)</span><span class="form-hint" data-i18n="skill_modal.name_hint">Starts with a letter; digits, -, _, and one space allowed</span></label>
           <input type="text" id="skill-name" data-i18n-placeholder="skill_modal.name_placeholder" placeholder="e.g. web-summary" />
+        </div>
+        <div class="form-row">
+          <label data-i18n="skill_modal.category">Category</label>
+          <div class="ai-select" id="skill-category-select"></div>
         </div>
         <div class="form-row">
           <label data-i18n="skill_modal.description">Summary</label>
@@ -857,6 +905,7 @@
   <script src="./modules/agent-schedule.js"></script>
   <script src="./modules/utils.js"></script>
   <script src="./modules/marketplace.js"></script>
+  <script src="./modules/marketplace_dev.js"></script>
 
   <!--
     MathJax v3.2.2 — TeX → CommonHTML.

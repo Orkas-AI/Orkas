@@ -3,21 +3,24 @@
  * shared by every core-agent chat request.
  *
  * Resolution order (see CLAUDE.md §6):
- *   1. <uid>/cloud/skills/      (user-custom; same id overrides builtin)
- *   2. data/builtin/skills/     (built-in; hash-synced from src/builtin/skills at startup)
+ *   1. <uid>/cloud/skills/                (user-custom; same id overrides platform install)
+ *   2. <uid>/local/marketplace/skills/    (platform-installed; per-machine copy reconciled
+ *                                          from the cloud-synced installs.json manifest)
  *
  * The loader caches by per-dir mtime, so `list()` is effectively free
  * between CRUD events. `features/skills.ts` can call `invalidateSkills()`
  * after a create/update/delete to force a re-scan before the next chat.
  *
  * The `Source` label is computed in this layer (`skillSourceLabel`), not
- * by the loader's basename inference — after the per-uid migration both
- * roots end in `/skills`, so basename is no longer distinguishing.
+ * by the loader's basename inference — both roots end in `/skills`, so
+ * basename is no longer distinguishing. 'builtin' is preserved as the
+ * label string for backwards compatibility with the rest of the codebase;
+ * UI renders it as "Platform".
  */
 
 import * as path from 'node:path';
 
-import { BUILTIN_SKILLS_DIR, userSkillsDir } from '../../paths';
+import { userMarketplaceSkillsDir, userSkillsDir } from '../../paths';
 import { getActiveUserId } from '../../features/users';
 import { getCurrentLang } from '../../i18n';
 // `pickDescription` is loaded lazily — see CLAUDE.md §3: any static import
@@ -33,13 +36,15 @@ async function getPickDescription(): Promise<PickDescription> {
   return _pickDescription;
 }
 
-// `Source` is decided by root path, not by `path.basename(source)` — after the
-// per-uid migration both skill roots end in `/skills`, so basename loses its
-// discrimination (see CLAUDE.md §4). Only `BUILTIN_SKILLS_DIR` counts as
-// builtin; everything else (= `userSkillsDir(uid)`) is custom.
-const BUILTIN_ROOT_RESOLVED = path.resolve(BUILTIN_SKILLS_DIR);
+// `Source` is decided by root path, not by `path.basename(source)` — both skill roots end
+// in `/skills`, so basename is non-discriminating (see CLAUDE.md §4). Marketplace-installed
+// dir = 'builtin'; everything else (= cloud custom) = 'custom'. Resolved per-call because
+// the marketplace dir is per-uid; can't pre-resolve to a module-level constant.
 function skillSourceLabel(source: string): 'builtin' | 'custom' {
-  return path.resolve(source) === BUILTIN_ROOT_RESOLVED ? 'builtin' : 'custom';
+  try {
+    const platformRoot = path.resolve(userMarketplaceSkillsDir(getActiveUserId()));
+    return path.resolve(source) === platformRoot ? 'builtin' : 'custom';
+  } catch { return 'custom'; }
 }
 
 // Render the system-prompt block listing every skill the LLM can use.
@@ -75,20 +80,27 @@ async function renderSkillLines(
   if (!specs.length) return '';
   const lang = getCurrentLang();
   const pick = await getPickDescription();
+  // Each entry shows the human `name` (what the model uses to decide *whether* to reach
+  // for the skill) plus the raw `id` (what goes into the read_file path). They DIVERGE for
+  // marketplace installs whose dir name = 12-hex server id but whose authored name is a
+  // readable string — see core-agent loader.ts comment on the dir-id ≠ name split.
   const lines: string[] = [
     '## Available skills (skills)',
     '',
     '`read_file(<ROOT>/<id>/SKILL.md)` — ROOT by Source:',
     `- custom:  ${customRoot}`,
     `- builtin: ${builtinRoot}`,
-    'Use these ROOT values verbatim.',
+    'Use these ROOT values verbatim. `<id>` is the directory name shown after each entry; use it in the path even when it differs from the display name.',
     '',
   ];
   for (const s of specs) {
     const source = skillSourceLabel(s.source);
     const description = pick(s, lang);
     const desc = description ? ` — ${description}` : '';
-    lines.push(`- **${s.name}** (Source: ${source})${desc}`);
+    // When name == id (custom skills authored locally), collapse the redundancy; when they
+    // differ (marketplace installs), surface both so the model can pick by name and read by id.
+    const head = s.name && s.name !== s.id ? `**${s.name}** (id: ${s.id})` : `**${s.id}**`;
+    lines.push(`- ${head} (Source: ${source})${desc}`);
   }
   return lines.join('\n');
 }
@@ -107,7 +119,7 @@ async function getLoader(): Promise<SkillLoaderInstance> {
     _loaderPromise = import('#core-agent').then((m) => {
       return new m.SkillLoader({
         // custom (cloud, per-uid) listed first → user overrides of same-id builtins.
-        dirs: [userSkillsDir(getActiveUserId()), BUILTIN_SKILLS_DIR],
+        dirs: [userSkillsDir(getActiveUserId()), userMarketplaceSkillsDir(getActiveUserId())],
       });
     });
   }
@@ -156,7 +168,7 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
   // `activateUser` which calls `invalidateSkills` to drop the loader cache,
   // but the ROOT values must reflect the CURRENT uid regardless of cache age.
   const customRoot = path.resolve(userSkillsDir(getActiveUserId()));
-  const builtinRoot = path.resolve(BUILTIN_SKILLS_DIR);
+  const builtinRoot = path.resolve(userMarketplaceSkillsDir(getActiveUserId()));
 
   if (opts.allowlist === undefined) return renderSkillLines(filterDisabled(specs), customRoot, builtinRoot);
 
@@ -174,10 +186,12 @@ export async function invalidateSkills(): Promise<void> {
   loader.invalidate();
 }
 
-/** For diagnostics: return the skill list. */
+/** For diagnostics: return the skill list. Picks a description per the active UI language. */
 export async function listSkills(): Promise<Array<{ id: string; name: string; description: string }>> {
   const loader = await getLoader();
-  return loader.list().map((s) => ({ id: s.id, name: s.name, description: s.description }));
+  const lang = getCurrentLang();
+  const pick = await getPickDescription();
+  return loader.list().map((s) => ({ id: s.id, name: s.name, description: pick(s, lang) }));
 }
 
 /**

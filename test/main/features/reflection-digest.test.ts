@@ -5,15 +5,12 @@ import * as path from 'node:path';
 
 let tmpDir: string;
 let prevWs: string | undefined;
-let prevBuiltinRoot: string | undefined;
 const TEST_UID = 'u1';
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-digest-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
-  prevBuiltinRoot = process.env.ORKAS_BUILTIN_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
-  process.env.ORKAS_BUILTIN_ROOT = tmpDir;
   vi.resetModules();
   const users = await import('../../../src/main/features/users');
   users.activateUser(TEST_UID);
@@ -21,7 +18,6 @@ beforeEach(async () => {
 
 afterEach(() => {
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
-  process.env.ORKAS_BUILTIN_ROOT = prevBuiltinRoot;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 

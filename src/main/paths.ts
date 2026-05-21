@@ -34,6 +34,10 @@
  *                          before any TS module loads (`paths.ts` reads it at import time —
  *                          the env var MUST be set before the first `import * as paths` call).
  *   ORKAS_BUILTIN_ROOT     optional override for the builtin source dir
+ *   ORKAS_WORKSPACE_ROOT   point data root elsewhere (set by index.ts to
+ *                          `<container>/data`; tests / power users may
+ *                          pre-set it to a tmp dir to bypass container
+ *                          resolution)
  *   CORE_AGENT_AUTH_DIR    pinned by `activateUser()` to the active user's `<uid>/local/config/`
  */
 
@@ -73,18 +77,10 @@ export const WS_ROOT = path.resolve(process.env.ORKAS_WORKSPACE_ROOT);
 export const USERS_FILE        = path.join(WS_ROOT, 'users.json');
 // Machine-local logs (daily rolling, single global file shared across uids).
 export const LOGS_DIR          = path.join(WS_ROOT, 'logs');
-// Builtin runtime copy: hash-synced from `src/builtin/` at startup; all uids
-// read from here. The loader scans
-// `[<uid>/cloud/{skills,agents}, <BUILTIN_{SKILLS,AGENTS}_DIR>]`.
-export const BUILTIN_ROOT        = path.join(WS_ROOT, 'builtin');
-export const BUILTIN_AGENTS_DIR  = path.join(BUILTIN_ROOT, 'agents');
-export const BUILTIN_SKILLS_DIR  = path.join(BUILTIN_ROOT, 'skills');
-// Builtin agents follow the same directory shape:
-// `<BUILTIN_AGENTS_DIR>/<aid>/agent.json`. The runtime sub-directories
-// (meta / skills) only exist on the user cloud side; the builtin side does
-// not carry them.
-export const builtinAgentDir            = (agentId: string) => path.join(BUILTIN_AGENTS_DIR, agentId);
-export const builtinAgentDefinitionFile = (agentId: string) => path.join(builtinAgentDir(agentId), 'agent.json');
+// (The legacy globally-shared `data/builtin/{agents,skills}/` tree is gone. Marketplace
+// installs now land under `<uid>/local/marketplace/` per machine — see `userMarketplace*`
+// helpers below. A one-shot migration in `util/migrate-marketplace.ts` moves any pre-cutover
+// `data/builtin/` content into the active uid's cloud tree on first launch.)
 
 // ── Per-user roots ───────────────────────────────────────────────────────
 export const userRoot       = (uid: string) => path.join(WS_ROOT, uid);
@@ -245,6 +241,79 @@ export const sessionToolResultsDir = (uid: string, sessionId: string) =>
 // Never synced — the source paths are local-absolute.
 export const userFileCacheDir = (uid: string) => path.join(userLocalRoot(uid), 'file_cache');
 
+// ── Cache umbrella ─────────────────────────────────────────────────────
+// `<uid>/local/cache/<bucket>/` is the convention for **user-clearable**
+// caches: anything dropped here is fair game for the "clear cache" UI
+// button. features/cache_clearable.ts enumerates the buckets and exposes
+// clearBucket / clearAll. Distinct from `local/config/` (user prefs;
+// untouched) and `local/biz/` (server-source business data; refreshable
+// but not user-clearable).
+export const userLocalCacheDir = (uid: string) => path.join(userLocalRoot(uid), 'cache');
+export const localCacheBucketDir = (uid: string, bucket: string) =>
+  path.join(userLocalCacheDir(uid), bucket);
+
+// ── Business data ──────────────────────────────────────────────────────
+// `<uid>/local/biz/` holds server-sourced reference data the client mirrors
+// locally (e.g. marketplace.json carrying the category registry with a 24h
+// TTL). Not user prefs (=> not in config/) and not throwaway cache
+// (=> not in cache/) — losing it forces a re-fetch but is otherwise safe.
+export const userLocalBizDir = (uid: string) => path.join(userLocalRoot(uid), 'biz');
+export const marketplaceBizFile = (uid: string) =>
+  path.join(userLocalBizDir(uid), 'marketplace.json');
+
+// ── Marketplace content cache (`<uid>/local/cache/marketplace/`) ────────
+// Mirror of agent.json / skill bundle content fetched from the server, used
+// to render the detail page without re-hitting the network on every visit
+// and to short-circuit install when the same version is already on disk.
+// Lives under cache/ (the "clearable" umbrella above) — losing it just
+// triggers a re-fetch.
+export const marketplaceCacheDir       = (uid: string) => localCacheBucketDir(uid, 'marketplace');
+export const marketplaceCacheAgentsDir = (uid: string) => path.join(marketplaceCacheDir(uid), 'agents');
+export const marketplaceCacheSkillsDir = (uid: string) => path.join(marketplaceCacheDir(uid), 'skills');
+export const marketplaceCacheAgentDir  = (uid: string, id: string) =>
+  path.join(marketplaceCacheAgentsDir(uid), id);
+export const marketplaceCacheSkillDir  = (uid: string, id: string) =>
+  path.join(marketplaceCacheSkillsDir(uid), id);
+// Marketplace listing-grid cache: single JSON file storing the last `/list` response per
+// (kind, category, q) key. Read at openMarketplace to render instantly; written on each
+// fresh response. Under `cache/` umbrella so a "clear cache" wipe drops it.
+export const marketplaceListingsCacheFile = (uid: string) =>
+  path.join(marketplaceCacheDir(uid), 'listings.json');
+// Marker dropped at the end of a successful default-install seed pass. Decoupled from
+// `installs.json` (which gets mutated row-by-row during seed; a mid-write crash leaves a
+// partial manifest). Presence of THIS file = "the entire seed completed at least once" —
+// next launch skips seed; absence = "seed never finished, retry on next launch (add*Install
+// is idempotent so re-runs are safe)". Under cloud/ so cross-device sync propagates "seeded
+// already" once any device finishes the seed.
+export const marketplaceDefaultsSeededFile = (uid: string) =>
+  path.join(userMarketplaceDirCloud(uid), '.default-seeded.json');
+
+// ── Marketplace install target (`<uid>/local/marketplace/`) ─────────────
+// **Where actually-installed content lives on this machine.** Distinct from the cache above:
+// cache holds anything the user has viewed; this holds anything the user has installed.
+// Per-user and per-machine — multi-device install state is reconciled via the cloud-synced
+// `installs.json` manifest below: each machine sees the same list of installed ids/urls and
+// fetches whichever local copies are missing on startup (`features/marketplace_reconcile.ts`).
+// Listed by `features/{agents,skills}.ts::list*` alongside cloud/{agents,skills}/ so installed
+// items show under the "Platform" group in the UI.
+export const userMarketplaceDir        = (uid: string) => path.join(userLocalRoot(uid), 'marketplace');
+export const userMarketplaceAgentsDir  = (uid: string) => path.join(userMarketplaceDir(uid), 'agents');
+export const userMarketplaceSkillsDir  = (uid: string) => path.join(userMarketplaceDir(uid), 'skills');
+export const userMarketplaceAgentDir   = (uid: string, id: string) =>
+  path.join(userMarketplaceAgentsDir(uid), id);
+export const userMarketplaceSkillDir   = (uid: string, id: string) =>
+  path.join(userMarketplaceSkillsDir(uid), id);
+
+// ── Marketplace install manifest (cloud-synced) ────────────────────────
+// `<uid>/cloud/marketplace/installs.json` — the only marketplace state that crosses devices.
+// Format: { version, agents:[{id, version, published_at, agent_json_url, installed_at}],
+// skills:[{id, version, published_at, bundle_url, installed_at}] }. Used by
+// `features/marketplace_reconcile.ts` to fetch missing content into `local/marketplace/`
+// at startup. Touched by `features/marketplace_installs.ts` (single-writer for the file).
+export const userMarketplaceDirCloud   = (uid: string) => path.join(userCloudRoot(uid), 'marketplace');
+export const userMarketplaceInstallsFile = (uid: string) =>
+  path.join(userMarketplaceDirCloud(uid), 'installs.json');
+
 // Run-history root for local CLI agent dispatches
 // (features/local_agents/runner.ts). One subdirectory per dispatch:
 // <uid>/local/file_cache/local-agent-runs/<runId>/{meta.json,
@@ -292,17 +361,8 @@ export function embeddingModelDir(): string {
   return path.join(PC_ROOT, 'resources', 'embedding-model');
 }
 
-// ── Builtin source dirs (shipped, read-only in packaged app) ─────────────
-// All source lives under SRC_ROOT, and `builtin/` follows; electron-builder
-// globs `src/builtin/**` into asar at packaging time. When the user
-// overrides ORKAS_BUILTIN_ROOT, the path is used as-is and does not go
-// through SRC_ROOT.
-export const BUILTIN_SKILLS_SOURCE = process.env.ORKAS_BUILTIN_ROOT
-  ? path.join(path.resolve(process.env.ORKAS_BUILTIN_ROOT), 'skills')
-  : path.join(SRC_ROOT, 'builtin', 'skills');
-export const BUILTIN_AGENTS_SOURCE = process.env.ORKAS_BUILTIN_ROOT
-  ? path.join(path.resolve(process.env.ORKAS_BUILTIN_ROOT), 'agents')
-  : path.join(SRC_ROOT, 'builtin', 'agents');
+// (No shipped builtin source tree anymore. The marketplace is the only source for
+// platform agents/skills, fetched at install time and reconciled from the cloud manifest.)
 
 // ── User workspace (user-facing working directory for agent output) ──────
 // Default: `userWorkSpace/` next to the workspace root.
@@ -316,7 +376,7 @@ export const DEFAULT_USER_WORKSPACE = process.env.ORKAS_WORKSPACE_ROOT
 // Only the top-level shared directories are created here; per-uid sub-trees
 // are mkdir'd on demand by `features/users.activateUser(uid)`.
 export function ensureTopLevelLayout(): void {
-  for (const d of [LOGS_DIR, BUILTIN_AGENTS_DIR, BUILTIN_SKILLS_DIR, DEFAULT_USER_WORKSPACE]) {
+  for (const d of [LOGS_DIR, DEFAULT_USER_WORKSPACE]) {
     fs.mkdirSync(d, { recursive: true });
   }
 }
@@ -340,6 +400,9 @@ export function ensureUserLayout(uid: string): void {
     userAgentsDir(uid),
     userSkillsDir(uid),
     userProjectsDir(uid),
+    userMarketplaceAgentsDir(uid),
+    userMarketplaceSkillsDir(uid),
+    userMarketplaceDirCloud(uid),
     // userMetaDir is deprecated — per-agent meta now lands in the
     // `agents/<aid>/meta/` sub-directory, mkdir'd on demand at agent
     // creation time, so no top-level placeholder is required.

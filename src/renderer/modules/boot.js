@@ -147,6 +147,7 @@ function setView(view, cid, opts = {}) {
                 : view === 'apps' ? 'panel-apps'
                 : view === 'settings' ? 'panel-settings'
                 : view === 'project' ? 'panel-project'
+                : view === 'marketplace' ? 'panel-marketplace'
                 : 'panel-conversation';
   document.getElementById(panelId).classList.add('active');
 

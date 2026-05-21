@@ -225,6 +225,11 @@ function bindStaticHandlers() {
   document.getElementById('agent-promote-btn')?.addEventListener('click', () => {
     if (_selectedAgent?.source === 'custom') promoteCustomAgent(_selectedAgent.id);
   });
+  document.getElementById('agent-upload-marketplace-btn')?.addEventListener('click', () => {
+    if (_selectedAgent?.source === 'custom' && typeof openMarketplaceUpload === 'function') {
+      openMarketplaceUpload('agent', _selectedAgent.id);
+    }
+  });
   document.getElementById('agent-chat-clear-btn')?.addEventListener('click', clearAgentChat);
   // Agent inline chat: only bind auto-grow here. Send/abort/Cmd+Enter are
   // wired lazily by createChatController in _ensureAgentChatController.
@@ -256,6 +261,11 @@ function bindStaticHandlers() {
   document.getElementById('skill-delete-btn')?.addEventListener('click', deleteSelectedSkill);
   document.getElementById('skill-promote-btn')?.addEventListener('click', () => {
     if (_selectedSkill?.source === 'custom') promoteCustomSkill(_selectedSkill.id);
+  });
+  document.getElementById('skill-upload-marketplace-btn')?.addEventListener('click', () => {
+    if (_selectedSkill?.source === 'custom' && typeof openMarketplaceUpload === 'function') {
+      openMarketplaceUpload('skill', _selectedSkill.id);
+    }
   });
   // Skill name editing is now wired inline by `_toggleSkillNameEditable`
   // (input + blur listeners attached on first edit-mode entry, gated by

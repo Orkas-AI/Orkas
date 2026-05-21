@@ -26,6 +26,10 @@ import * as scheduledTasks from '../features/scheduled_tasks';
 import { isAgentEnabled } from '../features/component_enabled';
 import * as skills from '../features/skills';
 import * as marketplace from '../features/marketplace';
+import * as marketplaceBiz from '../features/marketplace_biz';
+import * as marketplaceCache from '../features/marketplace_cache';
+import * as marketplaceReconcile from '../features/marketplace_reconcile';
+import * as cacheClearable from '../features/cache_clearable';
 import * as contexts from '../features/contexts';
 import * as kbVector from '../features/kb_vector';
 import * as kbIndexer from '../features/kb_indexer';
@@ -454,8 +458,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { agent };
   },
 
-  'agents.create': async ({ name = '', description = '', description_zh, description_en, workflow = '', icon, color, runtime } = {}) => {
-    return { agent: await agents.createCustomAgent({ name, description, description_zh, description_en, workflow, icon, color, runtime }) };
+  'agents.create': async ({ name = '', description = '', description_zh, description_en, workflow = '', icon, color, runtime, category } = {}) => {
+    return { agent: await agents.createCustomAgent({ name, description, description_zh, description_en, workflow, icon, color, runtime, category }) };
   },
 
 
@@ -523,8 +527,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return skills.listSkillTree(source, id);
   },
 
-  'skills.create': async ({ name, description }) => {
-    return { skill: await skills.createCustomSkill(name, description || '') };
+  'skills.create': async ({ name, description, category }) => {
+    return { skill: await skills.createCustomSkill(name, description || '', category || '') };
   },
 
   'skills.pickImportDir': async () => {
@@ -603,23 +607,104 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // ── Marketplace ──
-  // Listing + install endpoints hit the public Server catalog; no auth wiring needed on the
-  // client side. Upload endpoints live in `dev_handlers.ts` (dev builds only).
-  'marketplace.categories': async ({ kind } = {}) => ({ list: await marketplace.listCategories(kind) }),
+  // Listing + detail + install endpoints hit the public Server catalog; categories are served
+  // from the local 24h biz cache (features/marketplace_biz.ts), so no server hit unless stale.
+  // Upload endpoints live in `dev_handlers.ts` (dev builds only).
+  'marketplace.categories': async () => ({ list: await marketplaceBiz.getMarketplaceCategories() }),
 
   'marketplace.listAgents': async (opts = {}) => marketplace.listMarketplaceAgents(opts),
 
   'marketplace.listSkills': async (opts = {}) => marketplace.listMarketplaceSkills(opts),
 
-  'marketplace.installAgent': async ({ id }) => {
+  // Detail endpoints (cache-first) — used by the marketplace panel's detail view to render
+  // full content. Caller passes the list-row's (version, published_at) so we can short-circuit
+  // on a hot cache. Sweep is invoked once per openMarketplace at the entry point.
+  'marketplace.detailAgent': async ({ id, version, published_at }) => {
     if (!id || typeof id !== 'string') throw new Error('id required');
-    return marketplace.installMarketplaceAgent(id);
+    if (typeof version !== 'string' || typeof published_at !== 'number') {
+      throw new Error('version + published_at required');
+    }
+    return marketplace.getAgentDetail(id, { version, published_at });
   },
 
-  'marketplace.installSkill': async ({ id }) => {
+  'marketplace.detailSkill': async ({ id, version, published_at }) => {
     if (!id || typeof id !== 'string') throw new Error('id required');
-    return marketplace.installMarketplaceSkill(id);
+    if (typeof version !== 'string' || typeof published_at !== 'number') {
+      throw new Error('version + published_at required');
+    }
+    return marketplace.getSkillDetail(id, { version, published_at });
   },
+
+  'marketplace.installAgent': async ({ id, version, published_at }) => {
+    if (!id || typeof id !== 'string') throw new Error('id required');
+    if (typeof version !== 'string' || typeof published_at !== 'number') {
+      throw new Error('version + published_at required');
+    }
+    return marketplace.installMarketplaceAgent(id, { version, published_at });
+  },
+
+  'marketplace.installSkill': async ({ id, version, published_at }) => {
+    if (!id || typeof id !== 'string') throw new Error('id required');
+    if (typeof version !== 'string' || typeof published_at !== 'number') {
+      throw new Error('version + published_at required');
+    }
+    return marketplace.installMarketplaceSkill(id, { version, published_at });
+  },
+
+  // Uninstall is non-dev: wipes the local install copy + manifest entry. Does NOT touch the
+  // server row (`marketplace_dev.deleteMarketplace*` does that, dev-only).
+  'marketplace.uninstallAgent': async ({ id }) => {
+    if (!id || typeof id !== 'string') throw new Error('id required');
+    return marketplace.uninstallMarketplaceAgent(id);
+  },
+
+  'marketplace.uninstallSkill': async ({ id }) => {
+    if (!id || typeof id !== 'string') throw new Error('id required');
+    return marketplace.uninstallMarketplaceSkill(id);
+  },
+
+  // Entry-point housekeeping for the marketplace panel: sweep stale + over-sized cache entries.
+  // Cheap (O(N entries) stat), so it's safe to call once per openMarketplace from the renderer.
+  'marketplace.sweepCache': async () => ({ bytes_freed: await marketplaceCache.sweepIfNeeded() }),
+
+  // Renderer queries this once at startup to learn the current reconcile state, then subscribes
+  // to push-events `marketplace:reconcile-status` for in-flight progress. See main/index.ts
+  // boot wiring + features/marketplace_reconcile.ts::subscribeReconcileStatus.
+  'marketplace.reconcileStatus': async () => marketplaceReconcile.getReconcileStatus(),
+
+  // Persistent listing-grid cache so cold starts don't show a blank panel. Renderer hydrates
+  // from this on `openMarketplace` and writes back after every fresh /list response. See
+  // `marketplace_cache.ts::{getListingsCache,setListingsCache}`.
+  'marketplace.getListingsCache': async () => marketplaceCache.getListingsCache(),
+
+  'marketplace.setListingsCache': async ({ entries }) => {
+    if (!entries || typeof entries !== 'object') throw new Error('entries required');
+    await marketplaceCache.setListingsCache(entries);
+    return { ok: true as const };
+  },
+
+  // Detail-page file viewer (skill kind only — agent payload is fully in the detail response).
+  'marketplace.cacheSkillFiles': async ({ id }) => {
+    if (!id || typeof id !== 'string') throw new Error('id required');
+    return { list: await marketplaceCache.listSkillCacheFiles(id) };
+  },
+
+  'marketplace.cacheSkillRead': async ({ id, file }) => {
+    if (!id || typeof id !== 'string') throw new Error('id required');
+    if (!file || typeof file !== 'string') throw new Error('file required');
+    const content = await marketplaceCache.readSkillCacheFile(id, file);
+    return { content: content || '' };
+  },
+
+  // ── Cache (clearable umbrella under `<uid>/local/cache/<bucket>/`) ──
+  'cache.listClearable': async () => ({ list: await cacheClearable.listClearableBuckets() }),
+
+  'cache.clearBucket': async ({ name }) => {
+    if (!name || typeof name !== 'string') throw new Error('name required');
+    return { bytes_freed: await cacheClearable.clearBucket(name) };
+  },
+
+  'cache.clearAll': async () => ({ bytes_freed: await cacheClearable.clearAllClearable() }),
 
   // ── Contexts (user-owned directory tree; vectorized via kb_indexer) ──
   'contexts.tree': async () => ({ tree: contexts.listContextsTree() }),
@@ -1105,6 +1190,15 @@ const activeStreams = new Map<string, StreamState>();
 async function resolveContext(sender: WebContents): Promise<IpcContext> {
   const user = await users.getOrCreateSelfUser();
   return { userId: user.user_id, user, sender };
+}
+
+/** Send a push-event to every open renderer. Channel name must match preload's
+ *  `PUSH_EVENT_PREFIXES` allow-list (currently `marketplace:` / `sync:`). Used by main-initiated
+ *  status broadcasts (boot-time reconcile / future cloud-sync state). */
+export function broadcastToRenderer(channel: string, payload: unknown): void {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) win.webContents.send(channel, payload);
+  }
 }
 
 export function register(): void {

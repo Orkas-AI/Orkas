@@ -19,16 +19,12 @@ vi.mock('../../../src/main/model/client', () => ({
 
 let tmpDir: string;
 let prevWs: string | undefined;
-let prevBuiltinRoot: string | undefined;
 const TEST_UID = 'u1';
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-agents-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
-  prevBuiltinRoot = process.env.ORKAS_BUILTIN_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
-  // Point builtin source at an empty tmp so startup sync reads nothing.
-  process.env.ORKAS_BUILTIN_ROOT = tmpDir;
   vi.resetModules();
   const users = await import('../../../src/main/features/users');
   users.activateUser(TEST_UID);
@@ -36,7 +32,6 @@ beforeEach(async () => {
 
 afterEach(() => {
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
-  process.env.ORKAS_BUILTIN_ROOT = prevBuiltinRoot;
   streamImpl.current = null;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -52,9 +47,9 @@ function customAgentsDir(): string {
   return path.join(tmpDir, TEST_UID, 'cloud', 'agents');
 }
 
-// Builtin agents are top-level data/builtin/agents (shared across uids).
+// Platform (marketplace-installed) agents live under <uid>/local/marketplace/agents/.
 function builtinAgentsDir(): string {
-  return path.join(tmpDir, 'builtin', 'agents');
+  return path.join(tmpDir, TEST_UID, 'local', 'marketplace', 'agents');
 }
 
 function writeCustomAgent(agentId: string, fields: Partial<Record<string, any>> = {}): void {
@@ -554,26 +549,9 @@ describe('agents › extractAgentFieldBlocks › inputs', () => {
   });
 });
 
-describe('agents › hashTree', () => {
-  it('returns empty for missing dir', async () => {
-    const a = await loadAgents();
-    expect(a.hashTree(path.join(tmpDir, 'nope'))).toBe('');
-  });
-
-  it('hashes per-agent agent.json files only and is stable across calls', async () => {
-    const a = await loadAgents();
-    const dir = path.join(tmpDir, 'mixed');
-    fs.mkdirSync(path.join(dir, 'agent-a'), { recursive: true });
-    fs.writeFileSync(path.join(dir, 'agent-a', 'agent.json'), '{"a":1}');
-    const h1 = a.hashTree(dir);
-    // Stability: same content → same hash
-    expect(a.hashTree(dir)).toBe(h1);
-    // Subdir without agent.json doesn't affect the hash
-    fs.mkdirSync(path.join(dir, 'no-spec'));
-    fs.writeFileSync(path.join(dir, 'no-spec', 'README.md'), 'docs');
-    expect(a.hashTree(dir)).toBe(h1);
-  });
-});
+// hashTree / syncBuiltinAgents removed: there is no globally-shared `data/builtin/`
+// tree anymore. Platform agents now arrive via marketplace install and live at
+// `<uid>/local/marketplace/agents/<id>/` per machine — see features/marketplace_*.ts.
 
 describe('agents › createCustomAgent', () => {
   it('creates a 12-hex-id agent with defaults', async () => {
@@ -1046,99 +1024,6 @@ describe('agents › list cache invalidation', () => {
   });
 });
 
-// Marketplace-installed agents land in the same BUILTIN_AGENTS_DIR as shipped built-ins,
-// distinguished only by the `_marketplace.json` sentinel inside the dir. The sync routines
-// must (a) leave them alone during the stale-removal pass, and (b) exclude them from the
-// hashTree short-circuit so adding/removing a built-in upstream still triggers a re-sync.
-describe('agents › marketplace sentinel', () => {
-  function writeMarketplaceAgent(id: string): string {
-    const dir = path.join(builtinAgentsDir(), id);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'agent.json'), JSON.stringify({ agent_id: id, name: id }));
-    fs.writeFileSync(path.join(dir, '_marketplace.json'), JSON.stringify({
-      server_id: id, version: '1.0.0', category: 'general', installed_at: 1700000000000,
-    }));
-    return dir;
-  }
-  // The plain built-in equivalent — dir under BUILTIN_AGENTS_DIR with just agent.json, no
-  // sentinel. Used to verify the stale-removal pass still works on non-marketplace dirs.
-  function writePlainBuiltinAgent(id: string): string {
-    const dir = path.join(builtinAgentsDir(), id);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'agent.json'), JSON.stringify({ agent_id: id, name: id }));
-    return dir;
-  }
-  function builtinSrcAgentsDir(): string {
-    // `ORKAS_BUILTIN_ROOT` is set to tmpDir, so the SOURCE side resolves to `tmpDir/agents`.
-    return path.join(tmpDir, 'agents');
-  }
-  function writeSrcBuiltinAgent(id: string): void {
-    const dir = path.join(builtinSrcAgentsDir(), id);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'agent.json'), JSON.stringify({ agent_id: id, name: id }));
-  }
-
-  it('hashTree excludes marketplace-installed dirs (sentinel-bearing)', async () => {
-    const a = await loadAgents();
-    const dir = path.join(tmpDir, 'mixed-mp');
-    // Plain built-in
-    fs.mkdirSync(path.join(dir, 'plain'), { recursive: true });
-    fs.writeFileSync(path.join(dir, 'plain', 'agent.json'), '{"a":1}');
-    const baseline = a.hashTree(dir);
-
-    // Add a marketplace install — should NOT change the hash.
-    fs.mkdirSync(path.join(dir, 'mp1'), { recursive: true });
-    fs.writeFileSync(path.join(dir, 'mp1', 'agent.json'), '{"a":2}');
-    fs.writeFileSync(path.join(dir, 'mp1', '_marketplace.json'), '{}');
-    expect(a.hashTree(dir)).toBe(baseline);
-
-    // Remove the sentinel — now the dir is "really" a stray built-in and DOES change the hash.
-    fs.rmSync(path.join(dir, 'mp1', '_marketplace.json'));
-    expect(a.hashTree(dir)).not.toBe(baseline);
-  });
-
-  it('syncBuiltinAgents preserves marketplace dirs but still removes plain stale dirs', async () => {
-    const a = await loadAgents();
-    fs.mkdirSync(builtinAgentsDir(), { recursive: true });
-    fs.mkdirSync(builtinSrcAgentsDir(), { recursive: true });
-
-    // Two dirs in dst, neither present in src: one marketplace, one plain stale.
-    const mpDir    = writeMarketplaceAgent('mp-agent-1');
-    const plainDir = writePlainBuiltinAgent('stale-agent-1');
-
-    a.syncBuiltinAgents();
-
-    expect(fs.existsSync(mpDir)).toBe(true);
-    expect(fs.existsSync(path.join(mpDir, '_marketplace.json'))).toBe(true);
-    expect(fs.existsSync(plainDir)).toBe(false);
-  });
-
-  it('syncBuiltinAgents does not overwrite a marketplace dir even when a same-id built-in ships', async () => {
-    // The src side ships agent `X`; dst has the same id installed from the marketplace with
-    // different content. Marketplace wins (the stale-removal pass skipped it, and the
-    // hashTree-based short-circuit should kick in because the marketplace dir is excluded from
-    // the hash — both sides see the same hash for the plain set).
-    const a = await loadAgents();
-    fs.mkdirSync(builtinAgentsDir(), { recursive: true });
-    fs.mkdirSync(builtinSrcAgentsDir(), { recursive: true });
-    const id = 'shared-id';
-    // Src ships content "from-builtin"
-    fs.mkdirSync(path.join(builtinSrcAgentsDir(), id), { recursive: true });
-    fs.writeFileSync(path.join(builtinSrcAgentsDir(), id, 'agent.json'), '{"v":"from-builtin"}');
-    // Dst has a marketplace install with different content
-    fs.mkdirSync(path.join(builtinAgentsDir(), id), { recursive: true });
-    fs.writeFileSync(path.join(builtinAgentsDir(), id, 'agent.json'), '{"v":"from-marketplace"}');
-    fs.writeFileSync(path.join(builtinAgentsDir(), id, '_marketplace.json'), '{}');
-
-    a.syncBuiltinAgents();
-
-    const dst = fs.readFileSync(path.join(builtinAgentsDir(), id, 'agent.json'), 'utf8');
-    expect(dst).toBe('{"v":"from-marketplace"}');
-    expect(fs.existsSync(path.join(builtinAgentsDir(), id, '_marketplace.json'))).toBe(true);
-
-    // Sanity: a normal src-only id still syncs through unchanged.
-    writeSrcBuiltinAgent('plain-src-only');
-    a.syncBuiltinAgents();
-    expect(fs.existsSync(path.join(builtinAgentsDir(), 'plain-src-only', 'agent.json'))).toBe(true);
-  });
-});
+// (The legacy marketplace-sentinel / data/builtin sync tests are gone. Marketplace
+// installs now live at `<uid>/local/marketplace/agents/<id>/` and are reconciled from
+// the cloud-synced `installs.json` manifest — see features/marketplace_*.ts.)

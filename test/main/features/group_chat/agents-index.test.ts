@@ -35,7 +35,7 @@ function customAgentsDir(): string {
   return path.join(tmpDir, TEST_UID, 'cloud', 'agents');
 }
 function builtinAgentsDir(): string {
-  return path.join(tmpDir, 'builtin', 'agents');
+  return path.join(tmpDir, TEST_UID, 'local', 'marketplace', 'agents');
 }
 
 function writeAgent(root: string, agent_id: string, body: Record<string, unknown>) {
@@ -51,8 +51,8 @@ beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-agentsidx-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
-  // Force fresh module loads so `BUILTIN_AGENTS_DIR` (module-level const
-  // resolved at paths.ts import time) gets the test ORKAS_WORKSPACE_ROOT.
+  // Force fresh module loads so per-uid roots (resolved at paths.ts import time
+  // for module-level constants) align with the test ORKAS_WORKSPACE_ROOT.
   vi.resetModules();
   const users = await import('../../../../src/main/features/users');
   users.activateUser(TEST_UID);

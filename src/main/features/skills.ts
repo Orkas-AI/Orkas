@@ -23,8 +23,8 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import {
-  BUILTIN_SKILLS_DIR, BUILTIN_SKILLS_SOURCE,
-  userSkillsDir, userSkillChatDir, userSessionFile, WS_ROOT,
+  userSkillsDir, userSkillChatDir, userSessionFile, WS_ROOT, SRC_ROOT,
+  userMarketplaceSkillsDir,
 } from '../paths';
 import { evictSession } from '../model/core-agent/session-store';
 import { getActiveUserId } from './users';
@@ -47,7 +47,13 @@ import { invalidateSkills as invalidateCoreAgentSkills } from '../model/core-age
 import { readDisabledSets, setSkillEnabled } from './component_enabled';
 import { findOuterTagRanges } from '../util/markdown-prose-code';
 
-const SKILL_TREE_IGNORE: ReadonlySet<string> = new Set(['.DS_Store', '__pycache__', '.git', 'node_modules']);
+// Names hidden from the in-app skill source-tree view. `_install.json` (marketplace install
+// version pin) and `_cache.json` (marketplace cache LRU bookkeeping) are tooling sidecars,
+// not authored content — surfacing them confuses users and looks like noise in the file list.
+const SKILL_TREE_IGNORE: ReadonlySet<string> = new Set([
+  '.DS_Store', '__pycache__', '.git', 'node_modules',
+  '_install.json', '_cache.json',
+]);
 // Starts with a letter, then letters/digits/_/-; single spaces are allowed
 // between word groups (no leading/trailing/consecutive spaces).
 const SKILL_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]*(?: [A-Za-z0-9_-]+)*$/;
@@ -75,10 +81,20 @@ export interface SkillListing {
   source: SkillSource;
   description_zh: string;
   description_en: string;
+  /** Marketplace category code (`education` / `ecommerce` / `rnd` / …). Empty string when
+   *  the SKILL.md frontmatter doesn't set one — UI treats that as "uncategorized". */
+  category: string;
   /** **Computed at load time, not persisted.** Filled by `listSkills` from
    *  `features/component_enabled.ts`. Defaults to true unless the user has
    *  explicitly disabled the skill. */
   enabled: boolean;
+  /** Author uid for `source==='builtin'` (marketplace-installed) skills — read from
+   *  `_install.json`. `"0"` = "官方"; empty for `source==='custom'`. Renderer uses this to
+   *  show the "官方/作者" badge instead of an "内置" chip. */
+  create_uid?: string;
+  /** Marketplace install version for `source==='builtin'`. Read from `_install.json` so the
+   *  skills-tab card can render a `v1.0.0` chip. Undefined for custom skills. */
+  version?: string;
 }
 
 export interface CustomSkill {
@@ -86,7 +102,20 @@ export interface CustomSkill {
   name: string;
   description_zh: string;
   description_en: string;
+  category: string;
   source: 'custom';
+  dir: string;
+}
+
+/** Like `CustomSkill` but `source` is open — used by edit-chat resolution
+ *  which has to handle built-ins in dev mode. */
+export interface SkillForEdit {
+  id: string;
+  name: string;
+  description_zh: string;
+  description_en: string;
+  category: string;
+  source: SkillSource;
   dir: string;
 }
 
@@ -120,115 +149,19 @@ export interface SkillFrontmatter {
   description?: string;
   description_zh?: string;
   description_en?: string;
+  /** Marketplace category code; required for skills published to the marketplace, optional for
+   *  user-created skills (defaults to empty string / "uncategorized" in `listSkills` output). */
+  category?: string;
   [key: string]: string | string[] | undefined;
 }
 
 export interface SkillChatMeta { session_id?: string; [k: string]: unknown }
 
-// ═══════════════════════════════════════════════════════════════════════
-// 1. Builtin skill sync (startup)
-// ═══════════════════════════════════════════════════════════════════════
-
-/** A skill dir is marketplace-installed iff it carries a `_marketplace.json` sentinel — see
- *  `features/marketplace.ts::writeSentinel`. Marketplace items aren't in `src/builtin/skills/`,
- *  so the startup sync must leave them alone: they're filtered out of the stale-removal step,
- *  and a marketplace install of the same id wins over a same-named built-in (built-in does NOT
- *  overwrite). The sentinel itself is also excluded from `hashTree` so it doesn't trip the
- *  per-startup short-circuit. */
-function _isMarketplaceInstalled(dir: string): boolean {
-  return fs.existsSync(path.join(dir, '_marketplace.json'));
-}
-
-/**
- * Stable content hash of every file under `root`. Mirrors the Python
- * `_hash_tree`: relative posix paths + NUL + bytes + newline per file,
- * folded into a sha256. Empty / missing tree → ''.
- */
-export function hashTree(root: string): string {
-  if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) return '';
-  const h = crypto.createHash('sha256');
-
-  function walk(dir: string, relBase = ''): void {
-    const entries = fs.readdirSync(dir, { withFileTypes: true })
-      .sort((a, b) => a.name.localeCompare(b.name));
-    for (const e of entries) {
-      const rel = relBase ? `${relBase}/${e.name}` : e.name;
-      const parts = rel.split('/');
-      if (parts.some((p) => SKILL_TREE_IGNORE.has(p) || p.startsWith('.'))) continue;
-      if (e.name === '_marketplace.json') continue;
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) walk(full, rel);
-      else if (e.isFile()) {
-        h.update(rel, 'utf8');
-        h.update(Buffer.from([0]));
-        try { h.update(fs.readFileSync(full)); } catch { /* skip */ }
-        h.update(Buffer.from([0x0a]));
-      }
-    }
-  }
-  walk(root);
-  return h.digest('hex');
-}
-
-/**
- * Refresh `data/shared/skills/builtin/` from `PC/builtin/skills/`.
- * Returns true if any change was made (caller should re-register + invalidate).
- */
-export function syncBuiltinSkills(): boolean {
-  fs.mkdirSync(BUILTIN_SKILLS_DIR, { recursive: true });
-  if (!fs.existsSync(BUILTIN_SKILLS_SOURCE)) {
-    log.info(`source dir missing: ${BUILTIN_SKILLS_SOURCE}; skipping`);
-    return false;
-  }
-
-  const srcNames = new Set(fs.readdirSync(BUILTIN_SKILLS_SOURCE, { withFileTypes: true })
-    .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
-    .map((e) => e.name));
-  // Marketplace-installed dirs are filtered out so they neither contribute to "stale" detection
-  // (would be deleted because src/builtin doesn't ship them) nor get overwritten by a same-named
-  // built-in during the content-diff pass.
-  const dstNames = new Set(fs.readdirSync(BUILTIN_SKILLS_DIR, { withFileTypes: true })
-    .filter((e) => e.isDirectory()
-      && !e.name.startsWith('.')
-      && !_isMarketplaceInstalled(path.join(BUILTIN_SKILLS_DIR, e.name)))
-    .map((e) => e.name));
-
-  let changed = false;
-
-  // Removed upstream → drop local copy
-  for (const stale of [...dstNames].filter((n) => !srcNames.has(n)).sort()) {
-    try {
-      fs.rmSync(path.join(BUILTIN_SKILLS_DIR, stale), { recursive: true, force: true });
-      log.info(`removed stale ${stale}`);
-      changed = true;
-    } catch (err) {
-      log.warn(`rm ${stale} failed: ${(err as Error).message}`);
-    }
-  }
-
-  // Content-diff sync. Skip names where dst is a marketplace install (preserve user choice).
-  for (const name of [...srcNames].sort()) {
-    const src = path.join(BUILTIN_SKILLS_SOURCE, name);
-    const dst = path.join(BUILTIN_SKILLS_DIR, name);
-    if (fs.existsSync(dst) && _isMarketplaceInstalled(dst)) continue;
-    const srcHash = hashTree(src);
-    const dstHash = fs.existsSync(dst) && fs.statSync(dst).isDirectory() ? hashTree(dst) : '';
-    if (srcHash === dstHash) continue;
-    if (fs.existsSync(dst)) {
-      try { fs.rmSync(dst, { recursive: true, force: true }); }
-      catch (err) { log.warn(`rm ${dst} failed: ${(err as Error).message}`); continue; }
-    }
-    try {
-      fs.cpSync(src, dst, { recursive: true });
-      log.info(`synced ${name}`);
-      changed = true;
-    } catch (err) {
-      log.warn(`copy ${name} failed: ${(err as Error).message}`);
-    }
-  }
-
-  return changed;
-}
+// `syncBuiltinSkills` / `hashTree` / `_isMarketplaceInstalled` removed — there is no longer a
+// shipped-builtin tree (`PC/src/builtin/skills/` is gone). Marketplace installs land directly
+// in `<uid>/local/marketplace/skills/<id>/` via `features/marketplace.ts::installMarketplaceSkill`
+// and are reconciled across devices through the cloud-synced installs.json manifest. Source
+// 'builtin' is a legacy enum name; on disk it now resolves to `userMarketplaceSkillsDir(uid)`.
 
 // ═══════════════════════════════════════════════════════════════════════
 // 2. Skill reading / listing
@@ -306,7 +239,7 @@ function _unescapeDoubleQuoted(s: string): string {
 }
 
 function skillBaseDir(source: SkillSource): string {
-  return source === 'custom' ? CUSTOM_SKILLS_DIR() : BUILTIN_SKILLS_DIR;
+  return source === 'custom' ? CUSTOM_SKILLS_DIR() : userMarketplaceSkillsDir(getActiveUserId());
 }
 
 // Module-level cache for `listSkills`.
@@ -315,9 +248,55 @@ let _skillListCache: SkillListCache | null = null;
 
 function _invalidateSkillListCache(): void { _skillListCache = null; }
 
+/** Internal cache invalidator + core-agent registry invalidator. Exported for
+ *  the dev-only `skills_dev` module so its dual-write path goes through the
+ *  same cache-busting chain as `writeCustomSkillFile`. */
+export function invalidateSkillCachesForEdit(): void {
+  _invalidateSkillListCache();
+  invalidateCoreAgentSkills().catch(() => { /* runner may not be loaded yet */ });
+}
+
+/** A skill id resolves to a built-in iff there's a directory with that name
+ *  under the runtime built-in tree. The src tree may be missing in packaged
+ *  builds, so the runtime tree is the authoritative check. */
+export function isBuiltinSkill(skillId: string): boolean {
+  if (!skillId) return false;
+  const d = path.join(userMarketplaceSkillsDir(getActiveUserId()), skillId);
+  try { return fs.statSync(d).isDirectory(); } catch { return false; }
+}
+
+/** Resolve a skill id for edit-chat use, regardless of source. Returns the
+ *  same shape as `getCustomSkill` but with `source` reflecting where the dir
+ *  was found. Custom is checked first (matches the loader precedence). */
+export async function getSkillForEdit(skillId: string): Promise<SkillForEdit | null> {
+  if (!skillId) return null;
+  const sources: Array<[SkillSource, string]> = [
+    ['custom', CUSTOM_SKILLS_DIR()],
+    ['builtin', userMarketplaceSkillsDir(getActiveUserId())],
+  ];
+  for (const [source, base] of sources) {
+    const d = path.join(base, skillId);
+    if (!fs.existsSync(d) || !fs.statSync(d).isDirectory()) continue;
+    let name = skillId;
+    let descPair = { description_zh: '', description_en: '' };
+    let category = '';
+    const md = path.join(d, 'SKILL.md');
+    if (fs.existsSync(md)) {
+      try {
+        const { meta } = splitSkillMd(fs.readFileSync(md, 'utf8'));
+        name = meta.name || skillId;
+        descPair = migrateDescriptionPair(meta as any);
+        category = (meta.category as string) || '';
+      } catch { /* ignore */ }
+    }
+    return { id: skillId, name, ...descPair, category, source, dir: d };
+  }
+  return null;
+}
+
 function _skillDirStamp(): string {
   let stamp = '';
-  for (const d of [CUSTOM_SKILLS_DIR(), BUILTIN_SKILLS_DIR]) {
+  for (const d of [CUSTOM_SKILLS_DIR(), userMarketplaceSkillsDir(getActiveUserId())]) {
     try { stamp += `${d}:${fs.statSync(d).mtimeMs};`; }
     catch { stamp += `${d}:0;`; }
   }
@@ -331,7 +310,7 @@ export async function listSkills(): Promise<SkillListing[]> {
   const out: SkillListing[] = [];
   const seen = new Set<string>();
   // Custom first so it wins on id collision (matches openclaw symlink rule).
-  const sources: Array<[SkillSource, string]> = [['custom', CUSTOM_SKILLS_DIR()], ['builtin', BUILTIN_SKILLS_DIR]];
+  const sources: Array<[SkillSource, string]> = [['custom', CUSTOM_SKILLS_DIR()], ['builtin', userMarketplaceSkillsDir(getActiveUserId())]];
   for (const [source, baseDir] of sources) {
     if (!fs.existsSync(baseDir)) continue;
     const names = fs.readdirSync(baseDir, { withFileTypes: true })
@@ -349,14 +328,30 @@ export async function listSkills(): Promise<SkillListing[]> {
       const skillMd = path.join(baseDir, name, 'SKILL.md');
       let displayName = name;
       let descPair = { description_zh: '', description_en: '' };
+      let category = '';
+      let createUid: string | undefined;
+      let version: string | undefined;
       if (fs.existsSync(skillMd)) {
         try {
           const meta = parseSkillFrontmatter(fs.readFileSync(skillMd, 'utf8'));
           descPair = migrateDescriptionPair(meta as any);
           displayName = meta.name as string || name;
+          category = (meta.category as string) || '';
         } catch { /* ignore */ }
       }
-      out.push({ id: name, name: displayName, source, ...descPair, enabled: true });
+      // Marketplace-installed skills carry `_install.json` with `create_uid` + `version` —
+      // read it so the UI can show "官方/作者" + version chips without an extra IPC. Custom skills skip.
+      if (source === 'builtin') {
+        try {
+          const metaFile = path.join(baseDir, name, '_install.json');
+          if (fs.existsSync(metaFile)) {
+            const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+            if (meta && typeof meta.create_uid === 'string') createUid = meta.create_uid;
+            if (meta && typeof meta.version === 'string') version = meta.version;
+          }
+        } catch { /* corrupt _install.json — leave fields undefined */ }
+      }
+      out.push({ id: name, name: displayName, source, ...descPair, category, enabled: true, create_uid: createUid, version });
     }
   }
   _skillListCache = { stamp, data: out };
@@ -454,11 +449,16 @@ export function validateSkillName(name: string): string {
   return '';
 }
 
-// Skill-id shape check used by IPC handlers. Accepts the same alphabet as
-// validateSkillName (spaces between words OK) so space-named skills can be
-// opened / updated.
+// Skill-id shape check used by IPC handlers. Accepts EITHER a user-typed skill name
+// (SKILL_NAME_RE — letter-led, spaces between words) for custom skills, OR a 12-hex
+// server-assigned id for marketplace-installed skills (which can begin with a digit).
+// Without the hex branch, dev uploading a platform-installed skill whose id starts with a
+// digit (e.g. `9720e1e263fd` Word/DOCX) bounced as "invalid skill id" — root cause of the
+// "上传 skill 报错" event seen in main log.
+const SKILL_HEX_ID_RE = /^[a-f0-9]{12}$/;
 export function isValidSkillId(id: unknown): boolean {
-  return typeof id === 'string' && id.length > 0 && SKILL_NAME_RE.test(id);
+  if (typeof id !== 'string' || !id) return false;
+  return SKILL_HEX_ID_RE.test(id) || SKILL_NAME_RE.test(id);
 }
 
 function customSkillDir(skillId: string): string {
@@ -469,6 +469,7 @@ export function skillMdContent(
   name: string,
   description: string | { zh?: string; en?: string },
   body = '',
+  category = '',
 ): string {
   const cleanName = (name || '').replace(/\n/g, ' ').replace(/"/g, '\\"');
   const sanitize = (s: string) => (s || '').replace(/\n/g, ' ').replace(/"/g, '\\"');
@@ -486,8 +487,12 @@ export function skillMdContent(
   }
   const cleanZh = sanitize(zh);
   const cleanEn = sanitize(en);
+  const cleanCategory = sanitize(category || '');
   const trimmedBody = body.replace(/^\n+/, '');
-  return `---\nname: "${cleanName}"\ndescription_zh: "${cleanZh}"\ndescription_en: "${cleanEn}"\n---\n\n${trimmedBody}`;
+  // Emit `category` only when explicitly provided — user-created skills without a category yet
+  // are perfectly valid; the field becomes mandatory only at marketplace upload time.
+  const categoryLine = cleanCategory ? `\ncategory: "${cleanCategory}"` : '';
+  return `---\nname: "${cleanName}"\ndescription_zh: "${cleanZh}"\ndescription_en: "${cleanEn}"${categoryLine}\n---\n\n${trimmedBody}`;
 }
 
 export function splitSkillMd(text: string): { meta: SkillFrontmatter; body: string } {
@@ -506,14 +511,16 @@ export async function getCustomSkill(skillId: string): Promise<CustomSkill | nul
   const md = path.join(d, 'SKILL.md');
   let name = skillId;
   let descPair = { description_zh: '', description_en: '' };
+  let category = '';
   if (fs.existsSync(md)) {
     try {
       const { meta } = splitSkillMd(fs.readFileSync(md, 'utf8'));
       name = meta.name || skillId;
       descPair = migrateDescriptionPair(meta as any);
+      category = (meta.category as string) || '';
     } catch { /* ignore */ }
   }
-  return { id: skillId, name, ...descPair, source: 'custom', dir: d };
+  return { id: skillId, name, ...descPair, category, source: 'custom', dir: d };
 }
 
 export async function listCustomSkillFiles(skillId: string): Promise<SkillFileInfo[]> {
@@ -539,7 +546,9 @@ export async function listCustomSkillFiles(skillId: string): Promise<SkillFileIn
   return out;
 }
 
-export async function createCustomSkill(name: string, description: string): Promise<CustomSkill | null> {
+export async function createCustomSkill(
+  name: string, description: string, category = '',
+): Promise<CustomSkill | null> {
   const err = validateSkillName(name);
   if (err) throw new Error(err);
   const d = customSkillDir(name);
@@ -547,12 +556,12 @@ export async function createCustomSkill(name: string, description: string): Prom
   // Custom skills would silently shadow a same-named builtin in the
   // skill-registry first-wins resolution. Reject the create so the user
   // renames up front.
-  if (fs.existsSync(path.join(BUILTIN_SKILLS_DIR, name))) {
+  if (fs.existsSync(path.join(userMarketplaceSkillsDir(getActiveUserId()), name))) {
     throw new Error(t('skills.errors.builtin_conflict', { name }));
   }
   fs.mkdirSync(d, { recursive: true });
-  writeTextAtomicSync(path.join(d, 'SKILL.md'), skillMdContent(name, description));
-  log.info(`created name=${name}`);
+  writeTextAtomicSync(path.join(d, 'SKILL.md'), skillMdContent(name, description, '', category));
+  log.info(`created name=${name} category=${category || '(none)'}`);
   _invalidateSkillListCache();
   invalidateCoreAgentSkills().catch(() => { /* runner may not be loaded yet */ });
   return getCustomSkill(name);
@@ -560,7 +569,13 @@ export async function createCustomSkill(name: string, description: string): Prom
 
 export async function updateCustomSkill(
   skillId: string,
-  updates: { name?: string; description?: string; description_zh?: string; description_en?: string },
+  updates: {
+    name?: string;
+    description?: string;
+    description_zh?: string;
+    description_en?: string;
+    category?: string;
+  },
   options: { skipRename?: boolean } = {},
 ): Promise<CustomSkill | null> {
   let d = customSkillDir(skillId);
@@ -587,6 +602,10 @@ export async function updateCustomSkill(
     if (legacy && isChinese && !explicitZh) newZh = legacy;
     if (legacy && !isChinese && !explicitEn) newEn = legacy;
   }
+  // category: explicit update wins, otherwise carry over persisted value.
+  const newCategory = Object.prototype.hasOwnProperty.call(updates, 'category')
+    ? String(updates.category || '')
+    : ((meta.category as string) || '');
 
   let currentId = skillId;
   // `skipRename` is the in-progress-edit hook used by the skill detail name
@@ -601,7 +620,7 @@ export async function updateCustomSkill(
     if (err) throw new Error(err);
     const target = customSkillDir(newName);
     if (fs.existsSync(target)) throw new Error(t('skills.errors.skill_exists', { name: newName }));
-    if (fs.existsSync(path.join(BUILTIN_SKILLS_DIR, newName))) {
+    if (fs.existsSync(path.join(userMarketplaceSkillsDir(getActiveUserId()), newName))) {
       throw new Error(t('skills.errors.builtin_conflict', { name: newName }));
     }
     fs.renameSync(d, target);
@@ -645,8 +664,8 @@ export async function updateCustomSkill(
     currentId = newName;
   }
 
-  writeTextAtomicSync(md, skillMdContent(newName, { zh: newZh, en: newEn }, body));
-  log.info(`updated name=${currentId}`);
+  writeTextAtomicSync(md, skillMdContent(newName, { zh: newZh, en: newEn }, body, newCategory));
+  log.info(`updated name=${currentId} category=${newCategory || '(none)'}`);
   _invalidateSkillListCache();
   invalidateCoreAgentSkills().catch(() => { /* runner may not be loaded yet */ });
   return getCustomSkill(currentId);
@@ -699,6 +718,12 @@ const IMPORT_FILTER_NAMES: ReadonlySet<string> = new Set([
   // ownerId/slug/version/publishedAt — irrelevant to this app and shows
   // up as "header noise" in the UI).
   '_meta.json',
+  // Marketplace sidecars: `_install.json` (version pin written by install / reconcile —
+  // meaningless once a platform skill is imported as custom) and `_cache.json` (LRU bookkeeping
+  // for the detail-page cache). Both are tooling internal — must never propagate when a user
+  // imports a skill dir or when dev re-uploads a platform skill (see also marketplace_dev::
+  // SKIP_NAMES).
+  '_install.json', '_cache.json',
   // npm packaging artefacts — skill dirs are forbidden from carrying their
   // own node_modules or package.json (see core conventions); strip the
   // sidecars too so partial copies don't linger.
@@ -716,7 +741,7 @@ function _isBlacklistedImportSource(realDir: string): { blocked: true; reason: s
 
   // Orkas's own trees — pulling these in would recursion-bomb and/or leak
   // the source/data.
-  for (const root of [path.resolve(BUILTIN_SKILLS_SOURCE, '..', '..'), WS_ROOT]) {
+  for (const root of [SRC_ROOT, WS_ROOT]) {
     if (root && (dir === root || dir.startsWith(root + path.sep))) {
       return { blocked: true, reason: t('skills.import_block.self_dir') };
     }
@@ -923,7 +948,7 @@ async function _renameSkillByFrontmatterIfNeeded(currentId: string): Promise<str
   if (validateSkillName(intended) !== '') return null;
   // Don't clobber an existing skill (custom or builtin) at the new id
   if (fs.existsSync(customSkillDir(intended))) return null;
-  if (fs.existsSync(path.join(BUILTIN_SKILLS_DIR, intended))) return null;
+  if (fs.existsSync(path.join(userMarketplaceSkillsDir(getActiveUserId()), intended))) return null;
   try {
     const updated = await updateCustomSkill(currentId, { name: intended });
     if (updated) {
@@ -1175,7 +1200,7 @@ async function _applySkillContainerCreate(files: SkillFileBlock[]): Promise<Skil
   if (fs.existsSync(customSkillDir(name))) {
     return { ok: false, error: t('skills.errors.skill_exists', { name }) };
   }
-  if (fs.existsSync(path.join(BUILTIN_SKILLS_DIR, name))) {
+  if (fs.existsSync(path.join(userMarketplaceSkillsDir(getActiveUserId()), name))) {
     return { ok: false, error: t('skills.errors.builtin_conflict', { name }) };
   }
   // Seed description from the frontmatter so the registry never sees a
@@ -1286,6 +1311,9 @@ export interface SkillChatResult {
   message?: string;
   error?: string;
   written?: string[];
+  /** Frontmatter `name` edits trigger a rename of the skill dir; this list surfaces
+   *  every (oldId → newId) pair so the renderer can re-anchor open tabs. */
+  renamed?: Array<{ oldId: string; newId: string }>;
 }
 
 export async function sendToSkillChat(userId: string, skillId: string, content: string): Promise<SkillChatResult> {
@@ -1313,7 +1341,7 @@ export async function sendToSkillChat(userId: string, skillId: string, content: 
     // that, so it's blocked at the sandbox level.
     readOnlyExtraRoots: [
       ...(skill.dir ? [skill.dir] : []),
-      BUILTIN_SKILLS_DIR,
+      userMarketplaceSkillsDir(getActiveUserId()),
       userSkillsDir(userId),
     ],
   });
@@ -1400,7 +1428,7 @@ export async function* streamSendToSkillChat(
       cacheRetention: 'short',
       readOnlyExtraRoots: [
       ...(skill.dir ? [skill.dir] : []),
-      BUILTIN_SKILLS_DIR,
+      userMarketplaceSkillsDir(getActiveUserId()),
       userSkillsDir(userId),
     ],
       ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),

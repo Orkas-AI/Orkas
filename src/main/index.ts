@@ -228,7 +228,6 @@ function registerIpc(): void {
         appRoot: paths.APP_ROOT,
         pcRoot: paths.PC_ROOT,
         wsRoot: paths.WS_ROOT,
-        builtinSkillsSource: paths.BUILTIN_SKILLS_SOURCE,
         usersFile: paths.USERS_FILE,
       },
       storage: sample,
@@ -258,7 +257,6 @@ async function runBootSelfCheck(): Promise<void> {
   const diag = {
     appRoot: paths.APP_ROOT,
     wsRoot: paths.WS_ROOT,
-    builtinSource: paths.BUILTIN_SKILLS_SOURCE,
     promptChatNormal: prompts.exists('chat_commander'),
     promptOrganize: prompts.exists('contexts_organize'),
   };
@@ -283,18 +281,20 @@ async function runBootSelfCheck(): Promise<void> {
     log.info('i18n language resolved', { lang });
   } catch (err) { log.warn('i18n init failed', { error: (err as Error).message }); }
 
-  // Stage 2: builtin skill content sync from `src/builtin/skills/` →
-  // `data/builtin/skills/`. core-agent's SkillLoader picks these up directly
-  // from the top-level dir, shared across all uids.
+  // Stage 2: one-shot migration of any pre-marketplace `data/builtin/{agents,skills}/`
+  // tree into the active uid's cloud/. Idempotent via marker file; no-op on fresh
+  // installs. After this runs there is no more globally-shared builtin tree — every
+  // marketplace install lives at `<uid>/local/marketplace/` and gets reconciled from
+  // the cloud `installs.json` manifest.
   try {
-    skillsFeature.syncBuiltinSkills();
+    const { migrateLegacyBuiltinToCloud } = await import('./util/migrate-marketplace');
+    const out = await migrateLegacyBuiltinToCloud(users.getActiveUserId());
+    if (out.moved_agents || out.moved_skills) {
+      log.info('legacy builtin migrated', out);
+    }
   } catch (err) {
-    log.warn('skill bootstrap failed', { error: (err as Error).message });
+    log.warn('legacy builtin migrate failed', { error: (err as Error).message });
   }
-
-  // Stage 2b: builtin agents sync (hash-tree; cheap if empty).
-  try { agentsFeature.syncBuiltinAgents(); }
-  catch (err) { log.warn('builtin-agents sync failed', { error: (err as Error).message }); }
 
   // Stage 3: clear stale processing=true conversations from a previous crash.
   try { await chatsFeature.sweepStaleProcessing(); }
@@ -713,6 +713,54 @@ if (!gotLock) {
     // due tasks through the same bus entry point a manual run takes
     // (chats.createConversation + groupChat.send). Idempotent.
     scheduledTasks.startScheduler();
+
+    // Background: prime the marketplace category cache so the first openMarketplace
+    // doesn't pay the round-trip on cold start. Errors are swallowed — the lazy
+    // path in features/marketplace_biz.ts is the real safety net.
+    import('./features/marketplace_biz').then((m) => m.primeCategoryCache()).catch(() => {});
+
+    // Background marketplace setup: (1) seed the default installs manifest on first launch
+    // (no manifest file → fetch `/marketplace/defaults` → write a row per official item),
+    // (2) reconcile downloads any manifest rows whose local content is missing. Step 1
+    // populates the manifest that step 2 consumes; both are fire-and-forget so a slow / down
+    // server never blocks UI boot. Reconcile status updates broadcast to renderers so the
+    // marketplace panel can show a "syncing" banner — layering keeps `features/` free of
+    // `ipc/` imports, broadcast wiring lives here (same pattern as `group_chat.subscribe`).
+    (async () => {
+      try {
+        const mp = await import('./features/marketplace');
+        const seeded = await mp.ensureDefaultInstalls(users.getActiveUserId());
+        if (seeded.seeded_agents || seeded.seeded_skills) {
+          createLogger('marketplace_defaults').info('seeded default installs', seeded);
+        }
+      } catch (err) {
+        createLogger('marketplace_defaults').warn('default installs seed failed', {
+          error: (err as Error).message,
+        });
+      }
+      try {
+        const m = await import('./features/marketplace_reconcile');
+        m.subscribeReconcileStatus((status) => {
+          ipc.broadcastToRenderer('marketplace:reconcile-status', status);
+        });
+        await m.reconcileInstalls(users.getActiveUserId());
+      } catch (err) {
+        createLogger('marketplace_reconcile').warn('startup reconcile failed', {
+          error: (err as Error).message,
+        });
+      }
+      try {
+        // Backfill `create_uid` / `version` for older install records (predates those fields
+        // being persisted). Idempotent — no-op when every row already has the field. Runs after
+        // reconcile so any freshly-pulled record already has the fields and the backfill skips it.
+        const mp = await import('./features/marketplace');
+        await mp.backfillMarketplaceCreateUid(users.getActiveUserId());
+      } catch (err) {
+        createLogger('marketplace_backfill').warn('startup backfill failed', {
+          error: (err as Error).message,
+        });
+      }
+    })();
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();

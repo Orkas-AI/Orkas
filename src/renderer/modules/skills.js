@@ -4,6 +4,29 @@ const _skillsLog = createLogger('skills');
 let _skillsCache = null;
 let _selectedSkill = null;    // { source, id }
 
+/** Version + category + author chips for a marketplace-installed skill. Mirrors the
+ *  marketplace card footer. `_resolveCategoryLabel` is defined in `agents.js` (flat top-level
+ *  scope per CLAUDE.md §8). Author chip: `create_uid='0'` → 官方 badge; non-zero → user badge. */
+function _skillPlatformChipsHtml(s) {
+  const lang = getLang();
+  const parts = [];
+  if (s.version) {
+    const versionLabel = t('marketplace.version').replace('{version}', String(s.version));
+    parts.push(`<span class="skill-card-chip is-version">${escapeHtml(versionLabel)}</span>`);
+  }
+  if (s.category) {
+    const catLabel = _resolveCategoryLabel(s.category, lang);
+    parts.push(`<span class="skill-card-chip">${escapeHtml(catLabel)}</span>`);
+  }
+  if (s.create_uid) {
+    const isPlatform = String(s.create_uid) === '0';
+    const label = isPlatform ? t('marketplace.author_platform') : t('marketplace.author_user').replace('{uid}', String(s.create_uid));
+    const cls = isPlatform ? 'skill-card-chip is-platform' : 'skill-card-chip is-user';
+    parts.push(`<span class="${cls}">${escapeHtml(label)}</span>`);
+  }
+  return parts.join('');
+}
+
 // Re-render the skill grid + currently selected detail page when the UI
 // language changes — descriptions are bilingual now and `pickDesc` returns
 // a different string after the locale flip. Detail re-render goes through
@@ -121,6 +144,10 @@ function renderSkillsGrid(skills) {
     // the grid cards stay clean and use the ⋯ menu for actions.
     const moreBtn = `<button type="button" class="skill-card-more" data-skill-more title="${moreTitle}" aria-label="${moreTitle}">⋯</button>`;
     const enabled = s.enabled !== false;
+    // Marketplace-installed (`builtin`) skills carry version + category from _install.json /
+    // SKILL.md frontmatter — show them as inline chips so users see provenance without
+    // opening the detail page. Custom skills skip (no published version).
+    const platformChips = s.source === 'builtin' ? _skillPlatformChipsHtml(s) : '';
     return `
       <div class="skill-card${enabled ? '' : ' is-disabled'}" data-id="${escapeHtml(s.id)}" data-source="${s.source}">
         <div class="skill-card-header">
@@ -129,6 +156,7 @@ function renderSkillsGrid(skills) {
         </div>
         <div class="${descClass}">${escapeHtml(descText)}</div>
         <div class="skill-card-actions">
+          ${platformChips}
           <button type="button" class="skill-card-use" data-skill-use title="${useTitle}" aria-label="${useTitle}">
             <svg class="icon-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><polygon points="5,3 5,13 13,8" fill="currentColor"/></svg>
           </button>
@@ -299,10 +327,14 @@ function _openSkillRowMenu(anchorBtn, id, source) {
     `<div class="skill-row-menu-item" data-action="toggle-enabled">${escapeHtml(enabled ? t('component.disable') : t('component.enable'))}</div>`,
   );
 
-  if (source === 'custom' && isDevMode()) {
+  if (source === 'custom' && false) {
     items.push(
       `<div class="skill-row-menu-item" data-action="promote">${escapeHtml(t('skills.promote_to_builtin'))}</div>`,
     );
+  }
+  // Upload-to-marketplace owned by marketplace_dev.js (absent in OrkasOpen). typeof check
+  // naturally hides the entry on builds that don't ship the dev module.
+  if (typeof openMarketplaceUpload === 'function') {
     items.push(
       `<div class="skill-row-menu-item" data-action="upload-marketplace">${escapeHtml(t('marketplace.upload'))}</div>`,
     );
@@ -539,10 +571,16 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   nameEl.classList.remove('editable');
   nameEl.removeAttribute('title');
 
-  // Source label + colored tag — mirrors `.agents-detail-source.is-builtin/.is-custom`.
+  // Header chips: custom = "自定义"; marketplace-installed = {category} + {官方/作者}.
+  // Same `_renderSourceMetaHtml` helper as the agent detail page (defined in agents.js,
+  // shared via the renderer's flat top-level scope per CLAUDE.md §8).
   const sourceEl = document.getElementById('skills-detail-source');
-  sourceEl.textContent = source === 'custom' ? t('skills.source_custom') : t('skills.source_builtin');
-  sourceEl.className = 'skills-doc-source ' + (source === 'builtin' ? 'is-builtin' : 'is-custom');
+  sourceEl.className = 'skills-doc-source-row';
+  sourceEl.innerHTML = _renderSourceMetaHtml({
+    source,
+    category: skill?.category || '',
+    create_uid: skill?.create_uid || '',
+  });
 
   // Doc sections (description / external dependencies / dependent
   // skills / other attributes) — seed with the cached description so
@@ -563,10 +601,17 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
     const useBtn = document.getElementById('skill-use-btn');
     const editBtn = document.getElementById('skill-edit-btn');
     const enableBtn = document.getElementById('skill-enabled-btn');
+
+    const promoteBtn = document.getElementById('skill-promote-btn');
+    const uploadBtn = document.getElementById('skill-upload-marketplace-btn');
     const delBtn = document.getElementById('skill-delete-btn');
     if (useBtn) useBtn.style.display = editingThis ? 'none' : '';
     if (editBtn) editBtn.style.display = canEditThisSkill ? '' : 'none';
     if (enableBtn) enableBtn.style.display = editingThis ? 'none' : '';
+
+    if (promoteBtn) promoteBtn.style.display = (source === 'custom' && false && !editingThis) ? '' : 'none';
+    // Upload button visibility: gated by marketplace_dev.js's presence (OrkasOpen lacks it).
+    if (uploadBtn) uploadBtn.style.display = (typeof openMarketplaceUpload === 'function' && !editingThis) ? '' : 'none';
     if (delBtn) delBtn.style.display = (canEditThisSkill && !editingThis) ? '' : 'none';
   }
 
@@ -1199,6 +1244,15 @@ async function openSkillModal(editId) {
     _switchSkillTab('manual');
   }
 
+  // Marketplace category dropdown (manual tab). Edit mode pre-fills from cached category;
+  // create mode picks the first entry as default. 24h cached in main with fallback list.
+  if (typeof mountMarketplaceCategorySelect === 'function') {
+    const initial = editId
+      ? (_skillsCache?.find((s) => s.id === editId && s.source === 'custom')?.category || '')
+      : '';
+    mountMarketplaceCategorySelect('skill-category-select', initial).catch(() => {});
+  }
+
   // Wire tab buttons (idempotent — checks a flag)
   if (tabBar && !tabBar.dataset.wired) {
     tabBar.querySelectorAll('.skill-modal-tab').forEach((btn) => {
@@ -1257,6 +1311,7 @@ window.saveSkill = saveSkill;
 async function _saveSkillManual({ editId, msgEl }) {
   const name = document.getElementById('skill-name').value.trim();
   const description = document.getElementById('skill-description').value.trim();
+  const category = document.getElementById('skill-category-select')?.dataset.value || '';
   if (!name) {
     msgEl.textContent = t('skills.input_name_needed');
     msgEl.className = 'form-msg err';
@@ -1274,12 +1329,12 @@ async function _saveSkillManual({ editId, msgEl }) {
       ? await apiFetch(`/api/skills/${editId}/update`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, description }),
+          body: JSON.stringify({ name, description, category }),
         })
       : await apiFetch('/api/skills/create', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, description }),
+          body: JSON.stringify({ name, description, category }),
         });
     const data = await res.json();
     if (!data.ok) {

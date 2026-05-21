@@ -44,7 +44,10 @@ import {
   PlanSetInput, StepStatus, PlanFile,
 } from './plan';
 import * as planExecutor from './plan_executor';
-import { userChatsDir, BUILTIN_SKILLS_DIR, userSkillsDir, BUILTIN_AGENTS_DIR, userAgentsDir } from '../../paths';
+import {
+  userChatsDir, userSkillsDir, userAgentsDir,
+  userMarketplaceSkillsDir, userMarketplaceAgentsDir,
+} from '../../paths';
 import * as agentsFeat from '../agents';
 import { isAgentEnabled } from '../component_enabled';
 import { buildLanguageDirective, t } from '../../i18n';
@@ -987,8 +990,8 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // chip, so the sandbox-level lock keeps the LLM honest even if the
   // prompt strays. Builtin first to match the prompt's "locate by
   // source" guidance.
-  const skillRoots = [BUILTIN_SKILLS_DIR, userSkillsDir(uid)];
-  const agentRoots = [BUILTIN_AGENTS_DIR, userAgentsDir(uid)];
+  const skillRoots = [userMarketplaceSkillsDir(uid), userSkillsDir(uid)];
+  const agentRoots = [userMarketplaceAgentsDir(uid), userAgentsDir(uid)];
   if (cliAgent) {
     // CLI-backed agent path: spawn the local CLI in the user's workspace
     // and forward its events as `process` events so the same UI rail
@@ -1605,7 +1608,7 @@ async function buildAgentsIndexBlock(uid: string, allowedIds?: readonly string[]
   const { pickDescription } = await import('#core-agent');
   const lang = getCurrentLang();
   const customRoot = path.resolve(userAgentsDir(uid));
-  const builtinRoot = path.resolve(BUILTIN_AGENTS_DIR);
+  const builtinRoot = path.resolve(userMarketplaceAgentsDir(uid));
   const header = [
     '`read_file(<ROOT>/<id>/agent.json)` — ROOT by Source:',
     `- custom:  ${customRoot}`,

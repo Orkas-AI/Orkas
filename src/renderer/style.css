@@ -1078,12 +1078,14 @@ body.model-not-configured .main-content { flex-direction: column; }
   background: #fff;
 }
 
+/* Detail content container — padding matches `.marketplace-detail-header` density (14/20)
+   so the in-app skill detail and the marketplace skill preview align pixel-for-pixel. */
 .skills-detail-content {
   flex: 1;
   display: block;
   min-height: 0;
   overflow-y: auto;
-  padding: 24px 56px 60px;
+  padding: 14px 20px 28px;
   width: 100%;
 }
 .skills-detail-content::-webkit-scrollbar { width: 6px; }
@@ -1091,24 +1093,41 @@ body.model-not-configured .main-content { flex-direction: column; }
 
 /* ─── Single-document detail layout ─── */
 
+/* Single-row headline matching `.agents-detail-header` + `.marketplace-detail-header`:
+   back-button on the left, title + source chip middle, actions hugged to the right via
+   `margin-left:auto`. The row stays `nowrap` so it visually reads as one chrome strip; long
+   titles ellipsize rather than wrap (title gets `min-width:0` + overflow). Negative side
+   margins offset the `.skills-detail-content` container's horizontal padding so the
+   border-bottom rule reaches the panel edges — same chrome divider the agent detail uses. */
 .skills-doc-headline {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 10px 12px;
-  margin-bottom: 4px;
+  flex-wrap: nowrap;
+  gap: 8px;
+  margin: -14px -20px 20px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
+  background: #fff;
 }
 
 .skills-doc-title {
   margin: 0;
-  font-size: 22px;
-  font-weight: 700;
+  font-size: 16px;
+  font-weight: 600;
   color: var(--text);
-  line-height: 1.3;
-  padding: 2px 6px;
-  margin-left: -6px;
+  line-height: 1.4;
+  padding: 2px 4px;
+  margin-left: -4px;
   border-radius: 6px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 0 1 auto;   /* natural width + shrink for very long titles */
 }
+/* Source chip stays glued to the title; actions hug the right via `margin-left:auto`. */
+.skills-doc-headline > .skills-doc-source { flex-shrink: 0; }
+.skills-doc-headline > .skills-doc-actions { flex-shrink: 0; margin-left: auto; }
 .skills-doc-title.editable {
   cursor: pointer;
   transition: background 0.12s;
@@ -1131,6 +1150,14 @@ body.model-not-configured .main-content { flex-direction: column; }
 }
 .skills-doc-source.is-builtin { background: rgba(148, 163, 184, 0.15); color: #475569; }
 .skills-doc-source.is-custom  { background: rgba(37, 99, 235, 0.12); color: var(--primary); }
+.agents-detail-source.is-category,
+.skills-doc-source.is-category { background: rgba(79, 70, 229, 0.10); color: #4f46e5; }
+.agents-detail-source.is-platform,
+.skills-doc-source.is-platform { background: rgba(37, 99, 235, 0.12); color: #1d4ed8; }
+.agents-detail-source.is-user,
+.skills-doc-source.is-user { background: rgba(100, 116, 139, 0.10); color: #475569; }
+/* Allow multiple chips in the detail header source slot. */
+.skills-doc-source-row { display: inline-flex; gap: 6px; }
 /* Editing-state chrome on the title — mirrors `.agents-detail-name.is-editing`
    so both detail pages read as one chrome family. */
 .skills-doc-title.is-editing {
@@ -1146,7 +1173,7 @@ body.model-not-configured .main-content { flex-direction: column; }
 .skills-doc-actions {
   margin-left: auto;
   display: flex;
-  gap: 6px;
+  gap: 4px;
   align-items: center;
 }
 
@@ -1479,7 +1506,12 @@ body.model-not-configured .main-content { flex-direction: column; }
   display: flex;
   align-items: center;
   justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
 }
+/* When platform chips (version/category) sit on the actions row, the play button still
+   hugs the right edge — `margin-left:auto` handles the absent-chip case too. */
+.skill-card-actions > .skill-card-use { margin-left: auto; }
 
 .skill-card-use,
 .agent-card-use,
@@ -1548,25 +1580,6 @@ body.model-not-configured .main-content { flex-direction: column; }
   border-bottom: 1px solid var(--border);
   background: #fff;
   flex-shrink: 0;
-}
-
-.skills-back-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--muted);
-  font-size: 13px;
-  font-family: inherit;
-  cursor: pointer;
-  border-radius: 6px;
-  transition: background 0.12s, color 0.12s, border-color 0.12s;
-}
-.skills-back-btn:hover {
-  background: #f1f5f9;
-  color: var(--primary);
 }
 
 /* ─── "View source" collapsible (detail page bottom) ─── */
@@ -5027,7 +5040,8 @@ body.model-not-configured .main-content { flex-direction: column; }
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 /* When no chip is present, the play button still hugs the right edge.
    `margin-left: auto` plays nice with the absent-chip case. */
@@ -5050,21 +5064,6 @@ body.model-not-configured .main-content { flex-direction: column; }
   background: #fff;
   flex-shrink: 0;
 }
-
-.agents-back-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  border: none;
-  background: transparent;
-  color: var(--muted);
-  font-size: 13px;
-  cursor: pointer;
-  padding: 4px 8px;
-  border-radius: 6px;
-  font-family: inherit;
-}
-.agents-back-btn:hover { background: #f1f5f9; color: var(--text); }
 
 .agent-row-menu {
   position: fixed;
@@ -5113,8 +5112,11 @@ body.model-not-configured .main-content { flex-direction: column; }
   overflow-y: auto;
 }
 
+/* Compact header matches the marketplace detail density (.marketplace-detail-header):
+   tighter padding + title 16px so the in-app agent / skill detail and the marketplace
+   detail read as one chrome family. Body sections below keep their original spacing. */
 .agents-detail-header {
-  padding: 20px 32px 14px;
+  padding: 14px 20px;
   border-bottom: 1px solid var(--border);
   background: #fff;
   flex-shrink: 0;
@@ -5123,23 +5125,29 @@ body.model-not-configured .main-content { flex-direction: column; }
 .agents-detail-title-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
+  gap: 8px;
+  flex-wrap: nowrap;
 }
 
 .agents-detail-name {
   min-width: 0;
-  font-size: 17px;
+  font-size: 16px;
   font-weight: 600;
   color: var(--text);
   line-height: 1.4;
-  padding: 2px 6px;
-  margin-left: -6px;
+  padding: 2px 4px;
+  margin-left: -4px;
   border-radius: 6px;
   outline: none;
-  min-height: 24px;
+  min-height: 22px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 0 1 auto;   /* natural width + shrink for very long names */
 }
+/* Source chip stays glued to the name; actions hug the right via `margin-left:auto`. */
+.agents-detail-title-row > .agents-detail-source { flex-shrink: 0; }
+.agents-detail-title-row > .detail-actions { flex-shrink: 0; margin-left: auto; }
 .agents-detail-name.is-editing {
   background: #fff;
   box-shadow: 0 0 0 1px var(--border-strong) inset;
@@ -5163,12 +5171,14 @@ body.model-not-configured .main-content { flex-direction: column; }
 .agents-detail-source.is-custom  { background: rgba(37, 99, 235, 0.12); color: var(--primary); }
 
 /* ── Body: simple vertical stack of sections, each full-width ── */
+/* Padding matches `.skills-detail-content` + `.marketplace-detail-header` so the three
+   detail surfaces (app agent / app skill / marketplace preview) share one chrome density. */
 .agents-detail-body {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding: 20px 32px 24px;
+  padding: 14px 20px 28px;
   gap: 20px;
   overflow-y: auto;
 }
@@ -6089,6 +6099,344 @@ body.model-not-configured .main-content { flex-direction: column; }
    the dropdown from spanning the entire body. */
 .agents-detail-runtime { display: block; }
 .agents-detail-runtime-select { max-width: 280px; }
+
+
+/* Wrapper for the multi-button cluster on the right side of agents-grid-header /
+   skills-grid-header. Keeps `+ Create` / `More` glued together while the parent
+   header's `justify-content: space-between` still separates title from cluster. */
+.header-actions { display: flex; gap: 8px; align-items: center; }
+
+/* ─── Marketplace panel ─── */
+/* Full-page panel mirroring .agents-grid-view sizing: fill the parent .panel column. */
+.marketplace-view {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: #fff;
+}
+.marketplace-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.marketplace-back { flex-shrink: 0; }
+.marketplace-tabs { display: flex; gap: 4px; }
+.marketplace-tab {
+  background: transparent;
+  border: none;
+  padding: 6px 14px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--muted);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.marketplace-tab.is-active { background: var(--accent-soft, #eef2ff); color: var(--text); }
+.marketplace-search {
+  flex: 1;
+  max-width: 320px;
+  margin-left: auto;
+  padding: 6px 10px;
+  border: 1px solid rgba(0,0,0,0.1);
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.marketplace-categories {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 12px 20px;
+  border-bottom: 1px solid rgba(0,0,0,0.04);
+  flex-shrink: 0;
+}
+.marketplace-chip {
+  background: transparent;
+  border: 1px solid rgba(0,0,0,0.1);
+  padding: 4px 12px;
+  font-size: 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  color: var(--text);
+}
+.marketplace-chip.is-active {
+  background: var(--accent, #4f46e5);
+  border-color: transparent;
+  color: #fff;
+}
+
+.marketplace-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px 20px;
+}
+/* Reconcile-status banner (boot-time marketplace sync). Friendly muted-blue palette — the
+   yellow / warning tint was misread as "something's wrong" when it actually just means
+   "downloading default content in the background". The banner is **embedded under the panel
+   header** (after the title row, before the body) so it doesn't crowd the panel chrome. */
+.marketplace-reconcile-banner {
+  margin: 0 20px 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius-md, 8px);
+  background: rgba(37, 99, 235, 0.08);
+  color: #1d4ed8;
+  font-size: 12px;
+  line-height: 1.5;
+}
+/* Inline checkbox row inside the upload dialog. Used for the "用户默认安装" toggle so dev
+   can flag the item as part of the fresh-install seed set (`default_install` server flag). */
+.ui-dialog-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+.ui-dialog-checkbox-row input[type="checkbox"] {
+  margin: 0;
+  cursor: pointer;
+}
+/* Dev upload modal: just a centered spinner + label while the multipart POST is in flight. */
+.marketplace-upload-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 28px 32px;
+}
+.marketplace-upload-spinner {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 3px solid #cbd5e1;
+  border-top-color: #2563eb;
+  animation: marketplace-upload-spin 0.8s linear infinite;
+}
+.marketplace-upload-loading-text {
+  color: #475569;
+  font-size: 13px;
+}
+@keyframes marketplace-upload-spin {
+  to { transform: rotate(360deg); }
+}
+/* Author badge: differentiates same-name uploads. Platform = filled blue; user = outlined.
+   Shared across marketplace card + agents-tab card + skills-tab card so the same badge
+   reads the same everywhere a marketplace-installed item appears. */
+.marketplace-card-chip.is-platform,
+.agent-card-chip.is-platform,
+.skill-card-chip.is-platform {
+  background: rgba(37, 99, 235, 0.12);
+  color: #1d4ed8;
+}
+.marketplace-card-chip.is-user,
+.agent-card-chip.is-user,
+.skill-card-chip.is-user {
+  background: rgba(100, 116, 139, 0.10);
+  color: #475569;
+}
+
+/* Inline spinner for install/uninstall buttons. Sits to the left of the button label. */
+.marketplace-btn-spinner {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 6px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.5);
+  border-top-color: rgba(255, 255, 255, 0.95);
+  vertical-align: -1px;
+  animation: marketplace-upload-spin 0.8s linear infinite;
+}
+.btn.is-disabled .marketplace-btn-spinner {
+  border-color: rgba(100, 116, 139, 0.4);
+  border-top-color: rgba(100, 116, 139, 0.9);
+}
+/* Flex-wrap with fixed card width: each card is exactly 280px regardless of how many cards
+   the grid holds. A lone card no longer stretches to fill the entire row (which made it look
+   like a list-strip), and a populated grid wraps to a familiar tile layout. Trailing empty
+   space at the end of each row is intentional — keeps card visual rhythm consistent. */
+.marketplace-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-content: flex-start;
+}
+.marketplace-grid > .marketplace-card {
+  flex: 0 0 280px;
+  min-width: 0;
+}
+/* Invisible IntersectionObserver target for infinite scroll. Real preload margin comes
+   from `rootMargin` in JS — this just needs to be a reliably-observable element. */
+.mp-load-more-sentinel { height: 1px; width: 100%; }
+.marketplace-card {
+  border: 1px solid rgba(0,0,0,0.08);
+  border-radius: var(--radius-md, 8px);
+  padding: 14px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: #fff;
+}
+.marketplace-card-header { display: flex; align-items: baseline; gap: 8px; }
+.marketplace-card-name {
+  font-weight: 600;
+  font-size: 14px;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.marketplace-card-desc {
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.45;
+  flex: 1;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.marketplace-card-meta { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.marketplace-card-chip,
+.skill-card-chip,
+.agent-card-chip {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(79,70,229,0.08);
+  color: var(--accent, #4f46e5);
+  white-space: nowrap;
+}
+.marketplace-card-chip.muted { background: rgba(0,0,0,0.05); color: var(--muted); }
+/* Version chip — neutral grey to distinguish from category (accent) and author (platform/user). */
+.marketplace-card-chip.is-version,
+.agent-card-chip.is-version,
+.skill-card-chip.is-version {
+  background: rgba(0,0,0,0.05);
+  color: var(--muted);
+}
+/* Footer row: chips on the left flex-1, install/uninstall button hugged to the right via
+   `flex-shrink:0` so it never collapses before the chips. Replaces the old vertically-stacked
+   `.marketplace-card-meta` + `.marketplace-card-actions` arrangement. */
+.marketplace-card-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: auto;
+}
+.marketplace-card-footer > .marketplace-card-meta { flex: 1; }
+.marketplace-card-footer > .marketplace-card-actions { flex-shrink: 0; }
+.marketplace-card-actions { display: flex; }
+
+/* ─── Detail sub-view ─── */
+/* Mirrors the grid-view layout (full-panel flex column) so swapping the two display
+   styles is the only thing needed to switch between browse and detail. */
+.marketplace-grid-view,
+.marketplace-detail-view {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: #fff;
+}
+/* Marketplace detail header — padding mirrors `.agents-detail-header` so the in-app and
+   marketplace detail pages share one chrome density. */
+.marketplace-detail-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+/* Single-row title block: [name v1.0.0] [chip chip] all in one line. `min-width:0` lets
+   long names ellipsize rather than pushing the install / delete buttons off-screen; chips
+   are `flex-shrink:0` so they hug the title rather than collapsing first. */
+.marketplace-detail-title-wrap { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; }
+.marketplace-detail-title { font-size: 16px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.marketplace-detail-version { font-size: 12px; color: var(--muted); margin-left: 8px; font-weight: 400; }
+.marketplace-detail-meta-row { display: flex; gap: 6px; flex-wrap: nowrap; flex-shrink: 0; }
+.marketplace-detail-desc { padding: 12px 20px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+/* Outer body container is just a flex slot — the inner `.agents-detail-body` /
+   `.skills-detail-content` (rendered by `_mpAgentDetailHtml` / `_mpSkillDetailHtml`)
+   owns padding + scroll, so the marketplace preview lines up pixel-for-pixel with the
+   in-app detail page. */
+.marketplace-detail-body { flex: 1; overflow: hidden; display: flex; padding: 0; }
+.marketplace-detail-body > .agents-detail-body,
+.marketplace-detail-body > .skills-detail-content { flex: 1; min-height: 0; }
+.marketplace-detail-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 48px 20px;
+}
+.marketplace-detail-loading-text { color: var(--muted); font-size: 13px; }
+
+.marketplace-section { margin-top: 18px; }
+.marketplace-section-title { font-size: 14px; font-weight: 600; margin: 0 0 8px; }
+.marketplace-section-body { font-size: 13.5px; line-height: 1.55; }
+.marketplace-section-body ul { padding-left: 20px; margin: 6px 0; }
+.marketplace-section-body code { padding: 1px 5px; background: rgba(0,0,0,0.05); border-radius: 3px; font-size: 12.5px; }
+
+/* Skill detail: split view (file tree left, file body right). */
+.marketplace-skill-split {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  gap: 18px;
+  margin-top: 12px;
+  min-height: 280px;
+}
+.marketplace-skill-tree {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-size: 12.5px;
+  border: 1px solid rgba(0,0,0,0.08);
+  border-radius: 6px;
+  background: #fafafa;
+  overflow-y: auto;
+  max-height: 60vh;
+}
+.marketplace-skill-file {
+  padding: 6px 10px;
+  cursor: pointer;
+  border-bottom: 1px solid rgba(0,0,0,0.04);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow: hidden;
+}
+.marketplace-skill-file:last-child { border-bottom: none; }
+.marketplace-skill-file:hover { background: rgba(79,70,229,0.04); }
+.marketplace-skill-file.is-active { background: var(--accent-soft, #eef2ff); color: var(--text); font-weight: 500; }
+.marketplace-skill-file-body { min-width: 0; overflow-x: auto; }
+.marketplace-skill-code {
+  font-size: 12px;
+  line-height: 1.5;
+  background: #fafafa;
+  border: 1px solid rgba(0,0,0,0.06);
+  border-radius: 6px;
+  padding: 12px;
+  white-space: pre;
+  overflow: auto;
+  max-height: 70vh;
+}
+
+.ui-dialog-form { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }
+.ui-dialog-label { font-size: 12px; color: var(--muted); }
+.ui-dialog-input {
+  padding: 6px 10px;
+  border: 1px solid rgba(0,0,0,0.1);
+  border-radius: 6px;
+  font-size: 13px;
+}
 
 /* ─── Scheduled-tasks dialog (modules/agent-schedule.js) ─────────────── */
 .agent-schedule-dialog { min-width: 480px; max-width: 560px; }

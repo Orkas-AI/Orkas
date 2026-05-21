@@ -48,6 +48,29 @@ function logRecord(record) {
   } catch (_) { /* preload must not throw */ }
 }
 
+// Push-event subscription — for main-initiated broadcasts where the renderer doesn't drive
+// the lifecycle (unlike `stream` which the renderer starts). Channel names are restricted to
+// a known prefix list so the renderer can't tap into arbitrary internal IPC traffic.
+const PUSH_EVENT_PREFIXES = ['marketplace:', 'sync:'];
+function isAllowedPushChannel(channel) {
+  if (typeof channel !== 'string') return false;
+  return PUSH_EVENT_PREFIXES.some((p) => channel.startsWith(p));
+}
+
+/** Subscribe to a main-initiated push event. Returns an `unsubscribe()` function.
+ *  Throws if the channel isn't in the allow-list (see PUSH_EVENT_PREFIXES). */
+function onPushEvent(channel, handler) {
+  if (!isAllowedPushChannel(channel)) {
+    throw new Error(`push channel not allowed: ${channel}`);
+  }
+  if (typeof handler !== 'function') throw new Error('handler must be a function');
+  const listener = (_evt, payload) => {
+    try { handler(payload); } catch (_) { /* swallow — listener must not throw */ }
+  };
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.removeListener(channel, listener);
+}
+
 function stream(channel, payload, onEvent) {
   const requestId = nextRequestId();
   const channelKey = `stream:${requestId}`;
@@ -95,5 +118,6 @@ contextBridge.exposeInMainWorld('orkas', {
   getLocales: () => invoke('config.getLocales'),
   invoke,
   stream,
+  onPushEvent,
   log: logRecord,
 });

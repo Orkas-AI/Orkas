@@ -29,6 +29,41 @@ function _isReservedAgentName(name) {
   return _RESERVED_AGENT_NAMES.has(key);
 }
 
+/** Version + category + author chips for a marketplace-installed agent. Mirrors the
+ *  marketplace card footer so users see the same metadata in the agents grid.
+ *  `_mpCategoriesCache` is a module-level variable in `marketplace.js` (flat top-level
+ *  scope per CLAUDE.md §8). Author chip: `create_uid='0'` → 官方 badge; non-zero → user badge. */
+function _agentPlatformChipsHtml(a) {
+  const lang = getLang();
+  const parts = [];
+  if (a.version) {
+    const versionLabel = t('marketplace.version').replace('{version}', String(a.version));
+    parts.push(`<span class="agent-card-chip is-version">${escapeHtml(versionLabel)}</span>`);
+  }
+  if (a.category) {
+    const catLabel = _resolveCategoryLabel(a.category, lang);
+    parts.push(`<span class="agent-card-chip">${escapeHtml(catLabel)}</span>`);
+  }
+  if (a.create_uid) {
+    const isPlatform = String(a.create_uid) === '0';
+    const label = isPlatform ? t('marketplace.author_platform') : t('marketplace.author_user').replace('{uid}', String(a.create_uid));
+    const cls = isPlatform ? 'agent-card-chip is-platform' : 'agent-card-chip is-user';
+    parts.push(`<span class="${cls}">${escapeHtml(label)}</span>`);
+  }
+  return parts.join('');
+}
+
+/** Shared category-code → localized label. Falls back to the code when the categories
+ *  cache hasn't loaded yet (rare; the module-level preload usually populates it before
+ *  the user reaches the agents/skills tab). */
+function _resolveCategoryLabel(code, lang) {
+  if (!code) return '';
+  const list = (typeof _mpCategoriesCache !== 'undefined' && _mpCategoriesCache) || [];
+  const c = list.find((x) => x.code === code);
+  if (!c) return code;
+  return lang === 'zh' ? (c.name_zh || c.name_en || code) : (c.name_en || c.name_zh || code);
+}
+
 // Mirror of `agents.ts::NAME_TOKEN_RE` so the form rejects junk before
 // the round-trip. Charset must round-trip through the bus's @-mention
 // regex; see backend for the full reasoning. UIs may still surface
@@ -154,6 +189,10 @@ function renderAgentsGrid(agents) {
     const cliChip = (a.runtime && a.runtime.kind === 'cli')
       ? `<span class="agent-card-chip is-cli is-cli-${escapeHtml(a.runtime.cli)}">${escapeHtml(_cliBadgeLabel(a.runtime.cli))}</span>`
       : '';
+    // Marketplace-installed (`builtin`) agents carry version + category from _install.json /
+    // agent.json — show them as inline chips so users see "where this came from" without
+    // opening the detail page. Custom agents skip — they have no published version.
+    const platformChips = a.source === 'builtin' ? _agentPlatformChipsHtml(a) : '';
     return `
       <div class="agent-card${enabled ? '' : ' is-disabled'}" data-id="${escapeHtml(a.agent_id)}" data-source="${a.source}">
         <div class="agent-card-header">
@@ -163,7 +202,7 @@ function renderAgentsGrid(agents) {
         </div>
         <div class="${descClass}">${escapeHtml(descText)}</div>
         <div class="agent-card-actions">
-          ${cliChip}
+          ${cliChip}${platformChips}
           <button type="button" class="agent-card-use" data-agent-use title="${useTitle}" aria-label="${useTitle}">
             <svg class="icon-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><polygon points="5,3 5,13 13,8" fill="currentColor"/></svg>
           </button>
@@ -344,11 +383,21 @@ function _renderAgentRowMenuItems(menu, agentId) {
   if (canEdit) {
     items.push(`<div class="agent-row-menu-item" data-action="edit">${escapeHtml(t('agents.edit'))}</div>`);
   }
+  if (isCustom && false) {
+    items.push(`<div class="agent-row-menu-item" data-action="promote">${escapeHtml(t('agents.promote_to_builtin'))}</div>`);
+  }
+  // Upload-to-marketplace is owned by marketplace_dev.js (renderer-side dev module). OrkasOpen
+  // doesn't ship that file, so `typeof openMarketplaceUpload === 'function'` is false there
+  // and the menu item simply doesn't appear — no isDevMode check needed (and would be banned
+  // by OrkasOpen's strip-rules anyway).
+  if (typeof openMarketplaceUpload === 'function') {
+    items.push(`<div class="agent-row-menu-item" data-action="upload-marketplace">${escapeHtml(t('marketplace.upload'))}</div>`);
+  }
   // Scheduled tasks: available for every agent (custom + builtin) — a
   // schedule is a user-orchestration concern that only references the
   // agent and doesn't mutate its spec.
   items.push(`<div class="agent-row-menu-item" data-action="schedule">${escapeHtml(t('agents.schedule.menu'))}</div>`);
-  if (isCustom && isDevMode()) {
+  if (isCustom && false) {
     items.push(`<div class="agent-row-menu-item" data-action="promote">${escapeHtml(t('agents.promote_to_builtin'))}</div>`);
     items.push(`<div class="agent-row-menu-item" data-action="upload-marketplace">${escapeHtml(t('marketplace.upload'))}</div>`);
   }
@@ -417,6 +466,38 @@ async function selectAgent(agentId) {
   }
 }
 
+// Render the header meta strip for a single agent / skill detail. Used by both
+// `agents.js::_renderAgentDetail` and `skills.js::useSkill`. Three forms:
+//   - custom item: single "自定义" chip (kept for symmetry with prior chrome)
+//   - marketplace-installed item: category chip + author chip ("官方" if uid=0, else "作者 X")
+//     — replaces the old "内置" label which users found unfriendly
+//   - unknown create_uid (older `_install.json` pre-author-tracking): only the category chip
+// `item.source` distinguishes custom vs marketplace-installed; `item.category` (code) maps
+// to display name via `_mpCategoriesCache` (loaded at marketplace boot, hot in localStorage).
+function _renderSourceMetaHtml(item) {
+  if (!item) return '';
+  if (item.source === 'custom') {
+    return `<span class="agents-detail-source is-custom">${escapeHtml(t('agents.source_custom'))}</span>`;
+  }
+  const parts = [];
+  const catCode = String(item.category || '').trim();
+  if (catCode) {
+    const lang = (typeof getLang === 'function') ? getLang() : 'zh';
+    const cat = Array.isArray(_mpCategoriesCache) ? _mpCategoriesCache.find((c) => c.code === catCode) : null;
+    const label = cat ? (lang === 'zh' ? (cat.name_zh || cat.name_en || catCode) : (cat.name_en || cat.name_zh || catCode)) : catCode;
+    parts.push(`<span class="agents-detail-source is-category">${escapeHtml(label)}</span>`);
+  }
+  const uid = String(item.create_uid || '').trim();
+  if (uid) {
+    if (uid === '0') {
+      parts.push(`<span class="agents-detail-source is-platform">${escapeHtml(t('marketplace.author_platform'))}</span>`);
+    } else {
+      parts.push(`<span class="agents-detail-source is-user">${escapeHtml(t('marketplace.author_user').replace('{uid}', uid))}</span>`);
+    }
+  }
+  return parts.join('');
+}
+
 function _renderAgentDetail(agent, editing) {
   document.getElementById('agents-detail-content').style.display = '';
 
@@ -427,8 +508,10 @@ function _renderAgentDetail(agent, editing) {
   const editBtn = document.getElementById('agent-edit-btn');
 
   nameEl.textContent = agent.name || '';
-  sourceEl.textContent = agent.source === 'builtin' ? t('agents.source_builtin') : t('agents.source_custom');
-  sourceEl.className = 'agents-detail-source ' + (agent.source === 'builtin' ? 'is-builtin' : 'is-custom');
+  // Header chips: custom = single "自定义" tag; marketplace-installed (source=builtin) drops
+  // the "内置" wording entirely and shows {category} + {官方/作者} chips instead — same family
+  // as marketplace card meta. Empty category / missing create_uid silently skip.
+  sourceEl.innerHTML = _renderSourceMetaHtml(agent);
   // Runtime slot lives at the top of the body now (not the header):
   // an always-editable dropdown so the user can flip Orkas ↔ local CLI
   // without entering edit mode. The header chip was removed because
@@ -461,11 +544,18 @@ function _renderAgentDetail(agent, editing) {
   // "edit" button).
   const useBtn = document.getElementById('agent-use-btn');
   const enableBtn = document.getElementById('agent-enabled-btn');
+
+  const promoteBtn = document.getElementById('agent-promote-btn');
+  const uploadBtn = document.getElementById('agent-upload-marketplace-btn');
   const delBtn = document.getElementById('agent-delete-btn');
   const isCustom = agent.source === 'custom';
   const canEdit = isCustom;
   if (useBtn) useBtn.style.display = editing ? 'none' : '';
   if (enableBtn) enableBtn.style.display = editing ? 'none' : '';
+
+  if (promoteBtn) promoteBtn.style.display = (isCustom && false && !editing) ? '' : 'none';
+  // Upload button visibility: gated by marketplace_dev.js's presence (OrkasOpen lacks it).
+  if (uploadBtn) uploadBtn.style.display = (typeof openMarketplaceUpload === 'function' && !editing) ? '' : 'none';
   if (delBtn) delBtn.style.display = (canEdit && !editing) ? '' : 'none';
   if (editBtn) {
     editBtn.style.display = canEdit ? '' : 'none';
@@ -603,7 +693,7 @@ function _renderAgentDetailAvatar(agent) {
   if (!slot) return;
   const isCustom = agent.source === 'custom';
   slot.innerHTML = renderAvatarHtml(agent.icon, agent.color, {
-    size: 44,
+    size: 32,
     seed: agent.agent_id,
     clickable: isCustom,
     extraClass: 'agents-detail-avatar',
@@ -928,6 +1018,12 @@ function openAgentModal() {
     mountExternalCliSelect((cli) => _applyExternalCliDefaults(cli)).catch(() => {});
   }
 
+  // Marketplace category dropdowns (both tabs). 24h cached in main, fallback to defaults.
+  if (typeof mountMarketplaceCategorySelect === 'function') {
+    mountMarketplaceCategorySelect('agent-category-select').catch(() => {});
+    mountMarketplaceCategorySelect('agent-ext-category-select').catch(() => {});
+  }
+
   modal.classList.add('open');
   setTimeout(() => document.getElementById('agent-name-input')?.focus(), 50);
 }
@@ -975,9 +1071,11 @@ async function _saveCreateAgent({ msgEl }) {
     return;
   }
 
+  const category = document.getElementById('agent-category-select')?.dataset.value || '';
+
   try {
     const avatar = randomAgentAvatar();
-    const body = { name, description, icon: avatar.icon, color: avatar.color };
+    const body = { name, description, icon: avatar.icon, color: avatar.color, category };
     const res = await apiFetch('/api/agents/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1046,6 +1144,8 @@ async function _saveExternalAgent({ msgEl }) {
   const description_zh = lang === 'zh' ? desc : (defaults ? defaults.description_zh : desc);
   const description_en = lang === 'en' ? desc : (defaults ? defaults.description_en : desc);
 
+  const category = document.getElementById('agent-ext-category-select')?.dataset.value || '';
+
   try {
     const avatar = randomAgentAvatar();
     const body = {
@@ -1054,6 +1154,7 @@ async function _saveExternalAgent({ msgEl }) {
       description_zh, description_en,
       icon: avatar.icon, color: avatar.color,
       runtime: { kind: 'cli', cli },
+      category,
     };
     const res = await apiFetch('/api/agents/create', {
       method: 'POST',

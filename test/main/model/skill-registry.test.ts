@@ -9,17 +9,17 @@ import * as path from 'node:path';
 // scan them — the loader is pure FS + frontmatter parsing, no network/LLM.
 //
 // Post-refactor layout:
-//   builtin skills → `<WS_ROOT>/builtin/skills/<id>/SKILL.md`
-//   custom skills  → `<WS_ROOT>/<uid>/cloud/skills/<id>/SKILL.md`
-// The loader scans `[userSkillsDir(activeUid), BUILTIN_SKILLS_DIR]`, with
-// custom listed first so same-id custom overrides builtin.
+//   platform skills → `<WS_ROOT>/<uid>/local/marketplace/skills/<id>/SKILL.md`
+//   custom skills   → `<WS_ROOT>/<uid>/cloud/skills/<id>/SKILL.md`
+// The loader scans `[userSkillsDir(activeUid), userMarketplaceSkillsDir(activeUid)]`,
+// with custom listed first so same-id custom overrides platform.
 
 let tmpDir: string;
 let prevWs: string | undefined;
 const TEST_UID = 'u1';
 
 function builtinDir(): string {
-  return path.join(tmpDir, 'builtin', 'skills');
+  return path.join(tmpDir, TEST_UID, 'local', 'marketplace', 'skills');
 }
 function customDir(): string {
   return path.join(tmpDir, TEST_UID, 'cloud', 'skills');

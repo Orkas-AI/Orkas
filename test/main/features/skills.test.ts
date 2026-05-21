@@ -19,17 +19,12 @@ vi.mock('../../../src/main/model/client', () => ({
 
 let tmpDir: string;
 let prevWs: string | undefined;
-let prevBuiltinRoot: string | undefined;
 const TEST_UID = 'u1';
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-skills-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
-  prevBuiltinRoot = process.env.ORKAS_BUILTIN_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
-  // Point builtin source at an empty dir so syncBuiltinSkills doesn't fire
-  // against the real repo during tests.
-  process.env.ORKAS_BUILTIN_ROOT = tmpDir;
   vi.resetModules();
   const users = await import('../../../src/main/features/users');
   users.activateUser(TEST_UID);
@@ -37,7 +32,6 @@ beforeEach(async () => {
 
 afterEach(() => {
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
-  process.env.ORKAS_BUILTIN_ROOT = prevBuiltinRoot;
   streamImpl.current = null;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -51,8 +45,8 @@ function customSkillsDir(): string {
 }
 
 function builtinSkillsDir(): string {
-  // Top-level data/builtin/skills — shared across uids.
-  return path.join(tmpDir, 'builtin', 'skills');
+  // Platform (marketplace-installed) skills live under <uid>/local/marketplace/skills/.
+  return path.join(tmpDir, TEST_UID, 'local', 'marketplace', 'skills');
 }
 
 function writeCustomSkill(id: string, frontmatter = `name: "${id}"\ndescription: "test"`, body = '# body'): void {
@@ -493,47 +487,9 @@ describe('skills › applySkillContainerFromCommander › edit', () => {
   });
 });
 
-describe('skills › hashTree', () => {
-  it('returns empty string for missing dir', async () => {
-    const s = await loadSkills();
-    expect(s.hashTree(path.join(tmpDir, 'nope'))).toBe('');
-  });
-
-  it('returns stable hex digest for same content', async () => {
-    const s = await loadSkills();
-    const root = path.join(tmpDir, 'stable');
-    fs.mkdirSync(root, { recursive: true });
-    fs.writeFileSync(path.join(root, 'a.txt'), 'hello');
-    const h1 = s.hashTree(root);
-    const h2 = s.hashTree(root);
-    expect(h1).toMatch(/^[0-9a-f]{64}$/);
-    expect(h1).toBe(h2);
-  });
-
-  it('changes when a file changes', async () => {
-    const s = await loadSkills();
-    const root = path.join(tmpDir, 'changes');
-    fs.mkdirSync(root, { recursive: true });
-    fs.writeFileSync(path.join(root, 'a.txt'), 'v1');
-    const h1 = s.hashTree(root);
-    fs.writeFileSync(path.join(root, 'a.txt'), 'v2');
-    const h2 = s.hashTree(root);
-    expect(h1).not.toBe(h2);
-  });
-
-  it('ignores dotfiles and ignored dirs', async () => {
-    const s = await loadSkills();
-    const root = path.join(tmpDir, 'ignored');
-    fs.mkdirSync(root, { recursive: true });
-    fs.writeFileSync(path.join(root, 'a.txt'), 'hello');
-    const h1 = s.hashTree(root);
-    fs.writeFileSync(path.join(root, '.DS_Store'), 'garbage');
-    fs.mkdirSync(path.join(root, '__pycache__'));
-    fs.writeFileSync(path.join(root, '__pycache__', 'x.pyc'), 'bin');
-    const h2 = s.hashTree(root);
-    expect(h1).toBe(h2);
-  });
-});
+// hashTree / syncBuiltinSkills removed: there is no globally-shared `data/builtin/`
+// tree anymore. Platform skills now arrive via marketplace install and live at
+// `<uid>/local/marketplace/skills/<id>/` per machine — see features/marketplace_*.ts.
 
 describe('skills › listSkills', () => {
   it('returns empty when both dirs are missing', async () => {
@@ -831,77 +787,6 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
   });
 });
 
-// Marketplace-installed skills share BUILTIN_SKILLS_DIR with shipped built-ins, distinguished by
-// a top-level `_marketplace.json` sentinel. Sync must leave them alone and the sentinel itself
-// must not influence the hash.
-describe('skills › marketplace sentinel', () => {
-  function builtinSrcSkillsDir(): string {
-    return path.join(tmpDir, 'skills');  // ORKAS_BUILTIN_ROOT = tmpDir, so SRC = tmpDir/skills
-  }
-  function writeMarketplaceSkill(id: string, body = '# from marketplace'): string {
-    const dir = path.join(builtinSkillsDir(), id);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'SKILL.md'), `---\nname: ${id}\ndescription: mp\n---\n${body}`);
-    fs.writeFileSync(path.join(dir, '_marketplace.json'), JSON.stringify({
-      server_id: id, version: '1.0.0', category: 'general', installed_at: 1700000000000,
-    }));
-    return dir;
-  }
-  function writePlainBuiltinSkillDst(id: string): string {
-    const dir = path.join(builtinSkillsDir(), id);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'SKILL.md'), `---\nname: ${id}\ndescription: plain\n---\n`);
-    return dir;
-  }
-  function writeSrcBuiltinSkill(id: string, body = '# from src builtin'): void {
-    const dir = path.join(builtinSrcSkillsDir(), id);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'SKILL.md'), `---\nname: ${id}\ndescription: shipped\n---\n${body}`);
-  }
-
-  it('hashTree ignores _marketplace.json at any level', async () => {
-    const s = await loadSkills();
-    const root = path.join(tmpDir, 'mp-hash');
-    fs.mkdirSync(root, { recursive: true });
-    fs.writeFileSync(path.join(root, 'SKILL.md'), 'baseline');
-    const baseline = s.hashTree(root);
-
-    // Adding the sentinel must NOT change the hash (otherwise every startup would re-sync).
-    fs.writeFileSync(path.join(root, '_marketplace.json'), '{"v":"1.0.0"}');
-    expect(s.hashTree(root)).toBe(baseline);
-
-    // Mutating SKILL.md still does change it (sanity).
-    fs.writeFileSync(path.join(root, 'SKILL.md'), 'baseline-modified');
-    expect(s.hashTree(root)).not.toBe(baseline);
-  });
-
-  it('syncBuiltinSkills preserves marketplace dirs but still removes plain stale dirs', async () => {
-    const s = await loadSkills();
-    fs.mkdirSync(builtinSkillsDir(), { recursive: true });
-    fs.mkdirSync(builtinSrcSkillsDir(), { recursive: true });
-
-    const mpDir    = writeMarketplaceSkill('mp-skill-1');
-    const plainDir = writePlainBuiltinSkillDst('stale-skill-1');
-
-    s.syncBuiltinSkills();
-
-    expect(fs.existsSync(mpDir)).toBe(true);
-    expect(fs.existsSync(path.join(mpDir, '_marketplace.json'))).toBe(true);
-    expect(fs.existsSync(plainDir)).toBe(false);
-  });
-
-  it('syncBuiltinSkills does not overwrite a marketplace dir with a same-name shipped skill', async () => {
-    const s = await loadSkills();
-    fs.mkdirSync(builtinSkillsDir(), { recursive: true });
-    fs.mkdirSync(builtinSrcSkillsDir(), { recursive: true });
-    const id = 'shared-id';
-    writeSrcBuiltinSkill(id, '# from src builtin');
-    writeMarketplaceSkill(id, '# from marketplace');
-
-    s.syncBuiltinSkills();
-
-    const dst = fs.readFileSync(path.join(builtinSkillsDir(), id, 'SKILL.md'), 'utf8');
-    expect(dst).toContain('from marketplace');
-    expect(fs.existsSync(path.join(builtinSkillsDir(), id, '_marketplace.json'))).toBe(true);
-  });
-});
+// (The legacy marketplace-sentinel / data/builtin sync tests are gone. Marketplace
+// installs now live at `<uid>/local/marketplace/skills/<id>/` and are reconciled from
+// the cloud-synced `installs.json` manifest — see features/marketplace_*.ts.)
