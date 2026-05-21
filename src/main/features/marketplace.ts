@@ -119,9 +119,9 @@ export interface MarketplaceAgent {
   icon: string;
   color: string;
   version: string;
-  /** Author uid. `"0"` is the "官方制作 / Platform" marker; everything else is a community
-   *  uploader. Dedup is on (name, create_uid), so same name from different authors yields
-   *  distinct rows — the UI shows the author badge so users can tell them apart. */
+  /** Author uid. `"0"` is the official-platform marker (UI label `marketplace.author_platform`);
+   *  everything else is a community uploader. Dedup is on (name, create_uid), so same name from
+   *  different authors yields distinct rows — the UI shows the author badge to tell them apart. */
   create_uid: string;
   download_count: number;
   published_at: number;
@@ -153,7 +153,7 @@ export interface AgentDetail {
    *  via the detail endpoint when missing. */
   agent_json_url: string;
   /** Author uid from the server row. Recorded in `_install.json` so the in-app detail can
-   *  render an "官方/作者" badge without a marketplace round-trip. May be `''` on cache-hit. */
+   *  render the author badge without a marketplace round-trip. May be `''` on cache-hit. */
   create_uid: string;
 }
 
@@ -326,8 +326,8 @@ export async function installMarketplaceAgent(
   await fsp.mkdir(target, { recursive: true });
   await fsp.writeFile(path.join(target, 'agent.json'), JSON.stringify(detail.agent_json, null, 2), 'utf8');
   // `_install.json` stores everything the in-app UI needs without re-hitting the network:
-  // version/published_at for reconcile freshness; create_uid for the "官方/作者" badge on
-  // the agent detail page.
+  // version/published_at for reconcile freshness; create_uid for the author badge on the
+  // agent detail page.
   await fsp.writeFile(path.join(target, '_install.json'),
     JSON.stringify({
       version: detail.version,
@@ -477,7 +477,7 @@ export async function ensureDefaultInstalls(uid: string): Promise<{ seeded_agent
 
 // ── one-time backfill for older install records ──────────────────────────
 // Earlier install paths (predating the create_uid + version persistence) wrote manifest
-// rows + `_install.json` files without those fields. The UI surfaces "官方/作者" badges +
+// rows + `_install.json` files without those fields. The UI surfaces the author badge +
 // version chip from `_install.json`, so older records render blank chips. Backfill is a
 // startup pass: for every manifest row missing `create_uid`, look it up in the catalog and
 // rewrite both the manifest entry and the per-machine `_install.json`. Idempotent — once

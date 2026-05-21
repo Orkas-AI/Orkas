@@ -89,8 +89,8 @@ export interface SkillListing {
    *  explicitly disabled the skill. */
   enabled: boolean;
   /** Author uid for `source==='builtin'` (marketplace-installed) skills — read from
-   *  `_install.json`. `"0"` = "官方"; empty for `source==='custom'`. Renderer uses this to
-   *  show the "官方/作者" badge instead of an "内置" chip. */
+   *  `_install.json`. `"0"` = official-platform marker; empty for `source==='custom'`. Renderer
+   *  uses this to show the author badge (label `marketplace.author_platform` / `_user`). */
   create_uid?: string;
   /** Marketplace install version for `source==='builtin'`. Read from `_install.json` so the
    *  skills-tab card can render a `v1.0.0` chip. Undefined for custom skills. */
@@ -340,7 +340,7 @@ export async function listSkills(): Promise<SkillListing[]> {
         } catch { /* ignore */ }
       }
       // Marketplace-installed skills carry `_install.json` with `create_uid` + `version` —
-      // read it so the UI can show "官方/作者" + version chips without an extra IPC. Custom skills skip.
+      // read it so the UI can show the author badge + version chips without an extra IPC. Custom skills skip.
       if (source === 'builtin') {
         try {
           const metaFile = path.join(baseDir, name, '_install.json');
@@ -454,7 +454,7 @@ export function validateSkillName(name: string): string {
 // server-assigned id for marketplace-installed skills (which can begin with a digit).
 // Without the hex branch, dev uploading a platform-installed skill whose id starts with a
 // digit (e.g. `9720e1e263fd` Word/DOCX) bounced as "invalid skill id" — root cause of the
-// "上传 skill 报错" event seen in main log.
+// "skill upload error" event seen in main log.
 const SKILL_HEX_ID_RE = /^[a-f0-9]{12}$/;
 export function isValidSkillId(id: unknown): boolean {
   if (typeof id !== 'string' || !id) return false;

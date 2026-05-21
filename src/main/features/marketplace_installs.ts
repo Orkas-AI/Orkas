@@ -68,8 +68,9 @@ export interface AgentInstall {
   published_at: number;
   agent_json_url: string;
   installed_at: number;
-  /** Author uid as recorded on the server. `"0"` = "官方"; everything else = community
-   *  uploader. Optional in the type so old manifest rows (pre-2026-05-13) still parse —
+  /** Author uid as recorded on the server. `"0"` is the official-platform marker (label
+   *  `marketplace.author_platform`); everything else is a community uploader. Optional
+   *  in the type so old manifest rows (pre-2026-05-13) still parse —
    *  reconcile fills it in next time the row is re-pulled. UI uses this to render the
    *  author badge on the agent detail page. */
   create_uid?: string;

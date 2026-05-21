@@ -141,9 +141,10 @@ export interface Agent {
    *  field back to disk. */
   enabled: boolean;
   /** Author uid for `source==='builtin'` (marketplace-installed) agents — read from the
-   *  install dir's `_install.json`. `"0"` = "官方制作"; non-zero = community uploader. Empty
-   *  string for `source==='custom'` (no marketplace install meta). Renderer uses this to show
-   *  the "官方/作者" badge instead of a "内置" chip on the detail / card. */
+   *  install dir's `_install.json`. `"0"` = official-platform marker; non-zero = community
+   *  uploader. Empty string for `source==='custom'` (no marketplace install meta). Renderer
+   *  uses this to show the author badge (label `marketplace.author_platform` / `_user`)
+   *  instead of a generic platform chip on the detail / card. */
   create_uid?: string;
   /** Marketplace install version for `source==='builtin'`. Read from `_install.json` so the
    *  agents-tab card can render a `v1.0.0` chip alongside the category. Custom agents leave
@@ -577,7 +578,7 @@ export async function listAgents(): Promise<Agent[]> {
         }
         seen.add(norm.agent_id);
         // Marketplace-installed agents carry an `_install.json` sidecar with `create_uid` +
-        // `version`. Read it lazily here so the UI can show "官方/作者" badges and the version
+        // `version`. Read it lazily here so the UI can show the author badge and the version
         // chip without an extra IPC round-trip. Custom agents skip — they have no install meta.
         if (source === 'builtin') {
           try {
