@@ -26,6 +26,8 @@ import { opencodeBackend } from './backends/opencode.js';
 import { hermesBackend } from './backends/hermes.js';
 import { type LocalBackend, type LocalEvent } from './backends/base.js';
 import * as persist from './persist.js';
+import { sessionToolResultsDir } from '../../paths.js';
+import { maybeSpillToolResult } from '../../util/tool-result-cap.js';
 
 const log = createLogger('local-agents:runner');
 
@@ -41,6 +43,55 @@ function resolveTimeoutMs(): number {
   if (!Number.isFinite(n) || n < 1000) return DEFAULT_TIMEOUT_MS;
   return n;
 }
+
+/** How long the runner waits without seeing ANY backend event before
+ *  emitting an `idle` heartbeat. The ticker below fires every
+ *  `IDLE_TICK_MS`; the first emit happens once
+ *  `now - lastEventAt > threshold`. Default 90 s because a thinking
+ *  turn between tool calls runs ~10-40 s — 90 s comfortably skips real
+ *  activity and catches genuine stalls. Backends with no streaming at
+ *  all (openclaw) pass a smaller value via `BackendRunOptions.idleMs`. */
+const DEFAULT_IDLE_MS = 90 * 1000;
+const DEFAULT_IDLE_TICK_MS = 30 * 1000;
+/** Lower bound on user-supplied / backend-supplied idle thresholds so a
+ *  misconfigured value can't drum the rail every second. Tests can
+ *  shrink this through `ORKAS_LOCAL_AGENT_IDLE_MIN_MS` to exercise the
+ *  heartbeat at a manageable speed; production never sets it. */
+const MIN_IDLE_MS_DEFAULT = 30 * 1000;
+
+function envNum(name: string): number | undefined {
+  const raw = process.env[name];
+  if (!raw) return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function resolveIdleMs(backendHint: number | undefined): number {
+  const minMs = envNum('ORKAS_LOCAL_AGENT_IDLE_MIN_MS') ?? MIN_IDLE_MS_DEFAULT;
+  const candidates: Array<number | undefined> = [
+    backendHint,
+    envNum('ORKAS_LOCAL_AGENT_IDLE_MS'),
+  ];
+  for (const c of candidates) {
+    if (c !== undefined && c >= minMs) return c;
+  }
+  return Math.max(DEFAULT_IDLE_MS, minMs);
+}
+
+function resolveIdleTickMs(idleMs: number): number {
+  // Tick at most every 30 s; for very short thresholds (tests, or a
+  // future short-idleMs backend) divide so the user sees ~3 pulses
+  // before the threshold is reached.
+  return Math.min(DEFAULT_IDLE_TICK_MS, Math.max(50, Math.floor(idleMs / 3)));
+}
+
+/** Default idle threshold per backend. Override only when the backend
+ *  semantics deviate from "streams events through the turn"; today
+ *  openclaw is the only one (no streaming at all — see openclaw.ts
+ *  header). */
+const BACKEND_IDLE_MS: Partial<Record<LocalCliType, number>> = {
+  openclaw: 30 * 1000,
+};
 
 const BACKENDS: Partial<Record<LocalCliType, LocalBackend>> = {
   claude: claudeBackend,
@@ -108,7 +159,48 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   // a renderer crash mid-run still leaves a complete jsonl trail.
   let streamedOutput = '';
   let terminal: { status: RunCliAgentResult['status']; output?: string; error?: string; sessionId?: string } | null = null;
+  // Buffer events for the devtools archive so the debug panel sees CLI
+  // dispatches alongside core-agent calls. Translation = LocalEvent →
+  // dispatch start so the panel can render a relative timeline.
+  const archiveAppend = (e: LocalEvent) => {
+    archiveEvents.push({
+      t: Date.now() - startedAtMs,
+      type: e.type,
+      data: { ...e } as unknown as Record<string, unknown>,
+    });
+  };
+  const idleThresholdMs = resolveIdleMs(BACKEND_IDLE_MS[opts.cli]);
+  // CLI dispatch session id (matches the devtools-archive session id
+  // built below). The per-session spill dir is anchored on this so
+  // sweep / read paths can find the file again.
+  const cliSessionId = `${opts.uid}-cli-${opts.cli}-${handle.runId}`;
+  const spillDir = sessionToolResultsDir(opts.uid, cliSessionId);
+  let lastEventAt = Date.now();
   const onEvent = (e: LocalEvent) => {
+    // Self-emitted idle pulses don't count as "the CLI did something"
+    // — without this carve-out we'd reset our own deadline and stop
+    // pulsing during a real stall.
+    if (e.type !== 'idle') lastEventAt = Date.now();
+    // Tool-event result phase: spill oversized output to disk before
+    // it lands in events.jsonl / the renderer stream. Above 50 KB the
+    // raw bash output bloats the persistence log and the renderer
+    // memory; the spill keeps a head+tail preview inline (matching
+    // the in-process tool-result spill format) and exposes the full
+    // path via `outputPath` for click-to-expand. Backends don't know
+    // about this — they always emit the full output.
+    if (e.type === 'tool-event' && (e as any).phase === 'result' && typeof (e as any).output === 'string') {
+      const { output, outputPath } = maybeSpillToolResult({
+        toolResultsDir: spillDir,
+        toolName: String((e as any).tool || 'tool'),
+        callId: String((e as any).callId || ''),
+        output: (e as any).output as string,
+      });
+      // Rewrite in place so the persisted event and the forwarded
+      // event match exactly — no divergence between disk replay and
+      // live render.
+      (e as any).output = output;
+      if (outputPath) (e as any).outputPath = outputPath;
+    }
     persist.append(handle, e);
     if (e.type === 'text-delta' && typeof e.text === 'string') {
       streamedOutput += e.text;
@@ -125,6 +217,21 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     opts.onEvent(e);
   };
 
+  // Idle ticker — purely informational; never kills the process. The
+  // existing 20-minute wall-clock timeout stays the only kill path. We
+  // re-emit at IDLE_TICK_MS cadence so the user gets a steady drumbeat
+  // ("○ no output for 30s" repeated) confirming the run is still
+  // ostensibly alive, rather than a single heartbeat that ages out.
+  const idleTickMs = resolveIdleTickMs(idleThresholdMs);
+  const idleTimer = setInterval(() => {
+    if (terminal) return;  // run already finished, don't keep pulsing
+    const stalledMs = Date.now() - lastEventAt;
+    if (stalledMs > idleThresholdMs) {
+      onEvent({ type: 'idle', stalledMs });
+    }
+  }, idleTickMs);
+  if (typeof idleTimer.unref === 'function') idleTimer.unref();
+
   try {
     await backend.run({
       binPath: entry.path,
@@ -136,6 +243,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
       signal: opts.signal,
       onEvent,
       timeoutMs: resolveTimeoutMs(),
+      idleMs: BACKEND_IDLE_MS[opts.cli],
     });
   } catch (err) {
     const msg = (err as Error).message || String(err);
@@ -144,6 +252,8 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
       onEvent({ type: 'done', status: 'failed', error: msg });
     }
   }
+
+  clearInterval(idleTimer);
 
   // Backends are required to emit a `done` — if missing, treat as
   // failure so callers don't hang on an absent terminal event.

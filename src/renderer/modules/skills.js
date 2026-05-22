@@ -319,9 +319,13 @@ function _openSkillRowMenu(anchorBtn, id, source) {
   const cached = _skillsCache?.find((s) => s.id === id && s.source === source);
   const enabled = cached ? cached.enabled !== false : true;
   const canEdit = source === 'custom';
+  const canEdit = source === 'custom' || (source === 'builtin' && false);
+  // Dev-only entry on builtin: tag the label so the user knows this isn't a
+  // normal user capability (mirrors marketplace.upload's "(dev)" treatment).
+  const editLabelSuffix = (source === 'builtin' && false) ? t('common.dev_suffix') : '';
   const items = [];
   if (canEdit) {
-    items.push(`<div class="skill-row-menu-item" data-action="edit">${escapeHtml(t('skills.edit'))}</div>`);
+    items.push(`<div class="skill-row-menu-item" data-action="edit">${escapeHtml(t('skills.edit') + editLabelSuffix)}</div>`);
   }
   items.push(
     `<div class="skill-row-menu-item" data-action="toggle-enabled">${escapeHtml(enabled ? t('component.disable') : t('component.enable'))}</div>`,
@@ -1020,7 +1024,14 @@ let _skillEditSkillId = null;
 function _updateEditButtonLabel() {
   const btn = document.getElementById('skill-edit-btn');
   if (!btn) return;
-  btn.textContent = _skillEditMode ? t('skills.edit_btn_done') : t('skills.edit_btn_edit');
+  if (_skillEditMode) {
+    btn.textContent = t('skills.edit_btn_done');
+    return;
+  }
+  // Tag the "Edit" label on builtin skills (dev-only entry); the "Done"
+  // branch above stays bare — in edit mode the marker is redundant.
+  const suffix = (_selectedSkill?.source === 'builtin' && false) ? t('common.dev_suffix') : '';
+  btn.textContent = t('skills.edit_btn_edit') + suffix;
 }
 
 // When called with {autoSeed: true} (e.g. right after skill creation),
@@ -1219,7 +1230,7 @@ async function openSkillModal(editId) {
     if (el) el.value = '';
   }
   const sel = document.getElementById('skill-dir-selected');
-  if (sel) sel.textContent = t('skill_modal.dir_none') || '(none selected)';
+  if (sel) sel.textContent = t('skill_modal.dir_none');
 
   if (editId) {
     title.textContent = t('skills.modal_edit_title');

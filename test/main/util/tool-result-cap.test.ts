@@ -8,6 +8,7 @@ import {
   persistToolResult,
   buildPersistedOutputMarker,
   sweepToolResults,
+  maybeSpillToolResult,
   MAX_RESULT_CHARS_BY_TOOL,
   DEFAULT_MAX_RESULT_CHARS,
   PERSIST_THRESHOLD,
@@ -213,5 +214,63 @@ describe('tool-result-cap › persistToolResult', () => {
     expect(a).not.toBe(b);
     expect(fs.readFileSync(a, 'utf8')).toBe('content A');
     expect(fs.readFileSync(b, 'utf8')).toBe('content B');
+  });
+});
+
+describe('tool-result-cap › maybeSpillToolResult (CLI side)', () => {
+  let dir: string;
+  beforeEach(() => { dir = makeTmpDir(); });
+  afterEach(() => cleanup(dir));
+
+  it('passes through unchanged when under the persist threshold', () => {
+    const r = maybeSpillToolResult({
+      toolResultsDir: dir,
+      toolName: 'bash',
+      callId: 'c1',
+      output: 'small output',
+    });
+    expect(r.output).toBe('small output');
+    expect(r.outputPath).toBeUndefined();
+    // Did NOT create the directory — under-threshold means no IO.
+    expect(fs.existsSync(path.join(dir, 'bash.txt'))).toBe(false);
+  });
+
+  it('spills to disk and returns marker + path when above threshold', () => {
+    const big = 'X'.repeat(PERSIST_THRESHOLD + 100);
+    const r = maybeSpillToolResult({
+      toolResultsDir: dir,
+      toolName: 'bash',
+      callId: 'c1',
+      output: big,
+    });
+    expect(r.outputPath).toBeTruthy();
+    expect(r.outputPath!.startsWith(dir)).toBe(true);
+    expect(fs.existsSync(r.outputPath!)).toBe(true);
+    expect(fs.readFileSync(r.outputPath!, 'utf8')).toBe(big);
+    // Marker preview wraps the path + sizes (same shape as in-process
+    // tool spill so the renderer can treat both identically).
+    expect(r.output).toMatch(/<persisted-output/);
+    expect(r.output).toContain(r.outputPath!);
+    expect(r.output.length).toBeLessThan(big.length);
+  });
+
+  it('returns the same shape as buildPersistedOutputMarker so renderers can normalize', () => {
+    const big = 'A'.repeat(PERSIST_THRESHOLD + 50);
+    const r = maybeSpillToolResult({
+      toolResultsDir: dir, toolName: 'bash', callId: 'c1', output: big,
+    });
+    const marker = buildPersistedOutputMarker(r.outputPath!, 'bash', big);
+    // Marker text differs only by the path (which we just substituted),
+    // so the prefix must match.
+    expect(r.output.startsWith('<persisted-output')).toBe(true);
+    expect(marker.startsWith('<persisted-output')).toBe(true);
+  });
+
+  it('handles empty output without touching disk', () => {
+    const r = maybeSpillToolResult({
+      toolResultsDir: dir, toolName: 'bash', callId: 'c1', output: '',
+    });
+    expect(r.output).toBe('');
+    expect(r.outputPath).toBeUndefined();
   });
 });

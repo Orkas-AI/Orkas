@@ -156,11 +156,11 @@ function _createWorkspaceChip(target) {
   chip.type = 'button';
   chip.className = 'workspace-chip';
   chip.dataset.wsTarget = target;
-  chip.title = (typeof t === 'function' ? t('workspace.chip_title') : 'Click to pick a workspace');
+  chip.title = (t('workspace.chip_title'));
   // Text-prefix layout matches the recipient / project chip pattern
   // ("给:" / "项目:" / "工作区:") — the folder icon was replaced per UX
   // feedback so all three left-side chips read as "[label]: [value]".
-  const prefix = (typeof t === 'function' ? t('workspace.chip_label') : 'Workspace: ');
+  const prefix = (t('workspace.chip_label'));
   chip.innerHTML =
     `<span class="workspace-chip-prefix">${escapeHtml(prefix)}</span>` +
     '<span class="workspace-chip-label"></span>' +

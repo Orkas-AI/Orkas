@@ -243,7 +243,7 @@ When a user message has an `<attachments>` prefix, each `<file name=... path=...
 **`read_file` / `stat_file` semantics**:
 - text / pdf / docx all use `charStart` / `charEnd` (0-based half-open intervals); omitted = full content. Response header is `<file path=.. kind=.. total_chars="N" covered="a-b">…</file>`.
 - For pdf / docx not yet extracted, `read_file` returns `E_NEED_STAT`; call `stat_file(path)` first to trigger extraction. text has no such issue.
-- image does NOT take a range; the response is a real-time compressed grayscale JPEG fed to the vision model (**you see it; the user does NOT**).
+- image does NOT take a range; the response is a real-time compressed grayscale JPEG fed to the vision model (**you see it; the user does NOT**). Manifest entries marked `attached="inline"` already ride this turn's vision input — answer from what you see, do NOT call `read_file` on them.
 
 **`search_files` / `grep_files`**: scope = `$working_dir` ∪ the current conversation's attachment dir. `search_files` finds paths by filename / glob; `grep_files` searches text across files (auto-extracts pdf/docx on hit).
 

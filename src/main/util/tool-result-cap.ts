@@ -160,6 +160,49 @@ export function persistToolResult(
   return abs;
 }
 
+/** Spill a CLI tool-event's full output to disk when it exceeds the
+ *  50 KB persistence threshold. Mirrors the in-process tool spill
+ *  policy above so an oversized bash output looks the same to the
+ *  renderer regardless of whether it came from `wrapToolWithCap`
+ *  (in-process tools) or a CLI subprocess's tool-event.
+ *
+ *  Used by `local_agents/runner.ts` to wrap each `tool-event
+ *  phase:'result'` before forwarding to the renderer. Backends stay
+ *  unaware of the spill mechanism — they always emit the full output.
+ *
+ *  Returns the rewritten `{output, outputPath}`. When below threshold,
+ *  `outputPath` is undefined and `output` is the original content
+ *  unchanged. */
+export function maybeSpillToolResult(opts: {
+  toolResultsDir: string;
+  toolName: string;
+  callId: string;
+  output: string;
+}): { output: string; outputPath?: string } {
+  const { toolResultsDir, toolName, output } = opts;
+  if (!output || output.length < PERSIST_THRESHOLD) {
+    return { output };
+  }
+  try {
+    const abs = persistToolResult(toolResultsDir, toolName, output);
+    log.info(`cli tool spill tool=${toolName} session=${path.basename(toolResultsDir)} size=${output.length} path=${abs}`);
+    // Same preview shape as the in-process path so the renderer's
+    // click-to-expand logic works identically.
+    return {
+      output: buildPersistedOutputMarker(abs, toolName, output),
+      outputPath: abs,
+    };
+  } catch (err) {
+    // Disk-write failure: surface a truncated preview rather than the
+    // full payload so we don't blow up the event stream.
+    log.warn(`cli tool spill failed, falling back to truncated preview tool=${toolName}: ${(err as Error).message}`);
+    const head = output.slice(0, PREVIEW_HEAD);
+    return {
+      output: `${head}\n\n[note: oversized output spill failed: ${(err as Error).message}]`,
+    };
+  }
+}
+
 export function buildPersistedOutputMarker(
   absPath: string,
   toolName: string,

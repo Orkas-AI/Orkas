@@ -34,6 +34,17 @@ import { app, BrowserWindow, Menu, ipcMain, nativeImage, protocol, shell } from 
 // edge case where productName isn't picked up early.
 app.setName('Orkas');
 
+// Dev = local Server. The PC has three API base resolvers (`features/account/server.ts`,
+// `ORKAS_API_BASE_URL` env var first — pinning it here once means every business call routes to
+// the local Server when running unpackaged (no scattered build-mode branches in feature modules).
+// Packaged builds: not set → each resolver falls back to its profile/prod default.
+// Explicit launcher env (`./dev.sh`, `ORKAS_API_BASE_URL=… ./run.sh`) wins, so a dev can still
+// repro a bug against a remote Server. `app.isPackaged` here is allowlisted in
+// `OpenSource/SyncCode/strip-rules.json::isPackaged_allowed_files`.
+if (!app.isPackaged && !process.env.ORKAS_API_BASE_URL) {
+  process.env.ORKAS_API_BASE_URL = 'http://127.0.0.1:8888/api';
+}
+
 // Register the KB file protocol BEFORE `app.whenReady()` — privileged
 // schemes can't be added after. `kb-file:///<relpath>` serves a single
 // file out of the current active user's `<uid>/cloud/contexts/`. Used by
@@ -122,6 +133,8 @@ import * as reflectionTrigger from './features/reflection-trigger';
 import * as scheduledTasks from './features/scheduled_tasks';
 import * as chatAttachments from './features/chat_attachments';
 import * as chatArtifacts from './features/chat_artifacts';
+// `features/sync/*` and `ipc/sync.ts` are stripped in OrkasOpen (depends on account).
+
 
 function createWindow(): BrowserWindow {
   const dev = !app.isPackaged;
@@ -202,6 +215,26 @@ function registerIpc(): void {
   });
 
   ipcMain.handle('orkas.appVersion', () => app.getVersion());
+
+  // Synchronous boot bundle for i18n. Renderer's preload calls this via
+  // `ipcRenderer.sendSync` BEFORE any DOM scripts run, so the renderer can
+  // populate _currentLang + _tables synchronously at module load — first
+  // paint shows the user's preferred language with no English flash. Using
+  // sendSync (and not the async `config.getLanguage` IPC) is the whole point:
+  // an async round-trip schedules a microtask, paint slips through. Reads
+  // ~100 KB of locale JSON per renderer boot; SSD-fast.
+  ipcMain.on('orkas:bootI18n', (event) => {
+    try {
+      const lang = appConfig.getLanguage();
+      const localesDir = path.join(paths.SRC_ROOT, 'renderer', 'locales');
+      const zh = JSON.parse(fs.readFileSync(path.join(localesDir, 'zh.json'), 'utf-8'));
+      const en = JSON.parse(fs.readFileSync(path.join(localesDir, 'en.json'), 'utf-8'));
+      event.returnValue = { ok: true, lang, tables: { zh, en } };
+    } catch (err) {
+      log.warn('bootI18n failed', { error: (err as Error)?.message });
+      event.returnValue = { ok: false };
+    }
+  });
 
   ipcMain.handle('orkas.diagnostics', async () => {
     const sample = {
@@ -526,8 +559,20 @@ function registerChatMediaProtocol(): void {
       if (host === 'local') {
         // pathname starts with `/`; on Windows the drive-letter prefix needs
         // that leading slash stripped. `_pathnameToAbsPath` handles both.
+        // Try media (image/video) first; fall through to preview (pdf/html)
+        // on bad-ext only — every other failure (not_found / too_large) is
+        // terminal, so we don't mask a real error by re-checking under a
+        // different bucket.
         const abs = _pathnameToAbsPath(u.pathname || '');
-        const resolved = chatAttachments.resolveLocalMediaPath(abs);
+        let resolved: ReturnType<typeof chatAttachments.resolveLocalMediaPath>
+          | ReturnType<typeof chatAttachments.resolveLocalPreviewPath>
+          = chatAttachments.resolveLocalMediaPath(abs);
+        if (!resolved.ok && (resolved as { code?: string }).code === 'bad_input') {
+          // Only retry under preview when the media resolver rejected on extension;
+          // path validation errors ('path must be absolute' / 'path required') re-raise.
+          const previewTry = chatAttachments.resolveLocalPreviewPath(abs);
+          if (previewTry.ok) resolved = previewTry;
+        }
         if (!resolved.ok) {
           // Same `(x as {field?: T}).field` access pattern as the cid branch above —
           // tsc's narrow on `if (!resolved.ok)` doesn't always propagate to the
@@ -743,20 +788,14 @@ if (!gotLock) {
         m.subscribeReconcileStatus((status) => {
           ipc.broadcastToRenderer('marketplace:reconcile-status', status);
         });
+        // Server-side update sweep runs first so the manifest leads the per-machine
+        // `_install.json` for items the admin has republished — reconcile then picks up the
+        // mismatch and re-pulls the new blob. Network failures here are swallowed by the
+        // helper itself; reconcile still runs against the stale manifest.
+        await m.checkServerUpdatesForInstalls(users.getActiveUserId());
         await m.reconcileInstalls(users.getActiveUserId());
       } catch (err) {
         createLogger('marketplace_reconcile').warn('startup reconcile failed', {
-          error: (err as Error).message,
-        });
-      }
-      try {
-        // Backfill `create_uid` / `version` for older install records (predates those fields
-        // being persisted). Idempotent — no-op when every row already has the field. Runs after
-        // reconcile so any freshly-pulled record already has the fields and the backfill skips it.
-        const mp = await import('./features/marketplace');
-        await mp.backfillMarketplaceCreateUid(users.getActiveUserId());
-      } catch (err) {
-        createLogger('marketplace_backfill').warn('startup backfill failed', {
           error: (err as Error).message,
         });
       }

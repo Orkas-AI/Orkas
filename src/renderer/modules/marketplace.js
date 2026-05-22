@@ -11,8 +11,8 @@
 //     cache stale / missing and writes back. Install reads from cache too.
 //   - openMarketplace() runs sweepCache() once on entry — 100 MB / 7d eviction.
 //
-// Per-card 安装 button (in detail) materializes the cached item into the local
-// `data/builtin/{agents,skills}/` tree with a `_marketplace.json` sentinel.
+// Per-card Install button (in detail) materializes the cached item into the local
+// platform-install tree (<uid>/local/marketplace/{agents,skills}/<id>/).
 //
 // Dev-only upload (`openMarketplaceUpload`) is exposed for agents.js / skills.js (⋯ menu +
 // detail-page actions). Category is NO LONGER asked — it lives in the spec now (agent.json
@@ -43,9 +43,10 @@ let _mpCategoriesCache = (() => {
 })();
 
 // Installed-state cache (synchronous via localStorage). Without this, every panel open
-// waits 1-2s for `agents.list` / `skills.list` IPCs before card buttons can show "已安装";
-// users see all cards flash "Install" first. The cache is updated after each successful
-// install/uninstall + after every successful background `agents.list` / `skills.list` refresh.
+// waits 1-2s for `agents.list` / `skills.list` IPCs before card buttons can show the
+// installed state; users see all cards flash "Install" first. The cache is updated after
+// each successful install/uninstall + after every successful background
+// `agents.list` / `skills.list` refresh.
 const MP_INSTALLED_LS_KEY = 'orkas:mp:installed';
 function _mpLoadInstalledFromLs() {
   try {
@@ -79,14 +80,14 @@ let _mpReconcileStatus = { state: 'idle', total: 0, pulled: 0 };
 // request on infinite-scroll, and `exhausted` flips true once a /list response is shorter
 // than `MP_LISTINGS_PAGE_SIZE` or covers `total`.
 //
-// SWR semantics (matches user expectation "切 tab/category 仍发请求,只是优先用缓存"):
+// SWR semantics ("switching tab/category still fires a request, but the cache renders first"):
 //   - Switching tab / category / opening panel:
 //     * Hydrate cache immediately so the grid renders prior items (no blank flash).
 //     * Always re-fetch page 1 in the background to overwrite stale rows.
 //   - Infinite scroll: when the sentinel near the grid bottom enters the viewport, fetch
 //     page = cached.nextPage and APPEND (dedupe by id) — never overwrite earlier pages.
 //   - "All" tab (category = '') feeds rows into per-category cache slots so a subsequent
-//     "教育" tab open paints fast. The reverse (cat slot → "All") is NOT done — All needs
+//     category tab open paints fast. The reverse (cat slot → "All") is NOT done — All needs
 //     a fresh time-ordered slice from the server.
 const MP_LISTINGS_PAGE_SIZE = 50;
 const _mpListingsCache = new Map();
@@ -119,16 +120,13 @@ function isMarketplaceOpen() {
   return document.getElementById('panel-marketplace')?.classList.contains('active') === true;
 }
 
-async function openMarketplace(initialTab = 'agent') {
+function openMarketplace(initialTab = 'agent') {
   const panel = document.getElementById('panel-marketplace');
   if (!panel) return;
 
   // Kick off the reconcile watcher on first marketplace open (rather than at script load) so
   // we don't fire IPC during early renderer init. Idempotent on later calls.
   _mpInitReconcileWatch();
-  // Hydrate persisted listings cache before first render — populates the in-memory Map so
-  // `_mpHydrateFromCache` below finds entries even on a cold app start.
-  await _mpHydrateListingsCache();
 
   _mpReturnView = (typeof currentView === 'string' && currentView !== 'marketplace')
     ? currentView : 'agents';
@@ -152,6 +150,7 @@ async function openMarketplace(initialTab = 'agent') {
       return { installedAgentIds: cached.agentIds, installedSkillIds: cached.skillIds };
     })(),
     loading: true,
+    searchBusy: false,
     installing: new Set(),
     error: '',
     // Detail-view scratchpad
@@ -172,15 +171,21 @@ async function openMarketplace(initialTab = 'agent') {
     _mpBound = true;
   }
 
+  // Reset the search box so it matches the freshly-reset `q` above (clean slate on reopen).
+  const searchEl = panel.querySelector('[data-mp-search]');
+  if (searchEl) searchEl.value = '';
+
+  // Show the panel + a loading affordance synchronously — before ANY async work — so a slow
+  // cache-read IPC or a slow server fetch never leaves the user on the prior view with no
+  // feedback. `_mpLoadAll` then hydrates the listings cache, paints cached rows when present,
+  // and overlays fresh data — all via its own `_mpRender` calls.
   if (typeof setView === 'function') setView('marketplace');
   _mpShowGridView();
   _mpRender();
 
-  // Best-effort sweep — never block UI on a failure.
+  // Best-effort cache sweep — never blocks the UI.
   window.orkas.invoke('marketplace.sweepCache').catch(() => { /* ignore */ });
 
-  // Fire-and-forget: `_mpLoadAll` paints cache + fresh data internally via its own
-  // `_mpRender` calls. Awaiting here would only delay returning control to the user.
   _mpLoadAll();
 }
 
@@ -251,7 +256,7 @@ async function _mpInitReconcileWatch() {
         try { if (typeof loadAgents === 'function') loadAgents(true); } catch { /* ignore */ }
         try { if (typeof loadSkills === 'function') loadSkills(true); } catch { /* ignore */ }
         // If marketplace panel is open right now, also re-run the install-state hydration
-        // so card buttons flip from "安装" to "已安装" without a tab switch.
+        // so card buttons flip from Install to Installed without a tab switch.
         if (isMarketplaceOpen()) _mpLoadAll();
       }
     });
@@ -305,24 +310,24 @@ function _mpBindPanel(panel) {
   );
   panel.querySelectorAll('[data-mp-tab]').forEach((btn) => {
     btn.addEventListener('click', () => {
-      if (!_mpState) return;
+      if (!_mpState || _mpState.tab === btn.dataset.mpTab) return;
       _mpState.tab = btn.dataset.mpTab;
       _mpState.category = '';
-      _mpRender();
+      // Re-hydrate from cache for the new (kind, '', q) and re-fetch — same cache-first path
+      // as category clicks, so the grid doesn't show the previous tab's rows under "All".
+      _mpRefreshListings();
     });
   });
   const search = panel.querySelector('[data-mp-search]');
   if (search) {
     search.addEventListener('keydown', (e) => {
       if (e.isComposing || e.keyCode === 229) return;
-      if (e.key === 'Enter') {
-        const next = search.value.trim();
-        if (next === _mpState.q) return;
-        _mpState.q = next;
-        _mpRefreshListings();
-      }
+      if (e.key === 'Enter') _mpRunSearch();
     });
+    search.addEventListener('input', _mpRenderSearchClear);
   }
+  panel.querySelector('[data-mp-search-btn]')?.addEventListener('click', _mpRunSearch);
+  panel.querySelector('[data-mp-search-clear]')?.addEventListener('click', _mpClearSearch);
   panel.querySelector('[data-mp-detail-install]')?.addEventListener('click', _mpInstallFromDetail);
   // Dev-only delete button click handler is bound by marketplace_dev.js (file absent in
   // OrkasOpen). HTML element ships in index.html with display:none — dev module flips it
@@ -330,16 +335,16 @@ function _mpBindPanel(panel) {
 }
 
 async function _mpLoadAll() {
-  // SWR open: paint cache immediately so the grid never goes blank between IPC roundtrips.
-  // Even when the TTL has elapsed (dev mode TTL=0 always fires a refresh), the user sees the
-  // stale list right away — fresh data swaps in once the background fetch lands.
-  const hadCache = _mpHydrateFromCache();
-  _mpState.loading = !hadCache;
-  _mpState.error = '';
+  // Pull the persisted listings cache into the in-memory Map first (idempotent — no-op after
+  // the first open this session) so the cache-first paint below has prior-run rows to show.
+  await _mpHydrateListingsCache();
+  // Cache-first (SWR): paint cached rows for the current (kind, category, q) immediately; if
+  // the visible tab has no rows, show the body spinner until the listings fetch lands. Either
+  // way we always re-fetch in the background and swap fresh data in.
+  _mpHydrateFromCache();
   if (_mpCategoriesCache) _mpState.categories = _mpCategoriesCache;
-  // First paint with whatever we already know — categories from the renderer cache (set on
-  // a prior session if it ran), listings from the hydrated cache. Avoids the "wait for the
-  // IPC roundtrip before showing anything" flash that broke the cache-first promise.
+  _mpState.loading = _mpVisibleItems().length === 0;
+  _mpState.error = '';
   _mpRender();
 
   try {
@@ -363,13 +368,10 @@ async function _mpLoadAll() {
     _mpPersistInstalled();
     await _mpLoadListings();
   } catch (err) {
-    // Background-refresh failure must NOT wipe what's already on screen. Only surface as a
-    // body-level error when we never managed to paint any cached items in the first place;
-    // otherwise log + keep the stale view (matches SWR semantics).
+    // A failed refresh must NOT wipe what's already on screen — surface as a body-level error
+    // only when the visible tab has nothing to show; otherwise log + keep the stale view.
     console.warn('marketplace background fetch failed:', err);
-    if (!hadCache && _mpState.agents.length === 0 && _mpState.skills.length === 0) {
-      _mpState.error = (err && err.message) || String(err);
-    }
+    if (_mpVisibleItems().length === 0) _mpState.error = (err && err.message) || String(err);
   } finally {
     _mpState.loading = false;
     _mpRender();
@@ -400,27 +402,81 @@ setTimeout(() => { _mpInitReconcileWatch().catch(() => {}); }, 0);
   } catch { /* preload happens at script load; window.orkas not ready is OK */ }
 })();
 
-// Top-level listings refresh: hydrate cache → render immediately if hit, then background
-// fetch + re-render. The single entry point for category-chip clicks and the search Enter
-// handler so the loading-state / cache-hit decision lives in one place.
-async function _mpRefreshListings() {
-  const hadCache = _mpHydrateFromCache();
-  _mpState.loading = !hadCache;
+// Single entry point for category-chip clicks and search submits: hydrate the cached rows for
+// the new (kind, category, q) and paint them; if the visible tab has no rows, show the body
+// spinner instead. Either way, re-fetch page 1 in the background and swap fresh data in.
+// `opts.searchBusy` additionally spins the search button while the fetch is in flight.
+async function _mpRefreshListings(opts = {}) {
+  if (!_mpState) return;
+  _mpHydrateFromCache();
+  _mpState.loading = _mpVisibleItems().length === 0;
+  _mpState.error = '';
+  if (opts.searchBusy) _mpState.searchBusy = true;
   _mpRender();
-  await _mpLoadListings();
-  _mpState.loading = false;
-  _mpRender();
+  try {
+    await _mpLoadListings();
+  } finally {
+    _mpState.loading = false;
+    if (opts.searchBusy) _mpState.searchBusy = false;
+    _mpRender();
+  }
 }
 
-// Generation token: every call to a load fn bumps `_loadGen`; only responses from the
-// latest gen get applied. Prevents stale responses (tab / category / search switched
-// mid-flight) from overwriting current state.
+// ─── Search box (input + Enter / search button + clear ×) ───
+// Triggered by Enter in the input OR a click on the search button — reads the live input
+// value, refreshes the listings for that query, and spins the search button while it loads.
+function _mpRunSearch() {
+  if (!_mpState) return;
+  const input = document.getElementById('panel-marketplace')?.querySelector('[data-mp-search]');
+  _mpState.q = (input?.value || '').trim();
+  _mpRefreshListings({ searchBusy: true });
+}
+
+// Clear (×) button inside the input: empties the box and, if a search was active, refreshes
+// back to the unfiltered list.
+function _mpClearSearch() {
+  if (!_mpState) return;
+  const input = document.getElementById('panel-marketplace')?.querySelector('[data-mp-search]');
+  if (input) { input.value = ''; input.focus(); }
+  _mpRenderSearchClear();
+  if (_mpState.q) {
+    _mpState.q = '';
+    _mpRefreshListings({ searchBusy: true });
+  }
+}
+
+// Reflect `_mpState.searchBusy` on the search button — spinner + greyed/disabled while a
+// search fetch is in flight, plain accent button otherwise (mirrors the install-button pattern).
+function _mpRenderSearchBtn() {
+  const btn = document.getElementById('panel-marketplace')?.querySelector('[data-mp-search-btn]');
+  if (!btn) return;
+  const busy = !!(_mpState && _mpState.searchBusy);
+  btn.className = busy ? 'btn btn-sm is-disabled marketplace-search-btn' : 'btn btn-sm btn-primary marketplace-search-btn';
+  btn.disabled = busy;
+  const label = escapeHtml(t('marketplace.search'));
+  btn.innerHTML = busy ? `<span class="marketplace-btn-spinner"></span>${label}` : label;
+}
+
+// Show the clear (×) button only when the input has text.
+function _mpRenderSearchClear() {
+  const panel = document.getElementById('panel-marketplace');
+  const input = panel?.querySelector('[data-mp-search]');
+  const clearBtn = panel?.querySelector('[data-mp-search-clear]');
+  if (!clearBtn) return;
+  clearBtn.hidden = !(input && input.value.length > 0);
+}
+
+// Re-point _mpState.agents/skills at the cached rows for the current (kind, category, q).
+// (Stale-response protection lives in `_mpLoadListingsPage`'s per-kind generation token.)
 function _mpHydrateFromCache() {
   const cat = _mpState.category, q = _mpState.q;
   const cachedA = _mpListingsCache.get(_mpListingsKey('agent', cat, q));
   const cachedS = _mpListingsCache.get(_mpListingsKey('skill', cat, q));
-  if (cachedA) _mpState.agents = cachedA.items;
-  if (cachedS) _mpState.skills = cachedS.items;
+  // No cache for this (kind, cat, q) → clear that list rather than leave the previous
+  // tab/category's rows on screen; the caller's `loading` flag (set from
+  // `_mpVisibleItems().length`) then decides spinner vs empty-state for the now-empty tab.
+  _mpState.agents = cachedA ? cachedA.items : [];
+  _mpState.skills = cachedS ? cachedS.items : [];
   return !!(cachedA || cachedS);
 }
 
@@ -523,6 +579,12 @@ async function _mpLoadMoreCurrentKind() {
   }
 }
 
+// The list the user is currently looking at — the basis for "is the page empty → show
+// loading", and for rendering / finding cards on the active tab.
+function _mpVisibleItems() {
+  return _mpState.tab === 'agent' ? _mpState.agents : _mpState.skills;
+}
+
 // ─── Grid view rendering ───
 function _mpRender() {
   const panel = document.getElementById('panel-marketplace');
@@ -536,6 +598,8 @@ function _mpRender() {
   }
   const searchEl = panel.querySelector('[data-mp-search]');
   if (searchEl) searchEl.setAttribute('placeholder', t('marketplace.search_ph'));
+  _mpRenderSearchBtn();
+  _mpRenderSearchClear();
 
   const cats = _mpState.categories;
   const chips = [
@@ -571,7 +635,7 @@ function _mpRender() {
   }
   // Order = server-side `updated_at DESC` (newest first). No further client sort — the
   // accumulator in `_mpLoadListingsPage` preserves the server's slicing.
-  const items = (_mpState.tab === 'agent' ? _mpState.agents : _mpState.skills);
+  const items = _mpVisibleItems();
   if (items.length === 0) {
     body.innerHTML = `<div class="empty">${escapeHtml(t('marketplace.empty'))}</div>`;
     return;
@@ -589,7 +653,7 @@ function _mpRender() {
         e.stopPropagation();
         _mpInstall(_mpState.tab, id);
       } else {
-        const item = (_mpState.tab === 'agent' ? _mpState.agents : _mpState.skills).find((x) => x.id === id);
+        const item = _mpVisibleItems().find((x) => x.id === id);
         if (item) _mpOpenDetail(_mpState.tab, item);
       }
     });
@@ -653,7 +717,8 @@ function _mpCardHtml(item, lang) {
 }
 
 /** Author badge — distinguishes same-name uploads by different authors. uid=0 is the
- *  "Platform" marker (官方制作); everything else falls back to a truncated uid. */
+ *  Platform marker (i18n key `marketplace.author_platform`); everything else falls back
+ *  to a truncated uid. */
 function _mpAuthorBadgeHtml(createUid) {
   if (!createUid) return '';
   const label = String(createUid) === '0'
@@ -753,8 +818,8 @@ function _mpRenderDetail() {
   const installBtn = panel.querySelector('[data-mp-detail-install]');
   installBtn.dataset.id = item.id;
   installBtn.dataset.kind = kind;
-  // When installed, repurpose the primary button as "卸载" (local-only uninstall — does NOT
-  // touch the server row). When installing/uninstalling, disabled with progress text + inline
+  // When installed, repurpose the primary button as Uninstall (local-only — does NOT touch
+  // the server row). When installing/uninstalling, disabled with progress text + inline
   // spinner so the user sees "still working" instead of a static label.
   const spinnerHtml = '<span class="marketplace-btn-spinner"></span>';
   if (installing) {
@@ -847,15 +912,15 @@ function _mpAgentDetailHtml(agentJson) {
   const lang = getLang();
   const desc = pickDesc(agentJson, lang).trim();
   const workflow = String(agentJson.workflow || '').trim();
-  const placeholderHtml = `<span class="agents-detail-placeholder">${escapeHtml(t('agents.placeholder_unset') || '—')}</span>`;
+  const placeholderHtml = `<span class="agents-detail-placeholder">${escapeHtml(t('agents.placeholder_unset'))}</span>`;
 
   return `<div class="agents-detail-body marketplace-detail-body-inner">
     <div class="agents-detail-section">
-      <div class="agents-detail-label">${escapeHtml(t('agents.label_desc') || 'Summary')}</div>
+      <div class="agents-detail-label">${escapeHtml(t('agents.label_desc'))}</div>
       <div class="agents-detail-desc">${desc ? escapeHtml(desc) : placeholderHtml}</div>
     </div>
     <div class="agents-detail-section agents-detail-section-workflow">
-      <div class="agents-detail-label">${escapeHtml(t('agents.label_workflow') || 'Workflow')}</div>
+      <div class="agents-detail-label">${escapeHtml(t('agents.label_workflow'))}</div>
       <div class="agents-detail-workflow markdown-body">${workflow ? renderMarkdownFull(workflow) : placeholderHtml}</div>
     </div>
   </div>`;
@@ -885,20 +950,20 @@ function _mpSkillDetailHtml() {
   const bodyHtml = isMd
     ? renderMarkdownFull(text)
     : `<pre class="code-view"><code>${escapeHtml(text)}</code></pre>`;
-  const placeholderHtml = `<span class="agents-detail-placeholder">${escapeHtml(t('agents.placeholder_unset') || '—')}</span>`;
+  const placeholderHtml = `<span class="agents-detail-placeholder">${escapeHtml(t('agents.placeholder_unset'))}</span>`;
 
   return `
     <div class="skills-detail-content marketplace-detail-body-inner">
       <section class="skills-doc-section">
-        <h3 class="skills-doc-section-label">${escapeHtml(t('skills.label_summary') || 'Summary')}</h3>
+        <h3 class="skills-doc-section-label">${escapeHtml(t('skills.label_summary'))}</h3>
         <div class="skills-doc-section-body">${summary ? escapeHtml(summary) : placeholderHtml}</div>
       </section>
       <section class="skills-doc-section skills-usage-section">
         <h3 class="skills-doc-section-label skills-usage-label">
-          <span>${escapeHtml(t('skills.label_usage') || 'Usage')}</span>
+          <span>${escapeHtml(t('skills.label_usage'))}</span>
           <button type="button" class="skills-source-toggle" data-mp-source-toggle aria-expanded="false">
             <span class="skills-source-toggle-caret" aria-hidden="true">▶</span>
-            <span>${escapeHtml(t('skills.label_source') || 'View source')}</span>
+            <span>${escapeHtml(t('skills.label_source'))}</span>
           </button>
         </h3>
         <div class="skills-source-panel" data-mp-source-panel style="display:none">
@@ -935,7 +1000,7 @@ async function _mpInstall(kind, id) {
     _mpPersistInstalled();
     if (typeof loadAgents === 'function' && kind === 'agent') await loadAgents(true);
     if (typeof loadSkills === 'function' && kind === 'skill') await loadSkills(true);
-    // Success: no toast — the button flips to "已安装" + state set above is the signal.
+    // Success: no toast — the button flips to "Installed" + state set above is the signal.
     // (Failure still alerts because the user otherwise has no way to know why nothing happened.)
   } catch (err) {
     const msg = (err && err.message) || String(err);
@@ -972,7 +1037,7 @@ async function _mpUninstall(kind, id) {
     _mpPersistInstalled();
     if (typeof loadAgents === 'function' && kind === 'agent') await loadAgents(true);
     if (typeof loadSkills === 'function' && kind === 'skill') await loadSkills(true);
-    // Success: button flips back to "安装" — no toast needed. (Failures still alert.)
+    // Success: button flips back to "Install" — no toast needed. (Failures still alert.)
   } catch (err) {
     const msg = (err && err.message) || String(err);
     uiAlert(t('marketplace.uninstall_failed').replace('{reason}', msg));

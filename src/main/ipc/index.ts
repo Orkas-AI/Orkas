@@ -51,7 +51,7 @@ import { createLogger, logFromRenderer } from '../logger';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { shell } from 'electron';
-import { WS_ROOT } from '../paths';
+import { WS_ROOT, chatAttachmentDir } from '../paths';
 
 const log = createLogger('ipc');
 
@@ -83,6 +83,17 @@ async function _resolveWorkspaceScope(
     return payload.projectId;
   }
   return undefined;
+}
+
+// Resolve the cid-scoped attachment dir from a renderer payload, when present.
+// The file-tools' allowed-paths scope is "active workspace ∪ this cid's
+// attachment dir" (CLAUDE.md §5); reveal + preview must honour the same
+// union so a user can preview an attachment they uploaded, not just files
+// the LLM wrote into the workspace.
+function _attachmentScopeForPayload(userId: string, payload: any): string | null {
+  if (!payload || typeof payload.cid !== 'string' || !payload.cid) return null;
+  if (!safeId(payload.cid)) return null;
+  return path.resolve(chatAttachmentDir(userId, payload.cid));
 }
 
 // ── Invoke handlers ──────────────────────────────────────────────────────
@@ -970,12 +981,72 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const ws = userWorkspace.getWorkspacePath(ctx.userId, projectId);
     const norm = path.resolve(target);
     const wsNorm = path.resolve(ws);
-    if (!norm.startsWith(wsNorm + path.sep) && norm !== wsNorm) {
+    const attachmentScope = _attachmentScopeForPayload(ctx.userId, payload);
+    const inAttachment = !!attachmentScope &&
+      (norm === attachmentScope || norm.startsWith(attachmentScope + path.sep));
+    if (!inAttachment && !norm.startsWith(wsNorm + path.sep) && norm !== wsNorm) {
       throw new Error('path is outside the user workspace');
     }
     if (!fs.existsSync(norm)) throw new Error('file not found');
     shell.showItemInFolder(norm);
     return { path: norm };
+  },
+
+  // Resolve a per-conversation attachment's absolute path. The renderer's
+  // chip carries (cid, name) but the in-app file viewer's contract is
+  // "abs path in"; we go through `resolveAttachmentAbsPath` so the same
+  // safe-name / traversal / not-a-file gates the chat-media:// handler
+  // already enforces apply here.
+  'attachments.absPath': async (payload, ctx) => {
+    const cid = payload?.cid;
+    const name = payload?.name;
+    if (typeof cid !== 'string' || !cid) throw new Error('missing cid');
+    if (typeof name !== 'string' || !name) throw new Error('missing name');
+    const r = chatAttachments.resolveAttachmentAbsPath(ctx.userId, cid, name);
+    if (!r.ok) {
+      const err = r as { code?: string; error?: string };
+      return { ok: false, error: err.error || err.code || 'failed' };
+    }
+    return { ok: true, path: r.absPath, kind: r.kind };
+  },
+
+  // Read a file's text content for the in-app preview overlay
+  // (markdown / plain text — pdf and html are streamed via `chat-media://`
+  // instead). Same scope as the file-tools per CLAUDE.md §5: active
+  // workspace ∪ the attachment dir of the current cid. 2 MB cap is
+  // intentional — the whole file is slurped into the JS heap and crosses
+  // IPC, so larger files would balloon the renderer; the caller falls
+  // through to the "too large → open folder" dialog on `error: 'too_large'`.
+  'produced.readText': async (payload, ctx) => {
+    const target = payload?.path;
+    if (typeof target !== 'string' || !target) {
+      throw new Error('missing path');
+    }
+    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
+    const ws = userWorkspace.getWorkspacePath(ctx.userId, projectId);
+    const norm = path.resolve(target);
+    const wsNorm = path.resolve(ws);
+    const attachmentScope = _attachmentScopeForPayload(ctx.userId, payload);
+    const inAttachment = !!attachmentScope &&
+      (norm === attachmentScope || norm.startsWith(attachmentScope + path.sep));
+    const inWorkspace = norm === wsNorm || norm.startsWith(wsNorm + path.sep);
+    if (!inWorkspace && !inAttachment) {
+      throw new Error('path is outside the user workspace');
+    }
+    let st: fs.Stats;
+    try { st = fs.statSync(norm); }
+    catch { return { ok: false, error: 'not_found' }; }
+    if (!st.isFile()) return { ok: false, error: 'not_found' };
+    const MAX_TEXT_BYTES = 2 * 1024 * 1024;
+    if (st.size > MAX_TEXT_BYTES) {
+      return { ok: false, error: 'too_large', size: st.size, cap: MAX_TEXT_BYTES };
+    }
+    let text: string;
+    try { text = fs.readFileSync(norm, 'utf8'); }
+    catch (err) { return { ok: false, error: String((err as Error).message || 'read failed') }; }
+    // Strip UTF-8 BOM so markdown / json don't render a leading invisible char.
+    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+    return { ok: true, text, size: st.size };
   },
 
   // Read the install data root (`<container>/data`) — read-only display
@@ -996,6 +1067,10 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // Discovery + model catalogs only; actual spawning happens inside group_chat
   // dispatch via `features/local_agents/runner.ts`, never as a standalone IPC.
   ...localAgentsHandlers,
+
+  // User-account login (Google / Apple OAuth). Stripped from the OrkasOpen build.
+
+  // Multi-device sync. Stripped from the OrkasOpen build (depends on account).
 };
 
 // ── Stream handlers ──────────────────────────────────────────────────────
@@ -1211,12 +1286,12 @@ export function register(): void {
       return { ok: true, ...(result || {}) };
     } catch (err) {
       log.error(`invoke ${channel} failed`, { error: (err as Error)?.message || String(err) });
-      const out: { ok: false; error: string; code?: string } = {
+      const out: { ok: false; error: string; code?: string | number } = {
         ok: false,
         error: (err as Error).message || String(err),
       };
       const code = (err as { code?: unknown }).code;
-      if (typeof code === 'string') out.code = code;
+      if (typeof code === 'string' || typeof code === 'number') out.code = code;
       return out;
     }
   });

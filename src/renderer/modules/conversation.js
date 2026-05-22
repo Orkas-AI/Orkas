@@ -292,7 +292,7 @@ function _renderRecipientChip(target) {
       nameEl.removeAttribute('data-i18n');
     } else {
       nameEl.setAttribute('data-i18n', 'chat.recipient_commander');
-      nameEl.textContent = (typeof t === 'function') ? t('chat.recipient_commander') : 'Commander';
+      nameEl.textContent = t('chat.recipient_commander');
     }
   }
 }
@@ -622,7 +622,7 @@ function _renderActorAvatarHtml(fromId) {
  *  (deleted agents whose old chats still need a label). */
 function _groupActorLabel(fromId) {
   if (fromId === 'user') return null;
-  if (fromId === 'commander') return t('chat.from_commander') || 'Commander';
+  if (fromId === 'commander') return t('chat.from_commander');
   if (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
     const a = _agentsCache.find((x) => x && x.agent_id === fromId);
     if (a && a.name) return a.name;
@@ -635,7 +635,7 @@ function _groupActorLabel(fromId) {
   // Last resort: never leak the id. Show a neutral placeholder; the chip
   // will repaint as soon as the cache catches up (state_changed handler
   // refreshes _groupMembersCache).
-  return t('chat.from_agent_unknown') || 'Agent';
+  return t('chat.from_agent_unknown');
 }
 const _groupMembersCache = new Map(); // cid → Actor[]
 async function _refreshGroupMembers(cid) {
@@ -978,8 +978,10 @@ function _renderMessageAttachmentsHtml(names, cid) {
 
 // ── Produced files (assistant messages only) ─────────────────────────────
 // Files written by the LLM via write_file / markdown_to_pdf / html_to_pdf.
-// Chips use the same visual language as attachments; clicking invokes
-// `workspace.revealPath` which calls shell.showItemInFolder in main.
+// Chips use the same visual language as attachments; clicking opens an
+// in-app preview overlay (chat-file-viewer.js) that renders the file's
+// final form (PDF / HTML / markdown / text) or falls through to a dialog
+// offering "open the containing folder" for unsupported kinds.
 
 function _iconForProduced(name) {
   const ext = (name.split('.').pop() || '').toLowerCase();
@@ -1009,10 +1011,9 @@ function _iconForProduced(name) {
 function _renderMessageProducedHtml(absPaths) {
   // Chip shows just the filename. The full absolute path lives only in
   // `data-produced-path` for the click handler; tooltip is a static
-  // localized "show in folder" hint instead of the raw OS path (which
-  // exposes the user's home directory and is hostile UX in mixed-locale
-  // contexts).
-  const hint = t('chat.produced_reveal_title') || 'Show in folder';
+  // localized "preview" hint instead of the raw OS path (which exposes
+  // the user's home directory and is hostile UX in mixed-locale contexts).
+  const hint = t('chat.produced_preview_title');
   const items = absPaths.map((p) => {
     const base = p.split(/[\\/]/).pop() || p;
     const icon = _iconForProduced(base);
@@ -1109,38 +1110,62 @@ function _hydrateMessageCreatedSkillChip(msgDiv) {
 function _hydrateMessageProducedChips(msgDiv) {
   const chips = msgDiv.querySelectorAll('.chat-msg-produced-item');
   chips.forEach((chip) => {
-    chip.addEventListener('click', async (e) => {
+    chip.addEventListener('click', (e) => {
       e.stopPropagation();
       const p = chip.dataset.producedPath;
       if (!p) return;
-      // Opens the OS file manager focused on the file (Finder on macOS,
-      // Explorer on Windows). The main-process handler validates the
-      // path is inside the active workspace and refuses outside paths.
-      try {
-        const res = await window.orkas.invoke('workspace.revealPath', { path: p });
-        if (!res || !res.ok) {
-          _convLog.warn('reveal failed', { path: p, error: res && res.error });
-        }
-      } catch (err) {
-        _convLog.warn('reveal threw', { path: p, error: String(err && err.message || err) });
+      // chat-file-viewer dispatches by extension to in-app preview overlay
+      // or, on unsupported kinds, an "open folder?" fallback dialog.
+      if (typeof openChatFileViewer === 'function') {
+        const base = p.split(/[\\/]/).pop() || p;
+        openChatFileViewer(p, base);
       }
     });
   });
 }
 
-function _hydrateMessageAttachmentThumbs(msgDiv, _cid) {
-  // Wire click-to-enlarge on image chips. Image bytes are served by the
-  // `chat-media://` protocol directly (no IPC fetch here). If the underlying
-  // file was deleted, the <img> will fail silently and the chip shows the
-  // broken-image placeholder — not worth hiding, the user chose to delete it.
-  const images = msgDiv.querySelectorAll('.chat-msg-attach.is-image');
-  images.forEach((chip) => {
-    const img = chip.querySelector('img.chat-msg-attach-thumb');
-    if (!img) return;
-    chip.addEventListener('click', (e) => {
+function _hydrateMessageAttachmentThumbs(msgDiv, cid) {
+  // Image chips have a thumb we want to enlarge via the lightbox; the rest
+  // (pdf / docx / text / video) get the same kind-aware viewer as produced
+  // chips. Video chips have inline <video> controls in the bubble already,
+  // so clicking the chip body shouldn't re-open the same playback — skip
+  // them. We rely on `_chatMediaUrl(cid, name)` having loaded the bytes for
+  // images so the lightbox can reuse the already-cached resource.
+  const allChips = msgDiv.querySelectorAll('.chat-msg-attach');
+  allChips.forEach((chip) => {
+    if (chip.classList.contains('is-video')) return;
+    if (chip.classList.contains('is-image')) {
+      const img = chip.querySelector('img.chat-msg-attach-thumb');
+      if (!img) return;
+      chip.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (typeof openChatImageLightbox === 'function') {
+          openChatImageLightbox(img.src, chip.dataset.attachName || '');
+        }
+      });
+      return;
+    }
+    // Non-image, non-video attachment chip → open the file viewer. The
+    // chip carries `(cid, name)`, not an absolute path; resolve via
+    // `attachments.absPath` so the viewer keeps a single "abs path in"
+    // contract. cid flows through to the viewer so reveal / read scope
+    // includes the per-conversation attachment dir.
+    const name = chip.dataset.attachName || (chip.querySelector('.chat-msg-attach-label')?.textContent || '').trim();
+    const chipCid = chip.dataset.attachCid || cid;
+    if (!name || !chipCid) return;
+    chip.classList.add('is-clickable');
+    chip.addEventListener('click', async (e) => {
       e.stopPropagation();
-      if (typeof openChatImageLightbox === 'function') {
-        openChatImageLightbox(img.src, chip.dataset.attachName || '');
+      if (typeof openChatFileViewer !== 'function') return;
+      try {
+        const res = await window.orkas.invoke('attachments.absPath', { cid: chipCid, name });
+        if (!res || !res.ok || !res.path) {
+          _convLog.warn('attachments.absPath failed', { cid: chipCid, name, error: res && res.error });
+          return;
+        }
+        openChatFileViewer(res.path, name, { cid: chipCid });
+      } catch (err) {
+        _convLog.warn('attachments.absPath threw', { cid: chipCid, name, error: String(err && err.message || err) });
       }
     });
   });
@@ -1682,13 +1707,13 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     ? ''
     : _groupActorLabel(message._from || (message._from_label ? '' : ''))
       || message._from_label
-      || (t('chat.from_agent_unknown') || 'Agent');
+      || (t('chat.from_agent_unknown'));
   const avatarHtml = role === 'user' ? '' : _renderActorAvatarHtml(message._from);
   const headerHtml = role === 'user'
     ? `<div class="chat-msg-header chat-msg-header-user"><span class="chat-msg-time">${formatTime(message.time || new Date().toISOString())}</span></div>`
     : `<div class="chat-msg-header">${avatarHtml}<span class="chat-msg-from">${escapeHtml(headerName)}</span><span class="chat-msg-time">${formatTime(message.time || new Date().toISOString())}</span></div>`;
   const planAnnHtml = message._plan_announcement
-    ? `<div class="chat-plan-announce">📋 ${escapeHtml(t('chat.plan_announce') || 'Plan')}</div>` : '';
+    ? `<div class="chat-plan-announce">📋 ${escapeHtml(t('chat.plan_announce'))}</div>` : '';
   // Below-bubble action row holds produced-file chips + created-agent chip
   // + archive button (the legacy `.chat-meta` slot). Lives OUTSIDE the
   // bubble so chips read as a footer, not as inline body content.
@@ -1901,9 +1926,9 @@ function _renderQuotePreview() {
   // capture flow through naturally; fall back to the click-time snapshot
   // when the actor was deleted between capture and render.
   const liveName = q.fromActor === 'commander'
-    ? (t('chat.from_commander') || 'Commander')
+    ? (t('chat.from_commander'))
     : _groupActorLabel(q.fromActor);
-  const fromName = liveName || q.fromName || (t('chat.from_agent_unknown') || 'Agent');
+  const fromName = liveName || q.fromName || (t('chat.from_agent_unknown'));
   const trunc = String(q.text || '');
   const fileChips = (q.produced || []).map((p) => {
     const base = String(p || '').split(/[\\/]/).pop() || p;
@@ -1988,6 +2013,7 @@ function _attachBubbleArchiveBtn(msgDiv, getContent) {
     } catch (_) { produced = []; }
     const fromName = fromActor === 'commander'
       ? (t('chat.from_commander') || 'Commander')
+      ? (t('chat.from_commander'))
       : (_groupActorLabel(fromActor) || '');
     _setQuote(currentCid, { fromActor, fromName, msgId, text, produced });
     const input = document.getElementById('chat-input');
@@ -2475,7 +2501,8 @@ function _processKindOf(text) {
   if (g === '◉') return 'patch';                 // file change
   if (g === '■') return 'tool';                  // tool call (start / end ok)
   if (g === '▷') return 'out';                   // command / cli stdout-or-stderr
-  if (g === '◆' || g === '◇') return 'think';   // reasoning / reply marker
+  if (g === '◆') return 'think';                  // reasoning / reply marker
+  if (g === '◇') return 'info';                   // auto-approved permission audit (kind-info)
   if (g === '▶' || g === '●') return 'bound';   // lifecycle start / end
   if (g === '▣') return 'plan';                  // plan announcement
   if (g === '◐') return 'live';                  // live generating preview
@@ -3268,8 +3295,8 @@ function _setPlaceholderActor(ph, actorId) {
   const chip = ph.querySelector('[data-role="from-chip"]');
   if (chip && !chip.textContent) {
     const label = actorId === 'commander'
-      ? (t('chat.from_commander') || 'Commander')
-      : (_groupActorLabel(actorId) || (t('chat.from_agent_unknown') || 'Agent'));
+      ? (t('chat.from_commander'))
+      : (_groupActorLabel(actorId) || (t('chat.from_agent_unknown')));
     chip.textContent = label;
   }
   const avatarSlot = ph.querySelector('[data-role="from-avatar"]');
@@ -3358,7 +3385,7 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
     if (bubble && !bubble.querySelector('.chat-plan-announce')) {
       const lbl = document.createElement('div');
       lbl.className = 'chat-plan-announce';
-      lbl.textContent = `📋 ${t('chat.plan_announce') || 'Plan'}`;
+      lbl.textContent = `📋 ${t('chat.plan_announce')}`;
       bubble.insertBefore(lbl, bubble.firstChild);
     }
   }
@@ -4045,9 +4072,54 @@ function _formatEventLine(evt) {
       // they pick up the right kind class downstream.
       const st = String(data?.status || '').toLowerCase();
       if (!st) return null;
+      // Format usage suffix when present (any status can carry it; we
+      // attach it to claude's `result` status so users see token count
+      // on every turn). Order: model · in/out/total · cache(read/write)
+      // · cost — keeps the eye-magnets (total tokens) center-left and
+      // the slow-changing model name first. Helper inlined to avoid
+      // scope leakage.
+      const usageSuffix = (() => {
+        const u = data?.usage;
+        if (!u || typeof u !== 'object') return '';
+        const parts = [];
+        if (typeof u.model === 'string' && u.model) parts.push(u.model);
+        const tokParts = [];
+        if (typeof u.input === 'number') tokParts.push('in=' + u.input);
+        if (typeof u.output === 'number') tokParts.push('out=' + u.output);
+        // Show total only when both halves are present, otherwise the
+        // number is misleading (we don't know what's missing).
+        if (typeof u.input === 'number' && typeof u.output === 'number') {
+          tokParts.push('total=' + (u.input + u.output));
+        }
+        if (tokParts.length) parts.push(tokParts.join(' '));
+        const cacheParts = [];
+        // Spell out read/write explicitly — the earlier `cache↻ / cache✎`
+        // glyphs were too cryptic. cache_read = hit on prior prompt
+        // prefix (1/10x price); cache_write = first-time write to the
+        // cache (1.25x price). Long claude turns are mostly cache_read.
+        if (typeof u.cacheRead === 'number') cacheParts.push('cache_read=' + u.cacheRead);
+        if (typeof u.cacheCreate === 'number') cacheParts.push('cache_write=' + u.cacheCreate);
+        if (cacheParts.length) parts.push(cacheParts.join(' '));
+        if (typeof u.cost === 'number') {
+          // 4 decimals catches sub-cent calls; rstrip trailing zeros
+          // to keep $0.5 from rendering as $0.5000.
+          const cents = u.cost.toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
+          parts.push('$' + cents);
+        }
+        return parts.length ? ' · ' + parts.join(' · ') : '';
+      })();
+      if (st === 'usage') {
+        // Streaming token-counter pulse (codex / opencode). Render as
+        // a milestone-style row so the rail's last-line coalescing
+        // can update it in place when the numbers advance, rather
+        // than appending one row per pulse. See _renderAgentEvent
+        // for the in-place update logic.
+        if (!usageSuffix) return null;
+        return '● tokens' + usageSuffix;
+      }
       if (st === 'session_ready' || st === 'running') return `▶ ${st}`;
-      if (st === 'result' || st === 'completed') return `● ${st}`;
-      if (st === 'error' || st === 'failed' || st === 'timeout') return `◯ ${st}`;
+      if (st === 'result' || st === 'completed') return `● ${st}${usageSuffix}`;
+      if (st === 'error' || st === 'failed' || st === 'timeout') return `◯ ${st}${usageSuffix}`;
       if (st === 'cancelled' || st === 'aborted') return `○ ${st}`;
       return `▪ ${st}`;
     }
@@ -4061,6 +4133,52 @@ function _formatEventLine(evt) {
       return `○ ${trimmed}`;
     }
     // Unknown CLI event types: hide rather than dump JSON.
+    if (cliType === 'log') {
+      // Structured CLI log records. claude --verbose / codex unknown
+      // notifications / opencode step_finish / acp commands_update all
+      // funnel here. Level decides the kind class so warn lands amber,
+      // error red, debug/info gray.
+      const level = String(data?.level || 'info').toLowerCase();
+      const msg = String(data?.message || '').replace(/\s+/g, ' ').trim();
+      if (!msg) return null;
+      const trimmed = msg.length > 200 ? msg.slice(0, 200) + '…' : msg;
+      const glyph = level === 'error' ? '◯'
+                  : level === 'warn' ? '○'
+                  : '▪';
+      return `${glyph} [${level}] ${trimmed}`;
+    }
+    if (cliType === 'raw-line') {
+      // Non-JSON stdout that the backend couldn't parse as its protocol
+      // (banner, debug noise, mid-run print). Render as kind-meta so it
+      // doesn't pretend to be a structured event.
+      const line = String(data?.line || '').replace(/\s+/g, ' ').trim();
+      if (!line) return null;
+      const trimmed = line.length > 200 ? line.slice(0, 200) + '…' : line;
+      return `▪ ${trimmed}`;
+    }
+    if (cliType === 'permission-request') {
+      // Auto-approved tool-use request the CLI gated through
+      // control_request. Surface as kind-info (◇) so users can audit
+      // which tools the daemon allowed without prompting.
+      const tool = String(data?.tool || '').trim() || 'tool';
+      const decision = data?.autoDecided === 'deny' ? 'denied' : 'allowed';
+      let inputSummary = '';
+      if (data?.input != null) {
+        const s = typeof data.input === 'string' ? data.input : JSON.stringify(data.input);
+        inputSummary = s.replace(/\s+/g, ' ').trim();
+        if (inputSummary.length > 120) inputSummary = inputSummary.slice(0, 120) + '…';
+      }
+      return `◇ ${decision}: ${tool}${inputSummary ? ' · ' + inputSummary : ''}`;
+    }
+    if (cliType === 'idle') {
+      // Runner-emitted heartbeat on prolonged silence — kind-warn so the
+      // user sees the row stand out from the regular stderr noise.
+      const ms = Number(data?.stalledMs || 0);
+      const secs = Math.max(1, Math.round(ms / 1000));
+      return `○ no output for ${secs}s`;
+    }
+    // Unknown CLI event types: hide rather than dump JSON. Devtools archive
+    // still records them verbatim under `<uid>/local/test/` for debugging.
     return null;
   }
 
@@ -4085,8 +4203,150 @@ function _renderAgentEvent(msg, evt) {
     }
     return;
   }
+
+  // CLI status:'usage' pulses update the LAST '● tokens · …' row in
+  // place rather than appending one row per pulse — long turns can
+  // emit hundreds of these and the rail would balloon otherwise. The
+  // ↓-deeper row is the canonical "running counter".
+  if (stream === 'cli'
+      && String(data?.type || '').toLowerCase() === 'status'
+      && String(data?.status || '').toLowerCase() === 'usage') {
+    const newLine = _formatEventLine(evt);
+    if (!newLine) return;
+    const body = msg.querySelector('[data-role="process"]');
+    if (body) {
+      // Find the last existing usage row by its '● tokens · ' prefix
+      // and overwrite. If none exists yet, fall through to append.
+      const rows = body.querySelectorAll('.stream-process-line');
+      for (let i = rows.length - 1; i >= 0; i--) {
+        if (rows[i].textContent.startsWith('● tokens · ')) {
+          rows[i].textContent = newLine;
+          return;
+        }
+      }
+    }
+    _streamingAppendProgress(msg, newLine);
+    return;
+  }
+
   const line = _formatEventLine(evt);
-  if (line) _streamingAppendProgress(msg, line);
+  if (!line) return;
+  // All tool result rows — CLI-backed AND in-process — are
+  // click-to-expand. Two storage paths for the full body, decided per
+  // event shape:
+  //   path present     → spilled to disk (≥50 KB); click reads via
+  //                      localAgents.readToolResult IPC.
+  //   output present   → live event already carries the complete body
+  //                      (<50 KB); stash on the row's JS prop and the
+  //                      click handler renders directly without IO.
+  // Renderer-side memory cost is bounded by the in-process tool-result
+  // cap (50 KB worst-case per row, swept with the bubble on conv close).
+  //
+  // Two event shapes flow through here:
+  //   stream='cli'  + data.type='tool-event' phase='result'   (CLI backends)
+  //                  → outputPath / output
+  //   stream='tool' + data.phase='end'                         (in-process tools)
+  //                  → result_path / output
+  // Same UI affordance for both — the "symmetry is the entire point"
+  // call-out in cli-richer-output plan.
+  const cliResult = stream === 'cli'
+      && String(data?.type || '').toLowerCase() === 'tool-event'
+      && data?.phase === 'result';
+  const toolResult = stream === 'tool' && data?.phase === 'end';
+  if (cliResult || toolResult) {
+    const path = cliResult
+      ? (typeof data?.outputPath === 'string' && data.outputPath ? data.outputPath : '')
+      : (typeof data?.result_path === 'string' && data.result_path ? data.result_path : '');
+    const fullOutput = typeof data?.output === 'string' ? data.output : '';
+    // Only offer expand when there's actually more than what the
+    // preview already shows (avoids a click that reveals the same
+    // text). 160 mirrors _formatEventLine's `detailStr` cap on the
+    // CLI side; in-process side uses 300 (`resultPreview` default)
+    // but a single shared 160 threshold is fine — anything larger
+    // reads better expanded anyway.
+    const truncated = path || (fullOutput && fullOutput.replace(/\s+/g, ' ').trim().length > 160);
+    if (truncated) {
+      _streamingAppendToolResultRow(msg, line, path, fullOutput);
+      return;
+    }
+  }
+  _streamingAppendProgress(msg, line);
+}
+
+/** Append a tool-event result row that can expand its full output. Two
+ *  storage paths for the full body, decided at append time:
+ *    - `outputPath` (string)   → runner spilled to disk; click reads via IPC.
+ *    - `fullOutput` (string)   → live event body (<50KB), stash on the
+ *                                 row's JS prop; click renders directly.
+ *  Exactly one of the two is required — caller (_renderAgentEvent) gates.
+ *
+ *  Path is stored in a data attribute; the in-memory fullOutput hangs
+ *  off `row._fullOutput` (raw JS prop, not dataset — dataset stringifies
+ *  and would double the memory). A delegated click handler set up once
+ *  per bubble does the lookup so we don't bind a closure per row.
+ */
+function _streamingAppendToolResultRow(msg, previewText, outputPath, fullOutput) {
+  const container = msg.querySelector('[data-role="process-container"]');
+  if (container) container.style.display = '';
+  const body = msg.querySelector('[data-role="process"]');
+  if (!body) return;
+  const innerWasAtBottom = _isNearBottom(body, 10);
+
+  const line = document.createElement('div');
+  const kind = _processKindOf(previewText);
+  line.className = 'stream-process-line is-expandable' + (kind ? ' kind-' + kind : '');
+  line.textContent = previewText;
+  if (outputPath) line.dataset.toolResultPath = outputPath;
+  if (fullOutput) line._fullOutput = fullOutput;
+  line.title = t('chat.tool_result_expand_hint');
+  body.appendChild(line);
+
+  // One delegated handler per bubble — cheaper than binding per row.
+  if (!body._toolResultClickBound) {
+    body._toolResultClickBound = true;
+    body.addEventListener('click', _onToolResultRowClick);
+  }
+
+  if (innerWasAtBottom) body.scrollTop = body.scrollHeight;
+  _stickBottomFromMsg(msg);
+}
+
+async function _onToolResultRowClick(ev) {
+  const row = ev.target.closest('.stream-process-line.is-expandable');
+  if (!row) return;
+  // Toggle existing expansion.
+  const next = row.nextElementSibling;
+  if (next && next.classList.contains('stream-process-line-full')) {
+    next.remove();
+    return;
+  }
+  const path = row.dataset.toolResultPath;
+  const inline = row._fullOutput;
+  const pre = document.createElement('pre');
+  pre.className = 'stream-process-line-full';
+
+  if (path) {
+    // window.orkas.invoke is the canonical IPC entry (matches every
+    // other feature's pattern — saved-apps / chat-artifact / workspace).
+    const inv = window.orkas && window.orkas.invoke;
+    if (typeof inv !== 'function') return;
+    let res;
+    try {
+      res = await inv('localAgents.readToolResult', { path });
+    } catch (err) {
+      res = { ok: false, error: String(err?.message || err) };
+    }
+    if (res && res.ok) {
+      pre.textContent = res.content + (res.truncated ? '\n\n[…truncated for display, open file for full content]' : '');
+    } else {
+      pre.textContent = '[failed to read: ' + (res?.error || 'unknown') + ']';
+    }
+  } else if (typeof inline === 'string' && inline) {
+    pre.textContent = inline;
+  } else {
+    pre.textContent = '[no content recorded for this row]';
+  }
+  row.insertAdjacentElement('afterend', pre);
 }
 
 // Update or create a single "live" line in the process pane.

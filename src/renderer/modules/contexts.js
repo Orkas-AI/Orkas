@@ -650,7 +650,7 @@ window.saveCtxNew = saveCtxNew;
 // for inline rename on the next tree render, and immediately drops the
 // viewer into edit mode so the user can start typing content.
 async function createCtxNewTextFile(parentDir = '') {
-  const stemBase = t('contexts.new.untitled_stem') || 'untitled';
+  const stemBase = t('contexts.new.untitled_stem');
   // Collect sibling file names so we can uniquify if a conflict exists.
   const siblings = _ctxListChildren(parentDir).map(n => n.name);
   let stem = stemBase;
@@ -685,14 +685,14 @@ async function createCtxNewTextFile(parentDir = '') {
 // behavior is layered on by the KB viewer; the file itself stays portable
 // and indexable like any other md note.
 async function createCtxNewTodoFile(parentDir = '') {
-  const stemBase = t('contexts.new.todo_stem') || 'todo list';
+  const stemBase = t('contexts.new.todo_stem');
   const siblings = _ctxListChildren(parentDir).map(n => n.name);
   let stem = stemBase;
   let i = 2;
   while (siblings.includes(`${stem}.md`)) { stem = `${stemBase} ${i++}`; }
   const name = `${stem}.md`;
   const fullPath = parentDir ? `${parentDir}/${name}` : name;
-  const heading = t('contexts.new.todo_template_heading') || 'Todo';
+  const heading = t('contexts.new.todo_template_heading');
   const template = `# ${heading}\n\n- [ ] \n- [ ] \n- [ ] \n`;
   try {
     const res = await apiFetch('/api/contexts/write', {
@@ -1322,7 +1322,7 @@ function _ctxApplyTodo(ta) {
   const { lineStart, lineEnd } = _ctxLineSpan(value, ta.selectionStart, ta.selectionEnd);
   const block = value.slice(lineStart, lineEnd);
   const lines = block.split('\n');
-  const placeholder = t('contexts.editor.placeholder.todo') || 'task';
+  const placeholder = t('contexts.editor.placeholder.todo');
   // Pick the mode from the first non-empty line.
   const firstNonEmpty = lines.find(l => l.trim().length > 0) || '';
   let mode;

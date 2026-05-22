@@ -205,6 +205,9 @@ export async function getConversationWorkspacePath(uid: string, cid: string): Pr
   // directory is NOT created here — see the function-level comment above.
   const persisted = await setWorkspaceDirOnce(uid, cid, slug);
   const finalSlug = persisted.workspace_dir || slug;
-  log.info(`cid=${cid} workspace_dir=${finalSlug} (title="${title}", lazy-mkdir)`);
+  // Don't log the raw title — it's user-authored content (can include
+  // chat topic / names). The slug (after slugifyConvTitle) is the
+  // diagnostic signal we need.
+  log.info(`cid=${cid} workspace_dir=${finalSlug} title_len=${title.length} (lazy-mkdir)`);
   return path.join(root, finalSlug);
 }

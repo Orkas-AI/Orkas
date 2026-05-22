@@ -32,6 +32,7 @@ import { createLogger } from '../logger';
 import { sweepToolResults } from '../util/tool-result-cap';
 import { migrateLegacySessionIds } from '../util/migrate-session-ids';
 import { migrateAgentLayout } from '../util/migrate-agent-layout';
+import { migrateKbToLocalContexts } from '../util/migrate-kb-to-local';
 
 const log = createLogger('users');
 
@@ -130,6 +131,12 @@ export function activateUser(uid: string): void {
   // util/migrate-agent-layout.ts + docs/plans/agent-as-directory.md.
   try { migrateAgentLayout(uid); }
   catch (err) { log.warn(`migrateAgentLayout uid=${uid}: ${(err as Error).message}`); }
+
+  // KB vector store moved from cloud/contexts/.kb → local/contexts/.kb
+  // (multi-device-sync batch 2 — index is machine-private, never crosses
+  // devices). Idempotent + stamped. See util/migrate-kb-to-local.ts.
+  try { migrateKbToLocalContexts(uid); }
+  catch (err) { log.warn(`migrateKbToLocalContexts uid=${uid}: ${(err as Error).message}`); }
 
   // Pin core-agent's auth/state dir to this uid's local/config/.
   // `resolveAuthDir()` re-reads this env var on every call (see

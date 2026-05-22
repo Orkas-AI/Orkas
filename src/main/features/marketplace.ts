@@ -51,6 +51,7 @@ import {
   userMarketplaceDirCloud,
 } from '../paths';
 import { getActiveUserId } from './users';
+import { getCurrentLang } from '../i18n';
 import { invalidateSkills as invalidateCoreAgentSkills } from '../model/core-agent/skill-registry';
 import {
   getSkillCacheDir, isCacheFresh, readAgentCache, touchCacheEntry,
@@ -58,7 +59,6 @@ import {
 } from './marketplace_cache';
 import {
   addAgentInstall, addSkillInstall, removeAgentInstall, removeSkillInstall,
-  readInstalls, writeInstalls,
 } from './marketplace_installs';
 import { createLogger } from '../logger';
 
@@ -68,13 +68,14 @@ const log = createLogger('marketplace');
 // Profile-driven (mirrors Server `env/start/{dev_,}api_start.sh` — see PC/CLAUDE.md §1 +
 // Server CLAUDE.md §7): `ORKAS_PROFILE=global` (default) routes to overseas (`orkas.ai`),
 // `ORKAS_PROFILE=cn` routes to China (`orkas.work`). `run.sh` exports the env from its
-// positional arg (`./run.sh cn`). Devs running against a local Server can still override
-// the entire base via `ORKAS_API_BASE_URL=http://127.0.0.1:8888/api ./run.sh`.
+// positional arg (`./run.sh cn`). An explicit `ORKAS_API_BASE_URL` always wins.
 //
-// **No build-mode branch on purpose** — OrkasOpen contract (per
-// `OpenSource/SyncCode/strip-rules.json`) bans build-mode checks outside the two
-// whitelisted infra files, and "dev vs packaged behavior must be identical". Profile +
-// env override are the explicit knobs.
+// **No build-mode branch in this file on purpose** — OrkasOpen contract (per
+// `OpenSource/SyncCode/strip-rules.json`) bans `app.isPackaged` checks outside the two
+// whitelisted infra files. The "dev → local Server" default is set ONCE in `index.ts`
+// (which IS whitelisted) by pinning `process.env.ORKAS_API_BASE_URL=http://127.0.0.1:8888/api`
+// when `!app.isPackaged`, so every API base resolver picks it up uniformly — no scattered
+// build-mode logic in feature modules.
 const PROFILE_BASES: Record<string, string> = {
   global: 'https://www.orkas.ai/api',
   cn:     'https://www.orkas.work/api',
@@ -89,10 +90,13 @@ export function apiBase(): string {
 // ── envelope ──────────────────────────────────────────────────────────────
 interface Envelope { code: number; msg?: string; [k: string]: unknown }
 
-async function postJson<T>(p: string, body: unknown): Promise<T> {
+export async function postJson<T>(p: string, body: unknown): Promise<T> {
   const res = await fetch(`${apiBase()}${p}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept-Language': getCurrentLang(),
+    },
     body: JSON.stringify(body || {}),
   });
   const text = await res.text();
@@ -473,79 +477,6 @@ export async function ensureDefaultInstalls(uid: string): Promise<{ seeded_agent
     log.warn(`default installs seed failed (will retry on next launch): ${(err as Error).message}`);
     return { seeded_agents: 0, seeded_skills: 0 };
   }
-}
-
-// ── one-time backfill for older install records ──────────────────────────
-// Earlier install paths (predating the create_uid + version persistence) wrote manifest
-// rows + `_install.json` files without those fields. The UI surfaces the author badge +
-// version chip from `_install.json`, so older records render blank chips. Backfill is a
-// startup pass: for every manifest row missing `create_uid`, look it up in the catalog and
-// rewrite both the manifest entry and the per-machine `_install.json`. Idempotent — once
-// every row is populated, the function short-circuits with no network call.
-//
-// We use the catalog `/list` endpoint (cheap, no side-effects) instead of `/detail` (which
-// increments download_count). The first page (size=100) covers current scale; pagination can
-// be added when the published catalog exceeds that.
-export async function backfillMarketplaceCreateUid(uid: string): Promise<void> {
-  let manifest;
-  try { manifest = await readInstalls(uid); } catch { return; }
-  const agentMissing = manifest.agents.filter((a) => !a.create_uid);
-  const skillMissing = manifest.skills.filter((s) => !s.create_uid);
-  if (!agentMissing.length && !skillMissing.length) return;
-
-  // Build (id → create_uid) maps by pulling the catalog list (paginated up to 200 rows total).
-  const agentMap = agentMissing.length ? await _fetchCreateUidMap('agents') : new Map<string, string>();
-  const skillMap = skillMissing.length ? await _fetchCreateUidMap('skills') : new Map<string, string>();
-
-  let touched = false;
-  for (const a of agentMissing) {
-    const cuid = agentMap.get(a.id);
-    if (cuid === undefined) continue;
-    a.create_uid = cuid;
-    await _patchInstallMeta(userMarketplaceAgentDir(uid, a.id), { create_uid: cuid, version: a.version });
-    touched = true;
-  }
-  for (const s of skillMissing) {
-    const cuid = skillMap.get(s.id);
-    if (cuid === undefined) continue;
-    s.create_uid = cuid;
-    await _patchInstallMeta(userMarketplaceSkillDir(uid, s.id), { create_uid: cuid, version: s.version });
-    touched = true;
-  }
-  if (touched) {
-    await writeInstalls(uid, manifest);
-    log.info(`backfilled create_uid: ${agentMissing.length} agent(s) + ${skillMissing.length} skill(s)`);
-  }
-}
-
-async function _fetchCreateUidMap(kind: 'agents' | 'skills'): Promise<Map<string, string>> {
-  const out = new Map<string, string>();
-  try {
-    // Two pages of 100 = 200 rows; sufficient for current marketplace size.
-    for (let page = 1; page <= 2; page++) {
-      const r = await postJson<{ list: Array<{ id: string; create_uid?: string }>; total: number }>(
-        `/marketplace/${kind}/list`, { page, size: 100 },
-      );
-      for (const row of r.list || []) {
-        if (row && typeof row.id === 'string') out.set(row.id, row.create_uid || '');
-      }
-      if ((r.list || []).length < 100) break;
-    }
-  } catch (err) {
-    log.warn(`backfill ${kind} catalog fetch failed: ${(err as Error).message}`);
-  }
-  return out;
-}
-
-async function _patchInstallMeta(dir: string, patch: { create_uid: string; version: string }): Promise<void> {
-  const f = path.join(dir, '_install.json');
-  if (!fs.existsSync(f)) return;
-  try {
-    const j = JSON.parse(await fsp.readFile(f, 'utf8'));
-    j.create_uid = patch.create_uid;
-    if (!j.version) j.version = patch.version;
-    await fsp.writeFile(f, JSON.stringify(j, null, 2), 'utf8');
-  } catch { /* corrupt _install.json — skip; reconcile will rewrite on next version bump */ }
 }
 
 // ── uninstall (user-facing; non-dev) ──────────────────────────────────────

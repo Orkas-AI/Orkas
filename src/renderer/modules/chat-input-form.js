@@ -198,7 +198,7 @@
 
       const changePill = document.createElement('span');
       changePill.className = 'form-field-dir-change';
-      changePill.textContent = t('input.dir.change') || 'Change';
+      changePill.textContent = t('input.dir.change');
       card.appendChild(changePill);
 
       let value = (typeof initial === 'string' && initial) ? initial : '';
@@ -210,7 +210,7 @@
           changePill.style.display = '';
           card.classList.remove('is-empty');
         } else {
-          pathLabel.textContent = t('input.dir.pick') || 'Pick directory…';
+          pathLabel.textContent = t('input.dir.pick');
           pathLabel.removeAttribute('title');
           pathLabel.classList.add('is-empty');
           changePill.style.display = 'none';

@@ -378,8 +378,43 @@ export function resolveLocalMediaPath(
   return { ok: true, absPath: normalized, kind: VIDEO_EXTS.has(ext) ? 'video' : 'image' };
 }
 
-/** MIME lookup for the chat-media:// protocol handler. Covers images + videos
- *  (the only kinds the handler streams — text/pdf/docx are read via IPC). */
+/**
+ * Sibling of `resolveLocalMediaPath` for files that aren't media but still
+ * need to be streamed through `chat-media://local/<abs>` so the renderer can
+ * preview them in-app (PDF via Chromium's PDFium, HTML via a sandboxed
+ * iframe). Same threat model: extension allow-list, no directory allow-list.
+ *
+ * No size cap — these are served via `serveFileRange`, so Chromium streams
+ * the bytes directly into the iframe (or PDF viewer) without ever touching
+ * the JS heap. Worst case of a huge file is a few seconds of busy GPU
+ * process while the user dismisses the overlay.
+ */
+const PREVIEW_DOC_EXTS: ReadonlySet<string> = new Set(['.pdf', '.html', '.htm']);
+
+export function resolveLocalPreviewPath(
+  absPath: string,
+): { ok: true; absPath: string; kind: 'pdf' | 'html' } | { ok: false; code: 'bad_input' | 'not_found'; error: string } {
+  if (typeof absPath !== 'string' || !absPath) {
+    return { ok: false, code: 'bad_input', error: 'path required' };
+  }
+  if (!path.isAbsolute(absPath)) {
+    return { ok: false, code: 'bad_input', error: 'path must be absolute' };
+  }
+  const normalized = path.resolve(absPath);
+  const ext = path.extname(normalized).toLowerCase();
+  if (!PREVIEW_DOC_EXTS.has(ext)) {
+    return { ok: false, code: 'bad_input', error: `unsupported extension: ${ext || '(none)'}` };
+  }
+  let stat: fs.Stats;
+  try { stat = fs.statSync(normalized); }
+  catch { return { ok: false, code: 'not_found', error: 'not found' }; }
+  if (!stat.isFile()) return { ok: false, code: 'not_found', error: 'not a file' };
+  return { ok: true, absPath: normalized, kind: ext === '.pdf' ? 'pdf' : 'html' };
+}
+
+/** MIME lookup for the chat-media:// protocol handler. Covers images, videos,
+ *  and the in-app preview docs served via `resolveLocalPreviewPath` (pdf /
+ *  html). Text/markdown go through the `produced.readText` IPC instead. */
 export function mediaMimeFor(name: string): string {
   const ext = path.extname(name).toLowerCase();
   if (ext === '.png') return 'image/png';
@@ -391,6 +426,8 @@ export function mediaMimeFor(name: string): string {
   if (ext === '.mov') return 'video/quicktime';
   if (ext === '.m4v') return 'video/x-m4v';
   if (ext === '.ogv') return 'video/ogg';
+  if (ext === '.pdf') return 'application/pdf';
+  if (ext === '.html' || ext === '.htm') return 'text/html';
   return 'application/octet-stream';
 }
 
@@ -541,6 +578,12 @@ export async function buildAttachmentManifest(
         const buf = fs.readFileSync(abs);
         const compressed = await toCompressedGrayJpeg(buf, { maxDim: 1024, quality: 70, grayscale: true });
         images.push({ data: compressed.buf.toString('base64'), mediaType: 'image/jpeg' });
+        // Also list the image in the manifest so the LLM has a text-side
+        // hint (filename + abs path) tying its inline-attached vision input
+        // to the user's intent ("this image is 证书.jpg"). `attached="inline"`
+        // tells the LLM bytes are already on this turn — see chat_commander.md
+        // attachments section — so it doesn't waste a read_file round-trip.
+        entries.push(`<file name="${escapeAttr(nm)}" path="${escapeAttr(abs)}" kind="image" attached="inline"/>`);
       } catch (err) {
         skipped.push({ name: nm, reason: t('attachments.skipped.compress_failed', { message: (err as Error).message }) });
       }

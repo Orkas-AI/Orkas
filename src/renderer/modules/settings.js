@@ -22,6 +22,9 @@ let _settingsState = {
 };
 
 async function loadSettings() {
+  // 4-tab structure (batch 6). Initialize switching + activate default tab
+  // (通用 by default — matches the is-active class on the markup).
+  if (typeof initSettingsTabs === 'function') initSettingsTabs();
   _settingsBindLanguageOnce();
   _settingsSyncLanguageRadio();
   _settingsBindClearAllConvsOnce();

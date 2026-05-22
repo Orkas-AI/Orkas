@@ -131,8 +131,9 @@ export const openclawBackend: LocalBackend = {
           opts.onEvent({ type: 'text-delta', text: replyText });
         }
 
+        const usage = parsed?.usage;
         if (code === 0 && replyText) {
-          return finish('completed', { output: replyText, sessionId: sid });
+          return finish('completed', { output: replyText, sessionId: sid, ...(usage ? { usage } : {}) });
         }
         if (code === 0 && !replyText) {
           // Exit clean but no parseable reply → treat as failed so
@@ -142,6 +143,7 @@ export const openclawBackend: LocalBackend = {
             output: '',
             sessionId: sid,
             stderrTail: tail.toString(),
+            ...(usage ? { usage } : {}),
           });
         }
         finish('failed', {
@@ -149,6 +151,7 @@ export const openclawBackend: LocalBackend = {
           output: replyText,
           sessionId: sid,
           stderrTail: tail.toString(),
+          ...(usage ? { usage } : {}),
         });
       });
     });
@@ -192,7 +195,7 @@ function stripAnsi(s: string): string {
  */
 export function parseOpenclawReply(stderrText: string):
   | null
-  | { text: string; sessionId?: string; error?: string } {
+  | { text: string; sessionId?: string; error?: string; usage?: Record<string, number | string> } {
   if (!stderrText) return null;
   const clean = stripAnsi(stderrText);
 
@@ -219,13 +222,51 @@ export function parseOpenclawReply(stderrText: string):
       const sessionId = obj.meta?.agentMeta?.sessionId
         || obj.meta?.sessionId
         || undefined;
-      return { text, sessionId };
+      const usage = _extractOpenclawUsage(
+        obj.meta?.agentMeta?.usage || obj.meta?.usage,
+        obj.meta?.agentMeta?.model || obj.meta?.agentMeta?.provider,
+      );
+      return { text, sessionId, ...(usage ? { usage } : {}) };
     }
     if (obj && typeof obj === 'object' && typeof obj.error === 'string') {
       return { text: '', error: String(obj.error) };
     }
   }
   return null;
+}
+
+/** Normalize openclaw's `meta.agentMeta.usage` block (or a fallback at
+ *  `meta.usage`) into our shared usage shape. openclaw passes through
+ *  whatever the upstream provider returned (Anthropic / OpenAI / etc.),
+ *  so the keys are snake_case or camelCase depending on provider. We
+ *  accept the most common spellings. Returns undefined when no number
+ *  was extractable. Exposed indirectly via parseOpenclawReply tests. */
+function _extractOpenclawUsage(
+  raw: any,
+  model: string | undefined,
+): undefined | Record<string, number | string> {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const input = _num(raw.input_tokens, raw.inputTokens, raw.prompt_tokens);
+  const output = _num(raw.output_tokens, raw.outputTokens, raw.completion_tokens);
+  const cacheRead = _num(raw.cache_read_input_tokens, raw.cacheReadInputTokens, raw.cached_input_tokens);
+  const cacheCreate = _num(raw.cache_creation_input_tokens, raw.cacheCreationInputTokens);
+  if (input === undefined && output === undefined && cacheRead === undefined && cacheCreate === undefined) {
+    return undefined;
+  }
+  const out: Record<string, number | string> = {};
+  if (input !== undefined) out.input = input;
+  if (output !== undefined) out.output = output;
+  if (cacheRead !== undefined) out.cacheRead = cacheRead;
+  if (cacheCreate !== undefined) out.cacheCreate = cacheCreate;
+  if (typeof model === 'string' && model) out.model = model;
+  return out;
+}
+
+function _num(...vals: any[]): number | undefined {
+  for (const v of vals) {
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+  }
+  return undefined;
 }
 
 function findMatchingBrace(s: string, openIdx: number): number {

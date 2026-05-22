@@ -226,7 +226,12 @@ function bindStaticHandlers() {
     if (_selectedAgent?.source === 'custom') promoteCustomAgent(_selectedAgent.id);
   });
   document.getElementById('agent-upload-marketplace-btn')?.addEventListener('click', () => {
-    if (_selectedAgent?.source === 'custom' && typeof openMarketplaceUpload === 'function') {
+    // Upload is allowed for both custom AND builtin (dev mode) — same
+    // marketplace publishing flow per CLAUDE.md §11. The row-menu handler
+    // (agents.js) already does this; the detail-page handler had a stale
+    // `source === 'custom'` guard that silently swallowed clicks on builtin
+    // detail pages.
+    if (_selectedAgent && typeof openMarketplaceUpload === 'function') {
       openMarketplaceUpload('agent', _selectedAgent.id);
     }
   });
@@ -263,7 +268,9 @@ function bindStaticHandlers() {
     if (_selectedSkill?.source === 'custom') promoteCustomSkill(_selectedSkill.id);
   });
   document.getElementById('skill-upload-marketplace-btn')?.addEventListener('click', () => {
-    if (_selectedSkill?.source === 'custom' && typeof openMarketplaceUpload === 'function') {
+    // Upload is allowed for both custom AND builtin (dev mode) — same as
+    // the agent upload handler above; see comment there.
+    if (_selectedSkill && typeof openMarketplaceUpload === 'function') {
       openMarketplaceUpload('skill', _selectedSkill.id);
     }
   });

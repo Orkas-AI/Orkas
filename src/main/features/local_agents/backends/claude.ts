@@ -22,6 +22,7 @@ import {
   spawnCli,
   bindAbort,
   LineSplitter,
+  levelOrInfo,
 } from './base.js';
 
 const log = createLogger('local-agents:claude');
@@ -40,6 +41,13 @@ export const claudeBackend: LocalBackend = {
     let resultText = '';
     let resultStatus: 'completed' | 'failed' | undefined;
     let resultError: string | undefined;
+    let resultUsage: Record<string, number | string> | undefined;
+    /** Running token tally accumulated from each `assistant` block's
+     *  `message.usage` (mirrors multica's per-model map). The final
+     *  `result.usage` claude itself emits is authoritative and overwrites
+     *  this when the turn ends; in the meantime accUsage drives the
+     *  live `status:'usage'` row. */
+    let accUsage: Record<string, number | string> | undefined;
     // Tracks whether we've seen a real stream_event with text content
     // — gates whether we can safely skip the assistant block's text
     // (which would otherwise duplicate the streamed body). Old claude
@@ -63,8 +71,19 @@ export const claudeBackend: LocalBackend = {
     }, opts.timeoutMs);
     if (typeof timer.unref === 'function') timer.unref();
 
-    // Build and send the single user message, then close stdin so
-    // claude knows there's no follow-up turn coming.
+    // Build and send the single user message, but keep stdin OPEN —
+    // claude code's stream-json protocol uses stdin for two channels:
+    //   1. The user message that kicks off the turn (one and done).
+    //   2. `control_response` records replying to claude's
+    //      `control_request` (tool-use permission, hook gates). Even
+    //      with `--permission-mode bypassPermissions`, MCP tools / user
+    //      hooks still gate via this channel and the process blocks
+    //      waiting for a stdin response we never send if we close
+    //      stdin here. That's the "silent hang for 20 minutes" symptom
+    //      users report — fix by writing the prompt without `.end()`
+    //      and closing stdin only once we see the terminal `result`
+    //      record (handled below in mapClaudeEvent's 'result' branch
+    //      via the closeStdin callback).
     const inputLine = JSON.stringify({
       type: 'user',
       message: {
@@ -72,7 +91,34 @@ export const claudeBackend: LocalBackend = {
         content: [{ type: 'text', text: opts.prompt }],
       },
     }) + '\n';
-    child.stdin.end(inputLine);
+    child.stdin.write(inputLine);
+
+    /** Auto-allow control_request — claude code asks for tool-use /
+     *  hook permission through this channel. We're a daemon-style
+     *  dispatcher (no interactive UI yet for approval), so the only
+     *  sane response is to allow and surface a permission-request
+     *  event to the rail for visibility. Schema mirrors multica's
+     *  daemon (`server/pkg/agent/claude.go::handleControlRequest`). */
+    const respondToControlRequest = (msg: any): void => {
+      const req = msg?.request || {};
+      const inputMap = (req.input && typeof req.input === 'object') ? req.input : {};
+      const response = {
+        type: 'control_response',
+        response: {
+          subtype: 'success',
+          request_id: msg.request_id,
+          response: {
+            behavior: 'allow',
+            updatedInput: inputMap,
+          },
+        },
+      };
+      try {
+        child.stdin.write(JSON.stringify(response) + '\n');
+      } catch (err) {
+        log.warn('claude control_response write failed', { error: (err as Error).message });
+      }
+    };
 
     // stdout: line-buffered JSON parsing.
     const splitter = new LineSplitter();
@@ -84,11 +130,51 @@ export const claudeBackend: LocalBackend = {
         let obj: any;
         try { obj = JSON.parse(trimmed); }
         catch {
-          // Pre-stream banner / debug noise — surface as text-delta
-          // when nothing else has arrived yet so users still see why
-          // the CLI is unhappy. After we have a session id, drop.
+          // Non-JSON stdout — two distinct paths:
+          //   - Before sessionId: surface as text-delta so a pre-stream
+          //     banner / startup error still lands in the user bubble
+          //     even when the CLI never gets far enough to talk
+          //     stream-json. This is the only signal the user has when
+          //     the CLI itself failed to boot.
+          //   - After sessionId: emit as raw-line. Banner, MCP startup
+          //     warnings, --verbose debug noise — direct-terminal users
+          //     see these every run; previously we dropped them
+          //     silently after session_id was captured, which is the
+          //     "Orkas shows less than the terminal" symptom users
+          //     reported. Raw-line renders as a kind-meta row in the
+          //     process rail.
           if (!sessionId) opts.onEvent({ type: 'text-delta', text: trimmed + '\n' });
+          else opts.onEvent({ type: 'raw-line', line: trimmed });
           return;
+        }
+        // Side-channel: control_request needs a stdin write back AND a
+        // rail event. Handled outside mapClaudeEvent so the mapper
+        // stays a pure translator (no I/O, easier to unit-test).
+        if (obj?.type === 'control_request') {
+          respondToControlRequest(obj);
+          opts.onEvent({
+            type: 'permission-request',
+            id: String(obj.request_id || ''),
+            tool: String(obj?.request?.tool_name || ''),
+            input: obj?.request?.input ?? {},
+            autoDecided: 'allow',
+            reason: 'bypass',
+          });
+          return;
+        }
+        // Side-channel: each `assistant` block carries a `message.usage`
+        // snapshot for that turn-piece. Multica accumulates these per
+        // model and reports a flat total at the end. We do the same
+        // accumulation AND additionally emit a streaming
+        // `status:'usage'` event so the rail shows a live token
+        // counter (matches the codex / opencode parity — claude only
+        // emits one usage record otherwise, at the terminal result).
+        if (obj?.type === 'assistant' && obj?.message?.usage) {
+          const inc = extractClaudeUsage({ usage: obj.message.usage, message: { model: obj.message.model } });
+          if (inc) {
+            accUsage = mergeUsage(accUsage, inc);
+            opts.onEvent({ type: 'status', status: 'usage', usage: accUsage });
+          }
         }
         const ev = mapClaudeEvent(obj, sessionId, partialState);
         if (ev?.captureSession && obj.session_id) sessionId = String(obj.session_id);
@@ -97,6 +183,12 @@ export const claudeBackend: LocalBackend = {
           resultStatus = ev.terminal.status;
           resultText = ev.terminal.text;
           resultError = ev.terminal.error;
+          resultUsage = ev.terminal.usage as typeof resultUsage;
+          // Terminal record received — close stdin so the CLI's
+          // post-result cleanup can exit (we kept it open through the
+          // run to handle control_request). EPIPE on this write is
+          // safe; base.ts's stdin.on('error') swallows it.
+          try { child.stdin.end(); } catch { /* already gone */ }
         }
       });
     });
@@ -138,11 +230,13 @@ export const claudeBackend: LocalBackend = {
       child.on('close', code => {
         if (opts.signal.aborted) return finish('cancelled');
         if (timedOut) return finish('timeout', { error: `claude exceeded ${opts.timeoutMs}ms`, stderrTail: tail.toString() });
-        if (code === 0 && resultStatus === 'completed') return finish('completed', { output: resultText });
+        if (code === 0 && resultStatus === 'completed') {
+          return finish('completed', { output: resultText, usage: resultUsage });
+        }
         // Non-zero exit OR result subtype indicated error — surface tail.
         const err = resultError
           || (code !== 0 ? `claude exited with code ${code}` : 'claude reported error in result');
-        finish('failed', { error: err, output: resultText, stderrTail: tail.toString() });
+        finish('failed', { error: err, output: resultText, stderrTail: tail.toString(), usage: resultUsage });
       });
     });
   },
@@ -193,11 +287,36 @@ export function mapClaudeEvent(
   partialState: { sawTextStreamEvent: boolean } = { sawTextStreamEvent: false },
 ):
   | undefined
-  | { event?: LocalEvent; captureSession?: boolean; terminal?: { status: 'completed' | 'failed'; text: string; error?: string } } {
+  | { event?: LocalEvent; captureSession?: boolean; terminal?: { status: 'completed' | 'failed'; text: string; error?: string; usage?: Record<string, number | string> } } {
   if (!obj || typeof obj !== 'object') return undefined;
   const type = obj.type;
   if (type === 'system' && obj.subtype === 'init') {
-    return { captureSession: true };
+    // Surface a running-status pulse alongside capturing the session
+    // id. Matches multica's parity: an explicit '▶ running' row tells
+    // the user the CLI handshake succeeded and we're now waiting on
+    // model output, distinct from the earlier '▶ /path/to/claude'
+    // spawn row.
+    return {
+      captureSession: true,
+      event: { type: 'status', status: 'running' },
+    };
+  }
+  if (type === 'log') {
+    // claude --verbose emits these for MCP / hook / tool-router
+    // internals. We used to drop them as an unknown type; they're
+    // exactly the "why is the CLI silent for 20s" signal users were
+    // missing.
+    const lvl = obj?.log?.level || obj?.level;
+    const msg = obj?.log?.message || obj?.message || '';
+    if (typeof msg !== 'string' || !msg) return undefined;
+    return {
+      event: {
+        type: 'log',
+        level: levelOrInfo(lvl),
+        message: msg,
+        source: 'claude',
+      },
+    };
   }
   if (type === 'stream_event') {
     const inner = obj.event;
@@ -218,18 +337,16 @@ export function mapClaudeEvent(
       return undefined;
     }
     if (innerType === 'content_block_start') {
-      const cb = inner.content_block;
-      if (cb?.type === 'tool_use') {
-        return {
-          event: {
-            type: 'tool-event',
-            tool: String(cb.name || 'unknown'),
-            callId: String(cb.id || ''),
-            phase: 'use',
-            input: cb.input ?? {},
-          },
-        };
-      }
+      // content_block_start for a tool_use ALWAYS has an empty `input`
+      // here — claude streams the actual input character-by-character
+      // through `input_json_delta` notifications and folds them at
+      // content_block_stop / in the assistant block. Emitting the
+      // start event surfaced as a confusing `■ Bash · 开始 · {}`
+      // duplicate of the proper `■ Bash · 开始 · {"command":...}` row
+      // the assistant block produces a few hundred ms later.
+      // Same reason `input_json_delta` is intentionally not rendered
+      // (see the content_block_delta branch above) — we wait for the
+      // assistant block to emit one row with the complete input.
       return undefined;
     }
     return undefined;
@@ -293,10 +410,82 @@ export function mapClaudeEvent(
     const ok = obj.subtype === 'success';
     const text = typeof obj.result === 'string' ? obj.result : '';
     const error = !ok && typeof obj.error === 'string' ? obj.error : undefined;
+    // Extract usage in the same shape multica daemon does
+    // (input_tokens / output_tokens / cache_read_input_tokens /
+    // cache_creation_input_tokens). Model lives on the message
+    // sibling sometimes; fall back to root `model` if present.
+    const usage = extractClaudeUsage(obj);
+    // Carry usage on the status event too so the rail can render
+    // "● result · in=N out=M cache=K" at turn end — claude only emits
+    // usage once (not streaming like codex/opencode), so without this
+    // the rail's last row is a bare `● result` and the user has no
+    // sense of how much the turn cost. The terminal record carries it
+    // alongside for the done event path.
     return {
-      event: { type: 'status', status: ok ? 'result' : 'error' },
-      terminal: { status: ok ? 'completed' : 'failed', text, error },
+      event: {
+        type: 'status',
+        status: ok ? 'result' : 'error',
+        ...(usage ? { usage } : {}),
+      },
+      terminal: { status: ok ? 'completed' : 'failed', text, error, usage },
     };
   }
   return undefined;
 }
+
+/** Pull token-usage fields out of a claude-code `type:result` record
+ *  into our normalized shape. Returns undefined when no recognizable
+ *  numeric fields are present so the caller can omit the `usage` key
+ *  rather than emit zeros. Exposed for unit testing.
+ *
+ *  Reads from THREE root fields:
+ *    - `usage.{input,output,cache_read,cache_creation}_input_tokens`
+ *    - `total_cost_usd` (claude tracks the dollars itself)
+ *    - `message.model` / `model` (string)
+ */
+export function extractClaudeUsage(obj: any): undefined | {
+  input?: number;
+  output?: number;
+  cacheRead?: number;
+  cacheCreate?: number;
+  cost?: number;
+  model?: string;
+} {
+  const u = obj?.usage;
+  const haveUsage = u && typeof u === 'object';
+  const out: Record<string, number | string> = {};
+  if (haveUsage) {
+    if (typeof u.input_tokens === 'number') out.input = u.input_tokens;
+    if (typeof u.output_tokens === 'number') out.output = u.output_tokens;
+    if (typeof u.cache_read_input_tokens === 'number') out.cacheRead = u.cache_read_input_tokens;
+    if (typeof u.cache_creation_input_tokens === 'number') out.cacheCreate = u.cache_creation_input_tokens;
+  }
+  if (typeof obj?.total_cost_usd === 'number' && Number.isFinite(obj.total_cost_usd)) {
+    out.cost = obj.total_cost_usd;
+  }
+  const model = obj?.message?.model || obj?.model;
+  if (typeof model === 'string' && model) out.model = model;
+  return Object.keys(out).length ? (out as any) : undefined;
+}
+
+/** Sum two normalized usage records numeric-field-wise. `model` follows
+ *  last-write-wins (multi-model turns are rare but possible). Used by
+ *  the claude backend to accumulate per-`assistant`-block snapshots
+ *  into a running total — exposed via `status:'usage'` events so the
+ *  rail shows a live token counter without waiting for the terminal
+ *  result record. Mirrors multica's per-model usage map (we collapse
+ *  to a single flat record since the rail only renders one usage row). */
+function mergeUsage(
+  acc: Record<string, number | string> | undefined,
+  inc: Record<string, number | string>,
+): Record<string, number | string> {
+  const out: Record<string, number | string> = { ...(acc || {}) };
+  for (const k of ['input', 'output', 'cacheRead', 'cacheCreate']) {
+    const a = typeof out[k] === 'number' ? (out[k] as number) : 0;
+    const i = typeof inc[k] === 'number' ? (inc[k] as number) : 0;
+    if (a || i) out[k] = a + i;
+  }
+  if (typeof inc.model === 'string' && inc.model) out.model = inc.model;
+  return out;
+}
+

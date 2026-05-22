@@ -43,6 +43,30 @@ function resultPreview(s: string, max = 300): string {
 }
 
 /**
+ * When `util/tool-result-cap.ts` spills an oversized in-process tool
+ * result to disk, it rewrites `result.content` into a
+ * `<persisted-output tool="..." size="..." path="...">...preview...</persisted-output>`
+ * marker. This is what the model sees, and it's what we receive as
+ * `ev.result` here in the event mapper. The renderer's click-to-expand
+ * UI needs the absolute path to read back the full body via
+ * `localAgents.readToolResult` — so we extract it from the marker.
+ *
+ * Returns `{ path, size }` when the marker is present, `null` otherwise
+ * (most tool calls don't spill — their result is just the raw output
+ * string, exposed directly through the `output` field on the event).
+ *
+ * Exposed for unit testing.
+ */
+export function extractPersistedOutputPath(result: string): { path: string; size: number } | null {
+  if (!result || typeof result !== 'string') return null;
+  // Match the opening tag only; the body and closing tag can be huge.
+  // tool-result-cap.ts owns the format — keep this regex in sync.
+  const m = /<persisted-output\b[^>]*?\bsize="(\d+)"[^>]*?\bpath="([^"]+)"/.exec(result);
+  if (!m) return null;
+  return { path: m[2], size: Number(m[1]) };
+}
+
+/**
  * Translate a raw retry reason (usually `err.message` from core-agent) into
  * a short user-facing phrase. The raw strings come from undici / pi-ai /
  * provider SDKs and are English / code-like; the process panel is
@@ -126,18 +150,37 @@ export async function* mapCoreAgentEvents(
       }
 
       case 'tool_end': {
-        const preview = resultPreview(ev.result || '');
+        const rawResult = ev.result || '';
+        const preview = resultPreview(rawResult);
+        // Two click-to-expand storage paths, decided here:
+        //   - oversized → util/tool-result-cap.ts already spilled to
+        //     disk; rawResult is a `<persisted-output path=...>` marker.
+        //     Pass the absolute path so the renderer reads back via
+        //     localAgents.readToolResult IPC.
+        //   - normal    → rawResult IS the full body (≤ 50 KB cap).
+        //     Pass it inline so the renderer stashes on the row and
+        //     renders directly without IO. The model already saw this
+        //     same body — sending it twice (event + persistent session)
+        //     adds ≤ 50 KB per call, well within memory budget.
+        const spill = extractPersistedOutputPath(rawResult);
+        const data: Record<string, unknown> = {
+          phase: 'end',
+          id: ev.id,
+          name: ev.name,
+          isError: !!ev.isError,
+          result_preview: preview,
+        };
+        if (spill) {
+          data.result_path = spill.path;
+          data.result_size = spill.size;
+        } else if (rawResult) {
+          data.output = rawResult;
+        }
         yield {
           type: 'event',
           event: {
             stream: 'tool',
-            data: {
-              phase: 'end',
-              id: ev.id,
-              name: ev.name,
-              isError: !!ev.isError,
-              result_preview: preview,
-            },
+            data,
           },
         };
         // Same dedupe rationale as `tool_start`: the renderer renders the

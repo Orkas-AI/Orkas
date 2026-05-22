@@ -22,6 +22,21 @@
 
 const { contextBridge, ipcRenderer } = require('electron');
 
+// Synchronous i18n boot — handed to the renderer via contextBridge before any
+// renderer-side script runs. The renderer's i18n module reads window.__orkasI18nBoot
+// at script-tag execution time (line 1118 of index.html, after all data-i18n
+// elements have been parsed), so applyDomI18n() can translate the DOM before
+// the first paint. Falls back to a null bundle on failure — i18n.js then runs
+// its old async initI18n() path. sendSync blocks for one short IPC round-trip
+// (~1-2 ms); the trade is paying that for zero language-flash on startup.
+let _i18nBoot = null;
+try {
+  const res = ipcRenderer.sendSync('orkas:bootI18n');
+  if (res && res.ok && (res.lang === 'zh' || res.lang === 'en') && res.tables) {
+    _i18nBoot = { lang: res.lang, tables: res.tables };
+  }
+} catch (_) { /* main not ready / handler missing → renderer falls back to async */ }
+
 let _streamCounter = 0;
 function nextRequestId() {
   _streamCounter += 1;
@@ -109,6 +124,63 @@ function stream(channel, payload, onEvent) {
   return { promise, cancel };
 }
 
+// push channel are stripped from the OrkasOpen build — see OpenSource/SyncCode/strip-rules.json.
+const account = {
+  status: () => invoke('account.status'),
+  listProviders: () => invoke('account.listProviders'),
+  startLogin: () => invoke('account.startLogin'),
+  logout: () => invoke('account.logout'),
+  currentUser: () => invoke('account.currentUser'),
+  // Subscribe to status-change pushes from main (login completed / session revoked). Returns an
+  // unsubscribe function.
+  onChange: (cb) => {
+    if (typeof cb !== 'function') return () => {};
+    const listener = (_evt, payload) => { try { cb(payload); } catch (_) { /* renderer cb threw */ } };
+  },
+};
+
+// Voice-to-text (the chat-composer mic button → the Server's /voice/asr_ws ASR proxy). The
+// `voice` namespace + renderer/modules/voice-input.js are stripped from the OrkasOpen build
+// (offline client, no Server) — see OpenSource/SyncCode/strip-rules.json.
+const voice = {
+};
+
+// Multi-device sync. Stripped from the OrkasOpen build along with the account namespace
+// it depends on — see OpenSource/SyncCode/strip-rules.json.
+const sync = {
+  runNow: () => invoke('sync.runNow'),
+  status: () => invoke('sync.status'),
+  usage: () => invoke('sync.usage'),
+  getEnabled: () => invoke('sync.getEnabled'),
+  setEnabled: (enabled, opts) => invoke('sync.setEnabled', {
+    enabled: !!enabled,
+    purge: !!(opts && opts.purge),
+  }),
+  usageBreakdown: () => invoke('sync.usageBreakdown'),
+  getPendingMassDelete: () => invoke('sync.getPendingMassDelete'),
+  confirmPendingDelete: () => invoke('sync.confirmPendingDelete'),
+  cancelPendingDelete: () => invoke('sync.cancelPendingDelete'),
+  onStatus: (cb) => {
+    if (typeof cb !== 'function') return () => {};
+    const listener = (_evt, payload) => { try { cb(payload); } catch (_) { /* swallow */ } };
+  },
+  onUsage: (cb) => {
+    if (typeof cb !== 'function') return () => {};
+    const listener = (_evt, payload) => { try { cb(payload); } catch (_) { /* swallow */ } };
+  },
+  // Fires after a sync pass pulls / renames / tombstone-deletes at least one
+  // file — the on-disk cloud/ tree now has content the renderer's in-memory
+  // lists don't know about. Payload: { domains: string[], cids: string[] }.
+  onDataChanged: (cb) => {
+    if (typeof cb !== 'function') return () => {};
+    const listener = (_evt, payload) => { try { cb(payload); } catch (_) { /* swallow */ } };
+  },
+};
+
+// Expose the sync-fetched i18n bundle on its own bridge key so the renderer
+// can pick it up at module load. Read-only — the renderer never mutates it.
+contextBridge.exposeInMainWorld('__orkasI18nBoot', _i18nBoot);
+
 contextBridge.exposeInMainWorld('orkas', {
   ping: () => ipcRenderer.invoke('orkas.ping'),
   diagnostics: () => ipcRenderer.invoke('orkas.diagnostics'),
@@ -116,6 +188,9 @@ contextBridge.exposeInMainWorld('orkas', {
   getLanguage: () => invoke('config.getLanguage'),
   setLanguage: (language) => invoke('config.setLanguage', { language }),
   getLocales: () => invoke('config.getLocales'),
+  account,
+  voice,
+  sync,
   invoke,
   stream,
   onPushEvent,

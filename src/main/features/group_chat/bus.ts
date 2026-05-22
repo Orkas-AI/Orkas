@@ -261,6 +261,16 @@ async function appendMain(uid: string, cid: string, msg: GroupMessage): Promise<
   const file = mainJsonlFile(uid, cid);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   await appendJsonlAtomic<GroupMessage>(file, msg);
+  // Stamp `updated_at` on this cid's _index.json row so the sidebar can sort
+  // by real last-activity time rather than file mtime (which sync clobbers
+  // when pulling from another device — see chats.ts::listConversations).
+  // Dynamic import to avoid the chats ↔ group_chat circular dep.
+  try {
+    const chats = await import('../chats');
+    await chats.bumpConversationActivity(uid, cid, msg.ts);
+  } catch (err) {
+    log.warn('bumpConversationActivity failed', { uid, cid, error: (err as Error)?.message });
+  }
 }
 
 // ── enqueue ──────────────────────────────────────────────────────────────
@@ -854,17 +864,19 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   }
 
   // Attach a `<attachments>` manifest block listing user-uploaded files
-  // (text / pdf / docx with absolute paths + kinds). Commander uses it to
-  // route work; agent uses it to extract values for `inputs_schema`
-  // (especially `type=file` fields). Without this the LLM only sees the
-  // text body and can't know what files the user attached. Image bytes
-  // aren't piped through here yet — that needs ChatOptions.images plumbing
-  // and lands as a follow-up.
+  // (text / pdf / docx / image with absolute paths + kinds). Commander uses
+  // it to route work; agent uses it to extract values for `inputs_schema`
+  // (especially `type=file` fields). Image bytes ride alongside via
+  // ChatOptions.images so the vision model sees them on the same user turn
+  // — the manifest entry carries `attached="inline"` so the LLM doesn't
+  // waste a read_file round-trip re-fetching what it already has.
+  let turnImages: Array<{ data: string; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' }> = [];
   if (item.attachments && item.attachments.length) {
     try {
       const { buildAttachmentManifest } = await import('../chat_attachments');
-      const { manifest } = await buildAttachmentManifest(uid, cid, item.attachments);
+      const { manifest, images } = await buildAttachmentManifest(uid, cid, item.attachments);
       if (manifest) messageText = `${manifest}\n${messageText}`;
+      if (images.length) turnImages = images;
     } catch (err) {
       log.warn(`attachments manifest build failed cid=${cid} actor=${actor.id}: ${(err as Error).message}`);
     }
@@ -1089,6 +1101,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       cacheRetention: 'short',
       abortSignal: w.abortController.signal,
       readOnlyExtraRoots: [...skillRoots, ...agentRoots],
+      ...(turnImages.length ? { images: turnImages } : {}),
       ...(extraTools.length ? { extraTools } : {}),
       ...(skillList !== undefined ? { skillList } : {}),
       // Skills are NOT project-scoped this round — every conversation sees

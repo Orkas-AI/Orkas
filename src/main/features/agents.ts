@@ -778,7 +778,8 @@ export interface UpdateAgentFields {
    *  Authored by the create modal + edit UI, not the LLM edit prompt. */
   runtime?: AgentRuntime | null;
   /** Marketplace category code. Empty string drops the field; omitted = untouched.
-   *  Authored by the create / edit dialog dropdown, NOT the agent-edit LLM. */
+   *  Authored by the create / edit dialog dropdown OR by the agent-edit LLM via the
+   *  `<category>` sub-tag (validated against `AGENT_CATEGORY_CODES` in `_parseAgentBlock`). */
   category?: string;
 }
 
@@ -1102,6 +1103,13 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
 const AGENT_CONTAINER_RE = /<agent>([\s\S]*?)<\/agent>/g;
 const AGENT_CHILD_RE = (tag: string) => new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`);
 
+/** Marketplace category codes — kept in sync with
+ *  `Server/biz/marketplace/marketplace_mgr.py::DEFAULT_CATEGORIES`. Single source of truth
+ *  for `<category>` validation in `<agent>` container parsing. */
+export const AGENT_CATEGORY_CODES: ReadonlySet<string> = new Set([
+  'education', 'ecommerce', 'rnd', 'writing', 'data', 'general',
+]);
+
 export interface ExtractedFields {
   /** Parsed from `<agent_id>` inside `<agent>`. Present → commander wants to
    * patch this existing custom agent (main-chat edit flow); absent → create
@@ -1125,6 +1133,11 @@ export interface ExtractedFields {
    * `false` (case-insensitive); anything else → key omitted (leave the
    * existing flag untouched). */
   interactive?: boolean;
+  /** Parsed from `<category>` inside `<agent>`. Body must be one of
+   *  `AGENT_CATEGORY_CODES`; invalid value → key omitted (existing field
+   *  preserved). New agents without a category fall through to whatever
+   *  `createCustomAgent` decides (empty string today). */
+  category?: string;
 }
 
 function _parseAgentBlock(inner: string): ExtractedFields {
@@ -1190,6 +1203,13 @@ function _parseAgentBlock(inner: string): ExtractedFields {
     if (v === 'true') fields.interactive = true;
     else if (v === 'false') fields.interactive = false;
     // Any other body → leave key omitted; previous flag survives.
+  }
+  const catM = inner.match(AGENT_CHILD_RE('category'));
+  if (catM) {
+    const v = catM[1].trim().toLowerCase();
+    // Validate against the known code set. Unknown values are dropped silently — the existing
+    // category field on the agent is preserved (don't let an LLM hallucinated code blank it).
+    if (AGENT_CATEGORY_CODES.has(v)) fields.category = v;
   }
   return fields;
 }
@@ -1566,6 +1586,7 @@ export async function createAgentFromBlocks(fields: ExtractedFields): Promise<Ag
   const created = await createCustomAgent({
     name, description, description_zh, description_en, workflow,
     ...(typeof fields.interactive === 'boolean' ? { interactive: fields.interactive } : {}),
+    ...(typeof fields.category === 'string' ? { category: fields.category } : {}),
   });
   if (!created) return null;
   // Fold optional skill_list + inputs in via updateCustomAgent so the

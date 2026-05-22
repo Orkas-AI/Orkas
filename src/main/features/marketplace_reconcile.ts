@@ -20,9 +20,12 @@ import * as path from 'node:path';
 import {
   userMarketplaceAgentDir, userMarketplaceSkillDir,
 } from '../paths';
-import { readInstalls, type AgentInstall, type SkillInstall } from './marketplace_installs';
+import {
+  readInstalls, addAgentInstall, addSkillInstall,
+  type AgentInstall, type SkillInstall,
+} from './marketplace_installs';
 import { invalidateSkills as invalidateCoreAgentSkills } from '../model/core-agent/skill-registry';
-import { extractBundleSafely } from './marketplace';
+import { extractBundleSafely, postJson } from './marketplace';
 import { createLogger } from '../logger';
 
 const log = createLogger('marketplace_reconcile');
@@ -65,6 +68,93 @@ function _setStatus(next: ReconcileStatus): void {
   for (const fn of _listeners) {
     try { fn(_status); } catch { /* listener errors must not break reconcile */ }
   }
+}
+
+/** Pre-reconcile step: sync the local cloud manifest against the server catalog. For every
+ *  installed item, look up the server's current (version, published_at). When the server has
+ *  newer values, write them back into the manifest — the subsequent `reconcileInstalls` pass
+ *  then detects the mismatch against per-machine `_install.json` and re-pulls the blob.
+ *
+ *  Side effects: at most one `addAgentInstall` / `addSkillInstall` write per changed row,
+ *  each going through the same per-uid lock as user-initiated installs. Items absent from the
+ *  server catalog (e.g. admin-deleted) are left untouched — auto-uninstall stays user-explicit.
+ *
+ *  Network failures are swallowed (offline boot must not block the rest of startup); the next
+ *  launch retries.
+ */
+export async function checkServerUpdatesForInstalls(uid: string): Promise<{ updated_agents: number; updated_skills: number }> {
+  const manifest = await readInstalls(uid);
+  if (manifest.agents.length === 0 && manifest.skills.length === 0) {
+    return { updated_agents: 0, updated_skills: 0 };
+  }
+
+  let agentMap: Map<string, _CatalogRow>;
+  let skillMap: Map<string, _CatalogRow>;
+  try {
+    [agentMap, skillMap] = await Promise.all([
+      _fetchServerCatalogMap('agents'),
+      _fetchServerCatalogMap('skills'),
+    ]);
+  } catch (err) {
+    log.warn(`server-check fetch failed (offline?): ${(err as Error).message}`);
+    return { updated_agents: 0, updated_skills: 0 };
+  }
+
+  let updated_agents = 0;
+  let updated_skills = 0;
+  for (const a of manifest.agents) {
+    const server = agentMap.get(a.id);
+    if (!server) continue;
+    if (server.version !== a.version || server.published_at !== a.published_at) {
+      log.info(`server-update agent ${a.id}: v${a.version} → v${server.version} (published_at ${a.published_at} → ${server.published_at})`);
+      // Replace the row in the manifest; reconcile will detect the version/published_at
+      // mismatch against `_install.json` and re-pull. agent_json_url is reused (server
+      // overwrites the same COS key on republish — see Server `api/marketplace.py::upload_agent`).
+      await addAgentInstall(uid, {
+        id: a.id, version: server.version, published_at: server.published_at,
+        agent_json_url: a.agent_json_url, create_uid: a.create_uid,
+      });
+      updated_agents++;
+    }
+  }
+  for (const s of manifest.skills) {
+    const server = skillMap.get(s.id);
+    if (!server) continue;
+    if (server.version !== s.version || server.published_at !== s.published_at) {
+      log.info(`server-update skill ${s.id}: v${s.version} → v${server.version} (published_at ${s.published_at} → ${server.published_at})`);
+      await addSkillInstall(uid, {
+        id: s.id, version: server.version, published_at: server.published_at,
+        bundle_url: s.bundle_url, create_uid: s.create_uid,
+      });
+      updated_skills++;
+    }
+  }
+  if (updated_agents + updated_skills > 0) {
+    log.info(`server-check: ${updated_agents} agent(s) + ${updated_skills} skill(s) marked for update`);
+  }
+  return { updated_agents, updated_skills };
+}
+
+interface _CatalogRow { version: string; published_at: number }
+
+/** Paginate the public `/marketplace/{kind}/list` endpoint and collapse to (id → version + ts).
+ *  Page-size 100 × 20 pages = 2000 row cap (well above current catalog scale). */
+async function _fetchServerCatalogMap(kind: 'agents' | 'skills'): Promise<Map<string, _CatalogRow>> {
+  const out = new Map<string, _CatalogRow>();
+  const PAGE_SIZE = 100;
+  for (let page = 1; page <= 20; page++) {
+    const r = await postJson<{ list: Array<{ id?: string; version?: string; published_at?: number }>; total?: number }>(
+      `/marketplace/${kind}/list`, { page, size: PAGE_SIZE },
+    );
+    const list = r.list || [];
+    for (const row of list) {
+      if (typeof row.id === 'string' && typeof row.version === 'string' && typeof row.published_at === 'number') {
+        out.set(row.id, { version: row.version, published_at: row.published_at });
+      }
+    }
+    if (list.length < PAGE_SIZE) break;
+  }
+  return out;
 }
 
 /** Read manifest + reconcile every entry in parallel. Returns counts for logging. Emits status

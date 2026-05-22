@@ -67,9 +67,9 @@ function _buildStepHtml(step) {
     : '';
   const actions = _isStepActionable(step, _currentInFlight)
     ? `<div class="plan-rail-step-actions">
-         <button type="button" class="btn btn-sm" data-action="retry" data-i18n="plan.action.retry">${escapeHtml(t('plan.action.retry') || 'Retry')}</button>
+         <button type="button" class="btn btn-sm" data-action="retry" data-i18n="plan.action.retry">${escapeHtml(t('plan.action.retry'))}</button>
          <button type="button" class="btn btn-sm" data-action="skip"  data-i18n="plan.action.skip">${escapeHtml(t('plan.action.skip')  || 'Skip')}</button>
-         <button type="button" class="btn btn-sm btn-danger" data-action="abort" data-i18n="plan.action.abort">${escapeHtml(t('plan.action.abort') || 'Abandon plan')}</button>
+         <button type="button" class="btn btn-sm btn-danger" data-action="abort" data-i18n="plan.action.abort">${escapeHtml(t('plan.action.abort'))}</button>
        </div>`
     : '';
   return `<div class="plan-rail-step is-${step.status}" data-step-index="${step.index}" ${step.output_msg_id ? `data-msg-id="${escapeHtml(step.output_msg_id)}"` : ''}>
@@ -238,7 +238,7 @@ document.addEventListener('click', async (ev) => {
       return;
     }
     if (action === 'skip') {
-      const ok = await uiConfirm(t('plan.confirm.skip') || 'Skip this step?');
+      const ok = await uiConfirm(t('plan.confirm.skip'));
       if (!ok) return;
       try {
         const res = await apiFetch(
@@ -255,7 +255,7 @@ document.addEventListener('click', async (ev) => {
       return;
     }
     if (action === 'abort') {
-      const ok = await uiConfirm(t('plan.confirm.abort') || 'Abandon the entire plan?');
+      const ok = await uiConfirm(t('plan.confirm.abort'));
       if (!ok) return;
       try {
         await apiFetch(

@@ -378,10 +378,16 @@ function _renderAgentRowMenuItems(menu, agentId) {
   const enabled = a ? a.enabled !== false : true;
   const isCustom = a?.source === 'custom';
   const canEdit = isCustom;
+  // Dev mode lifts the source guard for built-in edit / delete; custom adds
+  // a "promote to built-in" item too.
+  const canEdit = isCustom || (a?.source === 'builtin' && false);
+  // Dev-only entry on builtin: tag the label so the user knows this isn't a
+  // normal user capability (mirrors marketplace.upload's "(dev)" treatment).
+  const editLabelSuffix = (a?.source === 'builtin' && false) ? t('common.dev_suffix') : '';
   const toggleLabel = enabled ? t('component.disable') : t('component.enable');
   const items = [];
   if (canEdit) {
-    items.push(`<div class="agent-row-menu-item" data-action="edit">${escapeHtml(t('agents.edit'))}</div>`);
+    items.push(`<div class="agent-row-menu-item" data-action="edit">${escapeHtml(t('agents.edit') + editLabelSuffix)}</div>`);
   }
   if (isCustom && false) {
     items.push(`<div class="agent-row-menu-item" data-action="promote">${escapeHtml(t('agents.promote_to_builtin'))}</div>`);
@@ -559,7 +565,11 @@ function _renderAgentDetail(agent, editing) {
   if (delBtn) delBtn.style.display = (canEdit && !editing) ? '' : 'none';
   if (editBtn) {
     editBtn.style.display = canEdit ? '' : 'none';
-    editBtn.textContent = editing ? t('agents.edit_btn_done') : t('agents.edit_btn_edit');
+    // Tag the "Edit" label on builtin agents (dev-only entry); "Done" stays
+    // bare because the user is already in edit mode and the marker would be
+    // redundant noise.
+    const editSuffix = (!editing && agent.source === 'builtin' && false) ? t('common.dev_suffix') : '';
+    editBtn.textContent = editing ? t('agents.edit_btn_done') : (t('agents.edit_btn_edit') + editSuffix);
   }
   _renderAgentEnabledButton({ id: agent.agent_id, enabled: agent.enabled !== false });
 

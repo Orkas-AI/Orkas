@@ -1,4 +1,8 @@
 <!doctype html>
+<!-- `<html lang>` is updated to the user's preferred language by i18n.js at
+     script-load (line 1118), based on the sync bundle preload exposed on
+     window.__orkasI18nBoot. The fallback `en` here is what shows if both the
+     preload bridge and the IPC handler are unavailable. -->
 <html lang="en">
 <head>
   <meta charset="utf-8" />
@@ -355,7 +359,11 @@
               <button type="button" class="marketplace-tab" data-mp-tab="agent" data-i18n="marketplace.tab_agent">Agents</button>
               <button type="button" class="marketplace-tab" data-mp-tab="skill" data-i18n="marketplace.tab_skill">Skills</button>
             </div>
-            <input type="text" class="marketplace-search" data-mp-search data-i18n-placeholder="marketplace.search_ph" />
+            <div class="marketplace-search-wrap">
+              <input type="text" class="marketplace-search" data-mp-search data-i18n-placeholder="marketplace.search_ph" />
+              <button type="button" class="marketplace-search-clear" data-mp-search-clear data-i18n-title="common.clear" hidden>&times;</button>
+            </div>
+            <button type="button" class="btn btn-sm btn-primary marketplace-search-btn" data-mp-search-btn data-i18n="marketplace.search">Search</button>
           </div>
           <div class="marketplace-categories" data-mp-categories></div>
           <div class="marketplace-body" data-mp-body></div>
@@ -470,8 +478,18 @@
             <h2 data-i18n="settings.title">Settings</h2>
             <div class="settings-version" id="settings-version"></div>
           </div>
+
+          <!-- 4-tab restructure (batch 6 + 4 decision; see PC/docs/plans/multi-device-sync.md §4.9).
+               OrkasOpen contract: the 账号 tab AND the sync card inside 数据 tab are
+               stripped (see strip-rules.json) — settings.js handles missing-tab gracefully. -->
+          <div class="settings-tabs" role="tablist">
+            <button class="settings-tab is-active" data-settings-tab="account" data-i18n="settings.tab.account">账号</button>
+            <button class="settings-tab" data-settings-tab="data" data-i18n="settings.tab.data">数据</button>
+            <button class="settings-tab" data-settings-tab="general" data-i18n="settings.tab.general">通用</button>
+            <button class="settings-tab" data-settings-tab="credentials" data-i18n="settings.tab.credentials">配置</button>
+          </div>
+
           <div class="settings-body">
-            <div class="settings-section-head" data-i18n="settings.section.general">General</div>
 
             <div class="settings-group">
               <div class="settings-group-head">
@@ -488,145 +506,232 @@
                 </label>
               </div>
             </div>
-
-            <div class="settings-group">
-              <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.commander_avatar.title">Commander avatar</div>
-                <div class="settings-group-sub" data-i18n="settings.commander_avatar.sub">Click the avatar to pick a new icon and color.</div>
-              </div>
-              <div class="settings-row">
-                <span class="settings-commander-avatar-slot" id="settings-commander-avatar"></span>
-                <span class="settings-status muted" id="settings-commander-avatar-hint" data-i18n="settings.commander_avatar.hint">Click the avatar on the left to change it</span>
-              </div>
-            </div>
-
-            <div class="settings-group">
-              <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.localexec.title">Local Execution</div>
-                <div class="settings-group-sub" data-i18n="settings.localexec.sub">Once granted, agents may run shell commands, read/write workspace files, and generate PDFs. Without permission those tools refuse to run.</div>
-              </div>
-              <div class="settings-row">
-                <span class="settings-status" id="settings-localexec-status" data-i18n="settings.localexec.status_loading">Loading…</span>
-                <button class="btn btn-sm btn-primary" id="settings-localexec-toggle" data-i18n="settings.localexec.btn_grant">Grant local execution</button>
+            <!-- ───────────────────────── 账号 ───────────────────────── -->
+            <div class="settings-tab-pane" data-settings-pane="account">
+              <!-- Account card — populated by views/login/account_settings.js; hidden when not
+                   signed in. This block + that script are stripped from the OrkasOpen build. -->
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="account.settings_title">账号</div>
+                </div>
+                  </div>
+                </div>
               </div>
             </div>
 
-            <div class="settings-group">
-              <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.metacognition.title">Metacognition-level Agent Self-Evolution</div>
-                <div class="settings-group-sub" data-i18n="settings.metacognition.sub">When on, each agent periodically reviews its recent performance, draws lessons, and adjusts how it works so it does better next time. We call it "meta-cognitive" because the agent doesn't just do tasks — it also reasons about "how am I doing, and how could I do better next time?" That cognition about its own cognition is metacognition. Turn off to stop the self-review.</div>
+            <!-- ───────────────────────── 数据 ───────────────────────── -->
+            <div class="settings-tab-pane" data-settings-pane="data" hidden>
+              <!-- ─── 云端 ───────────────────────────────────────────────
+                   Sync cards — multi-device sync status / quota / conflicts. Split into separate
+                   .settings-group cards so the layout breathes; the whole subsection is stripped
+                   in OrkasOpen along with features/sync. Settings.js gates rendering on
+                   `typeof window.orkas?.sync !== 'undefined'`. -->
+              <div class="settings-section-head" id="settings-section-cloud" data-i18n="settings.section.cloud" style="display:none">云端</div>
+
+              <!-- Card 1: 主开关 + 状态 + 立即同步 -->
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.sync.title">云端同步</div>
+                  <div class="settings-group-sub" data-i18n="settings.sync.privacy_note">数据通过 HTTPS 加密上传到私有云存储，仅你的账号可访问。</div>
+                </div>
+                <div class="settings-row">
+                  <label class="settings-toggle settings-toggle-tight">
+                    <span data-i18n="settings.sync.toggle_enable">启用云端同步</span>
+                  </label>
+                </div>
+                <!-- "关闭中…" — shown only while the disable RPC is in flight. -->
+                  <span class="settings-status muted" data-i18n="settings.sync.disabling">关闭中…</span>
+                </div>
+                <!-- Disable-failed slot: inline error + retry button.
+                     Replaces the previous uiAlert toast; user asked for an
+                     in-card actionable failure state. -->
+                </div>
+                </div>
+                </div>
+                </div>
+                <!-- Mass-delete confirmation panel — only visible when the
+                     engine paused with reason `mass_delete_pending`. -->
+                    <span data-i18n="settings.sync.mass_delete_summary">即将从云端删除 </span>
+                    <span data-i18n="settings.sync.mass_delete_summary_tail"> 个文件。请确认这是有意的操作。</span>
+                  </div>
+                  <div class="settings-row">
+                  </div>
+                </div>
               </div>
-              <div class="settings-row">
-                <label class="settings-toggle">
-                  <input type="checkbox" id="settings-metacognition-toggle" />
-                  <span data-i18n="settings.metacognition.toggle">Enable</span>
-                </label>
-                <span class="settings-status muted" id="settings-metacognition-status"></span>
+
+              <!-- Card 2: 存储空间 (quota bar + always-visible category/project breakdown) -->
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.sync.storage_title">存储空间</div>
+                </div>
+                </div>
+              </div>
+
+              <!-- Card 3: 冲突记录 -->
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.sync.conflicts_title">冲突记录</div>
+                  <div class="settings-group-sub" data-i18n="settings.sync.conflicts_sub">两台设备同时修改同一文件时，被覆盖的版本会留底在这里，可恢复。</div>
+                </div>
+                  <div class="settings-empty" data-i18n="settings.sync.conflicts_empty">暂无冲突</div>
+                </div>
+              </div>
+
+              <!-- ─── 本地 ───────────────────────────────────────────────
+                   Maintenance actions on local data; not synced. -->
+              <div class="settings-section-head" data-i18n="settings.section.local">本地</div>
+
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.data_root.title">Data root</div>
+                  <div class="settings-group-sub" data-i18n="settings.data_root.sub">All conversations, agents, skills, and KB content live under this directory. Click the path to open it in the OS file manager.</div>
+                </div>
+                <div class="settings-row">
+                  <button class="btn btn-sm" id="settings-data-root-btn" type="button" title="" data-i18n-title="settings.data_root.open_tooltip"><span id="settings-data-root-path" class="muted"></span></button>
+                </div>
+              </div>
+
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.clear_all_convs.title">Clear all conversations</div>
+                  <div class="settings-group-sub" data-i18n="settings.clear_all_convs.sub">Removes every conversation and its associated message history, attachments, plan, sessions, and search index entries — same cascade as clicking × on a single conversation, applied to all of them. Skills and agents are NOT touched.</div>
+                </div>
+                <div class="settings-row">
+                  <button class="btn btn-sm btn-danger" id="settings-clear-all-convs-btn" data-i18n="settings.clear_all_convs.btn">Clear all conversations</button>
+                  <span class="settings-status muted" id="settings-clear-all-convs-status"></span>
+                </div>
               </div>
             </div>
 
-            <div class="settings-section-head" data-i18n="settings.section.models">Models & credentials</div>
-            <div class="settings-section-note" data-i18n="settings.section.models_note">API keys and OAuth tokens are stored locally only — never synced or sent off-device.</div>
+            <!-- ───────────────────────── 通用 ───────────────────────── -->
+            <div class="settings-tab-pane" data-settings-pane="general" hidden>
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.language.title">语言 / Language</div>
+                </div>
+                <div class="settings-row" id="settings-language-row">
+                  <label class="settings-lang-opt">
+                    <input type="radio" name="settings-language" value="zh" />
+                    <span data-i18n="settings.language.zh">简体中文</span>
+                  </label>
+                  <label class="settings-lang-opt">
+                    <input type="radio" name="settings-language" value="en" />
+                    <span data-i18n="settings.language.en">English</span>
+                  </label>
+                </div>
+              </div>
 
-            <div class="settings-group">
-              <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.add_auth_title">Add model authorization</div>
-                <div class="settings-group-sub" data-i18n="settings.add_auth_sub">Pick a provider and model, then add an API key or OAuth account.</div>
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.commander_avatar.title">Commander avatar</div>
+                  <div class="settings-group-sub" data-i18n="settings.commander_avatar.sub">Click the avatar to pick a new icon and color.</div>
+                </div>
+                <div class="settings-row">
+                  <span class="settings-commander-avatar-slot" id="settings-commander-avatar"></span>
+                  <span class="settings-status muted" id="settings-commander-avatar-hint" data-i18n="settings.commander_avatar.hint">Click the avatar on the left to change it</span>
+                </div>
               </div>
-              <div class="settings-row">
-                <label data-i18n="settings.provider">Provider</label>
-                <div class="ai-select" id="settings-picker-provider"></div>
+
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.localexec.title">Local Execution</div>
+                  <div class="settings-group-sub" data-i18n="settings.localexec.sub">Once granted, agents may run shell commands, read/write workspace files, and generate PDFs. Without permission those tools refuse to run.</div>
+                </div>
+                <div class="settings-row">
+                  <span class="settings-status" id="settings-localexec-status" data-i18n="settings.localexec.status_loading">Loading…</span>
+                  <button class="btn btn-sm btn-primary" id="settings-localexec-toggle" data-i18n="settings.localexec.btn_grant">Grant local execution</button>
+                </div>
               </div>
-              <div class="settings-row">
-                <label data-i18n="settings.model">Model</label>
-                <div class="ai-select" id="settings-picker-model"></div>
-              </div>
-              <div class="settings-row">
-                <button class="btn btn-primary" id="settings-add-entry-btn" data-i18n="settings.add_account">+ Add account</button>
-                <span class="settings-status" id="settings-picker-status"></span>
+
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.metacognition.title">Metacognition-level Agent Self-Evolution</div>
+                  <div class="settings-group-sub" data-i18n="settings.metacognition.sub">When on, each agent periodically reviews its recent performance, draws lessons, and adjusts how it works so it does better next time.</div>
+                </div>
+                <div class="settings-row">
+                  <label class="settings-toggle">
+                    <input type="checkbox" id="settings-metacognition-toggle" />
+                    <span data-i18n="settings.metacognition.toggle">Enable</span>
+                  </label>
+                  <span class="settings-status muted" id="settings-metacognition-status"></span>
+                </div>
               </div>
             </div>
 
-            <div class="settings-group">
-              <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.configured_title">Configured (by priority)</div>
-                <div class="settings-group-sub" data-i18n="settings.configured_sub">The first entry is the default model; later entries are the fallback chain. Drag to reorder.</div>
+            <!-- ───────────────────────── 配置 ───────────────────────── -->
+            <div class="settings-tab-pane" data-settings-pane="credentials" hidden>
+              <div class="settings-section-note" data-i18n="settings.section.models_note">API keys and OAuth tokens are stored locally only — never synced or sent off-device.</div>
+
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.add_auth_title">Add model authorization</div>
+                  <div class="settings-group-sub" data-i18n="settings.add_auth_sub">Pick a provider and model, then add an API key or OAuth account.</div>
+                </div>
+                <div class="settings-row">
+                  <label data-i18n="settings.provider">Provider</label>
+                  <div class="ai-select" id="settings-picker-provider"></div>
+                </div>
+                <div class="settings-row">
+                  <label data-i18n="settings.model">Model</label>
+                  <div class="ai-select" id="settings-picker-model"></div>
+                </div>
+                <div class="settings-row">
+                  <button class="btn btn-primary" id="settings-add-entry-btn" data-i18n="settings.add_account">+ Add account</button>
+                  <span class="settings-status" id="settings-picker-status"></span>
+                </div>
               </div>
-              <div class="settings-entries" id="settings-entries">
-                <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
+
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.configured_title">Configured (by priority)</div>
+                  <div class="settings-group-sub" data-i18n="settings.configured_sub">The first entry is the default model; later entries are the fallback chain. Drag to reorder.</div>
+                </div>
+                <div class="settings-entries" id="settings-entries">
+                  <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
+                </div>
+              </div>
+
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.search.title">Search API Key</div>
+                  <div class="settings-group-sub" data-i18n="settings.search.sub">Priority: paid API &gt; model-native search &gt; built-in keyless scraper.</div>
+                </div>
+                <div class="settings-row">
+                  <label data-i18n="settings.search.provider">Provider</label>
+                  <div class="ai-select" id="settings-search-provider"></div>
+                </div>
+                <div class="settings-row">
+                  <label data-i18n="settings.search.api_key">API Key</label>
+                  <input type="text" class="form-input" id="settings-search-key-input" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="settings-row">
+                  <button class="btn btn-primary" id="settings-search-add-btn" data-i18n="settings.search.add">+ Add search key</button>
+                  <span class="settings-status" id="settings-search-status"></span>
+                </div>
+                <div class="settings-entries" id="settings-search-entries">
+                  <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
+                </div>
+              </div>
+
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.image.title">Image generation API Key</div>
+                  <div class="settings-group-sub" data-i18n="settings.image.sub">API for the generate_image tool. Falls back to chat keys when those target OpenAI or Google.</div>
+                </div>
+                <div class="settings-row">
+                  <label data-i18n="settings.image.provider">Provider</label>
+                  <div class="ai-select" id="settings-image-provider"></div>
+                </div>
+                <div class="settings-row">
+                  <label data-i18n="settings.image.api_key">API Key</label>
+                  <input type="text" class="form-input" id="settings-image-key-input" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="settings-row">
+                  <button class="btn btn-primary" id="settings-image-add-btn" data-i18n="settings.image.add">+ Add image key</button>
+                  <span class="settings-status" id="settings-image-status"></span>
+                </div>
+                <div class="settings-entries" id="settings-image-entries">
+                  <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
+                </div>
               </div>
             </div>
 
-            <div class="settings-section-head" data-i18n="settings.section.tools">Tool capabilities</div>
-            <div class="settings-section-note" data-i18n="settings.section.tools_note">Search and image-gen API keys are stored locally only — never synced or sent off-device.</div>
-
-            <div class="settings-group">
-              <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.search.title">Search API Key</div>
-                <div class="settings-group-sub" data-i18n="settings.search.sub">Priority: paid API &gt; model-native search &gt; built-in keyless scraper.</div>
-              </div>
-              <div class="settings-row">
-                <label data-i18n="settings.search.provider">Provider</label>
-                <div class="ai-select" id="settings-search-provider"></div>
-              </div>
-              <div class="settings-row">
-                <label data-i18n="settings.search.api_key">API Key</label>
-                <input type="text" class="form-input" id="settings-search-key-input" autocomplete="off" spellcheck="false" />
-              </div>
-              <div class="settings-row">
-                <button class="btn btn-primary" id="settings-search-add-btn" data-i18n="settings.search.add">+ Add search key</button>
-                <span class="settings-status" id="settings-search-status"></span>
-              </div>
-              <div class="settings-entries" id="settings-search-entries">
-                <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
-              </div>
-            </div>
-
-            <div class="settings-group">
-              <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.image.title">Image generation API Key</div>
-                <div class="settings-group-sub" data-i18n="settings.image.sub">API for the generate_image tool. Falls back to chat keys when those target OpenAI or Google.</div>
-              </div>
-              <div class="settings-row">
-                <label data-i18n="settings.image.provider">Provider</label>
-                <div class="ai-select" id="settings-image-provider"></div>
-              </div>
-              <div class="settings-row">
-                <label data-i18n="settings.image.api_key">API Key</label>
-                <input type="text" class="form-input" id="settings-image-key-input" autocomplete="off" spellcheck="false" />
-              </div>
-              <div class="settings-row">
-                <button class="btn btn-primary" id="settings-image-add-btn" data-i18n="settings.image.add">+ Add image key</button>
-                <span class="settings-status" id="settings-image-status"></span>
-              </div>
-              <div class="settings-entries" id="settings-image-entries">
-                <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
-              </div>
-            </div>
-
-            <div class="settings-section-head" data-i18n="settings.section.data">Data</div>
-            <div class="settings-section-note" data-i18n="settings.section.data_note">Maintenance actions on local data. These cannot be undone.</div>
-
-            <div class="settings-group">
-              <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.data_root.title">Data root</div>
-                <div class="settings-group-sub" data-i18n="settings.data_root.sub">All conversations, agents, skills, and KB content live under this directory. Click the path to open it in the OS file manager.</div>
-              </div>
-              <div class="settings-row">
-                <button class="btn btn-sm" id="settings-data-root-btn" type="button" title="" data-i18n-title="settings.data_root.open_tooltip"><span id="settings-data-root-path" class="muted"></span></button>
-              </div>
-            </div>
-
-            <div class="settings-group">
-              <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.clear_all_convs.title">Clear all conversations</div>
-                <div class="settings-group-sub" data-i18n="settings.clear_all_convs.sub">Removes every conversation and its associated message history, attachments, plan, sessions, and search index entries — same cascade as clicking × on a single conversation, applied to all of them. Skills and agents are NOT touched.</div>
-              </div>
-              <div class="settings-row">
-                <button class="btn btn-sm btn-danger" id="settings-clear-all-convs-btn" data-i18n="settings.clear_all_convs.btn">Clear all conversations</button>
-                <span class="settings-status muted" id="settings-clear-all-convs-status"></span>
-              </div>
-            </div>
           </div>
         </div>
       </section>
@@ -885,6 +990,7 @@
   <script src="./modules/avatar-picker.js"></script>
   <script src="./modules/chat-input-form.js"></script>
   <script src="./modules/chat-lightbox.js"></script>
+  <script src="./modules/chat-file-viewer.js"></script>
   <script src="./modules/strip-structural-blocks.js"></script>
   <script src="./modules/projects.js"></script>
   <script src="./modules/project-detail.js"></script>
@@ -946,5 +1052,13 @@
   <script src="./vendor/mathjax/tex-chtml.js" defer></script>
   <script src="./modules/math.js"></script>
   <script src="./modules/settings.js"></script>
+  <script src="./modules/sync_settings.js"></script>
+  <script src="./modules/sync_refresh.js"></script>
+  <script src="./modules/sidebar_status.js"></script>
+  <script src="./modules/devtools-sysinfo.js"></script>
+  <script src="./modules/devtools-relaunch.js"></script>
+  <script src="./modules/devtools-native-search.js"></script>
+  <script src="./modules/devtools-archives.js"></script>
+  <script src="./modules/devtools.js"></script>
 </body>
 </html>

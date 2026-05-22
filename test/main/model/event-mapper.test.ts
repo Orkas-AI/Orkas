@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   mapCoreAgentEvents,
   friendlyRetryReason,
+  extractPersistedOutputPath,
 } from '../../../src/main/model/core-agent/event-mapper';
 
 type AgentRunEvent =
@@ -105,6 +106,64 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     const endEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'end');
     expect(endEvent.event.data.isError).toBe(true);
     expect(endEvent.event.data.result_preview).toContain('exit 1');
+  });
+
+  it('tool_end with small raw result → end event carries `output` (in-memory expand path)', async () => {
+    const body = 'line A\nline B\nline C';
+    const out = await collect([
+      { type: 'tool_start', name: 'read_file', id: 'c1', input: { path: 'x.md' } },
+      { type: 'tool_end', name: 'read_file', id: 'c1', result: body },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ]);
+    const endEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'end');
+    expect(endEvent.event.data.output).toBe(body);
+    expect(endEvent.event.data.result_path).toBeUndefined();
+  });
+
+  it('tool_end with spilled <persisted-output> result → end event carries `result_path`', async () => {
+    // tool-result-cap.ts rewrites oversized tool results into this
+    // marker shape; the model + the event mapper both consume it. The
+    // renderer's click-to-expand uses `result_path` to IPC-read the
+    // full body off disk.
+    const marker =
+      `<persisted-output tool="bash" size="71234" path="/Users/x/.orkas/data/u1/local/tool-results/u1-conv-cid/bash.abc123.txt">\n` +
+      `first 2000 chars …\n\n... [69234 chars omitted] ...\n\nlast 500 chars\n` +
+      `[Full content saved to: /Users/x/.orkas/data/u1/local/tool-results/u1-conv-cid/bash.abc123.txt. Use read_file(path) to retrieve verbatim.]\n` +
+      `</persisted-output>`;
+    const out = await collect([
+      { type: 'tool_start', name: 'bash', id: 'c2', input: { command: 'curl big' } },
+      { type: 'tool_end', name: 'bash', id: 'c2', result: marker },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ]);
+    const endEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'end');
+    expect(endEvent.event.data.result_path)
+      .toBe('/Users/x/.orkas/data/u1/local/tool-results/u1-conv-cid/bash.abc123.txt');
+    expect(endEvent.event.data.result_size).toBe(71234);
+    // When spilled, we do NOT also stuff `output` — the renderer's
+    // click handler exclusively goes through the IPC path. Avoids
+    // duplicating the (potentially large) marker text on the wire.
+    expect(endEvent.event.data.output).toBeUndefined();
+  });
+});
+
+describe('event-mapper › extractPersistedOutputPath', () => {
+  it('pulls path + size from a tool-result-cap marker', () => {
+    const r = extractPersistedOutputPath(
+      '<persisted-output tool="bash" size="123" path="/a/b/c.txt">\npreview\n</persisted-output>'
+    );
+    expect(r).toEqual({ path: '/a/b/c.txt', size: 123 });
+  });
+
+  it('returns null when the result is not a marker (small tool output)', () => {
+    expect(extractPersistedOutputPath('plain bash output')).toBeNull();
+    expect(extractPersistedOutputPath('')).toBeNull();
+    expect(extractPersistedOutputPath(null as unknown as string)).toBeNull();
+  });
+
+  it('returns null for malformed markers (defensive parse)', () => {
+    // Missing size attr — we require BOTH to parse, otherwise the
+    // renderer's expand IPC would have no `size` to report.
+    expect(extractPersistedOutputPath('<persisted-output path="/a/b.txt">x</persisted-output>')).toBeNull();
   });
 });
 

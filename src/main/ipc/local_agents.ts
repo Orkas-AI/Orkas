@@ -1,18 +1,33 @@
 /**
  * IPC handlers for local CLI agent discovery.
  *
- * Three logical channels exposed to the renderer:
- *   - `localAgents.list`       → all known CLI types with availability + version
- *   - `localAgents.detect`     → single-CLI re-probe (bypasses cache)
- *   - `localAgents.listModels` → static model catalog for a CLI type
+ * Logical channels exposed to the renderer:
+ *   - `localAgents.list`             → all known CLI types with availability + version
+ *   - `localAgents.detect`           → single-CLI re-probe (bypasses cache)
+ *   - `localAgents.listModels`       → static model catalog for a CLI type
+ *   - `localAgents.readToolResult`   → read a spilled CLI tool_result file
+ *                                       (renderer click-to-expand)
  *
  * No `run` channel here — the renderer doesn't spawn CLIs directly;
  * dispatch goes through the existing `groupChat` channel and `bus.ts`
  * routes CLI agents into `features/local_agents/runner.ts` (Step 6).
  */
 
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { detectAll, detectOne, invalidateCache, LOCAL_CLI_TYPES, type LocalCliType, type LocalCliEntry } from '../features/local_agents/registry.js';
 import { listModels } from '../features/local_agents/models.js';
+import { getActiveUserId } from '../features/users.js';
+import { userToolResultsDir } from '../paths.js';
+import { createLogger } from '../logger.js';
+
+const log = createLogger('ipc:local_agents');
+
+/** Inline-expand cap. The renderer's <pre> can render a few hundred KB
+ *  without freezing, but past that the user wants an editor anyway. We
+ *  cap reads here AND tell the renderer via `truncated: true` so it
+ *  can suggest opening the file directly. */
+const READ_TOOL_RESULT_MAX_BYTES = 256 * 1024;
 
 function isLocalCliType(v: unknown): v is LocalCliType {
   return typeof v === 'string' && (LOCAL_CLI_TYPES as readonly string[]).includes(v);
@@ -71,5 +86,76 @@ export const invokeHandlers = {
   'localAgents.listModels': async ({ type }: { type?: unknown }) => {
     if (!isLocalCliType(type)) throw new Error('invalid CLI type');
     return { models: listModels(type) };
+  },
+
+  /**
+   * Read a spilled CLI tool_result file. The renderer's click-to-expand
+   * UI calls this with the `outputPath` it received on a `tool-event
+   * phase:'result'` event.
+   *
+   * Hard constraints:
+   *   - Path MUST resolve under the active uid's
+   *     `<uid>/local/tool-results/` directory. Symlink-traversal is
+   *     blocked by realpath-comparing against the canonical root, so a
+   *     compromised CLI can't trick the renderer into reading
+   *     arbitrary files.
+   *   - Read is byte-capped (256 KB inline); larger files truncate
+   *     and set `truncated: true`. The shell.openPath path for "open
+   *     in editor" is a separate IPC, not added in this round.
+   *
+   * Returns `{ok:true, content, truncated}` or `{ok:false, error}`;
+   * never throws across the IPC boundary so a UI bug can't crash the
+   * renderer.
+   */
+  'localAgents.readToolResult': async ({ path: filePath }: { path?: unknown }) => {
+    if (typeof filePath !== 'string' || !filePath) {
+      return { ok: false as const, error: 'invalid path' };
+    }
+    const uid = (() => {
+      try { return getActiveUserId(); }
+      catch { return ''; }
+    })();
+    if (!uid) return { ok: false as const, error: 'no active user' };
+    const rootDir = userToolResultsDir(uid);
+    // Resolve both sides via realpath when they exist, then compare.
+    // The renderer-supplied path may legitimately not exist anymore
+    // (sweep ran, tool-result evicted) — handle ENOENT cleanly.
+    let resolved: string;
+    try {
+      resolved = fs.realpathSync(filePath);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') return { ok: false as const, error: 'file no longer exists' };
+      return { ok: false as const, error: `cannot resolve path: ${(err as Error).message}` };
+    }
+    let rootResolved: string;
+    try { rootResolved = fs.realpathSync(rootDir); }
+    catch { return { ok: false as const, error: 'tool-results dir not found' }; }
+    const rel = path.relative(rootResolved, resolved);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) {
+      log.warn('readToolResult rejected out-of-scope path', { filePath, uid });
+      return { ok: false as const, error: 'path is outside tool-results scope' };
+    }
+    try {
+      const stat = fs.statSync(resolved);
+      if (!stat.isFile()) return { ok: false as const, error: 'not a regular file' };
+      const total = stat.size;
+      if (total <= READ_TOOL_RESULT_MAX_BYTES) {
+        const content = fs.readFileSync(resolved, 'utf8');
+        return { ok: true as const, content, truncated: false };
+      }
+      // Oversized — read head only. Buffer-level slice avoids loading
+      // the whole file into memory.
+      const fd = fs.openSync(resolved, 'r');
+      try {
+        const buf = Buffer.alloc(READ_TOOL_RESULT_MAX_BYTES);
+        fs.readSync(fd, buf, 0, READ_TOOL_RESULT_MAX_BYTES, 0);
+        return { ok: true as const, content: buf.toString('utf8'), truncated: true };
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch (err) {
+      return { ok: false as const, error: (err as Error).message };
+    }
   },
 };

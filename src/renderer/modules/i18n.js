@@ -11,9 +11,13 @@
 //                                         [data-i18n-title] under root (or
 //                                         document)
 //
-// Tables ship under `src/renderer/locales/{zh,en}.json`. We fetch them
-// through the IPC bridge (`window.orkas.getLocales`) — avoids fiddling
-// with sandbox + file:// fetch rules.
+// Tables ship under `src/renderer/locales/{zh,en}.json`. The primary delivery
+// is a synchronous `ipcRenderer.sendSync('orkas:bootI18n')` in preload, which
+// hands the renderer `{lang, tables}` before any DOM script runs — see the
+// `_bootSyncI18n` IIFE below. The async `window.orkas.getLocales` /
+// `getLanguage` IPC pair remains as a fallback inside `initI18n()` for the
+// rare case where preload didn't expose the bundle (handler missing during
+// hot reload, contextBridge crash, ...).
 //
 // Modules that render content dynamically (list rows, dialog messages
 // created on the fly) should register a `window.addEventListener(
@@ -25,6 +29,29 @@ const _i18nLog = createLogger('i18n');
 let _currentLang = 'en';
 let _tables = { zh: {}, en: {} };
 let _ready = false;
+
+// Synchronous boot path. preload.js does `ipcRenderer.sendSync('orkas:bootI18n')`
+// and exposes the result on `window.__orkasI18nBoot` BEFORE any DOM scripts
+// run. By the time this script tag executes (index.html line 1118 — after all
+// data-i18n elements have been parsed), the table + the user's lang are
+// already in hand. Apply translations now and the DOM never paints in the
+// wrong language. If the bundle is missing (preload error / handler not
+// registered), fall through to the async initI18n() flow below.
+(function _bootSyncI18n() {
+  try {
+    const boot = (typeof window !== 'undefined') ? window.__orkasI18nBoot : null;
+    if (!boot || !boot.tables) return;
+    if (boot.lang === 'zh' || boot.lang === 'en') _currentLang = boot.lang;
+    _tables = { zh: boot.tables.zh || {}, en: boot.tables.en || {} };
+    _ready = true;
+    applyDomI18n();
+    document.documentElement.setAttribute('lang', _currentLang);
+  } catch (err) {
+    _i18nLog.warn('sync i18n boot failed; falling back to async', {
+      error: (err && err.message) || String(err),
+    });
+  }
+})();
 
 function _lookup(key, lang) {
   const tbl = _tables[lang];
@@ -60,6 +87,7 @@ async function initI18n() {
   }
   _ready = true;
   applyDomI18n();
+  document.documentElement.setAttribute('lang', _currentLang);
   return _currentLang;
 }
 
@@ -78,6 +106,7 @@ async function setLang(lang) {
     _currentLang = lang;
   }
   applyDomI18n();
+  document.documentElement.setAttribute('lang', _currentLang);
   window.dispatchEvent(new CustomEvent('i18n-change', { detail: { lang: _currentLang } }));
   return _currentLang;
 }

@@ -135,13 +135,24 @@ export const userSessionFile        = (uid: string, sessionId: string) => path.j
 // Curated knowledge base (the "organized" region of the historical
 // two-region contexts design).
 export const userContextsDir        = (uid: string) => path.join(userCloudRoot(uid), 'contexts');
+// Machine-private mirror of contexts/ — holds derived state that must NOT
+// cross devices (currently just the KB vector store; see `userKbDir` below).
+// **Why** mirror the cloud structure under local/ instead of an ad-hoc
+// `<uid>/local/kb/`: keeps the mental model "everything KB lives under
+// .../contexts/.kb/" intact across the cloud/local divide so paths.ts
+// stays grep-able and the migration story is symmetric.
+export const userLocalContextsDir   = (uid: string) => path.join(userLocalRoot(uid), 'contexts');
 
 // Local vector store for the knowledge base (part of the cloud-sync domain,
 // stored in the same directory tree as the text content; on conflict the
 // newer mtime wins). The hidden sub-directory `.kb/` keeps it out of the
 // contexts user-visible listing (listContextsTree filters dotfiles).
 // Runtime WAL/SHM sidecar files are excluded from sync.
-export const userKbDir           = (uid: string) => path.join(userContextsDir(uid), '.kb');
+// KB vector store: machine-private, NOT cloud-synced (multi-device-sync
+// batch 2 decision). Path moved from `<uid>/cloud/contexts/.kb/` (legacy)
+// to `<uid>/local/contexts/.kb/` (current). One-shot rename runs from
+// `util/migrate-kb-to-local.ts` on activateUser.
+export const userKbDir           = (uid: string) => path.join(userLocalContextsDir(uid), '.kb');
 export const userKbVectorDbPath  = (uid: string) => path.join(userKbDir(uid), 'vector.db');
 export const userKbConfigPath    = (uid: string) => path.join(userKbDir(uid), 'config.json');
 
@@ -340,6 +351,23 @@ export const localCliSessionsFile = (uid: string, cid: string) =>
 // paths are machine-specific, so this is never synced.
 export const userWorkspaceConfigFile = (uid: string) => path.join(userLocalRoot(uid), 'workspace.json');
 
+// ── Multi-device sync (machine-private state) ────────────────────────────
+// `<uid>/local/sync/` is the engine's per-machine bookkeeping; nothing here
+// crosses devices (per plan §3.2). `index.json` is the last-synced snapshot
+// (path → {sha256, size, mtime_ms, _v, compressed}), `state.json` carries
+// generation / pending_uploads / device_id, and `conflicts/` retains
+// snapshots for the recovery UX (default 30d; profile-tunable per batch 7).
+export const userSyncDir          = (uid: string) => path.join(userLocalRoot(uid), 'sync');
+export const userSyncIndexFile    = (uid: string) => path.join(userSyncDir(uid), 'index.json');
+export const userSyncStateFile    = (uid: string) => path.join(userSyncDir(uid), 'state.json');
+export const userSyncConflictsDir = (uid: string) => path.join(userSyncDir(uid), 'conflicts');
+// Cached copy of the last-fetched cloud manifest. Read on engine startup so
+// the settings card's storage breakdown can render instantly without
+// waiting for a network round-trip. Refreshed at the end of every
+// successful sync pass.
+export const userSyncManifestCacheFile = (uid: string) =>
+  path.join(userSyncDir(uid), 'manifest_cached.json');
+
 // ── Build-time resources (shipped with installer, read-only) ────────────
 // The 95MB ONNX embedding model ships via electron-builder's `extraResources`
 // (it does not go through asar); dev and packaged builds have different paths:
@@ -411,6 +439,10 @@ export function ensureUserLayout(uid: string): void {
     userSearchDir(uid),
     userFileCacheDir(uid),
     userToolResultsDir(uid),
+    userSyncDir(uid),
+    userSyncConflictsDir(uid),
+    userLocalContextsDir(uid),
+    userKbDir(uid),
   ];
   for (const d of dirs) fs.mkdirSync(d, { recursive: true });
 

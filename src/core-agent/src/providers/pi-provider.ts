@@ -23,12 +23,34 @@ import type {
   KnownProvider,
 } from "@mariozechner/pi-ai";
 
+import * as crypto from "node:crypto";
+
 import type { Message, MessageContent, StreamEvent, StopReason, Usage } from "../shared/types.js";
 import { AuthError, ProviderError, RateLimitError, ContextOverflowError } from "../shared/errors.js";
 import { createLogger } from "../shared/logger.js";
 import type { CompletionParams, CompletionResult, LLMProvider, ToolDefinition } from "./base.js";
 
 const log = createLogger("pi-provider");
+
+/**
+ * Clamp a session id to a provider-safe cache key. OpenAI / Codex / Azure
+ * enforce `prompt_cache_key.length ≤ 64`; pi-ai forwards `options.sessionId`
+ * verbatim to that field. With the dev-mode OAuth flow `reconcileDevUid()`
+ * can install a 36-char GUID uid, after which `<uid>-gmember-<cid>-<aid>`
+ * is 70 chars and OpenAI 400s the request.
+ *
+ * Inputs that fit pass through unchanged so existing 8-digit-uid sessions
+ * keep their readable cache key (and existing cache buckets). Longer ones
+ * collapse to `<prefix>-<sha1hex>` = 22 + 1 + 40 = 63 chars — deterministic
+ * (same session ⇒ same key ⇒ cache still hits) and keeps a recognizable
+ * head for log diagnosis. */
+const MAX_CACHE_KEY_LEN = 64;
+function cacheSafeSessionId(s: string | undefined): string | undefined {
+  if (!s) return s;
+  if (s.length <= MAX_CACHE_KEY_LEN) return s;
+  const hash = crypto.createHash("sha1").update(s).digest("hex");
+  return `${s.slice(0, 22)}-${hash}`;
+}
 
 // ─── Type conversion helpers ──────────────────────────────────────────────
 
@@ -340,6 +362,7 @@ export function createPiProvider(config: {
       const model = resolveModel(providerId, params.model, resolvedModel, config.baseUrl);
       const context = buildPiContext(params.messages, params.systemPrompt, params.tools, model);
       const reasoning = effectiveReasoning(params.reasoning);
+      const sessionId = cacheSafeSessionId(params.sessionId);
 
       log.debug(`complete ${providerId}/${model.id}`);
 
@@ -354,7 +377,7 @@ export function createPiProvider(config: {
             temperature: params.temperature,
             reasoning,
             cacheRetention: params.cacheRetention,
-            sessionId: params.sessionId,
+            sessionId,
             ...(config.onPayload ? { onPayload: config.onPayload as any } : {}),
           });
         } else {
@@ -364,7 +387,7 @@ export function createPiProvider(config: {
             maxTokens: params.maxTokens,
             temperature: params.temperature,
             cacheRetention: params.cacheRetention,
-            sessionId: params.sessionId,
+            sessionId,
             ...(config.onPayload ? { onPayload: config.onPayload as any } : {}),
           });
         }
@@ -391,6 +414,7 @@ export function createPiProvider(config: {
       const model = resolveModel(providerId, params.model, resolvedModel, config.baseUrl);
       const context = buildPiContext(params.messages, params.systemPrompt, params.tools, model);
       const reasoning = effectiveReasoning(params.reasoning);
+      const sessionId = cacheSafeSessionId(params.sessionId);
 
       log.debug(`stream ${providerId}/${model.id}`);
 
@@ -403,7 +427,7 @@ export function createPiProvider(config: {
               temperature: params.temperature,
               reasoning,
               cacheRetention: params.cacheRetention,
-              sessionId: params.sessionId,
+              sessionId,
               ...(config.onPayload ? { onPayload: config.onPayload as any } : {}),
             })
           : piStream(model, context, {
@@ -412,7 +436,7 @@ export function createPiProvider(config: {
               maxTokens: params.maxTokens,
               temperature: params.temperature,
               cacheRetention: params.cacheRetention,
-              sessionId: params.sessionId,
+              sessionId,
               ...(config.onPayload ? { onPayload: config.onPayload as any } : {}),
             });
 

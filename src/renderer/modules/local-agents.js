@@ -107,7 +107,7 @@ async function mountExternalCliSelect(onChange) {
   if (!mount) return null;
   const entries = await loadLocalCliEntries();
   const available = entries.filter(e => e.available);
-  const noneLabel = t('agent_modal.ext_cli_none') || '(none)';
+  const noneLabel = t('agent_modal.ext_cli_none');
   const options = [
     { value: EXT_CLI_NONE, label: noneLabel },
     ...available.map(e => ({

@@ -2512,8 +2512,138 @@ body.model-not-configured .main-content { flex-direction: column; }
 }
 .chat-lightbox-close:hover { background: #f1f5f9; }
 
+/* In-app file preview overlay (chat-file-viewer.js). Mounted once into
+   <body> on first openChatFileViewer(). Same backdrop chrome as the image
+   lightbox; differs in that the stage is a fixed sheet (header + body)
+   instead of a free-floating image. */
+.chat-file-viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: none;
+  align-items: center;
+  justify-content: center;
+}
+.chat-file-viewer.is-open { display: flex; }
+.chat-file-viewer-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.82);
+}
+.chat-file-viewer-stage {
+  position: relative;
+  width: 92vw;
+  height: 92vh;
+  max-width: 1280px;
+  background: #fff;
+  border-radius: 10px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.4);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.chat-file-viewer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid #e2e8f0;
+  background: #f8fafc;
+  flex-shrink: 0;
+}
+.chat-file-viewer-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #0f172a;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  margin-right: 12px;
+}
+.chat-file-viewer-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.chat-file-viewer-reveal,
+.chat-file-viewer-close {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: #475569;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 120ms ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.chat-file-viewer-reveal:hover,
+.chat-file-viewer-close:hover { background: #e2e8f0; color: #0f172a; }
+.chat-file-viewer-reveal svg { display: block; }
+.chat-file-viewer-close { font-size: 20px; }
+.chat-file-viewer-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: #fff;
+}
+/* iframe-based body (pdf / html) fills the body slot. The body itself
+   handles scroll for non-iframe bodies (md / text). */
+.chat-file-viewer-pdf,
+.chat-file-viewer-html {
+  width: 100%;
+  height: 100%;
+  border: none;
+  display: block;
+}
+.chat-file-viewer-md {
+  padding: 24px 32px;
+  color: #0f172a;
+  font-size: 14px;
+  line-height: 1.7;
+  max-width: 880px;
+  margin: 0 auto;
+}
+.chat-file-viewer-text {
+  padding: 20px 24px;
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #0f172a;
+  background: #f8fafc;
+  white-space: pre-wrap;
+  word-break: break-word;
+  min-height: 100%;
+  box-sizing: border-box;
+}
+.chat-file-viewer-loading {
+  padding: 40px;
+  text-align: center;
+  color: #64748b;
+  font-size: 13px;
+}
+
+/* Attachment chips that aren't images / videos are clickable too
+   (chat-file-viewer); surface the affordance with the same hover treatment
+   as image chips. */
+.chat-msg-attach.is-clickable {
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.chat-msg-attach.is-clickable:hover {
+  background: rgba(59, 130, 246, 0.08);
+}
+
 /* Files produced by the assistant (write_file / markdown_to_pdf / html_to_pdf).
-   Same visual language as attachments; click reveals in Finder/Explorer. */
+   Same visual language as attachments; click opens the in-app preview overlay
+   (or, on unsupported types, falls back to a dialog with "open folder"). */
 .chat-msg-produced {
   display: flex;
   flex-wrap: wrap;
@@ -3403,6 +3533,28 @@ body.model-not-configured .main-content { flex-direction: column; }
 .stream-process-line.kind-meta  { color: #94a3b8; }                      /* ▪    fallback / lifecycle meta */
 .stream-process-line.kind-warn  { color: #d97706; }                      /* ○    awaiting approval / cli stderr */
 .stream-process-line.kind-err   { color: #ef4444; font-weight: 500; }   /* ◯ ✗  hard error / failed tool */
+.stream-process-line.kind-info  { color: #6366f1; }                      /* ◇    auto-approved permission audit row */
+
+/* Expandable tool-result row: cursor hint + subtle underline on hover.
+   Used for CLI tool-event(result) rows whose full output spilled to
+   disk; click reveals a `.stream-process-line-full` <pre> sibling. */
+.stream-process-line.is-expandable { cursor: pointer; }
+.stream-process-line.is-expandable:hover { text-decoration: underline; text-decoration-color: rgba(0,0,0,0.25); }
+.stream-process-line-full {
+  margin: 4px 0 8px 16px;
+  padding: 8px 12px;
+  background: rgba(0,0,0,0.04);
+  border-left: 2px solid rgba(0,0,0,0.15);
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #475569;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 320px;
+  overflow: auto;
+}
 
 .stream-final {
   /* Appears below process section with a subtle divider when process is open */
@@ -5367,6 +5519,165 @@ body.model-not-configured .main-content { flex-direction: column; }
   border-bottom: 1px solid var(--border, #e5e7eb);
 }
 .settings-section-head:first-child { margin-top: 0; }
+
+/* 4-tab structure (batch 6 decision). Visual primitive mirrors .marketplace-tabs. */
+.settings-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 0 4px 16px;
+  border-bottom: 1px solid var(--border, #e5e7eb);
+  padding-bottom: 8px;
+}
+.settings-tab {
+  background: transparent;
+  border: none;
+  padding: 6px 14px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--muted);
+  border-radius: 6px;
+  cursor: pointer;
+  position: relative;
+}
+.settings-tab.is-active { background: var(--accent-soft, #eef2ff); color: var(--text); }
+/* Tab title dot — set via .has-dot on the .settings-tab. The same primitive
+   is reused on the sidebar settings button (see Phase 5). */
+.settings-tab.has-dot::after,
+.has-dot::after {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent, #f59e0b);
+  margin-left: 6px;
+  vertical-align: middle;
+}
+.has-dot.is-red::after,
+.settings-tab.has-dot.is-red::after { background: #ef4444; }
+.has-dot.is-orange::after,
+.settings-tab.has-dot.is-orange::after { background: #f59e0b; }
+.settings-tab-pane[hidden] { display: none; }
+
+/* Sync card (data tab). */
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(16, 185, 129, 0.12);
+  color: #047857;
+  margin-right: 8px;
+}
+  max-width: 320px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+  flex: 1;
+  height: 6px;
+  background: var(--border, #e5e7eb);
+  border-radius: 3px;
+  overflow: hidden;
+  max-width: 320px;
+}
+  height: 100%;
+  width: 0%;
+  background: var(--accent, #6366f1);
+  transition: width 200ms ease;
+}
+  color: #b91c1c;
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+  margin-top: 12px;
+  padding: 12px 14px;
+  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  border-radius: 8px;
+  font-size: 13px;
+}
+  font-weight: 600;
+  color: #b91c1c;
+  margin-bottom: 4px;
+}
+  color: var(--text);
+  margin-bottom: 8px;
+}
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+  margin: 6px 0 12px;
+  padding-left: 18px;
+  max-height: 160px;
+  overflow-y: auto;
+  color: var(--text-muted, #6b7280);
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+  /* No horizontal padding — the breakdown rows must left-align with the
+   * quota bar text above (which also sits flush against the group's left
+   * edge). Vertical breathing room only. */
+  margin-top: 10px;
+  padding: 6px 0 4px;
+  font-size: 13px;
+}
+/* Single grid hoisted to the section so all rows share the same column
+ * tracks (otherwise per-row autos sized each row independently and the
+ * size column didn't right-align across rows). Two columns now: name
+ * (1fr, left-aligned) and size (auto, right-aligned). */
+  display: grid;
+  grid-template-columns: 1fr auto;
+  column-gap: 16px;
+  row-gap: 4px;
+  align-items: center;
+  margin: 8px 0 4px;
+  font-size: 12px;
+}
+  grid-column: 1 / -1;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted, #6b7280);
+  margin: 4px 4px 4px;
+}
+/* `display: contents` makes each row's children promote to direct grid
+ * items of the section, so the three columns line up across every row. */
+  display: contents;
+}
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  justify-self: end;
+}
+  margin-top: 12px;
+  font-size: 13px;
+}
+  cursor: pointer;
+  color: var(--text);
+  font-weight: 500;
+  list-style: none;
+  padding: 6px 4px;
+}
+  padding: 6px 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+  font-size: 11px;
+  margin-top: 14px;
+  padding: 8px 10px;
+  background: var(--bg-soft, #f9fafb);
+  border-radius: 6px;
+  line-height: 1.5;
+}
 .settings-section-note {
   font-size: 12px;
   color: var(--text-muted, #6b7280);
@@ -5462,6 +5773,11 @@ body.model-not-configured .main-content { flex-direction: column; }
   user-select: none;
 }
 .settings-row > label.settings-toggle input[type="checkbox"] { margin: 0; }
+/* `.settings-toggle-tight` — variant where the toggle does NOT take the full
+ *  row width; its sibling hint (`.settings-status`) sits right next to it
+ *  instead of being pushed to the far right. Used by the sync card so
+ *  "启用云端同步" + the enabled/disabled hint read as one line. */
+.settings-row > label.settings-toggle.settings-toggle-tight { flex: 0 0 auto; }
 
 /* Shared input style — used inside modals too. */
 .form-input {
@@ -6136,15 +6452,42 @@ body.model-not-configured .main-content { flex-direction: column; }
   cursor: pointer;
 }
 .marketplace-tab.is-active { background: var(--accent-soft, #eef2ff); color: var(--text); }
-.marketplace-search {
+.marketplace-search-wrap {
+  position: relative;
   flex: 1;
   max-width: 320px;
   margin-left: auto;
-  padding: 6px 10px;
+  display: flex;
+}
+.marketplace-search {
+  flex: 1;
+  padding: 6px 28px 6px 10px;
   border: 1px solid rgba(0,0,0,0.1);
   border-radius: 6px;
   font-size: 13px;
 }
+.marketplace-search-clear {
+  position: absolute;
+  right: 5px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+.marketplace-search-clear:hover { background: rgba(0,0,0,0.08); color: var(--text); }
+.marketplace-search-clear[hidden] { display: none; }
+.marketplace-search-btn { flex-shrink: 0; }
 
 .marketplace-categories {
   display: flex;
