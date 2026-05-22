@@ -123,16 +123,51 @@ describe('plan recovery › retryStep', () => {
     expect(fresh?.steps[0].transient_attempts).toBeUndefined();
   });
 
-  it('rejects when the step is not in failed state', async () => {
+  it('rejects terminal states that are not retry results', async () => {
     const cid = newCid();
     await seedPlan(TEST_UID, cid, {
       steps: [{ title: 'Step 1', assignee: A_NAME, wait_for: [] }],
     });
-    // Fresh setPlan leaves status='pending'.
+    const plan = await import('../../../../src/main/features/group_chat/plan');
+    await plan.updateStep(TEST_UID, cid, 1, 'skipped', { failure_reason: 'user skipped it' });
+
     const planExecutor = await import('../../../../src/main/features/group_chat/plan_executor');
     const r = await planExecutor.retryStep(TEST_UID, cid, 1);
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/not in failed state/);
+  });
+
+  it('treats repeated retry after recovery starts as idempotent', async () => {
+    const cid = newCid();
+    await seedPlan(TEST_UID, cid, {
+      steps: [
+        { title: 'Step 1', assignee: A_NAME, wait_for: [] },
+        { title: 'Step 2', assignee: A_NAME },
+        { title: 'Step 3', assignee: A_NAME },
+        { title: 'Step 4', assignee: A_NAME },
+      ],
+    });
+    const plan = await import('../../../../src/main/features/group_chat/plan');
+    await plan.updateStep(TEST_UID, cid, 1, 'in_progress');
+    await plan.updateStep(TEST_UID, cid, 2, 'pending');
+    await plan.updateStep(TEST_UID, cid, 3, 'blocked');
+    await plan.updateStep(TEST_UID, cid, 4, 'done');
+
+    const planExecutor = await import('../../../../src/main/features/group_chat/plan_executor');
+    const inProgress = await planExecutor.retryStep(TEST_UID, cid, 1);
+    const pending = await planExecutor.retryStep(TEST_UID, cid, 2);
+    const blocked = await planExecutor.retryStep(TEST_UID, cid, 3);
+    const done = await planExecutor.retryStep(TEST_UID, cid, 4);
+    expect(inProgress.ok).toBe(true);
+    expect(pending.ok).toBe(true);
+    expect(blocked.ok).toBe(true);
+    expect(done.ok).toBe(true);
+
+    const fresh = await plan.readPlan(TEST_UID, cid);
+    expect(fresh?.steps[0].status).toBe('in_progress');
+    expect(fresh?.steps[1].status).toBe('pending');
+    expect(fresh?.steps[2].status).toBe('blocked');
+    expect(fresh?.steps[3].status).toBe('done');
   });
 
   it('cascade-unblocks downstream skipped via `aborted by step N failure` reason', async () => {

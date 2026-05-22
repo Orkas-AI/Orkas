@@ -17,6 +17,13 @@ let _ctxPendingRename = null;       // {path} — flagged for inline-rename on t
 let _kbStatusByPath = {};           // {[path]: {status, chunks?, error?, kind?}}
 let _kbEventsAbort = null;
 
+function _ctxUiIconHtml(name, className) {
+  if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+    return window.uiIconHtml(name, className);
+  }
+  return '';
+}
+
 async function loadContexts() {
   try {
     const [treeRes, kbRes] = await Promise.all([
@@ -178,7 +185,9 @@ function _renderCtxNodes(nodes, depth = 0) {
     if (n.type === 'dir') {
       const open = _ctxExpanded.has(n.path);
       const caretCls = open ? 'skill-tree-caret' : 'skill-tree-caret collapsed';
-      const icon = open ? ICON_FOLDER_OPEN : ICON_FOLDER_CLOSED;
+      const icon = open
+        ? _ctxUiIconHtml('folder-open', 'skill-tree-node-svg')
+        : _ctxUiIconHtml('folder', 'skill-tree-node-svg');
       const childrenHtml = open
         ? `<div class="skill-tree-children">${_renderCtxNodes(n.children || [], depth + 1)}</div>`
         : '';
@@ -211,7 +220,7 @@ function _renderCtxNodes(nodes, depth = 0) {
       <div class="ctx-tree-wrap" data-path="${escapeHtml(n.path)}" data-type="file" draggable="true">
         <div class="skill-tree-node skill-tree-file${active}" data-ext="${escapeHtml(ext)}" style="padding-left:${indent}px">
           <span class="skill-tree-caret skill-tree-caret-empty"></span>
-          <span class="skill-tree-icon icon-file" data-ext="${escapeHtml(ext)}">${ICON_FILE}</span>
+          <span class="skill-tree-icon icon-file" data-ext="${escapeHtml(ext)}">${_ctxUiIconHtml('file', 'skill-tree-node-svg')}</span>
           ${labelHtml}
           ${chip}
           <button type="button" class="ctx-row-menu-btn" data-menu title="${moreTitle}" aria-label="${moreTitle}">⋯</button>
@@ -999,9 +1008,12 @@ function _showCtxBinaryViewer(rel, kind) {
   const els = _prepCtxViewerShell(rel);
   if (!els) return;
   const kindLabel = t(`contexts.viewer.kind_${kind}`) || kind.toUpperCase();
+  const icon = (typeof window !== 'undefined' && typeof window.fileKindIconHtml === 'function')
+    ? window.fileKindIconHtml(rel, kind)
+    : '';
   els.bodyEl.innerHTML = `
     <div class="ctx-viewer-binary">
-      <div class="ctx-viewer-binary-icon">${kind === 'pdf' ? '📄' : kind === 'docx' ? '📘' : '📎'}</div>
+      <div class="ctx-viewer-binary-icon">${icon}</div>
       <div class="ctx-viewer-binary-name">${escapeHtml(rel)}</div>
       <div class="ctx-viewer-binary-hint">${escapeHtml(t('contexts.viewer.binary_hint', { kind: kindLabel }))}</div>
       <button class="btn btn-primary" id="ctx-viewer-reveal-big">${escapeHtml(t('contexts.viewer.open_system'))}</button>
@@ -1122,9 +1134,8 @@ function _ctxClearDraft(path) {
   if (key) _ctxDrafts.delete(key);
 }
 
-// Toolbar definition. `kind` keys map to `_ctxApplyMd()` cases; `icon` uses
-// Unicode glyphs only (CLAUDE.md §8 — no colored emoji on process-info-style
-// rails); `label` is the i18n key for the title tooltip.
+// Toolbar definition. `kind` keys map to `_ctxApplyMd()` cases; SVG icons
+// come from icons.js; `label` is the i18n key for the title tooltip.
 const _CTX_EDITOR_TOOLBAR = [
   { kind: 'h1', icon: 'H1', label: 'contexts.editor.tb.h1' },
   { kind: 'h2', icon: 'H2', label: 'contexts.editor.tb.h2' },
@@ -1134,17 +1145,17 @@ const _CTX_EDITOR_TOOLBAR = [
   { kind: 'italic', icon: 'I', label: 'contexts.editor.tb.italic', cls: 'is-italic' },
   { kind: 'strike', icon: 'S', label: 'contexts.editor.tb.strike', cls: 'is-strike' },
   { kind: 'sep' },
-  { kind: 'ul', icon: '•', label: 'contexts.editor.tb.ul' },
-  { kind: 'ol', icon: '1.', label: 'contexts.editor.tb.ol' },
-  { kind: 'quote', icon: '“', label: 'contexts.editor.tb.quote' },
+  { kind: 'ul', iconName: 'list', label: 'contexts.editor.tb.ul' },
+  { kind: 'ol', iconName: 'list-ordered', label: 'contexts.editor.tb.ol' },
+  { kind: 'quote', iconName: 'quote', label: 'contexts.editor.tb.quote' },
   { kind: 'sep' },
-  { kind: 'code', icon: '<>', label: 'contexts.editor.tb.code' },
-  { kind: 'codeblock', icon: '{ }', label: 'contexts.editor.tb.codeblock' },
+  { kind: 'code', iconName: 'code', label: 'contexts.editor.tb.code' },
+  { kind: 'codeblock', iconName: 'code-block', label: 'contexts.editor.tb.codeblock' },
   { kind: 'sep' },
-  { kind: 'link', icon: '↗', label: 'contexts.editor.tb.link' },
-  { kind: 'image', icon: '▣', label: 'contexts.editor.tb.image' },
+  { kind: 'link', iconName: 'link', label: 'contexts.editor.tb.link' },
+  { kind: 'image', iconName: 'image', label: 'contexts.editor.tb.image' },
   { kind: 'sep' },
-  { kind: 'todo', icon: '☐', label: 'contexts.editor.tb.todo' },
+  { kind: 'todo', iconName: 'square', label: 'contexts.editor.tb.todo' },
 ];
 
 function _enterCtxEdit() {
@@ -1174,10 +1185,15 @@ function _ctxRenderEditor() {
     if (item.kind === 'sep') return `<span class="ctx-editor-toolbar-sep" aria-hidden="true"></span>`;
     const disabled = _ctxEditPreview ? 'disabled' : '';
     const extraCls = item.cls ? ` ${item.cls}` : '';
-    return `<button type="button" class="btn btn-sm btn-icon ctx-editor-tb-btn${extraCls}" data-kind="${item.kind}" title="${escapeHtml(t(item.label))}" ${disabled}>${escapeHtml(item.icon)}</button>`;
+    const icon = item.iconName && typeof window !== 'undefined' && typeof window.uiIconHtml === 'function'
+      ? window.uiIconHtml(item.iconName, 'ui-icon ctx-editor-svg-icon')
+      : escapeHtml(item.icon || '');
+    return `<button type="button" class="btn btn-sm btn-icon ctx-editor-tb-btn${extraCls}" data-kind="${item.kind}" title="${escapeHtml(t(item.label))}" ${disabled}>${icon}</button>`;
   }).join('');
   const toggleKey = _ctxEditPreview ? 'contexts.editor.tb.edit_back' : 'contexts.editor.tb.preview';
-  const toggleIcon = _ctxEditPreview ? '✎' : '◐';
+  const toggleIcon = typeof window !== 'undefined' && typeof window.uiIconHtml === 'function'
+    ? window.uiIconHtml(_ctxEditPreview ? 'pencil' : 'eye', 'ui-icon ctx-editor-toggle-icon')
+    : '';
   const draft = _ctxEditDraft;
   const bodyHtml = _ctxEditPreview
     ? `<div class="ctx-viewer-md markdown-body ctx-editor-preview">${draft.trim() ? renderMarkdown(draft) : `<div class="ctx-viewer-msg">${escapeHtml(t('contexts.editor.preview_empty'))}</div>`}</div>`
@@ -1186,7 +1202,7 @@ function _ctxRenderEditor() {
     <div class="ctx-editor-toolbar" role="toolbar">
       ${toolbarHtml}
       <span class="ctx-editor-toolbar-spacer"></span>
-      <button type="button" class="btn btn-sm ctx-editor-toggle" id="ctx-editor-toggle" title="${escapeHtml(t(toggleKey))}">${toggleIcon} ${escapeHtml(t(toggleKey))}</button>
+      <button type="button" class="btn btn-sm ctx-editor-toggle" id="ctx-editor-toggle" title="${escapeHtml(t(toggleKey))}">${toggleIcon}<span>${escapeHtml(t(toggleKey))}</span></button>
     </div>
     <div class="ctx-editor-body">${bodyHtml}</div>
   `;

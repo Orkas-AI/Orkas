@@ -270,6 +270,9 @@ export interface ChatFormPayload {
   /** `agent_id` of the agent that owns this form. The submission is routed
    *  back to this id (the bus will @-prefix on the user's behalf). */
   agent_id: string;
+  /** Executor-created user forms use this to bind the form submission to
+   *  the exact plan step it is allowed to complete. Agent forms omit it. */
+  plan_step_index?: number;
   fields: AgentInput[];
   submitted: boolean;
   values?: Record<string, unknown>;

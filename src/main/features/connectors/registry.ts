@@ -30,6 +30,7 @@
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as crypto from 'node:crypto';
 import { Mutex } from 'async-mutex';
 
 import { userConnectorsConfigFile } from '../../paths';
@@ -40,7 +41,7 @@ import type { ConnectorInstance, ConnectorsFile, OAuthGrant, DcrClientCredential
 const log = createLogger('connectors:registry');
 const _writeMutex = new Mutex();
 
-const EMPTY: ConnectorsFile = { version: 1, connections: {} };
+const EMPTY: ConnectorsFile = { version: 2, connections: {} };
 
 // On-disk shape: ConnectorInstance with all token-bearing fields collapsed into one
 // vault-encrypted `secrets_enc` string. **`transport` is in the blob too** — even though it's
@@ -142,9 +143,9 @@ function _readSync(uid: string): ConnectorsFile {
     if (code !== 'ENOENT') {
       log.warn('reading connectors.json failed', { error: (err as Error).message });
     }
-    return { version: 1, connections: {} };
+    return { version: 2, connections: {} };
   }
-  if (!raw.trim()) return { version: 1, connections: {} };
+  if (!raw.trim()) return { version: 2, connections: {} };
 
   // Legacy whole-file vault format: decrypt once, plaintext JSON already has oauth_grant /
   // dcr_client as plain fields per instance — return as-is. Next write upgrades to per-field.
@@ -152,17 +153,17 @@ function _readSync(uid: string): ConnectorsFile {
     const json = _tryDecrypt(uid, raw);
     if (json === null) {
       log.warn('decrypt connectors.json (legacy whole-file) failed with both seeds — treating as empty');
-      return { version: 1, connections: {} };
+      return { version: 2, connections: {} };
     }
     try {
       const obj = JSON.parse(json);
       if (obj && typeof obj === 'object' && obj.connections && typeof obj.connections === 'object') {
-        return { version: 1, connections: obj.connections as Record<string, ConnectorInstance> };
+        return { version: 2, connections: obj.connections as Record<string, ConnectorInstance> };
       }
     } catch (err) {
       log.warn('parse connectors.json (legacy whole-file) failed', { error: (err as Error).message });
     }
-    return { version: 1, connections: {} };
+    return { version: 2, connections: {} };
   }
 
   // Current format: plaintext JSON envelope, secrets_enc per instance.
@@ -173,12 +174,12 @@ function _readSync(uid: string): ConnectorsFile {
       for (const [id, disk] of Object.entries(obj.connections as Record<string, InstanceOnDisk>)) {
         conns[id] = _hydrateSecrets(uid, disk);
       }
-      return { version: 1, connections: conns };
+      return { version: 2, connections: conns };
     }
   } catch (err) {
     log.warn('parse connectors.json failed', { error: (err as Error).message });
   }
-  return { version: 1, connections: {} };
+  return { version: 2, connections: {} };
 }
 
 function _writeSync(uid: string, data: ConnectorsFile): void {
@@ -224,7 +225,7 @@ export function load(uid: string): ConnectorsFile {
 function _rt(grant: ConnectorInstance['oauth_grant']): string {
   const t = grant?.refresh_token;
   if (!t) return 'none';
-  return t.slice(0, 12) + (t.length > 12 ? '…' : '');
+  return crypto.createHash('sha256').update(t).digest('hex').slice(0, 12);
 }
 
 export async function upsert(uid: string, inst: ConnectorInstance): Promise<void> {

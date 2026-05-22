@@ -6,9 +6,16 @@ let _selectedAgent = null; // { id, name, source }
 let _agentEditing = false;
 let _agentFieldSaveTimer = null;
 
+function _agentUiIconHtml(name, className) {
+  if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+    return window.uiIconHtml(name, className);
+  }
+  return '';
+}
+
 // Mirror of `agents.ts::RESERVED_AGENT_NAMES` so the renderer can fail fast
 // without a round-trip. Server is still authoritative — this is just UX.
-const _RESERVED_AGENT_NAMES = new Set(['指挥官', '总指挥', 'commander']);
+const _RESERVED_AGENT_NAMES = new Set(['指挥官', '总指挥', 'コマンダー', '司令官', 'commander']);
 /** Look up the localized "External · <Brand>" label for an agent runtime
  *  type. The external badge (formerly "CLI · X") is the single
  *  user-facing tag for cli-runtime agents — name surfaces consistently
@@ -61,7 +68,7 @@ function _resolveCategoryLabel(code, lang) {
   const list = (typeof _mpCategoriesCache !== 'undefined' && _mpCategoriesCache) || [];
   const c = list.find((x) => x.code === code);
   if (!c) return code;
-  return lang === 'zh' ? (c.name_zh || c.name_en || code) : (c.name_en || c.name_zh || code);
+  return pickLocalizedName(c, lang) || code;
 }
 
 // Mirror of `agents.ts::NAME_TOKEN_RE` so the form rejects junk before
@@ -204,7 +211,7 @@ function renderAgentsGrid(agents) {
         <div class="agent-card-actions">
           ${cliChip}${platformChips}
           <button type="button" class="agent-card-use" data-agent-use title="${useTitle}" aria-label="${useTitle}">
-            <svg class="icon-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><polygon points="5,3 5,13 13,8" fill="currentColor"/></svg>
+            ${_agentUiIconHtml('play-triangle', 'icon-play')}
           </button>
         </div>
       </div>
@@ -490,7 +497,7 @@ function _renderSourceMetaHtml(item) {
   if (catCode) {
     const lang = (typeof getLang === 'function') ? getLang() : 'zh';
     const cat = Array.isArray(_mpCategoriesCache) ? _mpCategoriesCache.find((c) => c.code === catCode) : null;
-    const label = cat ? (lang === 'zh' ? (cat.name_zh || cat.name_en || catCode) : (cat.name_en || cat.name_zh || catCode)) : catCode;
+    const label = cat ? (pickLocalizedName(cat, lang) || catCode) : catCode;
     parts.push(`<span class="agents-detail-source is-category">${escapeHtml(label)}</span>`);
   }
   const uid = String(item.create_uid || '').trim();
@@ -572,9 +579,6 @@ function _renderAgentDetail(agent, editing) {
     editBtn.textContent = editing ? t('agents.edit_btn_done') : (t('agents.edit_btn_edit') + editSuffix);
   }
   _renderAgentEnabledButton({ id: agent.agent_id, enabled: agent.enabled !== false });
-
-  _renderAgentConnectorsSection(agent, editing);
-  _renderAgentOutputFormatSection(agent);
 
   _toggleAgentFieldEditable(editing);
 }
@@ -760,7 +764,9 @@ async function _renderAgentDetailRuntime(agent) {
       ? baseLabel : currentType;
     options.push({
       value: `cli:${currentType}`,
-      label: `${labelText} ${t('agent.cli_missing')}`,
+      label: labelText,
+      hint: t('agent.cli_missing'),
+      iconName: 'warning',
     });
   }
   if (options.length === 0) {
@@ -787,7 +793,7 @@ async function _renderAgentDetailRuntime(agent) {
       const lang = (typeof getLang === 'function') ? getLang() : 'zh';
       const prev = (typeof getCliDefaults === 'function') ? getCliDefaults(currentType) : null;
       const next2 = (typeof getCliDefaults === 'function') ? getCliDefaults(newCli) : null;
-      const prevDescLocal = prev ? (lang === 'en' ? prev.description_en : prev.description_zh) : '';
+      const prevDescLocal = prev ? pickDesc(prev, lang) : '';
       const curName = (agent.name || '').trim();
       const curDescLocal = pickDesc(agent, lang).trim();
       // Same default-like detection as the create modal: bare default OR
@@ -1101,9 +1107,7 @@ function _applyExternalCliDefaults(cliType, { force = false } = {}) {
   if (!nameEl || !descEl) return;
 
   const lang = (typeof getLang === 'function') ? getLang() : 'zh';
-  const localizedDesc = defaults
-    ? (lang === 'en' ? defaults.description_en : defaults.description_zh)
-    : '';
+  const localizedDesc = defaults ? pickDesc(defaults, lang) : '';
   const targetName = defaults ? defaults.name : '';
   const targetDesc = localizedDesc;
 
@@ -1112,7 +1116,7 @@ function _applyExternalCliDefaults(cliType, { force = false } = {}) {
   // name and gets a refreshed description. "Default-like name" also covers
   // dedup suffixes like "Claude Code 2" (added to dodge name-taken errors).
   const prev = (typeof getCliDefaults === 'function') ? getCliDefaults(_extActiveCli) : null;
-  const prevDescLocalized = prev ? (lang === 'en' ? prev.description_en : prev.description_zh) : '';
+  const prevDescLocalized = prev ? pickDesc(prev, lang) : '';
 
   const nameUntouched = force || _isDefaultlikeName(nameEl.value, prev?.name);
   const descUntouched = force
@@ -1171,32 +1175,8 @@ function openAgentModal() {
     mountMarketplaceCategorySelect('agent-ext-category-select').catch(() => {});
   }
 
-  // Output-format dropdown (Create tab only — External/CLI agents don't read the worker prompt
-  // hint). Default `markdown_only` matches the new "opt-in to richer formats" stance documented
-  // in PC/CLAUDE.md §6; detail-page dropdown does the same 3-option set + maps legacy values.
-  _mountAgentOutputFormatCreateSelect();
-
   modal.classList.add('open');
   setTimeout(() => document.getElementById('agent-name-input')?.focus(), 50);
-}
-
-function _mountAgentOutputFormatCreateSelect() {
-  const slot = document.getElementById('agent-output-format-select');
-  if (!slot) return;
-  slot.innerHTML = '';
-  const mount = document.createElement('div');
-  mount.className = 'ai-select';
-  slot.appendChild(mount);
-  const options = [
-    { value: 'markdown_only', label: t('agents.output_format_markdown_only') || 'Markdown only' },
-    { value: 'dashboard',     label: t('agents.output_format_dashboard')     || 'Dashboard (no artifact)' },
-    { value: 'artifact',      label: t('agents.output_format_artifact')      || 'Artifact (Dashboard + HTML)' },
-  ];
-  _aiSelectMount(mount, {
-    options,
-    value: 'markdown_only',
-    onChange: () => { /* dataset.value is the source of truth for save */ },
-  });
 }
 window.openAgentModal = openAgentModal;
 
@@ -1243,13 +1223,10 @@ async function _saveCreateAgent({ msgEl }) {
   }
 
   const category = document.getElementById('agent-category-select')?.dataset.value || '';
-  // Output-format pick from the modal's dropdown. Default `markdown_only` if for some reason the
-  // dataset wasn't stamped (defensive — _mountAgentOutputFormatCreateSelect always sets it).
-  const outputFormat = document.getElementById('agent-output-format-select')?.dataset.value || 'markdown_only';
 
   try {
     const avatar = randomAgentAvatar();
-    const body = { name, description, icon: avatar.icon, color: avatar.color, category, output_format: outputFormat };
+    const body = { name, description, icon: avatar.icon, color: avatar.color, category };
     const res = await apiFetch('/api/agents/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1315,8 +1292,9 @@ async function _saveExternalAgent({ msgEl }) {
   // both fully-translated can edit each side later.
   const defaults = (typeof getCliDefaults === 'function') ? getCliDefaults(cli) : null;
   const lang = (typeof getLang === 'function') ? getLang() : 'zh';
-  const description_zh = lang === 'zh' ? desc : (defaults ? defaults.description_zh : desc);
-  const description_en = lang === 'en' ? desc : (defaults ? defaults.description_en : desc);
+  const editingZh = descriptionLocale(lang) === 'zh';
+  const description_zh = editingZh ? desc : (defaults ? defaults.description_zh : desc);
+  const description_en = editingZh ? (defaults ? defaults.description_en : desc) : desc;
 
   const category = document.getElementById('agent-ext-category-select')?.dataset.value || '';
 
@@ -1942,4 +1920,3 @@ function bindAgentPickers() {
   }
 
 }
-

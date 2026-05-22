@@ -69,6 +69,7 @@ const _IPC_ROUTES = [
   ['POST',   /^\/api\/conversations\/([^/]+)\/plan\/steps\/(\d+)\/skip$/,  'groupChat.skipStep',  ['cid', 'stepIndex']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/events\/stream$/, 'groupChat.events',      ['cid'], { stream: true }],
   ['POST',   /^\/api\/conversations\/([^/]+)\/form-submitted$/, 'groupChat.markFormSubmitted', ['cid']],
+  ['POST',   /^\/api\/conversations\/([^/]+)\/marketplace-install$/, 'groupChat.resolveMarketplaceInstallRequest', ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/attachments$/,      'conversations.attachments.list',   ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/attachments\/upload$/, { upload: 'conversations.attachments.upload' }, ['cid']],
   ['DELETE', /^\/api\/conversations\/([^/]+)\/attachments$/,      'conversations.attachments.delete', ['cid']],
@@ -268,4 +269,3 @@ function apiFetch(url, options) {
 
   return window.orkas.invoke(channel, payload).then(_mockJsonResponse);
 }
-

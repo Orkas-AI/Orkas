@@ -180,7 +180,7 @@ function setView(view, cid, opts = {}) {
     if (isConvPending(cid) && !opts.skipLoad && !streamBubbleAlive) {
       const state = pendingConvs.get(cid);
       // Will be (re)appended after history loads — handled in loadConversationHistory
-      state.needsIndicator = true;
+      if (state) state.needsIndicator = true;
     }
     // Restore input draft + queue panel for this conversation
     if (!opts.skipLoad) _restoreDraft(cid);
@@ -256,4 +256,3 @@ function setView(view, cid, opts = {}) {
     currentCid = null;
   }
 }
-

@@ -4,6 +4,13 @@ const _skillsLog = createLogger('skills');
 let _skillsCache = null;
 let _selectedSkill = null;    // { source, id }
 
+function _skillUiIconHtml(name, className) {
+  if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+    return window.uiIconHtml(name, className);
+  }
+  return '';
+}
+
 /** Version + category + author chips for a marketplace-installed skill. Mirrors the
  *  marketplace card footer. `_resolveCategoryLabel` is defined in `agents.js` (flat top-level
  *  scope per CLAUDE.md §8). Author chip: `create_uid='0'` → 官方 badge; non-zero → user badge. */
@@ -158,7 +165,7 @@ function renderSkillsGrid(skills) {
         <div class="skill-card-actions">
           ${platformChips}
           <button type="button" class="skill-card-use" data-skill-use title="${useTitle}" aria-label="${useTitle}">
-            <svg class="icon-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><polygon points="5,3 5,13 13,8" fill="currentColor"/></svg>
+            ${_skillUiIconHtml('play-triangle', 'icon-play')}
           </button>
         </div>
       </div>
@@ -442,10 +449,10 @@ async function expandSkillTree(source, id, childrenEl) {
   bindTreeNodes(childrenEl, source, id);
 }
 
-// SVG icons for tree nodes
-const ICON_FOLDER_CLOSED = '<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.3a1.5 1.5 0 0 1 1.2.6l.9 1.2a1.5 1.5 0 0 0 1.2.6H16a1.5 1.5 0 0 1 1.5 1.5V14a1.5 1.5 0 0 1-1.5 1.5H4A1.5 1.5 0 0 1 2.5 14V5.5Z"/></svg>';
-const ICON_FOLDER_OPEN = '<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5.5A1.5 1.5 0 0 1 4.5 4h3.1a1.5 1.5 0 0 1 1.2.6l.9 1.2a1.5 1.5 0 0 0 1.2.6H16a1.5 1.5 0 0 1 1.5 1.5V8"/><path d="M2.2 9.2A1 1 0 0 1 3.2 8h13.6a1 1 0 0 1 .97 1.24l-1.2 5A1.5 1.5 0 0 1 15.1 15.4H4.2a1.5 1.5 0 0 1-1.46-1.16l-1.1-4.6a1 1 0 0 1 .06-.44Z"/></svg>';
-const ICON_FILE = '<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5H5.5A1.5 1.5 0 0 0 4 4v12a1.5 1.5 0 0 0 1.5 1.5h9A1.5 1.5 0 0 0 16 16V7l-4.5-4.5Z"/><path d="M11 2.5V7h4.5"/></svg>';
+// Tree icons are centralized in modules/icons.js; classes here only control sizing/color.
+const ICON_FOLDER_CLOSED = _skillUiIconHtml('folder', 'skill-tree-node-svg');
+const ICON_FOLDER_OPEN = _skillUiIconHtml('folder-open', 'skill-tree-node-svg');
+const ICON_FILE = _skillUiIconHtml('file', 'skill-tree-node-svg');
 
 function fileIconSvg(ext) {
   // Generic file icon; color is differentiated via data-ext
@@ -1487,4 +1494,3 @@ function _renderSkillEnabledButton(skill) {
     finally { btn.disabled = false; }
   });
 }
-

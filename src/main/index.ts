@@ -129,20 +129,25 @@ import * as chatsFeature from './features/chats';
 import * as searchFeature from './features/search';
 import * as authFeature from './features/auth';
 import * as appConfig from './features/config';
+import { getRendererTables } from './i18n';
 import * as reflectionTrigger from './features/reflection-trigger';
 import * as scheduledTasks from './features/scheduled_tasks';
 import * as chatAttachments from './features/chat_attachments';
 import * as chatArtifacts from './features/chat_artifacts';
 // `features/sync/*` and `ipc/sync.ts` are stripped in OrkasOpen (depends on account).
 import * as connectorsFeature from './features/connectors';
+import * as windowState from './features/window_state';
 // (sync + relay both depend on account; connectors depends on the Server OAuth bridge).
 
 
 function createWindow(): BrowserWindow {
   const dev = !app.isPackaged;
+  const dev = false;
+  const restored = windowState.restoreWindowState();
   const win = new BrowserWindow({
     width: 1280,
     height: 800,
+    ...restored.bounds,
     title: '',
     backgroundColor: '#ffffff',
     icon: path.join(paths.SRC_ROOT, 'resources', 'icons', 'icon.png'),
@@ -160,6 +165,8 @@ function createWindow(): BrowserWindow {
       plugins: true,
     },
   });
+  windowState.watchWindowState(win);
+  if (restored.isMaximized) win.maximize();
 
   win.loadFile(path.join(paths.SRC_ROOT, 'renderer', 'index.html'));
 
@@ -228,10 +235,7 @@ function registerIpc(): void {
   ipcMain.on('orkas:bootI18n', (event) => {
     try {
       const lang = appConfig.getLanguage();
-      const localesDir = path.join(paths.SRC_ROOT, 'renderer', 'locales');
-      const zh = JSON.parse(fs.readFileSync(path.join(localesDir, 'zh.json'), 'utf-8'));
-      const en = JSON.parse(fs.readFileSync(path.join(localesDir, 'en.json'), 'utf-8'));
-      event.returnValue = { ok: true, lang, tables: { zh, en } };
+      event.returnValue = { ok: true, lang, tables: getRendererTables() };
     } catch (err) {
       log.warn('bootI18n failed', { error: (err as Error)?.message });
       event.returnValue = { ok: false };
@@ -720,7 +724,6 @@ if (!gotLock) {
     connectorsFeature.bootstrap(users.getActiveUserId()).catch(() => {
       /* errors logged inside the feature; never block app startup */
     });
-    createWindow();
 
     // Background: pick up any out-of-band changes to source files (sync
     // drop-in, manual edits) into the search idx. Query path does not run

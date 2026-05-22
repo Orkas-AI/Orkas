@@ -15,6 +15,10 @@ const path = require('node:path');
 
 module.exports = async function afterPack(context) {
   if (context.electronPlatformName !== 'darwin') return;
+  if (process.env.CSC_LINK || process.env.CSC_NAME) {
+    console.log('[codesign-adhoc] formal signing env detected; skipping ad-hoc signing');
+    return;
+  }
   const appName = context.packager.appInfo.productFilename;
   const appPath = path.join(context.appOutDir, `${appName}.app`);
   console.log(`[codesign-adhoc] signing ${appPath}`);

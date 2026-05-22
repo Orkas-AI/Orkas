@@ -75,7 +75,8 @@ export class SkillLoader {
    * splicing into a system prompt so the LLM knows what skills exist and
    * when to reach for each one. Returns empty string if no skills.
    *
-   * `lang` selects which description (zh / en) is rendered; falls back per
+   * `lang` selects which description is rendered; unsupported description
+   * locales use English first, then fall back per
    * `pickDescription`. Defaults to `'en'` for safety in non-UI callers.
    */
   // Default convenience renderer for hosts without their own block builder.
@@ -87,7 +88,7 @@ export class SkillLoader {
   // need to consult a separate path-constants section. Other hosts may use
   // this default helper, in which case Source is taken from the dirs[]
   // basename.
-  renderSystemPromptBlock(lang: 'zh' | 'en' = 'en'): string {
+  renderSystemPromptBlock(lang: string = 'en'): string {
     const skills = this.list();
     if (!skills.length) return "";
     const lines = ["## Available skills (skills)", ""];

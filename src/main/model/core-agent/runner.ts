@@ -32,6 +32,7 @@ import { appendAgentSkill } from '../../features/agents';
 const log = createLogger('model/runner');
 import { createLocalTools, createFileTools } from './local-tools';
 import { createKbTools } from './kb-tools';
+import { createChatHistoryTools } from './chat-history-tools';
 import { createImageGenTool } from './image-gen-tool';
 import { createWebSearchOverrideTool } from './search-tools';
 import { sessionToolResultsDir, agentEvolvedSkillsDir } from '../../paths';
@@ -271,6 +272,14 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // (matches file-tools).
   const kbTools = uid ? createKbTools({ userId: uid }) : [];
 
+  // Conversation-history tools (chat_search + chat_read). Read-only and
+  // lower-priority than KB: useful for "what did we discuss before" recall,
+  // not an authoritative facts source.
+  const chatHistoryTools = uid ? createChatHistoryTools({
+    userId: uid,
+    ...(params.cid ? { currentCid: params.cid } : {}),
+  }) : [];
+
   // Image generation. Permission-gated like local-tools; reuses
   // localExec.granted (writing image bytes is the same blast radius as
   // write_file). Skipped when uid is unknown — generateImage needs the
@@ -340,6 +349,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...localTools,
     ...fileTools,
     ...kbTools,
+    ...chatHistoryTools,
     ...imageGenTools,
     ...searchOverrideTools,
     ...(params.extraTools || []),

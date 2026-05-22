@@ -8,11 +8,10 @@
  * cooldown window — see `reflection-trigger.ts` for the call site.
  *
  * Scope:
- *   - `<uid>-gconv-*.jsonl` (commander session) AND
- *   - `<uid>-gmember-<cid>-<aid>.jsonl` (agent worker session) for the
- *     target agent — added per plan §1.3 P0 because agent worker tool
- *     calls / errors are the largest reflection blind spot when only
- *     the commander session is read.
+ *   - Only `<uid>-gconv-*.jsonl` are scanned (main conversations).
+ *     Subagent invocations are not in scope (the `sub` kind has been
+ *     deprecated; group_chat `gmember` sessions are the new home for
+ *     per-agent histories).
  *
  * Output target: ~800 chars, ~250 tokens.
  */
@@ -21,7 +20,6 @@ import * as fs from 'node:fs';
 import { userSessionFile } from '../paths';
 import { createLogger } from '../logger';
 import { listConversations, type Conversation } from './chats';
-import { buildGmemberSessionId } from './group_chat/state';
 
 const log = createLogger('reflection-digest');
 
@@ -159,43 +157,26 @@ export async function buildAgentReflectionDigest(
 
   for (const conv of convs) {
     if (!targetMatches(conv.agent_id || '')) continue;
-    // Two sessions per matched conv: the commander gconv-* (already on
-    // conv.session_id), and — when the target agent is a specific one
-    // (not '_default') — the agent worker's gmember-* derived from
-    // (cid, agentId). _default = commander-only convs.
-    const sessionIds: string[] = [];
-    if (conv.session_id) sessionIds.push(conv.session_id);
-    if (agentId !== '_default') {
-      sessionIds.push(buildGmemberSessionId(conv.conversation_id, agentId));
+    if (!conv.session_id) continue;
+    let file: string;
+    try { file = userSessionFile(uid, conv.session_id); }
+    catch { continue; }
+    let stat: fs.Stats;
+    try { stat = fs.statSync(file); }
+    catch { continue; }
+    if (stat.mtimeMs < sinceMs) continue;
+
+    let raw: string;
+    try { raw = fs.readFileSync(file, 'utf8'); }
+    catch (err) { log.warn(`read ${file} failed: ${(err as Error).message}`); continue; }
+    const messages: any[] = [];
+    for (const line of raw.split('\n')) {
+      if (!line.trim()) continue;
+      try { messages.push(JSON.parse(line)); }
+      catch { /* skip malformed line */ }
     }
-    for (const sessionId of sessionIds) {
-      _scanSessionFile(uid, sessionId, sinceMs, metrics);
-    }
+    aggregateSession(messages, metrics);
   }
 
   return formatDigest(metrics, sinceMs, nowMs);
-}
-
-/** Read one session jsonl (gated by mtime), parse lines, fold into metrics.
- *  Logs warn + skips on read errors so a single corrupt file doesn't break
- *  the digest. */
-function _scanSessionFile(uid: string, sessionId: string, sinceMs: number, metrics: SessionMetrics): void {
-  let file: string;
-  try { file = userSessionFile(uid, sessionId); }
-  catch { return; }
-  let stat: fs.Stats;
-  try { stat = fs.statSync(file); }
-  catch { return; }
-  if (stat.mtimeMs < sinceMs) return;
-
-  let raw: string;
-  try { raw = fs.readFileSync(file, 'utf8'); }
-  catch (err) { log.warn(`read ${file} failed: ${(err as Error).message}`); return; }
-  const messages: any[] = [];
-  for (const line of raw.split('\n')) {
-    if (!line.trim()) continue;
-    try { messages.push(JSON.parse(line)); }
-    catch { /* skip malformed line */ }
-  }
-  aggregateSession(messages, metrics);
 }

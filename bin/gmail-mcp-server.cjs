@@ -652,8 +652,12 @@ async function main() {
   await server.connect(transport);
 }
 
-main().catch((err) => {
-  // Last-resort log to stderr; PC's main process tails this when diagnosing spawn failures.
-  process.stderr.write(`gmail-mcp-server fatal: ${err && err.message || err}\n`);
-  process.exit(1);
-});
+module.exports = { TOOLS, callTool };
+
+if (require.main === module) {
+  main().catch((err) => {
+    // Last-resort log to stderr; PC's main process tails this when diagnosing spawn failures.
+    process.stderr.write(`gmail-mcp-server fatal: ${err && err.message || err}\n`);
+    process.exit(1);
+  });
+}

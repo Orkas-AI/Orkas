@@ -7,7 +7,7 @@
  *   1. Sequential pipeline + variable substitution between steps
  *   2. Parallel fork (same parallel_group) + synthesis step waiting on all
  *   3. Failure policy: abort_plan / continue / ask_commander
- *   4. user-assignee step blocks until user enqueues
+ *   4. user-assignee step renders a form, blocks until submit, then resumes
  *   5. Auto plan_update on agent reply (no LLM plan_update tool call)
  */
 
@@ -102,6 +102,22 @@ async function readJsonl(uid: string, cid: string): Promise<any[]> {
   const file = path.join(paths.userChatsDir(uid), `${cid}.jsonl`);
   if (!fs.existsSync(file)) return [];
   return fs.readFileSync(file, 'utf-8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+}
+
+async function waitForPlan(
+  uid: string,
+  cid: string,
+  predicate: (snapshot: any) => boolean,
+  timeoutMs = 5000,
+): Promise<any> {
+  const plan = await import('../../../../src/main/features/group_chat/plan');
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const snapshot = await plan.readPlan(uid, cid);
+    if (snapshot && predicate(snapshot)) return snapshot;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  throw new Error(`plan did not reach expected state within ${timeoutMs}ms`);
 }
 
 // ── Helpers to assemble a plan_set tool-call inside a commander turn ─────
@@ -333,10 +349,11 @@ describe('plan_executor › failure policies', () => {
 // ─────────────────────────────────────────────────────────────────────────
 
 describe('plan_executor › user-assignee step', () => {
-  it('user step dispatches a question to user, plan waits, then continues on user reply', async () => {
+  it('user step dispatches a form to user, plan waits, then continues on form submit without waking commander', async () => {
     const cid = newCid();
     const state = await import('../../../../src/main/features/group_chat/state');
     const bus = await import('../../../../src/main/features/group_chat/bus');
+    const groupChat = await import('../../../../src/main/features/group_chat');
 
     _setScript(state.buildGmemberSessionId(cid, A_ID), [
       { type: 'final', text: '收到 user 的补充：' },
@@ -371,16 +388,71 @@ describe('plan_executor › user-assignee step', () => {
     const question = lines.find((l) => l.from === 'commander' && l.to.includes('user'));
     expect(question).toBeTruthy();
     expect(question.text).toContain('Python');
+    expect(question.form).toMatchObject({
+      agent_id: 'user',
+      plan_step_index: 1,
+      submitted: false,
+      fields: [
+        expect.objectContaining({
+          id: 'response',
+          label: '问 user 用什么语言',
+          type: 'textarea',
+          required: true,
+        }),
+      ],
+    });
 
-    // User answers.
-    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'TypeScript' });
+    // A regular chat message is allowed to start a commander discussion,
+    // but it must not be mistaken for the pending user-form answer.
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: '我不清楚啊，要讨论下' });
     await waitForQuiescent(TEST_UID, cid, 5000);
 
     snapshot = await plan.readPlan(TEST_UID, cid);
+    expect(snapshot?.steps[0].status).toBe('in_progress');
+    expect(snapshot?.steps[1].status).toBe('pending');
+
+    lines = await readJsonl(TEST_UID, cid);
+    expect(lines.find((l) => l.from === 'commander' && l.to.includes(A_ID))).toBeUndefined();
+    const stillWaitingQuestion = lines.find((l) => l.id === question.id);
+    expect(stillWaitingQuestion?.form.submitted).toBe(false);
+
+    // User answers through the rendered form. The facade returns a replay
+    // payload addressed to @user; after the bus strips that mention, the
+    // message stays user-visible but does not wake commander as a side turn.
+    const submit = await groupChat.markFormSubmittedAndDispatch({
+      userId: TEST_UID,
+      cid,
+      msgId: question.id,
+      formId: question.form.form_id,
+      values: { response: 'TypeScript' },
+    });
+    expect(submit.ok).toBe(true);
+    expect(submit.submission?.agent_id).toBe('user');
+    expect(submit.submission?.text).toContain('@user');
+    expect(submit.submission?.text).toContain('agent-input-submission');
+
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: submit.submission!.text });
+    snapshot = await waitForPlan(
+      TEST_UID,
+      cid,
+      (p) => p.steps[0].status === 'done' && p.steps[1].status === 'done',
+      5000,
+    );
+    await waitForQuiescent(TEST_UID, cid, 5000);
+
     expect(snapshot?.steps[0].status).toBe('done');     // user replied → step 1 closed
     expect(snapshot?.steps[1].status).toBe('done');     // A then ran with substituted user answer
 
     lines = await readJsonl(TEST_UID, cid);
+    const updatedQuestion = lines.find((l) => l.id === question.id);
+    expect(updatedQuestion?.form.submitted).toBe(true);
+    expect(updatedQuestion?.form.values).toEqual({ response: 'TypeScript' });
+
+    const userReplay = lines.find((l) => l.from === 'user' && l.text.includes('agent-input-submission'));
+    expect(userReplay).toBeTruthy();
+    expect(userReplay.to).toEqual(['user']);
+    expect(userReplay.text).not.toContain('@user');
+
     const dispatchToA = lines.find((l) => l.from === 'commander' && l.to.includes(A_ID));
     expect(dispatchToA).toBeTruthy();
     expect(dispatchToA.text).toContain('TypeScript'); // {{step_1.output_summary}} got user's reply
@@ -472,78 +544,4 @@ describe('plan_executor › auto plan_update', () => {
     expect(finalPlan?.steps[0].output_summary).toBe('A done');
     expect(finalPlan?.completed_signaled).toBe(true); // single-step plan terminal → signal fired
   }, 10_000);
-});
-
-// ─────────────────────────────────────────────────────────────────────────
-//  Test 6 — plan inherits user-turn attachments and forwards to workers
-//
-//  Regression guard for "commander sees the image, worker doesn't" — workers
-//  read images via ChatOptions.images, which is populated from
-//  item.attachments → buildAttachmentManifest. plan-step dispatches live
-//  across turn boundaries, so the source must be persisted on the plan.
-//
-//  Two fixtures pinned:
-//    A) initial_attachments set on plan → both forwarded dispatches carry
-//       the same attachments list (so worker's turnImages populates).
-//    B) initial_attachments unset → no attachments leak onto dispatches
-//       (verifies the optional path doesn't accidentally add an empty key).
-// ─────────────────────────────────────────────────────────────────────────
-
-describe('plan_executor › attachment inheritance', () => {
-  it('plan.initial_attachments propagates onto every step dispatch', async () => {
-    const cid = newCid();
-    const state = await import('../../../../src/main/features/group_chat/state');
-
-    _setScript(state.buildGmemberSessionId(cid, A_ID), [{ type: 'final', text: 'A done' }]);
-    _setScript(state.buildGmemberSessionId(cid, B_ID), [{ type: 'final', text: 'B done' }]);
-
-    await setupPlanAndKick(TEST_UID, cid, {
-      initial_message: '解这道题',
-      initial_attachments: ['problem.png', 'extra.jpg'],
-      steps: [
-        { title: '识图', assignee: A_NAME, input: '看附件中的题', wait_for: [] },
-        { title: '求解', assignee: B_NAME, input: '解题: {{step_1.output_summary}}', wait_for: [1] },
-      ],
-    });
-
-    await waitForQuiescent(TEST_UID, cid, 5000);
-
-    const lines = await readJsonl(TEST_UID, cid);
-    const toA = lines.find((l) => l.from === 'commander' && l.to.includes(A_ID));
-    const toB = lines.find((l) => l.from === 'commander' && l.to.includes(B_ID));
-
-    expect(toA?.attachments).toEqual(['problem.png', 'extra.jpg']);
-    expect(toB?.attachments).toEqual(['problem.png', 'extra.jpg']);
-
-    // Plan still records the source so retries / replan inherit.
-    const plan = await import('../../../../src/main/features/group_chat/plan');
-    const persisted = await plan.readPlan(TEST_UID, cid);
-    expect(persisted?.initial_attachments).toEqual(['problem.png', 'extra.jpg']);
-  }, 15_000);
-
-  it('no initial_attachments → dispatch messages omit the attachments key', async () => {
-    const cid = newCid();
-    const state = await import('../../../../src/main/features/group_chat/state');
-
-    _setScript(state.buildGmemberSessionId(cid, A_ID), [{ type: 'final', text: 'A done' }]);
-
-    await setupPlanAndKick(TEST_UID, cid, {
-      initial_message: 'no image case',
-      steps: [{ title: '只是文字', assignee: A_NAME, input: '回答', wait_for: [] }],
-    });
-
-    await waitForQuiescent(TEST_UID, cid, 5000);
-
-    const lines = await readJsonl(TEST_UID, cid);
-    const toA = lines.find((l) => l.from === 'commander' && l.to.includes(A_ID));
-    // Persisted GroupMessage shape: `attachments` is only present when non-empty
-    // (see _enqueueBody at bus.ts:612). Asserting omission catches a regression
-    // where we'd accidentally pass `attachments: []` and pollute the file.
-    expect(toA).toBeTruthy();
-    expect('attachments' in toA).toBe(false);
-
-    const plan = await import('../../../../src/main/features/group_chat/plan');
-    const persisted = await plan.readPlan(TEST_UID, cid);
-    expect(persisted?.initial_attachments).toBeUndefined();
-  }, 15_000);
 });

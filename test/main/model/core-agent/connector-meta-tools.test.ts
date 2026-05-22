@@ -97,6 +97,14 @@ const GITHUB_TOOLS: ToolSchema[] = [
   },
 ];
 
+const GOOGLE_WORKSPACE_TOOLS: ToolSchema[] = [
+  { name: 'send_message', description: '[Gmail] Send Gmail.', input_schema: { type: 'object', properties: {} } },
+  { name: 'list_events', description: '[Calendar] List calendar events.', input_schema: { type: 'object', properties: {} } },
+  { name: 'get_document', description: '[Docs] Read Google Docs.', input_schema: { type: 'object', properties: {} } },
+  { name: 'read_sheet', description: '[Sheets] Read Google Sheets.', input_schema: { type: 'object', properties: {} } },
+  { name: 'list_tasks', description: '[Tasks] List Google Tasks.', input_schema: { type: 'object', properties: {} } },
+];
+
 const UID = 'u-meta-001';
 
 beforeEach(() => {
@@ -389,6 +397,64 @@ describe('list_connector_tools', () => {
     const { createConnectorMetaTools } = await loadModule();
     const [listTools] = await createConnectorMetaTools({ userId: UID, agentId: 'a1' });
     const r = await runTool(listTools, { connector_id: 'github' });
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_CONNECTOR_NOT_VISIBLE');
+  });
+
+  it('dedupes Google Workspace tools when the matching single-service connector is also visible', async () => {
+    fixtures.instances = [
+      makeInstance({ id: 'google-workspace', display_name: 'Google Workspace', tools: GOOGLE_WORKSPACE_TOOLS }),
+      makeInstance({
+        id: 'gmail',
+        display_name: 'Gmail',
+        tools: [
+          { name: 'send_message', description: 'Send Gmail.', input_schema: { type: 'object', properties: {} } },
+        ],
+      }),
+    ];
+    const { createConnectorMetaTools } = await loadModule();
+    const [listTools] = await createConnectorMetaTools({ userId: UID });
+
+    const workspace = await runTool(listTools, { connector_id: 'google-workspace' });
+    expect(workspace.isError).toBeFalsy();
+    expect(workspace.content).not.toContain('### send_message');
+    expect(workspace.content).toContain('### list_events');
+
+    const gmail = await runTool(listTools, { connector_id: 'gmail' });
+    expect(gmail.isError).toBeFalsy();
+    expect(gmail.content).toContain('### send_message');
+  });
+
+  it('keeps Google Workspace Gmail tools when Gmail is not visible separately', async () => {
+    fixtures.instances = [
+      makeInstance({ id: 'google-workspace', display_name: 'Google Workspace', tools: GOOGLE_WORKSPACE_TOOLS }),
+    ];
+    const { createConnectorMetaTools } = await loadModule();
+    const [listTools] = await createConnectorMetaTools({ userId: UID });
+    const r = await runTool(listTools, { connector_id: 'google-workspace' });
+
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('### send_message');
+    expect(r.content).toContain('### list_events');
+  });
+
+  it('hides Google Workspace entirely when all of its service tools are shadowed by single-service connectors', async () => {
+    fixtures.instances = [
+      makeInstance({ id: 'google-workspace', display_name: 'Google Workspace', tools: GOOGLE_WORKSPACE_TOOLS }),
+      makeInstance({ id: 'gmail', tools: [{ name: 'send_message', description: '', input_schema: {} }] }),
+      makeInstance({ id: 'gcal', tools: [{ name: 'list_events', description: '', input_schema: {} }] }),
+      makeInstance({ id: 'gdocs', tools: [{ name: 'get_document', description: '', input_schema: {} }] }),
+      makeInstance({ id: 'gsheets', tools: [{ name: 'read_sheet', description: '', input_schema: {} }] }),
+      makeInstance({ id: 'gtasks', tools: [{ name: 'list_tasks', description: '', input_schema: {} }] }),
+    ];
+    const { getConnectorPromptBlock, createConnectorMetaTools } = await loadModule();
+
+    const block = await getConnectorPromptBlock(UID, undefined);
+    expect(block).not.toContain('**google-workspace**');
+    expect(block).toContain('**gmail**');
+
+    const [listTools] = await createConnectorMetaTools({ userId: UID });
+    const r = await runTool(listTools, { connector_id: 'google-workspace' });
     expect(r.isError).toBe(true);
     expect(r.content).toContain('E_CONNECTOR_NOT_VISIBLE');
   });

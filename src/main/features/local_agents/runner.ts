@@ -284,41 +284,14 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   // shows the human-readable CLI name; model = version string when
   // detected, falling back to the user-picked model id, falling back
   // to "(default)".
-  const brand = _cliBrandLabel(opts.cli);
-  const modelDisplay = entry.version
-    ? `${entry.version}${opts.model ? ` · ${opts.model}` : ''}`
-    : (opts.model || '(default)');
-    // Date-prefixed id matching the LLM-archive convention. Without
-    // it, archive filenames mix random-hex (CLI runId) with
-    // date-prefixed (LLM newArchiveId) and the lexicographic sort in
-    // `listFilesDesc` puts hex BEFORE dates regardless of when the
-    // run actually happened — the panel ends up out of order AND the
-    // 30-slot prune drops recent LLM calls. The runtime runId is
-    // preserved separately on `local-agent-runs/<runId>/`.
-    id: newArchiveId(new Date(startedAtMs)),
-    startedAt: startedAtIso,
-    endedAt: new Date(endedAtMs).toISOString(),
-    durationMs: endedAtMs - startedAtMs,
-    userId: opts.uid,
-    sessionId: `cli-${opts.cli}-${handle.runId}`,
-    input: {
-      message: opts.prompt,
-      provider: brand,
-      model: modelDisplay,
-    },
-    context: {
-      agentId: opts.agentId,
-      cid: opts.cid,
-      workingDir: opts.cwd,
-      hasAbortSignal: true,
-    },
-    events: archiveEvents,
-    output: {
-      text: finalOutput,
-      aborted: terminal.status === 'cancelled',
-      error: terminal.error || null,
-    },
-  });
+  // The dev devtools LLM-call archive is stripped from this build; the runtime
+  // `local-agent-runs/<runId>/` directory is the only persistence path.
+  void _cliBrandLabel(opts.cli);
+  void entry.version;
+  void startedAtMs;
+  void endedAtMs;
+  void startedAtIso;
+  void archiveEvents;
   return { runId: handle.runId, status: terminal.status, output: finalOutput, error: terminal.error };
 }
 

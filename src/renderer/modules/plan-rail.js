@@ -9,7 +9,7 @@
  *   - On `failed` steps (and only when state.in_flight is empty),
  *     surface retry / skip / abort actions wired to IPC
  *   - On `pending` steps with `transient_attempts > 0`, render a small
- *     `🔁 N/2` badge so users see the auto-retry in flight (otherwise the
+ *     retry badge so users see the auto-retry in flight (otherwise the
  *     transient retry would silently look like the step is just stuck)
  *   - Click a step row → scroll chat-history to that step's `output_msg_id`
  *
@@ -22,22 +22,141 @@ const _planRailLog = createLogger('plan-rail');
 // FIXED status → icon mapping. Single source of truth — no LLM input,
 // no backend, no locales should ever inject a different glyph.
 const STATUS_ICON = {
-  pending:     '⏳',
-  in_progress: '▶️',
-  done:        '✅',
-  failed:      '❌',
-  skipped:     '⏭️',
-  blocked:     '📝',
+  pending:     'hourglass',
+  in_progress: 'play',
+  done:        'check-circle',
+  failed:      'x-circle',
+  skipped:     'skip-forward',
+  blocked:     'document-pencil',
 };
-const TRANSIENT_BADGE_ICON = '🔁';
+const TRANSIENT_BADGE_ICON = 'refresh';
 const MAX_TRANSIENT_RETRIES = 2; // mirrors plan_executor.ts
+
+function _planIcon(name, className) {
+  if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') return window.uiIconHtml(name, className || 'ui-icon plan-rail-svg-icon');
+  return '';
+}
 
 let _currentCid = null;
 let _currentInFlight = [];
 let _refreshInflight = null;  // dedup overlapping refresh requests
+let _refreshSeq = 0;          // invalidate stale forced refresh responses
+let _lastPlan = null;
+const _stepActionRequests = new Set();
 
 function _isStepActionable(step, inFlight) {
   return step.status === 'failed' && (!inFlight || inFlight.length === 0);
+}
+
+function _stepActionKey(cid, stepIndex) {
+  return `${cid || ''}:${Number(stepIndex) || 0}`;
+}
+
+function _hasStepActionRequest(step) {
+  if (!_currentCid || !step) return false;
+  return _stepActionRequests.has(_stepActionKey(_currentCid, step.index));
+}
+
+function _setStepActionRequest(cid, stepIndex, pending) {
+  const key = _stepActionKey(cid, stepIndex);
+  if (pending) _stepActionRequests.add(key);
+  else _stepActionRequests.delete(key);
+}
+
+function _clearStepActionRequests(cid) {
+  const prefix = `${cid || ''}:`;
+  for (const key of Array.from(_stepActionRequests)) {
+    if (!cid || key.startsWith(prefix)) _stepActionRequests.delete(key);
+  }
+}
+
+function _pruneStepActionRequests(plan) {
+  if (!_currentCid || !plan || !Array.isArray(plan.steps)) return;
+  const liveSteps = new Set(
+    plan.steps
+      .filter(Boolean)
+      .map((s) => _stepActionKey(_currentCid, s.index)),
+  );
+  const prefix = `${_currentCid}:`;
+  for (const key of Array.from(_stepActionRequests)) {
+    if (key.startsWith(prefix) && !liveSteps.has(key)) _stepActionRequests.delete(key);
+  }
+}
+
+function _lockRenderedStepActions(stepEl) {
+  if (!stepEl) return;
+  stepEl.querySelectorAll('[data-action]').forEach((el) => {
+    el.disabled = true;
+    el.setAttribute('aria-disabled', 'true');
+  });
+}
+
+function _applyOptimisticStepStatus(cid, stepIndex, status, patch = {}) {
+  if (!cid || cid !== _currentCid || !_lastPlan || !Array.isArray(_lastPlan.steps)) return;
+  const steps = _lastPlan.steps.map((step) => {
+    if (!step || Number(step.index) !== Number(stepIndex)) return step;
+    return { ...step, ...patch, status };
+  });
+  _render({ ..._lastPlan, steps });
+}
+
+function _rerenderCachedPlan() {
+  if (_lastPlan) _render(_lastPlan);
+}
+
+function _beginStepAction(cid, stepIndex, stepEl, optimistic = null) {
+  _setStepActionRequest(cid, stepIndex, true);
+  // A recovery click changes the local interaction contract immediately:
+  // any older plan fetch that resolves after this point must not repaint the
+  // failed row and resurrect retry / skip / abort while the POST is in flight.
+  _refreshSeq += 1;
+  _refreshInflight = null;
+  _lockRenderedStepActions(stepEl);
+  if (optimistic && optimistic.status) {
+    _applyOptimisticStepStatus(cid, stepIndex, optimistic.status, optimistic.patch || {});
+  } else {
+    _rerenderCachedPlan();
+  }
+}
+
+async function _finishStepAction(cid, stepIndex, opts = {}) {
+  const refreshPromise = PlanRail.refresh(cid, { force: true });
+  if (opts.refreshInfo) _refreshConversationInfo(cid);
+  if (opts.clearAfterRefresh) {
+    try { await refreshPromise; }
+    finally {
+      _setStepActionRequest(cid, stepIndex, false);
+      if (cid === _currentCid) _rerenderCachedPlan();
+    }
+    return;
+  }
+  _setStepActionRequest(cid, stepIndex, false);
+  if (opts.rerender && cid === _currentCid) _rerenderCachedPlan();
+}
+
+function _refreshConversationInfo(cid) {
+  if (window.ConversationInfo && typeof window.ConversationInfo.refresh === 'function') {
+    window.ConversationInfo.refresh(cid, { silent: true });
+  }
+}
+
+async function _postStepAction(cid, stepIndex, action) {
+  const res = await apiFetch(
+    `/api/conversations/${encodeURIComponent(cid)}/plan/steps/${stepIndex}/${action}`,
+    { method: 'POST' },
+  );
+  return res.json().catch(() => ({}));
+}
+
+function _alertStepActionFailure(action, reason) {
+  const normalized = reason || 'unknown';
+  if (action === 'retry') {
+    uiAlert(t('plan.error.retry_failed', { reason: normalized }) || `Retry failed: ${normalized}`);
+  } else if (action === 'skip') {
+    uiAlert(t('plan.error.skip_failed', { reason: normalized }) || `Skip failed: ${normalized}`);
+  } else if (action === 'abort') {
+    uiAlert(t('plan.error.abort_failed', { reason: normalized }) || `Abort failed: ${normalized}`);
+  }
 }
 
 function _formatAssigneeMeta(raw) {
@@ -50,7 +169,7 @@ function _formatAssigneeMeta(raw) {
 }
 
 function _buildStepHtml(step) {
-  const icon = STATUS_ICON[step.status] || STATUS_ICON.pending;
+  const icon = _planIcon(STATUS_ICON[step.status] || STATUS_ICON.pending, 'ui-icon plan-rail-svg-icon');
   const num  = `${step.index}.`;
   const title = escapeHtml(step.title || '');
   // assignee literals `commander` / `user` are role tokens (commander wrote them via
@@ -60,12 +179,13 @@ function _buildStepHtml(step) {
   const meta = _formatAssigneeMeta(step.assignee);
   const transient = (step.status === 'pending' || step.status === 'in_progress')
     && Number(step.transient_attempts) > 0
-    ? `<span class="plan-rail-step-transient">${TRANSIENT_BADGE_ICON} ${step.transient_attempts}/${MAX_TRANSIENT_RETRIES}</span>`
+    ? `<span class="plan-rail-step-transient">${_planIcon(TRANSIENT_BADGE_ICON, 'ui-icon plan-rail-transient-icon')}<span>${step.transient_attempts}/${MAX_TRANSIENT_RETRIES}</span></span>`
     : '';
   const reason = step.failure_reason
     ? `<div class="plan-rail-step-reason">${escapeHtml(step.failure_reason)}</div>`
     : '';
-  const actions = _isStepActionable(step, _currentInFlight)
+  const actionRequested = _hasStepActionRequest(step);
+  const actions = _isStepActionable(step, _currentInFlight) && !actionRequested
     ? `<div class="plan-rail-step-actions">
          <button type="button" class="btn btn-sm" data-action="retry" data-i18n="plan.action.retry">${escapeHtml(t('plan.action.retry'))}</button>
          <button type="button" class="btn btn-sm" data-action="skip"  data-i18n="plan.action.skip">${escapeHtml(t('plan.action.skip')  || 'Skip')}</button>
@@ -102,14 +222,17 @@ function _render(plan) {
   // right).
   const wrap = root.closest('.chat-input-wrapper');
   if (!plan || !Array.isArray(plan.steps) || plan.steps.length === 0) {
+    _lastPlan = null;
     root.style.display = 'none';
     body.innerHTML = '';
     progress.textContent = '';
     if (wrap) wrap.classList.remove('has-plan-rail');
     return;
   }
+  _lastPlan = plan;
   root.style.display = '';
   if (wrap) wrap.classList.add('has-plan-rail');
+  _pruneStepActionRequests(plan);
   progress.textContent = _buildProgressText(plan);
   body.innerHTML = plan.steps.map(_buildStepHtml).join('');
 }
@@ -127,11 +250,12 @@ async function _fetchPlan(cid) {
   }
 }
 
-async function _doRefresh(cid) {
+async function _doRefresh(cid, seq) {
   if (!cid) return;
   if (cid !== _currentCid) return;  // view switched mid-fetch
   const plan = await _fetchPlan(cid);
   if (cid !== _currentCid) return;
+  if (seq !== _refreshSeq) return;
   _render(plan);
 }
 
@@ -144,6 +268,8 @@ const PlanRail = {
   bind(cid) {
     _currentCid = cid || null;
     _currentInFlight = [];
+    _clearStepActionRequests();
+    _refreshSeq += 1;
     // Drop any pending refresh from the previous cid — its result would
     // race with this bind's fetch and could write stale content into the
     // DOM. The cid-mismatch guard inside _doRefresh covers most of it,
@@ -160,17 +286,23 @@ const PlanRail = {
     _currentCid = null;
     _currentInFlight = [];
     _refreshInflight = null;
+    _refreshSeq += 1;
+    _clearStepActionRequests();
     _render(null);
   },
 
-  /** Re-fetch + re-render. Coalesces concurrent calls for the SAME cid;
-   *  bind() is responsible for clearing the slot when cid changes. */
-  refresh(cid) {
+  /** Re-fetch + re-render. Coalesces concurrent calls for the SAME cid unless
+   *  force=true, which is used after user actions so stale pre-click fetches
+   *  cannot re-enable old recovery buttons. */
+  refresh(cid, opts = {}) {
     if (!cid || cid !== _currentCid) return;
-    if (_refreshInflight) return _refreshInflight;
+    if (_refreshInflight && !opts.force) return _refreshInflight;
+    const seq = ++_refreshSeq;
     _refreshInflight = (async () => {
-      try { await _doRefresh(cid); }
-      finally { _refreshInflight = null; }
+      try { await _doRefresh(cid, seq); }
+      finally {
+        if (seq === _refreshSeq) _refreshInflight = null;
+      }
     })();
     return _refreshInflight;
   },
@@ -180,6 +312,7 @@ const PlanRail = {
   setInFlight(cid, inFlight) {
     if (cid !== _currentCid) return;
     _currentInFlight = Array.isArray(inFlight) ? inFlight.slice() : [];
+    _rerenderCachedPlan();
     PlanRail.refresh(cid);
   },
 };
@@ -217,53 +350,71 @@ document.addEventListener('click', async (ev) => {
   const btn = ev.target.closest('[data-action]');
   if (btn) {
     ev.stopPropagation();
+    if (btn.disabled) return;
     const stepEl = btn.closest('[data-step-index]');
     const stepIndex = stepEl ? Number(stepEl.dataset.stepIndex) : NaN;
     const cid = _currentCid;
     if (!cid || !Number.isFinite(stepIndex)) return;
+    if (_stepActionRequests.has(_stepActionKey(cid, stepIndex))) return;
     const action = btn.dataset.action;
     if (action === 'retry') {
+      _beginStepAction(cid, stepIndex, stepEl, {
+        status: 'pending',
+        patch: {
+          failure_reason: '',
+          output_msg_id: '',
+          transient_attempts: 0,
+        },
+      });
       try {
-        const res = await apiFetch(
-          `/api/conversations/${encodeURIComponent(cid)}/plan/steps/${stepIndex}/retry`,
-          { method: 'POST' },
-        );
-        const data = await res.json().catch(() => ({}));
+        const data = await _postStepAction(cid, stepIndex, 'retry');
         if (!data?.ok) {
-          uiAlert(t('plan.error.retry_failed', { reason: data?.error || 'unknown' }) || `Retry failed: ${data?.error || 'unknown'}`);
+          _alertStepActionFailure('retry', data?.error);
         }
       } catch (err) {
-        uiAlert(t('plan.error.retry_failed', { reason: err && err.message }) || `Retry failed: ${err && err.message}`);
+        _alertStepActionFailure('retry', err && err.message);
+      } finally {
+        await _finishStepAction(cid, stepIndex, { refreshInfo: true, clearAfterRefresh: true });
       }
       return;
     }
     if (action === 'skip') {
+      _beginStepAction(cid, stepIndex, stepEl);
       const ok = await uiConfirm(t('plan.confirm.skip'));
-      if (!ok) return;
+      if (!ok) {
+        await _finishStepAction(cid, stepIndex, { rerender: true });
+        return;
+      }
       try {
-        const res = await apiFetch(
-          `/api/conversations/${encodeURIComponent(cid)}/plan/steps/${stepIndex}/skip`,
-          { method: 'POST' },
-        );
-        const data = await res.json().catch(() => ({}));
+        const data = await _postStepAction(cid, stepIndex, 'skip');
         if (!data?.ok) {
-          uiAlert(t('plan.error.skip_failed', { reason: data?.error || 'unknown' }) || `Skip failed: ${data?.error || 'unknown'}`);
+          _alertStepActionFailure('skip', data?.error);
+        } else {
+          _applyOptimisticStepStatus(cid, stepIndex, 'skipped');
         }
       } catch (err) {
-        uiAlert(t('plan.error.skip_failed', { reason: err && err.message }) || `Skip failed: ${err && err.message}`);
+        _alertStepActionFailure('skip', err && err.message);
+      } finally {
+        await _finishStepAction(cid, stepIndex, { refreshInfo: true, clearAfterRefresh: true });
       }
       return;
     }
     if (action === 'abort') {
+      _beginStepAction(cid, stepIndex, stepEl);
       const ok = await uiConfirm(t('plan.confirm.abort'));
-      if (!ok) return;
+      if (!ok) {
+        await _finishStepAction(cid, stepIndex, { rerender: true });
+        return;
+      }
       try {
         await apiFetch(
           `/api/conversations/${encodeURIComponent(cid)}/abort`,
           { method: 'POST' },
         );
       } catch (err) {
-        uiAlert(t('plan.error.abort_failed', { reason: err && err.message }) || `Abort failed: ${err && err.message}`);
+        _alertStepActionFailure('abort', err && err.message);
+      } finally {
+        await _finishStepAction(cid, stepIndex, { refreshInfo: true, clearAfterRefresh: true });
       }
       return;
     }

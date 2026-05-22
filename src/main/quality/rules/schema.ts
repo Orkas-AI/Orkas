@@ -124,17 +124,12 @@ export function validateAgentJsonShape(
   const en = typeof agentJson.description_en === 'string' ? agentJson.description_en.trim() : '';
   const legacy = typeof agentJson.description === 'string' ? agentJson.description.trim() : '';
   if (!zh && !en && !legacy) {
-    // MEDIUM, not EXTREME: agents are commonly created as a stub
-    // (createCustomAgent with no body) and filled in via the inline
-    // edit chat afterwards. Blocking the create breaks that flow.
-    // The commander will simply not pick a description-less agent
-    // until the user fills it in — non-fatal.
     out.push({
-      level: 'MEDIUM',
+      level: 'EXTREME',
       rule: 'agent_description_missing',
       field: 'agent.json:description',
       snippet: '',
-      suggested_fix: 'Add `description_zh` and `description_en` so the commander can dispatch this agent in either UI language.',
+      suggested_fix: 'Agent spec must include `description_zh` and `description_en` so the commander can dispatch correctly in either UI language.',
     });
   } else {
     for (const [field, value] of [

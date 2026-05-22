@@ -12,6 +12,8 @@
  * MCP connection up. Tokens are lazily refreshed at boot / refresh-tools / reconnect; mid-call
  * expiry surfaces as a tool error and the user re-clicks "刷新工具".
  */
+import * as crypto from 'node:crypto';
+
 import * as registry from './registry';
 import { McpConnection } from './mcp-client';
 import { findCatalogEntry } from './catalog';
@@ -44,12 +46,11 @@ const REFRESH_BUFFER_MS = 5 * 60 * 1000;
 function _now(): number { return Date.now(); }
 function _nowIso(): string { return new Date().toISOString(); }
 
-/** Truncated token fingerprint for diagnostic logs — first 12 chars is enough to correlate
- *  across PC + Server logs without leaking the full token. Returns 'none' for missing tokens
- *  and 'null' for the literal-null fallback some refresh endpoints emit. */
+/** Non-reversible token fingerprint for diagnostic logs. Twelve SHA-256 hex chars are enough
+ *  to correlate PC + Server events without leaking a usable token prefix. */
 function _tokPrefix(t: string | null | undefined): string {
   if (!t) return 'none';
-  return t.slice(0, 12) + (t.length > 12 ? '…' : '');
+  return crypto.createHash('sha256').update(t).digest('hex').slice(0, 12);
 }
 
 /** Refresh the access_token if stale, dedupe concurrent callers, and persist the rotated grant
@@ -57,9 +58,9 @@ function _tokPrefix(t: string | null | undefined): string {
  *  another caller that just released the lock may have written a new grant; using the caller's
  *  in-memory `inst` snapshot would re-trigger an unnecessary (and stale-token-using!) refresh.
  *
- *  Diagnostic logging: every refresh attempt prints the RT prefix being sent so a future
+ *  Diagnostic logging: every refresh attempt prints the RT fingerprint being sent so a future
  *  `bad_refresh_token` failure can be correlated with the exchange/refresh that originally
- *  issued that RT. Rotation (old → new RT prefix) is also logged so we can verify the new
+ *  issued that RT. Rotation (old → new RT fingerprint) is also logged so we can verify the new
  *  RT actually made it onto disk via the post-write read-back in `registry._writeSync`. */
 async function _refreshGrantIfStale(uid: string, entry: CatalogEntry, instId: string): Promise<OAuthGrant> {
   const existing = _refreshLocks.get(instId);
@@ -337,8 +338,8 @@ async function _provisionMemberInstance(
   };
   // Diagnostic: capture which RT just got issued by the provider so a later refresh failure
   // can be matched against this exchange (the `_refreshGrantIfStale` logs print the same
-  // _tokPrefix shape — `bad_refresh_token` mid-day means the on-disk RT no longer matches
-  // what the provider has on record; correlating prefixes pinpoints whether the write here
+  // _tokPrefix fingerprint — `bad_refresh_token` mid-day means the on-disk RT no longer matches
+  // what the provider has on record; correlating fingerprints pinpoints whether the write here
   // didn't land or got overwritten by another path).
   log.info('provision: fresh grant from exchange', {
     id: entry.id,

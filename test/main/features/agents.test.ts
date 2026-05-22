@@ -59,7 +59,7 @@ function writeCustomAgent(agentId: string, fields: Partial<Record<string, any>> 
   const data: Record<string, any> = {
     agent_id: agentId,
     name: fields.name ?? agentId,
-    description: fields.description ?? '',
+    description: fields.description ?? 'Test agent',
     workflow: fields.workflow ?? '',
     created_at: '2026-04-18T10:00:00',
     updated_at: '2026-04-18T10:00:00',
@@ -567,18 +567,18 @@ describe('agents › createCustomAgent', () => {
 
   it('defaults empty name to the localized "Untitled agent" fallback', async () => {
     const a = await loadAgents();
-    const agent = await a.createCustomAgent();
+    const agent = await a.createCustomAgent({ description: 'desc' });
     expect(agent?.name).toBe('Untitled agent');
   });
 
   it('rejects reserved names (collide with commander role / sidebar tab)', async () => {
     const a = await loadAgents();
     // Plain hits + whitespace + case variants all collapse to the same key.
-    for (const bad of ['指挥官', '总指挥', 'commander', '  Commander  ', '指 挥 官']) {
+    for (const bad of ['指挥官', '总指挥', 'コマンダー', '司令官', 'commander', '  Commander  ', '指 挥 官', 'コ マ ン ダ ー']) {
       await expect(a.createCustomAgent({ name: bad })).rejects.toThrow(/reserved/i);
     }
     // Sanity: the guard doesn't over-reach to nearby strings.
-    await expect(a.createCustomAgent({ name: '副指挥官' })).resolves.toBeTruthy();
+    await expect(a.createCustomAgent({ name: '副指挥官', description: 'desc' })).resolves.toBeTruthy();
   });
 });
 
@@ -1010,7 +1010,7 @@ describe('agents › list cache invalidation', () => {
   it('picks up newly created agents on next listAgents', async () => {
     const a = await loadAgents();
     expect(await a.listAgents()).toEqual([]);
-    await a.createCustomAgent({ name: 'New' });
+    await a.createCustomAgent({ name: 'New', description: 'desc' });
     const list = await a.listAgents();
     expect(list).toHaveLength(1);
     expect(list[0].name).toBe('New');
@@ -1018,7 +1018,7 @@ describe('agents › list cache invalidation', () => {
 
   it('reflects updates immediately', async () => {
     const a = await loadAgents();
-    const agent = await a.createCustomAgent({ name: 'V1' });
+    const agent = await a.createCustomAgent({ name: 'V1', description: 'desc' });
     await a.updateCustomAgent(agent!.agent_id, { name: 'V2' });
     const list = await a.listAgents();
     expect(list[0].name).toBe('V2');

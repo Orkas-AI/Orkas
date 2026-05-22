@@ -35,6 +35,7 @@ describe('chat-file-viewer › _kindOf', () => {
     ['app.ts', 'text'],
     ['style.css', 'text'],
     ['log.log', 'text'],
+    ['video.mp4', 'video'],
   ])('classifies "%s" as %s', (name, kind) => {
     expect(_kindOf(name)).toBe(kind);
   });
@@ -49,7 +50,6 @@ describe('chat-file-viewer › _kindOf', () => {
     ['doc.docx', 'unsupported'],   // we deliberately don't preview docx in this round
     ['binary.exe', 'unsupported'],
     ['photo.heic', 'unsupported'], // image-ish but not in the allow-list
-    ['video.mp4', 'unsupported'],  // video isn't a viewer kind; main chat shows inline <video>
     ['no-extension', 'unsupported'],
     ['', 'unsupported'],
     ['file.', 'unsupported'],

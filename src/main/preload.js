@@ -32,7 +32,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 let _i18nBoot = null;
 try {
   const res = ipcRenderer.sendSync('orkas:bootI18n');
-  if (res && res.ok && (res.lang === 'zh' || res.lang === 'en') && res.tables) {
+  if (res && res.ok && res.lang && res.tables && Object.prototype.hasOwnProperty.call(res.tables, res.lang)) {
     _i18nBoot = { lang: res.lang, tables: res.tables };
   }
 } catch (_) { /* main not ready / handler missing → renderer falls back to async */ }
@@ -66,7 +66,8 @@ function logRecord(record) {
 // Push-event subscription — for main-initiated broadcasts where the renderer doesn't drive
 // the lifecycle (unlike `stream` which the renderer starts). Channel names are restricted to
 // a known prefix list so the renderer can't tap into arbitrary internal IPC traffic.
-const PUSH_EVENT_PREFIXES = ['marketplace:', 'sync:', 'conversations:'];
+// Sync + auto-updater push channels are stripped from this build along with their producers.
+const PUSH_EVENT_PREFIXES = ['marketplace:', 'conversations:'];
 function isAllowedPushChannel(channel) {
   if (typeof channel !== 'string') return false;
   return PUSH_EVENT_PREFIXES.some((p) => channel.startsWith(p));

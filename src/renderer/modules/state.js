@@ -12,8 +12,22 @@ let conversations = [];
 // key: cid, value: { loadingEl: HTMLElement | null, needsIndicator: bool,
 //                    controller: AbortController | null, aborted: bool }
 const pendingConvs = new Map();
+// Group-chat runtime state is emitted independently from the request
+// controller. Keep it in the same pending predicate so delegated agents keep
+// the send button in "replying/stop" mode until the whole turn is quiescent.
+const groupBusyConvs = new Map();
 
-function isConvPending(cid) { return pendingConvs.has(cid); }
+function isGroupConversationBusy(cid) { return groupBusyConvs.has(cid); }
+
+function setGroupConversationBusy(cid, busy) {
+  if (!cid) return;
+  if (busy) groupBusyConvs.set(cid, true);
+  else groupBusyConvs.delete(cid);
+}
+
+function isConvPending(cid) {
+  return pendingConvs.has(cid) || isGroupConversationBusy(cid);
+}
 
 // Per-conversation queued messages (sent sequentially, one at a time).
 // key: cid, value: Array<{ id, content, skill }>
@@ -96,6 +110,7 @@ function stopPolling(cid) {
 function _onPolledResponse(cid, content, isError = false) {
   const state = pendingConvs.get(cid);
   pendingConvs.delete(cid);
+  setGroupConversationBusy(cid, false);
   _updateConvSidebarBadge(cid, false);
 
   const el = state?.loadingEl;
@@ -334,4 +349,3 @@ function autoGrow(el, maxPx) {
   el.style.height = 'auto';
   el.style.height = Math.min(el.scrollHeight, maxPx) + 'px';
 }
-

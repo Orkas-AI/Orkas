@@ -63,6 +63,10 @@ export interface GroupMessage {
    * interaction result back to it. Rendered as a sandboxed `<iframe>`
    * (`chat-app://`) at the bottom of the bubble. */
   artifacts?: Array<{ id: string; title: string; agent_id: string }>;
+  /** Commander-requested marketplace installs. The model can search the
+   * official marketplace and request a user decision, but the install only
+   * happens after the human clicks the rendered card. */
+  marketplace_requests?: MarketplaceInstallRequest[];
   /** Marks this message as a plan announcement (rendered with a folded
    * plan card in UI). Set by `plan_set` first-time emission. */
   plan_announcement?: boolean;
@@ -80,6 +84,27 @@ export interface GroupMessage {
     | { type: 'progress'; text: string }
     | { type: 'event'; event: { stream: string; data?: unknown } }
   >;
+}
+
+export interface MarketplaceInstallRequest {
+  request_id: string;
+  kind: 'agent' | 'skill';
+  id: string;
+  name: string;
+  /** Agent avatar tokens from the marketplace row. Skills do not render an avatar. */
+  icon?: string;
+  color?: string;
+  description_zh?: string;
+  description_en?: string;
+  category?: string;
+  create_uid?: string;
+  version: string;
+  published_at: number;
+  reason?: string;
+  status: 'pending' | 'installed' | 'skipped' | 'failed';
+  requested_at: string;
+  resolved_at?: string;
+  error?: string;
 }
 
 // ── Slice IO ─────────────────────────────────────────────────────────────

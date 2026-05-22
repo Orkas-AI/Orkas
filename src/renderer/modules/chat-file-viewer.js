@@ -7,6 +7,7 @@
 //
 // Render strategies:
 //   image (.png/.jpg/.jpeg/.webp/.gif) → delegate to openChatImageLightbox
+//   video (.mp4/.webm/.mov/.m4v/.ogv)  → <video controls>
 //   pdf   (.pdf)                       → <iframe> + Chromium PDFium
 //   html  (.html/.htm)                 → sandbox="allow-scripts" iframe
 //   md    (.md/.markdown)              → renderMarkdown(text) in a <div>
@@ -51,6 +52,7 @@ const _viewerLog = (typeof createLogger === 'function')
 // adding a new ext here is fine, but the renderer should actually have
 // something useful to do with it; otherwise the fallback is the better UX.
 const _IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
+const _VIDEO_EXTS = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
 const _MARKDOWN_EXTS = new Set(['.md', '.markdown']);
 // Text exts: the source-as-text bucket. Keep code-ish exts here too so the
 // user can peek at a generated script without leaving the app. No syntax
@@ -80,6 +82,7 @@ function _extOf(name) {
 function _kindOf(name) {
   const ext = _extOf(name);
   if (_IMAGE_EXTS.has(ext)) return 'image';
+  if (_VIDEO_EXTS.has(ext)) return 'video';
   if (ext === '.pdf') return 'pdf';
   if (ext === '.html' || ext === '.htm') return 'html';
   if (_MARKDOWN_EXTS.has(ext)) return 'markdown';
@@ -120,17 +123,16 @@ function _ensureViewer() {
   root.setAttribute('aria-hidden', 'true');
   const closeLabel = _viewerLabel('chat.preview_close_title', 'Close');
   const revealLabel = _viewerLabel('chat.preview_reveal_title', 'Open in folder');
-  // Folder SVG uses currentColor so it picks up the same gray as the close
-  // `×` — keeps the header monochrome. Colored emoji 📁 was tried first but
-  // it looked out of place against `×` (different rendering pipeline + size).
-  const folderSvg = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
+  const folderIcon = (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function')
+    ? window.uiIconHtml('folder', 'chat-file-viewer-folder-icon')
+    : '';
   root.innerHTML = `
     <div class="chat-file-viewer-backdrop"></div>
     <div class="chat-file-viewer-stage">
       <div class="chat-file-viewer-header">
         <span class="chat-file-viewer-title"></span>
         <div class="chat-file-viewer-actions">
-          <button type="button" class="chat-file-viewer-reveal" aria-label="${revealLabel}" title="${revealLabel}">${folderSvg}</button>
+          <button type="button" class="chat-file-viewer-reveal" aria-label="${revealLabel}" title="${revealLabel}">${folderIcon}</button>
           <button type="button" class="chat-file-viewer-close" aria-label="${closeLabel}" title="${closeLabel}">×</button>
         </div>
       </div>
@@ -234,6 +236,12 @@ function _renderHtmlBody(absPath, displayName) {
   // scripts and styles.
   const sandbox = 'allow-scripts';
   _viewerBody.innerHTML = `<iframe class="chat-file-viewer-html" sandbox="${sandbox}" src="${url}" title="${escapeHtml(displayName || '')}"></iframe>`;
+}
+
+function _renderVideoBody(absPath, displayName) {
+  _openViewerShell(displayName);
+  const url = _chatMediaLocalUrl(absPath);
+  _viewerBody.innerHTML = `<div class="chat-file-viewer-video-wrap"><video class="chat-file-viewer-video" controls preload="metadata" src="${url}"></video></div>`;
 }
 
 async function _renderMarkdownBody(absPath, displayName, cid) {
@@ -362,6 +370,7 @@ function openChatFileViewer(absPath, displayName, opts) {
     return;
   }
   if (kind === 'pdf')      return _renderPdfBody(absPath, name);
+  if (kind === 'video')    return _renderVideoBody(absPath, name);
   if (kind === 'html')     return _renderHtmlBody(absPath, name);
   if (kind === 'markdown') return _renderMarkdownBody(absPath, name, cid);
   if (kind === 'text')     return _renderTextBody(absPath, name, cid);

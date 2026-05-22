@@ -24,7 +24,12 @@
     "pack": "electron-builder --dir",
     "dist": "electron-builder",
     "dist:mac": "electron-builder --mac",
-    "dist:win": "electron-builder --win"
+    "dist:win": "electron-builder --win",
+    "release:bump-version": "node scripts/release-desktop/bump-version.mjs",
+    "release:desktop:sh": "bash scripts/release-desktop/release.sh",
+    "release:desktop": "node scripts/release-desktop/release.mjs",
+    "release:upload-feed": "node scripts/release-desktop/upload-feed.mjs",
+    "release:verify-feed": "node scripts/release-desktop/verify-feed.mjs"
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.7",
@@ -113,10 +118,16 @@
     "afterPack": "scripts/codesign-adhoc.cjs",
     "mac": {
       "category": "public.app-category.productivity",
-      "identity": null,
       "target": [
         {
           "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
           "arch": [
             "arm64",
             "x64"

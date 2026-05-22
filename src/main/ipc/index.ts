@@ -229,6 +229,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     let result;
     if (kind === 'agent') {
       if (!agents.isValidAgentId(id)) throw new Error('invalid id');
+      const agent = await agents.getAgent(id);
+      if (!agent || agent.enabled === false) throw new Error('agent_disabled');
       result = await projects.addAgentBinding(ctx.userId, projectId, id);
     } else if (kind === 'skill') {
       result = await projects.addSkillBinding(ctx.userId, projectId, id);
@@ -254,9 +256,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { bindings: result.bindings };
   },
 
-  // Candidates = full [builtin + custom] minus already-bound. Powers the
-  // "Add" picker on the project detail page so the renderer doesn't have
-  // to subtract client-side.
+  // Candidates = enabled [builtin + custom] minus already-bound. Powers the
+  // "Add" picker on the project detail page so disabled agents never appear
+  // as addable project members.
   'projects.bindings.candidates': async ({ projectId }, ctx) => {
     if (!safeId(projectId)) throw new Error('invalid projectId');
     if (!await projects.projectExists(ctx.userId, projectId)) throw new Error('not_found');
@@ -268,7 +270,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       skills.listSkills(),
     ]);
     return {
-      agents: agentList.filter((a: any) => !boundAgents.has(a.agent_id)),
+      agents: agentList.filter((a: any) => a.enabled !== false && !boundAgents.has(a.agent_id)),
       skills: skillList.filter((s: any) => !boundSkills.has(s.id)),
     };
   },
@@ -359,6 +361,20 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     }
     return groupChat.markFormSubmittedAndDispatch({
       userId: ctx.userId, cid, msgId, formId, values: values as Record<string, unknown>,
+    });
+  },
+
+  'groupChat.resolveMarketplaceInstallRequest': async ({ cid, msgId, requestId, decision }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    if (typeof msgId !== 'string' || !safeId(msgId)) throw new Error('invalid msgId');
+    if (typeof requestId !== 'string' || !safeId(requestId)) throw new Error('invalid requestId');
+    if (decision !== 'install' && decision !== 'skip') throw new Error('invalid decision');
+    return groupChat.resolveMarketplaceInstallRequest({
+      userId: ctx.userId,
+      cid,
+      msgId,
+      requestId,
+      decision,
     });
   },
 
@@ -471,8 +487,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { agent };
   },
 
-  'agents.create': async ({ name = '', description = '', description_zh, description_en, workflow = '', icon, color, runtime, category, output_format } = {}) => {
-    return { agent: await agents.createCustomAgent({ name, description, description_zh, description_en, workflow, icon, color, runtime, category, output_format }) };
+  'agents.create': async ({ name = '', description = '', description_zh, description_en, workflow = '', icon, color, runtime, category } = {}) => {
+    return { agent: await agents.createCustomAgent({ name, description, description_zh, description_en, workflow, icon, color, runtime, category }) };
   },
 
 
@@ -857,6 +873,10 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'prefs.setMetacognition': async ({ enabled }) => {
     return { enabled: appConfig.setMetacognitionEnabled(!!enabled) };
   },
+
+  // Desktop auto-update. The updater feature owns runtime support checks
+  // (packaged macOS/Windows only), feed configuration, download state, and
+  // quit-and-install coordination.
 
   // ── Auth / model config (settings page) ──
   'auth.listProviders': async () => auth.listProviders(),
@@ -1277,8 +1297,8 @@ async function resolveContext(sender: WebContents): Promise<IpcContext> {
 }
 
 /** Send a push-event to every open renderer. Channel name must match preload's
- *  `PUSH_EVENT_PREFIXES` allow-list (currently `marketplace:` / `sync:`). Used by main-initiated
- *  status broadcasts (boot-time reconcile / future cloud-sync state). */
+ *  `PUSH_EVENT_PREFIXES` allow-list. Used by main-initiated status broadcasts
+ *  (boot-time reconcile / sync / updater state). */
 export function broadcastToRenderer(channel: string, payload: unknown): void {
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.isDestroyed()) win.webContents.send(channel, payload);

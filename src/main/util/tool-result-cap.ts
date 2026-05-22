@@ -44,6 +44,7 @@ export const MAX_RESULT_CHARS_BY_TOOL: Record<string, number> = {
   bash: 30_000,
   search_file: 20_000,
   kb_search: 20_000,
+  chat_search: 20_000,
   web_fetch: 100_000,
   web_search: 100_000,
   markdown_to_pdf: 4_000,

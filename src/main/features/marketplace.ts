@@ -135,6 +135,7 @@ export interface MarketplaceAgent {
   download_count: number;
   published_at: number;
   updated_at: number;
+  default_install?: boolean | number;
 }
 
 export interface MarketplaceSkill {
@@ -148,6 +149,7 @@ export interface MarketplaceSkill {
   download_count: number;
   published_at: number;
   updated_at: number;
+  default_install?: boolean | number;
 }
 
 export interface AgentDetail {
@@ -164,6 +166,7 @@ export interface AgentDetail {
   /** Author uid from the server row. Recorded in `_install.json` so the in-app detail can
    *  render the author badge without a marketplace round-trip. May be `''` on cache-hit. */
   create_uid: string;
+  default_install?: boolean;
 }
 
 export interface SkillDetail {
@@ -178,6 +181,7 @@ export interface SkillDetail {
   bundle_url: string;
   /** Same as `AgentDetail.create_uid`. */
   create_uid: string;
+  default_install?: boolean;
 }
 
 // ── listing ───────────────────────────────────────────────────────────────
@@ -220,11 +224,11 @@ export async function getAgentDetail(
     }
   }
   // Miss → fetch + repopulate.
-  const data = await postJson<{ agent_json: Record<string, unknown>; version: string; category: string; published_at: number; agent_json_url: string; create_uid: string }>(
+  const data = await postJson<{ agent_json: Record<string, unknown>; version: string; category: string; published_at: number; agent_json_url: string; create_uid: string; default_install?: boolean }>(
     '/marketplace/agents/detail', { id: agentId },
   );
   await writeAgentCache(agentId, data.agent_json, { version: data.version, published_at: data.published_at });
-  return { id: agentId, version: data.version, category: data.category, published_at: data.published_at, agent_json: data.agent_json, agent_json_url: data.agent_json_url || '', create_uid: data.create_uid || '' };
+  return { id: agentId, version: data.version, category: data.category, published_at: data.published_at, agent_json: data.agent_json, agent_json_url: data.agent_json_url || '', create_uid: data.create_uid || '', default_install: data.default_install === true };
 }
 
 export async function getSkillDetail(
@@ -236,11 +240,11 @@ export async function getSkillDetail(
     return { id: skillId, version: expect.version, category: '', published_at: expect.published_at, cache_dir: getSkillCacheDir(skillId), bundle_url: '', create_uid: '' };
   }
   // Miss → fetch + write.
-  const meta = await postJson<{ bundle_url: string; version: string; category: string; published_at: number; create_uid: string }>(
+  const meta = await postJson<{ bundle_url: string; version: string; category: string; published_at: number; create_uid: string; default_install?: boolean }>(
     '/marketplace/skills/bundle', { id: skillId },
   );
   await _fetchAndCacheSkill(skillId, meta);
-  return { id: skillId, version: meta.version, category: meta.category, published_at: meta.published_at, cache_dir: getSkillCacheDir(skillId), bundle_url: meta.bundle_url, create_uid: meta.create_uid || '' };
+  return { id: skillId, version: meta.version, category: meta.category, published_at: meta.published_at, cache_dir: getSkillCacheDir(skillId), bundle_url: meta.bundle_url, create_uid: meta.create_uid || '', default_install: meta.default_install === true };
 }
 
 /** Fetch a skill .zip from COS and extract into the local cache (idempotent: wipe-and-replace). */
@@ -297,13 +301,14 @@ export async function installMarketplaceAgent(
   if (!detail.agent_json_url) {
     // Cache-hit path returns url='' (and create_uid=''); re-fetch via detail endpoint to
     // capture both — needed for manifest + `_install.json` author badge.
-    const fresh = await postJson<{ agent_json: Record<string, unknown>; version: string; category: string; published_at: number; agent_json_url: string; create_uid: string }>(
+    const fresh = await postJson<{ agent_json: Record<string, unknown>; version: string; category: string; published_at: number; agent_json_url: string; create_uid: string; default_install?: boolean }>(
       '/marketplace/agents/detail', { id: agentId },
     );
     detail = {
       id: agentId, version: fresh.version, category: fresh.category, published_at: fresh.published_at,
       agent_json: fresh.agent_json, agent_json_url: fresh.agent_json_url || '',
       create_uid: fresh.create_uid || '',
+      default_install: fresh.default_install === true,
     };
   }
 
@@ -374,10 +379,10 @@ export async function installMarketplaceSkill(
   if (!skillId) throw new Error('skillId required');
   let detail = await getSkillDetail(skillId, expect);
   if (!detail.bundle_url) {
-    const fresh = await postJson<{ bundle_url: string; version: string; category: string; published_at: number; create_uid: string }>(
+    const fresh = await postJson<{ bundle_url: string; version: string; category: string; published_at: number; create_uid: string; default_install?: boolean }>(
       '/marketplace/skills/bundle', { id: skillId },
     );
-    detail = { ...detail, bundle_url: fresh.bundle_url, create_uid: fresh.create_uid || '' };
+    detail = { ...detail, bundle_url: fresh.bundle_url, create_uid: fresh.create_uid || '', default_install: fresh.default_install === true };
   }
 
   const cacheDir = getSkillCacheDir(skillId);

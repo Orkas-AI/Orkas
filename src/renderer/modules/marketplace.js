@@ -605,7 +605,7 @@ function _mpRender() {
   const chips = [
     `<button type="button" class="marketplace-chip${_mpState.category === '' ? ' is-active' : ''}" data-mp-cat="">${escapeHtml(t('marketplace.all'))}</button>`,
     ...cats.map((c) => {
-      const label = lang === 'zh' ? (c.name_zh || c.name_en || c.code) : (c.name_en || c.name_zh || c.code);
+      const label = pickLocalizedName(c, lang) || c.code;
       const active = _mpState.category === c.code ? ' is-active' : '';
       return `<button type="button" class="marketplace-chip${active}" data-mp-cat="${escapeHtml(c.code)}">${escapeHtml(label)}</button>`;
     }),
@@ -732,7 +732,7 @@ function _mpCategoryLabel(code, lang) {
   if (!code) return '';
   const c = _mpState.categories.find((x) => x.code === code);
   if (!c) return code;
-  return lang === 'zh' ? (c.name_zh || c.name_en || code) : (c.name_en || c.name_zh || code);
+  return pickLocalizedName(c, lang) || code;
 }
 
 // ─── Detail view rendering ───
@@ -1080,7 +1080,7 @@ async function mountMarketplaceCategorySelect(elId, initialValue = '') {
   _aiSelectMount(el, {
     options: categories.map((c) => ({
       value: c.code,
-      label: lang === 'zh' ? (c.name_zh || c.name_en || c.code) : (c.name_en || c.name_zh || c.code),
+      label: pickLocalizedName(c, lang) || c.code,
     })),
     value: initialValue || (categories[0] && categories[0].code) || '',
   });

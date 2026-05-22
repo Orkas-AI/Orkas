@@ -15,6 +15,13 @@
 
 const _projectsLog = createLogger('projects');
 
+function _projectUiIconHtml(name, className) {
+  if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+    return window.uiIconHtml(name, className);
+  }
+  return '';
+}
+
 // Live cache of projects fetched from the backend. Mirrors `_agentsCache` /
 // `_skillsCache` patterns. `null` = not yet fetched.
 let _projectsCache = null;
@@ -139,7 +146,7 @@ function _renderInlineCreateRow() {
   // rather than a separate widget shape.
   return `
     <div class="project-row project-row-create" data-create>
-      <span class="project-icon">${ICON_FOLDER_CLOSED}</span>
+      <span class="project-icon">${_projectUiIconHtml('folder', 'project-folder-icon')}</span>
       <input type="text" class="project-rename-input" id="project-create-input"
              placeholder="${placeholder}" autocomplete="off" spellcheck="false" />
     </div>
@@ -149,13 +156,9 @@ function _renderInlineCreateRow() {
 function _renderProjectRow(p, convs) {
   const expanded = !!_projectsExpanded[p.project_id];
   const editing = _projectsInlineRenamePid === p.project_id;
-  // Reuse KB tree's folder SVG icons; open variant when expanded, closed
-  // otherwise. Defined as global consts in modules/skills.js (script load
-  // order: skills.js loads after projects.js, but renderProjectsSection
-  // only runs post-DOMContentLoaded by which point all scripts have
-  // initialised). No separate caret — the icon's open/closed state IS the
-  // expand indicator (matches the KB tree pattern).
-  const folderIcon = expanded ? ICON_FOLDER_OPEN : ICON_FOLDER_CLOSED;
+  const folderIcon = expanded
+    ? _projectUiIconHtml('folder-open', 'project-folder-icon')
+    : _projectUiIconHtml('folder', 'project-folder-icon');
   const moreTitle = escapeHtml(t('project.menu.more_actions'));
   const safeName = escapeHtml(p.name || '');
   const nameNode = editing
@@ -680,7 +683,9 @@ function _showCommanderProjectPicker(anchor) {
     if (isActive) {
       const check = document.createElement('span');
       check.className = 'workspace-menu-check';
-      check.textContent = '✓';
+      check.innerHTML = typeof window !== 'undefined' && typeof window.uiIconHtml === 'function'
+        ? window.uiIconHtml('check', 'ui-icon workspace-check-icon')
+        : '';
       row.appendChild(check);
     }
     row.addEventListener('click', () => {

@@ -2,7 +2,7 @@
  * User preferences bag — `<uid>/cloud/config/preferences.json`.
  *
  * Cross-device user preferences (cloud-synced). Currently stores the
- * UI language only (`language: 'zh' | 'en'`).
+ * UI language only (`language` from i18n.SUPPORTED_LANGS).
  *
  * History: the old `data/config/config.json` also held legacy
  * `provider` / `model` fields (the default model pair written by
@@ -45,6 +45,8 @@ export interface UserPreferences {
    * `ORKAS_METACOGNITION='0'` remains a higher-priority kill switch.
    * Reads go through `features/metacognition.isFeatureEnabled`. */
   metacognition_enabled?: boolean;
+  /** Desktop auto-update toggle. Defaults to enabled so signed release
+   * builds check the stable feed and download available updates. */
   [key: string]: unknown;
 }
 
@@ -145,6 +147,18 @@ export function getMetacognitionEnabled(): boolean {
 
 export function setMetacognitionEnabled(enabled: boolean): boolean {
   writePreferences({ metacognition_enabled: !!enabled });
+  return !!enabled;
+}
+
+// ── Desktop auto-update ─────────────────────────────────────────────────
+// Defaults to ON. Packaged app support is handled by features/app_update.ts;
+// this preference only captures the user's intent.
+
+export function getAutoUpdateEnabled(): boolean {
+  return v !== false;
+}
+
+export function setAutoUpdateEnabled(enabled: boolean): boolean {
   return !!enabled;
 }
 

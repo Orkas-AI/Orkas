@@ -36,7 +36,7 @@ import {
   stringifyMcpResult,
 } from '../../features/connectors/tools-adapter';
 import { findCatalogEntry } from '../../features/connectors/catalog';
-import { getCurrentLang } from '../../i18n';
+import { descriptionLang, getCurrentLang } from '../../i18n';
 import { createLogger } from '../../logger';
 import type { ConnectorInstance, ToolSchema } from '../../features/connectors/types';
 
@@ -64,10 +64,9 @@ function _renderConnectorLine(instance: ConnectorInstance): string {
   // every line is implicitly healthy. Disconnected / errored / connecting instances are hidden
   // from the LLM entirely — see tools-adapter.ts for the filter + rationale.
   const catalog = findCatalogEntry(instance.id);
-  const lang = getCurrentLang();
-  const desc = catalog
-    ? (lang === 'zh' ? catalog.description_zh : catalog.description_en)
-    : '';
+  const lang = descriptionLang(getCurrentLang());
+  const descKey = `description_${lang}` as 'description_zh' | 'description_en';
+  const desc = catalog ? (catalog[descKey] || '') : '';
   const acct = instance.oauth_grant?.account_label ? ` (account: ${instance.oauth_grant.account_label})` : '';
   return desc
     ? `- **${instance.id}** — ${instance.display_name}: ${desc}${acct}`

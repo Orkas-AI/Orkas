@@ -50,7 +50,13 @@ export function stringifyMcpResult(raw: unknown): string {
 /** Resolve the connectors visible to a given actor + the tool subset each one exposes.
  *  Returns one entry per visible instance; `tools` is post-`enabled_subtools` filter. Instances
  *  whose `tools_cache` is empty (e.g. cold-start before the first successful list_tools) are
- *  still returned with `tools: []`. */
+ *  still returned with `tools: []`.
+ *
+ *  Google Workspace overlap: the all-in-one `google-workspace` connector intentionally coexists
+ *  with the five single-service connectors. When both are visible to the current actor, the
+ *  single-service connector wins for its service and the duplicate Workspace tools are hidden.
+ *  This keeps the model from seeing two Gmail/Calendar/etc. routes for the same action while
+ *  still letting Workspace provide any services the user did not connect separately. */
 export async function resolveVisibleConnectors(
   uid: string,
   agentId: string | undefined,
@@ -72,13 +78,14 @@ export async function resolveVisibleConnectors(
   const userEnabled = connected.filter((i) => isConnectorEnabled(uid, i.id));
   if (!userEnabled.length) return [];
   const scope = await _enabledInstancesForActor(uid, agentId, userEnabled);
-  return scope.map((instance) => {
+  const resolved = scope.map((instance) => {
     const allowed = instance.enabled_subtools;
     const tools = allowed === null
       ? instance.tools_cache
       : instance.tools_cache.filter((t) => allowed.includes(t.name));
     return { instance, tools };
   });
+  return _dedupeGoogleWorkspaceTools(resolved);
 }
 
 async function _enabledInstancesForActor(
@@ -92,4 +99,58 @@ async function _enabledInstancesForActor(
   if (!Array.isArray(allowed) || allowed.length === 0) return [];
   const allowSet = new Set(allowed);
   return allInstances.filter((i) => allowSet.has(i.id));
+}
+
+const GOOGLE_WORKSPACE_ID = 'google-workspace';
+type GoogleWorkspaceService = 'gmail' | 'gcal' | 'gdocs' | 'gsheets' | 'gtasks';
+
+const GOOGLE_SERVICE_BY_CONNECTOR_ID: Record<string, GoogleWorkspaceService> = {
+  gmail: 'gmail',
+  gcal: 'gcal',
+  gdocs: 'gdocs',
+  gsheets: 'gsheets',
+  gtasks: 'gtasks',
+};
+
+const GOOGLE_WORKSPACE_TOOL_PREFIX_BY_SERVICE: Record<GoogleWorkspaceService, string> = {
+  gmail: '[Gmail]',
+  gcal: '[Calendar]',
+  gdocs: '[Docs]',
+  gsheets: '[Sheets]',
+  gtasks: '[Tasks]',
+};
+
+function _dedupeGoogleWorkspaceTools(
+  visible: Array<{ instance: ConnectorInstance; tools: ToolSchema[] }>,
+): Array<{ instance: ConnectorInstance; tools: ToolSchema[] }> {
+  const workspace = visible.find((v) => v.instance.id === GOOGLE_WORKSPACE_ID);
+  if (!workspace) return visible;
+
+  const shadowedPrefixes = new Set<string>();
+  for (const { instance } of visible) {
+    const service = GOOGLE_SERVICE_BY_CONNECTOR_ID[instance.id];
+    if (!service) continue;
+    shadowedPrefixes.add(GOOGLE_WORKSPACE_TOOL_PREFIX_BY_SERVICE[service]);
+  }
+  if (!shadowedPrefixes.size) return visible;
+
+  return visible
+    .map((v) => {
+      if (v.instance.id !== GOOGLE_WORKSPACE_ID) return v;
+      return {
+        instance: v.instance,
+        tools: v.tools.filter((t) => !_hasShadowedWorkspacePrefix(t, shadowedPrefixes)),
+      };
+    })
+    // When all five single-service connectors are visible, the Workspace connector has no unique
+    // tools left to expose to the model. Hide that empty duplicate route entirely.
+    .filter((v) => v.instance.id !== GOOGLE_WORKSPACE_ID || v.tools.length > 0);
+}
+
+function _hasShadowedWorkspacePrefix(tool: ToolSchema, shadowedPrefixes: Set<string>): boolean {
+  const desc = typeof tool.description === 'string' ? tool.description.trimStart() : '';
+  for (const prefix of shadowedPrefixes) {
+    if (desc.startsWith(prefix)) return true;
+  }
+  return false;
 }

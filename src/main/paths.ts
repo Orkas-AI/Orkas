@@ -27,6 +27,24 @@
  *       local/                    ← Machine-private domain (never synced)
  *         config/                 ← auth-profiles.json + web-search-cache.json
  *         search/                 ← contexts / chats inverted idx (agent / skill bodies queried in-memory at request time)
+ *   <container>/                  ← ~/.orkas (mac/linux) or <drive>:\.orkas (Windows, pinned)
+ *     data/                       ← WS_ROOT
+ *       users.json                ← Local uid registry + current_user_id
+ *       window-state.json         ← Last desktop window bounds (machine-local)
+ *       logs/                     ← Local logs (rolled daily, global)
+ *       builtin/                  ← Local public builtin runtime copy (hash-synced from src/builtin/ at startup)
+ *         agents/<agent_id>/
+ *         skills/<skill_id>/
+ *       <user_id>/
+ *         cloud/                  ← Cloud-sync domain (synced per uid / org / team once accounts are integrated)
+ *           chats/  chat_attachments/  sessions/  contexts/  memory/
+ *           agents/<agent_id>/  skills/<skill_id>/  meta/<agent_id>/
+ *           config/preferences.json
+ *         local/                  ← Machine-private domain (never synced)
+ *           config/               ← auth-profiles.json + web-search-cache.json
+ *           search/               ← contexts / chats inverted idx (agent / skill bodies queried in-memory at request time)
+ *           test/                 ← dev-only LLM archive
+ *     userWorkSpace/              ← DEFAULT_USER_WORKSPACE (sibling of data/)
  *
  * Runtime overrides:
  *   ORKAS_WORKSPACE_ROOT   point data root elsewhere; tests pre-set this in setup-env.ts.
@@ -75,6 +93,7 @@ export const WS_ROOT = path.resolve(process.env.ORKAS_WORKSPACE_ROOT);
 // ── Top-level (machine-global, shared across uids) ───────────────────────
 // Machine-local uid registry: { current_user_id, users: [{user_id, created_at}, ...] }
 export const USERS_FILE        = path.join(WS_ROOT, 'users.json');
+export const WINDOW_STATE_FILE = path.join(WS_ROOT, 'window-state.json');
 // Machine-local logs (daily rolling, single global file shared across uids).
 export const LOGS_DIR          = path.join(WS_ROOT, 'logs');
 // (The legacy globally-shared `data/builtin/{agents,skills}/` tree is gone. Marketplace
@@ -369,22 +388,6 @@ export const localCliSessionsFile = (uid: string, cid: string) =>
 // paths are machine-specific, so this is never synced.
 export const userWorkspaceConfigFile = (uid: string) => path.join(userLocalRoot(uid), 'workspace.json');
 
-// ── Expert signals (machine-private, append-only) ───────────────────────
-// Per-day jsonl of T0/T1 user behavior signals emitted by bus.ts turn-end
-// hook + IPC handlers (retry/skip/form/silence). Local-only: signals are
-// extractor-version dependent and shouldn't cross devices; they're inputs
-// to reflection / patch suggester / critic (phase 1+). See plan
-// `docs/plans/expert-signals-phase-0.md`. Daily rotation keeps query
-// scoped to a date range; no archive sweep yet (50-200 KB/day × 365 ≈
-// 18-73 MB/year is acceptable for append-only jsonl).
-export const userSignalsDir = (uid: string) => path.join(userLocalRoot(uid), 'signals');
-/** Returns `<signalsDir>/<yyyy-mm-dd>.jsonl`. `date` defaults to today (local). */
-export const signalsDailyFile = (uid: string, date?: Date) => {
-  const d = date || new Date();
-  const ymd = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-  return path.join(userSignalsDir(uid), `${ymd}.jsonl`);
-};
-
 // ── Quality validator reports (machine-private) ──────────────────────────
 // Per-spec ValidationReport produced by `src/main/quality/`. Local-only:
 // validator version + ruleset are tied to the installed build, so a report
@@ -493,7 +496,6 @@ export function ensureUserLayout(uid: string): void {
     userKbDir(uid),
     userQualitySkillsDir(uid),
     userQualityAgentsDir(uid),
-    userSignalsDir(uid),
   ];
   for (const d of dirs) fs.mkdirSync(d, { recursive: true });
 

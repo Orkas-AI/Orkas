@@ -19,6 +19,7 @@ let _settingsState = {
   pickerModelSel: null,
   addBtnBound: false,
   dragState: null,
+  appUpdateBound: false,
 };
 
 async function loadSettings() {
@@ -26,6 +27,7 @@ async function loadSettings() {
   // (通用 by default — matches the is-active class on the markup).
   if (typeof initSettingsTabs === 'function') initSettingsTabs();
   _settingsBindLanguageOnce();
+  _settingsBindAppUpdateOnce();
   _settingsSyncLanguageRadio();
   _settingsBindClearAllConvsOnce();
   await Promise.all([
@@ -35,6 +37,7 @@ async function loadSettings() {
     _settingsRefreshSearchProfiles(),
     _settingsRefreshImageProfiles(),
     _settingsRefreshCommanderAvatar(),
+    _settingsRefreshAppUpdate(),
     _settingsRefreshMetacognition(),
     _settingsRefreshDataRoot(),
   ]);
@@ -44,10 +47,128 @@ async function loadSettings() {
   _settingsRenderSearchSection();
   _settingsRenderImageSection();
   _settingsRenderCommanderAvatar();
+  _settingsRenderAppUpdate();
   _settingsRenderMetacognition();
   _settingsRenderDataRoot();
-  // Account card (views/login/account_settings.js — absent in OrkasOpen, so this is a no-op there).
+  // Account card + subscription card (views/login/account_settings.js — absent in
+  // OrkasOpen, so these are no-ops there). renderSubscriptionSettings rebinds the
+  // action button's click handler with the current subscription state on every
+  // render — opening the panel is the canonical "guarantee fresh button binding"
+  // moment, so call it explicitly here (not just from the account.onChange listener
+  // which only fires on state changes — for a Free user with no transitions the
+  // listener never fires after boot, leaving the button bound to whatever its
+  // first render captured).
   if (typeof renderAccountSettings === 'function') renderAccountSettings();
+  if (typeof renderSubscriptionSettings === 'function') renderSubscriptionSettings();
+}
+
+// ── Desktop auto-update ──
+// The main process owns the updater lifecycle; settings only mirrors its
+// state and sends user intent (enable, check, install).
+
+function _settingsBindAppUpdateOnce() {
+  if (_settingsState.appUpdateBound) return;
+  _settingsState.appUpdateBound = true;
+  try {
+    if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
+        _settingsRenderAppUpdate();
+      });
+    }
+  } catch (err) {
+    _settingsLog.warn('app update push subscription failed', err);
+  }
+}
+
+async function _settingsRefreshAppUpdate() {
+  try {
+  } catch (_) {
+  }
+}
+
+function _settingsFormatUpdateStatus(s) {
+  if (!s.supported) return '';
+  switch (s.phase) {
+    case 'checking':
+    case 'available':
+    case 'downloading': {
+      const pct = Number.isFinite(s.percent) ? Math.max(0, Math.min(100, s.percent)).toFixed(0) : '0';
+    }
+    case 'downloaded':
+    case 'not_available':
+    case 'error':
+    case 'not_configured':
+    default:
+  }
+}
+
+function _settingsRenderAppUpdate() {
+
+  if (cb) cb.checked = s ? !!s.enabled : true;
+  if (status) {
+    status.textContent = _settingsFormatUpdateStatus(s);
+    status.className = s?.phase === 'error' ? 'settings-status error' : 'settings-status muted';
+  }
+  if (checkBtn) {
+    checkBtn.disabled = !s || !s.canCheck;
+  }
+  if (downloadBtn) {
+    downloadBtn.hidden = !s?.canDownload;
+    downloadBtn.disabled = !s?.canDownload;
+  }
+  if (installBtn) {
+    installBtn.hidden = !s?.canInstall;
+    installBtn.disabled = !s?.canInstall;
+  }
+
+  if (cb && !cb.dataset.bound) {
+    cb.addEventListener('change', async () => {
+      const next = !!cb.checked;
+      try {
+        if (res && res.ok && res.state) {
+          _settingsRenderAppUpdate();
+        } else {
+          cb.checked = !next;
+        }
+      } catch (err) {
+        cb.checked = !next;
+        _settingsLog.warn('set app update failed', err);
+      }
+    });
+    cb.dataset.bound = '1';
+  }
+  if (checkBtn && !checkBtn.dataset.bound) {
+    checkBtn.addEventListener('click', async () => {
+      try {
+        if (res && res.ok && res.state) {
+          _settingsRenderAppUpdate();
+        }
+      } catch (err) {
+        _settingsLog.warn('check update failed', err);
+      }
+    });
+    checkBtn.dataset.bound = '1';
+  }
+  if (downloadBtn && !downloadBtn.dataset.bound) {
+    downloadBtn.addEventListener('click', async () => {
+      try {
+        if (res && res.ok && res.state) {
+          _settingsRenderAppUpdate();
+        }
+      } catch (err) {
+        _settingsLog.warn('download update failed', err);
+      }
+    });
+    downloadBtn.dataset.bound = '1';
+  }
+  if (installBtn && !installBtn.dataset.bound) {
+    installBtn.addEventListener('click', async () => {
+      try {
+      } catch (err) {
+        _settingsLog.warn('install update failed', err);
+      }
+    });
+    installBtn.dataset.bound = '1';
+  }
 }
 
 // ── Commander avatar ──
@@ -234,7 +355,7 @@ function _settingsRenderDataRoot() {
   }
 }
 
-// ── Language dropdown (zh / en) ──
+// ── Language dropdown ──
 // Bound once on first panel open; `loadSettings` then calls _settingsSyncLanguageRadio()
 // to re-sync the dropdown's current value with whatever setLang() last persisted.
 // Option labels are each language's autonym (本族语自称), intentionally NOT routed
@@ -244,8 +365,13 @@ function _settingsRenderDataRoot() {
 let _settingsLanguageSel = null;   // _aiSelectMount api
 
 const _SETTINGS_LANG_OPTIONS = [
-  { value: 'zh', label: '简体中文' },
-  { value: 'en', label: 'English' },
+  ...((typeof getSupportedLanguages === 'function')
+    ? getSupportedLanguages().map((l) => ({ value: l.code, label: l.label }))
+    : [
+        { value: 'zh', label: '简体中文' },
+        { value: 'en', label: 'English' },
+        { value: 'ja', label: '日本語' },
+      ]),
 ];
 
 function _settingsBindLanguageOnce() {
@@ -257,7 +383,7 @@ function _settingsBindLanguageOnce() {
     value: (typeof getLang === 'function') ? getLang() : 'en',
   });
   _settingsLanguageSel.onChange(async (next) => {
-    if (next !== 'zh' && next !== 'en') return;
+    if (typeof isSupportedLang === 'function' && !isSupportedLang(next)) return;
     try {
       await setLang(next);
       _settingsLog.info('language changed', { lang: next });
@@ -351,6 +477,7 @@ window.addEventListener('i18n-change', () => {
   _settingsRenderEntries();
   _settingsRenderSearchSection();
   _settingsRenderImageSection();
+  _settingsRenderAppUpdate();
   _settingsRenderMetacognition();
 });
 

@@ -159,7 +159,7 @@ function _renderCatalogCard(entry, instance) {
   const iconHtml = e.icon_svg
     ? `<div class="connector-card-icon is-svg">${e.icon_svg}</div>`
     : `<div class="connector-card-icon is-fallback">${escapeHtml((e.display_name || '?').slice(0, 2).toUpperCase())}</div>`;
-  const desc = (getLang && getLang() === 'zh' ? e.description_zh : e.description_en) || e.description_en || e.description_zh || '';
+  const desc = pickDesc(e, (typeof getLang === 'function') ? getLang() : 'en');
 
   const accountLabel = (instance && instance.oauth_grant && instance.oauth_grant.account_label) || '';
   const errorMsg = errored && instance && instance.status && instance.status.message;

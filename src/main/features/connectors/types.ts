@@ -65,7 +65,7 @@ export interface ConnectorInstance {
 }
 
 export interface ConnectorsFile {
-  version: 1;
+  version: 2;
   connections: Record<string, ConnectorInstance>;
 }
 

@@ -17,13 +17,12 @@
         <img class="logo-icon" src="../resources/icons/logo.png" alt="" draggable="false" />
         <div class="logo-text">Orkas</div>
       </div>
-      <button class="sidebar-search-btn" id="sidebar-search-btn" data-i18n-title="sidebar.search_title" title="Global search (⌘K)">
-        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="11" cy="11" r="7"></circle>
-          <path d="m21 21-4.3-4.3"></path>
-        </svg>
+      <button class="sidebar-search-btn" id="sidebar-search-btn" data-i18n-title="sidebar.search_title" title="Global search (Cmd/Ctrl+K)">
+        <span data-ui-icon="search" data-ui-icon-class="sidebar-search-icon"></span>
         <span class="sidebar-search-label" data-i18n="sidebar.search">Search</span>
-        <span class="sidebar-search-kbd">⌘K</span>
+        <span class="sidebar-search-kbd">
+          <span data-ui-icon="command" data-ui-icon-class="ui-icon sidebar-search-command-icon"></span><span>K</span>
+        </span>
       </button>
       <div class="sidebar-actions">
         <button class="sidebar-btn primary" id="new-chat-btn" data-i18n="sidebar.new_chat">Commander</button>
@@ -33,29 +32,32 @@
         <button class="sidebar-btn" id="contexts-btn" data-i18n="sidebar.contexts">Knowledge</button>
         <button class="sidebar-btn" id="apps-btn" data-i18n="sidebar.apps">My Apps</button>
       </div>
-      <div class="sidebar-section sidebar-projects-section">
-        <div class="sidebar-section-title-row">
-          <span class="sidebar-section-title" data-i18n="sidebar.projects">Projects</span>
-          <button class="sidebar-section-add" id="projects-add-btn"
-                  data-i18n-title="sidebar.project_create_title"
-                  data-i18n-aria-label="sidebar.project_create_title"
-                  title="New project" aria-label="New project">+</button>
+      <div class="sidebar-conversation-nav">
+        <div class="sidebar-section sidebar-projects-section">
+          <div class="sidebar-section-title-row">
+            <span class="sidebar-section-title" data-i18n="sidebar.projects">Projects</span>
+            <button class="sidebar-section-add" id="projects-add-btn"
+                    data-i18n-title="sidebar.project_create_title"
+                    data-i18n-aria-label="sidebar.project_create_title"
+                    title="New project" aria-label="New project">+</button>
+          </div>
+          <div class="projects-list" id="projects-list"></div>
         </div>
-        <div class="projects-list" id="projects-list"></div>
-      </div>
-      <div class="sidebar-section sidebar-conversations-section">
-        <div class="sidebar-section-title" data-i18n="sidebar.conversations">Conversations</div>
-        <div class="conversation-list" id="conversation-list">
-          <div class="conv-empty" data-i18n="sidebar.conv_empty">No conversations yet</div>
+        <div class="sidebar-section sidebar-conversations-section">
+          <div class="sidebar-section-title" data-i18n="sidebar.conversations">Conversations</div>
+          <div class="conversation-list" id="conversation-list">
+            <div class="conv-empty" data-i18n="sidebar.conv_empty">No conversations yet</div>
+          </div>
         </div>
       </div>
       <div class="sidebar-footer-actions">
         <button class="sidebar-footer-btn" id="settings-btn" data-i18n-title="sidebar.settings_title" title="Settings">
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
-            <circle cx="12" cy="12" r="3"></circle>
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-          </svg>
+          <span data-ui-icon="settings" data-ui-icon-class="sidebar-footer-icon"></span>
           <span data-i18n="sidebar.settings">Settings</span>
+        </button>
+        <button class="sidebar-footer-btn dev-only-btn" id="devtools-btn" style="display:none" data-i18n-title="sidebar.devtools_title" title="Visible in dev mode only">
+          <span data-ui-icon="terminal" data-ui-icon-class="sidebar-footer-icon"></span>
+          <span data-i18n="sidebar.devtools">Devtools</span>
         </button>
       </div>
     </aside>
@@ -78,6 +80,10 @@
               <textarea id="new-chat-input" data-i18n-placeholder="new_chat.input_placeholder" placeholder="Type a message..." rows="2"></textarea>
               <div class="chat-bottom-bar">
                 <button type="button" class="chat-attach-btn" id="new-chat-attach-btn" data-i18n-title="new_chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
+                <!-- Voice-to-text mic button (stripped in OrkasOpen — see OpenSource/SyncCode/strip-rules.json). -->
+                <button type="button" class="chat-attach-btn chat-mic-btn" id="new-chat-mic-btn" data-i18n-title="chat.mic_title" title="Voice input">
+                  <span data-ui-icon="mic" data-ui-icon-class="chat-mic-icon"></span>
+                </button>
                 <button type="button" class="chat-recipient-chip" id="new-chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Switch recipient (commander / agent)">
                   <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
                   <span class="chat-recipient-name" id="new-chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
@@ -89,14 +95,12 @@
                 <button type="button" class="chat-project-chip" id="new-chat-project-chip" data-i18n-title="chat.project_picker_title" title="Pick project">
                   <span class="chat-project-prefix" data-i18n="chat.project_label">Project: </span>
                   <span class="chat-project-name" id="new-chat-project-name" data-i18n="chat.project_none">None</span>
-                  <svg class="chat-project-chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5">
-                    <polyline points="6 9 12 15 18 9"/>
-                  </svg>
+                  <span data-ui-icon="chevron-down" data-ui-icon-class="chat-project-chevron"></span>
                 </button>
                 <input type="file" id="new-chat-attach-input" multiple style="display:none"
                        accept=".md,.markdown,.txt,.csv,.tsv,.json,.yaml,.yml,.log,.pdf,.docx,.png,.jpg,.jpeg,.webp,.gif,text/plain,text/markdown,text/csv,application/json,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/png,image/jpeg,image/webp,image/gif" />
                 <button id="new-chat-send-btn" class="chat-send-btn" data-i18n-title="new_chat.send_title" title="Send">
-                  <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"></path></svg>
+                  <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
                 </button>
               </div>
             </div>
@@ -107,39 +111,27 @@
       <!-- Conversation Detail -->
       <section class="panel" id="panel-conversation">
         <div class="chat-container">
-          <div id="conv-project-empty-banner" class="conv-project-empty-banner" style="display:none">
-            <span class="muted" data-i18n="project.bindings.empty_in_chat">This project has no agents or skills bound. Open the project page to add some.</span>
-            <button type="button" class="btn btn-sm" id="conv-project-empty-banner-open" data-i18n="project.bindings.open_settings">Open project page</button>
-          </div>
-          <div id="chat-history" class="chat-history">
-            <div class="empty" data-i18n="chat.empty">No messages yet...</div>
-          </div>
-          <div class="chat-input-wrapper">
-            <div class="chat-queue" id="chat-queue" style="display:none">
-              <div class="chat-queue-header">
-                <span class="chat-queue-label"><span data-i18n="chat.queue_label">Queued</span> <span class="chat-queue-count" id="chat-queue-count">0</span></span>
-                <span class="chat-queue-hint" data-i18n="chat.queue_hint">Drag to reorder · Edit · Delete</span>
-              </div>
-              <div class="chat-queue-list" id="chat-queue-list"></div>
+          <div class="chat-main-pane">
+            <button type="button" class="conversation-info-toggle" id="conversation-info-toggle"
+                    data-i18n-title="conversation_info.toggle_title"
+                    data-i18n-aria-label="conversation_info.toggle_title"
+                    title="Conversation info" aria-label="Conversation info" aria-expanded="false">
+              <span data-ui-icon="panel-list" data-ui-icon-class="conversation-info-toggle-icon"></span>
+            </button>
+            <div id="conv-project-empty-banner" class="conv-project-empty-banner" style="display:none">
+              <span class="muted" data-i18n="project.bindings.empty_in_chat">This project has no agents or skills bound. Open the project page to add some.</span>
+              <button type="button" class="btn btn-sm" id="conv-project-empty-banner-open" data-i18n="project.bindings.open_settings">Open project page</button>
             </div>
-            <div class="chat-input-area">
-              <!-- Floats above the input box. Plan rail anchors left, attachments
-                   wrap to its right. The workspace chip moved into
-                   .chat-bottom-bar below (next to the recipient chip) so
-                   the overlay no longer holds it. -->
-              <div class="chat-input-overlay">
-                <!-- Plan rail floats at left. Self-hides when current cid has
-                     no plan. Expanded body opens UPWARD (bottom: 100%) over
-                     the chat-history. See modules/plan-rail.js. -->
-                <div id="plan-rail" class="plan-rail" style="display:none">
-                  <div class="plan-rail-header" data-i18n-title="plan.toggle_title" title="Collapse / Expand">
-                    <span class="plan-rail-title">📋 <span data-i18n="plan.title">Execution Plan</span></span>
-                    <span class="plan-rail-progress" id="plan-rail-progress"></span>
-                    <span class="plan-rail-toggle" id="plan-rail-toggle">▴</span>
-                  </div>
-                  <div class="plan-rail-body" id="plan-rail-body"></div>
+            <div id="chat-history" class="chat-history">
+              <div class="empty" data-i18n="chat.empty">No messages yet...</div>
+            </div>
+            <div class="chat-input-wrapper">
+              <div class="chat-queue" id="chat-queue" style="display:none">
+                <div class="chat-queue-header">
+                  <span class="chat-queue-label"><span data-i18n="chat.queue_label">Queued</span> <span class="chat-queue-count" id="chat-queue-count">0</span></span>
+                  <span class="chat-queue-hint" data-i18n="chat.queue_hint">Drag to reorder · Edit · Delete</span>
                 </div>
-                <div class="chat-attachments" id="chat-attachments" style="display:none"></div>
+                <div class="chat-queue-list" id="chat-queue-list"></div>
               </div>
               <div class="chat-quote-preview" id="chat-quote-preview" style="display:none"></div>
               <textarea id="chat-input" data-i18n-placeholder="chat.input_placeholder" placeholder="Continue the conversation..." rows="2"></textarea>
@@ -152,16 +144,68 @@
                 <div class="chat-skill-chip" id="chat-skill-chip" data-target="conversation" style="display:none">
                   <span class="chip-label"></span>
                   <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
+              <div class="chat-input-area">
+                <!-- Floats above the input box. Plan rail anchors left, attachments
+                     wrap to its right. The workspace chip moved into
+                     .chat-bottom-bar below (next to the recipient chip) so
+                     the overlay no longer holds it. -->
+                <div class="chat-input-overlay">
+                  <!-- Plan rail floats at left. Self-hides when current cid has
+                       no plan. Expanded body opens UPWARD (bottom: 100%) over
+                       the chat-history. See modules/plan-rail.js. -->
+                  <div id="plan-rail" class="plan-rail" style="display:none">
+                    <div class="plan-rail-header" data-i18n-title="plan.toggle_title" title="Collapse / Expand">
+                      <span class="plan-rail-title">
+                        <span data-ui-icon="clipboard-list" data-ui-icon-class="ui-icon plan-rail-title-icon"></span>
+                        <span data-i18n="plan.title">Execution Plan</span>
+                      </span>
+                      <span class="plan-rail-progress" id="plan-rail-progress"></span>
+                      <span class="plan-rail-toggle" id="plan-rail-toggle">▴</span>
+                    </div>
+                    <div class="plan-rail-body" id="plan-rail-body"></div>
+                  </div>
+                  <div class="chat-attachments" id="chat-attachments" style="display:none"></div>
                 </div>
-                <input type="file" id="chat-attach-input" multiple style="display:none"
-                       accept=".md,.markdown,.txt,.csv,.tsv,.json,.yaml,.yml,.log,.pdf,.docx,.png,.jpg,.jpeg,.webp,.gif,text/plain,text/markdown,text/csv,application/json,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/png,image/jpeg,image/webp,image/gif" />
-                <button id="chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="Send">
-                  <svg class="send-icon" viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"></path></svg>
-                  <svg class="stop-icon" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>
-                </button>
+                <div class="chat-quote-preview" id="chat-quote-preview" style="display:none"></div>
+                <textarea id="chat-input" data-i18n-placeholder="chat.input_placeholder" placeholder="Continue the conversation..." rows="2"></textarea>
+                <div class="chat-bottom-bar">
+                  <button type="button" class="chat-attach-btn" id="chat-attach-btn" data-i18n-title="chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
+                  <!-- Voice-to-text mic button (stripped in OrkasOpen — see OpenSource/SyncCode/strip-rules.json). -->
+                  <button type="button" class="chat-attach-btn chat-mic-btn" id="chat-mic-btn" data-i18n-title="chat.mic_title" title="Voice input">
+                    <span data-ui-icon="mic" data-ui-icon-class="chat-mic-icon"></span>
+                  </button>
+                  <button type="button" class="chat-recipient-chip" id="chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Switch recipient (commander / agent)">
+                    <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
+                    <span class="chat-recipient-name" id="chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
+                  </button>
+                  <div class="chat-skill-chip" id="chat-skill-chip" data-target="conversation" style="display:none">
+                    <span class="chip-label"></span>
+                    <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
+                  </div>
+                  <input type="file" id="chat-attach-input" multiple style="display:none"
+                         accept=".md,.markdown,.txt,.csv,.tsv,.json,.yaml,.yml,.log,.pdf,.docx,.png,.jpg,.jpeg,.webp,.gif,text/plain,text/markdown,text/csv,application/json,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/png,image/jpeg,image/webp,image/gif" />
+                  <button id="chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="Send">
+                    <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
+                    <span data-ui-icon="stop" data-ui-icon-class="stop-icon"></span>
+                  </button>
+                </div>
               </div>
             </div>
           </div>
+          <aside class="conversation-info-panel" id="conversation-info-panel" hidden>
+            <div class="conversation-info-header">
+              <div class="conversation-info-title" data-i18n="conversation_info.title">Conversation info</div>
+              <button type="button" class="conversation-info-close" id="conversation-info-close"
+                      data-i18n-title="common.close" data-i18n-aria-label="common.close"
+                      title="Close" aria-label="Close">×</button>
+            </div>
+            <div class="conversation-info-tabs" role="tablist">
+              <button type="button" class="conversation-info-tab is-active" data-info-tab="tasks" data-i18n="conversation_info.tab_tasks">Tasks</button>
+              <button type="button" class="conversation-info-tab" data-info-tab="files" data-i18n="conversation_info.tab_files">Files</button>
+              <button type="button" class="conversation-info-tab" data-info-tab="attachments" data-i18n="conversation_info.tab_attachments">Attachments</button>
+            </div>
+            <div class="conversation-info-body" id="conversation-info-body"></div>
+          </aside>
         </div>
       </section>
 
@@ -200,7 +244,7 @@
                 <span class="skills-doc-source" id="skills-detail-source"></span>
                 <div class="skills-doc-actions" id="skills-detail-actions">
                   <button class="btn-icon-use" id="skill-use-btn" data-i18n-title="skills.use_tooltip" data-i18n-aria-label="skills.use_tooltip" aria-label="Use this skill">
-                    <svg class="icon-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><polygon points="5,3 5,13 13,8" fill="currentColor"/></svg>
+                    <span data-ui-icon="play-triangle" data-ui-icon-class="icon-play"></span>
                   </button>
                   <button class="btn btn-sm" id="skill-edit-btn" data-i18n="skills.edit">Edit</button>
                   <button class="btn btn-sm" id="skill-enabled-btn" data-i18n="component.disable">Disable</button>
@@ -252,8 +296,8 @@
             <div class="skills-chat-input-area">
               <textarea id="skills-chat-input" data-i18n-placeholder="skills.chat_input_placeholder" placeholder="Describe what to change..." rows="1"></textarea>
               <button id="skills-chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="Send">
-                <svg class="send-icon" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"></path></svg>
-                <svg class="stop-icon" viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>
+                <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
+                <span data-ui-icon="stop" data-ui-icon-class="stop-icon"></span>
               </button>
             </div>
           </div>
@@ -297,7 +341,7 @@
                   <span class="agents-detail-source" id="agents-detail-source"></span>
                   <div class="detail-actions" id="agents-detail-actions">
                     <button class="btn-icon-use" id="agent-use-btn" data-i18n-title="agents.use_tooltip" data-i18n-aria-label="agents.use_tooltip" aria-label="Use this agent">
-                      <svg class="icon-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><polygon points="5,3 5,13 13,8" fill="currentColor"/></svg>
+                      <span data-ui-icon="play-triangle" data-ui-icon-class="icon-play"></span>
                     </button>
                     <button class="btn btn-sm" id="agent-edit-btn" data-i18n="agents.edit_btn_edit">Edit</button>
                     <button class="btn btn-sm" id="agent-enabled-btn" data-i18n="component.disable">Disable</button>
@@ -321,15 +365,6 @@
                   <div class="agents-detail-label" data-i18n="agents.label_workflow">Workflow</div>
                   <div class="agents-detail-workflow markdown-body" id="agents-detail-workflow" contenteditable="false"></div>
                 </div>
-                <div class="agents-detail-section" id="agents-detail-connectors-section">
-                  <div class="agents-detail-label" data-i18n="agents.label_connectors">Connectors</div>
-                  <div class="agents-detail-connectors" id="agents-detail-connectors"></div>
-                </div>
-                <div class="agents-detail-section" id="agents-detail-output-format-section">
-                  <div class="agents-detail-label" data-i18n="agents.label_output_format">Output format</div>
-                  <div class="agents-detail-output-format" id="agents-detail-output-format"></div>
-                  <div class="form-hint muted" data-i18n="agents.output_format_hint">Hint to the agent on how to render replies. Auto = let the model pick per output.</div>
-                </div>
               </div>
             </div>
           </div>
@@ -349,8 +384,8 @@
             <div class="agents-chat-input-area">
               <textarea id="agents-chat-input" data-i18n-placeholder="agents.chat_input_placeholder" placeholder="Describe what to adjust..." rows="1"></textarea>
               <button id="agents-chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="Send">
-                <svg class="send-icon" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"></path></svg>
-                <svg class="stop-icon" viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>
+                <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
+                <span data-ui-icon="stop" data-ui-icon-class="stop-icon"></span>
               </button>
             </div>
           </div>
@@ -559,6 +594,13 @@
                   </div>
                 </div>
                 <!-- Past-due / grace warning row, populated only when status warrants. -->
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="account.subscription_title">会员</div>
+                </div>
+                    </div>
+                  </div>
+                </div>
+                <!-- Past-due / grace warning row, populated only when status warrants. -->
                 </div>
               </div>
             </div>
@@ -588,9 +630,17 @@
                   <span class="settings-status" data-i18n="settings.sync.pro_required">云端同步是 Pro 会员功能。开通后多台设备的对话、智能体、技能、知识库自动保持一致。</span>
                 </div>
                   <div class="settings-group-title" data-i18n="settings.sync.title">云端同步</div>
+                  </div>
                   <div class="settings-group-sub" data-i18n="settings.sync.privacy_note">数据通过 HTTPS 加密上传到私有云存储，仅你的账号可访问。</div>
                 </div>
-                <div class="settings-row">
+                <!-- Pro-required row: shown when current user is not Pro.
+                     Replaces the toggle row in that state so the user gets a
+                     clear "this is a Pro feature, subscribe" affordance instead
+                     of a toggle that just bounces them to a dialog. The
+                     existing toggle row + controls row still exist and stay
+                     functional for Pro users. -->
+                  <span class="settings-status" data-i18n="settings.sync.pro_required">云端同步是 Pro 会员功能。开通后多台设备的对话、智能体、技能、知识库自动保持一致。</span>
+                </div>
                   <label class="settings-toggle settings-toggle-tight">
                     <span data-i18n="settings.sync.toggle_enable">启用云端同步</span>
                   </label>
@@ -703,6 +753,17 @@
                   <span class="settings-status muted" id="settings-metacognition-status"></span>
                 </div>
               </div>
+
+              <div class="settings-group">
+                <div class="settings-group-head">
+                </div>
+                <div class="settings-row">
+                  <label class="settings-toggle">
+                  </label>
+                </div>
+                <div class="settings-row">
+                </div>
+              </div>
             </div>
 
             <!-- ───────────────────────── 配置 ───────────────────────── -->
@@ -813,10 +874,6 @@
         <div class="form-row">
           <label data-i18n="agent_modal.category">Category</label>
           <div class="ai-select" id="agent-category-select"></div>
-        </div>
-        <div class="form-row">
-          <label><span data-i18n="agents.label_output_format">Output format</span> <span class="form-hint" data-i18n="agents.output_format_hint">Tells the agent how to render replies.</span></label>
-          <div class="ai-select" id="agent-output-format-select"></div>
         </div>
         <div class="form-row">
           <label><span data-i18n="agent_modal.desc">Summary</span> <span class="form-hint" data-i18n="agent_modal.desc_hint">One line on what it does — the AI will generate a workflow from this</span></label>
@@ -1002,15 +1059,10 @@
   <div class="search-overlay" id="search-overlay" style="display:none">
     <div class="search-modal">
       <div class="search-input-row">
-        <svg class="search-input-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="11" cy="11" r="7"></circle>
-          <path d="m21 21-4.3-4.3"></path>
-        </svg>
+        <span data-ui-icon="search" data-ui-icon-class="search-input-icon"></span>
         <input type="text" id="search-input" data-i18n-placeholder="search.input_placeholder" placeholder="Search chats and knowledge base…" autocomplete="off" spellcheck="false" />
         <button class="search-close-btn" id="search-close-btn" data-i18n-title="search.close_title" title="Close (Esc)">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M18 6 6 18M6 6l12 12"></path>
-          </svg>
+          <span data-ui-icon="x" data-ui-icon-class="search-close-icon"></span>
         </button>
       </div>
       <div class="search-tabs" id="search-tabs" role="tablist">
@@ -1045,10 +1097,14 @@
        after boot.js (it calls bootApp); account_settings.js is invoked from settings.js::loadSettings. -->
   <script src="./views/login/login_panel.js"></script>
   <script src="./views/login/account_settings.js"></script>
+  <!-- Pro entitlement gate (renderer-side). Loads before voice / sync so window.proGate
+       exists when those modules attach button handlers. Stripped in OrkasOpen. -->
+  <script src="./modules/pro_gate.js"></script>
   <script src="./modules/avatar.js"></script>
   <script src="./modules/avatar-picker.js"></script>
   <script src="./modules/chat-input-form.js"></script>
   <script src="./modules/chat-lightbox.js"></script>
+  <script src="./modules/icons.js"></script>
   <script src="./modules/chat-file-viewer.js"></script>
   <script src="./modules/strip-structural-blocks.js"></script>
   <script src="./modules/projects.js"></script>
@@ -1056,6 +1112,7 @@
   <script src="./modules/conversation.js"></script>
   <script src="./modules/chat-artifact.js"></script>
   <script src="./modules/plan-rail.js"></script>
+  <script src="./modules/conversation-info.js"></script>
   <script src="./modules/queue-draft.js"></script>
   <script src="./modules/skills.js"></script>
   <script src="./modules/connectors.js"></script>

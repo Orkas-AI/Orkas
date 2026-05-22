@@ -38,22 +38,60 @@ if (mode !== 'electron' && mode !== 'node') {
 
 const prebuildInstallBin = require_.resolve('prebuild-install/bin.js');
 const sqliteDir = resolve(pcRoot, 'node_modules', 'better-sqlite3');
+const nativeAddon = resolve(sqliteDir, 'build', 'Release', 'better_sqlite3.node');
 
-// Fast-path: when target is `node`, the swap script itself runs under Node,
-// so a successful `require()` of the .node file proves it already matches
-// current Node's ABI — no need to invoke prebuild-install. Saves 1-2s on
-// repeat runs and dodges environments where spawning a grandchild Node
-// process is blocked (e.g. sandboxed shells that SIGKILL nested execve).
-//
-// `electron` mode has no symmetric check (current process is Node, can't
-// verify Electron ABI without spawning Electron-as-Node) — fall through.
-if (mode === 'node') {
-  try {
-    require_(resolve(sqliteDir, 'build', 'Release', 'better_sqlite3.node'));
-    process.exit(0);
-  } catch {
-    /* mismatch / missing → run prebuild-install below */
+function describeResult(result) {
+  const parts = [];
+  if (typeof result.status === 'number') parts.push(`exit ${result.status}`);
+  if (result.signal) parts.push(`signal ${result.signal}`);
+  if (result.error) parts.push(`error ${result.error.message}`);
+  return parts.join(', ') || 'unknown termination';
+}
+
+function firstUsefulLine(text) {
+  return String(text || '').split(/\r?\n/).map((s) => s.trim()).find(Boolean) || '';
+}
+
+function probeAbi(targetMode, { quiet = false } = {}) {
+  const requireSnippet = `require(${JSON.stringify(nativeAddon)})`;
+  const args = targetMode === 'electron'
+    ? [require_.resolve('electron/cli.js'), '-e', requireSnippet]
+    : ['-e', requireSnippet];
+  const result = spawnSync(process.execPath, args, {
+    cwd: pcRoot,
+    encoding: 'utf8',
+    stdio: 'pipe',
+    env: targetMode === 'electron'
+      ? { ...process.env, ELECTRON_RUN_AS_NODE: '1' }
+      : process.env,
+  });
+  if (result.status === 0) return true;
+  if (!quiet) {
+    const detail = describeResult(result);
+    const reason = firstUsefulLine(result.stderr) || firstUsefulLine(result.stdout);
+    console.error(`[swap-sqlite-abi] ${targetMode} ABI probe failed (${detail})${reason ? `: ${reason}` : ''}`);
   }
+  return false;
+}
+
+function rebuildNodeFromSource() {
+  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  return spawnSync(npm, ['rebuild', 'better-sqlite3'], {
+    cwd: pcRoot,
+    stdio: 'inherit',
+    env: {
+      ...process.env,
+      npm_config_build_from_source: 'better-sqlite3',
+    },
+  });
+}
+
+// Fast-path: probe the target runtime before touching the binary. Probe in a
+// child process instead of `require()`ing in this process: a bad native addon
+// can be killed by the OS before JS can catch an exception, and the wrapper
+// would only see `exit null`.
+if (probeAbi(mode, { quiet: true })) {
+  process.exit(0);
 }
 
 const args = [prebuildInstallBin];
@@ -76,7 +114,23 @@ const result = spawnSync(process.execPath, args, {
   stdio: 'inherit',
 });
 
-if (result.status !== 0) {
-  console.error(`[swap-sqlite-abi] prebuild-install exited with ${result.status}`);
-  process.exit(result.status ?? 1);
+// Some local environments have killed `prebuild-install` after the tarball was
+// already unpacked. Treat the post-install ABI probe as authoritative.
+if (probeAbi(mode, { quiet: true })) {
+  process.exit(0);
 }
+
+if (mode === 'node') {
+  console.error(`[swap-sqlite-abi] prebuild-install did not produce a loadable node ABI (${describeResult(result)}); rebuilding better-sqlite3 from source...`);
+  const rebuild = rebuildNodeFromSource();
+  if (probeAbi('node', { quiet: true })) {
+    process.exit(0);
+  }
+  console.error(`[swap-sqlite-abi] source rebuild did not produce a loadable node ABI (${describeResult(rebuild)})`);
+  probeAbi('node');
+  process.exit(rebuild.status ?? result.status ?? 1);
+}
+
+console.error(`[swap-sqlite-abi] prebuild-install did not produce a loadable ${mode} ABI (${describeResult(result)})`);
+probeAbi(mode);
+process.exit(result.status ?? 1);

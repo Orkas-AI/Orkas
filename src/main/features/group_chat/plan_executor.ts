@@ -22,9 +22,13 @@
  */
 
 import { Mutex } from 'async-mutex';
+import * as crypto from 'node:crypto';
+import * as path from 'node:path';
 
 import { createLogger } from '../../logger';
 import { t } from '../../i18n';
+import { userChatsDir } from '../../paths';
+import { readJsonl } from '../../storage';
 import { COMMANDER_ID, USER_ID, readMembers } from './state';
 import {
   readPlan, updateStep, markPlanCompletedSignaled,
@@ -32,7 +36,8 @@ import {
   type PlanFile, type PlanStep, type FailurePolicy,
 } from './plan';
 import type { ChatFormPayload } from './router';
-import { buildMention } from './router';
+import { buildMention, decodeSubmission } from './router';
+import type { GroupMessage } from './visibility';
 
 /** Per-cid mutex guarding plan-state transitions. Without this, when N
  * parallel-group agents finish nearly simultaneously, their reconcile
@@ -191,16 +196,14 @@ export interface ReconcileCtx {
  *  don't pull a circular import. Bus implements + injects on init. */
 export interface ExecutorBusHooks {
   /** Persist + emit a normal group message; same signature as `bus.enqueue`
-   *  but with one extra optional `triggered_step` knob. `attachments` lets
-   *  the executor forward the plan's `initial_attachments` so worker agents
-   *  receive the same image / file bytes the originating user turn carried. */
+   *  but with one extra optional `triggered_step` knob. */
   enqueue(params: {
     uid: string; cid: string;
     fromActorId: string; text: string;
     forceTo?: string[];
     triggered_step?: number;
     dispatch?: boolean;
-    attachments?: string[];
+    form?: ChatFormPayload;
   }): Promise<void>;
   /** Push a turn directly into commander's worker queue without persisting
    *  a chat message — used for the synthesis / commander-self steps where
@@ -584,6 +587,18 @@ export async function retryStep(
     const step = plan.steps.find((s) => s.index === stepIndex);
     if (!step) return { ok: false, error: 'step not found' };
     if (step.status !== 'failed') {
+      // The UI can issue a duplicate retry from stale DOM while the first
+      // retry has already re-armed the step. Treat those post-retry states as
+      // success so users do not see a false failure after recovery started.
+      if (
+        step.status === 'pending'
+        || step.status === 'in_progress'
+        || step.status === 'blocked'
+        || step.status === 'done'
+      ) {
+        log.info(`plan-step retry-noop cid=${cid} step=${stepIndex} current=${step.status}`);
+        return { ok: true };
+      }
       return { ok: false, error: `step is not in failed state (current: ${step.status})` };
     }
     await updateStep(uid, cid, stepIndex, 'pending', {
@@ -699,8 +714,39 @@ async function maybeMarkFinished(uid: string, cid: string, plan: PlanFile, ctx: 
       && assigneeMatches(s.assignee, actorId, members.actors),
     );
     if (!match) return;
+    if (actorId === USER_ID && !await acceptsUserStepCompletion(uid, cid, match, ctx)) return;
     await applyTermination(uid, cid, match, ctx);
   }
+}
+
+async function acceptsUserStepCompletion(
+  uid: string,
+  cid: string,
+  step: PlanStep,
+  ctx: ReconcileCtx,
+): Promise<boolean> {
+  const file = path.join(userChatsDir(uid), `${cid}.jsonl`);
+  const messages = await readJsonl<GroupMessage>(file, 100_000);
+  const userForms = messages.filter((m) => m.form?.agent_id === USER_ID);
+  const stepForms = userForms.filter((m) => m.form?.plan_step_index === step.index);
+  const candidates = stepForms.length ? stepForms : userForms;
+  const relevant = candidates.length ? candidates[candidates.length - 1] : undefined;
+  // Legacy conversations created before user-owned forms existed still need
+  // plain-text replies to complete user steps.
+  if (!relevant?.form) return true;
+
+  const text = ctx.finishedMessage?.text || '';
+  const submission = decodeSubmission(text);
+  const expectedFormId = relevant.form.form_id;
+  if (!submission || submission.agent_id !== USER_ID || submission.form_id !== expectedFormId) {
+    log.info(`plan-user-step ignored non-matching user message cid=${cid} step=${step.index} expected_form=${expectedFormId}`);
+    return false;
+  }
+  if (relevant.form.submitted !== true) {
+    log.info(`plan-user-step ignored unmarked submission cid=${cid} step=${step.index} form=${expectedFormId}`);
+    return false;
+  }
+  return true;
 }
 
 async function applyTermination(
@@ -817,20 +863,18 @@ async function dispatchStep(
 
   const rendered = renderTemplate(step.input, plan);
   const assignee = step.assignee.trim();
-  // Forward attachments captured at plan-set time so worker agents (and
-  // the user, for a `user`-assignee question) receive the same image / file
-  // bytes the triggering user turn carried — see PlanFile.initial_attachments.
-  const inheritedAttachments = plan.initial_attachments;
 
   if (USER_ALIASES.has(assignee.toLowerCase())) {
-    // Step asks user for input. Commander voice; render goes to user.
+    // Step asks user for input. Commander voice; render goes to user with
+    // a user-owned form so the reply can route back to the plan machinery
+    // without waking commander as an extra side conversation.
     await _hooks.enqueue({
       uid, cid,
       fromActorId: COMMANDER_ID,
       text: rendered,
       forceTo: [USER_ID],
       triggered_step: step.index,
-      ...(inheritedAttachments && inheritedAttachments.length ? { attachments: inheritedAttachments } : {}),
+      form: buildUserStepForm(step),
     });
     return;
   }
@@ -871,7 +915,6 @@ async function dispatchStep(
     forceTo: [agentId],
     triggered_step: step.index,
     dispatch: true,
-    ...(inheritedAttachments && inheritedAttachments.length ? { attachments: inheritedAttachments } : {}),
   });
 }
 
@@ -881,6 +924,23 @@ function assigneeDisplayPrefix(assignee: string): string {
   // user sees who got dispatched. `buildMention` preserves whitespace (see
   // its header).
   return buildMention(assignee.replace(/^@+/, ''));
+}
+
+function buildUserStepForm(step: PlanStep): ChatFormPayload {
+  const label = step.title.trim() || (step.input || '').trim() || 'response';
+  return {
+    form_id: crypto.randomBytes(8).toString('hex'),
+    agent_id: USER_ID,
+    plan_step_index: step.index,
+    fields: [{
+      id: 'response',
+      label,
+      type: 'textarea',
+      required: true,
+      default: '',
+    }],
+    submitted: false,
+  };
 }
 
 // ── Plan-complete signal ─────────────────────────────────────────────────

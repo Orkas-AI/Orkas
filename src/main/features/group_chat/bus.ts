@@ -32,6 +32,7 @@ import {
 } from './state';
 import {
   GroupMessage, appendVisible, readSlice, buildReplayPrefix,
+  type MarketplaceInstallRequest,
 } from './visibility';
 import {
   resolveRecipients, parseMentions, buildMention,
@@ -50,7 +51,9 @@ import {
 } from '../../paths';
 import * as agentsFeat from '../agents';
 import { isAgentEnabled } from '../component_enabled';
-import { buildLanguageDirective, t } from '../../i18n';
+import { buildLanguageDirective, descriptionLang, t } from '../../i18n';
+import * as marketplaceFeat from '../marketplace';
+import { readInstalls } from '../marketplace_installs';
 
 const log = createLogger('group_chat.bus');
 
@@ -180,6 +183,15 @@ interface WorkerState {
    * placeholder cleaned. Same staging pattern as pendingPlanAnnouncement +
    * deferred planExecutor.reconcile, just for direct dispatches. */
   pendingDispatches?: Array<{ to: string; message: string }>;
+  /** Marketplace install confirmations requested during a commander turn.
+   * The model can stage these via `marketplace_request_install`; the user
+   * decides in the renderer before any install side effect happens. */
+  pendingMarketplaceRequests?: MarketplaceInstallRequest[];
+  /** Last marketplace rows returned to the model in this turn, keyed by
+   *  `${kind}:${id}`. `marketplace_request_install` uses this to carry UI
+   *  metadata such as agent avatar tokens without relying on the model to
+   *  copy every field back. */
+  marketplaceSearchResults?: Map<string, Partial<MarketplaceInstallRequest>>;
 }
 
 interface CidState {
@@ -318,6 +330,7 @@ export interface EnqueueParams {
    * `agent_id` is the producing actor — the renderer routes a user→artifact
    * interaction result back to it. */
   artifacts?: Array<{ id: string; title: string; agent_id: string }>;
+  marketplace_requests?: MarketplaceInstallRequest[];
   plan_announcement?: boolean;
   /** Override resolved recipients (commander emitting plan announcement
    *  uses this to force `to=[user]`). Otherwise router decides. */
@@ -615,6 +628,9 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     ...(params.created_agents && params.created_agents.length ? { created_agents: params.created_agents } : {}),
     ...(params.created_skills && params.created_skills.length ? { created_skills: params.created_skills } : {}),
     ...(params.artifacts && params.artifacts.length ? { artifacts: params.artifacts } : {}),
+    ...(params.marketplace_requests && params.marketplace_requests.length
+      ? { marketplace_requests: params.marketplace_requests }
+      : {}),
     ...(params.plan_announcement ? { plan_announcement: true } : {}),
     ...(params.dispatch ? { dispatch: true } : {}),
     ...(params.process && params.process.length ? { process: params.process } : {}),
@@ -921,7 +937,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   let cliAgent: import('../agents').Agent | null = null;
   if (isCommander) {
     systemPrompt = await buildCommanderSystemPrompt(uid, cid, turnProjectScope?.agents ?? null);
-    extraTools = await buildCommanderExtraTools(state, w, item.attachments);
+    extraTools = await buildCommanderExtraTools(state, w);
     // skillList stays undefined for commander — every skill is globally
     // visible (skills are NOT project-scoped this round; see CLAUDE.md §6).
   } else {
@@ -1446,6 +1462,19 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     outcome = { ...outcome, text: t('chat.commander_dispatch_only', { agents: tags.join(', ') }) };
   }
 
+  // Marketplace install requests are visible side effects of a commander
+  // turn. They are staged by `marketplace_request_install` and attached to
+  // the final message so the renderer can show user-confirmation cards. If
+  // the model followed the tool instruction and produced no prose, still
+  // persist a bubble: the card itself is the thing the user needs to see.
+  const turnMarketplaceRequests = actor.kind === 'commander' && w.pendingMarketplaceRequests?.length
+    ? w.pendingMarketplaceRequests.slice()
+    : [];
+  if (actor.kind === 'commander') w.pendingMarketplaceRequests = undefined;
+  if (turnMarketplaceRequests.length > 0 && outcome.kind === 'silent') {
+    outcome = { kind: 'persist', text: '' };
+  }
+
   // Abort post-processing — single source of truth for both "promote silent
   // to persist when there's still something visible to keep" AND the
   // "(stopped)" suffix.
@@ -1497,6 +1526,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       ...(turnArtifacts.length
         ? { artifacts: turnArtifacts.map((a) => ({ id: a.id, title: a.title, agent_id: actor.id })) }
         : {}),
+      ...(turnMarketplaceRequests.length ? { marketplace_requests: turnMarketplaceRequests } : {}),
       ...(pendingPlan && actor.kind === 'commander'
         ? { plan_announcement: true, forceTo: [USER_ID] } : {}),
       ...(processItems.length ? { process: processItems } : {}),
@@ -1542,14 +1572,6 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   if (actor.kind === 'commander' && w.pendingDispatches && w.pendingDispatches.length) {
     const pending = w.pendingDispatches;
     w.pendingDispatches = undefined;
-    // Inherit the commander turn's user-uploaded attachments so the recipient
-    // worker sees the same image / file bytes the commander saw. Without this
-    // a worker honestly answers "I can't see the image" because turnImages
-    // only fires when `item.attachments` is populated. Plan-step dispatches
-    // get the same inheritance via PlanFile.initial_attachments (persisted
-    // because steps live across worker turn boundaries); dispatch_to is one-
-    // shot so per-turn flush is enough.
-    const inheritedAttachments = item.attachments;
     for (const d of pending) {
       try {
         await enqueue({
@@ -1558,9 +1580,6 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
           text: d.message,
           forceTo: [d.to],
           dispatch: true,
-          ...(inheritedAttachments && inheritedAttachments.length
-            ? { attachments: inheritedAttachments }
-            : {}),
         });
       } catch (err) {
         log.warn(`dispatch_to flush failed cid=${cid} to=${d.to}: ${(err as Error).message}`);
@@ -1679,7 +1698,7 @@ export async function _buildAgentsIndexBlockForTest(uid: string): Promise<string
 async function buildAgentsIndexBlock(uid: string, allowedIds?: readonly string[] | null): Promise<string> {
   const { getCurrentLang } = await import('../../i18n');
   const { pickDescription } = await import('#core-agent');
-  const lang = getCurrentLang();
+  const lang = descriptionLang(getCurrentLang());
   const customRoot = path.resolve(userAgentsDir(uid));
   const builtinRoot = path.resolve(userMarketplaceAgentsDir(uid));
   const header = [
@@ -1721,7 +1740,7 @@ async function buildAgentsIndexBlock(uid: string, allowedIds?: readonly string[]
 
 async function buildAgentInGroupSystemPrompt(
   _uid: string,
-  agent: { name?: string; description?: string; workflow?: string; agent_id: string; inputs?: unknown; output_format?: string },
+  agent: { name?: string; description?: string; workflow?: string; agent_id: string; inputs?: unknown },
   workingDir: string,
 ): Promise<string> {
   const { prompts } = await import('../../prompts/loader');
@@ -1747,47 +1766,102 @@ async function buildAgentInGroupSystemPrompt(
     workflow: (agent.workflow || '').trim() || '(not provided)',
     inputs_schema: inputsSchemaJson || '(none)',
     working_dir: workingDir,
-    output_format_hint: buildOutputFormatHint(agent.output_format),
   });
   const shared = prompts.load('chat_shared_rules', {});
   return appendLanguageDirective(concatSharedRules(main, shared));
 }
 
-/** Render the agent's `output_format` preference as a one-line worker prompt
- *  hint. Sits in the `## Runtime injection` tail (most-volatile slot per
- *  PC/CLAUDE.md §3 prompt-md cache layout). `'auto'` (legacy) and missing both
- *  produce an empty string — old agents authored before the redesign keep
- *  unconstrained behavior until the user explicitly picks a value. `'artifact'`
- *  is the renamed `'allow_artifacts'`; the old key is accepted as an alias for
- *  on-disk back-compat (specs written by pre-redesign builds). See
- *  `chat_shared_rules.md` "Output formats" for the underlying rule. */
-function buildOutputFormatHint(format: string | undefined): string {
-  switch (format) {
-    case 'markdown_only':
-      return '### Output format\nThis agent is configured **markdown-only**: do NOT emit `:::dashboard` blocks or call `create_artifact`. Plain markdown only.';
-    case 'dashboard':
-      return '### Output format\nThis agent is configured for **dashboard output**: prefer `:::dashboard` for structured snapshots (KPIs, tables, alerts, timelines); do NOT call `create_artifact`.';
-    case 'artifact':
-    case 'allow_artifacts':
-      return '### Output format\nThis agent is configured to **allow artifacts**: prefer `:::dashboard` for structured snapshots; reach for `create_artifact` when interactivity actually matters.';
-    case 'auto':
-    default:
-      return '';
-  }
+// ── Commander tools (plan_set / marketplace / dispatch) ─────────────────
+
+function _toolJson(data: unknown): { content: string } {
+  return { content: JSON.stringify(data) };
 }
 
-// ── Commander tools (plan_set / plan_update) ────────────────────────────
+function _toolError(error: string): { content: string; isError: true } {
+  return { content: JSON.stringify({ ok: false, error }), isError: true };
+}
 
-async function buildCommanderExtraTools(
-  state: CidState,
-  w: WorkerState,
-  // Attachments on the current commander turn's source item — passed through
-  // to plan_set so the plan persists them under `initial_attachments`. Worker
-  // dispatches in subsequent reconciles read it back from the plan so image /
-  // file bytes follow the dispatch chain. Same flow as `dispatch_to` flush,
-  // but persisted because plan steps live across worker turn boundaries.
-  currentTurnAttachments?: string[],
-): Promise<AgentTool[]> {
+function _clampLimit(raw: unknown, fallback: number, min: number, max: number): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+function _trimText(raw: unknown, max = 2000): string {
+  const s = typeof raw === 'string' ? raw.trim() : '';
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+function _normaliseMarketplaceKind(raw: unknown, allowBoth = false): 'agent' | 'skill' | 'both' | null {
+  const v = String(raw || (allowBoth ? 'both' : '')).trim().toLowerCase();
+  if (v === 'agent' || v === 'skill') return v;
+  if (allowBoth && v === 'both') return 'both';
+  return null;
+}
+
+function _compactMarketplaceItem(
+  kind: 'agent' | 'skill',
+  item: marketplaceFeat.MarketplaceAgent | marketplaceFeat.MarketplaceSkill,
+  installedIds: Set<string>,
+) {
+  const installed = installedIds.has(item.id);
+  const base = {
+    kind,
+    id: item.id,
+    name: item.name,
+    description_zh: item.description_zh || '',
+    description_en: item.description_en || '',
+    category: item.category || '',
+    version: item.version,
+    published_at: item.published_at,
+    create_uid: item.create_uid || '',
+    download_count: item.download_count || 0,
+    installed,
+  };
+  if (kind !== 'agent') return base;
+  const agent = item as marketplaceFeat.MarketplaceAgent;
+  return {
+    ...base,
+    icon: agent.icon || '',
+    color: agent.color || '',
+  };
+}
+
+function _marketplaceSearchTerms(query: string): string[] {
+  const out: string[] = [];
+  const push = (s: string) => {
+    const v = s.trim();
+    if (v.length < 2) return;
+    if (out.includes(v)) return;
+    out.push(v);
+  };
+  const commonHanTerms = [
+    '学习', '论文', '学术', '阅读', '精读', '研究', '导师', '助教', '助手',
+    '教育', '课程', '知识', '写作', '编程', '产品', '设计', '数据', '分析',
+    '营销', '法律', '财务', '医学', '心理', '苏格拉底',
+  ];
+  const hanRuns: string[] = [];
+  push(query);
+  for (const token of query.split(/[\s,，;；:：|/]+/g)) {
+    push(token);
+    const runs = token.match(/[\u3400-\u9fff]{2,}/g) || [];
+    hanRuns.push(...runs);
+    for (const run of runs) {
+      for (const term of commonHanTerms) {
+        if (run.includes(term)) push(term);
+      }
+    }
+  }
+  // Last-resort fallback for unknown Chinese compounds. Keep this after
+  // full tokens + common terms so weird cross-boundary bigrams ("文学",
+  // "习助") do not crowd out better English/user-supplied terms.
+  for (const run of hanRuns) {
+    for (let i = 0; i < run.length - 1; i += 1) push(run.slice(i, i + 2));
+  }
+  return out.slice(0, 12);
+}
+
+async function buildCommanderExtraTools(state: CidState, w: WorkerState): Promise<AgentTool[]> {
   const { uid, cid } = w;
   const tools: AgentTool[] = [];
   tools.push({
@@ -1854,9 +1928,6 @@ async function buildCommanderExtraTools(
         ...(typeof input?.initial_message === 'string' && input.initial_message.trim()
           ? { initial_message: String(input.initial_message) }
           : {}),
-        ...(currentTurnAttachments && currentTurnAttachments.length
-          ? { initial_attachments: currentTurnAttachments.slice() }
-          : {}),
         steps: raw.filter((s) => s && typeof s.title === 'string' && s.title.trim() && typeof s.assignee === 'string' && s.assignee.trim())
           .map((s) => ({
             title: String(s.title),
@@ -1891,6 +1962,259 @@ async function buildCommanderExtraTools(
       // synchronously here, so user immediately sees the plan card; only
       // the agent dispatch waits for commander to wrap up.
       return { content: JSON.stringify({ ok: true, plan: { steps: plan.steps } }) };
+    },
+  });
+
+  tools.push({
+    name: 'marketplace_search',
+    description: [
+      'Search the official marketplace catalog for agents and skills that are not already installed.',
+      'Use this only when the currently installed agents/skills and built-in tools do not adequately cover the user task, and a marketplace resource could materially help.',
+      'This tool only searches; it never installs. If you find one best candidate, call marketplace_request_install and then wait for the user decision.',
+    ].join(' '),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Search text describing the needed capability. Use the user language when possible.',
+        },
+        kind: {
+          type: 'string',
+          enum: ['agent', 'skill', 'both'],
+          description: 'Resource kind to search. Default: both.',
+        },
+        category: {
+          type: 'string',
+          description: 'Optional marketplace category code.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum results per kind (1-20). Default: 5.',
+        },
+        include_installed: {
+          type: 'boolean',
+          description: 'Include resources already installed. Default: false.',
+        },
+        official_only: {
+          type: 'boolean',
+          description: 'When true, only return platform-authored rows (create_uid == "0"). Default: false.',
+        },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+    async execute(input) {
+      const query = _trimText(input?.query, 300);
+      if (!query) return _toolError('`query` is required');
+      const kind = _normaliseMarketplaceKind(input?.kind, true) || 'both';
+      const category = _trimText(input?.category, 80);
+      const limit = _clampLimit(input?.limit, 5, 1, 20);
+      const includeInstalled = input?.include_installed === true;
+      const officialOnly = input?.official_only === true;
+      const size = Math.max(10, Math.min(50, limit * (includeInstalled ? 1 : 3)));
+      try {
+        const installs = await readInstalls(uid);
+        const installedAgentIds = new Set(installs.agents.map((a) => a.id));
+        const installedSkillIds = new Set(installs.skills.map((s) => s.id));
+        const terms = _marketplaceSearchTerms(query);
+        const filterRows = <T extends { id: string; create_uid?: string }>(
+          rows: T[],
+          installedIds: Set<string>,
+        ): T[] => rows
+          .filter((row) => includeInstalled || !installedIds.has(row.id))
+          .filter((row) => !officialOnly || String(row.create_uid || '') === '0')
+          .slice(0, limit);
+        const collectRows = async <T extends { id: string }>(
+          fetchRows: (term: string) => Promise<{ list: T[]; total: number }>,
+        ): Promise<{ rows: T[]; total: number }> => {
+          const merged = new Map<string, T>();
+          let maxTotal = 0;
+          for (const term of terms) {
+            const res = await fetchRows(term);
+            maxTotal = Math.max(maxTotal, res.total || 0);
+            for (const row of res.list || []) {
+              if (!merged.has(row.id)) merged.set(row.id, row);
+            }
+            if (merged.size >= limit * 3) break;
+          }
+          return { rows: Array.from(merged.values()), total: maxTotal };
+        };
+
+        const result: {
+          ok: true;
+          query: string;
+          searched_terms: string[];
+          agents?: ReturnType<typeof _compactMarketplaceItem>[];
+          skills?: ReturnType<typeof _compactMarketplaceItem>[];
+          totals: { agents?: number; skills?: number };
+        } = { ok: true, query, searched_terms: terms, totals: {} };
+
+        if (kind === 'agent' || kind === 'both') {
+          const res = await collectRows((term) => marketplaceFeat.listMarketplaceAgents({
+            q: term,
+            ...(category ? { category } : {}),
+            size,
+          }));
+          const rows = filterRows(res.rows || [], installedAgentIds);
+          result.agents = rows.map((a) => _compactMarketplaceItem('agent', a, installedAgentIds));
+          if (result.agents.length) {
+            if (!w.marketplaceSearchResults) w.marketplaceSearchResults = new Map();
+            for (const agent of result.agents) {
+              const meta = agent as {
+                id: string;
+                icon?: string;
+                color?: string;
+                description_zh?: string;
+                description_en?: string;
+                category?: string;
+                create_uid?: string;
+              };
+              w.marketplaceSearchResults.set(`agent:${agent.id}`, {
+                icon: meta.icon || '',
+                color: meta.color || '',
+                description_zh: meta.description_zh || '',
+                description_en: meta.description_en || '',
+                category: meta.category || '',
+                create_uid: meta.create_uid || '',
+              });
+            }
+          }
+          result.totals.agents = res.total || 0;
+        }
+        if (kind === 'skill' || kind === 'both') {
+          const res = await collectRows((term) => marketplaceFeat.listMarketplaceSkills({
+            q: term,
+            ...(category ? { category } : {}),
+            size,
+          }));
+          const rows = filterRows(res.rows || [], installedSkillIds);
+          result.skills = rows.map((s) => _compactMarketplaceItem('skill', s, installedSkillIds));
+          if (result.skills.length) {
+            if (!w.marketplaceSearchResults) w.marketplaceSearchResults = new Map();
+            for (const skill of result.skills) {
+              w.marketplaceSearchResults.set(`skill:${skill.id}`, {
+                description_zh: skill.description_zh || '',
+                description_en: skill.description_en || '',
+                category: skill.category || '',
+                create_uid: skill.create_uid || '',
+              });
+            }
+          }
+          result.totals.skills = res.total || 0;
+        }
+        return _toolJson(result);
+      } catch (err) {
+        return _toolError((err as Error).message || 'marketplace search failed');
+      }
+    },
+  });
+
+  tools.push({
+    name: 'marketplace_request_install',
+    description: [
+      'Ask the user to approve installing exactly one marketplace agent or skill found via marketplace_search.',
+      'This tool does not install anything. It renders a confirmation card for the user; after calling it, stop and wait for the user decision.',
+      'Use it only when the candidate is clearly useful for the current task. Prefer one best candidate over several speculative requests.',
+    ].join(' '),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['agent', 'skill'] },
+        id: { type: 'string', description: 'Marketplace resource id from marketplace_search.' },
+        name: { type: 'string', description: 'Human-readable resource name from marketplace_search.' },
+        icon: { type: 'string', description: 'For agents only: icon token from marketplace_search.' },
+        color: { type: 'string', description: 'For agents only: color token from marketplace_search.' },
+        description_zh: { type: 'string', description: 'Chinese description from marketplace_search.' },
+        description_en: { type: 'string', description: 'English description from marketplace_search.' },
+        category: { type: 'string', description: 'Category code from marketplace_search.' },
+        create_uid: { type: 'string', description: 'Author uid from marketplace_search; "0" means official.' },
+        version: { type: 'string', description: 'Version from marketplace_search.' },
+        published_at: { type: 'number', description: 'Published timestamp from marketplace_search.' },
+        reason: {
+          type: 'string',
+          description: 'Short user-facing reason this resource helps the current task.',
+        },
+      },
+      required: ['kind', 'id', 'name', 'version', 'published_at', 'reason'],
+      additionalProperties: false,
+    },
+    async execute(input) {
+      const kind = _normaliseMarketplaceKind(input?.kind, false);
+      if (kind !== 'agent' && kind !== 'skill') return _toolError('`kind` must be agent or skill');
+      const id = _trimText(input?.id, 128);
+      if (!safeId(id)) return _toolError('invalid marketplace id');
+      const version = _trimText(input?.version, 80);
+      if (!version) return _toolError('`version` is required');
+      const publishedAt = Number(input?.published_at);
+      if (!Number.isFinite(publishedAt)) return _toolError('`published_at` must be a number');
+      const name = _trimText(input?.name, 160) || id;
+      const reason = _trimText(input?.reason, 800);
+      if (!reason) return _toolError('`reason` is required');
+      const searchMeta = w.marketplaceSearchResults?.get(`${kind}:${id}`);
+      const icon = kind === 'agent'
+        ? (_trimText(input?.icon, 64) || _trimText(searchMeta?.icon, 64))
+        : '';
+      const color = kind === 'agent'
+        ? (_trimText(input?.color, 64) || _trimText(searchMeta?.color, 64))
+        : '';
+      const descriptionZh = _trimText(input?.description_zh, 1200) || _trimText(searchMeta?.description_zh, 1200);
+      const descriptionEn = _trimText(input?.description_en, 1200) || _trimText(searchMeta?.description_en, 1200);
+      const reqCategory = _trimText(input?.category, 80) || _trimText(searchMeta?.category, 80);
+      const createUid = _trimText(input?.create_uid, 80) || _trimText(searchMeta?.create_uid, 80);
+
+      try {
+        const installs = await readInstalls(uid);
+        const alreadyInstalled = kind === 'agent'
+          ? installs.agents.some((a) => a.id === id)
+          : installs.skills.some((s) => s.id === id);
+        if (alreadyInstalled) {
+          return _toolJson({
+            ok: true,
+            already_installed: true,
+            kind,
+            id,
+            instruction: 'This resource is already installed; use the installed agent or skill directly.',
+          });
+        }
+      } catch (err) {
+        log.warn(`marketplace_request_install readInstalls failed cid=${cid}: ${(err as Error).message}`);
+      }
+
+      if (!w.pendingMarketplaceRequests) w.pendingMarketplaceRequests = [];
+      const existing = w.pendingMarketplaceRequests.find((r) => r.kind === kind && r.id === id);
+      if (existing) {
+        return _toolJson({
+          ok: true,
+          request_id: existing.request_id,
+          status: 'pending_user_confirmation',
+          note: 'A confirmation request for this resource is already staged in this turn. Stop and wait for the user decision.',
+        });
+      }
+      const req: MarketplaceInstallRequest = {
+        request_id: genId12(),
+        kind,
+        id,
+        name,
+        ...(kind === 'agent' && icon ? { icon } : {}),
+        ...(kind === 'agent' && color ? { color } : {}),
+        ...(descriptionZh ? { description_zh: descriptionZh } : {}),
+        ...(descriptionEn ? { description_en: descriptionEn } : {}),
+        ...(reqCategory ? { category: reqCategory } : {}),
+        ...(createUid ? { create_uid: createUid } : {}),
+        version,
+        published_at: publishedAt,
+        reason,
+        status: 'pending',
+        requested_at: nowIso(),
+      };
+      w.pendingMarketplaceRequests.push(req);
+      return _toolJson({
+        ok: true,
+        request_id: req.request_id,
+        status: 'pending_user_confirmation',
+        instruction: 'Stop and wait for the user to install or skip this marketplace resource.',
+      });
     },
   });
 
@@ -2092,7 +2416,7 @@ planExecutor.bindBusHooks({
       ...(params.forceTo ? { forceTo: params.forceTo } : {}),
       ...(typeof params.triggered_step === 'number' ? { triggered_step: params.triggered_step } : {}),
       ...(params.dispatch ? { dispatch: true } : {}),
-      ...(params.attachments && params.attachments.length ? { attachments: params.attachments } : {}),
+      ...(params.form ? { form: params.form } : {}),
     });
   },
 

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   t, setCurrentLang, getCurrentLang,
-  detectSystemLang, isLang, _resetCacheForTests,
+  acceptLanguageHeader, detectSystemLang, descriptionLang, isLang, _resetCacheForTests,
 } from '../../src/main/i18n';
 
 beforeEach(() => {
@@ -16,17 +16,24 @@ describe('i18n › detectSystemLang', () => {
     }
   });
 
-  it('falls back to en for non-zh / malformed / empty', () => {
-    for (const v of ['en-US', 'ja-JP', 'fr', '', null, undefined, 42]) {
+  it('maps ja* locales to ja', () => {
+    for (const v of ['ja', 'ja-JP']) {
+      expect(detectSystemLang(v)).toBe('ja');
+    }
+  });
+
+  it('falls back to en for non-supported / malformed / empty', () => {
+    for (const v of ['en-US', 'fr', '', null, undefined, 42]) {
       expect(detectSystemLang(v)).toBe('en');
     }
   });
 });
 
 describe('i18n › isLang', () => {
-  it('accepts exactly zh and en', () => {
+  it('accepts supported language codes', () => {
     expect(isLang('zh')).toBe(true);
     expect(isLang('en')).toBe(true);
+    expect(isLang('ja')).toBe(true);
     expect(isLang('ZH')).toBe(false);
     expect(isLang('fr')).toBe(false);
     expect(isLang('')).toBe(false);
@@ -40,6 +47,8 @@ describe('i18n › t() lookup', () => {
     expect(t('errors.not_utf8')).toBe('文本类文件必须是 UTF-8 编码');
     setCurrentLang('en');
     expect(t('errors.not_utf8')).toBe('Text files must be UTF-8 encoded');
+    setCurrentLang('ja');
+    expect(t('errors.not_utf8')).toBe('テキストファイルは UTF-8 エンコードである必要があります');
   });
 
   it('falls back to en when key missing in current lang', () => {
@@ -72,6 +81,22 @@ describe('i18n › t() lookup', () => {
   it('per-call lang override takes precedence over current', () => {
     setCurrentLang('en');
     expect(t('errors.not_utf8', undefined, 'zh')).toBe('文本类文件必须是 UTF-8 编码');
+    expect(t('errors.not_utf8', undefined, 'ja')).toBe('テキストファイルは UTF-8 エンコードである必要があります');
     expect(getCurrentLang()).toBe('en'); // override does not mutate state
+  });
+});
+
+describe('i18n › descriptionLang', () => {
+  it('uses English descriptions for non-Chinese UI languages', () => {
+    expect(descriptionLang('zh')).toBe('zh');
+    expect(descriptionLang('en')).toBe('en');
+    expect(descriptionLang('ja')).toBe('en');
+  });
+});
+
+describe('i18n › acceptLanguageHeader', () => {
+  it('prefers the active UI locale for HTTP language negotiation', () => {
+    expect(acceptLanguageHeader('ja').startsWith('ja-JP')).toBe(true);
+    expect(acceptLanguageHeader('zh').startsWith('zh-CN')).toBe(true);
   });
 });

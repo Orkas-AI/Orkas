@@ -79,10 +79,17 @@ describe('features/config › initLanguage', () => {
     expect(appConfig.readConfig().language).toBe('zh');
   });
 
-  it('falls back to en for non-zh locales on first boot', async () => {
+  it('detects ja-* on first boot and persists', async () => {
+    const { appConfig, i18n } = await load();
+    expect(appConfig.initLanguage('ja-JP')).toBe('ja');
+    expect(i18n.getCurrentLang()).toBe('ja');
+    expect(appConfig.readConfig().language).toBe('ja');
+  });
+
+  it('falls back to en for unsupported locales on first boot', async () => {
     const paths = await import('../../../src/main/paths');
     const prefPath = paths.userPreferencesFile(TEST_UID);
-    for (const locale of ['en-US', 'ja-JP', 'fr-FR', '']) {
+    for (const locale of ['en-US', 'fr-FR', '']) {
       fs.rmSync(prefPath, { force: true });
       vi.resetModules();
       const users = await import('../../../src/main/features/users');
@@ -105,9 +112,9 @@ describe('features/config › initLanguage', () => {
 describe('features/config › setLanguage', () => {
   it('persists + updates in-memory current lang', async () => {
     const { appConfig, i18n } = await load();
-    appConfig.setLanguage('zh');
-    expect(i18n.getCurrentLang()).toBe('zh');
-    expect(appConfig.readConfig().language).toBe('zh');
+    appConfig.setLanguage('ja');
+    expect(i18n.getCurrentLang()).toBe('ja');
+    expect(appConfig.readConfig().language).toBe('ja');
   });
 
   it('rejects unsupported languages', async () => {

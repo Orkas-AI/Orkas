@@ -22,12 +22,12 @@ import * as path from 'node:path';
 
 import { userMarketplaceSkillsDir, userSkillsDir } from '../../paths';
 import { getActiveUserId } from '../../features/users';
-import { getCurrentLang } from '../../i18n';
+import { descriptionLang, getCurrentLang } from '../../i18n';
 // `pickDescription` is loaded lazily — see CLAUDE.md §3: any static import
 // from `#core-agent` at module load would pull in pi-ai before
 // `sdk-timeout-patch` has had a chance to monkey-patch it. The cached fn is
 // hydrated on first render call, after the loader is already initialized.
-type PickDescription = (s: { description_zh?: string; description_en?: string }, lang: 'zh' | 'en') => string;
+type PickDescription = (s: { description_zh?: string; description_en?: string }, lang: string) => string;
 let _pickDescription: PickDescription | null = null;
 async function getPickDescription(): Promise<PickDescription> {
   if (_pickDescription) return _pickDescription;
@@ -78,7 +78,7 @@ async function renderSkillLines(
   builtinRoot: string,
 ): Promise<string> {
   if (!specs.length) return '';
-  const lang = getCurrentLang();
+  const lang = descriptionLang(getCurrentLang());
   const pick = await getPickDescription();
   // Each entry shows the human `name` (what the model uses to decide *whether* to reach
   // for the skill) plus the raw `id` (what goes into the read_file path). They DIVERGE for
@@ -189,7 +189,7 @@ export async function invalidateSkills(): Promise<void> {
 /** For diagnostics: return the skill list. Picks a description per the active UI language. */
 export async function listSkills(): Promise<Array<{ id: string; name: string; description: string }>> {
   const loader = await getLoader();
-  const lang = getCurrentLang();
+  const lang = descriptionLang(getCurrentLang());
   const pick = await getPickDescription();
   return loader.list().map((s) => ({ id: s.id, name: s.name, description: pick(s, lang) }));
 }

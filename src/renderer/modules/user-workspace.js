@@ -161,12 +161,13 @@ function _createWorkspaceChip(target) {
   // ("给:" / "项目:" / "工作区:") — the folder icon was replaced per UX
   // feedback so all three left-side chips read as "[label]: [value]".
   const prefix = (t('workspace.chip_label'));
+  const chevronIcon = (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function')
+    ? window.uiIconHtml('chevron-down', 'workspace-chip-chevron')
+    : '';
   chip.innerHTML =
     `<span class="workspace-chip-prefix">${escapeHtml(prefix)}</span>` +
     '<span class="workspace-chip-label"></span>' +
-    '<svg class="workspace-chip-chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5">' +
-    '<polyline points="6 9 12 15 18 9"/>' +
-    '</svg>';
+    chevronIcon;
 
   chip.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -282,7 +283,9 @@ function _createMenuItem(text, isActive, onClick) {
   if (isActive) {
     const check = document.createElement('span');
     check.className = 'workspace-menu-check';
-    check.textContent = '✓';
+    check.innerHTML = typeof window !== 'undefined' && typeof window.uiIconHtml === 'function'
+      ? window.uiIconHtml('check', 'ui-icon workspace-check-icon')
+      : '';
     item.appendChild(check);
   }
   item.addEventListener('click', onClick);

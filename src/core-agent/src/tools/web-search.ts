@@ -33,6 +33,10 @@ const MAX_COUNT = 20;
 const USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
+function acceptLanguage(): string {
+  return process.env.ORKAS_ACCEPT_LANGUAGE || "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7";
+}
+
 export type SearchProvider = "brave" | "bing";
 
 type SearchResult = {
@@ -290,7 +294,7 @@ async function runProviderSearch(
       headers: {
         "User-Agent": USER_AGENT,
         Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Language": acceptLanguage(),
       },
       signal: controller.signal,
       redirect: "follow",

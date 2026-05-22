@@ -42,7 +42,6 @@ import { DEFAULT_USER_WORKSPACE, userWorkspaceConfigFile } from '../paths';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
 import { pruneOrphans } from './file_indexer';
-import { getConversation } from './chats';
 
 const log = createLogger('user-workspace');
 
@@ -194,6 +193,7 @@ export function getWorkspacePath(userId: string, projectId?: string): string {
 export async function resolveProjectIdForCid(userId: string, cid?: string): Promise<string | undefined> {
   if (!cid) return undefined;
   try {
+    const { getConversation } = await import('./chats');
     const conv = await getConversation(userId, cid);
     const pid = (conv as any)?.project_id;
     return typeof pid === 'string' && pid ? pid : undefined;

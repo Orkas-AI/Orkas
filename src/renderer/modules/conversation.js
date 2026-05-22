@@ -1,5 +1,10 @@
 const _convLog = createLogger('conversation');
 
+function _uiIconHtml(name, className) {
+  if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') return window.uiIconHtml(name, className || 'ui-icon');
+  return '';
+}
+
 // ─── @-mention highlighting (post-render DOM walk) ────────────────────────
 // Wrap `@<token>` matches in a `<span class="msg-mention">` so the chat
 // bubbles paint mentions in accent color. Done after markdown render via a
@@ -348,6 +353,7 @@ function onEnterConversationView() {
   // loadConversationHistory is intentionally skipped). Without this hook,
   // the rail would keep displaying the previous cid's plan content.
   if (window.PlanRail) window.PlanRail.bind(currentCid || null);
+  if (window.ConversationInfo) window.ConversationInfo.bind(currentCid || null);
   // Quote preview is per-cid; rerender so a quote captured in another conv
   // doesn't bleed into this one (and a quote left in this conv reappears
   // when the user navigates back).
@@ -362,6 +368,7 @@ function _forgetCidRecipient(cid) {
     delete _recipientByCid[cid];
     _saveRecipientMap();
   }
+  setGroupConversationBusy(cid, false);
   _latestInFlight.delete(cid);
   _lastInteractiveTurnAgent.delete(cid);
   // Drop any pending quote for the deleted conv (memory only — no localStorage).
@@ -645,6 +652,7 @@ async function _refreshGroupMembers(cid) {
     const data = await res.json();
     if (data?.ok && Array.isArray(data.actors)) {
       _groupMembersCache.set(cid, data.actors);
+      _refreshActorPlaceholders(cid);
       // Roster change can flip the inline "create agent" button visibility:
       // a freshly @-mentioned agent joins members.json before it streams a
       // reply, and the button must hide as soon as that happens.
@@ -656,6 +664,18 @@ async function _refreshGroupMembers(cid) {
   } catch (_) { /* non-fatal */ }
   return _groupMembersCache.get(cid) || [];
 }
+
+function _rememberGroupActor(cid, actor) {
+  if (!cid || !actor || !actor.id) return;
+  const existing = _groupMembersCache.get(cid) || [];
+  const idx = existing.findIndex((x) => x && x.id === actor.id);
+  const next = existing.slice();
+  if (idx >= 0) next[idx] = { ...next[idx], ...actor };
+  else next.push(actor);
+  _groupMembersCache.set(cid, next);
+  _refreshActorPlaceholders(cid, actor.id);
+}
+
 // Read-side normalizer: jsonl records written before the multi-edit
 // migration carry singular `created_agent`; new ones carry plural
 // `created_agents`. Returns the array, or `null` when neither field is set.
@@ -698,6 +718,7 @@ function _groupMsgToLegacy(gm) {
     ...(_normalizeCreatedAgents(gm) ? { created_agents: _normalizeCreatedAgents(gm) } : {}),
     ...(_normalizeCreatedSkills(gm) ? { created_skills: _normalizeCreatedSkills(gm) } : {}),
     ...(Array.isArray(gm.artifacts) && gm.artifacts.length ? { artifacts: gm.artifacts } : {}),
+    ...(Array.isArray(gm.marketplace_requests) && gm.marketplace_requests.length ? { marketplace_requests: gm.marketplace_requests } : {}),
     ...(gm.plan_announcement ? { _plan_announcement: true } : {}),
     ...(Array.isArray(gm.process) && gm.process.length ? { process: gm.process } : {}),
   };
@@ -727,6 +748,11 @@ const CHAT_ATTACH_ACCEPT = [
 const CHAT_IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.webp', '.gif'];
 const CHAT_VIDEO_EXTS = ['.mp4', '.webm', '.mov', '.m4v', '.ogv'];
 
+function _chatFileIconHtml(name, kind) {
+  if (typeof window !== 'undefined' && typeof window.fileKindIconHtml === 'function') return window.fileKindIconHtml(name, kind);
+  return '';
+}
+
 function _chatAttachExtOf(name) {
   const i = (name || '').lastIndexOf('.');
   return i >= 0 ? name.slice(i).toLowerCase() : '';
@@ -754,6 +780,9 @@ function _chatAttachList(cid) {
 function _chatAttachSet(cid, items) {
   _chatAttachments.set(cid, items);
   _chatAttachRenderChips(cid);
+  if (cid && cid === currentCid && window.ConversationInfo) {
+    window.ConversationInfo.refreshAttachments(cid);
+  }
 }
 
 function _chatAttachClear(cid) {
@@ -786,12 +815,8 @@ function _chatAttachRenderChips(cid) {
   host.style.display = '';
   host.innerHTML = items.map((it, i) => {
     const icon = it.kind === 'image'
-      ? (it.dataUrl ? `<img class="chat-attach-thumb" src="${it.dataUrl}" alt="">` : '🖼')
-      : it.kind === 'video'
-      ? '🎬'
-      : it.kind === 'pdf' ? '📄'
-      : it.kind === 'docx' ? '📝'
-      : '📃';
+      ? (it.dataUrl ? `<img class="chat-attach-thumb" src="${it.dataUrl}" alt="">` : _chatFileIconHtml(it.name, it.kind))
+      : _chatFileIconHtml(it.name, it.kind);
     const label = escapeHtml(it.name);
     const busy = it.status === 'uploading';
     const errored = it.status === 'error';
@@ -948,11 +973,7 @@ function _renderMessageAttachmentsHtml(names, cid) {
   const items = names.map((n) => {
     const ext = _chatAttachExtOf(n);
     const kind = _chatAttachKindFromExt(ext);
-    const icon = kind === 'pdf' ? '📄'
-               : kind === 'docx' ? '📝'
-               : kind === 'image' ? '🖼'
-               : kind === 'video' ? '🎬'
-               : '📃';
+    const icon = _chatFileIconHtml(n, kind);
     const label = escapeHtml(n);
     if (kind === 'image' && cid) {
       const url = _chatMediaUrl(cid, n);
@@ -984,28 +1005,7 @@ function _renderMessageAttachmentsHtml(names, cid) {
 // offering "open the containing folder" for unsupported kinds.
 
 function _iconForProduced(name) {
-  const ext = (name.split('.').pop() || '').toLowerCase();
-  if (ext === 'pdf') return '📄';
-  if (ext === 'docx' || ext === 'doc') return '📝';
-  if (['png', 'jpg', 'jpeg', 'webp', 'gif', 'svg', 'bmp', 'ico'].includes(ext)) return '🖼';
-  if (['mp4', 'webm', 'mov', 'm4v', 'ogv', 'avi', 'mkv'].includes(ext)) return '🎬';
-  if (['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac'].includes(ext)) return '🎵';
-  if (['md', 'markdown', 'txt', 'log', 'rst', 'tex'].includes(ext)) return '📃';
-  if (['json', 'yaml', 'yml', 'toml', 'csv', 'tsv', 'xlsx', 'xls', 'xml', 'ini', 'conf'].includes(ext)) return '📊';
-  if (['zip', 'tar', 'gz', 'tgz', 'bz2', 'xz', '7z', 'rar'].includes(ext)) return '📦';
-  // Source code / scripts — covers .py / .ts / web / shell / mainstream langs.
-  // Anything else falls through to the generic "file" icon below.
-  if ([
-    'py', 'pyi', 'ipynb',
-    'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs',
-    'html', 'htm', 'css', 'scss', 'sass', 'less',
-    'sh', 'bash', 'zsh', 'fish', 'ps1', 'bat', 'cmd',
-    'rb', 'go', 'rs', 'java', 'kt', 'kts', 'scala',
-    'c', 'cpp', 'cc', 'cxx', 'h', 'hpp', 'hxx',
-    'php', 'swift', 'lua', 'pl', 'pm', 'r', 'dart',
-    'sql', 'graphql', 'gql', 'proto',
-  ].includes(ext)) return '📜';
-  return '📄';
+  return _chatFileIconHtml(name);
 }
 
 function _renderMessageProducedHtml(absPaths) {
@@ -1515,17 +1515,18 @@ async function loadConversationHistory(cid) {
     const processingFresh = convMeta.processing === true
       && convMeta.processing_since
       && (Date.now() - new Date(convMeta.processing_since).getTime()) < 15 * 60 * 1000;
-    if (lastMsg?.role === 'user' && !isConvPending(cid) && processingFresh) {
-      pollMsgCounts.set(cid, history.length);
-      const loadingEl = appendChatMessage({
-        role: 'assistant',
-        content: `<span class="chat-replying">${escapeHtml(t('chat.thinking'))}</span>`,
-        time: nowIsoLocal(),
-      });
-      pendingConvs.set(cid, { loadingEl, needsIndicator: false });
-      _updateConvSendUI(cid);
+    const wasPendingBeforeHistoryRecovery = isConvPending(cid);
+    if (processingFresh && !wasPendingBeforeHistoryRecovery) {
+      setGroupConversationBusy(cid, true);
       _updateConvSidebarBadge(cid, true);
       startPolling(cid);
+      if (cid === currentCid) _updateConvSendUI(cid);
+    }
+    if (lastMsg?.role === 'user' && !wasPendingBeforeHistoryRecovery && processingFresh) {
+      pollMsgCounts.set(cid, history.length);
+      const loadingEl = _createStreamingAssistantMessage(container, { hiddenUntilActor: true });
+      pendingConvs.set(cid, { loadingEl, needsIndicator: false });
+      _updateConvSendUI(cid);
     } else if (isConvPending(cid)) {
       // User navigated away and back during an in-flight request. The stream
       // reader loop in createChatController.send() holds the original msgEl
@@ -1534,18 +1535,18 @@ async function loadConversationHistory(cid) {
       // Minting a new one here (as before) stranded the stream: events kept
       // landing on the orphaned node and the new bubble stayed at "thinking…"
       // until stream end / polling rescue.
-      const state = pendingConvs.get(cid);
+      let state = pendingConvs.get(cid);
+      if (!state) {
+        state = { loadingEl: null, needsIndicator: false, controller: null, aborted: false };
+        pendingConvs.set(cid, state);
+      }
       pollMsgCounts.set(cid, history.length);
       if (state.loadingEl) {
         const emptyEl = container.querySelector('.empty');
         if (emptyEl) emptyEl.remove();
         _appendBeforeSpacer(container, state.loadingEl);
       } else {
-        const loadingEl = appendChatMessage({
-          role: 'assistant',
-          content: `<span class="chat-replying">${escapeHtml(t('chat.thinking'))}</span>`,
-          time: nowIsoLocal(),
-        });
+        const loadingEl = _createStreamingAssistantMessage(container, { hiddenUntilActor: true });
         state.loadingEl = loadingEl;
       }
       state.needsIndicator = false;
@@ -1557,8 +1558,10 @@ async function loadConversationHistory(cid) {
     // adds it post-scroll and it ends up below the visible area.
     _ensureConvCreateAgentInline();
     _scrollToBottomNoAnim(container);
+    if (window.ConversationInfo) window.ConversationInfo.refresh(cid);
   } catch (e) {
     container.innerHTML = `<div class="empty">${escapeHtml(t('chat.load_failed', { msg: e.message || '' }))}</div>`;
+    if (window.ConversationInfo) window.ConversationInfo.refresh(cid);
   }
 }
 
@@ -1695,7 +1698,11 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   // `_stripSurvivingStructuralBlocks` in strip-structural-blocks.js).
   let displayContent = rawContent;
   if (!isHtmlSnippet) {
-    if (role === 'user') displayContent = _stripArtifactResultTagForDisplay(_stripSubmissionTagForDisplay(rawContent));
+    if (role === 'user') {
+      displayContent = _stripMarketplaceInstallResultTagForDisplay(
+        _stripArtifactResultTagForDisplay(_stripSubmissionTagForDisplay(rawContent)),
+      );
+    }
     else if (role === 'assistant') displayContent = _stripSurvivingStructuralBlocks(rawContent);
   }
   const contentHtml = isHtmlSnippet
@@ -1735,7 +1742,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     ? `<div class="chat-msg-header chat-msg-header-user"><span class="chat-msg-time">${formatTime(message.time || new Date().toISOString())}</span></div>`
     : `<div class="chat-msg-header">${avatarHtml}<span class="chat-msg-from">${escapeHtml(headerName)}</span><span class="chat-msg-time">${formatTime(message.time || new Date().toISOString())}</span></div>`;
   const planAnnHtml = message._plan_announcement
-    ? `<div class="chat-plan-announce">📋 ${escapeHtml(t('chat.plan_announce'))}</div>` : '';
+    ? `<div class="chat-plan-announce">${_uiIconHtml('clipboard-list', 'ui-icon chat-plan-announce-icon')}<span>${escapeHtml(t('chat.plan_announce'))}</span></div>` : '';
   // Below-bubble action row holds produced-file chips + created-agent chip
   // + archive button (the legacy `.chat-meta` slot). Lives OUTSIDE the
   // bubble so chips read as a footer, not as inline body content.
@@ -1776,6 +1783,12 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
       _mountChatInputForm(formHost, msgDiv, message, opts);
     }
   }
+  // Commander → user marketplace install confirmation cards. The model can
+  // request approval, but only this human click path performs the install.
+  if (role === 'assistant' && Array.isArray(message.marketplace_requests) && message.marketplace_requests.length) {
+    const bubble = msgDiv.querySelector('.chat-bubble');
+    if (bubble) _mountMarketplaceInstallRequests(bubble, msgDiv, message, opts);
+  }
   // Interactive web-app artifacts (assistant messages only) — sandboxed
   // `<iframe>` over the `chat-app://` protocol, appended after the form so it
   // reads as "reply text → embedded app". See chat-artifact.js.
@@ -1790,7 +1803,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     _attachBubbleArchiveBtn(msgDiv, () => rawContent);
   }
   // Persisted-process trail is independent of body type — it must render
-  // for HTML-stub bodies too (e.g. CLI errors like `<span>⚠️ ...</span>`),
+  // for HTML-stub bodies too (e.g. CLI warning spans),
   // otherwise after a refresh the only visible signal of a failed run is
   // the red error line and "what happened" is gone. Auto-expand for any
   // empty / abort-stub / HTML-stub body so the rail IS the content.
@@ -1870,6 +1883,191 @@ function _mountChatInputForm(host, msgDiv, message, opts) {
   });
 }
 
+function _marketplaceRequestKindLabel(kind) {
+  return kind === 'skill' ? t('marketplace_request.kind_skill') : t('marketplace_request.kind_agent');
+}
+
+function _marketplaceRequestStatusLabel(status) {
+  if (status === 'installed') return t('marketplace_request.status_installed');
+  if (status === 'skipped') return t('marketplace_request.status_skipped');
+  if (status === 'failed') return t('marketplace_request.status_failed');
+  return t('marketplace_request.status_pending');
+}
+
+function _marketplaceRequestAgentAvatarHtml(req) {
+  return renderAvatarHtml(req.icon || '', req.color || '', {
+    size: 32,
+    seed: req.id || req.name || 'marketplace-agent',
+    extraClass: 'marketplace-card-avatar chat-marketplace-request-avatar',
+    dataAttrs: { 'mp-avatar-slot': '1' },
+  });
+}
+
+const _MARKETPLACE_REQUEST_CATEGORY_LABELS = {
+  education: { zh: '教育', en: 'Education' },
+  ecommerce: { zh: '电商', en: 'E-commerce' },
+  rnd: { zh: '产研', en: 'R&D' },
+  writing: { zh: '写作', en: 'Writing' },
+  data: { zh: '数据', en: 'Data' },
+  general: { zh: '通用', en: 'General' },
+};
+
+function _marketplaceRequestCategoryLabel(code, lang) {
+  if (!code) return '';
+  const row = _MARKETPLACE_REQUEST_CATEGORY_LABELS[String(code)] || null;
+  if (!row) return String(code);
+  return lang === 'zh' ? row.zh : row.en;
+}
+
+function _marketplaceRequestAuthorBadgeHtml(createUid) {
+  if (!createUid) return '';
+  const label = String(createUid) === '0'
+    ? t('marketplace.author_platform')
+    : t('marketplace.author_user').replace('{uid}', String(createUid));
+  const cls = String(createUid) === '0' ? 'marketplace-card-chip is-platform' : 'marketplace-card-chip is-user';
+  return `<span class="${cls}">${escapeHtml(label)}</span>`;
+}
+
+async function _hydrateMarketplaceRequestMeta(card, req, cid, msgId) {
+  if (!card || !req) return;
+  const hasAvatar = req.kind !== 'agent' || req.icon || req.color;
+  const hasCardMeta = req.description_zh || req.description_en || req.category || req.create_uid;
+  if (hasAvatar && hasCardMeta) return;
+  try {
+    const q = req.name || req.id || '';
+    const channel = req.kind === 'skill' ? 'marketplace.listSkills' : 'marketplace.listAgents';
+    const res = await window.orkas.invoke(channel, { q, size: 20 });
+    const row = (res?.list || []).find((x) => x && x.id === req.id);
+    if (!row) return;
+    req.icon = row.icon || '';
+    req.color = row.color || '';
+    req.description_zh = row.description_zh || '';
+    req.description_en = row.description_en || '';
+    req.category = row.category || '';
+    req.create_uid = row.create_uid || '';
+    _renderMarketplaceInstallCard(card, req, cid, msgId);
+  } catch (_) { /* fallback content is already rendered */ }
+}
+
+function _setMarketplaceCardBusy(card, busy) {
+  if (!card) return;
+  card.dataset.busy = busy ? '1' : '0';
+  card.classList.toggle('is-busy', !!busy);
+  card.querySelectorAll('button').forEach((btn) => { btn.disabled = !!busy; });
+}
+
+function _renderMarketplaceInstallCard(card, req, cid, msgId) {
+  if (!card || !req) return;
+  const status = req.status || 'pending';
+  const kind = req.kind === 'skill' ? 'skill' : 'agent';
+  card.className = `marketplace-card chat-marketplace-request is-${status}`;
+  card.dataset.marketplaceRequestId = String(req.request_id || '');
+  card.dataset.marketplaceKind = kind;
+  const name = req.name || req.id || '';
+  const kindLabel = _marketplaceRequestKindLabel(kind);
+  const statusLabel = _marketplaceRequestStatusLabel(status);
+  const version = req.version ? t('marketplace.version').replace('{version}', String(req.version)) : '';
+  const lang = getLang();
+  const descText = pickDesc(req, lang) || req.reason || '';
+  const desc = descText ? `<div class="marketplace-card-desc">${escapeHtml(descText)}</div>` : '';
+  const catLabel = _marketplaceRequestCategoryLabel(req.category, lang);
+  const meta = [
+    version ? `<span class="marketplace-card-chip is-version">${escapeHtml(version)}</span>` : '',
+    catLabel ? `<span class="marketplace-card-chip">${escapeHtml(catLabel)}</span>` : '',
+    _marketplaceRequestAuthorBadgeHtml(req.create_uid),
+  ].filter(Boolean).join('');
+  const error = req.error ? `<div class="chat-marketplace-request-error">${escapeHtml(req.error)}</div>` : '';
+  const iconHtml = kind === 'agent'
+    ? _marketplaceRequestAgentAvatarHtml(req)
+    : '';
+  const actions = status === 'pending'
+    ? `<div class="marketplace-card-actions chat-marketplace-request-actions">
+        <button type="button" class="btn btn-primary btn-sm" data-mp-decision="install">${escapeHtml(t('marketplace_request.install'))}</button>
+        <button type="button" class="btn btn-sm" data-mp-decision="skip">${escapeHtml(t('marketplace_request.skip'))}</button>
+      </div>`
+    : `<div class="marketplace-card-actions chat-marketplace-request-actions">
+        <span class="chat-marketplace-request-status">${escapeHtml(statusLabel)}</span>
+      </div>`;
+  card.innerHTML = `
+    <div class="marketplace-card-header chat-marketplace-request-head">
+      ${iconHtml}
+      <div class="chat-marketplace-request-main">
+        <div class="chat-marketplace-request-title-row">
+          <span class="marketplace-card-name chat-marketplace-request-title">${escapeHtml(name)}</span>
+          <span class="marketplace-card-chip chat-marketplace-request-kind">${escapeHtml(kindLabel)}</span>
+        </div>
+      </div>
+    </div>
+    ${desc}
+    ${error}
+    <div class="marketplace-card-footer chat-marketplace-request-footer">
+      <div class="marketplace-card-meta">${meta}</div>
+      ${actions}
+    </div>
+  `;
+
+  const installBtn = card.querySelector('[data-mp-decision="install"]');
+  const skipBtn = card.querySelector('[data-mp-decision="skip"]');
+  if (installBtn) {
+    installBtn.addEventListener('click', () => {
+      _resolveMarketplaceInstallRequest(card, { ...req, kind }, cid, msgId, 'install');
+    });
+  }
+  if (skipBtn) {
+    skipBtn.addEventListener('click', () => {
+      _resolveMarketplaceInstallRequest(card, { ...req, kind }, cid, msgId, 'skip');
+    });
+  }
+  _hydrateMarketplaceRequestMeta(card, { ...req, kind }, cid, msgId);
+}
+
+function _mountMarketplaceInstallRequests(host, msgDiv, message, opts) {
+  const cid = opts.cid || currentCid;
+  if (!cid || !host || !message) return;
+  const msgId = msgDiv.dataset.msgId || message._msg_id || '';
+  if (!msgId) return;
+  const requests = Array.isArray(message.marketplace_requests) ? message.marketplace_requests : [];
+  for (const req of requests) {
+    if (!req || !req.request_id) continue;
+    const selector = `.chat-marketplace-request[data-marketplace-request-id="${CSS.escape(String(req.request_id))}"]`;
+    if (host.querySelector(selector)) continue;
+    const card = document.createElement('div');
+    host.appendChild(card);
+    _renderMarketplaceInstallCard(card, req, cid, msgId);
+  }
+}
+
+async function _resolveMarketplaceInstallRequest(card, req, cid, msgId, decision) {
+  if (!card || card.dataset.busy === '1') return;
+  _setMarketplaceCardBusy(card, true);
+  const installBtn = card.querySelector('[data-mp-decision="install"]');
+  if (decision === 'install' && installBtn) installBtn.textContent = t('marketplace.installing');
+  try {
+    const res = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/marketplace-install`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ msgId, requestId: req.request_id, decision }),
+    });
+    const data = await res.json();
+    if (!data || data.ok === false) {
+      throw new Error((data && data.error) || 'marketplace install request failed');
+    }
+    const updated = data.request || { ...req, status: decision === 'install' ? 'installed' : 'skipped' };
+    _renderMarketplaceInstallCard(card, updated, cid, msgId);
+    if (updated.status === 'installed') {
+      if (updated.kind === 'agent') { try { loadAgents?.(true); } catch (_) {} }
+      else { try { loadSkills?.(true); } catch (_) {} }
+    }
+    const submissionText = data.submission && data.submission.text;
+    if (submissionText) await sendInCurrentConversation(submissionText);
+  } catch (err) {
+    _setMarketplaceCardBusy(card, false);
+    const reason = (err && err.message) || String(err);
+    _convLog.warn('marketplace install request failed', reason);
+    try { await uiAlert(t('marketplace.install_failed').replace('{reason}', reason)); } catch (_) {}
+  }
+}
+
 // Insert a "process info" block above the assistant bubble content
 // using the items we stored at stream time. Collapsed by default so
 // old threads stay tidy; the user can click ▶ to expand. Exception:
@@ -1897,9 +2095,11 @@ function _renderPersistedProcess(msgDiv, items, { expanded = false } = {}) {
     else if (item && item.type === 'event') text = _formatEventLine(item.event) || '';
     if (!text) continue;
     const line = document.createElement('div');
-    const kind = _processKindOf(text);
+    const kind = item && item.type === 'event'
+      ? _eventProcessKind(item.event, text)
+      : _processKindOf(text);
     line.className = 'stream-process-line' + (kind ? ' kind-' + kind : '');
-    line.textContent = text;
+    _setProcessLineContent(line, text, kind);
     body.appendChild(line);
   }
   if (body.childElementCount === 0) return;  // nothing renderable
@@ -1954,7 +2154,7 @@ function _renderQuotePreview() {
   const trunc = String(q.text || '');
   const fileChips = (q.produced || []).map((p) => {
     const base = String(p || '').split(/[\\/]/).pop() || p;
-    return `<span class="chat-quote-file" title="${escapeHtml(p)}">📎 ${escapeHtml(base)}</span>`;
+    return `<span class="chat-quote-file" title="${escapeHtml(p)}">${_chatFileIconHtml(base)}<span class="chat-quote-file-label">${escapeHtml(base)}</span></span>`;
   }).join('');
   wrap.innerHTML = `
     <div class="chat-quote-header">
@@ -2046,14 +2246,14 @@ function _attachBubbleArchiveBtn(msgDiv, getContent) {
     const text = typeof getContent === 'function' ? (getContent() || '') : '';
     if (!text.trim() || copyBtn.disabled) return;
     copyBtn.disabled = true;
-    const orig = copyBtn.textContent;
+    const orig = copyBtn.innerHTML;
     try {
       await navigator.clipboard.writeText(text);
-      copyBtn.textContent = t('chat.copy_done');
+      copyBtn.innerHTML = `${_uiIconHtml('check', 'ui-icon btn-inline-icon')}<span>${escapeHtml(t('chat.copy_done'))}</span>`;
     } catch (err) {
       copyBtn.textContent = t('chat.copy_failed');
     }
-    setTimeout(() => { copyBtn.textContent = orig; copyBtn.disabled = false; }, 1500);
+    setTimeout(() => { copyBtn.innerHTML = orig; copyBtn.disabled = false; }, 1500);
   });
   btn.addEventListener('click', async (e) => {
     e.stopPropagation();
@@ -2068,7 +2268,7 @@ function _attachBubbleArchiveBtn(msgDiv, getContent) {
     });
     if (!pick) return;
     btn.disabled = true;
-    const orig = btn.textContent;
+    const orig = btn.innerHTML;
     try {
       const res = await apiFetch('/api/contexts/write', {
         method: 'POST',
@@ -2077,7 +2277,7 @@ function _attachBubbleArchiveBtn(msgDiv, getContent) {
       });
       const data = await res.json();
       if (data.ok) {
-        btn.textContent = t('chat.archive_done');
+        btn.innerHTML = `${_uiIconHtml('check', 'ui-icon btn-inline-icon')}<span>${escapeHtml(t('chat.archive_done'))}</span>`;
         if (currentView === 'contexts' && typeof loadContexts === 'function') {
           loadContexts();
         }
@@ -2089,7 +2289,7 @@ function _attachBubbleArchiveBtn(msgDiv, getContent) {
       btn.textContent = t('chat.archive_failed');
       await uiAlert(t('chat.archive_failed_with_reason', { reason: err.message || err }));
     }
-    setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2000);
+    setTimeout(() => { btn.innerHTML = orig; btn.disabled = false; }, 2000);
   });
   actionsRow.appendChild(actions);
 }
@@ -2453,7 +2653,7 @@ function _msTs(input) {
   return Date.now();
 }
 
-function _createStreamingAssistantMessage(container) {
+function _createStreamingAssistantMessage(container, opts = {}) {
   if (typeof container === 'string') container = document.getElementById(container);
   if (!container) container = document.getElementById('chat-history');
   const emptyEl = container.querySelector('.empty');
@@ -2495,6 +2695,10 @@ function _createStreamingAssistantMessage(container) {
     </div>
   `;
   msg.dataset.placeholder = '1';
+  if (opts.hiddenUntilActor) {
+    msg.dataset.identityPending = '1';
+    msg.style.display = 'none';
+  }
   // Pin placeholder by creation time so `_insertByTimestamp` keeps it in
   // chronological order with surrounding messages. Updated to the actual
   // gm.ts when the placeholder finalizes (so the bubble's position settles
@@ -2509,30 +2713,92 @@ function _hideThinking(msg) {
   if (thinking) thinking.style.display = 'none';
 }
 
-// Map the leading glyph of a formatted line to a semantic CSS class so the
-// stylesheet can tone errors red, tool calls blue, etc. The full glyph
-// palette + which event each one comes from is documented at the top of
-// `_formatEventLine`. Keep the two in sync — adding a new glyph there
-// without an entry here means the line renders in the default body color
-// (the muted slate baseline), which is what produced the "everything is
-// gray" look users complained about for CLI output.
+const _PROCESS_GLYPH_KIND = {
+  '\u25EF': 'err',
+  '\u2717': 'err',
+  '\u25CB': 'warn',
+  '\u25C9': 'patch',
+  '\u25A0': 'tool',
+  '\u25B7': 'out',
+  '\u25C6': 'think',
+  '\u25C7': 'info',
+  '\u25B6': 'bound',
+  '\u25CF': 'bound',
+  '\u25A3': 'plan',
+  '\u25D0': 'live',
+  '\u25AA': 'meta',
+};
+const _PROCESS_KIND_ICON = {
+  bound: 'play',
+  tool: 'squareFilled',
+  plan: 'clipboard-list',
+  patch: 'document-pencil',
+  think: 'diamond',
+  live: 'live',
+  out: 'output',
+  meta: 'dot',
+  warn: 'warning',
+  err: 'x-circle',
+  info: 'info',
+};
+
 function _processKindOf(text) {
   const g = (text || '').trimStart().charAt(0);
-  if (g === '◯' || g === '✗') return 'err';     // hard error / failed tool end
-  if (g === '○') return 'warn';                  // awaiting approval / soft warn
-  if (g === '◉') return 'patch';                 // file change
-  if (g === '■') return 'tool';                  // tool call (start / end ok)
-  if (g === '▷') return 'out';                   // command / cli stdout-or-stderr
-  if (g === '◆') return 'think';                  // reasoning / reply marker
-  if (g === '◇') return 'info';                   // auto-approved permission audit (kind-info)
-  if (g === '▶' || g === '●') return 'bound';   // lifecycle start / end
-  if (g === '▣') return 'plan';                  // plan announcement
-  if (g === '◐') return 'live';                  // live generating preview
-  if (g === '▪') return 'meta';                  // lifecycle / fallback meta
-  return '';
+  return _PROCESS_GLYPH_KIND[g] || '';
 }
 
-function _streamingAppendProgress(msg, text) {
+function _processLineText(text) {
+  return String(text || '').replace(/^\s*[\u25EF\u2717\u25CB\u25C9\u25A0\u25B7\u25C6\u25C7\u25B6\u25CF\u25A3\u25D0\u25AA]\uFE0F?\s*/u, '');
+}
+
+function _setProcessLineContent(line, text, kind) {
+  if (!line) return;
+  const body = _processLineText(text);
+  line.dataset.processText = body;
+  const icon = kind ? _uiIconHtml(_PROCESS_KIND_ICON[kind] || 'info', 'ui-icon stream-process-icon') : '';
+  line.innerHTML = `${icon}<span class="stream-process-text">${escapeHtml(body)}</span>`;
+}
+
+function _eventProcessKind(evt, text) {
+  if (!evt || typeof evt !== 'object') return _processKindOf(text);
+  const stream = evt.stream;
+  const data = evt.data || {};
+  if (stream === 'lifecycle') {
+    const p = data.phase;
+    if (p === 'error') return 'err';
+    if (p === 'start' || p === 'end') return 'bound';
+    return 'meta';
+  }
+  if (stream === 'item') return 'think';
+  if (stream === 'plan') return 'plan';
+  if (stream === 'tool') return data.isError ? 'err' : 'tool';
+  if (stream === 'command_output') return (!data.stdout && data.stderr) ? 'warn' : 'out';
+  if (stream === 'patch') return 'patch';
+  if (stream === 'approval') return 'warn';
+  if (stream === 'error') return 'err';
+  if (stream === 'cli') {
+    const type = String(data.type || '').toLowerCase();
+    if (type === 'tool-event') return 'tool';
+    if (type === 'process-info') return 'bound';
+    if (type === 'stderr-line' || type === 'idle') return 'warn';
+    if (type === 'permission-request') return 'info';
+    if (type === 'raw-line') return 'meta';
+    if (type === 'log') {
+      const level = String(data.level || 'info').toLowerCase();
+      return level === 'error' ? 'err' : level === 'warn' ? 'warn' : 'meta';
+    }
+    if (type === 'status') {
+      const st = String(data.status || '').toLowerCase();
+      if (st === 'error' || st === 'failed' || st === 'timeout') return 'err';
+      if (st === 'cancelled' || st === 'aborted') return 'warn';
+      if (st === 'session_ready' || st === 'running' || st === 'result' || st === 'completed' || st === 'usage') return 'bound';
+      return 'meta';
+    }
+  }
+  return _processKindOf(text) || 'meta';
+}
+
+function _streamingAppendProgress(msg, text, kindHint) {
   // Keep the "thinking…" row visible alongside the process trace — hiding it
   // while only process info shows makes long tool runs look stuck. The row
   // is cleared when the final reply (or an error) arrives.
@@ -2548,9 +2814,12 @@ function _streamingAppendProgress(msg, text) {
   // without being yanked back.
   const innerWasAtBottom = _isNearBottom(body, 10);
   const line = document.createElement('div');
-  const kind = _processKindOf(text);
+  const kind = kindHint || _processKindOf(text);
   line.className = 'stream-process-line' + (kind ? ' kind-' + kind : '');
-  line.textContent = text;
+  if (kind === 'bound' && /^tokens\b/.test(_processLineText(text))) {
+    line.dataset.streamUsage = '1';
+  }
+  _setProcessLineContent(line, text, kind);
   body.appendChild(line);
   if (innerWasAtBottom) body.scrollTop = body.scrollHeight;
   // Outer chat-history follows independently — its own sticky-bottom
@@ -2709,7 +2978,8 @@ function _streamingMarkAborted(msg) {
 
 function _finishStreamingMsg(cid) {
   pendingConvs.delete(cid);
-  stopPolling(cid);
+  if (isGroupConversationBusy(cid)) startPolling(cid);
+  else stopPolling(cid);
   _updateConvSidebarBadge(cid, false);
   if (cid === currentCid) _updateConvSendUI(cid);
   // Drain the next queued message for this conversation, if any.
@@ -3089,7 +3359,7 @@ function createChatController(config) {
     );
     if (hooks.onUserAppended) hooks.onUserAppended(userMsgEl, content, id);
 
-    const msgEl = _createStreamingAssistantMessage(historyEl);
+    const msgEl = _createStreamingAssistantMessage(historyEl, { hiddenUntilActor: true });
     if (hooks.onAssistantStart) hooks.onAssistantStart(msgEl, id);
 
     // On send, pin the user's message to the top of the viewport once;
@@ -3311,19 +3581,52 @@ const _groupPlaceholders = new Map(); // key = `${cid}:${actorId}` → element
 
 function _phKey(cid, actorId) { return `${cid}:${actorId || ''}`; }
 
-function _setPlaceholderActor(ph, actorId) {
+function _knownGroupActorLabel(cid, actorId) {
+  if (!actorId) return '';
+  if (actorId === 'commander') return t('chat.from_commander');
+  if (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
+    const a = _agentsCache.find((x) => x && x.agent_id === actorId);
+    if (a && a.name) return a.name;
+  }
+  const cached = _groupMembersCache.get(cid) || [];
+  const a = cached.find((x) => x && x.id === actorId);
+  return a && a.name ? a.name : '';
+}
+
+function _setPlaceholderActor(ph, actorId, opts = {}) {
   if (!ph) return;
+  const cid = opts.cid || currentCid;
+  const force = !!opts.force;
   ph.dataset.fromActor = actorId || '';
+  const label = _knownGroupActorLabel(cid, actorId);
+  const ready = !!actorId && (actorId === 'commander' || !!label || !!opts.allowFallback);
   const chip = ph.querySelector('[data-role="from-chip"]');
-  if (chip && !chip.textContent) {
-    const label = actorId === 'commander'
-      ? (t('chat.from_commander'))
-      : (_groupActorLabel(actorId) || (t('chat.from_agent_unknown')));
-    chip.textContent = label;
+  if (chip && (force || !chip.textContent)) {
+    chip.textContent = label || (opts.allowFallback ? t('chat.from_agent_unknown') : '');
   }
   const avatarSlot = ph.querySelector('[data-role="from-avatar"]');
-  if (avatarSlot && !avatarSlot.firstChild && actorId) {
-    avatarSlot.innerHTML = _renderActorAvatarHtml(actorId);
+  if (avatarSlot && actorId && (force || !avatarSlot.firstChild)) {
+    avatarSlot.innerHTML = label
+      ? _renderActorAvatarHtml(actorId)
+      : '';
+  }
+  if (ph.dataset.identityPending === '1') {
+    if (ready) {
+      ph.style.display = '';
+      delete ph.dataset.identityPending;
+    } else {
+      ph.style.display = 'none';
+    }
+  }
+}
+
+function _refreshActorPlaceholders(cid, actorId) {
+  if (!cid) return;
+  for (const [key, ph] of _groupPlaceholders.entries()) {
+    if (!key.startsWith(`${cid}:`)) continue;
+    const id = ph?.dataset?.fromActor || key.slice(`${cid}:`.length);
+    if (actorId && id !== actorId) continue;
+    _setPlaceholderActor(ph, id, { cid, force: true });
   }
 }
 
@@ -3342,15 +3645,18 @@ function _ensureActorPlaceholder(cid, actorId, fallbackPh) {
   if (fallbackPh && fallbackPh.parentElement
       && fallbackPh.dataset.finalized !== '1'
       && (!fallbackPh.dataset.fromActor || fallbackPh.dataset.fromActor === actorId)) {
-    _setPlaceholderActor(fallbackPh, actorId);
+    _setPlaceholderActor(fallbackPh, actorId, { cid });
     _groupPlaceholders.set(k, fallbackPh);
     return fallbackPh;
   }
   const container = document.getElementById('chat-history');
   if (!container) return null;
-  ph = _createStreamingAssistantMessage(container);
-  _setPlaceholderActor(ph, actorId);
+  ph = _createStreamingAssistantMessage(container, { hiddenUntilActor: true });
+  _setPlaceholderActor(ph, actorId, { cid });
   _groupPlaceholders.set(k, ph);
+  if (actorId && actorId !== 'commander' && !_knownGroupActorLabel(cid, actorId)) {
+    _refreshGroupMembers(cid).then(() => _refreshActorPlaceholders(cid, actorId)).catch(() => {});
+  }
   return ph;
 }
 
@@ -3399,7 +3705,7 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
     }
   }
   // Also fill the from chip in case state_changed never set it.
-  _setPlaceholderActor(ph, gm.from);
+  _setPlaceholderActor(ph, gm.from, { cid, force: true, allowFallback: true });
 
   // Plan-announcement label (commander first plan_set).
   if (gm.plan_announcement) {
@@ -3407,7 +3713,7 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
     if (bubble && !bubble.querySelector('.chat-plan-announce')) {
       const lbl = document.createElement('div');
       lbl.className = 'chat-plan-announce';
-      lbl.textContent = `📋 ${t('chat.plan_announce')}`;
+      lbl.innerHTML = `${_uiIconHtml('clipboard-list', 'ui-icon chat-plan-announce-icon')}<span>${escapeHtml(t('chat.plan_announce'))}</span>`;
       bubble.insertBefore(lbl, bubble.firstChild);
     }
   }
@@ -3473,6 +3779,18 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
     }
   }
 
+  if (Array.isArray(gm.marketplace_requests) && gm.marketplace_requests.length) {
+    const bubble = ph.querySelector('.chat-bubble');
+    if (bubble) {
+      const reqMessage = {
+        role: 'assistant',
+        marketplace_requests: gm.marketplace_requests,
+        _msg_id: gm.id,
+      };
+      _mountMarketplaceInstallRequests(bubble, ph, reqMessage, { cid });
+    }
+  }
+
   // Interactive web-app artifacts (chat-app:// iframe). Idempotent — skips
   // ids already mounted in this bubble.
   if (Array.isArray(gm.artifacts) && gm.artifacts.length && typeof window.mountMessageArtifacts === 'function') {
@@ -3497,6 +3815,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
   // user's view; visible end-of-turn replies will bump shortly after).
   if (evData.type === 'message' && evData.msg && !evData.msg.dispatch) {
     _bumpConvToTop(cid);
+    if (window.ConversationInfo) window.ConversationInfo.refresh(cid);
   }
   // Cross-cid leakage guard: per-cid controllers stay alive when the user
   // navigates away mid-stream (a legit pattern — let the conv finish in
@@ -3594,6 +3913,17 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     const actor = String(evData.actor || '');
     const data = evData.data || {};
     if (!actor) return;
+    // A renderer can attach after the actor's initial `state_changed(running)`
+    // event has already passed (refresh, tab switch, scheduled/remote run).
+    // Process events are proof that work is still active, so recover the
+    // composer state here instead of leaving the button in blue "send" mode
+    // while a live placeholder is visibly thinking.
+    if (!isGroupConversationBusy(cid)) {
+      setGroupConversationBusy(cid, true);
+      _updateConvSidebarBadge(cid, true);
+      startPolling(cid);
+      if (cid === currentCid) _updateConvSendUI(cid);
+    }
     const target = _ensureActorPlaceholder(cid, actor, streamingMsg);
     if (!target) return;
     // Diagnostic — count how many deltas reach the renderer per actor.
@@ -3620,14 +3950,17 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     // when an interactive agent's step enters in_progress, the user's next
     // reply should default to that agent without them having to @-mention.
     _evaluateAutoRecipient(cid);
-    if (window.PlanRail) window.PlanRail.refresh(cid);
+    if (window.PlanRail) window.PlanRail.refresh(cid, { force: true });
+    if (window.ConversationInfo) window.ConversationInfo.refresh(cid, { silent: true });
   } else if (evData.type === 'state_changed') {
     // Each in_flight actor gets a placeholder so its delta tokens / tool
     // calls render in its own bubble even before its `message` arrives.
     // Adopt the controller's initial placeholder for the first actor.
     const st = evData.state || {};
-    if (Array.isArray(st.in_flight)) {
-      for (const actorId of st.in_flight) {
+    const inFlight = Array.isArray(st.in_flight) ? st.in_flight.slice() : [];
+    setGroupConversationBusy(cid, st.status === 'running' || inFlight.length > 0);
+    if (inFlight.length) {
+      for (const actorId of inFlight) {
         if (!actorId) continue;
         _ensureActorPlaceholder(cid, actorId, streamingMsg);
       }
@@ -3635,7 +3968,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     // Mirror in_flight so _evaluateAutoRecipient knows when commander is
     // mid-turn (release the chip back to commander even if plan still has
     // an interactive agent's done step as the most-recent terminal).
-    _latestInFlight.set(cid, Array.isArray(st.in_flight) ? st.in_flight.slice() : []);
+    _latestInFlight.set(cid, inFlight);
     // state_changed also fires on plan reconcile boundaries — re-evaluate
     // the auto-target so the chip matches the current dispatch state even
     // when a plan_changed event was missed (e.g. on first connect).
@@ -3643,9 +3976,14 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     // Plan rail hides retry/skip/abort buttons whenever any worker is in
     // flight (avoids racing user actions against an in-progress turn).
     if (window.PlanRail) {
-      window.PlanRail.setInFlight(cid, Array.isArray(st.in_flight) ? st.in_flight : []);
+      window.PlanRail.setInFlight(cid, inFlight);
     }
+    if (window.ConversationInfo) window.ConversationInfo.refresh(cid, { silent: true });
+    _updateConvSidebarBadge(cid, false);
+    if (cid === currentCid) _updateConvSendUI(cid);
   } else if (evData.type === 'aborted') {
+    setGroupConversationBusy(cid, false);
+    _latestInFlight.set(cid, []);
     // Only drop EMPTY placeholders here (queued-but-not-yet-running workers
     // whose queue got cleared by bus.abort never fire runTurn → no follow-up
     // message/turn_silent → their dancing-dot placeholder would be orphaned
@@ -3670,6 +4008,8 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
       _groupPlaceholders.delete(k);
       if (ph && ph.parentElement) ph.remove();
     }
+    _updateConvSidebarBadge(cid, false);
+    if (cid === currentCid) _updateConvSendUI(cid);
   } else if (evData.type === 'turn_silent') {
     // The actor's turn ended without producing a persisted message
     // (executor returned outcome=silent). Two sub-cases:
@@ -3703,7 +4043,10 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
       }
     }
   } else if (evData.type === 'member_joined') {
-    // Refresh the cache so subsequent bubbles can render the agent's name.
+    // Refresh the cache so subsequent bubbles and already-mounted
+    // placeholders can render the agent's real name/avatar instead of the
+    // neutral streaming shell.
+    _rememberGroupActor(cid, evData.actor);
     _refreshGroupMembers(cid);
   }
 }
@@ -3795,6 +4138,17 @@ function _stripSubmissionTagForDisplay(text) {
 function _stripArtifactResultTagForDisplay(text) {
   if (!text || text.indexOf('<artifact-result') < 0) return text;
   const out = _stripOuterTagBlocks(text, 'artifact-result');
+  if (out === text) return text;
+  return out.replace(/\n{3,}/g, '\n\n').trimEnd();
+}
+
+// Hide the `<marketplace-install-result>` machine payload that gets replayed
+// after the user clicks a marketplace install/skip card. The visible summary
+// line remains, while the commander still receives the raw structured tag in
+// message history and can continue the task.
+function _stripMarketplaceInstallResultTagForDisplay(text) {
+  if (!text || text.indexOf('<marketplace-install-result') < 0) return text;
+  const out = _stripOuterTagBlocks(text, 'marketplace-install-result');
   if (out === text) return text;
   return out.replace(/\n{3,}/g, '\n\n').trimEnd();
 }
@@ -3935,12 +4289,8 @@ function _streamingAppendFinalDelta(msg, piece) {
 // exactly one semantic role — stick to this table when adding new streams:
 //
 //   ▶   reasoning start      ●   reasoning done
-//   ◆   thinking              ◇   reply (final)
-//   ◐   generating (live)
-//   ■   tool call             ▣   plan
-//   ▷   command output        ◉   file change
-//   ○   awaiting confirmation ◯   error
-//   ▪   other / fallback
+// Process-pane text is plain content; _eventProcessKind maps events to SVG
+// icons and semantic CSS classes.
 function _formatEventLine(evt) {
   if (!evt || typeof evt !== 'object') return null;
   const { stream, data } = evt;
@@ -3968,7 +4318,7 @@ function _formatEventLine(evt) {
     if (itemType.includes('tool') || itemType.includes('function') ||
         itemType.includes('message')) return null;
     const prefix = itemType.includes('reasoning') ? t('chat.stream.thinking') :
-                   (itemType ? `◆ ${itemType}` : '◆');
+                   (itemType || t('chat.stream.thinking'));
     const detail = data?.text || data?.summary || data?.name || '';
     const detailStr = detail ? ` — ${String(detail).replace(/\s+/g, ' ')}` : '';
     return `${prefix} ${phaseCn(data?.phase)}${detailStr}`.trim();
@@ -3988,7 +4338,6 @@ function _formatEventLine(evt) {
     const phase = data?.phase || data?.status;
     const p = phaseCn(phase);
     const isError = !!data?.isError;
-    const marker = phase === 'end' ? (isError ? '✗' : '■') : '■';
     // On start → show arguments (bash command / file path / JSON fallback).
     // On end   → prefer result_preview so users see what the call returned.
     let detail = '';
@@ -4012,23 +4361,20 @@ function _formatEventLine(evt) {
     detail = detail.replace(/\s+/g, ' ').trim();
     if (detail.length > 160) detail = detail.slice(0, 160) + '…';
     const detailStr = detail ? ' · ' + detail : '';
-    return `${marker} ${name}${p ? ' · ' + p : ''}${detailStr}`;
+    return `${name}${p ? ' · ' + p : ''}${detailStr}`;
   }
 
   if (stream === 'command_output') {
     // Distinguish stderr from stdout so CLI agents (claude code / codex /
     // openclaw / opencode / hermes) don't render their entire spool in a
-    // single muted slate. We keep ▷ for stdout, swap to ○ (kind-warn,
-    // amber) for stderr — many CLIs route progress and prompts to stderr,
-    // so we stop short of treating it as a hard error (◯) which would dye
-    // the whole sub-stream red. Falls back to stdout styling if the event
-    // doesn't disambiguate via separate stdout/stderr fields.
+    // single muted slate. Stderr maps to kind-warn; stdout maps to kind-out.
+    // Falls back to stdout styling if the event doesn't disambiguate via
+    // separate stdout/stderr fields.
     const stdout = data?.stdout;
     const stderr = data?.stderr;
     const text = data?.text || stdout || stderr || '';
     if (!text) return t('chat.stream.command_empty');
-    const isStderrOnly = !stdout && stderr;
-    return isStderrOnly ? `○ ${text}` : `▷ ${text}`;
+    return String(text);
   }
 
   if (stream === 'patch') {
@@ -4063,7 +4409,7 @@ function _formatEventLine(evt) {
   // CLI-backed agents (claude code / codex / openclaw / opencode / hermes)
   // emit `LocalEvent`s that bus.ts wraps verbatim as `{stream:'cli', data:e}`.
   // Without this branch the catch-all below dumped them as
-  // `▪ cli {json}` which is (a) unreadable JSON and (b) lands in
+  // `cli {json}` which is (a) unreadable JSON and (b) lands in
   // kind-meta — exactly the "all gray" symptom users see for CLI runs.
   // Field shapes mirror `local_agents/backends/base.ts::LocalEvent`.
   if (stream === 'cli') {
@@ -4081,17 +4427,17 @@ function _formatEventLine(evt) {
       detail = detail.replace(/\s+/g, ' ').trim();
       if (detail.length > 160) detail = detail.slice(0, 160) + '…';
       const detailStr = detail ? ' · ' + detail : '';
-      return `■ ${name}${phase ? ' · ' + phase : ''}${detailStr}`;
+      return `${name}${phase ? ' · ' + phase : ''}${detailStr}`;
     }
     if (cliType === 'process-info') {
       // Fired once at CLI spawn; surface as a milestone so the user sees
       // the run starting. cmd/args is enough — full cwd is noisy.
       const cmd = String(data?.cmd || '').trim();
-      return cmd ? `▶ ${cmd}` : null;
+      return cmd || null;
     }
     if (cliType === 'status') {
-      // Bucket statuses into milestone (▶/●), warn (○) and error (◯) so
-      // they pick up the right kind class downstream.
+      // Bucket statuses into milestone, warn and error so they pick up the
+      // right kind class downstream.
       const st = String(data?.status || '').toLowerCase();
       if (!st) return null;
       // Format usage suffix when present (any status can carry it; we
@@ -4115,8 +4461,8 @@ function _formatEventLine(evt) {
         }
         if (tokParts.length) parts.push(tokParts.join(' '));
         const cacheParts = [];
-        // Spell out read/write explicitly — the earlier `cache↻ / cache✎`
-        // glyphs were too cryptic. cache_read = hit on prior prompt
+        // Spell out read/write explicitly; compact cache glyphs were
+        // too cryptic. cache_read = hit on prior prompt
         // prefix (1/10x price); cache_write = first-time write to the
         // cache (1.25x price). Long claude turns are mostly cache_read.
         if (typeof u.cacheRead === 'number') cacheParts.push('cache_read=' + u.cacheRead);
@@ -4137,22 +4483,22 @@ function _formatEventLine(evt) {
         // than appending one row per pulse. See _renderAgentEvent
         // for the in-place update logic.
         if (!usageSuffix) return null;
-        return '● tokens' + usageSuffix;
+        return 'tokens' + usageSuffix;
       }
-      if (st === 'session_ready' || st === 'running') return `▶ ${st}`;
-      if (st === 'result' || st === 'completed') return `● ${st}${usageSuffix}`;
-      if (st === 'error' || st === 'failed' || st === 'timeout') return `◯ ${st}${usageSuffix}`;
-      if (st === 'cancelled' || st === 'aborted') return `○ ${st}`;
-      return `▪ ${st}`;
+      if (st === 'session_ready' || st === 'running') return st;
+      if (st === 'result' || st === 'completed') return `${st}${usageSuffix}`;
+      if (st === 'error' || st === 'failed' || st === 'timeout') return `${st}${usageSuffix}`;
+      if (st === 'cancelled' || st === 'aborted') return st;
+      return st;
     }
     if (cliType === 'stderr-line') {
       // CLIs route progress + diagnostics to stderr — treat as soft warn
-      // (○, kind-warn amber) rather than a hard error (◯, kind-err red),
-      // matching the heuristic we use for `command_output` stderr above.
+      // rather than a hard error, matching the heuristic we use for
+      // `command_output` stderr above.
       const line = String(data?.line || '').replace(/\s+/g, ' ').trim();
       if (!line) return null;
       const trimmed = line.length > 160 ? line.slice(0, 160) + '…' : line;
-      return `○ ${trimmed}`;
+      return trimmed;
     }
     // Unknown CLI event types: hide rather than dump JSON.
     if (cliType === 'log') {
@@ -4164,10 +4510,7 @@ function _formatEventLine(evt) {
       const msg = String(data?.message || '').replace(/\s+/g, ' ').trim();
       if (!msg) return null;
       const trimmed = msg.length > 200 ? msg.slice(0, 200) + '…' : msg;
-      const glyph = level === 'error' ? '◯'
-                  : level === 'warn' ? '○'
-                  : '▪';
-      return `${glyph} [${level}] ${trimmed}`;
+      return `[${level}] ${trimmed}`;
     }
     if (cliType === 'raw-line') {
       // Non-JSON stdout that the backend couldn't parse as its protocol
@@ -4176,11 +4519,11 @@ function _formatEventLine(evt) {
       const line = String(data?.line || '').replace(/\s+/g, ' ').trim();
       if (!line) return null;
       const trimmed = line.length > 200 ? line.slice(0, 200) + '…' : line;
-      return `▪ ${trimmed}`;
+      return trimmed;
     }
     if (cliType === 'permission-request') {
       // Auto-approved tool-use request the CLI gated through
-      // control_request. Surface as kind-info (◇) so users can audit
+      // control_request. Surface as kind-info so users can audit
       // which tools the daemon allowed without prompting.
       const tool = String(data?.tool || '').trim() || 'tool';
       const decision = data?.autoDecided === 'deny' ? 'denied' : 'allowed';
@@ -4190,21 +4533,21 @@ function _formatEventLine(evt) {
         inputSummary = s.replace(/\s+/g, ' ').trim();
         if (inputSummary.length > 120) inputSummary = inputSummary.slice(0, 120) + '…';
       }
-      return `◇ ${decision}: ${tool}${inputSummary ? ' · ' + inputSummary : ''}`;
+      return `${decision}: ${tool}${inputSummary ? ' · ' + inputSummary : ''}`;
     }
     if (cliType === 'idle') {
       // Runner-emitted heartbeat on prolonged silence — kind-warn so the
       // user sees the row stand out from the regular stderr noise.
       const ms = Number(data?.stalledMs || 0);
       const secs = Math.max(1, Math.round(ms / 1000));
-      return `○ no output for ${secs}s`;
+      return `no output for ${secs}s`;
     }
     // Unknown CLI event types: hide rather than dump JSON. Devtools archive
     // still records them verbatim under `<uid>/local/test/` for debugging.
     return null;
   }
 
-  return `▪ ${stream} ${JSON.stringify(data || {})}`;
+  return `${stream} ${JSON.stringify(data || {})}`;
 }
 
 // Render a live openclaw agent event into the streaming bubble. Assistant
@@ -4241,18 +4584,19 @@ function _renderAgentEvent(msg, evt) {
       // and overwrite. If none exists yet, fall through to append.
       const rows = body.querySelectorAll('.stream-process-line');
       for (let i = rows.length - 1; i >= 0; i--) {
-        if (rows[i].textContent.startsWith('● tokens · ')) {
-          rows[i].textContent = newLine;
+        if (rows[i].dataset.streamUsage === '1') {
+          _setProcessLineContent(rows[i], newLine, 'bound');
           return;
         }
       }
     }
-    _streamingAppendProgress(msg, newLine);
+    _streamingAppendProgress(msg, newLine, 'bound');
     return;
   }
 
   const line = _formatEventLine(evt);
   if (!line) return;
+  const lineKind = _eventProcessKind(evt, line);
   // All tool result rows — CLI-backed AND in-process — are
   // click-to-expand. Two storage paths for the full body, decided per
   // event shape:
@@ -4288,11 +4632,11 @@ function _renderAgentEvent(msg, evt) {
     // reads better expanded anyway.
     const truncated = path || (fullOutput && fullOutput.replace(/\s+/g, ' ').trim().length > 160);
     if (truncated) {
-      _streamingAppendToolResultRow(msg, line, path, fullOutput);
+      _streamingAppendToolResultRow(msg, line, path, fullOutput, lineKind);
       return;
     }
   }
-  _streamingAppendProgress(msg, line);
+  _streamingAppendProgress(msg, line, lineKind);
 }
 
 /** Append a tool-event result row that can expand its full output. Two
@@ -4307,7 +4651,7 @@ function _renderAgentEvent(msg, evt) {
  *  and would double the memory). A delegated click handler set up once
  *  per bubble does the lookup so we don't bind a closure per row.
  */
-function _streamingAppendToolResultRow(msg, previewText, outputPath, fullOutput) {
+function _streamingAppendToolResultRow(msg, previewText, outputPath, fullOutput, kindHint) {
   const container = msg.querySelector('[data-role="process-container"]');
   if (container) container.style.display = '';
   const body = msg.querySelector('[data-role="process"]');
@@ -4315,9 +4659,9 @@ function _streamingAppendToolResultRow(msg, previewText, outputPath, fullOutput)
   const innerWasAtBottom = _isNearBottom(body, 10);
 
   const line = document.createElement('div');
-  const kind = _processKindOf(previewText);
+  const kind = kindHint || _processKindOf(previewText);
   line.className = 'stream-process-line is-expandable' + (kind ? ' kind-' + kind : '');
-  line.textContent = previewText;
+  _setProcessLineContent(line, previewText, kind);
   if (outputPath) line.dataset.toolResultPath = outputPath;
   if (fullOutput) line._fullOutput = fullOutput;
   line.title = t('chat.tool_result_expand_hint');
@@ -4389,7 +4733,7 @@ function _streamingUpdateLive(msg, prefix, text, appendDelta) {
   let line = body.querySelector('.stream-process-live');
   if (!line) {
     line = document.createElement('div');
-    line.className = 'stream-process-line stream-process-live';
+    line.className = 'stream-process-line stream-process-live kind-live';
     body.appendChild(line);
     msg._liveBuf = '';
   }
@@ -4397,7 +4741,7 @@ function _streamingUpdateLive(msg, prefix, text, appendDelta) {
   else msg._liveBuf = text;
   // Show last ~200 chars to keep the row compact
   const preview = msg._liveBuf.length > 200 ? '…' + msg._liveBuf.slice(-200) : msg._liveBuf;
-  line.textContent = prefix + preview;
+  _setProcessLineContent(line, prefix + preview, 'live');
   if (innerWasAtBottom) body.scrollTop = body.scrollHeight;
   _stickBottomFromMsg(msg);
 }
@@ -4406,6 +4750,7 @@ function _streamingUpdateLive(msg, prefix, text, appendDelta) {
 function _resolveConvReply(cid, text, isError) {
   const state = pendingConvs.get(cid);
   pendingConvs.delete(cid);
+  setGroupConversationBusy(cid, false);
   stopPolling(cid);
   _updateConvSidebarBadge(cid, false);
 
@@ -4494,11 +4839,16 @@ function _renderConvDisabledBanner(cid) {
 
 function abortConvStream(cid) {
   const state = pendingConvs.get(cid);
+  setGroupConversationBusy(cid, false);
   // Group chat: also tell the bus to abort all in-flight worker turns + clear
   // queues. Cancelling just the IPC stream would leave agents running in the
   // background. Fire-and-forget — no need to block the UI on the response.
   try { apiFetch(`/api/conversations/${cid}/abort`, { method: 'POST' }); } catch (_) {}
-  if (!state) return;
+  if (!state) {
+    _updateConvSidebarBadge(cid, false);
+    if (cid === currentCid) _updateConvSendUI(cid);
+    return;
+  }
   // No-controller case: the pendingConvs entry was minted by
   // `loadConversationHistory`'s polling-rescue branch (user opened a conv
   // whose worker was started from outside this renderer — scheduled-task
@@ -4544,7 +4894,7 @@ function _updateConvSidebarBadge(cid, _unused) {
   // clears when main emits `done`, which can trail the stop click; until then
   // the bubble already shows the "stopped" state so the streaming badge would lie.
   const state = pendingConvs.get(cid);
-  const pending = !!state && !state.aborted;
+  const pending = isConvPending(cid) && !(state && state.aborted);
   // Use _getQueue so a queue persisted in localStorage is picked up even if
   // the conversation hasn't been opened in this session yet.
   const queued = _getQueue(cid).length;
@@ -4576,4 +4926,3 @@ function _refreshAllConvBadges() {
     if (cid) _updateConvSidebarBadge(cid);
   });
 }
-

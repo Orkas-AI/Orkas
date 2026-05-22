@@ -35,6 +35,7 @@ export type ToolGroup =
   | 'shell'      // command line
   | 'pdf'        // PDF rendering
   | 'kb'         // knowledge base
+  | 'chat'       // conversation history
   | 'image'      // image generation
   | 'web'        // web access
   | 'connector'  // third-party services via MCP umbrella tools
@@ -82,6 +83,10 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   { name: 'kb_search',     group: 'kb', summary: 'Semantic search over the user\'s knowledge base.' },
   { name: 'kb_read',       group: 'kb', summary: 'Read source-text chunks from a KB file that kb_search has hit.' },
 
+  // Conversation history
+  { name: 'chat_search',   group: 'chat', summary: 'Search prior conversation messages after KB is insufficient or the user asks about previous chats.' },
+  { name: 'chat_read',     group: 'chat', summary: 'Read nearby messages from a chat_search hit, or the latest messages from one conversation.' },
+
   // Image
   { name: 'generate_image', group: 'image', permission: 'localExec', summary: 'Call the configured image-generation API and save the result into the workspace.' },
 
@@ -110,6 +115,7 @@ const GROUP_ORDER: ReadonlyArray<{ group: ToolGroup; title: string }> = [
   { group: 'shell', title: 'Shell' },
   { group: 'pdf',   title: 'PDF' },
   { group: 'kb',    title: 'Knowledge base' },
+  { group: 'chat',  title: 'Conversation history' },
   { group: 'image', title: 'Image' },
   { group: 'web',       title: 'Web' },
   { group: 'connector', title: 'Connectors (third-party services)' },

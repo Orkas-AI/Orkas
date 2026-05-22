@@ -38,20 +38,21 @@ export interface MarketplaceCategory {
   code: string;
   name_zh: string;
   name_en: string;
+  name_ja?: string;
   /** Display order — lower first. Kept on the wire purely for client-side rendering. */
   sort_order: number;
 }
 
 /** Hard-coded fallback used only when both the persisted cache and the server are unreachable
- *  on a cold start. Mirrors the server `SEED_CATEGORIES` so the UI behaves identically when
+ *  on a cold start. Mirrors the server category registry so the UI behaves identically when
  *  the network blip clears. Keep in sync with `Server/biz/marketplace/marketplace_mgr.py`. */
 const FALLBACK_CATEGORIES: readonly MarketplaceCategory[] = [
-  { code: 'education', name_zh: '教育', name_en: 'Education',  sort_order: 10 },
-  { code: 'ecommerce', name_zh: '电商', name_en: 'E-commerce', sort_order: 20 },
-  { code: 'rnd',       name_zh: '产研', name_en: 'R&D',        sort_order: 30 },
-  { code: 'writing',   name_zh: '写作', name_en: 'Writing',    sort_order: 40 },
-  { code: 'data',      name_zh: '数据', name_en: 'Data',       sort_order: 50 },
-  { code: 'general',   name_zh: '通用', name_en: 'General',    sort_order: 60 },
+  { code: 'education', name_zh: '教育', name_en: 'Education',  name_ja: '教育',        sort_order: 10 },
+  { code: 'ecommerce', name_zh: '电商', name_en: 'E-commerce', name_ja: 'EC',          sort_order: 20 },
+  { code: 'rnd',       name_zh: '产研', name_en: 'R&D',        name_ja: '研究開発',    sort_order: 30 },
+  { code: 'writing',   name_zh: '写作', name_en: 'Writing',    name_ja: 'ライティング', sort_order: 40 },
+  { code: 'data',      name_zh: '数据', name_en: 'Data',       name_ja: 'データ',      sort_order: 50 },
+  { code: 'general',   name_zh: '通用', name_en: 'General',    name_ja: '汎用',        sort_order: 60 },
 ];
 
 interface PersistedBiz {
@@ -96,6 +97,7 @@ async function _fetchFromServer(): Promise<MarketplaceCategory[]> {
       code: String(row.code || ''),
       name_zh: String(row.name_zh || ''),
       name_en: String(row.name_en || ''),
+      name_ja: String(row.name_ja || ''),
       sort_order: typeof row.sort_order === 'number' ? row.sort_order : 0,
     }))
     .filter((c) => c.code);

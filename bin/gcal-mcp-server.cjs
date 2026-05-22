@@ -358,7 +358,11 @@ async function main() {
   await server.connect(new StdioServerTransport());
 }
 
-main().catch((err) => {
-  process.stderr.write(`gcal-mcp-server fatal: ${err && err.message || err}\n`);
-  process.exit(1);
-});
+module.exports = { TOOLS, callTool };
+
+if (require.main === module) {
+  main().catch((err) => {
+    process.stderr.write(`gcal-mcp-server fatal: ${err && err.message || err}\n`);
+    process.exit(1);
+  });
+}
