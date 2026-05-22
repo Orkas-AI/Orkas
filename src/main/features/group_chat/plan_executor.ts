@@ -191,13 +191,16 @@ export interface ReconcileCtx {
  *  don't pull a circular import. Bus implements + injects on init. */
 export interface ExecutorBusHooks {
   /** Persist + emit a normal group message; same signature as `bus.enqueue`
-   *  but with one extra optional `triggered_step` knob. */
+   *  but with one extra optional `triggered_step` knob. `attachments` lets
+   *  the executor forward the plan's `initial_attachments` so worker agents
+   *  receive the same image / file bytes the originating user turn carried. */
   enqueue(params: {
     uid: string; cid: string;
     fromActorId: string; text: string;
     forceTo?: string[];
     triggered_step?: number;
     dispatch?: boolean;
+    attachments?: string[];
   }): Promise<void>;
   /** Push a turn directly into commander's worker queue without persisting
    *  a chat message — used for the synthesis / commander-self steps where
@@ -814,6 +817,10 @@ async function dispatchStep(
 
   const rendered = renderTemplate(step.input, plan);
   const assignee = step.assignee.trim();
+  // Forward attachments captured at plan-set time so worker agents (and
+  // the user, for a `user`-assignee question) receive the same image / file
+  // bytes the triggering user turn carried — see PlanFile.initial_attachments.
+  const inheritedAttachments = plan.initial_attachments;
 
   if (USER_ALIASES.has(assignee.toLowerCase())) {
     // Step asks user for input. Commander voice; render goes to user.
@@ -823,6 +830,7 @@ async function dispatchStep(
       text: rendered,
       forceTo: [USER_ID],
       triggered_step: step.index,
+      ...(inheritedAttachments && inheritedAttachments.length ? { attachments: inheritedAttachments } : {}),
     });
     return;
   }
@@ -863,6 +871,7 @@ async function dispatchStep(
     forceTo: [agentId],
     triggered_step: step.index,
     dispatch: true,
+    ...(inheritedAttachments && inheritedAttachments.length ? { attachments: inheritedAttachments } : {}),
   });
 }
 

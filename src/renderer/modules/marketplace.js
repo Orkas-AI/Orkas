@@ -1004,7 +1004,20 @@ async function _mpInstall(kind, id) {
     // (Failure still alerts because the user otherwise has no way to know why nothing happened.)
   } catch (err) {
     const msg = (err && err.message) || String(err);
-    uiAlert(t('marketplace.install_failed').replace('{reason}', msg));
+    // Quality validator rejection → show the structured violation list
+    // instead of the generic install-failed alert. Falls back to alert if
+    // the report can't be loaded.
+    if (typeof isQualityRejectionError === 'function' && isQualityRejectionError(msg)) {
+      const report = await readQualityReport(kind, id);
+      if (report) {
+        const title = t('quality.install_rejected_title').replace('{name}', item.name || id);
+        await showValidationReport({ title, report });
+      } else {
+        uiAlert(t('marketplace.install_failed').replace('{reason}', msg));
+      }
+    } else {
+      uiAlert(t('marketplace.install_failed').replace('{reason}', msg));
+    }
   } finally {
     _mpState.installing.delete(key);
     _mpRender();

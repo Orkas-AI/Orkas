@@ -46,6 +46,7 @@ import * as avatars from '../features/avatars';
 import { getRendererTables, isLang, t } from '../i18n';
 import * as userWorkspace from '../features/user_workspace';
 import { invokeHandlers as localAgentsHandlers } from './local_agents';
+import { invokeHandlers as qualityHandlers } from './quality';
 import { invokeHandlers as connectorsHandlers } from './connectors';
 import { safeId } from '../storage';
 import { createLogger, logFromRenderer } from '../logger';
@@ -470,8 +471,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { agent };
   },
 
-  'agents.create': async ({ name = '', description = '', description_zh, description_en, workflow = '', icon, color, runtime, category } = {}) => {
-    return { agent: await agents.createCustomAgent({ name, description, description_zh, description_en, workflow, icon, color, runtime, category }) };
+  'agents.create': async ({ name = '', description = '', description_zh, description_en, workflow = '', icon, color, runtime, category, output_format } = {}) => {
+    return { agent: await agents.createCustomAgent({ name, description, description_zh, description_en, workflow, icon, color, runtime, category, output_format }) };
   },
 
 
@@ -1073,6 +1074,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 
   // Multi-device sync. Stripped from the OrkasOpen build (depends on account).
 
+  // Quality validator — renderer reads persisted ValidationReports to display
+  // why a spec write / marketplace install was rejected.
+  ...qualityHandlers,
   // Connectors (MCP-based). User-installed MCP servers expose tools to commander + selected
   // agents. No Server dependency → kept in OrkasOpen.
   ...connectorsHandlers,

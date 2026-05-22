@@ -44,6 +44,7 @@
   "skills.errors.builtin_conflict": "技能名「{name}」与内置技能冲突，请换一个名称",
   "skills.errors.url_scheme": "URL 必须以 http(s):// 开头",
   "skills.errors.create_failed": "创建技能失败",
+  "skills.errors.validation_blocked": "技能内容未通过质量校验，已取消创建",
   "skills.errors.container_empty": "`<skill>` 容器为空，没有要写入的内容",
   "skills.errors.create_missing_skill_md": "无法创建技能：缺少 SKILL.md 块",
   "skills.errors.create_missing_name": "无法创建技能：SKILL.md 头部缺少 `name` 字段",

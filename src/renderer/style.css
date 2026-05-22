@@ -1833,6 +1833,185 @@ body.model-not-configured .main-content { flex-direction: column; }
   color: var(--primary);
 }
 
+/* ─── Dashboard (`:::dashboard` directive — see utils.js renderDashboard).
+       Component tree → HTML; tones use the global --primary/--success/
+       --danger/--muted palette; data-* attrs drive layout / state. ─── */
+.dashboard {
+  margin: 0.6em 0;
+  font-size: 13px;
+  color: var(--text);
+}
+.dashboard .db-stack {
+  display: flex;
+  flex-direction: column;
+}
+.dashboard .db-stack[data-direction="horizontal"] {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: stretch;
+}
+.dashboard .db-stack[data-gap="sm"], .dashboard .db-grid[data-gap="sm"] { gap: 6px; }
+.dashboard .db-stack[data-gap="md"], .dashboard .db-grid[data-gap="md"] { gap: 12px; }
+.dashboard .db-stack[data-gap="lg"], .dashboard .db-grid[data-gap="lg"] { gap: 20px; }
+.dashboard .db-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.dashboard .db-grid[data-columns="1"] { grid-template-columns: minmax(0, 1fr); }
+.dashboard .db-grid[data-columns="2"] { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.dashboard .db-grid[data-columns="3"] { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.dashboard .db-grid[data-columns="4"] { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+@media (max-width: 640px) {
+  .dashboard .db-grid[data-columns="3"],
+  .dashboard .db-grid[data-columns="4"] { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+.dashboard .db-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  padding: 12px 14px;
+}
+.dashboard .db-card[data-tone="positive"] { border-color: rgba(22, 163, 74, 0.4); }
+.dashboard .db-card[data-tone="negative"] { border-color: rgba(220, 38, 38, 0.4); }
+.dashboard .db-card[data-tone="warning"]  { border-color: rgba(234, 179, 8, 0.45); }
+.dashboard .db-card-title {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 8px;
+  color: var(--text);
+}
+.dashboard .db-separator {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 6px 0;
+}
+
+/* Metric — KPI card. Numeric value is the visual anchor; delta carries tone. */
+.dashboard .db-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  min-width: 0;
+}
+.dashboard .db-metric-label {
+  font-size: 12px;
+  color: var(--muted);
+  text-transform: none;
+  letter-spacing: 0;
+}
+.dashboard .db-metric-value {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1.2;
+  word-break: break-word;
+}
+.dashboard .db-metric-delta {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.dashboard .db-metric-delta[data-tone="positive"] { color: var(--success); }
+.dashboard .db-metric-delta[data-tone="negative"] { color: var(--danger); }
+.dashboard .db-metric-delta[data-tone="warning"]  { color: #b45309; }
+
+/* Alert — color-coded banner. */
+.dashboard .db-alert {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--card);
+}
+.dashboard .db-alert-title { font-weight: 600; font-size: 13px; }
+.dashboard .db-alert-body  { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
+.dashboard .db-alert[data-level="info"]    { border-color: rgba(37, 99, 235, 0.35);  background: rgba(37, 99, 235, 0.06); }
+.dashboard .db-alert[data-level="success"] { border-color: rgba(22, 163, 74, 0.35);  background: rgba(22, 163, 74, 0.06); }
+.dashboard .db-alert[data-level="warning"] { border-color: rgba(234, 179, 8, 0.45);  background: rgba(234, 179, 8, 0.08); }
+.dashboard .db-alert[data-level="error"]   { border-color: rgba(220, 38, 38, 0.4);   background: rgba(220, 38, 38, 0.06); }
+
+/* Table — compact, numeric columns right-aligned. */
+.dashboard .db-table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.dashboard .db-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.dashboard .db-table th,
+.dashboard .db-table td { padding: 6px 10px; border-bottom: 1px solid var(--border); text-align: left; }
+.dashboard .db-table tr:last-child td { border-bottom: none; }
+.dashboard .db-table th { background: var(--bg); font-weight: 600; color: var(--text); }
+.dashboard .db-table th[data-numeric="1"],
+.dashboard .db-table td[data-numeric="1"] { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Timeline — left rail + per-item dot. */
+.dashboard .db-timeline { list-style: none; padding: 4px 0 4px 16px; border-left: 2px solid var(--border); display: flex; flex-direction: column; gap: 10px; }
+.dashboard .db-timeline-item { position: relative; padding-left: 8px; }
+.dashboard .db-timeline-item::before {
+  content: "";
+  position: absolute;
+  left: -22px;
+  top: 6px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--primary);
+}
+.dashboard .db-timeline-time  { font-size: 11.5px; color: var(--muted); }
+.dashboard .db-timeline-label { font-size: 13px; font-weight: 600; color: var(--text); }
+.dashboard .db-timeline-body  { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+
+/* Code / Markdown / Image */
+.dashboard .db-code {
+  background: #f8fafc;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0;
+}
+.dashboard .db-markdown { font-size: 13px; line-height: 1.5; }
+.dashboard .db-markdown p { margin: 0.3em 0; }
+.dashboard .db-image { margin: 0; }
+.dashboard .db-image img { max-width: 100%; border-radius: var(--radius-sm); display: block; }
+.dashboard .db-image-caption { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
+
+/* Chart — minimal inline SVG. 6-step categorical palette; pie + xy share it. */
+.dashboard .db-chart { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px; }
+.dashboard .db-chart-svg { width: 100%; height: auto; display: block; }
+.dashboard .db-chart-axis    { stroke: var(--border); stroke-width: 1; }
+.dashboard .db-chart-line    { fill: none; stroke: var(--primary); stroke-width: 2; }
+.dashboard .db-chart-area    { fill: var(--primary); opacity: 0.18; stroke: none; }
+.dashboard .db-chart-dot     { fill: var(--primary); }
+.dashboard .db-chart-bar-rect { fill: var(--primary); opacity: 0.85; }
+.dashboard .db-chart-xlabel  { font-size: 10px; fill: var(--muted); font-family: inherit; }
+.dashboard .db-chart-slice[data-idx="0"] { fill: #2563eb; }
+.dashboard .db-chart-slice[data-idx="1"] { fill: #16a34a; }
+.dashboard .db-chart-slice[data-idx="2"] { fill: #ea580c; }
+.dashboard .db-chart-slice[data-idx="3"] { fill: #9333ea; }
+.dashboard .db-chart-slice[data-idx="4"] { fill: #0891b2; }
+.dashboard .db-chart-slice[data-idx="5"] { fill: #ca8a04; }
+.dashboard .db-chart-legend { list-style: none; padding: 8px 4px 0; margin: 0; display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; }
+.dashboard .db-chart-legend li { display: flex; align-items: center; gap: 6px; color: var(--text); }
+.dashboard .db-chart-legend .db-chart-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+.dashboard .db-chart-legend li[data-idx="0"] .db-chart-swatch { background: #2563eb; }
+.dashboard .db-chart-legend li[data-idx="1"] .db-chart-swatch { background: #16a34a; }
+.dashboard .db-chart-legend li[data-idx="2"] .db-chart-swatch { background: #ea580c; }
+.dashboard .db-chart-legend li[data-idx="3"] .db-chart-swatch { background: #9333ea; }
+.dashboard .db-chart-legend li[data-idx="4"] .db-chart-swatch { background: #0891b2; }
+.dashboard .db-chart-legend li[data-idx="5"] .db-chart-swatch { background: #ca8a04; }
+.dashboard .db-chart-legend .db-chart-val { color: var(--muted); }
+.dashboard .db-chart-empty,
+.dashboard .db-table-empty,
+.dashboard .db-timeline-empty { font-size: 12px; color: var(--muted); padding: 6px 0; }
+
+/* Fallback when a `:::dashboard` block fails to parse — show the raw body
+   so the user can copy it and diagnose, rather than silently dropping. */
+.dashboard-parse-error { border-color: rgba(220, 38, 38, 0.4); }
+
 /* ─── Code view (for .py, .json etc.) ─── */
 .code-view {
   background: #f8fafc;

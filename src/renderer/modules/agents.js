@@ -574,8 +574,80 @@ function _renderAgentDetail(agent, editing) {
   _renderAgentEnabledButton({ id: agent.agent_id, enabled: agent.enabled !== false });
 
   _renderAgentConnectorsSection(agent, editing);
+  _renderAgentOutputFormatSection(agent);
 
   _toggleAgentFieldEditable(editing);
+}
+
+/** Render the output-format preference dropdown (markdown_only / dashboard /
+ *  artifact). Always editable (no edit-mode gating — same convention as the
+ *  runtime selector); persists via `agents.update({ output_format })`. Hidden
+ *  for CLI agents — those run an external coding CLI and ignore the in-process
+ *  system-prompt hint entirely.
+ *
+ *  Legacy on-disk values map for display: `'allow_artifacts'` → `'artifact'`
+ *  (it's the renamed entry); `'auto'` / missing → `'markdown_only'` (the new
+ *  default surfaced in the UI — runtime behavior for missing-field agents
+ *  stays "no hint" until the user picks something and triggers a save). */
+function _renderAgentOutputFormatSection(agent) {
+  const section = document.getElementById('agents-detail-output-format-section');
+  const slot = document.getElementById('agents-detail-output-format');
+  if (!section || !slot) return;
+  if (agent.runtime?.kind === 'cli') { section.style.display = 'none'; return; }
+  section.style.display = '';
+
+  const canEdit = agent.source === 'custom'
+    || (agent.source === 'builtin' && typeof isDevMode === 'function' && false);
+
+  slot.innerHTML = '';
+  const mount = document.createElement('div');
+  mount.className = 'ai-select';
+  slot.appendChild(mount);
+
+  const options = [
+    { value: 'markdown_only',  label: t('agents.output_format_markdown_only') || 'Markdown only' },
+    { value: 'dashboard',      label: t('agents.output_format_dashboard')     || 'Dashboard (no artifact)' },
+    { value: 'artifact',       label: t('agents.output_format_artifact')      || 'Artifact (Dashboard + HTML)' },
+  ];
+  // Map legacy on-disk values to the new 3-option display. `'allow_artifacts'` is the renamed
+  // `'artifact'`. `'auto'` / missing show as `'markdown_only'` (the new default); the field on
+  // disk stays unchanged until the user actually picks something and `onChange` fires a save.
+  let current;
+  switch (agent.output_format) {
+    case 'markdown_only':                       current = 'markdown_only'; break;
+    case 'dashboard':                           current = 'dashboard';     break;
+    case 'artifact':
+    case 'allow_artifacts':                     current = 'artifact';      break;
+    default:                                    current = 'markdown_only'; break;
+  }
+
+  const api = _aiSelectMount(mount, {
+    options,
+    value: current,
+    onChange: async (val) => {
+      try {
+        const res = await window.orkas.invoke('agents.update', {
+          agent_id: agent.agent_id,
+          updates: { output_format: val },
+        });
+        if (!res || !res.ok) {
+          api.setValue(current);
+          uiAlert((res && res.error) || t('agents.update_failed') || 'Update failed');
+        } else if (res.agent) {
+          agent.output_format = res.agent.output_format;
+        }
+      } catch (err) {
+        api.setValue(current);
+        uiAlert((err && err.message) || 'Update failed');
+      }
+    },
+  });
+  if (!canEdit) {
+    // Disable the trigger — read-only display for builtin agents in
+    // non-dev mode (mirrors the connectors row pattern).
+    const trigger = mount.querySelector('.ai-select-trigger');
+    if (trigger) { trigger.setAttribute('disabled', ''); trigger.style.pointerEvents = 'none'; trigger.style.opacity = '0.6'; }
+  }
 }
 
 async function _renderAgentConnectorsSection(agent, editing) {
@@ -1099,8 +1171,32 @@ function openAgentModal() {
     mountMarketplaceCategorySelect('agent-ext-category-select').catch(() => {});
   }
 
+  // Output-format dropdown (Create tab only — External/CLI agents don't read the worker prompt
+  // hint). Default `markdown_only` matches the new "opt-in to richer formats" stance documented
+  // in PC/CLAUDE.md §6; detail-page dropdown does the same 3-option set + maps legacy values.
+  _mountAgentOutputFormatCreateSelect();
+
   modal.classList.add('open');
   setTimeout(() => document.getElementById('agent-name-input')?.focus(), 50);
+}
+
+function _mountAgentOutputFormatCreateSelect() {
+  const slot = document.getElementById('agent-output-format-select');
+  if (!slot) return;
+  slot.innerHTML = '';
+  const mount = document.createElement('div');
+  mount.className = 'ai-select';
+  slot.appendChild(mount);
+  const options = [
+    { value: 'markdown_only', label: t('agents.output_format_markdown_only') || 'Markdown only' },
+    { value: 'dashboard',     label: t('agents.output_format_dashboard')     || 'Dashboard (no artifact)' },
+    { value: 'artifact',      label: t('agents.output_format_artifact')      || 'Artifact (Dashboard + HTML)' },
+  ];
+  _aiSelectMount(mount, {
+    options,
+    value: 'markdown_only',
+    onChange: () => { /* dataset.value is the source of truth for save */ },
+  });
 }
 window.openAgentModal = openAgentModal;
 
@@ -1147,10 +1243,13 @@ async function _saveCreateAgent({ msgEl }) {
   }
 
   const category = document.getElementById('agent-category-select')?.dataset.value || '';
+  // Output-format pick from the modal's dropdown. Default `markdown_only` if for some reason the
+  // dataset wasn't stamped (defensive — _mountAgentOutputFormatCreateSelect always sets it).
+  const outputFormat = document.getElementById('agent-output-format-select')?.dataset.value || 'markdown_only';
 
   try {
     const avatar = randomAgentAvatar();
-    const body = { name, description, icon: avatar.icon, color: avatar.color, category };
+    const body = { name, description, icon: avatar.icon, color: avatar.color, category, output_format: outputFormat };
     const res = await apiFetch('/api/agents/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

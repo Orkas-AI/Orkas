@@ -66,6 +66,35 @@ function escapeHtmlForBubble(s: string): string {
     .replace(/"/g, '&quot;');
 }
 
+/** Render a quality-validator rejection as a friendly user warning followed
+ *  by a structured JSON fenced block. The fenced block survives into the
+ *  LLM's own message history, giving it precise feedback to act on if the
+ *  user asks for a fix in the next turn — no separate retry channel needed. */
+function _formatValidationFailure(
+  failed: { path: string; report: { violations: Array<{ rule: string; level: string; field: string; snippet: string; suggested_fix: string }> } }[],
+): string {
+  const friendly = '<span style="color:var(--danger)">⚠️ Some skill files failed quality validation and were not written.</span>';
+  const machine = JSON.stringify({
+    validation_failed: failed.flatMap((f) => f.report.violations
+      .filter((v) => v.level === 'EXTREME')
+      .map((v) => ({
+        path: f.path, rule: v.rule, field: v.field,
+        snippet: v.snippet, suggested_fix: v.suggested_fix,
+      }))),
+  }, null, 2);
+  return `${friendly}\n\n\`\`\`json\n${machine}\n\`\`\``;
+}
+
+function _formatValidationWarnings(
+  warnings: { path: string; report: { violations: Array<{ rule: string; level: string; field: string; snippet: string; suggested_fix: string }> } }[],
+): string {
+  const friendly = '<span style="color:var(--muted)">ℹ️ Quality validator advisories (the files were written):</span>';
+  const items = warnings.flatMap((w) => w.report.violations
+    .filter((v) => v.level !== 'EXTREME')
+    .map((v) => `  - ${w.path}: **${v.rule}** — ${v.suggested_fix}`));
+  return `${friendly}\n${items.join('\n')}`;
+}
+
 const MAX_PROCESS_ITEMS_PER_TURN = 300;
 const MAX_WORKER_TURNS = 100; // hard ceiling against runaway loops
 
@@ -892,7 +921,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   let cliAgent: import('../agents').Agent | null = null;
   if (isCommander) {
     systemPrompt = await buildCommanderSystemPrompt(uid, cid, turnProjectScope?.agents ?? null);
-    extraTools = await buildCommanderExtraTools(state, w);
+    extraTools = await buildCommanderExtraTools(state, w, item.attachments);
     // skillList stays undefined for commander — every skill is globally
     // visible (skills are NOT project-scoped this round; see CLAUDE.md §6).
   } else {
@@ -1279,6 +1308,17 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
               const list = result.rejected.map((p) => `\`${p}\``).join(', ');
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Some skill files were rejected: ${list}</span>`;
             }
+            // Quality validator rejections: surface friendly warning to the
+            // user PLUS a structured fenced block so the LLM sees the
+            // violations in its own message history on the next turn and
+            // can rewrite. The fenced block is opaque to bus — it's just
+            // text that survives into history.
+            if (result.validation_failed && result.validation_failed.length) {
+              workingText = `${workingText}\n\n${_formatValidationFailure(result.validation_failed)}`;
+            }
+            if (result.validation_warnings && result.validation_warnings.length) {
+              workingText = `${workingText}\n\n${_formatValidationWarnings(result.validation_warnings)}`;
+            }
             // Project-scoped conv: auto-bind the new skill so the LLM in this
             // conv actually sees it via getSystemPromptBlock allowlist. Same
             // bug shape as the agent auto-bind above — without this the user
@@ -1294,7 +1334,16 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
               }
             }
           } else {
-            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ ${result.error || 'Skill operation failed.'}</span>`;
+            // Quality-blocked create: result has validation_failed even on
+            // ok:false. Display the structured violations so the LLM sees
+            // them in history and the user gets the same modal-style info.
+            // Plain error (missing-name / collision / etc) shows the
+            // localized message only.
+            if (result.validation_failed && result.validation_failed.length) {
+              workingText = `${workingText}\n\n${_formatValidationFailure(result.validation_failed)}`;
+            } else {
+              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ ${result.error || 'Skill operation failed.'}</span>`;
+            }
           }
         } catch (err) {
           const verb = container.skillId ? 'edit' : 'create';
@@ -1493,6 +1542,14 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   if (actor.kind === 'commander' && w.pendingDispatches && w.pendingDispatches.length) {
     const pending = w.pendingDispatches;
     w.pendingDispatches = undefined;
+    // Inherit the commander turn's user-uploaded attachments so the recipient
+    // worker sees the same image / file bytes the commander saw. Without this
+    // a worker honestly answers "I can't see the image" because turnImages
+    // only fires when `item.attachments` is populated. Plan-step dispatches
+    // get the same inheritance via PlanFile.initial_attachments (persisted
+    // because steps live across worker turn boundaries); dispatch_to is one-
+    // shot so per-turn flush is enough.
+    const inheritedAttachments = item.attachments;
     for (const d of pending) {
       try {
         await enqueue({
@@ -1501,6 +1558,9 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
           text: d.message,
           forceTo: [d.to],
           dispatch: true,
+          ...(inheritedAttachments && inheritedAttachments.length
+            ? { attachments: inheritedAttachments }
+            : {}),
         });
       } catch (err) {
         log.warn(`dispatch_to flush failed cid=${cid} to=${d.to}: ${(err as Error).message}`);
@@ -1661,7 +1721,7 @@ async function buildAgentsIndexBlock(uid: string, allowedIds?: readonly string[]
 
 async function buildAgentInGroupSystemPrompt(
   _uid: string,
-  agent: { name?: string; description?: string; workflow?: string; agent_id: string; inputs?: unknown },
+  agent: { name?: string; description?: string; workflow?: string; agent_id: string; inputs?: unknown; output_format?: string },
   workingDir: string,
 ): Promise<string> {
   const { prompts } = await import('../../prompts/loader');
@@ -1687,14 +1747,47 @@ async function buildAgentInGroupSystemPrompt(
     workflow: (agent.workflow || '').trim() || '(not provided)',
     inputs_schema: inputsSchemaJson || '(none)',
     working_dir: workingDir,
+    output_format_hint: buildOutputFormatHint(agent.output_format),
   });
   const shared = prompts.load('chat_shared_rules', {});
   return appendLanguageDirective(concatSharedRules(main, shared));
 }
 
+/** Render the agent's `output_format` preference as a one-line worker prompt
+ *  hint. Sits in the `## Runtime injection` tail (most-volatile slot per
+ *  PC/CLAUDE.md §3 prompt-md cache layout). `'auto'` (legacy) and missing both
+ *  produce an empty string — old agents authored before the redesign keep
+ *  unconstrained behavior until the user explicitly picks a value. `'artifact'`
+ *  is the renamed `'allow_artifacts'`; the old key is accepted as an alias for
+ *  on-disk back-compat (specs written by pre-redesign builds). See
+ *  `chat_shared_rules.md` "Output formats" for the underlying rule. */
+function buildOutputFormatHint(format: string | undefined): string {
+  switch (format) {
+    case 'markdown_only':
+      return '### Output format\nThis agent is configured **markdown-only**: do NOT emit `:::dashboard` blocks or call `create_artifact`. Plain markdown only.';
+    case 'dashboard':
+      return '### Output format\nThis agent is configured for **dashboard output**: prefer `:::dashboard` for structured snapshots (KPIs, tables, alerts, timelines); do NOT call `create_artifact`.';
+    case 'artifact':
+    case 'allow_artifacts':
+      return '### Output format\nThis agent is configured to **allow artifacts**: prefer `:::dashboard` for structured snapshots; reach for `create_artifact` when interactivity actually matters.';
+    case 'auto':
+    default:
+      return '';
+  }
+}
+
 // ── Commander tools (plan_set / plan_update) ────────────────────────────
 
-async function buildCommanderExtraTools(state: CidState, w: WorkerState): Promise<AgentTool[]> {
+async function buildCommanderExtraTools(
+  state: CidState,
+  w: WorkerState,
+  // Attachments on the current commander turn's source item — passed through
+  // to plan_set so the plan persists them under `initial_attachments`. Worker
+  // dispatches in subsequent reconciles read it back from the plan so image /
+  // file bytes follow the dispatch chain. Same flow as `dispatch_to` flush,
+  // but persisted because plan steps live across worker turn boundaries.
+  currentTurnAttachments?: string[],
+): Promise<AgentTool[]> {
   const { uid, cid } = w;
   const tools: AgentTool[] = [];
   tools.push({
@@ -1760,6 +1853,9 @@ async function buildCommanderExtraTools(state: CidState, w: WorkerState): Promis
       const stepsIn: PlanSetInput = {
         ...(typeof input?.initial_message === 'string' && input.initial_message.trim()
           ? { initial_message: String(input.initial_message) }
+          : {}),
+        ...(currentTurnAttachments && currentTurnAttachments.length
+          ? { initial_attachments: currentTurnAttachments.slice() }
           : {}),
         steps: raw.filter((s) => s && typeof s.title === 'string' && s.title.trim() && typeof s.assignee === 'string' && s.assignee.trim())
           .map((s) => ({
@@ -1996,6 +2092,7 @@ planExecutor.bindBusHooks({
       ...(params.forceTo ? { forceTo: params.forceTo } : {}),
       ...(typeof params.triggered_step === 'number' ? { triggered_step: params.triggered_step } : {}),
       ...(params.dispatch ? { dispatch: true } : {}),
+      ...(params.attachments && params.attachments.length ? { attachments: params.attachments } : {}),
     });
   },
 

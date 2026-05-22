@@ -43,6 +43,8 @@ import {
 import { listSkillSpecs } from '../model/core-agent/skill-registry';
 import { readDisabledSets, setAgentEnabled } from './component_enabled';
 import { renameAgentInMembers } from './group_chat/state';
+import { validateAgentSpec, ValidationReport as QualityReport } from '../quality';
+import { persistReport as persistQualityReport } from '../quality/report';
 
 export type AgentSource = 'builtin' | 'custom';
 
@@ -138,6 +140,21 @@ export interface Agent {
    *  connectors carry external side effects (sending emails, editing remote docs); a brand-new
    *  agent must opt in explicitly. Maintained by the agent edit UI, NOT by the agent-edit LLM. */
   enabled_connectors?: string[];
+  /** Output rendering preference — agent-level hint injected into the worker
+   *  system prompt at dispatch time. Three user-facing values, progressive
+   *  capability disclosure:
+   *    - `'markdown_only'`: blocks `:::dashboard` + `create_artifact`. The
+   *      create-modal default for new agents.
+   *    - `'dashboard'`: allows `:::dashboard` blocks; still blocks `create_artifact`.
+   *    - `'artifact'`: allows both `:::dashboard` and `create_artifact`.
+   *  Two legacy values kept for back-compat: `'auto'` (pre-redesign default,
+   *  empty hint = no constraint) and `'allow_artifacts'` (the old name for
+   *  `'artifact'`, treated identically by `bus.ts::buildOutputFormatHint`).
+   *  Missing field = no constraint (same as `'auto'`) — old agents authored
+   *  before the redesign keep their broad permissions until the user
+   *  explicitly picks a value. Authored by the agent edit UI dropdown, NOT
+   *  the agent-edit LLM. See `bus.ts::buildOutputFormatHint`. */
+  output_format?: OutputFormat;
   source: AgentSource;
   created_at: string;
   updated_at: string;
@@ -175,7 +192,19 @@ interface AgentRaw {
   runtime?: unknown;
   category?: unknown;
   enabled_connectors?: unknown;
+  output_format?: unknown;
 }
+
+/** Agent output rendering preference. Three user-facing values
+ *  (`'markdown_only' | 'dashboard' | 'artifact'`); the create modal defaults
+ *  to `'markdown_only'`. Two legacy values are kept in the enum for
+ *  on-disk back-compat: `'auto'` (pre-redesign default; missing-field is
+ *  still equivalent) and `'allow_artifacts'` (renamed to `'artifact'` — the
+ *  hint builder + detail dropdown treat them as the same). Missing field
+ *  on disk = no constraint (empty hint), preserving legacy agent behavior
+ *  through the redesign. See `Agent.output_format`. */
+export type OutputFormat = 'auto' | 'markdown_only' | 'dashboard' | 'artifact' | 'allow_artifacts';
+const _OUTPUT_FORMAT_VALUES = new Set<OutputFormat>(['auto', 'markdown_only', 'dashboard', 'artifact', 'allow_artifacts']);
 
 /** Per-agent execution backend. See `Agent.runtime`. */
 export type AgentRuntime =
@@ -500,6 +529,12 @@ export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSo
   }
   const rt = _normalizeRuntime(raw.runtime);
   if (rt) agent.runtime = rt;
+  // output_format: enum-coerce; missing / unknown collapses to "no field
+  // set" (downstream reads default to 'auto'). Only the three known values
+  // round-trip to disk, so a malformed JSON can't inject a fourth state.
+  if (typeof raw.output_format === 'string' && _OUTPUT_FORMAT_VALUES.has(raw.output_format as OutputFormat)) {
+    agent.output_format = raw.output_format as OutputFormat;
+  }
   return agent;
 }
 
@@ -688,6 +723,11 @@ export interface CreateAgentOptions {
   /** Marketplace category code (e.g. `education`). Empty string / omitted = uncategorized;
    *  required only at marketplace publish time. */
   category?: string;
+  /** Output rendering preference picked in the create-modal dropdown. Validated against
+   *  `_OUTPUT_FORMAT_VALUES` before persist — unknown values silently drop the field
+   *  (= old "missing = no constraint" semantics). The modal sends `'markdown_only'` by
+   *  default; omitted = field stays unset on disk. */
+  output_format?: OutputFormat;
 }
 
 /** Route a legacy `description` input into the matching language slot.
@@ -715,7 +755,7 @@ function resolveBilingualDescription(
  * manual edit. Returns the created agent.
  */
 export async function createCustomAgent(
-  { name = '', description = '', description_zh, description_en, workflow = '', icon, color, interactive, runtime, category }: CreateAgentOptions = {},
+  { name = '', description = '', description_zh, description_en, workflow = '', icon, color, interactive, runtime, category, output_format }: CreateAgentOptions = {},
 ): Promise<Agent | null> {
   assertAgentNameAllowed(name);
   await assertAgentNameUnique(String(name || '').trim());
@@ -743,6 +783,13 @@ export async function createCustomAgent(
   if (avatars.isKnownIcon(icon)) data.icon = icon;
   if (avatars.isKnownColor(color)) data.color = color;
   if (typeof interactive === 'boolean') data.interactive = interactive;
+  // Persist `output_format` only when the caller supplied a value the enum recognizes. Unknown
+  // strings (e.g. a future client speaking a newer dialect at an older main) drop silently — the
+  // missing field is equivalent to "no constraint" and won't break the worker prompt, whereas a
+  // bogus stored value would survive normalizeAgent and silently turn into empty hint anyway.
+  if (typeof output_format === 'string' && _OUTPUT_FORMAT_VALUES.has(output_format as OutputFormat)) {
+    data.output_format = output_format as OutputFormat;
+  }
   // Persist runtime only when it survives validation; an in_process
   // selection is the implicit default and not written to disk so old
   // tooling diffs cleanly.
@@ -758,10 +805,34 @@ export async function createCustomAgent(
       data.inputs = [_buildProjectDirInput()];
     }
   }
+  // Quality validation gate. EXTREME findings (missing required fields / red
+  // flags in workflow text / etc.) block the write; MEDIUM warnings pass
+  // through but are persisted for UI surfacing. Persist runs in both branches
+  // so the latest report on disk always matches the most recent intent.
+  const report = validateAgentSpec({ agentJson: data });
+  void persistQualityReport({
+    uid: getActiveUserId(), kind: 'agent', id: agentId, report,
+  });
+  if (!report.ok) {
+    // Roll back the freshly-mkdir'd directory so a rejected create doesn't
+    // leave behind an empty <aid>/ that would later confuse `listAgents`.
+    try { fs.rmSync(agentDir(getActiveUserId(), agentId), { recursive: true, force: true }); }
+    catch { /* tolerate cleanup failure */ }
+    throw new Error(_validationErrorMessage(report));
+  }
+
   await writeJson(customAgentFile(agentId), data);
   _invalidateAgentListCache();
   log.info(`created id=${agentId} name=${data.name}`);
   return normalizeAgent(data, 'custom');
+}
+
+/** Build a single-line error message from a failed report. Used to surface
+ *  validation rejection up the create/update path's existing throw flow. */
+function _validationErrorMessage(report: QualityReport): string {
+  const top = report.violations.find((v) => v.level === 'EXTREME');
+  if (!top) return 'validation failed';
+  return `validation failed (${top.rule}): ${top.suggested_fix}`;
 }
 
 /** Required-input schema injected on every external coding agent. The
@@ -821,6 +892,12 @@ export interface UpdateAgentFields {
    *   omitted → untouched
    *  Authored by the agent edit UI (connectors toggle list), NOT the agent-edit LLM. */
   enabled_connectors?: string[] | null;
+  /** Three-way update:
+   *   OutputFormat string → set (one of the three enum values)
+   *   null                 → drop (revert to default 'auto')
+   *   omitted              → untouched
+   *  Authored by the agent edit UI dropdown. */
+  output_format?: OutputFormat | null;
 }
 
 /**
@@ -835,6 +912,41 @@ export async function updateCustomAgent(
   if (!fs.existsSync(f)) return null;
   const data = await readJson<AgentRaw>(f);
   const oldName = typeof (data as any).name === 'string' ? (data as any).name : '';
+  await _applyAgentUpdates(data, agentId, updates);
+
+  // Quality gate (same policy as createCustomAgent): EXTREME blocks the
+  // write so the on-disk spec doesn't regress; MEDIUM persists but writes
+  // through.
+  const report = validateAgentSpec({ agentJson: data });
+  void persistQualityReport({
+    uid: getActiveUserId(), kind: 'agent', id: agentId, report,
+  });
+  if (!report.ok) {
+    throw new Error(_validationErrorMessage(report));
+  }
+
+  await writeJson(f, data);
+  _invalidateAgentListCache();
+  log.info(`updated id=${agentId}`);
+  // Propagate a name change into every conversation roster that already
+  // lists this agent. members.json snapshots the name at join time and the
+  // @-router resolves on roster-first, so without this sweep `@<old-name>`
+  // would keep matching in old chats.
+  const newName = typeof (data as any).name === 'string' ? (data as any).name : '';
+  if (newName && newName !== oldName) {
+    try { await renameAgentInMembers(getActiveUserId(), agentId, newName); }
+    catch (err) { log.warn(`rename roster sweep failed id=${agentId}: ${(err as Error).message}`); }
+  }
+  return normalizeAgent(data, 'custom');
+}
+
+/** Pure mutator: apply `updates` onto a raw agent spec object. Shared by
+ *  `updateCustomAgent` and the dev-mode built-in update path so the field
+ *  semantics stay identical regardless of source. Throws on reserved-name
+ *  collision (matches existing custom behavior). */
+async function _applyAgentUpdates(
+  data: AgentRaw, agentId: string, updates: UpdateAgentFields,
+): Promise<void> {
   if (Object.prototype.hasOwnProperty.call(updates || {}, 'name')) {
     const incomingName = typeof updates.name === 'string' ? updates.name : '';
     assertAgentNameAllowed(incomingName);
@@ -940,6 +1052,16 @@ export async function updateCustomAgent(
     } else if (Array.isArray(v)) {
       const ids = v.filter((s): s is string => typeof s === 'string' && s.length > 0);
       (data as { enabled_connectors?: string[] }).enabled_connectors = ids;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'output_format')) {
+    const v = (updates as { output_format?: OutputFormat | null }).output_format;
+    if (v === null || v === 'auto') {
+      // 'auto' is the implicit default; don't write it to disk so spec
+      // diffs stay clean and unset agents don't suddenly get a field.
+      delete (data as { output_format?: unknown }).output_format;
+    } else if (typeof v === 'string' && _OUTPUT_FORMAT_VALUES.has(v)) {
+      (data as { output_format?: OutputFormat }).output_format = v;
     }
   }
   if (Object.prototype.hasOwnProperty.call(updates || {}, 'icon')) {

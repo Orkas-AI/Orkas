@@ -46,16 +46,8 @@ async function loadSettings() {
   _settingsRenderCommanderAvatar();
   _settingsRenderMetacognition();
   _settingsRenderDataRoot();
-  // Account card + subscription card (views/login/account_settings.js — absent in
-  // OrkasOpen, so these are no-ops there). renderSubscriptionSettings rebinds the
-  // action button's click handler with the current subscription state on every
-  // render — opening the panel is the canonical "guarantee fresh button binding"
-  // moment, so call it explicitly here (not just from the account.onChange listener
-  // which only fires on state changes — for a Free user with no transitions the
-  // listener never fires after boot, leaving the button bound to whatever its
-  // first render captured).
+  // Account card (views/login/account_settings.js — absent in OrkasOpen, so this is a no-op there).
   if (typeof renderAccountSettings === 'function') renderAccountSettings();
-  if (typeof renderSubscriptionSettings === 'function') renderSubscriptionSettings();
 }
 
 // ── Commander avatar ──

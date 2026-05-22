@@ -325,6 +325,11 @@
                   <div class="agents-detail-label" data-i18n="agents.label_connectors">Connectors</div>
                   <div class="agents-detail-connectors" id="agents-detail-connectors"></div>
                 </div>
+                <div class="agents-detail-section" id="agents-detail-output-format-section">
+                  <div class="agents-detail-label" data-i18n="agents.label_output_format">Output format</div>
+                  <div class="agents-detail-output-format" id="agents-detail-output-format"></div>
+                  <div class="form-hint muted" data-i18n="agents.output_format_hint">Hint to the agent on how to render replies. Auto = let the model pick per output.</div>
+                </div>
               </div>
             </div>
           </div>
@@ -582,6 +587,10 @@
                      functional for Pro users. -->
                   <span class="settings-status" data-i18n="settings.sync.pro_required">云端同步是 Pro 会员功能。开通后多台设备的对话、智能体、技能、知识库自动保持一致。</span>
                 </div>
+                  <div class="settings-group-title" data-i18n="settings.sync.title">云端同步</div>
+                  <div class="settings-group-sub" data-i18n="settings.sync.privacy_note">数据通过 HTTPS 加密上传到私有云存储，仅你的账号可访问。</div>
+                </div>
+                <div class="settings-row">
                   <label class="settings-toggle settings-toggle-tight">
                     <span data-i18n="settings.sync.toggle_enable">启用云端同步</span>
                   </label>
@@ -804,6 +813,10 @@
         <div class="form-row">
           <label data-i18n="agent_modal.category">Category</label>
           <div class="ai-select" id="agent-category-select"></div>
+        </div>
+        <div class="form-row">
+          <label><span data-i18n="agents.label_output_format">Output format</span> <span class="form-hint" data-i18n="agents.output_format_hint">Tells the agent how to render replies.</span></label>
+          <div class="ai-select" id="agent-output-format-select"></div>
         </div>
         <div class="form-row">
           <label><span data-i18n="agent_modal.desc">Summary</span> <span class="form-hint" data-i18n="agent_modal.desc_hint">One line on what it does — the AI will generate a workflow from this</span></label>
@@ -1032,9 +1045,6 @@
        after boot.js (it calls bootApp); account_settings.js is invoked from settings.js::loadSettings. -->
   <script src="./views/login/login_panel.js"></script>
   <script src="./views/login/account_settings.js"></script>
-  <!-- Pro entitlement gate (renderer-side). Loads before voice / sync so window.proGate
-       exists when those modules attach button handlers. Stripped in OrkasOpen. -->
-  <script src="./modules/pro_gate.js"></script>
   <script src="./modules/avatar.js"></script>
   <script src="./modules/avatar-picker.js"></script>
   <script src="./modules/chat-input-form.js"></script>
@@ -1060,6 +1070,7 @@
   <script src="./modules/saved-apps.js"></script>
   <script src="./modules/agent-schedule.js"></script>
   <script src="./modules/utils.js"></script>
+  <script src="./modules/validation-report-view.js"></script>
   <script src="./modules/marketplace.js"></script>
   <script src="./modules/marketplace_dev.js"></script>
 

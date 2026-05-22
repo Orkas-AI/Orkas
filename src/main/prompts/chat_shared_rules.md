@@ -23,3 +23,35 @@ To generate a PDF you **must** use `markdown_to_pdf` (pure markdown) or `html_to
 - Images: `.png/.jpg/.jpeg/.webp/.gif`; video: `.mp4/.webm/.mov/.m4v/.ogv`.
 - Path shape: Unix `/Users/...` → `Users/...`; Windows keep the drive letter `C:/Users/...`; encode spaces / non-ASCII with `%20`.
 - `read_file` on an image is **for you to see** (multimodal input — the user does NOT see it); for the user to see it, you must reference it via markdown.
+
+## Output formats
+
+**Default = Markdown.** Narrative answers, lists, light tables, code fences — markdown covers most replies.
+
+**`:::dashboard`** — fenced JSON block for structured snapshots (KPI rows, alerts, timelines, multi-row data). Renders inline, no tool call:
+
+```
+:::dashboard
+{
+  "schema_version": 1,
+  "root": { "type": "Stack", "props": { "gap": "md" }, "children": [
+    { "type": "Grid", "props": { "columns": 3 }, "children": [
+      { "type": "Metric", "props": { "label": "Hosts", "value": "24", "delta": "+2", "tone": "positive" } },
+      { "type": "Metric", "props": { "label": "Unreachable", "value": "3", "tone": "negative" } },
+      { "type": "Metric", "props": { "label": "Avg RTT", "value": "42ms" } }
+    ] },
+    { "type": "Alert", "props": { "level": "warning", "title": "3 hosts unreachable", "body": "Check network ACL" } },
+    { "type": "Table", "props": {
+        "columns": [ { "key": "host", "label": "Host" }, { "key": "rtt", "label": "RTT", "numeric": true } ],
+        "rows": [ { "host": "10.0.0.1", "rtt": 12 }, { "host": "10.0.0.2", "rtt": 84 } ]
+    } }
+  ] }
+}
+:::
+```
+
+Component types: **layout** `Stack | Grid | Card | Separator`; **content** `Metric | Chart | Table | Alert | Timeline | Code | Markdown | Image`. Common props: `tone: positive|negative|neutral|warning`, `gap: sm|md|lg`, `columns: 1..4`, `level: info|success|warning|error`. Unknown `type` renders empty — stick to the list. JSON must parse; on doubt prefer markdown over a broken block.
+
+**`create_artifact`** — multi-file web-app bundle rendered in a sandboxed iframe. Use only when behavior matters (forms / dynamic charts / interactive pages); for static layouts `:::dashboard` already covers, prefer that — it's lighter, iOS-renderable, and far cheaper in tokens.
+
+**Tool results are working data, not user prose.** Summarize and act on them; **do not** paste raw JSON / long logs / stack traces back into the reply. Quote at most a few salient lines when verbatim actually clarifies. Multi-row results → `:::dashboard`, not markdown tables hand-built from a JSON dump.

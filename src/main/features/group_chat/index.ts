@@ -143,7 +143,9 @@ export async function retryStep(
 ): Promise<{ ok: boolean; error?: string }> {
   if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
   if (!Number.isFinite(stepIndex) || stepIndex < 1) return { ok: false, error: 'invalid stepIndex' };
-  return planExecutor.retryStep(userId, cid, stepIndex);
+  const result = await planExecutor.retryStep(userId, cid, stepIndex);
+  if (result.ok) _emitPlanSignal(userId, cid, stepIndex, 'retry');
+  return result;
 }
 
 /** User-initiated skip of a failed plan step (rail "Skip" button). */
@@ -152,7 +154,31 @@ export async function skipStep(
 ): Promise<{ ok: boolean; error?: string }> {
   if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
   if (!Number.isFinite(stepIndex) || stepIndex < 1) return { ok: false, error: 'invalid stepIndex' };
-  return planExecutor.skipStep(userId, cid, stepIndex);
+  const result = await planExecutor.skipStep(userId, cid, stepIndex);
+  if (result.ok) _emitPlanSignal(userId, cid, stepIndex, 'skip');
+  return result;
+}
+
+/** Expert-signals hook (plan §5 mounts #2/#3) — read the plan to recover
+ *  the agent_id assigned to this step, then emit retry/skip signal.
+ *  Fire-and-forget; failures never block the IPC reply. */
+function _emitPlanSignal(uid: string, cid: string, stepIndex: number, kind: 'retry' | 'skip'): void {
+  (async () => {
+    try {
+      const plan = await readPlan(uid, cid);
+      const step = plan?.steps?.[stepIndex - 1];
+      const aid = (step && typeof (step as any).assignee === 'string') ? (step as any).assignee : '';
+      if (!aid) return;            // user-assignee or missing — no signal target
+      const { emitSignal } = await import('../expert_signals');
+      const { buildRetrySignal, buildSkipSignal } = await import('../expert_signals/extractors/event');
+      const turn_id = `${cid}:plan:${stepIndex}`;        // stable across retries of same step
+      emitSignal(uid, (kind === 'retry' ? buildRetrySignal : buildSkipSignal)({
+        cid, aid, turn_id, step_index: stepIndex,
+      }));
+    } catch (err) {
+      log.warn(`expert-signals plan ${kind} emit failed cid=${cid} step=${stepIndex}: ${(err as Error).message}`);
+    }
+  })();
 }
 
 // ── Streaming events ─────────────────────────────────────────────────────
@@ -257,6 +283,24 @@ export async function markFormSubmittedAndDispatch(
     return { ok: false, error: r.error };
   }
   log.info(`form-submitted user=${userId} cid=${cid} msgId=${msgId} agent=${agentId} fields=${target.form.fields.length}`);
+
+  // Expert-signals hook (plan §5 mount #4): one form_left_blank signal per
+  // field the user didn't touch (kept blank OR kept default). Fire-and-
+  // forget; failures never block the form submission.
+  (async () => {
+    try {
+      const { emitSignal } = await import('../expert_signals');
+      const { buildFormLeftBlankSignals } = await import('../expert_signals/extractors/event');
+      const signals = buildFormLeftBlankSignals({
+        cid, aid: agentId, turn_id: msgId, msg_id: msgId,
+        fields: target.form.fields as any,
+        values: (values || {}) as Record<string, unknown>,
+      });
+      for (const sig of signals) emitSignal(userId, sig);
+    } catch (err) {
+      log.warn(`expert-signals form_left_blank emit failed cid=${cid} msgId=${msgId}: ${(err as Error).message}`);
+    }
+  })();
 
   // Coding-agent contract: when a `project_dir` field is present in the
   // submitted form for an external claude / codex agent, persist it to

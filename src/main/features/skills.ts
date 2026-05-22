@@ -46,6 +46,11 @@ import {
 import { invalidateSkills as invalidateCoreAgentSkills } from '../model/core-agent/skill-registry';
 import { readDisabledSets, setSkillEnabled } from './component_enabled';
 import { findOuterTagRanges } from '../util/markdown-prose-code';
+import {
+  validateSkillFile,
+  ValidationReport as QualityReport,
+} from '../quality';
+import { persistReport as persistQualityReport } from '../quality/report';
 
 // Names hidden from the in-app skill source-tree view. `_install.json` (marketplace install
 // version pin) and `_cache.json` (marketplace cache LRU bookkeeping) are tooling sidecars,
@@ -971,9 +976,55 @@ async function _renameSkillByFrontmatterIfNeeded(currentId: string): Promise<str
   return null;
 }
 
+export interface WriteSkillFileResult {
+  ok: boolean;
+  /** Quality report from the file scan. `undefined` only when the call
+   *  rejected on a non-quality reason (missing dir, path-escape). */
+  report?: QualityReport;
+  /** Non-quality rejection reason: 'missing_dir' | 'invalid_path'. */
+  reason?: 'missing_dir' | 'invalid_path';
+}
+
 /**
- * Safely write content to `<skill_dir>/<relpath>`. Rejects path-escape attempts.
- * Skills are self-contained — only writes within `skillId`'s own dir.
+ * Safely write content to `<skill_dir>/<relpath>` after running the quality
+ * validator. Rejects:
+ *   - path-escape attempts (`reason: 'invalid_path'`)
+ *   - missing skill dir (`reason: 'missing_dir'`)
+ *   - quality EXTREME violations (`report.ok === false`)
+ *
+ * MEDIUM / LOW violations don't block the write — the report is still
+ * persisted so the UI / reflection layer can surface advice.
+ *
+ * Used by authoring flows that want the structured report back (commander
+ * `<<<skill-file>>>` apply path; future inline edit chat). Callers that
+ * only need a yes/no go through the legacy `writeCustomSkillFile()` wrapper.
+ */
+export function writeCustomSkillFileChecked(
+  skillId: string,
+  relpath: string,
+  content: string,
+): WriteSkillFileResult {
+  const d = path.resolve(customSkillDir(skillId));
+  if (!fs.existsSync(d) || !fs.statSync(d).isDirectory()) {
+    return { ok: false, reason: 'missing_dir' };
+  }
+  const report = validateSkillFile({ relpath, content });
+  // Persist best-effort regardless of outcome — the report's also the input
+  // for the future evolution / reflection signal stream.
+  void persistQualityReport({
+    uid: getActiveUserId(), kind: 'skill', id: skillId, report,
+  });
+  if (!report.ok) {
+    return { ok: false, report };
+  }
+  const written = _writeSkillFileAt(d, relpath, content, /* invalidateOnSkillMd */ true);
+  if (!written) return { ok: false, report, reason: 'invalid_path' };
+  return { ok: true, report };
+}
+
+/**
+ * Boolean-returning wrapper for callers that don't consume the quality
+ * report. Internally delegates to `writeCustomSkillFileChecked`.
  */
 export function writeCustomSkillFile(
   skillId: string,
@@ -982,6 +1033,18 @@ export function writeCustomSkillFile(
 ): boolean {
   const d = path.resolve(customSkillDir(skillId));
   if (!fs.existsSync(d) || !fs.statSync(d).isDirectory()) return false;
+  return writeCustomSkillFileChecked(skillId, relpath, content).ok;
+}
+
+/** Path-validated write into a resolved skill directory. Returns false on
+ *  any path-escape attempt or missing dir. SKILL.md writes also bust the
+ *  shared list cache + core-agent skill registry cache when requested. */
+export function _writeSkillFileAt(
+  resolvedDir: string,
+  relpath: string,
+  content: string,
+  invalidateOnSkillMd = true,
+): boolean {
   if (!relpath) return false;
   const rel = relpath.trim().replace(/^\/+/, '');
   if (!rel || rel.startsWith('..')) return false;
@@ -1003,6 +1066,54 @@ export function writeCustomSkillFile(
     invalidateCoreAgentSkills().catch(() => { /* runner may not be loaded yet */ });
   }
   return true;
+}
+
+/** Edit-chat dispatcher (with validation report). Routes to custom write for
+ *  custom ids, and to the dev-only built-in dual-write for built-in ids in
+ *  dev mode. Validation runs on both branches — platform installs are not
+ *  exempt; if a dev edit introduces an EXTREME pattern it's still rejected.
+ *
+ *  Returns `{ ok: false }` (no report) for missing-id / built-in-outside-dev. */
+export async function writeSkillFileForEditChecked(
+  skillId: string,
+  relpath: string,
+  content: string,
+): Promise<WriteSkillFileResult> {
+  const customDir = customSkillDir(skillId);
+  if (fs.existsSync(customDir) && fs.statSync(customDir).isDirectory()) {
+    return writeCustomSkillFileChecked(skillId, relpath, content);
+  }
+  if (isBuiltinSkill(skillId) && false) {
+    // Built-in (platform-installed) skill edit. Validate first; defer the
+    // actual write to skills_dev (which knows the target install dir).
+    const report = validateSkillFile({ relpath, content });
+    void persistQualityReport({
+      uid: getActiveUserId(), kind: 'skill', id: skillId, report,
+    });
+    if (!report.ok) return { ok: false, report };
+    try {
+      const dev = await import('./skills_dev');
+      const written = await dev.writeBuiltinSkillFile(skillId, relpath, content);
+      return written ? { ok: true, report } : { ok: false, report, reason: 'invalid_path' };
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'MODULE_NOT_FOUND' && code !== 'ERR_MODULE_NOT_FOUND') {
+        log.warn(`skills_dev load failed: ${(err as Error).message}`);
+      }
+      return { ok: false };
+    }
+  }
+  return { ok: false };
+}
+
+/** Boolean wrapper around `writeSkillFileForEditChecked` for callers that
+ *  don't consume the quality report. */
+export async function writeSkillFileForEdit(
+  skillId: string,
+  relpath: string,
+  content: string,
+): Promise<boolean> {
+  return (await writeSkillFileForEditChecked(skillId, relpath, content)).ok;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1174,6 +1285,13 @@ export interface SkillContainerResult {
   /** Paths whose write was rejected (path-escape, missing dir, etc.). Never
    *  causes total failure — best-effort policy mirrors the skill-edit chat. */
   rejected?: string[];
+  /** Quality-validator rejections. Each entry pairs the rejected path with
+   *  the report (EXTREME violations only land here — MEDIUM passes through).
+   *  Surfaced to the LLM as structured retry feedback. */
+  validation_failed?: { path: string; report: QualityReport }[];
+  /** Quality-validator advisories. Files that wrote successfully but have
+   *  MEDIUM-level findings the LLM / UI should display. */
+  validation_warnings?: { path: string; report: QualityReport }[];
   /** Total-failure cause when `ok: false`. Already localized via `t()`. */
   error?: string;
 }
@@ -1213,9 +1331,32 @@ async function _applySkillContainerCreate(files: SkillFileBlock[]): Promise<Skil
   if (fs.existsSync(path.join(userMarketplaceSkillsDir(getActiveUserId()), name))) {
     return { ok: false, error: t('skills.errors.builtin_conflict', { name }) };
   }
-  // Seed description from the frontmatter so the registry never sees a
-  // transient empty-description state between createCustomSkill (which
-  // writes boilerplate SKILL.md) and the SKILL.md block write below.
+  // Pre-validate every file BEFORE any FS mutation. Without this, the path
+  // is "create dir + write boilerplate SKILL.md" → "write LLM files (each
+  // gated by validator)" → if every file gets rejected by EXTREME, the
+  // boilerplate SKILL.md remains and `listSkills` still shows the
+  // half-created skill. Pre-validation moves the EXTREME gate to a single
+  // decision point: any EXTREME → abort the whole create, no dir touched.
+  const validationFailed: { path: string; report: QualityReport }[] = [];
+  const validationWarnings: { path: string; report: QualityReport }[] = [];
+  for (const fb of files) {
+    const report = validateSkillFile({ relpath: fb.path, content: fb.content });
+    if (!report.ok) {
+      validationFailed.push({ path: fb.path, report });
+    } else if (report.violations.length > 0) {
+      validationWarnings.push({ path: fb.path, report });
+    }
+  }
+  if (validationFailed.length > 0) {
+    log.info(`commander create skill=${name} aborted by validator (files=${validationFailed.map((v) => v.path).join(',')})`);
+    return {
+      ok: false,
+      error: t('skills.errors.validation_blocked'),
+      validation_failed: validationFailed,
+    };
+  }
+
+  // All files passed EXTREME — proceed with the actual create.
   const desc = migrateDescriptionPair(meta as any);
   const seedDescription = desc.description_zh || desc.description_en || '';
   const created = await createCustomSkill(name, seedDescription);
@@ -1224,8 +1365,14 @@ async function _applySkillContainerCreate(files: SkillFileBlock[]): Promise<Skil
   const written: string[] = [];
   const rejected: string[] = [];
   for (const fb of files) {
-    if (writeCustomSkillFile(name, fb.path, fb.content)) written.push(fb.path);
-    else rejected.push(fb.path);
+    // After pre-validation passed, the only remaining reason to reject is
+    // a path-escape attempt (handled inside `writeCustomSkillFileChecked`).
+    const res = writeCustomSkillFileChecked(name, fb.path, fb.content);
+    if (res.ok) {
+      written.push(fb.path);
+    } else {
+      rejected.push(fb.path);
+    }
   }
   if (written.length) log.info(`commander created skill=${name} files=${written.length}`);
   return {
@@ -1235,6 +1382,7 @@ async function _applySkillContainerCreate(files: SkillFileBlock[]): Promise<Skil
     name,
     written,
     ...(rejected.length ? { rejected } : {}),
+    ...(validationWarnings.length ? { validation_warnings: validationWarnings } : {}),
   };
 }
 
@@ -1249,13 +1397,20 @@ async function _applySkillContainerEdit(skillId: string, files: SkillFileBlock[]
   }
   const written: string[] = [];
   const rejected: string[] = [];
+  const validationFailed: { path: string; report: QualityReport }[] = [];
+  const validationWarnings: { path: string; report: QualityReport }[] = [];
   let touchedSkillMd = false;
   for (const fb of files) {
-    if (await writeSkillFileForEdit(skillId, fb.path, fb.content)) {
+    const res = await writeSkillFileForEditChecked(skillId, fb.path, fb.content);
+    if (res.ok) {
       written.push(fb.path);
       if (fb.path.toUpperCase() === 'SKILL.MD') touchedSkillMd = true;
+      if (res.report && res.report.violations.length > 0) {
+        validationWarnings.push({ path: fb.path, report: res.report });
+      }
     } else {
       rejected.push(fb.path);
+      if (res.report) validationFailed.push({ path: fb.path, report: res.report });
     }
   }
   // Auto-rename when SKILL.md frontmatter `name` differs from the dir id —
@@ -1274,6 +1429,8 @@ async function _applySkillContainerEdit(skillId: string, files: SkillFileBlock[]
     name: post?.name || resolvedId,
     written,
     ...(rejected.length ? { rejected } : {}),
+    ...(validationFailed.length ? { validation_failed: validationFailed } : {}),
+    ...(validationWarnings.length ? { validation_warnings: validationWarnings } : {}),
   };
 }
 

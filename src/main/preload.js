@@ -66,7 +66,7 @@ function logRecord(record) {
 // Push-event subscription — for main-initiated broadcasts where the renderer doesn't drive
 // the lifecycle (unlike `stream` which the renderer starts). Channel names are restricted to
 // a known prefix list so the renderer can't tap into arbitrary internal IPC traffic.
-const PUSH_EVENT_PREFIXES = ['marketplace:', 'sync:'];
+const PUSH_EVENT_PREFIXES = ['marketplace:', 'sync:', 'conversations:'];
 function isAllowedPushChannel(channel) {
   if (typeof channel !== 'string') return false;
   return PUSH_EVENT_PREFIXES.some((p) => channel.startsWith(p));
@@ -124,12 +124,11 @@ function stream(channel, payload, onEvent) {
   return { promise, cancel };
 }
 
-// User-account login, voice ASR proxy, and multi-device sync namespaces are stripped from the
-// OrkasOpen build — see OpenSource/SyncCode/strip-rules.json. The renderer is not allowed to
-// reference these surfaces; renderer modules that depend on them are removed at sync time.
+const quality = {
+  readSkillReport: (id) => invoke('quality.readSkillReport', { id }),
+  readAgentReport: (id) => invoke('quality.readAgentReport', { id }),
+};
 
-// Expose the sync-fetched i18n bundle on its own bridge key so the renderer
-// can pick it up at module load. Read-only — the renderer never mutates it.
 contextBridge.exposeInMainWorld('__orkasI18nBoot', _i18nBoot);
 
 contextBridge.exposeInMainWorld('orkas', {
@@ -139,6 +138,7 @@ contextBridge.exposeInMainWorld('orkas', {
   getLanguage: () => invoke('config.getLanguage'),
   setLanguage: (language) => invoke('config.setLanguage', { language }),
   getLocales: () => invoke('config.getLocales'),
+  quality,
   invoke,
   stream,
   onPushEvent,

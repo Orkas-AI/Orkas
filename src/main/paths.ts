@@ -369,6 +369,36 @@ export const localCliSessionsFile = (uid: string, cid: string) =>
 // paths are machine-specific, so this is never synced.
 export const userWorkspaceConfigFile = (uid: string) => path.join(userLocalRoot(uid), 'workspace.json');
 
+// ── Expert signals (machine-private, append-only) ───────────────────────
+// Per-day jsonl of T0/T1 user behavior signals emitted by bus.ts turn-end
+// hook + IPC handlers (retry/skip/form/silence). Local-only: signals are
+// extractor-version dependent and shouldn't cross devices; they're inputs
+// to reflection / patch suggester / critic (phase 1+). See plan
+// `docs/plans/expert-signals-phase-0.md`. Daily rotation keeps query
+// scoped to a date range; no archive sweep yet (50-200 KB/day × 365 ≈
+// 18-73 MB/year is acceptable for append-only jsonl).
+export const userSignalsDir = (uid: string) => path.join(userLocalRoot(uid), 'signals');
+/** Returns `<signalsDir>/<yyyy-mm-dd>.jsonl`. `date` defaults to today (local). */
+export const signalsDailyFile = (uid: string, date?: Date) => {
+  const d = date || new Date();
+  const ymd = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return path.join(userSignalsDir(uid), `${ymd}.jsonl`);
+};
+
+// ── Quality validator reports (machine-private) ──────────────────────────
+// Per-spec ValidationReport produced by `src/main/quality/`. Local-only:
+// validator version + ruleset are tied to the installed build, so a report
+// from one machine isn't authoritative on another; the validator re-runs at
+// every write anyway, so persistence is informational (UI rail / evolution
+// signal source), not load-bearing. Only the latest report per spec is kept.
+export const userQualityReportsDir = (uid: string) => path.join(userLocalRoot(uid), 'quality_reports');
+export const userQualitySkillsDir  = (uid: string) => path.join(userQualityReportsDir(uid), 'skills');
+export const userQualityAgentsDir  = (uid: string) => path.join(userQualityReportsDir(uid), 'agents');
+export const qualitySkillReportFile = (uid: string, sid: string) =>
+  path.join(userQualitySkillsDir(uid), `${sid}.json`);
+export const qualityAgentReportFile = (uid: string, aid: string) =>
+  path.join(userQualityAgentsDir(uid), `${aid}.json`);
+
 // ── Multi-device sync (machine-private state) ────────────────────────────
 // `<uid>/local/sync/` is the engine's per-machine bookkeeping; nothing here
 // crosses devices (per plan §3.2). `index.json` is the last-synced snapshot
@@ -461,6 +491,9 @@ export function ensureUserLayout(uid: string): void {
     userSyncConflictsDir(uid),
     userLocalContextsDir(uid),
     userKbDir(uid),
+    userQualitySkillsDir(uid),
+    userQualityAgentsDir(uid),
+    userSignalsDir(uid),
   ];
   for (const d of dirs) fs.mkdirSync(d, { recursive: true });
 

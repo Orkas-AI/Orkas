@@ -142,3 +142,5 @@ $inputs_schema
 
 ### Working directory
 $working_dir
+
+$output_format_hint

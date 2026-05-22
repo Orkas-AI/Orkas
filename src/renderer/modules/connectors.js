@@ -173,12 +173,21 @@ function _renderCatalogCard(entry, instance) {
     : '';
 
   // Bottom-row action:
+  //   - connecting (this card is in `_connectorsState.connecting`): show spinner — overrides
+  //     every other state. Without this, a bundle finishes its 5-member install in ~0.7s
+  //     of stdio MCP handshakes; the card flips from "available" to "connected" section
+  //     before `_runConnect`'s `finally` clears the connecting flag, and the user sees
+  //     the spinner vanish "the moment they return from the browser" even though the
+  //     IPC chain (loadConnectors + grid re-render) is still finishing.
   //   - connected: 启用 / 停用 toggle (per-user soft switch — hides instance from LLM)
   //   - errored:   断开 (recover from a stuck error state)
   //   - oauth_pending: disabled "敬请期待"
   //   - default (uninstalled): 连接 (start OAuth)
   let action = '';
-  if (isOAuthPending) {
+  const isConnecting = _connectorsState.connecting && _connectorsState.connecting.has(e.id);
+  if (isConnecting) {
+    action = `<button class="btn btn-sm btn-primary is-loading" data-act="connect"><span class="btn-spinner"></span>${escapeHtml(t('connectors.action.connecting'))}</button>`;
+  } else if (isOAuthPending) {
     action = `<button class="btn btn-sm" disabled>${escapeHtml(t('connectors.action.unavailable'))}</button>`;
   } else if (connected) {
     const label = enabledFlag ? t('component.disable') : t('component.enable');
@@ -187,11 +196,7 @@ function _renderCatalogCard(entry, instance) {
   } else if (errored) {
     action = `<button class="btn btn-sm btn-danger" data-act="disconnect">${escapeHtml(t('connectors.action.disconnect'))}</button>`;
   } else {
-    // Spinner while `_runConnect` is in flight. Button stays clickable (re-click supersedes).
-    const isConnecting = _connectorsState.connecting && _connectorsState.connecting.has(e.id);
-    const label = isConnecting ? t('connectors.action.connecting') : t('connectors.action.connect');
-    const spinner = isConnecting ? '<span class="btn-spinner"></span>' : '';
-    action = `<button class="btn btn-sm btn-primary${isConnecting ? ' is-loading' : ''}" data-act="connect">${spinner}${escapeHtml(label)}</button>`;
+    action = `<button class="btn btn-sm btn-primary" data-act="connect">${escapeHtml(t('connectors.action.connect'))}</button>`;
   }
 
   let secondaryHtml = '';

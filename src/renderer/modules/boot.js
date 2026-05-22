@@ -25,6 +25,10 @@ async function bootApp() {
     startScheduledTaskEventsSubscription();
   }
   _stampSettingsVersion();
+  // delivering an iOS-initiated command to the bus — see PC/CLAUDE.md §4 relay paragraph).
+  if (typeof startRelayActivitySubscription === 'function') {
+    startRelayActivitySubscription();
+  }
   _restoreLastView();
 }
 

@@ -1280,6 +1280,28 @@ async function loadConversations() {
   }
 }
 
+// Subscribe once to the main-side relay activity push. When iOS triggers a task on this PC,
+// after `groupChat.send` returns — we either reload the full list (new cid) or just bump the
+// existing entry to the top (matches what `_handleGroupBusEvent('message')` does for PC-local
+// activity). Without this, iOS-created convs only appear in the sidebar after a PC relaunch.
+let _relayActivityWatchStarted = false;
+function startRelayActivitySubscription() {
+  if (_relayActivityWatchStarted) return;
+  if (!window.orkas || typeof window.orkas.onPushEvent !== 'function') return;
+  try {
+      if (!payload || !payload.cid) return;
+      if (payload.created) {
+        loadConversations().catch((err) => _convLog.warn('relay reload failed', err));
+      } else {
+        _bumpConvToTop(payload.cid);
+      }
+    });
+    _relayActivityWatchStarted = true;
+  } catch (err) {
+    _convLog.warn('relay activity subscribe failed', err);
+  }
+}
+
 // Move a conversation to the top of the sidebar list and re-render.
 // Called whenever a non-internal message lands on a cid so the list stays
 // ordered by last activity (matches backend listConversations sort, which

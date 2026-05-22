@@ -720,6 +720,7 @@ if (!gotLock) {
     connectorsFeature.bootstrap(users.getActiveUserId()).catch(() => {
       /* errors logged inside the feature; never block app startup */
     });
+    createWindow();
 
     // Background: pick up any out-of-band changes to source files (sync
     // drop-in, manual edits) into the search idx. Query path does not run

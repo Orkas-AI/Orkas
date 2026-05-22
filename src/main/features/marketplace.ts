@@ -61,6 +61,11 @@ import {
   addAgentInstall, addSkillInstall, removeAgentInstall, removeSkillInstall,
 } from './marketplace_installs';
 import { createLogger } from '../logger';
+import {
+  validateAgentSpec, validateSkillDir,
+  ValidationReport as QualityReport,
+} from '../quality';
+import { persistReport as persistQualityReport } from '../quality/report';
 
 const log = createLogger('marketplace');
 
@@ -322,7 +327,20 @@ export async function installMarketplaceAgent(
     }));
   }
 
-  // 2. Now materialize the agent: cache content → `<uid>/local/marketplace/agents/<id>/`.
+  // 2. Quality gate. Reject the install if `detail.agent_json` itself trips
+  //    a red flag — content already on the catalog can still be malicious
+  //    on a fresh user account, and the validator is the choke point that
+  //    catches it before write. EXTREME → abort + persist report; MEDIUM
+  //    only persists the report and lets the install proceed.
+  const preReport = validateAgentSpec({ agentJson: detail.agent_json });
+  await persistQualityReport({
+    uid: getActiveUserId(), kind: 'agent', id: agentId, report: preReport,
+  });
+  if (!preReport.ok) {
+    throw _qualityInstallError('agent', agentId, preReport);
+  }
+
+  // 3. Now materialize the agent: cache content → `<uid>/local/marketplace/agents/<id>/`.
   //    `_install.json` is a version pin read by `marketplace_reconcile.ts::_agentNeedsPull`
   //    on other devices to skip a re-pull when their local copy already matches the manifest's
   //    (version, published_at).
@@ -340,7 +358,7 @@ export async function installMarketplaceAgent(
     }, null, 2), 'utf8');
   await touchCacheEntry('agent', agentId);
 
-  // 3. Record in the cloud-synced manifest so other devices reconcile this install.
+  // 4. Record in the cloud-synced manifest so other devices reconcile this install.
   await addAgentInstall(getActiveUserId(), {
     id: agentId, version: detail.version, published_at: detail.published_at,
     agent_json_url: detail.agent_json_url, create_uid: detail.create_uid || '',
@@ -367,6 +385,20 @@ export async function installMarketplaceSkill(
   await fsp.rm(target, { recursive: true, force: true });
   await fsp.mkdir(target, { recursive: true });
   await _copyDirSkippingCacheMeta(cacheDir, target);
+
+  // Quality gate on the materialized dir (rule scope = SKILL.md +
+  // scripts/*). EXTREME violations → roll back the install dir + persist
+  // the failed report + throw. MEDIUM passes through but the report is
+  // persisted so the UI advisory chip shows.
+  const skillReport = validateSkillDir(target);
+  await persistQualityReport({
+    uid: getActiveUserId(), kind: 'skill', id: skillId, report: skillReport,
+  });
+  if (!skillReport.ok) {
+    await fsp.rm(target, { recursive: true, force: true });
+    throw _qualityInstallError('skill', skillId, skillReport);
+  }
+
   await fsp.writeFile(path.join(target, '_install.json'),
     JSON.stringify({
       version: detail.version,
@@ -395,6 +427,22 @@ function _skillAlreadyOnDisk(skillId: string): boolean {
     if (fs.existsSync(path.join(installedDir, 'SKILL.md'))) return true;
   } catch { /* getActiveUserId throws when no active uid */ }
   return false;
+}
+
+/** Build a single-line error message for a quality-rejected install. The
+ *  full report is already persisted under `<uid>/local/quality_reports/`;
+ *  the renderer reads it via the `quality.readReport` IPC to display the
+ *  detailed violation list. The throw here is just the propagation path. */
+function _qualityInstallError(
+  kind: 'agent' | 'skill', id: string, report: QualityReport,
+): Error {
+  const top = report.violations.find((v) => v.level === 'EXTREME');
+  const reason = top ? `${top.rule}: ${top.suggested_fix}` : 'validation failed';
+  const e = new Error(`Quality validation rejected ${kind} ${id} (${reason})`);
+  (e as { qualityKind?: string }).qualityKind = kind;
+  (e as { qualityId?: string }).qualityId = id;
+  (e as { qualityReport?: QualityReport }).qualityReport = report;
+  return e;
 }
 
 async function _copyDirSkippingCacheMeta(src: string, dst: string): Promise<void> {

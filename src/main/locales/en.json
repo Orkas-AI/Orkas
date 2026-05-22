@@ -44,6 +44,7 @@
   "skills.errors.builtin_conflict": "Skill name \"{name}\" conflicts with a built-in skill. Please choose another name.",
   "skills.errors.url_scheme": "URL must start with http(s)://",
   "skills.errors.create_failed": "Failed to create skill",
+  "skills.errors.validation_blocked": "Skill content failed quality validation — creation aborted",
   "skills.errors.container_empty": "Empty `<skill>` container — nothing to write",
   "skills.errors.create_missing_skill_md": "Cannot create skill: missing SKILL.md block",
   "skills.errors.create_missing_name": "Cannot create skill: SKILL.md frontmatter is missing the `name` field",
