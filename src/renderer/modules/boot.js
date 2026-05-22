@@ -15,6 +15,7 @@ async function bootApp() {
   await loadProjects();
   await loadConversations();
   await loadAgents();
+  await loadSkills();
   // Warm the commander avatar cache so the first chat render doesn't fall
   // back to the default for a frame.
   if (typeof _ensureCommanderAvatarLoaded === 'function') _ensureCommanderAvatarLoaded();

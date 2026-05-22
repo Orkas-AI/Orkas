@@ -21,6 +21,7 @@ describe('quality › validateSkillFile', () => {
       'name: pdf-summarize',
       'description_en: Summarize PDFs',
       'description_zh: PDF 摘要',
+      'category: data',
       '---',
       'Body text explaining how to use this skill.',
     ].join('\n');
@@ -47,7 +48,7 @@ describe('quality › validateSkillFile', () => {
     const content = [
       '---',
       'name: x',
-      'description_en: x', 'description_zh: x',
+      'description_en: x', 'description_zh: x', 'category: general',
       '---',
       '```bash',
       'cat ~/.ssh/config',
@@ -75,7 +76,7 @@ describe('quality › validateSkillFile', () => {
   });
 
   it('treats SKILL.md case-insensitively', () => {
-    const content = '---\nname: x\ndescription_en: x\ndescription_zh: x\n---\n';
+    const content = '---\nname: x\ndescription_en: x\ndescription_zh: x\ncategory: general\n---\n';
     const a = validateSkillFile({ relpath: 'skill.md', content });
     const b = validateSkillFile({ relpath: 'SKILL.MD', content });
     expect(a.violations).toEqual([]);
@@ -108,14 +109,14 @@ describe('quality › validateSkillDir', () => {
 
   it('passes a directory with only a valid SKILL.md', () => {
     fs.writeFileSync(path.join(dir, 'SKILL.md'),
-      '---\nname: x\ndescription_zh: x\ndescription_en: x\n---\n');
+      '---\nname: x\ndescription_zh: x\ndescription_en: x\ncategory: general\n---\n');
     const r = validateSkillDir(dir);
     expect(r.ok).toBe(true);
   });
 
   it('aggregates findings from SKILL.md + scripts/', () => {
     fs.writeFileSync(path.join(dir, 'SKILL.md'),
-      '---\nname: x\ndescription_zh: x\ndescription_en: x\n---\n');
+      '---\nname: x\ndescription_zh: x\ndescription_en: x\ncategory: general\n---\n');
     fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true });
     fs.writeFileSync(path.join(dir, 'scripts', 'x.sh'),
       'cat ~/.bash_history\n');
@@ -127,7 +128,7 @@ describe('quality › validateSkillDir', () => {
 
   it('skips _install.json and other meta files', () => {
     fs.writeFileSync(path.join(dir, 'SKILL.md'),
-      '---\nname: x\ndescription_zh: x\ndescription_en: x\n---\n');
+      '---\nname: x\ndescription_zh: x\ndescription_en: x\ncategory: general\n---\n');
     fs.writeFileSync(path.join(dir, '_install.json'),
       '{"version":"1","published_at":0,"create_uid":""}');
     const r = validateSkillDir(dir);
@@ -141,6 +142,7 @@ describe('quality › validateAgentSpec', () => {
       agentJson: {
         agent_id: 'a1', name: 'A1',
         description_zh: 'zh', description_en: 'en',
+        category: 'general',
       },
     });
     expect(r.ok).toBe(true);
@@ -157,6 +159,7 @@ describe('quality › validateAgentSpec', () => {
       agentJson: {
         agent_id: 'a', name: 'X',
         description_en: 'en', description_zh: 'zh',
+        category: 'general',
         workflow: 'reads ~/.ssh/config from the user',
       },
     });
@@ -187,6 +190,7 @@ describe('quality › validateAgentDir', () => {
     fs.writeFileSync(path.join(dir, 'agent.json'), JSON.stringify({
       agent_id: 'a', name: 'X',
       description_zh: 'zh', description_en: 'en',
+      category: 'general',
     }));
     const r = validateAgentDir(dir);
     expect(r.ok).toBe(true);
@@ -195,7 +199,7 @@ describe('quality › validateAgentDir', () => {
 
 describe('quality › report shape', () => {
   it('always includes validated_at + validator_version', () => {
-    const r = validateSkillFile({ relpath: 'SKILL.md', content: '---\nname: x\ndescription_en: x\ndescription_zh: x\n---\n' });
+    const r = validateSkillFile({ relpath: 'SKILL.md', content: '---\nname: x\ndescription_en: x\ndescription_zh: x\ncategory: general\n---\n' });
     expect(r.validated_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(r.validator_version).toMatch(/^\d+\.\d+/);
   });

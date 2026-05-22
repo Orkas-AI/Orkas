@@ -3,6 +3,11 @@ const _skillsLog = createLogger('skills');
 
 let _skillsCache = null;
 let _selectedSkill = null;    // { source, id }
+const _SKILL_SPEC_CATEGORY_CODE_RE = /^[a-z][a-z0-9_-]{0,79}$/;
+function _normalizeSkillCategoryForHiddenSave(category) {
+  const code = String(category || '').trim().toLowerCase();
+  return _SKILL_SPEC_CATEGORY_CODE_RE.test(code) ? code : 'general';
+}
 
 function _skillUiIconHtml(name, className) {
   if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
@@ -40,6 +45,7 @@ function _skillPlatformChipsHtml(s) {
 // `selectSkillFile` so the SKILL.md frontmatter re-parses and the description picks the
 // right locale via `_renderSkillSections`.
 window.addEventListener('i18n-change', () => {
+  refreshChatUseChips();
   if (_skillsCache) renderSkillsGrid(_skillsCache);
   if (_selectedSkill?.id && _selectedSkill?.source) {
     // Re-read the same file the user was viewing; null nodeEl preserves
@@ -50,6 +56,24 @@ window.addEventListener('i18n-change', () => {
 });
 let _expandedDirs = new Set(); // keys like "source:id" or "source:id/subdir"
 let _skillTreeCache = new Map(); // key: "source:id" → tree array
+
+async function refreshSkillsAfterMarketplaceReconcile() {
+  _skillTreeCache.clear();
+  await loadSkills(true);
+  if (_skillEditMode) return;
+  if (_selectedSkill?.id && _selectedSkill.source === 'builtin') {
+    const source = _selectedSkill.source;
+    const id = _selectedSkill.id;
+    const filepath = _selectedSkill.filepath || 'SKILL.md';
+    await selectSkillFile(source, id, filepath, null);
+    const toggle = document.getElementById('skills-source-toggle');
+    const treeEl = document.getElementById('skills-source-tree');
+    if (toggle?.getAttribute('aria-expanded') === 'true' && treeEl) {
+      await expandSkillTree(source, id, treeEl);
+      _markActiveSkillFileInTree(filepath);
+    }
+  }
+}
 
 async function loadSkills(forceRefresh) {
   if (_skillsCache && !forceRefresh) { renderSkillsList(_skillsCache); return; }
@@ -65,15 +89,13 @@ async function loadSkills(forceRefresh) {
   }
 }
 
-// ─── Chat-input skill chip ───────────────────────────────────────────────
+// ─── Chat-input tool chip ────────────────────────────────────────────────
 //
-// The chat composer no longer surfaces a skill-picker button (or shortcut).
-// The chip pill is still used to display a skill that was attached
-// programmatically by the "use skill" flow (▶ on a skill card → useSkill →
-// setChatSkill). Clicking × removes the chip. On send, the chip's name is
-// prepended to the message as `use skill <name>: <content>`.
+// The composer exposes one reusable "use X" chip. Skills and connectors are
+// mutually exclusive because both are textual routing hints prepended to the
+// next message; agents remain separate in the recipient chip.
 
-const _chatSkill = { 'new-chat': '', 'conversation': '' };
+const _chatUse = { 'new-chat': null, 'conversation': null };
 
 function bindSkillPicker() {
   // Chip remove (×)
@@ -81,44 +103,145 @@ function bindSkillPicker() {
     el.addEventListener('click', (e) => {
       e.stopPropagation();
       const chip = el.closest('.chat-skill-chip');
-      if (chip) setChatSkill(chip.dataset.target, '');
+      if (chip) setChatUseSelection(chip.dataset.target, null);
     });
   });
 }
 
-function setChatSkill(target, name) {
-  const prev = _chatSkill[target] || '';
-  _chatSkill[target] = name || '';
-  if (target === 'conversation' && prev !== _chatSkill[target] && currentCid) {
-    _saveDraft(currentCid);
+function _normalizeChatUseSelection(value) {
+  if (!value) return null;
+  if (typeof value === 'string') {
+    const name = value.trim();
+    return name ? { kind: 'skill', id: name, name } : null;
   }
+  if (typeof value !== 'object') return null;
+  const kind = value.kind === 'connector' ? 'connector' : (value.kind === 'skill' ? 'skill' : '');
+  if (!kind) return null;
+  const name = String(value.name || value.id || '').trim();
+  const id = String(value.id || name).trim();
+  if (!name && !id) return null;
+  return { kind, id: id || name, name: name || id };
+}
+
+function getChatUseSelection(target) {
+  const cur = _normalizeChatUseSelection(_chatUse[target]);
+  return cur ? { ...cur } : null;
+}
+
+function formatChatUseLabel(selection) {
+  const sel = _normalizeChatUseSelection(selection);
+  if (!sel) return '';
+  if (sel.kind === 'connector') return t('connectors.use_label', { connector: sel.name || sel.id });
+  return t('skills.use_label', { skill: sel.name || sel.id });
+}
+
+function _chatUseLabelParts(selection) {
+  const sel = _normalizeChatUseSelection(selection);
+  if (!sel) return null;
+  const name = sel.name || sel.id;
+  const token = sel.kind === 'connector' ? 'connector' : 'skill';
+  const key = sel.kind === 'connector' ? 'connectors.use_label' : 'skills.use_label';
+  return {
+    name,
+    label: t(key, { [token]: name }),
+    prefix: t(key, { [token]: '' }),
+  };
+}
+
+function _renderChatUseChipLabel(labelEl, selection) {
+  if (!labelEl) return;
+  labelEl.textContent = '';
+  labelEl.removeAttribute('title');
+  const parts = _chatUseLabelParts(selection);
+  if (!parts) return;
+
+  const prefixEl = document.createElement('span');
+  prefixEl.className = 'chip-label-prefix';
+  prefixEl.textContent = parts.prefix;
+
+  const nameEl = document.createElement('span');
+  nameEl.className = 'chip-label-name';
+  nameEl.textContent = parts.name;
+
+  labelEl.append(prefixEl, nameEl);
+  labelEl.title = parts.label;
+}
+
+function _renderChatUseChip(target) {
+  const next = _normalizeChatUseSelection(_chatUse[target]);
   const chipId = target === 'new-chat' ? 'new-chat-skill-chip' : 'chat-skill-chip';
   const chip = document.getElementById(chipId);
   if (!chip) return;
-  if (!name) {
+  if (!next) {
     chip.style.display = 'none';
+    chip.classList.remove('is-skill', 'is-connector');
+    delete chip.dataset.kind;
+    delete chip.dataset.itemId;
     const lbl = chip.querySelector('.chip-label');
-    if (lbl) lbl.textContent = '';
+    _renderChatUseChipLabel(lbl, null);
     return;
   }
   chip.style.display = 'inline-flex';
+  chip.classList.toggle('is-skill', next.kind === 'skill');
+  chip.classList.toggle('is-connector', next.kind === 'connector');
+  chip.dataset.kind = next.kind;
+  chip.dataset.itemId = next.id || '';
   const lbl = chip.querySelector('.chip-label');
-  if (lbl) lbl.textContent = name;
-  // Return focus to the textarea after selection
+  _renderChatUseChipLabel(lbl, next);
+}
+
+function refreshChatUseChips() {
+  _renderChatUseChip('new-chat');
+  _renderChatUseChip('conversation');
+}
+
+function setChatUseSelection(target, selection) {
+  const prev = JSON.stringify(_normalizeChatUseSelection(_chatUse[target]) || null);
+  const next = _normalizeChatUseSelection(selection);
+  _chatUse[target] = next;
+  if (target === 'conversation' && prev !== JSON.stringify(next || null) && currentCid) {
+    _saveDraft(currentCid);
+  }
+  _renderChatUseChip(target);
+  // Return focus to the textarea after selection.
   const input = target === 'new-chat'
     ? document.getElementById('new-chat-input')
     : document.getElementById('chat-input');
   input?.focus();
 }
 
+function setChatSkill(target, name) {
+  setChatUseSelection(target, name ? { kind: 'skill', id: name, name } : null);
+}
+
+function setChatConnector(target, connectorId, connectorName) {
+  const id = String(connectorId || connectorName || '').trim();
+  const name = String(connectorName || connectorId || '').trim();
+  setChatUseSelection(target, id || name ? { kind: 'connector', id: id || name, name: name || id } : null);
+}
+
 function consumeChatSkill(target) {
+  const sel = getChatUseSelection(target);
+  return sel && sel.kind === 'skill' ? (sel.name || sel.id) : '';
+}
+
+function consumeChatUseSelection(target) {
   // Currently a one-way read. Chip persists until user removes it via the ×.
-  return _chatSkill[target] || '';
+  return getChatUseSelection(target);
 }
 
 function transformWithSkill(content, skill) {
   if (!skill) return content;
   return t('skills.use_prefix', { skill, content });
+}
+
+function transformWithChatUse(content, selection) {
+  const sel = _normalizeChatUseSelection(selection);
+  if (!sel) return content;
+  if (sel.kind === 'connector') {
+    return t('connectors.use_prefix', { connector: sel.name || sel.id, content });
+  }
+  return transformWithSkill(content, sel.name || sel.id);
 }
 
 function renderSkillsList(skills) { renderSkillsGrid(skills); }
@@ -1262,15 +1385,6 @@ async function openSkillModal(editId) {
     _switchSkillTab('manual');
   }
 
-  // Marketplace category dropdown (manual tab). Edit mode pre-fills from cached category;
-  // create mode picks the first entry as default. 24h cached in main with fallback list.
-  if (typeof mountMarketplaceCategorySelect === 'function') {
-    const initial = editId
-      ? (_skillsCache?.find((s) => s.id === editId && s.source === 'custom')?.category || '')
-      : '';
-    mountMarketplaceCategorySelect('skill-category-select', initial).catch(() => {});
-  }
-
   // Wire tab buttons (idempotent — checks a flag)
   if (tabBar && !tabBar.dataset.wired) {
     tabBar.querySelectorAll('.skill-modal-tab').forEach((btn) => {
@@ -1329,7 +1443,6 @@ window.saveSkill = saveSkill;
 async function _saveSkillManual({ editId, msgEl }) {
   const name = document.getElementById('skill-name').value.trim();
   const description = document.getElementById('skill-description').value.trim();
-  const category = document.getElementById('skill-category-select')?.dataset.value || '';
   if (!name) {
     msgEl.textContent = t('skills.input_name_needed');
     msgEl.className = 'form-msg err';
@@ -1343,6 +1456,8 @@ async function _saveSkillManual({ editId, msgEl }) {
     return;
   }
   try {
+    const cached = editId ? _skillsCache?.find((s) => s.id === editId && s.source === 'custom') : null;
+    const category = _normalizeSkillCategoryForHiddenSave(cached?.category);
     const res = editId
       ? await apiFetch(`/api/skills/${editId}/update`, {
           method: 'PUT',

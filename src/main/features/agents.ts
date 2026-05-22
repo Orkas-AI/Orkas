@@ -23,11 +23,15 @@ import {
   userAgentsDir, userSkillsDir, userAgentChatDir, userSessionFile, WS_ROOT,
   agentDir, agentDefinitionFile,
   userMarketplaceAgentsDir, userMarketplaceAgentDir, userMarketplaceSkillsDir,
+  userAgentRuntimeConfigFile,
 } from '../paths';
 import { evictSession } from '../model/core-agent/session-store';
 import { getActiveUserId } from './users';
 import { createLogger } from '../logger';
 import { t, buildLanguageDirective } from '../i18n';
+import { t, buildLanguageDirective, buildBuiltinEditingConstraint } from '../i18n';
+import { isDevEnv } from './devtools';
+import { getWorkspacePath } from './user_workspace';
 
 const log = createLogger('agents');
 
@@ -35,16 +39,26 @@ const log = createLogger('agents');
 function CUSTOM_AGENTS_DIR(): string { return userAgentsDir(getActiveUserId()); }
 function CUSTOM_SKILLS_DIR(): string { return userSkillsDir(getActiveUserId()); }
 import { prompts } from '../prompts/loader';
+import { findOuterTagRanges } from '../util/markdown-prose-code';
 import {
   nowIso, genAgentId, safeId,
   readJson, writeJson,
   appendJsonlAtomic, invalidateLineCount, readJsonl,
 } from '../storage';
-import { listSkillSpecs } from '../model/core-agent/skill-registry';
+import {
+  listSkillSpecs,
+  normalizeKnownSkillRefsForDisplay,
+  resolveSkillAllowlistRefs,
+  type SkillAllowlistRef,
+} from '../model/core-agent/skill-registry';
 import { readDisabledSets, setAgentEnabled } from './component_enabled';
 import { renameAgentInMembers } from './group_chat/state';
 import { validateAgentSpec, ValidationReport as QualityReport } from '../quality';
 import { persistReport as persistQualityReport } from '../quality/report';
+import {
+  DEFAULT_MARKETPLACE_CATEGORY_CODE,
+  normalizeMarketplaceCategoryCode,
+} from './marketplace_biz';
 
 export type AgentSource = 'builtin' | 'custom';
 
@@ -130,9 +144,8 @@ export interface Agent {
    *  via the dedicated `chat_agent_setup_cli.md` prompt; the LLM
    *  doesn't author it directly. */
   runtime?: AgentRuntime;
-  /** Marketplace category code (`education` / `ecommerce` / `rnd` / `writing` / `data` /
-   *  `general`). Empty string when uncategorized; required only when publishing to the
-   *  marketplace. Maintained via the create / edit dialog dropdown, NOT by the agent-edit LLM. */
+  /** Marketplace category code. Empty string only for legacy/manual specs.
+   *  Maintained by hidden create defaults and by the agent-edit LLM's `<category>` sub-tag. */
   category: string;
   /** Connector instance ids this agent is allowed to call. Three-state intentionally **diverges**
    *  from `skill_list`: `undefined` and `[]` both mean "no connectors" (collapsed to empty), only
@@ -140,6 +153,21 @@ export interface Agent {
    *  connectors carry external side effects (sending emails, editing remote docs); a brand-new
    *  agent must opt in explicitly. Maintained by the agent edit UI, NOT by the agent-edit LLM. */
   enabled_connectors?: string[];
+  /** Output rendering preference — agent-level hint injected into the worker
+   *  system prompt at dispatch time. Three user-facing values, progressive
+   *  capability disclosure:
+   *    - `'markdown_only'`: blocks `:::dashboard` + `create_artifact`. The
+   *      create-modal default for new agents.
+   *    - `'dashboard'`: allows `:::dashboard` blocks; still blocks `create_artifact`.
+   *    - `'artifact'`: allows both `:::dashboard` and `create_artifact`.
+   *  Two legacy values kept for back-compat: `'auto'` (pre-redesign default,
+   *  empty hint = no constraint) and `'allow_artifacts'` (the old name for
+   *  `'artifact'`, treated identically by `bus.ts::buildOutputFormatHint`).
+   *  Missing field = no constraint (same as `'auto'`) — old agents authored
+   *  before the redesign keep their broad permissions until the user
+   *  explicitly picks a value. Authored by the agent edit UI dropdown, NOT
+   *  the agent-edit LLM. See `bus.ts::buildOutputFormatHint`. */
+  output_format?: OutputFormat;
   source: AgentSource;
   created_at: string;
   updated_at: string;
@@ -177,7 +205,19 @@ interface AgentRaw {
   runtime?: unknown;
   category?: unknown;
   enabled_connectors?: unknown;
+  output_format?: unknown;
 }
+
+/** Agent output rendering preference. Three user-facing values
+ *  (`'markdown_only' | 'dashboard' | 'artifact'`); the create modal defaults
+ *  to `'markdown_only'`. Two legacy values are kept in the enum for
+ *  on-disk back-compat: `'auto'` (pre-redesign default; missing-field is
+ *  still equivalent) and `'allow_artifacts'` (renamed to `'artifact'` — the
+ *  hint builder + detail dropdown treat them as the same). Missing field
+ *  on disk = no constraint (empty hint), preserving legacy agent behavior
+ *  through the redesign. See `Agent.output_format`. */
+export type OutputFormat = 'auto' | 'markdown_only' | 'dashboard' | 'artifact' | 'allow_artifacts';
+const _OUTPUT_FORMAT_VALUES = new Set<OutputFormat>(['auto', 'markdown_only', 'dashboard', 'artifact', 'allow_artifacts']);
 
 /** Per-agent execution backend. See `Agent.runtime`. */
 export type AgentRuntime =
@@ -502,6 +542,12 @@ export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSo
   }
   const rt = _normalizeRuntime(raw.runtime);
   if (rt) agent.runtime = rt;
+  // output_format: enum-coerce; missing / unknown collapses to "no field
+  // set" (downstream reads default to 'auto'). Only the three known values
+  // round-trip to disk, so a malformed JSON can't inject a fourth state.
+  if (typeof raw.output_format === 'string' && _OUTPUT_FORMAT_VALUES.has(raw.output_format as OutputFormat)) {
+    agent.output_format = raw.output_format as OutputFormat;
+  }
   return agent;
 }
 
@@ -543,11 +589,150 @@ export function isCliAgent(agent: Pick<Agent, 'runtime'> | null | undefined): bo
   return !!agent && agent.runtime?.kind === 'cli';
 }
 
+interface AgentRuntimeLocalConfig {
+  version: 1;
+  project_dirs: Record<string, { path: string; updated_at?: string }>;
+}
+
+export interface AgentCliProjectDirInfo {
+  agent_id: string;
+  is_coding: boolean;
+  /** `workspace` means no per-agent override; `custom` means the user picked a directory. */
+  mode: 'workspace' | 'custom';
+  /** Display path. For a missing custom dir this remains the selected path. */
+  path: string;
+  /** Actual cwd used by dispatch. Falls back to workspace when a custom dir vanished. */
+  effective_path: string;
+  workspace_path: string;
+  custom_path?: string;
+  exists: boolean;
+}
+
+function _emptyAgentRuntimeConfig(): AgentRuntimeLocalConfig {
+  return { version: 1, project_dirs: {} };
+}
+
+function _readAgentRuntimeConfig(uid: string): AgentRuntimeLocalConfig {
+  const file = userAgentRuntimeConfigFile(uid);
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const out = _emptyAgentRuntimeConfig();
+    const dirs = raw && typeof raw === 'object' ? (raw as any).project_dirs : null;
+    if (dirs && typeof dirs === 'object') {
+      for (const [agentId, entry] of Object.entries(dirs)) {
+        if (!safeId(agentId) || !entry || typeof entry !== 'object') continue;
+        const p = typeof (entry as any).path === 'string' ? (entry as any).path.trim() : '';
+        if (!p) continue;
+        out.project_dirs[agentId] = {
+          path: path.resolve(p),
+          ...(typeof (entry as any).updated_at === 'string' ? { updated_at: (entry as any).updated_at } : {}),
+        };
+      }
+    }
+    return out;
+  } catch {
+    return _emptyAgentRuntimeConfig();
+  }
+}
+
+function _writeAgentRuntimeConfig(uid: string, cfg: AgentRuntimeLocalConfig): void {
+  const file = userAgentRuntimeConfigFile(uid);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2), 'utf8');
+  fs.renameSync(tmp, file);
+}
+
+function _deleteAgentRuntimeConfigEntry(uid: string, agentId: string): void {
+  const cfg = _readAgentRuntimeConfig(uid);
+  if (!Object.prototype.hasOwnProperty.call(cfg.project_dirs, agentId)) return;
+  delete cfg.project_dirs[agentId];
+  _writeAgentRuntimeConfig(uid, cfg);
+}
+
+function _dirExists(dirPath: string): boolean {
+  try { return fs.statSync(dirPath).isDirectory(); }
+  catch { return false; }
+}
+
+/** Resolve the per-agent project directory shown on the detail page and
+ *  used to initialise each conversation's coding cwd. Stored overrides are
+ *  local-only because absolute paths are machine-specific. Missing config =
+ *  effective workspace for the conversation/project scope. */
+export function getCliProjectDirInfoForAgent(
+  userId: string,
+  agent: Pick<Agent, 'agent_id' | 'runtime'>,
+  projectId?: string,
+): AgentCliProjectDirInfo {
+  const workspacePath = getWorkspacePath(userId, projectId);
+  const cli = agent.runtime?.kind === 'cli' ? agent.runtime.cli : '';
+  const isCoding = cliIsCodingAgent(cli);
+  const entry = isCoding ? _readAgentRuntimeConfig(userId).project_dirs[agent.agent_id] : undefined;
+  const customPath = entry?.path ? path.resolve(entry.path) : '';
+  const customExists = !!customPath && _dirExists(customPath);
+  return {
+    agent_id: agent.agent_id,
+    is_coding: isCoding,
+    mode: customPath ? 'custom' : 'workspace',
+    path: customPath || workspacePath,
+    effective_path: customExists ? customPath : workspacePath,
+    workspace_path: workspacePath,
+    ...(customPath ? { custom_path: customPath } : {}),
+    exists: customPath ? customExists : true,
+  };
+}
+
+export async function getAgentCliProjectDirInfo(
+  userId: string,
+  agentId: string,
+  projectId?: string,
+): Promise<AgentCliProjectDirInfo | null> {
+  if (!safeId(agentId)) return null;
+  const agent = await getAgent(agentId);
+  if (!agent) return null;
+  return getCliProjectDirInfoForAgent(userId, agent, projectId);
+}
+
+/** Set or clear the detail-page project directory for an external coding
+ *  agent. `dirPath=''` clears the override and returns to workspace mode. */
+export async function setAgentCliProjectDir(
+  userId: string,
+  agentId: string,
+  dirPath: string,
+): Promise<AgentCliProjectDirInfo | null> {
+  if (!safeId(agentId)) return null;
+  const agent = await getAgent(agentId);
+  if (!agent) return null;
+  const cli = agent.runtime?.kind === 'cli' ? agent.runtime.cli : '';
+  if (!cliIsCodingAgent(cli)) {
+    const err: any = new Error('agent is not an external coding agent');
+    err.code = 'E_AGENT_NOT_CODING_CLI';
+    throw err;
+  }
+
+  const cfg = _readAgentRuntimeConfig(userId);
+  const trimmed = String(dirPath || '').trim();
+  if (!trimmed) {
+    delete cfg.project_dirs[agentId];
+  } else {
+    const resolved = path.resolve(trimmed);
+    if (!_dirExists(resolved)) {
+      const err: any = new Error(t('errors.dir_not_exists'));
+      err.code = 'E_DIR_NOT_EXISTS';
+      throw err;
+    }
+    cfg.project_dirs[agentId] = { path: resolved, updated_at: nowIso() };
+  }
+  _writeAgentRuntimeConfig(userId, cfg);
+  return getCliProjectDirInfoForAgent(userId, agent);
+}
+
 interface AgentListCache { stamp: string; data: Agent[] }
 let _agentListCache: AgentListCache | null = null;
 
-function _invalidateAgentListCache(): void {
+function _invalidateAgentListCache(opts: { markDirty?: boolean } = {}): void {
   _agentListCache = null;
+  if (opts.markDirty === false) return;
   // Notify the sync engine (lazy-require — stripped in OrkasOpen builds). Every cache-invalidate
   // is also a disk-mutation point, so co-locating the dirty signal here covers all the
   // existing call sites without sprinkling sync calls across the file. The relPath here is
@@ -566,7 +751,16 @@ function _invalidateAgentListCache(): void {
  *  which updates the AGENT dir's mtime but NOT the parent (`CUSTOM_AGENTS_DIR`). The parent's
  *  mtime stays unchanged, the cache stamp stays valid, and `listAgents` returns ghosts of the
  *  agents sync just deleted. The sync bridge calls this so the next `listAgents` re-scans. */
-export const invalidateAgentListCache = _invalidateAgentListCache;
+export function invalidateAgentListCache(): void {
+  _invalidateAgentListCache();
+}
+
+/** Drop only the in-memory list cache. Marketplace reconcile updates live under
+ *  `<uid>/local/marketplace/agents`, not cloud-synced custom agents, so it must not mark the
+ *  `agents` sync domain dirty just to make the next list call re-read disk. */
+export function clearAgentListCache(): void {
+  _invalidateAgentListCache({ markDirty: false });
+}
 
 /** Toggle the active user's enabled override for an agent. Wrapping the
  *  raw setter so the IPC handler stays one-line and the per-uid resolution
@@ -635,7 +829,10 @@ export async function listAgents(): Promise<Agent[]> {
   // effect immediately without busting the disk-spec cache. Cheap — one
   // small JSON file read per call.
   const { agents: disabledAgentIds } = readDisabledSets(getActiveUserId());
-  return specs.map((a) => ({ ...a, enabled: !disabledAgentIds.has(a.agent_id) }));
+  const displaySkillSpecs = await _skillSpecsForDisplay();
+  return specs
+    .map((a) => ({ ...a, enabled: !disabledAgentIds.has(a.agent_id) }))
+    .map((a) => _withDisplaySkillRefs(a, displaySkillSpecs));
 }
 
 /**
@@ -655,7 +852,7 @@ export async function getAgent(agentId: string | null | undefined): Promise<Agen
       if (norm) {
         const { agents: disabledAgentIds } = readDisabledSets(getActiveUserId());
         norm.enabled = !disabledAgentIds.has(norm.agent_id);
-        return norm;
+        return _withDisplaySkillRefs(norm, await _skillSpecsForDisplay());
       }
     } catch { /* ignore */ }
   }
@@ -687,9 +884,13 @@ export interface CreateAgentOptions {
   /** Picked at create time from the modal's runtime selector. Stored as
    *  authored — `normalizeAgent` validates on read. */
   runtime?: AgentRuntime;
-  /** Marketplace category code (e.g. `education`). Empty string / omitted = uncategorized;
-   *  required only at marketplace publish time. */
+  /** Marketplace category code. Empty string / omitted remains tolerated for legacy/manual specs. */
   category?: string;
+  /** Output rendering preference picked in the create-modal dropdown. Validated against
+   *  `_OUTPUT_FORMAT_VALUES` before persist — unknown values silently drop the field
+   *  (= old "missing = no constraint" semantics). The modal sends `'markdown_only'` by
+   *  default; omitted = field stays unset on disk. */
+  output_format?: OutputFormat;
 }
 
 /** Route a legacy `description` input into the matching language slot.
@@ -711,13 +912,32 @@ function resolveBilingualDescription(
   };
 }
 
+async function _skillSpecsForDisplay(): Promise<SkillAllowlistRef[]> {
+  try { return await listSkillSpecs(); }
+  catch (err) {
+    log.warn(`skill display-name map unavailable: ${(err as Error).message}`);
+    return [];
+  }
+}
+
+async function _normalizeWorkflowSkillIds(workflow: string): Promise<string> {
+  const text = String(workflow || '');
+  if (!text) return text;
+  return normalizeKnownSkillRefsForDisplay(text, await _skillSpecsForDisplay());
+}
+
+function _withDisplaySkillRefs(agent: Agent, specs: SkillAllowlistRef[]): Agent {
+  const workflow = normalizeKnownSkillRefsForDisplay(agent.workflow || '', specs);
+  return workflow === agent.workflow ? agent : { ...agent, workflow };
+}
+
 /**
  * Create a custom agent. The call shape keeps historical optional fields, but
  * the quality gate requires a usable name plus at least one description variant
  * before the spec is written.
  */
 export async function createCustomAgent(
-  { name = '', description = '', description_zh, description_en, workflow = '', icon, color, interactive, runtime, category }: CreateAgentOptions = {},
+  { name = '', description = '', description_zh, description_en, workflow = '', icon, color, interactive, runtime, category, output_format }: CreateAgentOptions = {},
 ): Promise<Agent | null> {
   assertAgentNameAllowed(name);
   await assertAgentNameUnique(String(name || '').trim());
@@ -729,22 +949,33 @@ export async function createCustomAgent(
   // mkdir <aid>/ first so writeJson on agent.json has a parent.
   fs.mkdirSync(agentDir(getActiveUserId(), agentId), { recursive: true });
   const desc = resolveBilingualDescription(description, description_zh, description_en);
+  const normalizedWorkflow = await _normalizeWorkflowSkillIds(String(workflow || ''));
   const data: AgentRaw = {
     agent_id: agentId,
     name: String(name || '').trim() || t('agent.default_name'),
     description_zh: desc.description_zh,
     description_en: desc.description_en,
-    workflow: String(workflow || ''),
+    workflow: normalizedWorkflow,
     created_at: nowIso(),
     updated_at: nowIso(),
   };
   // Only emit `category` to disk when supplied; empty string is omitted so existing agents
-  // don't get spurious "category: ''" lines through resave.
-  const cleanCategory = typeof category === 'string' ? category.trim() : '';
+  // don't get spurious "category: ''" lines through resave. Candidate membership is dynamic,
+  // so this layer only normalizes the code shape.
+  const cleanCategory = typeof category === 'string' && category.trim()
+    ? normalizeMarketplaceCategoryCode(category)
+    : '';
   if (cleanCategory) data.category = cleanCategory;
   if (avatars.isKnownIcon(icon)) data.icon = icon;
   if (avatars.isKnownColor(color)) data.color = color;
   if (typeof interactive === 'boolean') data.interactive = interactive;
+  // Persist `output_format` only when the caller supplied a value the enum recognizes. Unknown
+  // strings (e.g. a future client speaking a newer dialect at an older main) drop silently — the
+  // missing field is equivalent to "no constraint" and won't break the worker prompt, whereas a
+  // bogus stored value would survive normalizeAgent and silently turn into empty hint anyway.
+  if (typeof output_format === 'string' && _OUTPUT_FORMAT_VALUES.has(output_format as OutputFormat)) {
+    data.output_format = output_format as OutputFormat;
+  }
   // Persist runtime only when it survives validation; an in_process
   // selection is the implicit default and not written to disk so old
   // tooling diffs cleanly.
@@ -838,8 +1069,8 @@ export interface UpdateAgentFields {
    *  Authored by the create modal + edit UI, not the LLM edit prompt. */
   runtime?: AgentRuntime | null;
   /** Marketplace category code. Empty string drops the field; omitted = untouched.
-   *  Authored by the create / edit dialog dropdown OR by the agent-edit LLM via the
-   *  `<category>` sub-tag (validated against `AGENT_CATEGORY_CODES` in `_parseAgentBlock`). */
+   *  Authored by hidden create defaults or by the agent-edit LLM via the `<category>` sub-tag.
+   *  Missing model output is repaired to the default category on create. */
   category?: string;
   /** Three-way update:
    *   array (possibly empty) → replace (filtered to non-empty strings)
@@ -847,6 +1078,12 @@ export interface UpdateAgentFields {
    *   omitted → untouched
    *  Authored by the agent edit UI (connectors toggle list), NOT the agent-edit LLM. */
   enabled_connectors?: string[] | null;
+  /** Three-way update:
+   *   OutputFormat string → set (one of the three enum values)
+   *   null                 → drop (revert to default 'auto')
+   *   omitted              → untouched
+   *  Authored by the agent edit UI dropdown. */
+  output_format?: OutputFormat | null;
 }
 
 /**
@@ -920,7 +1157,8 @@ async function _applyAgentUpdates(
   for (const k of ['name', 'workflow'] as const) {
     if (Object.prototype.hasOwnProperty.call(updates || {}, k)) {
       const v = (updates as any)[k];
-      (data as any)[k] = typeof v === 'string' ? v : '';
+      const next = typeof v === 'string' ? v : '';
+      (data as any)[k] = k === 'workflow' ? await _normalizeWorkflowSkillIds(next) : next;
     }
   }
   // First migrate any persisted legacy `description` into the bilingual pair
@@ -970,13 +1208,7 @@ async function _applyAgentUpdates(
     } else if (Array.isArray(v)) {
       const raw = v.filter((x) => typeof x === 'string' && safeId(x));
       const specs = await listSkillSpecs();
-      const known = new Set(specs.map((s) => s.id));
-      const ids: string[] = [];
-      const unknown: string[] = [];
-      for (const id of raw) {
-        if (known.has(id)) ids.push(id);
-        else unknown.push(id);
-      }
+      const { ids, unknown } = resolveSkillAllowlistRefs(specs, raw);
       if (unknown.length) {
         log.warn(`agent ${agentId}: unknown skills dropped: ${unknown.join(',')}`);
       }
@@ -1003,6 +1235,16 @@ async function _applyAgentUpdates(
       (data as { enabled_connectors?: string[] }).enabled_connectors = ids;
     }
   }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'output_format')) {
+    const v = (updates as { output_format?: OutputFormat | null }).output_format;
+    if (v === null || v === 'auto') {
+      // 'auto' is the implicit default; don't write it to disk so spec
+      // diffs stay clean and unset agents don't suddenly get a field.
+      delete (data as { output_format?: unknown }).output_format;
+    } else if (typeof v === 'string' && _OUTPUT_FORMAT_VALUES.has(v)) {
+      (data as { output_format?: OutputFormat }).output_format = v;
+    }
+  }
   if (Object.prototype.hasOwnProperty.call(updates || {}, 'icon')) {
     const v = (updates as any).icon;
     if (avatars.isKnownIcon(v)) data.icon = v;
@@ -1019,13 +1261,13 @@ async function _applyAgentUpdates(
       data.interactive = v;
     }
   }
-  // category: explicit empty-string drops the field; any non-empty string is stored as-is
-  // (no allow-list validation on this layer — caller / UI dropdown is the source of truth).
+  // category: explicit empty-string drops the field; any non-empty string is normalized to a
+  // safe code shape. Candidate membership is prompt-time dynamic, not a static backend list.
   if (Object.prototype.hasOwnProperty.call(updates || {}, 'category')) {
     const v = (updates as any).category;
     const trimmed = typeof v === 'string' ? v.trim() : '';
     if (!trimmed) delete (data as any).category;
-    else (data as any).category = trimmed;
+    else (data as any).category = normalizeMarketplaceCategoryCode(trimmed);
   }
   if (Object.prototype.hasOwnProperty.call(updates || {}, 'runtime')) {
     const v = updates.runtime;
@@ -1181,6 +1423,8 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
           log.warn(`session unlink user=${uid} agent=${agentId}: ${(err as Error).message}`);
         }
       }
+      try { _deleteAgentRuntimeConfigEntry(uid, agentId); }
+      catch (err) { log.warn(`runtime config cleanup user=${uid} agent=${agentId}: ${(err as Error).message}`); }
     }
   }
 
@@ -1210,15 +1454,9 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
 // placeholder to stream-hide. Shared between agent-edit chat and main-chat
 // quick-create; see the "Create agent" section of
 // `chat_agent_setup.md` / `chat_commander.md`.
-const AGENT_CONTAINER_RE = /<agent>([\s\S]*?)<\/agent>/g;
 const AGENT_CHILD_RE = (tag: string) => new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`);
 
-/** Marketplace category codes — kept in sync with
- *  `Server/biz/marketplace/marketplace_mgr.py::DEFAULT_CATEGORIES`. Single source of truth
- *  for `<category>` validation in `<agent>` container parsing. */
-export const AGENT_CATEGORY_CODES: ReadonlySet<string> = new Set([
-  'education', 'ecommerce', 'rnd', 'writing', 'data', 'general',
-]);
+const AGENT_CATEGORY_CODE_RE = /^[a-z][a-z0-9_-]{0,79}$/;
 
 export interface ExtractedFields {
   /** Parsed from `<agent_id>` inside `<agent>`. Present → commander wants to
@@ -1243,10 +1481,8 @@ export interface ExtractedFields {
    * `false` (case-insensitive); anything else → key omitted (leave the
    * existing flag untouched). */
   interactive?: boolean;
-  /** Parsed from `<category>` inside `<agent>`. Body must be one of
-   *  `AGENT_CATEGORY_CODES`; invalid value → key omitted (existing field
-   *  preserved). New agents without a category fall through to whatever
-   *  `createCustomAgent` decides (empty string today). */
+  /** Parsed from `<category>` inside `<agent>`. Candidate membership is
+   *  prompt-time dynamic; parsing only enforces a safe code shape. */
   category?: string;
 }
 
@@ -1317,9 +1553,7 @@ function _parseAgentBlock(inner: string): ExtractedFields {
   const catM = inner.match(AGENT_CHILD_RE('category'));
   if (catM) {
     const v = catM[1].trim().toLowerCase();
-    // Validate against the known code set. Unknown values are dropped silently — the existing
-    // category field on the agent is preserved (don't let an LLM hallucinated code blank it).
-    if (AGENT_CATEGORY_CODES.has(v)) fields.category = v;
+    if (AGENT_CATEGORY_CODE_RE.test(v)) fields.category = v;
   }
   return fields;
 }
@@ -1332,15 +1566,26 @@ function _parseAgentBlock(inner: string): ExtractedFields {
 export function extractAgentFieldBlocks(
   text: string,
 ): { cleanText: string; blocks: ExtractedFields[] } {
-  if (!text || text.indexOf('<agent>') < 0) return { cleanText: text, blocks: [] };
+  if (!text || text.indexOf('<agent') < 0) return { cleanText: text, blocks: [] };
+  const ranges = findOuterTagRanges(text, 'agent');
+  if (!ranges.length) return { cleanText: text, blocks: [] };
   const blocks: ExtractedFields[] = [];
-  // Iterate every container with the global-flag regex (NOT just the
-  // first). `AGENT_CONTAINER_RE` carries `/g` so successive `.exec` calls
-  // walk forward; we use `matchAll` for a flat collection.
-  for (const m of text.matchAll(AGENT_CONTAINER_RE)) {
-    blocks.push(_parseAgentBlock(m[1]));
+  let cleaned = '';
+  let cursor = 0;
+  for (const [s, e] of ranges) {
+    cleaned += text.slice(cursor, s);
+    const block = text.slice(s, e);
+    if (block.endsWith('</agent>')) {
+      const openEnd = block.indexOf('>');
+      if (openEnd >= 0) {
+        const inner = block.slice(openEnd + 1, block.length - '</agent>'.length);
+        blocks.push(_parseAgentBlock(inner));
+      }
+    }
+    cursor = e;
   }
-  const cleaned = text.replace(AGENT_CONTAINER_RE, '').replace(/\n{3,}/g, '\n\n').trim();
+  cleaned += text.slice(cursor);
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
   return { cleanText: cleaned, blocks };
 }
 
@@ -1423,6 +1668,7 @@ export function buildAgentEditSystemPrompt(agent: {
   description_zh?: string;
   description_en?: string;
   workflow?: string;
+  category?: string;
   interactive?: boolean;
   /** When the agent is CLI-backed, switch to `chat_agent_setup_cli.md`
    *  which omits workflow/skills authoring and tells the LLM not to
@@ -1579,7 +1825,7 @@ export async function* streamSendToAgentEditChat(
         if (Object.keys(fields).length) {
           await updateCustomAgent(agentId, fields);
           Object.assign(updated, fields);
-          for (const k of ['name', 'workflow'] as const) {
+          for (const k of ['name', 'workflow', 'category'] as const) {
             if (fields[k] !== undefined) {
               synthesizedProgress.push(t('process.agent.update_field', { field: k }));
             }
@@ -1688,15 +1934,17 @@ export function isValidAgentId(id: unknown): boolean {
 export async function createAgentFromBlocks(fields: ExtractedFields): Promise<Agent | null> {
   const name = (fields.name || '').trim();
   const workflow = (fields.workflow || '').trim();
+  const category = fields.category
+    ? normalizeMarketplaceCategoryCode(fields.category)
+    : DEFAULT_MARKETPLACE_CATEGORY_CODE;
   if (!name || !workflow) return null;
   const description = (fields.description || '').trim();
   const description_zh = (fields.description_zh || '').trim();
   const description_en = (fields.description_en || '').trim();
 
   const created = await createCustomAgent({
-    name, description, description_zh, description_en, workflow,
+    name, description, description_zh, description_en, workflow, category,
     ...(typeof fields.interactive === 'boolean' ? { interactive: fields.interactive } : {}),
-    ...(typeof fields.category === 'string' ? { category: fields.category } : {}),
   });
   if (!created) return null;
   // Fold optional skill_list + inputs in via updateCustomAgent so the

@@ -263,6 +263,9 @@ export const userAuthProfilesFile = (uid: string) => path.join(userLocalConfigDi
 export const userWebSearchCache   = (uid: string) => path.join(userLocalConfigDir(uid), 'web-search-cache.json');
 export const userReflectionStateFile = (uid: string) => path.join(userLocalConfigDir(uid), 'reflection-state.json');
 export const userDevtoolsFile     = (uid: string) => path.join(userLocalConfigDir(uid), 'devtools.json');
+// Machine-local defaults for external coding agents. Values are absolute
+// project directories, so they must not sync across devices.
+export const userAgentRuntimeConfigFile = (uid: string) => path.join(userLocalConfigDir(uid), 'agent-runtime.json');
 
 // Local search index (derived data, self-healing via reconcile, never synced).
 // Only the main conversation + knowledge base get a persistent inverted
@@ -374,7 +377,7 @@ export const localAgentRunDir = (uid: string, runId: string) =>
 
 // CLI agent session bindings (features/local_agents/sessions.ts) —
 // per-conversation map `{aid → {cli, sessionId}}` so the next dispatch
-// can `--resume` instead of re-replaying the whole visibility slice.
+// can `--resume` through the CLI's own conversation memory.
 // Lives under `local/` (NOT cloud-synced) because the session id
 // references claude's machine-local session files (`~/.claude/...`)
 // which aren't valid on a different device.
@@ -387,6 +390,22 @@ export const localCliSessionsFile = (uid: string, cid: string) =>
 // absolute path of the folder the user picked + a recents list. Absolute
 // paths are machine-specific, so this is never synced.
 export const userWorkspaceConfigFile = (uid: string) => path.join(userLocalRoot(uid), 'workspace.json');
+
+// ── Expert signals (machine-private, append-only) ───────────────────────
+// Per-day jsonl of T0/T1 user behavior signals emitted by bus.ts turn-end
+// hook + IPC handlers (retry/skip/form/silence). Local-only: signals are
+// extractor-version dependent and shouldn't cross devices; they're inputs
+// to reflection / patch suggester / critic (phase 1+). See plan
+// `docs/plans/expert-signals-phase-0.md`. Daily rotation keeps query
+// scoped to a date range; no archive sweep yet (50-200 KB/day × 365 ≈
+// 18-73 MB/year is acceptable for append-only jsonl).
+export const userSignalsDir = (uid: string) => path.join(userLocalRoot(uid), 'signals');
+/** Returns `<signalsDir>/<yyyy-mm-dd>.jsonl`. `date` defaults to today (local). */
+export const signalsDailyFile = (uid: string, date?: Date) => {
+  const d = date || new Date();
+  const ymd = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return path.join(userSignalsDir(uid), `${ymd}.jsonl`);
+};
 
 // ── Quality validator reports (machine-private) ──────────────────────────
 // Per-spec ValidationReport produced by `src/main/quality/`. Local-only:
@@ -496,6 +515,7 @@ export function ensureUserLayout(uid: string): void {
     userKbDir(uid),
     userQualitySkillsDir(uid),
     userQualityAgentsDir(uid),
+    userSignalsDir(uid),
   ];
   for (const d of dirs) fs.mkdirSync(d, { recursive: true });
 

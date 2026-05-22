@@ -11,6 +11,7 @@ describe('quality › schema › validateSkillFrontmatter', () => {
       name: 'pdf-summarize',
       description_zh: 'PDF 摘要工具',
       description_en: 'Summarize PDF documents',
+      category: 'data',
     });
     expect(v).toEqual([]);
   });
@@ -57,6 +58,7 @@ describe('quality › schema › validateSkillFrontmatter', () => {
       name: 'foo',
       description_en: long,
       description_zh: 'short',
+      category: 'general',
     });
     const long_v = v.find((x) => x.rule === 'frontmatter_description_too_long');
     expect(long_v?.level).toBe('MEDIUM');
@@ -66,9 +68,23 @@ describe('quality › schema › validateSkillFrontmatter', () => {
   it('a valid name with single-space groups passes', () => {
     const v = validateSkillFrontmatter({
       name: 'Foo Bar Baz',
-      description_zh: 'x', description_en: 'x',
+      description_zh: 'x', description_en: 'x', category: 'general',
     });
     expect(v.map((x) => x.rule)).not.toContain('frontmatter_name_invalid');
+  });
+
+  it('flags missing or invalid category', () => {
+    const missing = validateSkillFrontmatter({
+      name: 'foo', description_zh: 'x', description_en: 'x',
+    });
+    const missingCat = missing.find((x) => x.rule === 'frontmatter_category_missing');
+    expect(missingCat?.level).toBe('MEDIUM');
+
+    const invalid = validateSkillFrontmatter({
+      name: 'foo', description_zh: 'x', description_en: 'x', category: 'bad category',
+    });
+    const invalidCat = invalid.find((x) => x.rule === 'frontmatter_category_invalid');
+    expect(invalidCat?.level).toBe('MEDIUM');
   });
 });
 
@@ -78,6 +94,7 @@ describe('quality › schema › validateAgentJsonShape', () => {
       agent_id: 'abc123',
       name: 'My Agent',
       description_zh: 'zh', description_en: 'en',
+      category: 'general',
     });
     expect(v).toEqual([]);
   });
@@ -108,10 +125,24 @@ describe('quality › schema › validateAgentJsonShape', () => {
   it('flags overlong description as MEDIUM', () => {
     const v = validateAgentJsonShape({
       agent_id: 'abc', name: 'X',
-      description_en: 'y'.repeat(900), description_zh: 'short',
+      description_en: 'y'.repeat(900), description_zh: 'short', category: 'general',
     });
     const long = v.find((x) => x.rule === 'agent_description_too_long');
     expect(long?.level).toBe('MEDIUM');
+  });
+
+  it('flags missing or invalid category', () => {
+    const missing = validateAgentJsonShape({
+      agent_id: 'abc', name: 'X', description_zh: 'zh', description_en: 'en',
+    });
+    const missingCat = missing.find((x) => x.rule === 'agent_category_missing');
+    expect(missingCat?.level).toBe('MEDIUM');
+
+    const invalid = validateAgentJsonShape({
+      agent_id: 'abc', name: 'X', description_zh: 'zh', description_en: 'en', category: 'bad category',
+    });
+    const invalidCat = invalid.find((x) => x.rule === 'agent_category_invalid');
+    expect(invalidCat?.level).toBe('MEDIUM');
   });
 });
 

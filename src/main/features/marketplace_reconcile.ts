@@ -20,6 +20,8 @@ import * as path from 'node:path';
 import {
   userMarketplaceAgentDir, userMarketplaceSkillDir,
 } from '../paths';
+import { clearAgentListCache } from './agents';
+import { clearSkillListCache } from './skills';
 import {
   readInstalls, addAgentInstall, addSkillInstall,
   type AgentInstall, type SkillInstall,
@@ -71,7 +73,7 @@ function _setStatus(next: ReconcileStatus): void {
 }
 
 /** Pre-reconcile step: sync the local cloud manifest against the server catalog. For every
- *  installed item, look up the server's current (version, published_at). When the server has
+ *  installed item, look up the server's current (version, updated_at/published_at). When the server has
  *  newer values, write them back into the manifest — the subsequent `reconcileInstalls` pass
  *  then detects the mismatch against per-machine `_install.json` and re-pulls the blob.
  *
@@ -105,14 +107,14 @@ export async function checkServerUpdatesForInstalls(uid: string): Promise<{ upda
   for (const a of manifest.agents) {
     const server = agentMap.get(a.id);
     if (!server) continue;
-    if (server.version !== a.version || server.published_at !== a.published_at) {
-      log.info(`server-update agent ${a.id}: v${a.version} → v${server.version} (published_at ${a.published_at} → ${server.published_at})`);
-      // Replace the row in the manifest; reconcile will detect the version/published_at
+    if (server.version !== a.version || _freshnessAt(server) !== _freshnessAt(a)) {
+      log.info(`server-update agent ${a.id}: v${a.version} → v${server.version} (freshness ${_freshnessAt(a)} → ${_freshnessAt(server)})`);
+      // Replace the row in the manifest; reconcile will detect the version/freshness
       // mismatch against `_install.json` and re-pull. agent_json_url is reused (server
       // overwrites the same COS key on republish — see Server `api/marketplace.py::upload_agent`).
       await addAgentInstall(uid, {
         id: a.id, version: server.version, published_at: server.published_at,
-        agent_json_url: a.agent_json_url, create_uid: a.create_uid,
+        updated_at: server.updated_at, agent_json_url: a.agent_json_url, create_uid: a.create_uid,
       });
       updated_agents++;
     }
@@ -120,11 +122,11 @@ export async function checkServerUpdatesForInstalls(uid: string): Promise<{ upda
   for (const s of manifest.skills) {
     const server = skillMap.get(s.id);
     if (!server) continue;
-    if (server.version !== s.version || server.published_at !== s.published_at) {
-      log.info(`server-update skill ${s.id}: v${s.version} → v${server.version} (published_at ${s.published_at} → ${server.published_at})`);
+    if (server.version !== s.version || _freshnessAt(server) !== _freshnessAt(s)) {
+      log.info(`server-update skill ${s.id}: v${s.version} → v${server.version} (freshness ${_freshnessAt(s)} → ${_freshnessAt(server)})`);
       await addSkillInstall(uid, {
         id: s.id, version: server.version, published_at: server.published_at,
-        bundle_url: s.bundle_url, create_uid: s.create_uid,
+        updated_at: server.updated_at, bundle_url: s.bundle_url, create_uid: s.create_uid,
       });
       updated_skills++;
     }
@@ -135,7 +137,7 @@ export async function checkServerUpdatesForInstalls(uid: string): Promise<{ upda
   return { updated_agents, updated_skills };
 }
 
-interface _CatalogRow { version: string; published_at: number }
+interface _CatalogRow { version: string; published_at: number; updated_at?: number }
 
 /** Paginate the public `/marketplace/{kind}/list` endpoint and collapse to (id → version + ts).
  *  Page-size 100 × 20 pages = 2000 row cap (well above current catalog scale). */
@@ -143,13 +145,17 @@ async function _fetchServerCatalogMap(kind: 'agents' | 'skills'): Promise<Map<st
   const out = new Map<string, _CatalogRow>();
   const PAGE_SIZE = 100;
   for (let page = 1; page <= 20; page++) {
-    const r = await postJson<{ list: Array<{ id?: string; version?: string; published_at?: number }>; total?: number }>(
+    const r = await postJson<{ list: Array<{ id?: string; version?: string; published_at?: number; updated_at?: number }>; total?: number }>(
       `/marketplace/${kind}/list`, { page, size: PAGE_SIZE },
     );
     const list = r.list || [];
     for (const row of list) {
       if (typeof row.id === 'string' && typeof row.version === 'string' && typeof row.published_at === 'number') {
-        out.set(row.id, { version: row.version, published_at: row.published_at });
+        out.set(row.id, {
+          version: row.version,
+          published_at: row.published_at,
+          ...(typeof row.updated_at === 'number' ? { updated_at: row.updated_at } : {}),
+        });
       }
     }
     if (list.length < PAGE_SIZE) break;
@@ -205,7 +211,11 @@ export async function reconcileInstalls(uid: string): Promise<{ pulled_agents: n
   await Promise.all([...agentTasks, ...skillTasks]);
 
   if (pulled_skills > 0) {
+    try { clearSkillListCache(); } catch { /* list cache may not be loaded yet */ }
     try { invalidateCoreAgentSkills(); } catch { /* runner may not be loaded yet */ }
+  }
+  if (pulled_agents > 0) {
+    try { clearAgentListCache(); } catch { /* list cache may not be loaded yet */ }
   }
   _setStatus({
     state: 'done', total, pulled: pulled_agents + pulled_skills,
@@ -216,14 +226,14 @@ export async function reconcileInstalls(uid: string): Promise<{ pulled_agents: n
 }
 
 /** Need-pull check: missing dir / missing agent.json / `_install.json::version` mismatch.
- *  Mirrors the cache freshness rule from marketplace_cache.ts (version + published_at). */
+ *  Mirrors the cache freshness rule from marketplace_cache.ts (version + updated_at fallback). */
 function _agentNeedsPull(uid: string, row: AgentInstall): boolean {
   const dir = userMarketplaceAgentDir(uid, row.id);
   const agentJsonFile = path.join(dir, 'agent.json');
   if (!fs.existsSync(agentJsonFile)) return true;
   const meta = _readInstallMeta(dir);
   if (!meta) return true;
-  return meta.version !== row.version || meta.published_at !== row.published_at;
+  return meta.version !== row.version || _freshnessAt(meta) !== _freshnessAt(row);
 }
 
 function _skillNeedsPull(uid: string, row: SkillInstall): boolean {
@@ -231,10 +241,14 @@ function _skillNeedsPull(uid: string, row: SkillInstall): boolean {
   if (!fs.existsSync(path.join(dir, 'SKILL.md'))) return true;
   const meta = _readInstallMeta(dir);
   if (!meta) return true;
-  return meta.version !== row.version || meta.published_at !== row.published_at;
+  return meta.version !== row.version || _freshnessAt(meta) !== _freshnessAt(row);
 }
 
-interface InstallMeta { version: string; published_at: number; create_uid?: string }
+interface InstallMeta { version: string; published_at: number; updated_at?: number; create_uid?: string }
+
+function _freshnessAt(row: { published_at: number; updated_at?: number }): number {
+  return typeof row.updated_at === 'number' ? row.updated_at : row.published_at;
+}
 
 function _readInstallMeta(dir: string): InstallMeta | null {
   const f = path.join(dir, '_install.json');
@@ -245,6 +259,7 @@ function _readInstallMeta(dir: string): InstallMeta | null {
     return {
       version: j.version,
       published_at: j.published_at,
+      ...(typeof j.updated_at === 'number' ? { updated_at: j.updated_at } : {}),
       create_uid: typeof j.create_uid === 'string' ? j.create_uid : '',
     };
   } catch { return null; }
@@ -270,6 +285,7 @@ async function _pullAgent(uid: string, row: AgentInstall): Promise<void> {
   await fsp.writeFile(path.join(dir, 'agent.json'), text, 'utf8');
   await _writeInstallMeta(dir, {
     version: row.version, published_at: row.published_at,
+    ...(typeof row.updated_at === 'number' ? { updated_at: row.updated_at } : {}),
     create_uid: row.create_uid || '',
   });
 }
@@ -292,6 +308,7 @@ async function _pullSkill(uid: string, row: SkillInstall): Promise<void> {
   if (!fs.existsSync(path.join(dir, 'SKILL.md'))) throw new Error('bundle missing SKILL.md');
   await _writeInstallMeta(dir, {
     version: row.version, published_at: row.published_at,
+    ...(typeof row.updated_at === 'number' ? { updated_at: row.updated_at } : {}),
     create_uid: row.create_uid || '',
   });
 }

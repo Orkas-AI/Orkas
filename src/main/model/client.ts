@@ -124,6 +124,16 @@ export interface ChatOptions {
    *  and attaches a `artifacts[]` list to the assistant message so the
    *  renderer embeds each interactive web-app artifact in the bubble. */
   onArtifactCreated?: (a: { id: string; title: string }) => void;
+  /** Fired at turn start with each skill id that entered the system-prompt
+   *  index, split by source system (`A.custom` / `A.platform` / `B`).
+   *  `features/group_chat` buffers per turn and emits `skill_advertised`
+   *  signals at turn-end (grouped by system). See expert-signals plan
+   *  §4.1 + PC/CLAUDE.md §4 constraint 9. */
+  onSkillAdvertised?: (skill_id: string, system: 'A.custom' | 'A.platform' | 'B') => void;
+  /** Fired when the agent's `read_file` resolves to a SKILL.md path inside
+   *  any of the three skill roots. Bus buffers per turn and emits one
+   *  `skill_invoked` signal per (system, skill_id) pair at turn-end. */
+  onSkillInvoked?: (skill_id: string, system: 'A.custom' | 'A.platform' | 'B', trigger: 'read_file') => void;
   /** Prompt-cache TTL policy. Undefined lets pi-ai pick its default
    * (`"short"` = Anthropic 5m / OpenAI in-memory). `"long"` opts into
    * extended retention (Anthropic 1h with 2x write premium / OpenAI 24h).

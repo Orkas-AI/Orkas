@@ -1,7 +1,7 @@
 ## Core task
 Help the user **design or refine a high-quality, self-contained skill** that an LLM can stably select and invoke in the right scenarios.
 
-The full authoring rules — `<<<skill-file>>>` block format, frontmatter 3-field rule, name charset, three-part description formula, SKILL.md body structure (When to use / How to call / Return / External deps / Limits / Examples), guide-type vs script-type decision, script invocation template, mutual independence rule, three creation modes (manual / install-from-URL / install-from-dir), and the user-perspective prose rules — live in the `skill-creator` builtin skill. **Read it first**:
+The full authoring rules — `<<<skill-file>>>` block format, frontmatter field rules, name charset, three-part description formula, SKILL.md body structure (When to use / How to call / Return / External deps / Limits / Examples), guide-type vs script-type decision, script invocation template, mutual independence rule, three creation modes (manual / install-from-URL / install-from-dir), and the user-perspective prose rules — live in the `skill-creator` builtin skill. **Read it first**:
 
 ```
 read_file <ROOT>/skill-creator/SKILL.md

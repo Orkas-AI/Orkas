@@ -2,7 +2,7 @@
  * Marketplace install manifest — `<uid>/cloud/marketplace/installs.json`.
  *
  * The ONLY marketplace state that crosses devices. Records what the user has installed (id +
- * version + published_at + COS URL); the actual content lives at `<uid>/local/marketplace/`
+ * version + freshness timestamp + COS URL); the actual content lives at `<uid>/local/marketplace/`
  * on each machine and is reconciled on startup by `features/marketplace_reconcile.ts`
  * (fetches whatever's listed in the manifest but missing locally).
  *
@@ -12,11 +12,13 @@
  *     "version": 1,
  *     "agents": [
  *       { "id": "abc123def456", "version": "1.0.0", "published_at": 1747066800000,
+ *         "updated_at": 1747067800000,
  *         "agent_json_url": "https://orkas-1367889399.cos.../agent.json",
  *         "installed_at": 1747066800100 }
  *     ],
  *     "skills": [
  *       { "id": "xyz789...", "version": "1.0.0", "published_at": 1747066800000,
+ *         "updated_at": 1747067800000,
  *         "bundle_url": "https://orkas-1367889399.cos.../xyz789.zip",
  *         "installed_at": 1747066800100 }
  *     ]
@@ -66,6 +68,10 @@ export interface AgentInstall {
   id: string;
   version: string;
   published_at: number;
+  /** Server row update timestamp. Preferred freshness key because republish updates this
+   *  while `published_at` remains the original first-publish time. Optional so old manifest
+   *  rows still parse and fall back to `published_at`. */
+  updated_at?: number;
   agent_json_url: string;
   installed_at: number;
   /** Author uid as recorded on the server. `"0"` is the official-platform marker (label
@@ -80,6 +86,8 @@ export interface SkillInstall {
   id: string;
   version: string;
   published_at: number;
+  /** Same freshness semantics as `AgentInstall.updated_at`. */
+  updated_at?: number;
   bundle_url: string;
   installed_at: number;
   /** Same as `AgentInstall.create_uid` — see comment there. */

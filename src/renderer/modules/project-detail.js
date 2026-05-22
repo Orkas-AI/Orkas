@@ -13,7 +13,7 @@
 const _projectDetailLog = createLogger('project-detail');
 
 let _projectDetailPid = '';     // pid currently rendered in the panel
-let _projectDetailMeta = null;  // { project, bindings, agentDetails, skillDetails }
+let _projectDetailMeta = null;  // { project, agentDetails, skillDetails }
 
 // ── Public: navigate-into ──────────────────────────────────────────────
 
@@ -34,7 +34,6 @@ async function loadProjectDetail(pid) {
     }
     _projectDetailMeta = {
       project: getRes.project,
-      bindings: listRes.bindings || { agents: [], skills: [] },
       agentDetails: Array.isArray(listRes.agentDetails) ? listRes.agentDetails : [],
       skillDetails: Array.isArray(listRes.skillDetails) ? listRes.skillDetails : [],
     };
@@ -55,29 +54,23 @@ function _renderProjectDetailEmpty() {
 
 function _renderProjectDetail() {
   if (!_projectDetailMeta) { _renderProjectDetailEmpty(); return; }
-  const { project, bindings, agentDetails, skillDetails } = _projectDetailMeta;
+  const { project, agentDetails, skillDetails } = _projectDetailMeta;
 
   const titleEl = document.getElementById('project-detail-title');
   if (titleEl) titleEl.textContent = project?.name || '';
 
-  // Stale ids (binding referent missing — agent / skill was deleted).
-  const agentValidIds = new Set(agentDetails.map((a) => a.agent_id));
-  const skillValidIds = new Set(skillDetails.map((s) => s.id));
-  const staleAgents = (bindings.agents || []).filter((id) => !agentValidIds.has(id));
-  const staleSkills = (bindings.skills || []).filter((id) => !skillValidIds.has(id));
-
   document.getElementById('project-agents-list').innerHTML = _renderBindingsRows(
-    'agent', agentDetails, staleAgents,
+    'agent', agentDetails,
   );
   document.getElementById('project-skills-list').innerHTML = _renderBindingsRows(
-    'skill', skillDetails, staleSkills,
+    'skill', skillDetails,
   );
 
   applyDomI18n();
   _bindRemoveButtons();
 }
 
-function _renderBindingsRows(kind, items, staleIds) {
+function _renderBindingsRows(kind, items) {
   const lang = _activeLang();
   const removeLabel = escapeHtml(t('project.bindings.remove'));
   const sorted = (items || []).slice().sort(_byDisplayName);
@@ -98,19 +91,6 @@ function _renderBindingsRows(kind, items, staleIds) {
           ${descHtml}
         </div>
         <button type="button" class="btn btn-sm btn-danger" data-action="remove">${removeLabel}</button>
-      </div>
-    `);
-  }
-  for (const id of staleIds) {
-    rows.push(`
-      <div class="project-binding-row project-binding-row--stale" data-kind="${kind}" data-id="${escapeHtml(id)}">
-        <div class="project-binding-main">
-          <div class="project-binding-head">
-            <span class="project-binding-name">${escapeHtml(id)}</span>
-            <span class="project-binding-source project-binding-source--stale" data-i18n="project.bindings.stale">Removed</span>
-          </div>
-        </div>
-        <button type="button" class="btn btn-sm" data-action="remove">${removeLabel}</button>
       </div>
     `);
   }

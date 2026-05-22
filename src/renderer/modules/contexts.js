@@ -7,7 +7,8 @@ const _contextsLog = createLogger('contexts');
 
 let _ctxTree = [];                  // tree of {name, path, type:'dir'|'file', children?, bytes?, mtime?}
 let _ctxExpanded = new Set();       // dir paths that are open
-let _ctxActive = null;              // {id, content} — currently opened file in right-pane
+let _ctxActive = null;              // {id} — currently opened file in right-pane
+let _ctxMveController = null;       // active mountMdViewEdit controller for the right-pane md viewer
 let _ctxPendingRename = null;       // {path} — flagged for inline-rename on the
                                     // next renderCtxTree() (set by the "new
                                     // text file" action after creating an
@@ -950,7 +951,12 @@ async function revealCtxFile(rel) {
 }
 
 function _prepCtxViewerShell(rel) {
-  _ctxActive = { id: rel, content: '' };
+  _ctxActive = { id: rel };
+  // Tear down the previous md mount before switching files — otherwise the
+  // outgoing controller's textarea-input listeners would still react to the
+  // about-to-be-replaced DOM and the drafts map could record updates against
+  // the wrong rel.
+  if (_ctxMveController) { try { _ctxMveController.destroy(); } catch (_) {} _ctxMveController = null; }
   const empty = document.getElementById('contexts-editor-empty');
   const wrap = document.getElementById('contexts-viewer-wrap');
   const pathEl = document.getElementById('contexts-editor-path');
@@ -969,19 +975,48 @@ function _prepCtxViewerShell(rel) {
   };
 }
 
+// Per-file in-progress edit state, keyed by relpath. Survives switching to
+// another KB file or to another sidebar tab — coming back to the file
+// restores edit mode + the unsaved draft instead of dropping to read mode.
+// Lifetime = renderer session (cleared on Save / Cancel / Delete; re-keyed
+// on Rename). Not persisted across app restarts. Fed via the
+// `onDraftChange` callback below.
+const _ctxDrafts = new Map();
+
+function _ctxClearDraft(path) {
+  const key = path || (_ctxActive && _ctxActive.id);
+  if (key) _ctxDrafts.delete(key);
+}
+
 function _showCtxTextViewer(rel, content) {
   const els = _prepCtxViewerShell(rel);
   if (!els) return;
-  _ctxActive.content = content;
-  if (_ctxDrafts.has(rel)) {
-    // There's an in-progress edit for this file from earlier in the
-    // session — restore it (textarea or preview, whichever the user was
-    // in) instead of dropping to read mode and clobbering the draft.
-    _enterCtxEdit();
-  } else {
-    _renderCtxViewerMd(els.bodyEl, els.actionsEl);
-  }
+  _ctxMveController = mountMdViewEdit({
+    bodyEl: els.bodyEl,
+    actionsEl: els.actionsEl,
+    source: { kind: 'context', rel },
+    // Skip the read round-trip — caller already has the bytes.
+    initialContent: content,
+    // Restore in-progress edits if the user was previously typing in this
+    // file. mountMdViewEdit forces edit mode when `initialDraft` is present.
+    initialDraft: _ctxDrafts.get(rel) || null,
+    callbacks: {
+      // Mirror draft state into the per-file Map so it survives switching
+      // to another file in the tree and back.
+      onDraftChange: (draft) => {
+        if (draft === null) _ctxDrafts.delete(rel);
+        else _ctxDrafts.set(rel, draft);
+      },
+      onReveal: () => revealCtxFile(rel),
+      onDelete: () => _deleteCtxFromViewer(),
+      onSaved:  async () => { await loadContexts(); },
+    },
+  });
   els.bodyEl.scrollTop = 0;
+}
+
+function _enterCtxEdit() {
+  if (_ctxMveController) _ctxMveController.setMode('edit');
 }
 
 function _showCtxImageViewer(rel, base64, mediaType, bytes) {
@@ -1029,542 +1064,6 @@ function _showCtxBinaryViewer(rel, kind) {
   els.actionsEl.querySelector('#ctx-viewer-del').addEventListener('click', _deleteCtxFromViewer);
 }
 
-function _renderCtxViewerMd(bodyEl, actionsEl) {
-  if (!_ctxActive) return;
-  bodyEl = bodyEl || document.getElementById('contexts-viewer-body');
-  actionsEl = actionsEl || document.getElementById('contexts-viewer-actions');
-  const content = _ctxActive.content || '';
-  bodyEl.innerHTML = `<div class="ctx-viewer-md markdown-body">${renderMarkdown(content)}</div>`;
-  // After md render, walk the emitted `.task-item` checkboxes (renderMarkdown
-  // emits them `disabled`) and wire them up to write back to the file. Order
-  // of `.task-item` lis in DOM matches the order of `^(\s*)- \[( |x|X)\] `
-  // lines in source by construction (renderMarkdown does not reorder).
-  _ctxBindTaskCheckboxes(bodyEl);
-  actionsEl.innerHTML = `
-    <button class="btn btn-sm" id="ctx-viewer-edit">${escapeHtml(t('contexts.viewer.edit'))}</button>
-    <button class="btn btn-sm" id="ctx-viewer-reveal">${escapeHtml(t('contexts.viewer.open_system'))}</button>
-    <button class="btn btn-sm btn-danger" id="ctx-viewer-del">${escapeHtml(t('contexts.viewer.delete'))}</button>
-  `;
-  actionsEl.querySelector('#ctx-viewer-edit').addEventListener('click', _enterCtxEdit);
-  actionsEl.querySelector('#ctx-viewer-reveal').addEventListener('click', () => revealCtxFile(_ctxActive.id));
-  actionsEl.querySelector('#ctx-viewer-del').addEventListener('click', _deleteCtxFromViewer);
-}
-
-// Regex shared by checkbox-binding (preview side) and the editor's Todo
-// toolbar button. Captures: 1=indent, 2=mark ( /x/X), 3=rest of line.
-const _CTX_TODO_LINE_RE = /^(\s*)- \[( |x|X)\] (.*)$/;
-
-// Scan source content for task-list lines. Returns `[{ lineIdx, checked }, ...]`
-// in source order. The Nth entry corresponds to the Nth `.task-item` in the
-// rendered DOM (renderMarkdown preserves source order for list items).
-function _ctxScanTaskLines(content) {
-  const lines = content.split('\n');
-  const out = [];
-  for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(_CTX_TODO_LINE_RE);
-    if (m) out.push({ lineIdx: i, checked: m[2].toLowerCase() === 'x' });
-  }
-  return out;
-}
-
-function _ctxBindTaskCheckboxes(rootEl) {
-  if (!rootEl || !_ctxActive) return;
-  const tasks = _ctxScanTaskLines(_ctxActive.content || '');
-  const boxes = rootEl.querySelectorAll('.task-item input[type="checkbox"]');
-  // Defensive: if the two counts diverge (e.g., user has malformed markdown
-  // that renderMarkdown rescued differently), bail out rather than mis-wire.
-  if (boxes.length !== tasks.length) return;
-  boxes.forEach((box, i) => {
-    box.removeAttribute('disabled');
-    const li = box.closest('li.task-item');
-    if (tasks[i].checked && li) li.classList.add('is-done');
-    box.addEventListener('change', () => _ctxToggleTask(tasks[i].lineIdx, li, box));
-  });
-}
-
-async function _ctxToggleTask(lineIdx, liEl, boxEl) {
-  if (!_ctxActive) return;
-  const lines = (_ctxActive.content || '').split('\n');
-  const m = (lines[lineIdx] || '').match(_CTX_TODO_LINE_RE);
-  if (!m) return;
-  const wasChecked = m[2].toLowerCase() === 'x';
-  const nextMark = wasChecked ? ' ' : 'x';
-  lines[lineIdx] = `${m[1]}- [${nextMark}] ${m[3]}`;
-  const next = lines.join('\n');
-  // Optimistic UI — flip the `is-done` style + the box state immediately;
-  // revert if the save round-trip fails.
-  if (liEl) liEl.classList.toggle('is-done', !wasChecked);
-  if (boxEl) boxEl.checked = !wasChecked;
-  try {
-    const res = await apiFetch('/api/contexts/update', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: _ctxActive.id, content: next }),
-    });
-    const data = await res.json();
-    if (!data.ok) throw new Error(data.error || 'save_failed');
-    _ctxActive.content = next;
-  } catch (e) {
-    if (liEl) liEl.classList.toggle('is-done', wasChecked);
-    if (boxEl) boxEl.checked = wasChecked;
-    await uiAlert(t('contexts.todo.save_failed', { reason: e.message || e }));
-  }
-}
-
-// Editor mode = textarea + markdown toolbar; preview mode = renderMarkdown of
-// the current draft. The draft is only persisted to disk on Save — the
-// in-memory _ctxActive.content stays at the last-saved value, so Cancel can
-// revert without re-fetch.
-let _ctxEditPreview = false;
-let _ctxEditDraft = '';
-// Per-file in-progress edit state, keyed by relpath. Survives switching to
-// another KB file or to another sidebar tab — coming back to the file
-// restores edit mode + the unsaved draft instead of dropping to read mode.
-// Lifetime = renderer session (cleared on Save / Cancel / Delete; re-keyed
-// on Rename). Not persisted across app restarts.
-const _ctxDrafts = new Map();
-
-function _ctxStashDraft() {
-  if (!_ctxActive) return;
-  _ctxDrafts.set(_ctxActive.id, { content: _ctxEditDraft, isPreview: _ctxEditPreview });
-}
-
-function _ctxClearDraft(path) {
-  const key = path || (_ctxActive && _ctxActive.id);
-  if (key) _ctxDrafts.delete(key);
-}
-
-// Toolbar definition. `kind` keys map to `_ctxApplyMd()` cases; SVG icons
-// come from icons.js; `label` is the i18n key for the title tooltip.
-const _CTX_EDITOR_TOOLBAR = [
-  { kind: 'h1', icon: 'H1', label: 'contexts.editor.tb.h1' },
-  { kind: 'h2', icon: 'H2', label: 'contexts.editor.tb.h2' },
-  { kind: 'h3', icon: 'H3', label: 'contexts.editor.tb.h3' },
-  { kind: 'sep' },
-  { kind: 'bold', icon: 'B', label: 'contexts.editor.tb.bold', cls: 'is-bold' },
-  { kind: 'italic', icon: 'I', label: 'contexts.editor.tb.italic', cls: 'is-italic' },
-  { kind: 'strike', icon: 'S', label: 'contexts.editor.tb.strike', cls: 'is-strike' },
-  { kind: 'sep' },
-  { kind: 'ul', iconName: 'list', label: 'contexts.editor.tb.ul' },
-  { kind: 'ol', iconName: 'list-ordered', label: 'contexts.editor.tb.ol' },
-  { kind: 'quote', iconName: 'quote', label: 'contexts.editor.tb.quote' },
-  { kind: 'sep' },
-  { kind: 'code', iconName: 'code', label: 'contexts.editor.tb.code' },
-  { kind: 'codeblock', iconName: 'code-block', label: 'contexts.editor.tb.codeblock' },
-  { kind: 'sep' },
-  { kind: 'link', iconName: 'link', label: 'contexts.editor.tb.link' },
-  { kind: 'image', iconName: 'image', label: 'contexts.editor.tb.image' },
-  { kind: 'sep' },
-  { kind: 'todo', iconName: 'square', label: 'contexts.editor.tb.todo' },
-];
-
-function _enterCtxEdit() {
-  if (!_ctxActive) return;
-  const draft = _ctxDrafts.get(_ctxActive.id);
-  if (draft) {
-    // Returning to a file we were editing — restore the unsaved draft +
-    // whichever sub-mode (textarea vs preview) the user was in.
-    _ctxEditPreview = !!draft.isPreview;
-    _ctxEditDraft = draft.content || '';
-  } else {
-    _ctxEditPreview = false;
-    _ctxEditDraft = _ctxActive.content || '';
-    // Stash an empty-changes entry so "I clicked Edit but typed nothing"
-    // also survives a file/tab switch — the user explicitly entered edit
-    // mode and the round-trip back should land them right where they were.
-    _ctxStashDraft();
-  }
-  _ctxRenderEditor();
-}
-
-function _ctxRenderEditor() {
-  const bodyEl = document.getElementById('contexts-viewer-body');
-  const actionsEl = document.getElementById('contexts-viewer-actions');
-  if (!bodyEl || !actionsEl) return;
-  const toolbarHtml = _CTX_EDITOR_TOOLBAR.map(item => {
-    if (item.kind === 'sep') return `<span class="ctx-editor-toolbar-sep" aria-hidden="true"></span>`;
-    const disabled = _ctxEditPreview ? 'disabled' : '';
-    const extraCls = item.cls ? ` ${item.cls}` : '';
-    const icon = item.iconName && typeof window !== 'undefined' && typeof window.uiIconHtml === 'function'
-      ? window.uiIconHtml(item.iconName, 'ui-icon ctx-editor-svg-icon')
-      : escapeHtml(item.icon || '');
-    return `<button type="button" class="btn btn-sm btn-icon ctx-editor-tb-btn${extraCls}" data-kind="${item.kind}" title="${escapeHtml(t(item.label))}" ${disabled}>${icon}</button>`;
-  }).join('');
-  const toggleKey = _ctxEditPreview ? 'contexts.editor.tb.edit_back' : 'contexts.editor.tb.preview';
-  const toggleIcon = typeof window !== 'undefined' && typeof window.uiIconHtml === 'function'
-    ? window.uiIconHtml(_ctxEditPreview ? 'pencil' : 'eye', 'ui-icon ctx-editor-toggle-icon')
-    : '';
-  const draft = _ctxEditDraft;
-  const bodyHtml = _ctxEditPreview
-    ? `<div class="ctx-viewer-md markdown-body ctx-editor-preview">${draft.trim() ? renderMarkdown(draft) : `<div class="ctx-viewer-msg">${escapeHtml(t('contexts.editor.preview_empty'))}</div>`}</div>`
-    : `<textarea class="ctx-viewer-editor" id="ctx-viewer-textarea" spellcheck="false">${escapeHtml(draft)}</textarea>`;
-  bodyEl.innerHTML = `
-    <div class="ctx-editor-toolbar" role="toolbar">
-      ${toolbarHtml}
-      <span class="ctx-editor-toolbar-spacer"></span>
-      <button type="button" class="btn btn-sm ctx-editor-toggle" id="ctx-editor-toggle" title="${escapeHtml(t(toggleKey))}">${toggleIcon}<span>${escapeHtml(t(toggleKey))}</span></button>
-    </div>
-    <div class="ctx-editor-body">${bodyHtml}</div>
-  `;
-  actionsEl.innerHTML = `
-    <button class="btn btn-sm btn-primary" id="ctx-viewer-save">${escapeHtml(t('contexts.viewer.save'))}</button>
-    <button class="btn btn-sm" id="ctx-viewer-cancel">${escapeHtml(t('contexts.viewer.cancel'))}</button>
-  `;
-  actionsEl.querySelector('#ctx-viewer-save').addEventListener('click', _saveCtxEdit);
-  actionsEl.querySelector('#ctx-viewer-cancel').addEventListener('click', () => {
-    _ctxClearDraft();
-    _ctxEditPreview = false;
-    _ctxEditDraft = '';
-    _renderCtxViewerMd();
-  });
-  bodyEl.querySelector('#ctx-editor-toggle').addEventListener('click', _ctxTogglePreview);
-  bodyEl.querySelectorAll('.ctx-editor-tb-btn').forEach(btn => {
-    btn.addEventListener('mousedown', (e) => {
-      // Prevent the textarea from losing focus on click (otherwise the cursor
-      // position is lost and the inserted snippet lands at the end).
-      e.preventDefault();
-    });
-    btn.addEventListener('click', () => {
-      if (_ctxEditPreview) return;
-      const ta = document.getElementById('ctx-viewer-textarea');
-      if (!ta) return;
-      _ctxApplyMd(ta, btn.dataset.kind);
-    });
-  });
-  const ta = bodyEl.querySelector('#ctx-viewer-textarea');
-  if (ta) {
-    ta.addEventListener('keydown', (e) => _ctxOnKey(ta, e));
-    ta.addEventListener('input', () => { _ctxEditDraft = ta.value; _ctxStashDraft(); });
-    ta.focus();
-  }
-}
-
-function _ctxTogglePreview() {
-  const ta = document.getElementById('ctx-viewer-textarea');
-  if (ta) _ctxEditDraft = ta.value;
-  _ctxEditPreview = !_ctxEditPreview;
-  _ctxStashDraft();
-  _ctxRenderEditor();
-}
-
-// Wrap-style ops toggle: if the selection is already wrapped with `mark`,
-// unwrap it; otherwise insert the wrap (with the placeholder pre-selected
-// when the selection is empty).
-function _ctxWrapSelection(ta, mark, placeholder) {
-  const start = ta.selectionStart;
-  let end = ta.selectionEnd;
-  const value = ta.value;
-  // Trailing-newline clamp: when a user "selects a line" (triple-click /
-  // Shift+Down) the selection often includes the trailing `\n`. Wrapping
-  // that range would emit `**Hello\n**`, leaving the closing mark stranded
-  // on the next line.
-  while (end > start && value[end - 1] === '\n') end -= 1;
-  const sel = value.slice(start, end);
-  const before = value.slice(0, start);
-  const after = value.slice(end);
-  const markLen = mark.length;
-  // Unwrap if the selection itself is wrapped, OR if the wrap marks are
-  // immediately around the selection.
-  if (sel.startsWith(mark) && sel.endsWith(mark) && sel.length >= markLen * 2) {
-    const inner = sel.slice(markLen, sel.length - markLen);
-    _ctxReplaceRange(ta, start, end, inner, start, start + inner.length);
-    return;
-  }
-  if (
-    before.endsWith(mark) &&
-    after.startsWith(mark)
-  ) {
-    const newStart = start - markLen;
-    const newEnd = end + markLen;
-    _ctxReplaceRange(ta, newStart, newEnd, sel, newStart, newStart + sel.length);
-    return;
-  }
-  const inner = sel || placeholder;
-  const wrapped = `${mark}${inner}${mark}`;
-  // If the selection was empty, leave the caret in the middle so the
-  // placeholder is selected — the next keystroke replaces it.
-  const innerStart = start + markLen;
-  const innerEnd = innerStart + inner.length;
-  _ctxReplaceRange(ta, start, end, wrapped, innerStart, innerEnd);
-}
-
-// Compute the line span (lineStart..lineEnd) covered by the current selection.
-// **Trailing-newline clamp**: if the selection ends right after a `\n`, treat
-// the selection as ending at the position before that `\n`. Without this,
-// double-clicking / triple-clicking / Shift+Down to select a single line
-// (which on most platforms grabs the trailing newline too) makes
-// `indexOf('\n', selEnd)` find the NEXT line's terminator and the operation
-// silently affects the line below.
-function _ctxLineSpan(value, selStart, selEnd) {
-  let effEnd = selEnd;
-  if (effEnd > selStart && value[effEnd - 1] === '\n') effEnd -= 1;
-  const lineStart = value.lastIndexOf('\n', selStart - 1) + 1;
-  let lineEnd = value.indexOf('\n', effEnd);
-  if (lineEnd === -1) lineEnd = value.length;
-  return { lineStart, lineEnd };
-}
-
-// Heading op: replace any existing `^#+ ` prefix with the target level, or
-// strip the prefix entirely if every line is already at the target level.
-// Without this, applying H2 to a line that's already H1 would prepend a
-// second `## ` and produce `## # Hello`.
-function _ctxApplyHeading(ta, level) {
-  const target = '#'.repeat(level) + ' ';
-  const value = ta.value;
-  const { lineStart, lineEnd } = _ctxLineSpan(value, ta.selectionStart, ta.selectionEnd);
-  const block = value.slice(lineStart, lineEnd);
-  const lines = block.split('\n');
-  const stripHeading = (line) => line.replace(/^#{1,6} /, '');
-  const isTarget = (line) => line === '' || line.startsWith(target);
-  // Toggle: every line already at this level → strip headings entirely.
-  if (lines.every(isTarget)) {
-    const rebuilt = lines.map(stripHeading).join('\n');
-    _ctxReplaceRange(ta, lineStart, lineEnd, rebuilt, lineStart, lineStart + rebuilt.length);
-    return;
-  }
-  const rebuilt = lines.map(line => line === '' ? line : `${target}${stripHeading(line)}`).join('\n');
-  _ctxReplaceRange(ta, lineStart, lineEnd, rebuilt, lineStart, lineStart + rebuilt.length);
-}
-
-// Todo three-state cycle (line-batch). The first non-empty selected line
-// decides the target state for the whole batch:
-//   - `- [ ] foo`  → `- [x] foo`        (mark batch as done)
-//   - `- [x] foo`  → `foo`              (strip todo prefix entirely)
-//   - anything else → `- [ ] foo`        (turn into a todo; first strips any
-//                                         existing `- ` bullet so `- foo`
-//                                         doesn't become `- [ ] - foo`)
-function _ctxApplyTodo(ta) {
-  const value = ta.value;
-  const { lineStart, lineEnd } = _ctxLineSpan(value, ta.selectionStart, ta.selectionEnd);
-  const block = value.slice(lineStart, lineEnd);
-  const lines = block.split('\n');
-  const placeholder = t('contexts.editor.placeholder.todo');
-  // Pick the mode from the first non-empty line.
-  const firstNonEmpty = lines.find(l => l.trim().length > 0) || '';
-  let mode;
-  if (/^(\s*)- \[ \] /.test(firstNonEmpty)) mode = 'check';
-  else if (/^(\s*)- \[[xX]\] /.test(firstNonEmpty)) mode = 'strip';
-  else mode = 'mark';
-  const rebuilt = lines.map(line => {
-    if (line.trim().length === 0) return line;
-    const indent = (line.match(/^(\s*)/) || ['', ''])[1];
-    const rest = line.slice(indent.length);
-    if (mode === 'check') {
-      const m = rest.match(/^- \[ \] (.*)$/);
-      return m ? `${indent}- [x] ${m[1]}` : line;
-    }
-    if (mode === 'strip') {
-      return `${indent}${rest.replace(/^- \[[ xX]\] /, '')}`;
-    }
-    // mode === 'mark': turn the line into a todo. Drop any existing bullet
-    // prefix (`- ` / `* ` / `+ ` / `1. `) so we don't double up.
-    const body = rest.replace(/^([-*+]|\d+\.) +/, '') || placeholder;
-    return `${indent}- [ ] ${body}`;
-  }).join('\n');
-  _ctxReplaceRange(ta, lineStart, lineEnd, rebuilt, lineStart, lineStart + rebuilt.length);
-}
-
-// Line-prefix ops: apply `prefix(idx)` to each selected line (or the caret
-// line); toggle off if every line already carries the same prefix.
-function _ctxLinePrefix(ta, prefixFn) {
-  const value = ta.value;
-  const { lineStart, lineEnd } = _ctxLineSpan(value, ta.selectionStart, ta.selectionEnd);
-  const block = value.slice(lineStart, lineEnd);
-  const lines = block.split('\n');
-  // Toggle: if every non-empty line starts with the prefix (idx 0), strip it.
-  const firstPrefix = prefixFn(0);
-  const allMatch = lines.every(line => line.length === 0 || line.startsWith(firstPrefix));
-  let rebuilt;
-  if (allMatch && firstPrefix) {
-    rebuilt = lines.map(line => line.startsWith(firstPrefix) ? line.slice(firstPrefix.length) : line).join('\n');
-  } else {
-    rebuilt = lines.map((line, idx) => `${prefixFn(idx)}${line}`).join('\n');
-  }
-  _ctxReplaceRange(ta, lineStart, lineEnd, rebuilt, lineStart, lineStart + rebuilt.length);
-}
-
-// Drop-in block insert (codeblock / link / image).
-function _ctxInsertBlock(ta, opts) {
-  const { text, selStart, selEnd } = opts;
-  const start = ta.selectionStart;
-  const end = ta.selectionEnd;
-  _ctxReplaceRange(ta, start, end, text, start + selStart, start + selEnd);
-}
-
-function _ctxReplaceRange(ta, from, to, replacement, newSelStart, newSelEnd) {
-  ta.setRangeText(replacement, from, to, 'preserve');
-  ta.selectionStart = newSelStart;
-  ta.selectionEnd = newSelEnd;
-  _ctxEditDraft = ta.value;
-  // setRangeText doesn't fire `input`, so toolbar ops bypass the input
-  // handler's draft stash — capture explicitly.
-  _ctxStashDraft();
-  ta.focus();
-}
-
-function _ctxApplyMd(ta, kind) {
-  switch (kind) {
-    case 'bold':      return _ctxWrapSelection(ta, '**', t('contexts.editor.placeholder.bold'));
-    case 'italic':    return _ctxWrapSelection(ta, '*',  t('contexts.editor.placeholder.italic'));
-    case 'strike':    return _ctxWrapSelection(ta, '~~', t('contexts.editor.placeholder.strike'));
-    case 'code':      return _ctxWrapSelection(ta, '`',  t('contexts.editor.placeholder.code'));
-    case 'h1':        return _ctxApplyHeading(ta, 1);
-    case 'h2':        return _ctxApplyHeading(ta, 2);
-    case 'h3':        return _ctxApplyHeading(ta, 3);
-    case 'quote':     return _ctxLinePrefix(ta, () => '> ');
-    case 'ul':        return _ctxLinePrefix(ta, () => '- ');
-    case 'ol':        return _ctxLinePrefix(ta, (i) => `${i + 1}. `);
-    case 'todo':      return _ctxApplyTodo(ta);
-    case 'codeblock': {
-      const start = ta.selectionStart, end = ta.selectionEnd;
-      const sel = ta.value.slice(start, end);
-      const body = sel || t('contexts.editor.placeholder.code');
-      // Ensure surrounding blank lines when the caret is mid-paragraph.
-      const before = ta.value.slice(0, start);
-      const after = ta.value.slice(end);
-      const leadNl = before.length === 0 || before.endsWith('\n\n') ? '' : (before.endsWith('\n') ? '\n' : '\n\n');
-      const tailNl = after.length === 0 || after.startsWith('\n\n') ? '' : (after.startsWith('\n') ? '\n' : '\n\n');
-      const text = `${leadNl}\`\`\`\n${body}\n\`\`\`${tailNl}`;
-      const innerStart = start + leadNl.length + 4; // after ```\n
-      const innerEnd = innerStart + body.length;
-      return _ctxInsertBlock(ta, { text, selStart: innerStart - start, selEnd: innerEnd - start });
-    }
-    case 'link': {
-      const start = ta.selectionStart, end = ta.selectionEnd;
-      const sel = ta.value.slice(start, end);
-      const linkText = sel || t('contexts.editor.placeholder.link_text');
-      const url = t('contexts.editor.placeholder.link_url');
-      const text = `[${linkText}](${url})`;
-      // Select the URL placeholder so the user can paste / type their URL.
-      const urlStart = 1 + linkText.length + 2; // after "[text]("
-      const urlEnd = urlStart + url.length;
-      return _ctxInsertBlock(ta, { text, selStart: urlStart, selEnd: urlEnd });
-    }
-    case 'image': {
-      const start = ta.selectionStart, end = ta.selectionEnd;
-      const sel = ta.value.slice(start, end);
-      const alt = sel || t('contexts.editor.placeholder.image_alt');
-      const url = t('contexts.editor.placeholder.image_url');
-      const text = `![${alt}](${url})`;
-      const urlStart = 2 + alt.length + 2;
-      const urlEnd = urlStart + url.length;
-      return _ctxInsertBlock(ta, { text, selStart: urlStart, selEnd: urlEnd });
-    }
-  }
-}
-
-// Strip a leading list/quote marker; return null if the line isn't a list line.
-function _ctxParseListPrefix(line) {
-  const m = line.match(/^(\s*)([-*+]|\d+\.)(\s+)/);
-  if (!m) return null;
-  return { indent: m[1], marker: m[2], gap: m[3], total: m[0] };
-}
-
-function _ctxOnKey(ta, e) {
-  // IME composition guard (CLAUDE.md §8) — Chinese / Japanese / Korean Enter
-  // commits a candidate; don't fire shortcuts or list-continuation while a
-  // composition is active.
-  if (e.isComposing || e.keyCode === 229) return;
-
-  const mod = e.metaKey || e.ctrlKey;
-  if (mod && !e.shiftKey && !e.altKey) {
-    const k = (e.key || '').toLowerCase();
-    if (k === 'b') { e.preventDefault(); return _ctxApplyMd(ta, 'bold'); }
-    if (k === 'i') { e.preventDefault(); return _ctxApplyMd(ta, 'italic'); }
-    if (k === 'k') { e.preventDefault(); return _ctxApplyMd(ta, 'link'); }
-    if (k === 's') { e.preventDefault(); return _saveCtxEdit(); }
-  }
-
-  if (e.key === 'Tab') {
-    e.preventDefault();
-    const start = ta.selectionStart;
-    const end = ta.selectionEnd;
-    const value = ta.value;
-    const multiLine = value.slice(start, end).includes('\n');
-    if (multiLine) {
-      // Use the same trailing-newline-clamped span as the toolbar line ops,
-      // so selecting "row1\nrow2\n" doesn't drag row3's leading column into
-      // the indent batch.
-      const { lineStart, lineEnd } = _ctxLineSpan(value, start, end);
-      const block = value.slice(lineStart, lineEnd);
-      const lines = block.split('\n');
-      let rebuilt;
-      if (e.shiftKey) {
-        rebuilt = lines.map(l => l.replace(/^( {1,2}|\t)/, '')).join('\n');
-      } else {
-        rebuilt = lines.map(l => `  ${l}`).join('\n');
-      }
-      _ctxReplaceRange(ta, lineStart, lineEnd, rebuilt, lineStart, lineStart + rebuilt.length);
-      return;
-    }
-    if (e.shiftKey) {
-      const lineStart = value.lastIndexOf('\n', start - 1) + 1;
-      const head = value.slice(lineStart, lineStart + 2);
-      const strip = head === '  ' ? 2 : (head[0] === '\t' ? 1 : 0);
-      if (strip) {
-        const newStart = Math.max(lineStart, start - strip);
-        _ctxReplaceRange(ta, lineStart, lineStart + strip, '', newStart, Math.max(newStart, end - strip));
-      }
-      return;
-    }
-    _ctxReplaceRange(ta, start, end, '  ', start + 2, start + 2);
-    return;
-  }
-
-  if (e.key === 'Enter') {
-    const value = ta.value;
-    const start = ta.selectionStart;
-    const end = ta.selectionEnd;
-    if (start !== end) return; // non-empty selection: default behavior (replace)
-    const lineStart = value.lastIndexOf('\n', start - 1) + 1;
-    const lineSoFar = value.slice(lineStart, start);
-    const parsed = _ctxParseListPrefix(lineSoFar);
-    if (!parsed) return;
-    // Empty list line → break out (remove the marker entirely).
-    if (lineSoFar === parsed.total) {
-      e.preventDefault();
-      _ctxReplaceRange(ta, lineStart, start, '', lineStart, lineStart);
-      return;
-    }
-    e.preventDefault();
-    let nextMarker = parsed.marker;
-    if (/^\d+\.$/.test(parsed.marker)) {
-      const n = parseInt(parsed.marker, 10);
-      nextMarker = `${n + 1}.`;
-    }
-    const insert = `\n${parsed.indent}${nextMarker}${parsed.gap}`;
-    _ctxReplaceRange(ta, start, start, insert, start + insert.length, start + insert.length);
-    return;
-  }
-}
-
-async function _saveCtxEdit() {
-  if (!_ctxActive) return;
-  const ta = document.getElementById('ctx-viewer-textarea');
-  // Textarea is only present in edit mode; preview mode saves from the draft
-  // captured at the toggle point. Always sync the textarea value into the
-  // draft first so the two paths converge.
-  if (ta) _ctxEditDraft = ta.value;
-  const next = _ctxEditDraft;
-  try {
-    const res = await apiFetch('/api/contexts/update', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: _ctxActive.id, content: next }),
-    });
-    const data = await res.json();
-    if (!data.ok) { await uiAlert(data.error || t('contexts.save_failed')); return; }
-    _ctxActive.content = next;
-    _ctxClearDraft();
-    _ctxEditPreview = false;
-    _ctxEditDraft = '';
-    _renderCtxViewerMd();
-    await loadContexts();
-  } catch (e) {
-    await uiAlert(t('contexts.save_failed_with', { reason: e.message || e }));
-  }
-}
-
 async function _deleteCtxFromViewer() {
   if (!_ctxActive) return;
   const rel = _ctxActive.id;
@@ -1582,6 +1081,7 @@ async function _deleteCtxFromViewer() {
 }
 
 function _clearCtxViewer() {
+  if (_ctxMveController) { try { _ctxMveController.destroy(); } catch (_) {} _ctxMveController = null; }
   _ctxActive = null;
   const empty = document.getElementById('contexts-editor-empty');
   const wrap = document.getElementById('contexts-viewer-wrap');

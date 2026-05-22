@@ -78,6 +78,24 @@ function _deriveBundleInstance(entry) {
   };
 }
 
+function listUsableConnectorsForPicker() {
+  const catalogById = new Map((_connectorsState.catalog || []).map((entry) => [entry.id, entry]));
+  const lang = (typeof getLang === 'function') ? getLang() : 'en';
+  return (_connectorsState.instances || [])
+    .filter((inst) => inst && inst.status && inst.status.kind === 'connected' && inst.enabled !== false)
+    .map((inst) => {
+      const entry = catalogById.get(inst.id) || _entryFromInstance(inst);
+      const account = inst.oauth_grant && inst.oauth_grant.account_label ? inst.oauth_grant.account_label : '';
+      return {
+        id: inst.id,
+        name: inst.display_name || entry.display_name || inst.id,
+        description: pickDesc(entry, lang),
+        account,
+      };
+    })
+    .sort((a, b) => (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base', numeric: true }));
+}
+
 function _renderConnectorsGrid() {
   const gridView = document.getElementById('connectors-grid-view');
   if (!gridView) return;

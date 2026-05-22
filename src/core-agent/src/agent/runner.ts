@@ -10,6 +10,7 @@ import {
 import { createLogger } from "../shared/logger.js";
 import type { CoreAgentConfig } from "../config/schema.js";
 import type { EvolutionConfig } from "../evolution/types.js";
+import { detectUserCorrection } from "../evolution/metacognition.js";
 import type { LLMProvider, CompletionResult } from "../providers/base.js";
 import { ProviderRegistry } from "../providers/registry.js";
 import type { AgentTool, ToolContext } from "../tools/base.js";
@@ -42,6 +43,7 @@ export class AgentRunner {
   private readonly skillStore: SkillStore | null;
   private readonly skillAllowlist: string[] | undefined;
   private readonly onCompact: ((summary: string) => void) | null;
+  private readonly onLearnedSkillAdvertised: ((id: string) => void) | null;
 
   constructor(opts: {
     config: CoreAgentConfig;
@@ -55,6 +57,12 @@ export class AgentRunner {
     /** Fires after skill_manage(create) with the new skill id — Orkas
      * uses this to keep the bound agent's `skill_list` in sync. */
     onSkillCreated?: (id: string) => void;
+    /** Fires once per turn for each learned-skill id rendered into the
+     * system-prompt's `## Available Learned Skills` block (System B in
+     * the host's signal-attribution vocabulary). Pure callback — exceptions
+     * are swallowed; emission is best-effort. Orkas bridges this to its
+     * `onSkillAdvertised` ChatOptions hook with `system: 'B'`. */
+    onLearnedSkillAdvertised?: (id: string) => void;
     /** Called after session compaction with the generated summary text. */
     onCompact?: (summary: string) => void;
   }) {
@@ -63,6 +71,7 @@ export class AgentRunner {
     this.session = opts.session ?? new Session();
     this.onCompact = opts.onCompact ?? null;
     this.skillAllowlist = opts.skillAllowlist;
+    this.onLearnedSkillAdvertised = opts.onLearnedSkillAdvertised ?? null;
 
     // Set up evolution / skill store
     const evolutionConfig = this.config.evolution;
@@ -516,6 +525,11 @@ export class AgentRunner {
     result: AgentRunResult,
     competence?: string,
     strategies?: string,
+    /** The user message that triggered this run. When provided, `buildRunMetrics`
+     *  runs `detectUserCorrection` on it to populate `userCorrections`. Wired
+     *  through from the caller per plan §6.1 so the same heuristic feeds both
+     *  this metric and the bus-side `correction` signal (no double-judgment). */
+    inboundMessage?: string,
   ): { prompt: string; primaryFocus: string; score: number } | null {
     const metaConfig = this.config.evolution.metacognition as MetacognitionConfig;
     if (!metaConfig.enabled) {
@@ -523,8 +537,8 @@ export class AgentRunner {
       return null;
     }
 
-    const metrics = this.buildRunMetrics(result);
-    log.debug(`evaluateReflection: metrics toolCalls=${metrics.toolCalls} errors=${metrics.errorCount} errorKind=${metrics.errorKind} transient=${metrics.transientErrorCount} skills=[${metrics.skillsLoaded.join(',')}]`);
+    const metrics = this.buildRunMetrics(result, inboundMessage);
+    log.debug(`evaluateReflection: metrics toolCalls=${metrics.toolCalls} errors=${metrics.errorCount} errorKind=${metrics.errorKind} transient=${metrics.transientErrorCount} corrections=${metrics.userCorrections} skills=[${metrics.skillsLoaded.join(',')}]`);
 
     const reflection = shouldReflect(metrics, metaConfig, competence);
     if (!reflection.shouldReflect) {
@@ -623,8 +637,11 @@ export class AgentRunner {
     return lines.join('\n');
   }
 
-  /** Convert AgentRunResult.meta into RunMetrics for the trigger evaluator. */
-  private buildRunMetrics(result: AgentRunResult): RunMetrics {
+  /** Convert AgentRunResult.meta into RunMetrics for the trigger evaluator.
+   *  When `inboundMessage` is provided, runs `detectUserCorrection` to set
+   *  `userCorrections` (otherwise 0). Reuses the same heuristic the bus-side
+   *  expert_signals extractor uses — same input, same boolean. */
+  private buildRunMetrics(result: AgentRunResult, inboundMessage?: string): RunMetrics {
     const meta = result.meta;
     const transient = meta.transientToolErrors ?? 0;
     const permanent = meta.permanentToolErrors ?? 0;
@@ -645,7 +662,7 @@ export class AgentRunner {
       hadErrors,
       recovered: hadErrors && result.text.length > 0,
       errorCount: totalToolErrors + (meta.error ? 1 : 0),
-      userCorrections: 0,
+      userCorrections: inboundMessage && detectUserCorrection(inboundMessage) ? 1 : 0,
       errorKind,
       transientErrorCount: transient,
     };
@@ -658,6 +675,25 @@ export class AgentRunner {
 
     try {
       const skillsIndex = await this.skillStore.buildIndex(this.skillAllowlist);
+      // Signal-attribution hook: re-list to recover the rendered id set.
+      // SkillStore.list() is mtime-cached so this is effectively free; not
+      // worth changing buildIndex's signature. Mirror the same allowlist
+      // filter so the emitted set matches what landed in the prompt.
+      if (skillsIndex && this.onLearnedSkillAdvertised) {
+        try {
+          let advertised = await this.skillStore.list();
+          if (this.skillAllowlist !== undefined) {
+            const allow = new Set(this.skillAllowlist);
+            advertised = advertised.filter((s) => allow.has(s.id));
+          }
+          for (const s of advertised) {
+            try { this.onLearnedSkillAdvertised(s.id); }
+            catch { /* best-effort */ }
+          }
+        } catch (err) {
+          log.warn(`onLearnedSkillAdvertised replay failed: ${formatError(err)}`);
+        }
+      }
       const guidance = buildSkillsGuidance(skillsIndex);
       return basePrompt + "\n\n" + guidance;
     } catch (err) {

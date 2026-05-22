@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll } from 'vitest';
-import { toCompressedGrayJpeg } from '../../../src/main/util/image-transform';
+import { prepareFeedbackUploadImage, toCompressedGrayJpeg } from '../../../src/main/util/image-transform';
 
 let sourcePng: Buffer;
 
@@ -51,5 +51,55 @@ describe('image-transform › toCompressedGrayJpeg', () => {
 
   it('rejects empty buffer', async () => {
     await expect(toCompressedGrayJpeg(Buffer.alloc(0))).rejects.toThrow(/empty|invalid/i);
+  });
+});
+
+describe('image-transform › prepareFeedbackUploadImage', () => {
+  it('compresses large feedback images as color JPEG', async () => {
+    const r = await prepareFeedbackUploadImage(sourcePng, {
+      fileName: 'screen.png',
+      mimeType: 'image/png',
+      maxBytes: 200 * 1024,
+      maxDim: 600,
+      compressTriggerBytes: 0,
+    });
+
+    expect(r.compressed).toBe(true);
+    expect(r.mimeType).toBe('image/jpeg');
+    expect(r.fileName).toBe('screen.jpg');
+    expect(r.buf.length).toBeLessThanOrEqual(200 * 1024);
+    expect(Math.max(r.width || 0, r.height || 0)).toBeLessThanOrEqual(600);
+
+    const { Jimp } = await import('jimp' as any);
+    const out: any = await Jimp.read(r.buf);
+    const px = out.getPixelColor(20, 20);
+    const r8 = (px >>> 24) & 0xff;
+    const g8 = (px >>> 16) & 0xff;
+    const b8 = (px >>> 8)  & 0xff;
+    expect(Math.max(Math.abs(r8 - g8), Math.abs(g8 - b8), Math.abs(r8 - b8))).toBeGreaterThan(16);
+  });
+
+  it('keeps small feedback images untouched when compression is not useful', async () => {
+    const { Jimp } = await import('jimp' as any);
+    const small: any = new Jimp({ width: 120, height: 90, color: 0x6699CCFF });
+    const smallPng: Buffer = await small.getBuffer('image/png');
+    const r = await prepareFeedbackUploadImage(smallPng, {
+      fileName: 'small.png',
+      mimeType: 'image/png',
+      maxBytes: 5 * 1024 * 1024,
+    });
+
+    expect(r.compressed).toBe(false);
+    expect(r.mimeType).toBe('image/png');
+    expect(r.fileName).toBe('small.png');
+    expect(r.buf.equals(smallPng)).toBe(true);
+  });
+
+  it('does not try to compress oversized GIFs', async () => {
+    await expect(prepareFeedbackUploadImage(Buffer.alloc(11), {
+      fileName: 'clip.gif',
+      mimeType: 'image/gif',
+      maxBytes: 10,
+    })).rejects.toMatchObject({ code: 'image_too_large' });
   });
 });

@@ -65,13 +65,9 @@ export interface StateFile {
    *  slug rules and the placeholder fallback. */
   workspace_dir?: string;
   /** Project directory for coding-agent (claude / codex) dispatches in
-   *  this conversation. Auto-set on the first coding-agent turn to the
-   *  user's effective workspace path (so the user doesn't have to pick
-   *  manually for the common case), and re-synced to follow workspace
-   *  switches as long as `coding_project_dir_explicit` is false. Once
-   *  the user picks a different directory through the input-form
-   *  (`coding_project_dir_explicit=true`), workspace changes no longer
-   *  override their choice. Absolute path. Missing / empty → coding
+   *  this conversation. Initialised on the first coding-agent turn from
+   *  that agent's detail-page project-dir setting; missing setting =
+   *  effective workspace path. Absolute path. Missing / empty → coding
    *  agents fall back to the conv's workspace root. The field is
    *  per-conversation, NOT per-agent: one project for the whole
    *  conversation across however many coding agents it has. */
@@ -86,6 +82,11 @@ export interface StateFile {
    *  auto-set by the workspace-sync path in `bus.ts` and is allowed to
    *  follow future workspace switches. Cleared whenever
    *  `coding_project_dir` is cleared. */
+  /** True when the user picked `coding_project_dir` explicitly, either
+   *  via the agent detail page's custom project-dir setting at initial
+   *  conversation setup, or via the `<agent-input-form>` directory
+   *  picker (form-submit hook in `group_chat/index.ts`). Cleared
+   *  whenever `coding_project_dir` is cleared. */
   coding_project_dir_explicit?: boolean;
 }
 
@@ -349,12 +350,10 @@ export async function setWorkspaceDirOnce(uid: string, cid: string, dir: string)
  *  Caller is responsible for absolute-path validation — we only do
  *  string handling here. Returns the resulting state.
  *
- *  `opts.explicit` records whether the user actively chose this
- *  directory through the `<agent-input-form>` picker. The flag is
- *  consulted by the workspace-sync path in `bus.ts`: explicit picks
- *  are sticky (workspace switches don't override them), auto-set
- *  values track the workspace. Clearing `dir` also clears the flag
- *  so the next auto-set doesn't accidentally inherit a stale `true`. */
+ *  `opts.explicit` records whether this value came from a user-chosen
+ *  custom directory (agent detail setting or `<agent-input-form>`).
+ *  Clearing `dir` also clears the flag so the next initialisation
+ *  doesn't accidentally inherit a stale `true`. */
 export async function setCodingProjectDir(
   uid: string, cid: string, dir: string,
   opts: { explicit: boolean },

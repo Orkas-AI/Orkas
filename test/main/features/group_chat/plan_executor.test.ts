@@ -544,4 +544,111 @@ describe('plan_executor › auto plan_update', () => {
     expect(finalPlan?.steps[0].output_summary).toBe('A done');
     expect(finalPlan?.completed_signaled).toBe(true); // single-step plan terminal → signal fired
   }, 10_000);
+
+  it('manual commander dispatch still completes the matching in_progress step', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const plan = await import('../../../../src/main/features/group_chat/plan');
+
+    _setScript(state.buildGmemberSessionId(cid, A_ID), [
+      { type: 'final', text: 'manual dispatch result' },
+    ]);
+
+    await plan.setPlan(TEST_UID, cid, {
+      initial_message: 'q',
+      steps: [{ title: 'a', assignee: A_NAME, input: 'do', wait_for: [] }],
+    });
+    await state.seedReservedActors(TEST_UID, cid);
+    await state.ensureAgentMember(TEST_UID, cid, A_ID, A_NAME);
+    await plan.updateStep(TEST_UID, cid, 1, 'in_progress');
+
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'commander',
+      text: `@${A_NAME} 请继续执行第 1 步`,
+      forceTo: [A_ID],
+      dispatch: true,
+    });
+    await waitForQuiescent(TEST_UID, cid, 4000);
+
+    const finalPlan = await plan.readPlan(TEST_UID, cid);
+    expect(finalPlan?.steps[0].status).toBe('done');
+    expect(finalPlan?.steps[0].output_summary).toBe('manual dispatch result');
+  }, 10_000);
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+//  Test 6 — plan inherits user-turn attachments and forwards to workers
+//
+//  Regression guard for "commander sees the image, worker doesn't" — workers
+//  read images via ChatOptions.images, which is populated from
+//  item.attachments → buildAttachmentManifest. plan-step dispatches live
+//  across turn boundaries, so the source must be persisted on the plan.
+//
+//  Two fixtures pinned:
+//    A) initial_attachments set on plan → both forwarded dispatches carry
+//       the same attachments list (so worker's turnImages populates).
+//    B) initial_attachments unset → no attachments leak onto dispatches
+//       (verifies the optional path doesn't accidentally add an empty key).
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('plan_executor › attachment inheritance', () => {
+  it('plan.initial_attachments propagates onto every step dispatch', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+
+    _setScript(state.buildGmemberSessionId(cid, A_ID), [{ type: 'final', text: 'A done' }]);
+    _setScript(state.buildGmemberSessionId(cid, B_ID), [{ type: 'final', text: 'B done' }]);
+
+    await setupPlanAndKick(TEST_UID, cid, {
+      initial_message: '解这道题',
+      initial_attachments: ['problem.png', 'extra.jpg'],
+      steps: [
+        { title: '识图', assignee: A_NAME, input: '看附件中的题', wait_for: [] },
+        { title: '求解', assignee: B_NAME, input: '解题: {{step_1.output_summary}}', wait_for: [1] },
+      ],
+    });
+
+    await waitForQuiescent(TEST_UID, cid, 5000);
+
+    const lines = await readJsonl(TEST_UID, cid);
+    const toA = lines.find((l) => l.from === 'commander' && l.to.includes(A_ID));
+    const toB = lines.find((l) => l.from === 'commander' && l.to.includes(B_ID));
+
+    expect(toA?.attachments).toEqual(['problem.png', 'extra.jpg']);
+    expect(toB?.attachments).toEqual(['problem.png', 'extra.jpg']);
+
+    // Plan still records the source so retries / replan inherit.
+    const plan = await import('../../../../src/main/features/group_chat/plan');
+    const persisted = await plan.readPlan(TEST_UID, cid);
+    expect(persisted?.initial_attachments).toEqual(['problem.png', 'extra.jpg']);
+  }, 15_000);
+
+  it('no initial_attachments → dispatch messages omit the attachments key', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+
+    _setScript(state.buildGmemberSessionId(cid, A_ID), [{ type: 'final', text: 'A done' }]);
+
+    await setupPlanAndKick(TEST_UID, cid, {
+      initial_message: 'no image case',
+      steps: [{ title: '只是文字', assignee: A_NAME, input: '回答', wait_for: [] }],
+    });
+
+    await waitForQuiescent(TEST_UID, cid, 5000);
+
+    const lines = await readJsonl(TEST_UID, cid);
+    const toA = lines.find((l) => l.from === 'commander' && l.to.includes(A_ID));
+    // Persisted GroupMessage shape: `attachments` is only present when non-empty
+    // (see _enqueueBody at bus.ts:612). Asserting omission catches a regression
+    // where we'd accidentally pass `attachments: []` and pollute the file.
+    expect(toA).toBeTruthy();
+    expect('attachments' in toA).toBe(false);
+
+    const plan = await import('../../../../src/main/features/group_chat/plan');
+    const persisted = await plan.readPlan(TEST_UID, cid);
+    expect(persisted?.initial_attachments).toBeUndefined();
+  }, 15_000);
 });

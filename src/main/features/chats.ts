@@ -31,11 +31,14 @@ import { t } from '../i18n';
 
 const log = createLogger('chats');
 import * as search from './search';
-import * as groupChat from './group_chat';
-import { buildGconvSessionId, readState, setStatus } from './group_chat/state';
+import { purgeGroupDir, readState, setStatus } from './group_chat/state';
 import type { GroupMessage } from './group_chat/visibility';
 
 const CONVERSATION_INDEX_NAME = '_index.json';
+
+function buildConversationSessionId(cid: string): string {
+  return `gconv-${cid}`;
+}
 
 export type ConversationKind = 'normal' | string;
 
@@ -109,7 +112,8 @@ export async function listConversations(userId: string): Promise<Conversation[]>
     let since: string | null = null;
     try {
       const s = await readState(userId, c.conversation_id);
-      const busBusy = !groupChat.busIsQuiescent(userId, c.conversation_id);
+      const bus = await import('./group_chat/bus');
+      const busBusy = !bus.isQuiescent(userId, c.conversation_id);
       processing = s.status === 'running' || busBusy;
       since = processing ? s.last_active_at : null;
     } catch { /* missing state file = idle */ }
@@ -203,7 +207,7 @@ export async function createConversation(userId: string, {
     kind,
     agent_id: agentId || '',
     skill_id: skillId || '',
-    session_id: buildGconvSessionId(cid),
+    session_id: buildConversationSessionId(cid),
     ...(projectId ? { project_id: projectId } : {}),
     created_at: nowIso(),
     updated_at: nowIso(),
@@ -244,7 +248,11 @@ export async function deleteConversation(userId: string, cid: string): Promise<b
   await saveConversations(userId, kept);
 
   // Purge group dir (members.json / state.json / plan.md / visibility/) + bus state.
-  try { await groupChat.dropConv(userId, cid); }
+  try {
+    const bus = await import('./group_chat/bus');
+    bus.dropConv(userId, cid);
+    await purgeGroupDir(userId, cid);
+  }
   catch (err) { log.warn(`group_chat dropConv failed user=${userId} cid=${cid}: ${(err as Error).message}`); }
 
   // Purge main jsonl.
@@ -254,7 +262,7 @@ export async function deleteConversation(userId: string, cid: string): Promise<b
   search.dropChatConversation(userId, cid);
 
   // Purge commander session + every per-agent member session.
-  purgeSession(userId, removed?.session_id || buildGconvSessionId(cid));
+  purgeSession(userId, removed?.session_id || buildConversationSessionId(cid));
   // gmember sessions: glob the sessions dir for `<uid>-gmember-<cid>-*` —
   // we can't rely on readMembers() because `groupChat.dropConv` above has
   // already removed members.json (the historical cause of the 50+ orphan

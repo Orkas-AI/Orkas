@@ -46,6 +46,7 @@ import {
 import { chatAttachmentDir } from '../../paths';
 import { getWorkspacePath } from '../../features/user_workspace';
 import { isPathAllowed } from '../../util/path-sandbox';
+import { parseSkillPath } from '../../features/expert_signals/skill_path';
 
 const log = createLogger('file-tools');
 
@@ -90,6 +91,11 @@ export interface FileToolsOpts {
    *  picks up the project-scoped selection (per CLAUDE.md projects feature).
    *  Empty / missing → default-scope workspace. */
   projectId?: string;
+  /** Fires when `read_file` resolves to a SKILL.md path under one of the
+   *  three skill roots (System A.custom / A.platform / B). Bus collects
+   *  per turn for the `skill_invoked` signal. Pure callback — exceptions
+   *  swallowed, never blocks the tool result. */
+  onSkillInvoked?: (skill_id: string, system: 'A.custom' | 'A.platform' | 'B', trigger: 'read_file') => void;
 }
 
 /** Assemble the allowed-roots list for the current (uid, cid). File-tools
@@ -226,6 +232,17 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
         log.info(
           `read_file user=${opts.userId} kind=${kind} covered=${cs}-${ce} total=${total} path=${abs}`,
         );
+        // skill_invoked attribution: when the LLM read_file's a SKILL.md
+        // body, the body is the progressive-disclosure "use this skill"
+        // signal (per Claude Code conventions). Emit AFTER the successful
+        // text read — image / pdf / docx SKILL.md is not a real shape.
+        if (opts.onSkillInvoked) {
+          const parsed = parseSkillPath(abs, opts.userId);
+          if (parsed) {
+            try { opts.onSkillInvoked(parsed.skill_id, parsed.system, 'read_file'); }
+            catch (err) { log.warn(`onSkillInvoked callback failed: ${(err as Error).message}`); }
+          }
+        }
         return { content: `${header}\n${result.content}\n</file>` };
       } catch (err) {
         if (err instanceof NeedStatError) {

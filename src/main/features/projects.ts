@@ -378,6 +378,31 @@ export async function getBindings(uid: string, projectId: string): Promise<Proje
   return _readBindings(uid, projectId);
 }
 
+export async function pruneBindings(
+  uid: string,
+  projectId: string,
+  valid: { agents?: ReadonlySet<string>; skills?: ReadonlySet<string> },
+): Promise<{ ok: true; bindings: ProjectBindings; pruned: ProjectBindings } | { ok: false; error: ProjectError }> {
+  await _ensurePromoted(uid);
+  if (!fs.existsSync(projectMetaFile(uid, projectId))) return { ok: false, error: 'not_found' };
+  const cur = await _readBindings(uid, projectId);
+  const validAgents = valid.agents;
+  const validSkills = valid.skills;
+  const next: ProjectBindings = {
+    agents: validAgents ? cur.agents.filter((id) => validAgents.has(id)) : cur.agents,
+    skills: validSkills ? cur.skills.filter((id) => validSkills.has(id)) : cur.skills,
+  };
+  const pruned: ProjectBindings = {
+    agents: validAgents ? cur.agents.filter((id) => !validAgents.has(id)) : [],
+    skills: validSkills ? cur.skills.filter((id) => !validSkills.has(id)) : [],
+  };
+  if (pruned.agents.length || pruned.skills.length) {
+    await _writeBindings(uid, projectId, next);
+    log.info(`pruned stale bindings user=${uid} pid=${projectId} agents=${pruned.agents.length} skills=${pruned.skills.length}`);
+  }
+  return { ok: true, bindings: next, pruned };
+}
+
 /** Single resolver, threaded through runTurn alongside the workspace lookup.
  *
  *  - `null` = orphan conversation (no project_id) → no scope filter; legacy

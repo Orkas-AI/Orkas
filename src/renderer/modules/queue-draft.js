@@ -4,8 +4,8 @@
 // sent immediately. Queue is per-cid, persisted in localStorage so a refresh
 // mid-stream doesn't drop pending messages. Drained one-by-one when the
 // current reply finishes (or is aborted). Each entry records the raw user
-// text plus the selected skill — the "use skill X" prefix is applied at
-// dispatch time so a later skill change is reflected correctly.
+// text plus the selected skill / connector — the "use X" prefix is applied
+// at dispatch time so a later selection change is reflected correctly.
 
 function _loadQueueFromStorage(cid) {
   if (!cid) return [];
@@ -41,12 +41,30 @@ function _forgetConvLocal(cid) {
   if (typeof _forgetCidRecipient === 'function') _forgetCidRecipient(cid);
 }
 
-function enqueueMessage(cid, content, skill) {
+function _queueItemUseSelection(item) {
+  if (!item) return null;
+  if (item.use && typeof _normalizeChatUseSelection === 'function') {
+    return _normalizeChatUseSelection(item.use);
+  }
+  if (item.skill && typeof _normalizeChatUseSelection === 'function') {
+    return _normalizeChatUseSelection({ kind: 'skill', id: item.skill, name: item.skill });
+  }
+  return null;
+}
+
+function enqueueMessage(cid, content, useSelection, opts = {}) {
   const q = _getQueue(cid);
+  const extra = opts && opts.extra && typeof opts.extra === 'object' ? opts.extra : null;
+  const use = typeof _normalizeChatUseSelection === 'function'
+    ? _normalizeChatUseSelection(useSelection)
+    : null;
   q.push({
     id: `q${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
     content,
-    skill: skill || '',
+    use: use || null,
+    skill: use && use.kind === 'skill' ? (use.name || use.id || '') : '',
+    direct: !!(opts && opts.direct),
+    ...(extra ? { extra } : {}),
   });
   _saveQueueToStorage(cid);
   _updateConvSidebarBadge(cid);
@@ -103,15 +121,17 @@ function _dispatchNextQueued(cid) {
   _saveQueueToStorage(cid);
   _updateConvSidebarBadge(cid);
   renderMessageQueue(cid);
-  // Skill is an inline text prefix (applied at dispatch time so later skill
-  // changes take effect). Agent runs are just "run <name>" text — no flag.
+  // Skill / connector is an inline text prefix (applied at dispatch time so
+  // later selection changes take effect). Agent runs are just "run <name>"
+  // text — no flag.
   // Recipient prefix (`@<agent>`) is also applied at dispatch time so the
   // message routes to whoever is currently selected in the chip.
-  const withSkill = next.skill ? transformWithSkill(next.content, next.skill) : next.content;
-  const content = applyRecipientPrefix(withSkill, 'conversation');
+  const use = _queueItemUseSelection(next);
+  const withUse = use ? transformWithChatUse(next.content, use) : next.content;
+  const content = next.direct ? next.content : applyRecipientPrefix(withUse, 'conversation');
   // Fire-and-forget: sendInCurrentConversation handles its own errors via
   // _streamingSetError + _finishStreamingMsg (which will re-enter this fn).
-  sendInCurrentConversation(content);
+  sendInCurrentConversation(content, next.extra);
 }
 
 function renderMessageQueue(cid) {
@@ -129,13 +149,14 @@ function renderMessageQueue(cid) {
   panel.style.display = '';
   if (countEl) countEl.textContent = String(q.length);
   list.innerHTML = q.map(item => {
-    const skillChip = item.skill
-      ? `<span class="chat-queue-skill">${escapeHtml(item.skill)}</span>` : '';
+    const use = _queueItemUseSelection(item);
+    const useChip = use
+      ? `<span class="chat-queue-skill">${escapeHtml(formatChatUseLabel(use))}</span>` : '';
     const preview = escapeHtml((item.content || '').replace(/\s+/g, ' ')).slice(0, 200);
     return `
       <div class="chat-queue-item" draggable="true" data-qid="${item.id}">
         <div class="chat-queue-drag" title="${escapeHtml(t('chat.queue_drag_title'))}">⋮⋮</div>
-        <div class="chat-queue-text">${skillChip}${preview}</div>
+        <div class="chat-queue-text">${useChip}${preview}</div>
         <div class="chat-queue-actions">
           <button class="chat-queue-btn" data-act="edit">${escapeHtml(t('chat.queue_edit'))}</button>
           <button class="chat-queue-btn danger" data-act="del">×</button>
@@ -243,8 +264,8 @@ function _startQueueItemEdit(cid, row) {
 // ─── Input draft persistence (per-conversation) ───
 //
 // Typed-but-unsent text is bound to the conversation id and survives tab
-// switches, panel navigation, and reloads. The selected skill chip for the
-// conversation input is persisted alongside so it's restored too.
+// switches, panel navigation, and reloads. The selected skill / connector
+// chip for the conversation input is persisted alongside so it's restored too.
 
 let _draftSaveTimer = null;
 
@@ -254,10 +275,14 @@ function _saveDraft(cid) {
   _draftSaveTimer = setTimeout(() => {
     const input = document.getElementById('chat-input');
     const text = input ? input.value : '';
-    const skill = _chatSkill['conversation'] || '';
+    const use = getChatUseSelection('conversation');
     try {
-      if (text || skill) {
-        localStorage.setItem(_DRAFT_KEY(cid), JSON.stringify({ text, skill }));
+      if (text || use) {
+        localStorage.setItem(_DRAFT_KEY(cid), JSON.stringify({
+          text,
+          use,
+          skill: use && use.kind === 'skill' ? (use.name || use.id || '') : '',
+        }));
       } else {
         localStorage.removeItem(_DRAFT_KEY(cid));
       }
@@ -280,10 +305,13 @@ function _restoreDraft(cid) {
     data = raw ? JSON.parse(raw) : null;
   } catch (_) {}
   const text = (data && typeof data.text === 'string') ? data.text : '';
-  const skill = (data && typeof data.skill === 'string') ? data.skill : '';
+  const use = data && data.use
+    ? data.use
+    : ((data && typeof data.skill === 'string' && data.skill)
+      ? { kind: 'skill', id: data.skill, name: data.skill }
+      : null);
   input.value = text;
   autoGrow(input, 200);
-  // Apply or clear the skill chip without re-persisting the draft (no input event fires).
-  setChatSkill('conversation', skill);
+  // Apply or clear the chip without re-persisting the draft (no input event fires).
+  setChatUseSelection('conversation', use);
 }
-

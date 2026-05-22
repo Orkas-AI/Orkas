@@ -253,11 +253,27 @@ async function _mpInitReconcileWatch() {
       // switch tabs. Force re-fetch (loadAgents(true) / loadSkills(true)) bypasses the renderer
       // module-level lists cache; the marketplace listed-state hydrates from those.
       if (status.state === 'done' && prevState === 'running' && status.pulled > 0) {
-        try { if (typeof loadAgents === 'function') loadAgents(true); } catch { /* ignore */ }
-        try { if (typeof loadSkills === 'function') loadSkills(true); } catch { /* ignore */ }
-        // If marketplace panel is open right now, also re-run the install-state hydration
-        // so card buttons flip from Install to Installed without a tab switch.
-        if (isMarketplaceOpen()) _mpLoadAll();
+        Promise.resolve().then(async () => {
+          try {
+            if (typeof refreshAgentsAfterMarketplaceReconcile === 'function') {
+              await refreshAgentsAfterMarketplaceReconcile();
+            } else if (typeof loadAgents === 'function') {
+              await loadAgents(true);
+            }
+          } catch { /* ignore */ }
+          try {
+            if (typeof refreshSkillsAfterMarketplaceReconcile === 'function') {
+              await refreshSkillsAfterMarketplaceReconcile();
+            } else if (typeof loadSkills === 'function') {
+              await loadSkills(true);
+            }
+          } catch { /* ignore */ }
+          // If marketplace panel is open right now, also re-run the install-state hydration
+          // so card buttons flip from Install to Installed without a tab switch.
+          if (isMarketplaceOpen()) {
+            try { await _mpLoadAll(); } catch { /* ignore */ }
+          }
+        }).catch(() => { /* ignore */ });
       }
     });
   } catch { /* push channel not allowed (shouldn't happen) — silently degrade to no banner */ }
@@ -367,6 +383,7 @@ async function _mpLoadAll() {
     _mpState.installedSkillIds = new Set(((instSkills && instSkills.skills) || []).map((s) => s.id));
     _mpPersistInstalled();
     await _mpLoadListings();
+    await _mpRefreshOpenDetailFromListings();
   } catch (err) {
     // A failed refresh must NOT wipe what's already on screen — surface as a body-level error
     // only when the visible tab has nothing to show; otherwise log + keep the stale view.
@@ -380,6 +397,24 @@ async function _mpLoadAll() {
 
 function _mpPersistCategoriesCache(list) {
   try { localStorage.setItem(MP_CATEGORIES_LS_KEY, JSON.stringify(list)); } catch { /* ignore */ }
+}
+
+async function _mpRefreshOpenDetailFromListings() {
+  if (!_mpState || _mpState.view !== 'detail' || !_mpState.detailKind || !_mpState.detailItem) return;
+  const kind = _mpState.detailKind;
+  const list = kind === 'agent' ? _mpState.agents : _mpState.skills;
+  const fresh = list.find((x) => x.id === _mpState.detailItem.id);
+  if (!fresh) return;
+  const prev = _mpState.detailItem;
+  const changed = prev.version !== fresh.version
+    || prev.published_at !== fresh.published_at
+    || prev.updated_at !== fresh.updated_at;
+  if (!changed) {
+    _mpState.detailItem = { ...prev, ...fresh };
+    _mpRenderDetail();
+    return;
+  }
+  await _mpOpenDetail(kind, fresh, { preserveSkillState: true });
 }
 
 // Module-load: kick off the reconcile-status watch so the banner in `agents-grid-view` /
@@ -736,34 +771,43 @@ function _mpCategoryLabel(code, lang) {
 }
 
 // ─── Detail view rendering ───
-async function _mpOpenDetail(kind, item) {
+async function _mpOpenDetail(kind, item, opts = {}) {
+  const prevSelected = opts.preserveSkillState ? (_mpState.detailSkillSelected || 'SKILL.md') : 'SKILL.md';
+  const prevSourceOpen = opts.preserveSkillState ? !!_mpState.detailSkillSourceOpen : false;
   _mpState.detailKind = kind;
   _mpState.detailItem = item;
   _mpState.detailLoading = true;
   _mpState.detailError = '';
   _mpState.detailAgentJson = null;
   _mpState.detailSkillFiles = [];
-  _mpState.detailSkillSelected = 'SKILL.md';
+  _mpState.detailSkillSelected = prevSelected;
   _mpState.detailSkillFileText = '';
+  _mpState.detailSkillSourceOpen = prevSourceOpen;
   _mpShowDetailView();
   _mpRenderDetail();
 
   try {
     if (kind === 'agent') {
       const detail = await window.orkas.invoke('marketplace.detailAgent', {
-        id: item.id, version: item.version, published_at: item.published_at,
+        id: item.id, version: item.version,
+        published_at: item.published_at, updated_at: item.updated_at,
       });
       if (!detail || detail.ok === false) throw new Error((detail && detail.error) || 'detail failed');
       _mpState.detailAgentJson = detail.agent_json;
     } else {
       const detail = await window.orkas.invoke('marketplace.detailSkill', {
-        id: item.id, version: item.version, published_at: item.published_at,
+        id: item.id, version: item.version,
+        published_at: item.published_at, updated_at: item.updated_at,
       });
       if (!detail || detail.ok === false) throw new Error((detail && detail.error) || 'detail failed');
       const files = await window.orkas.invoke('marketplace.cacheSkillFiles', { id: item.id });
       _mpState.detailSkillFiles = (files && files.list) || [];
-      if (_mpState.detailSkillFiles.find((f) => f.path === 'SKILL.md')) {
-        const r = await window.orkas.invoke('marketplace.cacheSkillRead', { id: item.id, file: 'SKILL.md' });
+      const selected = _mpState.detailSkillFiles.find((f) => f.path === _mpState.detailSkillSelected)
+        ? _mpState.detailSkillSelected
+        : 'SKILL.md';
+      _mpState.detailSkillSelected = selected;
+      if (_mpState.detailSkillFiles.find((f) => f.path === selected)) {
+        const r = await window.orkas.invoke('marketplace.cacheSkillRead', { id: item.id, file: selected });
         _mpState.detailSkillFileText = (r && r.content) || '';
       }
     }
@@ -992,7 +1036,8 @@ async function _mpInstall(kind, id) {
   try {
     const channel = kind === 'agent' ? 'marketplace.installAgent' : 'marketplace.installSkill';
     const r = await window.orkas.invoke(channel, {
-      id, version: item.version, published_at: item.published_at,
+      id, version: item.version,
+      published_at: item.published_at, updated_at: item.updated_at,
     });
     if (!r || r.ok === false) throw new Error((r && r.error) || 'install failed');
     if (kind === 'agent') _mpState.installedAgentIds.add(id);

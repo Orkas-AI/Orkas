@@ -140,6 +140,18 @@ function _refreshConversationInfo(cid) {
   }
 }
 
+function _beginConversationRecoveryStream(cid) {
+  const runtime = window.ConversationRuntime;
+  if (!runtime || typeof runtime.observePlanRecoveryRun !== 'function') return null;
+  try { return runtime.observePlanRecoveryRun(cid); }
+  catch (_) { return null; }
+}
+
+function _cancelConversationRecoveryStream(handle) {
+  try { if (handle && typeof handle.cancel === 'function') handle.cancel(); }
+  catch (_) {}
+}
+
 async function _postStepAction(cid, stepIndex, action) {
   const res = await apiFetch(
     `/api/conversations/${encodeURIComponent(cid)}/plan/steps/${stepIndex}/${action}`,
@@ -188,7 +200,7 @@ function _buildStepHtml(step) {
   const actions = _isStepActionable(step, _currentInFlight) && !actionRequested
     ? `<div class="plan-rail-step-actions">
          <button type="button" class="btn btn-sm" data-action="retry" data-i18n="plan.action.retry">${escapeHtml(t('plan.action.retry'))}</button>
-         <button type="button" class="btn btn-sm" data-action="skip"  data-i18n="plan.action.skip">${escapeHtml(t('plan.action.skip')  || 'Skip')}</button>
+         <button type="button" class="btn btn-sm" data-action="skip"  data-i18n="plan.action.skip">${escapeHtml(t('plan.action.skip'))}</button>
          <button type="button" class="btn btn-sm btn-danger" data-action="abort" data-i18n="plan.action.abort">${escapeHtml(t('plan.action.abort'))}</button>
        </div>`
     : '';
@@ -366,14 +378,21 @@ document.addEventListener('click', async (ev) => {
           transient_attempts: 0,
         },
       });
+      const recoveryStream = _beginConversationRecoveryStream(cid);
+      let recoveryStarted = false;
       try {
         const data = await _postStepAction(cid, stepIndex, 'retry');
         if (!data?.ok) {
           _alertStepActionFailure('retry', data?.error);
+          _cancelConversationRecoveryStream(recoveryStream);
+        } else {
+          recoveryStarted = true;
         }
       } catch (err) {
+        _cancelConversationRecoveryStream(recoveryStream);
         _alertStepActionFailure('retry', err && err.message);
       } finally {
+        if (!recoveryStarted) _cancelConversationRecoveryStream(recoveryStream);
         await _finishStepAction(cid, stepIndex, { refreshInfo: true, clearAfterRefresh: true });
       }
       return;
@@ -385,16 +404,22 @@ document.addEventListener('click', async (ev) => {
         await _finishStepAction(cid, stepIndex, { rerender: true });
         return;
       }
+      const recoveryStream = _beginConversationRecoveryStream(cid);
+      let recoveryStarted = false;
       try {
         const data = await _postStepAction(cid, stepIndex, 'skip');
         if (!data?.ok) {
           _alertStepActionFailure('skip', data?.error);
+          _cancelConversationRecoveryStream(recoveryStream);
         } else {
+          recoveryStarted = true;
           _applyOptimisticStepStatus(cid, stepIndex, 'skipped');
         }
       } catch (err) {
+        _cancelConversationRecoveryStream(recoveryStream);
         _alertStepActionFailure('skip', err && err.message);
       } finally {
+        if (!recoveryStarted) _cancelConversationRecoveryStream(recoveryStream);
         await _finishStepAction(cid, stepIndex, { refreshInfo: true, clearAfterRefresh: true });
       }
       return;

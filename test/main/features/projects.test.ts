@@ -308,6 +308,31 @@ describe('projects › bindings CRUD', () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toBe('not_found');
   });
+
+  it('prunes bindings whose agent or skill no longer exists', async () => {
+    const projects = await loadProjects();
+    const p = await projects.createProject(TEST_UID, 'PruneBindings');
+    if (!p.ok) throw new Error('precondition');
+    const pid = p.project.project_id;
+
+    await projects.addAgentBinding(TEST_UID, pid, 'agent-live');
+    await projects.addAgentBinding(TEST_UID, pid, 'agent-gone');
+    await projects.addSkillBinding(TEST_UID, pid, 'skill-live');
+    await projects.addSkillBinding(TEST_UID, pid, 'skill-gone');
+
+    const res = await projects.pruneBindings(TEST_UID, pid, {
+      agents: new Set(['agent-live']),
+      skills: new Set(['skill-live']),
+    });
+
+    expect(res.ok).toBe(true);
+    if (res.ok) {
+      expect(res.bindings).toEqual({ agents: ['agent-live'], skills: ['skill-live'] });
+      expect(res.pruned).toEqual({ agents: ['agent-gone'], skills: ['skill-gone'] });
+    }
+    expect(await projects.getBindings(TEST_UID, pid))
+      .toEqual({ agents: ['agent-live'], skills: ['skill-live'] });
+  });
 });
 
 describe('projects › resolveProjectScope', () => {

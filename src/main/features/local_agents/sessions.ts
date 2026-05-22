@@ -2,9 +2,11 @@
  * Per-conversation CLI session bindings.
  *
  * Each (cid, aid, cli) tuple gets a CLI-reported session id so the
- * next dispatch can pass `--resume <id>` instead of re-replaying the
- * full visibility slice as prompt context. The CLI keeps its own
- * conversation memory; we only persist the handle.
+ * next dispatch can pass `--resume <id>`. The CLI keeps its own
+ * conversation memory; we only persist the handle. Host prompts stay
+ * current-turn-only while this handle is valid; if the handle is absent
+ * after prior visible turns (for example cwd changed), group_chat may
+ * bridge that transcript once into the fresh CLI session.
  *
  * Storage: `<uid>/local/cli-sessions/<cid>.json`, shape:
  *   { "<aid>": { "cli": "claude", "sessionId": "...", "updatedAt": "..." } }
@@ -15,7 +17,7 @@
  *
  * `cli` is captured alongside the id so a runtime swap (the user
  * picks a different CLI from the detail page selector) treats the
- * old binding as stale — fresh dispatch, fresh prompt. The runner
+ * old binding as stale — fresh dispatch, fresh CLI session. The runner
  * persists a new id once the new CLI emits one.
  */
 
@@ -63,8 +65,7 @@ async function write(uid: string, cid: string, data: CliSessionsFile): Promise<v
 /**
  * Return the bound CLI session id for the (cid, aid, cli) tuple, or
  * null if no binding exists OR the binding is for a different CLI
- * (runtime swapped). Caller treats null as "fresh dispatch — replay
- * the visibility slice".
+ * (runtime swapped). Caller treats null as a fresh CLI session.
  */
 export async function getSessionId(uid: string, cid: string, aid: string, cli: string): Promise<string | null> {
   const file = await read(uid, cid);

@@ -127,8 +127,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     // grey out the input + show a banner without making a second IPC round trip.
     // True for unbound (no agent_id) — input always allowed there.
     const agent_enabled = conv.agent_id ? isAgentEnabled(ctx.userId, conv.agent_id) : true;
+    const runtime = await groupChat.runtimeStatus(ctx.userId, cid);
     return {
-      conversation: { ...conv, agent_enabled },
+      conversation: { ...conv, ...runtime, agent_enabled },
       history: await chats.getMessages(ctx.userId, cid, limit),
     };
   },
@@ -198,20 +199,24 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // ── Project bindings (the strict scope of agents/skills visible inside
   // a project conversation; see CLAUDE.md §6 outer-intersection rule) ──
   // `bindings.list` returns the bound ids JOINED with name/description so
-  // the renderer can paint the detail page in one round-trip; unknown ids
-  // (referent deleted) are filtered out of the joined view but kept in the
-  // raw `agents` / `skills` arrays so the user can see + clean up stale
-  // bindings.
+  // the renderer can paint the detail page in one round-trip. Unknown ids
+  // (referent deleted) are pruned here so stale bindings never become user
+  // cleanup work.
   'projects.bindings.list': async ({ projectId }, ctx) => {
     if (!safeId(projectId)) throw new Error('invalid projectId');
     if (!await projects.projectExists(ctx.userId, projectId)) throw new Error('not_found');
-    const bindings = await projects.getBindings(ctx.userId, projectId);
     const [agentList, skillList] = await Promise.all([
       agents.listAgents(),
       skills.listSkills(),
     ]);
     const agentById = new Map(agentList.map((a: any) => [a.agent_id, a]));
     const skillById = new Map(skillList.map((s: any) => [s.id, s]));
+    const pruned = await projects.pruneBindings(ctx.userId, projectId, {
+      agents: new Set(agentList.map((a: any) => a.agent_id)),
+      skills: new Set(skillList.map((s: any) => s.id)),
+    });
+    if (!pruned.ok) throw new Error((pruned as { error: string }).error);
+    const bindings = pruned.bindings;
     return {
       bindings,
       agentDetails: bindings.agents
@@ -338,6 +343,11 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'groupChat.readPlan': async ({ cid }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
     return groupChat.readPlanForCid(ctx.userId, cid);
+  },
+
+  'groupChat.runtimeStatus': async ({ cid }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return groupChat.runtimeStatus(ctx.userId, cid);
   },
 
   'groupChat.retryStep': async ({ cid, stepIndex }, ctx) => {
@@ -487,8 +497,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { agent };
   },
 
-  'agents.create': async ({ name = '', description = '', description_zh, description_en, workflow = '', icon, color, runtime, category } = {}) => {
-    return { agent: await agents.createCustomAgent({ name, description, description_zh, description_en, workflow, icon, color, runtime, category }) };
+  'agents.create': async ({ name = '', description = '', description_zh, description_en, workflow = '', icon, color, runtime, category, output_format } = {}) => {
+    return { agent: await agents.createCustomAgent({ name, description, description_zh, description_en, workflow, icon, color, runtime, category, output_format }) };
   },
 
 
@@ -513,6 +523,21 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (typeof enabled !== 'boolean') throw new Error('enabled must be boolean');
     agents.setAgentEnabledForActiveUser(agent_id, enabled);
     return { ok: true, enabled };
+  },
+
+  'agents.cliProjectDir.get': async ({ agent_id }, ctx) => {
+    if (!agents.isValidAgentId(agent_id)) throw new Error('invalid agent_id');
+    const info = await agents.getAgentCliProjectDirInfo(ctx.userId, agent_id);
+    if (!info) throw new Error('agent not found');
+    return { info };
+  },
+
+  'agents.cliProjectDir.set': async ({ agent_id, path: dirPath = '' }, ctx) => {
+    if (!agents.isValidAgentId(agent_id)) throw new Error('invalid agent_id');
+    if (typeof dirPath !== 'string') throw new Error('path must be string');
+    const info = await agents.setAgentCliProjectDir(ctx.userId, agent_id, dirPath);
+    if (!info) throw new Error('agent not found');
+    return { info };
   },
 
   'agents.chat.history': async ({ agent_id, limit = 500 }, ctx) => {
@@ -646,38 +671,50 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'marketplace.listSkills': async (opts = {}) => marketplace.listMarketplaceSkills(opts),
 
   // Detail endpoints (cache-first) — used by the marketplace panel's detail view to render
-  // full content. Caller passes the list-row's (version, published_at) so we can short-circuit
+  // full content. Caller passes the list-row's (version, freshness timestamp) so we can short-circuit
   // on a hot cache. Sweep is invoked once per openMarketplace at the entry point.
-  'marketplace.detailAgent': async ({ id, version, published_at }) => {
+  'marketplace.detailAgent': async ({ id, version, published_at, updated_at }) => {
     if (!id || typeof id !== 'string') throw new Error('id required');
     if (typeof version !== 'string' || typeof published_at !== 'number') {
       throw new Error('version + published_at required');
     }
-    return marketplace.getAgentDetail(id, { version, published_at });
+    return marketplace.getAgentDetail(id, {
+      version, published_at,
+      ...(typeof updated_at === 'number' ? { updated_at } : {}),
+    });
   },
 
-  'marketplace.detailSkill': async ({ id, version, published_at }) => {
+  'marketplace.detailSkill': async ({ id, version, published_at, updated_at }) => {
     if (!id || typeof id !== 'string') throw new Error('id required');
     if (typeof version !== 'string' || typeof published_at !== 'number') {
       throw new Error('version + published_at required');
     }
-    return marketplace.getSkillDetail(id, { version, published_at });
+    return marketplace.getSkillDetail(id, {
+      version, published_at,
+      ...(typeof updated_at === 'number' ? { updated_at } : {}),
+    });
   },
 
-  'marketplace.installAgent': async ({ id, version, published_at }) => {
+  'marketplace.installAgent': async ({ id, version, published_at, updated_at }) => {
     if (!id || typeof id !== 'string') throw new Error('id required');
     if (typeof version !== 'string' || typeof published_at !== 'number') {
       throw new Error('version + published_at required');
     }
-    return marketplace.installMarketplaceAgent(id, { version, published_at });
+    return marketplace.installMarketplaceAgent(id, {
+      version, published_at,
+      ...(typeof updated_at === 'number' ? { updated_at } : {}),
+    });
   },
 
-  'marketplace.installSkill': async ({ id, version, published_at }) => {
+  'marketplace.installSkill': async ({ id, version, published_at, updated_at }) => {
     if (!id || typeof id !== 'string') throw new Error('id required');
     if (typeof version !== 'string' || typeof published_at !== 'number') {
       throw new Error('version + published_at required');
     }
-    return marketplace.installMarketplaceSkill(id, { version, published_at });
+    return marketplace.installMarketplaceSkill(id, {
+      version, published_at,
+      ...(typeof updated_at === 'number' ? { updated_at } : {}),
+    });
   },
 
   // Uninstall is non-dev: wipes the local install copy + manifest entry. Does NOT touch the
@@ -1071,6 +1108,44 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { ok: true, text, size: st.size };
   },
 
+  // Write a UTF-8 text file into the workspace (or current cid's attachment
+  // dir). Sandbox parity with `produced.readText`: same scope, same 2MB cap on
+  // the resulting bytes — the chat-md drawer is the sole caller today, and
+  // the file's job is "human edits the LLM's md output", so anything larger
+  // belongs in the OS editor (open via reveal).
+  'produced.writeText': async (payload, ctx) => {
+    const target = payload?.path;
+    const content = payload?.content;
+    if (typeof target !== 'string' || !target) {
+      throw new Error('missing path');
+    }
+    if (typeof content !== 'string') {
+      throw new Error('missing content');
+    }
+    const MAX_TEXT_BYTES = 2 * 1024 * 1024;
+    const bytes = Buffer.byteLength(content, 'utf8');
+    if (bytes > MAX_TEXT_BYTES) {
+      return { ok: false, error: 'too_large', size: bytes, cap: MAX_TEXT_BYTES };
+    }
+    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
+    const ws = userWorkspace.getWorkspacePath(ctx.userId, projectId);
+    const norm = path.resolve(target);
+    const wsNorm = path.resolve(ws);
+    const attachmentScope = _attachmentScopeForPayload(ctx.userId, payload);
+    const inAttachment = !!attachmentScope &&
+      (norm === attachmentScope || norm.startsWith(attachmentScope + path.sep));
+    const inWorkspace = norm === wsNorm || norm.startsWith(wsNorm + path.sep);
+    if (!inWorkspace && !inAttachment) {
+      throw new Error('path is outside the user workspace');
+    }
+    try {
+      fs.writeFileSync(norm, content, 'utf8');
+    } catch (err) {
+      return { ok: false, error: String((err as Error).message || 'write failed') };
+    }
+    return { ok: true, size: bytes };
+  },
+
   // Read the install data root (`<container>/data`) — read-only display
   // for the settings page "Data root" row. WS_ROOT is process-stable so
   // no async work is needed.
@@ -1091,6 +1166,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   ...localAgentsHandlers,
 
   // User-account login (Google / Apple OAuth). Stripped from the OrkasOpen build.
+
+  // User feedback from Settings. Depends on the account session for Server auth.
 
   // Multi-device sync. Stripped from the OrkasOpen build (depends on account).
 
@@ -1155,22 +1232,12 @@ const streamHandlers: Record<string, StreamHandler> = {
         yield { type: 'error', text: sendRes.error || 'send failed' };
         return;
       }
-      let sawWorkActivity = false;
       drainLoop: while (!cancelled) {
         while (buf.length) {
           const ev = buf.shift()!;
-          if (ev.type === 'state_changed') {
-            const st = (ev as any).state;
-            if (st && st.status === 'running') sawWorkActivity = true;
-            if (sawWorkActivity && st && st.status !== 'running'
-                && (!st.in_flight || st.in_flight.length === 0)
-                && groupChat.busIsQuiescent(ctx.userId, cid)) {
-              yield { type: 'event', event: { stream: 'group', data: ev } };
-              break drainLoop;
-            }
-          }
           yield { type: 'event', event: { stream: 'group', data: ev } };
         }
+        if (groupChat.busIsQuiescent(ctx.userId, cid)) break drainLoop;
         if (cancelled) break;
         await new Promise<void>((resolve) => { wake = resolve; });
       }
@@ -1180,9 +1247,50 @@ const streamHandlers: Record<string, StreamHandler> = {
     }
   },
 
-  'groupChat.events': async function* ({ cid }, ctx, signal) {
+  'groupChat.events': async function* ({ cid, untilIdle }, ctx, signal) {
     if (!safeId(cid)) {
       yield { type: 'error', text: 'invalid cid' };
+      return;
+    }
+    if (untilIdle) {
+      const buf: GroupEvent[] = [];
+      let wake: (() => void) | null = null;
+      let cancelled = signal.aborted;
+      let sawWorkActivity = !groupChat.busIsQuiescent(ctx.userId, cid);
+      const onAbort = () => { cancelled = true; const w = wake; wake = null; w?.(); };
+      if (!cancelled) signal.addEventListener('abort', onAbort, { once: true });
+      const unsub = groupChat.subscribeBus(ctx.userId, cid, (ev) => {
+        buf.push(ev);
+        const w = wake; wake = null; w?.();
+      });
+      try {
+        while (!cancelled) {
+          while (buf.length) {
+            const ev = buf.shift()!;
+            if (ev.type === 'process') sawWorkActivity = true;
+            if (ev.type === 'artifact_created') sawWorkActivity = true;
+            if (ev.type === 'message') {
+              const msg = (ev as any).msg;
+              if (msg && msg.from !== 'user') sawWorkActivity = true;
+            }
+            if (ev.type === 'state_changed') {
+              const st = ev.state;
+              const inFlight = Array.isArray(st?.in_flight) ? st.in_flight : [];
+              if (st?.status === 'running' || inFlight.length > 0 || !groupChat.busIsQuiescent(ctx.userId, cid)) {
+                sawWorkActivity = true;
+              }
+            }
+            yield ev;
+            if (sawWorkActivity && groupChat.busIsQuiescent(ctx.userId, cid)) return;
+          }
+          if (sawWorkActivity && groupChat.busIsQuiescent(ctx.userId, cid)) return;
+          if (cancelled) break;
+          await new Promise<void>((resolve) => { wake = resolve; });
+        }
+      } finally {
+        try { unsub(); } catch { /* ignore */ }
+        try { signal.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
+      }
       return;
     }
     for await (const ev of groupChat.streamEvents(ctx.userId, cid, { abortSignal: signal })) {

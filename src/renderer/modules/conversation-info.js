@@ -328,7 +328,6 @@ const ConversationInfo = (() => {
     const dirHtml = dirs.map(([name, child]) => `
       <details class="conversation-info-dir" style="--depth:${depth}" open>
         <summary class="conversation-info-dir-summary">
-          <span class="conversation-info-dir-icon">▸</span>
           <span class="conversation-info-dir-folder-icon conversation-info-dir-folder-closed">${_uiIcon('folder', 'ui-icon conversation-info-dir-svg-icon')}</span>
           <span class="conversation-info-dir-folder-icon conversation-info-dir-folder-open">${_uiIcon('folder-open', 'ui-icon conversation-info-dir-svg-icon')}</span>
           <span class="conversation-info-dir-name">${escapeHtml(name)}</span>

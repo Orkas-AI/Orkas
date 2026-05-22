@@ -67,15 +67,42 @@ function startPolling(cid) {
       const res = await apiFetch(`/api/conversations/${cid}/history?limit=500`);
       const data = await res.json();
       if (!data.ok || !data.history) return;
-      const msgs = data.history;
+      const msgs = data.history.filter((m) => !(m && m.dispatch));
       const last = msgs[msgs.length - 1];
       const known = pollMsgCounts.get(cid) || 0;
+      const hasServerRuntime = !!data.conversation
+        && Object.prototype.hasOwnProperty.call(data.conversation, 'processing');
+      const runtimeBusy = hasServerRuntime
+        ? data.conversation.processing === true
+        : isGroupConversationBusy(cid);
+      if (runtimeBusy && cid === currentCid && window.PlanRail) {
+        try { window.PlanRail.refresh(cid, { force: true }); } catch (_) {}
+      }
 
       if (msgs.length > known && _isPolledAssistantMsg(last)) {
-        // New assistant message arrived
+        // New visible assistant message arrived. During plan execution this
+        // may be a mid-turn announcement while other actors are still
+        // running; reloading history then detaches live placeholders and
+        // makes bubbles flash. Treat polling as rescue only once runtime is
+        // idle; the live stream owns in-flight DOM updates.
+        if (runtimeBusy) {
+          const recovered = await window.ConversationRuntime?.recoverPolledMessages?.(cid, msgs);
+          if (recovered) pollMsgCounts.set(cid, msgs.length);
+          return;
+        }
         pollMsgCounts.set(cid, msgs.length);
         stopPolling(cid);
-        _onPolledResponse(cid, last.text);
+        _onPolledResponse(cid, last);
+        return;
+      }
+
+      // Local busy state can outlive the IPC stream if the renderer missed the
+      // terminal state_changed event. Once main says runtime is idle, use the
+      // persisted last assistant message to settle any leftover placeholder.
+      if (!runtimeBusy && isConvPending(cid) && _isPolledAssistantMsg(last)) {
+        pollMsgCounts.set(cid, msgs.length);
+        stopPolling(cid);
+        _onPolledResponse(cid, last);
         return;
       }
 
@@ -107,7 +134,11 @@ function stopPolling(cid) {
   if (t) { clearInterval(t); pollTimers.delete(cid); }
 }
 
-function _onPolledResponse(cid, content, isError = false) {
+function _onPolledResponse(cid, contentOrMessage, isError = false) {
+  const polledMessage = contentOrMessage && typeof contentOrMessage === 'object'
+    ? contentOrMessage
+    : null;
+  const content = polledMessage ? (polledMessage.text || '') : contentOrMessage;
   const state = pendingConvs.get(cid);
   pendingConvs.delete(cid);
   setGroupConversationBusy(cid, false);
@@ -129,7 +160,25 @@ function _onPolledResponse(cid, content, isError = false) {
       && finalEl.style.display !== 'none'
       && (finalEl.textContent || '').trim().length > 0;
     if (alreadyFinalized) {
-      // Stream already finalized this bubble in place — leave it alone.
+      // Stream already finalized this bubble in place. Leave it alone only
+      // when polling is reporting the same persisted message. If polling saw a
+      // later assistant record (common for plan-generated user forms emitted
+      // right after the commander's plan card), reload history so sidecar
+      // fields like `form` are mounted instead of silently disappearing.
+      const finalizedId = el.dataset.msgId || '';
+      const polledId = polledMessage?.id || '';
+      const sidecarMissing = !!polledMessage && (
+        (polledMessage.form && !el.querySelector('.chat-input-form'))
+        || (Array.isArray(polledMessage.produced) && polledMessage.produced.length && !el.querySelector('.chat-msg-produced'))
+        || (polledMessage.plan_announcement && !el.querySelector('.chat-plan-announce'))
+      );
+      if (polledId && (finalizedId !== polledId || sidecarMissing)) {
+        if (cid === currentCid) {
+          loadConversationHistory(cid);
+          _updateConvSendUI(cid);
+        }
+        return;
+      }
       if (cid === currentCid) _updateConvSendUI(cid);
       return;
     }

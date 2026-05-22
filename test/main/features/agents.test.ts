@@ -53,13 +53,14 @@ function builtinAgentsDir(): string {
 }
 
 function writeCustomAgent(agentId: string, fields: Partial<Record<string, any>> = {}): void {
-  // Agent 目录形态:`agents/<aid>/agent.json`(详见 docs/plans/agent-as-directory.md)
+  // Agent directory shape: `agents/<aid>/agent.json` (see docs/plans/agent-as-directory.md).
   const dir = path.join(customAgentsDir(), agentId);
   fs.mkdirSync(dir, { recursive: true });
   const data: Record<string, any> = {
     agent_id: agentId,
     name: fields.name ?? agentId,
     description: fields.description ?? 'Test agent',
+    category: fields.category ?? 'general',
     workflow: fields.workflow ?? '',
     created_at: '2026-04-18T10:00:00',
     updated_at: '2026-04-18T10:00:00',
@@ -73,10 +74,10 @@ function customSkillsDir(): string {
   return path.join(tmpDir, TEST_UID, 'cloud', 'skills');
 }
 
-function writeSkillOnDisk(id: string): void {
+function writeSkillOnDisk(id: string, name = id): void {
   const dir = path.join(customSkillsDir(), id);
   fs.mkdirSync(dir, { recursive: true });
-  const lines = ['---', `name: ${id}`, `description: test skill ${id}`, '---', '', 'body'];
+  const lines = ['---', `name: ${name}`, `description: test skill ${name}`, '---', '', 'body'];
   fs.writeFileSync(path.join(dir, 'SKILL.md'), lines.join('\n'));
 }
 
@@ -227,6 +228,73 @@ describe('agents › normalizeAgent', () => {
   });
 });
 
+describe('agents › CLI project directory settings', () => {
+  it('defaults coding agents to workspace and stores custom dirs in local config only', async () => {
+    writeCustomAgent('code-agent', {
+      name: 'Code Agent',
+      runtime: { kind: 'cli', cli: 'codex' },
+    } as any);
+    const a = await loadAgents();
+    const userWorkspace = await import('../../../src/main/features/user_workspace');
+    const workspacePath = userWorkspace.getWorkspacePath(TEST_UID);
+
+    const initial = await a.getAgentCliProjectDirInfo(TEST_UID, 'code-agent');
+    expect(initial).toMatchObject({
+      agent_id: 'code-agent',
+      is_coding: true,
+      mode: 'workspace',
+      path: workspacePath,
+      effective_path: workspacePath,
+      exists: true,
+    });
+
+    const customDir = path.join(tmpDir, 'repo');
+    fs.mkdirSync(customDir);
+    const custom = await a.setAgentCliProjectDir(TEST_UID, 'code-agent', customDir);
+    expect(custom).toMatchObject({
+      mode: 'custom',
+      path: customDir,
+      effective_path: customDir,
+      custom_path: customDir,
+      exists: true,
+    });
+
+    const spec = JSON.parse(fs.readFileSync(path.join(customAgentsDir(), 'code-agent', 'agent.json'), 'utf8'));
+    expect(JSON.stringify(spec)).not.toContain(customDir);
+    const localConfig = path.join(tmpDir, TEST_UID, 'local', 'config', 'agent-runtime.json');
+    expect(JSON.parse(fs.readFileSync(localConfig, 'utf8')).project_dirs['code-agent'].path).toBe(customDir);
+
+    fs.rmSync(customDir, { recursive: true, force: true });
+    const missing = await a.getAgentCliProjectDirInfo(TEST_UID, 'code-agent');
+    expect(missing).toMatchObject({
+      mode: 'custom',
+      path: customDir,
+      effective_path: workspacePath,
+      exists: false,
+    });
+
+    const reset = await a.setAgentCliProjectDir(TEST_UID, 'code-agent', '');
+    expect(reset).toMatchObject({
+      mode: 'workspace',
+      path: workspacePath,
+      effective_path: workspacePath,
+      exists: true,
+    });
+  });
+
+  it('rejects project directory overrides on non-coding CLI agents', async () => {
+    writeCustomAgent('general-cli', {
+      name: 'General CLI',
+      runtime: { kind: 'cli', cli: 'openclaw' },
+    } as any);
+    const a = await loadAgents();
+    const customDir = path.join(tmpDir, 'repo');
+    fs.mkdirSync(customDir);
+    await expect(a.setAgentCliProjectDir(TEST_UID, 'general-cli', customDir))
+      .rejects.toMatchObject({ code: 'E_AGENT_NOT_CODING_CLI' });
+  });
+});
+
 describe('agents › isValidAgentId', () => {
   it('accepts alphanumeric + _/-', async () => {
     const a = await loadAgents();
@@ -325,6 +393,59 @@ describe('agents › extractAgentFieldBlocks', () => {
     expect(r.blocks[1].workflow).toBe('good-B');
   });
 
+  it('ignores non-XML fenced protocol examples and extracts the real container after them', async () => {
+    const a = await loadAgents();
+    const text = [
+      'Format example:',
+      '```',
+      '<agent>',
+      '<name>Example</name>',
+      '</agent>',
+      '```',
+      'Now the actual update:',
+      '<agent>',
+      '<name>Real</name>',
+      '<workflow>step `bash`</workflow>',
+      '</agent>',
+      'done',
+    ].join('\n');
+    const r = a.extractAgentFieldBlocks(text);
+    expect(r.blocks).toHaveLength(1);
+    expect(r.blocks[0]).toEqual({ name: 'Real', workflow: 'step `bash`' });
+    expect(r.cleanText).toContain('<name>Example</name>');
+    expect(r.cleanText).not.toContain('<name>Real</name>');
+  });
+
+  it('treats fenced ```xml agent blocks as structural output', async () => {
+    const a = await loadAgents();
+    const text = [
+      '```xml',
+      '<agent>',
+      '<name>Example</name>',
+      '<workflow>step one</workflow>',
+      '</agent>',
+      '```',
+    ].join('\n');
+    const r = a.extractAgentFieldBlocks(text);
+    expect(r.blocks).toEqual([{ name: 'Example', workflow: 'step one' }]);
+    expect(r.cleanText).toBe('```xml\n\n```');
+  });
+
+  it('leaves inline quoted agent markers visible', async () => {
+    const a = await loadAgents();
+    const text = '请输出 "<agent><name>Example</name></agent>" 这些字符';
+    const r = a.extractAgentFieldBlocks(text);
+    expect(r.blocks).toEqual([]);
+    expect(r.cleanText).toBe(text);
+  });
+
+  it('strips an unclosed real <agent> block without extracting partial fields', async () => {
+    const a = await loadAgents();
+    const r = a.extractAgentFieldBlocks('visible\n<agent>\n<name>Partial</name>\n<workflow>half');
+    expect(r.blocks).toEqual([]);
+    expect(r.cleanText).toBe('visible');
+  });
+
   it('ignores child tags with empty body', async () => {
     const a = await loadAgents();
     const r = a.extractAgentFieldBlocks('<agent><name>   </name></agent>');
@@ -394,6 +515,16 @@ describe('agents › extractAgentFieldBlocks', () => {
     expect('interactive' in a.extractAgentFieldBlocks('<agent><interactive>yes</interactive></agent>').blocks[0]).toBe(false);
     expect('interactive' in a.extractAgentFieldBlocks('<agent><interactive>1</interactive></agent>').blocks[0]).toBe(false);
     expect('interactive' in a.extractAgentFieldBlocks('<agent><interactive></interactive></agent>').blocks[0]).toBe(false);
+  });
+
+  it('extracts safe category codes and drops unsafe ones', async () => {
+    const a = await loadAgents();
+    expect(a.extractAgentFieldBlocks('<agent><category>DATA</category></agent>')
+      .blocks[0].category).toBe('data');
+    expect(a.extractAgentFieldBlocks('<agent><category>misc</category></agent>')
+      .blocks[0].category).toBe('misc');
+    expect('category' in a.extractAgentFieldBlocks('<agent><category>bad category</category></agent>').blocks[0])
+      .toBe(false);
   });
 });
 
@@ -557,7 +688,7 @@ describe('agents › extractAgentFieldBlocks › inputs', () => {
 describe('agents › createCustomAgent', () => {
   it('creates a 12-hex-id agent with defaults', async () => {
     const a = await loadAgents();
-    const agent = await a.createCustomAgent({ name: 'Alpha', description: 'desc' });
+    const agent = await a.createCustomAgent({ name: 'Alpha', description: 'desc', category: 'general' });
     expect(agent?.agent_id).toMatch(/^[0-9a-f]{12}$/);
     expect(agent?.name).toBe('Alpha');
     expect(agent?.source).toBe('custom');
@@ -567,8 +698,22 @@ describe('agents › createCustomAgent', () => {
 
   it('defaults empty name to the localized "Untitled agent" fallback', async () => {
     const a = await loadAgents();
-    const agent = await a.createCustomAgent({ description: 'desc' });
+    const agent = await a.createCustomAgent({ description: 'desc', category: 'general' });
     expect(agent?.name).toBe('Untitled agent');
+  });
+
+  it('stores workflow skill references by display name', async () => {
+    writeSkillOnDisk('16e1bfcb3426', 'agent-creator');
+    const a = await loadAgents();
+    const agent = await a.createCustomAgent({
+      name: 'Builder',
+      description: 'desc',
+      category: 'rnd',
+      workflow: 'skill: follow the `16e1bfcb3426` skill',
+    });
+    expect(agent?.workflow).toBe('`agent-creator` skill');
+    const file = path.join(customAgentsDir(), agent?.agent_id || '', 'agent.json');
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).workflow).toBe('`agent-creator` skill');
   });
 
   it('rejects reserved names (collide with commander role / sidebar tab)', async () => {
@@ -578,7 +723,29 @@ describe('agents › createCustomAgent', () => {
       await expect(a.createCustomAgent({ name: bad })).rejects.toThrow(/reserved/i);
     }
     // Sanity: the guard doesn't over-reach to nearby strings.
-    await expect(a.createCustomAgent({ name: '副指挥官', description: 'desc' })).resolves.toBeTruthy();
+    await expect(a.createCustomAgent({ name: '副指挥官', description: 'desc', category: 'general' })).resolves.toBeTruthy();
+  });
+});
+
+describe('agents › createAgentFromBlocks', () => {
+  it('backfills the default category when model-authored creates omit it', async () => {
+    const a = await loadAgents();
+    const missing = await a.createAgentFromBlocks({
+      name: 'No Category',
+      description_en: 'desc',
+      workflow: 'Do the work.',
+    });
+    expect(missing?.category).toBe('general');
+
+    const created = await a.createAgentFromBlocks({
+      name: 'Data Agent',
+      description_en: 'desc',
+      workflow: 'Analyze the data.',
+      category: 'data',
+    });
+    expect(created?.category).toBe('data');
+    const file = path.join(customAgentsDir(), created?.agent_id || '', 'agent.json');
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).category).toBe('data');
   });
 });
 
@@ -633,6 +800,17 @@ describe('agents › getAgent', () => {
     expect(agent?.name).toBe('A');
     expect(agent?.source).toBe('custom');
   });
+
+  it('exposes legacy workflow skill ids as display names', async () => {
+    writeSkillOnDisk('16e1bfcb3426', 'agent-creator');
+    writeCustomAgent('abc', {
+      name: 'A',
+      workflow: 'skill: follow the `16e1bfcb3426` skill',
+    });
+    const a = await loadAgents();
+    const agent = await a.getAgent('abc');
+    expect(agent?.workflow).toBe('`agent-creator` skill');
+  });
 });
 
 describe('agents › updateCustomAgent', () => {
@@ -645,6 +823,18 @@ describe('agents › updateCustomAgent', () => {
     expect(updated?.name).toBe('Old');  // preserved
     expect(updated?.description_en).toBe('newDesc');
     expect(updated?.workflow).toBe('wf');  // preserved
+  });
+
+  it('normalizes workflow skill references on update', async () => {
+    writeSkillOnDisk('efb0fe5d9664', 'skill-creator');
+    writeCustomAgent('abc', { name: 'Old', workflow: 'wf' });
+    const a = await loadAgents();
+    const updated = await a.updateCustomAgent('abc', {
+      workflow: 'skill: follow the efb0fe5d9664 skill',
+    });
+    expect(updated?.workflow).toBe('`skill-creator` skill');
+    const file = path.join(customAgentsDir(), 'abc', 'agent.json');
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).workflow).toBe('`skill-creator` skill');
   });
 
   it('backfills empty name to the localized "Untitled agent" fallback', async () => {
@@ -984,9 +1174,10 @@ describe('agents › deleteCustomAgent', () => {
 describe('agents › buildAgentEditSystemPrompt', () => {
   it('substitutes agent fields and drops the removed skills_list placeholder', async () => {
     const a = await loadAgents();
-    const sys = a.buildAgentEditSystemPrompt({
+    const sys = await a.buildAgentEditSystemPrompt({
       name: 'Researcher',
       description: '一句话简介',
+      category: 'rnd',
       workflow: '1. step one\n2. step two',
     });
     expect(sys).toContain('Researcher');
@@ -994,6 +1185,8 @@ describe('agents › buildAgentEditSystemPrompt', () => {
     expect(sys).toContain('step one');
     // Migration check: template no longer carries the redundant skills list.
     expect(sys).not.toContain('$skills_list');
+    expect(sys).not.toContain('$category');
+    expect(sys).not.toContain('$category_field_definition');
     expect(sys).not.toMatch(/##\s*可用的\s*skill/);
     // Not a user-message prefix anymore — no trailing input footer.
     expect(sys).not.toMatch(/##\s*用户的输入/);
@@ -1001,7 +1194,7 @@ describe('agents › buildAgentEditSystemPrompt', () => {
 
   it('falls back to (not provided) when fields are empty', async () => {
     const a = await loadAgents();
-    const sys = a.buildAgentEditSystemPrompt({});
+    const sys = await a.buildAgentEditSystemPrompt({});
     expect(sys).toContain('(not provided)');
   });
 });
@@ -1010,7 +1203,7 @@ describe('agents › list cache invalidation', () => {
   it('picks up newly created agents on next listAgents', async () => {
     const a = await loadAgents();
     expect(await a.listAgents()).toEqual([]);
-    await a.createCustomAgent({ name: 'New', description: 'desc' });
+    await a.createCustomAgent({ name: 'New', description: 'desc', category: 'general' });
     const list = await a.listAgents();
     expect(list).toHaveLength(1);
     expect(list[0].name).toBe('New');
@@ -1018,10 +1211,42 @@ describe('agents › list cache invalidation', () => {
 
   it('reflects updates immediately', async () => {
     const a = await loadAgents();
-    const agent = await a.createCustomAgent({ name: 'V1', description: 'desc' });
+    const agent = await a.createCustomAgent({ name: 'V1', description: 'desc', category: 'general' });
     await a.updateCustomAgent(agent!.agent_id, { name: 'V2' });
     const list = await a.listAgents();
     expect(list[0].name).toBe('V2');
+  });
+
+  it('cache-only invalidator picks up marketplace file rewrites', async () => {
+    const parent = builtinAgentsDir();
+    const dir = path.join(parent, 'platform-agent');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'agent.json'), JSON.stringify({
+      agent_id: 'platform-agent',
+      name: 'Old platform agent',
+      description: '',
+      workflow: '',
+    }));
+    const fixedStamp = new Date('2026-01-01T00:00:00.000Z');
+    fs.utimesSync(parent, fixedStamp, fixedStamp);
+
+    const a = await loadAgents();
+    expect((await a.listAgents()).find((x) => x.agent_id === 'platform-agent')?.name)
+      .toBe('Old platform agent');
+
+    fs.writeFileSync(path.join(dir, 'agent.json'), JSON.stringify({
+      agent_id: 'platform-agent',
+      name: 'New platform agent',
+      description: '',
+      workflow: '',
+    }));
+    fs.utimesSync(parent, fixedStamp, fixedStamp);
+
+    expect((await a.listAgents()).find((x) => x.agent_id === 'platform-agent')?.name)
+      .toBe('Old platform agent');
+    a.clearAgentListCache();
+    expect((await a.listAgents()).find((x) => x.agent_id === 'platform-agent')?.name)
+      .toBe('New platform agent');
   });
 });
 

@@ -12,7 +12,7 @@
 // and edit. `description_zh` + `description_en` are stored side-by-
 // side on the agent so locale switches are zero-cost; `name` is a
 // single brand label (the user can rename to disambiguate two
-// instances of the same CLI bound to different project_dirs).
+// instances of the same CLI bound to different project directories).
 //
 // Detection pre-warms 500ms after script load so the first modal
 // open doesn't pay the cold detection cost.
@@ -63,8 +63,8 @@ function getCliDefaults(cliType) {
 }
 
 /** True when the CLI is one of claude / codex (the coding agents that
- *  expose a project-dir form input). Mirrors `cliSupportsProjectDir`
- *  in features/agents.ts — keep in sync. */
+ *  expose a project-directory setting). Mirrors
+ *  `cliIsCodingAgent` in features/agents.ts — keep in sync. */
 function cliIsCodingAgent(cliType) {
   const d = getCliDefaults(cliType);
   return !!(d && d.isCoding);
@@ -97,7 +97,7 @@ let _extCliSelectApi = null;
  * selected"; detected CLIs follow. `onChange` fires with the chosen
  * `LocalCliType` (string) or null when the user reverts to the "not
  * selected" sentinel — agents.js wires
- * this to the auto-fill / project-dir-row toggling logic.
+ * this to the auto-fill logic.
  *
  * Idempotent: re-mounting just resets options + value so a re-open of
  * the modal picks up newly-installed CLIs.

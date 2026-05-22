@@ -196,13 +196,16 @@ export interface ReconcileCtx {
  *  don't pull a circular import. Bus implements + injects on init. */
 export interface ExecutorBusHooks {
   /** Persist + emit a normal group message; same signature as `bus.enqueue`
-   *  but with one extra optional `triggered_step` knob. */
+   *  but with one extra optional `triggered_step` knob. `attachments` lets
+   *  the executor forward the plan's `initial_attachments` so worker agents
+   *  receive the same image / file bytes the originating user turn carried. */
   enqueue(params: {
     uid: string; cid: string;
     fromActorId: string; text: string;
     forceTo?: string[];
     triggered_step?: number;
     dispatch?: boolean;
+    attachments?: string[];
     form?: ChatFormPayload;
   }): Promise<void>;
   /** Push a turn directly into commander's worker queue without persisting
@@ -303,12 +306,11 @@ function outcomeForSynthTurn(evt: TurnFinishedEvent): TurnOutcome {
 
 /** User-direct (or non-plan) turn outcome decision.
  *
- * Side effect: if this is an agent reply AND there's a `blocked` plan step
- * whose assignee matches this agent (typical post-form-submit case), the
- * step transitions to `done` and downstream is dispatched. This bridges
- * the gap between "form pause" (step blocked) and "agent re-runs after
- * user submits" (which arrives here as trigger=user_direct since the user
- * enqueue triggered the agent worker, not the executor).
+ * Side effect: if this is an agent reply AND there's an active plan step
+ * whose assignee matches this agent, the step transitions through the normal
+ * plan-step completion path and downstream is dispatched. This covers both
+ * form-unblock replies (`blocked`) and commander/manual recovery dispatches
+ * that do not carry a `triggered_step` stamp (`in_progress`).
  *
  * commander empty-final policy: user_direct means the user is actively
  * waiting on commander, so silent is forbidden — even a tool-only turn
@@ -320,18 +322,16 @@ function outcomeForSynthTurn(evt: TurnFinishedEvent): TurnOutcome {
  * agent empty-final → always persist '(no reply)'.
  */
 async function outcomeForUserDirectTurn(uid: string, cid: string, evt: TurnFinishedEvent): Promise<TurnOutcome> {
-  // Form-pause unblock: if this agent has a blocked step, treat THIS turn
-  // as that step's terminator. Re-route through applyPlanStepTurn so the
-  // exact same transition logic applies (success / form-again / failure).
   if (evt.actor.kind === 'agent') {
     const plan = await readPlan(uid, cid);
     if (plan?.steps?.length) {
       const members = await readMembers(uid, cid);
-      const blocked = plan.steps.find((s) =>
-        s.status === 'blocked' && assigneeMatches(s.assignee, evt.actor.id, members.actors),
+      const active = plan.steps.find((s) =>
+        (s.status === 'in_progress' || s.status === 'blocked')
+        && assigneeMatches(s.assignee, evt.actor.id, members.actors),
       );
-      if (blocked) {
-        const outcome = await applyPlanStepTurn(uid, cid, evt, blocked.index);
+      if (active) {
+        const outcome = await applyPlanStepTurn(uid, cid, evt, active.index);
         await reconcileAfterStepTransition(uid, cid);
         return outcome;
       }
@@ -838,6 +838,33 @@ async function dispatchReady(uid: string, cid: string, plan: PlanFile): Promise<
     if (!groups.has(k)) groups.set(k, []);
     groups.get(k)!.push(s);
   }
+  // Expert-signals: emit one `agent_dispatched` signal per group BEFORE
+  // wakening — we want the audit record even if the enqueue downstream
+  // throws. turn_id is synthesized (this signal's consumer use case is
+  // aggregation — "did commander dispatch multiple agents to the same
+  // query?" — not JOIN with other signals; see expert-signals plan §4.3
+  // + reservation against cross-signal JOIN). Best-effort.
+  try {
+    const { emitSignal } = await import('../expert_signals');
+    const { buildAgentDispatchedSignal } = await import('../expert_signals/extractors/event');
+    const baseTs = Date.now();
+    let i = 0;
+    for (const [groupKey, steps] of groups) {
+      const assignees = steps.map((s) => s.assignee).filter(Boolean);
+      const parallel_group = groupKey.startsWith('_solo_') ? null : groupKey;
+      emitSignal(uid, buildAgentDispatchedSignal({
+        cid,
+        // `plan:dispatch:<ts>:<i>` is unique per emit. Documented in the
+        // signal builder comment.
+        turn_id: `${cid}:plan:dispatch:${baseTs}:${i++}`,
+        candidates: assignees.slice(),
+        dispatched: assignees.slice(),
+        parallel_group,
+      }));
+    }
+  } catch (err) {
+    log.warn(`agent_dispatched emit failed cid=${cid}: ${(err as Error).message}`);
+  }
   for (const [, steps] of groups) {
     for (const step of steps) {
       await dispatchStep(uid, cid, step, plan);
@@ -863,6 +890,10 @@ async function dispatchStep(
 
   const rendered = renderTemplate(step.input, plan);
   const assignee = step.assignee.trim();
+  // Forward attachments captured at plan-set time so worker agents (and
+  // the user, for a `user`-assignee question) receive the same image / file
+  // bytes the triggering user turn carried — see PlanFile.initial_attachments.
+  const inheritedAttachments = plan.initial_attachments;
 
   if (USER_ALIASES.has(assignee.toLowerCase())) {
     // Step asks user for input. Commander voice; render goes to user with
@@ -874,6 +905,7 @@ async function dispatchStep(
       text: rendered,
       forceTo: [USER_ID],
       triggered_step: step.index,
+      ...(inheritedAttachments && inheritedAttachments.length ? { attachments: inheritedAttachments } : {}),
       form: buildUserStepForm(step),
     });
     return;
@@ -915,6 +947,7 @@ async function dispatchStep(
     forceTo: [agentId],
     triggered_step: step.index,
     dispatch: true,
+    ...(inheritedAttachments && inheritedAttachments.length ? { attachments: inheritedAttachments } : {}),
   });
 }
 

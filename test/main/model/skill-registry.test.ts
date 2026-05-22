@@ -71,6 +71,16 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     expect(text).not.toContain('summarize');
   });
 
+  it('matches allowlist entries by display name when marketplace id differs', async () => {
+    writeSkill(builtinDir(), '6bb95f967501', 'github', 'GitHub skill');
+    writeSkill(builtinDir(), 'daa4378ab55a', 'find-skill', 'Find skill');
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock({ allowlist: ['github', 'find-skill'] });
+    expect(text).toContain('**github** (Source: builtin; internal read id: 6bb95f967501)');
+    expect(text).toContain('**find-skill** (Source: builtin; internal read id: daa4378ab55a)');
+    expect(text).not.toContain('(id: 6bb95f967501)');
+  });
+
   it('returns empty string when allowlist is [] (agent opting out of all skills)', async () => {
     writeSkill(builtinDir(), 'translate', 'Translate', 'T');
     const { getSystemPromptBlock } = await loadRegistry();
@@ -124,11 +134,34 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     expect(text).toContain(`- custom:  ${path.resolve(customDir())}`);
     expect(text).toContain(`- builtin: ${path.resolve(builtinDir())}`);
     expect(text).toContain('Use these ROOT values verbatim');
+    expect(text).toContain('These entries are skills, not tool names');
+    expect(text).toContain('never call the display name or id as a tool');
+    expect(text).toContain('Never mention skill ids');
   });
 
   it('block omits ROOT header when no skills are present (renderSkillLines short-circuits empty)', async () => {
     const { getSystemPromptBlock } = await loadRegistry();
     const text = await getSystemPromptBlock();
     expect(text).toBe('');
+  });
+});
+
+describe('skill-registry › replaceKnownSkillIdsForDisplay', () => {
+  it('rewrites known marketplace ids to display names with token boundaries', async () => {
+    const { replaceKnownSkillIdsForDisplay } = await loadRegistry();
+    const text = replaceKnownSkillIdsForDisplay(
+      'skill: follow the `16e1bfcb3426` skill; leave x16e1bfcb3426y alone',
+      [{ id: '16e1bfcb3426', name: 'agent-creator' }],
+    );
+    expect(text).toBe('skill: follow the `agent-creator` skill; leave x16e1bfcb3426y alone');
+  });
+
+  it('normalizes skill follow phrasing to a compact display reference', async () => {
+    const { normalizeKnownSkillRefsForDisplay } = await loadRegistry();
+    const text = normalizeKnownSkillRefsForDisplay(
+      '`skill: follow the 16e1bfcb3426 skill` — create agents',
+      [{ id: '16e1bfcb3426', name: 'agent-creator' }],
+    );
+    expect(text).toBe('`agent-creator` skill — create agents');
   });
 });

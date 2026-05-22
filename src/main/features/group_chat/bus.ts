@@ -54,6 +54,7 @@ import { isAgentEnabled } from '../component_enabled';
 import { buildLanguageDirective, descriptionLang, t } from '../../i18n';
 import * as marketplaceFeat from '../marketplace';
 import { readInstalls } from '../marketplace_installs';
+import { createSkillTurnBuffer } from '../expert_signals/turn_hooks';
 
 const log = createLogger('group_chat.bus');
 
@@ -116,6 +117,11 @@ export type GroupEvent =
    * up as a stuck "thinking" bubble when commander's turn ends silently. */
   | { type: 'message'; cid: string; msg: GroupMessage; turn_end?: boolean }
   | { type: 'process'; cid: string; actor: string; data: Record<string, unknown> }
+  /** A `create_artifact` tool call finished writing its bundle. The final
+   * end-of-turn message still carries `msg.artifacts` for persistence; this
+   * live event lets the renderer mount the iframe immediately instead of
+   * waiting for the whole actor turn to finish. */
+  | { type: 'artifact_created'; cid: string; actor: string; artifact: { id: string; title: string; agent_id: string } }
   | { type: 'plan_changed'; cid: string }
   | { type: 'state_changed'; cid: string; state: Awaited<ReturnType<typeof readState>> }
   | { type: 'member_joined'; cid: string; actor: Actor }
@@ -271,6 +277,19 @@ export function isQuiescent(uid: string, cid: string): boolean {
     if (w.queue.length > 0) return false;
   }
   return true;
+}
+
+export function runtimeSnapshot(uid: string, cid: string): { processing: boolean; inFlight: string[] } {
+  const s = _cids.get(cidKey(uid, cid));
+  if (!s) return { processing: false, inFlight: [] };
+  const inFlight: string[] = [];
+  for (const [, w] of s.workers) {
+    if (w.running) inFlight.push(w.actor.id);
+  }
+  return {
+    processing: !isQuiescent(uid, cid),
+    inFlight,
+  };
 }
 
 /** Recompute the on-disk `status` field based on actual worker / queue
@@ -695,11 +714,15 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   // commander in `to`, so it goes through the regular dispatch loop above.
 
   // User-driven reconcile: when user enqueues, plan_executor needs a chance
-  // to mark a `user`-assignee step as done and dispatch downstream. Worker-
-  // driven reconcile already runs in runTurn for agent/commander turns.
-  // Fire-and-forget — reconcile is idempotent and shouldn't block enqueue.
+  // to mark a `user`-assignee step as done and dispatch downstream. This is
+  // part of the send transaction, not a background side effect: the IPC
+  // send-stream subscribes before calling send(), and it must not return until
+  // the immediate plan handoff (user step → next agent / commander) has queued
+  // its work. Otherwise the renderer can close the stream between the user
+  // echo and the downstream dispatch, which is exactly how form submissions
+  // ended up as fake loading bubbles until history polling caught up.
   if (fromActorId === USER_ID) {
-    void planExecutor.reconcile(uid, cid, {
+    await planExecutor.reconcile(uid, cid, {
       finishedActorId: USER_ID,
       finishedMessage: { id: msgId, text: rewrittenText, files: [], failed: false },
     }).catch((err) => log.warn(`plan reconcile (user) threw cid=${cid}: ${(err as Error).message}`));
@@ -937,7 +960,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   let cliAgent: import('../agents').Agent | null = null;
   if (isCommander) {
     systemPrompt = await buildCommanderSystemPrompt(uid, cid, turnProjectScope?.agents ?? null);
-    extraTools = await buildCommanderExtraTools(state, w);
+    extraTools = await buildCommanderExtraTools(state, w, item.attachments);
     // skillList stays undefined for commander — every skill is globally
     // visible (skills are NOT project-scoped this round; see CLAUDE.md §6).
   } else {
@@ -982,6 +1005,14 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
 
   // Streaming.
   const { streamChatWithModel } = await import('../../model/client');
+  // Per-turn skill-attribution buffer. Records skill_advertised at runner
+  // build time (System A via skill-registry, System B via SkillStore) and
+  // skill_invoked at each successful `read_file` of a SKILL.md. Drained
+  // at turn-end below using the persisted agent msg id as `turn_id`, so
+  // downstream signals JOIN cleanly with text/tool_failure/retry on the
+  // same turn. Silent turns (no persisted message) drop the buffer — see
+  // expert-signals-skill-attribution plan §3.4 + `turn_hooks.ts`.
+  const skillBuffer = createSkillTurnBuffer();
   // Per-turn list — feeds the green-chip "files produced" bubble. The
   // conversation-scoped `state.producedPaths` is what uniquify consults
   // for ownership; we keep this Set per turn purely for UI surfacing.
@@ -1000,7 +1031,15 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // one as a sandboxed `<iframe>` (`chat-app://`); `agent_id` = this actor,
   // the routing target for a user→artifact interaction result.
   const turnArtifacts: Array<{ id: string; title: string }> = [];
-  const onArtifactCreated = (a: { id: string; title: string }) => { turnArtifacts.push(a); };
+  const onArtifactCreated = (a: { id: string; title: string }) => {
+    turnArtifacts.push(a);
+    emit(state, {
+      type: 'artifact_created',
+      cid,
+      actor: actor.id,
+      artifact: { id: a.id, title: a.title, agent_id: actor.id },
+    });
+  };
   let finalText = '';
   // Mirror of every text delta we forwarded to the renderer this turn.
   // Used as the salvage source when the user aborts mid-stream — the
@@ -1065,21 +1104,19 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     // conventions and don't need that scoping. Override here:
     const userWorkspace = await import('../user_workspace');
     const wsRoot = userWorkspace.getWorkspacePath(uid, turnProjectId);
-    // Coding agents (claude / codex) honour the per-conversation
-    // `coding_project_dir` when set so the CLI runs inside the user's
-    // actual project; non-coding CLIs always use the workspace. The
-    // chip in the conversation surface lets the user set/change the
-    // dir mid-conversation. We also defensively check the directory
-    // exists and is a real dir — if it vanished between picker and
-    // dispatch we fall back rather than failing the run.
+    // Coding agents (claude / codex) initialise the per-conversation
+    // `coding_project_dir` from the agent detail page's project-dir
+    // setting. Missing setting = effective workspace. Once a
+    // conversation has a dir, later turns keep using it; the agent can
+    // still ask the user to switch through the standard directory form.
+    // Non-coding CLIs always use the workspace. We defensively check
+    // the directory exists — if it vanished we fall back rather than
+    // failing the run.
     let cliWorkingDir = wsRoot;
     if (agentsFeat.cliIsCodingAgent(cliAgent.runtime?.kind === 'cli' ? cliAgent.runtime.cli : '')) {
-      // Default + workspace-sync: on the first coding-agent turn the
-      // user shouldn't have to pick a directory just to start; default
-      // to their effective workspace. On later turns, follow workspace
-      // changes silently — unless the user has explicitly picked
-      // something different through the input-form (sticky).
-      await _syncCodingProjectDirWithWorkspace(uid, cid, wsRoot);
+      const dirInfo = agentsFeat.getCliProjectDirInfoForAgent(uid, cliAgent, turnProjectId);
+      cliWorkingDir = dirInfo.effective_path;
+      await _initializeCodingProjectDir(uid, cid, dirInfo);
       const st = await import('./state');
       const stateFile = await st.readState(uid, cid);
       const projDir = stateFile.coding_project_dir;
@@ -1143,6 +1180,8 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       onFileWritten,
       hasProducedPath,
       onArtifactCreated,
+      onSkillAdvertised: (id, sys) => skillBuffer.recordAdvertised(id, sys),
+      onSkillInvoked: (id, sys, trig) => skillBuffer.recordInvoked(id, sys, trig),
       cacheRetention: 'short',
       abortSignal: w.abortController.signal,
       readOnlyExtraRoots: [...skillRoots, ...agentRoots],
@@ -1512,8 +1551,9 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     }
   }
 
+  let persistedMsg: GroupMessage | null = null;
   if (outcome.kind === 'persist') {
-    await enqueue({
+    persistedMsg = await enqueue({
       uid, cid,
       fromActorId: actor.id,
       text: outcome.text,
@@ -1572,6 +1612,14 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   if (actor.kind === 'commander' && w.pendingDispatches && w.pendingDispatches.length) {
     const pending = w.pendingDispatches;
     w.pendingDispatches = undefined;
+    // Inherit the commander turn's user-uploaded attachments so the recipient
+    // worker sees the same image / file bytes the commander saw. Without this
+    // a worker honestly answers "I can't see the image" because turnImages
+    // only fires when `item.attachments` is populated. Plan-step dispatches
+    // get the same inheritance via PlanFile.initial_attachments (persisted
+    // because steps live across worker turn boundaries); dispatch_to is one-
+    // shot so per-turn flush is enough.
+    const inheritedAttachments = item.attachments;
     for (const d of pending) {
       try {
         await enqueue({
@@ -1580,11 +1628,28 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
           text: d.message,
           forceTo: [d.to],
           dispatch: true,
+          ...(inheritedAttachments && inheritedAttachments.length
+            ? { attachments: inheritedAttachments }
+            : {}),
         });
       } catch (err) {
         log.warn(`dispatch_to flush failed cid=${cid} to=${d.to}: ${(err as Error).message}`);
       }
     }
+  }
+
+  // Expert-signals: drain skill_advertised / skill_invoked using the
+  // persisted msg id as turn_id (per turn_id convention — see
+  // PC/CLAUDE.md §4 constraint 9 + expert-signals plan §3.4). Silent
+  // turns drop the buffer; CLI agents bypass SkillLoader so the buffer
+  // is empty for them and the drain is a no-op.
+  if (persistedMsg) {
+    skillBuffer.drainAndEmit({
+      uid, cid,
+      aid: actor.kind === 'commander' ? null : actor.id,
+      turn_id: persistedMsg.id,
+      msg_ids: [persistedMsg.id],
+    });
   }
 
   await _syncStateStatus(state);
@@ -1740,7 +1805,7 @@ async function buildAgentsIndexBlock(uid: string, allowedIds?: readonly string[]
 
 async function buildAgentInGroupSystemPrompt(
   _uid: string,
-  agent: { name?: string; description?: string; workflow?: string; agent_id: string; inputs?: unknown },
+  agent: { name?: string; description?: string; workflow?: string; agent_id: string; inputs?: unknown; output_format?: string },
   workingDir: string,
 ): Promise<string> {
   const { prompts } = await import('../../prompts/loader');
@@ -1766,9 +1831,33 @@ async function buildAgentInGroupSystemPrompt(
     workflow: (agent.workflow || '').trim() || '(not provided)',
     inputs_schema: inputsSchemaJson || '(none)',
     working_dir: workingDir,
+    output_format_hint: buildOutputFormatHint(agent.output_format),
   });
   const shared = prompts.load('chat_shared_rules', {});
   return appendLanguageDirective(concatSharedRules(main, shared));
+}
+
+/** Render the agent's `output_format` preference as a one-line worker prompt
+ *  hint. Sits in the `## Runtime injection` tail (most-volatile slot per
+ *  PC/CLAUDE.md §3 prompt-md cache layout). `'auto'` (legacy) and missing both
+ *  produce an empty string — old agents authored before the redesign keep
+ *  unconstrained behavior until the user explicitly picks a value. `'artifact'`
+ *  is the renamed `'allow_artifacts'`; the old key is accepted as an alias for
+ *  on-disk back-compat (specs written by pre-redesign builds). See
+ *  `chat_shared_rules.md` "Output formats" for the underlying rule. */
+function buildOutputFormatHint(format: string | undefined): string {
+  switch (format) {
+    case 'markdown_only':
+      return '### Output format\nThis agent is configured **markdown-only**: do NOT emit `:::dashboard` blocks or call `create_artifact`. Plain markdown only.';
+    case 'dashboard':
+      return '### Output format\nThis agent is configured for **dashboard output**: prefer `:::dashboard` for structured snapshots (KPIs, tables, alerts, timelines); do NOT call `create_artifact`.';
+    case 'artifact':
+    case 'allow_artifacts':
+      return '### Output format\nThis agent is configured to **allow artifacts**: prefer `:::dashboard` for structured snapshots; reach for `create_artifact` when interactivity actually matters.';
+    case 'auto':
+    default:
+      return '';
+  }
 }
 
 // ── Commander tools (plan_set / marketplace / dispatch) ─────────────────
@@ -1814,6 +1903,7 @@ function _compactMarketplaceItem(
     category: item.category || '',
     version: item.version,
     published_at: item.published_at,
+    ...(typeof item.updated_at === 'number' ? { updated_at: item.updated_at } : {}),
     create_uid: item.create_uid || '',
     download_count: item.download_count || 0,
     installed,
@@ -1844,7 +1934,7 @@ function _marketplaceSearchTerms(query: string): string[] {
   push(query);
   for (const token of query.split(/[\s,，;；:：|/]+/g)) {
     push(token);
-    const runs = token.match(/[\u3400-\u9fff]{2,}/g) || [];
+    const runs = token.match(/[㐀-鿿]{2,}/g) || [];
     hanRuns.push(...runs);
     for (const run of runs) {
       for (const term of commonHanTerms) {
@@ -1861,7 +1951,17 @@ function _marketplaceSearchTerms(query: string): string[] {
   return out.slice(0, 12);
 }
 
-async function buildCommanderExtraTools(state: CidState, w: WorkerState): Promise<AgentTool[]> {
+
+async function buildCommanderExtraTools(
+  state: CidState,
+  w: WorkerState,
+  // Attachments on the current commander turn's source item — passed through
+  // to plan_set so the plan persists them under `initial_attachments`. Worker
+  // dispatches in subsequent reconciles read it back from the plan so image /
+  // file bytes follow the dispatch chain. Same flow as `dispatch_to` flush,
+  // but persisted because plan steps live across worker turn boundaries.
+  currentTurnAttachments?: string[],
+): Promise<AgentTool[]> {
   const { uid, cid } = w;
   const tools: AgentTool[] = [];
   tools.push({
@@ -1927,6 +2027,9 @@ async function buildCommanderExtraTools(state: CidState, w: WorkerState): Promis
       const stepsIn: PlanSetInput = {
         ...(typeof input?.initial_message === 'string' && input.initial_message.trim()
           ? { initial_message: String(input.initial_message) }
+          : {}),
+        ...(currentTurnAttachments && currentTurnAttachments.length
+          ? { initial_attachments: currentTurnAttachments.slice() }
           : {}),
         steps: raw.filter((s) => s && typeof s.title === 'string' && s.title.trim() && typeof s.assignee === 'string' && s.assignee.trim())
           .map((s) => ({
@@ -2131,6 +2234,7 @@ async function buildCommanderExtraTools(state: CidState, w: WorkerState): Promis
         create_uid: { type: 'string', description: 'Author uid from marketplace_search; "0" means official.' },
         version: { type: 'string', description: 'Version from marketplace_search.' },
         published_at: { type: 'number', description: 'Published timestamp from marketplace_search.' },
+        updated_at: { type: 'number', description: 'Updated timestamp from marketplace_search; include when present.' },
         reason: {
           type: 'string',
           description: 'Short user-facing reason this resource helps the current task.',
@@ -2152,6 +2256,8 @@ async function buildCommanderExtraTools(state: CidState, w: WorkerState): Promis
       const reason = _trimText(input?.reason, 800);
       if (!reason) return _toolError('`reason` is required');
       const searchMeta = w.marketplaceSearchResults?.get(`${kind}:${id}`);
+      const rawUpdatedAt = input?.updated_at ?? searchMeta?.updated_at;
+      const updatedAt = rawUpdatedAt == null ? NaN : Number(rawUpdatedAt);
       const icon = kind === 'agent'
         ? (_trimText(input?.icon, 64) || _trimText(searchMeta?.icon, 64))
         : '';
@@ -2204,6 +2310,7 @@ async function buildCommanderExtraTools(state: CidState, w: WorkerState): Promis
         ...(createUid ? { create_uid: createUid } : {}),
         version,
         published_at: publishedAt,
+        ...(Number.isFinite(updatedAt) ? { updated_at: updatedAt } : {}),
         reason,
         status: 'pending',
         requested_at: nowIso(),
@@ -2416,6 +2523,7 @@ planExecutor.bindBusHooks({
       ...(params.forceTo ? { forceTo: params.forceTo } : {}),
       ...(typeof params.triggered_step === 'number' ? { triggered_step: params.triggered_step } : {}),
       ...(params.dispatch ? { dispatch: true } : {}),
+      ...(params.attachments && params.attachments.length ? { attachments: params.attachments } : {}),
       ...(params.form ? { form: params.form } : {}),
     });
   },
@@ -2469,56 +2577,38 @@ planExecutor.bindBusHooks({
 // ── CLI agent turn ────────────────────────────────────────────────────────
 //
 // CLI-backed agents replace the LLM stream loop in runTurn. We pack the
-// agent's full visibility slice + the dispatched message + any user
-// attachments into a single prompt, spawn the configured CLI in the
-// user's workspace, and stream events into the same `process` rail the
-// renderer already understands. The final body is the CLI's last
-// "result" text — assigned into runTurn's `finalText` so plan_executor /
-// post-turn enqueue keep working unchanged.
+// dispatched message + any user attachments into a single prompt, spawn
+// the configured CLI in the user's workspace, and stream events into the
+// same `process` rail the renderer already understands. The final body
+// is the CLI's last "result" text — assigned into runTurn's `finalText`
+// so plan_executor / post-turn enqueue keep working unchanged.
 //
-// Stateless on purpose: every dispatch starts a fresh CLI run. Session
-// continuity (`--resume`) is a future optimisation; for now the slice is
-// the source of truth.
+// CLI continuity normally belongs to the CLI itself (`--resume` / thread
+// resume), so the host prompt sends only the current task plus lightweight
+// runtime context (attachments, cwd-switch protocol).
+// Exception: if we have to start a fresh CLI session after this agent already
+// has visible history (for example cwd changed and the old cwd-keyed session
+// id was cleared), we bridge that prior visible transcript once.
 
 const CLI_PROMPT_MAX_BYTES = 200 * 1024;
 
-/** Default + workspace-sync for the coding-agent project directory.
+/** Initialise the coding-agent project directory for a conversation.
  *
- *  Two cases the user expects to "just work":
- *    1. First dispatch in a fresh conv: we shouldn't pop a directory
- *       picker just to start — the user already chose a workspace,
- *       use that.
- *    2. User switches the workspace mid-conversation (chip in the
- *       chat surface): the next coding-agent turn should follow.
- *
- *  Either case = "auto-set" with `explicit=false`. Once the user
- *  picks a different directory through the input-form picker
- *  (form-submit hook flips `explicit=true`), workspace switches no
- *  longer override their choice. Caller must already have established
- *  this is a coding agent (the explicit flag is meaningless for
- *  non-coding CLIs that don't honour `coding_project_dir`). */
-async function _syncCodingProjectDirWithWorkspace(
-  uid: string, cid: string, wsPath: string,
+ *  The source is the agent detail page's local project-dir setting:
+ *  custom override if present, otherwise the effective workspace for
+ *  this conversation/project. This runs only while the conversation has
+ *  no `coding_project_dir`; once set, that cwd stays stable for the
+ *  conversation until the user explicitly switches it through the
+ *  directory form. */
+async function _initializeCodingProjectDir(
+  uid: string, cid: string, info: agentsFeat.AgentCliProjectDirInfo,
 ): Promise<void> {
   const cur = await readState(uid, cid);
-  if (cur.coding_project_dir_explicit) return;            // sticky
-  if (cur.coding_project_dir === wsPath) return;          // already in sync
-  const oldDir = cur.coding_project_dir || '';
-  await setCodingProjectDir(uid, cid, wsPath, { explicit: false });
-  if (oldDir && oldDir !== wsPath) {
-    // CLI session bindings reference the OLD cwd. claude code keys
-    // sessions by cwd (`~/.claude/projects/<encoded-cwd>/<id>.jsonl`),
-    // so resuming a stale id at the new cwd fails with
-    // "No conversation found". Drop bindings preemptively so the
-    // next dispatch goes through the full-slice replay path —
-    // user-visible conversation continues seamlessly because
-    // `_buildCliPrompt` includes the slice when `resuming=false`.
-    const cliSessions = await import('../local_agents/sessions');
-    await cliSessions.clearForConversation(uid, cid);
-    log.info(`coding cwd changed cid=${cid} ${oldDir} → ${wsPath} — cleared cli sessions`);
-  } else {
-    log.info(`coding project_dir auto-set cid=${cid} → ${wsPath}`);
-  }
+  if (cur.coding_project_dir) return;
+  const target = info.effective_path;
+  if (!target) return;
+  await setCodingProjectDir(uid, cid, target, { explicit: info.mode === 'custom' && info.exists });
+  log.info(`coding project_dir initialised cid=${cid} → ${target}`);
 }
 
 /** Build an `<agent-input-form>` block listing the agent's required
@@ -2582,17 +2672,19 @@ async function _runCliAgentTurn(opts: {
   if (formBlock) return { text: formBlock };
 
   // Look up any prior CLI session bound to this (cid, aid, cli). If
-  // present, we ask the CLI to resume it (claude: `--resume <id>`)
-  // and skip replaying the visibility slice in the prompt — the CLI
-  // already remembers the prior turns. First dispatch / fresh CLI
-  // swap → null → we replay the slice as before. Saves significant
-  // tokens and round-trip latency on long conversations.
+  // present, we ask the CLI to resume it (claude: `--resume <id>`,
+  // codex: `thread/resume`). With a valid resume handle, the prompt stays
+  // current-turn-only: CLI agents persist their own conversation records,
+  // and duplicating host chat history here bloats context and can confuse
+  // the CLI's native memory. Without a handle, but with prior visible
+  // turns, we bridge that transcript into the fresh CLI session.
   const cliSessions = await import('../local_agents/sessions');
   const resumeSessionId = await cliSessions.getSessionId(
     opts.uid, opts.cid, opts.agent.agent_id, runtime.cli,
   );
+  const bridgeHistory = !resumeSessionId && _hasPriorVisibleCliHistory(opts.item, opts.slice);
   const promptText = await _buildCliPrompt(
-    opts.uid, opts.cid, opts.agent, opts.item, opts.slice, !!resumeSessionId,
+    opts.uid, opts.cid, opts.agent, opts.item, opts.slice, bridgeHistory,
   );
   // When `_buildCliPrompt` took the slash-command fast-path, promptText is
   // the raw `/cmd …` we forwarded. Remember the command name so the
@@ -2736,11 +2828,7 @@ async function _buildCliPrompt(
   agent: import('../agents').Agent,
   item: QueueItem,
   slice: GroupMessage[],
-  /** When true, the CLI is resuming a prior session and already has
-   *  the conversation history in its own memory — we skip the slice
-   *  block entirely and just send the static frame + new task. Drops
-   *  massive redundancy on long convs. */
-  resuming: boolean,
+  bridgeHistory: boolean,
 ): Promise<string> {
   // Slash-command fast-path: when the user sends `/foo …` to a CLI agent,
   // forward the raw text so the CLI's own slash dispatcher (built-ins +
@@ -2764,7 +2852,7 @@ async function _buildCliPrompt(
   // Layout = `chat_cli_agent.md` (static frame) + `chat_cli_coding_protocol.md`
   // (coding-only). The static-first / runtime-last split keeps the
   // CLI's prompt cache stable across turns: identity + protocol stay
-  // byte-identical, attachments / slice / task body all change.
+  // byte-identical, attachments / task body change.
   const { prompts } = await import('../../prompts/loader');
   const { chatAttachmentDir } = await import('../../paths');
 
@@ -2838,8 +2926,6 @@ async function _buildCliPrompt(
     taskBody = item.llmPayload;
   }
 
-  // Render the template with a candidate conversation block. The
-  // truncation pass below sizes the block against the byte cap.
   const render = (conversationBlock: string) => prompts.load('chat_cli_agent', {
     agent_name: agent.name || agent.agent_id,
     agent_description: (agent.description_en || agent.description_zh || '').trim(),
@@ -2849,31 +2935,26 @@ async function _buildCliPrompt(
     task_body: taskBody,
   });
 
-  // Resuming → CLI already has the slice in its own memory; skip
-  // replay entirely. Static frame + new task is enough.
-  if (resuming) return render('');
+  if (!bridgeHistory) return render('');
 
-  // Conversation slice, oldest → newest. Empty-text rows skipped.
+  const history = _priorVisibleCliHistory(item, slice);
+  if (!history.length) return render('');
+
   const sliceLines: string[] = [];
-  for (const m of slice) {
+  for (const m of history) {
     const to = (m.to || []).join(',') || '-';
     const text = (m.text || '').replace(/\r/g, '').trim();
     if (!text) continue;
     sliceLines.push(`[${m.from} → ${to}] ${text}`);
   }
+  if (!sliceLines.length) return render('');
 
-  // Size the slice against the byte cap by rendering once with an
-  // empty block — gives an exact base size including the protocol /
-  // attachments / task. If even the base exceeds the cap, fall back
-  // to a no-history prompt rather than truncating the task body.
   const baseBytes = Buffer.byteLength(render(''), 'utf8');
   if (baseBytes >= CLI_PROMPT_MAX_BYTES) {
     log.warn(`cli prompt: base exceeds cap; sending minimal prompt cid=${cid} agent=${agent.agent_id}`);
     return render('');
   }
   const sliceBudget = CLI_PROMPT_MAX_BYTES - baseBytes;
-  // Walk newest-backward, keep lines while we have budget. Oldest
-  // lines that don't fit are dropped.
   const kept: string[] = [];
   let used = 0;
   for (let i = sliceLines.length - 1; i >= 0; i--) {
@@ -2886,8 +2967,15 @@ async function _buildCliPrompt(
   if (truncated) {
     log.warn(`cli prompt: trimmed ${sliceLines.length - kept.length}/${sliceLines.length} oldest slice rows cid=${cid} agent=${agent.agent_id}`);
   }
-  const conversationBlock = kept.length
-    ? `## Conversation so far${truncated ? ' (truncated)' : ''}\n${kept.join('\n')}`
-    : '';
+  const conversationBlock = `## Conversation so far${truncated ? ' (truncated)' : ''}\n${kept.join('\n')}`;
   return render(conversationBlock);
+}
+
+function _priorVisibleCliHistory(item: QueueItem, slice: GroupMessage[]): GroupMessage[] {
+  const idx = slice.findIndex((m) => m.id === item.msgId);
+  return idx >= 0 ? slice.slice(0, idx) : slice;
+}
+
+function _hasPriorVisibleCliHistory(item: QueueItem, slice: GroupMessage[]): boolean {
+  return _priorVisibleCliHistory(item, slice).some((m) => (m.text || '').trim());
 }

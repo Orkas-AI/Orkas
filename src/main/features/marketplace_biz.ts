@@ -26,6 +26,7 @@ import { createLogger } from '../logger';
 const log = createLogger('marketplace_biz');
 
 const TTL_MS = 24 * 60 * 60 * 1000;  // 24 hours
+export const DEFAULT_MARKETPLACE_CATEGORY_CODE = 'general';
 
 // In-memory mirror of `marketplace.json::categories`. Populated on first read from disk; refreshed
 // on every successful server fetch. Skips the fs + JSON.parse round-trip when the IPC handler is
@@ -41,6 +42,18 @@ export interface MarketplaceCategory {
   name_ja?: string;
   /** Display order — lower first. Kept on the wire purely for client-side rendering. */
   sort_order: number;
+}
+
+export function isSafeMarketplaceCategoryCode(code: string): boolean {
+  return /^[a-z][a-z0-9_-]{0,79}$/.test(String(code || '').trim().toLowerCase());
+}
+
+export function normalizeMarketplaceCategoryCode(
+  code: string,
+  fallback = DEFAULT_MARKETPLACE_CATEGORY_CODE,
+): string {
+  const normalized = String(code || '').trim().toLowerCase();
+  return isSafeMarketplaceCategoryCode(normalized) ? normalized : fallback;
 }
 
 /** Hard-coded fallback used only when both the persisted cache and the server are unreachable

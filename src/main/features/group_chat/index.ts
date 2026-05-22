@@ -18,13 +18,13 @@ import { t } from '../../i18n';
 
 import {
   COMMANDER_ID, USER_ID, readMembers, readState, seedReservedActors, purgeGroupDir,
-  setCodingProjectDir,
+  setCodingProjectDir, setStatus,
 } from './state';
-import { isPlaceholderTitle } from './conv_workspace';
+import { isPlaceholderTitle } from './conv_title';
 import { readPlan, type PlanFile } from './plan';
 import * as planExecutor from './plan_executor';
 import {
-  abort as busAbort, dropConv as busDropConv, enqueue, subscribe, isQuiescent,
+  abort as busAbort, dropConv as busDropConv, enqueue, subscribe, isQuiescent, runtimeSnapshot,
   type GroupEvent,
 } from './bus';
 
@@ -33,6 +33,29 @@ import {
  *  in the microtask gap between turns; the bus's in-memory queues are the
  *  authoritative source. */
 export const busIsQuiescent = isQuiescent;
+
+export async function runtimeStatus(
+  userId: string,
+  cid: string,
+): Promise<{ processing: boolean; processing_since: string | null; in_flight: string[] }> {
+  if (!safeId(cid)) return { processing: false, processing_since: null, in_flight: [] };
+  try {
+    const state = await readState(userId, cid);
+    const runtime = runtimeSnapshot(userId, cid);
+    const inFlight = Array.from(new Set([
+      ...(Array.isArray(state.in_flight) ? state.in_flight : []),
+      ...runtime.inFlight,
+    ].filter(Boolean)));
+    const processing = state.status === 'running' || runtime.processing;
+    return {
+      processing,
+      processing_since: processing ? (state.last_active_at || null) : null,
+      in_flight: inFlight,
+    };
+  } catch {
+    return { processing: false, processing_since: null, in_flight: [] };
+  }
+}
 
 /** Re-export so the IPC layer can subscribe to the bus BEFORE calling
  *  send(). enqueue wakes the recipient worker synchronously, which then
@@ -146,7 +169,10 @@ export async function retryStep(
 ): Promise<{ ok: boolean; error?: string }> {
   if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
   if (!Number.isFinite(stepIndex) || stepIndex < 1) return { ok: false, error: 'invalid stepIndex' };
-  return planExecutor.retryStep(userId, cid, stepIndex);
+  await clearAbortedStatusForRecovery(userId, cid);
+  const result = await planExecutor.retryStep(userId, cid, stepIndex);
+  if (result.ok) _emitPlanSignal(userId, cid, stepIndex, 'retry');
+  return result;
 }
 
 /** User-initiated skip of a failed plan step (rail "Skip" button). */
@@ -155,7 +181,56 @@ export async function skipStep(
 ): Promise<{ ok: boolean; error?: string }> {
   if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
   if (!Number.isFinite(stepIndex) || stepIndex < 1) return { ok: false, error: 'invalid stepIndex' };
-  return planExecutor.skipStep(userId, cid, stepIndex);
+  await clearAbortedStatusForRecovery(userId, cid);
+  const result = await planExecutor.skipStep(userId, cid, stepIndex);
+  if (result.ok) _emitPlanSignal(userId, cid, stepIndex, 'skip');
+  return result;
+}
+
+/** Expert-signals hook (plan §5 mounts #2/#3) — read the plan to recover
+ *  the agent_id assigned to this step + the source agent msg id, then emit
+ *  retry/skip signal. Fire-and-forget; failures never block the IPC reply.
+ *
+ *  turn_id = `step.output_msg_id` (the agent msg this step produced).
+ *  Per expert-signals plan §3.4 + types.ts Signal.turn_id doc: `turn_id` is
+ *  the agent msg id this signal reacts to / is produced by. For retry/skip
+ *  that's the source output being retried — letting consumers JOIN this
+ *  signal against `skill_invoked` / `tool_failure` from the same agent
+ *  turn. Previous design used synthetic `<cid>:plan:<step>` shared across
+ *  every retry on the same step; the shared-id property is now recovered
+ *  via `metadata.step_index` group-by (consumers count repeat retries
+ *  there). When the step has no `output_msg_id` (rare — step in_progress
+ *  with no output yet), the signal is dropped: a turn_id-less retry signal
+ *  can't be attributed to a specific agent turn. */
+function _emitPlanSignal(uid: string, cid: string, stepIndex: number, kind: 'retry' | 'skip'): void {
+  (async () => {
+    try {
+      const plan = await readPlan(uid, cid);
+      const step = plan?.steps?.[stepIndex - 1];
+      const aid = (step && typeof (step as any).assignee === 'string') ? (step as any).assignee : '';
+      if (!aid) return;            // user-assignee or missing — no signal target
+      const turn_id = (step as any)?.output_msg_id;
+      if (!turn_id) return;        // no source agent msg id → drop (see fn doc)
+      const { emitSignal } = await import('../expert_signals');
+      const { buildRetrySignal, buildSkipSignal } = await import('../expert_signals/extractors/event');
+      emitSignal(uid, (kind === 'retry' ? buildRetrySignal : buildSkipSignal)({
+        cid, aid, turn_id, step_index: stepIndex,
+        msg_ids: [turn_id],
+      }));
+    } catch (err) {
+      log.warn(`expert-signals plan ${kind} emit failed cid=${cid} step=${stepIndex}: ${(err as Error).message}`);
+    }
+  })();
+}
+
+async function clearAbortedStatusForRecovery(userId: string, cid: string): Promise<void> {
+  try {
+    const state = await readState(userId, cid);
+    if (state.status === 'aborted') await setStatus(userId, cid, 'idle');
+  } catch {
+    // Recovery actions should still reach the plan executor even if the
+    // runtime status file is temporarily unavailable.
+  }
 }
 
 // ── Streaming events ─────────────────────────────────────────────────────
@@ -263,6 +338,24 @@ export async function markFormSubmittedAndDispatch(
   }
   log.info(`form-submitted user=${userId} cid=${cid} msgId=${msgId} agent=${agentId} fields=${target.form.fields.length}`);
 
+  // Expert-signals hook (plan §5 mount #4): one form_left_blank signal per
+  // field the user didn't touch (kept blank OR kept default). Fire-and-
+  // forget; failures never block the form submission.
+  (async () => {
+    try {
+      const { emitSignal } = await import('../expert_signals');
+      const { buildFormLeftBlankSignals } = await import('../expert_signals/extractors/event');
+      const signals = buildFormLeftBlankSignals({
+        cid, aid: agentId, turn_id: msgId, msg_id: msgId,
+        fields: target.form.fields as any,
+        values: (values || {}) as Record<string, unknown>,
+      });
+      for (const sig of signals) emitSignal(userId, sig);
+    } catch (err) {
+      log.warn(`expert-signals form_left_blank emit failed cid=${cid} msgId=${msgId}: ${(err as Error).message}`);
+    }
+  })();
+
   // Coding-agent contract: when a `project_dir` field is present in the
   // submitted form for an external claude / codex agent, persist it to
   // conv state so `_runCliAgentTurn` can spawn the CLI inside that
@@ -283,8 +376,9 @@ export async function markFormSubmittedAndDispatch(
         if (oldDir && oldDir !== projDir) {
           // cwd is about to change — claude code's sessions are cwd-keyed,
           // so the existing binding would fail with "No conversation
-          // found" on resume. Drop it; next dispatch replays the full
-          // slice so the user-visible conversation continues seamlessly.
+          // found" on resume. Drop it; next dispatch starts a fresh CLI
+          // session and bridges the prior visible transcript once so the
+          // user-visible conversation continues seamlessly.
           const cliSessions = await import('../local_agents/sessions');
           await cliSessions.clearForConversation(userId, cid);
           log.info(`coding cwd changed (form) user=${userId} cid=${cid} ${oldDir} → ${projDir} — cleared cli sessions`);
@@ -381,6 +475,7 @@ function _encodeMarketplaceInstallResult(
     name: req.name,
     version: req.version,
     published_at: req.published_at,
+    ...(typeof req.updated_at === 'number' ? { updated_at: req.updated_at } : {}),
     status,
     ...(error ? { error } : {}),
   };
@@ -521,9 +616,17 @@ export async function resolveMarketplaceInstallRequest(
 
   try {
     if (req.kind === 'agent') {
-      await marketplace.installMarketplaceAgent(req.id, { version: req.version, published_at: req.published_at });
+      await marketplace.installMarketplaceAgent(req.id, {
+        version: req.version,
+        published_at: req.published_at,
+        ...(typeof req.updated_at === 'number' ? { updated_at: req.updated_at } : {}),
+      });
     } else {
-      await marketplace.installMarketplaceSkill(req.id, { version: req.version, published_at: req.published_at });
+      await marketplace.installMarketplaceSkill(req.id, {
+        version: req.version,
+        published_at: req.published_at,
+        ...(typeof req.updated_at === 'number' ? { updated_at: req.updated_at } : {}),
+      });
     }
     await _autoBindInstalledMarketplaceResource(userId, cid, req);
     const patched = await _patchMarketplaceRequest(userId, cid, msgId, requestId, {

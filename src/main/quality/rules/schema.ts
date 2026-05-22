@@ -23,6 +23,8 @@ const SKILL_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]*(?: [A-Za-z0-9_-]+)*$/;
 // around 800.
 const MAX_DESC_LEN = 800;
 
+const CATEGORY_CODE_RE = /^[a-z][a-z0-9_-]{0,79}$/;
+
 /**
  * Validate SKILL.md frontmatter. Body content is scanned separately by
  * red-flags + extractExecutableBlocks.
@@ -84,6 +86,25 @@ export function validateSkillFrontmatter(
     }
   }
 
+  const category = typeof frontmatter.category === 'string' ? frontmatter.category.trim() : '';
+  if (!category) {
+    out.push({
+      level: 'MEDIUM',
+      rule: 'frontmatter_category_missing',
+      field: 'frontmatter:category',
+      snippet: '',
+      suggested_fix: 'Add `category:` using the category codes defined in skill-creator; the writer can backfill the default when missing.',
+    });
+  } else if (!CATEGORY_CODE_RE.test(category)) {
+    out.push({
+      level: 'MEDIUM',
+      rule: 'frontmatter_category_invalid',
+      field: 'frontmatter:category',
+      snippet: category.slice(0, 80),
+      suggested_fix: 'Use a safe marketplace category code from skill-creator.',
+    });
+  }
+
   return out;
 }
 
@@ -124,12 +145,17 @@ export function validateAgentJsonShape(
   const en = typeof agentJson.description_en === 'string' ? agentJson.description_en.trim() : '';
   const legacy = typeof agentJson.description === 'string' ? agentJson.description.trim() : '';
   if (!zh && !en && !legacy) {
+    // MEDIUM, not EXTREME: agents are commonly created as a stub
+    // (createCustomAgent with no body) and filled in via the inline
+    // edit chat afterwards. Blocking the create breaks that flow.
+    // The commander will simply not pick a description-less agent
+    // until the user fills it in — non-fatal.
     out.push({
-      level: 'EXTREME',
+      level: 'MEDIUM',
       rule: 'agent_description_missing',
       field: 'agent.json:description',
       snippet: '',
-      suggested_fix: 'Agent spec must include `description_zh` and `description_en` so the commander can dispatch correctly in either UI language.',
+      suggested_fix: 'Add `description_zh` and `description_en` so the commander can dispatch this agent in either UI language.',
     });
   } else {
     for (const [field, value] of [
@@ -145,6 +171,25 @@ export function validateAgentJsonShape(
         });
       }
     }
+  }
+
+  const category = typeof agentJson.category === 'string' ? agentJson.category.trim() : '';
+  if (!category) {
+    out.push({
+      level: 'MEDIUM',
+      rule: 'agent_category_missing',
+      field: 'agent.json:category',
+      snippet: '',
+      suggested_fix: 'Add `category` using the category codes defined in agent-creator; the writer can backfill the default when missing.',
+    });
+  } else if (!CATEGORY_CODE_RE.test(category)) {
+    out.push({
+      level: 'MEDIUM',
+      rule: 'agent_category_invalid',
+      field: 'agent.json:category',
+      snippet: category.slice(0, 80),
+      suggested_fix: 'Use a safe marketplace category code from agent-creator.',
+    });
   }
 
   return out;

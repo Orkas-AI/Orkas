@@ -82,6 +82,18 @@ function renderMarkdownFull(md) {
     }
   });
 
+  // :::dashboard directives — JSON component tree → recursive HTML render.
+  // Malformed JSON falls back to a code-view block so the user sees the raw
+  // body instead of a silently-dropped section.
+  md = md.replace(/:::dashboard\s*\n([\s\S]*?)\n\s*:::/g, (_, body) => {
+    try {
+      const spec = JSON.parse(body.trim());
+      return protect(renderDashboard(spec));
+    } catch (e) {
+      return protect(`<pre class="code-view dashboard-parse-error"><code>${escapeHtml(body.trim())}</code></pre>`);
+    }
+  });
+
   // Math blocks — protect so markdown phase 2 (emphasis, autolinking, html
   // escapes) doesn't mangle LaTeX before MathJax sees it. Order matters:
   //   1. `$$...$$` and `\[...\]` (display) — multi-line, must match first
@@ -326,6 +338,256 @@ function renderChartBar(data) {
   }
   html += '</div>';
   return html;
+}
+
+// ─── Dashboard renderer (`:::dashboard` directive) ────────────────────────
+// Recursive component tree → HTML. Components live in two tiers:
+//   • Layout primitives  : Stack / Grid / Card / Separator (no semantics)
+//   • Content components : Metric / Chart / Table / Alert / Timeline /
+//                          Code / Markdown / Image
+// Unknown `type` and missing props render an empty container instead of
+// throwing — keeps the surrounding bubble alive when the model produces a
+// partially-formed tree. Props are enum-coerced via _dbEnum(); raw px / hex
+// values are intentionally NOT accepted (consistency over flexibility).
+//
+// Cross-file note: the model-facing schema reference lives in
+// `chat_shared_rules.md` "Output formats". Component names and enum values
+// must match that doc — adding a component or a new prop value requires
+// updating both sides in the same patch.
+
+const _DB_GAP = { sm: 'sm', md: 'md', lg: 'lg' };
+const _DB_TONE = { positive: 'positive', negative: 'negative', neutral: 'neutral', warning: 'warning' };
+const _DB_LEVEL = { info: 'info', success: 'success', warning: 'warning', error: 'error' };
+const _DB_CHART_KIND = { line: 'line', bar: 'bar', area: 'area', pie: 'pie' };
+
+function _dbEnum(table, val, dflt) {
+  return (val && Object.prototype.hasOwnProperty.call(table, val)) ? table[val] : dflt;
+}
+
+function renderDashboard(spec) {
+  if (!spec || typeof spec !== 'object') return '';
+  const theme = spec.theme || {};
+  const themeColor = _dbEnum({ neutral: 'neutral', brand: 'brand', success: 'success', warning: 'warning', danger: 'danger' }, theme.color, 'neutral');
+  const themeStyle = _dbEnum({ minimal: 'minimal', card: 'card' }, theme.style, 'minimal');
+  const inner = _renderDbNode(spec.root);
+  return `<div class="dashboard" data-theme-color="${themeColor}" data-theme-style="${themeStyle}">${inner}</div>`;
+}
+
+function _renderDbNode(node) {
+  if (!node || typeof node !== 'object') return '';
+  const props = (node.props && typeof node.props === 'object') ? node.props : {};
+  const children = Array.isArray(node.children) ? node.children : [];
+  switch (node.type) {
+    // ── Layout ────────────────────────────────────────────────────────
+    case 'Stack':     return _dbStack(props, children);
+    case 'Grid':      return _dbGrid(props, children);
+    case 'Card':      return _dbCard(props, children);
+    case 'Separator': return '<hr class="db-separator">';
+    // ── Content ───────────────────────────────────────────────────────
+    case 'Metric':    return _dbMetric(props);
+    case 'Chart':     return _dbChart(props);
+    case 'Table':     return _dbTable(props);
+    case 'Alert':     return _dbAlert(props);
+    case 'Timeline':  return _dbTimeline(props);
+    case 'Code':      return _dbCode(props);
+    case 'Markdown':  return _dbMarkdown(props);
+    case 'Image':     return _dbImage(props);
+    default:          return `<div class="db-unknown" data-type="${escapeHtml(String(node.type || ''))}"></div>`;
+  }
+}
+
+function _dbChildren(children) {
+  return children.map(_renderDbNode).join('');
+}
+
+// ── Layout primitives ──────────────────────────────────────────────────
+
+function _dbStack(props, children) {
+  const dir = props.direction === 'horizontal' ? 'horizontal' : 'vertical';
+  const gap = _dbEnum(_DB_GAP, props.gap, 'md');
+  return `<div class="db-stack" data-direction="${dir}" data-gap="${gap}">${_dbChildren(children)}</div>`;
+}
+
+function _dbGrid(props, children) {
+  const cols = Math.min(4, Math.max(1, Number(props.columns) || 2));
+  const gap = _dbEnum(_DB_GAP, props.gap, 'md');
+  return `<div class="db-grid" data-columns="${cols}" data-gap="${gap}">${_dbChildren(children)}</div>`;
+}
+
+function _dbCard(props, children) {
+  const tone = _dbEnum(_DB_TONE, props.tone, 'neutral');
+  const title = props.title ? `<div class="db-card-title">${escapeHtml(props.title)}</div>` : '';
+  return `<section class="db-card" data-tone="${tone}">${title}<div class="db-card-body">${_dbChildren(children)}</div></section>`;
+}
+
+// ── Content components ────────────────────────────────────────────────
+
+function _dbMetric(props) {
+  const label = escapeHtml(props.label || '');
+  const value = escapeHtml(String(props.value == null ? '' : props.value));
+  const tone = _dbEnum(_DB_TONE, props.tone, 'neutral');
+  const delta = props.delta != null
+    ? `<div class="db-metric-delta" data-tone="${tone}">${escapeHtml(String(props.delta))}</div>` : '';
+  return `<div class="db-metric" data-tone="${tone}">
+    <div class="db-metric-label">${label}</div>
+    <div class="db-metric-value">${value}</div>
+    ${delta}
+  </div>`;
+}
+
+function _dbAlert(props) {
+  const level = _dbEnum(_DB_LEVEL, props.level, 'info');
+  const title = escapeHtml(props.title || '');
+  const body = props.body ? `<div class="db-alert-body">${escapeHtml(props.body)}</div>` : '';
+  return `<div class="db-alert" data-level="${level}" role="status">
+    <div class="db-alert-title">${title}</div>${body}
+  </div>`;
+}
+
+function _dbTable(props) {
+  const cols = Array.isArray(props.columns) ? props.columns : [];
+  const rows = Array.isArray(props.rows) ? props.rows : [];
+  if (!cols.length) return '<div class="db-table-empty"></div>';
+  const head = cols.map(c => {
+    const numeric = c && c.numeric ? ' data-numeric="1"' : '';
+    return `<th${numeric}>${escapeHtml((c && (c.label || c.key)) || '')}</th>`;
+  }).join('');
+  const body = rows.map(r => {
+    const cells = cols.map(c => {
+      const k = c && c.key;
+      const v = (k && r && Object.prototype.hasOwnProperty.call(r, k)) ? r[k] : '';
+      const numeric = c && c.numeric ? ' data-numeric="1"' : '';
+      return `<td${numeric}>${escapeHtml(String(v == null ? '' : v))}</td>`;
+    }).join('');
+    return `<tr>${cells}</tr>`;
+  }).join('');
+  return `<div class="db-table-wrap"><table class="db-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
+function _dbTimeline(props) {
+  const items = Array.isArray(props.items) ? props.items : [];
+  if (!items.length) return '<div class="db-timeline-empty"></div>';
+  const lis = items.map(it => {
+    const time = escapeHtml((it && it.time) || '');
+    const label = escapeHtml((it && it.label) || '');
+    const body = it && it.body ? `<div class="db-timeline-body">${escapeHtml(it.body)}</div>` : '';
+    return `<li class="db-timeline-item">
+      <div class="db-timeline-time">${time}</div>
+      <div class="db-timeline-label">${label}</div>
+      ${body}
+    </li>`;
+  }).join('');
+  return `<ol class="db-timeline">${lis}</ol>`;
+}
+
+function _dbCode(props) {
+  const lang = escapeHtml(props.lang || '');
+  const code = escapeHtml(String(props.code == null ? '' : props.code));
+  const langAttr = lang ? ` data-lang="${lang}"` : '';
+  return `<pre class="db-code"${langAttr}><code>${code}</code></pre>`;
+}
+
+function _dbMarkdown(props) {
+  // Accept `text` (schema name) or `content` (common model guess) — without
+  // this alias the model's `{ Markdown: { content: "..." } }` silently
+  // collapses to an empty bubble and the section disappears.
+  const raw = props.text != null ? props.text : props.content;
+  const text = String(raw == null ? '' : raw);
+  // Recursive call back into renderMarkdownFull keeps the same feature set
+  // (tables / lists / inline code / autolinks); strip leading `:::dashboard`
+  // re-entry to prevent an infinite-render loop if the model nests one.
+  const cleaned = text.replace(/:::dashboard[\s\S]*?:::/g, '');
+  return `<div class="db-markdown">${renderMarkdownFull(cleaned)}</div>`;
+}
+
+function _dbImage(props) {
+  const src = String(props.src || '');
+  if (!src) return '';
+  const alt = escapeHtml(props.alt || '');
+  const caption = props.caption
+    ? `<figcaption class="db-image-caption">${escapeHtml(props.caption)}</figcaption>` : '';
+  return `<figure class="db-image"><img src="${src}" alt="${alt}">${caption}</figure>`;
+}
+
+// ── Chart (minimal inline SVG; line/bar/area/pie) ─────────────────────
+
+function _dbChart(props) {
+  const kind = _dbEnum(_DB_CHART_KIND, props.kind, 'bar');
+  const data = Array.isArray(props.data) ? props.data : [];
+  if (!data.length) return '<div class="db-chart-empty"></div>';
+  if (kind === 'pie') return _dbPie(data);
+  return _dbXyChart(kind, data);
+}
+
+function _dbPie(data) {
+  // data: [{label, value}, ...]
+  const items = data.filter(d => d && Number.isFinite(Number(d.value)) && Number(d.value) > 0);
+  const total = items.reduce((a, d) => a + Number(d.value), 0);
+  if (!total) return '<div class="db-chart-empty"></div>';
+  const cx = 50, cy = 50, r = 45;
+  let acc = 0;
+  const segs = items.map((d, i) => {
+    const v = Number(d.value);
+    const startAngle = (acc / total) * Math.PI * 2 - Math.PI / 2;
+    acc += v;
+    const endAngle = (acc / total) * Math.PI * 2 - Math.PI / 2;
+    const large = (v / total) > 0.5 ? 1 : 0;
+    const x1 = cx + r * Math.cos(startAngle), y1 = cy + r * Math.sin(startAngle);
+    const x2 = cx + r * Math.cos(endAngle),   y2 = cy + r * Math.sin(endAngle);
+    return `<path d="M${cx},${cy} L${x1.toFixed(2)},${y1.toFixed(2)} A${r},${r} 0 ${large} 1 ${x2.toFixed(2)},${y2.toFixed(2)} Z" class="db-chart-slice" data-idx="${i % 6}"></path>`;
+  }).join('');
+  const legend = items.map((d, i) =>
+    `<li data-idx="${i % 6}"><span class="db-chart-swatch"></span>${escapeHtml(d.label || '')} <span class="db-chart-val">${escapeHtml(String(d.value))}</span></li>`
+  ).join('');
+  return `<div class="db-chart" data-kind="pie">
+    <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" class="db-chart-svg">${segs}</svg>
+    <ol class="db-chart-legend">${legend}</ol>
+  </div>`;
+}
+
+function _dbXyChart(kind, data) {
+  // data: [{x, y}, ...] — x is label (string), y is numeric.
+  const points = data.map(d => ({ x: String((d && d.x) ?? ''), y: Number((d && d.y) ?? 0) }))
+    .filter(p => Number.isFinite(p.y));
+  if (!points.length) return '<div class="db-chart-empty"></div>';
+  const W = 320, H = 140, padL = 32, padR = 8, padT = 8, padB = 22;
+  const innerW = W - padL - padR, innerH = H - padT - padB;
+  const maxY = Math.max(...points.map(p => p.y), 0);
+  const minY = Math.min(...points.map(p => p.y), 0);
+  const span = (maxY - minY) || 1;
+  const xOf = (i) => padL + (points.length === 1 ? innerW / 2 : (i / (points.length - 1)) * innerW);
+  const yOf = (y) => padT + innerH - ((y - minY) / span) * innerH;
+  const axis = `<line x1="${padL}" y1="${padT + innerH}" x2="${W - padR}" y2="${padT + innerH}" class="db-chart-axis"></line>`;
+  let body = '';
+  if (kind === 'bar') {
+    const barW = innerW / points.length * 0.6;
+    body = points.map((p, i) => {
+      const x = xOf(i) - barW / 2;
+      const y = yOf(Math.max(p.y, 0));
+      const h = Math.abs(yOf(p.y) - yOf(0));
+      return `<rect x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${barW.toFixed(2)}" height="${h.toFixed(2)}" class="db-chart-bar-rect"></rect>`;
+    }).join('');
+  } else {
+    const path = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${xOf(i).toFixed(2)},${yOf(p.y).toFixed(2)}`).join(' ');
+    if (kind === 'area') {
+      const area = `M${xOf(0).toFixed(2)},${yOf(minY).toFixed(2)} ` +
+        points.map((p, i) => `L${xOf(i).toFixed(2)},${yOf(p.y).toFixed(2)}`).join(' ') +
+        ` L${xOf(points.length - 1).toFixed(2)},${yOf(minY).toFixed(2)} Z`;
+      body = `<path d="${area}" class="db-chart-area"></path><path d="${path}" class="db-chart-line"></path>`;
+    } else {
+      body = `<path d="${path}" class="db-chart-line"></path>` +
+        points.map((p, i) => `<circle cx="${xOf(i).toFixed(2)}" cy="${yOf(p.y).toFixed(2)}" r="2.5" class="db-chart-dot"></circle>`).join('');
+    }
+  }
+  const labels = points.map((p, i) => {
+    if (points.length > 8 && i % Math.ceil(points.length / 6) !== 0 && i !== points.length - 1) return '';
+    return `<text x="${xOf(i).toFixed(2)}" y="${(H - 6).toFixed(2)}" class="db-chart-xlabel" text-anchor="middle">${escapeHtml(p.x)}</text>`;
+  }).join('');
+  return `<div class="db-chart" data-kind="${kind}">
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" class="db-chart-svg">
+      ${axis}${body}${labels}
+    </svg>
+  </div>`;
 }
 
 // Detect video src by extension. Dispatches markdown ![](src) to <video>
@@ -745,5 +1007,7 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     _linkifyBareEmails,
     inlineFormat,
     escapeHtml,
+    renderMarkdown,
+    renderDashboard,
   };
 }

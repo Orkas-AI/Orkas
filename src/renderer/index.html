@@ -77,14 +77,14 @@
               <div class="chat-input-overlay">
                 <div class="chat-attachments" id="new-chat-attachments" style="display:none"></div>
               </div>
-              <textarea id="new-chat-input" data-i18n-placeholder="new_chat.input_placeholder" placeholder="Type a message..." rows="2"></textarea>
+              <textarea id="new-chat-input" data-i18n-placeholder="new_chat.input_placeholder" placeholder="Type a message. Use @ to call agents, skills, connectors." rows="2"></textarea>
               <div class="chat-bottom-bar">
                 <button type="button" class="chat-attach-btn" id="new-chat-attach-btn" data-i18n-title="new_chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
                 <!-- Voice-to-text mic button (stripped in OrkasOpen — see OpenSource/SyncCode/strip-rules.json). -->
                 <button type="button" class="chat-attach-btn chat-mic-btn" id="new-chat-mic-btn" data-i18n-title="chat.mic_title" title="Voice input">
                   <span data-ui-icon="mic" data-ui-icon-class="chat-mic-icon"></span>
                 </button>
-                <button type="button" class="chat-recipient-chip" id="new-chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Switch recipient (commander / agent)">
+                <button type="button" class="chat-recipient-chip" id="new-chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Choose agent, skill, or connector">
                   <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
                   <span class="chat-recipient-name" id="new-chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
                 </button>
@@ -167,14 +167,14 @@
                   <div class="chat-attachments" id="chat-attachments" style="display:none"></div>
                 </div>
                 <div class="chat-quote-preview" id="chat-quote-preview" style="display:none"></div>
-                <textarea id="chat-input" data-i18n-placeholder="chat.input_placeholder" placeholder="Continue the conversation..." rows="2"></textarea>
+                <textarea id="chat-input" data-i18n-placeholder="chat.input_placeholder" placeholder="Continue the conversation. Use @ to call agents, skills, connectors." rows="2"></textarea>
                 <div class="chat-bottom-bar">
                   <button type="button" class="chat-attach-btn" id="chat-attach-btn" data-i18n-title="chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
                   <!-- Voice-to-text mic button (stripped in OrkasOpen — see OpenSource/SyncCode/strip-rules.json). -->
                   <button type="button" class="chat-attach-btn chat-mic-btn" id="chat-mic-btn" data-i18n-title="chat.mic_title" title="Voice input">
                     <span data-ui-icon="mic" data-ui-icon-class="chat-mic-icon"></span>
                   </button>
-                  <button type="button" class="chat-recipient-chip" id="chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Switch recipient (commander / agent)">
+                  <button type="button" class="chat-recipient-chip" id="chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Choose agent, skill, or connector">
                     <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
                     <span class="chat-recipient-name" id="chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
                   </button>
@@ -205,6 +205,22 @@
               <button type="button" class="conversation-info-tab" data-info-tab="attachments" data-i18n="conversation_info.tab_attachments">Attachments</button>
             </div>
             <div class="conversation-info-body" id="conversation-info-body"></div>
+          </aside>
+          <!-- Markdown viewer / editor drawer. Hosts the shared mountMdViewEdit
+               component (modules/md-view-edit.js) for either an assistant-
+               generated .md file (workspace source) or a free-form scratch
+               edit triggered from a chat-selection context menu (ephemeral
+               source). Slides in from the right just like conversation-info,
+               but is its own single-purpose surface. -->
+          <aside class="chat-md-drawer-panel" id="chat-md-drawer-panel" hidden>
+            <div class="chat-md-drawer-header">
+              <div class="chat-md-drawer-title" id="chat-md-drawer-title"></div>
+              <div class="chat-md-drawer-actions detail-actions" id="chat-md-drawer-actions"></div>
+              <button type="button" class="chat-md-drawer-close" id="chat-md-drawer-close"
+                      data-i18n-title="common.close" data-i18n-aria-label="common.close"
+                      title="Close" aria-label="Close">×</button>
+            </div>
+            <div class="chat-md-drawer-body markdown-body" id="chat-md-drawer-body"></div>
           </aside>
         </div>
       </section>
@@ -357,6 +373,10 @@
                   <div class="agents-detail-label" data-i18n="agents.label_runtime">External agent</div>
                   <div class="agents-detail-runtime" id="agents-detail-runtime"></div>
                 </div>
+                <div class="agents-detail-section" id="agents-detail-project-dir-section" style="display:none">
+                  <div class="agents-detail-label" data-i18n="agents.label_project_dir">Project directory</div>
+                  <div class="agents-detail-project-dir" id="agents-detail-project-dir"></div>
+                </div>
                 <div class="agents-detail-section">
                   <div class="agents-detail-label" data-i18n="agents.label_desc">Summary</div>
                   <div class="agents-detail-desc" id="agents-detail-desc" contenteditable="false"></div>
@@ -364,6 +384,11 @@
                 <div class="agents-detail-section agents-detail-section-workflow">
                   <div class="agents-detail-label" data-i18n="agents.label_workflow">Workflow</div>
                   <div class="agents-detail-workflow markdown-body" id="agents-detail-workflow" contenteditable="false"></div>
+                </div>
+                <div class="agents-detail-section" id="agents-detail-output-format-section">
+                  <div class="agents-detail-label" data-i18n="agents.label_output_format">Output format</div>
+                  <div class="agents-detail-output-format" id="agents-detail-output-format"></div>
+                  <div class="form-hint muted" data-i18n="agents.output_format_hint">Hint to the agent on how to render replies. Auto = let the model pick per output.</div>
                 </div>
               </div>
             </div>
@@ -540,8 +565,10 @@
       <section class="panel" id="panel-settings">
         <div class="settings-container">
           <div class="settings-header">
-            <h2 data-i18n="settings.title">Settings</h2>
-            <div class="settings-version" id="settings-version"></div>
+            <div class="settings-heading">
+              <h2 data-i18n="settings.title">Settings</h2>
+              <div class="settings-version" id="settings-version"></div>
+            </div>
           </div>
 
           <!-- 4-tab restructure (batch 6 + 4 decision; see PC/docs/plans/multi-device-sync.md §4.9).
@@ -872,8 +899,8 @@
           <input type="text" id="agent-name-input" data-i18n-placeholder="agent_modal.name_placeholder" placeholder="e.g. Code Review Assistant" />
         </div>
         <div class="form-row">
-          <label data-i18n="agent_modal.category">Category</label>
-          <div class="ai-select" id="agent-category-select"></div>
+          <label><span data-i18n="agents.label_output_format">Output format</span> <span class="form-hint" data-i18n="agents.output_format_hint">Tells the agent how to render replies.</span></label>
+          <div class="ai-select" id="agent-output-format-select"></div>
         </div>
         <div class="form-row">
           <label><span data-i18n="agent_modal.desc">Summary</span> <span class="form-hint" data-i18n="agent_modal.desc_hint">One line on what it does — the AI will generate a workflow from this</span></label>
@@ -883,8 +910,8 @@
 
       <!-- External panel: bind a local CLI as the runtime. CLI selector
            appears first; name + description are pre-filled from the chosen
-           CLI's defaults but stay editable. claude / codex additionally
-           expose a project-directory input. -->
+           CLI's defaults but stay editable. claude / codex get a
+           project-directory setting on the detail page after creation. -->
       <div class="skill-modal-panel" data-agent-panel="external">
         <div class="form-row">
           <label data-i18n="agent_modal.ext_cli_label">Agent</label>
@@ -893,10 +920,6 @@
         <div class="form-row">
           <label data-i18n="agent_modal.ext_name">Name</label>
           <input type="text" id="agent-ext-name-input" data-i18n-placeholder="agent_modal.ext_name_placeholder" placeholder="e.g. Claude Code" />
-        </div>
-        <div class="form-row">
-          <label data-i18n="agent_modal.category">Category</label>
-          <div class="ai-select" id="agent-ext-category-select"></div>
         </div>
         <div class="form-row">
           <label data-i18n="agent_modal.ext_desc">Summary</label>
@@ -932,10 +955,6 @@
           <input type="text" id="skill-name" data-i18n-placeholder="skill_modal.name_placeholder" placeholder="e.g. web-summary" />
         </div>
         <div class="form-row">
-          <label data-i18n="skill_modal.category">Category</label>
-          <div class="ai-select" id="skill-category-select"></div>
-        </div>
-        <div class="form-row">
           <label data-i18n="skill_modal.description">Summary</label>
           <textarea id="skill-description" rows="4" data-i18n-placeholder="skill_modal.desc_placeholder" placeholder="One line on what this skill does and when to use it..."></textarea>
         </div>
@@ -969,8 +988,13 @@
     </div>
   </div>
 
-  <!-- Agent picker popup (new-chat only) -->
+  <!-- Agent / skill / connector picker popup -->
   <div class="skill-picker" id="agent-picker" style="display:none">
+    <div class="skill-picker-tabs" role="tablist" aria-label="Picker type">
+      <button type="button" class="skill-picker-tab active" data-agent-picker-tab="agents" data-i18n="agent_picker.tab_agents">Agents</button>
+      <button type="button" class="skill-picker-tab" data-agent-picker-tab="skills" data-i18n="agent_picker.tab_skills">Skills</button>
+      <button type="button" class="skill-picker-tab" data-agent-picker-tab="connectors" data-i18n="agent_picker.tab_connectors">Connectors</button>
+    </div>
     <div class="skill-picker-header">
       <input type="text" id="agent-picker-search" data-i18n-placeholder="agent_picker.search_placeholder" placeholder="Search agents..." autocomplete="off" />
     </div>
@@ -1106,6 +1130,9 @@
   <script src="./modules/chat-lightbox.js"></script>
   <script src="./modules/icons.js"></script>
   <script src="./modules/chat-file-viewer.js"></script>
+  <script src="./modules/md-view-edit.js"></script>
+  <script src="./modules/context-menu.js"></script>
+  <script src="./modules/chat-md-drawer.js"></script>
   <script src="./modules/strip-structural-blocks.js"></script>
   <script src="./modules/projects.js"></script>
   <script src="./modules/project-detail.js"></script>
@@ -1169,6 +1196,7 @@
   </script>
   <script src="./vendor/mathjax/tex-chtml.js" defer></script>
   <script src="./modules/math.js"></script>
+  <script src="./modules/feedback.js"></script>
   <script src="./modules/settings.js"></script>
   <script src="./modules/sync_settings.js"></script>
   <script src="./modules/sync_refresh.js"></script>

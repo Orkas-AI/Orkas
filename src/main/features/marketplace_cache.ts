@@ -9,8 +9,8 @@
  *   2. `sweepIfNeeded()` — entry-time GC: when total cache > 100 MB OR any entry's
  *      `last_used_at` > 7d ago, evict expired then LRU-trim until size ≤ 80 MB.
  *
- * Cache hit rule (`isCacheFresh`): persisted `_cache.json` must carry `version` + `published_at`
- * matching the server-list row for this id. Any mismatch (uploader pushed a new version) ⇒ miss,
+ * Cache hit rule (`isCacheFresh`): persisted `_cache.json` must carry `version` + freshness
+ * timestamp matching the server-list row for this id. Any mismatch (uploader republished) ⇒ miss,
  * caller refetches. The install target lives separately at `<uid>/local/marketplace/{agents,
  * skills}/<id>/` with its own `_install.json` version pin (read by `marketplace_reconcile.ts`).
  * The cache is a strictly local staging area and may be cleared by the user without touching
@@ -46,6 +46,9 @@ export interface CacheMeta {
   version: string;
   /** `marketplace_<kind>s.published_at` (ms) at fetch time — staleness check. */
   published_at: number;
+  /** `marketplace_<kind>s.updated_at` (ms) at fetch time. Preferred staleness key because
+   *  republishing keeps `published_at` stable. Optional for older cache entries. */
+  updated_at?: number;
   /** When the bytes landed on disk (ms). */
   fetched_at: number;
   /** Bumped on every detail-page read or install. Drives LRU eviction. */
@@ -65,16 +68,20 @@ async function _writeMeta(dir: string, meta: CacheMeta): Promise<void> {
   await fsp.writeFile(_metaFile(dir), JSON.stringify(meta, null, 2), 'utf8');
 }
 
-/** Hit check. Caller passes the server-list row's `version` + `published_at`; both must match
+function _freshnessAt(row: { published_at: number; updated_at?: number }): number {
+  return typeof row.updated_at === 'number' ? row.updated_at : row.published_at;
+}
+
+/** Hit check. Caller passes the server-list row's `version` + freshness timestamp; both must match
  *  the cached values. The cache dir itself existing is necessary but not sufficient — a
  *  half-written dir would also exist, hence the field comparison. */
-export async function isCacheFresh(kind: 'agent' | 'skill', id: string, expect: { version: string; published_at: number }): Promise<boolean> {
+export async function isCacheFresh(kind: 'agent' | 'skill', id: string, expect: { version: string; published_at: number; updated_at?: number }): Promise<boolean> {
   const dir = _cacheDir(kind, id);
   if (!fs.existsSync(dir)) return false;
   const meta = await _readMeta(dir);
   if (!meta) return false;
   if (meta.version !== expect.version) return false;
-  if (meta.published_at !== expect.published_at) return false;
+  if (_freshnessAt(meta) !== _freshnessAt(expect)) return false;
   return true;
 }
 
@@ -97,7 +104,7 @@ export async function touchCacheEntry(kind: 'agent' | 'skill', id: string): Prom
  *  a previous version surviving). Sentinel-style atomic write: meta is written last so a
  *  half-written entry fails `isCacheFresh`. */
 export async function writeAgentCache(
-  id: string, agentJson: Record<string, unknown>, meta: { version: string; published_at: number },
+  id: string, agentJson: Record<string, unknown>, meta: { version: string; published_at: number; updated_at?: number },
 ): Promise<void> {
   const dir = _cacheDir('agent', id);
   await fsp.rm(dir, { recursive: true, force: true });
@@ -106,6 +113,7 @@ export async function writeAgentCache(
   const now = Date.now();
   await _writeMeta(dir, {
     server_id: id, version: meta.version, published_at: meta.published_at,
+    ...(typeof meta.updated_at === 'number' ? { updated_at: meta.updated_at } : {}),
     fetched_at: now, last_used_at: now,
   });
 }
@@ -124,7 +132,7 @@ export async function readAgentCache(id: string): Promise<Record<string, unknown
 export async function writeSkillCache(
   id: string,
   extract: (dir: string) => Promise<void> | void,
-  meta: { version: string; published_at: number },
+  meta: { version: string; published_at: number; updated_at?: number },
 ): Promise<void> {
   const dir = _cacheDir('skill', id);
   await fsp.rm(dir, { recursive: true, force: true });
@@ -133,6 +141,7 @@ export async function writeSkillCache(
   const now = Date.now();
   await _writeMeta(dir, {
     server_id: id, version: meta.version, published_at: meta.published_at,
+    ...(typeof meta.updated_at === 'number' ? { updated_at: meta.updated_at } : {}),
     fetched_at: now, last_used_at: now,
   });
 }

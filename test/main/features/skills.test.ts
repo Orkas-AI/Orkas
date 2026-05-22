@@ -326,12 +326,22 @@ describe('skills › extractSkillContainers', () => {
   // span — would falsely trigger a real skill write. This is the "agent
   // section line 229 / chat_skill_setup.md showing protocol" risk surface.
 
-  it('B5: `<skill>` inside fenced ```xml block must NOT match', async () => {
+  it('B5: `<skill>` inside fenced non-XML code block must NOT match', async () => {
     const s = await loadSkills();
-    const text = 'Here is the format:\n```xml\n<skill>\n<skill_id>example</skill_id>\n<<<skill-file path=SKILL.md\nname: "example"\n>>>\n</skill>\n```\nThat is the shape.';
+    const text = 'Here is the format:\n```\n<skill>\n<skill_id>example</skill_id>\n<<<skill-file path=SKILL.md\nname: "example"\n>>>\n</skill>\n```\nThat is the shape.';
     const r = s.extractSkillContainers(text);
     expect(r.containers).toEqual([]);
     expect(r.cleanText).toBe(text); // Untouched — it's prose teaching, not a real op.
+  });
+
+  it('B5b: `<skill>` inside fenced ```xml block is treated as structural', async () => {
+    const s = await loadSkills();
+    const text = '```xml\n<skill>\n<skill_id>example</skill_id>\n<<<skill-file path=SKILL.md\nbody\n>>>\n</skill>\n```';
+    const r = s.extractSkillContainers(text);
+    expect(r.containers).toHaveLength(1);
+    expect(r.containers[0].skillId).toBe('example');
+    expect(r.containers[0].files.map((f: any) => f.path)).toEqual(['SKILL.md']);
+    expect(r.cleanText).toBe('```xml\n\n```');
   });
 
   it('B6: `<skill>` inside inline backtick span must NOT match', async () => {
@@ -342,16 +352,24 @@ describe('skills › extractSkillContainers', () => {
     expect(r.cleanText).toBe(text);
   });
 
+  it('B6b: inline quoted `<skill>` text must NOT match', async () => {
+    const s = await loadSkills();
+    const text = '请输出 "<skill><skill_id>example</skill_id></skill>" 这些字符';
+    const r = s.extractSkillContainers(text);
+    expect(r.containers).toEqual([]);
+    expect(r.cleanText).toBe(text);
+  });
+
   it('B7: real container AFTER a code-fence example — only the real one is extracted', async () => {
     const s = await loadSkills();
     // Critical: this is the failure mode the guard prevents — a naive
     // regex would match the FIRST `<skill>` (the fenced example) and
     // try to write fictional files, ignoring the real container below.
-    const text = 'Format:\n```xml\n<skill>\n<skill_id>example</skill_id>\n</skill>\n```\nAnd here is the real one:\n<skill>\n<skill_id>real</skill_id>\n<<<skill-file path=SKILL.md\nbody\n>>>\n</skill>';
+    const text = 'Format:\n```\n<skill>\n<skill_id>example</skill_id>\n</skill>\n```\nAnd here is the real one:\n<skill>\n<skill_id>real</skill_id>\n<<<skill-file path=SKILL.md\nbody\n>>>\n</skill>';
     const r = s.extractSkillContainers(text);
     expect(r.containers).toHaveLength(1);
     expect(r.containers[0].skillId).toBe('real');
-    expect(r.cleanText).toContain('```xml');
+    expect(r.cleanText).toContain('```');
     expect(r.cleanText).toContain('<skill>\n<skill_id>example</skill_id>'); // fenced example survives
   });
 });
@@ -359,7 +377,7 @@ describe('skills › extractSkillContainers', () => {
 describe('skills › applySkillContainerFromCommander › create', () => {
   it('creates skill from frontmatter `name`, writes all blocks', async () => {
     const s = await loadSkills();
-    const skillMdContent = '---\nname: "social-fetch"\ndescription_zh: "抓取并分析"\ndescription_en: "Fetch and analyze"\n---\n\n# When to use\n…\n';
+    const skillMdContent = '---\nname: "social-fetch"\ndescription_zh: "抓取并分析"\ndescription_en: "Fetch and analyze"\ncategory: "data"\n---\n\n# When to use\n…\n';
     const r = await s.applySkillContainerFromCommander({
       files: [
         { path: 'SKILL.md', content: skillMdContent },
@@ -391,6 +409,23 @@ describe('skills › applySkillContainerFromCommander › create', () => {
     });
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/name|缺少/);
+  });
+
+  it('backfills category when model-authored create omits or mangles it', async () => {
+    const s = await loadSkills();
+    const missing = await s.applySkillContainerFromCommander({
+      files: [{ path: 'SKILL.md', content: '---\nname: "uncategorized"\ndescription_en: "x"\n---\n\nbody\n' }],
+    });
+    expect(missing.ok).toBe(true);
+    expect(fs.readFileSync(path.join(customSkillsDir(), 'uncategorized', 'SKILL.md'), 'utf8'))
+      .toContain('category: "general"');
+
+    const invalid = await s.applySkillContainerFromCommander({
+      files: [{ path: 'SKILL.md', content: '---\nname: "badcat"\ndescription_en: "x"\ncategory: "bad category"\n---\n\nbody\n' }],
+    });
+    expect(invalid.ok).toBe(true);
+    expect(fs.readFileSync(path.join(customSkillsDir(), 'badcat', 'SKILL.md'), 'utf8'))
+      .toContain('category: "general"');
   });
 
   it('rejects create when name has Chinese characters (charset gate)', async () => {
@@ -447,22 +482,37 @@ describe('skills › applySkillContainerFromCommander › edit', () => {
       .toContain('body');
   });
 
-  it('rejects edit when skill does not exist', async () => {
+  it('creates when skill_id target is missing but a full SKILL.md payload is present', async () => {
     const s = await loadSkills();
     const r = await s.applySkillContainerFromCommander({
       skillId: 'nonexistent',
-      files: [{ path: 'SKILL.md', content: '---\nname: "nonexistent"\n---\n\nbody\n' }],
+      files: [{
+        path: 'SKILL.md',
+        content: '---\nname: "nonexistent"\ndescription_zh: "测试技能"\ndescription_en: "Test skill"\ncategory: "general"\n---\n\n# When to use\nUse for test prompts.\n',
+      }],
+    });
+    expect(r.ok).toBe(true);
+    expect(r.kind).toBe('created');
+    expect(r.skillId).toBe('nonexistent');
+    expect(fs.existsSync(path.join(customSkillsDir(), 'nonexistent', 'SKILL.md'))).toBe(true);
+  });
+
+  it('rejects missing skill_id target when there is no SKILL.md create payload', async () => {
+    const s = await loadSkills();
+    const r = await s.applySkillContainerFromCommander({
+      skillId: 'nonexistent',
+      files: [{ path: 'scripts/run.py', content: 'pass\n' }],
     });
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/not found|不存在/i);
   });
 
   it('auto-renames the dir when SKILL.md `name` changes', async () => {
-    writeCustomSkill('oldname', 'name: "oldname"\ndescription_en: "x"', 'body');
+    writeCustomSkill('oldname', 'name: "oldname"\ndescription_en: "x"\ncategory: "general"', 'body');
     const s = await loadSkills();
     const r = await s.applySkillContainerFromCommander({
       skillId: 'oldname',
-      files: [{ path: 'SKILL.md', content: '---\nname: "newname"\ndescription_en: "x"\n---\n\nbody\n' }],
+      files: [{ path: 'SKILL.md', content: '---\nname: "newname"\ndescription_en: "x"\ncategory: "general"\n---\n\nbody\n' }],
     });
     expect(r.ok).toBe(true);
     expect(r.skillId).toBe('newname');
@@ -520,6 +570,30 @@ describe('skills › listSkills', () => {
     expect(dup).toHaveLength(1);
     expect(dup[0].source).toBe('custom');
     expect(dup[0].description_en).toBe('cx');
+  });
+
+  it('cache-only invalidator picks up marketplace file rewrites', async () => {
+    const parent = builtinSkillsDir();
+    const dir = path.join(parent, 'platform-skill');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'SKILL.md'),
+      '---\nname: "Old platform skill"\ndescription: "old"\n---\n');
+    const fixedStamp = new Date('2026-01-01T00:00:00.000Z');
+    fs.utimesSync(parent, fixedStamp, fixedStamp);
+
+    const s = await loadSkills();
+    expect((await s.listSkills()).find((x) => x.id === 'platform-skill')?.name)
+      .toBe('Old platform skill');
+
+    fs.writeFileSync(path.join(dir, 'SKILL.md'),
+      '---\nname: "New platform skill"\ndescription: "new"\n---\n');
+    fs.utimesSync(parent, fixedStamp, fixedStamp);
+
+    expect((await s.listSkills()).find((x) => x.id === 'platform-skill')?.name)
+      .toBe('Old platform skill');
+    s.clearSkillListCache();
+    expect((await s.listSkills()).find((x) => x.id === 'platform-skill')?.name)
+      .toBe('New platform skill');
   });
 });
 
@@ -687,7 +761,7 @@ describe('skills › listSkillTree', () => {
 
 describe('skills › buildSkillEditSystemPrompt', () => {
   it('renders template with skill metadata + file list, no leftover placeholders', async () => {
-    writeCustomSkill('alpha', 'name: "Alpha"\ndescription: "a demo"', 'body text');
+    writeCustomSkill('alpha', 'name: "Alpha"\ndescription: "a demo"\ncategory: "writing"', 'body text');
     const s = await loadSkills();
     const skill = (await s.getCustomSkill('alpha'))!;
     const sys = await s.buildSkillEditSystemPrompt(skill);
@@ -698,7 +772,7 @@ describe('skills › buildSkillEditSystemPrompt', () => {
     // Template no longer carries the user-input footer.
     expect(sys).not.toMatch(/##\s*用户的初始请求/);
     // All placeholders resolved.
-    expect(sys).not.toMatch(/\$skill_name|\$skill_description|\$skill_dir|\$skill_files/);
+    expect(sys).not.toMatch(/\$skill_name|\$skill_description|\$skill_category|\$category_field_definition|\$skill_dir|\$skill_files/);
   });
 });
 

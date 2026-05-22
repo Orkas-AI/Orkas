@@ -16,6 +16,11 @@ function _agentUiIconHtml(name, className) {
 // Mirror of `agents.ts::RESERVED_AGENT_NAMES` so the renderer can fail fast
 // without a round-trip. Server is still authoritative — this is just UX.
 const _RESERVED_AGENT_NAMES = new Set(['指挥官', '总指挥', 'コマンダー', '司令官', 'commander']);
+const _SPEC_CATEGORY_CODE_RE = /^[a-z][a-z0-9_-]{0,79}$/;
+function _normalizeSpecCategoryForHiddenSave(category) {
+  const code = String(category || '').trim().toLowerCase();
+  return _SPEC_CATEGORY_CODE_RE.test(code) ? code : 'general';
+}
 /** Look up the localized "External · <Brand>" label for an agent runtime
  *  type. The external badge (formerly "CLI · X") is the single
  *  user-facing tag for cli-runtime agents — name surfaces consistently
@@ -377,6 +382,14 @@ window.addEventListener('i18n-change', () => {
   }
 });
 
+async function refreshAgentsAfterMarketplaceReconcile() {
+  await loadAgents(true);
+  if (_agentEditing) return;
+  if (_selectedAgent?.id && _selectedAgent.source === 'builtin') {
+    await selectAgent(_selectedAgent.id);
+  }
+}
+
 /** Render the per-row "⋯" menu items based on the target agent's source +
  *  enabled state. Called fresh on each open so the toggle label is right
  *  and builtin agents see only the enable/disable item. */
@@ -530,6 +543,7 @@ function _renderAgentDetail(agent, editing) {
   // without entering edit mode. The header chip was removed because
   // it duplicated information the dropdown already exposes.
   _renderAgentDetailRuntime(agent);
+  _renderAgentDetailProjectDir(agent);
   const localizedDesc = pickDesc(agent, getLang()).trim();
   descEl.textContent = localizedDesc;
 
@@ -580,6 +594,8 @@ function _renderAgentDetail(agent, editing) {
   }
   _renderAgentEnabledButton({ id: agent.agent_id, enabled: agent.enabled !== false });
 
+  _renderAgentOutputFormatSection(agent);
+
   _toggleAgentFieldEditable(editing);
 }
 
@@ -602,6 +618,7 @@ function _renderAgentOutputFormatSection(agent) {
 
   const canEdit = agent.source === 'custom'
     || (agent.source === 'builtin' && typeof isDevMode === 'function' && false);
+    || (agent.source === 'builtin' && typeof isDevMode === 'function' && false);
 
   slot.innerHTML = '';
   const mount = document.createElement('div');
@@ -612,6 +629,9 @@ function _renderAgentOutputFormatSection(agent) {
     { value: 'markdown_only',  label: t('agents.output_format_markdown_only') || 'Markdown only' },
     { value: 'dashboard',      label: t('agents.output_format_dashboard')     || 'Dashboard (no artifact)' },
     { value: 'artifact',       label: t('agents.output_format_artifact')      || 'Artifact (Dashboard + HTML)' },
+    { value: 'markdown_only',  label: t('agents.output_format_markdown_only') },
+    { value: 'dashboard',      label: t('agents.output_format_dashboard') },
+    { value: 'artifact',       label: t('agents.output_format_artifact') },
   ];
   // Map legacy on-disk values to the new 3-option display. `'allow_artifacts'` is the renamed
   // `'artifact'`. `'auto'` / missing show as `'markdown_only'` (the new default); the field on
@@ -637,18 +657,21 @@ function _renderAgentOutputFormatSection(agent) {
         if (!res || !res.ok) {
           api.setValue(current);
           uiAlert((res && res.error) || t('agents.update_failed') || 'Update failed');
+          uiAlert((res && res.error) || t('agents.update_failed'));
         } else if (res.agent) {
           agent.output_format = res.agent.output_format;
         }
       } catch (err) {
         api.setValue(current);
         uiAlert((err && err.message) || 'Update failed');
+        uiAlert((err && err.message) || t('agents.update_failed'));
       }
     },
   });
   if (!canEdit) {
     // Disable the trigger — read-only display for builtin agents in
     // non-dev mode (mirrors the connectors row pattern).
+    // non-dev mode (mirrors the runtime row pattern).
     const trigger = mount.querySelector('.ai-select-trigger');
     if (trigger) { trigger.setAttribute('disabled', ''); trigger.style.pointerEvents = 'none'; trigger.style.opacity = '0.6'; }
   }
@@ -837,6 +860,106 @@ async function _renderAgentDetailRuntime(agent) {
   });
 }
 
+/** Project directory setting for external coding agents (claude / codex).
+ *  Stored in a local-only main-process config; each conversation copies
+ *  the effective value on its first coding-agent dispatch. */
+async function _renderAgentDetailProjectDir(agent) {
+  const section = document.getElementById('agents-detail-project-dir-section');
+  const slot = document.getElementById('agents-detail-project-dir');
+  if (!section || !slot) return;
+  const cli = agent.runtime?.kind === 'cli' ? agent.runtime.cli : '';
+  const supportsProjectDir = typeof cliIsCodingAgent === 'function' && cliIsCodingAgent(cli);
+  if (!supportsProjectDir) {
+    section.style.display = 'none';
+    slot.innerHTML = '';
+    return;
+  }
+  section.style.display = '';
+  slot.dataset.agentId = agent.agent_id;
+
+  const canEdit = agent.source === 'custom'
+    || (agent.source === 'builtin' && typeof isDevMode === 'function' && false);
+
+  const renderInfo = (info) => {
+    if (_selectedAgent?.id !== agent.agent_id || slot.dataset.agentId !== agent.agent_id) return;
+    const mode = info?.mode === 'custom' ? 'custom' : 'workspace';
+    const missing = mode === 'custom' && info.exists === false;
+    const pathText = String(info?.path || info?.workspace_path || '');
+    const badge = mode === 'custom'
+      ? t('agents.project_dir_custom')
+      : t('agents.project_dir_workspace');
+    const status = missing ? t('agents.project_dir_missing') : badge;
+    const cardClass = [
+      'agent-project-dir-card',
+      mode === 'workspace' ? 'is-workspace' : 'is-custom',
+      missing ? 'is-missing' : '',
+      canEdit ? '' : 'is-disabled',
+    ].filter(Boolean).join(' ');
+    slot.innerHTML = `
+      <div class="${cardClass}">
+        ${_agentUiIconHtml(missing ? 'warning' : 'folder-open', 'agent-project-dir-icon')}
+        <div class="agent-project-dir-main">
+          <div class="agent-project-dir-path" title="${escapeHtml(pathText)}">${escapeHtml(pathText)}</div>
+          <div class="agent-project-dir-mode">${escapeHtml(status)}</div>
+        </div>
+        <div class="agent-project-dir-actions">
+          <button type="button" class="btn btn-sm" data-act="pick" ${canEdit ? '' : 'disabled'}>${escapeHtml(t('input.dir.change'))}</button>
+          ${mode === 'custom' ? `<button type="button" class="btn btn-sm" data-act="reset" ${canEdit ? '' : 'disabled'}>${escapeHtml(t('agents.project_dir_use_workspace'))}</button>` : ''}
+        </div>
+      </div>`;
+    const pickBtn = slot.querySelector('[data-act="pick"]');
+    const resetBtn = slot.querySelector('[data-act="reset"]');
+    const pick = async () => {
+      if (!canEdit) return;
+      try {
+        const picked = await window.orkas.invoke('common.pickDirectory', {
+          title: t('agents.label_project_dir'),
+        });
+        if (!picked || picked.cancelled || !picked.path) return;
+        const saved = await window.orkas.invoke('agents.cliProjectDir.set', {
+          agent_id: agent.agent_id,
+          path: picked.path,
+        });
+        if (!saved || !saved.ok) {
+          await uiAlert((saved && saved.error) || t('agents.project_dir_save_failed'));
+          return;
+        }
+        renderInfo(saved.info);
+      } catch (err) {
+        await uiAlert((err && err.message) || t('agents.project_dir_save_failed'));
+      }
+    };
+    pickBtn?.addEventListener('click', (e) => { e.stopPropagation(); pick(); });
+    resetBtn?.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (!canEdit) return;
+      try {
+        const saved = await window.orkas.invoke('agents.cliProjectDir.set', {
+          agent_id: agent.agent_id,
+          path: '',
+        });
+        if (!saved || !saved.ok) {
+          await uiAlert((saved && saved.error) || t('agents.project_dir_save_failed'));
+          return;
+        }
+        renderInfo(saved.info);
+      } catch (err) {
+        await uiAlert((err && err.message) || t('agents.project_dir_save_failed'));
+      }
+    });
+  };
+
+  slot.innerHTML = `<div class="agent-project-dir-card is-loading">${_agentUiIconHtml('folder-open', 'agent-project-dir-icon')}<div class="agent-project-dir-main"><div class="agent-project-dir-path">${escapeHtml(t('common.loading'))}</div></div></div>`;
+  try {
+    const res = await window.orkas.invoke('agents.cliProjectDir.get', { agent_id: agent.agent_id });
+    if (!res || !res.ok || !res.info) throw new Error(res?.error || 'failed');
+    renderInfo(res.info);
+  } catch (err) {
+    _agentsLog.warn('load agent project dir failed', err);
+    slot.innerHTML = `<div class="agents-detail-placeholder">${escapeHtml(t('agents.project_dir_load_failed'))}</div>`;
+  }
+}
+
 /** Render the detail-page avatar slot. Custom agents get a clickable avatar
  *  that opens the picker; builtin agents just show theirs read-only. Each
  *  picker change is sent as an `agents.update` IPC and the local cache is
@@ -1011,10 +1134,13 @@ async function _flushAgentFieldSave({ validate = false } = {}) {
   }
   _pendingAgentField = null;
   try {
+    const body = { [field]: value };
+    const category = _normalizeSpecCategoryForHiddenSave(_selectedAgent.category);
+    if (category !== _selectedAgent.category) body.category = category;
     const res = await apiFetch(`/api/agents/${encodeURIComponent(_selectedAgent.id)}/update`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ [field]: value }),
+      body: JSON.stringify(body),
     });
     const data = await res.json();
     if (!data.ok) {
@@ -1169,14 +1295,28 @@ function openAgentModal() {
     mountExternalCliSelect((cli) => _applyExternalCliDefaults(cli)).catch(() => {});
   }
 
-  // Marketplace category dropdowns (both tabs). 24h cached in main, fallback to defaults.
-  if (typeof mountMarketplaceCategorySelect === 'function') {
-    mountMarketplaceCategorySelect('agent-category-select').catch(() => {});
-    mountMarketplaceCategorySelect('agent-ext-category-select').catch(() => {});
-  }
+  // Output-format dropdown (Create tab only — External/CLI agents don't read the worker prompt
+  // hint). Default `markdown_only` matches the new "opt-in to richer formats" stance documented
+  // in PC/CLAUDE.md §6; detail-page dropdown does the same 3-option set + maps legacy values.
+  _mountAgentOutputFormatCreateSelect();
 
   modal.classList.add('open');
   setTimeout(() => document.getElementById('agent-name-input')?.focus(), 50);
+}
+
+function _mountAgentOutputFormatCreateSelect() {
+  const slot = document.getElementById('agent-output-format-select');
+  if (!slot) return;
+  // Mount directly on the slot — _aiSelectMount stamps `dataset.value` on the
+  // element it's given, and _saveCreateAgent reads `slot.dataset.value`. An
+  // intermediate wrapper div would put the dataset out of reach of the save.
+  slot.innerHTML = '';
+  const options = [
+    { value: 'markdown_only', label: t('agents.output_format_markdown_only') },
+    { value: 'dashboard',     label: t('agents.output_format_dashboard') },
+    { value: 'artifact',      label: t('agents.output_format_artifact') },
+  ];
+  _aiSelectMount(slot, { options, value: 'markdown_only' });
 }
 window.openAgentModal = openAgentModal;
 
@@ -1222,11 +1362,13 @@ async function _saveCreateAgent({ msgEl }) {
     return;
   }
 
-  const category = document.getElementById('agent-category-select')?.dataset.value || '';
+  // Output-format pick from the modal's dropdown. Default `markdown_only` if for some reason the
+  // dataset wasn't stamped (defensive — _mountAgentOutputFormatCreateSelect always sets it).
+  const outputFormat = document.getElementById('agent-output-format-select')?.dataset.value || 'markdown_only';
 
   try {
     const avatar = randomAgentAvatar();
-    const body = { name, description, icon: avatar.icon, color: avatar.color, category };
+    const body = { name, description, icon: avatar.icon, color: avatar.color, category: 'general', output_format: outputFormat };
     const res = await apiFetch('/api/agents/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1296,8 +1438,6 @@ async function _saveExternalAgent({ msgEl }) {
   const description_zh = editingZh ? desc : (defaults ? defaults.description_zh : desc);
   const description_en = editingZh ? (defaults ? defaults.description_en : desc) : desc;
 
-  const category = document.getElementById('agent-ext-category-select')?.dataset.value || '';
-
   try {
     const avatar = randomAgentAvatar();
     const body = {
@@ -1306,7 +1446,7 @@ async function _saveExternalAgent({ msgEl }) {
       description_zh, description_en,
       icon: avatar.icon, color: avatar.color,
       runtime: { kind: 'cli', cli },
-      category,
+      category: 'general',
     };
     const res = await apiFetch('/api/agents/create', {
       method: 'POST',
@@ -1586,6 +1726,40 @@ if (typeof window !== 'undefined') {
 // Set on every `_openAgentPicker`; consumed by `_renderAgentPickerList` and
 // the search-input change handler so live filtering stays scoped.
 let _pickerBoundAgentIds = null;
+let _pickerBoundSkillIds = null;
+let _agentPickerTab = 'agents';
+const _AGENT_PICKER_TABS = new Set(['agents', 'skills', 'connectors']);
+
+function _normalizeAgentPickerTab(tab) {
+  return _AGENT_PICKER_TABS.has(tab) ? tab : 'agents';
+}
+
+function _agentPickerSearchPlaceholder() {
+  if (_agentPickerTab === 'skills') return t('agent_picker.search_skills_placeholder');
+  if (_agentPickerTab === 'connectors') return t('agent_picker.search_connectors_placeholder');
+  return t('agent_picker.search_placeholder');
+}
+
+function _updateAgentPickerChrome() {
+  const picker = document.getElementById('agent-picker');
+  if (!picker) return;
+  picker.querySelectorAll('[data-agent-picker-tab]').forEach((btn) => {
+    const active = btn.dataset.agentPickerTab === _agentPickerTab;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-selected', active ? 'true' : 'false');
+  });
+  const search = document.getElementById('agent-picker-search');
+  if (search) search.placeholder = _agentPickerSearchPlaceholder();
+}
+
+function _setAgentPickerTab(tab, opts = {}) {
+  _agentPickerTab = _normalizeAgentPickerTab(tab);
+  const search = document.getElementById('agent-picker-search');
+  if (search && !opts.keepSearch) search.value = '';
+  _updateAgentPickerChrome();
+  _renderAgentPickerList(search ? search.value : '');
+  if (opts.focusSearch !== false) setTimeout(() => search?.focus(), 0);
+}
 
 function _resolveActiveProjectId(anchorId) {
   if (anchorId === 'new-chat-recipient-chip') {
@@ -1616,21 +1790,29 @@ async function _openAgentPicker(anchorBtn) {
   // agent silently disappears from the list. Mirror the `setView('agents')`
   // force-refresh in `boot.js` here so the picker is also a ground-truth
   // surface; cost is one IPC + dir scan per picker open (sub-ms in practice).
-  await loadAgents(true);
+  await Promise.all([
+    loadAgents(true),
+    (typeof loadSkills === 'function' ? loadSkills(true) : Promise.resolve()),
+    (typeof loadConnectors === 'function' ? loadConnectors() : Promise.resolve()),
+  ]);
   // Refresh project-scope bindings on every open so the picker reflects
   // whatever project the user just picked (commander chip) or whatever
   // project the active conv belongs to.
   _pickerBoundAgentIds = null;
+  _pickerBoundSkillIds = null;
   const pid = _resolveActiveProjectId(anchorBtn.id);
   if (pid) {
     try {
       const res = await window.orkas.invoke('projects.bindings.list', { projectId: pid });
-      if (res?.ok) _pickerBoundAgentIds = new Set((res.bindings && res.bindings.agents) || []);
+      if (res?.ok) {
+        _pickerBoundAgentIds = new Set((res.bindings && res.bindings.agents) || []);
+        _pickerBoundSkillIds = new Set((res.bindings && res.bindings.skills) || []);
+      }
     } catch (_) { /* fall back to global listing */ }
   }
   // Render first so measurement in _positionPopoverAboveOrBelow reflects
   // the real list height (not stale content from a previous open).
-  _renderAgentPickerList('');
+  _setAgentPickerTab('agents', { focusSearch: false });
   _positionPopoverAboveOrBelow(picker, anchorBtn);
   setTimeout(() => document.getElementById('agent-picker-search')?.focus(), 30);
 }
@@ -1640,14 +1822,24 @@ function _closeAgentPicker() {
   if (picker) picker.style.display = 'none';
   // NOTE: callers that close-without-selection (Esc / click-outside) must
   // also clear `_atKeyMark` — otherwise the next picker open would consume
-  // a stale `@`. Selection callers leave the mark so _triggerAgent can use
-  // it before clearing.
+  // a stale `@`. Selection callers leave the mark so _triggerPickerItem can
+  // use it before clearing.
 }
 
 function _renderAgentPickerList(filterText) {
   const listEl = document.getElementById('agent-picker-list');
   const picker = document.getElementById('agent-picker');
+  if (!listEl) return;
   const anchorId = picker?.dataset.anchorId || '';
+  _updateAgentPickerChrome();
+  if (_agentPickerTab === 'skills') {
+    _renderSkillPickerList(listEl, filterText, anchorId);
+    return;
+  }
+  if (_agentPickerTab === 'connectors') {
+    _renderConnectorPickerList(listEl, filterText, anchorId);
+    return;
+  }
   // Disabled agents are filtered out — picker is a "what can I dispatch right
   // now" UI, and re-enabling lives in the management page (Agents view + ⋯ menu).
   let agents = (_agentsCache || []).filter((a) => a.enabled !== false);
@@ -1686,7 +1878,7 @@ function _renderAgentPickerList(filterText) {
   const commanderName = t('chat.recipient_commander');
   const commanderMatchesFilter = !q || commanderName.toLowerCase().includes(q);
   if (!filtered.length && !(isRecipientPicker && commanderMatchesFilter)) {
-    listEl.innerHTML = `<div class="skill-picker-item" style="color:#9ca3af">${escapeHtml(t('agents.no_match'))}</div>`;
+    listEl.innerHTML = `<div class="skill-picker-empty">${escapeHtml(t('agents.no_match'))}</div>`;
     return;
   }
   const groups = { custom: [], builtin: [] };
@@ -1697,14 +1889,14 @@ function _renderAgentPickerList(filterText) {
       list.map(a => {
         const aDesc = pickDesc(a, lang).trim();
         return `
-        <div class="skill-picker-item" data-id="${escapeHtml(a.agent_id)}" data-name="${escapeHtml(a.name || a.agent_id)}">
+        <div class="skill-picker-item" data-kind="agent" data-id="${escapeHtml(a.agent_id)}" data-name="${escapeHtml(a.name || a.agent_id)}">
           <div class="skill-picker-item-name">${escapeHtml(a.name || t('agents.unnamed'))}</div>
           ${aDesc ? `<div class="skill-picker-item-desc">${escapeHtml(aDesc)}</div>` : ''}
         </div>`;
       }).join('');
   };
   const commanderHtml = (isRecipientPicker && commanderMatchesFilter)
-    ? `<div class="skill-picker-item" data-id="__commander__" data-name="${escapeHtml(commanderName)}">
+    ? `<div class="skill-picker-item" data-kind="agent" data-id="__commander__" data-name="${escapeHtml(commanderName)}">
          <div class="skill-picker-item-name">${escapeHtml(commanderName)}</div>
          <div class="skill-picker-item-desc">${escapeHtml(t('chat.recipient_commander_hint'))}</div>
        </div>`
@@ -1718,10 +1910,97 @@ function _renderAgentPickerList(filterText) {
     ? `<div class="skill-picker-empty-hint">${escapeHtml(t('agents.no_project_agents'))}</div>`
     : '';
   listEl.innerHTML = projectEmptyHint + commanderHtml + groupHtml(t('agents.source_custom'), groups.custom) + groupHtml(t('agents.source_builtin'), groups.builtin);
+  _bindAgentPickerListItems(listEl, anchorId);
+}
+
+function _matchPickerItem(q, name, desc, extra = '') {
+  if (!q) return true;
+  return String(name || '').toLowerCase().includes(q)
+    || String(desc || '').toLowerCase().includes(q)
+    || String(extra || '').toLowerCase().includes(q);
+}
+
+function _pickerMatchScore(q, name) {
+  const n = String(name || '').toLowerCase();
+  if (!q) return 0;
+  if (n === q) return 0;
+  if (n.startsWith(q)) return 1;
+  if (n.includes(q)) return 2;
+  return 3;
+}
+
+function _renderSkillPickerList(listEl, filterText, anchorId) {
+  const lang = getLang();
+  const q = (filterText || '').toLowerCase();
+  let skills = (_skillsCache || []).filter((s) => s.enabled !== false);
+  if (_pickerBoundSkillIds) skills = skills.filter((s) => _pickerBoundSkillIds.has(s.id));
+  const filtered = q
+    ? skills
+        .filter((s) => _matchPickerItem(q, s.name || s.id, pickDesc(s, lang), s.id))
+        .sort((a, b) => _pickerMatchScore(q, a.name || a.id) - _pickerMatchScore(q, b.name || b.id))
+    : skills;
+  if (!filtered.length) {
+    const hint = (!q && _pickerBoundSkillIds && _pickerBoundSkillIds.size === 0)
+      ? `<div class="skill-picker-empty-hint">${escapeHtml(t('skills.no_project_skills'))}</div>`
+      : '';
+    listEl.innerHTML = hint + `<div class="skill-picker-empty">${escapeHtml(t('skills.no_match'))}</div>`;
+    return;
+  }
+  const groups = { custom: [], builtin: [] };
+  for (const s of filtered) (groups[s.source] || groups.custom).push(s);
+  const groupHtml = (label, list) => {
+    if (!list.length) return '';
+    return `<div class="skill-picker-group-label">${escapeHtml(label)}</div>` +
+      list.map((s) => {
+        const desc = pickDesc(s, lang).trim();
+        const name = s.name || s.id;
+        return `
+        <div class="skill-picker-item" data-kind="skill" data-id="${escapeHtml(s.id)}" data-name="${escapeHtml(name)}">
+          <div class="skill-picker-item-name">${escapeHtml(name)}</div>
+          ${desc ? `<div class="skill-picker-item-desc">${escapeHtml(desc)}</div>` : ''}
+        </div>`;
+      }).join('');
+  };
+  const hint = (!q && _pickerBoundSkillIds && _pickerBoundSkillIds.size === 0)
+    ? `<div class="skill-picker-empty-hint">${escapeHtml(t('skills.no_project_skills'))}</div>`
+    : '';
+  listEl.innerHTML = hint + groupHtml(t('skills.source_custom'), groups.custom) + groupHtml(t('skills.source_builtin'), groups.builtin);
+  _bindAgentPickerListItems(listEl, anchorId);
+}
+
+function _renderConnectorPickerList(listEl, filterText, anchorId) {
+  const q = (filterText || '').toLowerCase();
+  const items = (typeof listUsableConnectorsForPicker === 'function')
+    ? listUsableConnectorsForPicker()
+    : [];
+  const filtered = q
+    ? items
+        .filter((c) => _matchPickerItem(q, c.name || c.id, c.description, `${c.id} ${c.account || ''}`))
+        .sort((a, b) => _pickerMatchScore(q, a.name || a.id) - _pickerMatchScore(q, b.name || b.id))
+    : items;
+  if (!filtered.length) {
+    listEl.innerHTML = `<div class="skill-picker-empty">${escapeHtml(q ? t('connectors.no_match') : t('connectors.no_connected'))}</div>`;
+    return;
+  }
+  listEl.innerHTML = `<div class="skill-picker-group-label">${escapeHtml(t('connectors.group.connected'))}</div>` +
+    filtered.map((c) => {
+      const descParts = [];
+      if (c.description) descParts.push(c.description);
+      if (c.account) descParts.push(t('connectors.account_label', { account: c.account }));
+      return `
+      <div class="skill-picker-item" data-kind="connector" data-id="${escapeHtml(c.id)}" data-name="${escapeHtml(c.name || c.id)}">
+        <div class="skill-picker-item-name">${escapeHtml(c.name || c.id)}</div>
+        ${descParts.length ? `<div class="skill-picker-item-desc">${escapeHtml(descParts.join(' · '))}</div>` : ''}
+      </div>`;
+    }).join('');
+  _bindAgentPickerListItems(listEl, anchorId);
+}
+
+function _bindAgentPickerListItems(listEl, anchorId) {
   for (const el of listEl.querySelectorAll('[data-id]')) {
     el.addEventListener('click', async () => {
       _closeAgentPicker();
-      await _triggerAgent(el.dataset.id, el.dataset.name, anchorId);
+      await _triggerPickerItem(el.dataset.kind || 'agent', el.dataset.id, el.dataset.name, anchorId);
     });
     el.addEventListener('mouseenter', () => {
       const all = listEl.querySelectorAll('.skill-picker-item[data-id]');
@@ -1755,13 +2034,33 @@ function _moveAgentPickerActive(delta) {
   _setAgentPickerActive(next);
 }
 
+function _targetFromPickerAnchor(anchorId) {
+  return anchorId === 'new-chat-recipient-chip' ? 'new-chat' : 'conversation';
+}
+
+async function _triggerPickerItem(kind, itemId, itemName, anchorId) {
+  const target = _targetFromPickerAnchor(anchorId);
+  if (kind === 'skill') {
+    setChatSkill(target, itemName || itemId);
+    _consumeAtKeyChar();
+    const inputId = target === 'new-chat' ? 'new-chat-input' : 'chat-input';
+    _focusInput(document.getElementById(inputId));
+    return;
+  }
+  if (kind === 'connector') {
+    setChatConnector(target, itemId, itemName || itemId);
+    _consumeAtKeyChar();
+    const inputId = target === 'new-chat' ? 'new-chat-input' : 'chat-input';
+    _focusInput(document.getElementById(inputId));
+    return;
+  }
+  await _triggerAgent(itemId, itemName, anchorId);
+}
+
 // Route an agent selection to the right behaviour based on which button
 // triggered the picker:
-//   - conversation toolbar → send/queue "run <name>" in the CURRENT conv.
-//     Never opens a new conv. No hidden backend injection — the model reads
-//     the visible message and follows chat_commander.md rule 0.
-//   - new-chat toolbar → create a new normal conv + run agent (useAgent)
-// Selection is one-shot (no persistent chip).
+//   - recipient chip / @ picker → update the persistent recipient chip.
+//   - other anchors → spin up a fresh conversation for that agent.
 async function _triggerAgent(agentId, agentName, anchorId) {
   const isRecipientAnchor = anchorId === 'chat-recipient-chip' || anchorId === 'new-chat-recipient-chip';
   if (isRecipientAnchor) {
@@ -1810,6 +2109,14 @@ function _focusInput(input) {
 function bindAgentPickers() {
   // Re-bindable helper: wire the recipient chips on both chat panels +
   // under anchorIds. Guarded with dataset.bound so a second call is a no-op.
+  document.querySelectorAll('[data-agent-picker-tab]').forEach((btn) => {
+    if (btn.dataset.bound === '1') return;
+    btn.dataset.bound = '1';
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      _setAgentPickerTab(btn.dataset.agentPickerTab || 'agents');
+    });
+  });
   const searchInput = document.getElementById('agent-picker-search');
   searchInput?.addEventListener('input', () => {
     _renderAgentPickerList(searchInput.value);
@@ -1848,9 +2155,9 @@ function bindAgentPickers() {
     });
   }
 
-  // `@` keystroke in either chat textarea opens the recipient picker. The
-  // typed `@` itself is removed on a successful pick (see _consumeAtKeyChar)
-  // so the chip is the single source of truth for recipient.
+  // `@` keystroke in either chat textarea opens the agent / skill / connector
+  // picker. The typed `@` itself is removed on a successful pick so the chips
+  // are the single source of truth for the selected route/context.
   const onAtKey = (anchorId) => (e) => {
     if (e.key !== '@') return;
     const btn = document.getElementById(anchorId);
@@ -1862,8 +2169,7 @@ function bindAgentPickers() {
         inputId: ta.id || '',
         posAfter: typeof ta.selectionStart === 'number' ? ta.selectionStart : 0,
       };
-      if (!_agentsCache) loadAgents().then(() => _openAgentPicker(btn));
-      else _openAgentPicker(btn);
+      _openAgentPicker(btn);
     }, 0);
   };
   // Backspace right after a `@<name>` token (with or without the trailing
@@ -1916,6 +2222,13 @@ function bindAgentPickers() {
       if (anchorEl && anchorEl.contains(e.target)) return;
       _atKeyMark = null;
       _closeAgentPicker();
+    });
+    window.addEventListener('i18n-change', () => {
+      _updateAgentPickerChrome();
+      if (picker.style.display !== 'none') {
+        const search = document.getElementById('agent-picker-search');
+        _renderAgentPickerList(search ? search.value : '');
+      }
     });
   }
 

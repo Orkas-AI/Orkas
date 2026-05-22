@@ -50,6 +50,7 @@ vi.mock('../../../../src/main/features/connectors/catalog', () => ({
 
 vi.mock('../../../../src/main/i18n', () => ({
   getCurrentLang: () => 'en',
+  descriptionLang: (lang: 'zh' | 'en' | 'ja') => (lang === 'zh' ? 'zh' : 'en'),
 }));
 
 vi.mock('../../../../src/main/logger', () => ({

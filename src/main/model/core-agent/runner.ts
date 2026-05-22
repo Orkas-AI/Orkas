@@ -131,6 +131,26 @@ export interface BuildRunnerParams {
   /** Fires after each successful `create_artifact` call. See `model/client.ts`
    *  `ChatOptions.onArtifactCreated`. */
   onArtifactCreated?: (a: { id: string; title: string }) => void;
+  /** Fires once per skill id rendered into the system-prompt skills index,
+   *  with its source system. Called at runner build time (before the LLM
+   *  sees the prompt). Bus collects per turn for `skill_advertised`. */
+  onSkillAdvertised?: (skill_id: string, system: 'A.custom' | 'A.platform' | 'B') => void;
+  /** Fires when `read_file` resolves to a SKILL.md path inside any of the
+   *  three skill roots. Bus collects per turn for `skill_invoked`. */
+  onSkillInvoked?: (skill_id: string, system: 'A.custom' | 'A.platform' | 'B', trigger: 'read_file') => void;
+  /** Fires when the pi-ai onPayload hook injects a vendor native web search
+   *  tool schema for this call. Used by client.ts to record a synthetic
+   *  `progress/native_search/injected` event into the devtools archive.
+   *  May fire multiple times per chat turn if rotating-provider falls over
+   *  to a secondary candidate. */
+  onNativeSearchInjected?: (info: NativeSearchInjectedInfo) => void;
+  /** Fires when rotating-provider commits to a candidate (success) or
+   *  surfaces a non-rotatable error (failure). Used by client.ts to update
+   *  the dev archive's recorded model / provider / profile so the stored
+   *  row reflects the candidate that actually owned the visible outcome,
+   *  not the rotating-provider's primary label. Fires at most once per
+   *  call; not invoked when rotation rolls past a candidate. */
+  onCandidateChosen?: (info: { profileId: string; providerId: string; modelId: string }) => void;
 }
 
 /** Tool definition snapshot used to log "what tools did the LLM actually see
@@ -192,6 +212,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     getSystemPromptBlock({
       ...(renderAllowlist === undefined ? {} : { allowlist: [...renderAllowlist] }),
       disabledIds: disabledSkillIds,
+      ...(params.onSkillAdvertised ? { onSkillAdvertised: params.onSkillAdvertised } : {}),
     }),
   ]);
 
@@ -262,6 +283,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         ...(params.projectId ? { projectId: params.projectId } : {}),
         ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
         ...(params.readOnlyExtraRoots?.length ? { readOnlyExtraRoots: params.readOnlyExtraRoots } : {}),
+        ...(params.onSkillInvoked ? { onSkillInvoked: params.onSkillInvoked } : {}),
       })
     : [];
 
@@ -486,6 +508,13 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       }
     : undefined;
 
+  // Bridge System B advertised → ChatOptions.onSkillAdvertised. The SDK
+  // doesn't know about the host's skill-system taxonomy; we tag every id
+  // it surfaces as `'B'` before passing it up.
+  const onLearnedSkillAdvertised = params.onSkillAdvertised
+    ? (id: string) => params.onSkillAdvertised!(id, 'B')
+    : undefined;
+
   const runner = new mod.AgentRunner({
     config,
     providers,
@@ -493,6 +522,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...(wrappedTools.length ? { tools: wrappedTools } : {}),
     ...(params.skillList !== undefined ? { skillAllowlist: params.skillList } : {}),
     ...(onSkillCreated ? { onSkillCreated } : {}),
+    ...(onLearnedSkillAdvertised ? { onLearnedSkillAdvertised } : {}),
   });
 
   return {

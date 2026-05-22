@@ -26,12 +26,13 @@
 // `chat_skill_setup.md` chose `<<<>>>` for file blocks).
 //
 // Both families share the same prose/code guard — if any of them is
-// mentioned literally inside a fenced code block or inline backtick span
-// (e.g., a protocol explanation), the literal mention must survive; the
-// real container must still be stripped/replaced atomically even when its
-// body contains backticks / fences / quotes (otherwise the prose/code split
-// fragments the container and the post-fragment suffix leaks past — the
-// 34e27fcb / a3110e61 / follow-up cycle on `<agent>`).
+// mentioned literally inside a non-XML fenced code block, inline backtick
+// span, or inline quoted sentence (e.g., a protocol explanation), the
+// literal mention must survive. Explicit ```xml fences remain structural
+// output. Real containers must still be stripped/replaced atomically even
+// when their body contains backticks / fences / quotes (otherwise the
+// prose/code split fragments the container and the post-fragment suffix
+// leaks past — the 34e27fcb / a3110e61 / follow-up cycle on `<agent>`).
 //
 // Lives in a standalone file so vitest can `require()` it under Node and
 // pin the set-A vs set-B invariants — regressions in this category aren't
@@ -49,9 +50,11 @@
 // backtick spans; everything else is prose. Used by the `<agent>` container
 // strippers so coding scenarios — where the LLM legitimately quotes `<agent>`
 // inside a code sample to explain how this app's structured-output protocol
-// works — don't see the bubble silently truncated. Mid-stream unclosed fences
-// and unclosed inline backticks are treated as code through end-of-buffer,
-// matching how the markdown renderer would paint them.
+// works — don't see the bubble silently truncated. Fenced blocks with an
+// `xml` info string carry `xmlFence: true` so structural parsers can still
+// process them. Mid-stream unclosed fences and unclosed inline backticks are
+// treated as code through end-of-buffer, matching how the markdown renderer
+// would paint them.
 function _splitMarkdownProseCode(text) {
   const segs = [];
   if (!text) return segs;
@@ -74,6 +77,8 @@ function _splitMarkdownProseCode(text) {
         if (count >= 3) {
           let k = j + count;
           while (k < n && text[k] !== '\n') k++;
+          const info = text.slice(j + count, k).trim().toLowerCase();
+          const xmlFence = /^xml(?:\s|$)/.test(info);
           let scan = k < n ? k + 1 : n;
           let close = -1;
           while (scan < n) {
@@ -95,7 +100,7 @@ function _splitMarkdownProseCode(text) {
           }
           flushProse(i);
           const endIdx = close >= 0 ? close : n;
-          segs.push({ kind: 'code', text: text.slice(i, endIdx) });
+          segs.push({ kind: 'code', text: text.slice(i, endIdx), xmlFence });
           proseStart = endIdx;
           i = endIdx;
           continue;
@@ -136,6 +141,46 @@ function _splitMarkdownProseCode(text) {
   return segs;
 }
 
+function _isInsideQuotedSpanOnLine(text, idx) {
+  const lineStart = text.lastIndexOf('\n', Math.max(0, idx - 1)) + 1;
+  const nextNl = text.indexOf('\n', idx);
+  const lineEnd = nextNl < 0 ? text.length : nextNl;
+  const linePrefix = text.slice(lineStart, idx);
+  const hasClosingAsciiDouble = text.indexOf('"', idx) >= 0 && text.indexOf('"', idx) < lineEnd;
+  if (hasClosingAsciiDouble) {
+    let open = false;
+    for (let i = 0; i < linePrefix.length; i++) {
+      if (linePrefix[i] !== '"') continue;
+      if (i > 0 && linePrefix[i - 1] === '\\') continue;
+      open = !open;
+    }
+    if (open) return true;
+  }
+
+  for (const [openQuote, closeQuote] of [['“', '”'], ['‘', '’'], ['「', '」'], ['『', '』'], ['《', '》']]) {
+    const lastOpen = text.lastIndexOf(openQuote, idx - 1);
+    if (lastOpen < lineStart) continue;
+    const lastClose = text.lastIndexOf(closeQuote, idx - 1);
+    const nextClose = text.indexOf(closeQuote, idx);
+    if (lastOpen > lastClose && nextClose >= 0 && nextClose < lineEnd) return true;
+  }
+  return false;
+}
+
+function _isLineStartOpening(text, idx) {
+  const lineStart = text.lastIndexOf('\n', Math.max(0, idx - 1)) + 1;
+  for (let i = lineStart; i < idx; i++) {
+    const ch = text[i];
+    if (ch === ' ' || ch === '\t' || ch === '"' || ch === '\'' || ch === '“' || ch === '‘' || ch === '「' || ch === '『' || ch === '《') continue;
+    return false;
+  }
+  return true;
+}
+
+function _isInlineQuotedOpening(text, idx) {
+  return _isInsideQuotedSpanOnLine(text, idx) && !_isLineStartOpening(text, idx);
+}
+
 // Find every `<TAG>...</TAG>` (or unclosed `<TAG>...EOF`) range whose
 // OPENING tag falls in an outer prose segment. The tagged container is
 // treated as one atomic unit — once the opening tag is in prose, we walk
@@ -143,8 +188,8 @@ function _splitMarkdownProseCode(text) {
 // backticks / fences / quotes authored inside the body don't fragment
 // the container and let the post-fragment suffix (often including the
 // closing tag) leak past the stripper. The outer-context check still
-// preserves literal mentions of the tag inside fenced code / inline
-// backtick spans (coding-explanation case).
+// preserves literal mentions of the tag inside non-XML fenced code, inline
+// backtick spans, and inline quoted sentences (coding-explanation case).
 //
 // Generalized over `tagName` so the same atomic-container guarantee
 // covers `<agent>` (commander create/edit container), `<agent-input-form>`
@@ -168,7 +213,7 @@ function _findOuterTagRanges(text, tagName) {
   for (const seg of segs) {
     const segStart = pos;
     pos += seg.text.length;
-    if (seg.kind !== 'prose') continue;
+    if (seg.kind !== 'prose' && !seg.xmlFence) continue;
     let from = segStart;
     while (from < pos) {
       const last = ranges.length ? ranges[ranges.length - 1] : null;
@@ -183,6 +228,13 @@ function _findOuterTagRanges(text, tagName) {
         || next === 9 /* \t */ || next === 10 /* \n */ || next === 13 /* \r */
         || next === 47 /* / */;
       if (!isBoundary) {
+        from = openIdx + openLeader.length;
+        continue;
+      }
+      // Inline quoted explanations survive (`请输出 "<skill>...</skill>"`).
+      // A line that starts with quoted XML still counts as a deliberate
+      // structure block and is processed.
+      if (!seg.xmlFence && _isInlineQuotedOpening(text, openIdx)) {
         from = openIdx + openLeader.length;
         continue;
       }
@@ -262,7 +314,7 @@ function _replaceOuterAgentBlocks(buf, placeholder) {
 //     but if the main extractor misses a variant the raw XML lands in the
 //     bubble alongside the widget. Strip silently rather than render raw.
 //   - `<agent-input-submission>` — user form-reply tag; user-side render
-//     already strips it via _stripSubmissionTagForDisplay, but if it ever
+//     already strips it via _stripUserStructuralBlocksForDisplay, but if it ever
 //     leaks into assistant text (LLM hallucination / quoting), strip too.
 //
 // Each tag is removed independently via the same atomic-container helper
@@ -280,21 +332,24 @@ function _replaceOuterAgentBlocks(buf, placeholder) {
 // `SKILL_FILE_BLOCK_RE` in `features/skills.ts`).
 //
 // Outer-context check (prose vs code segment) is shared with the tag
-// finder: a literal `<<<skill-file` mentioned inside a fenced code block
-// or inline backtick (LLM showing the protocol to a user) must NOT be
-// recognised as a real block.
+// finder: a literal `<<<skill-file` mentioned inside a non-XML fenced code
+// block, inline backtick, or inline quoted sentence (LLM showing the
+// protocol to a user) must NOT be recognised as a real block. Explicit
+// ```xml fences are treated as machine output.
 const SKILL_FILE_OPEN = '<<<skill-file';
 const SKILL_FILE_CLOSE = '\n>>>';
 
-function _findOuterSkillFileRanges(text) {
+function _findSkillFileRanges(text, { respectCodeGuard = true } = {}) {
   if (!text || text.indexOf(SKILL_FILE_OPEN) < 0) return [];
-  const segs = _splitMarkdownProseCode(text);
+  const segs = respectCodeGuard
+    ? _splitMarkdownProseCode(text)
+    : [{ kind: 'prose', text }];
   const ranges = [];
   let pos = 0;
   for (const seg of segs) {
     const segStart = pos;
     pos += seg.text.length;
-    if (seg.kind !== 'prose') continue;
+    if (seg.kind !== 'prose' && !seg.xmlFence) continue;
     let from = segStart;
     while (from < pos) {
       const last = ranges.length ? ranges[ranges.length - 1] : null;
@@ -302,6 +357,10 @@ function _findOuterSkillFileRanges(text) {
       if (from >= pos) break;
       const openIdx = text.indexOf(SKILL_FILE_OPEN, from);
       if (openIdx < 0 || openIdx >= pos) break;
+      if (!seg.xmlFence && _isInlineQuotedOpening(text, openIdx)) {
+        from = openIdx + SKILL_FILE_OPEN.length;
+        continue;
+      }
       // Mirror agent's atomic-container guarantee: once the opener is in an
       // outer prose segment, walk to `\n>>>` regardless of what's inside
       // (file content can contain backticks, inline code, fences, anything).
@@ -316,6 +375,14 @@ function _findOuterSkillFileRanges(text) {
   return ranges;
 }
 
+function _findOuterSkillFileRanges(text) {
+  return _findSkillFileRanges(text, { respectCodeGuard: true });
+}
+
+function _findAnySkillFileRanges(text) {
+  return _findSkillFileRanges(text, { respectCodeGuard: false });
+}
+
 function _stripOuterSkillFileBlocks(text) {
   if (!text) return text;
   const ranges = _findOuterSkillFileRanges(text);
@@ -327,6 +394,21 @@ function _stripOuterSkillFileBlocks(text) {
     cursor = e;
   }
   out += text.slice(cursor);
+  return out;
+}
+
+function _replaceAnySkillFileBlocks(buf, replacement) {
+  if (!buf) return buf;
+  const ranges = _findAnySkillFileRanges(buf);
+  if (!ranges.length) return buf;
+  let out = '';
+  let cursor = 0;
+  for (const [s, e] of ranges) {
+    out += buf.slice(cursor, s);
+    out += replacement;
+    cursor = e;
+  }
+  out += buf.slice(cursor);
   return out;
 }
 
@@ -378,10 +460,18 @@ function _stripSkillCreateContainer(buf, fallbackPlaceholder) {
     out += buf.slice(cursor, s);
     const block = buf.slice(s, e);
     if (block.endsWith('</skill>')) {
-      out += block
+      const inner = block
         .replace(/^<skill>\s*/, '')
         .replace(/\s*<\/skill>$/, '')
         .replace(/<skill_id>[\s\S]*?<\/skill_id>\s*/g, '');
+      // The normal streaming pipeline replaces `<<<skill-file>>>` blocks
+      // before this function runs. Some models wrap those machine blocks
+      // inside a Markdown fence or otherwise leave one behind before this
+      // pass sees it. Even if an earlier pass misses the block, the
+      // surrounding `<skill>` container tells us this is real machine output.
+      // Inside a real container there are no user-visible examples: any
+      // surviving skill-file block is machine output and must be hidden.
+      out += _replaceAnySkillFileBlocks(inner, fallbackPlaceholder);
     } else {
       out += fallbackPlaceholder;
     }
@@ -410,6 +500,95 @@ function _stripSurvivingStructuralBlocks(text) {
   return out.replace(/\n{3,}/g, '\n\n').trim();
 }
 
+function _stripSubmissionRoutingMentionForDisplay(text) {
+  if (!text) return text;
+  return String(text).replace(/^@[^\r\n]+[ \t]*(?:\r?\n|$)/, '').trimStart();
+}
+
+function _stripUserStructuralBlocksForDisplay(text) {
+  if (!text) return text;
+  let out = text;
+
+  const afterSubmission = _stripOuterTagBlocks(out, 'agent-input-submission');
+  if (afterSubmission !== out) {
+    out = _stripSubmissionRoutingMentionForDisplay(afterSubmission)
+      .replace(/\n{3,}/g, '\n\n')
+      .trimEnd();
+  }
+
+  const afterArtifact = _stripOuterTagBlocks(out, 'artifact-result');
+  if (afterArtifact !== out) {
+    out = afterArtifact.replace(/\n{3,}/g, '\n\n').trimEnd();
+  }
+
+  const afterMarketplace = _stripOuterTagBlocks(out, 'marketplace-install-result');
+  if (afterMarketplace !== out) {
+    out = afterMarketplace.replace(/\n{3,}/g, '\n\n').trimEnd();
+  }
+
+  return out;
+}
+
+function _buildSkillDisplayNameById(skills) {
+  const out = new Map();
+  if (!Array.isArray(skills)) return out;
+  for (const skill of skills) {
+    const id = typeof skill?.id === 'string' ? skill.id.trim() : '';
+    const name = typeof skill?.name === 'string' ? skill.name.trim() : '';
+    if (!id || !name || id === name) continue;
+    out.set(id.toLowerCase(), name);
+  }
+  return out;
+}
+
+function _buildSkillDisplayNameByRef(skills) {
+  const out = new Map();
+  if (!Array.isArray(skills)) return out;
+  for (const skill of skills) {
+    const id = typeof skill?.id === 'string' ? skill.id.trim() : '';
+    const name = typeof skill?.name === 'string' ? skill.name.trim() : '';
+    const display = name || id;
+    if (!display) continue;
+    if (id) out.set(id.toLowerCase(), display);
+    if (name) out.set(name.toLowerCase(), display);
+  }
+  return out;
+}
+
+function _escapeSkillIdForRegex(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function _replaceKnownSkillIdsForDisplay(text, skills) {
+  if (!text) return text;
+  const byId = _buildSkillDisplayNameById(skills);
+  if (!byId.size) return text;
+  const ids = Array.from(byId.keys()).sort((a, b) => b.length - a.length);
+  const alt = ids.map(_escapeSkillIdForRegex).join('|');
+  const re = new RegExp(`(^|[^A-Za-z0-9_])(${alt})(?=$|[^A-Za-z0-9_])`, 'gi');
+  return String(text).replace(re, (_m, prefix, id) => `${prefix}${byId.get(id.toLowerCase()) || id}`);
+}
+
+function _simplifyKnownSkillFollowPhrasesForDisplay(text, skills) {
+  if (!text) return text;
+  const byRef = _buildSkillDisplayNameByRef(skills);
+  if (!byRef.size) return text;
+  const replaceRef = (full, ref) => {
+    const display = byRef.get(String(ref || '').trim().toLowerCase());
+    return display ? `\`${display}\` skill` : full;
+  };
+  let out = String(text).replace(/`skill:\s*follow\s+the\s+([A-Za-z0-9_.-]+)\s+skill`/gi, replaceRef);
+  out = out.replace(/skill:\s*follow\s+the\s+`?([A-Za-z0-9_.-]+)`?\s+skill/gi, replaceRef);
+  return out;
+}
+
+function _normalizeKnownSkillRefsForDisplay(text, skills) {
+  return _simplifyKnownSkillFollowPhrasesForDisplay(
+    _replaceKnownSkillIdsForDisplay(text, skills),
+    skills,
+  );
+}
+
 // Test bridge — see file header. No-op in the browser (`module` undefined).
 if (typeof module !== 'undefined' && typeof module.exports === 'object') {
   module.exports = {
@@ -426,5 +605,10 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     _extractSkillFilePath,
     _stripSkillCreateContainer,
     _stripSurvivingStructuralBlocks,
+    _stripSubmissionRoutingMentionForDisplay,
+    _stripUserStructuralBlocksForDisplay,
+    _replaceKnownSkillIdsForDisplay,
+    _simplifyKnownSkillFollowPhrasesForDisplay,
+    _normalizeKnownSkillRefsForDisplay,
   };
 }

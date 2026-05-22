@@ -100,6 +100,9 @@ export interface MarketplaceInstallRequest {
   create_uid?: string;
   version: string;
   published_at: number;
+  /** Server row update timestamp. Preferred freshness key for marketplace installs because
+   *  republishing keeps `published_at` stable. */
+  updated_at?: number;
   reason?: string;
   status: 'pending' | 'installed' | 'skipped' | 'failed';
   requested_at: string;

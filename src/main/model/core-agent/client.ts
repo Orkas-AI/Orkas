@@ -92,6 +92,8 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     onFileWritten,
     hasProducedPath,
     onArtifactCreated,
+    onSkillAdvertised,
+    onSkillInvoked,
     cacheRetention,
     thinkingLevel,
   } = opts;
@@ -188,6 +190,53 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(onFileWritten ? { onFileWritten } : {}),
       ...(hasProducedPath ? { hasProducedPath } : {}),
       ...(onArtifactCreated ? { onArtifactCreated } : {}),
+      ...(onSkillAdvertised ? { onSkillAdvertised } : {}),
+      ...(onSkillInvoked ? { onSkillInvoked } : {}),
+      onNativeSearchInjected: (info) => {
+        recorder?.record({
+          type: 'progress',
+          event: { stream: 'native_search', data: { phase: 'injected', ...info } },
+        });
+      },
+      // rotating-provider commits / surfaced-error candidate notice. Rewrite
+      // the archive row so model / provider / profile reflect the candidate
+      // that actually owned this call's visible outcome, not the rotating-
+      // provider's primary label. Recorder may not be set yet at the moment
+      // buildRunner eagerly constructs the rotating-provider; fires at runtime
+      // when complete()/stream() actually picks a candidate, so the recorder
+      // is always live by then.
+      onCandidateChosen: (info) => {
+        recorder?.setActiveCandidate(info);
+      },
+    });
+    const { runner, providerId, modelId, resolvedSystemPrompt, profileId, entryId, toolDefs } = built;
+
+    recorder = startRecording({
+      userId,
+      sessionId,
+      input: {
+        message,
+        systemPrompt: resolvedSystemPrompt,
+        model: modelId,
+        provider: providerId,
+        profileId,
+        entryId,
+        tools: toolDefs,
+      },
+      context: {
+        ...(agentId ? { agentId } : {}),
+        ...(cid ? { cid } : {}),
+        ...(workingDir ? { workingDir } : {}),
+        // skillList: undefined → no allowlist (full listing); preserve as null
+        // so the renderer can distinguish "all skills" from "explicit []".
+        skillList: skillList === undefined ? null : [...skillList],
+        ...(extraRoots && extraRoots.length ? { extraRoots: [...extraRoots] } : {}),
+        ...(readOnlyExtraRoots && readOnlyExtraRoots.length ? { readOnlyExtraRoots: [...readOnlyExtraRoots] } : {}),
+        ...(cacheRetention ? { cacheRetention } : {}),
+        idleTimeoutSec: idleTimeout,
+        ...(images && images.length ? { imageCount: images.length } : {}),
+        ...(abortSignal ? { hasAbortSignal: true } : {}),
+      },
     });
     const { runner, providerId, modelId } = built;
 

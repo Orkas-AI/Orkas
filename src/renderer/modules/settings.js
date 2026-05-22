@@ -28,6 +28,7 @@ async function loadSettings() {
   if (typeof initSettingsTabs === 'function') initSettingsTabs();
   _settingsBindLanguageOnce();
   _settingsBindAppUpdateOnce();
+  if (typeof initFeedbackSettings === 'function') initFeedbackSettings();
   _settingsSyncLanguageRadio();
   _settingsBindClearAllConvsOnce();
   await Promise.all([
