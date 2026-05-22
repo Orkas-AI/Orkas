@@ -159,6 +159,13 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { deleted: ok };
   },
 
+  'conversations.pin': async ({ cid, pinned }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    const conv = await chats.setConversationPinned(ctx.userId, cid, !!pinned);
+    if (!conv) throw new Error('conversation not found');
+    return { conversation: conv };
+  },
+
   'conversations.deleteAll': async (_args, ctx) => {
     const deleted = await chats.deleteAllConversations(ctx.userId);
     return { deleted };
@@ -1158,6 +1165,28 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!fs.existsSync(target)) throw new Error('data root not found');
     shell.openPath(target);
     return { ok: true, path: target };
+  },
+
+  // Dev-only debug panel data. All handlers no-op in packaged builds
+  // (return empty list / null / 0) so the renderer-side panel gracefully
+  // shows "nothing to show here".
+  'devtools.listArchives':  async () => devtools.listArchives(),
+  'devtools.readArchive':   async ({ id }) => devtools.readArchive(String(id || '')),
+  'devtools.clearArchives': async () => devtools.clearArchives(),
+  'devtools.getNativeSearchEnabled': async () => ({ enabled: devtools.isNativeSearchEnabled() }),
+  'devtools.setNativeSearchEnabled': async ({ enabled }) => {
+    devtools.setNativeSearchEnabled(!!enabled);
+    return { enabled: devtools.isNativeSearchEnabled() };
+  },
+  // Skill metrics — phase-1 consumer of expert_signals. Aggregates the
+  // last N days of skill_advertised / skill_invoked / correction / edit /
+  // skill_ineffective into a per-skill dashboard row. UI lives in the
+  // devtools panel for v0; not dev-only at the backend (data is general
+  // user-private signals, surfaced inside devtools per plan §3.3
+  // "先给专家自己看").
+  'devtools.skillMetricsReport': async ({ sinceDays } = {}) => {
+    const { aggregateSkillMetrics } = await import('../features/skill_metrics');
+    return aggregateSkillMetrics({ sinceDays: Number.isFinite(sinceDays) ? Number(sinceDays) : undefined });
   },
 
   // Local CLI agent discovery (claude / codex / openclaw / opencode / hermes).

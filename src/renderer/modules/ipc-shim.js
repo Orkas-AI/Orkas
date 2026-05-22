@@ -59,6 +59,7 @@ const _IPC_ROUTES = [
 
   // Pattern routes (with path parameters)
   ['DELETE', /^\/api\/conversations\/([^/]+)$/,            'conversations.delete',       ['cid']],
+  ['POST',   /^\/api\/conversations\/([^/]+)\/pin$/,       'conversations.pin',          ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/history$/,   'conversations.history',      ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/send$/,      'groupChat.send',             ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/send\/stream$/, 'conversations.sendStream', ['cid'], { stream: true }],

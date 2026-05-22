@@ -180,7 +180,13 @@ function _initMentionMirror(textarea) {
   wrap.appendChild(textarea);
 
   let lastSynced = '';
+  let lastPlaceholder = '';
   const sync = () => {
+    const placeholder = textarea.getAttribute('placeholder') || '';
+    if (placeholder !== lastPlaceholder) {
+      lastPlaceholder = placeholder;
+      mirror.dataset.placeholder = placeholder;
+    }
     const v = textarea.value || '';
     if (v === lastSynced) return;
     lastSynced = v;
@@ -436,6 +442,14 @@ function onEnterConversationView() {
   // the rail would keep displaying the previous cid's plan content.
   if (window.PlanRail) window.PlanRail.bind(currentCid || null);
   if (window.ConversationInfo) window.ConversationInfo.bind(currentCid || null);
+  // Returning to a conversation while its original send-stream is still
+  // alive can miss state/process events that fired while another view was
+  // active (the cross-cid guard intentionally drops them). Ask main for the
+  // current in-flight actors so the visible placeholders catch up
+  // immediately, instead of waiting for the next tool event.
+  if (currentCid && isConvPending(currentCid)) {
+    _syncPendingActorsFromRuntime(currentCid, { allowController: true }).catch(() => {});
+  }
   // Quote preview is per-cid; rerender so a quote captured in another conv
   // doesn't bleed into this one (and a quote left in this conv reappears
   // when the user navigates back).
@@ -493,7 +507,7 @@ function _stopRuntimeActorRecovery(cid) {
   _runtimeRecoveryTimers.delete(cid);
 }
 
-async function _syncPendingActorsFromRuntime(cid) {
+async function _syncPendingActorsFromRuntime(cid, opts = {}) {
   if (!cid || !isConvPending(cid)) return false;
   const state = pendingConvs.get(cid);
   if (!state || state.aborted) return false;
@@ -501,7 +515,9 @@ async function _syncPendingActorsFromRuntime(cid) {
   // cases. A live send-stream controller is already the authoritative event
   // source; letting this path finish it can manufacture empty loading bubbles
   // or clear pending in the middle of a plan handoff.
-  if (state.controller) return false;
+  const allowController = !!opts.allowController;
+  const hasLiveController = !!state.controller && _convChatCtrls.has(cid);
+  if (hasLiveController && !allowController) return false;
   const loadingEl = state.loadingEl;
   let data = null;
   try {
@@ -526,6 +542,13 @@ async function _syncPendingActorsFromRuntime(cid) {
     try { window.ConversationInfo.refresh(cid, { silent: true }); } catch (_) {}
   }
   if (!processing) {
+    if (hasLiveController) {
+      _latestInFlight.set(cid, []);
+      setGroupConversationBusy(cid, false);
+      _updateConvSidebarBadge(cid, false);
+      if (cid === currentCid) _updateConvSendUI(cid);
+      return true;
+    }
     _latestInFlight.set(cid, []);
     setGroupConversationBusy(cid, false);
     _updateConvSidebarBadge(cid, false);
@@ -544,6 +567,14 @@ async function _syncPendingActorsFromRuntime(cid) {
   _updateConvSidebarBadge(cid, true);
   startPolling(cid);
   if (cid === currentCid) _updateConvSendUI(cid);
+  if (!hasLiveController) {
+    // Runtime polling can tell us who is working, but it does not carry
+    // process/delta events. When the local send-stream was lost (refresh,
+    // stale controller state, or reconnect), attach the group event stream
+    // so plan-triggered agents keep streaming instead of only appearing
+    // after the final history poll.
+    _observeConversationRunFromPlanAction(cid, { attachExisting: true });
+  }
   if (!inFlight.length) return false;
 
   // Names/avatars are local data; warm members before revealing so the
@@ -1582,22 +1613,134 @@ function startRelayActivitySubscription() {
   }
 }
 
+// `timeBucket` + `_BUCKET_ORDER` live in modules/conv-bucket.js (loaded
+// ahead of this file in index.html). Kept as a separate file so its pure
+// helper can be fixture-tested via the §9 CJS bridge without dragging the
+// whole renderer-side global graph (createLogger / IPC) into vitest.
+
 // Move a conversation to the top of the sidebar list and re-render.
 // Called whenever a non-internal message lands on a cid so the list stays
-// ordered by last activity (matches backend listConversations sort, which
-// reads <cid>.jsonl mtime on the next full reload).
+// ordered by pin state first, then last activity (matches backend
+// listConversations sort on the next full reload).
 function _bumpConvToTop(cid) {
   if (!cid || !Array.isArray(conversations) || !conversations.length) return;
-  const idx = conversations.findIndex((c) => c && c.conversation_id === cid);
-  if (idx <= 0) return;
-  const [c] = conversations.splice(idx, 1);
+  const c = conversations.find((row) => row && row.conversation_id === cid);
+  if (!c) return;
   c.last_active_at = new Date().toISOString();
-  conversations.unshift(c);
+  _sortConversationCacheForSidebar();
   renderConversationList();
+}
+
+function _compareConversationsForSidebar(a, b) {
+  const ap = (a && a.pinned_at) || '';
+  const bp = (b && b.pinned_at) || '';
+  if (ap && !bp) return -1;
+  if (!ap && bp) return 1;
+  if (ap && bp) {
+    const pinCmp = bp.localeCompare(ap);
+    if (pinCmp) return pinCmp;
+  }
+  return ((b && b.last_active_at) || '').localeCompare((a && a.last_active_at) || '');
+}
+
+function _sortConversationCacheForSidebar() {
+  if (!Array.isArray(conversations)) return;
+  conversations.sort(_compareConversationsForSidebar);
+}
+
+function _renderConversationSidebarItem(c, opts = {}) {
+  const cid = escapeHtml(c.conversation_id);
+  const title = escapeHtml(c.title || t('chat.new_conv_title'));
+  const isPinned = !!c.pinned_at;
+  const pinTitle = escapeHtml(t(isPinned ? 'chat.conv_unpin_title' : 'chat.conv_pin_title'));
+  const delTitle = escapeHtml(t('chat.conv_del_title'));
+  const pinIcon = _uiIconHtml('pin', 'conv-item-action-icon');
+  const delIcon = _uiIconHtml('trash', 'conv-item-action-icon') || '×';
+  const classes = [
+    'conv-item',
+    opts.nested ? 'conv-item-nested' : '',
+    currentCid === c.conversation_id ? 'active' : '',
+    isPinned ? 'is-pinned' : '',
+  ].filter(Boolean).join(' ');
+  return `
+    <div class="${classes}" data-cid="${cid}">
+      <button type="button" class="conv-item-action conv-item-pin${isPinned ? ' is-pinned' : ''}"
+              data-pin-cid="${cid}" data-pin-next="${isPinned ? '0' : '1'}"
+              title="${pinTitle}" aria-label="${pinTitle}">${pinIcon}</button>
+      <div class="conv-item-title" title="${title}">${title}</div>
+      <button type="button" class="conv-item-action conv-item-del"
+              data-del-cid="${cid}" title="${delTitle}" aria-label="${delTitle}">${delIcon}</button>
+    </div>
+  `;
+}
+
+async function _toggleConversationPinned(cid, pinned) {
+  if (!cid || !Array.isArray(conversations)) return;
+  const snapshot = conversations.map((c) => (c ? { ...c } : c));
+  const local = conversations.find((c) => c && c.conversation_id === cid);
+  if (!local) return;
+  if (pinned) local.pinned_at = new Date().toISOString();
+  else delete local.pinned_at;
+  _sortConversationCacheForSidebar();
+  renderConversationList();
+
+  try {
+    const res = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/pin`, {
+      method: 'POST',
+      body: JSON.stringify({ pinned }),
+    });
+    const data = await res.json();
+    if (!data || data.ok === false || !data.conversation) {
+      throw new Error((data && data.error) || 'pin failed');
+    }
+    const idx = conversations.findIndex((c) => c && c.conversation_id === cid);
+    if (idx >= 0) {
+      conversations[idx] = { ...conversations[idx], ...data.conversation };
+      _sortConversationCacheForSidebar();
+      renderConversationList();
+    }
+  } catch (err) {
+    conversations = snapshot;
+    renderConversationList();
+    _convLog.warn('toggle conversation pin failed', err);
+  }
+}
+
+function _bindConversationSidebarItems(container, opts = {}) {
+  if (!container) return;
+  const selector = opts.selector || '.conv-item';
+  container.querySelectorAll(selector).forEach(el => {
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('.conv-item-action')) return;
+      setView('conversation', el.dataset.cid);
+    });
+  });
+  container.querySelectorAll('.conv-item-pin').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const cid = btn.dataset.pinCid;
+      const pinned = btn.dataset.pinNext === '1';
+      await _toggleConversationPinned(cid, pinned);
+    });
+  });
+  container.querySelectorAll('.conv-item-del').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const cid = btn.dataset.delCid;
+      if (!(await uiConfirm(t('chat.conv_del_confirm')))) return;
+      abortConvStream(cid);
+      _forgetConvLocal(cid);
+      await apiFetch(`/api/conversations/${encodeURIComponent(cid)}`, { method: 'DELETE' });
+      if (currentCid === cid) setView('new-chat');
+      await loadConversations();
+      if (typeof opts.afterDelete === 'function') await opts.afterDelete(cid);
+    });
+  });
 }
 
 function renderConversationList() {
   const container = document.getElementById('conversation-list');
+  _sortConversationCacheForSidebar();
   // Conversations with a project_id are rendered nested under their project
   // by `projects.js::renderProjectsSection`. The "Conversations" section
   // here only shows the unprojected ones — same data model as the user's
@@ -1611,36 +1754,38 @@ function renderConversationList() {
     if (typeof renderProjectsSection === 'function') renderProjectsSection();
     return;
   }
-  const delTitle = escapeHtml(t('chat.conv_del_title'));
-  container.innerHTML = unprojected.map(c => {
-    // All conversations are now the single `normal` kind — no type badge.
-    const title = escapeHtml(c.title || t('chat.new_conv_title'));
-    return `
-      <div class="conv-item" data-cid="${c.conversation_id}">
-        <div class="conv-item-title" title="${title}">${title}</div>
-        <button class="conv-item-del" data-del-cid="${c.conversation_id}" title="${delTitle}">×</button>
-      </div>
-    `;
-  }).join('');
+  // Pinned convs float to the top of the sidebar (no time header) — they
+  // were pinned because the user wants them visible regardless of recency,
+  // so bucketing them would defeat the feature. The rest get grouped into
+  // today / yesterday / last7 / last30 / older buckets by last activity.
+  const pinned = [];
+  const rest = [];
+  for (const c of unprojected) {
+    if (c && c.pinned_at) pinned.push(c);
+    else rest.push(c);
+  }
+  const now = new Date();
+  const buckets = { today: [], yesterday: [], last7: [], last30: [], older: [] };
+  // Fall back through last_active_at → updated_at → created_at: backend's
+  // `listConversations` always emits last_active_at, but optimistic unshifts
+  // from create/launch paths land here before the next refresh and may
+  // carry only created_at. Without this fallback they'd land in 'older'.
+  for (const c of rest) {
+    const iso = c.last_active_at || c.updated_at || c.created_at || '';
+    buckets[timeBucket(iso, now)].push(c);
+  }
+  const parts = [];
+  for (const c of pinned) parts.push(_renderConversationSidebarItem(c));
+  for (const b of _BUCKET_ORDER) {
+    const items = buckets[b];
+    if (!items.length) continue;
+    const headerKey = `sidebar.bucket.${b}`;
+    parts.push(`<div class="conv-list-section-header" data-i18n="${headerKey}">${escapeHtml(t(headerKey))}</div>`);
+    for (const c of items) parts.push(_renderConversationSidebarItem(c));
+  }
+  container.innerHTML = parts.join('');
 
-  container.querySelectorAll('.conv-item').forEach(el => {
-    el.addEventListener('click', (e) => {
-      if (e.target.closest('.conv-item-del')) return;
-      setView('conversation', el.dataset.cid);
-    });
-  });
-  container.querySelectorAll('.conv-item-del').forEach(btn => {
-    btn.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      const cid = btn.dataset.delCid;
-      if (!(await uiConfirm(t('chat.conv_del_confirm')))) return;
-      abortConvStream(cid);
-      _forgetConvLocal(cid);
-      await apiFetch(`/api/conversations/${cid}`, { method: 'DELETE' });
-      if (currentCid === cid) setView('new-chat');
-      await loadConversations();
-    });
-  });
+  _bindConversationSidebarItems(container);
 
   // Re-render the projects section (it consumes the same `conversations`
   // global to group projected items by project).
@@ -1806,7 +1951,10 @@ async function loadConversationHistory(cid) {
       startPolling(cid);
       if (cid === currentCid) _updateConvSendUI(cid);
     }
-    if (lastMsg?.role === 'user' && !wasPendingBeforeHistoryRecovery && processingFresh) {
+    const shouldRecoverRunningUi = !wasPendingBeforeHistoryRecovery
+      && processingFresh
+      && (lastMsg?.role === 'user' || inFlightActors.length > 0);
+    if (shouldRecoverRunningUi) {
       pollMsgCounts.set(cid, history.length);
       const loadingEl = _createStreamingAssistantMessage(container, { hiddenUntilActor: true });
       pendingConvs.set(cid, { loadingEl, needsIndicator: false });
@@ -2317,19 +2465,10 @@ function _marketplaceRequestCategoryLabel(code, lang) {
   return row[base] || row.en;
 }
 
-function _marketplaceRequestAuthorBadgeHtml(createUid) {
-  if (!createUid) return '';
-  const label = String(createUid) === '0'
-    ? t('marketplace.author_platform')
-    : t('marketplace.author_user').replace('{uid}', String(createUid));
-  const cls = String(createUid) === '0' ? 'marketplace-card-chip is-platform' : 'marketplace-card-chip is-user';
-  return `<span class="${cls}">${escapeHtml(label)}</span>`;
-}
-
 async function _hydrateMarketplaceRequestMeta(card, req, cid, msgId) {
   if (!card || !req) return;
   const hasAvatar = req.kind !== 'agent' || req.icon || req.color;
-  const hasCardMeta = req.description_zh || req.description_en || req.category || req.create_uid;
+  const hasCardMeta = req.description_zh || req.description_en || req.category;
   if (hasAvatar && hasCardMeta) return;
   try {
     const q = req.name || req.id || '';
@@ -2342,7 +2481,6 @@ async function _hydrateMarketplaceRequestMeta(card, req, cid, msgId) {
     req.description_zh = row.description_zh || '';
     req.description_en = row.description_en || '';
     req.category = row.category || '';
-    req.create_uid = row.create_uid || '';
     _renderMarketplaceInstallCard(card, req, cid, msgId);
   } catch (_) { /* fallback content is already rendered */ }
 }
@@ -2372,7 +2510,6 @@ function _renderMarketplaceInstallCard(card, req, cid, msgId) {
   const meta = [
     version ? `<span class="marketplace-card-chip is-version">${escapeHtml(version)}</span>` : '',
     catLabel ? `<span class="marketplace-card-chip">${escapeHtml(catLabel)}</span>` : '',
-    _marketplaceRequestAuthorBadgeHtml(req.create_uid),
   ].filter(Boolean).join('');
   const error = req.error ? `<div class="chat-marketplace-request-error">${escapeHtml(req.error)}</div>` : '';
   const iconHtml = kind === 'agent'
@@ -2755,6 +2892,11 @@ async function handleNewChatSubmit() {
     // otherwise the optimistic + backend-refreshed titles disagree and
     // the sidebar entry flips on the next loadConversations.
     conv.title = _autoTitle(raw);
+    // Backend `createConversation` returns `created_at`/`updated_at` but
+    // NOT the derived `last_active_at` (that lives only in `listConversations`'
+    // output). Set it explicitly so `timeBucket` puts the brand-new row in
+    // the 'today' bucket instead of falling through to 'older'.
+    conv.last_active_at = new Date().toISOString();
     conversations.unshift(conv);
     renderConversationList();
     // The new conv may have landed inside a project — refresh the projects
@@ -3039,8 +3181,7 @@ function _makeStreamPaintYield() {
 function _observeConversationRunFromPlanAction(cid, opts = {}) {
   if (!cid) return null;
   const attachExisting = !!opts.attachExisting;
-  const existingState = pendingConvs.get(cid);
-  if (_convChatCtrls.has(cid) || existingState?.controller) return null;
+  if (_convChatCtrls.has(cid)) return null;
   if (!attachExisting && (pendingConvs.has(cid) || isGroupConversationBusy(cid))) return null;
 
   const controller = new AbortController();
@@ -5559,7 +5700,9 @@ function _updateConvSidebarBadge(cid, _unused) {
     html += `<span class="conv-status-count">${queued}</span>`;
   }
   badge.innerHTML = html;
-  item.prepend(badge);
+  const title = item.querySelector('.conv-item-title');
+  if (title) item.insertBefore(badge, title);
+  else item.prepend(badge);
 }
 
 // Repaint badges on every visible conversation item. Called after re-render
@@ -5624,3 +5767,4 @@ if (typeof window !== 'undefined') {
     _initChatSelectionMenu();
   }
 }
+

@@ -208,6 +208,51 @@ describe('plan_executor › sequential pipeline + variable substitution', () => 
   }, 15_000);
 });
 
+describe('plan_executor › plan-triggered agent live events', () => {
+  it('emits agent process/delta events before the plan-step final message', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+
+    _setScript(state.buildGmemberSessionId(cid, A_ID), [
+      { type: 'progress', text: 'searching sources' },
+      {
+        type: 'event',
+        event: {
+          stream: 'tool',
+          data: { phase: 'start', id: 'tool-1', name: 'web_search', arguments: { query: 'education' } },
+        },
+      },
+      { type: 'delta', text: 'partial answer' },
+      { type: 'final', text: 'final answer' },
+    ]);
+
+    const events: any[] = [];
+    const unsubscribe = bus.subscribe(TEST_UID, cid, (ev) => events.push(ev));
+    try {
+      await setupPlanAndKick(TEST_UID, cid, {
+        initial_message: 'research education',
+        steps: [
+          { title: 'research', assignee: A_NAME, input: 'go', wait_for: [] },
+        ],
+      });
+      await waitForQuiescent(TEST_UID, cid, 5000);
+    } finally {
+      unsubscribe();
+    }
+
+    const agentProcessIdx = events.findIndex((e) => e.type === 'process' && e.actor === A_ID);
+    const agentMessageIdx = events.findIndex((e) => e.type === 'message' && e.turn_end === true && e.msg?.from === A_ID);
+    expect(agentProcessIdx).toBeGreaterThanOrEqual(0);
+    expect(agentMessageIdx).toBeGreaterThan(agentProcessIdx);
+
+    const agentProcessEvents = events.filter((e) => e.type === 'process' && e.actor === A_ID);
+    expect(agentProcessEvents.some((e) => e.data?.type === 'progress' && e.data.text === 'searching sources')).toBe(true);
+    expect(agentProcessEvents.some((e) => e.data?.type === 'event' && e.data.event?.stream === 'tool')).toBe(true);
+    expect(agentProcessEvents.some((e) => e.data?.type === 'delta' && e.data.text === 'partial answer')).toBe(true);
+  }, 15_000);
+});
+
 // ─────────────────────────────────────────────────────────────────────────
 //  Test 2 — parallel fork + synthesis
 // ─────────────────────────────────────────────────────────────────────────

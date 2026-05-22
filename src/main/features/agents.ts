@@ -176,11 +176,8 @@ export interface Agent {
    *  unless the user has explicitly disabled the agent. Don't write this
    *  field back to disk. */
   enabled: boolean;
-  /** Author uid for `source==='builtin'` (marketplace-installed) agents — read from the
-   *  install dir's `_install.json`. `"0"` = official-platform marker; non-zero = community
-   *  uploader. Empty string for `source==='custom'` (no marketplace install meta). Renderer
-   *  uses this to show the author badge (label `marketplace.author_platform` / `_user`)
-   *  instead of a generic platform chip on the detail / card. */
+  /** Marketplace author uid. Kept optional for install/reconcile compatibility; global UI
+   *  surfaces must not render it. */
   create_uid?: string;
   /** Marketplace install version for `source==='builtin'`. Read from `_install.json` so the
    *  agents-tab card can render a `v1.0.0` chip alongside the category. Custom agents leave
@@ -807,15 +804,14 @@ export async function listAgents(): Promise<Agent[]> {
           continue;
         }
         seen.add(norm.agent_id);
-        // Marketplace-installed agents carry an `_install.json` sidecar with `create_uid` +
-        // `version`. Read it lazily here so the UI can show the author badge and the version
-        // chip without an extra IPC round-trip. Custom agents skip — they have no install meta.
+        // Marketplace-installed agents carry an `_install.json` sidecar with `version`.
+        // Author uid may also be present there for install/reconcile compatibility, but the
+        // global UI intentionally does not surface it.
         if (source === 'builtin') {
           try {
             const metaFile = path.join(dir, e.name, '_install.json');
             if (fs.existsSync(metaFile)) {
               const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
-              if (meta && typeof meta.create_uid === 'string') norm.create_uid = meta.create_uid;
               if (meta && typeof meta.version === 'string') norm.version = meta.version;
             }
           } catch { /* corrupt _install.json → leave fields undefined */ }

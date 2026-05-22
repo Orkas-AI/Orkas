@@ -25,6 +25,7 @@ export type SignalType =
   | 'edit'               // T1: user message token-diffed significantly from agent's last text
   | 'skill_advertised'   // T0: skills entered system prompt index at turn start (per system)
   | 'skill_invoked'      // T0: agent read_file'd a SKILL.md body during the turn
+  | 'skill_ineffective'  // T0: skill_invoked in a turn that ended with a non-transient, non-aborted error
   | 'agent_dispatched';  // T0: commander dispatched ready plan steps (candidates + dispatched)
 
 /** Which skill catalog produced a `skill_advertised` / `skill_invoked` signal.

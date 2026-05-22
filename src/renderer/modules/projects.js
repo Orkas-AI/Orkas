@@ -179,15 +179,10 @@ function _renderProjectRow(p, convs) {
     if (!convs.length) {
       html += `<div class="project-conv-empty">${escapeHtml(t('sidebar.project_conv_empty'))}</div>`;
     } else {
-      const delTitle = escapeHtml(t('chat.conv_del_title'));
       for (const c of convs) {
-        const title = escapeHtml(c.title || t('chat.new_conv_title'));
-        html += `
-          <div class="conv-item conv-item-nested" data-cid="${c.conversation_id}">
-            <div class="conv-item-title" title="${title}">${title}</div>
-            <button class="conv-item-del" data-del-cid="${c.conversation_id}" title="${delTitle}">×</button>
-          </div>
-        `;
+        html += (typeof _renderConversationSidebarItem === 'function')
+          ? _renderConversationSidebarItem(c, { nested: true })
+          : `<div class="conv-item conv-item-nested" data-cid="${escapeHtml(c.conversation_id)}"><div class="conv-item-title" title="${escapeHtml(c.title || t('chat.new_conv_title'))}">${escapeHtml(c.title || t('chat.new_conv_title'))}</div></div>`;
       }
     }
     html += '</div>';
@@ -227,28 +222,21 @@ function _bindProjectsHandlers(container) {
     });
   });
 
-  // Nested conv items.
-  container.querySelectorAll('.conv-item-nested').forEach((el) => {
-    el.addEventListener('click', (e) => {
-      if (e.target.closest('.conv-item-del')) return;
-      setView('conversation', el.dataset.cid);
+  if (typeof _bindConversationSidebarItems === 'function') {
+    _bindConversationSidebarItems(container, {
+      selector: '.conv-item-nested',
+      async afterDelete() {
+        // Project conv counts changed → refresh project cache so future reads
+        // (delete confirm body, etc.) see the right number.
+        await loadProjects(true);
+      },
     });
-  });
-  container.querySelectorAll('.conv-item-nested .conv-item-del').forEach((btn) => {
-    btn.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      const cid = btn.dataset.delCid;
-      if (!(await uiConfirm(t('chat.conv_del_confirm')))) return;
-      if (typeof abortConvStream === 'function') abortConvStream(cid);
-      if (typeof _forgetConvLocal === 'function') _forgetConvLocal(cid);
-      await apiFetch(`/api/conversations/${cid}`, { method: 'DELETE' });
-      if (currentCid === cid) setView('new-chat');
-      await loadConversations();
-      // Project conv counts changed → refresh project cache so future reads
-      // (delete confirm body, etc.) see the right number.
-      await loadProjects(true);
+  } else {
+    // Nested conv items.
+    container.querySelectorAll('.conv-item-nested').forEach((el) => {
+      el.addEventListener('click', () => setView('conversation', el.dataset.cid));
     });
-  });
+  }
 }
 
 function _toggleProjectExpand(pid) {

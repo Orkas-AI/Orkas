@@ -41,10 +41,10 @@ function _isReservedAgentName(name) {
   return _RESERVED_AGENT_NAMES.has(key);
 }
 
-/** Version + category + author chips for a marketplace-installed agent. Mirrors the
+/** Version + category chips for a marketplace-installed agent. Mirrors the
  *  marketplace card footer so users see the same metadata in the agents grid.
  *  `_mpCategoriesCache` is a module-level variable in `marketplace.js` (flat top-level
- *  scope per CLAUDE.md §8). Author chip: `create_uid='0'` → 官方 badge; non-zero → user badge. */
+ *  scope per CLAUDE.md §8). */
 function _agentPlatformChipsHtml(a) {
   const lang = getLang();
   const parts = [];
@@ -55,12 +55,6 @@ function _agentPlatformChipsHtml(a) {
   if (a.category) {
     const catLabel = _resolveCategoryLabel(a.category, lang);
     parts.push(`<span class="agent-card-chip">${escapeHtml(catLabel)}</span>`);
-  }
-  if (a.create_uid) {
-    const isPlatform = String(a.create_uid) === '0';
-    const label = isPlatform ? t('marketplace.author_platform') : t('marketplace.author_user').replace('{uid}', String(a.create_uid));
-    const cls = isPlatform ? 'agent-card-chip is-platform' : 'agent-card-chip is-user';
-    parts.push(`<span class="${cls}">${escapeHtml(label)}</span>`);
   }
   return parts.join('');
 }
@@ -493,11 +487,9 @@ async function selectAgent(agentId) {
 }
 
 // Render the header meta strip for a single agent / skill detail. Used by both
-// `agents.js::_renderAgentDetail` and `skills.js::useSkill`. Three forms:
+// `agents.js::_renderAgentDetail` and `skills.js::useSkill`. Two forms:
 //   - custom item: single "自定义" chip (kept for symmetry with prior chrome)
-//   - marketplace-installed item: category chip + author chip ("官方" if uid=0, else "作者 X")
-//     — replaces the old "内置" label which users found unfriendly
-//   - unknown create_uid (older `_install.json` pre-author-tracking): only the category chip
+//   - marketplace-installed item: category chip, without author uid / official tags
 // `item.source` distinguishes custom vs marketplace-installed; `item.category` (code) maps
 // to display name via `_mpCategoriesCache` (loaded at marketplace boot, hot in localStorage).
 function _renderSourceMetaHtml(item) {
@@ -513,14 +505,6 @@ function _renderSourceMetaHtml(item) {
     const label = cat ? (pickLocalizedName(cat, lang) || catCode) : catCode;
     parts.push(`<span class="agents-detail-source is-category">${escapeHtml(label)}</span>`);
   }
-  const uid = String(item.create_uid || '').trim();
-  if (uid) {
-    if (uid === '0') {
-      parts.push(`<span class="agents-detail-source is-platform">${escapeHtml(t('marketplace.author_platform'))}</span>`);
-    } else {
-      parts.push(`<span class="agents-detail-source is-user">${escapeHtml(t('marketplace.author_user').replace('{uid}', uid))}</span>`);
-    }
-  }
   return parts.join('');
 }
 
@@ -535,8 +519,7 @@ function _renderAgentDetail(agent, editing) {
 
   nameEl.textContent = agent.name || '';
   // Header chips: custom = single "自定义" tag; marketplace-installed (source=builtin) drops
-  // the "内置" wording entirely and shows {category} + {官方/作者} chips instead — same family
-  // as marketplace card meta. Empty category / missing create_uid silently skip.
+  // the "内置" wording entirely and shows category only, without author uid / official tags.
   sourceEl.innerHTML = _renderSourceMetaHtml(agent);
   // Runtime slot lives at the top of the body now (not the header):
   // an always-editable dropdown so the user can flip Orkas ↔ local CLI
@@ -1624,6 +1607,11 @@ async function useAgent(agentId, seedText) {
     if (!data.ok) throw new Error(data.error || t('agents.create_conv_failed'));
     const conv = data.conversation;
     conv.title = _autoTitle(visible);
+    // Same fix as the new-chat path in conversation.js: backend's create
+    // response carries `created_at`/`updated_at` but NOT the derived
+    // `last_active_at`, so `timeBucket` would default this brand-new row to
+    // the 'older' bucket and the user thinks it disappeared.
+    conv.last_active_at = new Date().toISOString();
     conversations.unshift(conv);
     renderConversationList();
     setView('conversation', conv.conversation_id, { skipLoad: true });
@@ -1726,9 +1714,9 @@ if (typeof window !== 'undefined') {
 // Set on every `_openAgentPicker`; consumed by `_renderAgentPickerList` and
 // the search-input change handler so live filtering stays scoped.
 let _pickerBoundAgentIds = null;
-let _pickerBoundSkillIds = null;
 let _agentPickerTab = 'agents';
-const _AGENT_PICKER_TABS = new Set(['agents', 'skills', 'connectors']);
+const _AGENT_PICKER_TAB_ORDER = ['agents', 'skills', 'connectors'];
+const _AGENT_PICKER_TABS = new Set(_AGENT_PICKER_TAB_ORDER);
 
 function _normalizeAgentPickerTab(tab) {
   return _AGENT_PICKER_TABS.has(tab) ? tab : 'agents';
@@ -1759,6 +1747,13 @@ function _setAgentPickerTab(tab, opts = {}) {
   _updateAgentPickerChrome();
   _renderAgentPickerList(search ? search.value : '');
   if (opts.focusSearch !== false) setTimeout(() => search?.focus(), 0);
+}
+
+function _moveAgentPickerTab(delta) {
+  const cur = _AGENT_PICKER_TAB_ORDER.indexOf(_agentPickerTab);
+  const idx = cur >= 0 ? cur : 0;
+  const next = (idx + delta + _AGENT_PICKER_TAB_ORDER.length) % _AGENT_PICKER_TAB_ORDER.length;
+  _setAgentPickerTab(_AGENT_PICKER_TAB_ORDER[next]);
 }
 
 function _resolveActiveProjectId(anchorId) {
@@ -1795,18 +1790,16 @@ async function _openAgentPicker(anchorBtn) {
     (typeof loadSkills === 'function' ? loadSkills(true) : Promise.resolve()),
     (typeof loadConnectors === 'function' ? loadConnectors() : Promise.resolve()),
   ]);
-  // Refresh project-scope bindings on every open so the picker reflects
+  // Refresh project-scoped agent bindings on every open so the picker reflects
   // whatever project the user just picked (commander chip) or whatever
-  // project the active conv belongs to.
+  // project the active conv belongs to. Skills and connectors stay global.
   _pickerBoundAgentIds = null;
-  _pickerBoundSkillIds = null;
   const pid = _resolveActiveProjectId(anchorBtn.id);
   if (pid) {
     try {
       const res = await window.orkas.invoke('projects.bindings.list', { projectId: pid });
       if (res?.ok) {
         _pickerBoundAgentIds = new Set((res.bindings && res.bindings.agents) || []);
-        _pickerBoundSkillIds = new Set((res.bindings && res.bindings.skills) || []);
       }
     } catch (_) { /* fall back to global listing */ }
   }
@@ -1933,17 +1926,13 @@ function _renderSkillPickerList(listEl, filterText, anchorId) {
   const lang = getLang();
   const q = (filterText || '').toLowerCase();
   let skills = (_skillsCache || []).filter((s) => s.enabled !== false);
-  if (_pickerBoundSkillIds) skills = skills.filter((s) => _pickerBoundSkillIds.has(s.id));
   const filtered = q
     ? skills
         .filter((s) => _matchPickerItem(q, s.name || s.id, pickDesc(s, lang), s.id))
         .sort((a, b) => _pickerMatchScore(q, a.name || a.id) - _pickerMatchScore(q, b.name || b.id))
     : skills;
   if (!filtered.length) {
-    const hint = (!q && _pickerBoundSkillIds && _pickerBoundSkillIds.size === 0)
-      ? `<div class="skill-picker-empty-hint">${escapeHtml(t('skills.no_project_skills'))}</div>`
-      : '';
-    listEl.innerHTML = hint + `<div class="skill-picker-empty">${escapeHtml(t('skills.no_match'))}</div>`;
+    listEl.innerHTML = `<div class="skill-picker-empty">${escapeHtml(t('skills.no_match'))}</div>`;
     return;
   }
   const groups = { custom: [], builtin: [] };
@@ -1961,10 +1950,7 @@ function _renderSkillPickerList(listEl, filterText, anchorId) {
         </div>`;
       }).join('');
   };
-  const hint = (!q && _pickerBoundSkillIds && _pickerBoundSkillIds.size === 0)
-    ? `<div class="skill-picker-empty-hint">${escapeHtml(t('skills.no_project_skills'))}</div>`
-    : '';
-  listEl.innerHTML = hint + groupHtml(t('skills.source_custom'), groups.custom) + groupHtml(t('skills.source_builtin'), groups.builtin);
+  listEl.innerHTML = groupHtml(t('skills.source_custom'), groups.custom) + groupHtml(t('skills.source_builtin'), groups.builtin);
   _bindAgentPickerListItems(listEl, anchorId);
 }
 
@@ -2128,6 +2114,8 @@ function bindAgentPickers() {
     // English candidate would also fire our select-active-item handler.
     if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Escape') { _atKeyMark = null; _closeAgentPicker(); e.preventDefault(); return; }
+    if (e.key === 'ArrowRight') { _moveAgentPickerTab(1); e.preventDefault(); return; }
+    if (e.key === 'ArrowLeft')  { _moveAgentPickerTab(-1); e.preventDefault(); return; }
     if (e.key === 'ArrowDown') { _moveAgentPickerActive(1); e.preventDefault(); return; }
     if (e.key === 'ArrowUp')   { _moveAgentPickerActive(-1); e.preventDefault(); return; }
     if (e.key === 'Enter') {

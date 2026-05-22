@@ -54,7 +54,7 @@ import { isAgentEnabled } from '../component_enabled';
 import { buildLanguageDirective, descriptionLang, t } from '../../i18n';
 import * as marketplaceFeat from '../marketplace';
 import { readInstalls } from '../marketplace_installs';
-import { createSkillTurnBuffer } from '../expert_signals/turn_hooks';
+import { createSkillTurnBuffer, onAgentTurnEnd, onUserMessage } from '../expert_signals/turn_hooks';
 
 const log = createLogger('group_chat.bus');
 
@@ -722,6 +722,16 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   // echo and the downstream dispatch, which is exactly how form submissions
   // ended up as fake loading bubbles until history polling caught up.
   if (fromActorId === USER_ID) {
+    // Phase-0 chokepoint (was lost from commit 76358a8e per
+    // `docs/plans/expert-signals-phase0-wiring-gaps.md`): cancels pending
+    // silence check + extracts text-class signals (accept / correction /
+    // reject / edit) against the cached last agent message. Fire-and-
+    // forget; correctionDetected return value is intentionally unused
+    // here (runner.ts:665 does its own detectUserCorrection for
+    // RunMetrics — acceptable double-judgment for v0).
+    onUserMessage({ uid, cid, userMsg: { id: msgId, text: rewrittenText } })
+      .catch((err) => log.warn(`onUserMessage threw cid=${cid}: ${(err as Error).message}`));
+
     await planExecutor.reconcile(uid, cid, {
       finishedActorId: USER_ID,
       finishedMessage: { id: msgId, text: rewrittenText, files: [], failed: false },
@@ -1649,6 +1659,20 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       aid: actor.kind === 'commander' ? null : actor.id,
       turn_id: persistedMsg.id,
       msg_ids: [persistedMsg.id],
+      errText: errText || undefined,
+      aborted,
+    });
+    // Phase-0 chokepoint (was lost from commit 76358a8e per
+    // `docs/plans/expert-signals-phase0-wiring-gaps.md`): caches agent msg
+    // for the next user-reply text-signal JOIN, emits tool_failure when
+    // errText is set, schedules silence check (cancelled by onUserMessage
+    // when the user replies). Sync + self-guarded against errors.
+    onAgentTurnEnd({
+      uid, cid,
+      actorId: actor.id,
+      isCommander: actor.kind === 'commander',
+      agentMsg: { id: persistedMsg.id, text: persistedMsg.text || '' },
+      errText: errText || undefined,
     });
   }
 

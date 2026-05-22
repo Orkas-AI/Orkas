@@ -98,9 +98,8 @@ export interface SkillListing {
    *  `features/component_enabled.ts`. Defaults to true unless the user has
    *  explicitly disabled the skill. */
   enabled: boolean;
-  /** Author uid for `source==='builtin'` (marketplace-installed) skills — read from
-   *  `_install.json`. `"0"` = official-platform marker; empty for `source==='custom'`. Renderer
-   *  uses this to show the author badge (label `marketplace.author_platform` / `_user`). */
+  /** Marketplace author uid. Kept optional for install/reconcile compatibility; global UI
+   *  surfaces must not render it. */
   create_uid?: string;
   /** Marketplace install version for `source==='builtin'`. Read from `_install.json` so the
    *  skills-tab card can render a `v1.0.0` chip. Undefined for custom skills. */
@@ -356,7 +355,6 @@ export async function listSkills(): Promise<SkillListing[]> {
       let displayName = name;
       let descPair = { description_zh: '', description_en: '' };
       let category = '';
-      let createUid: string | undefined;
       let version: string | undefined;
       if (fs.existsSync(skillMd)) {
         try {
@@ -366,19 +364,19 @@ export async function listSkills(): Promise<SkillListing[]> {
           category = (meta.category as string) || '';
         } catch { /* ignore */ }
       }
-      // Marketplace-installed skills carry `_install.json` with `create_uid` + `version` —
-      // read it so the UI can show the author badge + version chips without an extra IPC. Custom skills skip.
+      // Marketplace-installed skills carry `_install.json` with `version`. Author uid may also
+      // be present for install/reconcile compatibility, but the global UI intentionally does
+      // not surface it.
       if (source === 'builtin') {
         try {
           const metaFile = path.join(baseDir, name, '_install.json');
           if (fs.existsSync(metaFile)) {
             const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
-            if (meta && typeof meta.create_uid === 'string') createUid = meta.create_uid;
             if (meta && typeof meta.version === 'string') version = meta.version;
           }
         } catch { /* corrupt _install.json — leave fields undefined */ }
       }
-      out.push({ id: name, name: displayName, source, ...descPair, category, enabled: true, create_uid: createUid, version });
+      out.push({ id: name, name: displayName, source, ...descPair, category, enabled: true, create_uid: undefined, version });
     }
   }
   _skillListCache = { stamp, data: out };

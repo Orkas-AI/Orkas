@@ -14,7 +14,9 @@
 
 import { emitSignal } from './index';
 import { extractTextSignals } from './extractors/text';
+import { isTransientError } from '../../util/transient-errors';
 import {
+  buildSkillIneffectiveSignal,
   buildToolFailureSignal,
   buildSkillAdvertisedSignal,
   buildSkillInvokedSignal,
@@ -67,7 +69,19 @@ function _key(uid: string, cid: string): string { return `${uid}:${cid}`; }
 export interface SkillTurnBuffer {
   recordAdvertised(skill_id: string, system: SkillSystem): void;
   recordInvoked(skill_id: string, system: SkillSystem, trigger: SkillInvokeTrigger): void;
-  drainAndEmit(args: { uid: string; cid: string; aid: string | null; turn_id: string; msg_ids: string[] }): void;
+  /** Drain the buffer at turn-end.
+   *  - `errText` / `aborted`: when provided, the buffer emits one
+   *    `skill_ineffective` per invoked (system, skill_id) iff `errText`
+   *    is non-empty, NOT classified transient (network-class blip
+   *    excluded), AND `!aborted` (user-stopped turns aren't the skill's
+   *    fault). Omitting both keeps the legacy advertised+invoked emit
+   *    behaviour. */
+  drainAndEmit(args: {
+    uid: string; cid: string; aid: string | null;
+    turn_id: string; msg_ids: string[];
+    errText?: string;
+    aborted?: boolean;
+  }): void;
 }
 
 export function createSkillTurnBuffer(): SkillTurnBuffer {
@@ -95,7 +109,7 @@ export function createSkillTurnBuffer(): SkillTurnBuffer {
       if (!skill_id) return;
       invoked.add(enc(system, skill_id));
     },
-    drainAndEmit({ uid, cid, aid, turn_id, msg_ids }) {
+    drainAndEmit({ uid, cid, aid, turn_id, msg_ids, errText, aborted }) {
       if (!turn_id) {
         // Without a turn id (= agent msg id) the signal can't be joined to
         // anything else — drop instead of emitting a useless record.
@@ -125,6 +139,27 @@ export function createSkillTurnBuffer(): SkillTurnBuffer {
         emitSignal(uid, buildSkillInvokedSignal({
           cid, aid, turn_id, system, skill_id, trigger: 'read_file', msg_ids,
         }));
+      }
+      // skill_ineffective: skill was loaded and the turn ended with a
+      // non-transient, non-aborted error. One signal per invoked skill
+      // — over-attribute on purpose when multiple skills loaded in the
+      // same failing turn; downstream consumers (skill_metrics) can
+      // weight or filter. See `expert-signals-skill-ineffective.md`.
+      const errExcerpt = (errText || '').trim();
+      if (
+        errExcerpt
+        && !aborted
+        && !isTransientError(errExcerpt)
+        && invoked.size > 0
+      ) {
+        for (const k of invoked) {
+          const { system, skill_id } = dec(k);
+          emitSignal(uid, buildSkillIneffectiveSignal({
+            cid, aid, turn_id, system, skill_id,
+            error_excerpt: errExcerpt,
+            msg_ids,
+          }));
+        }
       }
       advertised.clear();
       invoked.clear();

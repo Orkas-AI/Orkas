@@ -139,9 +139,12 @@
     } catch (err) { _fail(_t('apps.edit_failed', 'Could not open an edit conversation'), err); return; }
     const conv = r.conversation;
     if (!conv || !conv.conversation_id) { _fail(_t('apps.edit_failed', 'Could not open an edit conversation')); return; }
-    // Add to the sidebar list.
+    // Add to the sidebar list. Set last_active_at explicitly — backend
+    // create response doesn't include the derived field, so timeBucket
+    // would otherwise put this brand-new row in the 'older' bucket.
     try {
       if (typeof conversations !== 'undefined' && Array.isArray(conversations)) {
+        conv.last_active_at = new Date().toISOString();
         conversations.unshift(conv);
         if (typeof renderConversationList === 'function') renderConversationList();
       }

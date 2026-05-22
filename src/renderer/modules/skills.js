@@ -16,9 +16,9 @@ function _skillUiIconHtml(name, className) {
   return '';
 }
 
-/** Version + category + author chips for a marketplace-installed skill. Mirrors the
+/** Version + category chips for a marketplace-installed skill. Mirrors the
  *  marketplace card footer. `_resolveCategoryLabel` is defined in `agents.js` (flat top-level
- *  scope per CLAUDE.md §8). Author chip: `create_uid='0'` → 官方 badge; non-zero → user badge. */
+ *  scope per CLAUDE.md §8). */
 function _skillPlatformChipsHtml(s) {
   const lang = getLang();
   const parts = [];
@@ -29,12 +29,6 @@ function _skillPlatformChipsHtml(s) {
   if (s.category) {
     const catLabel = _resolveCategoryLabel(s.category, lang);
     parts.push(`<span class="skill-card-chip">${escapeHtml(catLabel)}</span>`);
-  }
-  if (s.create_uid) {
-    const isPlatform = String(s.create_uid) === '0';
-    const label = isPlatform ? t('marketplace.author_platform') : t('marketplace.author_user').replace('{uid}', String(s.create_uid));
-    const cls = isPlatform ? 'skill-card-chip is-platform' : 'skill-card-chip is-user';
-    parts.push(`<span class="${cls}">${escapeHtml(label)}</span>`);
   }
   return parts.join('');
 }
@@ -705,7 +699,7 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   nameEl.classList.remove('editable');
   nameEl.removeAttribute('title');
 
-  // Header chips: custom = "自定义"; marketplace-installed = {category} + {官方/作者}.
+  // Header chips: custom = "自定义"; marketplace-installed = category only.
   // Same `_renderSourceMetaHtml` helper as the agent detail page (defined in agents.js,
   // shared via the renderer's flat top-level scope per CLAUDE.md §8).
   const sourceEl = document.getElementById('skills-detail-source');
@@ -713,7 +707,6 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   sourceEl.innerHTML = _renderSourceMetaHtml({
     source,
     category: skill?.category || '',
-    create_uid: skill?.create_uid || '',
   });
 
   // Doc sections (description / external dependencies / dependent
@@ -1083,6 +1076,15 @@ function _scheduleSkillFieldSave(field, value) {
 async function _flushSkillFieldSave({ validate = false } = {}) {
   clearTimeout(_skillFieldSaveTimer);
   _skillFieldSaveTimer = null;
+  // Clicking Done blurs the contenteditable title before the click handler
+  // runs. That blur autosave can clear `_pendingSkillField`; recover the
+  // current DOM value so the explicit commit still performs the dir rename.
+  if (!_pendingSkillField && validate && _selectedSkill?.source === 'custom') {
+    const nameEl = document.getElementById('skills-detail-name');
+    if (nameEl && String(nameEl.innerText || '').trim() !== _selectedSkill.id) {
+      _pendingSkillField = { field: 'name', value: nameEl.innerText };
+    }
+  }
   if (!_pendingSkillField || !_selectedSkill) return;
   const { field, value } = _pendingSkillField;
   if (field === 'name') {

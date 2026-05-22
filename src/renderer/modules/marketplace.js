@@ -741,7 +741,6 @@ function _mpCardHtml(item, lang) {
         <div class="marketplace-card-meta">
           ${item.version ? `<span class="marketplace-card-chip is-version">${escapeHtml(versionLabel)}</span>` : ''}
           ${catLabel ? `<span class="marketplace-card-chip">${escapeHtml(catLabel)}</span>` : ''}
-          ${_mpAuthorBadgeHtml(item.create_uid)}
         </div>
         <div class="marketplace-card-actions">
           <button type="button" class="${btnClass}" ${btnAttrs}>${btnSpinner}${escapeHtml(btnLabel)}</button>
@@ -749,18 +748,6 @@ function _mpCardHtml(item, lang) {
       </div>
     </div>
   `;
-}
-
-/** Author badge — distinguishes same-name uploads by different authors. uid=0 is the
- *  Platform marker (i18n key `marketplace.author_platform`); everything else falls back
- *  to a truncated uid. */
-function _mpAuthorBadgeHtml(createUid) {
-  if (!createUid) return '';
-  const label = String(createUid) === '0'
-    ? t('marketplace.author_platform')
-    : t('marketplace.author_user').replace('{uid}', String(createUid));
-  const cls = String(createUid) === '0' ? 'marketplace-card-chip is-platform' : 'marketplace-card-chip is-user';
-  return `<span class="${cls}">${escapeHtml(label)}</span>`;
 }
 
 function _mpCategoryLabel(code, lang) {
@@ -847,14 +834,13 @@ function _mpRenderDetail() {
       avatarSlot.style.display = 'none';
     }
   }
-  // Name + version share a row; category / author chips drop to the meta-row below.
+  // Name + version share a row; category chips drop to the meta-row below.
   panel.querySelector('[data-mp-detail-name]').innerHTML = `
     ${escapeHtml(item.name || item.id)}
     <span class="marketplace-detail-version">${escapeHtml(versionLabel)}</span>
   `;
   panel.querySelector('[data-mp-detail-meta]').innerHTML = [
     catLabel ? `<span class="marketplace-card-chip">${escapeHtml(catLabel)}</span>` : '',
-    _mpAuthorBadgeHtml(item.create_uid),
   ].filter(Boolean).join(' ');
   // (description used to render in a top-of-body `.marketplace-detail-desc` strip; now it's
   // the first section inside body — see `_mpAgentDetailHtml` / `_mpSkillDetailHtml`)

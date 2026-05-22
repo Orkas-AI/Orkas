@@ -60,6 +60,9 @@ export interface Conversation {
    *  `<cid>.jsonl`, `groupChatDir`, `chat_attachments`, and `session_id`
    *  paths stay verbatim, so cid uniqueness + §5 isolation are unaffected. */
   project_id?: string;
+  /** Optional sidebar pin timestamp. Pinned conversations sort to the top of
+   *  whichever sidebar list currently contains them (project or unprojected). */
+  pinned_at?: string;
   created_at: string;
   updated_at: string;
   /** Derived from group_chat state.json at read time; never persisted on
@@ -136,7 +139,17 @@ export async function listConversations(userId: string): Promise<Conversation[]>
     const lastActiveAt = lastActiveMs ? new Date(lastActiveMs).toISOString() : (c.updated_at || c.created_at || '');
     out.push({ ...c, processing, processing_since: since, last_active_at: lastActiveAt });
   }
-  out.sort((a, b) => (b.last_active_at || '').localeCompare(a.last_active_at || ''));
+  out.sort((a, b) => {
+    const ap = a.pinned_at || '';
+    const bp = b.pinned_at || '';
+    if (ap && !bp) return -1;
+    if (!ap && bp) return 1;
+    if (ap && bp) {
+      const pinCmp = bp.localeCompare(ap);
+      if (pinCmp) return pinCmp;
+    }
+    return (b.last_active_at || '').localeCompare(a.last_active_at || '');
+  });
   return out;
 }
 
@@ -230,6 +243,22 @@ export async function updateConversation(
   items[i] = { ...items[i], ...updates, updated_at: nowIso() };
   await saveConversations(userId, items);
   return items[i];
+}
+
+export async function setConversationPinned(
+  userId: string, cid: string, pinned: boolean,
+): Promise<Conversation | null> {
+  if (!safeId(cid)) return null;
+  const items = await _readRawConversations(userId);
+  const i = items.findIndex((c) => c.conversation_id === cid);
+  if (i < 0) return null;
+  if (pinned) {
+    if (!items[i].pinned_at) items[i].pinned_at = nowIso();
+  } else {
+    delete items[i].pinned_at;
+  }
+  await saveConversations(userId, items);
+  return getConversation(userId, cid);
 }
 
 /** Drop a session jsonl + its in-memory cache entry. Routes through
@@ -360,9 +389,38 @@ export async function deleteConversationsByAgent(agentId: string): Promise<numbe
   return total;
 }
 
+// Filler-word prefixes commonly written before the actual ask. Ordered
+// longest-first within each regex so JS regex alternation (left-biased)
+// doesn't match a shorter prefix when a longer one is also valid. Single-
+// character fillers (e.g. bare `请`) are intentionally NOT listed — too
+// likely to clip real content like `请教...`.
+const ZH_FILLER_RE = /^(帮我看一下|可不可以|帮我看下|帮我看看|麻烦你|帮我看|我想要|想问问|能不能|可以不|可以吗|请帮我|看一下|麻烦|帮我|我想|想问|请问|看下|看看)\s*/;
+const EN_FILLER_RE = /^(could you|would you|can you|help me|i'?d like to|i want to|please)\s+/i;
+const CLAUSE_RE = /[，。？！；;,.?!]/;
+const TITLE_MAX = 30;
+
 export function autoTitle(content: string): string {
-  let text = (content || '').trim().replace(/\n/g, ' ');
-  if (text.length > 40) text = text.slice(0, 40) + '…';
+  const raw = (content || '').trim().replace(/\s+/g, ' ');
+  if (!raw) return t('chat.default_title');
+  let text = raw;
+  // Strip stacked fillers ("请帮我看下..." → "请帮我" first, then "看下");
+  // cap iterations so a pathological self-similar prefix can't loop.
+  for (let i = 0; i < 5; i++) {
+    const before = text;
+    text = text.replace(ZH_FILLER_RE, '').replace(EN_FILLER_RE, '');
+    if (text === before) break;
+  }
+  text = text.trim();
+  // Take the first clause IF it's long enough on its own — guards against
+  // clipping "AI，怎么样" down to bare "AI" which loses all signal.
+  const clauseIdx = text.search(CLAUSE_RE);
+  if (clauseIdx >= 4) text = text.slice(0, clauseIdx);
+  text = text.trim();
+  // If stripping killed everything (input was pure filler), fall back to
+  // the original trimmed input so the sidebar still shows what the user
+  // actually typed.
+  if (!text) text = raw;
+  if (text.length > TITLE_MAX) text = text.slice(0, TITLE_MAX) + '…';
   return text || t('chat.default_title');
 }
 

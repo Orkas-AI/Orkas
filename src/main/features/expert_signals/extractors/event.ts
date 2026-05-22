@@ -160,6 +160,37 @@ export function buildSkillAdvertisedSignal(args: {
   };
 }
 
+/** Emitted at turn-end when a `skill_invoked` happened AND the turn ended
+ *  with a non-transient, non-aborted error. One signal per (turn, system,
+ *  skill_id) — same granularity as `skill_invoked` so consumers can JOIN
+ *  the two directly. `error_kind` is hardcoded `'permanent'` for v0; a
+ *  future session-jsonl scanner could refine to `'mixed'` when some tool
+ *  calls in the same turn succeeded. */
+export function buildSkillIneffectiveSignal(args: {
+  cid: string;
+  aid: string | null;
+  turn_id: string;
+  system: SkillSystem;
+  skill_id: string;
+  error_excerpt: string;
+  msg_ids?: string[];
+}): SignalInput {
+  return {
+    type: 'skill_ineffective',
+    source: 'event',
+    cid: args.cid,
+    aid: args.aid,
+    turn_id: args.turn_id,
+    context_ref: { msg_ids: args.msg_ids || [] },
+    extractor_version: EXTRACTOR_VERSION.skill_attribution,
+    delta: { system: args.system, skill_id: args.skill_id },
+    metadata: {
+      error_excerpt: args.error_excerpt.slice(0, 200),
+      error_kind: 'permanent',
+    },
+  };
+}
+
 /** Emitted when the agent's `read_file` resolves to a SKILL.md path inside
  *  one of the three skill roots. Same turn can produce multiple invoked
  *  signals for distinct skills; consumers de-dup by (turn_id, system, skill_id). */

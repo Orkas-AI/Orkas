@@ -25,12 +25,12 @@
         </span>
       </button>
       <div class="sidebar-actions">
-        <button class="sidebar-btn primary" id="new-chat-btn" data-i18n="sidebar.new_chat">Commander</button>
-        <button class="sidebar-btn" id="agents-btn" data-i18n="sidebar.agents">Agents</button>
-        <button class="sidebar-btn" id="skills-btn" data-i18n="sidebar.skills">Skills</button>
-        <button class="sidebar-btn" id="connectors-btn" data-i18n="sidebar.connectors">Connectors</button>
-        <button class="sidebar-btn" id="contexts-btn" data-i18n="sidebar.contexts">Knowledge</button>
-        <button class="sidebar-btn" id="apps-btn" data-i18n="sidebar.apps">My Apps</button>
+        <button class="sidebar-btn primary" id="new-chat-btn"><span data-ui-icon="message-square" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.new_chat">Commander</span></button>
+        <button class="sidebar-btn" id="agents-btn"><span data-ui-icon="users" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.agents">Agents</span></button>
+        <button class="sidebar-btn" id="skills-btn"><span data-ui-icon="sparkles" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.skills">Skills</span></button>
+        <button class="sidebar-btn" id="connectors-btn"><span data-ui-icon="plug" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.connectors">Connectors</span></button>
+        <button class="sidebar-btn" id="contexts-btn"><span data-ui-icon="book-open" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.contexts">Knowledge</span></button>
+        <button class="sidebar-btn" id="apps-btn"><span data-ui-icon="layout-grid" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.apps">My Apps</span></button>
       </div>
       <div class="sidebar-conversation-nav">
         <div class="sidebar-section sidebar-projects-section">
@@ -60,6 +60,10 @@
           <span data-i18n="sidebar.devtools">Devtools</span>
         </button>
       </div>
+      <div class="sidebar-resize-handle" id="sidebar-resize-handle"
+           role="separator" aria-orientation="vertical"
+           data-i18n-title="sidebar.resize_title"
+           title="Drag to resize · double-click to reset"></div>
     </aside>
 
     <main class="main-content">
@@ -77,7 +81,7 @@
               <div class="chat-input-overlay">
                 <div class="chat-attachments" id="new-chat-attachments" style="display:none"></div>
               </div>
-              <textarea id="new-chat-input" data-i18n-placeholder="new_chat.input_placeholder" placeholder="Type a message. Use @ to call agents, skills, connectors." rows="2"></textarea>
+              <textarea id="new-chat-input" data-i18n-placeholder="new_chat.input_placeholder" placeholder="Type @ to choose agents, skills, connectors." rows="2"></textarea>
               <div class="chat-bottom-bar">
                 <button type="button" class="chat-attach-btn" id="new-chat-attach-btn" data-i18n-title="new_chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
                 <!-- Voice-to-text mic button (stripped in OrkasOpen — see OpenSource/SyncCode/strip-rules.json). -->
@@ -167,7 +171,7 @@
                   <div class="chat-attachments" id="chat-attachments" style="display:none"></div>
                 </div>
                 <div class="chat-quote-preview" id="chat-quote-preview" style="display:none"></div>
-                <textarea id="chat-input" data-i18n-placeholder="chat.input_placeholder" placeholder="Continue the conversation. Use @ to call agents, skills, connectors." rows="2"></textarea>
+                <textarea id="chat-input" data-i18n-placeholder="chat.input_placeholder" placeholder="Type @ to choose agents, skills, connectors." rows="2"></textarea>
                 <div class="chat-bottom-bar">
                   <button type="button" class="chat-attach-btn" id="chat-attach-btn" data-i18n-title="chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
                   <!-- Voice-to-text mic button (stripped in OrkasOpen — see OpenSource/SyncCode/strip-rules.json). -->
@@ -875,6 +879,118 @@
         </div>
       </section>
 
+      <!-- Devtools (dev-only) -->
+      <section class="panel" id="panel-devtools">
+        <div class="devtools-container">
+          <div class="devtools-header">
+            <h2 data-i18n="devtools.title">Devtools</h2>
+            <div class="devtools-sub" data-i18n="devtools.subtitle">Dev mode only</div>
+          </div>
+
+          <!-- System info -->
+          <div class="devtools-card" id="devtools-card-sysinfo">
+            <div class="devtools-card-header">
+              <span class="devtools-card-title" data-i18n="devtools.sysinfo_title">System info</span>
+              <span class="devtools-card-actions">
+                <button class="btn btn-sm" id="devtools-sysinfo-copy-btn" data-i18n-title="devtools.copy_title" title="Copy as text" data-i18n="devtools.copy">Copy</button>
+              </span>
+            </div>
+            <div class="devtools-sysinfo-grid" id="devtools-sysinfo-grid"></div>
+          </div>
+
+          <!-- Refresh / Relaunch -->
+          <div class="devtools-card" id="devtools-card-relaunch">
+            <div class="devtools-card-header">
+              <span class="devtools-card-title" data-i18n="devtools.relaunch_title">Relaunch</span>
+              <span class="devtools-card-sub" data-i18n="devtools.relaunch_sub">Relaunch the Orkas process so local code changes take effect</span>
+            </div>
+            <div class="devtools-relaunch-row">
+              <button class="btn btn-sm btn-primary" id="devtools-relaunch-btn" data-i18n="devtools.relaunch_btn">Relaunch (Cmd/Ctrl + Shift + R)</button>
+            </div>
+          </div>
+
+          <!-- Model-native web search toggle -->
+          <div class="devtools-card" id="devtools-card-native-search">
+            <div class="devtools-card-header">
+              <span class="devtools-card-title" data-i18n="devtools.native_search_title">Model native web search</span>
+              <span class="devtools-card-sub" data-i18n="devtools.native_search_sub">When enabled, injects model server-side search tool on supported models. In-memory only, defaults on after restart.</span>
+            </div>
+            <label class="devtools-toggle-row">
+              <input type="checkbox" id="devtools-native-search-toggle" checked />
+              <span data-i18n="devtools.native_search_toggle">Enable model-native web search (OpenAI / Anthropic / Google)</span>
+            </label>
+          </div>
+
+          <!-- Skill metrics dashboard -->
+          <div class="devtools-card devtools-card-skill-metrics" id="devtools-card-skill-metrics">
+            <div class="devtools-card-header">
+              <span class="devtools-card-title" data-i18n="devtools.skill_metrics.title">Skill metrics</span>
+              <span class="devtools-card-sub" data-i18n="devtools.skill_metrics.sub">Aggregated from expert signals — invocation rate / modified-after-hit / negative transfer per skill</span>
+              <span class="devtools-card-actions">
+                <span class="devtools-skill-metrics-days" id="devtools-skill-metrics-days" role="group">
+                  <button class="btn btn-sm" data-days="1" data-i18n="devtools.skill_metrics.days_1">1d</button>
+                  <button class="btn btn-sm active" data-days="7" data-i18n="devtools.skill_metrics.days_7">7d</button>
+                  <button class="btn btn-sm" data-days="30" data-i18n="devtools.skill_metrics.days_30">30d</button>
+                </span>
+                <button class="btn btn-sm" id="devtools-skill-metrics-refresh-btn" data-i18n="devtools.refresh">Refresh</button>
+              </span>
+            </div>
+            <div class="devtools-skill-metrics-summary" id="devtools-skill-metrics-summary"></div>
+            <div class="devtools-skill-metrics-body" id="devtools-skill-metrics-body">
+              <div class="devtools-empty" data-i18n="devtools.skill_metrics.empty">(no signals in the selected range)</div>
+            </div>
+          </div>
+
+          <!-- LLM call archives -->
+          <div class="devtools-card devtools-card-archives" id="devtools-card-archives">
+            <div class="devtools-card-header">
+              <span class="devtools-card-title" data-i18n="devtools.archives_title">LLM call archives</span>
+              <span class="devtools-card-sub" data-i18n="devtools.archives_sub">The last 30 streamChatWithModel calls with full input / output / events</span>
+              <span class="devtools-card-actions">
+                <button class="btn btn-sm" id="devtools-archives-refresh-btn" data-i18n="devtools.refresh">Refresh</button>
+                <button class="btn btn-sm btn-danger" id="devtools-archives-clear-btn" data-i18n="devtools.clear">Clear</button>
+              </span>
+            </div>
+            <div class="devtools-body">
+              <div class="devtools-list-col">
+                <div class="devtools-list" id="devtools-list">
+                  <div class="devtools-empty" data-i18n="devtools.archives_empty">(no calls recorded)</div>
+                </div>
+              </div>
+              <div class="devtools-detail-col">
+                <div class="devtools-detail-empty" id="devtools-detail-empty" data-i18n="devtools.archives_detail_empty">Pick a call on the left to see details</div>
+                <div class="devtools-detail" id="devtools-detail" style="display:none">
+                  <div class="devtools-detail-meta" id="devtools-detail-meta"></div>
+                  <div class="devtools-detail-section">
+                    <div class="devtools-section-title" data-i18n="devtools.input_title">User input</div>
+                    <pre class="devtools-section-body" id="devtools-detail-input"></pre>
+                  </div>
+                  <div class="devtools-detail-section">
+                    <div class="devtools-section-title">System Prompt</div>
+                    <pre class="devtools-section-body" id="devtools-detail-sysprompt"></pre>
+                  </div>
+                  <div class="devtools-detail-section">
+                    <div class="devtools-section-title" data-i18n="devtools.context_title">Context</div>
+                    <pre class="devtools-section-body" id="devtools-detail-context"></pre>
+                  </div>
+                  <div class="devtools-detail-section">
+                    <div class="devtools-section-title"><span data-i18n="devtools.tools_title">Available tools</span>（<span id="devtools-detail-tools-count">0</span>）</div>
+                    <pre class="devtools-section-body" id="devtools-detail-tools"></pre>
+                  </div>
+                  <div class="devtools-detail-section">
+                    <div class="devtools-section-title"><span data-i18n="devtools.events_title">Stream events</span>（<span id="devtools-detail-events-count">0</span>）</div>
+                    <pre class="devtools-section-body" id="devtools-detail-events"></pre>
+                  </div>
+                  <div class="devtools-detail-section">
+                    <div class="devtools-section-title" data-i18n="devtools.output_title">Model output</div>
+                    <pre class="devtools-section-body" id="devtools-detail-output"></pre>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
     </main>
   </div>
 
@@ -1136,6 +1252,7 @@
   <script src="./modules/strip-structural-blocks.js"></script>
   <script src="./modules/projects.js"></script>
   <script src="./modules/project-detail.js"></script>
+  <script src="./modules/conv-bucket.js"></script>
   <script src="./modules/conversation.js"></script>
   <script src="./modules/chat-artifact.js"></script>
   <script src="./modules/plan-rail.js"></script>
@@ -1201,10 +1318,12 @@
   <script src="./modules/sync_settings.js"></script>
   <script src="./modules/sync_refresh.js"></script>
   <script src="./modules/sidebar_status.js"></script>
+  <script src="./modules/sidebar-resize.js"></script>
   <script src="./modules/devtools-sysinfo.js"></script>
   <script src="./modules/devtools-relaunch.js"></script>
   <script src="./modules/devtools-native-search.js"></script>
   <script src="./modules/devtools-archives.js"></script>
+  <script src="./modules/devtools-skill-metrics.js"></script>
   <script src="./modules/devtools.js"></script>
 </body>
 </html>

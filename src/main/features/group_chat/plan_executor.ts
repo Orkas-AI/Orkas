@@ -29,6 +29,7 @@ import { createLogger } from '../../logger';
 import { t } from '../../i18n';
 import { userChatsDir } from '../../paths';
 import { readJsonl } from '../../storage';
+import { isTransientError } from '../../util/transient-errors';
 import { COMMANDER_ID, USER_ID, readMembers } from './state';
 import {
   readPlan, updateStep, markPlanCompletedSignaled,
@@ -69,10 +70,11 @@ const USER_ALIASES = new Set(['user', '用户']);
  *  (fresh stream, fresh provider connection). Capped to avoid infinite
  *  loops when the user is just genuinely offline.
  *
- *  IMPORTANT — never include `aborted` or `cancelled` in this pattern:
- *  user-initiated abort must not be silently retried; the literal string
- *  `'aborted by user'` is also explicitly excluded by the guard. */
-const TRANSIENT_ERR_PATTERNS = /\b(terminated|fetch failed|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|socket hang up|EPIPE|network error|Connection closed)\b/i;
+ *  Pattern lives in `util/transient-errors.ts` as a shared classifier
+ *  — `features/expert_signals/turn_hooks.ts` is the second consumer
+ *  (skill_ineffective skips transient-class errors so we don't blame
+ *  skills for network blips). Single source of truth for "is this
+ *  a network blip" semantics. */
 const MAX_TRANSIENT_RETRIES = 2;
 
 /** Returns true when `reason` matches a transient network-error pattern AND
@@ -84,7 +86,7 @@ async function maybeRetryTransient(
 ): Promise<boolean> {
   if (!reason) return false;
   if (reason === 'aborted by user') return false;
-  if (!TRANSIENT_ERR_PATTERNS.test(reason)) return false;
+  if (!isTransientError(reason)) return false;
   const attempts = step.transient_attempts ?? 0;
   if (attempts >= MAX_TRANSIENT_RETRIES) return false;
   await updateStep(uid, cid, step.index, 'pending', {

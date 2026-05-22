@@ -673,6 +673,23 @@ describe('skills › updateCustomSkill', () => {
     expect(fs.existsSync(path.join(customSkillsDir(), 'beta'))).toBe(true);
   });
 
+  it('supports two-phase name edits with skipRename before final rename', async () => {
+    writeCustomSkill('alpha', 'name: "alpha"\ndescription_en: "x"', 'body');
+    const s = await loadSkills();
+
+    const staged = await s.updateCustomSkill('alpha', { name: 'beta' }, { skipRename: true });
+    expect(staged?.id).toBe('alpha');
+    expect(fs.existsSync(path.join(customSkillsDir(), 'alpha'))).toBe(true);
+    expect(fs.existsSync(path.join(customSkillsDir(), 'beta'))).toBe(false);
+    expect(fs.readFileSync(path.join(customSkillsDir(), 'alpha', 'SKILL.md'), 'utf8'))
+      .toContain('name: "beta"');
+
+    const committed = await s.updateCustomSkill('alpha', { name: 'beta' });
+    expect(committed?.id).toBe('beta');
+    expect(fs.existsSync(path.join(customSkillsDir(), 'alpha'))).toBe(false);
+    expect(fs.existsSync(path.join(customSkillsDir(), 'beta'))).toBe(true);
+  });
+
   it('returns null for missing skill', async () => {
     const s = await loadSkills();
     expect(await s.updateCustomSkill('ghost', { description: 'x' })).toBeNull();
