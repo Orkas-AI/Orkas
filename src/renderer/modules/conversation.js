@@ -1839,26 +1839,11 @@ async function loadConversations() {
   }
 }
 
-// Subscribe once to the main-side relay activity push. When iOS triggers a task on this PC,
-// after `groupChat.send` returns — we either reload the full list (new cid) or just bump the
-// existing entry to the top (matches what `_handleGroupBusEvent('message')` does for PC-local
-// activity). Without this, iOS-created convs only appear in the sidebar after a PC relaunch.
-let _relayActivityWatchStarted = false;
+// iOS remote-control bridge is stripped from this build; the push channel is
+// never wired, so this is a no-op. boot.js still invokes it to keep its boot
+// sequence identical across builds.
 function startRelayActivitySubscription() {
-  if (_relayActivityWatchStarted) return;
-  if (!window.orkas || typeof window.orkas.onPushEvent !== 'function') return;
-  try {
-      if (!payload || !payload.cid) return;
-      if (payload.created) {
-        loadConversations().catch((err) => _convLog.warn('relay reload failed', err));
-      } else {
-        _bumpConvToTop(payload.cid);
-      }
-    });
-    _relayActivityWatchStarted = true;
-  } catch (err) {
-    _convLog.warn('relay activity subscribe failed', err);
-  }
+  /* no-op */
 }
 
 // `timeBucket` + `_BUCKET_ORDER` live in modules/conv-bucket.js (loaded
@@ -3023,8 +3008,7 @@ function _attachBubbleArchiveBtn(msgDiv, getContent) {
       if (!Array.isArray(produced)) produced = [];
     } catch (_) { produced = []; }
     const fromName = fromActor === 'commander'
-      ? (t('chat.from_commander') || 'Commander')
-      ? (t('chat.from_commander'))
+      ? t('chat.from_commander')
       : (_groupActorLabel(fromActor) || '');
     _setQuote(currentCid, { fromActor, fromName, msgId, text, produced });
     const input = document.getElementById('chat-input');
@@ -3109,12 +3093,6 @@ async function handleNewChatSubmit() {
   _convLog.info('new chat submit', {
     content_length: content.length,
     use: useSelection ? useSelection.kind : null,
-    attachments: draftNames.length,
-  });
-    from: 'new_chat',
-    length: content.length,
-    has_skill: !!(useSelection && useSelection.kind === 'skill'),
-    has_connector: !!(useSelection && useSelection.kind === 'connector'),
     attachments: draftNames.length,
   });
 
@@ -3225,14 +3203,7 @@ async function handleChatSubmit() {
     return;
   }
   const attachments = attachList.filter((a) => a.status !== 'error').map((a) => a.name);
-  _convLog.info('chat submit', { cid, length: raw.length, skill: skill || null, attachments: attachments.length });
   _convLog.info('chat submit', { cid, length: raw.length, use: useSelection ? useSelection.kind : null, attachments: attachments.length });
-    from: 'conversation',
-    length: raw.length,
-    has_skill: !!(useSelection && useSelection.kind === 'skill'),
-    has_connector: !!(useSelection && useSelection.kind === 'connector'),
-    attachments: attachments.length,
-  });
 
   // If this conversation is already streaming OR has queued items waiting,
   // enqueue the new message instead of sending it now. Keep the raw text +

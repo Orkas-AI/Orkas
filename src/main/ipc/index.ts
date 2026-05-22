@@ -47,7 +47,6 @@ import * as appConfig from '../features/config';
 import * as avatars from '../features/avatars';
 import { getRendererTables, isLang, t } from '../i18n';
 import { isPathAllowed } from '../util/path-sandbox';
-import * as devtools from '../features/devtools';
 import * as userWorkspace from '../features/user_workspace';
 import { invokeHandlers as localAgentsHandlers } from './local_agents';
 import { invokeHandlers as qualityHandlers } from './quality';
@@ -1264,13 +1263,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     } catch (err) {
       return { ok: false, error: String((err as Error).message || 'write failed') };
     }
-    if (inProjectFile && payload?.projectId) {
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-        const sync = require('../features/sync') as { markDirty?: (domain: string, relPath: string) => void };
-        sync.markDirty?.('projects', `cloud/projects/${payload.projectId}/files`);
-      } catch { /* sync stripped */ }
-    }
+    // features/sync stripped from the OrkasOpen build — no markDirty nudge.
+    void inProjectFile;
     return { ok: true, size: bytes };
   },
 
@@ -1288,23 +1282,11 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { ok: true, path: target };
   },
 
-  // Dev-only debug panel data. All handlers no-op in packaged builds
-  // (return empty list / null / 0) so the renderer-side panel gracefully
-  // shows "nothing to show here".
-  'devtools.listArchives':  async () => devtools.listArchives(),
-  'devtools.readArchive':   async ({ id }) => devtools.readArchive(String(id || '')),
-  'devtools.clearArchives': async () => devtools.clearArchives(),
-  'devtools.getNativeSearchEnabled': async () => ({ enabled: devtools.isNativeSearchEnabled() }),
-  'devtools.setNativeSearchEnabled': async ({ enabled }) => {
-    devtools.setNativeSearchEnabled(!!enabled);
-    return { enabled: devtools.isNativeSearchEnabled() };
-  },
-  // Skill metrics — phase-1 consumer of expert_signals. Aggregates the
-  // last N days of skill_advertised / skill_invoked / correction / edit /
-  // skill_ineffective into a per-skill dashboard row. UI lives in the
-  // devtools panel for v0; not dev-only at the backend (data is general
-  // user-private signals, surfaced inside devtools per plan §3.3
-  // "先给专家自己看").
+  // Skill metrics — phase-1 consumer of expert_signals. Aggregates the last N
+  // days of skill_advertised / skill_invoked / correction / edit /
+  // skill_ineffective into a per-skill dashboard row. The matching renderer
+  // panel was stripped from the OrkasOpen build; the handler stays callable
+  // so any future surface (or test harness) can read the same aggregate.
   'devtools.skillMetricsReport': async ({ sinceDays } = {}) => {
     const { aggregateSkillMetrics } = await import('../features/skill_metrics');
     return aggregateSkillMetrics({ sinceDays: Number.isFinite(sinceDays) ? Number(sinceDays) : undefined });

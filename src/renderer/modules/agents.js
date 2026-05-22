@@ -406,22 +406,13 @@ function _renderAgentRowMenuItems(menu, agentId) {
   const a = _agentsCache?.find((x) => x.agent_id === agentId);
   const enabled = a ? a.enabled !== false : true;
   const isCustom = a?.source === 'custom';
+  // OrkasOpen has no dev-env concept (per PC/CLAUDE.md §11 "OrkasOpen contract"),
+  // so platform / marketplace agents stay read-only — only custom agents are editable.
   const canEdit = isCustom;
-  // Dev mode lifts the source guard for built-in edit / delete; custom adds
-  // a "promote to built-in" item too.
-  const canEdit = isCustom || (a?.source === 'builtin' && false);
-  // Dev-only entry on builtin: tag the label so the user knows this isn't a
-  // normal user capability (mirrors marketplace.upload's "(dev)" treatment).
-  const editLabelSuffix = (a?.source === 'builtin' && false) ? t('common.dev_suffix') : '';
-  // Dev mode lifts the source guard for marketplace edit / delete.
-  const canEdit = isCustom || (_isAgentPlatformSource(a?.source) && false);
-  // Dev-only entry on builtin: tag the label so the user knows this isn't a
-  // normal user capability (mirrors marketplace.upload's "(dev)" treatment).
-  const editLabelSuffix = (_isAgentPlatformSource(a?.source) && false) ? t('common.dev_suffix') : '';
   const toggleLabel = enabled ? t('component.disable') : t('component.enable');
   const items = [];
   if (canEdit) {
-    items.push(`<div class="agent-row-menu-item" data-action="edit">${escapeHtml(t('agents.edit') + editLabelSuffix)}</div>`);
+    items.push(`<div class="agent-row-menu-item" data-action="edit">${escapeHtml(t('agents.edit'))}</div>`);
   }
   if (isCustom && false) {
     items.push(`<div class="agent-row-menu-item" data-action="promote">${escapeHtml(t('agents.promote_to_builtin'))}</div>`);
@@ -582,28 +573,18 @@ function _renderAgentDetail(agent, editing) {
   const uploadBtn = document.getElementById('agent-upload-marketplace-btn');
   const delBtn = document.getElementById('agent-delete-btn');
   const isCustom = agent.source === 'custom';
+  // OrkasOpen has no dev-env concept (per PC/CLAUDE.md §11 "OrkasOpen contract"):
+  // platform / marketplace agents stay read-only — only custom agents are editable.
   const canEdit = isCustom;
   if (useBtn) useBtn.style.display = editing ? 'none' : '';
   if (enableBtn) enableBtn.style.display = editing ? 'none' : '';
-
-  if (promoteBtn) promoteBtn.style.display = (isCustom && false && !editing) ? '' : 'none';
-  const uploadBtn = document.getElementById('agent-upload-marketplace-btn');
-  const delBtn = document.getElementById('agent-delete-btn');
-  const isCustom = agent.source === 'custom';
-  const canEdit = isCustom || (_isAgentPlatformSource(agent.source) && false);
-  if (useBtn) useBtn.style.display = editing ? 'none' : '';
-  if (enableBtn) enableBtn.style.display = editing ? 'none' : '';
+  if (promoteBtn) promoteBtn.style.display = 'none';
   // Upload button visibility: gated by marketplace_dev.js's presence (OrkasOpen lacks it).
   if (uploadBtn) uploadBtn.style.display = (typeof openMarketplaceUpload === 'function' && !editing) ? '' : 'none';
   if (delBtn) delBtn.style.display = (canEdit && !editing) ? '' : 'none';
   if (editBtn) {
     editBtn.style.display = canEdit ? '' : 'none';
-    // Tag the "Edit" label on marketplace agents (dev-only entry); "Done" stays
-    // bare because the user is already in edit mode and the marker would be
-    // redundant noise.
-    const editSuffix = (!editing && agent.source === 'builtin' && false) ? t('common.dev_suffix') : '';
-    const editSuffix = (!editing && _isAgentPlatformSource(agent.source) && false) ? t('common.dev_suffix') : '';
-    editBtn.textContent = editing ? t('agents.edit_btn_done') : (t('agents.edit_btn_edit') + editSuffix);
+    editBtn.textContent = editing ? t('agents.edit_btn_done') : t('agents.edit_btn_edit');
   }
   _renderAgentEnabledButton({ id: agent.agent_id, enabled: agent.enabled !== false });
 
@@ -629,10 +610,9 @@ function _renderAgentOutputFormatSection(agent) {
   if (agent.runtime?.kind === 'cli') { section.style.display = 'none'; return; }
   section.style.display = '';
 
-  const canEdit = agent.source === 'custom'
-    || (agent.source === 'builtin' && typeof isDevMode === 'function' && false);
-    || (agent.source === 'builtin' && typeof isDevMode === 'function' && false);
-    || (_isAgentPlatformSource(agent.source) && typeof isDevMode === 'function' && false);
+  // OrkasOpen has no dev-env concept (per PC/CLAUDE.md §11 "OrkasOpen contract"):
+  // platform / marketplace agents stay read-only — only custom agents are editable.
+  const canEdit = agent.source === 'custom';
 
   slot.innerHTML = '';
   const mount = document.createElement('div');
@@ -643,9 +623,6 @@ function _renderAgentOutputFormatSection(agent) {
     { value: 'markdown_only',  label: t('agents.output_format_markdown_only') || 'Markdown only' },
     { value: 'dashboard',      label: t('agents.output_format_dashboard')     || 'Dashboard (no artifact)' },
     { value: 'artifact',       label: t('agents.output_format_artifact')      || 'Artifact (Dashboard + HTML)' },
-    { value: 'markdown_only',  label: t('agents.output_format_markdown_only') },
-    { value: 'dashboard',      label: t('agents.output_format_dashboard') },
-    { value: 'artifact',       label: t('agents.output_format_artifact') },
   ];
   // Map legacy on-disk values to the new 3-option display. `'allow_artifacts'` is the renamed
   // `'artifact'`. `'auto'` / missing show as `'markdown_only'` (the new default); the field on
@@ -891,9 +868,7 @@ async function _renderAgentDetailProjectDir(agent) {
   section.style.display = '';
   slot.dataset.agentId = agent.agent_id;
 
-  const canEdit = agent.source === 'custom'
-    || (agent.source === 'builtin' && typeof isDevMode === 'function' && false);
-    || (_isAgentPlatformSource(agent.source) && typeof isDevMode === 'function' && false);
+  const canEdit = agent.source === 'custom';
 
   const renderInfo = (info) => {
     if (_selectedAgent?.id !== agent.agent_id || slot.dataset.agentId !== agent.agent_id) return;
@@ -1515,19 +1490,14 @@ async function _autoSendAgentChat(content) {
 }
 
 async function deleteSelectedAgent() {
-  if (!_selectedAgent || _selectedAgent.source === 'builtin') return;
-  if (!_selectedAgent) return;
-  const isMarketplace = _isAgentPlatformSource(_selectedAgent.source);
-  if (isMarketplace && !false) return;
+  // OrkasOpen has no dev-env concept (per PC/CLAUDE.md §11 "OrkasOpen contract"):
+  // platform / marketplace agents are not user-deletable — only custom agents.
+  if (!_selectedAgent || _selectedAgent.source !== 'custom') return;
   if (!(await uiConfirm(t('agents.delete_confirm')))) return;
   const agentId = _selectedAgent.id;
   try {
-    const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}`,
-      { method: 'DELETE' });
+    const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}`, { method: 'DELETE' });
     const data = await res.json();
-    const data = isMarketplace
-      ? await window.orkas.invoke('agents.builtin.delete', { agent_id: agentId })
-      : await (await apiFetch(`/api/agents/${encodeURIComponent(agentId)}`, { method: 'DELETE' })).json();
     if (!data.ok) throw new Error(data.error || t('agents.delete_failed'));
     _selectedAgent = null; _agentEditing = false;
     document.getElementById('agents-chat-col').style.display = 'none';

@@ -138,19 +138,6 @@ export interface BuildRunnerParams {
   /** Fires when `read_file` resolves to a SKILL.md path inside any of the
    *  three skill roots. Bus collects per turn for `skill_invoked`. */
   onSkillInvoked?: (skill_id: string, system: 'A.custom' | 'A.platform' | 'B', trigger: 'read_file') => void;
-  /** Fires when the pi-ai onPayload hook injects a vendor native web search
-   *  tool schema for this call. Used by client.ts to record a synthetic
-   *  `progress/native_search/injected` event into the devtools archive.
-   *  May fire multiple times per chat turn if rotating-provider falls over
-   *  to a secondary candidate. */
-  onNativeSearchInjected?: (info: NativeSearchInjectedInfo) => void;
-  /** Fires when rotating-provider commits to a candidate (success) or
-   *  surfaces a non-rotatable error (failure). Used by client.ts to update
-   *  the dev archive's recorded model / provider / profile so the stored
-   *  row reflects the candidate that actually owned the visible outcome,
-   *  not the rotating-provider's primary label. Fires at most once per
-   *  call; not invoked when rotation rolls past a candidate. */
-  onCandidateChosen?: (info: { profileId: string; providerId: string; modelId: string }) => void;
 }
 
 /** Tool definition snapshot used to log "what tools did the LLM actually see
@@ -219,8 +206,6 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const providerId = primary?.provider || 'anthropic';
   const modelId    = primary?.model    || 'claude-sonnet-4-5';
 
-  // Build tools array: memory tool + metacognition tool.
-  const uid = params.userId || extractUidFromSessionId(params.sessionId);
   // Build tools array: memory tool + metacognition tool. Assembly stays
   // above the system-prompt build because finalToolNames is still snapshotted
   // for the dev archive after this section.

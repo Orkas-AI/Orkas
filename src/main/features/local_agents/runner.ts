@@ -159,16 +159,8 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   // a renderer crash mid-run still leaves a complete jsonl trail.
   let streamedOutput = '';
   let terminal: { status: RunCliAgentResult['status']; output?: string; error?: string; sessionId?: string } | null = null;
-  // Buffer events for the devtools archive so the debug panel sees CLI
-  // dispatches alongside core-agent calls. Translation = LocalEvent →
-  // dispatch start so the panel can render a relative timeline.
-  const archiveAppend = (e: LocalEvent) => {
-    archiveEvents.push({
-      t: Date.now() - startedAtMs,
-      type: e.type,
-      data: { ...e } as unknown as Record<string, unknown>,
-    });
-  };
+  // The dev devtools LLM-call archive is stripped from this build; the runtime
+  // `local-agent-runs/<runId>/` directory is the only persistence path.
   const idleThresholdMs = resolveIdleMs(BACKEND_IDLE_MS[opts.cli]);
   // CLI dispatch session id (matches the devtools-archive session id
   // built below). The per-session spill dir is anchored on this so
@@ -274,24 +266,10 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   log.info('end', {
     runId: handle.runId, cli: opts.cli, status: terminal.status, bytes: finalOutput?.length ?? 0,
   });
-  // The per-run jsonl under `local-agent-runs/<runId>/` (written by
-  // `persist`) is the only post-run artifact.
-  // prod and self-catches all errors, so we don't await or guard here.
-  // Devtools archive shape — keep the session_id format `<uid>-cli-<tail>`
-  // to match the §5 security invariant (uid first segment, kind second);
-  // `cli` is the new kind devtools recognises and badges as such.
-  // Provider = brand label ("Claude Code" / "Codex" ...) so the panel
-  // shows the human-readable CLI name; model = version string when
-  // detected, falling back to the user-picked model id, falling back
-  // to "(default)".
-  // The dev devtools LLM-call archive is stripped from this build; the runtime
-  // `local-agent-runs/<runId>/` directory is the only persistence path.
-  void _cliBrandLabel(opts.cli);
+  // The per-run jsonl under `local-agent-runs/<runId>/` (written by `persist`)
+  // is the only post-run artifact in this build.
   void entry.version;
-  void startedAtMs;
   void endedAtMs;
-  void startedAtIso;
-  void archiveEvents;
   return { runId: handle.runId, status: terminal.status, output: finalOutput, error: terminal.error };
 }
 

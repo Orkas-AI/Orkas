@@ -29,8 +29,6 @@ import { evictSession } from '../model/core-agent/session-store';
 import { getActiveUserId } from './users';
 import { createLogger } from '../logger';
 import { t, buildLanguageDirective } from '../i18n';
-import { t, buildLanguageDirective, buildBuiltinEditingConstraint } from '../i18n';
-import { isDevEnv } from './devtools';
 import { getWorkspacePath } from './user_workspace';
 
 const log = createLogger('agents');
@@ -734,16 +732,9 @@ let _agentListCache: AgentListCache | null = null;
 
 function _invalidateAgentListCache(opts: { markDirty?: boolean } = {}): void {
   _agentListCache = null;
-  if (opts.markDirty === false) return;
-  // Notify the sync engine (lazy-require — stripped in OrkasOpen builds). Every cache-invalidate
-  // is also a disk-mutation point, so co-locating the dirty signal here covers all the
-  // existing call sites without sprinkling sync calls across the file. The relPath here is
-  // informational only — the engine ignores it and walks `cloud/` itself.
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = require('./sync') as { markDirty?: (domain: string, relPath: string) => void };
-    sync.markDirty?.('agents', 'cloud/agents');
-  } catch { /* features/sync stripped */ }
+  // features/sync stripped from the OrkasOpen build (offline client, no cloud
+  // sync); the markDirty hook is intentionally a no-op here.
+  void opts;
 }
 
 /** Public re-export of `_invalidateAgentListCache` for cross-module callers (sync engine).
@@ -1309,7 +1300,6 @@ async function _applyAgentUpdates(
   }
   if (!data.name) data.name = t('agent.default_name');
   data.updated_at = nowIso();
-  await writeJson(f, data);
 }
 
 /** Edit-chat dispatcher: routes to custom write for custom agents, and to
@@ -1322,18 +1312,6 @@ export async function updateAgentSpec(
   if (!agentId) return null;
   if (fs.existsSync(customAgentFile(agentId))) {
     return updateCustomAgent(agentId, updates);
-  }
-  if (fs.existsSync(_platformAgentSpecFile(agentId)) && false) {
-    try {
-      const dev = await import('./agents_dev');
-      return await dev.updateBuiltinAgentSpec(agentId, updates);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code !== 'MODULE_NOT_FOUND' && code !== 'ERR_MODULE_NOT_FOUND') {
-        log.warn(`agents_dev load failed: ${(err as Error).message}`);
-      }
-      return null;
-    }
   }
   return null;
 }
@@ -1351,17 +1329,6 @@ export async function _applyAgentUpdatesAndInvalidate(
 ): Promise<Agent | null> {
   await _applyAgentUpdates(data, agentId, updates);
   _invalidateAgentListCache();
-  log.info(`updated id=${agentId}`);
-  // Propagate a name change into every conversation roster that already
-  // lists this agent. members.json snapshots the name at join time and the
-  // @-router resolves on roster-first, so without this sweep `@<old-name>`
-  // would keep matching in old chats.
-  const newName = typeof (data as any).name === 'string' ? (data as any).name : '';
-  if (newName && newName !== oldName) {
-    try { await renameAgentInMembers(getActiveUserId(), agentId, newName); }
-    catch (err) { log.warn(`rename roster sweep failed id=${agentId}: ${(err as Error).message}`); }
-  }
-  return normalizeAgent(data, 'custom');
   return normalizeAgent(data, 'marketplace');
 }
 

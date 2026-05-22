@@ -462,18 +462,12 @@ function _openSkillRowMenu(anchorBtn, id, source) {
   // longer carry a toggle).
   const cached = _skillsCache?.find((s) => s.id === id && s.source === source);
   const enabled = cached ? cached.enabled !== false : true;
+  // OrkasOpen has no dev-env concept (per PC/CLAUDE.md §11 "OrkasOpen contract"),
+  // so platform / marketplace skills stay read-only — only custom skills are editable.
   const canEdit = source === 'custom';
-  const canEdit = source === 'custom' || (source === 'builtin' && false);
-  // Dev-only entry on builtin: tag the label so the user knows this isn't a
-  // normal user capability (mirrors marketplace.upload's "(dev)" treatment).
-  const editLabelSuffix = (source === 'builtin' && false) ? t('common.dev_suffix') : '';
-  const canEdit = source === 'custom' || (_isSkillPlatformSource(source) && false);
-  // Dev-only entry on marketplace items: tag the label so the user knows this isn't a
-  // normal user capability (mirrors marketplace.upload's "(dev)" treatment).
-  const editLabelSuffix = (_isSkillPlatformSource(source) && false) ? t('common.dev_suffix') : '';
   const items = [];
   if (canEdit) {
-    items.push(`<div class="skill-row-menu-item" data-action="edit">${escapeHtml(t('skills.edit') + editLabelSuffix)}</div>`);
+    items.push(`<div class="skill-row-menu-item" data-action="edit">${escapeHtml(t('skills.edit'))}</div>`);
   }
   items.push(
     `<div class="skill-row-menu-item" data-action="toggle-enabled">${escapeHtml(enabled ? t('component.disable') : t('component.enable'))}</div>`,
@@ -746,8 +740,9 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   // Order: use (icon) / edit / enable-disable / delete.
   // In edit mode only the "done" button (the relabeled "edit") is
   // shown; everything else hides.
+  // OrkasOpen has no dev-env concept (per PC/CLAUDE.md §11 "OrkasOpen contract"):
+  // platform / marketplace skills stay read-only — only custom skills are editable.
   const canEditThisSkill = source === 'custom';
-  const canEditThisSkill = source === 'custom' || (_isSkillPlatformSource(source) && false);
   const editingThis = _skillEditMode && _skillEditSkillId === id && canEditThisSkill;
   const actions = document.getElementById('skills-detail-actions');
   if (actions) {
@@ -1187,11 +1182,9 @@ function _updateEditButtonLabel() {
     btn.textContent = t('skills.edit_btn_done');
     return;
   }
-  // Tag the "Edit" label on marketplace skills (dev-only entry); the "Done"
-  // branch above stays bare — in edit mode the marker is redundant.
-  const suffix = (_selectedSkill?.source === 'builtin' && false) ? t('common.dev_suffix') : '';
-  const suffix = (_isSkillPlatformSource(_selectedSkill?.source) && false) ? t('common.dev_suffix') : '';
-  btn.textContent = t('skills.edit_btn_edit') + suffix;
+  // OrkasOpen has no dev-env concept (per PC/CLAUDE.md §11 "OrkasOpen contract");
+  // platform / marketplace skill labels never carry the dev-suffix marker.
+  btn.textContent = t('skills.edit_btn_edit');
 }
 
 // When called with {autoSeed: true} (e.g. right after skill creation),
@@ -1600,17 +1593,14 @@ function editSelectedSkill() {
 
 async function deleteSelectedSkill() {
   if (!_selectedSkill) return;
+  // OrkasOpen has no dev-env concept (per PC/CLAUDE.md §11 "OrkasOpen contract"):
+  // platform skills are not user-deletable here — only custom skills.
   if (_selectedSkill.source !== 'custom') return;
-  const src = _selectedSkill.source;
-  if (src !== 'custom' && !(_isSkillPlatformSource(src) && false)) return;
   const sid = _selectedSkill.id;
   const cached = _skillsCache?.find(s => s.id === sid && s.source === 'custom');
   if (!(await uiConfirm(t('skills.delete_confirm', { name: cached?.name || sid })))) return;
   try {
     const result = await (await apiFetch(`/api/skills/${sid}`, { method: 'DELETE' })).json();
-    const result = _isSkillPlatformSource(src)
-      ? await window.orkas.invoke('skills.builtin.delete', { id: sid })
-      : await (await apiFetch(`/api/skills/${sid}`, { method: 'DELETE' })).json();
     if (!result.ok) {
       await uiAlert(t('skills.delete_failed_with', { reason: result.error || '' }));
       return;

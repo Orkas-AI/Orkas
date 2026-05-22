@@ -24,6 +24,7 @@ import * as fs from 'node:fs';
 import {
   USERS_FILE,
   userLocalConfigDir,
+  userRoot,
   userToolResultsDir,
   ensureUserLayout,
 } from '../paths';

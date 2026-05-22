@@ -32,14 +32,10 @@ const OLD_FILENAME = 'connectors.json';
 const NEW_FILENAME = 'connectors.json';
 const STAMP_FILE = '.migrate-connectors-to-cloud.done';
 
+// features/account stripped from the OrkasOpen build — no OAuth user_id available;
+// the migration always falls back to the local-uid seed.
 function _oauthUserId(): string | null {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const account = require('../features/account') as { oauthUserId?: () => string | null };
-    return account.oauthUserId?.() ?? null;
-  } catch {
-    return null;
-  }
+  return null;
 }
 
 export function migrateConnectorsToCloud(uid: string): boolean {

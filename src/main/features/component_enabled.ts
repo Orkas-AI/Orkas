@@ -43,15 +43,9 @@ import { createLogger } from '../logger';
 
 const log = createLogger('component-enabled');
 
-// Lazy require sync: the module is stripped from OrkasOpen builds, and a static import would
-// break that build at module-load time. When sync is absent we silently no-op — the file
-// still sits at `cloud/config/` for whenever sync becomes available.
+// features/sync is stripped from the OrkasOpen build — markDirty is a no-op.
 function _notifyDirty(): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = require('./sync') as { markDirty?: (domain: string, relPath: string) => void };
-    sync.markDirty?.('component_enabled', 'cloud/config/component-enabled.json');
-  } catch { /* features/sync stripped */ }
+  /* no-op */
 }
 
 const SCHEMA_VERSION = 1;

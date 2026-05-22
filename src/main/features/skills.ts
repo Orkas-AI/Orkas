@@ -266,15 +266,9 @@ let _skillListCache: SkillListCache | null = null;
 
 function _invalidateSkillListCache(opts: { markDirty?: boolean } = {}): void {
   _skillListCache = null;
-  if (opts.markDirty === false) return;
-  // Sync engine dirty signal (lazy-require — stripped in OrkasOpen). Mirrors the pattern in
-  // `agents.ts::_invalidateAgentListCache`: every cache-invalidate is also a disk-mutation
-  // point, co-locating keeps wiring tight.
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = require('./sync') as { markDirty?: (domain: string, relPath: string) => void };
-    sync.markDirty?.('skills', 'cloud/skills');
-  } catch { /* features/sync stripped */ }
+  // features/sync stripped from the OrkasOpen build — `opts.markDirty` has no
+  // downstream consumer; consume the param to keep the signature stable.
+  void opts;
 }
 
 /** Internal cache invalidator + core-agent registry invalidator. Exported for
@@ -581,17 +575,17 @@ export async function getCustomSkill(skillId: string): Promise<CustomSkill | nul
   return { id: skillId, name, ...descPair, category, source: 'custom', dir: d };
 }
 
-export async function listCustomSkillFiles(skillId: string): Promise<SkillFileInfo[]> {
-  const d = path.resolve(customSkillDir(skillId));
+async function _listSkillFilesAt(dir: string): Promise<SkillFileInfo[]> {
+  const d = path.resolve(dir);
   if (!fs.existsSync(d) || !fs.statSync(d).isDirectory()) return [];
   const out: SkillFileInfo[] = [];
 
-  function walk(dir: string, relBase = ''): void {
-    for (const e of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+  function walk(cur: string, relBase = ''): void {
+    for (const e of fs.readdirSync(cur, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
       const rel = relBase ? `${relBase}/${e.name}` : e.name;
       const parts = rel.split('/');
       if (parts.some((p) => p.startsWith('.') || SKILL_TREE_IGNORE.has(p))) continue;
-      const full = path.join(dir, e.name);
+      const full = path.join(cur, e.name);
       if (e.isDirectory()) walk(full, rel);
       else if (e.isFile()) {
         let size = 0;
@@ -602,6 +596,10 @@ export async function listCustomSkillFiles(skillId: string): Promise<SkillFileIn
   }
   walk(d);
   return out;
+}
+
+export async function listCustomSkillFiles(skillId: string): Promise<SkillFileInfo[]> {
+  return _listSkillFilesAt(customSkillDir(skillId));
 }
 
 export async function createCustomSkill(
@@ -1093,9 +1091,9 @@ export function _writeSkillFileAt(
   if (!rel || rel.startsWith('..')) return false;
   const parts = rel.split('/');
   if (parts.some((p) => p === '' || p === '.' || p === '..')) return false;
-  const target = path.resolve(d, rel);
+  const target = path.resolve(resolvedDir, rel);
   try {
-    const relative = path.relative(d, target);
+    const relative = path.relative(resolvedDir, target);
     if (relative.startsWith('..') || path.isAbsolute(relative)) return false;
   } catch { return false; }
   writeTextAtomicSync(target, content);
@@ -1128,26 +1126,6 @@ export async function writeSkillFileForEditChecked(
   const customDir = customSkillDir(skillId);
   if (fs.existsSync(customDir) && fs.statSync(customDir).isDirectory()) {
     return writeCustomSkillFileChecked(skillId, relpath, contentForWrite);
-  }
-  if (isBuiltinSkill(skillId) && false) {
-    // Built-in (platform-installed) skill edit. Validate first; defer the
-    // actual write to skills_dev (which knows the target install dir).
-    const report = validateSkillFile({ relpath, content: contentForWrite });
-    void persistQualityReport({
-      uid: getActiveUserId(), kind: 'skill', id: skillId, report,
-    });
-    if (!report.ok) return { ok: false, report };
-    try {
-      const dev = await import('./skills_dev');
-      const written = await dev.writeBuiltinSkillFile(skillId, relpath, contentForWrite);
-      return written ? { ok: true, report } : { ok: false, report, reason: 'invalid_path' };
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code !== 'MODULE_NOT_FOUND' && code !== 'ERR_MODULE_NOT_FOUND') {
-        log.warn(`skills_dev load failed: ${(err as Error).message}`);
-      }
-      return { ok: false };
-    }
   }
   return { ok: false };
 }
@@ -1517,8 +1495,6 @@ export async function buildSkillEditSystemPrompt(skill: {
   description_en?: string;
   category?: string;
   dir?: string;
-}): Promise<string> {
-  const files = await listCustomSkillFiles(skill.id || '');
   /** Picks the file-listing path: `marketplace` reads files from `dir`
    *  directly (per-machine install root), `custom` resolves via id under
    *  the user's custom skills dir. */
@@ -1543,7 +1519,6 @@ export async function buildSkillEditSystemPrompt(skill: {
     skill_dir: skill.dir || '',
     skill_files: skillFilesBlock(files),
   });
-  return `${body}\n\n---\n\n${buildLanguageDirective()}`;
   const tail = buildLanguageDirective();
   return `${body}\n\n---\n\n${tail}`;
 }

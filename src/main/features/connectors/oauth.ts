@@ -26,6 +26,7 @@ import { shell } from 'electron';
 
 import { getLanguage } from '../config';
 import { createLogger } from '../../logger';
+import { accountApiBase, tokenStore } from './_server_bridge';
 import type { CatalogEntry, OAuthGrant } from './types';
 
 const log = createLogger('connectors:oauth');

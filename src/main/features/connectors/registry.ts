@@ -58,30 +58,15 @@ type InstanceOnDisk = Omit<ConnectorInstance, 'oauth_grant' | 'dcr_client' | 'tr
 };
 interface SecretsBlob { oauth_grant?: OAuthGrant; dcr_client?: DcrClientCredentials; transport?: Transport }
 
-// Vault-seed resolver. Tries the Orkas account's OAuth user_id (cross-device decryptable);
-// falls back to local uid for OrkasOpen / pre-login. Lazy require because `features/account`
-// is stripped from the OrkasOpen build — a static import would break that build at module-load
-// time. Same defensive pattern as `catalog.ts::_loadGoogleEntries`.
+// Vault-seed resolver. OrkasOpen strips `features/account`, so there is no
+// cross-device OAuth user_id to fall back to — the seed is always the local uid.
 function _vaultSeed(uid: string): string {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const account = require('../account') as { oauthUserId?: () => string | null };
-    const oauth = account.oauthUserId?.();
-    if (oauth) return oauth;
-  } catch { /* features/account stripped → fall through */ }
   return uid;
 }
 
-// Same lazy-require for the sync engine — OrkasOpen strips `features/sync`, so a static import
-// would break the build. When sync is absent, `_notifyDirty` is a no-op and writes go through
-// without the immediate-sync nudge (the file still syncs eventually via the 5-min periodic /
-// before-quit on builds that DO have sync; OrkasOpen never syncs at all).
+// features/sync stripped from the OrkasOpen build — `_notifyDirty` is a no-op.
 function _notifyDirty(): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = require('../sync') as { markDirty?: (domain: string, relPath: string) => void };
-    sync.markDirty?.('connectors', 'cloud/config/connectors.json');
-  } catch { /* features/sync stripped */ }
+  /* no-op */
 }
 
 // Decrypt with the active seed; fall back to local-uid for files written before the

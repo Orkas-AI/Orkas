@@ -201,11 +201,7 @@ async function _writeBindings(uid: string, pid: string, b: ProjectBindings): Pro
 // file should kick the sync debounce so the change propagates within seconds rather than the
 // 5-min periodic.
 function _notifyDirty(): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = require('./sync') as { markDirty?: (domain: string, relPath: string) => void };
-    sync.markDirty?.('projects', 'cloud/projects');
-  } catch { /* features/sync stripped */ }
+  // features/sync stripped from the OrkasOpen build — no-op.
 }
 
 // ── Validation ────────────────────────────────────────────────────────────

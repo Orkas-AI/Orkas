@@ -50,7 +50,6 @@ import {
   userMarketplaceSkillsDir, userMarketplaceAgentsDir, projectFilesDir,
 } from '../../paths';
 import * as agentsFeat from '../agents';
-import { isDevEnv } from '../devtools';
 import { isAgentEnabled } from '../component_enabled';
 import { buildLanguageDirective, descriptionLang, t } from '../../i18n';
 import * as marketplaceFeat from '../marketplace';

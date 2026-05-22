@@ -150,18 +150,6 @@ export function setMetacognitionEnabled(enabled: boolean): boolean {
   return !!enabled;
 }
 
-// ── Desktop auto-update ─────────────────────────────────────────────────
-// Defaults to ON. Packaged app support is handled by features/app_update.ts;
-// this preference only captures the user's intent.
-
-export function getAutoUpdateEnabled(): boolean {
-  return v !== false;
-}
-
-export function setAutoUpdateEnabled(enabled: boolean): boolean {
-  return !!enabled;
-}
-
 /** Production wrapper: reads the system locale from Electron's `app`. */
 export function initLanguageFromApp(): Lang {
   let locale = '';

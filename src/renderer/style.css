@@ -6873,38 +6873,9 @@ body.model-not-configured .main-content { flex-direction: column; }
 .settings-tab.has-dot.is-orange::after { background: #f59e0b; }
 .settings-tab-pane[hidden] { display: none; }
 
-/* Subscription card (account tab). Layout: chip badge + status text on one
-   line, detail line beneath, action button on the right. Avatar slot omitted —
-   that slot is reserved for user identity in the Account card; using it for a
-   tier marker confused the visual hierarchy (FREE in a circle reads as a user
-   avatar). */
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 2px;
-}
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  padding: 2px 8px;
-  border-radius: 10px;
-  background: rgba(107, 114, 128, 0.12);
-  color: #4b5563;
-  text-transform: uppercase;
-}
-  background: #0a0a0a;
-  color: #fff;
-}
-  background: #0a0a0a;
-  color: #fff;
-}
-  font-size: 14px;
-  color: var(--ink, #0a0a0a);
-}
-
-/* Pro feature badge — inline in a card title to mark "this is Pro-gated"
-   when the current user isn't a Pro subscriber. Same chip shape as the
-   subscription card's badge so the visual language stays consistent. */
+/* The subscription / sync / Pro-gated styles that lived here are stripped from the
+   OrkasOpen build (no Orkas account backend, no cloud sync engine). The
+   `.settings-pro-badge` chip still has consumers elsewhere, so it stays. */
 .settings-pro-badge {
   display: inline-block;
   margin-left: 8px;
@@ -6919,127 +6890,6 @@ body.model-not-configured .main-content { flex-direction: column; }
   vertical-align: 2px;
 }
 
-/* Sync card (data tab). */
-  font-size: 12px;
-  padding: 2px 8px;
-  border-radius: 10px;
-  background: rgba(16, 185, 129, 0.12);
-  color: #047857;
-  margin-right: 8px;
-}
-  max-width: 320px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-  flex: 1;
-  height: 6px;
-  background: var(--border, #e5e7eb);
-  border-radius: 3px;
-  overflow: hidden;
-  max-width: 320px;
-}
-  height: 100%;
-  width: 0%;
-  background: var(--accent, #6366f1);
-  transition: width 200ms ease;
-}
-  color: #b91c1c;
-  font-size: 12px;
-  white-space: pre-wrap;
-}
-  color: #b91c1c;
-}
-  margin-top: 12px;
-  padding: 12px 14px;
-  background: rgba(239, 68, 68, 0.08);
-  border: 1px solid rgba(239, 68, 68, 0.35);
-  border-radius: 8px;
-  font-size: 13px;
-}
-  font-weight: 600;
-  color: #b91c1c;
-  margin-bottom: 4px;
-}
-  color: var(--text);
-  margin-bottom: 8px;
-}
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-}
-  margin: 6px 0 12px;
-  padding-left: 18px;
-  max-height: 160px;
-  overflow-y: auto;
-  color: var(--text-muted, #6b7280);
-  font-size: 12px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
-  /* No horizontal padding — the breakdown rows must left-align with the
-   * quota bar text above (which also sits flush against the group's left
-   * edge). Vertical breathing room only. */
-  margin-top: 10px;
-  padding: 6px 0 4px;
-  font-size: 13px;
-}
-/* Single grid hoisted to the section so all rows share the same column
- * tracks (otherwise per-row autos sized each row independently and the
- * size column didn't right-align across rows). Two columns now: name
- * (1fr, left-aligned) and size (auto, right-aligned). */
-  display: grid;
-  grid-template-columns: 1fr auto;
-  column-gap: 16px;
-  row-gap: 4px;
-  align-items: center;
-  margin: 8px 0 4px;
-  font-size: 12px;
-}
-  grid-column: 1 / -1;
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--text-muted, #6b7280);
-  margin: 4px 4px 4px;
-}
-/* `display: contents` makes each row's children promote to direct grid
- * items of the section, so the three columns line up across every row. */
-  display: contents;
-}
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-  font-variant-numeric: tabular-nums;
-  color: var(--text);
-  justify-self: end;
-}
-  margin-top: 12px;
-  font-size: 13px;
-}
-  cursor: pointer;
-  color: var(--text);
-  font-weight: 500;
-  list-style: none;
-  padding: 6px 4px;
-}
-  padding: 6px 4px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-}
-  font-size: 11px;
-  margin-top: 14px;
-  padding: 8px 10px;
-  background: var(--bg-soft, #f9fafb);
-  border-radius: 6px;
-  line-height: 1.5;
-}
 .settings-section-note {
   font-size: 12px;
   color: var(--text-muted, #6b7280);
@@ -7060,9 +6910,6 @@ body.model-not-configured .main-content { flex-direction: column; }
   margin: 0 0 6px;
   font-size: 20px;
   font-weight: 600;
-}
-  flex: 0 0 auto;
-  margin-top: 2px;
 }
 .settings-version {
   color: var(--text-muted, #6b7280);

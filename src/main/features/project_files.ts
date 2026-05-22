@@ -115,12 +115,8 @@ async function ensureProjectFilesDir(userId: string, projectId: string): Promise
   return dir;
 }
 
-function _notifyDirty(projectId: string): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = require('./sync') as { markDirty?: (domain: string, relPath: string) => void };
-    sync.markDirty?.('projects', `cloud/projects/${projectId}/files`);
-  } catch { /* features/sync stripped */ }
+function _notifyDirty(_projectId: string): void {
+  // features/sync stripped from the OrkasOpen build — no-op.
 }
 
 function infoFor(absPath: string): ProjectFileInfo | null {

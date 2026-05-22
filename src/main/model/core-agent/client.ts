@@ -251,51 +251,6 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(onArtifactCreated ? { onArtifactCreated } : {}),
       ...(onSkillAdvertised ? { onSkillAdvertised } : {}),
       ...(onSkillInvoked ? { onSkillInvoked } : {}),
-      onNativeSearchInjected: (info) => {
-        recorder?.record({
-          type: 'progress',
-          event: { stream: 'native_search', data: { phase: 'injected', ...info } },
-        });
-      },
-      // rotating-provider commits / surfaced-error candidate notice. Rewrite
-      // the archive row so model / provider / profile reflect the candidate
-      // that actually owned this call's visible outcome, not the rotating-
-      // provider's primary label. Recorder may not be set yet at the moment
-      // buildRunner eagerly constructs the rotating-provider; fires at runtime
-      // when complete()/stream() actually picks a candidate, so the recorder
-      // is always live by then.
-      onCandidateChosen: (info) => {
-        recorder?.setActiveCandidate(info);
-      },
-    });
-    const { runner, providerId, modelId, resolvedSystemPrompt, profileId, entryId, toolDefs } = built;
-
-    recorder = startRecording({
-      userId,
-      sessionId,
-      input: {
-        message,
-        systemPrompt: resolvedSystemPrompt,
-        model: modelId,
-        provider: providerId,
-        profileId,
-        entryId,
-        tools: toolDefs,
-      },
-      context: {
-        ...(agentId ? { agentId } : {}),
-        ...(cid ? { cid } : {}),
-        ...(workingDir ? { workingDir } : {}),
-        // skillList: undefined → no allowlist (full listing); preserve as null
-        // so the renderer can distinguish "all skills" from "explicit []".
-        skillList: skillList === undefined ? null : [...skillList],
-        ...(extraRoots && extraRoots.length ? { extraRoots: [...extraRoots] } : {}),
-        ...(readOnlyExtraRoots && readOnlyExtraRoots.length ? { readOnlyExtraRoots: [...readOnlyExtraRoots] } : {}),
-        ...(cacheRetention ? { cacheRetention } : {}),
-        idleTimeoutSec: idleTimeout,
-        ...(images && images.length ? { imageCount: images.length } : {}),
-        ...(abortSignal ? { hasAbortSignal: true } : {}),
-      },
     });
     const { runner, providerId, modelId } = built;
 
@@ -340,12 +295,8 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     }
     log.info(`turn end ${turnTag} events=${eventCount} err=${errText ? 'yes' : 'no'}`);
 
-    // Metacognitive reflection is no longer triggered per-turn — it now
-    // runs once at app startup with a per-agent cooldown. See
-    // `features/reflection-trigger.ts`.
-    // runs from the background orchestrator on a 12h cycle. See
-    // `features/reflection-orchestrator.ts`. Keeping `agentRunResult`
-    // captured above for the recorder/archive payload.
+    // Metacognitive reflection runs from the background orchestrator on a
+    // 12h cycle (see `features/reflection-orchestrator.ts`); no per-turn hook.
     void agentRunResult;
 
     if (externalAbort || directSessionAbort) {
@@ -360,7 +311,6 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     const wasAborted = externalAbort || directSessionAbort || (controller.signal.aborted && !idleHit);
     errText = wasAborted ? 'aborted' : ((err as Error).message || String(err));
     if (wasAborted) {
-      abortedFlag = true;
       log.info(`stream aborted ${turnTag}`);
       yield { type: 'error', text: errText, aborted: true };
     } else {

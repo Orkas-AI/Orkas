@@ -137,17 +137,6 @@
                 </div>
                 <div class="chat-queue-list" id="chat-queue-list"></div>
               </div>
-              <div class="chat-quote-preview" id="chat-quote-preview" style="display:none"></div>
-              <textarea id="chat-input" data-i18n-placeholder="chat.input_placeholder" placeholder="Continue the conversation..." rows="2"></textarea>
-              <div class="chat-bottom-bar">
-                <button type="button" class="chat-attach-btn" id="chat-attach-btn" data-i18n-title="chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
-                <button type="button" class="chat-recipient-chip" id="chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Switch recipient (commander / agent)">
-                  <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
-                  <span class="chat-recipient-name" id="chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
-                </button>
-                <div class="chat-skill-chip" id="chat-skill-chip" data-target="conversation" style="display:none">
-                  <span class="chip-label"></span>
-                  <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
               <div class="chat-input-area">
                 <!-- Floats above the input box. Plan rail anchors left, attachments
                      wrap to its right. The workspace chip moved into
@@ -625,140 +614,20 @@
           <!-- 4-tab restructure (batch 6 + 4 decision; see PC/docs/plans/multi-device-sync.md §4.9).
                OrkasOpen contract: the 账号 tab AND the sync card inside 数据 tab are
                stripped (see strip-rules.json) — settings.js handles missing-tab gracefully. -->
+          <!-- Account tab + the entire multi-device sync card stack are stripped from this
+               build (see OpenSource/SyncCode/strip-rules.json) — no Orkas account backend, no
+               cloud sync engine, so the 数据 tab keeps only the 本地 (Data root + Clear all
+               conversations) section. -->
           <div class="settings-tabs" role="tablist">
-            <button class="settings-tab is-active" data-settings-tab="account" data-i18n="settings.tab.account">账号</button>
             <button class="settings-tab" data-settings-tab="data" data-i18n="settings.tab.data">数据</button>
-            <button class="settings-tab" data-settings-tab="general" data-i18n="settings.tab.general">通用</button>
+            <button class="settings-tab is-active" data-settings-tab="general" data-i18n="settings.tab.general">通用</button>
             <button class="settings-tab" data-settings-tab="credentials" data-i18n="settings.tab.credentials">配置</button>
           </div>
 
           <div class="settings-body">
 
-            <div class="settings-group">
-              <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.language.title">语言 / Language</div>
-              </div>
-              <div class="settings-row" id="settings-language-row">
-                <label class="settings-lang-opt">
-                  <input type="radio" name="settings-language" value="zh" />
-                  <span data-i18n="settings.language.zh">简体中文</span>
-                </label>
-                <label class="settings-lang-opt">
-                  <input type="radio" name="settings-language" value="en" />
-                  <span data-i18n="settings.language.en">English</span>
-                </label>
-              </div>
-            </div>
-            <!-- ───────────────────────── 账号 ───────────────────────── -->
-            <div class="settings-tab-pane" data-settings-pane="account">
-              <!-- Account card — populated by views/login/account_settings.js; hidden when not
-                   signed in. This block + that script are stripped from the OrkasOpen build. -->
-                <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="account.settings_title">账号</div>
-                </div>
-                  </div>
-                </div>
-              </div>
-
-              <!-- Subscription / membership card — populated by views/login/account_settings.js
-                   alongside the Account card. Hidden when not signed in (matches the Account card's
-                   visibility). Stripped from the OrkasOpen build with the rest of the account block.
-                   Layout: badge chip inline with status text (no avatar circle — that visual slot is
-                   for user identity, not tier marker). -->
-                <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="account.subscription_title">会员</div>
-                </div>
-                    </div>
-                  </div>
-                </div>
-                <!-- Past-due / grace warning row, populated only when status warrants. -->
-                <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="account.subscription_title">会员</div>
-                </div>
-                    </div>
-                  </div>
-                </div>
-                <!-- Past-due / grace warning row, populated only when status warrants. -->
-                </div>
-              </div>
-            </div>
-
             <!-- ───────────────────────── 数据 ───────────────────────── -->
             <div class="settings-tab-pane" data-settings-pane="data" hidden>
-              <!-- ─── 云端 ───────────────────────────────────────────────
-                   Sync cards — multi-device sync status / quota / conflicts. Split into separate
-                   .settings-group cards so the layout breathes; the whole subsection is stripped
-                   in OrkasOpen along with features/sync. Settings.js gates rendering on
-                   `typeof window.orkas?.sync !== 'undefined'`. -->
-              <div class="settings-section-head" id="settings-section-cloud" data-i18n="settings.section.cloud" style="display:none">云端</div>
-
-              <!-- Card 1: 主开关 + 状态 + 立即同步 -->
-                <div class="settings-group-head">
-                  <div class="settings-group-title">
-                    <span data-i18n="settings.sync.title">云端同步</span>
-                  </div>
-                  <div class="settings-group-sub" data-i18n="settings.sync.privacy_note">数据通过 HTTPS 加密上传到私有云存储，仅你的账号可访问。</div>
-                </div>
-                <!-- Pro-required row: shown when current user is not Pro.
-                     Replaces the toggle row in that state so the user gets a
-                     clear "this is a Pro feature, subscribe" affordance instead
-                     of a toggle that just bounces them to a dialog. The
-                     existing toggle row + controls row still exist and stay
-                     functional for Pro users. -->
-                  <span class="settings-status" data-i18n="settings.sync.pro_required">云端同步是 Pro 会员功能。开通后多台设备的对话、智能体、技能、知识库自动保持一致。</span>
-                </div>
-                  <div class="settings-group-title" data-i18n="settings.sync.title">云端同步</div>
-                  </div>
-                  <div class="settings-group-sub" data-i18n="settings.sync.privacy_note">数据通过 HTTPS 加密上传到私有云存储，仅你的账号可访问。</div>
-                </div>
-                <!-- Pro-required row: shown when current user is not Pro.
-                     Replaces the toggle row in that state so the user gets a
-                     clear "this is a Pro feature, subscribe" affordance instead
-                     of a toggle that just bounces them to a dialog. The
-                     existing toggle row + controls row still exist and stay
-                     functional for Pro users. -->
-                  <span class="settings-status" data-i18n="settings.sync.pro_required">云端同步是 Pro 会员功能。开通后多台设备的对话、智能体、技能、知识库自动保持一致。</span>
-                </div>
-                  <label class="settings-toggle settings-toggle-tight">
-                    <span data-i18n="settings.sync.toggle_enable">启用云端同步</span>
-                  </label>
-                </div>
-                <!-- "关闭中…" — shown only while the disable RPC is in flight. -->
-                  <span class="settings-status muted" data-i18n="settings.sync.disabling">关闭中…</span>
-                </div>
-                <!-- Disable-failed slot: inline error + retry button.
-                     Replaces the previous uiAlert toast; user asked for an
-                     in-card actionable failure state. -->
-                </div>
-                </div>
-                </div>
-                </div>
-                <!-- Mass-delete confirmation panel — only visible when the
-                     engine paused with reason `mass_delete_pending`. -->
-                    <span data-i18n="settings.sync.mass_delete_summary">即将从云端删除 </span>
-                    <span data-i18n="settings.sync.mass_delete_summary_tail"> 个文件。请确认这是有意的操作。</span>
-                  </div>
-                  <div class="settings-row">
-                  </div>
-                </div>
-              </div>
-
-              <!-- Card 2: 存储空间 (quota bar + always-visible category/project breakdown) -->
-                <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="settings.sync.storage_title">存储空间</div>
-                </div>
-                </div>
-              </div>
-
-              <!-- Card 3: 冲突记录 -->
-                <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="settings.sync.conflicts_title">冲突记录</div>
-                  <div class="settings-group-sub" data-i18n="settings.sync.conflicts_sub">两台设备同时修改同一文件时，被覆盖的版本会留底在这里，可恢复。</div>
-                </div>
-                  <div class="settings-empty" data-i18n="settings.sync.conflicts_empty">暂无冲突</div>
-                </div>
-              </div>
-
               <!-- ─── 本地 ───────────────────────────────────────────────
                    Maintenance actions on local data; not synced. -->
               <div class="settings-section-head" data-i18n="settings.section.local">本地</div>
@@ -829,17 +698,6 @@
                     <span data-i18n="settings.metacognition.toggle">Enable</span>
                   </label>
                   <span class="settings-status muted" id="settings-metacognition-status"></span>
-                </div>
-              </div>
-
-              <div class="settings-group">
-                <div class="settings-group-head">
-                </div>
-                <div class="settings-row">
-                  <label class="settings-toggle">
-                  </label>
-                </div>
-                <div class="settings-row">
                 </div>
               </div>
             </div>
@@ -1280,13 +1138,9 @@
   <script src="./modules/i18n.js"></script>
   <script src="./modules/model-guard.js"></script>
   <script src="./modules/boot.js"></script>
-  <!-- Account login gate + Settings account card — stripped in OrkasOpen. login_panel.js must load
-       after boot.js (it calls bootApp); account_settings.js is invoked from settings.js::loadSettings. -->
-  <script src="./views/login/login_panel.js"></script>
-  <script src="./views/login/account_settings.js"></script>
-  <!-- Pro entitlement gate (renderer-side). Loads before voice / sync so window.proGate
-       exists when those modules attach button handlers. Stripped in OrkasOpen. -->
-  <script src="./modules/pro_gate.js"></script>
+  <!-- Account login gate + pro-entitlement gate are stripped from the OrkasOpen build
+       (no Orkas account backend, no membership tiers). The matching <script> tags have
+       been removed to avoid 404 noise on launch. -->
   <script src="./modules/avatar.js"></script>
   <script src="./modules/avatar-picker.js"></script>
   <script src="./modules/chat-input-form.js"></script>
@@ -1362,17 +1216,12 @@
   </script>
   <script src="./vendor/mathjax/tex-chtml.js" defer></script>
   <script src="./modules/math.js"></script>
-  <script src="./modules/feedback.js"></script>
   <script src="./modules/settings.js"></script>
-  <script src="./modules/sync_settings.js"></script>
-  <script src="./modules/sync_refresh.js"></script>
-  <script src="./modules/sidebar_status.js"></script>
+  <script src="./modules/settings_tabs.js"></script>
   <script src="./modules/sidebar-resize.js"></script>
-  <script src="./modules/devtools-sysinfo.js"></script>
-  <script src="./modules/devtools-relaunch.js"></script>
-  <script src="./modules/devtools-native-search.js"></script>
-  <script src="./modules/devtools-archives.js"></script>
-  <script src="./modules/devtools-skill-metrics.js"></script>
-  <script src="./modules/devtools.js"></script>
+  <!-- Stripped modules (sync / feedback / devtools / voice-input / login / pro_gate) are
+       absent from the OrkasOpen build; their <script> tags have been removed so Chromium
+       doesn't 404 on every launch. -->
+
 </body>
 </html>

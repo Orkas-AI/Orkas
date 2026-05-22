@@ -19,7 +19,6 @@ let _settingsState = {
   pickerModelSel: null,
   addBtnBound: false,
   dragState: null,
-  appUpdateBound: false,
 };
 
 async function loadSettings() {
@@ -27,7 +26,6 @@ async function loadSettings() {
   // (通用 by default — matches the is-active class on the markup).
   if (typeof initSettingsTabs === 'function') initSettingsTabs();
   _settingsBindLanguageOnce();
-  _settingsBindAppUpdateOnce();
   if (typeof initFeedbackSettings === 'function') initFeedbackSettings();
   _settingsSyncLanguageRadio();
   _settingsBindClearAllConvsOnce();
@@ -38,7 +36,6 @@ async function loadSettings() {
     _settingsRefreshSearchProfiles(),
     _settingsRefreshImageProfiles(),
     _settingsRefreshCommanderAvatar(),
-    _settingsRefreshAppUpdate(),
     _settingsRefreshMetacognition(),
     _settingsRefreshDataRoot(),
   ]);
@@ -48,7 +45,6 @@ async function loadSettings() {
   _settingsRenderSearchSection();
   _settingsRenderImageSection();
   _settingsRenderCommanderAvatar();
-  _settingsRenderAppUpdate();
   _settingsRenderMetacognition();
   _settingsRenderDataRoot();
   // Account card + subscription card (views/login/account_settings.js — absent in
@@ -63,114 +59,10 @@ async function loadSettings() {
   if (typeof renderSubscriptionSettings === 'function') renderSubscriptionSettings();
 }
 
-// ── Desktop auto-update ──
-// The main process owns the updater lifecycle; settings only mirrors its
-// state and sends user intent (enable, check, install).
-
-function _settingsBindAppUpdateOnce() {
-  if (_settingsState.appUpdateBound) return;
-  _settingsState.appUpdateBound = true;
-  try {
-    if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
-        _settingsRenderAppUpdate();
-      });
-    }
-  } catch (err) {
-    _settingsLog.warn('app update push subscription failed', err);
-  }
-}
-
-async function _settingsRefreshAppUpdate() {
-  try {
-  } catch (_) {
-  }
-}
-
-function _settingsFormatUpdateStatus(s) {
-  if (!s.supported) return '';
-  switch (s.phase) {
-    case 'checking':
-    case 'available':
-    case 'downloading': {
-      const pct = Number.isFinite(s.percent) ? Math.max(0, Math.min(100, s.percent)).toFixed(0) : '0';
-    }
-    case 'downloaded':
-    case 'not_available':
-    case 'error':
-    case 'not_configured':
-    default:
-  }
-}
-
-function _settingsRenderAppUpdate() {
-
-  if (cb) cb.checked = s ? !!s.enabled : true;
-  if (status) {
-    status.textContent = _settingsFormatUpdateStatus(s);
-    status.className = s?.phase === 'error' ? 'settings-status error' : 'settings-status muted';
-  }
-  if (checkBtn) {
-    checkBtn.disabled = !s || !s.canCheck;
-  }
-  if (downloadBtn) {
-    downloadBtn.hidden = !s?.canDownload;
-    downloadBtn.disabled = !s?.canDownload;
-  }
-  if (installBtn) {
-    installBtn.hidden = !s?.canInstall;
-    installBtn.disabled = !s?.canInstall;
-  }
-
-  if (cb && !cb.dataset.bound) {
-    cb.addEventListener('change', async () => {
-      const next = !!cb.checked;
-      try {
-        if (res && res.ok && res.state) {
-          _settingsRenderAppUpdate();
-        } else {
-          cb.checked = !next;
-        }
-      } catch (err) {
-        cb.checked = !next;
-        _settingsLog.warn('set app update failed', err);
-      }
-    });
-    cb.dataset.bound = '1';
-  }
-  if (checkBtn && !checkBtn.dataset.bound) {
-    checkBtn.addEventListener('click', async () => {
-      try {
-        if (res && res.ok && res.state) {
-          _settingsRenderAppUpdate();
-        }
-      } catch (err) {
-        _settingsLog.warn('check update failed', err);
-      }
-    });
-    checkBtn.dataset.bound = '1';
-  }
-  if (downloadBtn && !downloadBtn.dataset.bound) {
-    downloadBtn.addEventListener('click', async () => {
-      try {
-        if (res && res.ok && res.state) {
-          _settingsRenderAppUpdate();
-        }
-      } catch (err) {
-        _settingsLog.warn('download update failed', err);
-      }
-    });
-    downloadBtn.dataset.bound = '1';
-  }
-  if (installBtn && !installBtn.dataset.bound) {
-    installBtn.addEventListener('click', async () => {
-      try {
-      } catch (err) {
-        _settingsLog.warn('install update failed', err);
-      }
-    });
-    installBtn.dataset.bound = '1';
-  }
-}
+// Desktop auto-update is stripped from the OrkasOpen build — there is no
+// official feed / signing pipeline for OSS releases (see
+// `OpenSource/SyncCode/strip-rules.json`). Users download new versions from
+// GitHub Releases manually.
 
 // ── Commander avatar ──
 // Commander avatar goes through the prefs IPC and lands in
@@ -478,7 +370,6 @@ window.addEventListener('i18n-change', () => {
   _settingsRenderEntries();
   _settingsRenderSearchSection();
   _settingsRenderImageSection();
-  _settingsRenderAppUpdate();
   _settingsRenderMetacognition();
 });
 
