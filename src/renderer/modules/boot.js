@@ -256,4 +256,5 @@ function setView(view, cid, opts = {}) {
   } else {
     currentCid = null;
   }
+  if (typeof renderProjectsSection === 'function') renderProjectsSection();
 }

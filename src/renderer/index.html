@@ -124,7 +124,7 @@
             </button>
             <div id="conv-project-empty-banner" class="conv-project-empty-banner" style="display:none">
               <span class="muted" data-i18n="project.bindings.empty_in_chat">This project has no agents or skills bound. Open the project page to add some.</span>
-              <button type="button" class="btn btn-sm" id="conv-project-empty-banner-open" data-i18n="project.bindings.open_settings">Open project page</button>
+              <button type="button" class="btn btn-sm" id="conv-project-empty-banner-open" data-i18n="project.bindings.open_settings">Open</button>
             </div>
             <div id="chat-history" class="chat-history">
               <div class="empty" data-i18n="chat.empty">No messages yet...</div>
@@ -247,7 +247,7 @@
               <div class="skills-grid" id="skills-grid-custom"></div>
             </div>
             <div class="skills-group" id="skills-grid-builtin-group" style="display:none">
-              <div class="skills-group-label" data-i18n="skills.builtin_group">Built-in</div>
+              <div class="skills-group-label" data-i18n="skills.builtin_group">Marketplace</div>
               <div class="skills-grid" id="skills-grid-builtin"></div>
             </div>
             <div class="skills-empty" id="skills-empty" data-i18n="skills.empty">No skills yet</div>
@@ -342,7 +342,7 @@
               <div class="agents-grid" id="agents-grid-custom"></div>
             </div>
             <div class="agents-group" id="agents-grid-builtin-group" style="display:none">
-              <div class="agents-group-label" data-i18n="agents.builtin_group">Built-in</div>
+              <div class="agents-group-label" data-i18n="agents.builtin_group">Marketplace</div>
               <div class="agents-grid" id="agents-grid-builtin"></div>
             </div>
             <div class="agents-empty" id="agents-empty" data-i18n="agents.empty">No agents yet</div>
@@ -464,34 +464,81 @@
         <div class="project-detail-view">
           <div class="project-detail-content" id="project-detail-content">
             <div class="project-detail-header">
-              <h2 class="project-detail-title" id="project-detail-title"></h2>
-              <input type="text" class="project-detail-title-input" id="project-detail-title-input"
-                     style="display:none" autocomplete="off" spellcheck="false" />
+              <div class="project-detail-title-wrap">
+                <h2 class="project-detail-title" id="project-detail-title"></h2>
+                <input type="text" class="project-detail-title-input" id="project-detail-title-input"
+                       style="display:none" autocomplete="off" spellcheck="false" />
+              </div>
               <div class="project-detail-actions">
-                <button type="button" class="btn btn-sm" id="project-action-new-conv" data-i18n="project.action.new_conv">+ New chat</button>
                 <button type="button" class="btn btn-sm" id="project-action-rename" data-i18n="project.action.rename">Rename</button>
                 <button type="button" class="btn btn-sm btn-danger" id="project-action-delete" data-i18n="project.action.delete">Delete</button>
               </div>
             </div>
-            <section class="project-detail-card" id="project-detail-agents-section">
-              <div class="project-detail-card-head">
-                <span class="project-detail-card-title" data-i18n="project.bindings.agents_title">Agents</span>
-                <button type="button" class="btn btn-sm" id="project-add-agent-btn" data-i18n="project.bindings.add_agent">Add</button>
+            <div class="project-detail-grid">
+              <div class="project-detail-main">
+                <section class="project-composer-card">
+                  <div class="project-composer-input-area">
+                    <div class="chat-input-overlay">
+                      <div class="chat-attachments" id="project-chat-attachments" style="display:none"></div>
+                    </div>
+                    <textarea id="project-chat-input" data-i18n-placeholder="project.chat.placeholder" placeholder="Type @ to choose agents, skills, connectors." rows="2"></textarea>
+                    <div class="chat-bottom-bar project-composer-bottom">
+                      <button type="button" class="chat-attach-btn" id="project-chat-attach-btn" data-i18n-title="project.files.add" title="Add file">+</button>
+                      <button type="button" class="chat-attach-btn chat-mic-btn" id="project-chat-mic-btn" data-i18n-title="chat.mic_title" title="Voice input">
+                        <span data-ui-icon="mic" data-ui-icon-class="chat-mic-icon"></span>
+                      </button>
+                      <button type="button" class="chat-recipient-chip" id="project-chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Choose agent, skill, or connector">
+                        <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
+                        <span class="chat-recipient-name" id="project-chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
+                      </button>
+                      <div class="chat-skill-chip" id="project-chat-skill-chip" data-target="project" style="display:none">
+                        <span class="chip-label"></span>
+                        <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
+                      </div>
+                      <button type="button" class="chat-send-btn project-chat-send-btn" id="project-chat-send-btn" data-i18n-title="chat.send_title" title="Send">
+                        <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
+                      </button>
+                    </div>
+                  </div>
+                </section>
               </div>
-              <div class="project-bindings-list" id="project-agents-list"></div>
-            </section>
-            <!-- Skills section intentionally hidden this round: skills are
-                 globally available regardless of project membership. The
-                 storage + IPC + runner plumbing for skill bindings stays in
-                 place so this card can be re-introduced without a schema
-                 change later. -->
-            <section class="project-detail-card" id="project-detail-skills-section" style="display:none">
-              <div class="project-detail-card-head">
-                <span class="project-detail-card-title" data-i18n="project.bindings.skills_title">Skills</span>
-                <button type="button" class="btn btn-sm" id="project-add-skill-btn" data-i18n="project.bindings.add_skill">Add</button>
-              </div>
-              <div class="project-bindings-list" id="project-skills-list"></div>
-            </section>
+
+              <aside class="project-detail-side">
+                <section class="project-detail-card" id="project-detail-agents-section">
+                  <div class="project-detail-card-head">
+                    <span class="project-detail-card-title" data-i18n="project.bindings.agents_title">Agents</span>
+                    <button type="button" class="btn btn-sm" id="project-add-agent-btn" data-i18n="project.bindings.add_agent">Add</button>
+                  </div>
+                  <div class="project-bindings-list" id="project-agents-list"></div>
+                </section>
+
+                <section class="project-detail-card" id="project-detail-files-section">
+                  <div class="project-detail-card-head">
+                    <span class="project-detail-card-title" data-i18n="project.files.title">Files</span>
+                    <button type="button" class="project-card-icon-btn" id="project-add-file-btn"
+                            data-i18n-title="project.files.add" title="Add file" aria-label="Add file">+</button>
+                    <input type="file" id="project-file-input" multiple
+                           accept=".md,.markdown,.txt,.csv,.tsv,.json,.yaml,.yml,.log,.pdf,.docx,.png,.jpg,.jpeg,.webp,.gif,.mp4,.webm,.mov,.m4v,.ogv,text/markdown,text/plain,text/csv,application/json,application/x-yaml,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,video/quicktime"
+                           style="display:none" />
+                  </div>
+                  <div class="project-files-status muted" id="project-files-status"></div>
+                  <div class="project-files-list" id="project-files-list"></div>
+                </section>
+
+                <!-- Skills section intentionally hidden this round: skills are
+                     globally available regardless of project membership. The
+                     storage + IPC + runner plumbing for skill bindings stays in
+                     place so this card can be re-introduced without a schema
+                     change later. -->
+                <section class="project-detail-card" id="project-detail-skills-section" style="display:none">
+                  <div class="project-detail-card-head">
+                    <span class="project-detail-card-title" data-i18n="project.bindings.skills_title">Skills</span>
+                    <button type="button" class="btn btn-sm" id="project-add-skill-btn" data-i18n="project.bindings.add_skill">Add</button>
+                  </div>
+                  <div class="project-bindings-list" id="project-skills-list"></div>
+                </section>
+              </aside>
+            </div>
           </div>
         </div>
       </section>
@@ -1247,6 +1294,7 @@
   <script src="./modules/icons.js"></script>
   <script src="./modules/chat-file-viewer.js"></script>
   <script src="./modules/md-view-edit.js"></script>
+  <script src="./modules/text-view-edit.js"></script>
   <script src="./modules/context-menu.js"></script>
   <script src="./modules/chat-md-drawer.js"></script>
   <script src="./modules/strip-structural-blocks.js"></script>
@@ -1270,6 +1318,7 @@
   <script src="./modules/agents.js"></script>
   <script src="./modules/saved-apps.js"></script>
   <script src="./modules/agent-schedule.js"></script>
+  <script src="./modules/auto-title.js"></script>
   <script src="./modules/utils.js"></script>
   <script src="./modules/validation-report-view.js"></script>
   <script src="./modules/marketplace.js"></script>

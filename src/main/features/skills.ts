@@ -8,8 +8,8 @@
  *   4. Skill inline edit chat (per user × skill, prefix injection, file-block extraction)
  *
  * Two skill sources:
- *   builtin — data/shared/skills/builtin/<id>/ (seeded from PC/builtin/skills/)
- *   custom  — data/shared/skills/custom/<id>/  (user-created, editable)
+ *   marketplace — <uid>/local/marketplace/skills/<id>/
+ *   custom      — <uid>/cloud/skills/<id>/
  *
  * core-agent integration: after any custom-skill mutation we call
  * `invalidateSkills()` from `model/core-agent/skill-registry` so the next
@@ -83,7 +83,8 @@ function _parseSkillFileAttrs(raw: string): { path?: string } {
   return out;
 }
 
-export type SkillSource = 'builtin' | 'custom';
+export type SkillSource = 'marketplace' | 'custom';
+type SkillSourceInput = SkillSource | 'builtin';
 
 export interface SkillListing {
   id: string;
@@ -101,7 +102,7 @@ export interface SkillListing {
   /** Marketplace author uid. Kept optional for install/reconcile compatibility; global UI
    *  surfaces must not render it. */
   create_uid?: string;
-  /** Marketplace install version for `source==='builtin'`. Read from `_install.json` so the
+  /** Marketplace install version for `source==='marketplace'`. Read from `_install.json` so the
    *  skills-tab card can render a `v1.0.0` chip. Undefined for custom skills. */
   version?: string;
 }
@@ -247,8 +248,16 @@ function _unescapeDoubleQuoted(s: string): string {
   });
 }
 
-function skillBaseDir(source: SkillSource): string {
-  return source === 'custom' ? CUSTOM_SKILLS_DIR() : userMarketplaceSkillsDir(getActiveUserId());
+function normalizeSkillSource(source: SkillSourceInput): SkillSource {
+  return source === 'builtin' ? 'marketplace' : source;
+}
+
+function isMarketplaceSource(source: SkillSourceInput): boolean {
+  return normalizeSkillSource(source) === 'marketplace';
+}
+
+function skillBaseDir(source: SkillSourceInput): string {
+  return normalizeSkillSource(source) === 'custom' ? CUSTOM_SKILLS_DIR() : userMarketplaceSkillsDir(getActiveUserId());
 }
 
 // Module-level cache for `listSkills`.
@@ -298,7 +307,7 @@ export async function getSkillForEdit(skillId: string): Promise<SkillForEdit | n
   if (!skillId) return null;
   const sources: Array<[SkillSource, string]> = [
     ['custom', CUSTOM_SKILLS_DIR()],
-    ['builtin', userMarketplaceSkillsDir(getActiveUserId())],
+    ['marketplace', userMarketplaceSkillsDir(getActiveUserId())],
   ];
   for (const [source, base] of sources) {
     const d = path.join(base, skillId);
@@ -336,7 +345,7 @@ export async function listSkills(): Promise<SkillListing[]> {
   const out: SkillListing[] = [];
   const seen = new Set<string>();
   // Custom first so it wins on id collision (matches openclaw symlink rule).
-  const sources: Array<[SkillSource, string]> = [['custom', CUSTOM_SKILLS_DIR()], ['builtin', userMarketplaceSkillsDir(getActiveUserId())]];
+  const sources: Array<[SkillSource, string]> = [['custom', CUSTOM_SKILLS_DIR()], ['marketplace', userMarketplaceSkillsDir(getActiveUserId())]];
   for (const [source, baseDir] of sources) {
     if (!fs.existsSync(baseDir)) continue;
     const names = fs.readdirSync(baseDir, { withFileTypes: true })
@@ -345,8 +354,8 @@ export async function listSkills(): Promise<SkillListing[]> {
       .sort();
     for (const name of names) {
       if (seen.has(name)) {
-        if (source === 'builtin') {
-          log.warn(`id conflict: custom and builtin both define "${name}" — custom wins, rename one`);
+        if (isMarketplaceSource(source)) {
+          log.warn(`id conflict: custom and marketplace both define "${name}" — custom wins, rename one`);
         }
         continue;
       }
@@ -367,7 +376,7 @@ export async function listSkills(): Promise<SkillListing[]> {
       // Marketplace-installed skills carry `_install.json` with `version`. Author uid may also
       // be present for install/reconcile compatibility, but the global UI intentionally does
       // not surface it.
-      if (source === 'builtin') {
+      if (isMarketplaceSource(source)) {
         try {
           const metaFile = path.join(baseDir, name, '_install.json');
           if (fs.existsSync(metaFile)) {
@@ -376,7 +385,7 @@ export async function listSkills(): Promise<SkillListing[]> {
           }
         } catch { /* corrupt _install.json — leave fields undefined */ }
       }
-      out.push({ id: name, name: displayName, source, ...descPair, category, enabled: true, create_uid: undefined, version });
+      out.push({ id: name, name: displayName, source: normalizeSkillSource(source), ...descPair, category, enabled: true, create_uid: undefined, version });
     }
   }
   _skillListCache = { stamp, data: out };
@@ -399,7 +408,7 @@ export function setSkillEnabledForActiveUser(skillId: string, enabled: boolean):
 export type Result<T = Record<string, unknown>> = ({ ok: true } & T) | { ok: false; error: string };
 
 export async function readSkillFile(
-  source: SkillSource, skillId: string, filepath = 'SKILL.md',
+  source: SkillSourceInput, skillId: string, filepath = 'SKILL.md',
 ): Promise<Result<{ content: string; ext: string; path: string }>> {
   const base = skillBaseDir(source);
   const skillDir = path.resolve(base, skillId);
@@ -420,7 +429,7 @@ export async function readSkillFile(
 }
 
 export async function listSkillTree(
-  source: SkillSource, skillId: string,
+  source: SkillSourceInput, skillId: string,
 ): Promise<Result<{ tree: SkillTreeNode[] }>> {
   const base = skillBaseDir(source);
   const skillDir = path.resolve(base, skillId);
@@ -1441,10 +1450,13 @@ async function _applySkillContainerEdit(skillId: string, files: SkillFileBlock[]
     }
     return { ok: false, error: t('skills.errors.skill_not_found', { id: skillId }) };
   }
-  // Built-in skills are dev-mode-only via the detail-panel edit chat; the
-  // commander flow always rejects regardless of dev mode (mirrors the agent
-  // edit policy at `bus.ts` post-stream parsing).
-  if (skill.source !== 'custom') {
+  // Marketplace skills are dev-mode-only from any write path (commander
+  // here + inline edit chat at sendToSkillChat). Mirrors the agent edit
+  // policy at `bus.ts` post-stream parsing. Downstream
+  // `writeSkillFileForEditChecked` routes the dev branch through
+  // `skills_dev.writeBuiltinSkillFile`, which writes the local marketplace
+  // install dir.
+  if (skill.source !== 'custom' && !false) {
     return { ok: false, error: t('errors.builtin_skill_not_editable') };
   }
   const written: string[] = [];
@@ -1507,6 +1519,14 @@ export async function buildSkillEditSystemPrompt(skill: {
   dir?: string;
 }): Promise<string> {
   const files = await listCustomSkillFiles(skill.id || '');
+  /** Picks the file-listing path: `marketplace` reads files from `dir`
+   *  directly (per-machine install root), `custom` resolves via id under
+   *  the user's custom skills dir. */
+  source?: SkillSource;
+}): Promise<string> {
+  const files = isMarketplaceSource(skill.source || 'custom') && skill.dir
+    ? await _listSkillFilesAt(skill.dir)
+    : await listCustomSkillFiles(skill.id || '');
   // Resolve all three forms into a single legacy `$skill_description` for the
   // current template, plus the bilingual pair for forward-compat. Phase 2
   // splits the template; this keeps existing prompt rendering working.
@@ -1524,6 +1544,8 @@ export async function buildSkillEditSystemPrompt(skill: {
     skill_files: skillFilesBlock(files),
   });
   return `${body}\n\n---\n\n${buildLanguageDirective()}`;
+  const tail = buildLanguageDirective();
+  return `${body}\n\n---\n\n${tail}`;
 }
 
 export interface SkillChatResult {
@@ -1539,6 +1561,9 @@ export interface SkillChatResult {
 export async function sendToSkillChat(userId: string, skillId: string, content: string): Promise<SkillChatResult> {
   const skill = await getCustomSkill(skillId);
   if (!skill) return { ok: false, error: 'skill not found' };
+  if (isMarketplaceSource(skill.source) && !false) {
+    return { ok: false, error: t('errors.builtin_skill_not_editable') };
+  }
 
   const meta = await loadSkillChatMeta(userId, skillId);
   const sessionId = meta.session_id || defaultSkillSessionId(skillId);
@@ -1619,6 +1644,11 @@ export async function* streamSendToSkillChat(
   const skill = await getCustomSkill(skillId);
   if (!skill) {
     yield { type: 'error', text: 'skill not found' };
+    yield { type: 'done' };
+    return;
+  }
+  if (isMarketplaceSource(skill.source) && !false) {
+    yield { type: 'error', text: t('errors.builtin_skill_not_editable') };
     yield { type: 'done' };
     return;
   }

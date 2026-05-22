@@ -61,13 +61,6 @@ function parseArgs(argv) {
   return { skillId, scriptBase, scriptArgs };
 }
 
-// Sibling directories of WS_ROOT that are NOT user-id dirs. See paths.ts —
-// users.json / window-state.json are files (filtered by isDirectory above);
-// these are the directories we must not treat as uids.
-const RESERVED_WS_DIRS = new Set([
-  'logs', 'config', 'user_workspaces', 'builtin',
-]);
-
 function locateSkillScript(skillId, scriptBase) {
   const wsRoot = process.env.ORKAS_WORKSPACE_ROOT
     || process.env.ORKAS_WS_ROOT
@@ -75,17 +68,26 @@ function locateSkillScript(skillId, scriptBase) {
   // Candidate skill dirs — mirror SkillRegistry's
   // [<uid>/cloud/skills, <uid>/local/marketplace/skills] resolution, with a
   // dev/source-tree fallback for unpacked builtins.
-  const skillDirs = [];
+  //
   // Per-user skills live under <ws>/<uid>/cloud/skills/<id> and
   // <ws>/<uid>/local/marketplace/skills/<id>. uid can be numeric or a UUID,
-  // so we scan every non-reserved subdirectory rather than regex-matching.
+  // so we scan every subdirectory rather than regex-matching. Skip the deny-
+  // list approach (had to hand-maintain a list of `logs / config / ...`
+  // sibling names that would drift the moment a new top-level data dir gets
+  // added under PC/CLAUDE.md §4); instead, only KEEP an entry if it actually
+  // contains the skill under one of the two SkillRegistry-aware shapes. This
+  // is the strict invariant — a real uid dir always has one of those shapes
+  // when the skill is installed for that user; any sibling dir that doesn't
+  // is irrelevant by construction.
+  const skillDirs = [];
   try {
     for (const entry of fs.readdirSync(wsRoot, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       if (entry.name.startsWith('.')) continue;
-      if (RESERVED_WS_DIRS.has(entry.name)) continue;
-      skillDirs.push(path.join(wsRoot, entry.name, 'cloud', 'skills', skillId));
-      skillDirs.push(path.join(wsRoot, entry.name, 'local', 'marketplace', 'skills', skillId));
+      const cloud = path.join(wsRoot, entry.name, 'cloud', 'skills', skillId);
+      const marketplace = path.join(wsRoot, entry.name, 'local', 'marketplace', 'skills', skillId);
+      if (fs.existsSync(cloud)) skillDirs.push(cloud);
+      if (fs.existsSync(marketplace)) skillDirs.push(marketplace);
     }
   } catch { /* no data dir yet */ }
   if (process.env.ORKAS_PC_DIR) {

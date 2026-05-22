@@ -1,9 +1,8 @@
 /**
- * Google Workspace catalog entries — extracted from `catalog.ts` so they can be stripped
- * from the OrkasOpen build (Google requires Workspace Developer Preview Program enrollment
- * + production CASA verification, which the OSS distribution can't satisfy). PC builds
- * include this file via a try/require in `catalog.ts`; OrkasOpen ships without it (see
- * `OpenSource/SyncCode/strip-rules.json` `forbidden_files`).
+ * Google Workspace catalog entries — extracted from `catalog.ts` so the Google bundle and
+ * per-service connectors stay isolated while still syncing to OrkasOpen. Both PC and OrkasOpen
+ * include this file via a try/require in `catalog.ts`; the catch path only keeps older open-source
+ * checkouts without this file from crashing.
  *
  * Includes:
  *   - `google-workspace` (one independent all-in-one connector backed by

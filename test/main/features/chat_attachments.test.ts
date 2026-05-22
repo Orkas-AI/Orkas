@@ -34,9 +34,9 @@ async function loadMod() {
   return import('../../../src/main/features/chat_attachments');
 }
 
-async function makePng(): Promise<Buffer> {
+async function makePng(color = 0xAACCEEFF): Promise<Buffer> {
   const { Jimp } = await import('jimp' as any);
-  const img: any = new Jimp({ width: 200, height: 200, color: 0xAACCEEFF });
+  const img: any = new Jimp({ width: 200, height: 200, color });
   return await img.getBuffer('image/png');
 }
 
@@ -141,6 +141,92 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(r1.info.name).toBe('dup.txt');
     expect(r2.info.name).not.toBe('dup.txt');
     expect(r2.info.name.endsWith('.txt')).toBe(true);
+  });
+
+  it('reuses an existing attachment when upload content hash matches', async () => {
+    const m = await loadMod();
+    const r1 = await m.uploadAttachment(UID, CID, 'first.txt', Buffer.from('same bytes'));
+    const r2 = await m.uploadAttachment(UID, CID, 'second.txt', Buffer.from('same bytes'));
+
+    expect(r1.ok && r2.ok).toBe(true);
+    if (!(r1.ok && r2.ok)) return;
+    expect(r2.info.name).toBe(r1.info.name);
+    expect(r2.reused).toBe(true);
+    expect(fs.readdirSync(attDir()).filter((n) => !n.startsWith('.'))).toEqual(['first.txt']);
+  });
+
+  it('reuses a single attachment when matching uploads arrive concurrently', async () => {
+    const m = await loadMod();
+    const results = await Promise.all([
+      m.uploadAttachment(UID, CID, 'parallel-a.txt', Buffer.from('same parallel bytes')),
+      m.uploadAttachment(UID, CID, 'parallel-b.txt', Buffer.from('same parallel bytes')),
+      m.uploadAttachment(UID, CID, 'parallel-c.txt', Buffer.from('same parallel bytes')),
+    ]);
+
+    expect(results.every((r) => r.ok)).toBe(true);
+    if (!results.every((r) => r.ok)) return;
+    expect(new Set(results.map((r) => r.info.name)).size).toBe(1);
+    expect(results.filter((r) => r.reused).length).toBe(2);
+    expect(fs.readdirSync(attDir()).filter((n) => !n.startsWith('.'))).toEqual(['parallel-a.txt']);
+  });
+
+  it('imports a workspace file by path into the attachment pool', async () => {
+    const m = await loadMod();
+    const source = path.join(tmpDir, 'workspace-note.md');
+    fs.writeFileSync(source, '# hello\n', 'utf8');
+
+    const r = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.info.name).toBe('workspace-note.md');
+    expect(r.info.kind).toBe('text');
+    expect(fs.readFileSync(path.join(attDir(), 'workspace-note.md'), 'utf8')).toBe('# hello\n');
+  });
+
+  it('reuses an existing attachment when imported file hash matches', async () => {
+    const m = await loadMod();
+    const r1 = await m.uploadAttachment(UID, CID, 'kept.md', Buffer.from('same body'));
+    const source = path.join(tmpDir, 'copy.md');
+    fs.writeFileSync(source, 'same body', 'utf8');
+
+    const r2 = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(r1.ok && r2.ok).toBe(true);
+    if (!(r1.ok && r2.ok)) return;
+    expect(r2.info.name).toBe('kept.md');
+    expect(r2.reused).toBe(true);
+    expect(fs.readdirSync(attDir()).filter((n) => !n.startsWith('.'))).toEqual(['kept.md']);
+  });
+
+  it('reuses a single attachment when matching imports arrive concurrently', async () => {
+    const m = await loadMod();
+    const sourceA = path.join(tmpDir, 'source-a.md');
+    const sourceB = path.join(tmpDir, 'source-b.md');
+    fs.writeFileSync(sourceA, 'same imported body', 'utf8');
+    fs.writeFileSync(sourceB, 'same imported body', 'utf8');
+
+    const results = await Promise.all([
+      m.importAttachmentFromPath(UID, CID, sourceA),
+      m.importAttachmentFromPath(UID, CID, sourceB),
+    ]);
+
+    expect(results.every((r) => r.ok)).toBe(true);
+    if (!results.every((r) => r.ok)) return;
+    expect(new Set(results.map((r) => r.info.name)).size).toBe(1);
+    expect(results.filter((r) => r.reused).length).toBe(1);
+    expect(fs.readdirSync(attDir()).filter((n) => !n.startsWith('.'))).toEqual(['source-a.md']);
+  });
+
+  it('validates text encoding when importing by path', async () => {
+    const m = await loadMod();
+    const source = path.join(tmpDir, 'bad.txt');
+    fs.writeFileSync(source, Buffer.from([0xFF, 0xFE]));
+
+    const r = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(r.ok).toBe(false);
+    expect(fs.existsSync(path.join(attDir(), 'bad.txt'))).toBe(false);
   });
 });
 
@@ -640,7 +726,7 @@ describe('chat_attachments › buildAttachmentManifest', () => {
   it('caps images per message: inlined ones appear in manifest, over-cap ones go to skipped[] only', async () => {
     const m = await loadMod();
     for (let i = 0; i < 7; i++) {
-      await m.uploadAttachment(UID, CID, `img${i}.png`, await makePng());
+      await m.uploadAttachment(UID, CID, `img${i}.png`, await makePng(0x11223300 + i));
     }
     const r = await m.buildAttachmentManifest(
       UID, CID,

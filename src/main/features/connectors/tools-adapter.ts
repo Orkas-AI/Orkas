@@ -112,34 +112,38 @@ const GOOGLE_SERVICE_BY_CONNECTOR_ID: Record<string, GoogleWorkspaceService> = {
   gtasks: 'gtasks',
 };
 
-const GOOGLE_WORKSPACE_TOOL_PREFIX_BY_SERVICE: Record<GoogleWorkspaceService, string> = {
-  gmail: '[Gmail]',
-  gcal: '[Calendar]',
-  gdocs: '[Docs]',
-  gsheets: '[Sheets]',
-  gtasks: '[Tasks]',
-};
-
 function _dedupeGoogleWorkspaceTools(
   visible: Array<{ instance: ConnectorInstance; tools: ToolSchema[] }>,
 ): Array<{ instance: ConnectorInstance; tools: ToolSchema[] }> {
   const workspace = visible.find((v) => v.instance.id === GOOGLE_WORKSPACE_ID);
   if (!workspace) return visible;
 
-  const shadowedPrefixes = new Set<string>();
-  for (const { instance } of visible) {
-    const service = GOOGLE_SERVICE_BY_CONNECTOR_ID[instance.id];
-    if (!service) continue;
-    shadowedPrefixes.add(GOOGLE_WORKSPACE_TOOL_PREFIX_BY_SERVICE[service]);
+  // Collect tool names from every visible single-Google-service connector.
+  // `bin/google-workspace-mcp-server.cjs` wraps the same five service
+  // adapters the standalone connectors use, preserving each adapter's
+  // original tool `name` and only adding a `[Gmail]` / `[Calendar]` / …
+  // prefix to the `description`. So `name` is the strict equality
+  // invariant — a service tool advertised under standalone `gmail`
+  // shares its name byte-for-byte with the workspace's wrapped copy.
+  // Matching by name is robust to a future UI polish that drops the
+  // description prefix (which would silently break the prior
+  // description-prefix dedup and re-expose both Gmail routes to the
+  // model — the 20–50 tool-selection-accuracy cliff anti-pattern that
+  // PC/CLAUDE.md §6.5 warns against).
+  const shadowedNames = new Set<string>();
+  for (const { instance, tools } of visible) {
+    if (instance.id === GOOGLE_WORKSPACE_ID) continue;
+    if (!GOOGLE_SERVICE_BY_CONNECTOR_ID[instance.id]) continue;
+    for (const t of tools) shadowedNames.add(t.name);
   }
-  if (!shadowedPrefixes.size) return visible;
+  if (!shadowedNames.size) return visible;
 
   return visible
     .map((v) => {
       if (v.instance.id !== GOOGLE_WORKSPACE_ID) return v;
       return {
         instance: v.instance,
-        tools: v.tools.filter((t) => !_hasShadowedWorkspacePrefix(t, shadowedPrefixes)),
+        tools: v.tools.filter((t) => !shadowedNames.has(t.name)),
       };
     })
     // When all five single-service connectors are visible, the Workspace connector has no unique
@@ -147,10 +151,5 @@ function _dedupeGoogleWorkspaceTools(
     .filter((v) => v.instance.id !== GOOGLE_WORKSPACE_ID || v.tools.length > 0);
 }
 
-function _hasShadowedWorkspacePrefix(tool: ToolSchema, shadowedPrefixes: Set<string>): boolean {
-  const desc = typeof tool.description === 'string' ? tool.description.trimStart() : '';
-  for (const prefix of shadowedPrefixes) {
-    if (desc.startsWith(prefix)) return true;
-  }
-  return false;
-}
+/** Test-only export — see `test/main/features/connectors/dedupe-google-workspace.test.ts`. */
+export const _dedupeGoogleWorkspaceToolsForTest = _dedupeGoogleWorkspaceTools;

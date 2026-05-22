@@ -26,6 +26,15 @@
 // Mixed: real container + literal mention coexisting in one buffer — only
 // the real container goes, the literal mention stays put.
 //
+// Note on ```xml fences: starting `bc6e0156`, ```xml is treated as a
+// **structural** fence (its body IS the LLM's actual tag emission), not as
+// a preservation marker. The earlier set B1 wording "inside a ```xml block
+// must be preserved" is intentionally retired — the positive coverage for
+// the new semantic lives in the "explicit XML fences are treated as
+// structural blocks" describe blocks further down. ```xml as an example
+// container preservation marker is not coming back; LLM teaching surfaces
+// should use plain ``` for examples.
+//
 // Adding a new guard / branch to any of these strippers? Add a fixture
 // for the motivating shape AND keep the existing fixtures green. Don't
 // rely on "I checked it manually" — that's the loop these tests exist
@@ -48,6 +57,7 @@ const {
   _replaceKnownSkillIdsForDisplay,
   _simplifyKnownSkillFollowPhrasesForDisplay,
   _normalizeKnownSkillRefsForDisplay,
+  _collapseRepeatedStructuralPlaceholders,
 } = strip as {
   _splitMarkdownProseCode: (text: string) => Array<{ kind: 'prose' | 'code'; text: string; xmlFence?: boolean }>;
   _findOuterTagRanges: (text: string, tagName: string) => Array<[number, number]>;
@@ -62,6 +72,7 @@ const {
   _replaceKnownSkillIdsForDisplay: (text: string, skills: Array<{ id: string; name?: string }>) => string;
   _simplifyKnownSkillFollowPhrasesForDisplay: (text: string, skills: Array<{ id: string; name?: string }>) => string;
   _normalizeKnownSkillRefsForDisplay: (text: string, skills: Array<{ id: string; name?: string }>) => string;
+  _collapseRepeatedStructuralPlaceholders: (buf: string, placeholder: string) => string;
 };
 
 const PH = '⟨PLACEHOLDER⟩';
@@ -347,14 +358,15 @@ describe('<agent-input-submission> — explicit XML fences are structural', () =
 
 describe('main-chat creation stream stripping', () => {
   function streamDisplay(buf: string): string {
-    return _stripSkillCreateContainer(
+    const skillPh = '[organizing skill config]';
+    return _collapseRepeatedStructuralPlaceholders(_stripSkillCreateContainer(
       _replaceOuterTagBlocks(
-        strip._replaceOuterSkillFileBlocks(buf, (path: string) => `\n[writing ${path || 'file'}]\n`),
+        strip._replaceOuterSkillFileBlocks(buf, () => `\n${skillPh}\n`),
         'agent',
         PH,
       ),
-      PH,
-    );
+      `\n${skillPh}\n`,
+    ), `\n${skillPh}\n`);
   }
 
   it('does not leak skill frontmatter or agent XML while bulk create output streams', () => {
@@ -387,7 +399,32 @@ describe('main-chat creation stream stripping', () => {
       const display = streamDisplay(raw.slice(0, i));
       expect(display).not.toMatch(/name: leio|description_zh|description_en|把研发工作组织|Organize engineering|# leio-sdlc-adapter|<workflow>|Plandex研发助手/);
     }
-    expect(streamDisplay(raw)).toContain('[writing SKILL.md]');
+    expect(streamDisplay(raw)).toContain('[organizing skill config]');
+  });
+
+  it('shows one skill placeholder for consecutive skill-file blocks', () => {
+    const raw = [
+      '<skill>',
+      '<<<skill-file path=SKILL.md',
+      '---',
+      'name: first',
+      '>>>',
+      '<<<skill-file path=scripts/a.py',
+      'print("a")',
+      '>>>',
+      '</skill>',
+    ].join('\n');
+    const display = streamDisplay(raw);
+    expect(display.split('[organizing skill config]').length - 1).toBe(1);
+  });
+});
+
+describe('stream placeholders', () => {
+  it('collapses consecutive repeated structural placeholders', () => {
+    expect(_collapseRepeatedStructuralPlaceholders(`lead\n${PH}\n\n${PH}\ntrail`, PH))
+      .toBe(`lead\n${PH}\ntrail`);
+    expect(_collapseRepeatedStructuralPlaceholders(`lead\n${PH}\nkeep\n${PH}`, PH))
+      .toBe(`lead\n${PH}\nkeep\n${PH}`);
   });
 });
 
@@ -475,6 +512,69 @@ describe('<artifact-result> — explicit XML fences are structural', () => {
   it('strips a result block inside ```xml', () => {
     const buf = 'Format:\n```xml\n<artifact-result artifact_id="x" agent_id="y">\n{...}\n</artifact-result>\n```';
     expect(_stripOuterTagBlocks(buf, 'artifact-result')).toBe('Format:\n```xml\n\n```');
+  });
+});
+
+// `<marketplace-install-result>` — the machine tag the commander composes
+// when an install request resolves (accepted / declined / failed). Carried
+// in a user message so the next commander turn can read it; stripped from
+// the user bubble's display via `_stripUserStructuralBlocksForDisplay`.
+// Same whack-a-mole class as `<agent-input-submission>` / `<artifact-result>`
+// — added to `_stripSurvivingStructuralBlocks` allow-list in `2f325f90`
+// without fixtures, retroactively pinned here. Real shape (from
+// `group_chat/index.ts::resolveMarketplaceInstallRequest`):
+//   `<marketplace-install-result request_id="..." kind="..." id="..." status="..."> body </marketplace-install-result>`
+describe('<marketplace-install-result> — set A (real result tags stripped from display)', () => {
+  it('A1. result tag with the 4 standard attributes + body', () => {
+    const buf = 'Confirming install:\n\n<marketplace-install-result request_id="r-1" kind="agent" id="abcd1234" status="accepted">\nuser approved\n</marketplace-install-result>';
+    expect(_stripOuterTagBlocks(buf, 'marketplace-install-result')).toBe('Confirming install:\n\n');
+  });
+
+  it('A2. body contains backticks / angle brackets — still atomic', () => {
+    const buf = 'pre\n\n<marketplace-install-result request_id="r" kind="skill" id="x" status="declined">\nreason: user said "use `<existing>` instead"\n</marketplace-install-result>\npost';
+    const out = _stripOuterTagBlocks(buf, 'marketplace-install-result');
+    expect(out).not.toContain('marketplace-install-result');
+    expect(out).not.toContain('`<existing>`');
+    expect(out).toBe('pre\n\n\npost');
+  });
+});
+
+describe('<marketplace-install-result> — set B (literal mentions survive)', () => {
+  it('B1. inside a fenced non-XML code block (e.g. docs quoting the protocol)', () => {
+    const buf = 'Wire format:\n```\n<marketplace-install-result request_id="X" kind="agent" id="Y" status="accepted">\n...\n</marketplace-install-result>\n```';
+    expect(_stripOuterTagBlocks(buf, 'marketplace-install-result')).toBe(buf);
+  });
+
+  it('B2. inside an inline backtick span', () => {
+    const buf = 'The commander posts a `<marketplace-install-result ...>` tag when the install resolves.';
+    expect(_stripOuterTagBlocks(buf, 'marketplace-install-result')).toBe(buf);
+  });
+
+  it('B3. UNCLOSED inline backtick (mid-stream code-explanation)', () => {
+    const buf = 'see `<marketplace-install-result';
+    expect(_stripOuterTagBlocks(buf, 'marketplace-install-result')).toBe(buf);
+  });
+});
+
+describe('<marketplace-install-result> — explicit XML fences are structural', () => {
+  it('strips a result block inside ```xml (parity with <artifact-result>)', () => {
+    const buf = 'Reply:\n```xml\n<marketplace-install-result request_id="X" kind="agent" id="Y" status="accepted">\nok\n</marketplace-install-result>\n```';
+    expect(_stripOuterTagBlocks(buf, 'marketplace-install-result')).toBe('Reply:\n```xml\n\n```');
+  });
+});
+
+describe('<marketplace-install-result> — round-trip through the two strip callers', () => {
+  it('_stripSurvivingStructuralBlocks removes assistant-text hallucinations of the tag', () => {
+    const buf = 'Sure, here is the install reply you asked for: <marketplace-install-result request_id="r" kind="skill" id="x" status="accepted">echo</marketplace-install-result> done.';
+    const out = _stripSurvivingStructuralBlocks(buf);
+    expect(out).not.toContain('marketplace-install-result');
+    expect(out).toContain('Sure, here is the install reply you asked for:');
+    expect(out).toContain('done.');
+  });
+
+  it('_stripUserStructuralBlocksForDisplay removes the user-emitted tag from the bubble', () => {
+    const buf = 'I accept.\n\n<marketplace-install-result request_id="r" kind="agent" id="x" status="accepted">ok</marketplace-install-result>';
+    expect(_stripUserStructuralBlocksForDisplay(buf)).toBe('I accept.');
   });
 });
 

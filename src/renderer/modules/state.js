@@ -287,9 +287,6 @@ function bindStaticHandlers() {
   });
   document.getElementById('agent-edit-btn')?.addEventListener('click', toggleAgentEditMode);
   document.getElementById('agent-delete-btn')?.addEventListener('click', deleteSelectedAgent);
-  document.getElementById('agent-promote-btn')?.addEventListener('click', () => {
-    if (_selectedAgent?.source === 'custom') promoteCustomAgent(_selectedAgent.id);
-  });
   document.getElementById('agent-upload-marketplace-btn')?.addEventListener('click', () => {
     // Upload is allowed for both custom AND builtin (dev mode) — same
     // marketplace publishing flow per CLAUDE.md §11. The row-menu handler
@@ -329,9 +326,6 @@ function bindStaticHandlers() {
   });
   document.getElementById('skill-edit-btn')?.addEventListener('click', toggleSkillEditMode);
   document.getElementById('skill-delete-btn')?.addEventListener('click', deleteSelectedSkill);
-  document.getElementById('skill-promote-btn')?.addEventListener('click', () => {
-    if (_selectedSkill?.source === 'custom') promoteCustomSkill(_selectedSkill.id);
-  });
   document.getElementById('skill-upload-marketplace-btn')?.addEventListener('click', () => {
     // Upload is allowed for both custom AND builtin (dev mode) — same as
     // the agent upload handler above; see comment there.

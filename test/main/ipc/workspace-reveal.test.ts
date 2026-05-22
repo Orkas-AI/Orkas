@@ -42,16 +42,19 @@ afterEach(() => {
 
 async function callRevealPath(userId: string, input: unknown): Promise<{ ok: boolean; error?: string; path?: string }> {
   // Bypass the full IPC runtime — call the feature directly with the same
-  // guard logic the handler uses. This mirrors the handler body in ipc/index.ts.
+  // guard logic the handler uses. Mirrors `ipc/index.ts::workspace.revealPath`:
+  // it delegates the symlink-safe sandbox check to `util/path-sandbox.isPathAllowed`
+  // (via the `_ipcFileSandboxAllowedRoots` helper); the test reproduction tracks
+  // that — drift here = drift from the real handler.
   const userWorkspace = await import('../../../src/main/features/user_workspace');
+  const { isPathAllowed } = await import('../../../src/main/util/path-sandbox');
   const { shell } = await import('electron');
 
   const p = (input as { path?: unknown })?.path;
   if (!p || typeof p !== 'string') return { ok: false, error: 'missing path' };
   const abs = path.resolve(p);
   const wsRoot = path.resolve(userWorkspace.getWorkspacePath(userId));
-  const rel = path.relative(wsRoot, abs);
-  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+  if (!isPathAllowed(abs, [wsRoot])) {
     return { ok: false, error: 'path is outside the current workspace' };
   }
   if (!fs.existsSync(abs)) return { ok: false, error: 'file not found' };
@@ -107,6 +110,50 @@ describe('workspace.revealPath › validation', () => {
     expect(showItemInFolder).not.toHaveBeenCalled();
   });
 
+  it('rejects a symlink inside the workspace that points outside (symlink-escape)', async () => {
+    // The bug class the isPathAllowed migration closes: a symlink planted
+    // inside an allowed root (here, the user's workspace) that resolves to
+    // a target OUTSIDE the allowed root. The previous lexical
+    // `startsWith(wsRoot + sep)` check would let this through because the
+    // symlink's textual path IS inside the workspace; `isPathAllowed` calls
+    // `fs.realpathSync` on both sides and the rejection happens because the
+    // resolved target sits outside the root.
+    const ws = await import('../../../src/main/features/user_workspace');
+    const wsDir = path.join(tmpDir, 'ws-sym');
+    fs.mkdirSync(wsDir, { recursive: true });
+    ws.setWorkspacePath('u-sym', wsDir);
+
+    const outside = path.join(tmpDir, 'outside-target.txt');
+    fs.writeFileSync(outside, 'attacker-controlled');
+
+    const trap = path.join(wsDir, 'looks-inside.txt');
+    fs.symlinkSync(outside, trap);
+
+    const res = await callRevealPath('u-sym', { path: trap });
+    expect(res.ok).toBe(false);
+    expect(res.error).toMatch(/outside/);
+    expect(showItemInFolder).not.toHaveBeenCalled();
+  });
+
+  it('accepts a symlink inside the workspace that points to another file inside the workspace', async () => {
+    // The companion preservation case: a symlink whose target is also
+    // within the allowed root MUST be accepted (otherwise `isPathAllowed`
+    // would break legitimate `ln -s` use inside the workspace).
+    const ws = await import('../../../src/main/features/user_workspace');
+    const wsDir = path.join(tmpDir, 'ws-sym-ok');
+    fs.mkdirSync(wsDir, { recursive: true });
+    ws.setWorkspacePath('u-sym-ok', wsDir);
+
+    const target = path.join(wsDir, 'real.pdf');
+    fs.writeFileSync(target, '%PDF');
+    const link = path.join(wsDir, 'link.pdf');
+    fs.symlinkSync(target, link);
+
+    const res = await callRevealPath('u-sym-ok', { path: link });
+    expect(res.ok).toBe(true);
+    expect(showItemInFolder).toHaveBeenCalledWith(link);
+  });
+
   it('rejects a non-string / missing path', async () => {
     const res1 = await callRevealPath('u1', {});
     expect(res1.ok).toBe(false);
@@ -128,16 +175,20 @@ describe('workspace.revealPath › validation', () => {
     expect(showItemInFolder).not.toHaveBeenCalled();
   });
 
-  it('rejects the workspace root itself (empty relative path)', async () => {
-    // `path.relative(root, root)` === '' — the guard should treat this as
-    // "there's no file to reveal here".
+  it('accepts the workspace root itself (revealing the workspace folder is a legit action)', async () => {
+    // `isPathAllowed(root, [root])` returns true by design — revealing the
+    // workspace root in Finder/Explorer is a legitimate "open my workspace"
+    // request. The pre-refactor lexical guard also allowed this
+    // (`norm === wsNorm` short-circuits the `&& norm !== wsNorm` arm in the
+    // OR chain), so the behaviour is preserved across the isPathAllowed
+    // migration.
     const ws = await import('../../../src/main/features/user_workspace');
     const dir = path.join(tmpDir, 'ws');
     fs.mkdirSync(dir, { recursive: true });
     ws.setWorkspacePath('u5', dir);
 
     const res = await callRevealPath('u5', { path: dir });
-    expect(res.ok).toBe(false);
-    expect(res.error).toMatch(/outside/);
+    expect(res.ok).toBe(true);
+    expect(showItemInFolder).toHaveBeenCalledWith(dir);
   });
 });

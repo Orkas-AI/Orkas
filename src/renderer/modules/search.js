@@ -212,7 +212,8 @@ const _SEARCH_KIND_META = {
 
 const _SEARCH_SOURCE_LABEL = {
   custom:  'search.source.custom',
-  builtin: 'search.source.builtin',
+  builtin: 'search.source.marketplace',
+  marketplace: 'search.source.marketplace',
 };
 
 // Render one result into HTML. Uses the shared `_renderSearchRow` helper for
@@ -235,7 +236,8 @@ function _renderSearchRow(r, dataIdx, query) {
     }
   } else if (r.kind === 'agent' || r.kind === 'skill') {
     title = r.name || r.id;
-    const srcKey = _SEARCH_SOURCE_LABEL[r.source] || '';
+    const source = (typeof normalizeCatalogSource === 'function') ? normalizeCatalogSource(r.source) : r.source;
+    const srcKey = _SEARCH_SOURCE_LABEL[source] || _SEARCH_SOURCE_LABEL[r.source] || '';
     sub = srcKey ? t(srcKey) : '';
   }
   const active = dataIdx === _searchActiveIdx ? ' active' : '';
@@ -418,4 +420,3 @@ function _saveSearchHistoryEntry(query) {
   cur.unshift(q);
   _saveSearchHistory(cur.slice(0, _SEARCH_HISTORY_MAX));
 }
-

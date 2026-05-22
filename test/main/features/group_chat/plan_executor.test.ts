@@ -446,6 +446,11 @@ describe('plan_executor › user-assignee step', () => {
         }),
       ],
     });
+    // Dispatch must stamp `pending_form_id` on the step itself so that
+    // `acceptsUserStepCompletion` can match the user reply in O(1) instead
+    // of re-scanning the conversation jsonl. If this regresses, the gate
+    // silently falls back to "accept any user reply" (legacy mode).
+    expect(snapshot?.steps[0].pending_form_id).toBe(question.form.form_id);
 
     // A regular chat message is allowed to start a commander discussion,
     // but it must not be mistaken for the pending user-form answer.

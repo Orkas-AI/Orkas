@@ -10,7 +10,6 @@ import {
 import { createLogger } from "../shared/logger.js";
 import type { CoreAgentConfig } from "../config/schema.js";
 import type { EvolutionConfig } from "../evolution/types.js";
-import { detectUserCorrection } from "../evolution/metacognition.js";
 import type { LLMProvider, CompletionResult } from "../providers/base.js";
 import { ProviderRegistry } from "../providers/registry.js";
 import type { AgentTool, ToolContext } from "../tools/base.js";
@@ -18,8 +17,6 @@ import { toToolDefinition } from "../tools/base.js";
 import { getBuiltinTools } from "../tools/builtin.js";
 import { SkillStore } from "../evolution/skill-store.js";
 import { createSkillManageTool } from "../evolution/skill-tools.js";
-import { shouldReflect, buildAdaptiveReviewPrompt } from "../evolution/metacognition.js";
-import type { MetacognitionConfig, RunMetrics } from "../evolution/types.js";
 import { Session } from "./session.js";
 import type { AgentRunParams, AgentRunResult, AgentRunMeta, AgentRunEvent } from "./types.js";
 
@@ -509,163 +506,6 @@ export class AgentRunner {
   /** Get the skill store (if evolution is enabled). */
   getSkillStore(): SkillStore | null {
     return this.skillStore;
-  }
-
-  /**
-   * Evaluate whether a completed run warrants metacognitive reflection.
-   * Converts AgentRunResult.meta into RunMetrics, calls shouldReflect(),
-   * and if triggered, returns the adaptive review prompt. Returns null
-   * if no reflection is needed.
-   *
-   * @param result      The completed run result
-   * @param competence  Current COMPETENCE.md content (optional)
-   * @param strategies  Current LEARNING_STRATEGIES.md content (optional)
-   */
-  evaluateReflection(
-    result: AgentRunResult,
-    competence?: string,
-    strategies?: string,
-    /** The user message that triggered this run. When provided, `buildRunMetrics`
-     *  runs `detectUserCorrection` on it to populate `userCorrections`. Wired
-     *  through from the caller per plan §6.1 so the same heuristic feeds both
-     *  this metric and the bus-side `correction` signal (no double-judgment). */
-    inboundMessage?: string,
-  ): { prompt: string; primaryFocus: string; score: number } | null {
-    const metaConfig = this.config.evolution.metacognition as MetacognitionConfig;
-    if (!metaConfig.enabled) {
-      log.debug('evaluateReflection: metacognition disabled in config');
-      return null;
-    }
-
-    const metrics = this.buildRunMetrics(result, inboundMessage);
-    log.debug(`evaluateReflection: metrics toolCalls=${metrics.toolCalls} errors=${metrics.errorCount} errorKind=${metrics.errorKind} transient=${metrics.transientErrorCount} corrections=${metrics.userCorrections} skills=[${metrics.skillsLoaded.join(',')}]`);
-
-    const reflection = shouldReflect(metrics, metaConfig, competence);
-    if (!reflection.shouldReflect) {
-      log.info(`evaluateReflection: no reflection needed (score=${reflection.score.toFixed(2)} threshold=${metaConfig.reflectThreshold} signals=${reflection.signals.length})`);
-      return null;
-    }
-
-    // Build a conversation digest so the reflection LLM has context
-    // about what actually happened (it runs in an ephemeral session).
-    const digest = this.buildConversationDigest(result, metrics, reflection.signals);
-
-    const prompt = buildAdaptiveReviewPrompt(
-      reflection.primaryFocus,
-      competence || '',
-      strategies || '',
-      undefined, // skillHealthReport — future
-      digest,
-    );
-    return {
-      prompt,
-      primaryFocus: reflection.primaryFocus,
-      score: reflection.score,
-    };
-  }
-
-  /**
-   * Build a concise digest of the conversation for the reflection LLM.
-   * Since the reflection runs in an ephemeral session, it needs this
-   * context to understand what happened and make meaningful updates.
-   */
-  private buildConversationDigest(
-    result: AgentRunResult,
-    metrics: RunMetrics,
-    signals: Array<{ name: string; reason: string }>,
-  ): string {
-    const lines: string[] = [];
-
-    // What tools were used
-    if (metrics.toolNames.length > 0) {
-      lines.push(`Tools used: ${metrics.toolNames.join(', ')}`);
-    }
-
-    // Which skills were loaded
-    if (metrics.skillsLoaded.length > 0) {
-      lines.push(`Skills loaded: ${metrics.skillsLoaded.join(', ')}`);
-    }
-
-    // Error info with classification
-    if (result.meta.error) {
-      lines.push(`Error: [${result.meta.error.kind}] ${result.meta.error.message}`);
-      if (metrics.recovered) lines.push('Outcome: recovered from the error and completed the task');
-    }
-    if (metrics.errorKind !== 'none') {
-      const label = metrics.errorKind === 'transient' ? 'transient (network / timeout / rate limit)'
-        : metrics.errorKind === 'mixed' ? 'mixed (transient + permanent)'
-        : 'permanent (non-transient)';
-      lines.push(`Error kind: ${label} (${metrics.transientErrorCount} transient occurrence(s))`);
-    }
-
-    // Trigger signals
-    lines.push(`Trigger signals: ${signals.map(s => `${s.name}(${s.reason})`).join('; ')}`);
-
-    // The agent's final response (truncated) — this is the most important
-    // context for understanding what actually happened
-    if (result.text) {
-      const maxLen = 1500;
-      const text = result.text.length > maxLen
-        ? result.text.slice(0, maxLen) + '\n…(truncated)'
-        : result.text;
-      lines.push('', '--- Final assistant reply ---', text);
-    }
-
-    // Session message history (user messages only, for additional context)
-    const messages = this.session.getMessages();
-    const userMessages = messages
-      .filter(m => m.role === 'user')
-      .map(m => {
-        const textParts = m.content
-          .filter((c: any) => c.type === 'text')
-          .map((c: any) => c.text)
-          .join('');
-        return textParts;
-      })
-      .filter(t => t.length > 0);
-
-    if (userMessages.length > 0) {
-      lines.push('', '--- User messages ---');
-      // Include last few user messages (most relevant)
-      const recent = userMessages.slice(-3);
-      for (const msg of recent) {
-        const truncated = msg.length > 300 ? msg.slice(0, 300) + '…' : msg;
-        lines.push(`- ${truncated}`);
-      }
-    }
-
-    return lines.join('\n');
-  }
-
-  /** Convert AgentRunResult.meta into RunMetrics for the trigger evaluator.
-   *  When `inboundMessage` is provided, runs `detectUserCorrection` to set
-   *  `userCorrections` (otherwise 0). Reuses the same heuristic the bus-side
-   *  expert_signals extractor uses — same input, same boolean. */
-  private buildRunMetrics(result: AgentRunResult, inboundMessage?: string): RunMetrics {
-    const meta = result.meta;
-    const transient = meta.transientToolErrors ?? 0;
-    const permanent = meta.permanentToolErrors ?? 0;
-    const hadErrors = meta.error !== undefined || transient + permanent > 0;
-    const totalToolErrors = transient + permanent;
-    let errorKind: import('../evolution/types.js').ErrorKind = 'none';
-    if (totalToolErrors > 0) {
-      if (transient > 0 && permanent === 0) errorKind = 'transient';
-      else if (permanent > 0 && transient === 0) errorKind = 'permanent';
-      else errorKind = 'mixed';
-    } else if (meta.error) {
-      errorKind = 'permanent';
-    }
-    return {
-      toolCalls: meta.toolLoops,
-      toolNames: meta.toolNames ?? [],
-      skillsLoaded: meta.skillsLoaded ?? [],
-      hadErrors,
-      recovered: hadErrors && result.text.length > 0,
-      errorCount: totalToolErrors + (meta.error ? 1 : 0),
-      userCorrections: inboundMessage && detectUserCorrection(inboundMessage) ? 1 : 0,
-      errorKind,
-      transientErrorCount: transient,
-    };
   }
 
   private async buildSystemPromptWithEvolution(basePrompt: string): Promise<string> {

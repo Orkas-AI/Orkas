@@ -437,6 +437,15 @@ function _replaceOuterSkillFileBlocks(buf, makePlaceholder) {
   return out;
 }
 
+function _collapseRepeatedStructuralPlaceholders(buf, placeholder) {
+  if (!buf || !placeholder) return buf;
+  const marker = String(placeholder).trim();
+  if (!marker) return buf;
+  const escaped = marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const collapsed = String(buf).replace(new RegExp(`${escaped}(?:\\s*${escaped})+`, 'g'), marker);
+  return collapsed.replace(/\n{3,}/g, '\n\n');
+}
+
 // Streaming-time strip for the commander's `<skill>` container. Two modes:
 //   - **Closed** `<skill>...</skill>` → strip outer tags + any `<skill_id>`
 //     sub-tag, keep the inner content. The inner `<<<skill-file>>>` blocks
@@ -610,5 +619,6 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     _replaceKnownSkillIdsForDisplay,
     _simplifyKnownSkillFollowPhrasesForDisplay,
     _normalizeKnownSkillRefsForDisplay,
+    _collapseRepeatedStructuralPlaceholders,
   };
 }

@@ -1,9 +1,9 @@
 /**
- * Agents — listing, custom CRUD, builtin sync, inline edit chat.
+ * Agents — listing, custom CRUD, marketplace installs, inline edit chat.
  *
  * Mirrors the skills module shape. Two sources:
- *   builtin — data/shared/agents/builtin/<id>.json (synced from PC/builtin/agents/)
- *   custom  — data/shared/agents/custom/<id>.json  (user-created, editable)
+ *   marketplace — <uid>/local/marketplace/agents/<id>/agent.json
+ *   custom      — <uid>/cloud/agents/<id>/agent.json
  *
  * Schema (one JSON per agent):
  *   { agent_id, name, description, workflow, created_at, updated_at }
@@ -60,7 +60,8 @@ import {
   normalizeMarketplaceCategoryCode,
 } from './marketplace_biz';
 
-export type AgentSource = 'builtin' | 'custom';
+export type AgentSource = 'marketplace' | 'custom';
+type AgentSourceInput = AgentSource | 'builtin';
 
 export type AgentInputType = 'text' | 'textarea' | 'select' | 'multiselect' | 'number' | 'boolean' | 'file' | 'directory';
 
@@ -179,7 +180,7 @@ export interface Agent {
   /** Marketplace author uid. Kept optional for install/reconcile compatibility; global UI
    *  surfaces must not render it. */
   create_uid?: string;
-  /** Marketplace install version for `source==='builtin'`. Read from `_install.json` so the
+  /** Marketplace install version for `source==='marketplace'`. Read from `_install.json` so the
    *  agents-tab card can render a `v1.0.0` chip alongside the category. Custom agents leave
    *  this undefined (version is a publish concept, not authored locally). */
   version?: string;
@@ -244,21 +245,25 @@ export interface AgentChatMeta { session_id?: string; [k: string]: unknown }
 // 1. Builtin agent sync (startup)
 // ─────────────────────────────────────────────────────────────────────────
 
-// `syncBuiltinAgents` / `hashTree` / `_isMarketplaceInstalled` removed — there is no longer a
-// shipped-builtin tree to sync from (`PC/src/builtin/` is gone) or a sentinel to protect (the
-// install flow now writes to `<uid>/local/marketplace/agents/` directly, distinct from the
-// scrubbed builtin path that no longer exists). Source='builtin' still names the UI group
-// ("Platform"); on disk it resolves to `userMarketplaceAgentsDir(uid)`.
+// `syncBuiltinAgents` / `hashTree` / `_isMarketplaceInstalled` removed — marketplace installs
+// now write to `<uid>/local/marketplace/agents/` directly.
 
 // ─────────────────────────────────────────────────────────────────────────
 // 2. Read / list
 // ─────────────────────────────────────────────────────────────────────────
 
-/** Resolve where a given source's agents live on disk. Source='builtin' is a legacy name
- *  preserved across the codebase; it now points at the per-user marketplace install dir. */
-function agentBaseDir(source: AgentSource): string {
+function normalizeAgentSource(source: AgentSourceInput): AgentSource {
+  return source === 'builtin' ? 'marketplace' : source;
+}
+
+function isMarketplaceSource(source: AgentSourceInput): boolean {
+  return normalizeAgentSource(source) === 'marketplace';
+}
+
+/** Resolve where a given source's agents live on disk. */
+function agentBaseDir(source: AgentSourceInput): string {
   const uid = getActiveUserId();
-  return source === 'builtin' ? userMarketplaceAgentsDir(uid) : userAgentsDir(uid);
+  return isMarketplaceSource(source) ? userMarketplaceAgentsDir(uid) : userAgentsDir(uid);
 }
 
 /** Helpers replacing the removed `builtinAgentDir` / `builtinAgentDefinitionFile`.
@@ -340,7 +345,7 @@ function assertAgentNameCharsetValid(name: string): void {
   }
 }
 
-/** Reject names already in use by another agent (custom OR builtin).
+/** Reject names already in use by another agent (custom OR marketplace).
  *  Matches `_agentNameKey` (case-insensitive, all whitespace stripped) so
  *  "Code Helper" and "codehelper" collide. `excludeAgentId` lets the
  *  update path keep its own name. Caller owns the check at every write
@@ -479,7 +484,7 @@ export function validateAgentInputs(raw: unknown): AgentInput[] {
   return out;
 }
 
-export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSource): Agent | null {
+export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSourceInput): Agent | null {
   if (!raw || typeof raw !== 'object' || !raw.agent_id) return null;
   // Migrate legacy single-`description` into the matching language slot.
   // Same Chinese-character heuristic as the skill loader; explicit > legacy.
@@ -494,7 +499,7 @@ export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSo
     description_en: explicitEn || (legacyDesc && !legacyHasChinese ? legacyDesc : ''),
     workflow: typeof raw.workflow === 'string' ? raw.workflow : '',
     category: typeof raw.category === 'string' ? raw.category : '',
-    source,
+    source: normalizeAgentSource(source),
     created_at: raw.created_at || '',
     updated_at: raw.updated_at || '',
     // Defaults to enabled; overlaid by listAgents / getAgent from the
@@ -784,7 +789,7 @@ export async function listAgents(): Promise<Agent[]> {
   } else {
     specs = [];
     const seen = new Set<string>();
-    const sources: Array<[AgentSource, string]> = [['custom', CUSTOM_AGENTS_DIR()], ['builtin', userMarketplaceAgentsDir(getActiveUserId())]];
+    const sources: Array<[AgentSource, string]> = [['custom', CUSTOM_AGENTS_DIR()], ['marketplace', userMarketplaceAgentsDir(getActiveUserId())]];
     for (const [source, dir] of sources) {
       if (!fs.existsSync(dir)) continue;
       const entries = (await fsp.readdir(dir, { withFileTypes: true }))
@@ -798,8 +803,8 @@ export async function listAgents(): Promise<Agent[]> {
         const norm = normalizeAgent(data, source);
         if (!norm) continue;
         if (seen.has(norm.agent_id)) {
-          if (source === 'builtin') {
-            log.warn(`id conflict: custom and builtin both define "${norm.agent_id}" — custom wins, rename one`);
+          if (isMarketplaceSource(source)) {
+            log.warn(`id conflict: custom and marketplace both define "${norm.agent_id}" — custom wins, rename one`);
           }
           continue;
         }
@@ -807,7 +812,7 @@ export async function listAgents(): Promise<Agent[]> {
         // Marketplace-installed agents carry an `_install.json` sidecar with `version`.
         // Author uid may also be present there for install/reconcile compatibility, but the
         // global UI intentionally does not surface it.
-        if (source === 'builtin') {
+        if (isMarketplaceSource(source)) {
           try {
             const metaFile = path.join(dir, e.name, '_install.json');
             if (fs.existsSync(metaFile)) {
@@ -837,8 +842,8 @@ export async function listAgents(): Promise<Agent[]> {
  */
 export async function getAgent(agentId: string | null | undefined): Promise<Agent | null> {
   if (!agentId) return null;
-  for (const source of ['custom', 'builtin'] as AgentSource[]) {
-    const f = source === 'builtin'
+  for (const source of ['custom', 'marketplace'] as AgentSource[]) {
+    const f = isMarketplaceSource(source)
       ? _platformAgentSpecFile(agentId)
       : agentDefinitionFile(getActiveUserId(), agentId);
     if (!fs.existsSync(f)) continue;
@@ -1357,6 +1362,7 @@ export async function _applyAgentUpdatesAndInvalidate(
     catch (err) { log.warn(`rename roster sweep failed id=${agentId}: ${(err as Error).message}`); }
   }
   return normalizeAgent(data, 'custom');
+  return normalizeAgent(data, 'marketplace');
 }
 
 /**
@@ -1704,6 +1710,8 @@ export function buildAgentEditSystemPrompt(agent: {
         interactive: agent.interactive === true ? 'true' : 'false',
       });
   return `${body}\n\n---\n\n${buildLanguageDirective()}`;
+  const tail = buildLanguageDirective();
+  return `${body}\n\n---\n\n${tail}`;
 }
 
 export interface AgentEditResult {

@@ -155,6 +155,7 @@ function _renderInlineCreateRow() {
 
 function _renderProjectRow(p, convs) {
   const expanded = !!_projectsExpanded[p.project_id];
+  const selected = _isProjectSelected(p.project_id);
   const editing = _projectsInlineRenamePid === p.project_id;
   const folderIcon = expanded
     ? _projectUiIconHtml('folder-open', 'project-folder-icon')
@@ -166,7 +167,7 @@ function _renderProjectRow(p, convs) {
               value="${escapeHtml(p.name || '')}" autocomplete="off" spellcheck="false" />`
     : `<span class="project-name" title="${safeName}">${safeName}</span>`;
   let html = `
-    <div class="project-row" data-pid="${escapeHtml(p.project_id)}">
+    <div class="project-row${selected ? ' active' : ''}" data-pid="${escapeHtml(p.project_id)}">
       <span class="project-icon">${folderIcon}</span>
       ${nameNode}
       <button type="button" class="ctx-row-menu-btn project-row-menu-btn" data-project-menu
@@ -190,6 +191,12 @@ function _renderProjectRow(p, convs) {
   return html;
 }
 
+function _isProjectSelected(pid) {
+  return currentView === 'project'
+    && typeof _projectDetailPid !== 'undefined'
+    && _projectDetailPid === pid;
+}
+
 // ── Event wiring ────────────────────────────────────────────────────────
 
 function _bindProjectsHandlers(container) {
@@ -202,9 +209,9 @@ function _bindProjectsHandlers(container) {
     _bindInlineRenameInput(input);
   });
 
-  // Project rows: any click → BOTH open the detail page AND toggle the
-  // expand state of nested conversations (per design — single click does
-  // both). Exceptions: ⋯ opens its menu; rename input swallows click.
+  // Project rows: first click selects/opens the project detail. Once that
+  // project is already selected, clicking the row toggles its nested
+  // conversations.
   container.querySelectorAll('.project-row[data-pid]').forEach((row) => {
     const pid = row.dataset.pid;
     row.addEventListener('click', (e) => {
@@ -217,8 +224,12 @@ function _bindProjectsHandlers(container) {
         _openProjectRowMenu(e.target.closest('[data-project-menu]'), pid);
         return;
       }
+      if (!_isProjectSelected(pid)) {
+        if (typeof setView === 'function') setView('project', pid);
+        renderProjectsSection();
+        return;
+      }
       _toggleProjectExpand(pid);
-      if (typeof setView === 'function') setView('project', pid);
     });
   });
 
@@ -405,7 +416,6 @@ function _openProjectRowMenu(anchorBtn, pid) {
   _closeProjectRowMenu();
 
   const items = [
-    { action: 'new_conv', label: t('project.menu.new_conv') },
     { action: 'rename', label: t('project.menu.rename') },
     { action: 'delete', label: t('project.menu.delete'), danger: true },
   ];
@@ -456,18 +466,8 @@ function _closeProjectRowMenu() {
 }
 
 async function _runProjectMenuAction(action, pid) {
-  if (action === 'new_conv') return _newConvWithProject(pid);
   if (action === 'rename') return _startProjectInlineRename(pid);
   if (action === 'delete') return _confirmDeleteProject(pid);
-}
-
-// Pin pid into the commander chip's localStorage key BEFORE switching view —
-// onEnterCommanderProjectChip (fired from boot.js view-change) reads the same
-// key and re-validates against _projectsCache, so by the time the new-chat
-// panel mounts the chip is already showing this project.
-function _newConvWithProject(pid) {
-  try { localStorage.setItem(_COMMANDER_LAST_PROJECT_KEY, pid); } catch (_) {}
-  setView('new-chat');
 }
 
 // ── Delete flow ─────────────────────────────────────────────────────────

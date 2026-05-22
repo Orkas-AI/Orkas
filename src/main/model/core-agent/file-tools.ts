@@ -14,13 +14,14 @@
  *                       conversation's attachment dir + active workspace.
  *                       Never triggers extract; `total_chars` is included
  *                       only when the cache already has it.
- *   - `grep_files`    — cross-file text search in the same scope. text/md/
- *                       code → direct; pdf/docx → extract (cached); image
- *                       skipped.
+ *   - `grep_files`    — cross-file text search in that same scanned scope.
+ *                       text/md/code → direct; pdf/docx → extract (cached);
+ *                       image skipped.
  *
- * Scope is enforced via `util/path-sandbox.isPathAllowed`: every tool's
- * first step is to verify the target falls under
- *   [ active workspace dir,  chat_attachments/<cid>/ ].
+ * Scope is enforced via `util/path-sandbox.isPathAllowed`: path-taking tools
+ * first verify the target falls under
+ *   [ active workspace dir,  chat_attachments/<cid>/, project files /
+ *     caller-provided extra roots ].
  * Paths outside that set return an explicit E_PATH_OUT_OF_SCOPE error.
  *
  * These tools do NOT require localExec permission — they only read from
@@ -77,8 +78,8 @@ export interface FileToolsOpts {
    *  Read AND write are permitted under these roots — used by per-skill edit
    *  chats to expose the skill dir for the `<<<skill-file>>>` tooling. */
   extraRoots?: readonly string[];
-  /** Read-only extra roots: file-tools (read_file / search_files / grep_files
-   *  / stat_file) can see these, but write-side tools (edit_file / write_file
+  /** Read-only extra roots: path-taking file tools (read_file / stat_file)
+   *  can see these, but write-side tools (edit_file / write_file
    *  / bash / markdown_to_pdf / html_to_pdf / generate_image) cannot mutate
    *  paths inside. Used by the group-chat commander to inspect agent.json /
    *  built-in agents / skill specs without giving direct-write access — the
@@ -131,7 +132,7 @@ function guardPath(opts: FileToolsOpts, abs: string): string | null {
   if (!isPathAllowed(abs, allowedRoots(opts))) {
     return errText(
       'E_PATH_OUT_OF_SCOPE',
-      `path is outside the current conversation's visible scope (workspace + attachments): ${abs}`,
+      `path is outside the current conversation's visible scope (workspace + attachments + project files): ${abs}`,
     );
   }
   return null;
@@ -146,7 +147,7 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
       'Read a slice of a file\'s text by absolute path.\n'
       + '\n'
       + 'Parameters:\n'
-      + '  path      — required. Must be inside the current workspace or this conversation\'s attachment dir.\n'
+      + '  path      — required. Must be inside the current workspace, this conversation\'s attachment dir, or a listed project file.\n'
       + '  charStart — 0-based inclusive start offset. Default 0.\n'
       + '  charEnd   — 0-based exclusive end offset.  Default = total_chars (end of file).\n'
       + '\n'
@@ -169,7 +170,7 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
     inputSchema: {
       type: 'object',
       properties: {
-        path:      { type: 'string', description: 'Absolute path. Must be inside workspace or current attachment dir.' },
+        path:      { type: 'string', description: 'Absolute path. Must be inside workspace, current attachment dir, or project files.' },
         charStart: { type: 'number', description: '0-based start char (inclusive). Default 0.' },
         charEnd:   { type: 'number', description: '0-based end char (exclusive). Default total_chars.' },
       },
@@ -278,7 +279,7 @@ function createStatFileTool(opts: FileToolsOpts): AgentTool {
       + '`total_chars` for the file — typically for a pdf/docx that has never been read.\n'
       + '\n'
       + 'Parameters:\n'
-      + '  path — required. Absolute path inside workspace or current attachment dir.\n'
+      + '  path — required. Absolute path inside workspace, current attachment dir, or project files.\n'
       + '\n'
       + 'Response:\n'
       + '  <file path="..." kind="text|pdf|docx" total_chars="N"/>\n'
@@ -291,7 +292,7 @@ function createStatFileTool(opts: FileToolsOpts): AgentTool {
     inputSchema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Absolute path. Must be inside workspace or current attachment dir.' },
+        path: { type: 'string', description: 'Absolute path. Must be inside workspace, current attachment dir, or project files.' },
       },
       required: ['path'],
     },

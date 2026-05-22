@@ -47,9 +47,10 @@ import {
 import * as planExecutor from './plan_executor';
 import {
   userChatsDir, userSkillsDir, userAgentsDir,
-  userMarketplaceSkillsDir, userMarketplaceAgentsDir,
+  userMarketplaceSkillsDir, userMarketplaceAgentsDir, projectFilesDir,
 } from '../../paths';
 import * as agentsFeat from '../agents';
+import { isDevEnv } from '../devtools';
 import { isAgentEnabled } from '../component_enabled';
 import { buildLanguageDirective, descriptionLang, t } from '../../i18n';
 import * as marketplaceFeat from '../marketplace';
@@ -923,6 +924,10 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       log.warn(`resolve project scope cid=${cid} pid=${turnProjectId}: ${(err as Error).message}`);
     }
   }
+  const turnProjectFilesRoot = turnProjectId ? projectFilesDir(uid, turnProjectId) : '';
+  const turnProjectFilesSystemBlock = turnProjectId
+    ? await buildProjectFilesSystemBlock(uid, cid, turnProjectId)
+    : '';
 
   // First-turn replay: if the persistent session jsonl doesn't exist yet,
   // prepend a `<group-chat-history>` block built from the visibility slice
@@ -941,13 +946,14 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     log.warn(`replay-prefix build failed cid=${cid} actor=${actor.id}: ${(err as Error).message}`);
   }
 
-  // Attach a `<attachments>` manifest block listing user-uploaded files
-  // (text / pdf / docx / image with absolute paths + kinds). Commander uses
-  // it to route work; agent uses it to extract values for `inputs_schema`
-  // (especially `type=file` fields). Image bytes ride alongside via
-  // ChatOptions.images so the vision model sees them on the same user turn
-  // — the manifest entry carries `attached="inline"` so the LLM doesn't
-  // waste a read_file round-trip re-fetching what it already has.
+  // Attach a `<attachments>` manifest block listing files uploaded on this
+  // user turn (text / pdf / docx / image with absolute paths + kinds).
+  // Project files are shared conversation context, so they live in the
+  // system prompt's runtime injection block instead of being prepended to
+  // the user message. Image bytes ride alongside via ChatOptions.images so
+  // the vision model sees them on the same user turn — the manifest entry
+  // carries `attached="inline"` so the LLM doesn't waste a read_file
+  // round-trip re-fetching what it already has.
   let turnImages: Array<{ data: string; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' }> = [];
   if (item.attachments && item.attachments.length) {
     try {
@@ -969,7 +975,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // Hoisted here so the branch below can read it without re-fetching.
   let cliAgent: import('../agents').Agent | null = null;
   if (isCommander) {
-    systemPrompt = await buildCommanderSystemPrompt(uid, cid, turnProjectScope?.agents ?? null);
+    systemPrompt = await buildCommanderSystemPrompt(uid, cid, turnProjectScope?.agents ?? null, turnProjectFilesSystemBlock);
     extraTools = await buildCommanderExtraTools(state, w, item.attachments);
     // skillList stays undefined for commander — every skill is globally
     // visible (skills are NOT project-scoped this round; see CLAUDE.md §6).
@@ -1004,7 +1010,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       cliAgent = agent;
       systemPrompt = ''; // unused on CLI path
     } else {
-      systemPrompt = await buildAgentInGroupSystemPrompt(uid, agent, workingDir);
+      systemPrompt = await buildAgentInGroupSystemPrompt(uid, agent, workingDir, turnProjectFilesSystemBlock);
       // Pass agent.skill_list verbatim — it carries System A + System B
       // ids the agent owns. Skills are NOT project-scoped this round
       // (see CLAUDE.md §6); the runner's `projectAllowedSkillIds` hook is
@@ -1194,7 +1200,11 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       onSkillInvoked: (id, sys, trig) => skillBuffer.recordInvoked(id, sys, trig),
       cacheRetention: 'short',
       abortSignal: w.abortController.signal,
-      readOnlyExtraRoots: [...skillRoots, ...agentRoots],
+      readOnlyExtraRoots: [
+        ...(turnProjectFilesRoot ? [turnProjectFilesRoot] : []),
+        ...skillRoots,
+        ...agentRoots,
+      ],
       ...(turnImages.length ? { images: turnImages } : {}),
       ...(extraTools.length ? { extraTools } : {}),
       ...(skillList !== undefined ? { skillList } : {}),
@@ -1306,12 +1316,19 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
             const target = await agentsFeat.getAgent(editId);
             if (!target) {
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent edit failed: agent not found (id=${editId}).</span>`;
-            } else if (target.source !== 'custom') {
-              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Built-in agents can't be edited from the main chat; fork one in the right-hand detail panel and edit there.</span>`;
+            } else if (target.source !== 'custom' && !false) {
+              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Marketplace agents can't be edited from the main chat; fork one in the right-hand detail panel and edit there.</span>`;
             } else if (agentsFeat.isCliAgent(target)) {
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ External agents can only be edited from the right-hand detail panel.</span>`;
             } else {
-              const updated = await agentsFeat.updateCustomAgent(editId, fields);
+              // `updateAgentSpec` dispatches: custom → updateCustomAgent,
+              // marketplace + dev → agents_dev.updateBuiltinAgentSpec
+              // (which writes the local marketplace install dir). The
+              // dev-env source guard above is what makes the marketplace
+              // branch reachable; the direct `updateCustomAgent` call this
+              // replaces would short-circuit to null because the custom
+              // agent.json doesn't exist for marketplace ids.
+              const updated = await agentsFeat.updateAgentSpec(editId, fields);
               if (updated) {
                 createdAgents.push({ agent_id: updated.agent_id, name: updated.name, kind: 'updated' });
               } else {
@@ -1694,7 +1711,10 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
 // ── System prompts ───────────────────────────────────────────────────────
 
 async function buildCommanderSystemPrompt(
-  uid: string, cid: string, allowedAgentIds?: readonly string[] | null,
+  uid: string,
+  cid: string,
+  allowedAgentIds?: readonly string[] | null,
+  projectFilesBlock = '',
 ): Promise<string> {
   const { prompts } = await import('../../prompts/loader');
   const path_ = await import('node:path');
@@ -1726,9 +1746,22 @@ async function buildCommanderSystemPrompt(
     os: process.platform === 'darwin' ? 'macOS' : process.platform === 'win32' ? 'Windows' : process.platform,
     working_dir: workingDir,
     local_exec_state: permState,
+    project_files_block: projectFilesBlock,
   });
   const shared = prompts.load('chat_shared_rules', {});
   return appendLanguageDirective(concatSharedRules(main, shared));
+}
+
+async function buildProjectFilesSystemBlock(uid: string, cid: string, projectId: string): Promise<string> {
+  try {
+    const projectFileFeature = await import('../project_files');
+    const manifest = await projectFileFeature.buildProjectFilesManifest(uid, projectId);
+    if (!manifest) return '';
+    return `### Project files\n\n${manifest}`;
+  } catch (err) {
+    log.warn(`project files system block failed cid=${cid} pid=${projectId}: ${(err as Error).message}`);
+    return '';
+  }
 }
 
 /** Merge shared_rules into the per-role prompt. The shared block carries
@@ -1756,9 +1789,9 @@ function appendLanguageDirective(prompt: string): string {
 // Format:
 //   `\`read_file(<ROOT>/<id>/agent.json)\` — ROOT by Source:\n` +
 //   `- custom:  <abs path>\n` +
-//   `- builtin: <abs path>\n` +
+//   `- marketplace: <abs path>\n` +
 //   `Use these ROOT values verbatim. \`id:\` is tool-call input only — prose mentions agents as @<name>.\n\n` +
-//   per-entry lines `- @<name> (Source: custom|builtin, id: <agent_id>) — desc` + optional `\n  inputs_schema: <slim json>`
+//   per-entry lines `- @<name> (Source: custom|marketplace, id: <agent_id>) — desc` + optional `\n  inputs_schema: <slim json>`
 //
 // Why expose id and ROOT inline (changed 2026-05): the prior layout hid
 // agent_id (to discourage hex-id leak in user prose) and put paths in a
@@ -1789,11 +1822,11 @@ async function buildAgentsIndexBlock(uid: string, allowedIds?: readonly string[]
   const { pickDescription } = await import('#core-agent');
   const lang = descriptionLang(getCurrentLang());
   const customRoot = path.resolve(userAgentsDir(uid));
-  const builtinRoot = path.resolve(userMarketplaceAgentsDir(uid));
+  const marketplaceRoot = path.resolve(userMarketplaceAgentsDir(uid));
   const header = [
     '`read_file(<ROOT>/<id>/agent.json)` — ROOT by Source:',
     `- custom:  ${customRoot}`,
-    `- builtin: ${builtinRoot}`,
+    `- marketplace: ${marketplaceRoot}`,
     'Use these ROOT values verbatim. `id:` is tool-call input only — prose mentions agents as @<name>.',
     '',
   ].join('\n');
@@ -1831,6 +1864,7 @@ async function buildAgentInGroupSystemPrompt(
   _uid: string,
   agent: { name?: string; description?: string; workflow?: string; agent_id: string; inputs?: unknown; output_format?: string },
   workingDir: string,
+  projectFilesBlock = '',
 ): Promise<string> {
   const { prompts } = await import('../../prompts/loader');
   // Render the agent's declared inputs schema so the LLM knows when to
@@ -1856,6 +1890,7 @@ async function buildAgentInGroupSystemPrompt(
     inputs_schema: inputsSchemaJson || '(none)',
     working_dir: workingDir,
     output_format_hint: buildOutputFormatHint(agent.output_format),
+    project_files_block: projectFilesBlock,
   });
   const shared = prompts.load('chat_shared_rules', {});
   return appendLanguageDirective(concatSharedRules(main, shared));
@@ -2467,6 +2502,7 @@ export async function abort(uid: string, cid: string): Promise<void> {
   const state = _cids.get(cidKey(uid, cid));
   let cleared = 0;
   let aborted = 0;
+  let abortedModelSessions = 0;
   if (state) {
     for (const [, w] of state.workers) {
       cleared += w.queue.length;
@@ -2475,6 +2511,21 @@ export async function abort(uid: string, cid: string): Promise<void> {
       w.turnsThisActivation = 0;
       try { w.abortController?.abort(); } catch { /* ignore */ }
     }
+  }
+  // Belt-and-suspenders abort for model turns. In production traces we saw
+  // user stop requests reach this function while the bus worker map no longer
+  // exposed the live AbortController (`abortedWorkers=0`), even though the
+  // core-agent session kept running. The model client owns a per-session
+  // abort registry, so abort all active sessions for this conversation too:
+  // `gconv-<cid>` and every `gmember-<cid>-<agent>`.
+  try {
+    const model = await import('../../model/client');
+    const abortByCid = (model as {
+      abortActiveSessionsForConversation?: (cid: string) => number;
+    }).abortActiveSessionsForConversation;
+    if (typeof abortByCid === 'function') abortedModelSessions = abortByCid(cid);
+  } catch (err) {
+    log.warn(`abort model-session fallback failed cid=${cid}: ${(err as Error).message}`);
   }
   await setStatus(uid, cid, 'aborted');
   if (state) {
@@ -2500,7 +2551,7 @@ export async function abort(uid: string, cid: string): Promise<void> {
       await new Promise<void>((resolve) => setTimeout(resolve, 25));
     }
   }
-  log.info(`abort user=${uid} cid=${cid} clearedQueue=${cleared} abortedWorkers=${aborted}`);
+  log.info(`abort user=${uid} cid=${cid} clearedQueue=${cleared} abortedWorkers=${aborted} abortedModelSessions=${abortedModelSessions}`);
 }
 
 // ── Cleanup ──────────────────────────────────────────────────────────────
@@ -2536,6 +2587,23 @@ export function _cidStateForTest(uid: string, cid: string): CidState | null {
 // having to import bus internals (which would be a circular import). Bus is
 // the only authority that mutates worker queues; executor speaks through
 // these hooks.
+//
+// Catastrophic-if-broken invariant: bus.ts MUST be loaded exactly once per
+// process. If a second copy gets loaded (e.g. CJS + ESM dual load when
+// `bootstrap.cjs` requires src/main as CJS but somewhere does `await
+// import('./group_chat/bus')` — Node always resolves dynamic `import()` to
+// ESM regardless of caller context, producing a SEPARATE module instance
+// with its own `_cids`), the second load's bindBusHooks call wins because
+// plan_executor's `_hooks` is a module-level singleton. Then `groupChat.send`
+// (in module A) routes through `planExecutor.reconcile → _hooks.enqueue`
+// which now points at module B's enqueue. Module B has empty `_cids`, so
+// it creates a fresh state for the cid — agent workers run in B's state,
+// events emit to B's listeners (empty), and the IPC subscriber (registered
+// on module A) sees zero. Symptom: "loading 一直显示，中断后才看到 process
+// info"; chats sidebar sometimes-shows phantom `processing=true`. Bug fixed
+// at the load-path side: see chats.ts `require('./group_chat/bus')` (CJS
+// require, hits the same module cache as our static `from './bus'` import
+// chain) — never `await import` this file.
 
 planExecutor.bindBusHooks({
   async enqueue(params) {
@@ -2916,6 +2984,19 @@ async function _buildCliPrompt(
   const attachmentsBlock = allAtts.length
     ? `## Attachments\n${allAtts.map(a => `- ${a}`).join('\n')}`
     : '';
+  let projectFilesBlock = '';
+  try {
+    const { getConversation } = await import('../chats');
+    const conv = await getConversation(uid, cid);
+    const pid = (conv as any)?.project_id;
+    if (typeof pid === 'string' && pid) {
+      const projectFileFeature = await import('../project_files');
+      projectFilesBlock = await projectFileFeature.buildProjectFilesCliBlock(uid, pid);
+    }
+  } catch (err) {
+    log.warn(`cli project files block failed cid=${cid}: ${(err as Error).message}`);
+  }
+  const filesBlock = [attachmentsBlock, projectFilesBlock].filter(Boolean).join('\n\n');
 
   // ── Task body — submission unwrap if the dispatch was a form-submit.
   // When the user confirmed the input form, the dispatched payload is
@@ -2954,7 +3035,7 @@ async function _buildCliPrompt(
     agent_name: agent.name || agent.agent_id,
     agent_description: (agent.description_en || agent.description_zh || '').trim(),
     output_protocol_block: outputProtocolBlock,
-    attachments_block: attachmentsBlock,
+    attachments_block: filesBlock,
     conversation_block: conversationBlock,
     task_body: taskBody,
   });

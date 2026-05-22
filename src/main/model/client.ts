@@ -17,6 +17,8 @@
 import type { AgentTool } from '#core-agent';
 
 import {
+  abortActiveSession as _abortActiveSession,
+  abortActiveSessionsForConversation as _abortActiveSessionsForConversation,
   chatWithModel as _chatWithModel,
   streamChatWithModel as _streamChatWithModel,
 } from './core-agent/client';
@@ -153,3 +155,5 @@ export interface ChatOptions {
 
 export const chatWithModel = _chatWithModel;
 export const streamChatWithModel = _streamChatWithModel;
+export const abortActiveSession = _abortActiveSession;
+export const abortActiveSessionsForConversation = _abortActiveSessionsForConversation;

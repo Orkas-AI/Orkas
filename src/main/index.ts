@@ -130,7 +130,7 @@ import * as searchFeature from './features/search';
 import * as authFeature from './features/auth';
 import * as appConfig from './features/config';
 import { getRendererTables } from './i18n';
-import * as reflectionTrigger from './features/reflection-trigger';
+import * as reflectionOrchestrator from './features/reflection-orchestrator';
 import * as scheduledTasks from './features/scheduled_tasks';
 import * as chatAttachments from './features/chat_attachments';
 import * as chatArtifacts from './features/chat_artifacts';
@@ -138,11 +138,11 @@ import * as chatArtifacts from './features/chat_artifacts';
 import * as connectorsFeature from './features/connectors';
 import * as windowState from './features/window_state';
 // (sync + relay both depend on account; connectors depends on the Server OAuth bridge).
+// (both depend on the Orkas account/Server surface). Connectors, including Google, are synced.
 
 
 function createWindow(): BrowserWindow {
   const dev = !app.isPackaged;
-  const dev = false;
   const restored = windowState.restoreWindowState();
   const win = new BrowserWindow({
     width: 1280,
@@ -256,6 +256,7 @@ function registerIpc(): void {
       builtin_skills_dir: 'X', custom_skills_dir: 'X',
       agents_index: '', plan_state: '',
       os: 'X', working_dir: 'X', local_exec_state: 'X',
+      project_files_block: '',
     });
     const tplLen = tplNormal.length;
     const skills = await skillsFeature.listSkills();
@@ -276,7 +277,7 @@ function registerIpc(): void {
       },
       skills: {
         total: skills.length,
-        builtin: skills.filter((s) => s.source === 'builtin').length,
+        marketplace: skills.filter((s) => s.source === 'marketplace').length,
         custom: skills.filter((s) => s.source === 'custom').length,
         ids: skills.map((s) => `${s.source}:${s.id}`),
       },
@@ -754,16 +755,15 @@ if (!gotLock) {
       }
     });
 
-    // Background: per-agent metacognitive reflection. Time-triggered (48h
-    // cooldown per agent), not per-turn. Delay so it doesn't race the UI's
-    // first paint or the user's first action.
+    // Background: per-agent metacognitive reflection. Single 12h-chained
+    // loop replaces the old 48h-cooldown startup-only trigger
+    // (docs/plans/reflection-redesign.md). Delay the first cycle so it
+    // doesn't race the UI's first paint or the user's first action; the
+    // loop self-schedules thereafter.
     setTimeout(() => {
       const uid = users.getActiveUserId();
-      const reflectLog = createLogger('reflection-trigger');
-      reflectionTrigger.runStartupReflections(uid).catch((err) => {
-        reflectLog.error('startup reflection batch failed', { error: err?.message || String(err) });
-      });
-    }, reflectionTrigger.STARTUP_DELAY_MS);
+      reflectionOrchestrator.startReflectionLoop(uid);
+    }, reflectionOrchestrator.STARTUP_DELAY_MS);
 
     // Background: scheduled-agent-tasks tick (every 30s). Reads
     // <uid>/cloud/config/scheduled_tasks.json on each tick and dispatches

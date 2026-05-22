@@ -1,7 +1,7 @@
 // Connectors panel — curated OAuth-only catalog of MCP-based integrations.
 //
-// Layout: a single scrollable grid view with two stacked sections — "已连接" (Connected) on top,
-// "可用" (Available) below. No tab switching; same shape as the Skills panel's
+// Layout: a single scrollable grid view with two stacked sections — connected on top,
+// available below. No tab switching; same shape as the Skills panel's
 // Custom / Built-in split. Both groups hide themselves when empty.
 //
 // Click model: only the action buttons on a card are clickable. Clicking elsewhere on a card
@@ -9,10 +9,10 @@
 // click handler was firing OAuth flows by accident. Buttons stop propagation as a defence in
 // depth.
 //
-// OAuth flow UX: clicking "连接" just opens the system browser and returns control to the
+// OAuth flow UX: clicking Connect just opens the system browser and returns control to the
 // renderer's _runConnect Promise (which the main process resolves once the deep-link callback
-// completes). **The card itself does NOT change state during the flow** — no "授权中" badge, no
-// disabled button. The user can click "连接" again at any time; server-side startOAuth
+// completes). **The card itself does NOT change state during the flow** — no authorizing badge, no
+// disabled button. The user can click Connect again at any time; server-side startOAuth
 // supersedes any prior pending flow, and the renderer surfaces only real errors (the
 // "superseded" message is swallowed since it's caused by the user's own re-click).
 
@@ -25,7 +25,7 @@ let _connectorsState = {
   /** Per-card connecting flag. Set when `_runConnect` is in flight (browser-open → deep-link
    *  return → /oauth/exchange → MCP connect → list_tools). Visible only post-return when the
    *  user comes back to PC and the IPC is still running through exchange + MCP setup — without
-   *  this they'd see a static "连接" button with no indication anything is happening. Button
+   *  this they'd see a static Connect button with no indication anything is happening. Button
    *  stays clickable; re-click supersedes the prior flow (see comment in `_runConnect`). */
   connecting: new Set(),
 };
@@ -63,7 +63,7 @@ function _deriveBundleInstance(entry) {
     && members.every((m) => m.status && m.status.kind === 'connected');
   const anyErrored = members.find((m) => m.status && m.status.kind === 'error');
   const accountLabel = members.map((m) => m.oauth_grant && m.oauth_grant.account_label).find(Boolean) || '';
-  // For enabled: bundle is "enabled" iff every member is enabled (any disabled → show "停用-able").
+  // For enabled: bundle is "enabled" iff every member is enabled (any disabled → show Enable).
   const allEnabled = members.every((m) => m.enabled !== false);
   return {
     id: entry.id,
@@ -182,12 +182,12 @@ function _renderCatalogCard(entry, instance) {
   const accountLabel = (instance && instance.oauth_grant && instance.oauth_grant.account_label) || '';
   const errorMsg = errored && instance && instance.status && instance.status.message;
 
-  // ⋯ menu lives on connected cards only — it hosts the destructive "断开" action so it stays
+  // The ⋯ menu lives on connected cards only — it hosts the destructive disconnect action so it stays
   // one click away from accidental triggers. Un-connected / errored cards still surface the
-  // disconnect action as a bottom-row button (they need it visible to recover; the "停用" toggle
+  // disconnect action as a bottom-row button (they need it visible to recover; the disable toggle
   // doesn't apply when there's nothing to disable).
   const menuHtml = connected
-    ? `<button class="connector-card-menu-btn" data-act="menu" aria-label="${escapeHtml(t('common.more') || '⋯')}">⋯</button>`
+    ? `<button class="connector-card-menu-btn" data-act="menu" aria-label="${escapeHtml(t('common.more'))}">⋯</button>`
     : '';
 
   // Bottom-row action:
@@ -197,10 +197,10 @@ function _renderCatalogCard(entry, instance) {
   //     before `_runConnect`'s `finally` clears the connecting flag, and the user sees
   //     the spinner vanish "the moment they return from the browser" even though the
   //     IPC chain (loadConnectors + grid re-render) is still finishing.
-  //   - connected: 启用 / 停用 toggle (per-user soft switch — hides instance from LLM)
-  //   - errored:   断开 (recover from a stuck error state)
-  //   - oauth_pending: disabled "敬请期待"
-  //   - default (uninstalled): 连接 (start OAuth)
+  //   - connected: enable / disable toggle (per-user soft switch — hides instance from LLM)
+  //   - errored:   disconnect (recover from a stuck error state)
+  //   - oauth_pending: disabled unavailable button
+  //   - default (uninstalled): connect (start OAuth)
   let action = '';
   const isConnecting = _connectorsState.connecting && _connectorsState.connecting.has(e.id);
   if (isConnecting) {
@@ -257,7 +257,7 @@ function _renderCatalogCard(entry, instance) {
   return card;
 }
 
-// Tiny absolute-positioned popover anchored under the ⋯ button — one item for now ("断开").
+// Tiny absolute-positioned popover anchored under the ⋯ button — one disconnect item for now.
 // Closes on outside click / Esc / window scroll. Keeping it inline so we don't pull in a generic
 // menu primitive for one use site; if a second connector-card menu item ever lands, refactor.
 function _openCardMenu(anchorBtn, entry, instance) {
@@ -357,7 +357,7 @@ async function _runConnect(entry) {
   try {
     const res = await window.orkas.invoke('connectors.start_oauth', { catalog_id: entry.id });
     if (res && res.ok && res.instance) {
-      // Refresh state + re-render the grid. The new instance shows up in the "已连接" group.
+      // Refresh state + re-render the grid. The new instance shows up in the connected group.
       await loadConnectors();
     } else if (res && !res.ok) {
       const msg = (res.error || '').toLowerCase();

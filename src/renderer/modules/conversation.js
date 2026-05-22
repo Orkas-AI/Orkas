@@ -215,6 +215,8 @@ function _initAllMentionMirrors() {
   if (chatInput) _initMentionMirror(chatInput);
   const newChatInput = document.getElementById('new-chat-input');
   if (newChatInput) _initMentionMirror(newChatInput);
+  const projectChatInput = document.getElementById('project-chat-input');
+  if (projectChatInput) _initMentionMirror(projectChatInput);
 }
 
 const CHAT_INPUT_RESERVE_FALLBACK = 140;
@@ -275,6 +277,7 @@ const _RECIPIENT_LS_KEY = 'chat.recipientByCid';
 let _recipientByCid = {};       // { [cid]: {kind,id,name} } — agents only; commander = absence
 let _newChatRecipient = { ..._COMMANDER }; // ephemeral, reset on view-enter
 let _pendingNewChatRecipient = null;        // captured at send time, transferred to new cid
+let _projectChatRecipient = { ..._COMMANDER }; // ephemeral recipient for project detail composer
 
 function _loadRecipientMap() {
   try {
@@ -305,6 +308,7 @@ function _normRecipient(next) {
 
 function _activeRecipient(target) {
   if (target === 'new-chat') return _newChatRecipient;
+  if (target === 'project') return _projectChatRecipient;
   if (currentCid && _recipientByCid[currentCid]) return _recipientByCid[currentCid];
   return _COMMANDER;
 }
@@ -340,6 +344,8 @@ function setChatRecipient(target, next, _opts = {}) {
   if (!r) return;
   if (target === 'new-chat') {
     _newChatRecipient = r;
+  } else if (target === 'project') {
+    _projectChatRecipient = r;
   } else if (currentCid) {
     if (r.kind === 'commander') delete _recipientByCid[currentCid];
     else _recipientByCid[currentCid] = r;
@@ -364,9 +370,11 @@ function _transferNewChatRecipientTo(cid) {
 }
 
 function _renderRecipientChip(target) {
-  const targets = target ? [target] : ['conversation', 'new-chat'];
+  const targets = target ? [target] : ['conversation', 'new-chat', 'project'];
   for (const tg of targets) {
-    const id = tg === 'new-chat' ? 'new-chat-recipient-name' : 'chat-recipient-name';
+    const id = tg === 'new-chat'
+      ? 'new-chat-recipient-name'
+      : (tg === 'project' ? 'project-chat-recipient-name' : 'chat-recipient-name');
     const nameEl = document.getElementById(id);
     if (!nameEl) continue;
     const r = _activeRecipient(tg);
@@ -496,15 +504,89 @@ function _forgetCidRecipient(cid) {
 const _autoEvalInflight = new Set(); // cid set
 const _latestInFlight = new Map();   // cid → string[] (mirrors state_changed.state.in_flight)
 const _runtimeRecoveryTimers = new Map(); // cid → timeout id
+const _lastGroupWorkEventAt = new Map(); // cid → ms timestamp of process/artifact/assistant message
+const _groupObserverCtrls = new Map();   // cid → recovery observer controller
+const _groupEventDedupe = new Map();     // cid → recently handled visible group events
 // cid → most recent interactive agent that produced an end-of-turn message.
 // Used as Phase 1.5 sticky when there's no plan + nobody in flight (single
 // agent dispatch via @-mention finished a turn but user hasn't replied yet).
 const _lastInteractiveTurnAgent = new Map();
+const GROUP_EVENT_DEDUPE_LIMIT = 600;
+
+function _groupEventDedupeKey(evData) {
+  if (!evData || typeof evData !== 'object') return '';
+  if (evData.type === 'message' && evData.msg) {
+    const gm = evData.msg;
+    if (gm.id) return `message:${gm.id}:${evData.turn_end ? 1 : 0}`;
+    return `message:${gm.from || ''}:${gm.to || ''}:${gm.ts || ''}:${(gm.text || '').length}:${evData.turn_end ? 1 : 0}`;
+  }
+  if (evData.type === 'artifact_created') {
+    const artifact = evData.artifact || {};
+    if (artifact.id) return `artifact:${evData.actor || artifact.agent_id || ''}:${artifact.id}`;
+  }
+  if (evData.type === 'process') {
+    const actor = String(evData.actor || '');
+    const data = evData.data || {};
+    if (data.type === 'delta') return '';
+    if (data.type === 'progress' && data.text) {
+      return `process:progress:${actor}:${String(data.text).slice(0, 500)}`;
+    }
+    if (data.type === 'event') {
+      const evt = data.event || {};
+      if (evt.stream === 'assistant') return '';
+      const payload = evt.data || {};
+      const eventId = payload.id || payload.call_id || payload.tool_call_id || payload.request_id || '';
+      const phase = payload.phase || payload.status || payload.type || '';
+      const name = payload.name || payload.tool || payload.command || '';
+      if (eventId || phase || name) {
+        return `process:event:${actor}:${evt.stream || ''}:${eventId}:${phase}:${name}`;
+      }
+    }
+  }
+  return '';
+}
+
+// Mirror of the carve-outs in `_groupEventDedupeKey`: text-streaming events
+// (per-token deltas and assistant-stream chunks) carry no stable ID, so they
+// can't be deduped between the primary sendStream and the secondary observer.
+// The observer uses this to drop them while the primary is still alive.
+function _isUndedupableLiveEvent(evData) {
+  if (!evData || evData.type !== 'process') return false;
+  const data = evData.data || {};
+  if (data.type === 'delta') return true;
+  if (data.type === 'event' && data.event && data.event.stream === 'assistant') return true;
+  return false;
+}
+
+function _rememberGroupEventIfDuplicate(cid, evData) {
+  const key = _groupEventDedupeKey(evData);
+  if (!cid || !key) return false;
+  let seen = _groupEventDedupe.get(cid);
+  if (!seen) {
+    seen = new Map();
+    _groupEventDedupe.set(cid, seen);
+  }
+  if (seen.has(key)) return true;
+  seen.set(key, Date.now());
+  while (seen.size > GROUP_EVENT_DEDUPE_LIMIT) {
+    const oldest = seen.keys().next().value;
+    if (oldest == null) break;
+    seen.delete(oldest);
+  }
+  return false;
+}
 
 function _stopRuntimeActorRecovery(cid) {
   const timer = _runtimeRecoveryTimers.get(cid);
   if (timer) clearTimeout(timer);
   _runtimeRecoveryTimers.delete(cid);
+}
+
+function _stopGroupEventObserver(cid) {
+  const ctrl = _groupObserverCtrls.get(cid);
+  if (!ctrl) return;
+  _groupObserverCtrls.delete(cid);
+  try { ctrl.abort(); } catch (_) {}
 }
 
 async function _syncPendingActorsFromRuntime(cid, opts = {}) {
@@ -539,9 +621,10 @@ async function _syncPendingActorsFromRuntime(cid, opts = {}) {
     } catch (_) {}
   }
   if (window.ConversationInfo) {
-    try { window.ConversationInfo.refresh(cid, { silent: true }); } catch (_) {}
+    try { window.ConversationInfo.refreshTasks(cid, { silent: true }); } catch (_) {}
   }
   if (!processing) {
+    _stopGroupEventObserver(cid);
     if (hasLiveController) {
       _latestInFlight.set(cid, []);
       setGroupConversationBusy(cid, false);
@@ -567,6 +650,17 @@ async function _syncPendingActorsFromRuntime(cid, opts = {}) {
   _updateConvSidebarBadge(cid, true);
   startPolling(cid);
   if (cid === currentCid) _updateConvSendUI(cid);
+  if (hasLiveController) {
+    // Keep a second, read-only group event stream attached while a plan-driven
+    // run is active. The request-scoped send stream can be interrupted by
+    // renderer lifecycle / abort races; this observer is cheap and idempotent,
+    // and process-event de-dupe below is now render-aware so duplicates are
+    // less dangerous than a missing live rail.
+    _observeConversationRunFromPlanAction(cid, {
+      attachExisting: true,
+      allowWithController: true,
+    });
+  }
   if (!hasLiveController) {
     // Runtime polling can tell us who is working, but it does not carry
     // process/delta events. When the local send-stream was lost (refresh,
@@ -598,7 +692,7 @@ function _startRuntimeActorRecovery(cid) {
       _stopRuntimeActorRecovery(cid);
       return;
     }
-    const recovered = await _syncPendingActorsFromRuntime(cid);
+    const recovered = await _syncPendingActorsFromRuntime(cid, { allowController: true });
     if (!isConvPending(cid) || pendingConvs.get(cid)?.aborted) {
       _stopRuntimeActorRecovery(cid);
       return;
@@ -828,9 +922,18 @@ async function _openActorAgentDetail(actorId) {
   try {
     const res = await apiFetch(`/api/agents/${encodeURIComponent(aid)}`);
     const data = await res.json();
-    if (!data?.ok || !data?.agent) return;
+    if (!data?.ok || !data?.agent) {
+      // Agent was deleted / renamed / never installed under this uid — the
+      // user clicked the actor header and landed on the Agents tab with no
+      // detail panel. Tell them why instead of silently dropping the click.
+      _convLog.warn('open message actor: agent not found', { agent_id: aid });
+      try { await uiAlert(t('agents.agent_not_found')); } catch (_) {}
+      return;
+    }
   } catch (err) {
-    _convLog.warn('open message actor failed', { agent_id: aid, error: String(err && err.message || err) });
+    const msg = String(err && err.message || err);
+    _convLog.warn('open message actor failed', { agent_id: aid, error: msg });
+    try { await uiAlert(t('chat.unknown_error') + ': ' + msg); } catch (_) {}
     return;
   }
   if (typeof _showAgentsDetailView === 'function') await _showAgentsDetailView(aid);
@@ -1023,9 +1126,11 @@ function _groupMsgToLegacy(gm) {
 // ─── Chat attachments (pending-send pool per cid) ─────────────────────────
 // User picks files via "+" → we upload them to `<cid>/` and remember them in
 // this Map. On send we hand the filenames to the server; on success the list
-// for that cid is cleared (per-message granularity). Each entry is {name, kind, bytes, dataUrl?}.
+// for that cid is cleared (per-message granularity). Each entry is
+// {name, displayName?, kind, bytes, dataUrl?, sha256?, reused?}. `name` is the
+// real attachment-pool filename; `displayName` is the stable composer label.
 
-const _chatAttachments = new Map();   // cid → Array<{name, kind, bytes, dataUrl?}>
+const _chatAttachments = new Map();   // cid → Array<{name, displayName?, kind, bytes, dataUrl?, sha256?, reused?}>
 
 // Draft cid used by the commander (new-chat) tab — files land under
 // `data/<uid>/chat_attachments/main_chat/` until the user hits send, at which
@@ -1042,6 +1147,7 @@ const CHAT_ATTACH_ACCEPT = [
 
 const CHAT_IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.webp', '.gif'];
 const CHAT_VIDEO_EXTS = ['.mp4', '.webm', '.mov', '.m4v', '.ogv'];
+const ORKAS_FILE_DRAG_MIME = 'application/x-orkas-file';
 
 function _chatFileIconHtml(name, kind) {
   if (typeof window !== 'undefined' && typeof window.fileKindIconHtml === 'function') return window.fileKindIconHtml(name, kind);
@@ -1061,6 +1167,61 @@ function _chatAttachKindFromExt(ext) {
   return 'text';
 }
 
+function _chatAttachBaseName(p) {
+  const parts = String(p || '').split(/[\\/]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : String(p || '');
+}
+
+function _chatAttachHex(buf) {
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+async function _chatAttachSha256(buf) {
+  const subtle = globalThis.crypto && globalThis.crypto.subtle;
+  if (!subtle || typeof subtle.digest !== 'function') return '';
+  const digest = await subtle.digest('SHA-256', buf);
+  return _chatAttachHex(digest);
+}
+
+async function _chatAttachPrepareUploadFiles(cid, fileList) {
+  const files = Array.from(fileList || []);
+  const rejected = [];
+  const prepared = [];
+  const seenHashes = new Set(
+    _chatAttachList(cid)
+      .map((item) => item && item.sha256 ? `${Number(item.bytes) || 0}:${item.sha256}` : '')
+      .filter(Boolean),
+  );
+
+  for (const file of files) {
+    const ext = _chatAttachExtOf(file.name);
+    if (!CHAT_ATTACH_ACCEPT.includes(ext)) {
+      rejected.push(t('chat.attach_unsupported', { name: file.name }));
+      continue;
+    }
+
+    let buf;
+    let sha256 = '';
+    try {
+      buf = await file.arrayBuffer();
+    } catch (err) {
+      rejected.push(t('chat.attach_upload_fail', { name: file.name, reason: err.message || t('chat.attach_upload_generic_fail') }));
+      continue;
+    }
+    try { sha256 = await _chatAttachSha256(buf); }
+    catch (_) { sha256 = ''; }
+
+    const key = sha256 ? `${buf.byteLength}:${sha256}` : '';
+    if (key && seenHashes.has(key)) continue;
+    if (key) seenHashes.add(key);
+    prepared.push({ file, ext, buf, sha256 });
+  }
+
+  return { prepared, rejected };
+}
+
 // Build the `chat-media://` URL for serving an attachment's raw bytes to an
 // <img> or <video>. The main-process handler enforces uid + path safety; we
 // just URL-encode both path segments here.
@@ -1076,13 +1237,16 @@ function _chatAttachSet(cid, items) {
   _chatAttachments.set(cid, items);
   _chatAttachRenderChips(cid);
   if (cid && cid === currentCid && window.ConversationInfo) {
-    window.ConversationInfo.refreshAttachments(cid);
+    window.ConversationInfo.refreshAttachments(cid, { items });
   }
 }
 
 function _chatAttachClear(cid) {
   _chatAttachments.delete(cid);
   _chatAttachRenderChips(cid);
+  if (cid && cid === currentCid && window.ConversationInfo) {
+    window.ConversationInfo.refreshAttachments(cid, { items: [] });
+  }
 }
 
 // cid → DOM host id for the chip row. Draft cid (commander tab) renders into the
@@ -1109,10 +1273,11 @@ function _chatAttachRenderChips(cid) {
   }
   host.style.display = '';
   host.innerHTML = items.map((it, i) => {
+    const displayName = it.displayName || it.name;
     const icon = it.kind === 'image'
-      ? (it.dataUrl ? `<img class="chat-attach-thumb" src="${it.dataUrl}" alt="">` : _chatFileIconHtml(it.name, it.kind))
-      : _chatFileIconHtml(it.name, it.kind);
-    const label = escapeHtml(it.name);
+      ? (it.dataUrl ? `<img class="chat-attach-thumb" src="${it.dataUrl}" alt="">` : _chatFileIconHtml(displayName, it.kind))
+      : _chatFileIconHtml(displayName, it.kind);
+    const label = escapeHtml(displayName);
     const busy = it.status === 'uploading';
     const errored = it.status === 'error';
     const klass = `chat-attach-chip${busy ? ' is-uploading' : ''}${errored ? ' is-error' : ''}`;
@@ -1146,9 +1311,9 @@ async function _chatAttachRemove(cid, idx) {
   if (item.dataUrl && item.dataUrl.startsWith('blob:')) {
     try { URL.revokeObjectURL(item.dataUrl); } catch (_) { /* ignore */ }
   }
-  // Only hit the server if the upload actually completed — placeholders
-  // that errored out or are still uploading have no disk counterpart yet.
-  if (item.status !== 'uploading') {
+  // Only delete files this chip created. Reused files can belong to earlier
+  // messages, so removing the pending chip must leave the original on disk.
+  if (item.status !== 'uploading' && !item.reused) {
     try {
       await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/attachments?name=${encodeURIComponent(item.name)}`, {
         method: 'DELETE',
@@ -1169,23 +1334,36 @@ function _chatAttachReplaceByTempId(cid, tempId, patch) {
     // Drop the entry entirely (error path).
     items.splice(idx, 1);
   } else {
-    items[idx] = { ...items[idx], ...patch };
+    const next = { ...items[idx], ...patch };
+    const dupIdx = next.name
+      ? items.findIndex((it, i) => i !== idx && it.name === next.name && it.status !== 'uploading')
+      : -1;
+    if (dupIdx >= 0) {
+      if (items[idx].dataUrl && items[idx].dataUrl.startsWith('blob:')) {
+        try { URL.revokeObjectURL(items[idx].dataUrl); } catch (_) { /* ignore */ }
+      }
+      items.splice(idx, 1);
+    } else {
+      items[idx] = next;
+    }
   }
   _chatAttachSet(cid, items);
 }
 
 async function _chatAttachUpload(cid, fileList) {
-  const files = Array.from(fileList || []);
-  if (!files.length) return;
+  const { prepared, rejected } = await _chatAttachPrepareUploadFiles(cid, fileList);
+  if (!prepared.length) {
+    if (rejected.length) uiAlert(t('chat.attach_rejected_prefix', { list: rejected.join('\n') }));
+    return;
+  }
 
-  // ── Step 1: show placeholders immediately ────────────────────────────
-  // Append a busy chip for each file *before* any network I/O so the user
-  // sees the chip appear the instant they pick files. Images get a cheap
-  // local preview via URL.createObjectURL — no extra roundtrip needed.
+  // ── Step 1: show placeholders after client-side hash dedupe ───────────
+  // Hashing before painting chips prevents one add/drop action with several
+  // identical files from flashing duplicate thumbnails above the composer.
   const placeholders = [];
   const current = _chatAttachList(cid).slice();
-  for (const file of files) {
-    const ext = _chatAttachExtOf(file.name);
+  for (const item of prepared) {
+    const { file, ext, buf, sha256 } = item;
     const kind = _chatAttachKindFromExt(ext);
     const tempId = `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     let localPreview = null;
@@ -1193,31 +1371,24 @@ async function _chatAttachUpload(cid, fileList) {
       try { localPreview = URL.createObjectURL(file); } catch (_) { /* ignore */ }
     }
     const entry = {
-      tempId, name: file.name, kind, bytes: file.size || 0,
-      dataUrl: localPreview, status: 'uploading',
+      tempId, name: file.name, displayName: file.name, kind, bytes: file.size || 0,
+      dataUrl: localPreview, sha256, status: 'uploading',
     };
     current.push(entry);
-    placeholders.push({ tempId, file, ext });
+    placeholders.push({ tempId, file, ext, buf, sha256 });
   }
   _chatAttachSet(cid, current);
 
   // ── Step 2: upload all in parallel; rendering is already done ─────────
-  const rejected = [];
   await Promise.all(placeholders.map(async (ph) => {
-    if (!CHAT_ATTACH_ACCEPT.includes(ph.ext)) {
-      _chatAttachReplaceByTempId(cid, ph.tempId, null);
-      rejected.push(t('chat.attach_unsupported', { name: ph.file.name }));
-      return;
-    }
     try {
-      const buf = await ph.file.arrayBuffer();
       const res = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/attachments/upload`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/octet-stream',
           'X-Filename': encodeURIComponent(ph.file.name),
         },
-        body: buf,
+        body: ph.buf,
       });
       const data = await res.json();
       if (!data.ok) {
@@ -1230,13 +1401,103 @@ async function _chatAttachUpload(cid, fileList) {
       // roundtrip to fetch a dataUrl the server would just base64 back.
       _chatAttachReplaceByTempId(cid, ph.tempId, {
         name: info.name,
+        displayName: ph.file.name,
         kind: info.kind,
         bytes: info.bytes,
+        reused: !!data.reused,
+        sha256: ph.sha256,
         status: 'ready',
       });
     } catch (err) {
       _chatAttachReplaceByTempId(cid, ph.tempId, null);
       rejected.push(t('chat.attach_upload_fail', { name: ph.file.name, reason: err.message || t('chat.attach_upload_generic_fail') }));
+    }
+  }));
+
+  if (rejected.length) {
+    uiAlert(t('chat.attach_rejected_prefix', { list: rejected.join('\n') }));
+  }
+}
+
+function _chatAttachInternalDragItems(dataTransfer) {
+  if (!dataTransfer || !dataTransfer.types) return [];
+  let hasInternal = false;
+  for (let i = 0; i < dataTransfer.types.length; i++) {
+    if (dataTransfer.types[i] === ORKAS_FILE_DRAG_MIME) {
+      hasInternal = true;
+      break;
+    }
+  }
+  if (!hasInternal) return [];
+  let raw = '';
+  try { raw = dataTransfer.getData(ORKAS_FILE_DRAG_MIME); }
+  catch (_) { return []; }
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    const list = Array.isArray(parsed) ? parsed : [parsed];
+    return list
+      .map((item) => ({
+        path: typeof item?.path === 'string' ? item.path : '',
+        name: typeof item?.name === 'string' ? item.name : '',
+      }))
+      .filter((item) => item.path);
+  } catch (_) {
+    return [];
+  }
+}
+
+async function _chatAttachImportPaths(cid, entries) {
+  const files = Array.isArray(entries) ? entries.filter((it) => it && it.path) : [];
+  if (!files.length) return;
+
+  const placeholders = [];
+  const current = _chatAttachList(cid).slice();
+  for (const item of files) {
+    const displayName = item.name || _chatAttachBaseName(item.path);
+    const ext = _chatAttachExtOf(displayName);
+    const kind = _chatAttachKindFromExt(ext);
+    const tempId = `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    current.push({
+      tempId,
+      name: displayName,
+      displayName,
+      kind,
+      bytes: 0,
+      dataUrl: null,
+      status: 'uploading',
+    });
+    placeholders.push({ tempId, path: item.path, name: displayName });
+  }
+  _chatAttachSet(cid, current);
+
+  const rejected = [];
+  await Promise.all(placeholders.map(async (ph) => {
+    try {
+      const res = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/attachments/import`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: ph.path, name: ph.name }),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        _chatAttachReplaceByTempId(cid, ph.tempId, null);
+        rejected.push(t('chat.attach_upload_fail', { name: ph.name, reason: data.error || t('chat.attach_upload_generic_fail') }));
+        return;
+      }
+      const info = data.info;
+      _chatAttachReplaceByTempId(cid, ph.tempId, {
+        name: info.name,
+        displayName: ph.name,
+        kind: info.kind,
+        bytes: info.bytes,
+        dataUrl: (info.kind === 'image' || info.kind === 'video') ? _chatMediaUrl(cid, info.name) : null,
+        reused: !!data.reused,
+        status: 'ready',
+      });
+    } catch (err) {
+      _chatAttachReplaceByTempId(cid, ph.tempId, null);
+      rejected.push(t('chat.attach_upload_fail', { name: ph.name, reason: err.message || t('chat.attach_upload_generic_fail') }));
     }
   }));
 
@@ -1409,30 +1670,12 @@ function _hydrateMessageProducedChips(msgDiv) {
       e.stopPropagation();
       const p = chip.dataset.producedPath;
       if (!p) return;
-      // Markdown lands in the right-side drawer with view/edit semantics
-      // (reuses the KB editor — see modules/md-view-edit.js). Other kinds
-      // continue to use the existing in-app preview overlay / fallback.
-      if (_isMarkdownPath(p) && typeof openChatMdDrawer === 'function') {
-        const base = p.split(/[\\/]/).pop() || p;
-        openChatMdDrawer({
-          source: { kind: 'workspace', absPath: p, cid: currentCid || undefined },
-          initialMode: 'view',
-          title: base,
-        });
-        return;
-      }
       if (typeof openChatFileViewer === 'function') {
         const base = p.split(/[\\/]/).pop() || p;
-        openChatFileViewer(p, base);
+        openChatFileViewer(p, base, currentCid ? { cid: currentCid } : undefined);
       }
     });
   });
-}
-
-function _isMarkdownPath(p) {
-  if (!p) return false;
-  const lower = p.toLowerCase();
-  return lower.endsWith('.md') || lower.endsWith('.markdown');
 }
 
 function _hydrateMessageAttachmentThumbs(msgDiv, cid) {
@@ -1512,26 +1755,31 @@ function _bindChatPasteAttach(inputSelector, getCid) {
 function _bindChatDropAttach(wrapSelector, getCid) {
   const el = document.querySelector(wrapSelector);
   if (!el || el.dataset.dropBound === '1') return;
-  const isFileDrag = (e) => {
+  const isAttachDrag = (e) => {
     const types = e.dataTransfer && e.dataTransfer.types;
     if (!types) return false;
     for (let i = 0; i < types.length; i++) {
-      if (types[i] === 'Files') return true;
+      if (types[i] === 'Files' || types[i] === ORKAS_FILE_DRAG_MIME) return true;
     }
     return false;
   };
   const allow = (e) => {
-    if (!isFileDrag(e)) return;
+    if (!isAttachDrag(e)) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = 'copy';
   };
   el.addEventListener('dragover', allow);
   el.addEventListener('dragenter', allow);
   el.addEventListener('drop', (e) => {
-    if (!isFileDrag(e)) return;
+    if (!isAttachDrag(e)) return;
     e.preventDefault();
     const cid = getCid();
     if (!cid) return;
+    const internalFiles = _chatAttachInternalDragItems(e.dataTransfer);
+    if (internalFiles.length) {
+      _chatAttachImportPaths(cid, internalFiles);
+      return;
+    }
     _chatAttachUpload(cid, e.dataTransfer.files);
   });
   el.dataset.dropBound = '1';
@@ -1703,6 +1951,10 @@ async function _toggleConversationPinned(cid, pinned) {
     conversations = snapshot;
     renderConversationList();
     _convLog.warn('toggle conversation pin failed', err);
+    // Surface failure to the user — silent rollback leaves a chip-flicker
+    // with no explanation (typical race: another tab/device deleted the
+    // conv while this pin was in flight, or the server transient-errored).
+    try { await uiAlert(t('chat.pin_failed')); } catch (_) {}
   }
 }
 
@@ -2008,10 +2260,10 @@ async function loadConversationHistory(cid) {
     // adds it post-scroll and it ends up below the visible area.
     _ensureConvCreateAgentInline();
     _scrollToBottomNoAnim(container);
-    if (window.ConversationInfo) window.ConversationInfo.refresh(cid);
+    if (window.ConversationInfo) window.ConversationInfo.refreshTasks(cid);
   } catch (e) {
     container.innerHTML = `<div class="empty">${escapeHtml(t('chat.load_failed', { msg: e.message || '' }))}</div>`;
-    if (window.ConversationInfo) window.ConversationInfo.refresh(cid);
+    if (window.ConversationInfo) window.ConversationInfo.refreshTasks(cid);
   }
 }
 
@@ -2083,7 +2335,7 @@ async function _recoverPolledVisibleMessages(cid, rawMessages) {
   }
   if (changed) {
     try { if (window.PlanRail) window.PlanRail.refresh(cid, { force: true }); } catch (_) {}
-    try { if (window.ConversationInfo) window.ConversationInfo.refresh(cid); } catch (_) {}
+    try { if (window.ConversationInfo) window.ConversationInfo.refreshTasks(cid); } catch (_) {}
   }
   return changed;
 }
@@ -3063,9 +3315,12 @@ function _makeConvChatController(cid) {
           controller: { abort: () => _convChatCtrls.get(id)?.abort() },
           aborted: false,
         });
+        _lastGroupWorkEventAt.set(id, Date.now());
+        _groupEventDedupe.delete(id);
         _updateConvSendUI(id);
         _updateConvSidebarBadge(id, true);
         startPolling(id);
+        _startRuntimeActorRecovery(id);
       },
       onAbort(_msgEl, id) {
         const state = pendingConvs.get(id);
@@ -3181,7 +3436,9 @@ function _makeStreamPaintYield() {
 function _observeConversationRunFromPlanAction(cid, opts = {}) {
   if (!cid) return null;
   const attachExisting = !!opts.attachExisting;
-  if (_convChatCtrls.has(cid)) return null;
+  const allowWithController = !!opts.allowWithController;
+  if (_convChatCtrls.has(cid) && !allowWithController) return null;
+  if (allowWithController && _groupObserverCtrls.has(cid)) return null;
   if (!attachExisting && (pendingConvs.has(cid) || isGroupConversationBusy(cid))) return null;
 
   const controller = new AbortController();
@@ -3195,6 +3452,7 @@ function _observeConversationRunFromPlanAction(cid, opts = {}) {
       try { controller.abort(); } catch (_) {}
     },
   };
+  if (allowWithController) _groupObserverCtrls.set(cid, ctrl);
 
   const activate = () => {
     if (activated || controller.signal.aborted) return;
@@ -3205,12 +3463,14 @@ function _observeConversationRunFromPlanAction(cid, opts = {}) {
     msgEl = existing.loadingEl || (cid === currentCid
       ? _createStreamingAssistantMessage(container, { hiddenUntilActor: true })
       : null);
-    _convChatCtrls.set(cid, ctrl);
+    if (!allowWithController) {
+      _convChatCtrls.set(cid, ctrl);
+    }
     pendingConvs.set(cid, {
       ...existing,
       loadingEl: msgEl,
       needsIndicator: false,
-      controller: ctrl,
+      controller: allowWithController ? (existing.controller || ctrl) : ctrl,
       aborted: false,
     });
     setGroupConversationBusy(cid, true);
@@ -3266,6 +3526,17 @@ function _observeConversationRunFromPlanAction(cid, opts = {}) {
             if (st.status === 'running' || inFlight.length > 0) sawActivity = true;
           }
           if (sawActivity) activate();
+          // While the primary IPC sendStream still holds the live source of
+          // truth for rendering, skip events the dedupe layer can't
+          // disambiguate. `_groupEventDedupeKey` returns empty for delta
+          // tokens and assistant-stream events (no stable ID), so feeding
+          // them from both subscribers doubles every appended chunk into
+          // the streaming bubble. The observer remains active for ID-bearing
+          // events so the resilience story (primary dies mid-turn → bubble
+          // still receives message/artifact/state_changed) is preserved.
+          if (allowWithController && _convChatCtrls.has(cid) && _isUndedupableLiveEvent(evData)) {
+            continue;
+          }
           _handleGroupBusEvent(cid, msgEl, evData, { archive: true });
           const paintWait = maybeYieldToPaint();
           if (paintWait) await paintWait;
@@ -3281,14 +3552,23 @@ function _observeConversationRunFromPlanAction(cid, opts = {}) {
     } finally {
       settled = true;
       clearTimeout(noActivityTimer);
-      if (_convChatCtrls.get(cid) === ctrl) _convChatCtrls.delete(cid);
+      if (allowWithController) {
+        if (_groupObserverCtrls.get(cid) === ctrl) _groupObserverCtrls.delete(cid);
+      } else if (_convChatCtrls.get(cid) === ctrl) {
+        _convChatCtrls.delete(cid);
+      }
       if (activated) {
+        if (allowWithController) {
+          if (window.PlanRail) window.PlanRail.refresh(cid, { force: true });
+          if (window.ConversationInfo) window.ConversationInfo.refreshTasks(cid, { silent: true });
+          return;
+        }
         setGroupConversationBusy(cid, false);
         _removeEmptyStreamingPlaceholder(msgEl);
         _finishStreamingMsg(cid);
         _scheduleHistoryReconcileAfterStream(cid);
         if (window.PlanRail) window.PlanRail.refresh(cid, { force: true });
-        if (window.ConversationInfo) window.ConversationInfo.refresh(cid, { silent: true });
+        if (window.ConversationInfo) window.ConversationInfo.refreshTasks(cid, { silent: true });
       }
     }
   })();
@@ -3511,6 +3791,10 @@ function _setProcessLineContent(line, text, kind) {
   line.innerHTML = `${icon}<span class="stream-process-text">${escapeHtml(body)}</span>`;
 }
 
+function _processLineCount(msg) {
+  return msg?.querySelectorAll?.('[data-role="process"] .stream-process-line')?.length || 0;
+}
+
 function _eventProcessKind(evt, text) {
   if (!evt || typeof evt !== 'object') return _processKindOf(text);
   const stream = evt.stream;
@@ -3730,6 +4014,9 @@ function _streamingMarkAborted(msg) {
 
 function _finishStreamingMsg(cid) {
   _stopRuntimeActorRecovery(cid);
+  _stopGroupEventObserver(cid);
+  _lastGroupWorkEventAt.delete(cid);
+  _groupEventDedupe.delete(cid);
   pendingConvs.delete(cid);
   if (isGroupConversationBusy(cid)) startPolling(cid);
   else stopPolling(cid);
@@ -4179,7 +4466,12 @@ function createChatController(config) {
             }
             const paintWait = maybeYieldToPaint();
             if (paintWait) await paintWait;
-          } catch (_) { /* skip malformed */ }
+          } catch (err) {
+            _convLog.warn('stream event handler failed', {
+              cid: id,
+              error: String(err && err.message || err),
+            });
+          }
         }
       }
     } catch (err) {
@@ -4583,6 +4875,13 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
 //   { type: 'aborted', cid }
 function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {}) {
   if (!evData || typeof evData !== 'object') return;
+  if (
+    evData.type === 'process'
+    || evData.type === 'artifact_created'
+    || (evData.type === 'message' && evData.msg && evData.msg.from !== 'user')
+  ) {
+    _lastGroupWorkEventAt.set(cid, Date.now());
+  }
   // Bump the conv to the top of the sidebar list whenever a user-visible
   // message lands — applies to both currently-viewed and background convs,
   // so the sidebar stays ordered by last activity in real time. Skip
@@ -4590,7 +4889,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
   // user's view; visible end-of-turn replies will bump shortly after).
   if (evData.type === 'message' && evData.msg && !evData.msg.dispatch) {
     _bumpConvToTop(cid);
-    if (window.ConversationInfo) window.ConversationInfo.refresh(cid);
+    if (window.ConversationInfo) window.ConversationInfo.refreshTasks(cid);
   }
   // Cross-cid leakage guard: per-cid controllers stay alive when the user
   // navigates away mid-stream (a legit pattern — let the conv finish in
@@ -4605,6 +4904,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
   // and on switch-back `loadConversationHistory` rebuilds the cid's view
   // from disk — so dropping live UI updates here is safe.
   if (cid !== currentCid) return;
+  if (evData.type !== 'process' && _rememberGroupEventIfDuplicate(cid, evData)) return;
   if (evData.type === 'message') {
     const gm = evData.msg;
     if (!gm) return;
@@ -4705,7 +5005,15 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
       if (cid === currentCid) _updateConvSendUI(cid);
     }
     const target = _ensureActorPlaceholder(cid, actor, streamingMsg);
-    if (!target) return;
+    if (!target) {
+      _convLog.warn('group process target missing', {
+        cid,
+        actor,
+        kind: data.type || '',
+      });
+      return;
+    }
+    if (_rememberGroupEventIfDuplicate(cid, evData)) return;
     // Diagnostic — count how many deltas reach the renderer per actor.
     // If this number is much smaller than the bus emit count from the
     // turn-end log, the bottleneck is upstream (IPC batching). If it's
@@ -4716,14 +5024,37 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
         window._convDeltaCount[actor] = (window._convDeltaCount[actor] || 0) + 1;
       }
     }
-    if (data.type === 'delta' && typeof data.text === 'string') {
-      // Token-by-token streaming → write into the placeholder's final
-      // body so the user sees the reply form character-by-character.
-      _streamingAppendFinalDelta(target, data.text);
-    } else if (data.type === 'progress' && data.text) {
-      _streamingAppendProgress(target, String(data.text));
-    } else if (data.type === 'event') {
-      _renderAgentEvent(target, data.event);
+    try {
+      if (data.type === 'delta' && typeof data.text === 'string') {
+        // Token-by-token streaming → write into the placeholder's final
+        // body so the user sees the reply form character-by-character.
+        _streamingAppendFinalDelta(target, data.text);
+      } else if (data.type === 'progress' && data.text) {
+        _streamingAppendProgress(target, String(data.text));
+      } else if (data.type === 'event') {
+        const before = _processLineCount(target);
+        _renderAgentEvent(target, data.event);
+        const evt = data.event || {};
+        const line = evt.stream === 'tool' ? _formatEventLine(evt) : null;
+        if (line && _processLineCount(target) <= before) {
+          _streamingAppendProgress(target, line, _eventProcessKind(evt, line));
+        }
+      }
+    } catch (err) {
+      const evt = data.event || {};
+      const fallback = data.type === 'progress'
+        ? String(data.text || '')
+        : (evt && evt.stream ? _formatEventLine(evt) : '');
+      _convLog.warn('group process render failed', {
+        cid,
+        actor,
+        kind: data.type || '',
+        stream: evt.stream || '',
+        error: String(err && err.message || err),
+      });
+      if (fallback) {
+        try { _streamingAppendProgress(target, fallback, _eventProcessKind(evt, fallback)); } catch (_) {}
+      }
     }
   } else if (evData.type === 'artifact_created') {
     const actor = String(evData.actor || evData.artifact?.agent_id || '');
@@ -4747,7 +5078,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     // reply should default to that agent without them having to @-mention.
     _evaluateAutoRecipient(cid);
     if (window.PlanRail) window.PlanRail.refresh(cid, { force: true });
-    if (window.ConversationInfo) window.ConversationInfo.refresh(cid, { silent: true });
+    if (window.ConversationInfo) window.ConversationInfo.refreshTasks(cid, { silent: true });
   } else if (evData.type === 'state_changed') {
     // Each in_flight actor gets a placeholder so its delta tokens / tool
     // calls render in its own bubble even before its `message` arrives.
@@ -4774,7 +5105,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     if (window.PlanRail) {
       window.PlanRail.setInFlight(cid, inFlight);
     }
-    if (window.ConversationInfo) window.ConversationInfo.refresh(cid, { silent: true });
+    if (window.ConversationInfo) window.ConversationInfo.refreshTasks(cid, { silent: true });
     _updateConvSidebarBadge(cid, false);
     if (cid === currentCid) _updateConvSendUI(cid);
   } else if (evData.type === 'aborted') {
@@ -4934,19 +5265,18 @@ function _stripAgentCreateBlocksForStream(buf) {
   return _replaceOuterAgentBlocks(buf, _streamPlaceholderHtml('chat.create_agent_streaming_placeholder'));
 }
 
+function _skillStreamPlaceholderHtml() {
+  return _streamPlaceholderHtml('chat.create_skill_streaming_placeholder');
+}
+
 // `<<<skill-file path=X ... >>>` blocks (skill edit chat). Different fence
 // shape from `<agent>` (see strip-structural-blocks.js header) but same user-facing
-// contract: streaming placeholder hides the raw block + reveals the file
-// being written. The path attribute (when present) flows into the
-// localised "Writing X…" label so the placeholder is informative;
-// unattributed blocks fall back to a generic "Writing file…" label.
+// contract: streaming placeholder hides raw file content while the skill is
+// being assembled. Do not surface per-file paths here: one skill can emit
+// several file blocks, and repeating "Writing SKILL.md" made the stream noisy.
 function _stripSkillFileBlocksForStream(buf) {
-  return _replaceOuterSkillFileBlocks(buf, (path) => {
-    const label = path
-      ? t('chat.skill_file_streaming_placeholder', { path })
-      : t('chat.skill_file_streaming_placeholder_unknown');
-    return `\n<em class="stream-placeholder">${escapeHtml(label)}</em>\n`;
-  });
+  const placeholder = _skillStreamPlaceholderHtml();
+  return _replaceOuterSkillFileBlocks(buf, () => placeholder);
 }
 
 // `<skill>` container (commander create / edit). Pure logic lives in
@@ -4957,10 +5287,11 @@ function _stripSkillFileBlocksForStream(buf) {
 // composes `_replaceOuterAgentBlocks`). Set A / set B fixtures pinned in
 // `test/renderer/strip-structural-blocks.test.ts`.
 function _stripSkillCreateBlocksForStream(buf) {
-  return _stripSkillCreateContainer(
+  const placeholder = _skillStreamPlaceholderHtml();
+  return _collapseRepeatedStructuralPlaceholders(_stripSkillCreateContainer(
     buf,
-    _streamPlaceholderHtml('chat.create_skill_streaming_placeholder'),
-  );
+    placeholder,
+  ), placeholder);
 }
 
 function _stripAgentFormBlockForStream(buf) {
@@ -5608,13 +5939,14 @@ function _refreshTaskSurfacesAfterAbort(cid) {
     }
   } catch (_) {}
   try {
-    if (window.ConversationInfo) window.ConversationInfo.refresh(cid, { silent: true });
+    if (window.ConversationInfo) window.ConversationInfo.refreshTasks(cid, { silent: true });
   } catch (_) {}
 }
 
 function abortConvStream(cid) {
   const state = pendingConvs.get(cid);
   _stopRuntimeActorRecovery(cid);
+  _stopGroupEventObserver(cid);
   setGroupConversationBusy(cid, false);
   // Group chat: also tell the bus to abort all in-flight worker turns + clear
   // queues. Cancelling just the IPC stream would leave agents running in the
@@ -5767,4 +6099,3 @@ if (typeof window !== 'undefined') {
     _initChatSelectionMenu();
   }
 }
-

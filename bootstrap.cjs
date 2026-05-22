@@ -18,6 +18,38 @@
 'use strict';
 
 require('./src/main/install-data-root.cjs');
+const fs = require('node:fs');
+const path = require('node:path');
+
+function configurePackagedEsbuildBinary() {
+  if (!process.versions.electron || !process.resourcesPath || process.env.ESBUILD_BINARY_PATH) {
+    return;
+  }
+
+  const platformPackages = {
+    'darwin:arm64': ['@esbuild', 'darwin-arm64', 'bin', 'esbuild'],
+    'darwin:x64': ['@esbuild', 'darwin-x64', 'bin', 'esbuild'],
+    'linux:arm64': ['@esbuild', 'linux-arm64', 'bin', 'esbuild'],
+    'linux:x64': ['@esbuild', 'linux-x64', 'bin', 'esbuild'],
+    'win32:arm64': ['@esbuild', 'win32-arm64', 'esbuild.exe'],
+    'win32:ia32': ['@esbuild', 'win32-ia32', 'esbuild.exe'],
+    'win32:x64': ['@esbuild', 'win32-x64', 'esbuild.exe'],
+  };
+  const parts = platformPackages[`${process.platform}:${process.arch}`];
+  if (!parts) return;
+
+  const bin = path.join(
+    process.resourcesPath,
+    'app.asar.unpacked',
+    'node_modules',
+    ...parts,
+  );
+  if (fs.existsSync(bin)) {
+    process.env.ESBUILD_BINARY_PATH = bin;
+  }
+}
+
+configurePackagedEsbuildBinary();
 
 require('tsx/cjs');
 require('tsx/esm/api').register();

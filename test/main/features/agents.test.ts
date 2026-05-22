@@ -104,12 +104,12 @@ describe('agents › normalizeAgent', () => {
     const norm = a.normalizeAgent({
       agent_id: 'x', name: 'N', description: 'D', workflow: 'W',
       created_at: 't1', updated_at: 't2',
-    }, 'builtin');
+    }, 'marketplace');
     expect(norm).toEqual({
       agent_id: 'x', name: 'N',
       description_zh: '', description_en: 'D',
       workflow: 'W',
-      source: 'builtin', created_at: 't1', updated_at: 't2',
+      source: 'marketplace', created_at: 't1', updated_at: 't2',
       category: '',
       // computed-at-load default; overridden by listAgents/getAgent at the boundary
       enabled: true,
@@ -766,7 +766,7 @@ describe('agents › listAgents', () => {
     const a = await loadAgents();
     const list = await a.listAgents();
     const sources = Object.fromEntries(list.map((x) => [x.agent_id, x.source]));
-    expect(sources).toEqual({ c1: 'custom', b1: 'builtin' });
+    expect(sources).toEqual({ c1: 'custom', b1: 'marketplace' });
   });
 
   it('custom wins when builtin has same id', async () => {

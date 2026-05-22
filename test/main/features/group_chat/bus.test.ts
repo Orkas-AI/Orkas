@@ -18,6 +18,7 @@ vi.mock('../../../../src/main/model/client', () => ({
     yield { type: 'done' };
   },
   async chatWithModel() { return { ok: true, text: '', error: '', aborted: false }; },
+  abortActiveSessionsForConversation: vi.fn(() => 0),
 }));
 
 const cliRunMock = vi.hoisted(() => ({ calls: [] as any[] }));

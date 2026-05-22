@@ -4,6 +4,19 @@ const _skillsLog = createLogger('skills');
 let _skillsCache = null;
 let _selectedSkill = null;    // { source, id }
 const _SKILL_SPEC_CATEGORY_CODE_RE = /^[a-z][a-z0-9_-]{0,79}$/;
+
+function _skillSource(source) {
+  return (typeof normalizeCatalogSource === 'function')
+    ? normalizeCatalogSource(source)
+    : String(source || '');
+}
+
+function _isSkillPlatformSource(source) {
+  return (typeof isMarketplaceCatalogSource === 'function')
+    ? isMarketplaceCatalogSource(source)
+    : _skillSource(source) === 'marketplace';
+}
+
 function _normalizeSkillCategoryForHiddenSave(category) {
   const code = String(category || '').trim().toLowerCase();
   return _SKILL_SPEC_CATEGORY_CODE_RE.test(code) ? code : 'general';
@@ -55,7 +68,7 @@ async function refreshSkillsAfterMarketplaceReconcile() {
   _skillTreeCache.clear();
   await loadSkills(true);
   if (_skillEditMode) return;
-  if (_selectedSkill?.id && _selectedSkill.source === 'builtin') {
+  if (_selectedSkill?.id && _isSkillPlatformSource(_selectedSkill.source)) {
     const source = _selectedSkill.source;
     const id = _selectedSkill.id;
     const filepath = _selectedSkill.filepath || 'SKILL.md';
@@ -75,7 +88,10 @@ async function loadSkills(forceRefresh) {
     const res = await apiFetch('/api/skills/list');
     const data = await res.json();
     if (data.ok) {
-      _skillsCache = data.skills || [];
+      _skillsCache = (data.skills || []).map((s) => ({
+        ...s,
+        source: _skillSource(s.source),
+      }));
       renderSkillsList(_skillsCache);
     }
   } catch (e) {
@@ -89,7 +105,7 @@ async function loadSkills(forceRefresh) {
 // mutually exclusive because both are textual routing hints prepended to the
 // next message; agents remain separate in the recipient chip.
 
-const _chatUse = { 'new-chat': null, 'conversation': null };
+const _chatUse = { 'new-chat': null, 'conversation': null, project: null };
 
 function bindSkillPicker() {
   // Chip remove (×)
@@ -163,7 +179,9 @@ function _renderChatUseChipLabel(labelEl, selection) {
 
 function _renderChatUseChip(target) {
   const next = _normalizeChatUseSelection(_chatUse[target]);
-  const chipId = target === 'new-chat' ? 'new-chat-skill-chip' : 'chat-skill-chip';
+  const chipId = target === 'new-chat'
+    ? 'new-chat-skill-chip'
+    : (target === 'project' ? 'project-chat-skill-chip' : 'chat-skill-chip');
   const chip = document.getElementById(chipId);
   if (!chip) return;
   if (!next) {
@@ -187,6 +205,7 @@ function _renderChatUseChip(target) {
 function refreshChatUseChips() {
   _renderChatUseChip('new-chat');
   _renderChatUseChip('conversation');
+  _renderChatUseChip('project');
 }
 
 function setChatUseSelection(target, selection) {
@@ -200,7 +219,7 @@ function setChatUseSelection(target, selection) {
   // Return focus to the textarea after selection.
   const input = target === 'new-chat'
     ? document.getElementById('new-chat-input')
-    : document.getElementById('chat-input');
+    : (target === 'project' ? document.getElementById('project-chat-input') : document.getElementById('chat-input'));
   input?.focus();
 }
 
@@ -242,7 +261,7 @@ function renderSkillsList(skills) { renderSkillsGrid(skills); }
 
 function renderSkillsGrid(skills) {
   const custom = skills.filter(s => s.source === 'custom');
-  const builtin = skills.filter(s => s.source === 'builtin');
+  const marketplace = skills.filter(s => _isSkillPlatformSource(s.source));
   const emptyEl = document.getElementById('skills-empty');
   const customGroup = document.getElementById('skills-grid-custom-group');
   const builtinGroup = document.getElementById('skills-grid-builtin-group');
@@ -264,14 +283,14 @@ function renderSkillsGrid(skills) {
     const desc = pickDesc(s, getLang()).trim();
     const descClass = desc ? 'skill-card-desc' : 'skill-card-desc is-empty';
     const descText = desc || t('skills.no_desc');
-    // Source label (custom / builtin) is shown on the detail page only;
+    // Source label (custom / marketplace) is shown on the detail page only;
     // the grid cards stay clean and use the ⋯ menu for actions.
     const moreBtn = `<button type="button" class="skill-card-more" data-skill-more title="${moreTitle}" aria-label="${moreTitle}">⋯</button>`;
     const enabled = s.enabled !== false;
-    // Marketplace-installed (`builtin`) skills carry version + category from _install.json /
+    // Marketplace-installed skills carry version + category from _install.json /
     // SKILL.md frontmatter — show them as inline chips so users see provenance without
     // opening the detail page. Custom skills skip (no published version).
-    const platformChips = s.source === 'builtin' ? _skillPlatformChipsHtml(s) : '';
+    const platformChips = _isSkillPlatformSource(s.source) ? _skillPlatformChipsHtml(s) : '';
     return `
       <div class="skill-card${enabled ? '' : ' is-disabled'}" data-id="${escapeHtml(s.id)}" data-source="${s.source}">
         <div class="skill-card-header">
@@ -295,7 +314,7 @@ function renderSkillsGrid(skills) {
     gridEl.innerHTML = list.map(cardHtml).join('');
   };
   renderGroup(custom, customGroup, customGrid);
-  renderGroup(builtin, builtinGroup, builtinGrid);
+  renderGroup(marketplace, builtinGroup, builtinGrid);
 
   // Wire card / ▶ / ⋯ click handlers. (Enable/disable lives in the ⋯ menu
   // now — no toggle switch on the card.)
@@ -373,6 +392,7 @@ function _showSkillsGridView() {
 }
 
 async function _showSkillsDetailView(source, id) {
+  source = _skillSource(source);
   const grid = document.getElementById('skills-grid-view');
   const detail = document.getElementById('skills-detail-view');
   if (grid) grid.style.display = 'none';
@@ -447,6 +467,10 @@ function _openSkillRowMenu(anchorBtn, id, source) {
   // Dev-only entry on builtin: tag the label so the user knows this isn't a
   // normal user capability (mirrors marketplace.upload's "(dev)" treatment).
   const editLabelSuffix = (source === 'builtin' && false) ? t('common.dev_suffix') : '';
+  const canEdit = source === 'custom' || (_isSkillPlatformSource(source) && false);
+  // Dev-only entry on marketplace items: tag the label so the user knows this isn't a
+  // normal user capability (mirrors marketplace.upload's "(dev)" treatment).
+  const editLabelSuffix = (_isSkillPlatformSource(source) && false) ? t('common.dev_suffix') : '';
   const items = [];
   if (canEdit) {
     items.push(`<div class="skill-row-menu-item" data-action="edit">${escapeHtml(t('skills.edit') + editLabelSuffix)}</div>`);
@@ -548,6 +572,7 @@ async function _toggleSkillsSource() {
 }
 
 async function expandSkillTree(source, id, childrenEl) {
+  source = _skillSource(source);
   const key = `${source}:${id}`;
   let tree = _skillTreeCache.get(key);
   if (!tree) {
@@ -675,6 +700,7 @@ function findDirInTree(tree, targetPath) {
 }
 
 async function selectSkillFile(source, id, filepath, nodeEl) {
+  source = _skillSource(source);
   const skill = _skillsCache?.find(s => s.id === id && s.source === source);
   // Detect "same-skill file switch" vs initial / cross-skill load — only the
   // former needs scroll preservation (user is mid-page browsing source files).
@@ -721,6 +747,7 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   // In edit mode only the "done" button (the relabeled "edit") is
   // shown; everything else hides.
   const canEditThisSkill = source === 'custom';
+  const canEditThisSkill = source === 'custom' || (_isSkillPlatformSource(source) && false);
   const editingThis = _skillEditMode && _skillEditSkillId === id && canEditThisSkill;
   const actions = document.getElementById('skills-detail-actions');
   if (actions) {
@@ -1160,9 +1187,10 @@ function _updateEditButtonLabel() {
     btn.textContent = t('skills.edit_btn_done');
     return;
   }
-  // Tag the "Edit" label on builtin skills (dev-only entry); the "Done"
+  // Tag the "Edit" label on marketplace skills (dev-only entry); the "Done"
   // branch above stays bare — in edit mode the marker is redundant.
   const suffix = (_selectedSkill?.source === 'builtin' && false) ? t('common.dev_suffix') : '';
+  const suffix = (_isSkillPlatformSource(_selectedSkill?.source) && false) ? t('common.dev_suffix') : '';
   btn.textContent = t('skills.edit_btn_edit') + suffix;
 }
 
@@ -1176,6 +1204,9 @@ function _updateEditButtonLabel() {
 async function toggleSkillEditMode(opts = {}) {
   if (!_selectedSkill) return;
   if (_selectedSkill.source !== 'custom') return;
+  // Marketplace editing is dev-only; lift the source guard accordingly.
+  if (_selectedSkill.source !== 'custom'
+      && !(_isSkillPlatformSource(_selectedSkill.source) && false)) return;
   if (_skillEditMode && _skillEditSkillId === _selectedSkill.id) {
     // Abort any in-flight reply so "done" means "stop + exit", not
     // "exit but keep streaming". The chat controller is a singleton;
@@ -1570,11 +1601,16 @@ function editSelectedSkill() {
 async function deleteSelectedSkill() {
   if (!_selectedSkill) return;
   if (_selectedSkill.source !== 'custom') return;
+  const src = _selectedSkill.source;
+  if (src !== 'custom' && !(_isSkillPlatformSource(src) && false)) return;
   const sid = _selectedSkill.id;
   const cached = _skillsCache?.find(s => s.id === sid && s.source === 'custom');
   if (!(await uiConfirm(t('skills.delete_confirm', { name: cached?.name || sid })))) return;
   try {
     const result = await (await apiFetch(`/api/skills/${sid}`, { method: 'DELETE' })).json();
+    const result = _isSkillPlatformSource(src)
+      ? await window.orkas.invoke('skills.builtin.delete', { id: sid })
+      : await (await apiFetch(`/api/skills/${sid}`, { method: 'DELETE' })).json();
     if (!result.ok) {
       await uiAlert(t('skills.delete_failed_with', { reason: result.error || '' }));
       return;

@@ -9,6 +9,13 @@ Switch automatically by availability (paid API / model native / built-in `web_se
    - Regardless of source, **do not** stitch together a "trend summary" purely from search snippets.
 3. **Failures keep going**: skip to the next URL on a fetch failure; on empty search results or `isError`, **try at least two different strategies** (current UI language ↔ English / different keywords / `site:`) before giving up — a single empty result is not a reason to give up. When everything fails, state the actual cause (empty results / preview text), not vague "API error" wording.
 
+## Skill external dependencies
+
+When a skill's `SKILL.md` lists external runtime requirements (pip / npm packages, CLI binaries, credentials, ...), resolve at invocation time **before** stopping:
+
+1. **Self-resolvable** (pip / npm / CLI installable via a package manager) → install once using the skill's stated command; on success continue, on failure stop and report what you tried (a `bash`-unauthorized error here means the user must enable "Settings → Local execution" and install themselves).
+2. **User-required** (API keys, OAuth tokens, paid credentials, sudo) → stop and report what the user must do; never invent a credential or call the tool with a placeholder.
+
 ## PDF toolchain rules
 
 To generate a PDF you **must** use `markdown_to_pdf` (pure markdown) or `html_to_pdf` (tables / custom styles), both based on Electron `printToPDF` + system fonts. **Do not** call reportlab / pypdf / pdfkit / wkhtmltopdf / LaTeX from `bash` — CJK fonts will render as squares. **Even when the built-in PDF tools error, do not fall back** to those low-level libraries — report the error truthfully, do not silently swap paths to "patch over it".

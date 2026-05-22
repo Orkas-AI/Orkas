@@ -39,20 +39,22 @@ async function callReadText(
   const userWorkspace = await import('../../../src/main/features/user_workspace');
   const { chatAttachmentDir } = await import('../../../src/main/paths');
   const { safeId } = await import('../../../src/main/storage');
+  const { isPathAllowed } = await import('../../../src/main/util/path-sandbox');
 
   const target = input?.path;
   if (typeof target !== 'string' || !target) return { ok: false, error: 'missing path' };
   const ws = userWorkspace.getWorkspacePath(userId);
   const norm = path.resolve(target);
-  const wsNorm = path.resolve(ws);
   const cidRaw = input?.cid;
   const attachmentScope = (typeof cidRaw === 'string' && cidRaw && safeId(cidRaw))
     ? path.resolve(chatAttachmentDir(userId, cidRaw))
     : null;
-  const inAttachment = !!attachmentScope &&
-    (norm === attachmentScope || norm.startsWith(attachmentScope + path.sep));
-  const inWorkspace = norm === wsNorm || norm.startsWith(wsNorm + path.sep);
-  if (!inWorkspace && !inAttachment) {
+  // Mirrors `ipc/index.ts::produced.readText`: delegate the symlink-safe
+  // sandbox check to `util/path-sandbox.isPathAllowed`. Drift here = drift
+  // from the real handler.
+  const allowedRoots: string[] = [path.resolve(ws)];
+  if (attachmentScope) allowedRoots.push(attachmentScope);
+  if (!isPathAllowed(norm, allowedRoots)) {
     return { ok: false, error: 'path is outside the user workspace' };
   }
   let st: fs.Stats;

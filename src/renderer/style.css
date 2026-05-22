@@ -474,11 +474,22 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   text-align: left;
 }
 
+.sidebar-btn [data-ui-icon] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+  line-height: 0;
+}
+
 .sidebar-btn-icon {
   width: 15px;
   height: 15px;
   flex: 0 0 15px;
   color: #94a3b8;
+  display: block;
 }
 
 .sidebar-btn.active .sidebar-btn-icon {
@@ -625,6 +636,8 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   position: relative;
 }
 .project-row:hover { background: #f1f5f9; color: var(--text); }
+.project-row.active { background: #eff6ff; color: var(--primary); }
+.project-row.active .project-icon { color: var(--primary); }
 .project-row.is-menu-open { background: #f1f5f9; }
 
 .project-icon {
@@ -707,20 +720,25 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
 .project-detail-content {
   flex: 1;
   overflow-y: auto;
-  padding: 22px 32px 32px 32px;
-  max-width: 880px;
+  padding: 28px 32px 36px 32px;
+  max-width: 1180px;
   width: 100%;
   margin: 0 auto;
   box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
 }
 .project-detail-header {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin-bottom: 22px;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+.project-detail-title-wrap {
+  flex: 1;
+  min-width: 0;
 }
 .project-detail-title {
-  flex: 1;
   font-size: 22px;
   font-weight: 600;
   color: var(--text);
@@ -731,7 +749,8 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   white-space: nowrap;
 }
 .project-detail-title-input {
-  flex: 1;
+  width: 100%;
+  box-sizing: border-box;
   font-size: 22px;
   font-weight: 600;
   color: var(--text);
@@ -748,13 +767,76 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   gap: 8px;
   flex-shrink: 0;
 }
+.project-detail-grid {
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 28px;
+  align-items: start;
+  min-height: 380px;
+}
+.project-detail-main,
+.project-detail-side {
+  min-width: 0;
+}
+.project-detail-main {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  padding-top: 8px;
+}
+.project-composer-card {
+  width: 100%;
+}
+.project-composer-input-area {
+  pointer-events: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: #fff;
+  border: 1px solid var(--primary);
+  border-radius: 16px;
+  padding: 10px 16px;
+  box-shadow: 0 8px 32px rgba(37, 99, 235, 0.08);
+  position: relative;
+  transition: all 0.2s;
+}
+.project-composer-input-area:focus-within {
+  border-color: var(--primary);
+  box-shadow: 0 8px 32px rgba(37, 99, 235, 0.16);
+  transform: translateY(-2px);
+}
+.project-composer-input-area textarea {
+  flex: 0 1 auto;
+  width: 100%;
+  min-height: 62px;
+  max-height: 220px;
+  border: none;
+  outline: none;
+  resize: none;
+  padding: 4px 4px;
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--text);
+  background: transparent;
+  font-family: inherit;
+}
+.project-composer-input-area .chat-input-mirror {
+  font-size: 15px;
+}
+.project-composer-bottom {
+  min-height: 40px;
+}
+.project-chat-send-btn {
+  margin-left: auto;
+}
 
 /* Card-style section. Mirrors the look in shipping-product references —
    white card on neutral page bg, rounded corners, subtle border. */
 .project-detail-card {
   background: #fff;
   border: 1px solid #e5e7eb;
-  border-radius: 12px;
+  border-radius: 8px;
   padding: 16px 18px;
   margin-bottom: 14px;
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
@@ -811,6 +893,8 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   padding: 1px 6px;
   border-radius: 4px;
 }
+.project-binding-source--custom { color: #1d4ed8; background: #dbeafe; }
+.project-binding-source--marketplace { color: #475569; background: #e2e8f0; }
 .project-binding-source--stale { color: #b45309; background: #fef3c7; }
 .project-binding-desc {
   font-size: 12px;
@@ -899,6 +983,109 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+.project-card-icon-btn {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: #64748b;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+.project-card-icon-btn:hover {
+  background: #f1f5f9;
+  color: var(--text);
+}
+.project-files-status {
+  min-height: 18px;
+  margin-top: 8px;
+  font-size: 12px;
+}
+.project-files-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+.project-file-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 6px 4px;
+  border-radius: 6px;
+  color: #334155;
+}
+.project-file-row:hover { background: #f8fafc; }
+.project-file-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  padding: 0;
+}
+.project-file-icon {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.project-file-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+}
+.project-file-meta {
+  flex: 0 0 auto;
+  color: #94a3b8;
+  font-size: 11px;
+}
+.project-file-remove {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+}
+.project-file-row:hover .project-file-remove { color: #64748b; }
+.project-file-remove:hover {
+  background: #fee2e2;
+  color: #dc2626;
+}
+
+@media (max-width: 980px) {
+  .project-detail-grid {
+    grid-template-columns: 1fr;
+    min-height: 0;
+  }
+  .project-detail-actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
 }
 
 /* Empty-bindings banner inside an in-project conversation. */
@@ -2304,7 +2491,10 @@ body.model-not-configured .main-content { flex-direction: column; }
   color: #64748b;
   box-shadow: 0 6px 18px rgba(15, 23, 42, 0.08);
   cursor: pointer;
-  transition: background 120ms ease, color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+  transition: top 120ms ease, background 120ms ease, color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+}
+.chat-main-pane.has-project-empty-banner .conversation-info-toggle {
+  top: 62px;
 }
 .conversation-info-toggle:hover,
 .conversation-info-toggle.is-active {
@@ -3342,6 +3532,49 @@ body.model-not-configured .main-content { flex-direction: column; }
   gap: 6px;
   flex-shrink: 0;
 }
+.chat-file-viewer-md-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.chat-file-viewer-md-actions:empty { display: none; }
+.chat-file-viewer-md-actions .btn {
+  min-height: 28px;
+  white-space: nowrap;
+}
+.chat-file-viewer-md-actions .ctx-viewer-action-icon-btn {
+  width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: #475569;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.chat-file-viewer-md-actions .ctx-viewer-action-icon-btn:hover {
+  background: #e2e8f0;
+  color: #0f172a;
+}
+.chat-file-viewer-md-actions .ctx-viewer-action-icon-btn.btn-primary {
+  background: transparent;
+  color: var(--primary);
+}
+.chat-file-viewer-md-actions .ctx-viewer-action-icon-btn.btn-primary:hover {
+  background: rgba(59, 130, 246, 0.10);
+  color: var(--primary-hover);
+}
+.chat-file-viewer-md-actions .ctx-viewer-action-icon-btn.btn-danger {
+  color: var(--danger);
+}
+.chat-file-viewer-md-actions .ctx-viewer-action-icon {
+  width: 15px;
+  height: 15px;
+  display: block;
+}
 .chat-file-viewer-reveal,
 .chat-file-viewer-close {
   width: 28px;
@@ -3367,6 +3600,11 @@ body.model-not-configured .main-content { flex-direction: column; }
   min-height: 0;
   overflow: auto;
   background: #fff;
+}
+.chat-file-viewer.is-markdown .chat-file-viewer-body {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 /* iframe-based body (pdf / html) fills the body slot. The body itself
    handles scroll for non-iframe bodies (md / text). */
@@ -3398,6 +3636,53 @@ body.model-not-configured .main-content { flex-direction: column; }
   max-width: 880px;
   margin: 0 auto;
 }
+.chat-file-viewer.is-markdown .chat-file-viewer-body > .ctx-viewer-md {
+  flex: 1 1 auto;
+  width: 100%;
+  max-width: 880px;
+  min-height: 0;
+  margin: 0 auto;
+  padding: 24px 32px;
+  box-sizing: border-box;
+  overflow: auto;
+  color: #0f172a;
+  font-size: 14px;
+  line-height: 1.7;
+}
+.chat-file-viewer.is-markdown .ctx-editor-toolbar {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 8px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+}
+.chat-file-viewer.is-markdown .ctx-editor-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
+.chat-file-viewer.is-markdown .ctx-viewer-editor {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 16px 20px;
+  border: 0;
+  border-radius: 0;
+  outline: 0;
+  resize: none;
+}
+.chat-file-viewer.is-markdown .ctx-editor-preview {
+  flex: 1 1 auto;
+  width: 100%;
+  max-width: 880px;
+  min-height: 0;
+  margin: 0 auto;
+  padding: 24px 32px;
+  border: 0;
+  border-radius: 0;
+  box-sizing: border-box;
+  overflow: auto;
+}
 .chat-file-viewer-text {
   padding: 20px 24px;
   margin: 0;
@@ -3410,6 +3695,28 @@ body.model-not-configured .main-content { flex-direction: column; }
   word-break: break-word;
   min-height: 100%;
   box-sizing: border-box;
+}
+/* Mirrors .is-markdown's flex layout: body becomes a flex column so the
+   <pre> view or <textarea> editor (both direct children of the body) can
+   fill the available height and own their own scroll. */
+.chat-file-viewer.is-text .chat-file-viewer-body {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.chat-file-viewer.is-text .chat-file-viewer-body > .chat-file-viewer-text {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+.chat-file-viewer.is-text .chat-file-viewer-body > .ctx-viewer-editor {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 16px 20px;
+  border: 0;
+  border-radius: 0;
+  outline: 0;
+  resize: none;
 }
 .chat-file-viewer-loading {
   padding: 40px;
@@ -7056,10 +7363,9 @@ body.model-not-configured .main-content { flex-direction: column; }
   right: 0;
   /* Popovers portal to <body> at open time (see _aiSelectMount) so
      they can escape parent overflow:auto. They must therefore beat
-     every overlay they could appear inside. `.modal-overlay` is 100,
-     `.ui-dialog-overlay` is 200, the avatar picker is 300, common
-     toasts top out at 1000 — pick a value above all of them. */
-  z-index: 1200;
+     every overlay they could appear inside, including the login gate
+     at z-index 10000. */
+  z-index: 12000;
   background: #fff;
   border: 1px solid var(--border, #e5e7eb);
   border-radius: 8px;

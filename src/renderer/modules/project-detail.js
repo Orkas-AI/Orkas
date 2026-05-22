@@ -1,8 +1,6 @@
 // ─── Project detail panel ───────────────────────────────────────────────
-// Drives `#panel-project`: shows the project's bindings (agents + skills)
-// and exposes Add / Remove for each. Opened by clicking a project row in
-// the sidebar (`projects.js::_renderProjectRow` — single click both
-// expands the row and switches view here).
+// Drives `#panel-project`: shows the project composer, files, and bindings
+// (agents + skills), and exposes Add / Remove for each.
 //
 // Header carries 3 actions: + New chat / Rename / Delete. The "Back" button
 // was intentionally removed — the sidebar IS the back navigation.
@@ -13,7 +11,7 @@
 const _projectDetailLog = createLogger('project-detail');
 
 let _projectDetailPid = '';     // pid currently rendered in the panel
-let _projectDetailMeta = null;  // { project, agentDetails, skillDetails }
+let _projectDetailMeta = null;  // { project, agentDetails, skillDetails, files }
 
 // ── Public: navigate-into ──────────────────────────────────────────────
 
@@ -25,17 +23,19 @@ async function loadProjectDetail(pid) {
     return;
   }
   try {
-    const [getRes, listRes] = await Promise.all([
+    const [getRes, listRes, filesRes] = await Promise.all([
       window.orkas.invoke('projects.get', { projectId: pid }),
       window.orkas.invoke('projects.bindings.list', { projectId: pid }),
+      window.orkas.invoke('projects.files.list', { projectId: pid }),
     ]);
-    if (!getRes?.ok || !listRes?.ok) {
-      throw new Error((getRes && getRes.error) || (listRes && listRes.error) || 'load_failed');
+    if (!getRes?.ok || !listRes?.ok || !filesRes?.ok) {
+      throw new Error((getRes && getRes.error) || (listRes && listRes.error) || (filesRes && filesRes.error) || 'load_failed');
     }
     _projectDetailMeta = {
       project: getRes.project,
       agentDetails: Array.isArray(listRes.agentDetails) ? listRes.agentDetails : [],
       skillDetails: Array.isArray(listRes.skillDetails) ? listRes.skillDetails : [],
+      files: Array.isArray(filesRes.files) ? filesRes.files : [],
     };
     _renderProjectDetail();
   } catch (err) {
@@ -48,13 +48,17 @@ async function loadProjectDetail(pid) {
 function _renderProjectDetailEmpty() {
   const titleEl = document.getElementById('project-detail-title');
   if (titleEl) titleEl.textContent = '';
-  document.getElementById('project-agents-list').innerHTML = '';
-  document.getElementById('project-skills-list').innerHTML = '';
+  const agents = document.getElementById('project-agents-list');
+  const skills = document.getElementById('project-skills-list');
+  const files = document.getElementById('project-files-list');
+  if (agents) agents.innerHTML = '';
+  if (skills) skills.innerHTML = '';
+  if (files) files.innerHTML = '';
 }
 
 function _renderProjectDetail() {
   if (!_projectDetailMeta) { _renderProjectDetailEmpty(); return; }
-  const { project, agentDetails, skillDetails } = _projectDetailMeta;
+  const { project, agentDetails, skillDetails, files } = _projectDetailMeta;
 
   const titleEl = document.getElementById('project-detail-title');
   if (titleEl) titleEl.textContent = project?.name || '';
@@ -65,9 +69,13 @@ function _renderProjectDetail() {
   document.getElementById('project-skills-list').innerHTML = _renderBindingsRows(
     'skill', skillDetails,
   );
+  _renderProjectFiles(files || []);
 
   applyDomI18n();
   _bindRemoveButtons();
+  _bindProjectFileRows();
+  if (typeof refreshWorkspaceChip === 'function') refreshWorkspaceChip();
+  if (typeof hydrateUiIcons === 'function') hydrateUiIcons(document.getElementById('project-detail-content'));
 }
 
 function _renderBindingsRows(kind, items) {
@@ -78,9 +86,9 @@ function _renderBindingsRows(kind, items) {
   for (const it of sorted) {
     const id = (kind === 'agent') ? it.agent_id : it.id;
     const name = escapeHtml(it.name || id);
-    const desc = _pickItemDescription(it, lang);
+    const desc = kind === 'agent' ? '' : _pickItemDescription(it, lang);
     const descHtml = desc ? `<div class="project-binding-desc muted">${escapeHtml(desc)}</div>` : '';
-    const sourceTag = it.source ? `<span class="project-binding-source">${escapeHtml(it.source)}</span>` : '';
+    const sourceTag = _projectBindingSourceHtml(it.source, kind);
     rows.push(`
       <div class="project-binding-row" data-kind="${kind}" data-id="${escapeHtml(id)}">
         <div class="project-binding-main">
@@ -99,6 +107,204 @@ function _renderBindingsRows(kind, items) {
     return `<div class="empty" data-i18n="${emptyKey}">${escapeHtml(t(emptyKey))}</div>`;
   }
   return rows.join('');
+}
+
+function _formatProjectFileBytes(bytes) {
+  const n = Number(bytes);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(n / 1024 / 1024).toFixed(n < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
+function _renderProjectFiles(files) {
+  const list = document.getElementById('project-files-list');
+  const status = document.getElementById('project-files-status');
+  if (!list) return;
+  if (status) status.textContent = '';
+  const sorted = (files || []).slice().sort(_byDisplayName);
+  if (!sorted.length) {
+    list.innerHTML = `<div class="empty" data-i18n="project.files.empty">${escapeHtml(t('project.files.empty'))}</div>`;
+    return;
+  }
+  const removeLabel = escapeHtml(t('project.files.remove'));
+  list.innerHTML = sorted.map((f) => {
+    const name = f.name || '';
+    const label = escapeHtml(name);
+    const icon = (typeof window !== 'undefined' && typeof window.fileKindIconHtml === 'function')
+      ? window.fileKindIconHtml(name, f.kind)
+      : '';
+    const meta = _formatProjectFileBytes(f.bytes);
+    return `
+      <div class="project-file-row" data-project-file="${label}">
+        <button type="button" class="project-file-main" title="${label}" data-action="open-file">
+          <span class="project-file-icon">${icon}</span>
+          <span class="project-file-name">${label}</span>
+          ${meta ? `<span class="project-file-meta">${escapeHtml(meta)}</span>` : ''}
+        </button>
+        <button type="button" class="project-file-remove" data-action="remove-file"
+                title="${removeLabel}" aria-label="${removeLabel}">×</button>
+      </div>
+    `;
+  }).join('');
+}
+
+function _bindProjectFileRows() {
+  const root = document.getElementById('project-files-list');
+  if (!root) return;
+  root.querySelectorAll('.project-file-row[data-project-file]').forEach((row) => {
+    const name = row.dataset.projectFile || '';
+    row.querySelector('[data-action="open-file"]')?.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await _openProjectFile(name);
+    });
+    row.querySelector('[data-action="remove-file"]')?.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await _deleteProjectFile(name);
+    });
+  });
+}
+
+async function _openProjectFile(name) {
+  if (!_projectDetailPid || !name || typeof openChatFileViewer !== 'function') return;
+  try {
+    const res = await window.orkas.invoke('projects.files.absPath', {
+      projectId: _projectDetailPid,
+      name,
+    });
+    if (!res?.ok || !res.path) throw new Error(res?.error || 'not_found');
+    openChatFileViewer(res.path, name, { projectId: _projectDetailPid });
+  } catch (err) {
+    _projectDetailLog.warn('open project file failed', err);
+  }
+}
+
+async function _deleteProjectFile(name) {
+  if (!_projectDetailPid || !name) return;
+  try {
+    const res = await window.orkas.invoke('projects.files.delete', {
+      projectId: _projectDetailPid,
+      name,
+    });
+    if (!res?.ok) throw new Error(res?.error || 'delete_failed');
+    await loadProjectDetail(_projectDetailPid);
+  } catch (err) {
+    _projectDetailLog.warn('delete project file failed', err);
+    if (typeof uiAlert === 'function') uiAlert(t('project.files.delete_failed'));
+  }
+}
+
+function _arrayBufferToBase64(buf) {
+  const bytes = new Uint8Array(buf || new ArrayBuffer(0));
+  let binary = '';
+  const step = 0x8000;
+  for (let i = 0; i < bytes.length; i += step) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + step, bytes.length)));
+  }
+  return btoa(binary);
+}
+
+function _setProjectFilesStatus(text) {
+  const status = document.getElementById('project-files-status');
+  if (status) status.textContent = text || '';
+}
+
+async function _uploadProjectFiles(fileList) {
+  if (!_projectDetailPid || !fileList || !fileList.length) return;
+  const files = Array.from(fileList).filter(Boolean);
+  if (!files.length) return;
+  _setProjectFilesStatus(t('project.files.uploading'));
+  const failed = [];
+  await Promise.all(files.map(async (file) => {
+    try {
+      const buf = await file.arrayBuffer();
+      const res = await window.orkas.invoke('projects.files.upload', {
+        projectId: _projectDetailPid,
+        name: file.name || 'file',
+        data: _arrayBufferToBase64(buf),
+      });
+      if (!res?.ok) {
+        failed.push(t('project.files.upload_failed', {
+          name: file.name || 'file',
+          reason: res?.error || t('chat.attach_upload_generic_fail'),
+        }));
+      }
+    } catch (err) {
+      failed.push(t('project.files.upload_failed', {
+        name: file.name || 'file',
+        reason: err?.message || t('chat.attach_upload_generic_fail'),
+      }));
+    }
+  }));
+  await loadProjectDetail(_projectDetailPid);
+  if (failed.length && typeof uiAlert === 'function') {
+    await uiAlert(t('project.files.upload_failed_list', { list: failed.join('\n') }));
+  }
+}
+
+async function _submitProjectChat() {
+  if (!_projectDetailPid) return;
+  const input = document.getElementById('project-chat-input');
+  const btn = document.getElementById('project-chat-send-btn');
+  const raw = (input?.value || '').trim();
+  if (!raw) return;
+  if (typeof ensureModelConfigured === 'function' && !ensureModelConfigured()) return;
+  const useSelection = (typeof consumeChatUseSelection === 'function')
+    ? consumeChatUseSelection('project')
+    : null;
+  const recipient = (typeof getChatRecipient === 'function')
+    ? getChatRecipient('project')
+    : null;
+  const withUse = (typeof transformWithChatUse === 'function')
+    ? transformWithChatUse(raw, useSelection)
+    : raw;
+  const content = (typeof applyRecipientPrefix === 'function')
+    ? applyRecipientPrefix(withUse, 'project')
+    : withUse;
+  if (btn) btn.disabled = true;
+  let convId = '';
+  try {
+    const res = await apiFetch('/api/conversations/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: 'normal', projectId: _projectDetailPid }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || t('chat.create_conv_failed'));
+    const conv = data.conversation;
+    convId = conv.conversation_id;
+    conv.title = (typeof _autoTitle === 'function') ? _autoTitle(raw) : raw.slice(0, 32);
+    conversations.unshift(conv);
+    renderConversationList();
+    if (typeof loadProjects === 'function') loadProjects(true);
+  } catch (err) {
+    if (typeof uiAlert === 'function') {
+      await uiAlert(t('chat.create_conv_failed_with_reason', { reason: err?.message || err }));
+    }
+    if (btn) btn.disabled = false;
+    return;
+  }
+
+  if (input) {
+    input.value = '';
+    if (typeof autoGrow === 'function') autoGrow(input, 180);
+  }
+  const chatInput = document.getElementById('chat-input');
+  if (chatInput) {
+    chatInput.value = '';
+    if (typeof autoGrow === 'function') autoGrow(chatInput, 200);
+  }
+  if (typeof setView === 'function') setView('conversation', convId, { skipLoad: true });
+  if (recipient && typeof setChatRecipient === 'function') {
+    setChatRecipient('conversation', recipient);
+  }
+  if (useSelection && typeof setChatUseSelection === 'function') {
+    setChatUseSelection('conversation', useSelection);
+  }
+  if (btn) btn.disabled = false;
+  if (typeof sendInCurrentConversation === 'function') {
+    await sendInCurrentConversation(content);
+  }
 }
 
 function _activeLang() {
@@ -122,6 +328,18 @@ function _pickItemDescription(item, lang) {
   // cross-locale fallback (zh ?? en ?? '') so a one-language entry never
   // renders blank. Don't duplicate the rule here.
   return (typeof pickDesc === 'function') ? pickDesc(item, lang) : '';
+}
+
+function _projectBindingSourceHtml(source, kind) {
+  if (!source) return '';
+  const label = (typeof catalogSourceLabel === 'function')
+    ? catalogSourceLabel(source, kind === 'skill' ? 'skills' : 'agents')
+    : String(source);
+  if (!label) return '';
+  const normalized = (typeof normalizeCatalogSource === 'function')
+    ? normalizeCatalogSource(source)
+    : String(source);
+  return `<span class="project-binding-source project-binding-source--${escapeHtml(normalized)}">${escapeHtml(label)}</span>`;
 }
 
 function _bindRemoveButtons() {
@@ -216,7 +434,7 @@ async function _openAddPicker(kind) {
       const name = escapeHtml(c.name || id);
       const desc = _pickItemDescription(c, lang);
       const descHtml = desc ? `<div class="project-binding-desc muted">${escapeHtml(desc)}</div>` : '';
-      const source = c.source ? `<span class="project-binding-source">${escapeHtml(c.source)}</span>` : '';
+      const source = _projectBindingSourceHtml(c.source, kind);
       return `
         <div class="project-binding-picker-item" data-kind="${kind}" data-id="${escapeHtml(id)}">
           <div class="project-binding-main">
@@ -286,16 +504,7 @@ async function _openAddPicker(kind) {
   setTimeout(() => searchEl.focus(), 0);
 }
 
-// ── Header actions: New chat / Rename / Delete ────────────────────────
-
-function _onNewConvAction() {
-  if (!_projectDetailPid) return;
-  // Pin pid into the commander chip's localStorage key so the new-chat
-  // panel mounts with this project pre-selected. Mirrors
-  // `projects.js::_newConvWithProject` semantics — keep the key in sync.
-  try { localStorage.setItem('commander.lastProject', _projectDetailPid); } catch (_) {}
-  if (typeof setView === 'function') setView('new-chat');
-}
+// ── Header actions: Rename / Delete ────────────────────────────────────
 
 function _onRenameAction() {
   if (!_projectDetailMeta) return;
@@ -373,6 +582,11 @@ async function _onDeleteAction() {
 
 // ── Empty-bindings banner inside in-project conversations ─────────────
 
+function _setConvProjectBannerVisible(visible) {
+  const pane = document.querySelector('#panel-conversation .chat-main-pane');
+  if (pane) pane.classList.toggle('has-project-empty-banner', !!visible);
+}
+
 async function refreshConvProjectEmptyBanner(cid) {
   const banner = document.getElementById('conv-project-empty-banner');
   if (!banner) return;
@@ -384,6 +598,7 @@ async function refreshConvProjectEmptyBanner(cid) {
   if (!pid) {
     banner.style.display = 'none';
     delete banner.dataset.pid;
+    _setConvProjectBannerVisible(false);
     return;
   }
   try {
@@ -393,9 +608,13 @@ async function refreshConvProjectEmptyBanner(cid) {
     // gates whether the user can do anything inside this project.
     const isEmpty = !(b.agents || []).length;
     banner.style.display = isEmpty ? '' : 'none';
-    banner.dataset.pid = pid;
+    if (isEmpty) banner.dataset.pid = pid;
+    else delete banner.dataset.pid;
+    _setConvProjectBannerVisible(isEmpty);
   } catch (_) {
     banner.style.display = 'none';
+    delete banner.dataset.pid;
+    _setConvProjectBannerVisible(false);
   }
 }
 
@@ -410,10 +629,6 @@ document.addEventListener('DOMContentLoaded', () => {
     e.stopPropagation();
     _openAddPicker('skill');
   });
-  document.getElementById('project-action-new-conv')?.addEventListener('click', (e) => {
-    e.stopPropagation();
-    _onNewConvAction();
-  });
   document.getElementById('project-action-rename')?.addEventListener('click', (e) => {
     e.stopPropagation();
     _onRenameAction();
@@ -421,6 +636,35 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('project-action-delete')?.addEventListener('click', (e) => {
     e.stopPropagation();
     _onDeleteAction();
+  });
+  document.getElementById('project-add-file-btn')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    document.getElementById('project-file-input')?.click();
+  });
+  document.getElementById('project-chat-attach-btn')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    document.getElementById('project-file-input')?.click();
+  });
+  document.getElementById('project-file-input')?.addEventListener('change', async (e) => {
+    await _uploadProjectFiles(e.target.files);
+    e.target.value = '';
+  });
+  const projectInput = document.getElementById('project-chat-input');
+  if (projectInput) {
+    projectInput.addEventListener('input', () => {
+      if (typeof autoGrow === 'function') autoGrow(projectInput, 180);
+    });
+    projectInput.addEventListener('keydown', (e) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        _submitProjectChat();
+      }
+    });
+  }
+  document.getElementById('project-chat-send-btn')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    _submitProjectChat();
   });
   // Inline rename input handlers.
   const inputEl = document.getElementById('project-detail-title-input');

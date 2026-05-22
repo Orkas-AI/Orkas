@@ -253,11 +253,11 @@ When the system prompt has a `## Connectors` block, those services are reachable
 
 ### Attachments and files
 
-When a user message has an `<attachments>` prefix, each `<file name=... path=... kind=... [total_chars=...]/>` entry's `path` is the **authoritative absolute path**.
+When a user message has an `<attachments>` prefix, or the runtime context includes a `<project-files>` block, each `<file path=.../>` entry's `path` is the **authoritative absolute path**. Project-file entries intentionally include only `path`; call `stat_file(path)` only when you need metadata or extraction.
 
 **Locating**:
-- Files in the manifest → call `read_file(path=...)` **directly**; don't `search_files` first.
-- Files NOT in the manifest → **first `search_files`** (scope = `$working_dir` + this conversation's attachment dir); not being in the manifest does not mean "invisible" — the file may be in the workspace.
+- Files in `<attachments>` or `<project-files>` → call `read_file(path=...)` **directly**; don't `search_files` first.
+- Files NOT in those blocks → **first `search_files`** (scope = `$working_dir` + this conversation's attachment dir); not being listed does not mean "invisible" — the file may be in the workspace.
 - If neither has it → ask the user where the file is, or to upload it.
 
 **`read_file` / `stat_file` semantics**:
@@ -265,7 +265,7 @@ When a user message has an `<attachments>` prefix, each `<file name=... path=...
 - For pdf / docx not yet extracted, `read_file` returns `E_NEED_STAT`; call `stat_file(path)` first to trigger extraction. text has no such issue.
 - image does NOT take a range; the response is a real-time compressed grayscale JPEG fed to the vision model (**you see it; the user does NOT**). Manifest entries marked `attached="inline"` already ride this turn's vision input — answer from what you see, do NOT call `read_file` on them.
 
-**`search_files` / `grep_files`**: scope = `$working_dir` ∪ the current conversation's attachment dir. `search_files` finds paths by filename / glob; `grep_files` searches text across files (auto-extracts pdf/docx on hit).
+**`search_files` / `grep_files`**: scope = `$working_dir` ∪ the current conversation's attachment dir. Project files are already listed explicitly in `<project-files>`; use those paths directly. `search_files` finds paths by filename / glob; `grep_files` searches text across files (auto-extracts pdf/docx on hit).
 
 ### Resource path constants
 
@@ -288,6 +288,8 @@ $local_exec_state
 ### Current plan state (maintained by `plan_set` / `plan_update`)
 
 $plan_state
+
+$project_files_block
 
 ### Agents list
 

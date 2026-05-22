@@ -19,6 +19,7 @@ import { ipcMain, dialog, BrowserWindow, type WebContents } from 'electron';
 import * as users from '../features/users';
 import * as chats from '../features/chats';
 import * as projects from '../features/projects';
+import * as projectFiles from '../features/project_files';
 import * as groupChat from '../features/group_chat';
 import type { GroupEvent } from '../features/group_chat/bus';
 import * as agents from '../features/agents';
@@ -35,6 +36,7 @@ import * as kbVector from '../features/kb_vector';
 import * as kbIndexer from '../features/kb_indexer';
 import * as chatAttachments from '../features/chat_attachments';
 import * as chatArtifacts from '../features/chat_artifacts';
+import * as conversationFiles from '../features/conversation_files';
 import * as savedApps from '../features/saved_apps';
 import * as search from '../features/search';
 import * as auth from '../features/auth';
@@ -44,6 +46,8 @@ import * as permissions from '../features/permissions';
 import * as appConfig from '../features/config';
 import * as avatars from '../features/avatars';
 import { getRendererTables, isLang, t } from '../i18n';
+import { isPathAllowed } from '../util/path-sandbox';
+import * as devtools from '../features/devtools';
 import * as userWorkspace from '../features/user_workspace';
 import { invokeHandlers as localAgentsHandlers } from './local_agents';
 import { invokeHandlers as qualityHandlers } from './quality';
@@ -53,7 +57,9 @@ import { createLogger, logFromRenderer } from '../logger';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { shell } from 'electron';
-import { WS_ROOT, chatAttachmentDir } from '../paths';
+import { WS_ROOT, chatAttachmentDir, projectFilesDir } from '../paths';
+import { readState as readGroupChatState } from '../features/group_chat/state';
+import { readPlan as readGroupChatPlan } from '../features/group_chat/plan';
 
 const log = createLogger('ipc');
 
@@ -98,6 +104,72 @@ function _attachmentScopeForPayload(userId: string, payload: any): string | null
   return path.resolve(chatAttachmentDir(userId, payload.cid));
 }
 
+// Project-file scope for sandbox checks. Takes the already-resolved projectId
+// (computed by `_resolveWorkspaceScope`, which is cid-authoritative) rather
+// than reading payload.projectId directly — this enforces that a caller
+// passing `{cid, projectId}` where conv-cid.project_id !== projectId cannot
+// reach a foreign project's files (the cid wins, the claimed projectId
+// silently drops). When no cid is in payload, `_resolveWorkspaceScope`
+// already falls back to payload.projectId, so the commander-tab path
+// (project chip click before any conversation exists) continues to work.
+function _projectFileScopeForUser(userId: string, projectId: string | undefined): string | null {
+  if (!projectId || !safeId(projectId)) return null;
+  return path.resolve(projectFilesDir(userId, projectId));
+}
+
+/** Build the allowed-roots list for the file-class IPC sandbox: workspace ∪
+ *  current cid's attachment dir ∪ payload's project-file dir. The actual
+ *  containment check happens via `util/path-sandbox.isPathAllowed`, which
+ *  realpath-resolves both candidate and roots so a symlink planted inside
+ *  any allowed root cannot exfiltrate to a path outside.
+ *
+ *  Centralised for `conversations.attachments.import` / `workspace.revealPath`
+ *  / `produced.readText` / `produced.writeText` so the scope union stays in
+ *  sync. Previously each handler did its own `path.resolve(target).startsWith(
+ *  scope + path.sep)` triplet — lexical only, which let a symlink target
+ *  outside the scope quietly slip through under a `<uid>` workspace path
+ *  that itself contained one (the realistic attack: LLM-assisted skill
+ *  drops a symlink into an attachment dir; user later writes to the
+ *  apparent path through `produced.writeText` and the bytes land at
+ *  attacker-chosen target). */
+async function _ipcFileSandboxAllowedRoots(userId: string, payload: any): Promise<string[]> {
+  const projectId = await _resolveWorkspaceScope(userId, payload);
+  const roots: string[] = [userWorkspace.getWorkspacePath(userId, projectId)];
+  const att = _attachmentScopeForPayload(userId, payload);
+  if (att) roots.push(att);
+  const pf = _projectFileScopeForUser(userId, projectId);
+  if (pf) roots.push(pf);
+  return roots;
+}
+
+/** Test-only export — see `test/main/ipc/{produced-readText,workspace-reveal}.test.ts`. */
+export const _ipcFileSandboxAllowedRootsForTest = _ipcFileSandboxAllowedRoots;
+
+async function _isConversationRecordedFile(userId: string, cid: string, absPath: string): Promise<boolean> {
+  if (!safeId(cid)) return false;
+  const target = path.resolve(absPath);
+  const matches = (value: unknown): boolean =>
+    typeof value === 'string' && !!value && path.resolve(value) === target;
+
+  try {
+    const messages = await chats.getMessages(userId, cid, 2000);
+    for (const msg of messages as any[]) {
+      const produced = Array.isArray(msg?.produced) ? msg.produced : [];
+      if (produced.some(matches)) return true;
+    }
+  } catch { /* best-effort allow-list */ }
+
+  try {
+    const plan = await readGroupChatPlan(userId, cid);
+    for (const step of plan?.steps || []) {
+      const files = Array.isArray(step.output_files) ? step.output_files : [];
+      if (files.some(matches)) return true;
+    }
+  } catch { /* best-effort allow-list */ }
+
+  return false;
+}
+
 // ── Invoke handlers ──────────────────────────────────────────────────────
 // Contract: `(payload, { userId, sender }) => result` where result is
 // merged into a `{ ok: true, ...result }` response. Throw to signal error.
@@ -132,6 +204,17 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       conversation: { ...conv, ...runtime, agent_enabled },
       history: await chats.getMessages(ctx.userId, cid, limit),
     };
+  },
+
+  'conversations.files.list': async ({ cid }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    const projectId = await userWorkspace.resolveProjectIdForCid(ctx.userId, cid);
+    const workspaceRoot = userWorkspace.getWorkspacePath(ctx.userId, projectId);
+    const state = await readGroupChatState(ctx.userId, cid);
+    const root = state.workspace_dir
+      ? path.join(workspaceRoot, state.workspace_dir)
+      : workspaceRoot;
+    return conversationFiles.listWorkspaceFiles(root);
   },
 
   'conversations.create': async ({ title = '', projectId = '' } = {}, ctx) => {
@@ -201,6 +284,33 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const project = await projects.getProject(ctx.userId, projectId);
     if (!project) throw new Error('not_found');
     return { project };
+  },
+
+  'projects.files.list': async ({ projectId }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (!await projects.projectExists(ctx.userId, projectId)) throw new Error('not_found');
+    return { files: await projectFiles.listProjectFiles(ctx.userId, projectId) };
+  },
+
+  'projects.files.upload': async ({ projectId, name, data }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (typeof data !== 'string') throw new Error('missing data');
+    const buf = Buffer.from(data, 'base64');
+    return projectFiles.uploadProjectFile(ctx.userId, projectId, name || '', buf);
+  },
+
+  'projects.files.delete': async ({ projectId, name }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (typeof name !== 'string' || !name) throw new Error('invalid name');
+    return projectFiles.deleteProjectFile(ctx.userId, projectId, name);
+  },
+
+  'projects.files.absPath': async ({ projectId, name }, ctx) => {
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (typeof name !== 'string' || !name) throw new Error('invalid name');
+    const r = await projectFiles.resolveProjectFileAbsPath(ctx.userId, projectId, name);
+    if (!r.ok) return { ok: false, error: (r as { error?: string }).error || 'failed' };
+    return { ok: true, path: r.absPath, kind: r.kind };
   },
 
   // ── Project bindings (the strict scope of agents/skills visible inside
@@ -425,6 +535,22 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return chatAttachments.uploadAttachment(ctx.userId, cid, name || '', buf);
   },
 
+  'conversations.attachments.import': async (payload, ctx) => {
+    const cid = payload?.cid;
+    const sourcePath = payload?.path;
+    if (!safeId(cid)) throw new Error('invalid cid');
+    if (typeof sourcePath !== 'string' || !sourcePath) throw new Error('missing path');
+
+    const norm = path.resolve(sourcePath);
+    const allowedRoots = await _ipcFileSandboxAllowedRoots(ctx.userId, payload);
+    const inSandbox = isPathAllowed(norm, allowedRoots);
+    const inRecordedFile = !inSandbox && await _isConversationRecordedFile(ctx.userId, cid, norm);
+    if (!inSandbox && !inRecordedFile) {
+      throw new Error('path is outside the user workspace');
+    }
+    return chatAttachments.importAttachmentFromPath(ctx.userId, cid, norm);
+  },
+
   'conversations.attachments.delete': async ({ cid, name }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
     return chatAttachments.deleteAttachment(ctx.userId, cid, name || '');
@@ -569,7 +695,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'skills.list': async () => ({ skills: await skills.listSkills() }),
 
   'skills.read': async ({ source, id, file = 'SKILL.md' }) => {
-    if (source !== 'builtin' && source !== 'custom') throw new Error('invalid source');
+    if (source !== 'marketplace' && source !== 'builtin' && source !== 'custom') throw new Error('invalid source');
     if (!skills.isValidSkillId(id)) throw new Error('invalid skill id');
     return skills.readSkillFile(source, id, file);
   },
@@ -583,7 +709,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   'skills.tree': async ({ source, id }) => {
-    if (source !== 'builtin' && source !== 'custom') throw new Error('invalid source');
+    if (source !== 'marketplace' && source !== 'builtin' && source !== 'custom') throw new Error('invalid source');
     if (!skills.isValidSkillId(id)) throw new Error('invalid skill id');
     return skills.listSkillTree(source, id);
   },
@@ -1043,14 +1169,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (typeof target !== 'string' || !target) {
       throw new Error('missing path');
     }
-    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
-    const ws = userWorkspace.getWorkspacePath(ctx.userId, projectId);
     const norm = path.resolve(target);
-    const wsNorm = path.resolve(ws);
-    const attachmentScope = _attachmentScopeForPayload(ctx.userId, payload);
-    const inAttachment = !!attachmentScope &&
-      (norm === attachmentScope || norm.startsWith(attachmentScope + path.sep));
-    if (!inAttachment && !norm.startsWith(wsNorm + path.sep) && norm !== wsNorm) {
+    if (!isPathAllowed(norm, await _ipcFileSandboxAllowedRoots(ctx.userId, payload))) {
       throw new Error('path is outside the user workspace');
     }
     if (!fs.existsSync(norm)) throw new Error('file not found');
@@ -1088,15 +1208,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (typeof target !== 'string' || !target) {
       throw new Error('missing path');
     }
-    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
-    const ws = userWorkspace.getWorkspacePath(ctx.userId, projectId);
     const norm = path.resolve(target);
-    const wsNorm = path.resolve(ws);
-    const attachmentScope = _attachmentScopeForPayload(ctx.userId, payload);
-    const inAttachment = !!attachmentScope &&
-      (norm === attachmentScope || norm.startsWith(attachmentScope + path.sep));
-    const inWorkspace = norm === wsNorm || norm.startsWith(wsNorm + path.sep);
-    if (!inWorkspace && !inAttachment) {
+    if (!isPathAllowed(norm, await _ipcFileSandboxAllowedRoots(ctx.userId, payload))) {
       throw new Error('path is outside the user workspace');
     }
     let st: fs.Stats;
@@ -1134,21 +1247,29 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (bytes > MAX_TEXT_BYTES) {
       return { ok: false, error: 'too_large', size: bytes, cap: MAX_TEXT_BYTES };
     }
-    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
-    const ws = userWorkspace.getWorkspacePath(ctx.userId, projectId);
     const norm = path.resolve(target);
-    const wsNorm = path.resolve(ws);
-    const attachmentScope = _attachmentScopeForPayload(ctx.userId, payload);
-    const inAttachment = !!attachmentScope &&
-      (norm === attachmentScope || norm.startsWith(attachmentScope + path.sep));
-    const inWorkspace = norm === wsNorm || norm.startsWith(wsNorm + path.sep);
-    if (!inWorkspace && !inAttachment) {
+    if (!isPathAllowed(norm, await _ipcFileSandboxAllowedRoots(ctx.userId, payload))) {
       throw new Error('path is outside the user workspace');
     }
+    // Used below to gate sync.markDirty: we want to bump the project-files
+    // sync domain ONLY when the write actually landed inside the
+    // project-files scope (so a workspace-only write doesn't tickle the
+    // project-sync engine). Computed via isPathAllowed on the narrow scope
+    // so the symlink-safe semantics match the outer gate.
+    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
+    const projectFileScope = _projectFileScopeForUser(ctx.userId, projectId);
+    const inProjectFile = !!projectFileScope && isPathAllowed(norm, [projectFileScope]);
     try {
       fs.writeFileSync(norm, content, 'utf8');
     } catch (err) {
       return { ok: false, error: String((err as Error).message || 'write failed') };
+    }
+    if (inProjectFile && payload?.projectId) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+        const sync = require('../features/sync') as { markDirty?: (domain: string, relPath: string) => void };
+        sync.markDirty?.('projects', `cloud/projects/${payload.projectId}/files`);
+      } catch { /* sync stripped */ }
     }
     return { ok: true, size: bytes };
   },
@@ -1226,15 +1347,13 @@ const streamHandlers: Record<string, StreamHandler> = {
     }
     const atts = Array.isArray(attachments) ? attachments.filter((n: any) => typeof n === 'string') : [];
     // Legacy `conversations.stream` is now a thin wrapper around the
-    // group_chat bus. **Subscribe to the bus directly BEFORE calling
-    // `groupChat.send`** — `send` internally wakes the recipient worker
+    // group_chat bus. Subscribe to the bus directly BEFORE calling
+    // `groupChat.send` — `send` internally wakes the recipient worker
     // synchronously, and that worker's first state_changed / process events
-    // can fire on the same microtask cycle as `send` returns. If we waited
-    // and then opened the subscription via `streamEvents`, those first
-    // events would arrive at the bus listener list before our listener
-    // attached and be dropped. The previous "send + then for-await
-    // streamEvents" pattern was the source of "agent reply doesn't appear
-    // until I refresh".
+    // can fire on the same microtask cycle as `send` returns. We also drain
+    // the subscription while `send` is still in flight: plan-triggered runs
+    // can spend real time dispatching/reconciling before `send` resolves,
+    // but the bus is already carrying the agent's process/delta stream.
     //
     // We relay events until the bus is fully quiescent (no worker running
     // AND every actor's queue empty) — checked via the in-memory bus
@@ -1243,34 +1362,69 @@ const streamHandlers: Record<string, StreamHandler> = {
     const buf: GroupEvent[] = [];
     let wake: (() => void) | null = null;
     let cancelled = signal.aborted;
+    const notify = () => {
+      const w = wake; wake = null; w?.();
+    };
     const onAbort = () => {
       cancelled = true;
-      const w = wake; wake = null; w?.();
+      notify();
     };
     if (!cancelled) signal.addEventListener('abort', onAbort, { once: true });
     const unsub = groupChat.subscribeBus(ctx.userId, cid, (ev) => {
       buf.push(ev);
-      const w = wake; wake = null; w?.();
+      notify();
     });
-    try {
-      const sendRes = await groupChat.send({
-        userId: ctx.userId, cid, text,
-        ...(atts.length ? { attachments: atts } : {}),
-      });
-      if (!sendRes.ok) {
-        yield { type: 'error', text: sendRes.error || 'send failed' };
-        return;
+    let relayCount = 0;
+    let processCount = 0;
+    let firstProcessLogged = false;
+    let sendDone = false;
+    let sendRes: Awaited<ReturnType<typeof groupChat.send>> | null = null;
+    let sendErr: unknown = null;
+    const sendPromise = (async () => {
+      try {
+        sendRes = await groupChat.send({
+          userId: ctx.userId, cid, text,
+          ...(atts.length ? { attachments: atts } : {}),
+        });
+      } catch (err) {
+        sendErr = err;
+      } finally {
+        sendDone = true;
+        notify();
       }
+    })();
+    void sendPromise;
+    try {
       drainLoop: while (!cancelled) {
         while (buf.length) {
           const ev = buf.shift()!;
+          relayCount += 1;
+          if (ev.type === 'process') {
+            processCount += 1;
+            if (!firstProcessLogged) {
+              firstProcessLogged = true;
+              log.info(`sendStream first process cid=${cid} actor=${(ev as any).actor || ''} kind=${(ev as any).data?.type || ''}`);
+            }
+          }
           yield { type: 'event', event: { stream: 'group', data: ev } };
         }
-        if (groupChat.busIsQuiescent(ctx.userId, cid)) break drainLoop;
+        if (sendDone) {
+          if (sendErr) {
+            const errText = sendErr instanceof Error ? sendErr.message : String(sendErr || 'send failed');
+            yield { type: 'error', text: errText };
+            return;
+          }
+          if (!sendRes?.ok) {
+            yield { type: 'error', text: sendRes?.error || 'send failed' };
+            return;
+          }
+          if (groupChat.busIsQuiescent(ctx.userId, cid)) break drainLoop;
+        }
         if (cancelled) break;
         await new Promise<void>((resolve) => { wake = resolve; });
       }
     } finally {
+      log.info(`sendStream closed cid=${cid} relayed=${relayCount} process=${processCount} sendDone=${sendDone} cancelled=${cancelled}`);
       try { unsub(); } catch { /* ignore */ }
       try { signal.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
     }
@@ -1286,6 +1440,9 @@ const streamHandlers: Record<string, StreamHandler> = {
       let wake: (() => void) | null = null;
       let cancelled = signal.aborted;
       let sawWorkActivity = !groupChat.busIsQuiescent(ctx.userId, cid);
+      let relayCount = 0;
+      let processCount = 0;
+      let firstProcessLogged = false;
       const onAbort = () => { cancelled = true; const w = wake; wake = null; w?.(); };
       if (!cancelled) signal.addEventListener('abort', onAbort, { once: true });
       const unsub = groupChat.subscribeBus(ctx.userId, cid, (ev) => {
@@ -1309,6 +1466,14 @@ const streamHandlers: Record<string, StreamHandler> = {
                 sawWorkActivity = true;
               }
             }
+            relayCount += 1;
+            if (ev.type === 'process') {
+              processCount += 1;
+              if (!firstProcessLogged) {
+                firstProcessLogged = true;
+                log.info(`groupEvents first process cid=${cid} actor=${(ev as any).actor || ''} kind=${(ev as any).data?.type || ''}`);
+              }
+            }
             yield ev;
             if (sawWorkActivity && groupChat.busIsQuiescent(ctx.userId, cid)) return;
           }
@@ -1317,6 +1482,7 @@ const streamHandlers: Record<string, StreamHandler> = {
           await new Promise<void>((resolve) => { wake = resolve; });
         }
       } finally {
+        log.info(`groupEvents closed cid=${cid} relayed=${relayCount} process=${processCount} cancelled=${cancelled}`);
         try { unsub(); } catch { /* ignore */ }
         try { signal.removeEventListener?.('abort', onAbort); } catch { /* ignore */ }
       }
@@ -1478,6 +1644,7 @@ export function register(): void {
     const controller = new AbortController();
     const state: StreamState = { cancelled: false, controller };
     activeStreams.set(requestId, state);
+    log.info(`streamStart channel=${channel} requestId=${requestId} cid=${payload?.cid || payload?.id || payload?.agent_id || ''}`);
     try {
       const ctx = await resolveContext(event.sender);
       for await (const ev of handler(payload || {}, ctx, controller.signal)) {
@@ -1490,6 +1657,7 @@ export function register(): void {
       out({ type: 'error', text: (err as Error).message || String(err) });
     } finally {
       activeStreams.delete(requestId);
+      log.info(`streamDone channel=${channel} requestId=${requestId} cancelled=${state.cancelled}`);
       out({ type: 'done' });
     }
   });

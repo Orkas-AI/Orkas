@@ -476,7 +476,7 @@ describe('skills › applySkillContainerFromCommander › edit', () => {
       files: [{ path: 'SKILL.md', content: '---\nname: "shipped"\n---\n\ntampered\n' }],
     });
     expect(r.ok).toBe(false);
-    expect(r.error).toMatch(/built-in|内置/i);
+    expect(r.error).toMatch(/marketplace|平台技能|マーケットプレイス/i);
     // Original body preserved.
     expect(fs.readFileSync(path.join(builtinSkillsDir(), 'shipped', 'SKILL.md'), 'utf8'))
       .toContain('body');
@@ -646,7 +646,7 @@ describe('skills › createCustomSkill', () => {
     const builtinDir = path.join(builtinSkillsDir(), 'fixed');
     fs.mkdirSync(builtinDir, { recursive: true });
     const s = await loadSkills();
-    await expect(s.createCustomSkill('fixed', '')).rejects.toThrow(/conflicts with a built-in|内置技能冲突/);
+    await expect(s.createCustomSkill('fixed', '')).rejects.toThrow(/conflicts with a marketplace|与平台技能冲突|マーケットプレイスのスキルと競合/);
   });
 });
 

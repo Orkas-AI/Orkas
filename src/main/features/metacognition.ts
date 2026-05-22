@@ -38,7 +38,7 @@ export const STRATEGIES_CHAR_LIMIT = 4000;   // ~1300 tokens — strategies is a
 //   1. env `ORKAS_METACOGNITION='0'` — dev/CI kill switch, hard off.
 //   2. user preference `preferences.json::metacognition_enabled` — UI setting;
 //      undefined (never written) → treated as on, preserving historical default.
-// runner.ts and reflection-trigger.ts both read from here; don't sprinkle the
+// runner.ts and reflection-orchestrator.ts both read from here; don't sprinkle the
 // env check around again.
 export function isFeatureEnabled(): boolean {
   if (process.env.ORKAS_METACOGNITION === '0') return false;

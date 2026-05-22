@@ -52,6 +52,29 @@ function escapeHtml(str) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 }
 
+function normalizeCatalogSource(source) {
+  const s = String(source || '').trim().toLowerCase();
+  if (s === 'builtin' || s === 'platform') return 'marketplace';
+  if (s === 'custom') return 'custom';
+  return s;
+}
+
+function isCustomCatalogSource(source) {
+  return normalizeCatalogSource(source) === 'custom';
+}
+
+function isMarketplaceCatalogSource(source) {
+  return normalizeCatalogSource(source) === 'marketplace';
+}
+
+function catalogSourceLabel(source, kind = 'agents') {
+  const normalized = normalizeCatalogSource(source);
+  const base = kind === 'skills' ? 'skills' : 'agents';
+  if (normalized === 'custom') return t(`${base}.source_custom`);
+  if (normalized === 'marketplace') return t(`${base}.source_marketplace`);
+  return source ? String(source) : '';
+}
+
 // Full markdown renderer (used for skill detail view and chat)
 function renderMarkdownFull(md) {
   if (!md) return '';
@@ -730,27 +753,11 @@ function nowIsoLocal() {
  *  refreshes with backend's value and the sidebar entry visibly flips.
  *  Empty input returns '' so the caller can fall back to its own
  *  placeholder (`t('chat.new_conv_title')` for the conv list). */
-const _AUTO_TITLE_ZH_FILLER = /^(帮我看一下|可不可以|帮我看下|帮我看看|麻烦你|帮我看|我想要|想问问|能不能|可以不|可以吗|请帮我|看一下|麻烦|帮我|我想|想问|请问|看下|看看)\s*/;
-const _AUTO_TITLE_EN_FILLER = /^(could you|would you|can you|help me|i'?d like to|i want to|please)\s+/i;
-const _AUTO_TITLE_CLAUSE = /[，。？！；;,.?!]/;
-const _AUTO_TITLE_MAX = 30;
-function _autoTitle(text) {
-  const raw = String(text == null ? '' : text).trim().replace(/\s+/g, ' ');
-  if (!raw) return '';
-  let s = raw;
-  for (let i = 0; i < 5; i++) {
-    const before = s;
-    s = s.replace(_AUTO_TITLE_ZH_FILLER, '').replace(_AUTO_TITLE_EN_FILLER, '');
-    if (s === before) break;
-  }
-  s = s.trim();
-  const clauseIdx = s.search(_AUTO_TITLE_CLAUSE);
-  if (clauseIdx >= 4) s = s.slice(0, clauseIdx);
-  s = s.trim();
-  if (!s) s = raw;
-  if (s.length > _AUTO_TITLE_MAX) s = s.slice(0, _AUTO_TITLE_MAX) + '…';
-  return s;
-}
+// `_autoTitle` + its regex constants live in `modules/auto-title.js` so the
+// regex set has a single renderer-side home and a clean target for the
+// `test/renderer/auto-title-parity.test.ts` parity check against
+// `src/main/util/auto-title.ts`. The new file is loaded before consumers
+// via `<script src="./modules/auto-title.js">` in index.html.
 
 function formatTime(iso) {
   if (!iso) return '-';

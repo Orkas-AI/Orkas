@@ -1,7 +1,7 @@
 // ─── Right-side markdown drawer for the chat view ───
 // Hosted next to the main chat history, slides in from the right. Two source
 // kinds today (defined by mountMdViewEdit):
-//   workspace — clicked an LLM-produced .md / .markdown file chip
+//   workspace — a caller explicitly wants a side drawer for a workspace file
 //   ephemeral — context-menu "临时编辑" on a chat selection
 //
 // Single-instance: reopening always closes the previous mount. The drawer's

@@ -1,8 +1,9 @@
 // ─── Conversation info side panel ───────────────────────────────────────
 // Right-side companion panel for the active conversation. It summarizes the
-// structured plan, produced files, and attachments without adding new backend
-// state: everything is derived from the same history / plan / attachment
-// endpoints already used by the chat view.
+// structured plan, workspace files, and attachments. The file tab reads the
+// live conversation workspace first, then merges chip-tracked produced files
+// from history so the panel stays aligned with disk even when tools create
+// files through bash / CLI flows.
 
 const ConversationInfo = (() => {
   const _infoLog = (typeof createLogger === 'function')
@@ -13,12 +14,20 @@ const ConversationInfo = (() => {
   let _open = false;
   let _activeTab = 'tasks';
   let _seq = 0;
+  let _taskSeq = 0;
+  let _attachmentSeq = 0;
   let _loading = false;
   let _error = '';
   let _snapshot = {
     conversation: null,
     history: [],
     plan: null,
+    members: [],
+    files: [],
+    fileRoot: '',
+    fileRootExists: false,
+    filesTruncated: false,
+    filesCount: 0,
     attachments: [],
   };
 
@@ -55,6 +64,19 @@ const ConversationInfo = (() => {
       .filter(Boolean);
   }
 
+  function _normalizePath(p) {
+    return String(p || '').replace(/\\/g, '/').replace(/\/+/g, '/');
+  }
+
+  function _relPathUnder(root, target) {
+    const r = _normalizePath(root).replace(/\/+$/, '');
+    const t = _normalizePath(target);
+    if (!r || !t) return '';
+    if (t === r) return '';
+    const prefix = r + '/';
+    return t.startsWith(prefix) ? t.slice(prefix.length) : '';
+  }
+
   function _samePrefix(a, b) {
     if (!Array.isArray(a) || !Array.isArray(b) || a.length > b.length) return false;
     for (let i = 0; i < a.length; i++) {
@@ -76,8 +98,23 @@ const ConversationInfo = (() => {
     return common;
   }
 
+  // One-time warn when the shared icons helpers (`window.fileKindIconHtml` /
+  // `window.uiIconHtml`, defined by `modules/icons.js`) are missing — typical
+  // cause is an `index.html` script-list refactor that put `icons.js` after a
+  // consumer. Without this warn the panel just paints rows without icons,
+  // silently degrading; logging once lets DevTools surface the broken load
+  // order on the first render attempt. The flag is per-module-lifetime to
+  // avoid spamming on every refresh.
+  let _warnedIconsMissing = false;
+  function _warnIconsHelperMissingOnce(helperName) {
+    if (_warnedIconsMissing) return;
+    _warnedIconsMissing = true;
+    _infoLog.warn(`icons.js helper missing: ${helperName} — check index.html <script> load order`);
+  }
+
   function _iconForName(name, kind) {
     if (typeof window !== 'undefined' && typeof window.fileKindIconHtml === 'function') return window.fileKindIconHtml(name, kind);
+    _warnIconsHelperMissingOnce('fileKindIconHtml');
     return '';
   }
 
@@ -85,6 +122,7 @@ const ConversationInfo = (() => {
     if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
       return window.uiIconHtml(name, className);
     }
+    _warnIconsHelperMissingOnce('uiIconHtml');
     return '';
   }
 
@@ -114,11 +152,19 @@ const ConversationInfo = (() => {
 
   async function _load(cid) {
     const enc = encodeURIComponent(cid);
-    const [historyData, planData, attachmentData] = await Promise.all([
+    const [historyData, planData, memberData, filesData, attachmentData] = await Promise.all([
       _fetchJson(`/api/conversations/${enc}/history?limit=500`),
       _fetchJson(`/api/conversations/${enc}/plan`).catch((err) => {
         _infoLog.warn('plan load failed', { cid, error: err && err.message });
         return { plan: null };
+      }),
+      _fetchJson(`/api/conversations/${enc}/members`).catch((err) => {
+        _infoLog.warn('member load failed', { cid, error: err && err.message });
+        return { actors: [] };
+      }),
+      _fetchJson(`/api/conversations/${enc}/files`).catch((err) => {
+        _infoLog.warn('file list load failed', { cid, error: err && err.message });
+        return { items: [], root: '', rootExists: false, truncated: false, count: 0 };
       }),
       _fetchJson(`/api/conversations/${enc}/attachments`).catch((err) => {
         _infoLog.warn('attachment load failed', { cid, error: err && err.message });
@@ -129,8 +175,49 @@ const ConversationInfo = (() => {
       conversation: historyData.conversation || null,
       history: Array.isArray(historyData.history) ? historyData.history : [],
       plan: planData.plan || null,
+      members: Array.isArray(memberData.actors) ? memberData.actors : [],
+      files: Array.isArray(filesData.items) ? filesData.items : [],
+      fileRoot: typeof filesData.root === 'string' ? filesData.root : '',
+      fileRootExists: filesData.rootExists === true,
+      filesTruncated: filesData.truncated === true,
+      filesCount: Number(filesData.count) || 0,
       attachments: Array.isArray(attachmentData.items) ? attachmentData.items : [],
     };
+  }
+
+  async function _loadTaskSnapshot(cid) {
+    const enc = encodeURIComponent(cid);
+    const [historyData, planData, memberData] = await Promise.all([
+      _fetchJson(`/api/conversations/${enc}/history?limit=500`),
+      _fetchJson(`/api/conversations/${enc}/plan`).catch((err) => {
+        _infoLog.warn('plan load failed', { cid, error: err && err.message });
+        return { plan: null };
+      }),
+      _fetchJson(`/api/conversations/${enc}/members`).catch((err) => {
+        _infoLog.warn('member load failed', { cid, error: err && err.message });
+        return { actors: [] };
+      }),
+    ]);
+    return {
+      conversation: historyData.conversation || null,
+      history: Array.isArray(historyData.history) ? historyData.history : [],
+      plan: planData.plan || null,
+      members: Array.isArray(memberData.actors) ? memberData.actors : [],
+    };
+  }
+
+  function _normalizeAttachmentItems(items) {
+    return (Array.isArray(items) ? items : [])
+      .filter((item) => item && item.status !== 'error')
+      .map((item) => ({
+        name: String(item.name || ''),
+        displayName: item.displayName ? String(item.displayName) : '',
+        kind: item.kind || _kindForName(item.name || item.displayName || ''),
+        bytes: Number(item.bytes) || 0,
+        mtime: item.mtime,
+        status: item.status || '',
+      }))
+      .filter((item) => item.name);
   }
 
   function _currentConversationTitle() {
@@ -149,27 +236,147 @@ const ConversationInfo = (() => {
     return '';
   }
 
-  function _parseAnnouncementSteps(text) {
+  function _normalizeActorKey(value) {
+    return String(value || '').trim().replace(/^@+/, '').replace(/\s+/g, '').toLowerCase();
+  }
+
+  function _buildMemberLookup(members) {
+    const byKey = new Map();
+    const add = (key, actor) => {
+      const norm = _normalizeActorKey(key);
+      if (norm && actor) byKey.set(norm, actor);
+    };
+    for (const actor of Array.isArray(members) ? members : []) {
+      if (!actor || !actor.id) continue;
+      add(actor.id, actor);
+      add(actor.name, actor);
+    }
+    add('commander', { id: 'commander', kind: 'commander', name: _label('chat.recipient_commander', 'Commander') });
+    add('指挥官', { id: 'commander', kind: 'commander', name: _label('chat.recipient_commander', 'Commander') });
+    add('我自己', { id: 'commander', kind: 'commander', name: _label('chat.recipient_commander', 'Commander') });
+    add('自己', { id: 'commander', kind: 'commander', name: _label('chat.recipient_commander', 'Commander') });
+    add('user', { id: 'user', kind: 'user', name: _label('chat.from_user', 'User') });
+    add('用户', { id: 'user', kind: 'user', name: _label('chat.from_user', 'User') });
+    return { byKey };
+  }
+
+  function _normalizeAssignee(raw, lookup) {
+    const ref = String(raw || '').trim().replace(/^@+/, '').trim();
+    if (!ref) return '';
+    const actor = lookup && lookup.byKey ? lookup.byKey.get(_normalizeActorKey(ref)) : null;
+    if (actor && actor.id) return String(actor.id);
+    const key = _normalizeActorKey(ref);
+    if (key === 'commander' || key === '指挥官' || key === '我自己' || key === '自己') return 'commander';
+    if (key === 'user' || key === '用户') return 'user';
+    return ref;
+  }
+
+  function _parseAnnouncementSteps(text, lookup) {
     const lines = String(text || '').split(/\r?\n/);
     const steps = [];
     for (const line of lines) {
       const m = line.match(/^\s*(\d+)[\.\)、)]\s+(.+?)\s*$/u);
       if (!m) continue;
       const idx = Number(m[1]);
-      const body = String(m[2] || '').replace(/[（(][^）)]*[）)]\s*$/u, '').trim();
+      let body = String(m[2] || '').trim();
+      let assignee = '';
+      const assigneeMatch = body.match(/[（(]([^）)]*)[）)]\s*$/u);
+      if (assigneeMatch) {
+        assignee = _normalizeAssignee(assigneeMatch[1], lookup);
+        body = body.slice(0, assigneeMatch.index).trim();
+      }
       if (!body) continue;
-      steps.push({ index: idx, title: body, status: 'pending' });
+      steps.push({ index: idx, title: body, status: 'pending', ...(assignee ? { assignee } : {}) });
     }
     return steps;
+  }
+
+  function _actorMatches(actorValue, ref, lookup) {
+    if (!actorValue || !ref) return false;
+    const actor = lookup && lookup.byKey ? lookup.byKey.get(_normalizeActorKey(actorValue)) : null;
+    const refActor = lookup && lookup.byKey ? lookup.byKey.get(_normalizeActorKey(ref)) : null;
+    const actorId = actor?.id || String(actorValue);
+    const refId = refActor?.id || String(ref);
+    if (actorId === refId) return true;
+    return _normalizeActorKey(actorId) === _normalizeActorKey(refId)
+      || _normalizeActorKey(actor?.name) === _normalizeActorKey(ref)
+      || _normalizeActorKey(actorValue) === _normalizeActorKey(refActor?.name);
+  }
+
+  function _isUserVisibleTurn(m) {
+    return !!m && !m.dispatch && !m.plan_announcement && (m.from || m.role);
+  }
+
+  function _messageTargetsAssignee(m, assignee, lookup) {
+    if (!m || !m.dispatch || !assignee) return false;
+    const to = Array.isArray(m.to) ? m.to : [];
+    if (to.some((target) => _actorMatches(target, assignee, lookup))) return true;
+    const text = String(m.text || m.content || '').trim();
+    const mention = text.match(/^@([^\s，,：:]+)/u);
+    return !!mention && _actorMatches(mention[1], assignee, lookup);
+  }
+
+  function _messageCarriesStepIndex(m, step) {
+    const idx = Number(step && step.index);
+    if (!Number.isFinite(idx)) return false;
+    return Number(m && (m.triggered_step ?? m.plan_step_index ?? m.form?.plan_step_index)) === idx;
+  }
+
+  function _inferHistoricalSteps(steps, section, lookup) {
+    if (!Array.isArray(steps) || !steps.length) return [];
+    const usedDispatches = new Set();
+    const usedDoneTurns = new Set();
+    let previousDoneIdx = -1;
+    return steps.map((step) => {
+      const assignee = step.assignee || '';
+      const explicitIdx = section.findIndex((m) => _messageCarriesStepIndex(m, step));
+      const explicitDoneIdx = section.findIndex((m) =>
+        _messageCarriesStepIndex(m, step) && _isUserVisibleTurn(m));
+      const dispatchIdx = explicitIdx >= 0 ? explicitIdx : section.findIndex((m, idx) =>
+        !usedDispatches.has(idx) && _messageTargetsAssignee(m, assignee, lookup));
+      let doneIdx = -1;
+      if (explicitDoneIdx >= 0) {
+        doneIdx = explicitDoneIdx;
+      } else if (assignee === 'commander') {
+        const start = Math.max(0, previousDoneIdx + 1);
+        doneIdx = section.findIndex((m, idx) =>
+          idx >= start
+          && !usedDoneTurns.has(idx)
+          && _isUserVisibleTurn(m)
+          && _actorMatches(m.from || m.role, 'commander', lookup));
+      } else if (assignee) {
+        const start = dispatchIdx >= 0 ? dispatchIdx : Math.max(0, previousDoneIdx + 1);
+        doneIdx = section.findIndex((m, idx) =>
+          idx >= start
+          && !usedDoneTurns.has(idx)
+          && _isUserVisibleTurn(m)
+          && _actorMatches(m.from || m.role, assignee, lookup));
+      }
+      if (doneIdx >= 0) {
+        usedDoneTurns.add(doneIdx);
+        if (dispatchIdx >= 0) usedDispatches.add(dispatchIdx);
+        previousDoneIdx = Math.max(previousDoneIdx, doneIdx);
+        return { ...step, status: 'done' };
+      }
+      if (dispatchIdx >= 0) {
+        usedDispatches.add(dispatchIdx);
+        return { ...step, status: 'in_progress' };
+      }
+      return step;
+    });
   }
 
   function _buildTasks() {
     const history = _snapshot.history || [];
     const plan = _snapshot.plan;
+    const lookup = _buildMemberLookup(_snapshot.members);
     const tasks = [];
     for (let i = 0; i < history.length; i++) {
       const m = history[i];
       if (!m || !m.plan_announcement) continue;
+      const nextPlanIdx = history.findIndex((next, idx) => idx > i && next && next.plan_announcement);
+      const sectionEnd = nextPlanIdx >= 0 ? nextPlanIdx : history.length;
+      const parsedSteps = _parseAnnouncementSteps(m.text || m.content || '', lookup);
       const fallbackTitle = _nearestPriorUserText(history, i - 1)
         || _currentConversationTitle()
         || _label('conversation_info.task_plan_fallback', 'Execution plan');
@@ -177,7 +384,8 @@ const ConversationInfo = (() => {
         id: `plan-${m.id || i}`,
         title: fallbackTitle,
         time: m.ts || m.time || '',
-        steps: _parseAnnouncementSteps(m.text || m.content || ''),
+        steps: _inferHistoricalSteps(parsedSteps, history.slice(i + 1, sectionEnd), lookup),
+        _historyIndex: i,
         current: false,
       });
     }
@@ -195,13 +403,21 @@ const ConversationInfo = (() => {
         current: true,
       };
       if (tasks.length) {
-        tasks[tasks.length - 1] = { ...tasks[tasks.length - 1], ...current };
+        tasks[tasks.length - 1] = { ...tasks[tasks.length - 1], ...current, _historyIndex: tasks[tasks.length - 1]._historyIndex };
       } else {
         tasks.push(current);
       }
     }
 
-    return tasks.sort((a, b) => new Date(b.time || 0).getTime() - new Date(a.time || 0).getTime());
+    return tasks
+      .sort((a, b) => {
+        const at = new Date(a.time || 0).getTime();
+        const bt = new Date(b.time || 0).getTime();
+        const timeDiff = (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0);
+        if (timeDiff !== 0) return timeDiff;
+        return (b._historyIndex ?? -1) - (a._historyIndex ?? -1);
+      })
+      .map(({ _historyIndex, ...task }) => task);
   }
 
   function _statusLabel(status) {
@@ -238,7 +454,9 @@ const ConversationInfo = (() => {
     if (!a) return '';
     if (a === 'commander') return _label('chat.recipient_commander', 'Commander');
     if (a === 'user') return _label('chat.from_user', 'User');
-    return '@' + a;
+    const lookup = _buildMemberLookup(_snapshot.members);
+    const actor = lookup.byKey.get(_normalizeActorKey(a));
+    return '@' + (actor?.name || a);
   }
 
   function _renderStep(step) {
@@ -282,7 +500,7 @@ const ConversationInfo = (() => {
     }).join('')}</div>`;
   }
 
-  function _collectProducedFiles() {
+  function _collectHistoryProducedFiles() {
     const byPath = new Map();
     for (const m of _snapshot.history || []) {
       const ts = m && (m.ts || m.time || '');
@@ -305,11 +523,60 @@ const ConversationInfo = (() => {
     return Array.from(byPath.values()).sort((a, b) => String(a.path).localeCompare(String(b.path)));
   }
 
+  function _collectVisibleFiles() {
+    const byPath = new Map();
+    const fileRoot = _snapshot.fileRoot || '';
+    const workspaceFiles = Array.isArray(_snapshot.files) ? _snapshot.files : [];
+    for (const item of workspaceFiles) {
+      const p = item && item.path ? String(item.path) : '';
+      if (!p) continue;
+      const key = _normalizePath(p);
+      const relPath = item.relPath ? String(item.relPath) : _relPathUnder(fileRoot, p);
+      byPath.set(key, {
+        path: p,
+        relPath,
+        name: item.name || _baseName(p),
+        time: item.mtime ? new Date(Number(item.mtime)).toISOString() : '',
+        bytes: Number(item.bytes) || 0,
+        source: 'workspace',
+      });
+    }
+
+    const hasAuthoritativeWorkspaceSnapshot = !!fileRoot && _snapshot.fileRootExists === true;
+    for (const produced of _collectHistoryProducedFiles()) {
+      const p = produced && produced.path ? String(produced.path) : '';
+      if (!p) continue;
+      const key = _normalizePath(p);
+      if (byPath.has(key)) continue;
+      const relPath = _relPathUnder(fileRoot, p);
+      if (relPath && hasAuthoritativeWorkspaceSnapshot && !_snapshot.filesTruncated) {
+        // The workspace snapshot is authoritative for files under its root.
+        // If a produced file was deleted or renamed, don't keep showing the
+        // stale history record.
+        continue;
+      }
+      byPath.set(key, {
+        ...produced,
+        relPath,
+        name: _baseName(p),
+        source: 'produced',
+      });
+    }
+
+    return Array.from(byPath.values()).sort((a, b) => {
+      const ar = a.relPath || a.path || '';
+      const br = b.relPath || b.path || '';
+      return String(ar).localeCompare(String(br));
+    });
+  }
+
   function _buildFileTree(files) {
     const root = { dirs: new Map(), files: [] };
-    const common = _commonDirSegments(files.map((f) => f.path));
+    const hasRelPaths = files.some((f) => f && f.relPath);
+    const common = hasRelPaths ? [] : _commonDirSegments(files.map((f) => f.path));
     for (const file of files) {
-      const all = _splitPath(file.path);
+      const treePath = hasRelPaths ? (file.relPath || _baseName(file.path)) : file.path;
+      const all = _splitPath(treePath);
       const rel = _samePrefix(common, all) ? all.slice(common.length) : all;
       const parts = rel.length ? rel : [_baseName(file.path)];
       let node = root;
@@ -326,7 +593,7 @@ const ConversationInfo = (() => {
     const dirs = Array.from(node.dirs.entries()).sort((a, b) => a[0].localeCompare(b[0]));
     const files = node.files.slice().sort((a, b) => a.name.localeCompare(b.name));
     const dirHtml = dirs.map(([name, child]) => `
-      <details class="conversation-info-dir" style="--depth:${depth}" open>
+      <details class="conversation-info-dir" style="--depth:${depth}">
         <summary class="conversation-info-dir-summary">
           <span class="conversation-info-dir-folder-icon conversation-info-dir-folder-closed">${_uiIcon('folder', 'ui-icon conversation-info-dir-svg-icon')}</span>
           <span class="conversation-info-dir-folder-icon conversation-info-dir-folder-open">${_uiIcon('folder-open', 'ui-icon conversation-info-dir-svg-icon')}</span>
@@ -337,7 +604,7 @@ const ConversationInfo = (() => {
     `).join('');
     const fileHtml = files.map((file) => `
       <button type="button" class="conversation-info-file" style="--depth:${depth}"
-              data-file-path="${escapeHtml(file.path)}" title="${escapeHtml(file.path)}">
+              data-file-path="${escapeHtml(file.path)}" draggable="true" title="${escapeHtml(file.path)}">
         <span class="conversation-info-file-icon">${_iconForName(file.name)}</span>
         <span class="conversation-info-file-name">${escapeHtml(file.name)}</span>
       </button>
@@ -346,12 +613,15 @@ const ConversationInfo = (() => {
   }
 
   function _renderFiles() {
-    const files = _collectProducedFiles();
+    const files = _collectVisibleFiles();
     if (!files.length) {
-      return `<div class="conversation-info-empty">${escapeHtml(_label('conversation_info.empty_files', 'No generated files yet'))}</div>`;
+      return `<div class="conversation-info-empty">${escapeHtml(_label('conversation_info.empty_files', 'No files yet'))}</div>`;
     }
     const tree = _buildFileTree(files);
-    return `<div class="conversation-info-tree">${_renderTreeNode(tree, 0)}</div>`;
+    const trunc = _snapshot.filesTruncated
+      ? `<div class="conversation-info-empty is-small">${escapeHtml(_label('conversation_info.files_truncated', 'Showing first {count} files', { count: _snapshot.filesCount || files.length }))}</div>`
+      : '';
+    return `${trunc}<div class="conversation-info-tree">${_renderTreeNode(tree, 0)}</div>`;
   }
 
   function _collectConversationAttachments() {
@@ -371,6 +641,7 @@ const ConversationInfo = (() => {
       if (!name) continue;
       byName.set(name, {
         name,
+        displayName: item.displayName ? String(item.displayName) : '',
         kind: item.kind || _kindForName(name),
         bytes: Number(item.bytes) || 0,
         time: item.mtime ? new Date(Number(item.mtime) * 1000).toISOString() : '',
@@ -392,13 +663,14 @@ const ConversationInfo = (() => {
     }
     return `<div class="conversation-info-attachment-list">${items.map((item) => {
       const name = String(item.name || '');
+      const label = String(item.displayName || item.name || '');
       const size = _formatBytes(item.bytes);
       const meta = [item.kind || '', size].filter(Boolean).join(' · ');
       return `
-        <button type="button" class="conversation-info-attachment" data-attachment-name="${escapeHtml(name)}" title="${escapeHtml(name)}">
-          <span class="conversation-info-file-icon">${_iconForName(name, item.kind)}</span>
+        <button type="button" class="conversation-info-attachment" data-attachment-name="${escapeHtml(name)}" title="${escapeHtml(label)}">
+          <span class="conversation-info-file-icon">${_iconForName(label, item.kind)}</span>
           <span class="conversation-info-attachment-main">
-            <span class="conversation-info-file-name">${escapeHtml(name)}</span>
+            <span class="conversation-info-file-name">${escapeHtml(label)}</span>
             ${meta ? `<span class="conversation-info-attachment-meta">${escapeHtml(meta)}</span>` : ''}
           </span>
         </button>
@@ -471,13 +743,65 @@ const ConversationInfo = (() => {
     }
   }
 
+  async function refreshAttachments(cid, opts = {}) {
+    const target = cid || _cid;
+    if (!target || target !== _cid || !_open) return;
+    const items = Array.isArray(opts.items) ? _normalizeAttachmentItems(opts.items) : null;
+    if (items) {
+      _snapshot = { ..._snapshot, attachments: items };
+      if (_activeTab === 'attachments') _renderBody();
+      return;
+    }
+
+    const seq = ++_attachmentSeq;
+    try {
+      const data = await _fetchJson(`/api/conversations/${encodeURIComponent(target)}/attachments`);
+      if (seq !== _attachmentSeq || target !== _cid) return;
+      _snapshot = {
+        ..._snapshot,
+        attachments: Array.isArray(data.items) ? data.items : [],
+      };
+      if (_activeTab === 'attachments') _renderBody();
+    } catch (err) {
+      _infoLog.warn('attachment refresh failed', { cid: target, error: err && err.message });
+    }
+  }
+
+  async function refreshTasks(cid, opts = {}) {
+    const target = cid || _cid;
+    if (!target || target !== _cid || !_open) return;
+    const seq = ++_taskSeq;
+    const silent = !!opts.silent;
+    if (!silent && _activeTab === 'tasks') {
+      _loading = true;
+      _error = '';
+      _renderBody();
+    }
+    try {
+      const partial = await _loadTaskSnapshot(target);
+      if (seq !== _taskSeq || target !== _cid) return;
+      _snapshot = { ..._snapshot, ...partial };
+      _error = '';
+    } catch (err) {
+      if (seq !== _taskSeq || target !== _cid) return;
+      _error = (err && err.message) || String(err);
+    } finally {
+      if (seq === _taskSeq && target === _cid) {
+        _loading = false;
+        if (_activeTab === 'tasks') _renderBody();
+      }
+    }
+  }
+
   function bind(cid) {
     _cid = cid || null;
     _open = false;
-    _snapshot = { conversation: null, history: [], plan: null, attachments: [] };
+    _snapshot = { conversation: null, history: [], plan: null, members: [], files: [], fileRoot: '', fileRootExists: false, filesTruncated: false, filesCount: 0, attachments: [] };
     _error = '';
     _loading = false;
     _seq++;
+    _taskSeq++;
+    _attachmentSeq++;
     _syncChrome();
     _renderBody();
     if (_open && _cid) refresh(_cid);
@@ -542,6 +866,18 @@ const ConversationInfo = (() => {
           _openAttachment(attachment.dataset.attachmentName || '');
         }
       });
+      body.addEventListener('dragstart', (ev) => {
+        const file = ev.target.closest('.conversation-info-file[data-file-path]');
+        if (!file || !ev.dataTransfer) return;
+        const path = file.dataset.filePath || '';
+        if (!path) return;
+        const name = (file.querySelector('.conversation-info-file-name')?.textContent || _baseName(path)).trim();
+        try {
+          ev.dataTransfer.effectAllowed = 'copy';
+          ev.dataTransfer.setData('application/x-orkas-file', JSON.stringify({ path, name }));
+          ev.dataTransfer.setData('text/plain', path);
+        } catch (_) { /* best-effort */ }
+      });
     }
     _syncChrome();
     _renderBody();
@@ -561,7 +897,8 @@ const ConversationInfo = (() => {
     bind,
     unbind,
     refresh,
-    refreshAttachments: refresh,
+    refreshTasks,
+    refreshAttachments,
   };
 })();
 

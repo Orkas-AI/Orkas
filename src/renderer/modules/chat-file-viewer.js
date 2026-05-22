@@ -10,8 +10,12 @@
 //   video (.mp4/.webm/.mov/.m4v/.ogv)  → <video controls>
 //   pdf   (.pdf)                       → <iframe> + Chromium PDFium
 //   html  (.html/.htm)                 → sandbox="allow-scripts" iframe
-//   md    (.md/.markdown)              → renderMarkdown(text) in a <div>
-//   text  (.txt/.json/.csv/.code…)     → <pre> with the source
+//   md    (.md/.markdown)              → mountMdViewEdit (markdown toolbar
+//                                        only fires here — that's the
+//                                        contract the markdown editor
+//                                        carries that text files don't)
+//   text  (.txt/.json/.csv/.code…)     → mountTextViewEdit (<pre> view +
+//                                        plain textarea edit, no toolbar)
 //   else                               → uiConfirm "Open the folder?"
 //
 // chat-media://local/<abs> serves pdf/html bytes (streamed via
@@ -34,14 +38,24 @@
 //     opts.cid — pass through when the file is a per-conv attachment, so
 //                main can include the cid's attachment dir in the reveal /
 //                read scope. Workspace-only paths can omit it.
+//     opts.projectId — pass through when the file belongs to a project file
+//                pool so reveal / text preview can include that scope.
 
 let _viewerEl = null;
 let _viewerBody = null;
 let _viewerTitle = null;
 let _viewerRevealBtn = null;
+let _viewerMdActions = null;
 let _viewerKeyHandler = null;
 let _viewerCurrentPath = null;
 let _viewerCurrentCid = null;
+let _viewerCurrentProjectId = null;
+// Active view/edit controller — md (mountMdViewEdit) or text
+// (mountTextViewEdit). Both expose the same shape (`destroy / isDirty /
+// getMode / setMode`), so the close path can teardown without branching.
+let _viewerEditController = null;
+let _viewerDirty = false;
+let _viewerRenderSeq = 0;
 
 const _viewerLog = (typeof createLogger === 'function')
   ? createLogger('chat-file-viewer')
@@ -132,6 +146,7 @@ function _ensureViewer() {
       <div class="chat-file-viewer-header">
         <span class="chat-file-viewer-title"></span>
         <div class="chat-file-viewer-actions">
+          <div class="chat-file-viewer-md-actions"></div>
           <button type="button" class="chat-file-viewer-reveal" aria-label="${revealLabel}" title="${revealLabel}">${folderIcon}</button>
           <button type="button" class="chat-file-viewer-close" aria-label="${closeLabel}" title="${closeLabel}">×</button>
         </div>
@@ -145,6 +160,7 @@ function _ensureViewer() {
   _viewerBody = root.querySelector('.chat-file-viewer-body');
   _viewerTitle = root.querySelector('.chat-file-viewer-title');
   _viewerRevealBtn = root.querySelector('.chat-file-viewer-reveal');
+  _viewerMdActions = root.querySelector('.chat-file-viewer-md-actions');
 
   // i18n change → re-label the icon-only buttons. Same lazy listener pattern
   // as chat-lightbox; the singleton is created on first open so the
@@ -166,12 +182,35 @@ function _ensureViewer() {
   return root;
 }
 
+function _confirmDiscardViewerEdits() {
+  if (!_viewerDirty) return true;
+  return window.confirm(_viewerLabel('chat.md_drawer.close_confirm', 'Discard unsaved changes?'));
+}
+
+function _teardownViewerContent() {
+  if (_viewerEditController) {
+    try { _viewerEditController.destroy(); }
+    catch (err) { _viewerLog.warn('edit controller destroy threw', err); }
+  }
+  _viewerEditController = null;
+  _viewerDirty = false;
+  if (_viewerBody) _viewerBody.innerHTML = '';
+  if (_viewerMdActions) _viewerMdActions.innerHTML = '';
+  if (_viewerEl) _viewerEl.classList.remove('is-markdown', 'is-text');
+}
+
+function _typesetViewerMarkdown() {
+  if (typeof typesetMath !== 'function' || !_viewerBody) return;
+  try { typesetMath(_viewerBody); } catch (_) { /* non-fatal */ }
+}
+
 async function _onRevealClick() {
   const p = _viewerCurrentPath;
   if (!p) return;
   try {
     const payload = { path: p };
     if (_viewerCurrentCid) payload.cid = _viewerCurrentCid;
+    if (_viewerCurrentProjectId) payload.projectId = _viewerCurrentProjectId;
     const res = await window.orkas.invoke('workspace.revealPath', payload);
     if (!res || !res.ok) {
       _viewerLog.warn('reveal failed', { path: p, error: res && res.error });
@@ -181,10 +220,24 @@ async function _onRevealClick() {
   }
 }
 
-function _openViewerShell(displayName) {
+function _openViewerShell(displayName, opts) {
   const el = _ensureViewer();
+  if (!_confirmDiscardViewerEdits()) return null;
+  _teardownViewerContent();
+  _viewerRenderSeq += 1;
+  const absPath = opts && opts.absPath;
+  const cid = (opts && opts.cid) || null;
+  const projectId = (opts && opts.projectId) || null;
+  _viewerCurrentPath = absPath || null;
+  _viewerCurrentCid = cid;
+  _viewerCurrentProjectId = projectId;
   _viewerTitle.textContent = displayName || '';
-  _viewerBody.innerHTML = '';
+  // `is-markdown` / `is-text` switch the body to a flex column so an editor
+  // textarea can fill the available height. View-mode `<pre>` and view-mode
+  // markdown both rely on this same layout — see style.css §chat-file-viewer
+  // for the per-class rules.
+  if (opts && opts.kind === 'markdown') el.classList.add('is-markdown');
+  if (opts && opts.kind === 'text') el.classList.add('is-text');
   el.classList.add('is-open');
   el.setAttribute('aria-hidden', 'false');
   if (!_viewerKeyHandler) {
@@ -192,41 +245,48 @@ function _openViewerShell(displayName) {
       if (!_isViewerOpen()) return;
       // IME guard: Esc commits IME composition cancel — don't double-fire close.
       if (e.isComposing || e.keyCode === 229) return;
+      const active = document.activeElement;
+      if (active && active.tagName === 'TEXTAREA' && active.closest('.chat-file-viewer')) return;
       if (e.key === 'Escape') closeChatFileViewer();
     };
     document.addEventListener('keydown', _viewerKeyHandler);
   }
-  return el;
+  return _viewerRenderSeq;
 }
 
-function closeChatFileViewer() {
+function closeChatFileViewer(opts) {
   if (!_viewerEl) return;
+  const force = !!(opts && opts.force);
+  if (!force && !_confirmDiscardViewerEdits()) return false;
+  _viewerRenderSeq += 1;
   _viewerEl.classList.remove('is-open');
   _viewerEl.setAttribute('aria-hidden', 'true');
   // Drop iframe / blob src so big preview docs can be GC'd promptly when
   // the user closes the overlay. Without this, hidden iframes keep the
   // PDFium / HTML document alive in memory until the next reopen.
-  if (_viewerBody) _viewerBody.innerHTML = '';
+  _teardownViewerContent();
   _viewerCurrentPath = null;
   _viewerCurrentCid = null;
+  _viewerCurrentProjectId = null;
   if (_viewerKeyHandler) {
     document.removeEventListener('keydown', _viewerKeyHandler);
     _viewerKeyHandler = null;
   }
+  return true;
 }
 
 // ── Per-kind body builders ───────────────────────────────────────────────
 
-function _renderPdfBody(absPath, displayName) {
-  _openViewerShell(displayName);
+function _renderPdfBody(absPath, displayName, cid, projectId) {
+  if (!_openViewerShell(displayName, { kind: 'pdf', absPath, cid, projectId })) return;
   const url = _chatMediaLocalUrl(absPath);
   // `#toolbar=1&navpanes=0` are Chromium PDFium control hints (keep toolbar,
   // hide left sidebar). Same pattern as the KB context PDF viewer.
   _viewerBody.innerHTML = `<iframe class="chat-file-viewer-pdf" src="${url}#toolbar=1&navpanes=0" title="${escapeHtml(displayName || '')}"></iframe>`;
 }
 
-function _renderHtmlBody(absPath, displayName) {
-  _openViewerShell(displayName);
+function _renderHtmlBody(absPath, displayName, cid, projectId) {
+  if (!_openViewerShell(displayName, { kind: 'html', absPath, cid, projectId })) return;
   const url = _chatMediaLocalUrl(absPath);
   // sandbox: allow-scripts ONLY. chat-media:// is a distinct origin from
   // file://, so SOP blocks parent.* access; we additionally forbid
@@ -238,47 +298,88 @@ function _renderHtmlBody(absPath, displayName) {
   _viewerBody.innerHTML = `<iframe class="chat-file-viewer-html" sandbox="${sandbox}" src="${url}" title="${escapeHtml(displayName || '')}"></iframe>`;
 }
 
-function _renderVideoBody(absPath, displayName) {
-  _openViewerShell(displayName);
+function _renderVideoBody(absPath, displayName, cid, projectId) {
+  if (!_openViewerShell(displayName, { kind: 'video', absPath, cid, projectId })) return;
   const url = _chatMediaLocalUrl(absPath);
   _viewerBody.innerHTML = `<div class="chat-file-viewer-video-wrap"><video class="chat-file-viewer-video" controls preload="metadata" src="${url}"></video></div>`;
 }
 
-async function _renderMarkdownBody(absPath, displayName, cid) {
-  _openViewerShell(displayName);
+async function _renderMarkdownBody(absPath, displayName, cid, projectId) {
+  const seq = _openViewerShell(displayName, { kind: 'markdown', absPath, cid, projectId });
+  if (!seq) return;
   _viewerBody.innerHTML = `<div class="chat-file-viewer-loading">…</div>`;
-  const text = await _readTextFile(absPath, cid);
-  if (text === null) return; // _readTextFile already routed to the fallback dialog
-  // renderMarkdown is the single markdown surface; matches chat bubbles so
-  // generated reports look identical here and inline.
-  const md = (typeof renderMarkdown === 'function') ? renderMarkdown(text) : escapeHtml(text);
-  _viewerBody.innerHTML = `<div class="chat-file-viewer-md">${md}</div>`;
-  // Same async LaTeX typeset chat bubbles use. Skipped silently if math.js
-  // isn't loaded (e.g. tests).
-  if (typeof typesetMath === 'function') {
-    try { typesetMath(_viewerBody); } catch (_) { /* non-fatal */ }
+  const text = await _readTextFile(absPath, cid, projectId, seq);
+  if (text === null || seq !== _viewerRenderSeq || !_isViewerOpen()) return; // _readTextFile already routed to the fallback dialog
+  if (typeof mountMdViewEdit !== 'function') {
+    _viewerLog.warn('mountMdViewEdit missing; falling back to read-only markdown preview');
+    const md = (typeof renderMarkdown === 'function') ? renderMarkdown(text) : escapeHtml(text);
+    _viewerBody.innerHTML = `<div class="chat-file-viewer-md">${md}</div>`;
+    _typesetViewerMarkdown();
+    return;
   }
+  _viewerEditController = mountMdViewEdit({
+    bodyEl: _viewerBody,
+    actionsEl: _viewerMdActions,
+    source: { kind: 'workspace', absPath, cid: cid || undefined, projectId: projectId || undefined },
+    capabilities: projectId
+      ? { edit: false, save: false, delete: false, reveal: false, taskCheckbox: false }
+      : { reveal: false, delete: false },
+    initialMode: 'view',
+    initialContent: text,
+    actionIconOnly: true,
+    callbacks: {
+      onDirtyChange: (dirty) => { _viewerDirty = !!dirty; },
+      onSaved: () => _typesetViewerMarkdown(),
+    },
+  });
+  _typesetViewerMarkdown();
 }
 
-async function _renderTextBody(absPath, displayName, cid) {
-  _openViewerShell(displayName);
+async function _renderTextBody(absPath, displayName, cid, projectId) {
+  const seq = _openViewerShell(displayName, { kind: 'text', absPath, cid, projectId });
+  if (!seq) return;
   _viewerBody.innerHTML = `<div class="chat-file-viewer-loading">…</div>`;
-  const text = await _readTextFile(absPath, cid);
-  if (text === null) return;
-  _viewerBody.innerHTML = `<pre class="chat-file-viewer-text">${escapeHtml(text)}</pre>`;
+  // Pre-fetch via _readTextFile so the too_large / read-failure path falls
+  // back to the "open the folder?" dialog (same UX as the read-only path
+  // before). On success, hand the text to mountTextViewEdit; it owns the
+  // view ↔ edit transitions, save IPC, and dirty tracking from there.
+  const text = await _readTextFile(absPath, cid, projectId, seq);
+  if (text === null || seq !== _viewerRenderSeq || !_isViewerOpen()) return;
+  if (typeof mountTextViewEdit !== 'function') {
+    _viewerLog.warn('mountTextViewEdit missing; falling back to read-only text preview');
+    _viewerBody.innerHTML = `<pre class="chat-file-viewer-text">${escapeHtml(text)}</pre>`;
+    return;
+  }
+  _viewerEditController = mountTextViewEdit({
+    bodyEl: _viewerBody,
+    actionsEl: _viewerMdActions,
+    source: { absPath, cid: cid || undefined, projectId: projectId || undefined },
+    // Project files are read-only by design (the LLM owns project workspace
+    // mutations); workspace / per-conv attachments allow edit + save.
+    capabilities: projectId ? { edit: false, save: false } : { edit: true, save: true },
+    initialMode: 'view',
+    initialContent: text,
+    actionIconOnly: true,
+    callbacks: {
+      onDirtyChange: (dirty) => { _viewerDirty = !!dirty; },
+    },
+  });
 }
 
 // Fetch a file's text via IPC. Returns the text on success; on rejection
 // surfaces the fallback dialog (and returns null so the caller knows to
 // stop). Closes the overlay before showing the dialog so it doesn't stack
 // on top of a half-built viewer.
-async function _readTextFile(absPath, cid) {
+async function _readTextFile(absPath, cid, projectId, seq) {
   _viewerCurrentPath = absPath;
   _viewerCurrentCid = cid || null;
+  _viewerCurrentProjectId = projectId || null;
   try {
     const payload = { path: absPath };
     if (cid) payload.cid = cid;
+    if (projectId) payload.projectId = projectId;
     const res = await window.orkas.invoke('produced.readText', payload);
+    if (seq && seq !== _viewerRenderSeq) return null;
     if (res && res.ok) return String(res.text || '');
     // Specifically distinguish too_large so the user sees "file is X MB,
     // open in folder?" instead of a generic failure.
@@ -287,13 +388,13 @@ async function _readTextFile(absPath, cid) {
     if (err === 'too_large') {
       const sizeMb = ((res && res.size) || 0) / 1024 / 1024;
       const capMb = ((res && res.cap) || 2 * 1024 * 1024) / 1024 / 1024;
-      await _showUnsupportedDialog(absPath, cid, {
+      await _showUnsupportedDialog(absPath, cid, projectId, {
         messageKey: 'chat.preview_too_large_message',
         vars: { name: absPath.split(/[\\/]/).pop() || absPath, size: sizeMb.toFixed(1), cap: capMb.toFixed(0) },
         fallback: `File is ${sizeMb.toFixed(1)} MB (over the ${capMb.toFixed(0)} MB preview cap). Open the containing folder?`,
       });
     } else {
-      await _showUnsupportedDialog(absPath, cid, {
+      await _showUnsupportedDialog(absPath, cid, projectId, {
         messageKey: 'chat.preview_read_failed_message',
         vars: { name: absPath.split(/[\\/]/).pop() || absPath },
         fallback: 'Could not read this file. Open the containing folder?',
@@ -301,9 +402,10 @@ async function _readTextFile(absPath, cid) {
     }
     return null;
   } catch (e) {
+    if (seq && seq !== _viewerRenderSeq) return null;
     _viewerLog.warn('readText threw', { path: absPath, error: String(e && e.message || e) });
     closeChatFileViewer();
-    await _showUnsupportedDialog(absPath, cid, {
+    await _showUnsupportedDialog(absPath, cid, projectId, {
       messageKey: 'chat.preview_read_failed_message',
       vars: { name: absPath.split(/[\\/]/).pop() || absPath },
       fallback: 'Could not read this file. Open the containing folder?',
@@ -315,7 +417,7 @@ async function _readTextFile(absPath, cid) {
 // Fallback dialog: explain to the user that we can't preview this file
 // inline, and offer to open the folder it lives in. uiConfirm returns true
 // on the (relabeled) primary button.
-async function _showUnsupportedDialog(absPath, cid, opts) {
+async function _showUnsupportedDialog(absPath, cid, projectId, opts) {
   const name = absPath.split(/[\\/]/).pop() || absPath;
   const ext = _extOf(name) || _viewerLabel('chat.preview_unsupported_no_ext', '(no extension)');
   const message = opts && opts.messageKey
@@ -343,6 +445,7 @@ async function _showUnsupportedDialog(absPath, cid, opts) {
   try {
     const payload = { path: absPath };
     if (cid) payload.cid = cid;
+    if (projectId) payload.projectId = projectId;
     const res = await window.orkas.invoke('workspace.revealPath', payload);
     if (!res || !res.ok) _viewerLog.warn('fallback reveal failed', { path: absPath, error: res && res.error });
   } catch (err) {
@@ -355,10 +458,9 @@ async function _showUnsupportedDialog(absPath, cid, opts) {
 function openChatFileViewer(absPath, displayName, opts) {
   if (!absPath) return;
   const cid = (opts && opts.cid) || null;
+  const projectId = (opts && opts.projectId) || null;
   const name = displayName || (absPath.split(/[\\/]/).pop() || absPath);
   const kind = _kindOf(name);
-  _viewerCurrentPath = absPath;
-  _viewerCurrentCid = cid;
 
   if (kind === 'image') {
     // Delegate — the image lightbox already has zoom / pan / keyboard. We
@@ -369,13 +471,13 @@ function openChatFileViewer(absPath, displayName, opts) {
     }
     return;
   }
-  if (kind === 'pdf')      return _renderPdfBody(absPath, name);
-  if (kind === 'video')    return _renderVideoBody(absPath, name);
-  if (kind === 'html')     return _renderHtmlBody(absPath, name);
-  if (kind === 'markdown') return _renderMarkdownBody(absPath, name, cid);
-  if (kind === 'text')     return _renderTextBody(absPath, name, cid);
+  if (kind === 'pdf')      return _renderPdfBody(absPath, name, cid, projectId);
+  if (kind === 'video')    return _renderVideoBody(absPath, name, cid, projectId);
+  if (kind === 'html')     return _renderHtmlBody(absPath, name, cid, projectId);
+  if (kind === 'markdown') return _renderMarkdownBody(absPath, name, cid, projectId);
+  if (kind === 'text')     return _renderTextBody(absPath, name, cid, projectId);
   // unsupported — go straight to the dialog, never open the shell.
-  return _showUnsupportedDialog(absPath, cid, {});
+  return _showUnsupportedDialog(absPath, cid, projectId, {});
 }
 
 // CJS bridge for vitest — pure functions only, per PC/CLAUDE.md §9.

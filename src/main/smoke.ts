@@ -79,6 +79,7 @@ async function section(name: string, fn: () => void | Promise<void>): Promise<vo
       builtin_skills_dir: '/b/s', custom_skills_dir: '/c/s',
       agents_index: '- foo', plan_state: '',
       os: 'macOS', working_dir: '/tmp', local_exec_state: 'x',
+      project_files_block: '',
     });
     assert.ok(typeof rendered === 'string' && rendered.length > 0);
   });

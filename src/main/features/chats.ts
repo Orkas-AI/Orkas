@@ -28,6 +28,9 @@ import {
 } from '../storage';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
+import {
+  ZH_FILLER_RE, EN_FILLER_RE, CLAUSE_RE, TITLE_MAX,
+} from '../util/auto-title';
 
 const log = createLogger('chats');
 import * as search from './search';
@@ -115,7 +118,14 @@ export async function listConversations(userId: string): Promise<Conversation[]>
     let since: string | null = null;
     try {
       const s = await readState(userId, c.conversation_id);
-      const bus = await import('./group_chat/bus');
+      // CJS require (not dynamic import) so bus.ts resolves through the same
+      // module cache as the static-import chain. Node's dynamic `import()` is
+      // always ESM, which would load bus.ts as a SECOND module instance with
+      // its own _cids Map — splitting the bus state into two and silently
+      // losing every event that's emitted on the wrong half (see bus.ts comment
+      // at planExecutor.bindBusHooks for why ESM-vs-CJS duplication corrupts
+      // plan_executor's hooks).
+      const bus = require('./group_chat/bus') as typeof import('./group_chat/bus');
       const busBusy = !bus.isQuiescent(userId, c.conversation_id);
       processing = s.status === 'running' || busBusy;
       since = processing ? s.last_active_at : null;
@@ -277,8 +287,11 @@ export async function deleteConversation(userId: string, cid: string): Promise<b
   await saveConversations(userId, kept);
 
   // Purge group dir (members.json / state.json / plan.md / visibility/) + bus state.
+  // CJS require (same reason as listConversations above) — dynamic `import()`
+  // would load bus.ts as a second ESM module and dropConv would clear the
+  // wrong _cids.
   try {
-    const bus = await import('./group_chat/bus');
+    const bus = require('./group_chat/bus') as typeof import('./group_chat/bus');
     bus.dropConv(userId, cid);
     await purgeGroupDir(userId, cid);
   }
@@ -394,10 +407,7 @@ export async function deleteConversationsByAgent(agentId: string): Promise<numbe
 // doesn't match a shorter prefix when a longer one is also valid. Single-
 // character fillers (e.g. bare `请`) are intentionally NOT listed — too
 // likely to clip real content like `请教...`.
-const ZH_FILLER_RE = /^(帮我看一下|可不可以|帮我看下|帮我看看|麻烦你|帮我看|我想要|想问问|能不能|可以不|可以吗|请帮我|看一下|麻烦|帮我|我想|想问|请问|看下|看看)\s*/;
-const EN_FILLER_RE = /^(could you|would you|can you|help me|i'?d like to|i want to|please)\s+/i;
-const CLAUSE_RE = /[，。？！；;,.?!]/;
-const TITLE_MAX = 30;
+// Heuristic auto-title regex/constants — see top-of-file import.
 
 export function autoTitle(content: string): string {
   const raw = (content || '').trim().replace(/\s+/g, ' ');

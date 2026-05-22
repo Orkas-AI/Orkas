@@ -15,7 +15,7 @@
 //
 // API:
 //   mountMdViewEdit({ bodyEl, actionsEl, source, capabilities?, initialMode?,
-//                     initialContent?, initialDraft?, callbacks? })
+//                     initialContent?, initialDraft?, actionIconOnly?, callbacks? })
 //     → { destroy, refreshContent, getMode, setMode, isDirty,
 //         getDraft, setDraftAsContent, getSource }
 //
@@ -103,6 +103,7 @@ function mountMdViewEdit(opts) {
     callbacks,
     bodyEl,
     actionsEl,
+    actionIconOnly: opts.actionIconOnly === true,
     // Canonical content (from disk / source). Ephemeral seeds this with
     // initialText; the "is dirty" check compares draft vs. this.
     content: '',
@@ -288,6 +289,18 @@ function _mveRenderError(state, msg) {
   state.actionsEl.innerHTML = '';
 }
 
+function _mveActionButton(state, action, labelKey, iconName, extraClass) {
+  const label = t(labelKey);
+  const cls = `btn btn-sm${state.actionIconOnly ? ' btn-icon ctx-viewer-action-icon-btn' : ''}${extraClass ? ` ${extraClass}` : ''}`;
+  if (!state.actionIconOnly) {
+    return `<button class="${cls}" data-mve-action="${action}">${escapeHtml(label)}</button>`;
+  }
+  const icon = (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function')
+    ? window.uiIconHtml(iconName, 'ui-icon ctx-viewer-action-icon')
+    : escapeHtml(label);
+  return `<button type="button" class="${cls}" data-mve-action="${action}" aria-label="${escapeHtml(label)}" title="${escapeHtml(label)}">${icon}</button>`;
+}
+
 function _mveRenderView(state) {
   state.mode = 'view';
   const bodyEl = state.bodyEl;
@@ -297,9 +310,9 @@ function _mveRenderView(state) {
   if (state.caps.taskCheckbox) _mveBindTaskCheckboxes(state, bodyEl);
 
   const actions = [];
-  if (state.caps.edit)   actions.push(`<button class="btn btn-sm" data-mve-action="edit">${escapeHtml(t('contexts.viewer.edit'))}</button>`);
-  if (state.caps.reveal) actions.push(`<button class="btn btn-sm" data-mve-action="reveal">${escapeHtml(t('contexts.viewer.open_system'))}</button>`);
-  if (state.caps.delete) actions.push(`<button class="btn btn-sm btn-danger" data-mve-action="delete">${escapeHtml(t('contexts.viewer.delete'))}</button>`);
+  if (state.caps.edit)   actions.push(_mveActionButton(state, 'edit', 'contexts.viewer.edit', 'pencil'));
+  if (state.caps.reveal) actions.push(_mveActionButton(state, 'reveal', 'contexts.viewer.open_system', 'folder-open'));
+  if (state.caps.delete) actions.push(_mveActionButton(state, 'delete', 'contexts.viewer.delete', 'trash', 'btn-danger'));
   actionsEl.innerHTML = actions.join('');
 
   actionsEl.querySelector('[data-mve-action="edit"]')?.addEventListener('click', () => _mveEnterEdit(state));
@@ -350,11 +363,11 @@ function _mveRenderEditor(state) {
   // Actions: save/cancel for persisted sources; copy/sendToChat for ephemeral.
   const actions = [];
   if (state.caps.save) {
-    actions.push(`<button class="btn btn-sm btn-primary" data-mve-action="save">${escapeHtml(t('contexts.viewer.save'))}</button>`);
-    actions.push(`<button class="btn btn-sm" data-mve-action="cancel">${escapeHtml(t('contexts.viewer.cancel'))}</button>`);
+    actions.push(_mveActionButton(state, 'save', 'contexts.viewer.save', 'check', 'btn-primary'));
+    actions.push(_mveActionButton(state, 'cancel', 'contexts.viewer.cancel', 'x'));
   } else if (state.source.kind === 'ephemeral') {
-    actions.push(`<button class="btn btn-sm" data-mve-action="copy-draft">${escapeHtml(t('chat.md_drawer.copy_draft'))}</button>`);
-    actions.push(`<button class="btn btn-sm btn-primary" data-mve-action="send-to-chat">${escapeHtml(t('chat.md_drawer.send_to_chat'))}</button>`);
+    actions.push(_mveActionButton(state, 'copy-draft', 'chat.md_drawer.copy_draft', 'clipboard-list'));
+    actions.push(_mveActionButton(state, 'send-to-chat', 'chat.md_drawer.send_to_chat', 'send', 'btn-primary'));
   }
   actionsEl.innerHTML = actions.join('');
 

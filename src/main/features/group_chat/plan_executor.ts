@@ -23,12 +23,9 @@
 
 import { Mutex } from 'async-mutex';
 import * as crypto from 'node:crypto';
-import * as path from 'node:path';
 
 import { createLogger } from '../../logger';
 import { t } from '../../i18n';
-import { userChatsDir } from '../../paths';
-import { readJsonl } from '../../storage';
 import { isTransientError } from '../../util/transient-errors';
 import { COMMANDER_ID, USER_ID, readMembers } from './state';
 import {
@@ -590,13 +587,23 @@ export async function retryStep(
     if (!step) return { ok: false, error: 'step not found' };
     if (step.status !== 'failed') {
       // The UI can issue a duplicate retry from stale DOM while the first
-      // retry has already re-armed the step. Treat those post-retry states as
-      // success so users do not see a false failure after recovery started.
+      // retry has already re-armed the step (failed -> pending -> dispatch
+      // -> in_progress / blocked-on-deps). Treat those mid-recovery states
+      // as success so users do not see a false failure after recovery
+      // started.
+      //
+      // `done` is intentionally NOT in this set: by the time a step
+      // reaches `done`, the rail has already re-rendered with a hidden
+      // retry button (`_isStepActionable` in plan-rail.js returns
+      // `failed`-only), so there is no DOM path that produces a retry
+      // click on a done step. Accepting it here would also fire a retry
+      // expert-signal with the completed turn's output_msg_id, attributing
+      // user dissatisfaction to a successful execution — see PC/CLAUDE.md
+      // §10 expert-signals turn_id convention.
       if (
         step.status === 'pending'
         || step.status === 'in_progress'
         || step.status === 'blocked'
-        || step.status === 'done'
       ) {
         log.info(`plan-step retry-noop cid=${cid} step=${stepIndex} current=${step.status}`);
         return { ok: true };
@@ -607,6 +614,7 @@ export async function retryStep(
       failure_reason: '',
       output_msg_id: '',
       transient_attempts: 0,
+      pending_form_id: '',
     });
     // Unblock cascade-skipped downstream: when step N failed under
     // `abort_plan` policy, applyTermination marked all not-yet-terminal
@@ -722,30 +730,21 @@ async function maybeMarkFinished(uid: string, cid: string, plan: PlanFile, ctx: 
 }
 
 async function acceptsUserStepCompletion(
-  uid: string,
+  _uid: string,
   cid: string,
   step: PlanStep,
   ctx: ReconcileCtx,
 ): Promise<boolean> {
-  const file = path.join(userChatsDir(uid), `${cid}.jsonl`);
-  const messages = await readJsonl<GroupMessage>(file, 100_000);
-  const userForms = messages.filter((m) => m.form?.agent_id === USER_ID);
-  const stepForms = userForms.filter((m) => m.form?.plan_step_index === step.index);
-  const candidates = stepForms.length ? stepForms : userForms;
-  const relevant = candidates.length ? candidates[candidates.length - 1] : undefined;
-  // Legacy conversations created before user-owned forms existed still need
-  // plain-text replies to complete user steps.
-  if (!relevant?.form) return true;
+  // Legacy conversations + plans authored before the stamp existed have no
+  // `pending_form_id`. Accept any user reply for those (the original
+  // behaviour before user-owned forms were introduced).
+  const expectedFormId = step.pending_form_id;
+  if (!expectedFormId) return true;
 
   const text = ctx.finishedMessage?.text || '';
   const submission = decodeSubmission(text);
-  const expectedFormId = relevant.form.form_id;
   if (!submission || submission.agent_id !== USER_ID || submission.form_id !== expectedFormId) {
     log.info(`plan-user-step ignored non-matching user message cid=${cid} step=${step.index} expected_form=${expectedFormId}`);
-    return false;
-  }
-  if (relevant.form.submitted !== true) {
-    log.info(`plan-user-step ignored unmarked submission cid=${cid} step=${step.index} form=${expectedFormId}`);
     return false;
   }
   return true;
@@ -901,6 +900,14 @@ async function dispatchStep(
     // Step asks user for input. Commander voice; render goes to user with
     // a user-owned form so the reply can route back to the plan machinery
     // without waking commander as an extra side conversation.
+    //
+    // Stamp `pending_form_id` on the step BEFORE enqueueing so the user's
+    // reply can be matched in O(1) inside the reconcile mutex (see
+    // `acceptsUserStepCompletion`) — without this, that gate would have to
+    // scan the whole <cid>.jsonl to recover the mapping, with the linear
+    // scan happening inside `_planLock`.
+    const form = buildUserStepForm(step);
+    await updateStep(uid, cid, step.index, 'in_progress', { pending_form_id: form.form_id });
     await _hooks.enqueue({
       uid, cid,
       fromActorId: COMMANDER_ID,
@@ -908,7 +915,7 @@ async function dispatchStep(
       forceTo: [USER_ID],
       triggered_step: step.index,
       ...(inheritedAttachments && inheritedAttachments.length ? { attachments: inheritedAttachments } : {}),
-      form: buildUserStepForm(step),
+      form,
     });
     return;
   }

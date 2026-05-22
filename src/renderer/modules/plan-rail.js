@@ -135,8 +135,8 @@ async function _finishStepAction(cid, stepIndex, opts = {}) {
 }
 
 function _refreshConversationInfo(cid) {
-  if (window.ConversationInfo && typeof window.ConversationInfo.refresh === 'function') {
-    window.ConversationInfo.refresh(cid, { silent: true });
+  if (window.ConversationInfo && typeof window.ConversationInfo.refreshTasks === 'function') {
+    window.ConversationInfo.refreshTasks(cid, { silent: true });
   }
 }
 
@@ -222,6 +222,20 @@ function _buildProgressText(plan) {
   return `${done}/${plan.steps.length}`;
 }
 
+function _isPlanFullyComplete(plan) {
+  const steps = plan && Array.isArray(plan.steps) ? plan.steps : [];
+  if (!steps.length) return false;
+  if (Array.isArray(_currentInFlight) && _currentInFlight.length > 0) return false;
+  return steps.every((s) => s && (s.status === 'done' || s.status === 'skipped'));
+}
+
+function _hideRail(root, body, progress, wrap) {
+  root.style.display = 'none';
+  body.innerHTML = '';
+  progress.textContent = '';
+  if (wrap) wrap.classList.remove('has-plan-rail');
+}
+
 function _render(plan) {
   const root = document.getElementById('plan-rail');
   const body = document.getElementById('plan-rail-body');
@@ -235,10 +249,13 @@ function _render(plan) {
   const wrap = root.closest('.chat-input-wrapper');
   if (!plan || !Array.isArray(plan.steps) || plan.steps.length === 0) {
     _lastPlan = null;
-    root.style.display = 'none';
-    body.innerHTML = '';
-    progress.textContent = '';
-    if (wrap) wrap.classList.remove('has-plan-rail');
+    _hideRail(root, body, progress, wrap);
+    return;
+  }
+  if (_isPlanFullyComplete(plan)) {
+    _lastPlan = plan;
+    _clearStepActionRequests(_currentCid);
+    _hideRail(root, body, progress, wrap);
     return;
   }
   _lastPlan = plan;

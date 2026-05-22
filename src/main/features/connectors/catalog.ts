@@ -74,18 +74,15 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     },
   },
   // Google Workspace entries (`google-workspace` bundle + 5 service members) live in
-  // `catalog-google.ts` and are loaded via `_loadGoogleEntries` below — that file is
-  // **stripped from the OrkasOpen build** because Google's production OAuth verification +
-  // CASA assessment can't be satisfied for an OSS distribution (see
-  // `OpenSource/SyncCode/strip-rules.json` `forbidden_files`). PC ships them; OrkasOpen
-  // silently omits them (require throws → empty array).
+  // `catalog-google.ts` and are loaded via `_loadGoogleEntries` below. PC and OrkasOpen both
+  // ship them; the try/require keeps older OrkasOpen checkouts that lack the file from crashing.
   ..._loadGoogleEntries(),
 ];
 
 function _loadGoogleEntries(): CatalogEntry[] {
   try {
-    // `require` (not `import`) so the path isn't statically resolved at bundle time. In the
-    // OrkasOpen build the file is absent and the require throws — we swallow + return [].
+    // `require` (not `import`) so the path isn't statically resolved at bundle time. Older
+    // OrkasOpen builds may lack this file; swallow and return [] for that compatibility case.
     // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
     const mod = require('./catalog-google') as { GOOGLE_ENTRIES?: CatalogEntry[] };
     return Array.isArray(mod.GOOGLE_ENTRIES) ? mod.GOOGLE_ENTRIES : [];

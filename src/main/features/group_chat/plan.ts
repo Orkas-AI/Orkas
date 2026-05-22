@@ -76,6 +76,17 @@ export interface PlanStep {
    * Reset to 0 on user-initiated retry / step success. */
   transient_attempts?: number;
 
+  /** For `assignee === 'user'` steps only: the random `form_id` the
+   * executor stamped at dispatch time. Used by
+   * `plan_executor.ts::acceptsUserStepCompletion` to verify that the
+   * user's `<agent-input-submission>` text references the form we
+   * actually dispatched — O(1) lookup instead of reconstructing the
+   * mapping by scanning the conversation jsonl. Cleared on retryStep
+   * so a re-armed step gets a fresh form_id on the next dispatch.
+   * Absent on legacy plans authored before this field existed; in that
+   * case the gate falls back to "accept any user reply". */
+  pending_form_id?: string;
+
   /** Legacy free-form notes (kept for tools that still use it). */
   notes?: string;
 }
@@ -150,6 +161,8 @@ function normalizeStep(raw: any, i: number): PlanStep {
     ...(typeof raw?.failure_reason === 'string' ? { failure_reason: raw.failure_reason } : {}),
     ...(Number.isFinite(Number(raw?.transient_attempts)) && Number(raw.transient_attempts) > 0
       ? { transient_attempts: Number(raw.transient_attempts) } : {}),
+    ...(typeof raw?.pending_form_id === 'string' && raw.pending_form_id
+      ? { pending_form_id: String(raw.pending_form_id) } : {}),
     ...(typeof raw?.notes === 'string' && raw.notes.trim() ? { notes: String(raw.notes) } : {}),
   };
 }
@@ -234,7 +247,7 @@ export async function setPlan(
 
 export async function updateStep(
   uid: string, cid: string, stepIndex: number, status: StepStatus,
-  patch?: { notes?: string; output_summary?: string; output_files?: string[]; output_msg_id?: string; failure_reason?: string; transient_attempts?: number },
+  patch?: { notes?: string; output_summary?: string; output_files?: string[]; output_msg_id?: string; failure_reason?: string; transient_attempts?: number; pending_form_id?: string },
 ): Promise<PlanFile | null> {
   const cur = await readPlan(uid, cid);
   if (!cur) return null;
@@ -255,6 +268,10 @@ export async function updateStep(
   if (patch?.transient_attempts !== undefined) {
     if (patch.transient_attempts > 0) cur.steps[idx].transient_attempts = patch.transient_attempts;
     else delete cur.steps[idx].transient_attempts;
+  }
+  if (patch?.pending_form_id !== undefined) {
+    if (patch.pending_form_id) cur.steps[idx].pending_form_id = patch.pending_form_id;
+    else delete cur.steps[idx].pending_form_id;
   }
   await writePlanRaw(uid, cid, cur);
   log.info(`plan-update user=${uid} cid=${cid} step=${stepIndex} status=${status}`);

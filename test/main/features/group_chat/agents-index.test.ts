@@ -75,7 +75,7 @@ describe('agents_index block — header + per-entry shape', () => {
     const text = await buildBlock(TEST_UID);
     expect(text).toContain('`read_file(<ROOT>/<id>/agent.json)`');
     expect(text).toContain(`- custom:  ${path.resolve(customAgentsDir())}`);
-    expect(text).toContain(`- builtin: ${path.resolve(builtinAgentsDir())}`);
+    expect(text).toContain(`- marketplace: ${path.resolve(builtinAgentsDir())}`);
     expect(text).toContain('Use these ROOT values verbatim');
     expect(text).toContain('@<name>');
   });

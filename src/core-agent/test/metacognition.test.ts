@@ -3,7 +3,7 @@ import {
   detectUserCorrection,
   emptyRunMetrics,
   shouldReflect,
-  buildAdaptiveReviewPrompt,
+  buildReviewPrompt,
 } from '../src/evolution/metacognition.js';
 import type { RunMetrics, MetacognitionConfig } from '../src/evolution/types.js';
 
@@ -287,91 +287,83 @@ describe('shouldReflect', () => {
   });
 });
 
-// ── buildAdaptiveReviewPrompt ───────────────────────────────────────────
+// ── buildReviewPrompt ───────────────────────────────────────────────────
 
-describe('buildAdaptiveReviewPrompt', () => {
-  it('builds error_recovery focused prompt', () => {
-    const prompt = buildAdaptiveReviewPrompt('error_recovery', '', '');
-    expect(prompt).toContain('recovered from an error');
-    expect(prompt).toContain('skill_manage');
-    expect(prompt).toContain('metacognition');
+describe('buildReviewPrompt', () => {
+  it('renders the transcript section with content when provided', () => {
+    const transcript = '## Activity since 2026-05-19 14:00\n\n### c001\n[14:23 user]\nq';
+    const prompt = buildReviewPrompt('', '', transcript);
+    expect(prompt).toContain('Activity transcript');
+    expect(prompt).toContain('14:23 user');
   });
 
-  it('builds user_correction focused prompt', () => {
-    const prompt = buildAdaptiveReviewPrompt('user_correction', '', '');
-    expect(prompt).toContain('corrected your approach');
-    expect(prompt).toContain('COMPETENCE');
-  });
-
-  it('builds skill_ineffective focused prompt', () => {
-    const prompt = buildAdaptiveReviewPrompt('skill_ineffective', '', '');
-    expect(prompt).toContain('did not help');
-    expect(prompt).toContain('Patch or delete');
-  });
-
-  it('builds known_weakness focused prompt', () => {
-    const prompt = buildAdaptiveReviewPrompt('known_weakness', '', '');
-    expect(prompt).toContain('known weaknesses');
-    expect(prompt).toContain('Strengthen');
-  });
-
-  it('builds complexity default prompt', () => {
-    const prompt = buildAdaptiveReviewPrompt('complexity', '', '');
-    expect(prompt).toContain('complex task');
+  it('shows placeholder when transcript is empty', () => {
+    const prompt = buildReviewPrompt('', '', '');
+    expect(prompt).toContain('No new activity in the window');
   });
 
   it('includes competence content', () => {
-    const prompt = buildAdaptiveReviewPrompt('complexity', 'I am strong at Python', '');
+    const prompt = buildReviewPrompt('I am strong at Python', '', '');
     expect(prompt).toContain('I am strong at Python');
     expect(prompt).not.toContain('No self-assessment yet');
   });
 
   it('shows placeholder when no competence', () => {
-    const prompt = buildAdaptiveReviewPrompt('complexity', '', '');
+    const prompt = buildReviewPrompt('', '', '');
     expect(prompt).toContain('No self-assessment yet');
   });
 
   it('includes strategies content', () => {
-    const prompt = buildAdaptiveReviewPrompt('complexity', '', 'Error extraction pattern');
+    const prompt = buildReviewPrompt('', 'Error extraction pattern', '');
     expect(prompt).toContain('Error extraction pattern');
     expect(prompt).not.toContain('No strategy log yet');
   });
 
-  it('includes skill health report when provided', () => {
-    const report = '- docker-debug: effectiveness 0.83, healthy';
-    const prompt = buildAdaptiveReviewPrompt('complexity', '', '', report);
-    expect(prompt).toContain('Skill health report');
-    expect(prompt).toContain('docker-debug');
-  });
-
-  it('omits skill health section when not provided', () => {
-    const prompt = buildAdaptiveReviewPrompt('complexity', '', '');
-    expect(prompt).not.toContain('Skill health report');
-  });
-
-  it('includes conversation digest when provided', () => {
-    const digest = 'Tools used: bash, read_file\nSkills loaded: docker-debug\n--- final reply ---\nFixed Docker container that failed to start';
-    const prompt = buildAdaptiveReviewPrompt('error_recovery', '', '', undefined, digest);
-    expect(prompt).toContain('docker-debug');
-    expect(prompt).toContain('Docker container');
-    expect(prompt).toContain('final reply');
-  });
-
-  it('omits conversation digest content when not provided', () => {
-    const prompt = buildAdaptiveReviewPrompt('complexity', '', '');
-    expect(prompt).not.toContain('final reply');
-  });
-
-  it('builds weakness_succeeded focused prompt', () => {
-    const prompt = buildAdaptiveReviewPrompt('weakness_succeeded', '', '');
-    expect(prompt).toContain('performed normally');
-    expect(prompt).toContain('remove or downgrade');
-    expect(prompt).toContain('Do not modify or delete the related skills');
-  });
-
-  it('includes transient error guidance in all prompts', () => {
-    const prompt = buildAdaptiveReviewPrompt('complexity', '', '');
+  it('always includes transient-error guidance (preserved invariant)', () => {
+    const prompt = buildReviewPrompt('', '', '');
     expect(prompt).toContain('transient errors');
     expect(prompt).toContain('Do not mark them as weaknesses in COMPETENCE.md');
+  });
+
+  it('always offers the four post-reflection actions', () => {
+    const prompt = buildReviewPrompt('', '', '');
+    expect(prompt).toContain('skill_manage tool');
+    expect(prompt).toContain('metacognition tool');
+    expect(prompt).toMatch(/nothing to save/i);
+  });
+
+  it('directs LLM to look for user preferences + domain constraints', () => {
+    const prompt = buildReviewPrompt('', '', '');
+    // Plan §2.3: prompt should nudge LLM to extract red lines / edits / etc.
+    expect(prompt).toMatch(/user preferences|domain constraints|red lines/i);
+  });
+
+  it('directs LLM to write imperatives, not descriptions', () => {
+    // Plan §9.x: prose injection of COMPETENCE/STRATEGIES is too soft unless
+    // entries are written as actionable rules with trigger conditions.
+    const prompt = buildReviewPrompt('', '', '');
+    expect(prompt).toContain('Writing style');
+    // The NEVER / ALWAYS / WHEN-THEN formula is the load-bearing instruction.
+    expect(prompt).toMatch(/NEVER\s*\/\s*ALWAYS\s*\/\s*WHEN-THEN/);
+    // Concrete bad/good pair is the second load-bearing piece.
+    expect(prompt).toMatch(/✗.*✓/s);
+  });
+
+  it('overrides skill_manage tool\'s "confirm with user" default for reflection', () => {
+    // skill_manage tool description says "Confirm with user before creating
+    // or deleting" — written for live turns. Without an explicit override
+    // here, reflection LLM gets inhibited and never creates skills. See
+    // reflection-redesign plan: skill-creation soft pitfall 1.
+    const prompt = buildReviewPrompt('', '', '');
+    expect(prompt).toMatch(/no user confirmation needed|does NOT need user confirmation/i);
+  });
+
+  it('extends Writing style guidance to the skill description field', () => {
+    // The description field is the ONLY thing the next-turn agent sees
+    // before deciding to load a skill — vague descriptions make the skill
+    // effectively dead. Soft pitfall 2 in reflection-redesign plan.
+    const prompt = buildReviewPrompt('', '', '');
+    expect(prompt).toMatch(/description.*field|`description`/i);
+    expect(prompt).toMatch(/WHEN to use/i);
   });
 });

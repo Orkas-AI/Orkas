@@ -216,11 +216,12 @@ export const userProjectsDir       = (uid: string) => path.join(userCloudRoot(ui
 export const projectDir            = (uid: string, pid: string) => path.join(userProjectsDir(uid), pid);
 export const projectMetaFile       = (uid: string, pid: string) => path.join(projectDir(uid, pid), 'project.json');
 export const projectBindingsFile   = (uid: string, pid: string) => path.join(projectDir(uid, pid), 'bindings.json');
+export const projectFilesDir        = (uid: string, pid: string) => path.join(projectDir(uid, pid), 'files');
 export const agentDir            = (uid: string, agentId: string) => path.join(userAgentsDir(uid), agentId || '_default');
 export const agentDefinitionFile = (uid: string, agentId: string) => path.join(agentDir(uid, agentId), 'agent.json');
 
 // Agent metacognition (per-agent self-assessment + learning strategies).
-// Writes go through features/metacognition.ts; reflection-trigger fires
+// Writes go through features/metacognition.ts; reflection-orchestrator fires
 // automatically and the `metacognition` tool lets the agent maintain it
 // itself.
 export const agentMetaDir        = (uid: string, agentId: string) => path.join(agentDir(uid, agentId), 'meta');

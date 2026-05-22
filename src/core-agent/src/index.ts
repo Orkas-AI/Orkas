@@ -66,7 +66,7 @@ export {
 // Evolution (self-improvement)
 export { SkillStore, createSkillManageTool } from "./evolution/index.js";
 export type { Skill, SkillSummary, SkillFrontmatter } from "./evolution/index.js";
-export { detectUserCorrection, emptyRunMetrics, shouldReflect, buildAdaptiveReviewPrompt } from "./evolution/index.js";
+export { detectUserCorrection, emptyRunMetrics, shouldReflect, buildReviewPrompt } from "./evolution/index.js";
 export type { MetacognitionConfig, RunMetrics, TriggerSignal, MetacognitiveReflection } from "./evolution/index.js";
 
 // CLI

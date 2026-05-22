@@ -1,6 +1,7 @@
 {
   "name": "orkas",
   "version": "2026.4.30",
+  "version": "2026.5.21",
   "private": true,
   "license": "MIT",
   "description": "Orkas desktop — Electron + Node one-piece app",
@@ -19,6 +20,7 @@
     "rebuild:sqlite:electron": "node scripts/swap-sqlite-abi.mjs electron",
     "rebuild:sqlite:node": "node scripts/swap-sqlite-abi.mjs node",
     "postinstall": "node scripts/swap-sqlite-abi.mjs electron && node scripts/fetch-embedding-model.mjs",
+    "prepare": "node scripts/install-git-hooks.mjs",
     "prepack": "node scripts/swap-sqlite-abi.mjs electron",
     "predist": "node scripts/swap-sqlite-abi.mjs electron",
     "pack": "electron-builder --dir",
@@ -48,7 +50,6 @@
     "fastembed": "^2.1.0",
     "jimp": "^1.6.1",
     "mammoth": "^1.12.0",
-    "onnxruntime-node": "^1.24.3",
     "pdfjs-dist": "^5.6.205",
     "sqlite-vec": "^0.1.9",
     "tsx": "^4.21.0",
@@ -102,7 +103,6 @@
       "node_modules/bindings/**/*",
       "node_modules/file-uri-to-path/**/*",
       "node_modules/sqlite-vec*/**/*",
-      "node_modules/onnxruntime-node/**/*",
       "node_modules/fastembed/**/*"
     ],
     "extraResources": [
@@ -135,6 +135,9 @@
         }
       ],
       "icon": "src/resources/icons/icon.icns"
+    },
+    "dmg": {
+      "writeUpdateInfo": false
     },
     "win": {
       "target": "nsis",
