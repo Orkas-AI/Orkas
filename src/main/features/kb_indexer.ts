@@ -298,7 +298,7 @@ async function extractChunks(uid: string, relPath: string, buf: Buffer, kind: kb
 // burns tokens + tempts the model to mis-call them.
 async function describeImage(userId: string, sourceName: string, raw: Buffer): Promise<string> {
   const compressed = await toCompressedGrayJpeg(raw, { maxDim: 1024, quality: 70, grayscale: true });
-  const sessionId = `${userId}-extract-img-${crypto.randomBytes(4).toString('hex')}`;
+  const sessionId = `extract-img-${crypto.randomBytes(4).toString('hex')}`;
   const message = prompts.load('contexts_extract_image', { source_name: sourceName });
   const r = await chatWithModel({
     userId,

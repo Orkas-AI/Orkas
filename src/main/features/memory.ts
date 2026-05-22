@@ -274,7 +274,7 @@ export async function extractAndSaveCompactFacts(
   const result = await chatWithModel({
     userId,
     message: extractPrompt,
-    sessionId: `${userId}-memory-extract-${Date.now()}`,
+    sessionId: `memory-extract-${Date.now()}`,
     systemPrompt: 'You are a fact extraction assistant. Follow the instructions strictly and do not add any extra content.',
   });
 

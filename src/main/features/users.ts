@@ -191,6 +191,57 @@ export function activateUser(uid: string): void {
 }
 
 /**
+ * DEV CONVENIENCE — align the active local data uid with the account's server-side user_id, so a
+ * dev tester logging into a different account doesn't end up with a mismatched local data dir:
+ *   - `data/<serverUid>/` already exists → switch the active uid to it (the old dir is left alone).
+ *   - else, `data/<currentUid>/` exists  → rename it to `data/<serverUid>/`, drop the stale registry
+ *                                          entry, and re-activate.
+ *   - else                               → just (re-)activate `<serverUid>`.
+ *
+ * **Callers MUST gate this on `!app.isPackaged`** — it is a dev-only behavior; it must not run in
+ * packaged builds. Returns true if it changed the active uid.
+ */
+export function reconcileDevUid(serverUid: string): boolean {
+  const target = String(serverUid || '').trim();
+  if (!target || !safeId(target)) {
+    log.warn(`reconcileDevUid: server uid not usable as a local uid, skipping: ${JSON.stringify(serverUid)}`);
+    return false;
+  }
+  // Server's `gen_uuid()` was changed to emit dashless 32-hex going forward (Server/utils/util.py),
+  // so the value here is already in the canonical local form — no client-side normalization
+  // needed. Accounts created before that change still carry the older `XXXXXXXX-XXXX-XXXX-…`
+  // shape on disk; safeId() accepts both, the equality check below is a literal compare, and
+  // path segments don't care about format.
+  const current = getActiveUserId();
+  if (target === current) return false;
+
+  const targetExists = fs.existsSync(userRoot(target));
+  const currentExists = fs.existsSync(userRoot(current));
+  try {
+    if (!targetExists && currentExists) {
+      fs.renameSync(userRoot(current), userRoot(target));
+      // Drop the stale `current` entry; activateUser() below adds `target` + flips current_user_id.
+      const reg = readRegistry();
+      if (reg) {
+        reg.users = reg.users.filter((u) => u.user_id !== current);
+        if (reg.current_user_id === current) reg.current_user_id = target;
+        writeRegistry(reg);
+      }
+      log.info(`reconcileDevUid: renamed local data dir ${current} -> ${target}`);
+    } else if (targetExists) {
+      log.info(`reconcileDevUid: switching active uid ${current} -> ${target} (target data dir already present)`);
+    } else {
+      log.info(`reconcileDevUid: no data dir to move; activating fresh ${target}`);
+    }
+    activateUser(target);
+    return true;
+  } catch (err) {
+    log.error(`reconcileDevUid ${current} -> ${target} failed: ${(err as Error).message}`);
+    return false;
+  }
+}
+
+/**
  * Boot-time entrypoint — read users.json and activate current_user_id; if
  * none, generate a new uid and activate that. Returns the record.
  */

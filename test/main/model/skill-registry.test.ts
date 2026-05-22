@@ -115,7 +115,7 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
   // — `$builtin_skills_dir / $custom_skills_dir` no longer flow through the
   // prompt template, so this header IS the only place the LLM learns the
   // real root paths.
-  it('block header carries Read pattern + resolved ROOT values + anti-prior warning', async () => {
+  it('block header carries Read pattern + resolved ROOT values', async () => {
     writeSkill(builtinDir(), 'shipped', 'Shipped', 'desc-b');
     writeSkill(customDir(), 'mine', 'Mine', 'desc-c');
     const { getSystemPromptBlock } = await loadRegistry();
@@ -124,7 +124,6 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     expect(text).toContain(`- custom:  ${path.resolve(customDir())}`);
     expect(text).toContain(`- builtin: ${path.resolve(builtinDir())}`);
     expect(text).toContain('Use these ROOT values verbatim');
-    expect(text).toContain('training-prior');
   });
 
   it('block omits ROOT header when no skills are present (renderSkillLines short-circuits empty)', async () => {

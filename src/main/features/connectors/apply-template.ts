@@ -8,9 +8,48 @@
  * Validation lives here because catalog entries don't know whether a token is still valid;
  * throw on missing pieces, the caller surfaces the error.
  */
+import { app } from 'electron';
+
+import * as paths from '../../paths';
 import type { CatalogEntry, OAuthGrant, Transport } from './types';
 
 type EnvSynth = (access_token: string) => Record<string, string>;
+
+// Cache the Electron-as-Node values once per process — `process.execPath` and PC_ROOT are
+// immutable at runtime. Lazy because `app` is undefined in vitest paths that pull this module
+// without an Electron context.
+let _electronAsNode: { node: string; pcDir: string } | null = null;
+function _electronAsNodeVars(): { node: string; pcDir: string } {
+  if (_electronAsNode) return _electronAsNode;
+  const isPackaged = !!app && app.isPackaged;
+  // Packaged builds: rewrite `app.asar` → `app.asar.unpacked` so the spawned child can read the
+  // adapter script as a real file on disk (asar contents aren't visible to a child process that
+  // doesn't have the asar mount logic). Mirrors `client.ts::buildSkillSandboxEnv`.
+  const pcDir = isPackaged
+    ? paths.PC_ROOT.replace(/\bapp\.asar\b/, 'app.asar.unpacked')
+    : paths.PC_ROOT;
+  _electronAsNode = { node: process.execPath, pcDir };
+  return _electronAsNode;
+}
+
+/** Resolve `${ORKAS_NODE}` / `${ORKAS_PC_DIR}` placeholders inside a stdio template's
+ *  command / args. Lets connector catalog entries reference our adapter scripts by symbolic
+ *  path without hard-coding absolute paths at catalog-author time. Unknown placeholders throw
+ *  to surface typos at install — silent passthrough would let `${ORKS_NODE}` slip through and
+ *  spawn a literal-named binary that doesn't exist. */
+function _resolvePlaceholders(s: string): string {
+  const vars = _electronAsNodeVars();
+  return s.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/g, (_m, key) => {
+    if (key === 'ORKAS_NODE') return vars.node;
+    if (key === 'ORKAS_PC_DIR') return vars.pcDir;
+    throw new Error(`unknown placeholder \${${key}} in transport template`);
+  });
+}
+
+function _hasElectronAsNodePlaceholder(tpl: { command: string; args: string[] }): boolean {
+  if (/\$\{ORKAS_NODE\}/.test(tpl.command)) return true;
+  return tpl.args.some((a) => /\$\{ORKAS_NODE\}/.test(a) || /\$\{ORKAS_PC_DIR\}/.test(a));
+}
 
 const _SYNTHESIZERS: Record<string, EnvSynth> = {
   // Notion OAuth: the official @notionhq/notion-mcp-server reads `OPENAPI_MCP_HEADERS`, a JSON
@@ -44,10 +83,20 @@ export function applyTemplate(entry: CatalogEntry, grant: OAuthGrant): Transport
     } else {
       throw new Error('OAuth stdio template needs either oauth_env_key or env_synthesizer');
     }
+    // Electron-as-Node injection: templates pointing at our own bundled adapter scripts (e.g.
+    // `${ORKAS_NODE}` + `${ORKAS_PC_DIR}/bin/gmail-mcp-server.cjs`) need `ELECTRON_RUN_AS_NODE=1`
+    // in the child env so Electron boots as plain Node. Same pattern as `client.ts::
+    // buildSkillSandboxEnv`. We only inject these when the template actually uses a
+    // placeholder — third-party stdio servers like the legacy `npx @modelcontextprotocol/server-X`
+    // pattern stay env-clean.
+    if (_hasElectronAsNodePlaceholder(tpl)) {
+      const vars = _electronAsNodeVars();
+      env = { ...env, ELECTRON_RUN_AS_NODE: '1', ORKAS_NODE: vars.node, ORKAS_PC_DIR: vars.pcDir };
+    }
     return {
       kind: 'stdio',
-      command: tpl.command,
-      args: [...tpl.args],
+      command: _resolvePlaceholders(tpl.command),
+      args: tpl.args.map((a) => _resolvePlaceholders(a)),
       env,
     };
   }

@@ -24,6 +24,7 @@
  */
 import * as manager from './manager';
 import * as agents from '../agents';
+import { isConnectorEnabled } from '../component_enabled';
 import type { ConnectorInstance, ToolSchema } from './types';
 
 /** Convert MCP `callTool`'s raw result into a single string the LLM can read.
@@ -57,7 +58,20 @@ export async function resolveVisibleConnectors(
   if (!uid) return [];
   const all = manager.listInstances(uid);
   if (!all.length) return [];
-  const scope = await _enabledInstancesForActor(uid, agentId, all);
+  // Live-state filter: only currently-connected instances surface to the LLM. A `connecting` /
+  // `disconnected` / `error` instance is unreachable in this turn — `manager.callTool` would
+  // throw anyway, and showing it (with a "— disconnected (ask user to refresh)" suffix) is
+  // noise that pollutes both the prompt block and the meta-tool routing matrix. The user can
+  // reconnect in the Connectors panel; the instance reappears on the next turn.
+  const connected = all.filter((i) => i.status.kind === 'connected');
+  if (!connected.length) return [];
+  // Per-user soft-disable filter (Connectors panel "停用" button). Separate from `agent.enabled_connectors`:
+  // this filter applies to every actor including the commander; even a disconnected-by-user instance
+  // that's still OAuth-grant-valid and MCP-connected stays hidden from the LLM until re-enabled.
+  // See features/component_enabled.ts + CLAUDE.md §6.5 "Per-user enable toggle".
+  const userEnabled = connected.filter((i) => isConnectorEnabled(uid, i.id));
+  if (!userEnabled.length) return [];
+  const scope = await _enabledInstancesForActor(uid, agentId, userEnabled);
   return scope.map((instance) => {
     const allowed = instance.enabled_subtools;
     const tools = allowed === null

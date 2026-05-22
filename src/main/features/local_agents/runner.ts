@@ -173,7 +173,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   // CLI dispatch session id (matches the devtools-archive session id
   // built below). The per-session spill dir is anchored on this so
   // sweep / read paths can find the file again.
-  const cliSessionId = `${opts.uid}-cli-${opts.cli}-${handle.runId}`;
+  const cliSessionId = `cli-${opts.cli}-${handle.runId}`;
   const spillDir = sessionToolResultsDir(opts.uid, cliSessionId);
   let lastEventAt = Date.now();
   const onEvent = (e: LocalEvent) => {
@@ -276,6 +276,49 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   });
   // The per-run jsonl under `local-agent-runs/<runId>/` (written by
   // `persist`) is the only post-run artifact.
+  // prod and self-catches all errors, so we don't await or guard here.
+  // Devtools archive shape — keep the session_id format `<uid>-cli-<tail>`
+  // to match the §5 security invariant (uid first segment, kind second);
+  // `cli` is the new kind devtools recognises and badges as such.
+  // Provider = brand label ("Claude Code" / "Codex" ...) so the panel
+  // shows the human-readable CLI name; model = version string when
+  // detected, falling back to the user-picked model id, falling back
+  // to "(default)".
+  const brand = _cliBrandLabel(opts.cli);
+  const modelDisplay = entry.version
+    ? `${entry.version}${opts.model ? ` · ${opts.model}` : ''}`
+    : (opts.model || '(default)');
+    // Date-prefixed id matching the LLM-archive convention. Without
+    // it, archive filenames mix random-hex (CLI runId) with
+    // date-prefixed (LLM newArchiveId) and the lexicographic sort in
+    // `listFilesDesc` puts hex BEFORE dates regardless of when the
+    // run actually happened — the panel ends up out of order AND the
+    // 30-slot prune drops recent LLM calls. The runtime runId is
+    // preserved separately on `local-agent-runs/<runId>/`.
+    id: newArchiveId(new Date(startedAtMs)),
+    startedAt: startedAtIso,
+    endedAt: new Date(endedAtMs).toISOString(),
+    durationMs: endedAtMs - startedAtMs,
+    userId: opts.uid,
+    sessionId: `cli-${opts.cli}-${handle.runId}`,
+    input: {
+      message: opts.prompt,
+      provider: brand,
+      model: modelDisplay,
+    },
+    context: {
+      agentId: opts.agentId,
+      cid: opts.cid,
+      workingDir: opts.cwd,
+      hasAbortSignal: true,
+    },
+    events: archiveEvents,
+    output: {
+      text: finalOutput,
+      aborted: terminal.status === 'cancelled',
+      error: terminal.error || null,
+    },
+  });
   return { runId: handle.runId, status: terminal.status, output: finalOutput, error: terminal.error };
 }
 

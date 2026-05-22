@@ -168,6 +168,7 @@ async function _readProject(uid: string, pid: string): Promise<Project | null> {
 async function _writeProject(uid: string, p: Project): Promise<void> {
   fs.mkdirSync(projectDir(uid, p.project_id), { recursive: true });
   await writeJson(projectMetaFile(uid, p.project_id), p);
+  _notifyDirty();
 }
 
 function _normaliseBindings(raw: any): ProjectBindings {
@@ -192,6 +193,19 @@ async function _readBindings(uid: string, pid: string): Promise<ProjectBindings>
 async function _writeBindings(uid: string, pid: string, b: ProjectBindings): Promise<void> {
   fs.mkdirSync(projectDir(uid, pid), { recursive: true });
   await writeJson(projectBindingsFile(uid, pid), b);
+  _notifyDirty();
+}
+
+// Sync engine dirty signal (lazy-require — `features/sync` is stripped from OrkasOpen). Mirrors
+// the pattern in `agents.ts::_invalidateAgentListCache`: any write to a `cloud/projects/...`
+// file should kick the sync debounce so the change propagates within seconds rather than the
+// 5-min periodic.
+function _notifyDirty(): void {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = require('./sync') as { markDirty?: (domain: string, relPath: string) => void };
+    sync.markDirty?.('projects', 'cloud/projects');
+  } catch { /* features/sync stripped */ }
 }
 
 // ── Validation ────────────────────────────────────────────────────────────

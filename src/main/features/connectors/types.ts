@@ -195,4 +195,13 @@ export interface CatalogEntry {
   transport_template: TransportTemplate | null;
   /** Set when `transport_template` is null to explain why; renderer surfaces in the badge. */
   unavailable_reason?: 'oauth_pending';
+  /** When set, this catalog entry is a **UI-only bundle**: one OAuth flow provisions N member
+   *  ConnectorInstances (one per listed catalog id). The bundle entry itself does NOT produce a
+   *  ConnectorInstance and has `transport_template: null` — the model sees the members as
+   *  independent connectors with their own tools. Renderer shows a single bundle card and
+   *  hides the member entries. The bundle's OAuth `catalog_id` triggers the server-side
+   *  scope-union path (e.g. `google-workspace` requests all 5 Google service scopes at once),
+   *  and the manager clones the resulting grant into each member instance. See
+   *  `manager.ts::connectViaOAuth`. */
+  bundle_member_ids?: string[];
 }

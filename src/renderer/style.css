@@ -17,6 +17,40 @@
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
+/* ─── Global scrollbar — thin, subtle. Without this rule, any scrollable
+       container that doesn't have its own ::-webkit-scrollbar override (e.g.
+       settings panels, sync usage breakdown, generic modal bodies) falls
+       back to the OS default — on macOS that's a chunky ~15px bar that
+       looks out of place against the app's compact, soft-shadowed UI.
+       Per-element overrides further down the file (.projects-list,
+       .conversation-list, .skills-grid-scroll, etc.) keep their tighter
+       4–6px widths via CSS specificity; this rule only catches the
+       "no override declared" case. ─── */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(15, 23, 42, 0.16);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(15, 23, 42, 0.32);
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(15, 23, 42, 0.16) transparent;
+}
+
 body {
   height: 100vh;
   font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -5559,6 +5593,49 @@ body.model-not-configured .main-content { flex-direction: column; }
 .settings-tab.has-dot.is-orange::after { background: #f59e0b; }
 .settings-tab-pane[hidden] { display: none; }
 
+/* Subscription card (account tab). Layout: chip badge + status text on one
+   line, detail line beneath, action button on the right. Avatar slot omitted —
+   that slot is reserved for user identity in the Account card; using it for a
+   tier marker confused the visual hierarchy (FREE in a circle reads as a user
+   avatar). */
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(107, 114, 128, 0.12);
+  color: #4b5563;
+  text-transform: uppercase;
+}
+  background: #0a0a0a;
+  color: #fff;
+}
+  font-size: 14px;
+  color: var(--ink, #0a0a0a);
+}
+
+/* Pro feature badge — inline in a card title to mark "this is Pro-gated"
+   when the current user isn't a Pro subscriber. Same chip shape as the
+   subscription card's badge so the visual language stays consistent. */
+.settings-pro-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 7px;
+  border-radius: 8px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  background: #0a0a0a;
+  color: #fff;
+  text-transform: uppercase;
+  vertical-align: 2px;
+}
+
 /* Sync card (data tab). */
   font-size: 12px;
   padding: 2px 8px;
@@ -7163,6 +7240,64 @@ body.model-not-configured .main-content { flex-direction: column; }
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
+/* Connected card's ⋯ menu lives at the top-right of `.connector-card-top`. Hosts the destructive
+   "disconnect" action; kept off the visible foot row so it's one extra click away from the
+   common "enable / disable" toggle. */
+.connector-card-menu-btn {
+  margin-left: auto;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  background: transparent;
+  border-radius: 6px;
+  font-size: 18px;
+  line-height: 1;
+  color: #6b7280;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.connector-card-menu-btn:hover { background: rgba(15, 23, 42, 0.06); color: #111827; }
+.connector-card-menu-popover {
+  position: fixed;
+  z-index: 1000;
+  background: #fff;
+  border: 1px solid rgba(15, 23, 42, 0.12);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12);
+  min-width: 120px;
+  padding: 4px;
+}
+.connector-card-menu-item {
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+}
+.connector-card-menu-item:hover { background: rgba(15, 23, 42, 0.05); }
+.connector-card-menu-item.is-danger { color: #dc2626; }
+.connector-card-menu-item.is-danger:hover { background: rgba(220, 38, 38, 0.08); }
+
+/* Disabled-but-connected card: muted look so the user can tell at a glance which connector
+   they've turned off, without removing it from the "Connected" group. */
+.connector-card.is-disabled { opacity: 0.55; }
+.connector-card.is-disabled .connector-card-icon { filter: saturate(0.4); }
+
+/* Inline spinner inside the "连接" button — shown post-deep-link return while the IPC is
+   running through `/oauth/exchange` + MCP `initialize` + `list_tools` (3 network roundtrips,
+   ~hundreds of ms to a few seconds). Button stays clickable; spinner just signals progress. */
+.btn-spinner {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 6px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.5);
+  border-top-color: rgba(255, 255, 255, 0.95);
+  vertical-align: -1px;
+  animation: marketplace-upload-spin 0.8s linear infinite;
+}
+
 .connector-card-foot { margin-top: auto; display: flex; justify-content: flex-end; gap: 6px; align-items: center; }
 .connector-card-foot .btn-link {
   background: transparent;

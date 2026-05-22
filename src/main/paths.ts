@@ -225,6 +225,14 @@ export const userComponentEnabledFile = (uid: string) => path.join(userCloudConf
 // Same dir + cloud-sync policy as preferences.json; user-orchestration
 // config, NOT per-agent runtime asset (those live under agents/<aid>/).
 export const userScheduledTasksFile = (uid: string) => path.join(userCloudConfigDir(uid), 'scheduled_tasks.json');
+// Connector registry: installed MCP server instances + cached tool schemas + OAuth grants
+// (vault-encrypted with the active Orkas account's OAuth user_id as seed — see
+// `features/connectors/registry.ts`). Cloud-synced as of 2026-05-15 so a user authorizing on
+// one device sees the same connectors on another. **Vault key:** OAuth user_id (not local uid)
+// so any device logged into the same Orkas account can decrypt; OrkasOpen / not-logged-in
+// users fall back to local uid (the file then sits in cloud/config/ but doesn't actually
+// sync — sync engine is inactive without an account).
+export const userConnectorsConfigFile = (uid: string) => path.join(userCloudConfigDir(uid), 'connectors.json');
 
 // ── Local-only per-user (never synced) ───────────────────────────────────
 
@@ -236,12 +244,6 @@ export const userAuthProfilesFile = (uid: string) => path.join(userLocalConfigDi
 export const userWebSearchCache   = (uid: string) => path.join(userLocalConfigDir(uid), 'web-search-cache.json');
 export const userReflectionStateFile = (uid: string) => path.join(userLocalConfigDir(uid), 'reflection-state.json');
 export const userDevtoolsFile     = (uid: string) => path.join(userLocalConfigDir(uid), 'devtools.json');
-// Connector registry: installed MCP server instances + cached tool schemas.
-// Why under local/ rather than cloud/: holds access tokens (PATs / OAuth
-// bearers) and is machine-private by design; failure mode for sync would be
-// a token leaked to another device. Token-vault concerns: see
-// `features/connectors/registry.ts` header.
-export const userConnectorsConfigFile = (uid: string) => path.join(userLocalConfigDir(uid), 'connectors.json');
 
 // Local search index (derived data, self-healing via reconcile, never synced).
 // Only the main conversation + knowledge base get a persistent inverted

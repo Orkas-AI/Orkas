@@ -126,7 +126,7 @@ async function realReflectForAgent(uid: string, agentId: string, sinceMs: number
   // created by buildRunner stays empty. Acceptable: same pattern as
   // organizer/extract-img kinds (§5).
   const tail = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-  const sessionId = `${uid}-reflect-${tail}`;
+  const sessionId = `reflect-${tail}`;
 
   const { runner } = await buildRunner({
     sessionId,

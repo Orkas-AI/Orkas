@@ -47,7 +47,7 @@ describe('chats › createConversation', () => {
     const chats = await loadChats();
     const conv = await chats.createConversation(TEST_UID, { title: 't1' });
     expect(conv.conversation_id).toMatch(/^[0-9a-f]{12}$/);
-    expect(conv.session_id).toBe(`${TEST_UID}-gconv-${conv.conversation_id}`);
+    expect(conv.session_id).toBe(`gconv-${conv.conversation_id}`);
     const idx = JSON.parse(fs.readFileSync(
       path.join(tmpDir, TEST_UID, 'cloud', 'chats', '_index.json'), 'utf-8'));
     expect(idx[0].conversation_id).toBe(conv.conversation_id);
@@ -70,7 +70,7 @@ describe('chats › createConversation', () => {
     const c1 = await chats.createConversation(TEST_UID, { projectId: 'p_aabbccdd' });
     expect(c1.project_id).toBe('p_aabbccdd');
     // session_id MUST stay independent of project_id.
-    expect(c1.session_id).toBe(`${TEST_UID}-gconv-${c1.conversation_id}`);
+    expect(c1.session_id).toBe(`gconv-${c1.conversation_id}`);
     const c2 = await chats.createConversation(TEST_UID);
     expect(c2.project_id).toBeUndefined();
 

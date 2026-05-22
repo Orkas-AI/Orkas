@@ -45,7 +45,7 @@ describe('projects › createProject', () => {
     const r = await projects.createProject(TEST_UID, '  My Project  ');
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(r.project.project_id).toMatch(/^p_[0-9a-f]{8}$/);
+    expect(r.project.project_id).toMatch(/^p_[0-9a-f]{12}$/);
     expect(r.project.name).toBe('My Project');                 // trimmed
     expect(r.project.owner_uid).toBe(TEST_UID);
     expect(r.project.created_at).toBeTruthy();

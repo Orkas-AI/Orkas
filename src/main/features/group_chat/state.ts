@@ -94,23 +94,25 @@ export const USER_ID = 'user';
 export const RESERVED_IDS: ReadonlySet<string> = new Set([COMMANDER_ID, USER_ID]);
 
 // ── session_id builders ──────────────────────────────────────────────────
+// Format: `<kind>-<tail>` (CLAUDE.md §5). User scoping comes from the path root
+// (`<activeUid>/{cloud,local}/sessions/<sid>.jsonl`), not from the session_id.
 
 /** Commander session — one per conversation, shared across all turns. */
-export function buildGconvSessionId(uid: string, cid: string): string {
-  return `${uid}-gconv-${cid}`;
+export function buildGconvSessionId(cid: string): string {
+  return `gconv-${cid}`;
 }
 
 /** Per-agent session — one per (conv, agent), shared across all the agent's
  * turns in that conv. */
-export function buildGmemberSessionId(uid: string, cid: string, agentId: string): string {
-  return `${uid}-gmember-${cid}-${agentId}`;
+export function buildGmemberSessionId(cid: string, agentId: string): string {
+  return `gmember-${cid}-${agentId}`;
 }
 
 /** Resolve an actor's session id from its kind/id. The user actor has no
  * session — it's the human. Throws on unknown kind. */
-export function actorSessionId(uid: string, cid: string, actor: Actor): string {
-  if (actor.kind === 'commander') return buildGconvSessionId(uid, cid);
-  if (actor.kind === 'agent') return buildGmemberSessionId(uid, cid, actor.id);
+export function actorSessionId(cid: string, actor: Actor): string {
+  if (actor.kind === 'commander') return buildGconvSessionId(cid);
+  if (actor.kind === 'agent') return buildGmemberSessionId(cid, actor.id);
   throw new Error(`actor ${actor.kind}/${actor.id} has no session`);
 }
 

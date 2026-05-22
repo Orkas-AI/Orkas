@@ -541,6 +541,21 @@
                   </div>
                 </div>
               </div>
+
+              <!-- Subscription / membership card — populated by views/login/account_settings.js
+                   alongside the Account card. Hidden when not signed in (matches the Account card's
+                   visibility). Stripped from the OrkasOpen build with the rest of the account block.
+                   Layout: badge chip inline with status text (no avatar circle — that visual slot is
+                   for user identity, not tier marker). -->
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="account.subscription_title">会员</div>
+                </div>
+                    </div>
+                  </div>
+                </div>
+                <!-- Past-due / grace warning row, populated only when status warrants. -->
+                </div>
+              </div>
             </div>
 
             <!-- ───────────────────────── 数据 ───────────────────────── -->
@@ -554,10 +569,19 @@
 
               <!-- Card 1: 主开关 + 状态 + 立即同步 -->
                 <div class="settings-group-head">
-                  <div class="settings-group-title" data-i18n="settings.sync.title">云端同步</div>
+                  <div class="settings-group-title">
+                    <span data-i18n="settings.sync.title">云端同步</span>
+                  </div>
                   <div class="settings-group-sub" data-i18n="settings.sync.privacy_note">数据通过 HTTPS 加密上传到私有云存储，仅你的账号可访问。</div>
                 </div>
-                <div class="settings-row">
+                <!-- Pro-required row: shown when current user is not Pro.
+                     Replaces the toggle row in that state so the user gets a
+                     clear "this is a Pro feature, subscribe" affordance instead
+                     of a toggle that just bounces them to a dialog. The
+                     existing toggle row + controls row still exist and stay
+                     functional for Pro users. -->
+                  <span class="settings-status" data-i18n="settings.sync.pro_required">云端同步是 Pro 会员功能。开通后多台设备的对话、智能体、技能、知识库自动保持一致。</span>
+                </div>
                   <label class="settings-toggle settings-toggle-tight">
                     <span data-i18n="settings.sync.toggle_enable">启用云端同步</span>
                   </label>
@@ -1004,6 +1028,13 @@
   <script src="./modules/i18n.js"></script>
   <script src="./modules/model-guard.js"></script>
   <script src="./modules/boot.js"></script>
+  <!-- Account login gate + Settings account card — stripped in OrkasOpen. login_panel.js must load
+       after boot.js (it calls bootApp); account_settings.js is invoked from settings.js::loadSettings. -->
+  <script src="./views/login/login_panel.js"></script>
+  <script src="./views/login/account_settings.js"></script>
+  <!-- Pro entitlement gate (renderer-side). Loads before voice / sync so window.proGate
+       exists when those modules attach button handlers. Stripped in OrkasOpen. -->
+  <script src="./modules/pro_gate.js"></script>
   <script src="./modules/avatar.js"></script>
   <script src="./modules/avatar-picker.js"></script>
   <script src="./modules/chat-input-form.js"></script>

@@ -272,8 +272,9 @@ describe('local_agents/runner', () => {
     expect(fs.existsSync(toolEvent.outputPath)).toBe(true);
     expect(fs.readFileSync(toolEvent.outputPath, 'utf8')).toBe(big);
     // Spill landed under the expected per-session directory shape:
-    // <uid>/local/tool-results/<uid>-cli-claude-<runId>/bash.<id>.txt
-    expect(toolEvent.outputPath).toContain(`${TEST_UID}-cli-claude-${result.runId}`);
+    // <uid>/local/tool-results/cli-claude-<runId>/bash.<id>.txt (CLAUDE.md §5 — session_id
+    // dropped uid prefix; user scoping comes from path root, not the filename)
+    expect(toolEvent.outputPath).toContain(`cli-claude-${result.runId}`);
     expect(toolEvent.outputPath).toMatch(/bash\.[0-9a-f]+\.txt$/);
   });
 

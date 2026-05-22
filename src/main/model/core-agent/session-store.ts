@@ -1,7 +1,7 @@
 /**
  * Session store — maps a session_id (one per conversation) to a
  * `PersistentSession` backed by a JSONL file under
- * `data/<user_id>/cloud/sessions/<session_id>.jsonl`.
+ * `data/<user_id>/{cloud,local}/sessions/<session_id>.jsonl`.
  *
  * session_id format (see CLAUDE.md §5):
  *   `<uid>-<kind>-<tail>`
@@ -18,6 +18,22 @@
  *   Legacy brand prefixes are stripped once at startup by the
  *   migration tool in features/users.ts and should not appear here;
  *   any id carrying such a prefix is treated as illegal.
+ *   `<kind>-<tail>` — kind ∈ {gconv | gmember | skill | agent | extract-img |
+ *   reflect | memory-extract | anon | cli}. The kind keyword is the FIRST
+ *   segment, never an arbitrary prefix.
+ *
+ *   user scoping comes from path root: `<activeUid>/{cloud,local}/sessions/<sid>.jsonl`
+ *   resolved via `getActiveUserId()`. The session_id intentionally does NOT
+ *   carry uid — repeating it in the filename added zero security (`sessionFileFor`
+ *   was self-checking the prefix it just got handed) and forced uid to be
+ *   dash-free, which broke when OAuth UUIDs entered the system.
+ *
+ *   Builders (no uid param): features/group_chat/state.ts::{buildGconv,buildGmember}SessionId,
+ *     features/agents.ts::defaultAgentEditSessionId, features/skills.ts::defaultSkillSessionId.
+ *
+ *   Legacy formats (`aiteam-…` brand prefix, `<uid>-<kind>-<tail>` uid prefix) are
+ *   stripped once at startup by `util/migrate-session-ids.ts` and should not appear
+ *   here at runtime.
  *
  * session jsonl only carries the LLM-facing view (including tool_use /
  * tool_result / compaction); it's a separate file from
@@ -49,14 +65,15 @@ const log = createLogger('model');
  */
 const EPHEMERAL_KINDS = ['extract-img', 'reflect', 'memory-extract', 'anon'] as const;
 
-export function isEphemeralSessionId(userId: string, sessionId: string): boolean {
-  // Caller is responsible for having validated the uid prefix. Tail can be
-  // multi-segment (memory-extract / extract-img), so we can't split on '-' —
-  // match against each known kind followed by '-' (or kind alone for edge
-  // tests).
-  const tail = sessionId.slice(userId.length + 1);
+/** All recognised kind keywords (used by `resolveSessionPath`'s kind-anchor assertion).
+ *  Order matters in the regex alternation: longer alternatives must come before their
+ *  shorter prefix overlaps so that e.g. `extract-img-…` matches as one kind, not as
+ *  `extract` + leftover. */
+const KNOWN_KINDS_RE = /^(gmember|gconv|memory-extract|extract-img|reflect|skill|agent|anon|cli)(?:-|$)/;
+
+export function isEphemeralSessionId(sessionId: string): boolean {
   for (const kind of EPHEMERAL_KINDS) {
-    if (tail === kind || tail.startsWith(`${kind}-`)) return true;
+    if (sessionId === kind || sessionId.startsWith(`${kind}-`)) return true;
   }
   return false;
 }
@@ -65,25 +82,25 @@ export function isEphemeralSessionId(userId: string, sessionId: string): boolean
  * Build the filesystem path that backs a given session id, picking cloud or
  * local based on the kind (see EPHEMERAL_KINDS above).
  *
- * Assertion: `sessionId` must start with `<userId>-`. This blocks the legacy
- * format `<kind>-<uid>-<tail>` (used by extract/organizer before the rewrite)
- * from silently routing user-private jsonl into a wrong tree.
+ * Defensive assertion: `sessionId` must start with a known kind keyword.
+ * Catches accidental hand-built ids that don't go through a builder; without
+ * this guard a malformed id would just silently land at a wrong-shaped jsonl
+ * filename. user scoping itself is enforced by the caller passing `userId`
+ * (`sessionFileFor` reads it from `getActiveUserId()`); the session_id no
+ * longer carries it.
  *
  * Constructors (chats / group_chat / agents-edit / skills-edit / kb image
- * extract / reflection) must build ids via the feature-layer helpers; never
- * by hand.
+ * extract / reflection / cli) must build ids via the feature-layer helpers;
+ * never by hand.
  */
 export function resolveSessionPath(userId: string, sessionId: string): string {
-  const prefix = `${userId}-`;
-  if (!sessionId.startsWith(prefix)) {
+  if (!KNOWN_KINDS_RE.test(sessionId)) {
     throw new Error(
-      `invalid session id "${sessionId}" — must start with "${prefix}" (user is ${userId})`,
+      `invalid session id "${sessionId}" — must start with a known kind ` +
+      `(gconv | gmember | skill | agent | extract-img | reflect | memory-extract | anon | cli)`,
     );
   }
-  if (sessionId.length <= prefix.length) {
-    throw new Error(`invalid session id "${sessionId}" — missing kind/tail after uid`);
-  }
-  return isEphemeralSessionId(userId, sessionId)
+  return isEphemeralSessionId(sessionId)
     ? userLocalSessionFile(userId, sessionId)
     : userSessionFile(userId, sessionId);
 }

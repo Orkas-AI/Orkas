@@ -544,7 +544,18 @@ export function isCliAgent(agent: Pick<Agent, 'runtime'> | null | undefined): bo
 interface AgentListCache { stamp: string; data: Agent[] }
 let _agentListCache: AgentListCache | null = null;
 
-function _invalidateAgentListCache(): void { _agentListCache = null; }
+function _invalidateAgentListCache(): void {
+  _agentListCache = null;
+  // Notify the sync engine (lazy-require — stripped in OrkasOpen builds). Every cache-invalidate
+  // is also a disk-mutation point, so co-locating the dirty signal here covers all the
+  // existing call sites without sprinkling sync calls across the file. The relPath here is
+  // informational only — the engine ignores it and walks `cloud/` itself.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = require('./sync') as { markDirty?: (domain: string, relPath: string) => void };
+    sync.markDirty?.('agents', 'cloud/agents');
+  } catch { /* features/sync stripped */ }
+}
 
 /** Public re-export of `_invalidateAgentListCache` for cross-module callers (sync engine).
  *  **Why exposed**: `listAgents` caches the disk spec list keyed on the two source dirs'
@@ -1100,7 +1111,7 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
         catch (err) { log.warn(`rm failed user=${uid} agent=${agentId}: ${(err as Error).message}`); }
         invalidateLineCount(path.join(chatDir, 'chat.jsonl'));
       }
-      const sessionId = defaultAgentEditSessionId(uid, agentId);
+      const sessionId = defaultAgentEditSessionId(agentId);
       try { evictSession(sessionId); } catch { /* cache may not hold it */ }
       const sessionJsonl = userSessionFile(uid, sessionId);
       try { await fsp.unlink(sessionJsonl); }
@@ -1286,8 +1297,8 @@ function agentChatMetaPath(userId: string, agentId: string): string {
   return path.join(agentChatDir(userId, agentId), 'chat.json');
 }
 
-function defaultAgentEditSessionId(userId: string, agentId: string): string {
-  return `${userId}-agent-${agentId}`;
+function defaultAgentEditSessionId(agentId: string): string {
+  return `agent-${agentId}`;
 }
 
 async function loadAgentChatMeta(userId: string, agentId: string): Promise<AgentChatMeta> {
@@ -1326,7 +1337,7 @@ export async function clearAgentChat(userId: string, agentId: string): Promise<b
   // the LLM retains its full prior context even though the UI history is
   // empty — same bug pattern as clearSkillChat (paths from before a
   // promote-to-builtin survive in the LLM's memory).
-  const sessionId = defaultAgentEditSessionId(userId, agentId);
+  const sessionId = defaultAgentEditSessionId(agentId);
   try { evictSession(sessionId); } catch { /* not in cache */ }
   try { await fsp.unlink(userSessionFile(userId, sessionId)); }
   catch (err) {
@@ -1405,7 +1416,7 @@ export async function sendToAgentEditChat(userId: string, agentId: string, conte
   if (agent.source !== 'custom') return { ok: false, error: t('errors.builtin_agent_not_editable') };
 
   const meta = await loadAgentChatMeta(userId, agentId);
-  const sessionId = meta.session_id || defaultAgentEditSessionId(userId, agentId);
+  const sessionId = meta.session_id || defaultAgentEditSessionId(agentId);
 
   const systemPrompt = buildAgentEditSystemPrompt(agent);
 
@@ -1465,7 +1476,7 @@ export async function* streamSendToAgentEditChat(
   }
 
   const meta = await loadAgentChatMeta(userId, agentId);
-  const sessionId = meta.session_id || defaultAgentEditSessionId(userId, agentId);
+  const sessionId = meta.session_id || defaultAgentEditSessionId(agentId);
 
   const systemPrompt = buildAgentEditSystemPrompt(agent);
 

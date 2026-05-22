@@ -75,7 +75,7 @@ function buildSkillSandboxEnv(): Record<string, string> {
 export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<StreamEvent, void, unknown> {
   const {
     userId, message,
-    sessionId = `${userId}-anon-${genConversationId().slice(0, 8)}`,
+    sessionId = `anon-${genConversationId().slice(0, 8)}`,
     systemPrompt,
     workingDir,
     images,

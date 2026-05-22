@@ -109,6 +109,7 @@ describe('agents › normalizeAgent', () => {
       description_zh: '', description_en: 'D',
       workflow: 'W',
       source: 'builtin', created_at: 't1', updated_at: 't2',
+      category: '',
       // computed-at-load default; overridden by listAgents/getAgent at the boundary
       enabled: true,
     });
@@ -971,7 +972,7 @@ describe('agents › deleteCustomAgent', () => {
     writeCustomAgent('victim');
     const sessionDir = path.join(tmpDir, TEST_UID, 'cloud', 'sessions');
     fs.mkdirSync(sessionDir, { recursive: true });
-    const sessionFile = path.join(sessionDir, `${TEST_UID}-agent-victim.jsonl`);
+    const sessionFile = path.join(sessionDir, 'agent-victim.jsonl');
     fs.writeFileSync(sessionFile, '{"role":"user","content":"old"}\n');
 
     const a = await loadAgents();

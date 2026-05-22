@@ -47,7 +47,6 @@ const LEGACY_KINDS = new Set(['sub', 'organizer', 'conv']);
 
 interface SweepResult {
   scanned: number;
-  alien_uid: number;          // prefix doesn't match the active uid — session-store can never read these
   orphan_cid: number;         // gconv/gmember whose cid is no longer registered
   ephemeral_on_cloud: number; // ephemeral kinds that leaked into cloud/sessions/
   legacy: number;             // sub / organizer / conv leftovers
@@ -55,30 +54,29 @@ interface SweepResult {
   errors: number;
 }
 
-// Pull the kind segment out of `<uid>-<kind>-<tail>`, accounting for
-// multi-segment kinds (extract-img / memory-extract). Returns null when the
-// id doesn't fit `<uid>-...` shape.
-function classify(userId: string, baseName: string): { kind: string; cid?: string } | null {
-  if (!baseName.startsWith(`${userId}-`)) return null;
-  const tail = baseName.slice(userId.length + 1);
-  if (!tail) return null;
-  // Match against multi-segment kinds first (longest match wins) — order
-  // matters: `extract-img-abc` would also start with `extract` (a non-kind
-  // prefix), but we don't list `extract` as a kind anymore.
+// Pull the kind segment out of `<kind>-<tail>` (CLAUDE.md §5; uid is no longer in session_id).
+// Multi-segment kinds (extract-img / memory-extract) are recognized longest-first. Returns
+// null when the basename doesn't start with any known kind keyword (caller skips it — usually
+// a leftover from a half-completed legacy migration).
+function classify(baseName: string): { kind: string; cid?: string } | null {
+  if (!baseName) return null;
+  // Match against multi-segment kinds first (longest match wins) — order matters: `extract-img-abc`
+  // starts with `extract` (a non-kind prefix), and `memory-extract-x` would otherwise match
+  // `memory` (also not a kind).
   for (const k of ['extract-img', 'memory-extract']) {
-    if (tail.startsWith(`${k}-`)) return { kind: k };
+    if (baseName === k) return { kind: k };
+    if (baseName.startsWith(`${k}-`)) return { kind: k };
   }
-  // For gconv/gmember/skill/agent/reflect/anon and legacy sub/organizer/conv:
-  // single-segment kind, the rest is the tail (cid / aid / sid / random).
-  const dash = tail.indexOf('-');
-  if (dash < 0) return { kind: tail };
-  const kind = tail.slice(0, dash);
-  const rest = tail.slice(dash + 1);
+  // Single-segment kind, the rest is the tail (cid / aid / sid / random).
+  const dash = baseName.indexOf('-');
+  if (dash < 0) return { kind: baseName };
+  const kind = baseName.slice(0, dash);
+  const rest = baseName.slice(dash + 1);
   if (kind === 'gconv') return { kind, cid: rest };
   if (kind === 'gmember') {
-    // gmember tail is `<cid>-<aid>`. Split the cid out by taking everything
-    // up to the LAST dash. (cids today are 12-hex and contain no dashes; the
-    // last-dash split is robust to that and to any future cid shape.)
+    // gmember tail is `<cid>-<aid>`. Split the cid out by taking everything up to the LAST
+    // dash. (cids today are 12-hex and contain no dashes; the last-dash split is robust to
+    // that and to any future cid shape.)
     const lastDash = rest.lastIndexOf('-');
     if (lastDash < 0) return { kind, cid: rest };
     return { kind, cid: rest.slice(0, lastDash) };
@@ -110,32 +108,13 @@ async function sweepCloud(userId: string, result: SweepResult): Promise<void> {
     result.scanned++;
     const sid = name.slice(0, -'.jsonl'.length);
 
-    // 1. Alien-uid prefix: the file lives under the active uid's sessions/
-    //    dir but its session_id starts with a different uid. session-store's
-    //    hard assertion (sessionFileFor: id MUST start with `<activeUid>-`)
-    //    means these are unreachable from any code path — pure dead state.
-    //    Historical cause on dev boxes: when the uid format moved from
-    //    8-digit numeric to UUID, the data root carried over but sessions
-    //    were never renamed; the 8-digit-prefix files persisted, taking up
-    //    ~90% of the directory. Reading from them is impossible, so the
-    //    safest treatment is to drop them.
-    if (!sid.startsWith(`${userId}-`)) {
-      try {
-        await fsp.unlink(path.join(dir, name));
-        result.alien_uid++;
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-          log.warn(`unlink alien ${name}: ${(err as Error).message}`);
-          result.errors++;
-        }
-      }
-      continue;
-    }
-
-    const info = classify(userId, sid);
+    // session_id is now `<kind>-<tail>` (CLAUDE.md §5 — uid no longer in session_id).
+    // Files with any other shape are leftovers from before the migration and should already
+    // have been renamed by `migrateLegacySessionIds`; classify() returns null for them.
+    const info = classify(sid);
     if (!info) continue;
     let reason: keyof Pick<SweepResult, 'orphan_cid' | 'ephemeral_on_cloud' | 'legacy'> | null = null;
-    if (isEphemeralSessionId(userId, sid)) {
+    if (isEphemeralSessionId(sid)) {
       reason = 'ephemeral_on_cloud';
     } else if (LEGACY_KINDS.has(info.kind)) {
       reason = 'legacy';
@@ -189,18 +168,17 @@ async function sweepLocalByAge(userId: string, result: SweepResult, now: number)
 export async function sweepSessions(userId: string): Promise<SweepResult> {
   const t0 = Date.now();
   const result: SweepResult = {
-    scanned: 0, alien_uid: 0, orphan_cid: 0, ephemeral_on_cloud: 0, legacy: 0,
+    scanned: 0, orphan_cid: 0, ephemeral_on_cloud: 0, legacy: 0,
     local_aged_out: 0, errors: 0,
   };
   await sweepCloud(userId, result);
   await sweepLocalByAge(userId, result, Date.now());
-  const removed = result.alien_uid + result.orphan_cid + result.ephemeral_on_cloud
+  const removed = result.orphan_cid + result.ephemeral_on_cloud
                 + result.legacy + result.local_aged_out;
   if (removed > 0 || result.errors > 0) {
     log.info('sweep complete', {
       uid: userId,
       scanned: result.scanned,
-      alien_uid: result.alien_uid,
       orphan_cid: result.orphan_cid,
       ephemeral_on_cloud: result.ephemeral_on_cloud,
       legacy: result.legacy,

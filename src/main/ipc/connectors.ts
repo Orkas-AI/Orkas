@@ -14,13 +14,29 @@
  * the flow and waits for the deep-link callback.
  */
 import * as connectors from '../features/connectors';
+import { isConnectorEnabled, setConnectorEnabled } from '../features/component_enabled';
 
 export const invokeHandlers = {
   'connectors.catalog': async () => ({ catalog: connectors.CONNECTOR_CATALOG }),
 
-  'connectors.list': async (_payload: unknown, ctx: { userId: string }) => ({
-    instances: connectors.listInstances(ctx.userId),
-  }),
+  'connectors.list': async (_payload: unknown, ctx: { userId: string }) => {
+    // Attach the per-user `enabled` flag so the renderer can render the "停用 / 启用" toggle
+    // without a second IPC. Defaults to true when the user hasn't toggled it (the file only
+    // stores `false` overrides — see features/component_enabled.ts).
+    const raw = connectors.listInstances(ctx.userId);
+    const instances = raw.map((inst) => ({ ...inst, enabled: isConnectorEnabled(ctx.userId, inst.id) }));
+    return { instances };
+  },
+
+  'connectors.set_enabled': async (
+    payload: { id?: unknown; enabled?: unknown },
+    ctx: { userId: string },
+  ) => {
+    if (typeof payload?.id !== 'string') throw new Error('invalid id');
+    if (typeof payload?.enabled !== 'boolean') throw new Error('invalid enabled flag');
+    setConnectorEnabled(ctx.userId, payload.id, payload.enabled);
+    return { ok: true, enabled: payload.enabled };
+  },
 
   'connectors.start_oauth': async (payload: { catalog_id?: unknown }, ctx: { userId: string }) => {
     if (typeof payload?.catalog_id !== 'string') throw new Error('invalid catalog_id');

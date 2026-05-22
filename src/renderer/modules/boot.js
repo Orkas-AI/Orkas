@@ -88,6 +88,12 @@ function _saveLastView(view, cid) {
 }
 
 function _restoreLastView() {
+  // Restart policy: only `conversation` view is remembered across launches.
+  // Every other tab (agents / skills / contexts / connectors / apps / settings
+  // / project detail / marketplace / devtools) intentionally falls back to
+  // the commander (new-chat) — the user always lands on a known starting
+  // point and doesn't accidentally resume a settings / inventory tab they
+  // wandered into before quitting.
   let saved = null;
   try {
     const raw = localStorage.getItem(_LAST_VIEW_KEY);
@@ -99,20 +105,6 @@ function _restoreLastView() {
 
   if (view === 'conversation' && cid && conversations.some(c => c.conversation_id === cid)) {
     setView('conversation', cid);
-    return;
-  }
-  // Project detail page: cid slot carries the pid (see boot.js setView).
-  // Verify the project still exists (might have been deleted on another
-  // device since last save) before restoring; fall through to new-chat
-  // otherwise.
-  if (view === 'project' && cid
-      && Array.isArray(_projectsCache)
-      && _projectsCache.some((p) => p && p.project_id === cid)) {
-    setView('project', cid);
-    return;
-  }
-  if (view === 'agents' || view === 'skills' || view === 'contexts' || view === 'new-chat') {
-    setView(view);
     return;
   }
   setView('new-chat');

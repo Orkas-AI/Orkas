@@ -124,58 +124,9 @@ function stream(channel, payload, onEvent) {
   return { promise, cancel };
 }
 
-// push channel are stripped from the OrkasOpen build — see OpenSource/SyncCode/strip-rules.json.
-const account = {
-  status: () => invoke('account.status'),
-  listProviders: () => invoke('account.listProviders'),
-  startLogin: () => invoke('account.startLogin'),
-  logout: () => invoke('account.logout'),
-  currentUser: () => invoke('account.currentUser'),
-  // Subscribe to status-change pushes from main (login completed / session revoked). Returns an
-  // unsubscribe function.
-  onChange: (cb) => {
-    if (typeof cb !== 'function') return () => {};
-    const listener = (_evt, payload) => { try { cb(payload); } catch (_) { /* renderer cb threw */ } };
-  },
-};
-
-// Voice-to-text (the chat-composer mic button → the Server's /voice/asr_ws ASR proxy). The
-// `voice` namespace + renderer/modules/voice-input.js are stripped from the OrkasOpen build
-// (offline client, no Server) — see OpenSource/SyncCode/strip-rules.json.
-const voice = {
-};
-
-// Multi-device sync. Stripped from the OrkasOpen build along with the account namespace
-// it depends on — see OpenSource/SyncCode/strip-rules.json.
-const sync = {
-  runNow: () => invoke('sync.runNow'),
-  status: () => invoke('sync.status'),
-  usage: () => invoke('sync.usage'),
-  getEnabled: () => invoke('sync.getEnabled'),
-  setEnabled: (enabled, opts) => invoke('sync.setEnabled', {
-    enabled: !!enabled,
-    purge: !!(opts && opts.purge),
-  }),
-  usageBreakdown: () => invoke('sync.usageBreakdown'),
-  getPendingMassDelete: () => invoke('sync.getPendingMassDelete'),
-  confirmPendingDelete: () => invoke('sync.confirmPendingDelete'),
-  cancelPendingDelete: () => invoke('sync.cancelPendingDelete'),
-  onStatus: (cb) => {
-    if (typeof cb !== 'function') return () => {};
-    const listener = (_evt, payload) => { try { cb(payload); } catch (_) { /* swallow */ } };
-  },
-  onUsage: (cb) => {
-    if (typeof cb !== 'function') return () => {};
-    const listener = (_evt, payload) => { try { cb(payload); } catch (_) { /* swallow */ } };
-  },
-  // Fires after a sync pass pulls / renames / tombstone-deletes at least one
-  // file — the on-disk cloud/ tree now has content the renderer's in-memory
-  // lists don't know about. Payload: { domains: string[], cids: string[] }.
-  onDataChanged: (cb) => {
-    if (typeof cb !== 'function') return () => {};
-    const listener = (_evt, payload) => { try { cb(payload); } catch (_) { /* swallow */ } };
-  },
-};
+// User-account login, voice ASR proxy, and multi-device sync namespaces are stripped from the
+// OrkasOpen build — see OpenSource/SyncCode/strip-rules.json. The renderer is not allowed to
+// reference these surfaces; renderer modules that depend on them are removed at sync time.
 
 // Expose the sync-fetched i18n bundle on its own bridge key so the renderer
 // can pick it up at module load. Read-only — the renderer never mutates it.
@@ -188,9 +139,6 @@ contextBridge.exposeInMainWorld('orkas', {
   getLanguage: () => invoke('config.getLanguage'),
   setLanguage: (language) => invoke('config.setLanguage', { language }),
   getLocales: () => invoke('config.getLocales'),
-  account,
-  voice,
-  sync,
   invoke,
   stream,
   onPushEvent,

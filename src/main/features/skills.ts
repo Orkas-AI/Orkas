@@ -246,7 +246,17 @@ function skillBaseDir(source: SkillSource): string {
 interface SkillListCache { stamp: string; data: SkillListing[] }
 let _skillListCache: SkillListCache | null = null;
 
-function _invalidateSkillListCache(): void { _skillListCache = null; }
+function _invalidateSkillListCache(): void {
+  _skillListCache = null;
+  // Sync engine dirty signal (lazy-require — stripped in OrkasOpen). Mirrors the pattern in
+  // `agents.ts::_invalidateAgentListCache`: every cache-invalidate is also a disk-mutation
+  // point, co-locating keeps wiring tight.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = require('./sync') as { markDirty?: (domain: string, relPath: string) => void };
+    sync.markDirty?.('skills', 'cloud/skills');
+  } catch { /* features/sync stripped */ }
+}
 
 /** Internal cache invalidator + core-agent registry invalidator. Exported for
  *  the dev-only `skills_dev` module so its dual-write path goes through the
@@ -643,13 +653,13 @@ export async function updateCustomSkill(
             invalidateLineCount(path.join(oldChatDir, 'chat.jsonl'));
             invalidateLineCount(path.join(newChatDir, 'chat.jsonl'));
             const m = await loadSkillChatMeta(uid, newName);
-            m.session_id = defaultSkillSessionId(uid, newName);
+            m.session_id = defaultSkillSessionId(newName);
             await saveSkillChatMeta(uid, newName, m);
           } catch (err) {
             log.warn(`rename user=${uid} ${oldChatDir} -> ${newChatDir} failed: ${(err as Error).message}`);
           }
         }
-        const oldSid = defaultSkillSessionId(uid, skillId);
+        const oldSid = defaultSkillSessionId(skillId);
         try { evictSession(oldSid); } catch { /* not in cache */ }
         const oldSessionJsonl = userSessionFile(uid, oldSid);
         try { fs.unlinkSync(oldSessionJsonl); }
@@ -691,7 +701,7 @@ export async function deleteCustomSkill(skillId: string): Promise<boolean> {
         catch (err) { log.warn(`rm failed user=${uid} skill=${skillId}: ${(err as Error).message}`); }
         invalidateLineCount(path.join(chatDir, 'chat.jsonl'));
       }
-      const sessionId = defaultSkillSessionId(uid, skillId);
+      const sessionId = defaultSkillSessionId(skillId);
       try { evictSession(sessionId); } catch { /* cache may not hold it */ }
       const sessionJsonl = userSessionFile(uid, sessionId);
       try { fs.unlinkSync(sessionJsonl); }
@@ -1013,8 +1023,8 @@ function skillChatMetaPath(userId: string, skillId: string): string {
   return path.join(skillChatDir(userId, skillId), 'chat.json');
 }
 
-function defaultSkillSessionId(userId: string, skillId: string): string {
-  return `${userId}-skill-${skillId}`;
+function defaultSkillSessionId(skillId: string): string {
+  return `skill-${skillId}`;
 }
 
 async function loadSkillChatMeta(userId: string, skillId: string): Promise<SkillChatMeta> {
@@ -1051,7 +1061,7 @@ export async function clearSkillChat(userId: string, skillId: string): Promise<b
   // even though the UI history is empty — visible as the LLM "remembering"
   // pre-clear state, e.g. trying to read paths that no longer exist after a
   // promote-to-builtin. Session id is id-keyed so it survives source changes.
-  const sessionId = defaultSkillSessionId(userId, skillId);
+  const sessionId = defaultSkillSessionId(skillId);
   try { evictSession(sessionId); } catch { /* not in cache */ }
   try { await fsp.unlink(userSessionFile(userId, sessionId)); }
   catch (err) {
@@ -1321,7 +1331,7 @@ export async function sendToSkillChat(userId: string, skillId: string, content: 
   if (!skill) return { ok: false, error: 'skill not found' };
 
   const meta = await loadSkillChatMeta(userId, skillId);
-  const sessionId = meta.session_id || defaultSkillSessionId(userId, skillId);
+  const sessionId = meta.session_id || defaultSkillSessionId(skillId);
 
   const systemPrompt = await buildSkillEditSystemPrompt(skill);
 
@@ -1404,7 +1414,7 @@ export async function* streamSendToSkillChat(
   }
 
   const meta = await loadSkillChatMeta(userId, skillId);
-  const sessionId = meta.session_id || defaultSkillSessionId(userId, skillId);
+  const sessionId = meta.session_id || defaultSkillSessionId(skillId);
 
   const systemPrompt = await buildSkillEditSystemPrompt(skill);
 

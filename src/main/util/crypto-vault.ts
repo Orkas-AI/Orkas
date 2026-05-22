@@ -42,10 +42,14 @@ const APP_SALT = Buffer.from('orkas/connectors/v1', 'utf8');
 
 const _keyCache = new Map<string, Buffer>();
 
-function _deriveKey(uid: string): Buffer {
-  if (_keyCache.has(uid)) return _keyCache.get(uid)!;
-  const k = crypto.pbkdf2Sync(uid, APP_SALT, ITER, KEY_LEN, 'sha256');
-  _keyCache.set(uid, k);
+// The seed is any opaque string the caller controls — historically the local uid (machine-
+// private encryption), now also the Orkas-account OAuth user_id when the file is meant to be
+// decrypted cross-device after cloud sync (see `features/connectors/registry.ts` for that
+// case). The function doesn't care which it is; the caller picks.
+function _deriveKey(seed: string): Buffer {
+  if (_keyCache.has(seed)) return _keyCache.get(seed)!;
+  const k = crypto.pbkdf2Sync(seed, APP_SALT, ITER, KEY_LEN, 'sha256');
+  _keyCache.set(seed, k);
   return k;
 }
 
@@ -61,9 +65,9 @@ export function isEncryptedPayload(text: string): boolean {
   }
 }
 
-export function encrypt(uid: string, plaintext: string): string {
-  if (!uid) throw new Error('crypto-vault: uid required');
-  const key = _deriveKey(uid);
+export function encrypt(seed: string, plaintext: string): string {
+  if (!seed) throw new Error('crypto-vault: seed required');
+  const key = _deriveKey(seed);
   const iv = crypto.randomBytes(IV_LEN);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   const ct = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
@@ -72,15 +76,15 @@ export function encrypt(uid: string, plaintext: string): string {
   return blob.toString('base64');
 }
 
-export function decrypt(uid: string, b64: string): string {
-  if (!uid) throw new Error('crypto-vault: uid required');
+export function decrypt(seed: string, b64: string): string {
+  if (!seed) throw new Error('crypto-vault: seed required');
   const blob = Buffer.from(b64, 'base64');
   if (blob.length < MAGIC.length + IV_LEN + TAG_LEN) throw new Error('crypto-vault: payload too short');
   if (!blob.subarray(0, MAGIC.length).equals(MAGIC)) throw new Error('crypto-vault: bad magic');
   const iv = blob.subarray(MAGIC.length, MAGIC.length + IV_LEN);
   const tag = blob.subarray(MAGIC.length + IV_LEN, MAGIC.length + IV_LEN + TAG_LEN);
   const ct = blob.subarray(MAGIC.length + IV_LEN + TAG_LEN);
-  const key = _deriveKey(uid);
+  const key = _deriveKey(seed);
   const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(ct), decipher.final()]).toString('utf8');

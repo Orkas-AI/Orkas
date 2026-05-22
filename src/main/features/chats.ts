@@ -203,7 +203,7 @@ export async function createConversation(userId: string, {
     kind,
     agent_id: agentId || '',
     skill_id: skillId || '',
-    session_id: buildGconvSessionId(userId, cid),
+    session_id: buildGconvSessionId(cid),
     ...(projectId ? { project_id: projectId } : {}),
     created_at: nowIso(),
     updated_at: nowIso(),
@@ -254,14 +254,14 @@ export async function deleteConversation(userId: string, cid: string): Promise<b
   search.dropChatConversation(userId, cid);
 
   // Purge commander session + every per-agent member session.
-  purgeSession(userId, removed?.session_id || buildGconvSessionId(userId, cid));
+  purgeSession(userId, removed?.session_id || buildGconvSessionId(cid));
   // gmember sessions: glob the sessions dir for `<uid>-gmember-<cid>-*` —
   // we can't rely on readMembers() because `groupChat.dropConv` above has
   // already removed members.json (the historical cause of the 50+ orphan
   // gmember files we found on the dev box: readMembers returns {actors:[]}
   // → the for-loop never ran → every per-agent worker session leaked).
   // Scanning the actual filesystem is the truth source.
-  const gmemberPrefix = `${userId}-gmember-${cid}-`;
+  const gmemberPrefix = `gmember-${cid}-`;
   try {
     const names = await fsp.readdir(userSessionsDir(userId));
     for (const n of names) {

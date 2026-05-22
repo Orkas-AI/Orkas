@@ -504,7 +504,7 @@ describe('skills › listSkills', () => {
     const s = await loadSkills();
     const list = await s.listSkills();
     expect(list).toEqual([
-      { id: 'alpha', name: 'Alpha', source: 'custom', description_zh: '', description_en: 'The first', enabled: true },
+      { id: 'alpha', name: 'Alpha', source: 'custom', description_zh: '', description_en: 'The first', category: '', create_uid: undefined, enabled: true },
     ]);
   });
 
@@ -538,6 +538,7 @@ describe('skills › getCustomSkill', () => {
       name: 'Alpha',
       description_zh: '',
       description_en: 'desc',
+      category: '',
       source: 'custom',
       dir: path.join(customSkillsDir(), 'alpha'),
     });
@@ -622,7 +623,7 @@ describe('skills › deleteCustomSkill', () => {
     writeCustomSkill('target');
     const sessionDir = path.join(tmpDir, TEST_UID, 'cloud', 'sessions');
     fs.mkdirSync(sessionDir, { recursive: true });
-    const sessionFile = path.join(sessionDir, `${TEST_UID}-skill-target.jsonl`);
+    const sessionFile = path.join(sessionDir, 'skill-target.jsonl');
     fs.writeFileSync(sessionFile, '{"role":"user","content":"old"}\n');
 
     const s = await loadSkills();

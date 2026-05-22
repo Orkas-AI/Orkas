@@ -808,7 +808,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   emit(state, { type: 'state_changed', cid, state: await readState(uid, cid) });
   log.info(`turn-start user=${uid} cid=${cid} actor=${actor.id} kind=${actor.kind} fromMsg=${item.msgId} from=${item.fromActorId}`);
 
-  const sessionId = actorSessionId(uid, cid, actor);
+  const sessionId = actorSessionId(cid, actor);
   const isCommander = actor.kind === 'commander';
   // Per-conv subdir under the user's root workspace — keeps repeat
   // agent runs writing the same basename grouped together instead of

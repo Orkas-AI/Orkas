@@ -115,93 +115,73 @@ async function runTool(tool: { execute: (input: any, ctx: any) => Promise<any> }
 }
 
 // ── connectorExposureFromSessionId (the runner.ts session-kind gate) ────
+//
+// session_id is now `<kind>-<tail>` (CLAUDE.md §5 — uid no longer in session_id, since the
+// path root `<activeUid>/{cloud,local}/sessions/<sid>.jsonl` already scopes by user). The
+// gate just looks at the kind keyword anchored at the start.
 
 describe('connectorExposureFromSessionId', () => {
-  // Real-world archive sample that broke the prior anchored-regex implementation: uid is a
-  // UUID with internal dashes. The buggy `^[^-]+-(gconv|gmember)-/` only captured the first
-  // hex group (`D69594E0`) and rejected the rest, returning 'none' on every UUID-uid session.
-  it('matches gconv with a UUID-shaped uid (regression: UUID-uid sessions used to be rejected)', async () => {
+  it('matches gconv (commander) → tools+block', async () => {
     const { connectorExposureFromSessionId } = await import('../../../../src/main/model/core-agent/runner');
-    expect(connectorExposureFromSessionId('D69594E0-CF31-424C-9318-30231197E3A9-gconv-ac5559863d42')).toBe('tools+block');
+    expect(connectorExposureFromSessionId('gconv-ac5559863d42')).toBe('tools+block');
   });
 
-  it('matches gmember with a UUID-shaped uid + dashed cid + dashed aid', async () => {
+  it('matches gmember (agent worker) including dashed aid in the tail → tools+block', async () => {
     const { connectorExposureFromSessionId } = await import('../../../../src/main/model/core-agent/runner');
-    expect(connectorExposureFromSessionId('D69594E0-CF31-424C-9318-30231197E3A9-gmember-cv-1-agt-42')).toBe('tools+block');
+    expect(connectorExposureFromSessionId('gmember-cv1-agt-42')).toBe('tools+block');
   });
 
-  it('matches agent-edit with a UUID-shaped uid', async () => {
+  it('matches agent-edit → discover+block (block + list_connector_tools, NO call_connector_tool)', async () => {
     const { connectorExposureFromSessionId } = await import('../../../../src/main/model/core-agent/runner');
-    expect(connectorExposureFromSessionId('D69594E0-CF31-424C-9318-30231197E3A9-agent-agt-7')).toBe('block-only');
-  });
-
-  it('still matches the legacy 8-digit-numeric uid shape (CLAUDE.md §4)', async () => {
-    const { connectorExposureFromSessionId } = await import('../../../../src/main/model/core-agent/runner');
-    expect(connectorExposureFromSessionId('99999999-gconv-cv1')).toBe('tools+block');
-    expect(connectorExposureFromSessionId('99999999-gmember-cv1-agt-1')).toBe('tools+block');
-    expect(connectorExposureFromSessionId('99999999-agent-agt-1')).toBe('block-only');
+    expect(connectorExposureFromSessionId('agent-agt-7')).toBe('discover+block');
   });
 
   it('returns none for non-task session kinds (skill / extract-img / cli / reflect / memory-extract / anon)', async () => {
     const { connectorExposureFromSessionId } = await import('../../../../src/main/model/core-agent/runner');
-    expect(connectorExposureFromSessionId('D69594E0-CF31-424C-9318-30231197E3A9-skill-sk1')).toBe('none');
-    expect(connectorExposureFromSessionId('99999999-skill-sk1')).toBe('none');
-    expect(connectorExposureFromSessionId('99999999-extract-img-deadbeef')).toBe('none');
-    expect(connectorExposureFromSessionId('99999999-cli-claude-run-1')).toBe('none');
-    expect(connectorExposureFromSessionId('99999999-reflect-x')).toBe('none');
-    expect(connectorExposureFromSessionId('99999999-memory-extract-x')).toBe('none');
-    expect(connectorExposureFromSessionId('99999999-anon')).toBe('none');
+    expect(connectorExposureFromSessionId('skill-sk1')).toBe('none');
+    expect(connectorExposureFromSessionId('extract-img-deadbeef')).toBe('none');
+    expect(connectorExposureFromSessionId('cli-claude-run-1')).toBe('none');
+    expect(connectorExposureFromSessionId('reflect-x')).toBe('none');
+    expect(connectorExposureFromSessionId('memory-extract-x')).toBe('none');
+    expect(connectorExposureFromSessionId('anon')).toBe('none');
+    expect(connectorExposureFromSessionId('anon-deadbeef')).toBe('none');
+  });
+
+  it('returns none when fed a legacy uid-prefixed session_id (regression: pre-migration leftovers must not silently match)', async () => {
+    // Legacy `<uid>-<kind>-<tail>` files should be renamed by `migrateLegacySessionIds` before
+    // the runner ever sees them. If one slips through, the gate returning 'none' is safer than
+    // a partial substring match that would expose the wrong tools.
+    const { connectorExposureFromSessionId } = await import('../../../../src/main/model/core-agent/runner');
+    expect(connectorExposureFromSessionId('D69594E0-CF31-424C-9318-30231197E3A9-gconv-cv1')).toBe('none');
+    expect(connectorExposureFromSessionId('99999999-agent-agt-1')).toBe('none');
   });
 });
 
-// ── extractUidFromSessionId (anchors on the kind keyword, not first `-`) ─
-
-describe('extractUidFromSessionId', () => {
-  it('returns the full UUID-shaped uid (regression: prior `^([^-]+)-` regex truncated it to the first hex group)', async () => {
-    const { extractUidFromSessionId } = await import('../../../../src/main/model/core-agent/runner');
-    expect(extractUidFromSessionId('D69594E0-CF31-424C-9318-30231197E3A9-gconv-ac5559863d42'))
-      .toBe('D69594E0-CF31-424C-9318-30231197E3A9');
-  });
-
-  it('returns the 8-digit numeric uid (CLAUDE.md §4 legacy shape)', async () => {
-    const { extractUidFromSessionId } = await import('../../../../src/main/model/core-agent/runner');
-    expect(extractUidFromSessionId('99999999-gconv-cv1')).toBe('99999999');
-    expect(extractUidFromSessionId('99999999-gmember-cv1-agt-1')).toBe('99999999');
-    expect(extractUidFromSessionId('99999999-skill-sk1')).toBe('99999999');
-    expect(extractUidFromSessionId('99999999-agent-agt-1')).toBe('99999999');
-  });
-
-  it('handles dashed kind keywords (extract-img / memory-extract) without splitting them', async () => {
-    const { extractUidFromSessionId } = await import('../../../../src/main/model/core-agent/runner');
-    expect(extractUidFromSessionId('D69594E0-CF31-424C-9318-30231197E3A9-extract-img-deadbeef'))
-      .toBe('D69594E0-CF31-424C-9318-30231197E3A9');
-    expect(extractUidFromSessionId('99999999-memory-extract-foo')).toBe('99999999');
-  });
-
-  it('handles kinds with no tail (-anon at end of string)', async () => {
-    const { extractUidFromSessionId } = await import('../../../../src/main/model/core-agent/runner');
-    expect(extractUidFromSessionId('99999999-anon')).toBe('99999999');
-    expect(extractUidFromSessionId('D69594E0-CF31-424C-9318-30231197E3A9-anon')).toBe('D69594E0-CF31-424C-9318-30231197E3A9');
-  });
-
-  it('returns null when no recognised kind keyword is present', async () => {
-    const { extractUidFromSessionId } = await import('../../../../src/main/model/core-agent/runner');
-    expect(extractUidFromSessionId('justauidwithnokind')).toBeNull();
-    expect(extractUidFromSessionId('')).toBeNull();
-  });
-});
-
-// ── createConnectorMetaTools shape (now async + conditional) ────────────
+// ── createConnectorMetaTools shape (mode-gated tri-state) ───────────────
 
 describe('createConnectorMetaTools', () => {
-  it('returns the two meta-tools when at least one connector is visible', async () => {
+  it('full mode: returns both meta-tools when at least one connector is visible', async () => {
     fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
     const { createConnectorMetaTools } = await loadModule();
-    const tools = await createConnectorMetaTools({ userId: UID });
+    const tools = await createConnectorMetaTools({ userId: UID }, 'full');
     expect(tools.map((t) => t.name)).toEqual([
       'list_connector_tools',
       'call_connector_tool',
     ]);
+  });
+
+  it('discover mode: returns only list_connector_tools (no call) — agent-edit shape', async () => {
+    fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
+    const { createConnectorMetaTools } = await loadModule();
+    const tools = await createConnectorMetaTools({ userId: UID }, 'discover');
+    expect(tools.map((t) => t.name)).toEqual(['list_connector_tools']);
+  });
+
+  it('full is the default when mode is omitted', async () => {
+    fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
+    const { createConnectorMetaTools } = await loadModule();
+    const tools = await createConnectorMetaTools({ userId: UID });
+    expect(tools.length).toBe(2);
   });
 
   it('returns [] when no connector is visible (commander, no instances installed)', async () => {
@@ -278,23 +258,27 @@ describe('getConnectorPromptBlock', () => {
     expect(githubLine).not.toContain('account:');
   });
 
-  it('omits status suffix on the healthy `connected` case (keeps lines short)', async () => {
+  it('never emits a status suffix — the block only contains connected instances by design', async () => {
     fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
     const { getConnectorPromptBlock } = await loadModule();
     const block = await getConnectorPromptBlock(UID, undefined);
-    expect(block).not.toContain('connected');
-    expect(block).not.toContain('disconnected');
+    expect(block).not.toMatch(/—\s*(connected|disconnected|connecting|error)/i);
+    expect(block).not.toMatch(/ask user to refresh/i);
   });
 
-  it('appends a status suffix only when not connected (lets the model surface the issue)', async () => {
+  it('non-connected instances are filtered out entirely (not just status-suffixed)', async () => {
     fixtures.instances = [
-      makeInstance({ id: 'notion', tools: NOTION_TOOLS, status: { kind: 'disconnected' } }),
+      makeInstance({ id: 'notion',  tools: NOTION_TOOLS,  status: { kind: 'disconnected' } }),
+      makeInstance({ id: 'github',  tools: GITHUB_TOOLS,  status: { kind: 'error', message: 'boom', at: 0 } }),
+      makeInstance({ id: 'gmail',   tools: [],            status: { kind: 'connecting' } }),
+      makeInstance({ id: 'slack',   tools: [],            status: { kind: 'connected', since: 0 } }),
     ];
     const { getConnectorPromptBlock } = await loadModule();
     const block = await getConnectorPromptBlock(UID, undefined);
-    expect(block).toContain('**notion**');
-    expect(block).toContain('disconnected');
-    expect(block).toMatch(/ask user to refresh/i);
+    expect(block).toContain('**slack**');
+    expect(block).not.toContain('**notion**');
+    expect(block).not.toContain('**github**');
+    expect(block).not.toContain('**gmail**');
   });
 
   it('falls back to display_name only when the catalog has no description (defensive)', async () => {
@@ -372,9 +356,10 @@ describe('list_connector_tools', () => {
     expect(r.content).toContain('E_CONNECTOR_NOT_VISIBLE');
   });
 
-  it('disconnected connector → E_CONNECTOR_NOT_CONNECTED', async () => {
-    // Need at least one connected instance so the meta-tools array isn't empty; then
-    // also include a disconnected one to exercise the per-call branch.
+  it('disconnected connector → invisible at the meta-tool, surfaces as E_CONNECTOR_NOT_VISIBLE', async () => {
+    // Under the live-state filter (`resolveVisibleConnectors` keeps only connected instances),
+    // a disconnected instance never reaches the per-call branch — the model sees the same
+    // error code as for an unknown id, and `## Connectors` doesn't list it either.
     fixtures.instances = [
       makeInstance({ id: 'github', tools: GITHUB_TOOLS }),
       makeInstance({ id: 'notion', tools: NOTION_TOOLS, status: { kind: 'disconnected' } }),
@@ -383,7 +368,7 @@ describe('list_connector_tools', () => {
     const [listTools] = await createConnectorMetaTools({ userId: UID });
     const r = await runTool(listTools, { connector_id: 'notion' });
     expect(r.isError).toBe(true);
-    expect(r.content).toContain('E_CONNECTOR_NOT_CONNECTED');
+    expect(r.content).toContain('E_CONNECTOR_NOT_VISIBLE');
   });
 
   it('missing connector_id → E_BAD_INPUT', async () => {

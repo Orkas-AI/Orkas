@@ -54,34 +54,24 @@ function errResult(code: string, msg: string): ToolResult {
   return { content: `${code}: ${msg}`, isError: true };
 }
 
-/** Status suffix appended to a connector line. Empty for the healthy `connected` case (most
- *  connectors most of the time) — keeps each line short. Non-empty for states the model needs
- *  to surface to the user. */
-function _statusSuffix(status: ConnectorInstance['status']): string {
-  switch (status.kind) {
-    case 'connected':    return '';
-    case 'connecting':   return ' — connecting';
-    case 'disconnected': return ' — disconnected (ask user to refresh)';
-    case 'error':        return ` — error: ${status.message}`;
-    default:             return ` — ${(status as { kind: string }).kind}`;
-  }
-}
-
 function _renderConnectorLine(instance: ConnectorInstance): string {
   // Catalog entry holds the bilingual description; instance.id doubles as the catalog id (per
   // types.ts: instance.id is the catalog entry id, used both for routing and as the
   // `<id>__<tool>` prefix). Falls back to display_name alone when the catalog has no
   // description (shouldn't happen for shipped connectors).
+  //
+  // No status suffix: `resolveVisibleConnectors` filters to `status.kind === 'connected'` so
+  // every line is implicitly healthy. Disconnected / errored / connecting instances are hidden
+  // from the LLM entirely — see tools-adapter.ts for the filter + rationale.
   const catalog = findCatalogEntry(instance.id);
   const lang = getCurrentLang();
   const desc = catalog
     ? (lang === 'zh' ? catalog.description_zh : catalog.description_en)
     : '';
   const acct = instance.oauth_grant?.account_label ? ` (account: ${instance.oauth_grant.account_label})` : '';
-  const head = desc
-    ? `**${instance.id}** — ${instance.display_name}: ${desc}${acct}`
-    : `**${instance.id}** — ${instance.display_name}${acct}`;
-  return `- ${head}${_statusSuffix(instance.status)}`;
+  return desc
+    ? `- **${instance.id}** — ${instance.display_name}: ${desc}${acct}`
+    : `- **${instance.id}** — ${instance.display_name}${acct}`;
 }
 
 /** Render the `## Connectors` system-prompt block — pure enumeration (one line per connector).
@@ -128,16 +118,13 @@ function createListConnectorToolsTool(opts: ConnectorMetaToolsOpts): AgentTool {
       const visible = await resolveVisibleConnectors(opts.userId, opts.agentId);
       const match = visible.find((v) => v.instance.id === cid);
       if (!match) {
+        // resolveVisibleConnectors already filters to `status.kind === 'connected'`, so a miss
+        // here means either the id is wrong OR the connector went disconnected between block
+        // render and this call. Either way the LLM's recovery is identical (re-read the
+        // `## Connectors` block, or ask the user to refresh) — one error code keeps it simple.
         return errResult(
           'E_CONNECTOR_NOT_VISIBLE',
-          `connector "${cid}" is not enabled for this conversation. See the \`## Connectors\` system-prompt block for valid ids.`,
-        );
-      }
-      if (match.instance.status.kind !== 'connected') {
-        return errResult(
-          'E_CONNECTOR_NOT_CONNECTED',
-          `connector "${cid}" is currently ${match.instance.status.kind}. ` +
-          'Tell the user to open the Connectors panel and click "刷新工具" / "Refresh tools".',
+          `connector "${cid}" is not currently available. See the \`## Connectors\` system-prompt block for valid ids; if it was there a moment ago, ask the user to refresh it in the Connectors panel.`,
         );
       }
       if (!match.tools.length) {
@@ -261,13 +248,28 @@ function createCallConnectorToolTool(opts: ConnectorMetaToolsOpts): AgentTool {
   };
 }
 
-/** Build the connector meta-tools for a single runner. Returns `[]` when uid is empty OR when
- *  the actor has no visible connectors — in that case the system prompt also doesn't carry the
- *  `## Connectors` block, so the tools have nothing to act on and would only confuse the model. */
-export async function createConnectorMetaTools(opts: ConnectorMetaToolsOpts): Promise<AgentTool[]> {
+/** Build the connector meta-tools for a single runner.
+ *
+ *  `mode` selects exposure (mirrors the tri-state gate in `runner.ts::connectorExposureFromSessionId`):
+ *    - `'full'`     → both `list_connector_tools` + `call_connector_tool` (gconv / gmember
+ *                     sessions — actual user tasks invoking external services).
+ *    - `'discover'` → `list_connector_tools` only (agent-edit session — the editor LLM uses
+ *                     it to learn each connector's actions so the authored workflow can name
+ *                     specific action names like "gmail's `send_email`" instead of just
+ *                     "gmail's email-sending feature". `call_connector_tool` is withheld so an
+ *                     authoring session can never produce external side effects.).
+ *
+ *  Returns `[]` when uid is empty OR when the actor has no visible connectors — in that case
+ *  the system prompt also doesn't carry the `## Connectors` block, so the tools have nothing
+ *  to act on and would only confuse the model. */
+export async function createConnectorMetaTools(
+  opts: ConnectorMetaToolsOpts,
+  mode: 'full' | 'discover' = 'full',
+): Promise<AgentTool[]> {
   if (!opts.userId) return [];
   const visible = await resolveVisibleConnectors(opts.userId, opts.agentId);
   if (!visible.length) return [];
+  if (mode === 'discover') return [createListConnectorToolsTool(opts)];
   return [
     createListConnectorToolsTool(opts),
     createCallConnectorToolTool(opts),
