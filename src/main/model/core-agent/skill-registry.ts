@@ -3,28 +3,31 @@
  * shared by every core-agent chat request.
  *
  * Resolution order (see CLAUDE.md §6):
- *   1. <uid>/cloud/skills/      (user-custom; same id overrides builtin)
- *   2. data/builtin/skills/     (built-in; hash-synced from src/builtin/skills at startup)
+ *   1. <uid>/cloud/skills/                (user-custom; same id overrides platform install)
+ *   2. <uid>/local/marketplace/skills/    (platform-installed; per-machine copy reconciled
+ *                                          from the cloud-synced installs.json manifest)
  *
  * The loader caches by per-dir mtime, so `list()` is effectively free
  * between CRUD events. `features/skills.ts` can call `invalidateSkills()`
  * after a create/update/delete to force a re-scan before the next chat.
  *
  * The `Source` label is computed in this layer (`skillSourceLabel`), not
- * by the loader's basename inference — after the per-uid migration both
- * roots end in `/skills`, so basename is no longer distinguishing.
+ * by the loader's basename inference — both roots end in `/skills`, so
+ * basename is no longer distinguishing. 'builtin' is preserved as the
+ * label string for backwards compatibility with the rest of the codebase;
+ * UI renders it as "Platform".
  */
 
 import * as path from 'node:path';
 
-import { BUILTIN_SKILLS_DIR, userSkillsDir } from '../../paths';
+import { userMarketplaceSkillsDir, userSkillsDir } from '../../paths';
 import { getActiveUserId } from '../../features/users';
-import { getCurrentLang } from '../../i18n';
+import { descriptionLang, getCurrentLang } from '../../i18n';
 // `pickDescription` is loaded lazily — see CLAUDE.md §3: any static import
 // from `#core-agent` at module load would pull in pi-ai before
 // `sdk-timeout-patch` has had a chance to monkey-patch it. The cached fn is
 // hydrated on first render call, after the loader is already initialized.
-type PickDescription = (s: { description_zh?: string; description_en?: string }, lang: 'zh' | 'en') => string;
+type PickDescription = (s: { description_zh?: string; description_en?: string }, lang: string) => string;
 let _pickDescription: PickDescription | null = null;
 async function getPickDescription(): Promise<PickDescription> {
   if (_pickDescription) return _pickDescription;
@@ -33,13 +36,15 @@ async function getPickDescription(): Promise<PickDescription> {
   return _pickDescription;
 }
 
-// `Source` is decided by root path, not by `path.basename(source)` — after the
-// per-uid migration both skill roots end in `/skills`, so basename loses its
-// discrimination (see CLAUDE.md §4). Only `BUILTIN_SKILLS_DIR` counts as
-// builtin; everything else (= `userSkillsDir(uid)`) is custom.
-const BUILTIN_ROOT_RESOLVED = path.resolve(BUILTIN_SKILLS_DIR);
+// `Source` is decided by root path, not by `path.basename(source)` — both skill roots end
+// in `/skills`, so basename is non-discriminating (see CLAUDE.md §4). Marketplace-installed
+// dir = 'builtin'; everything else (= cloud custom) = 'custom'. Resolved per-call because
+// the marketplace dir is per-uid; can't pre-resolve to a module-level constant.
 function skillSourceLabel(source: string): 'builtin' | 'custom' {
-  return path.resolve(source) === BUILTIN_ROOT_RESOLVED ? 'builtin' : 'custom';
+  try {
+    const platformRoot = path.resolve(userMarketplaceSkillsDir(getActiveUserId()));
+    return path.resolve(source) === platformRoot ? 'builtin' : 'custom';
+  } catch { return 'custom'; }
 }
 
 // Render the system-prompt block listing every skill the LLM can use.
@@ -49,8 +54,8 @@ function skillSourceLabel(source: string): 'builtin' | 'custom' {
 //   `\`read_file(<ROOT>/<id>/SKILL.md)\` — ROOT by Source:\n` +
 //   `- custom:  <abs path>\n` +
 //   `- builtin: <abs path>\n` +
-//   `Use these ROOT values verbatim; do NOT use training-prior layouts (e.g. \`/data/custom/skills/\`).\n\n` +
-//   per-entry lines `- **<id>** (Source: custom|builtin) — desc`
+//   `Use these ROOT values verbatim.\n\n` +
+//   per-entry lines `- **<display name>** (Source: custom|builtin; internal read id: <id>) — desc`
 //
 // Why the inline ROOT header (added 2026-05): putting only `(Source: ...)` on
 // each entry and listing the path constants in a separate `## Resource locations`
@@ -73,22 +78,33 @@ async function renderSkillLines(
   builtinRoot: string,
 ): Promise<string> {
   if (!specs.length) return '';
-  const lang = getCurrentLang();
+  const lang = descriptionLang(getCurrentLang());
   const pick = await getPickDescription();
+  // Each entry shows the human `name` (what the model uses to decide *whether* to reach
+  // for the skill) plus the raw `id` (what goes into the read_file path). They DIVERGE for
+  // marketplace installs whose dir name = 12-hex server id but whose authored name is a
+  // readable string — see core-agent loader.ts comment on the dir-id ≠ name split.
   const lines: string[] = [
     '## Available skills (skills)',
     '',
     '`read_file(<ROOT>/<id>/SKILL.md)` — ROOT by Source:',
     `- custom:  ${customRoot}`,
     `- builtin: ${builtinRoot}`,
-    'Use these ROOT values verbatim.',
+    'Use these ROOT values verbatim. `<id>` is the internal read id shown after each entry; use it only inside read_file paths, even when it differs from the display name.',
+    'These entries are skills, not tool names. To use one, read its SKILL.md by internal read id and follow the instructions; never call the display name or id as a tool.',
+    'Never mention skill ids in plans, workflows, progress, or final replies. User-facing text must refer to skills by display name only.',
     '',
   ];
   for (const s of specs) {
     const source = skillSourceLabel(s.source);
     const description = pick(s, lang);
     const desc = description ? ` — ${description}` : '';
-    lines.push(`- **${s.name}** (Source: ${source})${desc}`);
+    // When name == id (custom skills authored locally), collapse the redundancy; when they
+    // differ (marketplace installs), keep the id explicitly internal so the model can read by
+    // path without being primed to repeat the id in user-facing prose.
+    const displayName = s.name || s.id;
+    const internal = displayName !== s.id ? `; internal read id: ${s.id}` : '';
+    lines.push(`- **${displayName}** (Source: ${source}${internal})${desc}`);
   }
   return lines.join('\n');
 }
@@ -97,6 +113,113 @@ type CoreAgent = typeof import('#core-agent');
 type SkillLoaderCtor = CoreAgent['SkillLoader'];
 type SkillLoaderInstance = InstanceType<SkillLoaderCtor>;
 type SkillSpec = ReturnType<SkillLoaderInstance['list']>[number];
+export interface SkillAllowlistRef {
+  id: string;
+  name?: string;
+  source?: string;
+}
+
+function _skillRefRank(s: SkillAllowlistRef): number {
+  if (!s.source) return 1;
+  return skillSourceLabel(s.source) === 'custom' ? 0 : 1;
+}
+
+export function resolveSkillAllowlistRefs(
+  specs: SkillAllowlistRef[],
+  refs: string[],
+): { ids: string[]; unknown: string[] } {
+  const byId = new Map<string, SkillAllowlistRef>();
+  const byName = new Map<string, SkillAllowlistRef[]>();
+  for (const s of specs) {
+    if (!s || !s.id) continue;
+    byId.set(s.id, s);
+    const name = typeof s.name === 'string' ? s.name : '';
+    if (name) {
+      const list = byName.get(name) || [];
+      list.push(s);
+      byName.set(name, list);
+    }
+  }
+  for (const list of byName.values()) {
+    list.sort((a, b) => {
+      const byRank = _skillRefRank(a) - _skillRefRank(b);
+      return byRank || a.id.localeCompare(b.id);
+    });
+  }
+
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  const unknown: string[] = [];
+  for (const ref of refs) {
+    if (typeof ref !== 'string' || ref.length === 0) continue;
+    const resolved = byId.get(ref) || byName.get(ref)?.[0] || null;
+    if (!resolved) {
+      unknown.push(ref);
+      continue;
+    }
+    if (!seen.has(resolved.id)) {
+      seen.add(resolved.id);
+      ids.push(resolved.id);
+    }
+  }
+  return { ids, unknown };
+}
+
+function _buildDisplayNameByInternalId(specs: SkillAllowlistRef[]): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const s of specs || []) {
+    const id = typeof s?.id === 'string' ? s.id.trim() : '';
+    const name = typeof s?.name === 'string' ? s.name.trim() : '';
+    if (!id || !name || id === name) continue;
+    out.set(id.toLowerCase(), name);
+  }
+  return out;
+}
+
+function _buildDisplayNameByRef(specs: SkillAllowlistRef[]): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const s of specs || []) {
+    const id = typeof s?.id === 'string' ? s.id.trim() : '';
+    const name = typeof s?.name === 'string' ? s.name.trim() : '';
+    const display = name || id;
+    if (!display) continue;
+    if (id) out.set(id.toLowerCase(), display);
+    if (name) out.set(name.toLowerCase(), display);
+  }
+  return out;
+}
+
+export function replaceKnownSkillIdsForDisplay(text: string, specs: SkillAllowlistRef[]): string {
+  if (!text) return text;
+  const byId = _buildDisplayNameByInternalId(specs);
+  if (!byId.size) return text;
+  const ids = [...byId.keys()].sort((a, b) => b.length - a.length);
+  const alt = ids.map((id) => id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  const re = new RegExp(`(^|[^A-Za-z0-9_])(${alt})(?=$|[^A-Za-z0-9_])`, 'gi');
+  return String(text).replace(re, (_m, prefix: string, id: string) => {
+    return `${prefix}${byId.get(id.toLowerCase()) || id}`;
+  });
+}
+
+export function simplifyKnownSkillFollowPhrasesForDisplay(text: string, specs: SkillAllowlistRef[]): string {
+  if (!text) return text;
+  const byRef = _buildDisplayNameByRef(specs);
+  if (!byRef.size) return text;
+  const replaceRef = (full: string, ref: string) => {
+    const display = byRef.get(String(ref || '').trim().toLowerCase());
+    return display ? `\`${display}\` skill` : full;
+  };
+  let out = String(text).replace(/`skill:\s*follow\s+the\s+([A-Za-z0-9_.-]+)\s+skill`/gi, replaceRef);
+  out = out.replace(/skill:\s*follow\s+the\s+`?([A-Za-z0-9_.-]+)`?\s+skill/gi, replaceRef);
+  return out;
+}
+
+export function normalizeKnownSkillRefsForDisplay(text: string, specs: SkillAllowlistRef[]): string {
+  return simplifyKnownSkillFollowPhrasesForDisplay(
+    replaceKnownSkillIdsForDisplay(text, specs),
+    specs,
+  );
+}
 
 // Skill loader is rebuilt on uid switch — `invalidateSkills()` clears it so
 // the next `getLoader()` call re-reads the new user's custom skills dir.
@@ -107,7 +230,7 @@ async function getLoader(): Promise<SkillLoaderInstance> {
     _loaderPromise = import('#core-agent').then((m) => {
       return new m.SkillLoader({
         // custom (cloud, per-uid) listed first → user overrides of same-id builtins.
-        dirs: [userSkillsDir(getActiveUserId()), BUILTIN_SKILLS_DIR],
+        dirs: [userSkillsDir(getActiveUserId()), userMarketplaceSkillsDir(getActiveUserId())],
       });
     });
   }
@@ -121,8 +244,9 @@ export interface SystemPromptBlockOptions {
    * array is passed, renders an empty block — used when an agent declares
    * `skill_list: []` to opt out of all skills.
    *
-   * Unknown ids are silently dropped (skill may have been deleted since the
-   * agent was configured); a warn-level log surfaces the mismatch.
+   * Unknown ids/names are silently dropped (skill may have been deleted
+   * since the agent was configured). Display-name matching preserves legacy
+   * agents authored before marketplace installs decoupled id from name.
    */
   allowlist?: string[];
   /**
@@ -133,6 +257,15 @@ export interface SystemPromptBlockOptions {
    * in — this module stays free of `features/*` imports.
    */
   disabledIds?: Iterable<string>;
+  /**
+   * Fires once per skill id rendered, with its source system (`A.custom`
+   * for `<uid>/cloud/skills/` or `A.platform` for the marketplace install
+   * dir). Caller (`runner.ts::buildRunner`) bridges this to ChatOptions
+   * so `features/group_chat/bus.ts` collects per turn for the
+   * `skill_advertised` signal. Pure callback — no FS, no IO, no awaits.
+   * See `docs/plans/expert-signals-skill-attribution.md` §4.1.
+   */
+  onSkillAdvertised?: (skill_id: string, system: 'A.custom' | 'A.platform') => void;
 }
 
 /**
@@ -156,15 +289,28 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
   // `activateUser` which calls `invalidateSkills` to drop the loader cache,
   // but the ROOT values must reflect the CURRENT uid regardless of cache age.
   const customRoot = path.resolve(userSkillsDir(getActiveUserId()));
-  const builtinRoot = path.resolve(BUILTIN_SKILLS_DIR);
+  const builtinRoot = path.resolve(userMarketplaceSkillsDir(getActiveUserId()));
 
-  if (opts.allowlist === undefined) return renderSkillLines(filterDisabled(specs), customRoot, builtinRoot);
+  let rendered: typeof specs;
+  if (opts.allowlist === undefined) {
+    rendered = filterDisabled(specs);
+  } else {
+    const rawAllow = opts.allowlist.filter((id) => typeof id === 'string' && id.length > 0);
+    if (rawAllow.length === 0) return '';
+    const { ids } = resolveSkillAllowlistRefs(specs, rawAllow);
+    const allow = new Set(ids);
+    rendered = filterDisabled(specs.filter((s) => allow.has(s.id)));
+  }
 
-  const rawAllow = opts.allowlist.filter((id) => typeof id === 'string' && id.length > 0);
-  if (rawAllow.length === 0) return '';
+  if (opts.onSkillAdvertised && rendered.length) {
+    for (const s of rendered) {
+      try {
+        opts.onSkillAdvertised(s.id, skillSourceLabel(s.source) === 'custom' ? 'A.custom' : 'A.platform');
+      } catch { /* callback throws are non-fatal; signal emission is best-effort */ }
+    }
+  }
 
-  const allow = new Set(rawAllow);
-  return renderSkillLines(filterDisabled(specs.filter((s) => allow.has(s.id))), customRoot, builtinRoot);
+  return renderSkillLines(rendered, customRoot, builtinRoot);
 }
 
 /** Drop the internal mtime cache so the next `list()` rescans. */
@@ -174,10 +320,12 @@ export async function invalidateSkills(): Promise<void> {
   loader.invalidate();
 }
 
-/** For diagnostics: return the skill list. */
+/** For diagnostics: return the skill list. Picks a description per the active UI language. */
 export async function listSkills(): Promise<Array<{ id: string; name: string; description: string }>> {
   const loader = await getLoader();
-  return loader.list().map((s) => ({ id: s.id, name: s.name, description: s.description }));
+  const lang = descriptionLang(getCurrentLang());
+  const pick = await getPickDescription();
+  return loader.list().map((s) => ({ id: s.id, name: s.name, description: pick(s, lang) }));
 }
 
 /**

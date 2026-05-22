@@ -1,9 +1,9 @@
 /**
- * Agents — listing, custom CRUD, builtin sync, inline edit chat.
+ * Agents — listing, custom CRUD, marketplace installs, inline edit chat.
  *
  * Mirrors the skills module shape. Two sources:
- *   builtin — data/shared/agents/builtin/<id>.json (synced from PC/builtin/agents/)
- *   custom  — data/shared/agents/custom/<id>.json  (user-created, editable)
+ *   marketplace — <uid>/local/marketplace/agents/<id>/agent.json
+ *   custom      — <uid>/cloud/agents/<id>/agent.json
  *
  * Schema (one JSON per agent):
  *   { agent_id, name, description, workflow, created_at, updated_at }
@@ -20,15 +20,16 @@ import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 
 import {
-  BUILTIN_AGENTS_DIR, BUILTIN_AGENTS_SOURCE, BUILTIN_SKILLS_DIR,
   userAgentsDir, userSkillsDir, userAgentChatDir, userSessionFile, WS_ROOT,
   agentDir, agentDefinitionFile,
-  builtinAgentDir, builtinAgentDefinitionFile,
+  userMarketplaceAgentsDir, userMarketplaceAgentDir, userMarketplaceSkillsDir,
+  userAgentRuntimeConfigFile,
 } from '../paths';
 import { evictSession } from '../model/core-agent/session-store';
 import { getActiveUserId } from './users';
 import { createLogger } from '../logger';
 import { t, buildLanguageDirective } from '../i18n';
+import { getWorkspacePath } from './user_workspace';
 
 const log = createLogger('agents');
 
@@ -36,16 +37,29 @@ const log = createLogger('agents');
 function CUSTOM_AGENTS_DIR(): string { return userAgentsDir(getActiveUserId()); }
 function CUSTOM_SKILLS_DIR(): string { return userSkillsDir(getActiveUserId()); }
 import { prompts } from '../prompts/loader';
+import { findOuterTagRanges } from '../util/markdown-prose-code';
 import {
   nowIso, genAgentId, safeId,
   readJson, writeJson,
   appendJsonlAtomic, invalidateLineCount, readJsonl,
 } from '../storage';
-import { listSkillSpecs } from '../model/core-agent/skill-registry';
+import {
+  listSkillSpecs,
+  normalizeKnownSkillRefsForDisplay,
+  resolveSkillAllowlistRefs,
+  type SkillAllowlistRef,
+} from '../model/core-agent/skill-registry';
 import { readDisabledSets, setAgentEnabled } from './component_enabled';
 import { renameAgentInMembers } from './group_chat/state';
+import { validateAgentSpec, ValidationReport as QualityReport } from '../quality';
+import { persistReport as persistQualityReport } from '../quality/report';
+import {
+  DEFAULT_MARKETPLACE_CATEGORY_CODE,
+  normalizeMarketplaceCategoryCode,
+} from './marketplace_biz';
 
-export type AgentSource = 'builtin' | 'custom';
+export type AgentSource = 'marketplace' | 'custom';
+type AgentSourceInput = AgentSource | 'builtin';
 
 export type AgentInputType = 'text' | 'textarea' | 'select' | 'multiselect' | 'number' | 'boolean' | 'file' | 'directory';
 
@@ -129,6 +143,30 @@ export interface Agent {
    *  via the dedicated `chat_agent_setup_cli.md` prompt; the LLM
    *  doesn't author it directly. */
   runtime?: AgentRuntime;
+  /** Marketplace category code. Empty string only for legacy/manual specs.
+   *  Maintained by hidden create defaults and by the agent-edit LLM's `<category>` sub-tag. */
+  category: string;
+  /** Connector instance ids this agent is allowed to call. Three-state intentionally **diverges**
+   *  from `skill_list`: `undefined` and `[]` both mean "no connectors" (collapsed to empty), only
+   *  `string[]` non-empty grants access. Why stricter than skill_list's "undefined = no filter":
+   *  connectors carry external side effects (sending emails, editing remote docs); a brand-new
+   *  agent must opt in explicitly. Maintained by the agent edit UI, NOT by the agent-edit LLM. */
+  enabled_connectors?: string[];
+  /** Output rendering preference — agent-level hint injected into the worker
+   *  system prompt at dispatch time. Three user-facing values, progressive
+   *  capability disclosure:
+   *    - `'markdown_only'`: blocks `:::dashboard` + `create_artifact`. The
+   *      create-modal default for new agents.
+   *    - `'dashboard'`: allows `:::dashboard` blocks; still blocks `create_artifact`.
+   *    - `'artifact'`: allows both `:::dashboard` and `create_artifact`.
+   *  Two legacy values kept for back-compat: `'auto'` (pre-redesign default,
+   *  empty hint = no constraint) and `'allow_artifacts'` (the old name for
+   *  `'artifact'`, treated identically by `bus.ts::buildOutputFormatHint`).
+   *  Missing field = no constraint (same as `'auto'`) — old agents authored
+   *  before the redesign keep their broad permissions until the user
+   *  explicitly picks a value. Authored by the agent edit UI dropdown, NOT
+   *  the agent-edit LLM. See `bus.ts::buildOutputFormatHint`. */
+  output_format?: OutputFormat;
   source: AgentSource;
   created_at: string;
   updated_at: string;
@@ -137,6 +175,13 @@ export interface Agent {
    *  unless the user has explicitly disabled the agent. Don't write this
    *  field back to disk. */
   enabled: boolean;
+  /** Marketplace author uid. Kept optional for install/reconcile compatibility; global UI
+   *  surfaces must not render it. */
+  create_uid?: string;
+  /** Marketplace install version for `source==='marketplace'`. Read from `_install.json` so the
+   *  agents-tab card can render a `v1.0.0` chip alongside the category. Custom agents leave
+   *  this undefined (version is a publish concept, not authored locally). */
+  version?: string;
 }
 
 interface AgentRaw {
@@ -154,7 +199,21 @@ interface AgentRaw {
   color?: unknown;
   interactive?: unknown;
   runtime?: unknown;
+  category?: unknown;
+  enabled_connectors?: unknown;
+  output_format?: unknown;
 }
+
+/** Agent output rendering preference. Three user-facing values
+ *  (`'markdown_only' | 'dashboard' | 'artifact'`); the create modal defaults
+ *  to `'markdown_only'`. Two legacy values are kept in the enum for
+ *  on-disk back-compat: `'auto'` (pre-redesign default; missing-field is
+ *  still equivalent) and `'allow_artifacts'` (renamed to `'artifact'` — the
+ *  hint builder + detail dropdown treat them as the same). Missing field
+ *  on disk = no constraint (empty hint), preserving legacy agent behavior
+ *  through the redesign. See `Agent.output_format`. */
+export type OutputFormat = 'auto' | 'markdown_only' | 'dashboard' | 'artifact' | 'allow_artifacts';
+const _OUTPUT_FORMAT_VALUES = new Set<OutputFormat>(['auto', 'markdown_only', 'dashboard', 'artifact', 'allow_artifacts']);
 
 /** Per-agent execution backend. See `Agent.runtime`. */
 export type AgentRuntime =
@@ -184,95 +243,46 @@ export interface AgentChatMeta { session_id?: string; [k: string]: unknown }
 // 1. Builtin agent sync (startup)
 // ─────────────────────────────────────────────────────────────────────────
 
-/** Hash all agent definitions under `root` (directory form: `<aid>/agent.json`).
- * Used by `syncBuiltinAgents` to detect upstream changes. Skipped: dot-prefixed
- * dirs and any subdir without `agent.json` (so the hash is stable against
- * runtime artifacts like `meta/` or `skills/` if they ever land here — they
- * shouldn't, builtin is spec-only). */
-export function hashTree(root: string): string {
-  if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) return '';
-  const h = crypto.createHash('sha256');
-  const entries = fs.readdirSync(root, { withFileTypes: true })
-    .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
-    .sort((a, b) => a.name.localeCompare(b.name));
-  for (const e of entries) {
-    const specFile = path.join(root, e.name, 'agent.json');
-    if (!fs.existsSync(specFile)) continue;
-    h.update(e.name, 'utf8');
-    h.update(Buffer.from([0]));
-    try { h.update(fs.readFileSync(specFile)); } catch { /* skip */ }
-    h.update(Buffer.from([0x0a]));
-  }
-  return h.digest('hex');
-}
-
-export function syncBuiltinAgents(): boolean {
-  fs.mkdirSync(BUILTIN_AGENTS_DIR, { recursive: true });
-  if (!fs.existsSync(BUILTIN_AGENTS_SOURCE)) {
-    log.info(`source dir missing: ${BUILTIN_AGENTS_SOURCE}; skipping`);
-    return false;
-  }
-  const srcHash = hashTree(BUILTIN_AGENTS_SOURCE);
-  const dstHash = hashTree(BUILTIN_AGENTS_DIR);
-  if (srcHash === dstHash) return false;
-
-  const listAgentDirs = (root: string): Set<string> => new Set(
-    fs.readdirSync(root, { withFileTypes: true })
-      .filter((e) => e.isDirectory()
-        && !e.name.startsWith('.')
-        && fs.existsSync(path.join(root, e.name, 'agent.json')))
-      .map((e) => e.name),
-  );
-  const srcIds = listAgentDirs(BUILTIN_AGENTS_SOURCE);
-  const dstIds = listAgentDirs(BUILTIN_AGENTS_DIR);
-
-  let changed = false;
-  for (const stale of [...dstIds].filter((id) => !srcIds.has(id)).sort()) {
-    try {
-      fs.rmSync(builtinAgentDir(stale), { recursive: true, force: true });
-      log.info(`removed stale builtin agent ${stale}`);
-      changed = true;
-    } catch (err) {
-      log.warn(`rm ${stale} failed: ${(err as Error).message}`);
-    }
-  }
-  for (const id of [...srcIds].sort()) {
-    const src = path.join(BUILTIN_AGENTS_SOURCE, id, 'agent.json');
-    const dst = builtinAgentDefinitionFile(id);
-    try {
-      const srcBuf = fs.readFileSync(src);
-      const dstBuf = fs.existsSync(dst) ? fs.readFileSync(dst) : null;
-      if (!dstBuf || !srcBuf.equals(dstBuf)) {
-        fs.mkdirSync(path.dirname(dst), { recursive: true });
-        fs.writeFileSync(dst, srcBuf);
-        log.info(`synced builtin agent ${id}`);
-        changed = true;
-      }
-    } catch (err) {
-      log.warn(`copy ${id} failed: ${(err as Error).message}`);
-    }
-  }
-  return changed;
-}
+// `syncBuiltinAgents` / `hashTree` / `_isMarketplaceInstalled` removed — marketplace installs
+// now write to `<uid>/local/marketplace/agents/` directly.
 
 // ─────────────────────────────────────────────────────────────────────────
 // 2. Read / list
 // ─────────────────────────────────────────────────────────────────────────
 
-function agentBaseDir(source: AgentSource): string {
-  return source === 'builtin' ? BUILTIN_AGENTS_DIR : CUSTOM_AGENTS_DIR();
+function normalizeAgentSource(source: AgentSourceInput): AgentSource {
+  return source === 'builtin' ? 'marketplace' : source;
+}
+
+function isMarketplaceSource(source: AgentSourceInput): boolean {
+  return normalizeAgentSource(source) === 'marketplace';
+}
+
+/** Resolve where a given source's agents live on disk. */
+function agentBaseDir(source: AgentSourceInput): string {
+  const uid = getActiveUserId();
+  return isMarketplaceSource(source) ? userMarketplaceAgentsDir(uid) : userAgentsDir(uid);
+}
+
+/** Helpers replacing the removed `builtinAgentDir` / `builtinAgentDefinitionFile`.
+ *  Same shape but per-user (marketplace installs are per-user, not per-machine). */
+function _platformAgentDir(agentId: string): string {
+  return userMarketplaceAgentDir(getActiveUserId(), agentId);
+}
+function _platformAgentSpecFile(agentId: string): string {
+  return path.join(_platformAgentDir(agentId), 'agent.json');
 }
 
 const INPUT_ID_RE = /^[a-z_][a-z0-9_]{0,31}$/;
 const ALLOWED_INPUT_TYPES: readonly AgentInputType[] = ['text', 'textarea', 'select', 'multiselect', 'number', 'boolean', 'file', 'directory'];
 
 // Reserved agent display names — collide with the commander role surfaced in
-// the chat-recipient chip and the sidebar tab (Chinese localizations are
-// "指挥官" and "总指挥" respectively). The bus router also keys "commander"
-// as a member id, so we guard the English form too. Comparison is
-// case-insensitive after stripping all whitespace, so "  Commander " or
-// the spaced Chinese form "总 指挥" all resolve to the same canonical key.
-const RESERVED_AGENT_NAMES = new Set(['指挥官', '总指挥', 'commander']);
+// the chat-recipient chip and the sidebar tab. The bus router also keys
+// "commander" as a member id, so we guard localized display names and the
+// English form. Comparison is case-insensitive after stripping all whitespace,
+// so "  Commander " or the spaced Chinese form "总 指挥" all resolve to the
+// same canonical key.
+const RESERVED_AGENT_NAMES = new Set(['指挥官', '总指挥', 'コマンダー', '司令官', 'commander']);
 function _agentNameKey(name: string): string {
   return String(name || '').replace(/\s+/g, '').toLowerCase();
 }
@@ -333,7 +343,7 @@ function assertAgentNameCharsetValid(name: string): void {
   }
 }
 
-/** Reject names already in use by another agent (custom OR builtin).
+/** Reject names already in use by another agent (custom OR marketplace).
  *  Matches `_agentNameKey` (case-insensitive, all whitespace stripped) so
  *  "Code Helper" and "codehelper" collide. `excludeAgentId` lets the
  *  update path keep its own name. Caller owns the check at every write
@@ -472,7 +482,7 @@ export function validateAgentInputs(raw: unknown): AgentInput[] {
   return out;
 }
 
-export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSource): Agent | null {
+export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSourceInput): Agent | null {
   if (!raw || typeof raw !== 'object' || !raw.agent_id) return null;
   // Migrate legacy single-`description` into the matching language slot.
   // Same Chinese-character heuristic as the skill loader; explicit > legacy.
@@ -486,7 +496,8 @@ export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSo
     description_zh: explicitZh || (legacyDesc && legacyHasChinese ? legacyDesc : ''),
     description_en: explicitEn || (legacyDesc && !legacyHasChinese ? legacyDesc : ''),
     workflow: typeof raw.workflow === 'string' ? raw.workflow : '',
-    source,
+    category: typeof raw.category === 'string' ? raw.category : '',
+    source: normalizeAgentSource(source),
     created_at: raw.created_at || '',
     updated_at: raw.updated_at || '',
     // Defaults to enabled; overlaid by listAgents / getAgent from the
@@ -512,6 +523,13 @@ export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSo
   }
   if (avatars.isKnownIcon(raw.icon)) agent.icon = raw.icon;
   if (avatars.isKnownColor(raw.color)) agent.color = raw.color;
+  // enabled_connectors: only `string[]` carries through; missing / null / non-array all collapse
+  // to "no connectors" (the field stays absent on the Agent object, which the runner treats as
+  // empty). Filtering to safeId-ish strings keeps a malformed JSON from injecting weird ids.
+  if (Array.isArray(raw.enabled_connectors)) {
+    const filtered = raw.enabled_connectors.filter((v): v is string => typeof v === 'string' && v.length > 0);
+    if (filtered.length) agent.enabled_connectors = filtered;
+  }
   // interactive — tolerant boolean coerce (LLMs sometimes emit "true"/"false"
   // strings). Missing/malformed → undefined; downstream readers treat
   // undefined the same as false.
@@ -524,6 +542,12 @@ export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSo
   }
   const rt = _normalizeRuntime(raw.runtime);
   if (rt) agent.runtime = rt;
+  // output_format: enum-coerce; missing / unknown collapses to "no field
+  // set" (downstream reads default to 'auto'). Only the three known values
+  // round-trip to disk, so a malformed JSON can't inject a fourth state.
+  if (typeof raw.output_format === 'string' && _OUTPUT_FORMAT_VALUES.has(raw.output_format as OutputFormat)) {
+    agent.output_format = raw.output_format as OutputFormat;
+  }
   return agent;
 }
 
@@ -565,10 +589,171 @@ export function isCliAgent(agent: Pick<Agent, 'runtime'> | null | undefined): bo
   return !!agent && agent.runtime?.kind === 'cli';
 }
 
+interface AgentRuntimeLocalConfig {
+  version: 1;
+  project_dirs: Record<string, { path: string; updated_at?: string }>;
+}
+
+export interface AgentCliProjectDirInfo {
+  agent_id: string;
+  is_coding: boolean;
+  /** `workspace` means no per-agent override; `custom` means the user picked a directory. */
+  mode: 'workspace' | 'custom';
+  /** Display path. For a missing custom dir this remains the selected path. */
+  path: string;
+  /** Actual cwd used by dispatch. Falls back to workspace when a custom dir vanished. */
+  effective_path: string;
+  workspace_path: string;
+  custom_path?: string;
+  exists: boolean;
+}
+
+function _emptyAgentRuntimeConfig(): AgentRuntimeLocalConfig {
+  return { version: 1, project_dirs: {} };
+}
+
+function _readAgentRuntimeConfig(uid: string): AgentRuntimeLocalConfig {
+  const file = userAgentRuntimeConfigFile(uid);
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const out = _emptyAgentRuntimeConfig();
+    const dirs = raw && typeof raw === 'object' ? (raw as any).project_dirs : null;
+    if (dirs && typeof dirs === 'object') {
+      for (const [agentId, entry] of Object.entries(dirs)) {
+        if (!safeId(agentId) || !entry || typeof entry !== 'object') continue;
+        const p = typeof (entry as any).path === 'string' ? (entry as any).path.trim() : '';
+        if (!p) continue;
+        out.project_dirs[agentId] = {
+          path: path.resolve(p),
+          ...(typeof (entry as any).updated_at === 'string' ? { updated_at: (entry as any).updated_at } : {}),
+        };
+      }
+    }
+    return out;
+  } catch {
+    return _emptyAgentRuntimeConfig();
+  }
+}
+
+function _writeAgentRuntimeConfig(uid: string, cfg: AgentRuntimeLocalConfig): void {
+  const file = userAgentRuntimeConfigFile(uid);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2), 'utf8');
+  fs.renameSync(tmp, file);
+}
+
+function _deleteAgentRuntimeConfigEntry(uid: string, agentId: string): void {
+  const cfg = _readAgentRuntimeConfig(uid);
+  if (!Object.prototype.hasOwnProperty.call(cfg.project_dirs, agentId)) return;
+  delete cfg.project_dirs[agentId];
+  _writeAgentRuntimeConfig(uid, cfg);
+}
+
+function _dirExists(dirPath: string): boolean {
+  try { return fs.statSync(dirPath).isDirectory(); }
+  catch { return false; }
+}
+
+/** Resolve the per-agent project directory shown on the detail page and
+ *  used to initialise each conversation's coding cwd. Stored overrides are
+ *  local-only because absolute paths are machine-specific. Missing config =
+ *  effective workspace for the conversation/project scope. */
+export function getCliProjectDirInfoForAgent(
+  userId: string,
+  agent: Pick<Agent, 'agent_id' | 'runtime'>,
+  projectId?: string,
+): AgentCliProjectDirInfo {
+  const workspacePath = getWorkspacePath(userId, projectId);
+  const cli = agent.runtime?.kind === 'cli' ? agent.runtime.cli : '';
+  const isCoding = cliIsCodingAgent(cli);
+  const entry = isCoding ? _readAgentRuntimeConfig(userId).project_dirs[agent.agent_id] : undefined;
+  const customPath = entry?.path ? path.resolve(entry.path) : '';
+  const customExists = !!customPath && _dirExists(customPath);
+  return {
+    agent_id: agent.agent_id,
+    is_coding: isCoding,
+    mode: customPath ? 'custom' : 'workspace',
+    path: customPath || workspacePath,
+    effective_path: customExists ? customPath : workspacePath,
+    workspace_path: workspacePath,
+    ...(customPath ? { custom_path: customPath } : {}),
+    exists: customPath ? customExists : true,
+  };
+}
+
+export async function getAgentCliProjectDirInfo(
+  userId: string,
+  agentId: string,
+  projectId?: string,
+): Promise<AgentCliProjectDirInfo | null> {
+  if (!safeId(agentId)) return null;
+  const agent = await getAgent(agentId);
+  if (!agent) return null;
+  return getCliProjectDirInfoForAgent(userId, agent, projectId);
+}
+
+/** Set or clear the detail-page project directory for an external coding
+ *  agent. `dirPath=''` clears the override and returns to workspace mode. */
+export async function setAgentCliProjectDir(
+  userId: string,
+  agentId: string,
+  dirPath: string,
+): Promise<AgentCliProjectDirInfo | null> {
+  if (!safeId(agentId)) return null;
+  const agent = await getAgent(agentId);
+  if (!agent) return null;
+  const cli = agent.runtime?.kind === 'cli' ? agent.runtime.cli : '';
+  if (!cliIsCodingAgent(cli)) {
+    const err: any = new Error('agent is not an external coding agent');
+    err.code = 'E_AGENT_NOT_CODING_CLI';
+    throw err;
+  }
+
+  const cfg = _readAgentRuntimeConfig(userId);
+  const trimmed = String(dirPath || '').trim();
+  if (!trimmed) {
+    delete cfg.project_dirs[agentId];
+  } else {
+    const resolved = path.resolve(trimmed);
+    if (!_dirExists(resolved)) {
+      const err: any = new Error(t('errors.dir_not_exists'));
+      err.code = 'E_DIR_NOT_EXISTS';
+      throw err;
+    }
+    cfg.project_dirs[agentId] = { path: resolved, updated_at: nowIso() };
+  }
+  _writeAgentRuntimeConfig(userId, cfg);
+  return getCliProjectDirInfoForAgent(userId, agent);
+}
+
 interface AgentListCache { stamp: string; data: Agent[] }
 let _agentListCache: AgentListCache | null = null;
 
-function _invalidateAgentListCache(): void { _agentListCache = null; }
+function _invalidateAgentListCache(opts: { markDirty?: boolean } = {}): void {
+  _agentListCache = null;
+  // features/sync stripped from the OrkasOpen build (offline client, no cloud
+  // sync); the markDirty hook is intentionally a no-op here.
+  void opts;
+}
+
+/** Public re-export of `_invalidateAgentListCache` for cross-module callers (sync engine).
+ *  **Why exposed**: `listAgents` caches the disk spec list keyed on the two source dirs'
+ *  `mtimeMs`. Local create/update/delete go through this module and call `_invalidateAgentListCache`
+ *  inline. But the sync engine writes (and `unlink`s) files directly under `<uid>/cloud/agents/<aid>/`,
+ *  which updates the AGENT dir's mtime but NOT the parent (`CUSTOM_AGENTS_DIR`). The parent's
+ *  mtime stays unchanged, the cache stamp stays valid, and `listAgents` returns ghosts of the
+ *  agents sync just deleted. The sync bridge calls this so the next `listAgents` re-scans. */
+export function invalidateAgentListCache(): void {
+  _invalidateAgentListCache();
+}
+
+/** Drop only the in-memory list cache. Marketplace reconcile updates live under
+ *  `<uid>/local/marketplace/agents`, not cloud-synced custom agents, so it must not mark the
+ *  `agents` sync domain dirty just to make the next list call re-read disk. */
+export function clearAgentListCache(): void {
+  _invalidateAgentListCache({ markDirty: false });
+}
 
 /** Toggle the active user's enabled override for an agent. Wrapping the
  *  raw setter so the IPC handler stays one-line and the per-uid resolution
@@ -580,7 +765,7 @@ export function setAgentEnabledForActiveUser(agentId: string, enabled: boolean):
 
 function _agentDirStamp(): string {
   let stamp = '';
-  for (const d of [CUSTOM_AGENTS_DIR(), BUILTIN_AGENTS_DIR]) {
+  for (const d of [CUSTOM_AGENTS_DIR(), userMarketplaceAgentsDir(getActiveUserId())]) {
     try { stamp += `${d}:${fs.statSync(d).mtimeMs};`; }
     catch { stamp += `${d}:0;`; }
   }
@@ -595,7 +780,7 @@ export async function listAgents(): Promise<Agent[]> {
   } else {
     specs = [];
     const seen = new Set<string>();
-    const sources: Array<[AgentSource, string]> = [['custom', CUSTOM_AGENTS_DIR()], ['builtin', BUILTIN_AGENTS_DIR]];
+    const sources: Array<[AgentSource, string]> = [['custom', CUSTOM_AGENTS_DIR()], ['marketplace', userMarketplaceAgentsDir(getActiveUserId())]];
     for (const [source, dir] of sources) {
       if (!fs.existsSync(dir)) continue;
       const entries = (await fsp.readdir(dir, { withFileTypes: true }))
@@ -609,12 +794,24 @@ export async function listAgents(): Promise<Agent[]> {
         const norm = normalizeAgent(data, source);
         if (!norm) continue;
         if (seen.has(norm.agent_id)) {
-          if (source === 'builtin') {
-            log.warn(`id conflict: custom and builtin both define "${norm.agent_id}" — custom wins, rename one`);
+          if (isMarketplaceSource(source)) {
+            log.warn(`id conflict: custom and marketplace both define "${norm.agent_id}" — custom wins, rename one`);
           }
           continue;
         }
         seen.add(norm.agent_id);
+        // Marketplace-installed agents carry an `_install.json` sidecar with `version`.
+        // Author uid may also be present there for install/reconcile compatibility, but the
+        // global UI intentionally does not surface it.
+        if (isMarketplaceSource(source)) {
+          try {
+            const metaFile = path.join(dir, e.name, '_install.json');
+            if (fs.existsSync(metaFile)) {
+              const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+              if (meta && typeof meta.version === 'string') norm.version = meta.version;
+            }
+          } catch { /* corrupt _install.json → leave fields undefined */ }
+        }
         specs.push(norm);
       }
     }
@@ -624,7 +821,10 @@ export async function listAgents(): Promise<Agent[]> {
   // effect immediately without busting the disk-spec cache. Cheap — one
   // small JSON file read per call.
   const { agents: disabledAgentIds } = readDisabledSets(getActiveUserId());
-  return specs.map((a) => ({ ...a, enabled: !disabledAgentIds.has(a.agent_id) }));
+  const displaySkillSpecs = await _skillSpecsForDisplay();
+  return specs
+    .map((a) => ({ ...a, enabled: !disabledAgentIds.has(a.agent_id) }))
+    .map((a) => _withDisplaySkillRefs(a, displaySkillSpecs));
 }
 
 /**
@@ -633,9 +833,9 @@ export async function listAgents(): Promise<Agent[]> {
  */
 export async function getAgent(agentId: string | null | undefined): Promise<Agent | null> {
   if (!agentId) return null;
-  for (const source of ['custom', 'builtin'] as AgentSource[]) {
-    const f = source === 'builtin'
-      ? builtinAgentDefinitionFile(agentId)
+  for (const source of ['custom', 'marketplace'] as AgentSource[]) {
+    const f = isMarketplaceSource(source)
+      ? _platformAgentSpecFile(agentId)
       : agentDefinitionFile(getActiveUserId(), agentId);
     if (!fs.existsSync(f)) continue;
     try {
@@ -644,7 +844,7 @@ export async function getAgent(agentId: string | null | undefined): Promise<Agen
       if (norm) {
         const { agents: disabledAgentIds } = readDisabledSets(getActiveUserId());
         norm.enabled = !disabledAgentIds.has(norm.agent_id);
-        return norm;
+        return _withDisplaySkillRefs(norm, await _skillSpecsForDisplay());
       }
     } catch { /* ignore */ }
   }
@@ -655,8 +855,8 @@ export async function getAgent(agentId: string | null | undefined): Promise<Agen
 // 3. Custom CRUD
 // ─────────────────────────────────────────────────────────────────────────
 
-/** spec.json path for the active user's custom agent. Builtin agents go
- *  through `builtinAgentDefinitionFile` directly. */
+/** spec.json path for the active user's custom agent. Platform agents go
+ *  through `_platformAgentSpecFile` directly. */
 function customAgentFile(agentId: string): string {
   return agentDefinitionFile(getActiveUserId(), agentId);
 }
@@ -676,6 +876,13 @@ export interface CreateAgentOptions {
   /** Picked at create time from the modal's runtime selector. Stored as
    *  authored — `normalizeAgent` validates on read. */
   runtime?: AgentRuntime;
+  /** Marketplace category code. Empty string / omitted remains tolerated for legacy/manual specs. */
+  category?: string;
+  /** Output rendering preference picked in the create-modal dropdown. Validated against
+   *  `_OUTPUT_FORMAT_VALUES` before persist — unknown values silently drop the field
+   *  (= old "missing = no constraint" semantics). The modal sends `'markdown_only'` by
+   *  default; omitted = field stays unset on disk. */
+  output_format?: OutputFormat;
 }
 
 /** Route a legacy `description` input into the matching language slot.
@@ -697,36 +904,70 @@ function resolveBilingualDescription(
   };
 }
 
+async function _skillSpecsForDisplay(): Promise<SkillAllowlistRef[]> {
+  try { return await listSkillSpecs(); }
+  catch (err) {
+    log.warn(`skill display-name map unavailable: ${(err as Error).message}`);
+    return [];
+  }
+}
+
+async function _normalizeWorkflowSkillIds(workflow: string): Promise<string> {
+  const text = String(workflow || '');
+  if (!text) return text;
+  return normalizeKnownSkillRefsForDisplay(text, await _skillSpecsForDisplay());
+}
+
+function _withDisplaySkillRefs(agent: Agent, specs: SkillAllowlistRef[]): Agent {
+  const workflow = normalizeKnownSkillRefsForDisplay(agent.workflow || '', specs);
+  return workflow === agent.workflow ? agent : { ...agent, workflow };
+}
+
 /**
- * Create a blank custom agent. Initial fields are optional — the user typically
- * enters the edit page right after creation and fills them in via chat or
- * manual edit. Returns the created agent.
+ * Create a custom agent. The call shape keeps historical optional fields, but
+ * the quality gate requires a usable name plus at least one description variant
+ * before the spec is written.
  */
 export async function createCustomAgent(
-  { name = '', description = '', description_zh, description_en, workflow = '', icon, color, interactive, runtime }: CreateAgentOptions = {},
+  { name = '', description = '', description_zh, description_en, workflow = '', icon, color, interactive, runtime, category, output_format }: CreateAgentOptions = {},
 ): Promise<Agent | null> {
   assertAgentNameAllowed(name);
   await assertAgentNameUnique(String(name || '').trim());
   fs.mkdirSync(CUSTOM_AGENTS_DIR(), { recursive: true });
   let agentId: string;
   do { agentId = genAgentId(); }
-  while (fs.existsSync(builtinAgentDefinitionFile(agentId))
+  while (fs.existsSync(_platformAgentSpecFile(agentId))
       || fs.existsSync(customAgentFile(agentId)));
   // mkdir <aid>/ first so writeJson on agent.json has a parent.
   fs.mkdirSync(agentDir(getActiveUserId(), agentId), { recursive: true });
   const desc = resolveBilingualDescription(description, description_zh, description_en);
+  const normalizedWorkflow = await _normalizeWorkflowSkillIds(String(workflow || ''));
   const data: AgentRaw = {
     agent_id: agentId,
     name: String(name || '').trim() || t('agent.default_name'),
     description_zh: desc.description_zh,
     description_en: desc.description_en,
-    workflow: String(workflow || ''),
+    workflow: normalizedWorkflow,
     created_at: nowIso(),
     updated_at: nowIso(),
   };
+  // Only emit `category` to disk when supplied; empty string is omitted so existing agents
+  // don't get spurious "category: ''" lines through resave. Candidate membership is dynamic,
+  // so this layer only normalizes the code shape.
+  const cleanCategory = typeof category === 'string' && category.trim()
+    ? normalizeMarketplaceCategoryCode(category)
+    : '';
+  if (cleanCategory) data.category = cleanCategory;
   if (avatars.isKnownIcon(icon)) data.icon = icon;
   if (avatars.isKnownColor(color)) data.color = color;
   if (typeof interactive === 'boolean') data.interactive = interactive;
+  // Persist `output_format` only when the caller supplied a value the enum recognizes. Unknown
+  // strings (e.g. a future client speaking a newer dialect at an older main) drop silently — the
+  // missing field is equivalent to "no constraint" and won't break the worker prompt, whereas a
+  // bogus stored value would survive normalizeAgent and silently turn into empty hint anyway.
+  if (typeof output_format === 'string' && _OUTPUT_FORMAT_VALUES.has(output_format as OutputFormat)) {
+    data.output_format = output_format as OutputFormat;
+  }
   // Persist runtime only when it survives validation; an in_process
   // selection is the implicit default and not written to disk so old
   // tooling diffs cleanly.
@@ -742,10 +983,34 @@ export async function createCustomAgent(
       data.inputs = [_buildProjectDirInput()];
     }
   }
+  // Quality validation gate. EXTREME findings (missing required fields / red
+  // flags in workflow text / etc.) block the write; MEDIUM warnings pass
+  // through but are persisted for UI surfacing. Persist runs in both branches
+  // so the latest report on disk always matches the most recent intent.
+  const report = validateAgentSpec({ agentJson: data });
+  void persistQualityReport({
+    uid: getActiveUserId(), kind: 'agent', id: agentId, report,
+  });
+  if (!report.ok) {
+    // Roll back the freshly-mkdir'd directory so a rejected create doesn't
+    // leave behind an empty <aid>/ that would later confuse `listAgents`.
+    try { fs.rmSync(agentDir(getActiveUserId(), agentId), { recursive: true, force: true }); }
+    catch { /* tolerate cleanup failure */ }
+    throw new Error(_validationErrorMessage(report));
+  }
+
   await writeJson(customAgentFile(agentId), data);
   _invalidateAgentListCache();
   log.info(`created id=${agentId} name=${data.name}`);
   return normalizeAgent(data, 'custom');
+}
+
+/** Build a single-line error message from a failed report. Used to surface
+ *  validation rejection up the create/update path's existing throw flow. */
+function _validationErrorMessage(report: QualityReport): string {
+  const top = report.violations.find((v) => v.level === 'EXTREME');
+  if (!top) return 'validation failed';
+  return `validation failed (${top.rule}): ${top.suggested_fix}`;
 }
 
 /** Required-input schema injected on every external coding agent. The
@@ -795,6 +1060,22 @@ export interface UpdateAgentFields {
    *   omitted      → untouched
    *  Authored by the create modal + edit UI, not the LLM edit prompt. */
   runtime?: AgentRuntime | null;
+  /** Marketplace category code. Empty string drops the field; omitted = untouched.
+   *  Authored by hidden create defaults or by the agent-edit LLM via the `<category>` sub-tag.
+   *  Missing model output is repaired to the default category on create. */
+  category?: string;
+  /** Three-way update:
+   *   array (possibly empty) → replace (filtered to non-empty strings)
+   *   null  → drop the field
+   *   omitted → untouched
+   *  Authored by the agent edit UI (connectors toggle list), NOT the agent-edit LLM. */
+  enabled_connectors?: string[] | null;
+  /** Three-way update:
+   *   OutputFormat string → set (one of the three enum values)
+   *   null                 → drop (revert to default 'auto')
+   *   omitted              → untouched
+   *  Authored by the agent edit UI dropdown. */
+  output_format?: OutputFormat | null;
 }
 
 /**
@@ -809,6 +1090,41 @@ export async function updateCustomAgent(
   if (!fs.existsSync(f)) return null;
   const data = await readJson<AgentRaw>(f);
   const oldName = typeof (data as any).name === 'string' ? (data as any).name : '';
+  await _applyAgentUpdates(data, agentId, updates);
+
+  // Quality gate (same policy as createCustomAgent): EXTREME blocks the
+  // write so the on-disk spec doesn't regress; MEDIUM persists but writes
+  // through.
+  const report = validateAgentSpec({ agentJson: data });
+  void persistQualityReport({
+    uid: getActiveUserId(), kind: 'agent', id: agentId, report,
+  });
+  if (!report.ok) {
+    throw new Error(_validationErrorMessage(report));
+  }
+
+  await writeJson(f, data);
+  _invalidateAgentListCache();
+  log.info(`updated id=${agentId}`);
+  // Propagate a name change into every conversation roster that already
+  // lists this agent. members.json snapshots the name at join time and the
+  // @-router resolves on roster-first, so without this sweep `@<old-name>`
+  // would keep matching in old chats.
+  const newName = typeof (data as any).name === 'string' ? (data as any).name : '';
+  if (newName && newName !== oldName) {
+    try { await renameAgentInMembers(getActiveUserId(), agentId, newName); }
+    catch (err) { log.warn(`rename roster sweep failed id=${agentId}: ${(err as Error).message}`); }
+  }
+  return normalizeAgent(data, 'custom');
+}
+
+/** Pure mutator: apply `updates` onto a raw agent spec object. Shared by
+ *  `updateCustomAgent` and the dev-mode built-in update path so the field
+ *  semantics stay identical regardless of source. Throws on reserved-name
+ *  collision (matches existing custom behavior). */
+async function _applyAgentUpdates(
+  data: AgentRaw, agentId: string, updates: UpdateAgentFields,
+): Promise<void> {
   if (Object.prototype.hasOwnProperty.call(updates || {}, 'name')) {
     const incomingName = typeof updates.name === 'string' ? updates.name : '';
     assertAgentNameAllowed(incomingName);
@@ -833,7 +1149,8 @@ export async function updateCustomAgent(
   for (const k of ['name', 'workflow'] as const) {
     if (Object.prototype.hasOwnProperty.call(updates || {}, k)) {
       const v = (updates as any)[k];
-      (data as any)[k] = typeof v === 'string' ? v : '';
+      const next = typeof v === 'string' ? v : '';
+      (data as any)[k] = k === 'workflow' ? await _normalizeWorkflowSkillIds(next) : next;
     }
   }
   // First migrate any persisted legacy `description` into the bilingual pair
@@ -883,13 +1200,7 @@ export async function updateCustomAgent(
     } else if (Array.isArray(v)) {
       const raw = v.filter((x) => typeof x === 'string' && safeId(x));
       const specs = await listSkillSpecs();
-      const known = new Set(specs.map((s) => s.id));
-      const ids: string[] = [];
-      const unknown: string[] = [];
-      for (const id of raw) {
-        if (known.has(id)) ids.push(id);
-        else unknown.push(id);
-      }
+      const { ids, unknown } = resolveSkillAllowlistRefs(specs, raw);
       if (unknown.length) {
         log.warn(`agent ${agentId}: unknown skills dropped: ${unknown.join(',')}`);
       }
@@ -907,6 +1218,25 @@ export async function updateCustomAgent(
       data.inputs = validateAgentInputs(v);
     }
   }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'enabled_connectors')) {
+    const v = (updates as { enabled_connectors?: string[] | null }).enabled_connectors;
+    if (v === null) {
+      delete (data as { enabled_connectors?: unknown }).enabled_connectors;
+    } else if (Array.isArray(v)) {
+      const ids = v.filter((s): s is string => typeof s === 'string' && s.length > 0);
+      (data as { enabled_connectors?: string[] }).enabled_connectors = ids;
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'output_format')) {
+    const v = (updates as { output_format?: OutputFormat | null }).output_format;
+    if (v === null || v === 'auto') {
+      // 'auto' is the implicit default; don't write it to disk so spec
+      // diffs stay clean and unset agents don't suddenly get a field.
+      delete (data as { output_format?: unknown }).output_format;
+    } else if (typeof v === 'string' && _OUTPUT_FORMAT_VALUES.has(v)) {
+      (data as { output_format?: OutputFormat }).output_format = v;
+    }
+  }
   if (Object.prototype.hasOwnProperty.call(updates || {}, 'icon')) {
     const v = (updates as any).icon;
     if (avatars.isKnownIcon(v)) data.icon = v;
@@ -922,6 +1252,14 @@ export async function updateCustomAgent(
     } else if (typeof v === 'boolean') {
       data.interactive = v;
     }
+  }
+  // category: explicit empty-string drops the field; any non-empty string is normalized to a
+  // safe code shape. Candidate membership is prompt-time dynamic, not a static backend list.
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'category')) {
+    const v = (updates as any).category;
+    const trimmed = typeof v === 'string' ? v.trim() : '';
+    if (!trimmed) delete (data as any).category;
+    else (data as any).category = normalizeMarketplaceCategoryCode(trimmed);
   }
   if (Object.prototype.hasOwnProperty.call(updates || {}, 'runtime')) {
     const v = updates.runtime;
@@ -962,19 +1300,36 @@ export async function updateCustomAgent(
   }
   if (!data.name) data.name = t('agent.default_name');
   data.updated_at = nowIso();
-  await writeJson(f, data);
-  _invalidateAgentListCache();
-  log.info(`updated id=${agentId}`);
-  // Propagate a name change into every conversation roster that already
-  // lists this agent. members.json snapshots the name at join time and the
-  // @-router resolves on roster-first, so without this sweep `@<old-name>`
-  // would keep matching in old chats.
-  const newName = typeof (data as any).name === 'string' ? (data as any).name : '';
-  if (newName && newName !== oldName) {
-    try { await renameAgentInMembers(getActiveUserId(), agentId, newName); }
-    catch (err) { log.warn(`rename roster sweep failed id=${agentId}: ${(err as Error).message}`); }
+}
+
+/** Edit-chat dispatcher: routes to custom write for custom agents, and to
+ *  the dev-only built-in dual-write (src + data) for built-in agents in
+ *  dev mode. Returns null if the id resolves to neither, or if a built-in
+ *  write is attempted outside dev mode. */
+export async function updateAgentSpec(
+  agentId: string, updates: UpdateAgentFields,
+): Promise<Agent | null> {
+  if (!agentId) return null;
+  if (fs.existsSync(customAgentFile(agentId))) {
+    return updateCustomAgent(agentId, updates);
   }
-  return normalizeAgent(data, 'custom');
+  return null;
+}
+
+/** True iff `agentId` resolves to a built-in spec (the runtime data tree).
+ *  Mirrors `isBuiltinSkill`. */
+export function isBuiltinAgent(agentId: string): boolean {
+  if (!agentId) return false;
+  return fs.existsSync(_platformAgentSpecFile(agentId));
+}
+
+/** Internal: shared apply + cache invalidation for the dev module. */
+export async function _applyAgentUpdatesAndInvalidate(
+  data: AgentRaw, agentId: string, updates: UpdateAgentFields,
+): Promise<Agent | null> {
+  await _applyAgentUpdates(data, agentId, updates);
+  _invalidateAgentListCache();
+  return normalizeAgent(data, 'marketplace');
 }
 
 /**
@@ -1028,7 +1383,7 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
         catch (err) { log.warn(`rm failed user=${uid} agent=${agentId}: ${(err as Error).message}`); }
         invalidateLineCount(path.join(chatDir, 'chat.jsonl'));
       }
-      const sessionId = defaultAgentEditSessionId(uid, agentId);
+      const sessionId = defaultAgentEditSessionId(agentId);
       try { evictSession(sessionId); } catch { /* cache may not hold it */ }
       const sessionJsonl = userSessionFile(uid, sessionId);
       try { await fsp.unlink(sessionJsonl); }
@@ -1037,6 +1392,8 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
           log.warn(`session unlink user=${uid} agent=${agentId}: ${(err as Error).message}`);
         }
       }
+      try { _deleteAgentRuntimeConfigEntry(uid, agentId); }
+      catch (err) { log.warn(`runtime config cleanup user=${uid} agent=${agentId}: ${(err as Error).message}`); }
     }
   }
 
@@ -1066,8 +1423,9 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
 // placeholder to stream-hide. Shared between agent-edit chat and main-chat
 // quick-create; see the "Create agent" section of
 // `chat_agent_setup.md` / `chat_commander.md`.
-const AGENT_CONTAINER_RE = /<agent>([\s\S]*?)<\/agent>/g;
 const AGENT_CHILD_RE = (tag: string) => new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`);
+
+const AGENT_CATEGORY_CODE_RE = /^[a-z][a-z0-9_-]{0,79}$/;
 
 export interface ExtractedFields {
   /** Parsed from `<agent_id>` inside `<agent>`. Present → commander wants to
@@ -1092,6 +1450,9 @@ export interface ExtractedFields {
    * `false` (case-insensitive); anything else → key omitted (leave the
    * existing flag untouched). */
   interactive?: boolean;
+  /** Parsed from `<category>` inside `<agent>`. Candidate membership is
+   *  prompt-time dynamic; parsing only enforces a safe code shape. */
+  category?: string;
 }
 
 function _parseAgentBlock(inner: string): ExtractedFields {
@@ -1158,6 +1519,11 @@ function _parseAgentBlock(inner: string): ExtractedFields {
     else if (v === 'false') fields.interactive = false;
     // Any other body → leave key omitted; previous flag survives.
   }
+  const catM = inner.match(AGENT_CHILD_RE('category'));
+  if (catM) {
+    const v = catM[1].trim().toLowerCase();
+    if (AGENT_CATEGORY_CODE_RE.test(v)) fields.category = v;
+  }
   return fields;
 }
 
@@ -1169,15 +1535,26 @@ function _parseAgentBlock(inner: string): ExtractedFields {
 export function extractAgentFieldBlocks(
   text: string,
 ): { cleanText: string; blocks: ExtractedFields[] } {
-  if (!text || text.indexOf('<agent>') < 0) return { cleanText: text, blocks: [] };
+  if (!text || text.indexOf('<agent') < 0) return { cleanText: text, blocks: [] };
+  const ranges = findOuterTagRanges(text, 'agent');
+  if (!ranges.length) return { cleanText: text, blocks: [] };
   const blocks: ExtractedFields[] = [];
-  // Iterate every container with the global-flag regex (NOT just the
-  // first). `AGENT_CONTAINER_RE` carries `/g` so successive `.exec` calls
-  // walk forward; we use `matchAll` for a flat collection.
-  for (const m of text.matchAll(AGENT_CONTAINER_RE)) {
-    blocks.push(_parseAgentBlock(m[1]));
+  let cleaned = '';
+  let cursor = 0;
+  for (const [s, e] of ranges) {
+    cleaned += text.slice(cursor, s);
+    const block = text.slice(s, e);
+    if (block.endsWith('</agent>')) {
+      const openEnd = block.indexOf('>');
+      if (openEnd >= 0) {
+        const inner = block.slice(openEnd + 1, block.length - '</agent>'.length);
+        blocks.push(_parseAgentBlock(inner));
+      }
+    }
+    cursor = e;
   }
-  const cleaned = text.replace(AGENT_CONTAINER_RE, '').replace(/\n{3,}/g, '\n\n').trim();
+  cleaned += text.slice(cursor);
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
   return { cleanText: cleaned, blocks };
 }
 
@@ -1195,8 +1572,8 @@ function agentChatMetaPath(userId: string, agentId: string): string {
   return path.join(agentChatDir(userId, agentId), 'chat.json');
 }
 
-function defaultAgentEditSessionId(userId: string, agentId: string): string {
-  return `${userId}-agent-${agentId}`;
+function defaultAgentEditSessionId(agentId: string): string {
+  return `agent-${agentId}`;
 }
 
 async function loadAgentChatMeta(userId: string, agentId: string): Promise<AgentChatMeta> {
@@ -1235,7 +1612,7 @@ export async function clearAgentChat(userId: string, agentId: string): Promise<b
   // the LLM retains its full prior context even though the UI history is
   // empty — same bug pattern as clearSkillChat (paths from before a
   // promote-to-builtin survive in the LLM's memory).
-  const sessionId = defaultAgentEditSessionId(userId, agentId);
+  const sessionId = defaultAgentEditSessionId(agentId);
   try { evictSession(sessionId); } catch { /* not in cache */ }
   try { await fsp.unlink(userSessionFile(userId, sessionId)); }
   catch (err) {
@@ -1260,6 +1637,7 @@ export function buildAgentEditSystemPrompt(agent: {
   description_zh?: string;
   description_en?: string;
   workflow?: string;
+  category?: string;
   interactive?: boolean;
   /** When the agent is CLI-backed, switch to `chat_agent_setup_cli.md`
    *  which omits workflow/skills authoring and tells the LLM not to
@@ -1299,6 +1677,8 @@ export function buildAgentEditSystemPrompt(agent: {
         interactive: agent.interactive === true ? 'true' : 'false',
       });
   return `${body}\n\n---\n\n${buildLanguageDirective()}`;
+  const tail = buildLanguageDirective();
+  return `${body}\n\n---\n\n${tail}`;
 }
 
 export interface AgentEditResult {
@@ -1314,7 +1694,7 @@ export async function sendToAgentEditChat(userId: string, agentId: string, conte
   if (agent.source !== 'custom') return { ok: false, error: t('errors.builtin_agent_not_editable') };
 
   const meta = await loadAgentChatMeta(userId, agentId);
-  const sessionId = meta.session_id || defaultAgentEditSessionId(userId, agentId);
+  const sessionId = meta.session_id || defaultAgentEditSessionId(agentId);
 
   const systemPrompt = buildAgentEditSystemPrompt(agent);
 
@@ -1329,7 +1709,7 @@ export async function sendToAgentEditChat(userId: string, agentId: string, conte
   const result = await chatWithModel({
     userId, message: content, sessionId, systemPrompt,
     agentName: 'orkas_chat', timeout: 300,
-    readOnlyExtraRoots: [BUILTIN_SKILLS_DIR, userSkillsDir(userId)],
+    readOnlyExtraRoots: [userMarketplaceSkillsDir(userId), userSkillsDir(userId)],
   });
 
   if (!result.ok) {
@@ -1374,7 +1754,7 @@ export async function* streamSendToAgentEditChat(
   }
 
   const meta = await loadAgentChatMeta(userId, agentId);
-  const sessionId = meta.session_id || defaultAgentEditSessionId(userId, agentId);
+  const sessionId = meta.session_id || defaultAgentEditSessionId(agentId);
 
   const systemPrompt = buildAgentEditSystemPrompt(agent);
 
@@ -1396,7 +1776,7 @@ export async function* streamSendToAgentEditChat(
       userId, message: content, sessionId, systemPrompt,
       agentName: 'orkas_chat',
       cacheRetention: 'short',
-      readOnlyExtraRoots: [BUILTIN_SKILLS_DIR, userSkillsDir(userId)],
+      readOnlyExtraRoots: [userMarketplaceSkillsDir(userId), userSkillsDir(userId)],
       ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
     }) as AsyncIterable<any>) {
       const etype = event.type;
@@ -1416,7 +1796,7 @@ export async function* streamSendToAgentEditChat(
         if (Object.keys(fields).length) {
           await updateCustomAgent(agentId, fields);
           Object.assign(updated, fields);
-          for (const k of ['name', 'workflow'] as const) {
+          for (const k of ['name', 'workflow', 'category'] as const) {
             if (fields[k] !== undefined) {
               synthesizedProgress.push(t('process.agent.update_field', { field: k }));
             }
@@ -1525,13 +1905,16 @@ export function isValidAgentId(id: unknown): boolean {
 export async function createAgentFromBlocks(fields: ExtractedFields): Promise<Agent | null> {
   const name = (fields.name || '').trim();
   const workflow = (fields.workflow || '').trim();
+  const category = fields.category
+    ? normalizeMarketplaceCategoryCode(fields.category)
+    : DEFAULT_MARKETPLACE_CATEGORY_CODE;
   if (!name || !workflow) return null;
   const description = (fields.description || '').trim();
   const description_zh = (fields.description_zh || '').trim();
   const description_en = (fields.description_en || '').trim();
 
   const created = await createCustomAgent({
-    name, description, description_zh, description_en, workflow,
+    name, description, description_zh, description_en, workflow, category,
     ...(typeof fields.interactive === 'boolean' ? { interactive: fields.interactive } : {}),
   });
   if (!created) return null;

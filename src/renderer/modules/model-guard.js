@@ -31,6 +31,9 @@ function _ensureGuardBanner() {
   `;
   el.querySelector('.model-guard-cta').addEventListener('click', () => {
     if (typeof setView === 'function') setView('settings');
+    // Drop the user straight on the 配置 (Credentials) tab — that's where
+    // the model-auth UI lives now (Phase 4 4-tab restructure).
+    if (typeof window.activateSettingsTab === 'function') window.activateSettingsTab('credentials');
   });
   // Keep this one in sync when user toggles language.
   window.addEventListener('i18n-change', () => {
@@ -95,6 +98,7 @@ function ensureModelConfigured(opts = {}) {
       else window.alert(msg);
     } catch (_) { /* swallow — alert is best-effort */ }
     if (typeof setView === 'function') setView('settings');
+    if (typeof window.activateSettingsTab === 'function') window.activateSettingsTab('credentials');
   }
   return false;
 }

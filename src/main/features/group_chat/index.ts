@@ -14,16 +14,17 @@ import * as path from 'node:path';
 import { userChatsDir, groupChatVisibilityFile } from '../../paths';
 import { readJsonl, rewriteJsonlLine, nowIso, safeId } from '../../storage';
 import { createLogger } from '../../logger';
+import { t } from '../../i18n';
 
 import {
-  USER_ID, readMembers, readState, seedReservedActors, purgeGroupDir,
-  setCodingProjectDir,
+  COMMANDER_ID, USER_ID, readMembers, readState, seedReservedActors, purgeGroupDir,
+  setCodingProjectDir, setStatus,
 } from './state';
-import { isPlaceholderTitle } from './conv_workspace';
+import { isPlaceholderTitle } from './conv_title';
 import { readPlan, type PlanFile } from './plan';
 import * as planExecutor from './plan_executor';
 import {
-  abort as busAbort, dropConv as busDropConv, enqueue, subscribe, isQuiescent,
+  abort as busAbort, dropConv as busDropConv, enqueue, subscribe, isQuiescent, runtimeSnapshot,
   type GroupEvent,
 } from './bus';
 
@@ -32,6 +33,29 @@ import {
  *  in the microtask gap between turns; the bus's in-memory queues are the
  *  authoritative source. */
 export const busIsQuiescent = isQuiescent;
+
+export async function runtimeStatus(
+  userId: string,
+  cid: string,
+): Promise<{ processing: boolean; processing_since: string | null; in_flight: string[] }> {
+  if (!safeId(cid)) return { processing: false, processing_since: null, in_flight: [] };
+  try {
+    const state = await readState(userId, cid);
+    const runtime = runtimeSnapshot(userId, cid);
+    const inFlight = Array.from(new Set([
+      ...(Array.isArray(state.in_flight) ? state.in_flight : []),
+      ...runtime.inFlight,
+    ].filter(Boolean)));
+    const processing = state.status === 'running' || runtime.processing;
+    return {
+      processing,
+      processing_since: processing ? (state.last_active_at || null) : null,
+      in_flight: inFlight,
+    };
+  } catch {
+    return { processing: false, processing_since: null, in_flight: [] };
+  }
+}
 
 /** Re-export so the IPC layer can subscribe to the bus BEFORE calling
  *  send(). enqueue wakes the recipient worker synchronously, which then
@@ -43,6 +67,8 @@ import type { GroupMessage } from './visibility';
 import {
   type ChatFormPayload, encodeSubmission, buildMention,
 } from './router';
+import type { MarketplaceInstallRequest } from './visibility';
+import * as marketplace from '../marketplace';
 
 const log = createLogger('group_chat.facade');
 
@@ -143,7 +169,10 @@ export async function retryStep(
 ): Promise<{ ok: boolean; error?: string }> {
   if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
   if (!Number.isFinite(stepIndex) || stepIndex < 1) return { ok: false, error: 'invalid stepIndex' };
-  return planExecutor.retryStep(userId, cid, stepIndex);
+  await clearAbortedStatusForRecovery(userId, cid);
+  const result = await planExecutor.retryStep(userId, cid, stepIndex);
+  if (result.ok) _emitPlanSignal(userId, cid, stepIndex, 'retry');
+  return result;
 }
 
 /** User-initiated skip of a failed plan step (rail "Skip" button). */
@@ -152,7 +181,56 @@ export async function skipStep(
 ): Promise<{ ok: boolean; error?: string }> {
   if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
   if (!Number.isFinite(stepIndex) || stepIndex < 1) return { ok: false, error: 'invalid stepIndex' };
-  return planExecutor.skipStep(userId, cid, stepIndex);
+  await clearAbortedStatusForRecovery(userId, cid);
+  const result = await planExecutor.skipStep(userId, cid, stepIndex);
+  if (result.ok) _emitPlanSignal(userId, cid, stepIndex, 'skip');
+  return result;
+}
+
+/** Expert-signals hook (plan §5 mounts #2/#3) — read the plan to recover
+ *  the agent_id assigned to this step + the source agent msg id, then emit
+ *  retry/skip signal. Fire-and-forget; failures never block the IPC reply.
+ *
+ *  turn_id = `step.output_msg_id` (the agent msg this step produced).
+ *  Per expert-signals plan §3.4 + types.ts Signal.turn_id doc: `turn_id` is
+ *  the agent msg id this signal reacts to / is produced by. For retry/skip
+ *  that's the source output being retried — letting consumers JOIN this
+ *  signal against `skill_invoked` / `tool_failure` from the same agent
+ *  turn. Previous design used synthetic `<cid>:plan:<step>` shared across
+ *  every retry on the same step; the shared-id property is now recovered
+ *  via `metadata.step_index` group-by (consumers count repeat retries
+ *  there). When the step has no `output_msg_id` (rare — step in_progress
+ *  with no output yet), the signal is dropped: a turn_id-less retry signal
+ *  can't be attributed to a specific agent turn. */
+function _emitPlanSignal(uid: string, cid: string, stepIndex: number, kind: 'retry' | 'skip'): void {
+  (async () => {
+    try {
+      const plan = await readPlan(uid, cid);
+      const step = plan?.steps?.[stepIndex - 1];
+      const aid = (step && typeof (step as any).assignee === 'string') ? (step as any).assignee : '';
+      if (!aid) return;            // user-assignee or missing — no signal target
+      const turn_id = (step as any)?.output_msg_id;
+      if (!turn_id) return;        // no source agent msg id → drop (see fn doc)
+      const { emitSignal } = await import('../expert_signals');
+      const { buildRetrySignal, buildSkipSignal } = await import('../expert_signals/extractors/event');
+      emitSignal(uid, (kind === 'retry' ? buildRetrySignal : buildSkipSignal)({
+        cid, aid, turn_id, step_index: stepIndex,
+        msg_ids: [turn_id],
+      }));
+    } catch (err) {
+      log.warn(`expert-signals plan ${kind} emit failed cid=${cid} step=${stepIndex}: ${(err as Error).message}`);
+    }
+  })();
+}
+
+async function clearAbortedStatusForRecovery(userId: string, cid: string): Promise<void> {
+  try {
+    const state = await readState(userId, cid);
+    if (state.status === 'aborted') await setStatus(userId, cid, 'idle');
+  } catch {
+    // Recovery actions should still reach the plan executor even if the
+    // runtime status file is temporarily unavailable.
+  }
 }
 
 // ── Streaming events ─────────────────────────────────────────────────────
@@ -224,8 +302,10 @@ export interface MarkFormSubmittedInput {
  * here would either dispatch silently (no renderer subscription = lost
  * events) or double-enqueue (if renderer also sends).
  *
- * Returns the encoded submission text and the recipient agent_id so the
- * renderer can fire the send without re-encoding client-side.
+ * Returns the encoded submission text and the recipient actor id so the
+ * renderer can fire the send without re-encoding client-side. Agent-owned
+ * forms route back to that agent; user-owned plan forms route to `@user`
+ * so the executor can close the user step without waking commander.
  */
 export async function markFormSubmittedAndDispatch(
   input: MarkFormSubmittedInput,
@@ -258,6 +338,24 @@ export async function markFormSubmittedAndDispatch(
   }
   log.info(`form-submitted user=${userId} cid=${cid} msgId=${msgId} agent=${agentId} fields=${target.form.fields.length}`);
 
+  // Expert-signals hook (plan §5 mount #4): one form_left_blank signal per
+  // field the user didn't touch (kept blank OR kept default). Fire-and-
+  // forget; failures never block the form submission.
+  (async () => {
+    try {
+      const { emitSignal } = await import('../expert_signals');
+      const { buildFormLeftBlankSignals } = await import('../expert_signals/extractors/event');
+      const signals = buildFormLeftBlankSignals({
+        cid, aid: agentId, turn_id: msgId, msg_id: msgId,
+        fields: target.form.fields as any,
+        values: (values || {}) as Record<string, unknown>,
+      });
+      for (const sig of signals) emitSignal(userId, sig);
+    } catch (err) {
+      log.warn(`expert-signals form_left_blank emit failed cid=${cid} msgId=${msgId}: ${(err as Error).message}`);
+    }
+  })();
+
   // Coding-agent contract: when a `project_dir` field is present in the
   // submitted form for an external claude / codex agent, persist it to
   // conv state so `_runCliAgentTurn` can spawn the CLI inside that
@@ -278,8 +376,9 @@ export async function markFormSubmittedAndDispatch(
         if (oldDir && oldDir !== projDir) {
           // cwd is about to change — claude code's sessions are cwd-keyed,
           // so the existing binding would fail with "No conversation
-          // found" on resume. Drop it; next dispatch replays the full
-          // slice so the user-visible conversation continues seamlessly.
+          // found" on resume. Drop it; next dispatch starts a fresh CLI
+          // session and bridges the prior visible transcript once so the
+          // user-visible conversation continues seamlessly.
           const cliSessions = await import('../local_agents/sessions');
           await cliSessions.clearForConversation(userId, cid);
           log.info(`coding cwd changed (form) user=${userId} cid=${cid} ${oldDir} → ${projDir} — cleared cli sessions`);
@@ -310,14 +409,19 @@ export async function markFormSubmittedAndDispatch(
   );
   // `buildMention` keeps the display name verbatim (whitespace included);
   // falling back to the id keeps the dispatch working if the agent was
-  // renamed/disabled between form emit and submit.
+  // renamed/disabled between form emit and submit. User-owned plan forms
+  // deliberately keep `@user`: it is stripped from persisted text while
+  // routing the replay to the user actor, which lets plan reconciliation
+  // consume the answer without starting a commander turn.
   let mention = buildMention(agentId);
-  try {
-    const agentsFeat = await import('../agents');
-    const ag = await agentsFeat.getAgent(agentId);
-    if (ag && ag.name) mention = buildMention(ag.name);
-  } catch (err) {
-    log.warn(`form-submit name lookup failed agent=${agentId}: ${(err as Error).message}`);
+  if (agentId !== USER_ID) {
+    try {
+      const agentsFeat = await import('../agents');
+      const ag = await agentsFeat.getAgent(agentId);
+      if (ag && ag.name) mention = buildMention(ag.name);
+    } catch (err) {
+      log.warn(`form-submit name lookup failed agent=${agentId}: ${(err as Error).message}`);
+    }
   }
   // Newline (not space) between the @-mention and the bullet list so the
   // markdown renderer treats them as a paragraph followed by a list. With a
@@ -325,6 +429,241 @@ export async function markFormSubmittedAndDispatch(
   // and gets parsed as a hyphen in prose, dropping the first field out of
   // the list and leaving subsequent bullets visually orphaned.
   return { ok: true, submission: { text: `${mention}\n${encoded}`, agent_id: agentId } };
+}
+
+// ── Marketplace install confirmation ────────────────────────────────────
+
+export interface ResolveMarketplaceInstallRequestInput {
+  userId: string;
+  cid: string;
+  msgId: string;
+  requestId: string;
+  decision: 'install' | 'skip';
+}
+
+function _xmlAttr(value: unknown): string {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function _marketplaceResultSummary(req: MarketplaceInstallRequest, status: 'installed' | 'skipped' | 'failed', error?: string): string {
+  const name = req.name || req.id;
+  const kind = req.kind === 'skill'
+    ? t('marketplace_install_result.kind_skill')
+    : t('marketplace_install_result.kind_agent');
+  if (status === 'installed') {
+    return t('marketplace_install_result.installed', { kind, name });
+  }
+  if (status === 'skipped') {
+    return t('marketplace_install_result.skipped', { kind, name });
+  }
+  return t('marketplace_install_result.failed', { kind, name, error: error || 'unknown error' });
+}
+
+function _encodeMarketplaceInstallResult(
+  req: MarketplaceInstallRequest,
+  status: 'installed' | 'skipped' | 'failed',
+  error?: string,
+): string {
+  const payload = {
+    request_id: req.request_id,
+    kind: req.kind,
+    id: req.id,
+    name: req.name,
+    version: req.version,
+    published_at: req.published_at,
+    ...(typeof req.updated_at === 'number' ? { updated_at: req.updated_at } : {}),
+    status,
+    ...(error ? { error } : {}),
+  };
+  const json = JSON.stringify(payload, null, 2)
+    .replace(/<\/marketplace-install-result/gi, '<\\/marketplace-install-result');
+  return [
+    _marketplaceResultSummary(req, status, error),
+    `<marketplace-install-result request_id="${_xmlAttr(req.request_id)}" kind="${_xmlAttr(req.kind)}" id="${_xmlAttr(req.id)}" status="${_xmlAttr(status)}">`,
+    json,
+    '</marketplace-install-result>',
+  ].join('\n');
+}
+
+async function _rewriteMarketplaceRequestInFile(
+  file: string,
+  msgId: string,
+  requestId: string,
+  patch: Partial<MarketplaceInstallRequest>,
+): Promise<void> {
+  if (!fs.existsSync(file)) return;
+  const rows = await readJsonl<GroupMessage>(file, 100_000);
+  const idx = rows.findIndex((m) => m.id === msgId);
+  if (idx < 0) return;
+  await rewriteJsonlLine<GroupMessage>(file, idx, (rec) => {
+    if (!rec || rec.id !== msgId || !Array.isArray(rec.marketplace_requests)) return null;
+    const reqIdx = rec.marketplace_requests.findIndex((r) => r.request_id === requestId);
+    if (reqIdx < 0) return null;
+    const nextReqs = rec.marketplace_requests.slice();
+    nextReqs[reqIdx] = { ...nextReqs[reqIdx], ...patch };
+    return { ...rec, marketplace_requests: nextReqs };
+  });
+}
+
+async function _patchMarketplaceRequest(
+  userId: string,
+  cid: string,
+  msgId: string,
+  requestId: string,
+  patch: Partial<MarketplaceInstallRequest>,
+): Promise<{ ok: true; request: MarketplaceInstallRequest; message: GroupMessage } | { ok: false; error: string }> {
+  const file = mainJsonlFile(userId, cid);
+  const all = await readJsonl<GroupMessage>(file, 100_000);
+  const idx = all.findIndex((m) => m.id === msgId);
+  if (idx < 0) return { ok: false, error: 'message not found' };
+  const target = all[idx];
+  const requests = Array.isArray(target.marketplace_requests) ? target.marketplace_requests : [];
+  const reqIdx = requests.findIndex((r) => r.request_id === requestId);
+  if (reqIdx < 0) return { ok: false, error: 'request not found' };
+
+  let updatedReq: MarketplaceInstallRequest | null = null;
+  const r = await rewriteJsonlLine<GroupMessage>(file, idx, (rec) => {
+    if (!rec || rec.id !== msgId || !Array.isArray(rec.marketplace_requests)) return null;
+    const currentIdx = rec.marketplace_requests.findIndex((x) => x.request_id === requestId);
+    if (currentIdx < 0) return null;
+    const nextReqs = rec.marketplace_requests.slice();
+    updatedReq = { ...nextReqs[currentIdx], ...patch };
+    nextReqs[currentIdx] = updatedReq;
+    return { ...rec, marketplace_requests: nextReqs };
+  });
+  if (r.ok === false || !updatedReq) return { ok: false, error: r.ok === false ? r.error : 'request update failed' };
+
+  // Keep the commander's replay slice in sync; other actors do not need the
+  // card state for reasoning, and the main jsonl is the renderer source.
+  try {
+    await _rewriteMarketplaceRequestInFile(
+      groupChatVisibilityFile(userId, cid, target.from),
+      msgId,
+      requestId,
+      patch,
+    );
+  } catch (err) {
+    log.warn(`marketplace request slice update failed user=${userId} cid=${cid} msgId=${msgId}: ${(err as Error).message}`);
+  }
+  return { ok: true, request: updatedReq, message: r.record };
+}
+
+async function _autoBindInstalledMarketplaceResource(
+  userId: string,
+  cid: string,
+  req: MarketplaceInstallRequest,
+): Promise<void> {
+  try {
+    const chats = await import('../chats');
+    const conv = await chats.getConversation(userId, cid);
+    const projectId = (conv as any)?.project_id;
+    if (typeof projectId !== 'string' || !projectId) return;
+    const projectsFeat = await import('../projects');
+    if (req.kind === 'agent') {
+      await projectsFeat.addAgentBinding(userId, projectId, req.id);
+    } else {
+      await projectsFeat.addSkillBinding(userId, projectId, req.id);
+    }
+    log.info(`auto-bound marketplace ${req.kind} ${req.id} to project ${projectId} after install`);
+  } catch (err) {
+    log.warn(`marketplace install auto-bind failed user=${userId} cid=${cid} id=${req.id}: ${(err as Error).message}`);
+  }
+}
+
+export async function resolveMarketplaceInstallRequest(
+  input: ResolveMarketplaceInstallRequestInput,
+): Promise<{
+  ok: boolean;
+  error?: string;
+  request?: MarketplaceInstallRequest;
+  submission?: { text: string; agent_id: string };
+}> {
+  const { userId, cid, msgId, requestId, decision } = input;
+  if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
+  if (!safeId(msgId) || !safeId(requestId)) return { ok: false, error: 'invalid request' };
+  if (decision !== 'install' && decision !== 'skip') return { ok: false, error: 'invalid decision' };
+
+  const file = mainJsonlFile(userId, cid);
+  const all = await readJsonl<GroupMessage>(file, 100_000);
+  const target = all.find((m) => m.id === msgId);
+  const req = target?.marketplace_requests?.find((r) => r.request_id === requestId) || null;
+  if (!target || !req) return { ok: false, error: 'request not found' };
+  if (req.status !== 'pending') return { ok: false, error: 'request already resolved' };
+  if (req.kind !== 'agent' && req.kind !== 'skill') return { ok: false, error: 'invalid request kind' };
+  if (!safeId(req.id) || !req.version || !Number.isFinite(req.published_at)) {
+    return { ok: false, error: 'invalid marketplace request payload' };
+  }
+
+  if (decision === 'skip') {
+    const patched = await _patchMarketplaceRequest(userId, cid, msgId, requestId, {
+      status: 'skipped',
+      resolved_at: nowIso(),
+    });
+    if (!patched.ok) return patched;
+    return {
+      ok: true,
+      request: patched.request,
+      submission: {
+        text: _encodeMarketplaceInstallResult(patched.request, 'skipped'),
+        agent_id: COMMANDER_ID,
+      },
+    };
+  }
+
+  try {
+    if (req.kind === 'agent') {
+      await marketplace.installMarketplaceAgent(req.id, {
+        version: req.version,
+        published_at: req.published_at,
+        ...(typeof req.updated_at === 'number' ? { updated_at: req.updated_at } : {}),
+      });
+    } else {
+      await marketplace.installMarketplaceSkill(req.id, {
+        version: req.version,
+        published_at: req.published_at,
+        ...(typeof req.updated_at === 'number' ? { updated_at: req.updated_at } : {}),
+      });
+    }
+    await _autoBindInstalledMarketplaceResource(userId, cid, req);
+    const patched = await _patchMarketplaceRequest(userId, cid, msgId, requestId, {
+      status: 'installed',
+      resolved_at: nowIso(),
+    });
+    const request = patched.ok
+      ? patched.request
+      : { ...req, status: 'installed' as const, resolved_at: nowIso() };
+    if (patched.ok === false) {
+      log.warn(`marketplace request status update failed after install user=${userId} cid=${cid} msgId=${msgId}: ${patched.error}`);
+    }
+    return {
+      ok: true,
+      request,
+      submission: {
+        text: _encodeMarketplaceInstallResult(request, 'installed'),
+        agent_id: COMMANDER_ID,
+      },
+    };
+  } catch (err) {
+    const error = (err as Error).message || String(err);
+    const patched = await _patchMarketplaceRequest(userId, cid, msgId, requestId, {
+      status: 'failed',
+      resolved_at: nowIso(),
+      error,
+    });
+    const request = patched.ok ? patched.request : { ...req, status: 'failed' as const, resolved_at: nowIso(), error };
+    return {
+      ok: true,
+      request,
+      submission: {
+        text: _encodeMarketplaceInstallResult(request, 'failed', error),
+        agent_id: COMMANDER_ID,
+      },
+    };
+  }
 }
 
 // ── Read messages (UI initial load) ──────────────────────────────────────

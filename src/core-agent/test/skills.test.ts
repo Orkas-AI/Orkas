@@ -162,16 +162,18 @@ describe("SkillLoader", () => {
     expect(block).not.toMatch(/\(`/);
   });
 
-  it("parseSpec rewrites frontmatter name to match dir (invariant enforcement)", () => {
-    // Hand-edited SKILL.md with drifting `name` shouldn't break anything —
-    // the loader normalizes to the directory name and logs a warning.
+  it("parseSpec keeps frontmatter name distinct from dir id (id≠name invariant)", () => {
+    // The loader decouples id (= dir basename, used as `read_file` path
+    // component) from name (= frontmatter name, the LLM-facing display
+    // label). Marketplace installs deliberately let these diverge (dir is
+    // the 12-hex server_id, name is the authored human label).
     const customDir = path.join(root, "custom");
     writeSkill(customDir, "web-summary", { name: "WebSummaryLegacy", description: "x" });
 
     const loader = new SkillLoader({ dirs: [customDir] });
     const [spec] = loader.list();
     expect(spec.id).toBe("web-summary");
-    expect(spec.name).toBe("web-summary");  // not "WebSummaryLegacy"
+    expect(spec.name).toBe("WebSummaryLegacy");  // frontmatter is preserved verbatim
   });
 
 });

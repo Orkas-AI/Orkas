@@ -22,7 +22,11 @@ let _settingsState = {
 };
 
 async function loadSettings() {
+  // 4-tab structure (batch 6). Initialize switching + activate default tab
+  // (通用 by default — matches the is-active class on the markup).
+  if (typeof initSettingsTabs === 'function') initSettingsTabs();
   _settingsBindLanguageOnce();
+  if (typeof initFeedbackSettings === 'function') initFeedbackSettings();
   _settingsSyncLanguageRadio();
   _settingsBindClearAllConvsOnce();
   await Promise.all([
@@ -43,7 +47,22 @@ async function loadSettings() {
   _settingsRenderCommanderAvatar();
   _settingsRenderMetacognition();
   _settingsRenderDataRoot();
+  // Account card + subscription card (views/login/account_settings.js — absent in
+  // OrkasOpen, so these are no-ops there). renderSubscriptionSettings rebinds the
+  // action button's click handler with the current subscription state on every
+  // render — opening the panel is the canonical "guarantee fresh button binding"
+  // moment, so call it explicitly here (not just from the account.onChange listener
+  // which only fires on state changes — for a Free user with no transitions the
+  // listener never fires after boot, leaving the button bound to whatever its
+  // first render captured).
+  if (typeof renderAccountSettings === 'function') renderAccountSettings();
+  if (typeof renderSubscriptionSettings === 'function') renderSubscriptionSettings();
 }
+
+// Desktop auto-update is stripped from the OrkasOpen build — there is no
+// official feed / signing pipeline for OSS releases (see
+// `OpenSource/SyncCode/strip-rules.json`). Users download new versions from
+// GitHub Releases manually.
 
 // ── Commander avatar ──
 // Commander avatar goes through the prefs IPC and lands in
@@ -229,21 +248,35 @@ function _settingsRenderDataRoot() {
   }
 }
 
-// ── Language radio (zh / en) ──
-// Bound once; `loadSettings` just re-syncs the checked state each time the
-// panel is opened so the radio reflects whatever setLang() last persisted.
+// ── Language dropdown ──
+// Bound once on first panel open; `loadSettings` then calls _settingsSyncLanguageRadio()
+// to re-sync the dropdown's current value with whatever setLang() last persisted.
+// Option labels are each language's autonym (本族语自称), intentionally NOT routed
+// through t() — a Chinese user picking "English" should see "English", not the
+// translation of "English" in the current UI language.
 
-let _settingsLanguageBound = false;
+let _settingsLanguageSel = null;   // _aiSelectMount api
+
+const _SETTINGS_LANG_OPTIONS = [
+  ...((typeof getSupportedLanguages === 'function')
+    ? getSupportedLanguages().map((l) => ({ value: l.code, label: l.label }))
+    : [
+        { value: 'zh', label: '简体中文' },
+        { value: 'en', label: 'English' },
+        { value: 'ja', label: '日本語' },
+      ]),
+];
 
 function _settingsBindLanguageOnce() {
-  if (_settingsLanguageBound) return;
-  const row = document.getElementById('settings-language-row');
-  if (!row) return;
-  row.addEventListener('change', async (e) => {
-    const target = e.target;
-    if (!target || target.name !== 'settings-language') return;
-    const next = target.value;
-    if (next !== 'zh' && next !== 'en') return;
+  if (_settingsLanguageSel) return;
+  const el = document.getElementById('settings-language-select');
+  if (!el) return;
+  _settingsLanguageSel = _aiSelectMount(el, {
+    options: _SETTINGS_LANG_OPTIONS,
+    value: (typeof getLang === 'function') ? getLang() : 'en',
+  });
+  _settingsLanguageSel.onChange(async (next) => {
+    if (typeof isSupportedLang === 'function' && !isSupportedLang(next)) return;
     try {
       await setLang(next);
       _settingsLog.info('language changed', { lang: next });
@@ -251,14 +284,12 @@ function _settingsBindLanguageOnce() {
       _settingsLog.warn('setLang failed', { error: (err && err.message) || String(err) });
     }
   });
-  _settingsLanguageBound = true;
 }
 
 function _settingsSyncLanguageRadio() {
-  const cur = typeof getLang === 'function' ? getLang() : 'en';
-  document.querySelectorAll('input[name="settings-language"]').forEach((el) => {
-    el.checked = (el.value === cur);
-  });
+  // Function name kept for caller-side compatibility; semantics is now "sync dropdown value".
+  const cur = (typeof getLang === 'function') ? getLang() : 'en';
+  if (_settingsLanguageSel) _settingsLanguageSel.setValue(cur);
 }
 
 // ── Clear all conversations ──

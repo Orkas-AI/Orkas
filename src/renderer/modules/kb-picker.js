@@ -18,6 +18,13 @@ let _kbPickerCurrentDir = '';     // '' = root
 let _kbPickerExpanded = new Set();
 let _kbPickerTree = [];
 
+function _kbPickerUiIconHtml(name, className) {
+  if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+    return window.uiIconHtml(name, className);
+  }
+  return '';
+}
+
 /**
  * Open the picker. Resolves with `{ path }` where `path` is KB-relative
  * (e.g. "notes/meeting.md"); resolves with `null` on cancel or background
@@ -89,7 +96,7 @@ function _kbPickerRenderTree() {
   let html = `
     <div class="${rootClass}" data-kb-picker-dir="">
       <span class="kb-picker-caret kb-picker-caret-empty"></span>
-      <span class="kb-picker-icon">${ICON_FOLDER_OPEN}</span>
+      <span class="kb-picker-icon">${_kbPickerUiIconHtml('folder-open', 'kb-picker-folder-icon')}</span>
       <span class="kb-picker-label">${escapeHtml(t('contexts.root_label'))}</span>
     </div>
   `;
@@ -105,7 +112,9 @@ function _kbPickerRenderNodes(nodes, depth) {
     .map((n) => {
       const open = _kbPickerExpanded.has(n.path);
       const active = _kbPickerCurrentDir === n.path ? ' active' : '';
-      const icon = open ? ICON_FOLDER_OPEN : ICON_FOLDER_CLOSED;
+      const icon = open
+        ? _kbPickerUiIconHtml('folder-open', 'kb-picker-folder-icon')
+        : _kbPickerUiIconHtml('folder', 'kb-picker-folder-icon');
       const childrenHtml = open
         ? _kbPickerRenderNodes(n.children || [], depth + 1)
         : '';

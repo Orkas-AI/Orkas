@@ -19,17 +19,12 @@ vi.mock('../../../src/main/model/client', () => ({
 
 let tmpDir: string;
 let prevWs: string | undefined;
-let prevBuiltinRoot: string | undefined;
 const TEST_UID = 'u1';
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-skills-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
-  prevBuiltinRoot = process.env.ORKAS_BUILTIN_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
-  // Point builtin source at an empty dir so syncBuiltinSkills doesn't fire
-  // against the real repo during tests.
-  process.env.ORKAS_BUILTIN_ROOT = tmpDir;
   vi.resetModules();
   const users = await import('../../../src/main/features/users');
   users.activateUser(TEST_UID);
@@ -37,7 +32,6 @@ beforeEach(async () => {
 
 afterEach(() => {
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
-  process.env.ORKAS_BUILTIN_ROOT = prevBuiltinRoot;
   streamImpl.current = null;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -51,8 +45,8 @@ function customSkillsDir(): string {
 }
 
 function builtinSkillsDir(): string {
-  // Top-level data/builtin/skills — shared across uids.
-  return path.join(tmpDir, 'builtin', 'skills');
+  // Platform (marketplace-installed) skills live under <uid>/local/marketplace/skills/.
+  return path.join(tmpDir, TEST_UID, 'local', 'marketplace', 'skills');
 }
 
 function writeCustomSkill(id: string, frontmatter = `name: "${id}"\ndescription: "test"`, body = '# body'): void {
@@ -332,12 +326,22 @@ describe('skills › extractSkillContainers', () => {
   // span — would falsely trigger a real skill write. This is the "agent
   // section line 229 / chat_skill_setup.md showing protocol" risk surface.
 
-  it('B5: `<skill>` inside fenced ```xml block must NOT match', async () => {
+  it('B5: `<skill>` inside fenced non-XML code block must NOT match', async () => {
     const s = await loadSkills();
-    const text = 'Here is the format:\n```xml\n<skill>\n<skill_id>example</skill_id>\n<<<skill-file path=SKILL.md\nname: "example"\n>>>\n</skill>\n```\nThat is the shape.';
+    const text = 'Here is the format:\n```\n<skill>\n<skill_id>example</skill_id>\n<<<skill-file path=SKILL.md\nname: "example"\n>>>\n</skill>\n```\nThat is the shape.';
     const r = s.extractSkillContainers(text);
     expect(r.containers).toEqual([]);
     expect(r.cleanText).toBe(text); // Untouched — it's prose teaching, not a real op.
+  });
+
+  it('B5b: `<skill>` inside fenced ```xml block is treated as structural', async () => {
+    const s = await loadSkills();
+    const text = '```xml\n<skill>\n<skill_id>example</skill_id>\n<<<skill-file path=SKILL.md\nbody\n>>>\n</skill>\n```';
+    const r = s.extractSkillContainers(text);
+    expect(r.containers).toHaveLength(1);
+    expect(r.containers[0].skillId).toBe('example');
+    expect(r.containers[0].files.map((f: any) => f.path)).toEqual(['SKILL.md']);
+    expect(r.cleanText).toBe('```xml\n\n```');
   });
 
   it('B6: `<skill>` inside inline backtick span must NOT match', async () => {
@@ -348,16 +352,24 @@ describe('skills › extractSkillContainers', () => {
     expect(r.cleanText).toBe(text);
   });
 
+  it('B6b: inline quoted `<skill>` text must NOT match', async () => {
+    const s = await loadSkills();
+    const text = '请输出 "<skill><skill_id>example</skill_id></skill>" 这些字符';
+    const r = s.extractSkillContainers(text);
+    expect(r.containers).toEqual([]);
+    expect(r.cleanText).toBe(text);
+  });
+
   it('B7: real container AFTER a code-fence example — only the real one is extracted', async () => {
     const s = await loadSkills();
     // Critical: this is the failure mode the guard prevents — a naive
     // regex would match the FIRST `<skill>` (the fenced example) and
     // try to write fictional files, ignoring the real container below.
-    const text = 'Format:\n```xml\n<skill>\n<skill_id>example</skill_id>\n</skill>\n```\nAnd here is the real one:\n<skill>\n<skill_id>real</skill_id>\n<<<skill-file path=SKILL.md\nbody\n>>>\n</skill>';
+    const text = 'Format:\n```\n<skill>\n<skill_id>example</skill_id>\n</skill>\n```\nAnd here is the real one:\n<skill>\n<skill_id>real</skill_id>\n<<<skill-file path=SKILL.md\nbody\n>>>\n</skill>';
     const r = s.extractSkillContainers(text);
     expect(r.containers).toHaveLength(1);
     expect(r.containers[0].skillId).toBe('real');
-    expect(r.cleanText).toContain('```xml');
+    expect(r.cleanText).toContain('```');
     expect(r.cleanText).toContain('<skill>\n<skill_id>example</skill_id>'); // fenced example survives
   });
 });
@@ -365,7 +377,7 @@ describe('skills › extractSkillContainers', () => {
 describe('skills › applySkillContainerFromCommander › create', () => {
   it('creates skill from frontmatter `name`, writes all blocks', async () => {
     const s = await loadSkills();
-    const skillMdContent = '---\nname: "social-fetch"\ndescription_zh: "抓取并分析"\ndescription_en: "Fetch and analyze"\n---\n\n# When to use\n…\n';
+    const skillMdContent = '---\nname: "social-fetch"\ndescription_zh: "抓取并分析"\ndescription_en: "Fetch and analyze"\ncategory: "data"\n---\n\n# When to use\n…\n';
     const r = await s.applySkillContainerFromCommander({
       files: [
         { path: 'SKILL.md', content: skillMdContent },
@@ -397,6 +409,23 @@ describe('skills › applySkillContainerFromCommander › create', () => {
     });
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/name|缺少/);
+  });
+
+  it('backfills category when model-authored create omits or mangles it', async () => {
+    const s = await loadSkills();
+    const missing = await s.applySkillContainerFromCommander({
+      files: [{ path: 'SKILL.md', content: '---\nname: "uncategorized"\ndescription_en: "x"\n---\n\nbody\n' }],
+    });
+    expect(missing.ok).toBe(true);
+    expect(fs.readFileSync(path.join(customSkillsDir(), 'uncategorized', 'SKILL.md'), 'utf8'))
+      .toContain('category: "general"');
+
+    const invalid = await s.applySkillContainerFromCommander({
+      files: [{ path: 'SKILL.md', content: '---\nname: "badcat"\ndescription_en: "x"\ncategory: "bad category"\n---\n\nbody\n' }],
+    });
+    expect(invalid.ok).toBe(true);
+    expect(fs.readFileSync(path.join(customSkillsDir(), 'badcat', 'SKILL.md'), 'utf8'))
+      .toContain('category: "general"');
   });
 
   it('rejects create when name has Chinese characters (charset gate)', async () => {
@@ -447,28 +476,43 @@ describe('skills › applySkillContainerFromCommander › edit', () => {
       files: [{ path: 'SKILL.md', content: '---\nname: "shipped"\n---\n\ntampered\n' }],
     });
     expect(r.ok).toBe(false);
-    expect(r.error).toMatch(/built-in|内置/i);
+    expect(r.error).toMatch(/marketplace|平台技能|マーケットプレイス/i);
     // Original body preserved.
     expect(fs.readFileSync(path.join(builtinSkillsDir(), 'shipped', 'SKILL.md'), 'utf8'))
       .toContain('body');
   });
 
-  it('rejects edit when skill does not exist', async () => {
+  it('creates when skill_id target is missing but a full SKILL.md payload is present', async () => {
     const s = await loadSkills();
     const r = await s.applySkillContainerFromCommander({
       skillId: 'nonexistent',
-      files: [{ path: 'SKILL.md', content: '---\nname: "nonexistent"\n---\n\nbody\n' }],
+      files: [{
+        path: 'SKILL.md',
+        content: '---\nname: "nonexistent"\ndescription_zh: "测试技能"\ndescription_en: "Test skill"\ncategory: "general"\n---\n\n# When to use\nUse for test prompts.\n',
+      }],
+    });
+    expect(r.ok).toBe(true);
+    expect(r.kind).toBe('created');
+    expect(r.skillId).toBe('nonexistent');
+    expect(fs.existsSync(path.join(customSkillsDir(), 'nonexistent', 'SKILL.md'))).toBe(true);
+  });
+
+  it('rejects missing skill_id target when there is no SKILL.md create payload', async () => {
+    const s = await loadSkills();
+    const r = await s.applySkillContainerFromCommander({
+      skillId: 'nonexistent',
+      files: [{ path: 'scripts/run.py', content: 'pass\n' }],
     });
     expect(r.ok).toBe(false);
     expect(r.error).toMatch(/not found|不存在/i);
   });
 
   it('auto-renames the dir when SKILL.md `name` changes', async () => {
-    writeCustomSkill('oldname', 'name: "oldname"\ndescription_en: "x"', 'body');
+    writeCustomSkill('oldname', 'name: "oldname"\ndescription_en: "x"\ncategory: "general"', 'body');
     const s = await loadSkills();
     const r = await s.applySkillContainerFromCommander({
       skillId: 'oldname',
-      files: [{ path: 'SKILL.md', content: '---\nname: "newname"\ndescription_en: "x"\n---\n\nbody\n' }],
+      files: [{ path: 'SKILL.md', content: '---\nname: "newname"\ndescription_en: "x"\ncategory: "general"\n---\n\nbody\n' }],
     });
     expect(r.ok).toBe(true);
     expect(r.skillId).toBe('newname');
@@ -493,47 +537,9 @@ describe('skills › applySkillContainerFromCommander › edit', () => {
   });
 });
 
-describe('skills › hashTree', () => {
-  it('returns empty string for missing dir', async () => {
-    const s = await loadSkills();
-    expect(s.hashTree(path.join(tmpDir, 'nope'))).toBe('');
-  });
-
-  it('returns stable hex digest for same content', async () => {
-    const s = await loadSkills();
-    const root = path.join(tmpDir, 'stable');
-    fs.mkdirSync(root, { recursive: true });
-    fs.writeFileSync(path.join(root, 'a.txt'), 'hello');
-    const h1 = s.hashTree(root);
-    const h2 = s.hashTree(root);
-    expect(h1).toMatch(/^[0-9a-f]{64}$/);
-    expect(h1).toBe(h2);
-  });
-
-  it('changes when a file changes', async () => {
-    const s = await loadSkills();
-    const root = path.join(tmpDir, 'changes');
-    fs.mkdirSync(root, { recursive: true });
-    fs.writeFileSync(path.join(root, 'a.txt'), 'v1');
-    const h1 = s.hashTree(root);
-    fs.writeFileSync(path.join(root, 'a.txt'), 'v2');
-    const h2 = s.hashTree(root);
-    expect(h1).not.toBe(h2);
-  });
-
-  it('ignores dotfiles and ignored dirs', async () => {
-    const s = await loadSkills();
-    const root = path.join(tmpDir, 'ignored');
-    fs.mkdirSync(root, { recursive: true });
-    fs.writeFileSync(path.join(root, 'a.txt'), 'hello');
-    const h1 = s.hashTree(root);
-    fs.writeFileSync(path.join(root, '.DS_Store'), 'garbage');
-    fs.mkdirSync(path.join(root, '__pycache__'));
-    fs.writeFileSync(path.join(root, '__pycache__', 'x.pyc'), 'bin');
-    const h2 = s.hashTree(root);
-    expect(h1).toBe(h2);
-  });
-});
+// hashTree / syncBuiltinSkills removed: there is no globally-shared `data/builtin/`
+// tree anymore. Platform skills now arrive via marketplace install and live at
+// `<uid>/local/marketplace/skills/<id>/` per machine — see features/marketplace_*.ts.
 
 describe('skills › listSkills', () => {
   it('returns empty when both dirs are missing', async () => {
@@ -548,7 +554,7 @@ describe('skills › listSkills', () => {
     const s = await loadSkills();
     const list = await s.listSkills();
     expect(list).toEqual([
-      { id: 'alpha', name: 'Alpha', source: 'custom', description_zh: '', description_en: 'The first', enabled: true },
+      { id: 'alpha', name: 'Alpha', source: 'custom', description_zh: '', description_en: 'The first', category: '', create_uid: undefined, enabled: true },
     ]);
   });
 
@@ -564,6 +570,30 @@ describe('skills › listSkills', () => {
     expect(dup).toHaveLength(1);
     expect(dup[0].source).toBe('custom');
     expect(dup[0].description_en).toBe('cx');
+  });
+
+  it('cache-only invalidator picks up marketplace file rewrites', async () => {
+    const parent = builtinSkillsDir();
+    const dir = path.join(parent, 'platform-skill');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'SKILL.md'),
+      '---\nname: "Old platform skill"\ndescription: "old"\n---\n');
+    const fixedStamp = new Date('2026-01-01T00:00:00.000Z');
+    fs.utimesSync(parent, fixedStamp, fixedStamp);
+
+    const s = await loadSkills();
+    expect((await s.listSkills()).find((x) => x.id === 'platform-skill')?.name)
+      .toBe('Old platform skill');
+
+    fs.writeFileSync(path.join(dir, 'SKILL.md'),
+      '---\nname: "New platform skill"\ndescription: "new"\n---\n');
+    fs.utimesSync(parent, fixedStamp, fixedStamp);
+
+    expect((await s.listSkills()).find((x) => x.id === 'platform-skill')?.name)
+      .toBe('Old platform skill');
+    s.clearSkillListCache();
+    expect((await s.listSkills()).find((x) => x.id === 'platform-skill')?.name)
+      .toBe('New platform skill');
   });
 });
 
@@ -582,6 +612,7 @@ describe('skills › getCustomSkill', () => {
       name: 'Alpha',
       description_zh: '',
       description_en: 'desc',
+      category: '',
       source: 'custom',
       dir: path.join(customSkillsDir(), 'alpha'),
     });
@@ -615,7 +646,7 @@ describe('skills › createCustomSkill', () => {
     const builtinDir = path.join(builtinSkillsDir(), 'fixed');
     fs.mkdirSync(builtinDir, { recursive: true });
     const s = await loadSkills();
-    await expect(s.createCustomSkill('fixed', '')).rejects.toThrow(/conflicts with a built-in|内置技能冲突/);
+    await expect(s.createCustomSkill('fixed', '')).rejects.toThrow(/conflicts with a marketplace|与平台技能冲突|マーケットプレイスのスキルと競合/);
   });
 });
 
@@ -638,6 +669,23 @@ describe('skills › updateCustomSkill', () => {
     const s = await loadSkills();
     const updated = await s.updateCustomSkill('alpha', { name: 'beta' });
     expect(updated?.id).toBe('beta');
+    expect(fs.existsSync(path.join(customSkillsDir(), 'alpha'))).toBe(false);
+    expect(fs.existsSync(path.join(customSkillsDir(), 'beta'))).toBe(true);
+  });
+
+  it('supports two-phase name edits with skipRename before final rename', async () => {
+    writeCustomSkill('alpha', 'name: "alpha"\ndescription_en: "x"', 'body');
+    const s = await loadSkills();
+
+    const staged = await s.updateCustomSkill('alpha', { name: 'beta' }, { skipRename: true });
+    expect(staged?.id).toBe('alpha');
+    expect(fs.existsSync(path.join(customSkillsDir(), 'alpha'))).toBe(true);
+    expect(fs.existsSync(path.join(customSkillsDir(), 'beta'))).toBe(false);
+    expect(fs.readFileSync(path.join(customSkillsDir(), 'alpha', 'SKILL.md'), 'utf8'))
+      .toContain('name: "beta"');
+
+    const committed = await s.updateCustomSkill('alpha', { name: 'beta' });
+    expect(committed?.id).toBe('beta');
     expect(fs.existsSync(path.join(customSkillsDir(), 'alpha'))).toBe(false);
     expect(fs.existsSync(path.join(customSkillsDir(), 'beta'))).toBe(true);
   });
@@ -666,7 +714,7 @@ describe('skills › deleteCustomSkill', () => {
     writeCustomSkill('target');
     const sessionDir = path.join(tmpDir, TEST_UID, 'cloud', 'sessions');
     fs.mkdirSync(sessionDir, { recursive: true });
-    const sessionFile = path.join(sessionDir, `${TEST_UID}-skill-target.jsonl`);
+    const sessionFile = path.join(sessionDir, 'skill-target.jsonl');
     fs.writeFileSync(sessionFile, '{"role":"user","content":"old"}\n');
 
     const s = await loadSkills();
@@ -730,7 +778,7 @@ describe('skills › listSkillTree', () => {
 
 describe('skills › buildSkillEditSystemPrompt', () => {
   it('renders template with skill metadata + file list, no leftover placeholders', async () => {
-    writeCustomSkill('alpha', 'name: "Alpha"\ndescription: "a demo"', 'body text');
+    writeCustomSkill('alpha', 'name: "Alpha"\ndescription: "a demo"\ncategory: "writing"', 'body text');
     const s = await loadSkills();
     const skill = (await s.getCustomSkill('alpha'))!;
     const sys = await s.buildSkillEditSystemPrompt(skill);
@@ -741,7 +789,7 @@ describe('skills › buildSkillEditSystemPrompt', () => {
     // Template no longer carries the user-input footer.
     expect(sys).not.toMatch(/##\s*用户的初始请求/);
     // All placeholders resolved.
-    expect(sys).not.toMatch(/\$skill_name|\$skill_description|\$skill_dir|\$skill_files/);
+    expect(sys).not.toMatch(/\$skill_name|\$skill_description|\$skill_category|\$category_field_definition|\$skill_dir|\$skill_files/);
   });
 });
 
@@ -830,3 +878,7 @@ describe('skills › streamSendToSkillChat synthesized progress', () => {
     expect(events.filter((e) => e.type === 'progress')).toHaveLength(0);
   });
 });
+
+// (The legacy marketplace-sentinel / data/builtin sync tests are gone. Marketplace
+// installs now live at `<uid>/local/marketplace/skills/<id>/` and are reconciled from
+// the cloud-synced `installs.json` manifest — see features/marketplace_*.ts.)

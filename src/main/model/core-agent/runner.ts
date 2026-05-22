@@ -32,6 +32,7 @@ import { appendAgentSkill } from '../../features/agents';
 const log = createLogger('model/runner');
 import { createLocalTools, createFileTools } from './local-tools';
 import { createKbTools } from './kb-tools';
+import { createChatHistoryTools } from './chat-history-tools';
 import { createImageGenTool } from './image-gen-tool';
 import { createWebSearchOverrideTool } from './search-tools';
 import { sessionToolResultsDir, agentEvolvedSkillsDir } from '../../paths';
@@ -47,6 +48,7 @@ import { EXTERNAL_API_PROVIDERS } from '../provider_catalog';
 import { readDisabledSets } from '../../features/component_enabled';
 import { nativeSearchToolForApi, nativeSearchToolName } from './native-search-tools';
 import { hasAnySearchProfile } from '../../features/search_auth';
+import { createConnectorMetaTools, getConnectorPromptBlock } from './connector-meta-tools';
 import { createLogger } from '../../logger';
 import type { MemoryToolHandler } from '../../../core-agent/src/tools/memory-tool';
 import type { MetacognitionToolHandler } from '../../../core-agent/src/tools/metacognition-tool';
@@ -126,6 +128,16 @@ export interface BuildRunnerParams {
   /** Caller-supplied predicate consumed by write-style tools' uniquify
    *  logic. See `model/client.ts` `ChatOptions.hasProducedPath`. */
   hasProducedPath?: (absPath: string) => boolean;
+  /** Fires after each successful `create_artifact` call. See `model/client.ts`
+   *  `ChatOptions.onArtifactCreated`. */
+  onArtifactCreated?: (a: { id: string; title: string }) => void;
+  /** Fires once per skill id rendered into the system-prompt skills index,
+   *  with its source system. Called at runner build time (before the LLM
+   *  sees the prompt). Bus collects per turn for `skill_advertised`. */
+  onSkillAdvertised?: (skill_id: string, system: 'A.custom' | 'A.platform' | 'B') => void;
+  /** Fires when `read_file` resolves to a SKILL.md path inside any of the
+   *  three skill roots. Bus collects per turn for `skill_invoked`. */
+  onSkillInvoked?: (skill_id: string, system: 'A.custom' | 'A.platform' | 'B', trigger: 'read_file') => void;
 }
 
 /** Tool definition snapshot used to log "what tools did the LLM actually see
@@ -166,10 +178,11 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
 
   // Per-user disabled-skill set; passed into getSystemPromptBlock so the
   // rendered `## Available skills` block excludes user-disabled skills regardless
-  // of agent-level allowlist. Resolved off the active uid (we don't have
-  // params.userId yet for early auth-gate paths but session_id always carries
-  // it). Falls back to empty set when uid can't be parsed (ad-hoc/test).
-  const earlyUid = params.userId || extractUidFromSessionId(params.sessionId);
+  // of agent-level allowlist. Resolved off the active uid; session_id no longer
+  // carries the uid (CLAUDE.md §5), so callers that don't pass `params.userId`
+  // fall through to the active-user singleton. Wrapped in a try/catch so ad-hoc
+  // test paths that activate no user just see a null uid → empty disabled set.
+  const earlyUid = params.userId || _safeActiveUserId();
   const disabledSkillIds = earlyUid ? readDisabledSets(earlyUid).skills : new Set<string>();
 
   // System A render allowlist = intersect(skillList, project bindings).
@@ -186,14 +199,17 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     getSystemPromptBlock({
       ...(renderAllowlist === undefined ? {} : { allowlist: [...renderAllowlist] }),
       disabledIds: disabledSkillIds,
+      ...(params.onSkillAdvertised ? { onSkillAdvertised: params.onSkillAdvertised } : {}),
     }),
   ]);
 
   const providerId = primary?.provider || 'anthropic';
   const modelId    = primary?.model    || 'claude-sonnet-4-5';
 
-  // Build tools array: memory tool + metacognition tool.
-  const uid = params.userId || extractUidFromSessionId(params.sessionId);
+  // Build tools array: memory tool + metacognition tool. Assembly stays
+  // above the system-prompt build because finalToolNames is still snapshotted
+  // for the dev archive after this section.
+  const uid = params.userId || _safeActiveUserId();
   const agentId = params.agentId || '';
   const injectedTools: AgentTool[] = [];
 
@@ -229,10 +245,12 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const localTools = createLocalTools({
     ...(uid ? { userId: uid } : {}),
     ...(params.cid ? { cid: params.cid } : {}),
+    ...(agentId ? { agentId } : {}),
     ...(params.projectId ? { projectId: params.projectId } : {}),
     ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
     ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
     ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
+    ...(params.onArtifactCreated ? { onArtifactCreated: params.onArtifactCreated } : {}),
   });
 
   // File-scoped tools (read_file override + search_files + grep_files).
@@ -250,6 +268,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         ...(params.projectId ? { projectId: params.projectId } : {}),
         ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
         ...(params.readOnlyExtraRoots?.length ? { readOnlyExtraRoots: params.readOnlyExtraRoots } : {}),
+        ...(params.onSkillInvoked ? { onSkillInvoked: params.onSkillInvoked } : {}),
       })
     : [];
 
@@ -259,6 +278,14 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // content when building workflows). Skipped when uid is unknown
   // (matches file-tools).
   const kbTools = uid ? createKbTools({ userId: uid }) : [];
+
+  // Conversation-history tools (chat_search + chat_read). Read-only and
+  // lower-priority than KB: useful for "what did we discuss before" recall,
+  // not an authoritative facts source.
+  const chatHistoryTools = uid ? createChatHistoryTools({
+    userId: uid,
+    ...(params.cid ? { currentCid: params.cid } : {}),
+  }) : [];
 
   // Image generation. Permission-gated like local-tools; reuses
   // localExec.granted (writing image bytes is the same blast radius as
@@ -282,15 +309,58 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // off the ESM core-agent dynamic import.
   const searchOverrideTools: AgentTool[] = [await createWebSearchOverrideTool()];
 
+  // Connector meta-tools + system-prompt block (MCP-based, umbrella pattern). When ≥1
+  // connector is visible to this actor we inject the two meta-tools (`list_connector_tools` /
+  // `call_connector_tool`) plus a `## Connectors` block enumerating the connectors directly in
+  // the system prompt — the model sees the catalog without a discovery round-trip, and the
+  // block sits in the cached prefix. When 0 visible: zero tools, no block. Per-connector MCP
+  // actions are NEVER injected into `tools[]` — the model discovers and invokes them through
+  // the meta-tools (umbrella pattern); flat-injecting would balloon `tools[]` past the 20–50
+  // selection-accuracy cliff and invalidate the prompt-cache prefix on every connect/disconnect.
+  //
+  // Session-kind gate (tri-state):
+  //   - `gconv` (commander)  + `gmember` (agent worker)  → block + full tools (list + call —
+  //                                                         actual user tasks invoking external
+  //                                                         services).
+  //   - `agent` (agent-edit)                              → block + discover-only tool
+  //                                                         (`list_connector_tools`). Editor
+  //                                                         LLM reads action names + JSON
+  //                                                         schemas so the authored workflow
+  //                                                         can write "use gmail's `send_email`
+  //                                                         with body=..." rather than the
+  //                                                         coarse "use gmail to send email".
+  //                                                         `call_connector_tool` is withheld
+  //                                                         so an authoring session can never
+  //                                                         produce external side effects.
+  //   - everything else (skill-edit / KB-image / CLI dispatch / reflect / memory-extract /
+  //     anon)                                            → none.
+  // For agent-edit specifically, the block intentionally bypasses `agent.enabled_connectors`
+  // (passes undefined agentId) — the editor LLM should see EVERYTHING the user installed so it
+  // can recommend referencing a connector even if the agent's whitelist hasn't been opened to
+  // it yet (the user toggles `enabled_connectors` separately in the agent-edit UI).
+  const exposure = uid ? connectorExposureFromSessionId(params.sessionId) : 'none';
+  const blockAgentId = exposure === 'discover+block' ? undefined : (agentId || undefined);
+  const connectorBlock = exposure !== 'none' && uid
+    ? await getConnectorPromptBlock(uid, blockAgentId)
+    : '';
+  const connectorMetaTools = uid && exposure !== 'none'
+    ? await createConnectorMetaTools(
+        { userId: uid, ...(agentId ? { agentId } : {}) },
+        exposure === 'discover+block' ? 'discover' : 'full',
+      )
+    : [];
+
   // Merge injected tools with extra tools from caller
   const allTools = [
     ...injectedTools,
     ...localTools,
     ...fileTools,
     ...kbTools,
+    ...chatHistoryTools,
     ...imageGenTools,
     ...searchOverrideTools,
     ...(params.extraTools || []),
+    ...connectorMetaTools,
   ];
 
   // Cap each tool's result size + persist oversized outputs. Single wrap point
@@ -353,6 +423,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const parts: string[] = [];
   if (params.systemPrompt) parts.push(params.systemPrompt.trim());
   if (skillsBlock) parts.push(skillsBlock.trim());
+  if (connectorBlock) parts.push(connectorBlock.trim());
   const resolvedSystemPrompt = parts.join('\n\n');
 
   // Evolution (the self-evolving skill store) is per-agent: when an
@@ -422,6 +493,13 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       }
     : undefined;
 
+  // Bridge System B advertised → ChatOptions.onSkillAdvertised. The SDK
+  // doesn't know about the host's skill-system taxonomy; we tag every id
+  // it surfaces as `'B'` before passing it up.
+  const onLearnedSkillAdvertised = params.onSkillAdvertised
+    ? (id: string) => params.onSkillAdvertised!(id, 'B')
+    : undefined;
+
   const runner = new mod.AgentRunner({
     config,
     providers,
@@ -429,6 +507,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...(wrappedTools.length ? { tools: wrappedTools } : {}),
     ...(params.skillList !== undefined ? { skillAllowlist: params.skillList } : {}),
     ...(onSkillCreated ? { onSkillCreated } : {}),
+    ...(onLearnedSkillAdvertised ? { onLearnedSkillAdvertised } : {}),
   });
 
   return {
@@ -442,10 +521,40 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   };
 }
 
-/** Extract userId from session_id format: `<uid>-<kind>-...` */
-function extractUidFromSessionId(sessionId: string): string | null {
-  const m = sessionId.match(/^([^-]+)-/);
-  return m ? m[1] : null;
+/** Best-effort accessor for the active uid that doesn't throw when no user is activated yet
+ *  (ad-hoc / test paths). Production callers always come through with `params.userId` or after
+ *  `activateUser()`, so the fallback is just a safety net. Loaded lazily via require to avoid
+ *  pulling features/users into the early import graph. */
+function _safeActiveUserId(): string | null {
+  try {
+    const { getActiveUserId } = require('../../features/users') as typeof import('../../features/users');
+    return getActiveUserId();
+  } catch {
+    return null;
+  }
+}
+
+/** Tri-state connector exposure, gated by session kind (CLAUDE.md §5 session-id table):
+ *   - `tools+block`:    group-chat sessions (`gconv` commander + `gmember` agent worker) —
+ *     block + both meta-tools (`list_connector_tools` + `call_connector_tool`). Full exposure.
+ *   - `discover+block`: agent-edit (`agent`) — block + `list_connector_tools` ONLY. Editor LLM
+ *     can discover action names + JSON schemas to write specific workflow steps; cannot invoke
+ *     (an authoring session must never produce external side effects).
+ *   - `none`:           skill-edit, KB-image, CLI dispatch, reflect, memory-extract, anon, and
+ *     any future kind — neither block nor tools.
+ *   Add a new conversation kind that needs connectors? Extend this function explicitly + add
+ *   an entry to CLAUDE.md §5's session-id table.
+ *
+ * session_id format is `<kind>-<tail>` (CLAUDE.md §5 — uid no longer in session_id), so the
+ * kind keyword is anchored at the start. */
+export function connectorExposureFromSessionId(sessionId: string): 'tools+block' | 'discover+block' | 'none' {
+  if (/^(gconv|gmember)-/.test(sessionId)) return 'tools+block';
+  // Agent-edit gets `list_connector_tools` (read-only, no side effects) so the editor LLM can
+  // learn each connector's action names and write specific workflow steps — but NOT
+  // `call_connector_tool`, since an authoring session must never produce external side
+  // effects. See `connector-meta-tools.ts::createConnectorMetaTools` mode handling.
+  if (/^agent-/.test(sessionId)) return 'discover+block';
+  return 'none';
 }
 
 /**

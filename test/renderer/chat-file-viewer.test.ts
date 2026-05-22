@@ -1,0 +1,104 @@
+// Lock in the kind-classifier behaviour of chat-file-viewer.js. The viewer
+// dispatches by `_kindOf(name)` — every misclassification surfaces as
+// "I clicked a .md but it tried to load in an iframe" or vice versa, which
+// is hard to spot in code review. This is the multi-branch decision
+// function category from PC/CLAUDE.md §9.
+
+import { describe, it, expect } from 'vitest';
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const viewer = require('../../src/renderer/modules/chat-file-viewer.js');
+const { _kindOf, _extOf, _chatMediaLocalUrl } = viewer as {
+  _kindOf: (name: string) => string;
+  _extOf: (name: string) => string;
+  _chatMediaLocalUrl: (abs: string) => string;
+};
+
+describe('chat-file-viewer › _kindOf', () => {
+  // Set A — known kinds. One representative per ext set; the lists in the
+  // module are the contract, so coverage of one ext per kind is enough
+  // (the Set membership check makes per-ext coverage redundant).
+  it.each([
+    ['photo.png', 'image'],
+    ['art.jpg', 'image'],
+    ['art.jpeg', 'image'],
+    ['art.webp', 'image'],
+    ['art.gif', 'image'],
+    ['report.pdf', 'pdf'],
+    ['page.html', 'html'],
+    ['old.htm', 'html'],
+    ['note.md', 'markdown'],
+    ['old.markdown', 'markdown'],
+    ['plain.txt', 'text'],
+    ['data.json', 'text'],
+    ['table.csv', 'text'],
+    ['script.py', 'text'],
+    ['app.ts', 'text'],
+    ['style.css', 'text'],
+    ['log.log', 'text'],
+    ['video.mp4', 'video'],
+  ])('classifies "%s" as %s', (name, kind) => {
+    expect(_kindOf(name)).toBe(kind);
+  });
+
+  // Set B — unsupported / look-alike shapes. These specifically check
+  // that the classifier doesn't promote "looks like text" → text or
+  // "html-ish" → html when the actual ext doesn't match.
+  it.each([
+    ['archive.zip', 'unsupported'],
+    ['workbook.xlsx', 'unsupported'],
+    ['slides.pptx', 'unsupported'],
+    ['doc.docx', 'unsupported'],   // we deliberately don't preview docx in this round
+    ['binary.exe', 'unsupported'],
+    ['photo.heic', 'unsupported'], // image-ish but not in the allow-list
+    ['no-extension', 'unsupported'],
+    ['', 'unsupported'],
+    ['file.', 'unsupported'],
+    ['file.UPPER', 'unsupported'],
+  ])('refuses "%s" → fallback dialog', (name, kind) => {
+    expect(_kindOf(name)).toBe(kind);
+  });
+
+  it('is case-insensitive on the extension portion', () => {
+    expect(_kindOf('REPORT.PDF')).toBe('pdf');
+    expect(_kindOf('Note.MD')).toBe('markdown');
+    expect(_kindOf('Page.Html')).toBe('html');
+  });
+
+  it('handles paths with directories — only the basename ext matters', () => {
+    expect(_kindOf('/Users/me/Documents/note.md')).toBe('markdown');
+    expect(_kindOf('C:\\\\work\\\\report.pdf')).toBe('pdf');
+  });
+});
+
+describe('chat-file-viewer › _extOf', () => {
+  it('returns lowercased trailing extension', () => {
+    expect(_extOf('note.MD')).toBe('.md');
+    expect(_extOf('report.pdf')).toBe('.pdf');
+  });
+  it('returns "" for names with no dot', () => {
+    expect(_extOf('README')).toBe('');
+  });
+  it('uses the LAST dot, not the first', () => {
+    expect(_extOf('a.b.tar.gz')).toBe('.gz');
+  });
+});
+
+describe('chat-file-viewer › _chatMediaLocalUrl', () => {
+  // The URL has to round-trip cleanly through new URL() + the main-side
+  // `_pathnameToAbsPath`, so it must encode spaces / non-ASCII but
+  // preserve `/` separators. encodeURI does both.
+  it('builds chat-media://local/ + path for a unix abs path', () => {
+    expect(_chatMediaLocalUrl('/Users/me/file.pdf')).toBe('chat-media://local/Users/me/file.pdf');
+  });
+  it('URL-encodes spaces in the path', () => {
+    expect(_chatMediaLocalUrl('/Users/me/has space.pdf')).toBe('chat-media://local/Users/me/has%20space.pdf');
+  });
+  it('preserves "/" separators (doesn\'t use encodeURIComponent)', () => {
+    const url = _chatMediaLocalUrl('/a/b/c/d.pdf');
+    expect(url).not.toContain('%2F');
+    expect(url).toContain('/a/b/c/d.pdf');
+  });
+  it('converts Windows-style "\\\\" to "/" so URL parsing stays well-formed', () => {
+    expect(_chatMediaLocalUrl('C:\\Users\\me\\file.pdf')).toBe('chat-media://local/C:/Users/me/file.pdf');
+  });
+});

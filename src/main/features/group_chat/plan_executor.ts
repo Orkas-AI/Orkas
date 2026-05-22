@@ -22,9 +22,11 @@
  */
 
 import { Mutex } from 'async-mutex';
+import * as crypto from 'node:crypto';
 
 import { createLogger } from '../../logger';
 import { t } from '../../i18n';
+import { isTransientError } from '../../util/transient-errors';
 import { COMMANDER_ID, USER_ID, readMembers } from './state';
 import {
   readPlan, updateStep, markPlanCompletedSignaled,
@@ -32,7 +34,8 @@ import {
   type PlanFile, type PlanStep, type FailurePolicy,
 } from './plan';
 import type { ChatFormPayload } from './router';
-import { buildMention } from './router';
+import { buildMention, decodeSubmission } from './router';
+import type { GroupMessage } from './visibility';
 
 /** Per-cid mutex guarding plan-state transitions. Without this, when N
  * parallel-group agents finish nearly simultaneously, their reconcile
@@ -64,10 +67,11 @@ const USER_ALIASES = new Set(['user', '用户']);
  *  (fresh stream, fresh provider connection). Capped to avoid infinite
  *  loops when the user is just genuinely offline.
  *
- *  IMPORTANT — never include `aborted` or `cancelled` in this pattern:
- *  user-initiated abort must not be silently retried; the literal string
- *  `'aborted by user'` is also explicitly excluded by the guard. */
-const TRANSIENT_ERR_PATTERNS = /\b(terminated|fetch failed|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|socket hang up|EPIPE|network error|Connection closed)\b/i;
+ *  Pattern lives in `util/transient-errors.ts` as a shared classifier
+ *  — `features/expert_signals/turn_hooks.ts` is the second consumer
+ *  (skill_ineffective skips transient-class errors so we don't blame
+ *  skills for network blips). Single source of truth for "is this
+ *  a network blip" semantics. */
 const MAX_TRANSIENT_RETRIES = 2;
 
 /** Returns true when `reason` matches a transient network-error pattern AND
@@ -79,7 +83,7 @@ async function maybeRetryTransient(
 ): Promise<boolean> {
   if (!reason) return false;
   if (reason === 'aborted by user') return false;
-  if (!TRANSIENT_ERR_PATTERNS.test(reason)) return false;
+  if (!isTransientError(reason)) return false;
   const attempts = step.transient_attempts ?? 0;
   if (attempts >= MAX_TRANSIENT_RETRIES) return false;
   await updateStep(uid, cid, step.index, 'pending', {
@@ -191,13 +195,17 @@ export interface ReconcileCtx {
  *  don't pull a circular import. Bus implements + injects on init. */
 export interface ExecutorBusHooks {
   /** Persist + emit a normal group message; same signature as `bus.enqueue`
-   *  but with one extra optional `triggered_step` knob. */
+   *  but with one extra optional `triggered_step` knob. `attachments` lets
+   *  the executor forward the plan's `initial_attachments` so worker agents
+   *  receive the same image / file bytes the originating user turn carried. */
   enqueue(params: {
     uid: string; cid: string;
     fromActorId: string; text: string;
     forceTo?: string[];
     triggered_step?: number;
     dispatch?: boolean;
+    attachments?: string[];
+    form?: ChatFormPayload;
   }): Promise<void>;
   /** Push a turn directly into commander's worker queue without persisting
    *  a chat message — used for the synthesis / commander-self steps where
@@ -297,12 +305,11 @@ function outcomeForSynthTurn(evt: TurnFinishedEvent): TurnOutcome {
 
 /** User-direct (or non-plan) turn outcome decision.
  *
- * Side effect: if this is an agent reply AND there's a `blocked` plan step
- * whose assignee matches this agent (typical post-form-submit case), the
- * step transitions to `done` and downstream is dispatched. This bridges
- * the gap between "form pause" (step blocked) and "agent re-runs after
- * user submits" (which arrives here as trigger=user_direct since the user
- * enqueue triggered the agent worker, not the executor).
+ * Side effect: if this is an agent reply AND there's an active plan step
+ * whose assignee matches this agent, the step transitions through the normal
+ * plan-step completion path and downstream is dispatched. This covers both
+ * form-unblock replies (`blocked`) and commander/manual recovery dispatches
+ * that do not carry a `triggered_step` stamp (`in_progress`).
  *
  * commander empty-final policy: user_direct means the user is actively
  * waiting on commander, so silent is forbidden — even a tool-only turn
@@ -314,18 +321,16 @@ function outcomeForSynthTurn(evt: TurnFinishedEvent): TurnOutcome {
  * agent empty-final → always persist '(no reply)'.
  */
 async function outcomeForUserDirectTurn(uid: string, cid: string, evt: TurnFinishedEvent): Promise<TurnOutcome> {
-  // Form-pause unblock: if this agent has a blocked step, treat THIS turn
-  // as that step's terminator. Re-route through applyPlanStepTurn so the
-  // exact same transition logic applies (success / form-again / failure).
   if (evt.actor.kind === 'agent') {
     const plan = await readPlan(uid, cid);
     if (plan?.steps?.length) {
       const members = await readMembers(uid, cid);
-      const blocked = plan.steps.find((s) =>
-        s.status === 'blocked' && assigneeMatches(s.assignee, evt.actor.id, members.actors),
+      const active = plan.steps.find((s) =>
+        (s.status === 'in_progress' || s.status === 'blocked')
+        && assigneeMatches(s.assignee, evt.actor.id, members.actors),
       );
-      if (blocked) {
-        const outcome = await applyPlanStepTurn(uid, cid, evt, blocked.index);
+      if (active) {
+        const outcome = await applyPlanStepTurn(uid, cid, evt, active.index);
         await reconcileAfterStepTransition(uid, cid);
         return outcome;
       }
@@ -581,12 +586,35 @@ export async function retryStep(
     const step = plan.steps.find((s) => s.index === stepIndex);
     if (!step) return { ok: false, error: 'step not found' };
     if (step.status !== 'failed') {
+      // The UI can issue a duplicate retry from stale DOM while the first
+      // retry has already re-armed the step (failed -> pending -> dispatch
+      // -> in_progress / blocked-on-deps). Treat those mid-recovery states
+      // as success so users do not see a false failure after recovery
+      // started.
+      //
+      // `done` is intentionally NOT in this set: by the time a step
+      // reaches `done`, the rail has already re-rendered with a hidden
+      // retry button (`_isStepActionable` in plan-rail.js returns
+      // `failed`-only), so there is no DOM path that produces a retry
+      // click on a done step. Accepting it here would also fire a retry
+      // expert-signal with the completed turn's output_msg_id, attributing
+      // user dissatisfaction to a successful execution — see PC/CLAUDE.md
+      // §10 expert-signals turn_id convention.
+      if (
+        step.status === 'pending'
+        || step.status === 'in_progress'
+        || step.status === 'blocked'
+      ) {
+        log.info(`plan-step retry-noop cid=${cid} step=${stepIndex} current=${step.status}`);
+        return { ok: true };
+      }
       return { ok: false, error: `step is not in failed state (current: ${step.status})` };
     }
     await updateStep(uid, cid, stepIndex, 'pending', {
       failure_reason: '',
       output_msg_id: '',
       transient_attempts: 0,
+      pending_form_id: '',
     });
     // Unblock cascade-skipped downstream: when step N failed under
     // `abort_plan` policy, applyTermination marked all not-yet-terminal
@@ -696,8 +724,30 @@ async function maybeMarkFinished(uid: string, cid: string, plan: PlanFile, ctx: 
       && assigneeMatches(s.assignee, actorId, members.actors),
     );
     if (!match) return;
+    if (actorId === USER_ID && !await acceptsUserStepCompletion(uid, cid, match, ctx)) return;
     await applyTermination(uid, cid, match, ctx);
   }
+}
+
+async function acceptsUserStepCompletion(
+  _uid: string,
+  cid: string,
+  step: PlanStep,
+  ctx: ReconcileCtx,
+): Promise<boolean> {
+  // Legacy conversations + plans authored before the stamp existed have no
+  // `pending_form_id`. Accept any user reply for those (the original
+  // behaviour before user-owned forms were introduced).
+  const expectedFormId = step.pending_form_id;
+  if (!expectedFormId) return true;
+
+  const text = ctx.finishedMessage?.text || '';
+  const submission = decodeSubmission(text);
+  if (!submission || submission.agent_id !== USER_ID || submission.form_id !== expectedFormId) {
+    log.info(`plan-user-step ignored non-matching user message cid=${cid} step=${step.index} expected_form=${expectedFormId}`);
+    return false;
+  }
+  return true;
 }
 
 async function applyTermination(
@@ -789,6 +839,33 @@ async function dispatchReady(uid: string, cid: string, plan: PlanFile): Promise<
     if (!groups.has(k)) groups.set(k, []);
     groups.get(k)!.push(s);
   }
+  // Expert-signals: emit one `agent_dispatched` signal per group BEFORE
+  // wakening — we want the audit record even if the enqueue downstream
+  // throws. turn_id is synthesized (this signal's consumer use case is
+  // aggregation — "did commander dispatch multiple agents to the same
+  // query?" — not JOIN with other signals; see expert-signals plan §4.3
+  // + reservation against cross-signal JOIN). Best-effort.
+  try {
+    const { emitSignal } = await import('../expert_signals');
+    const { buildAgentDispatchedSignal } = await import('../expert_signals/extractors/event');
+    const baseTs = Date.now();
+    let i = 0;
+    for (const [groupKey, steps] of groups) {
+      const assignees = steps.map((s) => s.assignee).filter(Boolean);
+      const parallel_group = groupKey.startsWith('_solo_') ? null : groupKey;
+      emitSignal(uid, buildAgentDispatchedSignal({
+        cid,
+        // `plan:dispatch:<ts>:<i>` is unique per emit. Documented in the
+        // signal builder comment.
+        turn_id: `${cid}:plan:dispatch:${baseTs}:${i++}`,
+        candidates: assignees.slice(),
+        dispatched: assignees.slice(),
+        parallel_group,
+      }));
+    }
+  } catch (err) {
+    log.warn(`agent_dispatched emit failed cid=${cid}: ${(err as Error).message}`);
+  }
   for (const [, steps] of groups) {
     for (const step of steps) {
       await dispatchStep(uid, cid, step, plan);
@@ -814,15 +891,31 @@ async function dispatchStep(
 
   const rendered = renderTemplate(step.input, plan);
   const assignee = step.assignee.trim();
+  // Forward attachments captured at plan-set time so worker agents (and
+  // the user, for a `user`-assignee question) receive the same image / file
+  // bytes the triggering user turn carried — see PlanFile.initial_attachments.
+  const inheritedAttachments = plan.initial_attachments;
 
   if (USER_ALIASES.has(assignee.toLowerCase())) {
-    // Step asks user for input. Commander voice; render goes to user.
+    // Step asks user for input. Commander voice; render goes to user with
+    // a user-owned form so the reply can route back to the plan machinery
+    // without waking commander as an extra side conversation.
+    //
+    // Stamp `pending_form_id` on the step BEFORE enqueueing so the user's
+    // reply can be matched in O(1) inside the reconcile mutex (see
+    // `acceptsUserStepCompletion`) — without this, that gate would have to
+    // scan the whole <cid>.jsonl to recover the mapping, with the linear
+    // scan happening inside `_planLock`.
+    const form = buildUserStepForm(step);
+    await updateStep(uid, cid, step.index, 'in_progress', { pending_form_id: form.form_id });
     await _hooks.enqueue({
       uid, cid,
       fromActorId: COMMANDER_ID,
       text: rendered,
       forceTo: [USER_ID],
       triggered_step: step.index,
+      ...(inheritedAttachments && inheritedAttachments.length ? { attachments: inheritedAttachments } : {}),
+      form,
     });
     return;
   }
@@ -863,6 +956,7 @@ async function dispatchStep(
     forceTo: [agentId],
     triggered_step: step.index,
     dispatch: true,
+    ...(inheritedAttachments && inheritedAttachments.length ? { attachments: inheritedAttachments } : {}),
   });
 }
 
@@ -872,6 +966,23 @@ function assigneeDisplayPrefix(assignee: string): string {
   // user sees who got dispatched. `buildMention` preserves whitespace (see
   // its header).
   return buildMention(assignee.replace(/^@+/, ''));
+}
+
+function buildUserStepForm(step: PlanStep): ChatFormPayload {
+  const label = step.title.trim() || (step.input || '').trim() || 'response';
+  return {
+    form_id: crypto.randomBytes(8).toString('hex'),
+    agent_id: USER_ID,
+    plan_step_index: step.index,
+    fields: [{
+      id: 'response',
+      label,
+      type: 'textarea',
+      required: true,
+      default: '',
+    }],
+    submitted: false,
+  };
 }
 
 // ── Plan-complete signal ─────────────────────────────────────────────────

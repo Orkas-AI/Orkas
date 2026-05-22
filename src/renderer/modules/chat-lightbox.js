@@ -138,7 +138,7 @@ function _ensureLightbox() {
   const root = document.createElement('div');
   root.className = 'chat-lightbox';
   root.setAttribute('aria-hidden', 'true');
-  const closeLabel = typeof t === 'function' ? t('chat.lightbox_close_title') : 'Close';
+  const closeLabel = t('chat.lightbox_close_title');
   root.innerHTML = `
     <div class="chat-lightbox-backdrop"></div>
     <div class="chat-lightbox-stage">
@@ -155,7 +155,7 @@ function _ensureLightbox() {
     if (!_lightboxEl) return;
     const btn = _lightboxEl.querySelector('.chat-lightbox-close');
     if (btn) {
-      const label = typeof t === 'function' ? t('chat.lightbox_close_title') : 'Close';
+      const label = t('chat.lightbox_close_title');
       btn.setAttribute('aria-label', label);
       btn.setAttribute('title', label);
     }

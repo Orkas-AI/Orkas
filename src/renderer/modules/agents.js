@@ -6,9 +6,21 @@ let _selectedAgent = null; // { id, name, source }
 let _agentEditing = false;
 let _agentFieldSaveTimer = null;
 
+function _agentUiIconHtml(name, className) {
+  if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+    return window.uiIconHtml(name, className);
+  }
+  return '';
+}
+
 // Mirror of `agents.ts::RESERVED_AGENT_NAMES` so the renderer can fail fast
 // without a round-trip. Server is still authoritative — this is just UX.
-const _RESERVED_AGENT_NAMES = new Set(['指挥官', '总指挥', 'commander']);
+const _RESERVED_AGENT_NAMES = new Set(['指挥官', '总指挥', 'コマンダー', '司令官', 'commander']);
+const _SPEC_CATEGORY_CODE_RE = /^[a-z][a-z0-9_-]{0,79}$/;
+function _normalizeSpecCategoryForHiddenSave(category) {
+  const code = String(category || '').trim().toLowerCase();
+  return _SPEC_CATEGORY_CODE_RE.test(code) ? code : 'general';
+}
 /** Look up the localized "External · <Brand>" label for an agent runtime
  *  type. The external badge (formerly "CLI · X") is the single
  *  user-facing tag for cli-runtime agents — name surfaces consistently
@@ -27,6 +39,47 @@ function _cliBadgeLabel(type) {
 function _isReservedAgentName(name) {
   const key = String(name || '').replace(/\s+/g, '').toLowerCase();
   return _RESERVED_AGENT_NAMES.has(key);
+}
+
+function _agentSource(source) {
+  return (typeof normalizeCatalogSource === 'function')
+    ? normalizeCatalogSource(source)
+    : String(source || '');
+}
+
+function _isAgentPlatformSource(source) {
+  return (typeof isMarketplaceCatalogSource === 'function')
+    ? isMarketplaceCatalogSource(source)
+    : _agentSource(source) === 'marketplace';
+}
+
+/** Version + category chips for a marketplace-installed agent. Mirrors the
+ *  marketplace card footer so users see the same metadata in the agents grid.
+ *  `_mpCategoriesCache` is a module-level variable in `marketplace.js` (flat top-level
+ *  scope per CLAUDE.md §8). */
+function _agentPlatformChipsHtml(a) {
+  const lang = getLang();
+  const parts = [];
+  if (a.version) {
+    const versionLabel = t('marketplace.version').replace('{version}', String(a.version));
+    parts.push(`<span class="agent-card-chip is-version">${escapeHtml(versionLabel)}</span>`);
+  }
+  if (a.category) {
+    const catLabel = _resolveCategoryLabel(a.category, lang);
+    parts.push(`<span class="agent-card-chip">${escapeHtml(catLabel)}</span>`);
+  }
+  return parts.join('');
+}
+
+/** Shared category-code → localized label. Falls back to the code when the categories
+ *  cache hasn't loaded yet (rare; the module-level preload usually populates it before
+ *  the user reaches the agents/skills tab). */
+function _resolveCategoryLabel(code, lang) {
+  if (!code) return '';
+  const list = (typeof _mpCategoriesCache !== 'undefined' && _mpCategoriesCache) || [];
+  const c = list.find((x) => x.code === code);
+  if (!c) return code;
+  return pickLocalizedName(c, lang) || code;
 }
 
 // Mirror of `agents.ts::NAME_TOKEN_RE` so the form rejects junk before
@@ -65,7 +118,10 @@ async function loadAgents(forceRefresh) {
       // < orkas < 全(q)'). Without this, the backend's listAgents
       // internal sort (by agent_id, a 12-char nanoid) feels random to
       // users. The override here fixes that.
-      _agentsCache = (data.agents || []).slice().sort((a, b) => {
+      _agentsCache = (data.agents || []).map((a) => ({
+        ...a,
+        source: _agentSource(a.source),
+      })).sort((a, b) => {
         if (a.source !== b.source) return a.source === 'custom' ? -1 : 1;
         const ka = pinyinSortKey(a.name || a.agent_id || '');
         const kb = pinyinSortKey(b.name || b.agent_id || '');
@@ -122,7 +178,7 @@ function renderAgentsList(agents) { renderAgentsGrid(agents); }
 
 function renderAgentsGrid(agents) {
   const custom = agents.filter(a => a.source === 'custom');
-  const builtin = agents.filter(a => a.source === 'builtin');
+  const marketplace = agents.filter(a => _isAgentPlatformSource(a.source));
   const emptyEl = document.getElementById('agents-empty');
   const customGroup = document.getElementById('agents-grid-custom-group');
   const builtinGroup = document.getElementById('agents-grid-builtin-group');
@@ -154,6 +210,10 @@ function renderAgentsGrid(agents) {
     const cliChip = (a.runtime && a.runtime.kind === 'cli')
       ? `<span class="agent-card-chip is-cli is-cli-${escapeHtml(a.runtime.cli)}">${escapeHtml(_cliBadgeLabel(a.runtime.cli))}</span>`
       : '';
+    // Marketplace-installed (`builtin`) agents carry version + category from _install.json /
+    // agent.json — show them as inline chips so users see "where this came from" without
+    // opening the detail page. Custom agents skip — they have no published version.
+    const platformChips = _isAgentPlatformSource(a.source) ? _agentPlatformChipsHtml(a) : '';
     return `
       <div class="agent-card${enabled ? '' : ' is-disabled'}" data-id="${escapeHtml(a.agent_id)}" data-source="${a.source}">
         <div class="agent-card-header">
@@ -163,9 +223,9 @@ function renderAgentsGrid(agents) {
         </div>
         <div class="${descClass}">${escapeHtml(descText)}</div>
         <div class="agent-card-actions">
-          ${cliChip}
+          ${cliChip}${platformChips}
           <button type="button" class="agent-card-use" data-agent-use title="${useTitle}" aria-label="${useTitle}">
-            <svg class="icon-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><polygon points="5,3 5,13 13,8" fill="currentColor"/></svg>
+            ${_agentUiIconHtml('play-triangle', 'icon-play')}
           </button>
         </div>
       </div>
@@ -178,7 +238,7 @@ function renderAgentsGrid(agents) {
     gridEl.innerHTML = list.map(cardHtml).join('');
   };
   renderGroup(custom, customGroup, customGrid);
-  renderGroup(builtin, builtinGroup, builtinGrid);
+  renderGroup(marketplace, builtinGroup, builtinGrid);
 
   for (const card of document.querySelectorAll('.agent-card')) {
     const id = card.dataset.id;
@@ -331,6 +391,14 @@ window.addEventListener('i18n-change', () => {
   }
 });
 
+async function refreshAgentsAfterMarketplaceReconcile() {
+  await loadAgents(true);
+  if (_agentEditing) return;
+  if (_selectedAgent?.id && _isAgentPlatformSource(_selectedAgent.source)) {
+    await selectAgent(_selectedAgent.id);
+  }
+}
+
 /** Render the per-row "⋯" menu items based on the target agent's source +
  *  enabled state. Called fresh on each open so the toggle label is right
  *  and builtin agents see only the enable/disable item. */
@@ -338,16 +406,31 @@ function _renderAgentRowMenuItems(menu, agentId) {
   const a = _agentsCache?.find((x) => x.agent_id === agentId);
   const enabled = a ? a.enabled !== false : true;
   const isCustom = a?.source === 'custom';
-  // Dev mode lifts the source guard for built-in edit / delete; custom adds
-  // a "promote to built-in" item too.
-  const canEdit = isCustom || (a?.source === 'builtin' && isDevMode());
+  // OrkasOpen has no dev-env concept (per PC/CLAUDE.md §11 "OrkasOpen contract"),
+  // so platform / marketplace agents stay read-only — only custom agents are editable.
+  const canEdit = isCustom;
   const toggleLabel = enabled ? t('component.disable') : t('component.enable');
   const items = [];
   if (canEdit) {
     items.push(`<div class="agent-row-menu-item" data-action="edit">${escapeHtml(t('agents.edit'))}</div>`);
   }
-  if (isCustom && isDevMode()) {
+  if (isCustom && false) {
     items.push(`<div class="agent-row-menu-item" data-action="promote">${escapeHtml(t('agents.promote_to_builtin'))}</div>`);
+  }
+  // Upload-to-marketplace is owned by marketplace_dev.js (renderer-side dev module). OrkasOpen
+  // doesn't ship that file, so `typeof openMarketplaceUpload === 'function'` is false there
+  // and the menu item simply doesn't appear — no isDevMode check needed (and would be banned
+  // by OrkasOpen's strip-rules anyway).
+  if (typeof openMarketplaceUpload === 'function') {
+    items.push(`<div class="agent-row-menu-item" data-action="upload-marketplace">${escapeHtml(t('marketplace.upload'))}</div>`);
+  }
+  // Scheduled tasks: available for every agent (custom + builtin) — a
+  // schedule is a user-orchestration concern that only references the
+  // agent and doesn't mutate its spec.
+  items.push(`<div class="agent-row-menu-item" data-action="schedule">${escapeHtml(t('agents.schedule.menu'))}</div>`);
+  if (isCustom && false) {
+    items.push(`<div class="agent-row-menu-item" data-action="promote">${escapeHtml(t('agents.promote_to_builtin'))}</div>`);
+    items.push(`<div class="agent-row-menu-item" data-action="upload-marketplace">${escapeHtml(t('marketplace.upload'))}</div>`);
   }
   items.push(`<div class="agent-row-menu-item" data-action="toggle-enabled">${escapeHtml(toggleLabel)}</div>`);
   if (canEdit) {
@@ -367,31 +450,17 @@ function _renderAgentRowMenuItems(menu, agentId) {
       } else if (action === 'delete') {
         if (_selectedAgent?.id !== aid) await selectAgent(aid);
         await deleteSelectedAgent();
+
       } else if (action === 'promote') {
         await promoteCustomAgent(aid);
+      } else if (action === 'upload-marketplace') {
+        if (typeof openMarketplaceUpload === 'function') await openMarketplaceUpload('agent', aid);
       } else if (action === 'toggle-enabled') {
         await _flipAgentEnabledFromMenu(aid);
+      } else if (action === 'schedule') {
+        if (typeof openAgentScheduleDialog === 'function') await openAgentScheduleDialog(aid);
       }
     });
-  }
-}
-
-/** Dev-only: promote a custom agent to built-in. Copies agent.json to
- *  src+data trees, removes the custom dir (meta/ + skills/ dropped),
- *  refreshes the grid. */
-async function promoteCustomAgent(agentId) {
-  if (!isDevMode()) return;
-  const cached = _agentsCache?.find((x) => x.agent_id === agentId);
-  if (!(await uiConfirm(t('agents.promote_confirm', { name: cached?.name || agentId })))) return;
-  try {
-    const result = await window.orkas.invoke('agents.promoteToBuiltin', { agent_id: agentId });
-    if (!result.ok) {
-      await uiAlert(t('agents.promote_failed_with', { reason: result.error || '' }));
-      return;
-    }
-    await loadAgents(true);
-  } catch (e) {
-    await uiAlert(t('agents.promote_failed_with', { reason: e.message || e }));
   }
 }
 
@@ -410,6 +479,7 @@ async function selectAgent(agentId) {
     const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}`);
     const data = await res.json();
     if (!data.ok || !data.agent) return;
+    data.agent.source = _agentSource(data.agent.source);
     _selectedAgent = { id: data.agent.agent_id, name: data.agent.name, source: data.agent.source };
     _renderAgentDetail(data.agent, false);
     // Reset every nested scroll container — `.agents-detail-content` and
@@ -428,7 +498,30 @@ async function selectAgent(agentId) {
   }
 }
 
+// Render the header meta strip for a single agent / skill detail. Used by both
+// `agents.js::_renderAgentDetail` and `skills.js::useSkill`. Two forms:
+//   - custom item: single "自定义" chip (kept for symmetry with prior chrome)
+//   - marketplace-installed item: category chip, without author uid / official tags
+  // `item.source` distinguishes custom vs marketplace-installed; `item.category` (code) maps
+// to display name via `_mpCategoriesCache` (loaded at marketplace boot, hot in localStorage).
+function _renderSourceMetaHtml(item) {
+  if (!item) return '';
+  if (item.source === 'custom') {
+    return `<span class="agents-detail-source is-custom">${escapeHtml(t('agents.source_custom'))}</span>`;
+  }
+  const parts = [];
+  const catCode = String(item.category || '').trim();
+  if (catCode) {
+    const lang = (typeof getLang === 'function') ? getLang() : 'zh';
+    const cat = Array.isArray(_mpCategoriesCache) ? _mpCategoriesCache.find((c) => c.code === catCode) : null;
+    const label = cat ? (pickLocalizedName(cat, lang) || catCode) : catCode;
+    parts.push(`<span class="agents-detail-source is-category">${escapeHtml(label)}</span>`);
+  }
+  return parts.join('');
+}
+
 function _renderAgentDetail(agent, editing) {
+  agent = { ...agent, source: _agentSource(agent.source) };
   document.getElementById('agents-detail-content').style.display = '';
 
   const nameEl = document.getElementById('agents-detail-name');
@@ -438,13 +531,14 @@ function _renderAgentDetail(agent, editing) {
   const editBtn = document.getElementById('agent-edit-btn');
 
   nameEl.textContent = agent.name || '';
-  sourceEl.textContent = agent.source === 'builtin' ? t('agents.source_builtin') : t('agents.source_custom');
-  sourceEl.className = 'agents-detail-source ' + (agent.source === 'builtin' ? 'is-builtin' : 'is-custom');
+  // Header chips: custom = single "自定义" tag; marketplace-installed items show category only.
+  sourceEl.innerHTML = _renderSourceMetaHtml(agent);
   // Runtime slot lives at the top of the body now (not the header):
   // an always-editable dropdown so the user can flip Orkas ↔ local CLI
   // without entering edit mode. The header chip was removed because
   // it duplicated information the dropdown already exposes.
   _renderAgentDetailRuntime(agent);
+  _renderAgentDetailProjectDir(agent);
   const localizedDesc = pickDesc(agent, getLang()).trim();
   descEl.textContent = localizedDesc;
 
@@ -467,20 +561,26 @@ function _renderAgentDetail(agent, editing) {
   }
   if (!editing && !localizedDesc) descEl.innerHTML = unsetHtml;
 
+  // Detail header actions, fixed order: use (icon) / edit / enable-disable / delete.
   // Detail header actions, fixed order:
-  //   use (icon) / edit / enable-disable / promote-to-builtin
-  //   (custom + dev) / delete
+  //   use (icon) / edit / enable-disable / delete
   // Edit mode hides everything except the "done" button (the relabeled
   // "edit" button).
   const useBtn = document.getElementById('agent-use-btn');
   const enableBtn = document.getElementById('agent-enabled-btn');
+
   const promoteBtn = document.getElementById('agent-promote-btn');
+  const uploadBtn = document.getElementById('agent-upload-marketplace-btn');
   const delBtn = document.getElementById('agent-delete-btn');
   const isCustom = agent.source === 'custom';
-  const canEdit = isCustom || (agent.source === 'builtin' && isDevMode());
+  // OrkasOpen has no dev-env concept (per PC/CLAUDE.md §11 "OrkasOpen contract"):
+  // platform / marketplace agents stay read-only — only custom agents are editable.
+  const canEdit = isCustom;
   if (useBtn) useBtn.style.display = editing ? 'none' : '';
   if (enableBtn) enableBtn.style.display = editing ? 'none' : '';
-  if (promoteBtn) promoteBtn.style.display = (isCustom && isDevMode() && !editing) ? '' : 'none';
+  if (promoteBtn) promoteBtn.style.display = 'none';
+  // Upload button visibility: gated by marketplace_dev.js's presence (OrkasOpen lacks it).
+  if (uploadBtn) uploadBtn.style.display = (typeof openMarketplaceUpload === 'function' && !editing) ? '' : 'none';
   if (delBtn) delBtn.style.display = (canEdit && !editing) ? '' : 'none';
   if (editBtn) {
     editBtn.style.display = canEdit ? '' : 'none';
@@ -488,7 +588,147 @@ function _renderAgentDetail(agent, editing) {
   }
   _renderAgentEnabledButton({ id: agent.agent_id, enabled: agent.enabled !== false });
 
+  _renderAgentOutputFormatSection(agent);
+
   _toggleAgentFieldEditable(editing);
+}
+
+/** Render the output-format preference dropdown (markdown_only / dashboard /
+ *  artifact). Always editable (no edit-mode gating — same convention as the
+ *  runtime selector); persists via `agents.update({ output_format })`. Hidden
+ *  for CLI agents — those run an external coding CLI and ignore the in-process
+ *  system-prompt hint entirely.
+ *
+ *  Legacy on-disk values map for display: `'allow_artifacts'` → `'artifact'`
+ *  (it's the renamed entry); `'auto'` / missing → `'markdown_only'` (the new
+ *  default surfaced in the UI — runtime behavior for missing-field agents
+ *  stays "no hint" until the user picks something and triggers a save). */
+function _renderAgentOutputFormatSection(agent) {
+  const section = document.getElementById('agents-detail-output-format-section');
+  const slot = document.getElementById('agents-detail-output-format');
+  if (!section || !slot) return;
+  if (agent.runtime?.kind === 'cli') { section.style.display = 'none'; return; }
+  section.style.display = '';
+
+  // OrkasOpen has no dev-env concept (per PC/CLAUDE.md §11 "OrkasOpen contract"):
+  // platform / marketplace agents stay read-only — only custom agents are editable.
+  const canEdit = agent.source === 'custom';
+
+  slot.innerHTML = '';
+  const mount = document.createElement('div');
+  mount.className = 'ai-select';
+  slot.appendChild(mount);
+
+  const options = [
+    { value: 'markdown_only',  label: t('agents.output_format_markdown_only') || 'Markdown only' },
+    { value: 'dashboard',      label: t('agents.output_format_dashboard')     || 'Dashboard (no artifact)' },
+    { value: 'artifact',       label: t('agents.output_format_artifact')      || 'Artifact (Dashboard + HTML)' },
+  ];
+  // Map legacy on-disk values to the new 3-option display. `'allow_artifacts'` is the renamed
+  // `'artifact'`. `'auto'` / missing show as `'markdown_only'` (the new default); the field on
+  // disk stays unchanged until the user actually picks something and `onChange` fires a save.
+  let current;
+  switch (agent.output_format) {
+    case 'markdown_only':                       current = 'markdown_only'; break;
+    case 'dashboard':                           current = 'dashboard';     break;
+    case 'artifact':
+    case 'allow_artifacts':                     current = 'artifact';      break;
+    default:                                    current = 'markdown_only'; break;
+  }
+
+  const api = _aiSelectMount(mount, {
+    options,
+    value: current,
+    onChange: async (val) => {
+      try {
+        const res = await window.orkas.invoke('agents.update', {
+          agent_id: agent.agent_id,
+          updates: { output_format: val },
+        });
+        if (!res || !res.ok) {
+          api.setValue(current);
+          uiAlert((res && res.error) || t('agents.update_failed') || 'Update failed');
+          uiAlert((res && res.error) || t('agents.update_failed'));
+        } else if (res.agent) {
+          agent.output_format = res.agent.output_format;
+        }
+      } catch (err) {
+        api.setValue(current);
+        uiAlert((err && err.message) || 'Update failed');
+        uiAlert((err && err.message) || t('agents.update_failed'));
+      }
+    },
+  });
+  if (!canEdit) {
+    // Disable the trigger — read-only display for builtin agents in
+    // non-dev mode (mirrors the connectors row pattern).
+    // non-dev mode (mirrors the runtime row pattern).
+    const trigger = mount.querySelector('.ai-select-trigger');
+    if (trigger) { trigger.setAttribute('disabled', ''); trigger.style.pointerEvents = 'none'; trigger.style.opacity = '0.6'; }
+  }
+}
+
+async function _renderAgentConnectorsSection(agent, editing) {
+  const section = document.getElementById('agents-detail-connectors-section');
+  const slot = document.getElementById('agents-detail-connectors');
+  if (!section || !slot) return;
+  // Hidden for CLI runtime agents (they don't go through the in-process AgentRunner that
+  // injects connector tools).
+  const isCliRuntime = !!(agent.runtime && agent.runtime.kind === 'cli');
+  if (isCliRuntime) { section.style.display = 'none'; return; }
+  section.style.display = '';
+
+  let list = [];
+  try {
+    const res = await window.orkas.invoke('connectors.list', {});
+    if (res && res.ok && Array.isArray(res.instances)) list = res.instances;
+  } catch (_err) { /* leave list empty */ }
+
+  const enabled = new Set(Array.isArray(agent.enabled_connectors) ? agent.enabled_connectors : []);
+  const canEdit = agent.source === 'custom' || (agent.source === 'builtin' && typeof isDevMode === 'function' && false);
+
+  if (!list.length) {
+    slot.innerHTML = `<div class="muted">${escapeHtml(t('agents.connectors_empty') || 'No connectors installed. Add one in the Connectors tab.')}</div>`;
+    return;
+  }
+
+  slot.innerHTML = '';
+  for (const inst of list) {
+    const row = document.createElement('label');
+    row.className = 'agent-connector-row';
+    const checked = enabled.has(inst.id);
+    const status = (inst.status && inst.status.kind) || 'disconnected';
+    row.innerHTML = `
+      <input type="checkbox" class="agent-connector-toggle" ${checked ? 'checked' : ''} ${(canEdit && !editing) ? '' : 'disabled'} />
+      <span class="connector-dot connector-dot-${status}"></span>
+      <span class="agent-connector-name"></span>
+      <span class="agent-connector-id muted"></span>
+    `;
+    row.querySelector('.agent-connector-name').textContent = inst.display_name || inst.id;
+    row.querySelector('.agent-connector-id').textContent = inst.id;
+    const cb = row.querySelector('.agent-connector-toggle');
+    cb.addEventListener('change', async () => {
+      if (cb.checked) enabled.add(inst.id);
+      else enabled.delete(inst.id);
+      try {
+        const res = await window.orkas.invoke('agents.update', {
+          agent_id: agent.agent_id,
+          updates: { enabled_connectors: Array.from(enabled) },
+        });
+        if (!res || !res.ok) {
+          cb.checked = !cb.checked;
+          if (cb.checked) enabled.add(inst.id); else enabled.delete(inst.id);
+          uiAlert((res && res.error) || t('agents.update_failed') || 'Update failed');
+        } else if (res.agent) {
+          agent.enabled_connectors = res.agent.enabled_connectors;
+        }
+      } catch (err) {
+        cb.checked = !cb.checked;
+        uiAlert((err && err.message) || 'Update failed');
+      }
+    });
+    slot.appendChild(row);
+  }
 }
 
 /** Render the runtime control in the detail body.
@@ -538,7 +778,9 @@ async function _renderAgentDetailRuntime(agent) {
       ? baseLabel : currentType;
     options.push({
       value: `cli:${currentType}`,
-      label: `${labelText} ${t('agent.cli_missing')}`,
+      label: labelText,
+      hint: t('agent.cli_missing'),
+      iconName: 'warning',
     });
   }
   if (options.length === 0) {
@@ -565,7 +807,7 @@ async function _renderAgentDetailRuntime(agent) {
       const lang = (typeof getLang === 'function') ? getLang() : 'zh';
       const prev = (typeof getCliDefaults === 'function') ? getCliDefaults(currentType) : null;
       const next2 = (typeof getCliDefaults === 'function') ? getCliDefaults(newCli) : null;
-      const prevDescLocal = prev ? (lang === 'en' ? prev.description_en : prev.description_zh) : '';
+      const prevDescLocal = prev ? pickDesc(prev, lang) : '';
       const curName = (agent.name || '').trim();
       const curDescLocal = pickDesc(agent, lang).trim();
       // Same default-like detection as the create modal: bare default OR
@@ -609,6 +851,105 @@ async function _renderAgentDetailRuntime(agent) {
   });
 }
 
+/** Project directory setting for external coding agents (claude / codex).
+ *  Stored in a local-only main-process config; each conversation copies
+ *  the effective value on its first coding-agent dispatch. */
+async function _renderAgentDetailProjectDir(agent) {
+  const section = document.getElementById('agents-detail-project-dir-section');
+  const slot = document.getElementById('agents-detail-project-dir');
+  if (!section || !slot) return;
+  const cli = agent.runtime?.kind === 'cli' ? agent.runtime.cli : '';
+  const supportsProjectDir = typeof cliIsCodingAgent === 'function' && cliIsCodingAgent(cli);
+  if (!supportsProjectDir) {
+    section.style.display = 'none';
+    slot.innerHTML = '';
+    return;
+  }
+  section.style.display = '';
+  slot.dataset.agentId = agent.agent_id;
+
+  const canEdit = agent.source === 'custom';
+
+  const renderInfo = (info) => {
+    if (_selectedAgent?.id !== agent.agent_id || slot.dataset.agentId !== agent.agent_id) return;
+    const mode = info?.mode === 'custom' ? 'custom' : 'workspace';
+    const missing = mode === 'custom' && info.exists === false;
+    const pathText = String(info?.path || info?.workspace_path || '');
+    const badge = mode === 'custom'
+      ? t('agents.project_dir_custom')
+      : t('agents.project_dir_workspace');
+    const status = missing ? t('agents.project_dir_missing') : badge;
+    const cardClass = [
+      'agent-project-dir-card',
+      mode === 'workspace' ? 'is-workspace' : 'is-custom',
+      missing ? 'is-missing' : '',
+      canEdit ? '' : 'is-disabled',
+    ].filter(Boolean).join(' ');
+    slot.innerHTML = `
+      <div class="${cardClass}">
+        ${_agentUiIconHtml(missing ? 'warning' : 'folder-open', 'agent-project-dir-icon')}
+        <div class="agent-project-dir-main">
+          <div class="agent-project-dir-path" title="${escapeHtml(pathText)}">${escapeHtml(pathText)}</div>
+          <div class="agent-project-dir-mode">${escapeHtml(status)}</div>
+        </div>
+        <div class="agent-project-dir-actions">
+          <button type="button" class="btn btn-sm" data-act="pick" ${canEdit ? '' : 'disabled'}>${escapeHtml(t('input.dir.change'))}</button>
+          ${mode === 'custom' ? `<button type="button" class="btn btn-sm" data-act="reset" ${canEdit ? '' : 'disabled'}>${escapeHtml(t('agents.project_dir_use_workspace'))}</button>` : ''}
+        </div>
+      </div>`;
+    const pickBtn = slot.querySelector('[data-act="pick"]');
+    const resetBtn = slot.querySelector('[data-act="reset"]');
+    const pick = async () => {
+      if (!canEdit) return;
+      try {
+        const picked = await window.orkas.invoke('common.pickDirectory', {
+          title: t('agents.label_project_dir'),
+        });
+        if (!picked || picked.cancelled || !picked.path) return;
+        const saved = await window.orkas.invoke('agents.cliProjectDir.set', {
+          agent_id: agent.agent_id,
+          path: picked.path,
+        });
+        if (!saved || !saved.ok) {
+          await uiAlert((saved && saved.error) || t('agents.project_dir_save_failed'));
+          return;
+        }
+        renderInfo(saved.info);
+      } catch (err) {
+        await uiAlert((err && err.message) || t('agents.project_dir_save_failed'));
+      }
+    };
+    pickBtn?.addEventListener('click', (e) => { e.stopPropagation(); pick(); });
+    resetBtn?.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (!canEdit) return;
+      try {
+        const saved = await window.orkas.invoke('agents.cliProjectDir.set', {
+          agent_id: agent.agent_id,
+          path: '',
+        });
+        if (!saved || !saved.ok) {
+          await uiAlert((saved && saved.error) || t('agents.project_dir_save_failed'));
+          return;
+        }
+        renderInfo(saved.info);
+      } catch (err) {
+        await uiAlert((err && err.message) || t('agents.project_dir_save_failed'));
+      }
+    });
+  };
+
+  slot.innerHTML = `<div class="agent-project-dir-card is-loading">${_agentUiIconHtml('folder-open', 'agent-project-dir-icon')}<div class="agent-project-dir-main"><div class="agent-project-dir-path">${escapeHtml(t('common.loading'))}</div></div></div>`;
+  try {
+    const res = await window.orkas.invoke('agents.cliProjectDir.get', { agent_id: agent.agent_id });
+    if (!res || !res.ok || !res.info) throw new Error(res?.error || 'failed');
+    renderInfo(res.info);
+  } catch (err) {
+    _agentsLog.warn('load agent project dir failed', err);
+    slot.innerHTML = `<div class="agents-detail-placeholder">${escapeHtml(t('agents.project_dir_load_failed'))}</div>`;
+  }
+}
+
 /** Render the detail-page avatar slot. Custom agents get a clickable avatar
  *  that opens the picker; builtin agents just show theirs read-only. Each
  *  picker change is sent as an `agents.update` IPC and the local cache is
@@ -618,7 +959,7 @@ function _renderAgentDetailAvatar(agent) {
   if (!slot) return;
   const isCustom = agent.source === 'custom';
   slot.innerHTML = renderAvatarHtml(agent.icon, agent.color, {
-    size: 44,
+    size: 32,
     seed: agent.agent_id,
     clickable: isCustom,
     extraClass: 'agents-detail-avatar',
@@ -686,8 +1027,9 @@ function _toggleAgentFieldEditable(on) {
 
 async function toggleAgentEditMode() {
   if (!_selectedAgent) return;
-  // Built-in editing is dev-only; lift the source guard accordingly.
-  if (_selectedAgent.source === 'builtin' && !isDevMode()) return;
+  if (_selectedAgent.source === 'builtin') return;
+  // Marketplace editing is dev-only; lift the source guard accordingly.
+  if (_isAgentPlatformSource(_selectedAgent.source) && !false) return;
   if (_agentEditing) {
     await _exitAgentEditMode();
   } else {
@@ -754,7 +1096,7 @@ function _bindAgentFieldSave() {
 }
 
 function _scheduleAgentFieldSave(field, value) {
-  if (!_selectedAgent || _selectedAgent.source === 'builtin') return;
+  if (!_selectedAgent || _isAgentPlatformSource(_selectedAgent.source)) return;
   _pendingAgentField = { field, value };
   clearTimeout(_agentFieldSaveTimer);
   _agentFieldSaveTimer = setTimeout(_flushAgentFieldSave, 800);
@@ -784,10 +1126,13 @@ async function _flushAgentFieldSave({ validate = false } = {}) {
   }
   _pendingAgentField = null;
   try {
+    const body = { [field]: value };
+    const category = _normalizeSpecCategoryForHiddenSave(_selectedAgent.category);
+    if (category !== _selectedAgent.category) body.category = category;
     const res = await apiFetch(`/api/agents/${encodeURIComponent(_selectedAgent.id)}/update`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ [field]: value }),
+      body: JSON.stringify(body),
     });
     const data = await res.json();
     if (!data.ok) {
@@ -880,9 +1225,7 @@ function _applyExternalCliDefaults(cliType, { force = false } = {}) {
   if (!nameEl || !descEl) return;
 
   const lang = (typeof getLang === 'function') ? getLang() : 'zh';
-  const localizedDesc = defaults
-    ? (lang === 'en' ? defaults.description_en : defaults.description_zh)
-    : '';
+  const localizedDesc = defaults ? pickDesc(defaults, lang) : '';
   const targetName = defaults ? defaults.name : '';
   const targetDesc = localizedDesc;
 
@@ -891,7 +1234,7 @@ function _applyExternalCliDefaults(cliType, { force = false } = {}) {
   // name and gets a refreshed description. "Default-like name" also covers
   // dedup suffixes like "Claude Code 2" (added to dodge name-taken errors).
   const prev = (typeof getCliDefaults === 'function') ? getCliDefaults(_extActiveCli) : null;
-  const prevDescLocalized = prev ? (lang === 'en' ? prev.description_en : prev.description_zh) : '';
+  const prevDescLocalized = prev ? pickDesc(prev, lang) : '';
 
   const nameUntouched = force || _isDefaultlikeName(nameEl.value, prev?.name);
   const descUntouched = force
@@ -944,8 +1287,28 @@ function openAgentModal() {
     mountExternalCliSelect((cli) => _applyExternalCliDefaults(cli)).catch(() => {});
   }
 
+  // Output-format dropdown (Create tab only — External/CLI agents don't read the worker prompt
+  // hint). Default `markdown_only` matches the new "opt-in to richer formats" stance documented
+  // in PC/CLAUDE.md §6; detail-page dropdown does the same 3-option set + maps legacy values.
+  _mountAgentOutputFormatCreateSelect();
+
   modal.classList.add('open');
   setTimeout(() => document.getElementById('agent-name-input')?.focus(), 50);
+}
+
+function _mountAgentOutputFormatCreateSelect() {
+  const slot = document.getElementById('agent-output-format-select');
+  if (!slot) return;
+  // Mount directly on the slot — _aiSelectMount stamps `dataset.value` on the
+  // element it's given, and _saveCreateAgent reads `slot.dataset.value`. An
+  // intermediate wrapper div would put the dataset out of reach of the save.
+  slot.innerHTML = '';
+  const options = [
+    { value: 'markdown_only', label: t('agents.output_format_markdown_only') },
+    { value: 'dashboard',     label: t('agents.output_format_dashboard') },
+    { value: 'artifact',      label: t('agents.output_format_artifact') },
+  ];
+  _aiSelectMount(slot, { options, value: 'markdown_only' });
 }
 window.openAgentModal = openAgentModal;
 
@@ -991,9 +1354,13 @@ async function _saveCreateAgent({ msgEl }) {
     return;
   }
 
+  // Output-format pick from the modal's dropdown. Default `markdown_only` if for some reason the
+  // dataset wasn't stamped (defensive — _mountAgentOutputFormatCreateSelect always sets it).
+  const outputFormat = document.getElementById('agent-output-format-select')?.dataset.value || 'markdown_only';
+
   try {
     const avatar = randomAgentAvatar();
-    const body = { name, description, icon: avatar.icon, color: avatar.color };
+    const body = { name, description, icon: avatar.icon, color: avatar.color, category: 'general', output_format: outputFormat };
     const res = await apiFetch('/api/agents/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1059,8 +1426,9 @@ async function _saveExternalAgent({ msgEl }) {
   // both fully-translated can edit each side later.
   const defaults = (typeof getCliDefaults === 'function') ? getCliDefaults(cli) : null;
   const lang = (typeof getLang === 'function') ? getLang() : 'zh';
-  const description_zh = lang === 'zh' ? desc : (defaults ? defaults.description_zh : desc);
-  const description_en = lang === 'en' ? desc : (defaults ? defaults.description_en : desc);
+  const editingZh = descriptionLocale(lang) === 'zh';
+  const description_zh = editingZh ? desc : (defaults ? defaults.description_zh : desc);
+  const description_en = editingZh ? (defaults ? defaults.description_en : desc) : desc;
 
   try {
     const avatar = randomAgentAvatar();
@@ -1070,6 +1438,7 @@ async function _saveExternalAgent({ msgEl }) {
       description_zh, description_en,
       icon: avatar.icon, color: avatar.color,
       runtime: { kind: 'cli', cli },
+      category: 'general',
     };
     const res = await apiFetch('/api/agents/create', {
       method: 'POST',
@@ -1121,12 +1490,13 @@ async function _autoSendAgentChat(content) {
 }
 
 async function deleteSelectedAgent() {
-  if (!_selectedAgent || _selectedAgent.source === 'builtin') return;
+  // OrkasOpen has no dev-env concept (per PC/CLAUDE.md §11 "OrkasOpen contract"):
+  // platform / marketplace agents are not user-deletable — only custom agents.
+  if (!_selectedAgent || _selectedAgent.source !== 'custom') return;
   if (!(await uiConfirm(t('agents.delete_confirm')))) return;
   const agentId = _selectedAgent.id;
   try {
-    const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}`,
-      { method: 'DELETE' });
+    const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}`, { method: 'DELETE' });
     const data = await res.json();
     if (!data.ok) throw new Error(data.error || t('agents.delete_failed'));
     _selectedAgent = null; _agentEditing = false;
@@ -1247,6 +1617,11 @@ async function useAgent(agentId, seedText) {
     if (!data.ok) throw new Error(data.error || t('agents.create_conv_failed'));
     const conv = data.conversation;
     conv.title = _autoTitle(visible);
+    // Same fix as the new-chat path in conversation.js: backend's create
+    // response carries `created_at`/`updated_at` but NOT the derived
+    // `last_active_at`, so `timeBucket` would default this brand-new row to
+    // the 'older' bucket and the user thinks it disappeared.
+    conv.last_active_at = new Date().toISOString();
     conversations.unshift(conv);
     renderConversationList();
     setView('conversation', conv.conversation_id, { skipLoad: true });
@@ -1349,10 +1724,54 @@ if (typeof window !== 'undefined') {
 // Set on every `_openAgentPicker`; consumed by `_renderAgentPickerList` and
 // the search-input change handler so live filtering stays scoped.
 let _pickerBoundAgentIds = null;
+let _agentPickerTab = 'agents';
+const _AGENT_PICKER_TAB_ORDER = ['agents', 'skills', 'connectors'];
+const _AGENT_PICKER_TABS = new Set(_AGENT_PICKER_TAB_ORDER);
+
+function _normalizeAgentPickerTab(tab) {
+  return _AGENT_PICKER_TABS.has(tab) ? tab : 'agents';
+}
+
+function _agentPickerSearchPlaceholder() {
+  if (_agentPickerTab === 'skills') return t('agent_picker.search_skills_placeholder');
+  if (_agentPickerTab === 'connectors') return t('agent_picker.search_connectors_placeholder');
+  return t('agent_picker.search_placeholder');
+}
+
+function _updateAgentPickerChrome() {
+  const picker = document.getElementById('agent-picker');
+  if (!picker) return;
+  picker.querySelectorAll('[data-agent-picker-tab]').forEach((btn) => {
+    const active = btn.dataset.agentPickerTab === _agentPickerTab;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-selected', active ? 'true' : 'false');
+  });
+  const search = document.getElementById('agent-picker-search');
+  if (search) search.placeholder = _agentPickerSearchPlaceholder();
+}
+
+function _setAgentPickerTab(tab, opts = {}) {
+  _agentPickerTab = _normalizeAgentPickerTab(tab);
+  const search = document.getElementById('agent-picker-search');
+  if (search && !opts.keepSearch) search.value = '';
+  _updateAgentPickerChrome();
+  _renderAgentPickerList(search ? search.value : '');
+  if (opts.focusSearch !== false) setTimeout(() => search?.focus(), 0);
+}
+
+function _moveAgentPickerTab(delta) {
+  const cur = _AGENT_PICKER_TAB_ORDER.indexOf(_agentPickerTab);
+  const idx = cur >= 0 ? cur : 0;
+  const next = (idx + delta + _AGENT_PICKER_TAB_ORDER.length) % _AGENT_PICKER_TAB_ORDER.length;
+  _setAgentPickerTab(_AGENT_PICKER_TAB_ORDER[next]);
+}
 
 function _resolveActiveProjectId(anchorId) {
   if (anchorId === 'new-chat-recipient-chip') {
     return (typeof getCommanderProjectId === 'function') ? getCommanderProjectId() : '';
+  }
+  if (anchorId === 'project-chat-recipient-chip') {
+    return (typeof _projectDetailPid !== 'undefined') ? (_projectDetailPid || '') : '';
   }
   if (anchorId === 'chat-recipient-chip') {
     if (typeof currentCid !== 'undefined' && currentCid
@@ -1379,21 +1798,27 @@ async function _openAgentPicker(anchorBtn) {
   // agent silently disappears from the list. Mirror the `setView('agents')`
   // force-refresh in `boot.js` here so the picker is also a ground-truth
   // surface; cost is one IPC + dir scan per picker open (sub-ms in practice).
-  await loadAgents(true);
-  // Refresh project-scope bindings on every open so the picker reflects
+  await Promise.all([
+    loadAgents(true),
+    (typeof loadSkills === 'function' ? loadSkills(true) : Promise.resolve()),
+    (typeof loadConnectors === 'function' ? loadConnectors() : Promise.resolve()),
+  ]);
+  // Refresh project-scoped agent bindings on every open so the picker reflects
   // whatever project the user just picked (commander chip) or whatever
-  // project the active conv belongs to.
+  // project the active conv belongs to. Skills and connectors stay global.
   _pickerBoundAgentIds = null;
   const pid = _resolveActiveProjectId(anchorBtn.id);
   if (pid) {
     try {
       const res = await window.orkas.invoke('projects.bindings.list', { projectId: pid });
-      if (res?.ok) _pickerBoundAgentIds = new Set((res.bindings && res.bindings.agents) || []);
+      if (res?.ok) {
+        _pickerBoundAgentIds = new Set((res.bindings && res.bindings.agents) || []);
+      }
     } catch (_) { /* fall back to global listing */ }
   }
   // Render first so measurement in _positionPopoverAboveOrBelow reflects
   // the real list height (not stale content from a previous open).
-  _renderAgentPickerList('');
+  _setAgentPickerTab('agents', { focusSearch: false });
   _positionPopoverAboveOrBelow(picker, anchorBtn);
   setTimeout(() => document.getElementById('agent-picker-search')?.focus(), 30);
 }
@@ -1403,14 +1828,24 @@ function _closeAgentPicker() {
   if (picker) picker.style.display = 'none';
   // NOTE: callers that close-without-selection (Esc / click-outside) must
   // also clear `_atKeyMark` — otherwise the next picker open would consume
-  // a stale `@`. Selection callers leave the mark so _triggerAgent can use
-  // it before clearing.
+  // a stale `@`. Selection callers leave the mark so _triggerPickerItem can
+  // use it before clearing.
 }
 
 function _renderAgentPickerList(filterText) {
   const listEl = document.getElementById('agent-picker-list');
   const picker = document.getElementById('agent-picker');
+  if (!listEl) return;
   const anchorId = picker?.dataset.anchorId || '';
+  _updateAgentPickerChrome();
+  if (_agentPickerTab === 'skills') {
+    _renderSkillPickerList(listEl, filterText, anchorId);
+    return;
+  }
+  if (_agentPickerTab === 'connectors') {
+    _renderConnectorPickerList(listEl, filterText, anchorId);
+    return;
+  }
   // Disabled agents are filtered out — picker is a "what can I dispatch right
   // now" UI, and re-enabling lives in the management page (Agents view + ⋯ menu).
   let agents = (_agentsCache || []).filter((a) => a.enabled !== false);
@@ -1445,29 +1880,31 @@ function _renderAgentPickerList(filterText) {
     : agents;
   // Recipient chip exposes "commander" as a virtual top entry so the user can
   // switch back without an empty-state. Other anchors keep agent-only listing.
-  const isRecipientPicker = anchorId === 'chat-recipient-chip' || anchorId === 'new-chat-recipient-chip';
+  const isRecipientPicker = anchorId === 'chat-recipient-chip'
+    || anchorId === 'new-chat-recipient-chip'
+    || anchorId === 'project-chat-recipient-chip';
   const commanderName = t('chat.recipient_commander');
   const commanderMatchesFilter = !q || commanderName.toLowerCase().includes(q);
   if (!filtered.length && !(isRecipientPicker && commanderMatchesFilter)) {
-    listEl.innerHTML = `<div class="skill-picker-item" style="color:#9ca3af">${escapeHtml(t('agents.no_match'))}</div>`;
+    listEl.innerHTML = `<div class="skill-picker-empty">${escapeHtml(t('agents.no_match'))}</div>`;
     return;
   }
-  const groups = { custom: [], builtin: [] };
-  for (const a of filtered) (groups[a.source] || groups.custom).push(a);
+  const groups = { custom: [], marketplace: [] };
+  for (const a of filtered) (groups[_agentSource(a.source)] || groups.custom).push(a);
   const groupHtml = (label, list) => {
     if (!list.length) return '';
     return `<div class="skill-picker-group-label">${escapeHtml(label)}</div>` +
       list.map(a => {
         const aDesc = pickDesc(a, lang).trim();
         return `
-        <div class="skill-picker-item" data-id="${escapeHtml(a.agent_id)}" data-name="${escapeHtml(a.name || a.agent_id)}">
+        <div class="skill-picker-item" data-kind="agent" data-id="${escapeHtml(a.agent_id)}" data-name="${escapeHtml(a.name || a.agent_id)}">
           <div class="skill-picker-item-name">${escapeHtml(a.name || t('agents.unnamed'))}</div>
           ${aDesc ? `<div class="skill-picker-item-desc">${escapeHtml(aDesc)}</div>` : ''}
         </div>`;
       }).join('');
   };
   const commanderHtml = (isRecipientPicker && commanderMatchesFilter)
-    ? `<div class="skill-picker-item" data-id="__commander__" data-name="${escapeHtml(commanderName)}">
+    ? `<div class="skill-picker-item" data-kind="agent" data-id="__commander__" data-name="${escapeHtml(commanderName)}">
          <div class="skill-picker-item-name">${escapeHtml(commanderName)}</div>
          <div class="skill-picker-item-desc">${escapeHtml(t('chat.recipient_commander_hint'))}</div>
        </div>`
@@ -1480,11 +1917,97 @@ function _renderAgentPickerList(filterText) {
   const projectEmptyHint = (!q && _pickerBoundAgentIds && _pickerBoundAgentIds.size === 0)
     ? `<div class="skill-picker-empty-hint">${escapeHtml(t('agents.no_project_agents'))}</div>`
     : '';
-  listEl.innerHTML = projectEmptyHint + commanderHtml + groupHtml(t('agents.source_custom'), groups.custom) + groupHtml(t('agents.source_builtin'), groups.builtin);
+  listEl.innerHTML = projectEmptyHint + commanderHtml
+    + groupHtml(t('agents.source_custom'), groups.custom)
+    + groupHtml(t('agents.source_marketplace'), groups.marketplace);
+  _bindAgentPickerListItems(listEl, anchorId);
+}
+
+function _matchPickerItem(q, name, desc, extra = '') {
+  if (!q) return true;
+  return String(name || '').toLowerCase().includes(q)
+    || String(desc || '').toLowerCase().includes(q)
+    || String(extra || '').toLowerCase().includes(q);
+}
+
+function _pickerMatchScore(q, name) {
+  const n = String(name || '').toLowerCase();
+  if (!q) return 0;
+  if (n === q) return 0;
+  if (n.startsWith(q)) return 1;
+  if (n.includes(q)) return 2;
+  return 3;
+}
+
+function _renderSkillPickerList(listEl, filterText, anchorId) {
+  const lang = getLang();
+  const q = (filterText || '').toLowerCase();
+  let skills = (_skillsCache || []).filter((s) => s.enabled !== false);
+  const filtered = q
+    ? skills
+        .filter((s) => _matchPickerItem(q, s.name || s.id, pickDesc(s, lang), s.id))
+        .sort((a, b) => _pickerMatchScore(q, a.name || a.id) - _pickerMatchScore(q, b.name || b.id))
+    : skills;
+  if (!filtered.length) {
+    listEl.innerHTML = `<div class="skill-picker-empty">${escapeHtml(t('skills.no_match'))}</div>`;
+    return;
+  }
+  const groups = { custom: [], marketplace: [] };
+  for (const s of filtered) {
+    const source = (typeof normalizeCatalogSource === 'function') ? normalizeCatalogSource(s.source) : s.source;
+    (groups[source] || groups.custom).push(s);
+  }
+  const groupHtml = (label, list) => {
+    if (!list.length) return '';
+    return `<div class="skill-picker-group-label">${escapeHtml(label)}</div>` +
+      list.map((s) => {
+        const desc = pickDesc(s, lang).trim();
+        const name = s.name || s.id;
+        return `
+        <div class="skill-picker-item" data-kind="skill" data-id="${escapeHtml(s.id)}" data-name="${escapeHtml(name)}">
+          <div class="skill-picker-item-name">${escapeHtml(name)}</div>
+          ${desc ? `<div class="skill-picker-item-desc">${escapeHtml(desc)}</div>` : ''}
+        </div>`;
+      }).join('');
+  };
+  listEl.innerHTML = groupHtml(t('skills.source_custom'), groups.custom)
+    + groupHtml(t('skills.source_marketplace'), groups.marketplace);
+  _bindAgentPickerListItems(listEl, anchorId);
+}
+
+function _renderConnectorPickerList(listEl, filterText, anchorId) {
+  const q = (filterText || '').toLowerCase();
+  const items = (typeof listUsableConnectorsForPicker === 'function')
+    ? listUsableConnectorsForPicker()
+    : [];
+  const filtered = q
+    ? items
+        .filter((c) => _matchPickerItem(q, c.name || c.id, c.description, `${c.id} ${c.account || ''}`))
+        .sort((a, b) => _pickerMatchScore(q, a.name || a.id) - _pickerMatchScore(q, b.name || b.id))
+    : items;
+  if (!filtered.length) {
+    listEl.innerHTML = `<div class="skill-picker-empty">${escapeHtml(q ? t('connectors.no_match') : t('connectors.no_connected'))}</div>`;
+    return;
+  }
+  listEl.innerHTML = `<div class="skill-picker-group-label">${escapeHtml(t('connectors.group.connected'))}</div>` +
+    filtered.map((c) => {
+      const descParts = [];
+      if (c.description) descParts.push(c.description);
+      if (c.account) descParts.push(t('connectors.account_label', { account: c.account }));
+      return `
+      <div class="skill-picker-item" data-kind="connector" data-id="${escapeHtml(c.id)}" data-name="${escapeHtml(c.name || c.id)}">
+        <div class="skill-picker-item-name">${escapeHtml(c.name || c.id)}</div>
+        ${descParts.length ? `<div class="skill-picker-item-desc">${escapeHtml(descParts.join(' · '))}</div>` : ''}
+      </div>`;
+    }).join('');
+  _bindAgentPickerListItems(listEl, anchorId);
+}
+
+function _bindAgentPickerListItems(listEl, anchorId) {
   for (const el of listEl.querySelectorAll('[data-id]')) {
     el.addEventListener('click', async () => {
       _closeAgentPicker();
-      await _triggerAgent(el.dataset.id, el.dataset.name, anchorId);
+      await _triggerPickerItem(el.dataset.kind || 'agent', el.dataset.id, el.dataset.name, anchorId);
     });
     el.addEventListener('mouseenter', () => {
       const all = listEl.querySelectorAll('.skill-picker-item[data-id]');
@@ -1518,17 +2041,41 @@ function _moveAgentPickerActive(delta) {
   _setAgentPickerActive(next);
 }
 
+function _targetFromPickerAnchor(anchorId) {
+  if (anchorId === 'new-chat-recipient-chip') return 'new-chat';
+  if (anchorId === 'project-chat-recipient-chip') return 'project';
+  return 'conversation';
+}
+
+async function _triggerPickerItem(kind, itemId, itemName, anchorId) {
+  const target = _targetFromPickerAnchor(anchorId);
+  if (kind === 'skill') {
+    setChatSkill(target, itemName || itemId);
+    _consumeAtKeyChar();
+    const inputId = target === 'new-chat' ? 'new-chat-input' : (target === 'project' ? 'project-chat-input' : 'chat-input');
+    _focusInput(document.getElementById(inputId));
+    return;
+  }
+  if (kind === 'connector') {
+    setChatConnector(target, itemId, itemName || itemId);
+    _consumeAtKeyChar();
+    const inputId = target === 'new-chat' ? 'new-chat-input' : (target === 'project' ? 'project-chat-input' : 'chat-input');
+    _focusInput(document.getElementById(inputId));
+    return;
+  }
+  await _triggerAgent(itemId, itemName, anchorId);
+}
+
 // Route an agent selection to the right behaviour based on which button
 // triggered the picker:
-//   - conversation toolbar → send/queue "run <name>" in the CURRENT conv.
-//     Never opens a new conv. No hidden backend injection — the model reads
-//     the visible message and follows chat_commander.md rule 0.
-//   - new-chat toolbar → create a new normal conv + run agent (useAgent)
-// Selection is one-shot (no persistent chip).
+//   - recipient chip / @ picker → update the persistent recipient chip.
+//   - other anchors → spin up a fresh conversation for that agent.
 async function _triggerAgent(agentId, agentName, anchorId) {
-  const isRecipientAnchor = anchorId === 'chat-recipient-chip' || anchorId === 'new-chat-recipient-chip';
+  const isRecipientAnchor = anchorId === 'chat-recipient-chip'
+    || anchorId === 'new-chat-recipient-chip'
+    || anchorId === 'project-chat-recipient-chip';
   if (isRecipientAnchor) {
-    const target = anchorId === 'new-chat-recipient-chip' ? 'new-chat' : 'conversation';
+    const target = _targetFromPickerAnchor(anchorId);
     if (agentId === '__commander__') {
       setChatRecipient(target, { kind: 'commander' });
     } else {
@@ -1538,7 +2085,7 @@ async function _triggerAgent(agentId, agentName, anchorId) {
     // `@` is now redundant (the chip carries the recipient) and would also
     // leak into the sent text — strip it.
     _consumeAtKeyChar();
-    const inputId = target === 'new-chat' ? 'new-chat-input' : 'chat-input';
+    const inputId = target === 'new-chat' ? 'new-chat-input' : (target === 'project' ? 'project-chat-input' : 'chat-input');
     _focusInput(document.getElementById(inputId));
     return;
   }
@@ -1573,6 +2120,14 @@ function _focusInput(input) {
 function bindAgentPickers() {
   // Re-bindable helper: wire the recipient chips on both chat panels +
   // under anchorIds. Guarded with dataset.bound so a second call is a no-op.
+  document.querySelectorAll('[data-agent-picker-tab]').forEach((btn) => {
+    if (btn.dataset.bound === '1') return;
+    btn.dataset.bound = '1';
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      _setAgentPickerTab(btn.dataset.agentPickerTab || 'agents');
+    });
+  });
   const searchInput = document.getElementById('agent-picker-search');
   searchInput?.addEventListener('input', () => {
     _renderAgentPickerList(searchInput.value);
@@ -1584,6 +2139,8 @@ function bindAgentPickers() {
     // English candidate would also fire our select-active-item handler.
     if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Escape') { _atKeyMark = null; _closeAgentPicker(); e.preventDefault(); return; }
+    if (e.key === 'ArrowRight') { _moveAgentPickerTab(1); e.preventDefault(); return; }
+    if (e.key === 'ArrowLeft')  { _moveAgentPickerTab(-1); e.preventDefault(); return; }
     if (e.key === 'ArrowDown') { _moveAgentPickerActive(1); e.preventDefault(); return; }
     if (e.key === 'ArrowUp')   { _moveAgentPickerActive(-1); e.preventDefault(); return; }
     if (e.key === 'Enter') {
@@ -1593,7 +2150,7 @@ function bindAgentPickers() {
       if (active) { active.click(); e.preventDefault(); }
     }
   });
-  for (const id of ['chat-recipient-chip', 'new-chat-recipient-chip']) {
+  for (const id of ['chat-recipient-chip', 'new-chat-recipient-chip', 'project-chat-recipient-chip']) {
     const btn = document.getElementById(id);
     if (!btn || btn.dataset.bound === '1') continue;
     btn.dataset.bound = '1';
@@ -1611,9 +2168,9 @@ function bindAgentPickers() {
     });
   }
 
-  // `@` keystroke in either chat textarea opens the recipient picker. The
-  // typed `@` itself is removed on a successful pick (see _consumeAtKeyChar)
-  // so the chip is the single source of truth for recipient.
+  // `@` keystroke in either chat textarea opens the agent / skill / connector
+  // picker. The typed `@` itself is removed on a successful pick so the chips
+  // are the single source of truth for the selected route/context.
   const onAtKey = (anchorId) => (e) => {
     if (e.key !== '@') return;
     const btn = document.getElementById(anchorId);
@@ -1625,8 +2182,7 @@ function bindAgentPickers() {
         inputId: ta.id || '',
         posAfter: typeof ta.selectionStart === 'number' ? ta.selectionStart : 0,
       };
-      if (!_agentsCache) loadAgents().then(() => _openAgentPicker(btn));
-      else _openAgentPicker(btn);
+      _openAgentPicker(btn);
     }, 0);
   };
   // Backspace right after a `@<name>` token (with or without the trailing
@@ -1667,6 +2223,12 @@ function bindAgentPickers() {
     chatInput.addEventListener('keydown', onAtKey('chat-recipient-chip'));
     chatInput.addEventListener('keydown', onBackspaceMention);
   }
+  const projectChatInput = document.getElementById('project-chat-input');
+  if (projectChatInput && !projectChatInput.dataset.atBound) {
+    projectChatInput.dataset.atBound = '1';
+    projectChatInput.addEventListener('keydown', onAtKey('project-chat-recipient-chip'));
+    projectChatInput.addEventListener('keydown', onBackspaceMention);
+  }
   // One global click handler is enough — guard with a flag on the picker.
   const picker = document.getElementById('agent-picker');
   if (picker && !picker.dataset.outsideBound) {
@@ -1680,7 +2242,13 @@ function bindAgentPickers() {
       _atKeyMark = null;
       _closeAgentPicker();
     });
+    window.addEventListener('i18n-change', () => {
+      _updateAgentPickerChrome();
+      if (picker.style.display !== 'none') {
+        const search = document.getElementById('agent-picker-search');
+        _renderAgentPickerList(search ? search.value : '');
+      }
+    });
   }
 
 }
-

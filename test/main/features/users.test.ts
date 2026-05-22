@@ -123,3 +123,4 @@ describe('features/users › initActiveUser', () => {
     expect(rec.created_at).toBe('2026-01-01T00:00:00');
   });
 });
+

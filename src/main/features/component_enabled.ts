@@ -43,19 +43,31 @@ import { createLogger } from '../logger';
 
 const log = createLogger('component-enabled');
 
+// features/sync is stripped from the OrkasOpen build — markDirty is a no-op.
+function _notifyDirty(): void {
+  /* no-op */
+}
+
 const SCHEMA_VERSION = 1;
 
 export interface ComponentEnabledFile {
   version: number;
   agents: Record<string, boolean>;
   skills: Record<string, boolean>;
+  /** Per-user soft-disable for connector instances. Independent of OAuth grant / MCP connection
+   *  state — a "disabled" connector keeps its tokens and stays connected, but is invisible to
+   *  the LLM (`resolveVisibleConnectors` filters it out). "Disconnect" (manager.removeInstance)
+   *  is the heavier action that wipes the grant. */
+  connectors: Record<string, boolean>;
 }
 
 function emptyFile(): ComponentEnabledFile {
-  return { version: SCHEMA_VERSION, agents: {}, skills: {} };
+  return { version: SCHEMA_VERSION, agents: {}, skills: {}, connectors: {} };
 }
 
-/** Read the per-user enabled-overrides file. Missing / corrupt → empty defaults. */
+/** Read the per-user enabled-overrides file. Missing / corrupt → empty defaults.
+ *  Old v1 files without a `connectors` field are auto-padded with `{}` (no migration needed —
+ *  missing key = treat-as-enabled is the contract). */
 export function readEnabledMap(uid: string): ComponentEnabledFile {
   const p = userComponentEnabledFile(uid);
   try {
@@ -67,6 +79,7 @@ export function readEnabledMap(uid: string): ComponentEnabledFile {
       version: SCHEMA_VERSION,
       agents: (parsed.agents && typeof parsed.agents === 'object') ? sanitiseMap(parsed.agents) : {},
       skills: (parsed.skills && typeof parsed.skills === 'object') ? sanitiseMap(parsed.skills) : {},
+      connectors: (parsed.connectors && typeof parsed.connectors === 'object') ? sanitiseMap(parsed.connectors) : {},
     };
   } catch (err) {
     log.warn(`read failed, using empty defaults: ${(err as Error).message}`);
@@ -107,6 +120,12 @@ export function isSkillEnabled(uid: string, skillId: string, specDefault?: boole
   return resolve(map.skills, skillId, specDefault);
 }
 
+export function isConnectorEnabled(uid: string, connectorId: string, specDefault?: boolean): boolean {
+  if (!connectorId) return true;
+  const map = readEnabledMap(uid);
+  return resolve(map.connectors, connectorId, specDefault);
+}
+
 function resolve(overrides: Record<string, boolean>, id: string, specDefault?: boolean): boolean {
   const o = overrides[id];
   if (typeof o === 'boolean') return o;
@@ -121,10 +140,12 @@ export function setAgentEnabled(uid: string, agentId: string, enabled: boolean):
     version: SCHEMA_VERSION,
     agents: { ...cur.agents },
     skills: { ...cur.skills },
+    connectors: { ...cur.connectors },
   };
   if (enabled) delete next.agents[agentId];
   else next.agents[agentId] = false;
   writeAtomic(uid, next);
+  _notifyDirty();
   log.info(`agent ${agentId} → ${enabled ? 'enabled' : 'disabled'}`);
 }
 
@@ -135,19 +156,38 @@ export function setSkillEnabled(uid: string, skillId: string, enabled: boolean):
     version: SCHEMA_VERSION,
     agents: { ...cur.agents },
     skills: { ...cur.skills },
+    connectors: { ...cur.connectors },
   };
   if (enabled) delete next.skills[skillId];
   else next.skills[skillId] = false;
   writeAtomic(uid, next);
+  _notifyDirty();
   log.info(`skill ${skillId} → ${enabled ? 'enabled' : 'disabled'}`);
 }
 
+export function setConnectorEnabled(uid: string, connectorId: string, enabled: boolean): void {
+  if (!connectorId) throw new Error('connectorId required');
+  const cur = readEnabledMap(uid);
+  const next: ComponentEnabledFile = {
+    version: SCHEMA_VERSION,
+    agents: { ...cur.agents },
+    skills: { ...cur.skills },
+    connectors: { ...cur.connectors },
+  };
+  if (enabled) delete next.connectors[connectorId];
+  else next.connectors[connectorId] = false;
+  writeAtomic(uid, next);
+  _notifyDirty();
+  log.info(`connector ${connectorId} → ${enabled ? 'enabled' : 'disabled'}`);
+}
+
 /** Bulk read — used by the renderer to render toggle states without re-fetching
- *  per row. Returns `{agents: Set<disabledId>, skills: Set<disabledId>}`. */
-export function readDisabledSets(uid: string): { agents: Set<string>; skills: Set<string> } {
+ *  per row. Returns `{agents, skills, connectors: Set<disabledId>}`. */
+export function readDisabledSets(uid: string): { agents: Set<string>; skills: Set<string>; connectors: Set<string> } {
   const map = readEnabledMap(uid);
   return {
     agents: new Set(Object.keys(map.agents)),
     skills: new Set(Object.keys(map.skills)),
+    connectors: new Set(Object.keys(map.connectors)),
   };
 }

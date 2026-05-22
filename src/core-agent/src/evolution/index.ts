@@ -15,5 +15,5 @@ export {
   detectUserCorrection,
   emptyRunMetrics,
   shouldReflect,
-  buildAdaptiveReviewPrompt,
+  buildReviewPrompt,
 } from "./metacognition.js";

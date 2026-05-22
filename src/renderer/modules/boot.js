@@ -15,10 +15,21 @@ async function bootApp() {
   await loadProjects();
   await loadConversations();
   await loadAgents();
+  await loadSkills();
   // Warm the commander avatar cache so the first chat render doesn't fall
   // back to the default for a frame.
   if (typeof _ensureCommanderAvatarLoaded === 'function') _ensureCommanderAvatarLoaded();
+  // Long-lived subscription to scheduled-task fires (main pushes
+  // `conv_created` whenever a tick dispatches an agent); renderer reloads
+  // its conv list. Fire-and-forget: stream owns its own lifetime.
+  if (typeof startScheduledTaskEventsSubscription === 'function') {
+    startScheduledTaskEventsSubscription();
+  }
   _stampSettingsVersion();
+  // delivering an iOS-initiated command to the bus — see PC/CLAUDE.md §4 relay paragraph).
+  if (typeof startRelayActivitySubscription === 'function') {
+    startRelayActivitySubscription();
+  }
   _restoreLastView();
 }
 
@@ -30,13 +41,6 @@ async function _stampSettingsVersion() {
     if (v) el.textContent = 'v' + v;
   } catch (_) { /* ignore — non-critical */ }
 }
-
-// Dev-mode editing of built-in skills / agents is stripped from the
-// open-source build (the underlying `isDevEnv()` / built-in dual-write IPC
-// stack lives in the in-app debug panel that's only present in PC).
-// Renderer modules still branch on `isDevMode()` for those entry points,
-// so we stub it to false here.
-function isDevMode() { return false; }
 
 // One-shot rename of legacy brand-prefixed localStorage keys
 // (`orkas_*` / `orkas.*`) to the unprefixed form. After stamping,
@@ -89,6 +93,12 @@ function _saveLastView(view, cid) {
 }
 
 function _restoreLastView() {
+  // Restart policy: only `conversation` view is remembered across launches.
+  // Every other tab (agents / skills / contexts / connectors / apps / settings
+  // / project detail / marketplace / devtools) intentionally falls back to
+  // the commander (new-chat) — the user always lands on a known starting
+  // point and doesn't accidentally resume a settings / inventory tab they
+  // wandered into before quitting.
   let saved = null;
   try {
     const raw = localStorage.getItem(_LAST_VIEW_KEY);
@@ -100,20 +110,6 @@ function _restoreLastView() {
 
   if (view === 'conversation' && cid && conversations.some(c => c.conversation_id === cid)) {
     setView('conversation', cid);
-    return;
-  }
-  // Project detail page: cid slot carries the pid (see boot.js setView).
-  // Verify the project still exists (might have been deleted on another
-  // device since last save) before restoring; fall through to new-chat
-  // otherwise.
-  if (view === 'project' && cid
-      && Array.isArray(_projectsCache)
-      && _projectsCache.some((p) => p && p.project_id === cid)) {
-    setView('project', cid);
-    return;
-  }
-  if (view === 'agents' || view === 'skills' || view === 'contexts' || view === 'new-chat') {
-    setView(view);
     return;
   }
   setView('new-chat');
@@ -144,16 +140,21 @@ function setView(view, cid, opts = {}) {
   const panelId = view === 'new-chat' ? 'panel-new-chat'
                 : view === 'agents' ? 'panel-agents'
                 : view === 'skills' ? 'panel-skills'
+                : view === 'connectors' ? 'panel-connectors'
                 : view === 'contexts' ? 'panel-contexts'
+                : view === 'apps' ? 'panel-apps'
                 : view === 'settings' ? 'panel-settings'
                 : view === 'project' ? 'panel-project'
+                : view === 'marketplace' ? 'panel-marketplace'
                 : 'panel-conversation';
   document.getElementById(panelId).classList.add('active');
 
   document.getElementById('new-chat-btn').classList.toggle('active', view === 'new-chat');
   document.getElementById('agents-btn').classList.toggle('active', view === 'agents');
   document.getElementById('skills-btn').classList.toggle('active', view === 'skills');
+  document.getElementById('connectors-btn')?.classList.toggle('active', view === 'connectors');
   document.getElementById('contexts-btn')?.classList.toggle('active', view === 'contexts');
+  document.getElementById('apps-btn')?.classList.toggle('active', view === 'apps');
   document.getElementById('settings-btn')?.classList.toggle('active', view === 'settings');
   document.querySelectorAll('.conv-item').forEach(it => {
     it.classList.toggle('active', view === 'conversation' && it.dataset.cid === cid);
@@ -180,7 +181,7 @@ function setView(view, cid, opts = {}) {
     if (isConvPending(cid) && !opts.skipLoad && !streamBubbleAlive) {
       const state = pendingConvs.get(cid);
       // Will be (re)appended after history loads — handled in loadConversationHistory
-      state.needsIndicator = true;
+      if (state) state.needsIndicator = true;
     }
     // Restore input draft + queue panel for this conversation
     if (!opts.skipLoad) _restoreDraft(cid);
@@ -230,9 +231,20 @@ function setView(view, cid, opts = {}) {
     currentCid = null;
     // Same reasoning as the agents branch above.
     loadSkills(true);
+  } else if (view === 'connectors') {
+    currentCid = null;
+    // Status flips during a session (server health, token expiry); always re-fetch on entry.
+    if (typeof loadConnectors === 'function') loadConnectors();
   } else if (view === 'contexts') {
     currentCid = null;
     loadContexts();
+  } else if (view === 'apps') {
+    currentCid = null;
+    // Force-refresh on every visit (same rationale as agents/skills): a
+    // "保存" can land while the user is on another tab — the tab is the
+    // recovery path, so it should always show ground truth. Cheap (one IPC
+    // + dir scan).
+    if (typeof loadSavedApps === 'function') loadSavedApps(true);
   } else if (view === 'settings') {
     currentCid = null;
     loadSettings();
@@ -244,5 +256,5 @@ function setView(view, cid, opts = {}) {
   } else {
     currentCid = null;
   }
+  if (typeof renderProjectsSection === 'function') renderProjectsSection();
 }
-

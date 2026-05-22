@@ -24,6 +24,7 @@ import * as fs from 'node:fs';
 import {
   USERS_FILE,
   userLocalConfigDir,
+  userRoot,
   userToolResultsDir,
   ensureUserLayout,
 } from '../paths';
@@ -32,6 +33,7 @@ import { createLogger } from '../logger';
 import { sweepToolResults } from '../util/tool-result-cap';
 import { migrateLegacySessionIds } from '../util/migrate-session-ids';
 import { migrateAgentLayout } from '../util/migrate-agent-layout';
+import { migrateKbToLocalContexts } from '../util/migrate-kb-to-local';
 
 const log = createLogger('users');
 
@@ -119,6 +121,18 @@ export function activateUser(uid: string): void {
   catch (err) { log.warn(`sweepToolResults uid=${uid}: ${(err as Error).message}`); }
 
   // Strip legacy session_id brand prefixes once.
+  // Sessions GC: clean cid-orphan / legacy-kind / leaked-ephemeral in
+  // cloud/sessions/, and mtime>7d in local/sessions/. Fire-and-forget — the
+  // file scan is bounded by the size of sessions/ and shouldn't gate startup.
+  // See features/sessions_sweep.ts for what it does and doesn't touch.
+  (async () => {
+    try {
+      const mod = await import('./sessions_sweep');
+      await mod.sweepSessions(uid);
+    } catch (err) { log.warn(`sweepSessions uid=${uid}: ${(err as Error).message}`); }
+  })();
+
+  // Strip legacy session_id prefixes (aiteam- / orkas-) once.
   // Idempotent: after the stamp lands, subsequent startups are no-ops.
   // See util/migrate-session-ids.ts for details.
   try { migrateLegacySessionIds(uid); }
@@ -130,6 +144,12 @@ export function activateUser(uid: string): void {
   // util/migrate-agent-layout.ts + docs/plans/agent-as-directory.md.
   try { migrateAgentLayout(uid); }
   catch (err) { log.warn(`migrateAgentLayout uid=${uid}: ${(err as Error).message}`); }
+
+  // KB vector store moved from cloud/contexts/.kb → local/contexts/.kb
+  // (multi-device-sync batch 2 — index is machine-private, never crosses
+  // devices). Idempotent + stamped. See util/migrate-kb-to-local.ts.
+  try { migrateKbToLocalContexts(uid); }
+  catch (err) { log.warn(`migrateKbToLocalContexts uid=${uid}: ${(err as Error).message}`); }
 
   // Pin core-agent's auth/state dir to this uid's local/config/.
   // `resolveAuthDir()` re-reads this env var on every call (see
@@ -169,6 +189,57 @@ export function activateUser(uid: string): void {
   }
 
   log.info(`active user_id=${uid}`);
+}
+
+/**
+ * DEV CONVENIENCE — align the active local data uid with the account's server-side user_id, so a
+ * dev tester logging into a different account doesn't end up with a mismatched local data dir:
+ *   - `data/<serverUid>/` already exists → switch the active uid to it (the old dir is left alone).
+ *   - else, `data/<currentUid>/` exists  → rename it to `data/<serverUid>/`, drop the stale registry
+ *                                          entry, and re-activate.
+ *   - else                               → just (re-)activate `<serverUid>`.
+ *
+ * **Callers MUST gate this on `!app.isPackaged`** — it is a dev-only behavior; it must not run in
+ * packaged builds. Returns true if it changed the active uid.
+ */
+export function reconcileDevUid(serverUid: string): boolean {
+  const target = String(serverUid || '').trim();
+  if (!target || !safeId(target)) {
+    log.warn(`reconcileDevUid: server uid not usable as a local uid, skipping: ${JSON.stringify(serverUid)}`);
+    return false;
+  }
+  // Server's `gen_uuid()` was changed to emit dashless 32-hex going forward (Server/utils/util.py),
+  // so the value here is already in the canonical local form — no client-side normalization
+  // needed. Accounts created before that change still carry the older `XXXXXXXX-XXXX-XXXX-…`
+  // shape on disk; safeId() accepts both, the equality check below is a literal compare, and
+  // path segments don't care about format.
+  const current = getActiveUserId();
+  if (target === current) return false;
+
+  const targetExists = fs.existsSync(userRoot(target));
+  const currentExists = fs.existsSync(userRoot(current));
+  try {
+    if (!targetExists && currentExists) {
+      fs.renameSync(userRoot(current), userRoot(target));
+      // Drop the stale `current` entry; activateUser() below adds `target` + flips current_user_id.
+      const reg = readRegistry();
+      if (reg) {
+        reg.users = reg.users.filter((u) => u.user_id !== current);
+        if (reg.current_user_id === current) reg.current_user_id = target;
+        writeRegistry(reg);
+      }
+      log.info(`reconcileDevUid: renamed local data dir ${current} -> ${target}`);
+    } else if (targetExists) {
+      log.info(`reconcileDevUid: switching active uid ${current} -> ${target} (target data dir already present)`);
+    } else {
+      log.info(`reconcileDevUid: no data dir to move; activating fresh ${target}`);
+    }
+    activateUser(target);
+    return true;
+  } catch (err) {
+    log.error(`reconcileDevUid ${current} -> ${target} failed: ${(err as Error).message}`);
+    return false;
+  }
 }
 
 /**

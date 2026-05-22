@@ -77,4 +77,38 @@ describe('local_agents/backends/openclaw › parseOpenclawReply', () => {
     const r = parseOpenclawReply(stderr);
     expect(r?.text).toBe('code: { foo: { bar } }');
   });
+
+  it('extracts usage when meta.agentMeta.usage is present', () => {
+    const stderr = `{
+  "payloads": [{ "text": "ok" }],
+  "meta": {
+    "agentMeta": {
+      "sessionId": "s1",
+      "model": "claude-sonnet-4-6",
+      "usage": {
+        "input_tokens": 1200,
+        "output_tokens": 450,
+        "cache_read_input_tokens": 800
+      }
+    }
+  }
+}`;
+    const r = parseOpenclawReply(stderr);
+    expect(r?.usage).toEqual({
+      input: 1200,
+      output: 450,
+      cacheRead: 800,
+      model: 'claude-sonnet-4-6',
+    });
+  });
+
+  it('returns no usage field when the envelope has none (legacy openclaw builds)', () => {
+    const stderr = `{
+  "payloads": [{ "text": "ok" }],
+  "meta": { "agentMeta": { "sessionId": "s1" } }
+}`;
+    const r = parseOpenclawReply(stderr);
+    expect(r?.text).toBe('ok');
+    expect((r as any).usage).toBeUndefined();
+  });
 });

@@ -15,6 +15,15 @@
  * Anti-drift: `tool-catalog.test.ts` asserts that the set of tool names
  * runner.ts actually injects is a subset of `TOOL_CATALOG`. Forgetting
  * a catalog entry → test red.
+ *
+ * Connectors (Notion / Slack / GitHub / Gmail / …) are surfaced through two umbrella meta-
+ * tools (`list_connector_tools` / `call_connector_tool`) PLUS a `## Connectors` system-prompt
+ * block enumerating connector ids + descriptions. Both are injected only when ≥1 connector is
+ * visible to the current actor; otherwise zero connector slots in `tools[]`. The two meta-
+ * tools are static and ARE in this catalog; the per-connector MCP actions discovered at
+ * runtime are NOT enumerated here (they vary per-user / per-install). See
+ * `connector-meta-tools.ts` for the rationale (tool-selection accuracy cliff at 20–50 tools +
+ * prompt-cache stability).
  */
 
 import { createLogger } from '../../logger';
@@ -22,14 +31,16 @@ import { createLogger } from '../../logger';
 const log = createLogger('tool-catalog');
 
 export type ToolGroup =
-  | 'fs'        // files / workspace
-  | 'shell'     // command line
-  | 'pdf'       // PDF rendering
-  | 'kb'        // knowledge base
-  | 'image'     // image generation
-  | 'web'       // web access
-  | 'meta'      // cross-session state
-  | 'group';    // group-chat dispatch (commander only)
+  | 'fs'         // files / workspace
+  | 'shell'      // command line
+  | 'pdf'        // PDF rendering
+  | 'kb'         // knowledge base
+  | 'chat'       // conversation history
+  | 'image'      // image generation
+  | 'web'        // web access
+  | 'connector'  // third-party services via MCP umbrella tools
+  | 'meta'       // cross-session state
+  | 'group';     // group-chat dispatch (commander only)
 
 export interface ToolCatalogEntry {
   /** Tool name. Must match `AgentTool.name` exactly. */
@@ -59,6 +70,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   { name: 'stat_file',     group: 'fs', summary: 'Trigger PDF/DOCX extraction and return total_chars; call before read_file.' },
   { name: 'search_files',  group: 'fs', summary: 'Find files by name / glob across the workspace + attachment scope.' },
   { name: 'grep_files',    group: 'fs', summary: 'Grep text across the workspace + attachment scope (PDF/DOCX auto-extracted, then searched).' },
+  { name: 'create_artifact', group: 'fs', permission: 'localExec', summary: 'Build an interactive multi-file web app (HTML/CSS/JS) rendered live & clickable inside the chat bubble; for dashboards / calculators / visualizations / mini-tools — not documents (html_to_pdf) or images (generate_image).' },
 
   // Shell
   { name: 'bash',          group: 'shell', permission: 'localExec', summary: 'Execute a shell command on the user\'s machine (cwd = $working_dir).' },
@@ -71,12 +83,22 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   { name: 'kb_search',     group: 'kb', summary: 'Semantic search over the user\'s knowledge base.' },
   { name: 'kb_read',       group: 'kb', summary: 'Read source-text chunks from a KB file that kb_search has hit.' },
 
+  // Conversation history
+  { name: 'chat_search',   group: 'chat', summary: 'Search prior conversation messages after KB is insufficient or the user asks about previous chats.' },
+  { name: 'chat_read',     group: 'chat', summary: 'Read nearby messages from a chat_search hit, or the latest messages from one conversation.' },
+
   // Image
   { name: 'generate_image', group: 'image', permission: 'localExec', summary: 'Call the configured image-generation API and save the result into the workspace.' },
 
   // Web (when a vendor-native search is available the framework picks it automatically; the two below are the fallback channel)
   { name: 'web_search',    group: 'web', summary: 'Built-in fallback web search (vendor-native search is preferred automatically when available).' },
   { name: 'web_fetch',     group: 'web', summary: 'Fetch the body of a URL; pairs with web_search.' },
+
+  // Connectors (umbrella meta-tools — actual MCP actions are discovered + invoked via these;
+  // injected only when at least one connector is visible to the actor, alongside a
+  // `## Connectors` system-prompt block listing the connector ids + descriptions)
+  { name: 'list_connector_tools', group: 'connector', summary: 'Discover the actions a specific connector exposes (returns name + JSON input schema for each).' },
+  { name: 'call_connector_tool',  group: 'connector', summary: 'Invoke an action on a connector; call list_connector_tools first to learn the action name and schema.' },
 
   // Cross-session state
   { name: 'cross_session_memory', group: 'meta', summary: 'Read/write user / agent memory that persists across sessions.' },
@@ -93,9 +115,11 @@ const GROUP_ORDER: ReadonlyArray<{ group: ToolGroup; title: string }> = [
   { group: 'shell', title: 'Shell' },
   { group: 'pdf',   title: 'PDF' },
   { group: 'kb',    title: 'Knowledge base' },
+  { group: 'chat',  title: 'Conversation history' },
   { group: 'image', title: 'Image' },
-  { group: 'web',   title: 'Web' },
-  { group: 'meta',  title: 'Cross-session state' },
+  { group: 'web',       title: 'Web' },
+  { group: 'connector', title: 'Connectors (third-party services)' },
+  { group: 'meta',      title: 'Cross-session state' },
   { group: 'group', title: 'Group-chat dispatch' },
 ];
 

@@ -51,21 +51,31 @@ const _IPC_ROUTES = [
   ['POST',   '/api/kb/reconcile',             'kb.reconcile'],
   ['POST',   '/api/kb/reprocess',             'kb.reprocess'],
   ['POST',   '/api/kb/events/stream',         'kb.events',                  null, { stream: true }],
+  ['POST',   '/api/marketplace/categories',   'marketplace.categories'],
+  ['POST',   '/api/marketplace/agents/list',  'marketplace.listAgents'],
+  ['POST',   '/api/marketplace/skills/list',  'marketplace.listSkills'],
+  ['POST',   '/api/marketplace/agents/install', 'marketplace.installAgent'],
+  ['POST',   '/api/marketplace/skills/install', 'marketplace.installSkill'],
 
   // Pattern routes (with path parameters)
   ['DELETE', /^\/api\/conversations\/([^/]+)$/,            'conversations.delete',       ['cid']],
+  ['POST',   /^\/api\/conversations\/([^/]+)\/pin$/,       'conversations.pin',          ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/history$/,   'conversations.history',      ['cid']],
+  ['GET',    /^\/api\/conversations\/([^/]+)\/files$/,     'conversations.files.list',   ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/send$/,      'groupChat.send',             ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/send\/stream$/, 'conversations.sendStream', ['cid'], { stream: true }],
   ['POST',   /^\/api\/conversations\/([^/]+)\/abort$/,     'groupChat.abort',            ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/members$/,   'groupChat.listMembers',      ['cid']],
+  ['GET',    /^\/api\/conversations\/([^/]+)\/runtime$/,   'groupChat.runtimeStatus',    ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/plan$/,      'groupChat.readPlan',         ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/plan\/steps\/(\d+)\/retry$/, 'groupChat.retryStep', ['cid', 'stepIndex']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/plan\/steps\/(\d+)\/skip$/,  'groupChat.skipStep',  ['cid', 'stepIndex']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/events\/stream$/, 'groupChat.events',      ['cid'], { stream: true }],
   ['POST',   /^\/api\/conversations\/([^/]+)\/form-submitted$/, 'groupChat.markFormSubmitted', ['cid']],
+  ['POST',   /^\/api\/conversations\/([^/]+)\/marketplace-install$/, 'groupChat.resolveMarketplaceInstallRequest', ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/attachments$/,      'conversations.attachments.list',   ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/attachments\/upload$/, { upload: 'conversations.attachments.upload' }, ['cid']],
+  ['POST',   /^\/api\/conversations\/([^/]+)\/attachments\/import$/, 'conversations.attachments.import', ['cid']],
   ['DELETE', /^\/api\/conversations\/([^/]+)\/attachments$/,      'conversations.attachments.delete', ['cid']],
   ['GET',    /^\/api\/agents\/([^/]+)$/,                   'agents.get',                 ['agent_id']],
   ['DELETE', /^\/api\/agents\/([^/]+)$/,                   'agents.delete',              ['agent_id']],
@@ -263,4 +273,3 @@ function apiFetch(url, options) {
 
   return window.orkas.invoke(channel, payload).then(_mockJsonResponse);
 }
-

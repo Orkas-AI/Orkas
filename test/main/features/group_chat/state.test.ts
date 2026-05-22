@@ -23,19 +23,21 @@ afterEach(() => {
 });
 
 describe('group_chat state › sessionId builders', () => {
+  // session_id format is `<kind>-<tail>` (CLAUDE.md §5 — uid no longer in session_id; user
+  // scoping comes from the path root `<activeUid>/cloud/sessions/<sid>.jsonl`).
   it('build commander / member session ids with the right kind segment', async () => {
     const s = await import('../../../../src/main/features/group_chat/state');
-    expect(s.buildGconvSessionId('u1', 'cidA')).toBe('u1-gconv-cidA');
-    expect(s.buildGmemberSessionId('u1', 'cidA', 'agentX')).toBe('u1-gmember-cidA-agentX');
+    expect(s.buildGconvSessionId('cidA')).toBe('gconv-cidA');
+    expect(s.buildGmemberSessionId('cidA', 'agentX')).toBe('gmember-cidA-agentX');
   });
 
   it('actorSessionId routes commander → gconv, agent → gmember, user → throw', async () => {
     const s = await import('../../../../src/main/features/group_chat/state');
-    expect(s.actorSessionId('u1', 'cidA', { kind: 'commander', id: 'commander', joined_at: 't' }))
-      .toBe('u1-gconv-cidA');
-    expect(s.actorSessionId('u1', 'cidA', { kind: 'agent', id: 'agentX', joined_at: 't' }))
-      .toBe('u1-gmember-cidA-agentX');
-    expect(() => s.actorSessionId('u1', 'cidA', { kind: 'user', id: 'user', joined_at: 't' })).toThrow();
+    expect(s.actorSessionId('cidA', { kind: 'commander', id: 'commander', joined_at: 't' }))
+      .toBe('gconv-cidA');
+    expect(s.actorSessionId('cidA', { kind: 'agent', id: 'agentX', joined_at: 't' }))
+      .toBe('gmember-cidA-agentX');
+    expect(() => s.actorSessionId('cidA', { kind: 'user', id: 'user', joined_at: 't' })).toThrow();
   });
 });
 

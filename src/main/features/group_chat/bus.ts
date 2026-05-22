@@ -32,6 +32,7 @@ import {
 } from './state';
 import {
   GroupMessage, appendVisible, readSlice, buildReplayPrefix,
+  type MarketplaceInstallRequest,
 } from './visibility';
 import {
   resolveRecipients, parseMentions, buildMention,
@@ -44,10 +45,16 @@ import {
   PlanSetInput, StepStatus, PlanFile,
 } from './plan';
 import * as planExecutor from './plan_executor';
-import { userChatsDir, BUILTIN_SKILLS_DIR, userSkillsDir, BUILTIN_AGENTS_DIR, userAgentsDir } from '../../paths';
+import {
+  userChatsDir, userSkillsDir, userAgentsDir,
+  userMarketplaceSkillsDir, userMarketplaceAgentsDir, projectFilesDir,
+} from '../../paths';
 import * as agentsFeat from '../agents';
 import { isAgentEnabled } from '../component_enabled';
-import { buildLanguageDirective, t } from '../../i18n';
+import { buildLanguageDirective, descriptionLang, t } from '../../i18n';
+import * as marketplaceFeat from '../marketplace';
+import { readInstalls } from '../marketplace_installs';
+import { createSkillTurnBuffer, onAgentTurnEnd, onUserMessage } from '../expert_signals/turn_hooks';
 
 const log = createLogger('group_chat.bus');
 
@@ -61,6 +68,35 @@ function escapeHtmlForBubble(s: string): string {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+/** Render a quality-validator rejection as a friendly user warning followed
+ *  by a structured JSON fenced block. The fenced block survives into the
+ *  LLM's own message history, giving it precise feedback to act on if the
+ *  user asks for a fix in the next turn — no separate retry channel needed. */
+function _formatValidationFailure(
+  failed: { path: string; report: { violations: Array<{ rule: string; level: string; field: string; snippet: string; suggested_fix: string }> } }[],
+): string {
+  const friendly = '<span style="color:var(--danger)">⚠️ Some skill files failed quality validation and were not written.</span>';
+  const machine = JSON.stringify({
+    validation_failed: failed.flatMap((f) => f.report.violations
+      .filter((v) => v.level === 'EXTREME')
+      .map((v) => ({
+        path: f.path, rule: v.rule, field: v.field,
+        snippet: v.snippet, suggested_fix: v.suggested_fix,
+      }))),
+  }, null, 2);
+  return `${friendly}\n\n\`\`\`json\n${machine}\n\`\`\``;
+}
+
+function _formatValidationWarnings(
+  warnings: { path: string; report: { violations: Array<{ rule: string; level: string; field: string; snippet: string; suggested_fix: string }> } }[],
+): string {
+  const friendly = '<span style="color:var(--muted)">ℹ️ Quality validator advisories (the files were written):</span>';
+  const items = warnings.flatMap((w) => w.report.violations
+    .filter((v) => v.level !== 'EXTREME')
+    .map((v) => `  - ${w.path}: **${v.rule}** — ${v.suggested_fix}`));
+  return `${friendly}\n${items.join('\n')}`;
 }
 
 const MAX_PROCESS_ITEMS_PER_TURN = 300;
@@ -81,6 +117,11 @@ export type GroupEvent =
    * up as a stuck "thinking" bubble when commander's turn ends silently. */
   | { type: 'message'; cid: string; msg: GroupMessage; turn_end?: boolean }
   | { type: 'process'; cid: string; actor: string; data: Record<string, unknown> }
+  /** A `create_artifact` tool call finished writing its bundle. The final
+   * end-of-turn message still carries `msg.artifacts` for persistence; this
+   * live event lets the renderer mount the iframe immediately instead of
+   * waiting for the whole actor turn to finish. */
+  | { type: 'artifact_created'; cid: string; actor: string; artifact: { id: string; title: string; agent_id: string } }
   | { type: 'plan_changed'; cid: string }
   | { type: 'state_changed'; cid: string; state: Awaited<ReturnType<typeof readState>> }
   | { type: 'member_joined'; cid: string; actor: Actor }
@@ -148,6 +189,15 @@ interface WorkerState {
    * placeholder cleaned. Same staging pattern as pendingPlanAnnouncement +
    * deferred planExecutor.reconcile, just for direct dispatches. */
   pendingDispatches?: Array<{ to: string; message: string }>;
+  /** Marketplace install confirmations requested during a commander turn.
+   * The model can stage these via `marketplace_request_install`; the user
+   * decides in the renderer before any install side effect happens. */
+  pendingMarketplaceRequests?: MarketplaceInstallRequest[];
+  /** Last marketplace rows returned to the model in this turn, keyed by
+   *  `${kind}:${id}`. `marketplace_request_install` uses this to carry UI
+   *  metadata such as agent avatar tokens without relying on the model to
+   *  copy every field back. */
+  marketplaceSearchResults?: Map<string, Partial<MarketplaceInstallRequest>>;
 }
 
 interface CidState {
@@ -229,6 +279,19 @@ export function isQuiescent(uid: string, cid: string): boolean {
   return true;
 }
 
+export function runtimeSnapshot(uid: string, cid: string): { processing: boolean; inFlight: string[] } {
+  const s = _cids.get(cidKey(uid, cid));
+  if (!s) return { processing: false, inFlight: [] };
+  const inFlight: string[] = [];
+  for (const [, w] of s.workers) {
+    if (w.running) inFlight.push(w.actor.id);
+  }
+  return {
+    processing: !isQuiescent(uid, cid),
+    inFlight,
+  };
+}
+
 /** Recompute the on-disk `status` field based on actual worker / queue
  *  state. Honors the sticky `aborted` flag — once aborted, ONLY an
  *  explicit USER `enqueue` clears it (so a follow-up worker reply
@@ -258,6 +321,16 @@ async function appendMain(uid: string, cid: string, msg: GroupMessage): Promise<
   const file = mainJsonlFile(uid, cid);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   await appendJsonlAtomic<GroupMessage>(file, msg);
+  // Stamp `updated_at` on this cid's _index.json row so the sidebar can sort
+  // by real last-activity time rather than file mtime (which sync clobbers
+  // when pulling from another device — see chats.ts::listConversations).
+  // Dynamic import to avoid the chats ↔ group_chat circular dep.
+  try {
+    const chats = await import('../chats');
+    await chats.bumpConversationActivity(uid, cid, msg.ts);
+  } catch (err) {
+    log.warn('bumpConversationActivity failed', { uid, cid, error: (err as Error)?.message });
+  }
 }
 
 // ── enqueue ──────────────────────────────────────────────────────────────
@@ -272,6 +345,11 @@ export interface EnqueueParams {
   form?: ChatFormPayload;
   created_agents?: Array<{ agent_id: string; name: string; kind?: 'created' | 'updated' }>;
   created_skills?: Array<{ skill_id: string; name: string; kind?: 'created' | 'updated' }>;
+  /** Interactive web-app artifacts produced this turn (via `create_artifact`).
+   * `agent_id` is the producing actor — the renderer routes a user→artifact
+   * interaction result back to it. */
+  artifacts?: Array<{ id: string; title: string; agent_id: string }>;
+  marketplace_requests?: MarketplaceInstallRequest[];
   plan_announcement?: boolean;
   /** Override resolved recipients (commander emitting plan announcement
    *  uses this to force `to=[user]`). Otherwise router decides. */
@@ -568,6 +646,10 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     ...(params.form ? { form: params.form } : {}),
     ...(params.created_agents && params.created_agents.length ? { created_agents: params.created_agents } : {}),
     ...(params.created_skills && params.created_skills.length ? { created_skills: params.created_skills } : {}),
+    ...(params.artifacts && params.artifacts.length ? { artifacts: params.artifacts } : {}),
+    ...(params.marketplace_requests && params.marketplace_requests.length
+      ? { marketplace_requests: params.marketplace_requests }
+      : {}),
     ...(params.plan_announcement ? { plan_announcement: true } : {}),
     ...(params.dispatch ? { dispatch: true } : {}),
     ...(params.process && params.process.length ? { process: params.process } : {}),
@@ -632,11 +714,25 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   // commander in `to`, so it goes through the regular dispatch loop above.
 
   // User-driven reconcile: when user enqueues, plan_executor needs a chance
-  // to mark a `user`-assignee step as done and dispatch downstream. Worker-
-  // driven reconcile already runs in runTurn for agent/commander turns.
-  // Fire-and-forget — reconcile is idempotent and shouldn't block enqueue.
+  // to mark a `user`-assignee step as done and dispatch downstream. This is
+  // part of the send transaction, not a background side effect: the IPC
+  // send-stream subscribes before calling send(), and it must not return until
+  // the immediate plan handoff (user step → next agent / commander) has queued
+  // its work. Otherwise the renderer can close the stream between the user
+  // echo and the downstream dispatch, which is exactly how form submissions
+  // ended up as fake loading bubbles until history polling caught up.
   if (fromActorId === USER_ID) {
-    void planExecutor.reconcile(uid, cid, {
+    // Phase-0 chokepoint (was lost from commit 76358a8e per
+    // `docs/plans/expert-signals-phase0-wiring-gaps.md`): cancels pending
+    // silence check + extracts text-class signals (accept / correction /
+    // reject / edit) against the cached last agent message. Fire-and-
+    // forget; correctionDetected return value is intentionally unused
+    // here (runner.ts:665 does its own detectUserCorrection for
+    // RunMetrics — acceptable double-judgment for v0).
+    onUserMessage({ uid, cid, userMsg: { id: msgId, text: rewrittenText } })
+      .catch((err) => log.warn(`onUserMessage threw cid=${cid}: ${(err as Error).message}`));
+
+    await planExecutor.reconcile(uid, cid, {
       finishedActorId: USER_ID,
       finishedMessage: { id: msgId, text: rewrittenText, files: [], failed: false },
     }).catch((err) => log.warn(`plan reconcile (user) threw cid=${cid}: ${(err as Error).message}`));
@@ -652,6 +748,53 @@ function composeLlmTurnPayload(fromActorId: string, msg: GroupMessage): string {
   const head = `<msg from="${fromActorId}" to="${(msg.to || []).join(',')}">`;
   const tail = '</msg>';
   return `${head}\n${msg.text}\n${tail}`;
+}
+
+/** Reverse of `composeLlmTurnPayload`: extract the user-visible text from
+ *  a `<msg from=… to=…>\nTEXT\n</msg>` envelope. Returns `null` for any
+ *  payload that doesn't match the exact shape (defensive — keeps callers
+ *  from treating an unwrapped or differently-encoded payload as raw text). */
+function _unwrapLlmTurnPayload(payload: string): string | null {
+  const m = /^<msg from="[^"]*" to="[^"]*">\n([\s\S]*)\n<\/msg>$/.exec(payload);
+  return m ? m[1] : null;
+}
+
+/** True when `text` looks like a CLI slash command (`/foo`, `/my-cmd …`).
+ *  Matches a leading `/` followed by an alphanumeric command name on the
+ *  first line; trailing args / newlines are fine. Used to bypass the
+ *  chat_cli_agent template wrap so the CLI's own slash dispatcher sees
+ *  the `/` at position 0 of its user message content. */
+function _isSlashCommand(text: string): boolean {
+  return /^\/[A-Za-z][A-Za-z0-9_-]*(?=\s|$)/.test(text);
+}
+
+/** Treat the CLI's reply as "no useful text" when it's empty / whitespace
+ *  or the literal "(no content)" sentinel some CLIs (claude code in
+ *  particular) emit for slash commands that have no -p-mode effect. The
+ *  slash-command success-return path uses this to swap an empty bubble
+ *  for a confirmation note. */
+function _looksLikeNoOutput(text: string): boolean {
+  const t = (text || '').trim();
+  return t === '' || /^\(\s*no\s+content\s*\)$/i.test(t);
+}
+
+/** Strip a leading `@<recipient>` mention (display name or id form) and
+ *  the whitespace separator that follows it. Used by the slash-command
+ *  fast-path so `@Claude Code /new` collapses to `/new` before slash
+ *  detection — the `@<agent>` token is routing metadata, not part of the
+ *  command. Only the very first leading mention is stripped; other
+ *  `@<name>` tokens elsewhere in the body stay untouched. */
+function _stripLeadingRecipientMention(
+  text: string, agentName: string, agentId: string,
+): string {
+  if (!text) return text;
+  for (const tok of [agentName, agentId]) {
+    if (!tok) continue;
+    const esc = tok.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`^@${esc}(?:\\s+|$)`);
+    if (re.test(text)) return text.replace(re, '');
+  }
+  return text;
 }
 
 // ── Worker loop ──────────────────────────────────────────────────────────
@@ -743,7 +886,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   emit(state, { type: 'state_changed', cid, state: await readState(uid, cid) });
   log.info(`turn-start user=${uid} cid=${cid} actor=${actor.id} kind=${actor.kind} fromMsg=${item.msgId} from=${item.fromActorId}`);
 
-  const sessionId = actorSessionId(uid, cid, actor);
+  const sessionId = actorSessionId(cid, actor);
   const isCommander = actor.kind === 'commander';
   // Per-conv subdir under the user's root workspace — keeps repeat
   // agent runs writing the same basename grouped together instead of
@@ -780,6 +923,10 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       log.warn(`resolve project scope cid=${cid} pid=${turnProjectId}: ${(err as Error).message}`);
     }
   }
+  const turnProjectFilesRoot = turnProjectId ? projectFilesDir(uid, turnProjectId) : '';
+  const turnProjectFilesSystemBlock = turnProjectId
+    ? await buildProjectFilesSystemBlock(uid, cid, turnProjectId)
+    : '';
 
   // First-turn replay: if the persistent session jsonl doesn't exist yet,
   // prepend a `<group-chat-history>` block built from the visibility slice
@@ -798,18 +945,21 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     log.warn(`replay-prefix build failed cid=${cid} actor=${actor.id}: ${(err as Error).message}`);
   }
 
-  // Attach a `<attachments>` manifest block listing user-uploaded files
-  // (text / pdf / docx with absolute paths + kinds). Commander uses it to
-  // route work; agent uses it to extract values for `inputs_schema`
-  // (especially `type=file` fields). Without this the LLM only sees the
-  // text body and can't know what files the user attached. Image bytes
-  // aren't piped through here yet — that needs ChatOptions.images plumbing
-  // and lands as a follow-up.
+  // Attach a `<attachments>` manifest block listing files uploaded on this
+  // user turn (text / pdf / docx / image with absolute paths + kinds).
+  // Project files are shared conversation context, so they live in the
+  // system prompt's runtime injection block instead of being prepended to
+  // the user message. Image bytes ride alongside via ChatOptions.images so
+  // the vision model sees them on the same user turn — the manifest entry
+  // carries `attached="inline"` so the LLM doesn't waste a read_file
+  // round-trip re-fetching what it already has.
+  let turnImages: Array<{ data: string; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' }> = [];
   if (item.attachments && item.attachments.length) {
     try {
       const { buildAttachmentManifest } = await import('../chat_attachments');
-      const { manifest } = await buildAttachmentManifest(uid, cid, item.attachments);
+      const { manifest, images } = await buildAttachmentManifest(uid, cid, item.attachments);
       if (manifest) messageText = `${manifest}\n${messageText}`;
+      if (images.length) turnImages = images;
     } catch (err) {
       log.warn(`attachments manifest build failed cid=${cid} actor=${actor.id}: ${(err as Error).message}`);
     }
@@ -824,8 +974,8 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // Hoisted here so the branch below can read it without re-fetching.
   let cliAgent: import('../agents').Agent | null = null;
   if (isCommander) {
-    systemPrompt = await buildCommanderSystemPrompt(uid, cid, turnProjectScope?.agents ?? null);
-    extraTools = await buildCommanderExtraTools(state, w);
+    systemPrompt = await buildCommanderSystemPrompt(uid, cid, turnProjectScope?.agents ?? null, turnProjectFilesSystemBlock);
+    extraTools = await buildCommanderExtraTools(state, w, item.attachments);
     // skillList stays undefined for commander — every skill is globally
     // visible (skills are NOT project-scoped this round; see CLAUDE.md §6).
   } else {
@@ -859,7 +1009,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       cliAgent = agent;
       systemPrompt = ''; // unused on CLI path
     } else {
-      systemPrompt = await buildAgentInGroupSystemPrompt(uid, agent, workingDir);
+      systemPrompt = await buildAgentInGroupSystemPrompt(uid, agent, workingDir, turnProjectFilesSystemBlock);
       // Pass agent.skill_list verbatim — it carries System A + System B
       // ids the agent owns. Skills are NOT project-scoped this round
       // (see CLAUDE.md §6); the runner's `projectAllowedSkillIds` hook is
@@ -870,6 +1020,14 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
 
   // Streaming.
   const { streamChatWithModel } = await import('../../model/client');
+  // Per-turn skill-attribution buffer. Records skill_advertised at runner
+  // build time (System A via skill-registry, System B via SkillStore) and
+  // skill_invoked at each successful `read_file` of a SKILL.md. Drained
+  // at turn-end below using the persisted agent msg id as `turn_id`, so
+  // downstream signals JOIN cleanly with text/tool_failure/retry on the
+  // same turn. Silent turns (no persisted message) drop the buffer — see
+  // expert-signals-skill-attribution plan §3.4 + `turn_hooks.ts`.
+  const skillBuffer = createSkillTurnBuffer();
   // Per-turn list — feeds the green-chip "files produced" bubble. The
   // conversation-scoped `state.producedPaths` is what uniquify consults
   // for ownership; we keep this Set per turn purely for UI surfacing.
@@ -883,6 +1041,20 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // "ours" → overwrite in place. Files the user pre-created remain foreign
   // and still get `-2 / -3 / ...` suffixed via `util/uniquify-path`.
   const hasProducedPath = (absPath: string) => state.producedPaths.has(absPath);
+  // Interactive web-app artifacts created via `create_artifact` this turn.
+  // Attached to the actor's end-of-turn message so the renderer embeds each
+  // one as a sandboxed `<iframe>` (`chat-app://`); `agent_id` = this actor,
+  // the routing target for a user→artifact interaction result.
+  const turnArtifacts: Array<{ id: string; title: string }> = [];
+  const onArtifactCreated = (a: { id: string; title: string }) => {
+    turnArtifacts.push(a);
+    emit(state, {
+      type: 'artifact_created',
+      cid,
+      actor: actor.id,
+      artifact: { id: a.id, title: a.title, agent_id: actor.id },
+    });
+  };
   let finalText = '';
   // Mirror of every text delta we forwarded to the renderer this turn.
   // Used as the salvage source when the user aborts mid-stream — the
@@ -929,8 +1101,8 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // chip, so the sandbox-level lock keeps the LLM honest even if the
   // prompt strays. Builtin first to match the prompt's "locate by
   // source" guidance.
-  const skillRoots = [BUILTIN_SKILLS_DIR, userSkillsDir(uid)];
-  const agentRoots = [BUILTIN_AGENTS_DIR, userAgentsDir(uid)];
+  const skillRoots = [userMarketplaceSkillsDir(uid), userSkillsDir(uid)];
+  const agentRoots = [userMarketplaceAgentsDir(uid), userAgentsDir(uid)];
   if (cliAgent) {
     // CLI-backed agent path: spawn the local CLI in the user's workspace
     // and forward its events as `process` events so the same UI rail
@@ -947,21 +1119,19 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     // conventions and don't need that scoping. Override here:
     const userWorkspace = await import('../user_workspace');
     const wsRoot = userWorkspace.getWorkspacePath(uid, turnProjectId);
-    // Coding agents (claude / codex) honour the per-conversation
-    // `coding_project_dir` when set so the CLI runs inside the user's
-    // actual project; non-coding CLIs always use the workspace. The
-    // chip in the conversation surface lets the user set/change the
-    // dir mid-conversation. We also defensively check the directory
-    // exists and is a real dir — if it vanished between picker and
-    // dispatch we fall back rather than failing the run.
+    // Coding agents (claude / codex) initialise the per-conversation
+    // `coding_project_dir` from the agent detail page's project-dir
+    // setting. Missing setting = effective workspace. Once a
+    // conversation has a dir, later turns keep using it; the agent can
+    // still ask the user to switch through the standard directory form.
+    // Non-coding CLIs always use the workspace. We defensively check
+    // the directory exists — if it vanished we fall back rather than
+    // failing the run.
     let cliWorkingDir = wsRoot;
     if (agentsFeat.cliIsCodingAgent(cliAgent.runtime?.kind === 'cli' ? cliAgent.runtime.cli : '')) {
-      // Default + workspace-sync: on the first coding-agent turn the
-      // user shouldn't have to pick a directory just to start; default
-      // to their effective workspace. On later turns, follow workspace
-      // changes silently — unless the user has explicitly picked
-      // something different through the input-form (sticky).
-      await _syncCodingProjectDirWithWorkspace(uid, cid, wsRoot);
+      const dirInfo = agentsFeat.getCliProjectDirInfoForAgent(uid, cliAgent, turnProjectId);
+      cliWorkingDir = dirInfo.effective_path;
+      await _initializeCodingProjectDir(uid, cid, dirInfo);
       const st = await import('./state');
       const stateFile = await st.readState(uid, cid);
       const projDir = stateFile.coding_project_dir;
@@ -1024,9 +1194,17 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       ...(turnProjectId ? { projectId: turnProjectId } : {}),
       onFileWritten,
       hasProducedPath,
+      onArtifactCreated,
+      onSkillAdvertised: (id, sys) => skillBuffer.recordAdvertised(id, sys),
+      onSkillInvoked: (id, sys, trig) => skillBuffer.recordInvoked(id, sys, trig),
       cacheRetention: 'short',
       abortSignal: w.abortController.signal,
-      readOnlyExtraRoots: [...skillRoots, ...agentRoots],
+      readOnlyExtraRoots: [
+        ...(turnProjectFilesRoot ? [turnProjectFilesRoot] : []),
+        ...skillRoots,
+        ...agentRoots,
+      ],
+      ...(turnImages.length ? { images: turnImages } : {}),
       ...(extraTools.length ? { extraTools } : {}),
       ...(skillList !== undefined ? { skillList } : {}),
       // Skills are NOT project-scoped this round — every conversation sees
@@ -1137,12 +1315,19 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
             const target = await agentsFeat.getAgent(editId);
             if (!target) {
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent edit failed: agent not found (id=${editId}).</span>`;
-            } else if (target.source !== 'custom') {
-              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Built-in agents can't be edited from the main chat; fork one in the right-hand detail panel and edit there.</span>`;
+            } else if (target.source !== 'custom' && !false) {
+              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Marketplace agents can't be edited from the main chat; fork one in the right-hand detail panel and edit there.</span>`;
             } else if (agentsFeat.isCliAgent(target)) {
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ External agents can only be edited from the right-hand detail panel.</span>`;
             } else {
-              const updated = await agentsFeat.updateCustomAgent(editId, fields);
+              // `updateAgentSpec` dispatches: custom → updateCustomAgent,
+              // marketplace + dev → agents_dev.updateBuiltinAgentSpec
+              // (which writes the local marketplace install dir). The
+              // dev-env source guard above is what makes the marketplace
+              // branch reachable; the direct `updateCustomAgent` call this
+              // replaces would short-circuit to null because the custom
+              // agent.json doesn't exist for marketplace ids.
+              const updated = await agentsFeat.updateAgentSpec(editId, fields);
               if (updated) {
                 createdAgents.push({ agent_id: updated.agent_id, name: updated.name, kind: 'updated' });
               } else {
@@ -1204,6 +1389,17 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
               const list = result.rejected.map((p) => `\`${p}\``).join(', ');
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Some skill files were rejected: ${list}</span>`;
             }
+            // Quality validator rejections: surface friendly warning to the
+            // user PLUS a structured fenced block so the LLM sees the
+            // violations in its own message history on the next turn and
+            // can rewrite. The fenced block is opaque to bus — it's just
+            // text that survives into history.
+            if (result.validation_failed && result.validation_failed.length) {
+              workingText = `${workingText}\n\n${_formatValidationFailure(result.validation_failed)}`;
+            }
+            if (result.validation_warnings && result.validation_warnings.length) {
+              workingText = `${workingText}\n\n${_formatValidationWarnings(result.validation_warnings)}`;
+            }
             // Project-scoped conv: auto-bind the new skill so the LLM in this
             // conv actually sees it via getSystemPromptBlock allowlist. Same
             // bug shape as the agent auto-bind above — without this the user
@@ -1219,7 +1415,16 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
               }
             }
           } else {
-            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ ${result.error || 'Skill operation failed.'}</span>`;
+            // Quality-blocked create: result has validation_failed even on
+            // ok:false. Display the structured violations so the LLM sees
+            // them in history and the user gets the same modal-style info.
+            // Plain error (missing-name / collision / etc) shows the
+            // localized message only.
+            if (result.validation_failed && result.validation_failed.length) {
+              workingText = `${workingText}\n\n${_formatValidationFailure(result.validation_failed)}`;
+            } else {
+              workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ ${result.error || 'Skill operation failed.'}</span>`;
+            }
           }
         } catch (err) {
           const verb = container.skillId ? 'edit' : 'create';
@@ -1322,6 +1527,19 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     outcome = { ...outcome, text: t('chat.commander_dispatch_only', { agents: tags.join(', ') }) };
   }
 
+  // Marketplace install requests are visible side effects of a commander
+  // turn. They are staged by `marketplace_request_install` and attached to
+  // the final message so the renderer can show user-confirmation cards. If
+  // the model followed the tool instruction and produced no prose, still
+  // persist a bubble: the card itself is the thing the user needs to see.
+  const turnMarketplaceRequests = actor.kind === 'commander' && w.pendingMarketplaceRequests?.length
+    ? w.pendingMarketplaceRequests.slice()
+    : [];
+  if (actor.kind === 'commander') w.pendingMarketplaceRequests = undefined;
+  if (turnMarketplaceRequests.length > 0 && outcome.kind === 'silent') {
+    outcome = { kind: 'persist', text: '' };
+  }
+
   // Abort post-processing — single source of truth for both "promote silent
   // to persist when there's still something visible to keep" AND the
   // "(stopped)" suffix.
@@ -1337,6 +1555,16 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // user clearly saw it during streaming. Promoting to persist here lets
   // the enqueue carry `processItems` into the persisted message so reload
   // / history view still surfaces what the actor did before stopping.
+  // A `create_artifact` call is a user-visible side effect the plan executor
+  // doesn't know about (it never sees the artifact list). If the turn would
+  // otherwise be silent — e.g. a commander turn that only produced an
+  // artifact — promote it to persist so the embedded iframe surfaces. Same
+  // rationale as the abort/process-trail promotion below; the artifact list
+  // itself is attached at enqueue time, independent of the executor outcome.
+  if (turnArtifacts.length > 0 && outcome.kind === 'silent') {
+    outcome = { kind: 'persist', text: '' };
+  }
+
   if (aborted) {
     if (outcome.kind === 'silent' && processItems.length > 0) {
       outcome = { kind: 'persist', text: '' };
@@ -1349,8 +1577,9 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     }
   }
 
+  let persistedMsg: GroupMessage | null = null;
   if (outcome.kind === 'persist') {
-    await enqueue({
+    persistedMsg = await enqueue({
       uid, cid,
       fromActorId: actor.id,
       text: outcome.text,
@@ -1360,6 +1589,10 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       ...(outcome.createdSkills && outcome.createdSkills.length
         ? { created_skills: outcome.createdSkills.map((s) => ({ skill_id: s.skill_id, name: s.name })) }
         : {}),
+      ...(turnArtifacts.length
+        ? { artifacts: turnArtifacts.map((a) => ({ id: a.id, title: a.title, agent_id: actor.id })) }
+        : {}),
+      ...(turnMarketplaceRequests.length ? { marketplace_requests: turnMarketplaceRequests } : {}),
       ...(pendingPlan && actor.kind === 'commander'
         ? { plan_announcement: true, forceTo: [USER_ID] } : {}),
       ...(processItems.length ? { process: processItems } : {}),
@@ -1405,6 +1638,14 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   if (actor.kind === 'commander' && w.pendingDispatches && w.pendingDispatches.length) {
     const pending = w.pendingDispatches;
     w.pendingDispatches = undefined;
+    // Inherit the commander turn's user-uploaded attachments so the recipient
+    // worker sees the same image / file bytes the commander saw. Without this
+    // a worker honestly answers "I can't see the image" because turnImages
+    // only fires when `item.attachments` is populated. Plan-step dispatches
+    // get the same inheritance via PlanFile.initial_attachments (persisted
+    // because steps live across worker turn boundaries); dispatch_to is one-
+    // shot so per-turn flush is enough.
+    const inheritedAttachments = item.attachments;
     for (const d of pending) {
       try {
         await enqueue({
@@ -1413,11 +1654,42 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
           text: d.message,
           forceTo: [d.to],
           dispatch: true,
+          ...(inheritedAttachments && inheritedAttachments.length
+            ? { attachments: inheritedAttachments }
+            : {}),
         });
       } catch (err) {
         log.warn(`dispatch_to flush failed cid=${cid} to=${d.to}: ${(err as Error).message}`);
       }
     }
+  }
+
+  // Expert-signals: drain skill_advertised / skill_invoked using the
+  // persisted msg id as turn_id (per turn_id convention — see
+  // PC/CLAUDE.md §4 constraint 9 + expert-signals plan §3.4). Silent
+  // turns drop the buffer; CLI agents bypass SkillLoader so the buffer
+  // is empty for them and the drain is a no-op.
+  if (persistedMsg) {
+    skillBuffer.drainAndEmit({
+      uid, cid,
+      aid: actor.kind === 'commander' ? null : actor.id,
+      turn_id: persistedMsg.id,
+      msg_ids: [persistedMsg.id],
+      errText: errText || undefined,
+      aborted,
+    });
+    // Phase-0 chokepoint (was lost from commit 76358a8e per
+    // `docs/plans/expert-signals-phase0-wiring-gaps.md`): caches agent msg
+    // for the next user-reply text-signal JOIN, emits tool_failure when
+    // errText is set, schedules silence check (cancelled by onUserMessage
+    // when the user replies). Sync + self-guarded against errors.
+    onAgentTurnEnd({
+      uid, cid,
+      actorId: actor.id,
+      isCommander: actor.kind === 'commander',
+      agentMsg: { id: persistedMsg.id, text: persistedMsg.text || '' },
+      errText: errText || undefined,
+    });
   }
 
   await _syncStateStatus(state);
@@ -1438,7 +1710,10 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
 // ── System prompts ───────────────────────────────────────────────────────
 
 async function buildCommanderSystemPrompt(
-  uid: string, cid: string, allowedAgentIds?: readonly string[] | null,
+  uid: string,
+  cid: string,
+  allowedAgentIds?: readonly string[] | null,
+  projectFilesBlock = '',
 ): Promise<string> {
   const { prompts } = await import('../../prompts/loader');
   const path_ = await import('node:path');
@@ -1470,9 +1745,22 @@ async function buildCommanderSystemPrompt(
     os: process.platform === 'darwin' ? 'macOS' : process.platform === 'win32' ? 'Windows' : process.platform,
     working_dir: workingDir,
     local_exec_state: permState,
+    project_files_block: projectFilesBlock,
   });
   const shared = prompts.load('chat_shared_rules', {});
   return appendLanguageDirective(concatSharedRules(main, shared));
+}
+
+async function buildProjectFilesSystemBlock(uid: string, cid: string, projectId: string): Promise<string> {
+  try {
+    const projectFileFeature = await import('../project_files');
+    const manifest = await projectFileFeature.buildProjectFilesManifest(uid, projectId);
+    if (!manifest) return '';
+    return `### Project files\n\n${manifest}`;
+  } catch (err) {
+    log.warn(`project files system block failed cid=${cid} pid=${projectId}: ${(err as Error).message}`);
+    return '';
+  }
 }
 
 /** Merge shared_rules into the per-role prompt. The shared block carries
@@ -1500,9 +1788,9 @@ function appendLanguageDirective(prompt: string): string {
 // Format:
 //   `\`read_file(<ROOT>/<id>/agent.json)\` — ROOT by Source:\n` +
 //   `- custom:  <abs path>\n` +
-//   `- builtin: <abs path>\n` +
+//   `- marketplace: <abs path>\n` +
 //   `Use these ROOT values verbatim. \`id:\` is tool-call input only — prose mentions agents as @<name>.\n\n` +
-//   per-entry lines `- @<name> (Source: custom|builtin, id: <agent_id>) — desc` + optional `\n  inputs_schema: <slim json>`
+//   per-entry lines `- @<name> (Source: custom|marketplace, id: <agent_id>) — desc` + optional `\n  inputs_schema: <slim json>`
 //
 // Why expose id and ROOT inline (changed 2026-05): the prior layout hid
 // agent_id (to discourage hex-id leak in user prose) and put paths in a
@@ -1531,13 +1819,13 @@ export async function _buildAgentsIndexBlockForTest(uid: string): Promise<string
 async function buildAgentsIndexBlock(uid: string, allowedIds?: readonly string[] | null): Promise<string> {
   const { getCurrentLang } = await import('../../i18n');
   const { pickDescription } = await import('#core-agent');
-  const lang = getCurrentLang();
+  const lang = descriptionLang(getCurrentLang());
   const customRoot = path.resolve(userAgentsDir(uid));
-  const builtinRoot = path.resolve(BUILTIN_AGENTS_DIR);
+  const marketplaceRoot = path.resolve(userMarketplaceAgentsDir(uid));
   const header = [
     '`read_file(<ROOT>/<id>/agent.json)` — ROOT by Source:',
     `- custom:  ${customRoot}`,
-    `- builtin: ${builtinRoot}`,
+    `- marketplace: ${marketplaceRoot}`,
     'Use these ROOT values verbatim. `id:` is tool-call input only — prose mentions agents as @<name>.',
     '',
   ].join('\n');
@@ -1573,8 +1861,9 @@ async function buildAgentsIndexBlock(uid: string, allowedIds?: readonly string[]
 
 async function buildAgentInGroupSystemPrompt(
   _uid: string,
-  agent: { name?: string; description?: string; workflow?: string; agent_id: string; inputs?: unknown },
+  agent: { name?: string; description?: string; workflow?: string; agent_id: string; inputs?: unknown; output_format?: string },
   workingDir: string,
+  projectFilesBlock = '',
 ): Promise<string> {
   const { prompts } = await import('../../prompts/loader');
   // Render the agent's declared inputs schema so the LLM knows when to
@@ -1599,14 +1888,138 @@ async function buildAgentInGroupSystemPrompt(
     workflow: (agent.workflow || '').trim() || '(not provided)',
     inputs_schema: inputsSchemaJson || '(none)',
     working_dir: workingDir,
+    output_format_hint: buildOutputFormatHint(agent.output_format),
+    project_files_block: projectFilesBlock,
   });
   const shared = prompts.load('chat_shared_rules', {});
   return appendLanguageDirective(concatSharedRules(main, shared));
 }
 
-// ── Commander tools (plan_set / plan_update) ────────────────────────────
+/** Render the agent's `output_format` preference as a one-line worker prompt
+ *  hint. Sits in the `## Runtime injection` tail (most-volatile slot per
+ *  PC/CLAUDE.md §3 prompt-md cache layout). `'auto'` (legacy) and missing both
+ *  produce an empty string — old agents authored before the redesign keep
+ *  unconstrained behavior until the user explicitly picks a value. `'artifact'`
+ *  is the renamed `'allow_artifacts'`; the old key is accepted as an alias for
+ *  on-disk back-compat (specs written by pre-redesign builds). See
+ *  `chat_shared_rules.md` "Output formats" for the underlying rule. */
+function buildOutputFormatHint(format: string | undefined): string {
+  switch (format) {
+    case 'markdown_only':
+      return '### Output format\nThis agent is configured **markdown-only**: do NOT emit `:::dashboard` blocks or call `create_artifact`. Plain markdown only.';
+    case 'dashboard':
+      return '### Output format\nThis agent is configured for **dashboard output**: prefer `:::dashboard` for structured snapshots (KPIs, tables, alerts, timelines); do NOT call `create_artifact`.';
+    case 'artifact':
+    case 'allow_artifacts':
+      return '### Output format\nThis agent is configured to **allow artifacts**: prefer `:::dashboard` for structured snapshots; reach for `create_artifact` when interactivity actually matters.';
+    case 'auto':
+    default:
+      return '';
+  }
+}
 
-async function buildCommanderExtraTools(state: CidState, w: WorkerState): Promise<AgentTool[]> {
+// ── Commander tools (plan_set / marketplace / dispatch) ─────────────────
+
+function _toolJson(data: unknown): { content: string } {
+  return { content: JSON.stringify(data) };
+}
+
+function _toolError(error: string): { content: string; isError: true } {
+  return { content: JSON.stringify({ ok: false, error }), isError: true };
+}
+
+function _clampLimit(raw: unknown, fallback: number, min: number, max: number): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+function _trimText(raw: unknown, max = 2000): string {
+  const s = typeof raw === 'string' ? raw.trim() : '';
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+function _normaliseMarketplaceKind(raw: unknown, allowBoth = false): 'agent' | 'skill' | 'both' | null {
+  const v = String(raw || (allowBoth ? 'both' : '')).trim().toLowerCase();
+  if (v === 'agent' || v === 'skill') return v;
+  if (allowBoth && v === 'both') return 'both';
+  return null;
+}
+
+function _compactMarketplaceItem(
+  kind: 'agent' | 'skill',
+  item: marketplaceFeat.MarketplaceAgent | marketplaceFeat.MarketplaceSkill,
+  installedIds: Set<string>,
+) {
+  const installed = installedIds.has(item.id);
+  const base = {
+    kind,
+    id: item.id,
+    name: item.name,
+    description_zh: item.description_zh || '',
+    description_en: item.description_en || '',
+    category: item.category || '',
+    version: item.version,
+    published_at: item.published_at,
+    ...(typeof item.updated_at === 'number' ? { updated_at: item.updated_at } : {}),
+    create_uid: item.create_uid || '',
+    download_count: item.download_count || 0,
+    installed,
+  };
+  if (kind !== 'agent') return base;
+  const agent = item as marketplaceFeat.MarketplaceAgent;
+  return {
+    ...base,
+    icon: agent.icon || '',
+    color: agent.color || '',
+  };
+}
+
+function _marketplaceSearchTerms(query: string): string[] {
+  const out: string[] = [];
+  const push = (s: string) => {
+    const v = s.trim();
+    if (v.length < 2) return;
+    if (out.includes(v)) return;
+    out.push(v);
+  };
+  const commonHanTerms = [
+    '学习', '论文', '学术', '阅读', '精读', '研究', '导师', '助教', '助手',
+    '教育', '课程', '知识', '写作', '编程', '产品', '设计', '数据', '分析',
+    '营销', '法律', '财务', '医学', '心理', '苏格拉底',
+  ];
+  const hanRuns: string[] = [];
+  push(query);
+  for (const token of query.split(/[\s,，;；:：|/]+/g)) {
+    push(token);
+    const runs = token.match(/[㐀-鿿]{2,}/g) || [];
+    hanRuns.push(...runs);
+    for (const run of runs) {
+      for (const term of commonHanTerms) {
+        if (run.includes(term)) push(term);
+      }
+    }
+  }
+  // Last-resort fallback for unknown Chinese compounds. Keep this after
+  // full tokens + common terms so weird cross-boundary bigrams ("文学",
+  // "习助") do not crowd out better English/user-supplied terms.
+  for (const run of hanRuns) {
+    for (let i = 0; i < run.length - 1; i += 1) push(run.slice(i, i + 2));
+  }
+  return out.slice(0, 12);
+}
+
+
+async function buildCommanderExtraTools(
+  state: CidState,
+  w: WorkerState,
+  // Attachments on the current commander turn's source item — passed through
+  // to plan_set so the plan persists them under `initial_attachments`. Worker
+  // dispatches in subsequent reconciles read it back from the plan so image /
+  // file bytes follow the dispatch chain. Same flow as `dispatch_to` flush,
+  // but persisted because plan steps live across worker turn boundaries.
+  currentTurnAttachments?: string[],
+): Promise<AgentTool[]> {
   const { uid, cid } = w;
   const tools: AgentTool[] = [];
   tools.push({
@@ -1673,6 +2086,9 @@ async function buildCommanderExtraTools(state: CidState, w: WorkerState): Promis
         ...(typeof input?.initial_message === 'string' && input.initial_message.trim()
           ? { initial_message: String(input.initial_message) }
           : {}),
+        ...(currentTurnAttachments && currentTurnAttachments.length
+          ? { initial_attachments: currentTurnAttachments.slice() }
+          : {}),
         steps: raw.filter((s) => s && typeof s.title === 'string' && s.title.trim() && typeof s.assignee === 'string' && s.assignee.trim())
           .map((s) => ({
             title: String(s.title),
@@ -1707,6 +2123,263 @@ async function buildCommanderExtraTools(state: CidState, w: WorkerState): Promis
       // synchronously here, so user immediately sees the plan card; only
       // the agent dispatch waits for commander to wrap up.
       return { content: JSON.stringify({ ok: true, plan: { steps: plan.steps } }) };
+    },
+  });
+
+  tools.push({
+    name: 'marketplace_search',
+    description: [
+      'Search the official marketplace catalog for agents and skills that are not already installed.',
+      'Use this only when the currently installed agents/skills and built-in tools do not adequately cover the user task, and a marketplace resource could materially help.',
+      'This tool only searches; it never installs. If you find one best candidate, call marketplace_request_install and then wait for the user decision.',
+    ].join(' '),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Search text describing the needed capability. Use the user language when possible.',
+        },
+        kind: {
+          type: 'string',
+          enum: ['agent', 'skill', 'both'],
+          description: 'Resource kind to search. Default: both.',
+        },
+        category: {
+          type: 'string',
+          description: 'Optional marketplace category code.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum results per kind (1-20). Default: 5.',
+        },
+        include_installed: {
+          type: 'boolean',
+          description: 'Include resources already installed. Default: false.',
+        },
+        official_only: {
+          type: 'boolean',
+          description: 'When true, only return platform-authored rows (create_uid == "0"). Default: false.',
+        },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+    async execute(input) {
+      const query = _trimText(input?.query, 300);
+      if (!query) return _toolError('`query` is required');
+      const kind = _normaliseMarketplaceKind(input?.kind, true) || 'both';
+      const category = _trimText(input?.category, 80);
+      const limit = _clampLimit(input?.limit, 5, 1, 20);
+      const includeInstalled = input?.include_installed === true;
+      const officialOnly = input?.official_only === true;
+      const size = Math.max(10, Math.min(50, limit * (includeInstalled ? 1 : 3)));
+      try {
+        const installs = await readInstalls(uid);
+        const installedAgentIds = new Set(installs.agents.map((a) => a.id));
+        const installedSkillIds = new Set(installs.skills.map((s) => s.id));
+        const terms = _marketplaceSearchTerms(query);
+        const filterRows = <T extends { id: string; create_uid?: string }>(
+          rows: T[],
+          installedIds: Set<string>,
+        ): T[] => rows
+          .filter((row) => includeInstalled || !installedIds.has(row.id))
+          .filter((row) => !officialOnly || String(row.create_uid || '') === '0')
+          .slice(0, limit);
+        const collectRows = async <T extends { id: string }>(
+          fetchRows: (term: string) => Promise<{ list: T[]; total: number }>,
+        ): Promise<{ rows: T[]; total: number }> => {
+          const merged = new Map<string, T>();
+          let maxTotal = 0;
+          for (const term of terms) {
+            const res = await fetchRows(term);
+            maxTotal = Math.max(maxTotal, res.total || 0);
+            for (const row of res.list || []) {
+              if (!merged.has(row.id)) merged.set(row.id, row);
+            }
+            if (merged.size >= limit * 3) break;
+          }
+          return { rows: Array.from(merged.values()), total: maxTotal };
+        };
+
+        const result: {
+          ok: true;
+          query: string;
+          searched_terms: string[];
+          agents?: ReturnType<typeof _compactMarketplaceItem>[];
+          skills?: ReturnType<typeof _compactMarketplaceItem>[];
+          totals: { agents?: number; skills?: number };
+        } = { ok: true, query, searched_terms: terms, totals: {} };
+
+        if (kind === 'agent' || kind === 'both') {
+          const res = await collectRows((term) => marketplaceFeat.listMarketplaceAgents({
+            q: term,
+            ...(category ? { category } : {}),
+            size,
+          }));
+          const rows = filterRows(res.rows || [], installedAgentIds);
+          result.agents = rows.map((a) => _compactMarketplaceItem('agent', a, installedAgentIds));
+          if (result.agents.length) {
+            if (!w.marketplaceSearchResults) w.marketplaceSearchResults = new Map();
+            for (const agent of result.agents) {
+              const meta = agent as {
+                id: string;
+                icon?: string;
+                color?: string;
+                description_zh?: string;
+                description_en?: string;
+                category?: string;
+                create_uid?: string;
+              };
+              w.marketplaceSearchResults.set(`agent:${agent.id}`, {
+                icon: meta.icon || '',
+                color: meta.color || '',
+                description_zh: meta.description_zh || '',
+                description_en: meta.description_en || '',
+                category: meta.category || '',
+                create_uid: meta.create_uid || '',
+              });
+            }
+          }
+          result.totals.agents = res.total || 0;
+        }
+        if (kind === 'skill' || kind === 'both') {
+          const res = await collectRows((term) => marketplaceFeat.listMarketplaceSkills({
+            q: term,
+            ...(category ? { category } : {}),
+            size,
+          }));
+          const rows = filterRows(res.rows || [], installedSkillIds);
+          result.skills = rows.map((s) => _compactMarketplaceItem('skill', s, installedSkillIds));
+          if (result.skills.length) {
+            if (!w.marketplaceSearchResults) w.marketplaceSearchResults = new Map();
+            for (const skill of result.skills) {
+              w.marketplaceSearchResults.set(`skill:${skill.id}`, {
+                description_zh: skill.description_zh || '',
+                description_en: skill.description_en || '',
+                category: skill.category || '',
+                create_uid: skill.create_uid || '',
+              });
+            }
+          }
+          result.totals.skills = res.total || 0;
+        }
+        return _toolJson(result);
+      } catch (err) {
+        return _toolError((err as Error).message || 'marketplace search failed');
+      }
+    },
+  });
+
+  tools.push({
+    name: 'marketplace_request_install',
+    description: [
+      'Ask the user to approve installing exactly one marketplace agent or skill found via marketplace_search.',
+      'This tool does not install anything. It renders a confirmation card for the user; after calling it, stop and wait for the user decision.',
+      'Use it only when the candidate is clearly useful for the current task. Prefer one best candidate over several speculative requests.',
+    ].join(' '),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['agent', 'skill'] },
+        id: { type: 'string', description: 'Marketplace resource id from marketplace_search.' },
+        name: { type: 'string', description: 'Human-readable resource name from marketplace_search.' },
+        icon: { type: 'string', description: 'For agents only: icon token from marketplace_search.' },
+        color: { type: 'string', description: 'For agents only: color token from marketplace_search.' },
+        description_zh: { type: 'string', description: 'Chinese description from marketplace_search.' },
+        description_en: { type: 'string', description: 'English description from marketplace_search.' },
+        category: { type: 'string', description: 'Category code from marketplace_search.' },
+        create_uid: { type: 'string', description: 'Author uid from marketplace_search; "0" means official.' },
+        version: { type: 'string', description: 'Version from marketplace_search.' },
+        published_at: { type: 'number', description: 'Published timestamp from marketplace_search.' },
+        updated_at: { type: 'number', description: 'Updated timestamp from marketplace_search; include when present.' },
+        reason: {
+          type: 'string',
+          description: 'Short user-facing reason this resource helps the current task.',
+        },
+      },
+      required: ['kind', 'id', 'name', 'version', 'published_at', 'reason'],
+      additionalProperties: false,
+    },
+    async execute(input) {
+      const kind = _normaliseMarketplaceKind(input?.kind, false);
+      if (kind !== 'agent' && kind !== 'skill') return _toolError('`kind` must be agent or skill');
+      const id = _trimText(input?.id, 128);
+      if (!safeId(id)) return _toolError('invalid marketplace id');
+      const version = _trimText(input?.version, 80);
+      if (!version) return _toolError('`version` is required');
+      const publishedAt = Number(input?.published_at);
+      if (!Number.isFinite(publishedAt)) return _toolError('`published_at` must be a number');
+      const name = _trimText(input?.name, 160) || id;
+      const reason = _trimText(input?.reason, 800);
+      if (!reason) return _toolError('`reason` is required');
+      const searchMeta = w.marketplaceSearchResults?.get(`${kind}:${id}`);
+      const rawUpdatedAt = input?.updated_at ?? searchMeta?.updated_at;
+      const updatedAt = rawUpdatedAt == null ? NaN : Number(rawUpdatedAt);
+      const icon = kind === 'agent'
+        ? (_trimText(input?.icon, 64) || _trimText(searchMeta?.icon, 64))
+        : '';
+      const color = kind === 'agent'
+        ? (_trimText(input?.color, 64) || _trimText(searchMeta?.color, 64))
+        : '';
+      const descriptionZh = _trimText(input?.description_zh, 1200) || _trimText(searchMeta?.description_zh, 1200);
+      const descriptionEn = _trimText(input?.description_en, 1200) || _trimText(searchMeta?.description_en, 1200);
+      const reqCategory = _trimText(input?.category, 80) || _trimText(searchMeta?.category, 80);
+      const createUid = _trimText(input?.create_uid, 80) || _trimText(searchMeta?.create_uid, 80);
+
+      try {
+        const installs = await readInstalls(uid);
+        const alreadyInstalled = kind === 'agent'
+          ? installs.agents.some((a) => a.id === id)
+          : installs.skills.some((s) => s.id === id);
+        if (alreadyInstalled) {
+          return _toolJson({
+            ok: true,
+            already_installed: true,
+            kind,
+            id,
+            instruction: 'This resource is already installed; use the installed agent or skill directly.',
+          });
+        }
+      } catch (err) {
+        log.warn(`marketplace_request_install readInstalls failed cid=${cid}: ${(err as Error).message}`);
+      }
+
+      if (!w.pendingMarketplaceRequests) w.pendingMarketplaceRequests = [];
+      const existing = w.pendingMarketplaceRequests.find((r) => r.kind === kind && r.id === id);
+      if (existing) {
+        return _toolJson({
+          ok: true,
+          request_id: existing.request_id,
+          status: 'pending_user_confirmation',
+          note: 'A confirmation request for this resource is already staged in this turn. Stop and wait for the user decision.',
+        });
+      }
+      const req: MarketplaceInstallRequest = {
+        request_id: genId12(),
+        kind,
+        id,
+        name,
+        ...(kind === 'agent' && icon ? { icon } : {}),
+        ...(kind === 'agent' && color ? { color } : {}),
+        ...(descriptionZh ? { description_zh: descriptionZh } : {}),
+        ...(descriptionEn ? { description_en: descriptionEn } : {}),
+        ...(reqCategory ? { category: reqCategory } : {}),
+        ...(createUid ? { create_uid: createUid } : {}),
+        version,
+        published_at: publishedAt,
+        ...(Number.isFinite(updatedAt) ? { updated_at: updatedAt } : {}),
+        reason,
+        status: 'pending',
+        requested_at: nowIso(),
+      };
+      w.pendingMarketplaceRequests.push(req);
+      return _toolJson({
+        ok: true,
+        request_id: req.request_id,
+        status: 'pending_user_confirmation',
+        instruction: 'Stop and wait for the user to install or skip this marketplace resource.',
+      });
     },
   });
 
@@ -1809,7 +2482,8 @@ async function buildCommanderExtraTools(state: CidState, w: WorkerState): Promis
       if (!Number.isFinite(idx) || !['in_progress', 'done', 'failed'].includes(status)) {
         return { content: JSON.stringify({ ok: false, error: 'invalid input' }), isError: true };
       }
-      const updated = await updateStep(uid, cid, idx, status, notes);
+      // updateStep's 5th arg is a `patch` object, not a bare notes string — wrap.
+      const updated = await updateStep(uid, cid, idx, status, notes !== undefined ? { notes } : undefined);
       if (!updated) {
         return { content: JSON.stringify({ ok: false, error: 'step not found or no plan yet' }), isError: true };
       }
@@ -1827,6 +2501,7 @@ export async function abort(uid: string, cid: string): Promise<void> {
   const state = _cids.get(cidKey(uid, cid));
   let cleared = 0;
   let aborted = 0;
+  let abortedModelSessions = 0;
   if (state) {
     for (const [, w] of state.workers) {
       cleared += w.queue.length;
@@ -1835,6 +2510,21 @@ export async function abort(uid: string, cid: string): Promise<void> {
       w.turnsThisActivation = 0;
       try { w.abortController?.abort(); } catch { /* ignore */ }
     }
+  }
+  // Belt-and-suspenders abort for model turns. In production traces we saw
+  // user stop requests reach this function while the bus worker map no longer
+  // exposed the live AbortController (`abortedWorkers=0`), even though the
+  // core-agent session kept running. The model client owns a per-session
+  // abort registry, so abort all active sessions for this conversation too:
+  // `gconv-<cid>` and every `gmember-<cid>-<agent>`.
+  try {
+    const model = await import('../../model/client');
+    const abortByCid = (model as {
+      abortActiveSessionsForConversation?: (cid: string) => number;
+    }).abortActiveSessionsForConversation;
+    if (typeof abortByCid === 'function') abortedModelSessions = abortByCid(cid);
+  } catch (err) {
+    log.warn(`abort model-session fallback failed cid=${cid}: ${(err as Error).message}`);
   }
   await setStatus(uid, cid, 'aborted');
   if (state) {
@@ -1860,7 +2550,7 @@ export async function abort(uid: string, cid: string): Promise<void> {
       await new Promise<void>((resolve) => setTimeout(resolve, 25));
     }
   }
-  log.info(`abort user=${uid} cid=${cid} clearedQueue=${cleared} abortedWorkers=${aborted}`);
+  log.info(`abort user=${uid} cid=${cid} clearedQueue=${cleared} abortedWorkers=${aborted} abortedModelSessions=${abortedModelSessions}`);
 }
 
 // ── Cleanup ──────────────────────────────────────────────────────────────
@@ -1896,6 +2586,23 @@ export function _cidStateForTest(uid: string, cid: string): CidState | null {
 // having to import bus internals (which would be a circular import). Bus is
 // the only authority that mutates worker queues; executor speaks through
 // these hooks.
+//
+// Catastrophic-if-broken invariant: bus.ts MUST be loaded exactly once per
+// process. If a second copy gets loaded (e.g. CJS + ESM dual load when
+// `bootstrap.cjs` requires src/main as CJS but somewhere does `await
+// import('./group_chat/bus')` — Node always resolves dynamic `import()` to
+// ESM regardless of caller context, producing a SEPARATE module instance
+// with its own `_cids`), the second load's bindBusHooks call wins because
+// plan_executor's `_hooks` is a module-level singleton. Then `groupChat.send`
+// (in module A) routes through `planExecutor.reconcile → _hooks.enqueue`
+// which now points at module B's enqueue. Module B has empty `_cids`, so
+// it creates a fresh state for the cid — agent workers run in B's state,
+// events emit to B's listeners (empty), and the IPC subscriber (registered
+// on module A) sees zero. Symptom: "loading 一直显示，中断后才看到 process
+// info"; chats sidebar sometimes-shows phantom `processing=true`. Bug fixed
+// at the load-path side: see chats.ts `require('./group_chat/bus')` (CJS
+// require, hits the same module cache as our static `from './bus'` import
+// chain) — never `await import` this file.
 
 planExecutor.bindBusHooks({
   async enqueue(params) {
@@ -1907,6 +2614,8 @@ planExecutor.bindBusHooks({
       ...(params.forceTo ? { forceTo: params.forceTo } : {}),
       ...(typeof params.triggered_step === 'number' ? { triggered_step: params.triggered_step } : {}),
       ...(params.dispatch ? { dispatch: true } : {}),
+      ...(params.attachments && params.attachments.length ? { attachments: params.attachments } : {}),
+      ...(params.form ? { form: params.form } : {}),
     });
   },
 
@@ -1959,56 +2668,38 @@ planExecutor.bindBusHooks({
 // ── CLI agent turn ────────────────────────────────────────────────────────
 //
 // CLI-backed agents replace the LLM stream loop in runTurn. We pack the
-// agent's full visibility slice + the dispatched message + any user
-// attachments into a single prompt, spawn the configured CLI in the
-// user's workspace, and stream events into the same `process` rail the
-// renderer already understands. The final body is the CLI's last
-// "result" text — assigned into runTurn's `finalText` so plan_executor /
-// post-turn enqueue keep working unchanged.
+// dispatched message + any user attachments into a single prompt, spawn
+// the configured CLI in the user's workspace, and stream events into the
+// same `process` rail the renderer already understands. The final body
+// is the CLI's last "result" text — assigned into runTurn's `finalText`
+// so plan_executor / post-turn enqueue keep working unchanged.
 //
-// Stateless on purpose: every dispatch starts a fresh CLI run. Session
-// continuity (`--resume`) is a future optimisation; for now the slice is
-// the source of truth.
+// CLI continuity normally belongs to the CLI itself (`--resume` / thread
+// resume), so the host prompt sends only the current task plus lightweight
+// runtime context (attachments, cwd-switch protocol).
+// Exception: if we have to start a fresh CLI session after this agent already
+// has visible history (for example cwd changed and the old cwd-keyed session
+// id was cleared), we bridge that prior visible transcript once.
 
 const CLI_PROMPT_MAX_BYTES = 200 * 1024;
 
-/** Default + workspace-sync for the coding-agent project directory.
+/** Initialise the coding-agent project directory for a conversation.
  *
- *  Two cases the user expects to "just work":
- *    1. First dispatch in a fresh conv: we shouldn't pop a directory
- *       picker just to start — the user already chose a workspace,
- *       use that.
- *    2. User switches the workspace mid-conversation (chip in the
- *       chat surface): the next coding-agent turn should follow.
- *
- *  Either case = "auto-set" with `explicit=false`. Once the user
- *  picks a different directory through the input-form picker
- *  (form-submit hook flips `explicit=true`), workspace switches no
- *  longer override their choice. Caller must already have established
- *  this is a coding agent (the explicit flag is meaningless for
- *  non-coding CLIs that don't honour `coding_project_dir`). */
-async function _syncCodingProjectDirWithWorkspace(
-  uid: string, cid: string, wsPath: string,
+ *  The source is the agent detail page's local project-dir setting:
+ *  custom override if present, otherwise the effective workspace for
+ *  this conversation/project. This runs only while the conversation has
+ *  no `coding_project_dir`; once set, that cwd stays stable for the
+ *  conversation until the user explicitly switches it through the
+ *  directory form. */
+async function _initializeCodingProjectDir(
+  uid: string, cid: string, info: agentsFeat.AgentCliProjectDirInfo,
 ): Promise<void> {
   const cur = await readState(uid, cid);
-  if (cur.coding_project_dir_explicit) return;            // sticky
-  if (cur.coding_project_dir === wsPath) return;          // already in sync
-  const oldDir = cur.coding_project_dir || '';
-  await setCodingProjectDir(uid, cid, wsPath, { explicit: false });
-  if (oldDir && oldDir !== wsPath) {
-    // CLI session bindings reference the OLD cwd. claude code keys
-    // sessions by cwd (`~/.claude/projects/<encoded-cwd>/<id>.jsonl`),
-    // so resuming a stale id at the new cwd fails with
-    // "No conversation found". Drop bindings preemptively so the
-    // next dispatch goes through the full-slice replay path —
-    // user-visible conversation continues seamlessly because
-    // `_buildCliPrompt` includes the slice when `resuming=false`.
-    const cliSessions = await import('../local_agents/sessions');
-    await cliSessions.clearForConversation(uid, cid);
-    log.info(`coding cwd changed cid=${cid} ${oldDir} → ${wsPath} — cleared cli sessions`);
-  } else {
-    log.info(`coding project_dir auto-set cid=${cid} → ${wsPath}`);
-  }
+  if (cur.coding_project_dir) return;
+  const target = info.effective_path;
+  if (!target) return;
+  await setCodingProjectDir(uid, cid, target, { explicit: info.mode === 'custom' && info.exists });
+  log.info(`coding project_dir initialised cid=${cid} → ${target}`);
 }
 
 /** Build an `<agent-input-form>` block listing the agent's required
@@ -2072,18 +2763,28 @@ async function _runCliAgentTurn(opts: {
   if (formBlock) return { text: formBlock };
 
   // Look up any prior CLI session bound to this (cid, aid, cli). If
-  // present, we ask the CLI to resume it (claude: `--resume <id>`)
-  // and skip replaying the visibility slice in the prompt — the CLI
-  // already remembers the prior turns. First dispatch / fresh CLI
-  // swap → null → we replay the slice as before. Saves significant
-  // tokens and round-trip latency on long conversations.
+  // present, we ask the CLI to resume it (claude: `--resume <id>`,
+  // codex: `thread/resume`). With a valid resume handle, the prompt stays
+  // current-turn-only: CLI agents persist their own conversation records,
+  // and duplicating host chat history here bloats context and can confuse
+  // the CLI's native memory. Without a handle, but with prior visible
+  // turns, we bridge that transcript into the fresh CLI session.
   const cliSessions = await import('../local_agents/sessions');
   const resumeSessionId = await cliSessions.getSessionId(
     opts.uid, opts.cid, opts.agent.agent_id, runtime.cli,
   );
+  const bridgeHistory = !resumeSessionId && _hasPriorVisibleCliHistory(opts.item, opts.slice);
   const promptText = await _buildCliPrompt(
-    opts.uid, opts.cid, opts.agent, opts.item, opts.slice, !!resumeSessionId,
+    opts.uid, opts.cid, opts.agent, opts.item, opts.slice, bridgeHistory,
   );
+  // When `_buildCliPrompt` took the slash-command fast-path, promptText is
+  // the raw `/cmd …` we forwarded. Remember the command name so the
+  // success-return path below can swap CLI's (no content)/empty result
+  // for a helpful note instead of leaving an empty bubble — common with
+  // session-control slashes like `/new` / `/clear` that no-op in -p mode.
+  const slashCommandName = _isSlashCommand(promptText)
+    ? (/^(\/[A-Za-z][A-Za-z0-9_-]*)/.exec(promptText)?.[1] ?? null)
+    : null;
   const runner = await import('../local_agents/runner');
 
   let accText = '';
@@ -2125,7 +2826,16 @@ async function _runCliAgentTurn(opts: {
         case 'text-delta':
           if (typeof (e as any).text === 'string') {
             accText += (e as any).text as string;
-            opts.onProcess({ type: 'delta', text: (e as any).text });
+            // Slash-command turns: buffer text-delta in `accText` instead
+            // of streaming to the bubble. The success-return path below
+            // either swaps the body for "已发送命令 …" (CLI returned
+            // empty / "(no content)") or hands the accumulated text in
+            // one shot as the final msg.text. Streaming would otherwise
+            // flash the CLI's "(no content)" before our substitution
+            // lands, since renderer commits each delta to the bubble.
+            if (!slashCommandName) {
+              opts.onProcess({ type: 'delta', text: (e as any).text });
+            }
           }
           break;
         case 'thinking':
@@ -2194,7 +2904,13 @@ async function _runCliAgentTurn(opts: {
       .setSessionId(opts.uid, opts.cid, opts.agent.agent_id, runtime.cli, backendSessionId)
       .catch(() => { /* logged inside sessions.ts */ });
   }
-  return { text: resultText || accText };
+  const finalText = resultText || accText;
+  if (slashCommandName && _looksLikeNoOutput(finalText)) {
+    return {
+      text: t('cli_agent.slash_no_output', { cmd: slashCommandName }),
+    };
+  }
+  return { text: finalText };
 }
 
 async function _buildCliPrompt(
@@ -2203,16 +2919,31 @@ async function _buildCliPrompt(
   agent: import('../agents').Agent,
   item: QueueItem,
   slice: GroupMessage[],
-  /** When true, the CLI is resuming a prior session and already has
-   *  the conversation history in its own memory — we skip the slice
-   *  block entirely and just send the static frame + new task. Drops
-   *  massive redundancy on long convs. */
-  resuming: boolean,
+  bridgeHistory: boolean,
 ): Promise<string> {
+  // Slash-command fast-path: when the user sends `/foo …` to a CLI agent,
+  // forward the raw text so the CLI's own slash dispatcher (built-ins +
+  // project `.claude/commands/*.md`) sees the leading `/`. Without this,
+  // the chat_cli_agent.md frame buries the slash beneath the agent
+  // identity + output-protocol + history block, and the CLI parser never
+  // fires. Only applies to direct user → CLI dispatch — form submissions
+  // and agent-to-agent forwards keep the full frame.
+  if (item.fromActorId === USER_ID && !decodeSubmission(item.llmPayload)) {
+    const rawUserText = _unwrapLlmTurnPayload(item.llmPayload);
+    if (rawUserText) {
+      const stripped = _stripLeadingRecipientMention(
+        rawUserText, agent.name || '', agent.agent_id,
+      );
+      if (_isSlashCommand(stripped)) {
+        return stripped;
+      }
+    }
+  }
+
   // Layout = `chat_cli_agent.md` (static frame) + `chat_cli_coding_protocol.md`
   // (coding-only). The static-first / runtime-last split keeps the
   // CLI's prompt cache stable across turns: identity + protocol stay
-  // byte-identical, attachments / slice / task body all change.
+  // byte-identical, attachments / task body change.
   const { prompts } = await import('../../prompts/loader');
   const { chatAttachmentDir } = await import('../../paths');
 
@@ -2252,6 +2983,19 @@ async function _buildCliPrompt(
   const attachmentsBlock = allAtts.length
     ? `## Attachments\n${allAtts.map(a => `- ${a}`).join('\n')}`
     : '';
+  let projectFilesBlock = '';
+  try {
+    const { getConversation } = await import('../chats');
+    const conv = await getConversation(uid, cid);
+    const pid = (conv as any)?.project_id;
+    if (typeof pid === 'string' && pid) {
+      const projectFileFeature = await import('../project_files');
+      projectFilesBlock = await projectFileFeature.buildProjectFilesCliBlock(uid, pid);
+    }
+  } catch (err) {
+    log.warn(`cli project files block failed cid=${cid}: ${(err as Error).message}`);
+  }
+  const filesBlock = [attachmentsBlock, projectFilesBlock].filter(Boolean).join('\n\n');
 
   // ── Task body — submission unwrap if the dispatch was a form-submit.
   // When the user confirmed the input form, the dispatched payload is
@@ -2286,42 +3030,35 @@ async function _buildCliPrompt(
     taskBody = item.llmPayload;
   }
 
-  // Render the template with a candidate conversation block. The
-  // truncation pass below sizes the block against the byte cap.
   const render = (conversationBlock: string) => prompts.load('chat_cli_agent', {
     agent_name: agent.name || agent.agent_id,
     agent_description: (agent.description_en || agent.description_zh || '').trim(),
     output_protocol_block: outputProtocolBlock,
-    attachments_block: attachmentsBlock,
+    attachments_block: filesBlock,
     conversation_block: conversationBlock,
     task_body: taskBody,
   });
 
-  // Resuming → CLI already has the slice in its own memory; skip
-  // replay entirely. Static frame + new task is enough.
-  if (resuming) return render('');
+  if (!bridgeHistory) return render('');
 
-  // Conversation slice, oldest → newest. Empty-text rows skipped.
+  const history = _priorVisibleCliHistory(item, slice);
+  if (!history.length) return render('');
+
   const sliceLines: string[] = [];
-  for (const m of slice) {
+  for (const m of history) {
     const to = (m.to || []).join(',') || '-';
     const text = (m.text || '').replace(/\r/g, '').trim();
     if (!text) continue;
     sliceLines.push(`[${m.from} → ${to}] ${text}`);
   }
+  if (!sliceLines.length) return render('');
 
-  // Size the slice against the byte cap by rendering once with an
-  // empty block — gives an exact base size including the protocol /
-  // attachments / task. If even the base exceeds the cap, fall back
-  // to a no-history prompt rather than truncating the task body.
   const baseBytes = Buffer.byteLength(render(''), 'utf8');
   if (baseBytes >= CLI_PROMPT_MAX_BYTES) {
     log.warn(`cli prompt: base exceeds cap; sending minimal prompt cid=${cid} agent=${agent.agent_id}`);
     return render('');
   }
   const sliceBudget = CLI_PROMPT_MAX_BYTES - baseBytes;
-  // Walk newest-backward, keep lines while we have budget. Oldest
-  // lines that don't fit are dropped.
   const kept: string[] = [];
   let used = 0;
   for (let i = sliceLines.length - 1; i >= 0; i--) {
@@ -2334,8 +3071,15 @@ async function _buildCliPrompt(
   if (truncated) {
     log.warn(`cli prompt: trimmed ${sliceLines.length - kept.length}/${sliceLines.length} oldest slice rows cid=${cid} agent=${agent.agent_id}`);
   }
-  const conversationBlock = kept.length
-    ? `## Conversation so far${truncated ? ' (truncated)' : ''}\n${kept.join('\n')}`
-    : '';
+  const conversationBlock = `## Conversation so far${truncated ? ' (truncated)' : ''}\n${kept.join('\n')}`;
   return render(conversationBlock);
+}
+
+function _priorVisibleCliHistory(item: QueueItem, slice: GroupMessage[]): GroupMessage[] {
+  const idx = slice.findIndex((m) => m.id === item.msgId);
+  return idx >= 0 ? slice.slice(0, idx) : slice;
+}
+
+function _hasPriorVisibleCliHistory(item: QueueItem, slice: GroupMessage[]): boolean {
+  return _priorVisibleCliHistory(item, slice).some((m) => (m.text || '').trim());
 }

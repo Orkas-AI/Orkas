@@ -179,6 +179,124 @@ describe('local_agents/runner', () => {
     expect(result.error).toMatch(/timeout/);
   });
 
+  it('emits idle events when the backend goes quiet beyond the threshold', async () => {
+    // Use real timers but shrink the threshold via env vars. The
+    // ORKAS_LOCAL_AGENT_IDLE_MIN_MS escape hatch exists exactly so
+    // unit tests can exercise the heartbeat at ~100ms rather than
+    // the 30s production floor.
+    const prevIdleMs = process.env.ORKAS_LOCAL_AGENT_IDLE_MS;
+    const prevIdleMin = process.env.ORKAS_LOCAL_AGENT_IDLE_MIN_MS;
+    process.env.ORKAS_LOCAL_AGENT_IDLE_MIN_MS = '50';
+    process.env.ORKAS_LOCAL_AGENT_IDLE_MS = '120';   // threshold 120ms
+    try {
+      mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+      let onEventCb: ((e: any) => void) | null = null;
+      let resolveBackend!: () => void;
+      mockBackendImpl = async ({ onEvent }) => {
+        onEventCb = onEvent;
+        onEvent({ type: 'process-info', pid: 42, cwd: '/x', cmd: 'claude', args: [] });
+        await new Promise<void>(resolve => { resolveBackend = resolve; });
+        onEvent({ type: 'done', status: 'completed', output: '', durationMs: 0 });
+      };
+
+      const runner = await loadRunner();
+      const events: any[] = [];
+      const promise = runner.run({
+        uid: TEST_UID, cid: 'c', agentId: 'a',
+        cli: 'claude', prompt: 'p', cwd: tmpDir,
+        signal: new AbortController().signal,
+        onEvent: e => events.push(e),
+      });
+
+      // Threshold=120ms, tick = max(50, 120/3=40) → 50ms. Wait ~250ms:
+      // at least 2 idle pulses should fire after the 120ms quiet period.
+      await new Promise(r => setTimeout(r, 250));
+      const idleCount1 = events.filter(e => e.type === 'idle').length;
+      expect(idleCount1).toBeGreaterThanOrEqual(1);
+
+      // Continue waiting → steady drumbeat (more idle events).
+      await new Promise(r => setTimeout(r, 150));
+      const idleCount2 = events.filter(e => e.type === 'idle').length;
+      expect(idleCount2).toBeGreaterThan(idleCount1);
+
+      // Backend emits a real event — deadline should reset, so no new
+      // idle pulse during the next sub-threshold window.
+      onEventCb!({ type: 'text-delta', text: 'still here' });
+      const beforeReset = events.filter(e => e.type === 'idle').length;
+      await new Promise(r => setTimeout(r, 80));  // less than 120ms threshold
+      const afterReset = events.filter(e => e.type === 'idle').length;
+      expect(afterReset).toBe(beforeReset);  // no new idle fired
+
+      resolveBackend();
+      await promise;
+    } finally {
+      if (prevIdleMs === undefined) delete process.env.ORKAS_LOCAL_AGENT_IDLE_MS;
+      else process.env.ORKAS_LOCAL_AGENT_IDLE_MS = prevIdleMs;
+      if (prevIdleMin === undefined) delete process.env.ORKAS_LOCAL_AGENT_IDLE_MIN_MS;
+      else process.env.ORKAS_LOCAL_AGENT_IDLE_MIN_MS = prevIdleMin;
+    }
+  });
+
+  it('spills oversized tool-event results to disk and rewrites output + outputPath', async () => {
+    const { PERSIST_THRESHOLD } = await import('../../../../src/main/util/tool-result-cap');
+    const big = 'X'.repeat(PERSIST_THRESHOLD + 200);
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({ type: 'process-info', pid: 1, cwd: '/x', cmd: 'claude', args: [] });
+      // Tool-event with massive output — the runner must intercept and
+      // spill this before it lands in events.jsonl or reaches the caller.
+      onEvent({
+        type: 'tool-event', tool: 'bash', callId: 'c1', phase: 'result', output: big,
+      });
+      onEvent({ type: 'done', status: 'completed', output: '', durationMs: 0 });
+    };
+
+    const runner = await loadRunner();
+    const events: any[] = [];
+    const result = await runner.run({
+      uid: TEST_UID, cid: 'c', agentId: 'a',
+      cli: 'claude', prompt: 'p', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: e => events.push(e),
+    });
+    expect(result.status).toBe('completed');
+
+    const toolEvent = events.find(e => e.type === 'tool-event' && e.phase === 'result');
+    expect(toolEvent).toBeDefined();
+    expect(toolEvent.outputPath).toBeTruthy();
+    expect(typeof toolEvent.output).toBe('string');
+    // Output is now the preview marker, not the full payload.
+    expect(toolEvent.output.length).toBeLessThan(big.length);
+    expect(toolEvent.output).toMatch(/<persisted-output/);
+    // The full content is on disk at the reported path.
+    expect(fs.existsSync(toolEvent.outputPath)).toBe(true);
+    expect(fs.readFileSync(toolEvent.outputPath, 'utf8')).toBe(big);
+    // Spill landed under the expected per-session directory shape:
+    // <uid>/local/tool-results/cli-claude-<runId>/bash.<id>.txt (CLAUDE.md §5 — session_id
+    // dropped uid prefix; user scoping comes from path root, not the filename)
+    expect(toolEvent.outputPath).toContain(`cli-claude-${result.runId}`);
+    expect(toolEvent.outputPath).toMatch(/bash\.[0-9a-f]+\.txt$/);
+  });
+
+  it('does not spill small tool-event outputs', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({ type: 'tool-event', tool: 'bash', callId: 'c1', phase: 'result', output: 'small output' });
+      onEvent({ type: 'done', status: 'completed', output: '', durationMs: 0 });
+    };
+    const runner = await loadRunner();
+    const events: any[] = [];
+    await runner.run({
+      uid: TEST_UID, cid: 'c', agentId: 'a',
+      cli: 'claude', prompt: 'p', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: e => events.push(e),
+    });
+    const toolEvent = events.find(e => e.type === 'tool-event' && e.phase === 'result');
+    expect(toolEvent.output).toBe('small output');
+    expect(toolEvent.outputPath).toBeUndefined();
+  });
+
   it('rejects unregistered CLI types cleanly', async () => {
     const runner = await loadRunner();
     const events: any[] = [];

@@ -19,12 +19,21 @@
 //       them preserved.
 //
 // Set B — literal `<agent>` mentions that MUST be preserved:
-//   B1. Inside a fenced ```xml code block (the original 34e27fcb case).
+//   B1. Inside a non-XML fenced code block.
 //   B2. Inside an inline backtick span.
 //   B3. Inside an UNCLOSED inline backtick (mid-stream code-explanation).
 //
 // Mixed: real container + literal mention coexisting in one buffer — only
 // the real container goes, the literal mention stays put.
+//
+// Note on ```xml fences: starting `bc6e0156`, ```xml is treated as a
+// **structural** fence (its body IS the LLM's actual tag emission), not as
+// a preservation marker. The earlier set B1 wording "inside a ```xml block
+// must be preserved" is intentionally retired — the positive coverage for
+// the new semantic lives in the "explicit XML fences are treated as
+// structural blocks" describe blocks further down. ```xml as an example
+// container preservation marker is not coming back; LLM teaching surfaces
+// should use plain ``` for examples.
 //
 // Adding a new guard / branch to any of these strippers? Add a fixture
 // for the motivating shape AND keep the existing fixtures green. Don't
@@ -44,8 +53,13 @@ const {
   _replaceOuterAgentBlocks,
   _stripSkillCreateContainer,
   _stripSurvivingStructuralBlocks,
+  _stripUserStructuralBlocksForDisplay,
+  _replaceKnownSkillIdsForDisplay,
+  _simplifyKnownSkillFollowPhrasesForDisplay,
+  _normalizeKnownSkillRefsForDisplay,
+  _collapseRepeatedStructuralPlaceholders,
 } = strip as {
-  _splitMarkdownProseCode: (text: string) => Array<{ kind: 'prose' | 'code'; text: string }>;
+  _splitMarkdownProseCode: (text: string) => Array<{ kind: 'prose' | 'code'; text: string; xmlFence?: boolean }>;
   _findOuterTagRanges: (text: string, tagName: string) => Array<[number, number]>;
   _stripOuterTagBlocks: (text: string, tagName: string) => string;
   _replaceOuterTagBlocks: (buf: string, tagName: string, placeholder: string) => string;
@@ -54,6 +68,11 @@ const {
   _replaceOuterAgentBlocks: (buf: string, placeholder: string) => string;
   _stripSkillCreateContainer: (buf: string, fallbackPlaceholder: string) => string;
   _stripSurvivingStructuralBlocks: (text: string) => string;
+  _stripUserStructuralBlocksForDisplay: (text: string) => string;
+  _replaceKnownSkillIdsForDisplay: (text: string, skills: Array<{ id: string; name?: string }>) => string;
+  _simplifyKnownSkillFollowPhrasesForDisplay: (text: string, skills: Array<{ id: string; name?: string }>) => string;
+  _normalizeKnownSkillRefsForDisplay: (text: string, skills: Array<{ id: string; name?: string }>) => string;
+  _collapseRepeatedStructuralPlaceholders: (buf: string, placeholder: string) => string;
 };
 
 const PH = '⟨PLACEHOLDER⟩';
@@ -128,8 +147,8 @@ describe('set A — real <agent> containers must be stripped / replaced', () => 
 // --- Set B: literal mentions must survive ---------------------------------
 
 describe('set B — literal <agent> in code must be preserved', () => {
-  it('B1. inside a fenced ```xml block', () => {
-    const buf = 'Use this format:\n```xml\n<agent><name>X</name></agent>\n```\nafter';
+  it('B1. inside a fenced non-XML code block', () => {
+    const buf = 'Use this format:\n```\n<agent><name>X</name></agent>\n```\nafter';
     expect(_stripSurvivingAgentBlocks(buf)).toBe(buf.trim());
     expect(_replaceOuterAgentBlocks(buf, PH)).toBe(buf);
   });
@@ -145,6 +164,30 @@ describe('set B — literal <agent> in code must be preserved', () => {
     expect(_stripSurvivingAgentBlocks(buf)).toBe(buf);
     expect(_replaceOuterAgentBlocks(buf, PH)).toBe(buf);
   });
+
+  it('B4. inline quoted text survives', () => {
+    const buf = '请输出 "<agent>...</agent>" 这几个字符';
+    expect(_stripSurvivingAgentBlocks(buf)).toBe(buf);
+    expect(_replaceOuterAgentBlocks(buf, PH)).toBe(buf);
+  });
+});
+
+describe('explicit XML fences are treated as structural blocks', () => {
+  it('strips a complete agent container inside ```xml', () => {
+    const buf = '```xml\n<agent><name>X</name></agent>\n```';
+    expect(_stripSurvivingAgentBlocks(buf)).toBe('```xml\n\n```');
+    expect(_replaceOuterAgentBlocks(buf, PH)).toBe(`\`\`\`xml\n${PH}\n\`\`\``);
+  });
+
+  it('quoted XML at line start is still a structure block', () => {
+    const buf = '"<agent><name>X</name></agent>"';
+    expect(_replaceOuterAgentBlocks(buf, PH)).toBe(`"${PH}"`);
+  });
+
+  it('inline quoted XML inside ```xml is still structural', () => {
+    const buf = '```xml\nvalue="<agent><name>X</name></agent>"\n```';
+    expect(_replaceOuterAgentBlocks(buf, PH)).toBe(`\`\`\`xml\nvalue="${PH}"\n\`\`\``);
+  });
 });
 
 // --- Mixed: container + literal mention coexisting -------------------------
@@ -153,7 +196,7 @@ describe('mixed — real container + literal mention in one buffer', () => {
   it('only the real container is replaced; quoted example survives', () => {
     const buf = [
       'Example format:',
-      '```xml',
+      '```',
       '<agent><name>Example</name></agent>',
       '```',
       'And here is the actual one:',
@@ -164,8 +207,8 @@ describe('mixed — real container + literal mention in one buffer', () => {
       'done.',
     ].join('\n');
     const stripped = _stripSurvivingAgentBlocks(buf);
-    // Quoted example inside ```xml stays.
-    expect(stripped).toContain('```xml');
+    // Quoted example inside a non-XML code fence stays.
+    expect(stripped).toContain('```');
     expect(stripped).toContain('<agent><name>Example</name></agent>');
     // Real one's tags / interior gone.
     expect(stripped).not.toContain('<name>Real</name>');
@@ -191,9 +234,14 @@ describe('granularity invariant — the guard is anchored at the opening tag', (
     expect(buf.slice(start, end)).toBe('<agent>a `b` c</agent>');
   });
 
-  it('opener inside fenced code → no range produced', () => {
+  it('opener inside non-XML fenced code → no range produced', () => {
     const buf = '```\n<agent>x</agent>\n```';
     expect(_findOuterAgentRanges(buf)).toEqual([]);
+  });
+
+  it('opener inside explicit XML fenced code → range produced', () => {
+    const buf = '```xml\n<agent>x</agent>\n```';
+    expect(_findOuterAgentRanges(buf)).toHaveLength(1);
   });
 
   it('opener inside inline backticks → no range produced', () => {
@@ -245,8 +293,8 @@ describe('<agent-input-form> — set A (real form blocks must be replaced)', () 
 });
 
 describe('<agent-input-form> — set B (literal mentions must survive)', () => {
-  it('B1. inside a fenced ```xml block (protocol explanation)', () => {
-    const buf = 'Format:\n```xml\n<agent-input-form>\n[]\n</agent-input-form>\n```\nend';
+  it('B1. inside a fenced non-XML code block (protocol explanation)', () => {
+    const buf = 'Format:\n```\n<agent-input-form>\n[]\n</agent-input-form>\n```\nend';
     expect(_replaceOuterTagBlocks(buf, 'agent-input-form', PH)).toBe(buf);
   });
 
@@ -258,6 +306,13 @@ describe('<agent-input-form> — set B (literal mentions must survive)', () => {
   it('B3. UNCLOSED inline backtick mid-stream (the streaming case)', () => {
     const buf = 'Use `<agent-input-form>';
     expect(_replaceOuterTagBlocks(buf, 'agent-input-form', PH)).toBe(buf);
+  });
+});
+
+describe('<agent-input-form> — explicit XML fences are structural', () => {
+  it('replaces a form block inside ```xml', () => {
+    const buf = 'Format:\n```xml\n<agent-input-form>\n[]\n</agent-input-form>\n```\nend';
+    expect(_replaceOuterTagBlocks(buf, 'agent-input-form', PH)).toBe(`Format:\n\`\`\`xml\n${PH}\n\`\`\`\nend`);
   });
 });
 
@@ -278,8 +333,8 @@ describe('<agent-input-submission> — set A (real submission tags stripped)', (
 });
 
 describe('<agent-input-submission> — set B (literal mentions survive)', () => {
-  it('B1. inside a fenced ```xml block', () => {
-    const buf = 'Reply format:\n```xml\n<agent-input-submission form_id="x" agent_id="y">\n{}\n</agent-input-submission>\n```';
+  it('B1. inside a fenced non-XML code block', () => {
+    const buf = 'Reply format:\n```\n<agent-input-submission form_id="x" agent_id="y">\n{}\n</agent-input-submission>\n```';
     expect(_stripOuterTagBlocks(buf, 'agent-input-submission')).toBe(buf);
   });
 
@@ -291,6 +346,235 @@ describe('<agent-input-submission> — set B (literal mentions survive)', () => 
   it('B3. UNCLOSED inline backtick (defense-in-depth, even though the tag normally only appears in user messages and not mid-stream)', () => {
     const buf = 'see `<agent-input-submission';
     expect(_stripOuterTagBlocks(buf, 'agent-input-submission')).toBe(buf);
+  });
+});
+
+describe('<agent-input-submission> — explicit XML fences are structural', () => {
+  it('strips a submission block inside ```xml', () => {
+    const buf = 'Reply format:\n```xml\n<agent-input-submission form_id="x" agent_id="y">\n{}\n</agent-input-submission>\n```';
+    expect(_stripOuterTagBlocks(buf, 'agent-input-submission')).toBe('Reply format:\n```xml\n\n```');
+  });
+});
+
+describe('main-chat creation stream stripping', () => {
+  function streamDisplay(buf: string): string {
+    const skillPh = '[organizing skill config]';
+    return _collapseRepeatedStructuralPlaceholders(_stripSkillCreateContainer(
+      _replaceOuterTagBlocks(
+        strip._replaceOuterSkillFileBlocks(buf, () => `\n${skillPh}\n`),
+        'agent',
+        PH,
+      ),
+      `\n${skillPh}\n`,
+    ), `\n${skillPh}\n`);
+  }
+
+  it('does not leak skill frontmatter or agent XML while bulk create output streams', () => {
+    const raw = [
+      '<skill>',
+      '<<<skill-file path=SKILL.md',
+      '---',
+      'name: leio-sdlc-adapter',
+      'description_zh: "把研发工作组织成带状态机和队列的流程"',
+      'description_en: "Organize engineering work into an SDLC flow"',
+      '---',
+      '',
+      '# leio-sdlc-adapter',
+      '## 何时使用',
+      '- 用户提到 `LEIO SDLC`。',
+      '>>>',
+      '</skill>',
+      '',
+      '<agent>',
+      '<name>Plandex研发助手</name>',
+      '<description_zh>围绕大项目编码任务做计划。</description_zh>',
+      '<workflow>',
+      '### 1. 收集上下文',
+      '- `read_file` — 读取材料。',
+      '</workflow>',
+      '</agent>',
+    ].join('\n');
+
+    for (let i = 1; i <= raw.length; i++) {
+      const display = streamDisplay(raw.slice(0, i));
+      expect(display).not.toMatch(/name: leio|description_zh|description_en|把研发工作组织|Organize engineering|# leio-sdlc-adapter|<workflow>|Plandex研发助手/);
+    }
+    expect(streamDisplay(raw)).toContain('[organizing skill config]');
+  });
+
+  it('shows one skill placeholder for consecutive skill-file blocks', () => {
+    const raw = [
+      '<skill>',
+      '<<<skill-file path=SKILL.md',
+      '---',
+      'name: first',
+      '>>>',
+      '<<<skill-file path=scripts/a.py',
+      'print("a")',
+      '>>>',
+      '</skill>',
+    ].join('\n');
+    const display = streamDisplay(raw);
+    expect(display.split('[organizing skill config]').length - 1).toBe(1);
+  });
+});
+
+describe('stream placeholders', () => {
+  it('collapses consecutive repeated structural placeholders', () => {
+    expect(_collapseRepeatedStructuralPlaceholders(`lead\n${PH}\n\n${PH}\ntrail`, PH))
+      .toBe(`lead\n${PH}\ntrail`);
+    expect(_collapseRepeatedStructuralPlaceholders(`lead\n${PH}\nkeep\n${PH}`, PH))
+      .toBe(`lead\n${PH}\nkeep\n${PH}`);
+  });
+});
+
+describe('user message display stripping', () => {
+  it('preserves ordinary one-line @agent messages', () => {
+    const buf = '@Agent Skill 搜集 你再次执行';
+    expect(_stripUserStructuralBlocksForDisplay(buf)).toBe(buf);
+  });
+
+  it('strips the routing @mention only for real form submission replays', () => {
+    const buf = [
+      '@Research Agent',
+      'You confirmed:',
+      '<agent-input-submission form_id="abc12345" agent_id="research-agent">',
+      '{"topic":"x"}',
+      '</agent-input-submission>',
+    ].join('\n');
+    expect(_stripUserStructuralBlocksForDisplay(buf)).toBe('You confirmed:');
+  });
+});
+
+describe('skill id display replacement', () => {
+  const skills = [
+    { id: '16e1bfcb3426', name: 'agent-creator' },
+    { id: 'efb0fe5d9664', name: 'skill-creator' },
+  ];
+
+  it('renders marketplace skill ids as display names in prose', () => {
+    const buf = 'Use `16e1bfcb3426`, then follow efb0fe5d9664.';
+    expect(_replaceKnownSkillIdsForDisplay(buf, skills))
+      .toBe('Use `agent-creator`, then follow skill-creator.');
+  });
+
+  it('does not replace embedded hash fragments or unknown ids', () => {
+    const buf = 'x16e1bfcb3426y 000000000000';
+    expect(_replaceKnownSkillIdsForDisplay(buf, skills)).toBe(buf);
+  });
+
+  it('simplifies skill follow phrasing to a compact display reference', () => {
+    expect(_simplifyKnownSkillFollowPhrasesForDisplay('skill: follow the `agent-creator` skill，then continue', skills))
+      .toBe('`agent-creator` skill，then continue');
+    expect(_normalizeKnownSkillRefsForDisplay('`skill: follow the 16e1bfcb3426 skill` — create agents', skills))
+      .toBe('`agent-creator` skill — create agents');
+  });
+});
+
+// `<artifact-result>` — the machine tag a renderer composes when an
+// interactive artifact posts a result back; carried in a user message so
+// the agent can parse it, stripped from the user bubble's display via
+// `_stripArtifactResultTagForDisplay` (which delegates to `_stripOuterTagBlocks`).
+// Same whack-a-mole class as the submission tag — pin set A + set B.
+describe('<artifact-result> — set A (real result tags stripped from display)', () => {
+  it('A1. result tag with attributes and a JSON payload body', () => {
+    const buf = 'Result from "Tip calc"\n\n<artifact-result artifact_id="abc123" agent_id="helper">\n{"payload":{"tip":18,"total":118}}\n</artifact-result>';
+    expect(_stripOuterTagBlocks(buf, 'artifact-result')).toBe('Result from "Tip calc"\n\n');
+  });
+
+  it('A2. payload JSON value contains backticks / angle brackets — still atomic', () => {
+    const buf = 'Result from "Editor"\n\n<artifact-result artifact_id="x" agent_id="a">\n{"payload":{"code":"a `b` <c>"}}\n</artifact-result>\nthanks';
+    const out = _stripOuterTagBlocks(buf, 'artifact-result');
+    expect(out).not.toContain('artifact-result');
+    expect(out).not.toContain('`b`');
+    expect(out).toBe('Result from "Editor"\n\n\nthanks');
+  });
+});
+
+describe('<artifact-result> — set B (literal mentions survive)', () => {
+  it('B1. inside a fenced non-XML code block (e.g. the tool description quoting the protocol)', () => {
+    const buf = 'Format:\n```\n<artifact-result artifact_id="x" agent_id="y">\n{...}\n</artifact-result>\n```';
+    expect(_stripOuterTagBlocks(buf, 'artifact-result')).toBe(buf);
+  });
+
+  it('B2. inside an inline backtick span', () => {
+    const buf = 'The renderer posts a `<artifact-result ...>` tag back to you.';
+    expect(_stripOuterTagBlocks(buf, 'artifact-result')).toBe(buf);
+  });
+
+  it('B3. UNCLOSED inline backtick', () => {
+    const buf = 'see `<artifact-result';
+    expect(_stripOuterTagBlocks(buf, 'artifact-result')).toBe(buf);
+  });
+});
+
+describe('<artifact-result> — explicit XML fences are structural', () => {
+  it('strips a result block inside ```xml', () => {
+    const buf = 'Format:\n```xml\n<artifact-result artifact_id="x" agent_id="y">\n{...}\n</artifact-result>\n```';
+    expect(_stripOuterTagBlocks(buf, 'artifact-result')).toBe('Format:\n```xml\n\n```');
+  });
+});
+
+// `<marketplace-install-result>` — the machine tag the commander composes
+// when an install request resolves (accepted / declined / failed). Carried
+// in a user message so the next commander turn can read it; stripped from
+// the user bubble's display via `_stripUserStructuralBlocksForDisplay`.
+// Same whack-a-mole class as `<agent-input-submission>` / `<artifact-result>`
+// — added to `_stripSurvivingStructuralBlocks` allow-list in `2f325f90`
+// without fixtures, retroactively pinned here. Real shape (from
+// `group_chat/index.ts::resolveMarketplaceInstallRequest`):
+//   `<marketplace-install-result request_id="..." kind="..." id="..." status="..."> body </marketplace-install-result>`
+describe('<marketplace-install-result> — set A (real result tags stripped from display)', () => {
+  it('A1. result tag with the 4 standard attributes + body', () => {
+    const buf = 'Confirming install:\n\n<marketplace-install-result request_id="r-1" kind="agent" id="abcd1234" status="accepted">\nuser approved\n</marketplace-install-result>';
+    expect(_stripOuterTagBlocks(buf, 'marketplace-install-result')).toBe('Confirming install:\n\n');
+  });
+
+  it('A2. body contains backticks / angle brackets — still atomic', () => {
+    const buf = 'pre\n\n<marketplace-install-result request_id="r" kind="skill" id="x" status="declined">\nreason: user said "use `<existing>` instead"\n</marketplace-install-result>\npost';
+    const out = _stripOuterTagBlocks(buf, 'marketplace-install-result');
+    expect(out).not.toContain('marketplace-install-result');
+    expect(out).not.toContain('`<existing>`');
+    expect(out).toBe('pre\n\n\npost');
+  });
+});
+
+describe('<marketplace-install-result> — set B (literal mentions survive)', () => {
+  it('B1. inside a fenced non-XML code block (e.g. docs quoting the protocol)', () => {
+    const buf = 'Wire format:\n```\n<marketplace-install-result request_id="X" kind="agent" id="Y" status="accepted">\n...\n</marketplace-install-result>\n```';
+    expect(_stripOuterTagBlocks(buf, 'marketplace-install-result')).toBe(buf);
+  });
+
+  it('B2. inside an inline backtick span', () => {
+    const buf = 'The commander posts a `<marketplace-install-result ...>` tag when the install resolves.';
+    expect(_stripOuterTagBlocks(buf, 'marketplace-install-result')).toBe(buf);
+  });
+
+  it('B3. UNCLOSED inline backtick (mid-stream code-explanation)', () => {
+    const buf = 'see `<marketplace-install-result';
+    expect(_stripOuterTagBlocks(buf, 'marketplace-install-result')).toBe(buf);
+  });
+});
+
+describe('<marketplace-install-result> — explicit XML fences are structural', () => {
+  it('strips a result block inside ```xml (parity with <artifact-result>)', () => {
+    const buf = 'Reply:\n```xml\n<marketplace-install-result request_id="X" kind="agent" id="Y" status="accepted">\nok\n</marketplace-install-result>\n```';
+    expect(_stripOuterTagBlocks(buf, 'marketplace-install-result')).toBe('Reply:\n```xml\n\n```');
+  });
+});
+
+describe('<marketplace-install-result> — round-trip through the two strip callers', () => {
+  it('_stripSurvivingStructuralBlocks removes assistant-text hallucinations of the tag', () => {
+    const buf = 'Sure, here is the install reply you asked for: <marketplace-install-result request_id="r" kind="skill" id="x" status="accepted">echo</marketplace-install-result> done.';
+    const out = _stripSurvivingStructuralBlocks(buf);
+    expect(out).not.toContain('marketplace-install-result');
+    expect(out).toContain('Sure, here is the install reply you asked for:');
+    expect(out).toContain('done.');
+  });
+
+  it('_stripUserStructuralBlocksForDisplay removes the user-emitted tag from the bubble', () => {
+    const buf = 'I accept.\n\n<marketplace-install-result request_id="r" kind="agent" id="x" status="accepted">ok</marketplace-install-result>';
+    expect(_stripUserStructuralBlocksForDisplay(buf)).toBe('I accept.');
   });
 });
 
@@ -344,6 +628,13 @@ describe('_stripSurvivingStructuralBlocks (final-time safety strip)', () => {
     expect(_stripSurvivingStructuralBlocks(buf)).toBe('lead\n\ntail');
   });
 
+  it('strips a leaked <artifact-result> in assistant text but preserves a literal mention in code', () => {
+    const real = 'lead\n<artifact-result artifact_id="x" agent_id="a">{"payload":1}</artifact-result>\ntail';
+    expect(_stripSurvivingStructuralBlocks(real)).toBe('lead\n\ntail');
+    const literal = 'Post back a `<artifact-result ...>` tag.';
+    expect(_stripSurvivingStructuralBlocks(literal)).toBe(literal);
+  });
+
   it('strips all three tags coexisting in one buffer', () => {
     const buf = [
       'before',
@@ -367,7 +658,7 @@ describe('_stripSurvivingStructuralBlocks (final-time safety strip)', () => {
   it('preserves every literal mention inside fenced code', () => {
     const buf = [
       'Three protocol tags:',
-      '```xml',
+      '```',
       '<agent><name>X</name></agent>',
       '<agent-input-form>\n[]\n</agent-input-form>',
       '<agent-input-submission form_id="f" agent_id="a">{}</agent-input-submission>',
@@ -388,7 +679,7 @@ describe('_stripSurvivingStructuralBlocks (final-time safety strip)', () => {
   it('mixed: real <agent> + literal forms in code → only <agent> stripped', () => {
     const buf = [
       'spec:',
-      '```xml',
+      '```',
       '<agent-input-form>\n[]\n</agent-input-form>',
       '```',
       '<agent><name>Real</name></agent>',
@@ -398,6 +689,24 @@ describe('_stripSurvivingStructuralBlocks (final-time safety strip)', () => {
     expect(out).toContain('<agent-input-form>');
     expect(out).not.toContain('<name>Real</name>');
     expect(out).toContain('after');
+  });
+
+  it('strips structural tags inside explicit XML fences', () => {
+    const buf = [
+      'Three protocol tags:',
+      '```xml',
+      '<agent><name>X</name></agent>',
+      '<agent-input-form>\n[]\n</agent-input-form>',
+      '<agent-input-submission form_id="f" agent_id="a">{}</agent-input-submission>',
+      '```',
+      'end',
+    ].join('\n');
+    const out = _stripSurvivingStructuralBlocks(buf);
+    expect(out).not.toContain('<agent><name>X</name></agent>');
+    expect(out).not.toContain('<agent-input-form>');
+    expect(out).not.toContain('<agent-input-submission');
+    expect(out).toContain('```xml');
+    expect(out).toContain('end');
   });
 
   it('no-op when buffer has none of the three tags', () => {
@@ -538,6 +847,38 @@ describe('skill-file — set B (literal <<<skill-file>>> mentions must survive)'
     expect(_stripOuterSkillFileBlocks(buf)).toBe(buf);
     expect(_replaceOuterSkillFileBlocks(buf, SKILL_PH)).toBe(buf);
   });
+
+  it('B4. inline quoted text survives', () => {
+    const buf = '请输出 "<<<skill-file path=SKILL.md>>>" 这几个字符';
+    expect(_stripOuterSkillFileBlocks(buf)).toBe(buf);
+    expect(_replaceOuterSkillFileBlocks(buf, SKILL_PH)).toBe(buf);
+  });
+});
+
+describe('skill-file — explicit XML fences are machine blocks', () => {
+  it('replaces a complete skill-file block inside ```xml', () => {
+    const buf = [
+      '```xml',
+      '<<<skill-file path=SKILL.md',
+      'body',
+      '>>>',
+      '```',
+    ].join('\n');
+    expect(_stripOuterSkillFileBlocks(buf)).toBe('```xml\n\n```');
+    expect(_replaceOuterSkillFileBlocks(buf, SKILL_PH)).toBe('```xml\n⟨SKILL:SKILL.md⟩\n```');
+  });
+
+  it('replaces an inline quoted skill-file block inside ```xml', () => {
+    const buf = [
+      '```xml',
+      'value="<<<skill-file path=SKILL.md',
+      'body',
+      '>>>"',
+      '```',
+    ].join('\n');
+    expect(_stripOuterSkillFileBlocks(buf)).toBe('```xml\nvalue=""\n```');
+    expect(_replaceOuterSkillFileBlocks(buf, SKILL_PH)).toBe('```xml\nvalue="⟨SKILL:SKILL.md⟩"\n```');
+  });
 });
 
 describe('skill-file — mixed (real block + literal mention coexisting)', () => {
@@ -650,6 +991,32 @@ describe('_stripSkillCreateContainer — set A (real shapes)', () => {
     expect(out).not.toContain('<skill>');
   });
 
+  it('A2b. closed real container hides skill-file blocks even when the LLM fenced them', () => {
+    // The backend can still parse this because the `<skill>` container is
+    // real. If a raw `<<<skill-file>>>` survives until this later pass, the
+    // streaming renderer must not leak SKILL.md body content while waiting
+    // for the final parsed message.
+    const buf = [
+      '<skill>',
+      '```xml',
+      '<<<skill-file path=SKILL.md',
+      '---',
+      'name: frontend-ui-engineering',
+      '---',
+      '',
+      '## Quick Reference: ARIA Live Regions',
+      '| Value | Behavior |',
+      '>>>',
+      '```',
+      '</skill>',
+    ].join('\n');
+    const out = _stripSkillCreateContainer(buf, '⟨FALLBACK⟩');
+    expect(out).toContain('⟨FALLBACK⟩');
+    expect(out).not.toContain('<<<skill-file');
+    expect(out).not.toContain('frontend-ui-engineering');
+    expect(out).not.toContain('Quick Reference: ARIA Live Regions');
+  });
+
   it('A3. unclosed container collapses to fallback placeholder', () => {
     // Mid-stream: `<skill>` opened, no `</skill>` yet. Inner content may
     // still be raw `<skill_id>` / token fragments — the fallback hides
@@ -692,16 +1059,22 @@ describe('_stripSkillCreateContainer — set B (look-alikes must NOT match)', ()
     expect(out).toBe(buf);
   });
 
-  it('B2. literal `<skill>` inside a fenced ```xml block (protocol explanation)', () => {
-    // LLM showing the user the protocol shape inside a code fence must
-    // not be processed as a real container.
+  it('B2. explicit `<skill>` inside a fenced ```xml block is structural', () => {
     const buf = 'See:\n```xml\n<skill>\n<skill_id>foo</skill_id>\n</skill>\n```\nend';
     const out = _stripSkillCreateContainer(buf, '⟨FALLBACK⟩');
-    expect(out).toBe(buf);
+    expect(out).not.toContain('<skill>');
+    expect(out).not.toContain('<skill_id>');
+    expect(out).not.toContain('foo');
   });
 
   it('B3. literal `<skill>` inside an inline backtick span', () => {
     const buf = 'use the `<skill>` container to wrap things';
+    const out = _stripSkillCreateContainer(buf, '⟨FALLBACK⟩');
+    expect(out).toBe(buf);
+  });
+
+  it('B3b. inline quoted `<skill>` text survives', () => {
+    const buf = '请输出 "<skill>...</skill>" 这几个字符';
     const out = _stripSkillCreateContainer(buf, '⟨FALLBACK⟩');
     expect(out).toBe(buf);
   });

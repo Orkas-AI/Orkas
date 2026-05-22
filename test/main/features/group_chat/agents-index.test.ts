@@ -35,7 +35,7 @@ function customAgentsDir(): string {
   return path.join(tmpDir, TEST_UID, 'cloud', 'agents');
 }
 function builtinAgentsDir(): string {
-  return path.join(tmpDir, 'builtin', 'agents');
+  return path.join(tmpDir, TEST_UID, 'local', 'marketplace', 'agents');
 }
 
 function writeAgent(root: string, agent_id: string, body: Record<string, unknown>) {
@@ -51,8 +51,8 @@ beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-agentsidx-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
-  // Force fresh module loads so `BUILTIN_AGENTS_DIR` (module-level const
-  // resolved at paths.ts import time) gets the test ORKAS_WORKSPACE_ROOT.
+  // Force fresh module loads so per-uid roots (resolved at paths.ts import time
+  // for module-level constants) align with the test ORKAS_WORKSPACE_ROOT.
   vi.resetModules();
   const users = await import('../../../../src/main/features/users');
   users.activateUser(TEST_UID);
@@ -75,7 +75,7 @@ describe('agents_index block — header + per-entry shape', () => {
     const text = await buildBlock(TEST_UID);
     expect(text).toContain('`read_file(<ROOT>/<id>/agent.json)`');
     expect(text).toContain(`- custom:  ${path.resolve(customAgentsDir())}`);
-    expect(text).toContain(`- builtin: ${path.resolve(builtinAgentsDir())}`);
+    expect(text).toContain(`- marketplace: ${path.resolve(builtinAgentsDir())}`);
     expect(text).toContain('Use these ROOT values verbatim');
     expect(text).toContain('@<name>');
   });

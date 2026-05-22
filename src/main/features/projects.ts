@@ -168,6 +168,7 @@ async function _readProject(uid: string, pid: string): Promise<Project | null> {
 async function _writeProject(uid: string, p: Project): Promise<void> {
   fs.mkdirSync(projectDir(uid, p.project_id), { recursive: true });
   await writeJson(projectMetaFile(uid, p.project_id), p);
+  _notifyDirty();
 }
 
 function _normaliseBindings(raw: any): ProjectBindings {
@@ -192,6 +193,15 @@ async function _readBindings(uid: string, pid: string): Promise<ProjectBindings>
 async function _writeBindings(uid: string, pid: string, b: ProjectBindings): Promise<void> {
   fs.mkdirSync(projectDir(uid, pid), { recursive: true });
   await writeJson(projectBindingsFile(uid, pid), b);
+  _notifyDirty();
+}
+
+// Sync engine dirty signal (lazy-require — `features/sync` is stripped from OrkasOpen). Mirrors
+// the pattern in `agents.ts::_invalidateAgentListCache`: any write to a `cloud/projects/...`
+// file should kick the sync debounce so the change propagates within seconds rather than the
+// 5-min periodic.
+function _notifyDirty(): void {
+  // features/sync stripped from the OrkasOpen build — no-op.
 }
 
 // ── Validation ────────────────────────────────────────────────────────────
@@ -362,6 +372,31 @@ export async function getBindings(uid: string, projectId: string): Promise<Proje
   await _ensurePromoted(uid);
   if (!fs.existsSync(projectMetaFile(uid, projectId))) return { agents: [], skills: [] };
   return _readBindings(uid, projectId);
+}
+
+export async function pruneBindings(
+  uid: string,
+  projectId: string,
+  valid: { agents?: ReadonlySet<string>; skills?: ReadonlySet<string> },
+): Promise<{ ok: true; bindings: ProjectBindings; pruned: ProjectBindings } | { ok: false; error: ProjectError }> {
+  await _ensurePromoted(uid);
+  if (!fs.existsSync(projectMetaFile(uid, projectId))) return { ok: false, error: 'not_found' };
+  const cur = await _readBindings(uid, projectId);
+  const validAgents = valid.agents;
+  const validSkills = valid.skills;
+  const next: ProjectBindings = {
+    agents: validAgents ? cur.agents.filter((id) => validAgents.has(id)) : cur.agents,
+    skills: validSkills ? cur.skills.filter((id) => validSkills.has(id)) : cur.skills,
+  };
+  const pruned: ProjectBindings = {
+    agents: validAgents ? cur.agents.filter((id) => !validAgents.has(id)) : [],
+    skills: validSkills ? cur.skills.filter((id) => !validSkills.has(id)) : [],
+  };
+  if (pruned.agents.length || pruned.skills.length) {
+    await _writeBindings(uid, projectId, next);
+    log.info(`pruned stale bindings user=${uid} pid=${projectId} agents=${pruned.agents.length} skills=${pruned.skills.length}`);
+  }
+  return { ok: true, bindings: next, pruned };
 }
 
 /** Single resolver, threaded through runTurn alongside the workspace lookup.

@@ -298,17 +298,18 @@ function _descSnippet(description: string, qLower: string): string {
   return (start > 0 ? '…' : '') + flat.slice(start, end) + (end < flat.length ? '…' : '');
 }
 
-async function _currentLang(): Promise<'zh' | 'en'> {
+async function _currentDescriptionLang(): Promise<'zh' | 'en'> {
   try {
-    const { getCurrentLang } = await import('../../i18n');
-    return getCurrentLang() === 'zh' ? 'zh' : 'en';
+    const { descriptionLang, getCurrentLang } = await import('../../i18n');
+    return descriptionLang(getCurrentLang());
   } catch { return 'en'; }
 }
 
 function _pickDesc(item: { description_zh?: string; description_en?: string }, lang: 'zh' | 'en'): string {
-  const primary = lang === 'zh' ? item.description_zh : item.description_en;
+  const primary = item[`description_${lang}`];
   if (primary && primary.trim()) return primary;
-  const fallback = lang === 'zh' ? item.description_en : item.description_zh;
+  const fallbackLang = ({ zh: 'en', en: 'zh' } as const)[lang];
+  const fallback = item[`description_${fallbackLang}`];
   return fallback || '';
 }
 
@@ -316,7 +317,7 @@ export async function searchAgents(_userId: string, query: string): Promise<Sear
   const q = (query || '').trim();
   if (!q) return [];
   const qLower = q.toLowerCase();
-  const lang = await _currentLang();
+  const lang = await _currentDescriptionLang();
   const { listAgents } = await import('../agents');
   const list = await listAgents();
   const scored: SearchResult[] = [];
@@ -343,7 +344,7 @@ export async function searchSkills(_userId: string, query: string): Promise<Sear
   const q = (query || '').trim();
   if (!q) return [];
   const qLower = q.toLowerCase();
-  const lang = await _currentLang();
+  const lang = await _currentDescriptionLang();
   const { listSkills } = await import('../skills');
   const list = await listSkills();
   const scored: SearchResult[] = [];

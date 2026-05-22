@@ -1,0 +1,433 @@
+/**
+ * Connector manager — process-level singleton holding live MCP client connections.
+ *
+ * On boot: read registry, reconnect every instance best-effort (failures land as `status:error`
+ * but don't block app startup). On shutdown: close all connections cleanly so stdio
+ * subprocesses exit instead of leaking. Tool calls route here from the AgentRunner's tools[]
+ * array via `tools-adapter.ts`.
+ *
+ * Every instance uses OAuth — there is no API-key path. The `connectViaOAuth` entry point runs
+ * the full PKCE/browser/code-exchange flow, persists the grant, applies the catalog's transport
+ * template (which substitutes the fresh access_token into env / headers), and brings the live
+ * MCP connection up. Tokens are lazily refreshed at boot / refresh-tools / reconnect; mid-call
+ * expiry surfaces as a tool error and the user re-clicks "刷新工具".
+ */
+import * as crypto from 'node:crypto';
+
+import * as registry from './registry';
+import { McpConnection } from './mcp-client';
+import { findCatalogEntry } from './catalog';
+import { applyTemplate } from './apply-template';
+import { startOAuth, refreshIfStale } from './oauth';
+import { startMcpDcrOAuth, refreshDcrIfStale } from './oauth-dcr';
+import { createLogger } from '../../logger';
+import type { CatalogEntry, ConnectorInstance, OAuthGrant, ToolSchema, Transport } from './types';
+
+const log = createLogger('connectors:manager');
+
+const _conns = new Map<string, McpConnection>();
+let _bootedFor: string | null = null;
+
+/** Per-instance in-flight refresh dedupe. **Why:** OAuth refresh_tokens (GitHub App `ghr_*`,
+ *  Notion DCR, etc.) ROTATE on every successful exchange — the old token is invalidated the
+ *  moment the provider issues a new one. Two concurrent `_resolveTransport` calls (e.g. two
+ *  parallel `call_connector_tool` invocations from one model turn, or `bootstrap` racing with
+ *  a user-triggered tool call) would both POST the SAME stale refresh_token; the first wins
+ *  and rotates → the second hits `bad_refresh_token` → its catch branch writes
+ *  `status:error` → the connector is permanently broken until the user re-authorizes. The
+ *  Map<instanceId, Promise<OAuthGrant>> coalesces concurrent callers onto a single in-flight
+ *  request; subsequent calls await the same Promise, get the same new grant, and proceed
+ *  identically. Lock entries auto-clear in the `finally` block so a failed refresh doesn't
+ *  jam the slot. */
+const _refreshLocks = new Map<string, Promise<OAuthGrant>>();
+
+const REFRESH_BUFFER_MS = 5 * 60 * 1000;
+
+function _now(): number { return Date.now(); }
+function _nowIso(): string { return new Date().toISOString(); }
+
+/** Non-reversible token fingerprint for diagnostic logs. Twelve SHA-256 hex chars are enough
+ *  to correlate PC + Server events without leaking a usable token prefix. */
+function _tokPrefix(t: string | null | undefined): string {
+  if (!t) return 'none';
+  return crypto.createHash('sha256').update(t).digest('hex').slice(0, 12);
+}
+
+/** Refresh the access_token if stale, dedupe concurrent callers, and persist the rotated grant
+ *  atomically before returning. After taking the lock we re-READ the instance from disk —
+ *  another caller that just released the lock may have written a new grant; using the caller's
+ *  in-memory `inst` snapshot would re-trigger an unnecessary (and stale-token-using!) refresh.
+ *
+ *  Diagnostic logging: every refresh attempt prints the RT fingerprint being sent so a future
+ *  `bad_refresh_token` failure can be correlated with the exchange/refresh that originally
+ *  issued that RT. Rotation (old → new RT fingerprint) is also logged so we can verify the new
+ *  RT actually made it onto disk via the post-write read-back in `registry._writeSync`. */
+async function _refreshGrantIfStale(uid: string, entry: CatalogEntry, instId: string): Promise<OAuthGrant> {
+  const existing = _refreshLocks.get(instId);
+  if (existing) {
+    log.info('refresh dedupe hit', { id: instId });
+    return existing;
+  }
+  const p = (async () => {
+    try {
+      const inst = registry.load(uid).connections[instId];
+      if (!inst) throw new Error('instance not found');
+      if (!inst.oauth_grant) throw new Error('no oauth_grant');
+      // Already fresh? Skip the remote call entirely.
+      if (inst.oauth_grant.expires_at && inst.oauth_grant.expires_at - Date.now() > REFRESH_BUFFER_MS) {
+        return inst.oauth_grant;
+      }
+      const oldRt = inst.oauth_grant.refresh_token;
+      log.info('refresh attempt', {
+        id: instId,
+        auth_mode: entry.auth_mode,
+        rt_prefix: _tokPrefix(oldRt),
+        at_prefix: _tokPrefix(inst.oauth_grant.access_token),
+        expires_at_ms: inst.oauth_grant.expires_at,
+        ms_until_expiry: inst.oauth_grant.expires_at ? inst.oauth_grant.expires_at - Date.now() : null,
+      });
+      let next: OAuthGrant;
+      try {
+        if (entry.auth_mode === 'mcp_dcr') {
+          if (!inst.dcr_client) throw new Error('DCR instance missing dcr_client credentials');
+          next = await refreshDcrIfStale(inst.dcr_client, inst.oauth_grant);
+        } else {
+          next = await refreshIfStale(uid, entry, inst.oauth_grant);
+        }
+      } catch (err) {
+        log.warn('refresh upstream failed', {
+          id: instId,
+          rt_sent: _tokPrefix(oldRt),
+          error: (err as Error).message,
+        });
+        throw err;
+      }
+      const rotated = oldRt !== next.refresh_token;
+      log.info('refresh ok', {
+        id: instId,
+        old_rt: _tokPrefix(oldRt),
+        new_rt: _tokPrefix(next.refresh_token),
+        new_at: _tokPrefix(next.access_token),
+        rotated,
+        new_expires_at_ms: next.expires_at,
+      });
+      // Persist the rotated grant inside the lock so the next caller's re-read sees it. Use
+      // `update(patch)` not `upsert(snapshot)` — concurrent writers (status updates from a
+      // different code path) must not be clobbered by a stale field-set spread.
+      if (next !== inst.oauth_grant) {
+        try {
+          await registry.update(uid, instId, (cur) => ({
+            ...cur,
+            oauth_grant: next,
+            updated_at: _nowIso(),
+          }));
+          log.info('refresh grant persisted', {
+            id: instId,
+            new_rt: _tokPrefix(next.refresh_token),
+          });
+        } catch (err) {
+          log.error('refresh grant persist FAILED — disk RT now diverged from server', {
+            id: instId,
+            new_rt_on_server: _tokPrefix(next.refresh_token),
+            error: (err as Error).message,
+          });
+          throw err;
+        }
+      }
+      return next;
+    } finally {
+      _refreshLocks.delete(instId);
+    }
+  })();
+  _refreshLocks.set(instId, p);
+  return p;
+}
+
+async function _resolveTransport(uid: string, inst: ConnectorInstance): Promise<{ transport: Transport; grant: OAuthGrant } | null> {
+  const entry = findCatalogEntry(inst.id);
+  if (!entry) {
+    log.warn('catalog entry missing for instance', { id: inst.id });
+    return null;
+  }
+  if (!inst.oauth_grant) {
+    log.warn('instance has no oauth_grant', { id: inst.id });
+    return null;
+  }
+  let grant: OAuthGrant;
+  try {
+    grant = await _refreshGrantIfStale(uid, entry, inst.id);
+  } catch (err) {
+    log.warn('refresh failed', { id: inst.id, error: (err as Error).message });
+    throw err;
+  }
+  const transport = applyTemplate(entry, grant);
+  return { transport, grant };
+}
+
+/** Atomic patch of the per-instance status field. Used in every error / success branch below
+ *  instead of `registry.upsert(snapshot)` to avoid clobbering fields written concurrently by
+ *  the refresh path (most importantly `oauth_grant`). When the row was deleted between entry
+ *  and patch (`removeInstance` raced us), `update` returns null and we fall back to the caller's
+ *  stale `inst` — harmless since nobody downstream looks up by id again. */
+async function _patchStatus(
+  uid: string,
+  inst: ConnectorInstance,
+  patch: (cur: ConnectorInstance) => ConnectorInstance,
+): Promise<ConnectorInstance> {
+  const updated = await registry.update(uid, inst.id, patch);
+  return updated ?? inst;
+}
+
+async function _connectAndCacheTools(uid: string, inst: ConnectorInstance): Promise<ConnectorInstance> {
+  let transport: Transport;
+  try {
+    const resolved = await _resolveTransport(uid, inst);
+    if (!resolved) {
+      return _patchStatus(uid, inst, (cur) => ({
+        ...cur,
+        status: { kind: 'error', message: 'transport unresolved', at: _now() },
+        updated_at: _nowIso(),
+      }));
+    }
+    transport = resolved.transport;
+  } catch (err) {
+    return _patchStatus(uid, inst, (cur) => ({
+      ...cur,
+      status: { kind: 'error', message: (err as Error).message, at: _now() },
+      updated_at: _nowIso(),
+    }));
+  }
+  const conn = new McpConnection(inst.id, transport);
+  try {
+    await conn.connect();
+    const tools = await conn.listTools();
+    _conns.set(inst.id, conn);
+    return _patchStatus(uid, inst, (cur) => ({
+      ...cur,
+      transport,
+      tools_cache: tools,
+      tools_cached_at: _now(),
+      status: { kind: 'connected', since: _now() },
+      updated_at: _nowIso(),
+    }));
+  } catch (err) {
+    log.warn('connect+list failed', { id: inst.id, error: (err as Error).message });
+    try { await conn.close(); } catch { /* swallow */ }
+    return _patchStatus(uid, inst, (cur) => ({
+      ...cur,
+      status: { kind: 'error', message: (err as Error).message, at: _now() },
+      updated_at: _nowIso(),
+    }));
+  }
+}
+
+export async function bootstrap(uid: string): Promise<void> {
+  if (!uid || _bootedFor === uid) return;
+  _bootedFor = uid;
+  const file = registry.load(uid);
+  const ids = Object.keys(file.connections);
+  if (!ids.length) {
+    log.info('no connectors to bootstrap');
+    return;
+  }
+  await Promise.all(ids.map((id) => _connectAndCacheTools(uid, file.connections[id]).catch(() => {})));
+  const connected = Array.from(_conns.values()).filter((c) => c.isConnected).length;
+  log.info('connectors bootstrap done', { total: ids.length, connected });
+}
+
+export function listInstances(uid: string): ConnectorInstance[] {
+  if (!uid) return [];
+  const file = registry.load(uid);
+  return Object.values(file.connections).sort((a, b) =>
+    (a.display_name || a.id).localeCompare(b.display_name || b.id, undefined, {
+      sensitivity: 'base',
+      numeric: true,
+    }),
+  );
+}
+
+export function getInstance(uid: string, id: string): ConnectorInstance | null {
+  if (!uid) return null;
+  const file = registry.load(uid);
+  return file.connections[id] || null;
+}
+
+/** Drive the full OAuth flow for a catalog entry and bring the resulting MCP connection up.
+ *  This is the **only** public install path — there is no free-form / API-key entry point.
+ *  Dispatches to server-bridge or DCR depending on `entry.auth_mode`. */
+export async function connectViaOAuth(uid: string, catalogId: string): Promise<ConnectorInstance> {
+  if (!uid) throw new Error('uid required');
+  const entry = findCatalogEntry(catalogId);
+  if (!entry) throw new Error('unknown catalog id');
+
+  log.info('connectViaOAuth: starting OAuth', { catalog_id: catalogId, auth_mode: entry.auth_mode });
+  let grant: OAuthGrant;
+  let dcrClient: ConnectorInstance['dcr_client'];
+  if (entry.auth_mode === 'mcp_dcr') {
+    const result = await startMcpDcrOAuth(uid, entry);
+    grant = result.grant;
+    dcrClient = result.client;
+  } else {
+    if (!entry.oauth) throw new Error(`'${catalogId}' has no oauth config`);
+    grant = await startOAuth(uid, entry);
+  }
+
+  // Bundle entry: one OAuth flow (the Server returns a grant with union scopes) → provision N
+  // member instances, each with its own transport and a deep-cloned grant. The bundle entry
+  // itself has `transport_template: null` and never becomes an instance — see CatalogEntry's
+  // `bundle_member_ids` doc.
+  if (entry.bundle_member_ids?.length) {
+    log.info('connectViaOAuth: bundle — provisioning members', {
+      bundle: catalogId,
+      members: entry.bundle_member_ids,
+    });
+    let firstMember: ConnectorInstance | null = null;
+    for (const memberId of entry.bundle_member_ids) {
+      const memberEntry = findCatalogEntry(memberId);
+      if (!memberEntry) { log.warn('bundle member missing from catalog', { memberId }); continue; }
+      if (!memberEntry.transport_template) { log.warn('bundle member has no transport template', { memberId }); continue; }
+      // Deep-clone so each member's `_refreshGrantIfStale` mutates its own copy when the token
+      // rotates. They independently re-hit the refresh endpoint (slight waste, ~5 refreshes/h
+      // per user — acceptable); the alternative is a shared refresh lock keyed by `refresh_token`
+      // which is a bigger lifecycle change.
+      const memberGrant: OAuthGrant = JSON.parse(JSON.stringify(grant));
+      const member = await _provisionMemberInstance(uid, memberEntry, memberGrant, dcrClient);
+      if (!firstMember) firstMember = member;
+    }
+    if (!firstMember) throw new Error('bundle produced no member instances');
+    return firstMember;  // renderer reloads the full list after; the return value is informational
+  }
+
+  if (!entry.transport_template) {
+    throw new Error(`'${catalogId}' is not installable yet (${entry.unavailable_reason || 'unavailable'})`);
+  }
+  log.info('connectViaOAuth: OAuth done; spawning MCP server', { catalog_id: catalogId });
+  return _provisionMemberInstance(uid, entry, grant, dcrClient);
+}
+
+/** Provision (or replace) a single instance for a non-bundle catalog entry. Pulled out of
+ *  `connectViaOAuth` so the bundle branch can loop over members. Caller has already obtained
+ *  the OAuth grant. */
+async function _provisionMemberInstance(
+  uid: string,
+  entry: CatalogEntry,
+  grant: OAuthGrant,
+  dcrClient: ConnectorInstance['dcr_client'],
+): Promise<ConnectorInstance> {
+  const transport = applyTemplate(entry, grant);
+
+  // Tear down any prior live connection for the same id before re-using the slot.
+  const prior = _conns.get(entry.id);
+  if (prior) {
+    try { await prior.close(); } catch { /* swallow */ }
+    _conns.delete(entry.id);
+  }
+
+  const draft: ConnectorInstance = {
+    id: entry.id,
+    display_name: entry.display_name,
+    transport,
+    enabled_subtools: null,
+    tools_cache: [],
+    tools_cached_at: 0,
+    status: { kind: 'connecting' },
+    oauth_grant: grant,
+    ...(dcrClient ? { dcr_client: dcrClient } : {}),
+    created_at: _nowIso(),
+    updated_at: _nowIso(),
+  };
+  // Diagnostic: capture which RT just got issued by the provider so a later refresh failure
+  // can be matched against this exchange (the `_refreshGrantIfStale` logs print the same
+  // _tokPrefix fingerprint — `bad_refresh_token` mid-day means the on-disk RT no longer matches
+  // what the provider has on record; correlating fingerprints pinpoints whether the write here
+  // didn't land or got overwritten by another path).
+  log.info('provision: fresh grant from exchange', {
+    id: entry.id,
+    rt_prefix: _tokPrefix(grant.refresh_token),
+    at_prefix: _tokPrefix(grant.access_token),
+    expires_at_ms: grant.expires_at,
+    has_dcr_client: !!dcrClient,
+  });
+  await registry.upsert(uid, draft);
+  return _connectAndCacheTools(uid, draft);
+}
+
+export async function removeInstance(uid: string, id: string): Promise<boolean> {
+  if (!uid) return false;
+  const conn = _conns.get(id);
+  if (conn) {
+    try { await conn.close(); } catch { /* swallow */ }
+    _conns.delete(id);
+  }
+  return registry.remove(uid, id);
+}
+
+export async function refreshTools(uid: string, id: string): Promise<ToolSchema[]> {
+  if (!uid) throw new Error('uid required');
+  const inst = getInstance(uid, id);
+  if (!inst) throw new Error('instance not found');
+  // Force refresh-token check by tearing the live conn down and reconnecting through
+  // _connectAndCacheTools (which re-resolves transport with a fresh access_token).
+  const prior = _conns.get(id);
+  if (prior) {
+    try { await prior.close(); } catch { /* swallow */ }
+    _conns.delete(id);
+  }
+  const updated = await _connectAndCacheTools(uid, inst);
+  return updated.tools_cache;
+}
+
+export async function setEnabledSubtools(
+  uid: string,
+  id: string,
+  subset: string[] | null,
+): Promise<ConnectorInstance | null> {
+  if (!uid) return null;
+  return registry.update(uid, id, (cur) => ({
+    ...cur,
+    enabled_subtools: subset,
+    updated_at: _nowIso(),
+  }));
+}
+
+export async function callTool(
+  uid: string,
+  id: string,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<unknown> {
+  if (!uid) throw new Error('uid required');
+  const inst = getInstance(uid, id);
+  if (!inst) throw new Error('instance not found');
+  // Stale-token guard: the transport snapshots the bearer at connect time (for streamable-http)
+  // or injects it into env at spawn time (for stdio). A long-lived connection past the
+  // `expires_at` deadline will keep using the dead token on every request — fine for short-lived
+  // chats (1h Gmail TTL is rarely exceeded inside one conversation) but breaks "leave PC open
+  // overnight" use cases. Detect staleness, tear down + reconnect; `_resolveTransport` calls
+  // `_refreshGrantIfStale` which rotates the token before applyTemplate rebuilds the transport
+  // with the fresh one. Same `REFRESH_BUFFER_MS` window the refresh path uses.
+  const grant = inst.oauth_grant;
+  const stale = !!(grant && grant.expires_at && grant.expires_at - Date.now() <= REFRESH_BUFFER_MS);
+  let conn = _conns.get(id);
+  if (stale && conn) {
+    log.info('grant stale → tearing down to refresh on reconnect', { id });
+    try { await conn.close(); } catch { /* swallow */ }
+    _conns.delete(id);
+    conn = undefined;
+  }
+  if (!conn || !conn.isConnected) {
+    const resolved = await _resolveTransport(uid, inst);
+    if (!resolved) throw new Error('transport unresolved');
+    conn = new McpConnection(id, resolved.transport);
+    await conn.connect();
+    _conns.set(id, conn);
+  }
+  return conn.callTool(name, args);
+}
+
+export async function shutdownAll(): Promise<void> {
+  const all = Array.from(_conns.values());
+  _conns.clear();
+  await Promise.all(all.map((c) => c.close().catch(() => {})));
+  _bootedFor = null;
+}

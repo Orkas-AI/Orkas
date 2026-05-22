@@ -136,4 +136,25 @@ describe('prompts ↔ code contract', () => {
     expect(commanderPrompt).not.toMatch(/Even when the built-in PDF tools error, do not fall back/i);
     expect(agentPrompt).not.toMatch(/Even when the built-in PDF tools error, do not fall back/i);
   });
+
+  it('agent authoring and execution prompts distinguish skills from tools', () => {
+    const agentPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_agent_in_group.md'), 'utf-8');
+
+    expect(agentPrompt).toContain('Skills are not tools');
+    expect(agentPrompt).toContain('do NOT attempt a tool call with the skill');
+  });
+
+  it('authoring prompt shells leave category field rules to creator skills', () => {
+    const authoringPrompts = [
+      'chat_commander.md',
+      'chat_agent_setup.md',
+      'chat_agent_setup_cli.md',
+      'chat_skill_setup.md',
+    ].map((name) => fs.readFileSync(path.join(PROMPTS_DIR, name), 'utf-8'));
+    for (const prompt of authoringPrompts) {
+      expect(prompt).not.toContain('Required category');
+      expect(prompt).not.toContain('$category_field_definition');
+      expect(prompt).not.toMatch(/education.*ecommerce.*rnd.*writing.*data.*general/s);
+    }
+  });
 });

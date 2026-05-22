@@ -1,16 +1,15 @@
 /**
  * i18n — minimal lookup for main-side user-facing strings.
  *
- * Two locales only: `zh` (简体中文) / `en` (English). Tables live in
- * `src/main/locales/{zh,en}.json` as flat key → string maps (dot-separated
- * keys like `errors.not_utf8`).
+ * Tables live in `src/main/locales/*.json` as flat key → string maps
+ * (dot-separated keys like `errors.not_utf8`).
  *
  * Lookup order: current lang → `en` → raw key (so missing keys stand out in
  * UI instead of going silently blank).
  *
  * Used by features/* to produce localized `error` fields returned to the
- * renderer. LLM prompts, logs, and telemetry remain in their source language
- * and are NOT routed through here.
+ * renderer. LLM prompts and logs remain in their source language and are
+ * NOT routed through here.
  */
 
 import * as path from 'node:path';
@@ -18,20 +17,100 @@ import * as fs from 'node:fs';
 
 import { SRC_ROOT } from './paths';
 
-export type Lang = 'zh' | 'en';
-export const SUPPORTED_LANGS: readonly Lang[] = ['zh', 'en'] as const;
+export type Lang = 'zh' | 'en' | 'ja';
+
+export interface LocaleMeta {
+  code: Lang;
+  label: string;
+  htmlLang: string;
+  intlLocale: string;
+  llmName: string;
+  fallback: Lang | null;
+}
+
+export const LOCALES: readonly LocaleMeta[] = [
+  {
+    code: 'zh',
+    label: '简体中文',
+    htmlLang: 'zh-CN',
+    intlLocale: 'zh-CN',
+    llmName: 'Chinese (简体中文)',
+    fallback: 'en',
+  },
+  {
+    code: 'en',
+    label: 'English',
+    htmlLang: 'en',
+    intlLocale: 'en-US',
+    llmName: 'English',
+    fallback: null,
+  },
+  {
+    code: 'ja',
+    label: '日本語',
+    htmlLang: 'ja',
+    intlLocale: 'ja-JP',
+    llmName: 'Japanese (日本語)',
+    fallback: 'en',
+  },
+] as const;
+
+export const SUPPORTED_LANGS: readonly Lang[] = LOCALES.map((l) => l.code);
+const LOCALE_BY_CODE: Readonly<Record<Lang, LocaleMeta>> = LOCALES.reduce((acc, meta) => {
+  acc[meta.code] = meta;
+  return acc;
+}, {} as Record<Lang, LocaleMeta>);
 
 export function isLang(v: unknown): v is Lang {
-  return v === 'zh' || v === 'en';
+  return typeof v === 'string' && SUPPORTED_LANGS.includes(v as Lang);
+}
+
+export function normalizeLang(rawLocale: unknown): Lang | null {
+  const s = typeof rawLocale === 'string' ? rawLocale.trim().toLowerCase() : '';
+  if (!s) return null;
+  for (const lang of SUPPORTED_LANGS) {
+    if (s === lang || s.startsWith(`${lang}-`) || s.startsWith(`${lang}_`)) return lang;
+  }
+  return null;
+}
+
+export function getLocaleMeta(lang: Lang): LocaleMeta {
+  return LOCALE_BY_CODE[lang] ?? LOCALE_BY_CODE.en;
+}
+
+export function acceptLanguageHeader(lang: Lang): string {
+  const parts: string[] = [];
+  for (const [idx, candidate] of fallbackChain(lang).entries()) {
+    const meta = getLocaleMeta(candidate);
+    const q = idx === 0 ? '' : `;q=${Math.max(0.1, 0.9 - idx * 0.1).toFixed(1)}`;
+    parts.push(`${meta.intlLocale}${q}`);
+    if (candidate !== meta.intlLocale.split('-')[0]) parts.push(`${candidate}${q}`);
+  }
+  return parts.join(',');
+}
+
+export function fallbackChain(lang: Lang): Lang[] {
+  const out: Lang[] = [];
+  const seen = new Set<Lang>();
+  let cur: Lang | null = lang;
+  while (cur && !seen.has(cur)) {
+    out.push(cur);
+    seen.add(cur);
+    cur = getLocaleMeta(cur).fallback;
+  }
+  return out;
+}
+
+export function descriptionLang(lang: Lang): 'zh' | 'en' {
+  return lang === 'zh' ? 'zh' : 'en';
 }
 
 /**
- * Map an Electron `app.getLocale()` / BCP-47 tag to our two-locale space.
- * Anything starting with `zh` → `zh`; everything else → `en`.
+ * Map an Electron `app.getLocale()` / BCP-47 tag to the supported UI language
+ * space. Unknown input falls back to English.
  */
 export function detectSystemLang(rawLocale: unknown): Lang {
-  const s = typeof rawLocale === 'string' ? rawLocale.trim().toLowerCase() : '';
-  return s.startsWith('zh') ? 'zh' : 'en';
+  return normalizeLang(rawLocale) ?? 'en';
 }
 
 // ── Table loading ────────────────────────────────────────────────────────
@@ -61,10 +140,10 @@ function loadTable(lang: Lang): Table {
 
 /** Clear cached tables; test-only — app code never needs this. */
 export function _resetCacheForTests(): void {
-  _tables.zh = undefined;
-  _tables.en = undefined;
-  _rendererTables.zh = undefined;
-  _rendererTables.en = undefined;
+  for (const lang of SUPPORTED_LANGS) {
+    _tables[lang] = undefined;
+    _rendererTables[lang] = undefined;
+  }
 }
 
 // ── Renderer-side tables (shipped under src/renderer/locales/) ───────────
@@ -92,12 +171,11 @@ function loadRendererTable(lang: Lang): Table {
   return table;
 }
 
-/** Returns both renderer tables for the renderer-side i18n module. */
-export function getRendererTables(): { zh: Table; en: Table } {
-  return {
-    zh: loadRendererTable('zh'),
-    en: loadRendererTable('en'),
-  };
+/** Returns all renderer tables for the renderer-side i18n module. */
+export function getRendererTables(): Record<Lang, Table> {
+  const out = {} as Record<Lang, Table>;
+  for (const lang of SUPPORTED_LANGS) out[lang] = loadRendererTable(lang);
+  return out;
 }
 
 // ── Current lang ─────────────────────────────────────────────────────────
@@ -105,6 +183,7 @@ let _current: Lang = 'en';
 
 export function setCurrentLang(lang: Lang): void {
   _current = lang;
+  try { process.env.ORKAS_ACCEPT_LANGUAGE = acceptLanguageHeader(lang); } catch { /* non-node test harness */ }
 }
 
 export function getCurrentLang(): Lang {
@@ -117,13 +196,8 @@ export function getCurrentLang(): Lang {
 // runtime injection) — this is the most volatile part of the prompt, so
 // keeping it last avoids invalidating the KV-cache prefix.
 
-const LANG_NAMES: Record<Lang, string> = {
-  zh: 'Chinese (简体中文)',
-  en: 'English',
-};
-
 export function buildLanguageDirective(lang: Lang = _current): string {
-  const name = LANG_NAMES[lang] ?? LANG_NAMES.en;
+  const name = getLocaleMeta(lang).llmName;
   return [
     '## User language',
     '',
@@ -147,10 +221,12 @@ export function buildLanguageDirective(lang: Lang = _current): string {
  */
 export function t(key: string, vars?: Record<string, string | number>, lang?: Lang): string {
   const primary = lang && isLang(lang) ? lang : _current;
-  const fromPrimary = loadTable(primary)[key];
-  const raw = fromPrimary != null
-    ? fromPrimary
-    : (primary === 'en' ? key : (loadTable('en')[key] ?? key));
+  let raw: string | undefined;
+  for (const candidate of fallbackChain(primary)) {
+    raw = loadTable(candidate)[key];
+    if (raw != null) break;
+  }
+  raw = raw ?? key;
   if (!vars) return raw;
   return raw.replace(/\{(\w+)\}/g, (m, name: string) => {
     const v = vars[name];

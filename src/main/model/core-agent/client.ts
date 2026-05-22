@@ -68,6 +68,54 @@ function buildSkillSandboxEnv(): Record<string, string> {
   return _skillSandboxEnv;
 }
 
+type ActiveSessionAbort = {
+  abort: () => void;
+};
+
+const activeSessionAborts = new Map<string, Set<ActiveSessionAbort>>();
+
+function addActiveSessionAbort(sessionId: string, entry: ActiveSessionAbort): void {
+  let set = activeSessionAborts.get(sessionId);
+  if (!set) {
+    set = new Set();
+    activeSessionAborts.set(sessionId, set);
+  }
+  set.add(entry);
+}
+
+function removeActiveSessionAbort(sessionId: string, entry: ActiveSessionAbort): void {
+  const set = activeSessionAborts.get(sessionId);
+  if (!set) return;
+  set.delete(entry);
+  if (set.size === 0) activeSessionAborts.delete(sessionId);
+}
+
+export function abortActiveSession(sessionId: string): number {
+  const set = activeSessionAborts.get(sessionId);
+  if (!set || set.size === 0) return 0;
+  let count = 0;
+  for (const entry of Array.from(set)) {
+    try {
+      entry.abort();
+      count += 1;
+    } catch { /* already aborted */ }
+  }
+  return count;
+}
+
+export function abortActiveSessionsForConversation(cid: string): number {
+  if (!cid) return 0;
+  let count = 0;
+  const commanderSession = `gconv-${cid}`;
+  const memberPrefix = `gmember-${cid}-`;
+  for (const sessionId of Array.from(activeSessionAborts.keys())) {
+    if (sessionId === commanderSession || sessionId.startsWith(memberPrefix)) {
+      count += abortActiveSession(sessionId);
+    }
+  }
+  return count;
+}
+
 /**
  * Stream chat using core-agent. Yields the same events as the openclaw
  * client so existing consumers don't care which backend is live.
@@ -75,7 +123,7 @@ function buildSkillSandboxEnv(): Record<string, string> {
 export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<StreamEvent, void, unknown> {
   const {
     userId, message,
-    sessionId = `${userId}-anon-${genConversationId().slice(0, 8)}`,
+    sessionId = `anon-${genConversationId().slice(0, 8)}`,
     systemPrompt,
     workingDir,
     images,
@@ -91,6 +139,9 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     projectId,
     onFileWritten,
     hasProducedPath,
+    onArtifactCreated,
+    onSkillAdvertised,
+    onSkillInvoked,
     cacheRetention,
     thinkingLevel,
   } = opts;
@@ -144,6 +195,17 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   let idleTimer: NodeJS.Timeout | null = null;
   let idleHit = false;
   let externalAbort = false;
+  let directSessionAbort = false;
+  const activeAbortEntry: ActiveSessionAbort = {
+    abort: () => {
+      directSessionAbort = true;
+      log.info(`direct session abort ${turnTag} — releasing locks immediately`);
+      controller.abort();
+      releaseSlotOnce('session-abort');
+      releaseSessionOnce('session-abort');
+    },
+  };
+  addActiveSessionAbort(sessionId, activeAbortEntry);
 
   const resetIdle = () => {
     if (idleTimer) clearTimeout(idleTimer);
@@ -186,6 +248,9 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(readOnlyExtraRoots && readOnlyExtraRoots.length ? { readOnlyExtraRoots } : {}),
       ...(onFileWritten ? { onFileWritten } : {}),
       ...(hasProducedPath ? { hasProducedPath } : {}),
+      ...(onArtifactCreated ? { onArtifactCreated } : {}),
+      ...(onSkillAdvertised ? { onSkillAdvertised } : {}),
+      ...(onSkillInvoked ? { onSkillInvoked } : {}),
     });
     const { runner, providerId, modelId } = built;
 
@@ -230,12 +295,11 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     }
     log.info(`turn end ${turnTag} events=${eventCount} err=${errText ? 'yes' : 'no'}`);
 
-    // Metacognitive reflection is no longer triggered per-turn — it now
-    // runs once at app startup with a per-agent cooldown. See
-    // `features/reflection-trigger.ts`.
+    // Metacognitive reflection runs from the background orchestrator on a
+    // 12h cycle (see `features/reflection-orchestrator.ts`); no per-turn hook.
     void agentRunResult;
 
-    if (externalAbort) {
+    if (externalAbort || directSessionAbort) {
       // mapCoreAgentEvents may have already yielded 'error: empty response'
       // for the short-circuit; tag the stream as aborted for the client.
       yield { type: 'error', text: 'aborted', aborted: true };
@@ -244,10 +308,17 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       yield { type: 'error', text: errText };
     }
   } catch (err) {
-    errText = (err as Error).message || String(err);
-    log.error('stream error:', err);
-    yield { type: 'error', text: errText };
+    const wasAborted = externalAbort || directSessionAbort || (controller.signal.aborted && !idleHit);
+    errText = wasAborted ? 'aborted' : ((err as Error).message || String(err));
+    if (wasAborted) {
+      log.info(`stream aborted ${turnTag}`);
+      yield { type: 'error', text: errText, aborted: true };
+    } else {
+      log.error('stream error:', err);
+      yield { type: 'error', text: errText };
+    }
   } finally {
+    removeActiveSessionAbort(sessionId, activeAbortEntry);
     if (idleTimer) clearTimeout(idleTimer);
     if (abortSignal) abortSignal.removeEventListener?.('abort', onExternalAbort);
     // Heal orphan tool_use in the cached session before releasing the

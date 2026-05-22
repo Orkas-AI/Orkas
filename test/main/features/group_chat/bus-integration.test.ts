@@ -25,16 +25,30 @@ function _setScript(sessionId: string, events: any[]) {
 }
 function _resetScripts() { _scripts.clear(); }
 
+const modelAbortMock = vi.hoisted(() => vi.fn(() => 0));
+
 vi.mock('../../../../src/main/model/client', () => ({
   async *streamChatWithModel(opts: any) {
     const sid = opts.sessionId || '';
     const queue = _scripts.get(sid) || [];
     const events = queue.shift() || [{ type: 'final', text: '' }];
     _scripts.set(sid, queue);
-    for (const ev of events) yield ev;
+    for (const ev of events) {
+      if (ev?.type === '__wait_for_abort__') {
+        if (!opts.abortSignal?.aborted) {
+          await new Promise<void>((resolve) => {
+            opts.abortSignal?.addEventListener('abort', () => resolve(), { once: true });
+          });
+        }
+        yield { type: 'error', text: 'aborted', aborted: true };
+        continue;
+      }
+      yield ev;
+    }
     yield { type: 'done' };
   },
   async chatWithModel() { return { ok: true, text: '', error: '', aborted: false }; },
+  abortActiveSessionsForConversation: modelAbortMock,
 }));
 
 let tmpDir: string;
@@ -52,6 +66,8 @@ beforeEach(async () => {
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   _resetScripts();
+  modelAbortMock.mockClear();
+  modelAbortMock.mockReturnValue(0);
   vi.resetModules();
   const users = await import('../../../../src/main/features/users');
   users.activateUser(TEST_UID);
@@ -211,6 +227,15 @@ describe.skip('group_chat bus integration › multi-recipient parallel dispatch'
 });
 
 describe('group_chat bus integration › abort sticky across worker post-cleanup', () => {
+  it('abort also targets active core-agent sessions by conversation id', async () => {
+    const cid = newCid();
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+
+    await bus.abort(TEST_UID, cid);
+
+    expect(modelAbortMock).toHaveBeenCalledWith(cid);
+  });
+
   it('abort during a turn keeps state.aborted; subsequent worker reply does NOT un-stick', async () => {
     const cid = newCid();
     const state = await import('../../../../src/main/features/group_chat/state');
@@ -232,6 +257,44 @@ describe('group_chat bus integration › abort sticky across worker post-cleanup
     await bus.abort(TEST_UID, cid);
     // Wait long enough for any pending worker microtasks to settle.
     await new Promise((r) => setTimeout(r, 100));
+    const st = await state.readState(TEST_UID, cid);
+    expect(st.status).toBe('aborted');
+  });
+
+  it('abort during a live agent turn propagates to the worker AbortSignal', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+
+    bus.subscribe(TEST_UID, cid, () => {});
+    _setScript(state.buildGmemberSessionId(TEST_UID, cid, AGENT_ID), [
+      { type: '__wait_for_abort__' },
+      { type: 'final', text: 'should not appear after abort' },
+    ]);
+
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `@${AGENT_NAME} long task`,
+    });
+
+    const start = Date.now();
+    while (Date.now() - start < 1000) {
+      const live = bus._cidStateForTest(TEST_UID, cid);
+      const worker = live?.workers.get(AGENT_ID);
+      if (worker?.running && worker.abortController) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(bus._cidStateForTest(TEST_UID, cid)?.workers.get(AGENT_ID)?.abortController).toBeTruthy();
+
+    await bus.abort(TEST_UID, cid);
+    await waitForQuiescent(TEST_UID, cid, 2000);
+
+    const paths = await import('../../../../src/main/paths');
+    const storage = await import('../../../../src/main/storage');
+    const messages = await storage.readJsonl<any>(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`));
+    expect(messages.some((m: any) => m.text.includes('should not appear after abort'))).toBe(false);
     const st = await state.readState(TEST_UID, cid);
     expect(st.status).toBe('aborted');
   });

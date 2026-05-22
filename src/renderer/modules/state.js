@@ -12,8 +12,22 @@ let conversations = [];
 // key: cid, value: { loadingEl: HTMLElement | null, needsIndicator: bool,
 //                    controller: AbortController | null, aborted: bool }
 const pendingConvs = new Map();
+// Group-chat runtime state is emitted independently from the request
+// controller. Keep it in the same pending predicate so delegated agents keep
+// the send button in "replying/stop" mode until the whole turn is quiescent.
+const groupBusyConvs = new Map();
 
-function isConvPending(cid) { return pendingConvs.has(cid); }
+function isGroupConversationBusy(cid) { return groupBusyConvs.has(cid); }
+
+function setGroupConversationBusy(cid, busy) {
+  if (!cid) return;
+  if (busy) groupBusyConvs.set(cid, true);
+  else groupBusyConvs.delete(cid);
+}
+
+function isConvPending(cid) {
+  return pendingConvs.has(cid) || isGroupConversationBusy(cid);
+}
 
 // Per-conversation queued messages (sent sequentially, one at a time).
 // key: cid, value: Array<{ id, content, skill }>
@@ -31,6 +45,20 @@ const pollMsgCounts = new Map(); // cid → last known message count
 // `loadConversationHistory` call. True for conversations with no agent_id.
 const convAgentEnabledByCid = new Map();
 
+// Backend `/api/conversations/<cid>/history` returns raw GroupMessage
+// records (`{id, ts, from, to, text, ...}`) — NOT the legacy
+// `{role, content, time}` shape. `loadConversationHistory` translates via
+// `_groupMsgToLegacy`; the polling rescue path forgot to. Polling now
+// looks at `from` directly: anything not `'user'` is an assistant-side
+// reply (commander or any agent), and `from === 'user'` is a user
+// message. Without this, polling never recognised the agent's reply, so
+// the "thinking…" loadingEl created for mid-turn opens stayed pinned
+// forever (visible as a stuck `智能体 思考中…` bubble below the actual
+// reply — the symptom that surfaced once scheduled-task fires made the
+// "open conv mid-turn without a local ctrl" path common).
+function _isPolledAssistantMsg(m) { return !!(m && m.from && m.from !== 'user'); }
+function _isPolledUserMsg(m) { return !!(m && m.from === 'user'); }
+
 function startPolling(cid) {
   if (pollTimers.has(cid)) return;
   const timer = setInterval(async () => {
@@ -39,20 +67,47 @@ function startPolling(cid) {
       const res = await apiFetch(`/api/conversations/${cid}/history?limit=500`);
       const data = await res.json();
       if (!data.ok || !data.history) return;
-      const msgs = data.history;
+      const msgs = data.history.filter((m) => !(m && m.dispatch));
       const last = msgs[msgs.length - 1];
       const known = pollMsgCounts.get(cid) || 0;
+      const hasServerRuntime = !!data.conversation
+        && Object.prototype.hasOwnProperty.call(data.conversation, 'processing');
+      const runtimeBusy = hasServerRuntime
+        ? data.conversation.processing === true
+        : isGroupConversationBusy(cid);
+      if (runtimeBusy && cid === currentCid && window.PlanRail) {
+        try { window.PlanRail.refresh(cid, { force: true }); } catch (_) {}
+      }
 
-      if (msgs.length > known && last?.role === 'assistant') {
-        // New assistant message arrived
+      if (msgs.length > known && _isPolledAssistantMsg(last)) {
+        // New visible assistant message arrived. During plan execution this
+        // may be a mid-turn announcement while other actors are still
+        // running; reloading history then detaches live placeholders and
+        // makes bubbles flash. Treat polling as rescue only once runtime is
+        // idle; the live stream owns in-flight DOM updates.
+        if (runtimeBusy) {
+          const recovered = await window.ConversationRuntime?.recoverPolledMessages?.(cid, msgs);
+          if (recovered) pollMsgCounts.set(cid, msgs.length);
+          return;
+        }
         pollMsgCounts.set(cid, msgs.length);
         stopPolling(cid);
-        _onPolledResponse(cid, last.content);
+        _onPolledResponse(cid, last);
+        return;
+      }
+
+      // Local busy state can outlive the IPC stream if the renderer missed the
+      // terminal state_changed event. Once main says runtime is idle, use the
+      // persisted last assistant message to settle any leftover placeholder.
+      if (!runtimeBusy && isConvPending(cid) && _isPolledAssistantMsg(last)) {
+        pollMsgCounts.set(cid, msgs.length);
+        stopPolling(cid);
+        _onPolledResponse(cid, last);
         return;
       }
 
       // If server is no longer processing but last message is still user → request was lost
-      if (last?.role === 'user' && data.conversation?.processing === false) {
+      if (_isPolledUserMsg(last) && data.conversation?.processing === false) {
         stopPolling(cid);
         _onPolledResponse(cid, t('chat.reply_interrupted'), true);
         return;
@@ -62,7 +117,7 @@ function startPolling(cid) {
       // model idle watchdog (10 min) + a small buffer. Shorter thresholds would
       // trip on genuine long agent runs.
       const since = data.conversation?.processing_since;
-      if (last?.role === 'user' && data.conversation?.processing === true && since) {
+      if (_isPolledUserMsg(last) && data.conversation?.processing === true && since) {
         const elapsedSec = (Date.now() - new Date(since).getTime()) / 1000;
         if (elapsedSec > 720) {
           stopPolling(cid);
@@ -79,9 +134,14 @@ function stopPolling(cid) {
   if (t) { clearInterval(t); pollTimers.delete(cid); }
 }
 
-function _onPolledResponse(cid, content, isError = false) {
+function _onPolledResponse(cid, contentOrMessage, isError = false) {
+  const polledMessage = contentOrMessage && typeof contentOrMessage === 'object'
+    ? contentOrMessage
+    : null;
+  const content = polledMessage ? (polledMessage.text || '') : contentOrMessage;
   const state = pendingConvs.get(cid);
   pendingConvs.delete(cid);
+  setGroupConversationBusy(cid, false);
   _updateConvSidebarBadge(cid, false);
 
   const el = state?.loadingEl;
@@ -100,7 +160,25 @@ function _onPolledResponse(cid, content, isError = false) {
       && finalEl.style.display !== 'none'
       && (finalEl.textContent || '').trim().length > 0;
     if (alreadyFinalized) {
-      // Stream already finalized this bubble in place — leave it alone.
+      // Stream already finalized this bubble in place. Leave it alone only
+      // when polling is reporting the same persisted message. If polling saw a
+      // later assistant record (common for plan-generated user forms emitted
+      // right after the commander's plan card), reload history so sidecar
+      // fields like `form` are mounted instead of silently disappearing.
+      const finalizedId = el.dataset.msgId || '';
+      const polledId = polledMessage?.id || '';
+      const sidecarMissing = !!polledMessage && (
+        (polledMessage.form && !el.querySelector('.chat-input-form'))
+        || (Array.isArray(polledMessage.produced) && polledMessage.produced.length && !el.querySelector('.chat-msg-produced'))
+        || (polledMessage.plan_announcement && !el.querySelector('.chat-plan-announce'))
+      );
+      if (polledId && (finalizedId !== polledId || sidecarMissing)) {
+        if (cid === currentCid) {
+          loadConversationHistory(cid);
+          _updateConvSendUI(cid);
+        }
+        return;
+      }
       if (cid === currentCid) _updateConvSendUI(cid);
       return;
     }
@@ -140,6 +218,8 @@ function bindStaticHandlers() {
   document.getElementById('new-chat-btn').addEventListener('click', () => setView('new-chat'));
   document.getElementById('agents-btn').addEventListener('click', () => setView('agents'));
   document.getElementById('skills-btn').addEventListener('click', () => setView('skills'));
+  document.getElementById('connectors-btn')?.addEventListener('click', () => setView('connectors'));
+  document.getElementById('apps-btn')?.addEventListener('click', () => setView('apps'));
   document.getElementById('contexts-btn').addEventListener('click', () => setView('contexts'));
   document.getElementById('settings-btn')?.addEventListener('click', () => setView('settings'));
 
@@ -200,14 +280,22 @@ function bindStaticHandlers() {
   // Agents (grid + detail)
   // "Done" button (only visible while editing) — exits edit mode.
   document.getElementById('create-agent-btn')?.addEventListener('click', () => openAgentModal());
+  document.getElementById('agents-more-btn')?.addEventListener('click', () => openMarketplace('agent'));
   document.getElementById('agents-back-btn')?.addEventListener('click', () => _showAgentsGridView());
   document.getElementById('agent-use-btn')?.addEventListener('click', () => {
     if (_selectedAgent) useAgent(_selectedAgent.id);
   });
   document.getElementById('agent-edit-btn')?.addEventListener('click', toggleAgentEditMode);
   document.getElementById('agent-delete-btn')?.addEventListener('click', deleteSelectedAgent);
-  document.getElementById('agent-promote-btn')?.addEventListener('click', () => {
-    if (_selectedAgent?.source === 'custom') promoteCustomAgent(_selectedAgent.id);
+  document.getElementById('agent-upload-marketplace-btn')?.addEventListener('click', () => {
+    // Upload is allowed for both custom AND builtin (dev mode) — same
+    // marketplace publishing flow per CLAUDE.md §11. The row-menu handler
+    // (agents.js) already does this; the detail-page handler had a stale
+    // `source === 'custom'` guard that silently swallowed clicks on builtin
+    // detail pages.
+    if (_selectedAgent && typeof openMarketplaceUpload === 'function') {
+      openMarketplaceUpload('agent', _selectedAgent.id);
+    }
   });
   document.getElementById('agent-chat-clear-btn')?.addEventListener('click', clearAgentChat);
   // Agent inline chat: only bind auto-grow here. Send/abort/Cmd+Enter are
@@ -232,13 +320,18 @@ function bindStaticHandlers() {
 
   // Skill buttons
   document.getElementById('create-skill-btn')?.addEventListener('click', () => openSkillModal());
+  document.getElementById('skills-more-btn')?.addEventListener('click', () => openMarketplace('skill'));
   document.getElementById('skill-use-btn')?.addEventListener('click', () => {
     if (_selectedSkill) useSkill(_selectedSkill.id, _selectedSkill.name);
   });
   document.getElementById('skill-edit-btn')?.addEventListener('click', toggleSkillEditMode);
   document.getElementById('skill-delete-btn')?.addEventListener('click', deleteSelectedSkill);
-  document.getElementById('skill-promote-btn')?.addEventListener('click', () => {
-    if (_selectedSkill?.source === 'custom') promoteCustomSkill(_selectedSkill.id);
+  document.getElementById('skill-upload-marketplace-btn')?.addEventListener('click', () => {
+    // Upload is allowed for both custom AND builtin (dev mode) — same as
+    // the agent upload handler above; see comment there.
+    if (_selectedSkill && typeof openMarketplaceUpload === 'function') {
+      openMarketplaceUpload('skill', _selectedSkill.id);
+    }
   });
   // Skill name editing is now wired inline by `_toggleSkillNameEditable`
   // (input + blur listeners attached on first edit-mode entry, gated by
@@ -299,4 +392,3 @@ function autoGrow(el, maxPx) {
   el.style.height = 'auto';
   el.style.height = Math.min(el.scrollHeight, maxPx) + 'px';
 }
-

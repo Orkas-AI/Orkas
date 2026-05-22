@@ -30,6 +30,12 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+// Register tsx/cjs so that any same-feature CJS require call resolves .ts
+// files under vitest. Without this hook vitest's plain-node CJS resolver
+// fails the require and chats.deleteConversation silently skips purgeGroupDir,
+// breaking the delete-cascade tests.
+import 'tsx/cjs';
+
 if (!process.env.ORKAS_WORKSPACE_ROOT) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-vitest-'));
   process.env.ORKAS_WORKSPACE_ROOT = tmp;

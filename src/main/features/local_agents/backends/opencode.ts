@@ -44,6 +44,10 @@ export const opencodeBackend: LocalBackend = {
     let resultStatus: 'completed' | 'failed' | undefined;
     let resultError: string | undefined;
     let observedSessionId: string | undefined;
+    // Most-recent per-step usage snapshot; step_finish events fire
+    // throughout the turn, each carrying the cumulative-so-far. We
+    // forward the latest as `done.usage` at termination.
+    let lastUsage: Record<string, number | string> | undefined;
 
     opts.onEvent({
       type: 'process-info',
@@ -70,13 +74,23 @@ export const opencodeBackend: LocalBackend = {
         const trimmed = line.trim();
         if (!trimmed) return;
         let obj: any;
-        try { obj = JSON.parse(trimmed); } catch { return; }
+        try { obj = JSON.parse(trimmed); }
+        catch {
+          // Non-NDJSON line on stdout — surface so users see CLI's
+          // own logging / startup banner instead of a silent gap.
+          opts.onEvent({ type: 'raw-line', line: trimmed });
+          return;
+        }
         const ev = mapOpencodeEvent(obj);
         if (ev?.captureSessionId) observedSessionId = ev.captureSessionId;
         if (ev?.event) {
           opts.onEvent(ev.event);
           if (ev.event.type === 'text-delta' && typeof (ev.event as any).text === 'string') {
             textOut += (ev.event as any).text as string;
+          }
+          if (ev.event.type === 'status' && (ev.event as any).status === 'usage') {
+            const u = (ev.event as any).usage;
+            if (u && typeof u === 'object') lastUsage = u;
           }
         }
         if (ev?.terminal) {
@@ -104,6 +118,7 @@ export const opencodeBackend: LocalBackend = {
           type: 'done', status,
           durationMs: Date.now() - startedAt,
           sessionId: observedSessionId,
+          ...(lastUsage ? { usage: lastUsage } : {}),
           ...extra,
         });
         resolve();
@@ -192,14 +207,75 @@ export function mapOpencodeEvent(obj: any):
       out!.terminal = { status: 'failed', error: String(msg) };
       return out;
     }
-    case 'step_finish':
-      // Token usage event; nothing to surface (we don't track usage
-      // for CLI calls in archive context yet).
+    case 'step_finish': {
+      // Carries per-step token usage. Surface as a status:'usage' event
+      // when we can pull numbers out, so the rail renders a live
+      // running counter; otherwise fall back to a debug log so users
+      // still see that a step completed.
+      const usage = extractOpencodeUsage(obj.part || obj);
+      if (usage) {
+        out!.event = { type: 'status', status: 'usage', usage };
+      } else {
+        out!.event = {
+          type: 'log',
+          level: 'debug',
+          message: `step_finish: ${JSON.stringify(obj.part || obj).slice(0, 160)}`,
+          source: 'opencode',
+        };
+      }
       return out;
+    }
     case 'step_start':
       out!.event = { type: 'status', status: 'running' };
       return out;
     default:
+      // Genuinely unknown opencode event — keep visible at level=info
+      // so we notice when the wire format drifts (matches the codex
+      // treatment).
+      if (typeof obj.type === 'string' && obj.type) {
+        out!.event = {
+          type: 'log',
+          level: 'info',
+          message: `${obj.type}: ${JSON.stringify(obj).slice(0, 200)}`,
+          source: 'opencode',
+        };
+        return out;
+      }
       return out!.captureSessionId ? out : undefined;
   }
+}
+
+/** Extract token usage from an opencode `step_finish` event's `part`
+ *  block. Opencode's wire format isn't entirely stable across versions;
+ *  we accept the shapes observed in practice (tokens nested under
+ *  `tokens.{input,output,cache}`) and inline at the top level.
+ *  Exposed for unit testing. */
+export function extractOpencodeUsage(part: any): undefined | Record<string, number | string> {
+  if (!part || typeof part !== 'object') return undefined;
+  const candidates: any[] = [];
+  if (part.tokens) candidates.push(part.tokens);
+  if (part.usage) candidates.push(part.usage);
+  candidates.push(part);
+  for (const c of candidates) {
+    if (!c || typeof c !== 'object') continue;
+    const input = numOrUndef(c.input, c.inputTokens, c.input_tokens);
+    const output = numOrUndef(c.output, c.outputTokens, c.output_tokens);
+    const cacheRead = numOrUndef(c.cache, c.cacheRead, c.cache_read, c.cache_read_input_tokens);
+    if (input === undefined && output === undefined && cacheRead === undefined) continue;
+    const out: Record<string, number | string> = {};
+    if (input !== undefined) out.input = input;
+    if (output !== undefined) out.output = output;
+    if (cacheRead !== undefined) out.cacheRead = cacheRead;
+    const model = part.model || part.providerID || part.modelID;
+    if (typeof model === 'string' && model) out.model = model;
+    return out;
+  }
+  return undefined;
+}
+
+function numOrUndef(...vals: any[]): number | undefined {
+  for (const v of vals) {
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+  }
+  return undefined;
 }

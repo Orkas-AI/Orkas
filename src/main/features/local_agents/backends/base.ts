@@ -27,20 +27,28 @@ export type LocalEventType =
   | 'tool-event'
   | 'stderr-line'
   | 'status'
+  | 'log'
+  | 'raw-line'
+  | 'permission-request'
+  | 'idle'
   | 'done';
 
 export interface LocalEvent {
   type: LocalEventType;
   /** Free-form payload — exact keys vary per type. Documented inline at
    *  each emit site; a minimal index:
-   *    process-info: { pid, cwd, cmd, args, sessionId? }
-   *    text-delta:   { text }
-   *    thinking:     { text }
-   *    tool-event:   { tool, callId?, phase: 'use'|'result', input?, output? }
-   *    stderr-line:  { line }
-   *    status:       { status }
-   *    done:         { status: 'completed'|'failed'|'cancelled'|'timeout'|
-   *                            'missing_cli', error?, durationMs?, sessionId? }
+   *    process-info:       { pid, cwd, cmd, args, sessionId? }
+   *    text-delta:         { text }
+   *    thinking:           { text }
+   *    tool-event:         { tool, callId?, phase: 'use'|'result', input?, output?, outputPath? }
+   *    stderr-line:        { line }
+   *    status:             { status, usage? }   // usage carried for status:'usage' running counters
+   *    log:                { level: 'debug'|'info'|'warn'|'error', message, source? }
+   *    raw-line:           { line }             // stdout line we couldn't parse as our protocol
+   *    permission-request: { id, tool?, input?, autoDecided: 'allow'|'deny', reason }
+   *    idle:               { stalledMs }        // runner-emitted heartbeat on prolonged silence
+   *    done:               { status: 'completed'|'failed'|'cancelled'|'timeout'|
+   *                                  'missing_cli', error?, durationMs?, sessionId?, usage? }
    */
   [key: string]: unknown;
 }
@@ -62,6 +70,13 @@ export interface BackendRunOptions {
   /** Wall-clock cap. Backends should arm a timer and emit
    *  `done({status:'timeout'})` when it fires before the CLI exits. */
   timeoutMs: number;
+  /** Per-backend idle threshold override (ms). Read by `runner.ts`'s
+   *  idle-heartbeat to decide when to emit `{type:'idle'}` events. When
+   *  unset the runner uses its own default (90 s; configurable via
+   *  ORKAS_LOCAL_AGENT_IDLE_MS). Backends with no streaming (today:
+   *  openclaw) should pass a smaller value so users get an early "still
+   *  alive" pulse instead of staring at a blank rail for the full run. */
+  idleMs?: number;
 }
 
 export interface LocalBackend {
@@ -140,6 +155,20 @@ export class LineSplitter {
       this.buf = '';
     }
   }
+}
+
+/** Normalize a free-form log level string to our 4-tier scale. CLIs
+ *  use various conventions (`debug` / `DEBUG` / `verbose` / `warning`
+ *  / `err` / numeric); unknown values fold to `info`. Shared by every
+ *  backend's `log`-event emit site so the renderer can rely on the
+ *  4-value enum. */
+export function levelOrInfo(raw: unknown): 'debug' | 'info' | 'warn' | 'error' {
+  if (typeof raw !== 'string') return 'info';
+  const s = raw.toLowerCase();
+  if (s === 'debug' || s === 'trace' || s === 'verbose') return 'debug';
+  if (s === 'warn' || s === 'warning') return 'warn';
+  if (s === 'error' || s === 'err' || s === 'fatal') return 'error';
+  return 'info';
 }
 
 /**

@@ -62,8 +62,10 @@ function datePrefixOf(name: string): string | null {
 
 // ── Sensitive-field redaction ────────────────────────────────────────────
 
-// Keys that may carry secrets — redacted regardless of nesting depth.
-// Matched case-insensitively against property names.
+// Keys that may carry secrets or PII — redacted regardless of nesting depth.
+// Matched case-insensitively against property names. `name` is intentionally
+// NOT here (too broad: agent.name / connector.name / project.name / filename
+// are all legit business values).
 const REDACT_KEYS = new Set([
   'key', 'apikey', 'api_key',
   'access', 'refresh',
@@ -73,6 +75,11 @@ const REDACT_KEYS = new Set([
   'password', 'passwd', 'pwd',
   'authorization',
   'cookie', 'setcookie', 'set-cookie',
+  // PII (defense-in-depth — no current call site logs these unmasked, but
+  // the rule shields against future regressions).
+  'phone', 'mobile',
+  'email',
+  'username',
 ]);
 
 const MASK = '***REDACTED***';

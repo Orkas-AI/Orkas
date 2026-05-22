@@ -22,6 +22,7 @@ import {
   spawnCli,
   bindAbort,
   LineSplitter,
+  levelOrInfo,
 } from './base.js';
 
 export interface AcpBackendDef {
@@ -108,7 +109,15 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
           const trimmed = line.trim();
           if (!trimmed) return;
           let env: any;
-          try { env = JSON.parse(trimmed); } catch { return; }
+          try { env = JSON.parse(trimmed); }
+          catch {
+            // ACP wire is NDJSON; a non-JSON line means the CLI logged
+            // something straight to stdout (hermes occasionally does
+            // this on startup). Surface as raw-line so it appears in
+            // the process rail.
+            opts.onEvent({ type: 'raw-line', line: trimmed });
+            return;
+          }
           handleAcpMessage(env, {
             onSessionNew: id => {
               sessionId = id;
@@ -148,7 +157,17 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
               try { child.stdin.end(); } catch { /* */ }
             },
             onUnknown: raw => {
-              opts.onEvent({ type: 'tool-event', tool: 'acp', phase: 'use', input: raw, callId: '' });
+              // Previously surfaced as a fake `tool:'acp'` tool-event,
+              // which polluted the tools rail with category-error rows.
+              // Reroute to a log event so the rail's tool list stays
+              // honest and unknown ACP traffic still gets visibility.
+              const summary = JSON.stringify(raw).slice(0, 200);
+              opts.onEvent({
+                type: 'log',
+                level: 'info',
+                message: `acp: ${summary}`,
+                source: 'acp',
+              });
             },
           });
         });

@@ -27,22 +27,27 @@ export interface SkillSpec {
   source: string;
 }
 
+function descriptionLocale(lang: string): 'zh' | 'en' {
+  return String(lang || '').split(/[-_]/)[0] === 'zh' ? 'zh' : 'en';
+}
+
 /** Pick a description for a target language with cross-language fallback.
  *
- *  `lang === 'zh'`: `description_zh` || `description_en` || `''`. Mirror for
- *  `'en'`. Cross-fallback guarantees non-empty when any description exists,
- *  so the user never sees a blank entry just because the matching locale
- *  hasn't been filled. Loader migrates legacy single-`description` files
- *  into one of the two slots at parse time — nothing else needs to look at
- *  the legacy field. */
+ *  Description storage is intentionally zh/en only: non-Chinese UI languages
+ *  use English first. Cross-fallback guarantees non-empty when any description
+ *  exists, so the user never sees a blank entry just because the matching
+ *  locale hasn't been filled. Loader migrates legacy single-`description`
+ *  files into one of the two slots at parse time. */
 export function pickDescription(
   spec: { description_zh?: string; description_en?: string },
-  lang: 'zh' | 'en',
+  lang: string,
 ): string {
-  const zh = (spec.description_zh || '').trim();
-  const en = (spec.description_en || '').trim();
-  if (lang === 'zh') return zh || en || '';
-  return en || zh || '';
+  const primaryLocale = descriptionLocale(lang);
+  const primary = spec[`description_${primaryLocale}`];
+  if (primary && primary.trim()) return primary.trim();
+  const fallbackLocale = ({ zh: 'en', en: 'zh' } as const)[primaryLocale];
+  const fallback = spec[`description_${fallbackLocale}`];
+  return (fallback || '').trim();
 }
 
 /** Input to `SkillLoader`. */

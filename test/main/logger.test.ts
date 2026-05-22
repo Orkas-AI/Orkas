@@ -58,6 +58,27 @@ describe('logger › redact', () => {
     expect(out.list[1].token).toBe('***REDACTED***');
   });
 
+  it('masks PII field names (phone / mobile / email / username) but leaves name passthrough', async () => {
+    const { redact } = await import('../../src/main/logger');
+    const out = redact({
+      phone: '13800138000',
+      mobile: '+8613800138000',
+      email: 'alice@example.com',
+      username: 'alice',
+      // `name` is intentionally NOT a redact key — too broad (agent.name etc).
+      name: 'Alpha Agent',
+      // PII-shaped fields nested in an array.
+      contacts: [{ email: 'b@example.com', phone: '13900139000' }],
+    }) as any;
+    expect(out.phone).toBe('***REDACTED***');
+    expect(out.mobile).toBe('***REDACTED***');
+    expect(out.email).toBe('***REDACTED***');
+    expect(out.username).toBe('***REDACTED***');
+    expect(out.name).toBe('Alpha Agent');
+    expect(out.contacts[0].email).toBe('***REDACTED***');
+    expect(out.contacts[0].phone).toBe('***REDACTED***');
+  });
+
   it('is case-insensitive on the key name', async () => {
     const { redact } = await import('../../src/main/logger');
     const out = redact({

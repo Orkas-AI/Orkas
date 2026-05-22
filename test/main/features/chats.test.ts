@@ -47,7 +47,7 @@ describe('chats › createConversation', () => {
     const chats = await loadChats();
     const conv = await chats.createConversation(TEST_UID, { title: 't1' });
     expect(conv.conversation_id).toMatch(/^[0-9a-f]{12}$/);
-    expect(conv.session_id).toBe(`${TEST_UID}-gconv-${conv.conversation_id}`);
+    expect(conv.session_id).toBe(`gconv-${conv.conversation_id}`);
     const idx = JSON.parse(fs.readFileSync(
       path.join(tmpDir, TEST_UID, 'cloud', 'chats', '_index.json'), 'utf-8'));
     expect(idx[0].conversation_id).toBe(conv.conversation_id);
@@ -70,7 +70,7 @@ describe('chats › createConversation', () => {
     const c1 = await chats.createConversation(TEST_UID, { projectId: 'p_aabbccdd' });
     expect(c1.project_id).toBe('p_aabbccdd');
     // session_id MUST stay independent of project_id.
-    expect(c1.session_id).toBe(`${TEST_UID}-gconv-${c1.conversation_id}`);
+    expect(c1.session_id).toBe(`gconv-${c1.conversation_id}`);
     const c2 = await chats.createConversation(TEST_UID);
     expect(c2.project_id).toBeUndefined();
 
@@ -80,6 +80,38 @@ describe('chats › createConversation', () => {
     const persistedC2 = idx.find((c: any) => c.conversation_id === c2.conversation_id);
     expect(persistedC1.project_id).toBe('p_aabbccdd');
     expect(persistedC2.project_id).toBeUndefined();
+  });
+});
+
+describe('chats › setConversationPinned', () => {
+  it('pins a conversation above newer unpinned rows without changing activity time', async () => {
+    const chats = await loadChats();
+    const older = await chats.createConversation(TEST_UID, { title: 'older' });
+    const newer = await chats.createConversation(TEST_UID, { title: 'newer' });
+    const before = await chats.getConversation(TEST_UID, older.conversation_id);
+
+    const pinned = await chats.setConversationPinned(TEST_UID, older.conversation_id, true);
+    expect(pinned?.pinned_at).toBeTruthy();
+    expect(pinned?.updated_at).toBe(before?.updated_at);
+
+    const listed = await chats.listConversations(TEST_UID);
+    expect(listed.map((c) => c.conversation_id)).toEqual([
+      older.conversation_id,
+      newer.conversation_id,
+    ]);
+  });
+
+  it('unpins a conversation and removes pinned_at from the persisted index', async () => {
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID, { title: 'pin me' });
+    await chats.setConversationPinned(TEST_UID, conv.conversation_id, true);
+
+    const unpinned = await chats.setConversationPinned(TEST_UID, conv.conversation_id, false);
+    expect(unpinned?.pinned_at).toBeUndefined();
+
+    const idx = JSON.parse(fs.readFileSync(
+      path.join(tmpDir, TEST_UID, 'cloud', 'chats', '_index.json'), 'utf-8'));
+    expect(idx[0].pinned_at).toBeUndefined();
   });
 });
 

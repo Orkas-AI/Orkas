@@ -82,7 +82,7 @@ export async function createWebSearchOverrideTool(): Promise<AgentTool> {
       const profile = pickActiveSearchProfile();
       if (profile) {
         const label = SEARCH_PROVIDER_LABEL[profile.provider] || profile.provider;
-        log.info('web_search via paid API', { provider: profile.provider, query: query.slice(0, 80), count });
+        log.info('web_search via paid API', { provider: profile.provider, query_len: query.length, count });
         try {
           const res = await runSearchAdapter(profile, query, count);
           log.info('web_search paid API ok', { provider: profile.provider, results: res.results.length });
@@ -106,7 +106,7 @@ export async function createWebSearchOverrideTool(): Promise<AgentTool> {
         }
       }
 
-      log.info('web_search via builtin keyless (no paid profile configured)', { query: query.slice(0, 80), count });
+      log.info('web_search via builtin keyless (no paid profile configured)', { query_len: query.length, count });
       return mod.runBuiltinWebSearch(query, count);
     },
   });

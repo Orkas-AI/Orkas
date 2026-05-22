@@ -26,10 +26,10 @@ export type KbSearchHit = vs.VecSearchHit;
 export type KbSearchOpts = vs.VecSearchOpts;
 
 function kbDbDir(uid: string): string {
-  // userKbVectorDbPath returns `<uid>/cloud/contexts/.kb/vector.db`; vec_store
-  // expects the containing directory so it can manage `vector.db` +
-  // `config.json` side by side. `path.dirname` handles `/` and `\` correctly
-  // on every platform.
+  // userKbVectorDbPath returns `<uid>/local/contexts/.kb/vector.db`
+  // (machine-private, NOT cloud-synced; multi-device-sync batch 2 +
+  // util/migrate-kb-to-local.ts). vec_store expects the containing
+  // directory so it can manage `vector.db` + `config.json` side by side.
   return path.dirname(userKbVectorDbPath(uid));
 }
 

@@ -7,7 +7,8 @@ const _contextsLog = createLogger('contexts');
 
 let _ctxTree = [];                  // tree of {name, path, type:'dir'|'file', children?, bytes?, mtime?}
 let _ctxExpanded = new Set();       // dir paths that are open
-let _ctxActive = null;              // {id, content} — currently opened file in right-pane
+let _ctxActive = null;              // {id} — currently opened file in right-pane
+let _ctxMveController = null;       // active mountMdViewEdit controller for the right-pane md viewer
 let _ctxPendingRename = null;       // {path} — flagged for inline-rename on the
                                     // next renderCtxTree() (set by the "new
                                     // text file" action after creating an
@@ -16,6 +17,13 @@ let _ctxPendingRename = null;       // {path} — flagged for inline-rename on t
                                     // "rename" item).
 let _kbStatusByPath = {};           // {[path]: {status, chunks?, error?, kind?}}
 let _kbEventsAbort = null;
+
+function _ctxUiIconHtml(name, className) {
+  if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+    return window.uiIconHtml(name, className);
+  }
+  return '';
+}
 
 async function loadContexts() {
   try {
@@ -178,7 +186,9 @@ function _renderCtxNodes(nodes, depth = 0) {
     if (n.type === 'dir') {
       const open = _ctxExpanded.has(n.path);
       const caretCls = open ? 'skill-tree-caret' : 'skill-tree-caret collapsed';
-      const icon = open ? ICON_FOLDER_OPEN : ICON_FOLDER_CLOSED;
+      const icon = open
+        ? _ctxUiIconHtml('folder-open', 'skill-tree-node-svg')
+        : _ctxUiIconHtml('folder', 'skill-tree-node-svg');
       const childrenHtml = open
         ? `<div class="skill-tree-children">${_renderCtxNodes(n.children || [], depth + 1)}</div>`
         : '';
@@ -211,7 +221,7 @@ function _renderCtxNodes(nodes, depth = 0) {
       <div class="ctx-tree-wrap" data-path="${escapeHtml(n.path)}" data-type="file" draggable="true">
         <div class="skill-tree-node skill-tree-file${active}" data-ext="${escapeHtml(ext)}" style="padding-left:${indent}px">
           <span class="skill-tree-caret skill-tree-caret-empty"></span>
-          <span class="skill-tree-icon icon-file" data-ext="${escapeHtml(ext)}">${ICON_FILE}</span>
+          <span class="skill-tree-icon icon-file" data-ext="${escapeHtml(ext)}">${_ctxUiIconHtml('file', 'skill-tree-node-svg')}</span>
           ${labelHtml}
           ${chip}
           <button type="button" class="ctx-row-menu-btn" data-menu title="${moreTitle}" aria-label="${moreTitle}">⋯</button>
@@ -375,6 +385,13 @@ async function deleteCtxEntry(rel, kind) {
     if (_ctxActive && (_ctxActive.id === rel || _ctxActive.id.startsWith(rel + '/'))) {
       _clearCtxViewer();
     }
+    // Drop drafts under the deleted path (file or whole dir subtree); a
+    // stale draft pointing at a no-longer-existing file would silently
+    // re-create itself on the next click into a same-named freshly-made
+    // file.
+    for (const key of Array.from(_ctxDrafts.keys())) {
+      if (key === rel || key.startsWith(rel + '/')) _ctxDrafts.delete(key);
+    }
     await loadContexts();
   } catch (e) {
     await uiAlert(t('contexts.delete_failed_with', { reason: e.message || e }));
@@ -469,6 +486,7 @@ function _ctxMenuItemsFor(kind, relPath) {
   if (kind === 'root') {
     return [
       { action: 'new_text',   label: t('contexts.menu.new_text') },
+      { action: 'new_todo',   label: t('contexts.menu.new_todo') },
       { action: 'new_folder', label: t('contexts.menu.new_folder') },
       { action: 'upload',     label: t('contexts.menu.upload') },
     ];
@@ -476,6 +494,7 @@ function _ctxMenuItemsFor(kind, relPath) {
   if (kind === 'dir') {
     return [
       { action: 'new_text',   label: t('contexts.menu.new_text') },
+      { action: 'new_todo',   label: t('contexts.menu.new_todo') },
       { action: 'new_folder', label: t('contexts.menu.new_folder') },
       { action: 'upload',     label: t('contexts.menu.upload') },
       { action: 'rename',     label: t('contexts.menu.rename') },
@@ -494,9 +513,10 @@ function _ctxMenuItemsFor(kind, relPath) {
 }
 
 async function _runCtxMenuAction(action, kind, relPath) {
-  const dirArg = kind === 'root' ? '' : relPath;  // for new_text / new_folder / upload
+  const dirArg = kind === 'root' ? '' : relPath;  // for new_text / new_todo / new_folder / upload
   switch (action) {
     case 'new_text':   return createCtxNewTextFile(dirArg);
+    case 'new_todo':   return createCtxNewTodoFile(dirArg);
     case 'new_folder': return promptCtxNewInDir(dirArg);
     case 'upload': {
       const input = document.getElementById('ctx-file-input');
@@ -564,6 +584,18 @@ async function _commitInlineRename(rel, nextBase) {
     const data = await res.json();
     if (!data.ok) { await uiAlert(data.error || t('contexts.entry.rename_failed')); await loadContexts(); return; }
     if (_ctxActive && _ctxActive.id === rel) _ctxActive.id = dst;
+    // Re-key any drafts (file rename: one entry; dir rename: every entry
+    // under the old prefix) so the draft survives the rename. Iterate a
+    // snapshot since we're mutating the map.
+    for (const [key, val] of Array.from(_ctxDrafts.entries())) {
+      if (key === rel) {
+        _ctxDrafts.set(dst, val);
+        _ctxDrafts.delete(rel);
+      } else if (key.startsWith(rel + '/')) {
+        _ctxDrafts.set(dst + key.slice(rel.length), val);
+        _ctxDrafts.delete(key);
+      }
+    }
     await loadContexts();
   } catch (e) {
     await uiAlert(t('contexts.entry.rename_failed_with', { reason: e.message || e }));
@@ -628,7 +660,7 @@ window.saveCtxNew = saveCtxNew;
 // for inline rename on the next tree render, and immediately drops the
 // viewer into edit mode so the user can start typing content.
 async function createCtxNewTextFile(parentDir = '') {
-  const stemBase = t('contexts.new.untitled_stem') || 'untitled';
+  const stemBase = t('contexts.new.untitled_stem');
   // Collect sibling file names so we can uniquify if a conflict exists.
   const siblings = _ctxListChildren(parentDir).map(n => n.name);
   let stem = stemBase;
@@ -651,6 +683,39 @@ async function createCtxNewTextFile(parentDir = '') {
     // + Save/Cancel actions). `_ctxPendingRename` will be consumed by the
     // next renderCtxTree() call.
     _showCtxTextViewer(fullPath, '');
+    _enterCtxEdit();
+  } catch (e) {
+    await uiAlert(t('contexts.network_error', { reason: e.message || e }));
+  }
+}
+
+// "+ todo list" handler — mirrors `createCtxNewTextFile` but seeds the file
+// with a minimal task-list template so the user lands on something usable.
+// Stored as plain .md (GitHub-style `- [ ]` syntax) — interactive checkbox
+// behavior is layered on by the KB viewer; the file itself stays portable
+// and indexable like any other md note.
+async function createCtxNewTodoFile(parentDir = '') {
+  const stemBase = t('contexts.new.todo_stem');
+  const siblings = _ctxListChildren(parentDir).map(n => n.name);
+  let stem = stemBase;
+  let i = 2;
+  while (siblings.includes(`${stem}.md`)) { stem = `${stemBase} ${i++}`; }
+  const name = `${stem}.md`;
+  const fullPath = parentDir ? `${parentDir}/${name}` : name;
+  const heading = t('contexts.new.todo_template_heading');
+  const template = `# ${heading}\n\n- [ ] \n- [ ] \n- [ ] \n`;
+  try {
+    const res = await apiFetch('/api/contexts/write', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: fullPath, content: template }),
+    });
+    const data = await res.json();
+    if (!data.ok) { await uiAlert(data.error || t('contexts.file.create_failed')); return; }
+    if (parentDir) _ctxExpanded.add(parentDir);
+    _ctxPendingRename = { path: fullPath };
+    await loadContexts();
+    _showCtxTextViewer(fullPath, template);
     _enterCtxEdit();
   } catch (e) {
     await uiAlert(t('contexts.network_error', { reason: e.message || e }));
@@ -886,7 +951,12 @@ async function revealCtxFile(rel) {
 }
 
 function _prepCtxViewerShell(rel) {
-  _ctxActive = { id: rel, content: '' };
+  _ctxActive = { id: rel };
+  // Tear down the previous md mount before switching files — otherwise the
+  // outgoing controller's textarea-input listeners would still react to the
+  // about-to-be-replaced DOM and the drafts map could record updates against
+  // the wrong rel.
+  if (_ctxMveController) { try { _ctxMveController.destroy(); } catch (_) {} _ctxMveController = null; }
   const empty = document.getElementById('contexts-editor-empty');
   const wrap = document.getElementById('contexts-viewer-wrap');
   const pathEl = document.getElementById('contexts-editor-path');
@@ -905,12 +975,48 @@ function _prepCtxViewerShell(rel) {
   };
 }
 
+// Per-file in-progress edit state, keyed by relpath. Survives switching to
+// another KB file or to another sidebar tab — coming back to the file
+// restores edit mode + the unsaved draft instead of dropping to read mode.
+// Lifetime = renderer session (cleared on Save / Cancel / Delete; re-keyed
+// on Rename). Not persisted across app restarts. Fed via the
+// `onDraftChange` callback below.
+const _ctxDrafts = new Map();
+
+function _ctxClearDraft(path) {
+  const key = path || (_ctxActive && _ctxActive.id);
+  if (key) _ctxDrafts.delete(key);
+}
+
 function _showCtxTextViewer(rel, content) {
   const els = _prepCtxViewerShell(rel);
   if (!els) return;
-  _ctxActive.content = content;
-  _renderCtxViewerMd(els.bodyEl, els.actionsEl);
+  _ctxMveController = mountMdViewEdit({
+    bodyEl: els.bodyEl,
+    actionsEl: els.actionsEl,
+    source: { kind: 'context', rel },
+    // Skip the read round-trip — caller already has the bytes.
+    initialContent: content,
+    // Restore in-progress edits if the user was previously typing in this
+    // file. mountMdViewEdit forces edit mode when `initialDraft` is present.
+    initialDraft: _ctxDrafts.get(rel) || null,
+    callbacks: {
+      // Mirror draft state into the per-file Map so it survives switching
+      // to another file in the tree and back.
+      onDraftChange: (draft) => {
+        if (draft === null) _ctxDrafts.delete(rel);
+        else _ctxDrafts.set(rel, draft);
+      },
+      onReveal: () => revealCtxFile(rel),
+      onDelete: () => _deleteCtxFromViewer(),
+      onSaved:  async () => { await loadContexts(); },
+    },
+  });
   els.bodyEl.scrollTop = 0;
+}
+
+function _enterCtxEdit() {
+  if (_ctxMveController) _ctxMveController.setMode('edit');
 }
 
 function _showCtxImageViewer(rel, base64, mediaType, bytes) {
@@ -937,9 +1043,12 @@ function _showCtxBinaryViewer(rel, kind) {
   const els = _prepCtxViewerShell(rel);
   if (!els) return;
   const kindLabel = t(`contexts.viewer.kind_${kind}`) || kind.toUpperCase();
+  const icon = (typeof window !== 'undefined' && typeof window.fileKindIconHtml === 'function')
+    ? window.fileKindIconHtml(rel, kind)
+    : '';
   els.bodyEl.innerHTML = `
     <div class="ctx-viewer-binary">
-      <div class="ctx-viewer-binary-icon">${kind === 'pdf' ? '📄' : kind === 'docx' ? '📘' : '📎'}</div>
+      <div class="ctx-viewer-binary-icon">${icon}</div>
       <div class="ctx-viewer-binary-name">${escapeHtml(rel)}</div>
       <div class="ctx-viewer-binary-hint">${escapeHtml(t('contexts.viewer.binary_hint', { kind: kindLabel }))}</div>
       <button class="btn btn-primary" id="ctx-viewer-reveal-big">${escapeHtml(t('contexts.viewer.open_system'))}</button>
@@ -955,58 +1064,6 @@ function _showCtxBinaryViewer(rel, kind) {
   els.actionsEl.querySelector('#ctx-viewer-del').addEventListener('click', _deleteCtxFromViewer);
 }
 
-function _renderCtxViewerMd(bodyEl, actionsEl) {
-  if (!_ctxActive) return;
-  bodyEl = bodyEl || document.getElementById('contexts-viewer-body');
-  actionsEl = actionsEl || document.getElementById('contexts-viewer-actions');
-  const content = _ctxActive.content || '';
-  bodyEl.innerHTML = `<div class="ctx-viewer-md markdown-body">${renderMarkdown(content)}</div>`;
-  actionsEl.innerHTML = `
-    <button class="btn btn-sm" id="ctx-viewer-edit">${escapeHtml(t('contexts.viewer.edit'))}</button>
-    <button class="btn btn-sm" id="ctx-viewer-reveal">${escapeHtml(t('contexts.viewer.open_system'))}</button>
-    <button class="btn btn-sm btn-danger" id="ctx-viewer-del">${escapeHtml(t('contexts.viewer.delete'))}</button>
-  `;
-  actionsEl.querySelector('#ctx-viewer-edit').addEventListener('click', _enterCtxEdit);
-  actionsEl.querySelector('#ctx-viewer-reveal').addEventListener('click', () => revealCtxFile(_ctxActive.id));
-  actionsEl.querySelector('#ctx-viewer-del').addEventListener('click', _deleteCtxFromViewer);
-}
-
-function _enterCtxEdit() {
-  if (!_ctxActive) return;
-  const bodyEl = document.getElementById('contexts-viewer-body');
-  const actionsEl = document.getElementById('contexts-viewer-actions');
-  const content = _ctxActive.content || '';
-  bodyEl.innerHTML = `<textarea class="ctx-viewer-editor" id="ctx-viewer-textarea" spellcheck="false">${escapeHtml(content)}</textarea>`;
-  actionsEl.innerHTML = `
-    <button class="btn btn-sm btn-primary" id="ctx-viewer-save">${escapeHtml(t('contexts.viewer.save'))}</button>
-    <button class="btn btn-sm" id="ctx-viewer-cancel">${escapeHtml(t('contexts.viewer.cancel'))}</button>
-  `;
-  actionsEl.querySelector('#ctx-viewer-save').addEventListener('click', _saveCtxEdit);
-  actionsEl.querySelector('#ctx-viewer-cancel').addEventListener('click', () => _renderCtxViewerMd());
-  document.getElementById('ctx-viewer-textarea')?.focus();
-}
-
-async function _saveCtxEdit() {
-  if (!_ctxActive) return;
-  const ta = document.getElementById('ctx-viewer-textarea');
-  if (!ta) return;
-  const next = ta.value;
-  try {
-    const res = await apiFetch('/api/contexts/update', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: _ctxActive.id, content: next }),
-    });
-    const data = await res.json();
-    if (!data.ok) { await uiAlert(data.error || t('contexts.save_failed')); return; }
-    _ctxActive.content = next;
-    _renderCtxViewerMd();
-    await loadContexts();
-  } catch (e) {
-    await uiAlert(t('contexts.save_failed_with', { reason: e.message || e }));
-  }
-}
-
 async function _deleteCtxFromViewer() {
   if (!_ctxActive) return;
   const rel = _ctxActive.id;
@@ -1015,6 +1072,7 @@ async function _deleteCtxFromViewer() {
     const res = await apiFetch(`/api/contexts/delete?path=${encodeURIComponent(rel)}`, { method: 'DELETE' });
     const data = await res.json();
     if (!data.ok) { await uiAlert(data.error || t('contexts.delete_failed')); return; }
+    _ctxClearDraft(rel);
     _clearCtxViewer();
     await loadContexts();
   } catch (e) {
@@ -1023,6 +1081,7 @@ async function _deleteCtxFromViewer() {
 }
 
 function _clearCtxViewer() {
+  if (_ctxMveController) { try { _ctxMveController.destroy(); } catch (_) {} _ctxMveController = null; }
   _ctxActive = null;
   const empty = document.getElementById('contexts-editor-empty');
   const wrap = document.getElementById('contexts-viewer-wrap');

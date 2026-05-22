@@ -201,103 +201,81 @@ function extractSection(text: string, headingKeywords: string[]): string | null 
   return captured.length > 0 ? captured.join('\n').trim() : null;
 }
 
-// ── Adaptive review prompt generation ───────────────────────────────────
+// ── Review prompt generation ────────────────────────────────────────────
 
 /**
- * Build a review prompt tailored to the trigger reason, the agent's
- * self-assessment, and available learning strategies.
+ * Build the reflection LLM prompt for one agent over a recent activity
+ * transcript.
  *
- * @param primaryFocus     Trigger reason (error_recovery, user_correction, etc.)
- * @param competence       Current COMPETENCE.md content
- * @param strategies       Current LEARNING_STRATEGIES.md content
- * @param skillHealthReport  Optional skill health report
- * @param conversationDigest  Summary of what happened in the conversation
+ * Single open-ended prompt (no `primaryFocus` branching) per
+ * `docs/plans/reflection-redesign.md` §2.3 — the LLM reads the transcript
+ * and decides what's worth saving. Eliminating the 7-case switch removes
+ * a window-aggregation ambiguity (multi-focus runs would need contradictory
+ * directives) and keeps the system prompt cache-stable across calls.
+ *
+ * @param competence    Current COMPETENCE.md content (capped 3000 chars by the meta tool)
+ * @param strategies    Current LEARNING_STRATEGIES.md content (capped 4000 chars)
+ * @param transcript    Activity transcript from `reflection-transcript.buildTranscript`
  */
-export function buildAdaptiveReviewPrompt(
-  primaryFocus: string,
+export function buildReviewPrompt(
   competence: string,
   strategies: string,
-  skillHealthReport?: string,
-  conversationDigest?: string,
+  transcript: string,
 ): string {
-  const base = 'Based on the conversation digest below, consider improving your skills and self-awareness.\n\n'
+  const base = 'Based on the activity transcript below, review and update your self-understanding.\n\n'
     + '**Important: transient errors (network timeouts, dropped connections, rate limits) are environmental issues, not skill or capability deficits. '
     + 'Do not mark them as weaknesses in COMPETENCE.md, do not modify or delete the related skills, '
     + 'and do not advise avoiding the tool in LEARNING_STRATEGIES.md.**\n\n';
 
-  let focus: string;
-  switch (primaryFocus) {
-    case 'error_recovery':
-      focus = 'You recovered from an error during this task. '
-            + 'Extract the resolution into a reusable skill, focusing on the non-obvious steps that made recovery succeed.';
-      break;
-    case 'user_correction':
-      focus = 'The user corrected your approach. '
-            + 'Identify what you got wrong, then create or update a skill that captures the correct way. '
-            + 'Also update COMPETENCE.md to record this weakness.';
-      break;
-    case 'skill_ineffective':
-      focus = 'A skill you loaded did not help on this task. '
-            + 'Diagnose why: outdated? too generic? mismatched? '
-            + 'Patch or delete the ineffective skill.';
-      break;
-    case 'known_weakness':
-      focus = 'This task hit one of your known weaknesses. '
-            + 'Strengthen this area. If you succeeded, update COMPETENCE.md to reflect the progress.';
-      break;
-    case 'weakness_succeeded':
-      focus = 'A capability you previously flagged as a weakness performed normally on this task. '
-            + 'Update COMPETENCE.md: remove or downgrade that weakness entry. '
-            + 'Do not modify or delete the related skills — they are working as expected.';
-      break;
-    case 'periodic_review':
-      focus = 'Some time has passed since the last reflection — do a periodic review. '
-            + 'Look at COMPETENCE.md and LEARNING_STRATEGIES.md: '
-            + 'merge similar entries, drop content that no longer applies or is duplicated, '
-            + 'and distill recently-recurring stable patterns into new skills. '
-            + 'If there is nothing new worth saving, just say "nothing to save" — do not reflect for the sake of reflecting.';
-      break;
-    case 'complexity':
-    default:
-      focus = 'This is a complex task. '
-            + 'Consider whether any approach or pattern is worth saving as a skill.';
-      break;
-  }
+  const focus = 'Look at COMPETENCE.md and LEARNING_STRATEGIES.md: '
+    + 'merge similar entries, drop content that no longer applies or is duplicated, '
+    + 'and distill recently-recurring stable patterns into new skills. '
+    + 'Identify user preferences and domain constraints surfaced in this window — '
+    + 'red lines the user revealed, edits made to your draft, repeated corrections, '
+    + 'workflow preferences. '
+    + 'If there is nothing new worth saving, just say "nothing to save" — '
+    + 'do not reflect for the sake of reflecting.';
 
-  const parts = [
+  // Imperative writing guidance — prose injection of COMPETENCE/STRATEGIES
+  // into the runtime system prompt is a weak nudge unless entries are written
+  // as actionable rules anchored to trigger conditions. Without this section
+  // reflection tends to produce vague descriptions ("agent should be careful
+  // about X") that the agent reliably ignores. See docs/plans/reflection-redesign.md §9.
+  const writingStyle = 'When you update COMPETENCE.md / LEARNING_STRATEGIES.md or '
+    + 'author a skill, write actionable imperatives — not descriptions.\n'
+    + '  ✗ "Agent should be careful about overly verbose output."\n'
+    + '  ✓ "NEVER exceed 5 bullet points in family-office context replies."\n'
+    + '  ✗ "User seems to prefer concise output."\n'
+    + '  ✓ "WHEN replying to family-office context, ALWAYS lead with the '
+    + 'bottom-line answer before rationale."\n'
+    + 'Use NEVER / ALWAYS / WHEN-THEN structures with concrete trigger conditions.\n'
+    + 'For a new skill\'s `description` field specifically: one imperative line '
+    + 'stating WHEN to use the skill, not what it is about (the description is '
+    + 'the only thing the next turn\'s agent sees before deciding to load the body).\n'
+    + '  ✗ "Q4 earnings analysis skill."\n'
+    + '  ✓ "WHEN handling Q4 earnings for utilities, use trailing-4-quarters not annualized."';
+
+  return [
     base,
     `**Focus**: ${focus}`,
-  ];
-
-  if (conversationDigest) {
-    parts.push(
-      '',
-      '**Conversation digest**:',
-      conversationDigest,
-    );
-  }
-
-  parts.push(
+    '',
+    `**Writing style**: ${writingStyle}`,
+    '',
+    '**Activity transcript**:',
+    transcript || '(No new activity in the window.)',
     '',
     '**Current self-assessment (COMPETENCE.md)**:',
     competence || '(No self-assessment yet — consider creating one.)',
     '',
     '**Available learning strategies (LEARNING_STRATEGIES.md)**:',
     strategies || '(No strategy log yet — use your own judgment.)',
-  );
-
-  if (skillHealthReport) {
-    parts.push('', '**Skill health report**:', skillHealthReport);
-  }
-
-  parts.push(
     '',
     'After reflecting, you can:',
-    '1. Create / patch / delete skills via the skill_manage tool',
+    '1. Create / patch / delete skills via the skill_manage tool '
+    + '(no user confirmation needed during reflection — the tool\'s default '
+    + '"confirm with user" guidance is for live turns, not for this call).',
     '2. Update COMPETENCE.md via the metacognition tool',
     '3. Update LEARNING_STRATEGIES.md via the metacognition tool',
     '4. If nothing is worth saving, just say "nothing to save"',
-  );
-
-  return parts.join('\n');
+  ].join('\n');
 }

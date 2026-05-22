@@ -22,6 +22,7 @@
 
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import { Readable } from 'node:stream';
 import { app, BrowserWindow, Menu, ipcMain, nativeImage, protocol, shell } from 'electron';
 
 // Force the user-visible app name to "Orkas" before anything else
@@ -32,6 +33,12 @@ import { app, BrowserWindow, Menu, ipcMain, nativeImage, protocol, shell } from 
 // via electron-builder's `productName`; this call covers dev + any
 // edge case where productName isn't picked up early.
 app.setName('Orkas');
+
+// OrkasOpen has no dev-vs-packaged behavior split (see PC/CLAUDE.md §11 "OrkasOpen
+// contract" + memory `feedback_orkasopen_no_dev_branch`): the API base must resolve
+// to the same `orkas.ai` endpoint whether the user runs `./run.sh` against source
+// or a packaged build. A developer who genuinely wants to point at a local server
+// can still set `ORKAS_API_BASE_URL=http://127.0.0.1:8888/api ./run.sh` explicitly.
 
 // Register the KB file protocol BEFORE `app.whenReady()` — privileged
 // schemes can't be added after. `kb-file:///<relpath>` serves a single
@@ -46,22 +53,39 @@ protocol.registerSchemesAsPrivileged([
   },
   // `chat-media://cid/<encCid>/<encName>` — serves image + video bytes out
   // of the active user's `<uid>/cloud/chat_attachments/<cid>/`. `stream:true`
-  // lets Chromium do byte-range requests on `<video>` seek without us
-  // manually implementing Range handling (we hand back a normal Response
-  // and Chromium / Electron handles scroll + seek over it).
+  // only enables a streamed Response body — it does NOT make Chromium issue
+  // byte-range requests on its own; the handler must advertise
+  // `Accept-Ranges: bytes` and serve `206` itself (see `serveFileRange`).
+  // Without that, `<video preload="metadata">` freezes a few seconds in
+  // because Chromium can't resume past the cancelled metadata-probe fetch.
   {
     scheme: 'chat-media',
     privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true },
   },
+  // `chat-app://cid/<encCid>/<encArtifactId>/<relpath>` — serves the files of
+  // an LLM-generated interactive web-app artifact out of
+  // `<uid>/cloud/chat_artifacts/<cid>/<artifactId>/`, embedded in a sandboxed
+  // `<iframe>` in the chat bubble (renderer `modules/chat-artifact.js`).
+  // `standard:true` gives the iframe a real origin (`chat-app://cid`) so it
+  // can use `<script type="module">` / same-origin `fetch` of sibling files /
+  // `localStorage`; `secure:true` lets the `file://` renderer frame it
+  // without a mixed-content block (same as `kb-file://`). `stream:true` for
+  // the Range-aware streamed body (see `serveFileRange`).
+  {
+    scheme: 'chat-app',
+    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true },
+  },
 ]);
 
-// Packaged-mode WS_ROOT redirect (`~/.orkas/data` or a Windows container
-// drive) is already done in `bootstrap.cjs`, and **must** happen there —
-// TypeScript's import hoisting would pull `paths.ts`'s require ahead of
-// any env-setting block here, so doing it later is too late. Drive
-// selection rules live in `packaged-data-root.cjs`, required directly by
-// `bootstrap.cjs`.
+// WS_ROOT env injection (`~/.orkas/data` on mac/linux; Windows pinned
+// drive's `<drive>:\.orkas\data`) is already done in `bootstrap.cjs` via
+// `install-data-root.cjs`, and **must** happen there — TypeScript's
+// import hoisting would pull `paths.ts`'s require ahead of any
+// env-setting block here, so doing it later is too late. Container
+// resolution + Windows pin + source-run migration logic lives in
+// `src/main/install-data-root.cjs`.
 import * as paths from './paths';
+import { parseByteRange } from './util/http-range';
 
 // `CORE_AGENT_AUTH_DIR` is pinned per-uid by `features/users.activateUser()`
 // (runs inside `runBootSelfCheck` below). `resolveAuthDir()` in core-agent
@@ -84,9 +108,9 @@ const log = createLogger('orkas');
 import { installSdkTimeoutPatch } from './model/core-agent/sdk-timeout-patch';
 installSdkTimeoutPatch();
 
-// Opt-in provider-fetch diagnostics (gated by ORKAS_FETCH_DIAG=1).
-// Default off — zero overhead for end users. Set the env var when
-// investigating fetch-level failures to dump the real undici cause chain.
+// Provider-fetch diagnostics — always on. Dumps the real undici cause
+// chain (the cause that pi-ai's internal retry loop would otherwise
+// swallow) into data/logs/. See fetch-diag.ts.
 import { installFetchDiag } from './model/core-agent/fetch-diag';
 installFetchDiag();
 
@@ -100,14 +124,25 @@ import * as chatsFeature from './features/chats';
 import * as searchFeature from './features/search';
 import * as authFeature from './features/auth';
 import * as appConfig from './features/config';
-import * as reflectionTrigger from './features/reflection-trigger';
+import { getRendererTables } from './i18n';
+import * as reflectionOrchestrator from './features/reflection-orchestrator';
+import * as scheduledTasks from './features/scheduled_tasks';
 import * as chatAttachments from './features/chat_attachments';
+import * as chatArtifacts from './features/chat_artifacts';
+// `features/sync/*` and `ipc/sync.ts` are stripped in OrkasOpen (depends on account).
+import * as connectorsFeature from './features/connectors';
+import * as windowState from './features/window_state';
+// (sync + relay both depend on account; connectors depends on the Server OAuth bridge).
+// (both depend on the Orkas account/Server surface). Connectors, including Google, are synced.
+
 
 function createWindow(): BrowserWindow {
   const dev = !app.isPackaged;
+  const restored = windowState.restoreWindowState();
   const win = new BrowserWindow({
     width: 1280,
     height: 800,
+    ...restored.bounds,
     title: '',
     backgroundColor: '#ffffff',
     icon: path.join(paths.SRC_ROOT, 'resources', 'icons', 'icon.png'),
@@ -125,6 +160,8 @@ function createWindow(): BrowserWindow {
       plugins: true,
     },
   });
+  windowState.watchWindowState(win);
+  if (restored.isMaximized) win.maximize();
 
   win.loadFile(path.join(paths.SRC_ROOT, 'renderer', 'index.html'));
 
@@ -183,6 +220,23 @@ function registerIpc(): void {
 
   ipcMain.handle('orkas.appVersion', () => app.getVersion());
 
+  // Synchronous boot bundle for i18n. Renderer's preload calls this via
+  // `ipcRenderer.sendSync` BEFORE any DOM scripts run, so the renderer can
+  // populate _currentLang + _tables synchronously at module load — first
+  // paint shows the user's preferred language with no English flash. Using
+  // sendSync (and not the async `config.getLanguage` IPC) is the whole point:
+  // an async round-trip schedules a microtask, paint slips through. Reads
+  // ~100 KB of locale JSON per renderer boot; SSD-fast.
+  ipcMain.on('orkas:bootI18n', (event) => {
+    try {
+      const lang = appConfig.getLanguage();
+      event.returnValue = { ok: true, lang, tables: getRendererTables() };
+    } catch (err) {
+      log.warn('bootI18n failed', { error: (err as Error)?.message });
+      event.returnValue = { ok: false };
+    }
+  });
+
   ipcMain.handle('orkas.diagnostics', async () => {
     const sample = {
       nowIso: storage.nowIso(),
@@ -197,6 +251,7 @@ function registerIpc(): void {
       builtin_skills_dir: 'X', custom_skills_dir: 'X',
       agents_index: '', plan_state: '',
       os: 'X', working_dir: 'X', local_exec_state: 'X',
+      project_files_block: '',
     });
     const tplLen = tplNormal.length;
     const skills = await skillsFeature.listSkills();
@@ -208,7 +263,6 @@ function registerIpc(): void {
         appRoot: paths.APP_ROOT,
         pcRoot: paths.PC_ROOT,
         wsRoot: paths.WS_ROOT,
-        builtinSkillsSource: paths.BUILTIN_SKILLS_SOURCE,
         usersFile: paths.USERS_FILE,
       },
       storage: sample,
@@ -218,7 +272,7 @@ function registerIpc(): void {
       },
       skills: {
         total: skills.length,
-        builtin: skills.filter((s) => s.source === 'builtin').length,
+        marketplace: skills.filter((s) => s.source === 'marketplace').length,
         custom: skills.filter((s) => s.source === 'custom').length,
         ids: skills.map((s) => `${s.source}:${s.id}`),
       },
@@ -238,7 +292,6 @@ async function runBootSelfCheck(): Promise<void> {
   const diag = {
     appRoot: paths.APP_ROOT,
     wsRoot: paths.WS_ROOT,
-    builtinSource: paths.BUILTIN_SKILLS_SOURCE,
     promptChatNormal: prompts.exists('chat_commander'),
     promptOrganize: prompts.exists('contexts_organize'),
   };
@@ -263,18 +316,20 @@ async function runBootSelfCheck(): Promise<void> {
     log.info('i18n language resolved', { lang });
   } catch (err) { log.warn('i18n init failed', { error: (err as Error).message }); }
 
-  // Stage 2: builtin skill content sync from `src/builtin/skills/` →
-  // `data/builtin/skills/`. core-agent's SkillLoader picks these up directly
-  // from the top-level dir, shared across all uids.
+  // Stage 2: one-shot migration of any pre-marketplace `data/builtin/{agents,skills}/`
+  // tree into the active uid's cloud/. Idempotent via marker file; no-op on fresh
+  // installs. After this runs there is no more globally-shared builtin tree — every
+  // marketplace install lives at `<uid>/local/marketplace/` and gets reconciled from
+  // the cloud `installs.json` manifest.
   try {
-    skillsFeature.syncBuiltinSkills();
+    const { migrateLegacyBuiltinToCloud } = await import('./util/migrate-marketplace');
+    const out = await migrateLegacyBuiltinToCloud(users.getActiveUserId());
+    if (out.moved_agents || out.moved_skills) {
+      log.info('legacy builtin migrated', out);
+    }
   } catch (err) {
-    log.warn('skill bootstrap failed', { error: (err as Error).message });
+    log.warn('legacy builtin migrate failed', { error: (err as Error).message });
   }
-
-  // Stage 2b: builtin agents sync (hash-tree; cheap if empty).
-  try { agentsFeature.syncBuiltinAgents(); }
-  catch (err) { log.warn('builtin-agents sync failed', { error: (err as Error).message }); }
 
   // Stage 3: clear stale processing=true conversations from a previous crash.
   try { await chatsFeature.sweepStaleProcessing(); }
@@ -324,6 +379,70 @@ const _KB_FILE_MIME: Record<string, string> = {
   '.json': 'application/json',
 };
 
+/**
+ * Stream a file on disk back through a `protocol.handle` callback with HTTP
+ * Range support — shared by `kb-file://` and `chat-media://`.
+ *
+ * Why this exists: a `protocol.handle` reply that returns `200` + a
+ * `Content-Length` but no `Accept-Ranges` makes Chromium treat the resource
+ * as non-seekable. For `<video preload="metadata">` that is fatal — Chromium's
+ * metadata probe fetches only the head of the file and then *cancels* its
+ * request; when playback later runs past that prefetched head buffer it has no
+ * way to resume (the resource is "not range-capable" and the original request
+ * is gone), so the `<video>` freezes a few seconds in with no error in the UI.
+ * Advertising `Accept-Ranges: bytes` + honouring `206` requests is the fix; it
+ * also makes seeking work and lets PDFium fetch only the pages it shows.
+ *
+ * Also switches the body from `fs.readFileSync` — the old handlers buffered the
+ * whole file into memory, so a 200 MB video spiked RSS by 200 MB — to a lazy
+ * `fs.createReadStream`.
+ *
+ * `totalSize` is the caller's already-statted byte length, so we don't `stat`
+ * the file a second time.
+ */
+function serveFileRange(
+  request: Request,
+  absPath: string,
+  contentType: string,
+  totalSize: number,
+): Response {
+  const baseHeaders: Record<string, string> = {
+    'Content-Type': contentType,
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'private, max-age=60',
+  };
+  const range = parseByteRange(request.headers.get('Range'), totalSize);
+
+  if (range === 'unsatisfiable') {
+    return new Response('requested range not satisfiable', {
+      status: 416,
+      headers: { ...baseHeaders, 'Content-Range': `bytes */${totalSize}` },
+    });
+  }
+
+  const nodeStream = range
+    ? fs.createReadStream(absPath, { start: range.start, end: range.end })
+    : fs.createReadStream(absPath);
+  nodeStream.on('error', (err) => {
+    log.warn('media stream error', { absPath, error: (err as Error).message });
+  });
+  const body = Readable.toWeb(nodeStream) as unknown as ReadableStream;
+
+  if (range) {
+    return new Response(body, {
+      status: 206,
+      headers: {
+        ...baseHeaders,
+        'Content-Range': `bytes ${range.start}-${range.end}/${totalSize}`,
+        'Content-Length': String(range.end - range.start + 1),
+      },
+    });
+  }
+  return new Response(body, {
+    headers: { ...baseHeaders, 'Content-Length': String(totalSize) },
+  });
+}
+
 function registerKbFileProtocol(): void {
   protocol.handle('kb-file', async (request) => {
     const reqUrl = request.url;
@@ -355,22 +474,16 @@ function registerKbFileProtocol(): void {
         log.warn('kb-file: traversal blocked', { reqUrl, rel });
         return new Response('forbidden', { status: 403 });
       }
-      if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) {
+      let st: fs.Stats | undefined;
+      try { st = fs.statSync(abs); } catch { /* falls through to 404 below */ }
+      if (!st || !st.isFile()) {
         log.warn('kb-file: not found', { reqUrl, rel, abs });
         return new Response('not found', { status: 404 });
       }
-      log.info('kb-file: serving', { reqUrl, abs });
+      log.info('kb-file: serving', { reqUrl, abs, bytes: st.size });
       const ext = path.extname(abs).toLowerCase();
       const contentType = _KB_FILE_MIME[ext] || 'application/octet-stream';
-      const buf = fs.readFileSync(abs);
-      return new Response(buf, {
-        headers: {
-          'Content-Type': contentType,
-          'Content-Length': String(buf.length),
-          // Let Chromium's PDFium cache range fetches for scroll.
-          'Cache-Control': 'private, max-age=60',
-        },
-      });
+      return serveFileRange(request, abs, contentType, st.size);
     } catch (err) {
       log.warn('kb-file serve failed', { reqUrl, error: (err as Error).message });
       return new Response('error', { status: 500 });
@@ -440,40 +553,120 @@ function registerChatMediaProtocol(): void {
           log.warn('chat-media/cid: reject', { reqUrl, code, error: (resolved as { error?: string }).error });
           return new Response(String((resolved as { error?: string }).error || code || 'error'), { status: _statusFor(code) });
         }
-        const buf = fs.readFileSync(resolved.absPath);
-        return new Response(buf, {
-          headers: {
-            'Content-Type': chatAttachments.mediaMimeFor(name),
-            'Content-Length': String(buf.length),
-            'Cache-Control': 'private, max-age=60',
-          },
-        });
+        const st = fs.statSync(resolved.absPath);
+        log.info('chat-media/cid: serving', { abs: resolved.absPath, kind: resolved.kind, bytes: st.size });
+        return serveFileRange(request, resolved.absPath, chatAttachments.mediaMimeFor(name), st.size);
       }
 
       if (host === 'local') {
         // pathname starts with `/`; on Windows the drive-letter prefix needs
         // that leading slash stripped. `_pathnameToAbsPath` handles both.
+        // Try media (image/video) first; fall through to preview (pdf/html)
+        // on bad-ext only — every other failure (not_found / too_large) is
+        // terminal, so we don't mask a real error by re-checking under a
+        // different bucket.
         const abs = _pathnameToAbsPath(u.pathname || '');
-        const resolved = chatAttachments.resolveLocalMediaPath(abs);
-        if (!resolved.ok) {
-          log.warn('chat-media/local: reject', { reqUrl, code: resolved.code, error: resolved.error });
-          return new Response(resolved.error, { status: _statusFor(resolved.code) });
+        let resolved: ReturnType<typeof chatAttachments.resolveLocalMediaPath>
+          | ReturnType<typeof chatAttachments.resolveLocalPreviewPath>
+          = chatAttachments.resolveLocalMediaPath(abs);
+        if (!resolved.ok && (resolved as { code?: string }).code === 'bad_input') {
+          // Only retry under preview when the media resolver rejected on extension;
+          // path validation errors ('path must be absolute' / 'path required') re-raise.
+          const previewTry = chatAttachments.resolveLocalPreviewPath(abs);
+          if (previewTry.ok) resolved = previewTry;
         }
-        const buf = fs.readFileSync(resolved.absPath);
-        log.info('chat-media/local: serving', { abs: resolved.absPath, kind: resolved.kind, bytes: buf.length });
-        return new Response(buf, {
-          headers: {
-            'Content-Type': chatAttachments.mediaMimeFor(resolved.absPath),
-            'Content-Length': String(buf.length),
-            'Cache-Control': 'private, max-age=60',
-          },
-        });
+        if (!resolved.ok) {
+          // Same `(x as {field?: T}).field` access pattern as the cid branch above —
+          // tsc's narrow on `if (!resolved.ok)` doesn't always propagate to the
+          // error-branch fields here, so go through the type-assertion escape hatch.
+          const err = resolved as { code?: string; error?: string };
+          log.warn('chat-media/local: reject', { reqUrl, code: err.code, error: err.error });
+          return new Response(String(err.error || ''), { status: _statusFor(err.code) });
+        }
+        const st = fs.statSync(resolved.absPath);
+        log.info('chat-media/local: serving', { abs: resolved.absPath, kind: resolved.kind, bytes: st.size });
+        return serveFileRange(request, resolved.absPath, chatAttachments.mediaMimeFor(resolved.absPath), st.size);
       }
 
       log.warn('chat-media: unknown host', { reqUrl, host });
       return new Response('bad request', { status: 400 });
     } catch (err) {
       log.warn('chat-media serve failed', { reqUrl, error: (err as Error).message });
+      return new Response('error', { status: 500 });
+    }
+  });
+}
+
+// `chat-app://cid/<encCid>/<encArtifactId>/<relpath...>` — streams the files
+// of an LLM-generated interactive web-app artifact out of the active user's
+// `<uid>/cloud/chat_artifacts/<cid>/<artifactId>/`. Read-only; every request
+// is filtered through `chatArtifacts.resolveArtifactFilePath` (safe-cid /
+// safe-artifactId / safe-relpath + `path.relative` traversal guard + served
+// extension allowlist + regular-file check). The reserved virtual relpath
+// `__orkas/bridge.js` is served from the in-memory `BRIDGE_JS` constant, not
+// from disk. Fixed host (`cid`) sidesteps URL-parser divergence the same way
+// `chat-media://cid/...` does. `Access-Control-Allow-Origin: *` is set
+// defensively — `chat-app://` URLs are only issuable from inside this app.
+function _withArtifactCors(resp: Response): Response {
+  // Re-wrap so we can add the header without mutating the shared
+  // `serveFileRange` helper (kb-file / chat-media must not change). The body
+  // stream is passed through untouched — Chromium consumes it once.
+  const headers = new Headers(resp.headers);
+  headers.set('Access-Control-Allow-Origin', '*');
+  return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers });
+}
+
+function registerChatAppProtocol(): void {
+  protocol.handle('chat-app', async (request) => {
+    const reqUrl = request.url;
+    try {
+      let u: URL;
+      try { u = new URL(reqUrl); }
+      catch {
+        log.warn('chat-app: unparseable URL', { reqUrl });
+        return new Response('bad request', { status: 400 });
+      }
+      if (u.host.toLowerCase() !== 'cid') {
+        log.warn('chat-app: unknown host', { reqUrl, host: u.host });
+        return new Response('bad request', { status: 400 });
+      }
+      // pathname is `/<encCid>/<encArtifactId>/<relpath...>` (always leading
+      // slash, URL-encoded). Decode the whole thing then split — decoding
+      // first then splitting on `/` is wrong if a relpath segment contained
+      // an encoded slash, but artifact file paths never do (safeRelPath
+      // rejects `\0` / `\`, and an encoded `/` would just be a path
+      // separator anyway); decode per-segment to be precise.
+      const rawSegs = (u.pathname || '').replace(/^\/+/, '').split('/');
+      const cid = rawSegs[0] ? decodeURIComponent(rawSegs[0]) : '';
+      const artifactId = rawSegs[1] ? decodeURIComponent(rawSegs[1]) : '';
+      const relPath = rawSegs.slice(2).map((s) => (s ? decodeURIComponent(s) : '')).join('/');
+      if (!cid || !artifactId) {
+        log.warn('chat-app: bad URL (need cid + artifactId)', { reqUrl });
+        return new Response('bad request', { status: 400 });
+      }
+
+      // Reserved virtual path: the runtime bridge script (not on disk).
+      if (relPath === chatArtifacts.BRIDGE_RELPATH) {
+        return _withArtifactCors(new Response(chatArtifacts.BRIDGE_JS, {
+          headers: { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'private, max-age=60' },
+        }));
+      }
+
+      const uid = users.getActiveUserId();
+      const resolved = chatArtifacts.resolveArtifactFilePath(uid, cid, artifactId, relPath);
+      if (!resolved.ok) {
+        // Cast in the error branch — `strictNullChecks: false` keeps the
+        // whole union here (same workaround as the chat-media handler above).
+        const code = (resolved as { code?: string }).code;
+        const errMsg = (resolved as { error?: string }).error;
+        log.warn('chat-app: reject', { reqUrl, code, error: errMsg });
+        return new Response(String(errMsg || code || 'error'), { status: _statusFor(code) });
+      }
+      const st = fs.statSync(resolved.absPath);
+      log.info('chat-app: serving', { abs: resolved.absPath, mime: resolved.mime, bytes: st.size });
+      return _withArtifactCors(serveFileRange(request, resolved.absPath, resolved.mime, st.size));
+    } catch (err) {
+      log.warn('chat-app serve failed', { reqUrl, error: (err as Error).message });
       return new Response('error', { status: 500 });
     }
   });
@@ -518,8 +711,15 @@ if (!gotLock) {
     }
     registerKbFileProtocol();
     registerChatMediaProtocol();
+    registerChatAppProtocol();
     registerIpc();
     createWindow();
+
+    // Reconnect persisted MCP connector instances + register the before-quit shutdown hook.
+    // Independent of account: connectors are machine-local and work for any active uid.
+    connectorsFeature.bootstrap(users.getActiveUserId()).catch(() => {
+      /* errors logged inside the feature; never block app startup */
+    });
 
     // Background: pick up any out-of-band changes to source files (sync
     // drop-in, manual edits) into the search idx. Query path does not run
@@ -550,16 +750,63 @@ if (!gotLock) {
       }
     });
 
-    // Background: per-agent metacognitive reflection. Time-triggered (48h
-    // cooldown per agent), not per-turn. Delay so it doesn't race the UI's
-    // first paint or the user's first action.
+    // Background: per-agent metacognitive reflection. Single 12h-chained
+    // loop replaces the old 48h-cooldown startup-only trigger
+    // (docs/plans/reflection-redesign.md). Delay the first cycle so it
+    // doesn't race the UI's first paint or the user's first action; the
+    // loop self-schedules thereafter.
     setTimeout(() => {
       const uid = users.getActiveUserId();
-      const reflectLog = createLogger('reflection-trigger');
-      reflectionTrigger.runStartupReflections(uid).catch((err) => {
-        reflectLog.error('startup reflection batch failed', { error: err?.message || String(err) });
-      });
-    }, reflectionTrigger.STARTUP_DELAY_MS);
+      reflectionOrchestrator.startReflectionLoop(uid);
+    }, reflectionOrchestrator.STARTUP_DELAY_MS);
+
+    // Background: scheduled-agent-tasks tick (every 30s). Reads
+    // <uid>/cloud/config/scheduled_tasks.json on each tick and dispatches
+    // due tasks through the same bus entry point a manual run takes
+    // (chats.createConversation + groupChat.send). Idempotent.
+    scheduledTasks.startScheduler();
+
+    // Background: prime the marketplace category cache so the first openMarketplace
+    // doesn't pay the round-trip on cold start. Errors are swallowed — the lazy
+    // path in features/marketplace_biz.ts is the real safety net.
+    import('./features/marketplace_biz').then((m) => m.primeCategoryCache()).catch(() => {});
+
+    // Background marketplace setup: (1) seed the default installs manifest on first launch
+    // (no manifest file → fetch `/marketplace/defaults` → write a row per official item),
+    // (2) reconcile downloads any manifest rows whose local content is missing. Step 1
+    // populates the manifest that step 2 consumes; both are fire-and-forget so a slow / down
+    // server never blocks UI boot. Reconcile status updates broadcast to renderers so the
+    // marketplace panel can show a "syncing" banner — layering keeps `features/` free of
+    // `ipc/` imports, broadcast wiring lives here (same pattern as `group_chat.subscribe`).
+    (async () => {
+      try {
+        const mp = await import('./features/marketplace');
+        const seeded = await mp.ensureDefaultInstalls(users.getActiveUserId());
+        if (seeded.seeded_agents || seeded.seeded_skills) {
+          createLogger('marketplace_defaults').info('seeded default installs', seeded);
+        }
+      } catch (err) {
+        createLogger('marketplace_defaults').warn('default installs seed failed', {
+          error: (err as Error).message,
+        });
+      }
+      try {
+        const m = await import('./features/marketplace_reconcile');
+        m.subscribeReconcileStatus((status) => {
+          ipc.broadcastToRenderer('marketplace:reconcile-status', status);
+        });
+        // Server-side update sweep runs first so the manifest leads the per-machine
+        // `_install.json` for items the admin has republished — reconcile then picks up the
+        // mismatch and re-pulls the new blob. Network failures here are swallowed by the
+        // helper itself; reconcile still runs against the stale manifest.
+        await m.checkServerUpdatesForInstalls(users.getActiveUserId());
+        await m.reconcileInstalls(users.getActiveUserId());
+      } catch (err) {
+        createLogger('marketplace_reconcile').warn('startup reconcile failed', {
+          error: (err as Error).message,
+        });
+      }
+    })();
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();

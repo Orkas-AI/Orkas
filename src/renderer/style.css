@@ -15,7 +15,55 @@
   --radius-sm: 10px;
 }
 
+.ui-icon {
+  display: inline-block;
+  width: 1em;
+  height: 1em;
+  flex: 0 0 auto;
+  color: currentColor;
+  vertical-align: -0.12em;
+}
+.btn-inline-icon {
+  width: 14px;
+  height: 14px;
+  margin-right: 4px;
+}
+
 * { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* ─── Global scrollbar — thin, subtle. Without this rule, any scrollable
+       container that doesn't have its own ::-webkit-scrollbar override (e.g.
+       settings panels, sync usage breakdown, generic modal bodies) falls
+       back to the OS default — on macOS that's a chunky ~15px bar that
+       looks out of place against the app's compact, soft-shadowed UI.
+       Per-element overrides further down the file (.projects-list,
+       .conversation-list, .skills-grid-scroll, etc.) keep their tighter
+       4–6px widths via CSS specificity; this rule only catches the
+       "no override declared" case. ─── */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(15, 23, 42, 0.16);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(15, 23, 42, 0.32);
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(15, 23, 42, 0.16) transparent;
+}
 
 body {
   height: 100vh;
@@ -33,14 +81,50 @@ body {
 
 /* ─── Sidebar ─── */
 .sidebar {
-  width: 200px;
+  /* Width is overridden at runtime by sidebar-resize.js via `--sidebar-width`;
+     the 236px fallback (from upstream pre-resize sizing) applies when the
+     custom property hasn't been set. min/max bound the drag-resize range. */
+  width: var(--sidebar-width, 236px);
+  min-width: 180px;
+  max-width: 480px;
   background: #fff;
   color: var(--text);
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
   border-right: 1px solid var(--border);
+  position: relative;
 }
+
+/* Drag handle on the sidebar's right edge. Sits on top of the border so the
+   visible chrome stays the existing 1px line; widens to a 6px hit-zone for
+   the pointer. Double-click resets to default via sidebar-resize.js. */
+.sidebar-resize-handle {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 20;
+  background: transparent;
+  transition: background 0.15s;
+  -webkit-app-region: no-drag;
+}
+.sidebar-resize-handle:hover,
+.sidebar-resize-handle.is-active {
+  background: rgba(59, 130, 246, 0.25);
+}
+
+/* While the user is dragging the handle the whole window adopts a
+   col-resize cursor and we suppress text selection / iframe pointer events so
+   the drag doesn't get hijacked by the chat panel or an artifact iframe. */
+body.is-sidebar-resizing,
+body.is-sidebar-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+body.is-sidebar-resizing iframe { pointer-events: none; }
 
 .sidebar-logo {
   padding: 10px 16px;
@@ -49,6 +133,7 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-shrink: 0;
 }
 
 .logo-icon {
@@ -71,6 +156,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  flex-shrink: 0;
 }
 
 /* Sidebar search trigger — sits between the logo strip and the action list. */
@@ -89,8 +175,14 @@ body {
   cursor: pointer;
   transition: all 0.15s;
   -webkit-app-region: no-drag;
+  flex-shrink: 0;
 }
 .sidebar-search-btn:hover { background: #f1f5f9; color: var(--text); }
+.sidebar-search-icon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
 .sidebar-search-btn .sidebar-search-label { flex: 1; text-align: left; }
 .sidebar-search-btn .sidebar-search-kbd {
   font-size: 10.5px;
@@ -100,6 +192,19 @@ body {
   border: 1px solid var(--border);
   border-radius: 4px;
   background: #fff;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.sidebar-search-command-icon {
+  width: 11px;
+  height: 11px;
+}
+
+.sidebar-footer-icon {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
 }
 
 /* ── Global search overlay (Cmd+K) ─────────────────────────────────────── */
@@ -131,7 +236,17 @@ body {
   padding: 14px 16px;
   border-bottom: 1px solid var(--border);
 }
-.search-input-icon { color: #94a3b8; flex-shrink: 0; }
+.search-input-icon {
+  width: 18px;
+  height: 18px;
+  color: #94a3b8;
+  flex-shrink: 0;
+}
+.search-close-icon {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
 #search-input {
   flex: 1;
   border: none;
@@ -359,6 +474,28 @@ body {
   text-align: left;
 }
 
+.sidebar-btn [data-ui-icon] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+  line-height: 0;
+}
+
+.sidebar-btn-icon {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+  color: #94a3b8;
+  display: block;
+}
+
+.sidebar-btn.active .sidebar-btn-icon {
+  color: currentColor;
+}
+
 .sidebar-btn:hover {
   background: #f1f5f9;
   color: var(--text);
@@ -382,6 +519,7 @@ body {
   padding: 6px 12px 10px;
   border-top: 1px solid var(--border);
   background: #fafafa;
+  flex-shrink: 0;
 }
 .sidebar-footer-btn {
   display: inline-flex;
@@ -402,37 +540,38 @@ body {
 .sidebar-footer-btn:hover  { background: #f1f5f9; color: var(--text); }
 .sidebar-footer-btn.active { background: #eff6ff; color: var(--primary); font-weight: 600; }
 
-.sidebar-section {
+.sidebar-conversation-nav {
   flex: 1;
   min-height: 0;
   padding: 4px 8px 8px;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  overflow-y: auto;
   border-top: 1px solid var(--border);
   margin-top: 4px;
 }
+.sidebar-conversation-nav::-webkit-scrollbar { width: 4px; }
+.sidebar-conversation-nav::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 3px; }
 
-/* Projects section sits on top of conversations; let it stay intrinsic-sized
-   (rows are short, even ~20 projects fit in a small slab) while the
-   conversations section underneath takes the remaining height. Cap so a user
-   with dozens of projects doesn't push the conv list off-screen — internal
-   scroll engages. */
-.sidebar-projects-section {
+.sidebar-section {
   flex: 0 0 auto;
-  max-height: 40vh;
-  border-top: 1px solid var(--border);
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: visible;
 }
 
-/* Conversations section under Projects — share the same conceptual area as
-   Projects (per UX feedback "可以认为是同样的区域"). The divider stays as
-   a hairline visual cue but in a much lighter tone so the two sections
-   read as related rather than partitioned. Falls back to var(--border)
-   on platforms / themes where the muted variant isn't defined. */
+/* Projects and the catch-all conversation list are one conversation
+   navigation surface. The parent .sidebar-conversation-nav owns scrolling so
+   project conversations and ordinary conversations move together. */
+.sidebar-projects-section {
+  border-top: 0;
+}
+
 .sidebar-conversations-section {
-  flex: 1 1 auto;
   border-top: 1px solid rgba(15, 23, 42, 0.05);
-  margin-top: 0;
+  margin-top: 8px;
+  padding-top: 4px;
 }
 
 .sidebar-section-title-row {
@@ -446,8 +585,8 @@ body {
   padding: 12px 4px 6px;
   font-size: 11px;
   font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.6px;
+  text-transform: none;
+  letter-spacing: 0;
   color: #9ca3af;
 }
 
@@ -476,15 +615,12 @@ body {
 /* ─── Projects list ─── */
 
 .projects-list {
-  flex: 1;
-  overflow-y: auto;
+  overflow: visible;
   display: flex;
   flex-direction: column;
   gap: 1px;
-  padding-right: 2px;
+  padding-right: 0;
 }
-.projects-list::-webkit-scrollbar { width: 4px; }
-.projects-list::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 3px; }
 
 .project-row {
   display: flex;
@@ -500,6 +636,8 @@ body {
   position: relative;
 }
 .project-row:hover { background: #f1f5f9; color: var(--text); }
+.project-row.active { background: #eff6ff; color: var(--primary); }
+.project-row.active .project-icon { color: var(--primary); }
 .project-row.is-menu-open { background: #f1f5f9; }
 
 .project-icon {
@@ -582,20 +720,25 @@ body {
 .project-detail-content {
   flex: 1;
   overflow-y: auto;
-  padding: 22px 32px 32px 32px;
-  max-width: 880px;
+  padding: 28px 32px 36px 32px;
+  max-width: 1180px;
   width: 100%;
   margin: 0 auto;
   box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
 }
 .project-detail-header {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin-bottom: 22px;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+.project-detail-title-wrap {
+  flex: 1;
+  min-width: 0;
 }
 .project-detail-title {
-  flex: 1;
   font-size: 22px;
   font-weight: 600;
   color: var(--text);
@@ -606,7 +749,8 @@ body {
   white-space: nowrap;
 }
 .project-detail-title-input {
-  flex: 1;
+  width: 100%;
+  box-sizing: border-box;
   font-size: 22px;
   font-weight: 600;
   color: var(--text);
@@ -623,13 +767,76 @@ body {
   gap: 8px;
   flex-shrink: 0;
 }
+.project-detail-grid {
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 28px;
+  align-items: start;
+  min-height: 380px;
+}
+.project-detail-main,
+.project-detail-side {
+  min-width: 0;
+}
+.project-detail-main {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  padding-top: 8px;
+}
+.project-composer-card {
+  width: 100%;
+}
+.project-composer-input-area {
+  pointer-events: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: #fff;
+  border: 1px solid var(--primary);
+  border-radius: 16px;
+  padding: 10px 16px;
+  box-shadow: 0 8px 32px rgba(37, 99, 235, 0.08);
+  position: relative;
+  transition: all 0.2s;
+}
+.project-composer-input-area:focus-within {
+  border-color: var(--primary);
+  box-shadow: 0 8px 32px rgba(37, 99, 235, 0.16);
+  transform: translateY(-2px);
+}
+.project-composer-input-area textarea {
+  flex: 0 1 auto;
+  width: 100%;
+  min-height: 62px;
+  max-height: 220px;
+  border: none;
+  outline: none;
+  resize: none;
+  padding: 4px 4px;
+  font-size: 15px;
+  line-height: 1.55;
+  color: var(--text);
+  background: transparent;
+  font-family: inherit;
+}
+.project-composer-input-area .chat-input-mirror {
+  font-size: 15px;
+}
+.project-composer-bottom {
+  min-height: 40px;
+}
+.project-chat-send-btn {
+  margin-left: auto;
+}
 
 /* Card-style section. Mirrors the look in shipping-product references —
    white card on neutral page bg, rounded corners, subtle border. */
 .project-detail-card {
   background: #fff;
   border: 1px solid #e5e7eb;
-  border-radius: 12px;
+  border-radius: 8px;
   padding: 16px 18px;
   margin-bottom: 14px;
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
@@ -686,6 +893,8 @@ body {
   padding: 1px 6px;
   border-radius: 4px;
 }
+.project-binding-source--custom { color: #1d4ed8; background: #dbeafe; }
+.project-binding-source--marketplace { color: #475569; background: #e2e8f0; }
 .project-binding-source--stale { color: #b45309; background: #fef3c7; }
 .project-binding-desc {
   font-size: 12px;
@@ -775,6 +984,109 @@ body {
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
+.project-card-icon-btn {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: #64748b;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+.project-card-icon-btn:hover {
+  background: #f1f5f9;
+  color: var(--text);
+}
+.project-files-status {
+  min-height: 18px;
+  margin-top: 8px;
+  font-size: 12px;
+}
+.project-files-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+.project-file-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 6px 4px;
+  border-radius: 6px;
+  color: #334155;
+}
+.project-file-row:hover { background: #f8fafc; }
+.project-file-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  padding: 0;
+}
+.project-file-icon {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.project-file-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+}
+.project-file-meta {
+  flex: 0 0 auto;
+  color: #94a3b8;
+  font-size: 11px;
+}
+.project-file-remove {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+}
+.project-file-row:hover .project-file-remove { color: #64748b; }
+.project-file-remove:hover {
+  background: #fee2e2;
+  color: #dc2626;
+}
+
+@media (max-width: 980px) {
+  .project-detail-grid {
+    grid-template-columns: 1fr;
+    min-height: 0;
+  }
+  .project-detail-actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+}
 
 /* Empty-bindings banner inside an in-project conversation. */
 .conv-project-empty-banner {
@@ -801,16 +1113,25 @@ body {
 }
 
 .conversation-list {
-  flex: 1;
-  overflow-y: auto;
+  overflow: visible;
   display: flex;
   flex-direction: column;
   gap: 1px;
-  padding-right: 2px;
+  padding-right: 0;
 }
 
-.conversation-list::-webkit-scrollbar { width: 4px; }
-.conversation-list::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 3px; }
+/* Time-bucket headers inside #conversation-list (today / yesterday /
+   last 7 / last 30 / older). Uppercase tracking + muted color so the eye
+   skips them as section labels rather than tappable rows. */
+.conv-list-section-header {
+  padding: 10px 10px 4px 10px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: #94a3b8;
+  letter-spacing: 0.04em;
+  user-select: none;
+}
+.conv-list-section-header:first-child { padding-top: 4px; }
 
 .conv-item {
   display: flex;
@@ -828,6 +1149,66 @@ body {
 
 .conv-item:hover { background: #f1f5f9; color: var(--text); }
 .conv-item.active { background: #eff6ff; color: var(--primary); }
+
+.conv-item-action {
+  position: absolute;
+  top: 50%;
+  z-index: 2;
+  width: 20px;
+  height: 20px;
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+  cursor: pointer;
+  border-radius: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  visibility: hidden;
+  opacity: 0;
+  transform: translateY(-50%);
+  transition: background 0.12s, color 0.12s, opacity 0.12s;
+}
+
+.conv-item-pin { left: 6px; }
+.conv-item-del { right: 6px; }
+
+.conv-item:hover .conv-item-action,
+.conv-item:focus-within .conv-item-action {
+  visibility: visible;
+  opacity: 1;
+}
+
+.conv-item:hover .conv-item-title,
+.conv-item:focus-within .conv-item-title {
+  padding-left: 22px;
+  padding-right: 22px;
+}
+
+.conv-item-action-icon {
+  width: 14px;
+  height: 14px;
+  display: block;
+  transition: transform 0.12s;
+}
+
+.conv-item-pin:not(.is-pinned) .conv-item-action-icon {
+  transform: rotate(35deg);
+}
+
+.conv-item-pin.is-pinned .conv-item-action-icon {
+  transform: rotate(0deg);
+}
+
+.conv-item-pin.is-pinned {
+  color: var(--primary);
+}
+
+.conv-item-pin:hover {
+  background: rgba(37, 99, 235, 0.1);
+  color: var(--primary);
+}
 
 .conv-item-title {
   flex: 1;
@@ -916,22 +1297,6 @@ body {
   background: rgba(234, 179, 8, 0.28);
 }
 
-.conv-item-del {
-  flex-shrink: 0;
-  width: 20px;
-  height: 20px;
-  border: none;
-  background: transparent;
-  color: #94a3b8;
-  cursor: pointer;
-  border-radius: 4px;
-  display: none;
-  align-items: center;
-  justify-content: center;
-  font-size: 14px;
-}
-
-.conv-item:hover .conv-item-del { display: flex; }
 .conv-item-del:hover { background: rgba(220,38,38,0.1); color: var(--danger); }
 
 .conv-empty {
@@ -1078,37 +1443,62 @@ body.model-not-configured .main-content { flex-direction: column; }
   background: #fff;
 }
 
+/* Detail content container — padding matches `.marketplace-detail-header` density (14/20)
+   so the in-app skill detail and the marketplace skill preview align pixel-for-pixel. */
 .skills-detail-content {
   flex: 1;
   display: block;
   min-height: 0;
   overflow-y: auto;
-  padding: 24px 56px 60px;
+  padding: 14px 20px 28px;
   width: 100%;
+}
+#skills-detail-content {
+  padding-top: 0;
 }
 .skills-detail-content::-webkit-scrollbar { width: 6px; }
 .skills-detail-content::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 3px; }
 
 /* ─── Single-document detail layout ─── */
 
+/* Single-row headline matching `.agents-detail-header` + `.marketplace-detail-header`:
+   back-button on the left, title + source chip middle, actions hugged to the right via
+   `margin-left:auto`. The row stays `nowrap` so it visually reads as one chrome strip; long
+   titles ellipsize rather than wrap (title gets `min-width:0` + overflow). Negative side
+   side margins offset the `.skills-detail-content` container's horizontal padding so the
+   border-bottom rule reaches the panel edges — same chrome divider the agent detail uses. */
 .skills-doc-headline {
+  position: sticky;
+  top: 0;
+  z-index: 5;
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 10px 12px;
-  margin-bottom: 4px;
+  flex-wrap: nowrap;
+  gap: 8px;
+  margin: 0 -20px 20px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
+  background: #fff;
 }
 
 .skills-doc-title {
   margin: 0;
-  font-size: 22px;
-  font-weight: 700;
+  font-size: 16px;
+  font-weight: 600;
   color: var(--text);
-  line-height: 1.3;
-  padding: 2px 6px;
-  margin-left: -6px;
+  line-height: 1.4;
+  padding: 2px 4px;
+  margin-left: -4px;
   border-radius: 6px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 0 1 auto;   /* natural width + shrink for very long titles */
 }
+/* Source chip stays glued to the title; actions hug the right via `margin-left:auto`. */
+.skills-doc-headline > .skills-doc-source { flex-shrink: 0; }
+.skills-doc-headline > .skills-doc-actions { flex-shrink: 0; margin-left: auto; }
 .skills-doc-title.editable {
   cursor: pointer;
   transition: background 0.12s;
@@ -1131,6 +1521,14 @@ body.model-not-configured .main-content { flex-direction: column; }
 }
 .skills-doc-source.is-builtin { background: rgba(148, 163, 184, 0.15); color: #475569; }
 .skills-doc-source.is-custom  { background: rgba(37, 99, 235, 0.12); color: var(--primary); }
+.agents-detail-source.is-category,
+.skills-doc-source.is-category { background: rgba(79, 70, 229, 0.10); color: #4f46e5; }
+.agents-detail-source.is-platform,
+.skills-doc-source.is-platform { background: rgba(37, 99, 235, 0.12); color: #1d4ed8; }
+.agents-detail-source.is-user,
+.skills-doc-source.is-user { background: rgba(100, 116, 139, 0.10); color: #475569; }
+/* Allow multiple chips in the detail header source slot. */
+.skills-doc-source-row { display: inline-flex; gap: 6px; }
 /* Editing-state chrome on the title — mirrors `.agents-detail-name.is-editing`
    so both detail pages read as one chrome family. */
 .skills-doc-title.is-editing {
@@ -1146,7 +1544,7 @@ body.model-not-configured .main-content { flex-direction: column; }
 .skills-doc-actions {
   margin-left: auto;
   display: flex;
-  gap: 6px;
+  gap: 4px;
   align-items: center;
 }
 
@@ -1321,6 +1719,14 @@ body.model-not-configured .main-content { flex-direction: column; }
   border-radius: 8px;
   flex-shrink: 0;
 }
+.skills-chat-input-area .chat-send-btn .send-icon {
+  width: 16px;
+  height: 16px;
+}
+.skills-chat-input-area .chat-send-btn .stop-icon {
+  width: 14px;
+  height: 14px;
+}
 
 /* SKILL.md body — sits inside a "使用说明" section now; padding/scroll
    moved to the parent .skills-detail-content. */
@@ -1479,7 +1885,12 @@ body.model-not-configured .main-content { flex-direction: column; }
   display: flex;
   align-items: center;
   justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
 }
+/* When platform chips (version/category) sit on the actions row, the play button still
+   hugs the right edge — `margin-left:auto` handles the absent-chip case too. */
+.skill-card-actions > .skill-card-use { margin-left: auto; }
 
 .skill-card-use,
 .agent-card-use,
@@ -1509,6 +1920,8 @@ body.model-not-configured .main-content { flex-direction: column; }
 .skill-card-use .icon-play,
 .agent-card-use .icon-play,
 .btn-icon-use .icon-play {
+  width: 14px;
+  height: 14px;
   display: block;
 }
 
@@ -1548,25 +1961,6 @@ body.model-not-configured .main-content { flex-direction: column; }
   border-bottom: 1px solid var(--border);
   background: #fff;
   flex-shrink: 0;
-}
-
-.skills-back-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--muted);
-  font-size: 13px;
-  font-family: inherit;
-  cursor: pointer;
-  border-radius: 6px;
-  transition: background 0.12s, color 0.12s, border-color 0.12s;
-}
-.skills-back-btn:hover {
-  background: #f1f5f9;
-  color: var(--primary);
 }
 
 /* ─── "View source" collapsible (detail page bottom) ─── */
@@ -1786,6 +2180,185 @@ body.model-not-configured .main-content { flex-direction: column; }
   color: var(--primary);
 }
 
+/* ─── Dashboard (`:::dashboard` directive — see utils.js renderDashboard).
+       Component tree → HTML; tones use the global --primary/--success/
+       --danger/--muted palette; data-* attrs drive layout / state. ─── */
+.dashboard {
+  margin: 0.6em 0;
+  font-size: 13px;
+  color: var(--text);
+}
+.dashboard .db-stack {
+  display: flex;
+  flex-direction: column;
+}
+.dashboard .db-stack[data-direction="horizontal"] {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: stretch;
+}
+.dashboard .db-stack[data-gap="sm"], .dashboard .db-grid[data-gap="sm"] { gap: 6px; }
+.dashboard .db-stack[data-gap="md"], .dashboard .db-grid[data-gap="md"] { gap: 12px; }
+.dashboard .db-stack[data-gap="lg"], .dashboard .db-grid[data-gap="lg"] { gap: 20px; }
+.dashboard .db-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.dashboard .db-grid[data-columns="1"] { grid-template-columns: minmax(0, 1fr); }
+.dashboard .db-grid[data-columns="2"] { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.dashboard .db-grid[data-columns="3"] { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.dashboard .db-grid[data-columns="4"] { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+@media (max-width: 640px) {
+  .dashboard .db-grid[data-columns="3"],
+  .dashboard .db-grid[data-columns="4"] { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+.dashboard .db-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  padding: 12px 14px;
+}
+.dashboard .db-card[data-tone="positive"] { border-color: rgba(22, 163, 74, 0.4); }
+.dashboard .db-card[data-tone="negative"] { border-color: rgba(220, 38, 38, 0.4); }
+.dashboard .db-card[data-tone="warning"]  { border-color: rgba(234, 179, 8, 0.45); }
+.dashboard .db-card-title {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 8px;
+  color: var(--text);
+}
+.dashboard .db-separator {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 6px 0;
+}
+
+/* Metric — KPI card. Numeric value is the visual anchor; delta carries tone. */
+.dashboard .db-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  min-width: 0;
+}
+.dashboard .db-metric-label {
+  font-size: 12px;
+  color: var(--muted);
+  text-transform: none;
+  letter-spacing: 0;
+}
+.dashboard .db-metric-value {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1.2;
+  word-break: break-word;
+}
+.dashboard .db-metric-delta {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.dashboard .db-metric-delta[data-tone="positive"] { color: var(--success); }
+.dashboard .db-metric-delta[data-tone="negative"] { color: var(--danger); }
+.dashboard .db-metric-delta[data-tone="warning"]  { color: #b45309; }
+
+/* Alert — color-coded banner. */
+.dashboard .db-alert {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--card);
+}
+.dashboard .db-alert-title { font-weight: 600; font-size: 13px; }
+.dashboard .db-alert-body  { font-size: 12.5px; color: var(--muted); margin-top: 4px; }
+.dashboard .db-alert[data-level="info"]    { border-color: rgba(37, 99, 235, 0.35);  background: rgba(37, 99, 235, 0.06); }
+.dashboard .db-alert[data-level="success"] { border-color: rgba(22, 163, 74, 0.35);  background: rgba(22, 163, 74, 0.06); }
+.dashboard .db-alert[data-level="warning"] { border-color: rgba(234, 179, 8, 0.45);  background: rgba(234, 179, 8, 0.08); }
+.dashboard .db-alert[data-level="error"]   { border-color: rgba(220, 38, 38, 0.4);   background: rgba(220, 38, 38, 0.06); }
+
+/* Table — compact, numeric columns right-aligned. */
+.dashboard .db-table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.dashboard .db-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.dashboard .db-table th,
+.dashboard .db-table td { padding: 6px 10px; border-bottom: 1px solid var(--border); text-align: left; }
+.dashboard .db-table tr:last-child td { border-bottom: none; }
+.dashboard .db-table th { background: var(--bg); font-weight: 600; color: var(--text); }
+.dashboard .db-table th[data-numeric="1"],
+.dashboard .db-table td[data-numeric="1"] { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Timeline — left rail + per-item dot. */
+.dashboard .db-timeline { list-style: none; padding: 4px 0 4px 16px; border-left: 2px solid var(--border); display: flex; flex-direction: column; gap: 10px; }
+.dashboard .db-timeline-item { position: relative; padding-left: 8px; }
+.dashboard .db-timeline-item::before {
+  content: "";
+  position: absolute;
+  left: -22px;
+  top: 6px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--primary);
+}
+.dashboard .db-timeline-time  { font-size: 11.5px; color: var(--muted); }
+.dashboard .db-timeline-label { font-size: 13px; font-weight: 600; color: var(--text); }
+.dashboard .db-timeline-body  { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+
+/* Code / Markdown / Image */
+.dashboard .db-code {
+  background: #f8fafc;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0;
+}
+.dashboard .db-markdown { font-size: 13px; line-height: 1.5; }
+.dashboard .db-markdown p { margin: 0.3em 0; }
+.dashboard .db-image { margin: 0; }
+.dashboard .db-image img { max-width: 100%; border-radius: var(--radius-sm); display: block; }
+.dashboard .db-image-caption { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
+
+/* Chart — minimal inline SVG. 6-step categorical palette; pie + xy share it. */
+.dashboard .db-chart { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px; }
+.dashboard .db-chart-svg { width: 100%; height: auto; display: block; }
+.dashboard .db-chart-axis    { stroke: var(--border); stroke-width: 1; }
+.dashboard .db-chart-line    { fill: none; stroke: var(--primary); stroke-width: 2; }
+.dashboard .db-chart-area    { fill: var(--primary); opacity: 0.18; stroke: none; }
+.dashboard .db-chart-dot     { fill: var(--primary); }
+.dashboard .db-chart-bar-rect { fill: var(--primary); opacity: 0.85; }
+.dashboard .db-chart-xlabel  { font-size: 10px; fill: var(--muted); font-family: inherit; }
+.dashboard .db-chart-slice[data-idx="0"] { fill: #2563eb; }
+.dashboard .db-chart-slice[data-idx="1"] { fill: #16a34a; }
+.dashboard .db-chart-slice[data-idx="2"] { fill: #ea580c; }
+.dashboard .db-chart-slice[data-idx="3"] { fill: #9333ea; }
+.dashboard .db-chart-slice[data-idx="4"] { fill: #0891b2; }
+.dashboard .db-chart-slice[data-idx="5"] { fill: #ca8a04; }
+.dashboard .db-chart-legend { list-style: none; padding: 8px 4px 0; margin: 0; display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; }
+.dashboard .db-chart-legend li { display: flex; align-items: center; gap: 6px; color: var(--text); }
+.dashboard .db-chart-legend .db-chart-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+.dashboard .db-chart-legend li[data-idx="0"] .db-chart-swatch { background: #2563eb; }
+.dashboard .db-chart-legend li[data-idx="1"] .db-chart-swatch { background: #16a34a; }
+.dashboard .db-chart-legend li[data-idx="2"] .db-chart-swatch { background: #ea580c; }
+.dashboard .db-chart-legend li[data-idx="3"] .db-chart-swatch { background: #9333ea; }
+.dashboard .db-chart-legend li[data-idx="4"] .db-chart-swatch { background: #0891b2; }
+.dashboard .db-chart-legend li[data-idx="5"] .db-chart-swatch { background: #ca8a04; }
+.dashboard .db-chart-legend .db-chart-val { color: var(--muted); }
+.dashboard .db-chart-empty,
+.dashboard .db-table-empty,
+.dashboard .db-timeline-empty { font-size: 12px; color: var(--muted); padding: 6px 0; }
+
+/* Fallback when a `:::dashboard` block fails to parse — show the raw body
+   so the user can copy it and diagnose, rather than silently dropping. */
+.dashboard-parse-error { border-color: rgba(220, 38, 38, 0.4); }
+
 /* ─── Code view (for .py, .json etc.) ─── */
 .code-view {
   background: #f8fafc;
@@ -1883,14 +2456,356 @@ body.model-not-configured .main-content { flex-direction: column; }
 /* ─── Chat (matches agent-cowork board) ─── */
 .chat-container {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   height: 100%;
   background: #f8fafc;
   position: relative;
-  /* Used by `.chat-input-form { width: 40cqw }`. */
-  container-type: inline-size;
 }
 
+.chat-main-pane {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: #f8fafc;
+  /* Used by `.chat-input-form { width: 40cqw }`. */
+  container-type: inline-size;
+  --chat-input-reserve: 140px;
+}
+
+.conversation-info-toggle {
+  position: absolute;
+  top: 16px;
+  right: 18px;
+  z-index: 12;
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.92);
+  color: #64748b;
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.08);
+  cursor: pointer;
+  transition: top 120ms ease, background 120ms ease, color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+}
+.chat-main-pane.has-project-empty-banner .conversation-info-toggle {
+  top: 62px;
+}
+.conversation-info-toggle:hover,
+.conversation-info-toggle.is-active {
+  background: #fff;
+  color: var(--primary);
+  border-color: rgba(37, 99, 235, 0.35);
+  box-shadow: 0 8px 22px rgba(37, 99, 235, 0.14);
+}
+.conversation-info-toggle-icon {
+  width: 18px;
+  height: 18px;
+}
+
+.conversation-info-panel {
+  flex: 0 0 min(380px, 36vw);
+  width: min(380px, 36vw);
+  min-width: 320px;
+  max-width: 420px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-left: 1px solid var(--border);
+  background: #fff;
+  color: var(--text);
+  box-shadow: -12px 0 28px rgba(15, 23, 42, 0.05);
+  z-index: 20;
+}
+.conversation-info-panel[hidden] { display: none !important; }
+.conversation-info-header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 16px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.conversation-info-title {
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--text);
+}
+.conversation-info-close {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+.conversation-info-close:hover {
+  color: #0f172a;
+  background: #f1f5f9;
+  border-color: #e2e8f0;
+}
+.conversation-info-tabs {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 4px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.conversation-info-tab {
+  flex: 1 1 0;
+  min-width: 0;
+  border: none;
+  border-radius: 8px;
+  padding: 7px 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+}
+.conversation-info-tab:hover { color: var(--text); background: #f8fafc; }
+.conversation-info-tab.is-active {
+  color: var(--text);
+  background: var(--accent-soft, #eef2ff);
+  font-weight: 600;
+}
+.conversation-info-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+}
+.conversation-info-empty {
+  min-height: 160px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 18px;
+  color: #94a3b8;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.conversation-info-empty.is-small {
+  min-height: 0;
+  justify-content: flex-start;
+  padding: 8px 0;
+  font-size: 12px;
+}
+.conversation-info-empty.is-error { color: var(--danger); }
+
+.conversation-info-task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.conversation-info-task {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+  overflow: hidden;
+}
+.conversation-info-task-summary {
+  display: flex;
+  align-items: center;
+  padding: 12px 12px 6px;
+}
+.conversation-info-task-title {
+  display: block;
+  color: #0f172a;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.conversation-info-task-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 8px 12px 14px;
+}
+.conversation-info-step {
+  padding: 0;
+}
+.conversation-info-step-head {
+  display: grid;
+  grid-template-columns: 18px auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 6px;
+}
+.conversation-info-step-icon {
+  width: 18px;
+  height: 18px;
+  color: #64748b;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 1px;
+}
+.conversation-info-step-status-icon {
+  width: 16px;
+  height: 16px;
+}
+.conversation-info-step.is-done .conversation-info-step-icon { color: #16a34a; }
+.conversation-info-step.is-in_progress .conversation-info-step-icon { color: #2563eb; }
+.conversation-info-step.is-failed .conversation-info-step-icon { color: #dc2626; }
+.conversation-info-step.is-skipped .conversation-info-step-icon { color: #94a3b8; }
+.conversation-info-step.is-blocked .conversation-info-step-icon { color: #d97706; }
+.conversation-info-step-index {
+  color: #64748b;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.45;
+}
+.conversation-info-step-title {
+  min-width: 0;
+  color: #0f172a;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.conversation-info-status {
+  justify-self: end;
+  max-width: 92px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-radius: 999px;
+  padding: 2px 6px;
+  background: #f1f5f9;
+  color: #64748b;
+  font-size: 10px;
+  font-weight: 600;
+}
+.conversation-info-step-meta,
+.conversation-info-step-reason {
+  margin-top: 3px;
+  margin-left: 24px;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.conversation-info-step-reason { color: var(--danger); }
+
+.conversation-info-tree,
+.conversation-info-attachment-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.conversation-info-dir {
+  display: flex;
+  flex-direction: column;
+}
+.conversation-info-dir-summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 4px 8px 4px calc(8px + var(--depth, 0) * 14px);
+  border-radius: 8px;
+  color: #475569;
+  font-size: 12px;
+  cursor: pointer;
+  list-style: none;
+}
+.conversation-info-dir-summary::-webkit-details-marker { display: none; }
+.conversation-info-dir-summary:hover { background: #f8fafc; }
+.conversation-info-dir-folder-icon {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #f59e0b;
+}
+.conversation-info-dir-svg-icon {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+.conversation-info-dir-folder-open { display: none; }
+.conversation-info-dir[open] > .conversation-info-dir-summary .conversation-info-dir-folder-closed { display: none; }
+.conversation-info-dir[open] > .conversation-info-dir-summary .conversation-info-dir-folder-open { display: inline-flex; }
+.conversation-info-dir-name,
+.conversation-info-file-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conversation-info-file,
+.conversation-info-attachment {
+  width: 100%;
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border: none;
+  border-radius: 8px;
+  padding: 5px 8px 5px calc(8px + var(--depth, 0) * 14px);
+  background: transparent;
+  color: #334155;
+  font-size: 12px;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.conversation-info-file:hover,
+.conversation-info-attachment:hover { background: #f1f5f9; }
+.conversation-info-file-icon {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  font-size: 14px;
+  line-height: 1;
+}
+.conversation-info-attachment {
+  padding-left: 8px;
+  border: 1px solid transparent;
+}
+.conversation-info-attachment:hover { border-color: #e2e8f0; }
+.conversation-info-attachment-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.conversation-info-attachment-meta {
+  color: #94a3b8;
+  font-size: 11px;
+}
+
+@media (max-width: 920px) {
+  .conversation-info-panel {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(360px, calc(100% - 48px));
+    min-width: 0;
+    flex-basis: auto;
+  }
+}
 
 /* Inline "创建智能体" entry pinned to the end of #chat-history — divider
    lines on both sides with a small button in the middle. Hidden during
@@ -1941,13 +2856,13 @@ body.model-not-configured .main-content { flex-direction: column; }
   min-height: 0;
   /* Bottom: 80px **inside** the scroll viewport so when the user
      scrolls all the way down the last bubble has breathing room above
-     the floating input area / attachment chips. The 140px margin-bottom
-     keeps the scrollbar track clear of the floating input so the thumb
-     stays visible at the end. We use padding-bottom (NOT bigger margin)
+     the floating input area / attachment chips. The margin-bottom follows
+     the measured floating input wrapper height so quote previews / queues
+     keep the scrollbar track clear of the composer. We use padding-bottom (NOT bigger margin)
      because the goal is more whitespace inside the scroll view, not
      pushing the viewport upward — that was the wrong fix earlier. */
   padding: 24px 10% 80px;
-  margin-bottom: 140px;
+  margin-bottom: var(--chat-input-reserve, 140px);
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -2052,6 +2967,11 @@ body.model-not-configured .main-content { flex-direction: column; }
   caret-color: var(--text);
   -webkit-text-fill-color: transparent;
 }
+.chat-input-mirror-wrap textarea::placeholder {
+  color: transparent;
+  opacity: 0;
+  -webkit-text-fill-color: transparent;
+}
 .chat-input-mirror {
   position: absolute;
   inset: 0;
@@ -2071,6 +2991,10 @@ body.model-not-configured .main-content { flex-direction: column; }
   letter-spacing: 0;
   tab-size: 4;
   box-sizing: border-box;
+}
+.chat-input-mirror:empty::before {
+  content: attr(data-placeholder);
+  color: #94a3b8;
 }
 .chat-input-mirror .msg-mention {
   color: var(--accent, #2563eb);
@@ -2104,7 +3028,15 @@ body.model-not-configured .main-content { flex-direction: column; }
   transform: none;
 }
 
-.chat-send-btn .stop-icon { display: none; }
+.chat-send-btn .send-icon {
+  width: 18px;
+  height: 18px;
+}
+.chat-send-btn .stop-icon {
+  width: 16px;
+  height: 16px;
+  display: none;
+}
 .chat-send-btn.streaming {
   background: #dc2626;
 }
@@ -2185,6 +3117,9 @@ body.model-not-configured .main-content { flex-direction: column; }
   max-width: 240px;
 }
 .chat-attach-chip .chat-attach-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   font-size: 14px;
   line-height: 1;
   flex-shrink: 0;
@@ -2302,6 +3237,15 @@ body.model-not-configured .main-content { flex-direction: column; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.chat-quote-preview .chat-quote-file .chat-file-kind-icon {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+}
+.chat-quote-preview .chat-quote-file-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 /* "+" button — sits left of the textarea inside .chat-input-area */
 .chat-attach-btn {
@@ -2323,6 +3267,32 @@ body.model-not-configured .main-content { flex-direction: column; }
 .chat-attach-btn:hover {
   background: #f1f5f9;
   color: #334155;
+}
+
+/* Mic button — voice-to-text. Reuses .chat-attach-btn's box; adds the
+   recording / finalizing states. Stripped in OrkasOpen — see
+   OpenSource/SyncCode/strip-rules.json. */
+.chat-mic-btn svg { display: block; }
+.chat-mic-icon {
+  width: 15px;
+  height: 15px;
+}
+.chat-mic-btn.is-recording {
+  color: #dc2626;
+  background: #fee2e2;
+  animation: chat-mic-pulse 1.3s ease-in-out infinite;
+}
+.chat-mic-btn.is-recording:hover {
+  color: #dc2626;
+  background: #fecaca;
+}
+.chat-mic-btn.is-busy {
+  color: #94a3b8;
+  cursor: default;
+}
+@keyframes chat-mic-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.28); }
+  60% { box-shadow: 0 0 0 5px rgba(220, 38, 38, 0); }
 }
 
 /* Bottom row inside the input area: [+] [recipient] [project] [skill]
@@ -2363,6 +3333,14 @@ body.model-not-configured .main-content { flex-direction: column; }
   background: #fff;
   border-color: rgba(37, 99, 235, 0.2);
   color: #1e293b;
+}
+.chat-msg-attach-icon,
+.chat-msg-produced-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  line-height: 1;
 }
 .chat-message.user .chat-msg-attach-icon { color: #334155; }
 .chat-msg-attach.is-image {
@@ -2499,8 +3477,268 @@ body.model-not-configured .main-content { flex-direction: column; }
 }
 .chat-lightbox-close:hover { background: #f1f5f9; }
 
+/* In-app file preview overlay (chat-file-viewer.js). Mounted once into
+   <body> on first openChatFileViewer(). Same backdrop chrome as the image
+   lightbox; differs in that the stage is a fixed sheet (header + body)
+   instead of a free-floating image. */
+.chat-file-viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: none;
+  align-items: center;
+  justify-content: center;
+}
+.chat-file-viewer.is-open { display: flex; }
+.chat-file-viewer-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.82);
+}
+.chat-file-viewer-stage {
+  position: relative;
+  width: 92vw;
+  height: 92vh;
+  max-width: 1280px;
+  background: #fff;
+  border-radius: 10px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.4);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.chat-file-viewer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid #e2e8f0;
+  background: #f8fafc;
+  flex-shrink: 0;
+}
+.chat-file-viewer-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #0f172a;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  margin-right: 12px;
+}
+.chat-file-viewer-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.chat-file-viewer-md-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.chat-file-viewer-md-actions:empty { display: none; }
+.chat-file-viewer-md-actions .btn {
+  min-height: 28px;
+  white-space: nowrap;
+}
+.chat-file-viewer-md-actions .ctx-viewer-action-icon-btn {
+  width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: #475569;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.chat-file-viewer-md-actions .ctx-viewer-action-icon-btn:hover {
+  background: #e2e8f0;
+  color: #0f172a;
+}
+.chat-file-viewer-md-actions .ctx-viewer-action-icon-btn.btn-primary {
+  background: transparent;
+  color: var(--primary);
+}
+.chat-file-viewer-md-actions .ctx-viewer-action-icon-btn.btn-primary:hover {
+  background: rgba(59, 130, 246, 0.10);
+  color: var(--primary-hover);
+}
+.chat-file-viewer-md-actions .ctx-viewer-action-icon-btn.btn-danger {
+  color: var(--danger);
+}
+.chat-file-viewer-md-actions .ctx-viewer-action-icon {
+  width: 15px;
+  height: 15px;
+  display: block;
+}
+.chat-file-viewer-reveal,
+.chat-file-viewer-close {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: #475569;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 120ms ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.chat-file-viewer-reveal:hover,
+.chat-file-viewer-close:hover { background: #e2e8f0; color: #0f172a; }
+.chat-file-viewer-reveal svg { display: block; }
+.chat-file-viewer-close { font-size: 20px; }
+.chat-file-viewer-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: #fff;
+}
+.chat-file-viewer.is-markdown .chat-file-viewer-body {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+/* iframe-based body (pdf / html) fills the body slot. The body itself
+   handles scroll for non-iframe bodies (md / text). */
+.chat-file-viewer-pdf,
+.chat-file-viewer-html {
+  width: 100%;
+  height: 100%;
+  border: none;
+  display: block;
+}
+.chat-file-viewer-video-wrap {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #020617;
+}
+.chat-file-viewer-video {
+  max-width: 100%;
+  max-height: 100%;
+  background: #020617;
+}
+.chat-file-viewer-md {
+  padding: 24px 32px;
+  color: #0f172a;
+  font-size: 14px;
+  line-height: 1.7;
+  max-width: 880px;
+  margin: 0 auto;
+}
+.chat-file-viewer.is-markdown .chat-file-viewer-body > .ctx-viewer-md {
+  flex: 1 1 auto;
+  width: 100%;
+  max-width: 880px;
+  min-height: 0;
+  margin: 0 auto;
+  padding: 24px 32px;
+  box-sizing: border-box;
+  overflow: auto;
+  color: #0f172a;
+  font-size: 14px;
+  line-height: 1.7;
+}
+.chat-file-viewer.is-markdown .ctx-editor-toolbar {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 8px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+}
+.chat-file-viewer.is-markdown .ctx-editor-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
+.chat-file-viewer.is-markdown .ctx-viewer-editor {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 16px 20px;
+  border: 0;
+  border-radius: 0;
+  outline: 0;
+  resize: none;
+}
+.chat-file-viewer.is-markdown .ctx-editor-preview {
+  flex: 1 1 auto;
+  width: 100%;
+  max-width: 880px;
+  min-height: 0;
+  margin: 0 auto;
+  padding: 24px 32px;
+  border: 0;
+  border-radius: 0;
+  box-sizing: border-box;
+  overflow: auto;
+}
+.chat-file-viewer-text {
+  padding: 20px 24px;
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #0f172a;
+  background: #f8fafc;
+  white-space: pre-wrap;
+  word-break: break-word;
+  min-height: 100%;
+  box-sizing: border-box;
+}
+/* Mirrors .is-markdown's flex layout: body becomes a flex column so the
+   <pre> view or <textarea> editor (both direct children of the body) can
+   fill the available height and own their own scroll. */
+.chat-file-viewer.is-text .chat-file-viewer-body {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.chat-file-viewer.is-text .chat-file-viewer-body > .chat-file-viewer-text {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+.chat-file-viewer.is-text .chat-file-viewer-body > .ctx-viewer-editor {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 16px 20px;
+  border: 0;
+  border-radius: 0;
+  outline: 0;
+  resize: none;
+}
+.chat-file-viewer-loading {
+  padding: 40px;
+  text-align: center;
+  color: #64748b;
+  font-size: 13px;
+}
+
+/* Attachment chips that aren't images / videos are clickable too
+   (chat-file-viewer); surface the affordance with the same hover treatment
+   as image chips. */
+.chat-msg-attach.is-clickable {
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.chat-msg-attach.is-clickable:hover {
+  background: rgba(59, 130, 246, 0.08);
+}
+
 /* Files produced by the assistant (write_file / markdown_to_pdf / html_to_pdf).
-   Same visual language as attachments; click reveals in Finder/Explorer. */
+   Same visual language as attachments; click opens the in-app preview overlay
+   (or, on unsupported types, falls back to a dialog with "open folder"). */
 .chat-msg-produced {
   display: flex;
   flex-wrap: wrap;
@@ -2524,6 +3762,22 @@ body.model-not-configured .main-content { flex-direction: column; }
 .chat-msg-produced-item:hover {
   background: rgba(34, 197, 94, 0.16);
 }
+.chat-file-kind-icon {
+  display: block;
+  width: 16px;
+  height: 16px;
+  color: currentColor;
+}
+.chat-file-kind-icon.is-image { color: #16a34a; }
+.chat-file-kind-icon.is-video { color: #7c3aed; }
+.chat-file-kind-icon.is-audio { color: #db2777; }
+.chat-file-kind-icon.is-pdf { color: #dc2626; }
+.chat-file-kind-icon.is-doc { color: #2563eb; }
+.chat-file-kind-icon.is-text,
+.chat-file-kind-icon.is-file { color: #64748b; }
+.chat-file-kind-icon.is-data { color: #0891b2; }
+.chat-file-kind-icon.is-archive { color: #b45309; }
+.chat-file-kind-icon.is-code { color: #475569; }
 .chat-msg-produced-label {
   display: inline-block;
   overflow: hidden;
@@ -2821,6 +4075,214 @@ body.model-not-configured .main-content { flex-direction: column; }
   color: var(--muted);
 }
 
+/* Marketplace install request card. Same inline-panel scale as input forms:
+   the user explicitly approves before any marketplace resource is installed. */
+.chat-marketplace-request {
+  margin-top: 10px;
+  width: min(360px, 100%);
+  max-width: 100%;
+  min-width: 280px;
+  background: #fff;
+  border-color: rgba(0,0,0,0.08);
+}
+.chat-marketplace-request.is-installed {
+  background: #fff;
+  border-color: rgba(34, 197, 94, 0.26);
+}
+.chat-marketplace-request.is-skipped {
+  background: #fff;
+  border-color: rgba(148, 163, 184, 0.35);
+}
+.chat-marketplace-request.is-failed {
+  background: #fff;
+  border-color: rgba(239, 68, 68, 0.28);
+}
+.chat-marketplace-request-head {
+  align-items: center;
+}
+.marketplace-card-header.chat-marketplace-request-head {
+  align-items: center;
+}
+.chat-marketplace-request-avatar {
+  flex: 0 0 auto;
+}
+.chat-marketplace-request-main {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.chat-marketplace-request-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.marketplace-card-name.chat-marketplace-request-title { flex: 0 1 auto; }
+.chat-marketplace-request-kind { flex: 0 0 auto; }
+.chat-marketplace-request-status {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(0,0,0,0.05);
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+}
+.chat-marketplace-request-error {
+  line-height: 1.45;
+  color: var(--muted);
+}
+.chat-marketplace-request-error { color: var(--danger); }
+.chat-marketplace-request-actions {
+  gap: 6px;
+}
+.chat-marketplace-request.is-busy {
+  opacity: 0.82;
+}
+
+/* Interactive web-app artifact card — sandboxed `<iframe>` over the
+   `chat-app://` protocol, embedded inside the assistant `.chat-bubble`.
+   See modules/chat-artifact.js. Understated chrome (a title bar + reload)
+   so it reads as an inline panel, not a separate window. */
+.chat-artifact-host { margin-top: 10px; }
+.chat-artifact-card {
+  width: 40cqw;
+  max-width: 100%;
+  min-width: 280px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--bg);
+}
+.chat-artifact-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 6px 10px;
+  background: rgba(127, 127, 127, 0.06);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.chat-artifact-title {
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 0 1 auto;
+}
+.chat-artifact-spacer { flex: 1 1 auto; }
+.chat-artifact-header .btn-sm { flex: 0 0 auto; }
+.chat-artifact-more {
+  /* A compact `⋯` button — slimmer than the default `.btn-sm` padding so it
+     reads as a quiet header affordance. */
+  padding: 2px 8px;
+  font-size: 15px;
+  line-height: 1;
+}
+.chat-artifact-more.is-menu-open { background: rgba(15, 23, 42, 0.08); }
+.chat-artifact-frame {
+  display: block;
+  width: 100%;
+  border: 0;
+  background: #fff;
+}
+/* Card-header `⋯` popover (reload / open in browser / save) + the My Apps
+   panel's per-card `⋯` popover — both mirror `.agent-row-menu`'s look. */
+.chat-artifact-menu,
+.app-row-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 120px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(15, 23, 42, 0.12);
+  padding: 4px 0;
+}
+.chat-artifact-menu-item,
+.app-row-menu-item {
+  padding: 6px 14px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+.chat-artifact-menu-item:hover,
+.app-row-menu-item:hover { background: #f1f5f9; }
+.app-row-menu-item.is-danger { color: #dc2626; }
+.app-row-menu-item.is-danger:hover { background: #fef2f2; }
+
+/* ─── "My Apps" panel — user-kept create_artifact bundles (saved-apps.js) ───
+   Reuses the agents-tab layout shells (`.agents-grid-view` / `-header` /
+   `-scroll` / `.agents-empty`); only the card grid + card need their own
+   classes (the agents tab binds a global `.agent-card` click handler). */
+.apps-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 16px;
+  padding: 8px 0 16px;
+}
+.app-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: border-color 0.12s, box-shadow 0.12s;
+  min-height: 84px;
+}
+.app-card:hover {
+  border-color: rgba(37, 99, 235, 0.45);
+  box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
+}
+.app-card.is-menu-open { border-color: rgba(37, 99, 235, 0.45); }
+.app-card-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 22px;
+}
+.app-card-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.app-card-more {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  margin-right: -4px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1;
+  border-radius: 4px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  visibility: hidden;
+}
+.app-card:hover .app-card-more,
+.app-card.is-menu-open .app-card-more { visibility: visible; }
+.app-card-more:hover { background: rgba(15, 23, 42, 0.08); color: #334155; }
+.app-card-hint {
+  font-size: 12px;
+  color: #94a3b8;
+}
+
 .chat-queue-header {
   display: flex;
   align-items: center;
@@ -3022,6 +4484,20 @@ body.model-not-configured .main-content { flex-direction: column; }
   font-weight: 500;
   color: var(--text, #1f2937);
 }
+.chat-msg-from.is-agent-link {
+  cursor: pointer;
+  border-radius: 4px;
+  transition: color 0.12s, background 0.12s;
+}
+.chat-msg-from.is-agent-link:hover {
+  color: var(--primary, #2563eb);
+  background: rgba(37, 99, 235, 0.08);
+}
+.chat-msg-from.is-agent-link:focus-visible,
+.chat-msg-header .avatar-circle.is-clickable:focus-visible {
+  outline: 2px solid rgba(37, 99, 235, 0.45);
+  outline-offset: 2px;
+}
 .chat-msg-from:empty {
   display: none;
 }
@@ -3099,12 +4575,20 @@ body.model-not-configured .main-content { flex-direction: column; }
 /* Plan announcement card — rendered as the leading line of the bubble
  * when commander emits its initial plan_set message. */
 .chat-plan-announce {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 12px;
   font-weight: 600;
   color: var(--text-muted, #6b7280);
   margin-bottom: 6px;
   padding-bottom: 6px;
   border-bottom: 1px dashed var(--border-soft, #e5e7eb);
+}
+.chat-plan-announce-icon {
+  width: 14px;
+  height: 14px;
+  color: var(--primary);
 }
 
 .chat-bubble {
@@ -3204,14 +4688,14 @@ body.model-not-configured .main-content { flex-direction: column; }
      this baseline and read as supporting context. */
   color: #94a3b8;
   font-family: ui-monospace, SFMono-Regular, monospace;
-  /* Force text-style rendering for symbols like ▶ ✓ ◆ ⚙ ▸ ✎ — otherwise
-     some systems render them as larger colored emoji glyphs. */
-  font-variant-emoji: text;
 }
 .stream-process-body::-webkit-scrollbar { width: 4px; }
 .stream-process-body::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 3px; }
 
 .stream-process-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
   padding: 1px 0;
   white-space: pre-wrap;
   word-break: break-all;
@@ -3234,19 +4718,49 @@ body.model-not-configured .main-content { flex-direction: column; }
                   and (b) folding into Normal loses the "someone is
                   waiting on you" signal at the rail level.
      4. Error   — hard error / failed tool; red-500 + 500 weight.
-   Glyphs in `_processKindOf` map into these classes — adding a new
-   glyph there needs a matching rule here, otherwise the line falls
-   back to the Normal baseline. */
-.stream-process-line.kind-bound { color: #64748b; font-weight: 500; }   /* ▶ ●  lifecycle milestones */
-.stream-process-line.kind-tool  { color: #64748b; font-weight: 500; }   /* ■    tool call */
-.stream-process-line.kind-plan  { color: #64748b; font-weight: 500; }   /* ▣    plan announcement */
-.stream-process-line.kind-patch { color: #64748b; font-weight: 500; }   /* ◉    file change */
-.stream-process-line.kind-think { color: #94a3b8; }                      /* ◆ ◇  reasoning / reply markers */
-.stream-process-line.kind-live  { color: #94a3b8; }                      /* ◐    live generating */
-.stream-process-line.kind-out   { color: #94a3b8; }                      /* ▷    command stdout */
-.stream-process-line.kind-meta  { color: #94a3b8; }                      /* ▪    fallback / lifecycle meta */
-.stream-process-line.kind-warn  { color: #d97706; }                      /* ○    awaiting approval / cli stderr */
-.stream-process-line.kind-err   { color: #ef4444; font-weight: 500; }   /* ◯ ✗  hard error / failed tool */
+   `_eventProcessKind` maps events into these classes; old persisted
+   glyph-prefixed rows are normalized at render time. */
+.stream-process-line.kind-bound { color: #64748b; font-weight: 500; }
+.stream-process-line.kind-tool  { color: #64748b; font-weight: 500; }
+.stream-process-line.kind-plan  { color: #64748b; font-weight: 500; }
+.stream-process-line.kind-patch { color: #64748b; font-weight: 500; }
+.stream-process-line.kind-think { color: #94a3b8; }
+.stream-process-line.kind-live  { color: #94a3b8; }
+.stream-process-line.kind-out   { color: #94a3b8; }
+.stream-process-line.kind-meta  { color: #94a3b8; }
+.stream-process-line.kind-warn  { color: #d97706; }
+.stream-process-line.kind-err   { color: #ef4444; font-weight: 500; }
+.stream-process-line.kind-info  { color: #6366f1; }
+.stream-process-icon {
+  width: 13px;
+  height: 13px;
+  margin-top: 2px;
+}
+.stream-process-text {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+/* Expandable tool-result row: cursor hint + subtle underline on hover.
+   Used for CLI tool-event(result) rows whose full output spilled to
+   disk; click reveals a `.stream-process-line-full` <pre> sibling. */
+.stream-process-line.is-expandable { cursor: pointer; }
+.stream-process-line.is-expandable:hover { text-decoration: underline; text-decoration-color: rgba(0,0,0,0.25); }
+.stream-process-line-full {
+  margin: 4px 0 8px 16px;
+  padding: 8px 12px;
+  background: rgba(0,0,0,0.04);
+  border-left: 2px solid rgba(0,0,0,0.15);
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #475569;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 320px;
+  overflow: auto;
+}
 
 .stream-final {
   /* Appears below process section with a subtle divider when process is open */
@@ -3403,15 +4917,14 @@ body.model-not-configured .main-content { flex-direction: column; }
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  padding: 3px 6px 3px 10px;
-  background: rgba(37, 99, 235, 0.1);
-  border: 1px solid rgba(37, 99, 235, 0.25);
+  padding: 4px 6px 4px 10px;
+  background: rgba(37, 99, 235, 0.08);
+  border: 1px solid rgba(37, 99, 235, 0.22);
   color: var(--primary);
-  border-radius: 10px;
+  border-radius: 14px;
   font-size: 12px;
   font-weight: 500;
   line-height: 1.4;
-  margin-bottom: 2px;
   align-self: center;
 }
 
@@ -3500,10 +5013,24 @@ body.model-not-configured .main-content { flex-direction: column; }
 }
 
 .chat-skill-chip .chip-label {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
   max-width: 160px;
+}
+
+.chat-skill-chip .chip-label-prefix {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.chat-skill-chip .chip-label-name {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--primary);
 }
 
 .chat-skill-chip .chip-close {
@@ -3622,8 +5149,13 @@ body.model-not-configured .main-content { flex-direction: column; }
 
 .workspace-menu-check {
   flex-shrink: 0;
-  font-size: 15px;
   color: var(--text);
+  display: inline-flex;
+  align-items: center;
+}
+.workspace-check-icon {
+  width: 15px;
+  height: 15px;
 }
 
 .workspace-menu-sep {
@@ -3634,8 +5166,8 @@ body.model-not-configured .main-content { flex-direction: column; }
 
 .skill-picker {
   position: fixed;
-  width: 300px;
-  max-height: 340px;
+  width: 340px;
+  max-height: 380px;
   background: #fff;
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -3644,6 +5176,38 @@ body.model-not-configured .main-content { flex-direction: column; }
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+.skill-picker-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+  padding: 8px 8px 0;
+  background: #fff;
+}
+
+.skill-picker-tab {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.skill-picker-tab:hover {
+  background: #f8fafc;
+  color: var(--text);
+}
+
+.skill-picker-tab.active {
+  background: rgba(37, 99, 235, 0.1);
+  border-color: rgba(37, 99, 235, 0.22);
+  color: var(--primary);
 }
 
 .skill-picker-header {
@@ -3838,6 +5402,10 @@ body.model-not-configured .main-content { flex-direction: column; }
 .ctx-viewer-binary-icon {
   font-size: 56px;
   line-height: 1;
+}
+.ctx-viewer-binary-icon .chat-file-kind-icon {
+  width: 56px;
+  height: 56px;
 }
 .ctx-viewer-binary-name {
   font-size: 14px;
@@ -4133,7 +5701,7 @@ body.model-not-configured .main-content { flex-direction: column; }
 
 .ctx-viewer-editor {
   width: 100%;
-  min-height: 420px;
+  min-height: 380px;
   height: 100%;
   box-sizing: border-box;
   padding: 14px 16px;
@@ -4149,6 +5717,88 @@ body.model-not-configured .main-content { flex-direction: column; }
 .ctx-viewer-editor:focus {
   border-color: var(--primary, #3b82f6);
   box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.12);
+}
+
+/* KB new-text markdown editor — toolbar above the textarea / preview */
+.ctx-editor-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 8px;
+  margin-bottom: 8px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.ctx-editor-toolbar .btn-icon {
+  min-width: 30px;
+  height: 28px;
+  padding: 0 8px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Monaco, monospace;
+  font-size: 12px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.ctx-editor-toolbar .btn-icon.is-bold { font-weight: 700; }
+.ctx-editor-toolbar .btn-icon.is-italic { font-style: italic; }
+.ctx-editor-toolbar .btn-icon.is-strike { text-decoration: line-through; }
+.ctx-editor-toolbar .btn-icon[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.ctx-editor-svg-icon {
+  width: 15px;
+  height: 15px;
+}
+.ctx-editor-toolbar-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--border);
+  margin: 0 4px;
+}
+.ctx-editor-toolbar-spacer { flex: 1; }
+.ctx-editor-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+}
+.ctx-editor-toggle-icon {
+  width: 14px;
+  height: 14px;
+}
+.ctx-editor-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 380px;
+}
+.ctx-editor-body .ctx-viewer-editor { flex: 1; }
+.ctx-editor-preview {
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  padding: 14px 16px;
+  background: #fff;
+  min-height: 380px;
+  overflow: auto;
+}
+
+/* KB todo list — interactive checkboxes inside the read-mode markdown view.
+   `renderMarkdown` already emits `<li class="task-item"><input type=checkbox>
+   …</li>`; contexts.js layers click handling + the `is-done` toggle on top. */
+.ctx-viewer-md li.task-item { list-style: none; margin-left: -16px; }
+.ctx-viewer-md li.task-item input[type="checkbox"] {
+  margin-right: 6px;
+  vertical-align: middle;
+}
+.ctx-viewer-md li.task-item input[type="checkbox"]:not([disabled]) {
+  cursor: pointer;
+}
+.ctx-viewer-md li.task-item.is-done {
+  color: var(--muted, #94a3b8);
+  text-decoration: line-through;
 }
 
 /* ─── Agents ─── */
@@ -4470,7 +6120,17 @@ body.model-not-configured .main-content { flex-direction: column; }
   transition: box-shadow 0.15s, background 0.15s;
 }
 .plan-rail-header:hover { background: #f8fafc; box-shadow: 0 2px 6px rgba(15, 23, 42, 0.12); }
-.plan-rail-title { flex: 0 0 auto; }
+.plan-rail-title {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.plan-rail-title .ui-icon {
+  width: 14px;
+  height: 14px;
+  color: var(--primary);
+}
 .plan-rail-progress {
   flex: 0 0 auto;
   color: var(--text);
@@ -4523,7 +6183,22 @@ body.model-not-configured .main-content { flex-direction: column; }
   align-items: baseline;
   gap: 6px;
 }
-.plan-rail-step-icon { font-size: 14px; line-height: 1; flex: 0 0 auto; }
+.plan-rail-step-icon {
+  line-height: 1;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+}
+.plan-rail-svg-icon {
+  width: 15px;
+  height: 15px;
+}
+.plan-rail-step.is-pending .plan-rail-svg-icon { color: #64748b; }
+.plan-rail-step.is-in_progress .plan-rail-svg-icon { color: var(--primary); }
+.plan-rail-step.is-done .plan-rail-svg-icon { color: #16a34a; }
+.plan-rail-step.is-failed .plan-rail-svg-icon { color: var(--danger); }
+.plan-rail-step.is-skipped .plan-rail-svg-icon { color: #94a3b8; }
+.plan-rail-step.is-blocked .plan-rail-svg-icon { color: #d97706; }
 .plan-rail-step-num {
   font-variant-numeric: tabular-nums;
   opacity: 0.6;
@@ -4536,11 +6211,19 @@ body.model-not-configured .main-content { flex-direction: column; }
   line-height: 1.4;
 }
 .plan-rail-step-transient {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
   font-size: 12px;
   color: var(--text);
   opacity: 0.7;
   white-space: nowrap;
   flex: 0 0 auto;
+}
+.plan-rail-transient-icon {
+  width: 12px;
+  height: 12px;
+  color: #7c3aed;
 }
 /* Assignee on its own line, indented under the title text (icon + num
    take ~32px). Smaller font, primary color, single line with ellipsis. */
@@ -4568,12 +6251,12 @@ body.model-not-configured .main-content { flex-direction: column; }
   padding-top: 4px;
 }
 
-/* Per-status accents — only on the title to avoid icon recoloring (the
-   emoji carries its own color). */
+/* Per-status accents — only on the title. Icons carry status color via
+   .plan-rail-svg-icon rules above. */
 .plan-rail-step.is-done    .plan-rail-step-title { opacity: 0.65; text-decoration: line-through; text-decoration-color: rgba(0,0,0,0.2); }
 .plan-rail-step.is-skipped .plan-rail-step-title { opacity: 0.55; }
 .plan-rail-step.is-failed  .plan-rail-step-title { color: var(--danger); }
-.plan-rail-step.is-blocked .plan-rail-step-title { color: var(--text); /* neutral — the 📝 icon already conveys "awaiting input" */ }
+.plan-rail-step.is-blocked .plan-rail-step-title { color: var(--text); }
 .plan-rail-step.is-in_progress .plan-rail-step-title { color: var(--primary); font-weight: 500; }
 
 /* Detail-page action button row (shared across skills / agents / contexts).
@@ -4815,7 +6498,8 @@ body.model-not-configured .main-content { flex-direction: column; }
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 /* When no chip is present, the play button still hugs the right edge.
    `margin-left: auto` plays nice with the absent-chip case. */
@@ -4838,21 +6522,6 @@ body.model-not-configured .main-content { flex-direction: column; }
   background: #fff;
   flex-shrink: 0;
 }
-
-.agents-back-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  border: none;
-  background: transparent;
-  color: var(--muted);
-  font-size: 13px;
-  cursor: pointer;
-  padding: 4px 8px;
-  border-radius: 6px;
-  font-family: inherit;
-}
-.agents-back-btn:hover { background: #f1f5f9; color: var(--text); }
 
 .agent-row-menu {
   position: fixed;
@@ -4901,8 +6570,11 @@ body.model-not-configured .main-content { flex-direction: column; }
   overflow-y: auto;
 }
 
+/* Compact header matches the marketplace detail density (.marketplace-detail-header):
+   tighter padding + title 16px so the in-app agent / skill detail and the marketplace
+   detail read as one chrome family. Body sections below keep their original spacing. */
 .agents-detail-header {
-  padding: 20px 32px 14px;
+  padding: 14px 20px;
   border-bottom: 1px solid var(--border);
   background: #fff;
   flex-shrink: 0;
@@ -4911,23 +6583,29 @@ body.model-not-configured .main-content { flex-direction: column; }
 .agents-detail-title-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
+  gap: 8px;
+  flex-wrap: nowrap;
 }
 
 .agents-detail-name {
   min-width: 0;
-  font-size: 17px;
+  font-size: 16px;
   font-weight: 600;
   color: var(--text);
   line-height: 1.4;
-  padding: 2px 6px;
-  margin-left: -6px;
+  padding: 2px 4px;
+  margin-left: -4px;
   border-radius: 6px;
   outline: none;
-  min-height: 24px;
+  min-height: 22px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 0 1 auto;   /* natural width + shrink for very long names */
 }
+/* Source chip stays glued to the name; actions hug the right via `margin-left:auto`. */
+.agents-detail-title-row > .agents-detail-source { flex-shrink: 0; }
+.agents-detail-title-row > .detail-actions { flex-shrink: 0; margin-left: auto; }
 .agents-detail-name.is-editing {
   background: #fff;
   box-shadow: 0 0 0 1px var(--border-strong) inset;
@@ -4951,12 +6629,14 @@ body.model-not-configured .main-content { flex-direction: column; }
 .agents-detail-source.is-custom  { background: rgba(37, 99, 235, 0.12); color: var(--primary); }
 
 /* ── Body: simple vertical stack of sections, each full-width ── */
+/* Padding matches `.skills-detail-content` + `.marketplace-detail-header` so the three
+   detail surfaces (app agent / app skill / marketplace preview) share one chrome density. */
 .agents-detail-body {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding: 20px 32px 24px;
+  padding: 14px 20px 28px;
   gap: 20px;
   overflow-y: auto;
 }
@@ -5123,6 +6803,14 @@ body.model-not-configured .main-content { flex-direction: column; }
   border-radius: 8px;
   margin-bottom: 0;
 }
+.agents-chat-input-area .chat-send-btn .send-icon {
+  width: 16px;
+  height: 16px;
+}
+.agents-chat-input-area .chat-send-btn .stop-icon {
+  width: 14px;
+  height: 14px;
+}
 
 /* ═══ Settings panel ═══════════════════════════════════════════════════ */
 
@@ -5145,6 +6833,63 @@ body.model-not-configured .main-content { flex-direction: column; }
   border-bottom: 1px solid var(--border, #e5e7eb);
 }
 .settings-section-head:first-child { margin-top: 0; }
+
+/* 4-tab structure (batch 6 decision). Visual primitive mirrors .marketplace-tabs. */
+.settings-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 0 4px 16px;
+  border-bottom: 1px solid var(--border, #e5e7eb);
+  padding-bottom: 8px;
+}
+.settings-tab {
+  background: transparent;
+  border: none;
+  padding: 6px 14px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--muted);
+  border-radius: 6px;
+  cursor: pointer;
+  position: relative;
+}
+.settings-tab.is-active { background: var(--accent-soft, #eef2ff); color: var(--text); }
+/* Tab title dot — set via .has-dot on the .settings-tab. The same primitive
+   is reused on the sidebar settings button (see Phase 5). */
+.settings-tab.has-dot::after,
+.has-dot::after {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent, #f59e0b);
+  margin-left: 6px;
+  vertical-align: middle;
+}
+.has-dot.is-red::after,
+.settings-tab.has-dot.is-red::after { background: #ef4444; }
+.has-dot.is-orange::after,
+.settings-tab.has-dot.is-orange::after { background: #f59e0b; }
+.settings-tab-pane[hidden] { display: none; }
+
+/* The subscription / sync / Pro-gated styles that lived here are stripped from the
+   OrkasOpen build (no Orkas account backend, no cloud sync engine). The
+   `.settings-pro-badge` chip still has consumers elsewhere, so it stays. */
+.settings-pro-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 7px;
+  border-radius: 8px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  background: #0a0a0a;
+  color: #fff;
+  text-transform: uppercase;
+  vertical-align: 2px;
+}
+
 .settings-section-note {
   font-size: 12px;
   color: var(--text-muted, #6b7280);
@@ -5152,7 +6897,14 @@ body.model-not-configured .main-content { flex-direction: column; }
   line-height: 1.5;
 }
 .settings-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
   margin-bottom: 28px;
+}
+.settings-heading {
+  min-width: 0;
 }
 .settings-header h2 {
   margin: 0 0 6px;
@@ -5240,6 +6992,11 @@ body.model-not-configured .main-content { flex-direction: column; }
   user-select: none;
 }
 .settings-row > label.settings-toggle input[type="checkbox"] { margin: 0; }
+/* `.settings-toggle-tight` — variant where the toggle does NOT take the full
+ *  row width; its sibling hint (`.settings-status`) sits right next to it
+ *  instead of being pushed to the far right. Used by the sync card so
+ *  "启用云端同步" + the enabled/disabled hint read as one line. */
+.settings-row > label.settings-toggle.settings-toggle-tight { flex: 0 0 auto; }
 
 /* Shared input style — used inside modals too. */
 .form-input {
@@ -5270,6 +7027,127 @@ body.model-not-configured .main-content { flex-direction: column; }
 .settings-status.ok    { color: #047857; }
 .settings-status.error { color: #b91c1c; }
 .settings-status.busy  { color: #6b7280; }
+
+.feedback-dialog {
+  width: min(560px, 92vw);
+  max-width: 560px;
+}
+.feedback-submit-btn {
+  display: inline-flex;
+  align-items: center;
+  min-width: 82px;
+  justify-content: center;
+}
+.feedback-dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.feedback-textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 130px;
+  max-height: 260px;
+  padding: 10px 12px;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+  font-family: inherit;
+  color: var(--text);
+  box-sizing: border-box;
+}
+.feedback-textarea:focus {
+  outline: none;
+  border-color: var(--primary, #2563eb);
+  box-shadow: 0 0 0 3px rgba(37,99,235,.12);
+}
+.feedback-meta-row,
+.feedback-picker-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.feedback-meta-row .settings-status,
+.feedback-picker-row .settings-status {
+  flex: 1 1 auto;
+}
+.feedback-counter {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--text-muted, #6b7280);
+}
+.feedback-images {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.feedback-image-item {
+  position: relative;
+  min-width: 0;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 8px;
+  padding: 8px;
+  background: #fff;
+}
+.feedback-image-thumb {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #f8fafc;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.feedback-image-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.feedback-image-placeholder {
+  width: 22px;
+  height: 22px;
+  border: 2px solid #cbd5e1;
+  border-top-color: var(--primary, #2563eb);
+  border-radius: 50%;
+  animation: feedback-spin 0.8s linear infinite;
+}
+@keyframes feedback-spin { to { transform: rotate(360deg); } }
+.feedback-image-name {
+  margin-top: 6px;
+  padding-right: 22px;
+  font-size: 12px;
+  color: var(--text-muted, #6b7280);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.feedback-image-item.is-failed {
+  border-color: rgba(220, 38, 38, 0.35);
+}
+.feedback-image-item.is-failed .feedback-image-name {
+  color: #b91c1c;
+}
+.feedback-image-remove {
+  position: absolute;
+  right: 6px;
+  bottom: 5px;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: #64748b;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 20px;
+}
+.feedback-image-remove:hover {
+  background: #f1f5f9;
+  color: #0f172a;
+}
 
 /* ── Custom dropdown (AiSelect) ────────────────────────────────────────── */
 .ai-select {
@@ -5308,8 +7186,17 @@ body.model-not-configured .main-content { flex-direction: column; }
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 .ai-select-label.placeholder { color: var(--text-muted, #9ca3af); }
+.ai-select-label > span:last-child,
+.ai-select-item-label > span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .ai-select-caret {
   flex: 0 0 auto;
   color: #6b7280;
@@ -5323,10 +7210,9 @@ body.model-not-configured .main-content { flex-direction: column; }
   right: 0;
   /* Popovers portal to <body> at open time (see _aiSelectMount) so
      they can escape parent overflow:auto. They must therefore beat
-     every overlay they could appear inside. `.modal-overlay` is 100,
-     `.ui-dialog-overlay` is 200, the avatar picker is 300, common
-     toasts top out at 1000 — pick a value above all of them. */
-  z-index: 1200;
+     every overlay they could appear inside, including the login gate
+     at z-index 10000. */
+  z-index: 12000;
   background: #fff;
   border: 1px solid var(--border, #e5e7eb);
   border-radius: 8px;
@@ -5352,8 +7238,19 @@ body.model-not-configured .main-content { flex-direction: column; }
 .ai-select-item-label {
   font-size: 13px;
   color: #111827;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 .ai-select-item.active .ai-select-item-label { color: var(--primary, #2563eb); font-weight: 500; }
+.ai-select-option-icon {
+  display: inline-flex;
+  color: #d97706;
+}
+.ai-select-svg-icon {
+  width: 14px;
+  height: 14px;
+}
 .ai-select-item-hint {
   font-size: 11px;
   color: var(--text-muted, #6b7280);
@@ -5739,6 +7636,88 @@ body.model-not-configured .main-content { flex-direction: column; }
   opacity: 0.6;
 }
 
+/* ── Devtools archive list ── */
+.devtools-list-badge {
+  display: inline-block;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  margin-left: 6px;
+  line-height: 1.5;
+  vertical-align: middle;
+}
+/* Session-kind badges (agent-edit / skill-edit / KB image vision). conv (主对话)
+   intentionally has no badge — it's the default. */
+.devtools-list-badge.is-kind-agent       { background: #fef3c7; color: #92400e; }
+.devtools-list-badge.is-kind-skill       { background: #ecfccb; color: #4d7c0f; }
+.devtools-list-badge.is-kind-extract-img { background: #fce7f3; color: #9d174d; }
+.devtools-list-badge.is-kind-cli         { background: #eef2ff; color: #3730a3; }
+
+/* ── Devtools skill-metrics table ── */
+.devtools-skill-metrics-summary {
+  padding: 6px 14px 8px 14px;
+  font-size: 11px;
+  color: var(--text-muted, #6b7280);
+}
+.devtools-skill-metrics-body {
+  overflow-x: auto;
+  padding: 0 8px 8px 8px;
+}
+.devtools-skill-metrics-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.devtools-skill-metrics-table th,
+.devtools-skill-metrics-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid #eef2f7;
+  text-align: left;
+  vertical-align: middle;
+}
+.devtools-skill-metrics-table th {
+  font-weight: 600;
+  font-size: 10.5px;
+  color: #94a3b8;
+  letter-spacing: 0.04em;
+  background: #fafbfc;
+}
+.devtools-skill-metrics-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.devtools-skill-metrics-table tbody tr:hover { background: #f8fafc; }
+
+.devtools-skill-cell-name { line-height: 1.3; }
+.devtools-skill-name {
+  display: block;
+  font-weight: 500;
+  color: var(--text, #1f2937);
+}
+.devtools-skill-id,
+.devtools-skill-id-only {
+  display: block;
+  font-size: 10.5px;
+  color: var(--text-muted, #6b7280);
+  font-family: ui-monospace, SFMono-Regular, monospace;
+}
+.devtools-skill-id-only { font-size: 12px; color: var(--text, #1f2937); font-family: inherit; }
+
+.devtools-skill-badge {
+  display: inline-block;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  line-height: 1.5;
+}
+.devtools-skill-badge.is-custom   { background: #ecfccb; color: #4d7c0f; }
+.devtools-skill-badge.is-platform { background: #dbeafe; color: #1e40af; }
+.devtools-skill-badge.is-b        { background: #fef3c7; color: #92400e; }
+
+.devtools-skill-metrics-days { display: inline-flex; gap: 4px; margin-right: 6px; }
+.devtools-skill-metrics-days .btn.active {
+  background: var(--primary, #2563eb);
+  color: #fff;
+  border-color: transparent;
+}
+
 /* ─── MathJax tweaks (chat bubbles) ────────────────────────────────────────
    Display math on long formulas exceeds bubble width; give it a horizontal
    scrollbar instead of clipping / stretching the bubble. Inline math just
@@ -5877,3 +7856,1068 @@ body.model-not-configured .main-content { flex-direction: column; }
    the dropdown from spanning the entire body. */
 .agents-detail-runtime { display: block; }
 .agents-detail-runtime-select { max-width: 280px; }
+
+.agents-detail-project-dir { max-width: 100%; }
+.agent-project-dir-card {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.02);
+  min-width: 0;
+}
+.agent-project-dir-card.is-missing {
+  border-color: rgba(239, 68, 68, 0.35);
+  background: rgba(239, 68, 68, 0.04);
+}
+.agent-project-dir-card.is-disabled {
+  opacity: 0.72;
+}
+.agent-project-dir-icon {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  color: var(--primary);
+}
+.agent-project-dir-card.is-missing .agent-project-dir-icon {
+  color: var(--danger);
+}
+.agent-project-dir-main {
+  flex: 1 1 auto;
+  min-width: 180px;
+}
+.agent-project-dir-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text);
+}
+.agent-project-dir-mode {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.agent-project-dir-card.is-missing .agent-project-dir-mode {
+  color: var(--danger);
+}
+.agent-project-dir-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+/* Wrapper for the multi-button cluster on the right side of agents-grid-header /
+   skills-grid-header. Keeps `+ Create` / `More` glued together while the parent
+   header's `justify-content: space-between` still separates title from cluster. */
+.header-actions { display: flex; gap: 8px; align-items: center; }
+
+/* ─── Marketplace panel ─── */
+/* Full-page panel mirroring .agents-grid-view sizing: fill the parent .panel column. */
+.marketplace-view {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: #fff;
+}
+.marketplace-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.marketplace-back { flex-shrink: 0; }
+.marketplace-tabs { display: flex; gap: 4px; }
+.marketplace-tab {
+  background: transparent;
+  border: none;
+  padding: 6px 14px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--muted);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.marketplace-tab.is-active { background: var(--accent-soft, #eef2ff); color: var(--text); }
+.marketplace-search-wrap {
+  position: relative;
+  flex: 1;
+  max-width: 320px;
+  margin-left: auto;
+  display: flex;
+}
+.marketplace-search {
+  flex: 1;
+  padding: 6px 28px 6px 10px;
+  border: 1px solid rgba(0,0,0,0.1);
+  border-radius: 6px;
+  font-size: 13px;
+}
+.marketplace-search-clear {
+  position: absolute;
+  right: 5px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+.marketplace-search-clear:hover { background: rgba(0,0,0,0.08); color: var(--text); }
+.marketplace-search-clear[hidden] { display: none; }
+.marketplace-search-btn { flex-shrink: 0; }
+
+.marketplace-categories {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 12px 20px;
+  border-bottom: 1px solid rgba(0,0,0,0.04);
+  flex-shrink: 0;
+}
+.marketplace-chip {
+  background: transparent;
+  border: 1px solid rgba(0,0,0,0.1);
+  padding: 4px 12px;
+  font-size: 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  color: var(--text);
+}
+.marketplace-chip.is-active {
+  background: var(--accent, #4f46e5);
+  border-color: transparent;
+  color: #fff;
+}
+
+.marketplace-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px 20px;
+}
+/* Reconcile-status banner (boot-time marketplace sync). Friendly muted-blue palette — the
+   yellow / warning tint was misread as "something's wrong" when it actually just means
+   "downloading default content in the background". The banner is **embedded under the panel
+   header** (after the title row, before the body) so it doesn't crowd the panel chrome. */
+.marketplace-reconcile-banner {
+  margin: 0 20px 8px;
+  padding: 8px 12px;
+  border-radius: var(--radius-md, 8px);
+  background: rgba(37, 99, 235, 0.08);
+  color: #1d4ed8;
+  font-size: 12px;
+  line-height: 1.5;
+}
+/* Inline checkbox row inside the upload dialog. Used for the "用户默认安装" toggle so dev
+   can flag the item as part of the fresh-install seed set (`default_install` server flag). */
+.ui-dialog-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+.ui-dialog-checkbox-row input[type="checkbox"] {
+  margin: 0;
+  cursor: pointer;
+}
+/* Dev upload modal: just a centered spinner + label while the multipart POST is in flight. */
+.marketplace-upload-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 28px 32px;
+}
+.marketplace-upload-spinner {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 3px solid #cbd5e1;
+  border-top-color: #2563eb;
+  animation: marketplace-upload-spin 0.8s linear infinite;
+}
+.marketplace-upload-loading-text {
+  color: #475569;
+  font-size: 13px;
+}
+@keyframes marketplace-upload-spin {
+  to { transform: rotate(360deg); }
+}
+/* Author badge: differentiates same-name uploads. Platform = filled blue; user = outlined.
+   Shared across marketplace card + agents-tab card + skills-tab card so the same badge
+   reads the same everywhere a marketplace-installed item appears. */
+.marketplace-card-chip.is-platform,
+.agent-card-chip.is-platform,
+.skill-card-chip.is-platform {
+  background: rgba(37, 99, 235, 0.12);
+  color: #1d4ed8;
+}
+.marketplace-card-chip.is-user,
+.agent-card-chip.is-user,
+.skill-card-chip.is-user {
+  background: rgba(100, 116, 139, 0.10);
+  color: #475569;
+}
+
+/* Inline spinner for install/uninstall buttons. Sits to the left of the button label. */
+.marketplace-btn-spinner {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 6px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.5);
+  border-top-color: rgba(255, 255, 255, 0.95);
+  vertical-align: -1px;
+  animation: marketplace-upload-spin 0.8s linear infinite;
+}
+.btn.is-disabled .marketplace-btn-spinner {
+  border-color: rgba(100, 116, 139, 0.4);
+  border-top-color: rgba(100, 116, 139, 0.9);
+}
+/* Flex-wrap with fixed card width: each card is exactly 280px regardless of how many cards
+   the grid holds. A lone card no longer stretches to fill the entire row (which made it look
+   like a list-strip), and a populated grid wraps to a familiar tile layout. Trailing empty
+   space at the end of each row is intentional — keeps card visual rhythm consistent. */
+.marketplace-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-content: flex-start;
+}
+.marketplace-grid > .marketplace-card {
+  flex: 0 0 280px;
+  min-width: 0;
+}
+/* Invisible IntersectionObserver target for infinite scroll. Real preload margin comes
+   from `rootMargin` in JS — this just needs to be a reliably-observable element. */
+.mp-load-more-sentinel { height: 1px; width: 100%; }
+.marketplace-card {
+  border: 1px solid rgba(0,0,0,0.08);
+  border-radius: var(--radius-md, 8px);
+  padding: 14px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: #fff;
+}
+.marketplace-card-header { display: flex; align-items: baseline; gap: 8px; }
+.marketplace-card-name {
+  font-weight: 600;
+  font-size: 14px;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.marketplace-card-desc {
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.45;
+  flex: 1;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.marketplace-card-meta { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.marketplace-card-chip,
+.skill-card-chip,
+.agent-card-chip {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(79,70,229,0.08);
+  color: var(--accent, #4f46e5);
+  white-space: nowrap;
+}
+.marketplace-card-chip.muted { background: rgba(0,0,0,0.05); color: var(--muted); }
+/* Version chip — neutral grey to distinguish from category (accent) and author (platform/user). */
+.marketplace-card-chip.is-version,
+.agent-card-chip.is-version,
+.skill-card-chip.is-version {
+  background: rgba(0,0,0,0.05);
+  color: var(--muted);
+}
+/* Footer row: chips on the left flex-1, install/uninstall button hugged to the right via
+   `flex-shrink:0` so it never collapses before the chips. Replaces the old vertically-stacked
+   `.marketplace-card-meta` + `.marketplace-card-actions` arrangement. */
+.marketplace-card-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: auto;
+}
+.marketplace-card-footer > .marketplace-card-meta { flex: 1; }
+.marketplace-card-footer > .marketplace-card-actions { flex-shrink: 0; }
+.marketplace-card-actions { display: flex; }
+
+/* ─── Detail sub-view ─── */
+/* Mirrors the grid-view layout (full-panel flex column) so swapping the two display
+   styles is the only thing needed to switch between browse and detail. */
+.marketplace-grid-view,
+.marketplace-detail-view {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: #fff;
+}
+/* Marketplace detail header — padding mirrors `.agents-detail-header` so the in-app and
+   marketplace detail pages share one chrome density. */
+.marketplace-detail-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+/* Single-row title block: [name v1.0.0] [chip chip] all in one line. `min-width:0` lets
+   long names ellipsize rather than pushing the install / delete buttons off-screen; chips
+   are `flex-shrink:0` so they hug the title rather than collapsing first. */
+.marketplace-detail-title-wrap { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; }
+.marketplace-detail-title { font-size: 16px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.marketplace-detail-version { font-size: 12px; color: var(--muted); margin-left: 8px; font-weight: 400; }
+.marketplace-detail-meta-row { display: flex; gap: 6px; flex-wrap: nowrap; flex-shrink: 0; }
+.marketplace-detail-desc { padding: 12px 20px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+/* Outer body container is just a flex slot — the inner `.agents-detail-body` /
+   `.skills-detail-content` (rendered by `_mpAgentDetailHtml` / `_mpSkillDetailHtml`)
+   owns padding + scroll, so the marketplace preview lines up pixel-for-pixel with the
+   in-app detail page. */
+.marketplace-detail-body { flex: 1; overflow: hidden; display: flex; padding: 0; }
+.marketplace-detail-body > .agents-detail-body,
+.marketplace-detail-body > .skills-detail-content { flex: 1; min-height: 0; }
+.marketplace-detail-loading {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 48px 20px;
+}
+.marketplace-detail-loading-text { color: var(--muted); font-size: 13px; }
+
+.marketplace-section { margin-top: 18px; }
+.marketplace-section-title { font-size: 14px; font-weight: 600; margin: 0 0 8px; }
+.marketplace-section-body { font-size: 13.5px; line-height: 1.55; }
+.marketplace-section-body ul { padding-left: 20px; margin: 6px 0; }
+.marketplace-section-body code { padding: 1px 5px; background: rgba(0,0,0,0.05); border-radius: 3px; font-size: 12.5px; }
+
+/* Skill detail: split view (file tree left, file body right). */
+.marketplace-skill-split {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  gap: 18px;
+  margin-top: 12px;
+  min-height: 280px;
+}
+.marketplace-skill-tree {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-size: 12.5px;
+  border: 1px solid rgba(0,0,0,0.08);
+  border-radius: 6px;
+  background: #fafafa;
+  overflow-y: auto;
+  max-height: 60vh;
+}
+.marketplace-skill-file {
+  padding: 6px 10px;
+  cursor: pointer;
+  border-bottom: 1px solid rgba(0,0,0,0.04);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  overflow: hidden;
+}
+.marketplace-skill-file:last-child { border-bottom: none; }
+.marketplace-skill-file:hover { background: rgba(79,70,229,0.04); }
+.marketplace-skill-file.is-active { background: var(--accent-soft, #eef2ff); color: var(--text); font-weight: 500; }
+.marketplace-skill-file-body { min-width: 0; overflow-x: auto; }
+.marketplace-skill-code {
+  font-size: 12px;
+  line-height: 1.5;
+  background: #fafafa;
+  border: 1px solid rgba(0,0,0,0.06);
+  border-radius: 6px;
+  padding: 12px;
+  white-space: pre;
+  overflow: auto;
+  max-height: 70vh;
+}
+
+.ui-dialog-form { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }
+.ui-dialog-label { font-size: 12px; color: var(--muted); }
+.ui-dialog-input {
+  padding: 6px 10px;
+  border: 1px solid rgba(0,0,0,0.1);
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+/* ─── Scheduled-tasks dialog (modules/agent-schedule.js) ─────────────── */
+.agent-schedule-dialog { min-width: 480px; max-width: 560px; }
+.agent-schedule-title { margin-bottom: 12px; }
+.agent-schedule-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.agent-schedule-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+.agent-schedule-empty {
+  padding: 18px 0;
+  text-align: center;
+}
+.agent-schedule-row {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: #fafafa;
+}
+.agent-schedule-row.is-disabled { opacity: 0.55; }
+.agent-schedule-row-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.agent-schedule-row-toggle {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+}
+.agent-schedule-row-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.agent-schedule-row-summary {
+  font-size: 13px;
+  font-weight: 600;
+}
+.agent-schedule-row-title {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-schedule-row-lastrun {
+  font-size: 11px;
+  margin-top: 4px;
+}
+.agent-schedule-row-input {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text);
+  background: #fff;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.agent-schedule-row-actions {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.agent-schedule-actions-row {
+  display: flex;
+  justify-content: flex-start;
+}
+
+.agent-schedule-form {
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+  margin-top: 4px;
+}
+.agent-schedule-form input[type="number"],
+.agent-schedule-form input[type="time"],
+.agent-schedule-form input[type="text"],
+.agent-schedule-form textarea {
+  width: 100%;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 14px;
+  font-family: inherit;
+  color: var(--text);
+  background: #fafafa;
+  box-sizing: border-box;
+}
+.agent-schedule-form input:focus,
+.agent-schedule-form textarea:focus {
+  outline: none;
+  border-color: var(--primary);
+  background-color: #fff;
+}
+.agent-schedule-interval-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.agent-schedule-interval-input { max-width: 120px; }
+.agent-schedule-time-input { max-width: 160px; }
+.agent-schedule-type-select { max-width: 220px; }
+
+.agent-schedule-weekdays {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.agent-schedule-weekday-chip {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: #fafafa;
+  color: var(--text);
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+.agent-schedule-weekday-chip:hover { border-color: #cbd5e1; }
+.agent-schedule-weekday-chip.is-on {
+  background: #eef2ff;
+  border-color: #c7d2fe;
+  color: #3730a3;
+}
+.agent-schedule-enabled-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500 !important;
+  margin-bottom: 0 !important;
+}
+
+/* ─── Marketplace overlay ─── */
+/* Wider modal so the card grid breathes; reuse .modal padding / shadow / radius. */
+.marketplace-modal {
+  max-width: 880px;
+  width: 92vw;
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+}
+.marketplace-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 20px 12px;
+  border-bottom: 1px solid rgba(0,0,0,0.06);
+}
+.marketplace-tabs { display: flex; gap: 4px; }
+.marketplace-tab {
+  background: transparent;
+  border: none;
+  padding: 6px 14px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--muted);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.marketplace-tab.is-active { background: var(--accent-soft, #eef2ff); color: var(--text); }
+.marketplace-search {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid rgba(0,0,0,0.1);
+  border-radius: 6px;
+  font-size: 13px;
+}
+.marketplace-close { margin-left: auto; }
+
+.marketplace-categories {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 10px 20px;
+  border-bottom: 1px solid rgba(0,0,0,0.04);
+}
+.marketplace-chip {
+  background: transparent;
+  border: 1px solid rgba(0,0,0,0.1);
+  padding: 4px 12px;
+  font-size: 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  color: var(--text);
+}
+.marketplace-chip.is-active {
+  background: var(--accent, #4f46e5);
+  border-color: transparent;
+  color: #fff;
+}
+
+.marketplace-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px 20px;
+}
+.marketplace-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 14px;
+}
+.marketplace-card {
+  border: 1px solid rgba(0,0,0,0.08);
+  border-radius: var(--radius-md, 8px);
+  padding: 14px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: #fff;
+}
+.marketplace-card-header { display: flex; align-items: center; gap: 10px; }
+.marketplace-card-name { font-weight: 600; font-size: 14px; flex: 1; }
+.marketplace-card-desc {
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.45;
+  flex: 1;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.marketplace-card-meta { display: flex; gap: 6px; flex-wrap: wrap; }
+.marketplace-card-chip {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(79,70,229,0.08);
+  color: var(--accent, #4f46e5);
+}
+.marketplace-card-chip.muted { background: rgba(0,0,0,0.05); color: var(--muted); }
+.marketplace-card-actions { display: flex; justify-content: flex-end; }
+
+.ui-dialog-form { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }
+.ui-dialog-label { font-size: 12px; color: var(--muted); }
+.ui-dialog-input {
+  padding: 6px 10px;
+  border: 1px solid rgba(0,0,0,0.1);
+  border-radius: 6px;
+  font-size: 13px;
+}
+/* ─── Connectors panel ─── */
+/* The `.panel` base rule already sets display:none → flex toggle via `.active`; do NOT
+   override `#panel-connectors` with `display: flex`, that breaks the setView() gating
+   (id selector beats the class rule → panel stays visible regardless of `.active`). */
+.connectors-grid-view, .connectors-detail-view {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.connectors-grid-header {
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid var(--border);
+  background: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.connectors-grid-title { font-size: 16px; font-weight: 600; color: var(--text); }
+.connectors-grid-tabs {
+  display: flex;
+  gap: 16px;
+  padding: 12px 20px 0;
+  border-bottom: 1px solid var(--border);
+  background: #fff;
+  flex-shrink: 0;
+}
+.connectors-tab {
+  background: transparent;
+  border: 0;
+  padding: 8px 4px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-muted, #6b7280);
+  border-bottom: 2px solid transparent;
+}
+.connectors-tab.is-active { color: var(--text); border-bottom-color: #2563eb; }
+.connectors-grid-scroll { flex: 1; overflow-y: auto; padding: 18px 24px 32px; }
+.connectors-group { flex-shrink: 0; padding: 6px 0; }
+.connectors-group-label {
+  padding: 12px 4px 6px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: #9ca3af;
+}
+.connectors-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 16px;
+  padding: 8px 0 16px;
+}
+.connectors-empty { padding: 32px; text-align: center; }
+.connector-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: border-color 0.12s, box-shadow 0.12s;
+  min-height: 152px;
+}
+.connector-card:hover {
+  border-color: rgba(37, 99, 235, 0.45);
+  box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
+}
+.connector-card-top { display: flex; align-items: center; gap: 10px; }
+.connector-card-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.connector-card-icon.is-svg {
+  background: #fff;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  padding: 6px;
+}
+.connector-card-icon.is-svg svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.connector-card-icon.is-fallback {
+  background: #6b7280;
+}
+.connector-card-headline { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.connector-card-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.connector-card-account {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.connector-card-error {
+  font-size: 12px;
+  color: #b91c1c;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.connector-card-desc {
+  font-size: 12px;
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/* Connected card's ⋯ menu lives at the top-right of `.connector-card-top`. Hosts the destructive
+   "disconnect" action; kept off the visible foot row so it's one extra click away from the
+   common "enable / disable" toggle. */
+.connector-card-menu-btn {
+  margin-left: auto;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  background: transparent;
+  border-radius: 6px;
+  font-size: 18px;
+  line-height: 1;
+  color: #6b7280;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.connector-card-menu-btn:hover { background: rgba(15, 23, 42, 0.06); color: #111827; }
+.connector-card-menu-popover {
+  position: fixed;
+  z-index: 1000;
+  background: #fff;
+  border: 1px solid rgba(15, 23, 42, 0.12);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12);
+  min-width: 120px;
+  padding: 4px;
+}
+.connector-card-menu-item {
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+}
+.connector-card-menu-item:hover { background: rgba(15, 23, 42, 0.05); }
+.connector-card-menu-item.is-danger { color: #dc2626; }
+.connector-card-menu-item.is-danger:hover { background: rgba(220, 38, 38, 0.08); }
+
+/* Disabled-but-connected card: muted look so the user can tell at a glance which connector
+   they've turned off, without removing it from the "Connected" group. */
+.connector-card.is-disabled { opacity: 0.55; }
+.connector-card.is-disabled .connector-card-icon { filter: saturate(0.4); }
+
+/* Inline spinner inside the "连接" button — shown post-deep-link return while the IPC is
+   running through `/oauth/exchange` + MCP `initialize` + `list_tools` (3 network roundtrips,
+   ~hundreds of ms to a few seconds). Button stays clickable; spinner just signals progress. */
+.btn-spinner {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 6px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.5);
+  border-top-color: rgba(255, 255, 255, 0.95);
+  vertical-align: -1px;
+  animation: marketplace-upload-spin 0.8s linear infinite;
+}
+
+.connector-card-foot { margin-top: auto; display: flex; justify-content: flex-end; gap: 6px; align-items: center; }
+.connector-card-foot .btn-link {
+  background: transparent;
+  border: none;
+  color: var(--text-muted, #6b7280);
+  text-decoration: underline;
+  cursor: pointer;
+  padding: 4px 8px;
+}
+.connector-card-foot .btn-link:hover { color: #2563eb; }
+
+/* Tab count badge */
+.connectors-tab { display: inline-flex; align-items: center; gap: 6px; }
+.connectors-tab-count { font-size: 11px; }
+
+/* Legacy dot retained for the agent detail toggle list */
+.connector-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #9ca3af;
+}
+.connector-dot-connected { background: #10b981; }
+.connector-dot-connecting { background: #f59e0b; }
+.connector-dot-error { background: #ef4444; }
+
+/* Detail view */
+.connectors-detail-header {
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
+  background: #fff;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+.connectors-detail-title { flex: 1; font-size: 15px; font-weight: 600; }
+.connectors-detail-actions { display: flex; gap: 8px; }
+.connectors-detail-body { flex: 1; overflow-y: auto; padding: 20px 24px 32px; }
+.connector-detail-row { display: flex; gap: 12px; padding: 6px 0; font-size: 13px; align-items: baseline; }
+.connector-detail-section { margin-top: 18px; }
+.connector-detail-section-title { font-size: 13px; font-weight: 600; margin-bottom: 8px; color: var(--text); }
+.connector-tools-list { display: flex; flex-direction: column; gap: 4px; }
+.connector-tool-row {
+  display: grid;
+  grid-template-columns: auto 200px 1fr;
+  gap: 10px;
+  align-items: baseline;
+  padding: 6px 0;
+  font-size: 13px;
+  cursor: pointer;
+  border-bottom: 1px solid #f3f4f6;
+}
+.connector-tool-name { font-family: ui-monospace, monospace; font-size: 12px; }
+.connector-tool-desc { font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
+
+/* Connect / configure modal (minimal scoped styles for the connectors flow; if the project
+   later introduces a shared .modal-overlay / .modal-card system, these can be retired). */
+#connectors-connect-modal.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+#connectors-connect-modal .modal-card {
+  width: min(520px, 92vw);
+  max-height: 88vh;
+  overflow: auto;
+  background: #fff;
+  border-radius: 12px;
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+#connectors-connect-modal .modal-title { font-size: 16px; font-weight: 600; }
+#connectors-connect-modal .form-row { display: flex; flex-direction: column; gap: 6px; }
+#connectors-connect-modal .form-row label { font-size: 12px; font-weight: 500; color: var(--text-muted, #6b7280); }
+#connectors-connect-modal .form-row input,
+#connectors-connect-modal .form-row select {
+  font: inherit;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+}
+#connectors-connect-modal .form-hint { font-size: 11px; display: inline-block; }
+#connectors-connect-modal .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.connectors-add-status { font-size: 12px; min-height: 18px; }
+
+/* ── Chat-side markdown drawer ─────────────────────────────────────────
+   Same width / chrome rules as `.conversation-info-panel` (kept locally
+   rather than promoted to a shared `.chat-side-drawer` class because the
+   conversation-info CSS already shipped — extracting later if a third
+   drawer surface lands). The body re-uses `.ctx-*` classes from the
+   contexts editor since the mount component is the same. */
+.chat-md-drawer-panel {
+  /* Wider than conversation-info — markdown is text-heavy and worth the
+     real estate. Caps so the main chat column doesn't collapse on narrow
+     windows. */
+  flex: 0 0 min(560px, 50vw);
+  width: min(560px, 50vw);
+  min-width: 420px;
+  max-width: 720px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-left: 1px solid var(--border);
+  background: #fff;
+  color: var(--text);
+  box-shadow: -12px 0 28px rgba(15, 23, 42, 0.05);
+  z-index: 20;
+}
+.chat-md-drawer-panel[hidden] { display: none !important; }
+.chat-md-drawer-header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 16px 16px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.chat-md-drawer-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chat-md-drawer-actions { flex: 0 0 auto; display: flex; gap: 6px; }
+.chat-md-drawer-close {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+.chat-md-drawer-close:hover {
+  color: #0f172a;
+  background: #f1f5f9;
+  border-color: #e2e8f0;
+}
+.chat-md-drawer-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+}
+/* The mount writes its toolbar / body / textarea inline; we let the
+   existing ctx-* rules dictate visuals (single source of truth) and only
+   reset the host container's padding here so the textarea can stretch
+   edge-to-edge. */
+.chat-md-drawer-body .ctx-editor-toolbar { padding: 8px 12px; border-bottom: 1px solid var(--border); }
+.chat-md-drawer-body .ctx-editor-body { flex: 1 1 auto; min-height: 0; display: flex; }
+.chat-md-drawer-body .ctx-viewer-md { padding: 12px 16px; flex: 1 1 auto; overflow: auto; }
+.chat-md-drawer-body .ctx-viewer-editor { flex: 1 1 auto; min-height: 0; padding: 12px 16px; border: 0; outline: 0; resize: none; }
+
+/* ── Generic right-click context menu (modules/context-menu.js) ─────── */
+.context-menu {
+  position: fixed;
+  z-index: 9999;
+  min-width: 160px;
+  padding: 4px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.12);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.context-menu-item {
+  display: block;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--text);
+  cursor: pointer;
+}
+.context-menu-item:hover,
+.context-menu-item.is-active { background: var(--accent-soft, #eef2ff); }
+.context-menu-item.is-disabled { color: #94a3b8; cursor: not-allowed; }
+.context-menu-item.is-disabled:hover { background: transparent; }

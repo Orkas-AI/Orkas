@@ -35,6 +35,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as crypto from 'node:crypto';
 
 import { chatAttachmentDir, userChatAttachmentsDir, userChatsDir } from '../paths';
 import { createLogger } from '../logger';
@@ -146,6 +147,85 @@ function uniqueTarget(dir: string, name: string): string {
   return path.join(dir, `${stem}-${stamp}${ext}`);
 }
 
+const attachmentWriteLocks = new Map<string, Promise<void>>();
+
+async function withAttachmentWriteLock<T>(
+  userId: string,
+  cid: string,
+  fn: () => Promise<T> | T,
+): Promise<T> {
+  const key = JSON.stringify([userId, cid]);
+  const prev = attachmentWriteLocks.get(key) || Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  attachmentWriteLocks.set(key, current);
+  try {
+    await prev;
+    return await fn();
+  } finally {
+    release();
+    if (attachmentWriteLocks.get(key) === current) {
+      attachmentWriteLocks.delete(key);
+    }
+  }
+}
+
+function attachmentInfoForPath(absPath: string, name = path.basename(absPath)): AttachmentInfo | null {
+  const ext = path.extname(name).toLowerCase();
+  if (!ALLOWED_EXTENSIONS.has(ext)) return null;
+  let st: fs.Stats;
+  try { st = fs.statSync(absPath); }
+  catch { return null; }
+  if (!st.isFile()) return null;
+  return {
+    name,
+    bytes: st.size,
+    kind: kindOf(ext),
+    mtime: Math.floor(st.mtimeMs / 1000),
+  };
+}
+
+function hashBuffer(buf: Buffer): string {
+  return crypto.createHash('sha256').update(buf).digest('hex');
+}
+
+function hashFile(absPath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const h = crypto.createHash('sha256');
+    const s = fs.createReadStream(absPath);
+    s.on('data', (chunk) => h.update(chunk));
+    s.on('error', reject);
+    s.on('end', () => resolve(h.digest('hex')));
+  });
+}
+
+async function findDuplicateByHash(
+  dir: string,
+  bytes: number,
+  sha256: string,
+): Promise<AttachmentInfo | null> {
+  let items: fs.Dirent[];
+  try { items = fs.readdirSync(dir, { withFileTypes: true }); }
+  catch { return null; }
+  items.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+  for (const e of items) {
+    if (!e.isFile() || e.name.startsWith('.')) continue;
+    const ext = path.extname(e.name).toLowerCase();
+    if (!ALLOWED_EXTENSIONS.has(ext)) continue;
+    const abs = path.join(dir, e.name);
+    let st: fs.Stats;
+    try { st = fs.statSync(abs); }
+    catch { continue; }
+    if (st.size !== bytes) continue;
+    try {
+      if (await hashFile(abs) === sha256) {
+        return attachmentInfoForPath(abs, e.name);
+      }
+    } catch { /* skip unreadable */ }
+  }
+  return null;
+}
+
 // ── Public API ───────────────────────────────────────────────────────────
 
 export async function uploadAttachment(
@@ -153,7 +233,7 @@ export async function uploadAttachment(
   cid: string,
   name: string,
   raw: Buffer | Uint8Array | null | undefined,
-): Promise<Result<{ info: AttachmentInfo }>> {
+): Promise<Result<{ info: AttachmentInfo; reused?: boolean }>> {
   let safeName: string;
   let safeConvId: string;
   try {
@@ -175,36 +255,115 @@ export async function uploadAttachment(
   }
 
   const dir = ensureDir(userId, safeConvId);
-  const target = uniqueTarget(dir, safeName);
-  const finalName = path.basename(target);
-  try { fs.writeFileSync(target, buf); }
-  catch (err) {
-    // Roll back the mkdir from `ensureDir` if the directory ended up empty
-    // (i.e., this was the first attachment for the cid and the write failed
-    // before producing anything). Best-effort: a non-empty dir means a
-    // previous successful upload owns it and must not be touched.
-    try {
-      if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
-    } catch { /* best-effort */ }
-    return { ok: false, error: (err as Error).message };
+  const incomingHash = hashBuffer(buf);
+  return withAttachmentWriteLock(userId, safeConvId, async () => {
+    const duplicate = await findDuplicateByHash(dir, buf.length, incomingHash);
+    if (duplicate) {
+      log.info(`upload dedupe user=${userId} cid=${safeConvId} reuse=${duplicate.name} bytes=${duplicate.bytes}`);
+      return { ok: true, info: duplicate, reused: true };
+    }
+
+    const target = uniqueTarget(dir, safeName);
+    const finalName = path.basename(target);
+    try { fs.writeFileSync(target, buf); }
+    catch (err) {
+      // Roll back the mkdir from `ensureDir` if the directory ended up empty
+      // (i.e., this was the first attachment for the cid and the write failed
+      // before producing anything). Best-effort: a non-empty dir means a
+      // previous successful upload owns it and must not be touched.
+      try {
+        if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
+      } catch { /* best-effort */ }
+      return { ok: false, error: (err as Error).message };
+    }
+
+    // No upload-time preprocessing: extract / grayscale happen lazily in
+    // features/file_indexer when the model's tools first touch this file.
+    // Video is display-only and never preprocessed.
+
+    const st = fs.statSync(target);
+    const kind = kindOf(ext);
+    log.info(`upload user=${userId} cid=${safeConvId} name=${finalName} kind=${kind} bytes=${st.size}`);
+    return {
+      ok: true,
+      info: {
+        name: finalName,
+        bytes: st.size,
+        kind,
+        mtime: Math.floor(st.mtimeMs / 1000),
+      },
+    };
+  });
+}
+
+export async function importAttachmentFromPath(
+  userId: string,
+  cid: string,
+  sourcePath: string,
+  name?: string,
+): Promise<Result<{ info: AttachmentInfo; reused?: boolean }>> {
+  let safeName: string;
+  let safeConvId: string;
+  try {
+    safeName = safeAttachmentName(name || path.basename(sourcePath || ''));
+    safeConvId = safeCid(cid);
+  } catch (err) { return { ok: false, error: (err as Error).message }; }
+
+  const absSource = path.resolve(String(sourcePath || ''));
+  let sourceStat: fs.Stats;
+  try { sourceStat = fs.statSync(absSource); }
+  catch { return { ok: false, error: 'file not found' }; }
+  if (!sourceStat.isFile()) return { ok: false, error: 'file not found' };
+
+  const ext = path.extname(safeName).toLowerCase();
+  const cap = maxBytesFor(ext);
+  if (sourceStat.size > cap) {
+    return { ok: false, error: t('errors.file_too_large_mb', { mb: Math.round(cap / 1024 / 1024) }) };
+  }
+  if (TEXT_EXTS.has(ext)) {
+    let buf: Buffer;
+    try { buf = fs.readFileSync(absSource); }
+    catch (err) { return { ok: false, error: (err as Error).message }; }
+    const s = buf.toString('utf8');
+    if (Buffer.from(s, 'utf8').length !== buf.length) {
+      return { ok: false, error: t('errors.not_utf8') };
+    }
   }
 
-  // No upload-time preprocessing: extract / grayscale happen lazily in
-  // features/file_indexer when the model's tools first touch this file.
-  // Video is display-only and never preprocessed.
+  const dir = ensureDir(userId, safeConvId);
+  let incomingHash: string;
+  try { incomingHash = await hashFile(absSource); }
+  catch (err) { return { ok: false, error: (err as Error).message }; }
+  return withAttachmentWriteLock(userId, safeConvId, async () => {
+    const duplicate = await findDuplicateByHash(dir, sourceStat.size, incomingHash);
+    if (duplicate) {
+      log.info(`import dedupe user=${userId} cid=${safeConvId} reuse=${duplicate.name} bytes=${duplicate.bytes}`);
+      return { ok: true, info: duplicate, reused: true };
+    }
 
-  const st = fs.statSync(target);
-  const kind = kindOf(ext);
-  log.info(`upload user=${userId} cid=${safeConvId} name=${finalName} kind=${kind} bytes=${st.size}`);
-  return {
-    ok: true,
-    info: {
-      name: finalName,
-      bytes: st.size,
-      kind,
-      mtime: Math.floor(st.mtimeMs / 1000),
-    },
-  };
+    const target = uniqueTarget(dir, safeName);
+    const finalName = path.basename(target);
+    try { fs.copyFileSync(absSource, target); }
+    catch (err) {
+      try {
+        if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
+      } catch { /* best-effort */ }
+      return { ok: false, error: (err as Error).message };
+    }
+
+    const st = fs.statSync(target);
+    const kind = kindOf(ext);
+    log.info(`import user=${userId} cid=${safeConvId} name=${finalName} kind=${kind} bytes=${st.size}`);
+    return {
+      ok: true,
+      info: {
+        name: finalName,
+        bytes: st.size,
+        kind,
+        mtime: Math.floor(st.mtimeMs / 1000),
+      },
+    };
+  });
 }
 
 export function listAttachments(userId: string, cid: string): AttachmentInfo[] {
@@ -378,8 +537,43 @@ export function resolveLocalMediaPath(
   return { ok: true, absPath: normalized, kind: VIDEO_EXTS.has(ext) ? 'video' : 'image' };
 }
 
-/** MIME lookup for the chat-media:// protocol handler. Covers images + videos
- *  (the only kinds the handler streams — text/pdf/docx are read via IPC). */
+/**
+ * Sibling of `resolveLocalMediaPath` for files that aren't media but still
+ * need to be streamed through `chat-media://local/<abs>` so the renderer can
+ * preview them in-app (PDF via Chromium's PDFium, HTML via a sandboxed
+ * iframe). Same threat model: extension allow-list, no directory allow-list.
+ *
+ * No size cap — these are served via `serveFileRange`, so Chromium streams
+ * the bytes directly into the iframe (or PDF viewer) without ever touching
+ * the JS heap. Worst case of a huge file is a few seconds of busy GPU
+ * process while the user dismisses the overlay.
+ */
+const PREVIEW_DOC_EXTS: ReadonlySet<string> = new Set(['.pdf', '.html', '.htm']);
+
+export function resolveLocalPreviewPath(
+  absPath: string,
+): { ok: true; absPath: string; kind: 'pdf' | 'html' } | { ok: false; code: 'bad_input' | 'not_found'; error: string } {
+  if (typeof absPath !== 'string' || !absPath) {
+    return { ok: false, code: 'bad_input', error: 'path required' };
+  }
+  if (!path.isAbsolute(absPath)) {
+    return { ok: false, code: 'bad_input', error: 'path must be absolute' };
+  }
+  const normalized = path.resolve(absPath);
+  const ext = path.extname(normalized).toLowerCase();
+  if (!PREVIEW_DOC_EXTS.has(ext)) {
+    return { ok: false, code: 'bad_input', error: `unsupported extension: ${ext || '(none)'}` };
+  }
+  let stat: fs.Stats;
+  try { stat = fs.statSync(normalized); }
+  catch { return { ok: false, code: 'not_found', error: 'not found' }; }
+  if (!stat.isFile()) return { ok: false, code: 'not_found', error: 'not a file' };
+  return { ok: true, absPath: normalized, kind: ext === '.pdf' ? 'pdf' : 'html' };
+}
+
+/** MIME lookup for the chat-media:// protocol handler. Covers images, videos,
+ *  and the in-app preview docs served via `resolveLocalPreviewPath` (pdf /
+ *  html). Text/markdown go through the `produced.readText` IPC instead. */
 export function mediaMimeFor(name: string): string {
   const ext = path.extname(name).toLowerCase();
   if (ext === '.png') return 'image/png';
@@ -391,6 +585,8 @@ export function mediaMimeFor(name: string): string {
   if (ext === '.mov') return 'video/quicktime';
   if (ext === '.m4v') return 'video/x-m4v';
   if (ext === '.ogv') return 'video/ogg';
+  if (ext === '.pdf') return 'application/pdf';
+  if (ext === '.html' || ext === '.htm') return 'text/html';
   return 'application/octet-stream';
 }
 
@@ -541,6 +737,12 @@ export async function buildAttachmentManifest(
         const buf = fs.readFileSync(abs);
         const compressed = await toCompressedGrayJpeg(buf, { maxDim: 1024, quality: 70, grayscale: true });
         images.push({ data: compressed.buf.toString('base64'), mediaType: 'image/jpeg' });
+        // Also list the image in the manifest so the LLM has a text-side
+        // hint (filename + abs path) tying its inline-attached vision input
+        // to the user's intent ("this image is 证书.jpg"). `attached="inline"`
+        // tells the LLM bytes are already on this turn — see chat_commander.md
+        // attachments section — so it doesn't waste a read_file round-trip.
+        entries.push(`<file name="${escapeAttr(nm)}" path="${escapeAttr(abs)}" kind="image" attached="inline"/>`);
       } catch (err) {
         skipped.push({ name: nm, reason: t('attachments.skipped.compress_failed', { message: (err as Error).message }) });
       }

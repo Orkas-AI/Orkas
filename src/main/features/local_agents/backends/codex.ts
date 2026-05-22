@@ -37,6 +37,18 @@ import {
   LineSplitter,
 } from './base.js';
 
+/** codex notifications that are pure metadata noise — we keep them
+ *  visible only at level=debug. Everything outside this list AND
+ *  outside the structured handlers above falls through to a level=info
+ *  log event so users see what the binary is up to. usage notifications
+ *  are intentionally OUT of this list because step 6 promotes them to
+ *  a structured `status:'usage'` event with live counters. */
+const CODEX_DROP_TO_DEBUG = new Set<string>([
+  'thread/started',
+  'account/rateLimits/updated',
+  'mcpServer/startupStatus/updated',
+]);
+
 const log = createLogger('local-agents:codex');
 
 export const codexBackend: LocalBackend = {
@@ -77,6 +89,10 @@ export const codexBackend: LocalBackend = {
     const seenTurnIds = new Set<string>();
     let collectedText = '';
     let turnError: string | undefined;
+    // Latest usage snapshot from `thread/tokenUsage/updated` —
+    // each notification is a cumulative state (not an increment),
+    // so we just overwrite. Threaded into the done event below.
+    let lastUsage: Record<string, number | string> | undefined;
 
     const sendLine = (msg: object) => {
       try { child.stdin.write(JSON.stringify(msg) + '\n'); }
@@ -107,7 +123,15 @@ export const codexBackend: LocalBackend = {
         const trimmed = line.trim();
         if (!trimmed) return;
         let env: any;
-        try { env = JSON.parse(trimmed); } catch { return; }
+        try { env = JSON.parse(trimmed); }
+        catch {
+          // codex stdout is supposed to be pure JSON-RPC; a non-JSON
+          // line here means the binary logged something directly to
+          // stdout (rare, but diagnostic-worthy when it happens — we
+          // were swallowing these before).
+          opts.onEvent({ type: 'raw-line', line: trimmed });
+          return;
+        }
         // Response (matches a pending request by id).
         if (env && typeof env.id === 'number' && pending.has(env.id)) {
           const p = pending.get(env.id)!;
@@ -253,6 +277,21 @@ export const codexBackend: LocalBackend = {
         return;
       }
 
+      // ── Token-usage streaming pulse ─────────────────────────────
+      // codex 0.125+ emits this notification through a turn whenever
+      // the cumulative token count advances. Strongest 'still alive'
+      // signal short of actual text — surface as a status:'usage'
+      // event the rail can render as a live counter row, and stash
+      // the latest value for the terminal done event.
+      if (method === 'thread/tokenUsage/updated') {
+        const u = extractCodexUsage(params);
+        if (u) {
+          lastUsage = u;
+          opts.onEvent({ type: 'status', status: 'usage', usage: u });
+        }
+        return;
+      }
+
       // ── Legacy codex/event protocol (older codex builds) ─────────
       if (method === 'codex/event' || method.startsWith('codex/event/')) {
         const ev = (params && typeof params === 'object' && typeof params.type === 'string')
@@ -262,9 +301,19 @@ export const codexBackend: LocalBackend = {
         return;
       }
 
-      // Noise we explicitly drop without surfacing:
-      //   thread/started, thread/tokenUsage/updated,
-      //   account/rateLimits/updated, mcpServer/startupStatus/updated
+      // Anything else — surface as a log event. Bucketed noise
+      // (CODEX_DROP_TO_DEBUG) goes at level=debug so it's visible only
+      // with ORKAS_LOG_LEVEL=debug; everything genuinely unknown goes
+      // at level=info so users see what the binary is doing instead
+      // of staring at a quiet rail. Trimmed to keep rail rows short.
+      const lvl: 'debug' | 'info' = CODEX_DROP_TO_DEBUG.has(method) ? 'debug' : 'info';
+      const summary = JSON.stringify(params || {}).slice(0, 200);
+      opts.onEvent({
+        type: 'log',
+        level: lvl,
+        message: `${method}: ${summary}`,
+        source: 'codex',
+      });
     }
 
     function handleLegacyCodexEvent(ev: Record<string, any>) {
@@ -333,6 +382,7 @@ export const codexBackend: LocalBackend = {
         type: 'done', status,
         durationMs: Date.now() - startedAt,
         sessionId: threadId,
+        ...(lastUsage ? { usage: lastUsage } : {}),
         ...extra,
       });
       resolveOuter();
@@ -440,5 +490,51 @@ export function extractThreadId(result: any): string | undefined {
   if (!result || typeof result !== 'object') return undefined;
   if (typeof result.threadId === 'string' && result.threadId) return result.threadId;
   if (result.thread && typeof result.thread.id === 'string' && result.thread.id) return result.thread.id;
+  return undefined;
+}
+
+/** Extract token usage from a `thread/tokenUsage/updated` notification's
+ *  params block. Codex flips between snake_case and camelCase across
+ *  versions and wraps the counters under `usage` / `info.totalTokenUsage`
+ *  / `info.lastTokenUsage`; we accept all observed shapes and produce
+ *  the normalized `{input, output, cacheRead, cacheCreate, model}`
+ *  payload the rest of the system speaks. Returns undefined when no
+ *  recognizable numeric field is present.
+ *
+ *  Exposed for unit testing. */
+export function extractCodexUsage(params: any): undefined | Record<string, number | string> {
+  if (!params || typeof params !== 'object') return undefined;
+  const candidates: any[] = [];
+  if (params.usage) candidates.push(params.usage);
+  if (params.info?.totalTokenUsage) candidates.push(params.info.totalTokenUsage);
+  if (params.info?.lastTokenUsage) candidates.push(params.info.lastTokenUsage);
+  if (params.payload?.info?.totalTokenUsage) candidates.push(params.payload.info.totalTokenUsage);
+  if (params.payload?.info?.lastTokenUsage) candidates.push(params.payload.info.lastTokenUsage);
+  // Bare params block can itself carry the fields when codex inlines them.
+  candidates.push(params);
+
+  for (const c of candidates) {
+    if (!c || typeof c !== 'object') continue;
+    const input = pickNum(c, ['input_tokens', 'inputTokens']);
+    const output = pickNum(c, ['output_tokens', 'outputTokens']);
+    const cacheRead = pickNum(c, ['cache_read_input_tokens', 'cacheReadInputTokens', 'cached_input_tokens', 'cachedInputTokens']);
+    const cacheCreate = pickNum(c, ['cache_creation_input_tokens', 'cacheCreationInputTokens']);
+    if (input === undefined && output === undefined && cacheRead === undefined && cacheCreate === undefined) continue;
+    const out: Record<string, number | string> = {};
+    if (input !== undefined) out.input = input;
+    if (output !== undefined) out.output = output;
+    if (cacheRead !== undefined) out.cacheRead = cacheRead;
+    if (cacheCreate !== undefined) out.cacheCreate = cacheCreate;
+    const model = params.model || params.info?.model || params.payload?.info?.model || params.payload?.model;
+    if (typeof model === 'string' && model) out.model = model;
+    return out;
+  }
+  return undefined;
+}
+
+function pickNum(o: Record<string, any>, keys: string[]): number | undefined {
+  for (const k of keys) {
+    if (typeof o[k] === 'number' && Number.isFinite(o[k])) return o[k];
+  }
   return undefined;
 }

@@ -15,6 +15,13 @@
 
 const _projectsLog = createLogger('projects');
 
+function _projectUiIconHtml(name, className) {
+  if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+    return window.uiIconHtml(name, className);
+  }
+  return '';
+}
+
 // Live cache of projects fetched from the backend. Mirrors `_agentsCache` /
 // `_skillsCache` patterns. `null` = not yet fetched.
 let _projectsCache = null;
@@ -139,7 +146,7 @@ function _renderInlineCreateRow() {
   // rather than a separate widget shape.
   return `
     <div class="project-row project-row-create" data-create>
-      <span class="project-icon">${ICON_FOLDER_CLOSED}</span>
+      <span class="project-icon">${_projectUiIconHtml('folder', 'project-folder-icon')}</span>
       <input type="text" class="project-rename-input" id="project-create-input"
              placeholder="${placeholder}" autocomplete="off" spellcheck="false" />
     </div>
@@ -148,14 +155,11 @@ function _renderInlineCreateRow() {
 
 function _renderProjectRow(p, convs) {
   const expanded = !!_projectsExpanded[p.project_id];
+  const selected = _isProjectSelected(p.project_id);
   const editing = _projectsInlineRenamePid === p.project_id;
-  // Reuse KB tree's folder SVG icons; open variant when expanded, closed
-  // otherwise. Defined as global consts in modules/skills.js (script load
-  // order: skills.js loads after projects.js, but renderProjectsSection
-  // only runs post-DOMContentLoaded by which point all scripts have
-  // initialised). No separate caret — the icon's open/closed state IS the
-  // expand indicator (matches the KB tree pattern).
-  const folderIcon = expanded ? ICON_FOLDER_OPEN : ICON_FOLDER_CLOSED;
+  const folderIcon = expanded
+    ? _projectUiIconHtml('folder-open', 'project-folder-icon')
+    : _projectUiIconHtml('folder', 'project-folder-icon');
   const moreTitle = escapeHtml(t('project.menu.more_actions'));
   const safeName = escapeHtml(p.name || '');
   const nameNode = editing
@@ -163,7 +167,7 @@ function _renderProjectRow(p, convs) {
               value="${escapeHtml(p.name || '')}" autocomplete="off" spellcheck="false" />`
     : `<span class="project-name" title="${safeName}">${safeName}</span>`;
   let html = `
-    <div class="project-row" data-pid="${escapeHtml(p.project_id)}">
+    <div class="project-row${selected ? ' active' : ''}" data-pid="${escapeHtml(p.project_id)}">
       <span class="project-icon">${folderIcon}</span>
       ${nameNode}
       <button type="button" class="ctx-row-menu-btn project-row-menu-btn" data-project-menu
@@ -176,20 +180,21 @@ function _renderProjectRow(p, convs) {
     if (!convs.length) {
       html += `<div class="project-conv-empty">${escapeHtml(t('sidebar.project_conv_empty'))}</div>`;
     } else {
-      const delTitle = escapeHtml(t('chat.conv_del_title'));
       for (const c of convs) {
-        const title = escapeHtml(c.title || t('chat.new_conv_title'));
-        html += `
-          <div class="conv-item conv-item-nested" data-cid="${c.conversation_id}">
-            <div class="conv-item-title" title="${title}">${title}</div>
-            <button class="conv-item-del" data-del-cid="${c.conversation_id}" title="${delTitle}">×</button>
-          </div>
-        `;
+        html += (typeof _renderConversationSidebarItem === 'function')
+          ? _renderConversationSidebarItem(c, { nested: true })
+          : `<div class="conv-item conv-item-nested" data-cid="${escapeHtml(c.conversation_id)}"><div class="conv-item-title" title="${escapeHtml(c.title || t('chat.new_conv_title'))}">${escapeHtml(c.title || t('chat.new_conv_title'))}</div></div>`;
       }
     }
     html += '</div>';
   }
   return html;
+}
+
+function _isProjectSelected(pid) {
+  return currentView === 'project'
+    && typeof _projectDetailPid !== 'undefined'
+    && _projectDetailPid === pid;
 }
 
 // ── Event wiring ────────────────────────────────────────────────────────
@@ -204,9 +209,9 @@ function _bindProjectsHandlers(container) {
     _bindInlineRenameInput(input);
   });
 
-  // Project rows: any click → BOTH open the detail page AND toggle the
-  // expand state of nested conversations (per design — single click does
-  // both). Exceptions: ⋯ opens its menu; rename input swallows click.
+  // Project rows: first click selects/opens the project detail. Once that
+  // project is already selected, clicking the row toggles its nested
+  // conversations.
   container.querySelectorAll('.project-row[data-pid]').forEach((row) => {
     const pid = row.dataset.pid;
     row.addEventListener('click', (e) => {
@@ -219,33 +224,30 @@ function _bindProjectsHandlers(container) {
         _openProjectRowMenu(e.target.closest('[data-project-menu]'), pid);
         return;
       }
+      if (!_isProjectSelected(pid)) {
+        if (typeof setView === 'function') setView('project', pid);
+        renderProjectsSection();
+        return;
+      }
       _toggleProjectExpand(pid);
-      if (typeof setView === 'function') setView('project', pid);
     });
   });
 
-  // Nested conv items.
-  container.querySelectorAll('.conv-item-nested').forEach((el) => {
-    el.addEventListener('click', (e) => {
-      if (e.target.closest('.conv-item-del')) return;
-      setView('conversation', el.dataset.cid);
+  if (typeof _bindConversationSidebarItems === 'function') {
+    _bindConversationSidebarItems(container, {
+      selector: '.conv-item-nested',
+      async afterDelete() {
+        // Project conv counts changed → refresh project cache so future reads
+        // (delete confirm body, etc.) see the right number.
+        await loadProjects(true);
+      },
     });
-  });
-  container.querySelectorAll('.conv-item-nested .conv-item-del').forEach((btn) => {
-    btn.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      const cid = btn.dataset.delCid;
-      if (!(await uiConfirm(t('chat.conv_del_confirm')))) return;
-      if (typeof abortConvStream === 'function') abortConvStream(cid);
-      if (typeof _forgetConvLocal === 'function') _forgetConvLocal(cid);
-      await apiFetch(`/api/conversations/${cid}`, { method: 'DELETE' });
-      if (currentCid === cid) setView('new-chat');
-      await loadConversations();
-      // Project conv counts changed → refresh project cache so future reads
-      // (delete confirm body, etc.) see the right number.
-      await loadProjects(true);
+  } else {
+    // Nested conv items.
+    container.querySelectorAll('.conv-item-nested').forEach((el) => {
+      el.addEventListener('click', () => setView('conversation', el.dataset.cid));
     });
-  });
+  }
 }
 
 function _toggleProjectExpand(pid) {
@@ -414,7 +416,6 @@ function _openProjectRowMenu(anchorBtn, pid) {
   _closeProjectRowMenu();
 
   const items = [
-    { action: 'new_conv', label: t('project.menu.new_conv') },
     { action: 'rename', label: t('project.menu.rename') },
     { action: 'delete', label: t('project.menu.delete'), danger: true },
   ];
@@ -465,18 +466,8 @@ function _closeProjectRowMenu() {
 }
 
 async function _runProjectMenuAction(action, pid) {
-  if (action === 'new_conv') return _newConvWithProject(pid);
   if (action === 'rename') return _startProjectInlineRename(pid);
   if (action === 'delete') return _confirmDeleteProject(pid);
-}
-
-// Pin pid into the commander chip's localStorage key BEFORE switching view —
-// onEnterCommanderProjectChip (fired from boot.js view-change) reads the same
-// key and re-validates against _projectsCache, so by the time the new-chat
-// panel mounts the chip is already showing this project.
-function _newConvWithProject(pid) {
-  try { localStorage.setItem(_COMMANDER_LAST_PROJECT_KEY, pid); } catch (_) {}
-  setView('new-chat');
 }
 
 // ── Delete flow ─────────────────────────────────────────────────────────
@@ -653,14 +644,17 @@ function onEnterCommanderProjectChip() {
 }
 
 /** User clicked the commander chip → show a small popover listing
- *  None + every existing project. Style mirrors the workspace dropdown. */
+ *  None + every existing project. Reuses `.workspace-menu` (not
+ *  `_aiSelectMount`) because this is a chip-row popover anchored next to
+ *  the workspace chip — `_aiSelectMount` targets in-form dropdowns with
+ *  different chrome (border / hover state / row height). */
 function _showCommanderProjectPicker(anchor) {
   const old = document.getElementById('commander-project-picker');
   if (old) { old.remove(); return; }
 
   const menu = document.createElement('div');
   menu.id = 'commander-project-picker';
-  menu.className = 'workspace-menu';  // reuse styling
+  menu.className = 'workspace-menu';
   anchor.classList.add('chat-project-chip--open');
 
   const items = [
@@ -677,7 +671,9 @@ function _showCommanderProjectPicker(anchor) {
     if (isActive) {
       const check = document.createElement('span');
       check.className = 'workspace-menu-check';
-      check.textContent = '✓';
+      check.innerHTML = typeof window !== 'undefined' && typeof window.uiIconHtml === 'function'
+        ? window.uiIconHtml('check', 'ui-icon workspace-check-icon')
+        : '';
       row.appendChild(check);
     }
     row.addEventListener('click', () => {

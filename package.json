@@ -1,6 +1,6 @@
 {
   "name": "orkas",
-  "version": "2026.5.11",
+  "version": "2026.5.22",
   "private": true,
   "license": "MIT",
   "description": "Orkas desktop — Electron + Node one-piece app",
@@ -19,14 +19,11 @@
     "rebuild:sqlite:electron": "node scripts/swap-sqlite-abi.mjs electron",
     "rebuild:sqlite:node": "node scripts/swap-sqlite-abi.mjs node",
     "postinstall": "node scripts/swap-sqlite-abi.mjs electron && node scripts/fetch-embedding-model.mjs",
-    "prepack": "node scripts/swap-sqlite-abi.mjs electron",
-    "predist": "node scripts/swap-sqlite-abi.mjs electron",
-    "pack": "electron-builder --dir",
-    "dist": "electron-builder",
-    "dist:mac": "electron-builder --mac",
-    "dist:win": "electron-builder --win"
+    "prepare": "node scripts/install-git-hooks.mjs",
+    "prepack": "node scripts/swap-sqlite-abi.mjs electron"
   },
   "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
     "@types/node": "^25.6.0",
     "electron": "^32.0.0",
     "typescript": "^6.0.3",
@@ -34,13 +31,14 @@
   },
   "dependencies": {
     "@mariozechner/pi-ai": "^0.73.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "adm-zip": "^0.5.16",
     "async-mutex": "^0.5.0",
     "better-sqlite3": "^12.9.0",
     "electron-log": "^5.4.3",
     "fastembed": "^2.1.0",
     "jimp": "^1.6.1",
     "mammoth": "^1.12.0",
-    "onnxruntime-node": "^1.24.3",
     "pdfjs-dist": "^5.6.205",
     "sqlite-vec": "^0.1.9",
     "tsx": "^4.21.0",
@@ -49,6 +47,15 @@
   "build": {
     "appId": "com.orkas.desktop",
     "productName": "Orkas",
+    "protocols": [
+      {
+        "name": "Orkas",
+        "schemes": [
+          "orkas"
+        ],
+        "role": "Viewer"
+      }
+    ],
     "directories": {
       "output": "dist"
     },
@@ -85,7 +92,6 @@
       "node_modules/bindings/**/*",
       "node_modules/file-uri-to-path/**/*",
       "node_modules/sqlite-vec*/**/*",
-      "node_modules/onnxruntime-node/**/*",
       "node_modules/fastembed/**/*"
     ],
     "extraResources": [
@@ -101,7 +107,11 @@
     "afterPack": "scripts/codesign-adhoc.cjs",
     "mac": {
       "category": "public.app-category.productivity",
-      "identity": null,
+      "hardenedRuntime": true,
+      "entitlements": "product/signing/entitlements.mac.plist",
+      "entitlementsInherit": "product/signing/entitlements.mac.inherit.plist",
+      "notarize": true,
+      "forceCodeSigning": true,
       "target": [
         {
           "target": "dmg",
@@ -109,9 +119,19 @@
             "arm64",
             "x64"
           ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
         }
       ],
       "icon": "src/resources/icons/icon.icns"
+    },
+    "dmg": {
+      "writeUpdateInfo": false
     },
     "win": {
       "target": "nsis",

@@ -65,23 +65,28 @@ export interface StateFile {
    *  slug rules and the placeholder fallback. */
   workspace_dir?: string;
   /** Project directory for coding-agent (claude / codex) dispatches in
-   *  this conversation. Auto-set on the first coding-agent turn to the
-   *  user's effective workspace path (so the user doesn't have to pick
-   *  manually for the common case), and re-synced to follow workspace
-   *  switches as long as `coding_project_dir_explicit` is false. Once
-   *  the user picks a different directory through the input-form
-   *  (`coding_project_dir_explicit=true`), workspace changes no longer
-   *  override their choice. Absolute path. Missing / empty → coding
+   *  this conversation. Initialised on the first coding-agent turn from
+   *  that agent's detail-page project-dir setting; missing setting =
+   *  effective workspace path. Absolute path. Missing / empty → coding
    *  agents fall back to the conv's workspace root. The field is
    *  per-conversation, NOT per-agent: one project for the whole
    *  conversation across however many coding agents it has. */
   coding_project_dir?: string;
+  /** True once this conversation has been touched by the iOS remote-control
+   *  client (a relayed command landed on this PC, or the user opted in).
+   *  appended messages + plan/state up to the Server so the phone can watch
+   *  progress. Only `true` is recorded; absent = not relayed. */
   /** True when the user picked `coding_project_dir` explicitly via the
    *  `<agent-input-form>` directory picker (form-submit hook in
    *  `group_chat/index.ts`). False / missing means the dir was
    *  auto-set by the workspace-sync path in `bus.ts` and is allowed to
    *  follow future workspace switches. Cleared whenever
    *  `coding_project_dir` is cleared. */
+  /** True when the user picked `coding_project_dir` explicitly, either
+   *  via the agent detail page's custom project-dir setting at initial
+   *  conversation setup, or via the `<agent-input-form>` directory
+   *  picker (form-submit hook in `group_chat/index.ts`). Cleared
+   *  whenever `coding_project_dir` is cleared. */
   coding_project_dir_explicit?: boolean;
 }
 
@@ -90,23 +95,25 @@ export const USER_ID = 'user';
 export const RESERVED_IDS: ReadonlySet<string> = new Set([COMMANDER_ID, USER_ID]);
 
 // ── session_id builders ──────────────────────────────────────────────────
+// Format: `<kind>-<tail>` (CLAUDE.md §5). User scoping comes from the path root
+// (`<activeUid>/{cloud,local}/sessions/<sid>.jsonl`), not from the session_id.
 
 /** Commander session — one per conversation, shared across all turns. */
-export function buildGconvSessionId(uid: string, cid: string): string {
-  return `${uid}-gconv-${cid}`;
+export function buildGconvSessionId(cid: string): string {
+  return `gconv-${cid}`;
 }
 
 /** Per-agent session — one per (conv, agent), shared across all the agent's
  * turns in that conv. */
-export function buildGmemberSessionId(uid: string, cid: string, agentId: string): string {
-  return `${uid}-gmember-${cid}-${agentId}`;
+export function buildGmemberSessionId(cid: string, agentId: string): string {
+  return `gmember-${cid}-${agentId}`;
 }
 
 /** Resolve an actor's session id from its kind/id. The user actor has no
  * session — it's the human. Throws on unknown kind. */
-export function actorSessionId(uid: string, cid: string, actor: Actor): string {
-  if (actor.kind === 'commander') return buildGconvSessionId(uid, cid);
-  if (actor.kind === 'agent') return buildGmemberSessionId(uid, cid, actor.id);
+export function actorSessionId(cid: string, actor: Actor): string {
+  if (actor.kind === 'commander') return buildGconvSessionId(cid);
+  if (actor.kind === 'agent') return buildGmemberSessionId(cid, actor.id);
   throw new Error(`actor ${actor.kind}/${actor.id} has no session`);
 }
 
@@ -343,12 +350,10 @@ export async function setWorkspaceDirOnce(uid: string, cid: string, dir: string)
  *  Caller is responsible for absolute-path validation — we only do
  *  string handling here. Returns the resulting state.
  *
- *  `opts.explicit` records whether the user actively chose this
- *  directory through the `<agent-input-form>` picker. The flag is
- *  consulted by the workspace-sync path in `bus.ts`: explicit picks
- *  are sticky (workspace switches don't override them), auto-set
- *  values track the workspace. Clearing `dir` also clears the flag
- *  so the next auto-set doesn't accidentally inherit a stale `true`. */
+ *  `opts.explicit` records whether this value came from a user-chosen
+ *  custom directory (agent detail setting or `<agent-input-form>`).
+ *  Clearing `dir` also clears the flag so the next initialisation
+ *  doesn't accidentally inherit a stale `true`. */
 export async function setCodingProjectDir(
   uid: string, cid: string, dir: string,
   opts: { explicit: boolean },
@@ -364,6 +369,15 @@ export async function setCodingProjectDir(
       delete s.coding_project_dir;
       delete s.coding_project_dir_explicit;
     }
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return s;
+  });
+}
+
+/** Mark / unmark this conversation as relay-enabled (mirrored to the iOS client — see
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
     s.last_active_at = nowIso();
     await writeStateRaw(uid, cid, s);
     return s;

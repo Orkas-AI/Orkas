@@ -4,7 +4,9 @@
 
 [English](./README.md) · [简体中文](./README.zh-CN.md)
 
-> Command your AI team through conversation — made for people who want a team, not a chat box.
+> **Your AI workforce · Open · Local · Yours forever**
+>
+> AI learns how you work · Stays private · Pays you back later
 
 **Multi-agent collaboration · Self-evolving agents · Local-first storage · Cross-platform desktop app**
 

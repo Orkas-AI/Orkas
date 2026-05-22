@@ -543,74 +543,10 @@ describe("Evolution: AgentRunner integration", () => {
     expect(runner.getSkillStore()).toBeNull();
   });
 
-  it("evaluateReflection returns null when metacognition is disabled", async () => {
-    const store = new SkillStore(skillsDir, makeConfig(skillsDir));
-    await store.init();
-
-    const registry = new ProviderRegistry();
-    const config = createConfig({
-      agent: { defaultProvider: "mock", defaultModel: "mock-model" },
-      evolution: { enabled: true, skillsDir, metacognition: { enabled: false } },
-    });
-
-    const runner = new AgentRunner({ config, providers: registry, tools: [], skillStore: store });
-    const result = makeRunResult({ toolLoops: 10 });
-    expect(runner.evaluateReflection(result)).toBeNull();
-  });
-
-  it("evaluateReflection returns prompt when metacognition triggers", async () => {
-    const store = new SkillStore(skillsDir, makeConfig(skillsDir));
-    await store.init();
-
-    const registry = new ProviderRegistry();
-    const config = createConfig({
-      agent: { defaultProvider: "mock", defaultModel: "mock-model" },
-      evolution: {
-        enabled: true,
-        skillsDir,
-        metacognition: { enabled: true, reflectThreshold: 0.7 },
-      },
-    });
-
-    const runner = new AgentRunner({ config, providers: registry, tools: [], skillStore: store });
-    // Error recovery (weight 0.8) should trigger
-    const result = makeRunResult({
-      toolLoops: 3,
-      error: { kind: "provider_error", message: "temporary" },
-      toolNames: ["bash"],
-      skillsLoaded: [],
-    });
-    // result.text is non-empty → recovered = true
-    const evaluation = runner.evaluateReflection(result);
-    expect(evaluation).not.toBeNull();
-    expect(evaluation!.primaryFocus).toBe("error_recovery");
-    // Adaptive review prompt = English head (buildAdaptiveReviewPrompt) +
-    // English digest body (buildConversationDigest's "Outcome: recovered
-    // from the error and completed the task") + the user-supplied
-    // result.text appended verbatim.
-    expect(evaluation!.prompt).toContain("conversation digest");
-    expect(evaluation!.prompt).toContain("recovered from the error");
-    expect(evaluation!.prompt).toContain("Task completed");
-  });
-
-  it("evaluateReflection returns null for simple runs", async () => {
-    const store = new SkillStore(skillsDir, makeConfig(skillsDir));
-    await store.init();
-
-    const registry = new ProviderRegistry();
-    const config = createConfig({
-      agent: { defaultProvider: "mock", defaultModel: "mock-model" },
-      evolution: {
-        enabled: true,
-        skillsDir,
-        metacognition: { enabled: true, reflectThreshold: 0.7 },
-      },
-    });
-
-    const runner = new AgentRunner({ config, providers: registry, tools: [], skillStore: store });
-    const result = makeRunResult({ toolLoops: 2 });
-    expect(runner.evaluateReflection(result)).toBeNull();
-  });
+  // Per-turn `evaluateReflection` path removed in the reflection redesign
+  // (`docs/plans/reflection-redesign.md` §2.4). Reflection now runs only
+  // from the orchestrator (`features/reflection-orchestrator.ts`); the
+  // runner no longer owns reflection triggering.
 
   it("agent can create a skill via tool call", async () => {
     const mockProvider = createMockProvider([

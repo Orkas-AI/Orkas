@@ -24,6 +24,7 @@ const _wsLog = createLogger('user-workspace');
 const _wsInfoByTarget = {
   'new-chat': { currentPath: '', defaultPath: '', isDefault: true, recentPaths: [], scope: 'default' },
   'conversation': { currentPath: '', defaultPath: '', isDefault: true, recentPaths: [], scope: 'default' },
+  project: { currentPath: '', defaultPath: '', isDefault: true, recentPaths: [], scope: 'default' },
 };
 
 // ── Workspace display helpers ───────────────────────────────────────
@@ -42,6 +43,10 @@ function _wsScopeHintFor(target) {
   if (target === 'conversation') {
     return currentCid ? { cid: currentCid } : {};
   }
+  if (target === 'project') {
+    const pid = (typeof _projectDetailPid !== 'undefined') ? (_projectDetailPid || '') : '';
+    return pid ? { projectId: pid } : {};
+  }
   // new-chat / commander panel
   if (typeof getCommanderProjectId === 'function') {
     const pid = getCommanderProjectId();
@@ -55,7 +60,7 @@ function _updateChipForTarget(target) {
   const info = _wsInfoByTarget[target] || _wsInfoByTarget['conversation'];
   const sel = target === 'new-chat'
     ? '#panel-new-chat .workspace-chip'
-    : '#panel-conversation .workspace-chip';
+    : (target === 'project' ? '#panel-project .workspace-chip' : '#panel-conversation .workspace-chip');
   const chip = document.querySelector(sel);
   if (!chip) return;
   const label = chip.querySelector('.workspace-chip-label');
@@ -75,6 +80,7 @@ function _updateChipForTarget(target) {
 function _updateAllChips() {
   _updateChipForTarget('new-chat');
   _updateChipForTarget('conversation');
+  _updateChipForTarget('project');
 }
 
 // ── Core actions ────────────────────────────────────────────────────
@@ -101,7 +107,7 @@ async function _fetchWorkspaceInfo(target) {
 /** Refetch info for both targets — called on boot, on commander chip change,
  *  and on conversation switch. */
 async function _refreshAllWorkspaceInfo() {
-  await Promise.all([_fetchWorkspaceInfo('new-chat'), _fetchWorkspaceInfo('conversation')]);
+  await Promise.all([_fetchWorkspaceInfo('new-chat'), _fetchWorkspaceInfo('conversation'), _fetchWorkspaceInfo('project')]);
   _updateAllChips();
 }
 
@@ -156,17 +162,18 @@ function _createWorkspaceChip(target) {
   chip.type = 'button';
   chip.className = 'workspace-chip';
   chip.dataset.wsTarget = target;
-  chip.title = (typeof t === 'function' ? t('workspace.chip_title') : 'Click to pick a workspace');
+  chip.title = (t('workspace.chip_title'));
   // Text-prefix layout matches the recipient / project chip pattern
   // ("给:" / "项目:" / "工作区:") — the folder icon was replaced per UX
   // feedback so all three left-side chips read as "[label]: [value]".
-  const prefix = (typeof t === 'function' ? t('workspace.chip_label') : 'Workspace: ');
+  const prefix = (t('workspace.chip_label'));
+  const chevronIcon = (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function')
+    ? window.uiIconHtml('chevron-down', 'workspace-chip-chevron')
+    : '';
   chip.innerHTML =
     `<span class="workspace-chip-prefix">${escapeHtml(prefix)}</span>` +
     '<span class="workspace-chip-label"></span>' +
-    '<svg class="workspace-chip-chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5">' +
-    '<polyline points="6 9 12 15 18 9"/>' +
-    '</svg>';
+    chevronIcon;
 
   chip.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -282,7 +289,9 @@ function _createMenuItem(text, isActive, onClick) {
   if (isActive) {
     const check = document.createElement('span');
     check.className = 'workspace-menu-check';
-    check.textContent = '✓';
+    check.innerHTML = typeof window !== 'undefined' && typeof window.uiIconHtml === 'function'
+      ? window.uiIconHtml('check', 'ui-icon workspace-check-icon')
+      : '';
     item.appendChild(check);
   }
   item.addEventListener('click', onClick);
@@ -308,6 +317,13 @@ async function initUserWorkspace() {
     const chip = _createWorkspaceChip('conversation');
     if (sendBtn) convBar.insertBefore(chip, sendBtn);
     else convBar.appendChild(chip);
+  }
+  const projectBar = document.querySelector('#panel-project .chat-bottom-bar');
+  if (projectBar) {
+    const sendBtn = projectBar.querySelector('.chat-send-btn');
+    const chip = _createWorkspaceChip('project');
+    if (sendBtn) projectBar.insertBefore(chip, sendBtn);
+    else projectBar.appendChild(chip);
   }
 
   await _refreshAllWorkspaceInfo();

@@ -24,10 +24,18 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const swapScript = resolve(here, 'swap-sqlite-abi.mjs');
 
+function describeResult(result) {
+  const parts = [];
+  if (typeof result.status === 'number') parts.push(`exit ${result.status}`);
+  if (result.signal) parts.push(`signal ${result.signal}`);
+  if (result.error) parts.push(`error ${result.error.message}`);
+  return parts.join(', ') || 'unknown termination';
+}
+
 function swap(mode) {
   const r = spawnSync(process.execPath, [swapScript, mode], { stdio: 'inherit' });
   if (r.status !== 0) {
-    console.error(`[run-tests] ABI swap to ${mode} failed (exit ${r.status}).`);
+    console.error(`[run-tests] ABI swap to ${mode} failed (${describeResult(r)}).`);
     if (mode === 'electron') {
       console.error('[run-tests] Recover manually: npm run rebuild:sqlite:electron');
     }

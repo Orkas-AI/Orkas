@@ -22,6 +22,21 @@
 
 const { contextBridge, ipcRenderer } = require('electron');
 
+// Synchronous i18n boot — handed to the renderer via contextBridge before any
+// renderer-side script runs. The renderer's i18n module reads window.__orkasI18nBoot
+// at script-tag execution time (line 1118 of index.html, after all data-i18n
+// elements have been parsed), so applyDomI18n() can translate the DOM before
+// the first paint. Falls back to a null bundle on failure — i18n.js then runs
+// its old async initI18n() path. sendSync blocks for one short IPC round-trip
+// (~1-2 ms); the trade is paying that for zero language-flash on startup.
+let _i18nBoot = null;
+try {
+  const res = ipcRenderer.sendSync('orkas:bootI18n');
+  if (res && res.ok && res.lang && res.tables && Object.prototype.hasOwnProperty.call(res.tables, res.lang)) {
+    _i18nBoot = { lang: res.lang, tables: res.tables };
+  }
+} catch (_) { /* main not ready / handler missing → renderer falls back to async */ }
+
 let _streamCounter = 0;
 function nextRequestId() {
   _streamCounter += 1;
@@ -46,6 +61,30 @@ function logRecord(record) {
       payload: record || {},
     }).catch(() => {});
   } catch (_) { /* preload must not throw */ }
+}
+
+// Push-event subscription — for main-initiated broadcasts where the renderer doesn't drive
+// the lifecycle (unlike `stream` which the renderer starts). Channel names are restricted to
+// a known prefix list so the renderer can't tap into arbitrary internal IPC traffic.
+// Sync + auto-updater push channels are stripped from this build along with their producers.
+const PUSH_EVENT_PREFIXES = ['marketplace:', 'conversations:'];
+function isAllowedPushChannel(channel) {
+  if (typeof channel !== 'string') return false;
+  return PUSH_EVENT_PREFIXES.some((p) => channel.startsWith(p));
+}
+
+/** Subscribe to a main-initiated push event. Returns an `unsubscribe()` function.
+ *  Throws if the channel isn't in the allow-list (see PUSH_EVENT_PREFIXES). */
+function onPushEvent(channel, handler) {
+  if (!isAllowedPushChannel(channel)) {
+    throw new Error(`push channel not allowed: ${channel}`);
+  }
+  if (typeof handler !== 'function') throw new Error('handler must be a function');
+  const listener = (_evt, payload) => {
+    try { handler(payload); } catch (_) { /* swallow — listener must not throw */ }
+  };
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.removeListener(channel, listener);
 }
 
 function stream(channel, payload, onEvent) {
@@ -86,6 +125,13 @@ function stream(channel, payload, onEvent) {
   return { promise, cancel };
 }
 
+const quality = {
+  readSkillReport: (id) => invoke('quality.readSkillReport', { id }),
+  readAgentReport: (id) => invoke('quality.readAgentReport', { id }),
+};
+
+contextBridge.exposeInMainWorld('__orkasI18nBoot', _i18nBoot);
+
 contextBridge.exposeInMainWorld('orkas', {
   ping: () => ipcRenderer.invoke('orkas.ping'),
   diagnostics: () => ipcRenderer.invoke('orkas.diagnostics'),
@@ -93,7 +139,9 @@ contextBridge.exposeInMainWorld('orkas', {
   getLanguage: () => invoke('config.getLanguage'),
   setLanguage: (language) => invoke('config.setLanguage', { language }),
   getLocales: () => invoke('config.getLocales'),
+  quality,
   invoke,
   stream,
+  onPushEvent,
   log: logRecord,
 });

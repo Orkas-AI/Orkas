@@ -333,12 +333,13 @@ describe('auth › entries (priority list)', () => {
     // Remove credential p2 directly via removeCredential; since that cascades,
     // it also drops e1. To simulate a dangling entry without cascade, reach
     // into the json file.
-    const fs   = await import('node:fs');
     const pathMod = await import('../../../src/main/paths');
+    const cryptoVault = await import('../../../src/main/util/crypto-vault');
     const storePath = pathMod.userAuthProfilesFile(TEST_UID);
-    const store = JSON.parse(fs.readFileSync(storePath, 'utf-8'));
+    const raw = fs.readFileSync(storePath, 'utf-8');
+    const store = JSON.parse(cryptoVault.decrypt(TEST_UID, raw));
     delete store.profiles[p2.profileId];
-    fs.writeFileSync(storePath, JSON.stringify(store));
+    fs.writeFileSync(storePath, cryptoVault.encrypt(TEST_UID, JSON.stringify(store)));
 
     const pick = await a.pickChatEntry();
     expect(pick).not.toBeNull();

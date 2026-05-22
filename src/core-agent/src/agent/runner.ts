@@ -17,8 +17,6 @@ import { toToolDefinition } from "../tools/base.js";
 import { getBuiltinTools } from "../tools/builtin.js";
 import { SkillStore } from "../evolution/skill-store.js";
 import { createSkillManageTool } from "../evolution/skill-tools.js";
-import { shouldReflect, buildAdaptiveReviewPrompt } from "../evolution/metacognition.js";
-import type { MetacognitionConfig, RunMetrics } from "../evolution/types.js";
 import { Session } from "./session.js";
 import type { AgentRunParams, AgentRunResult, AgentRunMeta, AgentRunEvent } from "./types.js";
 
@@ -42,6 +40,7 @@ export class AgentRunner {
   private readonly skillStore: SkillStore | null;
   private readonly skillAllowlist: string[] | undefined;
   private readonly onCompact: ((summary: string) => void) | null;
+  private readonly onLearnedSkillAdvertised: ((id: string) => void) | null;
 
   constructor(opts: {
     config: CoreAgentConfig;
@@ -55,6 +54,12 @@ export class AgentRunner {
     /** Fires after skill_manage(create) with the new skill id — Orkas
      * uses this to keep the bound agent's `skill_list` in sync. */
     onSkillCreated?: (id: string) => void;
+    /** Fires once per turn for each learned-skill id rendered into the
+     * system-prompt's `## Available Learned Skills` block (System B in
+     * the host's signal-attribution vocabulary). Pure callback — exceptions
+     * are swallowed; emission is best-effort. Orkas bridges this to its
+     * `onSkillAdvertised` ChatOptions hook with `system: 'B'`. */
+    onLearnedSkillAdvertised?: (id: string) => void;
     /** Called after session compaction with the generated summary text. */
     onCompact?: (summary: string) => void;
   }) {
@@ -63,6 +68,7 @@ export class AgentRunner {
     this.session = opts.session ?? new Session();
     this.onCompact = opts.onCompact ?? null;
     this.skillAllowlist = opts.skillAllowlist;
+    this.onLearnedSkillAdvertised = opts.onLearnedSkillAdvertised ?? null;
 
     // Set up evolution / skill store
     const evolutionConfig = this.config.evolution;
@@ -502,155 +508,6 @@ export class AgentRunner {
     return this.skillStore;
   }
 
-  /**
-   * Evaluate whether a completed run warrants metacognitive reflection.
-   * Converts AgentRunResult.meta into RunMetrics, calls shouldReflect(),
-   * and if triggered, returns the adaptive review prompt. Returns null
-   * if no reflection is needed.
-   *
-   * @param result      The completed run result
-   * @param competence  Current COMPETENCE.md content (optional)
-   * @param strategies  Current LEARNING_STRATEGIES.md content (optional)
-   */
-  evaluateReflection(
-    result: AgentRunResult,
-    competence?: string,
-    strategies?: string,
-  ): { prompt: string; primaryFocus: string; score: number } | null {
-    const metaConfig = this.config.evolution.metacognition as MetacognitionConfig;
-    if (!metaConfig.enabled) {
-      log.debug('evaluateReflection: metacognition disabled in config');
-      return null;
-    }
-
-    const metrics = this.buildRunMetrics(result);
-    log.debug(`evaluateReflection: metrics toolCalls=${metrics.toolCalls} errors=${metrics.errorCount} errorKind=${metrics.errorKind} transient=${metrics.transientErrorCount} skills=[${metrics.skillsLoaded.join(',')}]`);
-
-    const reflection = shouldReflect(metrics, metaConfig, competence);
-    if (!reflection.shouldReflect) {
-      log.info(`evaluateReflection: no reflection needed (score=${reflection.score.toFixed(2)} threshold=${metaConfig.reflectThreshold} signals=${reflection.signals.length})`);
-      return null;
-    }
-
-    // Build a conversation digest so the reflection LLM has context
-    // about what actually happened (it runs in an ephemeral session).
-    const digest = this.buildConversationDigest(result, metrics, reflection.signals);
-
-    const prompt = buildAdaptiveReviewPrompt(
-      reflection.primaryFocus,
-      competence || '',
-      strategies || '',
-      undefined, // skillHealthReport — future
-      digest,
-    );
-    return {
-      prompt,
-      primaryFocus: reflection.primaryFocus,
-      score: reflection.score,
-    };
-  }
-
-  /**
-   * Build a concise digest of the conversation for the reflection LLM.
-   * Since the reflection runs in an ephemeral session, it needs this
-   * context to understand what happened and make meaningful updates.
-   */
-  private buildConversationDigest(
-    result: AgentRunResult,
-    metrics: RunMetrics,
-    signals: Array<{ name: string; reason: string }>,
-  ): string {
-    const lines: string[] = [];
-
-    // What tools were used
-    if (metrics.toolNames.length > 0) {
-      lines.push(`Tools used: ${metrics.toolNames.join(', ')}`);
-    }
-
-    // Which skills were loaded
-    if (metrics.skillsLoaded.length > 0) {
-      lines.push(`Skills loaded: ${metrics.skillsLoaded.join(', ')}`);
-    }
-
-    // Error info with classification
-    if (result.meta.error) {
-      lines.push(`Error: [${result.meta.error.kind}] ${result.meta.error.message}`);
-      if (metrics.recovered) lines.push('Outcome: recovered from the error and completed the task');
-    }
-    if (metrics.errorKind !== 'none') {
-      const label = metrics.errorKind === 'transient' ? 'transient (network / timeout / rate limit)'
-        : metrics.errorKind === 'mixed' ? 'mixed (transient + permanent)'
-        : 'permanent (non-transient)';
-      lines.push(`Error kind: ${label} (${metrics.transientErrorCount} transient occurrence(s))`);
-    }
-
-    // Trigger signals
-    lines.push(`Trigger signals: ${signals.map(s => `${s.name}(${s.reason})`).join('; ')}`);
-
-    // The agent's final response (truncated) — this is the most important
-    // context for understanding what actually happened
-    if (result.text) {
-      const maxLen = 1500;
-      const text = result.text.length > maxLen
-        ? result.text.slice(0, maxLen) + '\n…(truncated)'
-        : result.text;
-      lines.push('', '--- Final assistant reply ---', text);
-    }
-
-    // Session message history (user messages only, for additional context)
-    const messages = this.session.getMessages();
-    const userMessages = messages
-      .filter(m => m.role === 'user')
-      .map(m => {
-        const textParts = m.content
-          .filter((c: any) => c.type === 'text')
-          .map((c: any) => c.text)
-          .join('');
-        return textParts;
-      })
-      .filter(t => t.length > 0);
-
-    if (userMessages.length > 0) {
-      lines.push('', '--- User messages ---');
-      // Include last few user messages (most relevant)
-      const recent = userMessages.slice(-3);
-      for (const msg of recent) {
-        const truncated = msg.length > 300 ? msg.slice(0, 300) + '…' : msg;
-        lines.push(`- ${truncated}`);
-      }
-    }
-
-    return lines.join('\n');
-  }
-
-  /** Convert AgentRunResult.meta into RunMetrics for the trigger evaluator. */
-  private buildRunMetrics(result: AgentRunResult): RunMetrics {
-    const meta = result.meta;
-    const transient = meta.transientToolErrors ?? 0;
-    const permanent = meta.permanentToolErrors ?? 0;
-    const hadErrors = meta.error !== undefined || transient + permanent > 0;
-    const totalToolErrors = transient + permanent;
-    let errorKind: import('../evolution/types.js').ErrorKind = 'none';
-    if (totalToolErrors > 0) {
-      if (transient > 0 && permanent === 0) errorKind = 'transient';
-      else if (permanent > 0 && transient === 0) errorKind = 'permanent';
-      else errorKind = 'mixed';
-    } else if (meta.error) {
-      errorKind = 'permanent';
-    }
-    return {
-      toolCalls: meta.toolLoops,
-      toolNames: meta.toolNames ?? [],
-      skillsLoaded: meta.skillsLoaded ?? [],
-      hadErrors,
-      recovered: hadErrors && result.text.length > 0,
-      errorCount: totalToolErrors + (meta.error ? 1 : 0),
-      userCorrections: 0,
-      errorKind,
-      transientErrorCount: transient,
-    };
-  }
-
   private async buildSystemPromptWithEvolution(basePrompt: string): Promise<string> {
     if (!this.skillStore || !this.config.evolution.enabled) {
       return basePrompt;
@@ -658,6 +515,25 @@ export class AgentRunner {
 
     try {
       const skillsIndex = await this.skillStore.buildIndex(this.skillAllowlist);
+      // Signal-attribution hook: re-list to recover the rendered id set.
+      // SkillStore.list() is mtime-cached so this is effectively free; not
+      // worth changing buildIndex's signature. Mirror the same allowlist
+      // filter so the emitted set matches what landed in the prompt.
+      if (skillsIndex && this.onLearnedSkillAdvertised) {
+        try {
+          let advertised = await this.skillStore.list();
+          if (this.skillAllowlist !== undefined) {
+            const allow = new Set(this.skillAllowlist);
+            advertised = advertised.filter((s) => allow.has(s.id));
+          }
+          for (const s of advertised) {
+            try { this.onLearnedSkillAdvertised(s.id); }
+            catch { /* best-effort */ }
+          }
+        } catch (err) {
+          log.warn(`onLearnedSkillAdvertised replay failed: ${formatError(err)}`);
+        }
+      }
       const guidance = buildSkillsGuidance(skillsIndex);
       return basePrompt + "\n\n" + guidance;
     } catch (err) {
@@ -726,19 +602,20 @@ export class AgentRunner {
           const tool = this.tools.get(call.name);
           if (!tool) {
             log.warn(`Reflection: unknown tool "${call.name}"`);
-            reflectSession.addToolResult(call.id, `Unknown tool: ${call.name}`, true);
+            // addToolResult signature: (id, result, images?, isError?) — pass undefined for images.
+            reflectSession.addToolResult(call.id, `Unknown tool: ${call.name}`, undefined, true);
             continue;
           }
           try {
             log.info(`Reflection tool: ${call.name}(${JSON.stringify(call.input).slice(0, 200)})`);
             const toolResult = await tool.execute(call.input, toolCtx);
-            reflectSession.addToolResult(call.id, toolResult.content, toolResult.isError);
+            reflectSession.addToolResult(call.id, toolResult.content, toolResult.images, toolResult.isError);
             if (toolResult.isError) {
               log.warn(`Reflection tool ${call.name} returned error: ${toolResult.content.slice(0, 200)}`);
             }
           } catch (err) {
             log.error(`Reflection tool ${call.name} threw: ${formatError(err)}`);
-            reflectSession.addToolResult(call.id, `Error: ${formatError(err)}`, true);
+            reflectSession.addToolResult(call.id, `Error: ${formatError(err)}`, undefined, true);
           }
         }
       } catch (err) {

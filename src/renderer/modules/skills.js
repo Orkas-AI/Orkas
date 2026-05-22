@@ -3,6 +3,48 @@ const _skillsLog = createLogger('skills');
 
 let _skillsCache = null;
 let _selectedSkill = null;    // { source, id }
+const _SKILL_SPEC_CATEGORY_CODE_RE = /^[a-z][a-z0-9_-]{0,79}$/;
+
+function _skillSource(source) {
+  return (typeof normalizeCatalogSource === 'function')
+    ? normalizeCatalogSource(source)
+    : String(source || '');
+}
+
+function _isSkillPlatformSource(source) {
+  return (typeof isMarketplaceCatalogSource === 'function')
+    ? isMarketplaceCatalogSource(source)
+    : _skillSource(source) === 'marketplace';
+}
+
+function _normalizeSkillCategoryForHiddenSave(category) {
+  const code = String(category || '').trim().toLowerCase();
+  return _SKILL_SPEC_CATEGORY_CODE_RE.test(code) ? code : 'general';
+}
+
+function _skillUiIconHtml(name, className) {
+  if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+    return window.uiIconHtml(name, className);
+  }
+  return '';
+}
+
+/** Version + category chips for a marketplace-installed skill. Mirrors the
+ *  marketplace card footer. `_resolveCategoryLabel` is defined in `agents.js` (flat top-level
+ *  scope per CLAUDE.md §8). */
+function _skillPlatformChipsHtml(s) {
+  const lang = getLang();
+  const parts = [];
+  if (s.version) {
+    const versionLabel = t('marketplace.version').replace('{version}', String(s.version));
+    parts.push(`<span class="skill-card-chip is-version">${escapeHtml(versionLabel)}</span>`);
+  }
+  if (s.category) {
+    const catLabel = _resolveCategoryLabel(s.category, lang);
+    parts.push(`<span class="skill-card-chip">${escapeHtml(catLabel)}</span>`);
+  }
+  return parts.join('');
+}
 
 // Re-render the skill grid + currently selected detail page when the UI
 // language changes — descriptions are bilingual now and `pickDesc` returns
@@ -10,6 +52,7 @@ let _selectedSkill = null;    // { source, id }
 // `selectSkillFile` so the SKILL.md frontmatter re-parses and the description picks the
 // right locale via `_renderSkillSections`.
 window.addEventListener('i18n-change', () => {
+  refreshChatUseChips();
   if (_skillsCache) renderSkillsGrid(_skillsCache);
   if (_selectedSkill?.id && _selectedSkill?.source) {
     // Re-read the same file the user was viewing; null nodeEl preserves
@@ -21,13 +64,34 @@ window.addEventListener('i18n-change', () => {
 let _expandedDirs = new Set(); // keys like "source:id" or "source:id/subdir"
 let _skillTreeCache = new Map(); // key: "source:id" → tree array
 
+async function refreshSkillsAfterMarketplaceReconcile() {
+  _skillTreeCache.clear();
+  await loadSkills(true);
+  if (_skillEditMode) return;
+  if (_selectedSkill?.id && _isSkillPlatformSource(_selectedSkill.source)) {
+    const source = _selectedSkill.source;
+    const id = _selectedSkill.id;
+    const filepath = _selectedSkill.filepath || 'SKILL.md';
+    await selectSkillFile(source, id, filepath, null);
+    const toggle = document.getElementById('skills-source-toggle');
+    const treeEl = document.getElementById('skills-source-tree');
+    if (toggle?.getAttribute('aria-expanded') === 'true' && treeEl) {
+      await expandSkillTree(source, id, treeEl);
+      _markActiveSkillFileInTree(filepath);
+    }
+  }
+}
+
 async function loadSkills(forceRefresh) {
   if (_skillsCache && !forceRefresh) { renderSkillsList(_skillsCache); return; }
   try {
     const res = await apiFetch('/api/skills/list');
     const data = await res.json();
     if (data.ok) {
-      _skillsCache = data.skills || [];
+      _skillsCache = (data.skills || []).map((s) => ({
+        ...s,
+        source: _skillSource(s.source),
+      }));
       renderSkillsList(_skillsCache);
     }
   } catch (e) {
@@ -35,15 +99,13 @@ async function loadSkills(forceRefresh) {
   }
 }
 
-// ─── Chat-input skill chip ───────────────────────────────────────────────
+// ─── Chat-input tool chip ────────────────────────────────────────────────
 //
-// The chat composer no longer surfaces a skill-picker button (or shortcut).
-// The chip pill is still used to display a skill that was attached
-// programmatically by the "use skill" flow (▶ on a skill card → useSkill →
-// setChatSkill). Clicking × removes the chip. On send, the chip's name is
-// prepended to the message as `use skill <name>: <content>`.
+// The composer exposes one reusable "use X" chip. Skills and connectors are
+// mutually exclusive because both are textual routing hints prepended to the
+// next message; agents remain separate in the recipient chip.
 
-const _chatSkill = { 'new-chat': '', 'conversation': '' };
+const _chatUse = { 'new-chat': null, 'conversation': null, project: null };
 
 function bindSkillPicker() {
   // Chip remove (×)
@@ -51,39 +113,134 @@ function bindSkillPicker() {
     el.addEventListener('click', (e) => {
       e.stopPropagation();
       const chip = el.closest('.chat-skill-chip');
-      if (chip) setChatSkill(chip.dataset.target, '');
+      if (chip) setChatUseSelection(chip.dataset.target, null);
     });
   });
 }
 
-function setChatSkill(target, name) {
-  const prev = _chatSkill[target] || '';
-  _chatSkill[target] = name || '';
-  if (target === 'conversation' && prev !== _chatSkill[target] && currentCid) {
-    _saveDraft(currentCid);
+function _normalizeChatUseSelection(value) {
+  if (!value) return null;
+  if (typeof value === 'string') {
+    const name = value.trim();
+    return name ? { kind: 'skill', id: name, name } : null;
   }
-  const chipId = target === 'new-chat' ? 'new-chat-skill-chip' : 'chat-skill-chip';
+  if (typeof value !== 'object') return null;
+  const kind = value.kind === 'connector' ? 'connector' : (value.kind === 'skill' ? 'skill' : '');
+  if (!kind) return null;
+  const name = String(value.name || value.id || '').trim();
+  const id = String(value.id || name).trim();
+  if (!name && !id) return null;
+  return { kind, id: id || name, name: name || id };
+}
+
+function getChatUseSelection(target) {
+  const cur = _normalizeChatUseSelection(_chatUse[target]);
+  return cur ? { ...cur } : null;
+}
+
+function formatChatUseLabel(selection) {
+  const sel = _normalizeChatUseSelection(selection);
+  if (!sel) return '';
+  if (sel.kind === 'connector') return t('connectors.use_label', { connector: sel.name || sel.id });
+  return t('skills.use_label', { skill: sel.name || sel.id });
+}
+
+function _chatUseLabelParts(selection) {
+  const sel = _normalizeChatUseSelection(selection);
+  if (!sel) return null;
+  const name = sel.name || sel.id;
+  const token = sel.kind === 'connector' ? 'connector' : 'skill';
+  const key = sel.kind === 'connector' ? 'connectors.use_label' : 'skills.use_label';
+  return {
+    name,
+    label: t(key, { [token]: name }),
+    prefix: t(key, { [token]: '' }),
+  };
+}
+
+function _renderChatUseChipLabel(labelEl, selection) {
+  if (!labelEl) return;
+  labelEl.textContent = '';
+  labelEl.removeAttribute('title');
+  const parts = _chatUseLabelParts(selection);
+  if (!parts) return;
+
+  const prefixEl = document.createElement('span');
+  prefixEl.className = 'chip-label-prefix';
+  prefixEl.textContent = parts.prefix;
+
+  const nameEl = document.createElement('span');
+  nameEl.className = 'chip-label-name';
+  nameEl.textContent = parts.name;
+
+  labelEl.append(prefixEl, nameEl);
+  labelEl.title = parts.label;
+}
+
+function _renderChatUseChip(target) {
+  const next = _normalizeChatUseSelection(_chatUse[target]);
+  const chipId = target === 'new-chat'
+    ? 'new-chat-skill-chip'
+    : (target === 'project' ? 'project-chat-skill-chip' : 'chat-skill-chip');
   const chip = document.getElementById(chipId);
   if (!chip) return;
-  if (!name) {
+  if (!next) {
     chip.style.display = 'none';
+    chip.classList.remove('is-skill', 'is-connector');
+    delete chip.dataset.kind;
+    delete chip.dataset.itemId;
     const lbl = chip.querySelector('.chip-label');
-    if (lbl) lbl.textContent = '';
+    _renderChatUseChipLabel(lbl, null);
     return;
   }
   chip.style.display = 'inline-flex';
+  chip.classList.toggle('is-skill', next.kind === 'skill');
+  chip.classList.toggle('is-connector', next.kind === 'connector');
+  chip.dataset.kind = next.kind;
+  chip.dataset.itemId = next.id || '';
   const lbl = chip.querySelector('.chip-label');
-  if (lbl) lbl.textContent = name;
-  // Return focus to the textarea after selection
+  _renderChatUseChipLabel(lbl, next);
+}
+
+function refreshChatUseChips() {
+  _renderChatUseChip('new-chat');
+  _renderChatUseChip('conversation');
+  _renderChatUseChip('project');
+}
+
+function setChatUseSelection(target, selection) {
+  const prev = JSON.stringify(_normalizeChatUseSelection(_chatUse[target]) || null);
+  const next = _normalizeChatUseSelection(selection);
+  _chatUse[target] = next;
+  if (target === 'conversation' && prev !== JSON.stringify(next || null) && currentCid) {
+    _saveDraft(currentCid);
+  }
+  _renderChatUseChip(target);
+  // Return focus to the textarea after selection.
   const input = target === 'new-chat'
     ? document.getElementById('new-chat-input')
-    : document.getElementById('chat-input');
+    : (target === 'project' ? document.getElementById('project-chat-input') : document.getElementById('chat-input'));
   input?.focus();
 }
 
+function setChatSkill(target, name) {
+  setChatUseSelection(target, name ? { kind: 'skill', id: name, name } : null);
+}
+
+function setChatConnector(target, connectorId, connectorName) {
+  const id = String(connectorId || connectorName || '').trim();
+  const name = String(connectorName || connectorId || '').trim();
+  setChatUseSelection(target, id || name ? { kind: 'connector', id: id || name, name: name || id } : null);
+}
+
 function consumeChatSkill(target) {
+  const sel = getChatUseSelection(target);
+  return sel && sel.kind === 'skill' ? (sel.name || sel.id) : '';
+}
+
+function consumeChatUseSelection(target) {
   // Currently a one-way read. Chip persists until user removes it via the ×.
-  return _chatSkill[target] || '';
+  return getChatUseSelection(target);
 }
 
 function transformWithSkill(content, skill) {
@@ -91,11 +248,20 @@ function transformWithSkill(content, skill) {
   return t('skills.use_prefix', { skill, content });
 }
 
+function transformWithChatUse(content, selection) {
+  const sel = _normalizeChatUseSelection(selection);
+  if (!sel) return content;
+  if (sel.kind === 'connector') {
+    return t('connectors.use_prefix', { connector: sel.name || sel.id, content });
+  }
+  return transformWithSkill(content, sel.name || sel.id);
+}
+
 function renderSkillsList(skills) { renderSkillsGrid(skills); }
 
 function renderSkillsGrid(skills) {
   const custom = skills.filter(s => s.source === 'custom');
-  const builtin = skills.filter(s => s.source === 'builtin');
+  const marketplace = skills.filter(s => _isSkillPlatformSource(s.source));
   const emptyEl = document.getElementById('skills-empty');
   const customGroup = document.getElementById('skills-grid-custom-group');
   const builtinGroup = document.getElementById('skills-grid-builtin-group');
@@ -117,10 +283,14 @@ function renderSkillsGrid(skills) {
     const desc = pickDesc(s, getLang()).trim();
     const descClass = desc ? 'skill-card-desc' : 'skill-card-desc is-empty';
     const descText = desc || t('skills.no_desc');
-    // Source label (custom / builtin) is shown on the detail page only;
+    // Source label (custom / marketplace) is shown on the detail page only;
     // the grid cards stay clean and use the ⋯ menu for actions.
     const moreBtn = `<button type="button" class="skill-card-more" data-skill-more title="${moreTitle}" aria-label="${moreTitle}">⋯</button>`;
     const enabled = s.enabled !== false;
+    // Marketplace-installed skills carry version + category from _install.json /
+    // SKILL.md frontmatter — show them as inline chips so users see provenance without
+    // opening the detail page. Custom skills skip (no published version).
+    const platformChips = _isSkillPlatformSource(s.source) ? _skillPlatformChipsHtml(s) : '';
     return `
       <div class="skill-card${enabled ? '' : ' is-disabled'}" data-id="${escapeHtml(s.id)}" data-source="${s.source}">
         <div class="skill-card-header">
@@ -129,8 +299,9 @@ function renderSkillsGrid(skills) {
         </div>
         <div class="${descClass}">${escapeHtml(descText)}</div>
         <div class="skill-card-actions">
+          ${platformChips}
           <button type="button" class="skill-card-use" data-skill-use title="${useTitle}" aria-label="${useTitle}">
-            <svg class="icon-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><polygon points="5,3 5,13 13,8" fill="currentColor"/></svg>
+            ${_skillUiIconHtml('play-triangle', 'icon-play')}
           </button>
         </div>
       </div>
@@ -143,7 +314,7 @@ function renderSkillsGrid(skills) {
     gridEl.innerHTML = list.map(cardHtml).join('');
   };
   renderGroup(custom, customGroup, customGrid);
-  renderGroup(builtin, builtinGroup, builtinGrid);
+  renderGroup(marketplace, builtinGroup, builtinGrid);
 
   // Wire card / ▶ / ⋯ click handlers. (Enable/disable lives in the ⋯ menu
   // now — no toggle switch on the card.)
@@ -221,6 +392,7 @@ function _showSkillsGridView() {
 }
 
 async function _showSkillsDetailView(source, id) {
+  source = _skillSource(source);
   const grid = document.getElementById('skills-grid-view');
   const detail = document.getElementById('skills-detail-view');
   if (grid) grid.style.display = 'none';
@@ -285,12 +457,14 @@ function _openSkillRowMenu(anchorBtn, id, source) {
   _closeSkillRowMenu();
   menu.dataset.skillId = id;
   menu.dataset.source = source;
-  // Edit/delete are gated: custom always allowed; built-in only in dev mode.
+  // Edit/delete are gated: custom always allowed; built-ins are read-only.
   // Enable/disable is always shown (lives in this menu now since cards no
   // longer carry a toggle).
   const cached = _skillsCache?.find((s) => s.id === id && s.source === source);
   const enabled = cached ? cached.enabled !== false : true;
-  const canEdit = source === 'custom' || (source === 'builtin' && isDevMode());
+  // OrkasOpen has no dev-env concept (per PC/CLAUDE.md §11 "OrkasOpen contract"),
+  // so platform / marketplace skills stay read-only — only custom skills are editable.
+  const canEdit = source === 'custom';
   const items = [];
   if (canEdit) {
     items.push(`<div class="skill-row-menu-item" data-action="edit">${escapeHtml(t('skills.edit'))}</div>`);
@@ -298,9 +472,17 @@ function _openSkillRowMenu(anchorBtn, id, source) {
   items.push(
     `<div class="skill-row-menu-item" data-action="toggle-enabled">${escapeHtml(enabled ? t('component.disable') : t('component.enable'))}</div>`,
   );
-  if (source === 'custom' && isDevMode()) {
+
+  if (source === 'custom' && false) {
     items.push(
       `<div class="skill-row-menu-item" data-action="promote">${escapeHtml(t('skills.promote_to_builtin'))}</div>`,
+    );
+  }
+  // Upload-to-marketplace owned by marketplace_dev.js (absent in OrkasOpen). typeof check
+  // naturally hides the entry on builds that don't ship the dev module.
+  if (typeof openMarketplaceUpload === 'function') {
+    items.push(
+      `<div class="skill-row-menu-item" data-action="upload-marketplace">${escapeHtml(t('marketplace.upload'))}</div>`,
     );
   }
   if (canEdit) {
@@ -325,8 +507,11 @@ function _openSkillRowMenu(anchorBtn, id, source) {
         // Mimic the existing delete flow (from detail page) but for any card.
         _selectedSkill = { source, id, filepath: 'SKILL.md', name: '' };
         await deleteSelectedSkill();
+
       } else if (action === 'promote') {
         await promoteCustomSkill(id);
+      } else if (action === 'upload-marketplace') {
+        if (typeof openMarketplaceUpload === 'function') await openMarketplaceUpload('skill', id);
       } else if (action === 'toggle-enabled') {
         const cur = _skillsCache?.find((s) => s.id === id && s.source === source);
         const nextEnabled = !(cur ? cur.enabled !== false : true);
@@ -381,6 +566,7 @@ async function _toggleSkillsSource() {
 }
 
 async function expandSkillTree(source, id, childrenEl) {
+  source = _skillSource(source);
   const key = `${source}:${id}`;
   let tree = _skillTreeCache.get(key);
   if (!tree) {
@@ -399,10 +585,10 @@ async function expandSkillTree(source, id, childrenEl) {
   bindTreeNodes(childrenEl, source, id);
 }
 
-// SVG icons for tree nodes
-const ICON_FOLDER_CLOSED = '<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.3a1.5 1.5 0 0 1 1.2.6l.9 1.2a1.5 1.5 0 0 0 1.2.6H16a1.5 1.5 0 0 1 1.5 1.5V14a1.5 1.5 0 0 1-1.5 1.5H4A1.5 1.5 0 0 1 2.5 14V5.5Z"/></svg>';
-const ICON_FOLDER_OPEN = '<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5.5A1.5 1.5 0 0 1 4.5 4h3.1a1.5 1.5 0 0 1 1.2.6l.9 1.2a1.5 1.5 0 0 0 1.2.6H16a1.5 1.5 0 0 1 1.5 1.5V8"/><path d="M2.2 9.2A1 1 0 0 1 3.2 8h13.6a1 1 0 0 1 .97 1.24l-1.2 5A1.5 1.5 0 0 1 15.1 15.4H4.2a1.5 1.5 0 0 1-1.46-1.16l-1.1-4.6a1 1 0 0 1 .06-.44Z"/></svg>';
-const ICON_FILE = '<svg viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5H5.5A1.5 1.5 0 0 0 4 4v12a1.5 1.5 0 0 0 1.5 1.5h9A1.5 1.5 0 0 0 16 16V7l-4.5-4.5Z"/><path d="M11 2.5V7h4.5"/></svg>';
+// Tree icons are centralized in modules/icons.js; classes here only control sizing/color.
+const ICON_FOLDER_CLOSED = _skillUiIconHtml('folder', 'skill-tree-node-svg');
+const ICON_FOLDER_OPEN = _skillUiIconHtml('folder-open', 'skill-tree-node-svg');
+const ICON_FILE = _skillUiIconHtml('file', 'skill-tree-node-svg');
 
 function fileIconSvg(ext) {
   // Generic file icon; color is differentiated via data-ext
@@ -508,6 +694,7 @@ function findDirInTree(tree, targetPath) {
 }
 
 async function selectSkillFile(source, id, filepath, nodeEl) {
+  source = _skillSource(source);
   const skill = _skillsCache?.find(s => s.id === id && s.source === source);
   // Detect "same-skill file switch" vs initial / cross-skill load — only the
   // former needs scroll preservation (user is mid-page browsing source files).
@@ -532,10 +719,15 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   nameEl.classList.remove('editable');
   nameEl.removeAttribute('title');
 
-  // Source label + colored tag — mirrors `.agents-detail-source.is-builtin/.is-custom`.
+  // Header chips: custom = "自定义"; marketplace-installed = category only.
+  // Same `_renderSourceMetaHtml` helper as the agent detail page (defined in agents.js,
+  // shared via the renderer's flat top-level scope per CLAUDE.md §8).
   const sourceEl = document.getElementById('skills-detail-source');
-  sourceEl.textContent = source === 'custom' ? t('skills.source_custom') : t('skills.source_builtin');
-  sourceEl.className = 'skills-doc-source ' + (source === 'builtin' ? 'is-builtin' : 'is-custom');
+  sourceEl.className = 'skills-doc-source-row';
+  sourceEl.innerHTML = _renderSourceMetaHtml({
+    source,
+    category: skill?.category || '',
+  });
 
   // Doc sections (description / external dependencies / dependent
   // skills / other attributes) — seed with the cached description so
@@ -545,11 +737,12 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   _renderSkillSections(seedDesc ? [['description', seedDesc]] : []);
 
   // Actions bar: visible when a skill is selected.
-  // Order: use (icon) / edit / enable-disable / promote-to-builtin
-  //        (custom + dev) / delete.
+  // Order: use (icon) / edit / enable-disable / delete.
   // In edit mode only the "done" button (the relabeled "edit") is
   // shown; everything else hides.
-  const canEditThisSkill = source === 'custom' || (source === 'builtin' && isDevMode());
+  // OrkasOpen has no dev-env concept (per PC/CLAUDE.md §11 "OrkasOpen contract"):
+  // platform / marketplace skills stay read-only — only custom skills are editable.
+  const canEditThisSkill = source === 'custom';
   const editingThis = _skillEditMode && _skillEditSkillId === id && canEditThisSkill;
   const actions = document.getElementById('skills-detail-actions');
   if (actions) {
@@ -557,21 +750,23 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
     const useBtn = document.getElementById('skill-use-btn');
     const editBtn = document.getElementById('skill-edit-btn');
     const enableBtn = document.getElementById('skill-enabled-btn');
+
     const promoteBtn = document.getElementById('skill-promote-btn');
+    const uploadBtn = document.getElementById('skill-upload-marketplace-btn');
     const delBtn = document.getElementById('skill-delete-btn');
     if (useBtn) useBtn.style.display = editingThis ? 'none' : '';
     if (editBtn) editBtn.style.display = canEditThisSkill ? '' : 'none';
     if (enableBtn) enableBtn.style.display = editingThis ? 'none' : '';
-    if (promoteBtn) promoteBtn.style.display = (source === 'custom' && isDevMode() && !editingThis) ? '' : 'none';
+
+    if (promoteBtn) promoteBtn.style.display = (source === 'custom' && false && !editingThis) ? '' : 'none';
+    // Upload button visibility: gated by marketplace_dev.js's presence (OrkasOpen lacks it).
+    if (uploadBtn) uploadBtn.style.display = (typeof openMarketplaceUpload === 'function' && !editingThis) ? '' : 'none';
     if (delBtn) delBtn.style.display = (canEditThisSkill && !editingThis) ? '' : 'none';
   }
 
   // Wire name editability (edit mode + custom only) and hide the
   // description section while editing (req #3: edit description by editing
-  // the `description_*:` frontmatter in SKILL.md, not via a separate UI
-  // block). Built-in skills' name is **never** directly editable here even
-  // under dev mode — direct rename would skip the dual-tree dir rename +
-  // per-user chat dir migration that LLM-driven SKILL.md edits go through.
+  // the `description_*:` frontmatter in SKILL.md, not via a separate UI block).
   const nameEditable = editingThis && source === 'custom';
   _toggleSkillNameEditable(nameEl, nameEditable);
   const summarySection = document.getElementById('skills-section-summary');
@@ -903,6 +1098,15 @@ function _scheduleSkillFieldSave(field, value) {
 async function _flushSkillFieldSave({ validate = false } = {}) {
   clearTimeout(_skillFieldSaveTimer);
   _skillFieldSaveTimer = null;
+  // Clicking Done blurs the contenteditable title before the click handler
+  // runs. That blur autosave can clear `_pendingSkillField`; recover the
+  // current DOM value so the explicit commit still performs the dir rename.
+  if (!_pendingSkillField && validate && _selectedSkill?.source === 'custom') {
+    const nameEl = document.getElementById('skills-detail-name');
+    if (nameEl && String(nameEl.innerText || '').trim() !== _selectedSkill.id) {
+      _pendingSkillField = { field: 'name', value: nameEl.innerText };
+    }
+  }
   if (!_pendingSkillField || !_selectedSkill) return;
   const { field, value } = _pendingSkillField;
   if (field === 'name') {
@@ -974,7 +1178,13 @@ let _skillEditSkillId = null;
 function _updateEditButtonLabel() {
   const btn = document.getElementById('skill-edit-btn');
   if (!btn) return;
-  btn.textContent = _skillEditMode ? t('skills.edit_btn_done') : t('skills.edit_btn_edit');
+  if (_skillEditMode) {
+    btn.textContent = t('skills.edit_btn_done');
+    return;
+  }
+  // OrkasOpen has no dev-env concept (per PC/CLAUDE.md §11 "OrkasOpen contract");
+  // platform / marketplace skill labels never carry the dev-suffix marker.
+  btn.textContent = t('skills.edit_btn_edit');
 }
 
 // When called with {autoSeed: true} (e.g. right after skill creation),
@@ -986,9 +1196,10 @@ function _updateEditButtonLabel() {
 // automatically — the user drives the conversation from a blank input.
 async function toggleSkillEditMode(opts = {}) {
   if (!_selectedSkill) return;
-  // Built-in editing is dev-only; lift the source guard accordingly.
+  if (_selectedSkill.source !== 'custom') return;
+  // Marketplace editing is dev-only; lift the source guard accordingly.
   if (_selectedSkill.source !== 'custom'
-      && !(_selectedSkill.source === 'builtin' && isDevMode())) return;
+      && !(_isSkillPlatformSource(_selectedSkill.source) && false)) return;
   if (_skillEditMode && _skillEditSkillId === _selectedSkill.id) {
     // Abort any in-flight reply so "done" means "stop + exit", not
     // "exit but keep streaming". The chat controller is a singleton;
@@ -1175,7 +1386,7 @@ async function openSkillModal(editId) {
     if (el) el.value = '';
   }
   const sel = document.getElementById('skill-dir-selected');
-  if (sel) sel.textContent = t('skill_modal.dir_none') || '(none selected)';
+  if (sel) sel.textContent = t('skill_modal.dir_none');
 
   if (editId) {
     title.textContent = t('skills.modal_edit_title');
@@ -1271,16 +1482,18 @@ async function _saveSkillManual({ editId, msgEl }) {
     return;
   }
   try {
+    const cached = editId ? _skillsCache?.find((s) => s.id === editId && s.source === 'custom') : null;
+    const category = _normalizeSkillCategoryForHiddenSave(cached?.category);
     const res = editId
       ? await apiFetch(`/api/skills/${editId}/update`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, description }),
+          body: JSON.stringify({ name, description, category }),
         })
       : await apiFetch('/api/skills/create', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, description }),
+          body: JSON.stringify({ name, description, category }),
         });
     const data = await res.json();
     if (!data.ok) {
@@ -1380,15 +1593,14 @@ function editSelectedSkill() {
 
 async function deleteSelectedSkill() {
   if (!_selectedSkill) return;
-  const src = _selectedSkill.source;
-  if (src !== 'custom' && !(src === 'builtin' && isDevMode())) return;
+  // OrkasOpen has no dev-env concept (per PC/CLAUDE.md §11 "OrkasOpen contract"):
+  // platform skills are not user-deletable here — only custom skills.
+  if (_selectedSkill.source !== 'custom') return;
   const sid = _selectedSkill.id;
-  const cached = _skillsCache?.find(s => s.id === sid && s.source === src);
+  const cached = _skillsCache?.find(s => s.id === sid && s.source === 'custom');
   if (!(await uiConfirm(t('skills.delete_confirm', { name: cached?.name || sid })))) return;
   try {
-    const result = src === 'builtin'
-      ? await window.orkas.invoke('skills.builtin.delete', { id: sid })
-      : await (await apiFetch(`/api/skills/${sid}`, { method: 'DELETE' })).json();
+    const result = await (await apiFetch(`/api/skills/${sid}`, { method: 'DELETE' })).json();
     if (!result.ok) {
       await uiAlert(t('skills.delete_failed_with', { reason: result.error || '' }));
       return;
@@ -1402,26 +1614,6 @@ async function deleteSelectedSkill() {
     _showSkillsGridView();
   } catch (e) {
     await uiAlert(t('skills.delete_failed_with', { reason: e.message || e }));
-  }
-}
-
-/** Dev-only: promote a custom skill to built-in. Copies to src+data trees,
- *  removes the custom dir, refreshes the grid. */
-async function promoteCustomSkill(id) {
-  if (!isDevMode()) return;
-  const cached = _skillsCache?.find(s => s.id === id && s.source === 'custom');
-  if (!(await uiConfirm(t('skills.promote_confirm', { name: cached?.name || id })))) return;
-  try {
-    const result = await window.orkas.invoke('skills.promoteToBuiltin', { id });
-    if (!result.ok) {
-      await uiAlert(t('skills.promote_failed_with', { reason: result.error || '' }));
-      return;
-    }
-    _skillsCache = null;
-    _skillTreeCache.clear();
-    await loadSkills();
-  } catch (e) {
-    await uiAlert(t('skills.promote_failed_with', { reason: e.message || e }));
   }
 }
 
@@ -1445,4 +1637,3 @@ function _renderSkillEnabledButton(skill) {
     finally { btn.disabled = false; }
   });
 }
-

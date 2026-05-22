@@ -1,4 +1,8 @@
 <!doctype html>
+<!-- `<html lang>` is updated to the user's preferred language by i18n.js at
+     script-load (line 1118), based on the sync bundle preload exposed on
+     window.__orkasI18nBoot. The fallback `en` here is what shows if both the
+     preload bridge and the IPC handler are unavailable. -->
 <html lang="en">
 <head>
   <meta charset="utf-8" />
@@ -13,45 +17,53 @@
         <img class="logo-icon" src="../resources/icons/logo.png" alt="" draggable="false" />
         <div class="logo-text">Orkas</div>
       </div>
-      <button class="sidebar-search-btn" id="sidebar-search-btn" data-i18n-title="sidebar.search_title" title="Global search (⌘K)">
-        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="11" cy="11" r="7"></circle>
-          <path d="m21 21-4.3-4.3"></path>
-        </svg>
+      <button class="sidebar-search-btn" id="sidebar-search-btn" data-i18n-title="sidebar.search_title" title="Global search (Cmd/Ctrl+K)">
+        <span data-ui-icon="search" data-ui-icon-class="sidebar-search-icon"></span>
         <span class="sidebar-search-label" data-i18n="sidebar.search">Search</span>
-        <span class="sidebar-search-kbd">⌘K</span>
+        <span class="sidebar-search-kbd">
+          <span data-ui-icon="command" data-ui-icon-class="ui-icon sidebar-search-command-icon"></span><span>K</span>
+        </span>
       </button>
       <div class="sidebar-actions">
-        <button class="sidebar-btn primary" id="new-chat-btn" data-i18n="sidebar.new_chat">Commander</button>
-        <button class="sidebar-btn" id="agents-btn" data-i18n="sidebar.agents">Agents</button>
-        <button class="sidebar-btn" id="skills-btn" data-i18n="sidebar.skills">Skills</button>
-        <button class="sidebar-btn" id="contexts-btn" data-i18n="sidebar.contexts">Knowledge</button>
+        <button class="sidebar-btn primary" id="new-chat-btn"><span data-ui-icon="message-square" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.new_chat">Commander</span></button>
+        <button class="sidebar-btn" id="agents-btn"><span data-ui-icon="users" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.agents">Agents</span></button>
+        <button class="sidebar-btn" id="skills-btn"><span data-ui-icon="sparkles" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.skills">Skills</span></button>
+        <button class="sidebar-btn" id="connectors-btn"><span data-ui-icon="plug" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.connectors">Connectors</span></button>
+        <button class="sidebar-btn" id="contexts-btn"><span data-ui-icon="book-open" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.contexts">Knowledge</span></button>
+        <button class="sidebar-btn" id="apps-btn"><span data-ui-icon="layout-grid" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.apps">My Apps</span></button>
       </div>
-      <div class="sidebar-section sidebar-projects-section">
-        <div class="sidebar-section-title-row">
-          <span class="sidebar-section-title" data-i18n="sidebar.projects">Projects</span>
-          <button class="sidebar-section-add" id="projects-add-btn"
-                  data-i18n-title="sidebar.project_create_title"
-                  data-i18n-aria-label="sidebar.project_create_title"
-                  title="New project" aria-label="New project">+</button>
+      <div class="sidebar-conversation-nav">
+        <div class="sidebar-section sidebar-projects-section">
+          <div class="sidebar-section-title-row">
+            <span class="sidebar-section-title" data-i18n="sidebar.projects">Projects</span>
+            <button class="sidebar-section-add" id="projects-add-btn"
+                    data-i18n-title="sidebar.project_create_title"
+                    data-i18n-aria-label="sidebar.project_create_title"
+                    title="New project" aria-label="New project">+</button>
+          </div>
+          <div class="projects-list" id="projects-list"></div>
         </div>
-        <div class="projects-list" id="projects-list"></div>
-      </div>
-      <div class="sidebar-section sidebar-conversations-section">
-        <div class="sidebar-section-title" data-i18n="sidebar.conversations">Conversations</div>
-        <div class="conversation-list" id="conversation-list">
-          <div class="conv-empty" data-i18n="sidebar.conv_empty">No conversations yet</div>
+        <div class="sidebar-section sidebar-conversations-section">
+          <div class="sidebar-section-title" data-i18n="sidebar.conversations">Conversations</div>
+          <div class="conversation-list" id="conversation-list">
+            <div class="conv-empty" data-i18n="sidebar.conv_empty">No conversations yet</div>
+          </div>
         </div>
       </div>
       <div class="sidebar-footer-actions">
         <button class="sidebar-footer-btn" id="settings-btn" data-i18n-title="sidebar.settings_title" title="Settings">
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
-            <circle cx="12" cy="12" r="3"></circle>
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-          </svg>
+          <span data-ui-icon="settings" data-ui-icon-class="sidebar-footer-icon"></span>
           <span data-i18n="sidebar.settings">Settings</span>
         </button>
+        <button class="sidebar-footer-btn dev-only-btn" id="devtools-btn" style="display:none" data-i18n-title="sidebar.devtools_title" title="Visible in dev mode only">
+          <span data-ui-icon="terminal" data-ui-icon-class="sidebar-footer-icon"></span>
+          <span data-i18n="sidebar.devtools">Devtools</span>
+        </button>
       </div>
+      <div class="sidebar-resize-handle" id="sidebar-resize-handle"
+           role="separator" aria-orientation="vertical"
+           data-i18n-title="sidebar.resize_title"
+           title="Drag to resize · double-click to reset"></div>
     </aside>
 
     <main class="main-content">
@@ -69,28 +81,30 @@
               <div class="chat-input-overlay">
                 <div class="chat-attachments" id="new-chat-attachments" style="display:none"></div>
               </div>
-              <textarea id="new-chat-input" data-i18n-placeholder="new_chat.input_placeholder" placeholder="Type a message..." rows="2"></textarea>
+              <textarea id="new-chat-input" data-i18n-placeholder="new_chat.input_placeholder" placeholder="Type @ to choose agents, skills, connectors." rows="2"></textarea>
               <div class="chat-bottom-bar">
                 <button type="button" class="chat-attach-btn" id="new-chat-attach-btn" data-i18n-title="new_chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
-                <button type="button" class="chat-recipient-chip" id="new-chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Switch recipient (commander / agent)">
+                <!-- Voice-to-text mic button (stripped in OrkasOpen — see OpenSource/SyncCode/strip-rules.json). -->
+                <button type="button" class="chat-attach-btn chat-mic-btn" id="new-chat-mic-btn" data-i18n-title="chat.mic_title" title="Voice input">
+                  <span data-ui-icon="mic" data-ui-icon-class="chat-mic-icon"></span>
+                </button>
+                <button type="button" class="chat-recipient-chip" id="new-chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Choose agent, skill, or connector">
                   <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
                   <span class="chat-recipient-name" id="new-chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
-                </button>
-                <button type="button" class="chat-project-chip" id="new-chat-project-chip" data-i18n-title="chat.project_picker_title" title="Pick project">
-                  <span class="chat-project-prefix" data-i18n="chat.project_label">Project: </span>
-                  <span class="chat-project-name" id="new-chat-project-name" data-i18n="chat.project_none">None</span>
-                  <svg class="chat-project-chevron" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5">
-                    <polyline points="6 9 12 15 18 9"/>
-                  </svg>
                 </button>
                 <div class="chat-skill-chip" id="new-chat-skill-chip" data-target="new-chat" style="display:none">
                   <span class="chip-label"></span>
                   <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
                 </div>
+                <button type="button" class="chat-project-chip" id="new-chat-project-chip" data-i18n-title="chat.project_picker_title" title="Pick project">
+                  <span class="chat-project-prefix" data-i18n="chat.project_label">Project: </span>
+                  <span class="chat-project-name" id="new-chat-project-name" data-i18n="chat.project_none">None</span>
+                  <span data-ui-icon="chevron-down" data-ui-icon-class="chat-project-chevron"></span>
+                </button>
                 <input type="file" id="new-chat-attach-input" multiple style="display:none"
                        accept=".md,.markdown,.txt,.csv,.tsv,.json,.yaml,.yml,.log,.pdf,.docx,.png,.jpg,.jpeg,.webp,.gif,text/plain,text/markdown,text/csv,application/json,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/png,image/jpeg,image/webp,image/gif" />
                 <button id="new-chat-send-btn" class="chat-send-btn" data-i18n-title="new_chat.send_title" title="Send">
-                  <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"></path></svg>
+                  <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
                 </button>
               </div>
             </div>
@@ -101,61 +115,106 @@
       <!-- Conversation Detail -->
       <section class="panel" id="panel-conversation">
         <div class="chat-container">
-          <div id="conv-project-empty-banner" class="conv-project-empty-banner" style="display:none">
-            <span class="muted" data-i18n="project.bindings.empty_in_chat">This project has no agents or skills bound. Open the project page to add some.</span>
-            <button type="button" class="btn btn-sm" id="conv-project-empty-banner-open" data-i18n="project.bindings.open_settings">Open project page</button>
-          </div>
-          <div id="chat-history" class="chat-history">
-            <div class="empty" data-i18n="chat.empty">No messages yet...</div>
-          </div>
-          <div class="chat-input-wrapper">
-            <div class="chat-queue" id="chat-queue" style="display:none">
-              <div class="chat-queue-header">
-                <span class="chat-queue-label"><span data-i18n="chat.queue_label">Queued</span> <span class="chat-queue-count" id="chat-queue-count">0</span></span>
-                <span class="chat-queue-hint" data-i18n="chat.queue_hint">Drag to reorder · Edit · Delete</span>
-              </div>
-              <div class="chat-queue-list" id="chat-queue-list"></div>
+          <div class="chat-main-pane">
+            <button type="button" class="conversation-info-toggle" id="conversation-info-toggle"
+                    data-i18n-title="conversation_info.toggle_title"
+                    data-i18n-aria-label="conversation_info.toggle_title"
+                    title="Conversation info" aria-label="Conversation info" aria-expanded="false">
+              <span data-ui-icon="panel-list" data-ui-icon-class="conversation-info-toggle-icon"></span>
+            </button>
+            <div id="conv-project-empty-banner" class="conv-project-empty-banner" style="display:none">
+              <span class="muted" data-i18n="project.bindings.empty_in_chat">This project has no agents or skills bound. Open the project page to add some.</span>
+              <button type="button" class="btn btn-sm" id="conv-project-empty-banner-open" data-i18n="project.bindings.open_settings">Open</button>
             </div>
-            <div class="chat-input-area">
-              <!-- Floats above the input box. Plan rail anchors left, attachments
-                   wrap to its right. The workspace chip moved into
-                   .chat-bottom-bar below (next to the recipient chip) so
-                   the overlay no longer holds it. -->
-              <div class="chat-input-overlay">
-                <!-- Plan rail floats at left. Self-hides when current cid has
-                     no plan. Expanded body opens UPWARD (bottom: 100%) over
-                     the chat-history. See modules/plan-rail.js. -->
-                <div id="plan-rail" class="plan-rail" style="display:none">
-                  <div class="plan-rail-header" data-i18n-title="plan.toggle_title" title="Collapse / Expand">
-                    <span class="plan-rail-title">📋 <span data-i18n="plan.title">Execution Plan</span></span>
-                    <span class="plan-rail-progress" id="plan-rail-progress"></span>
-                    <span class="plan-rail-toggle" id="plan-rail-toggle">▴</span>
+            <div id="chat-history" class="chat-history">
+              <div class="empty" data-i18n="chat.empty">No messages yet...</div>
+            </div>
+            <div class="chat-input-wrapper">
+              <div class="chat-queue" id="chat-queue" style="display:none">
+                <div class="chat-queue-header">
+                  <span class="chat-queue-label"><span data-i18n="chat.queue_label">Queued</span> <span class="chat-queue-count" id="chat-queue-count">0</span></span>
+                  <span class="chat-queue-hint" data-i18n="chat.queue_hint">Drag to reorder · Edit · Delete</span>
+                </div>
+                <div class="chat-queue-list" id="chat-queue-list"></div>
+              </div>
+              <div class="chat-input-area">
+                <!-- Floats above the input box. Plan rail anchors left, attachments
+                     wrap to its right. The workspace chip moved into
+                     .chat-bottom-bar below (next to the recipient chip) so
+                     the overlay no longer holds it. -->
+                <div class="chat-input-overlay">
+                  <!-- Plan rail floats at left. Self-hides when current cid has
+                       no plan. Expanded body opens UPWARD (bottom: 100%) over
+                       the chat-history. See modules/plan-rail.js. -->
+                  <div id="plan-rail" class="plan-rail" style="display:none">
+                    <div class="plan-rail-header" data-i18n-title="plan.toggle_title" title="Collapse / Expand">
+                      <span class="plan-rail-title">
+                        <span data-ui-icon="clipboard-list" data-ui-icon-class="ui-icon plan-rail-title-icon"></span>
+                        <span data-i18n="plan.title">Execution Plan</span>
+                      </span>
+                      <span class="plan-rail-progress" id="plan-rail-progress"></span>
+                      <span class="plan-rail-toggle" id="plan-rail-toggle">▴</span>
+                    </div>
+                    <div class="plan-rail-body" id="plan-rail-body"></div>
                   </div>
-                  <div class="plan-rail-body" id="plan-rail-body"></div>
+                  <div class="chat-attachments" id="chat-attachments" style="display:none"></div>
                 </div>
-                <div class="chat-attachments" id="chat-attachments" style="display:none"></div>
-              </div>
-              <div class="chat-quote-preview" id="chat-quote-preview" style="display:none"></div>
-              <textarea id="chat-input" data-i18n-placeholder="chat.input_placeholder" placeholder="Continue the conversation..." rows="2"></textarea>
-              <div class="chat-bottom-bar">
-                <button type="button" class="chat-attach-btn" id="chat-attach-btn" data-i18n-title="chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
-                <button type="button" class="chat-recipient-chip" id="chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Switch recipient (commander / agent)">
-                  <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
-                  <span class="chat-recipient-name" id="chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
-                </button>
-                <div class="chat-skill-chip" id="chat-skill-chip" data-target="conversation" style="display:none">
-                  <span class="chip-label"></span>
-                  <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
+                <div class="chat-quote-preview" id="chat-quote-preview" style="display:none"></div>
+                <textarea id="chat-input" data-i18n-placeholder="chat.input_placeholder" placeholder="Type @ to choose agents, skills, connectors." rows="2"></textarea>
+                <div class="chat-bottom-bar">
+                  <button type="button" class="chat-attach-btn" id="chat-attach-btn" data-i18n-title="chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
+                  <!-- Voice-to-text mic button (stripped in OrkasOpen — see OpenSource/SyncCode/strip-rules.json). -->
+                  <button type="button" class="chat-attach-btn chat-mic-btn" id="chat-mic-btn" data-i18n-title="chat.mic_title" title="Voice input">
+                    <span data-ui-icon="mic" data-ui-icon-class="chat-mic-icon"></span>
+                  </button>
+                  <button type="button" class="chat-recipient-chip" id="chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Choose agent, skill, or connector">
+                    <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
+                    <span class="chat-recipient-name" id="chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
+                  </button>
+                  <div class="chat-skill-chip" id="chat-skill-chip" data-target="conversation" style="display:none">
+                    <span class="chip-label"></span>
+                    <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
+                  </div>
+                  <input type="file" id="chat-attach-input" multiple style="display:none"
+                         accept=".md,.markdown,.txt,.csv,.tsv,.json,.yaml,.yml,.log,.pdf,.docx,.png,.jpg,.jpeg,.webp,.gif,text/plain,text/markdown,text/csv,application/json,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/png,image/jpeg,image/webp,image/gif" />
+                  <button id="chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="Send">
+                    <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
+                    <span data-ui-icon="stop" data-ui-icon-class="stop-icon"></span>
+                  </button>
                 </div>
-                <input type="file" id="chat-attach-input" multiple style="display:none"
-                       accept=".md,.markdown,.txt,.csv,.tsv,.json,.yaml,.yml,.log,.pdf,.docx,.png,.jpg,.jpeg,.webp,.gif,text/plain,text/markdown,text/csv,application/json,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/png,image/jpeg,image/webp,image/gif" />
-                <button id="chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="Send">
-                  <svg class="send-icon" viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"></path></svg>
-                  <svg class="stop-icon" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>
-                </button>
               </div>
             </div>
           </div>
+          <aside class="conversation-info-panel" id="conversation-info-panel" hidden>
+            <div class="conversation-info-header">
+              <div class="conversation-info-title" data-i18n="conversation_info.title">Conversation info</div>
+              <button type="button" class="conversation-info-close" id="conversation-info-close"
+                      data-i18n-title="common.close" data-i18n-aria-label="common.close"
+                      title="Close" aria-label="Close">×</button>
+            </div>
+            <div class="conversation-info-tabs" role="tablist">
+              <button type="button" class="conversation-info-tab is-active" data-info-tab="tasks" data-i18n="conversation_info.tab_tasks">Tasks</button>
+              <button type="button" class="conversation-info-tab" data-info-tab="files" data-i18n="conversation_info.tab_files">Files</button>
+              <button type="button" class="conversation-info-tab" data-info-tab="attachments" data-i18n="conversation_info.tab_attachments">Attachments</button>
+            </div>
+            <div class="conversation-info-body" id="conversation-info-body"></div>
+          </aside>
+          <!-- Markdown viewer / editor drawer. Hosts the shared mountMdViewEdit
+               component (modules/md-view-edit.js) for either an assistant-
+               generated .md file (workspace source) or a free-form scratch
+               edit triggered from a chat-selection context menu (ephemeral
+               source). Slides in from the right just like conversation-info,
+               but is its own single-purpose surface. -->
+          <aside class="chat-md-drawer-panel" id="chat-md-drawer-panel" hidden>
+            <div class="chat-md-drawer-header">
+              <div class="chat-md-drawer-title" id="chat-md-drawer-title"></div>
+              <div class="chat-md-drawer-actions detail-actions" id="chat-md-drawer-actions"></div>
+              <button type="button" class="chat-md-drawer-close" id="chat-md-drawer-close"
+                      data-i18n-title="common.close" data-i18n-aria-label="common.close"
+                      title="Close" aria-label="Close">×</button>
+            </div>
+            <div class="chat-md-drawer-body markdown-body" id="chat-md-drawer-body"></div>
+          </aside>
         </div>
       </section>
 
@@ -165,15 +224,19 @@
         <div class="skills-grid-view" id="skills-grid-view">
           <div class="skills-grid-header">
             <span data-i18n="skills.title">Skills</span>
-            <button class="btn btn-sm" id="create-skill-btn" data-i18n="skills.add">+ Add</button>
+            <div class="header-actions">
+              <button class="btn btn-sm" id="create-skill-btn" data-i18n="skills.add">+ Add</button>
+              <button class="btn btn-sm" id="skills-more-btn" data-i18n="skills.more_btn">More</button>
+            </div>
           </div>
+          <div class="marketplace-reconcile-banner" data-reconcile-banner style="display:none"></div>
           <div class="skills-grid-scroll">
             <div class="skills-group" id="skills-grid-custom-group" style="display:none">
               <div class="skills-group-label" data-i18n="skills.custom_group">Custom</div>
               <div class="skills-grid" id="skills-grid-custom"></div>
             </div>
             <div class="skills-group" id="skills-grid-builtin-group" style="display:none">
-              <div class="skills-group-label" data-i18n="skills.builtin_group">Built-in</div>
+              <div class="skills-group-label" data-i18n="skills.builtin_group">Marketplace</div>
               <div class="skills-grid" id="skills-grid-builtin"></div>
             </div>
             <div class="skills-empty" id="skills-empty" data-i18n="skills.empty">No skills yet</div>
@@ -183,23 +246,20 @@
         <!-- Detail view (replaces grid when a card is opened) -->
         <div class="skills-detail-view" id="skills-detail-view" style="display:none">
           <div class="skills-detail-col" id="skills-detail-col">
-            <div class="skills-detail-breadcrumb">
-              <button type="button" class="skills-back-btn" id="skills-back-btn">
-                <span aria-hidden="true">←</span>
-                <span data-i18n="skills.back">Back to skills</span>
-              </button>
-            </div>
             <div class="skills-detail-content" id="skills-detail-content" style="display:none">
               <div class="skills-doc-headline">
+                <button type="button" class="btn btn-sm" id="skills-back-btn" data-i18n="common.back">Back</button>
                 <h1 class="skills-doc-title" id="skills-detail-name" data-editable="false"></h1>
                 <span class="skills-doc-source" id="skills-detail-source"></span>
                 <div class="skills-doc-actions" id="skills-detail-actions">
                   <button class="btn-icon-use" id="skill-use-btn" data-i18n-title="skills.use_tooltip" data-i18n-aria-label="skills.use_tooltip" aria-label="Use this skill">
-                    <svg class="icon-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><polygon points="5,3 5,13 13,8" fill="currentColor"/></svg>
+                    <span data-ui-icon="play-triangle" data-ui-icon-class="icon-play"></span>
                   </button>
                   <button class="btn btn-sm" id="skill-edit-btn" data-i18n="skills.edit">Edit</button>
                   <button class="btn btn-sm" id="skill-enabled-btn" data-i18n="component.disable">Disable</button>
+
                   <button class="btn btn-sm" id="skill-promote-btn" style="display:none" data-i18n="skills.promote_to_builtin">Make built-in (dev)</button>
+                  <button class="btn btn-sm" id="skill-upload-marketplace-btn" style="display:none" data-i18n="marketplace.upload">Upload to marketplace (dev)</button>
                   <button class="btn btn-sm btn-danger" id="skill-delete-btn" data-i18n="skills.delete">Delete</button>
                 </div>
               </div>
@@ -245,8 +305,8 @@
             <div class="skills-chat-input-area">
               <textarea id="skills-chat-input" data-i18n-placeholder="skills.chat_input_placeholder" placeholder="Describe what to change..." rows="1"></textarea>
               <button id="skills-chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="Send">
-                <svg class="send-icon" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"></path></svg>
-                <svg class="stop-icon" viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>
+                <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
+                <span data-ui-icon="stop" data-ui-icon-class="stop-icon"></span>
               </button>
             </div>
           </div>
@@ -259,15 +319,19 @@
         <div class="agents-grid-view" id="agents-grid-view">
           <div class="agents-grid-header">
             <span data-i18n="agents.title">Agents</span>
-            <button class="btn btn-sm" id="create-agent-btn" data-i18n="agents.create_btn">+ Create</button>
+            <div class="header-actions">
+              <button class="btn btn-sm" id="create-agent-btn" data-i18n="agents.create_btn">+ Create</button>
+              <button class="btn btn-sm" id="agents-more-btn" data-i18n="agents.more_btn">More</button>
+            </div>
           </div>
+          <div class="marketplace-reconcile-banner" data-reconcile-banner style="display:none"></div>
           <div class="agents-grid-scroll">
             <div class="agents-group" id="agents-grid-custom-group" style="display:none">
               <div class="agents-group-label" data-i18n="agents.custom_group">Custom</div>
               <div class="agents-grid" id="agents-grid-custom"></div>
             </div>
             <div class="agents-group" id="agents-grid-builtin-group" style="display:none">
-              <div class="agents-group-label" data-i18n="agents.builtin_group">Built-in</div>
+              <div class="agents-group-label" data-i18n="agents.builtin_group">Marketplace</div>
               <div class="agents-grid" id="agents-grid-builtin"></div>
             </div>
             <div class="agents-empty" id="agents-empty" data-i18n="agents.empty">No agents yet</div>
@@ -277,25 +341,22 @@
         <!-- Detail view (replaces grid when a card is opened) -->
         <div class="agents-detail-view" id="agents-detail-view" style="display:none">
           <div class="agents-detail-col" id="agents-detail-col">
-            <div class="agents-detail-breadcrumb">
-              <button type="button" class="agents-back-btn" id="agents-back-btn">
-                <span aria-hidden="true">←</span>
-                <span data-i18n="agents.back">Back to agents</span>
-              </button>
-            </div>
             <div class="agents-detail-content" id="agents-detail-content" style="display:none">
               <div class="agents-detail-header">
                 <div class="agents-detail-title-row">
+                  <button type="button" class="btn btn-sm" id="agents-back-btn" data-i18n="common.back">Back</button>
                   <span class="agents-detail-avatar-slot" id="agents-detail-avatar"></span>
                   <div class="agents-detail-name" id="agents-detail-name" contenteditable="false"></div>
                   <span class="agents-detail-source" id="agents-detail-source"></span>
                   <div class="detail-actions" id="agents-detail-actions">
                     <button class="btn-icon-use" id="agent-use-btn" data-i18n-title="agents.use_tooltip" data-i18n-aria-label="agents.use_tooltip" aria-label="Use this agent">
-                      <svg class="icon-play" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><polygon points="5,3 5,13 13,8" fill="currentColor"/></svg>
+                      <span data-ui-icon="play-triangle" data-ui-icon-class="icon-play"></span>
                     </button>
                     <button class="btn btn-sm" id="agent-edit-btn" data-i18n="agents.edit_btn_edit">Edit</button>
                     <button class="btn btn-sm" id="agent-enabled-btn" data-i18n="component.disable">Disable</button>
+
                     <button class="btn btn-sm" id="agent-promote-btn" style="display:none" data-i18n="agents.promote_to_builtin">Make built-in (dev)</button>
+                    <button class="btn btn-sm" id="agent-upload-marketplace-btn" style="display:none" data-i18n="marketplace.upload">Upload to marketplace (dev)</button>
                     <button class="btn btn-sm btn-danger" id="agent-delete-btn" data-i18n="agents.delete">Delete</button>
                   </div>
                 </div>
@@ -305,6 +366,10 @@
                   <div class="agents-detail-label" data-i18n="agents.label_runtime">External agent</div>
                   <div class="agents-detail-runtime" id="agents-detail-runtime"></div>
                 </div>
+                <div class="agents-detail-section" id="agents-detail-project-dir-section" style="display:none">
+                  <div class="agents-detail-label" data-i18n="agents.label_project_dir">Project directory</div>
+                  <div class="agents-detail-project-dir" id="agents-detail-project-dir"></div>
+                </div>
                 <div class="agents-detail-section">
                   <div class="agents-detail-label" data-i18n="agents.label_desc">Summary</div>
                   <div class="agents-detail-desc" id="agents-detail-desc" contenteditable="false"></div>
@@ -312,6 +377,11 @@
                 <div class="agents-detail-section agents-detail-section-workflow">
                   <div class="agents-detail-label" data-i18n="agents.label_workflow">Workflow</div>
                   <div class="agents-detail-workflow markdown-body" id="agents-detail-workflow" contenteditable="false"></div>
+                </div>
+                <div class="agents-detail-section" id="agents-detail-output-format-section">
+                  <div class="agents-detail-label" data-i18n="agents.label_output_format">Output format</div>
+                  <div class="agents-detail-output-format" id="agents-detail-output-format"></div>
+                  <div class="form-hint muted" data-i18n="agents.output_format_hint">Hint to the agent on how to render replies. Auto = let the model pick per output.</div>
                 </div>
               </div>
             </div>
@@ -332,11 +402,49 @@
             <div class="agents-chat-input-area">
               <textarea id="agents-chat-input" data-i18n-placeholder="agents.chat_input_placeholder" placeholder="Describe what to adjust..." rows="1"></textarea>
               <button id="agents-chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="Send">
-                <svg class="send-icon" viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"></path></svg>
-                <svg class="stop-icon" viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>
+                <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
+                <span data-ui-icon="stop" data-ui-icon-class="stop-icon"></span>
               </button>
             </div>
           </div>
+        </div>
+      </section>
+
+      <!-- Marketplace (entered via the More button on agents / skills tabs;
+           closes back to its origin view via openMarketplace's return-stack).
+           Two sub-views — grid (browse + categories) and detail (full content + install). -->
+      <section class="panel" id="panel-marketplace">
+        <!-- Grid view (default) -->
+        <div class="marketplace-grid-view" id="marketplace-grid-view">
+          <div class="marketplace-header">
+            <button type="button" class="btn btn-sm" data-mp-close data-i18n="common.back">Back</button>
+            <div class="marketplace-tabs">
+              <button type="button" class="marketplace-tab" data-mp-tab="agent" data-i18n="marketplace.tab_agent">Agents</button>
+              <button type="button" class="marketplace-tab" data-mp-tab="skill" data-i18n="marketplace.tab_skill">Skills</button>
+            </div>
+            <div class="marketplace-search-wrap">
+              <input type="text" class="marketplace-search" data-mp-search data-i18n-placeholder="marketplace.search_ph" />
+              <button type="button" class="marketplace-search-clear" data-mp-search-clear data-i18n-title="common.clear" hidden>&times;</button>
+            </div>
+            <button type="button" class="btn btn-sm btn-primary marketplace-search-btn" data-mp-search-btn data-i18n="marketplace.search">Search</button>
+          </div>
+          <div class="marketplace-categories" data-mp-categories></div>
+          <div class="marketplace-body" data-mp-body></div>
+        </div>
+
+        <!-- Detail view (replaces grid when a card is clicked) -->
+        <div class="marketplace-detail-view" id="marketplace-detail-view" style="display:none">
+          <div class="marketplace-detail-header">
+            <button type="button" class="btn btn-sm" data-mp-detail-back data-i18n="common.back">Back</button>
+            <span class="marketplace-detail-avatar-slot" data-mp-detail-avatar></span>
+            <div class="marketplace-detail-title-wrap">
+              <span class="marketplace-detail-title" data-mp-detail-name></span>
+              <span class="marketplace-detail-meta-row" data-mp-detail-meta></span>
+            </div>
+            <button type="button" class="btn btn-sm btn-primary" data-mp-detail-install></button>
+            <button type="button" class="btn btn-sm btn-danger" data-mp-detail-delete style="display:none" data-i18n="marketplace.delete">Delete (dev)</button>
+          </div>
+          <div class="marketplace-detail-body" data-mp-detail-body></div>
         </div>
       </section>
 
@@ -345,34 +453,101 @@
         <div class="project-detail-view">
           <div class="project-detail-content" id="project-detail-content">
             <div class="project-detail-header">
-              <h2 class="project-detail-title" id="project-detail-title"></h2>
-              <input type="text" class="project-detail-title-input" id="project-detail-title-input"
-                     style="display:none" autocomplete="off" spellcheck="false" />
+              <div class="project-detail-title-wrap">
+                <h2 class="project-detail-title" id="project-detail-title"></h2>
+                <input type="text" class="project-detail-title-input" id="project-detail-title-input"
+                       style="display:none" autocomplete="off" spellcheck="false" />
+              </div>
               <div class="project-detail-actions">
-                <button type="button" class="btn btn-sm" id="project-action-new-conv" data-i18n="project.action.new_conv">+ New chat</button>
                 <button type="button" class="btn btn-sm" id="project-action-rename" data-i18n="project.action.rename">Rename</button>
                 <button type="button" class="btn btn-sm btn-danger" id="project-action-delete" data-i18n="project.action.delete">Delete</button>
               </div>
             </div>
-            <section class="project-detail-card" id="project-detail-agents-section">
-              <div class="project-detail-card-head">
-                <span class="project-detail-card-title" data-i18n="project.bindings.agents_title">Agents</span>
-                <button type="button" class="btn btn-sm" id="project-add-agent-btn" data-i18n="project.bindings.add_agent">Add</button>
+            <div class="project-detail-grid">
+              <div class="project-detail-main">
+                <section class="project-composer-card">
+                  <div class="project-composer-input-area">
+                    <div class="chat-input-overlay">
+                      <div class="chat-attachments" id="project-chat-attachments" style="display:none"></div>
+                    </div>
+                    <textarea id="project-chat-input" data-i18n-placeholder="project.chat.placeholder" placeholder="Type @ to choose agents, skills, connectors." rows="2"></textarea>
+                    <div class="chat-bottom-bar project-composer-bottom">
+                      <button type="button" class="chat-attach-btn" id="project-chat-attach-btn" data-i18n-title="project.files.add" title="Add file">+</button>
+                      <button type="button" class="chat-attach-btn chat-mic-btn" id="project-chat-mic-btn" data-i18n-title="chat.mic_title" title="Voice input">
+                        <span data-ui-icon="mic" data-ui-icon-class="chat-mic-icon"></span>
+                      </button>
+                      <button type="button" class="chat-recipient-chip" id="project-chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Choose agent, skill, or connector">
+                        <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
+                        <span class="chat-recipient-name" id="project-chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
+                      </button>
+                      <div class="chat-skill-chip" id="project-chat-skill-chip" data-target="project" style="display:none">
+                        <span class="chip-label"></span>
+                        <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
+                      </div>
+                      <button type="button" class="chat-send-btn project-chat-send-btn" id="project-chat-send-btn" data-i18n-title="chat.send_title" title="Send">
+                        <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
+                      </button>
+                    </div>
+                  </div>
+                </section>
               </div>
-              <div class="project-bindings-list" id="project-agents-list"></div>
-            </section>
-            <!-- Skills section intentionally hidden this round: skills are
-                 globally available regardless of project membership. The
-                 storage + IPC + runner plumbing for skill bindings stays in
-                 place so this card can be re-introduced without a schema
-                 change later. -->
-            <section class="project-detail-card" id="project-detail-skills-section" style="display:none">
-              <div class="project-detail-card-head">
-                <span class="project-detail-card-title" data-i18n="project.bindings.skills_title">Skills</span>
-                <button type="button" class="btn btn-sm" id="project-add-skill-btn" data-i18n="project.bindings.add_skill">Add</button>
-              </div>
-              <div class="project-bindings-list" id="project-skills-list"></div>
-            </section>
+
+              <aside class="project-detail-side">
+                <section class="project-detail-card" id="project-detail-agents-section">
+                  <div class="project-detail-card-head">
+                    <span class="project-detail-card-title" data-i18n="project.bindings.agents_title">Agents</span>
+                    <button type="button" class="btn btn-sm" id="project-add-agent-btn" data-i18n="project.bindings.add_agent">Add</button>
+                  </div>
+                  <div class="project-bindings-list" id="project-agents-list"></div>
+                </section>
+
+                <section class="project-detail-card" id="project-detail-files-section">
+                  <div class="project-detail-card-head">
+                    <span class="project-detail-card-title" data-i18n="project.files.title">Files</span>
+                    <button type="button" class="project-card-icon-btn" id="project-add-file-btn"
+                            data-i18n-title="project.files.add" title="Add file" aria-label="Add file">+</button>
+                    <input type="file" id="project-file-input" multiple
+                           accept=".md,.markdown,.txt,.csv,.tsv,.json,.yaml,.yml,.log,.pdf,.docx,.png,.jpg,.jpeg,.webp,.gif,.mp4,.webm,.mov,.m4v,.ogv,text/markdown,text/plain,text/csv,application/json,application/x-yaml,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,video/quicktime"
+                           style="display:none" />
+                  </div>
+                  <div class="project-files-status muted" id="project-files-status"></div>
+                  <div class="project-files-list" id="project-files-list"></div>
+                </section>
+
+                <!-- Skills section intentionally hidden this round: skills are
+                     globally available regardless of project membership. The
+                     storage + IPC + runner plumbing for skill bindings stays in
+                     place so this card can be re-introduced without a schema
+                     change later. -->
+                <section class="project-detail-card" id="project-detail-skills-section" style="display:none">
+                  <div class="project-detail-card-head">
+                    <span class="project-detail-card-title" data-i18n="project.bindings.skills_title">Skills</span>
+                    <button type="button" class="btn btn-sm" id="project-add-skill-btn" data-i18n="project.bindings.add_skill">Add</button>
+                  </div>
+                  <div class="project-bindings-list" id="project-skills-list"></div>
+                </section>
+              </aside>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Connectors (MCP-based, curated catalog) -->
+      <section class="panel" id="panel-connectors">
+        <div class="connectors-grid-view" id="connectors-grid-view">
+          <div class="connectors-grid-header">
+            <div class="connectors-grid-title" data-i18n="connectors.title">Connectors</div>
+          </div>
+          <div class="connectors-grid-scroll">
+            <div class="connectors-group" id="connectors-group-connected" style="display:none">
+              <div class="connectors-group-label" data-i18n="connectors.group.connected">Connected</div>
+              <div class="connectors-grid" id="connectors-grid-connected"></div>
+            </div>
+            <div class="connectors-group" id="connectors-group-available" style="display:none">
+              <div class="connectors-group-label" data-i18n="connectors.group.available">Available</div>
+              <div class="connectors-grid" id="connectors-grid-available"></div>
+            </div>
+            <div class="connectors-empty empty" id="connectors-empty" style="display:none" data-i18n="connectors.empty">No connectors available.</div>
           </div>
         </div>
       </section>
@@ -413,174 +588,314 @@
         </div>
       </section>
 
+      <!-- My Apps — user-kept copies of create_artifact bundles (see modules/saved-apps.js) -->
+      <section class="panel" id="panel-apps">
+        <div class="agents-grid-view">
+          <div class="agents-grid-header">
+            <span data-i18n="apps.title">Apps you've created</span>
+          </div>
+          <div class="agents-grid-scroll">
+            <div class="apps-grid" id="apps-grid"></div>
+            <div class="agents-empty" id="apps-empty" data-i18n="apps.empty">No saved apps yet</div>
+          </div>
+        </div>
+      </section>
+
       <!-- Settings -->
       <section class="panel" id="panel-settings">
         <div class="settings-container">
           <div class="settings-header">
-            <h2 data-i18n="settings.title">Settings</h2>
-            <div class="settings-version" id="settings-version"></div>
+            <div class="settings-heading">
+              <h2 data-i18n="settings.title">Settings</h2>
+              <div class="settings-version" id="settings-version"></div>
+            </div>
           </div>
+
+          <!-- 4-tab restructure (batch 6 + 4 decision; see PC/docs/plans/multi-device-sync.md §4.9).
+               OrkasOpen contract: the 账号 tab AND the sync card inside 数据 tab are
+               stripped (see strip-rules.json) — settings.js handles missing-tab gracefully. -->
+          <!-- Account tab + the entire multi-device sync card stack are stripped from this
+               build (see OpenSource/SyncCode/strip-rules.json) — no Orkas account backend, no
+               cloud sync engine, so the 数据 tab keeps only the 本地 (Data root + Clear all
+               conversations) section. -->
+          <div class="settings-tabs" role="tablist">
+            <button class="settings-tab" data-settings-tab="data" data-i18n="settings.tab.data">数据</button>
+            <button class="settings-tab is-active" data-settings-tab="general" data-i18n="settings.tab.general">通用</button>
+            <button class="settings-tab" data-settings-tab="credentials" data-i18n="settings.tab.credentials">配置</button>
+          </div>
+
           <div class="settings-body">
-            <div class="settings-section-head" data-i18n="settings.section.general">General</div>
 
-            <div class="settings-group">
-              <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.language.title">语言 / Language</div>
+            <!-- ───────────────────────── 数据 ───────────────────────── -->
+            <div class="settings-tab-pane" data-settings-pane="data" hidden>
+              <!-- ─── 本地 ───────────────────────────────────────────────
+                   Maintenance actions on local data; not synced. -->
+              <div class="settings-section-head" data-i18n="settings.section.local">本地</div>
+
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.data_root.title">Data root</div>
+                  <div class="settings-group-sub" data-i18n="settings.data_root.sub">All conversations, agents, skills, and KB content live under this directory. Click the path to open it in the OS file manager.</div>
+                </div>
+                <div class="settings-row">
+                  <button class="btn btn-sm" id="settings-data-root-btn" type="button" title="" data-i18n-title="settings.data_root.open_tooltip"><span id="settings-data-root-path" class="muted"></span></button>
+                </div>
               </div>
-              <div class="settings-row" id="settings-language-row">
-                <label class="settings-lang-opt">
-                  <input type="radio" name="settings-language" value="zh" />
-                  <span data-i18n="settings.language.zh">简体中文</span>
-                </label>
-                <label class="settings-lang-opt">
-                  <input type="radio" name="settings-language" value="en" />
-                  <span data-i18n="settings.language.en">English</span>
-                </label>
+
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.clear_all_convs.title">Clear all conversations</div>
+                  <div class="settings-group-sub" data-i18n="settings.clear_all_convs.sub">Removes every conversation and its associated message history, attachments, plan, sessions, and search index entries — same cascade as clicking × on a single conversation, applied to all of them. Skills and agents are NOT touched.</div>
+                </div>
+                <div class="settings-row">
+                  <button class="btn btn-sm btn-danger" id="settings-clear-all-convs-btn" data-i18n="settings.clear_all_convs.btn">Clear all conversations</button>
+                  <span class="settings-status muted" id="settings-clear-all-convs-status"></span>
+                </div>
               </div>
             </div>
 
-            <div class="settings-group">
-              <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.commander_avatar.title">Commander avatar</div>
-                <div class="settings-group-sub" data-i18n="settings.commander_avatar.sub">Click the avatar to pick a new icon and color.</div>
+            <!-- ───────────────────────── 通用 ───────────────────────── -->
+            <div class="settings-tab-pane" data-settings-pane="general" hidden>
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.language.title">语言 / Language</div>
+                </div>
+                <div class="settings-row" id="settings-language-row">
+                  <div class="ai-select" id="settings-language-select"></div>
+                </div>
               </div>
-              <div class="settings-row">
-                <span class="settings-commander-avatar-slot" id="settings-commander-avatar"></span>
-                <span class="settings-status muted" id="settings-commander-avatar-hint" data-i18n="settings.commander_avatar.hint">Click the avatar on the left to change it</span>
+
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.commander_avatar.title">Commander avatar</div>
+                  <div class="settings-group-sub" data-i18n="settings.commander_avatar.sub">Click the avatar to pick a new icon and color.</div>
+                </div>
+                <div class="settings-row">
+                  <span class="settings-commander-avatar-slot" id="settings-commander-avatar"></span>
+                  <span class="settings-status muted" id="settings-commander-avatar-hint" data-i18n="settings.commander_avatar.hint">Click the avatar on the left to change it</span>
+                </div>
+              </div>
+
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.localexec.title">Local Execution</div>
+                  <div class="settings-group-sub" data-i18n="settings.localexec.sub">Once granted, agents may run shell commands, read/write workspace files, and generate PDFs. Without permission those tools refuse to run.</div>
+                </div>
+                <div class="settings-row">
+                  <span class="settings-status" id="settings-localexec-status" data-i18n="settings.localexec.status_loading">Loading…</span>
+                  <button class="btn btn-sm btn-primary" id="settings-localexec-toggle" data-i18n="settings.localexec.btn_grant">Grant local execution</button>
+                </div>
+              </div>
+
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.metacognition.title">Metacognition-level Agent Self-Evolution</div>
+                  <div class="settings-group-sub" data-i18n="settings.metacognition.sub">When on, each agent periodically reviews its recent performance, draws lessons, and adjusts how it works so it does better next time.</div>
+                </div>
+                <div class="settings-row">
+                  <label class="settings-toggle">
+                    <input type="checkbox" id="settings-metacognition-toggle" />
+                    <span data-i18n="settings.metacognition.toggle">Enable</span>
+                  </label>
+                  <span class="settings-status muted" id="settings-metacognition-status"></span>
+                </div>
               </div>
             </div>
 
-            <div class="settings-group">
-              <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.localexec.title">Local Execution</div>
-                <div class="settings-group-sub" data-i18n="settings.localexec.sub">Once granted, agents may run shell commands, read/write workspace files, and generate PDFs. Without permission those tools refuse to run.</div>
+            <!-- ───────────────────────── 配置 ───────────────────────── -->
+            <div class="settings-tab-pane" data-settings-pane="credentials" hidden>
+              <div class="settings-section-note" data-i18n="settings.section.models_note">API keys and OAuth tokens are stored locally only — never synced or sent off-device.</div>
+
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.add_auth_title">Add model authorization</div>
+                  <div class="settings-group-sub" data-i18n="settings.add_auth_sub">Pick a provider and model, then add an API key or OAuth account.</div>
+                </div>
+                <div class="settings-row">
+                  <label data-i18n="settings.provider">Provider</label>
+                  <div class="ai-select" id="settings-picker-provider"></div>
+                </div>
+                <div class="settings-row">
+                  <label data-i18n="settings.model">Model</label>
+                  <div class="ai-select" id="settings-picker-model"></div>
+                </div>
+                <div class="settings-row">
+                  <button class="btn btn-primary" id="settings-add-entry-btn" data-i18n="settings.add_account">+ Add account</button>
+                  <span class="settings-status" id="settings-picker-status"></span>
+                </div>
               </div>
-              <div class="settings-row">
-                <span class="settings-status" id="settings-localexec-status" data-i18n="settings.localexec.status_loading">Loading…</span>
-                <button class="btn btn-sm btn-primary" id="settings-localexec-toggle" data-i18n="settings.localexec.btn_grant">Grant local execution</button>
+
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.configured_title">Configured (by priority)</div>
+                  <div class="settings-group-sub" data-i18n="settings.configured_sub">The first entry is the default model; later entries are the fallback chain. Drag to reorder.</div>
+                </div>
+                <div class="settings-entries" id="settings-entries">
+                  <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
+                </div>
+              </div>
+
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.search.title">Search API Key</div>
+                  <div class="settings-group-sub" data-i18n="settings.search.sub">Priority: paid API &gt; model-native search &gt; built-in keyless scraper.</div>
+                </div>
+                <div class="settings-row">
+                  <label data-i18n="settings.search.provider">Provider</label>
+                  <div class="ai-select" id="settings-search-provider"></div>
+                </div>
+                <div class="settings-row">
+                  <label data-i18n="settings.search.api_key">API Key</label>
+                  <input type="text" class="form-input" id="settings-search-key-input" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="settings-row">
+                  <button class="btn btn-primary" id="settings-search-add-btn" data-i18n="settings.search.add">+ Add search key</button>
+                  <span class="settings-status" id="settings-search-status"></span>
+                </div>
+                <div class="settings-entries" id="settings-search-entries">
+                  <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
+                </div>
+              </div>
+
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.image.title">Image generation API Key</div>
+                  <div class="settings-group-sub" data-i18n="settings.image.sub">API for the generate_image tool. Falls back to chat keys when those target OpenAI or Google.</div>
+                </div>
+                <div class="settings-row">
+                  <label data-i18n="settings.image.provider">Provider</label>
+                  <div class="ai-select" id="settings-image-provider"></div>
+                </div>
+                <div class="settings-row">
+                  <label data-i18n="settings.image.api_key">API Key</label>
+                  <input type="text" class="form-input" id="settings-image-key-input" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="settings-row">
+                  <button class="btn btn-primary" id="settings-image-add-btn" data-i18n="settings.image.add">+ Add image key</button>
+                  <span class="settings-status" id="settings-image-status"></span>
+                </div>
+                <div class="settings-entries" id="settings-image-entries">
+                  <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
+                </div>
               </div>
             </div>
 
-            <div class="settings-group">
-              <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.metacognition.title">Metacognition-level Agent Self-Evolution</div>
-                <div class="settings-group-sub" data-i18n="settings.metacognition.sub">When on, each agent periodically reviews its recent performance, draws lessons, and adjusts how it works so it does better next time. We call it "meta-cognitive" because the agent doesn't just do tasks — it also reasons about "how am I doing, and how could I do better next time?" That cognition about its own cognition is metacognition. Turn off to stop the self-review.</div>
-              </div>
-              <div class="settings-row">
-                <label class="settings-toggle">
-                  <input type="checkbox" id="settings-metacognition-toggle" />
-                  <span data-i18n="settings.metacognition.toggle">Enable</span>
-                </label>
-                <span class="settings-status muted" id="settings-metacognition-status"></span>
-              </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Devtools (dev-only) -->
+      <section class="panel" id="panel-devtools">
+        <div class="devtools-container">
+          <div class="devtools-header">
+            <h2 data-i18n="devtools.title">Devtools</h2>
+            <div class="devtools-sub" data-i18n="devtools.subtitle">Dev mode only</div>
+          </div>
+
+          <!-- System info -->
+          <div class="devtools-card" id="devtools-card-sysinfo">
+            <div class="devtools-card-header">
+              <span class="devtools-card-title" data-i18n="devtools.sysinfo_title">System info</span>
+              <span class="devtools-card-actions">
+                <button class="btn btn-sm" id="devtools-sysinfo-copy-btn" data-i18n-title="devtools.copy_title" title="Copy as text" data-i18n="devtools.copy">Copy</button>
+              </span>
             </div>
+            <div class="devtools-sysinfo-grid" id="devtools-sysinfo-grid"></div>
+          </div>
 
-            <div class="settings-section-head" data-i18n="settings.section.models">Models & credentials</div>
-            <div class="settings-section-note" data-i18n="settings.section.models_note">API keys and OAuth tokens are stored locally only — never synced or sent off-device.</div>
-
-            <div class="settings-group">
-              <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.add_auth_title">Add model authorization</div>
-                <div class="settings-group-sub" data-i18n="settings.add_auth_sub">Pick a provider and model, then add an API key or OAuth account.</div>
-              </div>
-              <div class="settings-row">
-                <label data-i18n="settings.provider">Provider</label>
-                <div class="ai-select" id="settings-picker-provider"></div>
-              </div>
-              <div class="settings-row">
-                <label data-i18n="settings.model">Model</label>
-                <div class="ai-select" id="settings-picker-model"></div>
-              </div>
-              <div class="settings-row">
-                <button class="btn btn-primary" id="settings-add-entry-btn" data-i18n="settings.add_account">+ Add account</button>
-                <span class="settings-status" id="settings-picker-status"></span>
-              </div>
+          <!-- Refresh / Relaunch -->
+          <div class="devtools-card" id="devtools-card-relaunch">
+            <div class="devtools-card-header">
+              <span class="devtools-card-title" data-i18n="devtools.relaunch_title">Relaunch</span>
+              <span class="devtools-card-sub" data-i18n="devtools.relaunch_sub">Relaunch the Orkas process so local code changes take effect</span>
             </div>
-
-            <div class="settings-group">
-              <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.configured_title">Configured (by priority)</div>
-                <div class="settings-group-sub" data-i18n="settings.configured_sub">The first entry is the default model; later entries are the fallback chain. Drag to reorder.</div>
-              </div>
-              <div class="settings-entries" id="settings-entries">
-                <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
-              </div>
+            <div class="devtools-relaunch-row">
+              <button class="btn btn-sm btn-primary" id="devtools-relaunch-btn" data-i18n="devtools.relaunch_btn">Relaunch (Cmd/Ctrl + Shift + R)</button>
             </div>
+          </div>
 
-            <div class="settings-section-head" data-i18n="settings.section.tools">Tool capabilities</div>
-            <div class="settings-section-note" data-i18n="settings.section.tools_note">Search and image-gen API keys are stored locally only — never synced or sent off-device.</div>
-
-            <div class="settings-group">
-              <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.search.title">Search API Key</div>
-                <div class="settings-group-sub" data-i18n="settings.search.sub">Priority: paid API &gt; model-native search &gt; built-in keyless scraper.</div>
-              </div>
-              <div class="settings-row">
-                <label data-i18n="settings.search.provider">Provider</label>
-                <div class="ai-select" id="settings-search-provider"></div>
-              </div>
-              <div class="settings-row">
-                <label data-i18n="settings.search.api_key">API Key</label>
-                <input type="text" class="form-input" id="settings-search-key-input" autocomplete="off" spellcheck="false" />
-              </div>
-              <div class="settings-row">
-                <button class="btn btn-primary" id="settings-search-add-btn" data-i18n="settings.search.add">+ Add search key</button>
-                <span class="settings-status" id="settings-search-status"></span>
-              </div>
-              <div class="settings-entries" id="settings-search-entries">
-                <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
-              </div>
+          <!-- Model-native web search toggle -->
+          <div class="devtools-card" id="devtools-card-native-search">
+            <div class="devtools-card-header">
+              <span class="devtools-card-title" data-i18n="devtools.native_search_title">Model native web search</span>
+              <span class="devtools-card-sub" data-i18n="devtools.native_search_sub">When enabled, injects model server-side search tool on supported models. In-memory only, defaults on after restart.</span>
             </div>
+            <label class="devtools-toggle-row">
+              <input type="checkbox" id="devtools-native-search-toggle" checked />
+              <span data-i18n="devtools.native_search_toggle">Enable model-native web search (OpenAI / Anthropic / Google)</span>
+            </label>
+          </div>
 
-            <div class="settings-group">
-              <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.image.title">Image generation API Key</div>
-                <div class="settings-group-sub" data-i18n="settings.image.sub">API for the generate_image tool. Falls back to chat keys when those target OpenAI or Google.</div>
-              </div>
-              <div class="settings-row">
-                <label data-i18n="settings.image.provider">Provider</label>
-                <div class="ai-select" id="settings-image-provider"></div>
-              </div>
-              <div class="settings-row">
-                <label data-i18n="settings.image.api_key">API Key</label>
-                <input type="text" class="form-input" id="settings-image-key-input" autocomplete="off" spellcheck="false" />
-              </div>
-              <div class="settings-row">
-                <button class="btn btn-primary" id="settings-image-add-btn" data-i18n="settings.image.add">+ Add image key</button>
-                <span class="settings-status" id="settings-image-status"></span>
-              </div>
-              <div class="settings-entries" id="settings-image-entries">
-                <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
-              </div>
+          <!-- Skill metrics dashboard -->
+          <div class="devtools-card devtools-card-skill-metrics" id="devtools-card-skill-metrics">
+            <div class="devtools-card-header">
+              <span class="devtools-card-title" data-i18n="devtools.skill_metrics.title">Skill metrics</span>
+              <span class="devtools-card-sub" data-i18n="devtools.skill_metrics.sub">Aggregated from expert signals — invocation rate / modified-after-hit / negative transfer per skill</span>
+              <span class="devtools-card-actions">
+                <span class="devtools-skill-metrics-days" id="devtools-skill-metrics-days" role="group">
+                  <button class="btn btn-sm" data-days="1" data-i18n="devtools.skill_metrics.days_1">1d</button>
+                  <button class="btn btn-sm active" data-days="7" data-i18n="devtools.skill_metrics.days_7">7d</button>
+                  <button class="btn btn-sm" data-days="30" data-i18n="devtools.skill_metrics.days_30">30d</button>
+                </span>
+                <button class="btn btn-sm" id="devtools-skill-metrics-refresh-btn" data-i18n="devtools.refresh">Refresh</button>
+              </span>
             </div>
-
-            <div class="settings-section-head" data-i18n="settings.section.data">Data</div>
-            <div class="settings-section-note" data-i18n="settings.section.data_note">Maintenance actions on local data. These cannot be undone.</div>
-
-            <div class="settings-group">
-              <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.data_root.title">Data root</div>
-                <div class="settings-group-sub" data-i18n="settings.data_root.sub">All conversations, agents, skills, and KB content live under this directory. Click the path to open it in the OS file manager.</div>
-              </div>
-              <div class="settings-row">
-                <button class="btn btn-sm" id="settings-data-root-btn" type="button" title="" data-i18n-title="settings.data_root.open_tooltip"><span id="settings-data-root-path" class="muted"></span></button>
-              </div>
+            <div class="devtools-skill-metrics-summary" id="devtools-skill-metrics-summary"></div>
+            <div class="devtools-skill-metrics-body" id="devtools-skill-metrics-body">
+              <div class="devtools-empty" data-i18n="devtools.skill_metrics.empty">(no signals in the selected range)</div>
             </div>
+          </div>
 
-            <div class="settings-group">
-              <div class="settings-group-head">
-                <div class="settings-group-title" data-i18n="settings.clear_all_convs.title">Clear all conversations</div>
-                <div class="settings-group-sub" data-i18n="settings.clear_all_convs.sub">Removes every conversation and its associated message history, attachments, plan, sessions, and search index entries — same cascade as clicking × on a single conversation, applied to all of them. Skills and agents are NOT touched.</div>
+          <!-- LLM call archives -->
+          <div class="devtools-card devtools-card-archives" id="devtools-card-archives">
+            <div class="devtools-card-header">
+              <span class="devtools-card-title" data-i18n="devtools.archives_title">LLM call archives</span>
+              <span class="devtools-card-sub" data-i18n="devtools.archives_sub">The last 30 streamChatWithModel calls with full input / output / events</span>
+              <span class="devtools-card-actions">
+                <button class="btn btn-sm" id="devtools-archives-refresh-btn" data-i18n="devtools.refresh">Refresh</button>
+                <button class="btn btn-sm btn-danger" id="devtools-archives-clear-btn" data-i18n="devtools.clear">Clear</button>
+              </span>
+            </div>
+            <div class="devtools-body">
+              <div class="devtools-list-col">
+                <div class="devtools-list" id="devtools-list">
+                  <div class="devtools-empty" data-i18n="devtools.archives_empty">(no calls recorded)</div>
+                </div>
               </div>
-              <div class="settings-row">
-                <button class="btn btn-sm btn-danger" id="settings-clear-all-convs-btn" data-i18n="settings.clear_all_convs.btn">Clear all conversations</button>
-                <span class="settings-status muted" id="settings-clear-all-convs-status"></span>
+              <div class="devtools-detail-col">
+                <div class="devtools-detail-empty" id="devtools-detail-empty" data-i18n="devtools.archives_detail_empty">Pick a call on the left to see details</div>
+                <div class="devtools-detail" id="devtools-detail" style="display:none">
+                  <div class="devtools-detail-meta" id="devtools-detail-meta"></div>
+                  <div class="devtools-detail-section">
+                    <div class="devtools-section-title" data-i18n="devtools.input_title">User input</div>
+                    <pre class="devtools-section-body" id="devtools-detail-input"></pre>
+                  </div>
+                  <div class="devtools-detail-section">
+                    <div class="devtools-section-title">System Prompt</div>
+                    <pre class="devtools-section-body" id="devtools-detail-sysprompt"></pre>
+                  </div>
+                  <div class="devtools-detail-section">
+                    <div class="devtools-section-title" data-i18n="devtools.context_title">Context</div>
+                    <pre class="devtools-section-body" id="devtools-detail-context"></pre>
+                  </div>
+                  <div class="devtools-detail-section">
+                    <div class="devtools-section-title"><span data-i18n="devtools.tools_title">Available tools</span>（<span id="devtools-detail-tools-count">0</span>）</div>
+                    <pre class="devtools-section-body" id="devtools-detail-tools"></pre>
+                  </div>
+                  <div class="devtools-detail-section">
+                    <div class="devtools-section-title"><span data-i18n="devtools.events_title">Stream events</span>（<span id="devtools-detail-events-count">0</span>）</div>
+                    <pre class="devtools-section-body" id="devtools-detail-events"></pre>
+                  </div>
+                  <div class="devtools-detail-section">
+                    <div class="devtools-section-title" data-i18n="devtools.output_title">Model output</div>
+                    <pre class="devtools-section-body" id="devtools-detail-output"></pre>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
         </div>
       </section>
-
     </main>
   </div>
 
@@ -605,6 +920,10 @@
           <input type="text" id="agent-name-input" data-i18n-placeholder="agent_modal.name_placeholder" placeholder="e.g. Code Review Assistant" />
         </div>
         <div class="form-row">
+          <label><span data-i18n="agents.label_output_format">Output format</span> <span class="form-hint" data-i18n="agents.output_format_hint">Tells the agent how to render replies.</span></label>
+          <div class="ai-select" id="agent-output-format-select"></div>
+        </div>
+        <div class="form-row">
           <label><span data-i18n="agent_modal.desc">Summary</span> <span class="form-hint" data-i18n="agent_modal.desc_hint">One line on what it does — the AI will generate a workflow from this</span></label>
           <textarea id="agent-desc-input" rows="4" data-i18n-placeholder="agent_modal.desc_placeholder" placeholder="e.g. Review my code before commit, focus on logic bugs and security issues..."></textarea>
         </div>
@@ -612,8 +931,8 @@
 
       <!-- External panel: bind a local CLI as the runtime. CLI selector
            appears first; name + description are pre-filled from the chosen
-           CLI's defaults but stay editable. claude / codex additionally
-           expose a project-directory input. -->
+           CLI's defaults but stay editable. claude / codex get a
+           project-directory setting on the detail page after creation. -->
       <div class="skill-modal-panel" data-agent-panel="external">
         <div class="form-row">
           <label data-i18n="agent_modal.ext_cli_label">Agent</label>
@@ -690,8 +1009,13 @@
     </div>
   </div>
 
-  <!-- Agent picker popup (new-chat only) -->
+  <!-- Agent / skill / connector picker popup -->
   <div class="skill-picker" id="agent-picker" style="display:none">
+    <div class="skill-picker-tabs" role="tablist" aria-label="Picker type">
+      <button type="button" class="skill-picker-tab active" data-agent-picker-tab="agents" data-i18n="agent_picker.tab_agents">Agents</button>
+      <button type="button" class="skill-picker-tab" data-agent-picker-tab="skills" data-i18n="agent_picker.tab_skills">Skills</button>
+      <button type="button" class="skill-picker-tab" data-agent-picker-tab="connectors" data-i18n="agent_picker.tab_connectors">Connectors</button>
+    </div>
     <div class="skill-picker-header">
       <input type="text" id="agent-picker-search" data-i18n-placeholder="agent_picker.search_placeholder" placeholder="Search agents..." autocomplete="off" />
     </div>
@@ -780,15 +1104,10 @@
   <div class="search-overlay" id="search-overlay" style="display:none">
     <div class="search-modal">
       <div class="search-input-row">
-        <svg class="search-input-icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="11" cy="11" r="7"></circle>
-          <path d="m21 21-4.3-4.3"></path>
-        </svg>
+        <span data-ui-icon="search" data-ui-icon-class="search-input-icon"></span>
         <input type="text" id="search-input" data-i18n-placeholder="search.input_placeholder" placeholder="Search chats and knowledge base…" autocomplete="off" spellcheck="false" />
         <button class="search-close-btn" id="search-close-btn" data-i18n-title="search.close_title" title="Close (Esc)">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M18 6 6 18M6 6l12 12"></path>
-          </svg>
+          <span data-ui-icon="x" data-ui-icon-class="search-close-icon"></span>
         </button>
       </div>
       <div class="search-tabs" id="search-tabs" role="tablist">
@@ -819,17 +1138,30 @@
   <script src="./modules/i18n.js"></script>
   <script src="./modules/model-guard.js"></script>
   <script src="./modules/boot.js"></script>
+  <!-- Account login gate + pro-entitlement gate are stripped from the OrkasOpen build
+       (no Orkas account backend, no membership tiers). The matching <script> tags have
+       been removed to avoid 404 noise on launch. -->
   <script src="./modules/avatar.js"></script>
   <script src="./modules/avatar-picker.js"></script>
   <script src="./modules/chat-input-form.js"></script>
   <script src="./modules/chat-lightbox.js"></script>
+  <script src="./modules/icons.js"></script>
+  <script src="./modules/chat-file-viewer.js"></script>
+  <script src="./modules/md-view-edit.js"></script>
+  <script src="./modules/text-view-edit.js"></script>
+  <script src="./modules/context-menu.js"></script>
+  <script src="./modules/chat-md-drawer.js"></script>
   <script src="./modules/strip-structural-blocks.js"></script>
   <script src="./modules/projects.js"></script>
   <script src="./modules/project-detail.js"></script>
+  <script src="./modules/conv-bucket.js"></script>
   <script src="./modules/conversation.js"></script>
+  <script src="./modules/chat-artifact.js"></script>
   <script src="./modules/plan-rail.js"></script>
+  <script src="./modules/conversation-info.js"></script>
   <script src="./modules/queue-draft.js"></script>
   <script src="./modules/skills.js"></script>
+  <script src="./modules/connectors.js"></script>
   <script src="./modules/contexts.js"></script>
   <script src="./modules/kb-picker.js"></script>
   <script src="./modules/search.js"></script>
@@ -838,7 +1170,13 @@
   <script src="./vendor/pinyin-firstletter/data.js"></script>
   <script src="./modules/pinyin-firstletter.js"></script>
   <script src="./modules/agents.js"></script>
+  <script src="./modules/saved-apps.js"></script>
+  <script src="./modules/agent-schedule.js"></script>
+  <script src="./modules/auto-title.js"></script>
   <script src="./modules/utils.js"></script>
+  <script src="./modules/validation-report-view.js"></script>
+  <script src="./modules/marketplace.js"></script>
+  <script src="./modules/marketplace_dev.js"></script>
 
   <!--
     MathJax v3.2.2 — TeX → CommonHTML.
@@ -879,5 +1217,11 @@
   <script src="./vendor/mathjax/tex-chtml.js" defer></script>
   <script src="./modules/math.js"></script>
   <script src="./modules/settings.js"></script>
+  <script src="./modules/settings_tabs.js"></script>
+  <script src="./modules/sidebar-resize.js"></script>
+  <!-- Stripped modules (sync / feedback / devtools / voice-input / login / pro_gate) are
+       absent from the OrkasOpen build; their <script> tags have been removed so Chromium
+       doesn't 404 on every launch. -->
+
 </body>
 </html>

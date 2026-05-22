@@ -3,15 +3,34 @@
  *
  * All path constants live here — never hardcode paths elsewhere.
  *
- * Layout (dev and packaged both use this tree; only WS_ROOT differs):
+ * Layout (dev source-run and packaged builds both use the same tree —
+ * `WS_ROOT` is identical in both modes, pinned by `install-data-root.cjs`):
  *
- *   PC_ROOT/                      ← source + per-install binaries (asar-packed in prod)
+ *   APP_ROOT/                     ← source + per-install binaries (asar-packed in prod)
  *     bootstrap.cjs package.json node_modules/ test/ docs/
  *     src/
  *       main/                     ← index.ts + preload.js + features/...
  *       renderer/ builtin/ resources/ core-agent/
- *     data/                       ← WS_ROOT (dev default); userData/data in prod
+ *
+ *   WS_ROOT (= <container>/data)  ← `<container>` = `~/.orkas` on mac/linux,
+ *                                    pinned drive `<drive>:\.orkas` on win
+ *     users.json                  ← Local uid registry + current_user_id
+ *     logs/                       ← Local logs (rolled daily, global)
+ *     builtin/                    ← Builtin runtime copy (hash-synced from src/builtin/ at startup)
+ *       agents/<agent_id>/
+ *       skills/<skill_id>/
+ *     <user_id>/
+ *       cloud/                    ← Cloud-sync domain (synced per uid / org / team once accounts are integrated)
+ *         chats/  chat_attachments/  sessions/  contexts/  memory/
+ *         agents/<agent_id>/  skills/<skill_id>/  meta/<agent_id>/
+ *         config/preferences.json
+ *       local/                    ← Machine-private domain (never synced)
+ *         config/                 ← auth-profiles.json + web-search-cache.json
+ *         search/                 ← contexts / chats inverted idx (agent / skill bodies queried in-memory at request time)
+ *   <container>/                  ← ~/.orkas (mac/linux) or <drive>:\.orkas (Windows, pinned)
+ *     data/                       ← WS_ROOT
  *       users.json                ← Local uid registry + current_user_id
+ *       window-state.json         ← Last desktop window bounds (machine-local)
  *       logs/                     ← Local logs (rolled daily, global)
  *       builtin/                  ← Local public builtin runtime copy (hash-synced from src/builtin/ at startup)
  *         agents/<agent_id>/
@@ -24,49 +43,63 @@
  *         local/                  ← Machine-private domain (never synced)
  *           config/               ← auth-profiles.json + web-search-cache.json
  *           search/               ← contexts / chats inverted idx (agent / skill bodies queried in-memory at request time)
+ *           test/                 ← dev-only LLM archive
+ *     userWorkSpace/              ← DEFAULT_USER_WORKSPACE (sibling of data/)
  *
  * Runtime overrides:
- *   ORKAS_WORKSPACE_ROOT   point data root elsewhere (src/main/index.ts sets this in packaged builds; env var name predates the dir rename — kept for stability)
+ *   ORKAS_WORKSPACE_ROOT   point data root elsewhere; tests pre-set this in setup-env.ts.
+ *                          In normal boot, `install-data-root.cjs` sets it from bootstrap.cjs
+ *                          before any TS module loads (`paths.ts` reads it at import time —
+ *                          the env var MUST be set before the first `import * as paths` call).
  *   ORKAS_BUILTIN_ROOT     optional override for the builtin source dir
- *   CORE_AGENT_AUTH_DIR     pinned by `activateUser()` to the active user's `<uid>/local/config/`
+ *   ORKAS_WORKSPACE_ROOT   point data root elsewhere (set by index.ts to
+ *                          `<container>/data`; tests / power users may
+ *                          pre-set it to a tmp dir to bypass container
+ *                          resolution)
+ *   CORE_AGENT_AUTH_DIR    pinned by `activateUser()` to the active user's `<uid>/local/config/`
  */
 
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 
 // ── Roots ────────────────────────────────────────────────────────────────
-// __dirname = PC/src/main → parents[0]=main, [1]=src, [2]=PC.
-export const SRC_ROOT      = path.resolve(__dirname, '..');            // PC/src
-export const PC_ROOT       = path.resolve(__dirname, '..', '..');      // PC
+// __dirname = <app-root>/src/main → parents[0]=main, [1]=src, [2]=app-root.
+export const SRC_ROOT      = path.resolve(__dirname, '..');            // <app-root>/src
+export const PC_ROOT       = path.resolve(__dirname, '..', '..');      // <app-root> — name predates OrkasOpen rename, kept as internal symbol
 export const APP_ROOT      = PC_ROOT;
-export const PROJECT_ROOT  = path.resolve(PC_ROOT, '..');              // Orkas
+export const PROJECT_ROOT  = path.resolve(PC_ROOT, '..');
 
-// ── Data root (env > dev default) ────────────────────────────────────────
-// The on-disk directory name is `data/`; the constant is still named WS_ROOT
-// (a historical abbreviation of "workspace root" — it's an internal TS symbol
-// and not part of any user-facing naming). The env var `ORKAS_WORKSPACE_ROOT`
-// likewise keeps its old name so deployments upgrade transparently.
-export const WS_ROOT = process.env.ORKAS_WORKSPACE_ROOT
-  ? path.resolve(process.env.ORKAS_WORKSPACE_ROOT)
-  : path.join(PC_ROOT, 'data');
+// ── Data root (env required) ─────────────────────────────────────────────
+// `ORKAS_WORKSPACE_ROOT` is set unconditionally by `install-data-root.cjs`
+// before any TS module loads (see bootstrap.cjs). Tests pre-set it in
+// setup-env.ts. The on-disk directory name is `data/`; the constant is
+// still named WS_ROOT (a historical abbreviation of "workspace root" —
+// internal TS symbol, not user-facing). The env var name likewise keeps
+// its old form so deployments upgrade transparently.
+//
+// If the env var is missing here, something has gone wrong in the boot
+// sequence (e.g. a TS module was loaded before bootstrap.cjs's
+// install-data-root.cjs require). Fail loudly rather than silently
+// falling back to `<app-root>/data` and forking dev vs packaged data.
+if (!process.env.ORKAS_WORKSPACE_ROOT) {
+  throw new Error(
+    'paths.ts: ORKAS_WORKSPACE_ROOT is not set. ' +
+    'bootstrap.cjs must require install-data-root.cjs before any .ts module loads. ' +
+    'Tests must use test/setup-env.ts.',
+  );
+}
+export const WS_ROOT = path.resolve(process.env.ORKAS_WORKSPACE_ROOT);
 
 // ── Top-level (machine-global, shared across uids) ───────────────────────
 // Machine-local uid registry: { current_user_id, users: [{user_id, created_at}, ...] }
 export const USERS_FILE        = path.join(WS_ROOT, 'users.json');
+export const WINDOW_STATE_FILE = path.join(WS_ROOT, 'window-state.json');
 // Machine-local logs (daily rolling, single global file shared across uids).
 export const LOGS_DIR          = path.join(WS_ROOT, 'logs');
-// Builtin runtime copy: hash-synced from `src/builtin/` at startup; all uids
-// read from here. The loader scans
-// `[<uid>/cloud/{skills,agents}, <BUILTIN_{SKILLS,AGENTS}_DIR>]`.
-export const BUILTIN_ROOT        = path.join(WS_ROOT, 'builtin');
-export const BUILTIN_AGENTS_DIR  = path.join(BUILTIN_ROOT, 'agents');
-export const BUILTIN_SKILLS_DIR  = path.join(BUILTIN_ROOT, 'skills');
-// Builtin agents follow the same directory shape:
-// `<BUILTIN_AGENTS_DIR>/<aid>/agent.json`. The runtime sub-directories
-// (meta / skills) only exist on the user cloud side; the builtin side does
-// not carry them.
-export const builtinAgentDir            = (agentId: string) => path.join(BUILTIN_AGENTS_DIR, agentId);
-export const builtinAgentDefinitionFile = (agentId: string) => path.join(builtinAgentDir(agentId), 'agent.json');
+// (The legacy globally-shared `data/builtin/{agents,skills}/` tree is gone. Marketplace
+// installs now land under `<uid>/local/marketplace/` per machine — see `userMarketplace*`
+// helpers below. A one-shot migration in `util/migrate-marketplace.ts` moves any pre-cutover
+// `data/builtin/` content into the active uid's cloud tree on first launch.)
 
 // ── Per-user roots ───────────────────────────────────────────────────────
 export const userRoot       = (uid: string) => path.join(WS_ROOT, uid);
@@ -93,21 +126,61 @@ export const groupChatVisibilityFile = (uid: string, cid: string, actorId: strin
 export const userChatAttachmentsDir = (uid: string) => path.join(userCloudRoot(uid), 'chat_attachments');
 export const chatAttachmentDir      = (uid: string, cid: string) => path.join(userChatAttachmentsDir(uid), cid);
 
-// core-agent session jsonl (LLM-view) — all session kinds land here:
-// conv (legacy) / gconv / gmember / skill / agent / extract-img.
+// LLM-generated interactive web-app bundles (artifacts). Layout:
+// `<uid>/cloud/chat_artifacts/<cid>/<artifactId>/{index.html, ...assets, __orkas-meta.json}`.
+// Served read-only via the `chat-app://` protocol (see index.ts). Cloud-synced
+// with the conversation; purged by cid on conversation delete. Kept as a
+// separate pool from chat_attachments/ on purpose — attachments are user
+// uploads with an extension whitelist that `buildAttachmentManifest` scans to
+// feed the model; artifacts are arbitrary directory trees that must not.
+export const userChatArtifactsDir = (uid: string) => path.join(userCloudRoot(uid), 'chat_artifacts');
+export const chatArtifactCidDir   = (uid: string, cid: string) => path.join(userChatArtifactsDir(uid), cid);
+export const artifactDir          = (uid: string, cid: string, artifactId: string) =>
+  path.join(chatArtifactCidDir(uid, cid), artifactId);
+
+// User-kept copies of `create_artifact` apps ("My Apps"). Layout:
+// `<uid>/cloud/saved_apps/<appId>/{index.html, ...siblings, __orkas-meta.json}`.
+// Cloud-synced; never auto-purged (conversation-independent — only the user's
+// explicit delete from the My Apps tab removes one). Opened via `shell.openPath`
+// (a `file://` view). See `features/saved_apps.ts`.
+export const userSavedAppsDir = (uid: string) => path.join(userCloudRoot(uid), 'saved_apps');
+export const savedAppDir      = (uid: string, appId: string) => path.join(userSavedAppsDir(uid), appId);
+
+// core-agent session jsonl (LLM-view). Two regions:
+//   cloud/sessions/  — "resumable" kinds: gconv / gmember / skill / agent.
+//     The user (or the system on the user's behalf) may continue these
+//     conversations later, so the LLM history must cross devices.
+//   local/sessions/  — "ephemeral" kinds: extract-img / reflect /
+//     memory-extract / anon. One-shot background calls; nobody resumes them,
+//     and they're large + worthless to sync. Sessions_sweep GCs by mtime.
+// Routing lives in `model/core-agent/session-store.ts::resolveSessionPath`
+// and is the single place that decides which side an id lands on.
 export const userSessionsDir        = (uid: string) => path.join(userCloudRoot(uid), 'sessions');
 export const userSessionFile        = (uid: string, sessionId: string) => path.join(userSessionsDir(uid), `${sessionId}.jsonl`);
+export const userLocalSessionsDir   = (uid: string) => path.join(userLocalRoot(uid), 'sessions');
+export const userLocalSessionFile   = (uid: string, sessionId: string) => path.join(userLocalSessionsDir(uid), `${sessionId}.jsonl`);
 
 // Curated knowledge base (the "organized" region of the historical
 // two-region contexts design).
 export const userContextsDir        = (uid: string) => path.join(userCloudRoot(uid), 'contexts');
+// Machine-private mirror of contexts/ — holds derived state that must NOT
+// cross devices (currently just the KB vector store; see `userKbDir` below).
+// **Why** mirror the cloud structure under local/ instead of an ad-hoc
+// `<uid>/local/kb/`: keeps the mental model "everything KB lives under
+// .../contexts/.kb/" intact across the cloud/local divide so paths.ts
+// stays grep-able and the migration story is symmetric.
+export const userLocalContextsDir   = (uid: string) => path.join(userLocalRoot(uid), 'contexts');
 
 // Local vector store for the knowledge base (part of the cloud-sync domain,
 // stored in the same directory tree as the text content; on conflict the
 // newer mtime wins). The hidden sub-directory `.kb/` keeps it out of the
 // contexts user-visible listing (listContextsTree filters dotfiles).
 // Runtime WAL/SHM sidecar files are excluded from sync.
-export const userKbDir           = (uid: string) => path.join(userContextsDir(uid), '.kb');
+// KB vector store: machine-private, NOT cloud-synced (multi-device-sync
+// batch 2 decision). Path moved from `<uid>/cloud/contexts/.kb/` (legacy)
+// to `<uid>/local/contexts/.kb/` (current). One-shot rename runs from
+// `util/migrate-kb-to-local.ts` on activateUser.
+export const userKbDir           = (uid: string) => path.join(userLocalContextsDir(uid), '.kb');
 export const userKbVectorDbPath  = (uid: string) => path.join(userKbDir(uid), 'vector.db');
 export const userKbConfigPath    = (uid: string) => path.join(userKbDir(uid), 'config.json');
 
@@ -143,11 +216,12 @@ export const userProjectsDir       = (uid: string) => path.join(userCloudRoot(ui
 export const projectDir            = (uid: string, pid: string) => path.join(userProjectsDir(uid), pid);
 export const projectMetaFile       = (uid: string, pid: string) => path.join(projectDir(uid, pid), 'project.json');
 export const projectBindingsFile   = (uid: string, pid: string) => path.join(projectDir(uid, pid), 'bindings.json');
+export const projectFilesDir        = (uid: string, pid: string) => path.join(projectDir(uid, pid), 'files');
 export const agentDir            = (uid: string, agentId: string) => path.join(userAgentsDir(uid), agentId || '_default');
 export const agentDefinitionFile = (uid: string, agentId: string) => path.join(agentDir(uid, agentId), 'agent.json');
 
 // Agent metacognition (per-agent self-assessment + learning strategies).
-// Writes go through features/metacognition.ts; reflection-trigger fires
+// Writes go through features/metacognition.ts; reflection-orchestrator fires
 // automatically and the `metacognition` tool lets the agent maintain it
 // itself.
 export const agentMetaDir        = (uid: string, agentId: string) => path.join(agentDir(uid, agentId), 'meta');
@@ -167,6 +241,18 @@ export const userPreferencesFile = (uid: string) => path.join(userCloudConfigDir
 // Per-user enable/disable config (agents + skills). Schema in features/component_enabled.ts.
 // Same dir + cloud-sync policy as preferences.json; only `false` is stored.
 export const userComponentEnabledFile = (uid: string) => path.join(userCloudConfigDir(uid), 'component-enabled.json');
+// Per-user scheduled agent tasks. Schema in features/scheduled_tasks.ts.
+// Same dir + cloud-sync policy as preferences.json; user-orchestration
+// config, NOT per-agent runtime asset (those live under agents/<aid>/).
+export const userScheduledTasksFile = (uid: string) => path.join(userCloudConfigDir(uid), 'scheduled_tasks.json');
+// Connector registry: installed MCP server instances + cached tool schemas + OAuth grants
+// (vault-encrypted with the active Orkas account's OAuth user_id as seed — see
+// `features/connectors/registry.ts`). Cloud-synced as of 2026-05-15 so a user authorizing on
+// one device sees the same connectors on another. **Vault key:** OAuth user_id (not local uid)
+// so any device logged into the same Orkas account can decrypt; OrkasOpen / not-logged-in
+// users fall back to local uid (the file then sits in cloud/config/ but doesn't actually
+// sync — sync engine is inactive without an account).
+export const userConnectorsConfigFile = (uid: string) => path.join(userCloudConfigDir(uid), 'connectors.json');
 
 // ── Local-only per-user (never synced) ───────────────────────────────────
 
@@ -177,6 +263,10 @@ export const userLocalConfigDir   = (uid: string) => path.join(userLocalRoot(uid
 export const userAuthProfilesFile = (uid: string) => path.join(userLocalConfigDir(uid), 'auth-profiles.json');
 export const userWebSearchCache   = (uid: string) => path.join(userLocalConfigDir(uid), 'web-search-cache.json');
 export const userReflectionStateFile = (uid: string) => path.join(userLocalConfigDir(uid), 'reflection-state.json');
+export const userDevtoolsFile     = (uid: string) => path.join(userLocalConfigDir(uid), 'devtools.json');
+// Machine-local defaults for external coding agents. Values are absolute
+// project directories, so they must not sync across devices.
+export const userAgentRuntimeConfigFile = (uid: string) => path.join(userLocalConfigDir(uid), 'agent-runtime.json');
 
 // Local search index (derived data, self-healing via reconcile, never synced).
 // Only the main conversation + knowledge base get a persistent inverted
@@ -203,6 +293,79 @@ export const sessionToolResultsDir = (uid: string, sessionId: string) =>
 // Never synced — the source paths are local-absolute.
 export const userFileCacheDir = (uid: string) => path.join(userLocalRoot(uid), 'file_cache');
 
+// ── Cache umbrella ─────────────────────────────────────────────────────
+// `<uid>/local/cache/<bucket>/` is the convention for **user-clearable**
+// caches: anything dropped here is fair game for the "clear cache" UI
+// button. features/cache_clearable.ts enumerates the buckets and exposes
+// clearBucket / clearAll. Distinct from `local/config/` (user prefs;
+// untouched) and `local/biz/` (server-source business data; refreshable
+// but not user-clearable).
+export const userLocalCacheDir = (uid: string) => path.join(userLocalRoot(uid), 'cache');
+export const localCacheBucketDir = (uid: string, bucket: string) =>
+  path.join(userLocalCacheDir(uid), bucket);
+
+// ── Business data ──────────────────────────────────────────────────────
+// `<uid>/local/biz/` holds server-sourced reference data the client mirrors
+// locally (e.g. marketplace.json carrying the category registry with a 24h
+// TTL). Not user prefs (=> not in config/) and not throwaway cache
+// (=> not in cache/) — losing it forces a re-fetch but is otherwise safe.
+export const userLocalBizDir = (uid: string) => path.join(userLocalRoot(uid), 'biz');
+export const marketplaceBizFile = (uid: string) =>
+  path.join(userLocalBizDir(uid), 'marketplace.json');
+
+// ── Marketplace content cache (`<uid>/local/cache/marketplace/`) ────────
+// Mirror of agent.json / skill bundle content fetched from the server, used
+// to render the detail page without re-hitting the network on every visit
+// and to short-circuit install when the same version is already on disk.
+// Lives under cache/ (the "clearable" umbrella above) — losing it just
+// triggers a re-fetch.
+export const marketplaceCacheDir       = (uid: string) => localCacheBucketDir(uid, 'marketplace');
+export const marketplaceCacheAgentsDir = (uid: string) => path.join(marketplaceCacheDir(uid), 'agents');
+export const marketplaceCacheSkillsDir = (uid: string) => path.join(marketplaceCacheDir(uid), 'skills');
+export const marketplaceCacheAgentDir  = (uid: string, id: string) =>
+  path.join(marketplaceCacheAgentsDir(uid), id);
+export const marketplaceCacheSkillDir  = (uid: string, id: string) =>
+  path.join(marketplaceCacheSkillsDir(uid), id);
+// Marketplace listing-grid cache: single JSON file storing the last `/list` response per
+// (kind, category, q) key. Read at openMarketplace to render instantly; written on each
+// fresh response. Under `cache/` umbrella so a "clear cache" wipe drops it.
+export const marketplaceListingsCacheFile = (uid: string) =>
+  path.join(marketplaceCacheDir(uid), 'listings.json');
+// Marker dropped at the end of a successful default-install seed pass. Decoupled from
+// `installs.json` (which gets mutated row-by-row during seed; a mid-write crash leaves a
+// partial manifest). Presence of THIS file = "the entire seed completed at least once" —
+// next launch skips seed; absence = "seed never finished, retry on next launch (add*Install
+// is idempotent so re-runs are safe)". Under cloud/ so cross-device sync propagates "seeded
+// already" once any device finishes the seed.
+export const marketplaceDefaultsSeededFile = (uid: string) =>
+  path.join(userMarketplaceDirCloud(uid), '.default-seeded.json');
+
+// ── Marketplace install target (`<uid>/local/marketplace/`) ─────────────
+// **Where actually-installed content lives on this machine.** Distinct from the cache above:
+// cache holds anything the user has viewed; this holds anything the user has installed.
+// Per-user and per-machine — multi-device install state is reconciled via the cloud-synced
+// `installs.json` manifest below: each machine sees the same list of installed ids/urls and
+// fetches whichever local copies are missing on startup (`features/marketplace_reconcile.ts`).
+// Listed by `features/{agents,skills}.ts::list*` alongside cloud/{agents,skills}/ so installed
+// items show under the "Platform" group in the UI.
+export const userMarketplaceDir        = (uid: string) => path.join(userLocalRoot(uid), 'marketplace');
+export const userMarketplaceAgentsDir  = (uid: string) => path.join(userMarketplaceDir(uid), 'agents');
+export const userMarketplaceSkillsDir  = (uid: string) => path.join(userMarketplaceDir(uid), 'skills');
+export const userMarketplaceAgentDir   = (uid: string, id: string) =>
+  path.join(userMarketplaceAgentsDir(uid), id);
+export const userMarketplaceSkillDir   = (uid: string, id: string) =>
+  path.join(userMarketplaceSkillsDir(uid), id);
+
+// ── Marketplace install manifest (cloud-synced) ────────────────────────
+// `<uid>/cloud/marketplace/installs.json` — the only marketplace state that crosses devices.
+// Format: { version, agents:[{id, version, published_at, agent_json_url, installed_at}],
+// skills:[{id, version, published_at, bundle_url, installed_at}] }. Used by
+// `features/marketplace_reconcile.ts` to fetch missing content into `local/marketplace/`
+// at startup. Touched by `features/marketplace_installs.ts` (single-writer for the file).
+export const userMarketplaceDirCloud   = (uid: string) => path.join(userCloudRoot(uid), 'marketplace');
+export const userMarketplaceInstallsFile = (uid: string) =>
+  path.join(userMarketplaceDirCloud(uid), 'installs.json');
+
 // Run-history root for local CLI agent dispatches
 // (features/local_agents/runner.ts). One subdirectory per dispatch:
 // <uid>/local/file_cache/local-agent-runs/<runId>/{meta.json,
@@ -215,7 +378,7 @@ export const localAgentRunDir = (uid: string, runId: string) =>
 
 // CLI agent session bindings (features/local_agents/sessions.ts) —
 // per-conversation map `{aid → {cli, sessionId}}` so the next dispatch
-// can `--resume` instead of re-replaying the whole visibility slice.
+// can `--resume` through the CLI's own conversation memory.
 // Lives under `local/` (NOT cloud-synced) because the session id
 // references claude's machine-local session files (`~/.claude/...`)
 // which aren't valid on a different device.
@@ -228,6 +391,53 @@ export const localCliSessionsFile = (uid: string, cid: string) =>
 // absolute path of the folder the user picked + a recents list. Absolute
 // paths are machine-specific, so this is never synced.
 export const userWorkspaceConfigFile = (uid: string) => path.join(userLocalRoot(uid), 'workspace.json');
+
+// ── Expert signals (machine-private, append-only) ───────────────────────
+// Per-day jsonl of T0/T1 user behavior signals emitted by bus.ts turn-end
+// hook + IPC handlers (retry/skip/form/silence). Local-only: signals are
+// extractor-version dependent and shouldn't cross devices; they're inputs
+// to reflection / patch suggester / critic (phase 1+). See plan
+// `docs/plans/expert-signals-phase-0.md`. Daily rotation keeps query
+// scoped to a date range; no archive sweep yet (50-200 KB/day × 365 ≈
+// 18-73 MB/year is acceptable for append-only jsonl).
+export const userSignalsDir = (uid: string) => path.join(userLocalRoot(uid), 'signals');
+/** Returns `<signalsDir>/<yyyy-mm-dd>.jsonl`. `date` defaults to today (local). */
+export const signalsDailyFile = (uid: string, date?: Date) => {
+  const d = date || new Date();
+  const ymd = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return path.join(userSignalsDir(uid), `${ymd}.jsonl`);
+};
+
+// ── Quality validator reports (machine-private) ──────────────────────────
+// Per-spec ValidationReport produced by `src/main/quality/`. Local-only:
+// validator version + ruleset are tied to the installed build, so a report
+// from one machine isn't authoritative on another; the validator re-runs at
+// every write anyway, so persistence is informational (UI rail / evolution
+// signal source), not load-bearing. Only the latest report per spec is kept.
+export const userQualityReportsDir = (uid: string) => path.join(userLocalRoot(uid), 'quality_reports');
+export const userQualitySkillsDir  = (uid: string) => path.join(userQualityReportsDir(uid), 'skills');
+export const userQualityAgentsDir  = (uid: string) => path.join(userQualityReportsDir(uid), 'agents');
+export const qualitySkillReportFile = (uid: string, sid: string) =>
+  path.join(userQualitySkillsDir(uid), `${sid}.json`);
+export const qualityAgentReportFile = (uid: string, aid: string) =>
+  path.join(userQualityAgentsDir(uid), `${aid}.json`);
+
+// ── Multi-device sync (machine-private state) ────────────────────────────
+// `<uid>/local/sync/` is the engine's per-machine bookkeeping; nothing here
+// crosses devices (per plan §3.2). `index.json` is the last-synced snapshot
+// (path → {sha256, size, mtime_ms, _v, compressed}), `state.json` carries
+// generation / pending_uploads / device_id, and `conflicts/` retains
+// snapshots for the recovery UX (default 30d; profile-tunable per batch 7).
+export const userSyncDir          = (uid: string) => path.join(userLocalRoot(uid), 'sync');
+export const userSyncIndexFile    = (uid: string) => path.join(userSyncDir(uid), 'index.json');
+export const userSyncStateFile    = (uid: string) => path.join(userSyncDir(uid), 'state.json');
+export const userSyncConflictsDir = (uid: string) => path.join(userSyncDir(uid), 'conflicts');
+// Cached copy of the last-fetched cloud manifest. Read on engine startup so
+// the settings card's storage breakdown can render instantly without
+// waiting for a network round-trip. Refreshed at the end of every
+// successful sync pass.
+export const userSyncManifestCacheFile = (uid: string) =>
+  path.join(userSyncDir(uid), 'manifest_cached.json');
 
 // ── Build-time resources (shipped with installer, read-only) ────────────
 // The 95MB ONNX embedding model ships via electron-builder's `extraResources`
@@ -250,17 +460,8 @@ export function embeddingModelDir(): string {
   return path.join(PC_ROOT, 'resources', 'embedding-model');
 }
 
-// ── Builtin source dirs (shipped, read-only in packaged app) ─────────────
-// All source lives under SRC_ROOT, and `builtin/` follows; electron-builder
-// globs `src/builtin/**` into asar at packaging time. When the user
-// overrides ORKAS_BUILTIN_ROOT, the path is used as-is and does not go
-// through SRC_ROOT.
-export const BUILTIN_SKILLS_SOURCE = process.env.ORKAS_BUILTIN_ROOT
-  ? path.join(path.resolve(process.env.ORKAS_BUILTIN_ROOT), 'skills')
-  : path.join(SRC_ROOT, 'builtin', 'skills');
-export const BUILTIN_AGENTS_SOURCE = process.env.ORKAS_BUILTIN_ROOT
-  ? path.join(path.resolve(process.env.ORKAS_BUILTIN_ROOT), 'agents')
-  : path.join(SRC_ROOT, 'builtin', 'agents');
+// (No shipped builtin source tree anymore. The marketplace is the only source for
+// platform agents/skills, fetched at install time and reconciled from the cloud manifest.)
 
 // ── User workspace (user-facing working directory for agent output) ──────
 // Default: `userWorkSpace/` next to the workspace root.
@@ -274,7 +475,7 @@ export const DEFAULT_USER_WORKSPACE = process.env.ORKAS_WORKSPACE_ROOT
 // Only the top-level shared directories are created here; per-uid sub-trees
 // are mkdir'd on demand by `features/users.activateUser(uid)`.
 export function ensureTopLevelLayout(): void {
-  for (const d of [LOGS_DIR, BUILTIN_AGENTS_DIR, BUILTIN_SKILLS_DIR, DEFAULT_USER_WORKSPACE]) {
+  for (const d of [LOGS_DIR, DEFAULT_USER_WORKSPACE]) {
     fs.mkdirSync(d, { recursive: true });
   }
 }
@@ -289,6 +490,8 @@ export function ensureUserLayout(uid: string): void {
   const dirs = [
     userChatsDir(uid),
     userChatAttachmentsDir(uid),
+    userChatArtifactsDir(uid),
+    userSavedAppsDir(uid),
     userSessionsDir(uid),
     userContextsDir(uid),
     userKbDir(uid),
@@ -296,6 +499,9 @@ export function ensureUserLayout(uid: string): void {
     userAgentsDir(uid),
     userSkillsDir(uid),
     userProjectsDir(uid),
+    userMarketplaceAgentsDir(uid),
+    userMarketplaceSkillsDir(uid),
+    userMarketplaceDirCloud(uid),
     // userMetaDir is deprecated — per-agent meta now lands in the
     // `agents/<aid>/meta/` sub-directory, mkdir'd on demand at agent
     // creation time, so no top-level placeholder is required.
@@ -304,6 +510,13 @@ export function ensureUserLayout(uid: string): void {
     userSearchDir(uid),
     userFileCacheDir(uid),
     userToolResultsDir(uid),
+    userSyncDir(uid),
+    userSyncConflictsDir(uid),
+    userLocalContextsDir(uid),
+    userKbDir(uid),
+    userQualitySkillsDir(uid),
+    userQualityAgentsDir(uid),
+    userSignalsDir(uid),
   ];
   for (const d of dirs) fs.mkdirSync(d, { recursive: true });
 

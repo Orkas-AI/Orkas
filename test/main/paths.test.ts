@@ -9,21 +9,16 @@ import * as path from 'node:path';
 
 let tmpDir: string;
 let prevWs: string | undefined;
-let prevBuiltin: string | undefined;
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-paths-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
-  prevBuiltin = process.env.ORKAS_BUILTIN_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
-  delete process.env.ORKAS_BUILTIN_ROOT;
   vi.resetModules();
 });
 
 afterEach(() => {
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
-  if (prevBuiltin === undefined) delete process.env.ORKAS_BUILTIN_ROOT;
-  else process.env.ORKAS_BUILTIN_ROOT = prevBuiltin;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -45,7 +40,7 @@ describe('paths › roots', () => {
   });
 });
 
-describe('paths › top-level (users.json / logs / builtin)', () => {
+describe('paths › top-level (users.json / logs)', () => {
   it('USERS_FILE sits at the data root', async () => {
     const p = await import('../../src/main/paths');
     expect(p.USERS_FILE).toBe(path.join(p.WS_ROOT, 'users.json'));
@@ -55,14 +50,6 @@ describe('paths › top-level (users.json / logs / builtin)', () => {
     const p = await import('../../src/main/paths');
     expect(p.LOGS_DIR).toBe(path.join(p.WS_ROOT, 'logs'));
   });
-
-  it('BUILTIN_* dirs hang off the top-level builtin/', async () => {
-    const p = await import('../../src/main/paths');
-    expect(p.BUILTIN_ROOT).toBe(path.join(p.WS_ROOT, 'builtin'));
-    expect(p.BUILTIN_AGENTS_DIR).toBe(path.join(p.WS_ROOT, 'builtin', 'agents'));
-    expect(p.BUILTIN_SKILLS_DIR).toBe(path.join(p.WS_ROOT, 'builtin', 'skills'));
-  });
-
 });
 
 describe('paths › cloud-synced per-user', () => {
@@ -130,38 +117,36 @@ describe('paths › local (per-user, not synced)', () => {
     expect(p.userWorkspaceConfigFile(uid))
       .toBe(path.join(p.WS_ROOT, uid, 'local', 'workspace.json'));
   });
-});
 
-describe('paths › builtin source dirs', () => {
-  it('default builtin sources sit under SRC_ROOT/builtin', async () => {
+  it('marketplace install dirs land under <uid>/local/marketplace/', async () => {
     const p = await import('../../src/main/paths');
-    expect(p.BUILTIN_SKILLS_SOURCE).toBe(path.join(p.SRC_ROOT, 'builtin', 'skills'));
-    expect(p.BUILTIN_AGENTS_SOURCE).toBe(path.join(p.SRC_ROOT, 'builtin', 'agents'));
+    const uid = 'u1';
+    const root = path.join(p.WS_ROOT, uid, 'local', 'marketplace');
+    expect(p.userMarketplaceDir(uid)).toBe(root);
+    expect(p.userMarketplaceAgentsDir(uid)).toBe(path.join(root, 'agents'));
+    expect(p.userMarketplaceSkillsDir(uid)).toBe(path.join(root, 'skills'));
+    expect(p.userMarketplaceAgentDir(uid, 'a1')).toBe(path.join(root, 'agents', 'a1'));
+    expect(p.userMarketplaceSkillDir(uid, 's1')).toBe(path.join(root, 'skills', 's1'));
   });
 
-  it('ORKAS_BUILTIN_ROOT overrides the source root', async () => {
-    process.env.ORKAS_BUILTIN_ROOT = path.join(tmpDir, 'alt-builtin');
-    vi.resetModules();
+  it('marketplace cloud-sync manifest lands under <uid>/cloud/marketplace/installs.json', async () => {
     const p = await import('../../src/main/paths');
-    expect(p.BUILTIN_SKILLS_SOURCE).toBe(path.join(tmpDir, 'alt-builtin', 'skills'));
-    expect(p.BUILTIN_AGENTS_SOURCE).toBe(path.join(tmpDir, 'alt-builtin', 'agents'));
+    const uid = 'u1';
+    expect(p.userMarketplaceInstallsFile(uid))
+      .toBe(path.join(p.WS_ROOT, uid, 'cloud', 'marketplace', 'installs.json'));
   });
 });
 
 describe('paths › ensureTopLevelLayout side effect', () => {
   it('mkdirs the top-level skeleton on import (no uid-specific dirs)', async () => {
     await import('../../src/main/paths');
-    for (const d of [
-      path.join(tmpDir, 'logs'),
-      path.join(tmpDir, 'builtin', 'agents'),
-      path.join(tmpDir, 'builtin', 'skills'),
-    ]) {
-      expect(fs.existsSync(d), `expected ${d} to exist`).toBe(true);
-    }
+    expect(fs.existsSync(path.join(tmpDir, 'logs')), 'expected logs/ to exist').toBe(true);
     // Crucially: no `config/` at the top level any more — that was legacy.
     expect(fs.existsSync(path.join(tmpDir, 'config'))).toBe(false);
     // And no `shared/` — folded into `<uid>/cloud/`.
     expect(fs.existsSync(path.join(tmpDir, 'shared'))).toBe(false);
+    // And no `builtin/` — pre-marketplace tree is retired.
+    expect(fs.existsSync(path.join(tmpDir, 'builtin'))).toBe(false);
   });
 
   it('ensureUserLayout is idempotent + builds both cloud and local subtrees', async () => {

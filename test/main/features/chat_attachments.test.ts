@@ -34,9 +34,9 @@ async function loadMod() {
   return import('../../../src/main/features/chat_attachments');
 }
 
-async function makePng(): Promise<Buffer> {
+async function makePng(color = 0xAACCEEFF): Promise<Buffer> {
   const { Jimp } = await import('jimp' as any);
-  const img: any = new Jimp({ width: 200, height: 200, color: 0xAACCEEFF });
+  const img: any = new Jimp({ width: 200, height: 200, color });
   return await img.getBuffer('image/png');
 }
 
@@ -141,6 +141,92 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(r1.info.name).toBe('dup.txt');
     expect(r2.info.name).not.toBe('dup.txt');
     expect(r2.info.name.endsWith('.txt')).toBe(true);
+  });
+
+  it('reuses an existing attachment when upload content hash matches', async () => {
+    const m = await loadMod();
+    const r1 = await m.uploadAttachment(UID, CID, 'first.txt', Buffer.from('same bytes'));
+    const r2 = await m.uploadAttachment(UID, CID, 'second.txt', Buffer.from('same bytes'));
+
+    expect(r1.ok && r2.ok).toBe(true);
+    if (!(r1.ok && r2.ok)) return;
+    expect(r2.info.name).toBe(r1.info.name);
+    expect(r2.reused).toBe(true);
+    expect(fs.readdirSync(attDir()).filter((n) => !n.startsWith('.'))).toEqual(['first.txt']);
+  });
+
+  it('reuses a single attachment when matching uploads arrive concurrently', async () => {
+    const m = await loadMod();
+    const results = await Promise.all([
+      m.uploadAttachment(UID, CID, 'parallel-a.txt', Buffer.from('same parallel bytes')),
+      m.uploadAttachment(UID, CID, 'parallel-b.txt', Buffer.from('same parallel bytes')),
+      m.uploadAttachment(UID, CID, 'parallel-c.txt', Buffer.from('same parallel bytes')),
+    ]);
+
+    expect(results.every((r) => r.ok)).toBe(true);
+    if (!results.every((r) => r.ok)) return;
+    expect(new Set(results.map((r) => r.info.name)).size).toBe(1);
+    expect(results.filter((r) => r.reused).length).toBe(2);
+    expect(fs.readdirSync(attDir()).filter((n) => !n.startsWith('.'))).toEqual(['parallel-a.txt']);
+  });
+
+  it('imports a workspace file by path into the attachment pool', async () => {
+    const m = await loadMod();
+    const source = path.join(tmpDir, 'workspace-note.md');
+    fs.writeFileSync(source, '# hello\n', 'utf8');
+
+    const r = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.info.name).toBe('workspace-note.md');
+    expect(r.info.kind).toBe('text');
+    expect(fs.readFileSync(path.join(attDir(), 'workspace-note.md'), 'utf8')).toBe('# hello\n');
+  });
+
+  it('reuses an existing attachment when imported file hash matches', async () => {
+    const m = await loadMod();
+    const r1 = await m.uploadAttachment(UID, CID, 'kept.md', Buffer.from('same body'));
+    const source = path.join(tmpDir, 'copy.md');
+    fs.writeFileSync(source, 'same body', 'utf8');
+
+    const r2 = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(r1.ok && r2.ok).toBe(true);
+    if (!(r1.ok && r2.ok)) return;
+    expect(r2.info.name).toBe('kept.md');
+    expect(r2.reused).toBe(true);
+    expect(fs.readdirSync(attDir()).filter((n) => !n.startsWith('.'))).toEqual(['kept.md']);
+  });
+
+  it('reuses a single attachment when matching imports arrive concurrently', async () => {
+    const m = await loadMod();
+    const sourceA = path.join(tmpDir, 'source-a.md');
+    const sourceB = path.join(tmpDir, 'source-b.md');
+    fs.writeFileSync(sourceA, 'same imported body', 'utf8');
+    fs.writeFileSync(sourceB, 'same imported body', 'utf8');
+
+    const results = await Promise.all([
+      m.importAttachmentFromPath(UID, CID, sourceA),
+      m.importAttachmentFromPath(UID, CID, sourceB),
+    ]);
+
+    expect(results.every((r) => r.ok)).toBe(true);
+    if (!results.every((r) => r.ok)) return;
+    expect(new Set(results.map((r) => r.info.name)).size).toBe(1);
+    expect(results.filter((r) => r.reused).length).toBe(1);
+    expect(fs.readdirSync(attDir()).filter((n) => !n.startsWith('.'))).toEqual(['source-a.md']);
+  });
+
+  it('validates text encoding when importing by path', async () => {
+    const m = await loadMod();
+    const source = path.join(tmpDir, 'bad.txt');
+    fs.writeFileSync(source, Buffer.from([0xFF, 0xFE]));
+
+    const r = await m.importAttachmentFromPath(UID, CID, source);
+
+    expect(r.ok).toBe(false);
+    expect(fs.existsSync(path.join(attDir(), 'bad.txt'))).toBe(false);
   });
 });
 
@@ -465,6 +551,106 @@ describe('chat_attachments › resolveLocalMediaPath', () => {
   });
 });
 
+describe('chat_attachments › resolveLocalPreviewPath', () => {
+  // Preview-doc sibling of resolveLocalMediaPath: accepts pdf / html / htm
+  // at arbitrary abs paths so the renderer can render LLM-produced docs
+  // inline. No size cap (Chromium streams through serveFileRange).
+  async function setup() {
+    const mod = await loadMod();
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-localpreview-'));
+    return { mod, sandbox };
+  }
+
+  it('accepts an existing pdf at an arbitrary abs path', async () => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'doc.pdf');
+    fs.writeFileSync(p, makeMinimalPdf(['hi']));
+    const r = mod.resolveLocalPreviewPath(p);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.kind).toBe('pdf');
+    expect(r.absPath).toBe(path.resolve(p));
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('accepts .html and reports kind="html"', async () => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'page.html');
+    fs.writeFileSync(p, '<!doctype html><h1>ok</h1>');
+    const r = mod.resolveLocalPreviewPath(p);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.kind).toBe('html');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('also accepts the .htm spelling', async () => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'old.htm');
+    fs.writeFileSync(p, '<html></html>');
+    const r = mod.resolveLocalPreviewPath(p);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.kind).toBe('html');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('rejects image / video extensions (those belong to resolveLocalMediaPath)', async () => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'photo.png');
+    fs.writeFileSync(p, await makePng());
+    const r = mod.resolveLocalPreviewPath(p);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe('bad_input');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('rejects relative paths', async () => {
+    const { mod } = await setup();
+    const r = mod.resolveLocalPreviewPath('./foo.pdf');
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe('bad_input');
+  });
+
+  it('returns not_found when the file is absent', async () => {
+    const { mod, sandbox } = await setup();
+    const r = mod.resolveLocalPreviewPath(path.join(sandbox, 'ghost.pdf'));
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.code).toBe('not_found');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('imposes no size cap (very-large pdfs accepted — Chromium streams)', async () => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'big.pdf');
+    // 60 MB — above any existing image / docx cap. The preview path has
+    // no cap by design; if a cap were silently reintroduced this would
+    // start failing.
+    fs.writeFileSync(p, Buffer.alloc(60 * 1024 * 1024));
+    const r = mod.resolveLocalPreviewPath(p);
+    expect(r.ok).toBe(true);
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+});
+
+describe('chat_attachments › mediaMimeFor (preview docs)', () => {
+  // Existing media MIME coverage already exists earlier in the file; this
+  // describe pins the preview-doc additions so a renamed handler doesn't
+  // silently downgrade pdf / html to octet-stream.
+  it('returns application/pdf for .pdf', async () => {
+    const m = await loadMod();
+    expect(m.mediaMimeFor('report.pdf')).toBe('application/pdf');
+  });
+  it('returns text/html for .html and .htm', async () => {
+    const m = await loadMod();
+    expect(m.mediaMimeFor('page.html')).toBe('text/html');
+    expect(m.mediaMimeFor('old.htm')).toBe('text/html');
+  });
+});
+
 describe('chat_attachments › buildAttachmentManifest', () => {
   it('emits text entry with total_chars (cheap stat, no body leak)', async () => {
     const m = await loadMod();
@@ -521,20 +707,26 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     expect(r.skipped[0].name).toBe('clip.mp4');
   });
 
-  it('packs images into images[] as real-time compressed JPEG; manifest excludes them', async () => {
+  it('packs images into images[] as real-time compressed JPEG AND lists them in the manifest with attached="inline"', async () => {
     const m = await loadMod();
     await m.uploadAttachment(UID, CID, 'chart.png', await makePng());
     const r = await m.buildAttachmentManifest(UID, CID, ['chart.png']);
-    expect(r.manifest).toBe('');
+    // Manifest entry — gives the LLM a text-side handle on the image
+    // (filename + abs path) so it can answer "what did I upload" by name.
+    expect(r.manifest).toMatch(/<attachments>/);
+    expect(r.manifest).toMatch(/name="chart\.png"/);
+    expect(r.manifest).toMatch(/kind="image"/);
+    expect(r.manifest).toMatch(/attached="inline"/);
+    // Bytes — fed to vision via ChatOptions.images on the same user turn.
     expect(r.images.length).toBe(1);
     expect(r.images[0].mediaType).toBe('image/jpeg');
     expect(r.images[0].data.length).toBeGreaterThan(100);
   });
 
-  it('caps images per message and reports the rest as skipped', async () => {
+  it('caps images per message: inlined ones appear in manifest, over-cap ones go to skipped[] only', async () => {
     const m = await loadMod();
     for (let i = 0; i < 7; i++) {
-      await m.uploadAttachment(UID, CID, `img${i}.png`, await makePng());
+      await m.uploadAttachment(UID, CID, `img${i}.png`, await makePng(0x11223300 + i));
     }
     const r = await m.buildAttachmentManifest(
       UID, CID,
@@ -542,6 +734,11 @@ describe('chat_attachments › buildAttachmentManifest', () => {
       { maxImages: 3 },
     );
     expect(r.images).toHaveLength(3);
+    // Exactly 3 image entries in the manifest — over-cap images are dropped
+    // from BOTH images[] and entries[], surfaced only via skipped[].
+    expect(r.manifest.match(/<file [^>]*kind="image"/g)?.length).toBe(3);
+    expect(r.manifest).toMatch(/name="img0\.png"/);
+    expect(r.manifest).not.toMatch(/name="img6\.png"/);
     expect(r.skipped.length).toBe(4);
     expect(r.skipped.every((s) => /image cap|图片上限/.test(s.reason))).toBe(true);
   });

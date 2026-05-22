@@ -1,19 +1,20 @@
 // Backend port of the renderer's `_splitMarkdownProseCode` +
 // `_findOuterTagRanges` (lives in `src/renderer/modules/strip-structural-blocks.js`).
-// Used to give the post-stream container extractors (`<skill>` here, and
-// long-term `<agent>` once that flow's WIP refactor settles) a prose/code
-// guard: an LLM mentioning `<skill>` inside a fenced ``` block or inline
-// backtick span (e.g., teaching the user the protocol) must NOT cause
-// the backend to falsely "extract" the example as a real container and
-// persist nonexistent files.
+// Used to give the post-stream container extractors (`<skill>` and `<agent>`)
+// a prose/code guard: an LLM mentioning a machine tag inside a non-XML
+// fenced block, inline backtick span, or inline quoted sentence (e.g.,
+// teaching the user the protocol) must NOT cause the backend to falsely
+// "extract" the example as a real container and persist nonexistent files.
+// Explicit ```xml fences remain structural output: the LLM sometimes wraps
+// real XML protocol blocks in Markdown, and those must still be parsed.
 //
 // Logic mirror is intentional — the renderer pins set A / set B fixtures
 // directly in `test/renderer/strip-structural-blocks.test.ts`; the
 // backend port is exercised indirectly through
-// `test/main/features/skills.test.ts` (B5/B6/B7 cover the prose/code
-// guard against `extractSkillContainers`). Both copies must stay in
-// sync; if you change one, change the other and extend BOTH fixture
-// sets.
+// `test/main/features/skills.test.ts` and `test/main/features/agents.test.ts`
+// (prose/code guards against `extractSkillContainers` /
+// `extractAgentFieldBlocks`). Both copies must stay in sync; if you change
+// one, change the other and extend BOTH fixture sets.
 //
 // Why duplicated rather than shared: renderer is vanilla JS without
 // imports (PC/CLAUDE.md §8); main is TS with strict layering (§3, no
@@ -24,13 +25,16 @@
 export interface ProseCodeSegment {
   kind: 'prose' | 'code';
   text: string;
+  xmlFence?: boolean;
 }
 
 /** Split a markdown buffer into alternating prose / code segments. "Code" =
  *  fenced ``` / ~~~ blocks (≤3-space indent, info-string allowed) plus
- *  inline backtick spans; everything else is prose. Mid-stream unclosed
- *  fences and unclosed inline backticks are treated as code through
- *  end-of-buffer, matching the renderer's behavior. */
+ *  inline backtick spans; everything else is prose. Fenced blocks with an
+ *  `xml` info string carry `xmlFence: true` so downstream structural
+ *  parsers can still process them. Mid-stream unclosed fences and unclosed
+ *  inline backticks are treated as code through end-of-buffer, matching the
+ *  renderer's behavior. */
 export function splitMarkdownProseCode(text: string): ProseCodeSegment[] {
   const segs: ProseCodeSegment[] = [];
   if (!text) return segs;
@@ -53,6 +57,8 @@ export function splitMarkdownProseCode(text: string): ProseCodeSegment[] {
         if (count >= 3) {
           let k = j + count;
           while (k < n && text[k] !== '\n') k++;
+          const info = text.slice(j + count, k).trim().toLowerCase();
+          const xmlFence = /^xml(?:\s|$)/.test(info);
           let scan = k < n ? k + 1 : n;
           let close = -1;
           while (scan < n) {
@@ -74,7 +80,7 @@ export function splitMarkdownProseCode(text: string): ProseCodeSegment[] {
           }
           flushProse(i);
           const endIdx = close >= 0 ? close : n;
-          segs.push({ kind: 'code', text: text.slice(i, endIdx) });
+          segs.push({ kind: 'code', text: text.slice(i, endIdx), xmlFence });
           proseStart = endIdx;
           i = endIdx;
           continue;
@@ -115,8 +121,50 @@ export function splitMarkdownProseCode(text: string): ProseCodeSegment[] {
   return segs;
 }
 
+function isInsideQuotedSpanOnLine(text: string, idx: number): boolean {
+  const lineStart = text.lastIndexOf('\n', Math.max(0, idx - 1)) + 1;
+  const nextNl = text.indexOf('\n', idx);
+  const lineEnd = nextNl < 0 ? text.length : nextNl;
+  const linePrefix = text.slice(lineStart, idx);
+  const closingAsciiDouble = text.indexOf('"', idx);
+  if (closingAsciiDouble >= 0 && closingAsciiDouble < lineEnd) {
+    let open = false;
+    for (let i = 0; i < linePrefix.length; i++) {
+      if (linePrefix[i] !== '"') continue;
+      if (i > 0 && linePrefix[i - 1] === '\\') continue;
+      open = !open;
+    }
+    if (open) return true;
+  }
+
+  const pairs: Array<[string, string]> = [['“', '”'], ['‘', '’'], ['「', '」'], ['『', '』'], ['《', '》']];
+  for (const [openQuote, closeQuote] of pairs) {
+    const lastOpen = text.lastIndexOf(openQuote, idx - 1);
+    if (lastOpen < lineStart) continue;
+    const lastClose = text.lastIndexOf(closeQuote, idx - 1);
+    const nextClose = text.indexOf(closeQuote, idx);
+    if (lastOpen > lastClose && nextClose >= 0 && nextClose < lineEnd) return true;
+  }
+  return false;
+}
+
+function isLineStartOpening(text: string, idx: number): boolean {
+  const lineStart = text.lastIndexOf('\n', Math.max(0, idx - 1)) + 1;
+  for (let i = lineStart; i < idx; i++) {
+    const ch = text[i];
+    if (ch === ' ' || ch === '\t' || ch === '"' || ch === '\'' || ch === '“' || ch === '‘' || ch === '「' || ch === '『' || ch === '《') continue;
+    return false;
+  }
+  return true;
+}
+
+function isInlineQuotedOpening(text: string, idx: number): boolean {
+  return isInsideQuotedSpanOnLine(text, idx) && !isLineStartOpening(text, idx);
+}
+
 /** Find every `<TAG>...</TAG>` (or unclosed `<TAG>...EOF`) range whose
- *  OPENING tag falls in an outer prose segment. The tagged container is
+ *  OPENING tag falls in an outer prose segment or an explicit XML fence.
+ *  The tagged container is
  *  treated as one atomic unit — once the opening tag is in prose, we walk
  *  to the matching `</TAG>` (or EOF) regardless of what's inside, so
  *  backticks / fences / quotes authored inside the body don't fragment
@@ -137,7 +185,7 @@ export function findOuterTagRanges(text: string, tagName: string): Array<[number
   for (const seg of segs) {
     const segStart = pos;
     pos += seg.text.length;
-    if (seg.kind !== 'prose') continue;
+    if (seg.kind !== 'prose' && !seg.xmlFence) continue;
     let from = segStart;
     while (from < pos) {
       const last = ranges.length ? ranges[ranges.length - 1] : null;
@@ -150,6 +198,10 @@ export function findOuterTagRanges(text: string, tagName: string): Array<[number
         || next === 9 /* \t */ || next === 10 /* \n */ || next === 13 /* \r */
         || next === 47 /* / */;
       if (!isBoundary) {
+        from = openIdx + openLeader.length;
+        continue;
+      }
+      if (!seg.xmlFence && isInlineQuotedOpening(text, openIdx)) {
         from = openIdx + openLeader.length;
         continue;
       }

@@ -14,16 +14,19 @@
  *   .sh              — spawn `bash`, inherit stdio, exit with child's code.
  *   .rb              — spawn `ruby`, inherit stdio, exit with child's code.
  *
- * Resolution order:
- *   1. <uid>/cloud/skills/<id>/scripts/<basename>.<ext>   (custom)
- *   2. data/builtin/skills/<id>/scripts/<basename>.<ext>  (builtin runtime)
- *   3. <PC>/src/builtin/skills/<id>/scripts/<basename>.<ext> (dev / asar.unpacked)
+ * Resolution order (matches SkillRegistry — see model/core-agent/skill-registry.ts):
+ *   1. <uid>/cloud/skills/<id>/scripts/<basename>.<ext>            (custom)
+ *   2. <uid>/local/marketplace/skills/<id>/scripts/<basename>.<ext> (installed)
+ *   3. <PC>/src/builtin/skills/<id>/scripts/<basename>.<ext>       (dev / asar.unpacked)
  *   For each candidate dir we try ts → mjs → js → py → sh → rb in order.
  *
  * Env inputs:
- *   ORKAS_PC_DIR   — points at PC root (or asar.unpacked equivalent).
- *   ORKAS_WS_ROOT  — optional override for data/ root.
- *   ELECTRON_RUN_AS_NODE — set to 1 when running through Electron binary.
+ *   ORKAS_PC_DIR          — points at PC root (or asar.unpacked equivalent).
+ *   ORKAS_WORKSPACE_ROOT  — canonical workspace-data root (set by main process
+ *                           in install-data-root.ts). ORKAS_WS_ROOT is honoured
+ *                           as a back-compat alias. When neither is set the
+ *                           platform default ~/.orkas/data is used.
+ *   ELECTRON_RUN_AS_NODE  — set to 1 when running through Electron binary.
  *
  * This file is CommonJS so it can be required directly without import-hook
  * gymnastics. .ts skill scripts use ESM-style default export.
@@ -59,22 +62,34 @@ function parseArgs(argv) {
 }
 
 function locateSkillScript(skillId, scriptBase) {
-  const wsRoot = process.env.ORKAS_WS_ROOT
-    || (process.env.ORKAS_PC_DIR ? path.join(process.env.ORKAS_PC_DIR, 'data') : null)
-    || path.join(require('os').homedir(), 'Library', 'Application Support', 'Orkas', 'data');
-  // Candidate skill dirs — match SkillRegistry's [<uid>/cloud/skills, data/builtin/skills]
-  // resolution, plus a dev/source-tree fallback for builtins.
+  const wsRoot = process.env.ORKAS_WORKSPACE_ROOT
+    || process.env.ORKAS_WS_ROOT
+    || path.join(require('os').homedir(), '.orkas', 'data');
+  // Candidate skill dirs — mirror SkillRegistry's
+  // [<uid>/cloud/skills, <uid>/local/marketplace/skills] resolution, with a
+  // dev/source-tree fallback for unpacked builtins.
+  //
+  // Per-user skills live under <ws>/<uid>/cloud/skills/<id> and
+  // <ws>/<uid>/local/marketplace/skills/<id>. uid can be numeric or a UUID,
+  // so we scan every subdirectory rather than regex-matching. Skip the deny-
+  // list approach (had to hand-maintain a list of `logs / config / ...`
+  // sibling names that would drift the moment a new top-level data dir gets
+  // added under PC/CLAUDE.md §4); instead, only KEEP an entry if it actually
+  // contains the skill under one of the two SkillRegistry-aware shapes. This
+  // is the strict invariant — a real uid dir always has one of those shapes
+  // when the skill is installed for that user; any sibling dir that doesn't
+  // is irrelevant by construction.
   const skillDirs = [];
-  // Custom skills live under data/<uid>/cloud/skills/<id>/. We don't know the
-  // active uid here, so scan every uid dir we can find. In practice there's
-  // one active user so this is a 1-element scan.
   try {
     for (const entry of fs.readdirSync(wsRoot, { withFileTypes: true })) {
-      if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
-      skillDirs.push(path.join(wsRoot, entry.name, 'cloud', 'skills', skillId));
+      if (!entry.isDirectory()) continue;
+      if (entry.name.startsWith('.')) continue;
+      const cloud = path.join(wsRoot, entry.name, 'cloud', 'skills', skillId);
+      const marketplace = path.join(wsRoot, entry.name, 'local', 'marketplace', 'skills', skillId);
+      if (fs.existsSync(cloud)) skillDirs.push(cloud);
+      if (fs.existsSync(marketplace)) skillDirs.push(marketplace);
     }
   } catch { /* no data dir yet */ }
-  skillDirs.push(path.join(wsRoot, 'builtin', 'skills', skillId));
   if (process.env.ORKAS_PC_DIR) {
     skillDirs.push(path.join(process.env.ORKAS_PC_DIR, 'src', 'builtin', 'skills', skillId));
   }
@@ -93,7 +108,7 @@ function locateSkillScript(skillId, scriptBase) {
   }
   die(66, `skill script not found: ${skillId}/${scriptBase}.{${SCRIPT_EXTS.join(',')}}`, {
     searched: candidates,
-    hint: 'check skill id and script name; ORKAS_PC_DIR / ORKAS_WS_ROOT env',
+    hint: 'check skill id and script name; ORKAS_PC_DIR / ORKAS_WORKSPACE_ROOT env',
   });
 }
 

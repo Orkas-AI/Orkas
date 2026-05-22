@@ -76,6 +76,17 @@ export interface PlanStep {
    * Reset to 0 on user-initiated retry / step success. */
   transient_attempts?: number;
 
+  /** For `assignee === 'user'` steps only: the random `form_id` the
+   * executor stamped at dispatch time. Used by
+   * `plan_executor.ts::acceptsUserStepCompletion` to verify that the
+   * user's `<agent-input-submission>` text references the form we
+   * actually dispatched — O(1) lookup instead of reconstructing the
+   * mapping by scanning the conversation jsonl. Cleared on retryStep
+   * so a re-armed step gets a fresh form_id on the next dispatch.
+   * Absent on legacy plans authored before this field existed; in that
+   * case the gate falls back to "accept any user reply". */
+  pending_form_id?: string;
+
   /** Legacy free-form notes (kept for tools that still use it). */
   notes?: string;
 }
@@ -88,6 +99,14 @@ export interface PlanFile {
    * `{{user_initial_message}}` template substitution. Set by `setPlan` when
    * the plan is first written and the bus has the trigger context. */
   initial_message?: string;
+  /** Attachment filenames (relative to `chat_attachments/<cid>/`) carried by
+   * the user turn that triggered planning. Every step dispatch inherits this
+   * list so worker agents see the same image/file bytes the commander saw —
+   * otherwise images bypass the worker turn and the agent honestly answers
+   * "I can't see the image". `dispatch_to` (non-plan) handles inheritance
+   * via per-turn flush in bus.ts; plan steps live across worker turn
+   * boundaries so the source must be persisted here. */
+  initial_attachments?: string[];
   /** True after bus has fired the "all steps terminal" notification, so we
    * don't fire it again on subsequent reconciles for the same plan. */
   completed_signaled?: boolean;
@@ -108,6 +127,9 @@ export async function readPlan(uid: string, cid: string): Promise<PlanFile | nul
       created_at: parsed.created_at || nowIso(),
       updated_at: parsed.updated_at || nowIso(),
       initial_message: parsed.initial_message,
+      ...(Array.isArray(parsed.initial_attachments) && parsed.initial_attachments.length
+        ? { initial_attachments: parsed.initial_attachments.map(String) }
+        : {}),
       completed_signaled: parsed.completed_signaled,
       steps: parsed.steps.map(normalizeStep),
     };
@@ -139,6 +161,8 @@ function normalizeStep(raw: any, i: number): PlanStep {
     ...(typeof raw?.failure_reason === 'string' ? { failure_reason: raw.failure_reason } : {}),
     ...(Number.isFinite(Number(raw?.transient_attempts)) && Number(raw.transient_attempts) > 0
       ? { transient_attempts: Number(raw.transient_attempts) } : {}),
+    ...(typeof raw?.pending_form_id === 'string' && raw.pending_form_id
+      ? { pending_form_id: String(raw.pending_form_id) } : {}),
     ...(typeof raw?.notes === 'string' && raw.notes.trim() ? { notes: String(raw.notes) } : {}),
   };
 }
@@ -160,6 +184,10 @@ export interface PlanSetInput {
   /** Optional: the user message that triggered planning. Captured for
    * `{{user_initial_message}}` substitution at dispatch time. */
   initial_message?: string;
+  /** Optional: attachment filenames carried by the triggering user turn.
+   * Persisted on the plan so every step dispatch can hand the same image/
+   * file bytes to the worker (see PlanFile.initial_attachments). */
+  initial_attachments?: string[];
 }
 
 async function writePlanRaw(uid: string, cid: string, plan: PlanFile): Promise<void> {
@@ -181,11 +209,17 @@ export async function setPlan(
   const existed = fs.existsSync(file);
   let created_at = nowIso();
   let prevInitial: string | undefined;
+  let prevAttachments: string[] | undefined;
   if (existed) {
     const cur = await readPlan(uid, cid);
     if (cur?.created_at) created_at = cur.created_at;
     prevInitial = cur?.initial_message;
+    prevAttachments = cur?.initial_attachments;
   }
+  const inAtts = Array.isArray(input.initial_attachments) && input.initial_attachments.length
+    ? input.initial_attachments.map(String)
+    : undefined;
+  const initialAttachments = inAtts ?? prevAttachments;
   const steps: PlanStep[] = input.steps.map((s, i) => ({
     index: i + 1,
     title: (s.title || '').trim() || `Step ${i + 1}`,
@@ -202,6 +236,7 @@ export async function setPlan(
     created_at,
     updated_at: nowIso(),
     initial_message: input.initial_message ?? prevInitial,
+    ...(initialAttachments && initialAttachments.length ? { initial_attachments: initialAttachments } : {}),
     completed_signaled: false,
     steps,
   };
@@ -212,7 +247,7 @@ export async function setPlan(
 
 export async function updateStep(
   uid: string, cid: string, stepIndex: number, status: StepStatus,
-  patch?: { notes?: string; output_summary?: string; output_files?: string[]; output_msg_id?: string; failure_reason?: string; transient_attempts?: number },
+  patch?: { notes?: string; output_summary?: string; output_files?: string[]; output_msg_id?: string; failure_reason?: string; transient_attempts?: number; pending_form_id?: string },
 ): Promise<PlanFile | null> {
   const cur = await readPlan(uid, cid);
   if (!cur) return null;
@@ -233,6 +268,10 @@ export async function updateStep(
   if (patch?.transient_attempts !== undefined) {
     if (patch.transient_attempts > 0) cur.steps[idx].transient_attempts = patch.transient_attempts;
     else delete cur.steps[idx].transient_attempts;
+  }
+  if (patch?.pending_form_id !== undefined) {
+    if (patch.pending_form_id) cur.steps[idx].pending_form_id = patch.pending_form_id;
+    else delete cur.steps[idx].pending_form_id;
   }
   await writePlanRaw(uid, cid, cur);
   log.info(`plan-update user=${uid} cid=${cid} step=${stepIndex} status=${status}`);

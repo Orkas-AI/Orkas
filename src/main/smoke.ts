@@ -31,9 +31,10 @@ async function section(name: string, fn: () => void | Promise<void>): Promise<vo
   await section('WS_ROOT derivable', () => assert.ok(paths.WS_ROOT.length > 0));
   await section('USERS_FILE at data root', () =>
     assert.strictEqual(paths.USERS_FILE, path.join(paths.WS_ROOT, 'users.json')));
-  await section('BUILTIN_SKILLS_DIR at top level', () =>
-    assert.strictEqual(paths.BUILTIN_SKILLS_DIR, path.join(paths.WS_ROOT, 'builtin', 'skills')));
-  await section('BUILTIN_SKILLS_SOURCE points somewhere', () => assert.ok(paths.BUILTIN_SKILLS_SOURCE.length > 0));
+  await section('userMarketplaceSkillsDir under local', () =>
+    assert.ok(paths.userMarketplaceSkillsDir('12345678').endsWith('/12345678/local/marketplace/skills')));
+  await section('userMarketplaceAgentsDir under local', () =>
+    assert.ok(paths.userMarketplaceAgentsDir('12345678').endsWith('/12345678/local/marketplace/agents')));
   await section('userChatsDir in cloud', () =>
     assert.ok(paths.userChatsDir('12345678').endsWith('/12345678/cloud/chats')));
   await section('userAuthProfilesFile in local', () =>
@@ -78,6 +79,7 @@ async function section(name: string, fn: () => void | Promise<void>): Promise<vo
       builtin_skills_dir: '/b/s', custom_skills_dir: '/c/s',
       agents_index: '- foo', plan_state: '',
       os: 'macOS', working_dir: '/tmp', local_exec_state: 'x',
+      project_files_block: '',
     });
     assert.ok(typeof rendered === 'string' && rendered.length > 0);
   });
