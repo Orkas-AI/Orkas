@@ -56,6 +56,7 @@ import * as fs from 'node:fs';
 import { shell } from 'electron';
 
 import { userAuthProfilesFile, userLocalConfigDir } from '../paths';
+import * as cryptoVault from '../util/crypto-vault';
 import { getActiveUserId } from './users';
 import {
   FEATURED_API_PROVIDERS,
@@ -235,7 +236,16 @@ function ensureAuthDir(): void {
 function loadProfiles(): ProfilesFile {
   try {
     const raw = fs.readFileSync(profilesFile(), 'utf-8');
-    const data = JSON.parse(raw) as Partial<ProfilesFile>;
+    // Decrypt when the file carries the vault magic header; otherwise treat as legacy plaintext.
+    // The next saveProfiles() rewrites encrypted regardless, so plaintext is a one-shot
+    // migration path — no need for a dedicated migration entry point.
+    let json: string;
+    try {
+      json = cryptoVault.isEncryptedPayload(raw) ? cryptoVault.decrypt(getActiveUserId(), raw) : raw;
+    } catch {
+      json = raw;
+    }
+    const data = JSON.parse(json) as Partial<ProfilesFile>;
     if (data && typeof data === 'object' && data.profiles && typeof data.profiles === 'object') {
       const profiles: Record<string, StoredProfile> = {};
       for (const [id, p] of Object.entries(data.profiles)) {
@@ -339,7 +349,13 @@ export function saveImageProfiles(list: ImageProfile[]): void {
 
 function saveProfiles(store: ProfilesFile): void {
   ensureAuthDir();
-  fs.writeFileSync(profilesFile(), JSON.stringify(store, null, 2), 'utf-8');
+  const json = JSON.stringify(store, null, 2);
+  const uid = getActiveUserId();
+  // Encrypted at rest with the local-only crypto-vault — same blob format as connectors.json.
+  // Obfuscation-grade (key derivable from uid alone, see util/crypto-vault.ts header); covers
+  // the realistic threat surface (sync corner cases / logging / casual inspection).
+  const out = uid ? cryptoVault.encrypt(uid, json) : json;
+  fs.writeFileSync(profilesFile(), out, { encoding: 'utf-8', mode: 0o600 });
 }
 
 function makeProfileId(provider: string, label: string): string {

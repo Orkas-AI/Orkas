@@ -573,7 +573,72 @@ function _renderAgentDetail(agent, editing) {
   }
   _renderAgentEnabledButton({ id: agent.agent_id, enabled: agent.enabled !== false });
 
+  _renderAgentConnectorsSection(agent, editing);
+
   _toggleAgentFieldEditable(editing);
+}
+
+async function _renderAgentConnectorsSection(agent, editing) {
+  const section = document.getElementById('agents-detail-connectors-section');
+  const slot = document.getElementById('agents-detail-connectors');
+  if (!section || !slot) return;
+  // Hidden for CLI runtime agents (they don't go through the in-process AgentRunner that
+  // injects connector tools).
+  const isCliRuntime = !!(agent.runtime && agent.runtime.kind === 'cli');
+  if (isCliRuntime) { section.style.display = 'none'; return; }
+  section.style.display = '';
+
+  let list = [];
+  try {
+    const res = await window.orkas.invoke('connectors.list', {});
+    if (res && res.ok && Array.isArray(res.instances)) list = res.instances;
+  } catch (_err) { /* leave list empty */ }
+
+  const enabled = new Set(Array.isArray(agent.enabled_connectors) ? agent.enabled_connectors : []);
+  const canEdit = agent.source === 'custom' || (agent.source === 'builtin' && typeof isDevMode === 'function' && false);
+
+  if (!list.length) {
+    slot.innerHTML = `<div class="muted">${escapeHtml(t('agents.connectors_empty') || 'No connectors installed. Add one in the Connectors tab.')}</div>`;
+    return;
+  }
+
+  slot.innerHTML = '';
+  for (const inst of list) {
+    const row = document.createElement('label');
+    row.className = 'agent-connector-row';
+    const checked = enabled.has(inst.id);
+    const status = (inst.status && inst.status.kind) || 'disconnected';
+    row.innerHTML = `
+      <input type="checkbox" class="agent-connector-toggle" ${checked ? 'checked' : ''} ${(canEdit && !editing) ? '' : 'disabled'} />
+      <span class="connector-dot connector-dot-${status}"></span>
+      <span class="agent-connector-name"></span>
+      <span class="agent-connector-id muted"></span>
+    `;
+    row.querySelector('.agent-connector-name').textContent = inst.display_name || inst.id;
+    row.querySelector('.agent-connector-id').textContent = inst.id;
+    const cb = row.querySelector('.agent-connector-toggle');
+    cb.addEventListener('change', async () => {
+      if (cb.checked) enabled.add(inst.id);
+      else enabled.delete(inst.id);
+      try {
+        const res = await window.orkas.invoke('agents.update', {
+          agent_id: agent.agent_id,
+          updates: { enabled_connectors: Array.from(enabled) },
+        });
+        if (!res || !res.ok) {
+          cb.checked = !cb.checked;
+          if (cb.checked) enabled.add(inst.id); else enabled.delete(inst.id);
+          uiAlert((res && res.error) || t('agents.update_failed') || 'Update failed');
+        } else if (res.agent) {
+          agent.enabled_connectors = res.agent.enabled_connectors;
+        }
+      } catch (err) {
+        cb.checked = !cb.checked;
+        uiAlert((err && err.message) || 'Update failed');
+      }
+    });
+    slot.appendChild(row);
+  }
 }
 
 /** Render the runtime control in the detail body.

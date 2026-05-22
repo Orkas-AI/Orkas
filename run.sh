@@ -3,9 +3,9 @@
 # 行为：每次运行都先 kill 旧实例，再启动新进程（前台）。
 #
 # 用法（对齐 Server `env/start/{dev_,}api_start.sh` 的 profile 模式，详见 Server CLAUDE.md §7）：
-#   ./run.sh                # profile=global (默认，海外 orkas.ai)
-#   ./run.sh cn             # profile=cn      (国内 orkas.work)
-#   ORKAS_PROFILE=cn ./run.sh    # env 风格仍兼容
+#   ./run.sh                # profile=cn      (默认，国内 orkas.work)
+#   ./run.sh global         # profile=global  (海外 orkas.ai)
+#   ORKAS_PROFILE=global ./run.sh    # env 风格仍兼容
 # Profile 通过 ORKAS_PROFILE env 传给主进程，由 features/marketplace.ts::apiBase() 等读取，
 # 选择对应区域的 Orkas server。本地 dev 想覆盖到自己 server 的话，仍可单独设
 # ORKAS_API_BASE_URL=http://127.0.0.1:8888/api ./run.sh。
@@ -18,8 +18,8 @@ if [ ! -f "$APP_DIR/package.json" ]; then
   exit 1
 fi
 
-# 优先级：位置参数 $1 > 环境变量 ORKAS_PROFILE > 默认 global
-export ORKAS_PROFILE="${1:-${ORKAS_PROFILE:-global}}"
+# 优先级：位置参数 $1 > 环境变量 ORKAS_PROFILE > 默认 cn（dev 本地默认国内环境）
+export ORKAS_PROFILE="${1:-${ORKAS_PROFILE:-cn}}"
 echo "[Orkas] 启动 profile=$ORKAS_PROFILE"
 
 node "$APP_DIR/scripts/ensure-deps.cjs"

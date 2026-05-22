@@ -19,9 +19,9 @@ import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 
 import {
-  userChatsDir, userSessionFile, WS_ROOT,
+  userChatsDir, userSessionsDir, WS_ROOT,
 } from '../paths';
-import { evictSession } from '../model/core-agent/session-store';
+import { evictSession, deleteSessionFileForUser } from '../model/core-agent/session-store';
 import {
   nowIso, genConversationId, safeId,
   readJson, writeJson, invalidateLineCount, readJsonl,
@@ -32,7 +32,7 @@ import { t } from '../i18n';
 const log = createLogger('chats');
 import * as search from './search';
 import * as groupChat from './group_chat';
-import { buildGconvSessionId, buildGmemberSessionId, readMembers, readState, setStatus } from './group_chat/state';
+import { buildGconvSessionId, readState, setStatus } from './group_chat/state';
 import type { GroupMessage } from './group_chat/visibility';
 
 const CONVERSATION_INDEX_NAME = '_index.json';
@@ -182,12 +182,21 @@ export interface CreateConversationOptions {
    *  validating the projectId exists for this user — chats.ts persists it
    *  verbatim. */
   projectId?: string;
+  /** Optional explicit conversation id. Used when an external source already
+   *  Server assigned to a relayed command so iOS and PC agree on it). Must be
+   *  a `safeId`; if it collides with an existing conv, that conv is returned
+   *  unchanged. Defaults to a fresh generated id. */
+  conversationId?: string;
 }
 
 export async function createConversation(userId: string, {
-  kind = 'normal', agentId = '', skillId = '', title = '', projectId = '',
+  kind = 'normal', agentId = '', skillId = '', title = '', projectId = '', conversationId = '',
 }: CreateConversationOptions = {}): Promise<Conversation> {
-  const cid = genConversationId();
+  if (conversationId && safeId(conversationId)) {
+    const existing = await getConversation(userId, conversationId);
+    if (existing) return existing;
+  }
+  const cid = (conversationId && safeId(conversationId)) ? conversationId : genConversationId();
   const conv: Conversation = {
     conversation_id: cid,
     title: title || t('chat.default_title'),
@@ -219,17 +228,12 @@ export async function updateConversation(
   return items[i];
 }
 
-/** Drop a session jsonl + its in-memory cache entry. */
-async function purgeSession(userId: string, sessionId: string): Promise<void> {
+/** Drop a session jsonl + its in-memory cache entry. Routes through
+ *  resolveSessionPath so kind (cloud vs local) is respected. */
+function purgeSession(userId: string, sessionId: string): void {
   if (!sessionId) return;
   try { evictSession(sessionId); } catch { /* not in cache */ }
-  const f = userSessionFile(userId, sessionId);
-  try { await fsp.unlink(f); }
-  catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      log.warn(`session unlink user=${userId} session=${sessionId}: ${(err as Error).message}`);
-    }
-  }
+  deleteSessionFileForUser(userId, sessionId);
 }
 
 export async function deleteConversation(userId: string, cid: string): Promise<boolean> {
@@ -250,14 +254,25 @@ export async function deleteConversation(userId: string, cid: string): Promise<b
   search.dropChatConversation(userId, cid);
 
   // Purge commander session + every per-agent member session.
-  await purgeSession(userId, removed?.session_id || buildGconvSessionId(userId, cid));
+  purgeSession(userId, removed?.session_id || buildGconvSessionId(userId, cid));
+  // gmember sessions: glob the sessions dir for `<uid>-gmember-<cid>-*` —
+  // we can't rely on readMembers() because `groupChat.dropConv` above has
+  // already removed members.json (the historical cause of the 50+ orphan
+  // gmember files we found on the dev box: readMembers returns {actors:[]}
+  // → the for-loop never ran → every per-agent worker session leaked).
+  // Scanning the actual filesystem is the truth source.
+  const gmemberPrefix = `${userId}-gmember-${cid}-`;
   try {
-    const m = await readMembers(userId, cid);
-    for (const a of m.actors) {
-      if (a.kind !== 'agent') continue;
-      await purgeSession(userId, buildGmemberSessionId(userId, cid, a.id));
+    const names = await fsp.readdir(userSessionsDir(userId));
+    for (const n of names) {
+      if (!n.startsWith(gmemberPrefix) || !n.endsWith('.jsonl')) continue;
+      purgeSession(userId, n.slice(0, -'.jsonl'.length));
     }
-  } catch { /* members may already be gone */ }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn(`gmember sweep user=${userId} cid=${cid}: ${(err as Error).message}`);
+    }
+  }
 
   // Purge attachments + their extract caches.
   try {

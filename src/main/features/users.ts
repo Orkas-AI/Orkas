@@ -120,6 +120,18 @@ export function activateUser(uid: string): void {
   catch (err) { log.warn(`sweepToolResults uid=${uid}: ${(err as Error).message}`); }
 
   // Strip legacy session_id brand prefixes once.
+  // Sessions GC: clean cid-orphan / legacy-kind / leaked-ephemeral in
+  // cloud/sessions/, and mtime>7d in local/sessions/. Fire-and-forget — the
+  // file scan is bounded by the size of sessions/ and shouldn't gate startup.
+  // See features/sessions_sweep.ts for what it does and doesn't touch.
+  (async () => {
+    try {
+      const mod = await import('./sessions_sweep');
+      await mod.sweepSessions(uid);
+    } catch (err) { log.warn(`sweepSessions uid=${uid}: ${(err as Error).message}`); }
+  })();
+
+  // Strip legacy session_id prefixes (aiteam- / orkas-) once.
   // Idempotent: after the stamp lands, subsequent startups are no-ops.
   // See util/migrate-session-ids.ts for details.
   try { migrateLegacySessionIds(uid); }

@@ -29,6 +29,7 @@
         <button class="sidebar-btn primary" id="new-chat-btn" data-i18n="sidebar.new_chat">Commander</button>
         <button class="sidebar-btn" id="agents-btn" data-i18n="sidebar.agents">Agents</button>
         <button class="sidebar-btn" id="skills-btn" data-i18n="sidebar.skills">Skills</button>
+        <button class="sidebar-btn" id="connectors-btn" data-i18n="sidebar.connectors">Connectors</button>
         <button class="sidebar-btn" id="contexts-btn" data-i18n="sidebar.contexts">Knowledge</button>
         <button class="sidebar-btn" id="apps-btn" data-i18n="sidebar.apps">My Apps</button>
       </div>
@@ -320,6 +321,10 @@
                   <div class="agents-detail-label" data-i18n="agents.label_workflow">Workflow</div>
                   <div class="agents-detail-workflow markdown-body" id="agents-detail-workflow" contenteditable="false"></div>
                 </div>
+                <div class="agents-detail-section" id="agents-detail-connectors-section">
+                  <div class="agents-detail-label" data-i18n="agents.label_connectors">Connectors</div>
+                  <div class="agents-detail-connectors" id="agents-detail-connectors"></div>
+                </div>
               </div>
             </div>
           </div>
@@ -418,6 +423,26 @@
               </div>
               <div class="project-bindings-list" id="project-skills-list"></div>
             </section>
+          </div>
+        </div>
+      </section>
+
+      <!-- Connectors (MCP-based, curated catalog) -->
+      <section class="panel" id="panel-connectors">
+        <div class="connectors-grid-view" id="connectors-grid-view">
+          <div class="connectors-grid-header">
+            <div class="connectors-grid-title" data-i18n="connectors.title">Connectors</div>
+          </div>
+          <div class="connectors-grid-scroll">
+            <div class="connectors-group" id="connectors-group-connected" style="display:none">
+              <div class="connectors-group-label" data-i18n="connectors.group.connected">Connected</div>
+              <div class="connectors-grid" id="connectors-grid-connected"></div>
+            </div>
+            <div class="connectors-group" id="connectors-group-available" style="display:none">
+              <div class="connectors-group-label" data-i18n="connectors.group.available">Available</div>
+              <div class="connectors-grid" id="connectors-grid-available"></div>
+            </div>
+            <div class="connectors-empty empty" id="connectors-empty" style="display:none" data-i18n="connectors.empty">No connectors available.</div>
           </div>
         </div>
       </section>
@@ -606,14 +631,7 @@
                   <div class="settings-group-title" data-i18n="settings.language.title">语言 / Language</div>
                 </div>
                 <div class="settings-row" id="settings-language-row">
-                  <label class="settings-lang-opt">
-                    <input type="radio" name="settings-language" value="zh" />
-                    <span data-i18n="settings.language.zh">简体中文</span>
-                  </label>
-                  <label class="settings-lang-opt">
-                    <input type="radio" name="settings-language" value="en" />
-                    <span data-i18n="settings.language.en">English</span>
-                  </label>
+                  <div class="ai-select" id="settings-language-select"></div>
                 </div>
               </div>
 
@@ -999,6 +1017,7 @@
   <script src="./modules/plan-rail.js"></script>
   <script src="./modules/queue-draft.js"></script>
   <script src="./modules/skills.js"></script>
+  <script src="./modules/connectors.js"></script>
   <script src="./modules/contexts.js"></script>
   <script src="./modules/kb-picker.js"></script>
   <script src="./modules/search.js"></script>

@@ -113,6 +113,8 @@ The "Runtime injection" section at the end lists your `inputs_schema`. If it is 
 
 **Tools** are auto-registered via the tool-use protocol — call them by name (`read_file` / `bash` / `kb_search` / `web_search` / `markdown_to_pdf`, etc.). **Skills** are listed in the system prompt's `## Available skills (skills)` section; locate the detailed usage based on `Source` (`cat` the corresponding `SKILL.md`) — don't try both roots.
 
+**Connectors**: when the system prompt has a `## Connectors` block, invoke listed services via `list_connector_tools({connector_id})` (to see an action's JSON schema) then `call_connector_tool({connector_id, tool_name, args})`. List before calling — don't guess. If the needed service isn't listed, tell the dispatcher; don't fake it with `web_search` / `bash`.
+
 > Generic tool rules (PDF / search / file output / `chat-media://local`) are in the "Shared rules" section below.
 
 ---

@@ -143,6 +143,7 @@ function setView(view, cid, opts = {}) {
   const panelId = view === 'new-chat' ? 'panel-new-chat'
                 : view === 'agents' ? 'panel-agents'
                 : view === 'skills' ? 'panel-skills'
+                : view === 'connectors' ? 'panel-connectors'
                 : view === 'contexts' ? 'panel-contexts'
                 : view === 'apps' ? 'panel-apps'
                 : view === 'settings' ? 'panel-settings'
@@ -154,6 +155,7 @@ function setView(view, cid, opts = {}) {
   document.getElementById('new-chat-btn').classList.toggle('active', view === 'new-chat');
   document.getElementById('agents-btn').classList.toggle('active', view === 'agents');
   document.getElementById('skills-btn').classList.toggle('active', view === 'skills');
+  document.getElementById('connectors-btn')?.classList.toggle('active', view === 'connectors');
   document.getElementById('contexts-btn')?.classList.toggle('active', view === 'contexts');
   document.getElementById('apps-btn')?.classList.toggle('active', view === 'apps');
   document.getElementById('settings-btn')?.classList.toggle('active', view === 'settings');
@@ -232,6 +234,10 @@ function setView(view, cid, opts = {}) {
     currentCid = null;
     // Same reasoning as the agents branch above.
     loadSkills(true);
+  } else if (view === 'connectors') {
+    currentCid = null;
+    // Status flips during a session (server health, token expiry); always re-fetch on entry.
+    if (typeof loadConnectors === 'function') loadConnectors();
   } else if (view === 'contexts') {
     currentCid = null;
     loadContexts();

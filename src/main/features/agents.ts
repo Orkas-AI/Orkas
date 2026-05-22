@@ -132,6 +132,12 @@ export interface Agent {
    *  `general`). Empty string when uncategorized; required only when publishing to the
    *  marketplace. Maintained via the create / edit dialog dropdown, NOT by the agent-edit LLM. */
   category: string;
+  /** Connector instance ids this agent is allowed to call. Three-state intentionally **diverges**
+   *  from `skill_list`: `undefined` and `[]` both mean "no connectors" (collapsed to empty), only
+   *  `string[]` non-empty grants access. Why stricter than skill_list's "undefined = no filter":
+   *  connectors carry external side effects (sending emails, editing remote docs); a brand-new
+   *  agent must opt in explicitly. Maintained by the agent edit UI, NOT by the agent-edit LLM. */
+  enabled_connectors?: string[];
   source: AgentSource;
   created_at: string;
   updated_at: string;
@@ -168,6 +174,7 @@ interface AgentRaw {
   interactive?: unknown;
   runtime?: unknown;
   category?: unknown;
+  enabled_connectors?: unknown;
 }
 
 /** Per-agent execution backend. See `Agent.runtime`. */
@@ -474,6 +481,13 @@ export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSo
   }
   if (avatars.isKnownIcon(raw.icon)) agent.icon = raw.icon;
   if (avatars.isKnownColor(raw.color)) agent.color = raw.color;
+  // enabled_connectors: only `string[]` carries through; missing / null / non-array all collapse
+  // to "no connectors" (the field stays absent on the Agent object, which the runner treats as
+  // empty). Filtering to safeId-ish strings keeps a malformed JSON from injecting weird ids.
+  if (Array.isArray(raw.enabled_connectors)) {
+    const filtered = raw.enabled_connectors.filter((v): v is string => typeof v === 'string' && v.length > 0);
+    if (filtered.length) agent.enabled_connectors = filtered;
+  }
   // interactive — tolerant boolean coerce (LLMs sometimes emit "true"/"false"
   // strings). Missing/malformed → undefined; downstream readers treat
   // undefined the same as false.
@@ -531,6 +545,15 @@ interface AgentListCache { stamp: string; data: Agent[] }
 let _agentListCache: AgentListCache | null = null;
 
 function _invalidateAgentListCache(): void { _agentListCache = null; }
+
+/** Public re-export of `_invalidateAgentListCache` for cross-module callers (sync engine).
+ *  **Why exposed**: `listAgents` caches the disk spec list keyed on the two source dirs'
+ *  `mtimeMs`. Local create/update/delete go through this module and call `_invalidateAgentListCache`
+ *  inline. But the sync engine writes (and `unlink`s) files directly under `<uid>/cloud/agents/<aid>/`,
+ *  which updates the AGENT dir's mtime but NOT the parent (`CUSTOM_AGENTS_DIR`). The parent's
+ *  mtime stays unchanged, the cache stamp stays valid, and `listAgents` returns ghosts of the
+ *  agents sync just deleted. The sync bridge calls this so the next `listAgents` re-scans. */
+export const invalidateAgentListCache = _invalidateAgentListCache;
 
 /** Toggle the active user's enabled override for an agent. Wrapping the
  *  raw setter so the IPC handler stays one-line and the per-uid resolution
@@ -781,6 +804,12 @@ export interface UpdateAgentFields {
    *  Authored by the create / edit dialog dropdown OR by the agent-edit LLM via the
    *  `<category>` sub-tag (validated against `AGENT_CATEGORY_CODES` in `_parseAgentBlock`). */
   category?: string;
+  /** Three-way update:
+   *   array (possibly empty) → replace (filtered to non-empty strings)
+   *   null  → drop the field
+   *   omitted → untouched
+   *  Authored by the agent edit UI (connectors toggle list), NOT the agent-edit LLM. */
+  enabled_connectors?: string[] | null;
 }
 
 /**
@@ -891,6 +920,15 @@ export async function updateCustomAgent(
       // Re-validate on every write so even a trusted caller can't slip a
       // half-formed schema past us.
       data.inputs = validateAgentInputs(v);
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'enabled_connectors')) {
+    const v = (updates as { enabled_connectors?: string[] | null }).enabled_connectors;
+    if (v === null) {
+      delete (data as { enabled_connectors?: unknown }).enabled_connectors;
+    } else if (Array.isArray(v)) {
+      const ids = v.filter((s): s is string => typeof s === 'string' && s.length > 0);
+      (data as { enabled_connectors?: string[] }).enabled_connectors = ids;
     }
   }
   if (Object.prototype.hasOwnProperty.call(updates || {}, 'icon')) {

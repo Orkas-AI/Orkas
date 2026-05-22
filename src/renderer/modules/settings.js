@@ -232,20 +232,29 @@ function _settingsRenderDataRoot() {
   }
 }
 
-// ── Language radio (zh / en) ──
-// Bound once; `loadSettings` just re-syncs the checked state each time the
-// panel is opened so the radio reflects whatever setLang() last persisted.
+// ── Language dropdown (zh / en) ──
+// Bound once on first panel open; `loadSettings` then calls _settingsSyncLanguageRadio()
+// to re-sync the dropdown's current value with whatever setLang() last persisted.
+// Option labels are each language's autonym (本族语自称), intentionally NOT routed
+// through t() — a Chinese user picking "English" should see "English", not the
+// translation of "English" in the current UI language.
 
-let _settingsLanguageBound = false;
+let _settingsLanguageSel = null;   // _aiSelectMount api
+
+const _SETTINGS_LANG_OPTIONS = [
+  { value: 'zh', label: '简体中文' },
+  { value: 'en', label: 'English' },
+];
 
 function _settingsBindLanguageOnce() {
-  if (_settingsLanguageBound) return;
-  const row = document.getElementById('settings-language-row');
-  if (!row) return;
-  row.addEventListener('change', async (e) => {
-    const target = e.target;
-    if (!target || target.name !== 'settings-language') return;
-    const next = target.value;
+  if (_settingsLanguageSel) return;
+  const el = document.getElementById('settings-language-select');
+  if (!el) return;
+  _settingsLanguageSel = _aiSelectMount(el, {
+    options: _SETTINGS_LANG_OPTIONS,
+    value: (typeof getLang === 'function') ? getLang() : 'en',
+  });
+  _settingsLanguageSel.onChange(async (next) => {
     if (next !== 'zh' && next !== 'en') return;
     try {
       await setLang(next);
@@ -254,14 +263,12 @@ function _settingsBindLanguageOnce() {
       _settingsLog.warn('setLang failed', { error: (err && err.message) || String(err) });
     }
   });
-  _settingsLanguageBound = true;
 }
 
 function _settingsSyncLanguageRadio() {
-  const cur = typeof getLang === 'function' ? getLang() : 'en';
-  document.querySelectorAll('input[name="settings-language"]').forEach((el) => {
-    el.checked = (el.value === cur);
-  });
+  // Function name kept for caller-side compatibility; semantics is now "sync dropdown value".
+  const cur = (typeof getLang === 'function') ? getLang() : 'en';
+  if (_settingsLanguageSel) _settingsLanguageSel.setValue(cur);
 }
 
 // ── Clear all conversations ──

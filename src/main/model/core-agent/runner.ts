@@ -47,6 +47,7 @@ import { EXTERNAL_API_PROVIDERS } from '../provider_catalog';
 import { readDisabledSets } from '../../features/component_enabled';
 import { nativeSearchToolForApi, nativeSearchToolName } from './native-search-tools';
 import { hasAnySearchProfile } from '../../features/search_auth';
+import { createConnectorMetaTools, getConnectorPromptBlock } from './connector-meta-tools';
 import { createLogger } from '../../logger';
 import type { MemoryToolHandler } from '../../../core-agent/src/tools/memory-tool';
 import type { MetacognitionToolHandler } from '../../../core-agent/src/tools/metacognition-tool';
@@ -287,6 +288,39 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // off the ESM core-agent dynamic import.
   const searchOverrideTools: AgentTool[] = [await createWebSearchOverrideTool()];
 
+  // Connector meta-tools + system-prompt block (MCP-based, umbrella pattern). When ≥1
+  // connector is visible to this actor we inject the two meta-tools (`list_connector_tools` /
+  // `call_connector_tool`) plus a `## Connectors` block enumerating the connectors directly in
+  // the system prompt — the model sees the catalog without a discovery round-trip, and the
+  // block sits in the cached prefix. When 0 visible: zero tools, no block. Per-connector MCP
+  // actions are NEVER injected into `tools[]` — the model discovers and invokes them through
+  // the meta-tools (umbrella pattern); flat-injecting would balloon `tools[]` past the 20–50
+  // selection-accuracy cliff and invalidate the prompt-cache prefix on every connect/disconnect.
+  //
+  // Session-kind gate (tri-state):
+  //   - `gconv` (commander)  + `gmember` (agent worker)  → block + tools (full exposure)
+  //   - `agent` (agent-edit)                              → block only (LLM authoring the
+  //                                                         workflow needs to know what
+  //                                                         connectors exist so it can write
+  //                                                         "use the notion connector" etc.,
+  //                                                         but must NOT actually invoke them
+  //                                                         from an authoring session)
+  //   - everything else (skill-edit / KB-image / CLI dispatch / reflect / memory-extract /
+  //     anon)                                            → none (no accidental external side
+  //                                                         effects from non-task sessions)
+  // For agent-edit specifically, the block intentionally bypasses `agent.enabled_connectors`
+  // (passes undefined agentId) — the editor LLM should see EVERYTHING the user installed so it
+  // can recommend referencing a connector even if the agent's whitelist hasn't been opened to
+  // it yet (the user toggles `enabled_connectors` separately in the agent-edit UI).
+  const exposure = uid ? connectorExposureFromSessionId(params.sessionId) : 'none';
+  const blockAgentId = exposure === 'block-only' ? undefined : (agentId || undefined);
+  const connectorBlock = exposure !== 'none' && uid
+    ? await getConnectorPromptBlock(uid, blockAgentId)
+    : '';
+  const connectorMetaTools = exposure === 'tools+block' && uid
+    ? await createConnectorMetaTools({ userId: uid, ...(agentId ? { agentId } : {}) })
+    : [];
+
   // Merge injected tools with extra tools from caller
   const allTools = [
     ...injectedTools,
@@ -296,6 +330,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...imageGenTools,
     ...searchOverrideTools,
     ...(params.extraTools || []),
+    ...connectorMetaTools,
   ];
 
   // Cap each tool's result size + persist oversized outputs. Single wrap point
@@ -358,6 +393,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const parts: string[] = [];
   if (params.systemPrompt) parts.push(params.systemPrompt.trim());
   if (skillsBlock) parts.push(skillsBlock.trim());
+  if (connectorBlock) parts.push(connectorBlock.trim());
   const resolvedSystemPrompt = parts.join('\n\n');
 
   // Evolution (the self-evolving skill store) is per-agent: when an
@@ -447,10 +483,43 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   };
 }
 
-/** Extract userId from session_id format: `<uid>-<kind>-...` */
-function extractUidFromSessionId(sessionId: string): string | null {
-  const m = sessionId.match(/^([^-]+)-/);
-  return m ? m[1] : null;
+/** Recognised session-kind keywords per CLAUDE.md §5. Order matters — longer alternatives must
+ *  come first so that e.g. `extract-img` matches as one kind, not as `extract` then leftover. */
+const _SESSION_KIND_RE = /-(gmember|gconv|memory-extract|extract-img|reflect|skill|agent|anon|cli)(?:-|$)/;
+
+/** Extract userId from session_id (`<uid>-<kind>-...` per CLAUDE.md §5). The uid may itself
+ *  contain dashes (UUID-shaped uids are real on this codebase: `D695-…-E3A9-gconv-…`), so we
+ *  can't just take the first dash-free segment. Instead we anchor on the kind keyword and
+ *  return everything before the leading `-` of that kind. Returns `null` when no recognised
+ *  kind is present (caller falls back to its own source of truth — typically `params.userId`). */
+export function extractUidFromSessionId(sessionId: string): string | null {
+  const m = sessionId.match(_SESSION_KIND_RE);
+  if (!m || m.index === undefined) return null;
+  const uid = sessionId.slice(0, m.index);
+  return uid || null;
+}
+
+/** Tri-state connector exposure, gated by session kind (CLAUDE.md §5 session-id table):
+ *   - `tools+block`: group-chat sessions (`gconv` commander + `gmember` agent worker) — the
+ *     model both reads the catalog and invokes via the two meta-tools.
+ *   - `block-only`:  agent-edit (`agent`) — the editor LLM sees the catalog so it can author a
+ *     workflow that references connectors by id, but the meta-tools are NOT injected (no
+ *     external side effects from an authoring session).
+ *   - `none`:        skill-edit, KB-image, CLI dispatch, reflect, memory-extract, anon, and
+ *     any future kind — neither block nor tools.
+ *   Add a new conversation kind that needs connectors? Extend this gate explicitly + add an
+ *   entry to CLAUDE.md §5's session-id table.
+ *
+ * Implementation note: matches the kind keyword as a `-<kind>-` substring rather than anchoring
+ * to the start. Real uids are sometimes UUID-shaped (`D695-…-E3A9`, multiple internal dashes),
+ * so `^[^-]+-` would only ever capture the first hex group and miss every UUID-uid session.
+ * Hex digits (`[0-9a-f]`) can't form `gconv` / `gmember` / `agent` (the `g`/`n`/`m`/`t`
+ * characters disqualify them), and conv-ids / agent-ids in the tail use `[0-9a-f-]` — so the
+ * substring search is collision-free. */
+export function connectorExposureFromSessionId(sessionId: string): 'tools+block' | 'block-only' | 'none' {
+  if (/-(gconv|gmember)-/.test(sessionId)) return 'tools+block';
+  if (/-agent-/.test(sessionId)) return 'block-only';
+  return 'none';
 }
 
 /**

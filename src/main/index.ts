@@ -134,6 +134,8 @@ import * as scheduledTasks from './features/scheduled_tasks';
 import * as chatAttachments from './features/chat_attachments';
 import * as chatArtifacts from './features/chat_artifacts';
 // `features/sync/*` and `ipc/sync.ts` are stripped in OrkasOpen (depends on account).
+import * as connectorsFeature from './features/connectors';
+// (sync + relay both depend on account; connectors depends on the Server OAuth bridge).
 
 
 function createWindow(): BrowserWindow {
@@ -712,6 +714,12 @@ if (!gotLock) {
     registerChatAppProtocol();
     registerIpc();
     createWindow();
+
+    // Reconnect persisted MCP connector instances + register the before-quit shutdown hook.
+    // Independent of account: connectors are machine-local and work for any active uid.
+    connectorsFeature.bootstrap(users.getActiveUserId()).catch(() => {
+      /* errors logged inside the feature; never block app startup */
+    });
 
     // Background: pick up any out-of-band changes to source files (sync
     // drop-in, manual edits) into the search idx. Query path does not run

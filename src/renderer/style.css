@@ -6715,9 +6715,11 @@ body.model-not-configured .main-content { flex-direction: column; }
 .marketplace-detail-body > .agents-detail-body,
 .marketplace-detail-body > .skills-detail-content { flex: 1; min-height: 0; }
 .marketplace-detail-loading {
+  flex: 1;
   display: flex;
   flex-direction: column;
   align-items: center;
+  justify-content: center;
   gap: 10px;
   padding: 48px 20px;
 }
@@ -7033,3 +7035,238 @@ body.model-not-configured .main-content { flex-direction: column; }
   border-radius: 6px;
   font-size: 13px;
 }
+/* ─── Connectors panel ─── */
+/* The `.panel` base rule already sets display:none → flex toggle via `.active`; do NOT
+   override `#panel-connectors` with `display: flex`, that breaks the setView() gating
+   (id selector beats the class rule → panel stays visible regardless of `.active`). */
+.connectors-grid-view, .connectors-detail-view {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.connectors-grid-header {
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid var(--border);
+  background: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.connectors-grid-title { font-size: 16px; font-weight: 600; color: var(--text); }
+.connectors-grid-tabs {
+  display: flex;
+  gap: 16px;
+  padding: 12px 20px 0;
+  border-bottom: 1px solid var(--border);
+  background: #fff;
+  flex-shrink: 0;
+}
+.connectors-tab {
+  background: transparent;
+  border: 0;
+  padding: 8px 4px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-muted, #6b7280);
+  border-bottom: 2px solid transparent;
+}
+.connectors-tab.is-active { color: var(--text); border-bottom-color: #2563eb; }
+.connectors-grid-scroll { flex: 1; overflow-y: auto; padding: 18px 24px 32px; }
+.connectors-group { flex-shrink: 0; padding: 6px 0; }
+.connectors-group-label {
+  padding: 12px 4px 6px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: #9ca3af;
+}
+.connectors-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 16px;
+  padding: 8px 0 16px;
+}
+.connectors-empty { padding: 32px; text-align: center; }
+.connector-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: border-color 0.12s, box-shadow 0.12s;
+  min-height: 152px;
+}
+.connector-card:hover {
+  border-color: rgba(37, 99, 235, 0.45);
+  box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
+}
+.connector-card-top { display: flex; align-items: center; gap: 10px; }
+.connector-card-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.connector-card-icon.is-svg {
+  background: #fff;
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  padding: 6px;
+}
+.connector-card-icon.is-svg svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.connector-card-icon.is-fallback {
+  background: #6b7280;
+}
+.connector-card-headline { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.connector-card-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.connector-card-account {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.connector-card-error {
+  font-size: 12px;
+  color: #b91c1c;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.connector-card-desc {
+  font-size: 12px;
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.connector-card-foot { margin-top: auto; display: flex; justify-content: flex-end; gap: 6px; align-items: center; }
+.connector-card-foot .btn-link {
+  background: transparent;
+  border: none;
+  color: var(--text-muted, #6b7280);
+  text-decoration: underline;
+  cursor: pointer;
+  padding: 4px 8px;
+}
+.connector-card-foot .btn-link:hover { color: #2563eb; }
+
+/* Tab count badge */
+.connectors-tab { display: inline-flex; align-items: center; gap: 6px; }
+.connectors-tab-count { font-size: 11px; }
+
+/* Legacy dot retained for the agent detail toggle list */
+.connector-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #9ca3af;
+}
+.connector-dot-connected { background: #10b981; }
+.connector-dot-connecting { background: #f59e0b; }
+.connector-dot-error { background: #ef4444; }
+
+/* Detail view */
+.connectors-detail-header {
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
+  background: #fff;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+.connectors-detail-title { flex: 1; font-size: 15px; font-weight: 600; }
+.connectors-detail-actions { display: flex; gap: 8px; }
+.connectors-detail-body { flex: 1; overflow-y: auto; padding: 20px 24px 32px; }
+.connector-detail-row { display: flex; gap: 12px; padding: 6px 0; font-size: 13px; align-items: baseline; }
+.connector-detail-section { margin-top: 18px; }
+.connector-detail-section-title { font-size: 13px; font-weight: 600; margin-bottom: 8px; color: var(--text); }
+.connector-tools-list { display: flex; flex-direction: column; gap: 4px; }
+.connector-tool-row {
+  display: grid;
+  grid-template-columns: auto 200px 1fr;
+  gap: 10px;
+  align-items: baseline;
+  padding: 6px 0;
+  font-size: 13px;
+  cursor: pointer;
+  border-bottom: 1px solid #f3f4f6;
+}
+.connector-tool-name { font-family: ui-monospace, monospace; font-size: 12px; }
+.connector-tool-desc { font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
+
+/* Connect / configure modal (minimal scoped styles for the connectors flow; if the project
+   later introduces a shared .modal-overlay / .modal-card system, these can be retired). */
+#connectors-connect-modal.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+#connectors-connect-modal .modal-card {
+  width: min(520px, 92vw);
+  max-height: 88vh;
+  overflow: auto;
+  background: #fff;
+  border-radius: 12px;
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+#connectors-connect-modal .modal-title { font-size: 16px; font-weight: 600; }
+#connectors-connect-modal .form-row { display: flex; flex-direction: column; gap: 6px; }
+#connectors-connect-modal .form-row label { font-size: 12px; font-weight: 500; color: var(--text-muted, #6b7280); }
+#connectors-connect-modal .form-row input,
+#connectors-connect-modal .form-row select {
+  font: inherit;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fff;
+}
+#connectors-connect-modal .form-hint { font-size: 11px; display: inline-block; }
+#connectors-connect-modal .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.connectors-add-status { font-size: 12px; min-height: 18px; }
+
+/* Per-agent connector toggle row inside the agent detail page */
+.agent-connector-row {
+  display: grid;
+  grid-template-columns: auto auto 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 0;
+  font-size: 13px;
+  border-bottom: 1px solid #f3f4f6;
+  cursor: pointer;
+}
+.agent-connector-name { color: var(--text); }
+.agent-connector-id { font-family: ui-monospace, monospace; font-size: 11px; }

@@ -76,6 +76,10 @@ export interface StateFile {
    *  per-conversation, NOT per-agent: one project for the whole
    *  conversation across however many coding agents it has. */
   coding_project_dir?: string;
+  /** True once this conversation has been touched by the iOS remote-control
+   *  client (a relayed command landed on this PC, or the user opted in).
+   *  appended messages + plan/state up to the Server so the phone can watch
+   *  progress. Only `true` is recorded; absent = not relayed. */
   /** True when the user picked `coding_project_dir` explicitly via the
    *  `<agent-input-form>` directory picker (form-submit hook in
    *  `group_chat/index.ts`). False / missing means the dir was
@@ -364,6 +368,15 @@ export async function setCodingProjectDir(
       delete s.coding_project_dir;
       delete s.coding_project_dir_explicit;
     }
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return s;
+  });
+}
+
+/** Mark / unmark this conversation as relay-enabled (mirrored to the iOS client — see
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
     s.last_active_at = nowIso();
     await writeStateRaw(uid, cid, s);
     return s;

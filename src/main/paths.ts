@@ -127,10 +127,19 @@ export const artifactDir          = (uid: string, cid: string, artifactId: strin
 export const userSavedAppsDir = (uid: string) => path.join(userCloudRoot(uid), 'saved_apps');
 export const savedAppDir      = (uid: string, appId: string) => path.join(userSavedAppsDir(uid), appId);
 
-// core-agent session jsonl (LLM-view) — all session kinds land here:
-// conv (legacy) / gconv / gmember / skill / agent / extract-img.
+// core-agent session jsonl (LLM-view). Two regions:
+//   cloud/sessions/  — "resumable" kinds: gconv / gmember / skill / agent.
+//     The user (or the system on the user's behalf) may continue these
+//     conversations later, so the LLM history must cross devices.
+//   local/sessions/  — "ephemeral" kinds: extract-img / reflect /
+//     memory-extract / anon. One-shot background calls; nobody resumes them,
+//     and they're large + worthless to sync. Sessions_sweep GCs by mtime.
+// Routing lives in `model/core-agent/session-store.ts::resolveSessionPath`
+// and is the single place that decides which side an id lands on.
 export const userSessionsDir        = (uid: string) => path.join(userCloudRoot(uid), 'sessions');
 export const userSessionFile        = (uid: string, sessionId: string) => path.join(userSessionsDir(uid), `${sessionId}.jsonl`);
+export const userLocalSessionsDir   = (uid: string) => path.join(userLocalRoot(uid), 'sessions');
+export const userLocalSessionFile   = (uid: string, sessionId: string) => path.join(userLocalSessionsDir(uid), `${sessionId}.jsonl`);
 
 // Curated knowledge base (the "organized" region of the historical
 // two-region contexts design).
@@ -226,6 +235,13 @@ export const userLocalConfigDir   = (uid: string) => path.join(userLocalRoot(uid
 export const userAuthProfilesFile = (uid: string) => path.join(userLocalConfigDir(uid), 'auth-profiles.json');
 export const userWebSearchCache   = (uid: string) => path.join(userLocalConfigDir(uid), 'web-search-cache.json');
 export const userReflectionStateFile = (uid: string) => path.join(userLocalConfigDir(uid), 'reflection-state.json');
+export const userDevtoolsFile     = (uid: string) => path.join(userLocalConfigDir(uid), 'devtools.json');
+// Connector registry: installed MCP server instances + cached tool schemas.
+// Why under local/ rather than cloud/: holds access tokens (PATs / OAuth
+// bearers) and is machine-private by design; failure mode for sync would be
+// a token leaked to another device. Token-vault concerns: see
+// `features/connectors/registry.ts` header.
+export const userConnectorsConfigFile = (uid: string) => path.join(userLocalConfigDir(uid), 'connectors.json');
 
 // Local search index (derived data, self-healing via reconcile, never synced).
 // Only the main conversation + knowledge base get a persistent inverted

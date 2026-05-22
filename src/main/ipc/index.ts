@@ -46,6 +46,7 @@ import * as avatars from '../features/avatars';
 import { getRendererTables, isLang, t } from '../i18n';
 import * as userWorkspace from '../features/user_workspace';
 import { invokeHandlers as localAgentsHandlers } from './local_agents';
+import { invokeHandlers as connectorsHandlers } from './connectors';
 import { safeId } from '../storage';
 import { createLogger, logFromRenderer } from '../logger';
 import * as path from 'node:path';
@@ -1071,6 +1072,10 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // User-account login (Google / Apple OAuth). Stripped from the OrkasOpen build.
 
   // Multi-device sync. Stripped from the OrkasOpen build (depends on account).
+
+  // Connectors (MCP-based). User-installed MCP servers expose tools to commander + selected
+  // agents. No Server dependency → kept in OrkasOpen.
+  ...connectorsHandlers,
 };
 
 // ── Stream handlers ──────────────────────────────────────────────────────

@@ -231,6 +231,10 @@ Read the matching SKILL.md **before** emitting any `<agent>` / `<skill>` contain
 
 `kb_search(query, k?, dir?, kind?)` + `kb_read(path, chunk?, window?)`: search first, read on demand. After a hit, use `window: 1~2` to bring back adjacent chunks — small embedding unit (precise recall) + larger context unit (enough to answer) — both matter.
 
+### Connectors (third-party services)
+
+When the system prompt has a `## Connectors` block, those services are reachable via `list_connector_tools({connector_id})` (to see an action's JSON input schema) then `call_connector_tool({connector_id, tool_name, args})`. List before calling — don't guess action names. If the user asks for a service the block doesn't list, tell them to add it via the Connectors panel; don't fake it with `web_search` / `bash`.
+
 ### Attachments and files
 
 When a user message has an `<attachments>` prefix, each `<file name=... path=... kind=... [total_chars=...]/>` entry's `path` is the **authoritative absolute path**.

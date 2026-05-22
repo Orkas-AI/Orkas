@@ -47,6 +47,14 @@ function enumerateAllInjectedToolNames(): Set<string> {
   for (const t of createKbTools({ userId: 'testuid' })) names.add(t.name);
   names.add(createImageGenTool({ userId: 'testuid', cid: 'testcid' }).name);
 
+  // Connector umbrella meta-tools: two fixed tools, only injected when ≥1 connector is visible
+  // to the actor. Asserting presence in the catalog independent of runtime visibility — calling
+  // the factory here would short-circuit to [] without a manager mock, defeating the drift
+  // check. Per-connector MCP actions discovered at runtime are NOT enumerated (they vary
+  // per-user / per-install — see tool-catalog.ts header).
+  names.add('list_connector_tools');
+  names.add('call_connector_tool');
+
   return names;
 }
 
