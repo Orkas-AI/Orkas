@@ -2,6 +2,7 @@
   "name": "orkas",
   "version": "2026.4.30",
   "version": "2026.5.21",
+  "version": "2026.5.22",
   "private": true,
   "license": "MIT",
   "description": "Orkas desktop — Electron + Node one-piece app",
@@ -21,17 +22,7 @@
     "rebuild:sqlite:node": "node scripts/swap-sqlite-abi.mjs node",
     "postinstall": "node scripts/swap-sqlite-abi.mjs electron && node scripts/fetch-embedding-model.mjs",
     "prepare": "node scripts/install-git-hooks.mjs",
-    "prepack": "node scripts/swap-sqlite-abi.mjs electron",
-    "predist": "node scripts/swap-sqlite-abi.mjs electron",
-    "pack": "electron-builder --dir",
-    "dist": "electron-builder",
-    "dist:mac": "electron-builder --mac",
-    "dist:win": "electron-builder --win",
-    "release:bump-version": "node scripts/release-desktop/bump-version.mjs",
-    "release:desktop:sh": "bash scripts/release-desktop/release.sh",
-    "release:desktop": "node scripts/release-desktop/release.mjs",
-    "release:upload-feed": "node scripts/release-desktop/upload-feed.mjs",
-    "release:verify-feed": "node scripts/release-desktop/verify-feed.mjs"
+    "prepack": "node scripts/swap-sqlite-abi.mjs electron"
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.7",
@@ -118,6 +109,11 @@
     "afterPack": "scripts/codesign-adhoc.cjs",
     "mac": {
       "category": "public.app-category.productivity",
+      "hardenedRuntime": true,
+      "entitlements": "product/signing/entitlements.mac.plist",
+      "entitlementsInherit": "product/signing/entitlements.mac.inherit.plist",
+      "notarize": true,
+      "forceCodeSigning": true,
       "target": [
         {
           "target": "dmg",
