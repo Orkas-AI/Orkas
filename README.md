@@ -18,40 +18,9 @@
 
 ---
 
-## Four core points
+## Core features
 
-### 👥 Multi-agent collaboration
-
-**A whole team in one chat window** — the commander dispatches, agents handle their specialties, you just talk.
-
-- **Smart dispatch** — the commander has the full conversation context and decides on its own who to bring in and when, based on your needs and each agent's strengths
-- **Orchestrated collaboration** — multiple agents work in serial or in parallel within the same chat; task breakdown, hand-offs between agents, and result aggregation are all orchestrated by the commander
-- **Quickly create new agents** — describe one to the commander, or have it distill one from your past chats — it produces a reusable agent you can summon next time
-- **Step in anytime** — `@` any member to add requirements, redirect, or pull someone in / kick them out
-
-### 🌱 Self-evolving agents
-
-**Agents that get to know your work better the more you use them** — after each task, an agent reflects on how it did and how to do better next time, and accumulates experience over time.
-
-- **Reflective evolution** — after self-reflection, an agent updates its own playbook: what it's good at / not good at, and which methods work in which situations
-- **Skill crystallization** — the moves that worked this time get crystallized into a reusable skill, so the next similar task picks it up directly
-- **Private knowledge** — each agent has its own private skill library and memory, never crossed over from other agents
-
-### 💾 Local storage
-
-**Conversations, files, API keys, knowledge bases, custom agents / skills, memory — all stay on your machine.**
-
-- **Offline-capable** — except for the moment of calling the model API, everything else still runs with the network off
-- **Config is just files** — all data is plain files: readable, backupable, syncable through your own cloud drive; migrating machines is just copying a directory
-
-### 🖥️ Desktop app
-
-**As a desktop app, local file handling is smooth and the GUI beats the command line.**
-
-- **Direct local file access** — drop files into the chat as attachments; agents can read and write files in your workspace, run scripts, and generate PDFs / images / code; produced files appear as cards in the chat, one click to reveal in Finder / Explorer
-- **Visual operations** — agents, skills, and knowledge bases are all managed visually; view images, videos, and generated documents directly in the chat without switching to a CLI
-- **Use your own subscription or API key** — log in via OAuth or paste an API key for DeepSeek · Kimi · GLM · MiniMax · Doubao · Qwen · Claude · OpenAI · Gemini; requests don't go through Orkas and aren't archived
-- **Cross-platform** — macOS (Apple Silicon + Intel), Windows, and Linux
+![Core features](./resources/key-points-en.png)
 
 ---
 
