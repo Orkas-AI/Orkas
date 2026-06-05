@@ -46,9 +46,6 @@ export ORKAS_PROFILE="${1:-${ORKAS_PROFILE:-global}}"
 echo "[Orkas] Starting profile=$ORKAS_PROFILE"
 
 node "$APP_DIR/scripts/ensure-deps.cjs"
-# macOS dev only: declare the orkas:// scheme + a unique bundle id on the bundled Electron .app so
-# OAuth login deep-link callbacks route back to this running instance (no-op elsewhere; never fails).
-node "$APP_DIR/scripts/patch-dev-protocol.cjs" || true
 
 cd "$APP_DIR"
 pkill -9 -f "$APP_DIR/node_modules/electron/dist" >/dev/null 2>&1 || true
