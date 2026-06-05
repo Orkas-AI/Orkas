@@ -789,13 +789,10 @@ if (!gotLock) {
     registerKbFileProtocol();
     registerChatMediaProtocol();
     registerChatAppProtocol();
-    // Renderer permission gate (identical in dev and packaged). Microphone:
-    // the chat-composer voice-to-text button calls getUserMedia. Clipboard:
-    // copy-to-clipboard UI actions. Everything else is denied. On macOS the
-    // OS-level mic prompt still fires on first capture (Info.plist carries
-    // NSMicrophoneUsageDescription — see the `build.mac.extendInfo` block).
+    // Renderer permission gate (identical in dev and packaged). Clipboard:
+    // copy-to-clipboard UI actions. Everything else is denied.
     session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
-      callback(permission === 'media' || permission === 'clipboard-read' || permission === 'clipboard-sanitized-write');
+      callback(permission === 'clipboard-read' || permission === 'clipboard-sanitized-write');
     });
     registerIpc();
     clientConfigFeature.clientConfig.subscribeAll((keys) => {

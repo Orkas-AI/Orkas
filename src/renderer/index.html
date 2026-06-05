@@ -92,10 +92,8 @@
                 <div class="chat-attachments" id="new-chat-attachments" style="display:none"></div>
               </div>
               <textarea id="new-chat-input" data-i18n-placeholder="new_chat.input_placeholder" placeholder="Type @ to choose agents, skills, connectors." rows="2"></textarea>
-              <!-- Composer bottom bar order matches PC/docs/design/PATTERNS.md
-                   P11: [+] | divider | [To] | [workspace - JS-injected] |
-                   [skill] | spacer | [mic] | [send]. Mic+send are pushed
-                   right by `.chat-mic-btn { margin-left: auto }`. -->
+              <!-- Composer bottom bar: [+] | divider | [To] | [workspace - JS-injected] |
+                   [skill] | spacer | [send]. The send button owns the spacer. -->
               <div class="chat-bottom-bar">
                 <button type="button" class="chat-attach-btn" id="new-chat-attach-btn" data-i18n-title="new_chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
                 <span class="chat-composer-divider" aria-hidden="true"></span>
@@ -111,12 +109,6 @@
                   <span class="chip-label"></span>
                   <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
                 </div>
-                <!-- Voice-to-text mic button (stripped in OrkasOpen — see OpenSource/SyncCode/strip-rules.json).
-                     Carries `margin-left: auto` via .chat-mic-btn so it + the send
-                     button float to the right edge per design P11. -->
-                <button type="button" class="chat-attach-btn chat-mic-btn" id="new-chat-mic-btn" data-i18n-title="chat.mic_title" title="Voice input">
-                  <span data-ui-icon="mic" data-ui-icon-class="chat-mic-icon"></span>
-                </button>
                 <button id="new-chat-send-btn" class="chat-send-btn" data-i18n-title="new_chat.send_title" title="Send">
                   <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
                 </button>
@@ -232,10 +224,8 @@
                 </div>
                 <div class="chat-quote-preview" id="chat-quote-preview" style="display:none"></div>
                 <textarea id="chat-input" data-i18n-placeholder="chat.input_placeholder" placeholder="Type @ to choose agents, skills, connectors." rows="2"></textarea>
-                <!-- Composer bottom bar order matches PC/docs/design/PATTERNS.md
-                     P11: [+] | divider | [To] | [workspace - JS-injected] |
-                     [skill] | spacer | [mic] | [send]. Mic+send are pushed right
-                     by `.chat-mic-btn { margin-left: auto }`. -->
+                <!-- Composer bottom bar: [+] | divider | [To] | [workspace - JS-injected] |
+                     [skill] | spacer | [send]. The send button owns the spacer. -->
                 <div class="chat-bottom-bar">
                   <button type="button" class="chat-attach-btn" id="chat-attach-btn" data-i18n-title="chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
                   <span class="chat-composer-divider" aria-hidden="true"></span>
@@ -249,12 +239,6 @@
                     <span class="chip-label"></span>
                     <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
                   </div>
-                  <!-- Voice-to-text mic button (stripped in OrkasOpen — see OpenSource/SyncCode/strip-rules.json).
-                       Carries `margin-left: auto` via .chat-mic-btn so it + the send
-                       button float to the right edge per design P11. -->
-                  <button type="button" class="chat-attach-btn chat-mic-btn" id="chat-mic-btn" data-i18n-title="chat.mic_title" title="Voice input">
-                    <span data-ui-icon="mic" data-ui-icon-class="chat-mic-icon"></span>
-                  </button>
                   <button id="chat-send-btn" class="chat-send-btn" data-i18n-title="chat.send_title" title="Send">
                     <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
                     <span data-ui-icon="stop" data-ui-icon-class="stop-icon"></span>
@@ -579,7 +563,7 @@
                     <div class="chat-attachments" id="project-chat-attachments" style="display:none"></div>
                   </div>
                   <textarea id="project-chat-input" data-i18n-placeholder="project.chat.placeholder" placeholder="Type @ to choose agents, skills, connectors." rows="2"></textarea>
-                  <!-- Bottom bar: attach | divider | recipient | workspace (JS-injected) | skill | spacer | mic | send. -->
+                  <!-- Bottom bar: attach | divider | recipient | workspace (JS-injected) | skill | spacer | send. -->
                   <div class="chat-bottom-bar">
                     <button type="button" class="chat-attach-btn" id="project-chat-attach-btn" data-i18n-title="project.files.add" title="Add file">+</button>
                     <span class="chat-composer-divider" aria-hidden="true"></span>
@@ -593,9 +577,6 @@
                       <span class="chip-label"></span>
                       <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
                     </div>
-                    <button type="button" class="chat-attach-btn chat-mic-btn" id="project-chat-mic-btn" data-i18n-title="chat.mic_title" title="Voice input">
-                      <span data-ui-icon="mic" data-ui-icon-class="chat-mic-icon"></span>
-                    </button>
                     <button type="button" class="chat-send-btn" id="project-chat-send-btn" data-i18n-title="chat.send_title" title="Send">
                       <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
                     </button>
@@ -1288,9 +1269,6 @@
                 <span class="chip-label"></span>
                 <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
               </div>
-              <button type="button" class="chat-attach-btn chat-mic-btn" id="auto-mic-btn" data-i18n-title="chat.mic_title" title="Voice input">
-                <span data-ui-icon="mic" data-ui-icon-class="chat-mic-icon"></span>
-              </button>
             </div>
           </div>
         </div>
@@ -1469,13 +1447,12 @@
   <script src="./modules/boot.js"></script>
   <!-- Account login gate + Settings account card — stripped in OrkasOpen. login_panel.js must load
        after boot.js (it calls bootApp); account_settings.js is invoked from settings.js::loadSettings. -->
-  <!-- Pro entitlement gate (renderer-side). Loads before voice / sync so window.proGate
+  <!-- Pro entitlement gate (renderer-side). Loads before sync so window.proGate
        exists when those modules attach button handlers. Stripped in OrkasOpen. -->
   <script src="./modules/pro_gate.js"></script>
   <script src="./modules/avatar.js"></script>
   <script src="./modules/avatar-picker.js"></script>
   <script src="./modules/chat-input-form.js"></script>
-  <!-- Voice-to-text composer button — stripped in OrkasOpen (no Server). -->
   <script src="./modules/chat-lightbox.js"></script>
   <script src="./modules/icons.js"></script>
   <script src="./modules/chat-file-viewer.js"></script>

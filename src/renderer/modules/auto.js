@@ -722,18 +722,6 @@ function _mountAutoForm() {
     attachBtn.addEventListener('click', () => _autoPickAndUploadFiles());
   }
 
-  // Voice-to-text mic. The button is gated by the (stripped in OrkasOpen)
-  // voice-input module; `attach` is a no-op when window.VoiceInput is absent.
-  const micBtn = document.getElementById('auto-mic-btn');
-  const ta = document.getElementById('auto-task-input');
-  if (micBtn && ta && typeof window.VoiceInput === 'object' && typeof window.VoiceInput.attach === 'function') {
-    window.VoiceInput.attach(micBtn, ta);
-  } else if (micBtn) {
-    // OrkasOpen strip: hide the button rather than leave a non-functional
-    // affordance on the bar.
-    micBtn.style.display = 'none';
-  }
-
   // Keep i18n labels updating on lang switch.
   window.addEventListener('i18n-change', _autoRepaintLabels);
 

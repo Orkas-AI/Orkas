@@ -29,7 +29,7 @@
 }
 
 /* Canonical motion keyframes per PC/docs/design/TOKENS.md §6. Pre-existing
-   feature-scoped keyframes (chat-mic-pulse / ctx-kb-spin / …) keep their
+   feature-scoped keyframes (ctx-kb-spin / …) keep their
    names — new UI code references these short names. */
 @keyframes spin  { to { transform: rotate(360deg); } }
 @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(0.8); } }
@@ -4700,9 +4700,8 @@ body.model-not-configured .main-content { flex-direction: column; }
   text-overflow: ellipsis;
 }
 
-/* "+" / mic / icon-only buttons inside the composer bottom bar. Box matches
-   PC/docs/design/PATTERNS.md P11 (30×30, radius 7). Both buttons share this
-   the send button to the right edge of the bar. */
+/* "+" / icon-only buttons inside the composer bottom bar. Box matches
+   PC/docs/design/PATTERNS.md P11 (30×30, radius 7). */
 .chat-attach-btn {
   flex-shrink: 0;
   width: 30px;
@@ -4733,23 +4732,8 @@ body.model-not-configured .main-content { flex-direction: column; }
   background: var(--border);
 }
 
-/* Mic floats to the right edge — sits immediately left of the send button.
-   The whole "spacer" role is handled by margin-left:auto on this one element. */
-
-/* Mic button — voice-to-text. Reuses .chat-attach-btn's box; adds the
-   recording / finalizing states. Stripped in OrkasOpen — see
-   OpenSource/SyncCode/strip-rules.json. */
-.chat-mic-icon {
-  width: 15px;
-  height: 15px;
-}
-@keyframes chat-mic-pulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(220, 38, 38, 0.28); }
-  60% { box-shadow: 0 0 0 5px rgba(220, 38, 38, 0); }
-}
-
-/* Bottom row inside the input area, ordered per PC/docs/design/PATTERNS.md P11:
-   [+] | divider | [To] [workspace] [skill] [...] | spacer | [mic] [send].
+/* Bottom row inside the input area:
+   [+] | divider | [To] [workspace] [skill] [...] | spacer | [send].
    Wraps row-by-row on narrow windows so chips never overflow the input box. */
 .chat-bottom-bar {
   display: flex;
@@ -4760,8 +4744,6 @@ body.model-not-configured .main-content { flex-direction: column; }
   width: 100%;
   padding: 4px 4px 4px;
 }
-   When the mic IS present (full build), it carries the spacer role and the
-   send button sits flush next to it (gap:6px only). */
 .chat-bottom-bar .chat-send-btn {
   margin-left: auto;
 }
