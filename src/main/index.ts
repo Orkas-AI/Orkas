@@ -48,9 +48,7 @@ import './install-data-root.cjs';
 // edge case where productName isn't picked up early.
 app.setName('Orkas');
 
-// OrkasOpen uses the same public prod API defaults in source-run and packaged builds.
-// Keep `ORKAS_API_BASE_URL` as an explicit override only; otherwise marketplace resolves
-// by `ORKAS_PROFILE` (global -> orkas.ai, cn -> orkas.work) inside features/marketplace.ts.
+// OrkasOpen has exactly one server environment: global prod.
 
 // Register the KB file protocol BEFORE `app.whenReady()` — privileged
 // schemes can't be added after. `kb-file:///<relpath>` serves a single

@@ -200,13 +200,8 @@ export async function startMcpDcrOAuth(
     resource,
   });
 
-  // Register client. The redirect_uri must point at our Server's `/connectors/oauth/dcr-callback`
-  // endpoint, which is environment-dependent (`accountApiBase()` resolves to the dev or prod
-  // Server URL per `OAUTH_REDIRECT_BASE` / debug-mode rules). DCR registers whichever URL we
-  // declare with the provider, so dev (localhost) and prod (orkas.ai) just work side-by-side
-  // — each ConnectorInstance carries its own dcr_client tied to whichever env it was installed
-  // under. (A dev-mode install does NOT migrate to prod automatically; the user would
-  // reconnect.)
+  // Register client. OrkasOpen has exactly one redirect base: global prod. Each
+  // ConnectorInstance carries its own dcr_client for that Server-side callback.
   const redirectUri = `${accountApiBase().replace(/\/+$/, '')}/connectors/oauth/dcr-callback`;
   const registered = await _registerClient(meta.registration_endpoint, redirectUri);
   log.info('DCR registration done', { client_id_tail: registered.client_id.slice(-6) });

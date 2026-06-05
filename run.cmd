@@ -10,13 +10,7 @@ if not exist "%APP_DIR%\package.json" (
   exit /b 1
 )
 
-REM Priority: positional %1 > ORKAS_PROFILE env > default global.
-if not "%~1"=="" (
-  set "ORKAS_PROFILE=%~1"
-) else if "%ORKAS_PROFILE%"=="" (
-  set "ORKAS_PROFILE=global"
-)
-echo [Orkas] 启动 profile=%ORKAS_PROFILE%
+echo [Orkas] 启动 OrkasOpen (global prod)
 
 call node "%APP_DIR%\scripts\ensure-deps.cjs"
 if errorlevel 1 exit /b 1

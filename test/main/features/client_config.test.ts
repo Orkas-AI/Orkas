@@ -33,22 +33,12 @@ describe('client_config', () => {
     electronMock.app.off.mockClear();
     electronMock.powerMonitor.on.mockClear();
     electronMock.powerMonitor.off.mockClear();
-    delete process.env.ORKAS_ACCOUNT_API_BASE;
-    delete process.env.ORKAS_API_BASE_URL;
-    delete process.env.ORKAS_PROFILE;
-    delete process.env.ORKAS_CLIENT_CHANNEL;
-    delete process.env.ORKAS_CHANNEL;
   });
 
   afterEach(() => {
     stop();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
-    delete process.env.ORKAS_ACCOUNT_API_BASE;
-    delete process.env.ORKAS_API_BASE_URL;
-    delete process.env.ORKAS_PROFILE;
-    delete process.env.ORKAS_CLIENT_CHANNEL;
-    delete process.env.ORKAS_CHANNEL;
   });
 
   it('returns registered local defaults before any Server config is available', () => {
@@ -211,7 +201,6 @@ describe('client_config', () => {
 
     const now = 1_234_567;
     vi.spyOn(Date, 'now').mockReturnValue(now);
-    process.env.ORKAS_API_BASE_URL = 'https://config.example/api/';
     let requestedUrl = '';
     let requestedInit: RequestInit | undefined;
     vi.stubGlobal('fetch', async (input: string | URL | Request, init?: RequestInit) => {
@@ -233,10 +222,10 @@ describe('client_config', () => {
       expect(result).toEqual({ updated: true });
 
       const url = new URL(requestedUrl);
-      expect(url.origin + url.pathname).toBe('https://config.example/api/config/client');
+      expect(url.origin + url.pathname).toBe('https://orkas.ai/api/config/client');
       expect(url.searchParams.get('platform')).toBe('pc');
       expect(url.searchParams.get('version')).toBe('9.8.7');
-      expect(url.searchParams.get('channel')).toBe('dev');
+      expect(url.searchParams.get('channel')).toBe('open');
       expect(url.searchParams.get('region')).toBe('global');
       expect(url.searchParams.get('os')).toBe(process.platform);
       expect(url.searchParams.get('arch')).toBe(process.arch);
@@ -255,17 +244,13 @@ describe('client_config', () => {
     }
   });
 
-  it('uses the open channel when the open-source package marker is present', async () => {
+  it('uses the open channel for OrkasOpen config requests', async () => {
     const users = await import('../../../src/main/features/users');
     const paths = await import('../../../src/main/paths');
     const uid = 'clientconfigopenchannel';
     users.activateUser(uid);
     const file = paths.userRemoteConfigFile(uid);
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    const appDir = fs.mkdtempSync(path.join(path.dirname(file), 'open-app-'));
-    fs.writeFileSync(path.join(appDir, 'package.json'), JSON.stringify({ license: 'MIT' }), 'utf8');
-    (electronMock.app as any).getAppPath = vi.fn(() => appDir);
-
     let requestedUrl = '';
     vi.stubGlobal('fetch', async (input: string | URL | Request) => {
       requestedUrl = String(input);

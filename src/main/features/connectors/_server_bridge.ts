@@ -2,7 +2,7 @@
  * Server-bridge stubs for connector OAuth in the OrkasOpen build.
  *
  * PC's `features/connectors/oauth*.ts` reaches into `features/account/{server,token_store}` for:
- *   - `accountApiBase()` — the Orkas Server base URL (region-routed)
+ *   - `accountApiBase()` — the Orkas global prod Server base URL
  *   - `tokenStore.getDeviceId()` — stable per-machine UUID
  *   - `tokenStore.authHeaders()` — `{user_id, session_id}` for the logged-in user
  *
@@ -13,7 +13,7 @@
  * session in OrkasOpen — but exposing the same signature keeps the call sites identical.
  *
  * Where each piece comes from:
- *   - `accountApiBase` aliases `features/marketplace.apiBase()` (same resolver — single
+ *   - `accountApiBase` aliases `features/marketplace.apiBase()` (global prod only — single
  *     source of truth across all Server-bridged features in this build).
  *   - `getDeviceId()` persists a UUID at `<uid>/local/config/device.json` on first call. Stable
  *     across runs on the same machine; resets if the user wipes the local config dir.

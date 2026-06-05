@@ -26,22 +26,18 @@ vi.mock('../../../../src/main/features/config', () => ({
 
 let tmpDir: string;
 let prevWs: string | undefined;
-let prevApi: string | undefined;
 
 beforeEach(() => {
   vi.clearAllMocks();
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-github-oauth-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
-  prevApi = process.env.ORKAS_API_BASE_URL;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
-  process.env.ORKAS_API_BASE_URL = 'http://account.example/api';
   vi.resetModules();
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
-  process.env.ORKAS_API_BASE_URL = prevApi;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 

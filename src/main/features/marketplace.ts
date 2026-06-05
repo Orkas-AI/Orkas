@@ -74,22 +74,12 @@ import { persistReport as persistQualityReport } from '../quality/report';
 const log = createLogger('marketplace');
 
 // ── server URL ────────────────────────────────────────────────────────────
-// Profile-driven (mirrors Server `env/start/{dev_,}api_start.sh` — see PC/CLAUDE.md §1 +
-// Server CLAUDE.md §7): `ORKAS_PROFILE=global` (default) routes to overseas prod
-// (`orkas.ai`), `ORKAS_PROFILE=cn` routes to China prod (`orkas.work`). Use the apex
-// hosts directly so POST marketplace calls do not first hit a www -> apex 301 redirect.
-// `run.sh` exports the env from its positional arg (`./run.sh cn`). An explicit
-// `ORKAS_API_BASE_URL` always wins for local debugging, but OrkasOpen never auto-pins
-// source-run builds to a dev Server.
-const PROFILE_BASES: Record<string, string> = {
-  global: 'https://orkas.ai/api',
-  cn:     'https://orkas.work/api',
-};
+// OrkasOpen has exactly one server environment: global prod. Use the apex host directly
+// so POST marketplace calls do not first hit a www -> apex 301 redirect.
+const GLOBAL_PROD_API_BASE = 'https://orkas.ai/api';
 
 export function apiBase(): string {
-  if (process.env.ORKAS_API_BASE_URL) return process.env.ORKAS_API_BASE_URL.replace(/\/+$/, '');
-  const profile = process.env.ORKAS_PROFILE || 'global';
-  return PROFILE_BASES[profile] || PROFILE_BASES.global;
+  return GLOBAL_PROD_API_BASE;
 }
 
 // ── envelope ──────────────────────────────────────────────────────────────

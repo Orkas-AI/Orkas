@@ -50,7 +50,6 @@ type ElectronPowerMonitorLike = {
 const log = createLogger('client-config');
 const REFRESH_INTERVAL_MS = 4 * 60 * 60 * 1000;
 const PROD_DEFAULT = 'https://orkas.ai/api';
-const DEV_DEFAULT = 'http://127.0.0.1:8888/api';
 
 let started = false;
 let inFlight: Promise<ConfigRefreshResult> | null = null;
@@ -363,40 +362,18 @@ export class ClientConfigManager {
 
 export const clientConfig = new ClientConfigManager();
 
-export type ClientConfigChannel = 'prod' | 'dev' | 'open';
+export type ClientConfigChannel = 'open';
 
-function normalizeChannel(raw: string | undefined): ClientConfigChannel | null {
-  const v = String(raw || '').trim().toLowerCase();
-  if (v === 'prod' || v === 'dev' || v === 'open') return v;
-  return null;
-}
-
-function isOpenSourcePackage(app: ElectronAppLike): boolean {
-  try {
-    const appPath = typeof app.getAppPath === 'function' ? app.getAppPath() : '';
-    if (!appPath) return false;
-    const pkg = JSON.parse(fs.readFileSync(path.join(appPath, 'package.json'), 'utf8')) as Record<string, unknown>;
-    return String(pkg.license || '').trim().toUpperCase() === 'MIT';
-  } catch {
-    return false;
-  }
-}
-
-function channel(app: ElectronAppLike): ClientConfigChannel {
-  const envChannel = normalizeChannel(process.env.ORKAS_CLIENT_CHANNEL || process.env.ORKAS_CHANNEL);
-  if (envChannel) return envChannel;
-  if (isOpenSourcePackage(app)) return 'open';
-  return app.isPackaged ? 'prod' : 'dev';
+function channel(_app: ElectronAppLike): ClientConfigChannel {
+  return 'open';
 }
 
 function region(): string {
-  return (process.env.ORKAS_PROFILE || 'global').trim() || 'global';
+  return 'global';
 }
 
-function apiBase(app: ElectronAppLike): string {
-  const env = process.env.ORKAS_ACCOUNT_API_BASE || process.env.ORKAS_API_BASE_URL;
-  if (env) return env.replace(/\/+$/, '');
-  return app.isPackaged ? PROD_DEFAULT : DEV_DEFAULT;
+function apiBase(_app: ElectronAppLike): string {
+  return PROD_DEFAULT;
 }
 
 function buildUrl(app: ElectronAppLike): string {
