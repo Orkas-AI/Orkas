@@ -329,7 +329,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     for await (const ev of mapCoreAgentEvents(captureResult(rawEvents), { userId, skillDisplayNameById, agentDisplayNameById })) {
       resetIdle();
       eventCount += 1;
-      recorder.record(ev as any);
+      recorder?.record(ev as any);
       if (ev.type === 'final') finalText = (ev as any).text || finalText;
       if (ev.type === 'error') { errText = (ev as any).text || errText; if ((ev as any).aborted) abortedFlag = true; }
       // NOTE: compaction summaries are deliberately NOT mined into cross-session
