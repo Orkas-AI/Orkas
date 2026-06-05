@@ -42,8 +42,14 @@ interface DebugRecorder {
   finish(result: { text: string; aborted: boolean; error: string | null }): void;
 }
 
-function createDebugRecorder(): DebugRecorder | null {
-  return null;
+const NOOP_DEBUG_RECORDER: DebugRecorder = {
+  record() {},
+  setActiveCandidate() {},
+  finish() {},
+};
+
+function createDebugRecorder(): DebugRecorder {
+  return NOOP_DEBUG_RECORDER;
 }
 
 /**
@@ -244,10 +250,9 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     else abortSignal.addEventListener('abort', onExternalAbort, { once: true });
   }
 
-  // Dev-only archiver — no-op in prod. Initialised after buildRunner so
-  // the record can carry the resolved provider / model ids for prompt
-  // triage ("did this call actually hit the model I think it did").
-  let recorder: DebugRecorder | null = null;
+  // PC dev builds attach an archive recorder here. OrkasOpen keeps the same
+  // interface as a no-op object so stripped debug code cannot affect model calls.
+  const recorder = createDebugRecorder();
   let finalText = '';
   let errText: string | null = null;
   let abortedFlag = false;
@@ -280,7 +285,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(onSkillAdvertised ? { onSkillAdvertised } : {}),
       ...(onSkillInvoked ? { onSkillInvoked } : {}),
       onNativeSearchInjected: (info) => {
-        recorder?.record({
+        recorder.record({
           type: 'progress',
           event: { stream: 'native_search', data: { phase: 'injected', ...info } },
         });
@@ -293,12 +298,10 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       // when complete()/stream() actually picks a candidate, so the recorder
       // is always live by then.
       onCandidateChosen: (info) => {
-        recorder?.setActiveCandidate(info);
+        recorder.setActiveCandidate(info);
       },
     });
     const { runner, providerId, modelId, resolvedSystemPrompt, profileId, entryId, toolDefs, skillDisplayNameById, agentDisplayNameById } = built;
-
-    recorder = createDebugRecorder();
 
     const sandboxEnv = buildSkillSandboxEnv();
 
@@ -329,7 +332,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     for await (const ev of mapCoreAgentEvents(captureResult(rawEvents), { userId, skillDisplayNameById, agentDisplayNameById })) {
       resetIdle();
       eventCount += 1;
-      recorder?.record(ev as any);
+      recorder.record(ev as any);
       if (ev.type === 'final') finalText = (ev as any).text || finalText;
       if (ev.type === 'error') { errText = (ev as any).text || errText; if ((ev as any).aborted) abortedFlag = true; }
       // NOTE: compaction summaries are deliberately NOT mined into cross-session
@@ -392,10 +395,8 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     }
     releaseSlotOnce('finally');
     releaseSessionOnce('finally');
-    if (recorder) {
-      try { recorder.finish({ text: finalText, aborted: abortedFlag, error: errText }); }
-      catch (err) { log.warn('archive finish failed:', err); }
-    }
+    try { recorder.finish({ text: finalText, aborted: abortedFlag, error: errText }); }
+    catch (err) { log.warn('archive finish failed:', err); }
     yield { type: 'done' };
   }
 }
