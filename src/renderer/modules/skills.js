@@ -33,10 +33,8 @@ function _skillPlatformChipsHtml(s) {
     const versionLabel = t('marketplace.version').replace('{version}', String(s.version));
     parts.push(`<span class="skill-card-chip is-version">${escapeHtml(versionLabel)}</span>`);
   }
-  if (s.category) {
-    const catLabel = _resolveCategoryLabel(s.category, lang);
-    parts.push(`<span class="skill-card-chip">${escapeHtml(catLabel)}</span>`);
-  }
+  const catLabel = _resolveCategoryLabel(s.category, lang);
+  parts.push(`<span class="skill-card-chip">${escapeHtml(catLabel)}</span>`);
   return parts.join('');
 }
 
@@ -331,13 +329,20 @@ function renderSkillsGrid(skills) {
   })();
 
   // Chip strip — `_mpCategoriesCache` is defined in marketplace.js (flat top-level scope).
+  // Missing categories and non-registry category codes are treated as General.
   const canonicalCategoryCode = (code) => {
     return typeof _mpCanonicalCategoryCode === 'function'
       ? _mpCanonicalCategoryCode(code)
       : String(code || '').trim();
   };
-  const codesPresent = new Set(skills.map((s) => canonicalCategoryCode(s && s.category)));
   const cats = (typeof _mpCategoriesCache !== 'undefined' && _mpCategoriesCache) || [];
+  const knownCodes = _knownCategoryCodes(cats);
+  const rawCodesPresent = new Set(skills.map((s) => canonicalCategoryCode(s && s.category)));
+  const unknownCodes = [...rawCodesPresent].filter((c) => c && !knownCodes.has(c)).sort();
+  if (unknownCodes.length && typeof _mpMaybeRefreshCategoriesForCodes === 'function') {
+    _mpMaybeRefreshCategoriesForCodes(unknownCodes);
+  }
+  const codesPresent = new Set([...rawCodesPresent].map((c) => _effectiveCategoryCode(c, knownCodes)));
   const chipCodes = [];
   const chipCodeSeen = new Set();
   for (const c of cats) {
@@ -346,24 +351,14 @@ function renderSkillsGrid(skills) {
     chipCodes.push({ code, label: pickLocalizedName(c, lang) || code });
     chipCodeSeen.add(code);
   }
-  const knownCodes = new Set(cats.map((c) => canonicalCategoryCode(c && c.code)).filter(Boolean));
-  const unknownCodes = [...codesPresent].filter((c) => c && !knownCodes.has(c)).sort();
-  if (unknownCodes.length && typeof _mpMaybeRefreshCategoriesForCodes === 'function') {
-    _mpMaybeRefreshCategoriesForCodes(unknownCodes);
+  if (codesPresent.has('general') && !chipCodeSeen.has('general')) {
+    chipCodes.push({ code: 'general', label: _generalCategoryLabel(lang) });
+    chipCodeSeen.add('general');
   }
-  const hasUnknownCategory = codesPresent.has('') || unknownCodes.length > 0;
-  if (hasUnknownCategory) {
-    chipCodes.push({
-      code: '__unknown__',
-      label: typeof _mpUnknownCategoryLabel === 'function' ? _mpUnknownCategoryLabel() : 'Unknown',
-    });
+  if (_skillsActiveCategory === '__uncategorized__' || _skillsActiveCategory === '__unknown__') {
+    _skillsActiveCategory = codesPresent.has('general') ? 'general' : '';
   }
-  if (_skillsActiveCategory === '__uncategorized__') _skillsActiveCategory = '__unknown__';
-  if (_skillsActiveCategory && _skillsActiveCategory !== '__unknown__'
-      && !chipCodes.some((c) => c.code === _skillsActiveCategory)) {
-    _skillsActiveCategory = '';
-  }
-  if (_skillsActiveCategory === '__unknown__' && !hasUnknownCategory) {
+  if (_skillsActiveCategory && !chipCodes.some((c) => c.code === _skillsActiveCategory)) {
     _skillsActiveCategory = '';
   }
 
@@ -387,11 +382,7 @@ function renderSkillsGrid(skills) {
 
   const filtered = skills.filter((s) => {
     if (_skillsActiveCategory === '') return true;
-    if (_skillsActiveCategory === '__unknown__') {
-      const code = canonicalCategoryCode(s && s.category);
-      return !code || !knownCodes.has(code);
-    }
-    return canonicalCategoryCode(s && s.category) === _skillsActiveCategory;
+    return _effectiveCategoryCode(s && s.category, knownCodes) === _skillsActiveCategory;
   });
 
   const cardHtml = (s) => {

@@ -59,17 +59,47 @@ function _agentPlatformChipsHtml(a) {
     const versionLabel = t('marketplace.version').replace('{version}', String(a.version));
     parts.push(`<span class="agent-card-chip is-version">${escapeHtml(versionLabel)}</span>`);
   }
-  if (a.category) {
-    const catLabel = _resolveCategoryLabel(a.category, lang);
-    parts.push(`<span class="agent-card-chip">${escapeHtml(catLabel)}</span>`);
-  }
+  const catLabel = _resolveCategoryLabel(a.category, lang);
+  parts.push(`<span class="agent-card-chip">${escapeHtml(catLabel)}</span>`);
   return parts.join('');
 }
 
-/** Shared category-code → localized label. Unknown codes stay hidden behind a user-facing
- *  fallback while marketplace.js schedules a throttled registry refresh. */
+function _generalCategoryLabel(lang) {
+  const code = 'general';
+  const list = (typeof _mpCategoriesCache !== 'undefined' && _mpCategoriesCache) || [];
+  const c = list.find((x) => {
+    const xCode = typeof _mpCanonicalCategoryCode === 'function' ? _mpCanonicalCategoryCode(x && x.code) : String(x && x.code || '').trim();
+    return xCode === code;
+  });
+  const label = c ? pickLocalizedName(c, lang) : '';
+  if (label) return label;
+  if (lang === 'zh') return '通用';
+  if (lang === 'ja') return '汎用';
+  return 'General';
+}
+
+function _knownCategoryCodes(cats) {
+  const canonicalCategoryCode = (code) => {
+    return typeof _mpCanonicalCategoryCode === 'function'
+      ? _mpCanonicalCategoryCode(code)
+      : String(code || '').trim();
+  };
+  return new Set(
+    (cats || []).map((c) => canonicalCategoryCode(c && c.code)).filter(Boolean),
+  );
+}
+
+function _effectiveCategoryCode(code, knownCodes) {
+  const canonical = typeof _mpCanonicalCategoryCode === 'function'
+    ? _mpCanonicalCategoryCode(code)
+    : String(code || '').trim();
+  return canonical && knownCodes.has(canonical) ? canonical : 'general';
+}
+
+/** Shared category-code → localized label. Missing or non-registry codes display as General
+ *  while marketplace.js schedules a throttled registry refresh for possible server drift. */
 function _resolveCategoryLabel(code, lang) {
-  if (!code) return '';
+  if (!code) return _generalCategoryLabel(lang);
   if (typeof _mpMaybeRefreshCategoriesForCodes === 'function') {
     _mpMaybeRefreshCategoriesForCodes([code]);
   }
@@ -79,7 +109,7 @@ function _resolveCategoryLabel(code, lang) {
     const xCode = typeof _mpCanonicalCategoryCode === 'function' ? _mpCanonicalCategoryCode(x && x.code) : String(x && x.code || '').trim();
     return xCode === canonical;
   });
-  if (!c) return typeof _mpUnknownCategoryLabel === 'function' ? _mpUnknownCategoryLabel() : 'Unknown';
+  if (!c) return _generalCategoryLabel(lang);
   return pickLocalizedName(c, lang) || code;
 }
 
@@ -260,8 +290,8 @@ function renderAgentsGrid(agents) {
     return (raw && raw !== 'marketplace.all') ? raw : 'All';
   })();
 
-  // Build the chip strip from the marketplace category cache + one fallback
-  // "Unknown" chip for both missing categories and non-registry category codes.
+  // Build the chip strip from the marketplace category cache. Missing categories
+  // and non-registry category codes are treated as General.
   // If the active selection no longer matches any agent (rare — agent moved
   // between categories mid-session), fall back to All so the body isn't empty.
   const canonicalCategoryCode = (code) => {
@@ -269,8 +299,14 @@ function renderAgentsGrid(agents) {
       ? _mpCanonicalCategoryCode(code)
       : String(code || '').trim();
   };
-  const codesPresent = new Set(agents.map((a) => canonicalCategoryCode(a && a.category)));
   const cats = (typeof _mpCategoriesCache !== 'undefined' && _mpCategoriesCache) || [];
+  const knownCodes = _knownCategoryCodes(cats);
+  const rawCodesPresent = new Set(agents.map((a) => canonicalCategoryCode(a && a.category)));
+  const unknownCodes = [...rawCodesPresent].filter((c) => c && !knownCodes.has(c)).sort();
+  if (unknownCodes.length && typeof _mpMaybeRefreshCategoriesForCodes === 'function') {
+    _mpMaybeRefreshCategoriesForCodes(unknownCodes);
+  }
+  const codesPresent = new Set([...rawCodesPresent].map((c) => _effectiveCategoryCode(c, knownCodes)));
   const chipCodes = [];
   const chipCodeSeen = new Set();
   for (const c of cats) {
@@ -279,24 +315,14 @@ function renderAgentsGrid(agents) {
     chipCodes.push({ code, label: pickLocalizedName(c, lang) || code });
     chipCodeSeen.add(code);
   }
-  const knownCodes = new Set(cats.map((c) => canonicalCategoryCode(c && c.code)).filter(Boolean));
-  const unknownCodes = [...codesPresent].filter((c) => c && !knownCodes.has(c)).sort();
-  if (unknownCodes.length && typeof _mpMaybeRefreshCategoriesForCodes === 'function') {
-    _mpMaybeRefreshCategoriesForCodes(unknownCodes);
+  if (codesPresent.has('general') && !chipCodeSeen.has('general')) {
+    chipCodes.push({ code: 'general', label: _generalCategoryLabel(lang) });
+    chipCodeSeen.add('general');
   }
-  const hasUnknownCategory = codesPresent.has('') || unknownCodes.length > 0;
-  if (hasUnknownCategory) {
-    chipCodes.push({
-      code: '__unknown__',
-      label: typeof _mpUnknownCategoryLabel === 'function' ? _mpUnknownCategoryLabel() : 'Unknown',
-    });
+  if (_agentsActiveCategory === '__uncategorized__' || _agentsActiveCategory === '__unknown__') {
+    _agentsActiveCategory = codesPresent.has('general') ? 'general' : '';
   }
-  if (_agentsActiveCategory === '__uncategorized__') _agentsActiveCategory = '__unknown__';
-  if (_agentsActiveCategory && _agentsActiveCategory !== '__unknown__'
-      && !chipCodes.some((c) => c.code === _agentsActiveCategory)) {
-    _agentsActiveCategory = '';
-  }
-  if (_agentsActiveCategory === '__unknown__' && !hasUnknownCategory) {
+  if (_agentsActiveCategory && !chipCodes.some((c) => c.code === _agentsActiveCategory)) {
     _agentsActiveCategory = '';
   }
 
@@ -322,11 +348,7 @@ function renderAgentsGrid(agents) {
 
   const filtered = agents.filter((a) => {
     if (_agentsActiveCategory === '') return true;
-    if (_agentsActiveCategory === '__unknown__') {
-      const code = canonicalCategoryCode(a && a.category);
-      return !code || !knownCodes.has(code);
-    }
-    return canonicalCategoryCode(a && a.category) === _agentsActiveCategory;
+    return _effectiveCategoryCode(a && a.category, knownCodes) === _agentsActiveCategory;
   });
 
   const cardHtml = (a) => {
@@ -665,12 +687,9 @@ function _renderSourceMetaHtml(item) {
     const versionLabel = t('marketplace.version').replace('{version}', String(item.version));
     parts.push(`<span class="agents-detail-source is-version">${escapeHtml(versionLabel)}</span>`);
   }
-  const catCode = String(item.category || '').trim();
-  if (catCode) {
-    const lang = (typeof getLang === 'function') ? getLang() : 'zh';
-    const label = _resolveCategoryLabel(catCode, lang);
-    parts.push(`<span class="agents-detail-source is-category">${escapeHtml(label)}</span>`);
-  }
+  const lang = (typeof getLang === 'function') ? getLang() : 'zh';
+  const label = _resolveCategoryLabel(item.category, lang);
+  parts.push(`<span class="agents-detail-source is-category">${escapeHtml(label)}</span>`);
   return parts.join('');
 }
 
