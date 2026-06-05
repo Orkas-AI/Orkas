@@ -24,9 +24,10 @@
 import { describe, it, expect } from 'vitest';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const utils = require('../../src/renderer/modules/utils.js');
-const { renderMarkdown, renderDashboard } = utils as {
+const { renderMarkdown, renderDashboard, _parseDashboardSpec } = utils as {
   renderMarkdown: (md: string) => string;
   renderDashboard: (spec: unknown) => string;
+  _parseDashboardSpec: (body: string) => unknown;
 };
 
 function fence(spec: unknown): string {
@@ -208,6 +209,49 @@ describe('renderDashboard — defensive / unknown shapes (set A safety)', () => 
   });
 });
 
+describe('_parseDashboardSpec — tolerant parse (matching + look-alike non-matching)', () => {
+  it('strict-valid JSON parses unchanged', () => {
+    expect(_parseDashboardSpec('{"root":{"type":"Separator"}}'))
+      .toEqual({ root: { type: 'Separator' } });
+  });
+
+  it('repair 1: one extra trailing `}` after the root close', () => {
+    expect(_parseDashboardSpec('{"a":1}\n}')).toEqual({ a: 1 });
+  });
+
+  it('repair 1: trailing prose after a complete object is dropped', () => {
+    expect(_parseDashboardSpec('{"a":1}\n\nhope this helps!')).toEqual({ a: 1 });
+  });
+
+  it('repair 2: truncated tail gets the missing closers appended (innermost first)', () => {
+    expect(_parseDashboardSpec('{"a":1,"b":[1,2')).toEqual({ a: 1, b: [1, 2] });
+  });
+
+  it('string-aware: a `}` inside a string value never shifts the depth count', () => {
+    // Without string-awareness the brace in the body would be counted as a
+    // close and the real extra `}` would be mis-located.
+    expect(_parseDashboardSpec('{"body":"done 100% } ok"}\n}'))
+      .toEqual({ body: 'done 100% } ok' });
+  });
+
+  it('escaped quote inside a string does not end the string early', () => {
+    expect(_parseDashboardSpec('{"q":"a\\"b"}\n}')).toEqual({ q: 'a"b' });
+  });
+
+  it('non-matching: leading non-JSON garbage is NOT repaired → undefined', () => {
+    expect(_parseDashboardSpec('not { valid: json }')).toBeUndefined();
+  });
+
+  it('non-matching: empty / whitespace body → undefined', () => {
+    expect(_parseDashboardSpec('   ')).toBeUndefined();
+    expect(_parseDashboardSpec('')).toBeUndefined();
+  });
+
+  it('non-matching: irreparable junk → undefined (caller shows fallback)', () => {
+    expect(_parseDashboardSpec('{{{')).toBeUndefined();
+  });
+});
+
 describe('renderMarkdown integration — set B (must not break existing surfaces)', () => {
   it(':::chart-bar still renders alongside :::dashboard', () => {
     const md = ':::chart-bar\n[{"label":"x","value":5}]\n:::\n\n:::dashboard\n' +
@@ -236,6 +280,23 @@ describe('renderMarkdown integration — set B (must not break existing surfaces
     expect(html).toContain('not { valid: json }');
     // and NO .dashboard wrapper was emitted
     expect(html).not.toMatch(/class="dashboard"/);
+  });
+
+  it('extra trailing `}` (the DeepSeek miscount) still renders the dashboard', () => {
+    // Reproduces the field report: a structurally complete tree with one
+    // surplus `}` after the root close. Strict JSON.parse rejects it; the
+    // repair drops the trailing brace so the Alert renders instead of
+    // collapsing to a raw code-view block.
+    const md = ':::dashboard\n' +
+      '{\n"schema_version": 1,\n' +
+      '"root": { "type": "Stack", "props": { "gap": "md" }, "children": [\n' +
+      '{ "type": "Alert", "props": { "level": "warning", "title": "Funding", "body": "x" } }\n' +
+      '] } }\n}\n:::';
+    const html = renderMarkdown(md);
+    expect(html).not.toContain('dashboard-parse-error');
+    expect(html).toMatch(/class="dashboard"/);
+    expect(html).toMatch(/data-level="warning"/);
+    expect(html).toContain('Funding');
   });
 
   it('unclosed :::dashboard at end of doc → not a dashboard, body kept', () => {

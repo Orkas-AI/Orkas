@@ -114,15 +114,14 @@ function renderMarkdownFull(md) {
   });
 
   // :::dashboard directives — JSON component tree → recursive HTML render.
-  // Malformed JSON falls back to a code-view block so the user sees the raw
-  // body instead of a silently-dropped section.
+  // `_parseDashboardSpec` is strict-first, then attempts bounded repairs for
+  // the brace miscounts LLMs reliably produce. Anything it still can't parse
+  // falls back to a code-view block so the user sees the raw body instead of
+  // a silently-dropped section.
   md = md.replace(/:::dashboard\s*\n([\s\S]*?)\n\s*:::/g, (_, body) => {
-    try {
-      const spec = JSON.parse(body.trim());
-      return protect(renderDashboard(spec));
-    } catch (e) {
-      return protect(`<pre class="code-view dashboard-parse-error"><code>${escapeHtml(body.trim())}</code></pre>`);
-    }
+    const spec = _parseDashboardSpec(body);
+    if (spec !== undefined) return protect(renderDashboard(spec));
+    return protect(`<pre class="code-view dashboard-parse-error"><code>${escapeHtml(body.trim())}</code></pre>`);
   });
 
   // Math blocks — protect so markdown phase 2 (emphasis, autolinking, html
@@ -393,6 +392,59 @@ const _DB_CHART_KIND = { line: 'line', bar: 'bar', area: 'area', pie: 'pie' };
 
 function _dbEnum(table, val, dflt) {
   return (val && Object.prototype.hasOwnProperty.call(table, val)) ? table[val] : dflt;
+}
+
+// Tolerant parse for a `:::dashboard` JSON body. LLMs (DeepSeek especially,
+// when hand-writing a deeply-nested tree) reliably miscount the trailing
+// brackets — a single extra `}` after the root close, trailing prose, or a
+// truncated tail with closers missing. Strict `JSON.parse` rejects all three
+// and the whole dashboard collapses to a raw code-view block. We retry with
+// two bounded repairs before giving up:
+//   1. drop trailing garbage after the root value's balanced close
+//      (the common "one extra }" / trailing-prose case)
+//   2. append the missing closers for an unclosed (truncated) tree
+// Returns the parsed spec, or `undefined` if nothing parses — the caller then
+// shows the parse-error fallback so the raw body is never silently dropped.
+// The scan is string-aware: brackets inside string values (e.g. an Alert body
+// containing `}`) never shift the depth count, and we never trim leading
+// garbage (over-repair risk) — only the trailing tail is dropped.
+function _parseDashboardSpec(body) {
+  const text = String(body == null ? '' : body).trim();
+  if (!text) return undefined;
+  try { return JSON.parse(text); } catch (_) { /* fall through to repair */ }
+
+  let inString = false;
+  let escaped = false;
+  let opened = false;
+  let balancedEnd = -1;
+  const stack = [];
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; continue; }
+    if (c === '{' || c === '[') { stack.push(c); opened = true; }
+    else if (c === '}' || c === ']') {
+      if (stack.length) stack.pop();
+      // First time the root value closes: everything after is trailing tail.
+      if (opened && stack.length === 0) { balancedEnd = i + 1; break; }
+    }
+  }
+
+  // Repair 1: a complete root value followed by trailing garbage (extra `}`).
+  if (balancedEnd > 0 && balancedEnd < text.length) {
+    try { return JSON.parse(text.slice(0, balancedEnd)); } catch (_) { /* try next */ }
+  }
+  // Repair 2: unclosed tree — append the closers it still needs, innermost first.
+  if (opened && stack.length && !inString) {
+    const closers = stack.reverse().map((c) => (c === '{' ? '}' : ']')).join('');
+    try { return JSON.parse(text + closers); } catch (_) { /* give up */ }
+  }
+  return undefined;
 }
 
 function renderDashboard(spec) {
@@ -1089,6 +1141,7 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     escapeHtml,
     renderMarkdown,
     renderDashboard,
+    _parseDashboardSpec,
     sanitizeMathExpressionForMathJax,
     _aiSelectNextZIndex,
   };
