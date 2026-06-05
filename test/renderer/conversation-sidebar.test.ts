@@ -766,3 +766,51 @@ describe('conversation auto recipient', () => {
     expect(context._pickInteractiveAgent(null, members, [])).toBeNull();
   });
 });
+
+describe('new chat quick-start scenarios', () => {
+  it('falls back to commander without toast when the scenario agent is missing', async () => {
+    const context = loadConversationRenderer();
+    const toasts: any[] = [];
+    let clickHandler: Function | null = null;
+    const input = {
+      value: '',
+      focused: false,
+      selection: [0, 0],
+      focus() { this.focused = true; },
+      setSelectionRange(start: number, end: number) { this.selection = [start, end]; },
+      dispatchEvent() {},
+    };
+    const chip = {
+      dataset: { scenario: 'education' },
+      addEventListener(type: string, fn: Function) {
+        if (type === 'click') clickHandler = fn;
+      },
+    };
+    const row = {
+      dataset: {},
+      querySelectorAll: () => [chip],
+    };
+
+    context._agentsCache = [];
+    context.uiToast = (...args: any[]) => toasts.push(args);
+    context.autoGrow = () => {};
+    context.Event = class {
+      type: string;
+      constructor(type: string) { this.type = type; }
+    };
+    context.document.getElementById = (id: string) => {
+      if (id === 'new-chat-scenarios') return row;
+      if (id === 'new-chat-input') return input;
+      return null;
+    };
+
+    context._initEmptyStateScenarios();
+    expect(clickHandler).toBeTruthy();
+    await clickHandler!();
+
+    expect(context.getChatRecipient('new-chat')).toMatchObject({ kind: 'commander' });
+    expect(input.value).toContain('Tutor me step by step');
+    expect(input.focused).toBe(true);
+    expect(toasts).toHaveLength(0);
+  });
+});

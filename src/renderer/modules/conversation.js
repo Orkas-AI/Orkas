@@ -706,12 +706,6 @@ function _scenarioFindAgent(config) {
   return list.find((a) => a && a.enabled !== false && names.includes(a.name || '')) || null;
 }
 
-function _scenarioExpectedAgentName(config) {
-  if (!config) return '';
-  const names = Array.isArray(config.agentNames) ? config.agentNames : [];
-  return names[0] || config.agentId || '';
-}
-
 async function _scenarioApplyAgent(config) {
   if (!config || typeof setChatRecipient !== 'function') return null;
   let agent = _scenarioFindAgent(config);
@@ -727,37 +721,22 @@ async function _scenarioApplyAgent(config) {
   }
   if (!agent) {
     setChatRecipient('new-chat', { kind: 'commander' });
-    const input = document.getElementById('new-chat-input');
-    if (input) {
-      input.value = '';
-      if (typeof autoGrow === 'function') autoGrow(input, 260);
-      try { input.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
-    }
-    if (typeof uiToast === 'function') {
-      const name = _scenarioExpectedAgentName(config);
-      const msg = t('new_chat.quick.agent_required', { name });
-      uiToast(
-        msg && msg !== 'new_chat.quick.agent_required'
-          ? msg
-          : `Install or enable ${name || 'this agent'} before using this shortcut.`,
-        { variant: 'warning', timeoutMs: 5200 },
-      );
-    }
-    return null;
+    return { kind: 'commander' };
   }
   setChatRecipient('new-chat', {
     kind: 'agent',
     id: agent.agent_id,
     name: agent.name || agent.agent_id,
   });
-  return agent;
+  return { kind: 'agent', agent };
 }
 
 // Scenario chips — bound once in init() (state.js calls into here via
 // _initEmptyStateScenarios). Click pre-fills the textarea with the per-chip
-// template, switches the new-chat recipient to the matching installed agent,
-// and moves the caret to the first `[...]` placeholder so the user keeps
-// typing the specific question, not editing scaffolding.
+// template, switches the new-chat recipient to the matching installed agent
+// when available (otherwise commander handles it), and moves the caret to
+// the first `[...]` placeholder so the user keeps typing the specific
+// question, not editing scaffolding.
 function _initEmptyStateScenarios() {
   const row = document.getElementById('new-chat-scenarios');
   if (!row || row.dataset.bound === '1') return;
@@ -770,8 +749,8 @@ function _initEmptyStateScenarios() {
       const raw = key ? t(key) : '';
       const tmpl = (raw && raw !== key) ? raw : (_SCENARIO_TEMPLATES_FALLBACK_EN[id] || '');
       if (!tmpl) return;
-      const agent = await _scenarioApplyAgent(config);
-      if (!agent) return;
+      const applied = await _scenarioApplyAgent(config);
+      if (!applied) return;
       const input = document.getElementById('new-chat-input');
       if (!input) return;
       input.value = tmpl;
