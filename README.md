@@ -10,9 +10,7 @@
 
 **Multi-agent collaboration · Self-evolving agents · Local-first storage · Cross-platform desktop app**
 
-<sub>multi-agent system · AI team · agent team · AI workflow · agents orchestration</sub>
-
-🌐 Want team collaboration, expert agents, and more? → [Pro edition](https://orkas.ai)
+🌐 Want multi-device sync, remote control, team collaboration, and more? → [Commercial edition](https://orkas.ai)
 
 > ⭐ If Orkas helps you build better AI workflows, please consider giving it a star — it helps more people find the project.
 
