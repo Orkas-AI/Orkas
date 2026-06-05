@@ -479,11 +479,14 @@ async function _installMarketplaceAgentLocked(
     // agent detail page; `content_sha` for the dev-mode local-edit guard in
     // `marketplace_reconcile._agentNeedsPull` (see that function's header).
     const installContentSha = sha256OfFile(agentJsonFile);
+    const installedAt = Date.now();
     await fsp.writeFile(path.join(target, '_install.json'),
       JSON.stringify({
         version: detail.version,
         published_at: detail.published_at,
         ...(typeof detail.updated_at === 'number' ? { updated_at: detail.updated_at } : {}),
+        agent_json_url: detail.agent_json_url,
+        installed_at: installedAt,
         create_uid: detail.create_uid || '',
         ...(typeof detail.default_install === 'boolean' ? { default_install: detail.default_install } : {}),
         ...(typeof detail.is_open_source === 'boolean' ? { is_open_source: detail.is_open_source } : {}),
@@ -497,6 +500,7 @@ async function _installMarketplaceAgentLocked(
       id: agentId, version: detail.version, published_at: detail.published_at,
       ...(typeof detail.updated_at === 'number' ? { updated_at: detail.updated_at } : {}),
       agent_json_url: detail.agent_json_url, create_uid: detail.create_uid || '',
+      installed_at: installedAt,
       ...(typeof detail.default_install === 'boolean' ? { default_install: detail.default_install } : {}),
       ...(detail.status ? { status: detail.status } : {}),
     });
@@ -569,11 +573,14 @@ async function _installMarketplaceSkillLocked(
     }
 
     const skillContentSha = sha256OfFile(path.join(target, 'SKILL.md'));
+    const installedAt = Date.now();
     await fsp.writeFile(path.join(target, '_install.json'),
       JSON.stringify({
         version: detail.version,
         published_at: detail.published_at,
         ...(typeof detail.updated_at === 'number' ? { updated_at: detail.updated_at } : {}),
+        bundle_url: detail.bundle_url,
+        installed_at: installedAt,
         create_uid: detail.create_uid || '',
         ...(typeof detail.default_install === 'boolean' ? { default_install: detail.default_install } : {}),
         ...(typeof detail.is_open_source === 'boolean' ? { is_open_source: detail.is_open_source } : {}),
@@ -587,6 +594,7 @@ async function _installMarketplaceSkillLocked(
       id: skillId, version: detail.version, published_at: detail.published_at,
       ...(typeof detail.updated_at === 'number' ? { updated_at: detail.updated_at } : {}),
       bundle_url: detail.bundle_url, create_uid: detail.create_uid || '',
+      installed_at: installedAt,
       ...(typeof detail.default_install === 'boolean' ? { default_install: detail.default_install } : {}),
       ...(detail.status ? { status: detail.status } : {}),
     });

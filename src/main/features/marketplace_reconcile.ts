@@ -19,6 +19,7 @@ import * as path from 'node:path';
 
 import {
   userMarketplaceAgentDir, userMarketplaceSkillDir,
+  userMarketplaceAgentsDir, userMarketplaceSkillsDir,
 } from '../paths';
 import { sha256OfFile } from '../util/sha256';
 import { clearAgentListCache } from './agents';
@@ -50,6 +51,18 @@ export interface ReconcileStatus {
   /** Wall-clock time of the last transition (ms). Banner uses this to decide whether to
    *  auto-hide after a delay. */
   updated_at: number;
+}
+
+export interface ReconcileResult {
+  pulled_agents: number;
+  pulled_skills: number;
+  failed: string[];
+  pruned_agents: number;
+  pruned_skills: number;
+  restored_agents: number;
+  restored_skills: number;
+  patched_agents: number;
+  patched_skills: number;
 }
 
 let _status: ReconcileStatus = { state: 'idle', total: 0, pulled: 0, failed: [], updated_at: Date.now() };
@@ -223,16 +236,30 @@ async function _fetchServerCatalogMap(kind: 'agents' | 'skills'): Promise<Map<st
 
 /** Read manifest + reconcile every entry in parallel. Returns counts for logging. Emits status
  *  updates through the subscribe channel so the renderer can show a "syncing" banner. */
-export async function reconcileInstalls(uid: string): Promise<{ pulled_agents: number; pulled_skills: number; failed: string[] }> {
-  const manifest = await readInstalls(uid);
+export async function reconcileInstalls(uid: string): Promise<ReconcileResult> {
+  let manifest = await readInstalls(uid);
+  const localConvergence = await _reconcileLocalOnlyInstalls(uid, manifest);
+  if (localConvergence.restored_agents > 0 || localConvergence.restored_skills > 0) {
+    manifest = await readInstalls(uid);
+  }
   // Filter pull-needed up front so the banner's total is meaningful (it counts work the user
   // will actually see, not entries that short-circuit).
   const agentsNeedingPull = manifest.agents.filter((r) => _agentNeedsPull(uid, r));
   const skillsNeedingPull = manifest.skills.filter((r) => _skillNeedsPull(uid, r));
+  const agentPullIds = new Set(agentsNeedingPull.map((r) => r.id));
+  const skillPullIds = new Set(skillsNeedingPull.map((r) => r.id));
+  const metadataPatches = await _patchLocalMetadataForManifest(uid, manifest, agentPullIds, skillPullIds);
   const total = agentsNeedingPull.length + skillsNeedingPull.length;
   if (total === 0) {
+    _clearCachesAfterConvergence(localConvergence, metadataPatches);
     _setStatus({ state: 'idle', total: 0, pulled: 0, failed: [], updated_at: Date.now() });
-    return { pulled_agents: 0, pulled_skills: 0, failed: [] };
+    return {
+      pulled_agents: 0,
+      pulled_skills: 0,
+      failed: [],
+      ...localConvergence,
+      ...metadataPatches,
+    };
   }
 
   _setStatus({ state: 'running', total, pulled: 0, failed: [], updated_at: Date.now() });
@@ -275,12 +302,150 @@ export async function reconcileInstalls(uid: string): Promise<{ pulled_agents: n
   if (pulled_agents > 0) {
     try { clearAgentListCache(); } catch { /* list cache may not be loaded yet */ }
   }
+  _clearCachesAfterConvergence(localConvergence, metadataPatches);
   _setStatus({
     state: 'done', total, pulled: pulled_agents + pulled_skills,
     failed, updated_at: Date.now(),
   });
   log.info(`reconciled: pulled ${pulled_agents} agent(s) + ${pulled_skills} skill(s); failed=${failed.length}`);
-  return { pulled_agents, pulled_skills, failed };
+  return {
+    pulled_agents,
+    pulled_skills,
+    failed,
+    ...localConvergence,
+    ...metadataPatches,
+  };
+}
+
+interface LocalConvergenceCounts {
+  pruned_agents: number;
+  pruned_skills: number;
+  restored_agents: number;
+  restored_skills: number;
+}
+
+interface MetadataPatchCounts {
+  patched_agents: number;
+  patched_skills: number;
+}
+
+function _clearCachesAfterConvergence(local: LocalConvergenceCounts, meta: MetadataPatchCounts): void {
+  if (local.pruned_agents || local.restored_agents || meta.patched_agents) {
+    try { clearAgentListCache(); } catch { /* list cache may not be loaded yet */ }
+  }
+  if (local.pruned_skills || local.restored_skills || meta.patched_skills) {
+    try { clearSkillListCache(); } catch { /* list cache may not be loaded yet */ }
+    try { invalidateCoreAgentSkills(); } catch { /* runner may not be loaded yet */ }
+  }
+}
+
+async function _reconcileLocalOnlyInstalls(uid: string, manifest: Awaited<ReturnType<typeof readInstalls>>): Promise<LocalConvergenceCounts> {
+  const counts: LocalConvergenceCounts = {
+    pruned_agents: 0,
+    pruned_skills: 0,
+    restored_agents: 0,
+    restored_skills: 0,
+  };
+  const manifestAgents = new Set(manifest.agents.map((a) => a.id));
+  const manifestSkills = new Set(manifest.skills.map((s) => s.id));
+  for (const id of _localInstallIds(userMarketplaceAgentsDir(uid))) {
+    if (manifestAgents.has(id)) continue;
+    const dir = userMarketplaceAgentDir(uid, id);
+    const meta = _readInstallMeta(dir);
+    const tombstone = manifest._deleted_at?.agents?.[id] || 0;
+    const activeAt = _localInstallActiveAt(dir, meta);
+    if (tombstone > 0 && tombstone >= activeAt) {
+      await fsp.rm(dir, { recursive: true, force: true });
+      counts.pruned_agents++;
+      log.info(`pruned local-only marketplace agent ${id} (manifest tombstone wins)`);
+      continue;
+    }
+    if (_canRestoreAgentInstall(meta)) {
+      await addAgentInstall(uid, {
+        id,
+        version: meta.version,
+        published_at: meta.published_at,
+        ...(typeof meta.updated_at === 'number' ? { updated_at: meta.updated_at } : {}),
+        agent_json_url: meta.agent_json_url!,
+        installed_at: meta.installed_at!,
+        create_uid: meta.create_uid || '',
+        ...(typeof meta.default_install === 'boolean' ? { default_install: meta.default_install } : {}),
+        ...(meta.status ? { status: meta.status } : {}),
+      });
+      counts.restored_agents++;
+      log.info(`restored local-only marketplace agent ${id} into installs manifest`);
+    }
+  }
+  for (const id of _localInstallIds(userMarketplaceSkillsDir(uid))) {
+    if (manifestSkills.has(id)) continue;
+    const dir = userMarketplaceSkillDir(uid, id);
+    const meta = _readInstallMeta(dir);
+    const tombstone = manifest._deleted_at?.skills?.[id] || 0;
+    const activeAt = _localInstallActiveAt(dir, meta);
+    if (tombstone > 0 && tombstone >= activeAt) {
+      await fsp.rm(dir, { recursive: true, force: true });
+      counts.pruned_skills++;
+      log.info(`pruned local-only marketplace skill ${id} (manifest tombstone wins)`);
+      continue;
+    }
+    if (_canRestoreSkillInstall(meta)) {
+      await addSkillInstall(uid, {
+        id,
+        version: meta.version,
+        published_at: meta.published_at,
+        ...(typeof meta.updated_at === 'number' ? { updated_at: meta.updated_at } : {}),
+        bundle_url: meta.bundle_url!,
+        installed_at: meta.installed_at!,
+        create_uid: meta.create_uid || '',
+        ...(typeof meta.default_install === 'boolean' ? { default_install: meta.default_install } : {}),
+        ...(meta.status ? { status: meta.status } : {}),
+      });
+      counts.restored_skills++;
+      log.info(`restored local-only marketplace skill ${id} into installs manifest`);
+    }
+  }
+  return counts;
+}
+
+async function _patchLocalMetadataForManifest(
+  uid: string,
+  manifest: Awaited<ReturnType<typeof readInstalls>>,
+  agentPullIds: Set<string>,
+  skillPullIds: Set<string>,
+): Promise<MetadataPatchCounts> {
+  const counts: MetadataPatchCounts = { patched_agents: 0, patched_skills: 0 };
+  for (const row of manifest.agents) {
+    if (agentPullIds.has(row.id) || !_agentContentExists(uid, row.id)) continue;
+    const dir = userMarketplaceAgentDir(uid, row.id);
+    const meta = _readInstallMeta(dir);
+    if (!meta) continue;
+    const patch = _installMetaFromAgentRow(row);
+    if (!_installMetaMatches(meta, patch)) {
+      await _writeInstallMeta(dir, { ...meta, ...patch });
+      counts.patched_agents++;
+    }
+  }
+  for (const row of manifest.skills) {
+    if (skillPullIds.has(row.id) || !_skillContentExists(uid, row.id)) continue;
+    const dir = userMarketplaceSkillDir(uid, row.id);
+    const meta = _readInstallMeta(dir);
+    if (!meta) continue;
+    const patch = _installMetaFromSkillRow(row);
+    if (!_installMetaMatches(meta, patch)) {
+      await _writeInstallMeta(dir, { ...meta, ...patch });
+      counts.patched_skills++;
+    }
+  }
+  return counts;
+}
+
+function _localInstallIds(root: string): string[] {
+  try {
+    return fs.readdirSync(root, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+      .map((e) => e.name)
+      .sort();
+  } catch { return []; }
 }
 
 /** Need-pull check: missing dir / missing agent.json / `_install.json::version` mismatch.
@@ -338,8 +503,12 @@ interface InstallMeta {
   version: string;
   published_at: number;
   updated_at?: number;
+  agent_json_url?: string;
+  bundle_url?: string;
+  installed_at?: number;
   create_uid?: string;
   default_install?: boolean;
+  is_open_source?: boolean;
   status?: string;
   state?: string;
   /** sha256 (hex) of the spec's descriptive file at install / upload time —
@@ -352,6 +521,67 @@ function _freshnessAt(row: { published_at: number; updated_at?: number }): numbe
   return typeof row.updated_at === 'number' ? row.updated_at : row.published_at;
 }
 
+function _installStatus(row: { status?: string; state?: string }): string {
+  return (row.status || row.state || '').trim();
+}
+
+function _installActiveAt(dir: string, row: InstallMeta | AgentInstall | SkillInstall | null): number {
+  const installedAt = typeof row?.installed_at === 'number' ? row.installed_at : 0;
+  const freshness = row ? _freshnessAt(row) : 0;
+  if (installedAt > 0 || freshness > 0) return Math.max(installedAt, freshness);
+  try { return fs.statSync(dir).mtimeMs; } catch { return 0; }
+}
+
+function _localInstallActiveAt(dir: string, meta: InstallMeta | null): number {
+  return _installActiveAt(dir, meta);
+}
+
+function _canRestoreAgentInstall(meta: InstallMeta | null): meta is InstallMeta & { agent_json_url: string; installed_at: number } {
+  return !!meta
+    && typeof meta.agent_json_url === 'string' && meta.agent_json_url.length > 0
+    && typeof meta.installed_at === 'number' && meta.installed_at > 0;
+}
+
+function _canRestoreSkillInstall(meta: InstallMeta | null): meta is InstallMeta & { bundle_url: string; installed_at: number } {
+  return !!meta
+    && typeof meta.bundle_url === 'string' && meta.bundle_url.length > 0
+    && typeof meta.installed_at === 'number' && meta.installed_at > 0;
+}
+
+function _installMetaFromAgentRow(row: AgentInstall): Partial<InstallMeta> {
+  return {
+    version: row.version,
+    published_at: row.published_at,
+    ...(typeof row.updated_at === 'number' ? { updated_at: row.updated_at } : {}),
+    agent_json_url: row.agent_json_url,
+    installed_at: row.installed_at,
+    create_uid: row.create_uid || '',
+    ...(typeof row.default_install === 'boolean' ? { default_install: row.default_install } : {}),
+    ...(_installStatus(row) ? { status: _installStatus(row) } : {}),
+  };
+}
+
+function _installMetaFromSkillRow(row: SkillInstall): Partial<InstallMeta> {
+  return {
+    version: row.version,
+    published_at: row.published_at,
+    ...(typeof row.updated_at === 'number' ? { updated_at: row.updated_at } : {}),
+    bundle_url: row.bundle_url,
+    installed_at: row.installed_at,
+    create_uid: row.create_uid || '',
+    ...(typeof row.default_install === 'boolean' ? { default_install: row.default_install } : {}),
+    ...(_installStatus(row) ? { status: _installStatus(row) } : {}),
+  };
+}
+
+function _installMetaMatches(meta: InstallMeta, expected: Partial<InstallMeta>): boolean {
+  for (const [key, value] of Object.entries(expected) as Array<[keyof InstallMeta, unknown]>) {
+    if (value === undefined) continue;
+    if (meta[key] !== value) return false;
+  }
+  return true;
+}
+
 function _readInstallMeta(dir: string): InstallMeta | null {
   const f = path.join(dir, '_install.json');
   if (!fs.existsSync(f)) return null;
@@ -362,8 +592,12 @@ function _readInstallMeta(dir: string): InstallMeta | null {
       version: j.version,
       published_at: j.published_at,
       ...(typeof j.updated_at === 'number' ? { updated_at: j.updated_at } : {}),
+      agent_json_url: typeof j.agent_json_url === 'string' ? j.agent_json_url : '',
+      bundle_url: typeof j.bundle_url === 'string' ? j.bundle_url : '',
+      ...(typeof j.installed_at === 'number' ? { installed_at: j.installed_at } : {}),
       create_uid: typeof j.create_uid === 'string' ? j.create_uid : '',
       ...(typeof j.default_install === 'boolean' ? { default_install: j.default_install } : {}),
+      ...(typeof j.is_open_source === 'boolean' ? { is_open_source: j.is_open_source } : {}),
       ...(typeof j.status === 'string' ? { status: j.status } : (
         typeof j.state === 'string' ? { status: j.state } : {}
       )),
@@ -430,6 +664,8 @@ async function _pullAgentLocked(uid: string, row: AgentInstall): Promise<void> {
   await _writeInstallMeta(dir, {
     version: current.version, published_at: current.published_at,
     ...(typeof current.updated_at === 'number' ? { updated_at: current.updated_at } : {}),
+    agent_json_url: current.agent_json_url,
+    installed_at: current.installed_at,
     create_uid: current.create_uid || '',
     ...(typeof current.default_install === 'boolean' ? { default_install: current.default_install } : {}),
     ...((current.status || current.state) ? { status: current.status || current.state } : {}),
@@ -489,6 +725,8 @@ async function _pullSkillLocked(uid: string, row: SkillInstall): Promise<void> {
   await _writeInstallMeta(dir, {
     version: current.version, published_at: current.published_at,
     ...(typeof current.updated_at === 'number' ? { updated_at: current.updated_at } : {}),
+    bundle_url: current.bundle_url,
+    installed_at: current.installed_at,
     create_uid: current.create_uid || '',
     ...(typeof current.default_install === 'boolean' ? { default_install: current.default_install } : {}),
     ...((current.status || current.state) ? { status: current.status || current.state } : {}),
