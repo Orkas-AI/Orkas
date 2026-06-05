@@ -250,7 +250,6 @@ async function initUser() {
 function setView(view, cid, opts = {}) {
   if (currentView !== view || (view === 'conversation' && currentCid !== cid)) {
     _bootLog.info('view change', { view, cid: cid || undefined });
-    }
   }
   currentView = view;
   _saveLastView(view, cid);
@@ -404,3 +403,4 @@ function setView(view, cid, opts = {}) {
     currentCid = null;
   }
   if (typeof renderProjectsSection === 'function') renderProjectsSection();
+}

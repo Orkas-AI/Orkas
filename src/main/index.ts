@@ -36,11 +36,8 @@ import { app, BrowserWindow, Menu, ipcMain, nativeImage, protocol, session, shel
 // container, runs the one-shot PC/data → <container>/data migration, and
 // sets process.env.ORKAS_WORKSPACE_ROOT. Must be the FIRST project import
 // — any module loaded before this would not see the env var. See
-// install-data-root.ts header for why the side effect lives at load time
-// rather than in index.ts body (esbuild CJS hoists imports → body runs
-// after paths.ts loads, which is too late to set the env var).
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-require('./install-data-root.cjs');
+// install-data-root.cjs header for why the side effect lives at load time.
+import './install-data-root.cjs';
 
 // Force the user-visible app name to "Orkas" before anything else
 // reads it. In dev (running `electron .`) Electron defaults to the
