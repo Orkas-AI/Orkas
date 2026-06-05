@@ -149,7 +149,7 @@
   "sidebar.commander_running": "{n} running",
   "chat.header.details": "Details",
   "chat.header.running_pill": "Running",
-  "chat.header.agent_count": "{n} agents",
+  "chat.header.agent_count": "{n} エージェント",
   "chat.new_conv_title": "新規タスク",
   "plan.strip.expand": "Details",
   "plan.strip.expand_title": "Open conversation details",

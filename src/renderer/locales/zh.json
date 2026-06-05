@@ -159,7 +159,7 @@
   "sidebar.commander_running": "{n} 在执行",
   "chat.header.details": "详情",
   "chat.header.running_pill": "执行中",
-  "chat.header.agent_count": "{n} 个 agent",
+  "chat.header.agent_count": "{n} 个智能体",
   "chat.new_conv_title": "新任务",
   "plan.strip.expand": "展开详情",
   "plan.strip.expand_title": "打开会话详情",
