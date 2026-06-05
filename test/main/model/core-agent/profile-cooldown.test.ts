@@ -7,7 +7,6 @@ import {
   listCooldowns,
   _clearAll,
   DEFAULT_COOLDOWN_MS,
-  NETWORK_COOLDOWN_MS,
 } from '../../../../src/main/model/core-agent/profile-cooldown';
 
 describe('profile-cooldown', () => {
@@ -79,16 +78,9 @@ describe('profile-cooldown', () => {
     expect(DEFAULT_COOLDOWN_MS).toBe(10 * 60 * 1000);
   });
 
-  it('network kind 默认走 NETWORK_COOLDOWN_MS（30 秒）而非 10 分钟', () => {
+  it('network kind 不进入 cooldown（下一次请求应重新尝试）', () => {
     markCooldown('p1', 'network', 'ECONNRESET');
-    const entry = getCooldown('p1');
-    expect(entry?.cooledUntil).toBeGreaterThan(Date.now());
-    // 30 秒 + 1 ms 之后应该已经过期；如果错按 DEFAULT_COOLDOWN_MS 那 30 秒是远不够的
-    vi.advanceTimersByTime(NETWORK_COOLDOWN_MS + 1);
     expect(isCooledDown('p1')).toBe(false);
-  });
-
-  it('NETWORK_COOLDOWN_MS 是 30 秒（实施口径）', () => {
-    expect(NETWORK_COOLDOWN_MS).toBe(30 * 1000);
+    expect(getCooldown('p1')).toBeUndefined();
   });
 });

@@ -32,7 +32,7 @@ const _tveLog = createLogger('text-view-edit');
  * Optional: opts.initialContent (skips the initial read), opts.initialMode
  *           ('view' default), opts.actionIconOnly, opts.capabilities
  *           ({ edit, save } — defaults true; pass { edit: false } to lock
- *           read-only for project files etc.), opts.callbacks
+ *           read-only for Project Library files etc.), opts.callbacks
  *           ({ onDirtyChange, onSaved, onContentLoaded }).
  *
  * Returns a noop-shell controller on misuse rather than throwing — the
@@ -140,24 +140,6 @@ function _tveRender(state) {
   if (state.destroyed) return;
   if (state.mode === 'edit') _tveRenderEditor(state);
   else _tveRenderView(state);
-}
-
-function _tveRenderView(state) {
-  state.mode = 'view';
-  state.bodyEl.innerHTML = `<pre class="chat-file-viewer-text">${escapeHtml(state.content)}</pre>`;
-  const actions = [];
-  if (state.caps.edit) actions.push(_tveActionButton(state, 'edit', 'contexts.viewer.edit', 'pencil'));
-  state.actionsEl.innerHTML = actions.join('');
-  state.actionsEl.querySelector('[data-tve-action="edit"]')?.addEventListener('click', () => _tveEnterEdit(state));
-  _tveEmitDirty(state);
-}
-
-function _tveEnterEdit(state) {
-  if (!state.caps.edit) return;
-  state.mode = 'edit';
-  state.draft = state.content;
-  _tveRenderEditor(state);
-  _tveEmitDirty(state);
 }
 
 function _tveRenderEditor(state) {

@@ -141,6 +141,36 @@ function _splitMarkdownProseCode(text) {
   return segs;
 }
 
+function _replaceUnclosedDashboardBlocks(buf, placeholder) {
+  if (!buf || String(buf).indexOf(':::dashboard') < 0) return buf;
+  const ph = placeholder || '';
+  const processProse = (s) => {
+    if (!s || s.indexOf(':::dashboard') < 0) return s;
+    const openRe = /(^|\n)[ \t]*:::dashboard[ \t]*\r?\n/g;
+    let out = '';
+    let cursor = 0;
+    let m;
+    while ((m = openRe.exec(s)) !== null) {
+      const openStart = m.index + (m[1] ? 1 : 0);
+      const bodyStart = openRe.lastIndex;
+      const tail = s.slice(bodyStart);
+      const close = /\n[ \t]*:::[ \t]*(?=\r?\n|$)/.exec(tail);
+      if (!close) {
+        out += s.slice(cursor, openStart) + ph;
+        return out;
+      }
+      const closeEnd = bodyStart + close.index + close[0].length;
+      out += s.slice(cursor, closeEnd);
+      cursor = closeEnd;
+      openRe.lastIndex = closeEnd;
+    }
+    return out + s.slice(cursor);
+  };
+  return _splitMarkdownProseCode(String(buf))
+    .map((seg) => seg.kind === 'prose' ? processProse(seg.text) : seg.text)
+    .join('');
+}
+
 function _isInsideQuotedSpanOnLine(text, idx) {
   const lineStart = text.lastIndexOf('\n', Math.max(0, idx - 1)) + 1;
   const nextNl = text.indexOf('\n', idx);
@@ -446,9 +476,12 @@ function _collapseRepeatedStructuralPlaceholders(buf, placeholder) {
   return collapsed.replace(/\n{3,}/g, '\n\n');
 }
 
+const SKILL_META_TAG_RE = /<(?:name|description_zh|description_en|category)>[\s\S]*?<\/(?:name|description_zh|description_en|category)>\s*/g;
+
 // Streaming-time strip for the commander's `<skill>` container. Two modes:
 //   - **Closed** `<skill>...</skill>` → strip outer tags + any `<skill_id>`
-//     sub-tag, keep the inner content. The inner `<<<skill-file>>>` blocks
+//     / metadata sub-tags, keep the visible write placeholders. The inner
+//     `<<<skill-file>>>` blocks
 //     have already been transformed into per-file placeholders by an
 //     earlier pipeline pass; surfacing those gives the user "Writing X…"
 //     progress that matches the per-skill edit chat.
@@ -472,7 +505,8 @@ function _stripSkillCreateContainer(buf, fallbackPlaceholder) {
       const inner = block
         .replace(/^<skill>\s*/, '')
         .replace(/\s*<\/skill>$/, '')
-        .replace(/<skill_id>[\s\S]*?<\/skill_id>\s*/g, '');
+        .replace(/<skill_id>[\s\S]*?<\/skill_id>\s*/g, '')
+        .replace(SKILL_META_TAG_RE, '');
       // The normal streaming pipeline replaces `<<<skill-file>>>` blocks
       // before this function runs. Some models wrap those machine blocks
       // inside a Markdown fence or otherwise leave one behind before this
@@ -480,7 +514,8 @@ function _stripSkillCreateContainer(buf, fallbackPlaceholder) {
       // surrounding `<skill>` container tells us this is real machine output.
       // Inside a real container there are no user-visible examples: any
       // surviving skill-file block is machine output and must be hidden.
-      out += _replaceAnySkillFileBlocks(inner, fallbackPlaceholder);
+      const visible = _replaceAnySkillFileBlocks(inner, fallbackPlaceholder).trim();
+      out += visible || fallbackPlaceholder;
     } else {
       out += fallbackPlaceholder;
     }
@@ -496,7 +531,7 @@ function _stripSurvivingStructuralBlocks(text) {
   // `artifact-result` and `marketplace-install-result` are user→system result
   // tags (user-side render strips them); included here so they are also
   // removed if they ever leak into assistant text (LLM quoting / hallucination).
-  for (const tag of ['agent', 'agent-input-form', 'agent-input-submission', 'artifact-result', 'marketplace-install-result', 'skill']) {
+  for (const tag of ['agent', 'agent-input-form', 'agent-input-submission', 'artifact-result', 'marketplace-install-result', 'skill', 'skill-meta']) {
     out = _stripOuterTagBlocks(out, tag);
   }
   // `<<<skill-file>>>` blocks: backend `extractSkillFileBlocks` strips them
@@ -613,6 +648,7 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     _replaceOuterSkillFileBlocks,
     _extractSkillFilePath,
     _stripSkillCreateContainer,
+    _replaceUnclosedDashboardBlocks,
     _stripSurvivingStructuralBlocks,
     _stripSubmissionRoutingMentionForDisplay,
     _stripUserStructuralBlocksForDisplay,

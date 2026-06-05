@@ -2,6 +2,7 @@ import type { MessageContent } from "../shared/types.js";
 import {
   AuthError,
   ContextOverflowError,
+  classifyRetryableError,
   isRetryableError,
   RateLimitError,
   TimeoutError,
@@ -21,6 +22,19 @@ import { Session } from "./session.js";
 import type { AgentRunParams, AgentRunResult, AgentRunMeta, AgentRunEvent } from "./types.js";
 
 const log = createLogger("agent-runner");
+const RETRY_BASE_DELAY_MS = 1_000;
+const RETRY_MAX_DELAY_MS = 30_000;
+const RETRY_AFTER_MAX_DELAY_MS = 120_000;
+const RETRY_JITTER_RATIO = 0.2;
+
+function retryDelayMs(err: unknown, attempt: number): number {
+  if (err instanceof RateLimitError && err.retryAfterMs) {
+    return Math.min(Math.max(0, err.retryAfterMs), RETRY_AFTER_MAX_DELAY_MS);
+  }
+  const base = Math.min(RETRY_BASE_DELAY_MS * 2 ** attempt, RETRY_MAX_DELAY_MS);
+  const jitter = Math.floor(base * RETRY_JITTER_RATIO * Math.random());
+  return base + jitter;
+}
 
 /**
  * AgentRunner is the core agent execution harness.
@@ -222,6 +236,8 @@ export class AgentRunner {
             streamText += ev.text;
             // Forward to callers so UI can render incrementally.
             yield { type: "text_delta", text: ev.text };
+          } else if (ev.type === "retry") {
+            yield { type: "retry", attempt: ev.attempt, reason: ev.reason };
           } else if (ev.type === "message_end") {
             streamStopReason = ev.stopReason;
             if (ev.usage) {
@@ -432,12 +448,11 @@ export class AgentRunner {
           }
         }
 
-        if (isRetryableError(err) && attempt < maxRetries) {
-          const waitMs = err instanceof RateLimitError && err.retryAfterMs
-            ? err.retryAfterMs
-            : Math.min(1000 * 2 ** attempt, 30_000);
+        const retryKind = classifyRetryableError(err);
+        if (retryKind && attempt < maxRetries) {
+          const waitMs = retryDelayMs(err, attempt);
           const reason = formatError(err);
-          log.warn(`Retryable error (attempt ${attempt + 1}/${maxRetries}): ${reason}, waiting ${waitMs}ms`);
+          log.warn(`Retryable ${retryKind} error (attempt ${attempt + 1}/${maxRetries}): ${reason}, waiting ${waitMs}ms`);
           yield { type: "retry", attempt: attempt + 1, reason };
           await sleep(waitMs);
           continue;

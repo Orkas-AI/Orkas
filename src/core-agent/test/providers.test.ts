@@ -36,7 +36,7 @@ describe("Providers (pi-ai backed)", () => {
 
   describe("createPiProvider", () => {
     it("creates a provider for any pi-ai supported provider", () => {
-      const provider = createPiProvider({ provider: "anthropic", model: "claude-sonnet-4-20250514" });
+      const provider = createPiProvider({ provider: "anthropic", model: "claude-opus-4-8" });
       expect(provider.id).toBe("anthropic");
     });
 
@@ -104,15 +104,15 @@ describe("Providers (pi-ai backed)", () => {
 
     it("resolves provider from model string with slash", () => {
       const registry = new ProviderRegistry();
-      const resolved = registry.resolveForModel("anthropic/claude-sonnet-4-20250514");
+      const resolved = registry.resolveForModel("anthropic/claude-opus-4-8");
       expect(resolved).toBeDefined();
       expect(resolved?.provider.id).toBe("anthropic");
-      expect(resolved?.modelId).toBe("claude-sonnet-4-20250514");
+      expect(resolved?.modelId).toBe("claude-opus-4-8");
     });
 
     it("resolves anthropic provider for claude- prefixed models", () => {
       const registry = new ProviderRegistry();
-      const resolved = registry.resolveForModel("claude-sonnet-4-20250514");
+      const resolved = registry.resolveForModel("claude-opus-4-8");
       expect(resolved).toBeDefined();
       expect(resolved?.provider.id).toBe("anthropic");
     });

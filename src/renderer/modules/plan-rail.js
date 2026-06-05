@@ -6,8 +6,8 @@
  * Responsibilities:
  *   - Render every step with status icon + index + title + assignee
  *   - Show progress count `done/total` in the header
- *   - On `failed` steps (and only when state.in_flight is empty),
- *     surface retry / skip / abort actions wired to IPC
+ *   - Surface the unified plan-level stop / continue control supplied by
+ *     the backend (step-level retry / skip actions are intentionally absent)
  *   - On `pending` steps with `transient_attempts > 0`, render a small
  *     retry badge so users see the auto-retry in flight (otherwise the
  *     transient retry would silently look like the step is just stuck)
@@ -42,96 +42,10 @@ let _currentInFlight = [];
 let _refreshInflight = null;  // dedup overlapping refresh requests
 let _refreshSeq = 0;          // invalidate stale forced refresh responses
 let _lastPlan = null;
-const _stepActionRequests = new Set();
-
-function _isStepActionable(step, inFlight) {
-  return step.status === 'failed' && (!inFlight || inFlight.length === 0);
-}
-
-function _stepActionKey(cid, stepIndex) {
-  return `${cid || ''}:${Number(stepIndex) || 0}`;
-}
-
-function _hasStepActionRequest(step) {
-  if (!_currentCid || !step) return false;
-  return _stepActionRequests.has(_stepActionKey(_currentCid, step.index));
-}
-
-function _setStepActionRequest(cid, stepIndex, pending) {
-  const key = _stepActionKey(cid, stepIndex);
-  if (pending) _stepActionRequests.add(key);
-  else _stepActionRequests.delete(key);
-}
-
-function _clearStepActionRequests(cid) {
-  const prefix = `${cid || ''}:`;
-  for (const key of Array.from(_stepActionRequests)) {
-    if (!cid || key.startsWith(prefix)) _stepActionRequests.delete(key);
-  }
-}
-
-function _pruneStepActionRequests(plan) {
-  if (!_currentCid || !plan || !Array.isArray(plan.steps)) return;
-  const liveSteps = new Set(
-    plan.steps
-      .filter(Boolean)
-      .map((s) => _stepActionKey(_currentCid, s.index)),
-  );
-  const prefix = `${_currentCid}:`;
-  for (const key of Array.from(_stepActionRequests)) {
-    if (key.startsWith(prefix) && !liveSteps.has(key)) _stepActionRequests.delete(key);
-  }
-}
-
-function _lockRenderedStepActions(stepEl) {
-  if (!stepEl) return;
-  stepEl.querySelectorAll('[data-action]').forEach((el) => {
-    el.disabled = true;
-    el.setAttribute('aria-disabled', 'true');
-  });
-}
-
-function _applyOptimisticStepStatus(cid, stepIndex, status, patch = {}) {
-  if (!cid || cid !== _currentCid || !_lastPlan || !Array.isArray(_lastPlan.steps)) return;
-  const steps = _lastPlan.steps.map((step) => {
-    if (!step || Number(step.index) !== Number(stepIndex)) return step;
-    return { ...step, ...patch, status };
-  });
-  _render({ ..._lastPlan, steps });
-}
+let _lastControl = null;
 
 function _rerenderCachedPlan() {
-  if (_lastPlan) _render(_lastPlan);
-}
-
-function _beginStepAction(cid, stepIndex, stepEl, optimistic = null) {
-  _setStepActionRequest(cid, stepIndex, true);
-  // A recovery click changes the local interaction contract immediately:
-  // any older plan fetch that resolves after this point must not repaint the
-  // failed row and resurrect retry / skip / abort while the POST is in flight.
-  _refreshSeq += 1;
-  _refreshInflight = null;
-  _lockRenderedStepActions(stepEl);
-  if (optimistic && optimistic.status) {
-    _applyOptimisticStepStatus(cid, stepIndex, optimistic.status, optimistic.patch || {});
-  } else {
-    _rerenderCachedPlan();
-  }
-}
-
-async function _finishStepAction(cid, stepIndex, opts = {}) {
-  const refreshPromise = PlanRail.refresh(cid, { force: true });
-  if (opts.refreshInfo) _refreshConversationInfo(cid);
-  if (opts.clearAfterRefresh) {
-    try { await refreshPromise; }
-    finally {
-      _setStepActionRequest(cid, stepIndex, false);
-      if (cid === _currentCid) _rerenderCachedPlan();
-    }
-    return;
-  }
-  _setStepActionRequest(cid, stepIndex, false);
-  if (opts.rerender && cid === _currentCid) _rerenderCachedPlan();
+  if (_lastPlan) _render(_lastPlan, _lastControl);
 }
 
 function _refreshConversationInfo(cid) {
@@ -152,31 +66,25 @@ function _cancelConversationRecoveryStream(handle) {
   catch (_) {}
 }
 
-async function _postStepAction(cid, stepIndex, action) {
-  const res = await apiFetch(
-    `/api/conversations/${encodeURIComponent(cid)}/plan/steps/${stepIndex}/${action}`,
-    { method: 'POST' },
-  );
-  return res.json().catch(() => ({}));
-}
-
 function _alertStepActionFailure(action, reason) {
   const normalized = reason || 'unknown';
-  if (action === 'retry') {
-    uiAlert(t('plan.error.retry_failed', { reason: normalized }) || `Retry failed: ${normalized}`);
-  } else if (action === 'skip') {
-    uiAlert(t('plan.error.skip_failed', { reason: normalized }) || `Skip failed: ${normalized}`);
-  } else if (action === 'abort') {
-    uiAlert(t('plan.error.abort_failed', { reason: normalized }) || `Abort failed: ${normalized}`);
+  if (action === 'continue') {
+    uiAlert(t('plan.error.continue_failed', { reason: normalized }) || `Continue failed: ${normalized}`);
+  } else if (action === 'stop') {
+    uiAlert(t('plan.error.stop_failed', { reason: normalized }) || `Stop failed: ${normalized}`);
   }
 }
 
 function _formatAssigneeMeta(raw) {
   const a = (raw || '').trim();
   if (!a) return '';
-  // Mirror plan.ts::formatPlanAnnouncement (commander/user are role tokens, not @-mentions).
-  if (a === 'commander') return `<div class="plan-rail-step-meta">${escapeHtml(t('chat.recipient_commander'))}</div>`;
-  if (a === 'user')      return `<div class="plan-rail-step-meta">${escapeHtml(t('chat.from_user'))}</div>`;
+  // `user` / `用户` collapse into commander semantically: a plan step asking
+  // the user for input is really commander driving the interaction. The human
+  // is never a worker in the orchestration model, so don't surface "@用户"
+  // — mirror `conversation-info.js::_resolveAssigneeAvatar` exactly.
+  if (a === 'commander' || a === 'user' || a === '用户') {
+    return `<div class="plan-rail-step-meta">${escapeHtml(t('chat.recipient_commander'))}</div>`;
+  }
   return `<div class="plan-rail-step-meta">@${escapeHtml(a)}</div>`;
 }
 
@@ -196,14 +104,6 @@ function _buildStepHtml(step) {
   const reason = step.failure_reason
     ? `<div class="plan-rail-step-reason">${escapeHtml(step.failure_reason)}</div>`
     : '';
-  const actionRequested = _hasStepActionRequest(step);
-  const actions = _isStepActionable(step, _currentInFlight) && !actionRequested
-    ? `<div class="plan-rail-step-actions">
-         <button type="button" class="btn btn-sm" data-action="retry" data-i18n="plan.action.retry">${escapeHtml(t('plan.action.retry'))}</button>
-         <button type="button" class="btn btn-sm" data-action="skip"  data-i18n="plan.action.skip">${escapeHtml(t('plan.action.skip'))}</button>
-         <button type="button" class="btn btn-sm btn-danger" data-action="abort" data-i18n="plan.action.abort">${escapeHtml(t('plan.action.abort'))}</button>
-       </div>`
-    : '';
   return `<div class="plan-rail-step is-${step.status}" data-step-index="${step.index}" ${step.output_msg_id ? `data-msg-id="${escapeHtml(step.output_msg_id)}"` : ''}>
     <div class="plan-rail-step-head">
       <span class="plan-rail-step-icon" aria-label="${step.status}">${icon}</span>
@@ -213,7 +113,6 @@ function _buildStepHtml(step) {
     </div>
     ${meta}
     ${reason}
-    ${actions}
   </div>`;
 }
 
@@ -225,44 +124,82 @@ function _buildProgressText(plan) {
 function _isPlanFullyComplete(plan) {
   const steps = plan && Array.isArray(plan.steps) ? plan.steps : [];
   if (!steps.length) return false;
-  if (Array.isArray(_currentInFlight) && _currentInFlight.length > 0) return false;
   return steps.every((s) => s && (s.status === 'done' || s.status === 'skipped'));
 }
 
-function _hideRail(root, body, progress, wrap) {
+function _hideRail(root, body, progress, bar) {
+  const control = document.getElementById('plan-rail-control');
   root.style.display = 'none';
   body.innerHTML = '';
   progress.textContent = '';
-  if (wrap) wrap.classList.remove('has-plan-rail');
+  if (bar) bar.innerHTML = '';
+  if (control) {
+    control.hidden = true;
+    control.textContent = '';
+    delete control.dataset.planAction;
+  }
 }
 
-function _render(plan) {
+// Build the segmented progress bar — one cell per step. Classes drive the
+// fill per PC/docs/design/PATTERNS.md P8 (done/active = primary; queued =
+// surface-3 track; failed = danger). The chip itself stays in DOM either
+// way; cells are pure presentational divs with no event handlers.
+function _buildBarHtml(plan) {
+  if (!plan || !Array.isArray(plan.steps)) return '';
+  return plan.steps.map((s) => {
+    const status = String(s && s.status || 'pending');
+    let cls = '';
+    if (status === 'done' || status === 'skipped') cls = ' is-done';
+    else if (status === 'in_progress') cls = ' is-active';
+    else if (status === 'failed') cls = ' is-failed';
+    else if (status === 'blocked') cls = ' is-blocked';
+    return `<span class="plan-rail-bar-cell${cls}" aria-hidden="true"></span>`;
+  }).join('');
+}
+
+function _render(plan, controlState = null) {
   const root = document.getElementById('plan-rail');
   const body = document.getElementById('plan-rail-body');
   const progress = document.getElementById('plan-rail-progress');
+  const bar = document.getElementById('plan-rail-bar');
+  const control = document.getElementById('plan-rail-control');
   if (!root || !body || !progress) return;
-  // Mirror visibility onto the wrapper so .chat-queue can reserve left-side
-  // room for the rail's pill chip (chip floats above the input bubble's
-  // left shoulder; without this the queue panel's bottom-left would
-  // overlap the chip — symmetric to the workspace-chip reservation on the
-  // right).
-  const wrap = root.closest('.chat-input-wrapper');
   if (!plan || !Array.isArray(plan.steps) || plan.steps.length === 0) {
     _lastPlan = null;
-    _hideRail(root, body, progress, wrap);
+    _lastControl = null;
+    _hideRail(root, body, progress, bar);
     return;
   }
   if (_isPlanFullyComplete(plan)) {
     _lastPlan = plan;
-    _clearStepActionRequests(_currentCid);
-    _hideRail(root, body, progress, wrap);
+    _lastControl = controlState || null;
+    _hideRail(root, body, progress, bar);
     return;
   }
   _lastPlan = plan;
+  _lastControl = controlState || null;
   root.style.display = '';
-  if (wrap) wrap.classList.add('has-plan-rail');
-  _pruneStepActionRequests(plan);
   progress.textContent = _buildProgressText(plan);
+  if (bar) bar.innerHTML = _buildBarHtml(plan);
+  if (control) {
+    const action = controlState && controlState.action;
+    if (action === 'stop' || action === 'continue') {
+      control.hidden = false;
+      control.dataset.planAction = action;
+      control.textContent = action === 'stop'
+        ? t('plan.action.stop')
+        : t('plan.action.continue');
+      control.classList.toggle('is-stop', action === 'stop');
+      control.classList.toggle('is-continue', action === 'continue');
+    } else {
+      control.hidden = true;
+      control.textContent = '';
+      delete control.dataset.planAction;
+      control.classList.remove('is-stop', 'is-continue');
+    }
+  }
+  // Body is kept in DOM (hidden by [hidden] attr) for downstream consumers;
+  // the rendered HTML lets them un-hide a step list without re-querying.
   body.innerHTML = plan.steps.map(_buildStepHtml).join('');
 }
 
@@ -271,7 +208,7 @@ async function _fetchPlan(cid) {
     const res = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/plan`);
     if (!res.ok) return null;
     const data = await res.json();
-    if (data?.ok && data.plan) return data.plan;
+    if (data?.ok && data.plan) return { plan: data.plan, control: data.control || null };
     return null;
   } catch (err) {
     _planRailLog.warn(`fetch plan failed cid=${cid}: ${err && err.message}`);
@@ -282,10 +219,10 @@ async function _fetchPlan(cid) {
 async function _doRefresh(cid, seq) {
   if (!cid) return;
   if (cid !== _currentCid) return;  // view switched mid-fetch
-  const plan = await _fetchPlan(cid);
+  const payload = await _fetchPlan(cid);
   if (cid !== _currentCid) return;
   if (seq !== _refreshSeq) return;
-  _render(plan);
+  _render(payload && payload.plan, payload && payload.control);
 }
 
 // ── Public API ───────────────────────────────────────────────────────────
@@ -297,7 +234,7 @@ const PlanRail = {
   bind(cid) {
     _currentCid = cid || null;
     _currentInFlight = [];
-    _clearStepActionRequests();
+    _lastControl = null;
     _refreshSeq += 1;
     // Drop any pending refresh from the previous cid — its result would
     // race with this bind's fetch and could write stale content into the
@@ -314,9 +251,9 @@ const PlanRail = {
   unbind() {
     _currentCid = null;
     _currentInFlight = [];
+    _lastControl = null;
     _refreshInflight = null;
     _refreshSeq += 1;
-    _clearStepActionRequests();
     _render(null);
   },
 
@@ -362,101 +299,82 @@ document.addEventListener('click', async (ev) => {
   const root = document.getElementById('plan-rail');
   if (!root || !root.contains(ev.target)) return;
 
-  // Whole header is the toggle. Body clicks (action buttons / step rows)
-  // are not inside .plan-rail-header so they fall through to the handlers
-  // further down.
-  const header = ev.target.closest('.plan-rail-header');
-  if (header) {
-    const isCollapsed = root.classList.toggle('is-collapsed');
-    const toggle = document.getElementById('plan-rail-toggle');
-    if (toggle) toggle.textContent = isCollapsed ? '▴' : '▾';
-    try { localStorage.setItem(`plan-rail-collapsed-${_currentCid}`, isCollapsed ? '1' : '0'); }
-    catch { /* ignore */ }
+  // "展开详情 ▾" opens the conversation-info drawer to the Tasks tab. The
+  // rail no longer has an inline-expanded body (that lives in the drawer
+  // now per PC/docs/design/PATTERNS.md). Body clicks (action buttons / step
+  // rows) still fall through to the handlers below — they're rendered into
+  // the hidden #plan-rail-body so downstream features that un-hide it
+  // continue to work.
+  const expand = ev.target.closest('#plan-rail-expand');
+  if (expand) {
+    ev.stopPropagation();
+    if (window.ConversationInfo && typeof window.ConversationInfo.openAndSetTab === 'function') {
+      window.ConversationInfo.openAndSetTab('tasks');
+    } else if (window.ConversationInfo && typeof window.ConversationInfo.open === 'function') {
+      window.ConversationInfo.open();
+    }
     return;
   }
 
-  // Action buttons.
-  const btn = ev.target.closest('[data-action]');
-  if (btn) {
+  const control = ev.target.closest('#plan-rail-control');
+  if (control) {
     ev.stopPropagation();
-    if (btn.disabled) return;
-    const stepEl = btn.closest('[data-step-index]');
-    const stepIndex = stepEl ? Number(stepEl.dataset.stepIndex) : NaN;
+    if (control.disabled) return;
     const cid = _currentCid;
-    if (!cid || !Number.isFinite(stepIndex)) return;
-    if (_stepActionRequests.has(_stepActionKey(cid, stepIndex))) return;
-    const action = btn.dataset.action;
-    if (action === 'retry') {
-      _beginStepAction(cid, stepIndex, stepEl, {
-        status: 'pending',
-        patch: {
-          failure_reason: '',
-          output_msg_id: '',
-          transient_attempts: 0,
-        },
-      });
-      const recoveryStream = _beginConversationRecoveryStream(cid);
-      let recoveryStarted = false;
+    const action = control.dataset.planAction;
+    if (!cid || (action !== 'stop' && action !== 'continue')) return;
+    const ok = await uiConfirm(action === 'stop'
+      ? t('plan.confirm.stop')
+      : t('plan.confirm.continue'));
+    if (!ok) return;
+    control.disabled = true;
+    if (action === 'stop') {
       try {
-        const data = await _postStepAction(cid, stepIndex, 'retry');
-        if (!data?.ok) {
-          _alertStepActionFailure('retry', data?.error);
-          _cancelConversationRecoveryStream(recoveryStream);
+        const runtime = window.ConversationRuntime;
+        if (runtime && typeof runtime.abortConversation === 'function') {
+          runtime.abortConversation(cid);
         } else {
-          recoveryStarted = true;
+          const res = await apiFetch(
+            `/api/conversations/${encodeURIComponent(cid)}/abort`,
+            { method: 'POST' },
+          );
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || data?.ok === false) {
+            throw new Error(data?.error || `HTTP ${res.status || 500}`);
+          }
         }
       } catch (err) {
-        _cancelConversationRecoveryStream(recoveryStream);
-        _alertStepActionFailure('retry', err && err.message);
+        _alertStepActionFailure('stop', err && err.message);
       } finally {
-        if (!recoveryStarted) _cancelConversationRecoveryStream(recoveryStream);
-        await _finishStepAction(cid, stepIndex, { refreshInfo: true, clearAfterRefresh: true });
+        control.disabled = false;
+        await PlanRail.refresh(cid, { force: true });
+        _refreshConversationInfo(cid);
       }
       return;
     }
-    if (action === 'skip') {
-      _beginStepAction(cid, stepIndex, stepEl);
-      const ok = await uiConfirm(t('plan.confirm.skip'));
-      if (!ok) {
-        await _finishStepAction(cid, stepIndex, { rerender: true });
-        return;
-      }
+    if (action === 'continue') {
       const recoveryStream = _beginConversationRecoveryStream(cid);
       let recoveryStarted = false;
       try {
-        const data = await _postStepAction(cid, stepIndex, 'skip');
-        if (!data?.ok) {
-          _alertStepActionFailure('skip', data?.error);
-          _cancelConversationRecoveryStream(recoveryStream);
-        } else {
-          recoveryStarted = true;
-          _applyOptimisticStepStatus(cid, stepIndex, 'skipped');
-        }
-      } catch (err) {
-        _cancelConversationRecoveryStream(recoveryStream);
-        _alertStepActionFailure('skip', err && err.message);
-      } finally {
-        if (!recoveryStarted) _cancelConversationRecoveryStream(recoveryStream);
-        await _finishStepAction(cid, stepIndex, { refreshInfo: true, clearAfterRefresh: true });
-      }
-      return;
-    }
-    if (action === 'abort') {
-      _beginStepAction(cid, stepIndex, stepEl);
-      const ok = await uiConfirm(t('plan.confirm.abort'));
-      if (!ok) {
-        await _finishStepAction(cid, stepIndex, { rerender: true });
-        return;
-      }
-      try {
-        await apiFetch(
-          `/api/conversations/${encodeURIComponent(cid)}/abort`,
+        const res = await apiFetch(
+          `/api/conversations/${encodeURIComponent(cid)}/plan/continue`,
           { method: 'POST' },
         );
+        const data = await res.json().catch(() => ({}));
+        if (!data?.ok) {
+          _alertStepActionFailure('continue', data?.error);
+          _cancelConversationRecoveryStream(recoveryStream);
+        } else {
+          recoveryStarted = true;
+        }
       } catch (err) {
-        _alertStepActionFailure('abort', err && err.message);
+        _cancelConversationRecoveryStream(recoveryStream);
+        _alertStepActionFailure('continue', err && err.message);
       } finally {
-        await _finishStepAction(cid, stepIndex, { refreshInfo: true, clearAfterRefresh: true });
+        if (!recoveryStarted) _cancelConversationRecoveryStream(recoveryStream);
+        control.disabled = false;
+        await PlanRail.refresh(cid, { force: true });
+        _refreshConversationInfo(cid);
       }
       return;
     }
@@ -473,38 +391,8 @@ document.addEventListener('click', async (ev) => {
   }
 });
 
-// Outside-click dismiss: collapse an expanded rail when the user clicks anywhere outside it.
-// Companion to the header toggle above — that handler returns early on in-rail clicks, so
-// this one only ever fires when the click is somewhere else on the page. Persists the
-// collapsed state so it survives view re-bind, same as a manual toggle.
-document.addEventListener('click', (ev) => {
-  const root = document.getElementById('plan-rail');
-  if (!root || root.style.display === 'none') return;
-  if (root.classList.contains('is-collapsed')) return;
-  if (root.contains(ev.target)) return;
-  root.classList.add('is-collapsed');
-  const toggle = document.getElementById('plan-rail-toggle');
-  if (toggle) toggle.textContent = '▴';
-  if (_currentCid) {
-    try { localStorage.setItem(`plan-rail-collapsed-${_currentCid}`, '1'); }
-    catch { /* ignore */ }
-  }
-});
-
-// Restore collapsed state when binding a cid. Default is collapsed (the
-// floating chip UX assumes the panel is opened on demand). localStorage
-// only flips that when the user explicitly opened it last visit.
-const _origBind = PlanRail.bind;
-PlanRail.bind = function (cid) {
-  _origBind.call(PlanRail, cid);
-  const root = document.getElementById('plan-rail');
-  const toggle = document.getElementById('plan-rail-toggle');
-  if (!root || !toggle || !cid) return;
-  let collapsed = true;
-  try {
-    const stored = localStorage.getItem(`plan-rail-collapsed-${cid}`);
-    if (stored === '0') collapsed = false;
-  } catch { /* ignore */ }
-  root.classList.toggle('is-collapsed', collapsed);
-  toggle.textContent = collapsed ? '▴' : '▾';
-};
+// Outside-click dismiss and collapsed-state persistence were removed when the
+// rail moved from a floating chip to a permanent header strip — there's no
+// inline-expanded body to dismiss, and the segmented bar is always visible
+// when the rail has a plan. "展开详情 ▾" opens the conversation-info drawer
+// (Tasks tab) instead, handled by the click delegate above.

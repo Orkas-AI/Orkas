@@ -2,10 +2,11 @@
  * Reflection orchestrator — the single trigger for metacognitive reflection.
  *
  * Replaces the old startup-only `reflection-trigger.ts` and the per-turn
- * `runner.evaluateReflection` path. Per `docs/plans/reflection-redesign.md`:
+ * `runner.evaluateReflection` path. Per `Common/docs/plans/reflection-redesign.md`:
  *
- *   - One scheduler: fire on boot (after STARTUP_DELAY_MS) and every
- *     `CYCLE_INTERVAL_MS` thereafter via a setTimeout chain.
+ *   - One scheduler: fire on boot (deferred via util/boot_init.ts so the
+ *     first cycle doesn't race first-paint) and every `CYCLE_INTERVAL_MS`
+ *     thereafter via a setTimeout chain.
  *   - Per-agent gating: 4h min cooldown, dirty gate (signals.jsonl or
  *     session jsonl newer than lastReflectedAt), 7-day max-gap fallback.
  *   - Per-cycle cap: at most `MAX_AGENTS_PER_CYCLE`; eligible-but-deferred
@@ -23,9 +24,8 @@ import { writeJsonSync } from '../storage';
 import { createLogger } from '../logger';
 import { listAgents } from './agents';
 import { listConversations, type Conversation } from './chats';
-import { buildGmemberSessionId } from './group_chat/state';
 import * as metacognition from './metacognition';
-import { buildTranscript } from './reflection-transcript';
+import { buildTranscript, listAgentGmemberFiles } from './reflection-transcript';
 import { querySignals } from './expert_signals';
 import { buildRunner } from '../model/core-agent/runner';
 
@@ -33,8 +33,6 @@ const log = createLogger('reflection-orchestrator');
 
 // ── Constants (per plan §2.1) ────────────────────────────────────────────
 
-/** Delay after boot before firing the first cycle. */
-export const STARTUP_DELAY_MS = 30_000;
 /** Interval between cycles after the first. */
 export const CYCLE_INTERVAL_MS = 12 * 3600 * 1000;
 /** Minimum gap between reflections for the same agent (anti-thrash). */
@@ -154,21 +152,28 @@ export async function isAgentDirty(uid: string, agentId: string, sinceMs: number
     log.warn(`isAgentDirty: querySignals failed agent=${agentId}: ${(err as Error).message}`);
   }
 
-  // (2) session jsonl mtime probe (gconv for _default; gconv + gmember for specific)
-  let convs: Conversation[] = [];
-  try { convs = await listConversations(uid); }
-  catch (err) {
-    log.warn(`isAgentDirty: listConversations failed: ${(err as Error).message}`);
-    return false;
-  }
-  for (const c of convs) {
-    const a = c.agent_id || '';
-    const matches = isDefault ? !a : a === agentId;
-    if (!matches) continue;
-    if (_sessionNewerThan(uid, c.session_id, sinceMs)) return true;
-    if (!isDefault) {
-      const gmemberSid = buildGmemberSessionId(c.conversation_id, agentId);
-      if (_sessionNewerThan(uid, gmemberSid, sinceMs)) return true;
+  // (2) session jsonl mtime probe.
+  //   - `_default`: scan gconv-* of convs with no bound agent (commander = "agent").
+  //   - Specific agent: scan its gmember-*-<aid>.jsonl files directly. This
+  //     bypasses `conv.agent_id` (UI-hint, "starting agent") and catches
+  //     dispatched-in convs the previous design missed.
+  if (isDefault) {
+    let convs: Conversation[] = [];
+    try { convs = await listConversations(uid); }
+    catch (err) {
+      log.warn(`isAgentDirty: listConversations failed: ${(err as Error).message}`);
+      return false;
+    }
+    for (const c of convs) {
+      if (c.agent_id) continue;
+      if (_sessionNewerThan(uid, c.session_id, sinceMs)) return true;
+    }
+  } else {
+    for (const { file } of listAgentGmemberFiles(uid, agentId)) {
+      try {
+        const stat = fs.statSync(file);
+        if (stat.mtimeMs >= sinceMs) return true;
+      } catch { /* skip unreadable file */ }
     }
   }
   return false;
@@ -295,8 +300,8 @@ export interface LoopHandle {
 }
 
 /** Start the reflection loop: run one cycle now, then every
- *  `CYCLE_INTERVAL_MS` until stopped. The boot path calls this once after
- *  STARTUP_DELAY_MS and stores the handle so `before-quit` can cancel. */
+ *  `CYCLE_INTERVAL_MS` until stopped. The boot path calls this once via
+ *  the deferred boot phase (util/boot_init.ts). */
 export function startReflectionLoop(uid: string, opts: RunCycleOpts = {}): LoopHandle {
   let timer: NodeJS.Timeout | null = null;
   let stopped = false;
@@ -309,7 +314,8 @@ export function startReflectionLoop(uid: string, opts: RunCycleOpts = {}): LoopH
     timer = setTimeout(cycle, CYCLE_INTERVAL_MS);
   };
 
-  // Fire-and-forget; the caller has already delayed boot by STARTUP_DELAY_MS.
+  // Fire-and-forget; the boot deferred phase already adds enough latency
+  // to keep the first cycle clear of first-paint.
   cycle();
 
   return {

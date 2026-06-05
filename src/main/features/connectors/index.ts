@@ -6,13 +6,14 @@ export {
   removeInstance,
   refreshTools,
   setEnabledSubtools,
+  authorizeGoogleSheetsFiles,
   callTool,
   shutdownAll,
 } from './manager';
 export { resolveVisibleConnectors, stringifyMcpResult } from './tools-adapter';
 export { isValidInstanceId } from './registry';
 export { CONNECTOR_CATALOG, findCatalogEntry } from './catalog';
-export { handleCallbackUrl, cancelInFlightOAuth } from './oauth';
+export { handleCallbackUrl, cancelInFlightOAuth, startGoogleSheetsPicker } from './oauth';
 export { handleDcrCallbackUrl } from './oauth-dcr';
 export type {
   Transport,

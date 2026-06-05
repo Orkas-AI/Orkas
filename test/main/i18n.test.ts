@@ -74,6 +74,12 @@ describe('i18n › t() lookup', () => {
       .toBe('Hello Ada, you have 3 messages');
   });
 
+  it('resolves main-side disabled skill request message', () => {
+    setCurrentLang('zh');
+    expect(t('component.skill_disabled_request', { name: 'arxiv-reader' }))
+      .toBe('技能「arxiv-reader」已被停用，请重新启用后再使用。');
+  });
+
   it('leaves unknown placeholders untouched', () => {
     expect(t('Ping {unknown} pong', { other: 'x' })).toBe('Ping {unknown} pong');
   });

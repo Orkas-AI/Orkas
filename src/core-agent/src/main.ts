@@ -4,7 +4,7 @@
  *
  * Usage:
  *   npx tsx src/main.ts run "What is 2+2?"
- *   npx tsx src/main.ts chat --provider anthropic --model claude-sonnet-4-20250514
+ *   npx tsx src/main.ts chat --provider anthropic --model claude-opus-4-8
  *   npx tsx src/main.ts models --provider anthropic
  *   npx tsx src/main.ts memory status --dir ./memory
  *   npx tsx src/main.ts config

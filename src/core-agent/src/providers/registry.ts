@@ -3,14 +3,14 @@ import { createLogger } from "../shared/logger.js";
 import type { LLMProvider, ProviderFactory } from "./base.js";
 import { createPiProvider, createAnthropicProvider, createOpenAIProvider, listPiProviders } from "./pi-provider.js";
 import { resolveApiKeyFromStore, getOAuthCredential } from "../auth/store.js";
-import type { OAuthProviderInterface } from "@mariozechner/pi-ai";
+import type { OAuthProviderInterface } from "@earendil-works/pi-ai";
 
 const log = createLogger("providers");
 
 /**
  * Provider registry: manages LLM provider instances.
  *
- * Now uses @mariozechner/pi-ai as the backend, giving access to 25+ providers
+ * Now uses @earendil-works/pi-ai as the backend, giving access to 25+ providers
  * (Anthropic, OpenAI, Google, Mistral, Groq, xAI, etc.) out of the box.
  */
 export class ProviderRegistry {
@@ -73,7 +73,7 @@ export class ProviderRegistry {
     const oauthCred = getOAuthCredential(id);
     if (oauthCred && Date.now() >= oauthCred.expires) {
       try {
-        const { getOAuthProvider } = await import("@mariozechner/pi-ai/oauth");
+        const { getOAuthProvider } = await import("@earendil-works/pi-ai/oauth");
         const oauthProvider = getOAuthProvider(id);
         if (oauthProvider) {
           const { refreshOAuthCredential } = await import("../auth/oauth-flow.js");
@@ -91,7 +91,7 @@ export class ProviderRegistry {
     return this.get(id);
   }
 
-  /** Resolve the provider for a given model string (e.g., "anthropic/claude-sonnet-4-20250514"). */
+  /** Resolve the provider for a given model string (e.g., "anthropic/claude-opus-4-8"). */
   resolveForModel(model: string): { provider: LLMProvider; modelId: string } | undefined {
     // If model contains a slash, the prefix is the provider
     const slashIdx = model.indexOf("/");

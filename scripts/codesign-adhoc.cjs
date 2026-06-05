@@ -76,7 +76,7 @@ module.exports = async function afterPack(context) {
 
   prunePackedNativePayload(appPath, targetArch);
 
-  if (process.env.CSC_LINK || process.env.CSC_NAME) {
+  if (process.env.ORKAS_FORCE_ADHOC_CODESIGN !== '1' && (process.env.CSC_LINK || process.env.CSC_NAME)) {
     console.log('[codesign-adhoc] formal signing env detected; skipping ad-hoc signing');
     return;
   }

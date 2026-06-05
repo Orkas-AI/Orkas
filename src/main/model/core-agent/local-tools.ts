@@ -35,9 +35,11 @@
  * Note on naming: the two override tools MUST keep the exact core-agent
  * names (`bash` / `write_file`) or the LLM will see both — broken.
  *
- * Note on `bash`: shell-side writes (`cat > foo.py`, `tee`, etc.) bypass
- * this conflict protection by design — bash is a black box from this
- * wrapper's perspective. Prompts shouldn't claim otherwise.
+ * Note on `bash`: shell-side writes (`cat > foo.py`, `tee`, document
+ * generators, etc.) still bypass write_file's conflict protection. To keep
+ * produced-file chip ownership precise under parallel agent runs, bash only
+ * auto-reports files created / modified under its per-turn
+ * `ORKAS_OUTPUT_DIR`; shared workspace writes are left unclaimed.
  */
 
 import * as fs from 'node:fs';
@@ -51,8 +53,10 @@ import { uniquifyPath, renderRenameSignal } from '../../util/uniquify-path';
 import { isPathAllowed } from '../../util/path-sandbox';
 import { kindOf } from '../../features/file_indexer';
 import { getWorkspacePath } from '../../features/user_workspace';
-import { chatAttachmentDir } from '../../paths';
+import { chatAttachmentDir, userMarketplaceSkillsDir, userSkillsDir } from '../../paths';
 import * as chatArtifacts from '../../features/chat_artifacts';
+import { readDisabledSets } from '../../features/component_enabled';
+import { requestConfirmation as requestDeleteConfirmation, consumeGrantedConfirmation } from './delete-file-confirm';
 import { createLogger } from '../../logger';
 
 const log = createLogger('local-tools');
@@ -74,6 +78,10 @@ export interface LocalToolsOpts {
    *  metadata so the renderer knows which actor to route an interaction
    *  result back to. */
   agentId?: string;
+  /** Stable id for the current visible turn. Used to derive the per-turn
+   * `ORKAS_OUTPUT_DIR` consumed by bash so generated files can be attributed
+   * without racing other agents writing the same conversation workspace. */
+  turnId?: string;
   /** Project id of the current conversation, when it belongs to one.
    *  Threaded through from group_chat at runTurn so workspace resolution
    *  picks up the project-scoped selection (per CLAUDE.md projects feature).
@@ -83,6 +91,17 @@ export interface LocalToolsOpts {
    *  on top of workspace + attachment. Used by skill-edit / agent-edit
    *  chats so the LLM can edit files inside the skill / agent dir. */
   extraRoots?: readonly string[];
+  /** Extra absolute roots that are **read-only** for write-side tools
+   *  (`write_file` / `edit_file`) but in-scope for `delete_file`. The
+   *  per-call UI confirmation modal on `delete_file` is the safety gate
+   *  that makes this asymmetry safe — every delete requires explicit
+   *  user click, so a path the caller marked read-only is still
+   *  protected from silent overwrite by `write_file` / `edit_file`
+   *  while still being removable when the user explicitly says yes.
+   *  Used by skill-edit chat so the LLM can `delete_file` a script
+   *  inside the skill dir without granting it `write_file` access to
+   *  the same path. */
+  readOnlyExtraRoots?: readonly string[];
   /** Fires with absolute path after every successful write (write_file,
    * edit_file, markdown_to_pdf, html_to_pdf). Lets chats.ts surface
    * produced files to the UI. */
@@ -104,8 +123,9 @@ export interface LocalToolsOpts {
 }
 
 const DENY_MESSAGE =
-  'Local execution is not authorised for this machine. ' +
-  'The user must open Settings → Local Execution and grant permission before this tool can run.';
+  'E_TOOL_EXECUTION_ACCESS_DISABLED: Tool execution access is disabled, so command execution, file writes, PDFs, images, and local artifacts were not created. ' +
+  'Ask the user to open Settings > Tool Execution Access and enable "Enable Tool Execution Access", then retry. ' +
+  'Do not claim any file, PDF, image, or interactive app has already been created.';
 
 function deniedResult(): ToolResult {
   return { content: DENY_MESSAGE, isError: true };
@@ -122,6 +142,146 @@ function isMineFor(opts: LocalToolsOpts): (p: string) => boolean {
 
 function errText(code: string, msg: string): string {
   return `${code}: ${msg}`;
+}
+
+const BASH_PRODUCED_SCAN_LIMIT = 5000;
+const BASH_PRODUCED_SKIP_DIRS = new Set([
+  '.cache',
+  '.git',
+  '.hg',
+  '.mypy_cache',
+  '.next',
+  '.parcel-cache',
+  '.pytest_cache',
+  '.ruff_cache',
+  '.svn',
+  '.turbo',
+  '.venv',
+  '__pycache__',
+  'node_modules',
+  'venv',
+]);
+const BASH_PRODUCED_SKIP_FILES = new Set([
+  '.DS_Store',
+]);
+
+type BashFileSnapshotEntry = { mtimeMs: number; size: number };
+type BashFileSnapshot = Map<string, BashFileSnapshotEntry>;
+
+function safeOutputSegment(value: string | undefined, fallback: string): string {
+  const raw = String(value || '').trim();
+  const safe = raw.replace(/[^A-Za-z0-9_.-]+/g, '_').replace(/^_+|_+$/g, '');
+  return safe || fallback;
+}
+
+function randomOutputSegment(): string {
+  return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function bashOutputDir(opts: LocalToolsOpts, workingDir: string): string {
+  const actor = safeOutputSegment(opts.agentId || 'commander', 'actor');
+  const turn = safeOutputSegment(opts.turnId, randomOutputSegment());
+  return path.join(workingDir, '__orkas_outputs', actor, turn);
+}
+
+function shouldSkipBashProducedDir(name: string): boolean {
+  return BASH_PRODUCED_SKIP_DIRS.has(name);
+}
+
+function shouldSkipBashProducedFile(name: string): boolean {
+  return BASH_PRODUCED_SKIP_FILES.has(name);
+}
+
+function collectBashFileSnapshot(root: string): BashFileSnapshot {
+  const out: BashFileSnapshot = new Map();
+  const absRoot = path.resolve(root);
+  const visit = (dir: string) => {
+    if (out.size >= BASH_PRODUCED_SCAN_LIMIT) return;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch { return; }
+    for (const ent of entries) {
+      if (out.size >= BASH_PRODUCED_SCAN_LIMIT) return;
+      const name = ent.name;
+      if (ent.isDirectory()) {
+        if (!shouldSkipBashProducedDir(name)) visit(path.join(dir, name));
+        continue;
+      }
+      if (!ent.isFile() || shouldSkipBashProducedFile(name)) continue;
+      const abs = path.join(dir, name);
+      let st: fs.Stats;
+      try { st = fs.statSync(abs); }
+      catch { continue; }
+      if (!st.isFile()) continue;
+      out.set(path.resolve(abs), { mtimeMs: st.mtimeMs, size: st.size });
+    }
+  };
+  visit(absRoot);
+  return out;
+}
+
+function emitBashProducedFiles(opts: LocalToolsOpts, before: BashFileSnapshot, root: string): void {
+  if (!opts.onFileWritten) return;
+  const after = collectBashFileSnapshot(root);
+  for (const [abs, next] of after) {
+    const prev = before.get(abs);
+    if (prev && prev.mtimeMs === next.mtimeMs && prev.size === next.size) continue;
+    try { opts.onFileWritten(abs); }
+    catch (err) { log.warn(`onFileWritten callback failed: ${(err as Error).message}`); }
+  }
+}
+
+function withBashOutputEnv(ctx: ToolContext, outputDir: string): () => void {
+  const original = ctx.state.sandboxEnv as Record<string, string> | undefined;
+  ctx.state.sandboxEnv = {
+    ...(original ?? {}),
+    ORKAS_OUTPUT_DIR: outputDir,
+  };
+  return () => {
+    if (original) ctx.state.sandboxEnv = original;
+    else delete ctx.state.sandboxEnv;
+  };
+}
+
+function cleanupEmptyBashOutputDir(outputDir: string, workingDir: string): void {
+  try {
+    if (fs.existsSync(outputDir) && fs.readdirSync(outputDir).length === 0) {
+      fs.rmdirSync(outputDir);
+    }
+  } catch { /* best-effort */ }
+  try {
+    const actorDir = path.dirname(outputDir);
+    if (actorDir.startsWith(path.join(workingDir, '__orkas_outputs')) && fs.existsSync(actorDir) && fs.readdirSync(actorDir).length === 0) {
+      fs.rmdirSync(actorDir);
+    }
+  } catch { /* best-effort */ }
+  try {
+    const outputsDir = path.join(workingDir, '__orkas_outputs');
+    if (fs.existsSync(outputsDir) && fs.readdirSync(outputsDir).length === 0) {
+      fs.rmdirSync(outputsDir);
+    }
+  } catch { /* best-effort */ }
+}
+
+async function executeCoreBashWithOutputTracking(
+  opts: LocalToolsOpts,
+  input: Record<string, unknown>,
+  ctx: ToolContext,
+  workingDir: string,
+): Promise<ToolResult> {
+  const outputDir = bashOutputDir(opts, workingDir);
+  try { fs.mkdirSync(outputDir, { recursive: true }); }
+  catch { /* let the command surface any downstream path failure */ }
+  const before = opts.onFileWritten ? collectBashFileSnapshot(outputDir) : new Map<string, BashFileSnapshotEntry>();
+  const restoreEnv = withBashOutputEnv(ctx, outputDir);
+  try {
+    const result = await coreBashTool.execute(input, ctx);
+    if (!result.isError) emitBashProducedFiles(opts, before, outputDir);
+    return result;
+  } finally {
+    restoreEnv();
+    cleanupEmptyBashOutputDir(outputDir, workingDir);
+  }
 }
 
 /** Assemble the edit-time sandbox roots for the current (uid, cid). Mirrors
@@ -160,6 +320,27 @@ function guardEditPath(opts: LocalToolsOpts, abs: string): string | null {
   return null;
 }
 
+/** Like `guardEditPath` but also accepts `readOnlyExtraRoots`. Used only by
+ *  `delete_file`, where the per-call UI confirmation is the gate that
+ *  justifies including read-only roots in the deletable set. See the
+ *  `readOnlyExtraRoots` comment on `LocalToolsOpts`. */
+function guardDeletePath(opts: LocalToolsOpts, abs: string): string | null {
+  const roots = allowedRootsFor(opts);
+  if (opts.readOnlyExtraRoots?.length) {
+    for (const r of opts.readOnlyExtraRoots) if (r) roots.push(r);
+  }
+  if (!roots.length) {
+    return errText('E_NO_SCOPE', 'no visible roots for this conversation');
+  }
+  if (!isPathAllowed(abs, roots)) {
+    return errText(
+      'E_PATH_OUT_OF_SCOPE',
+      `path is outside the current conversation's deletable scope (workspace + attachments + read-only roots): ${abs}`,
+    );
+  }
+  return null;
+}
+
 function countOccurrences(haystack: string, needle: string): number {
   if (!needle) return 0;
   let count = 0;
@@ -171,18 +352,78 @@ function countOccurrences(haystack: string, needle: string): number {
   return count;
 }
 
+function extractRunSkillRefs(command: string): string[] {
+  const out: string[] = [];
+  const re = /(?:^|[^\w.-])run-skill\.cjs["']?\s+(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_-]+))/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(command)) !== null) {
+    const ref = (m[1] || m[2] || m[3] || '').trim();
+    if (ref) out.push(ref);
+  }
+  return out;
+}
+
+function commandMentionsSkillRoot(command: string, uid: string, skillId: string): boolean {
+  const unescaped = command.replace(/\\([\\ "'$`])/g, '$1');
+  const roots = [
+    path.resolve(userSkillsDir(uid), skillId),
+    path.resolve(userMarketplaceSkillsDir(uid), skillId),
+    path.posix.join('cloud', 'skills', skillId),
+    path.posix.join('local', 'marketplace', 'skills', skillId),
+  ];
+  return roots.some((root) => unescaped.includes(root));
+}
+
+function guardDisabledSkillBash(opts: LocalToolsOpts, command: string): string | null {
+  const uid = opts.userId;
+  if (!uid || !command) return null;
+
+  const disabled = readDisabledSets(uid).skills;
+  if (!disabled.size) return null;
+
+  for (const ref of extractRunSkillRefs(command)) {
+    if (disabled.has(ref)) {
+      return errText(
+        'E_SKILL_DISABLED',
+        `skill "${ref}" is disabled for this user; re-enable it before running its workflow.`,
+      );
+    }
+  }
+
+  for (const skillId of disabled) {
+    if (commandMentionsSkillRoot(command, uid, skillId)) {
+      return errText(
+        'E_SKILL_DISABLED',
+        `skill "${skillId}" is disabled for this user; re-enable it before running its workflow.`,
+      );
+    }
+  }
+
+  return null;
+}
+
 /** Wrapped `bash` tool — identical schema, permission-gated, host-shell wording. */
-function createBashTool(): AgentTool {
+function createBashTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'bash',
     description:
       'Execute a shell command on the user\'s local machine and return its output. ' +
       'Use for installing CLIs (brew, npm, pip), running builds, converting files, ' +
       'inspecting the filesystem, and any other host-side work. The shell runs in ' +
-      'the user\'s current workspace directory.',
+      'the user\'s current workspace directory. For files generated by scripts that ' +
+      'should be shown to the user as produced-file chips (for example .docx, .xlsx, ' +
+      '.pptx, .pdf, images, HTML, CSV, Markdown), write them under the absolute ' +
+      '$ORKAS_OUTPUT_DIR path. Scratch/cache files should stay elsewhere and will not ' +
+      'be surfaced as chips.',
     inputSchema: coreBashTool.inputSchema,
     async execute(input, ctx) {
       if (!getLocalExecGranted()) return deniedResult();
+      const command = String(input.command ?? '');
+      const disabledSkillErr = guardDisabledSkillBash(opts, command);
+      if (disabledSkillErr) {
+        log.warn(`bash disabled skill reject user=${opts.userId ?? '?'} command=${command.slice(0, 160)}`);
+        return { content: disabledSkillErr, isError: true };
+      }
       // `conv_workspace.ts` intentionally defers materialising the
       // per-conversation workspace dir; bash is a frequent first toucher
       // because `child_process.spawn` fails ENOENT if cwd doesn't exist.
@@ -204,13 +445,14 @@ function createBashTool(): AgentTool {
       //               bash on same cwd, ENOTEMPTY, EACCES) is silently
       //               swallowed.
       if (!ctx.workingDir) return coreBashTool.execute(input, ctx);
-      if (fs.existsSync(ctx.workingDir)) {
-        return coreBashTool.execute(input, ctx);
+      const workingDir = path.resolve(ctx.workingDir);
+      if (fs.existsSync(workingDir)) {
+        return executeCoreBashWithOutputTracking(opts, input, ctx, workingDir);
       }
       try { fs.mkdirSync(ctx.workingDir, { recursive: true }); }
       catch { /* let spawn produce the canonical error */ }
       try {
-        return await coreBashTool.execute(input, ctx);
+        return await executeCoreBashWithOutputTracking(opts, input, ctx, workingDir);
       } finally {
         try {
           if (fs.readdirSync(ctx.workingDir).length === 0) {
@@ -479,7 +721,7 @@ function createHtmlToPdfTool(opts: LocalToolsOpts): AgentTool {
   };
 }
 
-/** `create_artifact` — build an interactive multi-file web app shown live
+/** `create_artifact` — build an interactive multi-file app shown live
  *  inside the chat bubble (sandboxed `<iframe>` over the `chat-app://`
  *  protocol). Permission-gated like the other write-style tools; writes only
  *  into the current conversation's artifact pool (`chat_artifacts/<cid>/`),
@@ -489,9 +731,9 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'create_artifact',
     description:
-      'Build a small interactive web app (self-contained HTML/CSS/JS) that is rendered LIVE and clickable inside this chat reply, embedded in a sandboxed iframe.\n' +
+      'Build a small interactive app (self-contained HTML/CSS/JS) that is rendered LIVE and clickable inside this chat reply, embedded in a sandboxed iframe.\n' +
       '\n' +
-      'Use it for: dashboards, calculators, data visualizations, configurators, simulators, quizzes, mini-games — anything the user should interact with directly. Do NOT use it for static documents (use `html_to_pdf`) or images (use `generate_image`).\n' +
+      'Use it for: interactive dashboards, calculators, data visualizations with filters or drill-down, configurators, simulators, quizzes, mini-games — anything the user should operate directly. For static/read-only KPI, table, timeline, alert, or simple chart summaries, prefer `:::dashboard`. Do NOT use it for static documents (use `html_to_pdf`) or images (use `generate_image`).\n' +
       '\n' +
       'Input: `{ title?, files: [{ path, content, encoding? }, ...] }`\n' +
       '  - `files` MUST include a top-level `index.html` (the entry point). Up to 20 files, 256 KB per file, 1 MB total.\n' +
@@ -563,12 +805,174 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
   };
 }
 
+/** Wrapped `delete_file` tool — single-file unlink, sandboxed identically to
+ *  `edit_file` (workspace + current attachment dir + extraRoots / readonly).
+ *  Destructive, so on top of `localExec` we require a per-call user click
+ *  in the inline confirm card.
+ *
+ *  Async token model (does NOT block the LLM turn — see
+ *  delete-file-confirm.ts header):
+ *    - First call: `delete_file({path})` (no token). Tool mints a token,
+ *      emits the card, and returns IMMEDIATELY with `requires_user_confirmation`
+ *      so the LLM can keep doing other tool calls / finish the turn.
+ *      Skill-creator authoring rules require the LLM to stop in prose
+ *      after this and ask the user; never retry in the same turn.
+ *    - Second call: `delete_file({path, confirmation_token})`. Tool
+ *      checks the token's state:
+ *        granted → unlink
+ *        pending → tell LLM the user hasn't clicked yet
+ *        denied  → tell LLM the user said no
+ *        invalid → token expired / wrong path; mint a fresh one
+ */
+function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
+  return {
+    name: 'delete_file',
+    description:
+      'Delete a single file from disk via a two-step user-confirmed flow.\n' +
+      '\n' +
+      'Sandbox is identical to `edit_file` (workspace + current attachment ' +
+      'dir + extraRoots / readonly). Use instead of `bash rm` — `bash` is ' +
+      'unaware of the sandbox + the confirm gate.\n' +
+      '\n' +
+      'Flow:\n' +
+      '  Step 1 — `delete_file({path})` (no token). Tool emits an inline ' +
+      'confirm card to the user and returns `requires_user_confirmation: ' +
+      'true` with a `confirmation_token`. The tool does NOT block. Tell ' +
+      'the user in prose what you intend to delete; do NOT retry with ' +
+      'the token in the same turn — wait for the user to click the card ' +
+      'and reply, then retry on the next turn.\n' +
+      '  Step 2 — `delete_file({path, confirmation_token})`. Tool checks ' +
+      'the token state: granted → unlink + return success; pending → user ' +
+      "hasn't clicked yet, stop and wait; denied → user declined, give up; " +
+      'invalid → token expired or path changed, call Step 1 again.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description:
+            'Relative or absolute path to the file to delete. Resolved against the conversation working directory.',
+        },
+        confirmation_token: {
+          type: 'string',
+          description:
+            "Token returned by a prior delete_file call's `requires_user_confirmation` result. Pass it back on the second call to actually perform the unlink after the user has clicked the confirm card. Omit on the first call.",
+        },
+      },
+      required: ['path'],
+    },
+    async execute(input, ctx) {
+      if (!getLocalExecGranted()) return deniedResult();
+
+      const rawPath = String(input.path ?? '');
+      if (!rawPath) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
+      const token = typeof input.confirmation_token === 'string' && input.confirmation_token.trim()
+        ? input.confirmation_token.trim()
+        : '';
+
+      const abs = resolveAbs(ctx, rawPath);
+      const scopeErr = guardDeletePath(opts, abs);
+      if (scopeErr) {
+        log.warn(`delete_file scope reject user=${opts.userId ?? '?'} path=${abs}`);
+        return { content: scopeErr, isError: true };
+      }
+
+      // ── Step 2: token-bearing call → consume + unlink if granted.
+      if (token) {
+        const outcome = consumeGrantedConfirmation(token, abs);
+        if (outcome.outcome === 'pending') {
+          return {
+            content: errText(
+              'E_AWAITING_USER',
+              `${abs}: the user has not clicked the confirmation card yet. Stop the turn here, ask the user to confirm, and retry with the same confirmation_token after they reply.`,
+            ),
+            isError: true,
+          };
+        }
+        if (outcome.outcome === 'denied') {
+          log.info(`delete_file denied (token) user=${opts.userId ?? '?'} path=${abs}`);
+          return {
+            content: errText(
+              'E_USER_DENIED',
+              `${abs}: the user declined the deletion. Do not retry; treat the file as kept.`,
+            ),
+            isError: true,
+          };
+        }
+        if (outcome.outcome === 'invalid') {
+          return {
+            content: errText(
+              'E_INVALID_TOKEN',
+              `${abs}: the confirmation_token is unknown / expired / mismatched with the path. Call delete_file again WITHOUT the token to mint a fresh card.`,
+            ),
+            isError: true,
+          };
+        }
+        // granted — verify file still exists and unlink.
+        let st: fs.Stats;
+        try { st = fs.statSync(abs); }
+        catch (err) {
+          log.warn(`delete_file granted-but-missing user=${opts.userId ?? '?'} path=${abs}: ${(err as Error).message}`);
+          return {
+            content: errText('E_NOT_FOUND', `${abs}: file no longer exists (already removed?)`),
+            isError: true,
+          };
+        }
+        if (!st.isFile()) {
+          return {
+            content: errText('E_NOT_FILE', `${abs}: not a regular file`),
+            isError: true,
+          };
+        }
+        try { fs.unlinkSync(abs); }
+        catch (err) {
+          const msg = (err as Error).message;
+          log.warn(`delete_file unlink failed user=${opts.userId ?? '?'} path=${abs}: ${msg}`);
+          return {
+            content: errText('E_DELETE_FAILED', `${abs}: unlink failed: ${msg}`),
+            isError: true,
+          };
+        }
+        log.info(`delete_file user=${opts.userId ?? '?'} path=${abs}`);
+        return { content: `Deleted ${abs}` };
+      }
+
+      // ── Step 1: no token → check file exists, mint token + emit card.
+      let st: fs.Stats;
+      try { st = fs.statSync(abs); }
+      catch (err) {
+        log.warn(`delete_file not-found user=${opts.userId ?? '?'} path=${abs}: ${(err as Error).message}`);
+        return {
+          content: errText('E_NOT_FOUND', `${abs}: file does not exist`),
+          isError: true,
+        };
+      }
+      if (!st.isFile()) {
+        return {
+          content: errText('E_NOT_FILE', `${abs}: not a regular file (refuse to recursively delete directories from this tool)`),
+          isError: true,
+        };
+      }
+      const newToken = requestDeleteConfirmation(abs, { display_path: rawPath, cid: opts.cid });
+      log.info(`delete_file confirmation requested user=${opts.userId ?? '?'} path=${abs} token=${newToken}`);
+      return {
+        content:
+          `requires_user_confirmation: a confirmation card for "${rawPath}" has been shown to the user.\n` +
+          `confirmation_token: ${newToken}\n` +
+          `Next step: stop calling tools this turn. In your reply prose, tell the user what you plan to delete and ask them to click the card. ` +
+          `On the user's next reply, call delete_file again with BOTH \`path\` and \`confirmation_token\` set to complete the deletion.`,
+      };
+    },
+  };
+}
+
 /** Build the array of local-machine tools for a single runner. */
 export function createLocalTools(opts: LocalToolsOpts = {}): AgentTool[] {
   const tools: AgentTool[] = [
-    createBashTool(),
+    createBashTool(opts),
     createWriteFileTool(opts),
     createEditFileTool(opts),
+    createDeleteFileTool(opts),
     createMarkdownToPdfTool(opts),
     createHtmlToPdfTool(opts),
   ];

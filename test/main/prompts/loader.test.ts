@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { PromptManager, safeSubstitute, prompts } from '../../../src/main/prompts/loader';
+import { buildRuntimeDatetimeBlock, formatCurrentDatetime } from '../../../src/main/prompts/runtime_context';
 
 describe('prompts › safeSubstitute', () => {
   it('substitutes $identifier', () => {
@@ -44,6 +45,21 @@ describe('prompts › safeSubstitute', () => {
 
   it('handles literal {} without escaping', () => {
     expect(safeSubstitute('json: {"x":1}', {})).toBe('json: {"x":1}');
+  });
+});
+
+describe('prompts › runtime datetime context', () => {
+  it('formats local datetime as ISO with seconds and numeric offset', () => {
+    const block = buildRuntimeDatetimeBlock(new Date(2026, 5, 5, 14, 30, 0));
+
+    expect(formatCurrentDatetime(new Date(2026, 5, 5, 14, 30, 0))).toMatch(
+      /^2026-06-05T14:30:00[+-]\d{2}:\d{2}$/,
+    );
+    expect(block).toContain('## Current datetime');
+    expect(block).toMatch(/Current datetime: 2026-06-05T14:30:00[+-]\d{2}:\d{2}/);
+    expect(block).toMatch(/Timezone: .+/);
+    expect(block).not.toContain('This datetime is authoritative');
+    expect(block).not.toContain('Current year:');
   });
 });
 
@@ -154,17 +170,34 @@ describe('prompts › chat_shared_rules web-search invariants', () => {
 describe('prompts › chat_shared_rules PDF toolchain invariants', () => {
   const load = () => prompts.load('chat_shared_rules', {});
 
-  it('forbids hand-rolling reportlab / wkhtmltopdf / pypdf / pdfkit / LaTeX for PDFs', () => {
+  it('forbids hand-rolling reportlab / wkhtmltopdf / pdfkit / LaTeX for PDF generation', () => {
     const body = load();
     expect(body).toMatch(/Do not.*reportlab/);
     expect(body).toContain('wkhtmltopdf');
-    expect(body).toContain('pypdf');
+    expect(body).toContain('pdfkit');
+    expect(body).toContain('LaTeX');
     // CJK font issue is the concrete reason — lock the justification in.
     expect(body).toMatch(/CJK fonts/i);
   });
 
   it('forbids silent fallback from the built-in PDF tools to lower-level libs on error', () => {
     const body = load();
-    expect(body).toMatch(/do not fall back/i);
+    // `\W+` between "not" and "fall back" accepts either plain spacing or the
+    // markdown bold form ("**do not** fall back") the prompt now uses.
+    expect(body).toMatch(/do not\W+fall back/i);
+  });
+});
+
+describe('prompts › chat_shared_rules ordinary reply structure', () => {
+  it('keeps normal text/Markdown replies structured without forcing dashboards or reports', () => {
+    const body = prompts.load('chat_shared_rules', {});
+    expect(body).toContain('## Ordinary reply structure');
+    expect(body).toMatch(/optionally with an inline `:::dashboard` when useful/i);
+    expect(body).toMatch(/Start with the direct conclusion/i);
+    expect(body).toMatch(/key point visible before details/i);
+    expect(body).toMatch(/2-4 short user-facing sections/i);
+    expect(body).toMatch(/most important section first/i);
+    expect(body).toMatch(/structured data, metrics, comparisons, timelines, and status snapshots in `:::dashboard` by default/i);
+    expect(body).toMatch(/full reports, or playbooks/i);
   });
 });

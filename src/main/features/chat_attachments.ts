@@ -330,11 +330,12 @@ export async function importAttachmentFromPath(
     }
   }
 
-  const dir = ensureDir(userId, safeConvId);
-  let incomingHash: string;
-  try { incomingHash = await hashFile(absSource); }
-  catch (err) { return { ok: false, error: (err as Error).message }; }
   return withAttachmentWriteLock(userId, safeConvId, async () => {
+    const dir = ensureDir(userId, safeConvId);
+    let incomingHash: string;
+    try { incomingHash = await hashFile(absSource); }
+    catch (err) { return { ok: false, error: (err as Error).message }; }
+
     const duplicate = await findDuplicateByHash(dir, sourceStat.size, incomingHash);
     if (duplicate) {
       log.info(`import dedupe user=${userId} cid=${safeConvId} reuse=${duplicate.name} bytes=${duplicate.bytes}`);

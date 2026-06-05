@@ -62,10 +62,6 @@ async function loadProjects(forceRefresh) {
     _projectsCache = [];
   }
   renderProjectsSection();
-  // Commander chip visibility depends on cache size — hide entirely when
-  // the user has zero projects (UX request: no project chip clutter on
-  // first run / for users who don't adopt the feature).
-  _renderCommanderProjectChip();
   return _projectsCache;
 }
 
@@ -179,6 +175,8 @@ function _renderProjectRow(p, convs) {
     html += `<div class="project-conv-list" data-pid-children="${escapeHtml(p.project_id)}">`;
     if (!convs.length) {
       html += `<div class="project-conv-empty">${escapeHtml(t('sidebar.project_conv_empty'))}</div>`;
+    } else if (typeof _renderConversationTimeBucketList === 'function') {
+      html += _renderConversationTimeBucketList(convs, { nested: true, bucketScope: `project:${p.project_id}` });
     } else {
       for (const c of convs) {
         html += (typeof _renderConversationSidebarItem === 'function')
@@ -236,6 +234,7 @@ function _bindProjectsHandlers(container) {
   if (typeof _bindConversationSidebarItems === 'function') {
     _bindConversationSidebarItems(container, {
       selector: '.conv-item-nested',
+      onBucketToggle: renderProjectsSection,
       async afterDelete() {
         // Project conv counts changed → refresh project cache so future reads
         // (delete confirm body, etc.) see the right number.
@@ -277,11 +276,12 @@ function _cancelProjectInlineCreate() {
 
 function _bindInlineCreateInput(input) {
   input.addEventListener('click', (e) => e.stopPropagation());
+  if (typeof window.bindNameLimitControl === 'function') window.bindNameLimitControl(input);
   let committed = false;
   const commit = async (accept) => {
     if (committed) return;
     committed = true;
-    const name = (input.value || '').trim();
+    const name = _normaliseProjectNameFinal(input.value);
     if (!accept || !name) {
       _cancelProjectInlineCreate();
       return;
@@ -314,8 +314,9 @@ function _bindInlineCreateInput(input) {
     else if (e.key === 'Escape') { e.preventDefault(); commit(false); }
   });
   input.addEventListener('blur', () => commit(true));
-  // Clear inline error styling as the user types.
-  input.addEventListener('input', () => _clearProjectInlineError(input));
+  input.addEventListener('input', () => {
+    _clearProjectInlineError(input);
+  });
 }
 
 // ── Inline rename ───────────────────────────────────────────────────────
@@ -341,13 +342,14 @@ function _cancelProjectInlineRename() {
 
 function _bindInlineRenameInput(input) {
   input.addEventListener('click', (e) => e.stopPropagation());
+  if (typeof window.bindNameLimitControl === 'function') window.bindNameLimitControl(input);
   const pid = input.dataset.renamePid;
   const original = input.value;
   let committed = false;
   const commit = async (accept) => {
     if (committed) return;
     committed = true;
-    const next = (input.value || '').trim();
+    const next = _normaliseProjectNameFinal(input.value);
     if (!accept || !next || next === original) {
       _cancelProjectInlineRename();
       return;
@@ -372,7 +374,15 @@ function _bindInlineRenameInput(input) {
     else if (e.key === 'Escape') { e.preventDefault(); commit(false); }
   });
   input.addEventListener('blur', () => commit(true));
-  input.addEventListener('input', () => _clearProjectInlineError(input));
+  input.addEventListener('input', () => {
+    _clearProjectInlineError(input);
+  });
+}
+
+function _normaliseProjectNameFinal(raw) {
+  let name = String(raw || '').trim();
+  if (typeof window.limitNameDisplayText === 'function') name = window.limitNameDisplayText(name);
+  return name;
 }
 
 function _showProjectInlineError(input, code) {
@@ -477,9 +487,19 @@ async function _confirmDeleteProject(pid) {
   if (!project) return;
   const name = project.name || '';
   const count = Number(project.conv_count || 0);
+  // Look up project-scoped auto tasks BEFORE confirm so the body can warn
+  // the user they'll be cascade-deleted too. Best-effort: a transient IPC
+  // failure falls through to the no-auto-tasks message; the backend's
+  // cascade in `projects.deleteProject` still cleans them up either way.
+  let autoCount = 0;
+  try {
+    const r = await window.orkas.invoke('autoTasks.list', { projectId: pid });
+    if (r && Array.isArray(r.tasks)) autoCount = r.tasks.length;
+  } catch (_) { /* ignore — fall through with autoCount = 0 */ }
   // Build the confirm dialog. When N > 0 we surface the destructive scope on
   // the danger button itself so the user has to read N before clicking;
-  // when N = 0 it's just a simple confirm.
+  // when N = 0 it's just a simple confirm. Auto-task suffix appended
+  // whenever the project owns at least one task.
   let message;
   let dangerLabel;
   if (count > 0) {
@@ -488,6 +508,9 @@ async function _confirmDeleteProject(pid) {
   } else {
     message = t('project.delete_confirm_body_empty', { name });
     dangerLabel = t('project.delete_danger_label_empty');
+  }
+  if (autoCount > 0) {
+    message += ' ' + t('project.delete_confirm_auto_suffix', { n: autoCount });
   }
   const ok = await uiConfirmDanger({
     title: t('project.delete_confirm_title', { name }),
@@ -502,18 +525,13 @@ async function _confirmDeleteProject(pid) {
       const code = res && res.error;
       if (code === 'has_running_conv') {
         await uiAlert(t('project.has_running_conv'));
+      } else if (code === 'recycle_archive_failed' || res?.code === 'recycle_archive_failed') {
+        await uiAlert(t('project.delete_archive_failed'));
       } else {
         await uiAlert(t('project.delete_failed_generic'));
       }
       return;
     }
-    // Clear lastProject if the commander chip pointed at this pid.
-    try {
-      if (typeof _COMMANDER_LAST_PROJECT_KEY !== 'undefined') {
-        const stored = localStorage.getItem(_COMMANDER_LAST_PROJECT_KEY);
-        if (stored === pid) localStorage.removeItem(_COMMANDER_LAST_PROJECT_KEY);
-      }
-    } catch (_) {}
     // Drop expanded entry.
     if (_projectsExpanded[pid]) {
       delete _projectsExpanded[pid];
@@ -528,190 +546,25 @@ async function _confirmDeleteProject(pid) {
     }
     await loadConversations();
     await loadProjects(true);
-    // Commander chip may need to refresh ("None" if its pid was deleted).
-    if (typeof refreshCommanderProjectChip === 'function') refreshCommanderProjectChip();
   } catch (err) {
     _projectsLog.error('delete project failed', err);
     await uiAlert(t('project.delete_failed_generic'));
   }
 }
 
-// ── Commander project chip ─────────────────────────────────────────────
-// The commander tab (new-chat) carries a "Project: <name>" chip next to the
-// recipient chip. Default is None; the last manual pick is remembered across
-// sessions so reopening the commander tab restores the user's intent. The
-// pick travels into the freshly-created conversation via
-// `_pendingNewChatProjectId` (mirrors `_pendingNewChatRecipient`).
-//
-// In conversation detail there is NO project chip — project membership is
-// frozen at create time per the design.
+// ── Project name resolver ──────────────────────────────────────────────
+// Empty-state composer no longer carries a project chip — new conversations
+// from the commander tab are always orphan. Project membership is bound
+// only via the per-project page. This resolver is kept because the
+// conversation header + workspace chip tooltip still need a pid → name
+// lookup for already-bound conversations.
 
-const _COMMANDER_LAST_PROJECT_KEY = 'commander.lastProject';
-const _COMMANDER_NONE_SENTINEL = '__none__';
-
-let _commanderProjectId = '';        // ephemeral, lives only while commander tab is mounted
-let _pendingNewChatProjectId = '';   // ferried into the new conv after submit
-
-/** Public: read the commander tab's currently-picked project id (or '' for
- *  None). user-workspace.js uses this to scope its chip on the new-chat panel. */
-function getCommanderProjectId() {
-  return _commanderProjectId || '';
-}
-
-/** Public: resolve a project id to its display name from the cache. Returns
- *  empty string when the pid is unknown (e.g. just deleted). Used by
- *  user-workspace.js for the chip tooltip. */
+/** Resolve a project id to its display name from the cache. Returns empty
+ *  string when the pid is unknown (e.g. just deleted). */
 function getCommanderProjectIdName(pid) {
   if (!pid || !Array.isArray(_projectsCache)) return '';
   const p = _projectsCache.find((x) => x && x.project_id === pid);
   return (p && p.name) || '';
-}
-
-/** Public: surface the captured commander pick to handleNewChatSubmit so it
- *  can attach the projectId to the freshly-created conversation. The caller
- *  is expected to clear the ferry after consuming. */
-function _captureCommanderProjectForNewChat() {
-  _pendingNewChatProjectId = _commanderProjectId || '';
-}
-
-function _consumeCommanderProjectForNewChat() {
-  const pid = _pendingNewChatProjectId;
-  _pendingNewChatProjectId = '';
-  return pid;
-}
-
-/** Public: re-render the commander chip label + reset to None when the
- *  pid is gone (project was deleted). Called from delete flow + boot. */
-function refreshCommanderProjectChip() {
-  // Bail when the pinned id has vanished from the cache → fall back to None.
-  if (_commanderProjectId && Array.isArray(_projectsCache)) {
-    const exists = _projectsCache.some((p) => p && p.project_id === _commanderProjectId);
-    if (!exists) {
-      _commanderProjectId = '';
-      try { localStorage.removeItem(_COMMANDER_LAST_PROJECT_KEY); } catch (_) {}
-    }
-  }
-  _renderCommanderProjectChip();
-  // Workspace scope on the commander panel changes whenever the project pick
-  // changes (or a pid silently fell back to None). Keep the chip in sync.
-  if (typeof refreshWorkspaceChip === 'function') refreshWorkspaceChip();
-}
-
-function _renderCommanderProjectChip() {
-  const chip = document.getElementById('new-chat-project-chip');
-  const nameEl = document.getElementById('new-chat-project-name');
-  if (!chip || !nameEl) return;
-  // Hide the chip entirely when the user has no projects yet — first-run
-  // / non-adopters don't see a "Project: None" affordance until they
-  // create at least one project. Re-shown automatically the moment a
-  // project lands in the cache.
-  const hasProjects = Array.isArray(_projectsCache) && _projectsCache.length > 0;
-  if (!hasProjects) {
-    chip.style.display = 'none';
-    return;
-  }
-  chip.style.display = '';
-  const pid = _commanderProjectId;
-  if (pid) {
-    const p = _projectsCache.find((x) => x && x.project_id === pid);
-    if (p && p.name) {
-      nameEl.textContent = p.name;
-      nameEl.removeAttribute('data-i18n');
-      return;
-    }
-  }
-  // Fallback to None.
-  nameEl.setAttribute('data-i18n', 'chat.project_none');
-  nameEl.textContent = t('chat.project_none');
-}
-
-/** Restore the commander chip from localStorage on view-enter. Validates
- *  the saved pid still exists; falls back to None and clears storage if
- *  not. Called by conversation.js::onEnterNewChatView. */
-function onEnterCommanderProjectChip() {
-  let saved = '';
-  try { saved = localStorage.getItem(_COMMANDER_LAST_PROJECT_KEY) || ''; } catch (_) {}
-  if (saved === _COMMANDER_NONE_SENTINEL || !saved) {
-    _commanderProjectId = '';
-  } else if (Array.isArray(_projectsCache) && _projectsCache.some((p) => p && p.project_id === saved)) {
-    _commanderProjectId = saved;
-  } else {
-    _commanderProjectId = '';
-    try { localStorage.removeItem(_COMMANDER_LAST_PROJECT_KEY); } catch (_) {}
-  }
-  _renderCommanderProjectChip();
-  if (typeof refreshWorkspaceChip === 'function') refreshWorkspaceChip();
-}
-
-/** User clicked the commander chip → show a small popover listing
- *  None + every existing project. Reuses `.workspace-menu` (not
- *  `_aiSelectMount`) because this is a chip-row popover anchored next to
- *  the workspace chip — `_aiSelectMount` targets in-form dropdowns with
- *  different chrome (border / hover state / row height). */
-function _showCommanderProjectPicker(anchor) {
-  const old = document.getElementById('commander-project-picker');
-  if (old) { old.remove(); return; }
-
-  const menu = document.createElement('div');
-  menu.id = 'commander-project-picker';
-  menu.className = 'workspace-menu';
-  anchor.classList.add('chat-project-chip--open');
-
-  const items = [
-    { id: '', name: t('chat.project_none') },
-    ...((_projectsCache || []).map((p) => ({ id: p.project_id, name: p.name }))),
-  ];
-  for (const it of items) {
-    const isActive = (it.id || '') === (_commanderProjectId || '');
-    const row = document.createElement('div');
-    row.className = 'workspace-menu-item' + (isActive ? ' workspace-menu-item--active' : '');
-    const label = document.createElement('span');
-    label.textContent = it.name;
-    row.appendChild(label);
-    if (isActive) {
-      const check = document.createElement('span');
-      check.className = 'workspace-menu-check';
-      check.innerHTML = typeof window !== 'undefined' && typeof window.uiIconHtml === 'function'
-        ? window.uiIconHtml('check', 'ui-icon workspace-check-icon')
-        : '';
-      row.appendChild(check);
-    }
-    row.addEventListener('click', () => {
-      _commanderProjectId = it.id || '';
-      try {
-        if (_commanderProjectId) localStorage.setItem(_COMMANDER_LAST_PROJECT_KEY, _commanderProjectId);
-        else localStorage.setItem(_COMMANDER_LAST_PROJECT_KEY, _COMMANDER_NONE_SENTINEL);
-      } catch (_) {}
-      _renderCommanderProjectChip();
-      if (typeof refreshWorkspaceChip === 'function') refreshWorkspaceChip();
-      // Recipient validation: switching to a project that doesn't include
-      // the currently-picked agent must drop the chip back to commander
-      // (otherwise the user sends @<unbound-agent> + commander has nothing
-      // to dispatch to). No-op when commander or orphan project.
-      if (typeof validateRecipientAgainstProject === 'function') {
-        validateRecipientAgainstProject('new-chat', _commanderProjectId);
-      }
-      _closeMenu();
-    });
-    menu.appendChild(row);
-  }
-
-  const rect = anchor.getBoundingClientRect();
-  menu.style.position = 'fixed';
-  menu.style.left = rect.left + 'px';
-  menu.style.bottom = (window.innerHeight - rect.top + 4) + 'px';
-
-  document.body.appendChild(menu);
-
-  function _closeMenu() {
-    menu.remove();
-    anchor.classList.remove('chat-project-chip--open');
-    document.removeEventListener('mousedown', _onOutside);
-  }
-  function _onOutside(e) {
-    if (!menu.contains(e.target) && !anchor.contains(e.target)) _closeMenu();
-  }
-  setTimeout(() => document.addEventListener('mousedown', _onOutside), 0);
 }
 
 // ── Init ────────────────────────────────────────────────────────────────
@@ -723,14 +576,6 @@ document.addEventListener('DOMContentLoaded', () => {
     addBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       _startProjectInlineCreate();
-    });
-  }
-  // Commander chip click → open picker.
-  const commanderChip = document.getElementById('new-chat-project-chip');
-  if (commanderChip) {
-    commanderChip.addEventListener('click', (e) => {
-      e.stopPropagation();
-      _showCommanderProjectPicker(commanderChip);
     });
   }
   // Outside-click closes the ⋯ menu (mirrors KB).
@@ -747,7 +592,6 @@ document.addEventListener('DOMContentLoaded', () => {
     _closeProjectRowMenu();
     if (_projectsCache) {
       renderProjectsSection();
-      _renderCommanderProjectChip();
     }
   });
 });

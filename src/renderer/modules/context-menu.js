@@ -1,6 +1,6 @@
 // ─── Generic right-click context menu ───
 // Small floating menu anchored at the cursor; items are { label, onClick,
-// disabled? }. There's exactly one menu instance at a time — opening a new
+// disabled?, icon? }. There's exactly one menu instance at a time — opening a new
 // menu closes the previous one. Dismissers: outside click, Escape, scroll,
 // resize, and the i18n-change broadcast (label text may need refreshing).
 //
@@ -24,11 +24,14 @@ function showContextMenu(event, items) {
   const menu = document.createElement('div');
   menu.className = 'context-menu';
   menu.setAttribute('role', 'menu');
-  menu.innerHTML = _ctxMenuItems.map((it, idx) =>
-    `<button type="button" class="context-menu-item${it.disabled ? ' is-disabled' : ''}"`
+  menu.innerHTML = _ctxMenuItems.map((it, idx) => {
+    const icon = it.icon && typeof uiIconHtml === 'function'
+      ? `<span class="context-menu-icon">${uiIconHtml(it.icon)}</span>`
+      : '';
+    return `<button type="button" class="context-menu-item${it.disabled ? ' is-disabled' : ''}"`
     + ` data-context-menu-idx="${idx}" role="menuitem" tabindex="-1"`
-    + ` ${it.disabled ? 'disabled' : ''}>${escapeHtml(it.label)}</button>`
-  ).join('');
+    + ` ${it.disabled ? 'disabled' : ''}>${icon}<span class="context-menu-label">${escapeHtml(it.label)}</span></button>`;
+  }).join('');
   document.body.appendChild(menu);
   _ctxMenuEl = menu;
   _ctxMenuOpen = true;

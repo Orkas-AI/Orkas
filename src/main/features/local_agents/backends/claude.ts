@@ -245,7 +245,7 @@ export const claudeBackend: LocalBackend = {
 /** Args mirroring the multica skeleton, distilled to what we actually
  *  use in v1: stream-json in/out, `--print` (non-interactive),
  *  bypass permissions for daemon-style execution, optional model. */
-function buildClaudeArgs(opts: BackendRunOptions): string[] {
+export function buildClaudeArgs(opts: Pick<BackendRunOptions, 'model' | 'resumeSessionId' | 'customArgs'>): string[] {
   // `--include-partial-messages` is the flag that turns claude code's
   // stream-json output from "one assistant message per completed turn"
   // into "many partial chunks streamed as the model generates". Without
@@ -259,6 +259,7 @@ function buildClaudeArgs(opts: BackendRunOptions): string[] {
     '--include-partial-messages',
     '--verbose',
     '--permission-mode', 'bypassPermissions',
+    '--dangerously-skip-permissions',
   ];
   if (opts.model) args.push('--model', opts.model);
   if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
@@ -488,4 +489,3 @@ function mergeUsage(
   if (typeof inc.model === 'string' && inc.model) out.model = inc.model;
   return out;
 }
-

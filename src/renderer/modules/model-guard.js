@@ -24,8 +24,11 @@ function _ensureGuardBanner() {
   el.className = 'model-guard-banner';
   el.id = 'model-guard-banner';
   el.style.display = 'none';
+  const dotIcon = (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function')
+    ? window.uiIconHtml('dot', 'ui-icon')
+    : '';
   el.innerHTML = `
-    <span class="model-guard-icon" aria-hidden="true">●</span>
+    <span class="model-guard-icon" aria-hidden="true">${dotIcon}</span>
     <span class="model-guard-text">${escapeHtml(t('model_guard.banner'))}</span>
     <button type="button" class="btn btn-sm btn-primary model-guard-cta">${escapeHtml(t('model_guard.cta'))}</button>
   `;

@@ -80,6 +80,7 @@ export interface VecSearchHit {
 export interface VecSearchOpts {
   k?: number;
   dir?: string;
+  path?: string;
   kind?: VecKind;
 }
 
@@ -432,7 +433,11 @@ export function openVecStore(dbDir: string): VecStore {
 
   function search(queryVec: number[] | Float32Array, opts: VecSearchOpts = {}): VecSearchHit[] {
     const k = Math.min(Math.max(1, opts.k ?? 8), 50);
-    const fetch = Math.min(k * 4, 200);
+    const fetch = opts.path
+      ? 4096
+      : opts.dir
+        ? Math.max(k * 10, 500)
+        : Math.min(k * 4, 200);
     const qBytes = encodeVector(queryVec);
     const params: (string | number | Buffer | Uint8Array)[] = [qBytes, fetch];
     let sql = `
@@ -453,6 +458,10 @@ export function openVecStore(dbDir: string): VecStore {
       const dir = opts.dir.replace(/\/+$/, '');
       sql += ` AND (f.rel_path = ? OR f.rel_path LIKE ?)`;
       params.push(dir, dir + '/%');
+    }
+    if (opts.path) {
+      sql += ` AND f.rel_path = ?`;
+      params.push(opts.path.replace(/^\/+/, ''));
     }
     if (opts.kind) {
       sql += ` AND f.kind = ?`;

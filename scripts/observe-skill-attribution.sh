@@ -3,7 +3,7 @@
 #
 # One-shot e2e verifier for the skill-attribution signals
 # (skill_advertised / skill_invoked / agent_dispatched + the turn_id JOIN
-# guarantee from docs/plans/expert-signals-skill-attribution.md §3.4).
+# guarantee from Common/docs/plans/expert-signals-skill-attribution.md §3.4).
 #
 # Usage:
 #   PC/scripts/observe-skill-attribution.sh [<expected-skill-id>] [<timeout-seconds>]

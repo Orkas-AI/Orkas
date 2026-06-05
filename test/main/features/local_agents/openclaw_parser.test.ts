@@ -84,7 +84,7 @@ describe('local_agents/backends/openclaw › parseOpenclawReply', () => {
   "meta": {
     "agentMeta": {
       "sessionId": "s1",
-      "model": "claude-sonnet-4-6",
+      "model": "claude-opus-4-7",
       "usage": {
         "input_tokens": 1200,
         "output_tokens": 450,
@@ -98,7 +98,7 @@ describe('local_agents/backends/openclaw › parseOpenclawReply', () => {
       input: 1200,
       output: 450,
       cacheRead: 800,
-      model: 'claude-sonnet-4-6',
+      model: 'claude-opus-4-7',
     });
   });
 

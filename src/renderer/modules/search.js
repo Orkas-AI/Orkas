@@ -1,5 +1,5 @@
 // ─── Global search (Cmd+K) ───────────────────────────────────────────────
-// Live-search the knowledge base + chat history (per-user). Results are
+// Live-search the Library + chat history (per-user). Results are
 // grouped by kind; clicking one navigates to the source. Search history is
 // persisted in localStorage per user.
 
@@ -16,6 +16,9 @@ let _searchLastQuery = '';
 
 function _bindGlobalSearch() {
   document.getElementById('sidebar-search-btn')?.addEventListener('click', openGlobalSearch);
+  // Library page-header search button reuses the same Cmd+K overlay
+  // (Step 7 in the main-screen redesign — confirmed by user).
+  document.getElementById('contexts-page-header-search')?.addEventListener('click', openGlobalSearch);
   document.getElementById('search-close-btn')?.addEventListener('click', closeGlobalSearch);
   const input = document.getElementById('search-input');
   if (input && !input.dataset.bound) {
@@ -102,16 +105,35 @@ function _scheduleSearch(query) {
   _searchTimer = setTimeout(() => _runSearchNow(query), 150);
 }
 
+function _activeProjectIdForSearch() {
+  if (typeof currentView !== 'undefined' && currentView === 'project'
+      && typeof _projectDetailPid !== 'undefined' && _projectDetailPid) {
+    return _projectDetailPid;
+  }
+  if (typeof currentView !== 'undefined' && currentView === 'conversation'
+      && typeof currentCid !== 'undefined' && currentCid && Array.isArray(conversations)) {
+    const owner = conversations.find((c) => c && c.conversation_id === currentCid);
+    if (owner && owner.project_id) return owner.project_id;
+  }
+  return '';
+}
+
 async function _runSearchNow(queryArg) {
   const input = document.getElementById('search-input');
   const query = (queryArg !== undefined ? queryArg : (input?.value || '')).trim();
   if (!query) { _setSearchTabsVisible(false); _renderSearchEmptyState(); return; }
   const seq = ++_searchSeq;
   try {
+    const projectId = _activeProjectIdForSearch();
     const res = await apiFetch('/api/search/global', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query, scope: 'all', limit: _SEARCH_FETCH_LIMIT }),
+      body: JSON.stringify({
+        query,
+        scope: 'all',
+        limit: _SEARCH_FETCH_LIMIT,
+        ...(projectId ? { projectId } : {}),
+      }),
     });
     const data = await res.json();
     if (seq !== _searchSeq) return;     // a newer query arrived; drop this
@@ -228,6 +250,12 @@ function _renderSearchRow(r, dataIdx, query) {
   if (r.kind === 'context') {
     title = r.title || r.path;
     sub = r.path;
+    if (r.library_scope === 'project') {
+      if (r.project_name) {
+        projectChip = `<span class="search-result-project" title="${escapeHtml(r.project_name)}">${escapeHtml(r.project_name)}</span>`;
+      }
+      sub = r.project_name ? `${r.project_name} · ${r.path}` : r.path;
+    }
   } else if (r.kind === 'chat') {
     title = r.conv_title || t('chat.new_conv_title');
     sub = `${roleLabel(r.role)} · ${formatTime(r.time || '')}`;
@@ -271,7 +299,7 @@ function _renderSearchResults(query) {
   const parts = [];
   const visible = [];
 
-  // "All" tab order: chats → agents → skills → knowledge base; each
+  // "All" tab order: chats → agents → skills → Library; each
   // section caps at _SEARCH_ALL_PER_SECTION rows, with overflow
   // surfacing a "view more" button that jumps to the matching tab.
   // Other tabs render their own section only (no cap, so the user can
@@ -354,6 +382,18 @@ function _gotoSearchResult(r) {
   if (!r) return;
   closeGlobalSearch();
   if (r.kind === 'context') {
+    if (r.library_scope === 'project' && r.project_id) {
+      setView('project', r.project_id);
+      setTimeout(async () => {
+        try {
+          const res = await window.orkas.invoke('projects.files.absPath', { projectId: r.project_id, name: r.path });
+          if (res && res.ok && typeof openChatFileViewer === 'function') {
+            openChatFileViewer(res.path, r.title || r.path, { projectId: r.project_id });
+          }
+        } catch (_) { /* navigation best-effort */ }
+      }, 120);
+      return;
+    }
     setView('contexts');
     // Defer the file open so the contexts view has mounted its tree first —
     // openCtxFile renders into the viewer pane which only exists after setView.

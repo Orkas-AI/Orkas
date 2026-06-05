@@ -544,7 +544,7 @@ describe("Evolution: AgentRunner integration", () => {
   });
 
   // Per-turn `evaluateReflection` path removed in the reflection redesign
-  // (`docs/plans/reflection-redesign.md` §2.4). Reflection now runs only
+  // (`Common/docs/plans/reflection-redesign.md` §2.4). Reflection now runs only
   // from the orchestrator (`features/reflection-orchestrator.ts`); the
   // runner no longer owns reflection triggering.
 

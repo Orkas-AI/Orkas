@@ -37,10 +37,10 @@ import type { ChatFormPayload } from './router';
 import { buildMention, decodeSubmission } from './router';
 import type { GroupMessage } from './visibility';
 
-/** Per-cid mutex guarding plan-state transitions. Without this, when N
- * parallel-group agents finish nearly simultaneously, their reconcile
- * paths interleave — each reads the plan, finds the same downstream step
- * ready, and dispatches it. Result: one step gets dispatched N times.
+/** Per-cid mutex guarding plan-state transitions. Without this, when several
+ * agent finishes land close together, their reconcile paths interleave —
+ * each reads the plan, finds the same downstream step ready, and dispatches
+ * it. Result: one step gets dispatched N times.
  * The lock makes "read plan → mark step in_progress → enqueue" atomic
  * w.r.t. peer reconciles for the same cid. Plain `updateStep` from
  * outside reconcile (e.g. `transitionStepDone` invoked manually) is also
@@ -104,9 +104,9 @@ async function maybeRetryTransient(
 export type TurnTrigger =
   /** Step dispatched by the executor — agent / user-question / commander-self. */
   | { kind: 'plan_step'; step_index: number }
-  /** Plan-complete synthesis turn — commander wakes after every step
-   * terminated, charged with writing a closing summary to user. NO step
-   * transitions on this turn. */
+  /** Plan-complete fallback turn — commander wakes after every step
+   * terminated only when the executor decides a wrap-up is still needed.
+   * NO step transitions on this turn. */
   | { kind: 'plan_synth' }
   /** Default route from user, or any non-plan dispatch (manual @-mention,
    * etc). Won't drive plan transitions. */
@@ -124,6 +124,10 @@ export interface TurnFinishedEvent {
   /** Form extracted by the bus's post-stream parser (agents only). When
    * present, the step pauses (`blocked`) waiting on user form-fill. */
   form?: ChatFormPayload;
+  /** Lightweight multi-turn marker extracted from agent final text. `open`
+   * pauses the current plan step; `closed` completes it. Missing keeps the
+   * default one-shot behavior. */
+  planInteraction?: 'open' | 'closed';
   /** Files written via local-exec tools during this turn. */
   produced: string[];
   /** Agents created or updated from `<agent>...</agent>` containers
@@ -153,8 +157,8 @@ export interface TurnFinishedEvent {
  * `kind: 'silent'` — bus does NOT enqueue anything. Executor decided this
  *   turn produces no user-visible output.
  */
-export type TurnOutcome =
-  | {
+export type TurnOutcome = (
+  {
       kind: 'persist';
       text: string;
       form?: ChatFormPayload;
@@ -162,7 +166,14 @@ export type TurnOutcome =
       createdAgents?: Array<{ agent_id: string; name: string; kind: 'created' | 'updated' }>;
       createdSkills?: Array<{ skill_id: string; name: string; kind: 'created' | 'updated' }>;
     }
-  | { kind: 'silent' };
+  | { kind: 'silent' }
+) & {
+  /** Set when this turn transitioned a plan step. Bus uses it to wait until
+   * the final chat message is persisted before dispatching downstream work,
+   * so live placeholders cannot jump ahead of the message that produced
+   * the transition. */
+  planTransition?: { step_index: number };
+};
 
 export interface ReconcileCtx {
   /** The step whose dispatch this turn was carrying (passed through the
@@ -259,15 +270,13 @@ export async function onTurnFinished(
   }
 
   // All other paths potentially mutate plan state. Serialize per cid so
-  // concurrent agent finishes (parallel-group fork) don't double-dispatch
-  // the same downstream step. The lock spans the entire transition +
-  // reconcile chain so reads and writes within one turn-finished call
-  // can't interleave with another.
+  // near-simultaneous agent finishes don't race while marking steps done.
+  // Downstream dispatch happens later in bus, after the final message has
+  // been persisted.
   return _planLock(uid, cid).runExclusive(async () => {
     if (evt.trigger.kind === 'plan_step') {
       const outcome = await applyPlanStepTurn(uid, cid, evt, evt.trigger.step_index);
-      await reconcileAfterStepTransition(uid, cid);
-      return outcome;
+      return withPlanTransition(outcome, evt.trigger.step_index);
     }
     // user_direct: includes the form-unblock fallback (an agent post-form
     // reply triggers a plan transition through outcomeForUserDirectTurn).
@@ -331,8 +340,7 @@ async function outcomeForUserDirectTurn(uid: string, cid: string, evt: TurnFinis
       );
       if (active) {
         const outcome = await applyPlanStepTurn(uid, cid, evt, active.index);
-        await reconcileAfterStepTransition(uid, cid);
-        return outcome;
+        return withPlanTransition(outcome, active.index);
       }
     }
   }
@@ -379,6 +387,13 @@ async function outcomeForUserDirectTurn(uid: string, cid: string, evt: TurnFinis
   // agent empty + no side effects.
   if (evt.errText) return { kind: 'persist', text: errorBubble(evt.errText) };
   return { kind: 'persist', text: '(no reply)' };
+}
+
+function withPlanTransition(outcome: TurnOutcome, stepIndex: number): TurnOutcome {
+  return {
+    ...outcome,
+    planTransition: { step_index: stepIndex },
+  };
 }
 
 /** Plan-step turn — apply state transition + return outcome for bus. */
@@ -430,6 +445,25 @@ async function applyPlanStepTurn(
     };
   }
 
+  // Natural-language interaction pause: an interactive agent wants to keep
+  // talking with the user before the plan step completes. Unlike forms,
+  // there is no form payload; the blocked step itself makes the renderer
+  // route the next user reply back to this agent.
+  if (evt.planInteraction === 'open') {
+    await updateStep(uid, cid, step.index, 'blocked', {
+      output_msg_id: '',
+    });
+    _hooks!.emitPlanChanged(uid, cid);
+    log.info(`plan-step blocked (agent interaction open) cid=${cid} step=${step.index}`);
+    return {
+      kind: 'persist',
+      text: evt.finalText || '',
+      ...(evt.produced.length ? { produced: evt.produced } : {}),
+      ...(evt.createdAgents && evt.createdAgents.length ? { createdAgents: evt.createdAgents } : {}),
+      ...(evt.createdSkills && evt.createdSkills.length ? { createdSkills: evt.createdSkills } : {}),
+    };
+  }
+
   // Spurious-empty tool-only turn (commander finished plan_set, etc.).
   if (
     evt.actor.kind === 'commander'
@@ -448,6 +482,10 @@ async function applyPlanStepTurn(
   // Empty final without form / err → silent + don't transition. (Rare;
   // legitimate "thinking but nothing produced" — keeps step in_progress.)
   if (!evt.finalText || !evt.finalText.trim()) {
+    if (evt.planInteraction === 'closed') {
+      await transitionStepDone(uid, cid, step, '', evt.produced, '');
+      return { kind: 'silent' };
+    }
     if (evt.actor.kind === 'commander') return { kind: 'silent' };
     // agent empty: persist placeholder, mark done so plan can advance.
     await transitionStepDone(uid, cid, step, '', evt.produced, '');
@@ -515,17 +553,55 @@ async function transitionStepFailed(
   _hooks!.emitPlanChanged(uid, cid);
 }
 
+/** Backfill the persisted chat message id for the step that produced it.
+ * `onTurnFinished` runs before bus has enqueued the final message, so the
+ * state transition can only write an empty `output_msg_id`. Bus calls this
+ * after enqueue returns with the real message id. */
+export async function recordPersistedStepMessage(
+  uid: string,
+  cid: string,
+  stepIndex: number,
+  msg: { id: string; text?: string; files?: string[] },
+): Promise<void> {
+  if (!msg.id || !Number.isFinite(stepIndex) || stepIndex <= 0) return;
+  await _planLock(uid, cid).runExclusive(async () => {
+    const plan = await readPlan(uid, cid);
+    const step = plan?.steps.find((s) => s.index === stepIndex);
+    if (!step) return;
+
+    const patch: {
+      output_summary?: string;
+      output_files?: string[];
+      output_msg_id?: string;
+    } = {};
+    if (step.output_msg_id !== msg.id) patch.output_msg_id = msg.id;
+    if (!step.output_summary && msg.text) patch.output_summary = captureOutput(msg.text);
+    if ((!step.output_files || step.output_files.length === 0) && msg.files?.length) {
+      patch.output_files = msg.files;
+    }
+    if (!Object.keys(patch).length) return;
+
+    await updateStep(uid, cid, step.index, step.status, patch);
+    _hooks?.emitPlanChanged(uid, cid);
+  });
+}
+
 /** Fired after a step transition to dispatch downstream + check terminal.
  *  Exported so user-driven recovery actions (`retryStep` / `skipStep`) can
  *  reuse the exact same dispatch path the bus uses internally. */
 export async function reconcileAfterStepTransition(uid: string, cid: string): Promise<void> {
+  if (!_hooks) return;
+  return _planLock(uid, cid).runExclusive(async () => {
+    await reconcileAfterStepTransitionNoLock(uid, cid);
+  });
+}
+
+async function reconcileAfterStepTransitionNoLock(uid: string, cid: string): Promise<void> {
   const plan = await readPlan(uid, cid);
   if (!plan?.steps?.length) return;
   await dispatchReady(uid, cid, plan);
   const terminalNow = await readPlan(uid, cid);
-  if (terminalNow && isPlanTerminal(terminalNow) && !terminalNow.completed_signaled) {
-    await firePlanComplete(uid, cid, terminalNow);
-  }
+  await handlePlanTerminal(uid, cid, terminalNow);
 }
 
 function errorBubble(msg: string): string {
@@ -610,33 +686,107 @@ export async function retryStep(
       }
       return { ok: false, error: `step is not in failed state (current: ${step.status})` };
     }
-    await updateStep(uid, cid, stepIndex, 'pending', {
-      failure_reason: '',
-      output_msg_id: '',
-      transient_attempts: 0,
-      pending_form_id: '',
-    });
-    // Unblock cascade-skipped downstream: when step N failed under
-    // `abort_plan` policy, applyTermination marked all not-yet-terminal
-    // steps `skipped` with reason `aborted by step N failure`. Retrying
-    // step N should also re-arm those cascade victims; users explicitly
-    // skipped via the rail's "skip" button keep their reason and are NOT
-    // re-armed (their reason is the original failure_reason verbatim).
-    const cascadeReason = `aborted by step ${stepIndex} failure`;
-    const fresh = await readPlan(uid, cid);
-    if (fresh) {
-      for (const s of fresh.steps) {
-        if (s.status === 'skipped' && s.failure_reason === cascadeReason) {
-          await updateStep(uid, cid, s.index, 'pending', {
-            failure_reason: '',
-          });
-        }
-      }
-    }
+    await rearmFailedStepNoLock(uid, cid, stepIndex);
     log.info(`plan-step retry-requested cid=${cid} step=${stepIndex}`);
     _hooks!.emitPlanChanged(uid, cid);
-    await reconcileAfterStepTransition(uid, cid);
+    await reconcileAfterStepTransitionNoLock(uid, cid);
     return { ok: true };
+  });
+}
+
+async function rearmFailedStepNoLock(uid: string, cid: string, stepIndex: number): Promise<void> {
+  await updateStep(uid, cid, stepIndex, 'pending', {
+    failure_reason: '',
+    output_msg_id: '',
+    transient_attempts: 0,
+    pending_form_id: '',
+  });
+  // Unblock cascade-skipped downstream: when step N failed under
+  // `abort_plan` policy, applyTermination marked all not-yet-terminal
+  // steps `skipped` with reason `aborted by step N failure`. Retrying
+  // step N should also re-arm those cascade victims; users explicitly
+  // skipped via the rail's old "skip" button keep their reason and are
+  // NOT re-armed (their reason is the original failure_reason verbatim).
+  const cascadeReason = `aborted by step ${stepIndex} failure`;
+  const fresh = await readPlan(uid, cid);
+  if (fresh) {
+    for (const s of fresh.steps) {
+      if (s.status === 'skipped' && s.failure_reason === cascadeReason) {
+        await updateStep(uid, cid, s.index, 'pending', {
+          failure_reason: '',
+        });
+      }
+    }
+  }
+}
+
+/** Plan-level continue action used by the unified rail control. The UI no
+ * longer targets individual steps; the executor picks the first recoverable
+ * failed step and runs the same retry/reconcile path. If an old run left an
+ * `in_progress` step behind with no active worker, collapse it to `failed`
+ * first so the state shown to users stays simple: failed → continue. */
+export async function continuePlan(
+  uid: string, cid: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!_hooks) return { ok: false, error: 'executor not bound' };
+  return _planLock(uid, cid).runExclusive(async () => {
+    let plan = await readPlan(uid, cid);
+    if (!plan) return { ok: false, error: 'no plan' };
+
+    for (const step of plan.steps) {
+      if (step.status === 'in_progress') {
+        await updateStep(uid, cid, step.index, 'failed', {
+          failure_reason: 'execution interrupted',
+          output_msg_id: '',
+        });
+      }
+    }
+
+    plan = await readPlan(uid, cid);
+    if (!plan) return { ok: false, error: 'no plan' };
+    const failed = plan.steps.find((s) => s.status === 'failed');
+    if (failed) {
+      await rearmFailedStepNoLock(uid, cid, failed.index);
+      log.info(`plan-continue retrying cid=${cid} step=${failed.index}`);
+      _hooks!.emitPlanChanged(uid, cid);
+      await reconcileAfterStepTransitionNoLock(uid, cid);
+      return { ok: true };
+    }
+
+    const ready = findReadySteps(plan);
+    if (ready.length) {
+      log.info(`plan-continue reconciling ready steps cid=${cid} ready=${ready.map((s) => s.index).join(',')}`);
+      await reconcileAfterStepTransitionNoLock(uid, cid);
+      return { ok: true };
+    }
+
+    return { ok: false, error: 'no failed step to continue' };
+  });
+}
+
+/** Best-effort cleanup after a user stop or stale-process sweep. */
+export async function failInProgressSteps(
+  uid: string, cid: string, reason = 'execution interrupted',
+): Promise<number> {
+  if (!_hooks) return 0;
+  return _planLock(uid, cid).runExclusive(async () => {
+    const plan = await readPlan(uid, cid);
+    if (!plan) return 0;
+    let changed = 0;
+    for (const step of plan.steps) {
+      if (step.status === 'in_progress') {
+        await updateStep(uid, cid, step.index, 'failed', {
+          failure_reason: reason,
+          output_msg_id: '',
+        });
+        changed += 1;
+      }
+    }
+    if (changed) {
+      log.info(`plan marked in_progress failed cid=${cid} count=${changed} reason=${reason}`);
+      _hooks!.emitPlanChanged(uid, cid);
+    }
+    return changed;
   });
 }
 
@@ -662,19 +812,18 @@ export async function skipStep(
     });
     log.info(`plan-step skip-requested cid=${cid} step=${stepIndex}`);
     _hooks!.emitPlanChanged(uid, cid);
-    await reconcileAfterStepTransition(uid, cid);
+    await reconcileAfterStepTransitionNoLock(uid, cid);
     return { ok: true };
   });
 }
 
 /** Main entry point. Mark the finished step done (if any), then dispatch
- *  every step that's now ready. Re-entrant: dispatching may itself trigger
+ *  one step that's now ready. Re-entrant: dispatching may itself trigger
  *  more reconciles via the enqueue chain; the "find ready + dispatch" loop
  *  is idempotent (a step in `in_progress` won't re-dispatch).
  *
- *  Mutex-serialized per cid — without this, concurrent reconciles (e.g.
- *  three parallel-group agents finishing at the same time) can each see
- *  the same downstream step as `pending` and dispatch it multiple times. */
+ *  Mutex-serialized per cid — without this, concurrent reconciles can each
+ *  see the same downstream step as `pending` and dispatch it multiple times. */
 export async function reconcile(uid: string, cid: string, ctx: ReconcileCtx = {}): Promise<void> {
   if (!_hooks) return;
   return _planLock(uid, cid).runExclusive(async () => {
@@ -688,15 +837,13 @@ export async function reconcile(uid: string, cid: string, ctx: ReconcileCtx = {}
     const updated = await readPlan(uid, cid);
     if (!updated) return;
 
-    // 3. Find ready + dispatch (grouped by parallel_group).
+    // 3. Find ready + dispatch one step.
     await dispatchReady(uid, cid, updated);
 
-    // 4. If everything terminal and not yet signaled, fire plan-complete to
-    //    commander so it can wrap up for user.
+    // 4. If everything is terminal, mark the plan handled. Only fire an
+    //    extra commander wrap-up when the finished plan still needs one.
     const terminalNow = await readPlan(uid, cid);
-    if (terminalNow && isPlanTerminal(terminalNow) && !terminalNow.completed_signaled) {
-      await firePlanComplete(uid, cid, terminalNow);
-    }
+    await handlePlanTerminal(uid, cid, terminalNow);
   });
 }
 
@@ -831,46 +978,30 @@ function captureOutput(text: string): string {
 async function dispatchReady(uid: string, cid: string, plan: PlanFile): Promise<void> {
   const ready = findReadySteps(plan);
   if (!ready.length) return;
-  // Group by parallel_group; steps without group dispatch solo. Within a
-  // group, all steps fire in this same reconcile pass (one DOM tick).
-  const groups = new Map<string, PlanStep[]>();
-  for (const s of ready) {
-    const k = s.parallel_group || `_solo_${s.index}`;
-    if (!groups.has(k)) groups.set(k, []);
-    groups.get(k)!.push(s);
-  }
-  // Expert-signals: emit one `agent_dispatched` signal per group BEFORE
+  // Parallel step execution is disabled: dispatch only the earliest ready
+  // step. If several steps are ready (including legacy plans with
+  // `parallel_group` or multiple `wait_for: []` entries), later steps run
+  // after the current one finishes and reconciliation runs again.
+  const step = ready.slice().sort((a, b) => a.index - b.index)[0];
+  // Expert-signals: emit one `agent_dispatched` signal BEFORE
   // wakening — we want the audit record even if the enqueue downstream
-  // throws. turn_id is synthesized (this signal's consumer use case is
-  // aggregation — "did commander dispatch multiple agents to the same
-  // query?" — not JOIN with other signals; see expert-signals plan §4.3
-  // + reservation against cross-signal JOIN). Best-effort.
+  // throws. turn_id is synthesized; see expert-signals plan §4.3.
+  // Best-effort.
   try {
     const { emitSignal } = await import('../expert_signals');
     const { buildAgentDispatchedSignal } = await import('../expert_signals/extractors/event');
-    const baseTs = Date.now();
-    let i = 0;
-    for (const [groupKey, steps] of groups) {
-      const assignees = steps.map((s) => s.assignee).filter(Boolean);
-      const parallel_group = groupKey.startsWith('_solo_') ? null : groupKey;
-      emitSignal(uid, buildAgentDispatchedSignal({
-        cid,
-        // `plan:dispatch:<ts>:<i>` is unique per emit. Documented in the
-        // signal builder comment.
-        turn_id: `${cid}:plan:dispatch:${baseTs}:${i++}`,
-        candidates: assignees.slice(),
-        dispatched: assignees.slice(),
-        parallel_group,
-      }));
-    }
+    const assignees = step.assignee ? [step.assignee] : [];
+    emitSignal(uid, buildAgentDispatchedSignal({
+      cid,
+      turn_id: `${cid}:plan:dispatch:${Date.now()}:0`,
+      candidates: assignees.slice(),
+      dispatched: assignees.slice(),
+      parallel_group: null,
+    }));
   } catch (err) {
     log.warn(`agent_dispatched emit failed cid=${cid}: ${(err as Error).message}`);
   }
-  for (const [, steps] of groups) {
-    for (const step of steps) {
-      await dispatchStep(uid, cid, step, plan);
-    }
-  }
+  await dispatchStep(uid, cid, step, plan);
 }
 
 async function dispatchStep(
@@ -985,16 +1116,44 @@ function buildUserStepForm(step: PlanStep): ChatFormPayload {
   };
 }
 
-// ── Plan-complete signal ─────────────────────────────────────────────────
+// ── Plan-complete fallback ────────────────────────────────────────────────
+
+async function handlePlanTerminal(uid: string, cid: string, plan: PlanFile | null): Promise<void> {
+  if (!_hooks || !plan?.steps?.length) return;
+  if (!isPlanTerminal(plan) || plan.completed_signaled) return;
+
+  await markPlanCompletedSignaled(uid, cid);
+  _hooks.emitPlanChanged(uid, cid);
+
+  if (!needsPlanCompleteFallback(plan)) {
+    log.info(`plan-complete handled silently cid=${cid} steps=${plan.steps.length}`);
+    return;
+  }
+
+  await firePlanComplete(uid, cid, plan);
+}
+
+function needsPlanCompleteFallback(plan: PlanFile): boolean {
+  if (plan.steps.some((s) => s.status === 'failed' || s.status === 'skipped')) return true;
+  const last = plan.steps[plan.steps.length - 1];
+  if (!last?.output_msg_id && !last?.output_summary && !(last?.output_files && last.output_files.length)) return true;
+  return userExplicitlyAskedForWrapUp(plan.initial_message || '');
+}
+
+function userExplicitlyAskedForWrapUp(text: string): boolean {
+  const src = String(text || '').trim();
+  if (!src) return false;
+  return /(?:最后|最终|最后由|最终由).{0,12}(?:总结|汇总|收尾|报告)/i.test(src)
+    || /(?:总结|汇总|收尾).{0,12}(?:所有|全部|整体|最终|最后|各.{0,4}结果|交付|成果)/i.test(src)
+    || /\b(?:final|overall|wrap[-\s]?up|closing)\s+(?:summary|report|synthesis)\b/i.test(src)
+    || /\b(?:summari[sz]e|synthesis)\s+(?:everything|all|the\s+results|the\s+deliverables)\b/i.test(src);
+}
 
 async function firePlanComplete(uid: string, cid: string, plan: PlanFile): Promise<void> {
   if (!_hooks) return;
-  await markPlanCompletedSignaled(uid, cid);
-  _hooks.emitPlanChanged(uid, cid);
-  // Wake commander with a synthesis prompt that has all step outputs in
-  // scope. Commander's prompt knows what to do (write user-facing summary).
-  // No persisted chat message — only the eventual commander → user reply
-  // shows up to the user.
+  // Wake commander with a compact fallback prompt. This is no longer the
+  // normal completion path; regular plans should put any desired synthesis
+  // in an explicit commander step.
   const summary = plan.steps.map((s) =>
     `[Step ${s.index} | ${s.title} | ${s.assignee} | ${s.status}]${s.output_summary ? ` ${s.output_summary}` : ''}${s.output_files?.length ? ` files: ${s.output_files.join(', ')}` : ''}`,
   ).join('\n');
@@ -1005,7 +1164,7 @@ async function firePlanComplete(uid: string, cid: string, plan: PlanFile): Promi
     `Step results:`,
     summary,
     ``,
-    `All plan steps have terminated. Based on each step's output above, write a wrap-up report for the user: deliverables + key process points + suggested follow-up actions (if any). If any step failed, you must honestly tell the user which step failed and why.`,
+    `The plan has terminated and still needs a user-facing wrap-up because there was a failure/skipped step, no visible final output, or the user explicitly asked for a final synthesis. Write a concise wrap-up. If any step failed or was skipped, state which step and why.`,
     `</plan-complete>`,
   ].join('\n');
   await _hooks.pushCommanderTurn(uid, cid, {

@@ -1,3 +1,5 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { describe, it, expect } from 'vitest';
 import {
   CATALOG,
@@ -13,6 +15,7 @@ import {
   providerSubscriptionNote,
   sortProviderIds,
   curatedModelsFor,
+  resolveConfiguredPiModel,
   pickLatestGenerations,
 } from '../../../src/main/model/provider_catalog';
 
@@ -104,6 +107,21 @@ describe('provider_catalog › CURATED_MODELS', () => {
     expect(ids).toEqual(['kimi-k2.6', 'kimi-k2.5']);
   });
 
+  it('minimax catalog exposes M3 before the M2.7 generation', () => {
+    const directIds = (CURATED_MODELS['minimax-cn'] || []).map((m) => m.id);
+    expect(directIds).toEqual([
+      'MiniMax-M3',
+      'MiniMax-M2.7',
+      'MiniMax-M2.7-highspeed',
+    ]);
+
+    const globalPortalIds = (CURATED_MODELS['minimax-portal'] || []).map((m) => m.id);
+    expect(globalPortalIds).toEqual(directIds);
+
+    const portalIds = (CURATED_MODELS['minimax-portal-cn'] || []).map((m) => m.id);
+    expect(portalIds).toEqual(directIds);
+  });
+
   it('openrouter catalog includes DeepSeek / Qwen / GLM / Kimi / MiniMax', () => {
     const ids = (CURATED_MODELS.openrouter || []).map((m) => m.id);
     expect(ids.some((id) => id.startsWith('deepseek/'))).toBe(true);
@@ -111,6 +129,18 @@ describe('provider_catalog › CURATED_MODELS', () => {
     expect(ids.some((id) => id.startsWith('z-ai/'))).toBe(true);
     expect(ids.some((id) => id.startsWith('moonshotai/'))).toBe(true);
     expect(ids.some((id) => id.startsWith('minimax/'))).toBe(true);
+    expect(ids).toContain('minimax/minimax-m3');
+    expect(ids).toContain('minimax/minimax-m2.7');
+  });
+
+  it('openrouter Claude catalog is limited to Opus 4.8 and 4.7', () => {
+    const claudeIds = (CURATED_MODELS.openrouter || [])
+      .map((m) => m.id)
+      .filter((id) => id.includes('/claude-'));
+    expect(claudeIds).toEqual([
+      'anthropic/claude-opus-4.8',
+      'anthropic/claude-opus-4.7',
+    ]);
   });
 
   it('curatedModelsFor returns a shallow copy safe to mutate', () => {
@@ -123,6 +153,147 @@ describe('provider_catalog › CURATED_MODELS', () => {
 
   it('curatedModelsFor returns [] for unknown providers (triggers pi-ai fallback)', () => {
     expect(curatedModelsFor('no-such-provider-id')).toEqual([]);
+  });
+
+  it('curatedModelsFor can be overridden by Server remote-config cache', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const uid = 'modelcfgtest';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    storage.writeJsonSync(file, {
+      version: 1,
+      active: {
+        immediate: {
+          model_catalog: {
+            providers: {
+              openai: [{ id: 'gpt-test-next', name: 'GPT Test Next' }],
+            },
+          },
+        },
+      },
+    });
+    try {
+      expect(curatedModelsFor('openai')).toEqual([
+        { id: 'gpt-test-next', name: 'GPT Test Next' },
+      ]);
+      expect(curatedModelsFor('anthropic').length).toBeGreaterThan(0);
+      expect(CURATED_MODELS.openai?.[0]?.id).not.toBe('gpt-test-next');
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it('curatedModelsFor reflects a Server model upgrade and removal', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const uid = 'modelcfgupgrade';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    storage.writeJsonSync(file, {
+      version: 1,
+      active: {
+        immediate: {
+          model_catalog: {
+            providers: {
+              anthropic: [
+                { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
+                { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
+              ],
+            },
+          },
+        },
+      },
+    });
+    try {
+      expect(curatedModelsFor('anthropic').map((m) => m.id)).toEqual([
+        'claude-opus-4-8',
+        'claude-opus-4-7',
+      ]);
+      expect(curatedModelsFor('anthropic').map((m) => m.id)).not.toContain('claude-opus-4-6');
+      expect(curatedModelsFor('anthropic').map((m) => m.id)).not.toContain('claude-sonnet-4-6');
+      expect(curatedModelsFor('openai').length).toBeGreaterThan(0);
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it('resolves configured model ids by cloning a same-family pi-ai template', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const storage = await import('../../../src/main/storage');
+    const uid = 'modelcfgfallback';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+    storage.writeJsonSync(file, {
+      version: 1,
+      active: {
+        immediate: {
+          model_catalog: {
+            providers: {
+              anthropic: [
+                { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
+                { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
+              ],
+            },
+          },
+        },
+      },
+    });
+    const template = {
+      id: 'claude-opus-4-7',
+      name: 'Claude Opus 4.7',
+      api: 'anthropic-messages',
+      provider: 'anthropic',
+      baseUrl: 'https://api.anthropic.com',
+      reasoning: true,
+      input: ['text'],
+      cost: { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1 },
+      contextWindow: 200000,
+      maxTokens: 32000,
+    };
+    const catalog = {
+      getPiModel(provider: string, model: string) {
+        return provider === 'anthropic' && model === 'claude-opus-4-7'
+          ? template as any
+          : undefined;
+      },
+    };
+    try {
+      const resolved = resolveConfiguredPiModel(catalog, 'anthropic', 'claude-opus-4-8');
+      expect(resolved?.needsCustomModel).toBe(true);
+      expect(resolved?.isConfiguredFallback).toBe(true);
+      expect(resolved?.templateModelId).toBe('claude-opus-4-7');
+      expect(resolved?.model.id).toBe('claude-opus-4-8');
+      expect(resolved?.model.name).toBe('Claude Opus 4.8');
+      expect(resolved?.model.api).toBe(template.api);
+
+      const exactCatalog = {
+        getPiModel(provider: string, model: string) {
+          return provider === 'anthropic' && model === 'claude-opus-4-8'
+            ? { ...template, id: 'claude-opus-4-8', name: 'Claude Opus 4.8' } as any
+            : undefined;
+        },
+      };
+      const exact = resolveConfiguredPiModel(exactCatalog, 'anthropic', 'claude-opus-4-8');
+      expect(exact?.needsCustomModel).toBe(false);
+      expect(exact?.isConfiguredFallback).toBe(false);
+      expect(exact?.templateModelId).toBe('claude-opus-4-8');
+
+      const wrongFamilyCatalog = {
+        getPiModel(provider: string, model: string) {
+          return provider === 'anthropic' && model === 'claude-haiku-4-8'
+            ? { ...template, id: 'claude-haiku-4-8', name: 'Claude Haiku 4.8' } as any
+            : undefined;
+        },
+      };
+      expect(resolveConfiguredPiModel(wrongFamilyCatalog, 'anthropic', 'claude-opus-4-8')).toBeNull();
+      expect(resolveConfiguredPiModel(catalog, 'anthropic', 'claude-opus-4-9')).toBeNull();
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
   });
 });
 

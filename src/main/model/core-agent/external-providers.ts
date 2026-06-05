@@ -37,7 +37,7 @@
  */
 
 import type { LLMProvider } from '#core-agent';
-import type { Model } from '@mariozechner/pi-ai';
+import type { Model } from '@earendil-works/pi-ai';
 import { curatedModelsFor } from '../provider_catalog';
 
 // core-agent is an ESM package and the Orkas main process is CJS, so

@@ -10,6 +10,8 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
+import { macosTccSensitivePath } from '../util/macos-tcc';
+
 export interface ConversationWorkspaceFile {
   path: string;
   relPath: string;
@@ -24,6 +26,8 @@ export interface ConversationWorkspaceFileList {
   count: number;
   truncated: boolean;
   rootExists: boolean;
+  scanSkipped?: boolean;
+  skipReason?: string;
 }
 
 const DEFAULT_MAX_FILES = 5000;
@@ -42,6 +46,19 @@ export function listWorkspaceFiles(
   const maxDepth = Math.max(0, Math.floor(opts.maxDepth ?? DEFAULT_MAX_DEPTH));
   const items: ConversationWorkspaceFile[] = [];
   let truncated = false;
+
+  const protectedRoot = macosTccSensitivePath(rootAbs, { recursive: true });
+  if (protectedRoot) {
+    return {
+      root: rootAbs,
+      items,
+      count: 0,
+      truncated: false,
+      rootExists: true,
+      scanSkipped: true,
+      skipReason: protectedRoot.reason,
+    };
+  }
 
   let rootStat: fs.Stats;
   try { rootStat = fs.statSync(rootAbs); }

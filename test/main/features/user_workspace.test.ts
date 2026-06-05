@@ -5,16 +5,25 @@ import * as path from 'node:path';
 
 let tmpDir: string;
 let prevWs: string | undefined;
+let prevHome: string | undefined;
+let prevGuard: string | undefined;
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-ws-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
+  prevHome = process.env.HOME;
+  prevGuard = process.env.ORKAS_TCC_GUARD_FORCE;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
+  delete process.env.ORKAS_TCC_GUARD_FORCE;
   vi.resetModules();
 });
 
 afterEach(() => {
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+  if (prevHome === undefined) delete process.env.HOME;
+  else process.env.HOME = prevHome;
+  if (prevGuard === undefined) delete process.env.ORKAS_TCC_GUARD_FORCE;
+  else process.env.ORKAS_TCC_GUARD_FORCE = prevGuard;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -104,6 +113,38 @@ describe('user_workspace › setWorkspacePath', () => {
     const result = ws.setWorkspacePath('user123', dir);
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.path).toBe(dir);
+  });
+
+  it('allows macOS privacy-protected workspace roots selected by the user', async () => {
+    process.env.ORKAS_TCC_GUARD_FORCE = '1';
+    const home = path.join(tmpDir, 'fake-home');
+    const downloads = path.join(home, 'Downloads');
+    fs.mkdirSync(downloads, { recursive: true });
+    process.env.HOME = home;
+    const ws = await import('../../../src/main/features/user_workspace');
+
+    const result = ws.setWorkspacePath('userProtected', downloads);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.path).toBe(downloads);
+
+    expect(ws.getWorkspacePath('userProtected')).toBe(downloads);
+    const info = ws.getWorkspaceInfo('userProtected');
+    expect(info.currentPath).toBe(downloads);
+  });
+
+  it('allows ordinary project directories under the home folder', async () => {
+    process.env.ORKAS_TCC_GUARD_FORCE = '1';
+    const home = path.join(tmpDir, 'fake-home');
+    const projectDir = path.join(home, 'Projects', 'app');
+    fs.mkdirSync(projectDir, { recursive: true });
+    process.env.HOME = home;
+    const ws = await import('../../../src/main/features/user_workspace');
+
+    const result = ws.setWorkspacePath('userProjectDir', projectDir);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.path).toBe(projectDir);
   });
 });
 
@@ -245,6 +286,45 @@ describe('user_workspace › scoped (projects)', () => {
     expect(projInfo.recentPaths).not.toContain(defA);
   });
 
+  it('getWorkspaceInfo does not stat recent paths while rendering the chip', async () => {
+    const ws = await import('../../../src/main/features/user_workspace');
+    const cfgFile = path.join(tmpDir, 'userProtected', 'local', 'workspace.json');
+    fs.mkdirSync(path.dirname(cfgFile), { recursive: true });
+    const protectedRecent = path.join(tmpDir, 'missing-protected-recent');
+    fs.writeFileSync(cfgFile, JSON.stringify({
+      selectedPath: '',
+      updatedAt: '2026-06-03T00:00:00.000Z',
+      recentPaths: [protectedRecent],
+    }));
+
+    const info = ws.getWorkspaceInfo('userProtected');
+    expect(fs.existsSync(protectedRecent)).toBe(false);
+    expect(info.recentPaths).toContain(protectedRecent);
+  });
+
+  it('keeps a legacy protected selectedPath without statting it', async () => {
+    process.env.ORKAS_TCC_GUARD_FORCE = '1';
+    const home = path.join(tmpDir, 'fake-home');
+    const desktop = path.join(home, 'Desktop');
+    fs.mkdirSync(desktop, { recursive: true });
+    process.env.HOME = home;
+    const ws = await import('../../../src/main/features/user_workspace');
+    const p = await import('../../../src/main/paths');
+    const cfgFile = path.join(tmpDir, 'userLegacyProtected', 'local', 'workspace.json');
+    fs.mkdirSync(path.dirname(cfgFile), { recursive: true });
+    fs.writeFileSync(cfgFile, JSON.stringify({
+      selectedPath: desktop,
+      updatedAt: '2026-06-03T00:00:00.000Z',
+      recentPaths: [path.join(home, 'Downloads')],
+    }));
+
+    expect(ws.getWorkspacePath('userLegacyProtected')).toBe(desktop);
+    const info = ws.getWorkspaceInfo('userLegacyProtected');
+    expect(info.currentPath).toBe(desktop);
+    expect(info.defaultPath).toBe(p.DEFAULT_USER_WORKSPACE);
+    expect(info.recentPaths).toEqual([path.join(home, 'Downloads')]);
+  });
+
   it('reset on project scope falls through to default; default scope intact', async () => {
     const ws = await import('../../../src/main/features/user_workspace');
     const defaultDir = path.join(tmpDir, 'reset-def');
@@ -289,6 +369,31 @@ describe('user_workspace › scoped (projects)', () => {
     // DEFAULT_USER_WORKSPACE).
     const p = await import('../../../src/main/paths');
     expect(ws.getWorkspacePath('userPurge', 'p_drop')).toBe(p.DEFAULT_USER_WORKSPACE);
+  });
+});
+
+describe('user_workspace › sweepEmptyConvDirs', () => {
+  it('skips user-selected external workspace roots on boot cleanup', async () => {
+    const ws = await import('../../../src/main/features/user_workspace');
+    const cfgFile = path.join(tmpDir, 'userSweep', 'local', 'workspace.json');
+    const external = path.join(tmpDir, 'external-workspace');
+    const externalEmpty = path.join(external, 'empty-turn-dir');
+    const managed = path.join(tmpDir, '..', 'userWorkSpace');
+    const managedEmpty = path.join(managed, 'empty-turn-dir');
+    fs.mkdirSync(path.dirname(cfgFile), { recursive: true });
+    fs.mkdirSync(externalEmpty, { recursive: true });
+    fs.mkdirSync(managedEmpty, { recursive: true });
+    fs.writeFileSync(cfgFile, JSON.stringify({
+      selectedPath: external,
+      updatedAt: '2026-06-03T00:00:00.000Z',
+      recentPaths: [],
+    }));
+
+    const result = ws.sweepEmptyConvDirs('userSweep');
+
+    expect(result.swept).toBe(1);
+    expect(fs.existsSync(externalEmpty)).toBe(true);
+    expect(fs.existsSync(managedEmpty)).toBe(false);
   });
 });
 

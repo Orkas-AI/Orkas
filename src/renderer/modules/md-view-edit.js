@@ -73,6 +73,9 @@ function _mveDefaultCapabilities(kind) {
   if (kind === 'workspace') {
     return { edit: true, save: true, delete: false, reveal: true, taskCheckbox: true };
   }
+  if (kind === 'project-file') {
+    return { edit: true, save: true, delete: true, reveal: true, taskCheckbox: true };
+  }
   // ephemeral
   return { edit: true, save: false, delete: false, reveal: false, taskCheckbox: false };
 }
@@ -173,6 +176,19 @@ function mountMdViewEdit(opts) {
   function isDirty()  { return state.mode === 'edit' && state.draft !== state.content; }
   function getDraft() { return { content: state.draft, isPreview: state.preview }; }
   function getSource() { return state.source; }
+  /** Update the controller's source descriptor in place. Used when the
+   *  host renamed the underlying file out from under us — `state.draft`
+   *  / `state.content` stay intact (rename doesn't change bytes), only
+   *  the address used by future read/write IPC swaps. Caller is
+   *  responsible for surface updates (e.g. the host's path label);
+   *  controller doesn't re-render. Without this, saves after an inline
+   *  rename hit the backend with the stale path and the user gets a
+   *  spurious `not found` alert. */
+  function setSource(nextSource) {
+    if (state.destroyed) return;
+    if (!nextSource || typeof nextSource !== 'object') return;
+    state.source = nextSource;
+  }
 
   // Replace the canonical content with the current draft and re-render in
   // view mode. Used by the "send to chat input" flow where the host wants
@@ -184,7 +200,7 @@ function mountMdViewEdit(opts) {
     _mveRender(state);
   }
 
-  return { destroy, refreshContent, getMode, setMode, isDirty, getDraft, setDraftAsContent, getSource };
+  return { destroy, refreshContent, getMode, setMode, isDirty, getDraft, setDraftAsContent, getSource, setSource };
 }
 
 function _mveNoopController() {
@@ -197,6 +213,7 @@ function _mveNoopController() {
     getDraft()       { return { content: '', isPreview: false }; },
     setDraftAsContent() {},
     getSource()      { return null; },
+    setSource()      {},
   };
 }
 
@@ -220,9 +237,22 @@ async function _mveReadSource(source) {
     try {
       const payload = { path: source.absPath };
       if (source.cid) payload.cid = source.cid;
+      if (source.projectId) payload.projectId = source.projectId;
       const res = await window.orkas.invoke('produced.readText', payload);
       if (!res || !res.ok) return { ok: false, error: (res && res.error) || 'read_failed', detail: res };
       return { ok: true, content: String(res.text || '') };
+    } catch (e) {
+      return { ok: false, error: e.message || String(e) };
+    }
+  }
+  if (source.kind === 'project-file') {
+    try {
+      const res = await window.orkas.invoke('projects.files.readText', {
+        projectId: source.projectId,
+        name: source.name,
+      });
+      if (!res || !res.ok) return { ok: false, error: (res && res.error) || 'read_failed' };
+      return { ok: true, content: String(res.content || '') };
     } catch (e) {
       return { ok: false, error: e.message || String(e) };
     }
@@ -249,7 +279,21 @@ async function _mveWriteSource(source, content) {
     try {
       const payload = { path: source.absPath, content };
       if (source.cid) payload.cid = source.cid;
+      if (source.projectId) payload.projectId = source.projectId;
       const res = await window.orkas.invoke('produced.writeText', payload);
+      if (!res || !res.ok) return { ok: false, error: (res && res.error) || 'save_failed' };
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e.message || String(e) };
+    }
+  }
+  if (source.kind === 'project-file') {
+    try {
+      const res = await window.orkas.invoke('projects.files.updateText', {
+        projectId: source.projectId,
+        name: source.name,
+        content,
+      });
       if (!res || !res.ok) return { ok: false, error: (res && res.error) || 'save_failed' };
       return { ok: true };
     } catch (e) {
@@ -299,36 +343,6 @@ function _mveActionButton(state, action, labelKey, iconName, extraClass) {
     ? window.uiIconHtml(iconName, 'ui-icon ctx-viewer-action-icon')
     : escapeHtml(label);
   return `<button type="button" class="${cls}" data-mve-action="${action}" aria-label="${escapeHtml(label)}" title="${escapeHtml(label)}">${icon}</button>`;
-}
-
-function _mveRenderView(state) {
-  state.mode = 'view';
-  const bodyEl = state.bodyEl;
-  const actionsEl = state.actionsEl;
-  const content = state.content || '';
-  bodyEl.innerHTML = `<div class="ctx-viewer-md markdown-body">${renderMarkdown(content)}</div>`;
-  if (state.caps.taskCheckbox) _mveBindTaskCheckboxes(state, bodyEl);
-
-  const actions = [];
-  if (state.caps.edit)   actions.push(_mveActionButton(state, 'edit', 'contexts.viewer.edit', 'pencil'));
-  if (state.caps.reveal) actions.push(_mveActionButton(state, 'reveal', 'contexts.viewer.open_system', 'folder-open'));
-  if (state.caps.delete) actions.push(_mveActionButton(state, 'delete', 'contexts.viewer.delete', 'trash', 'btn-danger'));
-  actionsEl.innerHTML = actions.join('');
-
-  actionsEl.querySelector('[data-mve-action="edit"]')?.addEventListener('click', () => _mveEnterEdit(state));
-  actionsEl.querySelector('[data-mve-action="reveal"]')?.addEventListener('click', () => state.callbacks.onReveal?.());
-  actionsEl.querySelector('[data-mve-action="delete"]')?.addEventListener('click', () => state.callbacks.onDelete?.());
-
-  _mveEmitDirty(state);
-}
-
-function _mveEnterEdit(state) {
-  state.mode = 'edit';
-  // Only seed the draft from canonical content if we don't have a draft yet
-  // — caller-provided initialDraft and prior edit state both reach here.
-  if (!state.draft) state.draft = state.content || '';
-  _mveRenderEditor(state);
-  _mveEmitDirty(state);
 }
 
 function _mveRenderEditor(state) {

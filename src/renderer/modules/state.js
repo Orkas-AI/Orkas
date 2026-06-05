@@ -29,6 +29,30 @@ function isConvPending(cid) {
   return pendingConvs.has(cid) || isGroupConversationBusy(cid);
 }
 
+function _isPlainComposerEnter(e) {
+  return e.key === 'Enter' && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey;
+}
+
+function _insertComposerNewline(el) {
+  if (!el || typeof el.value !== 'string') return;
+  const start = typeof el.selectionStart === 'number' ? el.selectionStart : el.value.length;
+  const end = typeof el.selectionEnd === 'number' ? el.selectionEnd : start;
+  if (typeof el.setRangeText === 'function') {
+    el.setRangeText('\n', start, end, 'end');
+  } else {
+    el.value = `${el.value.slice(0, start)}\n${el.value.slice(end)}`;
+    el.selectionStart = el.selectionEnd = start + 1;
+  }
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function _handleModifiedComposerEnter(e) {
+  if (e.key !== 'Enter' || !(e.metaKey || e.ctrlKey)) return false;
+  e.preventDefault();
+  _insertComposerNewline(e.currentTarget);
+  return true;
+}
+
 // Per-conversation queued messages (sent sequentially, one at a time).
 // key: cid, value: Array<{ id, content, skill }>
 const messageQueues = new Map();
@@ -216,6 +240,7 @@ document.addEventListener('DOMContentLoaded', () => {
 function bindStaticHandlers() {
   // Sidebar nav
   document.getElementById('new-chat-btn').addEventListener('click', () => setView('new-chat'));
+  document.getElementById('auto-btn')?.addEventListener('click', () => setView('auto'));
   document.getElementById('agents-btn').addEventListener('click', () => setView('agents'));
   document.getElementById('skills-btn').addEventListener('click', () => setView('skills'));
   document.getElementById('connectors-btn')?.addEventListener('click', () => setView('connectors'));
@@ -231,12 +256,13 @@ function bindStaticHandlers() {
   const newBtn = document.getElementById('new-chat-send-btn');
   newBtn.addEventListener('click', handleNewChatSubmit);
   newInput.addEventListener('keydown', (e) => {
-    // Enter sends; Shift+Enter newline; Ctrl/Cmd+Enter also sends (kept for
-    // muscle memory). Skip while IME is composing — Chinese pinyin commit
-    // also fires Enter and would otherwise send a half-typed message.
+    // Plain Enter sends; Shift/Cmd/Ctrl+Enter inserts a newline. Skip while
+    // IME is composing — Chinese pinyin commit also fires Enter and would
+    // otherwise send a half-typed message.
     // keyCode 229 catches older Electron / Safari builds (CLAUDE.md §8).
     if (e.isComposing || e.keyCode === 229) return;
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (_handleModifiedComposerEnter(e)) return;
+    if (_isPlainComposerEnter(e)) {
       e.preventDefault();
       handleNewChatSubmit();
     }
@@ -258,10 +284,11 @@ function bindStaticHandlers() {
     }
   });
   chatInput.addEventListener('keydown', (e) => {
-    // Enter sends; Shift+Enter newline; Ctrl/Cmd+Enter also sends. Skip IME
+    // Plain Enter sends; Shift/Cmd/Ctrl+Enter inserts a newline. Skip IME
     // (CLAUDE.md §8 — keyCode 229 belt-and-suspenders for older builds).
     if (e.isComposing || e.keyCode === 229) return;
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (_handleModifiedComposerEnter(e)) return;
+    if (_isPlainComposerEnter(e)) {
       e.preventDefault();
       handleChatSubmit();
     }
@@ -283,7 +310,9 @@ function bindStaticHandlers() {
   document.getElementById('agents-more-btn')?.addEventListener('click', () => openMarketplace('agent'));
   document.getElementById('agents-back-btn')?.addEventListener('click', () => _showAgentsGridView());
   document.getElementById('agent-use-btn')?.addEventListener('click', () => {
-    if (_selectedAgent) useAgent(_selectedAgent.id);
+    if (_selectedAgent && !_agentsCache?.some((a) => a.agent_id === _selectedAgent.id && a.enabled === false)) {
+      useAgent(_selectedAgent.id);
+    }
   });
   document.getElementById('agent-edit-btn')?.addEventListener('click', toggleAgentEditMode);
   document.getElementById('agent-delete-btn')?.addEventListener('click', deleteSelectedAgent);
@@ -294,11 +323,11 @@ function bindStaticHandlers() {
     // `source === 'custom'` guard that silently swallowed clicks on builtin
     // detail pages.
     if (_selectedAgent && typeof openMarketplaceUpload === 'function') {
-      openMarketplaceUpload('agent', _selectedAgent.id);
+      openMarketplaceUpload('agent', _selectedAgent.id, _selectedAgent.source);
     }
   });
   document.getElementById('agent-chat-clear-btn')?.addEventListener('click', clearAgentChat);
-  // Agent inline chat: only bind auto-grow here. Send/abort/Cmd+Enter are
+  // Agent inline chat: only bind auto-grow here. Send/abort/plain Enter are
   // wired lazily by createChatController in _ensureAgentChatController.
   const agentChatInput = document.getElementById('agents-chat-input');
   agentChatInput?.addEventListener('input', () => autoGrow(agentChatInput, 120));
@@ -322,7 +351,9 @@ function bindStaticHandlers() {
   document.getElementById('create-skill-btn')?.addEventListener('click', () => openSkillModal());
   document.getElementById('skills-more-btn')?.addEventListener('click', () => openMarketplace('skill'));
   document.getElementById('skill-use-btn')?.addEventListener('click', () => {
-    if (_selectedSkill) useSkill(_selectedSkill.id, _selectedSkill.name);
+    if (_selectedSkill && !_skillsCache?.some((s) => s.id === _selectedSkill.id && s.enabled === false)) {
+      useSkill(_selectedSkill.id, _selectedSkill.name);
+    }
   });
   document.getElementById('skill-edit-btn')?.addEventListener('click', toggleSkillEditMode);
   document.getElementById('skill-delete-btn')?.addEventListener('click', deleteSelectedSkill);
@@ -330,7 +361,7 @@ function bindStaticHandlers() {
     // Upload is allowed for both custom AND builtin (dev mode) — same as
     // the agent upload handler above; see comment there.
     if (_selectedSkill && typeof openMarketplaceUpload === 'function') {
-      openMarketplaceUpload('skill', _selectedSkill.id);
+      openMarketplaceUpload('skill', _selectedSkill.id, _selectedSkill.source);
     }
   });
   // Skill name editing is now wired inline by `_toggleSkillNameEditable`
@@ -366,7 +397,7 @@ function bindStaticHandlers() {
     if (_skillsCache) renderSkillsGrid(_skillsCache);
   });
 
-  // Inline skill chat — input auto-grow only here; send/Cmd+Enter are wired
+  // Inline skill chat — input auto-grow only here; send/plain Enter are wired
   // lazily by createChatController when edit mode first opens (avoids double-
   // binding and keeps the skill controller as the single source of truth).
   const skillChatInput = document.getElementById('skills-chat-input');
@@ -374,7 +405,7 @@ function bindStaticHandlers() {
 
   bindSkillPicker();
 
-  // Knowledge base (two-region: per-user staging + shared organized)
+  // Library (two-region: per-user staging + shared organized)
   document.getElementById('ctx-tmp-new-btn')?.addEventListener('click', createNewCtxTmpDraft);
   document.getElementById('ctx-tmp-upload-btn')?.addEventListener('click', () => {
     document.getElementById('ctx-tmp-file-input')?.click();

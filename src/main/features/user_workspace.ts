@@ -41,6 +41,8 @@ import { dialog, BrowserWindow, shell } from 'electron';
 import { DEFAULT_USER_WORKSPACE, userWorkspaceConfigFile } from '../paths';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
+import { macosTccSensitivePath } from '../util/macos-tcc';
+import { logPathRef, logPathRefs } from '../util/log-redact';
 import { pruneOrphans } from './file_indexer';
 
 const log = createLogger('user-workspace');
@@ -143,31 +145,64 @@ function _writeEntry(cfg: WorkspaceConfig, projectId: string | undefined, entry:
 }
 
 /** Effective path for a given scope: project's selection (if any) → default's
- *  selection (if any) → DEFAULT_USER_WORKSPACE. Validates each step exists
- *  on disk; vanished selections fall through. */
+ *  selection (if any) → DEFAULT_USER_WORKSPACE. For macOS privacy-protected
+ *  locations, return the user-selected path without probing it; background
+ *  scanners are responsible for opting out before walking those roots. */
 function _effectivePath(cfg: WorkspaceConfig, projectId?: string): string {
   if (projectId) {
     const entry = cfg.projects[projectId];
     if (entry?.selectedPath) {
-      try {
-        if (fs.statSync(entry.selectedPath).isDirectory()) return entry.selectedPath;
-      } catch {
-        log.warn('project workspace path missing — falling back to default', {
-          projectId, path: entry.selectedPath,
+      const blocked = macosTccSensitivePath(path.resolve(entry.selectedPath), { recursive: true });
+      if (blocked) {
+        log.debug('project workspace path is privacy-protected — returning without stat', {
+          projectId, path: logPathRef(entry.selectedPath), reason: blocked.reason,
         });
+        return entry.selectedPath;
+      } else {
+        try {
+          if (fs.statSync(entry.selectedPath).isDirectory()) return entry.selectedPath;
+        } catch {
+          log.warn('project workspace path missing — falling back to default', {
+            projectId, path: logPathRef(entry.selectedPath),
+          });
+        }
       }
     }
   }
   if (cfg.default.selectedPath) {
-    try {
-      if (fs.statSync(cfg.default.selectedPath).isDirectory()) return cfg.default.selectedPath;
-    } catch {
-      log.warn('default workspace path missing — using DEFAULT_USER_WORKSPACE', {
-        path: cfg.default.selectedPath,
+    const blocked = macosTccSensitivePath(path.resolve(cfg.default.selectedPath), { recursive: true });
+    if (blocked) {
+      log.debug('default workspace path is privacy-protected — returning without stat', {
+        path: logPathRef(cfg.default.selectedPath), reason: blocked.reason,
       });
+      return cfg.default.selectedPath;
+    } else {
+      try {
+        if (fs.statSync(cfg.default.selectedPath).isDirectory()) return cfg.default.selectedPath;
+      } catch {
+        log.warn('default workspace path missing — using DEFAULT_USER_WORKSPACE', {
+          path: logPathRef(cfg.default.selectedPath),
+        });
+      }
     }
   }
   return DEFAULT_USER_WORKSPACE;
+}
+
+function _configuredDisplayPath(cfg: WorkspaceConfig, projectId?: string): string {
+  if (projectId) {
+    const projectSelected = cfg.projects[projectId]?.selectedPath;
+    if (projectSelected) return projectSelected;
+  }
+  const selected = cfg.default.selectedPath;
+  if (selected) return selected;
+  return DEFAULT_USER_WORKSPACE;
+}
+
+function _isManagedWorkspaceRoot(dirPath: string): boolean {
+  const root = path.resolve(DEFAULT_USER_WORKSPACE);
+  const target = path.resolve(dirPath || '');
+  return target === root || target.startsWith(root + path.sep);
 }
 
 // ── Public API ──────────────────────────────────────────────────────────
@@ -213,11 +248,14 @@ export function setWorkspacePath(
   projectId?: string,
 ): { ok: true; path: string } | { ok: false; error: string } {
   const resolved = path.resolve(dirPath);
-  try {
-    const stat = fs.statSync(resolved);
-    if (!stat.isDirectory()) return { ok: false, error: t('errors.path_not_dir') };
-  } catch {
-    return { ok: false, error: t('errors.dir_not_exists') };
+  const protectedSelection = macosTccSensitivePath(resolved, { recursive: true });
+  if (!protectedSelection) {
+    try {
+      const stat = fs.statSync(resolved);
+      if (!stat.isDirectory()) return { ok: false, error: t('errors.path_not_dir') };
+    } catch {
+      return { ok: false, error: t('errors.dir_not_exists') };
+    }
   }
 
   const cfg = readConfig(userId);
@@ -237,7 +275,7 @@ export function setWorkspacePath(
     recentPaths: recents.slice(0, MAX_RECENT),
   });
   writeConfig(userId, next);
-  log.info('workspace path updated', { userId, projectId: projectId || '(default)', path: resolved });
+  log.info('workspace path updated', { userId, projectId: projectId || '(default)', path: logPathRef(resolved) });
   _sweepFileCacheForWorkspace(userId, resolved);
   return { ok: true, path: resolved };
 }
@@ -264,7 +302,7 @@ export function resetWorkspacePath(userId: string, projectId?: string): { ok: tr
   writeConfig(userId, next);
 
   const effective = _effectivePath(next, projectId);
-  log.info('workspace path reset', { userId, projectId: projectId || '(default)', effective });
+  log.info('workspace path reset', { userId, projectId: projectId || '(default)', effective: logPathRef(effective) });
   _sweepFileCacheForWorkspace(userId, effective);
   return { ok: true, path: effective };
 }
@@ -273,11 +311,11 @@ function _sweepFileCacheForWorkspace(userId: string, workspacePath: string): voi
   pruneOrphans(userId, { workspacePath })
     .then((r) => {
       if (r.deleted > 0) {
-        log.info(`file_cache sweep on workspace switch deleted=${r.deleted}`, { userId, workspacePath });
+        log.info(`file_cache sweep on workspace switch deleted=${r.deleted}`, { userId, workspacePath: logPathRef(workspacePath) });
       }
     })
     .catch((err) => {
-      log.warn(`file_cache sweep on workspace switch failed: ${(err as Error).message}`, { userId, workspacePath });
+      log.warn(`file_cache sweep on workspace switch failed: ${(err as Error).message}`, { userId, workspacePath: logPathRef(workspacePath) });
     });
 }
 
@@ -296,12 +334,15 @@ export function getWorkspaceInfo(userId: string, projectId?: string): {
 } {
   const cfg = readConfig(userId);
   const entry = _readEntry(cfg, projectId);
-  const currentPath = _effectivePath(cfg, projectId);
+  // This runs on renderer boot to paint the workspace chip. Do not touch
+  // protected external directories here: macOS will surface TCC prompts for
+  // paths like ~/Downloads even for a simple stat. Actual selection/use still
+  // validates through setWorkspacePath/getWorkspacePath.
+  const currentPath = _configuredDisplayPath(cfg, projectId);
   const isDefault = !entry.selectedPath;
-  const recentPaths = (entry.recentPaths || []).filter((p) => {
-    if (p === currentPath || p === DEFAULT_USER_WORKSPACE) return false;
-    try { return fs.statSync(p).isDirectory(); } catch { return false; }
-  });
+  const recentPaths = (entry.recentPaths || [])
+    .filter((p) => p !== currentPath && p !== DEFAULT_USER_WORKSPACE)
+    .slice(0, MAX_RECENT);
   return {
     currentPath,
     defaultPath: DEFAULT_USER_WORKSPACE,
@@ -341,9 +382,13 @@ export async function selectDirectory(): Promise<string | null> {
 export function sweepEmptyConvDirs(userId: string): { swept: number } {
   const cfg = readConfig(userId);
   const roots = new Set<string>();
-  roots.add(_effectivePath(cfg, undefined));
-  for (const pid of Object.keys(cfg.projects)) {
-    roots.add(_effectivePath(cfg, pid));
+  const addManagedRoot = (root: string | undefined) => {
+    if (root && _isManagedWorkspaceRoot(root)) roots.add(path.resolve(root));
+  };
+  roots.add(path.resolve(DEFAULT_USER_WORKSPACE));
+  addManagedRoot(cfg.default.selectedPath);
+  for (const entry of Object.values(cfg.projects)) {
+    addManagedRoot(entry?.selectedPath);
   }
   let swept = 0;
   for (const root of roots) {
@@ -362,7 +407,7 @@ export function sweepEmptyConvDirs(userId: string): { swept: number } {
       } catch { /* best-effort */ }
     }
   }
-  if (swept > 0) log.info('swept empty workspace subdirs', { userId, swept, roots: Array.from(roots) });
+  if (swept > 0) log.info('swept empty workspace subdirs', { userId, swept, roots: logPathRefs(Array.from(roots)) });
   return { swept };
 }
 
@@ -384,7 +429,7 @@ export async function openWorkspaceInFileManager(
   }
   const err = await shell.openPath(target);
   if (err) {
-    log.warn('failed to open workspace path', { userId, path: target, err });
+    log.warn('failed to open workspace path', { userId, path: logPathRef(target), err });
     return { ok: false, error: err };
   }
   return { ok: true, path: target };

@@ -289,6 +289,13 @@ function _b64urlEncode(bytes) {
   return bytes.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
+function _base64MimeBody(s) {
+  return Buffer.from(s, 'utf8')
+    .toString('base64')
+    .replace(/.{1,76}/g, '$&\r\n')
+    .trimEnd();
+}
+
 // Builds the `{raw, threadId?}` body shape used by both `messages.send` and `drafts` endpoints.
 // Plain-text v1; HTML body deferred. Centralized so send_message / create_draft / update_draft
 // produce identical wire format.
@@ -306,9 +313,9 @@ function _buildRawMessage(args) {
     `Subject: ${_encodeHeader(subject)}`,
     'MIME-Version: 1.0',
     'Content-Type: text/plain; charset=UTF-8',
-    'Content-Transfer-Encoding: 8bit',
+    'Content-Transfer-Encoding: base64',
   ];
-  const rfc2822 = `${headers.join('\r\n')}\r\n\r\n${body}`;
+  const rfc2822 = `${headers.join('\r\n')}\r\n\r\n${_base64MimeBody(body)}`;
   return {
     raw: _b64urlEncode(Buffer.from(rfc2822, 'utf8')),
     ...(args.threadId ? { threadId: String(args.threadId) } : {}),
@@ -652,7 +659,7 @@ async function main() {
   await server.connect(transport);
 }
 
-module.exports = { TOOLS, callTool };
+module.exports = { TOOLS, callTool, _buildRawMessage };
 
 if (require.main === module) {
   main().catch((err) => {

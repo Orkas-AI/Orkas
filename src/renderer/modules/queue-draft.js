@@ -126,7 +126,24 @@ function _dispatchNextQueued(cid) {
   // text — no flag.
   // Recipient prefix (`@<agent>`) is also applied at dispatch time so the
   // message routes to whoever is currently selected in the chip.
-  const use = _queueItemUseSelection(next);
+  let use = _queueItemUseSelection(next);
+  if (use && typeof isChatUseAllowedForTarget === 'function' && !isChatUseAllowedForTarget('conversation')) {
+    use = null;
+  }
+  // Drop a connector prefix whose target is no longer live (disconnected /
+  // user-disabled / uninstalled between enqueue and drain). Without this,
+  // commander gets `use <connector>: …` text whose connector has no matching
+  // entry in the `## Connectors` system block, so the LLM either hallucinates
+  // a tool call or surfaces an error. Skill / agent prefixes have the same
+  // orphan failure class, but the renderer doesn't yet carry their live-state
+  // cache — left as separate Pending items.
+  if (use && use.kind === 'connector'
+      && typeof isConnectorLive === 'function'
+      && !isConnectorLive(use.id)) {
+    const label = use.name || use.id;
+    use = null;
+    try { uiAlert(t('connectors.dropped_at_drain', { connector: label })); } catch (_) {}
+  }
   const withUse = use ? transformWithChatUse(next.content, use) : next.content;
   const content = next.direct ? next.content : applyRecipientPrefix(withUse, 'conversation');
   // Fire-and-forget: sendInCurrentConversation handles its own errors via

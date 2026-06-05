@@ -116,6 +116,42 @@ async function waitForQuiescent(uid: string, cid: string, timeoutMs = 2000) {
   throw new Error(`bus did not quiesce within ${timeoutMs}ms`);
 }
 
+describe('group_chat bus integration › disabled skills', () => {
+  it('does not let commander substitute another skill when user explicitly requests a disabled one', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const enabled = await import('../../../../src/main/features/component_enabled');
+    const storage = await import('../../../../src/main/storage');
+
+    const skillDir = path.join(paths.userSkillsDir(TEST_UID), 'arxiv-reader');
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(path.join(skillDir, 'SKILL.md'), [
+      '---',
+      'name: "arxiv-reader"',
+      'description_zh: "ArXiv reader"',
+      'description_en: "ArXiv reader"',
+      '---',
+      '',
+      '# ArXiv Reader',
+    ].join('\n'));
+    enabled.setSkillEnabled(TEST_UID, 'arxiv-reader', false);
+
+    _setScript(state.buildGconvSessionId(TEST_UID, cid), [
+      { type: 'final', text: 'WRONG: substituted skill ran' },
+    ]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: '使用 arxiv-reader 技能：最新论文' });
+    await waitForQuiescent(TEST_UID, cid, 2000);
+
+    const messages = await storage.readJsonl<any>(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`));
+    expect(messages.some((m: any) => String(m.text || '').includes('WRONG'))).toBe(false);
+    expect(messages.some((m: any) => String(m.text || '').includes('component.skill_disabled_request'))).toBe(false);
+    expect(messages.some((m: any) => String(m.text || '').includes('arxiv-reader'))).toBe(true);
+    expect(messages.some((m: any) => /停用|disabled/i.test(String(m.text || '')))).toBe(true);
+  });
+});
+
 // SKIP 原因:这些 chain 测试依赖 commander 在 `final.text` 里写
 // `@<agent>` 触发派活。现在 LLM 派活已迁到 `dispatch_to` 工具调用,
 // commander/agent 散文里 `@` 不再触发(详见 docs/plans/dispatch-via-

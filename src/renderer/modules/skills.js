@@ -3,7 +3,6 @@ const _skillsLog = createLogger('skills');
 
 let _skillsCache = null;
 let _selectedSkill = null;    // { source, id }
-const _SKILL_SPEC_CATEGORY_CODE_RE = /^[a-z][a-z0-9_-]{0,79}$/;
 
 function _skillSource(source) {
   return (typeof normalizeCatalogSource === 'function')
@@ -15,11 +14,6 @@ function _isSkillPlatformSource(source) {
   return (typeof isMarketplaceCatalogSource === 'function')
     ? isMarketplaceCatalogSource(source)
     : _skillSource(source) === 'marketplace';
-}
-
-function _normalizeSkillCategoryForHiddenSave(category) {
-  const code = String(category || '').trim().toLowerCase();
-  return _SKILL_SPEC_CATEGORY_CODE_RE.test(code) ? code : 'general';
 }
 
 function _skillUiIconHtml(name, className) {
@@ -39,10 +33,8 @@ function _skillPlatformChipsHtml(s) {
     const versionLabel = t('marketplace.version').replace('{version}', String(s.version));
     parts.push(`<span class="skill-card-chip is-version">${escapeHtml(versionLabel)}</span>`);
   }
-  if (s.category) {
-    const catLabel = _resolveCategoryLabel(s.category, lang);
-    parts.push(`<span class="skill-card-chip">${escapeHtml(catLabel)}</span>`);
-  }
+  const catLabel = _resolveCategoryLabel(s.category, lang);
+  parts.push(`<span class="skill-card-chip">${escapeHtml(catLabel)}</span>`);
   return parts.join('');
 }
 
@@ -63,6 +55,31 @@ window.addEventListener('i18n-change', () => {
 });
 let _expandedDirs = new Set(); // keys like "source:id" or "source:id/subdir"
 let _skillTreeCache = new Map(); // key: "source:id" → tree array
+
+// Cross-module hook (renderer is classic scripts — top-level let/const are
+// visible across files per PC/CLAUDE.md §8). Called from
+// `conversation.js::_mountCreatedSkillChip` whenever the commander writes
+// `<<<skill-file>>>` blocks into a skill the user might be viewing in the
+// detail panel. Without this, the file tree on the detail page keeps showing
+// the pre-edit set of files until the user navigates away and back.
+// `id` matches any source (custom + marketplace) — commander writes flow
+// through `updateAgentSpec` / `_applySkillContainerEdit` for both sources,
+// so we don't filter by source here. If the user is currently viewing the
+// affected skill AND the source panel is expanded, also re-fetch the tree
+// so the new files appear without a manual refresh.
+async function invalidateSkillTreeCacheFor(skillId) {
+  if (!skillId) { _skillTreeCache.clear(); return; }
+  for (const key of Array.from(_skillTreeCache.keys())) {
+    if (key.endsWith(`:${skillId}`)) _skillTreeCache.delete(key);
+  }
+  if (_selectedSkill?.id !== skillId) return;
+  const toggle = document.getElementById('skills-source-toggle');
+  const treeEl = document.getElementById('skills-source-tree');
+  if (toggle?.getAttribute('aria-expanded') === 'true' && treeEl) {
+    await expandSkillTree(_selectedSkill.source, _selectedSkill.id, treeEl);
+    _markActiveSkillFileInTree(_selectedSkill.filepath || 'SKILL.md');
+  }
+}
 
 async function refreshSkillsAfterMarketplaceReconcile() {
   _skillTreeCache.clear();
@@ -85,18 +102,29 @@ async function refreshSkillsAfterMarketplaceReconcile() {
 async function loadSkills(forceRefresh) {
   if (_skillsCache && !forceRefresh) { renderSkillsList(_skillsCache); return; }
   try {
-    const res = await apiFetch('/api/skills/list');
+    const res = await apiFetch(forceRefresh ? '/api/skills/list?force=1' : '/api/skills/list');
     const data = await res.json();
     if (data.ok) {
       _skillsCache = (data.skills || []).map((s) => ({
         ...s,
         source: _skillSource(s.source),
-      }));
+      })).sort((a, b) => {
+        const ka = _skillNameSortKey(a);
+        const kb = _skillNameSortKey(b);
+        if (ka < kb) return -1;
+        if (ka > kb) return 1;
+        return String(a.id || '').localeCompare(String(b.id || ''), undefined, { numeric: true, sensitivity: 'base' });
+      });
       renderSkillsList(_skillsCache);
     }
   } catch (e) {
     _skillsLog.error('load skills failed', e);
   }
+}
+
+function _skillNameSortKey(skill) {
+  const name = String(skill?.name || skill?.id || '');
+  return (typeof pinyinSortKey === 'function') ? pinyinSortKey(name) : name.toLowerCase();
 }
 
 // ─── Chat-input tool chip ────────────────────────────────────────────────
@@ -208,15 +236,24 @@ function refreshChatUseChips() {
   _renderChatUseChip('project');
 }
 
-function setChatUseSelection(target, selection) {
+function isChatUseAllowedForTarget(target) {
+  if (typeof getChatRecipient !== 'function') return true;
+  const rec = getChatRecipient(target);
+  return !rec || rec.kind !== 'agent';
+}
+
+function setChatUseSelection(target, selection, opts = {}) {
   const prev = JSON.stringify(_normalizeChatUseSelection(_chatUse[target]) || null);
-  const next = _normalizeChatUseSelection(selection);
+  const next = isChatUseAllowedForTarget(target)
+    ? _normalizeChatUseSelection(selection)
+    : null;
   _chatUse[target] = next;
   if (target === 'conversation' && prev !== JSON.stringify(next || null) && currentCid) {
     _saveDraft(currentCid);
   }
   _renderChatUseChip(target);
   // Return focus to the textarea after selection.
+  if (opts && opts.focus === false) return;
   const input = target === 'new-chat'
     ? document.getElementById('new-chat-input')
     : (target === 'project' ? document.getElementById('project-chat-input') : document.getElementById('chat-input'));
@@ -240,7 +277,7 @@ function consumeChatSkill(target) {
 
 function consumeChatUseSelection(target) {
   // Currently a one-way read. Chip persists until user removes it via the ×.
-  return getChatUseSelection(target);
+  return isChatUseAllowedForTarget(target) ? getChatUseSelection(target) : null;
 }
 
 function transformWithSkill(content, skill) {
@@ -259,48 +296,118 @@ function transformWithChatUse(content, selection) {
 
 function renderSkillsList(skills) { renderSkillsGrid(skills); }
 
+// Active category-chip selection for the Skills page. Empty string = "All";
+// matches `_mpState.category` semantics in marketplace.js.
+let _skillsActiveCategory = '';
+
 function renderSkillsGrid(skills) {
-  const custom = skills.filter(s => s.source === 'custom');
-  const marketplace = skills.filter(s => _isSkillPlatformSource(s.source));
   const emptyEl = document.getElementById('skills-empty');
-  const customGroup = document.getElementById('skills-grid-custom-group');
-  const builtinGroup = document.getElementById('skills-grid-builtin-group');
-  const customGrid = document.getElementById('skills-grid-custom');
-  const builtinGrid = document.getElementById('skills-grid-builtin');
+  const chipsHost = document.getElementById('skills-categories');
+  const gridEl = document.getElementById('skills-grid');
+  if (!gridEl) return;
 
   if (!skills.length) {
+    if (chipsHost) chipsHost.innerHTML = '';
+    gridEl.classList.remove('is-sectioned');
+    gridEl.innerHTML = '';
     if (emptyEl) emptyEl.style.display = '';
-    if (customGroup) customGroup.style.display = 'none';
-    if (builtinGroup) builtinGroup.style.display = 'none';
     return;
   }
   if (emptyEl) emptyEl.style.display = 'none';
 
   const useTitle = escapeHtml(t('skills.use_tooltip'));
   const moreTitle = escapeHtml(t('skills.more_actions'));
+  const lang = getLang();
+  const customChipLabel = t('skills.custom_group');
+  const marketplaceGroupLabel = (() => {
+    const raw = t('skills.builtin_group');
+    return (raw && raw !== 'skills.builtin_group') ? raw : t('skills.source_marketplace');
+  })();
+  const allLabel = (() => {
+    const raw = t('marketplace.all');
+    return (raw && raw !== 'marketplace.all') ? raw : 'All';
+  })();
+
+  // Chip strip — `_mpCategoriesCache` is defined in marketplace.js (flat top-level scope).
+  // Missing categories and non-registry category codes are treated as General.
+  const canonicalCategoryCode = (code) => {
+    return typeof _mpCanonicalCategoryCode === 'function'
+      ? _mpCanonicalCategoryCode(code)
+      : String(code || '').trim();
+  };
+  const cats = (typeof _mpCategoriesCache !== 'undefined' && _mpCategoriesCache) || [];
+  const knownCodes = _knownCategoryCodes(cats);
+  const rawCodesPresent = new Set(skills.map((s) => canonicalCategoryCode(s && s.category)));
+  const unknownCodes = [...rawCodesPresent].filter((c) => c && !knownCodes.has(c)).sort();
+  if (unknownCodes.length && typeof _mpMaybeRefreshCategoriesForCodes === 'function') {
+    _mpMaybeRefreshCategoriesForCodes(unknownCodes);
+  }
+  const codesPresent = new Set([...rawCodesPresent].map((c) => _effectiveCategoryCode(c, knownCodes)));
+  const chipCodes = [];
+  const chipCodeSeen = new Set();
+  for (const c of cats) {
+    const code = canonicalCategoryCode(c && c.code);
+    if (!code || !codesPresent.has(code) || chipCodeSeen.has(code)) continue;
+    chipCodes.push({ code, label: pickLocalizedName(c, lang) || code });
+    chipCodeSeen.add(code);
+  }
+  if (codesPresent.has('general') && !chipCodeSeen.has('general')) {
+    chipCodes.push({ code: 'general', label: _generalCategoryLabel(lang) });
+    chipCodeSeen.add('general');
+  }
+  if (_skillsActiveCategory === '__uncategorized__' || _skillsActiveCategory === '__unknown__') {
+    _skillsActiveCategory = codesPresent.has('general') ? 'general' : '';
+  }
+  if (_skillsActiveCategory && !chipCodes.some((c) => c.code === _skillsActiveCategory)) {
+    _skillsActiveCategory = '';
+  }
+
+  if (chipsHost) {
+    const allActive = _skillsActiveCategory === '' ? ' is-active' : '';
+    const chipsHtml = [
+      `<button type="button" class="marketplace-chip${allActive}" data-skills-cat="">${escapeHtml(allLabel)}</button>`,
+      ...chipCodes.map((c) => {
+        const active = _skillsActiveCategory === c.code ? ' is-active' : '';
+        return `<button type="button" class="marketplace-chip${active}" data-skills-cat="${escapeHtml(c.code)}">${escapeHtml(c.label)}</button>`;
+      }),
+    ].join('');
+    chipsHost.innerHTML = chipsHtml;
+    chipsHost.querySelectorAll('[data-skills-cat]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        _skillsActiveCategory = btn.dataset.skillsCat || '';
+        if (_skillsCache) renderSkillsGrid(_skillsCache);
+      });
+    });
+  }
+
+  const filtered = skills.filter((s) => {
+    if (_skillsActiveCategory === '') return true;
+    return _effectiveCategoryCode(s && s.category, knownCodes) === _skillsActiveCategory;
+  });
 
   const cardHtml = (s) => {
-    const desc = pickDesc(s, getLang()).trim();
+    const desc = pickDesc(s, lang).trim();
     const descClass = desc ? 'skill-card-desc' : 'skill-card-desc is-empty';
     const descText = desc || t('skills.no_desc');
-    // Source label (custom / marketplace) is shown on the detail page only;
-    // the grid cards stay clean and use the ⋯ menu for actions.
     const moreBtn = `<button type="button" class="skill-card-more" data-skill-more title="${moreTitle}" aria-label="${moreTitle}">⋯</button>`;
     const enabled = s.enabled !== false;
-    // Marketplace-installed skills carry version + category from _install.json /
-    // SKILL.md frontmatter — show them as inline chips so users see provenance without
-    // opening the detail page. Custom skills skip (no published version).
-    const platformChips = _isSkillPlatformSource(s.source) ? _skillPlatformChipsHtml(s) : '';
+    // Source provenance: custom → "Custom" chip; marketplace → version + category chips.
+    let provenanceChips = '';
+    if (s.source === 'custom') {
+      provenanceChips = `<span class="skill-card-chip is-custom">${escapeHtml(customChipLabel)}</span>`;
+    } else if (_isSkillPlatformSource(s.source)) {
+      provenanceChips = _skillPlatformChipsHtml(s);
+    }
     return `
-      <div class="skill-card${enabled ? '' : ' is-disabled'}" data-id="${escapeHtml(s.id)}" data-source="${s.source}">
+      <div class="skill-card${enabled ? '' : ' is-disabled'}" data-id="${escapeHtml(s.id)}" data-source="${escapeHtml(s.source || '')}">
         <div class="skill-card-header">
           <span class="skill-card-name">${escapeHtml(s.name)}</span>
           ${moreBtn}
         </div>
         <div class="${descClass}">${escapeHtml(descText)}</div>
         <div class="skill-card-actions">
-          ${platformChips}
-          <button type="button" class="skill-card-use" data-skill-use title="${useTitle}" aria-label="${useTitle}">
+          ${provenanceChips}
+          <button type="button" class="skill-card-use" data-skill-use title="${useTitle}" aria-label="${useTitle}" ${enabled ? '' : 'disabled aria-disabled="true" tabindex="-1"'}>
             ${_skillUiIconHtml('play-triangle', 'icon-play')}
           </button>
         </div>
@@ -308,24 +415,41 @@ function renderSkillsGrid(skills) {
     `;
   };
 
-  const renderGroup = (list, group, gridEl) => {
-    if (!list.length) { group.style.display = 'none'; return; }
-    group.style.display = '';
-    gridEl.innerHTML = list.map(cardHtml).join('');
+  const groups = { custom: [], marketplace: [] };
+  for (const s of filtered) {
+    const source = _skillSource(s?.source);
+    if (source === 'marketplace') groups.marketplace.push(s);
+    else groups.custom.push(s);
+  }
+  const sectionHtml = (label, list) => {
+    if (!list.length) return '';
+    return `
+      <section class="skills-source-section">
+        <div class="skills-source-section-head">
+          <span>${escapeHtml(label)}</span>
+          <span class="skills-source-section-count">${list.length}</span>
+        </div>
+        <div class="skills-source-section-grid">
+          ${list.map(cardHtml).join('')}
+        </div>
+      </section>
+    `;
   };
-  renderGroup(custom, customGroup, customGrid);
-  renderGroup(marketplace, builtinGroup, builtinGrid);
+  gridEl.classList.add('is-sectioned');
+  gridEl.innerHTML = sectionHtml(customChipLabel, groups.custom)
+    + sectionHtml(marketplaceGroupLabel, groups.marketplace);
 
-  // Wire card / ▶ / ⋯ click handlers. (Enable/disable lives in the ⋯ menu
-  // now — no toggle switch on the card.)
-  for (const card of document.querySelectorAll('.skill-card')) {
+  // Wire card / ▶ / ⋯ click handlers. (Enable/disable lives in the ⋯ menu now.)
+  for (const card of gridEl.querySelectorAll('.skill-card')) {
     const id = card.dataset.id;
     const source = card.dataset.source;
     card.addEventListener('click', (e) => {
       if (e.target.closest('[data-skill-use]')) {
         e.stopPropagation();
-        const skill = _skillsCache?.find(s => s.id === id && s.source === source);
-        useSkill(id, skill?.name || id);
+        if (!card.classList.contains('is-disabled')) {
+          const skill = _skillsCache?.find(s => s.id === id && s.source === source);
+          useSkill(id, skill?.name || id);
+        }
         return;
       }
       if (e.target.closest('[data-skill-more]')) {
@@ -397,6 +521,8 @@ async function _showSkillsDetailView(source, id) {
   const detail = document.getElementById('skills-detail-view');
   if (grid) grid.style.display = 'none';
   if (detail) detail.style.display = 'flex';
+  await loadSkills(true);
+  _dropSkillTreeCache(source, id);
   // Reset scroll only on initial detail entry — file switching inside the
   // tree (handled by selectSkillFile) preserves position.
   const detailContent = document.getElementById('skills-detail-content');
@@ -411,6 +537,26 @@ async function _showSkillsDetailView(source, id) {
   // and "content shown below". scripts/ stays collapsed (user opens it
   // manually to reveal individual scripts).
   await _ensureSkillsSourceExpanded();
+}
+
+function _dropSkillTreeCache(source, id) {
+  const key = `${_skillSource(source)}:${id}`;
+  _skillTreeCache.delete(key);
+}
+
+async function refreshSelectedSkillDetail() {
+  if (_skillEditMode || !_selectedSkill?.id || !_selectedSkill?.source) return;
+  const detail = document.getElementById('skills-detail-view');
+  if (!detail || detail.style.display === 'none') return;
+  const source = _selectedSkill.source;
+  const id = _selectedSkill.id;
+  const filepath = _selectedSkill.filepath || 'SKILL.md';
+  _dropSkillTreeCache(source, id);
+  await selectSkillFile(source, id, filepath, null);
+  const toggle = document.getElementById('skills-source-toggle');
+  if (toggle?.getAttribute('aria-expanded') === 'true') {
+    await _ensureSkillsSourceExpanded();
+  }
 }
 
 async function _ensureSkillsSourceExpanded() {
@@ -457,27 +603,22 @@ function _openSkillRowMenu(anchorBtn, id, source) {
   _closeSkillRowMenu();
   menu.dataset.skillId = id;
   menu.dataset.source = source;
-  // Edit/delete are gated: custom always allowed; built-ins are read-only.
+  // Edit/delete are gated: custom always allowed; built-in only in dev mode.
   // Enable/disable is always shown (lives in this menu now since cards no
   // longer carry a toggle).
   const cached = _skillsCache?.find((s) => s.id === id && s.source === source);
   const enabled = cached ? cached.enabled !== false : true;
-  // OrkasOpen has no dev-env concept (per PC/CLAUDE.md §11 "OrkasOpen contract"),
-  // so platform / marketplace skills stay read-only — only custom skills are editable.
-  const canEdit = source === 'custom';
+  const canEdit = source === 'custom' || (_isSkillPlatformSource(source) && false);
+  // Dev-only entry on marketplace items: tag the label so the user knows this isn't a
+  // normal user capability (mirrors marketplace.upload's "(dev)" treatment).
+  const editLabelSuffix = (_isSkillPlatformSource(source) && false) ? t('common.dev_suffix') : '';
   const items = [];
   if (canEdit) {
-    items.push(`<div class="skill-row-menu-item" data-action="edit">${escapeHtml(t('skills.edit'))}</div>`);
+    items.push(`<div class="skill-row-menu-item" data-action="edit">${escapeHtml(t('skills.edit') + editLabelSuffix)}</div>`);
   }
   items.push(
     `<div class="skill-row-menu-item" data-action="toggle-enabled">${escapeHtml(enabled ? t('component.disable') : t('component.enable'))}</div>`,
   );
-
-  if (source === 'custom' && false) {
-    items.push(
-      `<div class="skill-row-menu-item" data-action="promote">${escapeHtml(t('skills.promote_to_builtin'))}</div>`,
-    );
-  }
   // Upload-to-marketplace owned by marketplace_dev.js (absent in OrkasOpen). typeof check
   // naturally hides the entry on builds that don't ship the dev module.
   if (typeof openMarketplaceUpload === 'function') {
@@ -507,11 +648,8 @@ function _openSkillRowMenu(anchorBtn, id, source) {
         // Mimic the existing delete flow (from detail page) but for any card.
         _selectedSkill = { source, id, filepath: 'SKILL.md', name: '' };
         await deleteSelectedSkill();
-
-      } else if (action === 'promote') {
-        await promoteCustomSkill(id);
       } else if (action === 'upload-marketplace') {
-        if (typeof openMarketplaceUpload === 'function') await openMarketplaceUpload('skill', id);
+        if (typeof openMarketplaceUpload === 'function') await openMarketplaceUpload('skill', id, source);
       } else if (action === 'toggle-enabled') {
         const cur = _skillsCache?.find((s) => s.id === id && s.source === source);
         const nextEnabled = !(cur ? cur.enabled !== false : true);
@@ -598,7 +736,6 @@ function fileIconSvg(ext) {
 function _setDirIcon(nodeEl, open) {
   const caret = nodeEl.querySelector('.skill-tree-caret');
   if (caret) {
-    caret.textContent = '▶';
     caret.classList.toggle('collapsed', !open);
   }
   const icon = nodeEl.querySelector('.skill-tree-icon');
@@ -612,7 +749,7 @@ function renderTreeNodes(nodes, source, id, depth) {
       const childrenHtml = `<div class="skill-tree-children" data-dir-path="${escapeHtml(n.path)}" style="display:none"></div>`;
       return `
         <div class="skill-tree-node skill-tree-dir" data-type="dir" data-path="${escapeHtml(n.path)}" style="padding-left:${indent}px">
-          <span class="skill-tree-caret collapsed">▶</span>
+          <span class="skill-tree-caret collapsed"></span>
           <span class="skill-tree-icon icon-folder">${ICON_FOLDER_CLOSED}</span>
           <span class="skill-tree-label">${escapeHtml(n.name)}</span>
         </div>
@@ -713,7 +850,7 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   nameEl.textContent = skill?.name || id;
   nameEl.dataset.skillId = id;
   nameEl.dataset.source = source;
-  // Name is editable ONLY in edit mode (req: "non-edit state must not allow rename").
+  // Name is editable ONLY in edit mode (req: "非编辑状态不能修改名称").
   // Editability is wired below alongside the description-section toggle —
   // both depend on `editingThis` which is computed a few lines down.
   nameEl.classList.remove('editable');
@@ -726,8 +863,10 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   sourceEl.className = 'skills-doc-source-row';
   sourceEl.innerHTML = _renderSourceMetaHtml({
     source,
+    version: skill?.version || '',
     category: skill?.category || '',
   });
+  _renderSkillDetailCategory(skill, source);
 
   // Doc sections (description / external dependencies / dependent
   // skills / other attributes) — seed with the cached description so
@@ -740,9 +879,7 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   // Order: use (icon) / edit / enable-disable / delete.
   // In edit mode only the "done" button (the relabeled "edit") is
   // shown; everything else hides.
-  // OrkasOpen has no dev-env concept (per PC/CLAUDE.md §11 "OrkasOpen contract"):
-  // platform / marketplace skills stay read-only — only custom skills are editable.
-  const canEditThisSkill = source === 'custom';
+  const canEditThisSkill = source === 'custom' || (_isSkillPlatformSource(source) && false);
   const editingThis = _skillEditMode && _skillEditSkillId === id && canEditThisSkill;
   const actions = document.getElementById('skills-detail-actions');
   if (actions) {
@@ -750,24 +887,26 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
     const useBtn = document.getElementById('skill-use-btn');
     const editBtn = document.getElementById('skill-edit-btn');
     const enableBtn = document.getElementById('skill-enabled-btn');
-
-    const promoteBtn = document.getElementById('skill-promote-btn');
     const uploadBtn = document.getElementById('skill-upload-marketplace-btn');
     const delBtn = document.getElementById('skill-delete-btn');
-    if (useBtn) useBtn.style.display = editingThis ? 'none' : '';
+    if (useBtn) {
+      useBtn.style.display = editingThis ? 'none' : '';
+      useBtn.disabled = skill?.enabled === false;
+      useBtn.setAttribute('aria-disabled', skill?.enabled === false ? 'true' : 'false');
+    }
     if (editBtn) editBtn.style.display = canEditThisSkill ? '' : 'none';
     if (enableBtn) enableBtn.style.display = editingThis ? 'none' : '';
-
-    if (promoteBtn) promoteBtn.style.display = (source === 'custom' && false && !editingThis) ? '' : 'none';
     // Upload button visibility: gated by marketplace_dev.js's presence (OrkasOpen lacks it).
     if (uploadBtn) uploadBtn.style.display = (typeof openMarketplaceUpload === 'function' && !editingThis) ? '' : 'none';
     if (delBtn) delBtn.style.display = (canEditThisSkill && !editingThis) ? '' : 'none';
   }
 
-  // Wire name editability (edit mode + custom only) and hide the
+  // Wire name editability and hide the
   // description section while editing (req #3: edit description by editing
-  // the `description_*:` frontmatter in SKILL.md, not via a separate UI block).
-  const nameEditable = editingThis && source === 'custom';
+  // the `description_*:` frontmatter in SKILL.md, not via a separate UI
+  // block). In dev mode, marketplace skill names are display metadata only:
+  // saving writes SKILL.md frontmatter without renaming the marketplace id dir.
+  const nameEditable = editingThis && (source === 'custom' || (_isSkillPlatformSource(source) && false));
   _toggleSkillNameEditable(nameEl, nameEditable);
   const summarySection = document.getElementById('skills-section-summary');
   if (summarySection) summarySection.style.display = editingThis ? 'none' : '';
@@ -778,12 +917,15 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   const body = document.getElementById('skills-detail-body');
   // Don't show a loading placeholder — it would collapse body height
   // before the new content arrives. Keep the previous content visible.
-  // For same-skill file switches, also pin body's min-height to its
-  // current rendered height so scrollHeight doesn't shrink when the new
-  // file's content is shorter than the old one (otherwise the browser
-  // clamps scrollTop and the page appears to jump up). The pin grows
-  // monotonically per detail session; reset on grid return / skill
-  // switch (handled in _showSkillsGridView / _showSkillsDetailView).
+  // For same-skill file switches, pin body's min-height to its current
+  // rendered height ONLY for the duration of the fetch + render so the
+  // body doesn't visibly collapse while the network call is in flight.
+  // The pin is cleared right after render so the body resettles to the
+  // new file's natural height — otherwise switching from a long source
+  // (e.g. SKILL.md) back to a short script leaves the body padded to
+  // the previous height and a large blank area appears below the new
+  // content. `_showSkillsGridView` / `_showSkillsDetailView` also reset
+  // minHeight on grid return / skill switch as a defensive backstop.
   const detailContent = document.getElementById('skills-detail-content');
   const savedScroll = detailContent ? detailContent.scrollTop : 0;
   if (sameSkill) {
@@ -828,9 +970,17 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   } catch (e) {
     body.innerHTML = `<span style="color:var(--danger)">${escapeHtml(t('skills.load_failed'))}</span>`;
   }
+  // Release the loading-time minHeight pin so the body collapses to the
+  // new file's natural height. Without this, switching from a long file
+  // back to a short one leaves a blank area below the new content (the
+  // pin was kept monotonically across same-skill file switches).
+  if (sameSkill) body.style.minHeight = '';
   // Restore scroll defensively. innerHTML swaps + section re-renders can
   // shift scrollHeight before the new content settles; clamping pulls
-  // scrollTop unexpectedly. Setting it back is cheap and idempotent.
+  // scrollTop unexpectedly. Setting it back is cheap and idempotent — the
+  // browser will clamp scrollTop to the new (possibly smaller) scrollHeight
+  // when the new file is shorter, which is the right outcome now that the
+  // body height honestly reflects the new content.
   if (detailContent) detailContent.scrollTop = savedScroll;
 
   // Chat column visibility is driven by edit-mode toggle.
@@ -901,6 +1051,39 @@ function _parseSkillFrontmatterPairs(content) {
   return pairs;
 }
 
+function _renderSkillDetailCategory(skill, source) {
+  const section = document.getElementById('skills-section-category');
+  const slot = document.getElementById('skills-detail-category');
+  if (!section || !slot) return;
+  const isCustom = source === 'custom';
+  section.style.display = isCustom ? '' : 'none';
+  if (!isCustom) { slot.innerHTML = ''; return; }
+  const skillId = skill?.id || _selectedSkill?.id;
+  _mountDetailCategorySelect(slot, {
+    value: skill?.category || 'general',
+    onChange: async (category) => {
+      try {
+        const res = await window.orkas.invoke('skills.update', {
+          id: skillId,
+          updates: { category: category || 'general' },
+          skipRename: true,
+        });
+        if (!res || res.ok === false || !res.skill) {
+          uiAlert((res && res.error) || t('skills.save_failed'));
+          return;
+        }
+        _skillsCache = null;
+        await loadSkills(true);
+        if (_selectedSkill?.id === skillId) {
+          await selectSkillFile('custom', skillId, _selectedSkill.filepath || 'SKILL.md', null);
+        }
+      } catch (err) {
+        uiAlert((err && err.message) || t('skills.save_failed'));
+      }
+    },
+  }).catch((err) => _skillsLog.warn('render category select failed', err));
+}
+
 // Single source of truth for rendering frontmatter fields into the
 // document. Splits known fields into their own dedicated sections (with
 // labels) and tucks any unknown leftover keys under "other
@@ -912,11 +1095,6 @@ function _renderSkillSections(pairs) {
   for (const [k, v] of (pairs || [])) {
     if (k && k !== 'name') map.set(k, v);
   }
-  // `description_zh` / `description_en` are the canonical bilingual fields;
-  // legacy single `description` is kept in `known` so it doesn't bleed into
-  // the "other attributes" bucket when reading older SKILL.md files.
-  const known = new Set(['description', 'description_zh', 'description_en']);
-
   // — Description — pick by current UI language with cross-language fallback (so a
   // single-language skill still shows something instead of going blank).
   const summaryEl = document.getElementById('skills-detail-summary');
@@ -935,23 +1113,16 @@ function _renderSkillSections(pairs) {
     }
   }
 
-  // — Other attributes (catch-all for anything we don't render explicitly) —
+  // — Other attributes —
+  // Orkas skill frontmatter is intentionally tiny: name, bilingual
+  // description, and category. Unknown/external metadata has no runtime
+  // effect, so authoring writes strip it and the read-only view hides any
+  // legacy leftovers instead of presenting them as meaningful properties.
   const extraSection = document.getElementById('skills-section-extra');
   const extraBody = document.getElementById('skills-detail-extra');
   if (extraSection && extraBody) {
-    const extra = [...map.entries()].filter(([k]) => !known.has(k));
-    if (!extra.length) {
-      extraSection.style.display = 'none';
-      extraBody.innerHTML = '';
-    } else {
-      extraSection.style.display = '';
-      extraBody.innerHTML = extra.map(([k, v]) => `
-        <div class="skills-doc-extra-row">
-          <span class="skills-doc-extra-key">${escapeHtml(k)}</span>
-          <span class="skills-doc-extra-val">${escapeHtml(v)}</span>
-        </div>
-      `).join('');
-    }
+    extraSection.style.display = 'none';
+    extraBody.innerHTML = '';
   }
 }
 
@@ -1047,8 +1218,8 @@ function _renderSkillFileEditor(body, content, _ext) {
 // ─── Skill name inline edit (mirrors agents.js's name editor) ───
 //
 // Replaces the older click-to-prompt rename path. The name field is now
-// only editable inside Skill detail's edit mode (req: non-edit state must
-// not allow rename). Wire-up:
+// only editable inside Skill detail's edit mode (req: 非编辑状态不能修改名称).
+// Wire-up:
 //   - Enter edit  → contenteditable + bind input/blur (one-time per element)
 //   - Type        → debounce 800ms → save SKILL.md frontmatter `name:`
 //                   via `skipRename:true` (no dir rename mid-typing)
@@ -1057,9 +1228,40 @@ function _renderSkillFileEditor(body, content, _ext) {
 //                   if valid AND name actually changed, fire one final
 //                   `skipRename:false` to commit the directory rename.
 
-const SKILL_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]*(?: [A-Za-z0-9_-]+)*$/;
+const SKILL_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]*$/;
 function _isValidSkillNameCharset(name) {
-  return typeof name === 'string' && name.length > 0 && name.length <= 64 && SKILL_NAME_RE.test(name);
+  if (typeof name !== 'string' || name.length <= 0) return false;
+  if (typeof window.nameDisplayWidth === 'function' && window.nameDisplayWidth(name) > window.NAME_DISPLAY_MAX_UNITS) return false;
+  return SKILL_NAME_RE.test(name);
+}
+
+function _isEditablePlatformSkill(skill) {
+  return !!skill && _isSkillPlatformSource(skill.source) && false;
+}
+
+function _canEditSelectedSkillName() {
+  return !!_selectedSkill && (_selectedSkill.source === 'custom' || _isEditablePlatformSkill(_selectedSkill));
+}
+
+function _selectedSkillNameFallback() {
+  if (!_selectedSkill) return '';
+  return String(_selectedSkill.source === 'custom'
+    ? _selectedSkill.id
+    : (_selectedSkill.name || _selectedSkill.id || '')).trim();
+}
+
+function _isValidSkillDisplayName(name) {
+  if (typeof name !== 'string') return false;
+  const trimmed = name.trim();
+  if (!trimmed || trimmed.includes('\n') || trimmed.includes('\r')) return false;
+  if (typeof window.nameDisplayWidth === 'function' && window.nameDisplayWidth(trimmed) > window.NAME_DISPLAY_MAX_UNITS) return false;
+  return true;
+}
+
+function _isValidSkillNameForSelected(name) {
+  return _isEditablePlatformSkill(_selectedSkill)
+    ? _isValidSkillDisplayName(name)
+    : _isValidSkillNameCharset(name);
 }
 
 function _toggleSkillNameEditable(nameEl, on) {
@@ -1072,6 +1274,7 @@ function _toggleSkillNameEditable(nameEl, on) {
 function _bindSkillNameSave(nameEl) {
   if (nameEl.dataset.bound === '1') return;
   nameEl.dataset.bound = '1';
+  if (typeof window.bindNameLimitControl === 'function') window.bindNameLimitControl(nameEl);
   nameEl.addEventListener('input', () => _scheduleSkillFieldSave('name', nameEl.innerText));
   nameEl.addEventListener('blur', () => _flushSkillFieldSave());
 }
@@ -1079,13 +1282,13 @@ function _bindSkillNameSave(nameEl) {
 let _pendingSkillField = null;
 let _skillFieldSaveTimer = null;
 function _scheduleSkillFieldSave(field, value) {
-  if (!_selectedSkill || _selectedSkill.source !== 'custom') return;
+  if (!_canEditSelectedSkillName()) return;
   _pendingSkillField = { field, value };
   clearTimeout(_skillFieldSaveTimer);
   _skillFieldSaveTimer = setTimeout(_flushSkillFieldSave, 800);
 }
 
-// `validate` is true ONLY when the user explicitly commits (clicks Done);
+// `validate` is true ONLY when the user explicitly commits (clicks 完成);
 // typing-debounced and blur-triggered flushes pass false — bad names
 // silently skip the save (DOM keeps the in-progress text) instead of
 // popping a uiAlert mid-keystroke. Mirrors agents.js::_flushAgentFieldSave.
@@ -1101,39 +1304,68 @@ async function _flushSkillFieldSave({ validate = false } = {}) {
   // Clicking Done blurs the contenteditable title before the click handler
   // runs. That blur autosave can clear `_pendingSkillField`; recover the
   // current DOM value so the explicit commit still performs the dir rename.
-  if (!_pendingSkillField && validate && _selectedSkill?.source === 'custom') {
+  if (!_pendingSkillField && validate && _canEditSelectedSkillName()) {
     const nameEl = document.getElementById('skills-detail-name');
-    if (nameEl && String(nameEl.innerText || '').trim() !== _selectedSkill.id) {
+    if (nameEl && String(nameEl.innerText || '').trim() !== _selectedSkillNameFallback()) {
       _pendingSkillField = { field: 'name', value: nameEl.innerText };
     }
   }
-  if (!_pendingSkillField || !_selectedSkill) return;
+  if (!_pendingSkillField || !_selectedSkill) return true;
   const { field, value } = _pendingSkillField;
   if (field === 'name') {
-    const name = String(value || '').trim();
-    const invalid = !_isValidSkillNameCharset(name);
+    const invalid = !_isValidSkillNameForSelected(String(value || ''));
     if (invalid) {
-      if (!validate) return;
+      if (!validate) return false;
       _pendingSkillField = null;
       await uiAlert(t('skills.name_invalid'));
       const nameEl = document.getElementById('skills-detail-name');
-      if (nameEl) nameEl.innerText = _selectedSkill.id;
-      // Roll the SKILL.md frontmatter back to the original id too — the
-      // skipRename:true writes during typing left a possibly-invalid name
-      // on disk; revert so the next listSkills auto-heal doesn't misfire.
-      try {
-        await apiFetch(`/api/skills/${encodeURIComponent(_selectedSkill.id)}/update?skipRename=1`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: _selectedSkill.id }),
-        });
-      } catch (_) { /* best-effort revert */ }
-      return;
+      if (nameEl) nameEl.innerText = _selectedSkillNameFallback();
+      if (_selectedSkill.source === 'custom') {
+        // Roll the SKILL.md frontmatter back to the original id too — the
+        // skipRename:true writes during typing left a possibly-invalid name
+        // on disk; revert so the next listSkills auto-heal doesn't misfire.
+        try {
+          await apiFetch(`/api/skills/${encodeURIComponent(_selectedSkill.id)}/update?skipRename=1`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: _selectedSkill.id }),
+          });
+        } catch (_) { /* best-effort revert */ }
+      }
+      return false;
     }
   }
   _pendingSkillField = null;
   const currentId = _selectedSkill.id;
   const newName = String(value || '').trim();
+  if (_isEditablePlatformSkill(_selectedSkill)) {
+    try {
+      const data = await window.orkas.invoke('skills.updateForEdit', {
+        id: currentId,
+        updates: { [field]: value },
+      });
+      if (!data || data.ok === false) {
+        throw new Error(data?.error || 'save failed');
+      }
+      if (field === 'name') {
+        const nextName = data.skill?.name || newName || currentId;
+        _skillsCache = null;
+        _skillTreeCache.clear();
+        await loadSkills();
+        _selectedSkill = { ..._selectedSkill, name: nextName };
+        const nameEl = document.getElementById('skills-detail-name');
+        if (nameEl) nameEl.innerText = nextName;
+      }
+      return true;
+    } catch (e) {
+      if (validate && field === 'name') {
+        await uiAlert(t('skills.rename_failed', { reason: e.message || e }));
+        const nameEl = document.getElementById('skills-detail-name');
+        if (nameEl) nameEl.innerText = _selectedSkillNameFallback();
+      }
+      return false;
+    }
+  }
   const skipRename = !validate || newName === currentId;
   // ipc-shim's `wrapAsUpdates` wraps the body under `updates`, so the
   // request body holds only field values; `skipRename` rides on the URL
@@ -1161,12 +1393,14 @@ async function _flushSkillFieldSave({ validate = false } = {}) {
       _selectedSkill = { ..._selectedSkill, id: resultId };
       _skillEditSkillId = resultId;
     }
+    return true;
   } catch (e) {
     if (validate && field === 'name') {
       await uiAlert(t('skills.rename_failed', { reason: e.message || e }));
       const nameEl = document.getElementById('skills-detail-name');
       if (nameEl) nameEl.innerText = _selectedSkill.id;
     }
+    return false;
   }
 }
 
@@ -1182,9 +1416,10 @@ function _updateEditButtonLabel() {
     btn.textContent = t('skills.edit_btn_done');
     return;
   }
-  // OrkasOpen has no dev-env concept (per PC/CLAUDE.md §11 "OrkasOpen contract");
-  // platform / marketplace skill labels never carry the dev-suffix marker.
-  btn.textContent = t('skills.edit_btn_edit');
+  // Tag the "Edit" label on marketplace skills (dev-only entry); the "Done"
+  // branch above stays bare — in edit mode the marker is redundant.
+  const suffix = (_isSkillPlatformSource(_selectedSkill?.source) && false) ? t('common.dev_suffix') : '';
+  btn.textContent = t('skills.edit_btn_edit') + suffix;
 }
 
 // When called with {autoSeed: true} (e.g. right after skill creation),
@@ -1196,7 +1431,6 @@ function _updateEditButtonLabel() {
 // automatically — the user drives the conversation from a blank input.
 async function toggleSkillEditMode(opts = {}) {
   if (!_selectedSkill) return;
-  if (_selectedSkill.source !== 'custom') return;
   // Marketplace editing is dev-only; lift the source guard accordingly.
   if (_selectedSkill.source !== 'custom'
       && !(_isSkillPlatformSource(_selectedSkill.source) && false)) return;
@@ -1213,12 +1447,15 @@ async function toggleSkillEditMode(opts = {}) {
     // branch in `_flushSkillFieldSave`). Valid + actually-changed name
     // → fires a `skipRename:false` update which commits the directory
     // rename + refreshes caches before we re-render readonly view.
-    await _flushSkillFieldSave({ validate: true });
+    const committed = await _flushSkillFieldSave({ validate: true });
+    if (committed === false) return;
     _skillEditMode = false;
     _skillEditSkillId = null;
     document.getElementById('skills-chat-col').style.display = 'none';
     _updateEditButtonLabel();
-    // Swap the body back to read-only view of the current file.
+    // Swap the body back to read-only view of the current file. Use the
+    // _selectedSkill.id snapshot — flush may have rotated it if the
+    // directory got renamed.
     await selectSkillFile(_selectedSkill.source, _selectedSkill.id,
       _selectedSkill.filepath || 'SKILL.md', null);
     return;
@@ -1232,6 +1469,7 @@ async function toggleSkillEditMode(opts = {}) {
     _selectedSkill.filepath || 'SKILL.md', null);
   _ensureSkillChatController();
   await _skillChatCtrl.loadHistory();
+  await _chatAttachRefreshFromServer(_skillEditAttachmentCid(_skillEditSkillId));
   if (opts.autoSeed) {
     const existing = document.querySelectorAll('#skills-chat-messages .chat-message');
     if (existing.length === 0) {
@@ -1246,8 +1484,83 @@ async function toggleSkillEditMode(opts = {}) {
 // Lazy singleton — created once, driven by `_skillEditSkillId` via the id
 // resolver so it follows the currently active skill.
 let _skillChatCtrl = null;
+let _skillEditAttachmentsBound = false;
+
+function _skillEditAttachmentCid(skillId) {
+  return skillId ? `skill-edit-${skillId}` : '';
+}
+
+function _bindSkillEditAttachments() {
+  if (_skillEditAttachmentsBound) return;
+  _skillEditAttachmentsBound = true;
+  const btn = document.getElementById('skills-chat-attach-btn');
+  const area = document.querySelector('.skills-chat-input-area');
+  const input = document.getElementById('skills-chat-input');
+  const currentCid = () => _skillEditAttachmentCid(_skillEditSkillId || '');
+  if (btn) {
+    btn.addEventListener('click', async () => {
+      const cid = currentCid();
+      if (cid) await _chatAttachPickAndUpload(cid);
+    });
+  }
+  if (area) {
+    area.addEventListener('dragover', (e) => {
+      const hasFiles = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length;
+      const hasInternal = e.dataTransfer && Array.from(e.dataTransfer.types || []).includes(ORKAS_FILE_DRAG_MIME);
+      if (!hasFiles && !hasInternal) return;
+      e.preventDefault();
+      area.classList.add('drag-over');
+    });
+    area.addEventListener('dragleave', () => area.classList.remove('drag-over'));
+    area.addEventListener('drop', async (e) => {
+      const cid = currentCid();
+      if (!cid) return;
+      const internal = _chatAttachInternalDragItems(e.dataTransfer);
+      if (internal.length) {
+        e.preventDefault();
+        area.classList.remove('drag-over');
+        await _chatAttachImportPaths(cid, internal);
+        return;
+      }
+      if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+        e.preventDefault();
+        area.classList.remove('drag-over');
+        await _chatAttachUpload(cid, e.dataTransfer.files);
+      }
+    });
+  }
+  if (input) {
+    input.addEventListener('paste', async (e) => {
+      if (!e.clipboardData || !e.clipboardData.files || !e.clipboardData.files.length) return;
+      const cid = currentCid();
+      if (!cid) return;
+      e.preventDefault();
+      await _chatAttachUpload(cid, e.clipboardData.files);
+    });
+  }
+}
+
+async function _buildSkillEditChatExtraBody(_content, skillId, state) {
+  const cid = _skillEditAttachmentCid(skillId);
+  const items = _chatAttachList(cid);
+  if (!items.length) return undefined;
+  if (items.some((a) => a.status === 'uploading')) {
+    await uiAlert(t('chat.attach_still_uploading'));
+    return null;
+  }
+  const attachments = items.filter((a) => a.status !== 'error').map((a) => a.name);
+  if (!attachments.length) return undefined;
+  if (state && (state.pending || state.hasQueue)) {
+    await uiAlert(t('chat.attach_queue_blocked'));
+    return null;
+  }
+  _chatAttachClear(cid);
+  return { attachments, attachment_cid: cid };
+}
+
 function _ensureSkillChatController() {
   if (_skillChatCtrl) return _skillChatCtrl;
+  _bindSkillEditAttachments();
   _skillChatCtrl = createChatController({
     historyEl: 'skills-chat-messages',
     inputEl: 'skills-chat-input',
@@ -1264,6 +1577,7 @@ function _ensureSkillChatController() {
       countId: 'skills-chat-queue-count',
     },
     hooks: {
+      buildExtraBody: _buildSkillEditChatExtraBody,
       async onFinal(ev, msgEl, id) {
         // Skill chat may rewrite files on disk; refresh the detail pane so
         // the tree and SKILL.md display reflect the new state.
@@ -1420,6 +1734,9 @@ async function openSkillModal(editId) {
   }
 
   modal.classList.add('open');
+  if (typeof window.bindNameLimitControl === 'function') {
+    window.bindNameLimitControl(document.getElementById('skill-name'));
+  }
 }
 window.openSkillModal = openSkillModal;
 
@@ -1467,10 +1784,17 @@ async function saveSkill() {
 window.saveSkill = saveSkill;
 
 async function _saveSkillManual({ editId, msgEl }) {
-  const name = document.getElementById('skill-name').value.trim();
+  const rawName = document.getElementById('skill-name').value;
+  const name = rawName.trim();
   const description = document.getElementById('skill-description').value.trim();
   if (!name) {
     msgEl.textContent = t('skills.input_name_needed');
+    msgEl.className = 'form-msg err';
+    document.getElementById('skill-name').focus();
+    return;
+  }
+  if (!_isValidSkillNameCharset(rawName)) {
+    msgEl.textContent = t('skills.name_invalid');
     msgEl.className = 'form-msg err';
     document.getElementById('skill-name').focus();
     return;
@@ -1482,18 +1806,20 @@ async function _saveSkillManual({ editId, msgEl }) {
     return;
   }
   try {
-    const cached = editId ? _skillsCache?.find((s) => s.id === editId && s.source === 'custom') : null;
-    const category = _normalizeSkillCategoryForHiddenSave(cached?.category);
+    // Create: stamp the marketplace default since the modal has no category picker.
+    // Edit: omit category so the on-disk frontmatter value is preserved (LLM-authored
+    // edits via `skill-creator` are the only source of category mutation).
+    const body = editId ? { name, description } : { name, description, category: 'general' };
     const res = editId
       ? await apiFetch(`/api/skills/${editId}/update`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, description, category }),
+          body: JSON.stringify(body),
         })
       : await apiFetch('/api/skills/create', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, description, category }),
+          body: JSON.stringify(body),
         });
     const data = await res.json();
     if (!data.ok) {
@@ -1542,14 +1868,42 @@ async function _saveSkillFromDir({ msgEl }) {
     msgEl.className = 'form-msg err';
     return;
   }
+  return _saveSkillFromDirWithQuality({ msgEl, srcDir, force: false });
+}
+
+function _qualityForceImportLabel() {
+  const v = t('quality.force_import');
+  return v === 'quality.force_import' ? 'Import anyway' : v;
+}
+
+function _qualityImportRejectedTitle(name) {
+  const tmpl = t('quality.import_rejected_title');
+  const fallback = `Import rejected by quality validator: ${name}`;
+  return tmpl === 'quality.import_rejected_title'
+    ? fallback
+    : tmpl.replace('{name}', name);
+}
+
+async function _saveSkillFromDirWithQuality({ msgEl, srcDir, force }) {
   try {
     const res = await apiFetch('/api/skills/create-from-dir', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: null, description: null, srcDir }),
+      body: JSON.stringify({ name: null, description: null, srcDir, ...(force ? { force: true } : {}) }),
     });
     const data = await res.json();
     if (!data.ok) {
+      if (!force && data.report && typeof showValidationReport === 'function') {
+        const titleName = data.skillId || srcDir.split(/[\\/]/).filter(Boolean).pop() || srcDir;
+        const action = await showValidationReport({
+          title: _qualityImportRejectedTitle(titleName),
+          report: data.report,
+          forceLabel: _qualityForceImportLabel(),
+        });
+        if (action === 'force') {
+          return _saveSkillFromDirWithQuality({ msgEl, srcDir, force: true });
+        }
+      }
       msgEl.textContent = data.error || t('skills.save_failed');
       msgEl.className = 'form-msg err';
       return;
@@ -1593,14 +1947,15 @@ function editSelectedSkill() {
 
 async function deleteSelectedSkill() {
   if (!_selectedSkill) return;
-  // OrkasOpen has no dev-env concept (per PC/CLAUDE.md §11 "OrkasOpen contract"):
-  // platform skills are not user-deletable here — only custom skills.
-  if (_selectedSkill.source !== 'custom') return;
+  const src = _selectedSkill.source;
+  if (src !== 'custom' && !(_isSkillPlatformSource(src) && false)) return;
   const sid = _selectedSkill.id;
-  const cached = _skillsCache?.find(s => s.id === sid && s.source === 'custom');
+  const cached = _skillsCache?.find(s => s.id === sid && s.source === src);
   if (!(await uiConfirm(t('skills.delete_confirm', { name: cached?.name || sid })))) return;
   try {
-    const result = await (await apiFetch(`/api/skills/${sid}`, { method: 'DELETE' })).json();
+    const result = _isSkillPlatformSource(src)
+      ? await window.orkas.invoke('skills.builtin.delete', { id: sid })
+      : await (await apiFetch(`/api/skills/${sid}`, { method: 'DELETE' })).json();
     if (!result.ok) {
       await uiAlert(t('skills.delete_failed_with', { reason: result.error || '' }));
       return;

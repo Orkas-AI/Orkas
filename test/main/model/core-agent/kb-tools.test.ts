@@ -4,7 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 /**
- * kb_search / kb_read tool contract tests. kb_embed is mocked so tests don't
+ * kb_list / kb_search / kb_read tool contract tests. kb_embed is mocked so tests don't
  * load ONNX. kb_vector is exercised for real (better-sqlite3 + sqlite-vec).
  */
 
@@ -68,7 +68,7 @@ describe('kb-tools › kb_search', () => {
   it('returns formatted hits with path/chunk/score/preview', async () => {
     await seedFiles();
     const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
-    const [kbSearch] = createKbTools({ userId: TEST_UID });
+    const [, kbSearch] = createKbTools({ userId: TEST_UID });
     const r = await kbSearch.execute({ query: 'alpha', k: 3 }, ctxFor());
     expect(r.isError).toBeFalsy();
     expect(r.content).toMatch(/path=notes\/a\.md/);
@@ -79,7 +79,7 @@ describe('kb-tools › kb_search', () => {
 
   it('rejects empty query', async () => {
     const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
-    const [kbSearch] = createKbTools({ userId: TEST_UID });
+    const [, kbSearch] = createKbTools({ userId: TEST_UID });
     const r = await kbSearch.execute({ query: '   ' }, ctxFor());
     expect(r.isError).toBe(true);
     expect(r.content).toMatch(/required/);
@@ -88,12 +88,23 @@ describe('kb-tools › kb_search', () => {
   it('respects kind filter', async () => {
     await seedFiles();
     const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
-    const [kbSearch] = createKbTools({ userId: TEST_UID });
+    const [, kbSearch] = createKbTools({ userId: TEST_UID });
     const r = await kbSearch.execute({ query: 'anything', k: 5, kind: 'image' }, ctxFor());
     expect(r.isError).toBeFalsy();
     expect(r.content).toMatch(/imgs\/c\.png/);
     expect(r.content).not.toMatch(/notes\/a\.md/);
     expect(r.content).not.toMatch(/drafts\/b\.md/);
+  });
+
+  it('respects exact path filter', async () => {
+    await seedFiles();
+    const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
+    const [, kbSearch] = createKbTools({ userId: TEST_UID });
+    const r = await kbSearch.execute({ query: 'alpha', k: 5, path: 'drafts/b.md' }, ctxFor());
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toMatch(/path=drafts\/b\.md/);
+    expect(r.content).not.toMatch(/path=notes\/a\.md/);
+    expect(r.content).not.toMatch(/path=imgs\/c\.png/);
   });
 
   it('reports processing count when KB has in-flight files', async () => {
@@ -102,9 +113,102 @@ describe('kb-tools › kb_search', () => {
       kind: 'text', bytes: 1, mtime: 1, sha1: 'p',
     });
     const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
-    const [kbSearch] = createKbTools({ userId: TEST_UID });
+    const [, kbSearch] = createKbTools({ userId: TEST_UID });
     const r = await kbSearch.execute({ query: 'x' }, ctxFor());
     expect(r.content).toMatch(/still being processed|processing=1/);
+  });
+
+  it('searches project and global Library scopes inside a project', async () => {
+    await seedFiles();
+    const projects = await import('../../../../src/main/features/projects');
+    const projectFiles = await import('../../../../src/main/features/project_files');
+    const projectLibrary = await import('../../../../src/main/features/project_library_indexer');
+    const created = await projects.createProject(TEST_UID, 'Project A');
+    expect(created.ok).toBe(true);
+    const projectId = created.ok ? created.project.project_id : '';
+    const dir = await projectFiles.createProjectDir(TEST_UID, projectId, 'project-folder');
+    expect(dir.ok).toBe(true);
+    const uploaded = await projectFiles.uploadProjectFile(
+      TEST_UID,
+      projectId,
+      'project-folder/project-note.md',
+      Buffer.from('project alpha body', 'utf8'),
+    );
+    expect(uploaded.ok).toBe(true);
+    const tree = await projectFiles.listProjectFileTree(TEST_UID, projectId);
+    expect(tree).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'dir',
+        relPath: 'project-folder',
+        children: expect.arrayContaining([
+          expect.objectContaining({ type: 'file', relPath: 'project-folder/project-note.md' }),
+        ]),
+      }),
+    ]));
+    await projectLibrary.drain(TEST_UID);
+
+    const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
+    const [, kbSearch, kbRead] = createKbTools({ userId: TEST_UID, projectId });
+    const r = await kbSearch.execute({ query: 'alpha', k: 10 }, ctxFor());
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toMatch(/scope=global path=notes\/a\.md/);
+    expect(r.content).toMatch(/scope=project path=project-folder\/project-note\.md/);
+
+    const read = await kbRead.execute({ scope: 'project', path: 'project-folder/project-note.md' }, ctxFor());
+    expect(read.isError).toBeFalsy();
+    expect(read.content).toMatch(/<library-file scope="project" path="project-folder\/project-note\.md"/);
+    expect(read.content).toMatch(/project alpha body/);
+  });
+});
+
+describe('kb-tools › kb_list', () => {
+  it('lists Library files with status, kind, scope, chunks, and size', async () => {
+    await seedFiles();
+    const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
+    const [kbList] = createKbTools({ userId: TEST_UID });
+    const r = await kbList.execute({}, ctxFor());
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toMatch(/Library files \(global total=3 ready=3/);
+    expect(r.content).toMatch(/scope=global path=notes\/a\.md kind=text status=ready chunks=2 size=10 B/);
+    expect(r.content).toMatch(/scope=global path=imgs\/c\.png kind=image status=ready chunks=1 size=10 B/);
+  });
+
+  it('filters by dir, kind, status, and limit', async () => {
+    await seedFiles();
+    const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
+    const [kbList] = createKbTools({ userId: TEST_UID });
+    const r = await kbList.execute({ dir: 'notes', kind: 'text', status: 'ready', limit: 1 }, ctxFor());
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toMatch(/notes\/a\.md/);
+    expect(r.content).not.toMatch(/drafts\/b\.md/);
+    expect(r.content).not.toMatch(/imgs\/c\.png/);
+  });
+
+  it('lists project and global Library scopes inside a project', async () => {
+    await seedFiles();
+    const projects = await import('../../../../src/main/features/projects');
+    const projectFiles = await import('../../../../src/main/features/project_files');
+    const projectLibrary = await import('../../../../src/main/features/project_library_indexer');
+    const created = await projects.createProject(TEST_UID, 'Project B');
+    expect(created.ok).toBe(true);
+    const projectId = created.ok ? created.project.project_id : '';
+    const uploaded = await projectFiles.uploadProjectFile(
+      TEST_UID,
+      projectId,
+      'project-note.md',
+      Buffer.from('project list body', 'utf8'),
+    );
+    expect(uploaded.ok).toBe(true);
+    await projectLibrary.drain(TEST_UID);
+
+    const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
+    const [kbList] = createKbTools({ userId: TEST_UID, projectId });
+    const r = await kbList.execute({}, ctxFor());
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toMatch(/global total=3 ready=3/);
+    expect(r.content).toMatch(/project total=1 ready=1/);
+    expect(r.content).toMatch(/scope=project path=project-note\.md/);
+    expect(r.content).toMatch(/scope=global path=notes\/a\.md/);
   });
 });
 
@@ -112,19 +216,19 @@ describe('kb-tools › kb_read', () => {
   it('returns full body by default (joined chunks)', async () => {
     await seedFiles();
     const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
-    const [, kbRead] = createKbTools({ userId: TEST_UID });
+    const [, , kbRead] = createKbTools({ userId: TEST_UID });
     const r = await kbRead.execute({ path: 'notes/a.md' }, ctxFor());
     expect(r.isError).toBeFalsy();
-    expect(r.content).toMatch(/<kb-file path="notes\/a\.md"/);
+    expect(r.content).toMatch(/<library-file scope="global" path="notes\/a\.md"/);
     expect(r.content).toMatch(/alpha content/);
     expect(r.content).toMatch(/second chunk body/);
-    expect(r.content).toMatch(/<\/kb-file>/);
+    expect(r.content).toMatch(/<\/library-file>/);
   });
 
   it('returns just one chunk when index given', async () => {
     await seedFiles();
     const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
-    const [, kbRead] = createKbTools({ userId: TEST_UID });
+    const [, , kbRead] = createKbTools({ userId: TEST_UID });
     const r = await kbRead.execute({ path: 'notes/a.md', chunk: 2 }, ctxFor());
     expect(r.content).toMatch(/second chunk body/);
     expect(r.content).not.toMatch(/alpha content/);
@@ -132,7 +236,7 @@ describe('kb-tools › kb_read', () => {
 
   it('rejects non-existent path', async () => {
     const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
-    const [, kbRead] = createKbTools({ userId: TEST_UID });
+    const [, , kbRead] = createKbTools({ userId: TEST_UID });
     const r = await kbRead.execute({ path: 'nope.md' }, ctxFor());
     expect(r.isError).toBe(true);
     expect(r.content).toMatch(/not found/);
@@ -144,7 +248,7 @@ describe('kb-tools › kb_read', () => {
       kind: 'text', bytes: 1, mtime: 1, sha1: 'x', error: 'extract blew up',
     });
     const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
-    const [, kbRead] = createKbTools({ userId: TEST_UID });
+    const [, , kbRead] = createKbTools({ userId: TEST_UID });
     const r = await kbRead.execute({ path: 'bad.md' }, ctxFor());
     expect(r.isError).toBe(true);
     expect(r.content).toMatch(/status=failed/);
@@ -165,7 +269,7 @@ describe('kb-tools › kb_read', () => {
       ],
     });
     const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
-    const [, kbRead] = createKbTools({ userId: TEST_UID });
+    const [, , kbRead] = createKbTools({ userId: TEST_UID });
     const r = await kbRead.execute({ path: 'multi.md', chunk: 2, window: 1 }, ctxFor());
     expect(r.isError).toBeFalsy();
     expect(r.content).toMatch(/chunk one body/);
@@ -178,7 +282,7 @@ describe('kb-tools › kb_read', () => {
     // Window extends past both ends of a 1-chunk file — just returns that chunk.
     await seedFiles();
     const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
-    const [, kbRead] = createKbTools({ userId: TEST_UID });
+    const [, , kbRead] = createKbTools({ userId: TEST_UID });
     const r = await kbRead.execute({ path: 'drafts/b.md', chunk: 1, window: 5 }, ctxFor());
     expect(r.isError).toBeFalsy();
     expect(r.content).toMatch(/a draft/);
@@ -187,7 +291,7 @@ describe('kb-tools › kb_read', () => {
   it('rejects out-of-range chunk index', async () => {
     await seedFiles();
     const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
-    const [, kbRead] = createKbTools({ userId: TEST_UID });
+    const [, , kbRead] = createKbTools({ userId: TEST_UID });
     const r = await kbRead.execute({ path: 'notes/a.md', chunk: 99 }, ctxFor());
     expect(r.isError).toBe(true);
     expect(r.content).toMatch(/out of range/);
@@ -195,15 +299,16 @@ describe('kb-tools › kb_read', () => {
 });
 
 describe('kb-tools › shape', () => {
-  it('createKbTools returns exactly two tools (search + read)', async () => {
+  it('createKbTools returns exactly three tools (list + search + read)', async () => {
     const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
     const tools = createKbTools({ userId: TEST_UID });
-    expect(tools.map((t) => t.name)).toEqual(['kb_search', 'kb_read']);
+    expect(tools.map((t) => t.name)).toEqual(['kb_list', 'kb_search', 'kb_read']);
   });
 
   it('tools have required JSON schema fields', async () => {
     const { createKbTools } = await import('../../../../src/main/model/core-agent/kb-tools');
-    const [kbSearch, kbRead] = createKbTools({ userId: TEST_UID });
+    const [kbList, kbSearch, kbRead] = createKbTools({ userId: TEST_UID });
+    expect(kbList.inputSchema?.properties).toHaveProperty('scope');
     expect(kbSearch.inputSchema?.required).toContain('query');
     expect(kbRead.inputSchema?.required).toContain('path');
   });

@@ -18,8 +18,14 @@ import * as registry from './registry';
 import { McpConnection } from './mcp-client';
 import { findCatalogEntry } from './catalog';
 import { applyTemplate } from './apply-template';
-import { startOAuth, refreshIfStale } from './oauth';
-import { startMcpDcrOAuth, refreshDcrIfStale } from './oauth-dcr';
+import { assertConnectorRuntimeEnabled, isConnectorRuntimeEnabled } from './availability';
+import { startOAuth, refreshIfStale, startGoogleSheetsPicker } from './oauth';
+import {
+  startMcpDcrOAuth,
+  refreshDcrIfStale,
+  refreshDcrServerManaged,
+  storeDcrServerManaged,
+} from './oauth-dcr';
 import { createLogger } from '../../logger';
 import type { CatalogEntry, ConnectorInstance, OAuthGrant, ToolSchema, Transport } from './types';
 
@@ -42,15 +48,192 @@ let _bootedFor: string | null = null;
 const _refreshLocks = new Map<string, Promise<OAuthGrant>>();
 
 const REFRESH_BUFFER_MS = 5 * 60 * 1000;
+const CONNECT_RETRY_DELAY_MS = 500;
 
 function _now(): number { return Date.now(); }
 function _nowIso(): string { return new Date().toISOString(); }
+function _sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+}
 
 /** Non-reversible token fingerprint for diagnostic logs. Twelve SHA-256 hex chars are enough
  *  to correlate PC + Server events without leaking a usable token prefix. */
 function _tokPrefix(t: string | null | undefined): string {
   if (!t) return 'none';
   return crypto.createHash('sha256').update(t).digest('hex').slice(0, 12);
+}
+
+function _missingRequiredScopes(entry: CatalogEntry, grant: OAuthGrant | undefined): string[] {
+  const required = Array.isArray(entry.required_oauth_scopes) ? entry.required_oauth_scopes : [];
+  if (!required.length || !grant) return [];
+  if (!Array.isArray(grant.scopes)) return required.slice();
+  const granted = new Set(grant.scopes.filter(Boolean));
+  return required.filter((scope) => !granted.has(scope));
+}
+
+function _storedAuthorizationProblem(inst: ConnectorInstance): { message: string; reason: string } | null {
+  const entry = findCatalogEntry(inst.id);
+  if (!entry) return null;
+  const statusError = inst.status?.kind === 'error' ? inst.status.message : '';
+  if (statusError && _isGoogleAuthFailure(entry, statusError)) {
+    return { message: statusError, reason: 'google_auth_error' };
+  }
+  return null;
+}
+
+function _hasStatusError(inst: ConnectorInstance, message: string): boolean {
+  return inst.status?.kind === 'error' && inst.status.message === message;
+}
+
+function _hasMissingRequiredScopes(inst: ConnectorInstance): boolean {
+  const entry = findCatalogEntry(inst.id);
+  return !!entry && _missingRequiredScopes(entry, inst.oauth_grant).length > 0;
+}
+
+function _isMissingRequiredScopesError(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  const msg = (err as Error | null)?.message || String(err || '');
+  return code === 'missing_required_scopes' || /missing_required_scopes|missing required scopes/i.test(msg);
+}
+
+function _isGoogleEntry(entry: CatalogEntry): boolean {
+  return entry.oauth?.provider_id === 'google';
+}
+
+function _isGitHubEntry(entry: CatalogEntry): boolean {
+  return entry.oauth?.provider_id === 'github';
+}
+
+function _isGoogleAuthFailure(entry: CatalogEntry, err: unknown): boolean {
+  if (!_isGoogleEntry(entry)) return false;
+  if (_isMissingRequiredScopesError(err)) return true;
+  const msg = (err as Error | null)?.message || String(err || '');
+  return /refresh HTTP\s+4\d\d|refresh_failed|invalid refresh response|access_token expired|no oauth_grant|transport unresolved|connector_unauthorized/i.test(msg);
+}
+
+function _isDcrAuthFailure(entry: CatalogEntry, err: unknown): boolean {
+  if (entry.auth_mode !== 'mcp_dcr') return false;
+  const msg = (err as Error | null)?.message || String(err || '');
+  return /DCR refresh HTTP\s+4\d\d|invalid_grant|access_token expired|no oauth_grant|transport unresolved/i.test(msg);
+}
+
+function _isTransientConnectorFailure(err: unknown): boolean {
+  const msg = (err as Error | null)?.message || String(err || '');
+  return /fetch failed|network|timeout|timed out|econnreset|econnrefused|eai_again|enotfound|socket|connection (closed|reset|dropped)|terminated/i.test(msg);
+}
+
+function _hasEstablishedConnectorState(inst: ConnectorInstance): boolean {
+  return inst.status?.kind === 'connected' || (Array.isArray(inst.tools_cache) && inst.tools_cache.length > 0);
+}
+
+function _isTransientStatusError(inst: ConnectorInstance): boolean {
+  return inst.status?.kind === 'error' && _isTransientConnectorFailure(inst.status.message);
+}
+
+function _asConnectedFromCache(inst: ConnectorInstance): ConnectorInstance {
+  if (inst.status?.kind === 'connected') return inst;
+  return {
+    ...inst,
+    status: { kind: 'connected', since: _now() },
+  };
+}
+
+async function _preserveEstablishedStateOnTransientFailure(
+  uid: string,
+  inst: ConnectorInstance,
+  err: unknown,
+  reason: string,
+): Promise<ConnectorInstance | null> {
+  if (!_isTransientConnectorFailure(err) || !_hasEstablishedConnectorState(inst)) return null;
+  log.warn('preserving established connector state after transient failure', {
+    id: inst.id,
+    reason,
+    error: (err as Error).message,
+  });
+  const current = registry.load(uid).connections[inst.id] || inst;
+  if (_isTransientStatusError(current)) {
+    const healed = await _patchStatus(uid, current, (cur) => ({
+      ..._asConnectedFromCache(cur),
+      updated_at: _nowIso(),
+    }));
+    return healed;
+  }
+  return current;
+}
+
+function _normalizeTransientStatusForList(uid: string, inst: ConnectorInstance): ConnectorInstance {
+  if (!_isTransientStatusError(inst) || !_hasEstablishedConnectorState(inst)) return inst;
+  const healed = _asConnectedFromCache(inst);
+  void _patchStatus(uid, inst, (cur) => ({
+    ..._asConnectedFromCache(cur),
+    updated_at: _nowIso(),
+  })).catch((err) => {
+    log.warn('failed to heal transient connector status', { id: inst.id, error: (err as Error).message });
+  });
+  return healed;
+}
+
+async function _removeStoredInstance(uid: string, id: string, reason: string): Promise<void> {
+  const conn = _conns.get(id);
+  if (conn) {
+    try { await conn.close(); } catch { /* swallow */ }
+    _conns.delete(id);
+  }
+  const removed = await registry.remove(uid, id);
+  if (removed) log.info('removed connector instance', { id, reason });
+}
+
+async function _removeInstancesForCatalog(uid: string, entry: CatalogEntry, reason: string): Promise<void> {
+  const ids = entry.bundle_member_ids?.length ? entry.bundle_member_ids : [entry.id];
+  await Promise.all(ids.map((id) => _removeStoredInstance(uid, id, reason)));
+}
+
+async function _dropMissingScopeInstance(uid: string, inst: ConnectorInstance, reason: string): Promise<boolean> {
+  const entry = findCatalogEntry(inst.id);
+  if (!entry) return false;
+  const missing = _missingRequiredScopes(entry, inst.oauth_grant);
+  if (!missing.length) return false;
+  log.warn('connector authorization missing required scopes; treating as uninstalled', {
+    id: inst.id,
+    missing_count: missing.length,
+    reason,
+  });
+  await _removeStoredInstance(uid, inst.id, reason);
+  return true;
+}
+
+function _dropMissingScopeInstanceSoon(uid: string, inst: ConnectorInstance, reason: string): void {
+  void _dropMissingScopeInstance(uid, inst, reason).catch((err) => {
+    log.warn('failed to remove missing-scope connector instance', { id: inst.id, error: (err as Error).message });
+  });
+}
+
+async function _markAuthorizationError(uid: string, id: string, message: string, reason: string): Promise<void> {
+  const conn = _conns.get(id);
+  if (conn) {
+    try { await conn.close(); } catch { /* swallow */ }
+    _conns.delete(id);
+  }
+  const updated = await registry.update(uid, id, (cur) => ({
+    ...cur,
+    status: { kind: 'error', message, at: _now() },
+    updated_at: _nowIso(),
+  }));
+  if (updated) log.warn('connector authorization requires reconnect', { id, reason });
+}
+
+async function _markInstancesForCatalogError(uid: string, entry: CatalogEntry, message: string, reason: string): Promise<void> {
+  const ids = entry.bundle_member_ids?.length ? entry.bundle_member_ids : [entry.id];
+  await Promise.all(ids.map((id) => _markAuthorizationError(uid, id, message, reason)));
+}
+
+function _markAuthorizationErrorSoon(uid: string, id: string, message: string, reason: string): void {
+  void _markAuthorizationError(uid, id, message, reason).catch((err) => {
+    log.warn('failed to mark connector authorization error', { id, error: (err as Error).message });
+  });
 }
 
 /** Refresh the access_token if stale, dedupe concurrent callers, and persist the rotated grant
@@ -62,19 +245,48 @@ function _tokPrefix(t: string | null | undefined): string {
  *  `bad_refresh_token` failure can be correlated with the exchange/refresh that originally
  *  issued that RT. Rotation (old → new RT fingerprint) is also logged so we can verify the new
  *  RT actually made it onto disk via the post-write read-back in `registry._writeSync`. */
-async function _refreshGrantIfStale(uid: string, entry: CatalogEntry, instId: string): Promise<OAuthGrant> {
-  const existing = _refreshLocks.get(instId);
+async function _refreshGrantIfStale(
+  uid: string,
+  entry: CatalogEntry,
+  instId: string,
+  opts: { force?: boolean } = {},
+): Promise<OAuthGrant> {
+  const lockKey = opts.force ? `${instId}:force` : instId;
+  const existing = _refreshLocks.get(lockKey);
   if (existing) {
     log.info('refresh dedupe hit', { id: instId });
     return existing;
   }
-  const p = (async () => {
+  let p: Promise<OAuthGrant>;
+  p = Promise.resolve().then(async () => {
     try {
       const inst = registry.load(uid).connections[instId];
       if (!inst) throw new Error('instance not found');
       if (!inst.oauth_grant) throw new Error('no oauth_grant');
+      if (await _dropMissingScopeInstance(uid, inst, 'missing_required_scopes_refresh')) {
+        const err = new Error('missing_required_scopes') as Error & { code?: string };
+        err.code = 'missing_required_scopes';
+        throw err;
+      }
+      const storedProblem = _storedAuthorizationProblem(inst);
+      if (storedProblem) {
+        await _markAuthorizationError(uid, inst.id, storedProblem.message, `refresh_${storedProblem.reason}`);
+        const err = new Error(storedProblem.message) as Error & { code?: string };
+        err.code = storedProblem.reason;
+        throw err;
+      }
       // Already fresh? Skip the remote call entirely.
-      if (inst.oauth_grant.expires_at && inst.oauth_grant.expires_at - Date.now() > REFRESH_BUFFER_MS) {
+      const needsGithubServerAdoption = entry.oauth?.provider_id === 'github'
+        && !!inst.oauth_grant.refresh_token
+        && !inst.oauth_grant.server_grant_id;
+      const needsDcrServerAdoption = entry.auth_mode === 'mcp_dcr'
+        && !!inst.oauth_grant.refresh_token
+        && !inst.oauth_grant.server_grant_id;
+      if (!opts.force
+        && !needsGithubServerAdoption
+        && !needsDcrServerAdoption
+        && inst.oauth_grant.expires_at
+        && inst.oauth_grant.expires_at - Date.now() > REFRESH_BUFFER_MS) {
         return inst.oauth_grant;
       }
       const oldRt = inst.oauth_grant.refresh_token;
@@ -89,17 +301,42 @@ async function _refreshGrantIfStale(uid: string, entry: CatalogEntry, instId: st
       let next: OAuthGrant;
       try {
         if (entry.auth_mode === 'mcp_dcr') {
-          if (!inst.dcr_client) throw new Error('DCR instance missing dcr_client credentials');
-          next = await refreshDcrIfStale(inst.dcr_client, inst.oauth_grant);
+          if (inst.oauth_grant.server_grant_id) {
+            next = await refreshDcrServerManaged(entry.id, inst.oauth_grant, opts);
+          } else {
+            if (!inst.dcr_client) throw new Error('DCR instance missing dcr_client credentials');
+            if (inst.oauth_grant.refresh_token) {
+              const force = opts.force || !inst.oauth_grant.expires_at || inst.oauth_grant.expires_at - Date.now() <= REFRESH_BUFFER_MS;
+              next = await storeDcrServerManaged(entry.id, inst.dcr_client, inst.oauth_grant, { force });
+            } else {
+              next = await refreshDcrIfStale(inst.dcr_client, inst.oauth_grant);
+            }
+          }
         } else {
-          next = await refreshIfStale(uid, entry, inst.oauth_grant);
+          next = await refreshIfStale(uid, entry, inst.oauth_grant, opts);
         }
       } catch (err) {
+        if (!_isTransientConnectorFailure(err) && _isGoogleAuthFailure(entry, err)) {
+          await _markAuthorizationError(uid, inst.id, (err as Error).message, 'google_auth_refresh_failed');
+        } else if (!_isTransientConnectorFailure(err) && _isDcrAuthFailure(entry, err)) {
+          await _markAuthorizationError(uid, inst.id, (err as Error).message, 'dcr_auth_refresh_failed');
+        }
         log.warn('refresh upstream failed', {
           id: instId,
           rt_sent: _tokPrefix(oldRt),
           error: (err as Error).message,
         });
+        throw err;
+      }
+      const missingAfterRefresh = _missingRequiredScopes(entry, next);
+      if (missingAfterRefresh.length) {
+        log.warn('refreshed connector grant missing required scopes; treating as uninstalled', {
+          id: instId,
+          missing_count: missingAfterRefresh.length,
+        });
+        await _removeStoredInstance(uid, inst.id, 'missing_required_scopes_refresh_result');
+        const err = new Error('missing_required_scopes') as Error & { code?: string };
+        err.code = 'missing_required_scopes';
         throw err;
       }
       const rotated = oldRt !== next.refresh_token;
@@ -116,11 +353,17 @@ async function _refreshGrantIfStale(uid: string, entry: CatalogEntry, instId: st
       // different code path) must not be clobbered by a stale field-set spread.
       if (next !== inst.oauth_grant) {
         try {
-          await registry.update(uid, instId, (cur) => ({
-            ...cur,
-            oauth_grant: next,
-            updated_at: _nowIso(),
-          }));
+          await registry.update(uid, instId, (cur) => {
+            const updated = {
+              ...cur,
+              oauth_grant: next,
+              updated_at: _nowIso(),
+            };
+            if (entry.auth_mode === 'mcp_dcr' && next.server_managed) {
+              delete (updated as ConnectorInstance).dcr_client;
+            }
+            return updated;
+          });
           log.info('refresh grant persisted', {
             id: instId,
             new_rt: _tokPrefix(next.refresh_token),
@@ -136,10 +379,12 @@ async function _refreshGrantIfStale(uid: string, entry: CatalogEntry, instId: st
       }
       return next;
     } finally {
-      _refreshLocks.delete(instId);
+      if (_refreshLocks.get(lockKey) === p) {
+        _refreshLocks.delete(lockKey);
+      }
     }
-  })();
-  _refreshLocks.set(instId, p);
+  });
+  _refreshLocks.set(lockKey, p);
   return p;
 }
 
@@ -179,6 +424,7 @@ async function _patchStatus(
 }
 
 async function _connectAndCacheTools(uid: string, inst: ConnectorInstance): Promise<ConnectorInstance> {
+  const entry = findCatalogEntry(inst.id);
   let transport: Transport;
   try {
     const resolved = await _resolveTransport(uid, inst);
@@ -191,6 +437,12 @@ async function _connectAndCacheTools(uid: string, inst: ConnectorInstance): Prom
     }
     transport = resolved.transport;
   } catch (err) {
+    const entry = findCatalogEntry(inst.id);
+    if (_isMissingRequiredScopesError(err) || (entry && !_isTransientConnectorFailure(err) && _isGoogleAuthFailure(entry, err))) {
+      return inst;
+    }
+    const preserved = await _preserveEstablishedStateOnTransientFailure(uid, inst, err, 'resolve_transport');
+    if (preserved) return preserved;
     return _patchStatus(uid, inst, (cur) => ({
       ...cur,
       status: { kind: 'error', message: (err as Error).message, at: _now() },
@@ -213,12 +465,70 @@ async function _connectAndCacheTools(uid: string, inst: ConnectorInstance): Prom
   } catch (err) {
     log.warn('connect+list failed', { id: inst.id, error: (err as Error).message });
     try { await conn.close(); } catch { /* swallow */ }
+    let statusErr = err;
+    if (_isTransientConnectorFailure(statusErr)) {
+      log.info('connect+list hit transient network failure; retrying once', { id: inst.id });
+      await _sleep(CONNECT_RETRY_DELAY_MS);
+      try {
+        const retryConn = new McpConnection(inst.id, transport);
+        await retryConn.connect();
+        const tools = await retryConn.listTools();
+        _conns.set(inst.id, retryConn);
+        return _patchStatus(uid, inst, (cur) => ({
+          ...cur,
+          transport,
+          tools_cache: tools,
+          tools_cached_at: _now(),
+          status: { kind: 'connected', since: _now() },
+          updated_at: _nowIso(),
+        }));
+      } catch (retryErr) {
+        statusErr = retryErr;
+        log.warn('connect+list transient retry failed', { id: inst.id, error: (retryErr as Error).message });
+      }
+    }
+    if (_shouldForceRefreshAfterConnectFailure(entry, inst, statusErr)) {
+      log.info('MCP endpoint rejected server-managed token; forcing grant refresh and retrying', { id: inst.id });
+      try {
+        const grant = await _refreshGrantIfStale(uid, entry!, inst.id, { force: true });
+        const retryTransport = applyTemplate(entry!, grant);
+        const retryConn = new McpConnection(inst.id, retryTransport);
+        await retryConn.connect();
+        const tools = await retryConn.listTools();
+        _conns.set(inst.id, retryConn);
+        return _patchStatus(uid, inst, (cur) => ({
+          ...cur,
+          transport: retryTransport,
+          tools_cache: tools,
+          tools_cached_at: _now(),
+          status: { kind: 'connected', since: _now() },
+          updated_at: _nowIso(),
+        }));
+      } catch (retryErr) {
+        statusErr = retryErr;
+        log.warn('server-managed forced refresh retry failed', { id: inst.id, error: (retryErr as Error).message });
+      }
+    }
+    const preserved = await _preserveEstablishedStateOnTransientFailure(uid, inst, statusErr, 'connect_list');
+    if (preserved) return preserved;
     return _patchStatus(uid, inst, (cur) => ({
       ...cur,
-      status: { kind: 'error', message: (err as Error).message, at: _now() },
+      status: { kind: 'error', message: (statusErr as Error).message, at: _now() },
       updated_at: _nowIso(),
     }));
   }
+}
+
+function _shouldForceRefreshAfterConnectFailure(
+  entry: CatalogEntry | null,
+  inst: ConnectorInstance,
+  err: unknown,
+): boolean {
+  if (!entry) return false;
+  if (!inst.oauth_grant?.server_grant_id || !inst.oauth_grant.server_managed) return false;
+  const msg = (err as Error).message || '';
+  return /\b(401|403|unauthorized|AuthenticateToken|authentication failed|invalid_token|invalid access token|missing_token)\b/i.test(msg)
+    || _isTransientConnectorFailure(err);
 }
 
 export async function bootstrap(uid: string): Promise<void> {
@@ -230,7 +540,30 @@ export async function bootstrap(uid: string): Promise<void> {
     log.info('no connectors to bootstrap');
     return;
   }
-  await Promise.all(ids.map((id) => _connectAndCacheTools(uid, file.connections[id]).catch(() => {})));
+  const validInstances: ConnectorInstance[] = [];
+  for (const id of ids) {
+    const inst = file.connections[id];
+    try {
+      if (await _dropMissingScopeInstance(uid, inst, 'missing_required_scopes_bootstrap')) continue;
+    } catch (err) {
+      log.warn('failed to remove missing-scope connector during bootstrap', { id, error: (err as Error).message });
+      continue;
+    }
+    const problem = _storedAuthorizationProblem(inst);
+    if (problem) {
+      if (!_hasStatusError(inst, problem.message)) {
+        try {
+          await _markAuthorizationError(uid, inst.id, problem.message, `bootstrap_${problem.reason}`);
+        } catch (err) {
+          log.warn('failed to mark authorization error during bootstrap', { id, error: (err as Error).message });
+        }
+      }
+      continue;
+    }
+    if (!isConnectorRuntimeEnabled(inst.id)) continue;
+    validInstances.push(inst);
+  }
+  await Promise.all(validInstances.map((inst) => _connectAndCacheTools(uid, inst).catch(() => {})));
   const connected = Array.from(_conns.values()).filter((c) => c.isConnected).length;
   log.info('connectors bootstrap done', { total: ids.length, connected });
 }
@@ -238,7 +571,25 @@ export async function bootstrap(uid: string): Promise<void> {
 export function listInstances(uid: string): ConnectorInstance[] {
   if (!uid) return [];
   const file = registry.load(uid);
-  return Object.values(file.connections).sort((a, b) =>
+  return Object.values(file.connections).filter((inst) => {
+    if (_hasMissingRequiredScopes(inst)) {
+      _dropMissingScopeInstanceSoon(uid, inst, 'missing_required_scopes_list');
+      return false;
+    }
+    return true;
+  }).map((inst) => {
+    const problem = _storedAuthorizationProblem(inst);
+    if (problem) {
+      if (!_hasStatusError(inst, problem.message)) {
+        _markAuthorizationErrorSoon(uid, inst.id, problem.message, `list_${problem.reason}`);
+      }
+      return {
+        ...inst,
+        status: { kind: 'error' as const, message: problem.message, at: _now() },
+      };
+    }
+    return _normalizeTransientStatusForList(uid, inst);
+  }).sort((a, b) =>
     (a.display_name || a.id).localeCompare(b.display_name || b.id, undefined, {
       sensitivity: 'base',
       numeric: true,
@@ -249,7 +600,25 @@ export function listInstances(uid: string): ConnectorInstance[] {
 export function getInstance(uid: string, id: string): ConnectorInstance | null {
   if (!uid) return null;
   const file = registry.load(uid);
-  return file.connections[id] || null;
+  const inst = file.connections[id] || null;
+  if (inst) {
+    if (_hasMissingRequiredScopes(inst)) {
+      _dropMissingScopeInstanceSoon(uid, inst, 'missing_required_scopes_get');
+      return null;
+    }
+    const problem = _storedAuthorizationProblem(inst);
+    if (problem) {
+      if (!_hasStatusError(inst, problem.message)) {
+        _markAuthorizationErrorSoon(uid, inst.id, problem.message, `get_${problem.reason}`);
+      }
+      return {
+        ...inst,
+        status: { kind: 'error', message: problem.message, at: _now() },
+      };
+    }
+    return _normalizeTransientStatusForList(uid, inst);
+  }
+  return inst;
 }
 
 /** Drive the full OAuth flow for a catalog entry and bring the resulting MCP connection up.
@@ -259,17 +628,42 @@ export async function connectViaOAuth(uid: string, catalogId: string): Promise<C
   if (!uid) throw new Error('uid required');
   const entry = findCatalogEntry(catalogId);
   if (!entry) throw new Error('unknown catalog id');
+  assertConnectorRuntimeEnabled(catalogId);
 
   log.info('connectViaOAuth: starting OAuth', { catalog_id: catalogId, auth_mode: entry.auth_mode });
   let grant: OAuthGrant;
   let dcrClient: ConnectorInstance['dcr_client'];
   if (entry.auth_mode === 'mcp_dcr') {
-    const result = await startMcpDcrOAuth(uid, entry);
-    grant = result.grant;
-    dcrClient = result.client;
+    try {
+      const result = await startMcpDcrOAuth(uid, entry);
+      grant = result.grant;
+      dcrClient = result.grant.server_managed ? undefined : result.client;
+    } catch (err) {
+      if (_isMissingRequiredScopesError(err)) {
+        await _removeInstancesForCatalog(uid, entry, 'missing_required_scopes_oauth');
+      } else if (_isGoogleAuthFailure(entry, err)) {
+        await _markInstancesForCatalogError(uid, entry, (err as Error).message, 'oauth_authorization_failed');
+      }
+      throw err;
+    }
   } else {
     if (!entry.oauth) throw new Error(`'${catalogId}' has no oauth config`);
-    grant = await startOAuth(uid, entry);
+    // GitHub App installation and user authorization are separate flows. First-time connects must
+    // start at the App install URL so the user picks repositories. Once this catalog has ever been
+    // authorized on this device, follow-up connects use the user-authorization URL; if the remote
+    // App was later uninstalled, Server detects that and bounces the browser back to install.
+    const existing = registry.load(uid).connections[catalogId] || null;
+    const reauthorize = _isGitHubEntry(entry) && (!!existing || registry.shouldReauthorize(uid, catalogId));
+    try {
+      grant = await startOAuth(uid, entry, { reauthorize });
+    } catch (err) {
+      if (_isMissingRequiredScopesError(err)) {
+        await _removeInstancesForCatalog(uid, entry, 'missing_required_scopes_oauth');
+      } else if (_isGoogleAuthFailure(entry, err)) {
+        await _markInstancesForCatalogError(uid, entry, (err as Error).message, 'oauth_authorization_failed');
+      }
+      throw err;
+    }
   }
 
   // Bundle entry: one OAuth flow (the Server returns a grant with union scopes) → provision N
@@ -349,6 +743,9 @@ async function _provisionMemberInstance(
     has_dcr_client: !!dcrClient,
   });
   await registry.upsert(uid, draft);
+  if (_isGitHubEntry(entry)) {
+    await registry.setReauthorizeHint(uid, entry.id, true);
+  }
   return _connectAndCacheTools(uid, draft);
 }
 
@@ -364,6 +761,7 @@ export async function removeInstance(uid: string, id: string): Promise<boolean> 
 
 export async function refreshTools(uid: string, id: string): Promise<ToolSchema[]> {
   if (!uid) throw new Error('uid required');
+  assertConnectorRuntimeEnabled(id);
   const inst = getInstance(uid, id);
   if (!inst) throw new Error('instance not found');
   // Force refresh-token check by tearing the live conn down and reconnecting through
@@ -390,6 +788,32 @@ export async function setEnabledSubtools(
   }));
 }
 
+export async function authorizeGoogleSheetsFiles(uid: string, fileIds?: string[]): Promise<string[]> {
+  if (!uid) throw new Error('uid required');
+  assertConnectorRuntimeEnabled('gsheets');
+  const inst = getInstance(uid, 'gsheets');
+  if (!inst || !inst.oauth_grant) throw new Error('connect Google Sheets first');
+
+  const picked = await startGoogleSheetsPicker(fileIds);
+  const prev = inst.oauth_grant;
+  const nextGrant: OAuthGrant = {
+    ...picked.grant,
+    refresh_token: picked.grant.refresh_token || prev.refresh_token,
+    account_label: picked.grant.account_label || prev.account_label,
+  };
+  await registry.update(uid, 'gsheets', (cur) => ({
+    ...cur,
+    oauth_grant: nextGrant,
+    updated_at: _nowIso(),
+  }));
+  const conn = _conns.get('gsheets');
+  if (conn) {
+    try { await conn.close(); } catch { /* swallow */ }
+    _conns.delete('gsheets');
+  }
+  return picked.pickedFileIds;
+}
+
 export async function callTool(
   uid: string,
   id: string,
@@ -397,6 +821,7 @@ export async function callTool(
   args: Record<string, unknown>,
 ): Promise<unknown> {
   if (!uid) throw new Error('uid required');
+  assertConnectorRuntimeEnabled(id);
   const inst = getInstance(uid, id);
   if (!inst) throw new Error('instance not found');
   // Stale-token guard: the transport snapshots the bearer at connect time (for streamable-http)

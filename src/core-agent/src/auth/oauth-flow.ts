@@ -1,13 +1,13 @@
 /**
  * OAuth login flows for supported providers.
  *
- * Uses @mariozechner/pi-ai's built-in OAuth support (loginOpenAICodex, etc.)
+ * Uses @earendil-works/pi-ai's built-in OAuth support (loginOpenAICodex, etc.)
  * with a CLI-friendly interactive flow: opens browser, waits for callback.
  */
 import { createInterface } from "node:readline";
 import { createLogger } from "../shared/logger.js";
 import { writeOAuthCredentials, getOAuthCredential } from "./store.js";
-import type { OAuthCredentials, OAuthProviderInterface } from "@mariozechner/pi-ai";
+import type { OAuthCredentials, OAuthProviderInterface } from "@earendil-works/pi-ai";
 
 const log = createLogger("oauth-flow");
 
@@ -60,8 +60,25 @@ export async function loginOAuthProvider(provider: OAuthProviderInterface): Prom
       }
       await openBrowser(info.url);
     },
+    onDeviceCode: (info) => {
+      console.log(`\nOpen this URL in your browser:\n\n  ${info.verificationUri}\n`);
+      console.log(`Enter code: ${info.userCode}\n`);
+      if (info.expiresInSeconds) {
+        console.log(`The code expires in ${info.expiresInSeconds} seconds.\n`);
+      }
+      void openBrowser(info.verificationUri);
+    },
     onPrompt: async (prompt) => {
       return await promptText(prompt.message);
+    },
+    onSelect: async (prompt) => {
+      console.log(`\n${prompt.message}`);
+      prompt.options.forEach((option, index) => {
+        console.log(`  ${index + 1}. ${option.label}`);
+      });
+      const answer = await promptText(`Enter number (1-${prompt.options.length})`);
+      const index = Number.parseInt(answer, 10) - 1;
+      return prompt.options[index]?.id;
     },
     onProgress: (message) => {
       log.debug(message);

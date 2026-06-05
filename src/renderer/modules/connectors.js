@@ -78,6 +78,63 @@ function _deriveBundleInstance(entry) {
   };
 }
 
+// True iff this connector id is currently live for the LLM (connected + not user-disabled).
+// Mirrors the main-side `resolveVisibleConnectors` filter so a queue-draft drained after the
+// user disconnects / disables the connector can detect the dangling reference and degrade the
+// message to plain text instead of injecting a `use <connector>` prefix the bus can't honor.
+function isConnectorLive(id) {
+  const inst = _instanceById(id);
+  return !!(inst && inst.status && inst.status.kind === 'connected' && inst.enabled !== false);
+}
+
+function _isReconnectableError(entry, instance) {
+  return !!(
+    entry
+    && entry.transport_template
+    && instance
+    && instance.status
+    && instance.status.kind === 'error'
+  );
+}
+
+function _isConnectorVisibleDisabled(entry) {
+  return !!(entry && entry.availability === 'visible_disabled');
+}
+
+function _showConnectorUnsupportedToast() {
+  const message = t('connectors.toast.unsupported');
+  if (typeof uiToast === 'function') uiToast(message, { variant: 'warning' });
+  else uiAlert(message);
+}
+
+function _connectorErrorFallback(kind) {
+  const lang = (typeof getLang === 'function') ? getLang() : 'en';
+  const zh = String(lang).startsWith('zh');
+  const ja = String(lang).startsWith('ja');
+  if (kind === 'network') {
+    if (zh) return '暂时无法连接，请稍后重试';
+    if (ja) return '一時的に接続できません。しばらくしてから再試行してください';
+    return 'Temporarily unable to connect. Please try again later.';
+  }
+  if (kind === 'reconnect') {
+    if (zh) return '授权已失效，请重新连接';
+    if (ja) return '認証の有効期限が切れました。再接続してください';
+    return 'Authorization expired. Please reconnect.';
+  }
+  return '';
+}
+
+function _formatConnectorStatusError(message) {
+  const msg = String(message || '');
+  if (/fetch failed|network|timeout|timed out|econnreset|econnrefused|eai_again|enotfound|socket|connection (closed|reset|dropped)|terminated/i.test(msg)) {
+    return _connectorErrorFallback('network');
+  }
+  if (/invalid_grant|connector_reconnect_required|reconnect required|grant not found/i.test(msg)) {
+    return _connectorErrorFallback('reconnect');
+  }
+  return msg;
+}
+
 function listUsableConnectorsForPicker() {
   const catalogById = new Map((_connectorsState.catalog || []).map((entry) => [entry.id, entry]));
   const lang = (typeof getLang === 'function') ? getLang() : 'en';
@@ -95,6 +152,25 @@ function listUsableConnectorsForPicker() {
     })
     .sort((a, b) => (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base', numeric: true }));
 }
+
+// Brand color hex per PC/docs/design/README §Surface E. Used as background
+// for the 32×32 letter square in `_renderCatalogCard` when no `icon_svg` is
+// shipped. Lookup is by `entry.id` (catalog id, stable across releases) with
+// a graphite fallback for unknown ids.
+const _CONNECTOR_BRAND_TINT = {
+  github: '#16181d',
+  notion: '#000000',
+  gmail: '#ea4335',
+  linear: '#5e6ad2',
+  slack: '#4a154b',
+  gcal: '#4285f4',
+  'google-calendar': '#4285f4',
+  jira: '#0052cc',
+  figma: '#0acf83',
+  drive: '#4285f4',
+  'google-drive': '#4285f4',
+  'google-workspace': '#4285f4',
+};
 
 function _renderConnectorsGrid() {
   const gridView = document.getElementById('connectors-grid-view');
@@ -157,11 +233,18 @@ function _renderConnectorsGrid() {
   } else {
     empty.style.display = 'none';
   }
+
+  // Surface E per-group count chips.
+  const connCountEl = document.getElementById('connectors-group-connected-count');
+  if (connCountEl) connCountEl.textContent = connectedItems.length > 0 ? String(connectedItems.length) : '';
+  const availCountEl = document.getElementById('connectors-group-available-count');
+  if (availCountEl) availCountEl.textContent = availableItems.length > 0 ? String(availableItems.length) : '';
 }
 
 function _renderCatalogCard(entry, instance) {
   const e = entry || _entryFromInstance(instance);
   const isOAuthPending = !!(e && e.unavailable_reason === 'oauth_pending');
+  const isVisibleDisabled = _isConnectorVisibleDisabled(e);
   const connected = !!(instance && instance.status && instance.status.kind === 'connected');
   const errored = !!(instance && instance.status && instance.status.kind === 'error');
   // `enabled` is per-user soft state attached by `connectors.list` IPC. Only meaningful for
@@ -174,9 +257,16 @@ function _renderCatalogCard(entry, instance) {
   card.className = `connector-card${connected && !enabledFlag ? ' is-disabled' : ''}`;
   card.dataset.id = e.id;
 
+  // Brand-color square per design (Surface E) — applied ONLY to the
+  // fallback letter glyph (no icon_svg shipped). When a real icon_svg is
+  // present, the SVG carries its own brand colors and a dark tint behind
+  // it can swallow monochrome marks (GitHub `fill:#181717` on `#16181d`,
+  // Notion `fill:#000` on `#000`, etc.) — the SVG sits on the card's own
+  // surface instead.
+  const brandTint = _CONNECTOR_BRAND_TINT[e.id] || '#16181d';
   const iconHtml = e.icon_svg
     ? `<div class="connector-card-icon is-svg">${e.icon_svg}</div>`
-    : `<div class="connector-card-icon is-fallback">${escapeHtml((e.display_name || '?').slice(0, 2).toUpperCase())}</div>`;
+    : `<div class="connector-card-icon is-fallback" style="background:${brandTint}">${escapeHtml((e.display_name || '?').slice(0, 1).toUpperCase())}</div>`;
   const desc = pickDesc(e, (typeof getLang === 'function') ? getLang() : 'en');
 
   const accountLabel = (instance && instance.oauth_grant && instance.oauth_grant.account_label) || '';
@@ -207,10 +297,14 @@ function _renderCatalogCard(entry, instance) {
     action = `<button class="btn btn-sm btn-primary is-loading" data-act="connect"><span class="btn-spinner"></span>${escapeHtml(t('connectors.action.connecting'))}</button>`;
   } else if (isOAuthPending) {
     action = `<button class="btn btn-sm" disabled>${escapeHtml(t('connectors.action.unavailable'))}</button>`;
+  } else if (isVisibleDisabled) {
+    action = `<button class="btn btn-sm btn-primary" data-act="unsupported-connect">${escapeHtml(t('connectors.action.connect'))}</button>`;
   } else if (connected) {
     const label = enabledFlag ? t('component.disable') : t('component.enable');
     const cls = enabledFlag ? 'btn btn-sm' : 'btn btn-sm btn-primary';
     action = `<button class="${cls}" data-act="toggle-enabled">${escapeHtml(label)}</button>`;
+  } else if (_isReconnectableError(e, instance)) {
+    action = `<button class="btn btn-sm btn-primary" data-act="connect">${escapeHtml(t('connectors.action.connect'))}</button>`;
   } else if (errored) {
     action = `<button class="btn btn-sm btn-danger" data-act="disconnect">${escapeHtml(t('connectors.action.disconnect'))}</button>`;
   } else {
@@ -239,9 +333,14 @@ function _renderCatalogCard(entry, instance) {
   card.querySelector('.connector-card-name').textContent = e.display_name;
   card.querySelector('.connector-card-desc').textContent = desc;
   if (errorMsg) {
-    card.querySelector('.connector-card-error').textContent = `${t('connectors.status.error')}: ${errorMsg}`;
+    const el = card.querySelector('.connector-card-error');
+    const text = `${t('connectors.status.error')}: ${_formatConnectorStatusError(errorMsg)}`;
+    el.textContent = text;
+    el.title = text;
   } else if (accountLabel) {
-    card.querySelector('.connector-card-account').textContent = accountLabel;
+    const el = card.querySelector('.connector-card-account');
+    el.textContent = accountLabel;
+    el.title = accountLabel;
   }
 
   card.querySelectorAll('button[data-act]').forEach((btn) => {
@@ -249,6 +348,7 @@ function _renderCatalogCard(entry, instance) {
       ev.stopPropagation();
       const act = btn.dataset.act;
       if (act === 'connect') _runConnect(e);
+      else if (act === 'unsupported-connect') _showConnectorUnsupportedToast();
       else if (act === 'disconnect') _quickDisconnect(e, instance);
       else if (act === 'menu') _openCardMenu(btn, e, instance);
       else if (act === 'toggle-enabled') _toggleConnectorEnabled(e, instance, !enabledFlag);
@@ -266,10 +366,26 @@ function _openCardMenu(anchorBtn, entry, instance) {
   const rect = anchorBtn.getBoundingClientRect();
   const pop = document.createElement('div');
   pop.className = 'connector-card-menu-popover';
-  pop.style.top = `${Math.round(rect.bottom + 4)}px`;
-  pop.style.left = `${Math.round(rect.right - 120)}px`;
-  pop.innerHTML = `<div class="connector-card-menu-item is-danger" data-act="disconnect">${escapeHtml(t('connectors.action.disconnect'))}</div>`;
+  pop.style.top = '-9999px';
+  pop.style.left = '-9999px';
+  const pickerItem = entry && entry.id === 'gsheets'
+    ? `<div class="connector-card-menu-item" data-act="authorize-sheets">${escapeHtml(t('connectors.action.select_sheet'))}</div>`
+    : '';
+  pop.innerHTML = `
+    ${pickerItem}
+    <div class="connector-card-menu-item is-danger" data-act="disconnect">${escapeHtml(t('connectors.action.disconnect'))}</div>
+  `;
   document.body.appendChild(pop);
+  const popRect = pop.getBoundingClientRect();
+  const margin = 8;
+  let left = rect.right - popRect.width;
+  let top = rect.bottom + 6;
+  if (left < margin) left = margin;
+  if (left + popRect.width > window.innerWidth - margin) left = window.innerWidth - popRect.width - margin;
+  if (top + popRect.height > window.innerHeight - margin) top = rect.top - popRect.height - 6;
+  if (top < margin) top = margin;
+  pop.style.left = `${Math.round(left)}px`;
+  pop.style.top = `${Math.round(top)}px`;
 
   const close = () => {
     pop.remove();
@@ -287,6 +403,30 @@ function _openCardMenu(anchorBtn, entry, instance) {
     close();
     _quickDisconnect(entry, instance);
   });
+  const sheetPicker = pop.querySelector('[data-act="authorize-sheets"]');
+  if (sheetPicker) {
+    sheetPicker.addEventListener('click', () => {
+      close();
+      _authorizeGoogleSheetsFiles();
+    });
+  }
+}
+
+async function _authorizeGoogleSheetsFiles() {
+  try {
+    const res = await window.orkas.invoke('connectors.google_sheets_authorize_files', {});
+    if (!res || !res.ok) {
+      uiAlert((res && res.error) || t('connectors.errors.authorize_sheet_failed'));
+      return;
+    }
+    const count = Array.isArray(res.picked_file_ids) ? res.picked_file_ids.length : 0;
+    await uiAlert(count > 0
+      ? t('connectors.toast.sheet_selected', { count })
+      : t('connectors.toast.sheet_authorized'));
+    await loadConnectors();
+  } catch (err) {
+    uiAlert((err && err.message) || t('connectors.errors.authorize_sheet_failed'));
+  }
 }
 
 async function _toggleConnectorEnabled(entry, instance, nextEnabled) {
@@ -345,6 +485,10 @@ async function _quickDisconnect(entry, instance) {
 }
 
 async function _runConnect(entry) {
+  if (_isConnectorVisibleDisabled(entry)) {
+    _showConnectorUnsupportedToast();
+    return;
+  }
   // Mark "connecting" so the card's foot button shows a spinner. The button stays clickable —
   // re-clicks supersede the prior pending flow on the main side (oauth.ts::startOAuth calls
   // _cancelPending before installing a new listener), and the prior _runConnect's await
@@ -362,14 +506,14 @@ async function _runConnect(entry) {
     } else if (res && !res.ok) {
       const msg = (res.error || '').toLowerCase();
       if (!msg.includes('superseded') && !msg.includes('cancelled')) {
-        uiAlert(res.error || t('connectors.errors.connect_failed'));
+        uiAlert(_formatConnectError(res));
       }
       await loadConnectors();
     }
   } catch (err) {
     const msg = ((err && err.message) || '').toLowerCase();
     if (!msg.includes('superseded') && !msg.includes('cancelled')) {
-      uiAlert((err && err.message) || t('connectors.errors.connect_failed'));
+      uiAlert(_formatConnectError(err));
     }
     await loadConnectors();
   } finally {
@@ -379,6 +523,21 @@ async function _runConnect(entry) {
     // clears even when the connect flow exits without a reload.
     _renderConnectorsGrid();
   }
+}
+
+function _formatConnectError(errLike) {
+  const code = errLike && errLike.code;
+  const msg = (errLike && (errLike.error || errLike.message)) || '';
+  if (code === 'connector_unsupported' || /connector_unsupported/i.test(String(msg))) {
+    return t('connectors.toast.unsupported');
+  }
+  if (code === 'missing_required_scopes' || /missing_required_scopes|missing required scopes/i.test(String(msg))) {
+    return t('connectors.errors.missing_required_scopes');
+  }
+  if (/fetch failed|network|timeout|timed out|econnreset|econnrefused|eai_again|enotfound/i.test(String(msg))) {
+    return _connectorErrorFallback('network');
+  }
+  return msg || t('connectors.errors.connect_failed');
 }
 
 function escapeHtml(s) {
@@ -391,11 +550,15 @@ window.addEventListener('i18n-change', () => {
   if (currentView === 'connectors') _renderConnectorsGrid();
 });
 
+// Refresh the grid when an account changed or connector:connected push arrives. Right now the
 // only consumer is the connectors panel itself, but registering at module load lets future
 // background events (token expiry notifications etc.) refresh the panel automatically.
-if (window.orkas && typeof window.orkas.on === 'function') {
+if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
   try {
-    window.orkas.on('connectors:changed', () => {
+    window.orkas.onPushEvent('connectors:changed', () => {
+      if (currentView === 'connectors') loadConnectors();
+    });
+    window.orkas.onPushEvent('client-config:changed', () => {
       if (currentView === 'connectors') loadConnectors();
     });
   } catch (_err) { /* event not supported; harmless */ }

@@ -10,6 +10,8 @@ if not exist "%APP_DIR%\package.json" (
   exit /b 1
 )
 
+echo [Orkas] 启动 OrkasOpen (global prod)
+
 call node "%APP_DIR%\scripts\ensure-deps.cjs"
 if errorlevel 1 exit /b 1
 

@@ -6,6 +6,8 @@ import {
   ContextOverflowError,
   ProviderError,
   TimeoutError,
+  classifyRetryableError,
+  classifyTransientNetworkError,
   isRetryableError,
   isTransientNetworkError,
   formatError,
@@ -76,6 +78,24 @@ describe("Errors", () => {
       expect(isRetryableError(new ProviderError("terminated", "openai-codex"))).toBe(true);
     });
 
+    it("returns true for hosted WebSocket stream drops", () => {
+      expect(isRetryableError(new ProviderError("WebSocket error", "openai-codex"))).toBe(true);
+      expect(isRetryableError(new Error("WebSocket closed unexpectedly"))).toBe(true);
+    });
+
+    it("returns true for slow SSE response-header timeouts", () => {
+      const err = new ProviderError("Codex SSE response headers timed out after 10000ms", "openai-codex");
+      expect(isRetryableError(err)).toBe(true);
+      expect(classifyRetryableError(err)).toBe("timeout");
+    });
+
+    it("returns true for provider-agnostic stream/connection drops", () => {
+      expect(isRetryableError(new ProviderError("Connection closed", "anthropic"))).toBe(true);
+      expect(isRetryableError(new ProviderError("stream disconnected before completion", "openai"))).toBe(true);
+      expect(isRetryableError(new Error("ERR_STREAM_PREMATURE_CLOSE"))).toBe(true);
+      expect(isRetryableError(new Error("read ECONNRESET"))).toBe(true);
+    });
+
     it("falls through to message check when statusCode alone says not retryable", () => {
       // ProviderError with statusCode=400 normally isn't retryable, but if
       // the message is a transient-network marker, the fall-through must kick in
@@ -84,6 +104,13 @@ describe("Errors", () => {
 
     it("returns true for Node fetch 'fetch failed'", () => {
       expect(isRetryableError(new TypeError("fetch failed"))).toBe(true);
+    });
+
+    it("returns true for retryable HTTP gateway/status families", () => {
+      expect(classifyRetryableError(new ProviderError("Request Timeout", "test", 408))).toBe("timeout");
+      expect(classifyRetryableError(new ProviderError("Gateway Timeout", "test", 504))).toBe("service_unavailable");
+      expect(classifyRetryableError(new ProviderError("Cloudflare timeout", "test", 524))).toBe("timeout");
+      expect(isRetryableError(new ProviderError("Gateway Timeout", "test", 504))).toBe(true);
     });
 
     it("returns true for raw socket codes via err.code", () => {
@@ -119,6 +146,24 @@ describe("Errors", () => {
       expect(isTransientNetworkError(new Error("fetch failed"))).toBe(true);
     });
 
+    it("matches websocket stream errors", () => {
+      expect(isTransientNetworkError(new Error("WebSocket error"))).toBe(true);
+      expect(isTransientNetworkError(new Error("ws closed unexpectedly"))).toBe(true);
+    });
+
+    it("matches slow SSE response-header timeouts", () => {
+      const err = new Error("Codex SSE response headers timed out after 10000ms");
+      expect(isTransientNetworkError(err)).toBe(true);
+      expect(classifyTransientNetworkError(err)).toBe("timeout");
+    });
+
+    it("matches generic stream/connection drops", () => {
+      expect(isTransientNetworkError(new Error("Connection closed"))).toBe(true);
+      expect(isTransientNetworkError(new Error("stream disconnected before completion"))).toBe(true);
+      expect(isTransientNetworkError(new Error("ERR_STREAM_PREMATURE_CLOSE"))).toBe(true);
+      expect(isTransientNetworkError(new Error("read ECONNRESET"))).toBe(true);
+    });
+
     it("matches via code on direct error", () => {
       expect(isTransientNetworkError(Object.assign(new Error("x"), { code: "ECONNRESET" }))).toBe(true);
       expect(isTransientNetworkError(Object.assign(new Error("x"), { code: "UND_ERR_CONNECT_TIMEOUT" }))).toBe(true);
@@ -128,6 +173,11 @@ describe("Errors", () => {
       const inner = Object.assign(new Error("inner"), { code: "UND_ERR_SOCKET" });
       const outer = Object.assign(new Error("outer"), { cause: inner });
       expect(isTransientNetworkError(outer)).toBe(true);
+    });
+
+    it("walks plain-object provider causes", () => {
+      const err = { message: "Provider failed", cause: { code: "UND_ERR_HEADERS_TIMEOUT" } };
+      expect(classifyTransientNetworkError(err)).toBe("timeout");
     });
 
     it("guards against runaway cause cycles", () => {
@@ -141,6 +191,7 @@ describe("Errors", () => {
 
     it("returns false for unrelated errors", () => {
       expect(isTransientNetworkError(new Error("some other thing"))).toBe(false);
+      expect(isTransientNetworkError(new Error("Request was aborted"))).toBe(false);
       expect(isTransientNetworkError(null)).toBe(false);
       expect(isTransientNetworkError(undefined)).toBe(false);
       expect(isTransientNetworkError({})).toBe(false);

@@ -68,6 +68,19 @@ describe('projects › createProject', () => {
     if (!r2.ok) expect(r2.error).toBe('name_empty');
   });
 
+  it('caps names by display width on create and rename', async () => {
+    const projects = await loadProjects();
+    const created = await projects.createProject(TEST_UID, 'a'.repeat(70));
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    expect(created.project.name).toBe('a'.repeat(60));
+
+    const renamed = await projects.renameProject(TEST_UID, created.project.project_id, '长'.repeat(40));
+    expect(renamed.ok).toBe(true);
+    if (!renamed.ok) return;
+    expect(renamed.project.name).toBe('长'.repeat(30));
+  });
+
   it('rejects case-insensitive duplicate names with name_dup', async () => {
     const projects = await loadProjects();
     const ok = await projects.createProject(TEST_UID, 'Alpha');

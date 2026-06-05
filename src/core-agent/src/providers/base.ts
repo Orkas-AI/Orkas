@@ -7,7 +7,7 @@ import type {
   Tool as PiTool,
   StreamOptions as PiStreamOptions,
   SimpleStreamOptions as PiSimpleStreamOptions,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
 
 // Re-export pi-ai types that consumers need
 export type { Model, PiContext, PiAssistantMessage, PiStreamEvent, PiTool };
@@ -66,7 +66,7 @@ export type CompletionResult = {
 /**
  * Abstract LLM provider interface.
  *
- * Now backed by @mariozechner/pi-ai for multi-provider support via OpenClaw's
+ * Now backed by @earendil-works/pi-ai for multi-provider support via OpenClaw's
  * unified LLM communication layer.
  */
 export interface LLMProvider {

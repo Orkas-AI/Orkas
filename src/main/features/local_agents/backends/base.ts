@@ -27,6 +27,7 @@ export type LocalEventType =
   | 'tool-event'
   | 'stderr-line'
   | 'status'
+  | 'file-change'
   | 'log'
   | 'raw-line'
   | 'permission-request'
@@ -43,6 +44,7 @@ export interface LocalEvent {
    *    tool-event:         { tool, callId?, phase: 'use'|'result', input?, output?, outputPath? }
    *    stderr-line:        { line }
    *    status:             { status, usage? }   // usage carried for status:'usage' running counters
+   *    file-change:        { paths: string[] }   // files reported by CLI-native diff/tool metadata
    *    log:                { level: 'debug'|'info'|'warn'|'error', message, source? }
    *    raw-line:           { line }             // stdout line we couldn't parse as our protocol
    *    permission-request: { id, tool?, input?, autoDecided: 'allow'|'deny', reason }

@@ -18,7 +18,7 @@ let _settingsState = {
   pickerProviderSel: null,
   pickerModelSel: null,
   addBtnBound: false,
-  dragState: null,
+  dragState: null
 };
 
 async function loadSettings() {
@@ -28,7 +28,6 @@ async function loadSettings() {
   _settingsBindLanguageOnce();
   if (typeof initFeedbackSettings === 'function') initFeedbackSettings();
   _settingsSyncLanguageRadio();
-  _settingsBindClearAllConvsOnce();
   await Promise.all([
     _settingsRefreshProviders(),
     _settingsRefreshEntries(),
@@ -58,11 +57,6 @@ async function loadSettings() {
   if (typeof renderAccountSettings === 'function') renderAccountSettings();
   if (typeof renderSubscriptionSettings === 'function') renderSubscriptionSettings();
 }
-
-// Desktop auto-update is stripped from the OrkasOpen build — there is no
-// official feed / signing pipeline for OSS releases (see
-// `OpenSource/SyncCode/strip-rules.json`). Users download new versions from
-// GitHub Releases manually.
 
 // ── Commander avatar ──
 // Commander avatar goes through the prefs IPC and lands in
@@ -116,7 +110,7 @@ function _settingsRenderCommanderAvatar() {
   });
 }
 
-// ── Local execution permission (bash / write_file / md_to_pdf / html_to_pdf) ──
+// ── Tool execution access permission ──
 
 async function _settingsRefreshLocalExec() {
   const res = await window.orkas.invoke('permissions.getLocalExec');
@@ -124,33 +118,18 @@ async function _settingsRefreshLocalExec() {
     granted: !!res.granted,
     grantedAt: res.grantedAt || null,
     revokedAt: res.revokedAt || null,
-  } : { granted: false, grantedAt: null, revokedAt: null };
+  } : { granted: true, grantedAt: null, revokedAt: null };
 }
 
 function _settingsRenderLocalExec() {
-  const statusEl = document.getElementById('settings-localexec-status');
-  const btn = document.getElementById('settings-localexec-toggle');
-  if (!statusEl || !btn) return;
-  const s = _settingsState.localExec || { granted: false };
-  if (s.granted) {
-    statusEl.textContent = s.grantedAt
-      ? t('settings.localexec.status_granted_with_date', { date: s.grantedAt })
-      : t('settings.localexec.status_granted');
-    statusEl.className = 'settings-status muted';
-    btn.textContent = t('settings.localexec.btn_revoke');
-    btn.className = 'btn btn-sm btn-danger';
-  } else {
-    statusEl.textContent = s.revokedAt
-      ? t('settings.localexec.status_revoked_with_date', { date: s.revokedAt })
-      : t('settings.localexec.status_revoked');
-    statusEl.className = 'settings-status muted';
-    btn.textContent = t('settings.localexec.btn_grant');
-    btn.className = 'btn btn-sm btn-primary';
-  }
-  if (!btn.dataset.bound) {
-    btn.addEventListener('click', async () => {
-      const state = _settingsState.localExec || { granted: false };
-      const channel = state.granted ? 'permissions.revokeLocalExec' : 'permissions.grantLocalExec';
+  const toggle = document.getElementById('settings-localexec-toggle');
+  if (!toggle) return;
+  const s = _settingsState.localExec || { granted: true };
+  toggle.checked = !!s.granted;
+  if (!toggle.dataset.bound) {
+    toggle.addEventListener('change', async () => {
+      const next = !!toggle.checked;
+      const channel = next ? 'permissions.grantLocalExec' : 'permissions.revokeLocalExec';
       try {
         const res = await window.orkas.invoke(channel);
         if (res && res.ok) {
@@ -160,12 +139,15 @@ function _settingsRenderLocalExec() {
             revokedAt: res.revokedAt || null,
           };
           _settingsRenderLocalExec();
+                  } else {
+          toggle.checked = !next;
         }
       } catch (err) {
+        toggle.checked = !next;
         _settingsLog.warn('local exec toggle failed', err);
       }
     });
-    btn.dataset.bound = '1';
+    toggle.dataset.bound = '1';
   }
 }
 
@@ -204,7 +186,7 @@ function _settingsRenderMetacognition() {
         const res = await window.orkas.invoke('prefs.setMetacognition', { enabled: next });
         if (res && res.ok) {
           _settingsState.metacognition = { ..._settingsState.metacognition, enabled: !!res.enabled };
-        } else {
+                  } else {
           // Roll back the UI on write failure.
           cb.checked = !next;
           _settingsLog.warn('setMetacognition rejected', res);
@@ -240,7 +222,7 @@ function _settingsRenderDataRoot() {
     btn.addEventListener('click', async () => {
       try {
         await window.orkas.invoke('app.openDataRoot');
-      } catch (err) {
+              } catch (err) {
         _settingsLog.warn('open data root failed', { error: (err && err.message) || String(err) });
       }
     });
@@ -280,7 +262,7 @@ function _settingsBindLanguageOnce() {
     try {
       await setLang(next);
       _settingsLog.info('language changed', { lang: next });
-    } catch (err) {
+          } catch (err) {
       _settingsLog.warn('setLang failed', { error: (err && err.message) || String(err) });
     }
   });
@@ -290,74 +272,6 @@ function _settingsSyncLanguageRadio() {
   // Function name kept for caller-side compatibility; semantics is now "sync dropdown value".
   const cur = (typeof getLang === 'function') ? getLang() : 'en';
   if (_settingsLanguageSel) _settingsLanguageSel.setValue(cur);
-}
-
-// ── Clear all conversations ──
-// One-shot bind: button click takes a snapshot of the current conv list
-// (the global `conversations` array, kept in sync by `loadConversations`),
-// runs the same per-cid renderer cleanup the × button does (abortConvStream
-// + _forgetConvLocal) for every cid in the snapshot, then fires the bulk
-// IPC `conversations.deleteAll` (server runs the full delete cascade per
-// cid: group dir / main jsonl / sessions / attachments / CLI / search idx
-// — see chats.deleteConversation). If the user was viewing one of the
-// deleted conversations, switch to new-chat. Reload the sidebar list.
-
-let _settingsClearAllConvsBound = false;
-
-function _settingsBindClearAllConvsOnce() {
-  if (_settingsClearAllConvsBound) return;
-  const btn = document.getElementById('settings-clear-all-convs-btn');
-  if (!btn) return;
-  btn.addEventListener('click', async () => {
-    // Snapshot BEFORE the bulk delete — once the server returns, the global
-    // `conversations` is about to be reloaded as empty and we'll lose the
-    // per-cid info needed for renderer cleanup.
-    const snapshot = (Array.isArray(conversations) ? conversations : []).slice();
-    const status = document.getElementById('settings-clear-all-convs-status');
-    if (!snapshot.length) {
-      if (typeof uiAlert === 'function') {
-        await uiAlert(t('settings.clear_all_convs.empty'));
-      }
-      return;
-    }
-    const ok = await uiConfirm(t('settings.clear_all_convs.confirm', { count: snapshot.length }));
-    if (!ok) return;
-
-    btn.disabled = true;
-    if (status) status.textContent = t('settings.clear_all_convs.in_progress');
-
-    const wasActiveDeleted = currentCid
-      && snapshot.some((c) => c.conversation_id === currentCid);
-    for (const c of snapshot) {
-      try { if (typeof abortConvStream === 'function') abortConvStream(c.conversation_id); } catch (_) {}
-      try { if (typeof _forgetConvLocal === 'function') _forgetConvLocal(c.conversation_id); } catch (_) {}
-    }
-
-    let deleted = 0;
-    try {
-      const res = await window.orkas.invoke('conversations.deleteAll');
-      if (res && typeof res.deleted === 'number') deleted = res.deleted;
-      _settingsLog.info('cleared all conversations', { count: deleted });
-    } catch (err) {
-      _settingsLog.warn('clear-all failed', { error: (err && err.message) || String(err) });
-      btn.disabled = false;
-      if (status) status.textContent = '';
-      if (typeof uiAlert === 'function') {
-        uiAlert(t('settings.clear_all_convs.failed', {
-          message: (err && err.message) || String(err),
-        }));
-      }
-      return;
-    }
-
-    if (wasActiveDeleted && typeof setView === 'function') setView('new-chat');
-    try { await loadConversations(); } catch (_) {}
-
-    btn.disabled = false;
-    if (status) status.textContent = t('settings.clear_all_convs.success', { count: deleted });
-    setTimeout(() => { if (status) status.textContent = ''; }, 4000);
-  });
-  _settingsClearAllConvsBound = true;
 }
 
 // Keep the radio in sync if some other code path changes language, and
@@ -577,7 +491,7 @@ function _settingsShowApiKeyForm(provider, modelId) {
     saveBtn.disabled = true;
     msg.textContent = t('settings.save_loading'); msg.className = 'form-msg';
     _settingsLog.info('add api key', { provider: provider.id, model: modelId, has_label: !!label });
-    const addRes = await window.orkas.invoke('auth.addApiKey', {
+        const addRes = await window.orkas.invoke('auth.addApiKey', {
       provider: provider.id,
       apiKey,
       label: label || undefined,
@@ -587,7 +501,7 @@ function _settingsShowApiKeyForm(provider, modelId) {
       msg.textContent = (addRes && addRes.error) || t('settings.save_failed');
       msg.className = 'form-msg error';
       _settingsLog.warn('add api key failed', { provider: provider.id, error: addRes && addRes.error });
-      return;
+            return;
     }
     const entryRes = await window.orkas.invoke('auth.addEntry', {
       provider: provider.id,
@@ -677,11 +591,11 @@ async function _settingsStartOAuthFlow(provider, modelId) {
   document.addEventListener('keydown', onKey, true);
 
   _settingsLog.info('oauth start', { provider: oauthProviderId });
-  const startRes = await window.orkas.invoke('auth.startOAuth', { provider: oauthProviderId });
+    const startRes = await window.orkas.invoke('auth.startOAuth', { provider: oauthProviderId });
   if (!startRes || !startRes.ok) {
     body.innerHTML = `<div class="oauth-flow-stage error">${escapeHtml((startRes && startRes.error) || t('settings.oauth.start_failed'))}</div>`;
     _settingsLog.warn('oauth start failed', { provider: oauthProviderId, error: startRes && startRes.error });
-    return;
+        return;
   }
   _oauthFlowId = startRes.flowId;
 
@@ -722,17 +636,14 @@ function _oauthFlowRender(provider, status, closeFlow) {
     body.innerHTML = `
       <div class="oauth-flow-stage">${escapeHtml(topHint)}</div>
       <div class="oauth-flow-hint">${escapeHtml(subHint)}</div>
-      <div class="oauth-auth-url">${escapeHtml(url)}</div>
       <div class="oauth-flow-actions">
         <button class="btn oauth-open-btn">${escapeHtml(t('settings.oauth.reopen'))}</button>
         <button class="btn oauth-copy-btn">${escapeHtml(t('settings.oauth.copy_link'))}</button>
       </div>
-      ${instructions ? `<div class="oauth-flow-tip oauth-flow-tip-multiline">${escapeHtml(instructions)}</div>` : ''}
+      ${(!usesCallbackServer && instructions) ? `<div class="oauth-flow-tip oauth-flow-tip-multiline">${escapeHtml(instructions)}</div>` : ''}
       ${usesCallbackServer ? `
-      <div class="form-row" style="margin-top:16px">
+      <div class="oauth-manual-row">
         <input type="text" class="oauth-manual-input form-input" placeholder="${escapeHtml(t('settings.oauth.manual_placeholder'))}" autocomplete="off" spellcheck="false" />
-      </div>
-      <div class="oauth-flow-actions">
         <button class="btn oauth-manual-submit-btn">${escapeHtml(t('settings.oauth.submit'))}</button>
       </div>` : ''}
     `;
@@ -1043,7 +954,7 @@ async function _settingsRemoveEntry(entry) {
     provider: entry.provider,
     model: entry.model,
   });
-  const res = await window.orkas.invoke('auth.removeEntry', { entryId: entry.entryId });
+    const res = await window.orkas.invoke('auth.removeEntry', { entryId: entry.entryId });
   if (!res || !res.ok) {
     _settingsLog.warn('remove entry failed', { entry_id: entry.entryId, error: res && res.error });
     await uiAlert((res && res.error) || t('settings.entries.delete_failed'));

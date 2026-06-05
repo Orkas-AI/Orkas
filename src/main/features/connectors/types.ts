@@ -56,9 +56,9 @@ export interface ConnectorInstance {
    *  The manager rewrites the transport env at spawn time using `oauth_grant.access_token`;
    *  refresh logic in `oauth.ts::refreshIfStale` runs before connect / after a 401. */
   oauth_grant?: OAuthGrant;
-  /** DCR-issued client identity for MCP-spec auth (`auth_mode === 'mcp_dcr'`). Empty for
-   *  server-bridge instances. Refresh uses these directly against the provider's token endpoint
-   *  — Server is not involved post-install. */
+  /** DCR-issued client identity for legacy local MCP-spec auth (`auth_mode === 'mcp_dcr'`).
+   *  New rotating DCR grants are server-managed; this field remains only so older local grants
+   *  can be adopted on the next refresh. */
   dcr_client?: DcrClientCredentials;
   created_at: string;
   updated_at: string;
@@ -67,6 +67,8 @@ export interface ConnectorInstance {
 export interface ConnectorsFile {
   version: 2;
   connections: Record<string, ConnectorInstance>;
+  oauth_hints?: Record<string, { reauthorize?: boolean }>;
+  _deleted_at?: Record<string, string>;
 }
 
 export interface NewInstanceInput {
@@ -115,8 +117,9 @@ export type TransportTemplate =
 //    self-registers via Dynamic Client Registration (RFC 7591) at runtime, runs the OAuth
 //    handshake from PC, uses the `/api/connectors/oauth/dcr-callback` Server endpoint **only**
 //    as an HTTPS callback intermediate (Server stashes code+state in a 5-min KV, deep-links
-//    PC). Server has no provider-specific knowledge. Used for Notion, Atlassian, Cloudflare
-//    suite, … — the modern path. PC stores DCR-issued client_id/secret on the instance.
+//    PC). After the first exchange, rotating DCR refresh grants are moved to Server and PC keeps
+//    only a server grant handle. Used for Notion, Atlassian, Cloudflare suite, … — the modern
+//    path.
 
 export interface OAuthConfig {
   /** Server-bridge only: matches the Server's `biz/connectors/oauth/<provider>.py` module name
@@ -124,8 +127,8 @@ export interface OAuthConfig {
   provider_id: string;
 }
 
-/** Dynamic Client Registration result (RFC 7591) for MCP-spec OAuth providers. Stored on the
- *  ConnectorInstance so refreshes can re-use the same client identity and revoke at uninstall.
+/** Dynamic Client Registration result (RFC 7591) for MCP-spec OAuth providers. Legacy local
+ *  instances may still store this on the ConnectorInstance until the grant is adopted by Server.
  *  All endpoints captured at first connect — re-discovery on every refresh would add latency
  *  and assumes provider doesn't rotate URLs (which they shouldn't). */
 export interface DcrClientCredentials {
@@ -149,6 +152,10 @@ export interface OAuthGrant {
   access_token: string;
   /** Long-lived rotation token; null when provider doesn't issue one. */
   refresh_token: string | null;
+  /** Server-owned grant reference. Used by providers with rotating refresh tokens. */
+  server_grant_id?: string;
+  /** True when the refresh token is intentionally held by Orkas Server, not this PC. */
+  server_managed?: boolean;
   /** Unix ms when `access_token` expires; null when provider doesn't say. */
   expires_at: number | null;
   /** Granted scope list (whatever the provider actually returned). */
@@ -189,12 +196,20 @@ export interface CatalogEntry {
   auth_mode: AuthMode;
   /** Required when `auth_mode === 'server_bridge'`; absent for `'mcp_dcr'` (no pre-registration). */
   oauth?: OAuthConfig;
+  /** OAuth scopes that must be present in the provider's returned grant for the connector to
+   *  function. Google lets users uncheck individual requested permissions on the consent screen;
+   *  when that happens the token exchange still succeeds but downstream APIs fail with 403s.
+   *  Entries that set this are rejected immediately after OAuth if any required scope is absent. */
+  required_oauth_scopes?: string[];
   /** MCP server config + how the access_token maps into env / headers. Null when this entry is
    *  catalogued but not yet installable (we don't have an MCP server target for it yet).
    *  Renderer surfaces a disabled "敬请期待" state. */
   transport_template: TransportTemplate | null;
   /** Set when `transport_template` is null to explain why; renderer surfaces in the badge. */
   unavailable_reason?: 'oauth_pending';
+  /** Remote-config gate. `visible_disabled` keeps the card visible but blocks OAuth/tool use. */
+  availability?: 'visible_disabled';
+  disabled_reason?: 'unsupported';
   /** When set, this catalog entry is a **UI-only bundle**: one OAuth flow provisions N member
    *  ConnectorInstances (one per listed catalog id). The bundle entry itself does NOT produce a
    *  ConnectorInstance and has `transport_template: null` — the model sees the members as

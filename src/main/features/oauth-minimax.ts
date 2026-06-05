@@ -41,7 +41,7 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto';
-import type { OAuthCredentials, OAuthProviderInterface, OAuthLoginCallbacks } from '@mariozechner/pi-ai';
+import type { OAuthCredentials, OAuthProviderInterface, OAuthLoginCallbacks } from '@earendil-works/pi-ai';
 import { t } from '../i18n';
 
 // ── Endpoint config ──────────────────────────────────────────────────────
@@ -376,7 +376,7 @@ export function buildMinimaxPortalProvider(region: MiniMaxRegion): OAuthProvider
  * cause is locatable.
  */
 export async function registerMinimaxOAuthProviders(): Promise<void> {
-  const oauth = await import('@mariozechner/pi-ai/oauth');
+  const oauth = await import('@earendil-works/pi-ai/oauth');
   const providers = [buildMinimaxPortalProvider('global'), buildMinimaxPortalProvider('cn')];
   for (const p of providers) {
     oauth.registerOAuthProvider(p);

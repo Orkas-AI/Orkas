@@ -1,7 +1,7 @@
 /**
  * Project-scoped files.
  *
- * Storage: `<uid>/cloud/projects/<pid>/files/<name>`.
+ * Storage: `<uid>/cloud/projects/<pid>/files/<relative/path>`.
  * These files belong to the project, not a single conversation, so every
  * conversation inside the project receives a lightweight file-list prompt and
  * file tools get read-only access to this directory.
@@ -15,12 +15,18 @@ import { createLogger } from '../logger';
 import { t } from '../i18n';
 import { invalidateFileCache } from './file_indexer';
 import { projectExists } from './projects';
+import * as projectLibraryIndexer from './project_library_indexer';
 
 const log = createLogger('project_files');
 
 const TEXT_EXTS: ReadonlySet<string> = new Set([
   '.md', '.markdown', '.txt', '.csv', '.tsv',
   '.json', '.yaml', '.yml', '.log',
+  '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
+  '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.sh', '.bash', '.zsh', '.rb', '.go', '.rs', '.java', '.kt',
+  '.c', '.cpp', '.cc', '.h', '.hpp', '.css', '.scss', '.less',
+  '.sql', '.graphql', '.gql',
 ]);
 const IMAGE_EXTS: ReadonlySet<string> = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 const VIDEO_EXTS: ReadonlySet<string> = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
@@ -29,6 +35,13 @@ const DOCX_EXT = '.docx';
 const ALLOWED_EXTENSIONS: ReadonlySet<string> = new Set([
   ...TEXT_EXTS, PDF_EXT, DOCX_EXT, ...IMAGE_EXTS, ...VIDEO_EXTS,
 ]);
+const IMAGE_MEDIA_TYPE: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+};
 
 const MAX_BYTES_TEXT = 5 * 1024 * 1024;
 const MAX_BYTES_DOCX = 20 * 1024 * 1024;
@@ -41,11 +54,24 @@ export type ProjectFileKind = 'text' | 'pdf' | 'docx' | 'image' | 'video';
 
 export interface ProjectFileInfo {
   name: string;
+  relPath: string;
+  type: 'file';
   path: string;
   bytes: number;
   kind: ProjectFileKind;
   mtime: number;
 }
+
+export interface ProjectDirInfo {
+  name: string;
+  relPath: string;
+  type: 'dir';
+  path: string;
+  mtime: number;
+  children: ProjectLibraryNode[];
+}
+
+export type ProjectLibraryNode = ProjectFileInfo | ProjectDirInfo;
 
 export type Result<T = {}> = ({ ok: true } & T) | { ok: false; error: string };
 
@@ -57,20 +83,51 @@ function safeProjectId(projectId: unknown): string {
   return projectId;
 }
 
-function safeFileName(name: unknown): string {
-  if (typeof name !== 'string') throw new Error('filename required');
-  const s = name.trim();
-  if (!s || s === '.' || s === '..') throw new Error('invalid filename');
-  if (s.includes('/') || s.includes('\\') || s.includes('\x00')) {
-    throw new Error('filename must not contain path separators');
+function normaliseProjectRelPath(input: unknown, kind: 'file' | 'dir', allowEmpty = false): string {
+  if (typeof input !== 'string') throw new Error(kind === 'file' ? 'filename required' : 'folder required');
+  const raw = input.trim().replace(/\\/g, '/');
+  if (!raw) {
+    if (allowEmpty) return '';
+    throw new Error(kind === 'file' ? 'invalid filename' : 'invalid folder');
   }
-  if (s.startsWith('.')) throw new Error("filename must not start with '.'");
-  if (s.length > MAX_FILENAME_LEN) throw new Error('filename too long');
-  const ext = path.extname(s).toLowerCase();
+  if (raw.includes('\x00') || raw.startsWith('/') || path.isAbsolute(raw)) {
+    throw new Error(kind === 'file' ? 'invalid filename' : 'invalid folder');
+  }
+  const parts = raw.split('/');
+  if (parts.some((part) => !part || part === '.' || part === '..' || part.startsWith('.'))) {
+    throw new Error(kind === 'file' ? 'invalid filename' : 'invalid folder');
+  }
+  if (parts.some((part) => part.length > MAX_FILENAME_LEN)) {
+    throw new Error(kind === 'file' ? 'filename too long' : 'folder name too long');
+  }
+  const rel = parts.join('/');
+  if (kind === 'dir') return rel;
+  const base = parts[parts.length - 1] || '';
+  const ext = path.extname(base).toLowerCase();
   if (!ALLOWED_EXTENSIONS.has(ext)) {
     throw new Error(t('errors.unsupported_file_ext', { ext: ext || t('errors.unsupported_file_no_ext') }));
   }
-  return s;
+  return rel;
+}
+
+function safeFileName(name: unknown): string {
+  return normaliseProjectRelPath(name, 'file');
+}
+
+function safeDirPath(name: unknown, allowEmpty = false): string {
+  return normaliseProjectRelPath(name, 'dir', allowEmpty);
+}
+
+function relPathFor(root: string, absPath: string): string {
+  return path.relative(path.resolve(root), path.resolve(absPath)).split(path.sep).join('/');
+}
+
+function resolveUnder(root: string, relPath: string): string {
+  const base = path.resolve(root);
+  const abs = path.resolve(base, relPath);
+  const rel = path.relative(base, abs);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) throw new Error('forbidden');
+  return abs;
 }
 
 function kindOfName(name: string): ProjectFileKind {
@@ -116,17 +173,22 @@ async function ensureProjectFilesDir(userId: string, projectId: string): Promise
 }
 
 function _notifyDirty(_projectId: string): void {
-  // features/sync stripped from the OrkasOpen build — no-op.
 }
 
-function infoFor(absPath: string): ProjectFileInfo | null {
+function _notifyDeleted(_projectId: string, _relPath: string): void {
+}
+
+function infoFor(absPath: string, root?: string): ProjectFileInfo | null {
   let st: fs.Stats;
   try { st = fs.statSync(absPath); }
   catch { return null; }
   if (!st.isFile()) return null;
   const name = path.basename(absPath);
+  const relPath = root ? relPathFor(root, absPath) : name;
   return {
     name,
+    relPath,
+    type: 'file',
     path: absPath,
     bytes: st.size,
     kind: kindOfName(name),
@@ -134,28 +196,83 @@ function infoFor(absPath: string): ProjectFileInfo | null {
   };
 }
 
-export async function listProjectFiles(userId: string, projectId: string): Promise<ProjectFileInfo[]> {
+function dirInfoFor(absPath: string, root: string, children: ProjectLibraryNode[]): ProjectDirInfo | null {
+  let st: fs.Stats;
+  try { st = fs.statSync(absPath); }
+  catch { return null; }
+  if (!st.isDirectory()) return null;
+  return {
+    name: path.basename(absPath),
+    relPath: relPathFor(root, absPath),
+    type: 'dir',
+    path: absPath,
+    mtime: Math.floor(st.mtimeMs / 1000),
+    children,
+  };
+}
+
+function sortDirents(items: fs.Dirent[]): fs.Dirent[] {
+  return items.slice().sort((a, b) => {
+    if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+    return a.name.toLowerCase().localeCompare(b.name.toLowerCase(), undefined, { numeric: true });
+  });
+}
+
+function walkProjectTree(absDir: string, root: string): ProjectLibraryNode[] {
+  let items: fs.Dirent[];
+  try { items = fs.readdirSync(absDir, { withFileTypes: true }); }
+  catch { return []; }
+  const out: ProjectLibraryNode[] = [];
+  for (const e of sortDirents(items)) {
+    if (e.name.startsWith('.')) continue;
+    const abs = path.join(absDir, e.name);
+    if (e.isDirectory()) {
+      const info = dirInfoFor(abs, root, walkProjectTree(abs, root));
+      if (info) out.push(info);
+      continue;
+    }
+    if (!e.isFile()) continue;
+    const ext = path.extname(e.name).toLowerCase();
+    if (!ALLOWED_EXTENSIONS.has(ext)) continue;
+    const info = infoFor(abs, root);
+    if (info) out.push(info);
+  }
+  return out;
+}
+
+function flattenFiles(nodes: ProjectLibraryNode[]): ProjectFileInfo[] {
+  const out: ProjectFileInfo[] = [];
+  for (const node of nodes) {
+    if (node.type === 'file') out.push(node);
+    else out.push(...flattenFiles(node.children || []));
+  }
+  return out;
+}
+
+function filesUnderEntry(absPath: string, root: string): ProjectFileInfo[] {
+  let st: fs.Stats;
+  try { st = fs.statSync(absPath); }
+  catch { return []; }
+  if (st.isFile()) {
+    const info = infoFor(absPath, root);
+    return info ? [info] : [];
+  }
+  if (st.isDirectory()) return flattenFiles(walkProjectTree(absPath, root));
+  return [];
+}
+
+export async function listProjectFileTree(userId: string, projectId: string): Promise<ProjectLibraryNode[]> {
   let dir: string;
   try {
     const pid = safeProjectId(projectId);
     if (!await projectExists(userId, pid)) return [];
     dir = projectFilesDir(userId, pid);
   } catch { return []; }
+  return walkProjectTree(dir, dir);
+}
 
-  let items: fs.Dirent[];
-  try { items = fs.readdirSync(dir, { withFileTypes: true }); }
-  catch { return []; }
-
-  const out: ProjectFileInfo[] = [];
-  items.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
-  for (const e of items) {
-    if (!e.isFile() || e.name.startsWith('.')) continue;
-    const ext = path.extname(e.name).toLowerCase();
-    if (!ALLOWED_EXTENSIONS.has(ext)) continue;
-    const info = infoFor(path.join(dir, e.name));
-    if (info) out.push(info);
-  }
-  return out;
+export async function listProjectFiles(userId: string, projectId: string): Promise<ProjectFileInfo[]> {
+  return flattenFiles(await listProjectFileTree(userId, projectId));
 }
 
 export async function uploadProjectFile(
@@ -185,15 +302,49 @@ export async function uploadProjectFile(
     }
   }
 
-  const target = uniqueTarget(dir, safeName);
+  const parent = path.dirname(safeName);
+  const targetDir = parent === '.' ? dir : resolveUnder(dir, parent);
+  try { fs.mkdirSync(targetDir, { recursive: true }); }
+  catch (err) { return { ok: false, error: (err as Error).message }; }
+  const target = uniqueTarget(targetDir, path.basename(safeName));
   try { fs.writeFileSync(target, buf); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
 
-  const info = infoFor(target);
+  const info = infoFor(target, dir);
   if (!info) return { ok: false, error: 'write failed' };
+  projectLibraryIndexer.enqueue(userId, pid, info.relPath, 'upsert');
   _notifyDirty(pid);
-  log.info(`upload user=${userId} pid=${pid} name=${info.name} kind=${info.kind} bytes=${info.bytes}`);
+  log.info(`upload user=${userId} pid=${pid} name=${info.relPath} kind=${info.kind} bytes=${info.bytes}`);
   return { ok: true, info };
+}
+
+export async function createProjectDir(
+  userId: string,
+  projectId: string,
+  relPath: string,
+): Promise<Result<{ path: string }>> {
+  let safePath: string;
+  let pid: string;
+  let root: string;
+  try {
+    safePath = safeDirPath(relPath);
+    pid = safeProjectId(projectId);
+    root = await ensureProjectFilesDir(userId, pid);
+  } catch (err) { return { ok: false, error: (err as Error).message }; }
+
+  let abs: string;
+  try { abs = resolveUnder(root, safePath); }
+  catch (err) { return { ok: false, error: (err as Error).message }; }
+  if (fs.existsSync(abs)) {
+    try {
+      if (fs.statSync(abs).isDirectory()) return { ok: true, path: safePath };
+      return { ok: false, error: 'target_exists' };
+    } catch (err) { return { ok: false, error: (err as Error).message }; }
+  }
+  try { fs.mkdirSync(abs, { recursive: false }); }
+  catch (err) { return { ok: false, error: (err as Error).message }; }
+  _notifyDirty(pid);
+  return { ok: true, path: safePath };
 }
 
 export async function deleteProjectFile(userId: string, projectId: string, name: string): Promise<Result> {
@@ -206,11 +357,17 @@ export async function deleteProjectFile(userId: string, projectId: string, name:
   } catch (err) { return { ok: false, error: (err as Error).message }; }
 
   const dir = projectFilesDir(userId, pid);
-  const abs = path.resolve(dir, safeName);
-  if (path.relative(path.resolve(dir), abs).startsWith('..')) return { ok: false, error: 'forbidden' };
+  let abs: string;
+  try { abs = resolveUnder(dir, safeName); }
+  catch (err) { return { ok: false, error: (err as Error).message }; }
   if (!fs.existsSync(abs)) return { ok: false, error: 'not_found' };
+  try {
+    if (!fs.statSync(abs).isFile()) return { ok: false, error: 'not_found' };
+  } catch { return { ok: false, error: 'not_found' }; }
   try { fs.unlinkSync(abs); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
+  projectLibraryIndexer.enqueue(userId, pid, safeName, 'delete');
+  _notifyDeleted(pid, safeName);
   try { invalidateFileCache(userId, abs); }
   catch (err) { log.warn(`invalidate cache ${abs}: ${(err as Error).message}`); }
   try {
@@ -218,6 +375,55 @@ export async function deleteProjectFile(userId: string, projectId: string, name:
   } catch { /* best-effort */ }
   _notifyDirty(pid);
   return { ok: true };
+}
+
+export async function deleteProjectEntry(userId: string, projectId: string, name: string): Promise<Result> {
+  let safeName: string;
+  let pid: string;
+  try {
+    safeName = safeDirPath(name);
+    pid = safeProjectId(projectId);
+    if (!await projectExists(userId, pid)) return { ok: false, error: 'not_found' };
+  } catch (err) { return { ok: false, error: (err as Error).message }; }
+
+  const root = path.resolve(projectFilesDir(userId, pid));
+  let abs: string;
+  try { abs = resolveUnder(root, safeName); }
+  catch (err) { return { ok: false, error: (err as Error).message }; }
+  let st: fs.Stats;
+  try { st = fs.statSync(abs); }
+  catch { return { ok: false, error: 'not_found' }; }
+  if (!st.isFile() && !st.isDirectory()) return { ok: false, error: 'not_found' };
+
+  const files = filesUnderEntry(abs, root);
+  try {
+    if (st.isDirectory()) fs.rmSync(abs, { recursive: true, force: false });
+    else fs.unlinkSync(abs);
+  } catch (err) { return { ok: false, error: (err as Error).message }; }
+
+  for (const file of files) {
+    projectLibraryIndexer.enqueue(userId, pid, file.relPath, 'delete');
+    _notifyDeleted(pid, file.relPath);
+    try { invalidateFileCache(userId, file.path); }
+    catch (err) { log.warn(`invalidate cache ${file.path}: ${(err as Error).message}`); }
+  }
+  _notifyDirty(pid);
+  return { ok: true };
+}
+
+export async function createProjectTextFile(
+  userId: string,
+  projectId: string,
+  name: string,
+): Promise<Result<{ info: ProjectFileInfo }>> {
+  let safeName: string;
+  try {
+    safeName = safeFileName(name);
+    if (!TEXT_EXTS.has(path.extname(safeName).toLowerCase())) {
+      return { ok: false, error: 'not a text file' };
+    }
+  } catch (err) { return { ok: false, error: (err as Error).message }; }
+  return uploadProjectFile(userId, projectId, safeName, Buffer.from('', 'utf8'));
 }
 
 export async function resolveProjectFileAbsPath(
@@ -234,14 +440,154 @@ export async function resolveProjectFileAbsPath(
   } catch (err) { return { ok: false, error: (err as Error).message }; }
 
   const root = path.resolve(projectFilesDir(userId, pid));
-  const abs = path.resolve(root, safeName);
-  const rel = path.relative(root, abs);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) return { ok: false, error: 'forbidden' };
+  let abs: string;
+  try { abs = resolveUnder(root, safeName); }
+  catch (err) { return { ok: false, error: (err as Error).message }; }
   let st: fs.Stats;
   try { st = fs.statSync(abs); }
   catch { return { ok: false, error: 'not_found' }; }
   if (!st.isFile()) return { ok: false, error: 'not_found' };
   return { ok: true, absPath: abs, kind: kindOfName(safeName) };
+}
+
+export async function readProjectTextFile(
+  userId: string,
+  projectId: string,
+  name: string,
+): Promise<Result<{ content: string; name: string }>> {
+  const r = await resolveProjectFileAbsPath(userId, projectId, name);
+  if (!r.ok) return { ok: false, error: (r as { error?: string }).error || 'not_found' };
+  if (r.kind !== 'text') return { ok: false, error: 'binary file cannot be read as text' };
+  let st: fs.Stats;
+  try { st = fs.statSync(r.absPath); }
+  catch { return { ok: false, error: 'not_found' }; }
+  if (st.size > MAX_BYTES_TEXT) {
+    return { ok: false, error: t('errors.file_too_large_mb', { mb: Math.round(MAX_BYTES_TEXT / 1024 / 1024) }) };
+  }
+  try {
+    let content = fs.readFileSync(r.absPath, 'utf8');
+    if (content.charCodeAt(0) === 0xFEFF) content = content.slice(1);
+    return { ok: true, content, name };
+  } catch (err) { return { ok: false, error: (err as Error).message }; }
+}
+
+export async function updateProjectTextFile(
+  userId: string,
+  projectId: string,
+  name: string,
+  content: string,
+): Promise<Result<{ name: string }>> {
+  const r = await resolveProjectFileAbsPath(userId, projectId, name);
+  if (!r.ok) return { ok: false, error: (r as { error?: string }).error || 'not_found' };
+  if (r.kind !== 'text') return { ok: false, error: 'binary file cannot be edited as text' };
+  const body = typeof content === 'string' ? content : '';
+  const bytes = Buffer.byteLength(body, 'utf8');
+  if (bytes > MAX_BYTES_TEXT) {
+    return { ok: false, error: t('errors.file_too_large_mb', { mb: Math.round(MAX_BYTES_TEXT / 1024 / 1024) }) };
+  }
+  try { fs.writeFileSync(r.absPath, body, 'utf8'); }
+  catch (err) { return { ok: false, error: (err as Error).message }; }
+  try { invalidateFileCache(userId, r.absPath); }
+  catch (err) { log.warn(`invalidate cache ${r.absPath}: ${(err as Error).message}`); }
+  projectLibraryIndexer.enqueue(userId, projectId, name, 'upsert');
+  _notifyDirty(projectId);
+  return { ok: true, name };
+}
+
+export async function renameProjectFile(
+  userId: string,
+  projectId: string,
+  oldName: string,
+  nextName: string,
+): Promise<Result<{ oldName: string; name: string; type: 'file' | 'dir'; info?: ProjectFileInfo }>> {
+  let safeOld: string;
+  let pid: string;
+  try {
+    safeOld = safeDirPath(oldName);
+    pid = safeProjectId(projectId);
+    if (!await projectExists(userId, pid)) return { ok: false, error: 'not_found' };
+  } catch (err) { return { ok: false, error: (err as Error).message }; }
+  const root = path.resolve(projectFilesDir(userId, pid));
+  let src: string;
+  try { src = resolveUnder(root, safeOld); }
+  catch (err) { return { ok: false, error: (err as Error).message }; }
+  let st: fs.Stats;
+  try { st = fs.statSync(src); }
+  catch { return { ok: false, error: 'not_found' }; }
+  if (!st.isFile() && !st.isDirectory()) return { ok: false, error: 'not_found' };
+
+  const type: 'file' | 'dir' = st.isDirectory() ? 'dir' : 'file';
+  let safeNext: string;
+  try {
+    safeNext = type === 'dir' ? safeDirPath(nextName) : safeFileName(nextName);
+  } catch (err) { return { ok: false, error: (err as Error).message }; }
+  if (safeOld === safeNext) {
+    if (type === 'dir') return { ok: true, oldName: safeOld, name: safeNext, type };
+    const current = infoFor(src, root);
+    return current ? { ok: true, oldName: safeOld, name: safeNext, type, info: current } : { ok: false, error: 'not_found' };
+  }
+  if (type === 'dir' && safeNext.startsWith(`${safeOld}/`)) return { ok: false, error: 'forbidden' };
+
+  let dst: string;
+  try { dst = resolveUnder(root, safeNext); }
+  catch (err) { return { ok: false, error: (err as Error).message }; }
+  if (fs.existsSync(dst)) return { ok: false, error: 'target_exists' };
+  if (!fs.existsSync(path.dirname(dst))) return { ok: false, error: 'not_found' };
+  const movedFiles = filesUnderEntry(src, root);
+  try { fs.renameSync(src, dst); }
+  catch (err) { return { ok: false, error: (err as Error).message }; }
+
+  for (const file of movedFiles) {
+    const nextRel = type === 'dir'
+      ? `${safeNext}${file.relPath.slice(safeOld.length)}`
+      : safeNext;
+    const nextAbs = resolveUnder(root, nextRel);
+    try { invalidateFileCache(userId, file.path); invalidateFileCache(userId, nextAbs); }
+    catch (err) { log.warn(`invalidate cache rename ${file.relPath}: ${(err as Error).message}`); }
+    projectLibraryIndexer.enqueue(userId, pid, file.relPath, 'delete');
+    projectLibraryIndexer.enqueue(userId, pid, nextRel, 'upsert');
+    _notifyDeleted(pid, file.relPath);
+  }
+  _notifyDirty(pid);
+  if (type === 'dir') return { ok: true, oldName: safeOld, name: safeNext, type };
+  const info = infoFor(dst, root);
+  if (!info) return { ok: false, error: 'rename failed' };
+  return { ok: true, oldName: safeOld, name: info.relPath, type, info };
+}
+
+export async function readProjectImage(
+  userId: string,
+  projectId: string,
+  name: string,
+): Promise<Result<{ base64: string; mediaType: string; bytes: number }>> {
+  const r = await resolveProjectFileAbsPath(userId, projectId, name);
+  if (!r.ok) return { ok: false, error: (r as { error?: string }).error || 'not_found' };
+  if (r.kind !== 'image') return { ok: false, error: 'not an image' };
+  const mediaType = IMAGE_MEDIA_TYPE[path.extname(r.absPath).toLowerCase()];
+  if (!mediaType) return { ok: false, error: 'not an image' };
+  try {
+    const buf = fs.readFileSync(r.absPath);
+    return { ok: true, base64: buf.toString('base64'), mediaType, bytes: buf.length };
+  } catch (err) { return { ok: false, error: (err as Error).message }; }
+}
+
+export async function readProjectDocxHtml(
+  userId: string,
+  projectId: string,
+  name: string,
+): Promise<Result<{ html: string }>> {
+  const r = await resolveProjectFileAbsPath(userId, projectId, name);
+  if (!r.ok) return { ok: false, error: (r as { error?: string }).error || 'not_found' };
+  if (r.kind !== 'docx') return { ok: false, error: 'not a docx file' };
+  try {
+    const { docxBufferToHtml } = await import('../util/extract-docx');
+    const buf = fs.readFileSync(r.absPath);
+    const html = await docxBufferToHtml(buf);
+    return { ok: true, html };
+  } catch (err) {
+    log.warn(`project docx→html ${projectId}/${name}: ${(err as Error).message}`);
+    return { ok: false, error: (err as Error).message };
+  }
 }
 
 export async function getProjectFilesRoot(userId: string, projectId: string): Promise<string | null> {
@@ -257,45 +603,4 @@ export async function isProjectFilePath(userId: string, projectId: string, absPa
   if (!root) return false;
   const rel = path.relative(path.resolve(root), path.resolve(absPath));
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
-}
-
-function escapeAttr(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-async function listProjectFilePathsForPrompt(userId: string, projectId: string): Promise<string[]> {
-  let dir: string;
-  try {
-    const pid = safeProjectId(projectId);
-    if (!await projectExists(userId, pid)) return [];
-    dir = projectFilesDir(userId, pid);
-  } catch { return []; }
-
-  let items: fs.Dirent[];
-  try { items = fs.readdirSync(dir, { withFileTypes: true }); }
-  catch { return []; }
-
-  return items
-    .filter(e => e.isFile() && !e.name.startsWith('.') && ALLOWED_EXTENSIONS.has(path.extname(e.name).toLowerCase()))
-    .sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()))
-    .map(e => path.join(dir, e.name));
-}
-
-export async function buildProjectFilesManifest(userId: string, projectId: string): Promise<string> {
-  const files = await listProjectFilePathsForPrompt(userId, projectId);
-  if (!files.length) return '';
-  const entries = files.map((p) => `<file path="${escapeAttr(p)}"/>`);
-  return [
-    '<project-files>',
-    'These files are available to every conversation in this project. Use read_file with the listed path when the task needs content; use stat_file first only when metadata or extraction is needed.',
-    ...entries,
-    '</project-files>',
-  ].join('\n');
-}
-
-export async function buildProjectFilesCliBlock(userId: string, projectId: string): Promise<string> {
-  const files = await listProjectFilePathsForPrompt(userId, projectId);
-  if (!files.length) return '';
-  const lines = files.map(p => `- ${p}`);
-  return `## Project files\n${lines.join('\n')}`;
 }

@@ -58,6 +58,26 @@ describe('logger › redact', () => {
     expect(out.list[1].token).toBe('***REDACTED***');
   });
 
+  it('sanitizes non-sensitive string fields inside objects', async () => {
+    const { redact } = await import('../../src/main/logger');
+    const out = redact({
+      url: 'https://example.test/oauth/callback?code=abc123&state=csrf456&ok=1',
+      note: 'contact alice@example.com phone 13800138000',
+      absPath: '/Users/user/Secret Project/report.pdf',
+      relPath: 'cloud/contexts/private/customer-plan.md',
+      user_id: 'ABCDEF1234567890',
+      session_id: 'session-secret-value',
+    }) as any;
+    expect(out.url).toBe('https://example.test/oauth/callback?code=***&state=***&ok=1');
+    expect(out.note).toBe('contact a***@example.com phone 138****8000');
+    expect(out.absPath).toContain('<abs-path:');
+    expect(out.relPath).toContain('<cloud-path:');
+    expect(JSON.stringify(out)).not.toContain('/Users/user');
+    expect(JSON.stringify(out)).not.toContain('customer-plan.md');
+    expect(out.user_id).toBe('ABCD...7890');
+    expect(out.session_id).toBe('***REDACTED***');
+  });
+
   it('masks PII field names (phone / mobile / email / username) but leaves name passthrough', async () => {
     const { redact } = await import('../../src/main/logger');
     const out = redact({
@@ -93,14 +113,30 @@ describe('logger › redact', () => {
     expect(out.PASSWORD).toBe('***REDACTED***');
   });
 
-  it('passes primitives and Errors through unchanged', async () => {
+  it('passes non-string primitives through unchanged and sanitizes strings', async () => {
     const { redact } = await import('../../src/main/logger');
     expect(redact('hello')).toBe('hello');
+    expect(redact('token=secret-value contact alice@example.com')).toBe('token=*** contact a***@example.com');
     expect(redact(42)).toBe(42);
     expect(redact(null)).toBe(null);
     expect(redact(undefined)).toBe(undefined);
-    const err = new Error('boom');
-    expect(redact(err)).toBe(err); // identity: stack stays intact
+  });
+
+  it('keeps Error shape but sanitizes message, stack, and custom fields', async () => {
+    const { redact } = await import('../../src/main/logger');
+    const err = Object.assign(new Error('request failed Authorization: Bearer abc.def'), {
+      token: 'secret',
+      url: 'https://example.test/cb?code=oauth-code&ok=1',
+    });
+    err.stack = 'Error: request failed Authorization: Bearer abc.def\n    at user alice@example.com';
+    const out = redact(err) as Error & { token?: string; url?: string };
+    expect(out).toBeInstanceOf(Error);
+    expect(out).not.toBe(err);
+    expect(out.message).toBe('request failed Authorization: Bearer ***');
+    expect(out.stack).toContain('Authorization: Bearer ***');
+    expect(out.stack).toContain('a***@example.com');
+    expect(out.token).toBe('***REDACTED***');
+    expect(out.url).toBe('https://example.test/cb?code=***&ok=1');
   });
 
   it('short-circuits circular references', async () => {

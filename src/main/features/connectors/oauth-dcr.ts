@@ -3,17 +3,18 @@
  *
  * For providers that host their own OAuth authorization server per the MCP authorization spec
  * (Notion, Atlassian, Cloudflare suite, …). Orkas has no pre-registered OAuth App at the
- * provider — PC self-registers at first connect via DCR (RFC 7591), holds its own client_id /
- * client_secret per-instance, drives the full OAuth handshake from the PC side.
+ * provider — PC self-registers at first connect via DCR (RFC 7591) and drives the initial
+ * OAuth handshake from the PC side.
  *
  * The Server-bridge in `oauth.ts` handles a different class of providers (GitHub Copilot MCP
  * today) where Orkas registered an OAuth App and Server holds the secret. The two flows live
  * side-by-side and `manager.ts::connectViaOAuth` dispatches by `catalog.auth_mode`.
  *
- * Server's only role in the DCR path: serve `/api/connectors/oauth/dcr-callback` as a stable
- * HTTPS redirect_uri (DCR clients must declare one at registration), stash the {code, state}
- * pair under a one-time exchange_code, deep-link back to PC. The token POST is done from PC
- * directly against the provider's `token_endpoint` using the DCR-issued credentials.
+ * Server serves `/api/connectors/oauth/dcr-callback` as a stable HTTPS redirect_uri (DCR
+ * clients must declare one at registration), stashes the {code, state} pair under a one-time
+ * exchange_code, and deep-links back to PC. PC then does the first token POST against the
+ * provider's `token_endpoint` using the DCR-issued credentials, immediately hands the rotating
+ * refresh grant + DCR client credentials to Server, and persists only a server grant id.
  *
  * **Why not localhost listener (RFC 8252 native-app pattern)**: PC/CLAUDE.md §1 bans HTTP
  * server in main process. Server-bridge callback gets us a stable, registered HTTPS URI
@@ -23,15 +24,16 @@ import * as crypto from 'node:crypto';
 import { URL, URLSearchParams } from 'node:url';
 import { shell } from 'electron';
 
+import { accountApiBase, tokenStore } from './_server_bridge';
 import { getLanguage } from '../config';
 import { createLogger } from '../../logger';
-import { accountApiBase, tokenStore } from './_server_bridge';
 import type { CatalogEntry, DcrClientCredentials, OAuthGrant, Transport } from './types';
 
 const log = createLogger('connectors:oauth-dcr');
 
 const FLOW_TIMEOUT_MS = 10 * 60 * 1000;
 const REFRESH_BUFFER_MS = 5 * 60 * 1000;
+const SERVER_REFRESH_RETRY_DELAY_MS = 500;
 const CLIENT_NAME = 'Orkas';
 
 interface PendingDcrFlow {
@@ -198,13 +200,8 @@ export async function startMcpDcrOAuth(
     resource,
   });
 
-  // Register client. The redirect_uri must point at our Server's `/connectors/oauth/dcr-callback`
-  // endpoint, which is environment-dependent (`accountApiBase()` resolves to the dev or prod
-  // Server URL per `OAUTH_REDIRECT_BASE` / debug-mode rules). DCR registers whichever URL we
-  // declare with the provider, so dev (127.0.0.1) and prod (orkas.ai) just work side-by-side
-  // — each ConnectorInstance carries its own dcr_client tied to whichever env it was installed
-  // under. (A dev-mode install does NOT migrate to prod automatically; the user would
-  // reconnect.)
+  // Register client. OrkasOpen has exactly one redirect base: global prod. Each
+  // ConnectorInstance carries its own dcr_client for that Server-side callback.
   const redirectUri = `${accountApiBase().replace(/\/+$/, '')}/connectors/oauth/dcr-callback`;
   const registered = await _registerClient(meta.registration_endpoint, redirectUri);
   log.info('DCR registration done', { client_id_tail: registered.client_id.slice(-6) });
@@ -339,13 +336,14 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
     };
     if (!tokens.access_token) throw new Error('token response missing access_token');
     const expires_at = typeof tokens.expires_in === 'number' ? Date.now() + tokens.expires_in * 1000 : null;
-    const grant: OAuthGrant = {
+    const localGrant: OAuthGrant = {
       access_token: tokens.access_token,
       refresh_token: tokens.refresh_token || null,
       expires_at,
       scopes: tokens.scope ? tokens.scope.split(/[\s,]+/).filter(Boolean) : [],
       token_type: tokens.token_type || 'Bearer',
     };
+    const grant = await storeDcrServerManaged(pending.catalogId, pending.client, localGrant);
     _pending = null;
     clearTimeout(pending.timer);
     log.info('DCR grant resolved', {
@@ -357,6 +355,156 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
   } catch (err) {
     _cancelPending(`token exchange failed: ${_fmtFetchErr('', err).message}`);
   }
+}
+
+function _scopeString(grant: OAuthGrant): string {
+  return Array.isArray(grant.scopes) ? grant.scopes.filter(Boolean).join(' ') : '';
+}
+
+function _expiresInSeconds(grant: OAuthGrant): number {
+  if (!grant.expires_at) return 0;
+  return Math.max(0, Math.round((grant.expires_at - Date.now()) / 1000));
+}
+
+function _sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+}
+
+async function _fetchDcrServerRefresh(provider: string, body: Record<string, unknown>): Promise<Response> {
+  const url = `${accountApiBase()}/connectors/oauth/refresh`;
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          ...tokenStore.authHeaders(),
+        },
+        body: JSON.stringify(body),
+      });
+    } catch (err) {
+      lastErr = err;
+      if (attempt === 0) {
+        log.warn('DCR server-managed refresh fetch failed; retrying once', {
+          provider,
+          error: (err as Error).message,
+        });
+        await _sleep(SERVER_REFRESH_RETRY_DELAY_MS);
+      }
+    }
+  }
+  throw lastErr;
+}
+
+function _grantFromServerPayload(
+  provider: string,
+  grant: OAuthGrant,
+  body: {
+    access_token?: string;
+    grant_id?: string;
+    server_managed?: boolean;
+    expires_in?: number;
+    token_type?: string;
+    scope?: string;
+    account_label?: string;
+  },
+): OAuthGrant {
+  if (!body.access_token || !body.grant_id) {
+    throw new Error(`invalid ${provider} server-managed DCR response`);
+  }
+  const expires_at = typeof body.expires_in === 'number' ? Date.now() + body.expires_in * 1000 : null;
+  return {
+    access_token: body.access_token,
+    refresh_token: null,
+    server_managed: true,
+    server_grant_id: body.grant_id,
+    expires_at,
+    scopes: body.scope ? body.scope.split(/[\s,]+/).filter(Boolean) : grant.scopes,
+    token_type: body.token_type || grant.token_type || 'Bearer',
+    ...(body.account_label || grant.account_label ? { account_label: body.account_label || grant.account_label } : {}),
+  };
+}
+
+export async function storeDcrServerManaged(
+  provider: string,
+  client: DcrClientCredentials,
+  grant: OAuthGrant,
+  opts: { force?: boolean } = {},
+): Promise<OAuthGrant> {
+  const res = await fetch(`${accountApiBase()}/connectors/oauth/dcr-store`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      ...tokenStore.authHeaders(),
+    },
+    body: JSON.stringify({
+      provider,
+      access_token: grant.access_token,
+      refresh_token: grant.refresh_token || '',
+      expires_in: _expiresInSeconds(grant),
+      token_type: grant.token_type || 'Bearer',
+      scope: _scopeString(grant),
+      account_label: grant.account_label || '',
+      dcr_client: client,
+      force_refresh: !!opts.force,
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`DCR store HTTP ${res.status}: ${text}`);
+  }
+  const body = await res.json() as {
+    code: number;
+    msg?: string;
+    access_token?: string;
+    grant_id?: string;
+    server_managed?: boolean;
+    expires_in?: number;
+    token_type?: string;
+    scope?: string;
+    account_label?: string;
+  };
+  if (body.code !== 0) throw new Error(body.msg || 'DCR server-managed store failed');
+  return _grantFromServerPayload(provider, grant, body);
+}
+
+export async function refreshDcrServerManaged(
+  provider: string,
+  grant: OAuthGrant,
+  opts: { force?: boolean } = {},
+): Promise<OAuthGrant> {
+  if (!grant.server_grant_id) throw new Error('DCR server grant missing grant_id');
+  const stale = !!(grant.expires_at && grant.expires_at - Date.now() <= REFRESH_BUFFER_MS);
+  if (!stale && !opts.force) return grant;
+  const res = await _fetchDcrServerRefresh(provider, {
+    provider,
+    grant_id: grant.server_grant_id,
+    device_id: tokenStore.getDeviceId(),
+    ...(opts.force ? { force_refresh: true } : {}),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`DCR refresh HTTP ${res.status}: ${text}`);
+  }
+  const body = await res.json() as {
+    code: number;
+    msg?: string;
+    access_token?: string;
+    grant_id?: string;
+    server_managed?: boolean;
+    expires_in?: number;
+    token_type?: string;
+    scope?: string;
+    account_label?: string;
+  };
+  if (body.code !== 0) throw new Error(body.msg || 'DCR server-managed refresh failed');
+  return _grantFromServerPayload(provider, grant, body);
 }
 
 /** Refresh a DCR-issued access_token. Called by manager before reconnect when expires_at is

@@ -1,6 +1,6 @@
 /** YAML frontmatter metadata for a SKILL.md file. */
 export type SkillFrontmatter = {
-  /** Skill display name (max 64 chars). */
+  /** Skill display name (max 60 ASCII chars or 30 CJK/Japanese chars). */
   name: string;
   /** One-line description (max 1024 chars). */
   description: string;

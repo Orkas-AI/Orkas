@@ -4,22 +4,22 @@
  * Single-file JSON at `<uid>/cloud/config/connectors.json` (see `paths.ts::userConnectorsConfigFile`).
  * **File body is plaintext JSON**; each instance's sensitive blob (`oauth_grant` + `dcr_client` +
  * `transport`) is packed into a single per-instance `secrets_enc` field encrypted via
- * `util/crypto-vault.ts` (PBKDF2 → AES-256-GCM). Metadata fields (`display_name` / `status` /
+ * `util/local-secret-store.ts`. Metadata fields (`display_name` / `status` /
  * `tools_cache` / timestamps) stay plaintext so Server-side iOS-clients-facing readers can list
- * connectors without holding the vault key. `transport` sits in the secrets blob even though it
+ * connectors without holding the local secret backend. `transport` sits in the secrets blob even though it
  * isn't a "secret" by name — `applyTemplate` bakes the resolved `access_token` into
  * `transport.env[oauth_env_key]` (stdio) / `transport.headers.Authorization` (streamable-http);
  * leaving it plaintext would defeat the whole encryption. Runtime cost is zero:
  * `manager.ts::_resolveTransport` re-runs `applyTemplate` from the catalog template + fresh
  * `oauth_grant` on every connect, so the persisted transport is purely vestigial. The read path
- * also accepts the legacy whole-file vault format produced by pre-LOCAL_DATA_VERSION=2 builds;
- * the next write naturally upgrades the file in place.
+ * accepts the immediately previous per-instance `crypto-vault` `secrets_enc` format and upgrades
+ * it in place.
  *
- * **Vault seed = Orkas-account OAuth user_id (when logged in), else local uid**. Same OAuth
+ * **Secret owner = Orkas-account OAuth user_id (when logged in), else local uid**. Same OAuth
  * user_id on every device the user signs into → cross-device decryption after cloud sync.
  * OrkasOpen / not-logged-in falls back to local uid (file then sits in cloud/config/ but the
  * sync engine is inactive without an account, so it stays machine-private de facto). See
- * `_vaultSeed` for the resolution.
+ * `_secretOwner` for the resolution.
  *
  * Sync trigger: each write fires `syncFeature.markDirty('connectors', 'cloud/config/connectors.json')`
  * so user actions (install / disconnect / refresh) push within the debounce window rather than
@@ -35,16 +35,17 @@ import { Mutex } from 'async-mutex';
 
 import { userConnectorsConfigFile } from '../../paths';
 import { createLogger } from '../../logger';
-import * as cryptoVault from '../../util/crypto-vault';
+import * as localSecrets from '../../util/local-secret-store';
 import type { ConnectorInstance, ConnectorsFile, OAuthGrant, DcrClientCredentials, Transport } from './types';
 
 const log = createLogger('connectors:registry');
 const _writeMutex = new Mutex();
 
-const EMPTY: ConnectorsFile = { version: 2, connections: {} };
+const EMPTY: ConnectorsFile = { version: 2, connections: {}, oauth_hints: {}, _deleted_at: {} };
+const CONNECTOR_SECRET_NAMESPACE = 'connectors.instance';
 
 // On-disk shape: ConnectorInstance with all token-bearing fields collapsed into one
-// vault-encrypted `secrets_enc` string. **`transport` is in the blob too** — even though it's
+// locally encrypted `secrets_enc` string. **`transport` is in the blob too** — even though it's
 // not a "secret" by name, `applyTemplate` bakes the resolved `access_token` into
 // `transport.env[oauth_env_key]` (stdio) / `transport.headers.Authorization` (streamable-http);
 // leaving it plaintext on disk would defeat the whole encryption. `manager.ts::_resolveTransport`
@@ -58,51 +59,80 @@ type InstanceOnDisk = Omit<ConnectorInstance, 'oauth_grant' | 'dcr_client' | 'tr
 };
 interface SecretsBlob { oauth_grant?: OAuthGrant; dcr_client?: DcrClientCredentials; transport?: Transport }
 
-// Vault-seed resolver. OrkasOpen strips `features/account`, so there is no
-// cross-device OAuth user_id to fall back to — the seed is always the local uid.
-function _vaultSeed(uid: string): string {
+const PRESERVED_SECRETS = Symbol('preservedConnectorSecrets');
+type ConnectorInstanceWithPreservedSecrets = ConnectorInstance & { [PRESERVED_SECRETS]?: string };
+
+// Secret-owner resolver for OrkasOpen: connector grants are encrypted to the local profile id.
+function _secretOwner(uid: string): string {
   return uid;
 }
 
-// features/sync stripped from the OrkasOpen build — `_notifyDirty` is a no-op.
+function _secretContext(uid: string, instanceId: string): localSecrets.LocalSecretContext {
+  return {
+    namespace: CONNECTOR_SECRET_NAMESPACE,
+    ownerId: _secretOwner(uid),
+    recordId: instanceId,
+  };
+}
+
 function _notifyDirty(): void {
-  /* no-op */
 }
 
-// Decrypt with the active seed; fall back to local-uid for files written before the
-// 2026-05-15 cloud-sync rekey OR for OrkasOpen / pre-login users who only ever had the
-// local-uid encryption path. AES-GCM's auth tag makes wrong-key attempts throw cleanly — no
-// plaintext leakage.
-function _tryDecrypt(uid: string, payload: string): string | null {
-  const primary = _vaultSeed(uid);
-  try { return cryptoVault.decrypt(primary, payload); } catch { /* try fallback */ }
-  if (primary !== uid) {
-    try { return cryptoVault.decrypt(uid, payload); } catch { /* both failed */ }
+function _notifyRendererChanged(): void {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const ipc = require('../../ipc') as { broadcastToRenderer?: (channel: string, payload: unknown) => void };
+    ipc.broadcastToRenderer?.('connectors:changed', { changed: true });
+  } catch { /* tests / OrkasOpen may not have the IPC bridge loaded */ }
+}
+
+function _notifyChanged(): void {
+  _notifyDirty();
+  _notifyRendererChanged();
+}
+
+function _legacySeeds(uid: string): string[] {
+  const primary = _secretOwner(uid);
+  return primary === uid ? [uid] : [primary, uid];
+}
+
+function _tryDecrypt(uid: string, instanceId: string, payload: string): { json: string; migrated: boolean } | null {
+  try {
+    const dec = localSecrets.decryptLocalSecretWithMeta(
+      _secretContext(uid, instanceId),
+      payload,
+      { legacySeeds: _legacySeeds(uid) },
+    );
+    return { json: dec.plaintext, migrated: localSecrets.shouldRewriteLocalSecret(dec.kind) };
+  } catch {
+    return null;
   }
-  return null;
 }
 
-function _hydrateSecrets(uid: string, disk: InstanceOnDisk): ConnectorInstance {
+function _hydrateSecrets(uid: string, disk: InstanceOnDisk): { instance: ConnectorInstance; migrated: boolean } {
   const { secrets_enc, ...rest } = disk;
   // transport is required on ConnectorInstance but absent from the disk shape — it lives in the
   // secrets blob. Cast through; manager.ts handles the no-transport / no-grant case via
   // `_resolveTransport` returning null → status:error.
   const out = { ...rest } as ConnectorInstance;
-  if (!secrets_enc) return out;
-  const json = _tryDecrypt(uid, secrets_enc);
-  if (json === null) {
-    log.warn('decrypt secrets_enc failed (both seeds) — instance left without transport/grant', { id: disk.id });
-    return out;
+  if (!secrets_enc) return { instance: out, migrated: false };
+  const dec = _tryDecrypt(uid, disk.id, secrets_enc);
+  if (dec === null) {
+    log.warn('decrypt secrets_enc failed (known formats) — instance left without transport/grant', { id: disk.id });
+    (out as ConnectorInstanceWithPreservedSecrets)[PRESERVED_SECRETS] = secrets_enc;
+    return { instance: out, migrated: false };
   }
   try {
-    const blob = JSON.parse(json) as SecretsBlob;
+    const blob = JSON.parse(dec.json) as SecretsBlob;
     if (blob.oauth_grant) out.oauth_grant = blob.oauth_grant;
     if (blob.dcr_client) out.dcr_client = blob.dcr_client;
     if (blob.transport) out.transport = blob.transport;
   } catch (err) {
     log.warn('parse secrets_enc payload failed', { id: disk.id, error: (err as Error).message });
+    (out as ConnectorInstanceWithPreservedSecrets)[PRESERVED_SECRETS] = secrets_enc;
+    return { instance: out, migrated: false };
   }
-  return out;
+  return { instance: out, migrated: dec.migrated };
 }
 
 function _dehydrateSecrets(uid: string, inst: ConnectorInstance): InstanceOnDisk {
@@ -113,7 +143,10 @@ function _dehydrateSecrets(uid: string, inst: ConnectorInstance): InstanceOnDisk
     if (oauth_grant) blob.oauth_grant = oauth_grant;
     if (dcr_client) blob.dcr_client = dcr_client;
     if (transport) blob.transport = transport;
-    onDisk.secrets_enc = cryptoVault.encrypt(_vaultSeed(uid), JSON.stringify(blob));
+    onDisk.secrets_enc = localSecrets.encryptLocalSecret(_secretContext(uid, inst.id), JSON.stringify(blob));
+  } else {
+    const preserved = (inst as ConnectorInstanceWithPreservedSecrets)[PRESERVED_SECRETS];
+    if (preserved) onDisk.secrets_enc = preserved;
   }
   return onDisk;
 }
@@ -128,43 +161,35 @@ function _readSync(uid: string): ConnectorsFile {
     if (code !== 'ENOENT') {
       log.warn('reading connectors.json failed', { error: (err as Error).message });
     }
-    return { version: 2, connections: {} };
+    return { version: 2, connections: {}, oauth_hints: {}, _deleted_at: {} };
   }
-  if (!raw.trim()) return { version: 2, connections: {} };
+  if (!raw.trim()) return { version: 2, connections: {}, oauth_hints: {}, _deleted_at: {} };
 
-  // Legacy whole-file vault format: decrypt once, plaintext JSON already has oauth_grant /
-  // dcr_client as plain fields per instance — return as-is. Next write upgrades to per-field.
-  if (cryptoVault.isEncryptedPayload(raw)) {
-    const json = _tryDecrypt(uid, raw);
-    if (json === null) {
-      log.warn('decrypt connectors.json (legacy whole-file) failed with both seeds — treating as empty');
-      return { version: 2, connections: {} };
-    }
-    try {
-      const obj = JSON.parse(json);
-      if (obj && typeof obj === 'object' && obj.connections && typeof obj.connections === 'object') {
-        return { version: 2, connections: obj.connections as Record<string, ConnectorInstance> };
-      }
-    } catch (err) {
-      log.warn('parse connectors.json (legacy whole-file) failed', { error: (err as Error).message });
-    }
-    return { version: 2, connections: {} };
-  }
-
-  // Current format: plaintext JSON envelope, secrets_enc per instance.
+  // Current format: plaintext JSON envelope, secrets_enc per instance. The only legacy form
+  // migrated here is the immediately previous per-instance crypto-vault payload.
   try {
     const obj = JSON.parse(raw);
     if (obj && typeof obj === 'object' && obj.connections && typeof obj.connections === 'object') {
       const conns: Record<string, ConnectorInstance> = {};
+      let migrated = false;
       for (const [id, disk] of Object.entries(obj.connections as Record<string, InstanceOnDisk>)) {
-        conns[id] = _hydrateSecrets(uid, disk);
+        const hydrated = _hydrateSecrets(uid, disk);
+        conns[id] = hydrated.instance;
+        migrated = migrated || hydrated.migrated;
       }
-      return { version: 2, connections: conns };
+      const oauthHints = obj.oauth_hints && typeof obj.oauth_hints === 'object' ? obj.oauth_hints : {};
+      const deletedAt = obj._deleted_at && typeof obj._deleted_at === 'object' ? obj._deleted_at : {};
+      const data: ConnectorsFile = { version: 2, connections: conns, oauth_hints: oauthHints, _deleted_at: deletedAt };
+      if (migrated) {
+        _writeSync(uid, data);
+        _notifyChanged();
+      }
+      return data;
     }
   } catch (err) {
     log.warn('parse connectors.json failed', { error: (err as Error).message });
   }
-  return { version: 2, connections: {} };
+  return { version: 2, connections: {}, oauth_hints: {}, _deleted_at: {} };
 }
 
 function _writeSync(uid: string, data: ConnectorsFile): void {
@@ -175,7 +200,12 @@ function _writeSync(uid: string, data: ConnectorsFile): void {
     for (const [id, inst] of Object.entries(data.connections)) {
       onDisk[id] = _dehydrateSecrets(uid, inst);
     }
-    const body = JSON.stringify({ version: 2, connections: onDisk }, null, 2);
+    const body = JSON.stringify({
+      version: 2,
+      connections: onDisk,
+      oauth_hints: data.oauth_hints || {},
+      _deleted_at: data._deleted_at || {},
+    }, null, 2);
     fs.writeFileSync(file, body, { mode: 0o600 });
     // Diagnostic verify: read back size + the secrets_enc fingerprints we just wrote so a
     // future "the RT we sent doesn't match server" failure can be traced against actual
@@ -224,9 +254,14 @@ export async function upsert(uid: string, inst: ConnectorInstance): Promise<void
       had_existing: !!before,
     });
     cur.connections[inst.id] = inst;
+    if (cur._deleted_at?.[inst.id]) {
+      const deleted = { ...(cur._deleted_at || {}) };
+      delete deleted[inst.id];
+      cur._deleted_at = deleted;
+    }
     _writeSync(uid, cur);
   });
-  _notifyDirty();
+  _notifyChanged();
 }
 
 export async function remove(uid: string, id: string): Promise<boolean> {
@@ -235,11 +270,36 @@ export async function remove(uid: string, id: string): Promise<boolean> {
     if (!cur.connections[id]) return false;
     log.info('registry.remove', { id, rt_before: _rt(cur.connections[id].oauth_grant) });
     delete cur.connections[id];
+    if (cur.oauth_hints?.[id]) {
+      const hints = { ...(cur.oauth_hints || {}) };
+      delete hints[id];
+      cur.oauth_hints = hints;
+    }
+    cur._deleted_at = { ...(cur._deleted_at || {}), [id]: new Date().toISOString() };
     _writeSync(uid, cur);
     return true;
   });
-  if (removed) _notifyDirty();
+  if (removed) _notifyChanged();
   return removed;
+}
+
+export function shouldReauthorize(uid: string, id: string): boolean {
+  if (!uid || !id) return false;
+  const file = _readSync(uid);
+  return !!file.oauth_hints?.[id]?.reauthorize;
+}
+
+export async function setReauthorizeHint(uid: string, id: string, enabled: boolean): Promise<void> {
+  if (!uid || !id) return;
+  await _writeMutex.runExclusive(async () => {
+    const cur = _readSync(uid);
+    const hints = { ...(cur.oauth_hints || {}) };
+    if (enabled) hints[id] = { ...(hints[id] || {}), reauthorize: true };
+    else delete hints[id];
+    cur.oauth_hints = hints;
+    _writeSync(uid, cur);
+  });
+  _notifyChanged();
 }
 
 export async function update(
@@ -262,7 +322,7 @@ export async function update(
     _writeSync(uid, cur);
     return updated;
   });
-  if (next) _notifyDirty();
+  if (next) _notifyChanged();
   return next;
 }
 

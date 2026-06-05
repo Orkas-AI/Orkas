@@ -69,6 +69,7 @@ export type StopReason = "end_turn" | "tool_use" | "max_tokens" | "stop_sequence
 /** Streaming event types. */
 export type StreamEvent =
   | { type: "text_delta"; text: string }
+  | { type: "retry"; attempt: number; reason: string }
   | { type: "tool_use_start"; id: string; name: string }
   | { type: "tool_use_delta"; id: string; input: string }
   | { type: "tool_use_end"; id: string }

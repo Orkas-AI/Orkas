@@ -130,7 +130,23 @@ describe('group_chat plan', () => {
     expect(re?.steps[2].wait_for).toEqual([1, 2]);
   });
 
-  it('findReadySteps respects wait_for + parallel_group', async () => {
+  it('normalizes later empty wait_for back to default serial order', async () => {
+    const plan = await import('../../../../src/main/features/group_chat/plan');
+    const r = await plan.setPlan(TEST_UID, TEST_CID, {
+      steps: [
+        { title: 'a', assignee: 'A', wait_for: [] },
+        { title: 'b', assignee: 'B', wait_for: [] },
+        { title: 'c', assignee: 'C', wait_for: [] },
+      ],
+    });
+
+    expect(r.plan.steps[0].wait_for).toEqual([]);
+    expect(r.plan.steps[1].wait_for).toBeUndefined();
+    expect(r.plan.steps[2].wait_for).toBeUndefined();
+    expect(plan.findReadySteps(r.plan).map((s) => s.index)).toEqual([1]);
+  });
+
+  it('ignores legacy parallel_group and serializes later empty wait_for', async () => {
     const plan = await import('../../../../src/main/features/group_chat/plan');
     const r = await plan.setPlan(TEST_UID, TEST_CID, {
       steps: [
@@ -140,10 +156,12 @@ describe('group_chat plan', () => {
         { title: 'd', assignee: 'D', wait_for: [1, 2, 3] },
       ],
     });
-    // Initially all 3 (a, b, c) are ready (no deps); d waits for [1,2,3].
-    expect(plan.findReadySteps(r.plan).map((s) => s.index).sort()).toEqual([1, 2, 3]);
+    expect(r.plan.steps.some((s) => s.parallel_group)).toBe(false);
+    expect(r.plan.steps[1].wait_for).toBeUndefined();
+    expect(r.plan.steps[2].wait_for).toBeUndefined();
+    expect(plan.findReadySteps(r.plan).map((s) => s.index)).toEqual([1]);
 
-    // Mark a + b done; c still in progress → d not ready yet.
+    // Mark a + b done; c is the next serial step → d not ready yet.
     await plan.updateStep(TEST_UID, TEST_CID, 1, 'done');
     await plan.updateStep(TEST_UID, TEST_CID, 2, 'done');
     const mid = await plan.readPlan(TEST_UID, TEST_CID);

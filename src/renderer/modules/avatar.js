@@ -1,9 +1,9 @@
 // ─── Avatar (icon + color) for AI actors ─────────────────────────────────
 //
-// The avatar catalog (15 icons + 16 colors + commander default) has its
-// single source of truth at `src/main/data/avatars.json`; we fetch it
-// once via IPC at startup and cache it locally. Every render helper
-// reads the cache — **no SVG or hex is hardcoded anywhere else**.
+// The avatar catalog (15 icons + 16 colors + commander default) is a
+// per-platform runtime resource fetched through `avatars.getCatalog` at
+// startup and cached locally. Every render helper reads the cache —
+// **no SVG or hex is hardcoded in the renderer**.
 //
 // Default fallback: when an agent has no stored avatar yet, derive a
 // deterministic combination by hashing `agent_id`. The same agent_id

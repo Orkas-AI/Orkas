@@ -144,6 +144,66 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     const text = await getSystemPromptBlock();
     expect(text).toBe('');
   });
+
+  it('renders compact skill descriptions in the prompt across zh/en descriptions', async () => {
+    writeSkill(customDir(), 'zh-long', 'ZhLong', '抓取网页并提取结构化信息；适合网页调研和数据整理；触发词：抓取、网页');
+    writeSkill(customDir(), 'zh-sentence', 'ZhSentence', '分析资料并输出结论。适合深度研究。');
+    writeSkill(customDir(), 'en-long', 'EnLong', 'Analyze API logs. Suitable for debugging production incidents. Triggers: logs, traces.');
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock();
+    expect(text).toContain('**ZhLong** (Source: custom; internal read id: zh-long) — 抓取网页并提取结构化信息');
+    expect(text).toContain('**ZhSentence** (Source: custom; internal read id: zh-sentence) — 分析资料并输出结论。');
+    expect(text).toContain('**EnLong** (Source: custom; internal read id: en-long) — Analyze API logs.');
+    expect(text).not.toContain('触发词');
+    expect(text).not.toContain('Suitable for debugging');
+    expect(text).not.toContain('Triggers: logs');
+  });
+
+  it('dedupes same display-name skills with custom shadowing builtin', async () => {
+    writeSkill(builtinDir(), 'builtin-reviewer', 'agent-static-review', 'builtin desc');
+    writeSkill(customDir(), 'custom-reviewer', 'agent-static-review', 'custom desc');
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock();
+    expect(text).toContain('**agent-static-review** (Source: custom; internal read id: custom-reviewer) — custom desc');
+    expect(text).not.toContain('builtin-reviewer');
+    expect(text).not.toContain('builtin desc');
+  });
+
+  it('keeps same display-name marketplace skills with different internal ids', async () => {
+    writeSkill(builtinDir(), '111111111111', 'agent-static-review', 'first marketplace desc');
+    writeSkill(builtinDir(), '222222222222', 'agent-static-review', 'second marketplace desc');
+    const advertised: Array<{ id: string; system: string }> = [];
+    const displayNameById = new Map<string, string>();
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock({
+      displayNameById,
+      onSkillAdvertised(id, system) {
+        advertised.push({ id, system });
+      },
+    });
+
+    expect(text).toContain('**agent-static-review** (Source: builtin; internal read id: 111111111111) — first marketplace desc');
+    expect(text).toContain('**agent-static-review** (Source: builtin; internal read id: 222222222222) — second marketplace desc');
+    expect(advertised).toEqual([
+      { id: '111111111111', system: 'A.platform' },
+      { id: '222222222222', system: 'A.platform' },
+    ]);
+    expect(displayNameById.get('111111111111')).toBe('agent-static-review');
+    expect(displayNameById.get('222222222222')).toBe('agent-static-review');
+  });
+
+  it('keeps explicitly allowlisted same-name marketplace skill ids', async () => {
+    writeSkill(builtinDir(), '111111111111', 'agent-static-review', 'first marketplace desc');
+    writeSkill(builtinDir(), '222222222222', 'agent-static-review', 'second marketplace desc');
+    writeSkill(builtinDir(), '333333333333', 'other-skill', 'other desc');
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock({ allowlist: ['111111111111', '222222222222'] });
+
+    expect(text).toContain('internal read id: 111111111111');
+    expect(text).toContain('internal read id: 222222222222');
+    expect(text).not.toContain('333333333333');
+    expect(text).not.toContain('other desc');
+  });
 });
 
 describe('skill-registry › replaceKnownSkillIdsForDisplay', () => {

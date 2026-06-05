@@ -178,6 +178,61 @@ describe('search › context snippet', () => {
   });
 });
 
+describe('search › CJK bigram anchor (noise-doc rejection)', () => {
+  // The bug shape that motivated the anchor filter: a user searches
+  // `苏格拉底` (a 4-char term whose individual chars `苏`/`格`/`拉`/`底`
+  // appear all over the corpus). Without anchoring, BM25 accumulates
+  // unigram contributions for every doc that contains any of those chars
+  // — and the noise docs flood the result list while the actual term
+  // appears nowhere. With anchoring, the result list is empty whenever
+  // no doc contains an adjacent-pair anchor (`苏格` / `格拉` / `拉底`).
+  it('rejects docs that contain only individual CJK chars from a multi-char query', async () => {
+    // None of these chats contains the full bigram `苏格` / `格拉` / `拉底`,
+    // but every one contains at least one of `拉` / `底` (very common chars).
+    writeChat('u1', 'noise1', [
+      { id: 'm0', ts: 't', from: 'user', to: ['commander'], mentions: [], text: '把这些候选拉成清单' },
+    ]);
+    writeChat('u1', 'noise2', [
+      { id: 'm0', ts: 't', from: 'user', to: ['commander'], mentions: [], text: '底层日志已经写好了' },
+    ]);
+    writeChat('u1', 'noise3', [
+      { id: 'm0', ts: 't', from: 'user', to: ['commander'], mentions: [], text: '关于学习教育的整理' },
+    ]);
+    const s = await loadSearch();
+    const ix = await import('../../../../src/main/features/search/indexer');
+    await ix.reconcileChatsIndex('u1');
+    const results = await s.searchChats('u1', '苏格拉底');
+    expect(results).toEqual([]);
+  });
+
+  it('keeps a doc that contains an adjacent-pair anchor from the query', async () => {
+    writeChat('u1', 'hit', [
+      { id: 'm0', ts: 't', from: 'user', to: ['commander'], mentions: [], text: '苏格拉底的对话风格' },
+    ]);
+    writeChat('u1', 'noise', [
+      { id: 'm0', ts: 't', from: 'user', to: ['commander'], mentions: [], text: '把候选拉到底层' },
+    ]);
+    const s = await loadSearch();
+    const ix = await import('../../../../src/main/features/search/indexer');
+    await ix.reconcileChatsIndex('u1');
+    const results = await s.searchChats('u1', '苏格拉底');
+    expect(results.length).toBe(1);
+    expect(results[0].cid).toBe('hit');
+  });
+
+  it('single-char CJK query still works (no bigram in tokens → no anchor filter)', async () => {
+    writeChat('u1', 'c1', [
+      { id: 'm0', ts: 't', from: 'user', to: ['commander'], mentions: [], text: '今天聊水的处理' },
+    ]);
+    const s = await loadSearch();
+    const ix = await import('../../../../src/main/features/search/indexer');
+    await ix.reconcileChatsIndex('u1');
+    const results = await s.searchChats('u1', '水');
+    expect(results.length).toBe(1);
+    expect(results[0].cid).toBe('c1');
+  });
+});
+
 describe('search › reconcileAll', () => {
   it('runs without throwing on an empty workspace', async () => {
     const s = await loadSearch();

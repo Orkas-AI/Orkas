@@ -1,14 +1,15 @@
 /**
- * Provider + model catalog — the single place to curate what the settings
- * page offers.
+ * Provider catalog — the single place to curate which providers the settings
+ * page offers. Provider model defaults live in features/client_config.ts and
+ * are registered through the central client-config manager.
  *
  * ## Layout
  *
  *   CATALOG          — ordered list of visible providers (one entry per
  *                      provider card). This is the source of truth; every
  *                      other export is derived from it.
- *   CURATED_MODELS   — per-provider model whitelist shown in the model
- *                      dropdown. Edit here to add or remove models.
+ *   CURATED_MODELS   — default per-provider model whitelist shown in the
+ *                      model dropdown. Can be overridden by model-catalog JSON.
  *   EXTRA_LABELS     — friendly labels for providers that aren't in
  *                      CATALOG but may show up via legacy saved profiles.
  *
@@ -18,6 +19,10 @@
  * falls back to `pickLatestGenerations()` over pi-ai's raw model list,
  * which keeps the last 2 (major, minor) version bands.
  *
+ * Runtime override:
+ *   Server remote-config can override model_catalog; the desktop cache is
+ *   last-known-good only, not a local source of truth.
+ *
  * ## OAuth
  *
  * OAuth capability is detected at runtime via pi-ai's `getOAuthProviders()`
@@ -25,6 +30,15 @@
  * entry tells the UI not to offer the API-key path (e.g. OpenAI Codex, the
  * Google CLI/Antigravity backends).
  */
+
+import {
+  DEFAULT_IMAGE_GEN_BY_PROVIDER,
+  DEFAULT_PROVIDER_MODELS,
+  type ImageGenCapability as ConfigImageGenCapability,
+  getConfiguredImageGenCapability,
+  getConfiguredProviderModels,
+} from '../features/client_config';
+import type { Api, Model } from '@earendil-works/pi-ai';
 
 // ── Catalog entry shape ─────────────────────────────────────────────────
 
@@ -52,7 +66,8 @@ export interface CatalogEntry {
 
 // ── Ordered catalog (dropdown order = array order) ──────────────────────
 //
-// Group 0: recommended default (DeepSeek direct — best China latency + price)
+// Group 0: optional/direct provider. Production builds hide DeepSeek by
+// default via provider_policy.ts; dev builds keep it for local testing.
 // Group 1: global frontier labs (Anthropic, OpenAI, Google)
 // Group 2: China mainstream (Zhipu GLM, Moonshot Kimi, MiniMax)
 // Group 3: aggregators (OpenRouter)
@@ -103,159 +118,130 @@ export const CATALOG: readonly CatalogEntry[] = [
 // Providers without an entry here fall through to `pickLatestGenerations`
 // which keeps the last 2 version bands from pi-ai's raw list.
 
-export const CURATED_MODELS: Readonly<Record<string, readonly { id: string; name: string }[]>> = {
-  // Anthropic direct: ids use dash form (pi-ai 0.68.1's
-  // provider="anthropic" uses claude-<tier>-<major>-<minor>). Opus 4.5–4.7,
-  // Sonnet 4.5/4.6 and Haiku 4.5 are real ids in pi-ai 0.68.1; sonnet-4-7
-  // and haiku-4-6/4-7 do not exist in pi-ai (verified 2026-04) and have
-  // been removed.
-  anthropic: [
-    { id: 'claude-opus-4-7',   name: 'Claude Opus 4.7' },
-    { id: 'claude-opus-4-6',   name: 'Claude Opus 4.6' },
-    { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
-  ],
-
-  // ChatGPT OAuth ("Codex subscription") whitelist — verified by probing
-  // https://chatgpt.com/backend-api/codex/responses. Most codex variants
-  // pi-ai lists (-codex-spark / -mini / -max / gpt-5.1 / gpt-5.2-codex)
-  // are rejected by OpenAI with "not supported when using Codex with a
-  // ChatGPT account". gpt-5.5 was added 2026-05-06 alongside the pi-ai
-  // 0.73.0 bump — re-probe before relying on it in production; if the
-  // Codex backend rejects it, drop the entry like the other 5.x variants.
-  'openai-codex': [
-    { id: 'gpt-5.5', name: 'GPT-5.5' },
-    { id: 'gpt-5.4', name: 'GPT-5.4' },
-  ],
-
-  // OpenAI direct. pi-ai 0.73.0 ships gpt-5.5 / 5.5-pro. The 5.3 family
-  // (only -codex / -codex-spark exist, no plain chat id) was dropped on
-  // 2026-05-06 — keep this list to the 5.4 + 5.5 generations only.
-  openai: [
-    { id: 'gpt-5.5',      name: 'GPT-5.5' },
-    { id: 'gpt-5.5-pro',  name: 'GPT-5.5 Pro' },
-    { id: 'gpt-5.4',      name: 'GPT-5.4' },
-    { id: 'gpt-5.4-pro',  name: 'GPT-5.4 Pro' },
-    { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
-  ],
-
-  // Google Gemini direct. pi-ai 0.68.1's provider="google" only lists 3.x
-  // entries with the -preview suffix (Google's 3.x is still in preview);
-  // the stable line caps at 2.5. The old catalog had hallucinated ids
-  // `gemini-3.1-pro` / `gemini-3-pro` / `gemini-3.0-flash` which pi-ai
-  // does not recognize — all replaced with real ids.
-  google: [
-    { id: 'gemini-3.1-pro-preview',        name: 'Gemini 3.1 Pro (preview)' },
-    { id: 'gemini-3.1-flash-lite-preview', name: 'Gemini 3.1 Flash Lite (preview)' },
-    { id: 'gemini-3-pro-preview',          name: 'Gemini 3 Pro (preview)' },
-    { id: 'gemini-3-flash-preview',        name: 'Gemini 3 Flash (preview)' },
-  ],
-
-  // Zhipu GLM — https://bigmodel.cn
-  zai: [
-    { id: 'glm-5.1',        name: 'GLM-5.1' },
-    { id: 'glm-5',          name: 'GLM-5' },
-    { id: 'glm-5-turbo',    name: 'GLM-5 Turbo' },
-    { id: 'glm-5v-turbo',   name: 'GLM-5V Turbo' },
-  ],
-
-  // Moonshot open platform — https://api.moonshot.cn/v1 (OpenAI-compatible,
-  // pay-as-you-go). pi-ai 0.68.1 does not register this provider; we
-  // hand-build a `Model<"openai-completions">` via
-  // `model/core-agent/external-providers.ts` and call pi-ai's low-level API
-  // directly. Ids are sourced from platform.kimi.com/docs/models
-  // (verified 2026-04). Only the current flagship K2.5 / K2.6 are listed
-  // (their ids contain a dot); the previous-gen K2 preview series EOLs
-  // 2026-05-25 and is intentionally omitted so new credentials don't default
-  // to a model that is about to be retired.
-  moonshot: [
-    { id: 'kimi-k2.6', name: 'Kimi K2.6' },
-    { id: 'kimi-k2.5', name: 'Kimi K2.5' },
-  ],
-
-  // Kimi Coding Plan — https://api.kimi.com/coding (Anthropic protocol,
-  // monthly subscription only). pi-ai 0.68.1's provider id is
-  // `kimi-coding`; `k2p6` (K2.6) was added.
-  'kimi-coding': [
-    { id: 'k2p6',             name: 'Kimi K2.6' },
-    { id: 'kimi-for-coding',  name: 'Kimi For Coding' },
-  ],
-
-  // MiniMax (China endpoint, API key)
-  'minimax-cn': [
-    { id: 'MiniMax-M2.7',           name: 'MiniMax M2.7' },
-    { id: 'MiniMax-M2.7-highspeed', name: 'MiniMax M2.7 Highspeed' },
-  ],
-
-  // MiniMax Portal (OAuth subscription) — same model ids as the API-key
-  // endpoint but auth'd via OAuth2 device-code (see features/oauth-minimax.ts).
-  'minimax-portal': [
-    { id: 'MiniMax-M2.7',           name: 'MiniMax M2.7' },
-    { id: 'MiniMax-M2.7-highspeed', name: 'MiniMax M2.7 Highspeed' },
-  ],
-  'minimax-portal-cn': [
-    { id: 'MiniMax-M2.7',           name: 'MiniMax M2.7' },
-    { id: 'MiniMax-M2.7-highspeed', name: 'MiniMax M2.7 Highspeed' },
-  ],
-
-  // DeepSeek V4 direct (OpenAI-compatible protocol, base url
-  // https://api.deepseek.com/v1). Released 2026-04-24; the old ids
-  // `deepseek-chat` / `deepseek-reasoner` are explicitly deprecated by the
-  // vendor — they map to v4-flash's non-reasoning / reasoning modes
-  // respectively. We only list the official ids here.
-  // Source: https://api-docs.deepseek.com/quick_start/pricing (verified 2026-04).
-  deepseek: [
-    { id: 'deepseek-v4-pro',   name: 'DeepSeek V4 Pro' },
-    { id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
-  ],
-
-  // Doubao Seed 2.0 (Volcengine Ark, OpenAI-compatible, base url
-  // https://ark.cn-beijing.volces.com/api/v3). Released 2026-02-15.
-  // Pro = flagship multimodal, Lite = budget tier. Mini / Code subtiers
-  // are intentionally not listed (Mini is edge-only, Code is programming-
-  // specific; two tiers are enough for the chat main line).
-  // Volcengine Ark also supports user-defined endpoints (ep-xxxx) —
-  // those custom ids can be entered directly in the credential form to
-  // override.
-  doubao: [
-    { id: 'doubao-seed-2-0-pro-260215',  name: 'Doubao Seed 2.0 Pro' },
-    { id: 'doubao-seed-2-0-lite-260215', name: 'Doubao Seed 2.0 Lite' },
-  ],
-
-  // OpenRouter aggregator. Notes against pi-ai 0.73.0 (2026-05-06):
-  //   - openai/gpt-5.5 / 5.5-pro added; openai/gpt-5.3-codex dropped.
-  //   - anthropic/claude-sonnet-4.7 / haiku-4.7 and google/gemini-3.1-pro
-  //     (no -preview suffix) still aren't in pi-ai's generated registry —
-  //     keep using the real ids below.
-  //   - xiaomi/mimo-v2.5 series is now registered in pi-ai 0.73.0
-  //     (previously kept ahead-of-registry against OpenRouter /v1/models).
-  openrouter: [
-    { id: 'anthropic/claude-opus-4.7',      name: 'Claude Opus 4.7' },
-    { id: 'anthropic/claude-opus-4.6-fast', name: 'Claude Opus 4.6 Fast' },
-    { id: 'anthropic/claude-sonnet-4.6',    name: 'Claude Sonnet 4.6' },
-    { id: 'anthropic/claude-haiku-4.5',     name: 'Claude Haiku 4.5' },
-    { id: 'openai/gpt-5.5',                 name: 'GPT-5.5' },
-    { id: 'openai/gpt-5.5-pro',             name: 'GPT-5.5 Pro' },
-    { id: 'openai/gpt-5.4',                 name: 'GPT-5.4' },
-    { id: 'openai/gpt-5.4-pro',             name: 'GPT-5.4 Pro' },
-    { id: 'google/gemini-3.1-pro-preview',  name: 'Gemini 3.1 Pro (preview)' },
-    { id: 'google/gemini-3-pro-preview',    name: 'Gemini 3 Pro (preview)' },
-    { id: 'deepseek/deepseek-v4-pro',       name: 'DeepSeek V4 Pro' },
-    { id: 'deepseek/deepseek-v4-flash',     name: 'DeepSeek V4 Flash' },
-    { id: 'moonshotai/kimi-k2.6',           name: 'Kimi K2.6' },
-    { id: 'moonshotai/kimi-k2.5',           name: 'Kimi K2.5' },
-    { id: 'qwen/qwen3-max',                 name: 'Qwen3 Max' },
-    { id: 'qwen/qwen3-coder',               name: 'Qwen3 Coder' },
-    { id: 'z-ai/glm-5.1',                   name: 'GLM-5.1' },
-    { id: 'z-ai/glm-5',                     name: 'GLM-5' },
-    { id: 'minimax/minimax-m2.7',           name: 'MiniMax M2.7' },
-    { id: 'xiaomi/mimo-v2.5-pro',           name: 'Xiaomi MiMo V2.5 Pro' },
-    { id: 'xiaomi/mimo-v2.5',               name: 'Xiaomi MiMo V2.5' },
-  ],
-};
+export const CURATED_MODELS = DEFAULT_PROVIDER_MODELS;
 
 export function curatedModelsFor(providerId: string): { id: string; name: string }[] {
+  const configured = getConfiguredProviderModels(providerId);
+  if (configured) return configured.models;
   const list = CURATED_MODELS[providerId];
   return list ? list.map((m) => ({ id: m.id, name: m.name })) : [];
+}
+
+/**
+ * pi-ai catalog aliases for provider ids that are runtime surfaces, not raw
+ * catalog provider ids. The model metadata is still valid because the alias
+ * points to the same API protocol and base URL family.
+ */
+export const PI_MODEL_PROVIDER_ALIAS: Readonly<Record<string, string>> = {
+  'minimax-portal-cn': 'minimax-cn',
+  'minimax-portal':    'minimax',
+};
+
+export interface PiModelCatalogLike {
+  getPiModel(provider: string, modelId: string): Model<Api> | undefined;
+}
+
+export interface ConfiguredPiModelResolution {
+  model: Model<Api>;
+  requestedProviderId: string;
+  requestedModelId: string;
+  catalogProviderId: string;
+  templateModelId: string;
+  isConfiguredFallback: boolean;
+  needsCustomModel: boolean;
+}
+
+function safeGetPiModel(
+  catalog: PiModelCatalogLike,
+  providerId: string,
+  modelId: string,
+): Model<Api> | undefined {
+  try {
+    return catalog.getPiModel(providerId, modelId);
+  } catch {
+    return undefined;
+  }
+}
+
+function cloneModelWithId(template: Model<Api>, id: string, name: string): Model<Api> {
+  return {
+    ...template,
+    id,
+    name,
+    input: [...template.input],
+    cost: { ...template.cost },
+    ...(template.headers ? { headers: { ...template.headers } } : {}),
+    ...(template.thinkingLevelMap ? { thinkingLevelMap: { ...template.thinkingLevelMap } } : {}),
+  };
+}
+
+function modelFamilyKey(modelId: string): string {
+  return String(modelId || '')
+    .toLowerCase()
+    .replace(/^.+?\//, '')
+    .replace(/[:._]+/g, '-')
+    .split('-')
+    .filter((part) => part && !/^\d/.test(part))
+    .filter((part) => !/^(latest|preview|experimental|exp|early|beta|free)$/.test(part))
+    .join('-');
+}
+
+/**
+ * Resolve a model for runtime use.
+ *
+ * Server config may intentionally advertise a newly released model id before
+ * pi-ai has shipped it. For those cases, clone metadata from a configured,
+ * same-family model that pi-ai already knows and override only id/name. This
+ * keeps provider protocol, base URL, context defaults and payload handling in
+ * one place while letting model-version bumps ship via Server JSON.
+ */
+export function resolveConfiguredPiModel(
+  catalog: PiModelCatalogLike,
+  providerId: string,
+  modelId: string,
+): ConfiguredPiModelResolution | null {
+  const requestedProviderId = String(providerId || '').trim();
+  const requestedModelId = String(modelId || '').trim();
+  if (!requestedProviderId || !requestedModelId) return null;
+
+  const catalogProviderId = PI_MODEL_PROVIDER_ALIAS[requestedProviderId] || requestedProviderId;
+  const exact = safeGetPiModel(catalog, catalogProviderId, requestedModelId);
+  if (exact) {
+    return {
+      model: exact,
+      requestedProviderId,
+      requestedModelId,
+      catalogProviderId,
+      templateModelId: requestedModelId,
+      isConfiguredFallback: false,
+      needsCustomModel: catalogProviderId !== requestedProviderId,
+    };
+  }
+
+  const configuredModels = curatedModelsFor(requestedProviderId);
+  const configured = configuredModels.find((m) => m.id === requestedModelId);
+  if (!configured) return null;
+
+  const requestedFamily = modelFamilyKey(requestedModelId);
+  const candidates = configuredModels
+    .filter((m) => m.id !== requestedModelId)
+    .filter((m) => requestedFamily && modelFamilyKey(m.id) === requestedFamily);
+
+  for (const candidate of candidates) {
+    const template = safeGetPiModel(catalog, catalogProviderId, candidate.id);
+    if (!template) continue;
+    return {
+      model: cloneModelWithId(template, requestedModelId, configured.name || requestedModelId),
+      requestedProviderId,
+      requestedModelId,
+      catalogProviderId,
+      templateModelId: candidate.id,
+      isConfiguredFallback: true,
+      needsCustomModel: true,
+    };
+  }
+
+  return null;
 }
 
 // ── Labels for providers outside CATALOG ────────────────────────────────
@@ -391,38 +377,26 @@ export const EXTERNAL_API_PROVIDERS: readonly string[] = ['moonshot', 'deepseek'
 // Adding a new provider: add an entry here AND a matching adapter in
 // `features/image_gen.ts::dispatchImageGen`.
 
-export interface ImageGenCapability {
-  /** Fixed model id passed to the provider's image API. NOT user-overridable
-   *  and NOT shown in any dropdown. */
-  model: string;
-  /** Which adapter in features/image_gen.ts handles the HTTP call. */
-  api: 'openai' | 'gemini' | 'doubao';
-  /** Whether the model accepts reference images for editing/variations. */
-  supportsEdit: boolean;
-}
+export type ImageGenCapability = ConfigImageGenCapability;
 
-export const IMAGE_GEN_BY_PROVIDER: Readonly<Record<string, ImageGenCapability>> = {
-  // OpenAI GPT Image 2 (released 2026-04-21; HTTP interface is fully
-  // compatible with gpt-image-1 and still uses /v1/images/generations +
-  // /v1/images/edits).
-  openai: { model: 'gpt-image-2',                     api: 'openai', supportsEdit: true },
-  // Google Nano Banana 2 = `gemini-3.1-flash-image-preview` (the -preview
-  // suffix is part of the official model id and must not be stripped).
-  // The Pro variant is Nano Banana Pro (`gemini-3-pro-image-preview`); we
-  // currently only ship Flash — better balance of speed and cost.
-  google: { model: 'gemini-3.1-flash-image-preview',  api: 'gemini', supportsEdit: true },
-  // Volcengine Ark Seedream 4.5 (doubao-seedream-4-5-251128, production
-  // 2025-11-28). OpenAI-compatible images endpoint
-  // (POST /api/v3/images/generations); text-to-image, image-to-image and
-  // multi-image composition all share this endpoint — without an `image`
-  // field in the body it's text-to-image, with `image: string | string[]`
-  // (URL or data URI) it's image-to-image. The old
-  // seedream-3-0-t2i-250415 has been retired (404).
-  doubao: { model: 'doubao-seedream-4-5-251128',      api: 'doubao', supportsEdit: true },
-};
+export const IMAGE_GEN_BY_PROVIDER = DEFAULT_IMAGE_GEN_BY_PROVIDER;
 
-export function findImageGenCapability(providerId: string): ImageGenCapability | null {
-  return IMAGE_GEN_BY_PROVIDER[providerId] || null;
+export function findImageGenCapability(providerId: string): ConfigImageGenCapability | null {
+  const base = IMAGE_GEN_BY_PROVIDER[providerId] || null;
+  const configured = getConfiguredImageGenCapability(providerId);
+  if (!configured) return base;
+  if (!base) {
+    if (!configured.model || !configured.api) return null;
+    return {
+      model: configured.model,
+      api: configured.api,
+      supportsEdit: configured.supportsEdit === true,
+    };
+  }
+  return {
+    ...base,
+    ...configured,
+  };
 }
 
 /**

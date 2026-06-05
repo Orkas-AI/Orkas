@@ -1,7 +1,7 @@
 /**
  * Build a chronological activity transcript for reflection.
  *
- * Replaces `reflection-digest.ts` per `docs/plans/reflection-redesign.md`.
+ * Replaces `reflection-digest.ts` per `Common/docs/plans/reflection-redesign.md`.
  * Reads the target agent's recent conversations, time-interleaves user
  * voice (from gconv) with agent replies (from gmember), injects four
  * system-event signal types (retry / skip / form_left_blank / silence),
@@ -16,7 +16,8 @@
  */
 
 import * as fs from 'node:fs';
-import { userSessionFile } from '../paths';
+import * as path from 'node:path';
+import { userSessionFile, userSessionsDir } from '../paths';
 import { createLogger } from '../logger';
 import { listConversations, type Conversation } from './chats';
 import { buildGmemberSessionId } from './group_chat/state';
@@ -42,6 +43,41 @@ export function estimateTokens(text: string): number {
   const cjkChars = (text.match(/[一-鿿぀-ヿ가-힯]/g) || []).length;
   const otherChars = text.length - cjkChars;
   return Math.ceil(cjkChars * 0.7 + otherChars / 4);
+}
+
+// ── Filesystem-based agent participation discovery ──────────────────────
+
+/** Find all `gmember-<cid>-<agentId>.jsonl` files on disk and return
+ *  `(cid, filepath)` for each. Bypasses `conv.agent_id` (the UI hint
+ *  "starting agent") to catch convs the agent was dispatched into via
+ *  `plan_set` — a real blind spot of the previous reflection design.
+ *
+ *  Returns empty when the sessions directory doesn't exist (fresh install
+ *  / freshly-switched uid). Used both for transcript building and for the
+ *  orchestrator's dirty-gate mtime probe.
+ *
+ *  Filename parsing uses `startsWith` + `endsWith` (not split-on-'-')
+ *  because cids may contain dashes (UUID-shaped). `agentId` is a
+ *  server-issued / `safeId`-validated identifier — no regex escape needed. */
+export function listAgentGmemberFiles(
+  uid: string,
+  agentId: string,
+): Array<{ cid: string; file: string }> {
+  if (!agentId) return [];
+  let dir: string;
+  try { dir = userSessionsDir(uid); } catch { return []; }
+  let names: string[];
+  try { names = fs.readdirSync(dir); } catch { return []; }
+  const prefix = 'gmember-';
+  const suffix = `-${agentId}.jsonl`;
+  const out: Array<{ cid: string; file: string }> = [];
+  for (const name of names) {
+    if (!name.startsWith(prefix) || !name.endsWith(suffix)) continue;
+    const cid = name.slice(prefix.length, -suffix.length);
+    if (!cid) continue;
+    out.push({ cid, file: path.join(dir, name) });
+  }
+  return out;
 }
 
 // ── Internal types ──────────────────────────────────────────────────────
@@ -220,10 +256,30 @@ export async function buildTranscript(
     return _empty();
   }
 
-  const matched = convs.filter((c) => {
-    const a = c.agent_id || '';
-    return isDefault ? !a : a === agentId;
-  });
+  // Cid → conv metadata lookup for both branches.
+  const convsMap = new Map<string, Conversation>();
+  for (const c of convs) convsMap.set(c.conversation_id, c);
+
+  let matched: Conversation[];
+  if (isDefault) {
+    // _default = commander-only convs (no agent bound). These have no
+    // gmember files; the gconv session is both user voice and "agent" reply.
+    matched = convs.filter((c) => !c.agent_id);
+  } else {
+    // Specific agent: filesystem-scan gmember files to find every conv the
+    // agent actually ran in — including ones it was dispatched into via
+    // plan_set where conv.agent_id != agentId. Orphan gmember files (conv
+    // deleted but sessions_sweep hasn't run) are skipped silently — sweep
+    // cleans them on next activateUser.
+    matched = [];
+    let orphans = 0;
+    for (const { cid } of listAgentGmemberFiles(uid, agentId)) {
+      const conv = convsMap.get(cid);
+      if (conv) matched.push(conv);
+      else orphans += 1;
+    }
+    if (orphans > 0) log.debug(`buildTranscript: ${orphans} orphan gmember file(s) for agent=${agentId} (conv deleted, awaiting sweep)`);
+  }
   if (!matched.length) return _empty();
 
   // Single signal query covers the whole window; we partition by cid below.

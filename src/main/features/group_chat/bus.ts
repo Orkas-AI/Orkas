@@ -37,7 +37,8 @@ import {
 import {
   resolveRecipients, parseMentions, buildMention,
   extractFormFromFinal, computeFormId, ChatFormPayload,
-  extractAgentFieldBlocks, extractSkillContainers, decodeSubmission,
+  extractPlanInteractionFromFinal, extractAgentFieldBlocks, extractSkillContainers, decodeSubmission,
+  type PlanInteractionStatus,
 } from './router';
 import * as skillsFeat from '../skills';
 import {
@@ -47,7 +48,7 @@ import {
 import * as planExecutor from './plan_executor';
 import {
   userChatsDir, userSkillsDir, userAgentsDir,
-  userMarketplaceSkillsDir, userMarketplaceAgentsDir, projectFilesDir,
+  userMarketplaceSkillsDir, userMarketplaceAgentsDir,
 } from '../../paths';
 import * as agentsFeat from '../agents';
 import { isAgentEnabled } from '../component_enabled';
@@ -55,6 +56,13 @@ import { buildLanguageDirective, descriptionLang, t } from '../../i18n';
 import * as marketplaceFeat from '../marketplace';
 import { readInstalls } from '../marketplace_installs';
 import { createSkillTurnBuffer, onAgentTurnEnd, onUserMessage } from '../expert_signals/turn_hooks';
+import {
+  compactPromptDescription,
+  listSkillSpecs,
+  resolveSkillAllowlistRefs,
+  type SkillAllowlistRef,
+} from '../../model/core-agent/skill-registry';
+import { buildRuntimeDatetimeBlock } from '../../prompts/runtime_context';
 
 const log = createLogger('group_chat.bus');
 
@@ -68,6 +76,73 @@ function escapeHtmlForBubble(s: string): string {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+function _normaliseSkillMentionText(s: string): string {
+  return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function _hasSkillUseIntent(text: string): boolean {
+  return /(?:使用|调用|運行|运行|执行|use|run|call|execute)/i.test(text);
+}
+
+function _escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function _workflowMentionsSkill(workflow: string, spec: SkillAllowlistRef): boolean {
+  const hay = String(workflow || '').toLowerCase();
+  const refs = [spec.id, spec.name].filter((v): v is string => typeof v === 'string' && !!v.trim());
+  for (const ref of refs) {
+    const needle = ref.toLowerCase().trim();
+    if (!needle) continue;
+    if (/^[a-z0-9_.-]+$/i.test(needle)) {
+      const re = new RegExp(`(^|[^a-z0-9_.-])${_escapeRe(needle)}(?=$|[^a-z0-9_.-])`, 'i');
+      if (re.test(hay)) return true;
+    } else if (hay.includes(needle)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function _runtimeSkillListForAgent(agent: agentsFeat.Agent): Promise<string[]> {
+  const workflow = String(agent.workflow || '');
+  if (!workflow.trim()) return [];
+  const specs = await listSkillSpecs().catch((err) => {
+    log.warn(`skill workflow filter list failed agent=${agent.agent_id}: ${(err as Error).message}`);
+    return [] as SkillAllowlistRef[];
+  });
+  if (!specs.length) return [];
+  const refs = Array.isArray(agent.skill_list) ? agent.skill_list : specs.map((s) => s.id);
+  if (!refs.length) return [];
+  const allowedIds = new Set(resolveSkillAllowlistRefs(specs, refs).ids);
+  return specs
+    .filter((s) => allowedIds.has(s.id) && _workflowMentionsSkill(workflow, s))
+    .map((s) => s.id);
+}
+
+async function _findDisabledSkillUseRequest(uid: string, text: string):
+  Promise<{ id: string; name: string } | null> {
+  if (!_hasSkillUseIntent(text)) return null;
+  let skills: skillsFeat.SkillListing[];
+  try {
+    skills = await skillsFeat.listSkills();
+  } catch (err) {
+    log.warn(`disabled skill request scan failed uid=${uid}: ${(err as Error).message}`);
+    return null;
+  }
+  const haystack = _normaliseSkillMentionText(text);
+  for (const skill of skills) {
+    if (skill.enabled !== false) continue;
+    const needles = [skill.id, skill.name]
+      .map((s) => _normaliseSkillMentionText(s))
+      .filter((s, idx, arr) => s.length >= 2 && arr.indexOf(s) === idx);
+    if (needles.some((needle) => haystack.includes(needle))) {
+      return { id: skill.id, name: skill.name || skill.id };
+    }
+  }
+  return null;
 }
 
 /** Render a quality-validator rejection as a friendly user warning followed
@@ -115,15 +190,15 @@ export type GroupEvent =
    * a tool-emitted mid-turn message wrongly consumes commander's placeholder
    * and a NEW placeholder gets recreated by post-tool process events, ending
    * up as a stuck "thinking" bubble when commander's turn ends silently. */
-  | { type: 'message'; cid: string; msg: GroupMessage; turn_end?: boolean }
-  | { type: 'process'; cid: string; actor: string; data: Record<string, unknown> }
+  | { type: 'message'; cid: string; msg: GroupMessage; turn_end?: boolean; turn_id?: string }
+  | { type: 'process'; cid: string; actor: string; turn_id?: string; data: Record<string, unknown> }
   /** A `create_artifact` tool call finished writing its bundle. The final
    * end-of-turn message still carries `msg.artifacts` for persistence; this
    * live event lets the renderer mount the iframe immediately instead of
    * waiting for the whole actor turn to finish. */
-  | { type: 'artifact_created'; cid: string; actor: string; artifact: { id: string; title: string; agent_id: string } }
+  | { type: 'artifact_created'; cid: string; actor: string; turn_id?: string; artifact: { id: string; title: string; agent_id: string } }
   | { type: 'plan_changed'; cid: string }
-  | { type: 'state_changed'; cid: string; state: Awaited<ReturnType<typeof readState>> }
+  | { type: 'state_changed'; cid: string; state: Awaited<ReturnType<typeof readState>>; active_turns?: ActiveTurn[] }
   | { type: 'member_joined'; cid: string; actor: Actor }
   | { type: 'aborted'; cid: string }
   /** Sent when an actor's turn ended without producing a persisted message
@@ -131,13 +206,22 @@ export type GroupEvent =
    * placeholder bubble for that actor. Layered on top of `turn_end` flag —
    * the flag handles "consume only on my own end-of-turn", `turn_silent`
    * handles "I had no end-of-turn message at all". */
-  | { type: 'turn_silent'; cid: string; actor: string };
+  | { type: 'turn_silent'; cid: string; actor: string; turn_id?: string };
 
 export type GroupListener = (ev: GroupEvent) => void;
+
+export interface ActiveTurn {
+  actor: string;
+  turn_id: string;
+}
 
 // ── Per-cid state ────────────────────────────────────────────────────────
 
 interface QueueItem {
+  /** Stable identity for exactly one actor execution. Renderer placeholders,
+   * process events, final messages and silent-turn cleanup all use this key
+   * instead of actor id so a later turn cannot re-adopt an older bubble. */
+  turnId: string;
   msgId: string;
   fromActorId: string;
   /** Composed runtime payload — what the worker actually feeds the LLM,
@@ -161,7 +245,7 @@ interface QueueItem {
   /** Plan-executor stamp: the plan step (1-based index) whose dispatch
    * created this turn. When the turn ends, `plan_executor.reconcile` uses
    * this to mark exactly THAT step as done (no actor-id guessing). `-1`
-   * marks plan-complete synthesis turns where no individual step terminates. */
+   * marks plan-complete fallback turns where no individual step terminates. */
   triggered_step?: number;
 }
 
@@ -174,6 +258,11 @@ interface WorkerState {
   /** Pending wake promise — resolved on enqueue to break the await. */
   wake: (() => void) | null;
   abortController: AbortController | null;
+  /** QueueItem.turnId currently owned by this worker, while `running=true`. */
+  currentTurnId: string | null;
+  /** Monotonic per-conversation order stamped when the worker claims a turn.
+   * Keeps `active_turns` in execution-start order instead of worker Map order. */
+  currentTurnOrder: number | null;
   turnsThisActivation: number;
   /** Set by `dropConv` so the worker loop can exit cleanly instead of
    * blocking forever on `wake` after the cid state is gone. */
@@ -213,6 +302,7 @@ interface CidState {
    * upstream waiters (IPC stream / waitForQuiescent in tests) don't
    * declare the bus done in the gap. */
   pendingEnqueues: number;
+  nextTurnOrder: number;
   /** Absolute paths written by any actor in THIS conversation since the
    *  bus was loaded. Feeds the write-tools' uniquify `isMine` predicate
    *  so refining a file across turns overwrites in place — the LLM's
@@ -224,7 +314,31 @@ interface CidState {
   producedPaths: Set<string>;
 }
 
-const _cids = new Map<string, CidState>();
+/**
+ * Per-cid in-memory state (workers, listeners, producedPaths, …).
+ *
+ * Pinned on `globalThis` under a `Symbol.for` key so that **all** module
+ * instances of this file share one Map. **Why** this file gets loaded more
+ * than once: in the Electron runtime everything goes through tsx/cjs and we
+ * end up with a single CJS instance — fine. But under vitest, this file is
+ * loaded as ESM by tests (`await import('.../bus')`) AND as CJS by
+ * `chats.ts` (`require('./group_chat/bus')`, see the comment in that file).
+ * Two instances means two separate `_cids` Maps; an enqueue on one side and
+ * a dropConv on the other would silently target different state — the bug
+ * `0268bce7` fixed at the IPC + plan-executor wiring layer, surfacing again
+ * here for the test's bus state assertions.
+ *
+ * The `??=` keeps the FIRST instance's Map authoritative; subsequent loads
+ * just rebind their module-local `_cids` to that same Map.
+ *
+ * **Convention for future bus.ts contributors**: any new module-level state
+ * with cross-cid identity (Maps, Sets, registries that must agree across
+ * loaders) MUST follow the same pattern. Plain `const x = new Map()` will
+ * re-introduce the dual-instance bug class for that new state.
+ */
+const _BUS_CIDS_KEY = Symbol.for('orkas.group_chat.bus._cids');
+const _cids: Map<string, CidState> =
+  ((globalThis as any)[_BUS_CIDS_KEY] ??= new Map<string, CidState>());
 
 function cidKey(uid: string, cid: string): string { return `${uid}:${cid}`; }
 
@@ -237,6 +351,7 @@ function getOrInitCid(uid: string, cid: string): CidState {
       workers: new Map(),
       listeners: new Set(),
       pendingEnqueues: 0,
+      nextTurnOrder: 0,
       producedPaths: new Set(),
     };
     _cids.set(k, s);
@@ -254,6 +369,26 @@ function emit(state: CidState, ev: GroupEvent): void {
   for (const l of state.listeners) {
     try { l(ev); } catch (err) { log.warn(`listener threw: ${(err as Error).message}`); }
   }
+}
+
+function activeTurnsForState(state: CidState): ActiveTurn[] {
+  const turns: Array<ActiveTurn & { order: number }> = [];
+  for (const [, w] of state.workers) {
+    if (w.running && w.currentTurnId) {
+      turns.push({ actor: w.actor.id, turn_id: w.currentTurnId, order: w.currentTurnOrder || 0 });
+    }
+  }
+  turns.sort((a, b) => a.order - b.order);
+  return turns.map(({ actor, turn_id }) => ({ actor, turn_id }));
+}
+
+async function emitStateChanged(state: CidState): Promise<void> {
+  emit(state, {
+    type: 'state_changed',
+    cid: state.cid,
+    state: await readState(state.uid, state.cid),
+    active_turns: activeTurnsForState(state),
+  });
 }
 
 /** True when nobody's running, every actor's queue is empty, AND no
@@ -279,9 +414,9 @@ export function isQuiescent(uid: string, cid: string): boolean {
   return true;
 }
 
-export function runtimeSnapshot(uid: string, cid: string): { processing: boolean; inFlight: string[] } {
+export function runtimeSnapshot(uid: string, cid: string): { processing: boolean; inFlight: string[]; activeTurns: ActiveTurn[] } {
   const s = _cids.get(cidKey(uid, cid));
-  if (!s) return { processing: false, inFlight: [] };
+  if (!s) return { processing: false, inFlight: [], activeTurns: [] };
   const inFlight: string[] = [];
   for (const [, w] of s.workers) {
     if (w.running) inFlight.push(w.actor.id);
@@ -289,6 +424,7 @@ export function runtimeSnapshot(uid: string, cid: string): { processing: boolean
   return {
     processing: !isQuiescent(uid, cid),
     inFlight,
+    activeTurns: activeTurnsForState(s),
   };
 }
 
@@ -307,7 +443,12 @@ async function _syncStateStatus(state: CidState, forceRunning = false): Promise<
     return want;
   });
   if (result.changed) {
-    emit(state, { type: 'state_changed', cid: state.cid, state: result.state });
+    emit(state, {
+      type: 'state_changed',
+      cid: state.cid,
+      state: result.state,
+      active_turns: activeTurnsForState(state),
+    });
   }
 }
 
@@ -369,6 +510,10 @@ export interface EnqueueParams {
    * first mid-turn message wrongly consumes the placeholder and post-tool
    * process events recreate a new one that ends up stuck. */
   turn_end?: boolean;
+  /** QueueItem.turnId for the actor execution that produced this official
+   * end-of-turn message. Renderer uses it to finalize the exact placeholder
+   * that collected this turn's process / delta events. */
+  turn_id?: string;
   /** Mark this message as an internal plan-step dispatch (commander →
    * agent, fired by plan_executor). Persists for the agent's slice but the
    * renderer hides it from the user view — the plan announcement already
@@ -670,7 +815,13 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   const allActorIds = new Set<string>([fromActorId, ...to, ...members.actors.map((a) => a.id)]);
   await appendVisible(uid, cid, sliceMsg, Array.from(allActorIds));
 
-  emit(state, { type: 'message', cid, msg, ...(params.turn_end ? { turn_end: true } : {}) });
+  emit(state, {
+    type: 'message',
+    cid,
+    msg,
+    ...(params.turn_end ? { turn_end: true } : {}),
+    ...(params.turn_id ? { turn_id: params.turn_id } : {}),
+  });
   log.info(`enqueue user=${uid} cid=${cid} msg=${msgId} from=${fromActorId} to=${to.join(',')} len=${rewrittenText.length}${params.turn_end ? ' turn_end=1' : ''}${unknown.length ? ` unknown=${unknown.join(',')}` : ''}`);
 
   // Dispatch to non-user recipients.
@@ -688,6 +839,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     }
     const w = ensureWorker(state, actor);
     w.queue.push({
+      turnId: genId12(),
       msgId,
       fromActorId,
       llmPayload: composeLlmTurnPayload(fromActorId, msg),
@@ -805,7 +957,7 @@ function ensureWorker(state: CidState, actor: Actor): WorkerState {
   const w: WorkerState = {
     uid: state.uid, cid: state.cid, actor,
     queue: [], running: false, wake: null,
-    abortController: null, turnsThisActivation: 0,
+    abortController: null, currentTurnId: null, currentTurnOrder: null, turnsThisActivation: 0,
     terminated: false,
   };
   state.workers.set(actor.id, w);
@@ -846,11 +998,15 @@ async function runWorkerLoop(state: CidState, w: WorkerState): Promise<void> {
     // would break out before the cascade finished. Owning running here
     // means it spans the WHOLE turn lifecycle.
     w.running = true;
+    w.currentTurnId = item.turnId;
+    w.currentTurnOrder = ++state.nextTurnOrder;
     try {
       await runTurn(state, w, item);
     } catch (err) {
       log.error(`worker turn failed cid=${w.cid} actor=${w.actor.id}: ${(err as Error).message}`);
     } finally {
+      w.currentTurnId = null;
+      w.currentTurnOrder = null;
       w.running = false;
     }
     w.turnsThisActivation += 1;
@@ -883,8 +1039,8 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   w.abortController = new AbortController();
   await _syncStateStatus(state, /*forceRunning*/ true);
   await markInFlight(uid, cid, actor.id, true);
-  emit(state, { type: 'state_changed', cid, state: await readState(uid, cid) });
-  log.info(`turn-start user=${uid} cid=${cid} actor=${actor.id} kind=${actor.kind} fromMsg=${item.msgId} from=${item.fromActorId}`);
+  await emitStateChanged(state);
+  log.info(`turn-start user=${uid} cid=${cid} actor=${actor.id} kind=${actor.kind} turn=${item.turnId} fromMsg=${item.msgId} from=${item.fromActorId}`);
 
   const sessionId = actorSessionId(cid, actor);
   const isCommander = actor.kind === 'commander';
@@ -923,11 +1079,6 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       log.warn(`resolve project scope cid=${cid} pid=${turnProjectId}: ${(err as Error).message}`);
     }
   }
-  const turnProjectFilesRoot = turnProjectId ? projectFilesDir(uid, turnProjectId) : '';
-  const turnProjectFilesSystemBlock = turnProjectId
-    ? await buildProjectFilesSystemBlock(uid, cid, turnProjectId)
-    : '';
-
   // First-turn replay: if the persistent session jsonl doesn't exist yet,
   // prepend a `<group-chat-history>` block built from the visibility slice
   // so the agent / commander has context. After the first turn, the
@@ -947,12 +1098,10 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
 
   // Attach a `<attachments>` manifest block listing files uploaded on this
   // user turn (text / pdf / docx / image with absolute paths + kinds).
-  // Project files are shared conversation context, so they live in the
-  // system prompt's runtime injection block instead of being prepended to
-  // the user message. Image bytes ride alongside via ChatOptions.images so
-  // the vision model sees them on the same user turn — the manifest entry
-  // carries `attached="inline"` so the LLM doesn't waste a read_file
-  // round-trip re-fetching what it already has.
+  // Library files are intentionally not path-injected; use kb_search/kb_read.
+  // Image bytes ride alongside via ChatOptions.images so the vision model sees
+  // them on the same user turn — the manifest entry carries `attached="inline"`
+  // so the LLM doesn't waste a read_file round-trip re-fetching what it already has.
   let turnImages: Array<{ data: string; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' }> = [];
   if (item.attachments && item.attachments.length) {
     try {
@@ -965,6 +1114,29 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     }
   }
 
+  if (isCommander && item.fromActorId === USER_ID) {
+    const disabledSkill = await _findDisabledSkillUseRequest(uid, item.llmPayload);
+    if (disabledSkill) {
+      const reply = `<span style="color:var(--danger)">${escapeHtmlForBubble(t('component.skill_disabled_request', { name: disabledSkill.name || disabledSkill.id }))}</span>`;
+      log.info(`blocked disabled skill request cid=${cid} skill=${disabledSkill.id}`);
+      w.abortController = null;
+      await markInFlight(uid, cid, actor.id, false);
+      await emitStateChanged(state);
+      await enqueue({
+        uid, cid,
+        fromActorId: actor.id,
+        text: reply,
+        forceTo: [USER_ID],
+        turn_end: true,
+        turn_id: item.turnId,
+        ...(typeof item.triggered_step === 'number' ? { triggered_step: item.triggered_step } : {}),
+      });
+      await _syncStateStatus(state);
+      log.info(`turn-end user=${uid} cid=${cid} actor=${actor.id} ms=${Date.now() - turnStartedAt} outcome=disabled_skill_request`);
+      return;
+    }
+  }
+
   // Build system prompt + extra tools per role.
   let systemPrompt: string;
   let extraTools: AgentTool[] = [];
@@ -973,8 +1145,9 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // extraTools — the LLM stream is replaced below by `runCliAgentTurn`.
   // Hoisted here so the branch below can read it without re-fetching.
   let cliAgent: import('../agents').Agent | null = null;
+  let actorInteractive = false;
   if (isCommander) {
-    systemPrompt = await buildCommanderSystemPrompt(uid, cid, turnProjectScope?.agents ?? null, turnProjectFilesSystemBlock);
+    systemPrompt = await buildCommanderSystemPrompt(uid, cid, turnProjectScope?.agents ?? null);
     extraTools = await buildCommanderExtraTools(state, w, item.attachments);
     // skillList stays undefined for commander — every skill is globally
     // visible (skills are NOT project-scoped this round; see CLAUDE.md §6).
@@ -997,24 +1170,25 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
         text: errBubble,
         forceTo: [USER_ID],
         turn_end: true,
+        turn_id: item.turnId,
         ...(typeof item.triggered_step === 'number' ? { triggered_step: item.triggered_step } : {}),
       });
       await markInFlight(uid, cid, actor.id, false);
-      emit(state, { type: 'state_changed', cid, state: await readState(uid, cid) });
+      await emitStateChanged(state);
       // Note: runWorkerLoop owns w.running — its finally clears the flag
       // when this returns. We DON'T touch it here.
       return;
     }
+    actorInteractive = agent.interactive === true;
     if (agentsFeat.isCliAgent(agent)) {
       cliAgent = agent;
       systemPrompt = ''; // unused on CLI path
     } else {
-      systemPrompt = await buildAgentInGroupSystemPrompt(uid, agent, workingDir, turnProjectFilesSystemBlock);
-      // Pass agent.skill_list verbatim — it carries System A + System B
-      // ids the agent owns. Skills are NOT project-scoped this round
-      // (see CLAUDE.md §6); the runner's `projectAllowedSkillIds` hook is
-      // preserved for future re-enable but bus does not pass it.
-      skillList = Array.isArray(agent.skill_list) ? agent.skill_list : undefined;
+      systemPrompt = await buildAgentInGroupSystemPrompt(uid, agent, workingDir);
+      // Runtime skills are the intersection of the agent's whitelist and
+      // workflow references. A broad whitelist is authoring metadata; only
+      // skills the workflow actually names should reach the prompt.
+      skillList = await _runtimeSkillListForAgent(agent);
     }
   }
 
@@ -1052,6 +1226,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       type: 'artifact_created',
       cid,
       actor: actor.id,
+      turn_id: item.turnId,
       artifact: { id: a.id, title: a.title, agent_id: actor.id },
     });
   };
@@ -1165,9 +1340,16 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
           // bubble (token-by-token); other shapes feed the process
           // rail. Renderer dispatch lives in conversation.js process
           // event handler — see `data.type === 'delta'` branch.
-          emit(state, { type: 'process', cid, actor: actor.id, data: data as unknown as Record<string, unknown> });
+          emit(state, {
+            type: 'process',
+            cid,
+            actor: actor.id,
+            turn_id: item.turnId,
+            data: data as unknown as Record<string, unknown>,
+          });
         },
       });
+      for (const p of cliOut.produced || []) onFileWritten(p);
       finalText = cliOut.text;
       streamingText = cliOut.text;
       if (cliOut.error) errText = cliOut.error;
@@ -1178,7 +1360,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     } finally {
       w.abortController = null;
       await markInFlight(uid, cid, actor.id, false);
-      emit(state, { type: 'state_changed', cid, state: await readState(uid, cid) });
+      await emitStateChanged(state);
     }
   } else {
   try {
@@ -1191,6 +1373,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       agentName: 'orkas_chat',
       ...(actor.kind === 'agent' ? { agentId: actor.id } : {}),
       cid,
+      turnId: item.turnId,
       ...(turnProjectId ? { projectId: turnProjectId } : {}),
       onFileWritten,
       hasProducedPath,
@@ -1200,7 +1383,6 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       cacheRetention: 'short',
       abortSignal: w.abortController.signal,
       readOnlyExtraRoots: [
-        ...(turnProjectFilesRoot ? [turnProjectFilesRoot] : []),
         ...skillRoots,
         ...agentRoots,
       ],
@@ -1225,6 +1407,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
         activityEvents += 1;
         emit(state, {
           type: 'process', cid, actor: actor.id,
+          turn_id: item.turnId,
           data: ev as unknown as Record<string, unknown>,
         });
       } else if (ev.type === 'error') {
@@ -1248,6 +1431,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
         }
         emit(state, {
           type: 'process', cid, actor: actor.id,
+          turn_id: item.turnId,
           data: ev as unknown as Record<string, unknown>,
         });
       }
@@ -1274,7 +1458,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     // touch status (status is owned by _syncStateStatus, which runs after
     // the post-turn enqueue below — until then we're still 'running' from
     // the worker's perspective).
-    emit(state, { type: 'state_changed', cid, state: await readState(uid, cid) });
+    await emitStateChanged(state);
   }
   } // end LLM branch (paired with `if (cliAgent) { ... } else {` above)
 
@@ -1284,8 +1468,17 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // failed) live in plan_executor.onTurnFinished.
   let workingText = finalText || '';
   let form: ChatFormPayload | undefined;
+  let planInteraction: PlanInteractionStatus | undefined;
   const createdAgents: Array<{ agent_id: string; name: string; kind: 'created' | 'updated' }> = [];
   const createdSkills: Array<{ skill_id: string; name: string; kind: 'created' | 'updated' }> = [];
+
+  if (actor.kind === 'agent' && actorInteractive && workingText) {
+    const pi = extractPlanInteractionFromFinal(workingText);
+    if (pi.status) {
+      workingText = pi.cleanText;
+      planInteraction = pi.status;
+    }
+  }
 
   if (actor.kind === 'agent' && workingText) {
     const r = extractFormFromFinal(workingText, actor.id);
@@ -1460,6 +1653,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       errText,
       aborted,
       ...(form ? { form } : {}),
+      ...(planInteraction ? { planInteraction } : {}),
       produced,
       ...(createdAgents.length ? { createdAgents } : {}),
       ...(createdSkills.length ? { createdSkills } : {}),
@@ -1479,6 +1673,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       ...(createdSkills.length ? { createdSkills } : {}),
     };
   }
+  const transitionedPlanStep = outcome.planTransition?.step_index;
 
   // Merge a staged plan announcement into commander's end-of-turn message
   // so the thinking rail (placeholder) and the plan card finalize into a
@@ -1601,7 +1796,19 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       // this flag, mid-turn tool-emitted messages (plan_executor's
       // dispatch) would also wrongly consume the placeholder.
       turn_end: true,
+      turn_id: item.turnId,
     });
+    if (typeof transitionedPlanStep === 'number') {
+      try {
+        await planExecutor.recordPersistedStepMessage(uid, cid, transitionedPlanStep, {
+          id: persistedMsg.id,
+          text: persistedMsg.text || '',
+          files: persistedMsg.produced || [],
+        });
+      } catch (err) {
+        log.warn(`plan-step output message backfill failed cid=${cid} step=${transitionedPlanStep}: ${(err as Error).message}`);
+      }
+    }
   } else if (outcome.kind === 'silent') {
     // outcome=silent → bus is NOT going to enqueue a message for this turn.
     // Any placeholder the renderer parked for this actor (e.g. a fresh one
@@ -1609,7 +1816,18 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     // by a mid-turn message) needs an explicit signal to clean up; otherwise
     // a "thinking + process info" bubble lingers, vanishing only on
     // page refresh.
-    emit(state, { type: 'turn_silent', cid, actor: actor.id });
+    emit(state, { type: 'turn_silent', cid, actor: actor.id, turn_id: item.turnId });
+  }
+
+  // Reconcile only after this turn has fully settled in chat history. This
+  // keeps downstream plan dispatches and any completion fallback from
+  // creating live placeholders before the step's own final message appears.
+  if (typeof transitionedPlanStep === 'number') {
+    try {
+      await planExecutor.reconcileAfterStepTransition(uid, cid);
+    } catch (err) {
+      log.warn(`post-persist plan reconcile failed cid=${cid} step=${transitionedPlanStep}: ${(err as Error).message}`);
+    }
   }
 
   // Deferred plan dispatch: if commander wrote a fresh plan via `plan_set`
@@ -1713,11 +1931,8 @@ async function buildCommanderSystemPrompt(
   uid: string,
   cid: string,
   allowedAgentIds?: readonly string[] | null,
-  projectFilesBlock = '',
 ): Promise<string> {
   const { prompts } = await import('../../prompts/loader');
-  const path_ = await import('node:path');
-  const paths_ = await import('../../paths');
   const plan = await readPlan(uid, cid);
   const allAgentsList = await buildAgentsIndexBlock(uid, allowedAgentIds);
   const { getConversationWorkspacePath } = await import('./conv_workspace');
@@ -1725,7 +1940,7 @@ async function buildCommanderSystemPrompt(
   const permState = (() => {
     try {
       const s = require('../permissions').getLocalExecState() as { granted: boolean };
-      return s.granted ? '**Granted** (free to execute)' : '**Not granted** (the user must enable it under "Settings → Local execution")';
+      return s.granted ? '**Granted** (write/execute tools available)' : '**Not granted** (the user must enable it under "Settings → Tool Execution Access")';
     } catch { return '**Not granted**'; }
   })();
   // Stable sections first (cache-friendly), runtime injection last.
@@ -1739,28 +1954,15 @@ async function buildCommanderSystemPrompt(
   // recreate the cross-section path-constants design that mis-fires under
   // training-prior layouts.
   const main = prompts.load('chat_commander', {
-    contexts_dir: path_.resolve(paths_.userContextsDir(uid)),
     agents_index: allAgentsList,
     plan_state: formatPlanForPrompt(plan),
     os: process.platform === 'darwin' ? 'macOS' : process.platform === 'win32' ? 'Windows' : process.platform,
     working_dir: workingDir,
     local_exec_state: permState,
-    project_files_block: projectFilesBlock,
+    output_format_hint: buildOutputFormatHint('auto'),
   });
   const shared = prompts.load('chat_shared_rules', {});
   return appendLanguageDirective(concatSharedRules(main, shared));
-}
-
-async function buildProjectFilesSystemBlock(uid: string, cid: string, projectId: string): Promise<string> {
-  try {
-    const projectFileFeature = await import('../project_files');
-    const manifest = await projectFileFeature.buildProjectFilesManifest(uid, projectId);
-    if (!manifest) return '';
-    return `### Project files\n\n${manifest}`;
-  } catch (err) {
-    log.warn(`project files system block failed cid=${cid} pid=${projectId}: ${(err as Error).message}`);
-    return '';
-  }
 }
 
 /** Merge shared_rules into the per-role prompt. The shared block carries
@@ -1776,11 +1978,11 @@ function concatSharedRules(main: string, shared: string): string {
   return `${main.slice(0, idx)}---\n\n${shared}\n\n${main.slice(idx)}`;
 }
 
-/** Append the user-language directive at the very tail. Kept last (after
- *  runtime injection) because it is the most volatile per-user variable;
- *  putting it last keeps the cached prefix stable. */
+/** Append volatile prompt tail after the runtime injection block. Current
+ *  datetime stays last because it changes every turn; keeping it at the tail
+ *  preserves the largest cacheable prefix. */
 function appendLanguageDirective(prompt: string): string {
-  return `${prompt}\n\n---\n\n${buildLanguageDirective()}`;
+  return `${prompt}\n\n---\n\n${buildLanguageDirective()}\n\n---\n\n${buildRuntimeDatetimeBlock()}`;
 }
 
 // Render the agents-index block injected into commander's system prompt.
@@ -1790,7 +1992,9 @@ function appendLanguageDirective(prompt: string): string {
 //   `- custom:  <abs path>\n` +
 //   `- marketplace: <abs path>\n` +
 //   `Use these ROOT values verbatim. \`id:\` is tool-call input only — prose mentions agents as @<name>.\n\n` +
-//   per-entry lines `- @<name> (Source: custom|marketplace, id: <agent_id>) — desc` + optional `\n  inputs_schema: <slim json>`
+//   per-entry lines `- @<name> (Source: custom|marketplace, id: <agent_id>) — desc` + optional marker lines:
+//   `  inputs: read agent.json before dispatch`
+//   `  interactive: true`
 //
 // Why expose id and ROOT inline (changed 2026-05): the prior layout hid
 // agent_id (to discourage hex-id leak in user prose) and put paths in a
@@ -1837,23 +2041,18 @@ async function buildAgentsIndexBlock(uid: string, allowedIds?: readonly string[]
     if (!list.length) return `${header}(no agents)`;
     const entries = list.map((a: any) => {
       const name = a.name || a.agent_id;
-      const description = pickDescription(a, lang);
+      const description = compactPromptDescription(pickDescription(a, lang));
       const desc = description ? ` — ${description}` : '';
       const head = `- ${buildMention(name)} (Source: ${a.source}, id: ${a.agent_id})${desc}`;
-      // Inline a slimmed inputs_schema (id / type / required / default /
-      // label / options / min / max / accept) so commander knows what
-      // params each agent expects when phrasing its `@<name>` dispatch
-      // text. Stripped of UI-only narrative fields (description /
-      // placeholder) — those bloat the prompt without helping extraction.
       const inputs = Array.isArray(a.inputs) ? a.inputs : null;
+      const markers: string[] = [];
       if (inputs && inputs.length) {
-        const slim = inputs.map((f: any) => {
-          const { description: _d, placeholder: _p, ...rest } = f;
-          return rest;
-        });
-        return `${head}\n  inputs_schema: ${JSON.stringify(slim)}`;
+        markers.push('inputs: read agent.json before dispatch');
       }
-      return head;
+      if (a.interactive === true) {
+        markers.push('interactive: true');
+      }
+      return markers.length ? `${head}\n  ${markers.join('\n  ')}` : head;
     }).join('\n');
     return `${header}${entries}`;
   } catch { return `${header}(no agents)`; }
@@ -1861,9 +2060,8 @@ async function buildAgentsIndexBlock(uid: string, allowedIds?: readonly string[]
 
 async function buildAgentInGroupSystemPrompt(
   _uid: string,
-  agent: { name?: string; description?: string; workflow?: string; agent_id: string; inputs?: unknown; output_format?: string },
+  agent: { name?: string; description?: string; workflow?: string; agent_id: string; inputs?: unknown; output_format?: string; interactive?: boolean },
   workingDir: string,
-  projectFilesBlock = '',
 ): Promise<string> {
   const { prompts } = await import('../../prompts/loader');
   // Render the agent's declared inputs schema so the LLM knows when to
@@ -1889,33 +2087,68 @@ async function buildAgentInGroupSystemPrompt(
     inputs_schema: inputsSchemaJson || '(none)',
     working_dir: workingDir,
     output_format_hint: buildOutputFormatHint(agent.output_format),
-    project_files_block: projectFilesBlock,
+    plan_interaction_hint: buildPlanInteractionHint(agent.interactive === true),
   });
   const shared = prompts.load('chat_shared_rules', {});
   return appendLanguageDirective(concatSharedRules(main, shared));
 }
 
-/** Render the agent's `output_format` preference as a one-line worker prompt
- *  hint. Sits in the `## Runtime injection` tail (most-volatile slot per
- *  PC/CLAUDE.md §3 prompt-md cache layout). `'auto'` (legacy) and missing both
- *  produce an empty string — old agents authored before the redesign keep
- *  unconstrained behavior until the user explicitly picks a value. `'artifact'`
- *  is the renamed `'allow_artifacts'`; the old key is accepted as an alias for
- *  on-disk back-compat (specs written by pre-redesign builds). See
- *  `chat_shared_rules.md` "Output formats" for the underlying rule. */
+function buildPlanInteractionHint(interactive: boolean): string {
+  if (!interactive) return '';
+  return [
+    '### Plan interaction',
+    'For plan steps, when Information sufficiency requires user input before completing this step, include `<plan-interaction status="open" />` with the `<agent-input-form>`.',
+    'An open reply pauses the step: briefly state the blocker, ask at most 2-3 focused form fields, and do not include a final recommendation, diagnosis, plan, or report.',
+    'Keep including `<plan-interaction status="open" />` while waiting for more user input. When the step is complete, include `<plan-interaction status="closed" />`.',
+  ].join('\n');
+}
+
+/** Render the `output_format` preference as a worker prompt hint. It lives in
+ *  the stable `## Response presentation` section instead of runtime context:
+ *  it only changes when an agent's output-format preference changes or we add
+ *  new presentation primitives. `'auto'` and missing both inject the same
+ *  intelligent chooser; `'markdown_only'` and `'allow_artifacts'` are accepted
+ *  as legacy aliases for on-disk back-compat. See `chat_shared_rules.md`
+ *  "Output formats" for the underlying primitives. */
 function buildOutputFormatHint(format: string | undefined): string {
   switch (format) {
+    case 'text':
     case 'markdown_only':
-      return '### Output format\nThis agent is configured **markdown-only**: do NOT emit `:::dashboard` blocks or call `create_artifact`. Plain markdown only.';
+      return '### Output format\nstandard reply output: use plain text or Markdown only. Do NOT emit `:::dashboard` blocks or call `create_artifact`.';
     case 'dashboard':
-      return '### Output format\nThis agent is configured for **dashboard output**: prefer `:::dashboard` for structured snapshots (KPIs, tables, alerts, timelines); do NOT call `create_artifact`.';
+      return [
+        '### Output format',
+        'dashboard output: use a valid fenced `:::dashboard` JSON block for read-only structured snapshots.',
+        'Follow the `Output formats` schema exactly. Do NOT call `create_artifact`.',
+      ].join('\n');
     case 'artifact':
     case 'allow_artifacts':
-      return '### Output format\nThis agent is configured to **allow artifacts**: prefer `:::dashboard` for structured snapshots; reach for `create_artifact` when interactivity actually matters.';
+      return [
+        '### Output format',
+        'This agent is configured to allow interactive apps: use `:::dashboard` for static/read-only structured snapshots; call `create_artifact` only when the user must operate the result.',
+        'Choose artifacts for click/type/filter/sort/calculate/drill-down/simulate; static results prefer `:::dashboard`.',
+      ].join('\n');
     case 'auto':
     default:
-      return '';
+      return [
+        '### Output format',
+        'This actor is configured for automatic output layout: choose the lightest useful presentation.',
+        '- Use plain text or Markdown for narrative answers, lists, code, fixed-format requests, progress, wrap-ups.',
+        '- Use `:::dashboard` for static/read-only structured snapshots; emit a valid fenced `:::dashboard` JSON block per `Output formats`.',
+        '- Use `create_artifact` only when the user must operate the result (click/type/filter/sort/calculate/drill-down/simulate).',
+        'No decorative dashboards/artifacts. Respect explicit user constraints.',
+      ].join('\n');
   }
+}
+
+// Test-only export so the prompt-level output-format contract is pinned
+// without booting a full group-chat worker.
+export function _buildOutputFormatHintForTest(format: string | undefined): string {
+  return buildOutputFormatHint(format);
+}
+
+export function _buildPlanInteractionHintForTest(interactive: boolean): string {
+  return buildPlanInteractionHint(interactive);
 }
 
 // ── Commander tools (plan_set / marketplace / dispatch) ─────────────────
@@ -2025,9 +2258,10 @@ async function buildCommanderExtraTools(
   tools.push({
     name: 'plan_set',
     description: [
-      'Record the full execution plan — the bus auto-dispatches per the plan, tracks state, and runs steps in series/parallel; **you do NOT need to @ dispatch anything afterwards**.',
+      'Record the full execution plan — the bus auto-dispatches per the plan, tracks state, and runs steps serially; **you do NOT need to @ dispatch anything afterwards**.',
       'Every step must specify `assignee` (user / commander / agent name) and `input` (dispatch text; can reference `{{user_initial_message}}` and `{{step_N.output_summary}}` template variables to pull in context).',
-      'Steps default to serial (each waits for the previous to be done); use `wait_for: []` to run a step immediately, `wait_for: [N]` to declare explicit dependencies, and `parallel_group: "g"` to mark multiple steps as a parallel group.',
+      'Steps run serially by default (each waits for the previous to be done). Use `wait_for: [N]` only to declare a real dependency on a non-previous step or multiple prior outputs.',
+      'Do not design parallel fan-out. If multiple agents are useful, order them so each step can use prior outputs; use an early `user` or interactive agent step when information is missing.',
       'The first call also posts a group announcement so the user sees the rough path; later overwrites just update the file. Step count 1–15.',
     ].join(' '),
     inputSchema: {
@@ -2055,11 +2289,7 @@ async function buildCommanderExtraTools(
               wait_for: {
                 type: 'array',
                 items: { type: 'number' },
-                description: 'Optional: list of step indices (1-based) this step depends on. Default = [previous step] (linear serial). `[]` = no dependency, run immediately. Multiple deps means wait for all of them to be done.',
-              },
-              parallel_group: {
-                type: 'string',
-                description: 'Optional: marks a parallel group. Steps in the same group are dispatched simultaneously (fork). Typical use: "multiple agents analyze the same problem independently".',
+                description: 'Optional: list of step indices (1-based) this step depends on. Default = [previous step] (linear serial). Use `[]` only for the first step. Multiple deps means wait for all of them to be done before this serial step runs.',
               },
               on_failure: {
                 type: 'string',
@@ -2079,7 +2309,7 @@ async function buildCommanderExtraTools(
     async execute(input) {
       const raw = (input?.steps || []) as Array<{
         title?: string; assignee?: string; input?: string;
-        wait_for?: number[]; parallel_group?: string;
+        wait_for?: number[];
         on_failure?: string; notes?: string;
       }>;
       const stepsIn: PlanSetInput = {
@@ -2095,7 +2325,6 @@ async function buildCommanderExtraTools(
             assignee: String(s.assignee),
             ...(s.input && typeof s.input === 'string' ? { input: String(s.input) } : {}),
             ...(Array.isArray(s.wait_for) ? { wait_for: s.wait_for.map(Number).filter(Number.isFinite) } : {}),
-            ...(s.parallel_group && typeof s.parallel_group === 'string' ? { parallel_group: String(s.parallel_group) } : {}),
             ...(s.on_failure && ['abort_plan', 'continue', 'ask_commander'].includes(s.on_failure)
               ? { on_failure: s.on_failure as any } : {}),
             ...(s.notes ? { notes: String(s.notes) } : {}),
@@ -2529,7 +2758,7 @@ export async function abort(uid: string, cid: string): Promise<void> {
   await setStatus(uid, cid, 'aborted');
   if (state) {
     emit(state, { type: 'aborted', cid });
-    emit(state, { type: 'state_changed', cid, state: await readState(uid, cid) });
+    await emitStateChanged(state);
     // Wait for every aborted worker's runTurn to finish unwinding (stream
     // error → finally → abortOutcome → enqueue). Without this the bus's
     // "(stopped)" + processItems message is still being persisted when
@@ -2629,6 +2858,7 @@ planExecutor.bindBusHooks({
     if (!commander) return;
     const w = ensureWorker(state, commander);
     w.queue.push({
+      turnId: genId12(),
       msgId: genId12(),
       fromActorId: 'plan',
       llmPayload: payload.llmPayload,
@@ -2696,6 +2926,10 @@ async function _initializeCodingProjectDir(
 ): Promise<void> {
   const cur = await readState(uid, cid);
   if (cur.coding_project_dir) return;
+  if (info.mode === 'custom' && !info.exists) {
+    log.info(`coding project_dir custom path missing cid=${cid} — awaiting user selection`);
+    return;
+  }
   const target = info.effective_path;
   if (!target) return;
   await setCodingProjectDir(uid, cid, target, { explicit: info.mode === 'custom' && info.exists });
@@ -2746,7 +2980,7 @@ async function _runCliAgentTurn(opts: {
   workingDir: string;
   signal: AbortSignal;
   onProcess: (data: Record<string, unknown>) => void;
-}): Promise<{ text: string; error?: string; aborted?: boolean }> {
+}): Promise<{ text: string; error?: string; aborted?: boolean; produced?: string[] }> {
   const runtime = opts.agent.runtime as Extract<NonNullable<import('../agents').AgentRuntime>, { kind: 'cli' }>;
 
   // Required-input gate: a CLI agent never runs an LLM, so the form-emit
@@ -2791,6 +3025,8 @@ async function _runCliAgentTurn(opts: {
   let resultText = '';
   let aborted = false;
   let backendSessionId: string | undefined;
+  const produced = new Set<string>();
+  const pendingToolPaths = new Map<string, string[]>();
   // Set when the CLI rejects our `--resume <id>` (e.g. claude code's
   // "No conversation found with session ID …"). Triggers a one-time
   // cleanup of the cliSessions binding so the next dispatch starts
@@ -2844,6 +3080,21 @@ async function _runCliAgentTurn(opts: {
           }
           break;
         case 'tool-event':
+          if ((e as any).phase === 'use') {
+            const paths = extractWritablePathsFromCliTool(e as any, opts.workingDir);
+            if (paths.length) pendingToolPaths.set(String((e as any).callId || ''), paths);
+          } else if ((e as any).phase === 'result') {
+            const callId = String((e as any).callId || '');
+            const paths = pendingToolPaths.get(callId) || [];
+            for (const p of paths) produced.add(p);
+            if (callId) pendingToolPaths.delete(callId);
+          }
+          opts.onProcess({ type: 'event', event: { stream: 'cli', data: e as unknown as Record<string, unknown> } });
+          break;
+        case 'file-change':
+          for (const p of normalizeCliProducedPaths((e as any).paths, opts.workingDir)) produced.add(p);
+          opts.onProcess({ type: 'event', event: { stream: 'cli', data: e as unknown as Record<string, unknown> } });
+          break;
         case 'process-info':
         case 'status':
           opts.onProcess({ type: 'event', event: { stream: 'cli', data: e as unknown as Record<string, unknown> } });
@@ -2880,17 +3131,17 @@ async function _runCliAgentTurn(opts: {
 
   if (result.status === 'missing_cli') {
     const msg = t('cli_agent.missing', { name: opts.agent.name || runtime.cli, cli: runtime.cli });
-    return { text: '', error: msg, aborted: false };
+    return { text: '', error: msg, aborted: false, produced: Array.from(produced) };
   }
   if (result.status === 'cancelled') {
-    return { text: resultText || accText, aborted: true };
+    return { text: resultText || accText, aborted: true, produced: Array.from(produced) };
   }
   if (result.status === 'failed' || result.status === 'timeout') {
     const detail = result.error || (result.status === 'timeout' ? 'timeout' : 'failed');
     // When the failure was a stale resume id, hint the user that a
     // simple resend will recover (the binding has been cleared above).
     const hint = resumeRejected ? ' — session expired; retry will start fresh.' : '';
-    return { text: resultText || accText, error: detail + hint };
+    return { text: resultText || accText, error: detail + hint, produced: Array.from(produced) };
   }
   // Successful turn — persist the (possibly new) session id so the
   // next dispatch can resume. Claude reports its session id every
@@ -2908,9 +3159,44 @@ async function _runCliAgentTurn(opts: {
   if (slashCommandName && _looksLikeNoOutput(finalText)) {
     return {
       text: t('cli_agent.slash_no_output', { cmd: slashCommandName }),
+      produced: Array.from(produced),
     };
   }
-  return { text: finalText };
+  return { text: finalText, produced: Array.from(produced) };
+}
+
+function normalizeCliProducedPaths(paths: unknown, workingDir: string): string[] {
+  if (!Array.isArray(paths)) return [];
+  const out = new Set<string>();
+  for (const raw of paths) {
+    if (typeof raw !== 'string' || !raw.trim()) continue;
+    const abs = path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(workingDir, raw);
+    out.add(abs);
+  }
+  return Array.from(out);
+}
+
+function extractWritablePathsFromCliTool(e: Record<string, unknown>, workingDir: string): string[] {
+  const tool = String(e.tool || '').toLowerCase();
+  if (!/(write|edit|patch|multiedit|create|save)/.test(tool)) return [];
+  const input = e.input && typeof e.input === 'object' ? e.input as Record<string, unknown> : {};
+  const candidates: unknown[] = [
+    input.path,
+    input.file,
+    input.file_path,
+    input.filePath,
+    input.filename,
+  ];
+  if (Array.isArray(input.files)) {
+    for (const f of input.files) {
+      if (typeof f === 'string') candidates.push(f);
+      else if (f && typeof f === 'object') {
+        const obj = f as Record<string, unknown>;
+        candidates.push(obj.path, obj.file_path, obj.filePath);
+      }
+    }
+  }
+  return normalizeCliProducedPaths(candidates.filter((p): p is string => typeof p === 'string'), workingDir);
 }
 
 async function _buildCliPrompt(
@@ -2983,19 +3269,7 @@ async function _buildCliPrompt(
   const attachmentsBlock = allAtts.length
     ? `## Attachments\n${allAtts.map(a => `- ${a}`).join('\n')}`
     : '';
-  let projectFilesBlock = '';
-  try {
-    const { getConversation } = await import('../chats');
-    const conv = await getConversation(uid, cid);
-    const pid = (conv as any)?.project_id;
-    if (typeof pid === 'string' && pid) {
-      const projectFileFeature = await import('../project_files');
-      projectFilesBlock = await projectFileFeature.buildProjectFilesCliBlock(uid, pid);
-    }
-  } catch (err) {
-    log.warn(`cli project files block failed cid=${cid}: ${(err as Error).message}`);
-  }
-  const filesBlock = [attachmentsBlock, projectFilesBlock].filter(Boolean).join('\n\n');
+  const filesBlock = attachmentsBlock;
 
   // ── Task body — submission unwrap if the dispatch was a form-submit.
   // When the user confirmed the input form, the dispatched payload is
@@ -3037,6 +3311,7 @@ async function _buildCliPrompt(
     attachments_block: filesBlock,
     conversation_block: conversationBlock,
     task_body: taskBody,
+    runtime_datetime_block: buildRuntimeDatetimeBlock(),
   });
 
   if (!bridgeHistory) return render('');

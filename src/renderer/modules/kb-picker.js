@@ -4,7 +4,7 @@
 // needs to drop a file into the KB at a user-chosen location.
 //
 // Public API:
-//   pickKbLocation({ defaultName, defaultDir?, title? })
+//   pickKbLocation({ defaultName, defaultDir?, title?, scope? })
 //     → Promise<{ path: string } | null>  // null = user cancelled
 //
 // Persistence: the last-selected directory is remembered in localStorage so
@@ -17,6 +17,7 @@ let _kbPickerResolve = null;
 let _kbPickerCurrentDir = '';     // '' = root
 let _kbPickerExpanded = new Set();
 let _kbPickerTree = [];
+let _kbPickerScope = { type: 'global' };
 
 function _kbPickerUiIconHtml(name, className) {
   if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
@@ -36,11 +37,13 @@ async function pickKbLocation(opts = {}) {
     _kbPickerResolve(null);
     _kbPickerResolve = null;
   }
-  await _kbPickerLoadTree();
+  _kbPickerScope = _kbPickerNormalizeScope(opts.scope || opts.targetScope);
+  await _kbPickerLoadTree(_kbPickerScope);
 
+  const lastDirKey = _kbPickerLastDirKey(_kbPickerScope);
   const defaultDir = opts.defaultDir != null
     ? String(opts.defaultDir)
-    : (localStorage.getItem(KB_PICKER_LAST_DIR_KEY) || '');
+    : (localStorage.getItem(lastDirKey) || '');
   _kbPickerCurrentDir = _kbPickerDirExists(defaultDir) ? defaultDir : '';
 
   // Expand the path down to the default dir so the user sees the selection.
@@ -66,11 +69,49 @@ async function pickKbLocation(opts = {}) {
 }
 window.pickKbLocation = pickKbLocation;
 
-async function _kbPickerLoadTree() {
+function _kbPickerNormalizeScope(scope) {
+  if (scope && scope.type === 'project' && typeof scope.projectId === 'string' && scope.projectId) {
+    return { type: 'project', projectId: scope.projectId };
+  }
+  return { type: 'global' };
+}
+
+function _kbPickerLastDirKey(scope) {
+  if (scope && scope.type === 'project' && scope.projectId) {
+    return `${KB_PICKER_LAST_DIR_KEY}.project.${scope.projectId}`;
+  }
+  return KB_PICKER_LAST_DIR_KEY;
+}
+
+function _kbPickerBasename(rel) {
+  const s = String(rel || '').replace(/\\/g, '/');
+  const parts = s.split('/').filter(Boolean);
+  return parts[parts.length - 1] || s;
+}
+
+function _kbPickerNormalizeTree(nodes) {
+  return (Array.isArray(nodes) ? nodes : []).map((n) => {
+    const node = n || {};
+    const rel = node.relPath || node.path || '';
+    return {
+      ...node,
+      path: rel,
+      name: node.name || _kbPickerBasename(rel),
+      children: _kbPickerNormalizeTree(node.children),
+    };
+  });
+}
+
+async function _kbPickerLoadTree(scope = { type: 'global' }) {
   try {
+    if (scope && scope.type === 'project' && scope.projectId && window.orkas?.invoke) {
+      const data = await window.orkas.invoke('projects.files.tree', { projectId: scope.projectId });
+      _kbPickerTree = data?.ok ? _kbPickerNormalizeTree(data.tree || []) : [];
+      return;
+    }
     const res = await apiFetch('/api/contexts/tree');
     const data = await res.json();
-    _kbPickerTree = data.ok ? (data.tree || []) : [];
+    _kbPickerTree = data.ok ? _kbPickerNormalizeTree(data.tree || []) : [];
   } catch (e) {
     _kbPickerLog.warn('tree fetch failed', e);
     _kbPickerTree = [];
@@ -208,7 +249,7 @@ async function confirmKbPicker() {
   const fullPath = _kbPickerCurrentDir ? `${_kbPickerCurrentDir}/${name}` : name;
 
   try {
-    localStorage.setItem(KB_PICKER_LAST_DIR_KEY, _kbPickerCurrentDir);
+    localStorage.setItem(_kbPickerLastDirKey(_kbPickerScope), _kbPickerCurrentDir);
   } catch { /* private-mode / quota — non-fatal */ }
 
   document.getElementById('kb-picker-modal').classList.remove('open');

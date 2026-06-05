@@ -34,6 +34,7 @@ import log from 'electron-log/main';
 import type { LogMessage } from 'electron-log';
 
 import { LOGS_DIR } from './paths';
+import { maskLogId, sanitizeLogTextForUpload } from './util/log-sanitize';
 
 // ── Tunables ─────────────────────────────────────────────────────────────
 
@@ -71,6 +72,7 @@ const REDACT_KEYS = new Set([
   'access', 'refresh',
   'token', 'accesstoken', 'refreshtoken', 'access_token', 'refresh_token',
   'idtoken', 'id_token',
+  'sessionid', 'session_id', 'sid',
   'secret', 'clientsecret', 'client_secret',
   'password', 'passwd', 'pwd',
   'authorization',
@@ -82,29 +84,46 @@ const REDACT_KEYS = new Set([
   'username',
 ]);
 
+const MASK_ID_KEYS = new Set([
+  'uid', 'userid', 'user_id',
+]);
+
 const MASK = '***REDACTED***';
 
 /**
  * Return a deep-cloned version of `v` with sensitive-looking fields masked.
- * - Primitive strings / numbers pass through (we only redact *named*
- *   fields; a bare token stringified into a message body is out of scope
- *   for this layer — callers must not log secrets positionally).
+ * - Strings are scanned for positional secrets, so `token=...`,
+ *   `Authorization: Bearer ...`, JWTs, email addresses, and phone numbers
+ *   are masked even when callers interpolate them into message text.
  * - Circular refs are short-circuited to `'[circular]'`.
- * - Errors are preserved (name/message/stack) since they rarely contain
- *   secrets and we want the stack intact for triage.
+ * - Errors keep their name/message/stack shape, but message and stack text
+ *   are sanitized before they reach file/console transports.
  */
 export function redact(v: unknown, seen: WeakSet<object> = new WeakSet()): unknown {
   if (v === null || v === undefined) return v;
+  if (typeof v === 'string') return sanitizeLogTextForUpload(v);
   if (typeof v !== 'object') return v;
-
-  if (v instanceof Error) {
-    // Don't walk into Error objects — they're rendered via %s by
-    // electron-log and their own fields (name/message/stack) are safe.
-    return v;
-  }
 
   if (seen.has(v as object)) return '[circular]';
   seen.add(v as object);
+
+  if (v instanceof Error) {
+    const out = new Error(sanitizeLogTextForUpload(v.message || ''));
+    out.name = sanitizeLogTextForUpload(v.name || 'Error');
+    if (typeof v.stack === 'string') out.stack = sanitizeLogTextForUpload(v.stack);
+    for (const [k, val] of Object.entries(v as Error & Record<string, unknown>)) {
+      if (k === 'name' || k === 'message' || k === 'stack') continue;
+      const key = k.toLowerCase();
+      if (REDACT_KEYS.has(key)) {
+        (out as Error & Record<string, unknown>)[k] = MASK;
+      } else if (MASK_ID_KEYS.has(key)) {
+        (out as Error & Record<string, unknown>)[k] = maskLogId(val);
+      } else {
+        (out as Error & Record<string, unknown>)[k] = redact(val, seen);
+      }
+    }
+    return out;
+  }
 
   if (Array.isArray(v)) return v.map((it) => redact(it, seen));
 
@@ -112,6 +131,8 @@ export function redact(v: unknown, seen: WeakSet<object> = new WeakSet()): unkno
   for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
     if (REDACT_KEYS.has(k.toLowerCase())) {
       out[k] = MASK;
+    } else if (MASK_ID_KEYS.has(k.toLowerCase())) {
+      out[k] = maskLogId(val);
     } else {
       out[k] = redact(val, seen);
     }
@@ -218,9 +239,10 @@ export function initLogger(): void {
 
   try { fs.mkdirSync(LOGS_DIR, { recursive: true }); } catch { /* noop */ }
 
-  // Level config — `ORKAS_LOG_LEVEL` overrides in both environments.
+  // Level config — `ORKAS_LOG_LEVEL` overrides in both environments; dev
+  // gets verbose console by default so you see activity while coding.
   const fileLevel = (process.env.ORKAS_LOG_LEVEL as any) || 'info';
-  const consoleLevel = (process.env.ORKAS_LOG_LEVEL as any) || 'info';
+  const consoleLevel = process.env.ORKAS_DEVTOOLS ? 'debug' : (process.env.ORKAS_LOG_LEVEL as any) || 'info';
 
   log.transports.file.level    = fileLevel;
   log.transports.console.level = consoleLevel;

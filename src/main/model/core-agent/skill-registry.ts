@@ -47,6 +47,65 @@ function skillSourceLabel(source: string): 'builtin' | 'custom' {
   } catch { return 'custom'; }
 }
 
+export function compactPromptDescription(description: string): string {
+  const text = String(description || '').trim();
+  if (!text) return '';
+
+  const markerPatterns: Array<{ re: RegExp; keepDelimiter?: boolean }> = [
+    { re: /[；;]\s*适合/u },
+    { re: /[；;]\s*适用/u },
+    { re: /[；;]\s*触发词/u },
+    { re: /[；;]\s*触发/u },
+    { re: /[；;]\s*关键词/u },
+    { re: /[;；]\s*(?:suitable for|use when|use for|best for|ideal for|triggers?|keywords?)\b/i },
+    { re: /\.\s+(?:suitable for|use when|use for|best for|ideal for|triggers?|keywords?)\b/i, keepDelimiter: true },
+  ];
+  const markerIndexes = markerPatterns
+    .map(({ re, keepDelimiter }) => {
+      const match = re.exec(text);
+      return match ? match.index + (keepDelimiter ? 1 : 0) : -1;
+    })
+    .filter((idx) => idx >= 0);
+  if (markerIndexes.length) {
+    const idx = Math.min(...markerIndexes);
+    return text.slice(0, idx).trim();
+  }
+
+  const sentenceEnd = text.indexOf('。');
+  if (sentenceEnd >= 0 && sentenceEnd < text.length - 1) {
+    return text.slice(0, sentenceEnd + 1).trim();
+  }
+
+  const zhSemicolon = text.indexOf('；');
+  if (zhSemicolon >= 0) {
+    return text.slice(0, zhSemicolon).trim();
+  }
+
+  return text;
+}
+
+function dedupeSkillsByDisplayName<T extends SkillAllowlistRef>(specs: T[]): T[] {
+  if (specs.length < 2) return specs;
+  const byName = new Map<string, T[]>();
+  for (const s of specs) {
+    const displayName = (s.name || s.id || '').trim();
+    if (!displayName) continue;
+    const list = byName.get(displayName) || [];
+    list.push(s);
+    byName.set(displayName, list);
+  }
+
+  const shadowed = new Set<T>();
+  for (const list of byName.values()) {
+    const hasCustom = list.some((s) => _skillRefRank(s) === 0);
+    if (!hasCustom) continue;
+    for (const s of list) {
+      if (_skillRefRank(s) !== 0) shadowed.add(s);
+    }
+  }
+  return specs.filter((s) => !shadowed.has(s));
+}
+
 // Render the system-prompt block listing every skill the LLM can use.
 //
 // Format:
@@ -90,14 +149,13 @@ async function renderSkillLines(
     '`read_file(<ROOT>/<id>/SKILL.md)` — ROOT by Source:',
     `- custom:  ${customRoot}`,
     `- builtin: ${builtinRoot}`,
-    'Use these ROOT values verbatim. `<id>` is the internal read id shown after each entry; use it only inside read_file paths, even when it differs from the display name.',
-    'These entries are skills, not tool names. To use one, read its SKILL.md by internal read id and follow the instructions; never call the display name or id as a tool.',
-    'Never mention skill ids in plans, workflows, progress, or final replies. User-facing text must refer to skills by display name only.',
+    'Use these ROOT values verbatim. `<id>` is the internal read id for read_file paths only, even when it differs from display name.',
+    'These entries are skills, not tool names: read SKILL.md and follow it; never call the display name or id as a tool. Never mention skill ids in plans, workflows, progress, or final replies.',
     '',
   ];
   for (const s of specs) {
     const source = skillSourceLabel(s.source);
-    const description = pick(s, lang);
+    const description = compactPromptDescription(pick(s, lang));
     const desc = description ? ` — ${description}` : '';
     // When name == id (custom skills authored locally), collapse the redundancy; when they
     // differ (marketplace installs), keep the id explicitly internal so the model can read by
@@ -263,9 +321,16 @@ export interface SystemPromptBlockOptions {
    * dir). Caller (`runner.ts::buildRunner`) bridges this to ChatOptions
    * so `features/group_chat/bus.ts` collects per turn for the
    * `skill_advertised` signal. Pure callback — no FS, no IO, no awaits.
-   * See `docs/plans/expert-signals-skill-attribution.md` §4.1.
+   * See `Common/docs/plans/expert-signals-skill-attribution.md` §4.1.
    */
   onSkillAdvertised?: (skill_id: string, system: 'A.custom' | 'A.platform') => void;
+  /**
+   * UI-only display-name collector. `getSystemPromptBlock` already has the
+   * filtered SkillSpec list in hand; callers can pass a Map here to reuse
+   * that metadata for local process-log rendering without rescanning skills
+   * or adding anything to the model prompt.
+   */
+  displayNameById?: Map<string, string>;
 }
 
 /**
@@ -302,11 +367,19 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
     rendered = filterDisabled(specs.filter((s) => allow.has(s.id)));
   }
 
+  rendered = dedupeSkillsByDisplayName(rendered);
+
   if (opts.onSkillAdvertised && rendered.length) {
     for (const s of rendered) {
       try {
         opts.onSkillAdvertised(s.id, skillSourceLabel(s.source) === 'custom' ? 'A.custom' : 'A.platform');
       } catch { /* callback throws are non-fatal; signal emission is best-effort */ }
+    }
+  }
+
+  if (opts.displayNameById) {
+    for (const s of rendered) {
+      if (s.id) opts.displayNameById.set(s.id, s.name || s.id);
     }
   }
 

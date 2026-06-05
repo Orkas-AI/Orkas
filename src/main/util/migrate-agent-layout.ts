@@ -64,13 +64,20 @@ interface MigrationStats {
   warnings: number;
 }
 
+interface MigrationOptions {
+  /** Ignore the startup migration stamp and scan for late-arriving legacy
+   *  files. Used after cloud sync pulls agents from an older device. */
+  force?: boolean;
+}
+
 /**
  * Migrate one user's agent layout in place. Idempotent — already-stamped uids
  * return zero stats without touching disk. Safe to call on every boot.
  */
-export function migrateAgentLayout(uid: string): MigrationStats {
+export function migrateAgentLayout(uid: string, opts: MigrationOptions = {}): MigrationStats {
   const stats: MigrationStats = { agentsConverted: 0, metaMoved: 0, warnings: 0 };
-  if (alreadyApplied(uid)) return stats;
+  const applied = alreadyApplied(uid);
+  if (applied && !opts.force) return stats;
 
   const agentsRoot = userAgentsDir(uid);
   const oldMetaRoot = path.join(userCloudRoot(uid), 'meta');
@@ -153,7 +160,7 @@ export function migrateAgentLayout(uid: string): MigrationStats {
     catch { /* keep */ }
   }
 
-  stamp(uid);
+  if (!applied) stamp(uid);
   if (stats.agentsConverted || stats.metaMoved || stats.warnings) {
     log.info(
       `agent-layout migration done uid=${uid} agents=${stats.agentsConverted} meta=${stats.metaMoved} warnings=${stats.warnings}`,

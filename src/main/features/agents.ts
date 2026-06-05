@@ -23,13 +23,14 @@ import {
   userAgentsDir, userSkillsDir, userAgentChatDir, userSessionFile, WS_ROOT,
   agentDir, agentDefinitionFile,
   userMarketplaceAgentsDir, userMarketplaceAgentDir, userMarketplaceSkillsDir,
-  userAgentRuntimeConfigFile,
+  userAgentRuntimeConfigFile, chatAttachmentDir,
 } from '../paths';
 import { evictSession } from '../model/core-agent/session-store';
 import { getActiveUserId } from './users';
 import { createLogger } from '../logger';
 import { t, buildLanguageDirective } from '../i18n';
 import { getWorkspacePath } from './user_workspace';
+import { buildAttachmentManifest } from './chat_attachments';
 
 const log = createLogger('agents');
 
@@ -37,6 +38,7 @@ const log = createLogger('agents');
 function CUSTOM_AGENTS_DIR(): string { return userAgentsDir(getActiveUserId()); }
 function CUSTOM_SKILLS_DIR(): string { return userSkillsDir(getActiveUserId()); }
 import { prompts } from '../prompts/loader';
+import { buildRuntimeDatetimeBlock } from '../prompts/runtime_context';
 import { findOuterTagRanges } from '../util/markdown-prose-code';
 import {
   nowIso, genAgentId, safeId,
@@ -57,6 +59,7 @@ import {
   DEFAULT_MARKETPLACE_CATEGORY_CODE,
   normalizeMarketplaceCategoryCode,
 } from './marketplace_biz';
+import { NAME_DISPLAY_MAX_UNITS, nameDisplayWidth } from '../util/name-limit';
 
 export type AgentSource = 'marketplace' | 'custom';
 type AgentSourceInput = AgentSource | 'builtin';
@@ -153,19 +156,18 @@ export interface Agent {
    *  agent must opt in explicitly. Maintained by the agent edit UI, NOT by the agent-edit LLM. */
   enabled_connectors?: string[];
   /** Output rendering preference — agent-level hint injected into the worker
-   *  system prompt at dispatch time. Three user-facing values, progressive
+   *  system prompt at dispatch time. Four user-facing values, progressive
    *  capability disclosure:
-   *    - `'markdown_only'`: blocks `:::dashboard` + `create_artifact`. The
-   *      create-modal default for new agents.
+   *    - `'auto'`: default. The model chooses the lightest useful
+   *      presentation: plain text/Markdown, inline dashboard, or interactive app.
+   *    - `'text'`: blocks `:::dashboard` + `create_artifact`. The plain-reply
+   *      hard constraint.
    *    - `'dashboard'`: allows `:::dashboard` blocks; still blocks `create_artifact`.
    *    - `'artifact'`: allows both `:::dashboard` and `create_artifact`.
-   *  Two legacy values kept for back-compat: `'auto'` (pre-redesign default,
-   *  empty hint = no constraint) and `'allow_artifacts'` (the old name for
-   *  `'artifact'`, treated identically by `bus.ts::buildOutputFormatHint`).
-   *  Missing field = no constraint (same as `'auto'`) — old agents authored
-   *  before the redesign keep their broad permissions until the user
-   *  explicitly picks a value. Authored by the agent edit UI dropdown, NOT
-   *  the agent-edit LLM. See `bus.ts::buildOutputFormatHint`. */
+   *  Legacy aliases kept for back-compat: `'markdown_only'` (old name for
+   *  `'text'`) and `'allow_artifacts'` (old name for `'artifact'`).
+   *  Missing field = auto. Authored by the agent edit UI dropdown, NOT the
+   *  agent-edit LLM. See `bus.ts::buildOutputFormatHint`. */
   output_format?: OutputFormat;
   source: AgentSource;
   created_at: string;
@@ -182,9 +184,19 @@ export interface Agent {
    *  agents-tab card can render a `v1.0.0` chip alongside the category. Custom agents leave
    *  this undefined (version is a publish concept, not authored locally). */
   version?: string;
+  /** Marketplace install freshness read from `_install.json`. Renderer marketplace uses this
+   *  to decide whether the server listing is newer than the local install. */
+  marketplace_published_at?: number;
+  marketplace_updated_at?: number;
+  /** Server-side fresh-install seed flag mirrored from marketplace metadata. */
+  default_install?: boolean;
+  /** Dev-only publishing metadata mirrored from marketplace metadata. */
+  is_open_source?: boolean;
+  /** Marketplace review lifecycle status mirrored from marketplace metadata. */
+  status?: string;
 }
 
-interface AgentRaw {
+export interface AgentRaw {
   agent_id?: string;
   name?: string;
   description?: string;
@@ -200,20 +212,26 @@ interface AgentRaw {
   interactive?: unknown;
   runtime?: unknown;
   category?: unknown;
+  status?: unknown;
+  state?: unknown;
   enabled_connectors?: unknown;
   output_format?: unknown;
 }
 
-/** Agent output rendering preference. Three user-facing values
- *  (`'markdown_only' | 'dashboard' | 'artifact'`); the create modal defaults
- *  to `'markdown_only'`. Two legacy values are kept in the enum for
- *  on-disk back-compat: `'auto'` (pre-redesign default; missing-field is
- *  still equivalent) and `'allow_artifacts'` (renamed to `'artifact'` — the
- *  hint builder + detail dropdown treat them as the same). Missing field
- *  on disk = no constraint (empty hint), preserving legacy agent behavior
- *  through the redesign. See `Agent.output_format`. */
-export type OutputFormat = 'auto' | 'markdown_only' | 'dashboard' | 'artifact' | 'allow_artifacts';
-const _OUTPUT_FORMAT_VALUES = new Set<OutputFormat>(['auto', 'markdown_only', 'dashboard', 'artifact', 'allow_artifacts']);
+/** Agent output rendering preference. Four user-facing values
+ *  (`'auto' | 'text' | 'dashboard' | 'artifact'`); the create modal defaults
+ *  to `'auto'`. Legacy values are accepted and canonicalized on read/write:
+ *  `'markdown_only'` → `'text'`, `'allow_artifacts'` → `'artifact'`.
+ *  Missing field on disk = auto. */
+export type OutputFormat = 'auto' | 'text' | 'dashboard' | 'artifact' | 'markdown_only' | 'allow_artifacts';
+const _OUTPUT_FORMAT_VALUES = new Set<OutputFormat>(['auto', 'text', 'dashboard', 'artifact', 'markdown_only', 'allow_artifacts']);
+
+function _canonicalOutputFormat(v: unknown): Exclude<OutputFormat, 'markdown_only' | 'allow_artifacts'> | null {
+  if (v === 'markdown_only') return 'text';
+  if (v === 'allow_artifacts') return 'artifact';
+  if (v === 'auto' || v === 'text' || v === 'dashboard' || v === 'artifact') return v;
+  return null;
+}
 
 /** Per-agent execution backend. See `Agent.runtime`. */
 export type AgentRuntime =
@@ -236,6 +254,24 @@ export type AgentRuntime =
 // renderer/modules/avatar.js pulls from the same file, so frontend and
 // backend never duplicate it.
 import * as avatars from './avatars';
+
+function _applyMarketplaceInstallMeta(agent: Agent, dir: string): void {
+  try {
+    const metaFile = path.join(dir, '_install.json');
+    if (!fs.existsSync(metaFile)) return;
+    const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+    if (!meta || typeof meta !== 'object') return;
+    if (typeof meta.version === 'string') agent.version = meta.version;
+    if (typeof meta.published_at === 'number') agent.marketplace_published_at = meta.published_at;
+    if (typeof meta.updated_at === 'number') agent.marketplace_updated_at = meta.updated_at;
+    if (typeof meta.default_install === 'boolean') agent.default_install = meta.default_install;
+    if (typeof meta.is_open_source === 'boolean') agent.is_open_source = meta.is_open_source;
+    if (typeof meta.status === 'string') agent.status = meta.status;
+    else if (typeof meta.state === 'string') agent.status = meta.state;
+  } catch (err) {
+    log.warn(`marketplace agent install metadata unreadable dir=${dir}: ${(err as Error).message}`);
+  }
+}
 
 export interface AgentChatMeta { session_id?: string; [k: string]: unknown }
 
@@ -279,9 +315,8 @@ const ALLOWED_INPUT_TYPES: readonly AgentInputType[] = ['text', 'textarea', 'sel
 // Reserved agent display names — collide with the commander role surfaced in
 // the chat-recipient chip and the sidebar tab. The bus router also keys
 // "commander" as a member id, so we guard localized display names and the
-// English form. Comparison is case-insensitive after stripping all whitespace,
-// so "  Commander " or the spaced Chinese form "总 指挥" all resolve to the
-// same canonical key.
+// English form. Comparison is case-insensitive after stripping all whitespace;
+// whitespace itself is rejected by the charset guard below.
 const RESERVED_AGENT_NAMES = new Set(['指挥官', '总指挥', 'コマンダー', '司令官', 'commander']);
 function _agentNameKey(name: string): string {
   return String(name || '').replace(/\s+/g, '').toLowerCase();
@@ -289,6 +324,7 @@ function _agentNameKey(name: string): string {
 function assertAgentNameAllowed(name: string): void {
   const key = _agentNameKey(name);
   if (!key) return; // empty handled elsewhere (defaults to t('agent.default_name'))
+  if (/\s/.test(String(name))) assertAgentNameCharsetValid(name);
   if (RESERVED_AGENT_NAMES.has(key)) {
     const err: any = new Error(`agent name "${name}" is reserved`);
     err.code = 'E_AGENT_NAME_RESERVED';
@@ -301,13 +337,10 @@ function assertAgentNameAllowed(name: string): void {
 // router (`router.ts::TOKEN_CLASS = [A-Za-z0-9_一-鿿-]`) — slashes,
 // backslashes, dots, parens, control chars etc. either truncate the
 // match (e.g. `@Agent/SkillSomeName` only matches `Agent`) or escape the
-// alternation arm at the regex stage. We additionally cap length and
-// allow a single internal space so multi-word display names
-// ("Code Review Helper") still resolve via the alternation. Leading /
-// trailing whitespace is rejected because UIs render names raw — stray
-// whitespace looks like a typo nobody can see to fix.
-const NAME_TOKEN_RE = /^[A-Za-z0-9_一-鿿-]+(?: [A-Za-z0-9_一-鿿-]+)*$/;
-const NAME_MAX_LENGTH = 50;
+// alternation arm at the regex stage. We additionally cap length. Any
+// whitespace is rejected because UIs render names raw — stray whitespace
+// looks like a typo nobody can see to fix.
+const NAME_TOKEN_RE = /^[A-Za-z0-9_一-鿿-]+$/;
 function assertAgentNameCharsetValid(name: string): void {
   if (name == null) return;
   const trimmed = String(name);
@@ -317,8 +350,8 @@ function assertAgentNameCharsetValid(name: string): void {
     err.code = 'E_AGENT_NAME_INVALID';
     throw err;
   }
-  if (trimmed.length > NAME_MAX_LENGTH) {
-    const err: any = new Error(`agent name longer than ${NAME_MAX_LENGTH} characters`);
+  if (nameDisplayWidth(trimmed) > NAME_DISPLAY_MAX_UNITS) {
+    const err: any = new Error(`agent name longer than ${NAME_DISPLAY_MAX_UNITS} display units`);
     err.code = 'E_AGENT_NAME_TOO_LONG';
     throw err;
   }
@@ -336,8 +369,8 @@ function assertAgentNameCharsetValid(name: string): void {
     }
     const detail = bad.length
       ? `forbidden character${bad.length > 1 ? 's' : ''}: ${bad.map(c => `\`${c}\``).join(' ')}`
-      : 'multiple consecutive spaces are not allowed (only single internal spaces between tokens)';
-    const err: any = new Error(`agent name "${trimmed}" contains unsupported characters — ${detail}. Allowed: ASCII letters / digits / \`_\` / \`-\` / CJK U+4E00–U+9FFF / single internal spaces. Forbidden include \`/\` \`\\\` \`.\` \`,\` \`(\` \`)\` \`:\` \`!\` \`?\`, full-width punctuation, kana, hangul, extended-CJK, emoji.`);
+      : 'spaces are not allowed';
+    const err: any = new Error(`agent name "${trimmed}" contains unsupported characters — ${detail}. Allowed: ASCII letters / digits / \`_\` / \`-\` / CJK U+4E00–U+9FFF. Forbidden include spaces, \`/\` \`\\\` \`.\` \`,\` \`(\` \`)\` \`:\` \`!\` \`?\`, full-width punctuation, kana, hangul, extended-CJK, emoji.`);
     err.code = 'E_AGENT_NAME_INVALID';
     throw err;
   }
@@ -497,6 +530,9 @@ export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSo
     description_en: explicitEn || (legacyDesc && !legacyHasChinese ? legacyDesc : ''),
     workflow: typeof raw.workflow === 'string' ? raw.workflow : '',
     category: typeof raw.category === 'string' ? raw.category : '',
+    ...(typeof raw.status === 'string' ? { status: raw.status } : (
+      typeof raw.state === 'string' ? { status: raw.state } : {}
+    )),
     source: normalizeAgentSource(source),
     created_at: raw.created_at || '',
     updated_at: raw.updated_at || '',
@@ -542,11 +578,11 @@ export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSo
   }
   const rt = _normalizeRuntime(raw.runtime);
   if (rt) agent.runtime = rt;
-  // output_format: enum-coerce; missing / unknown collapses to "no field
-  // set" (downstream reads default to 'auto'). Only the three known values
-  // round-trip to disk, so a malformed JSON can't inject a fourth state.
-  if (typeof raw.output_format === 'string' && _OUTPUT_FORMAT_VALUES.has(raw.output_format as OutputFormat)) {
-    agent.output_format = raw.output_format as OutputFormat;
+  // output_format: enum-coerce + legacy alias canonicalization. Missing /
+  // unknown collapses to "no field set" (downstream reads default to 'auto').
+  const outputFormat = _canonicalOutputFormat(raw.output_format);
+  if (outputFormat && outputFormat !== 'auto') {
+    agent.output_format = outputFormat;
   }
   return agent;
 }
@@ -732,9 +768,11 @@ let _agentListCache: AgentListCache | null = null;
 
 function _invalidateAgentListCache(opts: { markDirty?: boolean } = {}): void {
   _agentListCache = null;
-  // features/sync stripped from the OrkasOpen build (offline client, no cloud
-  // sync); the markDirty hook is intentionally a no-op here.
-  void opts;
+  if (opts.markDirty === false) return;
+  // Notify the sync engine (lazy-require — stripped in OrkasOpen builds). Every cache-invalidate
+  // is also a disk-mutation point, so co-locating the dirty signal here covers all the
+  // existing call sites without sprinkling sync calls across the file. The relPath here is
+  // informational only — the engine ignores it and walks `cloud/` itself.
 }
 
 /** Public re-export of `_invalidateAgentListCache` for cross-module callers (sync engine).
@@ -745,7 +783,7 @@ function _invalidateAgentListCache(opts: { markDirty?: boolean } = {}): void {
  *  mtime stays unchanged, the cache stamp stays valid, and `listAgents` returns ghosts of the
  *  agents sync just deleted. The sync bridge calls this so the next `listAgents` re-scans. */
 export function invalidateAgentListCache(): void {
-  _invalidateAgentListCache();
+  _invalidateAgentListCache({ markDirty: false });
 }
 
 /** Drop only the in-memory list cache. Marketplace reconcile updates live under
@@ -800,17 +838,11 @@ export async function listAgents(): Promise<Agent[]> {
           continue;
         }
         seen.add(norm.agent_id);
-        // Marketplace-installed agents carry an `_install.json` sidecar with `version`.
-        // Author uid may also be present there for install/reconcile compatibility, but the
-        // global UI intentionally does not surface it.
         if (isMarketplaceSource(source)) {
-          try {
-            const metaFile = path.join(dir, e.name, '_install.json');
-            if (fs.existsSync(metaFile)) {
-              const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
-              if (meta && typeof meta.version === 'string') norm.version = meta.version;
-            }
-          } catch { /* corrupt _install.json → leave fields undefined */ }
+          // Marketplace-installed agents carry `_install.json` with version + freshness.
+          // Author uid may also be present there for install/reconcile compatibility, but the
+          // global UI intentionally does not surface it.
+          _applyMarketplaceInstallMeta(norm, path.join(dir, e.name));
         }
         specs.push(norm);
       }
@@ -842,6 +874,9 @@ export async function getAgent(agentId: string | null | undefined): Promise<Agen
       const data = await readJson<AgentRaw>(f);
       const norm = normalizeAgent(data, source);
       if (norm) {
+        if (isMarketplaceSource(source)) {
+          _applyMarketplaceInstallMeta(norm, path.dirname(f));
+        }
         const { agents: disabledAgentIds } = readDisabledSets(getActiveUserId());
         norm.enabled = !disabledAgentIds.has(norm.agent_id);
         return _withDisplaySkillRefs(norm, await _skillSpecsForDisplay());
@@ -880,8 +915,8 @@ export interface CreateAgentOptions {
   category?: string;
   /** Output rendering preference picked in the create-modal dropdown. Validated against
    *  `_OUTPUT_FORMAT_VALUES` before persist — unknown values silently drop the field
-   *  (= old "missing = no constraint" semantics). The modal sends `'markdown_only'` by
-   *  default; omitted = field stays unset on disk. */
+   *  (= default auto semantics). The modal sends `'auto'` by default; omitted = field
+   *  stays unset on disk and is treated as auto at dispatch time. */
   output_format?: OutputFormat;
 }
 
@@ -950,6 +985,7 @@ export async function createCustomAgent(
     workflow: normalizedWorkflow,
     created_at: nowIso(),
     updated_at: nowIso(),
+    status: 'approved',
   };
   // Only emit `category` to disk when supplied; empty string is omitted so existing agents
   // don't get spurious "category: ''" lines through resave. Candidate membership is dynamic,
@@ -961,12 +997,12 @@ export async function createCustomAgent(
   if (avatars.isKnownIcon(icon)) data.icon = icon;
   if (avatars.isKnownColor(color)) data.color = color;
   if (typeof interactive === 'boolean') data.interactive = interactive;
-  // Persist `output_format` only when the caller supplied a value the enum recognizes. Unknown
-  // strings (e.g. a future client speaking a newer dialect at an older main) drop silently — the
-  // missing field is equivalent to "no constraint" and won't break the worker prompt, whereas a
-  // bogus stored value would survive normalizeAgent and silently turn into empty hint anyway.
-  if (typeof output_format === 'string' && _OUTPUT_FORMAT_VALUES.has(output_format as OutputFormat)) {
-    data.output_format = output_format as OutputFormat;
+  // Persist `output_format` only when the caller supplied a non-auto value the
+  // enum recognizes. Auto is the implicit default, so leaving it off keeps
+  // agent specs clean while dispatch still injects automatic layout rules.
+  const cleanOutputFormat = _canonicalOutputFormat(output_format);
+  if (cleanOutputFormat && cleanOutputFormat !== 'auto') {
+    data.output_format = cleanOutputFormat;
   }
   // Persist runtime only when it survives validation; an in_process
   // selection is the implicit default and not written to disk so old
@@ -1071,7 +1107,7 @@ export interface UpdateAgentFields {
    *  Authored by the agent edit UI (connectors toggle list), NOT the agent-edit LLM. */
   enabled_connectors?: string[] | null;
   /** Three-way update:
-   *   OutputFormat string → set (one of the three enum values)
+   *   OutputFormat string → set (one of the constrained enum values)
    *   null                 → drop (revert to default 'auto')
    *   omitted              → untouched
    *  Authored by the agent edit UI dropdown. */
@@ -1229,12 +1265,13 @@ async function _applyAgentUpdates(
   }
   if (Object.prototype.hasOwnProperty.call(updates || {}, 'output_format')) {
     const v = (updates as { output_format?: OutputFormat | null }).output_format;
-    if (v === null || v === 'auto') {
+    const clean = _canonicalOutputFormat(v);
+    if (v === null || clean === 'auto') {
       // 'auto' is the implicit default; don't write it to disk so spec
       // diffs stay clean and unset agents don't suddenly get a field.
       delete (data as { output_format?: unknown }).output_format;
-    } else if (typeof v === 'string' && _OUTPUT_FORMAT_VALUES.has(v)) {
-      (data as { output_format?: OutputFormat }).output_format = v;
+    } else if (clean) {
+      (data as { output_format?: OutputFormat }).output_format = clean;
     }
   }
   if (Object.prototype.hasOwnProperty.call(updates || {}, 'icon')) {
@@ -1313,6 +1350,7 @@ export async function updateAgentSpec(
   if (fs.existsSync(customAgentFile(agentId))) {
     return updateCustomAgent(agentId, updates);
   }
+  if (fs.existsSync(_platformAgentSpecFile(agentId))) return null;
   return null;
 }
 
@@ -1397,14 +1435,6 @@ export async function deleteCustomAgent(agentId: string): Promise<boolean> {
     }
   }
 
-  // Cascade: drop every conversation tied to this agent across every user.
-  try {
-    // Lazy require breaks the circular chats↔agents dependency.
-    const chats = require('./chats');
-    await chats.deleteConversationsByAgent(agentId);
-  } catch (err) {
-    log.warn(`cascade chat cleanup failed for ${agentId}: ${(err as Error).message}`);
-  }
   // Metacognition + evolved skills are already wiped by the
   // `rm -rf agents/<aid>/` above — meta / skills sub-directories live
   // inside that tree. No separate purge is needed.
@@ -1600,7 +1630,10 @@ async function _appendAgentChatMessage(userId: string, agentId: string, record: 
 
 export async function clearAgentChat(userId: string, agentId: string): Promise<boolean> {
   const agent = await getAgent(agentId);
-  if (!agent || agent.source !== 'custom') return false;
+  // Custom agents always allow clearing; built-in chat dirs only exist when
+  // dev mode has been editing them — allow clearing those too.
+  if (!agent) return false;
+  if (agent.source !== 'custom' && !false) return false;
   for (const p of [agentChatMsgsPath(userId, agentId), agentChatMetaPath(userId, agentId)]) {
     if (fs.existsSync(p)) {
       try { await fsp.unlink(p); }
@@ -1676,9 +1709,8 @@ export function buildAgentEditSystemPrompt(agent: {
         workflow: (agent.workflow || '').trim() || '(not provided)',
         interactive: agent.interactive === true ? 'true' : 'false',
       });
-  return `${body}\n\n---\n\n${buildLanguageDirective()}`;
   const tail = buildLanguageDirective();
-  return `${body}\n\n---\n\n${tail}`;
+  return `${body}\n\n---\n\n${tail}\n\n---\n\n${buildRuntimeDatetimeBlock()}`;
 }
 
 export interface AgentEditResult {
@@ -1688,18 +1720,58 @@ export interface AgentEditResult {
   updated?: ExtractedFields;
 }
 
-export async function sendToAgentEditChat(userId: string, agentId: string, content: string): Promise<AgentEditResult> {
+function agentEditAttachmentCid(agentId: string): string {
+  return `agent-edit-${agentId}`;
+}
+
+async function buildAgentEditMessageWithAttachments(
+  userId: string,
+  agentId: string,
+  content: string,
+  attachments?: string[],
+): Promise<{
+  message: string;
+  images: Array<{ data: string; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' }>;
+  attachmentNames: string[];
+  attachmentCid: string;
+}> {
+  const attachmentNames = Array.isArray(attachments)
+    ? attachments.filter((n): n is string => typeof n === 'string' && !!n.trim())
+    : [];
+  const attachmentCid = agentEditAttachmentCid(agentId);
+  if (!attachmentNames.length) return { message: content, images: [], attachmentNames, attachmentCid };
+  const { manifest, images } = await buildAttachmentManifest(userId, attachmentCid, attachmentNames);
+  return {
+    message: manifest ? `${manifest}\n${content}` : content,
+    images,
+    attachmentNames,
+    attachmentCid,
+  };
+}
+
+export async function sendToAgentEditChat(
+  userId: string,
+  agentId: string,
+  content: string,
+  opts: { attachments?: string[] } = {},
+): Promise<AgentEditResult> {
   const agent = await getAgent(agentId);
   if (!agent) return { ok: false, error: 'agent not found' };
-  if (agent.source !== 'custom') return { ok: false, error: t('errors.builtin_agent_not_editable') };
+  if (agent.source !== 'custom' && !false) {
+    return { ok: false, error: t('errors.builtin_agent_not_editable') };
+  }
 
   const meta = await loadAgentChatMeta(userId, agentId);
   const sessionId = meta.session_id || defaultAgentEditSessionId(agentId);
 
   const systemPrompt = buildAgentEditSystemPrompt(agent);
+  const attachmentCtx = await buildAgentEditMessageWithAttachments(userId, agentId, content, opts.attachments);
 
   await _appendAgentChatMessage(userId, agentId,
-    { time: nowIso(), role: 'user', content });
+    {
+      time: nowIso(), role: 'user', content,
+      ...(attachmentCtx.attachmentNames.length ? { attachments: attachmentCtx.attachmentNames, attachment_cid: attachmentCtx.attachmentCid } : {}),
+    });
 
   const { chatWithModel } = require('../model/client');
   // Read-only access to the builtin skills root so the LLM can `read_file`
@@ -1707,9 +1779,17 @@ export async function sendToAgentEditChat(userId: string, agentId: string, conte
   // `chat_agent_setup.md`). No write side — every mutation goes through
   // the `<agent>` container parser post-stream.
   const result = await chatWithModel({
-    userId, message: content, sessionId, systemPrompt,
+    userId, message: attachmentCtx.message, sessionId, systemPrompt,
     agentName: 'orkas_chat', timeout: 300,
     readOnlyExtraRoots: [userMarketplaceSkillsDir(userId), userSkillsDir(userId)],
+    ...(attachmentCtx.attachmentNames.length ? {
+      images: attachmentCtx.images,
+      readOnlyExtraRoots: [
+        userMarketplaceSkillsDir(userId),
+        userSkillsDir(userId),
+        chatAttachmentDir(userId, attachmentCtx.attachmentCid),
+      ],
+    } : {}),
   });
 
   if (!result.ok) {
@@ -1724,7 +1804,7 @@ export async function sendToAgentEditChat(userId: string, agentId: string, conte
   const fields = blocks[0] || {};
   const updated: ExtractedFields = {};
   if (Object.keys(fields).length) {
-    await updateCustomAgent(agentId, fields);
+    await updateAgentSpec(agentId, fields);
     Object.assign(updated, fields);
   }
 
@@ -1739,7 +1819,7 @@ const MAX_AGENT_PROCESS_ITEMS = 300;
 
 export async function* streamSendToAgentEditChat(
   userId: string, agentId: string, content: string,
-  opts: { abortSignal?: AbortSignal } = {},
+  opts: { abortSignal?: AbortSignal; attachments?: string[] } = {},
 ): AsyncGenerator<any, void, unknown> {
   const agent = await getAgent(agentId);
   if (!agent) {
@@ -1747,8 +1827,8 @@ export async function* streamSendToAgentEditChat(
     yield { type: 'done' };
     return;
   }
-  if (agent.source !== 'custom') {
-    yield { type: 'error', text: '内置智能体不可通过对话编辑' };
+  if (agent.source !== 'custom' && !false) {
+    yield { type: 'error', text: t('errors.builtin_agent_not_editable') };
     yield { type: 'done' };
     return;
   }
@@ -1757,9 +1837,13 @@ export async function* streamSendToAgentEditChat(
   const sessionId = meta.session_id || defaultAgentEditSessionId(agentId);
 
   const systemPrompt = buildAgentEditSystemPrompt(agent);
+  const attachmentCtx = await buildAgentEditMessageWithAttachments(userId, agentId, content, opts.attachments);
 
   await _appendAgentChatMessage(userId, agentId,
-    { time: nowIso(), role: 'user', content });
+    {
+      time: nowIso(), role: 'user', content,
+      ...(attachmentCtx.attachmentNames.length ? { attachments: attachmentCtx.attachmentNames, attachment_cid: attachmentCtx.attachmentCid } : {}),
+    });
 
   const { streamChatWithModel } = await import('../model/client');
   let finalText: string | null = null;
@@ -1773,10 +1857,15 @@ export async function* streamSendToAgentEditChat(
 
   try {
     for await (let event of streamChatWithModel({
-      userId, message: content, sessionId, systemPrompt,
+      userId, message: attachmentCtx.message, sessionId, systemPrompt,
       agentName: 'orkas_chat',
       cacheRetention: 'short',
-      readOnlyExtraRoots: [userMarketplaceSkillsDir(userId), userSkillsDir(userId)],
+      readOnlyExtraRoots: [
+        userMarketplaceSkillsDir(userId),
+        userSkillsDir(userId),
+        ...(attachmentCtx.attachmentNames.length ? [chatAttachmentDir(userId, attachmentCtx.attachmentCid)] : []),
+      ],
+      ...(attachmentCtx.images.length ? { images: attachmentCtx.images } : {}),
       ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
     }) as AsyncIterable<any>) {
       const etype = event.type;
@@ -1794,7 +1883,7 @@ export async function* streamSendToAgentEditChat(
         // Inline edit chat is bound to one agent; apply only the first block.
         const fields = blocks[0] || {};
         if (Object.keys(fields).length) {
-          await updateCustomAgent(agentId, fields);
+          await updateAgentSpec(agentId, fields);
           Object.assign(updated, fields);
           for (const k of ['name', 'workflow', 'category'] as const) {
             if (fields[k] !== undefined) {

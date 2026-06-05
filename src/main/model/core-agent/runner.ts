@@ -19,16 +19,22 @@
 
 import type { AgentTool, LLMProvider } from '#core-agent';
 
-import { pickChatEntryGroup, bumpEntryLastUsed, type ChatEntryChoice } from '../../features/auth';
+import {
+  pickChatEntryGroup,
+  bumpEntryLastUsed,
+  hasConfiguredModel,
+  getConfiguredModelCooldown,
+  type ChatEntryChoice,
+} from '../../features/auth';
 import { getSystemPromptBlock } from './skill-registry';
 import { t } from '../../i18n';
 // tool-catalog.ts: TOOL_CATALOG kept as the source of truth for the drift
 // test (tool-catalog.test.ts asserts injected names ⊆ catalog) and for any
 // future targeted use; runtime no longer renders the prompt block from it.
 import { getSession } from './session-store';
-import { addEntry, replaceEntry, removeEntry, listEntries } from '../../features/memory';
+import { addEntry, replaceEntry, removeEntry, listEntries, formatForSystemPrompt as formatMemoryForSystemPrompt } from '../../features/memory';
 import * as metacognition from '../../features/metacognition';
-import { appendAgentSkill } from '../../features/agents';
+import { appendAgentSkill, listAgents } from '../../features/agents';
 const log = createLogger('model/runner');
 import { createLocalTools, createFileTools } from './local-tools';
 import { createKbTools } from './kb-tools';
@@ -44,7 +50,7 @@ import {
 import { createMoonshotProvider, createDeepSeekProvider, createDoubaoProvider } from './external-providers';
 import { createRotatingProvider, type RotatingCandidate } from './rotating-provider';
 import { clearCooldown } from './profile-cooldown';
-import { EXTERNAL_API_PROVIDERS } from '../provider_catalog';
+import { EXTERNAL_API_PROVIDERS, resolveConfiguredPiModel } from '../provider_catalog';
 import { readDisabledSets } from '../../features/component_enabled';
 import { nativeSearchToolForApi, nativeSearchToolName } from './native-search-tools';
 import { hasAnySearchProfile } from '../../features/search_auth';
@@ -54,6 +60,10 @@ import type { MemoryToolHandler } from '../../../core-agent/src/tools/memory-too
 import type { MetacognitionToolHandler } from '../../../core-agent/src/tools/metacognition-tool';
 
 const runnerLog = createLogger('runner');
+
+function isNativeSearchEnabled(): boolean {
+  return true;
+}
 
 type CA = typeof import('#core-agent');
 type AgentRunnerCtor = CA['AgentRunner'];
@@ -87,6 +97,10 @@ export interface BuildRunnerParams {
    *  / process_file_full calls whose path targets the attachment dir of the
    *  current conv. */
   cid?: string;
+  /** Stable id for the visible actor turn. Threaded to local-tools so bash
+   *  can expose a per-turn ORKAS_OUTPUT_DIR for script-generated deliverables
+   *  without racing parallel agents in the same conversation workspace. */
+  turnId?: string;
   /** Project id of the conversation, when it belongs to one. Threaded
    *  through to local-tools / file-tools / image-gen-tool so workspace
    *  resolution picks up the project-scoped selection. Resolved once at
@@ -122,7 +136,7 @@ export interface BuildRunnerParams {
    *  only sanctioned mutation channels for those resources. */
   readOnlyExtraRoots?: readonly string[];
   /** Fires with the absolute path after each successful `write_file` /
-   * `markdown_to_pdf` / `html_to_pdf` call. See `model/client.ts`
+   * `markdown_to_pdf` / `html_to_pdf` call or tracked bash output file. See `model/client.ts`
    * `ChatOptions.onFileWritten` for the caller-facing contract. */
   onFileWritten?: (absPath: string) => void;
   /** Caller-supplied predicate consumed by write-style tools' uniquify
@@ -138,11 +152,31 @@ export interface BuildRunnerParams {
   /** Fires when `read_file` resolves to a SKILL.md path inside any of the
    *  three skill roots. Bus collects per turn for `skill_invoked`. */
   onSkillInvoked?: (skill_id: string, system: 'A.custom' | 'A.platform' | 'B', trigger: 'read_file') => void;
+  /** Fires when the pi-ai onPayload hook injects a vendor native web search
+   *  tool schema for this call. Used by client.ts to record a synthetic
+   *  `progress/native_search/injected` event into the devtools archive.
+   *  May fire multiple times per chat turn if rotating-provider falls over
+   *  to a secondary candidate. */
+  onNativeSearchInjected?: (info: NativeSearchInjectedInfo) => void;
+  /** Fires when rotating-provider commits to a candidate (success) or
+   *  surfaces a non-rotatable error (failure). Used by client.ts to update
+   *  the dev archive's recorded model / provider / profile so the stored
+   *  row reflects the candidate that actually owned the visible outcome,
+   *  not the rotating-provider's primary label. Fires at most once per
+   *  call; not invoked when rotation rolls past a candidate. */
+  onCandidateChosen?: (info: { profileId: string; providerId: string; modelId: string }) => void;
 }
 
-/** Tool definition snapshot used to log "what tools did the LLM actually see
- * for this call" when troubleshooting via logs. Mirrors the AgentTool shape
- * minus the executor closure (which is not
+export interface NativeSearchInjectedInfo {
+  provider: string;
+  model: string;
+  api: string;
+  tool: string;
+}
+
+/** Tool definition snapshot persisted to the dev-only LLM archive so the
+ * debug panel can show "what tools did the LLM actually see for this call".
+ * Mirrors the AgentTool shape minus the executor closure (which is not
  * serialisable). */
 export interface ToolDefSnapshot {
   name: string;
@@ -163,8 +197,14 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   modelId: string;
   /** Final tool set visible to the LLM (after last-write-wins merge of
    *  core-agent builtins + buildRunner-injected + caller-supplied extras).
-   *  Currently unused at the consumer level; kept for future debugging hooks. */
+   *  Used by the dev-only archiver. */
   toolDefs: ToolDefSnapshot[];
+  /** UI-only skill display names collected while rendering the prompt block.
+   *  Not injected into model context; reused for process-log labels. */
+  skillDisplayNameById: Map<string, string>;
+  /** UI-only agent display names collected once before the run.
+   *  Not injected into model context; reused for process-log labels. */
+  agentDisplayNameById: Map<string, string>;
 }> {
   // Auth gate first — if no group has any usable candidate, fail before
   // loading core-agent / scanning skills / opening a session file. Gives
@@ -173,6 +213,14 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const group = await pickChatEntryGroup();
   const primary: ChatEntryChoice | undefined = group[0];
   if (!primary && !process.env.ANTHROPIC_API_KEY) {
+    const cooldown = getConfiguredModelCooldown();
+    if (cooldown) {
+      const seconds = Math.max(1, Math.ceil((cooldown.cooledUntil - Date.now()) / 1000));
+      throw new Error(t('errors.model_temporarily_unavailable', { seconds }));
+    }
+    if (hasConfiguredModel().configured) {
+      throw new Error(t('errors.model_config_unavailable'));
+    }
     throw new Error(t('errors.no_model_configured'));
   }
 
@@ -193,6 +241,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   //   - agent in a project (both set) → intersection
   // SkillStore (System B) stays gated by `skillList` alone — see line ~429.
   const renderAllowlist = _intersectRenderAllowlist(params.skillList, params.projectAllowedSkillIds);
+  const skillDisplayNameById = new Map<string, string>();
   const [mod, session, skillsBlock] = await Promise.all([
     ca(),
     getSession(params.sessionId),
@@ -200,17 +249,28 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       ...(renderAllowlist === undefined ? {} : { allowlist: [...renderAllowlist] }),
       disabledIds: disabledSkillIds,
       ...(params.onSkillAdvertised ? { onSkillAdvertised: params.onSkillAdvertised } : {}),
+      displayNameById: skillDisplayNameById,
     }),
   ]);
 
   const providerId = primary?.provider || 'anthropic';
-  const modelId    = primary?.model    || 'claude-sonnet-4-5';
+  const modelId    = primary?.model    || 'claude-opus-4-8';
 
   // Build tools array: memory tool + metacognition tool. Assembly stays
   // above the system-prompt build because finalToolNames is still snapshotted
   // for the dev archive after this section.
   const uid = params.userId || _safeActiveUserId();
   const agentId = params.agentId || '';
+  const agentDisplayNameById = new Map<string, string>();
+  if (uid) {
+    try {
+      for (const agent of await listAgents()) {
+        if (agent?.agent_id) agentDisplayNameById.set(agent.agent_id, agent.name || agent.agent_id);
+      }
+    } catch (err) {
+      log.warn(`agent display-name scan failed: ${(err as Error).message}`);
+    }
+  }
   const injectedTools: AgentTool[] = [];
 
   if (uid) {
@@ -246,8 +306,18 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...(uid ? { userId: uid } : {}),
     ...(params.cid ? { cid: params.cid } : {}),
     ...(agentId ? { agentId } : {}),
+    ...(params.turnId ? { turnId: params.turnId } : {}),
     ...(params.projectId ? { projectId: params.projectId } : {}),
     ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
+    // `readOnlyExtraRoots` is threaded to localTools too — but ONLY the
+    // `delete_file` tool actually consumes it via `guardDeletePath`. The
+    // write-side tools (`write_file` / `edit_file`) still use
+    // `guardEditPath`, which ignores readOnly roots and keeps them
+    // immutable. The asymmetry exists because `delete_file` carries a
+    // per-call UI confirm modal (`delete-file-confirm.ts`) that the user
+    // physically has to click — that gate justifies allowing deletion of
+    // paths the caller marked read-only for silent writes.
+    ...(params.readOnlyExtraRoots?.length ? { readOnlyExtraRoots: params.readOnlyExtraRoots } : {}),
     ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
     ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
     ...(params.onArtifactCreated ? { onArtifactCreated: params.onArtifactCreated } : {}),
@@ -257,10 +327,10 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // Same last-write-wins rule — placed after localTools so `read_file` wins
   // over core-agent's builtin `read_file`. Skipped when uid is unknown
   // (e.g. ad-hoc test runs) since file-tools need it for cache scoping.
-  // `readOnlyExtraRoots` is intentionally only threaded HERE — write-side
-  // localTools / image-gen-tool stay limited to workspace + attachment +
-  // (read-write) extraRoots, so paths the caller marks read-only physically
-  // can't be mutated by the LLM.
+  // `readOnlyExtraRoots` is threaded here for the read scope (workspace +
+  // attachment + extraRoots + readOnlyExtraRoots all visible), while
+  // write-side tools (`write_file` / `edit_file`) still ignore it; only
+  // the dedicated `delete_file` tool above can act on those paths.
   const fileTools = uid
     ? createFileTools({
         userId: uid,
@@ -272,12 +342,15 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       })
     : [];
 
-  // Knowledge-base tools (kb_search + kb_read). Read-only, no localExec
+  // Library tools (kb_list + kb_search + kb_read). Read-only, no localExec
   // required. Injected for every main conv + group_chat actor; agent-edit
   // / skill-edit sessions also get them (the LLM may want to preview KB
   // content when building workflows). Skipped when uid is unknown
   // (matches file-tools).
-  const kbTools = uid ? createKbTools({ userId: uid }) : [];
+  const kbTools = uid ? createKbTools({
+    userId: uid,
+    ...(params.projectId ? { projectId: params.projectId } : {}),
+  }) : [];
 
   // Conversation-history tools (chat_search + chat_read). Read-only and
   // lower-priority than KB: useful for "what did we discuss before" recall,
@@ -319,7 +392,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // selection-accuracy cliff and invalidate the prompt-cache prefix on every connect/disconnect.
   //
   // Session-kind gate (tri-state):
-  //   - `gconv` (commander)  + `gmember` (agent worker)  → block + full tools (list + call —
+  //   - `gconv` (commander)                              → block + full tools (list + call —
   //                                                         actual user tasks invoking external
   //                                                         services).
   //   - `agent` (agent-edit)                              → block + discover-only tool
@@ -393,9 +466,10 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...wrappedTools.map((t) => t.name),
   ]));
 
-  // Snapshot the final tool definitions. Last-write-wins merge: builtins
-  // first, then wrappedTools override by name. Source label tracks where
-  // each definition came from for downstream introspection.
+  // Snapshot the final tool definitions for the dev archive. Last-write-wins
+  // merge: builtins first, then wrappedTools override by name. Source label
+  // tracks where each definition came from so the debug panel can call out
+  // injected vs. caller-supplied tools.
   const toolDefMap = new Map<string, ToolDefSnapshot>();
   for (const t of builtinTools) {
     toolDefMap.set(t.name, {
@@ -422,6 +496,12 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // need to live in the messages context.
   const parts: string[] = [];
   if (params.systemPrompt) parts.push(params.systemPrompt.trim());
+  // Cross-session memory (read side): the user's stored profile + notes as
+  // background context. Sits right after the role prompt as a session-stable
+  // segment; empty string when nothing is stored (no tokens for new users).
+  // Re-read each turn — a mid-conversation write shows up next turn.
+  const memoryBlock = uid ? formatMemoryForSystemPrompt(uid) : '';
+  if (memoryBlock) parts.push(memoryBlock);
   if (skillsBlock) parts.push(skillsBlock.trim());
   if (connectorBlock) parts.push(connectorBlock.trim());
   const resolvedSystemPrompt = parts.join('\n\n');
@@ -466,7 +546,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     // Build a rotating provider covering the whole primary group. Even
     // when there's only one candidate, the wrapper is cheap (just one
     // pass-through) and keeps the code path uniform.
-    const rotating = await buildRotatingProvider(mod, providerId, group);
+    const rotating = await buildRotatingProvider(mod, providerId, group, params.onNativeSearchInjected, params.onCandidateChosen);
     // Inject the rotating provider into BOTH the factory slot AND the
     // pre-built instance cache. ProviderRegistry.get() short-circuits on
     // the instance cache without consulting the factory, so injecting
@@ -518,6 +598,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     providerId,
     modelId,
     toolDefs,
+    skillDisplayNameById,
+    agentDisplayNameById,
   };
 }
 
@@ -535,8 +617,8 @@ function _safeActiveUserId(): string | null {
 }
 
 /** Tri-state connector exposure, gated by session kind (CLAUDE.md §5 session-id table):
- *   - `tools+block`:    group-chat sessions (`gconv` commander + `gmember` agent worker) —
- *     block + both meta-tools (`list_connector_tools` + `call_connector_tool`). Full exposure.
+ *   - `tools+block`:    group-chat commander sessions (`gconv`) — block + both meta-tools
+ *     (`list_connector_tools` + `call_connector_tool`). Full exposure.
  *   - `discover+block`: agent-edit (`agent`) — block + `list_connector_tools` ONLY. Editor LLM
  *     can discover action names + JSON schemas to write specific workflow steps; cannot invoke
  *     (an authoring session must never produce external side effects).
@@ -548,7 +630,7 @@ function _safeActiveUserId(): string | null {
  * session_id format is `<kind>-<tail>` (CLAUDE.md §5 — uid no longer in session_id), so the
  * kind keyword is anchored at the start. */
 export function connectorExposureFromSessionId(sessionId: string): 'tools+block' | 'discover+block' | 'none' {
-  if (/^(gconv|gmember)-/.test(sessionId)) return 'tools+block';
+  if (/^gconv-/.test(sessionId)) return 'tools+block';
   // Agent-edit gets `list_connector_tools` (read-only, no side effects) so the editor LLM can
   // learn each connector's action names and write specific workflow steps — but NOT
   // `call_connector_tool`, since an authoring session must never produce external side
@@ -599,6 +681,8 @@ async function buildRotatingProvider(
   mod: CA,
   providerId: string,
   group: ChatEntryChoice[],
+  onNativeSearchInjected?: (info: NativeSearchInjectedInfo) => void,
+  onCandidateChosen?: (info: { profileId: string; providerId: string; modelId: string }) => void,
 ): Promise<LLMProvider> {
   const candidates: RotatingCandidate[] = group.map((choice) => {
     const candProviderId = choice.provider;
@@ -612,17 +696,20 @@ async function buildRotatingProvider(
         if (isExternal) {
           return buildExternalProvider(candProviderId, choice.apiKey, candModelId);
         }
-        // The pi-ai catalog has no OAuth variant (`minimax-portal[-cn]`),
-        // but the OAuth endpoint shares baseUrl + api protocol with the
-        // corresponding API-key endpoint (`minimax[-cn]`); the access
-        // token can be used directly as a Bearer. Reuse the API-key
-        // Model metadata as customModel and skip the catalog lookup.
-        const customModel = aliasedPiModel(mod, candProviderId, candModelId);
+        const resolvedModel = resolveConfiguredPiModel(mod, candProviderId, candModelId);
+        if (resolvedModel?.isConfiguredFallback) {
+          log.info('using configured model fallback', {
+            provider: candProviderId,
+            model: candModelId,
+            templateProvider: resolvedModel.catalogProviderId,
+            templateModel: resolvedModel.templateModelId,
+          });
+        }
         return mod.createPiProvider({
           provider: candProviderId,
-          ...(customModel ? { customModel } : { model: candModelId }),
+          ...(resolvedModel?.needsCustomModel ? { customModel: resolvedModel.model } : { model: candModelId }),
           apiKey: choice.apiKey,
-          onPayload: buildNativeSearchOnPayload(candProviderId, candModelId),
+          onPayload: buildNativeSearchOnPayload(candProviderId, candModelId, onNativeSearchInjected),
         });
       },
     };
@@ -636,31 +723,8 @@ async function buildRotatingProvider(
       if (winner) bumpEntryLastUsed(winner.entryId);
       clearCooldown(profileId);
     },
+    ...(onCandidateChosen ? { onCandidateChosen } : {}),
   });
-}
-
-/**
- * Aliases for OAuth provider ids that are unknown to the pi-ai catalog →
- * the same-origin API-key provider. Same origin = same baseUrl + same api
- * protocol; an OAuth access token rides as a Bearer, indistinguishable
- * from an API key at the HTTP layer. Returns undefined when no alias is
- * registered, letting the caller fall through to the original catalog
- * lookup.
- */
-const PI_PROVIDER_ALIAS: Readonly<Record<string, string>> = {
-  'minimax-portal-cn': 'minimax-cn',
-  'minimax-portal':    'minimax',
-};
-
-function aliasedPiModel(mod: CA, providerId: string, modelId: string) {
-  const alias = PI_PROVIDER_ALIAS[providerId];
-  if (!alias) return undefined;
-  const m = mod.getPiModel(alias as any, modelId as any);
-  if (!m) {
-    log.warn(`pi-ai catalog has no ${alias}/${modelId}; falling back to default lookup`);
-    return undefined;
-  }
-  return m;
 }
 
 /** Check if metacognition feature is enabled.
@@ -677,9 +741,10 @@ export function isMetacognitionEnabled(): boolean {
 /**
  * Builds a pi-ai `onPayload` callback: pi-ai invokes it after handing us
  * the result of `buildParams` and before sending the request. When both
- * "model.api is in the supported list" and "the user has no paid search
- * profile configured" hold, we append the model's native web search tool
- * schema to `params.tools` and write an info log.
+ * "the debug toggle is on" and "model.api is in the supported list" hold,
+ * we append the model's native web search tool schema to `params.tools`,
+ * write an info log, and bubble the "injected" event up through the
+ * caller-supplied callback to client.ts's archive recorder.
  *
  * On a miss we return params unchanged (pi-ai treats an undefined return
  * as no-op, so a no-op return is also legal).
@@ -687,8 +752,10 @@ export function isMetacognitionEnabled(): boolean {
 function buildNativeSearchOnPayload(
   providerId: string,
   modelId: string,
+  onNativeSearchInjected?: (info: NativeSearchInjectedInfo) => void,
 ): (params: unknown, model: { api?: string }) => unknown {
   return (params, model) => {
+    if (!isNativeSearchEnabled()) return params;
     // Don't inject the model-side native search when the user has any paid
     // search-tool API key configured — let the overriding `web_search` tool
     // (search-tools.ts) be the single search surface, otherwise the LLM
@@ -713,6 +780,11 @@ function buildNativeSearchOnPayload(
       provider: providerId, model: modelId, api, tool: toolName,
       msgCount, toolsBefore, approxBodyBytes,
     });
+    try {
+      onNativeSearchInjected?.({ provider: providerId, model: modelId, api, tool: toolName });
+    } catch (err) {
+      runnerLog.warn(`onNativeSearchInjected callback failed: ${(err as Error).message}`);
+    }
     return { ...cur, tools: [...(Array.isArray(cur.tools) ? cur.tools : []), tool] };
   };
 }

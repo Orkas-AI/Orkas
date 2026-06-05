@@ -58,7 +58,7 @@ export const MemoryConfigSchema = z.object({
 /** Agent configuration schema. */
 export const AgentConfigSchema = z.object({
   /** Default model to use for the agent. */
-  defaultModel: z.string().default("claude-sonnet-4-20250514"),
+  defaultModel: z.string().default("claude-opus-4-8"),
   /** Default provider. */
   defaultProvider: z.string().default("anthropic"),
   /** Max retry attempts on transient errors. */

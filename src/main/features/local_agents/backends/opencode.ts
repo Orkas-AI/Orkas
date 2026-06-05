@@ -141,8 +141,8 @@ export const opencodeBackend: LocalBackend = {
   },
 };
 
-function buildOpencodeArgs(opts: BackendRunOptions): string[] {
-  const args = ['run', '--format', 'json'];
+export function buildOpencodeArgs(opts: Pick<BackendRunOptions, 'model' | 'resumeSessionId' | 'customArgs' | 'prompt'>): string[] {
+  const args = ['run', '--format', 'json', '--dangerously-skip-permissions'];
   if (opts.model) args.push('--model', opts.model);
   if (opts.resumeSessionId) args.push('--session', opts.resumeSessionId);
   if (opts.customArgs && opts.customArgs.length) args.push(...opts.customArgs);

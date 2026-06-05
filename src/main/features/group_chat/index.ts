@@ -21,7 +21,7 @@ import {
   setCodingProjectDir, setStatus,
 } from './state';
 import { isPlaceholderTitle } from './conv_title';
-import { readPlan, type PlanFile } from './plan';
+import { findReadySteps, isPlanTerminal, readPlan, type PlanFile } from './plan';
 import * as planExecutor from './plan_executor';
 import {
   abort as busAbort, dropConv as busDropConv, enqueue, subscribe, isQuiescent, runtimeSnapshot,
@@ -37,8 +37,8 @@ export const busIsQuiescent = isQuiescent;
 export async function runtimeStatus(
   userId: string,
   cid: string,
-): Promise<{ processing: boolean; processing_since: string | null; in_flight: string[] }> {
-  if (!safeId(cid)) return { processing: false, processing_since: null, in_flight: [] };
+): Promise<{ processing: boolean; processing_since: string | null; in_flight: string[]; active_turns: Array<{ actor: string; turn_id: string }> }> {
+  if (!safeId(cid)) return { processing: false, processing_since: null, in_flight: [], active_turns: [] };
   try {
     const state = await readState(userId, cid);
     const runtime = runtimeSnapshot(userId, cid);
@@ -46,15 +46,41 @@ export async function runtimeStatus(
       ...(Array.isArray(state.in_flight) ? state.in_flight : []),
       ...runtime.inFlight,
     ].filter(Boolean)));
-    const processing = state.status === 'running' || runtime.processing;
+    const processing = state.status === 'running' || inFlight.length > 0 || runtime.processing;
     return {
       processing,
       processing_since: processing ? (state.last_active_at || null) : null,
       in_flight: inFlight,
+      active_turns: runtime.activeTurns,
     };
   } catch {
-    return { processing: false, processing_since: null, in_flight: [] };
+    return { processing: false, processing_since: null, in_flight: [], active_turns: [] };
   }
+}
+
+export type PlanControlAction = 'stop' | 'continue' | null;
+export interface PlanControlState {
+  action: PlanControlAction;
+}
+
+function isPlanFullyCompleted(plan: PlanFile | null): boolean {
+  const steps = Array.isArray(plan?.steps) ? plan.steps : [];
+  return steps.length > 0 && steps.every((s) => s.status === 'done' || s.status === 'skipped');
+}
+
+async function planControlStateFor(
+  userId: string,
+  cid: string,
+  plan: PlanFile | null,
+): Promise<PlanControlState> {
+  if (!plan || !plan.steps?.length) return { action: null };
+  if (isPlanFullyCompleted(plan)) return { action: null };
+  const runtime = await runtimeStatus(userId, cid);
+  if (runtime.processing) return { action: 'stop' };
+  if (plan.steps.some((s) => s.status === 'failed')) return { action: 'continue' };
+  if (plan.steps.some((s) => s.status === 'in_progress')) return { action: 'continue' };
+  if (!isPlanTerminal(plan) && findReadySteps(plan).length > 0) return { action: 'continue' };
+  return { action: null };
 }
 
 /** Re-export so the IPC layer can subscribe to the bus BEFORE calling
@@ -98,7 +124,7 @@ export async function send(
   try {
     const chats = await import('../chats');
     const conv = await chats.getConversation(userId, cid);
-    if (conv && isPlaceholderTitle(conv.title)) {
+    if (conv && !conv.title_manually_set && isPlaceholderTitle(conv.title)) {
       await chats.updateConversation(userId, cid, { title: chats.autoTitle(text) });
     }
   } catch (err) {
@@ -122,6 +148,7 @@ export async function send(
 
 export async function abort(userId: string, cid: string): Promise<{ ok: boolean }> {
   await busAbort(userId, cid);
+  await planExecutor.failInProgressSteps(userId, cid, 'aborted by user');
   return { ok: true };
 }
 
@@ -157,10 +184,27 @@ export async function listMembers(userId: string, cid: string) {
 
 export async function readPlanForCid(
   userId: string, cid: string,
-): Promise<{ ok: boolean; plan?: PlanFile | null; error?: string }> {
+): Promise<{ ok: boolean; plan?: PlanFile | null; has_plan?: boolean; control?: PlanControlState; error?: string }> {
   if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
   const plan = await readPlan(userId, cid);
-  return { ok: true, plan: plan || null };
+  if (isPlanFullyCompleted(plan || null)) {
+    return { ok: true, plan: null, has_plan: true, control: { action: null } };
+  }
+  return {
+    ok: true,
+    plan: plan || null,
+    has_plan: !!plan,
+    control: await planControlStateFor(userId, cid, plan || null),
+  };
+}
+
+/** Plan-level continue action for the unified rail / task-details control. */
+export async function continuePlan(
+  userId: string, cid: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
+  await clearAbortedStatusForRecovery(userId, cid);
+  return planExecutor.continuePlan(userId, cid);
 }
 
 /** User-initiated retry of a failed plan step (rail "Retry" button). */
@@ -620,13 +664,13 @@ export async function resolveMarketplaceInstallRequest(
         version: req.version,
         published_at: req.published_at,
         ...(typeof req.updated_at === 'number' ? { updated_at: req.updated_at } : {}),
-      });
+      }, { name: req.name });
     } else {
       await marketplace.installMarketplaceSkill(req.id, {
         version: req.version,
         published_at: req.published_at,
         ...(typeof req.updated_at === 'number' ? { updated_at: req.updated_at } : {}),
-      });
+      }, { name: req.name });
     }
     await _autoBindInstalledMarketplaceResource(userId, cid, req);
     const patched = await _patchMarketplaceRequest(userId, cid, msgId, requestId, {
@@ -648,7 +692,13 @@ export async function resolveMarketplaceInstallRequest(
       },
     };
   } catch (err) {
-    const error = (err as Error).message || String(err);
+    const installInfo = marketplace.getMarketplaceInstallErrorInfo(err);
+    const failedKind = installInfo.kind || req.kind;
+    const failedName = installInfo.name || req.name || req.id;
+    const failedKindLabel = failedKind === 'skill'
+      ? t('marketplace_install_result.kind_skill')
+      : t('marketplace_install_result.kind_agent');
+    const error = `${failedKindLabel}: ${failedName} - ${installInfo.reason}`;
     const patched = await _patchMarketplaceRequest(userId, cid, msgId, requestId, {
       status: 'failed',
       resolved_at: nowIso(),

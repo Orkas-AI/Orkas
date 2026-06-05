@@ -13,9 +13,11 @@
 
 import { Violation } from '../types';
 
-// Skill name pattern: starts with a letter, then word chars / dashes, single
-// spaces allowed between groups. Mirrors `skills.ts::SKILL_NAME_RE`.
-const SKILL_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]*(?: [A-Za-z0-9_-]+)*$/;
+// Skill name pattern: starts with a letter, then word chars / dashes.
+// Spaces are not allowed. Mirrors `skills.ts::SKILL_NAME_RE`.
+const SKILL_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]*$/;
+// Agent names mirror `agents.ts::NAME_TOKEN_RE`.
+const AGENT_NAME_RE = /^[A-Za-z0-9_一-鿿-]+$/;
 
 // Description length budget: signal for "selection prompt readability" rather
 // than a hard cap. Empirically established by scanning current marketplace
@@ -34,8 +36,8 @@ export function validateSkillFrontmatter(
 ): Violation[] {
   const out: Violation[] = [];
 
-  const name = typeof frontmatter.name === 'string' ? frontmatter.name.trim() : '';
-  if (!name) {
+  const name = typeof frontmatter.name === 'string' ? frontmatter.name : '';
+  if (!name.trim()) {
     out.push({
       level: 'EXTREME',
       rule: 'frontmatter_name_missing',
@@ -52,7 +54,7 @@ export function validateSkillFrontmatter(
       rule: 'frontmatter_name_invalid',
       field: 'frontmatter:name',
       snippet: name.slice(0, 100),
-      suggested_fix: 'Skill name should start with a letter and contain only letters, digits, `_`, `-`, and single spaces between word groups.',
+      suggested_fix: 'Skill name should start with a letter and contain only letters, digits, `_`, and `-`; spaces are not allowed.',
     });
   }
 
@@ -130,14 +132,22 @@ export function validateAgentJsonShape(
     });
   }
 
-  const name = typeof agentJson.name === 'string' ? agentJson.name.trim() : '';
-  if (!name) {
+  const name = typeof agentJson.name === 'string' ? agentJson.name : '';
+  if (!name.trim()) {
     out.push({
       level: 'EXTREME',
       rule: 'agent_name_missing',
       field: 'agent.json:name',
       snippet: '',
       suggested_fix: 'Agent spec must include a non-empty `name`.',
+    });
+  } else if (!AGENT_NAME_RE.test(name)) {
+    out.push({
+      level: 'MEDIUM',
+      rule: 'agent_name_invalid',
+      field: 'agent.json:name',
+      snippet: name.slice(0, 100),
+      suggested_fix: 'Agent name should contain only letters, digits, `_`, `-`, or CJK characters; spaces are not allowed.',
     });
   }
 

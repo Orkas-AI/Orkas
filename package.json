@@ -1,11 +1,11 @@
 {
   "name": "orkas",
-  "version": "2026.5.22",
+  "version": "1.0.0",
   "private": true,
-  "license": "MIT",
   "description": "Orkas desktop — Electron + Node one-piece app",
   "main": "bootstrap.cjs",
   "type": "commonjs",
+  "packageManager": "npm@11.11.0",
   "imports": {
     "#core-agent": "./src/core-agent/src/index.ts"
   },
@@ -25,16 +25,16 @@
   "devDependencies": {
     "@types/adm-zip": "^0.5.7",
     "@types/node": "^25.6.0",
-    "electron": "^32.0.0",
+    "electron": "^41.7.1",
     "typescript": "^6.0.3",
     "vitest": "^4.1.5"
   },
   "dependencies": {
-    "@mariozechner/pi-ai": "^0.73.0",
+    "@earendil-works/pi-ai": "^0.78.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "adm-zip": "^0.5.16",
     "async-mutex": "^0.5.0",
-    "better-sqlite3": "^12.9.0",
+    "better-sqlite3": "^12.10.0",
     "electron-log": "^5.4.3",
     "fastembed": "^2.1.0",
     "jimp": "^1.6.1",
@@ -43,6 +43,9 @@
     "sqlite-vec": "^0.1.9",
     "tsx": "^4.21.0",
     "zod": "^3.24.0"
+  },
+  "overrides": {
+    "tar": "7.5.15"
   },
   "build": {
     "appId": "com.orkas.desktop",
@@ -62,7 +65,7 @@
     "files": [
       "bootstrap.cjs",
       "bin/**/*",
-      "src/main/**/*.{js,ts,mjs,cjs,md,json}",
+      "src/main/**/*.{js,ts,mjs,md,json}",
       "src/renderer/**/*",
       "src/builtin/**/*",
       "src/resources/icons/**/*",
@@ -110,7 +113,7 @@
       "hardenedRuntime": true,
       "entitlements": "product/signing/entitlements.mac.plist",
       "entitlementsInherit": "product/signing/entitlements.mac.inherit.plist",
-      "notarize": true,
+      "notarize": false,
       "forceCodeSigning": true,
       "target": [
         {
@@ -128,14 +131,21 @@
           ]
         }
       ],
-      "icon": "src/resources/icons/icon.icns"
+      "icon": "src/resources/icons/icon.icns",
+      "extendInfo": {}
     },
     "dmg": {
       "writeUpdateInfo": false
     },
     "win": {
       "target": "nsis",
-      "icon": "src/resources/icons/icon.ico"
+      "icon": "src/resources/icons/icon.ico",
+      "signtoolOptions": {
+        "signingHashAlgorithms": [
+          "sha256"
+        ],
+        "rfc3161TimeStampServer": "http://ts.ssl.com"
+      }
     },
     "linux": {
       "target": "AppImage",
@@ -144,5 +154,6 @@
   },
   "optionalDependencies": {
     "@esbuild/darwin-arm64": "^0.27.7"
-  }
+  },
+  "license": "MIT"
 }

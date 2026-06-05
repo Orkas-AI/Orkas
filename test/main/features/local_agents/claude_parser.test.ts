@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mapClaudeEvent, extractClaudeUsage } from '../../../../src/main/features/local_agents/backends/claude';
+import { buildClaudeArgs, mapClaudeEvent, extractClaudeUsage } from '../../../../src/main/features/local_agents/backends/claude';
 
 describe('local_agents/backends/claude › mapClaudeEvent', () => {
   it('captures session id AND emits status:running on system/init (parity with multica)', () => {
@@ -129,14 +129,14 @@ describe('local_agents/backends/claude › mapClaudeEvent', () => {
         cache_read_input_tokens: 800,
         cache_creation_input_tokens: 12,
       },
-      message: { model: 'claude-sonnet-4-6' },
+      message: { model: 'claude-opus-4-7' },
     }, 'sess');
     const expected = {
       input: 1234,
       output: 567,
       cacheRead: 800,
       cacheCreate: 12,
-      model: 'claude-sonnet-4-6',
+      model: 'claude-opus-4-7',
     };
     expect(r?.terminal?.usage).toEqual(expected);
     // Status event also carries usage so the rail renders
@@ -193,5 +193,14 @@ describe('local_agents/backends/claude › mapClaudeEvent', () => {
       request: { subtype: 'can_use_tool', tool_name: 'Bash', input: { command: 'ls' } },
     }, 'sess');
     expect(r).toBeUndefined();
+  });
+});
+
+describe('local_agents/backends/claude › trusted local permissions', () => {
+  it('starts Claude Code in non-interactive full-permission mode', () => {
+    const args = buildClaudeArgs({});
+    expect(args).toContain('--permission-mode');
+    expect(args).toContain('bypassPermissions');
+    expect(args).toContain('--dangerously-skip-permissions');
   });
 });

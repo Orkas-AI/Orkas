@@ -1,5 +1,5 @@
 /**
- * In-process cooldown map for auth-profiles whose key hit a rotatable
+ * In-process cooldown map for auth-profiles whose key hit a credential/account
  * failure (401 / 403 / 429 / 402 — see `auth-error.ts::classifyKeyFailure`).
  *
  * When a profile fails with a key-specific error:
@@ -24,23 +24,9 @@ const log = createLogger('auth-cooldown');
 /** Default cooldown duration: 10 minutes. Tests override via parameter. */
 export const DEFAULT_COOLDOWN_MS = 10 * 60 * 1000;
 
-/** Short cooldown for `network` kind (TCP reset / TLS handshake fail / DNS
- *  miss). The block is often endpoint-specific (firewall, GFW) and may
- *  clear within seconds; we just want to skip the bad endpoint long enough
- *  to let rotation reach a working candidate, then re-probe. */
-export const NETWORK_COOLDOWN_MS = 30 * 1000;
-
-/** Per-kind cooldown duration. Network gets a much shorter window than
- *  auth/balance because the underlying condition is likely transient
- *  (e.g. flaky route) — we don't want a one-off blip to sideline the
- *  candidate for 10 minutes. */
-function defaultDurationFor(kind: KeyFailureKind): number {
-  return kind === 'network' ? NETWORK_COOLDOWN_MS : DEFAULT_COOLDOWN_MS;
-}
-
 interface CooldownEntry {
   cooledUntil: number;
-  kind: KeyFailureKind;
+  kind: Exclude<KeyFailureKind, 'network'>;
   reason: string;
 }
 
@@ -63,7 +49,11 @@ export function markCooldown(
   durationMs?: number,
 ): void {
   if (!profileId) return;
-  const ms = durationMs ?? defaultDurationFor(kind);
+  if (kind === 'network') {
+    log.info(`skip cooldown profile=${profileId} kind=network reason=${reason.slice(0, 120)}`);
+    return;
+  }
+  const ms = durationMs ?? DEFAULT_COOLDOWN_MS;
   const cooledUntil = Date.now() + Math.max(0, ms);
   state.set(profileId, { cooledUntil, kind, reason });
   log.info(`cooldown profile=${profileId} kind=${kind} ms=${ms} reason=${reason.slice(0, 120)}`);
@@ -108,9 +98,9 @@ export function clearCooldown(profileId: string): void {
 }
 
 /** List cooled-down profile ids + metadata (sorted by cooledUntil asc). */
-export function listCooldowns(): { profileId: string; cooledUntil: number; kind: KeyFailureKind; reason: string }[] {
+export function listCooldowns(): { profileId: string; cooledUntil: number; kind: Exclude<KeyFailureKind, 'network'>; reason: string }[] {
   const now = Date.now();
-  const out: { profileId: string; cooledUntil: number; kind: KeyFailureKind; reason: string }[] = [];
+  const out: { profileId: string; cooledUntil: number; kind: Exclude<KeyFailureKind, 'network'>; reason: string }[] = [];
   for (const [pid, entry] of state) {
     if (now >= entry.cooledUntil) {
       state.delete(pid);

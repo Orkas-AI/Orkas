@@ -4,7 +4,7 @@
  * Aggregates the four skill-related signal kinds emitted in phase 0
  * (`skill_advertised` / `skill_invoked` / `correction` + `edit` /
  * `skill_ineffective`) into a per-skill dashboard row. Surfaces three
- * indicators per CLAUDE.md docs/evaluation/skill_dynamic_evaluation.md:
+ * indicators per Common/docs/evaluation/skill_dynamic_evaluation.md:
  *
  *   - **invocation_rate** = invoked / advertised
  *     "When the skill is in the system prompt, how often does the agent

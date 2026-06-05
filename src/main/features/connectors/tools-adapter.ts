@@ -25,6 +25,7 @@
 import * as manager from './manager';
 import * as agents from '../agents';
 import { isConnectorEnabled } from '../component_enabled';
+import { isConnectorRuntimeEnabled } from './availability';
 import type { ConnectorInstance, ToolSchema } from './types';
 
 /** Convert MCP `callTool`'s raw result into a single string the LLM can read.
@@ -69,7 +70,7 @@ export async function resolveVisibleConnectors(
   // throw anyway, and showing it (with a "— disconnected (ask user to refresh)" suffix) is
   // noise that pollutes both the prompt block and the meta-tool routing matrix. The user can
   // reconnect in the Connectors panel; the instance reappears on the next turn.
-  const connected = all.filter((i) => i.status.kind === 'connected');
+  const connected = all.filter((i) => i.status.kind === 'connected' && isConnectorRuntimeEnabled(i.id));
   if (!connected.length) return [];
   // Per-user soft-disable filter (Connectors panel "停用" button). Separate from `agent.enabled_connectors`:
   // this filter applies to every actor including the commander; even a disconnected-by-user instance

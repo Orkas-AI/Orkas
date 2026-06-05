@@ -7,6 +7,7 @@ const requireCjs = createRequire(import.meta.url);
 type Adapter = {
   TOOLS: Array<{ name: string }>;
   callTool: (name: string, args: Record<string, unknown>) => Promise<unknown>;
+  _buildRawMessage?: (args: Record<string, unknown>) => { raw: string; threadId?: string };
 };
 
 function loadAdapter(file: string): Adapter {
@@ -27,6 +28,11 @@ function mockFetchOnce(body: unknown, status = 200): ReturnType<typeof vi.fn> {
   const fetchMock = vi.fn(async () => jsonResponse(body, status));
   vi.stubGlobal('fetch', fetchMock);
   return fetchMock;
+}
+
+function decodeBase64Url(s: string): string {
+  const padded = s.replace(/-/g, '+').replace(/_/g, '/');
+  return Buffer.from(padded, 'base64').toString('utf8');
 }
 
 describe('Google stdio REST adapters', () => {
@@ -79,6 +85,26 @@ describe('Google stdio REST adapters', () => {
         headers: expect.objectContaining({ Authorization: 'Bearer test-access-token' }),
       }),
     );
+  });
+
+  it('gmail encodes non-ASCII send bodies as MIME-safe base64 text', () => {
+    const adapter = loadAdapter('gmail-mcp-server.cjs');
+    const message = adapter._buildRawMessage?.({
+      to: 'receiver@example.com',
+      subject: '测试邮件',
+      body: '你好，世界\n第二行',
+      threadId: 'thread-1',
+    });
+
+    expect(message?.threadId).toBe('thread-1');
+    const raw = decodeBase64Url(message?.raw || '');
+    expect(raw).toContain('Subject: =?utf-8?B?5rWL6K+V6YKu5Lu2?=');
+    expect(raw).toContain('Content-Type: text/plain; charset=UTF-8');
+    expect(raw).toContain('Content-Transfer-Encoding: base64');
+
+    const encodedBody = raw.split('\r\n\r\n')[1] || '';
+    expect(encodedBody.split('\r\n').every((line) => line.length <= 76)).toBe(true);
+    expect(Buffer.from(encodedBody.replace(/\r\n/g, ''), 'base64').toString('utf8')).toBe('你好，世界\n第二行');
   });
 
   it('calendar list_calendars maps calendarList items', async () => {

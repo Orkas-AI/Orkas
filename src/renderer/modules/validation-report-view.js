@@ -11,10 +11,11 @@
 // which is layout-specific.
 //
 // API:
-//   showValidationReport({ title, report, okLabel? }): Promise<void>
+//   showValidationReport({ title, report, okLabel?, forceLabel? }): Promise<'close'|'force'>
 //     title  — header text (caller localized)
 //     report — { ok, violations, validated_at, validator_version }
 //     okLabel — defaults to common.close
+//     forceLabel — when present, shows a neutral override button
 //
 //   readQualityReport(kind, id): Promise<ValidationReport | null>
 //     thin wrapper around window.orkas.quality.read{Skill,Agent}Report
@@ -36,9 +37,22 @@ function _levelLabel(level) {
   return level;
 }
 
+function _suggestedFixText(v) {
+  const rule = v && v.rule ? String(v.rule) : '';
+  if (rule) {
+    const key = `quality.fix.${rule}`;
+    try {
+      const localized = t(key);
+      if (localized && localized !== key) return localized;
+    } catch (_) { /* t() not ready */ }
+  }
+  return v && v.suggested_fix ? String(v.suggested_fix) : '';
+}
+
 function _renderViolationCard(v) {
   const color = _levelColor(v.level);
   const label = _levelLabel(v.level);
+  const suggestedFix = _suggestedFixText(v);
   return `
     <div class="quality-violation" style="border-left:3px solid ${color};padding:8px 12px;margin-bottom:10px;background:var(--surface-2,rgba(0,0,0,.03));border-radius:4px;">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
@@ -47,12 +61,12 @@ function _renderViolationCard(v) {
       </div>
       <div style="font-size:12px;color:var(--muted);margin-bottom:6px;font-family:var(--mono,monospace);">${escapeHtml(v.field || '')}</div>
       ${v.snippet ? `<pre style="margin:0 0 6px;padding:6px 8px;background:var(--surface-3,rgba(0,0,0,.05));border-radius:3px;font-size:12px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;">${escapeHtml(v.snippet)}</pre>` : ''}
-      <div style="font-size:13px;line-height:1.5;">${escapeHtml(v.suggested_fix || '')}</div>
+      <div style="font-size:13px;line-height:1.5;">${escapeHtml(suggestedFix)}</div>
     </div>
   `;
 }
 
-function showValidationReport({ title, report, okLabel } = {}) {
+function showValidationReport({ title, report, okLabel, forceLabel } = {}) {
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay ui-dialog-overlay open';
@@ -76,20 +90,16 @@ function showValidationReport({ title, report, okLabel } = {}) {
           catch (_) { return 'No findings.'; }
         })())}</div>`;
 
-    // Footer meta — small validator stamp, mirrors the version chip pattern on
-    // marketplace cards. Helps debugging "which rule version flagged this".
-    const meta = (report && report.validator_version)
-      ? `<div class="muted" style="font-size:11px;text-align:right;margin-top:8px;">validator ${escapeHtml(String(report.validator_version))} · ${escapeHtml(String(report.validated_at || ''))}</div>`
-      : '';
+    const force = forceLabel ? escapeHtml(forceLabel) : '';
 
     overlay.innerHTML = `
       <div class="modal ui-dialog quality-report-dialog" role="dialog" aria-modal="true" style="max-width:640px;width:90vw;">
         <div class="ui-dialog-title">${titleText}</div>
         <div class="quality-report-body" style="max-height:60vh;overflow-y:auto;margin:12px 0;">
           ${bodyHtml}
-          ${meta}
         </div>
         <div class="modal-actions">
+          ${force ? `<button class="btn" data-act="force">${force}</button>` : ''}
           <button class="btn btn-primary" data-act="ok">${ok}</button>
         </div>
       </div>
@@ -99,15 +109,15 @@ function showValidationReport({ title, report, okLabel } = {}) {
     const okBtn = overlay.querySelector('[data-act="ok"]');
     const onKey = (e) => {
       if (e.isComposing || e.keyCode === 229) return;
-      if (e.key === 'Escape' || e.key === 'Enter') finish();
+      if (e.key === 'Escape' || e.key === 'Enter') finish('close');
     };
-    const finish = () => {
+    const finish = (action = 'close') => {
       document.removeEventListener('keydown', onKey, true);
       overlay.remove();
-      resolve();
+      resolve(action);
     };
-    okBtn.addEventListener('click', finish);
-    overlay.addEventListener('click', (e) => { if (e.target === overlay) finish(); });
+    overlay.querySelector('[data-act="force"]')?.addEventListener('click', () => finish('force'));
+    okBtn.addEventListener('click', () => finish('close'));
     document.addEventListener('keydown', onKey, true);
     setTimeout(() => okBtn.focus(), 0);
   });

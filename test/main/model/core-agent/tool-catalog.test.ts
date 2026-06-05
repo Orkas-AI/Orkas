@@ -100,7 +100,7 @@ describe('tool-catalog', () => {
     const out = getToolsSystemPromptBlock(['kb_search', 'bash', 'read_file']);
     const fsIdx = out.indexOf('### Files / workspace');
     const shellIdx = out.indexOf('### Shell');
-    const kbIdx = out.indexOf('### Knowledge base');
+    const kbIdx = out.indexOf('### Library');
     expect(fsIdx).toBeGreaterThan(-1);
     expect(shellIdx).toBeGreaterThan(fsIdx);
     expect(kbIdx).toBeGreaterThan(shellIdx);

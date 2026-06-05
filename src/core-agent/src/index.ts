@@ -1,5 +1,5 @@
 // Core Agent — simplified extraction of OpenClaw's core modules.
-// Provides: LLM Provider interaction (via @mariozechner/pi-ai), Agent Harness,
+// Provides: LLM Provider interaction (via @earendil-works/pi-ai), Agent Harness,
 // Memory System (with SQLite), Sandbox execution, and CLI commands.
 
 // Config
@@ -8,11 +8,11 @@ export type { CoreAgentConfig, AgentConfig, MemoryConfig, ProviderConfig, ModelC
 
 // Shared types & utilities
 export type { Message, MessageContent, Usage, StopReason, StreamEvent } from "./shared/types.js";
-export { CoreAgentError, AuthError, RateLimitError, ContextOverflowError, ProviderError, TimeoutError, isRetryableError, isTransientNetworkError } from "./shared/errors.js";
+export { CoreAgentError, AuthError, RateLimitError, ContextOverflowError, ProviderError, TimeoutError, isRetryableError, isTransientNetworkError, classifyRetryableError, classifyTransientNetworkError } from "./shared/errors.js";
 export { createLogger } from "./shared/logger.js";
 export type { Logger, LogLevel } from "./shared/logger.js";
 
-// Providers (backed by @mariozechner/pi-ai)
+// Providers (backed by @earendil-works/pi-ai)
 export type { LLMProvider, CompletionParams, CompletionResult, ToolDefinition } from "./providers/index.js";
 export { createAnthropicProvider, createOpenAIProvider, createPiProvider } from "./providers/index.js";
 export { listPiProviders, listPiModels, getPiModel } from "./providers/index.js";

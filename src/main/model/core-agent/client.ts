@@ -33,9 +33,24 @@ import type { ChatOptions, ChatResult, StreamEvent } from '../client';
 import { buildRunner } from './runner';
 import { mapCoreAgentEvents } from './event-mapper';
 import { getSession as _getCachedSession } from './session-store';
-import { extractAndSaveCompactFacts } from '../../features/memory';
 import { app } from 'electron';
 import * as paths from '../../paths';
+
+interface DebugRecorder {
+  record(event: unknown): void;
+  setActiveCandidate(info: unknown): void;
+  finish(result: { text: string; aborted: boolean; error: string | null }): void;
+}
+
+const NOOP_DEBUG_RECORDER: DebugRecorder = {
+  record() {},
+  setActiveCandidate() {},
+  finish() {},
+};
+
+function createDebugRecorder(): DebugRecorder {
+  return NOOP_DEBUG_RECORDER;
+}
 
 /**
  * Env vars injected into the sandbox child process so skill scripts can
@@ -44,6 +59,8 @@ import * as paths from '../../paths';
  *     `ELECTRON_RUN_AS_NODE=1` in the child env)
  *   - `ORKAS_PC_DIR` = PC root, rewritten to `app.asar.unpacked` in
  *     packaged mode so `bin/run-skill.cjs` + tsx + skills resolve on real disk
+ *   - `ORKAS_WORKSPACE_ROOT` = canonical data root so `run-skill.cjs` can
+ *     find installed per-user skills under `<uid>/local/marketplace/skills`
  *   - `ELECTRON_RUN_AS_NODE` = makes the Electron binary boot as Node
  *
  * Injected via `AgentRunParams.sandboxEnv` → `ToolContext.state.sandboxEnv`
@@ -52,7 +69,7 @@ import * as paths from '../../paths';
  * Electron's own GPU/renderer/utility helpers and crash the app at boot.
  */
 let _skillSandboxEnv: Record<string, string> | null = null;
-function buildSkillSandboxEnv(): Record<string, string> {
+export function buildSkillSandboxEnv(): Record<string, string> {
   if (_skillSandboxEnv) return _skillSandboxEnv;
   // `app` is undefined when running under vitest (no Electron runtime). Treat
   // missing/!isPackaged the same — dev layout has everything on real disk.
@@ -63,6 +80,7 @@ function buildSkillSandboxEnv(): Record<string, string> {
   _skillSandboxEnv = {
     ORKAS_NODE: process.execPath,
     ORKAS_PC_DIR: pcDir,
+    ORKAS_WORKSPACE_ROOT: paths.WS_ROOT,
     ELECTRON_RUN_AS_NODE: '1',
   };
   return _skillSandboxEnv;
@@ -136,6 +154,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     readOnlyExtraRoots,
     agentId,
     cid,
+    turnId,
     projectId,
     onFileWritten,
     hasProducedPath,
@@ -231,15 +250,29 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     else abortSignal.addEventListener('abort', onExternalAbort, { once: true });
   }
 
+  // PC dev builds attach an archive recorder here. OrkasOpen keeps the same
+  // interface as a no-op object so stripped debug code cannot affect model calls.
+  const recorder = createDebugRecorder();
+  let finalText = '';
   let errText: string | null = null;
+  let abortedFlag = false;
 
   try {
+
+    // Called back when pi-ai's onPayload hook injects the native web
+    // search tool — write the event straight into the recorder so the
+    // devtools archive's events[] shows
+    // `progress/native_search/injected`. The recorder is instantiated
+    // after buildRunner, but onPayload only fires after
+    // runner.runStream, by which time the recorder is ready, so the
+    // closure can simply read the outer `let` variable.
     const built = await buildRunner({
       sessionId,
       systemPrompt,
       userId,
       agentId,
       ...(cid ? { cid } : {}),
+      ...(turnId ? { turnId } : {}),
       ...(projectId ? { projectId } : {}),
       ...(skillList !== undefined ? { skillList } : {}),
       ...(projectAllowedSkillIds !== undefined ? { projectAllowedSkillIds } : {}),
@@ -251,8 +284,24 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(onArtifactCreated ? { onArtifactCreated } : {}),
       ...(onSkillAdvertised ? { onSkillAdvertised } : {}),
       ...(onSkillInvoked ? { onSkillInvoked } : {}),
+      onNativeSearchInjected: (info) => {
+        recorder.record({
+          type: 'progress',
+          event: { stream: 'native_search', data: { phase: 'injected', ...info } },
+        });
+      },
+      // rotating-provider commits / surfaced-error candidate notice. Rewrite
+      // the archive row so model / provider / profile reflect the candidate
+      // that actually owned this call's visible outcome, not the rotating-
+      // provider's primary label. Recorder may not be set yet at the moment
+      // buildRunner eagerly constructs the rotating-provider; fires at runtime
+      // when complete()/stream() actually picks a candidate, so the recorder
+      // is always live by then.
+      onCandidateChosen: (info) => {
+        recorder.setActiveCandidate(info);
+      },
     });
-    const { runner, providerId, modelId } = built;
+    const { runner, providerId, modelId, resolvedSystemPrompt, profileId, entryId, toolDefs, skillDisplayNameById, agentDisplayNameById } = built;
 
     const sandboxEnv = buildSkillSandboxEnv();
 
@@ -280,28 +329,30 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     // terminal final/error synthesis. We re-yield every event it produces,
     // resetting the idle timer on each one.
     let eventCount = 0;
-    for await (const ev of mapCoreAgentEvents(captureResult(rawEvents))) {
+    for await (const ev of mapCoreAgentEvents(captureResult(rawEvents), { userId, skillDisplayNameById, agentDisplayNameById })) {
       resetIdle();
       eventCount += 1;
-      if (ev.type === 'error') errText = (ev as any).text || errText;
-      // Compact-time fact extraction (fire-and-forget)
-      if (ev.type === 'progress' && ev.event && (ev.event as any).stream === 'compaction') {
-        const summary = (ev.event as any).data?.summary;
-        if (summary && userId) {
-          extractAndSaveCompactFacts(userId, summary).catch(e => log.warn('compact fact extraction failed:', e));
-        }
-      }
+      recorder.record(ev as any);
+      if (ev.type === 'final') finalText = (ev as any).text || finalText;
+      if (ev.type === 'error') { errText = (ev as any).text || errText; if ((ev as any).aborted) abortedFlag = true; }
+      // NOTE: compaction summaries are deliberately NOT mined into cross-session
+      // memory. That hook persisted transient task progress (the summary is
+      // work-in-progress, not durable user facts) into MEMORY.md. Memory is now
+      // written only by the explicit `cross_session_memory` tool.
       yield ev;
     }
-    log.info(`turn end ${turnTag} events=${eventCount} err=${errText ? 'yes' : 'no'}`);
+    log.info(`turn end ${turnTag} events=${eventCount} finalLen=${finalText.length} err=${errText ? 'yes' : 'no'}`);
 
-    // Metacognitive reflection runs from the background orchestrator on a
-    // 12h cycle (see `features/reflection-orchestrator.ts`); no per-turn hook.
+    // Metacognitive reflection is no longer triggered per-turn — it now
+    // runs from the background orchestrator on a 12h cycle. See
+    // `features/reflection-orchestrator.ts`. Keeping `agentRunResult`
+    // captured above for the recorder/archive payload.
     void agentRunResult;
 
     if (externalAbort || directSessionAbort) {
       // mapCoreAgentEvents may have already yielded 'error: empty response'
       // for the short-circuit; tag the stream as aborted for the client.
+      abortedFlag = true;
       yield { type: 'error', text: 'aborted', aborted: true };
     } else if (idleHit) {
       errText = errText || `Model exceeded ${idleTimeout}s with no response (aborted)`;
@@ -311,6 +362,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     const wasAborted = externalAbort || directSessionAbort || (controller.signal.aborted && !idleHit);
     errText = wasAborted ? 'aborted' : ((err as Error).message || String(err));
     if (wasAborted) {
+      abortedFlag = true;
       log.info(`stream aborted ${turnTag}`);
       yield { type: 'error', text: errText, aborted: true };
     } else {
@@ -343,6 +395,8 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     }
     releaseSlotOnce('finally');
     releaseSessionOnce('finally');
+    try { recorder.finish({ text: finalText, aborted: abortedFlag, error: errText }); }
+    catch (err) { log.warn('archive finish failed:', err); }
     yield { type: 'done' };
   }
 }

@@ -1,5 +1,5 @@
 /**
- * Unified LLM provider backed by @mariozechner/pi-ai.
+ * Unified LLM provider backed by @earendil-works/pi-ai.
  *
  * Replaces the individual Anthropic/OpenAI implementations with pi-ai's
  * multi-provider layer — the same approach used by OpenClaw.
@@ -13,7 +13,7 @@ import {
   completeSimple as piCompleteSimple,
   streamSimple as piStreamSimple,
   Type,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
 import type {
   Model,
   Api,
@@ -21,7 +21,7 @@ import type {
   AssistantMessage as PiAssistantMessage,
   Tool as PiTool,
   KnownProvider,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
 
 import * as crypto from "node:crypto";
 
@@ -31,6 +31,10 @@ import { createLogger } from "../shared/logger.js";
 import type { CompletionParams, CompletionResult, LLMProvider, ToolDefinition } from "./base.js";
 
 const log = createLogger("pi-provider");
+
+// Core-agent favors stable HTTP event streams over WebSocket optimizations.
+// Providers that do not support transport selection ignore this option.
+const CORE_AGENT_TRANSPORT = "sse" as const;
 
 /**
  * Clamp a session id to a provider-safe cache key. OpenAI / Codex / Azure
@@ -372,6 +376,7 @@ export function createPiProvider(config: {
         if (reasoning) {
           result = await piCompleteSimple(model, context, {
             apiKey: config.apiKey,
+            transport: CORE_AGENT_TRANSPORT,
             signal: params.signal,
             maxTokens: params.maxTokens,
             temperature: params.temperature,
@@ -383,6 +388,7 @@ export function createPiProvider(config: {
         } else {
           result = await piComplete(model, context, {
             apiKey: config.apiKey,
+            transport: CORE_AGENT_TRANSPORT,
             signal: params.signal,
             maxTokens: params.maxTokens,
             temperature: params.temperature,
@@ -422,6 +428,7 @@ export function createPiProvider(config: {
         const eventStream = reasoning
           ? piStreamSimple(model, context, {
               apiKey: config.apiKey,
+              transport: CORE_AGENT_TRANSPORT,
               signal: params.signal,
               maxTokens: params.maxTokens,
               temperature: params.temperature,
@@ -432,6 +439,7 @@ export function createPiProvider(config: {
             })
           : piStream(model, context, {
               apiKey: config.apiKey,
+              transport: CORE_AGENT_TRANSPORT,
               signal: params.signal,
               maxTokens: params.maxTokens,
               temperature: params.temperature,
@@ -514,6 +522,7 @@ export function createPiProvider(config: {
           messages: [{ role: "user", content: "ping", timestamp: Date.now() }],
         }, {
           apiKey: config.apiKey,
+          transport: CORE_AGENT_TRANSPORT,
           maxTokens: 1,
         });
         return result.stopReason !== "error";
@@ -609,7 +618,7 @@ export function createAnthropicProvider(config: {
 } = {}): LLMProvider {
   return createPiProvider({
     provider: "anthropic",
-    model: "claude-sonnet-4-20250514",
+    model: "claude-opus-4-8",
     apiKey: config.apiKey,
     baseUrl: config.baseUrl,
   });

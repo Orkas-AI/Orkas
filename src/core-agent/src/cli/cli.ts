@@ -361,7 +361,7 @@ const loginCommand: CLICommand = {
       console.error("");
       // List available OAuth providers
       try {
-        const { getOAuthProviders } = await import("@mariozechner/pi-ai/oauth");
+        const { getOAuthProviders } = await import("@earendil-works/pi-ai/oauth");
         const oauthProviders = getOAuthProviders();
         if (oauthProviders.length > 0) {
           console.error("Available OAuth providers:");
@@ -403,13 +403,13 @@ const loginCommand: CLICommand = {
 
     // OAuth flow
     try {
-      const { getOAuthProvider } = await import("@mariozechner/pi-ai/oauth");
+      const { getOAuthProvider } = await import("@earendil-works/pi-ai/oauth");
       const oauthProvider = getOAuthProvider(provider);
 
       if (!oauthProvider) {
         console.error(`Error: No OAuth provider found for "${provider}".`);
         console.error("");
-        const { getOAuthProviders } = await import("@mariozechner/pi-ai/oauth");
+        const { getOAuthProviders } = await import("@earendil-works/pi-ai/oauth");
         const available = getOAuthProviders();
         if (available.length > 0) {
           console.error("Available OAuth providers:");
@@ -493,7 +493,7 @@ function helpCommand(cli: CLI): CLICommand {
     name: "help",
     description: "Show help information",
     async execute(_args, _opts) {
-      console.log("core-agent — LLM agent harness powered by @mariozechner/pi-ai\n");
+      console.log("core-agent — LLM agent harness powered by @earendil-works/pi-ai\n");
       console.log("Usage: core-agent <command> [options]\n");
       console.log("Commands:");
       for (const cmd of cli.getCommands()) {

@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { extractThreadId, extractCodexUsage } from '../../../../src/main/features/local_agents/backends/codex';
+import {
+  buildCodexThreadPermissionOverrides,
+  buildCodexTurnPermissionOverrides,
+  extractCodexDiffFiles,
+  extractThreadId,
+  extractCodexUsage,
+} from '../../../../src/main/features/local_agents/backends/codex';
 
 describe('local_agents/backends/codex › extractThreadId', () => {
   it('returns top-level threadId when present', () => {
@@ -71,5 +77,58 @@ describe('local_agents/backends/codex › extractCodexUsage', () => {
     expect(extractCodexUsage({})).toBeUndefined();
     expect(extractCodexUsage({ usage: { unknownKey: 'foo' } })).toBeUndefined();
     expect(extractCodexUsage(null)).toBeUndefined();
+  });
+});
+
+describe('local_agents/backends/codex › trusted local permissions', () => {
+  it('starts threads without sandbox approval prompts', () => {
+    expect(buildCodexThreadPermissionOverrides()).toEqual({
+      approvalPolicy: 'never',
+      sandbox: 'danger-full-access',
+    });
+  });
+
+  it('starts turns with full-access sandbox policy', () => {
+    expect(buildCodexTurnPermissionOverrides('/tmp/project')).toEqual({
+      cwd: '/tmp/project',
+      approvalPolicy: 'never',
+      sandboxPolicy: { type: 'dangerFullAccess' },
+    });
+  });
+});
+
+describe('local_agents/backends/codex › extractCodexDiffFiles', () => {
+  it('extracts changed files from a unified git diff', () => {
+    const files = extractCodexDiffFiles([
+      'diff --git a/app/index.html b/app/index.html',
+      'new file mode 100644',
+      '--- /dev/null',
+      '+++ b/app/index.html',
+      '@@ -0,0 +1 @@',
+      '+<html></html>',
+      'diff --git a/app/script.js b/app/script.js',
+      'index 1111111..2222222 100644',
+      '--- a/app/script.js',
+      '+++ b/app/script.js',
+    ].join('\n'));
+    expect(files).toEqual(['app/index.html', 'app/script.js']);
+  });
+
+  it('ignores empty or /dev/null paths', () => {
+    expect(extractCodexDiffFiles('--- /dev/null\n+++ /dev/null')).toEqual([]);
+  });
+
+  it('does not treat deleted files as produced files', () => {
+    const files = extractCodexDiffFiles([
+      'diff --git a/old.txt b/old.txt',
+      'deleted file mode 100644',
+      '--- a/old.txt',
+      '+++ /dev/null',
+      'diff --git a/new.txt b/new.txt',
+      'new file mode 100644',
+      '--- /dev/null',
+      '+++ b/new.txt',
+    ].join('\n'));
+    expect(files).toEqual(['new.txt']);
   });
 });

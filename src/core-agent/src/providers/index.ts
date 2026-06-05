@@ -12,5 +12,5 @@ export {
   listPiProviders,
   listPiModels,
 } from "./pi-provider.js";
-export { getModel as getPiModel } from "@mariozechner/pi-ai";
+export { getModel as getPiModel } from "@earendil-works/pi-ai";
 export { ProviderRegistry } from "./registry.js";

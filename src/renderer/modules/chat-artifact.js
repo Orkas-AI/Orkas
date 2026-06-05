@@ -18,7 +18,7 @@
 //   - `resize` → set the iframe's height (cross-origin, so the parent can't
 //     measure the content itself; the artifact reports it, optionally via the
 //     `__orkas/bridge.js` helper).
-//   - `open-external` → open an http(s) URL in the system browser.
+//   - `open-external` → open an http(s) URL outside the artifact iframe.
 // We never expose `window.orkas` or any privileged handle into the iframe.
 //
 // Classic script — no import/export; globals `renderChatArtifact`,
@@ -56,6 +56,18 @@
   let _menuEl = null;
   let _menuCtx = null;     // { frame, cid, artifactId, title } of the open menu
   let _menuAnchor = null;  // the ⋯ button that opened it
+
+  function _track(action, data) {
+    
+  }
+
+  function _trackError(action, data) {
+    
+  }
+  let _viewerEl = null;
+  let _viewerFrame = null;
+  let _viewerTitle = null;
+  let _viewerKeyHandler = null;
 
   // chat-app://cid/<encCid>/<encArtifactId>/index.html
   function _artifactUrl(cid, artifactId, rel) {
@@ -117,6 +129,7 @@
       const title = frame.dataset.artifactTitle || '';
       const type = String(data.type || '');
       if (type === 'resize') {
+        if (frame.classList && frame.classList.contains('chat-artifact-viewer-frame')) return;
         frame.style.height = `${_clampHeight(data.height)}px`;
         return;
       }
@@ -138,7 +151,75 @@
     });
   }
 
-  // ── card-header "⋯" menu (reload / open in browser / save) ──────────────
+  function _esc(s) {
+    try { if (typeof escapeHtml === 'function') return escapeHtml(String(s || '')); } catch (_) {}
+    return String(s || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function _closeViewer() {
+    if (!_viewerEl) return;
+    _viewerEl.classList.remove('is-open');
+    if (_viewerFrame) {
+      _viewerFrame.removeAttribute('src');
+      _viewerFrame.removeAttribute('title');
+      _viewerFrame.dataset.artifactCid = '';
+      _viewerFrame.dataset.artifactId = '';
+      _viewerFrame.dataset.artifactAgent = '';
+      _viewerFrame.dataset.artifactTitle = '';
+    }
+    if (_viewerKeyHandler) {
+      document.removeEventListener('keydown', _viewerKeyHandler);
+      _viewerKeyHandler = null;
+    }
+  }
+
+  function _ensureViewer() {
+    if (_viewerEl) return _viewerEl;
+    const el = document.createElement('div');
+    el.className = 'chat-artifact-viewer';
+    el.innerHTML = `
+      <div class="chat-artifact-viewer-backdrop"></div>
+      <div class="chat-artifact-viewer-stage" role="dialog" aria-modal="true">
+        <div class="chat-artifact-viewer-header">
+          <div class="chat-artifact-viewer-title"></div>
+          <button type="button" class="chat-artifact-viewer-close" aria-label="${_esc(_t('common.close', 'Close'))}" title="${_esc(_t('common.close', 'Close'))}">×</button>
+        </div>
+        <iframe class="chat-artifact-viewer-frame chat-artifact-frame" sandbox="${SANDBOX}" referrerpolicy="no-referrer"></iframe>
+      </div>`;
+    document.body.appendChild(el);
+    _viewerEl = el;
+    _viewerFrame = el.querySelector('.chat-artifact-viewer-frame');
+    _viewerTitle = el.querySelector('.chat-artifact-viewer-title');
+    el.querySelector('.chat-artifact-viewer-close')?.addEventListener('click', _closeViewer);
+    return el;
+  }
+
+  function _openViewer(ctx) {
+    if (!ctx || !ctx.cid || !ctx.artifactId) return;
+    const el = _ensureViewer();
+    const title = ctx.title || _t('artifact.title', 'Interactive app');
+    if (_viewerTitle) _viewerTitle.textContent = title;
+    if (_viewerFrame) {
+      _viewerFrame.dataset.artifactCid = String(ctx.cid);
+      _viewerFrame.dataset.artifactId = String(ctx.artifactId);
+      _viewerFrame.dataset.artifactAgent = String(ctx.agentId || '');
+      _viewerFrame.dataset.artifactTitle = title;
+      _viewerFrame.setAttribute('title', title);
+      _viewerFrame.src = _artifactUrl(ctx.cid, ctx.artifactId);
+    }
+    el.classList.add('is-open');
+    if (!_viewerKeyHandler) {
+      _viewerKeyHandler = (e) => { if (e.key === 'Escape') _closeViewer(); };
+      document.addEventListener('keydown', _viewerKeyHandler);
+    }
+  }
+
+  // ── card-header "⋯" menu (reload / open / save) ────────────────────────
   function _closeMenu() {
     if (_menuEl) _menuEl.style.display = 'none';
     if (_menuAnchor) _menuAnchor.classList.remove('is-menu-open');
@@ -172,7 +253,7 @@
     el.innerHTML = '';
     const defs = [
       ['reload', _t('artifact.reload', 'Reload')],
-      ['open', _t('artifact.open_external', 'Open in browser')],
+      ['open', _t('artifact.open_external', 'Open')],
       ['save', _t('artifact.menu_save', 'Save')],
     ];
     for (const [action, label] of defs) {
@@ -185,8 +266,9 @@
         const ctx = _menuCtx;
         _closeMenu();
         if (!ctx) return;
+        _track('artifact_menu_action', { action, cid: String(ctx.cid || ''), artifact_id: String(ctx.artifactId || '') });
         if (action === 'reload') _doReload(ctx);
-        else if (action === 'open') _doOpenExternal(ctx);
+        else if (action === 'open') _doOpen(ctx);
         else if (action === 'save') _doSave(ctx);
       });
       el.appendChild(it);
@@ -224,6 +306,7 @@
   function _doReload(ctx) {
     const f = ctx && ctx.frame;
     if (!f || !f.isConnected) return;
+    _track('artifact_reload', { cid: String(ctx.cid || ''), artifact_id: String(ctx.artifactId || '') });
     // Reset height to default; the artifact re-reports on load. Reassigning
     // `src` forces a fresh load (the protocol handler sends `Cache-Control:
     // private` and dev reload ignores cache; this just re-runs the app).
@@ -231,25 +314,28 @@
     f.src = _artifactUrl(ctx.cid, ctx.artifactId);
   }
 
-  async function _doOpenExternal(ctx) {
-    try {
-      const r = await window.orkas.invoke('conversations.artifacts.openExternal', {
-        cid: String(ctx.cid), artifactId: String(ctx.artifactId),
-      });
-      if (!r || r.ok === false) throw new Error((r && r.error) || 'open failed');
-    } catch (err) { _notifyFail(_t('artifact.open_failed', 'Could not open in browser'), err); }
+  function _doOpen(ctx) {
+    _track('artifact_open_viewer', { cid: String(ctx.cid || ''), artifact_id: String(ctx.artifactId || '') });
+    try { _openViewer(ctx); }
+    catch (err) { _trackError('artifact_open_viewer', { msg: String(err && err.message || err) }); _notifyFail(_t('artifact.open_failed', 'Could not open'), err); }
   }
 
   async function _doSave(ctx) {
+    _track('artifact_save', { cid: String(ctx.cid || ''), artifact_id: String(ctx.artifactId || '') });
     try {
       const r = await window.orkas.invoke('conversations.artifacts.save', {
         cid: String(ctx.cid), artifactId: String(ctx.artifactId),
       });
       if (!r || r.ok === false) throw new Error((r && r.error) || 'save failed');
-      try { if (typeof uiAlert === 'function') uiAlert(_t('apps.saved_toast', 'Saved to My Apps')); } catch (_) {}
+      _track('artifact_save_ok', { cid: String(ctx.cid || ''), artifact_id: String(ctx.artifactId || '') });
+      try {
+        const message = _t('apps.saved_toast', 'Saved to My Apps');
+        if (typeof uiToast === 'function') uiToast(message, { variant: 'success' });
+        else if (typeof uiAlert === 'function') uiAlert(message);
+      } catch (_) {}
       // Refresh the "My Apps" tab if its module is loaded.
       try { if (typeof loadSavedApps === 'function') loadSavedApps(true); } catch (_) {}
-    } catch (err) { _notifyFail(_t('apps.save_failed', 'Could not save the app'), err); }
+    } catch (err) { _trackError('artifact_save', { msg: String(err && err.message || err) }); _notifyFail(_t('apps.save_failed', 'Could not save the app'), err); }
   }
 
   // ── render ──────────────────────────────────────────────────────────────
@@ -271,8 +357,8 @@
     titleEl.title = title;
     const spacer = document.createElement('span');
     spacer.className = 'chat-artifact-spacer';
-    // All header actions live behind a single "⋯" popover (reload / open in
-    // browser / save) — keeps the bubble chrome quiet. See `_openMenu`.
+    // All header actions live behind a single "⋯" popover (reload / open /
+    // save) — keeps the bubble chrome quiet. See `_openMenu`.
     const moreBtn = document.createElement('button');
     moreBtn.className = 'btn btn-sm chat-artifact-more';
     moreBtn.type = 'button';
@@ -297,7 +383,8 @@
 
     moreBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      _openMenu(moreBtn, { frame, cid: ctx.cid, artifactId: ctx.artifactId, title });
+      _track('artifact_menu_open', { cid: String(ctx.cid || ''), artifact_id: String(ctx.artifactId || '') });
+      _openMenu(moreBtn, { frame, cid: ctx.cid, artifactId: ctx.artifactId, title, agentId: ctx.agentId || '' });
     });
 
     card.appendChild(header);

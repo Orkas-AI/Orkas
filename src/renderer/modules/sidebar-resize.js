@@ -15,7 +15,7 @@
   const STORAGE_KEY = 'orkas:sidebar-width';
   const MIN_WIDTH = 180;
   const MAX_WIDTH = 480;
-  const DEFAULT_WIDTH = 200;
+  const DEFAULT_WIDTH = 260;
 
   function clamp(n) {
     if (!Number.isFinite(n)) return DEFAULT_WIDTH;

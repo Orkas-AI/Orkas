@@ -34,7 +34,7 @@ export type ToolGroup =
   | 'fs'         // files / workspace
   | 'shell'      // command line
   | 'pdf'        // PDF rendering
-  | 'kb'         // knowledge base
+  | 'kb'         // Library
   | 'chat'       // conversation history
   | 'image'      // image generation
   | 'web'        // web access
@@ -66,11 +66,12 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   { name: 'read_file',     group: 'fs', summary: 'Read a slice of text from a workspace or attachment file (PDF/DOCX text or image as multimodal).' },
   { name: 'write_file',    group: 'fs', permission: 'localExec', summary: 'Write text/code/markdown into the workspace; resolves under $working_dir.' },
   { name: 'edit_file',     group: 'fs', permission: 'localExec', summary: 'In-place `old_string → new_string` replacement on an existing text file (instead of rewriting the whole file).' },
+  { name: 'delete_file',   group: 'fs', permission: 'localExec', summary: 'Delete a single file from the workspace / current attachment dir / extraRoots. Every call pops an in-app confirm modal — the tool blocks until the user clicks yes; on deny / timeout no file is touched. Use instead of `bash rm` for single-file removals.' },
   { name: 'list_files',    group: 'fs', summary: 'List the workspace directory tree.' },
   { name: 'stat_file',     group: 'fs', summary: 'Trigger PDF/DOCX extraction and return total_chars; call before read_file.' },
   { name: 'search_files',  group: 'fs', summary: 'Find files by name / glob across the workspace + attachment scope.' },
   { name: 'grep_files',    group: 'fs', summary: 'Grep text across the workspace + attachment scope (PDF/DOCX auto-extracted, then searched).' },
-  { name: 'create_artifact', group: 'fs', permission: 'localExec', summary: 'Build an interactive multi-file web app (HTML/CSS/JS) rendered live & clickable inside the chat bubble; for dashboards / calculators / visualizations / mini-tools — not documents (html_to_pdf) or images (generate_image).' },
+  { name: 'create_artifact', group: 'fs', permission: 'localExec', summary: 'Build an interactive multi-file app (HTML/CSS/JS) rendered live & clickable inside the chat bubble; for interactive dashboards / calculators / visualizations / mini-tools. Static/read-only dashboards should use :::dashboard; not documents (html_to_pdf) or images (generate_image).' },
 
   // Shell
   { name: 'bash',          group: 'shell', permission: 'localExec', summary: 'Execute a shell command on the user\'s machine (cwd = $working_dir).' },
@@ -79,12 +80,13 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   { name: 'markdown_to_pdf', group: 'pdf', permission: 'localExec', summary: 'Markdown → PDF (CJK-friendly, zero external dependency).' },
   { name: 'html_to_pdf',     group: 'pdf', permission: 'localExec', summary: 'HTML → PDF (same renderer).' },
 
-  // Knowledge base
-  { name: 'kb_search',     group: 'kb', summary: 'Semantic search over the user\'s knowledge base.' },
-  { name: 'kb_read',       group: 'kb', summary: 'Read source-text chunks from a KB file that kb_search has hit.' },
+  // Library
+  { name: 'kb_list',       group: 'kb', summary: 'List Library files and indexing status before choosing what to search or read.' },
+  { name: 'kb_search',     group: 'kb', summary: 'Semantic search over the user\'s Library.' },
+  { name: 'kb_read',       group: 'kb', summary: 'Read source-text chunks from a Library file that kb_search has hit.' },
 
   // Conversation history
-  { name: 'chat_search',   group: 'chat', summary: 'Search prior conversation messages after KB is insufficient or the user asks about previous chats.' },
+  { name: 'chat_search',   group: 'chat', summary: 'Search prior conversation messages after Library is insufficient or the user asks about previous chats.' },
   { name: 'chat_read',     group: 'chat', summary: 'Read nearby messages from a chat_search hit, or the latest messages from one conversation.' },
 
   // Image
@@ -114,7 +116,7 @@ const GROUP_ORDER: ReadonlyArray<{ group: ToolGroup; title: string }> = [
   { group: 'fs',    title: 'Files / workspace' },
   { group: 'shell', title: 'Shell' },
   { group: 'pdf',   title: 'PDF' },
-  { group: 'kb',    title: 'Knowledge base' },
+  { group: 'kb',    title: 'Library' },
   { group: 'chat',  title: 'Conversation history' },
   { group: 'image', title: 'Image' },
   { group: 'web',       title: 'Web' },

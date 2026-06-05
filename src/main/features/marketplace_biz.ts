@@ -53,7 +53,8 @@ export function normalizeMarketplaceCategoryCode(
   fallback = DEFAULT_MARKETPLACE_CATEGORY_CODE,
 ): string {
   const normalized = String(code || '').trim().toLowerCase();
-  return isSafeMarketplaceCategoryCode(normalized) ? normalized : fallback;
+  const canonical = normalized === 'writing' ? 'creation' : normalized;
+  return isSafeMarketplaceCategoryCode(canonical) ? canonical : fallback;
 }
 
 /** Hard-coded fallback used only when both the persisted cache and the server are unreachable
@@ -63,9 +64,10 @@ const FALLBACK_CATEGORIES: readonly MarketplaceCategory[] = [
   { code: 'education', name_zh: '教育', name_en: 'Education',  name_ja: '教育',        sort_order: 10 },
   { code: 'ecommerce', name_zh: '电商', name_en: 'E-commerce', name_ja: 'EC',          sort_order: 20 },
   { code: 'rnd',       name_zh: '产研', name_en: 'R&D',        name_ja: '研究開発',    sort_order: 30 },
-  { code: 'writing',   name_zh: '写作', name_en: 'Writing',    name_ja: 'ライティング', sort_order: 40 },
+  { code: 'creation',  name_zh: '创作', name_en: 'Creation',   name_ja: '創作',        sort_order: 40 },
   { code: 'data',      name_zh: '数据', name_en: 'Data',       name_ja: 'データ',      sort_order: 50 },
-  { code: 'general',   name_zh: '通用', name_en: 'General',    name_ja: '汎用',        sort_order: 60 },
+  { code: 'office',    name_zh: '办公', name_en: 'Office',     name_ja: 'オフィス',    sort_order: 60 },
+  { code: 'general',   name_zh: '通用', name_en: 'General',    name_ja: '汎用',        sort_order: 70 },
 ];
 
 interface PersistedBiz {
@@ -118,23 +120,34 @@ async function _fetchFromServer(): Promise<MarketplaceCategory[]> {
 
 /** Return the active category list. Reads from in-memory cache first, falls back to the
  *  persisted file, falls back to the server, falls back to the hard-coded default — so the UI
- *  always has a list to render. Sorted by sort_order ASC then code ASC for deterministic UI. */
-export async function getMarketplaceCategories(): Promise<MarketplaceCategory[]> {
+ *  always has a list to render. `localOnly` returns cache/fallback immediately for UI surfaces
+ *  that must not block their first paint on the network. Sorted by sort_order ASC then code ASC. */
+export async function getMarketplaceCategories(
+  opts: { localOnly?: boolean; forceRefresh?: boolean } = {},
+): Promise<MarketplaceCategory[]> {
   const uid = getActiveUserId();
   if (_memCacheUid !== uid) { _memCache = null; _memCacheUid = uid; }   // uid switch invalidates
   const now = Date.now();
+  const forceRefresh = opts.forceRefresh && !opts.localOnly;
 
-  // Fast path: in-memory hit within TTL.
-  if (_memCache && (now - _memCache.fetched_at) <= TTL_MS) {
+  // Fast path: in-memory hit within TTL. Local-only callers also accept stale data because the
+  // category registry is config-like and they are optimizing for immediate dialog paint.
+  if (!forceRefresh && _memCache && (opts.localOnly || (now - _memCache.fetched_at) <= TTL_MS)) {
     return _sort(_memCache.list);
   }
 
   // Cold or expired — try persisted file first (cheap), then server.
   const persisted = await _readPersisted();
   const cached = persisted.categories;
-  if (cached && (now - cached.fetched_at) <= TTL_MS) {
+  if (!forceRefresh && cached && (opts.localOnly || (now - cached.fetched_at) <= TTL_MS)) {
     _memCache = cached;
     return _sort(cached.list);
+  }
+
+  if (opts.localOnly) {
+    const fallback = [...FALLBACK_CATEGORIES] as MarketplaceCategory[];
+    _memCache = { fetched_at: 0, list: fallback };
+    return _sort(fallback);
   }
 
   try {

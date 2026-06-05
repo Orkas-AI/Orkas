@@ -297,6 +297,13 @@ export interface ExtractFormResult {
   form?: { agent_id: string; fields: AgentInput[] };
 }
 
+export type PlanInteractionStatus = 'open' | 'closed';
+
+export interface ExtractPlanInteractionResult {
+  cleanText: string;
+  status?: PlanInteractionStatus;
+}
+
 /** Strip an `agent-input-form` block (XML primary, legacy fence fallback)
  *  from an actor's final text. The bus calls this after every agent turn
  *  (commander never emits forms; forms are an agent → user channel). */
@@ -338,6 +345,27 @@ export function extractFormFromFinal(text: string, defaultAgentId?: string): Ext
   return { cleanText, form: { agent_id: agentId, fields } };
 }
 
+const PLAN_INTERACTION_RE =
+  /<plan-interaction\b([^>]*)\/>|<plan-interaction\b([^>]*)>\s*<\/plan-interaction>/gi;
+
+/** Strip the lightweight plan-interaction marker from an agent's visible
+ *  final text. The marker is intentionally tiny: only status=open|closed
+ *  matters, and the executor uses the latest valid marker in the reply. */
+export function extractPlanInteractionFromFinal(text: string): ExtractPlanInteractionResult {
+  if (!text || typeof text !== 'string') return { cleanText: text || '' };
+  if (!text.includes('<plan-interaction')) return { cleanText: text };
+
+  let status: PlanInteractionStatus | undefined;
+  const cleanText = text.replace(PLAN_INTERACTION_RE, (_full, attrs1 = '', attrs2 = '') => {
+    const attrs = String(attrs1 || attrs2 || '');
+    const m = /\bstatus\s*=\s*["'](open|closed)["']/i.exec(attrs);
+    if (m) status = m[1].toLowerCase() as PlanInteractionStatus;
+    return '\n';
+  }).replace(/\n{3,}/g, '\n\n').trim();
+
+  return status ? { cleanText, status } : { cleanText: text };
+}
+
 export function computeFormId(cid: string, msgId: string, agentId: string, fields: AgentInput[]): string {
   const h = crypto.createHash('sha1');
   h.update(cid); h.update('|');
@@ -373,10 +401,10 @@ export function decodeSubmission(text: string): DecodedSubmission | null {
 }
 
 /** Format a single submitted value for the human-readable summary that
- *  travels above the XML tag. Same logic as the legacy chat had — kept here
- *  so the renderer can call it without depending on agent_input_form.ts. */
+ *  travels above the XML tag. Optional blanks are intentionally rendered as
+ *  empty text, not "(unfilled)", so the user-visible replay mirrors the form. */
 export function formatValueForSummary(field: AgentInput, raw: unknown): string {
-  const fallback = '(unfilled)';
+  const fallback = '';
   if (raw === undefined || raw === null) return fallback;
   if (field.type === 'boolean') return raw === true ? 'yes' : 'no';
   if (field.type === 'select') {

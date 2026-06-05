@@ -31,6 +31,7 @@ import {
 } from '../paths';
 import { getActiveUserId } from './users';
 import { createLogger } from '../logger';
+import { withMarketplaceCacheLock } from './marketplace_locks';
 
 const log = createLogger('marketplace_cache');
 
@@ -106,15 +107,18 @@ export async function touchCacheEntry(kind: 'agent' | 'skill', id: string): Prom
 export async function writeAgentCache(
   id: string, agentJson: Record<string, unknown>, meta: { version: string; published_at: number; updated_at?: number },
 ): Promise<void> {
-  const dir = _cacheDir('agent', id);
-  await fsp.rm(dir, { recursive: true, force: true });
-  await fsp.mkdir(dir, { recursive: true });
-  await fsp.writeFile(path.join(dir, 'agent.json'), JSON.stringify(agentJson, null, 2), 'utf8');
-  const now = Date.now();
-  await _writeMeta(dir, {
-    server_id: id, version: meta.version, published_at: meta.published_at,
-    ...(typeof meta.updated_at === 'number' ? { updated_at: meta.updated_at } : {}),
-    fetched_at: now, last_used_at: now,
+  const uid = getActiveUserId();
+  await withMarketplaceCacheLock(uid, 'agent', id, async () => {
+    const dir = marketplaceCacheAgentDir(uid, id);
+    await fsp.rm(dir, { recursive: true, force: true });
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.writeFile(path.join(dir, 'agent.json'), JSON.stringify(agentJson, null, 2), 'utf8');
+    const now = Date.now();
+    await _writeMeta(dir, {
+      server_id: id, version: meta.version, published_at: meta.published_at,
+      ...(typeof meta.updated_at === 'number' ? { updated_at: meta.updated_at } : {}),
+      fetched_at: now, last_used_at: now,
+    });
   });
 }
 
@@ -134,15 +138,18 @@ export async function writeSkillCache(
   extract: (dir: string) => Promise<void> | void,
   meta: { version: string; published_at: number; updated_at?: number },
 ): Promise<void> {
-  const dir = _cacheDir('skill', id);
-  await fsp.rm(dir, { recursive: true, force: true });
-  await fsp.mkdir(dir, { recursive: true });
-  await extract(dir);
-  const now = Date.now();
-  await _writeMeta(dir, {
-    server_id: id, version: meta.version, published_at: meta.published_at,
-    ...(typeof meta.updated_at === 'number' ? { updated_at: meta.updated_at } : {}),
-    fetched_at: now, last_used_at: now,
+  const uid = getActiveUserId();
+  await withMarketplaceCacheLock(uid, 'skill', id, async () => {
+    const dir = marketplaceCacheSkillDir(uid, id);
+    await fsp.rm(dir, { recursive: true, force: true });
+    await fsp.mkdir(dir, { recursive: true });
+    await extract(dir);
+    const now = Date.now();
+    await _writeMeta(dir, {
+      server_id: id, version: meta.version, published_at: meta.published_at,
+      ...(typeof meta.updated_at === 'number' ? { updated_at: meta.updated_at } : {}),
+      fetched_at: now, last_used_at: now,
+    });
   });
 }
 
@@ -215,10 +222,10 @@ export interface ListingsCacheEntry {
   ts: number;
 }
 export interface ListingsCacheFile {
-  version: 1;
+  version: 3;
   entries: Record<string, ListingsCacheEntry>;
 }
-const LISTINGS_VERSION = 1;
+const LISTINGS_VERSION = 3;
 
 export async function getListingsCache(): Promise<ListingsCacheFile> {
   const file = marketplaceListingsCacheFile(getActiveUserId());
@@ -226,6 +233,9 @@ export async function getListingsCache(): Promise<ListingsCacheFile> {
   try {
     const text = await fsp.readFile(file, 'utf8');
     const parsed = JSON.parse(text) as Partial<ListingsCacheFile>;
+    if (parsed.version !== LISTINGS_VERSION) {
+      return { version: LISTINGS_VERSION, entries: {} };
+    }
     const entries = (parsed && typeof parsed.entries === 'object' && parsed.entries)
       ? (parsed.entries as Record<string, ListingsCacheEntry>) : {};
     return { version: LISTINGS_VERSION, entries };

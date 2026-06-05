@@ -1,25 +1,29 @@
 // Electron entry shim: register tsx so the main process can
 // `require('./src/main')` and resolve to src/main/index.ts (Node folder →
 // index.ts rule + tsx/cjs transpilation). Keeps __dirname semantics identical
-// to running plain JS — no compile step.
+// to running plain JS — no compile step in dev.
 //
-// 两件事必须在 tsx 注册前完成:
-//   1. **WS_ROOT env 注入**:require('./src/main/install-data-root.cjs') 的
-//      模块加载副作用解析容器目录、跑一次性 source-run → container 迁移、
-//      mkdir、写入 process.env.ORKAS_WORKSPACE_ROOT。**必须在 tsx 加载任何
-//      .ts 前完成** —— paths.ts 把 ORKAS_WORKSPACE_ROOT 在 import 时
-//      snapshot 成 WS_ROOT,任何先加载 paths.ts 的路径都会读到空。CJS require
-//      没有 hoist 问题,这层在 .cjs 里做最稳。
-//   2. Hooks:`tsx/cjs` 处理 src/main/**/*.ts 的同步 require;`tsx/esm/api`
-//      处理动态 `import()`(尤其 `import('#core-agent')`)。
-//
-// dev (源码运行) 和 packaged 走同一条路径 —— 无 isPackaged 分叉,容器解析、
-// 迁移、env 注入对两种入口形态行为完全一致。
+// Two hooks:
+//  - `tsx/cjs` (sync require hook) handles src/main/**/*.ts on the require()
+//    code path.
+//  - `tsx/esm` (ESM loader, registered via node:module) handles dynamic
+//    `import()` specifiers that resolve to .ts files — notably the
+//    `import('#core-agent')` subpath import that targets core-agent source.
 'use strict';
 
-require('./src/main/install-data-root.cjs');
 const fs = require('node:fs');
 const path = require('node:path');
+
+for (const arg of process.argv.slice(1)) {
+  if (typeof arg !== 'string') continue;
+  if (arg.startsWith('--orkas-profile=')) {
+    process.env.ORKAS_PROFILE = arg.slice('--orkas-profile='.length);
+  } else if (arg.startsWith('--orkas-api-base-url=')) {
+    process.env.ORKAS_API_BASE_URL = arg.slice('--orkas-api-base-url='.length);
+  } else if (arg.startsWith('--orkas-voice-api-base=')) {
+    process.env.ORKAS_VOICE_API_BASE = arg.slice('--orkas-voice-api-base='.length);
+  }
+}
 
 function configurePackagedEsbuildBinary() {
   if (!process.versions.electron || !process.resourcesPath || process.env.ESBUILD_BINARY_PATH) {
