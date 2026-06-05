@@ -1,30 +1,36 @@
 /**
  * Local-machine user registry + active uid lifecycle.
  *
- * `data/users.json` holds
- * `{ current_user_id, users: [{user_id, created_at}, ...] }` — the sole
- * top-level local metadata. All per-uid private data lives under
- * `data/<uid>/{cloud,local}/` (see paths.ts).
+ * `data/users.json` holds the local profile registry. The persisted field
+ * names (`current_user_id`, `users[].user_id`) are historical; hosted builds
+ * store the real account uid there while logged in.
+ *
+ * Hosted Orkas uses:
+ *   - `anonymous` while logged out.
+ *   - the server account uid while logged in.
+ *
+ * OrkasOpen still calls `initActiveUser()` without options, so first boot
+ * keeps the original 8-digit local id.
  *
  * Boot sequence:
- *   1. Read users.json; if absent, create the first uid (`genUserId`)
- *      and point current_user_id at it.
+ *   1. Read users.json; if absent, create the first profile id and point
+ *      current_user_id at it.
  *   2. `activateUser(uid)` mkdir's the uid sub-tree, pins
  *      CORE_AGENT_AUTH_DIR, and clears the relevant caches.
  *   3. From there, every feature uses `getActiveUserId()` to obtain the
- *      current uid.
+ *      current profile id.
  *
- * Currently only one uid is active at a time (a UI-level switcher is
- * planned for a later iteration). The registry shape already
- * accommodates multi-uid scenarios.
+ * Currently only one profile id is active at a time. The registry shape already
+ * accommodates multi-profile scenarios.
  */
 
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 
 import {
   USERS_FILE,
+  WS_ROOT,
   userLocalConfigDir,
-  userRoot,
   userToolResultsDir,
   ensureUserLayout,
 } from '../paths';
@@ -32,12 +38,19 @@ import { nowIso, genUserId, safeId, readJsonSync, writeJsonSync } from '../stora
 import { createLogger } from '../logger';
 import { sweepToolResults } from '../util/tool-result-cap';
 import { migrateLegacySessionIds } from '../util/migrate-session-ids';
+import { migrateChatsGhostCleanup } from '../util/migrate-chats-ghost-cleanup';
 import { migrateAgentLayout } from '../util/migrate-agent-layout';
 import { migrateKbToLocalContexts } from '../util/migrate-kb-to-local';
+import { rekeyUserLocalSecretsAfterLocalIdChange } from '../util/rekey-user-local-secrets';
+import { maskId } from '../util/log-redact';
 
 const log = createLogger('users');
+const ACCOUNT_FILE_NAME = 'account.json';
+
+export const ANONYMOUS_LOCAL_ID = 'anonymous';
 
 export interface UserRecord {
+  /** Historical persisted field name. Hosted builds store the real account uid here. */
   user_id: string;
   created_at: string;
 }
@@ -45,6 +58,25 @@ export interface UserRecord {
 interface UsersRegistry {
   current_user_id: string;
   users: UserRecord[];
+}
+
+export interface InitActiveUserOptions {
+  /** Hosted Orkas passes `anonymous`; OrkasOpen omits this and gets a generated 8-digit uid. */
+  defaultLocalId?: string;
+}
+
+export interface LegacyAccountLocalIdMigrationResult {
+  migrated: boolean;
+  from?: string;
+  to?: string;
+  accountUserId?: string;
+  reason?:
+    | 'no_registry'
+    | 'no_migration_needed'
+    | 'no_stored_account'
+    | 'target_exists'
+    | 'rename_failed';
+  error?: string;
 }
 
 // ── In-memory active uid ─────────────────────────────────────────────────
@@ -90,6 +122,99 @@ function writeRegistry(reg: UsersRegistry): void {
   writeJsonSync(USERS_FILE, reg);
 }
 
+function recordForLocalId(localId: string): UserRecord {
+  const reg = readRegistry();
+  return reg?.users.find((u) => u.user_id === localId) || { user_id: localId, created_at: nowIso() };
+}
+
+function replaceCurrentLocalId(reg: UsersRegistry, from: string, to: string): UsersRegistry {
+  const fromRecord = reg.users.find((u) => u.user_id === from);
+  const existingTarget = reg.users.find((u) => u.user_id === to);
+  const nextUsers = reg.users.filter((u) => u.user_id !== from && u.user_id !== to);
+  nextUsers.push(existingTarget || { user_id: to, created_at: fromRecord?.created_at || nowIso() });
+  return { current_user_id: to, users: nextUsers };
+}
+
+function localRoot(localId: string): string {
+  return path.join(WS_ROOT, localId);
+}
+
+export function localIdRootExists(localId: string): boolean {
+  if (!safeId(localId)) return false;
+  return fs.existsSync(localRoot(localId));
+}
+
+export function accountUserIdToLocalId(accountUserId: string): string {
+  const localId = String(accountUserId || '');
+  if (!safeId(localId)) throw new Error(`invalid account user id: ${String(accountUserId)}`);
+  return localId;
+}
+
+export function isAnonymousLocalId(localId?: string): boolean {
+  return (localId ?? ACTIVE_UID ?? '') === ANONYMOUS_LOCAL_ID;
+}
+
+export function readStoredAccountUserIdForLocalId(localId: string): string | null {
+  if (!safeId(localId)) return null;
+  try {
+    const file = path.join(userLocalConfigDir(localId), ACCOUNT_FILE_NAME);
+    const obj = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const accountUserId = obj && typeof obj === 'object' && typeof obj.user_id === 'string'
+      ? obj.user_id
+      : '';
+    if (!accountUserId) return null;
+    accountUserIdToLocalId(accountUserId);
+    return accountUserId;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Compatibility for hosted builds shipped before account uid directories:
+ * if users.json points at any old local id and that directory has a stored
+ * logged-in account, rename the directory to the real account uid before
+ * account bootstrap reads account.json.
+ */
+export function migrateLegacyLoggedInLocalIdToAccountLocalId(): LegacyAccountLocalIdMigrationResult {
+  const reg = readRegistry();
+  if (!reg) return { migrated: false, reason: 'no_registry' };
+
+  const from = reg.current_user_id;
+  const accountUserId = readStoredAccountUserIdForLocalId(from);
+  if (!accountUserId) return { migrated: false, from, reason: 'no_stored_account' };
+
+  let to: string;
+  try {
+    to = accountUserIdToLocalId(accountUserId);
+  } catch (err) {
+    return { migrated: false, from, accountUserId, reason: 'no_stored_account', error: (err as Error).message };
+  }
+  if (to === from) {
+    writeRegistry(replaceCurrentLocalId(reg, from, to));
+    return { migrated: false, from, to, accountUserId, reason: 'no_migration_needed' };
+  }
+
+  const fromRoot = localRoot(from);
+  const toRoot = localRoot(to);
+  if (fs.existsSync(toRoot)) {
+    writeRegistry(replaceCurrentLocalId(reg, from, to));
+    log.warn('legacy logged-in uid target already exists; switched registry without rename', { from: maskId(from), to: maskId(to) });
+    return { migrated: false, from, to, accountUserId, reason: 'target_exists' };
+  }
+
+  try {
+    fs.renameSync(fromRoot, toRoot);
+    rekeyUserLocalSecretsAfterLocalIdChange({ fromLocalId: from, toLocalId: to, accountUserId });
+    writeRegistry(replaceCurrentLocalId(reg, from, to));
+    log.info('legacy logged-in directory migrated to account uid', { from: maskId(from), to: maskId(to) });
+    return { migrated: true, from, to, accountUserId };
+  } catch (err) {
+    log.warn('legacy logged-in uid migration failed', { from: maskId(from), to: maskId(to), error: (err as Error).message });
+    return { migrated: false, from, to, accountUserId, reason: 'rename_failed', error: (err as Error).message };
+  }
+}
+
 // ── Activation ───────────────────────────────────────────────────────────
 
 /**
@@ -102,8 +227,7 @@ function writeRegistry(reg: UsersRegistry): void {
  *     config).
  *   - Write `current_user_id` back to users.json.
  *
- * Callers are typically `boot` and (in a future iteration) the UI
- * switcher.
+ * Callers are typically `boot` and account login/logout transitions.
  */
 export function activateUser(uid: string): void {
   if (!safeId(uid)) throw new Error(`invalid user id: ${String(uid)}`);
@@ -118,9 +242,8 @@ export function activateUser(uid: string): void {
   // files are small and the 7-day window is comfortably above typical
   // conversation lifetimes.
   try { sweepToolResults(userToolResultsDir(uid), 7); }
-  catch (err) { log.warn(`sweepToolResults uid=${uid}: ${(err as Error).message}`); }
+  catch (err) { log.warn('sweepToolResults failed', { uid: maskId(uid), error: (err as Error).message }); }
 
-  // Strip legacy session_id brand prefixes once.
   // Sessions GC: clean cid-orphan / legacy-kind / leaked-ephemeral in
   // cloud/sessions/, and mtime>7d in local/sessions/. Fire-and-forget — the
   // file scan is bounded by the size of sessions/ and shouldn't gate startup.
@@ -129,27 +252,32 @@ export function activateUser(uid: string): void {
     try {
       const mod = await import('./sessions_sweep');
       await mod.sweepSessions(uid);
-    } catch (err) { log.warn(`sweepSessions uid=${uid}: ${(err as Error).message}`); }
+    } catch (err) { log.warn('sweepSessions failed', { uid: maskId(uid), error: (err as Error).message }); }
   })();
 
   // Strip legacy session_id prefixes (aiteam- / orkas-) once.
   // Idempotent: after the stamp lands, subsequent startups are no-ops.
   // See util/migrate-session-ids.ts for details.
   try { migrateLegacySessionIds(uid); }
-  catch (err) { log.warn(`migrateLegacySessionIds uid=${uid}: ${(err as Error).message}`); }
+  catch (err) { log.warn('migrateLegacySessionIds failed', { uid: maskId(uid), error: (err as Error).message }); }
+
+  // Convert old sync ghosts (index row exists, jsonl already gone) into
+  // record-level tombstones so the new merge logic can propagate the delete.
+  try { migrateChatsGhostCleanup(uid); }
+  catch (err) { log.warn('migrateChatsGhostCleanup failed', { uid: maskId(uid), error: (err as Error).message }); }
 
   // Agent layout migration: `agents/<aid>.json` →
   // `agents/<aid>/agent.json`, and `meta/<aid>/*` →
   // `agents/<aid>/meta/*`. Likewise idempotent + stamped. See
   // util/migrate-agent-layout.ts + docs/plans/agent-as-directory.md.
   try { migrateAgentLayout(uid); }
-  catch (err) { log.warn(`migrateAgentLayout uid=${uid}: ${(err as Error).message}`); }
+  catch (err) { log.warn('migrateAgentLayout failed', { uid: maskId(uid), error: (err as Error).message }); }
 
   // KB vector store moved from cloud/contexts/.kb → local/contexts/.kb
   // (multi-device-sync batch 2 — index is machine-private, never crosses
   // devices). Idempotent + stamped. See util/migrate-kb-to-local.ts.
   try { migrateKbToLocalContexts(uid); }
-  catch (err) { log.warn(`migrateKbToLocalContexts uid=${uid}: ${(err as Error).message}`); }
+  catch (err) { log.warn('migrateKbToLocalContexts failed', { uid: maskId(uid), error: (err as Error).message }); }
 
   // Pin core-agent's auth/state dir to this uid's local/config/.
   // `resolveAuthDir()` re-reads this env var on every call (see
@@ -188,65 +316,15 @@ export function activateUser(uid: string): void {
     });
   }
 
-  log.info(`active user_id=${uid}`);
+  log.info('active user changed', { userId: maskId(uid) });
 }
 
 /**
- * DEV CONVENIENCE — align the active local data uid with the account's server-side user_id, so a
- * dev tester logging into a different account doesn't end up with a mismatched local data dir:
- *   - `data/<serverUid>/` already exists → switch the active uid to it (the old dir is left alone).
- *   - else, `data/<currentUid>/` exists  → rename it to `data/<serverUid>/`, drop the stale registry
- *                                          entry, and re-activate.
- *   - else                               → just (re-)activate `<serverUid>`.
- *
- * **Callers MUST gate this on `!app.isPackaged`** — it is a dev-only behavior; it must not run in
- * packaged builds. Returns true if it changed the active uid.
+ * Boot-time entrypoint — read users.json and activate current_user_id. If
+ * none exists, activate `defaultLocalId` (hosted: anonymous) or generate the
+ * legacy 8-digit uid (OrkasOpen).
  */
-export function reconcileDevUid(serverUid: string): boolean {
-  const target = String(serverUid || '').trim();
-  if (!target || !safeId(target)) {
-    log.warn(`reconcileDevUid: server uid not usable as a local uid, skipping: ${JSON.stringify(serverUid)}`);
-    return false;
-  }
-  // Server's `gen_uuid()` was changed to emit dashless 32-hex going forward (Server/utils/util.py),
-  // so the value here is already in the canonical local form — no client-side normalization
-  // needed. Accounts created before that change still carry the older `XXXXXXXX-XXXX-XXXX-…`
-  // shape on disk; safeId() accepts both, the equality check below is a literal compare, and
-  // path segments don't care about format.
-  const current = getActiveUserId();
-  if (target === current) return false;
-
-  const targetExists = fs.existsSync(userRoot(target));
-  const currentExists = fs.existsSync(userRoot(current));
-  try {
-    if (!targetExists && currentExists) {
-      fs.renameSync(userRoot(current), userRoot(target));
-      // Drop the stale `current` entry; activateUser() below adds `target` + flips current_user_id.
-      const reg = readRegistry();
-      if (reg) {
-        reg.users = reg.users.filter((u) => u.user_id !== current);
-        if (reg.current_user_id === current) reg.current_user_id = target;
-        writeRegistry(reg);
-      }
-      log.info(`reconcileDevUid: renamed local data dir ${current} -> ${target}`);
-    } else if (targetExists) {
-      log.info(`reconcileDevUid: switching active uid ${current} -> ${target} (target data dir already present)`);
-    } else {
-      log.info(`reconcileDevUid: no data dir to move; activating fresh ${target}`);
-    }
-    activateUser(target);
-    return true;
-  } catch (err) {
-    log.error(`reconcileDevUid ${current} -> ${target} failed: ${(err as Error).message}`);
-    return false;
-  }
-}
-
-/**
- * Boot-time entrypoint — read users.json and activate current_user_id; if
- * none, generate a new uid and activate that. Returns the record.
- */
-export function initActiveUser(): UserRecord {
+export function initActiveUser(opts: InitActiveUserOptions = {}): UserRecord {
   const reg = readRegistry();
   if (reg) {
     const rec = reg.users.find((u) => u.user_id === reg.current_user_id) || {
@@ -257,10 +335,60 @@ export function initActiveUser(): UserRecord {
     return rec;
   }
   // First boot — no registry yet.
-  const rec: UserRecord = { user_id: genUserId(), created_at: nowIso() };
+  const firstLocalId = opts.defaultLocalId || genUserId();
+  if (!safeId(firstLocalId)) throw new Error(`invalid default local id: ${String(firstLocalId)}`);
+  const rec: UserRecord = { user_id: firstLocalId, created_at: nowIso() };
   activateUser(rec.user_id);
-  log.info(`first-boot: created user_id=${rec.user_id}`);
+  log.info('first-boot: created user', { userId: maskId(rec.user_id) });
   return rec;
+}
+
+export function switchToAccountLocalId(accountUserId: string): UserRecord {
+  const localId = accountUserIdToLocalId(accountUserId);
+  const current = ACTIVE_UID;
+  if (current && current !== localId && isAnonymousLocalId(current) && !localIdRootExists(localId)) {
+    const reg = readRegistry();
+    const fromRoot = localRoot(current);
+    const toRoot = localRoot(localId);
+    try {
+      if (fs.existsSync(fromRoot)) {
+        fs.renameSync(fromRoot, toRoot);
+        rekeyUserLocalSecretsAfterLocalIdChange({ fromLocalId: current, toLocalId: localId, accountUserId });
+        if (reg) writeRegistry(replaceCurrentLocalId(reg, current, localId));
+        log.info('anonymous directory adopted by account uid', { from: maskId(current), to: maskId(localId) });
+      }
+    } catch (err) {
+      log.warn('anonymous directory adoption failed; falling back to account uid activation', {
+        from: maskId(current),
+        to: maskId(localId),
+        error: (err as Error).message,
+      });
+    }
+  }
+  activateUser(localId);
+  return recordForLocalId(localId);
+}
+
+export function switchToAnonymousLocalId(): UserRecord {
+  const current = ACTIVE_UID;
+  if (current && current !== ANONYMOUS_LOCAL_ID) {
+    const anonymousRoot = localRoot(ANONYMOUS_LOCAL_ID);
+    try {
+      fs.rmSync(anonymousRoot, {
+        recursive: true,
+        force: true,
+        maxRetries: 3,
+        retryDelay: 50,
+      });
+    } catch (err) {
+      log.warn('fresh anonymous directory reset failed; reusing existing directory', {
+        root: anonymousRoot,
+        error: (err as Error).message,
+      });
+    }
+  }
+  activateUser(ANONYMOUS_LOCAL_ID);
+  return recordForLocalId(ANONYMOUS_LOCAL_ID);
 }
 
 /**

@@ -89,8 +89,16 @@ function _datesInRange(since?: string, until?: string): Date[] {
   const start = since ? _atMidnight(new Date(since)) : today;
   const end = until ? _atMidnight(new Date(until)) : today;
   const out: Date[] = [];
-  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+  // Step by +36h then re-snap to local midnight. setDate(+1) preserves the
+  // local hour, which silently drifts off midnight across historical DST
+  // transitions in the host TZ (we saw it skip the most recent day on a
+  // zh-CN/Asia machine because Mongolia's pre-1978 +07→+08 shift carried
+  // through to today). 36h guarantees we cross any DST gap; _atMidnight
+  // re-anchors.
+  let d = new Date(start);
+  while (d <= end) {
     out.push(new Date(d));
+    d = _atMidnight(new Date(d.getTime() + 36 * 3600_000));
   }
   return out;
 }

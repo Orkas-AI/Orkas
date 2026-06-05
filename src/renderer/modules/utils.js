@@ -67,6 +67,14 @@ function isMarketplaceCatalogSource(source) {
   return normalizeCatalogSource(source) === 'marketplace';
 }
 
+function sanitizeMathExpressionForMathJax(expr) {
+  return String(expr || '').replace(/(^|[^\\])_{2,}/g, (match, prefix) => {
+    const len = match.length - prefix.length;
+    const em = Math.max(1.5, Math.min(4, len * 0.5));
+    return `${prefix}\\underline{\\hspace{${em}em}}`;
+  });
+}
+
 function catalogSourceLabel(source, kind = 'agents') {
   const normalized = normalizeCatalogSource(source);
   const base = kind === 'skills' ? 'skills' : 'agents';
@@ -127,11 +135,11 @@ function renderMarkdownFull(md) {
   //      `processEscapes: true` also lets authors write `\$` for literal.
   // We wrap the preserved delimiters in the output so MathJax can still
   // locate them — we're only shielding the inner characters from markdown.
-  md = md.replace(/\$\$([\s\S]+?)\$\$/g, (_, expr) => protect(`$$${expr}$$`));
-  md = md.replace(/\\\[([\s\S]+?)\\\]/g, (_, expr) => protect(`\\[${expr}\\]`));
-  md = md.replace(/\\\(([\s\S]+?)\\\)/g, (_, expr) => protect(`\\(${expr}\\)`));
+  md = md.replace(/\$\$([\s\S]+?)\$\$/g, (_, expr) => protect(`$$${sanitizeMathExpressionForMathJax(expr)}$$`));
+  md = md.replace(/\\\[([\s\S]+?)\\\]/g, (_, expr) => protect(`\\[${sanitizeMathExpressionForMathJax(expr)}\\]`));
+  md = md.replace(/\\\(([\s\S]+?)\\\)/g, (_, expr) => protect(`\\(${sanitizeMathExpressionForMathJax(expr)}\\)`));
   md = md.replace(/(^|[^\\$])\$(?!\s|\d)([^\$\n]+?)\$(?!\d)/g,
-    (_, pre, expr) => pre + protect(`$${expr}$`));
+    (_, pre, expr) => pre + protect(`$${sanitizeMathExpressionForMathJax(expr)}$`));
 
   // Inline code — protect from phase 2 transforms so autolinking / emphasis
   // don't touch its contents.
@@ -463,7 +471,8 @@ function _dbAlert(props) {
   const title = escapeHtml(props.title || '');
   const body = props.body ? `<div class="db-alert-body">${escapeHtml(props.body)}</div>` : '';
   return `<div class="db-alert" data-level="${level}" role="status">
-    <div class="db-alert-title">${title}</div>${body}
+    <span class="db-alert-icon" aria-hidden="true"></span>
+    <div class="db-alert-content"><div class="db-alert-title">${title}</div>${body}</div>
   </div>`;
 }
 
@@ -580,6 +589,13 @@ function _dbXyChart(kind, data) {
   const span = (maxY - minY) || 1;
   const xOf = (i) => padL + (points.length === 1 ? innerW / 2 : (i / (points.length - 1)) * innerW);
   const yOf = (y) => padT + innerH - ((y - minY) / span) * innerH;
+  const yTicks = [0, 0.5, 1].map((ratio) => {
+    const y = padT + innerH - ratio * innerH;
+    const val = minY + ratio * span;
+    const label = Math.abs(val) >= 10 ? Math.round(val) : Number(val.toFixed(1));
+    return `<line x1="${padL}" y1="${y.toFixed(2)}" x2="${W - padR}" y2="${y.toFixed(2)}" class="db-chart-gridline"></line>` +
+      `<text x="${(padL - 6).toFixed(2)}" y="${(y + 3).toFixed(2)}" class="db-chart-ylabel" text-anchor="end">${escapeHtml(String(label))}</text>`;
+  }).join('');
   const axis = `<line x1="${padL}" y1="${padT + innerH}" x2="${W - padR}" y2="${padT + innerH}" class="db-chart-axis"></line>`;
   let body = '';
   if (kind === 'bar') {
@@ -588,7 +604,7 @@ function _dbXyChart(kind, data) {
       const x = xOf(i) - barW / 2;
       const y = yOf(Math.max(p.y, 0));
       const h = Math.abs(yOf(p.y) - yOf(0));
-      return `<rect x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${barW.toFixed(2)}" height="${h.toFixed(2)}" class="db-chart-bar-rect"></rect>`;
+      return `<rect x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${barW.toFixed(2)}" height="${h.toFixed(2)}" rx="3" class="db-chart-bar-rect" data-idx="${i % 6}"></rect>`;
     }).join('');
   } else {
     const path = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${xOf(i).toFixed(2)},${yOf(p.y).toFixed(2)}`).join(' ');
@@ -599,7 +615,7 @@ function _dbXyChart(kind, data) {
       body = `<path d="${area}" class="db-chart-area"></path><path d="${path}" class="db-chart-line"></path>`;
     } else {
       body = `<path d="${path}" class="db-chart-line"></path>` +
-        points.map((p, i) => `<circle cx="${xOf(i).toFixed(2)}" cy="${yOf(p.y).toFixed(2)}" r="2.5" class="db-chart-dot"></circle>`).join('');
+        points.map((p, i) => `<circle cx="${xOf(i).toFixed(2)}" cy="${yOf(p.y).toFixed(2)}" r="2.5" class="db-chart-dot" data-idx="${i % 6}"></circle>`).join('');
     }
   }
   const labels = points.map((p, i) => {
@@ -608,7 +624,7 @@ function _dbXyChart(kind, data) {
   }).join('');
   return `<div class="db-chart" data-kind="${kind}">
     <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" class="db-chart-svg">
-      ${axis}${body}${labels}
+      ${yTicks}${axis}${body}${labels}
     </svg>
   </div>`;
 }
@@ -787,6 +803,43 @@ function formatTime(iso) {
 //   - reads current value via el.dataset.value (string)
 // Keyboard: Enter/Space toggles the popover, arrow keys to nav, Esc to close.
 
+const AI_SELECT_BASE_POPOVER_Z_INDEX = 14000;
+
+function _aiSelectNextZIndex(values, fallback = AI_SELECT_BASE_POPOVER_Z_INDEX) {
+  let z = fallback;
+  for (const raw of values || []) {
+    const n = Number.parseInt(String(raw || ''), 10);
+    if (Number.isFinite(n)) z = Math.max(z, n + 1);
+  }
+  return z;
+}
+
+function _aiSelectPopoverZIndexFor(el) {
+  const values = [];
+  for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
+    const raw = window.getComputedStyle(n).zIndex;
+    if (raw && raw !== 'auto') values.push(raw);
+  }
+  // Some modal systems put the high z-index on a sibling/backdrop instead
+  // of an ancestor of the select. Include visible app overlays so a body-
+  // portaled dropdown still paints above the current dialog layer.
+  if (typeof document !== 'undefined' && document.body) {
+    const layerSelector = [
+      '.modal-overlay.open',
+      '.ui-dialog-overlay.open',
+      '.account-login-overlay.open',
+      '[role="dialog"][aria-modal="true"]',
+    ].join(',');
+    for (const n of document.querySelectorAll(layerSelector)) {
+      if (!n || n === el || n.hidden) continue;
+      const style = window.getComputedStyle(n);
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
+      if (style.zIndex && style.zIndex !== 'auto') values.push(style.zIndex);
+    }
+  }
+  return _aiSelectNextZIndex(values);
+}
+
 function _aiSelectMount(el, config) {
   if (!el) return null;
   const state = {
@@ -899,6 +952,7 @@ function _aiSelectMount(el, config) {
     if (rect.bottom + 4 + popH > window.innerHeight - 8 && rect.top - 4 - popH > 8) {
       popover.style.top = (rect.top - 4 - popH) + 'px';
     }
+    popover.style.zIndex = String(_aiSelectPopoverZIndexFor(el));
   };
   const open = () => {
     if (state.open) return;
@@ -926,6 +980,7 @@ function _aiSelectMount(el, config) {
     popover.style.left = '';
     popover.style.top = '';
     popover.style.width = '';
+    popover.style.zIndex = '';
     // Restore popover to its original parent if that parent is still
     // attached to the document. If the host widget got removed mid-open
     // (e.g., the detail page re-rendered and replaced our slot), just
@@ -945,7 +1000,9 @@ function _aiSelectMount(el, config) {
     window.removeEventListener('resize', reposition, true);
   };
 
-  const onDocDown = (e) => { if (!el.contains(e.target)) close(); };
+  const onDocDown = (e) => {
+    if (!el.contains(e.target) && !popover.contains(e.target)) close();
+  };
   const onKey = (e) => {
     // IME composition guard (CLAUDE.md §8): the popover keydown listener
     // is on `document`, so a Chinese / Japanese / Korean composition in an
@@ -1017,11 +1074,11 @@ function _aiSelectPick(api, value) {
   }
 }
 
-// Test bridge — guarded CommonJS export of the pure helpers used by the
-// markdown autolink phase. No-op in the browser (`module` undefined). Per
-// PC/CLAUDE.md §9 only pure functions go through this bridge; the rest of
-// utils.js (DOM-coupled helpers like `_aiSelectMount`) stays unexported.
-// Matching test file: `test/renderer/utils-autolink.test.ts`.
+// Test bridge — guarded CommonJS export of pure helpers. No-op in the
+// browser (`module` undefined). Per PC/CLAUDE.md §9 only pure functions go
+// through this bridge; the rest of utils.js (DOM-coupled helpers like
+// `_aiSelectMount`) stays unexported.
+// Matching tests: `utils-autolink.test.ts`, `utils-ai-select.test.ts`.
 if (typeof module !== 'undefined' && typeof module.exports === 'object') {
   module.exports = {
     _BARE_URL_RE,
@@ -1032,5 +1089,7 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     escapeHtml,
     renderMarkdown,
     renderDashboard,
+    sanitizeMathExpressionForMathJax,
+    _aiSelectNextZIndex,
   };
 }

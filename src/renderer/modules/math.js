@@ -54,4 +54,63 @@ async function typesetMath(rootEl) {
   }
 }
 
+const _mathHtmlCache = new Map();
+const MATH_HTML_CACHE_LIMIT = 160;
+
+function _rememberMathHtml(key, value) {
+  if (!key) return;
+  if (_mathHtmlCache.has(key)) _mathHtmlCache.delete(key);
+  _mathHtmlCache.set(key, value);
+  while (_mathHtmlCache.size > MATH_HTML_CACHE_LIMIT) {
+    const oldest = _mathHtmlCache.keys().next().value;
+    if (oldest == null) break;
+    _mathHtmlCache.delete(oldest);
+  }
+}
+
+async function typesetMathHtml(html) {
+  const key = String(html || '');
+  if (!key) return '';
+  const cached = _mathHtmlCache.get(key);
+  if (cached) return cached;
+  if (typeof document === 'undefined' || !document.createElement) return key;
+  const host = document.createElement('div');
+  host.className = 'math-typeset-buffer';
+  host.style.position = 'fixed';
+  host.style.left = '-10000px';
+  host.style.top = '0';
+  host.style.width = '720px';
+  host.style.visibility = 'hidden';
+  host.style.pointerEvents = 'none';
+  host.style.contain = 'layout style paint';
+  host.innerHTML = key;
+  try {
+    document.body?.appendChild(host);
+    await _mjReady();
+    if (window.MathJax.typesetClear) window.MathJax.typesetClear([host]);
+    await window.MathJax.typesetPromise([host]);
+    const out = host.innerHTML;
+    _rememberMathHtml(key, out);
+    return out;
+  } catch (err) {
+    (_mathLog.warn || console.warn).call(_mathLog, 'typeset html failed:', (err && err.message) || err);
+    return key;
+  } finally {
+    if (host.parentElement) host.parentElement.removeChild(host);
+  }
+}
+
+function prewarmMathJax(retries = 240) {
+  if (window.MathJax && typeof window.MathJax.typesetPromise === 'function') {
+    _mjReady().catch((err) => {
+      (_mathLog.warn || console.warn).call(_mathLog, 'prewarm failed:', (err && err.message) || err);
+    });
+    return;
+  }
+  if (retries <= 0) return;
+  setTimeout(() => prewarmMathJax(retries - 1), 25);
+}
+
 window.typesetMath = typesetMath;
+window.typesetMathHtml = typesetMathHtml;
+setTimeout(() => prewarmMathJax(), 0);

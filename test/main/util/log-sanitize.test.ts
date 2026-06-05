@@ -17,7 +17,7 @@ describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
 
   it('masks Bearer token inside a JSON-stringified blob', () => {
     const out = sanitizeLogTextForUpload('{"authorization":"Bearer eyJhbGc"}');
-    expect(out).toBe('{"authorization":"Bearer ***"}');
+    expect(out).toBe('{"authorization":"***"}');
   });
 
   it('is case-insensitive on the Bearer scheme name (RFC 6750)', () => {
@@ -28,7 +28,61 @@ describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
   it('masks a JWT-shaped 3-segment token', () => {
     const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature-part';
     const out = sanitizeLogTextForUpload(`token=${jwt} expired`);
-    expect(out).toBe('token=***JWT*** expired');
+    expect(out).toBe('token=*** expired');
+  });
+
+  it('masks JWT-shaped text even without a token= prefix', () => {
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature-part';
+    const out = sanitizeLogTextForUpload(`raw ${jwt} expired`);
+    expect(out).toBe('raw ***JWT*** expired');
+  });
+
+  it('masks secret-looking key=value fragments', () => {
+    const out = sanitizeLogTextForUpload('refresh_token=rt-value session_id=sid-value uid=ABCDEF1234567890 ok=true');
+    expect(out).toBe('refresh_token=*** session_id=*** uid=ABCD...7890 ok=true');
+  });
+
+  it('masks secret-looking JSON fields', () => {
+    const out = sanitizeLogTextForUpload('{"access_token":"at-value","name":"visible"}');
+    expect(out).toBe('{"access_token":"***","name":"visible"}');
+  });
+
+  it('masks sensitive URL query params while preserving harmless params', () => {
+    const out = sanitizeLogTextForUpload('https://example.test/cb?code=abc&state=def&ok=1');
+    expect(out).toBe('https://example.test/cb?code=***&state=***&ok=1');
+  });
+
+  it('masks signed object-storage URL query params', () => {
+    const out = sanitizeLogTextForUpload('https://cos.test/file?q-ak=AKID&q-signature=sig&x-cos-security-token=tok&key=keep');
+    expect(out).toBe('https://cos.test/file?q-ak=***&q-signature=***&x-cos-security-token=***&key=keep');
+  });
+
+  it('masks cloud-relative paths while keeping a stable diagnostic placeholder', () => {
+    const out = sanitizeLogTextForUpload('failed to read cloud/contexts/private/customer-plan.md');
+    expect(out).toContain('<cloud-path:');
+    expect(out).not.toContain('customer-plan.md');
+  });
+
+  it('masks local absolute paths and file URLs', () => {
+    const out = sanitizeLogTextForUpload(
+      'open /Users/user/Secret Project/report.pdf then file:///Users/user/Secret Project/index.html',
+    );
+    expect(out).toContain('<abs-path:');
+    expect(out).toContain('<file-url-path:');
+    expect(out).not.toContain('/Users/user');
+    expect(out).not.toContain('Secret Project');
+  });
+
+  it('masks Windows absolute paths', () => {
+    const out = sanitizeLogTextForUpload('copy C:\\Users\\Alice\\Private\\token.txt failed');
+    expect(out).toContain('<abs-path:');
+    expect(out).not.toContain('Alice');
+    expect(out).not.toContain('token.txt');
+  });
+
+  it('masks common provider token prefixes', () => {
+    const out = sanitizeLogTextForUpload('key sk-test-placeholder');
+    expect(out).toBe('key ***TOKEN***');
   });
 
   it('masks email to first-char + domain (Server mask_email parity)', () => {
@@ -61,6 +115,11 @@ describe('sanitizeLogTextForUpload › set B (must be preserved)', () => {
     // "eyJfoo" by itself is not a JWT — needs three dot-separated segments.
     const out = sanitizeLogTextForUpload('payload prefix eyJfooBar after');
     expect(out).toBe('payload prefix eyJfooBar after');
+  });
+
+  it('leaves non-query code fields untouched', () => {
+    const out = sanitizeLogTextForUpload('response code=200 status=ok');
+    expect(out).toBe('response code=200 status=ok');
   });
 
   it('leaves a malformed email (1-char TLD) untouched', () => {

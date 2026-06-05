@@ -41,6 +41,7 @@ import * as path from 'node:path';
 
 import { userChatAttachmentsDir, userFileCacheDir } from '../paths';
 import { createLogger } from '../logger';
+import { macosTccSensitivePath } from '../util/macos-tcc';
 import { pdfBufferToPages, EXTRACT_CACHE_VERSION } from '../util/extract-pdf';
 import { docxBufferToMarkdown } from '../util/extract-docx';
 import { toCompressedGrayJpeg } from '../util/image-transform';
@@ -91,6 +92,13 @@ export interface FileMeta {
   /** Total character length of the text representation. Populated after
    *  materialisation for text / pdf / docx; undefined for image (no text). */
   totalChars?: number;
+  /** pdf only: the extractor (pdfjs) produced empty text on EVERY page —
+   *  almost always a font-mapping failure (embedded / subset / CJK cmap
+   *  gaps), not a genuinely blank document. `totalChars` is still non-zero
+   *  because the page delimiters count. The file tools surface this so the
+   *  model can retry with a different reader (bash + PyMuPDF). Absent = at
+   *  least one page yielded text. */
+  extractionEmpty?: boolean;
 }
 
 export interface TextReadResult {
@@ -151,6 +159,8 @@ interface OnDiskMeta {
   source: SourceScope;
   cid?: string;
   totalChars?: number;
+  /** pdf only — see FileMeta.extractionEmpty. */
+  extractionEmpty?: boolean;
   /** Per-page [charStart, charEnd) offsets into text.md. Populated for pdf only.
    *  Kept as a materialise by-product so grep / future per-page features don't
    *  have to re-scan; the file tools never expose it to the model. */
@@ -199,6 +209,7 @@ function metaToPublic(meta: OnDiskMeta): FileMeta {
   };
   if (meta.cid) out.cid = meta.cid;
   if (meta.totalChars !== undefined) out.totalChars = meta.totalChars;
+  if (meta.extractionEmpty) out.extractionEmpty = true;
   return out;
 }
 
@@ -255,6 +266,13 @@ async function materialise(
     fs.writeFileSync(path.join(dir, 'text.md'), acc, 'utf8');
     base.totalChars = acc.length;
     base.pageMap = pageMap;
+    // Every page came back blank → pdfjs almost certainly failed to map the
+    // fonts (vs a genuinely blank doc). Flag it so the file tools can steer
+    // the model to a different reader. Guard pages.length so a 0-page parse
+    // doesn't trip `[].every() === true`.
+    if (pages.length > 0 && pages.every((p) => p.trim().length === 0)) {
+      base.extractionEmpty = true;
+    }
   } else if (kind === 'docx') {
     const buf = fs.readFileSync(absPath);
     const md = await docxBufferToMarkdown(buf);
@@ -274,6 +292,7 @@ async function materialise(
   log.info(
     `materialise user=${userId} kind=${kind} chars=${base.totalChars ?? 0}`
     + (kind === 'pdf' ? ` pages=${base.pageMap?.length ?? 0}` : '')
+    + (base.extractionEmpty ? ' extraction=empty_pages' : '')
     + ` ms=${Date.now() - t0} path=${absPath}`,
   );
   return base;
@@ -463,6 +482,7 @@ export async function pruneOrphans(
     const reason =
       !meta ? 'no-meta' :
       meta.cacheVersion !== EXTRACT_CACHE_VERSION ? 'version' :
+      macosTccSensitivePath(path.resolve(meta.absPath), { recursive: false }) ? 'tcc-protected-source' :
       !safeExistsSync(meta.absPath) ? 'orphan' :
       (wsRoot && meta.source === 'workspace' && !_isUnder(meta.absPath, wsRoot)) ? 'out-of-workspace' :
       null;

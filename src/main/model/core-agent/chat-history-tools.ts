@@ -1,8 +1,8 @@
 /**
  * Conversation-history tools injected into main-conversation runners.
  *
- * These tools are intentionally lower-priority than the knowledge base:
- * chat logs are useful for "what did we discuss before" recall, but KB files
+ * These tools are intentionally lower-priority than the Library:
+ * chat logs are useful for "what did we discuss before" recall, but Library files
  * remain the authoritative source for durable facts and documents.
  */
 
@@ -91,7 +91,7 @@ function createChatSearchTool(opts: ChatHistoryToolsOpts): AgentTool {
       'Search across the current user\'s conversation history. Use this only after\n'
       + '`kb_search` / `kb_read` when the user asks about prior chats, previous\n'
       + 'decisions, or historical working context that may not have been saved to\n'
-      + 'the knowledge base. Chat history is informal and may be stale; treat it as\n'
+      + 'the Library. Chat history is informal and may be stale; treat it as\n'
       + 'supporting context, not as an authoritative source.',
     inputSchema: {
       type: 'object',
@@ -148,7 +148,7 @@ function createChatReadTool(opts: ChatHistoryToolsOpts): AgentTool {
     description:
       'Read messages from one conversation. Pair with `chat_search`: pass a hit\'s\n'
       + '`cid` and `msg_index` to fetch nearby context. If `msg_index` is omitted,\n'
-      + 'returns the latest messages from that conversation. Prefer KB tools for\n'
+      + 'returns the latest messages from that conversation. Prefer Library tools for\n'
       + 'durable facts; use chat_read for informal prior-chat context.',
     inputSchema: {
       type: 'object',

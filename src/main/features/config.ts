@@ -45,8 +45,9 @@ export interface UserPreferences {
    * `ORKAS_METACOGNITION='0'` remains a higher-priority kill switch.
    * Reads go through `features/metacognition.isFeatureEnabled`. */
   metacognition_enabled?: boolean;
-  /** Desktop auto-update toggle. Defaults to enabled so signed release
-   * builds check the stable feed and download available updates. */
+  /** Per-field update clocks used by cloud-sync to merge independent
+   * preference changes without treating the whole JSON file as one blob. */
+  _field_updated_at?: Record<string, number>;
   [key: string]: unknown;
 }
 
@@ -57,6 +58,12 @@ function preferencesFile(): string {
   return userPreferencesFile(getActiveUserId());
 }
 
+function systemLanguage(): Lang {
+  let locale = '';
+  try { locale = app.getLocale() || ''; } catch { /* pre-ready or test stub */ }
+  return detectSystemLang(locale);
+}
+
 export function readPreferences(): UserPreferences {
   return readJsonSync<UserPreferences>(preferencesFile());
 }
@@ -65,8 +72,24 @@ export function readPreferences(): UserPreferences {
 export function writePreferences(partial: Partial<UserPreferences>): UserPreferences {
   const current = readPreferences();
   const next: UserPreferences = { ...current };
+  const updatedKeys: string[] = [];
   for (const [k, v] of Object.entries(partial)) {
-    if (v !== undefined) next[k] = v;
+    if (v === undefined || k === '_field_updated_at') continue;
+    next[k] = v;
+    updatedKeys.push(k);
+  }
+  if (updatedKeys.length > 0) {
+    const prevClocks = (current._field_updated_at && typeof current._field_updated_at === 'object')
+      ? current._field_updated_at
+      : {};
+    const clocks: Record<string, number> = { ...prevClocks };
+    const maxExisting = Math.max(0, ...Object.values(clocks).map((v) => Number(v) || 0));
+    let ts = Math.max(Date.now(), maxExisting + 1);
+    for (const key of updatedKeys) {
+      clocks[key] = ts;
+      ts += 1;
+    }
+    next._field_updated_at = clocks;
   }
   writeJsonSync(preferencesFile(), next);
   return next;
@@ -83,12 +106,18 @@ export type AppConfig = UserPreferences;
 
 export function getLanguage(): Lang {
   const v = readPreferences().language;
-  return isLang(v) ? v : 'en';
+  return isLang(v) ? v : systemLanguage();
 }
 
 export function setLanguage(lang: Lang): Lang {
   if (!isLang(lang)) throw new Error(`unsupported language: ${String(lang)}`);
   writePreferences({ language: lang });
+  setCurrentLang(lang);
+  return lang;
+}
+
+export function refreshCurrentLanguageFromPreferences(): Lang {
+  const lang = getLanguage();
   setCurrentLang(lang);
   return lang;
 }
@@ -149,6 +178,7 @@ export function setMetacognitionEnabled(enabled: boolean): boolean {
   writePreferences({ metacognition_enabled: !!enabled });
   return !!enabled;
 }
+
 
 /** Production wrapper: reads the system locale from Electron's `app`. */
 export function initLanguageFromApp(): Lang {

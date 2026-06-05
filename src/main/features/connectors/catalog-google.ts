@@ -16,6 +16,22 @@
  */
 import type { CatalogEntry } from './types';
 
+const GOOGLE_SCOPES = {
+  gmail: ['https://www.googleapis.com/auth/gmail.modify'],
+  gcal: ['https://www.googleapis.com/auth/calendar'],
+  gdocs: ['https://www.googleapis.com/auth/documents'],
+  gsheets: ['https://www.googleapis.com/auth/drive.file'],
+  gtasks: ['https://www.googleapis.com/auth/tasks'],
+};
+
+const GOOGLE_WORKSPACE_SCOPES = [
+  ...GOOGLE_SCOPES.gmail,
+  ...GOOGLE_SCOPES.gcal,
+  ...GOOGLE_SCOPES.gdocs,
+  ...GOOGLE_SCOPES.gsheets,
+  ...GOOGLE_SCOPES.gtasks,
+];
+
 export const GOOGLE_ENTRIES: CatalogEntry[] = [
   // ── Google Workspace ────────────────────────────────────────────────────
   // Optional one-click suite (`google-workspace`) requests the union of the 5 service scopes and
@@ -35,6 +51,7 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
     description_en: 'Connect Gmail, Calendar, Docs, Sheets, and Tasks in one consent; individual services can also be connected separately.',
     auth_mode: 'server_bridge',
     oauth: { provider_id: 'google' },
+    required_oauth_scopes: GOOGLE_WORKSPACE_SCOPES,
     transport_template: {
       kind: 'stdio',
       command: '${ORKAS_NODE}',
@@ -51,6 +68,7 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
     description_en: 'Read and send mail, manage labels, automate the inbox.',
     auth_mode: 'server_bridge',
     oauth: { provider_id: 'google' },
+    required_oauth_scopes: GOOGLE_SCOPES.gmail,
     transport_template: {
       kind: 'stdio',
       command: '${ORKAS_NODE}',
@@ -67,6 +85,7 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
     description_en: 'View, create, and update calendar events and meetings.',
     auth_mode: 'server_bridge',
     oauth: { provider_id: 'google' },
+    required_oauth_scopes: GOOGLE_SCOPES.gcal,
     transport_template: {
       kind: 'stdio',
       command: '${ORKAS_NODE}',
@@ -83,6 +102,7 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
     description_en: 'Read, create, and manage Google Docs from your workflows.',
     auth_mode: 'server_bridge',
     oauth: { provider_id: 'google' },
+    required_oauth_scopes: GOOGLE_SCOPES.gdocs,
     transport_template: {
       kind: 'stdio',
       command: '${ORKAS_NODE}',
@@ -99,6 +119,7 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
     description_en: 'Use spreadsheets as a data source — read and write cells and formulas.',
     auth_mode: 'server_bridge',
     oauth: { provider_id: 'google' },
+    required_oauth_scopes: GOOGLE_SCOPES.gsheets,
     transport_template: {
       kind: 'stdio',
       command: '${ORKAS_NODE}',
@@ -115,6 +136,7 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
     description_en: 'Integrate task management directly into your workflows.',
     auth_mode: 'server_bridge',
     oauth: { provider_id: 'google' },
+    required_oauth_scopes: GOOGLE_SCOPES.gtasks,
     transport_template: {
       kind: 'stdio',
       command: '${ORKAS_NODE}',

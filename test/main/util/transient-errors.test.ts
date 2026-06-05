@@ -17,6 +17,13 @@ describe('isTransientError — set A (network-class blips)', () => {
     'EPIPE',
     'network error',
     'Connection closed unexpectedly',
+    'Codex SSE response headers timed out after 10000ms',
+    'SSE response headers timed out',
+    'UND_ERR_HEADERS_TIMEOUT',
+    'WebSocket closed unexpectedly',
+    'stream disconnected before completion',
+    '504 Gateway Timeout',
+    'rate limit exceeded',
   ])('matches transient pattern: %s', (msg) => {
     expect(isTransientError(msg)).toBe(true);
   });

@@ -11,11 +11,16 @@ const CID = 'conv-x';
 
 let tmpDir: string;
 let prevWs: string | undefined;
+let prevHome: string | undefined;
+let prevGuard: string | undefined;
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-filetools-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
+  prevHome = process.env.HOME;
+  prevGuard = process.env.ORKAS_TCC_GUARD_FORCE;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
+  delete process.env.ORKAS_TCC_GUARD_FORCE;
   vi.resetModules();
   const users = await import('../../../../src/main/features/users');
   users.activateUser(UID);
@@ -23,6 +28,10 @@ beforeEach(async () => {
 
 afterEach(() => {
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+  if (prevHome === undefined) delete process.env.HOME;
+  else process.env.HOME = prevHome;
+  if (prevGuard === undefined) delete process.env.ORKAS_TCC_GUARD_FORCE;
+  else process.env.ORKAS_TCC_GUARD_FORCE = prevGuard;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -178,6 +187,51 @@ describe('file-tools › read_file scope guards', () => {
     expect(r.isError).toBeFalsy();
     expect(r.content).toContain('hi from extra');
   });
+
+  it('blocks read_file from loading a disabled skill SKILL.md', async () => {
+    const ws = await import('../../../../src/main/features/user_workspace');
+    const paths = await import('../../../../src/main/paths');
+    const enabled = await import('../../../../src/main/features/component_enabled');
+    const wsDir = path.join(tmpDir, 'ws');
+    fs.mkdirSync(wsDir, { recursive: true });
+    const r0 = ws.setWorkspacePath(UID, wsDir);
+    if (!r0.ok) throw new Error(`setWorkspacePath failed: ${r0.error}`);
+
+    const skillRoot = paths.userSkillsDir(UID);
+    const skillPath = path.join(skillRoot, 'disabled-skill', 'SKILL.md');
+    fs.mkdirSync(path.dirname(skillPath), { recursive: true });
+    fs.writeFileSync(skillPath, '---\nname: Disabled\n---\nsecret workflow');
+    enabled.setSkillEnabled(UID, 'disabled-skill', false);
+
+    const mod = await import('../../../../src/main/model/core-agent/file-tools');
+    const tools = mod.createFileTools({ userId: UID, readOnlyExtraRoots: [skillRoot] });
+    const r = await run(getTool(tools, 'read_file'), { path: skillPath });
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_SKILL_DISABLED');
+    expect(r.content).not.toContain('secret workflow');
+  });
+
+  it('blocks stat_file from touching files inside a disabled skill', async () => {
+    const ws = await import('../../../../src/main/features/user_workspace');
+    const paths = await import('../../../../src/main/paths');
+    const enabled = await import('../../../../src/main/features/component_enabled');
+    const wsDir = path.join(tmpDir, 'ws');
+    fs.mkdirSync(wsDir, { recursive: true });
+    const r0 = ws.setWorkspacePath(UID, wsDir);
+    if (!r0.ok) throw new Error(`setWorkspacePath failed: ${r0.error}`);
+
+    const skillRoot = paths.userSkillsDir(UID);
+    const scriptPath = path.join(skillRoot, 'disabled-skill', 'scripts', 'search.py');
+    fs.mkdirSync(path.dirname(scriptPath), { recursive: true });
+    fs.writeFileSync(scriptPath, 'print("secret")\n');
+    enabled.setSkillEnabled(UID, 'disabled-skill', false);
+
+    const mod = await import('../../../../src/main/model/core-agent/file-tools');
+    const tools = mod.createFileTools({ userId: UID, readOnlyExtraRoots: [skillRoot] });
+    const r = await run(getTool(tools, 'stat_file'), { path: scriptPath });
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_SKILL_DISABLED');
+  });
 });
 
 describe('file-tools › stat_file', () => {
@@ -260,6 +314,30 @@ describe('file-tools › search_files', () => {
     const r = await run(getTool(tools, 'search_files'), { query: '*.pdf' });
     expect(r.content).toContain('a.pdf');
     expect(r.content).not.toContain('b.md');
+  });
+
+  it('does not recursively scan a privacy-protected workspace root', async () => {
+    process.env.ORKAS_TCC_GUARD_FORCE = '1';
+    const home = path.join(tmpDir, 'home');
+    const downloads = path.join(home, 'Downloads');
+    fs.mkdirSync(downloads, { recursive: true });
+    fs.writeFileSync(path.join(downloads, 'secret-contract.md'), 'private');
+    process.env.HOME = home;
+    vi.resetModules();
+    const users = await import('../../../../src/main/features/users');
+    users.activateUser(UID);
+    const ws = await import('../../../../src/main/features/user_workspace');
+    const set = ws.setWorkspacePath(UID, downloads);
+    expect(set.ok).toBe(true);
+    fs.mkdirSync(attachmentDir(), { recursive: true });
+    const mod = await import('../../../../src/main/model/core-agent/file-tools');
+    const tools = mod.createFileTools({ userId: UID, cid: CID });
+
+    const r = await run(getTool(tools, 'search_files'), { query: 'secret' });
+
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('privacy-protected workspace');
+    expect(r.content).not.toContain('secret-contract.md');
   });
 });
 

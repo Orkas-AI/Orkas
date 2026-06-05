@@ -31,8 +31,9 @@ import { createLogger } from '../../logger';
 const log = createLogger('image-gen-tool');
 
 const DENY_MESSAGE =
-  'Local execution is not authorised for this machine. ' +
-  'The user must open Settings → Local Execution and grant permission before this tool can run.';
+  'E_TOOL_EXECUTION_ACCESS_DISABLED: Tool execution access is disabled, so command execution, file writes, PDFs, images, and local artifacts were not created. ' +
+  'Ask the user to open Settings > Tool Execution Access and enable "Enable Tool Execution Access", then retry. ' +
+  'Do not claim any file, PDF, image, or interactive app has already been created.';
 
 export interface ImageGenToolOpts {
   userId: string;

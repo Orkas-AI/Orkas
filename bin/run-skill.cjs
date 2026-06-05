@@ -3,7 +3,7 @@
  * Orkas skill runner.
  *
  * Invoked by LLM bash tool as:
- *   $ORKAS_NODE $ORKAS_PC_DIR/bin/run-skill.cjs <skill-id> <script-basename> [-- args...]
+ *   $ORKAS_NODE $ORKAS_PC_DIR/bin/run-skill.cjs <skill-id-or-name> <script-basename> [-- args...]
  *
  * Dispatches by file extension so the LLM uses one invocation form regardless
  * of skill language:
@@ -18,7 +18,8 @@
  *   1. <uid>/cloud/skills/<id>/scripts/<basename>.<ext>            (custom)
  *   2. <uid>/local/marketplace/skills/<id>/scripts/<basename>.<ext> (installed)
  *   3. <PC>/src/builtin/skills/<id>/scripts/<basename>.<ext>       (dev / asar.unpacked)
- *   For each candidate dir we try ts → mjs → js → py → sh → rb in order.
+ *   4. Same roots by SKILL.md frontmatter `name` when marketplace id != authored name
+ *   For each candidate dir we try py → ts → mjs → js → sh → rb in order.
  *
  * Env inputs:
  *   ORKAS_PC_DIR          — points at PC root (or asar.unpacked equivalent).
@@ -61,7 +62,80 @@ function parseArgs(argv) {
   return { skillId, scriptBase, scriptArgs };
 }
 
-function locateSkillScript(skillId, scriptBase) {
+function isDir(p) {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function pushUnique(arr, seen, value) {
+  const resolved = path.resolve(value);
+  if (seen.has(resolved)) return;
+  seen.add(resolved);
+  arr.push(value);
+}
+
+function parseFrontmatterScalar(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  if (s[0] === '"') {
+    let out = '';
+    for (let i = 1; i < s.length; i++) {
+      const ch = s[i];
+      if (ch === '\\') {
+        const next = s[++i];
+        if (next === 'n') out += '\n';
+        else if (next === 'r') out += '\r';
+        else if (next === 't') out += '\t';
+        else if (next != null) out += next;
+        continue;
+      }
+      if (ch === '"') return out;
+      out += ch;
+    }
+    return s;
+  }
+  if (s[0] === "'") {
+    let out = '';
+    for (let i = 1; i < s.length; i++) {
+      const ch = s[i];
+      if (ch === "'" && s[i + 1] === "'") {
+        out += "'";
+        i++;
+        continue;
+      }
+      if (ch === "'") return out;
+      out += ch;
+    }
+    return s;
+  }
+  return s;
+}
+
+function readSkillDisplayName(skillDir) {
+  try {
+    const md = fs.readFileSync(path.join(skillDir, 'SKILL.md'), 'utf8');
+    if (!md.startsWith('---')) return '';
+    const end = md.indexOf('\n---', 3);
+    if (end === -1) return '';
+    const lines = md.slice(3, end).split('\n');
+    for (const line of lines) {
+      if (!line || !line.trim() || /^\s/.test(line)) continue;
+      const colonIdx = line.indexOf(':');
+      if (colonIdx <= 0) continue;
+      const key = line.slice(0, colonIdx).trim();
+      if (key !== 'name') continue;
+      return parseFrontmatterScalar(line.slice(colonIdx + 1));
+    }
+  } catch {
+    /* unreadable skill metadata is ignored; direct id lookup may still work */
+  }
+  return '';
+}
+
+function collectSkillDirs(skillRef) {
   const wsRoot = process.env.ORKAS_WORKSPACE_ROOT
     || process.env.ORKAS_WS_ROOT
     || path.join(require('os').homedir(), '.orkas', 'data');
@@ -79,20 +153,57 @@ function locateSkillScript(skillId, scriptBase) {
   // is the strict invariant — a real uid dir always has one of those shapes
   // when the skill is installed for that user; any sibling dir that doesn't
   // is irrelevant by construction.
-  const skillDirs = [];
+  const roots = [];
+  const directDirs = [];
+  const directSeen = new Set();
+  function addRoot(root) {
+    if (isDir(root)) roots.push(root);
+  }
+  function addDirect(root) {
+    const candidate = path.join(root, skillRef);
+    if (isDir(candidate)) pushUnique(directDirs, directSeen, candidate);
+  }
   try {
     for (const entry of fs.readdirSync(wsRoot, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       if (entry.name.startsWith('.')) continue;
-      const cloud = path.join(wsRoot, entry.name, 'cloud', 'skills', skillId);
-      const marketplace = path.join(wsRoot, entry.name, 'local', 'marketplace', 'skills', skillId);
-      if (fs.existsSync(cloud)) skillDirs.push(cloud);
-      if (fs.existsSync(marketplace)) skillDirs.push(marketplace);
+      const cloudRoot = path.join(wsRoot, entry.name, 'cloud', 'skills');
+      const marketplaceRoot = path.join(wsRoot, entry.name, 'local', 'marketplace', 'skills');
+      addRoot(cloudRoot);
+      addRoot(marketplaceRoot);
+      addDirect(cloudRoot);
+      addDirect(marketplaceRoot);
     }
   } catch { /* no data dir yet */ }
   if (process.env.ORKAS_PC_DIR) {
-    skillDirs.push(path.join(process.env.ORKAS_PC_DIR, 'src', 'builtin', 'skills', skillId));
+    const builtinRoot = path.join(process.env.ORKAS_PC_DIR, 'src', 'builtin', 'skills');
+    addRoot(builtinRoot);
+    addDirect(builtinRoot);
   }
+  if (directDirs.length) return directDirs;
+
+  const aliasDirs = [];
+  const aliasSeen = new Set();
+  for (const root of roots) {
+    let entries;
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+      const dir = path.join(root, entry.name);
+      if (readSkillDisplayName(dir) === skillRef) {
+        pushUnique(aliasDirs, aliasSeen, dir);
+      }
+    }
+  }
+  return aliasDirs;
+}
+
+function locateSkillScript(skillId, scriptBase) {
+  const skillDirs = collectSkillDirs(skillId);
   const candidates = [];
   for (const dir of skillDirs) {
     for (const ext of SCRIPT_EXTS) {
@@ -108,7 +219,7 @@ function locateSkillScript(skillId, scriptBase) {
   }
   die(66, `skill script not found: ${skillId}/${scriptBase}.{${SCRIPT_EXTS.join(',')}}`, {
     searched: candidates,
-    hint: 'check skill id and script name; ORKAS_PC_DIR / ORKAS_WORKSPACE_ROOT env',
+    hint: 'check skill id/display name and script name; ORKAS_PC_DIR / ORKAS_WORKSPACE_ROOT env',
   });
 }
 

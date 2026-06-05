@@ -14,6 +14,10 @@
  *       searchProfiles: [ { id, provider, apiKey, label, createdAt, extras? } ],   // v4+
  *       imageProfiles:  [ { id, provider, apiKey, label, createdAt } ]              // v4+
  *     }
+ *     The file body is encrypted through `util/local-secret-store`: Hosted Orkas writes
+ *     `ORKLSEC1:`, while OrkasOpen falls back to the open-source backend. The read path accepts
+ *     the previous whole-file `crypto-vault` payload and plaintext JSON as one-shot migration
+ *     inputs, then rewrites with the preferred backend.
  *
  * Forward/backward compat:
  *   - v3 readers see v4 files: `searchProfiles` / `imageProfiles` are
@@ -53,10 +57,11 @@
  */
 
 import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { shell } from 'electron';
 
 import { userAuthProfilesFile, userLocalConfigDir } from '../paths';
-import * as cryptoVault from '../util/crypto-vault';
+import * as localSecrets from '../util/local-secret-store';
 import { getActiveUserId } from './users';
 import {
   FEATURED_API_PROVIDERS,
@@ -66,6 +71,7 @@ import {
   EXTERNAL_API_PROVIDERS,
   isVisibleProvider,
   curatedModelsFor,
+  resolveConfiguredPiModel,
   pickLatestGenerations,
   providerLabel,
   providerDocsUrl,
@@ -73,7 +79,12 @@ import {
   providerRecommended,
   sortProviderIds,
 } from '../model/provider_catalog';
-import { isCooledDown, clearCooldown } from '../model/core-agent/profile-cooldown';
+import {
+  assertModelProviderAllowed,
+  isModelProviderAllowed,
+} from '../model/provider_policy';
+import { isCooledDown, getCooldown, clearCooldown } from '../model/core-agent/profile-cooldown';
+import type { KeyFailureKind } from '../model/core-agent/auth-error';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
 
@@ -95,12 +106,12 @@ function ca(): Promise<CoreAgentModule> {
 /** Lazy loader for pi-ai's OAuth providers (anthropic, openai-codex, etc.).
  *  On first load we also register our custom providers (MiniMax Portal).
  *  Idempotent — pi-ai's registry is id-keyed. */
-type PiOauthModule = typeof import('@mariozechner/pi-ai/oauth');
+type PiOauthModule = typeof import('@earendil-works/pi-ai/oauth');
 let _oauthPromise: Promise<PiOauthModule> | null = null;
 function piOauth(): Promise<PiOauthModule> {
   if (!_oauthPromise) {
     _oauthPromise = (async () => {
-      const mod = await import('@mariozechner/pi-ai/oauth');
+      const mod = await import('@earendil-works/pi-ai/oauth');
       try {
         const { registerMinimaxOAuthProviders } = await import('./oauth-minimax');
         await registerMinimaxOAuthProviders();
@@ -225,6 +236,8 @@ interface ProfilesFile {
 }
 
 const PROFILES_FILE_VERSION = 4;
+const AUTH_SECRET_NAMESPACE = 'auth.profiles';
+const AUTH_SECRET_RECORD_ID = 'auth-profiles.json';
 
 // ── Profiles store IO ────────────────────────────────────────────────────
 
@@ -233,18 +246,67 @@ function ensureAuthDir(): void {
   if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
 }
 
+function authSecretContext(uid: string): localSecrets.LocalSecretContext {
+  return {
+    namespace: AUTH_SECRET_NAMESPACE,
+    ownerId: uid,
+    recordId: AUTH_SECRET_RECORD_ID,
+  };
+}
+
+function authSecretOwner(localId: string): string {
+  try {
+    const obj = JSON.parse(fs.readFileSync(path.join(userLocalConfigDir(localId), 'account.json'), 'utf8'));
+    if (obj && typeof obj === 'object' && typeof obj.user_id === 'string' && obj.user_id) {
+      return obj.user_id;
+    }
+  } catch { /* logged out / OrkasOpen / unreadable account file */ }
+  return localId;
+}
+
+function uniqueOwners(values: Array<string | null | undefined>): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const v of values) {
+    if (!v || seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+  }
+  return out;
+}
+
+function decryptProfilesPayload(raw: string, localId: string): { json: string; needsRewrite: boolean } {
+  const primaryOwner = authSecretOwner(localId);
+  if (!localSecrets.isEncryptedSecret(raw)) {
+    return { json: raw, needsRewrite: true };
+  }
+
+  for (const ownerId of uniqueOwners([primaryOwner, localId])) {
+    try {
+      const dec = localSecrets.decryptLocalSecretWithMeta(
+        authSecretContext(ownerId),
+        raw,
+        { legacySeeds: [ownerId] },
+      );
+      return {
+        json: dec.plaintext,
+        needsRewrite: ownerId !== primaryOwner || localSecrets.shouldRewriteLocalSecret(dec.kind),
+      };
+    } catch {
+      /* try next owner */
+    }
+  }
+
+  throw new Error('auth-profiles decrypt failed');
+}
+
 function loadProfiles(): ProfilesFile {
   try {
     const raw = fs.readFileSync(profilesFile(), 'utf-8');
-    // Decrypt when the file carries the vault magic header; otherwise treat as legacy plaintext.
-    // The next saveProfiles() rewrites encrypted regardless, so plaintext is a one-shot
-    // migration path — no need for a dedicated migration entry point.
-    let json: string;
-    try {
-      json = cryptoVault.isEncryptedPayload(raw) ? cryptoVault.decrypt(getActiveUserId(), raw) : raw;
-    } catch {
-      json = raw;
-    }
+    // Decrypt current Hosted/Open fallback payloads, or the previous crypto-vault whole-file
+    // format. Plain JSON is also accepted as a one-shot migration input.
+    const uid = getActiveUserId();
+    const { json, needsRewrite } = decryptProfilesPayload(raw, uid);
     const data = JSON.parse(json) as Partial<ProfilesFile>;
     if (data && typeof data === 'object' && data.profiles && typeof data.profiles === 'object') {
       const profiles: Record<string, StoredProfile> = {};
@@ -273,7 +335,9 @@ function loadProfiles(): ProfilesFile {
         : [];
       const searchProfiles = parseSearchProfilesArray((data as any).searchProfiles);
       const imageProfiles = parseImageProfilesArray((data as any).imageProfiles);
-      return { version: PROFILES_FILE_VERSION, profiles, entries, searchProfiles, imageProfiles };
+      const store = { version: PROFILES_FILE_VERSION, profiles, entries, searchProfiles, imageProfiles };
+      if (needsRewrite) saveProfiles(store);
+      return store;
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
@@ -350,12 +414,24 @@ export function saveImageProfiles(list: ImageProfile[]): void {
 function saveProfiles(store: ProfilesFile): void {
   ensureAuthDir();
   const json = JSON.stringify(store, null, 2);
-  const uid = getActiveUserId();
-  // Encrypted at rest with the local-only crypto-vault — same blob format as connectors.json.
-  // Obfuscation-grade (key derivable from uid alone, see util/crypto-vault.ts header); covers
-  // the realistic threat surface (sync corner cases / logging / casual inspection).
-  const out = uid ? cryptoVault.encrypt(uid, json) : json;
+  const localId = getActiveUserId();
+  const ownerId = authSecretOwner(localId);
+  const out = ownerId ? localSecrets.encryptLocalSecret(authSecretContext(ownerId), json) : json;
   fs.writeFileSync(profilesFile(), out, { encoding: 'utf-8', mode: 0o600 });
+}
+
+function isStoredProfileBlocked(profile: StoredProfile | undefined): boolean {
+  return !!profile && !isModelProviderAllowed(profile.provider);
+}
+
+function isStoredProfileAllowed(profile: StoredProfile | undefined): profile is StoredProfile {
+  return !!profile && !isStoredProfileBlocked(profile);
+}
+
+function isEntryAllowed(store: ProfilesFile, entry: Entry): boolean {
+  const prof = store.profiles[entry.profileId];
+  return isModelProviderAllowed(entry.provider, entry.model)
+    && !isStoredProfileBlocked(prof);
 }
 
 function makeProfileId(provider: string, label: string): string {
@@ -397,9 +473,28 @@ export interface AuthConfig { provider: string; model: string }
  */
 export function hasConfiguredModel(): { configured: boolean } {
   const store = loadProfiles();
-  if (store.entries.length > 0) return { configured: true };
+  if (store.entries.some((e) => isEntryAllowed(store, e))) return { configured: true };
   if (process.env.ANTHROPIC_API_KEY) return { configured: true };
   return { configured: false };
+}
+
+export function getConfiguredModelCooldown(): {
+  profileId: string;
+  cooledUntil: number;
+  kind: KeyFailureKind;
+  reason: string;
+} | null {
+  const store = loadProfiles();
+  let best: { profileId: string; cooledUntil: number; kind: KeyFailureKind; reason: string } | null = null;
+  for (const entry of store.entries) {
+    if (!isEntryAllowed(store, entry)) continue;
+    if (!store.profiles[entry.profileId]) continue;
+    const cooldown = getCooldown(entry.profileId);
+    if (!cooldown) continue;
+    const current = { profileId: entry.profileId, ...cooldown };
+    if (!best || current.cooledUntil < best.cooledUntil) best = current;
+  }
+  return best;
 }
 
 export async function getConfig(): Promise<AuthConfig> {
@@ -407,7 +502,7 @@ export async function getConfig(): Promise<AuthConfig> {
   // list. Credentials + model selection share one source of truth
   // (auth-profiles.json); there's no longer a fallback config.json.
   const store = loadProfiles();
-  const first = store.entries[0];
+  const first = store.entries.find((e) => isEntryAllowed(store, e));
   if (first) return { provider: first.provider, model: first.model };
   return { provider: '', model: '' };
 }
@@ -502,6 +597,7 @@ export async function listProviders(): Promise<{ providers: ProviderEntry[] }> {
   const store = loadProfiles();
   const byProvider = new Map<string, ProfileView[]>();
   for (const [id, prof] of Object.entries(store.profiles)) {
+    if (!isStoredProfileAllowed(prof)) continue;
     const list = byProvider.get(prof.provider) || [];
     list.push(profileToView(id, prof));
     byProvider.set(prof.provider, list);
@@ -523,7 +619,9 @@ export async function listProviders(): Promise<{ providers: ProviderEntry[] }> {
 
   // Visible set: whitelist + providers with saved profiles.
   const visible = new Set<string>(VISIBLE_PROVIDERS);
-  for (const pid of byProvider.keys()) visible.add(pid);
+  for (const pid of byProvider.keys()) {
+    if (isModelProviderAllowed(pid)) visible.add(pid);
+  }
   // Hide pi-ai providers that exist only as the OAuth back-end for
   // something in the whitelist (e.g. minimax-portal-cn is reached through
   // minimax-cn), unless the user already has a profile there that wasn't
@@ -532,7 +630,7 @@ export async function listProviders(): Promise<{ providers: ProviderEntry[] }> {
     if (!byProvider.has(alias)) visible.delete(alias);
   }
 
-  const sorted = sortProviderIds([...visible]);
+  const sorted = sortProviderIds([...visible].filter((id) => isModelProviderAllowed(id)));
   const featuredIds = new Set(FEATURED_API_PROVIDERS.map((p) => p.id));
   // Provider-is-known-to-pi-ai check so we don't advertise API-key support
   // for an id that pi-ai can't build a client for. When core-agent is
@@ -583,12 +681,15 @@ export async function listProviders(): Promise<{ providers: ProviderEntry[] }> {
 export async function listModels(providerId: string): Promise<{ models: { id: string; name: string }[] }> {
   const id = String(providerId || '').trim();
   if (!id) return { models: [] };
+  if (!isModelProviderAllowed(id)) return { models: [] };
+  const allowed = (models: { id: string; name: string }[]) =>
+    models.filter((m) => isModelProviderAllowed(id, m.id));
   const curated = curatedModelsFor(id);
-  if (curated.length) return { models: curated };
+  if (curated.length) return { models: allowed(curated) };
   try {
     const mod = await ca();
     const raw = mod.listPiModels(id) || [];
-    return { models: pickLatestGenerations(raw as any[], 2) };
+    return { models: allowed(pickLatestGenerations(raw as any[], 2)) };
   } catch {
     return { models: [] };
   }
@@ -605,6 +706,7 @@ export async function addApiKey(
   const key = String(apiKey || '').trim();
   if (!id) throw new Error('provider required');
   if (!key) throw new Error('api key required');
+  assertModelProviderAllowed(id);
 
   const store = loadProfiles();
   const chosenLabel = label ? sanitizeLabel(label) : autoLabel(store, id);
@@ -707,6 +809,8 @@ async function buildModelNameLookup(): Promise<(p: string, m: string) => string>
   try { mod = await ca(); } catch { /* no pi-ai available */ }
   const cache = new Map<string, Map<string, string>>();
   return (provider: string, modelId: string) => {
+    const curated = curatedModelsFor(provider).find((m) => m.id === modelId);
+    if (curated) return curated.name;
     if (!mod) return modelId;
     let byId = cache.get(provider);
     if (!byId) {
@@ -725,7 +829,11 @@ async function buildModelNameLookup(): Promise<(p: string, m: string) => string>
 export async function listEntries(): Promise<{ entries: EntryView[] }> {
   const store = loadProfiles();
   const lookup = await buildModelNameLookup();
-  return { entries: store.entries.map((e) => entryToView(e, store, lookup)) };
+  return {
+    entries: store.entries
+      .filter((e) => isEntryAllowed(store, e))
+      .map((e) => entryToView(e, store, lookup)),
+  };
 }
 
 export async function addEntry({
@@ -737,6 +845,7 @@ export async function addEntry({
   const m = String(model || '').trim();
   const pid = String(profileId || '').trim();
   if (!p || !m || !pid) throw new Error('provider / model / profileId required');
+  assertModelProviderAllowed(p, m);
   const store = loadProfiles();
   if (!store.profiles[pid]) throw new Error('profile not found');
   if (store.profiles[pid].provider !== p) throw new Error('profile does not belong to provider');
@@ -769,6 +878,7 @@ export async function updateEntryModel(entryId: string, model: string): Promise<
   const store = loadProfiles();
   const target = store.entries.find((e) => e.entryId === id);
   if (!target) throw new Error('entry not found');
+  assertModelProviderAllowed(target.provider, m);
   // Deduplicate: if another entry with the same (provider, model, profileId)
   // already exists, removing the target makes the priority list cleaner.
   const collision = store.entries.find(
@@ -810,7 +920,11 @@ export async function reorderEntries(orderedIds: string[]): Promise<{ entries: E
   saveProfiles(store);
   invalidateCoreAgentRunner();
   const lookup = await buildModelNameLookup();
-  return { entries: store.entries.map((e) => entryToView(e, store, lookup)) };
+  return {
+    entries: store.entries
+      .filter((e) => isEntryAllowed(store, e))
+      .map((e) => entryToView(e, store, lookup)),
+  };
 }
 
 // ── OAuth flow orchestration ─────────────────────────────────────────────
@@ -949,6 +1063,17 @@ export async function startOAuth(
         // renderer still shows the URL + "copy link" button as a fallback.
         openExternalUrl(info.url);
       },
+      onDeviceCode: (info) => {
+        const details = [`Code: ${info.userCode}`];
+        if (info.expiresInSeconds) details.push(`Expires in ${info.expiresInSeconds} seconds.`);
+        flow.status = {
+          kind: 'awaiting_auth',
+          url: info.verificationUri,
+          instructions: details.join('\n'),
+          usesCallbackServer: false,
+        };
+        openExternalUrl(info.verificationUri);
+      },
       onPrompt: async (prompt) => {
         flow.status = {
           kind: 'awaiting_input',
@@ -981,6 +1106,14 @@ export async function startOAuth(
           resolve(val);
         };
       }),
+      onSelect: async (prompt) => {
+        const selected = prompt.options[0];
+        flow.status = {
+          kind: 'progress',
+          message: selected ? `${prompt.message} ${selected.label}` : prompt.message,
+        };
+        return selected?.id;
+      },
       onProgress: (message) => {
         flow.status = { kind: 'progress', message };
       },
@@ -1102,7 +1235,7 @@ function groupEntries(entries: Entry[]): Entry[][] {
  */
 async function resolveEntryApiKey(store: ProfilesFile, entry: Entry): Promise<string | undefined> {
   const prof = store.profiles[entry.profileId];
-  if (!prof) return undefined;
+  if (!prof || !isStoredProfileAllowed(prof)) return undefined;
   if (prof.type === 'api_key') return prof.key;
   if (Date.now() < prof.expires) return prof.access;
   try {
@@ -1143,7 +1276,8 @@ export function listApiKeyEntries(): ApiKeyEntryChoice[] {
   const out: ApiKeyEntryChoice[] = [];
   for (const e of store.entries) {
     const prof = store.profiles[e.profileId];
-    if (!prof || prof.type !== 'api_key') continue;
+    if (!isEntryAllowed(store, e) || !isStoredProfileAllowed(prof)) continue;
+    if (prof.type !== 'api_key') continue;
     out.push({
       entryId: e.entryId,
       profileId: e.profileId,
@@ -1207,6 +1341,10 @@ export async function pickChatEntryGroup(): Promise<ChatEntryChoice[]> {
 
   const choices: ChatEntryChoice[] = [];
   for (const entry of ordered) {
+    if (!isEntryAllowed(store, entry)) {
+      log.info(`skipping disabled provider/model ${entry.provider}/${entry.model}`);
+      continue;
+    }
     if (isCooledDown(entry.profileId)) {
       log.info(`skipping cooled-down profile ${entry.profileId}`);
       continue;
@@ -1248,6 +1386,7 @@ export async function pickRotationKey(providerId: string): Promise<{
 } | null> {
   const id = String(providerId || '').trim();
   if (!id) return null;
+  if (!isModelProviderAllowed(id)) return null;
   const store = loadProfiles();
   const candidates = Object.entries(store.profiles)
     .filter(([, p]) => p.provider === id)
@@ -1321,9 +1460,12 @@ export async function testConnection(
   modelId?: string,
   profileId?: string,
 ): Promise<TestConnectionResult> {
-  const mod = await ca();
   const pid = String(providerId || '').trim();
   if (!pid) return { ok: false, error: 'provider required' };
+  if (!isModelProviderAllowed(pid, modelId)) {
+    return { ok: false, error: 'DeepSeek is disabled in this build' };
+  }
+  const mod = await ca();
 
   let chosenProfileId: string | undefined = profileId;
   let apiKey: string | undefined;
@@ -1397,11 +1539,20 @@ export async function testConnection(
   // properties of undefined".
   const requestedModel = modelId ? String(modelId).trim() : '';
   let effectiveModel = requestedModel;
+  const resolvedModel = requestedModel ? resolveConfiguredPiModel(mod, pid, requestedModel) : null;
+  if (resolvedModel?.isConfiguredFallback) {
+    log.info('using configured model fallback for connection test', {
+      provider: pid,
+      model: requestedModel,
+      templateProvider: resolvedModel.catalogProviderId,
+      templateModel: resolvedModel.templateModelId,
+    });
+  }
   try {
     const knownIds: string[] = ((mod as any).listPiModels(pid) || [])
       .map((m: any) => m && m.id)
       .filter((id: unknown): id is string => typeof id === 'string');
-    if (requestedModel && !knownIds.includes(requestedModel)) {
+    if (requestedModel && !resolvedModel && !knownIds.includes(requestedModel)) {
       if (!knownIds.length) {
         return { ok: false, error: `provider "${pid}" has no models registered`, profileId: chosenProfileId };
       }
@@ -1413,11 +1564,13 @@ export async function testConnection(
   try {
     const provider = mod.createPiProvider({
       provider: pid,
-      model: effectiveModel || undefined,
+      ...(resolvedModel?.needsCustomModel
+        ? { customModel: resolvedModel.model }
+        : { model: effectiveModel || undefined }),
       apiKey,
     });
     const msg = await provider.complete({
-      model: effectiveModel,
+      model: resolvedModel?.needsCustomModel ? requestedModel : effectiveModel,
       // ChatGPT Codex's `responses` API rejects requests without
       // `instructions` (= system prompt). Plain providers ignore it.
       systemPrompt: 'You are a connectivity probe; reply with a single word.',

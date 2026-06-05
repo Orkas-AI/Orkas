@@ -33,6 +33,14 @@ export function accountApiBase(): string {
 const DEVICE_FILE = 'device.json';
 let _cachedDeviceId: string | null = null;
 
+function _activeOrFallbackUid(): string {
+  try {
+    return getActiveUserId();
+  } catch {
+    return 'anonymous';
+  }
+}
+
 function _readDeviceId(file: string): string | null {
   try {
     const raw = fs.readFileSync(file, 'utf8');
@@ -50,7 +58,7 @@ function _writeDeviceId(file: string, id: string): void {
 export const tokenStore = {
   getDeviceId(): string {
     if (_cachedDeviceId) return _cachedDeviceId;
-    const file = path.join(userLocalConfigDir(getActiveUserId()), DEVICE_FILE);
+    const file = path.join(userLocalConfigDir(_activeOrFallbackUid()), DEVICE_FILE);
     const existing = _readDeviceId(file);
     if (existing) {
       _cachedDeviceId = existing;

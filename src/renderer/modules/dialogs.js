@@ -47,9 +47,6 @@ function _uiShowDialog({ message, showCancel, okLabel, cancelLabel }) {
     };
     okBtn.addEventListener('click', () => finish(true));
     if (cancelBtn) cancelBtn.addEventListener('click', () => finish(false));
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) finish(showCancel ? false : true);
-    });
     document.addEventListener('keydown', onKey, true);
     setTimeout(() => okBtn.focus(), 0);
   });
@@ -76,6 +73,54 @@ function uiAlert(message) {
   return _uiShowDialog({ message, showCancel: false }).then(() => {});
 }
 
+let _uiToastHost = null;
+let _uiToastSeq = 0;
+
+function _uiEnsureToastHost() {
+  if (_uiToastHost && document.body.contains(_uiToastHost)) return _uiToastHost;
+  _uiToastHost = document.createElement('div');
+  _uiToastHost.className = 'ui-toast-host';
+  _uiToastHost.setAttribute('aria-live', 'polite');
+  _uiToastHost.setAttribute('aria-atomic', 'false');
+  document.body.appendChild(_uiToastHost);
+  return _uiToastHost;
+}
+
+function uiToast(message, opts) {
+  const text = String(message || '').trim();
+  if (!text) return null;
+  const host = _uiEnsureToastHost();
+  const toast = document.createElement('div');
+  const rawVariant = opts && opts.variant ? String(opts.variant) : 'info';
+  const variant = ['info', 'success', 'warning', 'error'].includes(rawVariant) ? rawVariant : 'info';
+  const timeout = Math.max(1200, Math.min(10000, Number(opts && opts.timeoutMs) || 3200));
+  const id = `ui-toast-${++_uiToastSeq}`;
+  toast.className = `ui-toast is-${variant}`;
+  toast.id = id;
+  toast.setAttribute('role', variant === 'error' ? 'alert' : 'status');
+  toast.innerHTML = `
+    <div class="ui-toast-bar" aria-hidden="true"></div>
+    <div class="ui-toast-message">${escapeHtml(text)}</div>
+  `;
+  host.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add('is-visible'));
+
+  let done = false;
+  const close = () => {
+    if (done) return;
+    done = true;
+    toast.classList.remove('is-visible');
+    toast.classList.add('is-leaving');
+    setTimeout(() => {
+      toast.remove();
+      if (host.childElementCount === 0) host.remove();
+    }, 180);
+  };
+  toast.addEventListener('click', close);
+  setTimeout(close, timeout);
+  return { id, close };
+}
+
 // Danger-styled confirm: title + multi-line message + custom danger button
 // label. The primary button uses .btn-danger (red) so the user sees the
 // destructive action signed by the action wording itself. Used by the
@@ -83,7 +128,7 @@ function uiAlert(message) {
 // to adopt for other irreversible actions later.
 //
 // Returns true if the user confirmed (clicked the danger button), false on
-// cancel / outside click / Esc.
+// cancel / Esc.
 function uiConfirmDanger({ title, message, dangerLabel, cancelLabel } = {}) {
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
@@ -120,9 +165,6 @@ function uiConfirmDanger({ title, message, dangerLabel, cancelLabel } = {}) {
     };
     okBtn.addEventListener('click', () => finish(true));
     cancelBtn.addEventListener('click', () => finish(false));
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) finish(false);
-    });
     document.addEventListener('keydown', onKey, true);
     setTimeout(() => cancelBtn.focus(), 0);  // focus cancel by default — safer
   });
@@ -130,7 +172,7 @@ function uiConfirmDanger({ title, message, dangerLabel, cancelLabel } = {}) {
 
 // Multi-button choice dialog. The user picks one of `choices[]` (each
 // gets its own button); the resolved value is the chosen `id`, or `null`
-// on cancel / Esc / outside-click. Used when an action has two valid
+// on cancel / Esc. Used when an action has two valid
 // follow-up paths (e.g. close-sync with / without cloud purge) — a plain
 // uiConfirm would force the user to imagine the alternative.
 //
@@ -175,16 +217,13 @@ function uiChoice({ title, message, choices = [], cancelLabel } = {}) {
       btn.addEventListener('click', () => finish(btn.dataset.id || null));
     });
     overlay.querySelector('[data-act="cancel"]').addEventListener('click', () => finish(null));
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) finish(null);
-    });
     document.addEventListener('keydown', onKey, true);
   });
 }
 
 // Text-input prompt with cancel / confirm buttons. Returns the entered string, or
 // null on cancel. Mirrors native `prompt()` semantics.
-function uiPrompt(message, defaultValue = '') {
+function uiPrompt(message, defaultValue = '', options = {}) {
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay ui-dialog-overlay open';
@@ -207,6 +246,9 @@ function uiPrompt(message, defaultValue = '') {
 
     const input = overlay.querySelector('.ui-dialog-input');
     input.value = defaultValue;
+    if (options && options.nameLimit && typeof window.bindNameLimitControl === 'function') {
+      window.bindNameLimitControl(input);
+    }
     const okBtn = overlay.querySelector('[data-act="ok"]');
     const cancelBtn = overlay.querySelector('[data-act="cancel"]');
     const onKey = (e) => {
@@ -223,11 +265,7 @@ function uiPrompt(message, defaultValue = '') {
     };
     okBtn.addEventListener('click', () => finish(input.value));
     cancelBtn.addEventListener('click', () => finish(null));
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) finish(null);
-    });
     document.addEventListener('keydown', onKey, true);
     setTimeout(() => { input.focus(); input.select(); }, 0);
   });
 }
-

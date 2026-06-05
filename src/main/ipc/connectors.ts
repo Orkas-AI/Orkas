@@ -15,15 +15,16 @@
  */
 import * as connectors from '../features/connectors';
 import { isConnectorEnabled, setConnectorEnabled } from '../features/component_enabled';
+import { catalogWithAvailability, isConnectorRuntimeEnabled } from '../features/connectors/availability';
 
 export const invokeHandlers = {
-  'connectors.catalog': async () => ({ catalog: connectors.CONNECTOR_CATALOG }),
+  'connectors.catalog': async () => ({ catalog: catalogWithAvailability(connectors.CONNECTOR_CATALOG) }),
 
   'connectors.list': async (_payload: unknown, ctx: { userId: string }) => {
     // Attach the per-user `enabled` flag so the renderer can render the "停用 / 启用" toggle
     // without a second IPC. Defaults to true when the user hasn't toggled it (the file only
     // stores `false` overrides — see features/component_enabled.ts).
-    const raw = connectors.listInstances(ctx.userId);
+    const raw = connectors.listInstances(ctx.userId).filter((inst) => isConnectorRuntimeEnabled(inst.id));
     const instances = raw.map((inst) => ({ ...inst, enabled: isConnectorEnabled(ctx.userId, inst.id) }));
     return { instances };
   },
@@ -74,5 +75,16 @@ export const invokeHandlers = {
     const instance = await connectors.setEnabledSubtools(ctx.userId, payload.id, subset);
     if (!instance) throw new Error('instance not found');
     return { instance };
+  },
+
+  'connectors.google_sheets_authorize_files': async (
+    payload: { file_ids?: unknown },
+    ctx: { userId: string },
+  ) => {
+    const fileIds = Array.isArray(payload?.file_ids)
+      ? payload.file_ids.filter((x): x is string => typeof x === 'string' && !!x.trim())
+      : [];
+    const picked_file_ids = await connectors.authorizeGoogleSheetsFiles(ctx.userId, fileIds);
+    return { picked_file_ids };
   },
 };

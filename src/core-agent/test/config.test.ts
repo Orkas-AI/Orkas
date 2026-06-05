@@ -6,7 +6,7 @@ describe("Config", () => {
     it("creates config with all defaults", () => {
       const config = createConfig();
 
-      expect(config.agent.defaultModel).toBe("claude-sonnet-4-20250514");
+      expect(config.agent.defaultModel).toBe("claude-opus-4-8");
       expect(config.agent.defaultProvider).toBe("anthropic");
       expect(config.agent.maxRetries).toBe(3);
       expect(config.agent.maxToolLoops).toBe(50);
@@ -52,7 +52,7 @@ describe("Config", () => {
   describe("CoreAgentConfigSchema", () => {
     it("validates valid config", () => {
       const result = CoreAgentConfigSchema.safeParse({
-        agent: { defaultModel: "claude-opus-4-6" },
+        agent: { defaultModel: "claude-opus-4-7" },
       });
       expect(result.success).toBe(true);
     });
@@ -75,12 +75,12 @@ describe("Config", () => {
   describe("loadConfig", () => {
     it("returns defaults when no path given", async () => {
       const config = await loadConfig();
-      expect(config.agent.defaultModel).toBe("claude-sonnet-4-20250514");
+      expect(config.agent.defaultModel).toBe("claude-opus-4-8");
     });
 
     it("returns defaults for non-existent file", async () => {
       const config = await loadConfig("/tmp/nonexistent-config-12345.json");
-      expect(config.agent.defaultModel).toBe("claude-sonnet-4-20250514");
+      expect(config.agent.defaultModel).toBe("claude-opus-4-8");
     });
   });
 });

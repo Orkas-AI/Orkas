@@ -405,7 +405,7 @@ describe('contexts › rebuildIndex', () => {
     const c = await loadContexts();
     c.rebuildIndex();
     const idx = fs.readFileSync(path.join(ctxRoot(), '_INDEX.md'), 'utf8');
-    expect(idx).toContain('# 知识库索引');
+    expect(idx).toContain('# 资料库索引');
     expect(idx).toContain('`dom/`');
     expect(idx).toContain('2 篇');
     expect(idx).toContain('root.md');

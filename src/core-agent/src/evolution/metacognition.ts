@@ -208,7 +208,7 @@ function extractSection(text: string, headingKeywords: string[]): string | null 
  * transcript.
  *
  * Single open-ended prompt (no `primaryFocus` branching) per
- * `docs/plans/reflection-redesign.md` §2.3 — the LLM reads the transcript
+ * `Common/docs/plans/reflection-redesign.md` §2.3 — the LLM reads the transcript
  * and decides what's worth saving. Eliminating the 7-case switch removes
  * a window-aggregation ambiguity (multi-focus runs would need contradictory
  * directives) and keeps the system prompt cache-stable across calls.
@@ -240,7 +240,7 @@ export function buildReviewPrompt(
   // into the runtime system prompt is a weak nudge unless entries are written
   // as actionable rules anchored to trigger conditions. Without this section
   // reflection tends to produce vague descriptions ("agent should be careful
-  // about X") that the agent reliably ignores. See docs/plans/reflection-redesign.md §9.
+  // about X") that the agent reliably ignores. See Common/docs/plans/reflection-redesign.md §9.
   const writingStyle = 'When you update COMPETENCE.md / LEARNING_STRATEGIES.md or '
     + 'author a skill, write actionable imperatives — not descriptions.\n'
     + '  ✗ "Agent should be careful about overly verbose output."\n'

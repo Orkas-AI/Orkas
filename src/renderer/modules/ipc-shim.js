@@ -44,6 +44,7 @@ const _IPC_ROUTES = [
   ['GET',    '/api/contexts/image',           'contexts.image'],
   ['GET',    '/api/contexts/docx',            'contexts.docxHtml'],
   ['POST',   '/api/contexts/reveal',          'contexts.reveal'],
+  ['POST',   '/api/library/write-text',        'library.writeText'],
   ['POST',   '/api/search/global',            'search.global'],
   ['POST',   '/api/conversations/attachments/adopt', 'conversations.attachments.adopt'],
   ['POST',   '/api/common/pick-directory',    'common.pickDirectory'],
@@ -56,10 +57,13 @@ const _IPC_ROUTES = [
   ['POST',   '/api/marketplace/skills/list',  'marketplace.listSkills'],
   ['POST',   '/api/marketplace/agents/install', 'marketplace.installAgent'],
   ['POST',   '/api/marketplace/skills/install', 'marketplace.installSkill'],
+  ['POST',   '/api/marketplace/agents/upload',  'marketplace.uploadAgent'],
+  ['POST',   '/api/marketplace/skills/upload',  'marketplace.uploadSkill'],
 
   // Pattern routes (with path parameters)
   ['DELETE', /^\/api\/conversations\/([^/]+)$/,            'conversations.delete',       ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/pin$/,       'conversations.pin',          ['cid']],
+  ['POST',   /^\/api\/conversations\/([^/]+)\/rename$/,    'conversations.rename',       ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/history$/,   'conversations.history',      ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/files$/,     'conversations.files.list',   ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/send$/,      'groupChat.send',             ['cid']],
@@ -68,6 +72,7 @@ const _IPC_ROUTES = [
   ['GET',    /^\/api\/conversations\/([^/]+)\/members$/,   'groupChat.listMembers',      ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/runtime$/,   'groupChat.runtimeStatus',    ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/plan$/,      'groupChat.readPlan',         ['cid']],
+  ['POST',   /^\/api\/conversations\/([^/]+)\/plan\/continue$/, 'groupChat.continuePlan', ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/plan\/steps\/(\d+)\/retry$/, 'groupChat.retryStep', ['cid', 'stepIndex']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/plan\/steps\/(\d+)\/skip$/,  'groupChat.skipStep',  ['cid', 'stepIndex']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/events\/stream$/, 'groupChat.events',      ['cid'], { stream: true }],
@@ -138,6 +143,11 @@ function _mockErrorResponse(error, status) {
   };
 }
 
+function _monitorIpcError(kind, channel, data) {
+  try {
+  } catch (_) {}
+}
+
 /**
  * Convert a window.orkas.stream call into a Response whose body is a
  * ReadableStream of SSE-formatted bytes. The existing app.js SSE reader
@@ -162,7 +172,10 @@ function _streamResponse(channel, payload, signal) {
       // second time.
       streamHandle.promise
         .then(() => { try { controller.close(); } catch (_) {} })
-        .catch((err) => { try { controller.error(err); } catch (_) {} });
+        .catch((err) => {
+          _monitorIpcError('ipc_stream', channel, { msg: err && err.message ? err.message : String(err) });
+          try { controller.error(err); } catch (_) {}
+        });
     },
     cancel() {
       if (streamHandle) streamHandle.cancel();
@@ -206,8 +219,14 @@ async function _uploadBinary(channel, options, extraParams) {
     binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + step, bytes.length)));
   }
   const data = btoa(binary);
-  const result = await window.orkas.invoke(channel, { ...(extraParams || {}), name, data });
-  return _mockJsonResponse(result);
+  try {
+    const result = await window.orkas.invoke(channel, { ...(extraParams || {}), name, data });
+    if (result && result.ok === false) _monitorIpcError('ipc_upload_result', channel, { msg: result.error || result.reason || 'failed' });
+    return _mockJsonResponse(result);
+  } catch (err) {
+    _monitorIpcError('ipc_upload', channel, { msg: err && err.message ? err.message : String(err) });
+    throw err;
+  }
 }
 
 /**
@@ -231,6 +250,7 @@ function apiFetch(url, options) {
   const route = _matchRoute(method, pathname);
   if (!route) {
     _shimLog.warn('unmatched route:', method, pathname);
+    _monitorIpcError('ipc_unmatched_route', method + ' ' + pathname);
     return Promise.resolve(_mockErrorResponse(`unknown route: ${method} ${pathname}`, 404));
   }
 
@@ -257,7 +277,7 @@ function apiFetch(url, options) {
   // invoke; path params (e.g. `cid`) are merged into the payload.
   if (channel && typeof channel === 'object' && channel.upload) {
     const uploadChannel = typeof channel.upload === 'string' ? channel.upload : 'contexts.upload';
-    return _uploadBinary(uploadChannel, options, params);
+    return _uploadBinary(uploadChannel, options, params).catch((err) => _mockErrorResponse((err && err.message) || String(err), 500));
   }
 
   // Streaming: go through window.orkas.stream + ReadableStream body.
@@ -271,5 +291,13 @@ function apiFetch(url, options) {
     ? { ...params, updates: body, ...query }
     : { ...query, ...body, ...params };
 
-  return window.orkas.invoke(channel, payload).then(_mockJsonResponse);
+  return window.orkas.invoke(channel, payload)
+    .then((result) => {
+      if (result && result.ok === false) _monitorIpcError('ipc_result', channel, { msg: result.error || result.reason || 'failed' });
+      return _mockJsonResponse(result);
+    })
+    .catch((err) => {
+      _monitorIpcError('ipc_invoke', channel, { msg: err && err.message ? err.message : String(err) });
+      return _mockErrorResponse((err && err.message) || String(err), 500);
+    });
 }

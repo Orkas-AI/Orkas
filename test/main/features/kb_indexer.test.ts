@@ -35,14 +35,27 @@ vi.mock('../../../src/main/features/kb_embed', () => ({
 }));
 
 // Image tests mock chatWithModel so we never hit a real LLM.
+const chatWithModelMock = vi.hoisted(() => vi.fn(async () => ({
+  ok: true,
+  text: 'mock image description',
+  error: '',
+  aborted: false,
+})));
 vi.mock('../../../src/main/model/client', () => ({
-  chatWithModel: async () => ({ ok: true, text: 'mock image description' }),
+  chatWithModel: chatWithModelMock,
 }));
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-kbidx-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
+  chatWithModelMock.mockReset();
+  chatWithModelMock.mockResolvedValue({
+    ok: true,
+    text: 'mock image description',
+    error: '',
+    aborted: false,
+  });
   vi.resetModules();
   const users = await import('../../../src/main/features/users');
   users.activateUser(TEST_UID);
@@ -64,6 +77,12 @@ function contextsRoot(): string {
 }
 
 function writeCtx(rel: string, body: string): void {
+  const full = path.join(contextsRoot(), rel);
+  fs.mkdirSync(path.dirname(full), { recursive: true });
+  fs.writeFileSync(full, body);
+}
+
+function writeCtxBuffer(rel: string, body: Buffer): void {
   const full = path.join(contextsRoot(), rel);
   fs.mkdirSync(path.dirname(full), { recursive: true });
   fs.writeFileSync(full, body);
@@ -192,6 +211,29 @@ describe('kb_indexer › enqueue + processJob', () => {
     await idx.drain(TEST_UID);
 
     expect(kb.getFileByPath(TEST_UID, 'short.md')?.chunks).toBe(1);
+  });
+
+  it('uses a fallback chunk when image vision extraction fails', async () => {
+    const { Jimp } = await import('jimp' as any);
+    const img: any = new Jimp({ width: 16, height: 16, color: 0x336699FF });
+    writeCtxBuffer('photo.png', await img.getBuffer('image/png'));
+    chatWithModelMock.mockResolvedValueOnce({
+      ok: false,
+      text: '',
+      error: 'vision model unavailable',
+      aborted: false,
+    });
+
+    const idx = await import('../../../src/main/features/kb_indexer');
+    const kb = await import('../../../src/main/features/kb_vector');
+    idx.enqueue(TEST_UID, 'photo.png');
+    await idx.drain(TEST_UID);
+
+    const row = kb.getFileByPath(TEST_UID, 'photo.png');
+    expect(row?.status).toBe('ready');
+    expect(row?.chunks).toBe(1);
+    const chunks = kb.readFileChunks(TEST_UID, 'photo.png');
+    expect(chunks[0]?.content).toMatch(/automatic visual description is unavailable/);
   });
 
   it('short-circuits empty files to ready with 0 chunks (no embed call)', async () => {

@@ -72,16 +72,6 @@ export interface StateFile {
    *  per-conversation, NOT per-agent: one project for the whole
    *  conversation across however many coding agents it has. */
   coding_project_dir?: string;
-  /** True once this conversation has been touched by the iOS remote-control
-   *  client (a relayed command landed on this PC, or the user opted in).
-   *  appended messages + plan/state up to the Server so the phone can watch
-   *  progress. Only `true` is recorded; absent = not relayed. */
-  /** True when the user picked `coding_project_dir` explicitly via the
-   *  `<agent-input-form>` directory picker (form-submit hook in
-   *  `group_chat/index.ts`). False / missing means the dir was
-   *  auto-set by the workspace-sync path in `bus.ts` and is allowed to
-   *  follow future workspace switches. Cleared whenever
-   *  `coding_project_dir` is cleared. */
   /** True when the user picked `coding_project_dir` explicitly, either
    *  via the agent detail page's custom project-dir setting at initial
    *  conversation setup, or via the `<agent-input-form>` directory
@@ -144,15 +134,26 @@ async function writeMembers(uid: string, cid: string, m: MembersFile): Promise<v
   await writeJson(groupChatMembersFile(uid, cid), m);
 }
 
-/** Idempotent. Returns true if the actor was newly added. */
+/** Idempotent. Returns true if the actor was newly added.
+ *
+ *  Mutex-guarded against concurrent callers — `groupChat.send` and
+ *  `streamEvents` both call `seedReservedActors` on the same microtask
+ *  cycle when the user submits the very first message of a new conv, and
+ *  without serialisation the two `addMember(commander)` calls race on the
+ *  members.json tmp-rename, surfacing as
+ *  `ENOENT: ... members.json.tmp -> members.json` and killing the stream.
+ *  Reuses `_stateLock` because it's already per-`(uid,cid)` and members
+ *  shares the cid scope. */
 export async function addMember(uid: string, cid: string, actor: Omit<Actor, 'joined_at'>): Promise<boolean> {
-  const members = await readMembers(uid, cid);
-  if (members.actors.find((a) => a.id === actor.id)) return false;
-  const next: Actor = { ...actor, joined_at: nowIso() };
-  members.actors.push(next);
-  await writeMembers(uid, cid, members);
-  log.info(`member-joined user=${uid} cid=${cid} actor=${actor.id} kind=${actor.kind}${actor.name ? ` name=${actor.name}` : ''}`);
-  return true;
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const members = await readMembers(uid, cid);
+    if (members.actors.find((a) => a.id === actor.id)) return false;
+    const next: Actor = { ...actor, joined_at: nowIso() };
+    members.actors.push(next);
+    await writeMembers(uid, cid, members);
+    log.info(`member-joined user=${uid} cid=${cid} actor=${actor.id} kind=${actor.kind}${actor.name ? ` name=${actor.name}` : ''}`);
+    return true;
+  });
 }
 
 /** Seed commander + user at conv creation / first activity. Idempotent. */
@@ -375,14 +376,6 @@ export async function setCodingProjectDir(
   });
 }
 
-/** Mark / unmark this conversation as relay-enabled (mirrored to the iOS client — see
-  return _stateLock(uid, cid).runExclusive(async () => {
-    const s = await readState(uid, cid);
-    s.last_active_at = nowIso();
-    await writeStateRaw(uid, cid, s);
-    return s;
-  });
-}
 
 /** Drop the whole group dir (called from chats.deleteConversation). */
 export async function purgeGroupDir(uid: string, cid: string): Promise<void> {

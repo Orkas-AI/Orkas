@@ -1,7 +1,7 @@
 /**
  * Tests for the connector umbrella architecture: `getConnectorPromptBlock` (system-prompt
  * enumeration) + the two meta-tools (`list_connector_tools` / `call_connector_tool`). Covers
- * the actor-visibility matrix (commander vs. agent worker, the `enabled_connectors` whitelist,
+ * the actor-visibility matrix (commander scope vs. optional agent-id filtering,
  * the `enabled_subtools` instance filter), the empty-state contract (zero tools + empty block
  * when nothing visible), the discover-before-invoke contract, and MCP error propagation.
  *
@@ -51,6 +51,8 @@ vi.mock('../../../../src/main/features/connectors/catalog', () => ({
 vi.mock('../../../../src/main/i18n', () => ({
   getCurrentLang: () => 'en',
   descriptionLang: (lang: 'zh' | 'en' | 'ja') => (lang === 'zh' ? 'zh' : 'en'),
+  SUPPORTED_LANGS: ['zh', 'en', 'ja'] as const,
+  t: (key: string) => key,
 }));
 
 vi.mock('../../../../src/main/logger', () => ({
@@ -135,9 +137,9 @@ describe('connectorExposureFromSessionId', () => {
     expect(connectorExposureFromSessionId('gconv-ac5559863d42')).toBe('tools+block');
   });
 
-  it('matches gmember (agent worker) including dashed aid in the tail → tools+block', async () => {
+  it('matches gmember (agent worker) including dashed aid in the tail → none', async () => {
     const { connectorExposureFromSessionId } = await import('../../../../src/main/model/core-agent/runner');
-    expect(connectorExposureFromSessionId('gmember-cv1-agt-42')).toBe('tools+block');
+    expect(connectorExposureFromSessionId('gmember-cv1-agt-42')).toBe('none');
   });
 
   it('matches agent-edit → discover+block (block + list_connector_tools, NO call_connector_tool)', async () => {

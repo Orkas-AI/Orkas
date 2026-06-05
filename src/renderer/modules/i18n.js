@@ -149,6 +149,21 @@ async function setLang(lang) {
   return _currentLang;
 }
 
+async function refreshLangFromMain() {
+  try {
+    const res = await window.orkas.getLanguage();
+    const next = res && res.ok && isSupportedLang(res.language) ? res.language : _currentLang;
+    if (next === _currentLang) return _currentLang;
+    _currentLang = next;
+    applyDomI18n();
+    _setDocumentLang(_currentLang);
+    window.dispatchEvent(new CustomEvent('i18n-change', { detail: { lang: _currentLang } }));
+  } catch (err) {
+    _i18nLog.warn('refreshLangFromMain failed', { error: (err && err.message) || String(err) });
+  }
+  return _currentLang;
+}
+
 // Fill text / placeholder / title for elements tagged with data-i18n*.
 // Safe to call multiple times and on subtrees (e.g. after inserting a new
 // dialog). Text content is written as plain text — keys that need rich

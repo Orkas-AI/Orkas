@@ -80,6 +80,12 @@ export interface AgentInstall {
    *  reconcile fills it in next time the row is re-pulled. UI uses this to render the
    *  author badge on the agent detail page. */
   create_uid?: string;
+  /** Server-side fresh-install seed flag. Optional for old manifest rows. */
+  default_install?: boolean;
+  /** Marketplace review lifecycle status mirrored from the server row. */
+  status?: string;
+  /** Legacy local metadata name, read for compatibility during the status merge. */
+  state?: string;
 }
 
 export interface SkillInstall {
@@ -92,6 +98,12 @@ export interface SkillInstall {
   installed_at: number;
   /** Same as `AgentInstall.create_uid` — see comment there. */
   create_uid?: string;
+  /** Same as `AgentInstall.default_install`. */
+  default_install?: boolean;
+  /** Same as `AgentInstall.status`. */
+  status?: string;
+  /** Legacy local metadata name, read for compatibility during the status merge. */
+  state?: string;
 }
 
 export const CURRENT_VERSION = 1;
@@ -100,6 +112,10 @@ export interface InstallsManifest {
   version: typeof CURRENT_VERSION;
   agents: AgentInstall[];
   skills: SkillInstall[];
+  _deleted_at?: {
+    agents?: Record<string, number>;
+    skills?: Record<string, number>;
+  };
 }
 
 const EMPTY: InstallsManifest = { version: CURRENT_VERSION, agents: [], skills: [] };
@@ -125,6 +141,7 @@ export async function readInstalls(uid: string): Promise<InstallsManifest> {
       version: CURRENT_VERSION,
       agents: Array.isArray(parsed.agents) ? parsed.agents.filter(_isAgentRow) : [],
       skills: Array.isArray(parsed.skills) ? parsed.skills.filter(_isSkillRow) : [],
+      ...(_readDeletedAt(parsed) ? { _deleted_at: _readDeletedAt(parsed) } : {}),
     };
   } catch (err) {
     log.warn(`read ${file} failed: ${(err as Error).message}`);
@@ -148,9 +165,16 @@ export async function addAgentInstall(uid: string, row: Omit<AgentInstall, 'inst
   await _getWriteLock(uid).runExclusive(async () => {
     const manifest = await readInstalls(uid);
     const idx = manifest.agents.findIndex((a) => a.id === row.id);
-    const entry: AgentInstall = { ...row, installed_at: row.installed_at || Date.now() };
+    const previous = idx >= 0 ? manifest.agents[idx] : null;
+    const entry: AgentInstall = {
+      ...(previous || {}),
+      ...row,
+      installed_at: row.installed_at || previous?.installed_at || Date.now(),
+    };
     if (idx >= 0) manifest.agents[idx] = entry;
     else manifest.agents.push(entry);
+    delete manifest._deleted_at?.agents?.[row.id];
+    _pruneDeletedAt(manifest);
     await writeInstalls(uid, manifest);
     log.info(`agent installed id=${row.id} v${row.version}`);
   });
@@ -160,9 +184,16 @@ export async function addSkillInstall(uid: string, row: Omit<SkillInstall, 'inst
   await _getWriteLock(uid).runExclusive(async () => {
     const manifest = await readInstalls(uid);
     const idx = manifest.skills.findIndex((s) => s.id === row.id);
-    const entry: SkillInstall = { ...row, installed_at: row.installed_at || Date.now() };
+    const previous = idx >= 0 ? manifest.skills[idx] : null;
+    const entry: SkillInstall = {
+      ...(previous || {}),
+      ...row,
+      installed_at: row.installed_at || previous?.installed_at || Date.now(),
+    };
     if (idx >= 0) manifest.skills[idx] = entry;
     else manifest.skills.push(entry);
+    delete manifest._deleted_at?.skills?.[row.id];
+    _pruneDeletedAt(manifest);
     await writeInstalls(uid, manifest);
     log.info(`skill installed id=${row.id} v${row.version}`);
   });
@@ -174,6 +205,7 @@ export async function removeAgentInstall(uid: string, id: string): Promise<boole
     const before = manifest.agents.length;
     manifest.agents = manifest.agents.filter((a) => a.id !== id);
     if (manifest.agents.length === before) return false;
+    _markDeleted(manifest, 'agents', id);
     await writeInstalls(uid, manifest);
     log.info(`agent uninstalled id=${id}`);
     return true;
@@ -186,6 +218,7 @@ export async function removeSkillInstall(uid: string, id: string): Promise<boole
     const before = manifest.skills.length;
     manifest.skills = manifest.skills.filter((s) => s.id !== id);
     if (manifest.skills.length === before) return false;
+    _markDeleted(manifest, 'skills', id);
     await writeInstalls(uid, manifest);
     log.info(`skill uninstalled id=${id}`);
     return true;
@@ -217,4 +250,37 @@ function _isSkillRow(x: unknown): x is SkillInstall {
   return typeof r.id === 'string' && typeof r.version === 'string'
     && typeof r.published_at === 'number' && typeof r.bundle_url === 'string'
     && typeof r.installed_at === 'number';
+}
+
+function _readDeletedAt(parsed: Partial<InstallsManifest> & { version?: unknown }): InstallsManifest['_deleted_at'] | null {
+  const raw = (parsed as any)._deleted_at;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const out: NonNullable<InstallsManifest['_deleted_at']> = {};
+  for (const kind of ['agents', 'skills'] as const) {
+    const bucket = raw[kind];
+    if (!bucket || typeof bucket !== 'object' || Array.isArray(bucket)) continue;
+    const clean: Record<string, number> = {};
+    for (const [id, value] of Object.entries(bucket as Record<string, unknown>)) {
+      const n = Number(value);
+      if (id && Number.isFinite(n) && n > 0) clean[id] = n;
+    }
+    if (Object.keys(clean).length > 0) out[kind] = clean;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function _markDeleted(manifest: InstallsManifest, kind: 'agents' | 'skills', id: string): void {
+  manifest._deleted_at = manifest._deleted_at || {};
+  manifest._deleted_at[kind] = manifest._deleted_at[kind] || {};
+  manifest._deleted_at[kind]![id] = Date.now();
+}
+
+function _pruneDeletedAt(manifest: InstallsManifest): void {
+  if (!manifest._deleted_at) return;
+  for (const kind of ['agents', 'skills'] as const) {
+    if (manifest._deleted_at[kind] && Object.keys(manifest._deleted_at[kind]!).length === 0) {
+      delete manifest._deleted_at[kind];
+    }
+  }
+  if (Object.keys(manifest._deleted_at).length === 0) delete manifest._deleted_at;
 }

@@ -15,11 +15,10 @@
  *                    / `payment_required` (this account is out of money)
  *   - `network`    → ECONNRESET / ETIMEDOUT / ENOTFOUND / "fetch failed" /
  *                    "Client network socket disconnected before secure TLS"
- *                    (TCP/TLS reset, often persistent for a specific endpoint
- *                    when the user is behind a firewall — rotating to a
- *                    different provider has a real chance of succeeding).
- *                    Cooldown is short (see `profile-cooldown.NETWORK_COOLDOWN_MS`)
- *                    so a one-shot blip doesn't sideline the candidate for long.
+ *                    (TCP/TLS reset. Rotating to a different provider can
+ *                    help inside the current request, but we do NOT cooldown
+ *                    network failures; the next user request starts from the
+ *                    configured entries list again).
  *
  * **Not** key failures (return null — error propagates, no rotation):
  *   - 400 malformed request / invalid model param (config issue, same on any key)

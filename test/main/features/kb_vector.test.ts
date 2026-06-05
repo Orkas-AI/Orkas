@@ -221,6 +221,14 @@ describe('kb_vector › search', () => {
     expect(hits.length).toBe(2);
   });
 
+  it('filters by exact path', async () => {
+    const kb = await loadKb();
+    await seed(kb);
+    const hits = kb.search(TEST_UID, fakeVec(1, 0), { k: 5, path: 'drafts/b.md' });
+    expect(hits.length).toBe(1);
+    expect(hits[0].rel_path).toBe('drafts/b.md');
+  });
+
   it('filters by kind', async () => {
     const kb = await loadKb();
     await seed(kb);

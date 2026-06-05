@@ -51,6 +51,10 @@ const CODEX_DROP_TO_DEBUG = new Set<string>([
 
 const log = createLogger('local-agents:codex');
 
+const TRUSTED_LOCAL_APPROVAL_POLICY = 'never';
+const TRUSTED_LOCAL_SANDBOX_MODE = 'danger-full-access';
+const TRUSTED_LOCAL_SANDBOX_POLICY = { type: 'dangerFullAccess' } as const;
+
 export const codexBackend: LocalBackend = {
   async run(opts: BackendRunOptions): Promise<void> {
     const args = buildCodexArgs(opts);
@@ -292,6 +296,18 @@ export const codexBackend: LocalBackend = {
         return;
       }
 
+      if (method === 'turn/diff/updated') {
+        const files = extractCodexDiffFiles(typeof params?.diff === 'string' ? params.diff : '');
+        if (files.length) opts.onEvent({ type: 'file-change', paths: files });
+        opts.onEvent({
+          type: 'log',
+          level: 'debug',
+          message: `turn/diff/updated: ${files.join(', ') || 'diff updated'}`,
+          source: 'codex',
+        });
+        return;
+      }
+
       // ── Legacy codex/event protocol (older codex builds) ─────────
       if (method === 'codex/event' || method.startsWith('codex/event/')) {
         const ev = (params && typeof params === 'object' && typeof params.type === 'string')
@@ -425,6 +441,7 @@ export const codexBackend: LocalBackend = {
         await rpc('turn/start', {
           threadId,
           input: [{ type: 'text', text: opts.prompt }],
+          ...buildCodexTurnPermissionOverrides(opts.cwd),
         });
         // After turn/start succeeds we wait passively — turn end is
         // driven by `turn/completed` / `task_complete` notifications,
@@ -444,6 +461,7 @@ export const codexBackend: LocalBackend = {
             threadId: o.resumeSessionId,
             cwd: o.cwd,
             model: o.model || null,
+            ...buildCodexThreadPermissionOverrides(),
             developerInstructions: null,
           });
           const tid = extractThreadId(r);
@@ -458,8 +476,7 @@ export const codexBackend: LocalBackend = {
         modelProvider: null,
         profile: null,
         cwd: o.cwd,
-        approvalPolicy: null,
-        sandbox: null,
+        ...buildCodexThreadPermissionOverrides(),
         config: null,
         baseInstructions: null,
         developerInstructions: null,
@@ -481,6 +498,66 @@ function buildCodexArgs(opts: BackendRunOptions): string[] {
   const args = ['app-server', '--listen', 'stdio://'];
   if (opts.customArgs && opts.customArgs.length) args.push(...opts.customArgs);
   return args;
+}
+
+export function buildCodexThreadPermissionOverrides(): { approvalPolicy: string; sandbox: string } {
+  return {
+    approvalPolicy: TRUSTED_LOCAL_APPROVAL_POLICY,
+    sandbox: TRUSTED_LOCAL_SANDBOX_MODE,
+  };
+}
+
+export function buildCodexTurnPermissionOverrides(cwd: string): {
+  cwd: string;
+  approvalPolicy: string;
+  sandboxPolicy: { type: string };
+} {
+  return {
+    cwd,
+    approvalPolicy: TRUSTED_LOCAL_APPROVAL_POLICY,
+    sandboxPolicy: { ...TRUSTED_LOCAL_SANDBOX_POLICY },
+  };
+}
+
+export function extractCodexDiffFiles(diff: string): string[] {
+  if (typeof diff !== 'string' || !diff) return [];
+  const out = new Set<string>();
+  let current = '';
+  let deleted = false;
+  const flush = () => {
+    if (current && !deleted) out.add(current);
+    current = '';
+    deleted = false;
+  };
+  for (const raw of diff.split(/\r?\n/)) {
+    const line = raw.trimEnd();
+    const git = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+    if (git) {
+      flush();
+      current = normalizeDiffPath(git[2] || git[1]);
+      continue;
+    }
+    if (/^deleted file mode\b/.test(line) || line === '+++ /dev/null') {
+      deleted = true;
+      continue;
+    }
+    const plus = /^\+\+\+ b\/(.+)$/.exec(line);
+    if (plus) {
+      const p = normalizeDiffPath(plus[1]);
+      if (p) current = p;
+    }
+  }
+  flush();
+  return Array.from(out);
+}
+
+function normalizeDiffPath(raw: string): string {
+  let p = String(raw || '').trim();
+  if (!p || p === '/dev/null') return '';
+  if ((p.startsWith('"') && p.endsWith('"')) || (p.startsWith("'") && p.endsWith("'"))) {
+    p = p.slice(1, -1);
+  }
+  return p;
 }
 
 /** Pull the `threadId` out of a `thread/start` or `thread/resume`

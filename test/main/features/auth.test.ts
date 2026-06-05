@@ -31,6 +31,15 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
+async function setDeepSeekEnabled(enabled: boolean): Promise<void> {
+  const { clientConfig } = await import('../../../src/main/features/client_config');
+  clientConfig.applyServerPayload({
+    immediate: { 'model.deepseek.enabled': enabled },
+    restart: {},
+    config_hash: `sha256:deepseek-${enabled ? 'on' : 'off'}`,
+  }, `"deepseek-${enabled ? 'on' : 'off'}"`);
+}
+
 describe('auth › maskKey', () => {
   it('returns empty for non-string inputs', async () => {
     const a = await import('../../../src/main/features/auth');
@@ -127,6 +136,45 @@ describe('auth › multi-profile store (addApiKey / removeCredential / renamePro
     const a = await import('../../../src/main/features/auth');
     const { profileId } = await a.addApiKey('openai', 'key-xxxxxxxxxxxx', 'work @home/1');
     expect(profileId).toBe('openai:work--home-1');
+  });
+
+  it('stores auth-profiles with the local-secret facade', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const paths = await import('../../../src/main/paths');
+    await a.addApiKey('openai', 'sk-local-secret-xxxxxxxx');
+    const raw = fs.readFileSync(paths.userAuthProfilesFile(TEST_UID), 'utf8');
+    expect(raw).toMatch(/^T1JLVkFVTFQx/);
+    expect(raw).not.toContain('sk-local-secret-xxxxxxxx');
+  });
+
+  it('migrates legacy crypto-vault auth-profiles on read', async () => {
+    const paths = await import('../../../src/main/paths');
+    const cryptoVault = await import('../../../src/main/util/crypto-vault');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, cryptoVault.encrypt(TEST_UID, JSON.stringify({
+      version: 4,
+      profiles: {
+        'openai:default': {
+          type: 'api_key',
+          provider: 'openai',
+          label: 'default',
+          key: 'sk-legacy-xxxxxxxx',
+          createdAt: 1,
+          lastUsed: 0,
+        },
+      },
+      entries: [],
+      searchProfiles: [],
+      imageProfiles: [],
+    })), 'utf8');
+
+    const a = await import('../../../src/main/features/auth');
+    const { providers } = await a.listProviders();
+    expect(providers.find((p) => p.id === 'openai')?.profiles[0]?.masked).toBe('sk-l…xxxx');
+    const raw = fs.readFileSync(file, 'utf8');
+    expect(raw).toMatch(/^T1JLVkFVTFQx/);
+    expect(raw).not.toContain('sk-legacy-xxxxxxxx');
   });
 
   it('removeCredential drops the profile', async () => {
@@ -239,14 +287,14 @@ describe('auth › entries (priority list)', () => {
     const a = await import('../../../src/main/features/auth');
     const p1 = await a.addApiKey('anthropic', 'key-xxxxxxxxxxxx', 'one');
     const p2 = await a.addApiKey('openai', 'sk-xxxxxxxxxxxx', 'one');
-    const r1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-5', profileId: p1.profileId });
+    const r1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-7', profileId: p1.profileId });
     const r2 = await a.addEntry({ provider: 'openai',    model: 'gpt-5',            profileId: p2.profileId });
     expect(r1.entryId).toBeTruthy();
     expect(r2.entryId).not.toBe(r1.entryId);
 
     const { entries } = await a.listEntries();
     expect(entries.map((e) => `${e.provider}:${e.model}`)).toEqual([
-      'anthropic:claude-opus-4-5',
+      'anthropic:claude-opus-4-7',
       'openai:gpt-5',
     ]);
   });
@@ -254,8 +302,8 @@ describe('auth › entries (priority list)', () => {
   it('addEntry is idempotent for the same (provider, model, profileId)', async () => {
     const a = await import('../../../src/main/features/auth');
     const p = await a.addApiKey('anthropic', 'k-xxxxxxxxxxxx');
-    const r1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-5', profileId: p.profileId });
-    const r2 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-5', profileId: p.profileId });
+    const r1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-7', profileId: p.profileId });
+    const r2 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-7', profileId: p.profileId });
     expect(r2.entryId).toBe(r1.entryId);
     const { entries } = await a.listEntries();
     expect(entries).toHaveLength(1);
@@ -272,7 +320,7 @@ describe('auth › entries (priority list)', () => {
   it('removeEntry drops the tuple', async () => {
     const a = await import('../../../src/main/features/auth');
     const p = await a.addApiKey('anthropic', 'k-xxxxxxxxxxxx');
-    const r = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-5', profileId: p.profileId });
+    const r = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-7', profileId: p.profileId });
     const out = await a.removeEntry(r.entryId);
     expect(out.removed).toBe(true);
     expect((await a.listEntries()).entries).toEqual([]);
@@ -281,7 +329,7 @@ describe('auth › entries (priority list)', () => {
   it('removeCredential cascades — entries pointing at the dropped profile go away', async () => {
     const a = await import('../../../src/main/features/auth');
     const p = await a.addApiKey('anthropic', 'k-xxxxxxxxxxxx');
-    await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-5', profileId: p.profileId });
+    await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-7', profileId: p.profileId });
     await a.removeCredential(p.profileId);
     expect((await a.listEntries()).entries).toEqual([]);
   });
@@ -290,7 +338,7 @@ describe('auth › entries (priority list)', () => {
     const a = await import('../../../src/main/features/auth');
     const p = await a.addApiKey('anthropic', 'k-xxxxxxxxxxxx');
     const q = await a.addApiKey('openai', 'k-xxxxxxxxxxxx');
-    const e1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-5', profileId: p.profileId });
+    const e1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-7', profileId: p.profileId });
     const e2 = await a.addEntry({ provider: 'openai',    model: 'gpt-5',            profileId: q.profileId });
 
     const res = await a.reorderEntries([e2.entryId, e1.entryId]);
@@ -307,8 +355,8 @@ describe('auth › entries (priority list)', () => {
     const a = await import('../../../src/main/features/auth');
     const p1 = await a.addApiKey('anthropic', 'k-one-xxxxxxxx', 'one');
     const p2 = await a.addApiKey('anthropic', 'k-two-xxxxxxxx', 'two');
-    const e1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-5', profileId: p1.profileId });
-    const e2 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-5', profileId: p2.profileId });
+    const e1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-7', profileId: p1.profileId });
+    const e2 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-7', profileId: p2.profileId });
 
     const first  = await a.pickChatEntry();
     const second = await a.pickChatEntry();
@@ -328,18 +376,19 @@ describe('auth › entries (priority list)', () => {
     // Priority: anthropic(bad)/openai(good) — we simulate "bad" by deleting
     // the credential after adding the entry (leaves a dangling entry, which
     // should be skipped, not returned).
-    const e1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-5', profileId: p2.profileId });
+    const e1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-7', profileId: p2.profileId });
     const e2 = await a.addEntry({ provider: 'openai',    model: 'gpt-5',            profileId: p1.profileId });
     // Remove credential p2 directly via removeCredential; since that cascades,
     // it also drops e1. To simulate a dangling entry without cascade, reach
     // into the json file.
     const pathMod = await import('../../../src/main/paths');
-    const cryptoVault = await import('../../../src/main/util/crypto-vault');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
     const storePath = pathMod.userAuthProfilesFile(TEST_UID);
     const raw = fs.readFileSync(storePath, 'utf-8');
-    const store = JSON.parse(cryptoVault.decrypt(TEST_UID, raw));
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    const store = JSON.parse(localSecrets.decryptLocalSecret(ctx, raw, { legacySeeds: [TEST_UID] }));
     delete store.profiles[p2.profileId];
-    fs.writeFileSync(storePath, cryptoVault.encrypt(TEST_UID, JSON.stringify(store)));
+    fs.writeFileSync(storePath, localSecrets.encryptLocalSecret(ctx, JSON.stringify(store)));
 
     const pick = await a.pickChatEntry();
     expect(pick).not.toBeNull();
@@ -355,7 +404,7 @@ describe('auth › pickChatEntryGroup + 冷却联动', () => {
   it('单把 key → group 只有 1 个候选', async () => {
     const a = await import('../../../src/main/features/auth');
     const p = await a.addApiKey('anthropic', 'k-only-xxxxxxxx');
-    const e = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-5', profileId: p.profileId });
+    const e = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-7', profileId: p.profileId });
 
     const group = await a.pickChatEntryGroup();
     expect(group.length).toBe(1);
@@ -366,8 +415,8 @@ describe('auth › pickChatEntryGroup + 冷却联动', () => {
     const a = await import('../../../src/main/features/auth');
     const p1 = await a.addApiKey('anthropic', 'k-1-xxxxxxxxxxx', 'one');
     const p2 = await a.addApiKey('anthropic', 'k-2-xxxxxxxxxxx', 'two');
-    const e1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-5', profileId: p1.profileId });
-    const e2 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-5', profileId: p2.profileId });
+    const e1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-7', profileId: p1.profileId });
+    const e2 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-7', profileId: p2.profileId });
 
     // Bump e1 first → e2 应该成为 oldest，排在前
     a.bumpEntryLastUsed(e1.entryId);
@@ -383,8 +432,8 @@ describe('auth › pickChatEntryGroup + 冷却联动', () => {
 
     const p1 = await a.addApiKey('anthropic', 'k-cold-xxxxxxx', 'cold');
     const p2 = await a.addApiKey('anthropic', 'k-warm-xxxxxxx', 'warm');
-    const e1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-5', profileId: p1.profileId });
-    const e2 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-5', profileId: p2.profileId });
+    const e1 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-7', profileId: p1.profileId });
+    const e2 = await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-7', profileId: p2.profileId });
 
     // 冷却 p1 —— 组内候选应该只剩 p2
     cd.markCooldown(p1.profileId, 'auth', 'mocked 401');
@@ -405,7 +454,7 @@ describe('auth › pickChatEntryGroup + 冷却联动', () => {
 
     const p1 = await a.addApiKey('anthropic', 'k-top-xxxxxxxx');
     const p2 = await a.addApiKey('openai',    'k-fallback-xxx');
-    await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-5', profileId: p1.profileId });
+    await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-7', profileId: p1.profileId });
     const e2 = await a.addEntry({ provider: 'openai',    model: 'gpt-5', profileId: p2.profileId });
 
     cd.markCooldown(p1.profileId, 'auth', 'cold');
@@ -451,7 +500,7 @@ describe('auth › hasConfiguredModel', () => {
     const p = await a.addApiKey('anthropic', 'k-xxxxxxxxxxxx');
     // Credential alone is not enough — we require an entry in the priority list.
     expect(a.hasConfiguredModel()).toEqual({ configured: false });
-    await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-5', profileId: p.profileId });
+    await a.addEntry({ provider: 'anthropic', model: 'claude-opus-4-7', profileId: p.profileId });
     expect(a.hasConfiguredModel()).toEqual({ configured: true });
   });
 
@@ -483,6 +532,48 @@ describe('auth › listModels', () => {
     const a = await import('../../../src/main/features/auth');
     const { models } = await a.listModels('no-such-provider');
     expect(models).toEqual([]);
+  });
+});
+
+describe('auth › DeepSeek policy gate', () => {
+  it('keeps DeepSeek visible by default without Server config', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const { providers } = await a.listProviders();
+    expect(providers.map((p) => p.id)).toContain('deepseek');
+    expect((await a.listModels('deepseek')).models.length).toBeGreaterThan(0);
+  });
+
+  it('hides DeepSeek direct and DeepSeek-backed OpenRouter models when Server config disables it', async () => {
+    await setDeepSeekEnabled(false);
+    const a = await import('../../../src/main/features/auth');
+
+    const { providers } = await a.listProviders();
+    expect(providers.map((p) => p.id)).not.toContain('deepseek');
+    expect(providers.map((p) => p.id)).toContain('openrouter');
+    expect((await a.listModels('deepseek')).models).toEqual([]);
+    expect((await a.listModels('openrouter')).models.some((m) => /deepseek/i.test(m.id))).toBe(false);
+    await expect(a.addApiKey('deepseek', 'sk-deepseek-disabled')).rejects.toThrow(/DeepSeek is disabled/);
+  });
+
+  it('does not use existing DeepSeek entries while disabled', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const p = await a.addApiKey('deepseek', 'sk-deepseek-existing');
+    await a.addEntry({ provider: 'deepseek', model: 'deepseek-v4-flash', profileId: p.profileId });
+    expect(a.hasConfiguredModel()).toEqual({ configured: true });
+
+    await setDeepSeekEnabled(false);
+    expect(a.hasConfiguredModel()).toEqual({ configured: false });
+    expect((await a.listEntries()).entries).toEqual([]);
+    expect(a.listApiKeyEntries()).toEqual([]);
+    expect(await a.pickChatEntry()).toBeNull();
+    expect(await a.pickRotationKey('deepseek')).toBeNull();
+    const { providers } = await a.listProviders();
+    expect(providers.flatMap((provider) => provider.profiles).some((profile) =>
+      profile.provider === 'deepseek' || profile.profileId.startsWith('deepseek:'),
+    )).toBe(false);
+    await expect(
+      a.addEntry({ provider: 'openrouter', model: 'deepseek/deepseek-v4-pro', profileId: p.profileId }),
+    ).rejects.toThrow(/DeepSeek is disabled/);
   });
 });
 

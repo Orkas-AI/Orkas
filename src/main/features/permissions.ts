@@ -1,14 +1,13 @@
 /**
  * Local-execution permission state.
  *
- * Single per-install flag that gates the `bash` / `write_file` /
- * `markdown_to_pdf` / `html_to_pdf` tools. The app runs real shell commands
- * and writes real files on the host, so the user has to grant consent
- * explicitly once.
+ * Single per-install flag that gates tools which execute commands or write
+ * local state (`bash`, write/edit/delete file, PDF/artifact generation, and
+ * companion generators such as images). It defaults to enabled; users can
+ * turn it off from Settings when they want read-only agent behavior.
  *
  * Stored in `data/config/permissions.json` (local-only; not synced across
- * devices — see CLAUDE.md §4). Corrupt / missing file → fail closed (not
- * granted).
+ * devices — see CLAUDE.md §4). Corrupt / missing file → default enabled.
  *
  * Contract:
  *   - `getLocalExecGranted()` is called at every tool execute(). Cheap: one
@@ -39,7 +38,7 @@ interface PermissionsFile {
   localExec: LocalExecState;
 }
 
-const DEFAULT_STATE: LocalExecState = { granted: false };
+const DEFAULT_STATE: LocalExecState = { granted: true };
 
 function filePath(): string {
   return path.join(userLocalConfigDir(getActiveUserId()), 'permissions.json');
@@ -53,15 +52,16 @@ function readFileSafe(): PermissionsFile {
     const parsed = JSON.parse(raw);
     const le = parsed?.localExec;
     if (!le || typeof le !== 'object') return { localExec: { ...DEFAULT_STATE } };
+    if (typeof le.granted !== 'boolean') return { localExec: { ...DEFAULT_STATE } };
     return {
       localExec: {
-        granted: le.granted === true,
+        granted: le.granted,
         ...(typeof le.grantedAt === 'string' ? { grantedAt: le.grantedAt } : {}),
         ...(typeof le.revokedAt === 'string' ? { revokedAt: le.revokedAt } : {}),
       },
     };
   } catch (err) {
-    log.warn(`permissions.json read failed, defaulting to not-granted: ${(err as Error).message}`);
+    log.warn(`permissions.json read failed, defaulting to granted: ${(err as Error).message}`);
     return { localExec: { ...DEFAULT_STATE } };
   }
 }
@@ -87,13 +87,13 @@ export function getLocalExecGranted(): boolean {
 export function grantLocalExec(): LocalExecState {
   const next: LocalExecState = { granted: true, grantedAt: nowIso() };
   writeFileAtomic({ localExec: next });
-  log.info('local execution granted');
+  log.info('tool execution access granted');
   return next;
 }
 
 export function revokeLocalExec(): LocalExecState {
   const next: LocalExecState = { granted: false, revokedAt: nowIso() };
   writeFileAtomic({ localExec: next });
-  log.info('local execution revoked');
+  log.info('tool execution access revoked');
   return next;
 }

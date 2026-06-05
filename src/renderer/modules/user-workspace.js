@@ -8,14 +8,15 @@
 //     `currentCid` — main looks up `conv.project_id` and operates on the
 //     project's per-scope workspace entry. Changes apply to every conv in
 //     that project.
-//   - On the commander (new-chat) panel, the chip reads the current
-//     project pick from `getCommanderProjectId()` (managed by
-//     modules/projects.js / conversation.js commander chip). When the
-//     commander has no project picked, scope falls back to default.
+//   - On the commander (new-chat) panel, scope is always default — new
+//     conversations created from the empty-state composer are orphan;
+//     project binding happens only inside per-project pages.
 //
 // Depends on: ipc-shim.js (apiFetch / window.orkas.invoke)
 
-const _wsLog = createLogger('user-workspace');
+const _wsLog = (typeof createLogger === 'function')
+  ? createLogger('user-workspace')
+  : { info() {}, warn() {}, error() {} };
 
 /** Cached workspace info, keyed by chip target. The chip on the conversation
  *  panel and the chip on the commander panel may show different paths when
@@ -47,11 +48,7 @@ function _wsScopeHintFor(target) {
     const pid = (typeof _projectDetailPid !== 'undefined') ? (_projectDetailPid || '') : '';
     return pid ? { projectId: pid } : {};
   }
-  // new-chat / commander panel
-  if (typeof getCommanderProjectId === 'function') {
-    const pid = getCommanderProjectId();
-    if (pid) return { projectId: pid };
-  }
+  // new-chat / commander panel — always orphan, falls back to default workspace.
   return {};
 }
 
@@ -111,6 +108,19 @@ async function _refreshAllWorkspaceInfo() {
   _updateAllChips();
 }
 
+function _showWorkspaceSetFailure(errOrMessage) {
+  const raw = typeof errOrMessage === 'string'
+    ? errOrMessage
+    : ((errOrMessage && errOrMessage.message) || String(errOrMessage || ''));
+  const fallback = t('workspace.set_failed');
+  const message = raw && raw !== '[object Object]' ? raw : fallback;
+  if (typeof uiToast === 'function') {
+    uiToast(message, { variant: 'warning', timeoutMs: 6000 });
+  } else if (typeof uiAlert === 'function') {
+    uiAlert(message);
+  }
+}
+
 async function _selectAndSetWorkspace(target, dirPath) {
   const hint = _wsScopeHintFor(target);
   try {
@@ -124,8 +134,12 @@ async function _selectAndSetWorkspace(target, dirPath) {
     if (setResult && setResult.ok && setResult.path) {
       await _refreshAllWorkspaceInfo();
       _wsLog.info('workspace selected', { target, path: setResult.path });
+    } else {
+      _showWorkspaceSetFailure((setResult && setResult.error) || t('workspace.set_failed'));
+      _wsLog.warn('workspace selection rejected', { target, path: selectedPath, error: setResult && setResult.error });
     }
   } catch (err) {
+    _showWorkspaceSetFailure(err);
     _wsLog.error('workspace selection failed', err);
   }
 }
@@ -301,32 +315,35 @@ function _createMenuItem(text, isActive, onClick) {
 // ── Init ────────────────────────────────────────────────────────────
 
 async function initUserWorkspace() {
-  // Insert one chip per panel into the bottom-bar (right of the recipient /
-  // project / skill chips, left of the send button). Mirroring the recipient
-  // chip's lifecycle so visuals stay consistent across panels.
-  const newBar = document.querySelector('#panel-new-chat .chat-bottom-bar');
-  if (newBar) {
-    const sendBtn = newBar.querySelector('.chat-send-btn');
-    const chip = _createWorkspaceChip('new-chat');
-    if (sendBtn) newBar.insertBefore(chip, sendBtn);
-    else newBar.appendChild(chip);
-  }
-  const convBar = document.querySelector('#panel-conversation .chat-bottom-bar');
-  if (convBar) {
-    const sendBtn = convBar.querySelector('.chat-send-btn');
-    const chip = _createWorkspaceChip('conversation');
-    if (sendBtn) convBar.insertBefore(chip, sendBtn);
-    else convBar.appendChild(chip);
-  }
-  const projectBar = document.querySelector('#panel-project .chat-bottom-bar');
-  if (projectBar) {
-    const sendBtn = projectBar.querySelector('.chat-send-btn');
-    const chip = _createWorkspaceChip('project');
-    if (sendBtn) projectBar.insertBefore(chip, sendBtn);
-    else projectBar.appendChild(chip);
-  }
+  // Insert one chip per panel into the bottom-bar immediately after the
+  // recipient chip per PC/docs/design/PATTERNS.md P11
+  // ([To] | [workspace] | [skill] | ...). Project-detail panel has no
+  // recipient chip — fall back to insert-before-send there.
+  _mountWorkspaceChipInBar(document.querySelector('#panel-new-chat .chat-bottom-bar'), 'new-chat');
+  _mountWorkspaceChipInBar(document.querySelector('#panel-conversation .chat-bottom-bar'), 'conversation');
+  _mountWorkspaceChipInBar(document.querySelector('#panel-project .chat-bottom-bar'), 'project');
 
   await _refreshAllWorkspaceInfo();
+}
+
+function _mountWorkspaceChipInBar(bar, target) {
+  if (!bar) return null;
+
+  const existing = Array.from(bar.querySelectorAll(`.workspace-chip[data-ws-target="${target}"]`));
+  const chip = existing[0] || _createWorkspaceChip(target);
+  for (const duplicate of existing.slice(1)) duplicate.remove();
+
+  const anchor = bar.querySelector('.chat-recipient-chip');
+  if (anchor) {
+    const ref = anchor.nextSibling;
+    if (ref !== chip) bar.insertBefore(chip, ref);
+    return chip;
+  }
+
+  const sendBtn = bar.querySelector('.chat-send-btn');
+  if (sendBtn && sendBtn !== chip) bar.insertBefore(chip, sendBtn);
+  else if (!chip.parentNode) bar.appendChild(chip);
+  return chip;
 }
 
 /** Public: called by conversation.js when the active cid changes (entering a
@@ -334,4 +351,8 @@ async function initUserWorkspace() {
  *  projects.js when the commander chip's project pick changes. */
 async function refreshWorkspaceChip() {
   await _refreshAllWorkspaceInfo();
+}
+
+if (typeof module !== 'undefined' && typeof module.exports === 'object') {
+  module.exports = { _mountWorkspaceChipInBar };
 }

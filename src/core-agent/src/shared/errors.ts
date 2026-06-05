@@ -60,23 +60,133 @@ export function formatError(err: unknown): string {
   return String(err);
 }
 
-export function isRetryableError(err: unknown): boolean {
-  if (err instanceof RateLimitError) return true;
-  if (err instanceof TimeoutError) return true;
+export type RetryableErrorKind =
+  | "rate_limit"
+  | "timeout"
+  | "connection_dropped"
+  | "service_unavailable"
+  | "server_error"
+  | "network";
+
+const RETRYABLE_PROVIDER_STATUS = new Set([
+  408, // request timeout
+  409, // conflict / transient write race on some gateways
+  425, // too early
+  429,
+  500,
+  502,
+  503,
+  504,
+  520,
+  521,
+  522,
+  523,
+  524,
+  529,
+  598,
+  599,
+]);
+
+const TRANSIENT_CODE_RE =
+  /^(UND_ERR_|ECONNRESET|ETIMEDOUT|ECONNREFUSED|ENETDOWN|ENETUNREACH|EPIPE|EAI_AGAIN|ERR_STREAM_PREMATURE_CLOSE)/i;
+
+const TRANSIENT_MESSAGE_PATTERNS: Array<[RetryableErrorKind, RegExp]> = [
+  ["service_unavailable", /\b(502|503|504|520|521|522|523|524|529|598|599)\b|bad gateway|service unavailable|gateway timeout|overloaded|upstream.?connect|connection.?refused/i],
+  ["timeout", /\bcodex sse response headers timed out after \d+ms\b|\bsse response headers timed out\b|\bresponse headers? (timed out|timeout)\b|\bheaders? (timed out|timeout)\b|\brequest timed out\b|\btimed out\b|\btimeout\b|etimedout|und_err_connect_timeout|und_err_headers_timeout|und_err_body_timeout/i],
+  ["connection_dropped", /\bterminated\b|\bfetch failed\b|socket (hang up|closed|close)|websocket (error|closed|close)|\bws (error|closed|close)\b|connection (closed|close|reset|dropped|terminated)|stream (closed|close|interrupted|disconnected|reset|terminated)|premature close|err_stream_premature_close|\b(read )?(econnreset|epipe)\b|\bund_err_socket\b/i],
+  ["network", /network.?(error|failure)|enetunreach|enetdown|eai_again|econnrefused/i],
+  ["rate_limit", /rate.?limit|too many requests|\b429\b/i],
+  ["server_error", /\b500\b|internal server error/i],
+];
+
+function retryKindForProviderStatus(statusCode: number | undefined): RetryableErrorKind | null {
+  if (!statusCode || !RETRYABLE_PROVIDER_STATUS.has(statusCode)) return null;
+  if (statusCode === 429) return "rate_limit";
+  if (statusCode === 408 || statusCode === 524 || statusCode === 598 || statusCode === 599) return "timeout";
+  if (statusCode === 502 || statusCode === 503 || statusCode === 504 || statusCode === 520 || statusCode === 521 || statusCode === 522 || statusCode === 523 || statusCode === 529) {
+    return "service_unavailable";
+  }
+  return "server_error";
+}
+
+function retryKindForMessage(message: string): RetryableErrorKind | null {
+  for (const [kind, pattern] of TRANSIENT_MESSAGE_PATTERNS) {
+    if (pattern.test(message)) return kind;
+  }
+  return null;
+}
+
+function errorMessageOf(err: unknown): string {
+  if (typeof err === "string") return err;
+  if (err instanceof Error) return err.message || "";
+  if (err && typeof err === "object") {
+    const rec = err as Record<string, unknown>;
+    if (typeof rec.message === "string") return rec.message;
+    if (typeof rec.error === "string") return rec.error;
+  }
+  return "";
+}
+
+function errorCodeOf(err: unknown): string {
+  if (!err || typeof err !== "object") return "";
+  const rec = err as Record<string, unknown>;
+  return typeof rec.code === "string" ? rec.code : "";
+}
+
+function errorCauseOf(err: unknown): unknown {
+  if (!err || typeof err !== "object") return null;
+  const rec = err as Record<string, unknown>;
+  if ("cause" in rec) return rec.cause;
+  if (rec.error && typeof rec.error === "object") return rec.error;
+  return null;
+}
+
+export function classifyTransientNetworkError(err: unknown): RetryableErrorKind | null {
+  let cur: unknown = err;
+  let depth = 0;
+  while (cur && depth < 8) {
+    const msg = errorMessageOf(cur);
+    if (msg) {
+      const kind = retryKindForMessage(msg);
+      if (kind) return kind;
+    }
+    const code = errorCodeOf(cur);
+    if (code && TRANSIENT_CODE_RE.test(code)) {
+      if (/TIMEOUT/i.test(code)) return "timeout";
+      if (/ECONNREFUSED|ENETUNREACH|ENETDOWN|EAI_AGAIN/i.test(code)) return "network";
+      return "connection_dropped";
+    }
+    cur = errorCauseOf(cur);
+    depth++;
+  }
+  return null;
+}
+
+export function classifyRetryableError(err: unknown): RetryableErrorKind | null {
+  if (err instanceof RateLimitError) return "rate_limit";
+  if (err instanceof TimeoutError) return "timeout";
   if (err instanceof ProviderError) {
-    const code = err.statusCode;
-    if (code === 429 || code === 500 || code === 502 || code === 503 || code === 529) return true;
+    const statusKind = retryKindForProviderStatus(err.statusCode);
+    if (statusKind) return statusKind;
     // Fall through to message/cause inspection — many network-layer failures
     // surface here as ProviderError with no statusCode.
   }
-  if (isTransientNetworkError(err)) return true;
-  return false;
+  return classifyTransientNetworkError(err);
+}
+
+export function isRetryableError(err: unknown): boolean {
+  return classifyRetryableError(err) !== null;
 }
 
 /**
  * Detect transient network / stream failures that warrant a retry:
+ *   - slow first-byte / response-header waits: "Codex SSE response headers timed out after 10000ms"
  *   - undici SSE body cutoff: `TypeError { message: "terminated", cause: SocketError }`
  *   - Node fetch front-door: `TypeError { message: "fetch failed", cause: ... }`
+ *   - WebSocket stream drops surfaced by hosted/OAuth transports as a bare
+ *     "WebSocket error" / close marker
+ *   - Provider/SDK stream-close variants: "connection closed", "stream
+ *     disconnected", "ERR_STREAM_PREMATURE_CLOSE", "read ECONNRESET"
  *   - Raw socket codes: ECONNRESET / ETIMEDOUT / ECONNREFUSED / ENETDOWN / EPIPE / EAI_AGAIN
  *   - undici named codes: UND_ERR_SOCKET / UND_ERR_CONNECT_TIMEOUT / UND_ERR_HEADERS_TIMEOUT / UND_ERR_BODY_TIMEOUT
  *
@@ -85,23 +195,5 @@ export function isRetryableError(err: unknown): boolean {
  * the instanceof relationship but preserving the string.
  */
 export function isTransientNetworkError(err: unknown): boolean {
-  const MSG_RE = /\bterminated\b|\bfetch failed\b|socket hang up|network.?(error|failure)/i;
-  const CODE_RE = /^(UND_ERR_|ECONNRESET|ETIMEDOUT|ECONNREFUSED|ENETDOWN|ENETUNREACH|EPIPE|EAI_AGAIN)/i;
-
-  let cur: unknown = err;
-  let depth = 0;
-  while (cur && depth < 5) {
-    if (cur instanceof Error) {
-      if (MSG_RE.test(cur.message || "")) return true;
-      const code = (cur as { code?: unknown }).code;
-      if (typeof code === "string" && CODE_RE.test(code)) return true;
-      cur = (cur as { cause?: unknown }).cause;
-    } else if (typeof cur === "string") {
-      return MSG_RE.test(cur);
-    } else {
-      break;
-    }
-    depth++;
-  }
-  return false;
+  return classifyTransientNetworkError(err) !== null;
 }

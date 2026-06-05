@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest';
 import {
   parseMentions, resolveRecipients,
   extractFormFromFinal, computeFormId, decodeSubmission, encodeSubmission,
+  extractPlanInteractionFromFinal,
 } from '../../../../src/main/features/group_chat/router';
 
 describe('group_chat router › parseMentions', () => {
@@ -186,6 +187,76 @@ describe('group_chat router › form encoding', () => {
     expect(r.cleanText).toContain('before');
     expect(r.cleanText).toContain('after');
     expect(r.cleanText).not.toContain('agent-input-form');
+  });
+
+  it('extractFormFromFinal pulls XML form blocks without exposing the raw protocol text', () => {
+    const text = [
+      '请补充信息。',
+      '',
+      '<agent-input-form>',
+      JSON.stringify({
+        fields: [
+          { id: 'topic', label: 'Topic', type: 'text', required: true },
+          { id: 'files', label: 'Files', type: 'file', multiple: true },
+        ],
+      }),
+      '</agent-input-form>',
+      '',
+      '收到后继续。',
+    ].join('\n');
+
+    const r = extractFormFromFinal(text, 'writer');
+    expect(r.form?.agent_id).toBe('writer');
+    expect(r.form?.fields.map((f) => f.id)).toEqual(['topic', 'files']);
+    expect(r.cleanText).toContain('请补充信息。');
+    expect(r.cleanText).toContain('收到后继续。');
+    expect(r.cleanText).not.toContain('<agent-input-form>');
+    expect(r.cleanText).not.toContain('"fields"');
+  });
+
+  it('extractPlanInteractionFromFinal strips valid markers and returns the latest status', () => {
+    const text = [
+      '我需要先和你确认目标。',
+      '<plan-interaction status="open" />',
+      '',
+      '收到后我会继续。',
+      '<plan-interaction status="closed"></plan-interaction>',
+    ].join('\n');
+
+    const r = extractPlanInteractionFromFinal(text);
+    expect(r.status).toBe('closed');
+    expect(r.cleanText).toContain('我需要先和你确认目标。');
+    expect(r.cleanText).toContain('收到后我会继续。');
+    expect(r.cleanText).not.toContain('plan-interaction');
+  });
+
+  it('extractPlanInteractionFromFinal leaves invalid markers visible', () => {
+    const text = '继续确认。\n<plan-interaction status="wait" />';
+    const r = extractPlanInteractionFromFinal(text);
+    expect(r.status).toBeUndefined();
+    expect(r.cleanText).toBe(text);
+  });
+
+  it('encodeSubmission leaves optional blanks empty instead of writing placeholders', () => {
+    const form = {
+      form_id: 'abcdef0123456789',
+      agent_id: 'writer',
+      fields: [
+        { id: 'optional', label: 'Optional', type: 'text' as const, default: '' },
+        { id: 'choice', label: 'Choice', type: 'select' as const, default: 'a', options: [{ value: 'a', label: 'A' }] },
+        { id: 'multi', label: 'Multi', type: 'multiselect' as const, default: [], options: [{ value: 'x', label: 'X' }] },
+      ],
+    };
+
+    const text = encodeSubmission(form, {});
+    const decoded = decodeSubmission(text);
+
+    expect(text).toContain('Optional：\n');
+    expect(text).toContain('Choice：A');
+    expect(text).toContain('Multi：\n');
+    expect(text).not.toContain('unfilled');
+    expect(text).not.toContain('undefined');
+    expect(decoded?.values).toEqual({});
   });
 
   it('computeFormId is deterministic on same inputs', () => {

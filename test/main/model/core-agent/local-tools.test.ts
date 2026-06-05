@@ -48,19 +48,67 @@ async function grant() {
   perm.grantLocalExec();
 }
 
+async function revoke() {
+  const perm = await import('../../../../src/main/features/permissions');
+  perm.revokeLocalExec();
+}
+
 async function run(tool: any, input: Record<string, any>) {
-  const ctx = { workingDir: '.', signal: undefined } as any;
+  const ctx = { workingDir: '.', signal: undefined, state: {} } as any;
   return await tool.execute(input, ctx);
 }
 
+async function buildBashTool() {
+  const localTools = await import('../../../../src/main/model/core-agent/local-tools');
+  const tools = localTools.createLocalTools({ userId: UID });
+  const bash = tools.find((t) => t.name === 'bash');
+  if (!bash) throw new Error('bash tool missing');
+  return bash;
+}
+
+describe('local-tools › bash › disabled skills', () => {
+  it('rejects run-skill.cjs for a disabled skill id', async () => {
+    await grant();
+    const enabled = await import('../../../../src/main/features/component_enabled');
+    enabled.setSkillEnabled(UID, 'disabled-skill', false);
+
+    const bash = await buildBashTool();
+    const r = await run(bash, {
+      command: '$ORKAS_NODE $ORKAS_PC_DIR/bin/run-skill.cjs disabled-skill search -- query',
+    });
+
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_SKILL_DISABLED');
+    expect(r.content).toContain('disabled-skill');
+  });
+
+  it('rejects commands that directly enter a disabled skill directory', async () => {
+    await grant();
+    const enabled = await import('../../../../src/main/features/component_enabled');
+    const paths = await import('../../../../src/main/paths');
+    enabled.setSkillEnabled(UID, 'disabled-skill', false);
+
+    const bash = await buildBashTool();
+    const skillDir = path.join(paths.userSkillsDir(UID), 'disabled-skill');
+    const r = await run(bash, {
+      command: `cd "${skillDir}" && python3 scripts/search.py`,
+    });
+
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_SKILL_DISABLED');
+    expect(r.content).toContain('disabled-skill');
+  });
+});
+
 describe('local-tools › edit_file › permission gate', () => {
   it('rejects when localExec not granted', async () => {
+    await revoke();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'a.txt');
     fs.writeFileSync(p, 'hello world');
     const r = await run(edit, { path: p, old_string: 'hello', new_string: 'hi' });
     expect(r.isError).toBe(true);
-    expect(r.content).toMatch(/Local execution is not authorised/i);
+    expect(r.content).toContain('E_TOOL_EXECUTION_ACCESS_DISABLED');
     // file untouched
     expect(fs.readFileSync(p, 'utf8')).toBe('hello world');
   });
@@ -253,11 +301,12 @@ describe('local-tools › create_artifact › availability', () => {
 
 describe('local-tools › create_artifact › permission gate', () => {
   it('rejects when localExec not granted', async () => {
+    await revoke();
     const tool = await buildCreateArtifactTool({ onArtifactCreated: () => {} });
     expect(tool).toBeTruthy();
     const r = await run(tool, { title: 'X', files: MIN_FILES });
     expect(r.isError).toBe(true);
-    expect(r.content).toMatch(/Local execution is not authorised/i);
+    expect(r.content).toContain('E_TOOL_EXECUTION_ACCESS_DISABLED');
   });
 });
 

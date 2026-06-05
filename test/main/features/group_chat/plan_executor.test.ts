@@ -5,7 +5,7 @@
  *
  * Coverage matrix:
  *   1. Sequential pipeline + variable substitution between steps
- *   2. Parallel fork (same parallel_group) + synthesis step waiting on all
+ *   2. Legacy parallel_group input is serialized by the executor
  *   3. Failure policy: abort_plan / continue / ask_commander
  *   4. user-assignee step renders a form, blocks until submit, then resumes
  *   5. Auto plan_update on agent reply (no LLM plan_update tool call)
@@ -102,6 +102,14 @@ async function readJsonl(uid: string, cid: string): Promise<any[]> {
   const file = path.join(paths.userChatsDir(uid), `${cid}.jsonl`);
   if (!fs.existsSync(file)) return [];
   return fs.readFileSync(file, 'utf-8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+}
+
+async function setAgentInteractive(uid: string, agentId: string, interactive: boolean): Promise<void> {
+  const paths = await import('../../../../src/main/paths');
+  const file = path.join(paths.agentDir(uid, agentId), 'agent.json');
+  const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
+  data.interactive = interactive;
+  fs.writeFileSync(file, JSON.stringify(data));
 }
 
 async function waitForPlan(
@@ -205,6 +213,56 @@ describe('plan_executor › sequential pipeline + variable substitution', () => 
     const plan = await import('../../../../src/main/features/group_chat/plan');
     const finalPlan = await plan.readPlan(TEST_UID, cid);
     expect(finalPlan?.steps.map((s) => s.status)).toEqual(['done', 'done', 'done']);
+    const outputIds = finalPlan?.steps.map((s) => s.output_msg_id) || [];
+    expect(outputIds).toHaveLength(3);
+    expect(outputIds.every(Boolean)).toBe(true);
+    for (const [idx, id] of outputIds.entries()) {
+      const msg = lines.find((l) => l.id === id);
+      expect(msg?.from).toBe([A_ID, B_ID, C_ID][idx]);
+    }
+  }, 15_000);
+
+  it('treats later empty wait_for without parallel_group as serial, not parallel', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+
+    _setScript(state.buildGmemberSessionId(cid, A_ID), [
+      { type: 'final', text: 'A done' },
+    ]);
+    _setScript(state.buildGmemberSessionId(cid, B_ID), [
+      { type: 'final', text: 'B done' },
+    ]);
+    _setScript(state.buildGmemberSessionId(cid, C_ID), [
+      { type: 'final', text: 'C done' },
+    ]);
+
+    await setupPlanAndKick(TEST_UID, cid, {
+      initial_message: 'write a serial plan',
+      steps: [
+        { title: 'a', assignee: A_NAME, input: 'do A', wait_for: [] },
+        { title: 'b', assignee: B_NAME, input: 'do B', wait_for: [] },
+        { title: 'c', assignee: C_NAME, input: 'do C', wait_for: [] },
+      ],
+    });
+
+    await waitForQuiescent(TEST_UID, cid, 5000);
+
+    const lines = await readJsonl(TEST_UID, cid);
+    const dispatchToA = lines.findIndex((l) => l.from === 'commander' && l.to.includes(A_ID));
+    const replyFromA = lines.findIndex((l) => l.from === A_ID);
+    const dispatchToB = lines.findIndex((l) => l.from === 'commander' && l.to.includes(B_ID));
+    const replyFromB = lines.findIndex((l) => l.from === B_ID);
+    const dispatchToC = lines.findIndex((l) => l.from === 'commander' && l.to.includes(C_ID));
+
+    expect(dispatchToA).toBeGreaterThanOrEqual(0);
+    expect(replyFromA).toBeGreaterThan(dispatchToA);
+    expect(dispatchToB).toBeGreaterThan(replyFromA);
+    expect(replyFromB).toBeGreaterThan(dispatchToB);
+    expect(dispatchToC).toBeGreaterThan(replyFromB);
+
+    const plan = await import('../../../../src/main/features/group_chat/plan');
+    const finalPlan = await plan.readPlan(TEST_UID, cid);
+    expect(finalPlan?.steps.map((s) => s.status)).toEqual(['done', 'done', 'done']);
   }, 15_000);
 });
 
@@ -251,14 +309,49 @@ describe('plan_executor › plan-triggered agent live events', () => {
     expect(agentProcessEvents.some((e) => e.data?.type === 'event' && e.data.event?.stream === 'tool')).toBe(true);
     expect(agentProcessEvents.some((e) => e.data?.type === 'delta' && e.data.text === 'partial answer')).toBe(true);
   }, 15_000);
+
+  it('starts fallback commander wrap-up only after the final step message is persisted', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+
+    _setScript(state.buildGmemberSessionId(cid, A_ID), [
+      { type: 'final', text: 'agent final answer' },
+    ]);
+    _setScript(state.buildGconvSessionId(cid), [
+      { type: 'final', text: '最终总结：agent final answer' },
+    ]);
+
+    const events: any[] = [];
+    const unsubscribe = bus.subscribe(TEST_UID, cid, (ev) => events.push(ev));
+    try {
+      await setupPlanAndKick(TEST_UID, cid, {
+        initial_message: 'make a plan，最后总结所有结果',
+        steps: [
+          { title: 'answer', assignee: A_NAME, input: 'go', wait_for: [] },
+        ],
+      });
+      await waitForQuiescent(TEST_UID, cid, 5000);
+    } finally {
+      unsubscribe();
+    }
+
+    const agentFinalIdx = events.findIndex((e) =>
+      e.type === 'message' && e.turn_end === true && e.msg?.from === A_ID);
+    const commanderActiveIdx = events.findIndex((e) =>
+      e.type === 'state_changed' && e.active_turns?.some((t: any) => t.actor === 'commander'));
+
+    expect(agentFinalIdx).toBeGreaterThanOrEqual(0);
+    expect(commanderActiveIdx).toBeGreaterThan(agentFinalIdx);
+  }, 15_000);
 });
 
 // ─────────────────────────────────────────────────────────────────────────
-//  Test 2 — parallel fork + synthesis
+//  Test 2 — legacy parallel_group is serialized
 // ─────────────────────────────────────────────────────────────────────────
 
-describe('plan_executor › parallel fork + synthesis', () => {
-  it('three agents in same parallel_group all dispatch at once; commander synth runs once they finish', async () => {
+describe('plan_executor › serializes legacy parallel_group plans', () => {
+  it('runs legacy parallel_group agents one at a time, then commander synth runs once they finish', async () => {
     const cid = newCid();
     const state = await import('../../../../src/main/features/group_chat/state');
 
@@ -274,6 +367,9 @@ describe('plan_executor › parallel fork + synthesis', () => {
     // Commander synthesis turn.
     _setScript(state.buildGconvSessionId(cid), [
       { type: 'final', text: '综合三方观点：可行但需谨慎。' },
+    ]);
+    _setScript(state.buildGconvSessionId(cid), [
+      { type: 'final', text: '不应追加第二次总结' },
     ]);
 
     await setupPlanAndKick(TEST_UID, cid, {
@@ -306,20 +402,33 @@ describe('plan_executor › parallel fork + synthesis', () => {
 
     const lines = await readJsonl(TEST_UID, cid);
 
-    // Three parallel dispatches commander → A/B/C should all be present.
-    expect(lines.filter((l) => l.from === 'commander' && l.to.length === 1
-      && [A_ID, B_ID, C_ID].includes(l.to[0]))).toHaveLength(3);
+    // Three legacy "parallel" dispatches should still be serialized.
+    const dispatchToA = lines.findIndex((l) => l.from === 'commander' && l.to.includes(A_ID));
+    const replyFromA = lines.findIndex((l) => l.from === A_ID);
+    const dispatchToB = lines.findIndex((l) => l.from === 'commander' && l.to.includes(B_ID));
+    const replyFromB = lines.findIndex((l) => l.from === B_ID);
+    const dispatchToC = lines.findIndex((l) => l.from === 'commander' && l.to.includes(C_ID));
+    const replyFromC = lines.findIndex((l) => l.from === C_ID);
+    expect(dispatchToA).toBeGreaterThanOrEqual(0);
+    expect(replyFromA).toBeGreaterThan(dispatchToA);
+    expect(dispatchToB).toBeGreaterThan(replyFromA);
+    expect(replyFromB).toBeGreaterThan(dispatchToB);
+    expect(dispatchToC).toBeGreaterThan(replyFromB);
+    expect(replyFromC).toBeGreaterThan(dispatchToC);
 
-    // Three agent replies.
+    // Three agent replies, but not concurrently.
     expect(lines.filter((l) => [A_ID, B_ID, C_ID].includes(l.from))).toHaveLength(3);
 
     // Commander synthesis was triggered (its final text was '综合三方观点：可行但需谨慎。').
     const synth = lines.find((l) => l.from === 'commander' && l.text.includes('综合三方观点'));
     expect(synth).toBeTruthy();
+    expect(lines.find((l) => l.from === 'commander' && l.text.includes('不应追加第二次总结'))).toBeUndefined();
 
     const plan = await import('../../../../src/main/features/group_chat/plan');
     const finalPlan = await plan.readPlan(TEST_UID, cid);
     expect(finalPlan?.steps.map((s) => s.status)).toEqual(['done', 'done', 'done', 'done']);
+    expect(finalPlan?.steps.some((s) => s.parallel_group)).toBe(false);
+    expect(finalPlan?.completed_signaled).toBe(true);
   }, 15_000);
 });
 
@@ -339,6 +448,9 @@ describe('plan_executor › failure policies', () => {
     _setScript(state.buildGmemberSessionId(cid, B_ID), [
       { type: 'final', text: 'B succeeded despite A failing' },
     ]);
+    _setScript(state.buildGconvSessionId(cid), [
+      { type: 'final', text: '兜底总结：A 跳过，B 已完成。' },
+    ]);
 
     await setupPlanAndKick(TEST_UID, cid, {
       initial_message: 'q',
@@ -354,6 +466,10 @@ describe('plan_executor › failure policies', () => {
     const finalPlan = await plan.readPlan(TEST_UID, cid);
     expect(finalPlan?.steps[0].status).toBe('skipped'); // continue policy → skipped not failed
     expect(finalPlan?.steps[1].status).toBe('done');     // B still ran (skipped counts as terminal for wait_for)
+    expect(finalPlan?.completed_signaled).toBe(true);
+
+    const lines = await readJsonl(TEST_UID, cid);
+    expect(lines.find((l) => l.from === 'commander' && l.text.includes('兜底总结'))).toBeTruthy();
   }, 15_000);
 
   it('on_failure=abort_plan: failed step blocks all downstream pending steps', async () => {
@@ -569,6 +685,64 @@ describe('plan_executor › agent form pauses the step (not "done")', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────
+//  Test 5b — interactive agent opens natural multi-turn plan interaction
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('plan_executor › agent plan interaction marker pauses the step', () => {
+  it('interactive agent open marker → step blocked; closed marker → step done + downstream advances', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+
+    await setAgentInteractive(TEST_UID, A_ID, true);
+
+    _setScript(state.buildGmemberSessionId(cid, A_ID), [
+      { type: 'final', text: '我需要先确认你的目标。\n<plan-interaction status="open" />' },
+    ]);
+
+    await setupPlanAndKick(TEST_UID, cid, {
+      initial_message: '帮我做学习计划',
+      steps: [
+        { title: '交互确认目标', assignee: A_NAME, input: '先和用户确认目标', wait_for: [] },
+        { title: '输出计划', assignee: B_NAME, input: '根据确认结果：{{step_1.output_summary}}', wait_for: [1] },
+      ],
+    });
+
+    await waitForQuiescent(TEST_UID, cid, 4000);
+
+    const plan = await import('../../../../src/main/features/group_chat/plan');
+    let snapshot = await plan.readPlan(TEST_UID, cid);
+    expect(snapshot?.steps[0].status).toBe('blocked');
+    expect(snapshot?.steps[1].status).toBe('pending');
+
+    let lines = await readJsonl(TEST_UID, cid);
+    const openMsg = lines.find((l) => l.from === A_ID && String(l.text || '').includes('我需要先确认'));
+    expect(openMsg?.text).not.toContain('plan-interaction');
+    expect(lines.find((l) => l.from === 'commander' && l.to.includes(B_ID))).toBeUndefined();
+
+    _setScript(state.buildGmemberSessionId(cid, A_ID), [
+      { type: 'final', text: '确认完成：目标是系统学习并完成项目。\n<plan-interaction status="closed" />' },
+    ]);
+    _setScript(state.buildGmemberSessionId(cid, B_ID), [
+      { type: 'final', text: '学习计划已生成' },
+    ]);
+
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: '@Alpha 目标是系统学习并完成项目' });
+    await waitForQuiescent(TEST_UID, cid, 5000);
+
+    snapshot = await plan.readPlan(TEST_UID, cid);
+    expect(snapshot?.steps[0].status).toBe('done');
+    expect(snapshot?.steps[1].status).toBe('done');
+    expect(snapshot?.steps[0].output_summary).toContain('确认完成');
+
+    lines = await readJsonl(TEST_UID, cid);
+    const closeMsg = lines.find((l) => l.from === A_ID && String(l.text || '').includes('确认完成'));
+    expect(closeMsg?.text).not.toContain('plan-interaction');
+    expect(lines.find((l) => l.from === 'commander' && l.to.includes(B_ID))).toBeTruthy();
+  }, 15_000);
+});
+
+// ─────────────────────────────────────────────────────────────────────────
 //  Test 6 — bus auto-marks step done without LLM plan_update
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -579,6 +753,9 @@ describe('plan_executor › auto plan_update', () => {
 
     _setScript(state.buildGmemberSessionId(cid, A_ID), [
       { type: 'final', text: 'A done' },
+    ]);
+    _setScript(state.buildGconvSessionId(cid), [
+      { type: 'final', text: '不应自动总结' },
     ]);
 
     await setupPlanAndKick(TEST_UID, cid, {
@@ -592,7 +769,10 @@ describe('plan_executor › auto plan_update', () => {
     const finalPlan = await plan.readPlan(TEST_UID, cid);
     expect(finalPlan?.steps[0].status).toBe('done');
     expect(finalPlan?.steps[0].output_summary).toBe('A done');
-    expect(finalPlan?.completed_signaled).toBe(true); // single-step plan terminal → signal fired
+    expect(finalPlan?.completed_signaled).toBe(true); // terminal completion handled once
+
+    const lines = await readJsonl(TEST_UID, cid);
+    expect(lines.find((l) => l.from === 'commander' && l.text.includes('不应自动总结'))).toBeUndefined();
   }, 10_000);
 
   it('manual commander dispatch still completes the matching in_progress step', async () => {

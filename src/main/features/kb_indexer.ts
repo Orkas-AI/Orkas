@@ -23,10 +23,9 @@ import { EventEmitter } from 'node:events';
 
 import { userContextsDir } from '../paths';
 import { createLogger } from '../logger';
-import { toCompressedGrayJpeg } from '../util/image-transform';
-import { chatWithModel } from '../model/client';
-import { prompts } from '../prompts/loader';
 import { fileToChunks } from '../util/file_to_chunks';
+import { logErrorRef, logPathRef, maskId } from '../util/log-redact';
+import { describeLibraryImage } from './library_image_describer';
 
 import * as kb from './kb_vector';
 import * as kbEmbed from './kb_embed';
@@ -50,6 +49,13 @@ export const EMBED_OVERLAP = 50;
 /** Files this indexer knows how to vectorize. Filenames not in this list are
  *  silently skipped by reconcile (e.g. `_INDEX.md` stays outside KB). */
 const TEXT_EXTS = new Set(['.md', '.markdown', '.txt', '.csv', '.tsv', '.json', '.yaml', '.yml', '.log']);
+for (const ext of [
+  '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
+  '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.sh', '.bash', '.zsh', '.rb', '.go', '.rs', '.java', '.kt',
+  '.c', '.cpp', '.cc', '.h', '.hpp', '.css', '.scss', '.less',
+  '.sql', '.graphql', '.gql',
+]) TEXT_EXTS.add(ext);
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 
 function kindFor(name: string): kb.KbKind | null {
@@ -98,6 +104,7 @@ interface Job {
 interface Queue {
   jobs: Job[];
   running: boolean;
+  scheduled: boolean;
 }
 
 const _queues = new Map<string, Queue>();
@@ -105,7 +112,7 @@ const _queues = new Map<string, Queue>();
 function getQueue(uid: string): Queue {
   let q = _queues.get(uid);
   if (!q) {
-    q = { jobs: [], running: false };
+    q = { jobs: [], running: false, scheduled: false };
     _queues.set(uid, q);
   }
   return q;
@@ -122,7 +129,17 @@ export function enqueue(uid: string, relPath: string, op: 'upsert' | 'delete' = 
   if (q.jobs.some((j) => j.relPath === relPath && j.op === op)) return;
   q.jobs.push({ relPath, op });
   if (op === 'upsert') emit({ userId: uid, relPath, status: 'pending' });
-  void runQueue(uid);
+  scheduleRunQueue(uid);
+}
+
+function scheduleRunQueue(uid: string): void {
+  const q = getQueue(uid);
+  if (q.running || q.scheduled) return;
+  q.scheduled = true;
+  setImmediate(() => {
+    q.scheduled = false;
+    void runQueue(uid);
+  });
 }
 
 /**
@@ -144,16 +161,31 @@ async function runQueue(uid: string): Promise<void> {
         if (job.op === 'delete') {
           // Serialise deletes behind any pending upsert to preserve FS ↔ DB order.
           chain = chain.then(() => processDelete(uid, job.relPath))
-            .catch((err) => log.warn(`delete ${job.relPath}: ${(err as Error).message}`));
+            .catch((err) => log.warn('delete failed', {
+              user_id: maskId(uid),
+              path: logPathRef(job.relPath),
+              error: logErrorRef(err),
+            }));
           continue;
         }
         let extract: ExtractResult | null = null;
         try { extract = await prepareAndExtract(uid, job.relPath); }
-        catch (err) { log.warn(`extract ${job.relPath}: ${(err as Error).message}`); continue; }
+        catch (err) {
+          log.warn('extract failed', {
+            user_id: maskId(uid),
+            path: logPathRef(job.relPath),
+            error: logErrorRef(err),
+          });
+          continue;
+        }
         if (!extract) continue;
         const ex = extract;
         chain = chain.then(() => embedAndUpsert(uid, ex))
-          .catch((err) => log.warn(`embed ${ex.relPath}: ${(err as Error).message}`));
+          .catch((err) => log.warn('embed failed', {
+            user_id: maskId(uid),
+            path: logPathRef(ex.relPath),
+            error: logErrorRef(err),
+          }));
       }
       // Drain the in-flight chain; new jobs may land during the drain (user
       // upload, reconcile enqueue), so re-check q.jobs after and loop back.
@@ -186,7 +218,7 @@ async function prepareAndExtract(uid: string, relPath: string): Promise<ExtractR
 
   const kind = kindFor(relPath);
   if (!kind) {
-    log.warn(`skipping ${relPath}: unsupported extension`);
+    log.warn('skipping unsupported library file', { user_id: maskId(uid), path: logPathRef(relPath) });
     return null;
   }
 
@@ -222,7 +254,7 @@ async function prepareAndExtract(uid: string, relPath: string): Promise<ExtractR
       chunks: [],
     });
     emit({ userId: uid, relPath, status: 'ready', kind, chunks: 0 });
-    log.info(`skipped empty ${relPath} kind=${kind}`);
+    log.info('skipped empty library file', { user_id: maskId(uid), path: logPathRef(relPath), kind });
     return null;
   }
 
@@ -237,7 +269,7 @@ async function prepareAndExtract(uid: string, relPath: string): Promise<ExtractR
     return { relPath, kind, bytes: stat.size, mtime: stat.mtimeMs / 1000, sha1, chunks };
   } catch (err) {
     const msg = (err as Error).message || String(err);
-    log.warn(`extract ${relPath}: ${msg}`);
+    log.warn('extract failed', { user_id: maskId(uid), path: logPathRef(relPath), kind, error: logErrorRef(err) });
     await kb.setFileStatus(uid, relPath, 'failed', { error: msg });
     emit({ userId: uid, relPath, status: 'failed', error: msg, kind });
     return null;
@@ -260,10 +292,15 @@ async function embedAndUpsert(uid: string, ex: ExtractResult): Promise<void> {
       })),
     });
     emit({ userId: uid, relPath: ex.relPath, status: 'ready', kind: ex.kind, chunks: ex.chunks.length });
-    log.info(`vectorized ${ex.relPath} kind=${ex.kind} chunks=${ex.chunks.length}`);
+    log.info('vectorized library file', {
+      user_id: maskId(uid),
+      path: logPathRef(ex.relPath),
+      kind: ex.kind,
+      chunks: ex.chunks.length,
+    });
   } catch (err) {
     const msg = (err as Error).message || String(err);
-    log.warn(`embed ${ex.relPath}: ${msg}`);
+    log.warn('embed failed', { user_id: maskId(uid), path: logPathRef(ex.relPath), kind: ex.kind, error: logErrorRef(err) });
     await kb.setFileStatus(uid, ex.relPath, 'failed', { error: msg });
     emit({ userId: uid, relPath: ex.relPath, status: 'failed', error: msg, kind: ex.kind });
   }
@@ -291,27 +328,8 @@ async function extractChunks(uid: string, relPath: string, buf: Buffer, kind: kb
   });
 }
 
-// Vision-based image description. Reuses the existing `contexts_extract_image`
-// prompt + the user's default LLM (which must have vision). `skillList: []`
-// disables skill-block injection — KB image extraction is a one-shot
-// vision-to-text task that has no use for skills, and injecting them just
-// burns tokens + tempts the model to mis-call them.
 async function describeImage(userId: string, sourceName: string, raw: Buffer): Promise<string> {
-  const compressed = await toCompressedGrayJpeg(raw, { maxDim: 1024, quality: 70, grayscale: true });
-  const sessionId = `extract-img-${crypto.randomBytes(4).toString('hex')}`;
-  const message = prompts.load('contexts_extract_image', { source_name: sourceName });
-  const r = await chatWithModel({
-    userId,
-    sessionId,
-    message,
-    images: [{ data: compressed.buf.toString('base64'), mediaType: 'image/jpeg' }],
-    skillList: [],
-    idleTimeout: 300,
-  });
-  if (!r.ok) throw new Error(`vision failed: ${r.error}`);
-  const text = (r.text || '').trim();
-  if (!text) throw new Error('vision returned empty text');
-  return text;
+  return describeLibraryImage(userId, sourceName, raw, { sessionPrefix: 'extract-img' });
 }
 
 // ── Reconcile ───────────────────────────────────────────────────────────
@@ -362,7 +380,12 @@ export async function reconcile(uid: string): Promise<ReconcileResult> {
   }
 
   if (enqueuedUpsert || enqueuedDelete) {
-    log.info(`uid=${uid} upsert=${enqueuedUpsert} delete=${enqueuedDelete} unchanged=${unchanged}`);
+    log.info('library reconcile queued work', {
+      user_id: maskId(uid),
+      upsert: enqueuedUpsert,
+      delete: enqueuedDelete,
+      unchanged,
+    });
   }
   return { enqueuedUpsert, enqueuedDelete, unchanged };
 }
@@ -409,7 +432,7 @@ function walk(root: string, rel: string): Map<string, { kind: kb.KbKind; sha1: s
 export async function drain(uid: string): Promise<void> {
   const q = getQueue(uid);
   // Poll every 10ms; jobs resolve fast in tests (mocked embed).
-  while (q.running || q.jobs.length) {
+  while (q.scheduled || q.running || q.jobs.length) {
     await new Promise((r) => setTimeout(r, 10));
   }
 }

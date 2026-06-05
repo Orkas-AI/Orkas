@@ -142,6 +142,43 @@ describe('rotating-provider › stream 可轮转失败', () => {
     expect(events.length).toBe(1);
     expect(getCooldown('p1')?.kind).toBe('auth');
   });
+
+  it('fetch failed 先在当前候选重试 3 次，仍失败才切到下一个候选', async () => {
+    const netErr = new TypeError('fetch failed');
+    let p1Builds = 0;
+    let p2Builds = 0;
+    const p = createRotatingProvider({
+      providerId: 'test',
+      networkRetryDelayMs: () => 0,
+      candidates: [
+        {
+          profileId: 'p1',
+          providerId: 'test',
+          modelId: 'test-model',
+          build: async () => {
+            p1Builds += 1;
+            return fakeProvider('p1', { throwBefore: netErr });
+          },
+        },
+        {
+          profileId: 'p2',
+          providerId: 'test',
+          modelId: 'test-model',
+          build: async () => {
+            p2Builds += 1;
+            return fakeProvider('p2', { streamEvents: [{ type: 'text_delta', text: 'ok' } as any] });
+          },
+        },
+      ],
+    });
+    const events = await collect(p.stream(PARAMS));
+    expect(p1Builds).toBe(4); // initial try + 3 retries
+    expect(p2Builds).toBe(1);
+    expect(events.filter((ev: any) => ev.type === 'retry').map((ev: any) => ev.attempt)).toEqual([1, 2, 3]);
+    expect((events[events.length - 1] as any).text).toBe('ok');
+    expect(getCooldown('p1')).toBeUndefined();
+    expect(getCooldown('p2')).toBeUndefined();
+  });
 });
 
 describe('rotating-provider › stream 不可轮转失败', () => {
@@ -318,6 +355,41 @@ describe('rotating-provider › stream 全部候选失败', () => {
       providerId: 'test',
       candidates: [],
     })).toThrow(/candidates list is empty/);
+  });
+
+  it('所有候选 fetch failed → 各自重试后不进冷却，最终抛非 transient 的汇总错误', async () => {
+    const netErr = new TypeError('fetch failed');
+    let p1Builds = 0;
+    let p2Builds = 0;
+    const p = createRotatingProvider({
+      providerId: 'test',
+      networkRetryDelayMs: () => 0,
+      candidates: [
+        {
+          profileId: 'p1',
+          providerId: 'test',
+          modelId: 'test-model',
+          build: async () => {
+            p1Builds += 1;
+            return fakeProvider('p1', { throwBefore: netErr });
+          },
+        },
+        {
+          profileId: 'p2',
+          providerId: 'test',
+          modelId: 'test-model',
+          build: async () => {
+            p2Builds += 1;
+            return fakeProvider('p2', { throwBefore: netErr });
+          },
+        },
+      ],
+    });
+    await expect(collect(p.stream(PARAMS))).rejects.toThrow(/All configured model candidates failed after network retries/);
+    expect(p1Builds).toBe(4);
+    expect(p2Builds).toBe(4);
+    expect(getCooldown('p1')).toBeUndefined();
+    expect(getCooldown('p2')).toBeUndefined();
   });
 });
 

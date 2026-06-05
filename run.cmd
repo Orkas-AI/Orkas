@@ -10,8 +10,17 @@ if not exist "%APP_DIR%\package.json" (
   exit /b 1
 )
 
+REM Priority: positional %1 > ORKAS_PROFILE env > default global.
+if not "%~1"=="" (
+  set "ORKAS_PROFILE=%~1"
+) else if "%ORKAS_PROFILE%"=="" (
+  set "ORKAS_PROFILE=global"
+)
+echo [Orkas] 启动 profile=%ORKAS_PROFILE%
+
 call node "%APP_DIR%\scripts\ensure-deps.cjs"
 if errorlevel 1 exit /b 1
+call node "%APP_DIR%\scripts\patch-dev-protocol.cjs"
 
 pushd "%APP_DIR%"
 taskkill /F /IM electron.exe >nul 2>nul

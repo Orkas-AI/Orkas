@@ -182,10 +182,10 @@ describe('agents › normalizeAgent', () => {
     const a = await loadAgents();
     const norm = a.normalizeAgent({
       agent_id: 'x', name: 'N',
-      runtime: { kind: 'cli', cli: 'claude', model: 'claude-sonnet-4-6', custom_args: ['--debug'] },
+      runtime: { kind: 'cli', cli: 'claude', model: 'claude-opus-4-7', custom_args: ['--debug'] },
     } as any, 'custom');
     expect(norm?.runtime).toEqual({
-      kind: 'cli', cli: 'claude', model: 'claude-sonnet-4-6', custom_args: ['--debug'],
+      kind: 'cli', cli: 'claude', model: 'claude-opus-4-7', custom_args: ['--debug'],
     });
     expect(a.isCliAgent(norm)).toBe(true);
   });
@@ -225,6 +225,28 @@ describe('agents › normalizeAgent', () => {
     expect(norm?.runtime).toEqual({
       kind: 'cli', cli: 'claude', custom_args: ['--ok', '--other'],
     });
+  });
+
+  it('keeps category and only recognized output_format values', async () => {
+    const a = await loadAgents();
+    expect(a.normalizeAgent({
+      agent_id: 'x',
+      category: 'data',
+      output_format: 'text',
+    }, 'custom')).toMatchObject({ category: 'data', output_format: 'text' });
+
+    expect(a.normalizeAgent({
+      agent_id: 'x',
+      output_format: 'markdown_only',
+    }, 'custom')).toMatchObject({ output_format: 'text' });
+
+    const bad = a.normalizeAgent({
+      agent_id: 'x',
+      category: 42 as any,
+      output_format: 'future-format' as any,
+    }, 'custom');
+    expect(bad?.category).toBe('');
+    expect('output_format' in (bad as any)).toBe(false);
   });
 });
 
@@ -696,10 +718,10 @@ describe('agents › createCustomAgent', () => {
     expect(fs.existsSync(file)).toBe(true);
   });
 
-  it('defaults empty name to the localized "Untitled agent" fallback', async () => {
+  it('defaults empty name to the localized no-space fallback', async () => {
     const a = await loadAgents();
     const agent = await a.createCustomAgent({ description: 'desc', category: 'general' });
-    expect(agent?.name).toBe('Untitled agent');
+    expect(agent?.name).toBe('UntitledAgent');
   });
 
   it('stores workflow skill references by display name', async () => {
@@ -716,11 +738,27 @@ describe('agents › createCustomAgent', () => {
     expect(JSON.parse(fs.readFileSync(file, 'utf8')).workflow).toBe('`agent-creator` skill');
   });
 
+  it('enforces the unified display-width name limit', async () => {
+    const a = await loadAgents();
+
+    await expect(a.createCustomAgent({ name: 'A'.repeat(60), description: 'desc', category: 'general' }))
+      .resolves.toBeTruthy();
+    await expect(a.createCustomAgent({ name: '中'.repeat(30), description: 'desc', category: 'general' }))
+      .resolves.toBeTruthy();
+    await expect(a.createCustomAgent({ name: 'A'.repeat(61), description: 'desc', category: 'general' }))
+      .rejects.toMatchObject({ code: 'E_AGENT_NAME_TOO_LONG' });
+    await expect(a.createCustomAgent({ name: '中'.repeat(31), description: 'desc', category: 'general' }))
+      .rejects.toMatchObject({ code: 'E_AGENT_NAME_TOO_LONG' });
+  });
+
   it('rejects reserved names (collide with commander role / sidebar tab)', async () => {
     const a = await loadAgents();
-    // Plain hits + whitespace + case variants all collapse to the same key.
-    for (const bad of ['指挥官', '总指挥', 'コマンダー', '司令官', 'commander', '  Commander  ', '指 挥 官', 'コ マ ン ダ ー']) {
+    // Plain hits + case variants all collapse to the same key.
+    for (const bad of ['指挥官', '总指挥', 'コマンダー', '司令官', 'commander']) {
       await expect(a.createCustomAgent({ name: bad })).rejects.toThrow(/reserved/i);
+    }
+    for (const bad of ['  Commander  ', '指 挥 官', 'コ マ ン ダ ー', 'Code Helper']) {
+      await expect(a.createCustomAgent({ name: bad })).rejects.toMatchObject({ code: 'E_AGENT_NAME_INVALID' });
     }
     // Sanity: the guard doesn't over-reach to nearby strings.
     await expect(a.createCustomAgent({ name: '副指挥官', description: 'desc', category: 'general' })).resolves.toBeTruthy();
@@ -731,14 +769,14 @@ describe('agents › createAgentFromBlocks', () => {
   it('backfills the default category when model-authored creates omit it', async () => {
     const a = await loadAgents();
     const missing = await a.createAgentFromBlocks({
-      name: 'No Category',
+      name: 'NoCategory',
       description_en: 'desc',
       workflow: 'Do the work.',
     });
     expect(missing?.category).toBe('general');
 
     const created = await a.createAgentFromBlocks({
-      name: 'Data Agent',
+      name: 'DataAgent',
       description_en: 'desc',
       workflow: 'Analyze the data.',
       category: 'data',
@@ -746,6 +784,42 @@ describe('agents › createAgentFromBlocks', () => {
     expect(created?.category).toBe('data');
     const file = path.join(customAgentsDir(), created?.agent_id || '', 'agent.json');
     expect(JSON.parse(fs.readFileSync(file, 'utf8')).category).toBe('data');
+  });
+
+  it('rejects creates missing mandatory name or workflow', async () => {
+    const a = await loadAgents();
+    await expect(a.createAgentFromBlocks({
+      name: 'NoWorkflow',
+      description_en: 'desc',
+    })).resolves.toBeNull();
+    await expect(a.createAgentFromBlocks({
+      workflow: 'Do the work.',
+      description_en: 'desc',
+    })).resolves.toBeNull();
+  });
+
+  it('persists optional skill allowlist, input schema and interactive flag', async () => {
+    writeSkillOnDisk('known-skill');
+    const a = await loadAgents();
+    const created = await a.createAgentFromBlocks({
+      name: 'InteractiveHelper',
+      description_en: 'desc',
+      workflow: 'Ask for a topic, then use the selected skill.',
+      category: 'writing',
+      interactive: true,
+      skill_list: ['known-skill', 'missing-skill'],
+      inputs: [
+        { id: 'topic', label: 'Topic', type: 'text', default: '', required: true },
+        { id: 'bad id', label: 'Bad', type: 'text', default: '' } as any,
+      ],
+    });
+
+    expect(created?.category).toBe('creation');
+    expect(created?.interactive).toBe(true);
+    expect(created?.skill_list).toEqual(['known-skill']);
+    expect(created?.inputs).toEqual([
+      { id: 'topic', label: 'Topic', type: 'text', default: '', required: true },
+    ]);
   });
 });
 
@@ -837,11 +911,11 @@ describe('agents › updateCustomAgent', () => {
     expect(JSON.parse(fs.readFileSync(file, 'utf8')).workflow).toBe('`skill-creator` skill');
   });
 
-  it('backfills empty name to the localized "Untitled agent" fallback', async () => {
+  it('backfills empty name to the localized no-space fallback', async () => {
     writeCustomAgent('abc', { name: 'Old' });
     const a = await loadAgents();
     const updated = await a.updateCustomAgent('abc', { name: '' });
-    expect(updated?.name).toBe('Untitled agent');
+    expect(updated?.name).toBe('UntitledAgent');
   });
 
   it('rejects renaming to a reserved name', async () => {
@@ -849,6 +923,16 @@ describe('agents › updateCustomAgent', () => {
     const a = await loadAgents();
     await expect(a.updateCustomAgent('abc', { name: '指挥官' })).rejects.toThrow(/reserved/i);
     // File on disk should still hold the old name.
+    const after = await a.getAgent('abc');
+    expect(after?.name).toBe('Old');
+  });
+
+  it('rejects renaming past the unified display-width limit', async () => {
+    writeCustomAgent('abc', { name: 'Old' });
+    const a = await loadAgents();
+
+    await expect(a.updateCustomAgent('abc', { name: '中'.repeat(31) }))
+      .rejects.toMatchObject({ code: 'E_AGENT_NAME_TOO_LONG' });
     const after = await a.getAgent('abc');
     expect(after?.name).toBe('Old');
   });
@@ -1022,6 +1106,49 @@ describe('agents › updateCustomAgent', () => {
     // Skills are independent — listing 'a' must NOT pull in unrelated ids.
     expect(updated?.skill_list).toEqual(['a']);
   });
+
+  it('updates category explicitly, preserves it when omitted, and drops it when cleared', async () => {
+    writeCustomAgent('abc', { name: 'N', category: 'general' });
+    const a = await loadAgents();
+
+    const changed = await a.updateCustomAgent('abc', { category: 'DATA' });
+    expect(changed?.category).toBe('data');
+    expect(JSON.parse(fs.readFileSync(path.join(customAgentsDir(), 'abc', 'agent.json'), 'utf8')).category)
+      .toBe('data');
+
+    const preserved = await a.updateCustomAgent('abc', { description: 'new desc' });
+    expect(preserved?.category).toBe('data');
+
+    const cleared = await a.updateCustomAgent('abc', { category: '' });
+    expect(cleared?.category).toBe('');
+    expect('category' in JSON.parse(fs.readFileSync(path.join(customAgentsDir(), 'abc', 'agent.json'), 'utf8')))
+      .toBe(false);
+  });
+
+  it('writes output_format only for explicit constrained modes and clears auto', async () => {
+    writeCustomAgent('abc', { name: 'N' });
+    const a = await loadAgents();
+
+    const autoCreated = await a.createCustomAgent({ name: 'AutoAgent', description: 'desc', output_format: 'auto' });
+    expect('output_format' in (autoCreated as any)).toBe(false);
+    expect('output_format' in JSON.parse(fs.readFileSync(path.join(customAgentsDir(), autoCreated!.agent_id, 'agent.json'), 'utf8')))
+      .toBe(false);
+
+    const constrained = await a.updateCustomAgent('abc', { output_format: 'artifact' });
+    expect(constrained?.output_format).toBe('artifact');
+    expect(JSON.parse(fs.readFileSync(path.join(customAgentsDir(), 'abc', 'agent.json'), 'utf8')).output_format)
+      .toBe('artifact');
+
+    const text = await a.updateCustomAgent('abc', { output_format: 'text' });
+    expect(text?.output_format).toBe('text');
+    expect(JSON.parse(fs.readFileSync(path.join(customAgentsDir(), 'abc', 'agent.json'), 'utf8')).output_format)
+      .toBe('text');
+
+    const cleared = await a.updateCustomAgent('abc', { output_format: 'auto' });
+    expect('output_format' in (cleared as any)).toBe(false);
+    expect('output_format' in JSON.parse(fs.readFileSync(path.join(customAgentsDir(), 'abc', 'agent.json'), 'utf8')))
+      .toBe(false);
+  });
 });
 
 describe('agents › appendAgentSkill', () => {
@@ -1132,6 +1259,34 @@ describe('agents › streamSendToAgentEditChat synthesized progress', () => {
     // Only the final event should fire — no progress noise.
     expect(events.filter((e) => e.type === 'progress')).toHaveLength(0);
   });
+
+  it('passes edit-chat attachments into the model prompt and history', async () => {
+    let seenOpts: any = null;
+    streamImpl.current = async function* (opts: any) {
+      seenOpts = opts;
+      yield { type: 'final', text: 'read attachment' };
+    };
+    writeCustomAgent('abc', { name: 'N' });
+    const attDir = path.join(tmpDir, TEST_UID, 'cloud', 'chat_attachments', 'agent-edit-abc');
+    fs.mkdirSync(attDir, { recursive: true });
+    fs.writeFileSync(path.join(attDir, 'brief.txt'), 'agent brief');
+
+    const a = await loadAgents();
+    for await (const _ev of a.streamSendToAgentEditChat('u1', 'abc', 'make changes', { attachments: ['brief.txt'] })) {
+      // drain
+    }
+
+    expect(seenOpts.message).toContain('<attachments>');
+    expect(seenOpts.message).toContain('brief.txt');
+    expect(seenOpts.message).toContain('make changes');
+    expect(seenOpts.readOnlyExtraRoots).toContain(attDir);
+
+    const chatPath = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'agent', 'abc', 'chat.jsonl');
+    const first = JSON.parse(fs.readFileSync(chatPath, 'utf8').trim().split('\n')[0]);
+    expect(first.role).toBe('user');
+    expect(first.attachments).toEqual(['brief.txt']);
+    expect(first.attachment_cid).toBe('agent-edit-abc');
+  });
 });
 
 describe('agents › deleteCustomAgent', () => {
@@ -1168,6 +1323,32 @@ describe('agents › deleteCustomAgent', () => {
     const a = await loadAgents();
     await a.deleteCustomAgent('victim');
     expect(fs.existsSync(sessionFile)).toBe(false);
+  });
+
+  it('does not delete existing tasks that reference the agent legacy field', async () => {
+    writeCustomAgent('victim');
+    const chatsDir = path.join(tmpDir, TEST_UID, 'cloud', 'chats');
+    fs.mkdirSync(chatsDir, { recursive: true });
+    const taskFile = path.join(chatsDir, 'task1.jsonl');
+    fs.writeFileSync(taskFile, '{"role":"user","content":"hi"}\n');
+    fs.writeFileSync(path.join(chatsDir, '_index.json'), JSON.stringify([
+      {
+        conversation_id: 'task1',
+        title: 'Task One',
+        kind: 'normal',
+        agent_id: 'victim',
+        session_id: 'gconv-task1',
+        created_at: '2026-06-01T10:00:00.000Z',
+        updated_at: '2026-06-01T10:00:00.000Z',
+      },
+    ]));
+
+    const a = await loadAgents();
+    await a.deleteCustomAgent('victim');
+
+    expect(fs.existsSync(taskFile)).toBe(true);
+    const rows = JSON.parse(fs.readFileSync(path.join(chatsDir, '_index.json'), 'utf8'));
+    expect(rows[0].deleted_at).toBeUndefined();
   });
 });
 
@@ -1217,6 +1398,26 @@ describe('agents › list cache invalidation', () => {
     expect(list[0].name).toBe('V2');
   });
 
+  it('keeps marketplace agent specs read-only in OrkasOpen', async () => {
+    const dir = path.join(builtinAgentsDir(), 'platform-agent');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'agent.json'), JSON.stringify({
+      agent_id: 'platform-agent',
+      name: 'OldPlatformAgent',
+      description: '',
+      workflow: '',
+    }));
+
+    const a = await loadAgents();
+    const updated = await a.updateAgentSpec('platform-agent', { name: 'RenamedPlatformAgent' });
+
+    expect(updated).toBeNull();
+    expect(JSON.parse(fs.readFileSync(path.join(dir, 'agent.json'), 'utf8')).name)
+      .toBe('OldPlatformAgent');
+    expect((await a.listAgents()).find((x) => x.agent_id === 'platform-agent')?.name)
+      .toBe('OldPlatformAgent');
+  });
+
   it('cache-only invalidator picks up marketplace file rewrites', async () => {
     const parent = builtinAgentsDir();
     const dir = path.join(parent, 'platform-agent');
@@ -1247,6 +1448,30 @@ describe('agents › list cache invalidation', () => {
     a.clearAgentListCache();
     expect((await a.listAgents()).find((x) => x.agent_id === 'platform-agent')?.name)
       .toBe('New platform agent');
+  });
+
+  it('exposes marketplace install version and freshness metadata', async () => {
+    const dir = path.join(builtinAgentsDir(), 'platform-agent');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'agent.json'), JSON.stringify({
+      agent_id: 'platform-agent',
+      name: 'Platform agent',
+      description: '',
+      workflow: '',
+    }));
+    fs.writeFileSync(path.join(dir, '_install.json'), JSON.stringify({
+      version: '1.2.3',
+      published_at: 1747066800000,
+      updated_at: 1747067800000,
+      default_install: true,
+    }));
+
+    const a = await loadAgents();
+    const found = (await a.listAgents()).find((x) => x.agent_id === 'platform-agent');
+    expect(found?.version).toBe('1.2.3');
+    expect(found?.marketplace_published_at).toBe(1747066800000);
+    expect(found?.marketplace_updated_at).toBe(1747067800000);
+    expect(found?.default_install).toBe(true);
   });
 });
 

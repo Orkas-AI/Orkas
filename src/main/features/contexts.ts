@@ -57,6 +57,11 @@ const CONTEXTS_IGNORE: ReadonlySet<string> = new Set([
 // the LLM so no practical ceiling on "how big a file can the KB take".
 const TEXT_EXTS: ReadonlySet<string> = new Set([
   '.md', '.markdown', '.txt', '.csv', '.tsv', '.json', '.yaml', '.yml', '.log',
+  '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
+  '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.sh', '.bash', '.zsh', '.rb', '.go', '.rs', '.java', '.kt',
+  '.c', '.cpp', '.cc', '.h', '.hpp', '.css', '.scss', '.less',
+  '.sql', '.graphql', '.gql',
 ]);
 const BINARY_EXTS: ReadonlySet<string> = new Set([
   '.pdf', '.docx', '.png', '.jpg', '.jpeg', '.webp', '.gif',
@@ -246,21 +251,19 @@ export function readContextImage(relpath: string): Result<{ base64: string; medi
   } catch (err) { return { ok: false, error: (err as Error).message }; }
 }
 
-/** Hand off an arbitrary KB file to the OS default viewer via `shell.openPath`.
- *  The path is validated against the KB root first, so a caller can't escape
- *  the contexts tree. Use cases: PDF / docx (no inline renderer), or user
- *  explicitly requesting "open externally" for text / image. */
-export async function openContextFileInSystem(relpath: string): Promise<Result> {
+/** Reveal a Library file in the OS file manager.
+ *  The path is validated against the Library root first, so a caller can't
+ *  escape the contexts tree. */
+export async function showContextFileInSystem(relpath: string): Promise<Result> {
   let p: string;
   try { p = resolvePath(relpath, { mustExist: true }); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   if (!fs.statSync(p).isFile()) return { ok: false, error: 'not a file' };
   try {
-    const err = await shell.openPath(p);
-    if (err) { log.warn(`openPath ${relpath}: ${err}`); return { ok: false, error: err }; }
+    shell.showItemInFolder(p);
     return { ok: true };
   } catch (err) {
-    log.warn(`openPath ${relpath}: ${(err as Error).message}`);
+    log.warn(`showItemInFolder ${relpath}: ${(err as Error).message}`);
     return { ok: false, error: (err as Error).message };
   }
 }
@@ -299,6 +302,9 @@ function checkDuplicateContent(sha1: string): Result<null> | null {
     ok: false,
     error: t('errors.kb_duplicate_sha1', { existingPath: existing.rel_path }),
   };
+}
+
+function notifyDeletedContext(_relPath: string): void {
 }
 
 export function writeContextFile(relpath: string, content: string): Result<{ path: string }> {
@@ -428,6 +434,7 @@ export function deleteContextTarget(relpath: string): Result {
   for (const r of droppedRels) {
     search.dropContext(uid, r);
     kbIndexer.enqueue(uid, r, 'delete');
+    notifyDeletedContext(r);
   }
   return { ok: true };
 }
@@ -489,6 +496,7 @@ export function renameContextEntry(srcRel: string, dstRel: string): Result<{ src
   for (const r of oldRels) {
     search.dropContext(uid, r);
     kbIndexer.enqueue(uid, r, 'delete');
+    notifyDeletedContext(r);
   }
   for (const r of _collectRelsUnder(dst, dstRel)) {
     search.upsertContext(uid, r);

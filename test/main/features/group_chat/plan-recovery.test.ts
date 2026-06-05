@@ -240,6 +240,52 @@ describe('plan recovery › retryStep', () => {
   });
 });
 
+describe('plan recovery › continuePlan', () => {
+  it('retries the first failed step through the plan-level control', async () => {
+    const cid = newCid();
+    await seedPlan(TEST_UID, cid, {
+      steps: [
+        { title: 'Step 1', assignee: A_NAME, input: 'do step 1', wait_for: [] },
+        { title: 'Step 2', assignee: A_NAME, input: 'do step 2' },
+      ],
+    });
+    const plan = await import('../../../../src/main/features/group_chat/plan');
+    await plan.updateStep(TEST_UID, cid, 1, 'failed', {
+      failure_reason: 'failed once',
+      transient_attempts: 2,
+    });
+
+    const planExecutor = await import('../../../../src/main/features/group_chat/plan_executor');
+    const r = await planExecutor.continuePlan(TEST_UID, cid);
+    expect(r.ok).toBe(true);
+
+    const fresh = await plan.readPlan(TEST_UID, cid);
+    expect(fresh?.steps[0].status).not.toBe('failed');
+    expect(fresh?.steps[0].failure_reason).toBeUndefined();
+    expect(fresh?.steps[0].transient_attempts).toBeUndefined();
+  });
+
+  it('collapses stale in_progress to failed, then continues from that step', async () => {
+    const cid = newCid();
+    await seedPlan(TEST_UID, cid, {
+      steps: [
+        { title: 'Step 1', assignee: A_NAME, input: 'do step 1', wait_for: [] },
+        { title: 'Step 2', assignee: A_NAME, input: 'do step 2' },
+      ],
+    });
+    const plan = await import('../../../../src/main/features/group_chat/plan');
+    await plan.updateStep(TEST_UID, cid, 1, 'in_progress');
+
+    const planExecutor = await import('../../../../src/main/features/group_chat/plan_executor');
+    const r = await planExecutor.continuePlan(TEST_UID, cid);
+    expect(r.ok).toBe(true);
+
+    const fresh = await plan.readPlan(TEST_UID, cid);
+    expect(fresh?.steps[0].status).not.toBe('failed');
+    expect(fresh?.steps[0].failure_reason).toBeUndefined();
+  });
+});
+
 // ─────────────────────────────────────────────────────────────────────────
 //  skipStep
 // ─────────────────────────────────────────────────────────────────────────
@@ -328,6 +374,24 @@ describe('plan recovery › transient auto-retry', () => {
     // After transient retry + reconcileAfterStepTransition, the step gets
     // re-dispatched right away → in_progress. The invariant is that the step
     // is NOT in failed state and the attempts counter was bumped.
+    expect(fresh?.steps[0].status).not.toBe('failed');
+    expect(fresh?.steps[0].transient_attempts).toBe(1);
+    expect(fresh?.steps[0].failure_reason).toBeUndefined();
+  });
+
+  it('folds a step back to pending on SSE header timeout', async () => {
+    const cid = newCid();
+    await seedPlan(TEST_UID, cid, {
+      steps: [{ title: 'Step 1', assignee: A_NAME, wait_for: [] }],
+    });
+    const plan = await import('../../../../src/main/features/group_chat/plan');
+    await plan.updateStep(TEST_UID, cid, 1, 'in_progress');
+
+    const planExecutor = await import('../../../../src/main/features/group_chat/plan_executor');
+    const evt = await buildEvtForStep(1, 'Codex SSE response headers timed out after 10000ms');
+    await planExecutor.onTurnFinished(TEST_UID, cid, evt);
+
+    const fresh = await plan.readPlan(TEST_UID, cid);
     expect(fresh?.steps[0].status).not.toBe('failed');
     expect(fresh?.steps[0].transient_attempts).toBe(1);
     expect(fresh?.steps[0].failure_reason).toBeUndefined();

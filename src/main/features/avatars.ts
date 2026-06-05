@@ -1,5 +1,5 @@
 /**
- * Avatar catalog — single source of truth for icon / color tokens.
+ * Avatar catalog — PC runtime source for icon / color tokens.
  *
  * Data lives at `src/main/data/avatars.json`:
  *   - icons[]:  { id, label, svg }
@@ -16,10 +16,12 @@
  * which caches them. Add / rename / re-style happens in the JSON, in one
  * place.
  *
- * **Why** one source of truth: an earlier version kept a duplicate token
+ * Keep this catalog aligned with iOS/Web via `PC/test/main/avatar-catalogs.test.ts`.
+ *
+ * **Why** one runtime source per platform: an earlier version kept a duplicate token
  * pool on the backend for random backfill, which immediately invited the
  * "edit one, forget the other" failure mode with the renderer's `avatar.js`.
- * After unification to the JSON:
+ * After unification to the platform JSON:
  *   - the backend only validates `id`; no color hex / svg awareness;
  *   - the renderer receives the full catalog (incl. SVG / hex) once, no
  *     hard-coding;

@@ -3,7 +3,10 @@ import {
   mapCoreAgentEvents,
   friendlyRetryReason,
   extractPersistedOutputPath,
+  skillReadMetadataForToolStart,
+  agentReadMetadataForToolStart,
 } from '../../../src/main/model/core-agent/event-mapper';
+import { userMarketplaceAgentsDir, userMarketplaceSkillsDir } from '../../../src/main/paths';
 
 type AgentRunEvent =
   | { type: 'text_delta'; text: string }
@@ -16,10 +19,10 @@ async function* toAsync<T>(items: T[]): AsyncIterable<T> {
   for (const it of items) yield it;
 }
 
-async function collect(events: AgentRunEvent[]) {
+async function collect(events: AgentRunEvent[], opts?: Parameters<typeof mapCoreAgentEvents>[1]) {
   const out: any[] = [];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const gen = mapCoreAgentEvents(toAsync(events) as any);
+  const gen = mapCoreAgentEvents(toAsync(events) as any, opts);
   for await (const ev of gen) out.push(ev);
   return out;
 }
@@ -69,6 +72,64 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     const startEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'start');
     expect(startEvent.event.data.name).toBe('read_file');
     expect(startEvent.event.data.arguments).toEqual({ path: '/tmp/foo.md' });
+  });
+
+  it('read_file of marketplace SKILL.md carries the display name without another skill scan', async () => {
+    const uid = 'u-skill-event';
+    const skillId = '16e1bfcb3426';
+    const skillPath = `${userMarketplaceSkillsDir(uid)}/${skillId}/SKILL.md`;
+    const skillDisplayNameById = new Map([[skillId, 'agent-creator']]);
+    const meta = skillReadMetadataForToolStart(
+      'read_file',
+      { path: skillPath },
+      { userId: uid, skillDisplayNameById },
+    );
+    expect(meta).toEqual({
+      skill_id: skillId,
+      skill_name: 'agent-creator',
+      skill_system: 'A.platform',
+    });
+
+    const out = await collect([
+      { type: 'tool_start', name: 'read_file', id: 'c-skill', input: { path: skillPath } },
+      { type: 'tool_end', name: 'read_file', id: 'c-skill', result: '<file>body</file>' },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ], { userId: uid, skillDisplayNameById });
+    const startEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'start');
+    const endEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'end');
+    expect(startEvent.event.data.skill_name).toBe('agent-creator');
+    expect(startEvent.event.data.skill_id).toBe(skillId);
+    expect(endEvent.event.data.skill_name).toBe('agent-creator');
+    expect(endEvent.event.data.skill_file).toBe('SKILL.md');
+  });
+
+  it('read_file of marketplace agent.json carries the agent display name', async () => {
+    const uid = 'u-agent-event';
+    const agentId = '4430ca181349';
+    const agentPath = `${userMarketplaceAgentsDir(uid)}/${agentId}/agent.json`;
+    const agentDisplayNameById = new Map([[agentId, '学习路径设计师']]);
+    const meta = agentReadMetadataForToolStart(
+      'read_file',
+      { path: agentPath },
+      { userId: uid, agentDisplayNameById },
+    );
+    expect(meta).toEqual({
+      agent_id: agentId,
+      agent_name: '学习路径设计师',
+      agent_system: 'marketplace',
+    });
+
+    const out = await collect([
+      { type: 'tool_start', name: 'read_file', id: 'c-agent', input: { path: agentPath } },
+      { type: 'tool_end', name: 'read_file', id: 'c-agent', result: '{"name":"学习路径设计师"}' },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ], { userId: uid, agentDisplayNameById });
+    const startEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'start');
+    const endEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'end');
+    expect(startEvent.event.data.agent_name).toBe('学习路径设计师');
+    expect(startEvent.event.data.agent_id).toBe(agentId);
+    expect(endEvent.event.data.agent_name).toBe('学习路径设计师');
+    expect(endEvent.event.data.agent_file).toBe('agent.json');
   });
 
   it('retry event → friendly Chinese progress, raw reason not leaked', async () => {
@@ -172,6 +233,10 @@ describe('event-mapper › friendlyRetryReason', () => {
     expect(friendlyRetryReason('terminated')).toBe('Connection dropped');
     expect(friendlyRetryReason('socket hang up')).toBe('Connection dropped');
     expect(friendlyRetryReason('fetch failed')).toBe('Connection dropped');
+    expect(friendlyRetryReason('WebSocket error')).toBe('Connection dropped');
+    expect(friendlyRetryReason('Connection closed')).toBe('Connection dropped');
+    expect(friendlyRetryReason('stream disconnected before completion')).toBe('Connection dropped');
+    expect(friendlyRetryReason('ERR_STREAM_PREMATURE_CLOSE')).toBe('Connection dropped');
     expect(friendlyRetryReason('ECONNRESET')).toBe('Connection dropped');
   });
 
@@ -179,6 +244,7 @@ describe('event-mapper › friendlyRetryReason', () => {
     expect(friendlyRetryReason('Request timeout')).toBe('Response timed out');
     expect(friendlyRetryReason('ETIMEDOUT')).toBe('Response timed out');
     expect(friendlyRetryReason('UND_ERR_HEADERS_TIMEOUT')).toBe('Response timed out');
+    expect(friendlyRetryReason('Codex SSE response headers timed out after 10000ms')).toBe('Response timed out');
   });
 
   it('maps rate limiting to "Service rate-limited"', () => {

@@ -10,11 +10,16 @@ const UID = 'u-fi-001';
 
 let tmpDir: string;
 let prevWs: string | undefined;
+let prevHome: string | undefined;
+let prevGuard: string | undefined;
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-file-indexer-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
+  prevHome = process.env.HOME;
+  prevGuard = process.env.ORKAS_TCC_GUARD_FORCE;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
+  delete process.env.ORKAS_TCC_GUARD_FORCE;
   vi.resetModules();
   const users = await import('../../../src/main/features/users');
   users.activateUser(UID);
@@ -22,6 +27,10 @@ beforeEach(async () => {
 
 afterEach(() => {
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+  if (prevHome === undefined) delete process.env.HOME;
+  else process.env.HOME = prevHome;
+  if (prevGuard === undefined) delete process.env.ORKAS_TCC_GUARD_FORCE;
+  else process.env.ORKAS_TCC_GUARD_FORCE = prevGuard;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -85,6 +94,26 @@ describe('file_indexer › statFile', () => {
     const png = await makePng();
     const abs = writeWorkspaceFile('chart.png', png);
     await expect(m.statFile(UID, abs)).rejects.toThrowError(m.NoTextError);
+  });
+
+  it('flags extractionEmpty when pdfjs yields no text on any page', async () => {
+    const m = await loadMod();
+    // All-empty content streams → pdfjs extracts '' per page (the font-mapping
+    // failure mode); total_chars is still non-zero from the page delimiters.
+    const abs = writeWorkspaceFile('scanlike.pdf', makeMinimalPdf(['', '']));
+    const meta = await m.statFile(UID, abs);
+    expect(meta.kind).toBe('pdf');
+    expect(meta.extractionEmpty).toBe(true);
+    expect(meta.totalChars).toBeGreaterThan(0);
+  });
+
+  it('does NOT flag extractionEmpty when at least one page has text', async () => {
+    const m = await loadMod();
+    // One blank page + one with text → legit sparse PDF, must not be flagged
+    // (guards `.every`, not `.some`).
+    const abs = writeWorkspaceFile('mixed.pdf', makeMinimalPdf(['', 'Bravo']));
+    const meta = await m.statFile(UID, abs);
+    expect(meta.extractionEmpty).toBeFalsy();
   });
 });
 
@@ -268,6 +297,31 @@ describe('file_indexer › invalidate + purge + prune', () => {
     const r = await m.pruneOrphans(UID);
     expect(r.deleted).toBe(1);
     expect(fs.readdirSync(userFileCacheRoot()).length).toBe(0);
+  });
+
+  it('pruneOrphans drops protected-source cache entries without statting the source', async () => {
+    process.env.ORKAS_TCC_GUARD_FORCE = '1';
+    const home = path.join(tmpDir, 'fake-home');
+    const downloads = path.join(home, 'Downloads');
+    fs.mkdirSync(downloads, { recursive: true });
+    process.env.HOME = home;
+    const m = await loadMod();
+    const protectedSource = path.join(downloads, 'old.pdf');
+    const cacheDir = path.join(userFileCacheRoot(), 'manual-cache');
+    fs.mkdirSync(cacheDir, { recursive: true });
+    fs.writeFileSync(path.join(cacheDir, 'meta.json'), JSON.stringify({
+      absPath: protectedSource,
+      mtime: 0,
+      size: 1,
+      kind: 'pdf',
+      source: 'workspace',
+      cacheVersion: m.EXTRACT_CACHE_VERSION,
+      lastAccessed: 0,
+    }));
+
+    const r = await m.pruneOrphans(UID);
+    expect(r.deleted).toBe(1);
+    expect(fs.existsSync(cacheDir)).toBe(false);
   });
 
   it('pruneOrphans with workspacePath drops workspace entries outside the new workspace', async () => {

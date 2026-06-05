@@ -292,16 +292,13 @@
     chips.className = 'form-field-file-chips';
     wrap.appendChild(chips);
 
-    // pick button + hidden input
-    const picker = document.createElement('label');
+    // pick button. Use the Electron main-process picker instead of a DOM
+    // file input so image-capable fields do not route through Chromium's
+    // macOS media-library picker and trip Photos Library permission prompts.
+    const picker = document.createElement('button');
+    picker.type = 'button';
     picker.className = 'btn btn-sm form-field-file-picker';
     picker.textContent = t(multiple ? 'chat.form.file_pick_multi' : 'chat.form.file_pick');
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.style.display = 'none';
-    if (multiple) input.multiple = true;
-    if (field.accept) input.accept = field.accept;
-    picker.appendChild(input);
     wrap.appendChild(picker);
 
     // entries: [{ tempId, name?, status: 'uploading'|'ready'|'failed' }]
@@ -364,7 +361,9 @@
 
     async function _uploadFile(ent, file) {
       try {
-        const buf = await file.arrayBuffer();
+        const buf = file.arrayBuffer
+          ? await file.arrayBuffer()
+          : _base64ToArrayBuffer(file.dataBase64 || '');
         const res = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/attachments/upload`, {
           method: 'POST',
           headers: {
@@ -387,8 +386,55 @@
       if (ctx && typeof ctx.onChange === 'function') ctx.onChange();
     }
 
-    input.addEventListener('change', () => {
-      const picked = Array.from(input.files || []);
+    function _acceptToExtensions(accept) {
+      const out = [];
+      const add = (x) => { if (x && !out.includes(x)) out.push(x); };
+      const mimeExts = {
+        'text/plain': ['txt'],
+        'text/markdown': ['md', 'markdown'],
+        'text/csv': ['csv'],
+        'text/tab-separated-values': ['tsv'],
+        'application/json': ['json'],
+        'application/pdf': ['pdf'],
+        'application/x-yaml': ['yaml', 'yml'],
+        'application/yaml': ['yaml', 'yml'],
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['docx'],
+      };
+      String(accept || '').split(',').map((x) => x.trim().toLowerCase()).forEach((part) => {
+        if (!part) return;
+        if (part.startsWith('.')) add(part.slice(1));
+        else if (part === 'image/*') ['png', 'jpg', 'jpeg', 'webp', 'gif'].forEach(add);
+        else if (part === 'video/*') ['mp4', 'webm', 'mov', 'm4v', 'ogv'].forEach(add);
+        else if (mimeExts[part]) mimeExts[part].forEach(add);
+        else if (part.includes('/')) {
+          const tail = part.slice(part.indexOf('/') + 1);
+          if (tail === 'jpeg') { add('jpg'); add('jpeg'); }
+          else if (/^[a-z0-9.+-]+$/.test(tail)) add(tail.replace(/^x-/, ''));
+        }
+      });
+      return out;
+    }
+
+    function _base64ToArrayBuffer(b64) {
+      const bin = atob(String(b64 || ''));
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return bytes.buffer;
+    }
+
+    picker.addEventListener('click', async () => {
+      if (disabled) return;
+      let picked = [];
+      try {
+        const res = await window.orkas.invoke('common.pickFiles', {
+          title: field.label || 'Choose file',
+          multiple,
+          extensions: _acceptToExtensions(field.accept),
+        });
+        picked = Array.isArray(res && res.files) ? res.files : [];
+      } catch (_err) {
+        picked = [];
+      }
       if (!picked.length) return;
       // single-file mode: replace any prior selection
       if (!multiple) entries.length = 0;
@@ -401,8 +447,6 @@
         entries.push(ent);
         _uploadFile(ent, file);
       }
-      // reset input so re-picking the same file fires `change` again
-      input.value = '';
       _renderChips();
       if (ctx && typeof ctx.onChange === 'function') ctx.onChange();
     });
@@ -445,7 +489,7 @@
   }
 
   function _formatSummaryLine(field, value) {
-    const fallback = t('chat.form.empty_value');
+    const fallback = '';
     if (value === undefined || value === null) return fallback;
     if (field.type === 'boolean') return value === true ? 'yes' : 'no';
     if (field.type === 'select') {

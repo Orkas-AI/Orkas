@@ -17,7 +17,9 @@
  * in order. The tricky bit is "when is it still safe to rotate?":
  *
  *   - Before any `text_delta` / `tool_use_start` / similar content event
- *     has been yielded → key failure ⇒ mark cooldown, try next candidate
+ *     has been yielded → credential/account failure ⇒ mark cooldown, try
+ *     next candidate; network failure ⇒ retry this candidate first, then
+ *     rotate without cooldown
  *   - After first content event has been yielded → failure propagates
  *     unchanged (rotating now would mean losing/duplicating visible
  *     output, which is worse than failing)
@@ -36,7 +38,9 @@
  *
  * ## Cooldown & onSuccess
  *
- * On a rotatable failure: `markCooldown(profileId, kind, reason)`.
+ * On a credential/account rotatable failure: `markCooldown(profileId, kind, reason)`.
+ * Network failures are never cooled down; each new user request starts from
+ * the configured entries list again.
  * On a successful first-event-yield: `onSuccess(profileId)` fires so
  * callers can clear any prior cooldown + bump lastUsed.
  */
@@ -48,6 +52,10 @@ import { markCooldown } from './profile-cooldown';
 import { createLogger } from '../../logger';
 
 const log = createLogger('rotating-provider');
+
+const NETWORK_RETRY_ATTEMPTS = 3;
+const NETWORK_RETRY_BASE_DELAY_MS = 500;
+const NETWORK_RETRY_MAX_DELAY_MS = 2_000;
 
 export interface RotatingCandidate {
   profileId: string;
@@ -72,9 +80,22 @@ export interface CreateRotatingProviderConfig {
    *  yielded successfully). Used by callers to clear cooldown on the
    *  winning profile and bump `lastUsed`. */
   onSuccess?: (profileId: string) => void;
+  /** Called when a candidate "owns" the call's outcome — either committed
+   *  (success) or surfaced the user-visible error after rotation exhausted
+   *  / a non-rotatable failure. The dev archive recorder uses this to
+   *  rewrite its model/provider/profile labels so the stored row reflects
+   *  the candidate that actually produced the visible result, not the
+   *  rotating-provider's primary label. Fires at most once per `complete`
+   *  / `stream` invocation. */
+  onCandidateChosen?: (info: { profileId: string; providerId: string; modelId: string }) => void;
   /** Provider id surfaced as `LLMProvider.id` — should match the group's
    *  shared provider id, e.g. "anthropic" / "moonshot". */
   providerId: string;
+  /** How many times to retry a network-class failure on the same candidate
+   *  before cooling it down and rotating to the next configured candidate. */
+  networkRetryAttempts?: number;
+  /** Test hook / tuning knob for network retry backoff. */
+  networkRetryDelayMs?: (attempt: number) => number;
 }
 
 export function createRotatingProvider(config: CreateRotatingProviderConfig): LLMProvider {
@@ -84,6 +105,10 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
   }
 
   const providerId = config.providerId;
+  const networkRetryAttempts = Math.max(0, config.networkRetryAttempts ?? NETWORK_RETRY_ATTEMPTS);
+  const networkRetryDelayMs = config.networkRetryDelayMs ?? ((attempt: number) => {
+    return Math.min(NETWORK_RETRY_BASE_DELAY_MS * 2 ** Math.max(0, attempt - 1), NETWORK_RETRY_MAX_DELAY_MS);
+  });
 
   /**
    * Events that are pure preamble — getting one doesn't commit us to this
@@ -106,6 +131,22 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
    *  only knows about the primary's model. */
   function paramsFor(cand: RotatingCandidate, params: CompletionParams): CompletionParams {
     return { ...params, model: cand.modelId };
+  }
+
+  function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    if (ms <= 0 || signal?.aborted) return Promise.resolve();
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      signal?.addEventListener?.('abort', () => {
+        clearTimeout(timer);
+        resolve();
+      }, { once: true });
+    });
+  }
+
+  function exhaustedNetworkError(lastErr: unknown): Error {
+    const msg = formatKeyFailure(lastErr) || 'network error';
+    return new Error(`All configured model candidates failed after network retries: ${msg.replace(/fetch[_\s-]?failed/ig, 'connection failed')}`);
   }
 
   async function streamOne(cand: RotatingCandidate, params: CompletionParams): Promise<{
@@ -175,45 +216,92 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
 
     async complete(params: CompletionParams): Promise<CompletionResult> {
       let lastErr: unknown = new Error('rotating-provider: no candidates');
+      let lastCand: RotatingCandidate | null = null;
+      let exhaustedNetwork = false;
       for (let i = 0; i < candidates.length; i++) {
         const cand = candidates[i];
-        try {
-          const provider = await cand.build();
-          const result = await provider.complete(paramsFor(cand, params));
-          config.onSuccess?.(cand.profileId);
-          return result;
-        } catch (err) {
-          lastErr = err;
-          const kind = classifyKeyFailure(err);
-          if (!kind) {
-            // Non-rotatable → bail now; don't burn good keys chasing a
-            // non-key failure.
-            throw err;
+        lastCand = cand;
+
+        for (let retry = 0; retry <= networkRetryAttempts; retry++) {
+          try {
+            const provider = await cand.build();
+            const result = await provider.complete(paramsFor(cand, params));
+            config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
+            config.onSuccess?.(cand.profileId);
+            return result;
+          } catch (err) {
+            lastErr = err;
+            const kind = classifyKeyFailure(err);
+            if (!kind) {
+              // Non-rotatable → this candidate owns the visible error.
+              config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
+              throw err;
+            }
+
+            if (kind === 'network' && retry < networkRetryAttempts) {
+              log.warn(`complete: profile=${cand.profileId} kind=network — retrying current candidate (${retry + 1}/${networkRetryAttempts})`);
+              await sleep(networkRetryDelayMs(retry + 1), (params as { signal?: AbortSignal }).signal);
+              continue;
+            }
+
+            const reason = formatKeyFailure(err);
+            if (kind !== 'network') markCooldown(cand.profileId, kind, reason);
+            exhaustedNetwork = kind === 'network';
+            log.warn(`complete: profile=${cand.profileId} kind=${kind} — trying next candidate (${i + 1}/${candidates.length})`);
+            break;
           }
-          const reason = formatKeyFailure(err);
-          markCooldown(cand.profileId, kind, reason);
-          log.warn(`complete: profile=${cand.profileId} kind=${kind} — trying next candidate (${i + 1}/${candidates.length})`);
         }
       }
+      // Exhausted: surface the last candidate's failure as the call's owner.
+      if (lastCand) config.onCandidateChosen?.({ profileId: lastCand.profileId, providerId: lastCand.providerId, modelId: lastCand.modelId });
+      if (exhaustedNetwork) throw exhaustedNetworkError(lastErr);
       throw lastErr;
     },
 
     async *stream(params: CompletionParams): AsyncIterable<StreamEvent> {
       let lastErr: unknown = new Error('rotating-provider: no candidates');
+      let lastCand: RotatingCandidate | null = null;
+      let exhaustedNetwork = false;
 
       for (let i = 0; i < candidates.length; i++) {
         const cand = candidates[i];
-        const attempt = await streamOne(cand, params);
+        lastCand = cand;
+        let attempt: Awaited<ReturnType<typeof streamOne>> | null = null;
+
+        for (let retry = 0; retry <= networkRetryAttempts; retry++) {
+          attempt = await streamOne(cand, params);
+
+          if (!('rotatable' in attempt)) break;
+
+          lastErr = attempt.err;
+          if (!attempt.rotatable) break;
+
+          const kind = classifyKeyFailure(attempt.err)!;
+          if (kind === 'network' && retry < networkRetryAttempts) {
+            const reason = formatKeyFailure(attempt.err);
+            log.warn(`stream: profile=${cand.profileId} kind=network — retrying current candidate (${retry + 1}/${networkRetryAttempts})`);
+            yield { type: 'retry', attempt: retry + 1, reason } as any;
+            await sleep(networkRetryDelayMs(retry + 1), (params as { signal?: AbortSignal }).signal);
+            continue;
+          }
+
+          break;
+        }
+
+        if (!attempt) continue;
 
         if ('rotatable' in attempt) {
           lastErr = attempt.err;
           if (!attempt.rotatable) {
-            // Non-rotatable failure before any content event → propagate.
+            // Non-rotatable failure before any content event → this
+            // candidate is what the user sees in the surfaced error.
+            config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
             throw attempt.err;
           }
           const kind = classifyKeyFailure(attempt.err)!;
           const reason = formatKeyFailure(attempt.err);
-          markCooldown(cand.profileId, kind, reason);
+          if (kind !== 'network') markCooldown(cand.profileId, kind, reason);
+          exhaustedNetwork = kind === 'network';
           log.warn(`stream: profile=${cand.profileId} kind=${kind} — trying next candidate (${i + 1}/${candidates.length})`);
           continue;
         }
@@ -222,6 +310,7 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
         // this candidate. From here on, failures propagate to caller
         // unchanged (rotation would mean corrupting visible stream).
         const { iterator, buffered } = attempt;
+        config.onCandidateChosen?.({ profileId: cand.profileId, providerId: cand.providerId, modelId: cand.modelId });
         config.onSuccess?.(cand.profileId);
 
         for (const ev of buffered) yield ev;
@@ -238,7 +327,10 @@ export function createRotatingProvider(config: CreateRotatingProviderConfig): LL
         }
       }
 
-      // Exhausted all candidates — throw whatever the last one gave us.
+      // Exhausted all candidates — surface the last one as the owner of
+      // the visible failure, then throw whatever it gave us.
+      if (lastCand) config.onCandidateChosen?.({ profileId: lastCand.profileId, providerId: lastCand.providerId, modelId: lastCand.modelId });
+      if (exhaustedNetwork) throw exhaustedNetworkError(lastErr);
       throw lastErr;
     },
 

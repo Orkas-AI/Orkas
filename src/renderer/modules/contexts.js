@@ -1,5 +1,5 @@
 const _contextsLog = createLogger('contexts');
-// ─── Knowledge base (contexts) ───
+// ─── Library (contexts) ───
 // Single user-owned directory tree at `<uid>/cloud/contexts/`.
 // Mutations (write / upload / mkdir / rename / delete) hit the backend directly;
 // the backend enqueues `kb_indexer` jobs that produce status transitions
@@ -17,6 +17,8 @@ let _ctxPendingRename = null;       // {path} — flagged for inline-rename on t
                                     // "rename" item).
 let _kbStatusByPath = {};           // {[path]: {status, chunks?, error?, kind?}}
 let _kbEventsAbort = null;
+let _kbStatusRefreshTimer = null;
+let _kbReconcileInFlight = false;
 
 function _ctxUiIconHtml(name, className) {
   if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
@@ -34,28 +36,72 @@ async function loadContexts() {
     const treeData = await treeRes.json();
     const kbData = await kbRes.json().catch(() => ({ ok: false }));
     if (treeData.ok) _ctxTree = treeData.tree || [];
-    if (kbData.ok) {
-      const next = {};
-      for (const f of kbData.files || []) {
-        next[f.path] = {
-          status: f.status, chunks: f.chunks, error: f.error, kind: f.kind,
-        };
-      }
-      // Any file that's physically on disk (tree) but not yet in kb_files
-      // (backend status response) is queued behind the kb_indexer worker —
-      // show 'pending' instead of leaving the chip blank. Without this, a
-      // multi-file upload would silently have all-but-the-first file look
-      // fully processed until the worker actually reached them.
-      for (const p of _collectCtxFilePaths(_ctxTree)) {
-        if (!next[p]) next[p] = { status: 'pending' };
-      }
-      _kbStatusByPath = next;
-    }
+    if (kbData.ok) _kbStatusByPath = _buildKbStatusMap(_ctxTree, kbData.files || []);
     renderCtxTree();
     _ensureKbEventSubscription();
+    _kickKbReconcileIfNeeded();
+    _scheduleKbStatusRefreshIfNeeded();
   } catch (e) {
     _contextsLog.error('load contexts failed', e);
   }
+}
+
+function _buildKbStatusMap(tree, statusRows) {
+  const next = {};
+  for (const f of statusRows || []) {
+    if (!f || !f.path) continue;
+    next[f.path] = {
+      status: f.status, chunks: f.chunks, error: f.error, kind: f.kind,
+    };
+  }
+  // Any file that's physically on disk (tree) but not yet in kb_files is
+  // either newly synced/dropped in or waiting behind the indexer queue. Mark
+  // it pending, then the reconcile + snapshot refresh loop below will either
+  // start the job or clear the chip once the DB says ready.
+  for (const p of _collectCtxFilePaths(tree)) {
+    if (!next[p]) next[p] = { status: 'pending' };
+  }
+  return next;
+}
+
+function _hasActiveKbStatuses() {
+  return Object.values(_kbStatusByPath || {}).some((st) =>
+    st && (st.status === 'pending' || st.status === 'processing'));
+}
+
+function _kickKbReconcileIfNeeded() {
+  if (_kbReconcileInFlight || !_hasActiveKbStatuses()) return;
+  _kbReconcileInFlight = true;
+  apiFetch('/api/kb/reconcile', { method: 'POST' })
+    .then(() => _refreshKbStatusSnapshot())
+    .catch((err) => _contextsLog.warn('kb reconcile failed', err))
+    .finally(() => {
+      _kbReconcileInFlight = false;
+      _scheduleKbStatusRefreshIfNeeded();
+    });
+}
+
+async function _refreshKbStatusSnapshot() {
+  const res = await apiFetch('/api/kb/status');
+  const data = await res.json().catch(() => ({ ok: false }));
+  if (!data.ok) return;
+  _kbStatusByPath = _buildKbStatusMap(_ctxTree, data.files || []);
+  renderCtxTree();
+}
+
+function _scheduleKbStatusRefreshIfNeeded() {
+  if (_kbStatusRefreshTimer || !_hasActiveKbStatuses()) return;
+  if (typeof currentView !== 'undefined' && currentView !== 'contexts') return;
+  _kbStatusRefreshTimer = setTimeout(async () => {
+    _kbStatusRefreshTimer = null;
+    if (typeof currentView !== 'undefined' && currentView !== 'contexts') return;
+    try { await _refreshKbStatusSnapshot(); }
+    catch (err) { _contextsLog.warn('kb status refresh failed', err); }
+    if (_hasActiveKbStatuses()) {
+      _kickKbReconcileIfNeeded();
+      _scheduleKbStatusRefreshIfNeeded();
+    }
+  }, 2000);
 }
 
 // ── KB event subscription ──
@@ -99,7 +145,13 @@ function _ensureKbEventSubscription() {
     } catch (err) {
       if (!controller.signal.aborted) _contextsLog.warn('kb events stream dropped', err);
     } finally {
+      const wasAborted = controller.signal.aborted;
       _kbEventsAbort = null;
+      if (!wasAborted) {
+        setTimeout(() => {
+          if (!_kbEventsAbort) loadContexts();
+        }, 1000);
+      }
     }
   })();
 }
@@ -134,6 +186,7 @@ function _applyKbEvent(ev) {
   } else {
     renderCtxTree();
   }
+  _scheduleKbStatusRefreshIfNeeded();
 }
 
 function _cssEscape(s) {
@@ -167,15 +220,31 @@ function _collectCtxFilePaths(nodes, out = []) {
 
 // ── Tree render ──
 
+// Total file count across the tree — drives the new Surface D page-header
+// count + tree-column count chips. Cheap O(n) walk over the in-memory tree.
+function _ctxTotalFiles() {
+  try { return _collectCtxFilePaths(_ctxTree).length; } catch (_) { return 0; }
+}
+function _refreshCtxCounts() {
+  const n = _ctxTotalFiles();
+  const treeEl = document.getElementById('contexts-tree-count');
+  if (treeEl) treeEl.textContent = n > 0 ? String(n) : '';
+}
+
 function renderCtxTree() {
   const container = document.getElementById('contexts-tree');
-  if (!container) return;
+  if (!container) {
+    _refreshCtxCounts();
+    return;
+  }
   if (!_ctxTree.length) {
     container.innerHTML = `<div class="empty">${escapeHtml(t('contexts.empty'))}</div>`;
+    _refreshCtxCounts();
     return;
   }
   container.innerHTML = _renderCtxNodes(_ctxTree);
   _bindCtxTreeHandlers(container);
+  _refreshCtxCounts();
 }
 
 function _renderCtxNodes(nodes, depth = 0) {
@@ -198,7 +267,7 @@ function _renderCtxNodes(nodes, depth = 0) {
       return `
         <div class="ctx-tree-wrap" data-path="${escapeHtml(n.path)}" data-type="dir" draggable="true">
           <div class="skill-tree-node skill-tree-dir" style="padding-left:${indent}px">
-            <span class="${caretCls}">▶</span>
+            <span class="${caretCls}"></span>
             <span class="skill-tree-icon icon-folder">${icon}</span>
             ${labelHtml}
             <button type="button" class="ctx-row-menu-btn" data-menu title="${moreTitle}" aria-label="${moreTitle}">⋯</button>
@@ -361,6 +430,9 @@ function _bindCtxTreeHandlers(container) {
 
 async function reprocessCtxKbFile(rel) {
   try {
+    _kbStatusByPath[rel] = { ...(_kbStatusByPath[rel] || {}), status: 'pending' };
+    _updateCtxKbChip(rel);
+    _scheduleKbStatusRefreshIfNeeded();
     const res = await apiFetch('/api/kb/reprocess', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -370,6 +442,20 @@ async function reprocessCtxKbFile(rel) {
     if (!data.ok) await uiAlert(data.error || t('contexts.kb.reprocess_failed'));
   } catch (e) {
     await uiAlert(t('contexts.kb.reprocess_failed_with', { reason: e.message || e }));
+  }
+}
+
+function _updateCtxKbChip(rel) {
+  const row = document.querySelector(`.contexts-tree .ctx-tree-wrap[data-path="${_cssEscape(rel)}"] > .skill-tree-node`);
+  if (!row) { renderCtxTree(); return; }
+  const existing = row.querySelector('.ctx-kb-chip');
+  const html = _kbStatusChipHtml(rel);
+  if (existing) {
+    if (html) existing.outerHTML = html;
+    else existing.remove();
+  } else if (html) {
+    const menuBtn = row.querySelector('.ctx-row-menu-btn');
+    if (menuBtn) menuBtn.insertAdjacentHTML('beforebegin', html);
   }
 }
 
@@ -486,7 +572,6 @@ function _ctxMenuItemsFor(kind, relPath) {
   if (kind === 'root') {
     return [
       { action: 'new_text',   label: t('contexts.menu.new_text') },
-      { action: 'new_todo',   label: t('contexts.menu.new_todo') },
       { action: 'new_folder', label: t('contexts.menu.new_folder') },
       { action: 'upload',     label: t('contexts.menu.upload') },
     ];
@@ -494,7 +579,6 @@ function _ctxMenuItemsFor(kind, relPath) {
   if (kind === 'dir') {
     return [
       { action: 'new_text',   label: t('contexts.menu.new_text') },
-      { action: 'new_todo',   label: t('contexts.menu.new_todo') },
       { action: 'new_folder', label: t('contexts.menu.new_folder') },
       { action: 'upload',     label: t('contexts.menu.upload') },
       { action: 'rename',     label: t('contexts.menu.rename') },
@@ -513,14 +597,13 @@ function _ctxMenuItemsFor(kind, relPath) {
 }
 
 async function _runCtxMenuAction(action, kind, relPath) {
-  const dirArg = kind === 'root' ? '' : relPath;  // for new_text / new_todo / new_folder / upload
+  const dirArg = kind === 'root' ? '' : relPath;  // for new_text / new_folder / upload
   switch (action) {
     case 'new_text':   return createCtxNewTextFile(dirArg);
     case 'new_todo':   return createCtxNewTodoFile(dirArg);
     case 'new_folder': return promptCtxNewInDir(dirArg);
     case 'upload': {
-      const input = document.getElementById('ctx-file-input');
-      if (input) { input.dataset.targetDir = dirArg; input.click(); }
+      await handleCtxNativeUpload(dirArg);
       return;
     }
     case 'rename':     return renameCtxEntry(relPath, kind);
@@ -556,10 +639,45 @@ async function _handleCtxMove(srcRel, targetDir) {
     if (_ctxActive && _ctxActive.id === srcRel) _ctxActive.id = dst;
     if (_ctxExpanded.has(srcRel)) { _ctxExpanded.delete(srcRel); _ctxExpanded.add(dst); }
     if (targetDir) _ctxExpanded.add(targetDir);
+    // Re-key drafts + retarget viewer the same way `_commitInlineRename`
+    // does — drag-drop moves are renames too as far as the open viewer
+    // is concerned.
+    for (const [key, val] of Array.from(_ctxDrafts.entries())) {
+      if (key === srcRel) {
+        _ctxDrafts.set(dst, val);
+        _ctxDrafts.delete(srcRel);
+      } else if (key.startsWith(srcRel + '/')) {
+        _ctxDrafts.set(dst + key.slice(srcRel.length), val);
+        _ctxDrafts.delete(key);
+      }
+    }
+    _retargetCtxViewerAfterRename(srcRel, dst);
     await loadContexts();
   } catch (e) {
     await uiAlert(t('contexts.entry.rename_failed_with', { reason: e.message || e }));
   }
+}
+
+/** If the right-pane md viewer is showing the renamed file (or any file
+ *  nested under a renamed directory), update the controller's internal
+ *  source.rel + the path label so the next save PUTs the correct path.
+ *  Without this, an inline-rename or drag-drop move while the file is
+ *  open in edit mode causes the next save to hit the backend with the
+ *  stale path and the user gets `not found: <old path>`. The viewer is
+ *  intentionally not re-rendered — the draft + cursor state stay put. */
+function _retargetCtxViewerAfterRename(oldRel, newRel) {
+  if (!_ctxMveController || typeof _ctxMveController.getSource !== 'function') return;
+  const src = _ctxMveController.getSource();
+  if (!src || src.kind !== 'context' || typeof src.rel !== 'string') return;
+  let nextRel = null;
+  if (src.rel === oldRel) nextRel = newRel;
+  else if (src.rel.startsWith(oldRel + '/')) nextRel = newRel + src.rel.slice(oldRel.length);
+  if (!nextRel) return;
+  if (typeof _ctxMveController.setSource === 'function') {
+    _ctxMveController.setSource({ ...src, rel: nextRel });
+  }
+  const pathEl = document.getElementById('contexts-editor-path');
+  if (pathEl) pathEl.textContent = nextRel;
 }
 
 // Inline-rename commit (invoked by the tree's inline-rename input on Enter
@@ -596,6 +714,7 @@ async function _commitInlineRename(rel, nextBase) {
         _ctxDrafts.delete(key);
       }
     }
+    _retargetCtxViewerAfterRename(rel, dst);
     await loadContexts();
   } catch (e) {
     await uiAlert(t('contexts.entry.rename_failed_with', { reason: e.message || e }));
@@ -740,6 +859,11 @@ function _ctxListChildren(dirPath) {
 
 const CTX_ALLOWED_EXTS = [
   '.md', '.markdown', '.txt', '.csv', '.tsv', '.json', '.yaml', '.yml', '.log',
+  '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
+  '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.sh', '.bash', '.zsh', '.rb', '.go', '.rs', '.java', '.kt',
+  '.c', '.cpp', '.cc', '.h', '.hpp', '.css', '.scss', '.less',
+  '.sql', '.graphql', '.gql',
   '.pdf', '.docx', '.png', '.jpg', '.jpeg', '.webp', '.gif',
 ];
 
@@ -816,6 +940,33 @@ async function handleCtxUpload(fileList, targetDir = '') {
   }
 }
 
+async function handleCtxNativeUpload(targetDir = '') {
+  if (targetDir) _ctxExpanded.add(targetDir);
+  const statusEl = document.getElementById('ctx-upload-status');
+  const labelEl = document.getElementById('ctx-upload-status-label');
+  if (statusEl && labelEl) {
+    labelEl.textContent = t('contexts.upload.in_progress', { count: 1 });
+    statusEl.style.display = '';
+  }
+  let data;
+  try {
+    data = await window.orkas.invoke('contexts.pickAndUpload', { targetDir });
+    await loadContexts();
+  } catch (err) {
+    _contextsLog.warn('native upload failed', err);
+    await uiAlert(err.message || String(err));
+    return;
+  } finally {
+    if (statusEl) statusEl.style.display = 'none';
+  }
+  const files = Array.isArray(data && data.files) ? data.files : [];
+  const failed = files.filter((r) => !r || r.ok === false);
+  if (failed.length) {
+    const list = failed.map((r) => `${r.name || ''}: ${r.error || r.reason || 'unknown'}`).join('\n');
+    await uiAlert(t('contexts.upload_failed', { name: list }));
+  }
+}
+
 // ── Viewer (right pane) ──
 // Dispatches on file extension:
 //   - text kinds        → markdown editor (read + edit + delete)
@@ -826,6 +977,11 @@ async function handleCtxUpload(fileList, targetDir = '') {
 
 const CTX_TEXT_EXTS = new Set([
   '.md', '.markdown', '.txt', '.csv', '.tsv', '.json', '.yaml', '.yml', '.log',
+  '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
+  '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
+  '.sh', '.bash', '.zsh', '.rb', '.go', '.rs', '.java', '.kt',
+  '.c', '.cpp', '.cc', '.h', '.hpp', '.css', '.scss', '.less',
+  '.sql', '.graphql', '.gql',
 ]);
 const CTX_IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 
@@ -1098,21 +1254,6 @@ function initCtxBindings() {
     e.stopPropagation();
     _openCtxRowMenu(e.currentTarget, 'root', '');
   });
-  // Hidden file input — both the root menu's "upload file" item and any
-  // folder row's "upload file" route through here. Target dir is stashed on dataset before
-  // .click() so this single handler routes correctly.
-  document.getElementById('ctx-file-input')?.addEventListener('change', async (ev) => {
-    const input = ev.target;
-    const files = input.files;
-    const targetDir = input.dataset.targetDir || '';
-    try {
-      await handleCtxUpload(files, targetDir);
-    } finally {
-      input.value = '';
-      input.dataset.targetDir = '';
-    }
-  });
-
   // Global menu dismissers — outside click / Esc / scroll / resize / i18n.
   document.addEventListener('click', (e) => {
     const menu = document.getElementById('ctx-row-menu');

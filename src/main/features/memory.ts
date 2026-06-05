@@ -20,8 +20,8 @@ import { createLogger } from '../logger';
 const log = createLogger('memory');
 
 // ── Constants ────────────────────────────────────────────────────────────
-export const MEMORY_CHAR_LIMIT = 2200;   // ~800 tokens
-export const USER_CHAR_LIMIT   = 1375;   // ~500 tokens
+export const MEMORY_CHAR_LIMIT = 2500;   // facts: keep room for several durable notes
+export const USER_CHAR_LIMIT   = 1500;   // profile/preferences: should stay concise
 export const ENTRY_SEPARATOR   = '\n§\n';
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -185,119 +185,120 @@ export function clearMemory(userId: string, target: 'memory' | 'user'): void {
   }
 }
 
-// ── System prompt guidance (always injected) ─────────────────────────────
+// ── Import parsing (read-only classifier for the UI import flow) ───────────
+//
+// Splits pasted/imported text into candidate entries, runs the SAME
+// `scanForInjection` the write path uses, and heuristically guesses each
+// entry's target + a cosmetic display "kind". This is advisory only — the
+// user confirms every target in the review step and the actual merge goes
+// through `addEntry` (which re-scans, dedups, and truncates). Adds no new
+// limit / separator / scanner behaviour.
 
-const MEMORY_GUIDANCE = [
-  '## Cross-session memory',
-  '',
-  'You have persistent memory across sessions via the `cross_session_memory` tool. Memory persists across conversations.',
-  '',
-  '⚠️ Core principle: when the user shares any personal information, you MUST immediately call the cross_session_memory tool to save it — not just acknowledge it verbally. Not calling the tool = forgetting.',
-  '',
-  '**You MUST call the tool in these situations (verbal acknowledgment alone = forgetting, strictly forbidden):**',
-  '- User explicitly says "remember", "make a note", "don\'t forget"',
-  '- User corrects your behavior ("don\'t do that", "from now on please…")',
-  '- User shares personal preferences, interests, or habits → target="user"',
-  '  e.g. "I like basketball", "I love coffee", "my hobby is swimming", "I\'m an early riser", "I dislike overtime"',
-  '- User reveals their role, profession, or identity → target="user"',
-  '  e.g. "I\'m a product manager", "I\'m a founder", "I\'m a student"',
-  '- User mentions tech preferences or tool choices → target="user"',
-  '  e.g. "I use VS Code", "I prefer TypeScript", "we use React"',
-  '- User describes their personality or communication style → target="user"',
-  '  e.g. "I\'m direct", "I prefer concise answers"',
-  '',
-  '**Rule of thumb: whenever the user\'s words contain a self-disclosing phrase like "I like / I love / I prefer / I usually / I dislike / I hate / I am / I\'m working on / my hobby / I tend to" — or its equivalent in any other language — you MUST call the tool with target="user". Better to over-save than to miss.**',
-  '',
-  '**You should proactively call the tool in these situations (target="memory"):**',
-  '- Important decisions or milestones ("we decided to use X", "the project has shipped")',
-  '- Project conventions or environment info ("deployed on AWS", "uses PostgreSQL")',
-  '',
-  '**Do NOT save:**',
-  '- One-off debugging details',
-  '- Large code blocks or raw log dumps',
-  '',
-  'Two targets:',
-  '- `memory`: your notes (facts, decisions, milestones, project conventions)',
-  '- `user`: user profile (role, preferences, interests, communication style, tech stack)',
-].join('\n');
+export interface ParsedImportEntry {
+  text: string;
+  target: 'memory' | 'user';
+  kind: string;
+  threat: string | null;
+}
 
-/**
- * Format memory guidance + existing entries as a system prompt block.
- * Always includes guidance so the LLM knows it has persistent memory,
- * even when there are no entries yet.
- */
-export function formatForSystemPrompt(userId: string): string {
-  const memEntries = loadEntries(userMemoryFile(userId));
-  const userEntries = loadEntries(userProfileFile(userId));
+// First-person self-disclosure → user profile (en + zh). Advisory only — the
+// user confirms every target in the import-review step before merge.
+const USER_HINTS: Array<{ re: RegExp; kind: string }> = [
+  { re: /\b(i am|i'm|my name is|i work as)\b/i, kind: 'identity' },
+  { re: /(我是|我叫|我的名字|我在.*(工作|做))/, kind: 'identity' },
+  { re: /\b(i (like|love|enjoy|prefer|usually|tend to|dislike|hate))\b/i, kind: 'preference' },
+  { re: /(喜欢|偏好|讨厌|不喜欢|习惯|倾向)/, kind: 'preference' },
+  { re: /\b(i('m| am)? (direct|concise|brief)|communication style)\b/i, kind: 'comm-style' },
+  { re: /(沟通风格|说话风格|先给结论|不要寒暄)/, kind: 'comm-style' },
+  { re: /\b(i use|we use|my stack|i code in|typescript|python|react|vs ?code)\b/i, kind: 'tech-stack' },
+  { re: /(技术栈|主力设备|常用.*(目录|工具|语言)|我用)/, kind: 'tech-stack' },
+];
 
-  const parts: string[] = [MEMORY_GUIDANCE];
+// Decisions / milestones / conventions → facts (target="memory").
+const MEMORY_HINTS: Array<{ re: RegExp; kind: string }> = [
+  { re: /\b(we |i )?(decided|chose|agreed)\b/i, kind: 'decision' },
+  { re: /(决定|选定|定下|敲定)/, kind: 'decision' },
+  { re: /\b(shipped|launched|released|milestone|deadline)\b/i, kind: 'milestone' },
+  { re: /(上线|发布|里程碑|周报|截止)/, kind: 'milestone' },
+  { re: /\b(deployed on|uses (aws|postgres|mysql)|convention|the project)\b/i, kind: 'convention' },
+  { re: /(约定|规范|项目.*(用|约定)|部署在|环境)/, kind: 'convention' },
+];
 
-  if (memEntries.length > 0) {
-    parts.push('### Current MEMORY entries');
-    parts.push(memEntries.map(e => e.text).join(ENTRY_SEPARATOR));
+function classifyImportEntry(text: string): { target: 'memory' | 'user'; kind: string } {
+  for (const { re, kind } of MEMORY_HINTS) {
+    if (re.test(text)) return { target: 'memory', kind };
   }
-  if (userEntries.length > 0) {
-    parts.push('### Current USER entries');
-    parts.push(userEntries.map(e => e.text).join(ENTRY_SEPARATOR));
+  for (const { re, kind } of USER_HINTS) {
+    if (re.test(text)) return { target: 'user', kind };
   }
-
-  if (memEntries.length === 0 && userEntries.length === 0) {
-    parts.push('_(no memory entries yet)_');
-  }
-
-  return parts.join('\n\n');
+  // Default to user profile when nothing matches: a misfiled preference is
+  // cheaper to fix than a task-state note landing in long-term facts, and the
+  // user re-checks every target in the review step anyway.
+  return { target: 'user', kind: 'preference' };
 }
 
 /**
- * Extract key facts from a compaction summary and save to MEMORY.md.
- *
- * Called asynchronously after context compaction — should not block the
- * main conversation stream. Uses an LLM call to extract facts.
+ * Parse free-form imported text into candidate memory entries. Splits on blank
+ * lines first (paragraph blocks), then on single line breaks, then trims +
+ * drops empties + dedups. Each candidate is scanned for injection and given an
+ * advisory target/kind. Bullet / list markers are stripped from the head.
  */
-export async function extractAndSaveCompactFacts(
-  userId: string,
-  summary: string,
-): Promise<void> {
-  if (!summary.trim()) return;
-
-  // Lazy-import to avoid circular deps (features -> model -> features)
-  const { chatWithModel } = await import('../model/client');
-  const { prompts } = await import('../prompts/loader');
-
-  const extractPrompt = prompts.load('memory_extract', { summary });
-  if (!extractPrompt) {
-    log.warn('memory_extract prompt template not found; skipping fact extraction');
-    return;
+export function parseImportText(text: string): ParsedImportEntry[] {
+  if (!text || !text.trim()) return [];
+  const seen = new Set<string>();
+  const out: ParsedImportEntry[] = [];
+  // Blank-line-separated blocks, then per-line within a block — covers both
+  // prose paragraphs and one-fact-per-line note dumps.
+  const blocks = text.split(/\n\s*\n+/);
+  const candidates: string[] = [];
+  for (const block of blocks) {
+    for (const line of block.split(/\n/)) {
+      candidates.push(line);
+    }
   }
-
-  // Use a throwaway session for the extraction call
-  const result = await chatWithModel({
-    userId,
-    message: extractPrompt,
-    sessionId: `memory-extract-${Date.now()}`,
-    systemPrompt: 'You are a fact extraction assistant. Follow the instructions strictly and do not add any extra content.',
-  });
-
-  if (!result.ok || !result.text.trim()) {
-    log.warn(`compact fact extraction failed: ${result.error || 'empty response'}`);
-    return;
+  for (const raw of candidates) {
+    // Strip leading list markers ("- ", "* ", "1. ", "• ") and surrounding ws.
+    const trimmed = raw.replace(/^\s*(?:[-*•]|\d+[.)])\s+/, '').trim();
+    if (!trimmed) continue;
+    if (seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    const { target, kind } = classifyImportEntry(trimmed);
+    out.push({ text: trimmed, target, kind, threat: scanForInjection(trimmed) });
   }
+  return out;
+}
 
-  // Parse output: one fact per line, lines starting with "- "
-  const lines = result.text.split('\n')
-    .map(l => l.trim())
-    .filter(l => l.startsWith('- '))
-    .map(l => l.slice(2).trim())
-    .filter(Boolean);
+// ── System prompt block (read side) ──────────────────────────────────────
 
-  let added = 0;
-  for (const fact of lines) {
-    const res = addEntry(userId, 'memory', fact);
-    if (res.ok) added++;
-    else break; // likely at char limit
+/**
+ * Render the user's existing memory as a system-prompt block so the model has
+ * it as background context every turn. READ side only — it does NOT teach the
+ * model when to write; the `cross_session_memory` tool's own description owns
+ * the save/skip rules (single source, kept tight). Returns '' when there is
+ * nothing stored, so new users pay zero prompt tokens and we never inject a
+ * "(no entries)" placeholder.
+ *
+ * Injected by `runner.ts::buildRunner` for any session with a uid. The system
+ * prompt is rebuilt every turn, so this re-reads from disk each turn — a model
+ * write mid-conversation is visible on the next turn (cache re-prefills only on
+ * the rare write turns; writes are infrequent by design).
+ */
+export function formatForSystemPrompt(userId: string): string {
+  const userEntries = loadEntries(userProfileFile(userId));
+  const memEntries = loadEntries(userMemoryFile(userId));
+  if (userEntries.length === 0 && memEntries.length === 0) return '';
+
+  const parts: string[] = [
+    '## What you already know about this user',
+    'Persistent across sessions — treat as background context. Keep it current with the `cross_session_memory` tool when the user corrects or adds something.',
+  ];
+  if (userEntries.length > 0) {
+    parts.push('### User profile (role, preferences, communication style, tech stack)');
+    parts.push(userEntries.map(e => e.text).join(ENTRY_SEPARATOR));
   }
-
-  if (added > 0) {
-    log.info(`extracted ${added} facts from compaction summary for user ${userId}`);
+  if (memEntries.length > 0) {
+    parts.push('### Notes (durable facts, decisions, conventions)');
+    parts.push(memEntries.map(e => e.text).join(ENTRY_SEPARATOR));
   }
+  return parts.join('\n\n');
 }

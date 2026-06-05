@@ -116,9 +116,9 @@ sleep 10
 read prompt
 cat <<'EOF'
 {"type":"system","subtype":"init","session_id":"s-acc","cwd":"/x"}
-{"type":"assistant","message":{"model":"claude-sonnet-4-6","content":[{"type":"text","text":"part 1"}],"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":1000,"cache_creation_input_tokens":20}}}
-{"type":"assistant","message":{"model":"claude-sonnet-4-6","content":[{"type":"text","text":"part 2"}],"usage":{"input_tokens":10,"output_tokens":40,"cache_read_input_tokens":1100,"cache_creation_input_tokens":0}}}
-{"type":"result","subtype":"success","result":"done","usage":{"input_tokens":110,"output_tokens":90,"cache_read_input_tokens":2100,"cache_creation_input_tokens":20},"total_cost_usd":0.0234,"message":{"model":"claude-sonnet-4-6"}}
+{"type":"assistant","message":{"model":"claude-opus-4-7","content":[{"type":"text","text":"part 1"}],"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":1000,"cache_creation_input_tokens":20}}}
+{"type":"assistant","message":{"model":"claude-opus-4-7","content":[{"type":"text","text":"part 2"}],"usage":{"input_tokens":10,"output_tokens":40,"cache_read_input_tokens":1100,"cache_creation_input_tokens":0}}}
+{"type":"result","subtype":"success","result":"done","usage":{"input_tokens":110,"output_tokens":90,"cache_read_input_tokens":2100,"cache_creation_input_tokens":20},"total_cost_usd":0.0234,"message":{"model":"claude-opus-4-7"}}
 EOF
 `);
     const events: any[] = [];
@@ -133,7 +133,7 @@ EOF
     const usageEvents = events.filter(e => e.type === 'status' && e.status === 'usage');
     expect(usageEvents).toHaveLength(2);
     expect(usageEvents[0].usage).toMatchObject({
-      input: 100, output: 50, cacheRead: 1000, cacheCreate: 20, model: 'claude-sonnet-4-6',
+      input: 100, output: 50, cacheRead: 1000, cacheCreate: 20, model: 'claude-opus-4-7',
     });
     // Second one should be the cumulative running total.
     expect(usageEvents[1].usage).toMatchObject({

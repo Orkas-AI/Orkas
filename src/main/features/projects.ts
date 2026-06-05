@@ -47,8 +47,10 @@ import {
 import { nowIso, readJson, writeJson } from '../storage';
 import { createLogger } from '../logger';
 import * as chats from './chats';
+import * as autoTasks from './auto_tasks';
 import { readState } from './group_chat/state';
 import { purgeProjectWorkspace } from './user_workspace';
+import { limitNameDisplayText } from '../util/name-limit';
 
 const log = createLogger('projects');
 
@@ -201,19 +203,15 @@ async function _writeBindings(uid: string, pid: string, b: ProjectBindings): Pro
 // file should kick the sync debounce so the change propagates within seconds rather than the
 // 5-min periodic.
 function _notifyDirty(): void {
-  // features/sync stripped from the OrkasOpen build — no-op.
 }
 
 // ── Validation ────────────────────────────────────────────────────────────
 
-const NAME_MAX_LEN = 60;
-
 /** Trim + length cap. Returns null if the input is unusable. */
 function normName(raw: unknown): string | null {
   if (typeof raw !== 'string') return null;
-  const s = raw.trim();
+  const s = limitNameDisplayText(raw.trim());
   if (!s) return null;
-  if (s.length > NAME_MAX_LEN) return s.slice(0, NAME_MAX_LEN);
   return s;
 }
 
@@ -300,14 +298,16 @@ export async function renameProject(
 
 /** Cascade-delete: every conversation under this project is dropped (full
  *  per-conv cascade — `<cid>.jsonl` / sessions / attachments / search idx /
- *  group dir / cli sessions), then the project directory itself.
+ *  group dir / cli sessions), every auto task scoped to this project is
+ *  dropped (config + attachments dir + scheduled timer cancelled via
+ *  `auto_tasks.deleteTask`), then the project directory itself.
  *
  *  Aborts upfront if any conv is currently `running` (state.json::status). The
  *  user must stop the in-flight turn first; we do not silently abort. */
 export async function deleteProject(
   uid: string,
   projectId: string,
-): Promise<{ ok: true; deleted_convs: number } | { ok: false; error: ProjectError }> {
+): Promise<{ ok: true; deleted_convs: number; deleted_auto_tasks: number } | { ok: false; error: ProjectError }> {
   await _ensurePromoted(uid);
   const cur = await _readProject(uid, projectId);
   if (!cur) return { ok: false, error: 'not_found' };
@@ -335,6 +335,24 @@ export async function deleteProject(
     }
   }
 
+  // Cascade-delete project-scoped auto tasks (config dir + attachments +
+  // cancel the per-task timer in the scheduler). `deleteTask` is idempotent
+  // and `rm -rf`s the whole `<uid>/cloud/auto_tasks/<task_id>/` directory.
+  let deletedAutoTasks = 0;
+  try {
+    const ownedTasks = await autoTasks.listTasks(uid, { projectId });
+    for (const t of ownedTasks) {
+      try {
+        const res = await autoTasks.deleteTask(uid, t.id);
+        if (res.ok) deletedAutoTasks++;
+      } catch (err) {
+        log.warn(`cascade auto-task del user=${uid} pid=${projectId} task=${t.id}: ${(err as Error).message}`);
+      }
+    }
+  } catch (err) {
+    log.warn(`enumerate auto tasks user=${uid} pid=${projectId}: ${(err as Error).message}`);
+  }
+
   // Drop the per-project workspace selection (machine-private; no cascade
   // needed beyond removing the dangling pid → path entry).
   try { purgeProjectWorkspace(uid, projectId); }
@@ -349,8 +367,8 @@ export async function deleteProject(
     log.warn(`drop project dir user=${uid} pid=${projectId}: ${(err as Error).message}`);
   }
 
-  log.info(`deleted user=${uid} pid=${projectId} convs=${deletedConvs}`);
-  return { ok: true, deleted_convs: deletedConvs };
+  log.info(`deleted user=${uid} pid=${projectId} convs=${deletedConvs} auto_tasks=${deletedAutoTasks}`);
+  return { ok: true, deleted_convs: deletedConvs, deleted_auto_tasks: deletedAutoTasks };
 }
 
 /** True iff the given pid is a known project for this user. Used by

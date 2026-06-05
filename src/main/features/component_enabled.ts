@@ -10,7 +10,12 @@
  * {
  *   "version": 1,
  *   "agents": { "<agent_id>": false, ... },
- *   "skills": { "<skill_id>": false, ... }
+ *   "skills": { "<skill_id>": false, ... },
+ *   "_item_updated_at": {
+ *     "agents": { "<agent_id>": 1710000000000, ... },
+ *     "skills": { "<skill_id>": 1710000000000, ... },
+ *     "connectors": { "<connector_id>": 1710000000000, ... }
+ *   }
  * }
  * ```
  *
@@ -43,9 +48,10 @@ import { createLogger } from '../logger';
 
 const log = createLogger('component-enabled');
 
-// features/sync is stripped from the OrkasOpen build — markDirty is a no-op.
+// Lazy require sync: the module is stripped from OrkasOpen builds, and a static import would
+// break that build at module-load time. When sync is absent we silently no-op — the file
+// still sits at `cloud/config/` for whenever sync becomes available.
 function _notifyDirty(): void {
-  /* no-op */
 }
 
 const SCHEMA_VERSION = 1;
@@ -59,10 +65,17 @@ export interface ComponentEnabledFile {
    *  the LLM (`resolveVisibleConnectors` filters it out). "Disconnect" (manager.removeInstance)
    *  is the heavier action that wipes the grant. */
   connectors: Record<string, boolean>;
+  /** Per-item clocks for sync merge. A key may exist here even when the
+   *  override is absent, meaning "explicitly enabled after a previous disable". */
+  _item_updated_at?: {
+    agents?: Record<string, number>;
+    skills?: Record<string, number>;
+    connectors?: Record<string, number>;
+  };
 }
 
 function emptyFile(): ComponentEnabledFile {
-  return { version: SCHEMA_VERSION, agents: {}, skills: {}, connectors: {} };
+  return { version: SCHEMA_VERSION, agents: {}, skills: {}, connectors: {}, _item_updated_at: {} };
 }
 
 /** Read the per-user enabled-overrides file. Missing / corrupt → empty defaults.
@@ -80,11 +93,32 @@ export function readEnabledMap(uid: string): ComponentEnabledFile {
       agents: (parsed.agents && typeof parsed.agents === 'object') ? sanitiseMap(parsed.agents) : {},
       skills: (parsed.skills && typeof parsed.skills === 'object') ? sanitiseMap(parsed.skills) : {},
       connectors: (parsed.connectors && typeof parsed.connectors === 'object') ? sanitiseMap(parsed.connectors) : {},
+      _item_updated_at: sanitiseClocks(parsed._item_updated_at),
     };
   } catch (err) {
     log.warn(`read failed, using empty defaults: ${(err as Error).message}`);
     return emptyFile();
   }
+}
+
+function sanitiseClocks(raw: unknown): ComponentEnabledFile['_item_updated_at'] {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const src = raw as Record<string, unknown>;
+  return {
+    agents: sanitiseClockMap(src.agents),
+    skills: sanitiseClockMap(src.skills),
+    connectors: sanitiseClockMap(src.connectors),
+  };
+}
+
+function sanitiseClockMap(raw: unknown): Record<string, number> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const n = Number(v);
+    if (typeof k === 'string' && k && Number.isFinite(n) && n > 0) out[k] = n;
+  }
+  return out;
 }
 
 function sanitiseMap(raw: Record<string, unknown>): Record<string, boolean> {
@@ -96,6 +130,23 @@ function sanitiseMap(raw: Record<string, unknown>): Record<string, boolean> {
     out[k] = false;
   }
   return out;
+}
+
+function touchClock(
+  file: ComponentEnabledFile,
+  kind: 'agents' | 'skills' | 'connectors',
+  id: string,
+): void {
+  const clocks = sanitiseClocks(file._item_updated_at) || {};
+  const bucket = { ...(clocks[kind] || {}) };
+  const maxExisting = Math.max(
+    0,
+    ...Object.values(clocks.agents || {}).map((v) => Number(v) || 0),
+    ...Object.values(clocks.skills || {}).map((v) => Number(v) || 0),
+    ...Object.values(clocks.connectors || {}).map((v) => Number(v) || 0),
+  );
+  bucket[id] = Math.max(Date.now(), maxExisting + 1);
+  file._item_updated_at = { ...clocks, [kind]: bucket };
 }
 
 function writeAtomic(uid: string, data: ComponentEnabledFile): void {
@@ -141,9 +192,11 @@ export function setAgentEnabled(uid: string, agentId: string, enabled: boolean):
     agents: { ...cur.agents },
     skills: { ...cur.skills },
     connectors: { ...cur.connectors },
+    _item_updated_at: sanitiseClocks(cur._item_updated_at),
   };
   if (enabled) delete next.agents[agentId];
   else next.agents[agentId] = false;
+  touchClock(next, 'agents', agentId);
   writeAtomic(uid, next);
   _notifyDirty();
   log.info(`agent ${agentId} → ${enabled ? 'enabled' : 'disabled'}`);
@@ -157,9 +210,11 @@ export function setSkillEnabled(uid: string, skillId: string, enabled: boolean):
     agents: { ...cur.agents },
     skills: { ...cur.skills },
     connectors: { ...cur.connectors },
+    _item_updated_at: sanitiseClocks(cur._item_updated_at),
   };
   if (enabled) delete next.skills[skillId];
   else next.skills[skillId] = false;
+  touchClock(next, 'skills', skillId);
   writeAtomic(uid, next);
   _notifyDirty();
   log.info(`skill ${skillId} → ${enabled ? 'enabled' : 'disabled'}`);
@@ -173,9 +228,11 @@ export function setConnectorEnabled(uid: string, connectorId: string, enabled: b
     agents: { ...cur.agents },
     skills: { ...cur.skills },
     connectors: { ...cur.connectors },
+    _item_updated_at: sanitiseClocks(cur._item_updated_at),
   };
   if (enabled) delete next.connectors[connectorId];
   else next.connectors[connectorId] = false;
+  touchClock(next, 'connectors', connectorId);
   writeAtomic(uid, next);
   _notifyDirty();
   log.info(`connector ${connectorId} → ${enabled ? 'enabled' : 'disabled'}`);

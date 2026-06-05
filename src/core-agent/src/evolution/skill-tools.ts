@@ -51,7 +51,7 @@ export function createSkillManageTool(
         },
         name: {
           type: "string",
-          description: "Human-readable skill name (max 64 chars). Required for create.",
+          description: "Human-readable skill name (max 60 ASCII chars or 30 CJK/Japanese chars). Required for create.",
         },
         description: {
           type: "string",

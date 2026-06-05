@@ -25,11 +25,36 @@
 import { createLogger } from '../../logger';
 import { t } from '../../i18n';
 import type { StreamEvent } from '../client';
+import { parseSkillPath } from '../../features/expert_signals/skill_path';
+import { userAgentsDir, userMarketplaceAgentsDir } from '../../paths';
+import * as path from 'node:path';
 
 const log = createLogger('model');
 
 type CA = typeof import('#core-agent');
 type AgentRunEvent = CA extends { AgentRunner: infer _ } ? import('#core-agent').AgentRunEvent : never;
+
+export interface MapCoreAgentEventsOptions {
+  userId?: string;
+  /** UI-only metadata collected while rendering the skills prompt block.
+   *  This avoids a second skill scan and does not change model-visible text. */
+  skillDisplayNameById?: ReadonlyMap<string, string>;
+  /** UI-only metadata collected before the run starts. Used to label
+   *  read_file(agent.json) process rows without scanning agents again. */
+  agentDisplayNameById?: ReadonlyMap<string, string>;
+}
+
+export interface SkillReadEventMetadata {
+  skill_id: string;
+  skill_name: string;
+  skill_system: 'A.custom' | 'A.platform' | 'B';
+}
+
+export interface AgentReadEventMetadata {
+  agent_id: string;
+  agent_name: string;
+  agent_system: 'custom' | 'marketplace';
+}
 
 /**
  * Short tool-result preview for the event log. Kept under ~300 chars so
@@ -84,10 +109,10 @@ export function friendlyRetryReason(reason: string): string {
   if (/\b(502|503|504)\b|bad gateway|service unavailable|gateway timeout/.test(r)) {
     return t('errors.network.unavailable');
   }
-  if (/\btimeout\b|etimedout|und_err_connect_timeout|und_err_headers_timeout|und_err_body_timeout/.test(r)) {
+  if (/\bcodex sse response headers timed out after \d+ms\b|\bsse response headers timed out\b|\bresponse headers? (timed out|timeout)\b|\bheaders? (timed out|timeout)\b|\btimed out\b|\btimeout\b|etimedout|und_err_connect_timeout|und_err_headers_timeout|und_err_body_timeout/.test(r)) {
     return t('errors.network.timeout');
   }
-  if (/\bterminated\b|socket hang up|fetch failed|econnreset|epipe|und_err_socket/.test(r)) {
+  if (/\bterminated\b|socket (hang up|closed|close)|fetch failed|websocket (error|closed|close)|\bws (error|closed|close)\b|connection (closed|close|reset|dropped|terminated)|stream (closed|close|interrupted|disconnected|reset|terminated)|premature close|err_stream_premature_close|econnreset|epipe|und_err_socket/.test(r)) {
     return t('errors.network.connection_dropped');
   }
   if (/rate.?limit|429|too many requests/.test(r)) return t('errors.network.rate_limited');
@@ -98,6 +123,92 @@ export function friendlyRetryReason(reason: string): string {
   return t('errors.network');
 }
 
+function toolInputPath(input: unknown): string {
+  if (!input) return '';
+  if (typeof input === 'string') return input;
+  if (typeof input !== 'object') return '';
+  const p = (input as Record<string, unknown>).path;
+  return typeof p === 'string' ? p : '';
+}
+
+export function skillReadMetadataForToolStart(
+  toolName: string,
+  input: unknown,
+  opts: MapCoreAgentEventsOptions = {},
+): SkillReadEventMetadata | null {
+  if (toolName !== 'read_file' || !opts.userId) return null;
+  const p = toolInputPath(input);
+  if (!p) return null;
+  const parsed = parseSkillPath(p, opts.userId);
+  if (!parsed) return null;
+  const display = opts.skillDisplayNameById?.get(parsed.skill_id) || parsed.skill_id;
+  return {
+    skill_id: parsed.skill_id,
+    skill_name: display,
+    skill_system: parsed.system,
+  };
+}
+
+export function agentReadMetadataForToolStart(
+  toolName: string,
+  input: unknown,
+  opts: MapCoreAgentEventsOptions = {},
+): AgentReadEventMetadata | null {
+  if (toolName !== 'read_file' || !opts.userId) return null;
+  const p = toolInputPath(input);
+  if (!p) return null;
+  const parsed = parseAgentJsonPath(p, opts.userId);
+  if (!parsed) return null;
+  const display = opts.agentDisplayNameById?.get(parsed.agent_id) || parsed.agent_id;
+  return {
+    agent_id: parsed.agent_id,
+    agent_name: display,
+    agent_system: parsed.system,
+  };
+}
+
+function skillReadEventFields(meta: SkillReadEventMetadata | null): Record<string, unknown> {
+  if (!meta) return {};
+  return {
+    skill_id: meta.skill_id,
+    skill_name: meta.skill_name,
+    skill_system: meta.skill_system,
+    skill_file: 'SKILL.md',
+  };
+}
+
+function agentReadEventFields(meta: AgentReadEventMetadata | null): Record<string, unknown> {
+  if (!meta) return {};
+  return {
+    agent_id: meta.agent_id,
+    agent_name: meta.agent_name,
+    agent_system: meta.agent_system,
+    agent_file: 'agent.json',
+  };
+}
+
+function parseAgentJsonPath(absPath: string, uid: string): { system: 'custom' | 'marketplace'; agent_id: string } | null {
+  if (!absPath || !uid) return null;
+  const abs = path.resolve(absPath);
+  if (path.basename(abs) !== 'agent.json') return null;
+
+  const custom = _tryAgentUnderRoot(abs, userAgentsDir(uid));
+  if (custom) return { system: 'custom', agent_id: custom };
+
+  const marketplace = _tryAgentUnderRoot(abs, userMarketplaceAgentsDir(uid));
+  if (marketplace) return { system: 'marketplace', agent_id: marketplace };
+
+  return null;
+}
+
+function _tryAgentUnderRoot(abs: string, root: string): string | null {
+  const rel = path.relative(path.resolve(root), abs);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  const segments = rel.split(path.sep);
+  if (segments.length !== 2 || segments[1] !== 'agent.json') return null;
+  return segments[0] || null;
+}
+
 /**
  * Consume a core-agent event stream and yield Orkas-shape events.
  * Does NOT yield the terminal `{type:'done'}` — the caller appends that
@@ -105,9 +216,12 @@ export function friendlyRetryReason(reason: string): string {
  */
 export async function* mapCoreAgentEvents(
   events: AsyncIterable<AgentRunEvent>,
+  opts: MapCoreAgentEventsOptions = {},
 ): AsyncGenerator<StreamEvent, { finalText: string; error: string | null }, unknown> {
   let finalText = '';
   let error: string | null = null;
+  const skillReadByToolId = new Map<string, SkillReadEventMetadata>();
+  const agentReadByToolId = new Map<string, AgentReadEventMetadata>();
 
   // Separator between turns (tool-loop interim commentary + final answer).
   // Inserted lazily on the first delta of a new turn so we don't append a
@@ -133,11 +247,22 @@ export async function* mapCoreAgentEvents(
       }
 
       case 'tool_start': {
+        const skillMeta = skillReadMetadataForToolStart(ev.name, ev.input, opts);
+        if (skillMeta) skillReadByToolId.set(ev.id, skillMeta);
+        const agentMeta = agentReadMetadataForToolStart(ev.name, ev.input, opts);
+        if (agentMeta) agentReadByToolId.set(ev.id, agentMeta);
         yield {
           type: 'event',
           event: {
             stream: 'tool',
-            data: { phase: 'start', id: ev.id, name: ev.name, arguments: ev.input },
+            data: {
+              phase: 'start',
+              id: ev.id,
+              name: ev.name,
+              arguments: ev.input,
+              ...skillReadEventFields(skillMeta),
+              ...agentReadEventFields(agentMeta),
+            },
           },
         };
         // The renderer formats the `tool` stream event into a single
@@ -152,6 +277,10 @@ export async function* mapCoreAgentEvents(
       case 'tool_end': {
         const rawResult = ev.result || '';
         const preview = resultPreview(rawResult);
+        const skillMeta = skillReadByToolId.get(ev.id) || null;
+        skillReadByToolId.delete(ev.id);
+        const agentMeta = agentReadByToolId.get(ev.id) || null;
+        agentReadByToolId.delete(ev.id);
         // Two click-to-expand storage paths, decided here:
         //   - oversized → util/tool-result-cap.ts already spilled to
         //     disk; rawResult is a `<persisted-output path=...>` marker.
@@ -169,6 +298,8 @@ export async function* mapCoreAgentEvents(
           name: ev.name,
           isError: !!ev.isError,
           result_preview: preview,
+          ...skillReadEventFields(skillMeta),
+          ...agentReadEventFields(agentMeta),
         };
         if (spill) {
           data.result_path = spill.path;
@@ -212,7 +343,9 @@ export async function* mapCoreAgentEvents(
       case 'done': {
         const result = ev.result;
         // Forward the accumulated token usage (input / output / cache read /
-        // cache write) for downstream cost / cache-hit observation. For
+        // cache write) so downstream consumers — today just the dev archiver,
+        // tomorrow a cost meter — can observe per-call spend. The devtools
+        // panel displays cacheRead/inputTokens ratio as cache hit rate. For
         // providers whose pi-ai adapter hard-codes cache fields to 0 (Mistral,
         // openai-responses write side) the value will be 0 — documented
         // behavior, not a bug on our side.

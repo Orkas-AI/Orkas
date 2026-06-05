@@ -4,7 +4,7 @@
  * The commander emits a complete plan via `plan_set`; bus's `plan_executor`
  * then drives execution deterministically:
  *   - dispatches steps when their `wait_for` predecessors are all done
- *   - groups same-`parallel_group` steps into one fork
+ *   - dispatches ready steps one at a time in plan order
  *   - auto-marks a step `done` when its assignee replies
  *   - renders `input` template (with `{{user_initial_message}}` and
  *     `{{step_N.output_summary}}` substitutions) into the dispatch text
@@ -58,8 +58,8 @@ export interface PlanStep {
    * `[]` for the first step. Steps with explicit empty array fire as soon
    * as the plan is set. */
   wait_for?: number[];
-  /** Steps with the same group fire together (fork). They still individually
-   * wait on their own `wait_for`. Used for "fan out N agents in parallel". */
+  /** Legacy field retained for old plan files. New plans do not persist it;
+   * the executor ignores it and runs ready steps one at a time. */
   parallel_group?: string;
   /** What to do if this step fails. Default: ask_commander. */
   on_failure?: FailurePolicy;
@@ -107,8 +107,8 @@ export interface PlanFile {
    * via per-turn flush in bus.ts; plan steps live across worker turn
    * boundaries so the source must be persisted here. */
   initial_attachments?: string[];
-  /** True after bus has fired the "all steps terminal" notification, so we
-   * don't fire it again on subsequent reconciles for the same plan. */
+  /** True after the executor has handled the terminal plan state, so repeated
+   * reconciles do not mark/notify/fallback-wrap the same plan again. */
   completed_signaled?: boolean;
   steps: PlanStep[];
 }
@@ -174,7 +174,6 @@ export interface PlanStepInput {
   assignee: string;
   input?: string;
   wait_for?: number[];
-  parallel_group?: string;
   on_failure?: FailurePolicy;
   notes?: string;
 }
@@ -220,17 +219,19 @@ export async function setPlan(
     ? input.initial_attachments.map(String)
     : undefined;
   const initialAttachments = inAtts ?? prevAttachments;
-  const steps: PlanStep[] = input.steps.map((s, i) => ({
-    index: i + 1,
-    title: (s.title || '').trim() || `Step ${i + 1}`,
-    assignee: (s.assignee || 'commander').trim(),
-    ...(s.input && s.input.trim() ? { input: s.input } : {}),
-    ...(Array.isArray(s.wait_for) ? { wait_for: s.wait_for.filter((n) => Number.isFinite(n)) } : {}),
-    ...(s.parallel_group && s.parallel_group.trim() ? { parallel_group: s.parallel_group.trim() } : {}),
-    ...(s.on_failure ? { on_failure: s.on_failure } : {}),
-    ...(s.notes && s.notes.trim() ? { notes: s.notes.trim() } : {}),
-    status: 'pending',
-  }));
+  const steps: PlanStep[] = input.steps.map((s, i) => {
+    const waitFor = normalizedWaitFor(i, s);
+    return {
+      index: i + 1,
+      title: (s.title || '').trim() || `Step ${i + 1}`,
+      assignee: (s.assignee || 'commander').trim(),
+      ...(s.input && s.input.trim() ? { input: s.input } : {}),
+      ...(waitFor ? { wait_for: waitFor } : {}),
+      ...(s.on_failure ? { on_failure: s.on_failure } : {}),
+      ...(s.notes && s.notes.trim() ? { notes: s.notes.trim() } : {}),
+      status: 'pending',
+    };
+  });
   const plan: PlanFile = {
     schema_version: 2,
     created_at,
@@ -243,6 +244,13 @@ export async function setPlan(
   await writePlanRaw(uid, cid, plan);
   log.info(`plan-set user=${uid} cid=${cid} steps=${steps.length} replan=${existed}`);
   return { plan };
+}
+
+function normalizedWaitFor(i: number, step: PlanStepInput): number[] | undefined {
+  if (!Array.isArray(step.wait_for)) return undefined;
+  const waitFor = step.wait_for.filter((n) => Number.isFinite(n));
+  if (i === 0 || waitFor.length > 0) return waitFor;
+  return undefined;
 }
 
 export async function updateStep(
@@ -278,8 +286,8 @@ export async function updateStep(
   return cur;
 }
 
-/** Mark `completed_signaled = true` so bus doesn't fire the "all done"
- *  signal twice for the same plan instance. */
+/** Mark `completed_signaled = true` so the executor handles terminal
+ *  completion only once for the same plan instance. */
 export async function markPlanCompletedSignaled(uid: string, cid: string): Promise<void> {
   const cur = await readPlan(uid, cid);
   if (!cur || cur.completed_signaled) return;

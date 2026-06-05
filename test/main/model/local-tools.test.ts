@@ -58,11 +58,11 @@ function makeCtx(): any {
 // ── Tool identity ─────────────────────────────────────────────────────────
 
 describe('local-tools › identity', () => {
-  it('exposes exactly five tools, named bash / write_file / edit_file / markdown_to_pdf / html_to_pdf', async () => {
+  it('exposes exactly six tools, named bash / write_file / edit_file / delete_file / markdown_to_pdf / html_to_pdf', async () => {
     const { lt } = await loadModules();
     const tools = lt.createLocalTools({});
     expect(tools.map((t) => t.name).sort()).toEqual(
-      ['bash', 'edit_file', 'html_to_pdf', 'markdown_to_pdf', 'write_file'],
+      ['bash', 'delete_file', 'edit_file', 'html_to_pdf', 'markdown_to_pdf', 'write_file'],
     );
   });
 
@@ -84,7 +84,8 @@ describe('local-tools › identity', () => {
 
 describe('local-tools › bash permission gate', () => {
   it('returns isError with the deny sentinel when permission is not granted', async () => {
-    const { lt } = await loadModules();
+    const { lt, perm } = await loadModules();
+    perm.revokeLocalExec();
     const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
     const res = await bash.execute({ command: 'echo hi' }, makeCtx());
     expect(res.isError).toBe(true);
@@ -116,11 +117,77 @@ describe('local-tools › bash permission gate', () => {
   });
 });
 
+describe('local-tools › bash produced files', () => {
+  it('fires onFileWritten for files created under ORKAS_OUTPUT_DIR', async () => {
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    const onFileWritten = vi.fn();
+    const bash = lt.createLocalTools({ agentId: 'agent-a', turnId: 'turn-1', onFileWritten }).find((t) => t.name === 'bash')!;
+
+    const res = await bash.execute({
+      command:
+        'node -e "const fs=require(\'fs\');' +
+        'fs.mkdirSync(process.env.ORKAS_OUTPUT_DIR, { recursive: true });' +
+        'fs.writeFileSync(process.env.ORKAS_OUTPUT_DIR + \'/report.docx\', \'doc\');' +
+        'fs.writeFileSync(process.env.ORKAS_OUTPUT_DIR + \'/notes.md\', \'notes\');"',
+      timeoutMs: 5000,
+    }, makeCtx());
+
+    expect(res.isError).toBeFalsy();
+    const outputDir = path.join(tmpDir, '__orkas_outputs', 'agent-a', 'turn-1');
+    const produced = new Set(onFileWritten.mock.calls.map(([p]) => p));
+    expect(produced).toContain(path.join(outputDir, 'report.docx'));
+    expect(produced).toContain(path.join(outputDir, 'notes.md'));
+  });
+
+  it('fires onFileWritten for files modified under ORKAS_OUTPUT_DIR', async () => {
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    const target = path.join(tmpDir, '__orkas_outputs', 'agent-a', 'turn-2', 'draft.txt');
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, 'v1');
+    const onFileWritten = vi.fn();
+    const bash = lt.createLocalTools({ agentId: 'agent-a', turnId: 'turn-2', onFileWritten }).find((t) => t.name === 'bash')!;
+
+    const res = await bash.execute({
+      command: 'node -e "require(\'fs\').writeFileSync(process.env.ORKAS_OUTPUT_DIR + \'/draft.txt\', \'v2\')"',
+      timeoutMs: 5000,
+    }, makeCtx());
+
+    expect(res.isError).toBeFalsy();
+    expect(fs.readFileSync(target, 'utf8')).toBe('v2');
+    expect(onFileWritten).toHaveBeenCalledWith(target);
+  });
+
+  it('does not surface files written outside ORKAS_OUTPUT_DIR as produced chips', async () => {
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    const onFileWritten = vi.fn();
+    const bash = lt.createLocalTools({ agentId: 'agent-a', turnId: 'turn-3', onFileWritten }).find((t) => t.name === 'bash')!;
+
+    const res = await bash.execute({
+      command:
+        'node -e "const fs=require(\'fs\');' +
+        'fs.writeFileSync(\'workspace-doc.docx\', \'wrong-owner\');' +
+        'fs.mkdirSync(process.env.ORKAS_OUTPUT_DIR, { recursive: true });' +
+        'fs.writeFileSync(process.env.ORKAS_OUTPUT_DIR + \'/visible.json\', \'{}\');"',
+      timeoutMs: 5000,
+    }, makeCtx());
+
+    expect(res.isError).toBeFalsy();
+    const outputDir = path.join(tmpDir, '__orkas_outputs', 'agent-a', 'turn-3');
+    const produced = new Set(onFileWritten.mock.calls.map(([p]) => p));
+    expect(produced).toContain(path.join(outputDir, 'visible.json'));
+    expect(produced).not.toContain(path.join(tmpDir, 'workspace-doc.docx'));
+  });
+});
+
 // ── Permission gate + onFileWritten: write_file ──────────────────────────
 
 describe('local-tools › write_file', () => {
   it('refuses and does NOT create the file when permission is not granted', async () => {
-    const { lt } = await loadModules();
+    const { lt, perm } = await loadModules();
+    perm.revokeLocalExec();
     const onFileWritten = vi.fn();
     const wf = lt.createLocalTools({ onFileWritten }).find((t) => t.name === 'write_file')!;
     const target = 'should-not-exist.txt';
@@ -216,7 +283,8 @@ describe('local-tools › write_file', () => {
 
 describe('local-tools › markdown_to_pdf', () => {
   it('refuses when permission is not granted', async () => {
-    const { lt } = await loadModules();
+    const { lt, perm } = await loadModules();
+    perm.revokeLocalExec();
     const onFileWritten = vi.fn();
     const mdpdf = lt.createLocalTools({ onFileWritten }).find((t) => t.name === 'markdown_to_pdf')!;
     const res = await mdpdf.execute({ path: 'x.pdf', markdown: '# hi' }, makeCtx());
@@ -270,7 +338,8 @@ describe('local-tools › markdown_to_pdf', () => {
 
 describe('local-tools › html_to_pdf', () => {
   it('refuses when permission is not granted', async () => {
-    const { lt } = await loadModules();
+    const { lt, perm } = await loadModules();
+    perm.revokeLocalExec();
     const hp = lt.createLocalTools({}).find((t) => t.name === 'html_to_pdf')!;
     const res = await hp.execute({ path: 'x.pdf', html: '<html></html>' }, makeCtx());
     expect(res.isError).toBe(true);

@@ -6,7 +6,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import type { OAuthCredentials } from "@mariozechner/pi-ai";
+import type { OAuthCredentials } from "@earendil-works/pi-ai";
 import { createLogger } from "../shared/logger.js";
 import type { AuthCredential, AuthStore, OAuthCredential } from "./types.js";
 

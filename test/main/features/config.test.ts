@@ -23,6 +23,8 @@ beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-config-'));
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
+  const electron = await import('electron');
+  (electron.app.getLocale as unknown as { mockReturnValue: (v: string) => void }).mockReturnValue('');
   const users = await import('../../../src/main/features/users');
   users.activateUser(TEST_UID);
 });
@@ -61,6 +63,16 @@ describe('features/config › readConfig / writeConfig', () => {
     appConfig.writeConfig({ language: 'zh' });
     appConfig.writeConfig({ language: undefined });
     expect(appConfig.readConfig().language).toBe('zh');
+  });
+
+  it('records per-field clocks for preference sync merges', async () => {
+    const { appConfig } = await load();
+    appConfig.writeConfig({ language: 'zh' });
+    const first = appConfig.readConfig()._field_updated_at?.language || 0;
+    appConfig.writeConfig({ commander_avatar: { icon: 'crown', color: 'gold' } });
+    const cfg = appConfig.readConfig();
+    expect(cfg._field_updated_at?.language).toBe(first);
+    expect(cfg._field_updated_at?.commander_avatar).toBeGreaterThan(first);
   });
 });
 
@@ -121,12 +133,28 @@ describe('features/config › setLanguage', () => {
     const { appConfig } = await load();
     expect(() => appConfig.setLanguage('fr' as unknown as 'en')).toThrow();
   });
+
+  it('refreshes in-memory current lang from synced preferences without rewriting', async () => {
+    const { appConfig, i18n } = await load();
+    appConfig.writeConfig({ language: 'zh' });
+    i18n.setCurrentLang('en');
+    expect(appConfig.refreshCurrentLanguageFromPreferences()).toBe('zh');
+    expect(i18n.getCurrentLang()).toBe('zh');
+  });
 });
 
 describe('features/config › getLanguage', () => {
   it('returns en when unset', async () => {
     const { appConfig } = await load();
     expect(appConfig.getLanguage()).toBe('en');
+  });
+
+  it('detects system language when no user preference exists', async () => {
+    const electron = await import('electron');
+    (electron.app.getLocale as unknown as { mockReturnValue: (v: string) => void }).mockReturnValue('zh-CN');
+    const { appConfig } = await load();
+
+    expect(appConfig.getLanguage()).toBe('zh');
   });
 
   it('returns persisted value', async () => {

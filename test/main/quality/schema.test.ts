@@ -65,12 +65,12 @@ describe('quality › schema › validateSkillFrontmatter', () => {
     expect(long_v?.field).toBe('frontmatter:description_en');
   });
 
-  it('a valid name with single-space groups passes', () => {
+  it('flags a name with single-space groups', () => {
     const v = validateSkillFrontmatter({
       name: 'Foo Bar Baz',
       description_zh: 'x', description_en: 'x', category: 'general',
     });
-    expect(v.map((x) => x.rule)).not.toContain('frontmatter_name_invalid');
+    expect(v.map((x) => x.rule)).toContain('frontmatter_name_invalid');
   });
 
   it('flags missing or invalid category', () => {
@@ -92,7 +92,7 @@ describe('quality › schema › validateAgentJsonShape', () => {
   it('passes a minimal valid agent.json', () => {
     const v = validateAgentJsonShape({
       agent_id: 'abc123',
-      name: 'My Agent',
+      name: 'MyAgent',
       description_zh: 'zh', description_en: 'en',
       category: 'general',
     });
@@ -101,10 +101,20 @@ describe('quality › schema › validateAgentJsonShape', () => {
 
   it('flags missing agent_id', () => {
     const v = validateAgentJsonShape({
-      name: 'My Agent',
+      name: 'MyAgent',
       description_zh: 'zh', description_en: 'en',
     });
     expect(v.map((x) => x.rule)).toContain('agent_id_missing');
+  });
+
+  it('flags names with spaces', () => {
+    const v = validateAgentJsonShape({
+      agent_id: 'abc123',
+      name: 'My Agent',
+      description_zh: 'zh', description_en: 'en',
+      category: 'general',
+    });
+    expect(v.map((x) => x.rule)).toContain('agent_name_invalid');
   });
 
   it('flags missing name', () => {

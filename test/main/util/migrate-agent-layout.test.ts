@@ -102,6 +102,21 @@ describe('migrate-agent-layout', () => {
     expect(fs.existsSync(path.join(agentsRoot(TEST_UID), 'a2.json'))).toBe(true);
   });
 
+  it('force-scans late flat agents after the migration stamp exists', async () => {
+    ensure(agentsRoot(TEST_UID));
+    fs.writeFileSync(path.join(agentsRoot(TEST_UID), 'a1.json'), '{}');
+
+    const { migrateAgentLayout } = await import('../../../src/main/util/migrate-agent-layout');
+    migrateAgentLayout(TEST_UID);
+
+    fs.writeFileSync(path.join(agentsRoot(TEST_UID), 'a2.json'), '{"agent_id":"a2"}');
+    const forced = migrateAgentLayout(TEST_UID, { force: true });
+
+    expect(forced.agentsConverted).toBe(1);
+    expect(fs.existsSync(path.join(agentsRoot(TEST_UID), 'a2', 'agent.json'))).toBe(true);
+    expect(fs.existsSync(path.join(agentsRoot(TEST_UID), 'a2.json'))).toBe(false);
+  });
+
   it('drops redundant flat <aid>.json when <aid>/agent.json already exists', async () => {
     ensure(path.join(agentsRoot(TEST_UID), 'a1'));
     fs.writeFileSync(path.join(agentsRoot(TEST_UID), 'a1', 'agent.json'), '{"new":true}');

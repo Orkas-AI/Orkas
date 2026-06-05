@@ -18,15 +18,14 @@
  *   3. When NO connector is visible to this actor, both the prompt block and the meta-tools are
  *      omitted entirely — `tools[]` shrinks by two slots and the system prompt stays smaller.
  *
- * Visibility: commander sees every connected instance; agent worker is gated by
- * `agent.enabled_connectors` (intentionally stricter than `agent.skill_list` — see
- * PC/CLAUDE.md §6.5). The `enabled_subtools` instance-level whitelist further filters which
- * actions each connector advertises. The two meta-tools share `resolveVisibleConnectors` so the
- * matrix is single-sourced.
+ * Visibility: commander sees every connected instance. The `enabled_subtools` instance-level
+ * whitelist further filters which actions each connector advertises. The resolver still accepts
+ * an optional actor filter for tests / future gates, but runner.ts no longer exposes connector
+ * tools to group-chat agent workers.
  *
- * Session-kind gate: callers (runner.ts) only invoke this module for `gconv` + `gmember`
- * sessions. Edit chats / KB-image extraction / CLI dispatch / reflect / memory-extract / anon
- * don't run user tasks against external services and stay free of connector exposure.
+ * Session-kind gate: callers (runner.ts) invoke this module for `gconv` full access and
+ * `agent` edit-session discovery. Group-chat agent workers / skill edit chats / KB-image
+ * extraction / CLI dispatch / reflect / memory-extract / anon stay free of connector exposure.
  */
 import type { AgentTool, ToolResult } from '#core-agent';
 
@@ -45,8 +44,7 @@ const log = createLogger('connector-meta-tools');
 export interface ConnectorMetaToolsOpts {
   /** Active uid. Required — without it the meta-tools have no scope. */
   userId: string;
-  /** Agent id when running as an agent worker. Empty / undefined = commander scope (no
-   *  `enabled_connectors` filter). */
+  /** Optional actor filter. Empty / undefined = commander scope. */
   agentId?: string;
 }
 
@@ -250,7 +248,7 @@ function createCallConnectorToolTool(opts: ConnectorMetaToolsOpts): AgentTool {
 /** Build the connector meta-tools for a single runner.
  *
  *  `mode` selects exposure (mirrors the tri-state gate in `runner.ts::connectorExposureFromSessionId`):
- *    - `'full'`     → both `list_connector_tools` + `call_connector_tool` (gconv / gmember
+ *    - `'full'`     → both `list_connector_tools` + `call_connector_tool` (gconv commander
  *                     sessions — actual user tasks invoking external services).
  *    - `'discover'` → `list_connector_tools` only (agent-edit session — the editor LLM uses
  *                     it to learn each connector's actions so the authored workflow can name

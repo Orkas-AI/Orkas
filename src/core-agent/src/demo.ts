@@ -17,7 +17,7 @@ function getArg(name: string, fallback: string): string {
 }
 
 const provider = getArg("provider", "anthropic");
-const model = getArg("model", provider === "openai" ? "gpt-4o" : "claude-sonnet-4-20250514");
+const model = getArg("model", provider === "openai" ? "gpt-4o" : "claude-opus-4-8");
 const message = getArg("message", "What is 2 + 2? Then use the calculator tool to verify.");
 
 // Create a custom calculator tool

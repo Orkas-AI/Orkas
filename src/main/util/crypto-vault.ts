@@ -1,9 +1,9 @@
 /**
- * Local-file encryption for credential-bearing JSON files (`connectors.json`, `auth-profiles.json`).
+ * Open-source fallback / legacy local-file encryption.
  *
  * Design intent — **obfuscation, not security**: the key is derived deterministically from a
- * compiled-in app salt + the active user's uid, so anyone who runs Orkas can decrypt their own
- * files (transparent to the user). It is NOT keychain-protected, deliberately — see
+ * compiled-in app salt + a caller-provided seed, so anyone who runs Orkas can decrypt their own
+ * files when they know the seed context. It is NOT keychain-protected, deliberately — see
  * PC/CLAUDE.md §6.5 OAuth section for the reasoning (portability + no OS-keystore dependency
  * trade-off the product owner accepted).
  *
@@ -18,8 +18,9 @@
  *     is in source code → key is recoverable from `uid` alone).
  *   - Targeted forensic recovery from a stolen device.
  *
- * Anyone needing the stronger guarantee should adopt keychain-backed storage; that's a separate
- * Phase 2 work item.
+ * Hosted Orkas should normally go through `util/local-secret-store.ts`, which uses the private
+ * `ORKLSEC1:` backend when available and calls this module only as an OrkasOpen fallback or for
+ * one-shot migration of older files.
  *
  * File layout written to disk:
  *

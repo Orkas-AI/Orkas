@@ -75,6 +75,8 @@ describe('renderDashboard — component coverage (set A)', () => {
   it('Alert: level + title + body', () => {
     const html = renderDashboard({ root: { type: 'Alert', props: { level: 'error', title: 'Down', body: 'Check uplink' } } });
     expect(html).toMatch(/data-level="error"/);
+    expect(html).toContain('class="db-alert-icon"');
+    expect(html).toContain('class="db-alert-content"');
     expect(html).toContain('Down');
     expect(html).toContain('Check uplink');
   });

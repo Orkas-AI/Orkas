@@ -15,7 +15,7 @@
  * unnecessary — the system label is derivable from the absolute path
  * alone.
  *
- * See `docs/plans/expert-signals-skill-attribution.md` §3.3.
+ * See `Common/docs/plans/expert-signals-skill-attribution.md` §3.3.
  */
 
 import * as path from 'node:path';

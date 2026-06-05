@@ -41,15 +41,15 @@ Two targets:
 WHEN TO SAVE:
 - User explicitly says "remember this" or "note that"
 - User corrections or preferences (highest priority)
-- Important decisions or milestones
+- Durable decisions or milestones that will still matter in future conversations (NOT the current task's working decisions)
 - User's role, expertise, or communication preferences (→ target "user")
-- Project conventions or environment facts
+- Stable project conventions or environment facts
 
 WHEN TO SKIP:
 - Trivial or obvious information
 - Easily re-discoverable facts
 - Raw data dumps, code blocks, or logs
-- Session-specific ephemera (temporary debug info, one-off questions)
+- Session-specific ephemera or the current task's state: temporary debug info, one-off questions, and your plan / progress / status this session — what you are doing, have done, or still need to do (e.g. "X is updated, but Y still needs checking"). Memory is for durable facts about the user and project, not work-in-progress.
 
 Actions: "add" (append new entry), "replace" (update existing by substring match), "remove" (delete by substring match), "list" (view current entries).`;
 

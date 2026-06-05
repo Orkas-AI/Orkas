@@ -80,4 +80,26 @@ describe('runner › buildRunner auth gate', () => {
       /No model configured/,
     );
   });
+
+  it('reports a temporary model pause when the only configured entry has credential cooldown', async () => {
+    const users = await import('../../../src/main/features/users');
+    users.activateUser('runnercooldown');
+    const i18n = await import('../../../src/main/i18n');
+    i18n.setCurrentLang('en');
+    const auth = await import('../../../src/main/features/auth');
+    const cooldown = await import('../../../src/main/model/core-agent/profile-cooldown');
+
+    const profile = await auth.addApiKey('anthropic', 'k-cooldown-xxxxxxxx');
+    await auth.addEntry({
+      provider: 'anthropic',
+      model: 'claude-opus-4-7',
+      profileId: profile.profileId,
+    });
+    cooldown.markCooldown(profile.profileId, 'auth', 'invalid key', 30_000);
+
+    const { buildRunner } = await loadRunner();
+    await expect(buildRunner({ sessionId: 'u1-gconv-x' })).rejects.toThrow(
+      /configured model is temporarily unavailable.*30s/i,
+    );
+  });
 });

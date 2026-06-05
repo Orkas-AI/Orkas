@@ -6,7 +6,7 @@
  * downstream reflection / patch suggester / critic (phase 1+). Each signal
  * is a single jsonl line under `<uid>/local/signals/<yyyy-mm-dd>.jsonl`.
  *
- * See `docs/plans/expert-signals-phase-0.md` for the rule catalog.
+ * See `Common/docs/plans/expert-signals-phase-0.md` for the rule catalog.
  */
 
 /** Phase 0 signal kinds (T0 system events + T1 text rules).
@@ -115,7 +115,7 @@ export interface Signal {
    *    rebased; consumers count repeat retries via `metadata.step_index`).
    *  Direct JOIN on `turn_id` recovers cross-signal causality
    *  (skill_invoked × correction, retry × tool_failure, …). See
-   *  `docs/plans/expert-signals-skill-attribution.md` §3.4. */
+   *  `Common/docs/plans/expert-signals-skill-attribution.md` §3.4. */
   turn_id: string;
   pre?: SignalTextSlice;
   post?: SignalTextSlice;

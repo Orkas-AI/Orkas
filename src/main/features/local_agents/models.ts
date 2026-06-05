@@ -26,11 +26,8 @@ export type LocalModel = {
 
 const CATALOG: Record<LocalCliType, LocalModel[]> = {
   claude: [
-    { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6', default: true },
+    { id: 'claude-opus-4-8', label: 'Claude Opus 4.8', default: true },
     { id: 'claude-opus-4-7', label: 'Claude Opus 4.7' },
-    { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5' },
-    { id: 'claude-opus-4-6', label: 'Claude Opus 4.6' },
-    { id: 'claude-sonnet-4-5', label: 'Claude Sonnet 4.5' },
   ],
   codex: [
     { id: 'gpt-5.5', label: 'GPT-5.5', default: true },

@@ -27,6 +27,40 @@
 
 // eslint-disable-next-line no-unused-vars
 const createLogger = (function () {
+  const SECRET_KEY_RE = /^(?:api_?key|access_?token|refresh_?token|id_?token|session_?id|client_?secret|private_?key|password|passwd|pwd|secret|token|authorization|cookie|set-cookie|phone|mobile|email|username)$/i;
+
+  function sanitizeText(value) {
+    return String(value ?? '')
+      .replace(/Bearer\s+[A-Za-z0-9._\-~+/=]+/gi, 'Bearer ***')
+      .replace(/Basic\s+[A-Za-z0-9+/=]+/gi, 'Basic ***')
+      .replace(/\beyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b/g, '***JWT***')
+      .replace(/([?&](?:api_?key|access_?token|refresh_?token|id_?token|session_?id|client_?secret|private_?key|password|passwd|pwd|secret|token|authorization|cookie|set-cookie|code|state|signature|sign|q-ak|q-signature|x-cos-security-token|x-amz-signature|x-amz-security-token|x-amz-credential|ossaccesskeyid|security-token)=)([^&#\s"']+)/gi, '$1***')
+      .replace(/\b(?:sk|rk)-[A-Za-z0-9][A-Za-z0-9_-]{12,}\b/g, '***TOKEN***')
+      .replace(/\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*(@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\b/g, '$1***$2')
+      .replace(/\b(1[3-9]\d)\d{4}(\d{4})\b/g, '$1****$2');
+  }
+
+  function sanitizeValue(value, seen) {
+    if (value == null) return value;
+    if (typeof value === 'string') return sanitizeText(value);
+    if (typeof value !== 'object') return value;
+    if (seen.has(value)) return '[circular]';
+    seen.add(value);
+    if (value instanceof Error) {
+      return {
+        name: sanitizeText(value.name || 'Error'),
+        message: sanitizeText(value.message || ''),
+        stack: value.stack ? sanitizeText(value.stack) : undefined,
+      };
+    }
+    if (Array.isArray(value)) return value.map((it) => sanitizeValue(it, seen));
+    const out = {};
+    Object.entries(value).forEach(([k, v]) => {
+      out[k] = SECRET_KEY_RE.test(k) ? '***REDACTED***' : sanitizeValue(v, seen);
+    });
+    return out;
+  }
+
   function send(level, module, message, args) {
     try {
       if (window.orkas && typeof window.orkas.log === 'function') {
@@ -40,10 +74,12 @@ const createLogger = (function () {
   function mirror(level, module, message, args) {
     try {
       const tag = `[${module}]`;
+      const safeMessage = sanitizeText(message);
+      const safeArgs = args.map((arg) => sanitizeValue(arg, new WeakSet()));
       // eslint-disable-next-line no-console
       const fn = console[level] || console.log;
-      if (args.length) fn.call(console, tag, message, ...args);
-      else             fn.call(console, tag, message);
+      if (safeArgs.length) fn.call(console, tag, safeMessage, ...safeArgs);
+      else                 fn.call(console, tag, safeMessage);
     } catch (_) { /* noop */ }
   }
 

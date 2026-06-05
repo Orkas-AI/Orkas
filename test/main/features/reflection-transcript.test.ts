@@ -91,7 +91,9 @@ function agentMsg(text: string, ts: number): any {
 }
 
 function writeSignalsJsonl(uid: string, signals: any[], date?: Date): void {
-  const ymd = (date || new Date()).toISOString().slice(0, 10);
+  // Match source: signalsDailyFile() uses local YMD, not UTC.
+  const d = date || new Date();
+  const ymd = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   const file = path.join(tmpDir, uid, 'local', 'signals', `${ymd}.jsonl`);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, signals.map((s) => JSON.stringify(s)).join('\n') + '\n');
@@ -410,8 +412,67 @@ describe('reflection-transcript › buildTranscript', () => {
     const mod = await loadModule();
     const r = await mod.buildTranscript(TEST_UID, 'agent-x', 0);
 
-    // User entry still produces a section.
+    // Filesystem scan finds no gmember-c1-agent-x.jsonl → conv excluded.
+    // (Plan §9.2 fix: ground-truth-based discovery, not conv.agent_id hint.)
+    expect(r.stats.convsIncluded).toBe(0);
+  });
+
+  it('includes convs where agent was dispatched into another agent\'s conv', async () => {
+    // c1 was started by "other-agent" but commander dispatched "target"
+    // via plan_set, so gmember-c1-target.jsonl exists even though
+    // conv.agent_id === "other-agent".
+    const a = writeConv(TEST_UID, { cid: 'c1', agentId: 'other-agent' });
+    writeSessionJsonl(TEST_UID, a.sessionId, [
+      userMsg('find me a target agent for analysis', 100, 'user', 'commander'),
+    ]);
+    // Write target's gmember file directly (mimics plan_set dispatch).
+    writeSessionJsonl(TEST_UID, 'gmember-c1-target', [
+      agentMsg('here is the analysis from target', 200),
+    ]);
+
+    const mod = await loadModule();
+    const r = await mod.buildTranscript(TEST_UID, 'target', 0);
+
     expect(r.stats.convsIncluded).toBe(1);
-    expect(r.text).toContain('lone q');
+    expect(r.text).toContain('here is the analysis from target');
+    // gconv user voice is included regardless of which agent the msg addressed.
+    expect(r.text).toContain('find me a target agent');
+  });
+});
+
+// ── listAgentGmemberFiles (filesystem-driven discovery) ─────────────────
+
+describe('reflection-transcript › listAgentGmemberFiles', () => {
+  it('returns empty when sessions directory does not exist', async () => {
+    const mod = await loadModule();
+    // No conv / session files written → sessions dir may not exist yet.
+    expect(mod.listAgentGmemberFiles(TEST_UID, 'whatever')).toEqual([]);
+  });
+
+  it('matches gmember-<cid>-<aid>.jsonl by suffix (cid may contain dashes)', async () => {
+    writeSessionJsonl(TEST_UID, 'gmember-abc-def-agent-x', [agentMsg('hi', 100)]);
+    writeSessionJsonl(TEST_UID, 'gmember-uuid-with-many-dashes-agent-x', [agentMsg('hi', 100)]);
+    writeSessionJsonl(TEST_UID, 'gmember-other-agent-y', [agentMsg('hi', 100)]);
+
+    const mod = await loadModule();
+    const found = mod.listAgentGmemberFiles(TEST_UID, 'agent-x');
+    const cids = found.map((x) => x.cid).sort();
+    expect(cids).toEqual(['abc-def', 'uuid-with-many-dashes']);
+  });
+
+  it('ignores non-matching files (gconv, ephemeral, etc.)', async () => {
+    writeSessionJsonl(TEST_UID, 'gconv-c1', [userMsg('q', 100)]);
+    writeSessionJsonl(TEST_UID, 'reflect-abc', [agentMsg('r', 100)]);
+    writeSessionJsonl(TEST_UID, 'gmember-c1-target', [agentMsg('a', 100)]);
+
+    const mod = await loadModule();
+    const found = mod.listAgentGmemberFiles(TEST_UID, 'target');
+    expect(found.length).toBe(1);
+    expect(found[0].cid).toBe('c1');
+  });
+
+  it('returns empty for empty agentId (defensive)', async () => {
+    const mod = await loadModule();
+    expect(mod.listAgentGmemberFiles(TEST_UID, '')).toEqual([]);
   });
 });

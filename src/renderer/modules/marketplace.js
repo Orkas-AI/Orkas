@@ -41,6 +41,78 @@ let _mpCategoriesCache = (() => {
     return Array.isArray(parsed) ? parsed : null;
   } catch { return null; }
 })();
+const MP_UNKNOWN_CATEGORY_REFRESH_MIN_MS = 5 * 60 * 1000;
+let _mpUnknownCategoryRefreshAt = 0;
+let _mpUnknownCategoryRefreshInFlight = null;
+const MP_REVIEW_STATUSES = ['unreviewed', 'reviewing', 'approved', 'rejected', 'archived'];
+
+function _mpUnknownCategoryLabel() {
+  const raw = t('marketplace.category_unknown');
+  return raw && raw !== 'marketplace.category_unknown' ? raw : 'Unknown';
+}
+
+function _mpCanonicalCategoryCode(code) {
+  const c = String(code || '').trim();
+  return c === 'writing' ? 'creation' : c;
+}
+
+function _mpReviewStatusLabel(status) {
+  const s = String(status || '').trim();
+  if (!s) return '';
+  const key = `marketplace.status_${s}`;
+  const raw = t(key);
+  return raw && raw !== key ? raw : s;
+}
+
+function _mpStatusFilterLabel() {
+  const raw = t('marketplace.status_filter_dev');
+  return raw && raw !== 'marketplace.status_filter_dev' ? raw : 'Status (Dev)';
+}
+
+function _mpUnknownCategoryCodes(codes) {
+  const list = Array.isArray(_mpCategoriesCache) ? _mpCategoriesCache : [];
+  const known = new Set(list.map((c) => c && _mpCanonicalCategoryCode(c.code)).filter(Boolean));
+  return [...codes]
+    .map((code) => _mpCanonicalCategoryCode(code))
+    .filter((code) => code && !known.has(code));
+}
+
+function _mpMaybeRefreshCategoriesForCodes(codes) {
+  const unknown = _mpUnknownCategoryCodes(codes);
+  if (!unknown.length) return;
+  const now = Date.now();
+  if (_mpUnknownCategoryRefreshInFlight) return;
+  if (now - _mpUnknownCategoryRefreshAt < MP_UNKNOWN_CATEGORY_REFRESH_MIN_MS) return;
+  _mpUnknownCategoryRefreshAt = now;
+  try {
+    _mpUnknownCategoryRefreshInFlight = window.orkas.invoke('marketplace.categories', { force_refresh: true })
+      .then((r) => {
+        const list = (r && r.list) || [];
+        if (!list.length) return;
+        _mpCategoriesCache = list;
+        _mpPersistCategoriesCache(list);
+        if (_mpState) {
+          _mpState.categories = list;
+          _mpRender();
+        }
+        if (typeof renderAgentsGrid === 'function' && typeof _agentsCache !== 'undefined' && _agentsCache) {
+          renderAgentsGrid(_agentsCache);
+        }
+        if (typeof renderSkillsGrid === 'function' && typeof _skillsCache !== 'undefined' && _skillsCache) {
+          renderSkillsGrid(_skillsCache);
+        }
+      })
+      .catch((err) => {
+        console.warn('marketplace categories forced refresh failed:', err);
+      })
+      .finally(() => {
+        _mpUnknownCategoryRefreshInFlight = null;
+      });
+  } catch (err) {
+    _mpUnknownCategoryRefreshInFlight = null;
+    console.warn('marketplace categories forced refresh failed:', err);
+  }
+}
 
 // Installed-state cache (synchronous via localStorage). Without this, every panel open
 // waits 1-2s for `agents.list` / `skills.list` IPCs before card buttons can show the
@@ -51,19 +123,55 @@ const MP_INSTALLED_LS_KEY = 'orkas:mp:installed';
 function _mpLoadInstalledFromLs() {
   try {
     const raw = localStorage.getItem(MP_INSTALLED_LS_KEY);
-    if (!raw) return { agentIds: new Set(), skillIds: new Set() };
+    if (!raw) {
+      return {
+        agentIds: new Set(), skillIds: new Set(),
+        agentMeta: new Map(), skillMeta: new Map(),
+      };
+    }
     const parsed = JSON.parse(raw);
+    const agentRows = Array.isArray(parsed?.agents)
+      ? parsed.agents
+      : (Array.isArray(parsed?.agentIds) ? parsed.agentIds.map((id) => ({ id })) : []);
+    const skillRows = Array.isArray(parsed?.skills)
+      ? parsed.skills
+      : (Array.isArray(parsed?.skillIds) ? parsed.skillIds.map((id) => ({ id })) : []);
     return {
-      agentIds: new Set(Array.isArray(parsed?.agentIds) ? parsed.agentIds : []),
-      skillIds: new Set(Array.isArray(parsed?.skillIds) ? parsed.skillIds : []),
+      agentIds: new Set(agentRows.map((x) => x?.id).filter(Boolean)),
+      skillIds: new Set(skillRows.map((x) => x?.id).filter(Boolean)),
+      agentMeta: new Map(agentRows.filter((x) => x?.id).map((x) => [String(x.id), _mpNormalizeInstallMeta(x)])),
+      skillMeta: new Map(skillRows.filter((x) => x?.id).map((x) => [String(x.id), _mpNormalizeInstallMeta(x)])),
     };
-  } catch { return { agentIds: new Set(), skillIds: new Set() }; }
+  } catch {
+    return {
+      agentIds: new Set(), skillIds: new Set(),
+      agentMeta: new Map(), skillMeta: new Map(),
+    };
+  }
+}
+function _mpNormalizeInstallMeta(row) {
+  const meta = { id: String(row?.id || '') };
+  if (row && typeof row.version === 'string') meta.version = row.version;
+  const published = row?.published_at ?? row?.marketplace_published_at;
+  const updated = row?.updated_at ?? row?.marketplace_updated_at;
+  if (typeof published === 'number') meta.published_at = published;
+  if (typeof updated === 'number') meta.updated_at = updated;
+  return meta;
+}
+function _mpInstallMetaRows(kind) {
+  const ids = kind === 'agent' ? _mpState.installedAgentIds : _mpState.installedSkillIds;
+  const map = kind === 'agent' ? _mpState.installedAgentMeta : _mpState.installedSkillMeta;
+  return [...ids].map((id) => ({ id, ...(map?.get(id) || {}) }));
 }
 function _mpPersistInstalled() {
   try {
+    const agents = _mpInstallMetaRows('agent');
+    const skills = _mpInstallMetaRows('skill');
     localStorage.setItem(MP_INSTALLED_LS_KEY, JSON.stringify({
-      agentIds: [..._mpState.installedAgentIds],
-      skillIds: [..._mpState.installedSkillIds],
+      agentIds: agents.map((x) => x.id),
+      skillIds: skills.map((x) => x.id),
+      agents,
+      skills,
     }));
   } catch { /* ignore */ }
 }
@@ -74,7 +182,7 @@ function _mpPersistInstalled() {
 let _mpReconcileStatus = { state: 'idle', total: 0, pulled: 0 };
 
 // Paginated listings cache (cross-process via main `marketplace.{get,set}ListingsCache`).
-// Key = `${kind}|${category||''}|${q||''}`. Value:
+// Key = `${kind}|${category||''}|${status||''}|${q||''}`. Value:
 //   { items, ts, nextPage, exhausted }
 // Where `items` accumulates across pages (deduped by id), `nextPage` is the next page-num to
 // request on infinite-scroll, and `exhausted` flips true once a /list response is shorter
@@ -88,11 +196,11 @@ let _mpReconcileStatus = { state: 'idle', total: 0, pulled: 0 };
 //     page = cached.nextPage and APPEND (dedupe by id) — never overwrite earlier pages.
 //   - "All" tab (category = '') feeds rows into per-category cache slots so a subsequent
 //     category tab open paints fast. The reverse (cat slot → "All") is NOT done — All needs
-//     a fresh time-ordered slice from the server.
+//     a fresh name-sort-key-ordered slice from the server.
 const MP_LISTINGS_PAGE_SIZE = 50;
 const _mpListingsCache = new Map();
 let _mpListingsHydrated = false;
-function _mpListingsKey(kind, category, q) { return `${kind}|${category || ''}|${q || ''}`; }
+function _mpListingsKey(kind, category, status, q) { return `${kind}|${category || ''}|${status || ''}|${q || ''}`; }
 
 async function _mpHydrateListingsCache() {
   if (_mpListingsHydrated) return;
@@ -120,7 +228,7 @@ function isMarketplaceOpen() {
   return document.getElementById('panel-marketplace')?.classList.contains('active') === true;
 }
 
-function openMarketplace(initialTab = 'agent') {
+function openMarketplace(initialTab = 'agent', opts = {}) {
   const panel = document.getElementById('panel-marketplace');
   if (!panel) return;
 
@@ -135,6 +243,7 @@ function openMarketplace(initialTab = 'agent') {
     view: 'grid',
     tab: initialTab === 'skill' ? 'skill' : 'agent',
     category: '',
+    status: '',
     q: '',
     agents: [],
     skills: [],
@@ -147,7 +256,12 @@ function openMarketplace(initialTab = 'agent') {
     // (and persist the updated set back to localStorage).
     ...(() => {
       const cached = _mpLoadInstalledFromLs();
-      return { installedAgentIds: cached.agentIds, installedSkillIds: cached.skillIds };
+      return {
+        installedAgentIds: cached.agentIds,
+        installedSkillIds: cached.skillIds,
+        installedAgentMeta: cached.agentMeta,
+        installedSkillMeta: cached.skillMeta,
+      };
     })(),
     loading: true,
     searchBusy: false,
@@ -185,6 +299,12 @@ function openMarketplace(initialTab = 'agent') {
 
   // Best-effort cache sweep — never blocks the UI.
   window.orkas.invoke('marketplace.sweepCache').catch(() => { /* ignore */ });
+
+  const deepLinkItem = opts && opts.detailItem && opts.detailItem.id ? opts.detailItem : null;
+  const deepLinkKind = opts && opts.detailKind ? opts.detailKind : _mpState.tab;
+  if (deepLinkItem) {
+    Promise.resolve().then(() => _mpOpenDetail(deepLinkKind === 'skill' ? 'skill' : 'agent', deepLinkItem)).catch(() => {});
+  }
 
   _mpLoadAll();
 }
@@ -350,49 +470,94 @@ function _mpBindPanel(panel) {
   // on via the `onMarketplaceDetailRendered` hook (see below).
 }
 
+// SWR entry: paint cached rows immediately, then fan out three independent network tasks
+// (installed-state / categories / listings). Each task owns its slice of `_mpState`, its own
+// error handling, and renders on completion. Previously these three lived inside a single
+// try/catch which silently swallowed `_mpLoadListings` whenever the installed-state or
+// categories IPCs hung or rejected — fresh listings never landed and the user stayed on
+// stale cached rows. Decoupling restores the SWR contract: any one task failing leaves the
+// other two free to update their slice.
 async function _mpLoadAll() {
-  // Pull the persisted listings cache into the in-memory Map first (idempotent — no-op after
-  // the first open this session) so the cache-first paint below has prior-run rows to show.
   await _mpHydrateListingsCache();
-  // Cache-first (SWR): paint cached rows for the current (kind, category, q) immediately; if
-  // the visible tab has no rows, show the body spinner until the listings fetch lands. Either
-  // way we always re-fetch in the background and swap fresh data in.
   _mpHydrateFromCache();
   if (_mpCategoriesCache) _mpState.categories = _mpCategoriesCache;
   _mpState.loading = _mpVisibleItems().length === 0;
   _mpState.error = '';
   _mpRender();
 
+  await Promise.all([
+    _mpRefreshInstalledState(),
+    _mpRefreshCategoriesIfMissing(),
+    _mpRefreshListingsAndRender(),
+  ]);
+}
+
+// Pulls the local installed-state and flips card buttons between Install / Installed.
+async function _mpRefreshInstalledState() {
   try {
-    const tasks = [
+    const [instAgents, instSkills] = await Promise.all([
       window.orkas.invoke('agents.list'),
       window.orkas.invoke('skills.list'),
-    ];
-    if (!_mpCategoriesCache) {
-      tasks.push(window.orkas.invoke('marketplace.categories', {}));
-    }
-    const results = await Promise.all(tasks);
-    const instAgents = results[0];
-    const instSkills = results[1];
-    if (!_mpCategoriesCache && results[2]) {
-      _mpCategoriesCache = (results[2] && results[2].list) || [];
-      _mpState.categories = _mpCategoriesCache;
-      _mpPersistCategoriesCache(_mpCategoriesCache);
-    }
-    _mpState.installedAgentIds = new Set(((instAgents && instAgents.agents) || []).map((a) => a.agent_id));
-    _mpState.installedSkillIds = new Set(((instSkills && instSkills.skills) || []).map((s) => s.id));
+    ]);
+    if (!_mpState) return;
+    const agentRows = ((instAgents && instAgents.agents) || [])
+      .filter((a) => _mpInstalledSource(a?.source) === 'marketplace')
+      .map((a) => ({
+        id: a.agent_id,
+        version: a.version,
+        published_at: a.marketplace_published_at,
+        updated_at: a.marketplace_updated_at,
+      }));
+    const skillRows = ((instSkills && instSkills.skills) || [])
+      .filter((s) => _mpInstalledSource(s?.source) === 'marketplace')
+      .map((s) => ({
+        id: s.id,
+        version: s.version,
+        published_at: s.marketplace_published_at,
+        updated_at: s.marketplace_updated_at,
+      }));
+    _mpState.installedAgentIds = new Set(agentRows.map((a) => a.id).filter(Boolean));
+    _mpState.installedSkillIds = new Set(skillRows.map((s) => s.id).filter(Boolean));
+    _mpState.installedAgentMeta = new Map(agentRows.filter((a) => a.id).map((a) => [String(a.id), _mpNormalizeInstallMeta(a)]));
+    _mpState.installedSkillMeta = new Map(skillRows.filter((s) => s.id).map((s) => [String(s.id), _mpNormalizeInstallMeta(s)]));
     _mpPersistInstalled();
-    await _mpLoadListings();
-    await _mpRefreshOpenDetailFromListings();
-  } catch (err) {
-    // A failed refresh must NOT wipe what's already on screen — surface as a body-level error
-    // only when the visible tab has nothing to show; otherwise log + keep the stale view.
-    console.warn('marketplace background fetch failed:', err);
-    if (_mpVisibleItems().length === 0) _mpState.error = (err && err.message) || String(err);
-  } finally {
-    _mpState.loading = false;
     _mpRender();
+  } catch (err) {
+    console.warn('marketplace installed-state refresh failed:', err);
   }
+}
+function _mpInstalledSource(source) {
+  if (typeof normalizeCatalogSource === 'function') return normalizeCatalogSource(source);
+  if (source === 'builtin' || source === 'platform') return 'marketplace';
+  return source;
+}
+
+// One-shot fetch of the category list (24h server-cached). Skipped when the renderer-level
+// cache already has it — the categories chip strip is allowed to lag a session.
+async function _mpRefreshCategoriesIfMissing() {
+  if (_mpCategoriesCache) return;
+  try {
+    const r = await window.orkas.invoke('marketplace.categories', {});
+    const list = (r && r.list) || [];
+    if (!list.length || !_mpState) return;
+    _mpCategoriesCache = list;
+    _mpState.categories = list;
+    _mpPersistCategoriesCache(list);
+    _mpRender();
+  } catch (err) {
+    console.warn('marketplace categories refresh failed:', err);
+  }
+}
+
+// Fresh listings for the current (kind, category, q). `_mpLoadListings` catches per-kind
+// errors internally and never rejects; this wrapper just flips `loading` off + re-renders +
+// reconciles an open detail page.
+async function _mpRefreshListingsAndRender() {
+  await _mpLoadListings();
+  if (!_mpState) return;
+  _mpState.loading = false;
+  _mpRender();
+  await _mpRefreshOpenDetailFromListings();
 }
 
 function _mpPersistCategoriesCache(list) {
@@ -422,6 +587,40 @@ async function _mpRefreshOpenDetailFromListings() {
 // marketplace. Idempotent — `_mpInitReconcileWatch` runs once and a second call no-ops.
 setTimeout(() => { _mpInitReconcileWatch().catch(() => {}); }, 0);
 
+// Public hook: re-pull the SWR network half while the marketplace panel is the active view.
+// Cheap when stale — the cache stays on screen and only the slices whose IPC returns fresh
+// rows re-render. Callers: the visibility/focus listeners below, post-upload + post-delete
+// hooks from marketplace_dev.js, and any future "I just changed server-side state" path.
+// No-op when the panel isn't visible (avoids burning IPC on a panel the user can't see; the
+// next openMarketplace will SWR-refresh anyway).
+function refreshMarketplaceIfActive() {
+  if (!isMarketplaceOpen() || !_mpState) return;
+  Promise.all([
+    _mpRefreshInstalledState(),
+    _mpRefreshListingsAndRender(),
+  ]).catch(() => { /* per-task handlers already logged */ });
+}
+
+// Re-fetch when the window comes back to the foreground (Cmd-Tab back, switch desktop,
+// browser tab visible again). Debounced so a rapid focus/blur burst fires one request.
+// Why this exists in addition to openMarketplace: the panel can sit open for minutes while
+// the user is in another app or another conversation — without this hook the listing stays
+// frozen at whatever was on screen when the user left, and admin republishes / dev uploads
+// from another window don't surface until the user clicks "More" again.
+let _mpVisRefreshTimer = null;
+function _mpScheduleVisibilityRefresh() {
+  if (!isMarketplaceOpen() || !_mpState) return;
+  clearTimeout(_mpVisRefreshTimer);
+  _mpVisRefreshTimer = setTimeout(() => {
+    _mpVisRefreshTimer = null;
+    refreshMarketplaceIfActive();
+  }, 250);
+}
+window.addEventListener('focus', _mpScheduleVisibilityRefresh);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) _mpScheduleVisibilityRefresh();
+});
+
 // Module-level background refresh of categories. We already have whatever was in localStorage
 // (set when the module evaluated). This refresh keeps the cache current with the server
 // without ever blocking the UI — fire-and-forget; failures keep the localStorage copy.
@@ -432,10 +631,37 @@ setTimeout(() => { _mpInitReconcileWatch().catch(() => {}); }, 0);
       if (list.length) {
         _mpCategoriesCache = list;
         _mpPersistCategoriesCache(list);
+        if (_mpState) {
+          _mpState.categories = list;
+          _mpRender();
+        }
       }
     }).catch(() => { /* ignore */ });
   } catch { /* preload happens at script load; window.orkas not ready is OK */ }
 })();
+
+(function _mpBindDeepLinkOpen() {
+  try {
+    window.orkas.onPushEvent('marketplace:open-detail', (payload) => {
+      const normalized = _mpNormalizeDeepLinkPayload(payload);
+      if (!normalized) return;
+      openMarketplace(normalized.kind, {
+        detailKind: normalized.kind,
+        detailItem: normalized.item,
+      });
+    });
+  } catch { /* push channel unavailable during very early dev boot — ignore */ }
+})();
+
+function _mpNormalizeDeepLinkPayload(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  const kind = payload.kind === 'skill' ? 'skill' : payload.kind === 'agent' ? 'agent' : null;
+  const item = payload.item && typeof payload.item === 'object' ? { ...payload.item } : {};
+  const id = String(payload.id || item.id || '').trim();
+  if (!kind || !id) return null;
+  item.id = id;
+  return { kind, item };
+}
 
 // Single entry point for category-chip clicks and search submits: hydrate the cached rows for
 // the new (kind, category, q) and paint them; if the visible tab has no rows, show the body
@@ -501,12 +727,36 @@ function _mpRenderSearchClear() {
   clearBtn.hidden = !(input && input.value.length > 0);
 }
 
+function _mpRenderStatusSelect(panel) {
+  const labelEl = panel.querySelector('[data-mp-status-label]');
+  if (labelEl) labelEl.textContent = _mpStatusFilterLabel();
+  const el = panel.querySelector('[data-mp-status-select]');
+  if (!el || typeof _aiSelectMount !== 'function') return;
+  const options = [
+    { value: '', label: t('marketplace.status_all') },
+    ...MP_REVIEW_STATUSES.map((status) => ({
+      value: status,
+      label: _mpReviewStatusLabel(status),
+    })),
+  ];
+  _aiSelectMount(el, {
+    options,
+    value: _mpState.status || '',
+    placeholder: t('marketplace.status_all'),
+    onChange(value) {
+      if (!_mpState) return;
+      _mpState.status = value || '';
+      _mpRefreshListings();
+    },
+  });
+}
+
 // Re-point _mpState.agents/skills at the cached rows for the current (kind, category, q).
 // (Stale-response protection lives in `_mpLoadListingsPage`'s per-kind generation token.)
 function _mpHydrateFromCache() {
-  const cat = _mpState.category, q = _mpState.q;
-  const cachedA = _mpListingsCache.get(_mpListingsKey('agent', cat, q));
-  const cachedS = _mpListingsCache.get(_mpListingsKey('skill', cat, q));
+  const cat = _mpState.category, status = _mpState.status, q = _mpState.q;
+  const cachedA = _mpListingsCache.get(_mpListingsKey('agent', cat, status, q));
+  const cachedS = _mpListingsCache.get(_mpListingsKey('skill', cat, status, q));
   // No cache for this (kind, cat, q) → clear that list rather than leave the previous
   // tab/category's rows on screen; the caller's `loading` flag (set from
   // `_mpVisibleItems().length`) then decides spinner vs empty-state for the now-empty tab.
@@ -516,23 +766,23 @@ function _mpHydrateFromCache() {
 }
 
 // Spread rows pulled from the "All" tab (category='') into each row's own category cache
-// slot. One-way: All → per-category. The reverse would corrupt the time-ordered "All" view.
+// slot. One-way: All → per-category. The reverse would corrupt the name-sort-key-ordered "All" view.
 function _mpSpreadAllIntoCategoryCaches(kind, rows, q) {
   if (!rows.length) return;
   const byCat = new Map();
   for (const row of rows) {
-    const c = String(row.category || '').trim();
+    const c = _mpCanonicalCategoryCode(row.category);
     if (!c) continue;
     if (!byCat.has(c)) byCat.set(c, []);
     byCat.get(c).push(row);
   }
   for (const [cat, catRows] of byCat) {
-    const key = _mpListingsKey(kind, cat, q);
+    const key = _mpListingsKey(kind, cat, _mpState.status, q);
     const existing = _mpListingsCache.get(key);
     const items = existing ? existing.items.slice() : [];
     const seen = new Set(items.map((x) => x.id));
     for (const r of catRows) if (!seen.has(r.id)) items.push(r);
-    items.sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
+    items.sort(_mpCompareMarketplaceName);
     _mpListingsCache.set(key, {
       items,
       ts: existing?.ts || Date.now(),
@@ -550,12 +800,12 @@ function _mpSpreadAllIntoCategoryCaches(kind, rows, q) {
 async function _mpLoadListingsPage(kind, { append, page }) {
   if (!_mpState._loadGen) _mpState._loadGen = { agent: 0, skill: 0 };
   const myGen = ++_mpState._loadGen[kind];
-  const cat = _mpState.category, q = _mpState.q;
-  const key = _mpListingsKey(kind, cat, q);
+  const cat = _mpState.category, status = _mpState.status, q = _mpState.q;
+  const key = _mpListingsKey(kind, cat, status, q);
   const channel = kind === 'agent' ? 'marketplace.listAgents' : 'marketplace.listSkills';
   try {
     const r = await window.orkas.invoke(channel, {
-      category: cat || null, q: q || null, page, size: MP_LISTINGS_PAGE_SIZE,
+      category: cat || null, status: status || null, q: q || null, page, size: MP_LISTINGS_PAGE_SIZE,
     });
     if (_mpState._loadGen[kind] !== myGen) return;
     const rows = (r && r.list) || [];
@@ -602,8 +852,8 @@ let _mpLoadMoreInflight = false;
 async function _mpLoadMoreCurrentKind() {
   if (_mpLoadMoreInflight) return;
   const kind = _mpState.tab;
-  const cat = _mpState.category, q = _mpState.q;
-  const cached = _mpListingsCache.get(_mpListingsKey(kind, cat, q));
+  const cat = _mpState.category, status = _mpState.status, q = _mpState.q;
+  const cached = _mpListingsCache.get(_mpListingsKey(kind, cat, status, q));
   if (!cached || cached.exhausted) return;
   _mpLoadMoreInflight = true;
   try {
@@ -633,6 +883,7 @@ function _mpRender() {
   }
   const searchEl = panel.querySelector('[data-mp-search]');
   if (searchEl) searchEl.setAttribute('placeholder', t('marketplace.search_ph'));
+  _mpRenderStatusSelect(panel);
   _mpRenderSearchBtn();
   _mpRenderSearchClear();
 
@@ -668,8 +919,8 @@ function _mpRender() {
     body.innerHTML = `<div class="empty">${escapeHtml(t('marketplace.load_failed'))}: ${escapeHtml(_mpState.error)}</div>`;
     return;
   }
-  // Order = server-side `updated_at DESC` (newest first). No further client sort — the
-  // accumulator in `_mpLoadListingsPage` preserves the server's slicing.
+  // Order comes from the server: relevance for searches, name sort otherwise.
+  // No further client sort — `_mpLoadListingsPage` preserves the server's slicing.
   const items = _mpVisibleItems();
   if (items.length === 0) {
     body.innerHTML = `<div class="empty">${escapeHtml(t('marketplace.empty'))}</div>`;
@@ -713,10 +964,11 @@ function _mpAttachInfiniteScroll(body) {
 
 function _mpCardHtml(item, lang) {
   const kind = _mpState.tab;
-  const installed = (kind === 'agent' ? _mpState.installedAgentIds : _mpState.installedSkillIds).has(item.id);
+  const status = _mpInstallStatus(kind, item);
   const installing = _mpState.installing.has(`${kind}:${item.id}`);
   const desc = pickDesc(item, lang) || '';
   const catLabel = _mpCategoryLabel(item.category, lang);
+  const statusLabel = _mpReviewStatusLabel(item.status || item.state);
   const versionLabel = t('marketplace.version').replace('{version}', String(item.version || ''));
   const avatar = kind === 'agent'
     ? renderAvatarHtml(item.icon, item.color, { size: 32, seed: item.id, extraClass: 'marketplace-card-avatar' })
@@ -725,10 +977,18 @@ function _mpCardHtml(item, lang) {
   let btnLabel = t('marketplace.install');
   let btnAttrs = `data-mp-install="${escapeHtml(kind)}" data-mp-id="${escapeHtml(item.id)}"`;
   let btnSpinner = '';
-  if (installed) { btnClass = 'btn btn-sm is-disabled'; btnLabel = t('marketplace.installed'); btnAttrs = 'disabled'; }
-  else if (installing) {
-    btnClass = 'btn btn-sm is-disabled'; btnLabel = t('marketplace.installing'); btnAttrs = 'disabled';
+  if (installing) {
+    btnClass = 'btn btn-sm is-disabled';
+    btnLabel = status.updateAvailable ? t('marketplace.updating') : t('marketplace.installing');
+    btnAttrs = 'disabled';
     btnSpinner = '<span class="marketplace-btn-spinner"></span>';
+  } else if (status.updateAvailable) {
+    btnClass = 'btn btn-sm btn-primary';
+    btnLabel = t('marketplace.update');
+  } else if (status.installed) {
+    btnClass = 'btn btn-sm is-disabled';
+    btnLabel = t('marketplace.installed');
+    btnAttrs = 'disabled';
   }
   return `
     <div class="marketplace-card" data-id="${escapeHtml(item.id)}">
@@ -741,6 +1001,7 @@ function _mpCardHtml(item, lang) {
         <div class="marketplace-card-meta">
           ${item.version ? `<span class="marketplace-card-chip is-version">${escapeHtml(versionLabel)}</span>` : ''}
           ${catLabel ? `<span class="marketplace-card-chip">${escapeHtml(catLabel)}</span>` : ''}
+          ${statusLabel ? `<span class="marketplace-card-chip is-status">${escapeHtml(statusLabel)}</span>` : ''}
         </div>
         <div class="marketplace-card-actions">
           <button type="button" class="${btnClass}" ${btnAttrs}>${btnSpinner}${escapeHtml(btnLabel)}</button>
@@ -751,10 +1012,15 @@ function _mpCardHtml(item, lang) {
 }
 
 function _mpCategoryLabel(code, lang) {
-  if (!code) return '';
-  const c = _mpState.categories.find((x) => x.code === code);
-  if (!c) return code;
-  return pickLocalizedName(c, lang) || code;
+  const canonical = _mpCanonicalCategoryCode(code);
+  if (!canonical) return '';
+  _mpMaybeRefreshCategoriesForCodes([canonical]);
+  const stateCats = Array.isArray(_mpState?.categories) ? _mpState.categories : [];
+  const cacheCats = Array.isArray(_mpCategoriesCache) ? _mpCategoriesCache : [];
+  const c = stateCats.find((x) => _mpCanonicalCategoryCode(x.code) === canonical)
+    || cacheCats.find((x) => _mpCanonicalCategoryCode(x.code) === canonical);
+  if (!c) return _mpUnknownCategoryLabel();
+  return pickLocalizedName(c, lang) || canonical;
 }
 
 // ─── Detail view rendering ───
@@ -816,8 +1082,9 @@ function _mpRenderDetail() {
   const lang = getLang();
   const desc = pickDesc(item, lang) || '';
   const catLabel = _mpCategoryLabel(item.category, lang);
+  const statusLabel = _mpReviewStatusLabel(item.status || item.state);
   const versionLabel = t('marketplace.version').replace('{version}', String(item.version || ''));
-  const installed = (kind === 'agent' ? _mpState.installedAgentIds : _mpState.installedSkillIds).has(item.id);
+  const status = _mpInstallStatus(kind, item);
   const installing = _mpState.installing.has(`${kind}:${item.id}`);
 
   // Avatar slot — only agents have icon/color; skill detail keeps the slot empty so the
@@ -834,13 +1101,13 @@ function _mpRenderDetail() {
       avatarSlot.style.display = 'none';
     }
   }
-  // Name + version share a row; category chips drop to the meta-row below.
-  panel.querySelector('[data-mp-detail-name]').innerHTML = `
-    ${escapeHtml(item.name || item.id)}
-    <span class="marketplace-detail-version">${escapeHtml(versionLabel)}</span>
-  `;
+  // Name stays ellipsized; version/category render as chips so both agent and skill details
+  // expose marketplace version even when the title is long.
+  panel.querySelector('[data-mp-detail-name]').textContent = item.name || item.id;
   panel.querySelector('[data-mp-detail-meta]').innerHTML = [
+    item.version ? `<span class="marketplace-card-chip is-version">${escapeHtml(versionLabel)}</span>` : '',
     catLabel ? `<span class="marketplace-card-chip">${escapeHtml(catLabel)}</span>` : '',
+    statusLabel ? `<span class="marketplace-card-chip is-status">${escapeHtml(statusLabel)}</span>` : '',
   ].filter(Boolean).join(' ');
   // (description used to render in a top-of-body `.marketplace-detail-desc` strip; now it's
   // the first section inside body — see `_mpAgentDetailHtml` / `_mpSkillDetailHtml`)
@@ -854,11 +1121,18 @@ function _mpRenderDetail() {
   const spinnerHtml = '<span class="marketplace-btn-spinner"></span>';
   if (installing) {
     const label = _mpState.uninstalling?.has(`${kind}:${item.id}`)
-      ? t('marketplace.uninstalling') : t('marketplace.installing');
+      ? t('marketplace.uninstalling')
+      : (status.updateAvailable ? t('marketplace.updating') : t('marketplace.installing'));
     installBtn.innerHTML = `${spinnerHtml}${escapeHtml(label)}`;
     installBtn.classList.add('is-disabled'); installBtn.disabled = true;
     installBtn.dataset.action = '';
-  } else if (installed) {
+  } else if (status.updateAvailable) {
+    installBtn.textContent = t('marketplace.update');
+    installBtn.classList.remove('is-disabled', 'btn-danger');
+    installBtn.classList.add('btn-primary');
+    installBtn.disabled = false;
+    installBtn.dataset.action = 'install';
+  } else if (status.installed) {
     installBtn.textContent = t('marketplace.uninstall');
     installBtn.classList.remove('is-disabled', 'btn-primary');
     installBtn.classList.add('btn-danger');
@@ -992,7 +1266,7 @@ function _mpSkillDetailHtml() {
         <h3 class="skills-doc-section-label skills-usage-label">
           <span>${escapeHtml(t('skills.label_usage'))}</span>
           <button type="button" class="skills-source-toggle" data-mp-source-toggle aria-expanded="false">
-            <span class="skills-source-toggle-caret" aria-hidden="true">▶</span>
+            <span class="skills-source-toggle-caret" aria-hidden="true">${typeof window !== 'undefined' && typeof window.uiIconHtml === 'function' ? window.uiIconHtml('chevron-right', 'ui-icon') : ''}</span>
             <span>${escapeHtml(t('skills.label_source'))}</span>
           </button>
         </h3>
@@ -1012,25 +1286,65 @@ function _fmtBytes(n) {
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
-async function _mpInstall(kind, id) {
-  const item = (kind === 'agent' ? _mpState.agents : _mpState.skills).find((x) => x.id === id);
+function _mpInstallKindLabel(kind) {
+  const key = kind === 'skill' ? 'marketplace_request.kind_skill' : 'marketplace_request.kind_agent';
+  const label = t(key);
+  if (label && label !== key) return label;
+  return kind === 'skill' ? 'Skill' : 'Agent';
+}
+
+function _mpInstallFailedText(kind, item, err) {
+  const failedKind = err?.marketplaceKind || kind;
+  const failedName = err?.marketplaceName || item?.name || item?.id || err?.marketplaceId || '';
+  const reason = err?.marketplaceReason || err?.message || String(err || '');
+  const tmpl = t('marketplace.install_failed_resource');
+  if (tmpl && tmpl !== 'marketplace.install_failed_resource') {
+    return tmpl
+      .replace('{kind}', _mpInstallKindLabel(failedKind))
+      .replace('{name}', failedName)
+      .replace('{reason}', reason);
+  }
+  return t('marketplace.install_failed').replace(
+    '{reason}',
+    `${_mpInstallKindLabel(failedKind)}: ${failedName}: ${reason}`,
+  );
+}
+
+function _mpInstallErrorFromResponse(r) {
+  const err = new Error((r && (r.marketplaceReason || r.error)) || 'install failed');
+  if (r && r.marketplaceKind) err.marketplaceKind = r.marketplaceKind;
+  if (r && r.marketplaceId) err.marketplaceId = r.marketplaceId;
+  if (r && r.marketplaceName) err.marketplaceName = r.marketplaceName;
+  if (r && r.marketplaceReason) err.marketplaceReason = r.marketplaceReason;
+  return err;
+}
+
+async function _mpInstall(kind, id, itemOverride = null) {
+  const item = itemOverride || (kind === 'agent' ? _mpState.agents : _mpState.skills).find((x) => x.id === id);
   if (!item) return;
   const key = `${kind}:${id}`;
   if (_mpState.installing.has(key)) return;
   _mpState.installing.add(key);
   _mpRender();
-  try {
+  const invokeInstall = async (force) => {
     const channel = kind === 'agent' ? 'marketplace.installAgent' : 'marketplace.installSkill';
     const r = await window.orkas.invoke(channel, {
-      id, version: item.version,
+      id, name: item.name || '',
+      version: item.version,
       published_at: item.published_at, updated_at: item.updated_at,
+      ...(force ? { force: true } : {}),
     });
-    if (!r || r.ok === false) throw new Error((r && r.error) || 'install failed');
-    if (kind === 'agent') _mpState.installedAgentIds.add(id);
-    else _mpState.installedSkillIds.add(id);
+    if (!r || r.ok === false) throw _mpInstallErrorFromResponse(r);
+  };
+  const markInstalled = async () => {
+    _mpMarkInstalled(kind, item);
     _mpPersistInstalled();
     if (typeof loadAgents === 'function' && kind === 'agent') await loadAgents(true);
     if (typeof loadSkills === 'function' && kind === 'skill') await loadSkills(true);
+  };
+  try {
+    await invokeInstall(false);
+    await markInstalled();
     // Success: no toast — the button flips to "Installed" + state set above is the signal.
     // (Failure still alerts because the user otherwise has no way to know why nothing happened.)
   } catch (err) {
@@ -1039,15 +1353,30 @@ async function _mpInstall(kind, id) {
     // instead of the generic install-failed alert. Falls back to alert if
     // the report can't be loaded.
     if (typeof isQualityRejectionError === 'function' && isQualityRejectionError(msg)) {
-      const report = await readQualityReport(kind, id);
+      const rejectedKind = err?.marketplaceKind || kind;
+      const rejectedId = err?.marketplaceId || id;
+      const rejectedName = err?.marketplaceName || item.name || id;
+      const report = await readQualityReport(rejectedKind, rejectedId);
       if (report) {
-        const title = t('quality.install_rejected_title').replace('{name}', item.name || id);
-        await showValidationReport({ title, report });
+        const title = t('quality.install_rejected_title').replace('{name}', rejectedName);
+        const forceLabel = (() => {
+          const v = t('quality.force_install');
+          return v === 'quality.force_install' ? 'Install anyway' : v;
+        })();
+        const action = await showValidationReport({ title, report, forceLabel });
+        if (action === 'force') {
+          try {
+            await invokeInstall(true);
+            await markInstalled();
+          } catch (forceErr) {
+            uiAlert(_mpInstallFailedText(kind, item, forceErr));
+          }
+        }
       } else {
-        uiAlert(t('marketplace.install_failed').replace('{reason}', msg));
+        uiAlert(_mpInstallFailedText(kind, item, err));
       }
     } else {
-      uiAlert(t('marketplace.install_failed').replace('{reason}', msg));
+      uiAlert(_mpInstallFailedText(kind, item, err));
     }
   } finally {
     _mpState.installing.delete(key);
@@ -1060,9 +1389,9 @@ async function _mpInstallFromDetail() {
   const item = _mpState.detailItem;
   const kind = _mpState.detailKind;
   if (!item || !kind) return;
-  const installed = (kind === 'agent' ? _mpState.installedAgentIds : _mpState.installedSkillIds).has(item.id);
-  if (installed) await _mpUninstall(kind, item.id);
-  else await _mpInstall(kind, item.id);
+  const status = _mpInstallStatus(kind, item);
+  if (status.installed && !status.updateAvailable) await _mpUninstall(kind, item.id);
+  else await _mpInstall(kind, item.id, item);
 }
 
 async function _mpUninstall(kind, id) {
@@ -1078,6 +1407,8 @@ async function _mpUninstall(kind, id) {
     if (!r || r.ok === false) throw new Error((r && r.error) || 'uninstall failed');
     if (kind === 'agent') _mpState.installedAgentIds.delete(id);
     else _mpState.installedSkillIds.delete(id);
+    if (kind === 'agent') _mpState.installedAgentMeta?.delete(id);
+    else _mpState.installedSkillMeta?.delete(id);
     _mpPersistInstalled();
     if (typeof loadAgents === 'function' && kind === 'agent') await loadAgents(true);
     if (typeof loadSkills === 'function' && kind === 'skill') await loadSkills(true);
@@ -1093,6 +1424,76 @@ async function _mpUninstall(kind, id) {
   }
 }
 
+function _mpMarkInstalled(kind, item) {
+  const ids = kind === 'agent' ? _mpState.installedAgentIds : _mpState.installedSkillIds;
+  const map = kind === 'agent' ? _mpState.installedAgentMeta : _mpState.installedSkillMeta;
+  ids.add(item.id);
+  if (map) {
+    map.set(item.id, _mpNormalizeInstallMeta({
+      id: item.id,
+      version: item.version,
+      published_at: item.published_at,
+      updated_at: item.updated_at,
+    }));
+  }
+}
+
+function _mpInstallStatus(kind, item) {
+  const ids = kind === 'agent' ? _mpState.installedAgentIds : _mpState.installedSkillIds;
+  const map = kind === 'agent' ? _mpState.installedAgentMeta : _mpState.installedSkillMeta;
+  const installed = ids?.has(item.id) === true;
+  const meta = map?.get(item.id) || null;
+  return { installed, updateAvailable: installed && _mpMarketplaceItemIsNewer(item, meta) };
+}
+
+function _mpMarketplaceItemIsNewer(item, local) {
+  if (!item || !local) return false;
+  const versionCmp = _mpCompareVersions(item.version, local.version);
+  if (versionCmp > 0) return true;
+  const remoteFresh = _mpFreshnessAt(item);
+  const localFresh = _mpFreshnessAt(local);
+  return Number.isFinite(remoteFresh) && Number.isFinite(localFresh) && remoteFresh > localFresh;
+}
+
+function _mpFreshnessAt(row) {
+  const v = row?.updated_at ?? row?.marketplace_updated_at ?? row?.published_at ?? row?.marketplace_published_at;
+  return typeof v === 'number' ? v : NaN;
+}
+
+function _mpCompareVersions(a, b) {
+  const aa = _mpVersionTokens(a);
+  const bb = _mpVersionTokens(b);
+  if (!aa.length || !bb.length) return 0;
+  const n = Math.max(aa.length, bb.length);
+  for (let i = 0; i < n; i++) {
+    const x = aa[i] ?? 0;
+    const y = bb[i] ?? 0;
+    if (x === y) continue;
+    if (typeof x === 'number' && typeof y === 'number') return x > y ? 1 : -1;
+    return String(x).localeCompare(String(y), undefined, { numeric: true, sensitivity: 'base' });
+  }
+  return 0;
+}
+
+function _mpCompareMarketplaceName(a, b) {
+  const ka = _mpMarketplaceNameSortKey(a);
+  const kb = _mpMarketplaceNameSortKey(b);
+  if (ka < kb) return -1;
+  if (ka > kb) return 1;
+  return String(a?.id || '').localeCompare(String(b?.id || ''), undefined, { numeric: true, sensitivity: 'base' });
+}
+
+function _mpMarketplaceNameSortKey(item) {
+  const name = String(item?.name || item?.id || '');
+  return (typeof pinyinSortKey === 'function') ? pinyinSortKey(name) : name.toLowerCase();
+}
+
+function _mpVersionTokens(v) {
+  const s = String(v || '').trim().replace(/^v/i, '');
+  if (!s) return [];
+  return (s.match(/\d+|[a-zA-Z]+/g) || []).map((part) => (/^\d+$/.test(part) ? Number(part) : part.toLowerCase()));
+}
+
 // Dev-only `_mpDeleteFromDetail` moved to marketplace_dev.js.
 
 // ─── Shared: category dropdown mount ──────────────────────────────────
@@ -1104,7 +1505,7 @@ async function mountMarketplaceCategorySelect(elId, initialValue = '') {
   if (!el) return;
   let categories = [];
   try {
-    const r = await window.orkas.invoke('marketplace.categories', {});
+    const r = await window.orkas.invoke('marketplace.categories', { local_only: true });
     categories = (r && r.list) || [];
   } catch { /* swallowed — main's fallback handles it */ }
   const lang = (typeof getLang === 'function') ? getLang() : 'zh';

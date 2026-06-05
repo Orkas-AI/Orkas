@@ -3,7 +3,7 @@
 // baking it into index.html and keeps this module self-contained.
 //
 // Interactions:
-//   - Click backdrop / × button / Esc        → close
+//   - × button / Esc                         → close
 //   - Wheel                                   → zoom (cursor-anchored)
 //   - + / =                                   → zoom in (around image center)
 //   - - / _                                   → zoom out
@@ -22,7 +22,9 @@
 
 let _lightboxEl = null;
 let _lightboxImg = null;
+let _lightboxAddLibraryBtn = null;
 let _lightboxKeyHandler = null;
+let _lightboxCurrentFile = null;
 
 // Zoom / pan state. Reset on every close so the next open starts at 1×.
 let _scale = 1;
@@ -139,10 +141,17 @@ function _ensureLightbox() {
   root.className = 'chat-lightbox';
   root.setAttribute('aria-hidden', 'true');
   const closeLabel = t('chat.lightbox_close_title');
+  const addLabel = t('chat.preview_add_library_title');
+  const libraryIcon = (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function')
+    ? window.uiIconHtml('database', 'chat-lightbox-library-icon')
+    : '';
   root.innerHTML = `
     <div class="chat-lightbox-backdrop"></div>
     <div class="chat-lightbox-stage">
       <img class="chat-lightbox-img" alt="" draggable="false" />
+      <button type="button" class="chat-lightbox-add-library" aria-label="${addLabel}" title="${addLabel}" hidden>
+        ${libraryIcon}
+      </button>
       <button type="button" class="chat-lightbox-close" aria-label="${closeLabel}" title="${closeLabel}">×</button>
     </div>
   `;
@@ -159,14 +168,20 @@ function _ensureLightbox() {
       btn.setAttribute('aria-label', label);
       btn.setAttribute('title', label);
     }
+    const add = _lightboxEl.querySelector('.chat-lightbox-add-library');
+    if (add) {
+      const label = t('chat.preview_add_library_title');
+      add.setAttribute('aria-label', label);
+      add.setAttribute('title', label);
+    }
   });
   _lightboxEl = root;
   _lightboxImg = root.querySelector('.chat-lightbox-img');
+  _lightboxAddLibraryBtn = root.querySelector('.chat-lightbox-add-library');
 
-  // Backdrop + × close; clicking the image itself does NOT close so user
-  // can drag-to-pan or right-click save without accidentally dismissing.
-  root.querySelector('.chat-lightbox-backdrop').addEventListener('click', closeChatImageLightbox);
+  // × closes; backdrop clicks are ignored to avoid accidental dismissals.
   root.querySelector('.chat-lightbox-close').addEventListener('click', closeChatImageLightbox);
+  _lightboxAddLibraryBtn.addEventListener('click', _onLightboxAddLibrary);
 
   // Zoom + pan. wheel must be non-passive to allow preventDefault (modern
   // Chromium defaults wheel listeners on document/window to passive).
@@ -181,12 +196,54 @@ function _ensureLightbox() {
   return root;
 }
 
-function openChatImageLightbox(src, alt) {
+async function _onLightboxAddLibrary(e) {
+  e.stopPropagation();
+  if (!_lightboxCurrentFile || !_lightboxAddLibraryBtn || _lightboxAddLibraryBtn.disabled) return;
+  const file = _lightboxCurrentFile;
+  const original = _lightboxAddLibraryBtn.innerHTML;
+  _lightboxAddLibraryBtn.disabled = true;
+  try {
+    const payload = { path: file.absPath };
+    if (file.cid) payload.cid = file.cid;
+    if (file.projectId) payload.projectId = file.projectId;
+    const res = await window.orkas.invoke('library.importProduced', payload);
+    if (!res || !res.ok) throw new Error((res && res.error) || 'failed');
+    const checkIcon = (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function')
+      ? window.uiIconHtml('check', 'chat-lightbox-library-icon')
+      : '';
+    _lightboxAddLibraryBtn.innerHTML = checkIcon;
+    if (res.scope === 'global' && typeof currentView !== 'undefined' && currentView === 'contexts' && typeof loadContexts === 'function') loadContexts();
+    if (res.scope === 'project' && res.projectId && typeof currentView !== 'undefined' && currentView === 'project' && typeof loadProjectDetail === 'function') {
+      loadProjectDetail(res.projectId).catch(() => {});
+    }
+  } catch (err) {
+    let message = `Add to Library failed: ${String(err && err.message || err)}`;
+    try {
+      const got = t('chat.preview_add_library_failed_with', { reason: String(err && err.message || err) });
+      if (got && got !== 'chat.preview_add_library_failed_with') message = got;
+    } catch (_) { /* keep fallback */ }
+    if (typeof uiAlert === 'function') await uiAlert(message);
+  } finally {
+    setTimeout(() => {
+      if (!_lightboxAddLibraryBtn) return;
+      _lightboxAddLibraryBtn.innerHTML = original;
+      _lightboxAddLibraryBtn.disabled = false;
+    }, 1500);
+  }
+}
+
+function openChatImageLightbox(src, alt, opts) {
   if (!src) return;
   const el = _ensureLightbox();
   _resetZoom();
   _lightboxImg.src = src;
   _lightboxImg.alt = alt || '';
+  _lightboxCurrentFile = opts && opts.absPath ? {
+    absPath: opts.absPath,
+    cid: opts.cid || null,
+    projectId: opts.projectId || null,
+  } : null;
+  if (_lightboxAddLibraryBtn) _lightboxAddLibraryBtn.hidden = !_lightboxCurrentFile;
   el.classList.add('is-open');
   el.setAttribute('aria-hidden', 'false');
   if (!_lightboxKeyHandler) {
@@ -222,6 +279,8 @@ function closeChatImageLightbox() {
     // start with transition:none stuck on the element.
     _lightboxImg.style.transition = '';
   }
+  _lightboxCurrentFile = null;
+  if (_lightboxAddLibraryBtn) _lightboxAddLibraryBtn.hidden = true;
   _isPanning = false;
   _resetZoom();
   if (_lightboxKeyHandler) {

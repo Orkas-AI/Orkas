@@ -20,8 +20,7 @@
  *
  * Scope is enforced via `util/path-sandbox.isPathAllowed`: path-taking tools
  * first verify the target falls under
- *   [ active workspace dir,  chat_attachments/<cid>/, project files /
- *     caller-provided extra roots ].
+ *   [ active workspace dir, chat_attachments/<cid>/, caller-provided extra roots ].
  * Paths outside that set return an explicit E_PATH_OUT_OF_SCOPE error.
  *
  * These tools do NOT require localExec permission — they only read from
@@ -44,10 +43,12 @@ import {
   NeedStatError,
   NoTextError,
 } from '../../features/file_indexer';
-import { chatAttachmentDir } from '../../paths';
+import { chatAttachmentDir, userMarketplaceSkillsDir, userSkillsDir } from '../../paths';
 import { getWorkspacePath } from '../../features/user_workspace';
 import { isPathAllowed } from '../../util/path-sandbox';
+import { macosTccSensitivePath } from '../../util/macos-tcc';
 import { parseSkillPath } from '../../features/expert_signals/skill_path';
+import { isSkillEnabled } from '../../features/component_enabled';
 
 const log = createLogger('file-tools');
 
@@ -132,10 +133,32 @@ function guardPath(opts: FileToolsOpts, abs: string): string | null {
   if (!isPathAllowed(abs, allowedRoots(opts))) {
     return errText(
       'E_PATH_OUT_OF_SCOPE',
-      `path is outside the current conversation's visible scope (workspace + attachments + project files): ${abs}`,
+      `path is outside the current conversation's visible scope (workspace + attachments): ${abs}`,
     );
   }
   return null;
+}
+
+function disabledSystemASkillIdForPath(opts: FileToolsOpts, abs: string): string | null {
+  const uid = opts.userId;
+  if (!uid) return null;
+  const roots = [userSkillsDir(uid), userMarketplaceSkillsDir(uid)];
+  for (const root of roots) {
+    const rel = path.relative(path.resolve(root), path.resolve(abs));
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) continue;
+    const skillId = rel.split(path.sep)[0];
+    if (skillId && !isSkillEnabled(uid, skillId)) return skillId;
+  }
+  return null;
+}
+
+function guardDisabledSkillAccess(opts: FileToolsOpts, abs: string): string | null {
+  const skillId = disabledSystemASkillIdForPath(opts, abs);
+  if (!skillId) return null;
+  return errText(
+    'E_SKILL_DISABLED',
+    `skill "${skillId}" is disabled for this user; re-enable it before reading or running its workflow.`,
+  );
 }
 
 // ── read_file ─────────────────────────────────────────────────────────────
@@ -147,7 +170,7 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
       'Read a slice of a file\'s text by absolute path.\n'
       + '\n'
       + 'Parameters:\n'
-      + '  path      — required. Must be inside the current workspace, this conversation\'s attachment dir, or a listed project file.\n'
+      + '  path      — required. Must be inside the current workspace or this conversation\'s attachment dir.\n'
       + '  charStart — 0-based inclusive start offset. Default 0.\n'
       + '  charEnd   — 0-based exclusive end offset.  Default = total_chars (end of file).\n'
       + '\n'
@@ -170,7 +193,7 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
     inputSchema: {
       type: 'object',
       properties: {
-        path:      { type: 'string', description: 'Absolute path. Must be inside workspace, current attachment dir, or project files.' },
+        path:      { type: 'string', description: 'Absolute path. Must be inside workspace or current attachment dir.' },
         charStart: { type: 'number', description: '0-based start char (inclusive). Default 0.' },
         charEnd:   { type: 'number', description: '0-based end char (exclusive). Default total_chars.' },
       },
@@ -185,6 +208,11 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
       if (scopeErr) {
         log.warn(`read_file scope reject user=${opts.userId} path=${abs}`);
         return { content: scopeErr, isError: true };
+      }
+      const disabledSkillErr = guardDisabledSkillAccess(opts, abs);
+      if (disabledSkillErr) {
+        log.warn(`read_file disabled skill reject user=${opts.userId} path=${abs}`);
+        return { content: disabledSkillErr, isError: true };
       }
 
       try { fs.statSync(abs); }
@@ -228,6 +256,7 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
           `kind="${kind}"`,
           `total_chars="${total}"`,
           `covered="${cs}-${ce}"`,
+          ...(result.meta.extractionEmpty ? ['extraction="empty_pages"'] : []),
         ];
         const header = `<file ${attrs.join(' ')}>`;
         log.info(
@@ -279,7 +308,7 @@ function createStatFileTool(opts: FileToolsOpts): AgentTool {
       + '`total_chars` for the file — typically for a pdf/docx that has never been read.\n'
       + '\n'
       + 'Parameters:\n'
-      + '  path — required. Absolute path inside workspace, current attachment dir, or project files.\n'
+      + '  path — required. Absolute path inside workspace or current attachment dir.\n'
       + '\n'
       + 'Response:\n'
       + '  <file path="..." kind="text|pdf|docx" total_chars="N"/>\n'
@@ -292,7 +321,7 @@ function createStatFileTool(opts: FileToolsOpts): AgentTool {
     inputSchema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Absolute path. Must be inside workspace, current attachment dir, or project files.' },
+        path: { type: 'string', description: 'Absolute path. Must be inside workspace or current attachment dir.' },
       },
       required: ['path'],
     },
@@ -306,6 +335,11 @@ function createStatFileTool(opts: FileToolsOpts): AgentTool {
         log.warn(`stat_file scope reject user=${opts.userId} path=${abs}`);
         return { content: scopeErr, isError: true };
       }
+      const disabledSkillErr = guardDisabledSkillAccess(opts, abs);
+      if (disabledSkillErr) {
+        log.warn(`stat_file disabled skill reject user=${opts.userId} path=${abs}`);
+        return { content: disabledSkillErr, isError: true };
+      }
 
       try { fs.statSync(abs); }
       catch (err) {
@@ -317,9 +351,13 @@ function createStatFileTool(opts: FileToolsOpts): AgentTool {
       try {
         const meta = await statFile(opts.userId, abs);
         const total = meta.totalChars ?? 0;
-        log.info(`stat_file user=${opts.userId} kind=${kind} total_chars=${total} path=${abs}`);
+        const emptyAttr = meta.extractionEmpty ? ' extraction="empty_pages"' : '';
+        log.info(
+          `stat_file user=${opts.userId} kind=${kind} total_chars=${total}`
+          + `${meta.extractionEmpty ? ' extraction=empty_pages' : ''} path=${abs}`,
+        );
         return {
-          content: `<file path="${abs}" kind="${kind}" total_chars="${total}"/>`,
+          content: `<file path="${abs}" kind="${kind}" total_chars="${total}"${emptyAttr}/>`,
         };
       } catch (err) {
         if (err instanceof NoTextError) {
@@ -363,13 +401,15 @@ function compileMatcher(query: string): (name: string) => boolean {
   return (name) => name.toLowerCase().includes(lower);
 }
 
-function walkFiles(root: string, max: number): string[] {
+function walkFiles(root: string, max: number): { files: string[]; skippedReason?: string } {
   const out: string[] = [];
-  if (!root) return out;
+  if (!root) return { files: out };
+  const protectedRoot = macosTccSensitivePath(path.resolve(root), { recursive: true });
+  if (protectedRoot) return { files: out, skippedReason: protectedRoot.reason };
   let rootStat: fs.Stats;
   try { rootStat = fs.statSync(root); }
-  catch { return out; }
-  if (!rootStat.isDirectory()) return out;
+  catch { return { files: out }; }
+  if (!rootStat.isDirectory()) return { files: out };
 
   const stack: string[] = [root];
   while (stack.length && out.length < max) {
@@ -387,7 +427,7 @@ function walkFiles(root: string, max: number): string[] {
       }
     }
   }
-  return out;
+  return { files: out };
 }
 
 function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
@@ -434,10 +474,16 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
       }
 
       const hits: SearchHit[] = [];
+      const skippedScans: string[] = [];
       let budget = MAX_SCAN_FILES;
       for (const { root, source } of rootKinds) {
         if (budget <= 0) break;
-        const files = walkFiles(root, budget);
+        const scan = walkFiles(root, budget);
+        if (scan.skippedReason) {
+          skippedScans.push(`${source}:${scan.skippedReason}`);
+          continue;
+        }
+        const files = scan.files;
         budget -= files.length;
         for (const abs of files) {
           const name = path.basename(abs);
@@ -466,6 +512,11 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
 
       hits.sort((a, b) => b.mtime - a.mtime);
       if (!hits.length) {
+        if (skippedScans.length) {
+          return {
+            content: 'No files were scanned in the privacy-protected workspace. Use an exact path with read_file/stat_file, or ask the user to attach the file.',
+          };
+        }
         return { content: query ? `No matches for "${query}".` : 'No files found.' };
       }
       const lines = hits.map((h) => {
@@ -557,12 +608,23 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
       }
 
       const targets: Array<{ abs: string; source: 'attachment' | 'workspace' }> = [];
+      const skippedScans: string[] = [];
       let budget = MAX_SCAN_FILES;
       for (const { root, source } of rootKinds) {
         if (budget <= 0) break;
-        const files = walkFiles(root, budget);
+        const scan = walkFiles(root, budget);
+        if (scan.skippedReason) {
+          skippedScans.push(`${source}:${scan.skippedReason}`);
+          continue;
+        }
+        const files = scan.files;
         budget -= files.length;
         for (const abs of files) targets.push({ abs, source });
+      }
+      if (!targets.length && skippedScans.length) {
+        return {
+          content: 'No files were scanned in the privacy-protected workspace. Use an exact path with read_file/stat_file, or ask the user to attach the file.',
+        };
       }
 
       let scanned = 0, skipped = 0, extracted = 0;

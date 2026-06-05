@@ -60,12 +60,14 @@ describe('component_enabled resolver', () => {
   it('setEnabled(true) clears the prior false override (only false persisted)', async () => {
     const ce = await import('../../../src/main/features/component_enabled');
     ce.setSkillEnabled(TEST_UID, 's1', false);
+    const disabledClock = ce.readEnabledMap(TEST_UID)._item_updated_at?.skills?.s1 || 0;
     expect(ce.isSkillEnabled(TEST_UID, 's1')).toBe(false);
     ce.setSkillEnabled(TEST_UID, 's1', true);
     expect(ce.isSkillEnabled(TEST_UID, 's1')).toBe(true);
     // The on-disk map should not contain s1 at all (true is the absence default).
     const map = ce.readEnabledMap(TEST_UID);
     expect(map.skills).not.toHaveProperty('s1');
+    expect(map._item_updated_at?.skills?.s1).toBeGreaterThan(disabledClock);
   });
 
   it('readDisabledSets returns ids of currently-disabled overrides only', async () => {

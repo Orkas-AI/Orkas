@@ -66,8 +66,7 @@ function logRecord(record) {
 // Push-event subscription — for main-initiated broadcasts where the renderer doesn't drive
 // the lifecycle (unlike `stream` which the renderer starts). Channel names are restricted to
 // a known prefix list so the renderer can't tap into arbitrary internal IPC traffic.
-// Sync + auto-updater push channels are stripped from this build along with their producers.
-const PUSH_EVENT_PREFIXES = ['marketplace:', 'conversations:'];
+const PUSH_EVENT_PREFIXES = ['marketplace:', 'conversations:', 'connectors:', 'client-config:', 'delete_file.'];
 function isAllowedPushChannel(channel) {
   if (typeof channel !== 'string') return false;
   return PUSH_EVENT_PREFIXES.some((p) => channel.startsWith(p));
@@ -125,20 +124,35 @@ function stream(channel, payload, onEvent) {
   return { promise, cancel };
 }
 
+// Quality validator — renderer reads persisted ValidationReports to display the
+// violation list when a write / install was rejected.
 const quality = {
   readSkillReport: (id) => invoke('quality.readSkillReport', { id }),
   readAgentReport: (id) => invoke('quality.readAgentReport', { id }),
 };
 
+// Global recycle bin. Unlike `sync`, this stays available in offline builds:
+// it contains both cloud-sync tombstones (when sync exists) and local in-app
+// delete snapshots.
+const recycleBin = {
+  list: () => invoke('recycle.list'),
+  restore: (id) => invoke('recycle.restore', { id: String(id || '') }),
+  delete: (id) => invoke('recycle.delete', { id: String(id || '') }),
+};
+
+// Expose the sync-fetched i18n bundle on its own bridge key so the renderer
+// can pick it up at module load. Read-only — the renderer never mutates it.
 contextBridge.exposeInMainWorld('__orkasI18nBoot', _i18nBoot);
 
 contextBridge.exposeInMainWorld('orkas', {
   ping: () => ipcRenderer.invoke('orkas.ping'),
   diagnostics: () => ipcRenderer.invoke('orkas.diagnostics'),
-  appVersion: () => ipcRenderer.invoke('orkas.appVersion'),
+  env: () => ipcRenderer.invoke('orkas.env'),
+  relaunch: () => ipcRenderer.invoke('orkas.relaunch'),
   getLanguage: () => invoke('config.getLanguage'),
   setLanguage: (language) => invoke('config.setLanguage', { language }),
   getLocales: () => invoke('config.getLocales'),
+  recycleBin,
   quality,
   invoke,
   stream,

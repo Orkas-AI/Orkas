@@ -49,10 +49,10 @@ function call(channel: string, payload: unknown = {}): ReturnType<InvokeFn> {
 }
 
 describe('ipc › permissions.* routes', () => {
-  it('permissions.getLocalExec defaults to not-granted on a fresh install', async () => {
+  it('permissions.getLocalExec defaults to granted on a fresh install', async () => {
     const res = await call('permissions.getLocalExec');
     expect(res.ok).toBe(true);
-    expect(res.granted).toBe(false);
+    expect(res.granted).toBe(true);
   });
 
   it('permissions.grantLocalExec flips the flag and persists', async () => {
@@ -74,7 +74,7 @@ describe('ipc › permissions.* routes', () => {
   });
 
   it('unknown permissions.* channel surfaces the router fallback error', async () => {
-    // Regression guard: this is the exact symptom that made "授权本机执行"
+    // Regression guard: this is the exact symptom that made "授权本机工具"
     // look dead — when a handler is missing, the router returns
     // { ok: false, error: 'unknown channel: ...' } and settings.js's
     // `if (res && res.ok)` silently no-ops. Make sure the three real

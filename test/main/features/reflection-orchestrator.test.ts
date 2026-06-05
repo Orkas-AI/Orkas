@@ -183,6 +183,70 @@ describe('reflection-orchestrator › runOneCycle', () => {
   });
 });
 
+// ── isAgentDirty (cross-agent dispatch fix) ─────────────────────────────
+
+describe('reflection-orchestrator › isAgentDirty', () => {
+  function writeConvIndex(uid: string, conv: { cid: string; agent_id: string }): void {
+    const idxPath = path.join(tmpDir, uid, 'cloud', 'chats', '_index.json');
+    fs.mkdirSync(path.dirname(idxPath), { recursive: true });
+    const list = fs.existsSync(idxPath) ? JSON.parse(fs.readFileSync(idxPath, 'utf8')) : [];
+    list.unshift({
+      conversation_id: conv.cid,
+      title: `t-${conv.cid}`,
+      kind: conv.agent_id ? 'agent_run' : 'normal',
+      agent_id: conv.agent_id,
+      skill_id: '',
+      session_id: `gconv-${conv.cid}`,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    });
+    fs.writeFileSync(idxPath, JSON.stringify(list));
+  }
+
+  function writeSessionFile(uid: string, sessionId: string, lines: any[]): void {
+    const file = path.join(tmpDir, uid, 'cloud', 'sessions', `${sessionId}.jsonl`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+  }
+
+  it('detects dispatched-in agent by gmember mtime even when conv.agent_id differs', async () => {
+    // c1 started by "other", commander dispatched "target" via plan_set.
+    // No signals.jsonl entries. Old design's listConversations+filter would
+    // miss this; the new filesystem-scan path catches it.
+    writeConvIndex(TEST_UID, { cid: 'c1', agent_id: 'other' });
+    writeSessionFile(TEST_UID, 'gmember-c1-target', [
+      { role: 'assistant', content: [{ type: 'text', text: 'hi from target' }], ts: 100 },
+    ]);
+
+    const mod = await loadModule();
+    expect(await mod.isAgentDirty(TEST_UID, 'target', 0)).toBe(true);
+  });
+
+  it('returns false when gmember file mtime is older than sinceMs', async () => {
+    writeConvIndex(TEST_UID, { cid: 'c1', agent_id: 'other' });
+    const file = path.join(tmpDir, TEST_UID, 'cloud', 'sessions', 'gmember-c1-target.jsonl');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '{"role":"assistant","content":[{"type":"text","text":"old"}],"ts":1}\n');
+    const ancient = Date.now() - 30 * 86400 * 1000;
+    fs.utimesSync(file, ancient / 1000, ancient / 1000);
+
+    const mod = await loadModule();
+    const since = Date.now() - 86400 * 1000;  // 1 day ago
+    expect(await mod.isAgentDirty(TEST_UID, 'target', since)).toBe(false);
+  });
+
+  it('returns false when no gmember file exists for the agent', async () => {
+    writeConvIndex(TEST_UID, { cid: 'c1', agent_id: 'other' });
+    writeSessionFile(TEST_UID, 'gmember-c1-other', [
+      { role: 'assistant', content: [{ type: 'text', text: 'other' }], ts: 100 },
+    ]);
+
+    const mod = await loadModule();
+    // 'target' has no gmember file → not dirty (regardless of c1's existence)
+    expect(await mod.isAgentDirty(TEST_UID, 'target', 0)).toBe(false);
+  });
+});
+
 // ── readReflectionState / writeReflectionState round-trip ───────────────
 
 describe('reflection-orchestrator › state persistence', () => {

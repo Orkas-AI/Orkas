@@ -24,12 +24,13 @@ import * as path from 'node:path';
 
 import {
   userSkillsDir, userSkillChatDir, userSessionFile, WS_ROOT, SRC_ROOT,
-  userMarketplaceSkillsDir,
+  userMarketplaceSkillsDir, chatAttachmentDir,
 } from '../paths';
 import { evictSession } from '../model/core-agent/session-store';
 import { getActiveUserId } from './users';
 import { createLogger } from '../logger';
 import { t, buildLanguageDirective } from '../i18n';
+import { buildAttachmentManifest } from './chat_attachments';
 
 // Custom skills live per-user at `<uid>/cloud/skills/`. Resolved lazily
 // from the active uid.
@@ -48,6 +49,7 @@ import { readDisabledSets, setSkillEnabled } from './component_enabled';
 import { findOuterTagRanges } from '../util/markdown-prose-code';
 import {
   validateSkillFile,
+  validateSkillDir,
   ValidationReport as QualityReport,
 } from '../quality';
 import { persistReport as persistQualityReport } from '../quality/report';
@@ -55,21 +57,35 @@ import {
   DEFAULT_MARKETPLACE_CATEGORY_CODE,
   normalizeMarketplaceCategoryCode,
 } from './marketplace_biz';
+import { NAME_DISPLAY_MAX_UNITS, nameDisplayWidth } from '../util/name-limit';
 
 // Names hidden from the in-app skill source-tree view. `_install.json` (marketplace install
 // version pin) and `_cache.json` (marketplace cache LRU bookkeeping) are tooling sidecars,
 // not authored content — surfacing them confuses users and looks like noise in the file list.
 const SKILL_TREE_IGNORE: ReadonlySet<string> = new Set([
   '.DS_Store', '__pycache__', '.git', 'node_modules',
+  '.venv', 'venv', '.pytest_cache', '.mypy_cache', '.ruff_cache', '.uv-cache',
+  '.tox', '.nox', '.nyc_output', 'htmlcov',
+  'dist', 'build', 'out', 'target', 'coverage',
+  '.cache', '.parcel-cache', '.next', '.nuxt', '.turbo',
+  '.npm', '.pnpm-store', '.yarn', '.vite', '.svelte-kit',
+  'tmp', 'temp', '.tmp', 'logs', 'log',
   '_install.json', '_cache.json',
 ]);
-// Starts with a letter, then letters/digits/_/-; single spaces are allowed
-// between word groups (no leading/trailing/consecutive spaces).
-const SKILL_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]*(?: [A-Za-z0-9_-]+)*$/;
+
+function _isGeneratedSkillSidecarName(name: string): boolean {
+  if (/\.(pyc|pyo|log|tmp|temp|tsbuildinfo)$/.test(name)) return true;
+  if (name === '.coverage' || name === '.eslintcache') return true;
+  if (name.includes('.bak-')) return true;
+  return false;
+}
+// Starts with a letter, then letters/digits/_/-. Spaces are not allowed.
+const SKILL_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]*$/;
 const CATEGORY_LINE_RE = /(^|\n)category\s*:\s*(.*?)(?=\n|$)/;
 // Block syntax: `<<<skill-file path=<rel> ... >>>`. Cross-skill writes (the
 // old `skill=<id>` attribute) are no longer supported — every skill is
-// self-contained. Attribute order is flexible.
+// self-contained. Attribute order is flexible. File deletion is NOT done
+// through this block — use the `delete_file` tool (per-call UI confirm).
 const SKILL_FILE_BLOCK_RE = /<<<skill-file((?:\s+\w+=\S+)+)\s*\n(.*?)\n>>>/gs;
 
 function _parseSkillFileAttrs(raw: string): { path?: string } {
@@ -99,12 +115,19 @@ export interface SkillListing {
    *  `features/component_enabled.ts`. Defaults to true unless the user has
    *  explicitly disabled the skill. */
   enabled: boolean;
-  /** Marketplace author uid. Kept optional for install/reconcile compatibility; global UI
-   *  surfaces must not render it. */
-  create_uid?: string;
   /** Marketplace install version for `source==='marketplace'`. Read from `_install.json` so the
    *  skills-tab card can render a `v1.0.0` chip. Undefined for custom skills. */
   version?: string;
+  /** Marketplace install freshness read from `_install.json`. Renderer marketplace uses this
+   *  to decide whether the server listing is newer than the local install. */
+  marketplace_published_at?: number;
+  marketplace_updated_at?: number;
+  /** Server-side fresh-install seed flag mirrored from marketplace metadata. */
+  default_install?: boolean;
+  /** Dev-only publishing metadata mirrored from marketplace metadata. */
+  is_open_source?: boolean;
+  /** Marketplace review lifecycle status. Custom skills read it from SKILL.md, marketplace skills from `_install.json`. */
+  status?: string;
 }
 
 export interface CustomSkill {
@@ -113,6 +136,7 @@ export interface CustomSkill {
   description_zh: string;
   description_en: string;
   category: string;
+  status?: string;
   source: 'custom';
   dir: string;
 }
@@ -125,6 +149,7 @@ export interface SkillForEdit {
   description_zh: string;
   description_en: string;
   category: string;
+  status?: string;
   source: SkillSource;
   dir: string;
 }
@@ -260,15 +285,25 @@ function skillBaseDir(source: SkillSourceInput): string {
   return normalizeSkillSource(source) === 'custom' ? CUSTOM_SKILLS_DIR() : userMarketplaceSkillsDir(getActiveUserId());
 }
 
+function skillMdFile(dir: string): string {
+  return path.join(dir, 'SKILL.md');
+}
+
+function hasSkillMd(dir: string): boolean {
+  try { return fs.statSync(skillMdFile(dir)).isFile(); }
+  catch { return false; }
+}
+
 // Module-level cache for `listSkills`.
 interface SkillListCache { stamp: string; data: SkillListing[] }
 let _skillListCache: SkillListCache | null = null;
 
 function _invalidateSkillListCache(opts: { markDirty?: boolean } = {}): void {
   _skillListCache = null;
-  // features/sync stripped from the OrkasOpen build — `opts.markDirty` has no
-  // downstream consumer; consume the param to keep the signature stable.
-  void opts;
+  if (opts.markDirty === false) return;
+  // Sync engine dirty signal (lazy-require — stripped in OrkasOpen). Mirrors the pattern in
+  // `agents.ts::_invalidateAgentListCache`: every cache-invalidate is also a disk-mutation
+  // point, co-locating keeps wiring tight.
 }
 
 /** Internal cache invalidator + core-agent registry invalidator. Exported for
@@ -306,10 +341,11 @@ export async function getSkillForEdit(skillId: string): Promise<SkillForEdit | n
   for (const [source, base] of sources) {
     const d = path.join(base, skillId);
     if (!fs.existsSync(d) || !fs.statSync(d).isDirectory()) continue;
+    if (!hasSkillMd(d)) continue;
     let name = skillId;
     let descPair = { description_zh: '', description_en: '' };
     let category = '';
-    const md = path.join(d, 'SKILL.md');
+    const md = skillMdFile(d);
     if (fs.existsSync(md)) {
       try {
         const { meta } = splitSkillMd(fs.readFileSync(md, 'utf8'));
@@ -326,7 +362,20 @@ export async function getSkillForEdit(skillId: string): Promise<SkillForEdit | n
 function _skillDirStamp(): string {
   let stamp = '';
   for (const d of [CUSTOM_SKILLS_DIR(), userMarketplaceSkillsDir(getActiveUserId())]) {
-    try { stamp += `${d}:${fs.statSync(d).mtimeMs};`; }
+    try {
+      const root = fs.statSync(d);
+      stamp += `${d}:${root.mtimeMs};`;
+      const children = fs.readdirSync(d, { withFileTypes: true })
+        .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+        .map((e) => e.name)
+        .sort();
+      for (const child of children) {
+        const childDir = path.join(d, child);
+        let childMtime = 0;
+        try { childMtime = fs.statSync(childDir).mtimeMs; } catch { /* ignore */ }
+        stamp += `${child}:${childMtime}:${hasSkillMd(childDir) ? 1 : 0};`;
+      }
+    }
     catch { stamp += `${d}:0;`; }
   }
   return stamp;
@@ -334,55 +383,83 @@ function _skillDirStamp(): string {
 
 export async function listSkills(): Promise<SkillListing[]> {
   const stamp = _skillDirStamp();
-  if (_skillListCache && _skillListCache.stamp === stamp) return _skillListCache.data;
-
-  const out: SkillListing[] = [];
-  const seen = new Set<string>();
-  // Custom first so it wins on id collision (matches openclaw symlink rule).
-  const sources: Array<[SkillSource, string]> = [['custom', CUSTOM_SKILLS_DIR()], ['marketplace', userMarketplaceSkillsDir(getActiveUserId())]];
-  for (const [source, baseDir] of sources) {
-    if (!fs.existsSync(baseDir)) continue;
-    const names = fs.readdirSync(baseDir, { withFileTypes: true })
-      .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
-      .map((e) => e.name)
-      .sort();
-    for (const name of names) {
-      if (seen.has(name)) {
-        if (isMarketplaceSource(source)) {
-          log.warn(`id conflict: custom and marketplace both define "${name}" — custom wins, rename one`);
-        }
-        continue;
-      }
-      seen.add(name);
-      const skillMd = path.join(baseDir, name, 'SKILL.md');
-      let displayName = name;
-      let descPair = { description_zh: '', description_en: '' };
-      let category = '';
-      let version: string | undefined;
-      if (fs.existsSync(skillMd)) {
-        try {
-          const meta = parseSkillFrontmatter(fs.readFileSync(skillMd, 'utf8'));
-          descPair = migrateDescriptionPair(meta as any);
-          displayName = meta.name as string || name;
-          category = (meta.category as string) || '';
-        } catch { /* ignore */ }
-      }
-      // Marketplace-installed skills carry `_install.json` with `version`. Author uid may also
-      // be present for install/reconcile compatibility, but the global UI intentionally does
-      // not surface it.
-      if (isMarketplaceSource(source)) {
-        try {
-          const metaFile = path.join(baseDir, name, '_install.json');
-          if (fs.existsSync(metaFile)) {
-            const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
-            if (meta && typeof meta.version === 'string') version = meta.version;
+  let out: SkillListing[];
+  if (_skillListCache && _skillListCache.stamp === stamp) {
+    out = _skillListCache.data;
+  } else {
+    out = [];
+    const seen = new Set<string>();
+    // Custom first so it wins on id collision (matches openclaw symlink rule).
+    const sources: Array<[SkillSource, string]> = [['custom', CUSTOM_SKILLS_DIR()], ['marketplace', userMarketplaceSkillsDir(getActiveUserId())]];
+    for (const [source, baseDir] of sources) {
+      if (!fs.existsSync(baseDir)) continue;
+      const names = fs.readdirSync(baseDir, { withFileTypes: true })
+        .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+        .map((e) => e.name)
+        .sort();
+      for (const name of names) {
+        if (seen.has(name)) {
+          if (isMarketplaceSource(source)) {
+            log.warn(`id conflict: custom and marketplace both define "${name}" — custom wins, rename one`);
           }
-        } catch { /* corrupt _install.json — leave fields undefined */ }
+          continue;
+        }
+        const skillDir = path.join(baseDir, name);
+        const skillMd = skillMdFile(skillDir);
+        if (!hasSkillMd(skillDir)) continue;
+        seen.add(name);
+        let displayName = name;
+        let descPair = { description_zh: '', description_en: '' };
+        let category = '';
+        let status: string | undefined;
+        let version: string | undefined;
+        let marketplacePublishedAt: number | undefined;
+        let marketplaceUpdatedAt: number | undefined;
+        let defaultInstall: boolean | undefined;
+        let isOpenSource: boolean | undefined;
+        if (fs.existsSync(skillMd)) {
+          try {
+            const meta = parseSkillFrontmatter(fs.readFileSync(skillMd, 'utf8'));
+            descPair = migrateDescriptionPair(meta as any);
+            displayName = meta.name as string || name;
+            category = (meta.category as string) || '';
+            if (typeof meta.status === 'string') status = meta.status;
+            else if (typeof meta.state === 'string') status = meta.state;
+          } catch { /* ignore */ }
+        }
+        // Marketplace-installed skills carry `_install.json` with `version`. Author uid may also
+        // be present for install/reconcile compatibility, but the global UI intentionally does
+        // not surface it.
+        if (isMarketplaceSource(source)) {
+          try {
+            const metaFile = path.join(baseDir, name, '_install.json');
+            if (fs.existsSync(metaFile)) {
+              const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
+              if (meta && typeof meta.version === 'string') version = meta.version;
+              if (meta && typeof meta.published_at === 'number') marketplacePublishedAt = meta.published_at;
+              if (meta && typeof meta.updated_at === 'number') marketplaceUpdatedAt = meta.updated_at;
+              if (meta && typeof meta.default_install === 'boolean') defaultInstall = meta.default_install;
+              if (meta && typeof meta.is_open_source === 'boolean') isOpenSource = meta.is_open_source;
+              if (meta && typeof meta.status === 'string') status = meta.status;
+              else if (meta && typeof meta.state === 'string') status = meta.state;
+            }
+          } catch (err) {
+            log.warn(`marketplace skill install metadata unreadable id=${name}: ${(err as Error).message}`);
+          }
+        }
+        out.push({
+          id: name, name: displayName, source: normalizeSkillSource(source), ...descPair,
+          category, enabled: true, version,
+          ...(typeof status === 'string' ? { status } : {}),
+          ...(typeof marketplacePublishedAt === 'number' ? { marketplace_published_at: marketplacePublishedAt } : {}),
+          ...(typeof marketplaceUpdatedAt === 'number' ? { marketplace_updated_at: marketplaceUpdatedAt } : {}),
+          ...(typeof defaultInstall === 'boolean' ? { default_install: defaultInstall } : {}),
+          ...(typeof isOpenSource === 'boolean' ? { is_open_source: isOpenSource } : {}),
+        });
       }
-      out.push({ id: name, name: displayName, source: normalizeSkillSource(source), ...descPair, category, enabled: true, create_uid: undefined, version });
     }
+    _skillListCache = { stamp, data: out };
   }
-  _skillListCache = { stamp, data: out };
   // Overlay per-user enabled overrides outside the cache (same pattern as
   // listAgents). Cheap per-call read so a toggle takes effect immediately
   // without having to bump dir mtime.
@@ -444,7 +521,7 @@ export async function listSkillTree(
     const out: SkillTreeNode[] = [];
     for (const e of items) {
       if (SKILL_TREE_IGNORE.has(e.name) || e.name.startsWith('.')) continue;
-      if (e.name.endsWith('.pyc')) continue;
+      if (_isGeneratedSkillSidecarName(e.name)) continue;
       const relPath = rel ? `${rel}/${e.name}` : e.name;
       const full = path.join(dir, e.name);
       if (e.isDirectory()) {
@@ -470,7 +547,7 @@ export async function listSkillTree(
 
 export function validateSkillName(name: string): string {
   if (!name) return t('skills.errors.name_required');
-  if (name.length > 64) return t('skills.errors.name_too_long');
+  if (nameDisplayWidth(name) > NAME_DISPLAY_MAX_UNITS) return t('skills.errors.name_too_long');
   if (!SKILL_NAME_RE.test(name)) {
     return t('skills.errors.name_invalid');
   }
@@ -478,7 +555,7 @@ export function validateSkillName(name: string): string {
 }
 
 // Skill-id shape check used by IPC handlers. Accepts EITHER a user-typed skill name
-// (SKILL_NAME_RE — letter-led, spaces between words) for custom skills, OR a 12-hex
+// (SKILL_NAME_RE — letter-led, no spaces) for custom skills, OR a 12-hex
 // server-assigned id for marketplace-installed skills (which can begin with a digit).
 // Without the hex branch, dev uploading a platform-installed skill whose id starts with a
 // digit (e.g. `9720e1e263fd` Word/DOCX) bounced as "invalid skill id" — root cause of the
@@ -498,6 +575,7 @@ export function skillMdContent(
   description: string | { zh?: string; en?: string },
   body = '',
   category = '',
+  status = '',
 ): string {
   const cleanName = (name || '').replace(/\n/g, ' ').replace(/"/g, '\\"');
   const sanitize = (s: string) => (s || '').replace(/\n/g, ' ').replace(/"/g, '\\"');
@@ -518,11 +596,13 @@ export function skillMdContent(
   const cleanCategory = category && String(category).trim()
     ? sanitize(normalizeMarketplaceCategoryCode(category))
     : '';
+  const cleanStatus = status && String(status).trim() ? sanitize(String(status).trim()) : '';
   const trimmedBody = body.replace(/^\n+/, '');
   // Emit `category` only when explicitly provided. Model-authored SKILL.md writes are validated
   // elsewhere and must include one; this helper stays tolerant for legacy/manual specs.
   const categoryLine = cleanCategory ? `\ncategory: "${cleanCategory}"` : '';
-  return `---\nname: "${cleanName}"\ndescription_zh: "${cleanZh}"\ndescription_en: "${cleanEn}"${categoryLine}\n---\n\n${trimmedBody}`;
+  const statusLine = cleanStatus ? `\nstatus: "${cleanStatus}"` : '';
+  return `---\nname: "${cleanName}"\ndescription_zh: "${cleanZh}"\ndescription_en: "${cleanEn}"${categoryLine}${statusLine}\n---\n\n${trimmedBody}`;
 }
 
 export function splitSkillMd(text: string): { meta: SkillFrontmatter; body: string } {
@@ -557,35 +637,58 @@ function ensureSkillMdCategoryForWrite(content: string): string {
   return `---${fm}${content.slice(end)}`;
 }
 
+function normalizeSkillMdForWrite(content: string, fallbackName = ''): string {
+  if (!content.startsWith('---')) return content;
+  const { meta, body } = splitSkillMd(content);
+  const name = String(meta.name || fallbackName || '').trim();
+  const descPair = migrateDescriptionPair(meta as any);
+  return ensureSkillMdCategoryForWrite(skillMdContent(
+    name,
+    { zh: descPair.description_zh, en: descPair.description_en },
+    body,
+    String(meta.category || ''),
+    String(meta.status || meta.state || ''),
+  ));
+}
+
 export async function getCustomSkill(skillId: string): Promise<CustomSkill | null> {
   const d = customSkillDir(skillId);
   if (!fs.existsSync(d) || !fs.statSync(d).isDirectory()) return null;
-  const md = path.join(d, 'SKILL.md');
+  if (!hasSkillMd(d)) return null;
+  const md = skillMdFile(d);
   let name = skillId;
   let descPair = { description_zh: '', description_en: '' };
   let category = '';
+  let status = '';
   if (fs.existsSync(md)) {
     try {
       const { meta } = splitSkillMd(fs.readFileSync(md, 'utf8'));
       name = meta.name || skillId;
       descPair = migrateDescriptionPair(meta as any);
       category = (meta.category as string) || '';
+      status = (meta.status as string) || (meta.state as string) || '';
     } catch { /* ignore */ }
   }
-  return { id: skillId, name, ...descPair, category, source: 'custom', dir: d };
+  return { id: skillId, name, ...descPair, category, status, source: 'custom', dir: d };
 }
 
-async function _listSkillFilesAt(dir: string): Promise<SkillFileInfo[]> {
-  const d = path.resolve(dir);
+export async function listCustomSkillFiles(skillId: string): Promise<SkillFileInfo[]> {
+  return _listSkillFilesAt(customSkillDir(skillId));
+}
+
+/** Internal: walk a skill directory (custom or built-in) and return its file
+ *  manifest. Same ignore-set as the dir-tree walker. */
+async function _listSkillFilesAt(skillDir: string): Promise<SkillFileInfo[]> {
+  const d = path.resolve(skillDir);
   if (!fs.existsSync(d) || !fs.statSync(d).isDirectory()) return [];
   const out: SkillFileInfo[] = [];
 
-  function walk(cur: string, relBase = ''): void {
-    for (const e of fs.readdirSync(cur, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+  function walk(dir: string, relBase = ''): void {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
       const rel = relBase ? `${relBase}/${e.name}` : e.name;
       const parts = rel.split('/');
       if (parts.some((p) => p.startsWith('.') || SKILL_TREE_IGNORE.has(p))) continue;
-      const full = path.join(cur, e.name);
+      const full = path.join(dir, e.name);
       if (e.isDirectory()) walk(full, rel);
       else if (e.isFile()) {
         let size = 0;
@@ -596,10 +699,6 @@ async function _listSkillFilesAt(dir: string): Promise<SkillFileInfo[]> {
   }
   walk(d);
   return out;
-}
-
-export async function listCustomSkillFiles(skillId: string): Promise<SkillFileInfo[]> {
-  return _listSkillFilesAt(customSkillDir(skillId));
 }
 
 export async function createCustomSkill(
@@ -616,7 +715,18 @@ export async function createCustomSkill(
     throw new Error(t('skills.errors.builtin_conflict', { name }));
   }
   fs.mkdirSync(d, { recursive: true });
-  writeTextAtomicSync(path.join(d, 'SKILL.md'), skillMdContent(name, description, '', category));
+  const skillMdPath = path.join(d, 'SKILL.md');
+  writeTextAtomicSync(skillMdPath, skillMdContent(name, description, '', category, 'approved'));
+  // Force-stamp mtime to "now" so the sync engine's tombstone resurrection
+  // guard (`engine.ts` step 3 — `df.mtime_ms > tombMs`) treats this file as
+  // unambiguously fresh. Without this, atomic rename can leave the final
+  // mtime pinned to the .tmp creation moment (slightly older than the
+  // current Date.now()), and if a recent in-UI delete left a tombstone with
+  // deleted_at_ms close to now, the guard fails — the next sync pass
+  // re-deletes the file. Documented occurrence: skill recreated right after
+  // its delete-tombstone propagated to server (`evidence-deep-research`,
+  // 2026-05-22 17:14 sync pass deleted_local=4).
+  try { fs.utimesSync(skillMdPath, new Date(), new Date()); } catch { /* best effort */ }
   log.info(`created name=${name} category=${category || '(none)'}`);
   _invalidateSkillListCache();
   invalidateCoreAgentSkills().catch(() => { /* runner may not be loaded yet */ });
@@ -720,7 +830,7 @@ export async function updateCustomSkill(
     currentId = newName;
   }
 
-  writeTextAtomicSync(md, skillMdContent(newName, { zh: newZh, en: newEn }, body, newCategory));
+  writeTextAtomicSync(md, skillMdContent(newName, { zh: newZh, en: newEn }, body, newCategory, String(meta.status || meta.state || 'approved')));
   log.info(`updated name=${currentId} category=${newCategory || '(none)'}`);
   _invalidateSkillListCache();
   invalidateCoreAgentSkills().catch(() => { /* runner may not be loaded yet */ });
@@ -770,6 +880,12 @@ export async function deleteCustomSkill(skillId: string): Promise<boolean> {
 const IMPORT_FILTER_NAMES: ReadonlySet<string> = new Set([
   '.git', '.svn', '.hg', 'node_modules', '.DS_Store', 'Thumbs.db',
   '__pycache__', '.vscode', '.idea', '.pytest_cache',
+  '.venv', 'venv', '.mypy_cache', '.ruff_cache', '.uv-cache',
+  '.tox', '.nox', '.nyc_output', 'htmlcov',
+  'dist', 'build', 'out', 'target', 'coverage',
+  '.cache', '.parcel-cache', '.next', '.nuxt', '.turbo',
+  '.npm', '.pnpm-store', '.yarn', '.vite', '.svelte-kit',
+  'tmp', 'temp', '.tmp', 'logs', 'log',
   // Foreign skill-platform metadata (clawhub/etc. publish manifests with
   // ownerId/slug/version/publishedAt — irrelevant to this app and shows
   // up as "header noise" in the UI).
@@ -786,8 +902,8 @@ const IMPORT_FILTER_NAMES: ReadonlySet<string> = new Set([
   'package.json', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock',
 ]);
 
-const IMPORT_MAX_FILES = 100;
-const IMPORT_MAX_BYTES = 50 * 1024 * 1024; // 50 MiB
+const IMPORT_MAX_FILES = 200;
+const IMPORT_MAX_BYTES = 10 * 1024 * 1024; // 10 MiB
 
 /** Paths that must never be selected as the source of a folder import.
  *  Check the *realpath* of the chosen dir against this list so symlinks
@@ -803,7 +919,7 @@ function _isBlacklistedImportSource(realDir: string): { blocked: true; reason: s
     }
   }
 
-  // Home-dir root exactly — would trigger the 50 MiB cap only after
+  // Home-dir root exactly — would trigger the import byte cap only after
   // hoovering plenty of sensitive files.
   const home = os.homedir();
   if (home && dir === home) return { blocked: true, reason: t('skills.import_block.home_root') };
@@ -838,15 +954,20 @@ function _isBlacklistedImportSource(realDir: string): { blocked: true; reason: s
   return { blocked: false };
 }
 
-function _walkImportSource(root: string): { files: { src: string; rel: string; size: number }[]; totalBytes: number } {
+function _walkImportSource(root: string): {
+  files: { src: string; rel: string; size: number }[];
+  fileCount: number;
+  totalBytes: number;
+} {
   const files: { src: string; rel: string; size: number }[] = [];
+  let fileCount = 0;
   let totalBytes = 0;
 
   function walk(dir: string, relBase: string): void {
-    if (files.length > IMPORT_MAX_FILES) return;
     const entries = fs.readdirSync(dir, { withFileTypes: true });
     for (const e of entries) {
       if (IMPORT_FILTER_NAMES.has(e.name)) continue;
+      if (_isGeneratedSkillSidecarName(e.name)) continue;
       const rel = relBase ? `${relBase}/${e.name}` : e.name;
       const full = path.join(dir, e.name);
       if (e.isSymbolicLink()) continue; // skip symlinks defensively
@@ -855,20 +976,26 @@ function _walkImportSource(root: string): { files: { src: string; rel: string; s
       } else if (e.isFile()) {
         let size = 0;
         try { size = fs.statSync(full).size; } catch { /* ignore */ }
-        files.push({ src: full, rel, size });
+        fileCount += 1;
         totalBytes += size;
-        if (files.length > IMPORT_MAX_FILES || totalBytes > IMPORT_MAX_BYTES) return;
+        // Count the whole import accurately, but keep the copy manifest bounded.
+        // Once fileCount exceeds the cap, createFromDir rejects before copying.
+        if (fileCount <= IMPORT_MAX_FILES) {
+          files.push({ src: full, rel, size });
+        }
       }
     }
   }
   walk(root, '');
-  return { files, totalBytes };
+  return { files, fileCount, totalBytes };
 }
 
 export interface ImportResult {
   ok: boolean;
   skill?: CustomSkill;
   seedMessage?: string;
+  report?: QualityReport;
+  skillId?: string;
   error?: string;
 }
 
@@ -921,6 +1048,7 @@ export async function createFromDir(
   name: string | null,
   description: string | null,
   srcDir: string,
+  opts: { force?: boolean } = {},
 ): Promise<ImportResult> {
   if (!srcDir || !path.isAbsolute(srcDir)) {
     return { ok: false, error: t('skills.errors.path_not_absolute') };
@@ -938,10 +1066,10 @@ export async function createFromDir(
   if (black.blocked) return { ok: false, error: t('skills.errors.import_refused', { reason: black.reason || '' }) };
 
   // Stats walk first so we fail fast before any copy.
-  const { files, totalBytes } = _walkImportSource(realSrc);
-  if (files.length === 0) return { ok: false, error: t('skills.errors.dir_empty') };
-  if (files.length > IMPORT_MAX_FILES) {
-    return { ok: false, error: t('skills.errors.too_many_files', { count: files.length, max: IMPORT_MAX_FILES }) };
+  const { files, fileCount, totalBytes } = _walkImportSource(realSrc);
+  if (fileCount === 0) return { ok: false, error: t('skills.errors.dir_empty') };
+  if (fileCount > IMPORT_MAX_FILES) {
+    return { ok: false, error: t('skills.errors.too_many_files', { count: fileCount, max: IMPORT_MAX_FILES }) };
   }
   if (totalBytes > IMPORT_MAX_BYTES) {
     return { ok: false, error: t('skills.errors.too_large', { mb: (totalBytes / 1024 / 1024).toFixed(1) }) };
@@ -961,7 +1089,12 @@ export async function createFromDir(
       // fine since createCustomSkill's SKILL.md is boilerplate).
       const dst = path.join(skillDir, rel);
       fs.mkdirSync(path.dirname(dst), { recursive: true });
-      fs.copyFileSync(src, dst);
+      if (rel.toUpperCase() === 'SKILL.MD') {
+        const raw = fs.readFileSync(src, 'utf8');
+        writeTextAtomicSync(dst, normalizeSkillMdForWrite(raw, created.id));
+      } else {
+        fs.copyFileSync(src, dst);
+      }
     }
   } catch (err) {
     log.warn(`import-dir copy failed skill=${created.id}: ${(err as Error).message}`);
@@ -973,6 +1106,20 @@ export async function createFromDir(
   // SKILL.md may have been overwritten by the import; drop cache either way.
   _invalidateSkillListCache();
   invalidateCoreAgentSkills().catch(() => { /* runner may not be loaded yet */ });
+
+  const report = validateSkillDir(skillDir);
+  void persistQualityReport({
+    uid: getActiveUserId(), kind: 'skill', id: created.id, report,
+  });
+  if (!report.ok && opts.force !== true) {
+    try { await deleteCustomSkill(created.id); } catch { /* best-effort rollback */ }
+    return {
+      ok: false,
+      error: t('skills.errors.validation_blocked'),
+      report,
+      skillId: created.id,
+    };
+  }
 
   log.info(`created-from-dir name=${created.id} files=${files.length} bytes=${totalBytes}`);
 
@@ -1049,7 +1196,10 @@ export function writeCustomSkillFileChecked(
   if (!fs.existsSync(d) || !fs.statSync(d).isDirectory()) {
     return { ok: false, reason: 'missing_dir' };
   }
-  const report = validateSkillFile({ relpath, content });
+  const contentForWrite = relpath.toUpperCase() === 'SKILL.MD'
+    ? normalizeSkillMdForWrite(content, skillId)
+    : content;
+  const report = validateSkillFile({ relpath, content: contentForWrite });
   // Persist best-effort regardless of outcome — the report's also the input
   // for the future evolution / reflection signal stream.
   void persistQualityReport({
@@ -1058,7 +1208,7 @@ export function writeCustomSkillFileChecked(
   if (!report.ok) {
     return { ok: false, report };
   }
-  const written = _writeSkillFileAt(d, relpath, content, /* invalidateOnSkillMd */ true);
+  const written = _writeSkillFileAt(d, relpath, contentForWrite, /* invalidateOnSkillMd */ true);
   if (!written) return { ok: false, report, reason: 'invalid_path' };
   return { ok: true, report };
 }
@@ -1072,8 +1222,6 @@ export function writeCustomSkillFile(
   relpath: string,
   content: string,
 ): boolean {
-  const d = path.resolve(customSkillDir(skillId));
-  if (!fs.existsSync(d) || !fs.statSync(d).isDirectory()) return false;
   return writeCustomSkillFileChecked(skillId, relpath, content).ok;
 }
 
@@ -1102,9 +1250,8 @@ export function _writeSkillFileAt(
   // doesn't bump dir mtime on file content changes — so without explicit
   // invalidation the system prompt keeps showing stale skill descriptions
   // until the next app restart.
-  if (rel.toUpperCase() === 'SKILL.MD') {
-    _invalidateSkillListCache();
-    invalidateCoreAgentSkills().catch(() => { /* runner may not be loaded yet */ });
+  if (invalidateOnSkillMd && rel.toUpperCase() === 'SKILL.MD') {
+    invalidateSkillCachesForEdit();
   }
   return true;
 }
@@ -1121,11 +1268,19 @@ export async function writeSkillFileForEditChecked(
   content: string,
 ): Promise<WriteSkillFileResult> {
   const contentForWrite = relpath.toUpperCase() === 'SKILL.MD'
-    ? ensureSkillMdCategoryForWrite(content)
+    ? normalizeSkillMdForWrite(content, skillId)
     : content;
   const customDir = customSkillDir(skillId);
   if (fs.existsSync(customDir) && fs.statSync(customDir).isDirectory()) {
     return writeCustomSkillFileChecked(skillId, relpath, contentForWrite);
+  }
+  if (isBuiltinSkill(skillId)) {
+    const report = validateSkillFile({ relpath, content: contentForWrite });
+    void persistQualityReport({
+      uid: getActiveUserId(), kind: 'skill', id: skillId, report,
+    });
+    if (!report.ok) return { ok: false, report };
+    return { ok: false, report, reason: 'invalid_path' };
   }
   return { ok: false };
 }
@@ -1138,6 +1293,45 @@ export async function writeSkillFileForEdit(
   content: string,
 ): Promise<boolean> {
   return (await writeSkillFileForEditChecked(skillId, relpath, content)).ok;
+}
+
+interface SkillMetadataApplyResult {
+  ok: boolean;
+  skillId: string;
+  name?: string;
+  written: boolean;
+  report?: QualityReport;
+  reason?: WriteSkillFileResult['reason'];
+}
+
+export async function applySkillMetadataForEdit(
+  skillId: string,
+  updates: SkillMetadataUpdate,
+): Promise<SkillMetadataApplyResult> {
+  const skill = await getSkillForEdit(skillId);
+  if (!skill) return { ok: false, skillId, written: false, reason: 'missing_dir' };
+  const mdPath = path.join(skill.dir, 'SKILL.md');
+  const current = fs.existsSync(mdPath) ? fs.readFileSync(mdPath, 'utf8') : '';
+  const next = ensureSkillMdCategoryForWrite(
+    _applyMetadataToSkillMdContent(current, updates, skill.id),
+  );
+  if (next === current) {
+    return { ok: true, skillId, name: skill.name || skillId, written: false };
+  }
+
+  const res = await writeSkillFileForEditChecked(skillId, 'SKILL.md', next);
+  if (!res.ok) {
+    return { ok: false, skillId, written: false, report: res.report, reason: res.reason };
+  }
+
+  let resolvedId = skillId;
+  if (skill.source === 'custom') {
+    const newId = await _renameSkillByFrontmatterIfNeeded(skillId);
+    if (newId && newId !== skillId) resolvedId = newId;
+  }
+  const post = await getSkillForEdit(resolvedId);
+  log.info(`skill=${skillId}${resolvedId !== skillId ? ` -> ${resolvedId}` : ''} metadata updated`);
+  return { ok: true, skillId: resolvedId, name: post?.name || resolvedId, written: true, report: res.report };
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1183,7 +1377,9 @@ async function _appendSkillChatMessage(userId: string, skillId: string, record: 
 }
 
 export async function clearSkillChat(userId: string, skillId: string): Promise<boolean> {
-  if (!fs.existsSync(customSkillDir(skillId))) return false;
+  // Allow clearing for either custom or built-in (dev mode reaches built-in
+  // edit chats). Path is id-keyed regardless of source.
+  if (!fs.existsSync(customSkillDir(skillId)) && !isBuiltinSkill(skillId)) return false;
   for (const p of [skillChatMsgsPath(userId, skillId), skillChatMetaPath(userId, skillId)]) {
     if (fs.existsSync(p)) {
       try { await fsp.unlink(p); }
@@ -1211,6 +1407,93 @@ export async function clearSkillChat(userId: string, skillId: string): Promise<b
 export interface SkillFileBlock {
   path: string;
   content: string;
+}
+
+const SKILL_METADATA_TAGS = ['name', 'description_zh', 'description_en', 'category'] as const;
+type SkillMetadataKey = typeof SKILL_METADATA_TAGS[number];
+
+export type SkillMetadataUpdate = Partial<Record<SkillMetadataKey, string>>;
+
+function _extractSimpleXmlTag(inner: string, tag: SkillMetadataKey): string | undefined {
+  const re = new RegExp(`<${tag}>\\s*([\\s\\S]*?)\\s*<\\/${tag}>`);
+  const m = inner.match(re);
+  return m ? m[1].trim() : undefined;
+}
+
+function _parseSkillMetadataUpdate(inner: string): SkillMetadataUpdate {
+  const out: SkillMetadataUpdate = {};
+  for (const tag of SKILL_METADATA_TAGS) {
+    const value = _extractSimpleXmlTag(inner, tag);
+    if (value !== undefined) out[tag] = value;
+  }
+  return out;
+}
+
+function _hasSkillMetadataUpdate(updates?: SkillMetadataUpdate): boolean {
+  return !!updates && SKILL_METADATA_TAGS.some((k) => Object.prototype.hasOwnProperty.call(updates, k));
+}
+
+function _mergeSkillMetadataUpdates(updates: SkillMetadataUpdate[]): SkillMetadataUpdate {
+  const merged: SkillMetadataUpdate = {};
+  for (const update of updates) {
+    for (const tag of SKILL_METADATA_TAGS) {
+      if (Object.prototype.hasOwnProperty.call(update, tag)) {
+        merged[tag] = String(update[tag] || '');
+      }
+    }
+  }
+  return merged;
+}
+
+function _applyMetadataToSkillMdContent(
+  content: string,
+  updates: SkillMetadataUpdate,
+  fallbackName = '',
+): string {
+  if (!_hasSkillMetadataUpdate(updates)) return content;
+  const { meta, body } = splitSkillMd(content || '');
+  const persisted = migrateDescriptionPair(meta as any);
+  const name = Object.prototype.hasOwnProperty.call(updates, 'name')
+    ? String(updates.name || '')
+    : String(meta.name || fallbackName || '');
+  const descriptionZh = Object.prototype.hasOwnProperty.call(updates, 'description_zh')
+    ? String(updates.description_zh || '')
+    : persisted.description_zh;
+  const descriptionEn = Object.prototype.hasOwnProperty.call(updates, 'description_en')
+    ? String(updates.description_en || '')
+    : persisted.description_en;
+  const category = Object.prototype.hasOwnProperty.call(updates, 'category')
+    ? String(updates.category || '')
+    : String(meta.category || '');
+  return skillMdContent(name, { zh: descriptionZh, en: descriptionEn }, body, category, String(meta.status || meta.state || 'approved'));
+}
+
+/** Strip `<skill-meta>...</skill-meta>` blocks from per-skill edit chat output.
+ *  Commander metadata lives inside the outer `<skill>` container and is parsed
+ *  by `_parseSkillContainer` below. */
+export function extractSkillMetadataBlocks(text: string): { cleanText: string; updates: SkillMetadataUpdate[] } {
+  if (!text || text.indexOf('<skill-meta') < 0) return { cleanText: text, updates: [] };
+  const ranges = findOuterTagRanges(text, 'skill-meta');
+  if (!ranges.length) return { cleanText: text, updates: [] };
+  const updates: SkillMetadataUpdate[] = [];
+  let cleaned = '';
+  let cursor = 0;
+  for (const [s, e] of ranges) {
+    cleaned += text.slice(cursor, s);
+    const block = text.slice(s, e);
+    if (block.endsWith('</skill-meta>')) {
+      const tagEnd = block.indexOf('>');
+      const inner = tagEnd >= 0
+        ? block.slice(tagEnd + 1, block.length - '</skill-meta>'.length)
+        : '';
+      const parsed = _parseSkillMetadataUpdate(inner);
+      if (_hasSkillMetadataUpdate(parsed)) updates.push(parsed);
+    }
+    cursor = e;
+  }
+  cleaned += text.slice(cursor);
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
+  return { cleanText: cleaned, updates };
 }
 
 /** Strip <<<skill-file path=X … >>> blocks. Returns { cleanText, files }. */
@@ -1250,13 +1533,20 @@ export interface SkillContainerExtracted {
   skillId?: string;
   /** All `<<<skill-file>>>` blocks parsed from inside the container. */
   files: SkillFileBlock[];
+  /** Optional field-level metadata updates, used for cheap category/description edits. */
+  metadata?: SkillMetadataUpdate;
 }
 
 function _parseSkillContainer(inner: string): SkillContainerExtracted {
   const idM = inner.match(SKILL_ID_RE);
   const skillId = idM ? idM[1].trim() : '';
-  const { files } = extractSkillFileBlocks(inner);
-  return { ...(skillId ? { skillId } : {}), files };
+  const { cleanText, files } = extractSkillFileBlocks(inner);
+  const metadata = _parseSkillMetadataUpdate(cleanText);
+  return {
+    ...(skillId ? { skillId } : {}),
+    files,
+    ...(_hasSkillMetadataUpdate(metadata) ? { metadata } : {}),
+  };
 }
 
 /**
@@ -1331,19 +1621,28 @@ export interface SkillContainerResult {
 export async function applySkillContainerFromCommander(
   container: SkillContainerExtracted,
 ): Promise<SkillContainerResult> {
-  if (!container.files.length && !container.skillId) {
+  const hasMetadata = _hasSkillMetadataUpdate(container.metadata);
+  if (!container.files.length && !hasMetadata) {
     return { ok: false, error: t('skills.errors.container_empty') };
   }
   if (container.skillId) {
-    return _applySkillContainerEdit(container.skillId, container.files);
+    return _applySkillContainerEdit(container.skillId, container.files, container.metadata);
   }
-  return _applySkillContainerCreate(container.files);
+  return _applySkillContainerCreate(container.files, container.metadata);
 }
 
-async function _applySkillContainerCreate(files: SkillFileBlock[]): Promise<SkillContainerResult> {
+async function _applySkillContainerCreate(
+  files: SkillFileBlock[],
+  metadata?: SkillMetadataUpdate,
+): Promise<SkillContainerResult> {
   files = files.map((f) => (
     f.path.toUpperCase() === 'SKILL.MD'
-      ? { ...f, content: ensureSkillMdCategoryForWrite(f.content || '') }
+      ? {
+        ...f,
+        content: normalizeSkillMdForWrite(
+          _applyMetadataToSkillMdContent(f.content || '', metadata || {}),
+        ),
+      }
       : f
   ));
   // SKILL.md is mandatory in the create branch — that's where the skill id
@@ -1351,9 +1650,10 @@ async function _applySkillContainerCreate(files: SkillFileBlock[]): Promise<Skil
   const skillMd = files.find((f) => f.path.toUpperCase() === 'SKILL.MD');
   if (!skillMd) return { ok: false, error: t('skills.errors.create_missing_skill_md') };
   const { meta } = splitSkillMd(skillMd.content || '');
-  const name = (meta.name || '').trim();
+  const rawName = (meta.name || '');
+  const name = rawName.trim();
   if (!name) return { ok: false, error: t('skills.errors.create_missing_name') };
-  const validateErr = validateSkillName(name);
+  const validateErr = validateSkillName(rawName);
   if (validateErr) return { ok: false, error: validateErr };
   // Collision checks — same gates as the IPC create path so commander and
   // detail panel produce identical failure modes.
@@ -1406,6 +1706,16 @@ async function _applySkillContainerCreate(files: SkillFileBlock[]): Promise<Skil
       rejected.push(fb.path);
     }
   }
+  // Force-stamp mtime on every freshly-written file so the sync engine's
+  // tombstone resurrection guard treats them as fresh (see the matching
+  // comment in `createCustomSkill`). Atomic rename can otherwise leave the
+  // final mtime pinned to the .tmp creation moment, falling below a recent
+  // delete tombstone's deleted_at_ms and triggering re-deletion next pass.
+  const stampNow = new Date();
+  for (const w of written) {
+    try { fs.utimesSync(path.join(customSkillDir(name), w), stampNow, stampNow); }
+    catch { /* best effort */ }
+  }
   if (written.length) log.info(`commander created skill=${name} files=${written.length}`);
   return {
     ok: true,
@@ -1418,7 +1728,15 @@ async function _applySkillContainerCreate(files: SkillFileBlock[]): Promise<Skil
   };
 }
 
-async function _applySkillContainerEdit(skillId: string, files: SkillFileBlock[]): Promise<SkillContainerResult> {
+async function _applySkillContainerEdit(
+  skillId: string,
+  files: SkillFileBlock[],
+  metadata?: SkillMetadataUpdate,
+): Promise<SkillContainerResult> {
+  const hasMetadata = _hasSkillMetadataUpdate(metadata);
+  if (!files.length && !hasMetadata) {
+    return { ok: false, error: t('skills.errors.container_empty') };
+  }
   const skill = await getSkillForEdit(skillId);
   if (!skill) {
     const hasSkillMd = files.some((f) => f.path.toUpperCase() === 'SKILL.MD');
@@ -1455,6 +1773,17 @@ async function _applySkillContainerEdit(skillId: string, files: SkillFileBlock[]
       if (res.report) validationFailed.push({ path: fb.path, report: res.report });
     }
   }
+  // Force-stamp mtime on every freshly-written file so the sync engine's
+  // tombstone resurrection guard treats them as fresh (see the matching
+  // comment in `createCustomSkill`). Edit path matters when a user deletes
+  // a skill and immediately re-edits the same id — without this stamp the
+  // atomic rename's mtime can fall under the lingering tombstone's
+  // deleted_at_ms and the next sync pass wipes the new bytes.
+  const editStampNow = new Date();
+  for (const w of written) {
+    try { fs.utimesSync(path.join(skill.dir, w), editStampNow, editStampNow); }
+    catch { /* best effort */ }
+  }
   // Auto-rename when SKILL.md frontmatter `name` differs from the dir id —
   // same hook as the per-skill edit chat (`streamSendToSkillChat`).
   let resolvedId = skillId;
@@ -1462,10 +1791,30 @@ async function _applySkillContainerEdit(skillId: string, files: SkillFileBlock[]
     const newId = await _renameSkillByFrontmatterIfNeeded(skillId);
     if (newId && newId !== skillId) resolvedId = newId;
   }
+
+  let metadataOk = !hasMetadata;
+  if (hasMetadata) {
+    const metaRes = await applySkillMetadataForEdit(resolvedId, metadata || {});
+    if (metaRes.ok) {
+      metadataOk = true;
+      resolvedId = metaRes.skillId;
+      if (metaRes.written) {
+        if (!written.includes('SKILL.md')) written.push('SKILL.md');
+        if (metaRes.report && metaRes.report.violations.length > 0) {
+          validationWarnings.push({ path: 'SKILL.md', report: metaRes.report });
+        }
+      }
+    } else if (metaRes.report) {
+      validationFailed.push({ path: 'SKILL.md', report: metaRes.report });
+    } else {
+      rejected.push('SKILL.md');
+    }
+  }
   const post = await getSkillForEdit(resolvedId);
   if (written.length) log.info(`commander updated skill=${skillId}${resolvedId !== skillId ? ` -> ${resolvedId}` : ''} files=${written.length}`);
+  const ok = files.length > 0 || metadataOk;
   return {
-    ok: true,
+    ok,
     kind: 'updated',
     skillId: resolvedId,
     name: post?.name || resolvedId,
@@ -1533,8 +1882,42 @@ export interface SkillChatResult {
   renamed?: Array<{ oldId: string; newId: string }>;
 }
 
-export async function sendToSkillChat(userId: string, skillId: string, content: string): Promise<SkillChatResult> {
-  const skill = await getCustomSkill(skillId);
+function skillEditAttachmentCid(skillId: string): string {
+  return `skill-edit-${skillId}`;
+}
+
+async function buildSkillEditMessageWithAttachments(
+  userId: string,
+  skillId: string,
+  content: string,
+  attachments?: string[],
+): Promise<{
+  message: string;
+  images: Array<{ data: string; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' }>;
+  attachmentNames: string[];
+  attachmentCid: string;
+}> {
+  const attachmentNames = Array.isArray(attachments)
+    ? attachments.filter((n): n is string => typeof n === 'string' && !!n.trim())
+    : [];
+  const attachmentCid = skillEditAttachmentCid(skillId);
+  if (!attachmentNames.length) return { message: content, images: [], attachmentNames, attachmentCid };
+  const { manifest, images } = await buildAttachmentManifest(userId, attachmentCid, attachmentNames);
+  return {
+    message: manifest ? `${manifest}\n${content}` : content,
+    images,
+    attachmentNames,
+    attachmentCid,
+  };
+}
+
+export async function sendToSkillChat(
+  userId: string,
+  skillId: string,
+  content: string,
+  opts: { attachments?: string[] } = {},
+): Promise<SkillChatResult> {
+  const skill = await getSkillForEdit(skillId);
   if (!skill) return { ok: false, error: 'skill not found' };
   if (isMarketplaceSource(skill.source) && !false) {
     return { ok: false, error: t('errors.builtin_skill_not_editable') };
@@ -1544,13 +1927,17 @@ export async function sendToSkillChat(userId: string, skillId: string, content: 
   const sessionId = meta.session_id || defaultSkillSessionId(skillId);
 
   const systemPrompt = await buildSkillEditSystemPrompt(skill);
+  const attachmentCtx = await buildSkillEditMessageWithAttachments(userId, skillId, content, opts.attachments);
 
   await _appendSkillChatMessage(userId, skillId,
-    { time: nowIso(), role: 'user', content });
+    {
+      time: nowIso(), role: 'user', content,
+      ...(attachmentCtx.attachmentNames.length ? { attachments: attachmentCtx.attachmentNames, attachment_cid: attachmentCtx.attachmentCid } : {}),
+    });
 
   const { chatWithModel } = require('../model/client');
   const result = await chatWithModel({
-    userId, message: content, sessionId, systemPrompt,
+    userId, message: attachmentCtx.message, sessionId, systemPrompt,
     agentName: 'orkas_chat', timeout: 300,
     // Read-only: the LLM in per-skill edit chat sees the skill dir for
     // inspection (read_file / search_files / grep_files / stat_file), but
@@ -1563,7 +1950,9 @@ export async function sendToSkillChat(userId: string, skillId: string, content: 
       ...(skill.dir ? [skill.dir] : []),
       userMarketplaceSkillsDir(getActiveUserId()),
       userSkillsDir(userId),
+      ...(attachmentCtx.attachmentNames.length ? [chatAttachmentDir(userId, attachmentCtx.attachmentCid)] : []),
     ],
+    ...(attachmentCtx.images.length ? { images: attachmentCtx.images } : {}),
   });
 
   if (!result.ok) {
@@ -1573,11 +1962,15 @@ export async function sendToSkillChat(userId: string, skillId: string, content: 
     return { ok: false, message: errMsg, error: result.error || '' };
   }
 
-  const { cleanText, files: fileBlocks } = extractSkillFileBlocks(result.text);
+  const fileExtract = extractSkillFileBlocks(result.text);
+  const metaExtract = extractSkillMetadataBlocks(fileExtract.cleanText);
+  const cleanText = metaExtract.cleanText;
+  const fileBlocks = fileExtract.files;
+  const metadataUpdate = _mergeSkillMetadataUpdates(metaExtract.updates);
   const written: string[] = [];
   const skillsTouchingMd = new Set<string>();
   for (const fb of fileBlocks) {
-    if (writeCustomSkillFile(skillId, fb.path, fb.content)) {
+    if (await writeSkillFileForEdit(skillId, fb.path, fb.content)) {
       written.push(fb.path);
       if (fb.path.toUpperCase() === 'SKILL.MD') {
         skillsTouchingMd.add(skillId);
@@ -1589,12 +1982,31 @@ export async function sendToSkillChat(userId: string, skillId: string, content: 
   if (written.length) log.info(`skill=${skillId} wrote ${written.length} file(s): ${JSON.stringify(written)}`);
 
   // Auto-rename any skill whose SKILL.md `name:` differs from its dir id.
-  // Non-streaming caller has no event channel; the rename is silent — the
-  // returned `renamed` array surfaces it for the caller to log / inform.
+  // Built-in dirs are tracked in git; renaming would orphan history and
+  // miss the dual-write — skip for built-ins entirely.
   const renamed: Array<{ oldId: string; newId: string }> = [];
-  for (const sid of skillsTouchingMd) {
-    const newId = await _renameSkillByFrontmatterIfNeeded(sid);
-    if (newId && newId !== sid) renamed.push({ oldId: sid, newId });
+  let currentSkillId = skillId;
+  if (skill.source === 'custom') {
+    for (const sid of skillsTouchingMd) {
+      const newId = await _renameSkillByFrontmatterIfNeeded(sid);
+      if (newId && newId !== sid) {
+        renamed.push({ oldId: sid, newId });
+        if (sid === currentSkillId) currentSkillId = newId;
+      }
+    }
+  }
+
+  if (_hasSkillMetadataUpdate(metadataUpdate)) {
+    const metaRes = await applySkillMetadataForEdit(currentSkillId, metadataUpdate);
+    if (metaRes.ok) {
+      if (metaRes.written && !written.includes('SKILL.md')) written.push('SKILL.md');
+      if (metaRes.skillId !== currentSkillId) {
+        renamed.push({ oldId: currentSkillId, newId: metaRes.skillId });
+        currentSkillId = metaRes.skillId;
+      }
+    } else {
+      log.warn(`rejected metadata update skill=${currentSkillId}`);
+    }
   }
 
   await _appendSkillChatMessage(userId, skillId,
@@ -1614,9 +2026,9 @@ const MAX_SKILL_PROCESS_ITEMS = 300;
  */
 export async function* streamSendToSkillChat(
   userId: string, skillId: string, content: string,
-  opts: { abortSignal?: AbortSignal } = {},
+  opts: { abortSignal?: AbortSignal; attachments?: string[] } = {},
 ): AsyncGenerator<any, void, unknown> {
-  const skill = await getCustomSkill(skillId);
+  const skill = await getSkillForEdit(skillId);
   if (!skill) {
     yield { type: 'error', text: 'skill not found' };
     yield { type: 'done' };
@@ -1632,9 +2044,13 @@ export async function* streamSendToSkillChat(
   const sessionId = meta.session_id || defaultSkillSessionId(skillId);
 
   const systemPrompt = await buildSkillEditSystemPrompt(skill);
+  const attachmentCtx = await buildSkillEditMessageWithAttachments(userId, skillId, content, opts.attachments);
 
   await _appendSkillChatMessage(userId, skillId,
-    { time: nowIso(), role: 'user', content });
+    {
+      time: nowIso(), role: 'user', content,
+      ...(attachmentCtx.attachmentNames.length ? { attachments: attachmentCtx.attachmentNames, attachment_cid: attachmentCtx.attachmentCid } : {}),
+    });
 
   const { streamChatWithModel } = await import('../model/client');
   let finalText: string | null = null;
@@ -1648,14 +2064,16 @@ export async function* streamSendToSkillChat(
 
   try {
     for await (let event of streamChatWithModel({
-      userId, message: content, sessionId, systemPrompt,
+      userId, message: attachmentCtx.message, sessionId, systemPrompt,
       agentName: 'orkas_chat',
       cacheRetention: 'short',
       readOnlyExtraRoots: [
       ...(skill.dir ? [skill.dir] : []),
       userMarketplaceSkillsDir(getActiveUserId()),
       userSkillsDir(userId),
+      ...(attachmentCtx.attachmentNames.length ? [chatAttachmentDir(userId, attachmentCtx.attachmentCid)] : []),
     ],
+      ...(attachmentCtx.images.length ? { images: attachmentCtx.images } : {}),
       ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
     }) as AsyncIterable<any>) {
       const etype = event.type;
@@ -1668,13 +2086,17 @@ export async function* streamSendToSkillChat(
       const synthesizedProgress: string[] = [];
       if (etype === 'final') {
         const raw = event.text || '';
-        const { cleanText, files: fileBlocks } = extractSkillFileBlocks(raw);
+        const fileExtract = extractSkillFileBlocks(raw);
+        const metaExtract = extractSkillMetadataBlocks(fileExtract.cleanText);
+        const cleanText = metaExtract.cleanText;
+        const fileBlocks = fileExtract.files;
+        const metadataUpdate = _mergeSkillMetadataUpdates(metaExtract.updates);
         // Track which skill ids had their SKILL.md (re)written this turn —
         // those are the ones we should auto-rename to match the new
         // frontmatter `name` field.
         const skillsTouchingMd = new Set<string>();
         for (const fb of fileBlocks) {
-          if (writeCustomSkillFile(skillId, fb.path, fb.content)) {
+          if (await writeSkillFileForEdit(skillId, fb.path, fb.content)) {
             written.push(fb.path);
             synthesizedProgress.push(t('process.skill.file_written', { path: fb.path }));
             if (fb.path.toUpperCase() === 'SKILL.MD') {
@@ -1689,15 +2111,42 @@ export async function* streamSendToSkillChat(
         // Auto-rename any skill whose SKILL.md `name:` differs from its
         // current dir-id. Yields `skill_renamed` events so the renderer
         // can switch the active edit chat to the new id transparently.
-        for (const sid of skillsTouchingMd) {
-          const newId = await _renameSkillByFrontmatterIfNeeded(sid);
-          if (newId && newId !== sid) {
-            const evt = {
-              type: 'event',
-              event: { stream: 'skill_renamed', data: { oldId: sid, newId } },
-            };
-            processItems.push({ type: 'event', event: evt.event });
-            yield evt;
+        // Built-in renames are skipped — git-tracked dir, dual-write would
+        // also need to rename src and data trees plus migrate user chat dirs.
+        let currentSkillId = skillId;
+        if (skill.source === 'custom') {
+          for (const sid of skillsTouchingMd) {
+            const newId = await _renameSkillByFrontmatterIfNeeded(sid);
+            if (newId && newId !== sid) {
+              if (sid === currentSkillId) currentSkillId = newId;
+              const evt = {
+                type: 'event',
+                event: { stream: 'skill_renamed', data: { oldId: sid, newId } },
+              };
+              processItems.push({ type: 'event', event: evt.event });
+              yield evt;
+            }
+          }
+        }
+        if (_hasSkillMetadataUpdate(metadataUpdate)) {
+          const metaRes = await applySkillMetadataForEdit(currentSkillId, metadataUpdate);
+          if (metaRes.ok) {
+            if (metaRes.written && !written.includes('SKILL.md')) {
+              written.push('SKILL.md');
+              synthesizedProgress.push(t('process.skill.metadata_updated'));
+            }
+            if (metaRes.skillId !== currentSkillId) {
+              const evt = {
+                type: 'event',
+                event: { stream: 'skill_renamed', data: { oldId: currentSkillId, newId: metaRes.skillId } },
+              };
+              processItems.push({ type: 'event', event: evt.event });
+              yield evt;
+              currentSkillId = metaRes.skillId;
+            }
+          } else {
+            log.warn(`rejected metadata update skill=${currentSkillId}`);
+            synthesizedProgress.push(t('process.skill.metadata_rejected'));
           }
         }
         finalText = cleanText;

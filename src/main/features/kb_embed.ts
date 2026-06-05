@@ -35,9 +35,9 @@ const log = createLogger('kb_embed');
  */
 const EMBED_BATCH_SIZE = 32;
 
-// Loaded lazily via dynamic import since fastembed is ESM / loads onnxruntime
-// eagerly. Keeping it dynamic means test code that mocks this module never
-// touches fastembed.
+// Loaded lazily so test code that mocks this module never touches fastembed.
+// Use require() deliberately: fastembed's ESM entry imports `tar` as a default
+// export, which breaks with tar@7. The CJS entry stays compatible.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let _embedder: any = null;
 const _initLock = new Mutex();
@@ -47,7 +47,7 @@ async function initEmbedder(): Promise<void> {
   await _initLock.runExclusive(async () => {
     if (_embedder) return;
     const started = Date.now();
-    const { FlagEmbedding, EmbeddingModel } = await import('fastembed');
+    const { FlagEmbedding, EmbeddingModel } = require('fastembed') as typeof import('fastembed');
     _embedder = await FlagEmbedding.init({
       model: EmbeddingModel.BGESmallZH,
       cacheDir: embeddingModelDir(),

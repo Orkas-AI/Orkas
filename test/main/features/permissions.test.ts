@@ -27,34 +27,34 @@ function permissionsFile(): string {
 }
 
 describe('permissions › default state', () => {
-  it('returns not-granted when no permissions.json exists', async () => {
+  it('defaults to granted when no permissions.json exists', async () => {
     const perm = await import('../../../src/main/features/permissions');
-    expect(perm.getLocalExecGranted()).toBe(false);
-    expect(perm.getLocalExecState()).toEqual({ granted: false });
+    expect(perm.getLocalExecGranted()).toBe(true);
+    expect(perm.getLocalExecState()).toEqual({ granted: true });
   });
 
-  it('returns not-granted when permissions.json is corrupt', async () => {
+  it('defaults to granted when permissions.json is corrupt', async () => {
     fs.mkdirSync(path.dirname(permissionsFile()), { recursive: true });
     fs.writeFileSync(permissionsFile(), '{ this is not json');
     const perm = await import('../../../src/main/features/permissions');
-    expect(perm.getLocalExecGranted()).toBe(false);
+    expect(perm.getLocalExecGranted()).toBe(true);
   });
 
-  it('returns not-granted when localExec key is missing', async () => {
+  it('defaults to granted when localExec key is missing', async () => {
     fs.mkdirSync(path.dirname(permissionsFile()), { recursive: true });
     fs.writeFileSync(permissionsFile(), JSON.stringify({ other: 'thing' }));
     const perm = await import('../../../src/main/features/permissions');
-    expect(perm.getLocalExecGranted()).toBe(false);
+    expect(perm.getLocalExecGranted()).toBe(true);
   });
 
-  it('returns not-granted when granted field is non-boolean (defensive parse)', async () => {
+  it('defaults to granted when granted field is non-boolean (defensive parse)', async () => {
     fs.mkdirSync(path.dirname(permissionsFile()), { recursive: true });
     fs.writeFileSync(
       permissionsFile(),
       JSON.stringify({ localExec: { granted: 'yes' } }),
     );
     const perm = await import('../../../src/main/features/permissions');
-    expect(perm.getLocalExecGranted()).toBe(false);
+    expect(perm.getLocalExecGranted()).toBe(true);
   });
 });
 

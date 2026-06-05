@@ -1,501 +1,211 @@
-# Orkas architecture and layering
-
-Only contents the LLM cannot derive from the source — hard constraints / the Why behind counter-intuitive decisions / pitfalls already hit. Architecture descriptions point at source, they do not restate the implementation.
-
----
-
-## 1. Project shape
-
-Single-process Electron desktop app: main = Node backend, renderer = vanilla HTML/CSS/JS, IPC for communication, local file storage. Startup: `bootstrap.cjs` → tsx loader → `src/main/index.ts`; no build step.
-
-**Hard constraints**:
-- main runs no HTTP / occupies no port / has no auth.
-- The renderer talks through the `contextBridge`-exposed `window.orkas.{invoke, stream}` allow-list API; **do not introduce** TS / JSX / webpack / vite.
-- Preload **must be `.js`** (the preload loader does not run the tsx hook); path is `src/main/preload.js`.
-- All LLM calls go through the in-process `core-agent` (`import('#core-agent')` dynamic load); no subprocesses. **Why:** avoid IPC serialization; locks / cancellation / event streams share memory.
-- **Local CLI agents are the one explicit exception** — agents whose spec carries `runtime.kind === 'cli'` (claude code / codex / openclaw / opencode / hermes) are spawned as child processes by `features/local_agents/runner.ts`. **`features/local_agents/` is the sole `child_process.spawn` entry point for CLI dispatches**; `bus.ts` routes here, every other `features/*` module is forbidden from spawning these CLIs directly. **Why:** a single spawn entry guarantees uniform persistence (`<uid>/local/file_cache/local-agent-runs/<runId>/`), cancellation (AbortSignal → SIGTERM → 10s grace → SIGKILL), and 5-CLI fanout discipline — bypassing it leaks zombies and forks the run-history schema.
-- Storage is JSON / JSONL primarily; sqlite is used in exactly one place — the KB vector store. **Why:** user data must stay readable, portable, and friendly to cloud sync (single file = single sync unit).
-- **skill / agent / contexts are three first-class citizens**; multi-agent collaboration follows the §5 group-chat architecture, with **no more "main agent calls subagent over RPC"**.
-- npm dependency allow-list is in `PC/package.json` (key entries: `electron / pi-ai / better-sqlite3 / sqlite-vec / fastembed / onnxruntime-node / pdfjs-dist / pdf-lib / mammoth / jimp / adm-zip / cos-nodejs-sdk-v5`). **New dependencies require a discussion first.**
-- Renderer-side third-party JS/CSS goes through static assets at `src/renderer/vendor/<name>/`; not via npm. **Why:** `require` is unavailable inside the contextBridge sandbox; routing through npm is actually a detour.
-- **Cross-platform**: macOS + Windows are both primary (Linux is community-grade). New code prefers cross-platform implementations (Node stdlib); platform branches must be verified on real machines for each branch — getting one platform working is not enough.
-- **Profile (region) routing**: `ORKAS_PROFILE` env selects which Orkas server region the PC talks to — `global` (default, `orkas.ai`) or `cn` (`orkas.work`). Mirrors Server `env/start/{dev_,}api_start.sh` (see Server CLAUDE.md §7). `run.sh` exports it from the first positional arg (`./run.sh cn`). Code that calls the Orkas API **must** route through `features/marketplace.ts::apiBase()` — never hard-code `orkas.ai` / `orkas.work`. Devs running against a local Server set `ORKAS_API_BASE_URL=http://127.0.0.1:8888/api` (overrides the profile lookup entirely). Telemetry / umami is intentionally NOT profile-gated (single-site analytics, see `renderer/modules/monitor.js` comment).
-
----
-
-## 2. Directory layout
-
-```
-PC/                          Electron project root, sole dev and packaging entry
-├── bootstrap.cjs            Registers the tsx loader → require('./src/main')
-├── data/                    Runtime data (gitignored, see §4)
-├── userWorkSpace/           Default workspace for the main conversation (gitignored)
-├── src/main/                Node backend (TS, transpiled at runtime by tsx)
-│   ├── index.ts             Electron lifecycle + IPC registration
-│   ├── preload.js           contextBridge → window.orkas (must be .js)
-│   ├── paths.ts             **Single source of truth for paths**; never scatter hard-coded paths
-│   ├── ipc/                 IPC handlers (see §3)
-│   ├── features/            Business layer (users / chats / group_chat / skills / agents / contexts / kb_* / auth / permissions / ...)
-│   ├── model/               Model-call layer (in-process core-agent)
-│   ├── prompts/             *.md templates
-│   └── util/                Pure functions (locks / path-sandbox / extract-* / file_to_chunks / ...)
-├── src/renderer/            Frontend UI (vanilla, see §8)
-└── src/core-agent/          AgentRunner / providers / PersistentSession / SkillLoader
-```
-
-**Runtime data location**: dev source-run and packaged builds use the SAME `<container>/{data,userWorkSpace}/` tree — no dev-vs-packaged data split. Container = `~/.orkas/` on macOS/Linux; on Windows it's the drive recorded in `%LOCALAPPDATA%\Orkas\install-pin.json` — chosen on first launch (lowest-letter non-system fixed drive, fallback `C:`) and reused on subsequent launches. The pin lives in LocalAppData (machine-private), not Roaming, because it records a drive choice on this specific machine. Full container resolution + pin handling logic lives in `src/main/install-data-root.cjs`. Pre-unification source-run `<repoRoot>/data` + `<repoRoot>/userWorkSpace` are migrated into the container by `src/main/util/migrate-source-data-root.cjs` on first launch (overlay merge: src wins per-file conflict, target-only paths preserved, `users.json::users[]` unioned with a `current_user_id` dangling-pointer guard).
-
----
-
-## 3. Layering constraints
-
-```
-ipc/                IPC handlers: arg validation + call into features; no IO, no business logic
-features/           Business layer: orchestrates storage + model + prompts; knows nothing about IPC
-model/              Model-call layer; client.ts re-exports, implementation in model/core-agent/
-model/core-agent/   Local adapters + tool overrides
-storage.ts          File IO helpers (stdlib only)
-prompts/            Template loader (stdlib only)
-i18n.ts             UI language table lookup (stdlib + locales/*.json only; never imports features / model)
-util/               Pure-function utilities (stdlib only or single third-party dep; **never reverse-import features/model**)
-```
-
-**Require rules**:
-- `index.ts` / `ipc/` → `features/` / `storage` / `paths` / `prompts`
-- `features/` → `storage` / `paths` / `prompts` / `model` / `util` / sibling features
-- `model/core-agent/` → dynamic `import('#core-agent')`; locks via `util/locks`; **never read or write business data under data/** (only session jsonl). **Why:** the model layer is stateless; orchestration of business state lives only in features. The model layer touching business data = double-write = state desync.
-- `features/local_agents/` is the **only feature module allowed to import `child_process`**. Other features must call `local_agents/runner.run(...)` for CLI dispatches; never spawn a coding CLI from anywhere else.
-- **CLI backends MUST answer `control_request` records on stdin** — claude code gates tool-use / hook permission through this side-channel even in `--permission-mode bypassPermissions` (MCP servers, user hooks). An unanswered request blocks the child forever waiting on stdin; the failure mode is a silent 20-minute hang ending in our wall-clock SIGTERM. The current handler in `claude.ts` writes a `behavior:'allow'` control_response and emits a `permission-request` event for the rail; if you change permission policy, keep the stdin write — never leave a control_request unanswered. Codex / opencode / ACP have their own out-of-band permission settings (`approvalPolicy`, `HERMES_YOLO_MODE`) and no equivalent stdin channel.
-
-**Key model/core-agent constraints** (each *-tool.ts has a header comment with the implementation details):
-- **Adding a new tool** = entry in `tool-catalog.ts::TOOL_CATALOG` (the anti-drift test relies on this) + register with the runner; system-prompt order is fixed `[systemPrompt → skillsBlock]` (KV-cache stable prefix first). **Tool descriptions go only through the SDK tool-use protocol's API tools field** (full description + JSON schema); **do not inject a "## Available tools" block into the prompt** — that's both duplication and a variable prefix that pollutes the cache.
-- **File-class tools** must funnel through `util/path-sandbox.isPathAllowed` at the entrypoint.
-- **`sdk-timeout-patch.ts`** must be invoked in `index.ts` after logger init and before any feature import; the order cannot change.
-- **`#core-agent` may only be loaded with dynamic `await import('#core-agent')`, never with top-level `import { x } from '#core-agent'`** — a top-level static import would synchronously load core-agent + its `pi-ai` dependency early in main startup, before `sdk-timeout-patch` runs; and the pi-ai package.json lacks an `exports` field, so ESM resolution dies with `ERR_PACKAGE_PATH_NOT_EXPORTED`. Every place that pulls a value from `#core-agent` follows the lazy singleton pattern of `getLoader()` / `getPickDescription()` — `await import` on first use, then cache.
-- **Tool output** is wrapped through `util/tool-result-cap.ts::wrapToolWithCap` enforcing per-tool caps (default 100K; `read_file`/`kb_read` exempted; over 50K spills to disk under `tool-results/<sid>/`).
-
-**features function conventions**: return objects + represent errors as `{ok:false, error}` or throw (the IPC handler unifies wrapping); for any function dealing with user-private data, `userId` must be the first argument.
-
-**IPC channels**: `orkas.invoke` (request/response) / `orkas.streamStart` (event stream `stream:<requestId>`, terminated by `{type:'done'}`) / `orkas.streamCancel`.
-
-**Prompt-md content hygiene** (`src/main/prompts/*.md` is injected into the LLM, **prohibited**):
-1. Project name / brand strings (`Orkas` etc.; replace with neutral wording such as "this system").
-2. Real OS path literals (`/Users/...` / `C:\Users\...`; replace with abstract descriptions or the `<abs-path>` placeholder; `$variable` placeholders injected via `prompts.load(name, vars)` are allowed).
-3. Project-specific directory names (`PC/data` / `userWorkSpace`).
-
-Exception: env-var names with the project prefix (`ORKAS_NODE` / `ORKAS_PC_DIR`) are allowed when actually referenced in bash. Before adding/changing a prompt, `grep "Orkas\|/Users/\|/home/\|PC/data\|PC/src" src/main/prompts/*.md` should come back clean.
-
-**Authoring rules live in platform skills, not in `chat_*.md`**: the canonical authoring rules for agents (`<agent>` container) and skills (`<skill>` container + `<<<skill-file>>>` blocks) live in two platform skills installed from the marketplace under ids `agent-creator` and `skill-creator`. The four prompts that previously copy-pasted these rules (`chat_commander.md`, `chat_agent_setup.md`, `chat_agent_setup_cli.md`, `chat_skill_setup.md`) now carry only a session-shell + `read_file <ROOT>/agent-creator/SKILL.md` (or skill-creator) pointer. **Why:** the long authoring rules are ~200 lines each and were duplicated across four prompts (~600 lines drift surface), kept in sync only by reviewer attention; the duplication caused the commander prompt to balloon past 460 lines, putting the rules in the lost-in-the-middle band. Moving them to platform skills cuts the always-loaded system prompt by ~590 lines and gives every authoring surface a single source of truth — the LLM `read_file`s the skill on demand. Field-level authoring details, including `category` candidate codes, belong in the matching creator skill; if the category set changes, update `agent-creator/SKILL.md` and `skill-creator/SKILL.md` together. The writer backfills a default category on missing/unsafe values; missing category is an advisory, not a write-blocking schema failure.
-
-**Cross-prompt sync constraint for residual shared rules**: a few smaller cross-prompt concepts still live inline (`<agent-input-form>` / `<agent-input-submission>` extract-first protocol in `chat_agent_in_group.md`, the `chat_shared_rules.md` web/PDF/file-output block injected by `bus.ts::concatSharedRules`). For those, the historical principle stands: pick one authoritative prompt as truth, downstream sites carry only the principle (no field detail / schema tables / full translation tables). Before touching the truth source, run `grep -E "<agent-input-form>|<agent-input-submission>" src/main/prompts/*.md` to reconcile downstream.
-
-**Prompt-md cache layout** (KV-cache prefix discipline): every `src/main/prompts/<name>.md` is split into two halves — **static rules first, then a single trailing `## Runtime injection` section that collects every `$variable` substitution** (with the most volatile field at the bottom of that section). Final assembled order = `<role>.md` static body → `chat_shared_rules.md` (when applicable) → `<role>.md` `## Runtime injection` → `buildLanguageDirective()`. The shared block is wedged in front of the runtime block by `bus.ts::concatSharedRules`; the language directive is appended last by `appendLanguageDirective`. **No `## Current xxx` / "current state" block at the top of the file** — anything the LLM itself rewrites mid-session (`<agent>` writeback / `<<<skill-file>>>` / `plan_set` / form submissions: `$name` / `$description*` / `$workflow` / `$skill_dir` / `$skill_files` / `$plan_state` / `$agents_index` / `$inputs_schema` / `$interactive`) goes only into the trailing runtime section. **Why:** putting volatile fields up front means the very next turn rewrites the cache prefix and we eat a full re-prefill; `chat_agent_setup.md` / `chat_agent_setup_cli.md` / `chat_skill_setup.md` shipped with a top-of-file `## Current agent` / `## Current skill` block, every edit turn invalidated the cache, and the fix was to consolidate those into the trailing `## Runtime injection` section. Same applies to any new prompt md added under `src/main/prompts/`. Path-constants that are fixed for the lifetime of a session (`$builtin_*_dir` / `$custom_*_dir` / `$working_dir`) are session-stable and may stay inline in the body; only fields that the LLM or bus mutate within a session are forbidden in the prefix.
-
----
-
-## 4. data sync domains
-
-Top-level three-way split: **cloud** (user-private, synced across devices) / **local** (machine-private, never synced) / **top-level** (globally shared).
-
-```
-<container>/data/
-├── users.json                 top-level Local uid registry + current_user_id
-├── logs/                      top-level Local logs (rolled daily, shared across uids)
-└── <user_id>/
-    ├── cloud/                 Cloud-sync domain
-    │   ├── chats/<cid>.jsonl  + chats/<cid>/{members,state,plan,visibility/}  group-chat runtime state (see §5)
-    │   ├── chats/{skill,agent}/<id>/chat.{json,jsonl}                          edit sessions
-    │   ├── chat_attachments/<cid>/    Main-conversation attachment pool (zero pre-processing)
-    │   ├── chat_artifacts/<cid>/<artifactId>/  LLM-generated interactive web-app bundles (`create_artifact`); served read-only via `chat-app://`; purged by cid on conv delete (see §5)
-    │   ├── saved_apps/<appId>/        User-kept copies of `create_artifact` apps ("My Apps" tab); conversation-independent; never auto-purged; opened via `shell.openPath` (file://) (see §5)
-    │   ├── sessions/<sid>.jsonl       core-agent PersistentSession
-    │   ├── contexts/                  KB user-managed directory tree (source files only; vector.db lives under local/contexts/.kb — see §7)
-    │   ├── memory/MEMORY.md + USER.md
-    │   ├── agents/<aid>/              Custom agent: agent.json (spec) + meta/ (metacognition) + skills/ (self-evolved SkillStore)
-    │   ├── skills/<sid>/              Custom skills (System A, scanned by SkillLoader)
-    │   ├── projects/<pid>/{project.json, bindings.json}  Logical groups of conversations + per-project agent/skill scope (no aggregate index — list = directory scan)
-    │   ├── marketplace/installs.json  Cloud-synced manifest of platform installs ({id, version, published_at, url} per agent + skill) — reconciled on startup
-    │   └── config/{preferences,component-enabled,connectors}.json   (connectors.json: plaintext envelope + per-instance vault-encrypted `secrets_enc`; seed = OAuth user_id — see §6.5)
-    └── local/                 Machine-private domain (never synced)
-        ├── config/            User prefs (auth-profiles / connector-oauth / permissions / reflection-state / web-search-cache / account = `(user_id, session_id)` + device_id + cached profile) — NEVER user-clearable
-        ├── biz/               Server-sourced business data (marketplace.json — 24h TTL category registry); refresh-on-need but NOT user-clearable
-        ├── marketplace/{agents,skills}/<id>/  Platform-installed content (per-machine copy reconciled from cloud installs.json)
-        ├── cache/<bucket>/    User-clearable cache umbrella (marketplace/ today; file_cache / tool-results are slated to migrate here)
-        ├── search/            Derived indexes (contexts / chats / skill_chats / agent_chats)
-        ├── workspace.json     Scoped workspace selection: `{default, projects:{<pid>:…}}` (legacy flat shape auto-promoted on first read)
-        ├── file_cache/<hash>/ Lazy cache for all files (see features/file_indexer.ts)
-        └── tool-results/<sid>/ Spill for oversized tool outputs
-```
-
-**Hard constraints**:
-1. **At top level**, only `users.json` / `logs/` / `<uid>/` are allowed; per-user data must land under `<uid>/{cloud,local}/`. There is no shipped global `builtin/` tree (retired with the marketplace cutover; one-shot migration in `util/migrate-marketplace.ts` moves any legacy `data/builtin/` into the active uid's cloud tree on first launch, then deletes it).
-2. **Platform agents / skills are marketplace-only**: published to the server via `marketplace_dev.upload*` (dev only), installed via `marketplace.installMarketplace*` to `<uid>/local/marketplace/{agents,skills}/<id>/`. The on-disk dir contains the same shape as a custom one (`agent.json` for agents, `SKILL.md` + script files for skills) plus a `_install.json` with `(version, published_at)` used by reconcile to detect drift. The cloud-synced manifest `<uid>/cloud/marketplace/installs.json` records `{id, version, published_at, url}` per entry; `marketplace_reconcile.reconcileInstalls(uid)` runs on startup, parallel-fetches anything missing from the local tree, and re-pulls when the manifest version disagrees with `_install.json`. Immediately before reconcile, `checkServerUpdatesForInstalls(uid)` sweeps every installed id against the server `/marketplace/{agents,skills}/list` endpoint and bumps the manifest's `(version, published_at)` when the server is newer — admin republishes propagate to every client on next startup without user action; offline boots swallow the network error and fall through to a normal reconcile against the stale manifest. **Why this split**: content is binary-blob / catalog-versioned and would tear cloud sync if every machine wrote the same bytes; per-machine local copy + tiny cloud-synced manifest = single source of truth at the manifest level, machine-private at the content level. The loaders scan `[<uid>/cloud/{agents,skills}/, <uid>/local/marketplace/{agents,skills}/]`; custom takes precedence over a platform install with the same id.
-3. **Agent directory shape (per-agent asset aggregation)**: `<uid>/cloud/agents/<aid>/` contains `agent.json` (the sole UI display source — pure spec) + `meta/` (metacognition: COMPETENCE.md + LEARNING_STRATEGIES.md) + `skills/` (SkillStore self-evolved skills, visible only to this agent, not injected into the SkillLoader system-prompt block). Deleting an agent = `rm -rf <aid>/`, no cascade. **Do not** revert to the old top-level `meta/` or `PC/skills/` (the SkillStore default cwd).
-4. **`search/` indexes are purely derived**: never synced; mtime+size reconcile self-heals before each query; 1-second debounced flush + force flush on `before-quit`; rebuild automatically on schema change or corruption.
-5. **The KB vector store is NOT cloud-synced (batch 2 decision)**: only `cloud/contexts/` source files cross devices; the `vector.db` + its `config.json` live at `<uid>/local/contexts/.kb/` (machine-private, NOT under cloud/). Each device's startup `kb_indexer.reconcile(uid)` rebuilds the index from the synced sources idempotently by sha1. One-shot migration `util/migrate-kb-to-local.ts` moves a pre-existing `<uid>/cloud/contexts/.kb/` directory into local/ on first launch (stamped under `.migrations`). **Why path mirrors cloud/contexts/ under local/contexts/**: keeps the mental model "KB lives under .../contexts/.kb/" intact across the cloud/local divide, so the cloud→local split is reflected in the path without renaming the `.kb` segment. **Why this changed from the earlier "vector.db IS synced" rule**: a single-doc edit kicks a hundreds-of-MB whole-DB re-upload — economics broke down once we wired the actual sync engine. Index rebuild is per-spec idempotent, so reuse it. **Journal mode is still DELETE, not WAL** (no benefit from switching; `kb_files` rows already use it).
-6. **Multi-device sync (plan: `PC/docs/plans/multi-device-sync.md`)**: COS bucket prefix = **`private/<oauth_user_id>/`** (NOT the local 8-digit `uid`); per-machine path stays `<container>/data/<local_uid>/cloud/`, and `private/<oauth_user_id>/` is the cloud-side mirror. **Why the `private/` namespace**: leaves the rest of the bucket (e.g. `public/marketplace/skills/`) freely STS-scoped for non-user-private content; without it, widening any future public scope risks colliding with user data prefixes. **Why oauth_user_id (not local uid)**: same OAuth user has different local `uid` on each device — using local uid would scatter cloud data. The `features/sync/` engine is the **sole** writer of cloud→COS traffic and `private/<oauth_user_id>/cloud/*` keys; `features/sync/manifest.ts::commitManifest` (POST `/sync/manifest/commit`) is the **sole** writer of `private/<oauth_user_id>/manifest.json` (Server enforces atomicity via per-user lock + generation CAS + quota delta; see `Server/CLAUDE.md` §4). PC's STS scope is `private/<oauth_user_id>/*` for read, `private/<oauth_user_id>/cloud/*` for write — `manifest.json` is read-only for PC by design. **Five canonical sync triggers** funnel through `DirtyBus` / `engine.syncNow`: startup (post-marketplace reconcile), debounce-fired dirty event, manual ("立即同步" button), 5-minute periodic safety-net ticker (`engine.ts::PERIODIC_INTERVAL_MS`, bound to engine lifetime so the master switch gates it for free), before-quit. The 30s global floor between auto runs (`engine.ts::GLOBAL_FLOOR_MS`) applies to all except manual + before-quit (which bypass it intentionally; periodic respects it — a recent pass for any reason defers the next tick). **3-way pull classification** (`manifest.ts::classifyPullCandidates`, called from `_passBody` step 5): every path `diff()` puts into `need_pull` is routed by the (base, disk, remote) sha tuple — case A `base==disk` (local untouched, remote moved) → straight overwrite, **never push**; case B `base==remote` (local moved, remote untouched) → reclassify to push (legacy 3-way diff); case C three-way divergence → content-aware merge, then push the merge result back. **Why case A must not push**: a path whose on-disk bytes differ from base usually came from a prior merge's residue, NOT a fresh user edit — pushing it would publish the engine's own historical output as if it were a user change. We shipped this bug for a while and saw `pulled: 4 / pushed: 0` every pass for the same set of jsonl + mutable-json paths; the case A bucket is the load-bearing fix.
-7. **Master switch defaults OFF** (user opt-in). `local/sync/state.json::enabled = false` until the settings card toggle turns it on. The engine's `init()` is a no-op while off, so login alone does not trigger any upload — there is exactly one moment data starts crossing the wire, and the user clicked a toggle to cause it.
-   - **`LOCAL_DATA_VERSION` data-version gate** (`features/sync/data_version.ts`): every PC build carries an integer schema-version constant; on each pass the engine compares it to `manifest.data_version` post-fetch and aborts with `pause_reason = 'version_outdated'` when `remote > LOCAL_DATA_VERSION` (Server mirrors the same gate on commit → `client_outdated` / 50404, which the engine handles as a sticky pause rather than a retry-able error). **When to bump + when NOT to + bumping procedure** are the MUST / MUST-NOT checklists in `data_version.ts`'s header comment — that file is the single source of truth for the call; don't restate the criteria elsewhere. **Why a third version field** when `manifest_v` and per-entry `schema_v` exist: they answer different questions — `manifest_v` is the manifest JSON's own structure, `schema_v` is per-file content format (with consumption logic still TODO in `merge/`), and `data_version` is the *global* application-data contract gate. Don't conflate them.
-8. **`<uid>/local/cache/<bucket>/` is the user-clearable cache umbrella**. Anything dropped under `cache/` is fair game for the "clear cache" UI button (`features/cache_clearable.ts::clearAllClearable`). Distinct from `config/` (user prefs — never auto-cleared) and `biz/` (server-sourced reference data — refresh-on-need but not user-clearable). The marketplace content cache lives at `cache/marketplace/{agents,skills}/<id>/` with a per-entry `_cache.json` carrying `(server_id, version, published_at, fetched_at, last_used_at)`; entry-time sweep evicts entries idle > 7d AND LRU-trims when total > 100 MB (see `features/marketplace_cache.ts::sweepIfNeeded`, called once per `openMarketplace`). **Note**: `local/marketplace/{agents,skills}/<id>/` (the install target — constraint 2) is NOT under `cache/` and is NOT user-clearable; only the staging cache for browsing detail is. Future migration: `file_cache/` and `tool-results/` will move under `cache/` so a single "clear cache" hits all of them — DON'T yet rely on this; each owner module updates its path helper before the move.
-
-9. **`<uid>/local/signals/<yyyy-mm-dd>.jsonl` is the expert-signal stream** (T0/T1 user-behavior records — retry / skip / form_left_blank / silence / tool_failure / accept / correction / reject / edit / skill_advertised / skill_invoked / skill_ineffective / agent_dispatched). Local-only, append-only, daily-rotated. **Sole writer for the features layer = `features/expert_signals/emitSignal`**; chokepoint sites are `features/group_chat/bus.ts::runTurn` end + `_enqueueBody` USER_ID branch + `features/group_chat/index.ts::{retryStep, skipStep, markFormSubmittedAndDispatch}` + `features/group_chat/plan_executor.ts::dispatchReady`. **Model-layer signals route through `ChatOptions.{onSkillAdvertised, onSkillInvoked}` callbacks** drained at bus turn-end (`expert_signals/turn_hooks.ts::createSkillTurnBuffer`); **the model layer must never `import { emitSignal }` directly** (would reverse-import features/ and violate §3 layering). **Why centralized**: scattered `emitSignal` across `features/*` (or, post-callback, scattered model-layer imports) violates the single-dispatch-primitive rule (§5) and produces signals whose order disagrees with turn order — downstream reflection / patch suggester / critic (phase 1+) all assume turn-aligned causality. **`turn_id` convention**: every signal's `turn_id` is the agent msg id the signal reacts to or is produced by (agent-side = self; user-reaction = previous agent msg; retry/skip = `step.output_msg_id`; agent_dispatched = synthetic `<cid>:plan:dispatch:<ts>:<i>` since no commander msg id is plumbed through plan_executor yet). Direct JOIN on `turn_id` recovers cross-signal causality (skill_invoked × correction, retry × tool_failure). Phase 0 has NO redaction layer (see §10).
-
-**uid lifecycle** (`features/users.ts`): on startup, `initActiveUser()` reads or creates `users.json` and calls `activateUser(uid)` (skeleton mkdir + injecting `process.env.CORE_AGENT_AUTH_DIR` + clearing caches + running migrations including `migrateLegacySessionIds`). All user-scoped features get the uid via `getActiveUserId()` (throws if not activated). One active uid at a time for now. **uid shape is unconstrained** — OrkasOpen first-boot generates 8-digit numeric via `genUserId()`; Hosted Orkas reconciles the local uid with the OAuth-issued user_id via `reconcileDevUid`, which today carries through whatever the server emits (UUID with dashes is real). Code that uses `<uid>/...` as a path segment is fine with any shape (single segment, no parsing). Code that USED to embed `<uid>-` into session_id has been removed (§5 — session_id is now `<kind>-<tail>`); never reintroduce that pattern.
-
-**User-account login (Google / Apple OAuth)** — all main-side code lives under `features/account/`, all renderer UI under `renderer/views/login/`; `index.ts` only hooks `account.registerProtocol()` + `account.bootstrap()`. Login state is a single sliding `SessionMgr` session — **no separate access/refresh token, no client-side refresh**: the provider handshake (`/account/oauth/{start,callback}` → one-time `exchange_code` → `/account/oauth/exchange`) returns `{user_id, session_id, user_info, subscription}` (subscription added by the membership-and-billing batch — see Server/docs/plans/membership-and-billing.md), and `user_id` + `session_id` (+ the cached `user_info` profile + `subscription` snapshot) are persisted **plaintext** to `<uid>/local/config/account.json` — same convention as `auth-profiles.json` and the rest of `<uid>/local/config/` (machine-private, never synced; protected by filesystem permissions, not in-file encryption). Authenticated requests carry `user_id` + `session_id` headers; the server renews the session on each one. At boot, a stored session → optimistic status `ready` from the disk cache immediately (no network wait), then one background authed call (`GET /account/me`, replacing the older `POST /account/points`) re-validates it AND refreshes the user_info + subscription snapshot in one round trip — a 401 there flips to `needed` and re-shows the login gate; a transient failure keeps the optimistic `ready`. **This whole feature — `features/account/`, `ipc/account.ts`, `views/login/`, the `window.orkas.account` namespace + `account:changed` push, the `orkas://` scheme, the `account.*` i18n keys, the `#settings-account-group` + `#settings-subscription-group` blocks — is stripped from the OrkasOpen build** (open-source client has no account backend); the strip list is single-sourced in `OpenSource/SyncCode/strip-rules.json`.
-
-**Membership-and-billing surface** (`features/account/subscription.ts` + the same `account.json` row carrying `subscription`): the snapshot rides on the existing `account:changed` push (`state.statusPayload.subscription`) — there is no second IPC channel for "tier-changed". The renderer's `views/login/account_settings.js::renderSubscriptionSettings()` reads from there + visibility-change re-fetch via `account.fetchMe()`. **Cloud sync and voice input are Pro-only** (Server-side gate via `require_entitlement("sync_enabled" | "voice_enabled")` in `Server/api/{sync,voice}.py`); the PC sync engine's master-switch in `local/sync/state.json::enabled` stays user-controlled, but writes will be 50403-rejected when `subscription.tier !== 'pro'` or status is non-active+non-grace — so the renderer's `sync_settings.js` should treat that as an expected failure mode (existing error UI surfaces it), not a bug. The renderer's only billing-action path is `account.openWebAccount()` → `/account/web_session/start` → `shell.openExternal` to the Web Account page; `BILLING_ACTIVE_PROVIDER=none` profiles render the Subscribe button as "Coming soon" (`account.subscription.billing_enabled` carries the answer; never gate on profile name). **Don't** mint a Stripe / Paddle URL inside the renderer — provider URL construction is server-side only (the entire reason the abstraction exists, see Server/CLAUDE.md §4).
-
-**Voice-to-text in the chat composers** — the mic button next to the "+" attach button streams mic audio (renderer `getUserMedia` + AudioWorklet → 16 kHz PCM) over a WebSocket to the Orkas Server's `/voice/asr_ws` proxy (VolcEngine ASR). Renderer-side in `modules/voice-input.js`; the WS URL comes from the `voice.asrWsUrl` IPC handler, which resolves the same Server base as `features/account/server.ts::accountApiBase()` (`orkas.ai` prod; `ORKAS_VOICE_API_BASE` / `ORKAS_API_BASE_URL` override) and **requires login** — it reads `user_id`+`session_id` from the account session (in main) and appends them as a query pair (a browser `WebSocket` can't set an Authorization header); no session → the handler returns `{ok:false, error:'E_NOT_LOGGED_IN'}` and `voice-input.js` shows `chat.mic_login_required`. Mic access needs the renderer permission gate in `index.ts` (`setPermissionRequestHandler` grants `media`) plus `build.mac.extendInfo.NSMicrophoneUsageDescription` so packaged macOS shows the OS prompt. **Server-dependent → stripped from the OrkasOpen build** (offline client, no Server): `modules/voice-input.js`, the mic-button markup + `<script>` line in `index.html`, the `.chat-mic-btn` CSS, the `chat.mic_*` i18n keys, the `voice` namespace in `preload.js`, the `voice.asrWsUrl` handler in `ipc/index.ts` — single-sourced in `OpenSource/SyncCode/strip-rules.json`. (The permission gate + Info.plist key stay — they're feature-agnostic and a no-op without the mic button.)
-
-**iOS remote-control relay** — `features/relay/` (Server-dependent, **stripped from the OrkasOpen build** like `features/account/`). The companion `iOS/` app is a remote control: it can't run agents, it dispatches commands to this PC and watches progress. While the account is signed in (wired from `index.ts` after `account.bootstrap()` resolves to `ready`): `device.ts` registers this PC as a relay device + heartbeats (`device_id` reuses `account/token_store.ts::getDeviceId` — a stable per-machine UUID persisted in `account.json`); HTTP / WS calls attach `user_id` + `session_id` from `token_store.authHeaders()` (the unified SessionMgr credential — no separate access/refresh token layer); `commands.ts` long-polls `/relay/commands/poll` for commands the iOS app addressed to this device and delivers each as a user message via `group_chat.send` (→ `bus.enqueue`, the single dispatch primitive — **no parallel dispatch path**); **the poll is true long-poll** — Server BRPOPs up to ~25 s, so PC chains the next call on response (no `setInterval` cadence) and bounds each call with an `AbortController` (`PER_CALL_TIMEOUT_MS = 35 s` in `commands.ts`). **Don't reintroduce a fixed inter-poll delay** — Server controls cadence via BRPOP; a client-side delay just adds latency between commands; `sync.ts` mirrors a `state.json::relay_enabled` conversation's `message` / `plan_changed` / `state_changed` bus events up to `/relay/conversations/sync` so the phone sees the same messages + plan rail. A relayed command's cid is the one the Server assigned (a fresh `rconv-…` for a new conversation, or the phone's existing cid); `chats.createConversation`'s `conversationId` option adopts it so both ends agree on the cid. **PC sidebar sync for iOS-triggered convs**: `commands.ts::processOne` emits an `onActivity({cid, created})` callback after each successful delivery; `main/index.ts` wires it to `ipc.broadcastToRenderer('conversations:relay_activity', …)`. The renderer's `startRelayActivitySubscription()` (in `modules/conversation.js`, kicked off from `boot.js`) reloads the conv list on `created:true` and `_bumpConvToTop(cid)` on `created:false` — so iOS-initiated work appears in the PC sidebar without a relaunch; **no parallel display path** (jsonl history + `groupChat.streamEvents` already covers opening / live updates). **No server-side agent execution** — the Server `relay` module is a thin presence + queue + conversation-mirror layer (see Server CLAUDE.md); a server-side "云端" worker is a future decision, and the iOS device picker shows "云端" permanently greyed until then.
-
----
-
-## 5. Conversation / session isolation (core security invariant)
-
-| Conversation type | UI message list | session_id |
-|---|---|---|
-| Main conversation (group chat) — commander | `<uid>/cloud/chats/<cid>.jsonl` | `gconv-<cid>` |
-| Main conversation (group chat) — agent worker | `<uid>/cloud/chats/<cid>/visibility/<aid>.jsonl` | `gmember-<cid>-<aid>` |
-| Skill editing | `<uid>/cloud/chats/skill/<sid>/chat.jsonl` | `skill-<sid>` |
-| Agent editing | `<uid>/cloud/chats/agent/<aid>/chat.jsonl` | `agent-<aid>` |
-| KB image understanding | (no UI) | `extract-img-<hex>` |
-| CLI agent dispatch (devtools archive only) | (no jsonl — archive only) | `cli-<cli>-<runId>` |
-
-session jsonl files land at `<uid>/{cloud,local}/sessions/<session_id>.jsonl` (cloud for resumable kinds gconv/gmember/skill/agent; local for ephemeral extract-img/reflect/memory-extract/anon — see `model/core-agent/session-store.ts::EPHEMERAL_KINDS`) — they are **two independent files** from the UI message list.
-
-**Project membership** is an index-level field on the conv record (`Conversation.project_id`), **not** part of any path or session_id. cid stays globally unique; `<cid>.jsonl` / `groupChatDir` / `chat_attachments/<cid>/` / `session_id = gconv-<cid>` paths are independent of project membership. Project membership has effect in two places, both resolved once at the top of `runTurn` and threaded through `ChatOptions`: (1) **workspace** — `getWorkspacePath(uid, projectId?)` (sync) picks the project-scoped selection from `<uid>/local/workspace.json::projects[pid]` when set, falling through to `default.selectedPath` then `DEFAULT_USER_WORKSPACE`; (2) **agent/skill scope** — `projects.resolveProjectScope(uid, projectId)` returns the project's `bindings.json` (`{agents, skills}`), which restricts the commander's agents-index render and the System A skill render to those ids only. Orphan conversations (no `project_id`) keep legacy global visibility. group_chat threads `projectId` + `projectAllowedSkillIds` through `ChatOptions` → `LocalToolsOpts` / `FileToolsOpts` / `ImageGenToolOpts` / `getSystemPromptBlock`. **Do not** re-read the conv index or bindings per tool call — the resolved values travel with the turn.
-
-**Security invariant**: `session_id` is `<kind>-<tail>` — the kind keyword anchors the FIRST segment, and `<kind>` ∈ `gconv | gmember | skill | agent | extract-img | reflect | memory-extract | anon | cli` (`sub` / `organizer` / `conv` are legacy kinds; new code does not generate them, but `migrate-session-ids` preserves these older files). **User scoping is provided by the path root** (`<activeUid>/{cloud,local}/sessions/<sid>.jsonl` resolved via `getActiveUserId()` in `model/core-agent/session-store.ts::sessionFileFor`); the session_id intentionally does NOT carry uid — a previous design embedded uid as the first segment, but it was redundant with the path root (sessionFileFor was self-checking the prefix it had just been handed) AND it forced uid to be dash-free, which broke when OAuth UUIDs entered the system. `resolveSessionPath` enforces the kind-anchor with a hard assertion (rejects ids that don't start with a known kind, blocks accidental hand-built ids). **Do not** prefix brand names (`orkas-` / `aiteam-` / any app name) or uid into session_id — startup `migrateLegacySessionIds(uid)` rewrites every legacy shape (`<brand>-<uid>-<kind>-<tail>` / `<uid>-<kind>-<tail>`) to `<kind>-<tail>` once. Adding a new kind requires extending this table + `session-store.ts::KNOWN_KINDS_RE` + (if it should expose connectors) `runner.ts::connectorExposureFromSessionId`. The `cli` kind is **devtools-only**: CLI dispatches don't write to `sessions/*.jsonl` (no core-agent session); the id exists purely to give the LLM-debug archive a stable, kind-tagged identifier.
-
-**Skill injection policy**: edit conversations + group-chat commander = no filtering (inject all); group-chat agent worker = filter by `agent.skill_list` three-state (see §6).
-
-**Prompt-cache convention**: continuous sessions (`gconv-* / gmember-* / skill-* / agent-*`) default to `cacheRetention: 'short'`; one-shot calls (memory / reflection / KB image) do not pass it. pi-ai already abstracts provider differences (the features layer does no branching). `'long'` is off by default (Anthropic's 1h has a 2× write surcharge).
-
-**Adding a new conversation type**: UI path must contain a `user_id` segment + session_id uses the `<kind>-<tail>` format (kind first segment, **no uid / brand prefix** — see Security invariant above) + conversation-level rules go through `ChatOptions.systemPrompt` (rebuilt every time, **don't splice them into the first user message as a prefix**) + update this table.
-
-### Group-chat architecture (`features/group_chat/`)
-
-Independent worker loops, **no RPC between actors**. Any agent first targeted by `dispatch_to` / `plan_set` is auto-added to the group.
-
-LLM dispatch only via structured channels (`dispatch_to` / `plan_set` tools); `@<name>` in commander / agent **prose** is NOT recognized as a dispatch signal — LLM training uses `@` as markdown decoration and this used to mis-trigger recurring bugs (user-typed `@<name>` is still parsed for UX). `dispatch_to` only stages — the recipient worker must not be woken before the commander turn fully wraps up, or the race that the `pendingPlanAnnouncement` + delayed-reconcile pattern was built to avoid reappears.
-
-**Single dispatch primitive**: `bus.ts::enqueue` is the only external control-flow entry point for group_chat. **Do not** introduce parallel enqueue functions. `groupChat.retryStep / skipStep` are not exceptions — they only mutate plan state; redispatch goes through `planExecutor.reconcileAfterStepTransition → dispatchReady → enqueue`.
-
-**Plan rail (`renderer/modules/plan-rail.js`)** is the SOLE frontend display for plan state — `STATUS_ICON` is single source of truth, no LLM input, no backend / locale duplicates. Failed-step action buttons hide while `state.in_flight` is non-empty to avoid racing user actions against an in-progress turn.
-
-**Plan-level transient retry** (`plan_executor.ts::TRANSIENT_ERR_PATTERNS`, cap `MAX_TRANSIENT_RETRIES=2`): patterns must only match network-layer signals (undici `terminated` / `ECONNRESET` / `ETIMEDOUT` etc.). **Never include `aborted` / `cancelled`** — user-initiated abort must not be silently retried (`'aborted by user'` is also explicitly excluded). The plan layer only does state recovery — no sleep / backoff / socket-reconnect logic (that's core-agent's job).
-
-**Key constraints**:
-- **Visibility slice** (security invariant): agent X sees only messages where `from==X ∨ to∋X ∨ mentions∋X`; workers must go through `visibility.readSlice` and **never read the full `<cid>.jsonl`** (which would leak other actors' private context).
-- **plan**: the commander writes `<cid>/plan.md` only via the `plan_set` tool; **no out-of-tool hand edits** (which would break the first-announcement semantics + UI `plan_changed` event chain). User-initiated `retryStep` / `skipStep` go through `plan_executor` (which `updateStep`s + reconciles), NOT through hand-editing `plan.json`.
-- **abort**: `groupChat.abort(cid)` is the sole group-level stop (clears every actor queue + aborts in-flight + sets `state.json.status='aborted'`; plan.md is preserved as a progress record); **no per-stream stop button**.
-- **Infinite-loop guard**: `MAX_WORKER_TURNS=100` (turns dimension, **not time**); paired with the outer `idleTimeout=600s`, two independent fallbacks.
-- **Structured outputs**: the commander's `<agent>...</agent>` container (create/edit agent), and the agent's ```agent-input-form``` fenced block (forms); format and pipeline details are in `bus.ts::runTurn` + `prompts/chat_*.md`.
-- **Delete cascade**: `chats.deleteConversation` → `groupChat.dropConv` is the one-stop call.
-
-### Attachments (main conversation only)
-
-Stored at `<uid>/cloud/chat_attachments/<cid>/<file>`, **zero pre-processing**; extract / compression are lazy under `<uid>/local/file_cache/<hash>/` (see `features/file_indexer.ts`).
-
-**Key constraints**:
-- file-tools scope = active workspace ∪ the attachment dir of the current cid; out-of-bounds → `E_PATH_OUT_OF_SCOPE`.
-- For pdf/docx, **`stat_file` must run before `read_file`** (read_file returns `E_NEED_STAT` — single responsibility, see §9 Don't do).
-- `chat-media://cid/<encCid>/<encName>` is a per-conv attachment URL; `chat-media://local/<abs>` references arbitrary local media (extension allow-list + size cap; **no directory allow-list** — the threat model is "users running their own LLM").
-- Video allow-list is `.mp4/.webm/.mov/.m4v/.ogv` (200 MB cap), **for display only, not fed to the model**.
-
-### Local execution tools
-
-`bash / write_file / edit_file / markdown_to_pdf / html_to_pdf / generate_image / create_artifact` share the `localExec.granted` permission gate (grant/revoke from the settings page, re-read on every `execute()` so it takes effect mid-conversation); unauthorized → `isError=true`. `web_search` goes through `searchProfiles[0]` → paid API → fallback built-in. Outputs are collected via `ChatOptions.onFileWritten` (also fires for `edit_file` so in-place modifications surface as green chips); the renderer shows green chips → IPC `workspace.revealPath` (strictly validated to stay inside the workspace). See `model/core-agent/{local-tools, image-gen-tool, search-tools}.ts`.
-
-### Structured-output rendering — three layers
-
-Three orthogonal carriers for agent output, ordered by weight:
-1. **Markdown** (default) — `renderMarkdown` in `src/renderer/modules/utils.js` (PC + iOS copy share the same renderer).
-2. **`:::dashboard` directive** — fenced JSON component tree parsed in-place by `renderDashboard` in the same file. ~12 components (Stack / Grid / Card / Separator / Metric / Chart / Table / Alert / Timeline / Code / Markdown / Image). **Renderer-level only — no tool plumbing**, the directive lives next to `:::chart-bar`. Schema reference for the LLM is inline in `prompts/chat_shared_rules.md` "Output formats"; adding a component or enum value requires updating both the renderer switch AND the shared-rules schema in the same patch. Fixture coverage: `test/renderer/utils-dashboard.test.ts` (per PC/CLAUDE.md §9 LLM-output text munging rule). **iOS works the same** — `:::dashboard` is pure renderer code; no `chat-app://` dependency.
-3. **`create_artifact`** — multi-file web-app artifact (heavy; see below). Use when behavior actually matters (forms / dynamic charts / interactive pages); static structured snapshots stay in `:::dashboard`.
-
-**Per-agent output-format preference**: `Agent.output_format` — three user-facing values, progressive capability disclosure: `'markdown_only'` (blocks `:::dashboard` + `create_artifact`; create-modal default for new agents); `'dashboard'` (allows `:::dashboard`, still blocks `create_artifact`); `'artifact'` (allows both). Two legacy on-disk values accepted as aliases by `bus.ts::buildOutputFormatHint`: `'allow_artifacts'` is the pre-rename `'artifact'`; `'auto'` is the pre-redesign default and maps to an empty hint. Missing field = same as `'auto'` (empty hint, no constraint) — agents authored before the redesign keep unconstrained behavior until the user explicitly picks a value, at which point `agents.update({ output_format })` persists the choice. Authored via the create modal (`modules/agents.js::_mountAgentOutputFormatCreateSelect`, default `markdown_only`) and the detail dropdown (`_renderAgentOutputFormatSection`, same 3-option set plus legacy-value mapping), NOT by the agent-edit LLM. Injected into the worker prompt's `## Runtime injection` tail. **Don't** move the injection point into the static prompt prefix (volatile field discipline, §3) — keep `'auto'` / missing producing an empty string so the cache prefix stays stable for unconstrained agents.
-
-### Interactive web-app artifacts (`create_artifact` + `chat-app://`)
-
-`create_artifact({title, files:[{path,content,encoding?}]})` writes a self-contained multi-file web app into `<uid>/cloud/chat_artifacts/<cid>/<artifactId>/` (the **only** place artifact files live; `features/chat_artifacts.ts` validates the set — must include a top-level `index.html`, ≤20 files / 256 KB·file / 1 MB total, served-extension allowlist, base64 for binary). The renderer embeds it as a sandboxed `<iframe>` (`sandbox="allow-scripts allow-same-origin allow-forms"`, cross-origin to the renderer so `parent.*` is blocked by SOP) at the bottom of the assistant bubble (`modules/chat-artifact.js`); the card header also has an "open in browser" button → `conversations.artifacts.openExternal` IPC → `shell.openPath(<artifactDir>/index.html)` (a `file://` view, so the `__orkas/bridge.js` virtual path and cross-origin sibling `fetch` don't work there — the iframe stays the primary surface; the path is still routed through `chatArtifacts.resolveArtifactFilePath`). It's served read-only by the privileged `chat-app://cid/<encCid>/<encArtifactId>/<relpath>` protocol handler in `index.ts` (every request → `chatArtifacts.resolveArtifactFilePath`, same traversal guards as `resolveAttachmentAbsPath`; reserved virtual path `__orkas/bridge.js` → in-memory `BRIDGE_JS`). The **only** artifact→app channel is `postMessage({__orkasArtifact:true, type:'submit'|'resize'|'open-external', ...}, '*')`, which the renderer validates by `event.source` identity (not origin string) before composing a `@`-routed user message (`<artifact-result artifact_id agent_id>` tag, stripped from display, opaque to bus). Never inject `window.orkas` or any privileged handle into the iframe. Flow: `create_artifact` fires `LocalToolsOpts.onArtifactCreated` → `bus.ts::runTurn` collects per-turn + attaches `GroupMessage.artifacts[{id,title,agent_id}]` on the end-of-turn enqueue (`agent_id` = the producing actor, the result-routing target); `chats.deleteConversation → chatArtifacts.purgeByCid`. `create_artifact` is only offered when the runner has both `cid` and an `onArtifactCreated` sink (group chat) — edit chats / ad-hoc runs don't get it. Orphaned artifact dirs (single-message edit/delete) are not GC'd yet.
-
-The artifact card's header collapses into one `⋯` popover: **reload** / **open in browser** (`conversations.artifacts.openExternal` → `shell.openPath(<artifactDir>/index.html)`, a `file://` view, so the `chat-app://` bridge / cross-origin sibling `fetch` don't work there — the iframe stays the primary surface) / **save**. **Save** (`conversations.artifacts.save` → `features/saved_apps.ts::saveFromArtifact`) copies the bundle into a conversation-independent pool `<uid>/cloud/saved_apps/<appId>/` (cloud-synced, never auto-purged, not touched by `deleteConversation`), stamped with a provenance `__orkas-meta.json`. The "My Apps" sidebar tab (`#apps-btn` → view `apps` → `#panel-apps`, `modules/saved-apps.js`) lists them (`savedApps.list`); a card's primary click opens it in the system browser (`savedApps.openExternal` → `savedApps.resolveSavedAppIndex` — same appId-shape + `path.relative` traversal guard family as `resolveArtifactFilePath` — then `shell.openPath`); the card `⋯` has **edit** (`savedApps.openForEditing` → creates a fresh normal conversation, bundles the app's source into a single `app-source.md` and `chatAttachments.uploadAttachment`s it there, returns the conv so the renderer navigates + pre-fills a draft — on any failure the half-built conv is rolled back via `deleteConversation`) / rename (`savedApps.rename`) / delete (`savedApps.delete`). "Edit" is a fork-and-modify flow: the new conversation's `create_artifact` produces a *new* artifact, not an in-place update; the original saved app is untouched.
-
-**Write-file conflict avoidance** (`util/uniquify-path.ts`): `write_file / markdown_to_pdf / html_to_pdf / generate_image` write to the path the model gives by default; **on conflict, uniquify** (insert `-N` before the basename suffix) and pass it back explicitly via the `<file-renamed>` block in the tool result. "Mine vs not mine" is decided by the caller-injected `ChatOptions.hasProducedPath` (group_chat uses producedSet at turn granularity) — paths this turn already wrote are treated as refinement (overwrite); other pre-existing files are external conflicts. **`bash` is not in the protected scope** (shell redirection is a black box). **`edit_file` is also not in this scope** by design — its semantics is "modify an existing file in place" (not "create a new artefact"), so uniquify would be wrong; it instead enforces sandbox-membership (workspace + current attachment dir + extraRoots, same set as the file-tools read side) and rejects pdf/docx/image kinds, so the LLM can only mutate text files the conversation can already see. When `read_file` hits ENOENT, it scans sibling `<name>-N<ext>` files in the same directory; on a hit it appends a `<file-renamed-earlier>` hint as a second layer of defense.
-
----
-
-## 6. Skills
-
-Sources = `<uid>/cloud/skills/` (custom, cloud-synced) + `<uid>/local/marketplace/skills/` (platform, per-machine; reconciled from the cloud-synced `<uid>/cloud/marketplace/installs.json` manifest — see §4 constraint 2). `SkillLoader` scans `[custom, platform]` and injects them into the system prompt; **custom takes precedence over a platform install with the same id**. The same per-machine + cloud-manifest split applies to agents (`<uid>/local/marketplace/agents/<id>/agent.json`). `category` is part of the spec itself (SKILL.md frontmatter / agent.json field) — same shape as custom; downstream readers (`listAgents` / `listSkills`) read it from one place. **Why:** earlier the dev upload tool didn't write category back into the spec, so platform installs lacked the field on disk; that's been fixed (`marketplace_dev.ts::uploadCustom*` rewrites the spec before zipping). `version` and `published_at` stay in `_install.json` + `installs.json` — they are install-state metadata, not spec content.
-
-**Authoring rules are themselves platform skills** (installed from the marketplace under `agent-creator` / `skill-creator` ids): they carry the canonical authoring rules for `<agent>` and `<skill>` containers. The four chat prompts (`chat_commander.md` + the three inline edit chats) point at them via `read_file <ROOT>/agent-creator/SKILL.md`. When changing authoring semantics — field shapes, validation rules, category candidates, similarity-check protocol, edit-loop, prose forbidden words — update the matching `*-creator/SKILL.md` and republish through the marketplace upload flow. See §3 "Authoring rules live in builtin skills" for the cross-prompt sync convention.
-
-**Dev-mode only**: platform skills + agents become editable through the existing inline edit chat (the `source !== 'custom'` guard is lifted when `false`); the ⋯ menu also exposes "delete" and "promote to platform" entries. Writes target the local install dir (`<uid>/local/marketplace/{agents,skills}/<id>/`) only — there is no shipped src tree to dual-write into. Server-side publishing is a separate flow through `marketplace_dev.upload*`. Two-layer protection: (1) runtime `false` gate on every entry; (2) physical exclusion at packaging time via `package.json::build.files` `!src/main/features/*_dev.ts` + `!src/main/ipc/dev_handlers.ts` (the dev modules are never present in asar). The setup prompt for platform editing uses `i18n.ts::buildBuiltinEditingConstraint()` (English-only output except `description_zh`) instead of the user-language directive — see §3.
-
-**Platform skill / agent source files keep their primary text in English** (SKILL.md body / examples, and the system / persona / workflow of platform agent specs): they ship to a multilingual user base, the LLM auto-replies in the conversation language, and there is no need for a Chinese fallback in the source files; mixing in Chinese makes English-speaking users see half-translated content. Custom skills / agents are user-authored and have no language restriction.
-
-**Exception: `description` must be bilingual** — SKILL.md frontmatter uses both `description_zh` + `description_en` (the legacy single `description` field is migrated by CJK heuristic in the loader / normalizeAgent buckets, but **new entries always use both fields**); agent spec JSON likewise uses `description_zh` + `description_en`. **Why:** the description is the selection signal seen by the commander / main-conversation LLM (`chat_commander.md:91/96/325`); built-in skills / agents are distributed globally, and an English-only description means a Chinese UI user sees an English description in the list, leading to mis-matches. At runtime, `getSystemPromptBlock` / `_buildAgentsIndexBlock` / UI rendering all pick the right one based on `getCurrentLang()` (the `pickDescription` resolver lives in core-agent + renderer utils, kept in sync). **Pre-translated, not at runtime** — description quality must be controllable, and runtime translation has both quality variance and latency cost.
-
-**SKILL.md frontmatter — allowed fields**: `name` / `description_zh` / `description_en` / `category` (legacy single `description` is migrated by CJK heuristic in the loader). **No** `requires` / `external_deps` / `tags` / `version` / any other field. Skills have no hard inter-dependencies (no transitive closure, no cross-skill writes); external deps are stated in the body's "External dependencies" section as plain text — runtime does not pre-check or auto-install. **`category`** holds a marketplace category code; the current candidate list is authored in `agent-creator` / `skill-creator`, not in the chat prompt shells. Model-authored agent/skill create or SKILL.md rewrite should choose exactly one current code; missing/unsafe values are repaired to the default category instead of blocking the whole write. Legacy/manual specs without it still load as empty string = "uncategorized" in `listSkills` / `listAgents`. The `_install.json` sidecar at the root of a platform-installed skill (`{version, published_at}`) is NOT consumed by SKILL parsing — it's read only by `marketplace_reconcile` to detect manifest/disk drift; `skills.ts::IMPORT_FILTER_NAMES` filters it (plus the legacy clawhub `_meta.json`) on import.
-
-**id ≠ name (loader decouples them)**: `SkillSpec.id = path.basename(dir)` (always the directory name, used as the `read_file <ROOT>/<id>/SKILL.md` path component); `SkillSpec.name = frontmatter name || id` (display label, what the LLM picks from). For **custom** skills they happen to coincide (`features/skills.ts::createCustomSkill` keeps `dir name = frontmatter name`). For **marketplace installs** they diverge — dir is the 12-hex `server_id` (catalog uniqueness), name is the authored human label. **Why:** allows multi-author same-name uploads (server dedup on `(name, create_uid)`); LLM still picks by readable name, reads by id. `skill-registry::renderSkillLines` emits both forms — `**<name>** (id: <id>)` when they differ, `**<id>**` when they don't — and the prompt warning line spells out "use `<id>` in the path even when it differs from the display name". Do NOT re-couple them in the loader (the early invariant was a mistake fixed 2026-05-12).
-
-**`agent.skill_list` three-state**: `undefined` = no filtering (legacy compatibility) / `[]` = zero skills / non-empty = a strict subset. `updateCustomAgent` only does "filter unknown ids" before saving; it does not expand a closure. The field is auto-maintained by the agent-edit LLM via the `<agent><skills>` sub-tag; **the frontend does not expose hand-editing**.
-
-**CLI-backed agents (`runtime.kind === 'cli'`) bypass SkillLoader entirely** — `skill_list` is ignored at dispatch time, the system prompt isn't built (the CLI brings its own prompt), and the edit chat uses `chat_agent_setup_cli.md` which forbids the LLM from authoring `<workflow>` / `<skills>` / `<runtime>` sub-tags. The runtime itself (cli + model + custom_args) is owned by the create modal + edit-form, not by the LLM.
-
-**Skill scripts default to `.py`** (Python 3, broadest coverage); also allowed: `.ts / .mjs / .js` (via tsx + Node), `.sh` (bash), `.rb` (ruby). **Why:** the vast majority of external-ecosystem skills are written in py; forcing rewrites is a high bar and bug-prone; py ships with macOS/Linux and Windows installs once. **All invocation goes through** `bin/run-skill.cjs <id> <basename>` (no extension); the runner dispatches by extension: `.py` → `python3` (Win: `py -3` → `python`); `.ts/.mjs/.js` → require + default export; `.sh` → `bash`; `.rb` → `ruby`. The subprocess gets `ORKAS_SKILL_ID` / `ORKAS_SKILL_DIR` env injected; stdio passthrough; exit code propagated. Skill directories must not contain `node_modules / package.json / requirements.txt / Gemfile` or other package-manager artifacts; `.ts` may use the existing PC npm allow-list (new deps follow §1), other languages use only the corresponding runtime stdlib.
-
-**Per-user enable/disable** (shared by agent + skill, stored at `<uid>/cloud/config/component-enabled.json`, **only `false` is recorded**): the single resolver entrypoint is `features/component_enabled.ts::isAgentEnabled / isSkillEnabled`. **Only 4 filter application sites** (do not add filtering elsewhere):
-1. `listAgents() / listSkills()` attaches `enabled` for the UI (no filtering — let the UI render the toggle).
-2. `group_chat/bus.ts::buildAgentsIndexBlock` — commander's agent picker list.
-3. `chats.ts::stream/sendToConversation` — bound disabled agents return `errors.agent_disabled` directly.
-4. `skill-registry.getSystemPromptBlock({disabledIds})` — render-stage filtering.
-
-**Project scope (current round: agents only)** is the OUTER intersection — applied BEFORE the 4 enable filters above, NOT a 5th site. group_chat resolves `projects.resolveProjectScope(uid, projectId)` once at the top of `runTurn` and threads `bindings.agents` into `buildAgentsIndexBlock(uid, allowedIds)` to collapse the commander's visible-agents list. **Skills are NOT project-scoped this round** — `bindings.skills` is read but bus does not pass it through to the runner; every skill remains globally visible (gated only by `skill_list ∩ enabled`). The runner's `projectAllowedSkillIds` parameter and `_intersectRenderAllowlist` helper are preserved for a future re-enable: when bus starts passing it again, the System A render block intersects `skillList ∩ projectAllowedSkillIds` while SkillStore (System B, agent self-evolved skills) stays gated by `skillList` alone — project bindings must NOT block an agent from accessing its own evolved skills. Order today: `project bindings ∩ enabled` for the agent picker; `skill_list ∩ enabled` for both System A and System B skills. Orphan conversations (no `project_id`) skip the project step entirely. Renderer: the recipient agent picker (`agents.js::_openAgentPicker`) refreshes `_pickerBoundAgentIds` on every open from `_resolveActiveProjectId(anchorId)` (commander chip's pid for new-chat, conv.project_id for in-chat) so the user can't pick an agent the project hasn't bound; commander remains pickable as a virtual entry; an empty-bindings project surfaces an in-picker hint to open the project page.
-
-**Write entry points** (rename / URL/dir import): see `features/skills.ts`. Every write entry must call `invalidateSkills()`. The `<<<skill-file>>>` block can only write into the current skill directory (no cross-skill `skill=Y` attribute).
-
-**Two system boundaries (skills have two sets)**:
-- **System A — user/UI-managed skills**: `<uid>/cloud/skills/<sid>/` (custom) + `<uid>/local/marketplace/skills/<sid>/` (platform), scanned by `SkillLoader` and injected into the system prompt's "## Available skills" block; this is the set the UI / skill-edit chat / import flow change.
-- **System B — agent self-evolved skills**: `<uid>/cloud/agents/<aid>/skills/<sid>/`, written by core-agent SDK's `SkillStore`, managed via the `skill_manage` tool (create / read / patch / list / delete); **visible only to the owning agent** (fetched via `skill_manage(list/read)`), NOT injected into the SkillLoader system-prompt block. The frontmatter contains runtime fields like `id / patchCount / createdAt / updatedAt / tags`.
-- runner.ts explicitly points the `evolution.skillsDir` of the `createConfig` call at `agentEvolvedSkillsDir(uid, agentId)`; **never** let SkillStore fall back to the cwd default and land under `PC/skills/` (we already added that to `.gitignore` as a defense).
-
----
-
-## 6.5 Connectors (MCP-based)
-
-Third-party integrations attach via MCP servers (`@modelcontextprotocol/sdk`); Orkas is purely an MCP **client**. **Every installable connector uses OAuth 2.0** — no API-key / PAT entry in the user-facing surface; `manager.connectViaOAuth(catalogId)` is the only install path. We don't host first-party MCP servers — community servers are spawned locally (stdio) or reached remotely (streamable-http) with the OAuth access_token injected per the catalog's `transport_template` at every spawn.
-
-**OAuth refresh**: lazy at boot / on next reconnect / on `刷新工具` — **no background timer**. **Per-instance dedupe lock** in `manager.ts::_refreshGrantIfStale`: refresh_tokens rotate on every exchange (GitHub `ghr_*`, Notion DCR, etc.); two concurrent `_resolveTransport` callers POSTing the same stale refresh_token would both succeed for one and fail with `bad_refresh_token` for the other → connector permanently broken. Lock coalesces concurrent callers onto a single in-flight Promise + re-reads instance from registry inside the lock so a just-released caller's persisted grant is picked up.
-
-**Status writes never use `registry.upsert(snapshot)`** — only `registry.update(patch)`. Spreading an entry-time `inst` snapshot would clobber the rotated `oauth_grant` written by a concurrent refresh (same race as above, the second leg of the same bug). `connectViaOAuth`'s initial `upsert(draft)` is the only exception (no concurrent writers — fresh row).
-
-**Provider client credentials** come from `features/connectors/oauth-config.ts` in priority order:
-1. Env vars `ORKAS_OAUTH_<PROVIDER>_CLIENT_ID` / `..._SECRET` — baked into Hosted Orkas builds.
-2. `<uid>/local/config/connector-oauth.json` — BYO for OrkasOpen / power users.
-
-**Storage**: `<uid>/cloud/config/connectors.json` — **plaintext JSON envelope**; each instance's `oauth_grant` + `dcr_client` + `transport` collapse into a single per-instance `secrets_enc` field encrypted via `util/crypto-vault.ts` (PBKDF2 → AES-256-GCM). **Why field-level, not whole-file**: metadata (`display_name` / `status` / `tools_cache` / timestamps) needs to be Server-readable so iOS / the components-view path can list connectors without holding the vault key; the token-bearing blob stays sealed. **`transport` is in the encrypted blob** even though it isn't a "secret" by name — `applyTemplate` bakes the resolved `access_token` into `transport.env[oauth_env_key]` (stdio) / `transport.headers.Authorization` (streamable-http), so leaving it plaintext defeats the encryption. Runtime cost is zero: `manager.ts::_resolveTransport` re-runs `applyTemplate` from catalog template + fresh `oauth_grant` on every connect, the persisted transport is purely vestigial. The read path also accepts the legacy whole-file vault format produced by `LOCAL_DATA_VERSION ≤ 1` builds — next write upgrades the file in place; `LOCAL_DATA_VERSION` is bumped to 2 because an older PC reading the new shape would silently drop every instance's grant. **Vault seed = OAuth user_id when logged in, local uid as fallback** (OrkasOpen / pre-login). Same Orkas account on N devices → same OAuth user_id → all devices decrypt the cloud-synced file. Logout doesn't destroy the file; re-login to the same account restores access. **Cloud-synced as of 2026-05-15** (was local-only — the migration `util/migrate-connectors-to-cloud.ts` runs once post-login). **Obfuscation-grade**, not keychain-strength — accepted for portability inside the data directory (no OS-keystore dependency). `auth-profiles.json` and `connector-oauth.json` keep local-uid seeds + whole-file vault and stay machine-private (LLM provider keys and BYO OAuth client config don't follow the user across devices).
-
-**Tool injection (umbrella pattern)** — `model/core-agent/connector-meta-tools.ts`:
-- System prompt carries a `## Connectors` block enumerating visible connectors (one line per: id + display_name + catalog description + optional account_label).
-- `tools[]` carries TWO meta-tools: `list_connector_tools(connector_id)` + `call_connector_tool(connector_id, tool_name, args)`.
-- **Per-connector MCP actions are NEVER injected into `tools[]`** — the model reads the catalog from the block and discovers per-action schemas through `list_connector_tools`. Reintroducing flat injection re-exposes the 20–50 tool-selection-accuracy cliff (Anthropic 30–50 / Cursor ~40 / Cline ~20 / Copilot 128 hard cap with degradation well below) AND invalidates the prompt-cache prefix (`tools → system → messages`) on every connect/disconnect.
-- Block carries **no protocol-teaching paragraph** — per-role chat prompts teach their own usage (commander/agent-worker invoke; agent-edit references action names in `<workflow>`).
-- All three (block + both tools) are omitted entirely when zero connectors are visible to the actor; `tools[]` shrinks accordingly and the model has no broken affordance.
-- Visibility is single-sourced through `tools-adapter.ts::resolveVisibleConnectors`.
-- Tool name shape `<instance_id>__<mcp_tool_name>` is retained for internal routing + dev archive but no longer surfaces to the model.
-
-**Visibility filters** (composed left-to-right by `resolveVisibleConnectors`):
-1. **Live-state**: only `status.kind === 'connected'` instances surface. Connecting / disconnected / error are silently hidden — `callTool` would throw anyway, and a "disconnected, ask user to refresh" hint is noise mid-task. **Don't reintroduce a status suffix** in the block.
-2. **Per-user enable toggle** (`<uid>/cloud/config/component-enabled.json::connectors`, shared with agents/skills, only `false` persisted): cloud-synced soft-disable. Disabled-but-connected instances keep their OAuth grant + live MCP session, but are invisible to the LLM (no block line; `list_connector_tools(<id>)` returns `E_CONNECTOR_NOT_VISIBLE`). **Why two switches** ("停用" vs "断开"): "断开" wipes the grant + requires re-OAuth to recover; "停用" is one-click reversible — the right UX for "mute for now, might re-enable in 5 min".
-3. **Per-agent whitelist** `agent.enabled_connectors`: **diverges from `agent.skill_list`'s three-state** — `undefined` and `[]` BOTH collapse to "no connectors"; only non-empty `string[]` grants access. Connectors carry external side effects, so a brand-new agent must opt in explicitly. UI-only field — agent-edit LLM never authors it (no `<agent>` sub-tag).
-
-**Session-kind gate** (`runner.ts::connectorExposureFromSessionId`, tri-state):
-- `gconv` (commander) + `gmember` (agent worker) → **block + both tools** (full exposure for actual user tasks).
-- `agent` (agent-edit) → **block + `list_connector_tools` only**. Editor LLM needs to learn action names + schemas so the authored `<workflow>` can write specific steps; `call_connector_tool` is withheld so authoring sessions never fire external side effects. The block in this mode **bypasses `agent.enabled_connectors`** (passes `undefined` agentId) — chicken-and-egg, the editor must see every installed connector to recommend referencing one the user can then toggle on.
-- `skill` (skill-edit) / KB-image / CLI dispatch / reflect / memory-extract / anon → **none**. Adding a kind that needs connectors: extend this gate explicitly + add an entry to §5's session-id table.
-
-**Lifecycle**: `manager.ts` is the process singleton. The live `Map<id, McpConnection>` is the runtime truth; persisted `status` is best-effort and lags. `before-quit` calls `shutdownAll()` so stdio subprocesses don't leak.
-
-**Spawn discipline** (per §1): `mcp-client.ts` is the sole entry for MCP stdio `child_process.spawn`; `oauth.ts` is the sole localhost-listener exception. Everything else routes through `manager.{callTool, connectViaOAuth}`.
-
-**Stdio adapter for vendor-blocked MCP** (`PC/bin/<svc>-mcp-server.cjs`): when a vendor's hosted MCP requires preview/allowlist enrollment (e.g. `gmailmcp.googleapis.com`), wrap the underlying public REST API in a local CJS stdio server. Catalog template uses `${ORKAS_NODE}` / `${ORKAS_PC_DIR}` placeholders that `apply-template.ts` resolves to Electron-as-Node + (asar.unpacked-aware) PC root. **CJS, not TS** — the child runs raw Node, no tsx; deps limited to `@modelcontextprotocol/sdk` + stdlib. **Token refresh** is handled by `manager.callTool` respawning the child when `expires_at` is within `REFRESH_BUFFER_MS`; the child has no refresh-token plumbing of its own.
-
-**Catalog bundles** (`CatalogEntry.bundle_member_ids`): a catalog entry can declare itself a **UI-only grouping** that fans out on connect. The bundle entry has `transport_template: null` and never becomes a ConnectorInstance — `manager.connectViaOAuth` runs OAuth once for the bundle (Server returns a grant with the union of all members' scopes, e.g. `_SCOPES_BY_CATALOG_ID['google-workspace']`) and provisions one instance per member with a deep-cloned grant. **Model view is unchanged**: each member stays a distinct connector with its own tools. Renderer hides member entries, shows the bundle card; disconnect / enable-toggle fan out across all members. Used today for `google-workspace`.
-
-**OrkasOpen**: nothing in `features/connectors/` is stripped — connectors, including Google Workspace catalog entries and stdio adapters, sync to the open-source build. (A future marketplace-style recommended-connectors UI would gate the same way `marketplace_dev` does — see §9 OrkasOpen contract.)
-
----
-
-## 7. Knowledge base (contexts)
-
-`<uid>/cloud/contexts/` is the user-managed directory tree (mixed md/txt/pdf/docx/image, cloud-synced). The derived `vector.db` + its model config lock live at the machine-private mirror `<uid>/local/contexts/.kb/` — NOT cloud-synced (batch 2). See `features/{contexts, kb_indexer, vec_store, kb_vector}.ts` + `util/migrate-kb-to-local.ts` for the one-shot path migration.
-
-**Key constraints**:
-- **Embedder is fixed at `bge-small-zh-v1.5`, 512 dims**; switching models requires a full rebuild (`config.json` lock prevents accidental swaps). The model is ~95 MB and ships via the installer's `extraResources`, so zero download / zero network at runtime.
-- **Journal mode is DELETE, not WAL** — kept for continuity with existing `kb_files` rows (the original "WAL would tear cloud sync" rationale is moot now that vector.db is machine-private, but switching brings no benefit).
-- **No `worker_threads` for multiple ONNX sessions**: empirically the native layer SIGSEGVs (OpenMP threadpool + concurrent allocator init is a known dangerous combination); for true parallelism use `child_process`.
-- The model side may use only `kb_search` / `kb_read` tools; **`cat` / `rg` access to `$contexts_dir/` is forbidden**.
-- Chunk cap is `EMBED_MAX_CHARS=400` chars (matching the 512-token window); no overlap across segments to avoid topic pollution.
-- `_INDEX.md` is generated only at the root of contexts for users browsing in Finder; **the model does not read it**.
-- Cloud-sync conflicts take the newer mtime; the loser runs `reconcile` at startup to backfill via sha1; the `kb_files` table is the manifest, no separate manifest file is needed.
-
-**Reusable vector-store utilities** (good for new scenarios; each file's header has the details): `util/file_to_chunks.ts` (pure function chunker) + `features/vec_store.ts` (`openVecStore(dbDir)` factory, both high- and low-level APIs) + `features/kb_vector.ts` (uid → dbDir adapter).
-
----
-
-## 8. Frontend (`src/renderer/`)
-
-Vanilla HTML/CSS/JS, classic `<script>` multi-file (no ESM, no build). Cross-file symbols share top-level `let/const`; **don't use** `export/import`; don't hang things on `window.*` (unless an HTML `onclick` requires it).
-
-**Key constraints**:
-- Adding a new file → also insert it into `index.html`'s `<script>` list (most additions go after `ipc-shim`).
-- Adding `window.orkas.*` API → must add a handler in `ipc/index.ts`; new `/api/*` → only added to `modules/ipc-shim.js::_IPC_ROUTES` (no real HTTP).
-- Markdown rendering has a single interface, `renderMarkdown(str)` (`modules/utils.js`); **don't write a "lite version"**. LaTeX is typeset asynchronously by `modules/math.js::typesetMath`; **no typesetting of streaming deltas** (avoids half-formed LaTeX flickering). The same file carries the `:::dashboard` directive renderer (`renderDashboard` + ~12 components) — same fenced-directive shape as `:::chart-bar`; never fork either into a parallel implementation. Placeholder/regex specifics live in those two files' headers; component schema reference lives in `prompts/chat_shared_rules.md` "Output formats" (renderer + schema must change together).
-- `index.html` resources **don't carry `?v=`**: dev `Cmd/Ctrl+R` goes through `reloadIgnoringCache()`; reload is disabled in prod.
-- `src/renderer/` **does not participate in typecheck** (vanilla + DOM gives too many checkJs false positives); main/ stays at `checkJs: true`.
-- Renderer icons MUST be inline SVG centralized in the single platform icon module `modules/icons.js` (both UI chrome and file-type icons live there). **Do not hardcode SVG paths at call sites, and do not use emoji as icons** in HTML, JS-rendered controls, process rows, plan rails, menus, or locale strings. Plain shortcut text such as `Ctrl+K` is fine; if a reusable UI/file symbol is used as an icon, add/reuse a named SVG in `modules/icons.js` and render it via the helper or `data-ui-icon`.
-- The UI shares one set of classes (`.btn / .btn-sm / .btn-primary / .btn-danger / .detail-actions / .empty / .muted`); differences are expressed via `.is-*` modifiers; **don't open near-duplicate classes**.
-- **Inventory lists sort A→Z by display name**: any UI list of user-named entities the user scans by name (agents / skills / project bindings + candidate pickers / similar future inventories) defaults to A→Z using `(a.name || a.id || '').localeCompare(other, undefined, { sensitivity: 'base', numeric: true })` — case + diacritics fold, `Item 2` precedes `Item 10`, zh + en mix sorts under default locale collation. **Why:** insertion / mtime order isn't a stable mental model for a name-lookup UI — re-renders shuffle it and users report "很乱" the moment a list grows past a screen. **Exempt** lists where the ordering IS the signal: conversation sidebar (last_active_at desc), project sidebar (created_at desc), search results (score desc), plan rail (step index asc), KB tree (path hierarchy), agent / skill picker fuzzy-search results (match-quality desc — see `agents.js::_renderAgentPickerList`).
-- **IME composition guard on Enter / Arrow shortcuts**: every keydown handler on an `<input>` / `<textarea>` that triggers an action (Enter→submit / search-jump / form-confirm; Arrow→list selection) **must early-return when `e.isComposing || e.keyCode === 229`**. **Why:** Chinese / Japanese / Korean IMEs use Enter to commit a composition candidate; without this guard, "Enter to confirm an English candidate when the primary suggestion is already English" silently fires the action and the user navigates away mid-typing. We've already hit this on the global search overlay; the chat input (`modules/conversation.js`) and the new-chat input (`modules/state.js`) had it from the start, the search input was missing it. Pattern to copy: `if (e.isComposing || e.keyCode === 229) return;` at the top of the handler. The `keyCode === 229` arm covers older Electron / Safari builds where `isComposing` is occasionally inaccurate.
-- **Network / long-running actions MUST show a loading affordance**: any user-initiated action that triggers a network round-trip, file IO, or any other operation that can run > ~100 ms (install / uninstall / upload / delete / publish / sync trigger / detail fetch / list fetch) **must surface progress**. **Prefer non-blocking inline loading** over modal blocking: (a) inline spinner inside the trigger button (`.marketplace-btn-spinner` pattern — see `marketplace.js::_mpRenderDetail`) + replace the label with `…ing`, (b) a thin status banner above the affected area (`marketplace.js::_mpUpdateReconcileBanner` pattern), or (c) skeleton / spinner inside the panel body (`.marketplace-detail-loading` — also used by the listing grid on cold open). **Modal blocking overlay is the last resort** — only when the action invalidates other UI surfaces or the user can't safely interact with anything else mid-flight (publish-upload uses one; everything else stays inline). **Why:** without a loading affordance the user can't tell "click registered" from "request hanging" — they click again, fire duplicate requests, or assume failure and abandon the task. Failed actions surface via `uiAlert` after the spinner clears.
-- **Stale-while-revalidate (SWR) for read-heavy network data**: any data that's (a) fetched on every panel open / view enter, (b) tolerant of being seconds-to-minutes out of date, and (c) likely to be re-rendered before the user notices drift (marketplace listings / categories / future "public catalog" panels) **must follow the SWR pattern**, NOT fire-on-every-open: **(1) render from cache immediately** (no blank loading flash when cache exists), **(2) check freshness against a TTL** (in-memory `ts` per entry), **(3) skip the network fetch entirely when within TTL**; outside TTL, fire a background fetch and update both the in-memory cache and (when applicable) a persisted file under `<uid>/local/cache/<bucket>/`. The reference implementation is `marketplace.js::_mpLoadListings` + `marketplace_cache.ts::{get,set}ListingsCache`; TTL there is **10 minutes** (`MP_LISTINGS_TTL_MS`). Pick TTL by data churn: high churn (download counts, online status) → 1-5min; low churn (categories, taxonomy) → 1-24h. **Why:** the previous "fetch every open" behavior hit the server N times per session even when the user just toggled views; SWR cuts traffic by ~one order of magnitude without the user noticing staleness in practice, and the persisted layer kills the cold-start blank flash. **Loading affordance still applies** — on a true cold miss (no cache) the body shows the spinner described above; on a cache hit subsequent background fetches are silent (the cached items already render, no spinner needed).
-
-### i18n
-
-Strings live in `src/{renderer,main}/locales/*.json`; supported UI languages are registered in `src/main/i18n.ts` and mirrored by the renderer i18n module. Lookup goes through `i18n.{js,ts}::t(key, vars?)` (flat dot-separated keys, fallback chain → raw key on miss). Language preference is stored in `<uid>/cloud/config/preferences.json`; runtime switches dispatch the `i18n-change` event.
-
-**Hard requirements**:
-- All user-visible strings (button / title / status / placeholder / tooltip / empty state / toast / dialog) **must go through i18n** with keys for every supported UI language, or an explicit fallback plan while translation is in progress.
-- Static HTML uses `data-i18n*` (`applyDomI18n()` auto-fills); **JS-injected text must subscribe to `i18n-change` and re-render** — common misses: sidebar lists / settings dynamic rows / status-toggle buttons.
-- Decide the i18n key first, then write the code; **no hard-coded Chinese with "I'll backfill later"**.
-- Agent / skill descriptions remain `description_zh` / `description_en`; Chinese UI uses `description_zh`, every other UI language uses `description_en` with cross-fallback only when the preferred side is empty.
-- **Not i18n-ed**: LLM prompts (`prompts/*.md` — the source language IS the prompt), logs, telemetry event names, user content.
-
----
-
-## 9. Dev workflow
-
-### Startup
-
-`cd PC && ./run.sh` (sole entry, kills the old instance + foreground start). F12 opens renderer DevTools (Chromium-built-in, available in non-dev too).
-
-### Git commit
-
-Commit messages **must be in English** — title + body + any footer — **no exceptions**. **Why:** the open-source repo has a global audience; Chinese commits read incoherently in GitHub history and break traceability for contributors writing release notes / running automation.
-
-The commit message is **about the change**, not about how it got here. Sync provenance (e.g. "this came from a PC commit") belongs in `OpenSource/SyncCode/sync-state.json`, **not** in the commit body. Write the message exactly as you would for a fresh OrkasOpen-native change.
-
-### After a change
-
-- main TS / core-agent → `./run.sh` restart (<1s, tsx transpile).
-- renderer → `Cmd+R` refresh (cache automatically ignored).
-- Storage paths / session_id / layering responsibilities / external deps changed → update this file as well.
-
-### Unit tests
-
-**Sole purpose**: lock down behavior that is easy to break by accident — **not** to chase coverage, **not** to function as docs, **not** to act as a confidence blanket.
-
-**Tests must be run via `npm test`**, **never** `npx vitest` / IDE right-click Run. `scripts/run-tests.mjs` swaps `better-sqlite3` to the Node ABI before tests, and unconditionally swaps it back to Electron afterwards. **Recovery** (MODULE_VERSION mismatch / startup SIGKILL with no stack): run `npm run rebuild:sqlite:electron`. Diagnostic one-liner and full causation are documented in `scripts/swap-sqlite-abi.mjs` headers.
-
-**Test triage**:
-- **Must write**: business invariants (uid isolation / session_id prefixes / path traversal / domain boundaries), recovery paths (corruption / concurrency / index mismatch → rebuild, rollback), multi-branch decision functions, cross-layer contracts, text trap spots.
-- **Don't write**: functions that are correct by typing alone, thin wrappers, UI/DOM, getter/setter, library-guaranteed behavior.
-- **Forbidden**: same-branch repeat assertions with different data, asserting internals, tautologies, just-change-args-not-branches, "type/signature/existence" tests, all-happy-path.
-
-**Organization**: `test/main/` mirrors `src/main/`; `test/renderer/` mirrors `src/renderer/modules/` for the small set of pure renderer-side functions that have fixture coverage (see below). One file per module under test; one level of nested `describe`.
-
-**Hard rule for LLM-output text munging** (regex / parser / classifier / segmenter / sanitizer that consumes streamed or final assistant text — `<agent>` strippers, `<agent-input-form>` strippers, prose/code splitters, mention parsers, code-fence handlers, etc.): these MUST have fixture tests pinning **set A (real shapes the matcher must handle)** AND **set B (look-alike shapes the matcher must NOT handle)**. Adding a guard / branch / segmentation step requires extending the fixture set with the new motivating shape — the patch isn't done until the new fixture is green AND every previous fixture still passes. Reason: this category is whack-a-mole prone — fixing one shape silently breaks another via guard granularity mismatch (we have shipped the same `<agent>` stripper regression three rounds in a row because each round only verified the new case). Typecheck and review can't catch granularity mismatches; only fixtures can.
-
-To make pure renderer-side functions testable under vitest without violating §8's "no export/import" rule, extract them into a standalone `src/renderer/modules/<name>.js` and end the file with a guarded CommonJS bridge:
-
-```js
-if (typeof module !== 'undefined' && typeof module.exports === 'object') {
-  module.exports = { _fnA, _fnB };
-}
-```
-
-The renderer evaluates `<script>`-loaded files where `module` is undefined, so the guard is a no-op there. Test side `require()`s the file. **This is the only allowed escape from §8's no-import/export rule, and only for pure functions** — anything that touches `window` / DOM / i18n / IPC stays inline.
-
-**Modifying existing code: existing behavior is the spec.** Adding a guard / branch / segmentation to existing code reorders its matrix of accepted inputs. If the previously-accepted shapes aren't actively re-checked, the change silently breaks them — this is the failure mode behind "fix here, break there" cycles. Before changing existing code: read recent `fix` commits on the file (they encode invariants nothing else documents), grep callers, run existing tests; for text-processing functions in particular, "mentally trace" is not enough — extend the fixture set first, then change the code.
-
-### Don't do
-
-**Dev environment / OSS strip**:
-- Branch business behavior on `app.isPackaged` / `process.env.NODE_ENV` / `isDevMode` / `isDevEnv`. Dev (source-run via `./run.sh`) and packaged builds must be functionally identical; the only `app.isPackaged` branches allowed are pure-infrastructure (data-root path, devTools toggle, `app.asar.unpacked` rewrite). **Why:** OrkasOpen ships from a synced upstream tree where the closed-source dev-only branches were stripped; reintroducing a dev branch here re-creates the divergence the strip rules exist to prevent. Enforcement: forbidden symbols + `isPackaged_allowed_files` allowlist live in `OpenSource/SyncCode/strip-rules.json`; `node OpenSource/SyncCode/bin/oss-sync-postcheck.mjs` must exit 0 after every sync.
-
-**Layering / paths**:
-- Write business in `ipc/` (skipping a layer); call core-agent directly / spawn processes from `features/`.
-- Storage paths missing the `<uid>` segment.
-- Embed `<uid>` into session_id (e.g. `<uid>-gconv-<cid>` or `<kind>-<uid>-<tail>` or any other shape that puts uid into the filename). session_id is `<kind>-<tail>` (per §5) — user scoping comes from the path root (`<activeUid>/{cloud,local}/sessions/<sid>.jsonl`), not from the filename. Embedding uid was a previous design that turned out redundant with path scoping AND forced uid to be dash-free, breaking every UUID-shaped uid (OAuth user_id). The 17 producer + matcher sites that used to do this have been swept; new code that does it gets caught by `session-store::resolveSessionPath`'s kind-anchor assertion (which throws on any id that doesn't start with a known kind keyword).
-- Cache uid paths as a module-level `const` in a feature module (must call `getActiveUserId()` each time).
-- Add `window.orkas.*` in the renderer without adding a handler in `ipc/index.ts`.
-- Bypass `util/locks.ts` / `util/path-sandbox.isPathAllowed` / `features/file_indexer.ts`.
-- Add eager pre-processing (extract / preview / chunking) to `chat_attachments.uploadAttachment`.
-- Treat `<uid>/local/workspace.json` as a flat `{selectedPath, recentPaths}` after the projects scope upgrade — the file is now `{default, projects:{<pid>:…}, updatedAt}`. Always go through `getWorkspacePath(uid, projectId?)` / `setWorkspacePath` / `resetWorkspacePath`; reading the JSON directly skips legacy-shape promotion + project-scope fallback.
-- Encode `project_id` into a path / cid / session_id segment. Project membership is an index-level field on the conv record only — see §5.
-- Reintroduce an aggregate `projects/_index.json`. Project existence is the set of `projects/<pid>/project.json` files on disk; listing scans the directory. **Why:** an aggregate index re-creates the multi-device sync conflict surface this round was designed to avoid (every membership change becomes a multi-file transactional write), and once a server-mediated collab story lands, server-side sync of project directories is a directory-level operation — clients only ever scan. See `features/projects.ts` header.
-- Apply the project agent/skill scope as a 5th `component_enabled` filter site. Project scope is an OUTER intersection plumbed through the existing render entry points (`buildAgentsIndexBlock` `allowedIds` / `getSystemPromptBlock` `allowlist`) — see §6.
-
-**Multi-device sync (plan: `PC/docs/plans/multi-device-sync.md`)**:
-- Write `private/<oauth_user_id>/manifest.json` from PC (any code path). The Server's `/sync/manifest/commit` is the **sole** writer; the CAS + size-delta quota check is server-side atomic. PC has STS scope `private/<oauth_user_id>/cloud/*` for writes — `manifest.json` is read-only for PC by design.
-- Use the local 8-digit `uid` for the COS prefix. Cloud paths are scoped by **OAuth `user_id`**, not by the local container uid (same OAuth account on two machines = same cloud prefix, different local uids).
-- Bypass `features/sync/transport.ts` for any object under `private/<oauth_user_id>/`. Anyone touching the sync engine's bucket must go through that module (STS caching, gzip whitelist, multipart upload, rename optimization all live there).
-- Re-introduce a `codec.ts` abstraction in `features/sync/` (batch 3 decision: v1 ships no application-layer encryption; pre-emptive abstraction adds reading cost without value). v2 E2EE work is a clean re-introduction, not a re-edit.
-- Set `Content-Encoding: gzip` on uploads — `cos-nodejs-sdk-v5` auto-decompresses on GET when that header is present, defeating the BYO-encoding contract (the goal is COS never decompresses). Use the custom `x-cos-meta-compressed: gzip` metadata + `Content-Type: application/gzip` per `transport.ts`.
-- Treat manifest entry `size` as plaintext bytes — `size` is the **actual COS-stored byte count (compressed if compressed)** (batch 8). Quota tracking lives in `user_sync_usage.bytes` on the Server, also compressed.
-- Add a new sync trigger pathway outside the five canonical triggers (see §4 constraint 6); new dispatch must funnel through `DirtyBus` / `engine.syncNow`.
-- Wire a `dirty` event in a feature without calling `syncFeature.markDirty(domain, 'cloud/<rel>')` (and never with `'local/...'`, which would corrupt the local index).
-
-**Artifacts (`chat-app://`)**:
-- Serve artifact bytes from anywhere but `chat_artifacts/<cid>/<artifactId>/` via the `chat-app://` handler; let `create_artifact` write outside the current cid's artifact pool. Every request goes through `chatArtifacts.resolveArtifactFilePath` (safe-cid / safe-artifactId / safe-relpath + `path.relative` traversal guard + served-extension allowlist) — see §5.
-- Expose `window.orkas` / IPC / any privileged handle into the artifact iframe. The only artifact→app channel is the validated `postMessage` contract; the iframe is sandboxed (`allow-scripts allow-same-origin allow-forms`, cross-origin to the renderer) and never gets a host handle.
-- Widen the served-extension allowlist to executable / archive types, or combine `allow-scripts` with anything that re-grants embedder access (the current flags are safe only because the artifact origin `chat-app://cid` ≠ the renderer's `file://`).
-- Route an artifact-result back via a parallel path — it's a plain `@<agent_id>`-prefixed user message through the normal send pipeline; the `<artifact-result>` tag is opaque to bus (stripped from display by `_stripArtifactResultTagForDisplay`).
-- Open / serve a saved-app file from anywhere but `saved_apps/<appId>/`. `savedApps.resolveSavedAppIndex` is the sole resolver before `shell.openPath` (same appId-shape + `path.relative` traversal guard family as `resolveArtifactFilePath`). `saveFromArtifact` copies *out of* a `chat_artifacts/<cid>/<artifactId>/` dir resolved by `chatArtifacts.resolveArtifactDir` — never copy from an unvalidated path. `openForEditing` bundles the app's source into a single `.md` attachment (the `chat_attachments` whitelist deliberately excludes `.html`/`.js`/`.css`, and `buildAttachmentManifest` would skip them) — don't copy raw `.html`/`.js` into `chat_attachments/`, and don't widen that whitelist for this.
-- Reuse `.agent-card` / `.agents-grid` class names for the "My Apps" panel (`#panel-apps` uses `.app-card` / `.apps-grid`): `agents.js` binds a global `document.querySelectorAll('.agent-card')` click handler, so sharing the name cross-wires the two panels. Layout-only shells (`.agents-grid-view` / `-header` / `-scroll` / `.agents-empty`) have no JS hook and are reused on purpose.
-
-**Timeouts / locks**:
-- Add a "total wall-clock timeout" to LLM calls (`timeout: N` / `setTimeout→abort`). The single application-layer watchdog is `client.ts::streamChatWithModel`'s `idleTimeout=600s` (true idle); the SDK 1h limit is backstopped by `sdk-timeout-patch.ts`; group-chat infinite-loop protection is `bus.ts::MAX_WORKER_TURNS=100` (**turns, do not change to a timeout**).
-- Add a wait timeout to `sessionLock.acquire()` / `globalSlots.acquire()`. Long LLM tasks should queue indefinitely; adding a timeout = fake failures.
-
-**Tests / sqlite ABI**:
-- `npx vitest` / `vitest run` / IDE right-click Run / call `scripts/swap-sqlite-abi.mjs node` directly (no failure rollback; if the network drops mid-way you end up with a half-overwritten `.node`, and Electron silently SIGKILLs). Always `npm test`; on failure run `npm run rebuild:sqlite:electron`.
-
-**Dependencies / config**:
-- Add an npm dep (see §1 allow-list).
-- Hand-edit `<uid>/local/marketplace/{agents,skills}/` (will be overwritten on the next startup reconcile when the cloud `installs.json` records a different version). **Dev-mode UI exception**: the inline edit chat + ⋯ menu's delete / promote-to-platform items write into the platform install dir directly; republish through `marketplace_dev.upload*` to make the change persist for other machines.
-- Hand-edit `<uid>/local/config/*.json` (go through the settings UI; `auth-profiles.json` write-entry triggers runner invalidation).
-
-**file-tools misuse**:
-- `read_file` doing automatic fallback extraction for pdf/docx (single responsibility — `stat_file` first, see `NeedStatError` for the forced throw).
-- `search_files` / manifest triggering extraction (must `getCachedMeta` peek).
-- `bash grep -r` scanning pdf/docx (use `grep_files`).
-
-**Prompt md / tool listing**:
-- Write project name / real OS path / project source-dir literals into `prompts/*.md` (see §3 "content hygiene").
-- Hard-code tool names in `chat_*.md`; new tool descriptions go to `tool-catalog.ts::TOOL_CATALOG.summary` — only "when to use X / X-specific constraint" belongs in the prompt.
-
-**Skill / agent enabled**:
-- Check `isAgentEnabled / isSkillEnabled` outside the 4 filter sites in §6; write disabled into spec JSON / SKILL.md frontmatter (violates "user preferences must not overwrite spec"); filter disabled inside `expandSkillClosure` early.
-
-**Connectors (§6.5)**:
-- Call `child_process.spawn` or instantiate an MCP transport outside `features/connectors/mcp-client.ts` (single spawn entry, mirrors the §1 CLI-agent rule).
-- Bind a localhost listener outside `features/connectors/oauth.ts` (the §1 single documented exception — never extend it with other routes / reuse it for non-OAuth purposes).
-- Write a connector instance's `oauth_grant` / `dcr_client` / `transport` as plaintext fields in `connectors.json` — they belong inside the per-instance `secrets_enc` blob written by `registry.ts::_dehydrateSecrets` and decrypted by `_hydrateSecrets` (the envelope is plaintext; only the token-bearing blob is vault-sealed). `transport` goes in the blob even though it isn't a "secret" by name — `applyTemplate` bakes the resolved access_token into it. `connector-oauth.json` / `auth-profiles.json` stay whole-file vault-encrypted under `local/config/` with local-uid seeds (machine-private). Never emit plaintext credentials from any path.
-- Reuse `features/account/` modules / `account.json` / `account.*` IPC namespace for connector auth — account login and connector authorization are two separate businesses (different Provider OAuth clients, different consent records, different revoke surfaces).
-- Inject connector tools into the prompt via text — they reach the LLM through the SDK `tools[]` field, same path as native tools (§3).
-- Treat `agent.enabled_connectors` like `agent.skill_list` — `undefined`/`[]` on connectors means "none allowed", NOT "no filter" (intentional asymmetry, per §6.5).
-- Reintroduce flat per-tool injection of connector MCP actions into `runner.ts::buildRunner`'s `wrappedTools` — connectors go through the `## Connectors` system-prompt block + two umbrella meta-tools (`list_connector_tools` / `call_connector_tool`) by design (per §6.5). **Why**: the umbrella indirection is the entire point of dodging the 20–50 tool-selection-accuracy cliff and keeping the prompt-cache prefix stable across connect/disconnect events. If a high-frequency action seems to need direct exposure, that's a `list_connector_tools` discoverability problem (improve the action description) — NOT a license to fork a "pinned tool" second pathway. The single-pathway rule mirrors the group-chat dispatch rule (§9 "Build a new enqueue / scheduling function in parallel to bus.enqueue") — parallel paths dilute each other.
-- Give `call_connector_tool` to a non-`gconv`/`gmember` session — only commander + agent worker get the executable tool. `agent` (agent-edit) gets `list_connector_tools` for schema discovery but NEVER `call_connector_tool` — authoring sessions must not produce external side effects. `skill` / KB-image / CLI / reflect / memory-extract / anon get neither block nor tools. The single source is `runner.ts::connectorExposureFromSessionId` (per §6.5 tri-state gate). Adding a new conversation kind that needs any connector access requires extending this function explicitly + an entry in §5's session-id table.
-- Reintroduce a status suffix (`— disconnected (ask user to refresh)`, `— error: …`) on the `## Connectors` block lines. `resolveVisibleConnectors` filters to `status.kind === 'connected'` so a non-connected instance is invisible to the LLM entirely (per §6.5 live-state filter). Showing a status hint the LLM can't act on mid-task is noise; the user resolves the state in the Connectors panel and the instance reappears on the next turn.
-- Reintroduce a free-form "add custom MCP server" UI / IPC, or an API-key install path — every install goes through `connectViaOAuth(catalog_id)`. If a service isn't in the catalog, add the catalog row first; if it lacks OAuth, leave it out of the curated set.
-
-**Group chat**:
-- Bypass `bus.enqueue` and write `<cid>.jsonl` or `visibility/<aid>.jsonl` directly (message routing / slicing / worker wake are bundled together).
-- Read full `<cid>.jsonl` from inside an agent worker (must use `visibility.readSlice`, otherwise other actors' private context leaks across).
-- Re-introduce `call_subagent` / `subagents.ts` (deprecated; LLM dispatch is `dispatch_to` (single) / `plan_set` (multi-actor) tools, no RPC).
-- Write `@<X>` in commander/agent prose expecting a dispatch — it's no longer recognized; the user just sees text nobody picked up.
-- Build a new enqueue / scheduling function in parallel to `bus.enqueue` — single-primitive principle, every dispatch path must go through it.
-- Hand-edit `<cid>/plan.md` outside the `plan.ts` tools.
-- Make `retryStep` / `skipStep` enqueue directly (must go through reconcile so the dispatch primitive stays singular).
-- Wire the rail's "重试" button to "send the user message again" — that double-writes user history; the action must go through the dedicated IPC (`groupChat.retryStep`) which only mutates plan state.
-- Add `aborted` / `cancelled` / `Run aborted` to `TRANSIENT_ERR_PATTERNS` — silently retrying user-initiated abort is the wrong behavior. Net new patterns must come from the network layer (undici / fetch / DNS / socket), not from intent layers.
-- Duplicate the plan rail status icon set (`plan-rail.js::STATUS_ICON`) into prompts / locales / backend. Single source of truth; downstream surfaces just read the rendered output.
-- Call `features/expert_signals/emitSignal` from anywhere but the chokepoints listed in §4 constraint 9 (bus.ts turn-end / `_enqueueBody` USER_ID branch / retryStep / skipStep / markFormSubmittedAndDispatch / plan_executor.dispatchReady). New signal kinds extend the extractor registry; never spread emit calls across `features/*`. **`model/` layer never imports `emitSignal`** — surface a `ChatOptions` callback instead (e.g. `onSkillAdvertised` / `onSkillInvoked` are bridged by `bus.ts` into the per-turn buffer drained at turn-end, per §4 constraint 9). Reusing the callback pattern matches existing `onFileWritten` / `onArtifactCreated` / `onSkillCreated` plumbing.
-- Reintroduce a synthetic `turn_id` for retry/skip (the old `<cid>:plan:<step>` shape) "so multiple retries on the same step share an id". Same-step retry grouping goes via `metadata.step_index`; sharing `turn_id` blocks the retry × skill_invoked / tool_failure JOIN that quality-setup §5 needs and is the bug `expert-signals-skill-attribution.md` was written to fix.
-
----
-
-## 10. Logging
-
-**Logging** is `src/main/logger.ts` (a thin wrapper over electron-log): main + renderer both write `data/logs/YYYY-MM-DD.log` (rolls to `.old.log` past 10 MB; startup `sweepLogs()` cleans up by ≥7 days / ≤100 MB; today's file is never deleted). The renderer forwards via IPC and lands as `renderer/<module>` scope. Redaction hook + `REDACT_KEYS` list live in `logger.ts`. Set log level via `ORKAS_LOG_LEVEL=debug`.
-
-**New code must**: use `createLogger('<module>')` instead of `console.log`; key entry points in main flows emit `log.info` (start + key fields userId/path/ms); **before catch / failure return, you must `log.warn` (recoverable) or `log.error` (invariant broken)** — only returning `{ok:false}` without a log = the upstream can't locate the issue; sensitive fields go through `REDACT_KEYS`. The local CLI agent stack uses `local-agents` for the registry / runner and per-backend scopes (`local-agents:claude` / `:codex` / `:openclaw` / `:opencode` / `:hermes`); spawn failures, missing-CLI hits, non-zero exit codes, and ACP parse errors must each emit a `log.warn` so dispatched-task issues are diagnosable from `data/logs/` alone.
-
-The open-source build has **no built-in remote telemetry / third-party analytics, and no in-app debug panel**; diagnose via logs + Chromium DevTools (F12).
+# PC
+
+Prompt context only: keep hard constraints, short rationale, and traps already hit. Implementation details belong in source headers and tests.
+
+## Boundary
+
+Single-process Electron app. Main is a Node backend, renderer is vanilla HTML/CSS/JS, and IPC is the only app communication path.
+
+- No HTTP server, no occupied port, and no local auth layer in main.
+- Renderer access goes through the `contextBridge` allow-list API `window.orkas.{invoke, stream}`.
+- No TypeScript/JSX/bundler in the renderer; classic scripts only.
+- `src/main/preload.js` must remain `.js`; preload does not run the tsx hook.
+- LLM calls use the in-process `core-agent` loaded dynamically through `import('#core-agent')`.
+- Local CLI agents are the explicit child-process exception. `features/local_agents/runner.ts` is the only CLI dispatch spawn path.
+- MCP stdio connectors spawn only through `features/connectors/mcp-client.ts`.
+- User data is mostly JSON/JSONL for readability and sync friendliness; sqlite is reserved for the KB vector store.
+- macOS and Windows are primary. Platform branches need platform-specific verification.
+- New npm dependencies require prior discussion; renderer third-party JS/CSS goes under `src/renderer/vendor/`, not npm.
+- API profile routing goes through existing account/marketplace API-base helpers. Do not hard-code production domains.
+
+## Layering
+
+- `ipc/`: validate args and call features; no business logic.
+- `features/`: business workflows; may use storage, paths, prompts, model, util, and sibling features.
+- `model/` and `model/core-agent/`: model-call adapters and tool plumbing; do not read/write business data under `data/`.
+- `util/`: pure/foundational helpers; never reverse-import features/model.
+- `storage.ts`, `paths.ts`, and path sandbox helpers are the storage/path choke points.
+- `i18n.ts` may read locales but must not import features/model.
+
+Additional rules:
+
+- Feature functions handling user-private data take `userId` as the first argument.
+- Boot-time async work registers through `util/boot_init.ts`, not raw startup timers or async IIFEs.
+- `#core-agent` is dynamic-import only. Static import loads dependencies before the SDK timeout patch and can break ESM resolution.
+- `sdk-timeout-patch.ts` must run in `index.ts` after logger init and before feature imports.
+- New core-agent tools must be registered in `tool-catalog.ts::TOOL_CATALOG` and runner wiring. Tool descriptions live in SDK `tools[]`, not in a duplicated prompt tool list.
+- File-class tools must check `util/path-sandbox.isPathAllowed` at entry.
+- Tool results go through `util/tool-result-cap.ts`.
+
+## Prompt Files
+
+`src/main/prompts/*.md` is LLM-facing source. It must not contain:
+
+- Product/brand names.
+- Real OS paths.
+- Project source/data directory literals.
+- Hard-coded tool catalogs.
+
+Runtime-volatile prompt fields go in one trailing `## Runtime injection` section. Static rules stay first so cache prefixes remain stable. Chat prompts must point to platform creator skills for agent/skill authoring details; do not duplicate field schemas or category tables inline.
+
+Residual shared prompt rules should have one canonical source, with downstream prompts carrying only a short reference.
+
+## Data Domains
+
+All user-scoped data lives under `<container>/data/<uid>/{cloud,local}/`.
+
+- Top-level data may contain only `users.json`, `logs/`, and user directories.
+- Hosted builds use `anonymous` while logged out and the Server account uid while logged in. OrkasOpen first boot keeps the legacy generated local id.
+- `uid` is an opaque single path segment. Do not parse it or embed it into session ids.
+- `cloud/` is syncable user-private state: chats, resumable sessions, attachments, artifacts, saved apps, contexts source files, memory, custom agents/skills, projects, marketplace install manifest, auto tasks, and user config.
+- `local/` is machine-private state: account/session cache, marketplace installed content, caches, indexes, vector DB, workspace selection, tool-result spills, local-agent archives, and dev archives.
+- Never cache uid-derived paths as module-level constants. Get the active uid at use time.
+- Platform agents/skills are marketplace installs in `local/marketplace/...`, reconciled from the cloud install manifest. Hand edits are overwritten unless made through dev-mode platform editing and republished.
+- Project membership is an index field on a conversation. Do not encode `project_id` into paths, cids, or session ids.
+- Project lists are directory scans; do not restore an aggregate `projects/_index.json`.
+
+## Account, Sync, And OrkasOpen
+
+- Hosted account login uses the Server `SessionMgr` pair (`user_id`, `session_id`), stored through `util/local-secret-store.ts`. There is no client refresh-token loop.
+- Authenticated HTTP calls carry `user_id` + `session_id`; WebSocket URLs carry the same pair only where required.
+- Optimistic login state may come from disk, but network revalidation must refresh or clear it.
+- Private hosted secret backends stay behind the local-secret facade. Do not import `features/hosted_secrets/` outside that facade.
+- Account, relay, voice, sync, billing, and marketplace-dev surfaces that depend on hosted Server features are stripped from OrkasOpen according to `OpenSource/SyncCode/strip-rules.json`. Do not add new hosted-only files without updating strip rules.
+- PC never writes `private/<oauth_user_id>/manifest.json`; Server `/sync/manifest/commit` is the only writer.
+- Cloud sync paths use OAuth `user_id`, not an unrelated local uid.
+- Object transfers under the sync prefix go through `features/sync/transport.ts`.
+- Manifest entry `size` is the COS-stored byte count. Do not treat it as plaintext bytes.
+- New sync triggers funnel through the existing dirty/sync engine, never an ad-hoc uploader.
+- Local data must not be marked dirty for cloud sync.
+- Cloud sync and voice are entitlement-gated by Server. Renderer failures from subscription gating are expected UX states, not sync/voice bugs.
+
+## Release Relay
+
+This release branch uses the pre-main relay shape:
+
+- iOS is a remote control. PC runs all agent work and delivers relayed commands through normal group-chat send/bus flow.
+- `features/relay/commands.ts` long-polls Server and must not add a fixed inter-poll delay; Server controls cadence.
+- `features/relay/sync.ts` mirrors relay-enabled conversations through bus events: messages, plan, state, and batched process events. Do not replace this with main's bounded conversation-list snapshot unless the matching Server/iOS code lands here.
+- PC pushes agent/skill account-index snapshots for iOS pickers. This release does not push project/workspace state to iOS.
+- No server-side agent execution and no cloud worker path. The iOS cloud option remains disabled until product/backend support exists.
+- Keep PC sidebar updates for iOS-triggered activity on the normal conversation list path; do not add a parallel display path.
+
+## Conversations And Group Chat
+
+Session ids are `<kind>-<tail>`; user scoping comes from the path root, not the filename. Add new kinds by updating the session-store allowlist and all session-kind gates.
+
+Main rules:
+
+- Commander, agent-worker, skill-edit, agent-edit, and one-shot sessions are separate session files from UI message lists.
+- Group chat dispatch goes through `features/group_chat/bus.ts::enqueue`. Do not create parallel enqueue/scheduling paths.
+- Agent workers read only their visibility slice; never the full conversation jsonl.
+- LLM dispatch is structured (`dispatch_to`, `plan_set`), not `@name` in prose.
+- `plan_set` owns plan writes. Retry/skip mutates plan state and reconciles through the plan executor; it does not send the original user message again.
+- User abort is never a transient retry. Network retry patterns must stay network-specific.
+- Group abort is the single stop path for all actors.
+- Infinite-loop protection is turn-count based, paired with idle timeout; do not replace it with total wall-clock timeout.
+- Expert signals emit only from the established group-chat chokepoints or model callbacks drained by bus. Model code must not import signal emitters directly.
+
+Attachments:
+
+- Main conversation attachments are stored under the current cid with zero eager preprocessing.
+- Read/edit tools are scoped to active workspace plus current attachment dir.
+- `stat_file` precedes `read_file` for pdf/docx.
+- Video attachments are display-only, not model input.
+
+## Artifacts And Saved Apps
+
+- `create_artifact` writes only to `<uid>/cloud/chat_artifacts/<cid>/<artifactId>/`.
+- `chat-app://` serves only validated artifact files through `features/chat_artifacts.ts`; never expose `window.orkas` or IPC to the iframe.
+- Artifact-to-app communication is the validated `postMessage` contract and routes back as a normal user message.
+- Saved apps live only under `<uid>/cloud/saved_apps/<appId>/` and open through the saved-app resolver.
+- Editing a saved app is fork-and-modify via a new conversation and attachment bundle; it is not in-place mutation.
+- Do not widen artifact served extensions or iframe sandbox privileges without a security review.
+
+## Skills, Agents, And Marketplace
+
+- Skill sources are custom cloud skills plus platform local marketplace installs. Custom overrides platform by id.
+- Agent/skill category belongs in the spec (`agent.json` or SKILL.md frontmatter); install freshness belongs in `_install.json` / install manifests.
+- Creator skills (`agent-creator`, `skill-creator`) are the canonical source for authoring semantics, validation details, and category candidates.
+- Creator skill paths under the PC data root: `<uid>/local/marketplace/skills/16e1bfcb3426/SKILL.md` (`agent-creator`) and `<uid>/local/marketplace/skills/efb0fe5d9664/SKILL.md` (`skill-creator`).
+- Platform agent/skill primary text is English. Descriptions are bilingual (`description_zh`, `description_en`); other UI languages fall back to English.
+- SKILL.md frontmatter allows only the approved spec fields. External dependencies are prose in the body, not runtime-managed metadata.
+- Skill id is the directory name; display name is frontmatter `name`. Do not re-couple them.
+- Same display-name marketplace/platform skills with different ids must stay visible by internal read id. Custom may shadow a same-name platform skill, but platform-platform duplicates must not be globally deduped.
+- `agent.skill_list`: missing means legacy unfiltered, empty means no skills, non-empty means strict subset.
+- CLI-backed agents ignore SkillLoader and own runtime settings through the create/edit form, not the LLM-authored workflow.
+- Skill execution goes through `bin/run-skill.cjs`; do not bypass the runner.
+- Component enabled/disabled state is user preference and must not be written into specs.
+
+Dev-mode marketplace editing/upload/delete is hosted/private tooling. Runtime gates and packaging strip rules must both protect it.
+
+## Connectors
+
+- Provider client credentials live on the Server. PC starts OAuth via Server and receives grants through the deep link callback.
+- Connector metadata may remain plaintext, but token-bearing grant/DCR/transport data lives inside per-instance `secrets_enc`.
+- `transport` is encrypted because resolved transport can contain access tokens.
+- Do not reuse account-login modules/namespaces for connector authorization.
+- Tool exposure uses the umbrella pattern: a `## Connectors` block plus `list_connector_tools` and `call_connector_tool` meta-tools.
+- Never inject every MCP action as a flat SDK tool list.
+- Connector visibility is live connected state, user enable toggle, and session-kind scope.
+- Commander (`gconv`) gets block + list + call. Agent-edit gets block + list only. Agent workers, skill edit, one-shots, CLI, reflection, and memory extraction get none.
+- Non-connected connectors are invisible to the LLM; do not add disconnected/error status hints to prompt blocks.
+- No free-form custom MCP-server UI or API-key install path without a product/security plan.
+
+## Knowledge Base
+
+- User-managed context source files live in cloud; derived vector DB and model config live in local machine-private `.kb`.
+- Embedder/model config is fixed unless a full rebuild/migration is designed.
+- Do not use worker_threads for multiple ONNX sessions; use child-process isolation for true parallelism.
+- The model may access contexts only through KB tools, not shell/file scans of the contexts dir.
+- Chunking/search/vector-store shared logic should reuse the existing utilities instead of new bespoke parsers.
+
+## Renderer
+
+- Classic scripts only. Add new script files to `index.html`.
+- New `window.orkas.*` APIs require a main IPC handler; renderer shim routes are centralized.
+- Markdown rendering uses `renderMarkdown`; dashboard directives and schema references change together.
+- Do not append cache-busting query strings to renderer resources.
+- Renderer icons are centralized in `modules/icons.js`; do not hard-code SVG paths or use emoji icons.
+- Reuse shared UI classes and modifiers. Do not create near-duplicate cards/buttons/chips.
+- Before adding overlays/popovers/dialogs, check existing z-index tiers.
+- Name-scanned inventory lists sort by display name unless the list's order is itself meaningful.
+- Keydown action shortcuts in inputs/textareas must ignore IME composition (`e.isComposing || e.keyCode === 229`).
+- Long-running user actions need visible progress; read-heavy network views should use stale-while-revalidate when staleness is acceptable.
+
+## i18n
+
+- Visible UI strings go through `src/{renderer,main}/locales/*.json` and `t(...)`.
+- Main-generated text uses main locales; renderer chrome uses renderer locales. Shared surfaces may need both.
+- Dynamic renderer text must re-render on `i18n-change`.
+- Agent/skill descriptions use `description_zh` for Chinese and `description_en` otherwise.
+- Prompts, logs, telemetry event names, and user content are not i18n-ed.
+
+## Logging, Telemetry, Privacy
+
+- Use `createLogger('<module>')`; do not use `console.log` for app logging.
+- Recoverable failures log `warn`; broken invariants log `error`.
+- Sensitive fields must be redacted before logs/telemetry.
+- Telemetry goes through `Monitor.click/event/error/identify`; payloads contain only ids, types, counts, lengths, or coarse status.
+- Expert-signal files are local-only and may contain raw excerpts. Never copy their content into logs, telemetry, or cross-machine channels.
+
+## Tests And Dev Workflow
+
+- Start PC with `cd PC && ./run.sh`.
+- Run tests with `npm test`, not `npx vitest`; the test script manages sqlite ABI swapping and rollback.
+- If sqlite ABI is broken, run `npm run rebuild:sqlite:electron`.
+- Tests should cover business invariants, recovery paths, concurrency, cross-layer contracts, and text-processing traps.
+- Do not test typing-only wrappers, trivial getters, happy-path-only cases, or implementation internals.
+- LLM-output parsers/sanitizers need fixture sets for both accepted real shapes and rejected look-alikes.
+- Pure renderer functions may expose a guarded CommonJS bridge for tests; DOM/i18n/IPC code should not.
+
+## Do Not
+
+- Put business logic in IPC handlers.
+- Spawn CLI agents or MCP servers outside the approved choke points.
+- Store user data outside `<uid>/{cloud,local}/`.
+- Hand-edit local config/marketplace install files outside the owning UI/dev flow.
+- Bypass path sandboxing, locks, file indexer, sync transport, or artifact/saved-app resolvers.
+- Add eager attachment extraction or automatic pdf/docx fallback in `read_file`.
+- Add LLM total wall-clock timeouts or lock wait timeouts; use the existing idle/watchdog semantics.
+- Reintroduce aggregate project indexes, uid-bearing session ids, flat connector tool injection, server-side relay agent execution, or parallel group-chat dispatch paths.

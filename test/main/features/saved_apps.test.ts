@@ -38,6 +38,7 @@ async function mods() {
 }
 
 const APPS_ROOT = () => path.join(tmpDir, UID, 'cloud', 'saved_apps');
+const attachDir = (cid: string) => path.join(tmpDir, UID, 'cloud', 'chat_attachments', cid);
 
 /** Make a chat artifact and return its id. */
 async function makeArtifact(title: string, extra: Array<{ path: string; content: string }> = []) {
@@ -82,6 +83,170 @@ describe('saved_apps › saveFromArtifact', () => {
   });
 });
 
+describe('saved_apps › saveFromPath', () => {
+  it('saves the whole app bundle when given a nested resource file', async () => {
+    const root = path.join(tmpDir, 'workspace', 'snake');
+    fs.mkdirSync(path.join(root, 'assets'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'index.html'), '<!doctype html><title>Snake</title><script src="assets/app.js"></script>');
+    fs.writeFileSync(path.join(root, 'styles.css'), 'body{}');
+    fs.writeFileSync(path.join(root, 'assets', 'app.js'), 'console.log(1)');
+    fs.mkdirSync(path.join(root, 'node_modules', 'skip'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'node_modules', 'skip', 'big.js'), 'nope');
+
+    const { savedApps } = await mods();
+    const inspected = savedApps.inspectBundleFromPath(path.join(root, 'assets', 'app.js'), { fenceRoots: [path.join(tmpDir, 'workspace')] });
+    expect(inspected).toMatchObject({ ok: true, canSave: true, rootDir: root, entry: 'index.html', title: 'Snake' });
+    const r = savedApps.saveFromPath(UID, path.join(root, 'assets', 'app.js'), { fenceRoots: [path.join(tmpDir, 'workspace')] });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const dir = path.join(APPS_ROOT(), r.id);
+    expect(fs.existsSync(path.join(dir, 'index.html'))).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'styles.css'))).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'assets', 'app.js'))).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'node_modules', 'skip', 'big.js'))).toBe(false);
+    const meta = JSON.parse(fs.readFileSync(path.join(dir, '__orkas-meta.json'), 'utf8'));
+    expect(meta.title).toBe('Snake');
+    expect(meta.sourcePath).toBe(root);
+  });
+
+  it('copies supported static resources and skips hidden, symlinked, excluded, and unsupported files', async () => {
+    const root = path.join(tmpDir, 'workspace', 'assets-app');
+    const outside = path.join(tmpDir, 'outside');
+    fs.mkdirSync(path.join(root, 'assets'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'node_modules', 'pkg'), { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(root, 'index.html'), '<!doctype html><title>Assets</title>');
+    fs.writeFileSync(path.join(root, 'styles.css'), 'body{}');
+    fs.writeFileSync(path.join(root, 'site.webmanifest'), '{"name":"Assets"}');
+    fs.writeFileSync(path.join(root, 'sound.mp3'), 'fake mp3');
+    fs.writeFileSync(path.join(root, 'model.glb'), 'fake glb');
+    fs.writeFileSync(path.join(root, 'assets', 'logo.png'), 'fake png');
+    fs.writeFileSync(path.join(root, 'archive.zip'), 'skip zip');
+    fs.writeFileSync(path.join(root, '.env'), 'skip hidden');
+    fs.writeFileSync(path.join(root, 'node_modules', 'pkg', 'index.js'), 'skip package');
+    fs.writeFileSync(path.join(outside, 'linked.txt'), 'skip symlink');
+    fs.symlinkSync(path.join(outside, 'linked.txt'), path.join(root, 'linked.txt'));
+
+    const { savedApps } = await mods();
+    const r = savedApps.saveFromPath(UID, path.join(root, 'styles.css'), { fenceRoots: [path.join(tmpDir, 'workspace')] });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const dir = path.join(APPS_ROOT(), r.id);
+    expect(fs.existsSync(path.join(dir, 'index.html'))).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'styles.css'))).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'site.webmanifest'))).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'sound.mp3'))).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'model.glb'))).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'assets', 'logo.png'))).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'archive.zip'))).toBe(false);
+    expect(fs.existsSync(path.join(dir, '.env'))).toBe(false);
+    expect(fs.existsSync(path.join(dir, 'node_modules', 'pkg', 'index.js'))).toBe(false);
+    expect(fs.existsSync(path.join(dir, 'linked.txt'))).toBe(false);
+  });
+
+  it('supports non-index HTML entries', async () => {
+    const root = path.join(tmpDir, 'workspace', 'arcade');
+    fs.mkdirSync(path.join(root, 'assets'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'game.html'), '<!doctype html><title>Arcade Game</title><link rel="stylesheet" href="styles.css">');
+    fs.writeFileSync(path.join(root, 'styles.css'), 'body{}');
+    fs.writeFileSync(path.join(root, 'assets', 'game.js'), 'console.log(1)');
+    fs.writeFileSync(path.join(root, 'assets', 'logo.png'), 'fake png');
+
+    const { savedApps } = await mods();
+    const inspectedFromResource = savedApps.inspectBundleFromPath(path.join(root, 'assets', 'game.js'), { fenceRoots: [path.join(tmpDir, 'workspace')] });
+    expect(inspectedFromResource).toMatchObject({ ok: true, canSave: true, rootDir: root, entry: 'game.html', title: 'Arcade Game' });
+    const inspectedFromDir = savedApps.inspectBundleFromPath(root, { fenceRoots: [path.join(tmpDir, 'workspace')] });
+    expect(inspectedFromDir).toMatchObject({ ok: true, canSave: true, rootDir: root, entry: 'game.html' });
+
+    const r = savedApps.saveFromPath(UID, path.join(root, 'styles.css'), { fenceRoots: [path.join(tmpDir, 'workspace')] });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const dir = path.join(APPS_ROOT(), r.id);
+    expect(fs.existsSync(path.join(dir, 'game.html'))).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'index.html'))).toBe(false);
+    const meta = JSON.parse(fs.readFileSync(path.join(dir, '__orkas-meta.json'), 'utf8'));
+    expect(meta.entry).toBe('game.html');
+    const resolved = savedApps.resolveSavedAppIndex(UID, r.id);
+    expect(resolved.ok).toBe(true);
+    if (resolved.ok) expect(resolved.absPath).toBe(path.join(dir, 'game.html'));
+    const edit = await savedApps.openForEditing(UID, r.id);
+    expect(edit.ok).toBe(true);
+    if (!edit.ok) return;
+    const conv = edit.conversation as { conversation_id: string };
+    const bundlePath = path.join(attachDir(conv.conversation_id), edit.sourceFileName);
+    const bundle = fs.readFileSync(bundlePath, 'utf8');
+    expect(bundle).toContain('current entry HTML is `game.html`');
+    expect(bundle).toContain('========== FILE: game.html ==========');
+    expect(bundle).toContain('========== FILE: assets/game.js ==========');
+    expect(bundle).toContain('[binary asset: assets/logo.png');
+  });
+
+  it('prefers index.html for a directory but uses the clicked HTML file as the entry', async () => {
+    const root = path.join(tmpDir, 'workspace', 'multi-html');
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(root, 'index.html'), '<!doctype html><title>Main</title>');
+    fs.writeFileSync(path.join(root, 'game.html'), '<!doctype html><title>Game</title>');
+
+    const { savedApps } = await mods();
+    expect(savedApps.inspectBundleFromPath(root, { fenceRoots: [path.join(tmpDir, 'workspace')] }))
+      .toMatchObject({ ok: true, canSave: true, entry: 'index.html', title: 'Main' });
+    const inspectedGame = savedApps.inspectBundleFromPath(path.join(root, 'game.html'), { fenceRoots: [path.join(tmpDir, 'workspace')] });
+    expect(inspectedGame).toMatchObject({ ok: true, canSave: true, entry: 'game.html', title: 'Game' });
+    const saved = savedApps.saveFromPath(UID, path.join(root, 'game.html'), { fenceRoots: [path.join(tmpDir, 'workspace')] });
+    expect(saved.ok).toBe(true);
+    if (!saved.ok) return;
+    const resolved = savedApps.resolveSavedAppIndex(UID, saved.id);
+    expect(resolved.ok).toBe(true);
+    if (resolved.ok) expect(resolved.absPath).toBe(path.join(APPS_ROOT(), saved.id, 'game.html'));
+  });
+
+  it('refuses unsupported files and folders without an HTML entry', async () => {
+    const root = path.join(tmpDir, 'workspace', 'docs');
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(root, 'report.pdf'), 'fake');
+    fs.writeFileSync(path.join(root, 'notes.md'), '# notes');
+
+    const { savedApps } = await mods();
+    expect(savedApps.inspectBundleFromPath(path.join(root, 'report.pdf'), { fenceRoots: [path.join(tmpDir, 'workspace')] }))
+      .toMatchObject({ ok: true, canSave: false });
+    expect(savedApps.inspectBundleFromPath(root, { fenceRoots: [path.join(tmpDir, 'workspace')] }))
+      .toMatchObject({ ok: true, canSave: false });
+    expect(savedApps.saveFromPath(UID, path.join(root, 'report.pdf'), { fenceRoots: [path.join(tmpDir, 'workspace')] }).ok)
+      .toBe(false);
+  });
+
+  it('does not cross the allowed fence while looking for an HTML entry', async () => {
+    const workspace = path.join(tmpDir, 'workspace');
+    const app = path.join(workspace, 'app');
+    fs.mkdirSync(path.join(app, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(workspace, 'index.html'), '<!doctype html><title>Outside</title>');
+    fs.writeFileSync(path.join(app, 'src', 'app.js'), 'console.log(1)');
+
+    const { savedApps } = await mods();
+    expect(savedApps.inspectBundleFromPath(path.join(app, 'src', 'app.js'), { fenceRoots: [app] }))
+      .toMatchObject({ ok: true, canSave: false });
+  });
+
+  it('refuses bundles over the file-count limit and leaves no temp app directory', async () => {
+    const root = path.join(tmpDir, 'workspace', 'too-many-files');
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(path.join(root, 'index.html'), '<!doctype html><title>Too many</title>');
+    for (let i = 0; i < 300; i += 1) {
+      fs.writeFileSync(path.join(root, `file-${String(i).padStart(3, '0')}.css`), 'body{}');
+    }
+
+    const { savedApps } = await mods();
+    const inspected = savedApps.inspectBundleFromPath(path.join(root, 'file-000.css'), { fenceRoots: [path.join(tmpDir, 'workspace')] });
+    expect(inspected).toMatchObject({ ok: true, canSave: false });
+    if (inspected.ok && !inspected.canSave) expect(inspected.reason).toContain('too many files');
+    const r = savedApps.saveFromPath(UID, path.join(root, 'file-000.css'), { fenceRoots: [path.join(tmpDir, 'workspace')] });
+    expect(r.ok).toBe(false);
+    const names = fs.readdirSync(APPS_ROOT());
+    expect(names.some((n) => n.includes('.tmp-'))).toBe(false);
+    expect(names.length).toBe(0);
+  });
+});
+
 describe('saved_apps › resolveSavedAppIndex', () => {
   it('resolves a real app and rejects bad / missing ids', async () => {
     const aid = await makeArtifact('Game');
@@ -100,6 +265,69 @@ describe('saved_apps › resolveSavedAppIndex', () => {
     const missing = savedApps.resolveSavedAppIndex(UID, 'Zm9vYmFyAA');
     expect(missing.ok).toBe(false);
     if (!missing.ok) expect(missing.code).toBe('not_found');
+  });
+
+  it('falls back to index.html for legacy or corrupt meta', async () => {
+    const aid = await makeArtifact('Legacy');
+    const { savedApps } = await mods();
+    const saved = savedApps.saveFromArtifact(UID, CID, aid);
+    if (!saved.ok) throw new Error('save failed');
+    const dir = path.join(APPS_ROOT(), saved.id);
+    fs.writeFileSync(path.join(dir, '__orkas-meta.json'), '{ not json');
+
+    const resolved = savedApps.resolveSavedAppIndex(UID, saved.id);
+    expect(resolved.ok).toBe(true);
+    if (resolved.ok) expect(resolved.absPath).toBe(path.join(dir, 'index.html'));
+    const edit = await savedApps.openForEditing(UID, saved.id);
+    expect(edit.ok).toBe(true);
+  });
+});
+
+describe('saved_apps › resolveSavedAppFilePath', () => {
+  it('resolves the configured entry and sibling assets for chat-app://saved', async () => {
+    const { savedApps } = await mods();
+    const root = path.join(tmpDir, 'workspace', 'calculator');
+    fs.mkdirSync(path.join(root, 'assets'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'calculator.html'), '<!doctype html><title>Calc</title><script src="assets/app.js"></script>');
+    fs.writeFileSync(path.join(root, 'assets', 'app.js'), 'console.log("calc")');
+    const saved = savedApps.saveFromPath(UID, path.join(root, 'calculator.html'), { fenceRoots: [path.join(tmpDir, 'workspace')] });
+    expect(saved.ok).toBe(true);
+    if (!saved.ok) return;
+
+    const entry = savedApps.resolveSavedAppFilePath(UID, saved.id, '');
+    expect(entry.ok).toBe(true);
+    if (entry.ok) {
+      expect(entry.absPath).toBe(path.join(APPS_ROOT(), saved.id, 'calculator.html'));
+      expect(entry.entry).toBe('calculator.html');
+      expect(entry.mime).toMatch(/text\/html/);
+    }
+
+    const js = savedApps.resolveSavedAppFilePath(UID, saved.id, 'assets/app.js');
+    expect(js.ok).toBe(true);
+    if (js.ok) {
+      expect(js.absPath).toBe(path.join(APPS_ROOT(), saved.id, 'assets', 'app.js'));
+      expect(js.mime).toMatch(/javascript/);
+    }
+  });
+
+  it('rejects traversal, metadata, and unsupported extensions', async () => {
+    const aid = await makeArtifact('Guard');
+    const { savedApps } = await mods();
+    const saved = savedApps.saveFromArtifact(UID, CID, aid);
+    if (!saved.ok) throw new Error('save failed');
+    fs.writeFileSync(path.join(APPS_ROOT(), saved.id, 'shell.exe'), 'nope');
+
+    const traversal = savedApps.resolveSavedAppFilePath(UID, saved.id, '../index.html');
+    expect(traversal.ok).toBe(false);
+    if (!traversal.ok) expect(traversal.code).toBe('bad_input');
+
+    const meta = savedApps.resolveSavedAppFilePath(UID, saved.id, '__orkas-meta.json');
+    expect(meta.ok).toBe(false);
+    if (!meta.ok) expect(meta.code).toBe('not_found');
+
+    const exe = savedApps.resolveSavedAppFilePath(UID, saved.id, 'shell.exe');
+    expect(exe.ok).toBe(false);
+    if (!exe.ok) expect(exe.code).toBe('forbidden');
   });
 });
 
@@ -166,10 +394,6 @@ describe('saved_apps › listSavedApps', () => {
 });
 
 describe('saved_apps › openForEditing', () => {
-  function attachDir(cid: string): string {
-    return path.join(tmpDir, UID, 'cloud', 'chat_attachments', cid);
-  }
-
   it('creates a conversation and bundles every source file into app-source.md', async () => {
     const { savedApps, chatArtifacts } = await mods();
     const chats = await import('../../../src/main/features/chats');

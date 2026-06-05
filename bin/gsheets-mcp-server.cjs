@@ -7,6 +7,9 @@ const { ListToolsRequestSchema, CallToolRequestSchema } = require('@modelcontext
 
 const TOKEN = process.env.GOOGLE_ACCESS_TOKEN || '';
 const BASE = 'https://sheets.googleapis.com/v4';
+const SPREADSHEET_ID_DESC =
+  'The long hash in the URL after /spreadsheets/d/. For existing files, the user must first ' +
+  'select the spreadsheet from the Google Sheets connector menu or use a spreadsheet created by Orkas.';
 
 const TOOLS = [
   {
@@ -15,7 +18,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        spreadsheetId: { type: 'string', description: 'The long hash in the URL after /spreadsheets/d/.' },
+        spreadsheetId: { type: 'string', description: SPREADSHEET_ID_DESC },
       },
       required: ['spreadsheetId'],
     },
@@ -29,7 +32,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        spreadsheetId: { type: 'string' },
+        spreadsheetId: { type: 'string', description: SPREADSHEET_ID_DESC },
         range: { type: 'string', description: 'A1 notation.' },
         valueRenderOption: { type: 'string', enum: ['FORMATTED_VALUE', 'UNFORMATTED_VALUE', 'FORMULA'] },
       },
@@ -45,7 +48,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        spreadsheetId: { type: 'string' },
+        spreadsheetId: { type: 'string', description: SPREADSHEET_ID_DESC },
         range: { type: 'string', description: 'A1 notation — anchor for the write.' },
         values: {
           type: 'array',
@@ -76,7 +79,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        spreadsheetId: { type: 'string' },
+        spreadsheetId: { type: 'string', description: SPREADSHEET_ID_DESC },
         range: { type: 'string', description: 'A1 notation. Google appends below the table at this anchor.' },
         values: { type: 'array', description: '2D array of row values.', items: { type: 'array' } },
         valueInputOption: { type: 'string', enum: ['RAW', 'USER_ENTERED'] },
@@ -90,7 +93,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        spreadsheetId: { type: 'string' },
+        spreadsheetId: { type: 'string', description: SPREADSHEET_ID_DESC },
         range: { type: 'string', description: 'A1 notation.' },
       },
       required: ['spreadsheetId', 'range'],
@@ -102,7 +105,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        spreadsheetId: { type: 'string' },
+        spreadsheetId: { type: 'string', description: SPREADSHEET_ID_DESC },
         ranges: { type: 'array', items: { type: 'string' }, description: 'A1 notation array.' },
         valueRenderOption: { type: 'string', enum: ['FORMATTED_VALUE', 'UNFORMATTED_VALUE', 'FORMULA'] },
       },
@@ -115,7 +118,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        spreadsheetId: { type: 'string' },
+        spreadsheetId: { type: 'string', description: SPREADSHEET_ID_DESC },
         data: {
           type: 'array',
           description: 'Each entry: {range: A1, values: 2D array}.',
@@ -132,7 +135,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        spreadsheetId: { type: 'string' },
+        spreadsheetId: { type: 'string', description: SPREADSHEET_ID_DESC },
         title: { type: 'string', description: 'New sheet title.' },
         index: { type: 'integer', description: 'Position index (0-based). Default appends.' },
         rowCount: { type: 'integer' },
@@ -147,7 +150,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        spreadsheetId: { type: 'string' },
+        spreadsheetId: { type: 'string', description: SPREADSHEET_ID_DESC },
         sheetId: { type: 'integer', description: 'The tab\'s sheetId (NOT title) — from `list_sheets`.' },
       },
       required: ['spreadsheetId', 'sheetId'],
@@ -159,7 +162,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        spreadsheetId: { type: 'string' },
+        spreadsheetId: { type: 'string', description: SPREADSHEET_ID_DESC },
         sheetId: { type: 'integer', description: 'Source tab\'s sheetId.' },
         newSheetName: { type: 'string', description: 'Optional new title.' },
         insertSheetIndex: { type: 'integer', description: 'Position of the copy (default: right after source).' },
@@ -173,7 +176,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        spreadsheetId: { type: 'string' },
+        spreadsheetId: { type: 'string', description: SPREADSHEET_ID_DESC },
         find: { type: 'string' },
         replacement: { type: 'string' },
         matchCase: { type: 'boolean' },

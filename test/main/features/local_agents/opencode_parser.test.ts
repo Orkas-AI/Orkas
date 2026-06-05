@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  buildOpencodeArgs,
   mapOpencodeEvent,
   extractOpencodeUsage,
 } from '../../../../src/main/features/local_agents/backends/opencode';
@@ -94,5 +95,17 @@ describe('local_agents/backends/opencode › extractOpencodeUsage', () => {
     expect(extractOpencodeUsage({})).toBeUndefined();
     expect(extractOpencodeUsage({ tokens: {} })).toBeUndefined();
     expect(extractOpencodeUsage(null)).toBeUndefined();
+  });
+});
+
+describe('local_agents/backends/opencode › trusted local permissions', () => {
+  it('runs OpenCode with non-interactive permission auto-approval', () => {
+    expect(buildOpencodeArgs({ prompt: 'hi' })).toEqual([
+      'run',
+      '--format',
+      'json',
+      '--dangerously-skip-permissions',
+      'hi',
+    ]);
   });
 });

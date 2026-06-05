@@ -11,8 +11,9 @@
 const _chatMdDrawerLog = createLogger('chat-md-drawer');
 
 let _cmdState = null;   // { controller, source, title, dirty }
+let _cmdDiscardConfirmPending = false;
 
-function openChatMdDrawer({ source, initialMode, title }) {
+async function openChatMdDrawer({ source, initialMode, title }) {
   if (!source || typeof source.kind !== 'string') {
     _chatMdDrawerLog.warn('openChatMdDrawer called without source.kind');
     return;
@@ -28,7 +29,7 @@ function openChatMdDrawer({ source, initialMode, title }) {
 
   // Replacing an open mount: ask before discarding unsaved edits.
   if (_cmdState && _cmdState.controller && _cmdState.dirty) {
-    const proceed = window.confirm(t('chat.md_drawer.close_confirm'));
+    const proceed = await _confirmDiscardChatMdDrawer();
     if (!proceed) return;
   }
   _teardownCmd();
@@ -61,7 +62,7 @@ function openChatMdDrawer({ source, initialMode, title }) {
       // be ignored (capability defaults already skip delete for workspace).
       onSendToChatInput: (text) => {
         const ok = _sendDraftToChatInput(text);
-        if (ok) closeChatMdDrawer({ force: true });
+        if (ok) void closeChatMdDrawer({ force: true });
       },
     },
   });
@@ -69,10 +70,10 @@ function openChatMdDrawer({ source, initialMode, title }) {
   _bindCloseHandlers();
 }
 
-function closeChatMdDrawer({ force = false } = {}) {
+async function closeChatMdDrawer({ force = false } = {}) {
   if (!_cmdState) return;
   if (!force && _cmdState.dirty) {
-    const proceed = window.confirm(t('chat.md_drawer.close_confirm'));
+    const proceed = await _confirmDiscardChatMdDrawer();
     if (!proceed) return;
   }
   const panel = document.getElementById('chat-md-drawer-panel');
@@ -105,6 +106,17 @@ function _defaultTitle(source) {
   return '';
 }
 
+async function _confirmDiscardChatMdDrawer() {
+  if (_cmdDiscardConfirmPending) return false;
+  _cmdDiscardConfirmPending = true;
+  const message = t('chat.md_drawer.close_confirm');
+  try {
+    return typeof uiConfirm === 'function' ? await uiConfirm(message) : false;
+  } finally {
+    _cmdDiscardConfirmPending = false;
+  }
+}
+
 // ── Close button / Esc dismisser ────────────────────────────────────────
 
 let _cmdHandlersBound = false;
@@ -112,7 +124,7 @@ function _bindCloseHandlers() {
   if (_cmdHandlersBound) return;
   _cmdHandlersBound = true;
   const closeBtn = document.getElementById('chat-md-drawer-close');
-  if (closeBtn) closeBtn.addEventListener('click', () => closeChatMdDrawer());
+  if (closeBtn) closeBtn.addEventListener('click', () => { void closeChatMdDrawer(); });
   document.addEventListener('keydown', (e) => {
     // IME guard (CLAUDE.md §8): don't intercept Escape while the user is
     // committing a composition candidate.
@@ -123,7 +135,7 @@ function _bindCloseHandlers() {
     // the behavior of the main chat composer).
     const active = document.activeElement;
     if (active && active.tagName === 'TEXTAREA' && active.closest('#chat-md-drawer-panel')) return;
-    closeChatMdDrawer();
+    void closeChatMdDrawer();
   });
 }
 

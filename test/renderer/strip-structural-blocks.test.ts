@@ -142,6 +142,42 @@ describe('set A — real <agent> containers must be stripped / replaced', () => 
     expect(replaced).toBe(`${PH}\nmid\n${PH}`);
     expect(replaced.split(PH).length - 1).toBe(2);
   });
+
+  // A6 pins the actual commander edit-marketplace-agent shape we shipped
+  // 2026-05-21: dispatch landed through updateAgentSpec for the first time
+  // (commit dc60c86d), and the renderer surfaced the container's inner
+  // agent_id + bilingual descriptions as a stray bubble next to the real
+  // reply because some render path skipped strip and let markdown's HTML
+  // pass-through swallow only the tags. Container shape matches what
+  // `extractAgentFieldBlocks` accepts: `<agent>` with `<agent_id>` /
+  // `<description_zh>` / `<description_en>` / `<workflow>` sub-tags, multi-
+  // line description bodies, mixed zh+en, fence-free.
+  it('A6. commander edit container with agent_id + bilingual descriptions + workflow', () => {
+    const buf = [
+      'preface',
+      '',
+      '<agent>',
+      '<agent_id>bc7ac250df71</agent_id>',
+      '<description_zh>按来源边界整理 Agent / Skill 候选，核对原始材料并保持来源保真；触发词：整合、交接包</description_zh>',
+      '<description_en>Organize Agent / Skill candidates by source boundary, verify original source material; Triggers: consolidate, handoff package</description_en>',
+      '<workflow>',
+      '### 1. 接收候选',
+      '- 读取用户提供的 Top 候选',
+      '</workflow>',
+      '</agent>',
+      'tail',
+    ].join('\n');
+    const stripped = _stripSurvivingAgentBlocks(buf);
+    expect(stripped).not.toContain('bc7ac250df71');
+    expect(stripped).not.toContain('按来源边界整理');
+    expect(stripped).not.toContain('Organize Agent / Skill');
+    expect(stripped).not.toContain('<workflow>');
+    expect(stripped).toBe('preface\n\ntail');
+
+    const replaced = _replaceOuterAgentBlocks(buf, PH);
+    expect(replaced).toBe(`preface\n\n${PH}\ntail`);
+    expect(replaced.split(PH).length - 1).toBe(1);
+  });
 });
 
 // --- Set B: literal mentions must survive ---------------------------------
@@ -737,11 +773,13 @@ const {
   _stripOuterSkillFileBlocks,
   _replaceOuterSkillFileBlocks,
   _extractSkillFilePath,
+  _replaceUnclosedDashboardBlocks,
 } = skill as {
   _findOuterSkillFileRanges: (text: string) => Array<[number, number]>;
   _stripOuterSkillFileBlocks: (text: string) => string;
   _replaceOuterSkillFileBlocks: (buf: string, makePlaceholder: (path: string) => string) => string;
   _extractSkillFilePath: (blockText: string) => string;
+  _replaceUnclosedDashboardBlocks: (buf: string, placeholder: string) => string;
 };
 
 const SKILL_PH = (path: string) => `⟨SKILL:${path || '?'}⟩`;
@@ -959,6 +997,26 @@ describe('skill-file — _stripSurvivingStructuralBlocks final-time safety', () 
   });
 });
 
+describe('dashboard streaming placeholders', () => {
+  const DASH_PH = '⟨DASHBOARD⟩';
+
+  it('replaces an unclosed dashboard block so partial JSON does not stream into the bubble', () => {
+    const buf = '已生成网页看板：\n\n:::dashboard\n{\n  "root": { "type": "Table", "props": {';
+    expect(_replaceUnclosedDashboardBlocks(buf, DASH_PH))
+      .toBe('已生成网页看板：\n\n⟨DASHBOARD⟩');
+  });
+
+  it('leaves a complete dashboard block alone so the final renderer can mount it', () => {
+    const buf = 'before\n:::dashboard\n{"root":{"type":"Separator"}}\n:::\nafter';
+    expect(_replaceUnclosedDashboardBlocks(buf, DASH_PH)).toBe(buf);
+  });
+
+  it('does not replace literal dashboard examples inside fenced code', () => {
+    const buf = '```md\n:::dashboard\n{"root":null}\n```\n';
+    expect(_replaceUnclosedDashboardBlocks(buf, DASH_PH)).toBe(buf);
+  });
+});
+
 // Streaming-time skill-container stripper. Unique surface vs `<agent>`:
 // closed containers must keep their inner content (per-file placeholders)
 // while still hiding outer `<skill>` / `<skill_id>` scaffolding; unclosed
@@ -989,6 +1047,14 @@ describe('_stripSkillCreateContainer — set A (real shapes)', () => {
     expect(out).toContain('[Writing SKILL.md…]');
     expect(out).toContain('[Writing scripts/foo.py…]');
     expect(out).not.toContain('<skill>');
+  });
+
+  it('A2c. metadata-only skill edit collapses to the fallback placeholder', () => {
+    const buf = '<skill>\n<skill_id>foo</skill_id>\n<category>data</category>\n</skill>';
+    const out = _stripSkillCreateContainer(buf, '⟨FALLBACK⟩');
+    expect(out).toBe('⟨FALLBACK⟩');
+    expect(out).not.toContain('<category>');
+    expect(out).not.toContain('data');
   });
 
   it('A2b. closed real container hides skill-file blocks even when the LLM fenced them', () => {
@@ -1088,6 +1154,14 @@ describe('_stripSkillCreateContainer — set B (look-alikes must NOT match)', ()
   it('B5. empty / falsy input', () => {
     expect(_stripSkillCreateContainer('', '⟨FALLBACK⟩')).toBe('');
     expect(_stripSkillCreateContainer(undefined as any, '⟨FALLBACK⟩')).toBe(undefined);
+  });
+});
+
+describe('<skill-meta> final safety strip', () => {
+  it('strips leaked skill metadata blocks', () => {
+    const buf = 'done\n<skill-meta>\n<category>data</category>\n</skill-meta>\ntail';
+    const out = _stripSurvivingStructuralBlocks(buf);
+    expect(out).toBe('done\n\ntail');
   });
 });
 

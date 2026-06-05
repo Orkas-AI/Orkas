@@ -37,7 +37,7 @@ import { t } from '../../i18n';
 
 const log = createLogger('search');
 
-import { tokenize } from './tokenize';
+import { tokenize, isCJK } from './tokenize';
 import type { Index, Doc } from './storage';
 import * as indexer from './indexer';
 
@@ -139,12 +139,42 @@ function _scoreIndex(idx: RuntimeIndex, queryTokens: string[]): Map<string, numb
   const scores = new Map<string, number>();
   if (!docCount) return scores;
   const avgdl = _avgDocLen(idx);
+
+  // CJK bigram anchor filter — tokenize emits both unigrams (`苏`) and
+  // bigrams (`苏格`) per CJK char. Single CJK chars match millions of
+  // irrelevant docs (`拉`, `底` are everywhere) and overwhelm BM25; without
+  // an anchor, searching `苏格拉底` ranks docs that only happen to contain
+  // `拉` or `底` because their unigram contributions accumulate. Whenever
+  // the query carries at least one CJK bigram, restrict the candidate set
+  // to docs that hit at least one of those bigrams; unigram contributions
+  // still adjust ranking within that set. Queries that contain ONLY single
+  // CJK chars (e.g. one-char `水`) fall through to the legacy unigram path
+  // so short / single-char searches still work.
+  const cjkBigrams = queryTokens.filter(
+    (t) => t.length === 2 && isCJK(t[0]) && isCJK(t[1]),
+  );
+  let anchored: Set<string> | null = null;
+  if (cjkBigrams.length) {
+    anchored = new Set<string>();
+    for (const t of cjkBigrams) {
+      const post = idx.postings[t];
+      if (!post) continue;
+      for (const [docId] of post) anchored.add(docId);
+    }
+    // No anchor bigram hit any doc — the query's full CJK shape doesn't
+    // appear in this index. Returning empty here keeps the noise-doc list
+    // from showing up; without it, the single-char unigram contributions
+    // would still surface unrelated docs.
+    if (anchored.size === 0) return scores;
+  }
+
   for (const t of queryTokens) {
     const post = idx.postings[t];
     if (!post) continue;
     const df = post.length;
     const idf = Math.log(1 + (docCount - df + 0.5) / (df + 0.5));
     for (const [docId, tf] of post) {
+      if (anchored && !anchored.has(docId)) continue;
       const doc = idx.docs[docId];
       const dl = (doc && typeof doc.len === 'number') ? doc.len : avgdl;
       const norm = 1 - BM25_B + BM25_B * (dl / avgdl);
@@ -192,6 +222,50 @@ export async function searchContexts(query: string, userId?: string): Promise<Se
       score,
     };
   });
+}
+
+export async function searchProjectContexts(userId: string, projectId: string, query: string): Promise<SearchResult[]> {
+  const q = (query || '').trim();
+  const pid = (projectId || '').trim();
+  if (!q || !pid) return [];
+  const qLower = q.toLowerCase();
+  const tokens = tokenize(q).filter((t) => t.length > 1 || !isCJK(t));
+  try {
+    const [projectFiles, projects] = await Promise.all([
+      import('../project_files'),
+      import('../projects'),
+    ]);
+    const [files, project] = await Promise.all([
+      projectFiles.listProjectFiles(userId, pid),
+      projects.getProject(userId, pid).catch(() => null),
+    ]);
+    const scored: SearchResult[] = [];
+    for (const f of files) {
+      const name = f.relPath || f.name || '';
+      const lower = name.toLowerCase();
+      let score = 0;
+      if (lower === qLower) score = 95;
+      else if (lower.startsWith(qLower)) score = 60;
+      else if (lower.includes(qLower)) score = 35;
+      else if (tokens.length && tokens.every((t) => lower.includes(t))) score = 18;
+      if (score <= 0) continue;
+      scored.push({
+        kind: 'context',
+        path: name,
+        title: name,
+        snippet: name,
+        score,
+        library_scope: 'project',
+        project_id: pid,
+        project_name: project?.name || '',
+      });
+    }
+    scored.sort((a, b) => b.score - a.score || String(a.path || '').localeCompare(String(b.path || '')));
+    return scored.slice(0, MAX_PER_KIND);
+  } catch (err) {
+    log.warn(`project contexts search failed user=${userId} pid=${pid}: ${(err as Error).message}`);
+    return [];
+  }
 }
 
 export async function searchChats(userId: string, query: string): Promise<SearchResult[]> {
@@ -406,16 +480,19 @@ async function _unlinkLegacyIndexes(uid: string): Promise<void> {
   }
 }
 
-export interface SearchAllOptions { limit?: number; scope?: 'all' | 'context' | 'chat' | 'agent' | 'skill' }
+export interface SearchAllOptions { limit?: number; scope?: 'all' | 'context' | 'chat' | 'agent' | 'skill'; projectId?: string }
 
 export async function searchAll(
-  userId: string, query: string, { limit = 30, scope = 'all' }: SearchAllOptions = {},
+  userId: string, query: string, { limit = 30, scope = 'all', projectId }: SearchAllOptions = {},
 ): Promise<{ results: SearchResult[]; total?: number }> {
   const q = (query || '').trim();
   if (!q) return { results: [] };
   const buckets: SearchResult[] = [];
   const tasks: Array<Promise<void>> = [];
-  if (scope === 'all' || scope === 'context') tasks.push(searchContexts(q).then((r) => { buckets.push(...r); }));
+  if (scope === 'all' || scope === 'context') {
+    tasks.push(searchContexts(q).then((r) => { buckets.push(...r); }));
+    if (projectId) tasks.push(searchProjectContexts(userId, projectId, q).then((r) => { buckets.push(...r); }));
+  }
   if (scope === 'all' || scope === 'chat')    tasks.push(searchChats(userId, q).then((r) => { buckets.push(...r); }));
   if (scope === 'all' || scope === 'agent')   tasks.push(searchAgents(userId, q).then((r) => { buckets.push(...r); }));
   if (scope === 'all' || scope === 'skill')   tasks.push(searchSkills(userId, q).then((r) => { buckets.push(...r); }));

@@ -3,6 +3,10 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+const streamGate = vi.hoisted(() => ({
+  releaseActiveTurn: null as null | (() => void),
+}));
+
 // Mock the model client so `runTurn` doesn't try to do a real LLM call.
 // `streamChatWithModel` returns an async iterator that yields one final
 // event with empty text + a done event; bus interprets that as "done,
@@ -13,6 +17,10 @@ vi.mock('../../../../src/main/model/client', () => ({
   async *streamChatWithModel(_opts: any) {
     if (String(_opts?.message || '').includes('ARTIFACT_EVENT_TEST')) {
       _opts?.onArtifactCreated?.({ id: 'art-live-1', title: 'Live App' });
+    }
+    if (String(_opts?.message || '').includes('ACTIVE_TURN_TEST')) {
+      yield { type: 'progress', text: 'active turn started' };
+      await new Promise<void>((resolve) => { streamGate.releaseActiveTurn = resolve; });
     }
     yield { type: 'final', text: '' };
     yield { type: 'done' };
@@ -43,6 +51,7 @@ beforeEach(async () => {
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
   cliRunMock.calls.length = 0;
+  streamGate.releaseActiveTurn = null;
   const users = await import('../../../../src/main/features/users');
   users.activateUser(TEST_UID);
 
@@ -104,6 +113,45 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     const m = await state.readMembers(TEST_UID, TEST_CID);
     expect(m.actors.find((a) => a.id === AGENT_ID)).toBeTruthy();
     expect(m.actors.find((a) => a.id === AGENT_ID)?.name).toBe(AGENT_NAME);
+  });
+
+  it('exposes a stable active turn id from process event through final message', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const events: any[] = [];
+    let resolveProgress: ((ev: any) => void) | null = null;
+    const progressSeen = new Promise<any>((resolve) => { resolveProgress = resolve; });
+    bus.subscribe(TEST_UID, TEST_CID, (ev) => {
+      events.push(ev);
+      if (ev.type === 'process' && ev.actor === 'commander' && ev.data?.type === 'progress') {
+        resolveProgress?.(ev);
+      }
+    });
+
+    try {
+      await bus.enqueue({
+        uid: TEST_UID, cid: TEST_CID, fromActorId: 'user',
+        text: 'ACTIVE_TURN_TEST',
+      });
+      const processEv = await Promise.race([
+        progressSeen,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('progress event timeout')), 1000)),
+      ]) as any;
+
+      expect(processEv.turn_id).toEqual(expect.any(String));
+      const running = bus.runtimeSnapshot(TEST_UID, TEST_CID);
+      expect(running.activeTurns).toContainEqual({ actor: 'commander', turn_id: processEv.turn_id });
+      expect(running.inFlight).toContain('commander');
+
+      streamGate.releaseActiveTurn?.();
+      await waitForQuiescent(TEST_UID, TEST_CID);
+
+      const finalEv = events.find((ev) => ev.type === 'message' && ev.turn_end && ev.msg?.from === 'commander');
+      expect(finalEv?.turn_id).toBe(processEv.turn_id);
+      expect(bus.runtimeSnapshot(TEST_UID, TEST_CID).activeTurns).toEqual([]);
+    } finally {
+      streamGate.releaseActiveTurn?.();
+      streamGate.releaseActiveTurn = null;
+    }
   });
 
   // `@<agent_id>` → `@<name>` rewrite assertions live in
@@ -207,6 +255,39 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     const st = await state.readState(TEST_UID, cid);
     expect(st.coding_project_dir).toBe(projectDir);
     expect(st.coding_project_dir_explicit).toBe(true);
+  });
+
+  it('asks for a project directory instead of silently falling back when a custom coding cwd vanished', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+    const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+    spec.runtime = { kind: 'cli', cli: 'codex' };
+    spec.inputs = [{ id: 'project_dir', type: 'directory', label: 'Project directory', required: true, default: '' }];
+    fs.writeFileSync(agentFile, JSON.stringify(spec));
+
+    const projectDir = path.join(tmpDir, 'repo-removed');
+    fs.mkdirSync(projectDir);
+    const agents = await import('../../../../src/main/features/agents');
+    await agents.setAgentCliProjectDir(TEST_UID, AGENT_ID, projectDir);
+    fs.rmSync(projectDir, { recursive: true, force: true });
+
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const cid = 'cid-coding-dir-missing';
+    await bus.enqueue({
+      uid: TEST_UID, cid, fromActorId: 'user',
+      text: `@${AGENT_NAME} 修一下这个项目`,
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    expect(cliRunMock.calls).toHaveLength(0);
+    const st = await state.readState(TEST_UID, cid);
+    expect(st.coding_project_dir).toBeUndefined();
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const formMsg = rows.find((row: any) => row?.form?.agent_id === AGENT_ID);
+    expect(formMsg?.form?.fields?.map((f: any) => f.id)).toEqual(['project_dir']);
   });
 
   it('does not replay prior visible history when a CLI session resumes', async () => {
