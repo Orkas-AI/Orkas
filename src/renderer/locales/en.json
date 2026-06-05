@@ -1029,7 +1029,7 @@
   "avatar.color.salmon": "Salmon",
   "settings.localexec.title": "Tool Execution Access",
   "settings.localexec.sub": "When off, agents cannot run terminal commands, create or edit workspace files, or generate PDFs, images, and interactive apps. Read-only tools are unaffected. File deletion still asks for confirmation when this is on.",
-  "settings.localexec.toggle": "Enable tool execution access",
+  "settings.localexec.toggle": "Enable",
   "settings.localexec.btn_grant": "Grant tool access",
   "settings.localexec.btn_revoke": "Revoke",
   "settings.metacognition.title": "Metacognition-level Agent Self-Evolution",

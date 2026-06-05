@@ -1029,7 +1029,7 @@
   "avatar.color.salmon": "三文鱼",
   "settings.localexec.title": "工具执行权限",
   "settings.localexec.sub": "关闭后，智能体将无法运行终端命令、创建或修改工作区文件、生成 PDF、图片和交互应用等。读取类工具不受影响；删除文件在开启时仍需单独确认。",
-  "settings.localexec.toggle": "启用工具执行权限",
+  "settings.localexec.toggle": "启用",
   "settings.localexec.btn_grant": "授权工具执行",
   "settings.localexec.btn_revoke": "撤销授权",
   "settings.metacognition.title": "元认知级别的 Agent 自演进",

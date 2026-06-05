@@ -1028,7 +1028,7 @@
   "avatar.color.salmon": "サーモン",
   "settings.localexec.title": "ツール実行権限",
   "settings.localexec.sub": "オフにすると、エージェントはターミナルコマンドの実行、ワークスペースファイルの作成・編集、PDF/画像/インタラクティブアプリの生成ができません。読み取り系ツールは影響を受けません。オンの場合もファイル削除は別途確認されます。",
-  "settings.localexec.toggle": "ツール実行権限を有効にする",
+  "settings.localexec.toggle": "有効",
   "settings.localexec.btn_grant": "ツール実行を許可",
   "settings.localexec.btn_revoke": "取り消す",
   "settings.metacognition.title": "メタ認知レベルのエージェント自己進化",
