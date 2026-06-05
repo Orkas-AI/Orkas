@@ -107,6 +107,21 @@ describe('provider_catalog › CURATED_MODELS', () => {
     expect(ids).toEqual(['kimi-k2.6', 'kimi-k2.5']);
   });
 
+  it('minimax catalog exposes M3 before the M2.7 generation', () => {
+    const directIds = (CURATED_MODELS['minimax-cn'] || []).map((m) => m.id);
+    expect(directIds).toEqual([
+      'MiniMax-M3',
+      'MiniMax-M2.7',
+      'MiniMax-M2.7-highspeed',
+    ]);
+
+    const globalPortalIds = (CURATED_MODELS['minimax-portal'] || []).map((m) => m.id);
+    expect(globalPortalIds).toEqual(directIds);
+
+    const portalIds = (CURATED_MODELS['minimax-portal-cn'] || []).map((m) => m.id);
+    expect(portalIds).toEqual(directIds);
+  });
+
   it('openrouter catalog includes DeepSeek / Qwen / GLM / Kimi / MiniMax', () => {
     const ids = (CURATED_MODELS.openrouter || []).map((m) => m.id);
     expect(ids.some((id) => id.startsWith('deepseek/'))).toBe(true);
@@ -114,6 +129,8 @@ describe('provider_catalog › CURATED_MODELS', () => {
     expect(ids.some((id) => id.startsWith('z-ai/'))).toBe(true);
     expect(ids.some((id) => id.startsWith('moonshotai/'))).toBe(true);
     expect(ids.some((id) => id.startsWith('minimax/'))).toBe(true);
+    expect(ids).toContain('minimax/minimax-m3');
+    expect(ids).toContain('minimax/minimax-m2.7');
   });
 
   it('openrouter Claude catalog is limited to Opus 4.8 and 4.7', () => {
