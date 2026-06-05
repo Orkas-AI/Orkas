@@ -677,7 +677,7 @@ function normalizeConnectorSwitchState(value: unknown): ConnectorSwitchState | n
 
 function normalizeGoogleConnectorsConfig(raw: unknown): Partial<GoogleConnectorsConfig> {
   const direct = normalizeConnectorSwitchState(raw);
-  if (direct) return { google: direct };
+  if (direct) return { google: direct, gmail: direct };
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
   const r = raw as Record<string, unknown>;
   const google = normalizeConnectorSwitchState(r.google ?? r.all ?? r.enabled);
@@ -723,8 +723,8 @@ clientConfig.registerDefault<ModelCatalogConfig>('model_catalog', DEFAULT_MODEL_
 });
 
 const DEFAULT_GOOGLE_CONNECTORS_CONFIG: GoogleConnectorsConfig = {
-  google: 'enabled',
-  gmail: 'enabled',
+  google: 'disabled',
+  gmail: 'disabled',
 };
 
 clientConfig.registerDefault<GoogleConnectorsConfig>('google_connectors', DEFAULT_GOOGLE_CONNECTORS_CONFIG, {

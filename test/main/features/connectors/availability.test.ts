@@ -53,7 +53,20 @@ function connectedInstance(id: string) {
 }
 
 describe('Google connector remote switches', () => {
-  it('defaults both Google switches to enabled', async () => {
+  it('hides Google connectors by default', async () => {
+    const catalog = await import('../../../../src/main/features/connectors/catalog');
+    const availability = await import('../../../../src/main/features/connectors/availability');
+
+    const out = availability.catalogWithAvailability(catalog.CONNECTOR_CATALOG);
+
+    expect(ids(out)).not.toEqual(expect.arrayContaining(['google-workspace', 'gmail', 'gcal', 'gdocs', 'gsheets', 'gtasks']));
+    expect(ids(out)).toContain('github');
+    expect(availability.connectorAvailabilityForId('gmail')).toBe('hidden');
+    expect(availability.connectorAvailabilityForId('github')).toBe('enabled');
+  });
+
+  it('lets the direct remote switch re-enable every Google connector', async () => {
+    await writeRemoteConfig(true);
     const catalog = await import('../../../../src/main/features/connectors/catalog');
     const availability = await import('../../../../src/main/features/connectors/availability');
 
@@ -61,7 +74,6 @@ describe('Google connector remote switches', () => {
 
     expect(ids(out)).toEqual(expect.arrayContaining(['google-workspace', 'gmail', 'gcal', 'gdocs', 'gsheets', 'gtasks']));
     expect(availability.connectorAvailabilityForId('gmail')).toBe('enabled');
-    expect(availability.connectorAvailabilityForId('github')).toBe('enabled');
   });
 
   it('hides every Google connector when the overall switch is disabled', async () => {
