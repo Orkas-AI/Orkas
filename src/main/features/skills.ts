@@ -40,6 +40,7 @@ function CUSTOM_SKILLS_DIR(): string {
 
 const log = createLogger('skills');
 import { prompts } from '../prompts/loader';
+import { buildRuntimeDatetimeBlock } from '../prompts/runtime_context';
 import {
   nowIso, readJson, writeJson, writeTextAtomicSync,
   appendJsonlAtomic, invalidateLineCount, readJsonl,
@@ -1869,7 +1870,7 @@ export async function buildSkillEditSystemPrompt(skill: {
     skill_files: skillFilesBlock(files),
   });
   const tail = buildLanguageDirective();
-  return `${body}\n\n---\n\n${tail}`;
+  return `${body}\n\n---\n\n${tail}\n\n---\n\n${buildRuntimeDatetimeBlock()}`;
 }
 
 export interface SkillChatResult {

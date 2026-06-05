@@ -62,6 +62,7 @@ import {
   resolveSkillAllowlistRefs,
   type SkillAllowlistRef,
 } from '../../model/core-agent/skill-registry';
+import { buildRuntimeDatetimeBlock } from '../../prompts/runtime_context';
 
 const log = createLogger('group_chat.bus');
 
@@ -1977,11 +1978,11 @@ function concatSharedRules(main: string, shared: string): string {
   return `${main.slice(0, idx)}---\n\n${shared}\n\n${main.slice(idx)}`;
 }
 
-/** Append the user-language directive at the very tail. Kept last (after
- *  runtime injection) because it is the most volatile per-user variable;
- *  putting it last keeps the cached prefix stable. */
+/** Append volatile prompt tail after the runtime injection block. Current
+ *  datetime stays last because it changes every turn; keeping it at the tail
+ *  preserves the largest cacheable prefix. */
 function appendLanguageDirective(prompt: string): string {
-  return `${prompt}\n\n---\n\n${buildLanguageDirective()}`;
+  return `${prompt}\n\n---\n\n${buildLanguageDirective()}\n\n---\n\n${buildRuntimeDatetimeBlock()}`;
 }
 
 // Render the agents-index block injected into commander's system prompt.
@@ -3310,6 +3311,7 @@ async function _buildCliPrompt(
     attachments_block: filesBlock,
     conversation_block: conversationBlock,
     task_body: taskBody,
+    runtime_datetime_block: buildRuntimeDatetimeBlock(),
   });
 
   if (!bridgeHistory) return render('');

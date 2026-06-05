@@ -63,6 +63,7 @@ describe('group_chat CLI output_format prompt hints', () => {
       attachments_block: '',
       conversation_block: '',
       task_body: 'Summarize status.',
+      runtime_datetime_block: '## Current datetime\n\nCurrent datetime: 2026-06-05T14:30:00+08:00\nTimezone: Asia/Shanghai',
     });
 
     expect(rendered).not.toContain('Use plain text or Markdown');

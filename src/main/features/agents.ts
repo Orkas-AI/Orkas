@@ -38,6 +38,7 @@ const log = createLogger('agents');
 function CUSTOM_AGENTS_DIR(): string { return userAgentsDir(getActiveUserId()); }
 function CUSTOM_SKILLS_DIR(): string { return userSkillsDir(getActiveUserId()); }
 import { prompts } from '../prompts/loader';
+import { buildRuntimeDatetimeBlock } from '../prompts/runtime_context';
 import { findOuterTagRanges } from '../util/markdown-prose-code';
 import {
   nowIso, genAgentId, safeId,
@@ -1709,7 +1710,7 @@ export function buildAgentEditSystemPrompt(agent: {
         interactive: agent.interactive === true ? 'true' : 'false',
       });
   const tail = buildLanguageDirective();
-  return `${body}\n\n---\n\n${tail}`;
+  return `${body}\n\n---\n\n${tail}\n\n---\n\n${buildRuntimeDatetimeBlock()}`;
 }
 
 export interface AgentEditResult {

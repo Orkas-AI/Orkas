@@ -191,10 +191,9 @@ export function getCurrentLang(): Lang {
 }
 
 // ── LLM language directive ───────────────────────────────────────────────
-// Appended at the tail of every conversational system prompt so the model
-// replies in the user's chosen UI language. Lives at the very end (after
-// runtime injection) — this is the most volatile part of the prompt, so
-// keeping it last avoids invalidating the KV-cache prefix.
+// Appended near the tail of every conversational system prompt so the model
+// replies in the user's chosen UI language. Callers may append per-turn
+// context after this block when it changes more often than language.
 
 export function buildLanguageDirective(lang: Lang = _current): string {
   const name = getLocaleMeta(lang).llmName;

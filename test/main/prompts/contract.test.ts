@@ -227,4 +227,16 @@ describe('prompts ↔ code contract', () => {
     expect(cliSetupPrompt).toMatch(/zero\/few inputs/i);
     expect(cliSetupPrompt).toMatch(/one task field plus one optional context field/i);
   });
+
+  it('runtime datetime context is appended after language directives', () => {
+    const bus = readFile('src/main/features/group_chat/bus.ts');
+    const agents = readFile('src/main/features/agents.ts');
+    const skills = readFile('src/main/features/skills.ts');
+    const cliPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_cli_agent.md'), 'utf-8');
+
+    expect(bus).toMatch(/buildLanguageDirective\(\)\}\\n\\n---\\n\\n\$\{buildRuntimeDatetimeBlock\(\)\}/);
+    expect(agents).toMatch(/buildLanguageDirective\(\)[\s\S]+buildRuntimeDatetimeBlock\(\)/);
+    expect(skills).toMatch(/buildLanguageDirective\(\)[\s\S]+buildRuntimeDatetimeBlock\(\)/);
+    expect(cliPrompt).toMatch(/\$task_body\n\n\$runtime_datetime_block\s*$/);
+  });
 });

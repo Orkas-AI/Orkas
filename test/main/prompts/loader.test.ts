@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { PromptManager, safeSubstitute, prompts } from '../../../src/main/prompts/loader';
+import { buildRuntimeDatetimeBlock, formatCurrentDatetime } from '../../../src/main/prompts/runtime_context';
 
 describe('prompts › safeSubstitute', () => {
   it('substitutes $identifier', () => {
@@ -44,6 +45,21 @@ describe('prompts › safeSubstitute', () => {
 
   it('handles literal {} without escaping', () => {
     expect(safeSubstitute('json: {"x":1}', {})).toBe('json: {"x":1}');
+  });
+});
+
+describe('prompts › runtime datetime context', () => {
+  it('formats local datetime as ISO with seconds and numeric offset', () => {
+    const block = buildRuntimeDatetimeBlock(new Date(2026, 5, 5, 14, 30, 0));
+
+    expect(formatCurrentDatetime(new Date(2026, 5, 5, 14, 30, 0))).toMatch(
+      /^2026-06-05T14:30:00[+-]\d{2}:\d{2}$/,
+    );
+    expect(block).toContain('## Current datetime');
+    expect(block).toMatch(/Current datetime: 2026-06-05T14:30:00[+-]\d{2}:\d{2}/);
+    expect(block).toMatch(/Timezone: .+/);
+    expect(block).not.toContain('This datetime is authoritative');
+    expect(block).not.toContain('Current year:');
   });
 });
 
