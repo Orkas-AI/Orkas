@@ -1,5 +1,5 @@
 // ─── Marketplace (full-page panel: grid + detail sub-views) ───
-// Browse + install official agents / skills from the Orkas Server. Entered via the "More"
+// Browse + install approved agents / skills from the Orkas Server. Entered via the "More"
 // button on the agents / skills tabs (#agents-more-btn / #skills-more-btn — wired in state.js).
 //
 // Two sub-views inside panel-marketplace (mirrors the agents / skills panel shape):
@@ -14,10 +14,6 @@
 // Per-card Install button (in detail) materializes the cached item into the local
 // platform-install tree (<uid>/local/marketplace/{agents,skills}/<id>/).
 //
-// Dev-only upload (`openMarketplaceUpload`) is exposed for agents.js / skills.js (⋯ menu +
-// detail-page actions). Category is NO LONGER asked — it lives in the spec now (agent.json
-// `category` field / SKILL.md `category` frontmatter).
-
 let _mpState = null;
 let _mpBound = false;
 let _mpReturnView = 'agents';
@@ -44,7 +40,6 @@ let _mpCategoriesCache = (() => {
 const MP_UNKNOWN_CATEGORY_REFRESH_MIN_MS = 5 * 60 * 1000;
 let _mpUnknownCategoryRefreshAt = 0;
 let _mpUnknownCategoryRefreshInFlight = null;
-const MP_REVIEW_STATUSES = ['unreviewed', 'reviewing', 'approved', 'rejected', 'archived'];
 
 function _mpUnknownCategoryLabel() {
   const raw = t('marketplace.category_unknown');
@@ -54,19 +49,6 @@ function _mpUnknownCategoryLabel() {
 function _mpCanonicalCategoryCode(code) {
   const c = String(code || '').trim();
   return c === 'writing' ? 'creation' : c;
-}
-
-function _mpReviewStatusLabel(status) {
-  const s = String(status || '').trim();
-  if (!s) return '';
-  const key = `marketplace.status_${s}`;
-  const raw = t(key);
-  return raw && raw !== key ? raw : s;
-}
-
-function _mpStatusFilterLabel() {
-  const raw = t('marketplace.status_filter_dev');
-  return raw && raw !== 'marketplace.status_filter_dev' ? raw : 'Status (Dev)';
 }
 
 function _mpUnknownCategoryCodes(codes) {
@@ -727,30 +709,6 @@ function _mpRenderSearchClear() {
   clearBtn.hidden = !(input && input.value.length > 0);
 }
 
-function _mpRenderStatusSelect(panel) {
-  const labelEl = panel.querySelector('[data-mp-status-label]');
-  if (labelEl) labelEl.textContent = _mpStatusFilterLabel();
-  const el = panel.querySelector('[data-mp-status-select]');
-  if (!el || typeof _aiSelectMount !== 'function') return;
-  const options = [
-    { value: '', label: t('marketplace.status_all') },
-    ...MP_REVIEW_STATUSES.map((status) => ({
-      value: status,
-      label: _mpReviewStatusLabel(status),
-    })),
-  ];
-  _aiSelectMount(el, {
-    options,
-    value: _mpState.status || '',
-    placeholder: t('marketplace.status_all'),
-    onChange(value) {
-      if (!_mpState) return;
-      _mpState.status = value || '';
-      _mpRefreshListings();
-    },
-  });
-}
-
 // Re-point _mpState.agents/skills at the cached rows for the current (kind, category, q).
 // (Stale-response protection lives in `_mpLoadListingsPage`'s per-kind generation token.)
 function _mpHydrateFromCache() {
@@ -800,12 +758,12 @@ function _mpSpreadAllIntoCategoryCaches(kind, rows, q) {
 async function _mpLoadListingsPage(kind, { append, page }) {
   if (!_mpState._loadGen) _mpState._loadGen = { agent: 0, skill: 0 };
   const myGen = ++_mpState._loadGen[kind];
-  const cat = _mpState.category, status = _mpState.status, q = _mpState.q;
-  const key = _mpListingsKey(kind, cat, status, q);
+  const cat = _mpState.category, q = _mpState.q;
+  const key = _mpListingsKey(kind, cat, _mpState.status, q);
   const channel = kind === 'agent' ? 'marketplace.listAgents' : 'marketplace.listSkills';
   try {
     const r = await window.orkas.invoke(channel, {
-      category: cat || null, status: status || null, q: q || null, page, size: MP_LISTINGS_PAGE_SIZE,
+      category: cat || null, q: q || null, page, size: MP_LISTINGS_PAGE_SIZE,
     });
     if (_mpState._loadGen[kind] !== myGen) return;
     const rows = (r && r.list) || [];
@@ -883,7 +841,6 @@ function _mpRender() {
   }
   const searchEl = panel.querySelector('[data-mp-search]');
   if (searchEl) searchEl.setAttribute('placeholder', t('marketplace.search_ph'));
-  _mpRenderStatusSelect(panel);
   _mpRenderSearchBtn();
   _mpRenderSearchClear();
 
@@ -968,7 +925,6 @@ function _mpCardHtml(item, lang) {
   const installing = _mpState.installing.has(`${kind}:${item.id}`);
   const desc = pickDesc(item, lang) || '';
   const catLabel = _mpCategoryLabel(item.category, lang);
-  const statusLabel = _mpReviewStatusLabel(item.status || item.state);
   const versionLabel = t('marketplace.version').replace('{version}', String(item.version || ''));
   const avatar = kind === 'agent'
     ? renderAvatarHtml(item.icon, item.color, { size: 32, seed: item.id, extraClass: 'marketplace-card-avatar' })
@@ -1001,7 +957,6 @@ function _mpCardHtml(item, lang) {
         <div class="marketplace-card-meta">
           ${item.version ? `<span class="marketplace-card-chip is-version">${escapeHtml(versionLabel)}</span>` : ''}
           ${catLabel ? `<span class="marketplace-card-chip">${escapeHtml(catLabel)}</span>` : ''}
-          ${statusLabel ? `<span class="marketplace-card-chip is-status">${escapeHtml(statusLabel)}</span>` : ''}
         </div>
         <div class="marketplace-card-actions">
           <button type="button" class="${btnClass}" ${btnAttrs}>${btnSpinner}${escapeHtml(btnLabel)}</button>
@@ -1082,7 +1037,6 @@ function _mpRenderDetail() {
   const lang = getLang();
   const desc = pickDesc(item, lang) || '';
   const catLabel = _mpCategoryLabel(item.category, lang);
-  const statusLabel = _mpReviewStatusLabel(item.status || item.state);
   const versionLabel = t('marketplace.version').replace('{version}', String(item.version || ''));
   const status = _mpInstallStatus(kind, item);
   const installing = _mpState.installing.has(`${kind}:${item.id}`);
@@ -1107,7 +1061,6 @@ function _mpRenderDetail() {
   panel.querySelector('[data-mp-detail-meta]').innerHTML = [
     item.version ? `<span class="marketplace-card-chip is-version">${escapeHtml(versionLabel)}</span>` : '',
     catLabel ? `<span class="marketplace-card-chip">${escapeHtml(catLabel)}</span>` : '',
-    statusLabel ? `<span class="marketplace-card-chip is-status">${escapeHtml(statusLabel)}</span>` : '',
   ].filter(Boolean).join(' ');
   // (description used to render in a top-of-body `.marketplace-detail-desc` strip; now it's
   // the first section inside body — see `_mpAgentDetailHtml` / `_mpSkillDetailHtml`)

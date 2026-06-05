@@ -75,19 +75,15 @@ const log = createLogger('marketplace');
 
 // ── server URL ────────────────────────────────────────────────────────────
 // Profile-driven (mirrors Server `env/start/{dev_,}api_start.sh` — see PC/CLAUDE.md §1 +
-// Server CLAUDE.md §7): `ORKAS_PROFILE=global` (default) routes to overseas (`orkas.ai`),
-// `ORKAS_PROFILE=cn` routes to China (`orkas.work`). `run.sh` exports the env from its
-// positional arg (`./run.sh cn`). An explicit `ORKAS_API_BASE_URL` always wins.
-//
-// **No build-mode branch in this file on purpose** — OrkasOpen contract (per
-// `OpenSource/SyncCode/strip-rules.json`) bans `app.isPackaged` checks outside the two
-// whitelisted infra files. The "dev → local Server" default is set ONCE in `index.ts`
-// (which IS whitelisted) by pinning `process.env.ORKAS_API_BASE_URL=http://localhost:8888/api`
-// when `!app.isPackaged`, so every API base resolver picks it up uniformly — no scattered
-// build-mode logic in feature modules.
+// Server CLAUDE.md §7): `ORKAS_PROFILE=global` (default) routes to overseas prod
+// (`orkas.ai`), `ORKAS_PROFILE=cn` routes to China prod (`orkas.work`). Use the apex
+// hosts directly so POST marketplace calls do not first hit a www -> apex 301 redirect.
+// `run.sh` exports the env from its positional arg (`./run.sh cn`). An explicit
+// `ORKAS_API_BASE_URL` always wins for local debugging, but OrkasOpen never auto-pins
+// source-run builds to a dev Server.
 const PROFILE_BASES: Record<string, string> = {
-  global: 'https://www.orkas.ai/api',
-  cn:     'https://www.orkas.work/api',
+  global: 'https://orkas.ai/api',
+  cn:     'https://orkas.work/api',
 };
 
 export function apiBase(): string {
@@ -205,7 +201,7 @@ export async function listMarketplaceAgents(
 ): Promise<{ list: MarketplaceAgent[]; total: number }> {
   return await postJson('/marketplace/agents/list', {
     category: opts.category || null,
-    status: opts.status || null,
+    status: 'approved',
     q: opts.q || null,
     page: opts.page || 1,
     size: opts.size || 50,
@@ -217,7 +213,7 @@ export async function listMarketplaceSkills(
 ): Promise<{ list: MarketplaceSkill[]; total: number }> {
   return await postJson('/marketplace/skills/list', {
     category: opts.category || null,
-    status: opts.status || null,
+    status: 'approved',
     q: opts.q || null,
     page: opts.page || 1,
     size: opts.size || 50,

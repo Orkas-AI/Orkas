@@ -63,10 +63,6 @@ function _agentPlatformChipsHtml(a) {
     const catLabel = _resolveCategoryLabel(a.category, lang);
     parts.push(`<span class="agent-card-chip">${escapeHtml(catLabel)}</span>`);
   }
-  const reviewStatus = a.status || a.state;
-  if (reviewStatus && typeof _mpReviewStatusLabel === 'function') {
-    parts.push(`<span class="agent-card-chip is-status">${escapeHtml(_mpReviewStatusLabel(reviewStatus))}</span>`);
-  }
   return parts.join('');
 }
 
@@ -674,10 +670,6 @@ function _renderSourceMetaHtml(item) {
     const lang = (typeof getLang === 'function') ? getLang() : 'zh';
     const label = _resolveCategoryLabel(catCode, lang);
     parts.push(`<span class="agents-detail-source is-category">${escapeHtml(label)}</span>`);
-  }
-  const reviewStatus = item.status || item.state;
-  if (reviewStatus && typeof _mpReviewStatusLabel === 'function') {
-    parts.push(`<span class="agents-detail-source is-status">${escapeHtml(_mpReviewStatusLabel(reviewStatus))}</span>`);
   }
   return parts.join('');
 }

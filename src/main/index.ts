@@ -48,17 +48,9 @@ import './install-data-root.cjs';
 // edge case where productName isn't picked up early.
 app.setName('Orkas');
 
-// Dev = local Server. The PC has three API base resolvers (`features/account/server.ts`,
-// `features/marketplace.ts`, the `voice URL` IPC handler) and they all honour the
-// `ORKAS_API_BASE_URL` env var first — pinning it here once means every business call routes to
-// the local Server when running unpackaged (no scattered build-mode branches in feature modules).
-// Packaged builds: not set → each resolver falls back to its profile/prod default.
-// Explicit launcher env (`./dev.sh`, `ORKAS_API_BASE_URL=… ./run.sh`) wins, so a dev can still
-// repro a bug against a remote Server. `app.isPackaged` here is allowlisted in
-// `OpenSource/SyncCode/strip-rules.json::isPackaged_allowed_files`.
-if (!app.isPackaged && !process.env.ORKAS_API_BASE_URL) {
-  process.env.ORKAS_API_BASE_URL = 'http://localhost:8888/api';
-}
+// OrkasOpen uses the same public prod API defaults in source-run and packaged builds.
+// Keep `ORKAS_API_BASE_URL` as an explicit override only; otherwise marketplace resolves
+// by `ORKAS_PROFILE` (global -> orkas.ai, cn -> orkas.work) inside features/marketplace.ts.
 
 // Register the KB file protocol BEFORE `app.whenReady()` — privileged
 // schemes can't be added after. `kb-file:///<relpath>` serves a single

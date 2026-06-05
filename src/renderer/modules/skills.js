@@ -37,10 +37,6 @@ function _skillPlatformChipsHtml(s) {
     const catLabel = _resolveCategoryLabel(s.category, lang);
     parts.push(`<span class="skill-card-chip">${escapeHtml(catLabel)}</span>`);
   }
-  const reviewStatus = s.status || s.state;
-  if (reviewStatus && typeof _mpReviewStatusLabel === 'function') {
-    parts.push(`<span class="skill-card-chip is-status">${escapeHtml(_mpReviewStatusLabel(reviewStatus))}</span>`);
-  }
   return parts.join('');
 }
 
