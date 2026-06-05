@@ -61,7 +61,7 @@ import {
   writeAgentCache, writeSkillCache,
 } from './marketplace_cache';
 import {
-  addAgentInstall, addSkillInstall, removeAgentInstall, removeSkillInstall,
+  addAgentInstall, addSkillInstall, readInstalls, removeAgentInstall, removeSkillInstall,
 } from './marketplace_installs';
 import { withMarketplaceCacheLock, withMarketplaceInstallLock } from './marketplace_locks';
 import { createLogger } from '../logger';
@@ -635,61 +635,125 @@ async function _copyDirSkippingCacheMeta(src: string, dst: string): Promise<void
   }
 }
 
-// ── default install seed (fresh launch) ───────────────────────────────────
-// Goal: on the very first launch a user sees a curated baseline of official agents / skills
-// without lifting a finger. The server `POST /marketplace/defaults` returns the recommended
-// set (rows with `default_install=1`); we add a manifest row per item and let the standard
-// `marketplace_reconcile` pass fetch the actual content at boot.
+async function _seedAgentSkillDependencies(
+  uid: string,
+  agentId: string,
+  installedSkills: Set<string>,
+  deletedSkills: Set<string>,
+): Promise<{ seeded: number; blocked: boolean }> {
+  const detail = await postJson<{ agent_json: Record<string, unknown> }>(
+    '/marketplace/agents/detail', { id: agentId },
+  );
+  const skillList = Array.isArray(detail.agent_json?.skill_list)
+    ? (detail.agent_json.skill_list as unknown[]).filter((x): x is string => typeof x === 'string' && x.trim() !== '')
+    : [];
+  let seeded = 0;
+  for (const sid of skillList) {
+    if (installedSkills.has(sid)) continue;
+    if (deletedSkills.has(sid)) {
+      log.info(`skip default agent ${agentId}; dependency skill ${sid} was previously uninstalled`);
+      return { seeded, blocked: true };
+    }
+    try {
+      const meta = await postJson<{ bundle_url: string; version: string; published_at: number; updated_at?: number; create_uid?: string; default_install?: boolean; status?: string; state?: string }>(
+        '/marketplace/skills/bundle', { id: sid },
+      );
+      await addSkillInstall(uid, {
+        id: sid,
+        version: meta.version || '1.0.0',
+        published_at: meta.published_at || 0,
+        ...(typeof meta.updated_at === 'number' ? { updated_at: meta.updated_at } : {}),
+        bundle_url: meta.bundle_url || '',
+        create_uid: meta.create_uid || '',
+        ...((meta.status || meta.state) ? { status: meta.status || meta.state } : {}),
+        default_install: meta.default_install === true,
+      });
+      seeded++;
+      installedSkills.add(sid);
+    } catch (err) {
+      log.warn(`skip default agent ${agentId}; dependency skill ${sid} seed failed: ${(err as Error).message}`);
+      return { seeded, blocked: true };
+    }
+  }
+  return { seeded, blocked: false };
+}
+
+// ── default install seed (fresh launch + incremental additions) ───────────
+// Goal: users see a curated baseline of official agents / skills without lifting a finger.
+// The server `POST /marketplace/defaults` returns the current recommended set (rows with
+// `default_install=1`); we add a manifest row per missing item and let the standard
+// `marketplace_reconcile` pass fetch the actual content at boot. Default agents mirror the
+// manual install path's dependency rule: read `agent_json.skill_list` and seed missing skills
+// first, so the reconciled agent never lands without its required skills.
 //
-// **Why a separate marker (not manifest existence)**: manifest gets mutated row-by-row
-// during seed via `add*Install`. If the process crashes mid-loop, the manifest exists but is
-// incomplete — using it as the "already seeded" signal would skip seed forever, dropping
-// the remaining items. Instead we drop a marker file `.default-seeded.json` only AFTER every
-// row has been persisted. Failures (fetch / mid-loop crash / reconcile network error) leave
-// the marker absent → next launch retries; `add*Install` is upsert so previously-written
-// rows update in place. Once written, the marker is the permanent "don't pester" signal —
-// later uninstall of a default item does NOT cause it to reappear.
+// This is intentionally incremental, not one-shot: if the team marks a new marketplace item
+// as default later, existing users who have never installed/uninstalled that id should get it
+// on their next boot. User intent still wins: uninstall records a tombstone in
+// `installs.json::_deleted_at`, and tombstoned ids are never re-seeded automatically. If a
+// default agent depends on a tombstoned skill, the agent is skipped too rather than installed
+// in a broken state.
+//
+// The marker file records the last observed default id set for diagnostics and crash recovery.
+// It is written only AFTER every eligible row is persisted. If the process crashes mid-loop,
+// `add*Install` upserts make the next boot safe to retry.
 export async function ensureDefaultInstalls(uid: string): Promise<{ seeded_agents: number; seeded_skills: number }> {
   const markerFile = marketplaceDefaultsSeededFile(uid);
-  if (fs.existsSync(markerFile)) {
-    return { seeded_agents: 0, seeded_skills: 0 };
-  }
   try {
     const data = await postJson<{
       agents: { id: string; version: string; published_at: number; updated_at?: number; agent_json_url: string; create_uid?: string; status?: string; state?: string }[];
       skills: { id: string; version: string; published_at: number; updated_at?: number; bundle_url: string; create_uid?: string; status?: string; state?: string }[];
     }>('/marketplace/defaults', {});
+    const manifest = await readInstalls(uid);
+    const installedAgents = new Set(manifest.agents.map((a) => a.id));
+    const installedSkills = new Set(manifest.skills.map((s) => s.id));
+    const deletedAgents = new Set(Object.keys(manifest._deleted_at?.agents || {}));
+    const deletedSkills = new Set(Object.keys(manifest._deleted_at?.skills || {}));
     let seededAgents = 0;
     let seededSkills = 0;
     for (const a of data.agents || []) {
       if (!a || !a.id) continue;
-      await addAgentInstall(uid, {
-        id: a.id, version: a.version || '1.0.0',
-        published_at: a.published_at || 0,
-        ...(typeof a.updated_at === 'number' ? { updated_at: a.updated_at } : {}),
-        agent_json_url: a.agent_json_url || '',
-        create_uid: a.create_uid || '',
-        ...((a.status || a.state) ? { status: a.status || a.state } : {}),
-        default_install: true,
-      });
-      seededAgents++;
+      if (deletedAgents.has(a.id)) continue;
+      try {
+        const depSeed = await _seedAgentSkillDependencies(uid, a.id, installedSkills, deletedSkills);
+        seededSkills += depSeed.seeded;
+        if (installedAgents.has(a.id) || depSeed.blocked) continue;
+        await addAgentInstall(uid, {
+          id: a.id, version: a.version || '1.0.0',
+          published_at: a.published_at || 0,
+          ...(typeof a.updated_at === 'number' ? { updated_at: a.updated_at } : {}),
+          agent_json_url: a.agent_json_url || '',
+          create_uid: a.create_uid || '',
+          ...((a.status || a.state) ? { status: a.status || a.state } : {}),
+          default_install: true,
+        });
+        seededAgents++;
+        installedAgents.add(a.id);
+      } catch (err) {
+        log.warn(`skip default agent ${a.id}; seed failed: ${(err as Error).message}`);
+      }
     }
     for (const s of data.skills || []) {
       if (!s || !s.id) continue;
-      await addSkillInstall(uid, {
-        id: s.id, version: s.version || '1.0.0',
-        published_at: s.published_at || 0,
-        ...(typeof s.updated_at === 'number' ? { updated_at: s.updated_at } : {}),
-        bundle_url: s.bundle_url || '',
-        create_uid: s.create_uid || '',
-        ...((s.status || s.state) ? { status: s.status || s.state } : {}),
-        default_install: true,
-      });
-      seededSkills++;
+      if (installedSkills.has(s.id) || deletedSkills.has(s.id)) continue;
+      try {
+        await addSkillInstall(uid, {
+          id: s.id, version: s.version || '1.0.0',
+          published_at: s.published_at || 0,
+          ...(typeof s.updated_at === 'number' ? { updated_at: s.updated_at } : {}),
+          bundle_url: s.bundle_url || '',
+          create_uid: s.create_uid || '',
+          ...((s.status || s.state) ? { status: s.status || s.state } : {}),
+          default_install: true,
+        });
+        seededSkills++;
+        installedSkills.add(s.id);
+      } catch (err) {
+        log.warn(`skip default skill ${s.id}; seed failed: ${(err as Error).message}`);
+      }
     }
-    // Marker is written LAST so any crash above leaves a partially-seeded manifest + no
-    // marker → next launch retries the whole loop, and add*Install upserts the rows that
-    // were already there. Failure here (rare disk issue) likewise → retry next launch.
+    // Marker is written LAST so any crash above leaves a partially-seeded manifest + stale/no
+    // marker → next launch retries the whole loop, and add*Install upserts rows already there.
+    // Failure here (rare disk issue) likewise → retry next launch.
     await fsp.mkdir(userMarketplaceDirCloud(uid), { recursive: true });
     await fsp.writeFile(markerFile, JSON.stringify({
       seeded_at: Date.now(),
@@ -700,10 +764,10 @@ export async function ensureDefaultInstalls(uid: string): Promise<{ seeded_agent
     log.info(`seeded default installs: ${seededAgents} agent(s) + ${seededSkills} skill(s)`);
     return { seeded_agents: seededAgents, seeded_skills: seededSkills };
   } catch (err) {
-    // No marker written → next launch retries. Manifest may be partially populated; that's
-    // fine because `reconcileInstalls` will pick up the rows that are there and the next
-    // ensure pass will finish the rest.
-    log.warn(`default installs seed failed (will retry on next launch): ${(err as Error).message}`);
+    // Stale/no marker → next launch retries. Manifest may be partially populated; that's fine
+    // because `reconcileInstalls` will pick up rows that are there and the next ensure pass
+    // will finish the rest.
+    log.warn(`default installs incremental seed failed (will retry on next launch): ${(err as Error).message}`);
     return { seeded_agents: 0, seeded_skills: 0 };
   }
 }
