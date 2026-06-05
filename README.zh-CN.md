@@ -24,10 +24,7 @@
 
 ## 产品截图
 
-| ![指挥官智能调度](./resources/app-ui/指挥官.jpg)<br>**指挥官智能调度** | ![智能体并行协作](./resources/app-ui/智能体并行调度.jpg)<br>**智能体并行协作** |
-|:---:|:---:|
-| ![智能体串行协作](./resources/app-ui/智能体串行调度.jpg)<br>**智能体串行协作** | ![智能体管理](./resources/app-ui/智能体.jpg)<br>**智能体管理** |
-| ![技能库](./resources/app-ui/技能库.jpg)<br>**技能库** | |
+![Orkas 首页](./resources/app-ui/home-zh.jpg)
 
 ---
 

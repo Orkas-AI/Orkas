@@ -24,10 +24,7 @@
 
 ## Screenshots
 
-| ![Commander dispatch](./resources/app-ui/commander.jpg)<br>**Commander dispatch** | ![Parallel agent collaboration](./resources/app-ui/call_agents.jpg)<br>**Parallel agent collaboration** |
-|:---:|:---:|
-| ![Serial agent collaboration](./resources/app-ui/call_agent.jpg)<br>**Serial agent collaboration** | ![Agent management](./resources/app-ui/agents.jpg)<br>**Agent management** |
-| ![Skill library](./resources/app-ui/skills.jpg)<br>**Skill library** | |
+![Orkas home screen](./resources/app-ui/home-en.jpg)
 
 ---
 
