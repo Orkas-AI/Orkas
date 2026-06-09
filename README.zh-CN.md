@@ -1,83 +1,65 @@
-# Orkas — 开源多智能体 AI 桌面客户端，用对话组建并指挥你的 AI 智能体团队
+# Orkas
 
-**开源的多智能体 AI 桌面客户端，做 AI 工作流编排：用一段对话组建你的 AI 团队 —— 指挥官 LLM 组装智能体团队，并行或串行调度子智能体，并让智能体通过自我反思与技能沉淀持续演进。本地优先存储，自带 LLM 密钥（Claude · OpenAI · Gemini · DeepSeek · Kimi · GLM · Qwen · MiniMax · 豆包），跨 macOS / Windows / Linux 三端。给本地 agent 加一层零代码、图形化的团队编排 —— OpenClaw、Hermes-Agent、Claude Code、Codex 等本地 CLI agent 都可以无缝接入。**
+**开源、本地优先的桌面应用：在一个对话里组建并指挥一支 AI agent 团队，用你自己的大模型 key，可完全离线运行。支持 macOS · Windows · Linux。**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
+[![Stars](https://img.shields.io/github/stars/Orkas-AI/Orkas?style=social)](https://github.com/Orkas-AI/Orkas/stargazers)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-blue)](https://orkas.ai)
+[![Download](https://img.shields.io/badge/download-orkas.ai-black)](https://orkas.ai)
+[![X: @leochenpm](https://img.shields.io/badge/X-%40leochenpm-black?logo=x)](https://x.com/leochenpm)
 
 [English](./README.md) · [简体中文](./README.zh-CN.md)
 
-> **你的 AI 员工 · 开源 · 本地化 · 永远属于你**
->
-> AI 学习你的工作方式 · 全程私有 · 日后变成你的资产
+![Orkas 演示](./resources/app-ui/demo.mp4)
 
-**多智能体协作 · 智能体自我演进 · 本地优先存储 · 跨平台桌面应用**
-
-🌐 想要多设备同步、远程控制、团队协作等更多功能？→ [商业版](https://orkas.ai)
-
-> ⭐ 如果 Orkas 帮你做出了更好的 AI 工作流，欢迎点个 star，让更多人看到这个项目。
+> 一个指挥官 LLM 组建一支 sub-agent 团队，并行或串行地分派任务；agent 通过复盘自我进化。你的对话、文件和 API key 始终不离开本机。
 
 ---
 
-## 核心功能
+## Orkas 是什么？
 
-![核心功能](./resources/key-points-zh.png)
+- **它是什么** —— 一个桌面 GUI 应用，让你组建一支专精的 AI agent 团队，并在同一个对话里指挥它们。不是代码框架，也不是托管 SaaS。
+- **本地优先** —— 对话、文件、API key、知识库、自定义 agent 全部留在你的硬盘上。模型调用从你的机器直连服务商，绝不经过 Orkas 服务器。
+- **多 agent（指挥官 + sub-agent）** —— 一个指挥官 LLM 并行或串行地分派 sub-agent；每个 agent 拥有自己私有的技能与记忆，并在每次任务后自我进化。
+- **自带大模型 key** —— 接入 Claude、OpenAI、Gemini、DeepSeek、Kimi、GLM、Qwen、MiniMax、Doubao，不同 agent 可混用不同服务商，无厂商锁定。
 
----
-
-## 产品截图
-
-![Orkas 首页](./resources/app-ui/home-zh.jpg)
-
----
-
-## 核心设计
-
-> 完整设计与硬约束 → [`CLAUDE.md`](./CLAUDE.md)
-
-### 群聊：可见性切片 + 单一调度原语
-
-一个对话里同时坐着指挥官、N 个智能体、用户，但每个智能体看到的对话**不是同一份**。
-
-- **可见性切片**——主对话写一份全量 jsonl；每个智能体在自己的 `visibility/<aid>.jsonl` 里只拿到一个切片：`from==自己 ∨ to∋自己 ∨ mentions∋自己`。worker 只读自己的切片，**不读全量主对话**——既省 token，也防止私有上下文跨智能体泄漏
-- **单一调度原语**——所有派活（指挥官的 `dispatch_to`、用户文本里的 `@`、计划拆分出的步骤）都汇到同一个 `enqueue` 原语，没有并行调度路径。新增派活方式必须经过它，避免散出"谁能唤醒谁"的混乱
-- **共享 plan**——多智能体协作的进度由指挥官写在一份 `plan.md` 里，所有成员都看得到当前推进到哪一步
-
-### 智能体调度：结构化通道，不靠消息里的 @
-
-LLM 容易把 `@` 当 markdown 装饰打出来——在消息里识别 `@` 派活会反复误触发。所以：
-
-- **结构化派活**——指挥官与智能体之间的派活必须走 `dispatch_to({to, message})` 工具调用，是个结构化通道；散文里的 `@` 系统不识别为派活信号（用户的 `@` 仍走文本识别，UX 不变）
-- **延迟唤醒**——一次 `dispatch_to` 调用只 stage，收件人 worker 在指挥官当前 turn 完整收尾后才被唤醒，防止抢跑
-- **轮次维度兜底**——死循环防护按轮次（`MAX_WORKER_TURNS=100`）而不是按时间。LLM 慢但有产出 ≠ 死循环
-
-### 元认知自演进：meta/ + 自管技能
-
-每个智能体在自己的目录里维护两类"自我认知"，由智能体自己写：
-
-- **`meta/COMPETENCE.md`**——我擅长 / 不擅长什么
-- **`meta/LEARNING_STRATEGIES.md`**——我用过哪些有效的方法
-
-任务跑完后，由智能体自我反思并更新这两份文件；下次接到任务时，meta 会作为 system prompt 的一部分喂给它，**让经验真正影响下一次的行为**。
-
-另一条进化路径是 `skill_manage` 工具：智能体可以把"这次解决 X 的招式"固化成一个**只属于自己**的技能（私有 SkillStore，独立于全局技能库）。下次同类任务直接调用，不用每次重推。
+> ⭐ 如果 Orkas 对你有用，点个 star 能帮助更多人发现这个项目。
 
 ---
 
-## 为什么选 Orkas？
+## 你能用它做什么？
 
-Orkas 不是一个跨多个聊天平台陪着你的"个人 AI 助手"，也不是一个托管的 SaaS 平台 —— 它是一个桌面应用：你在里面组建一支专业分工的智能体团队，通过一个对话指挥它们干活。
+- **自动化周期性报告与市场调研** —— 一个 sub-agent 负责收集、汇总并产出每周报告。
+- **把产品需求拆成开发任务** —— 指挥官把 PRD 拆成任务，分派给多个 agent。
+- **与你的文档对话、做本地数据分析** —— 拖入文件，数据全程留在本机。
+- **编排现有 CLI agent** —— OpenClaw、Hermes-Agent、Claude Code、Codex 等本地 CLI agent 可作为后端接入并接收任务交接。
 
-| 工具 | 它是什么 | Orkas 的差异 |
+---
+
+## 下载
+
+- **获取应用** → [orkas.ai](https://orkas.ai)（macOS · Windows · Linux 安装包）
+- **从源码运行** → 见下方 [快速开始](#快速开始)
+
+---
+
+## Orkas 与同类工具对比
+
+| 工具 | 它是什么 | Orkas 的不同之处 |
 | --- | --- | --- |
-| **OpenClaw** | 在你自己的设备上跑的"个人 AI 助手"，覆盖你已经在用的各种聊天渠道。单用户、随时在线、原生入驻每个渠道 | Orkas 是桌面多智能体客户端：不是把同一个助手铺到每个渠道，而是让你组建一支专业分工的团队，在一个桌面对话里调度 —— 按 agent 切片可见性、共享 `plan.md`、每个 agent 自我演进。OpenClaw 也可作为 Orkas 的 CLI 后端接入，让 Orkas 智能体把活转交给你的 OpenClaw |
-| **Hermes-Agent** | Nous Research 出的自改进个人 AI agent —— TUI + 多渠道网关，自带学习闭环、定时任务，可以跑在便宜的 VPS 或无服务器架构上 | Orkas 是桌面 GUI、团队形态：指挥官 LLM 在一个对话里并行或串行调度*一支团队*；每个 agent 有自己私有的技能库与元认知，整套栈都在你机器上本地跑。Hermes-Agent 也可作为 Orkas 的 CLI 后端接入 |
-| **云端 agent 平台**（SaaS 多智能体编排） | 服务器托管，对话 / 文件 / 密钥都在厂商基础设施上 | Orkas 本地优先：对话、文件、API key、知识库、自定义智能体 / 技能 / 记忆全部留在你的机器上。模型 API 调用直接从你的机器发到模型供应商 —— 不经 Orkas 服务器，不存档 |
+| **LangChain** | 面向开发者的框架/库，用于构建 LLM 应用与 agent —— 代码优先，嵌入你自己的 Python/JS 应用中。 | Orkas 是 **无代码的桌面 GUI**：通过对话组建并指挥一支 agent 团队，而不是写编排代码。数据与 key 默认留在本地。 |
+| **CrewAI** | 一个 Python 框架，用于编排扮演角色的自治 agent —— 你用代码定义 crew 和 agent。 | Orkas 提供同样的多 agent 编排，但**无需写代码**，运行在桌面应用里，内置**本地优先存储**与每个 agent 的自我进化。 |
+| **云端 agent 平台**（SaaS 编排器） | 服务器托管；对话、文件、API key 都存在厂商的基础设施上。 | Orkas **本地优先**：一切留在你的机器上，模型 API 调用直连服务商 —— 绝不被 Orkas 归档。 |
+| **OpenClaw** | 一个常驻的单一个人助理，跨即时通讯渠道触达你。 | Orkas 在一个桌面对话里组建并指挥一支专精 agent *团队* —— 且 OpenClaw 可作为 Orkas 的 CLI 后端接入。 |
+| **Hermes-Agent** | Nous Research 的自我改进个人 agent（TUI + 多渠道网关）。 | Orkas 是桌面 GUI、团队化形态，每个 agent 拥有私有技能与元认知 —— 且 Hermes-Agent 可作为 Orkas 的 CLI 后端接入。 |
 
-**Orkas 适合你**：你想要的是一支*团队*，而不是一个跨渠道陪着你的个人助手；你想要桌面 GUI 与可视化的智能体管理；你希望数据、密钥、智能体都留在自己机器上，而不是托管在某家云上。
+**如果你想要的是：**一支 agent *团队*（而非单个助理）、一个支持拖入文件与可视化管理 agent 的桌面 GUI、并希望数据/key/agent 都在自己的硬盘上而非厂商云端 —— 那么 Orkas 适合你。
 
 ---
 
 ## 快速开始
 
-**要求**：Node 20+ · Python 3 · macOS / Windows 10+ / 较新 Linux
+**环境要求**：Node 20+ · Python 3 · macOS / Windows 10+ / 较新的 Linux
 
 ```bash
 git clone https://github.com/Orkas-AI/Orkas.git
@@ -86,21 +68,54 @@ cd Orkas
 run.cmd            # Windows
 ```
 
-`run.sh` / `run.cmd` 会自动安装依赖并下载嵌入模型（约 95 MB）。首次启动后会在 `~/.orkas/`（macOS / Linux）或 `<字母最小的非系统盘>:\.orkas\`（Windows）创建工作目录，然后**设置 → AI 模型供应商**配置 API key 或 OAuth。
+`run.sh` / `run.cmd` 会自动安装依赖并下载嵌入模型（约 95 MB）。首次启动会在 `~/.orkas/`（macOS / Linux）或 `<最小的非系统盘>:\.orkas\`（Windows）下创建工作区。随后进入 **设置 → AI 服务商** 配置 API key 或 OAuth。
 
-> ⭐ 把 Orkas 跑起来了？给仓库点个 star 吧，能帮项目走得更远。
+---
+
+## 截图
+
+![Orkas 主界面](./resources/app-ui/home-zh.jpg)
+
+---
+
+## 工作原理（核心设计）
+
+> 完整设计与硬约束 → [`CLAUDE.md`](./CLAUDE.md)
+
+### 群聊：可见性切片 + 单一调度原语
+
+一个对话里有指挥官、N 个 agent 和你 —— 但**每个 agent 看到的对话并不相同**。
+
+- **可见性切片** —— 主对话是一份完整 jsonl；每个 agent 只拿到属于自己的切片（`from==me ∨ to∋me ∨ mentions∋me`）。worker 永远读不到完整主对话 —— 既省 token，又防止私有上下文在 agent 间泄漏。
+- **单一调度原语** —— 每一次分派（指挥官的 `dispatch_to`、用户的 `@`、计划拆出的步骤）都汇入同一个 `enqueue` 原语，没有并行的路由路径。
+- **共享计划** —— 多 agent 协作时，指挥官把进度写进同一份 `plan.md`，对每个成员可见。
+
+### Agent 分派：结构化通道，而非散文里的 `@`
+
+- **结构化分派** —— 指挥官与 agent 之间的分派必须走 `dispatch_to({to, message})` 工具调用；散文里的 `@` 不被识别为分派信号（用户的 `@` 仍按文本识别 —— 用户体验不变）。
+- **延迟唤醒** —— 一次 `dispatch_to` 只做暂存；接收方 worker 要等指挥官当前回合结束后才被唤醒，避免过早执行。
+- **基于回合的安全停止** —— 失控保护计的是回合数（`MAX_WORKER_TURNS=100`）而非墙钟时间，因此一个慢但在推进的 LLM 不会被误杀。
+
+### 自我进化：`meta/` + 自管理技能
+
+每个 agent 在自己的目录里维护：
+
+- **`meta/COMPETENCE.md`** —— 我擅长什么 / 不擅长什么。
+- **`meta/LEARNING_STRATEGIES.md`** —— 对我有效的方法。
+
+每次任务后 agent 复盘并更新它们；下次任务时 `meta/` 会作为系统提示的一部分回喂进去，让经验真正影响下一次运行。通过 `skill_manage` 工具，agent 还能把"我是如何解决 X 的"结晶成一个**私有**技能，下次直接复用。
 
 ---
 
 ## 致谢
 
-项目中部分核心模块参考了以下开源项目，特别感谢：
+本项目部分核心模块参考了以下开源项目，特此致谢：
 
 - [OpenClaw](https://github.com/openclaw/openclaw)
 - [Hermes-Agent](https://github.com/NousResearch/hermes-agent)
 
 ---
 
-## License
+## 许可证
 
 [MIT](./LICENSE)
