@@ -12,8 +12,6 @@
 
 ![Orkas 演示](./resources/app-ui/demo.gif)
 
-[查看高清演示视频](./resources/app-ui/demo.mp4)
-
 > 一个指挥官 LLM 组建一支 sub-agent 团队，并行或串行地分派任务；agent 通过复盘自我进化。你的对话、文件和 API key 始终不离开本机。
 
 ---

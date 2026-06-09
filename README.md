@@ -12,8 +12,6 @@
 
 ![Orkas demo](./resources/app-ui/demo.gif)
 
-[Watch the HD demo video](./resources/app-ui/demo.mp4)
-
 > A commander LLM assembles a team of sub-agents and dispatches them in parallel or in series. Agents self-evolve through reflection. Your conversations, files, and API keys never leave your machine.
 
 ---
