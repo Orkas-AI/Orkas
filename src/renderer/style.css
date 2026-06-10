@@ -8876,29 +8876,6 @@ body.model-not-configured .main-content { flex-direction: column; }
 .settings-tab.has-dot.is-orange::after { background: var(--warn); }
 .settings-tab-pane[hidden] { display: none; }
 
-/* Subscription card (account tab). Layout: chip badge + status text on one
-   line, detail line beneath, action button on the right. Avatar slot omitted —
-   that slot is reserved for user identity in the Account card; using it for a
-   tier marker confused the visual hierarchy (FREE in a circle reads as a user
-   avatar). */
-
-/* Pro feature badge — inline in a card title to mark "this is Pro-gated"
-   when the current user isn't a Pro subscriber. Same chip shape + gradient as
-   the subscription card's PRO badge so the visual language stays consistent. */
-.settings-pro-badge {
-  display: inline-block;
-  margin-left: 8px;
-  padding: 1px 7px;
-  border-radius: 99px;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  background: linear-gradient(135deg, var(--primary), #8b7cf6);
-  color: #fff;
-  text-transform: uppercase;
-  vertical-align: 2px;
-}
-
 /* Sync status pill (data tab). Variants: default = success / is-syncing =
    primary / is-error = danger / is-paused = neutral. Follows P6 pill shape. */
 .settings-recycle-body {

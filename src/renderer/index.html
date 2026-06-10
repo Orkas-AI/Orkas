@@ -92,12 +92,12 @@
                 <div class="chat-attachments" id="new-chat-attachments" style="display:none"></div>
               </div>
               <textarea id="new-chat-input" data-i18n-placeholder="new_chat.input_placeholder" placeholder="Type @ to choose agents, skills, connectors." rows="2"></textarea>
-              <!-- Composer bottom bar: [+] | divider | [To] | [workspace - JS-injected] |
+                <!-- Composer bottom bar: [+] | divider | [To] | [workspace - JS-injected] |
                    [skill] | spacer | [send]. The send button owns the spacer. -->
-              <div class="chat-bottom-bar">
-                <button type="button" class="chat-attach-btn" id="new-chat-attach-btn" data-i18n-title="new_chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
-                <span class="chat-composer-divider" aria-hidden="true"></span>
-                <button type="button" class="chat-recipient-chip" id="new-chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Choose agent, skill, or connector">
+                <div class="chat-bottom-bar">
+                  <button type="button" class="chat-attach-btn" id="new-chat-attach-btn" data-i18n-title="new_chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
+                  <span class="chat-composer-divider" aria-hidden="true"></span>
+                  <button type="button" class="chat-recipient-chip" id="new-chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Choose agent, skill, or connector">
                   <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
                   <span class="chat-recipient-name" id="new-chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
                 </button>
@@ -1445,11 +1445,7 @@
   <script src="./modules/model-guard.js"></script>
   <script src="./modules/delete-file-confirm.js"></script>
   <script src="./modules/boot.js"></script>
-  <!-- Account login gate + Settings account card — stripped in OrkasOpen. login_panel.js must load
-       after boot.js (it calls bootApp); account_settings.js is invoked from settings.js::loadSettings. -->
-  <!-- Pro entitlement gate (renderer-side). Loads before sync so window.proGate
-       exists when those modules attach button handlers. Stripped in OrkasOpen. -->
-  <script src="./modules/pro_gate.js"></script>
+  <!-- Account login gate + Settings account card are stripped in OrkasOpen. -->
   <script src="./modules/avatar.js"></script>
   <script src="./modules/avatar-picker.js"></script>
   <script src="./modules/chat-input-form.js"></script>

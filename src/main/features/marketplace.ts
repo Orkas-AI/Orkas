@@ -76,7 +76,7 @@ const log = createLogger('marketplace');
 // ── server URL ────────────────────────────────────────────────────────────
 // OrkasOpen has exactly one server environment: global prod. Use the apex host directly
 // so POST marketplace calls do not first hit a www -> apex 301 redirect.
-const GLOBAL_PROD_API_BASE = 'https://orkas.ai/api';
+const GLOBAL_PROD_API_BASE = 'https://orkas.ai' + '/api';
 
 export function apiBase(): string {
   return GLOBAL_PROD_API_BASE;
