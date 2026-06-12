@@ -38,7 +38,7 @@
 
 ## Download
 
-- **Get the app** → [orkas.ai](https://orkas.ai) (macOS · Windows · Linux installers)
+- **Get the app** → [orkas.ai](https://orkas.ai) (macOS · Windows installers)
 - **Run from source** → see [Quick start](#quick-start) below
 
 ---

@@ -38,7 +38,7 @@
 
 ## 下载
 
-- **获取应用** → [orkas.ai](https://orkas.ai)（macOS · Windows · Linux 安装包）
+- **获取应用** → [orkas.ai](https://orkas.ai)（macOS · Windows 安装包）
 - **从源码运行** → 见下方 [快速开始](#快速开始)
 
 ---
