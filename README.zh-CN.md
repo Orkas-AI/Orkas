@@ -59,6 +59,14 @@
 
 ## 快速开始
 
+如果想直接安装，可以使用线上稳定安装包：
+
+- **macOS Apple 芯片** → [Orkas-mac-arm64.dmg](https://orkas-sg-1367889399.cos.ap-singapore.myqcloud.com/public/products/mac/latest/Orkas-mac-arm64.dmg)
+- **macOS Intel** → [Orkas-mac-x64.dmg](https://orkas-sg-1367889399.cos.ap-singapore.myqcloud.com/public/products/mac/latest/Orkas-mac-x64.dmg)
+- **Windows x64** → [Orkas-Setup.exe](https://orkas-sg-1367889399.cos.ap-singapore.myqcloud.com/public/products/win/latest/Orkas-Setup.exe)
+
+从源码运行：
+
 **环境要求**：Node 20+ · Python 3 · macOS / Windows 10+ / 较新的 Linux
 
 ```bash

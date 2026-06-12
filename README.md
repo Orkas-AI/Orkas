@@ -59,6 +59,14 @@
 
 ## Quick start
 
+Prefer the packaged app? Use the production installer links:
+
+- **macOS Apple Silicon** -> [Orkas-mac-arm64.dmg](https://orkas-sg-1367889399.cos.ap-singapore.myqcloud.com/public/products/mac/latest/Orkas-mac-arm64.dmg)
+- **macOS Intel** -> [Orkas-mac-x64.dmg](https://orkas-sg-1367889399.cos.ap-singapore.myqcloud.com/public/products/mac/latest/Orkas-mac-x64.dmg)
+- **Windows x64** -> [Orkas-Setup.exe](https://orkas-sg-1367889399.cos.ap-singapore.myqcloud.com/public/products/win/latest/Orkas-Setup.exe)
+
+To run from source:
+
 **Requirements**: Node 20+ · Python 3 · macOS / Windows 10+ / recent Linux
 
 ```bash
