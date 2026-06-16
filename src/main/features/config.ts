@@ -45,6 +45,10 @@ export interface UserPreferences {
    * `ORKAS_METACOGNITION='0'` remains a higher-priority kill switch.
    * Reads go through `features/metacognition.isFeatureEnabled`. */
   metacognition_enabled?: boolean;
+  /** Whether machine-global skill roots such as ~/.codex/skills are visible
+   * to commander open-tier skill search. Missing means enabled, preserving
+   * the historical OrkasOpen behavior. */
+  global_skill_roots_enabled?: boolean;
   /** Per-field update clocks used by cloud-sync to merge independent
    * preference changes without treating the whole JSON file as one blob. */
   _field_updated_at?: Record<string, number>;
@@ -106,7 +110,16 @@ export type AppConfig = UserPreferences;
 
 export function getLanguage(): Lang {
   const v = readPreferences().language;
-  return isLang(v) ? v : systemLanguage();
+  const lang = isLang(v) ? v : systemLanguage();
+  setCurrentLang(lang);
+  return lang;
+}
+
+export function getLanguageForUser(uid: string): Lang {
+  const v = readJsonSync<UserPreferences>(userPreferencesFile(uid)).language;
+  const lang = isLang(v) ? v : systemLanguage();
+  setCurrentLang(lang);
+  return lang;
 }
 
 export function setLanguage(lang: Lang): Lang {
@@ -176,6 +189,15 @@ export function getMetacognitionEnabled(): boolean {
 
 export function setMetacognitionEnabled(enabled: boolean): boolean {
   writePreferences({ metacognition_enabled: !!enabled });
+  return !!enabled;
+}
+
+export function getGlobalSkillRootsEnabled(): boolean {
+  return readPreferences().global_skill_roots_enabled !== false;
+}
+
+export function setGlobalSkillRootsEnabled(enabled: boolean): boolean {
+  writePreferences({ global_skill_roots_enabled: !!enabled });
   return !!enabled;
 }
 

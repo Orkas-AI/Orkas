@@ -10,7 +10,7 @@
  *      single path — the old dev/prod data-root split is gone. The side
  *      effect lives at module load (not in body code) because esbuild's
  *      CJS transformer hoists imports — `paths.ts` would otherwise load
- *      with an unset env var. See install-data-root.ts header.
+ *      with an unset env var. See install-data-root.cjs header.
  *   2. Pin CORE_AGENT_AUTH_DIR to <WS_ROOT>/config/ so core-agent's
  *      credential store lives under data/ (local-only, never synced).
  *      The env var name is core-agent's public API — kept as
@@ -35,10 +35,10 @@ import { app, BrowserWindow, Menu, ipcMain, nativeImage, protocol, session, shel
 // container, runs the one-shot PC/data → <container>/data migration, and
 // sets process.env.ORKAS_WORKSPACE_ROOT. Must be the FIRST project import
 // — any module loaded before this would not see the env var. See
-// install-data-root.ts header for why the side effect lives at load time
+// install-data-root.cjs header for why the side effect lives at load time
 // rather than in index.ts body (esbuild CJS hoists imports → body runs
 // after paths.ts loads, which is too late to set the env var).
-import './install-data-root';
+import './install-data-root.cjs';
 
 const APP_USER_MODEL_ID = 'com.orkas.desktop';
 
@@ -105,7 +105,7 @@ const log = createLogger('orkas');
 
 // Replay any pin / migration warnings buffered by install-data-root
 // (which runs before logger.ts can be imported) into the daily log.
-import { flushEarlyDiagnostics } from './install-data-root';
+import { flushEarlyDiagnostics } from './install-data-root.cjs';
 {
   const installLog = createLogger('install-data-root');
   flushEarlyDiagnostics((m) => installLog.warn(m));

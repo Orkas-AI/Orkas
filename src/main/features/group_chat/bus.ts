@@ -1584,15 +1584,8 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   let workingText = finalText || '';
   if (turnSyncConflictResolution.length && workingText && !errText && !aborted) {
     const results = extractSyncConflictResults(workingText);
-    const allowedIds = new Set(turnSyncConflictResolution.map((item) => item.id));
-    try {
-      const syncFeature = await import('../sync');
-      for (const result of results) {
-        if (!allowedIds.has(result.conflictId)) continue;
-        await syncFeature.completeConflictResolutionResult(uid, result);
-      }
-    } catch (err) {
-      log.warn(`sync conflict result apply failed cid=${cid}: ${(err as Error).message}`);
+    if (results.length) {
+      log.warn(`sync conflict result ignored in OrkasOpen cid=${cid}: sync feature is stripped`);
     }
   }
 

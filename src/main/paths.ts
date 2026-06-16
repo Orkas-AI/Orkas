@@ -4,7 +4,7 @@
  * All path constants live here — never hardcode paths elsewhere.
  *
  * Layout (dev and packaged both use this tree; the only platform variation
- * is in `<container>` — see install-data-root.ts):
+ * is in `<container>` — see install-data-root.cjs):
  *
  *   PC_ROOT/                      ← source + per-install binaries (asar-packed in prod)
  *     bootstrap.cjs package.json node_modules/ test/ docs/

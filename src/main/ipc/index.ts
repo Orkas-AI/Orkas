@@ -1137,20 +1137,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 
   'agents.update': async ({ agent_id, updates }) => {
     if (!agents.isValidAgentId(agent_id)) throw new Error('invalid agent_id');
-    let data = await agents.updateCustomAgent(agent_id, updates || {});
-    if (!data) {
-      try {
-        const dev = await import('../features/agents_dev');
-        data = await dev.updateBuiltinAgentSpec(agent_id, updates || {});
-      } catch (err) {
-        const code = (err as NodeJS.ErrnoException).code;
-        if (code === 'MODULE_NOT_FOUND' || code === 'ERR_MODULE_NOT_FOUND') {
-          data = null;
-        } else {
-          throw err;
-        }
-      }
-    }
+    const data = await agents.updateCustomAgent(agent_id, updates || {});
     if (!data) throw new Error('agent not found or read-only');
     return { agent: data };
   },

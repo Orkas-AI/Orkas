@@ -33,7 +33,8 @@ async function section(name: string, fn: () => void | Promise<void>): Promise<vo
     const { prompts, safeSubstitute } = await import('./prompts/loader');
 
     console.log('[smoke] paths');
-    await section('PC_ROOT ends with /PC', () => assert.ok(paths.PC_ROOT.endsWith('/PC')));
+    await section('PC_ROOT is repository root', () =>
+      assert.ok(fs.existsSync(path.join(paths.PC_ROOT, 'package.json'))));
     await section('APP_ROOT === PC_ROOT (flat layout)', () => assert.ok(paths.APP_ROOT === paths.PC_ROOT));
     await section('WS_ROOT derivable', () => assert.ok(paths.WS_ROOT.length > 0));
     await section('USERS_FILE at data root', () =>
