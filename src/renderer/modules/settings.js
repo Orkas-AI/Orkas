@@ -39,11 +39,6 @@ function _settingsTrackModelSelect(surface, provider, model) {
   _settingsTrackClick('model_model_select', payload);
 }
 
-function _settingsIsOpenUnsupported(id) {
-  const el = document.getElementById(id);
-  return !!(el && el.closest('[data-open-unsupported]'));
-}
-
 async function _settingsSafeCall(label, fn) {
   if (typeof fn !== 'function') return;
   try {
@@ -64,12 +59,8 @@ async function loadSettings() {
     _settingsSafeCall('settings providers refresh', _settingsRefreshProviders),
     _settingsSafeCall('settings entries refresh', _settingsRefreshEntries),
     _settingsSafeCall('settings local execution refresh', _settingsRefreshLocalExec),
-    _settingsIsOpenUnsupported('settings-search-provider')
-      ? Promise.resolve()
-      : _settingsSafeCall('settings search refresh', _settingsRefreshSearchProfiles),
-    _settingsIsOpenUnsupported('settings-image-provider')
-      ? Promise.resolve()
-      : _settingsSafeCall('settings image refresh', _settingsRefreshImageProfiles),
+    _settingsSafeCall('settings search refresh', _settingsRefreshSearchProfiles),
+    _settingsSafeCall('settings image refresh', _settingsRefreshImageProfiles),
     _settingsSafeCall('settings commander avatar refresh', _settingsRefreshCommanderAvatar),
     _settingsSafeCall('settings metacognition refresh', _settingsRefreshMetacognition),
     _settingsSafeCall('settings data root refresh', _settingsRefreshDataRoot),
@@ -77,12 +68,8 @@ async function loadSettings() {
   await _settingsSafeCall('settings picker render', _settingsRenderPicker);
   await _settingsSafeCall('settings entries render', _settingsRenderEntries);
   await _settingsSafeCall('settings local execution render', _settingsRenderLocalExec);
-  if (!_settingsIsOpenUnsupported('settings-search-provider')) {
-    await _settingsSafeCall('settings search render', _settingsRenderSearchSection);
-  }
-  if (!_settingsIsOpenUnsupported('settings-image-provider')) {
-    await _settingsSafeCall('settings image render', _settingsRenderImageSection);
-  }
+  await _settingsSafeCall('settings search render', _settingsRenderSearchSection);
+  await _settingsSafeCall('settings image render', _settingsRenderImageSection);
   await _settingsSafeCall('settings commander avatar render', _settingsRenderCommanderAvatar);
   await _settingsSafeCall('settings metacognition render', _settingsRenderMetacognition);
   await _settingsSafeCall('settings data root render', _settingsRenderDataRoot);
@@ -335,8 +322,8 @@ window.addEventListener('i18n-change', () => {
   _settingsRenderLocalExec();
   _settingsRenderPicker();
   _settingsRenderEntries();
-  if (!_settingsIsOpenUnsupported('settings-search-provider')) _settingsRenderSearchSection();
-  if (!_settingsIsOpenUnsupported('settings-image-provider')) _settingsRenderImageSection();
+  _settingsRenderSearchSection();
+  _settingsRenderImageSection();
   if (typeof _settingsRenderVideoSection === 'function') _settingsRenderVideoSection();
   _settingsRenderMetacognition();
 });

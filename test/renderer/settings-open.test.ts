@@ -32,10 +32,6 @@ function liveLines(raw: string) {
     .filter((line) => line && !line.startsWith('//') && !line.startsWith('*'));
 }
 
-function count(raw: string, needle: string) {
-  return raw.split(needle).length - 1;
-}
-
 describe('open-source Settings sync guards', () => {
   it('loads the standalone settings tabs module before settings.js', () => {
     const tabsScript = '<script src="./modules/settings_tabs.js"></script>';
@@ -50,15 +46,19 @@ describe('open-source Settings sync guards', () => {
     expect(indexHtml).toMatch(/class=["'][^"']*\bsettings-tab\b[^"']*\bis-active\b[^"']*["'][^>]*data-settings-tab=["']data["']/);
   });
 
-  it('keeps unsupported search and image provider controls hidden from Orkas', () => {
+  it('keeps BYO search and image provider controls visible and wired', () => {
     for (const controlId of ['settings-search-provider', 'settings-image-provider']) {
       const groupTag = previousSettingsGroupTag(controlId);
-      expect(groupTag).toMatch(/\bhidden\b/);
-      expect(groupTag).toMatch(/\bdata-open-unsupported=["']1["']/);
+      expect(groupTag).not.toMatch(/\bhidden\b/);
+      expect(groupTag).not.toMatch(/\bdata-open-unsupported=["']1["']/);
     }
+    expect(settingsJs).toContain('searchAuth.list');
+    expect(settingsJs).toContain('searchAuth.add');
+    expect(settingsJs).toContain('imageAuth.list');
+    expect(settingsJs).toContain('imageAuth.add');
   });
 
-  it('isolates settings refresh/render failures and skips hidden provider sections', () => {
+  it('isolates settings refresh/render failures while loading BYO provider sections', () => {
     expect(settingsJs).toContain('async function _settingsSafeCall');
 
     const loadSettingsStart = settingsJs.indexOf('async function loadSettings()');
@@ -68,15 +68,32 @@ describe('open-source Settings sync guards', () => {
     for (const marker of [
       "_settingsSafeCall('settings providers refresh'",
       "_settingsSafeCall('settings entries refresh'",
+      "_settingsSafeCall('settings search refresh'",
+      "_settingsSafeCall('settings image refresh'",
       "_settingsSafeCall('settings picker render'",
       "_settingsSafeCall('settings entries render'",
+      "_settingsSafeCall('settings search render'",
+      "_settingsSafeCall('settings image render'",
     ]) {
       expect(loadSettingsSnippet).toContain(marker);
     }
 
     expect(loadSettingsSnippet).not.toMatch(/await\s+Promise\.all\s*\(\s*\[\s*_settingsRefresh/);
-    expect(count(settingsJs, "_settingsIsOpenUnsupported('settings-search-provider')")).toBeGreaterThanOrEqual(2);
-    expect(count(settingsJs, "_settingsIsOpenUnsupported('settings-image-provider')")).toBeGreaterThanOrEqual(2);
+    expect(settingsJs).not.toContain('_settingsIsOpenUnsupported');
+  });
+
+  it('does not expose Orkas-managed search or image providers', () => {
+    for (const marker of [
+      ['Orkas', 'Search'].join('-'),
+      ['orkas', 'search'].join('-'),
+      ['orkas', 'search'].join('_'),
+      ['Orkas', 'Image'].join('-'),
+      ['orkas', 'image'].join('-'),
+      ['orkas', 'image'].join('_'),
+    ]) {
+      expect(settingsJs).not.toContain(marker);
+      expect(indexHtml).not.toContain(marker);
+    }
   });
 
   it('does not leave bare PC-only settings renderer calls after stripping', () => {
