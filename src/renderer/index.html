@@ -1180,6 +1180,15 @@
     <div class="agent-row-menu-item is-danger" data-action="delete" data-i18n="agents.delete">Delete</div>
   </div>
 
+  <!-- Add-account modal (settings page) -->
+  <div class="modal-overlay" id="add-account-modal">
+    <div class="modal add-account-modal">
+      <h3 id="add-account-title" data-i18n="add_account.title">Add account</h3>
+      <div class="add-account-body" id="add-account-body"></div>
+      <div class="modal-actions" id="add-account-actions"></div>
+    </div>
+  </div>
+
   <!-- Auto-task create / edit modal (see modules/auto.js). Reused by the
        Automation tab AND the project-detail page's "自动化" tab. Opens via
        `window.openAutoTaskDialog({ task?, projectId?, onSaved? })`. -->

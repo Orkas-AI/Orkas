@@ -60,6 +60,27 @@ describe('open-source Settings sync guards', () => {
     expect(settingsJs).toContain('videoAuth.add');
   });
 
+  it('keeps model authorization add flow usable after open-source stripping', () => {
+    for (const id of [
+      'settings-picker-provider',
+      'settings-picker-model',
+      'settings-add-entry-btn',
+      'settings-picker-status',
+      'add-account-modal',
+      'add-account-title',
+      'add-account-body',
+      'add-account-actions',
+    ]) {
+      expect(indexHtml).toContain(`id="${id}"`);
+    }
+
+    expect(settingsJs).not.toContain('addBtnBound');
+    expect(settingsJs).toContain('addBtnEl');
+    expect(settingsJs).toContain('_settingsState.addBtnEl !== addBtn');
+    expect(settingsJs).toContain('_settingsState.pickerProviderEl !== providerEl');
+    expect(settingsJs).toContain('_settingsState.pickerModelEl !== modelEl');
+  });
+
   it('isolates settings refresh/render failures while loading BYO provider sections', () => {
     expect(settingsJs).toContain('async function _settingsSafeCall');
 

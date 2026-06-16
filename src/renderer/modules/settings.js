@@ -17,7 +17,9 @@ let _settingsState = {
   modelsCache: {},    // provider → [{id, name}]
   pickerProviderSel: null,
   pickerModelSel: null,
-  addBtnBound: false,
+  pickerProviderEl: null,
+  pickerModelEl: null,
+  addBtnEl: null,
   dragState: null,
   clientConfigBound: false,
 };
@@ -374,7 +376,11 @@ async function _settingsRenderPicker() {
     return { value: p.id, label, hint };
   });
 
-  if (!_settingsState.pickerProviderSel) {
+  const prevProvider = _settingsState.pickerProviderSel?.getValue()
+    || providerEl.dataset.value
+    || '';
+  if (!_settingsState.pickerProviderSel || _settingsState.pickerProviderEl !== providerEl) {
+    _settingsState.pickerProviderEl = providerEl;
     _settingsState.pickerProviderSel = _aiSelectMount(providerEl, {
       placeholder: t('settings.picker.select_provider'),
     });
@@ -384,13 +390,16 @@ async function _settingsRenderPicker() {
       _settingsSetStatus('settings-picker-status', '', '');
     });
   }
-  const prevProvider = _settingsState.pickerProviderSel.getValue();
   _settingsState.pickerProviderSel.setOptions(providerOptions, {
     value: prevProvider,
     placeholder: t('settings.picker.select_provider'),
   });
 
-  if (!_settingsState.pickerModelSel) {
+  const prevModel = _settingsState.pickerModelSel?.getValue()
+    || modelEl.dataset.value
+    || '';
+  if (!_settingsState.pickerModelSel || _settingsState.pickerModelEl !== modelEl) {
+    _settingsState.pickerModelEl = modelEl;
     _settingsState.pickerModelSel = _aiSelectMount(modelEl, {
       placeholder: t('settings.picker.pick_provider_first'),
     });
@@ -401,12 +410,12 @@ async function _settingsRenderPicker() {
   }
   await _settingsPopulatePickerModel(
     _settingsState.pickerProviderSel.getValue(),
-    _settingsState.pickerModelSel.getValue(),
+    prevModel,
   );
 
   const addBtn = document.getElementById('settings-add-entry-btn');
-  if (addBtn && !_settingsState.addBtnBound) {
-    _settingsState.addBtnBound = true;
+  if (addBtn && _settingsState.addBtnEl !== addBtn) {
+    _settingsState.addBtnEl = addBtn;
     addBtn.addEventListener('click', _settingsClickAddEntry);
   }
 }
