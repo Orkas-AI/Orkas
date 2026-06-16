@@ -65,9 +65,13 @@ describe('open-source Settings sync guards', () => {
     expect(indexHtml).toContain('id="settings-video-provider"');
     expect(indexHtml).not.toContain('id="settings-video-model"');
     expect(settingsJs).not.toContain('videoModelSel');
+    expect(settingsJs).not.toContain('videoModelsByProvider');
+    expect(settingsJs).not.toContain('modelsByProvider');
+    expect(settingsJs).not.toContain('_videoModelLabel');
     expect(settingsJs).not.toContain('_settingsRenderVideoModelPicker');
     expect(settingsJs).not.toContain('settings.video.pick_model');
     expect(settingsJs).not.toContain('settings.video.error_model_needed');
+    expect(settingsJs).not.toContain('Seedance 2.0');
 
     expect(settingsJs).toContain('DouBao · Seedream');
     expect(settingsJs).not.toContain('Seedream 3.0');

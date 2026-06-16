@@ -1330,33 +1330,15 @@ const _VIDEO_AUTH_PROVIDER_OPTIONS = [
   { id: 'doubao', label: 'DouBao · Seedance', docs: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey' },
 ];
 
-const _VIDEO_AUTH_MODELS_BY_PROVIDER = {
-  doubao: [
-    { id: 'doubao-seedance-2-0-260128', name: 'Seedance 2.0' },
-  ],
-};
-
 function _settingsVideoProviderOptions() {
   return Array.isArray(_settingsState.videoAuthProviderOptions) && _settingsState.videoAuthProviderOptions.length
     ? _settingsState.videoAuthProviderOptions
     : _VIDEO_AUTH_PROVIDER_OPTIONS;
 }
 
-function _settingsVideoModelsByProvider() {
-  return _settingsState.videoModelsByProvider && typeof _settingsState.videoModelsByProvider === 'object'
-    ? _settingsState.videoModelsByProvider
-    : _VIDEO_AUTH_MODELS_BY_PROVIDER;
-}
-
 function _videoProviderLabel(id) {
   const hit = _settingsVideoProviderOptions().find((p) => p.id === id);
   return hit ? hit.label : id;
-}
-
-function _videoModelLabel(provider, model) {
-  const list = _settingsVideoModelsByProvider()[provider] || [];
-  const hit = list.find((m) => m.id === model);
-  return hit ? hit.name : model;
 }
 
 function _settingsSelectedVideoProvider() {
@@ -1371,9 +1353,6 @@ async function _settingsRefreshVideoProfiles() {
   _settingsState.videoAuthProviderOptions = (res && res.ok && Array.isArray(res.providers) && res.providers.length)
     ? res.providers
     : _VIDEO_AUTH_PROVIDER_OPTIONS;
-  _settingsState.videoModelsByProvider = (res && res.ok && res.modelsByProvider && typeof res.modelsByProvider === 'object')
-    ? res.modelsByProvider
-    : _VIDEO_AUTH_MODELS_BY_PROVIDER;
 }
 
 function _settingsRenderVideoSection() {
@@ -1456,8 +1435,6 @@ function _settingsRenderVideoEntries() {
     primary.className = 'entry-primary';
     primary.innerHTML = `
       <span class="entry-provider">${escapeHtml(_videoProviderLabel(p.provider))}</span>
-      <span class="entry-sep">·</span>
-      <span class="entry-model">${escapeHtml(_videoModelLabel(p.provider, p.model))}</span>
       <span class="entry-sep">·</span>
       <span class="entry-account-chip">@ ${escapeHtml(p.label || 'default')}</span>
       ${p.apiKeyMasked ? `<span class="account-mask">${escapeHtml(p.apiKeyMasked)}</span>` : ''}

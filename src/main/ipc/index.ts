@@ -1710,9 +1710,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'videoAuth.list':     async () => ({
     ok: true,
     providers: videoAuth.listVideoProviderOptions(),
-    modelsByProvider: videoAuth.listVideoModelsByProvider(),
     profiles: videoAuth.listVideoProfiles().map((p) => ({
-      id: p.id, provider: p.provider, model: p.model, label: p.label, createdAt: p.createdAt,
+      id: p.id, provider: p.provider, label: p.label, createdAt: p.createdAt,
       apiKeyMasked: auth.maskKey(p.apiKey),
     })),
   }),
