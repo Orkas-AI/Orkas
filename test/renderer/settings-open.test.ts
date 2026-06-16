@@ -46,8 +46,8 @@ describe('open-source Settings sync guards', () => {
     expect(indexHtml).toMatch(/class=["'][^"']*\bsettings-tab\b[^"']*\bis-active\b[^"']*["'][^>]*data-settings-tab=["']data["']/);
   });
 
-  it('keeps BYO search and image provider controls visible and wired', () => {
-    for (const controlId of ['settings-search-provider', 'settings-image-provider']) {
+  it('keeps BYO search, image, and video provider controls visible and wired', () => {
+    for (const controlId of ['settings-search-provider', 'settings-image-provider', 'settings-video-provider']) {
       const groupTag = previousSettingsGroupTag(controlId);
       expect(groupTag).not.toMatch(/\bhidden\b/);
       expect(groupTag).not.toMatch(/\bdata-open-unsupported=["']1["']/);
@@ -56,6 +56,8 @@ describe('open-source Settings sync guards', () => {
     expect(settingsJs).toContain('searchAuth.add');
     expect(settingsJs).toContain('imageAuth.list');
     expect(settingsJs).toContain('imageAuth.add');
+    expect(settingsJs).toContain('videoAuth.list');
+    expect(settingsJs).toContain('videoAuth.add');
   });
 
   it('isolates settings refresh/render failures while loading BYO provider sections', () => {
@@ -70,10 +72,12 @@ describe('open-source Settings sync guards', () => {
       "_settingsSafeCall('settings entries refresh'",
       "_settingsSafeCall('settings search refresh'",
       "_settingsSafeCall('settings image refresh'",
+      "_settingsSafeCall('settings video refresh'",
       "_settingsSafeCall('settings picker render'",
       "_settingsSafeCall('settings entries render'",
       "_settingsSafeCall('settings search render'",
       "_settingsSafeCall('settings image render'",
+      "_settingsSafeCall('settings video render'",
     ]) {
       expect(loadSettingsSnippet).toContain(marker);
     }
@@ -82,7 +86,7 @@ describe('open-source Settings sync guards', () => {
     expect(settingsJs).not.toContain('_settingsIsOpenUnsupported');
   });
 
-  it('does not expose Orkas-managed search or image providers', () => {
+  it('does not expose Orkas-managed search, image, or video providers', () => {
     for (const marker of [
       ['Orkas', 'Search'].join('-'),
       ['orkas', 'search'].join('-'),
@@ -90,6 +94,9 @@ describe('open-source Settings sync guards', () => {
       ['Orkas', 'Image'].join('-'),
       ['orkas', 'image'].join('-'),
       ['orkas', 'image'].join('_'),
+      ['Orkas', 'Video'].join('-'),
+      ['orkas', 'video'].join('-'),
+      ['orkas', 'video'].join('_'),
     ]) {
       expect(settingsJs).not.toContain(marker);
       expect(indexHtml).not.toContain(marker);
@@ -98,9 +105,6 @@ describe('open-source Settings sync guards', () => {
 
   it('does not leave bare PC-only settings renderer calls after stripping', () => {
     for (const line of liveLines(settingsJs)) {
-      if (/_settingsRenderVideoSection\s*\(\s*\)/.test(line)) {
-        expect(line).toMatch(/typeof\s+_settingsRenderVideoSection\s*===\s*['"]function['"]/);
-      }
       expect(line).not.toMatch(/\brender(?:Account|Subscription)Settings\s*\(/);
     }
   });

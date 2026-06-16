@@ -44,6 +44,7 @@ import * as search from '../features/search';
 import * as auth from '../features/auth';
 import * as imageAuth from '../features/image_auth';
 import * as searchAuth from '../features/search_auth';
+import * as videoAuth from '../features/video_auth';
 import * as permissions from '../features/permissions';
 import * as appConfig from '../features/config';
 import * as avatars from '../features/avatars';
@@ -1704,6 +1705,20 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'imageAuth.remove':   async ({ id }) => imageAuth.removeImageProfile(id),
   'imageAuth.reorder':  async ({ orderedIds }) => imageAuth.reorderImageProfiles(orderedIds || []),
   'imageAuth.test':     async ({ id }) => imageAuth.testImageProfile(id),
+
+  // ── Video-generation API key (independent from chat/image entries) ──
+  'videoAuth.list':     async () => ({
+    ok: true,
+    providers: videoAuth.listVideoProviderOptions(),
+    modelsByProvider: videoAuth.listVideoModelsByProvider(),
+    profiles: videoAuth.listVideoProfiles().map((p) => ({
+      id: p.id, provider: p.provider, model: p.model, label: p.label, createdAt: p.createdAt,
+      apiKeyMasked: auth.maskKey(p.apiKey),
+    })),
+  }),
+  'videoAuth.add':      async ({ provider, model, apiKey, label }) => videoAuth.addVideoProfile({ provider, model, apiKey, label }),
+  'videoAuth.remove':   async ({ id }) => videoAuth.removeVideoProfile(id),
+  'videoAuth.reorder':  async ({ orderedIds }) => videoAuth.reorderVideoProfiles(orderedIds || []),
 
   // ── Search-tool API key (overrides built-in keyless web_search) ──
   'searchAuth.list':    async () => ({

@@ -1010,6 +1010,32 @@
                 </div>
               </div>
 
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.video.title">Video generation API Key</div>
+                  <div class="settings-group-sub" data-i18n="settings.video.sub">API key for video generation providers.</div>
+                </div>
+                <div class="settings-row">
+                  <label data-i18n="settings.video.provider">Provider</label>
+                  <div class="ai-select" id="settings-video-provider"></div>
+                </div>
+                <div class="settings-row">
+                  <label data-i18n="settings.video.model">Model</label>
+                  <div class="ai-select" id="settings-video-model"></div>
+                </div>
+                <div class="settings-row" id="settings-video-key-row">
+                  <label data-i18n="settings.video.api_key">API Key</label>
+                  <input type="text" class="form-input" id="settings-video-key-input" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="settings-row">
+                  <button class="btn btn-primary" id="settings-video-add-btn" data-i18n="settings.video.add">+ Add video key</button>
+                  <span class="settings-status" id="settings-video-status"></span>
+                </div>
+                <div class="settings-entries" id="settings-video-entries">
+                  <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
+                </div>
+              </div>
+
             </div>
 
           </div>

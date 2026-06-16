@@ -61,6 +61,7 @@ async function loadSettings() {
     _settingsSafeCall('settings local execution refresh', _settingsRefreshLocalExec),
     _settingsSafeCall('settings search refresh', _settingsRefreshSearchProfiles),
     _settingsSafeCall('settings image refresh', _settingsRefreshImageProfiles),
+    _settingsSafeCall('settings video refresh', _settingsRefreshVideoProfiles),
     _settingsSafeCall('settings commander avatar refresh', _settingsRefreshCommanderAvatar),
     _settingsSafeCall('settings metacognition refresh', _settingsRefreshMetacognition),
     _settingsSafeCall('settings data root refresh', _settingsRefreshDataRoot),
@@ -70,6 +71,7 @@ async function loadSettings() {
   await _settingsSafeCall('settings local execution render', _settingsRenderLocalExec);
   await _settingsSafeCall('settings search render', _settingsRenderSearchSection);
   await _settingsSafeCall('settings image render', _settingsRenderImageSection);
+  await _settingsSafeCall('settings video render', _settingsRenderVideoSection);
   await _settingsSafeCall('settings commander avatar render', _settingsRenderCommanderAvatar);
   await _settingsSafeCall('settings metacognition render', _settingsRenderMetacognition);
   await _settingsSafeCall('settings data root render', _settingsRenderDataRoot);
@@ -324,7 +326,7 @@ window.addEventListener('i18n-change', () => {
   _settingsRenderEntries();
   _settingsRenderSearchSection();
   _settingsRenderImageSection();
-  if (typeof _settingsRenderVideoSection === 'function') _settingsRenderVideoSection();
+  _settingsRenderVideoSection();
   _settingsRenderMetacognition();
 });
 
@@ -1303,6 +1305,219 @@ function _settingsRenderImageEntries() {
       onSuccess: async () => {
         await _settingsRefreshImageProfiles();
         _settingsRenderImageEntries();
+      },
+    });
+
+    container.appendChild(row);
+  });
+}
+
+// ── Video generation API key section ────────────────────────────────────
+//
+// Dedicated BYO video-generation credentials. The open-source build exposes
+// user-owned provider keys only; managed Orkas video providers stay stripped.
+
+const _VIDEO_AUTH_PROVIDER_OPTIONS = [
+  { id: 'doubao', label: 'DouBao', docs: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey' },
+];
+
+const _VIDEO_AUTH_MODELS_BY_PROVIDER = {
+  doubao: [
+    { id: 'doubao-seedance-2-0-260128', name: 'Seedance 2.0' },
+  ],
+};
+
+function _settingsVideoProviderOptions() {
+  return Array.isArray(_settingsState.videoAuthProviderOptions) && _settingsState.videoAuthProviderOptions.length
+    ? _settingsState.videoAuthProviderOptions
+    : _VIDEO_AUTH_PROVIDER_OPTIONS;
+}
+
+function _settingsVideoModelsByProvider() {
+  return _settingsState.videoModelsByProvider && typeof _settingsState.videoModelsByProvider === 'object'
+    ? _settingsState.videoModelsByProvider
+    : _VIDEO_AUTH_MODELS_BY_PROVIDER;
+}
+
+function _videoProviderLabel(id) {
+  const hit = _settingsVideoProviderOptions().find((p) => p.id === id);
+  return hit ? hit.label : id;
+}
+
+function _videoModelLabel(provider, model) {
+  const list = _settingsVideoModelsByProvider()[provider] || [];
+  const hit = list.find((m) => m.id === model);
+  return hit ? hit.name : model;
+}
+
+function _settingsSelectedVideoProvider() {
+  return _settingsState.videoProviderSel?.getValue()
+    || document.getElementById('settings-video-provider')?.dataset?.value
+    || '';
+}
+
+function _videoDefaultModel(provider) {
+  return (_settingsVideoModelsByProvider()[provider] || [])[0]?.id || '';
+}
+
+function _settingsSelectedVideoModel() {
+  return _settingsState.videoModelSel?.getValue()
+    || document.getElementById('settings-video-model')?.dataset?.value
+    || _videoDefaultModel(_settingsSelectedVideoProvider())
+    || '';
+}
+
+async function _settingsRefreshVideoProfiles() {
+  const res = await window.orkas.invoke('videoAuth.list');
+  _settingsState.videoProfiles = (res && res.ok && Array.isArray(res.profiles)) ? res.profiles : [];
+  _settingsState.videoAuthProviderOptions = (res && res.ok && Array.isArray(res.providers) && res.providers.length)
+    ? res.providers
+    : _VIDEO_AUTH_PROVIDER_OPTIONS;
+  _settingsState.videoModelsByProvider = (res && res.ok && res.modelsByProvider && typeof res.modelsByProvider === 'object')
+    ? res.modelsByProvider
+    : _VIDEO_AUTH_MODELS_BY_PROVIDER;
+}
+
+function _settingsRenderVideoSection() {
+  _settingsRenderVideoPicker();
+  _settingsRenderVideoEntries();
+}
+
+function _settingsRenderVideoPicker() {
+  const providerEl = document.getElementById('settings-video-provider');
+  const modelEl = document.getElementById('settings-video-model');
+  if (!providerEl) return;
+  if (!_settingsState.videoProviderSel) {
+    _settingsState.videoProviderSel = _aiSelectMount(providerEl, {
+      placeholder: t('settings.video.pick_provider'),
+    });
+    _settingsState.videoProviderSel.onChange((provider) => {
+      _settingsTrackModelProviderSelect('video_auth_picker', provider);
+      if (modelEl) _settingsRenderVideoModelPicker(provider);
+      _settingsSetStatus('settings-video-status', '', '');
+    });
+  }
+  if (modelEl && !_settingsState.videoModelSel) {
+    _settingsState.videoModelSel = _aiSelectMount(modelEl, {
+      placeholder: t('settings.video.pick_model'),
+    });
+    _settingsState.videoModelSel.onChange((model) => {
+      _settingsTrackModelSelect('video_auth_picker', _settingsState.videoProviderSel?.getValue(), model);
+      _settingsSetStatus('settings-video-status', '', '');
+    });
+  }
+  const prevProvider = _settingsState.videoProviderSel.getValue();
+  _settingsState.videoProviderSel.setOptions(
+    _settingsVideoProviderOptions().map((p) => ({
+      value: p.id,
+      label: p.label || p.id,
+      hint: p.docs,
+    })),
+    { value: prevProvider || '', placeholder: t('settings.video.pick_provider') },
+  );
+  if (modelEl) _settingsRenderVideoModelPicker(_settingsState.videoProviderSel.getValue());
+  const addBtn = document.getElementById('settings-video-add-btn');
+  if (addBtn && !addBtn.dataset.bound) {
+    addBtn.dataset.bound = '1';
+    addBtn.addEventListener('click', _settingsClickAddVideoKey);
+  }
+}
+
+function _settingsRenderVideoModelPicker(provider) {
+  const sel = _settingsState.videoModelSel;
+  if (!sel) return;
+  const list = _settingsVideoModelsByProvider()[provider] || [];
+  const prev = sel.getValue();
+  const nextValue = list.some((m) => m.id === prev) ? prev : (list[0]?.id || '');
+  sel.setOptions(
+    list.map((m) => ({ value: m.id, label: m.name || m.id })),
+    { value: nextValue, placeholder: t('settings.video.pick_model') },
+  );
+}
+
+async function _settingsClickAddVideoKey() {
+  const provider = _settingsSelectedVideoProvider();
+  const model = _settingsSelectedVideoModel();
+  const input = document.getElementById('settings-video-key-input');
+  const apiKey = (input?.value || '').trim();
+  if (!provider) { _settingsSetStatus('settings-video-status', 'error', t('settings.video.error_provider_needed')); return; }
+  if (!model) { _settingsSetStatus('settings-video-status', 'error', t('settings.video.error_model_needed')); return; }
+  if (!apiKey) { _settingsSetStatus('settings-video-status', 'error', t('settings.video.error_key_needed')); return; }
+  _settingsSetStatus('settings-video-status', 'busy', t('settings.video.adding'));
+  try {
+    const res = await window.orkas.invoke('videoAuth.add', { provider, model, apiKey, label: 'default' });
+    if (!res || !res.ok) {
+      _settingsSetStatus('settings-video-status', 'error', (res && res.error) || t('settings.video.add_failed'));
+      return;
+    }
+    if (input) input.value = '';
+    _settingsSetStatus('settings-video-status', 'ok', t('settings.video.add_ok'));
+    await _settingsRefreshVideoProfiles();
+    _settingsRenderVideoEntries();
+  } catch (err) {
+    _settingsSetStatus('settings-video-status', 'error', (err && err.message) || String(err));
+  }
+}
+
+function _settingsRenderVideoEntries() {
+  const container = document.getElementById('settings-video-entries');
+  if (!container) return;
+  container.innerHTML = '';
+  const list = _settingsState.videoProfiles || [];
+  if (!list.length) {
+    container.innerHTML = `<div class="settings-empty">${escapeHtml(t('settings.video.empty'))}</div>`;
+    return;
+  }
+  list.forEach((p, idx) => {
+    const row = document.createElement('div');
+    row.className = 'entry-row' + (idx === 0 ? ' is-default' : '');
+    row.dataset.profileId = p.id;
+
+    const rank = document.createElement('div');
+    rank.className = 'entry-rank';
+    rank.textContent = idx === 0 ? t('settings.video.active_tag') : `#${idx + 1}`;
+    row.appendChild(rank);
+
+    const main = document.createElement('div');
+    main.className = 'entry-main';
+    const primary = document.createElement('div');
+    primary.className = 'entry-primary';
+    primary.innerHTML = `
+      <span class="entry-provider">${escapeHtml(_videoProviderLabel(p.provider))}</span>
+      <span class="entry-sep">·</span>
+      <span class="entry-model">${escapeHtml(_videoModelLabel(p.provider, p.model))}</span>
+      <span class="entry-sep">·</span>
+      <span class="entry-account-chip">@ ${escapeHtml(p.label || 'default')}</span>
+      ${p.apiKeyMasked ? `<span class="account-mask">${escapeHtml(p.apiKeyMasked)}</span>` : ''}
+    `;
+    main.appendChild(primary);
+    row.appendChild(main);
+
+    const actions = document.createElement('div');
+    actions.className = 'entry-actions';
+    const delBtn = document.createElement('button');
+    delBtn.className = 'btn btn-sm btn-danger';
+    delBtn.textContent = t('settings.delete');
+    delBtn.addEventListener('click', async () => {
+      const ok = await uiConfirm(t('settings.video.confirm_delete', { provider: _videoProviderLabel(p.provider) }));
+      if (!ok) return;
+      const res = await window.orkas.invoke('videoAuth.remove', { id: p.id });
+      if (res && res.ok) {
+        await _settingsRefreshVideoProfiles();
+        _settingsRenderVideoEntries();
+      }
+    });
+    actions.appendChild(delBtn);
+    row.appendChild(actions);
+
+    _settingsAttachReorderDnd(row, {
+      kind: 'video',
+      id: p.id,
+      getIds: () => (_settingsState.videoProfiles || []).map((x) => x.id),
+      ipcName: 'videoAuth.reorder',
+      onSuccess: async () => {
+        await _settingsRefreshVideoProfiles();
+        _settingsRenderVideoEntries();
       },
     });
 

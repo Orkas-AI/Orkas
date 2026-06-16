@@ -12,7 +12,8 @@
  *       profiles: { "<provider>:<label>": { type, ...credential, ...meta } },
  *       entries:  [ { entryId, provider, model, profileId, lastUsed, createdAt } ],
  *       searchProfiles: [ { id, provider, apiKey, label, createdAt, extras? } ],   // v4+
- *       imageProfiles:  [ { id, provider, apiKey, label, createdAt } ]              // v4+
+ *       imageProfiles:  [ { id, provider, apiKey, label, createdAt } ],             // v4+
+ *       videoProfiles:  [ { id, provider, model, apiKey, label, createdAt } ]       // v4+
  *     }
  *     The file body is encrypted through `util/local-secret-store`: Hosted Orkas writes
  *     `ORKLSEC1:`, while the open-source build falls back to the open backend. The read path accepts
@@ -20,7 +21,7 @@
  *     inputs, then rewrites with the preferred backend.
  *
  * Forward/backward compat:
- *   - v3 readers see v4 files: `searchProfiles` / `imageProfiles` are
+ *   - v3 readers see v4 files: `searchProfiles` / `imageProfiles` / `videoProfiles` are
  *     unknown fields and ignored harmlessly.
  *   - v4 readers see v3 files: missing fields default to `[]`.
  *   No destructive migration needed.
@@ -226,13 +227,27 @@ export interface ImageProfile {
   createdAt: number;
 }
 
+/**
+ * Video-generation API key. Kept separate from image/chat keys because video
+ * providers expose video-specific model ids and billing.
+ */
+export interface VideoProfile {
+  id: string;
+  provider: string;          // doubao / ...
+  model: string;
+  apiKey: string;
+  label: string;
+  createdAt: number;
+}
+
 interface ProfilesFile {
-  /** v3 = chat profiles only. v4 adds searchProfiles / imageProfiles. */
+  /** v3 = chat profiles only. v4 adds BYO search / image / video profiles. */
   version: number;
   profiles: Record<string, StoredProfile>;
   entries: Entry[];
   searchProfiles?: SearchProfile[];
   imageProfiles?: ImageProfile[];
+  videoProfiles?: VideoProfile[];
 }
 
 const PROFILES_FILE_VERSION = 4;
@@ -335,7 +350,8 @@ function loadProfiles(): ProfilesFile {
         : [];
       const searchProfiles = parseSearchProfilesArray((data as any).searchProfiles);
       const imageProfiles = parseImageProfilesArray((data as any).imageProfiles);
-      const store = { version: PROFILES_FILE_VERSION, profiles, entries, searchProfiles, imageProfiles };
+      const videoProfiles = parseVideoProfilesArray((data as any).videoProfiles);
+      const store = { version: PROFILES_FILE_VERSION, profiles, entries, searchProfiles, imageProfiles, videoProfiles };
       if (needsRewrite) saveProfiles(store);
       return store;
     }
@@ -344,7 +360,7 @@ function loadProfiles(): ProfilesFile {
       log.warn('failed to load profiles store:', (err as Error).message);
     }
   }
-  return { version: PROFILES_FILE_VERSION, profiles: {}, entries: [], searchProfiles: [], imageProfiles: [] };
+  return { version: PROFILES_FILE_VERSION, profiles: {}, entries: [], searchProfiles: [], imageProfiles: [], videoProfiles: [] };
 }
 
 function parseSearchProfilesArray(arr: unknown): SearchProfile[] {
@@ -384,10 +400,28 @@ function parseImageProfilesArray(arr: unknown): ImageProfile[] {
   return out;
 }
 
-// ── Search / Image profiles store IO (low-level) ─────────────────────────
+function parseVideoProfilesArray(arr: unknown): VideoProfile[] {
+  if (!Array.isArray(arr)) return [];
+  const out: VideoProfile[] = [];
+  for (const raw of arr) {
+    const p = raw as any;
+    if (!p || typeof p !== 'object' || !p.id || !p.provider || !p.model || !p.apiKey) continue;
+    out.push({
+      id: String(p.id),
+      provider: String(p.provider),
+      model: String(p.model),
+      apiKey: String(p.apiKey),
+      label: String(p.label || 'default'),
+      createdAt: typeof p.createdAt === 'number' ? p.createdAt : Date.now(),
+    });
+  }
+  return out;
+}
+
+// ── Search / Image / Video profiles store IO (low-level) ─────────────────
 //
 // These helpers expose the new top-level fields so feature modules
-// (`features/search_auth.ts`, `features/image_auth.ts`) can manage them
+// (`features/search_auth.ts`, `features/image_auth.ts`, `features/video_auth.ts`) can manage them
 // without re-implementing the load/save round-trip. Live in auth.ts so
 // the entire `auth-profiles.json` file has a single owner.
 
@@ -408,6 +442,16 @@ export function loadImageProfiles(): ImageProfile[] {
 export function saveImageProfiles(list: ImageProfile[]): void {
   const store = loadProfiles();
   store.imageProfiles = [...list];
+  saveProfiles(store);
+}
+
+export function loadVideoProfiles(): VideoProfile[] {
+  return loadProfiles().videoProfiles || [];
+}
+
+export function saveVideoProfiles(list: VideoProfile[]): void {
+  const store = loadProfiles();
+  store.videoProfiles = [...list];
   saveProfiles(store);
 }
 
