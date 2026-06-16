@@ -108,6 +108,7 @@ export interface MarketplaceCategory {
   code: string;
   name_zh: string;
   name_en: string;
+  name_ja?: string;
   sort_order: number;
 }
 
@@ -235,16 +236,107 @@ export interface MarketplaceProject {
   task_en: string;
   home?: boolean;
 }
+export interface MarketplaceProjectsListResult {
+  list: MarketplaceProject[];
+  total: number;
+  categories: MarketplaceCategory[];
+  source?: 'server' | 'bundled';
+  stale?: boolean;
+}
+
+interface MarketplaceProjectsCatalog {
+  categories: MarketplaceCategory[];
+  projects: MarketplaceProject[];
+}
+
+let _localProjectsCatalog: MarketplaceProjectsCatalog | null = null;
+
+function _loadLocalProjectsCatalog(): MarketplaceProjectsCatalog {
+  if (_localProjectsCatalog) return _localProjectsCatalog;
+  // Bundled mirror of Server/biz/marketplace/marketplace_mgr.py::_OSS_* for offline dev.
+  const file = path.join(__dirname, '..', 'data', 'oss-projects.json');
+  const parsed = JSON.parse(fs.readFileSync(file, 'utf-8')) as Partial<MarketplaceProjectsCatalog>;
+  _localProjectsCatalog = {
+    categories: Array.isArray(parsed.categories) ? parsed.categories : [],
+    projects: Array.isArray(parsed.projects) ? parsed.projects : [],
+  };
+  return _localProjectsCatalog;
+}
+
+function _normProjectListOpts(
+  opts: { category?: string; q?: string; page?: number; size?: number; home_only?: boolean; local_only?: boolean } = {},
+): { category: string; q: string; page: number; size?: number; homeOnly: boolean } {
+  const page = Number(opts.page);
+  const size = Number(opts.size);
+  return {
+    category: String(opts.category || '').trim().toLowerCase(),
+    q: String(opts.q || '').trim().toLowerCase(),
+    page: Number.isFinite(page) ? Math.max(1, Math.floor(page)) : 1,
+    ...(Number.isFinite(size) ? { size: Math.max(1, Math.min(100, Math.floor(size))) } : {}),
+    homeOnly: opts.home_only === true,
+  };
+}
+
+function _listLocalMarketplaceProjects(
+  opts: { category?: string; q?: string; page?: number; size?: number; home_only?: boolean; local_only?: boolean } = {},
+): MarketplaceProjectsListResult {
+  const catalog = _loadLocalProjectsCatalog();
+  const normalized = _normProjectListOpts(opts);
+  const categoryCodes = new Set(catalog.categories.map((c) => c.code));
+  let rows = catalog.projects;
+  if (normalized.homeOnly) rows = rows.filter((p) => p.home);
+  if (normalized.category && categoryCodes.has(normalized.category)) {
+    rows = rows.filter((p) => p.category === normalized.category);
+  } else if (normalized.category) {
+    rows = [];
+  }
+  if (normalized.q) {
+    rows = rows.filter((p) => [
+      p.name,
+      p.repo,
+      p.by,
+      p.description_zh,
+      p.description_en,
+      p.task_zh,
+      p.task_en,
+    ].join(' ').toLowerCase().includes(normalized.q));
+  }
+
+  const total = rows.length;
+  const size = normalized.size || (normalized.homeOnly ? total || 1 : 20);
+  const start = (normalized.page - 1) * size;
+  const categories = catalog.categories
+    .slice()
+    .sort((a, b) => (a.sort_order - b.sort_order) || a.code.localeCompare(b.code));
+
+  return {
+    list: rows.slice(start, start + size).map((p) => ({ ...p })),
+    total,
+    categories: categories.map((c) => ({ ...c })),
+    source: 'bundled',
+    stale: true,
+  };
+}
+
 export async function listMarketplaceProjects(
-  opts: { category?: string; q?: string; page?: number; size?: number; home_only?: boolean } = {},
-): Promise<{ list: MarketplaceProject[]; total: number; categories: MarketplaceCategory[] }> {
-  return await postJson('/marketplace/projects/list', {
-    category: opts.category || null,
-    q: opts.q || null,
-    page: opts.page || 1,
-    ...(typeof opts.size === 'number' ? { size: opts.size } : {}),
-    home_only: opts.home_only === true,
-  });
+  opts: { category?: string; q?: string; page?: number; size?: number; home_only?: boolean; local_only?: boolean } = {},
+): Promise<MarketplaceProjectsListResult> {
+  if (opts.local_only === true) return _listLocalMarketplaceProjects(opts);
+  try {
+    const fresh = await postJson<MarketplaceProjectsListResult>('/marketplace/projects/list', {
+      category: opts.category || null,
+      q: opts.q || null,
+      page: opts.page || 1,
+      ...(typeof opts.size === 'number' ? { size: opts.size } : {}),
+      home_only: opts.home_only === true,
+    });
+    return { ...fresh, source: fresh.source || 'server', stale: false };
+  } catch (err) {
+    log.warn('marketplace projects server list failed; using bundled catalog', {
+      error: (err as Error)?.message || String(err),
+    });
+    return _listLocalMarketplaceProjects(opts);
+  }
 }
 
 // ── detail (cache-aware) ──────────────────────────────────────────────────

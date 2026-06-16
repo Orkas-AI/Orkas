@@ -26,25 +26,33 @@ function ossIconFor(cat) { return _OSS_CAT_ICON[cat] || 'sparkles'; }
 
 // Cache contract mirrors marketplace agent/skill listings:
 // renderer Map for hot reads + main-process `marketplace/listings.json` for
-// cold-start hydration + stale-while-revalidate when the cached row ages out.
+// cold-start hydration + stale-while-revalidate. Cached rows render first;
+// network refreshes are throttled per key so re-renders/i18n changes do not
+// hammer the Server.
 const OSS_CATALOG_REVALIDATE_MS = 5 * 60 * 1000;
+const OSS_HOME_COLD_REVALIDATE_MS = 4 * 60 * 60 * 1000;
 const OSS_MARKETPLACE_PAGE_SIZE = 100;
 let _ossCatalogHydrated = false;
 let _ossCatalogHydratePromise = null;
 const _ossCatalogCache = new Map();
 const _ossCatalogInflight = new Map();
+const _ossCatalogNextRefreshAt = new Map();
+const _ossCatalogColdRefreshChecked = new Set();
 
 function _ossNormalizeCatalogOpts(forceOrOpts) {
   if (typeof forceOrOpts === 'boolean') return { force: forceOrOpts };
   const raw = forceOrOpts && typeof forceOrOpts === 'object' ? forceOrOpts : {};
   const size = Number(raw.size);
+  const revalidate = raw.revalidate === 'always' || raw.revalidate === 'cold-start'
+    ? raw.revalidate
+    : raw.revalidate !== false;
   return {
     homeOnly: raw.homeOnly === true || raw.home_only === true,
     category: String(raw.category || '').trim(),
     q: String(raw.q || '').trim(),
     ...(Number.isFinite(size) && size > 0 ? { size: Math.min(100, Math.max(1, Math.floor(size))) } : {}),
     force: raw.force === true,
-    revalidate: raw.revalidate !== false,
+    revalidate,
   };
 }
 
@@ -95,7 +103,7 @@ function _ossPersistCatalogCache(key, entry) {
           items: entry.projects || [],
           categories: entry.categories || [],
           total: typeof entry.total === 'number' ? entry.total : (entry.projects || []).length,
-          ts: entry.ts || Date.now(),
+          ts: typeof entry.ts === 'number' ? entry.ts : Date.now(),
         },
       },
     }).catch(() => {});
@@ -108,6 +116,16 @@ function _ossCatalogPayload(opts) {
     ...(opts.category ? { category: opts.category } : {}),
     ...(opts.q ? { q: opts.q } : {}),
     ...(typeof opts.size === 'number' ? { size: opts.size } : {}),
+  };
+}
+
+function _ossEntryFromCatalogResponse(res) {
+  const bundledFallback = !!(res && (res.source === 'bundled' || res.stale === true));
+  return {
+    projects: Array.isArray(res && res.list) ? res.list : [],
+    categories: Array.isArray(res && res.categories) ? res.categories : [],
+    total: typeof (res && res.total) === 'number' ? res.total : (Array.isArray(res && res.list) ? res.list.length : 0),
+    ts: bundledFallback ? 0 : Date.now(),
   };
 }
 
@@ -129,14 +147,13 @@ function _ossDispatchCatalogUpdated(key, opts, entry) {
 
 async function _ossFetchCatalog(key, opts, notify) {
   if (_ossCatalogInflight.has(key)) return _ossCatalogInflight.get(key);
+  _ossCatalogNextRefreshAt.set(key, Date.now() + OSS_CATALOG_REVALIDATE_MS);
   const p = window.orkas.invoke('marketplace.listProjects', _ossCatalogPayload(opts))
     .then((res) => {
-      const entry = {
-        projects: Array.isArray(res && res.list) ? res.list : [],
-        categories: Array.isArray(res && res.categories) ? res.categories : [],
-        total: typeof (res && res.total) === 'number' ? res.total : (Array.isArray(res && res.list) ? res.list.length : 0),
-        ts: Date.now(),
-      };
+      const bundledFallback = !!(res && (res.source === 'bundled' || res.stale === true));
+      const existing = _ossCatalogCache.get(key);
+      if (bundledFallback && existing && existing.ts > 0) return existing;
+      const entry = _ossEntryFromCatalogResponse(res);
       _ossCatalogCache.set(key, entry);
       _ossPersistCatalogCache(key, entry);
       if (notify) _ossDispatchCatalogUpdated(key, opts, entry);
@@ -147,6 +164,37 @@ async function _ossFetchCatalog(key, opts, notify) {
   return p;
 }
 
+async function _ossLoadLocalCatalog(key, opts) {
+  const res = await window.orkas.invoke('marketplace.listProjects', {
+    ..._ossCatalogPayload(opts),
+    local_only: true,
+  });
+  const entry = _ossEntryFromCatalogResponse(res);
+  _ossCatalogCache.set(key, entry);
+  _ossPersistCatalogCache(key, entry);
+  return entry;
+}
+
+function _ossShouldRefreshCached(key, cached, opts) {
+  if (!opts.revalidate || _ossCatalogInflight.has(key)) return false;
+  if (opts.revalidate === 'always') return true;
+  if (opts.revalidate === 'cold-start') {
+    if (_ossCatalogColdRefreshChecked.has(key)) return false;
+    _ossCatalogColdRefreshChecked.add(key);
+    return !cached || !cached.ts || (Date.now() - cached.ts > OSS_HOME_COLD_REVALIDATE_MS);
+  }
+  const now = Date.now();
+  const stale = !cached || !cached.ts || (now - cached.ts > OSS_CATALOG_REVALIDATE_MS);
+  const nextRefreshAt = _ossCatalogNextRefreshAt.get(key) || 0;
+  return stale || now >= nextRefreshAt;
+}
+
+function _ossRefreshCatalogInBackground(key, opts) {
+  _ossFetchCatalog(key, opts, true).catch((err) => {
+    _ossLog.warn('oss catalog refresh failed', { error: err && err.message });
+  });
+}
+
 async function loadOssCatalog(forceOrOpts) {
   const opts = _ossNormalizeCatalogOpts(forceOrOpts);
   const key = ossCatalogCacheKey(opts);
@@ -155,12 +203,19 @@ async function loadOssCatalog(forceOrOpts) {
   const cached = _ossCatalogCache.get(key);
   if (cached && !opts.force) {
     const missingCategories = !opts.homeOnly && !(cached.categories || []).length;
-    if (opts.revalidate && (missingCategories || Date.now() - cached.ts > OSS_CATALOG_REVALIDATE_MS)) {
-      _ossFetchCatalog(key, opts, true).catch((err) => {
-        _ossLog.warn('oss catalog refresh failed', { error: err && err.message });
-      });
+    if (opts.revalidate && (missingCategories || _ossShouldRefreshCached(key, cached, opts))) {
+      _ossRefreshCatalogInBackground(key, opts);
     }
     return cached;
+  }
+  if (!opts.force) {
+    try {
+      const localEntry = await _ossLoadLocalCatalog(key, opts);
+      if (_ossShouldRefreshCached(key, localEntry, opts)) _ossRefreshCatalogInBackground(key, opts);
+      return localEntry;
+    } catch (err) {
+      _ossLog.warn('oss bundled catalog load failed', { error: err && err.message });
+    }
   }
   return _ossFetchCatalog(key, opts, false);
 }
@@ -260,7 +315,12 @@ async function initOssEntry(opts = {}) {
   }
 
   let data;
-  try { data = await loadOssCatalog({ homeOnly: true, revalidate: opts.revalidate !== false }); }
+  try {
+    data = await loadOssCatalog({
+      homeOnly: true,
+      revalidate: opts.revalidate === false ? false : 'cold-start',
+    });
+  }
   catch (err) { _ossLog.warn('oss entry load failed', { error: err && err.message }); entry.style.display = 'none'; return; }
 
   // ① receives the curated home subset from the Server. The Server config

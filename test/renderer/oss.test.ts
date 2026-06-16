@@ -111,7 +111,7 @@ describe('oss.js', () => {
     expect(calls.setView).toEqual([]);
   });
 
-  it('loadOssCatalog maps the IPC envelope and memoizes (one round-trip)', async () => {
+  it('loadOssCatalog uses bundled cache first, then refreshes without duplicate calls', async () => {
     const payload = {
       list: [{ id: 'x', name: 'X', task_zh: 't', task_en: 't', category: 'anim', driver: 'cli', stars: 10 }],
       categories: [{ code: 'anim', name_zh: '动画', name_en: 'Animation' }],
@@ -127,8 +127,165 @@ describe('oss.js', () => {
     const b = await context.loadOssCatalog();
     expect(a.projects).toHaveLength(1);
     expect(a.categories).toHaveLength(1);
-    expect(b).toBe(a);              // same memoized result
+    expect(b.projects).toHaveLength(1);
+    const listCalls = invokeCalls.filter((c) => c.channel === 'marketplace.listProjects');
+    expect(listCalls).toHaveLength(2);
+    expect(listCalls[0].payload).toEqual({ local_only: true });
+    expect(listCalls[1].payload).toEqual({});
+  });
+
+  it('loadOssCatalog returns disk cache first and refreshes once in the background', async () => {
+    const cachedProject = { id: 'cached', name: 'Cached', task_zh: '旧', task_en: 'old', category: 'anim', driver: 'cli' };
+    const freshPayload = {
+      source: 'server',
+      list: [{ id: 'fresh', name: 'Fresh', task_zh: '新', task_en: 'new', category: 'anim', driver: 'cli' }],
+      categories: [{ code: 'anim', name_zh: '动画', name_en: 'Animation' }],
+      total: 1,
+    };
+    let resolveList: (value: unknown) => void = () => {};
+    const listPromise = new Promise((resolve) => { resolveList = resolve; });
+    const { context, invokeCalls } = loadOss({
+      invoke: async (channel) => {
+        if (channel === 'marketplace.getListingsCache') {
+          return {
+            entries: {
+              'project|home|||': { items: [cachedProject], categories: [], total: 1, ts: Date.now() },
+            },
+          };
+        }
+        if (channel === 'marketplace.mergeListingsCache') return { ok: true };
+        return listPromise;
+      },
+    });
+
+    const a = await context.loadOssCatalog({ homeOnly: true });
+    const b = await context.loadOssCatalog({ homeOnly: true });
+
+    expect(a.projects.map((p: any) => p.id)).toEqual(['cached']);
+    expect(b.projects.map((p: any) => p.id)).toEqual(['cached']);
     expect(invokeCalls.filter((c) => c.channel === 'marketplace.listProjects')).toHaveLength(1);
+
+    resolveList(freshPayload);
+    await listPromise;
+    await Promise.resolve();
+    const c = await context.loadOssCatalog({ homeOnly: true, revalidate: false });
+    expect(c.projects.map((p: any) => p.id)).toEqual(['fresh']);
+  });
+
+  it('loadOssCatalog stores bundled fallback as stale cache', async () => {
+    const { context, invokeCalls } = loadOss({
+      invoke: async (channel) => {
+        if (channel === 'marketplace.getListingsCache') return { entries: {} };
+        if (channel === 'marketplace.mergeListingsCache') return { ok: true };
+        return {
+          source: 'bundled',
+          stale: true,
+          list: [{ id: 'bundled', name: 'Bundled', task_zh: '本地', task_en: 'local', category: 'anim', driver: 'cli' }],
+          categories: [],
+          total: 1,
+        };
+      },
+    });
+
+    await context.loadOssCatalog({ homeOnly: true });
+
+    const merge = invokeCalls.find((c) => c.channel === 'marketplace.mergeListingsCache');
+    expect(merge?.payload.entries['project|home|||'].ts).toBe(0);
+  });
+
+  it('loadOssCatalog does not replace real cache with bundled fallback', async () => {
+    const cachedProject = { id: 'server-cached', name: 'Server Cached', task_zh: '缓存', task_en: 'cached', category: 'anim', driver: 'cli' };
+    const { context } = loadOss({
+      invoke: async (channel) => {
+        if (channel === 'marketplace.getListingsCache') {
+          return {
+            entries: {
+              'project|home|||': { items: [cachedProject], categories: [], total: 1, ts: Date.now() },
+            },
+          };
+        }
+        if (channel === 'marketplace.mergeListingsCache') return { ok: true };
+        return {
+          source: 'bundled',
+          stale: true,
+          list: [{ id: 'bundled', name: 'Bundled', task_zh: '本地', task_en: 'local', category: 'anim', driver: 'cli' }],
+          categories: [],
+          total: 1,
+        };
+      },
+    });
+
+    await context.loadOssCatalog({ homeOnly: true });
+    await Promise.resolve();
+    const current = await context.loadOssCatalog({ homeOnly: true, revalidate: false });
+
+    expect(current.projects.map((p: any) => p.id)).toEqual(['server-cached']);
+  });
+
+  it('homepage cold-start policy skips refresh when server cache is under 4h old', async () => {
+    const cachedProject = { id: 'warm', name: 'Warm', task_zh: '缓存', task_en: 'cached', category: 'anim', driver: 'cli' };
+    const { context, invokeCalls } = loadOss({
+      invoke: async (channel) => {
+        if (channel === 'marketplace.getListingsCache') {
+          return {
+            entries: {
+              'project|home|||': { items: [cachedProject], categories: [], total: 1, ts: Date.now() },
+            },
+          };
+        }
+        if (channel === 'marketplace.mergeListingsCache') return { ok: true };
+        return {
+          source: 'server',
+          list: [{ id: 'fresh', name: 'Fresh', task_zh: '新', task_en: 'new', category: 'anim', driver: 'cli' }],
+          categories: [],
+          total: 1,
+        };
+      },
+    });
+
+    const data = await context.loadOssCatalog({ homeOnly: true, revalidate: 'cold-start' });
+
+    expect(data.projects.map((p: any) => p.id)).toEqual(['warm']);
+    expect(invokeCalls.filter((c) => c.channel === 'marketplace.listProjects')).toHaveLength(0);
+  });
+
+  it('homepage cold-start policy refreshes stale cache once per renderer boot', async () => {
+    const cachedProject = { id: 'old', name: 'Old', task_zh: '旧', task_en: 'old', category: 'anim', driver: 'cli' };
+    let resolveList: (value: unknown) => void = () => {};
+    const listPromise = new Promise((resolve) => { resolveList = resolve; });
+    const { context, invokeCalls } = loadOss({
+      invoke: async (channel) => {
+        if (channel === 'marketplace.getListingsCache') {
+          return {
+            entries: {
+              'project|home|||': {
+                items: [cachedProject],
+                categories: [],
+                total: 1,
+                ts: Date.now() - (4 * 60 * 60 * 1000) - 1,
+              },
+            },
+          };
+        }
+        if (channel === 'marketplace.mergeListingsCache') return { ok: true };
+        return listPromise;
+      },
+    });
+
+    await context.loadOssCatalog({ homeOnly: true, revalidate: 'cold-start' });
+    await context.loadOssCatalog({ homeOnly: true, revalidate: 'cold-start' });
+
+    expect(invokeCalls.filter((c) => c.channel === 'marketplace.listProjects')).toHaveLength(1);
+    resolveList({
+      source: 'server',
+      list: [{ id: 'fresh', name: 'Fresh', task_zh: '新', task_en: 'new', category: 'anim', driver: 'cli' }],
+      categories: [],
+      total: 1,
+    });
+    await listPromise;
+    await Promise.resolve();
+    const current = await context.loadOssCatalog({ homeOnly: true, revalidate: false });
+    expect(current.projects.map((p: any) => p.id)).toEqual(['fresh']);
   });
 
   it('loadOssCatalog passes home/search/category options through to Server', async () => {
@@ -142,8 +299,12 @@ describe('oss.js', () => {
     await context.loadOssCatalog({ homeOnly: true });
     await context.loadOssCatalog({ category: 'rag', q: 'llama', size: 100 });
     const listCalls = invokeCalls.filter((c) => c.channel === 'marketplace.listProjects');
-    expect(listCalls[0].payload).toEqual({ home_only: true });
-    expect(listCalls[1].payload).toEqual({ category: 'rag', q: 'llama', size: 100 });
+    expect(listCalls.map((c) => c.payload)).toEqual([
+      { home_only: true, local_only: true },
+      { home_only: true },
+      { category: 'rag', q: 'llama', size: 100, local_only: true },
+      { category: 'rag', q: 'llama', size: 100 },
+    ]);
   });
 
   it('ossGithubUrl derives the repo page', () => {

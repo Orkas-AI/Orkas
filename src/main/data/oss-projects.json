@@ -1,0 +1,69 @@
+{
+  "categories": [
+    { "code": "anim", "name_zh": "动画 / 视频", "name_en": "Animation / Video", "name_ja": "アニメ / 動画", "sort_order": 10 },
+    { "code": "browser", "name_zh": "浏览器", "name_en": "Browser", "name_ja": "ブラウザ", "sort_order": 30 },
+    { "code": "slides", "name_zh": "演示 / PPT", "name_en": "Slides / PPT", "name_ja": "スライド / PPT", "sort_order": 70 }
+  ],
+  "projects": [
+    {
+      "id": "hyperframes",
+      "name": "HyperFrames",
+      "repo": "heygen-com/hyperframes",
+      "category": "anim",
+      "driver": "cli",
+      "glyph": "◓",
+      "color": "#8b5cf6",
+      "by": "HyperFrames",
+      "home": true,
+      "description_zh": "生成开场动画和短视频, 装好后 Orkas 会自动调用。",
+      "description_en": "Generate intro animations and short videos; Orkas uses it automatically once installed.",
+      "task_zh": "帮我做一段产品开场动画",
+      "task_en": "Make a product intro animation for me"
+    },
+    {
+      "id": "browser-use",
+      "name": "Browser-Use",
+      "repo": "browser-use/browser-use",
+      "category": "browser",
+      "driver": "mcp",
+      "glyph": "◍",
+      "color": "#10b981",
+      "by": "Browser-Use",
+      "home": false,
+      "description_zh": "让 AI 直接帮你操作浏览器、点击和填写网页。",
+      "description_en": "Let AI operate the browser for you - click and fill in pages.",
+      "task_zh": "让 AI 帮我操作浏览器",
+      "task_en": "Let AI operate the browser for me"
+    },
+    {
+      "id": "ppt-master",
+      "name": "PPT-Master",
+      "repo": "hugohe3/ppt-master",
+      "category": "slides",
+      "driver": "install",
+      "glyph": "▥",
+      "color": "#f97316",
+      "by": "PPT-Master",
+      "home": true,
+      "description_zh": "用一段大纲或要点自动生成可编辑的 PPT 演示文稿。",
+      "description_en": "Generate an editable slide deck from an outline or a few bullet points.",
+      "task_zh": "把要点做成一份 PPT",
+      "task_en": "Turn my outline into a slide deck"
+    },
+    {
+      "id": "crawl4ai",
+      "name": "Crawl4AI",
+      "repo": "unclecode/crawl4ai",
+      "category": "browser",
+      "driver": "cli",
+      "glyph": "◑",
+      "color": "#14b8a6",
+      "by": "Crawl4AI",
+      "home": true,
+      "description_zh": "抓取网页正文并整理成干净的文档或结构化数据, 装好后 Orkas 会自动调用。",
+      "description_en": "Extract a web page's main content into a clean document or structured data; Orkas uses it automatically once installed.",
+      "task_zh": "抓取这个网页的内容整理成文档",
+      "task_en": "Pull this web page into a clean document"
+    }
+  ]
+}

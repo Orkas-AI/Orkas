@@ -688,6 +688,10 @@ window.addEventListener('i18n-change', () => { _mpUpdateReconcileBanner(); });
 // next openMarketplace will SWR-refresh anyway).
 function refreshMarketplaceIfActive() {
   if (!isMarketplaceOpen() || !_mpState) return;
+  if (_mpState.tab === 'oss') {
+    _mpLoadOss({ forceState: true }).catch(() => {});
+    return;
+  }
   Promise.all([
     _mpRefreshInstalledState(),
     _mpRefreshListingsAndRender(),
@@ -1101,7 +1105,7 @@ async function _mpLoadOss(opts = {}) {
         q: _mpState.ossQ || '',
         size: typeof OSS_MARKETPLACE_PAGE_SIZE === 'number' ? OSS_MARKETPLACE_PAGE_SIZE : 100,
         force: opts.force === true,
-        revalidate: opts.revalidate !== false,
+        revalidate: opts.revalidate === false ? false : 'always',
       }),
       loadOssInstalled(),
     ]);
