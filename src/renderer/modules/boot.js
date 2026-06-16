@@ -393,7 +393,10 @@ function setView(view, cid, opts = {}) {
     if (typeof loadSavedApps === 'function') loadSavedApps(true);
   } else if (view === 'settings') {
     currentCid = null;
-    loadSettings();
+    if (typeof loadSettings === 'function') {
+      Promise.resolve(loadSettings())
+        .catch((e) => _bootLog.warn('settings refresh on tab entry failed', { error: (e && e.message) || String(e) }));
+    }
   } else if (view === 'project') {
     // `cid` arg is repurposed as `pid` for this view (single second-arg
     // slot kept; the function only inspects it for 'conversation' above).
