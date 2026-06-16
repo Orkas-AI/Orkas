@@ -64,7 +64,7 @@ export function addVideoProfile(input: AddVideoProfileInput): { ok: true; id: st
     label: sanitizeLabel(input.label || 'default'),
     createdAt: Date.now(),
   };
-  list.push(profile);
+  list.unshift(profile);
   saveVideoProfiles(list);
   log.info('video profile added', { id: profile.id, provider, model });
   return { ok: true, id: profile.id };
@@ -95,7 +95,7 @@ export function listVideoProviderOptions(): Array<{ id: string; label: string; d
   return [
     {
       id: 'doubao',
-      label: 'DouBao',
+      label: 'DouBao · Seedance',
       docs: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey',
     },
   ];

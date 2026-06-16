@@ -10,6 +10,7 @@ function read(rel: string) {
 
 const indexHtml = read('src/renderer/index.html');
 const settingsJs = read('src/renderer/modules/settings.js');
+const styleCss = read('src/renderer/style.css');
 const bootJs = read('src/renderer/modules/boot.js');
 
 function previousSettingsGroupTag(controlId: string) {
@@ -79,6 +80,13 @@ describe('open-source Settings sync guards', () => {
     expect(settingsJs).toContain('_settingsState.addBtnEl !== addBtn');
     expect(settingsJs).toContain('_settingsState.pickerProviderEl !== providerEl');
     expect(settingsJs).toContain('_settingsState.pickerModelEl !== modelEl');
+  });
+
+  it('keeps the local execution permission mode UI spacing fix', () => {
+    expect(indexHtml).toContain('id="settings-localexec-modes"');
+    expect(styleCss).toContain('.settings-row.settings-mode-list > .settings-mode-opt');
+    expect(styleCss).toContain('flex: 0 0 auto;');
+    expect(styleCss).toContain('.settings-mode-label { font-size: 13px; color: var(--text); }');
   });
 
   it('isolates settings refresh/render failures while loading BYO provider sections', () => {

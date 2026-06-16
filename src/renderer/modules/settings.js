@@ -1327,7 +1327,7 @@ function _settingsRenderImageEntries() {
 // user-owned provider keys only; managed Orkas video providers stay stripped.
 
 const _VIDEO_AUTH_PROVIDER_OPTIONS = [
-  { id: 'doubao', label: 'DouBao', docs: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey' },
+  { id: 'doubao', label: 'DouBao · Seedance', docs: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey' },
 ];
 
 const _VIDEO_AUTH_MODELS_BY_PROVIDER = {

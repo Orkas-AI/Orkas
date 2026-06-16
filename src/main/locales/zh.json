@@ -78,7 +78,7 @@
   "errors.contexts.formats_only": "仅支持以下格式（{allowed}）",
   "errors.unknown_actor": "unknown actor: \"{name}\" — 名字要跟「智能体列表」里的 name 一致；或检查 agent 是否禁用",
   "errors.no_model_configured": "未配置模型，请到「设置」页添加 API 密钥或登录账号",
-  "errors.model_temporarily_unavailable": "已配置模型暂时不可用，请稍后再试，或在「设置」中检查凭证/切换可用模型。",
+  "errors.model_temporarily_unavailable": "已配置模型暂时不可用，约 {seconds} 秒后重试，或在「设置」中检查凭证/切换可用模型。",
   "errors.model_config_unavailable": "已配置模型，但当前凭证不可用。请到「设置」页检查 API 密钥、登录状态或切换备用模型。",
   "errors.model_credits_insufficient": "积分不足，请补充积分，或在「设置」中切换可用模型。",
   "errors.model_auth_unavailable": "模型凭证不可用，请到「设置」页检查 API 密钥、登录状态或切换可用模型。",

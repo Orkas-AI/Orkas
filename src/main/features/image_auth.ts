@@ -62,7 +62,7 @@ export function addImageProfile(input: AddImageProfileInput): { ok: true; id: st
     label: sanitizeLabel(input.label || 'default'),
     createdAt: Date.now(),
   };
-  list.push(profile);
+  list.unshift(profile);
   saveImageProfiles(list);
   log.info('image profile added', { id: profile.id, provider });
   return { ok: true, id: profile.id };

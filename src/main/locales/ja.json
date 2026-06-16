@@ -78,7 +78,7 @@
   "errors.contexts.formats_only": "対応形式は次のみです: {allowed}",
   "errors.unknown_actor": "不明な actor: 「{name}」。名前は「エージェント一覧」の `name` フィールドと一致する必要があります。エージェントが無効になっていないかも確認してください。",
   "errors.no_model_configured": "モデルが設定されていません。設定ページで API キーを追加するかサインインしてください。",
-  "errors.model_temporarily_unavailable": "設定済みモデルは一時的に利用できません。後でもう一度試すか、設定で認証情報や利用可能なモデルを確認してください。",
+  "errors.model_temporarily_unavailable": "設定済みモデルは約 {seconds} 秒間利用できません。後でもう一度試すか、設定で認証情報や利用可能なモデルを確認してください。",
   "errors.model_config_unavailable": "モデルは設定されていますが、現在その認証情報を使用できません。設定で API キー、サインイン状態、または代替モデルを確認してください。",
   "errors.model_credits_insufficient": "クレジットが不足しています。クレジットを追加するか、設定で利用可能なモデルへ切り替えてください。",
   "errors.model_auth_unavailable": "モデルの認証情報を使用できません。設定で API キー、サインイン状態、または利用可能なモデルを確認してください。",

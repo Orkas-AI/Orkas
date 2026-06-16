@@ -902,7 +902,7 @@ export async function addEntry({
 
   const entryId = nextEntryId();
   const now = Date.now();
-  store.entries.push({
+  store.entries.unshift({
     entryId,
     provider: p,
     model: m,

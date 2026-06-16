@@ -349,7 +349,7 @@ describe('auth › entries (priority list)', () => {
     expect(entries).toEqual([]);
   });
 
-  it('addEntry appends and preserves order', async () => {
+  it('addEntry prepends so newly added model configs become the default', async () => {
     const a = await import('../../../src/main/features/auth');
     const p1 = await a.addApiKey('anthropic', 'key-xxxxxxxxxxxx', 'one');
     const p2 = await a.addApiKey('openai', 'sk-xxxxxxxxxxxx', 'one');
@@ -360,8 +360,8 @@ describe('auth › entries (priority list)', () => {
 
     const { entries } = await a.listEntries();
     expect(entries.map((e) => `${e.provider}:${e.model}`)).toEqual([
-      'anthropic:claude-opus-4-7',
       'openai:gpt-5',
+      'anthropic:claude-opus-4-7',
     ]);
   });
 

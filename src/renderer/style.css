@@ -9493,6 +9493,9 @@ body.model-not-configured .main-content { flex-direction: column; }
   align-items: stretch;
   gap: 10px;
 }
+.settings-row.settings-mode-list > .settings-mode-opt {
+  flex: 0 0 auto;
+}
 .settings-mode-opt {
   display: flex;
   align-items: flex-start;
@@ -9501,7 +9504,7 @@ body.model-not-configured .main-content { flex-direction: column; }
 }
 .settings-mode-opt input[type="radio"] { margin: 3px 0 0 0; flex: 0 0 auto; }
 .settings-mode-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.settings-mode-label { font-size: 13px; color: var(--text-1); }
+.settings-mode-label { font-size: 13px; color: var(--text); }
 .settings-mode-desc { font-size: 12px; color: var(--text-2); line-height: 1.4; }
 
 /* Inline toggle label — for checkbox + long descriptive text inside a

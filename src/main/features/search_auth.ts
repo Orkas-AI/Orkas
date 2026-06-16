@@ -81,7 +81,7 @@ export function addSearchProfile(input: AddSearchProfileInput): { ok: true; id: 
     createdAt: Date.now(),
     extras: input.extras && Object.keys(input.extras).length ? { ...input.extras } : undefined,
   };
-  list.push(profile);
+  list.unshift(profile);
   saveSearchProfiles(list);
   log.info('search profile added', { id: profile.id, provider });
   return { ok: true, id: profile.id };

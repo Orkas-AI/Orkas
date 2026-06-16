@@ -50,7 +50,7 @@ describe('video_auth', () => {
     expect(second.ok).toBe(true);
     const firstId = first.ok ? first.id : '';
     const secondId = second.ok ? second.id : '';
-    expect(videoAuth.listVideoProfiles().map((p) => p.label)).toEqual(['one', 'two']);
+    expect(videoAuth.listVideoProfiles().map((p) => p.label)).toEqual(['two', 'one']);
 
     expect(videoAuth.reorderVideoProfiles([secondId, firstId])).toEqual({ ok: true });
     expect(videoAuth.listVideoProfiles().map((p) => p.id)).toEqual([secondId, firstId]);
@@ -72,5 +72,13 @@ describe('video_auth', () => {
       model: 'not-a-video-model',
       apiKey: 'video-secret',
     }).ok).toBe(false);
+  });
+
+  it('labels the BYO DouBao video provider with the Seedance product name', async () => {
+    const videoAuth = await import('../../../src/main/features/video_auth');
+
+    expect(videoAuth.listVideoProviderOptions()).toEqual([
+      expect.objectContaining({ id: 'doubao', label: 'DouBao · Seedance' }),
+    ]);
   });
 });
