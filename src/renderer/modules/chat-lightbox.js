@@ -23,6 +23,7 @@
 let _lightboxEl = null;
 let _lightboxImg = null;
 let _lightboxAddLibraryBtn = null;
+let _lightboxRevealBtn = null;
 let _lightboxKeyHandler = null;
 let _lightboxCurrentFile = null;
 
@@ -36,6 +37,19 @@ let _panStart = null;
 const MIN_SCALE = 0.5;
 const MAX_SCALE = 8;
 const ZOOM_STEP = 1.2;
+
+function _absPathFromChatMediaLocalUrl(src) {
+  if (!src) return '';
+  let url;
+  try { url = new URL(String(src)); }
+  catch (_) { return ''; }
+  if (url.protocol !== 'chat-media:' || url.hostname !== 'local') return '';
+  let p = decodeURIComponent(url.pathname || '');
+  if (!p) return '';
+  if (/^\/[A-Za-z]:\//.test(p)) return p.slice(1);
+  if (/^\/\/[^/]/.test(p)) p = p.replace(/^\/+/, '/');
+  return p.startsWith('/') ? p : `/${p}`;
+}
 
 function _isOpen() {
   return !!(_lightboxEl && _lightboxEl.classList.contains('is-open'));
@@ -142,8 +156,12 @@ function _ensureLightbox() {
   root.setAttribute('aria-hidden', 'true');
   const closeLabel = t('chat.lightbox_close_title');
   const addLabel = t('chat.preview_add_library_title');
+  const revealLabel = t('chat.preview_reveal_title');
   const libraryIcon = (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function')
     ? window.uiIconHtml('database', 'chat-lightbox-library-icon')
+    : '';
+  const folderIcon = (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function')
+    ? window.uiIconHtml('folder', 'chat-lightbox-folder-icon')
     : '';
   root.innerHTML = `
     <div class="chat-lightbox-backdrop"></div>
@@ -151,6 +169,9 @@ function _ensureLightbox() {
       <img class="chat-lightbox-img" alt="" draggable="false" />
       <button type="button" class="chat-lightbox-add-library" aria-label="${addLabel}" title="${addLabel}" hidden>
         ${libraryIcon}
+      </button>
+      <button type="button" class="chat-lightbox-reveal" aria-label="${revealLabel}" title="${revealLabel}" hidden>
+        ${folderIcon}
       </button>
       <button type="button" class="chat-lightbox-close" aria-label="${closeLabel}" title="${closeLabel}">×</button>
     </div>
@@ -174,14 +195,22 @@ function _ensureLightbox() {
       add.setAttribute('aria-label', label);
       add.setAttribute('title', label);
     }
+    const reveal = _lightboxEl.querySelector('.chat-lightbox-reveal');
+    if (reveal) {
+      const label = t('chat.preview_reveal_title');
+      reveal.setAttribute('aria-label', label);
+      reveal.setAttribute('title', label);
+    }
   });
   _lightboxEl = root;
   _lightboxImg = root.querySelector('.chat-lightbox-img');
   _lightboxAddLibraryBtn = root.querySelector('.chat-lightbox-add-library');
+  _lightboxRevealBtn = root.querySelector('.chat-lightbox-reveal');
 
   // × closes; backdrop clicks are ignored to avoid accidental dismissals.
   root.querySelector('.chat-lightbox-close').addEventListener('click', closeChatImageLightbox);
   _lightboxAddLibraryBtn.addEventListener('click', _onLightboxAddLibrary);
+  _lightboxRevealBtn.addEventListener('click', _onLightboxReveal);
 
   // Zoom + pan. wheel must be non-passive to allow preventDefault (modern
   // Chromium defaults wheel listeners on document/window to passive).
@@ -194,6 +223,28 @@ function _ensureLightbox() {
   document.addEventListener('mouseup', _onMouseUp);
 
   return root;
+}
+
+async function _onLightboxReveal(e) {
+  e.stopPropagation();
+  if (!_lightboxCurrentFile || !_lightboxRevealBtn || _lightboxRevealBtn.disabled) return;
+  const file = _lightboxCurrentFile;
+  _lightboxRevealBtn.disabled = true;
+  try {
+    const payload = { path: file.absPath };
+    if (file.cid) payload.cid = file.cid;
+    if (file.projectId) payload.projectId = file.projectId;
+    const res = await window.orkas.invoke('workspace.revealPath', payload);
+    if (!res || !res.ok) throw new Error((res && res.error) || 'failed');
+  } catch (err) {
+    try {
+      const reason = String(err && err.message || err);
+      const message = t('conversation_info.file_reveal_failed', { reason });
+      if (typeof uiAlert === 'function') await uiAlert(message && message !== 'conversation_info.file_reveal_failed' ? message : reason);
+    } catch (_) { /* best-effort; reveal failures are already non-destructive */ }
+  } finally {
+    if (_lightboxRevealBtn) _lightboxRevealBtn.disabled = false;
+  }
 }
 
 async function _onLightboxAddLibrary(e) {
@@ -238,12 +289,18 @@ function openChatImageLightbox(src, alt, opts) {
   _resetZoom();
   _lightboxImg.src = src;
   _lightboxImg.alt = alt || '';
-  _lightboxCurrentFile = opts && opts.absPath ? {
-    absPath: opts.absPath,
-    cid: opts.cid || null,
-    projectId: opts.projectId || null,
+  const inferredAbsPath = (!opts || !opts.absPath) ? _absPathFromChatMediaLocalUrl(src) : '';
+  const fallbackCid = (typeof currentCid !== 'undefined' && currentCid) ? currentCid : null;
+  const fileOpts = (opts && opts.absPath)
+    ? opts
+    : (inferredAbsPath ? { absPath: inferredAbsPath, cid: fallbackCid } : null);
+  _lightboxCurrentFile = fileOpts && fileOpts.absPath ? {
+    absPath: fileOpts.absPath,
+    cid: fileOpts.cid || null,
+    projectId: fileOpts.projectId || null,
   } : null;
   if (_lightboxAddLibraryBtn) _lightboxAddLibraryBtn.hidden = !_lightboxCurrentFile;
+  if (_lightboxRevealBtn) _lightboxRevealBtn.hidden = !_lightboxCurrentFile;
   el.classList.add('is-open');
   el.setAttribute('aria-hidden', 'false');
   if (!_lightboxKeyHandler) {
@@ -281,6 +338,7 @@ function closeChatImageLightbox() {
   }
   _lightboxCurrentFile = null;
   if (_lightboxAddLibraryBtn) _lightboxAddLibraryBtn.hidden = true;
+  if (_lightboxRevealBtn) _lightboxRevealBtn.hidden = true;
   _isPanning = false;
   _resetZoom();
   if (_lightboxKeyHandler) {

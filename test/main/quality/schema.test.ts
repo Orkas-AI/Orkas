@@ -1,17 +1,16 @@
 import { describe, it, expect } from 'vitest';
 import {
   validateSkillFrontmatter,
+  validateSkillMeta,
   validateAgentJsonShape,
   parseFailureViolation,
 } from '../../../src/main/quality/rules/schema';
 
 describe('quality › schema › validateSkillFrontmatter', () => {
-  it('passes a complete bilingual frontmatter', () => {
+  it('passes a portable skill frontmatter', () => {
     const v = validateSkillFrontmatter({
       name: 'pdf-summarize',
-      description_zh: 'PDF 摘要工具',
-      description_en: 'Summarize PDF documents',
-      category: 'data',
+      description: 'Summarize PDF documents',
     });
     expect(v).toEqual([]);
   });
@@ -39,12 +38,13 @@ describe('quality › schema › validateSkillFrontmatter', () => {
     expect(v.map((x) => x.rule)).toContain('frontmatter_name_invalid');
   });
 
-  it('flags missing description (no zh / en / legacy)', () => {
+  it('flags missing description as advisory', () => {
     const v = validateSkillFrontmatter({ name: 'foo' });
-    expect(v.map((x) => x.rule)).toContain('frontmatter_description_missing');
+    const missing = v.find((x) => x.rule === 'frontmatter_description_missing');
+    expect(missing?.level).toBe('MEDIUM');
   });
 
-  it('accepts legacy description (migrated by loader heuristic)', () => {
+  it('accepts generic description', () => {
     const v = validateSkillFrontmatter({
       name: 'foo',
       description: 'a description in some language',
@@ -56,34 +56,50 @@ describe('quality › schema › validateSkillFrontmatter', () => {
     const long = 'x'.repeat(900);
     const v = validateSkillFrontmatter({
       name: 'foo',
-      description_en: long,
-      description_zh: 'short',
-      category: 'general',
+      description: long,
     });
     const long_v = v.find((x) => x.rule === 'frontmatter_description_too_long');
     expect(long_v?.level).toBe('MEDIUM');
-    expect(long_v?.field).toBe('frontmatter:description_en');
+    expect(long_v?.field).toBe('frontmatter:description');
   });
 
   it('flags a name with single-space groups', () => {
     const v = validateSkillFrontmatter({
       name: 'Foo Bar Baz',
-      description_zh: 'x', description_en: 'x', category: 'general',
+      description: 'x',
     });
     expect(v.map((x) => x.rule)).toContain('frontmatter_name_invalid');
   });
 
-  it('flags missing or invalid category', () => {
-    const missing = validateSkillFrontmatter({
-      name: 'foo', description_zh: 'x', description_en: 'x',
+  it('tolerates legacy extension fields as advisory', () => {
+    const v = validateSkillFrontmatter({
+      name: 'foo', description_zh: 'x', description_en: 'x', category: 'data',
     });
-    const missingCat = missing.find((x) => x.rule === 'frontmatter_category_missing');
+    expect(v.filter((x) => x.rule === 'frontmatter_extension_field').map((x) => x.level))
+      .toEqual(['LOW', 'LOW', 'LOW']);
+  });
+});
+
+describe('quality › schema › validateSkillMeta', () => {
+  it('passes complete Orkas sidecar metadata', () => {
+    const v = validateSkillMeta({
+      category: 'data',
+      routing: {
+        applicable_domain: 'PDF summaries',
+        negative_examples: ['image generation'],
+        prerequisites: [],
+      },
+    });
+    expect(v).toEqual([]);
+  });
+
+  it('flags missing or invalid category as advisory', () => {
+    const missing = validateSkillMeta({});
+    const missingCat = missing.find((x) => x.rule === 'skill_meta_category_missing');
     expect(missingCat?.level).toBe('MEDIUM');
 
-    const invalid = validateSkillFrontmatter({
-      name: 'foo', description_zh: 'x', description_en: 'x', category: 'bad category',
-    });
-    const invalidCat = invalid.find((x) => x.rule === 'frontmatter_category_invalid');
+    const invalid = validateSkillMeta({ category: 'bad category' });
+    const invalidCat = invalid.find((x) => x.rule === 'skill_meta_category_invalid');
     expect(invalidCat?.level).toBe('MEDIUM');
   });
 });

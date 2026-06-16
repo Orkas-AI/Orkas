@@ -380,6 +380,105 @@ describe("AgentRunner", () => {
     expect(startEv.input).toEqual({ msg: "ping" });
   });
 
+  it("runStream forwards tool_progress while a tool is still executing", async () => {
+    const mockProvider = createMockProvider([
+      {
+        content: [
+          { type: "tool_use", id: "call_1", name: "slow_tool", input: { msg: "ping" } },
+        ],
+        stopReason: "tool_use",
+        usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "done." }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+        model: "mock-model",
+      },
+    ]);
+
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const slowTool = defineTool({
+      name: "slow_tool",
+      description: "Emits progress before returning",
+      inputSchema: { type: "object", properties: { msg: { type: "string" } } },
+      async execute(_input, ctx) {
+        ctx.emitProgress?.({ phase: "upload", message: "Uploading reference" });
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        ctx.emitProgress?.({ phase: "poll", message: "Waiting for task" });
+        return { content: "ok" };
+      },
+    });
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model" },
+    });
+
+    const runner = new AgentRunner({ config, providers: registry, tools: [slowTool] });
+    const collected: Array<{ type: string; [k: string]: unknown }> = [];
+    for await (const ev of runner.runStream({ message: "go" })) {
+      collected.push(ev as { type: string; [k: string]: unknown });
+    }
+
+    const iStart = collected.findIndex((e) => e.type === "tool_start");
+    const progress = collected.filter((e) => e.type === "tool_progress");
+    const iFirstProgress = collected.findIndex((e) => e.type === "tool_progress");
+    const iEnd = collected.findIndex((e) => e.type === "tool_end");
+    expect(progress.map((e) => e.message)).toEqual(["Uploading reference", "Waiting for task"]);
+    expect(progress.map((e) => e.name)).toEqual(["slow_tool", "slow_tool"]);
+    expect(progress.map((e) => e.id)).toEqual(["call_1", "call_1"]);
+    expect(iFirstProgress).toBeGreaterThan(iStart);
+    expect(iEnd).toBeGreaterThan(iFirstProgress);
+  });
+
+  it("runStream forwards tool input deltas before tool execution", async () => {
+    const mockProvider = createMockProvider([
+      {
+        content: [
+          { type: "tool_use", id: "call_1", name: "echo", input: { msg: "x".repeat(1200) } },
+        ],
+        stopReason: "tool_use",
+        usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "done." }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+        model: "mock-model",
+      },
+    ]);
+
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const echoTool = defineTool({
+      name: "echo",
+      description: "Echo input.msg",
+      inputSchema: { type: "object", properties: { msg: { type: "string" } } },
+      async execute(input) {
+        return { content: String(input.msg).slice(0, 4) };
+      },
+    });
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model" },
+    });
+
+    const runner = new AgentRunner({ config, providers: registry, tools: [echoTool] });
+    const collected: Array<{ type: string; [k: string]: unknown }> = [];
+    for await (const ev of runner.runStream({ message: "go" })) {
+      collected.push(ev as { type: string; [k: string]: unknown });
+    }
+
+    const iDelta = collected.findIndex((e) => e.type === "tool_delta" && e.name === "echo");
+    const iInputDelta = collected.findIndex((e) => e.type === "tool_delta" && Number(e.inputBytes) > 0);
+    const iStart = collected.findIndex((e) => e.type === "tool_start");
+    expect(iDelta).toBeGreaterThanOrEqual(0);
+    expect(iInputDelta).toBeGreaterThan(iDelta);
+    expect(iStart).toBeGreaterThan(iDelta);
+    expect(collected[iInputDelta].inputBytes).toBeGreaterThan(0);
+  });
+
   it("run() and runStream() produce the same final result", async () => {
     const sharedResponses: CompletionResult[] = [
       {

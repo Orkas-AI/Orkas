@@ -49,8 +49,13 @@ import { Mutex } from 'async-mutex';
 
 import { userMarketplaceInstallsFile, userMarketplaceDirCloud } from '../paths';
 import { createLogger } from '../logger';
+import { isExpiredMsTombstone } from '../util/tombstone_retention';
 
 const log = createLogger('marketplace_installs');
+
+function _markInstallsDirty(): void {
+  // OrkasOpen is local-only; cloud sync notification is intentionally absent.
+}
 
 // Per-uid mutex covering the RMW cycle of add*/remove* (read manifest → mutate → write).
 // Concurrent cascade install (Promise.all over skill_list) used to lose rows because each
@@ -159,6 +164,7 @@ export async function writeInstalls(uid: string, manifest: InstallsManifest): Pr
   const stamped = { ...manifest, version: CURRENT_VERSION };
   await fsp.writeFile(tmp, JSON.stringify(stamped, null, 2), 'utf8');
   await fsp.rename(tmp, file);
+  _markInstallsDirty();
 }
 
 export async function addAgentInstall(uid: string, row: Omit<AgentInstall, 'installed_at'> & { installed_at?: number }): Promise<void> {
@@ -262,6 +268,7 @@ function _readDeletedAt(parsed: Partial<InstallsManifest> & { version?: unknown 
     const clean: Record<string, number> = {};
     for (const [id, value] of Object.entries(bucket as Record<string, unknown>)) {
       const n = Number(value);
+      if (isExpiredMsTombstone(n)) continue;
       if (id && Number.isFinite(n) && n > 0) clean[id] = n;
     }
     if (Object.keys(clean).length > 0) out[kind] = clean;

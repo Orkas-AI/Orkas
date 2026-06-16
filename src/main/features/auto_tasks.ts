@@ -51,6 +51,7 @@ import { createLogger } from '../logger';
 import { t as translate } from '../i18n';
 import { getCurrentDevice } from '../util/device';
 import { limitNameDisplayText } from '../util/name-limit';
+import { findOuterTagRanges } from '../util/markdown-prose-code';
 export { getCurrentDevice };
 import { getActiveUserId, hasActiveUser } from './users';
 import * as chats from './chats';
@@ -206,14 +207,12 @@ async function _writeOne(uid: string, task: AutoTask): Promise<void> {
   _notifyDirty(`cloud/auto_tasks/${task.id}/config.json`);
 }
 
-// Sync engine dirty signal (lazy-require: `features/sync` is stripped from
-// OrkasOpen). Auto tasks live in per-task directories, so a single path hint is
-// enough to wake the sync debounce; the engine still scans the whole cloud tree.
 function _notifyDirty(relPath: string): void {
   if (_syncDirtyNotifierForTest) {
     _syncDirtyNotifierForTest('auto_tasks', relPath);
     return;
   }
+  void relPath;
 }
 
 async function _readAll(uid: string): Promise<AutoTask[]> {
@@ -462,6 +461,238 @@ export async function setTaskEnabled(
     _scheduleTask(uid, next);
     return { ok: true as const, task: next };
   });
+}
+
+// ── Commander `<auto-task>` container ────────────────────────────────────
+//
+// Mutations requested by the commander use a structural block, parallel to
+// `<agent>` / `<skill>`. The model never writes `config.json` directly; it
+// emits this container and the bus applies it through the same CRUD functions
+// used by the renderer.
+
+const AUTO_TASK_OPEN_TAG = '<auto-task>';
+const AUTO_TASK_CLOSE_TAG = '</auto-task>';
+const AUTO_TASK_CHILD_RE = (tag: string) => new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`);
+
+export type AutoTaskContainerAction = 'create' | 'update' | 'delete' | 'enable' | 'disable';
+
+export interface AutoTaskContainerExtracted {
+  action?: AutoTaskContainerAction;
+  taskId?: string;
+  updates: Partial<TaskDraft>;
+}
+
+export interface AutoTaskContainerResult {
+  ok: boolean;
+  kind?: 'created' | 'updated' | 'deleted' | 'enabled' | 'disabled';
+  task?: AutoTask;
+  taskId?: string;
+  title?: string;
+  error?: string;
+}
+
+export interface AutoTaskContainerApplyOptions {
+  /** Conversation whose current message attachments should be copied into
+   *  the task's attachment directory when `<attachments>` is present. */
+  sourceAttachmentCid?: string;
+}
+
+function _childText(inner: string, tag: string): string | undefined {
+  const m = inner.match(AUTO_TASK_CHILD_RE(tag));
+  return m ? m[1].trim() : undefined;
+}
+
+function _parseJsonChild<T>(inner: string, tag: string): T | undefined {
+  const raw = _childText(inner, tag);
+  if (raw === undefined || raw === '') return undefined;
+  try {
+    return JSON.parse(raw) as T;
+  } catch (err) {
+    log.warn(`<auto-task><${tag}> JSON parse failed: ${(err as Error).message}`);
+    return undefined;
+  }
+}
+
+function _parseMaybeClearableRef<T>(inner: string, tag: string): T | null | undefined {
+  const raw = _childText(inner, tag);
+  if (raw === undefined) return undefined;
+  if (raw === '') return null;
+  try {
+    return JSON.parse(raw) as T;
+  } catch (err) {
+    log.warn(`<auto-task><${tag}> JSON parse failed: ${(err as Error).message}`);
+    return undefined;
+  }
+}
+
+function _parseAutoTaskAction(raw: string | undefined): AutoTaskContainerAction | undefined {
+  const v = String(raw || '').trim().toLowerCase().replace(/_/g, '-');
+  if (v === 'create') return 'create';
+  if (v === 'update' || v === 'edit') return 'update';
+  if (v === 'delete' || v === 'remove') return 'delete';
+  if (v === 'enable') return 'enable';
+  if (v === 'disable') return 'disable';
+  return undefined;
+}
+
+function _parseAutoTaskBool(raw: string | undefined): boolean | undefined {
+  if (raw === undefined) return undefined;
+  const v = raw.trim().toLowerCase();
+  if (v === 'true') return true;
+  if (v === 'false') return false;
+  return undefined;
+}
+
+function _parseAutoTaskContainer(inner: string): AutoTaskContainerExtracted {
+  const updates: Partial<TaskDraft> = {};
+  const action = _parseAutoTaskAction(_childText(inner, 'action'));
+  const taskId = _childText(inner, 'task_id');
+  const title = _childText(inner, 'title');
+  const content = _childText(inner, 'content');
+  const projectId = _childText(inner, 'project_id');
+  const enabled = _parseAutoTaskBool(_childText(inner, 'enabled'));
+  const schedule = _parseJsonChild<Schedule>(inner, 'schedule');
+  const recipient = _parseJsonChild<TaskRecipient>(inner, 'recipient');
+  const skill = _parseMaybeClearableRef<TaskSkillRef>(inner, 'skill');
+  const connector = _parseMaybeClearableRef<TaskConnectorRef>(inner, 'connector');
+  const attachments = _parseJsonChild<string[]>(inner, 'attachments');
+
+  if (title !== undefined) updates.title = title;
+  if (content !== undefined) updates.content = content;
+  if (enabled !== undefined) updates.enabled = enabled;
+  if (schedule !== undefined) updates.schedule = schedule;
+  if (recipient !== undefined) updates.recipient = recipient;
+  if (skill !== undefined) updates.skill = skill as any;
+  if (connector !== undefined) updates.connector = connector as any;
+  if (projectId !== undefined) updates.project_id = projectId || null;
+  if (Array.isArray(attachments)) {
+    updates.attachments = attachments
+      .map((name) => _sanitiseFilename(String(name || '')))
+      .filter((name) => !!name);
+  }
+
+  return {
+    ...(action ? { action } : {}),
+    ...(taskId && _isValidTaskId(taskId) ? { taskId } : {}),
+    updates,
+  };
+}
+
+export function extractAutoTaskContainers(
+  text: string,
+): { cleanText: string; containers: AutoTaskContainerExtracted[] } {
+  if (!text || text.indexOf(AUTO_TASK_OPEN_TAG) < 0) return { cleanText: text, containers: [] };
+  const ranges = findOuterTagRanges(text, 'auto-task');
+  if (!ranges.length) return { cleanText: text, containers: [] };
+  const containers: AutoTaskContainerExtracted[] = [];
+  let cleaned = '';
+  let cursor = 0;
+  for (const [s, e] of ranges) {
+    cleaned += text.slice(cursor, s);
+    const block = text.slice(s, e);
+    if (block.startsWith(AUTO_TASK_OPEN_TAG) && block.endsWith(AUTO_TASK_CLOSE_TAG)) {
+      const inner = block.slice(AUTO_TASK_OPEN_TAG.length, block.length - AUTO_TASK_CLOSE_TAG.length);
+      containers.push(_parseAutoTaskContainer(inner));
+    }
+    cursor = e;
+  }
+  cleaned += text.slice(cursor);
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
+  return { cleanText: cleaned, containers };
+}
+
+function _autoTaskResultTitle(task: AutoTask | null | undefined, fallbackId: string): string {
+  const title = String(task?.title || '').trim();
+  if (title) return title;
+  const content = String(task?.content || '').trim();
+  if (content) return content.slice(0, 40);
+  return fallbackId;
+}
+
+export async function applyAutoTaskContainerFromCommander(
+  uid: string,
+  container: AutoTaskContainerExtracted,
+  opts: AutoTaskContainerApplyOptions = {},
+): Promise<AutoTaskContainerResult> {
+  const action = container.action || (container.taskId ? 'update' : 'create');
+  const taskId = container.taskId || '';
+  try {
+    if (action === 'create') {
+      const result = await createTask(uid, container.updates as TaskDraft);
+      if (!result.ok) return { ok: false, error: (result as { error: string }).error };
+      await _stageContainerAttachments(uid, result.task.id, container, opts);
+      return {
+        ok: true,
+        kind: 'created',
+        task: result.task,
+        taskId: result.task.id,
+        title: _autoTaskResultTitle(result.task, result.task.id),
+      };
+    }
+    if (!taskId) return { ok: false, error: 'task_id_required' };
+    if (action === 'delete') {
+      const before = await getTask(uid, taskId);
+      const result = await deleteTask(uid, taskId);
+      if (!result.ok) return { ok: false, error: 'not_found' };
+      return {
+        ok: true,
+        kind: 'deleted',
+        taskId,
+        title: _autoTaskResultTitle(before, taskId),
+      };
+    }
+    if (action === 'enable' || action === 'disable') {
+      const result = await setTaskEnabled(uid, taskId, action === 'enable');
+      if (!result.ok) return { ok: false, error: (result as { error: string }).error };
+      return {
+        ok: true,
+        kind: action === 'enable' ? 'enabled' : 'disabled',
+        task: result.task,
+        taskId,
+        title: _autoTaskResultTitle(result.task, taskId),
+      };
+    }
+    if (!Object.keys(container.updates).length) return { ok: false, error: 'empty_update' };
+    const result = await updateTask(uid, taskId, container.updates);
+    if (!result.ok) return { ok: false, error: (result as { error: string }).error };
+    await _stageContainerAttachments(uid, taskId, container, opts);
+    return {
+      ok: true,
+      kind: 'updated',
+      task: result.task,
+      taskId,
+      title: _autoTaskResultTitle(result.task, taskId),
+    };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message || String(err) };
+  }
+}
+
+async function _stageContainerAttachments(
+  uid: string,
+  taskId: string,
+  container: AutoTaskContainerExtracted,
+  opts: AutoTaskContainerApplyOptions,
+): Promise<void> {
+  if (!_isValidTaskId(taskId)) return;
+  const names = Array.isArray(container.updates.attachments)
+    ? container.updates.attachments.map((name) => _sanitiseFilename(name)).filter((name) => !!name)
+    : [];
+  if (!names.length || !opts.sourceAttachmentCid) return;
+  const srcDir = chatAttachmentDir(uid, opts.sourceAttachmentCid);
+  const destDir = autoTaskAttachmentsDir(uid, taskId);
+  if (!fs.existsSync(srcDir)) return;
+  try { fs.mkdirSync(destDir, { recursive: true }); } catch { return; }
+  for (const name of names) {
+    const src = path.join(srcDir, name);
+    if (!fs.existsSync(src)) continue;
+    try {
+      fs.copyFileSync(src, path.join(destDir, name));
+      _notifyDirty(`cloud/auto_tasks/${taskId}/attachments/${name}`);
+    } catch (err) {
+      log.warn(`container attachment stage failed uid=${uid} id=${taskId} name=${name}: ${(err as Error).message}`);
+    }
+  }
 }
 
 async function _markRan(uid: string, taskId: string, atIso: string, alsoDisable: boolean): Promise<void> {

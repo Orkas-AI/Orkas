@@ -40,7 +40,7 @@ describe('core-agent client skill sandbox env', () => {
 
     expect(client.buildSkillSandboxEnv()).toMatchObject({
       ELECTRON_RUN_AS_NODE: '1',
-      ORKAS_PC_DIR: expect.stringMatching(/OrkasOpen$/),
+      ORKAS_PC_DIR: expect.stringMatching(/PC$/),
       ORKAS_WORKSPACE_ROOT: path.resolve(tmpDir),
     });
   });

@@ -316,6 +316,24 @@ describe('file-tools › search_files', () => {
     expect(r.content).not.toContain('b.md');
   });
 
+  it('scans extraRoots in addition to workspace + attachment dir', async () => {
+    const ws = await import('../../../../src/main/features/user_workspace');
+    const wsDir = path.join(tmpDir, 'ws');
+    fs.mkdirSync(wsDir, { recursive: true });
+    const r0 = ws.setWorkspacePath(UID, wsDir);
+    if (!r0.ok) throw new Error(`setWorkspacePath failed: ${r0.error}`);
+    const extra = path.join(tmpDir, 'sync-conflict-target');
+    fs.mkdirSync(extra, { recursive: true });
+    fs.writeFileSync(path.join(extra, 'MOCK_SYNC_CONFLICT.md'), 'conflict target');
+
+    const mod = await import('../../../../src/main/model/core-agent/file-tools');
+    const tools = mod.createFileTools({ userId: UID, extraRoots: [extra] });
+    const r = await run(getTool(tools, 'search_files'), { query: 'MOCK_SYNC_CONFLICT.md' });
+
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('MOCK_SYNC_CONFLICT.md');
+  });
+
   it('does not recursively scan a privacy-protected workspace root', async () => {
     process.env.ORKAS_TCC_GUARD_FORCE = '1';
     const home = path.join(tmpDir, 'home');

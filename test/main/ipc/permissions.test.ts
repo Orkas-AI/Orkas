@@ -73,6 +73,27 @@ describe('ipc › permissions.* routes', () => {
     expect(typeof res.revokedAt).toBe('string');
   });
 
+  it('permissions.getLocalExec returns the mode and defaults to risk_prompt', async () => {
+    const res = await call('permissions.getLocalExec');
+    expect(res.ok).toBe(true);
+    expect(res.mode).toBe('risk_prompt');
+  });
+
+  it('permissions.setLocalExecMode persists a valid mode and is read back', async () => {
+    const res = await call('permissions.setLocalExecMode', { mode: 'allow_all' });
+    expect(res.ok).toBe(true);
+    expect(res.mode).toBe('allow_all');
+    expect(res.granted).toBe(true);
+
+    const after = await call('permissions.getLocalExec');
+    expect(after.mode).toBe('allow_all');
+  });
+
+  it('permissions.setLocalExecMode rejects an invalid mode', async () => {
+    const res = await call('permissions.setLocalExecMode', { mode: 'bogus' });
+    expect(res.ok).toBe(false);
+  });
+
   it('unknown permissions.* channel surfaces the router fallback error', async () => {
     // Regression guard: this is the exact symptom that made "授权本机工具"
     // look dead — when a handler is missing, the router returns

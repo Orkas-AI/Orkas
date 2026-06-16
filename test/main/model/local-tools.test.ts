@@ -6,6 +6,7 @@ import * as path from 'node:path';
 // ── Electron mock (for html_to_pdf / markdown_to_pdf paths) ─────────────
 
 const printToPDF = vi.fn(async () => Buffer.from('%PDF-1.4 test', 'utf8'));
+const insertCSS = vi.fn(async () => 'pdf-color-css');
 const loadURL = vi.fn(async () => {});
 const once = vi.fn((evt: string, cb: (...args: any[]) => void) => {
   if (evt === 'did-finish-load') setImmediate(cb);
@@ -13,7 +14,7 @@ const once = vi.fn((evt: string, cb: (...args: any[]) => void) => {
 const destroy = vi.fn();
 
 class FakeBrowserWindow {
-  webContents = { once, printToPDF, loadURL };
+  webContents = { once, printToPDF, insertCSS, loadURL };
   constructor(public opts: any) {}
   async loadURL(url: string) { return loadURL(url); }
   destroy() { destroy(); }
@@ -31,6 +32,7 @@ beforeEach(async () => {
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   printToPDF.mockClear();
+  insertCSS.mockClear();
   loadURL.mockClear();
   destroy.mockClear();
   vi.resetModules();
@@ -49,6 +51,12 @@ async function loadModules() {
   const lt = await import('../../../src/main/model/core-agent/local-tools');
   const perm = await import('../../../src/main/features/permissions');
   return { lt, perm };
+}
+
+async function setTmpWorkspace() {
+  const ws = await import('../../../src/main/features/user_workspace');
+  const res = ws.setWorkspacePath('u1', tmpDir);
+  if (!res.ok) throw new Error(`setWorkspacePath failed: ${res.error}`);
 }
 
 function makeCtx(): any {
@@ -117,12 +125,92 @@ describe('local-tools › bash permission gate', () => {
   });
 });
 
+// ── End-to-end: risk_prompt mode drives the real bash tool ────────────────
+
+describe('local-tools › bash risk_prompt mode (e2e)', () => {
+  async function loadWithBashPerms() {
+    const lt = await import('../../../src/main/model/core-agent/local-tools');
+    const perm = await import('../../../src/main/features/permissions');
+    const bashPerms = await import('../../../src/main/model/core-agent/bash-permissions');
+    return { lt, perm, bashPerms };
+  }
+  const OPTS = { userId: 'u1', cid: 'c1', agentId: 'a1' };
+
+  it('runs a non-risky command without prompting under risk_prompt', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('risk_prompt');
+    let prompted = false;
+    bashPerms._setBroadcastForTest(() => { prompted = true; });
+    try {
+      const bash = lt.createLocalTools(OPTS).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({ command: 'echo safe-run-ok', timeoutMs: 5000 }, makeCtx());
+      expect(prompted).toBe(false);
+      expect(res.isError).toBeFalsy();
+      expect(res.content).toContain('safe-run-ok');
+    } finally { bashPerms._setBroadcastForTest(null); }
+  });
+
+  // A risky-but-harmless command: reading a file literally named `id_rsa`
+  // trips the sensitive_path category, while the underlying `cat` is allowed
+  // by core-agent's own bash sandbox and its output proves whether it ran.
+  const SECRET = 'SECRET-sentinel-7f3';
+  function makeKeyFile(): string {
+    const p = path.join(tmpDir, 'id_rsa');
+    fs.writeFileSync(p, SECRET);
+    return p;
+  }
+
+  it('blocks a risky command on deny → E_BASH_RISK_DENIED and does NOT run it', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('risk_prompt');
+    const key = makeKeyFile();
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => { bashPerms.respond(info.request_id, 'deny'); });
+    try {
+      const bash = lt.createLocalTools(OPTS).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({ command: `cat ${key}`, timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(res.content).not.toContain(SECRET); // cat never ran
+    } finally { bashPerms._setBroadcastForTest(null); }
+  });
+
+  it('runs a risky command after the user allows it (allow_once)', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('risk_prompt');
+    const key = makeKeyFile();
+    let prompts = 0;
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => { prompts++; bashPerms.respond(info.request_id, 'allow_once'); });
+    try {
+      const bash = lt.createLocalTools(OPTS).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({ command: `cat ${key}`, timeoutMs: 5000 }, makeCtx());
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(res.content).toContain(SECRET); // cat ran
+      expect(prompts).toBe(1);
+    } finally { bashPerms._setBroadcastForTest(null); }
+  });
+
+  it('allow_all runs a risky command with no prompt at all', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('allow_all');
+    let prompted = false;
+    bashPerms._setBroadcastForTest(() => { prompted = true; });
+    const key = makeKeyFile();
+    try {
+      const bash = lt.createLocalTools(OPTS).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({ command: `cat ${key}`, timeoutMs: 5000 }, makeCtx());
+      expect(prompted).toBe(false);
+      expect(res.isError, `content=${res.content}`).toBeFalsy();
+      expect(res.content).toContain(SECRET);
+    } finally { bashPerms._setBroadcastForTest(null); }
+  });
+});
+
 describe('local-tools › bash produced files', () => {
-  it('fires onFileWritten for files created under ORKAS_OUTPUT_DIR', async () => {
+  it('fires onFileWritten for files created in the conversation workspace', async () => {
     const { lt, perm } = await loadModules();
     perm.grantLocalExec();
     const onFileWritten = vi.fn();
-    const bash = lt.createLocalTools({ agentId: 'agent-a', turnId: 'turn-1', onFileWritten }).find((t) => t.name === 'bash')!;
+    const bash = lt.createLocalTools({ agentId: 'agent-a', onFileWritten }).find((t) => t.name === 'bash')!;
 
     const res = await bash.execute({
       command:
@@ -134,20 +222,19 @@ describe('local-tools › bash produced files', () => {
     }, makeCtx());
 
     expect(res.isError).toBeFalsy();
-    const outputDir = path.join(tmpDir, '__orkas_outputs', 'agent-a', 'turn-1');
     const produced = new Set(onFileWritten.mock.calls.map(([p]) => p));
-    expect(produced).toContain(path.join(outputDir, 'report.docx'));
-    expect(produced).toContain(path.join(outputDir, 'notes.md'));
+    expect(produced).toContain(path.join(tmpDir, 'report.docx'));
+    expect(produced).toContain(path.join(tmpDir, 'notes.md'));
   });
 
-  it('fires onFileWritten for files modified under ORKAS_OUTPUT_DIR', async () => {
+  it('fires onFileWritten for files modified in the conversation workspace', async () => {
     const { lt, perm } = await loadModules();
     perm.grantLocalExec();
-    const target = path.join(tmpDir, '__orkas_outputs', 'agent-a', 'turn-2', 'draft.txt');
+    const target = path.join(tmpDir, 'draft.txt');
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, 'v1');
     const onFileWritten = vi.fn();
-    const bash = lt.createLocalTools({ agentId: 'agent-a', turnId: 'turn-2', onFileWritten }).find((t) => t.name === 'bash')!;
+    const bash = lt.createLocalTools({ agentId: 'agent-a', onFileWritten }).find((t) => t.name === 'bash')!;
 
     const res = await bash.execute({
       command: 'node -e "require(\'fs\').writeFileSync(process.env.ORKAS_OUTPUT_DIR + \'/draft.txt\', \'v2\')"',
@@ -159,26 +246,65 @@ describe('local-tools › bash produced files', () => {
     expect(onFileWritten).toHaveBeenCalledWith(target);
   });
 
-  it('does not surface files written outside ORKAS_OUTPUT_DIR as produced chips', async () => {
+  it('does not surface files written outside the conversation workspace as produced chips', async () => {
     const { lt, perm } = await loadModules();
     perm.grantLocalExec();
     const onFileWritten = vi.fn();
-    const bash = lt.createLocalTools({ agentId: 'agent-a', turnId: 'turn-3', onFileWritten }).find((t) => t.name === 'bash')!;
+    const bash = lt.createLocalTools({ agentId: 'agent-a', onFileWritten }).find((t) => t.name === 'bash')!;
+    const outsideTarget = path.join(os.tmpdir(), `orkas-localtools-outside-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+    const outsideForSingleQuotedJs = outsideTarget.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 
+    try {
+      const res = await bash.execute({
+        command:
+          'node -e "const fs=require(\'fs\');' +
+          `fs.writeFileSync('${outsideForSingleQuotedJs}', '{}');` +
+          'fs.writeFileSync(process.env.ORKAS_OUTPUT_DIR + \'/visible.json\', \'{}\');"',
+        timeoutMs: 5000,
+      }, makeCtx());
+
+      expect(res.isError).toBeFalsy();
+      const produced = new Set(onFileWritten.mock.calls.map(([p]) => p));
+      expect(produced).toContain(path.join(tmpDir, 'visible.json'));
+      expect(produced).not.toContain(outsideTarget);
+    } finally {
+      fs.rmSync(outsideTarget, { force: true });
+    }
+  });
+
+  it('does not surface cloned repo scaffolding as produced chips, but keeps the real deliverable', async () => {
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    const onFileWritten = vi.fn();
+    const bash = lt.createLocalTools({ agentId: 'agent-a', onFileWritten }).find((t) => t.name === 'bash')!;
+
+    // Simulate a skill unpacking its source tree into the workspace alongside
+    // the one file the user actually wanted (slides.pptx).
     const res = await bash.execute({
       command:
-        'node -e "const fs=require(\'fs\');' +
-        'fs.writeFileSync(\'workspace-doc.docx\', \'wrong-owner\');' +
-        'fs.mkdirSync(process.env.ORKAS_OUTPUT_DIR, { recursive: true });' +
-        'fs.writeFileSync(process.env.ORKAS_OUTPUT_DIR + \'/visible.json\', \'{}\');"',
+        'node -e "const fs=require(\'fs\');const d=process.env.ORKAS_OUTPUT_DIR;' +
+        'fs.mkdirSync(d + \'/.github\', { recursive: true });' +
+        'fs.writeFileSync(d + \'/README.md\', \'r\');' +
+        'fs.writeFileSync(d + \'/README_CN.md\', \'r\');' +
+        'fs.writeFileSync(d + \'/LICENSE\', \'l\');' +
+        'fs.writeFileSync(d + \'/CONTRIBUTING.md\', \'c\');' +
+        'fs.writeFileSync(d + \'/.gitignore\', \'g\');' +
+        'fs.writeFileSync(d + \'/.env.example\', \'e\');' +
+        'fs.writeFileSync(d + \'/.github/config.yml\', \'y\');' +
+        'fs.writeFileSync(d + \'/slides.pptx\', \'p\');"',
       timeoutMs: 5000,
     }, makeCtx());
 
     expect(res.isError).toBeFalsy();
-    const outputDir = path.join(tmpDir, '__orkas_outputs', 'agent-a', 'turn-3');
     const produced = new Set(onFileWritten.mock.calls.map(([p]) => p));
-    expect(produced).toContain(path.join(outputDir, 'visible.json'));
-    expect(produced).not.toContain(path.join(tmpDir, 'workspace-doc.docx'));
+    expect(produced).toContain(path.join(tmpDir, 'slides.pptx'));
+    expect(produced).not.toContain(path.join(tmpDir, 'README.md'));
+    expect(produced).not.toContain(path.join(tmpDir, 'README_CN.md'));
+    expect(produced).not.toContain(path.join(tmpDir, 'LICENSE'));
+    expect(produced).not.toContain(path.join(tmpDir, 'CONTRIBUTING.md'));
+    expect(produced).not.toContain(path.join(tmpDir, '.gitignore'));
+    expect(produced).not.toContain(path.join(tmpDir, '.env.example'));
+    expect(produced).not.toContain(path.join(tmpDir, '.github', 'config.yml'));
   });
 });
 
@@ -227,6 +353,7 @@ describe('local-tools › write_file', () => {
   it('writes to the model-given path verbatim when no collision exists', async () => {
     const { lt, perm } = await loadModules();
     perm.grantLocalExec();
+    await setTmpWorkspace();
     const onFileWritten = vi.fn();
     const wf = lt.createLocalTools({ userId: 'u1', onFileWritten })
       .find((t) => t.name === 'write_file')!;
@@ -241,6 +368,7 @@ describe('local-tools › write_file', () => {
   it('uniquifies basename and emits <file-renamed> when target exists and is not ours', async () => {
     const { lt, perm } = await loadModules();
     perm.grantLocalExec();
+    await setTmpWorkspace();
     const target = path.join(tmpDir, 'note.md');
     fs.writeFileSync(target, 'foreign');
     const onFileWritten = vi.fn();
@@ -261,6 +389,7 @@ describe('local-tools › write_file', () => {
   it('overwrites in place (no rename) when hasProducedPath claims the target', async () => {
     const { lt, perm } = await loadModules();
     perm.grantLocalExec();
+    await setTmpWorkspace();
     const target = path.join(tmpDir, 'draft.md');
     fs.writeFileSync(target, 'v1');
     const produced = new Set<string>([target]);

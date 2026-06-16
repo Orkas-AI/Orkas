@@ -133,7 +133,8 @@ function guardPath(opts: FileToolsOpts, abs: string): string | null {
   if (!isPathAllowed(abs, allowedRoots(opts))) {
     return errText(
       'E_PATH_OUT_OF_SCOPE',
-      `path is outside the current conversation's visible scope (workspace + attachments): ${abs}`,
+      `path is outside the current conversation's visible scope (workspace + attachments + user-granted folders): ${abs}. `
+      + 'If the user needs this folder, ask them to authorize it under "Settings → Folder Access" — do not retry until they do.',
     );
   }
   return null;
@@ -380,7 +381,7 @@ interface SearchHit {
   size: number;
   mtime: number;
   ext: string;
-  source: 'attachment' | 'workspace';
+  source: 'attachment' | 'workspace' | 'extra';
   /** Only present when a fresh cache entry is already on disk. Never
    *  triggers extract just to populate this field. */
   totalChars?: number;
@@ -465,12 +466,15 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
         return { content: errText('E_NO_SCOPE', 'no visible roots for this conversation'), isError: true };
       }
 
-      const rootKinds: Array<{ root: string; source: 'attachment' | 'workspace' }> = [];
+      const rootKinds: Array<{ root: string; source: 'attachment' | 'workspace' | 'extra' }> = [];
       try {
         rootKinds.push({ root: getWorkspacePath(opts.userId, opts.projectId), source: 'workspace' });
       } catch { /* workspace unavailable → skip */ }
       if (opts.cid) {
         rootKinds.push({ root: chatAttachmentDir(opts.userId, opts.cid), source: 'attachment' });
+      }
+      for (const root of [...(opts.extraRoots || []), ...(opts.readOnlyExtraRoots || [])]) {
+        if (root) rootKinds.push({ root, source: 'extra' });
       }
 
       const hits: SearchHit[] = [];
@@ -541,7 +545,7 @@ interface GrepHit {
   path: string;
   line: number;
   snippet: string;
-  source: 'attachment' | 'workspace';
+  source: 'attachment' | 'workspace' | 'extra';
 }
 
 async function pMapLimit<T, U>(
@@ -599,15 +603,18 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
         return { content: errText('E_BAD_INPUT', `invalid regex: ${(err as Error).message}`), isError: true };
       }
 
-      const rootKinds: Array<{ root: string; source: 'attachment' | 'workspace' }> = [];
+      const rootKinds: Array<{ root: string; source: 'attachment' | 'workspace' | 'extra' }> = [];
       try { rootKinds.push({ root: getWorkspacePath(opts.userId, opts.projectId), source: 'workspace' }); }
       catch { /* workspace unavailable */ }
       if (opts.cid) rootKinds.push({ root: chatAttachmentDir(opts.userId, opts.cid), source: 'attachment' });
+      for (const root of [...(opts.extraRoots || []), ...(opts.readOnlyExtraRoots || [])]) {
+        if (root) rootKinds.push({ root, source: 'extra' });
+      }
       if (!rootKinds.length) {
         return { content: errText('E_NO_SCOPE', 'no visible roots for this conversation'), isError: true };
       }
 
-      const targets: Array<{ abs: string; source: 'attachment' | 'workspace' }> = [];
+      const targets: Array<{ abs: string; source: 'attachment' | 'workspace' | 'extra' }> = [];
       const skippedScans: string[] = [];
       let budget = MAX_SCAN_FILES;
       for (const { root, source } of rootKinds) {
@@ -738,11 +745,64 @@ function snippetFromLine(line: string, matcher: RegExp): string {
 
 // ── Factory ──────────────────────────────────────────────────────────────
 
+// ── list_files ─────────────────────────────────────────────────────────────
+//
+// Overrides core-agent's builtin `list_files`, which does an unguarded
+// `fs.readdir` and would let the model enumerate any directory on disk
+// (e.g. ~/.ssh, other users' chat dirs) — bypassing the sandbox every other
+// file tool enforces. This override applies the same scope gate as read_file.
+function createListFilesTool(opts: FileToolsOpts): AgentTool {
+  return {
+    name: 'list_files',
+    description:
+      'List the entries (files and subdirectories) of a directory by absolute path.\n'
+      + '\n'
+      + 'Parameters:\n'
+      + '  path — required. Must be inside the current workspace, this conversation\'s\n'
+      + '         attachment dir, or a user-granted folder.\n'
+      + '\n'
+      + 'Each line is `d <name>` for a directory or `f <name>` for a file.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute directory path. Must be inside the conversation\'s visible scope.' },
+      },
+      required: ['path'],
+    },
+    async execute(input, ctx) {
+      const raw = String(input.path ?? '');
+      if (!raw) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
+      const abs = resolveAbs(ctx, raw);
+
+      const scopeErr = guardPath(opts, abs);
+      if (scopeErr) {
+        log.warn(`list_files scope reject user=${opts.userId} path=${abs}`);
+        return { content: scopeErr, isError: true };
+      }
+      const disabledSkillErr = guardDisabledSkillAccess(opts, abs);
+      if (disabledSkillErr) {
+        log.warn(`list_files disabled skill reject user=${opts.userId} path=${abs}`);
+        return { content: disabledSkillErr, isError: true };
+      }
+
+      try {
+        const entries = await fs.promises.readdir(abs, { withFileTypes: true });
+        const lines = entries.map((e) => `${e.isDirectory() ? 'd' : 'f'} ${e.name}`);
+        return { content: lines.join('\n') };
+      } catch (err) {
+        log.warn(`list_files failed user=${opts.userId} path=${abs}: ${(err as Error).message}`);
+        return { content: errText('E_LIST_FAILED', `${abs}: ${(err as Error).message}`), isError: true };
+      }
+    },
+  };
+}
+
 export function createFileTools(opts: FileToolsOpts): AgentTool[] {
   return [
     createReadFileTool(opts),
     createStatFileTool(opts),
     createSearchFilesTool(opts),
     createGrepFilesTool(opts),
+    createListFilesTool(opts),
   ];
 }

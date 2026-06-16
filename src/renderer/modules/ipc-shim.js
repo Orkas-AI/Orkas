@@ -143,9 +143,19 @@ function _mockErrorResponse(error, status) {
   };
 }
 
-function _monitorIpcError(kind, channel, data) {
-  try {
-  } catch (_) {}
+function _monitorIpcError() {}
+
+function _hasOrkasInvoke() {
+  return !!(window.orkas && typeof window.orkas.invoke === 'function');
+}
+
+function _hasOrkasStream() {
+  return !!(window.orkas && typeof window.orkas.stream === 'function');
+}
+
+function _isStreamCancel(err) {
+  const msg = err && err.message ? String(err.message) : String(err || '');
+  return (err && err.name === 'AbortError') || msg === 'stream cancelled';
 }
 
 /**
@@ -173,6 +183,10 @@ function _streamResponse(channel, payload, signal) {
       streamHandle.promise
         .then(() => { try { controller.close(); } catch (_) {} })
         .catch((err) => {
+          if (_isStreamCancel(err)) {
+            try { controller.close(); } catch (_) {}
+            return;
+          }
           _monitorIpcError('ipc_stream', channel, { msg: err && err.message ? err.message : String(err) });
           try { controller.error(err); } catch (_) {}
         });
@@ -202,6 +216,10 @@ function _streamResponse(channel, payload, signal) {
  * (e.g. `{ cid }` for per-conversation attachments).
  */
 async function _uploadBinary(channel, options, extraParams) {
+  if (!_hasOrkasInvoke()) {
+    return _mockJsonResponse({ ok: false, error: 'ipc bridge unavailable' });
+  }
+
   const rawName = ((options.headers || {})['X-Filename']) || '';
   const name = rawName ? decodeURIComponent(rawName) : '';
   const body = options.body;
@@ -282,6 +300,9 @@ function apiFetch(url, options) {
 
   // Streaming: go through window.orkas.stream + ReadableStream body.
   if (opts.stream) {
+    if (!_hasOrkasStream()) {
+      return Promise.resolve(_mockJsonResponse({ ok: false, error: 'ipc stream bridge unavailable' }));
+    }
     const payload = { ...query, ...body, ...params };
     return Promise.resolve(_streamResponse(channel, payload, options.signal));
   }
@@ -290,6 +311,10 @@ function apiFetch(url, options) {
   const payload = opts.wrapAsUpdates
     ? { ...params, updates: body, ...query }
     : { ...query, ...body, ...params };
+
+  if (!_hasOrkasInvoke()) {
+    return Promise.resolve(_mockJsonResponse({ ok: false, error: 'ipc bridge unavailable' }));
+  }
 
   return window.orkas.invoke(channel, payload)
     .then((result) => {

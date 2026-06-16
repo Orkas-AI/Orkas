@@ -3,6 +3,12 @@ let _conversationInlineRenameCid = null;
 let _conversationHeaderRenameCid = null;
 const _conversationExpandedBuckets = new Set();
 
+function _convTrackClick(action, data) {
+}
+
+function _convTrackEvent(action, data) {
+}
+
 function _uiIconHtml(name, className) {
   if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') return window.uiIconHtml(name, className || 'ui-icon');
   return '';
@@ -78,6 +84,15 @@ function _highlightMentionsIn(rootEl) {
     if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
     if (node.parentNode) node.parentNode.replaceChild(frag, node);
   }
+}
+
+function _isFailedAssistantContent(rawContent, message = null) {
+  if (message && (message.failed === true || message.error === true)) return true;
+  const raw = String(rawContent || '');
+  return /\bmsg-error\b/.test(raw)
+    || /color\s*:\s*var\(--danger\)/i.test(raw)
+    || /style=["'][^"']*var\(--danger\)/i.test(raw)
+    || /(?:模型调用失败|model\s+(?:call|invocation)\s+failed)/i.test(raw);
 }
 
 function _skillsForDisplayNameRewrite() {
@@ -437,6 +452,12 @@ function setChatRecipient(target, next, _opts = {}) {
     }
   }
   if (r.kind === 'agent' && typeof setChatUseSelection === 'function') {
+    // Switching INTO an agent clears any pending use chip. This keeps an
+    // open-tier (global / external-package) skill chip — pickable only while
+    // on the commander — from being carried into agent execution, which would
+    // run it via orkas_run_skill and break the open-tier commander-only rule.
+    // Picking a (trusted) skill while already on the agent is unaffected: that
+    // path never calls setChatRecipient.
     setChatUseSelection(target, null, { focus: false });
   }
   _renderRecipientChip(target);
@@ -500,6 +521,8 @@ function onEnterNewChatView() {
   // so the time-of-day greeting is correct after a long idle session.
   _refreshEmptyStateAll();
   _initEmptyStateScenarios();
+  // Open-source-driven「还能帮你做这些」capability strip (below the scenario row).
+  if (typeof initOssEntry === 'function') initOssEntry();
 }
 
 // ── Empty-state landing helpers ──────────────────────────────────────────
@@ -559,9 +582,18 @@ function _pickGreetingKey(date) {
   if (h < 18) return 'new_chat.greeting_afternoon';  // 12-17
   return 'new_chat.greeting_evening';                // 18-23
 }
-function _ensureEmptyStateAccountSub() {}
+let _emptyStateAccountStatus = null;
+let _emptyStateAccountSubBound = false;
+function _ensureEmptyStateAccountSub() {
+  _emptyStateAccountSubBound = true;
+}
 function _emptyStateUserDisplayName() {
-  return '';
+  const u = (_emptyStateAccountStatus && _emptyStateAccountStatus.userInfo) || null;
+  if (!u) return '';
+  // Prefer nickname; fall back to the email local-part so the greeting never
+  // shows a full email address (privacy + visual).
+  const raw = String(u.nickname || u.email || '').trim();
+  return raw.split('@')[0].trim();
 }
 function _refreshEmptyStateGreeting() {
   const el = document.getElementById('new-chat-greeting');
@@ -928,6 +960,16 @@ function _groupEventDedupeKey(evData) {
       const eventId = payload.id || payload.call_id || payload.tool_call_id || payload.request_id || '';
       const phase = payload.phase || payload.status || payload.type || '';
       const name = payload.name || payload.tool || payload.command || '';
+      if (evt.stream === 'tool' && String(phase) === 'progress') {
+        const progressPhase = String(payload.progress_phase || '');
+        const message = String(payload.message || '').slice(0, 500);
+        let progressData = '';
+        if (payload.progress_data != null) {
+          try { progressData = JSON.stringify(payload.progress_data).slice(0, 500); }
+          catch (_) { progressData = String(payload.progress_data).slice(0, 500); }
+        }
+        return `process:event:${actor}:${turnId}:${evt.stream || ''}:${eventId}:${phase}:${name}:${progressPhase}:${message}:${progressData}`;
+      }
       if (eventId || phase || name) {
         return `process:event:${actor}:${turnId}:${evt.stream || ''}:${eventId}:${phase}:${name}`;
       }
@@ -1483,7 +1525,7 @@ function _actorLinkAttrs(fromId) {
 async function _openActorAgentDetail(actorId) {
   const aid = String(actorId || '').trim();
   if (!_isAgentActor(aid)) return;
-    setView('agents');
+  setView('agents');
   try {
     const res = await apiFetch(`/api/agents/${encodeURIComponent(aid)}`);
     const data = await res.json();
@@ -1835,6 +1877,35 @@ function _chatAttachKindFromExt(ext) {
   return 'text';
 }
 
+function _chatAttachTargetOf(cid) {
+  if (cid === DRAFT_CID) return 'new_chat';
+  if (typeof cid === 'string' && cid.startsWith('agent-edit-')) return 'agent_edit';
+  if (typeof cid === 'string' && cid.startsWith('skill-edit-')) return 'skill_edit';
+  return 'conversation';
+}
+
+function _chatAttachPayload(cid, files, source) {
+  const list = Array.from(files || []);
+  const kinds = {};
+  let totalBytes = 0;
+  for (const file of list) {
+    const name = file && (file.name || file.path || '');
+    const kind = _chatAttachKindFromExt(_chatAttachExtOf(name));
+    kinds[kind] = (kinds[kind] || 0) + 1;
+    totalBytes += Number((file && (file.size || file.bytes)) || 0);
+  }
+  return {
+    source,
+    target: _chatAttachTargetOf(cid),
+    file_count: list.length,
+    total_bytes: totalBytes,
+    image_count: kinds.image || 0,
+    video_count: kinds.video || 0,
+    document_count: (kinds.pdf || 0) + (kinds.docx || 0),
+    text_count: kinds.text || 0,
+  };
+}
+
 function _chatAttachBaseName(p) {
   const parts = String(p || '').split(/[\\/]/).filter(Boolean);
   return parts.length ? parts[parts.length - 1] : String(p || '');
@@ -2033,10 +2104,18 @@ function _chatAttachReplaceByTempId(cid, tempId, patch) {
   _chatAttachSet(cid, items);
 }
 
-async function _chatAttachUpload(cid, fileList) {
+async function _chatAttachUpload(cid, fileList, source = 'drop') {
+  const clickPayload = _chatAttachPayload(cid, fileList, source);
+  _convTrackClick('chat_attachment_upload', clickPayload);
   const { prepared, rejected } = await _chatAttachPrepareUploadFiles(cid, fileList);
   if (!prepared.length) {
     if (rejected.length) uiAlert(t('chat.attach_rejected_prefix', { list: rejected.join('\n') }));
+    _convTrackEvent('chat_attachment_upload_result', {
+      ...clickPayload,
+      result: rejected.length ? 'failure' : 'skipped',
+      uploaded_count: 0,
+      failed_count: rejected.length,
+    });
     return;
   }
 
@@ -2063,6 +2142,7 @@ async function _chatAttachUpload(cid, fileList) {
   _chatAttachSet(cid, current);
 
   // ── Step 2: upload all in parallel; rendering is already done ─────────
+  let uploadFailed = 0;
   await Promise.all(placeholders.map(async (ph) => {
     try {
       const res = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/attachments/upload`, {
@@ -2076,6 +2156,7 @@ async function _chatAttachUpload(cid, fileList) {
       const data = await res.json();
       if (!data.ok) {
         _chatAttachReplaceByTempId(cid, ph.tempId, null);
+        uploadFailed += 1;
         rejected.push(t('chat.attach_upload_fail', { name: ph.file.name, reason: data.error || t('chat.attach_upload_generic_fail') }));
         return;
       }
@@ -2093,27 +2174,51 @@ async function _chatAttachUpload(cid, fileList) {
       });
     } catch (err) {
       _chatAttachReplaceByTempId(cid, ph.tempId, null);
+      uploadFailed += 1;
       rejected.push(t('chat.attach_upload_fail', { name: ph.file.name, reason: err.message || t('chat.attach_upload_generic_fail') }));
     }
   }));
+  const uploadedCount = Math.max(0, placeholders.length - uploadFailed);
+  const failedCount = rejected.length;
+  _convTrackEvent('chat_attachment_upload_result', {
+    ...clickPayload,
+    result: failedCount ? (uploadedCount ? 'partial_failure' : 'failure') : 'success',
+    uploaded_count: uploadedCount,
+    failed_count: failedCount,
+  });
 
   if (rejected.length) {
     uiAlert(t('chat.attach_rejected_prefix', { list: rejected.join('\n') }));
   }
 }
 
-async function _chatAttachPickAndUpload(cid) {
+async function _chatAttachPickAndUpload(cid, source = 'picker') {
   if (!cid) return;
+  const basePayload = { source, target: _chatAttachTargetOf(cid) };
+  _convTrackClick('chat_attachment_upload', basePayload);
   let data;
   try {
     data = await window.orkas.invoke('conversations.attachments.pickAndUpload', { cid });
   } catch (err) {
     _convLog.warn('native attachment picker failed', err);
+    _convTrackEvent('chat_attachment_upload_result', {
+      ...basePayload,
+      result: 'failure',
+      uploaded_count: 0,
+      failed_count: 1,
+    });
     await uiAlert(t('chat.attach_upload_fail', { name: '', reason: err.message || t('chat.attach_upload_generic_fail') }));
     return;
   }
   const picked = Array.isArray(data && data.items) ? data.items : [];
   const failed = Array.isArray(data && data.failed) ? data.failed : [];
+  _convTrackEvent('chat_attachment_upload_result', {
+    ...basePayload,
+    result: failed.length ? (picked.length ? 'partial_failure' : 'failure') : 'success',
+    uploaded_count: picked.length,
+    failed_count: failed.length,
+    file_count: picked.length + failed.length,
+  });
   if (picked.length) {
     const current = _chatAttachList(cid).slice();
     for (const item of picked) {
@@ -2170,9 +2275,11 @@ function _chatAttachInternalDragItems(dataTransfer) {
   }
 }
 
-async function _chatAttachImportPaths(cid, entries) {
+async function _chatAttachImportPaths(cid, entries, source = 'internal_drop') {
   const files = Array.isArray(entries) ? entries.filter((it) => it && it.path) : [];
   if (!files.length) return;
+  const clickPayload = _chatAttachPayload(cid, files, source);
+  _convTrackClick('chat_attachment_upload', clickPayload);
 
   const placeholders = [];
   const current = _chatAttachList(cid).slice();
@@ -2195,6 +2302,7 @@ async function _chatAttachImportPaths(cid, entries) {
   _chatAttachSet(cid, current);
 
   const rejected = [];
+  let uploadFailed = 0;
   await Promise.all(placeholders.map(async (ph) => {
     try {
       const res = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/attachments/import`, {
@@ -2205,6 +2313,7 @@ async function _chatAttachImportPaths(cid, entries) {
       const data = await res.json();
       if (!data.ok) {
         _chatAttachReplaceByTempId(cid, ph.tempId, null);
+        uploadFailed += 1;
         rejected.push(t('chat.attach_upload_fail', { name: ph.name, reason: data.error || t('chat.attach_upload_generic_fail') }));
         return;
       }
@@ -2220,9 +2329,17 @@ async function _chatAttachImportPaths(cid, entries) {
       });
     } catch (err) {
       _chatAttachReplaceByTempId(cid, ph.tempId, null);
+      uploadFailed += 1;
       rejected.push(t('chat.attach_upload_fail', { name: ph.name, reason: err.message || t('chat.attach_upload_generic_fail') }));
     }
   }));
+  const uploadedCount = Math.max(0, placeholders.length - uploadFailed);
+  _convTrackEvent('chat_attachment_upload_result', {
+    ...clickPayload,
+    result: uploadFailed ? (uploadedCount ? 'partial_failure' : 'failure') : 'success',
+    uploaded_count: uploadedCount,
+    failed_count: rejected.length,
+  });
 
   if (rejected.length) {
     uiAlert(t('chat.attach_rejected_prefix', { list: rejected.join('\n') }));
@@ -2230,7 +2347,7 @@ async function _chatAttachImportPaths(cid, entries) {
 }
 
 window.addChatAttachmentsFromPaths = async function addChatAttachmentsFromPaths(cid, entries) {
-  return _chatAttachImportPaths(cid || currentCid, entries);
+  return _chatAttachImportPaths(cid || currentCid, entries, 'external_import');
 };
 
 async function _chatAttachRefreshFromServer(cid) {
@@ -2268,7 +2385,7 @@ function _renderMessageAttachmentsHtml(names, cid) {
     if (kind === 'video' && cid) {
       const url = _chatMediaUrl(cid, n);
       return `<span class="chat-msg-attach is-video" data-attach-name="${label}" data-attach-cid="${escapeHtml(cid)}" title="${label}">
-        <video class="chat-msg-attach-video" controls preload="metadata" src="${url}"></video>
+        <video class="chat-msg-attach-video" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${url}"></video>
         <span class="chat-msg-attach-label">${label}</span>
       </span>`;
     }
@@ -2291,113 +2408,81 @@ function _iconForProduced(name) {
   return _chatFileIconHtml(name);
 }
 
+// Final-deliverable extensions float to the front of the chip row so the file
+// the user actually asked for leads, even when a noisy bash run mixed in stray
+// repo files. Everything else keeps its original order behind them.
+const _PRODUCED_DELIVERABLE_EXTS = new Set([
+  'pptx', 'ppt', 'key',
+  'docx', 'doc', 'pages',
+  'xlsx', 'xls', 'numbers', 'csv',
+  'pdf',
+  'zip',
+]);
+const _PRODUCED_VISIBLE_LIMIT = 8;
+
+function _producedDeliverableRank(name) {
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  return _PRODUCED_DELIVERABLE_EXTS.has(ext) ? 0 : 1;
+}
+
+function _producedPathSpecificity(p) {
+  const raw = String(p || '');
+  const segments = raw.split(/[\\/]/).filter(Boolean).length;
+  const absoluteBonus = (/^(?:[a-zA-Z]:[\\/]|[\\/])/.test(raw)) ? 1000 : 0;
+  return absoluteBonus + segments;
+}
+
+// Dedup by basename (the chip only shows the basename, so same-name files from
+// different dirs read as confusing duplicates) and float deliverables first.
+// If a turn reports both an early shallow/stale path and a later final path
+// with the same basename, keep the more specific path so the chip opens the
+// real deliverable instead of a root-level scratch name.
+// Stable: original order is preserved within each rank.
+function _orderProducedPaths(absPaths) {
+  const byBase = new Map();
+  for (const [i, p] of absPaths.entries()) {
+    const base = (p.split(/[\\/]/).pop() || p);
+    const next = { path: p, base, i };
+    const prev = byBase.get(base);
+    if (!prev) {
+      byBase.set(base, next);
+      continue;
+    }
+    const nextScore = _producedPathSpecificity(next.path);
+    const prevScore = _producedPathSpecificity(prev.path);
+    if (nextScore > prevScore || (nextScore === prevScore && next.i > prev.i)) {
+      byBase.set(base, { ...next, i: prev.i });
+    }
+  }
+  return Array.from(byBase.values())
+    .sort((a, b) => _producedDeliverableRank(a.base) - _producedDeliverableRank(b.base) || a.i - b.i);
+}
+
 function _renderMessageProducedHtml(absPaths) {
   // Chip shows just the filename. The full absolute path lives only in
   // `data-produced-path` for the click handler; tooltip is a static
   // localized "preview" hint instead of the raw OS path (which exposes
   // the user's home directory and is hostile UX in mixed-locale contexts).
   const hint = t('chat.produced_preview_title');
-  const items = absPaths.map((p) => {
-    const base = p.split(/[\\/]/).pop() || p;
-    const icon = _iconForProduced(base);
-    return `<span class="chat-msg-produced-item" data-produced-path="${escapeHtml(p)}" title="${escapeHtml(hint)}">
+  const ordered = _orderProducedPaths(absPaths);
+  const items = ordered.map((e, idx) => {
+    const icon = _iconForProduced(e.base);
+    const overflow = idx >= _PRODUCED_VISIBLE_LIMIT ? ' is-produced-overflow' : '';
+    return `<span class="chat-msg-produced-item${overflow}" data-produced-path="${escapeHtml(e.path)}" title="${escapeHtml(hint)}">
       <span class="chat-msg-produced-icon">${icon}</span>
-      <span class="chat-msg-produced-label">${escapeHtml(base)}</span>
-      <button type="button" class="chat-msg-produced-menu-btn" data-produced-menu title="${escapeHtml(t('common.more'))}" aria-label="${escapeHtml(t('common.more'))}">⋯</button>
+      <span class="chat-msg-produced-label">${escapeHtml(e.base)}</span>
     </span>`;
   });
-  return `<div class="chat-msg-produced">${items.join('')}</div>`;
-}
-
-function _producedFilePayload(absPath) {
-  const payload = { path: absPath };
-  if (currentCid) payload.cid = currentCid;
-  return payload;
-}
-
-function _ensureProducedMenu() {
-  let menu = document.getElementById('chat-produced-file-menu');
-  if (!menu) {
-    menu = document.createElement('div');
-    menu.id = 'chat-produced-file-menu';
-    menu.className = 'ctx-row-menu chat-produced-file-menu';
-    menu.style.display = 'none';
-    document.body.appendChild(menu);
+  // A long, noisy chip row (e.g. a skill that cloned its repo into the
+  // workspace) collapses past the visible limit behind a "+N more" toggle so
+  // the deliverable stays front and centre; clicking reveals the rest in place.
+  let moreHtml = '';
+  const hiddenCount = ordered.length - _PRODUCED_VISIBLE_LIMIT;
+  if (hiddenCount > 0) {
+    const moreLabel = t('chat.produced_show_more', { count: hiddenCount });
+    moreHtml = `<span class="chat-msg-produced-more" data-role="produced-more">${escapeHtml(moreLabel)}</span>`;
   }
-  return menu;
-}
-
-function _closeProducedMenu() {
-  const menu = document.getElementById('chat-produced-file-menu');
-  if (!menu) return;
-  menu.style.display = 'none';
-  document.removeEventListener('mousedown', _onProducedMenuOutside, true);
-  document.removeEventListener('keydown', _onProducedMenuKeyDown, true);
-}
-
-function _onProducedMenuOutside(ev) {
-  const menu = document.getElementById('chat-produced-file-menu');
-  if (!menu || menu.style.display === 'none') return;
-  if (menu.contains(ev.target)) return;
-  if (ev.target && ev.target.closest && ev.target.closest('.chat-msg-produced-menu-btn')) return;
-  _closeProducedMenu();
-}
-
-function _onProducedMenuKeyDown(ev) {
-  if (ev.key === 'Escape') _closeProducedMenu();
-}
-
-function _positionProducedMenu(menu, anchor) {
-  menu.style.display = 'block';
-  menu.style.left = '-9999px';
-  menu.style.top = '-9999px';
-  const rect = anchor.getBoundingClientRect();
-  const mr = menu.getBoundingClientRect();
-  const margin = 8;
-  const gap = 4;
-  let left = rect.right - mr.width;
-  if (left < margin) left = margin;
-  if (left + mr.width > window.innerWidth - margin) left = window.innerWidth - mr.width - margin;
-  const below = rect.bottom + gap + mr.height <= window.innerHeight - margin;
-  const top = below ? rect.bottom + gap : Math.max(margin, rect.top - mr.height - gap);
-  menu.style.left = `${left}px`;
-  menu.style.top = `${top}px`;
-}
-
-async function _saveProducedFileAsApp(absPath) {
-  try {
-    const res = await window.orkas.invoke('savedApps.saveFromPath', _producedFilePayload(absPath));
-    if (!res || res.ok === false) throw new Error((res && res.error) || 'failed');
-    if (typeof uiToast === 'function') uiToast(t('apps.saved_toast'), { variant: 'success' });
-    else if (typeof uiAlert === 'function') await uiAlert(t('apps.saved_toast'));
-    try { if (typeof loadSavedApps === 'function') loadSavedApps(true); } catch (_) {}
-  } catch (err) {
-    if (typeof uiAlert === 'function') await uiAlert(`${t('apps.save_failed')}: ${String(err && err.message || err)}`);
-  }
-}
-
-async function _openProducedFileMenu(anchorBtn, absPath) {
-  if (!anchorBtn || !absPath) return;
-  const menu = _ensureProducedMenu();
-  _closeProducedMenu();
-  let canSave = false;
-  try {
-    const inspected = await window.orkas.invoke('savedApps.inspectBundleFromPath', _producedFilePayload(absPath));
-    canSave = !!(inspected && inspected.ok !== false && inspected.canSave);
-  } catch (_) { canSave = false; }
-  if (!canSave) return;
-  menu.innerHTML = `<div class="ctx-row-menu-item" data-action="save-as-app">${escapeHtml(t('apps.save_from_file_action'))}</div>`;
-  menu.querySelectorAll('.ctx-row-menu-item[data-action]').forEach((item) => {
-    item.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      const action = item.dataset.action || '';
-      _closeProducedMenu();
-      if (action === 'save-as-app') await _saveProducedFileAsApp(absPath);
-    });
-  });
-  _positionProducedMenu(menu, anchorBtn);
-  document.addEventListener('mousedown', _onProducedMenuOutside, true);
-  document.addEventListener('keydown', _onProducedMenuKeyDown, true);
+  return `<div class="chat-msg-produced">${items.join('')}${moreHtml}</div>`;
 }
 
 // Render a "view details" chip on an assistant bubble when a new agent was
@@ -2432,7 +2517,7 @@ function _hydrateMessageCreatedAgentChip(msgDiv) {
     chip.addEventListener('click', async () => {
       const aid = chip.dataset.agentId;
       if (!aid) return;
-            setView('agents');
+      setView('agents');
       // Pre-check the agent is still loadable; if it was deleted (or its
       // record is broken) the detail view would render an empty shell —
       // bail to the grid instead.
@@ -2472,7 +2557,7 @@ function _hydrateMessageCreatedSkillChip(msgDiv) {
     chip.addEventListener('click', async () => {
       const sid = chip.dataset.skillId;
       if (!sid) return;
-            setView('skills');
+      setView('skills');
       // Pre-check SKILL.md is readable; covers both "skill was deleted" and
       // "skill row exists but its files are missing" (entering the detail
       // would render a 'file not found' shell otherwise).
@@ -2491,7 +2576,6 @@ function _hydrateMessageProducedChips(msgDiv) {
   chips.forEach((chip) => {
     chip.addEventListener('click', (e) => {
       e.stopPropagation();
-      if (e.target && e.target.closest && e.target.closest('.chat-msg-produced-menu-btn')) return;
       const p = chip.dataset.producedPath;
       if (!p) return;
       if (typeof openChatFileViewer === 'function') {
@@ -2499,17 +2583,16 @@ function _hydrateMessageProducedChips(msgDiv) {
         openChatFileViewer(p, base, currentCid ? { cid: currentCid } : undefined);
       }
     });
-    const menuBtn = chip.querySelector('.chat-msg-produced-menu-btn[data-produced-menu]');
-    if (menuBtn && menuBtn.dataset.bound !== '1') {
-      menuBtn.dataset.bound = '1';
-      menuBtn.addEventListener('click', async (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        const p = chip.dataset.producedPath;
-        if (p) await _openProducedFileMenu(menuBtn, p);
-      });
-    }
   });
+  const more = msgDiv.querySelector('.chat-msg-produced-more[data-role="produced-more"]');
+  if (more) {
+    more.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const row = more.closest('.chat-msg-produced');
+      if (row) row.classList.add('is-expanded');
+      more.remove();
+    });
+  }
 }
 
 function _showFileMissingToast(name) {
@@ -2607,7 +2690,7 @@ function _bindChatPasteAttach(inputSelector, getCid) {
     // Fire-and-forget — _chatAttachUpload paints placeholder chips
     // synchronously before any network IO, so the user sees the chip
     // appear at the top of the input area as soon as the paste lands.
-    _chatAttachUpload(cid, cd.files);
+    _chatAttachUpload(cid, cd.files, 'paste');
   });
   el.dataset.pasteBound = '1';
 }
@@ -2642,10 +2725,10 @@ function _bindChatDropAttach(wrapSelector, getCid) {
     if (!cid) return;
     const internalFiles = _chatAttachInternalDragItems(e.dataTransfer);
     if (internalFiles.length) {
-      _chatAttachImportPaths(cid, internalFiles);
+      _chatAttachImportPaths(cid, internalFiles, 'internal_drop');
       return;
     }
-    _chatAttachUpload(cid, e.dataTransfer.files);
+    _chatAttachUpload(cid, e.dataTransfer.files, 'drop');
   });
   el.dataset.dropBound = '1';
 }
@@ -2655,7 +2738,7 @@ function _initChatAttachInput() {
   if (!btn || btn.dataset.bound === '1') return;
   btn.addEventListener('click', () => {
     if (!currentCid) return;
-    _chatAttachPickAndUpload(currentCid);
+    _chatAttachPickAndUpload(currentCid, 'picker');
   });
   _bindChatPasteAttach('#chat-input', () => currentCid);
   _bindChatDropAttach('.chat-input-area', () => currentCid);
@@ -2672,7 +2755,7 @@ function _initChatAttachInput() {
 function _initNewChatAttachInput() {
   const btn = document.getElementById('new-chat-attach-btn');
   if (!btn || btn.dataset.bound === '1') return;
-  btn.addEventListener('click', () => _chatAttachPickAndUpload(DRAFT_CID));
+  btn.addEventListener('click', () => _chatAttachPickAndUpload(DRAFT_CID, 'picker'));
   _bindChatPasteAttach('#new-chat-input', () => DRAFT_CID);
   _bindChatDropAttach('.new-chat-input-area', () => DRAFT_CID);
   btn.dataset.bound = '1';
@@ -2690,11 +2773,13 @@ async function loadConversations() {
     }
   } catch (e) {
     _convLog.error('load conversations failed', e);
-      }
+  }
 }
 
-// Remote activity subscription is stripped from OrkasOpen.
-function startRelayActivitySubscription() {}
+let _relayActivityWatchStarted = false;
+function startRelayActivitySubscription() {
+  _relayActivityWatchStarted = true;
+}
 
 // `timeBucket` + `_BUCKET_ORDER` live in modules/conv-bucket.js (loaded
 // ahead of this file in index.html). Kept as a separate file so its pure
@@ -3288,7 +3373,7 @@ function _ensureConvCreateAgentInline() {
     btn.textContent = t('chat.create_agent_inline');
     btn.addEventListener('click', () => {
       if (!currentCid) return;
-            const input = document.getElementById('chat-input');
+      const input = document.getElementById('chat-input');
       if (!input) return;
       input.value = t('chat.create_agent_message');
       autoGrow(input, 200);
@@ -3305,7 +3390,8 @@ function _ensureConvCreateAgentInline() {
     container.appendChild(el);
   }
   const hasUserMsg = !!container.querySelector('.chat-message.user');
-  const isStreaming = !!spacer;
+  const runtimeBusy = _isConvCreateAgentInlineRuntimeBusy(currentCid);
+  const isStreaming = !!spacer || runtimeBusy;
   // Once any agent (other than commander / user) joins the conversation,
   // hide the entry — in a multi-agent flow the "promote a single agent"
   // semantic no longer holds. Either signal counts:
@@ -3323,7 +3409,15 @@ function _ensureConvCreateAgentInline() {
     const f = m.dataset.from || m.dataset.fromActor;
     return f && f !== 'commander' && f !== 'user';
   });
-  el.style.display = (hasUserMsg && !isStreaming && !hasAgentMsg) ? '' : 'none';
+  el.style.display = _shouldShowConvCreateAgentInline(hasUserMsg, isStreaming, hasAgentMsg) ? '' : 'none';
+}
+
+function _isConvCreateAgentInlineRuntimeBusy(cid) {
+  return !!cid && isConvPending(cid);
+}
+
+function _shouldShowConvCreateAgentInline(hasUserMsg, isStreaming, hasAgentMsg) {
+  return !!hasUserMsg && !isStreaming && !hasAgentMsg;
 }
 
 // Single observer wired once — any childList change on chat-history
@@ -3625,18 +3719,6 @@ function _claimPersistedUserMessage(cid, gm) {
   return true;
 }
 
-// Render relayed (iOS-originated) user messages for the open conversation.
-// Unlike a local send — where the chat controller appends the user bubble
-// client-side — a relay command's user message is appended in main
-// (`remote-control feature/commands.ts`) and its `message` bus event fires inside
-// `groupChat.send`, before `relay_activity` reaches the renderer and the
-// observer attaches. So nothing renders it: the live observer's
-// `_handleGroupBusEvent` only *claims* an existing user bubble (never
-// creates one), and poll recovery filters `from !== 'user'`. Without this
-// the question only appears after a conv switch reloads history. Called at
-// activity time (the user message is the latest record), so the bubble
-// lands above the reply the observer then streams in. Stamping `data-msg-id`
-// means a later user `message` event just claims it — no duplicate.
 async function _renderRelayUserMessagesIfMissing(cid) {
   if (!cid || cid !== currentCid) return;
   const container = document.getElementById('chat-history');
@@ -3708,46 +3790,12 @@ function _restoreHistoryReloadScroll(container, snapshot) {
 // counts as following.
 const STICKY_BOTTOM_THRESHOLD = 32;
 const STICKY_PROGRAMMATIC_SCROLL_GRACE_MS = 160;
-const TASK_CHAT_AUTO_STICK_STORAGE_KEY = 'orkas.dev.taskChatAutoStick';
-const TASK_CHAT_AUTO_STICK_INTERVAL_MS = 140;
-const TASK_CHAT_AUTO_STICK_PROGRAMMATIC_GRACE_MS = 800;
 function _isNearBottom(el, threshold = STICKY_BOTTOM_THRESHOLD) {
   if (!el) return true;
   return (el.scrollHeight - el.scrollTop - el.clientHeight) <= threshold;
 }
-function _isTaskChatScrollContainer(el) {
-  return !!el && el.id === 'chat-history';
-}
-function _taskChatLastBubble(el) {
-  if (!el || typeof el.querySelectorAll !== 'function') return null;
-  const messages = el.querySelectorAll(':scope > .chat-message');
-  return messages[messages.length - 1] || null;
-}
-function _taskChatBubbleBottom(el) {
-  const bubble = _taskChatLastBubble(el);
-  if (!el || !bubble || typeof el.getBoundingClientRect !== 'function'
-      || typeof bubble.getBoundingClientRect !== 'function') {
-    return null;
-  }
-  const containerRect = el.getBoundingClientRect();
-  const bubbleRect = bubble.getBoundingClientRect();
-  return bubbleRect.bottom - containerRect.top + Number(el.scrollTop || 0);
-}
-function _taskChatStickTargetTop(el) {
-  const bubbleBottom = _taskChatBubbleBottom(el);
-  if (!Number.isFinite(bubbleBottom)) return Number(el.scrollHeight || 0);
-  const maxTop = Math.max(0, Number(el.scrollHeight || 0) - Number(el.clientHeight || 0));
-  return Math.min(
-    Math.max(0, bubbleBottom - Number(el.clientHeight || 0) + 24),
-    maxTop,
-  );
-}
 function _isNearFollowTarget(el, threshold = STICKY_BOTTOM_THRESHOLD) {
-  if (!_isTaskChatScrollContainer(el)) return _isNearBottom(el, threshold);
-  const bubbleBottom = _taskChatBubbleBottom(el);
-  if (!Number.isFinite(bubbleBottom)) return _isNearBottom(el, threshold);
-  const visibleBottom = Number(el.scrollTop || 0) + Number(el.clientHeight || 0);
-  return (bubbleBottom + 24 - visibleBottom) <= threshold;
+  return _isNearBottom(el, threshold);
 }
 function _markProgrammaticStickyScroll(el, graceMs = STICKY_PROGRAMMATIC_SCROLL_GRACE_MS) {
   if (!el) return;
@@ -3793,70 +3841,6 @@ function _bindStickToBottom(el) {
   }, { passive: true });
 }
 
-function _isTaskChatAutoStickEnabled() {
-  try {
-    return localStorage.getItem(TASK_CHAT_AUTO_STICK_STORAGE_KEY) === '1';
-  } catch (_) {
-    return false;
-  }
-}
-
-function _scheduleTaskChatAutoStick(el) {
-  if (!el || el._taskChatAutoStickTimer || el._taskChatAutoStickRaf) return;
-  const now = Date.now();
-  const lastAt = Number(el._taskChatAutoStickLastAt || 0);
-  const delay = Math.max(0, TASK_CHAT_AUTO_STICK_INTERVAL_MS - (now - lastAt));
-  const run = () => {
-    el._taskChatAutoStickTimer = null;
-    const raf = typeof requestAnimationFrame === 'function'
-      ? requestAnimationFrame
-      : (fn) => setTimeout(fn, 0);
-    el._taskChatAutoStickRaf = raf(() => {
-      el._taskChatAutoStickRaf = null;
-      if (!el) return;
-      if (_isTaskChatScrollContainer(el) && !_isTaskChatAutoStickEnabled()) return;
-      if (el._stickyEnabled === false) return;
-      if (_isStickyPausedByUser(el)) return;
-      el._taskChatAutoStickLastAt = Date.now();
-      _markProgrammaticStickyScroll(el, TASK_CHAT_AUTO_STICK_PROGRAMMATIC_GRACE_MS);
-      const targetTop = _isTaskChatScrollContainer(el)
-        ? _taskChatStickTargetTop(el)
-        : Number(el.scrollHeight || 0);
-      if (typeof el.scrollTo === 'function') {
-        try {
-          el.scrollTo({ top: targetTop, behavior: 'smooth' });
-          return;
-        } catch (_) {
-          // Some test doubles / older containers only support scrollTop.
-        }
-      }
-      el.scrollTop = targetTop;
-    });
-  };
-  if (delay > 0) el._taskChatAutoStickTimer = setTimeout(run, delay);
-  else run();
-}
-
-function _setTaskChatAutoStickEnabled(enabled) {
-  const el = document.getElementById('chat-history');
-  if (!el) return;
-  if (!enabled) {
-    if (el._taskChatAutoStickTimer) {
-      clearTimeout(el._taskChatAutoStickTimer);
-      el._taskChatAutoStickTimer = null;
-    }
-    if (el._taskChatAutoStickRaf && typeof cancelAnimationFrame === 'function') {
-      cancelAnimationFrame(el._taskChatAutoStickRaf);
-    }
-    el._taskChatAutoStickRaf = null;
-    return;
-  }
-  el._stickyUserPaused = false;
-  el._stickyEnabled = true;
-  _bindStickToBottom(el);
-  _scheduleTaskChatAutoStick(el);
-}
-
 // Scroll the container to the bottom, but only if the user hasn't scrolled
 // up. Safe to call after every DOM mutation that adds height — the no-op
 // branch (sticky off) lets the user keep reading process info undisturbed.
@@ -3868,13 +3852,6 @@ function _setTaskChatAutoStickEnabled(enabled) {
 // call lands instantly without fighting the previous animation.
 function _stickBottomIfPinned(el) {
   if (!el) return;
-  if (_isTaskChatScrollContainer(el)) {
-    if (!_isTaskChatAutoStickEnabled()) return;
-    if (el._stickyEnabled === false) return;
-    if (_isStickyPausedByUser(el)) return;
-    _scheduleTaskChatAutoStick(el);
-    return;
-  }
   if (el._scrollPinActive) {
     return;
   }
@@ -4073,6 +4050,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   const producedHtml = (role === 'assistant' && Array.isArray(message.produced) && message.produced.length)
     ? _renderMessageProducedHtml(message.produced)
     : '';
+  const failedAssistant = role === 'assistant' && _isFailedAssistantContent(rawContent, message);
   const createdAgentsList = role === 'assistant' ? _normalizeCreatedAgents(message) : null;
   const createdAgentHtml = createdAgentsList
     ? _renderMessageCreatedAgentHtml(createdAgentsList)
@@ -4114,6 +4092,13 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   if (message._msg_id) msgDiv.dataset.msgId = String(message._msg_id);
   if (message._from) msgDiv.dataset.fromActor = String(message._from);
   msgDiv.dataset.ts = String(_msTs(message.time));
+  if (role === 'user') {
+    msgDiv.dataset.retryContent = String(rawContent || '');
+    if (Array.isArray(message.attachments) && message.attachments.length) {
+      msgDiv.dataset.retryAttachments = JSON.stringify(message.attachments);
+    }
+  }
+  if (failedAssistant) msgDiv.dataset.failed = '1';
   _stampRenderedGroupMessage(msgDiv, message);
   // Stash chip-tracked produced paths on the DOM so the 引用 handler can
   // attach them to the quote payload without plumbing message into every
@@ -4160,7 +4145,9 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   }
   // Archive button is only for finalised assistant replies (raw markdown,
   // not an HTML placeholder / status stub).
-  if (role === 'assistant' && !isHtmlSnippet && archive) {
+  if (role === 'assistant' && failedAssistant) {
+    _attachFailedAssistantActions(msgDiv, () => _messageTextForActions(msgDiv, rawContent));
+  } else if (role === 'assistant' && !isHtmlSnippet && archive) {
     _attachBubbleArchiveBtn(msgDiv, () => rawContent);
   }
   // Persisted-process trail is independent of body type — it must render
@@ -4574,10 +4561,41 @@ function applyQuotePrefix(raw, target) {
   return raw ? `${block}\n\n${raw}` : block;
 }
 
-// Attach a small "archive" button next to the time in the chat-meta row. Kept
-// outside the bubble so it never overlaps bubble content. `getContent` is a
-// callback so it can return the latest text after streaming completes.
-function _attachBubbleArchiveBtn(msgDiv, getContent) {
+function _messageTextForActions(msgDiv, fallback = '') {
+  const text = String(fallback || '');
+  if (text && !text.startsWith('<')) return text;
+  const bubble = msgDiv && msgDiv.querySelector ? msgDiv.querySelector('.chat-bubble') : null;
+  return (bubble && bubble.textContent ? bubble.textContent : text).trim();
+}
+
+function _attachBubbleRetryBtn(actions, msgDiv) {
+  if (!actions || actions.querySelector('.bubble-retry-btn')) return;
+  const retryBtn = document.createElement('button');
+  retryBtn.className = 'bubble-retry-btn';
+  retryBtn.title = t('chat.retry_btn_title');
+  retryBtn.textContent = t('chat.retry_btn');
+  retryBtn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    await _retryFailedAssistantMessage(msgDiv, retryBtn);
+  });
+  actions.appendChild(retryBtn);
+}
+
+function _attachFailedAssistantActions(msgDiv, getContent) {
+  if (!msgDiv) return;
+  msgDiv.dataset.failed = '1';
+  _attachBubbleActions(msgDiv, getContent, {
+    archive: false,
+    retry: true,
+  });
+}
+
+// Attach small action buttons below the bubble. Kept outside the bubble so
+// they never overlap content. `getContent` is a callback so it can return the
+// latest text after streaming completes.
+function _attachBubbleActions(msgDiv, getContent, opts = {}) {
+  const includeArchive = opts.archive !== false;
+  const includeRetry = opts.retry === true;
   // Archive button lives in the `.chat-msg-actions` row below the bubble
   // (alongside produced-file chips). Lazily create the row if a caller
   // (e.g. streaming placeholders that didn't allocate one) needs it.
@@ -4588,17 +4606,22 @@ function _attachBubbleArchiveBtn(msgDiv, getContent) {
     actionsRow.dataset.role = 'msg-actions';
     msgDiv.appendChild(actionsRow);
   }
-  if (actionsRow.querySelector('.chat-bubble-actions')) return; // already attached
+  const existingActions = actionsRow.querySelector('.chat-bubble-actions');
+  if (existingActions) {
+    if (includeRetry) _attachBubbleRetryBtn(existingActions, msgDiv);
+    return;
+  }
   const actions = document.createElement('span');
   actions.className = 'chat-bubble-actions';
   actions.innerHTML = `
-    <button class="bubble-archive-btn" title="${escapeHtml(t('chat.archive_btn_title'))}">${escapeHtml(t('chat.archive_btn'))}</button>
+    ${includeArchive ? `<button class="bubble-archive-btn" title="${escapeHtml(t('chat.archive_btn_title'))}">${escapeHtml(t('chat.archive_btn'))}</button>` : ''}
     <button class="bubble-copy-btn" title="${escapeHtml(t('chat.copy_btn_title'))}">${escapeHtml(t('chat.copy_btn'))}</button>
     <button class="bubble-quote-btn" title="${escapeHtml(t('chat.quote_btn_title'))}">${escapeHtml(t('chat.quote_btn'))}</button>
   `;
   const btn = actions.querySelector('.bubble-archive-btn');
   const copyBtn = actions.querySelector('.bubble-copy-btn');
   const quoteBtn = actions.querySelector('.bubble-quote-btn');
+  if (includeRetry) _attachBubbleRetryBtn(actions, msgDiv);
   quoteBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     const text = typeof getContent === 'function' ? (getContent() || '') : '';
@@ -4617,7 +4640,7 @@ function _attachBubbleArchiveBtn(msgDiv, getContent) {
     _setQuote(currentCid, { fromActor, fromName, msgId, text, produced });
     const input = document.getElementById('chat-input');
     if (input) { input.focus(); }
-      });
+  });
   copyBtn.addEventListener('click', async (e) => {
     e.stopPropagation();
     const text = typeof getContent === 'function' ? (getContent() || '') : '';
@@ -4632,6 +4655,10 @@ function _attachBubbleArchiveBtn(msgDiv, getContent) {
     }
     setTimeout(() => { copyBtn.innerHTML = orig; copyBtn.disabled = false; }, 1500);
   });
+  if (!btn) {
+    actionsRow.appendChild(actions);
+    return;
+  }
   btn.addEventListener('click', async (e) => {
     e.stopPropagation();
     const text = typeof getContent === 'function' ? (getContent() || '') : '';
@@ -4675,6 +4702,67 @@ function _attachBubbleArchiveBtn(msgDiv, getContent) {
     setTimeout(() => { btn.innerHTML = orig; btn.disabled = false; }, 2000);
   });
   actionsRow.appendChild(actions);
+}
+
+function _attachBubbleArchiveBtn(msgDiv, getContent) {
+  _attachBubbleActions(msgDiv, getContent, { archive: true });
+}
+
+function _findUserMessageForRetry(msgDiv) {
+  let cur = msgDiv ? msgDiv.previousElementSibling : null;
+  while (cur) {
+    if (cur.classList && cur.classList.contains('chat-message') && cur.classList.contains('user')) {
+      return cur;
+    }
+    cur = cur.previousElementSibling;
+  }
+  return null;
+}
+
+function _retryPayloadFromUserMessage(userMsgEl) {
+  if (!userMsgEl) return null;
+  const content = String(userMsgEl.dataset.retryContent || '').trim()
+    || String(userMsgEl.querySelector('.markdown-body')?.textContent || '').trim();
+  if (!content) return null;
+  let attachments = [];
+  try {
+    const raw = userMsgEl.dataset.retryAttachments || '';
+    if (raw) attachments = JSON.parse(raw);
+    if (!Array.isArray(attachments)) attachments = [];
+  } catch (_) { attachments = []; }
+  return {
+    content,
+    extra: attachments.length ? { attachments } : undefined,
+  };
+}
+
+async function _retryFailedAssistantMessage(msgDiv, btn) {
+  if (!msgDiv || !currentCid) return;
+  if (btn && btn.disabled) return;
+  if (btn) btn.disabled = true;
+  const orig = btn ? btn.textContent : '';
+  try {
+    if (window.PlanRail
+        && typeof window.PlanRail.currentAction === 'function'
+        && window.PlanRail.currentAction() === 'continue'
+        && typeof window.PlanRail.continueCurrent === 'function') {
+      await window.PlanRail.continueCurrent();
+      return;
+    }
+    const userMsgEl = _findUserMessageForRetry(msgDiv);
+    const payload = _retryPayloadFromUserMessage(userMsgEl);
+    if (!payload) {
+      await uiAlert(t('chat.retry_no_source'));
+      return;
+    }
+    if (btn) btn.textContent = t('chat.retry_running');
+    await sendInConversation(currentCid, payload.content, payload.extra);
+  } finally {
+    if (btn) {
+      btn.textContent = orig || t('chat.retry_btn');
+      btn.disabled = false;
+    }
+  }
 }
 
 // ─── Send flows ───
@@ -4924,6 +5012,8 @@ function _makeConvChatController(cid) {
 
 async function sendInConversation(cid, content, extra) {
   if (!cid) return;
+  const startedAt = performance.now();
+  const attachmentCount = Array.isArray(extra && extra.attachments) ? extra.attachments.length : 0;
   if (isConvPending(cid)) {
     enqueueMessage(cid, content, '', { direct: true, extra });
     return;
@@ -4935,7 +5025,11 @@ async function sendInConversation(cid, content, extra) {
 
   const ctrl = _makeConvChatController(cid);
   _convChatCtrls.set(cid, ctrl);
-  await ctrl.send(content, extra);
+  try {
+    await ctrl.send(content, extra);
+  } catch (err) {
+    throw err;
+  }
 }
 
 async function sendInCurrentConversation(content, extra) {
@@ -5421,6 +5515,11 @@ function _createStreamingAssistantMessage(container, opts = {}) {
         </summary>
         <div class="stream-process-body" data-role="process"></div>
       </details>
+      <div class="stream-activity" data-role="activity" style="display:none">
+        <span class="stream-activity-pulse" aria-hidden="true"></span>
+        <span class="stream-activity-text" data-role="activity-text"></span>
+        <span class="stream-activity-meta" data-role="activity-meta"></span>
+      </div>
       <div class="stream-final" data-role="final" style="display:none"></div>
       <div class="stream-thinking" data-role="thinking" aria-label="${escapeHtml(t('chat.thinking_short'))}">
         <span class="stream-thinking-dot"></span>
@@ -5563,6 +5662,100 @@ function _streamingAppendProgress(msg, text, kindHint) {
   _stickBottomFromMsg(msg);
 }
 
+// ── Always-visible liveness strip ──────────────────────────────────────
+// Long CLI-agent turns emit mostly tool-events, which land in the
+// collapsible / scrollable process rail — the bubble body itself can sit
+// unchanged for minutes and reads as "stuck" (real case: a 20-minute
+// claude-code turn produced 6 text deltas vs 80 tool events, and its last
+// ~10 minutes were one long Bash call with zero events). The activity
+// strip is one always-visible row on the streaming placeholder: latest
+// action summary + tool-call counter + a live elapsed clock. It does not
+// depend on the rail being open or scrolled, and its 1 s ticker keeps the
+// clock moving even while the backend is silent between events.
+function _streamingUpdateActivity(msg, text, opts = {}) {
+  if (!msg || msg.dataset.activityDone === '1') return;
+  const row = msg.querySelector('[data-role="activity"]');
+  if (!row) return;
+  if (!msg.dataset.activityStart) msg.dataset.activityStart = String(Date.now());
+  if (opts.countTool) {
+    msg.dataset.activityTools = String((Number(msg.dataset.activityTools) || 0) + 1);
+  }
+  const textEl = row.querySelector('[data-role="activity-text"]');
+  const label = String(text || '').replace(/\s+/g, ' ').trim();
+  if (textEl) {
+    if (label) {
+      textEl.textContent = label.length > 88 ? label.slice(0, 88) + '…' : label;
+    } else if (!textEl.textContent) {
+      // First event carried nothing displayable (e.g. a usage pulse) —
+      // still show the strip with a generic label so the user sees life.
+      textEl.textContent = t('chat.activity_working');
+    }
+  }
+  row.style.display = '';
+  _streamingPaintActivityMeta(msg);
+  if (!msg._activityTimer) {
+    msg._activityTimer = setInterval(() => {
+      // Self-clean on detach / finalize so a missed stop call can't leak
+      // the interval past the bubble's lifetime.
+      if (!msg.isConnected || msg.dataset.activityDone === '1') {
+        clearInterval(msg._activityTimer);
+        msg._activityTimer = null;
+        return;
+      }
+      _streamingPaintActivityMeta(msg);
+    }, 1000);
+  }
+}
+
+function _streamingPaintActivityMeta(msg) {
+  const meta = msg.querySelector('[data-role="activity-meta"]');
+  if (!meta) return;
+  const t0 = Number(msg.dataset.activityStart) || Date.now();
+  const secs = Math.max(0, Math.floor((Date.now() - t0) / 1000));
+  const mm = Math.floor(secs / 60);
+  const ss = String(secs % 60).padStart(2, '0');
+  const tools = Number(msg.dataset.activityTools) || 0;
+  const parts = [];
+  if (tools > 0) parts.push(t('chat.activity_tools', { n: tools }));
+  parts.push(`${mm}:${ss}`);
+  meta.textContent = parts.join(' · ');
+}
+
+function _streamingStopActivity(msg) {
+  if (!msg) return;
+  msg.dataset.activityDone = '1';
+  if (msg._activityTimer) {
+    clearInterval(msg._activityTimer);
+    msg._activityTimer = null;
+  }
+  const row = msg.querySelector('[data-role="activity"]');
+  if (row) row.style.display = 'none';
+}
+
+// Map one live process event onto the activity strip. Usage pulses prove
+// liveness but carry no displayable action — refresh the clock without
+// touching the label. Idle heartbeats get a localized "still running"
+// message (the rail's own idle row is en-only and easy to miss).
+function _streamingUpdateActivityFromEvent(msg, evt) {
+  const data = (evt && evt.data) || {};
+  const stream = (evt && evt.stream) || '';
+  const cliType = stream === 'cli' ? String(data.type || '').toLowerCase() : '';
+  if (cliType === 'status' && String(data.status || '').toLowerCase() === 'usage') {
+    _streamingUpdateActivity(msg, '');
+    return;
+  }
+  if (cliType === 'idle') {
+    const secs = Math.max(1, Math.round(Number(data.stalledMs || 0) / 1000));
+    _streamingUpdateActivity(msg, t('chat.activity_waiting', { secs }));
+    return;
+  }
+  const isToolUse = (cliType === 'tool-event' && data.phase !== 'result')
+    || (stream === 'tool' && (data.phase === 'start' || data.status === 'start'));
+  let line = null;
+  try { line = _formatEventLine(evt); } catch (_) { line = null; }
+  _streamingUpdateActivity(msg, line || '', { countTool: isToolUse });
+}
+
 // Cancel any rAF queued by `_streamingAppendFinalDelta`. Callers that are
 // about to overwrite `[data-role="final"]` with canonical content (final
 // text / error span) must call this first — otherwise the queued flush
@@ -5586,6 +5779,7 @@ function _cancelPendingStreamRaf(msg) {
 // agent edit chats skip it by design).
 function _streamingSetFinal(msg, text, { archive = false } = {}) {
   _hideThinking(msg);
+  _streamingStopActivity(msg);
   const finalEl = msg.querySelector('[data-role="final"]');
   if (!finalEl) return;
   _cancelPendingStreamRaf(msg);
@@ -5647,7 +5841,9 @@ function _streamingSetFinal(msg, text, { archive = false } = {}) {
 
 function _streamingSetError(msg, text) {
   _hideThinking(msg);
+  _streamingStopActivity(msg);
   _cancelPendingStreamRaf(msg);
+  msg.dataset.failed = '1';
   // Freeze the live preview line so it stops looking like it's still streaming.
   const live = msg.querySelector('.stream-process-live');
   if (live) {
@@ -5685,12 +5881,14 @@ function _streamingSetError(msg, text) {
   finalEl.style.display = '';
   delete msg.dataset.streamBuf;
   if (bodyHtml && typeof typesetMath === 'function') typesetMath(finalEl);
+  _attachFailedAssistantActions(msg, () => _messageTextForActions(msg, msg.dataset.finalText || ''));
 }
 
 // Mark the assistant bubble as user-interrupted. Preserves whatever partial
 // content streamed into the process pane; just stamps a "stopped" note.
 function _streamingMarkAborted(msg) {
   _hideThinking(msg);
+  _streamingStopActivity(msg);
   // Freeze any live preview line so it's not misread as still generating.
   const live = msg.querySelector('.stream-process-live');
   if (live) {
@@ -5807,6 +6005,8 @@ function _pinMessageToTopWithDynamicSpacer(msgEl, container) {
 //   hooks: {
 //     beforeSend(content, id)     → transformedContent | null   // cancel by returning null
 //     buildExtraBody(content, id, { pending, hasQueue }) → object | null
+//       Optional field: model_text. UI renders content, while the backend can
+//       send model_text to the model.
 //     onUserAppended(userMsgEl, content, id)
 //     onAssistantStart(msgEl, id)
 //     onStreamEvent(ev, msgEl, id)   // extra side-effects per event
@@ -5870,6 +6070,12 @@ function createChatController(config) {
     if (!_qCache.has(id)) _qCache.set(id, _qLoad(id));
     return _qCache.get(id);
   }
+  function _extraBodyWithoutModelText(extraBody) {
+    if (!extraBody || typeof extraBody !== 'object') return undefined;
+    const body = { ...extraBody };
+    delete body.model_text;
+    return Object.keys(body).length ? body : undefined;
+  }
   function enqueue(content, meta = {}) {
     if (!features.queue) return false;
     const id = config.getCurrentId();
@@ -5898,6 +6104,12 @@ function createChatController(config) {
     const item = q.find(m => m.id === qid);
     if (!item) return;
     item.content = newContent;
+    if (item.meta?.extraBody && Object.prototype.hasOwnProperty.call(item.meta.extraBody, 'model_text')) {
+      item.meta = {
+        ...item.meta,
+        extraBody: _extraBodyWithoutModelText(item.meta.extraBody) || {},
+      };
+    }
     _qSave(id, q);
     renderQueue();
   }
@@ -6582,7 +6794,11 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
   // .stream-process rail (collapsed if non-empty, hidden if empty) so
   // tool calls stay scannable after the reply lands.
   const text = String(gm.text || '');
-  _streamingSetFinal(ph, text, { archive });
+  const failedAssistant = _isFailedAssistantContent(text, gm);
+  _streamingSetFinal(ph, text, { archive: archive && !failedAssistant });
+  if (failedAssistant) {
+    _attachFailedAssistantActions(ph, () => _messageTextForActions(ph, text));
+  }
 
   // Lazily allocate the below-bubble actions row (post-stream placeholders
   // didn't get one at creation time; appendChatMessage history bubbles do).
@@ -6839,8 +7055,10 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
         // Token-by-token streaming → write into the placeholder's final
         // body so the user sees the reply form character-by-character.
         _streamingAppendFinalDelta(target, data.text);
+        _streamingUpdateActivity(target, t('chat.activity_writing'));
       } else if (data.type === 'progress' && data.text) {
         _streamingAppendProgress(target, String(data.text));
+        _streamingUpdateActivity(target, t('chat.activity_thinking'));
       } else if (data.type === 'event') {
         const before = _processLineCount(target);
         _renderAgentEvent(target, data.event);
@@ -6849,6 +7067,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
         if (line && _processLineCount(target) <= before) {
           _streamingAppendProgress(target, line, _eventProcessKind(evt, line));
         }
+        _streamingUpdateActivityFromEvent(target, evt);
       }
     } catch (err) {
       const evt = data.event || {};
@@ -7151,6 +7370,14 @@ function _stripSkillCreateBlocksForStream(buf) {
   ), placeholder);
 }
 
+function _stripAutoTaskBlocksForStream(buf) {
+  const placeholder = _streamPlaceholderHtml('chat.create_auto_task_streaming_placeholder');
+  return _collapseRepeatedStructuralPlaceholders(
+    _replaceOuterTagBlocks(buf, 'auto-task', placeholder),
+    placeholder,
+  );
+}
+
 function _stripAgentFormBlockForStream(buf) {
   // Primary: XML `<agent-input-form>...</agent-input-form>` (symmetric
   // with submission reply tag, token-stable). Legacy: fenced
@@ -7220,9 +7447,11 @@ function _streamingAppendFinalDelta(msg, piece) {
     const buf = msg.dataset.streamBuf || '';
     const display = _stripSkillCreateBlocksForStream(
       _stripAgentCreateBlocksForStream(
-        _stripAgentFormBlockForStream(
-          _stripDashboardBlocksForStream(
-            _stripSkillFileBlocksForStream(buf),
+        _stripAutoTaskBlocksForStream(
+          _stripAgentFormBlockForStream(
+            _stripDashboardBlocksForStream(
+              _stripSkillFileBlocksForStream(buf),
+            ),
           ),
         ),
       ),
@@ -7254,7 +7483,12 @@ function _formatEventLine(evt) {
   if (!stream || stream === 'assistant') return null;
   if (stream === 'usage') return null;
 
-  const phaseCn = (p) => (p === 'start' ? t('chat.stream.phase_start') : p === 'end' ? t('chat.stream.phase_end') : (p || ''));
+  const phaseCn = (p) => (
+    p === 'start' ? t('chat.stream.phase_start')
+      : p === 'end' ? t('chat.stream.phase_end')
+        : p === 'progress' ? t('chat.stream.phase_progress')
+        : (p || '')
+  );
 
   if (stream === 'lifecycle') {
     const p = data?.phase;
@@ -7300,6 +7534,9 @@ function _formatEventLine(evt) {
     // On start → show arguments (bash command / file path / JSON fallback).
     // On end   → prefer result_preview so users see what the call returned.
     let detail = name === 'read_file' ? _formatReadFileResourceDetail(data, args) : '';
+    if (phase === 'progress' && data?.message) {
+      detail = String(data.message);
+    }
     if (phase === 'end') {
       const rp = data?.result_preview;
       if (!detail && rp) detail = typeof rp === 'string' ? rp : JSON.stringify(rp);
@@ -7657,6 +7894,7 @@ function _resolveConvReply(cid, text, isError) {
 
   const el = state?.loadingEl;
   if (el && el.isConnected) {
+    if (isError) el.dataset.failed = '1';
     el.querySelector('.chat-bubble').innerHTML = isError
       ? `<span style="color:var(--danger)">${escapeHtml(t('chat.send_failed', { msg: text }))}</span>`
       : `<div class="markdown-body">${renderMarkdown(text)}</div>`;
@@ -7668,6 +7906,8 @@ function _resolveConvReply(cid, text, isError) {
         const md = el.querySelector('.chat-bubble .markdown-body');
         if (md) typesetMath(md);
       }
+    } else {
+      _attachFailedAssistantActions(el, () => _messageTextForActions(el, text));
     }
   } else if (cid === currentCid) {
     // loadingEl was replaced (user navigated away and back); reload history to show result
@@ -7686,6 +7926,7 @@ function _updateConvSendUI(cid) {
   const input = document.getElementById('chat-input');
   if (!sendBtn) return;
   const pending = isConvPending(cid);
+  _ensureConvCreateAgentInline();
   // While `.aborting` is set, pin the button as send-style + disabled. The
   // class self-clears once the stream truly terminates (pending flips false).
   if (sendBtn.classList.contains('aborting')) {

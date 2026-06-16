@@ -29,8 +29,10 @@ import {
 } from './rules/red-flags';
 import {
   validateSkillFrontmatter,
+  validateSkillMeta,
   validateAgentJsonShape,
   parseFailureViolation,
+  skillMetaParseViolation,
 } from './rules/schema';
 
 // Re-export the types so callers only need one import path.
@@ -52,6 +54,8 @@ export function validateSkillFile(args: {
 
   if (kind === 'skill_md') {
     violations.push(..._scanSkillMd(args.content, args.relpath));
+  } else if (kind === 'skill_meta') {
+    violations.push(..._scanSkillMeta(args.content));
   } else if (kind === 'script') {
     violations.push(...scanRedFlags({
       content: args.content,
@@ -89,7 +93,10 @@ export function validateSkillDir(skillDir: string): ValidationReport {
 
   try {
     const content = fs.readFileSync(skillMdPath, 'utf8');
-    violations.push(..._scanSkillMd(content, 'SKILL.md'));
+    const { meta, metaViolations } = _readSkillMeta(skillDir);
+    violations.push(...metaViolations);
+    violations.push(..._scanSkillMd(content, 'SKILL.md', meta));
+    violations.push(...validateSkillMeta(meta));
   } catch (err) {
     violations.push(parseFailureViolation({
       kind: 'frontmatter',
@@ -101,6 +108,7 @@ export function validateSkillDir(skillDir: string): ValidationReport {
   // Walk all other recognized files (scripts).
   for (const rel of _walkFiles(skillDir, '')) {
     if (rel.toUpperCase() === 'SKILL.MD') continue;
+    if (rel === '_meta.json') continue;
     const kind = detectSkillFileKind(rel);
     if (kind !== 'script') continue;
     try {
@@ -183,6 +191,7 @@ export function validateAgentDir(agentDir: string): ValidationReport {
 function detectSkillFileKind(relpath: string): ScanKind {
   const norm = relpath.replace(/\\/g, '/');
   if (norm.toUpperCase() === 'SKILL.MD') return 'skill_md';
+  if (norm === '_meta.json') return 'skill_meta';
   const ext = path.extname(norm).toLowerCase();
   if (['.py', '.sh', '.bash', '.zsh', '.ts', '.mjs', '.js', '.rb'].includes(ext)) {
     return 'script';
@@ -191,7 +200,7 @@ function detectSkillFileKind(relpath: string): ScanKind {
   return 'other';
 }
 
-function _scanSkillMd(content: string, field: string): Violation[] {
+function _scanSkillMd(content: string, field: string, skillMeta: Record<string, unknown> = {}): Violation[] {
   const violations: Violation[] = [];
 
   // Frontmatter: parse with a minimal YAML-subset (same shape as
@@ -205,7 +214,7 @@ function _scanSkillMd(content: string, field: string): Violation[] {
     }));
     return violations;
   }
-  violations.push(...validateSkillFrontmatter(meta));
+  violations.push(...validateSkillFrontmatter(meta, skillMeta));
 
   // Embedded executable code blocks: scan each for red flags.
   for (const block of extractExecutableBlocks(body)) {
@@ -217,6 +226,38 @@ function _scanSkillMd(content: string, field: string): Violation[] {
   }
 
   return violations;
+}
+
+function _scanSkillMeta(content: string): Violation[] {
+  try {
+    const parsed = JSON.parse(content);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return [skillMetaParseViolation('_meta.json must be a JSON object')];
+    }
+    return validateSkillMeta(parsed as Record<string, unknown>);
+  } catch (err) {
+    return [skillMetaParseViolation((err as Error).message)];
+  }
+}
+
+function _readSkillMeta(skillDir: string): { meta: Record<string, unknown>; metaViolations: Violation[] } {
+  const file = path.join(skillDir, '_meta.json');
+  if (!fs.existsSync(file)) return { meta: {}, metaViolations: [] };
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return {
+        meta: {},
+        metaViolations: [skillMetaParseViolation('_meta.json must be a JSON object')],
+      };
+    }
+    return { meta: parsed as Record<string, unknown>, metaViolations: [] };
+  } catch (err) {
+    return {
+      meta: {},
+      metaViolations: [skillMetaParseViolation((err as Error).message)],
+    };
+  }
 }
 
 interface SplitResult { meta: Record<string, string>; body: string; parseError?: string }

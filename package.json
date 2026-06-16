@@ -67,7 +67,6 @@
       "bin/**/*",
       "src/main/**/*.{js,ts,mjs,md,json}",
       "src/renderer/**/*",
-      "src/builtin/**/*",
       "src/resources/icons/**/*",
       "tsconfig.json",
       "node_modules/tsx/**/*",
@@ -80,12 +79,13 @@
       "!**/*.{py,pyc}",
       "!**/__pycache__",
       "!**/.DS_Store",
-      "!src/core-agent/test/**"
+      "!src/core-agent/test/**",
+      "!src/main/features/*_dev.ts",
+      "!src/main/ipc/dev_handlers.ts"
     ],
-    "asar": false,
+    "asar": true,
     "asarUnpack": [
       "bin/**/*",
-      "src/builtin/skills/**/*",
       "node_modules/tsx/**/*",
       "node_modules/get-tsconfig/**/*",
       "node_modules/resolve-pkg-maps/**/*",
@@ -104,6 +104,13 @@
         "filter": [
           "**/*",
           "!*.tar.gz"
+        ]
+      },
+      {
+        "from": "resources/mac-locales",
+        "to": ".",
+        "filter": [
+          "**/*"
         ]
       }
     ],
@@ -151,9 +158,6 @@
       "target": "AppImage",
       "category": "Utility"
     }
-  },
-  "optionalDependencies": {
-    "@esbuild/darwin-arm64": "^0.27.7"
   },
   "license": "MIT"
 }

@@ -65,11 +65,9 @@ const _viewerLog = (typeof createLogger === 'function')
   : { warn: () => {}, info: () => {}, error: () => {} };
 
 function _viewerTrack(action, data) {
-  
 }
 
 function _viewerTrackError(action, data) {
-  
 }
 
 // Extensions we'll try to render inline. Anything else falls through to the
@@ -172,6 +170,13 @@ function _setSaveAppVisible(visible) {
   if (!_viewerSaveAppBtn) return;
   _viewerSaveAppBtn.hidden = !visible;
   _viewerSaveAppBtn.disabled = !visible;
+}
+
+function _viewerCanAddToLibrary(kind) {
+  // The Library index supports text/PDF/DOCX/images, but not video. Images
+  // are delegated to chat-lightbox before this shell opens; the guard here
+  // keeps the video preview from offering an action the backend rejects.
+  return kind !== 'video';
 }
 
 function _isViewerOpen() {
@@ -414,10 +419,11 @@ async function _openViewerShell(displayName, opts) {
   const absPath = opts && opts.absPath;
   const cid = (opts && opts.cid) || null;
   const projectId = (opts && opts.projectId) || null;
+  const kind = (opts && opts.kind) || '';
   _viewerCurrentPath = absPath || null;
   _viewerCurrentCid = cid;
   _viewerCurrentProjectId = projectId;
-  if (_viewerAddLibraryBtn) _viewerAddLibraryBtn.hidden = !cid;
+  if (_viewerAddLibraryBtn) _viewerAddLibraryBtn.hidden = !cid || !_viewerCanAddToLibrary(kind);
   void _refreshSaveAppButton(_viewerCurrentPath);
   _viewerTitle.textContent = displayName || '';
   // `is-markdown` / `is-text` switch the body to a flex column so an editor
@@ -492,7 +498,7 @@ async function _renderHtmlBody(absPath, displayName, cid, projectId) {
 async function _renderVideoBody(absPath, displayName, cid, projectId) {
   if (!(await _openViewerShell(displayName, { kind: 'video', absPath, cid, projectId }))) return;
   const url = _chatMediaLocalUrl(absPath);
-  _viewerBody.innerHTML = `<div class="chat-file-viewer-video-wrap"><video class="chat-file-viewer-video" controls preload="metadata" src="${url}"></video></div>`;
+  _viewerBody.innerHTML = `<div class="chat-file-viewer-video-wrap"><video class="chat-file-viewer-video" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${url}"></video></div>`;
 }
 
 async function _renderMarkdownBody(absPath, displayName, cid, projectId) {
@@ -685,7 +691,7 @@ async function openChatFileViewer(absPath, displayName, opts) {
     // need the chat-media:// URL since openChatImageLightbox expects an
     // <img>-loadable src, not an abs path.
     if (typeof openChatImageLightbox === 'function') {
-      openChatImageLightbox(_chatMediaLocalUrl(absPath), name, cid ? { absPath, cid, projectId } : undefined);
+      openChatImageLightbox(_chatMediaLocalUrl(absPath), name, { absPath, cid, projectId });
     }
     return;
   }
@@ -700,5 +706,5 @@ async function openChatFileViewer(absPath, displayName, opts) {
 
 // CJS bridge for vitest — pure functions only, per PC/CLAUDE.md §9.
 if (typeof module !== 'undefined' && typeof module.exports === 'object') {
-  module.exports = { _kindOf, _extOf, _chatMediaLocalUrl };
+  module.exports = { _kindOf, _extOf, _chatMediaLocalUrl, _viewerCanAddToLibrary };
 }

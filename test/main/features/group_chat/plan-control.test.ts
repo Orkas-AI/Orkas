@@ -88,7 +88,7 @@ describe('group_chat plan control state', () => {
     expect(await controlAction(cid)).toBeNull();
   });
 
-  it('does not return a fully completed plan even when a new worker is active', async () => {
+  it('returns a fully completed plan for task details without exposing controls', async () => {
     const state = await import('../../../../src/main/features/group_chat/state');
     const cid = newCid();
     const plan = await seedPlan(cid);
@@ -97,7 +97,8 @@ describe('group_chat plan control state', () => {
     await state.markInFlight(TEST_UID, cid, 'some-agent', true);
 
     const payload = await readPlanPayload(cid);
-    expect(payload.plan).toBeNull();
+    expect(payload.plan?.steps.map((s: any) => s.status)).toEqual(['done', 'done']);
+    expect(payload.has_plan).toBe(true);
     expect(payload.control?.action).toBeNull();
   });
 });

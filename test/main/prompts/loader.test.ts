@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { PromptManager, safeSubstitute, prompts } from '../../../src/main/prompts/loader';
-import { buildRuntimeDatetimeBlock, formatCurrentDatetime } from '../../../src/main/prompts/runtime_context';
+import { buildRuntimeDatetimeBlock, formatCurrentDate } from '../../../src/main/prompts/runtime_context';
 
 describe('prompts › safeSubstitute', () => {
   it('substitutes $identifier', () => {
@@ -49,15 +49,14 @@ describe('prompts › safeSubstitute', () => {
 });
 
 describe('prompts › runtime datetime context', () => {
-  it('formats local datetime as ISO with seconds and numeric offset', () => {
+  it('formats local date with timezone context first', () => {
     const block = buildRuntimeDatetimeBlock(new Date(2026, 5, 5, 14, 30, 0));
 
-    expect(formatCurrentDatetime(new Date(2026, 5, 5, 14, 30, 0))).toMatch(
-      /^2026-06-05T14:30:00[+-]\d{2}:\d{2}$/,
-    );
-    expect(block).toContain('## Current datetime');
-    expect(block).toMatch(/Current datetime: 2026-06-05T14:30:00[+-]\d{2}:\d{2}/);
+    expect(formatCurrentDate(new Date(2026, 5, 5, 14, 30, 0))).toBe('2026-06-05');
+    expect(block).toContain('## Current date');
+    expect(block).toContain('Current date: 2026-06-05');
     expect(block).toMatch(/Timezone: .+/);
+    expect(block.indexOf('Timezone:')).toBeLessThan(block.indexOf('Current date:'));
     expect(block).not.toContain('This datetime is authoritative');
     expect(block).not.toContain('Current year:');
   });

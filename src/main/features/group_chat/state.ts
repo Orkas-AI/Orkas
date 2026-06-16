@@ -78,6 +78,20 @@ export interface StateFile {
    *  picker (form-submit hook in `group_chat/index.ts`). Cleared
    *  whenever `coding_project_dir` is cleared. */
   coding_project_dir_explicit?: boolean;
+  /** Conversation-scoped absolute roots for file tools. Used by narrow
+   *  system-created workflows such as sync-conflict resolution where the
+   *  target file lives outside the active workspace. */
+  tool_extra_roots?: string[];
+  /** System-created sync-conflict resolution metadata. A commander turn may
+   *  close only these records, and only by emitting a matching XML result. */
+  sync_conflict_resolution?: {
+    version: 1;
+    conflicts: {
+      id: string;
+      rel_path: string;
+      current_path: string;
+    }[];
+  };
 }
 
 export const COMMANDER_ID = 'commander';
@@ -248,6 +262,32 @@ export async function readState(uid: string, cid: string): Promise<StateFile> {
         ...(typeof data.coding_project_dir_explicit === 'boolean'
           ? { coding_project_dir_explicit: data.coding_project_dir_explicit }
           : {}),
+        ...(Array.isArray(data.tool_extra_roots)
+          ? { tool_extra_roots: data.tool_extra_roots.filter((s: unknown) => (
+              typeof s === 'string' && path.isAbsolute(s)
+            )) }
+          : {}),
+        ...(Array.isArray(data.sync_conflict_resolution?.conflicts)
+          ? {
+              sync_conflict_resolution: {
+                version: 1,
+                conflicts: data.sync_conflict_resolution.conflicts
+                  .map((item: unknown) => {
+                    const row = item as Record<string, unknown>;
+                    return {
+                      id: typeof row?.id === 'string' ? row.id : '',
+                      rel_path: typeof row?.rel_path === 'string' ? row.rel_path : '',
+                      current_path: typeof row?.current_path === 'string' ? row.current_path : '',
+                    };
+                  })
+                  .filter((item: { id: string; rel_path: string; current_path: string }) => (
+                    /^[A-Za-z0-9_.-]+$/.test(item.id)
+                    && item.rel_path.startsWith('cloud/')
+                    && path.isAbsolute(item.current_path)
+                  )),
+              },
+            }
+          : {}),
       };
     }
   } catch (err) {
@@ -332,6 +372,42 @@ export async function markInFlight(uid: string, cid: string, actorId: string, ru
   });
 }
 
+// In-memory throttle for `touchActivity`. `last_active_at` otherwise only
+// moves at turn boundaries (setStatus / markInFlight), so a single long turn
+// — a CLI agent rendering for 14 min, or a model turn grinding through many
+// tool calls — leaves it frozen at turn-start. The renderer's stuck-turn
+// watchdog (`renderer/modules/state.js`) reads `processing_since` (= this
+// field) and declares "service restarted, resend" once it's >12 min stale,
+// false-positiving on a turn that's actively streaming. `touchActivity`
+// advances it on real activity so the watchdog only fires when the process
+// is genuinely dead (no events → no bumps → it ages out correctly).
+const _activityBumpAt = new Map<string, number>(); // `${uid}:${cid}` → epoch ms
+const ACTIVITY_BUMP_THROTTLE_MS = 30 * 1000;
+
+/** Bump `last_active_at` to now if it's been more than the throttle window
+ *  since the last bump for this conversation. Hot-path safe: the throttle
+ *  check is synchronous and short-circuits before any lock/IO, so callers
+ *  may fire it per streamed event. Only writes while `status === 'running'`
+ *  — a bump that lands just after turn-end must not resurrect an idle conv.
+ *  Self-contained error handling: a transient state read/write failure
+ *  during streaming must never break the turn, so callers fire-and-forget. */
+export async function touchActivity(uid: string, cid: string): Promise<void> {
+  const k = `${uid}:${cid}`;
+  const now = Date.now();
+  if (now - (_activityBumpAt.get(k) || 0) < ACTIVITY_BUMP_THROTTLE_MS) return;
+  _activityBumpAt.set(k, now);
+  try {
+    await _stateLock(uid, cid).runExclusive(async () => {
+      const s = await readState(uid, cid);
+      if (s.status !== 'running') return;
+      s.last_active_at = nowIso();
+      await writeStateRaw(uid, cid, s);
+    });
+  } catch (err) {
+    log.warn(`touchActivity failed cid=${cid}: ${(err as Error).message}`);
+  }
+}
+
 /** Atomically lock in the per-conversation workspace subdirectory basename.
  *  No-op if the field is already set (frozen-on-first-write semantics — see
  *  `conv_workspace.ts`). Returns the resulting state. */
@@ -376,6 +452,50 @@ export async function setCodingProjectDir(
   });
 }
 
+export async function setToolExtraRoots(uid: string, cid: string, roots: readonly string[]): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    const clean = Array.from(new Set(
+      roots
+        .map((r) => String(r || '').trim())
+        .filter((r) => r && path.isAbsolute(r)),
+    ));
+    if (clean.length) s.tool_extra_roots = clean;
+    else delete s.tool_extra_roots;
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return s;
+  });
+}
+
+export async function setSyncConflictResolution(
+  uid: string,
+  cid: string,
+  conflicts: readonly { id: string; rel_path: string; current_path: string }[],
+): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    const clean = conflicts
+      .map((item) => ({
+        id: String(item.id || '').trim(),
+        rel_path: String(item.rel_path || '').replace(/\\/g, '/'),
+        current_path: String(item.current_path || '').trim(),
+      }))
+      .filter((item) => (
+        /^[A-Za-z0-9_.-]+$/.test(item.id)
+        && item.rel_path.startsWith('cloud/')
+        && path.isAbsolute(item.current_path)
+      ));
+    if (clean.length) {
+      s.sync_conflict_resolution = { version: 1, conflicts: clean };
+    } else {
+      delete s.sync_conflict_resolution;
+    }
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return s;
+  });
+}
 
 /** Drop the whole group dir (called from chats.deleteConversation). */
 export async function purgeGroupDir(uid: string, cid: string): Promise<void> {

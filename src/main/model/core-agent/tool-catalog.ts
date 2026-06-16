@@ -1,11 +1,10 @@
 /**
  * ToolCatalog — registry of injected built-in tools.
  *
- * Symmetric to `skill-registry.ts`: emits an "available tools" markdown
- * block injected into setup-LLM prompts, so that prompt templates
- * (`chat_agent_setup.md` etc.) don't have to hard-code tool names.
- *
  * Source of truth: a hand-written central constant table `TOOL_CATALOG`.
+ * Historically it also rendered an "available tools" markdown block into the
+ * setup-LLM prompts, but the runner no longer injects that block; the catalog
+ * now backs the anti-drift test below (and any future tool-listing surface).
  * NOT derived from `AgentTool` instances — the runtime `description` on
  * each tool is a long English doc aimed at the runtime LLM, while the
  * catalog `summary` is a short blurb aimed at the setup LLM; the two
@@ -101,6 +100,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   // `## Connectors` system-prompt block listing the connector ids + descriptions)
   { name: 'list_connector_tools', group: 'connector', summary: 'Discover the actions a specific connector exposes (returns name + JSON input schema for each).' },
   { name: 'call_connector_tool',  group: 'connector', summary: 'Invoke an action on a connector; call list_connector_tools first to learn the action name and schema.' },
+  { name: 'add_custom_connector', group: 'connector', summary: 'Commander-only: add a user-described custom MCP server (requires a user confirmation dialog before install).' },
 
   // Cross-session state
   { name: 'cross_session_memory', group: 'meta', summary: 'Read/write user / agent memory that persists across sessions.' },

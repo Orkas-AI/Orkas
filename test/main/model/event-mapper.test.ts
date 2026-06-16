@@ -10,7 +10,9 @@ import { userMarketplaceAgentsDir, userMarketplaceSkillsDir } from '../../../src
 
 type AgentRunEvent =
   | { type: 'text_delta'; text: string }
+  | { type: 'tool_delta'; name?: string; id: string; inputDelta: string; inputBytes?: number }
   | { type: 'tool_start'; name: string; id: string; input: unknown }
+  | { type: 'tool_progress'; name: string; id: string; phase?: string; message: string; data?: Record<string, unknown> }
   | { type: 'tool_end'; name: string; id: string; result: string; isError?: boolean }
   | { type: 'retry'; attempt: number; reason: string }
   | { type: 'done'; result: { text: string; meta: { error: null | { message: string } } } };
@@ -72,6 +74,44 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     const startEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'start');
     expect(startEvent.event.data.name).toBe('read_file');
     expect(startEvent.event.data.arguments).toEqual({ path: '/tmp/foo.md' });
+  });
+
+  it('tool_progress → single structured progress event with message', async () => {
+    const out = await collect([
+      { type: 'tool_start', name: 'generate_image', id: 'c-image', input: { output_path: 'out.png' } },
+      { type: 'tool_progress', name: 'generate_image', id: 'c-image', phase: 'save', message: 'Saving generated image', data: { elapsedMs: 30000 } },
+      { type: 'tool_end', name: 'generate_image', id: 'c-image', result: 'Image written to out.png' },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ]);
+
+    const progressEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'progress');
+    expect(progressEvent.event.stream).toBe('tool');
+    expect(progressEvent.event.data.name).toBe('generate_image');
+    expect(progressEvent.event.data.message).toBe('Saving generated image');
+    expect(progressEvent.event.data.progress_phase).toBe('save');
+    expect(progressEvent.event.data.progress_data).toEqual({ elapsedMs: 30000 });
+  });
+
+  it('write_file tool input deltas surface a start event before execution starts', async () => {
+    const content = 'x'.repeat(5200);
+    const out = await collect([
+      { type: 'tool_delta', name: 'write_file', id: 'c-write', inputDelta: '{"path":"notes/report.md","content":"', inputBytes: 36 },
+      { type: 'tool_delta', name: 'write_file', id: 'c-write', inputDelta: content.slice(0, 600), inputBytes: 636 },
+      { type: 'tool_delta', name: 'write_file', id: 'c-write', inputDelta: content.slice(600), inputBytes: 5236 },
+      { type: 'tool_start', name: 'write_file', id: 'c-write', input: { path: 'notes/report.md', content } },
+      { type: 'tool_end', name: 'write_file', id: 'c-write', result: 'wrote notes/report.md' },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ]);
+
+    const starts = out.filter((e) => e.type === 'event' && e.event?.data?.phase === 'start');
+    expect(starts).toHaveLength(1);
+    expect(starts[0].event.stream).toBe('tool');
+    expect(starts[0].event.data.name).toBe('write_file');
+    expect(starts[0].event.data.arguments).toEqual({ path: 'notes/report.md' });
+    const endIdx = out.findIndex((e) => e.type === 'event' && e.event?.data?.phase === 'end');
+    const startIdx = out.findIndex((e) => e.type === 'event' && e.event?.data?.phase === 'start');
+    expect(startIdx).toBeGreaterThanOrEqual(0);
+    expect(endIdx).toBeGreaterThan(startIdx);
   });
 
   it('read_file of marketplace SKILL.md carries the display name without another skill scan', async () => {

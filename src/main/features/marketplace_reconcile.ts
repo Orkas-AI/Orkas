@@ -20,6 +20,7 @@ import * as path from 'node:path';
 import {
   userMarketplaceAgentDir, userMarketplaceSkillDir,
   userMarketplaceAgentsDir, userMarketplaceSkillsDir,
+  marketplaceReconcileStateFile,
 } from '../paths';
 import { sha256OfFile } from '../util/sha256';
 import { clearAgentListCache } from './agents';
@@ -33,6 +34,7 @@ import { invalidateSkills as invalidateCoreAgentSkills } from '../model/core-age
 import { extractBundleSafely, postJson } from './marketplace';
 import { withMarketplaceInstallLock } from './marketplace_locks';
 import { createLogger } from '../logger';
+import { fetchWithRetry } from '../util/retry';
 
 const log = createLogger('marketplace_reconcile');
 
@@ -42,10 +44,16 @@ export type ReconcileState = 'idle' | 'running' | 'done';
 
 export interface ReconcileStatus {
   state: ReconcileState;
+  /** `default_seed` covers the pre-reconcile step that discovers/writes default manifest rows. */
+  phase?: 'default_seed' | 'reconcile';
   /** Total entries to pull this run (set when entering `running`). */
   total: number;
+  total_agents: number;
+  total_skills: number;
   /** Successfully pulled (incremented in real time). */
   pulled: number;
+  pulled_agents: number;
+  pulled_skills: number;
   /** ids of failed pulls — only meaningful in `done`. */
   failed: string[];
   /** Wall-clock time of the last transition (ms). Banner uses this to decide whether to
@@ -65,7 +73,45 @@ export interface ReconcileResult {
   patched_skills: number;
 }
 
-let _status: ReconcileStatus = { state: 'idle', total: 0, pulled: 0, failed: [], updated_at: Date.now() };
+export interface MarketplaceReconcileOptions {
+  shouldContinue?: () => boolean;
+  /** Skip network-heavy server catalog checks when a recent startup attempt already ran. */
+  minIntervalMs?: number;
+  /** Ignore `minIntervalMs`; used by explicit user actions and short retry loops. */
+  force?: boolean;
+}
+
+interface ReconcileLocalState {
+  server_check_attempted_at?: number;
+  server_check_succeeded_at?: number;
+}
+
+class ReconcileCancelled extends Error {
+  constructor() {
+    super('reconcile cancelled');
+    this.name = 'ReconcileCancelled';
+  }
+}
+
+function _assertContinue(opts?: MarketplaceReconcileOptions): void {
+  if (opts?.shouldContinue && !opts.shouldContinue()) throw new ReconcileCancelled();
+}
+
+function _idleStatus(): ReconcileStatus {
+  return {
+    state: 'idle',
+    total: 0,
+    total_agents: 0,
+    total_skills: 0,
+    pulled: 0,
+    pulled_agents: 0,
+    pulled_skills: 0,
+    failed: [],
+    updated_at: Date.now(),
+  };
+}
+
+let _status: ReconcileStatus = _idleStatus();
 type StatusListener = (s: ReconcileStatus) => void;
 const _listeners = new Set<StatusListener>();
 
@@ -88,6 +134,29 @@ function _setStatus(next: ReconcileStatus): void {
   }
 }
 
+export function setDefaultInstallSeedStatus(active: boolean): void {
+  if (active) {
+    _setStatus({
+      state: 'running',
+      phase: 'default_seed',
+      // Exact counts are not known until the defaults endpoint returns and reconcile filters
+      // pull-needed rows. Keep each page banner visible during this discovery/write phase.
+      total: 2,
+      total_agents: 1,
+      total_skills: 1,
+      pulled: 0,
+      pulled_agents: 0,
+      pulled_skills: 0,
+      failed: [],
+      updated_at: Date.now(),
+    });
+    return;
+  }
+  if (_status.phase === 'default_seed') {
+    _setStatus(_idleStatus());
+  }
+}
+
 /** Pre-reconcile step: sync the local cloud manifest against the server catalog. For every
  *  installed item, look up the server's current (version, updated_at/published_at). When the server has
  *  newer values, write them back into the manifest — the subsequent `reconcileInstalls` pass
@@ -100,11 +169,21 @@ function _setStatus(next: ReconcileStatus): void {
  *  Network failures are swallowed (offline boot must not block the rest of startup); the next
  *  launch retries.
  */
-export async function checkServerUpdatesForInstalls(uid: string): Promise<{ updated_agents: number; updated_skills: number }> {
+export async function checkServerUpdatesForInstalls(
+  uid: string,
+  opts: MarketplaceReconcileOptions = {},
+): Promise<{ updated_agents: number; updated_skills: number; skipped?: boolean }> {
+  try { _assertContinue(opts); } catch { return { updated_agents: 0, updated_skills: 0 }; }
   const manifest = await readInstalls(uid);
   if (manifest.agents.length === 0 && manifest.skills.length === 0) {
     return { updated_agents: 0, updated_skills: 0 };
   }
+  const minIntervalMs = Number.isFinite(opts.minIntervalMs) ? Math.max(0, Number(opts.minIntervalMs)) : 0;
+  if (!opts.force && _serverCheckRecentlyAttempted(uid, minIntervalMs)) {
+    log.info('server-check skipped: checked recently');
+    return { updated_agents: 0, updated_skills: 0, skipped: true };
+  }
+  _markServerCheckAttempt(uid);
 
   let agentMap: Map<string, _CatalogRow>;
   let skillMap: Map<string, _CatalogRow>;
@@ -117,6 +196,7 @@ export async function checkServerUpdatesForInstalls(uid: string): Promise<{ upda
     log.warn(`server-check fetch failed (offline?): ${(err as Error).message}`);
     return { updated_agents: 0, updated_skills: 0 };
   }
+  try { _assertContinue(opts); } catch { return { updated_agents: 0, updated_skills: 0 }; }
 
   let updated_agents = 0;
   let updated_skills = 0;
@@ -138,6 +218,7 @@ export async function checkServerUpdatesForInstalls(uid: string): Promise<{ upda
     const statusChanged = typeof server.status === 'string' && currentStatus !== server.status;
     if (contentChanged || defaultInstallChanged || statusChanged) {
       log.info(`server-update agent ${a.id}: v${a.version} → v${server.version} (freshness ${_freshnessAt(a)} → ${_freshnessAt(server)})`);
+      try { _assertContinue(opts); } catch { return { updated_agents, updated_skills }; }
       // Replace the row in the manifest; reconcile will detect the version/freshness
       // mismatch against `_install.json` and re-pull. agent_json_url is reused (server
       // overwrites the same COS key on republish — see Server `api/marketplace.py::upload_agent`).
@@ -174,6 +255,7 @@ export async function checkServerUpdatesForInstalls(uid: string): Promise<{ upda
     const statusChanged = typeof server.status === 'string' && currentStatus !== server.status;
     if (contentChanged || defaultInstallChanged || statusChanged) {
       log.info(`server-update skill ${s.id}: v${s.version} → v${server.version} (freshness ${_freshnessAt(s)} → ${_freshnessAt(server)})`);
+      try { _assertContinue(opts); } catch { return { updated_agents, updated_skills }; }
       await addSkillInstall(uid, {
         id: s.id, version: server.version, published_at: server.published_at,
         updated_at: server.updated_at, bundle_url: s.bundle_url, create_uid: s.create_uid,
@@ -197,7 +279,43 @@ export async function checkServerUpdatesForInstalls(uid: string): Promise<{ upda
   if (pruned_agents + pruned_skills > 0) {
     log.info(`server-check: pruned ${pruned_agents} stale agent install(s) + ${pruned_skills} stale skill install(s)`);
   }
+  _markServerCheckSuccess(uid);
   return { updated_agents, updated_skills };
+}
+
+function _readLocalState(uid: string): ReconcileLocalState {
+  try {
+    const raw = JSON.parse(fs.readFileSync(marketplaceReconcileStateFile(uid), 'utf8')) as ReconcileLocalState;
+    return raw && typeof raw === 'object' ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+function _writeLocalState(uid: string, patch: ReconcileLocalState): void {
+  try {
+    const file = marketplaceReconcileStateFile(uid);
+    const next = { ..._readLocalState(uid), ...patch };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+  } catch (err) {
+    log.warn(`server-check state write failed: ${(err as Error).message}`);
+  }
+}
+
+function _serverCheckRecentlyAttempted(uid: string, minIntervalMs: number, now = Date.now()): boolean {
+  if (minIntervalMs <= 0) return false;
+  const state = _readLocalState(uid);
+  const attemptedAt = Number(state.server_check_attempted_at || state.server_check_succeeded_at || 0);
+  return attemptedAt > 0 && now - attemptedAt < minIntervalMs;
+}
+
+function _markServerCheckAttempt(uid: string): void {
+  _writeLocalState(uid, { server_check_attempted_at: Date.now() });
+}
+
+function _markServerCheckSuccess(uid: string): void {
+  _writeLocalState(uid, { server_check_succeeded_at: Date.now() });
 }
 
 interface _CatalogRow { version: string; published_at: number; updated_at?: number; default_install?: boolean; status?: string }
@@ -236,9 +354,25 @@ async function _fetchServerCatalogMap(kind: 'agents' | 'skills'): Promise<Map<st
 
 /** Read manifest + reconcile every entry in parallel. Returns counts for logging. Emits status
  *  updates through the subscribe channel so the renderer can show a "syncing" banner. */
-export async function reconcileInstalls(uid: string): Promise<ReconcileResult> {
+export async function reconcileInstalls(
+  uid: string,
+  opts: MarketplaceReconcileOptions = {},
+): Promise<ReconcileResult> {
+  try { _assertContinue(opts); } catch {
+    return _emptyReconcileResult();
+  }
   let manifest = await readInstalls(uid);
-  const localConvergence = await _reconcileLocalOnlyInstalls(uid, manifest);
+  let localConvergence: LocalConvergenceCounts;
+  try {
+    localConvergence = await _reconcileLocalOnlyInstalls(uid, manifest, opts);
+  } catch (err) {
+    if (err instanceof ReconcileCancelled) return _emptyReconcileResult();
+    throw err;
+  }
+  try { _assertContinue(opts); } catch {
+    _setStatus(_idleStatus());
+    return { ..._emptyReconcileResult(), ...localConvergence };
+  }
   if (localConvergence.restored_agents > 0 || localConvergence.restored_skills > 0) {
     manifest = await readInstalls(uid);
   }
@@ -248,11 +382,20 @@ export async function reconcileInstalls(uid: string): Promise<ReconcileResult> {
   const skillsNeedingPull = manifest.skills.filter((r) => _skillNeedsPull(uid, r));
   const agentPullIds = new Set(agentsNeedingPull.map((r) => r.id));
   const skillPullIds = new Set(skillsNeedingPull.map((r) => r.id));
-  const metadataPatches = await _patchLocalMetadataForManifest(uid, manifest, agentPullIds, skillPullIds);
+  let metadataPatches: MetadataPatchCounts;
+  try {
+    metadataPatches = await _patchLocalMetadataForManifest(uid, manifest, agentPullIds, skillPullIds, opts);
+  } catch (err) {
+    if (err instanceof ReconcileCancelled) {
+      _setStatus(_idleStatus());
+      return { ..._emptyReconcileResult(), ...localConvergence };
+    }
+    throw err;
+  }
   const total = agentsNeedingPull.length + skillsNeedingPull.length;
   if (total === 0) {
     _clearCachesAfterConvergence(localConvergence, metadataPatches);
-    _setStatus({ state: 'idle', total: 0, pulled: 0, failed: [], updated_at: Date.now() });
+    _setStatus(_idleStatus());
     return {
       pulled_agents: 0,
       pulled_skills: 0,
@@ -262,32 +405,53 @@ export async function reconcileInstalls(uid: string): Promise<ReconcileResult> {
     };
   }
 
-  _setStatus({ state: 'running', total, pulled: 0, failed: [], updated_at: Date.now() });
+  _setStatus({
+    state: 'running',
+    phase: 'reconcile',
+    total,
+    total_agents: agentsNeedingPull.length,
+    total_skills: skillsNeedingPull.length,
+    pulled: 0,
+    pulled_agents: 0,
+    pulled_skills: 0,
+    failed: [],
+    updated_at: Date.now(),
+  });
 
   const failed: string[] = [];
   let pulled_agents = 0;
   let pulled_skills = 0;
 
   const bumpProgress = (): void => {
-    _setStatus({ ..._status, pulled: pulled_agents + pulled_skills, updated_at: Date.now() });
+    _setStatus({
+      ..._status,
+      pulled: pulled_agents + pulled_skills,
+      pulled_agents,
+      pulled_skills,
+      updated_at: Date.now(),
+    });
   };
 
   const agentTasks = agentsNeedingPull.map(async (row) => {
     try {
-      await _pullAgent(uid, row);
+      _assertContinue(opts);
+      await _pullAgent(uid, row, opts);
       pulled_agents++;
       bumpProgress();
     } catch (err) {
+      if (err instanceof ReconcileCancelled) return;
       log.warn(`agent ${row.id} pull failed: ${(err as Error).message}`);
       failed.push(`agent:${row.id}`);
     }
   });
   const skillTasks = skillsNeedingPull.map(async (row) => {
     try {
-      await _pullSkill(uid, row);
+      _assertContinue(opts);
+      await _pullSkill(uid, row, opts);
       pulled_skills++;
       bumpProgress();
     } catch (err) {
+      if (err instanceof ReconcileCancelled) return;
       log.warn(`skill ${row.id} pull failed: ${(err as Error).message}`);
       failed.push(`skill:${row.id}`);
     }
@@ -304,7 +468,14 @@ export async function reconcileInstalls(uid: string): Promise<ReconcileResult> {
   }
   _clearCachesAfterConvergence(localConvergence, metadataPatches);
   _setStatus({
-    state: 'done', total, pulled: pulled_agents + pulled_skills,
+    state: 'done',
+    phase: 'reconcile',
+    total,
+    total_agents: agentsNeedingPull.length,
+    total_skills: skillsNeedingPull.length,
+    pulled: pulled_agents + pulled_skills,
+    pulled_agents,
+    pulled_skills,
     failed, updated_at: Date.now(),
   });
   log.info(`reconciled: pulled ${pulled_agents} agent(s) + ${pulled_skills} skill(s); failed=${failed.length}`);
@@ -314,6 +485,20 @@ export async function reconcileInstalls(uid: string): Promise<ReconcileResult> {
     failed,
     ...localConvergence,
     ...metadataPatches,
+  };
+}
+
+function _emptyReconcileResult(): ReconcileResult {
+  return {
+    pulled_agents: 0,
+    pulled_skills: 0,
+    failed: [],
+    pruned_agents: 0,
+    pruned_skills: 0,
+    restored_agents: 0,
+    restored_skills: 0,
+    patched_agents: 0,
+    patched_skills: 0,
   };
 }
 
@@ -339,7 +524,11 @@ function _clearCachesAfterConvergence(local: LocalConvergenceCounts, meta: Metad
   }
 }
 
-async function _reconcileLocalOnlyInstalls(uid: string, manifest: Awaited<ReturnType<typeof readInstalls>>): Promise<LocalConvergenceCounts> {
+async function _reconcileLocalOnlyInstalls(
+  uid: string,
+  manifest: Awaited<ReturnType<typeof readInstalls>>,
+  opts: MarketplaceReconcileOptions = {},
+): Promise<LocalConvergenceCounts> {
   const counts: LocalConvergenceCounts = {
     pruned_agents: 0,
     pruned_skills: 0,
@@ -349,6 +538,7 @@ async function _reconcileLocalOnlyInstalls(uid: string, manifest: Awaited<Return
   const manifestAgents = new Set(manifest.agents.map((a) => a.id));
   const manifestSkills = new Set(manifest.skills.map((s) => s.id));
   for (const id of _localInstallIds(userMarketplaceAgentsDir(uid))) {
+    _assertContinue(opts);
     if (manifestAgents.has(id)) continue;
     const dir = userMarketplaceAgentDir(uid, id);
     const meta = _readInstallMeta(dir);
@@ -361,6 +551,7 @@ async function _reconcileLocalOnlyInstalls(uid: string, manifest: Awaited<Return
       continue;
     }
     if (_canRestoreAgentInstall(meta)) {
+      _assertContinue(opts);
       await addAgentInstall(uid, {
         id,
         version: meta.version,
@@ -377,6 +568,7 @@ async function _reconcileLocalOnlyInstalls(uid: string, manifest: Awaited<Return
     }
   }
   for (const id of _localInstallIds(userMarketplaceSkillsDir(uid))) {
+    _assertContinue(opts);
     if (manifestSkills.has(id)) continue;
     const dir = userMarketplaceSkillDir(uid, id);
     const meta = _readInstallMeta(dir);
@@ -389,6 +581,7 @@ async function _reconcileLocalOnlyInstalls(uid: string, manifest: Awaited<Return
       continue;
     }
     if (_canRestoreSkillInstall(meta)) {
+      _assertContinue(opts);
       await addSkillInstall(uid, {
         id,
         version: meta.version,
@@ -412,26 +605,31 @@ async function _patchLocalMetadataForManifest(
   manifest: Awaited<ReturnType<typeof readInstalls>>,
   agentPullIds: Set<string>,
   skillPullIds: Set<string>,
+  opts: MarketplaceReconcileOptions = {},
 ): Promise<MetadataPatchCounts> {
   const counts: MetadataPatchCounts = { patched_agents: 0, patched_skills: 0 };
   for (const row of manifest.agents) {
+    _assertContinue(opts);
     if (agentPullIds.has(row.id) || !_agentContentExists(uid, row.id)) continue;
     const dir = userMarketplaceAgentDir(uid, row.id);
     const meta = _readInstallMeta(dir);
     if (!meta) continue;
     const patch = _installMetaFromAgentRow(row);
     if (!_installMetaMatches(meta, patch)) {
+      _assertContinue(opts);
       await _writeInstallMeta(dir, { ...meta, ...patch });
       counts.patched_agents++;
     }
   }
   for (const row of manifest.skills) {
+    _assertContinue(opts);
     if (skillPullIds.has(row.id) || !_skillContentExists(uid, row.id)) continue;
     const dir = userMarketplaceSkillDir(uid, row.id);
     const meta = _readInstallMeta(dir);
     if (!meta) continue;
     const patch = _installMetaFromSkillRow(row);
     if (!_installMetaMatches(meta, patch)) {
+      _assertContinue(opts);
       await _writeInstallMeta(dir, { ...meta, ...patch });
       counts.patched_skills++;
     }
@@ -449,45 +647,20 @@ function _localInstallIds(root: string): string[] {
 }
 
 /** Need-pull check: missing dir / missing agent.json / `_install.json::version` mismatch.
- *  Mirrors the cache freshness rule from marketplace_cache.ts (version + updated_at fallback).
- *
- *  **Dev-mode local-edit guard**: when running under `false` and the meta
- *  carries a `content_sha` (= sha256 of the descriptive file at install/upload
- *  time), compare against disk. If they differ, the dev edited the spec locally
- *  and we must NOT clobber the change — return false + log. Production users
- *  don't hand-edit install dirs, so this branch is dev-only. Pre-feature
- *  installs (no `content_sha`) fall through to the legacy version+freshness
- *  comparison, which is the same behaviour as before.
- */
+ *  Mirrors the cache freshness rule from marketplace_cache.ts (version + updated_at fallback). */
 function _agentNeedsPull(uid: string, row: AgentInstall): boolean {
   if (!_agentContentExists(uid, row.id)) return true;
   const dir = userMarketplaceAgentDir(uid, row.id);
-  const agentJsonFile = path.join(dir, 'agent.json');
   const meta = _readInstallMeta(dir);
   if (!meta) return true;
-  if (false && typeof meta.content_sha === 'string') {
-    const diskSha = sha256OfFile(agentJsonFile);
-    if (diskSha && diskSha !== meta.content_sha) {
-      log.warn(`dev: agent ${row.id} agent.json locally modified (sha mismatch); skipping re-pull. Republish via the marketplace upload UI when ready, or 'reinstall from server' from the detail panel to discard local edits.`);
-      return false;
-    }
-  }
   return meta.version !== row.version || _freshnessAt(meta) !== _freshnessAt(row);
 }
 
 function _skillNeedsPull(uid: string, row: SkillInstall): boolean {
   if (!_skillContentExists(uid, row.id)) return true;
   const dir = userMarketplaceSkillDir(uid, row.id);
-  const skillMdFile = path.join(dir, 'SKILL.md');
   const meta = _readInstallMeta(dir);
   if (!meta) return true;
-  if (false && typeof meta.content_sha === 'string') {
-    const diskSha = sha256OfFile(skillMdFile);
-    if (diskSha && diskSha !== meta.content_sha) {
-      log.warn(`dev: skill ${row.id} SKILL.md locally modified (sha mismatch); skipping re-pull. Republish via the marketplace upload UI when ready, or 'reinstall from server' from the detail panel to discard local edits.`);
-      return false;
-    }
-  }
   return meta.version !== row.version || _freshnessAt(meta) !== _freshnessAt(row);
 }
 
@@ -618,14 +791,16 @@ async function _patchInstallMeta(dir: string, patch: Partial<InstallMeta>): Prom
 
 /** Fetch agent.json from the cloud URL recorded in the manifest, write to the per-machine
  *  install target. Wipe-and-replace so a previous version doesn't leave stale fields. */
-async function _pullAgent(uid: string, row: AgentInstall): Promise<void> {
-  return withMarketplaceInstallLock(uid, 'agent', row.id, async () => _pullAgentLocked(uid, row));
+async function _pullAgent(uid: string, row: AgentInstall, opts: MarketplaceReconcileOptions = {}): Promise<void> {
+  return withMarketplaceInstallLock(uid, 'agent', row.id, async () => _pullAgentLocked(uid, row, opts));
 }
 
-async function _pullAgentLocked(uid: string, row: AgentInstall): Promise<void> {
+async function _pullAgentLocked(uid: string, row: AgentInstall, opts: MarketplaceReconcileOptions = {}): Promise<void> {
   let current = row;
-  let res = await fetch(current.agent_json_url);
+  _assertContinue(opts);
+  let res = await fetchWithRetry(`marketplace:pull-agent:${row.id}`, current.agent_json_url);
   if (!res.ok && res.status === 404) {
+    _assertContinue(opts);
     const fresh = await postJson<{
       agent_json: Record<string, unknown>;
       version: string;
@@ -647,20 +822,26 @@ async function _pullAgentLocked(uid: string, row: AgentInstall): Promise<void> {
       ...(typeof fresh.default_install === 'boolean' ? { default_install: fresh.default_install } : {}),
       ...((fresh.status || fresh.state) ? { status: fresh.status || fresh.state } : {}),
     };
+    _assertContinue(opts);
     await addAgentInstall(uid, current);
-    res = await fetch(current.agent_json_url);
+    res = await fetchWithRetry(`marketplace:pull-agent:${row.id}:fresh`, current.agent_json_url);
   }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const text = await res.text();
+  _assertContinue(opts);
   // Validate it parses — manifest-stored URLs come from COS, treat as untrusted.
   const parsed = JSON.parse(text) as Record<string, unknown>;
   if (typeof parsed.agent_id !== 'string') throw new Error('agent.json missing agent_id');
 
   const dir = userMarketplaceAgentDir(uid, row.id);
+  _assertContinue(opts);
   await fsp.rm(dir, { recursive: true, force: true });
+  _assertContinue(opts);
   await fsp.mkdir(dir, { recursive: true });
   const agentJsonFile = path.join(dir, 'agent.json');
+  _assertContinue(opts);
   await fsp.writeFile(agentJsonFile, text, 'utf8');
+  _assertContinue(opts);
   await _writeInstallMeta(dir, {
     version: current.version, published_at: current.published_at,
     ...(typeof current.updated_at === 'number' ? { updated_at: current.updated_at } : {}),
@@ -679,14 +860,16 @@ async function _pullAgentLocked(uid: string, row: AgentInstall): Promise<void> {
 /** Fetch the skill bundle zip from cloud URL + extract. Same wipe-and-replace semantics.
  *  `extractBundleSafely` enforces entry count + uncompressed size caps (zip-bomb defense)
  *  — shared with the marketplace install path. */
-async function _pullSkill(uid: string, row: SkillInstall): Promise<void> {
-  return withMarketplaceInstallLock(uid, 'skill', row.id, async () => _pullSkillLocked(uid, row));
+async function _pullSkill(uid: string, row: SkillInstall, opts: MarketplaceReconcileOptions = {}): Promise<void> {
+  return withMarketplaceInstallLock(uid, 'skill', row.id, async () => _pullSkillLocked(uid, row, opts));
 }
 
-async function _pullSkillLocked(uid: string, row: SkillInstall): Promise<void> {
+async function _pullSkillLocked(uid: string, row: SkillInstall, opts: MarketplaceReconcileOptions = {}): Promise<void> {
   let current = row;
-  let res = await fetch(current.bundle_url);
+  _assertContinue(opts);
+  let res = await fetchWithRetry(`marketplace:pull-skill:${row.id}`, current.bundle_url);
   if (!res.ok && res.status === 404) {
+    _assertContinue(opts);
     const fresh = await postJson<{
       bundle_url: string;
       version: string;
@@ -707,21 +890,27 @@ async function _pullSkillLocked(uid: string, row: SkillInstall): Promise<void> {
       ...(typeof fresh.default_install === 'boolean' ? { default_install: fresh.default_install } : {}),
       ...((fresh.status || fresh.state) ? { status: fresh.status || fresh.state } : {}),
     };
+    _assertContinue(opts);
     await addSkillInstall(uid, current);
-    res = await fetch(current.bundle_url);
+    res = await fetchWithRetry(`marketplace:pull-skill:${row.id}:fresh`, current.bundle_url);
   }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const ab = await res.arrayBuffer();
+  _assertContinue(opts);
   const zip = new AdmZip(Buffer.from(ab));
 
   const dir = userMarketplaceSkillDir(uid, row.id);
+  _assertContinue(opts);
   await fsp.rm(dir, { recursive: true, force: true });
+  _assertContinue(opts);
   await fsp.mkdir(dir, { recursive: true });
 
+  _assertContinue(opts);
   extractBundleSafely(zip, dir);
   // Sanity: SKILL.md must end up in place (zip empty / corrupt would silently skip everything).
   const skillMdFile = path.join(dir, 'SKILL.md');
   if (!fs.existsSync(skillMdFile)) throw new Error('bundle missing SKILL.md');
+  _assertContinue(opts);
   await _writeInstallMeta(dir, {
     version: current.version, published_at: current.published_at,
     ...(typeof current.updated_at === 'number' ? { updated_at: current.updated_at } : {}),

@@ -3,7 +3,8 @@
  *
  * Discovery rules per CLI:
  *   1. ORKAS_<TYPE>_PATH env var, if set → use as-is (still validated).
- *   2. Else `whichBin(defaultBin)` to scan PATH.
+ *   2. Else `whichBin(defaultBin)` scans PATH plus standard GUI-app
+ *      fallback dirs (`~/.local/bin`, Homebrew locations, etc.).
  *   3. If found, run `<path> --version` and `checkMinVersion`.
  *
  * Results are cached for 60s to keep the create/edit panel snappy
@@ -18,6 +19,8 @@
 import { createLogger } from '../../logger.js';
 import { whichBin } from './which.js';
 import { checkMinVersion, detectVersion } from './version.js';
+import * as os from 'node:os';
+import * as path from 'node:path';
 
 const log = createLogger('local-agents');
 
@@ -43,6 +46,29 @@ const ENV_KEYS: Record<LocalCliType, string> = {
   opencode: 'ORKAS_OPENCODE_PATH',
   hermes: 'ORKAS_HERMES_PATH',
 };
+
+function defaultSearchDirs(type: LocalCliType): string[] {
+  const home = os.homedir();
+  const dirs: string[] = [];
+  if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA || (home ? path.join(home, 'AppData', 'Local') : '');
+    if (type === 'codex' && localAppData) {
+      dirs.push(path.join(localAppData, 'Programs', 'OpenAI', 'Codex', 'bin'));
+    }
+    return dirs;
+  }
+  if (home) {
+    // macOS GUI apps do not source ~/.zprofile, but Codex standalone
+    // installs its visible command here by default.
+    dirs.push(path.join(home, '.local', 'bin'));
+    dirs.push(path.join(home, 'bin'));
+  }
+  dirs.push('/opt/homebrew/bin', '/usr/local/bin');
+  if (type === 'codex' && process.platform === 'darwin') {
+    dirs.push('/Applications/Codex.app/Contents/Resources');
+  }
+  return dirs;
+}
 
 /** Detection result for a single CLI. */
 export type LocalCliEntry = {
@@ -90,14 +116,16 @@ export async function detectAll(opts: { force?: boolean } = {}): Promise<LocalCl
 export async function detectOne(type: LocalCliType): Promise<LocalCliEntry> {
   const envPath = process.env[ENV_KEYS[type]]?.trim();
   const candidate = envPath && envPath.length > 0 ? envPath : BIN_NAMES[type];
-  const resolved = await whichBin(candidate);
+  const resolved = await whichBin(candidate, {
+    extraDirs: envPath ? [] : defaultSearchDirs(type),
+  });
   if (!resolved) {
     return {
       type, path: null, version: null, available: false,
       error: 'not_found',
       errorDetail: envPath
         ? `${ENV_KEYS[type]}=${envPath} not found on PATH or filesystem`
-        : `${BIN_NAMES[type]} not found on PATH`,
+        : `${BIN_NAMES[type]} not found on PATH or standard CLI install locations`,
     };
   }
   const version = await detectVersion(resolved);

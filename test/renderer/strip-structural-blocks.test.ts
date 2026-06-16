@@ -1165,6 +1165,46 @@ describe('<skill-meta> final safety strip', () => {
   });
 });
 
+describe('<auto-task> final safety strip', () => {
+  it('replaces real automation containers during streaming', () => {
+    const buf = [
+      'done',
+      '<auto-task>',
+      '<action>create</action>',
+      '<title>Daily report</title>',
+      '</auto-task>',
+      'tail',
+    ].join('\n');
+    const out = _replaceOuterTagBlocks(buf, 'auto-task', PH);
+    expect(out).toBe(`done\n${PH}\ntail`);
+  });
+
+  it('preserves literal automation protocol examples during streaming', () => {
+    const buf = [
+      'Use `<auto-task>` in the protocol docs.',
+      '```',
+      '<auto-task><action>delete</action></auto-task>',
+      '```',
+    ].join('\n');
+    expect(_replaceOuterTagBlocks(buf, 'auto-task', PH)).toBe(buf);
+  });
+
+  it('strips leaked automation containers while preserving literal mentions', () => {
+    const buf = [
+      'done',
+      '<auto-task><action>create</action></auto-task>',
+      'Use `<auto-task>` in the protocol docs.',
+      '```',
+      '<auto-task><action>delete</action></auto-task>',
+      '```',
+    ].join('\n');
+    const out = _stripSurvivingStructuralBlocks(buf);
+    expect(out).not.toContain('<action>create</action>');
+    expect(out).toContain('Use `<auto-task>` in the protocol docs.');
+    expect(out).toContain('<action>delete</action>');
+  });
+});
+
 describe('_splitMarkdownProseCode sanity', () => {
   it('keeps inline backtick spans as code segments', () => {
     const segs = _splitMarkdownProseCode('a `b` c');

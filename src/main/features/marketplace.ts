@@ -45,16 +45,18 @@ import * as path from 'node:path';
 
 import { sha256OfFile } from '../util/sha256';
 import { logPathRef } from '../util/log-redact';
+import { fetchWithRetry } from '../util/retry';
 
 import {
   userSkillsDir,
   userMarketplaceAgentDir, userMarketplaceSkillDir,
+  userMarketplaceAgentsDir, userMarketplaceSkillsDir,
   marketplaceCacheAgentDir, marketplaceCacheSkillDir,
   userMarketplaceInstallsFile, marketplaceDefaultsSeededFile,
   userMarketplaceDirCloud,
 } from '../paths';
-import { getActiveUserId } from './users';
-import { getCurrentLang } from '../i18n';
+import { getActiveUserId, isAnonymousLocalId } from './users';
+import { getLanguage } from './config';
 import { invalidateSkills as invalidateCoreAgentSkills } from '../model/core-agent/skill-registry';
 import {
   getSkillCacheDir, isCacheFresh, readAgentCache, touchCacheEntry,
@@ -86,11 +88,11 @@ export function apiBase(): string {
 interface Envelope { code: number; msg?: string; [k: string]: unknown }
 
 export async function postJson<T>(p: string, body: unknown): Promise<T> {
-  const res = await fetch(`${apiBase()}${p}`, {
+  const res = await fetchWithRetry(`marketplace:${p}`, `${apiBase()}${p}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Accept-Language': getCurrentLang(),
+      'Accept-Language': getLanguage(),
     },
     body: JSON.stringify(body || {}),
   });
@@ -210,6 +212,41 @@ export async function listMarketplaceSkills(
   });
 }
 
+// Open-source projects专区 — a curated, read-only catalog (config-as-code on
+// the Server; no upload path). Unlike agents/skills it carries `driver`
+// (install/cli/mcp — the existing mechanism that runs it, not a new system),
+// `repo`, and a user-language `task_*` one-liner used to prefill the
+// Commander composer when a card is clicked. The list endpoint also returns
+// the OSS-specific `categories` so the client renders the chip row in one
+// round-trip.
+export type ProjectDriver = 'install' | 'cli' | 'mcp';
+export interface MarketplaceProject {
+  id: string;
+  name: string;
+  repo: string;
+  category: string;
+  driver: ProjectDriver;
+  glyph: string;
+  color: string;
+  by: string;
+  description_zh: string;
+  description_en: string;
+  task_zh: string;
+  task_en: string;
+  home?: boolean;
+}
+export async function listMarketplaceProjects(
+  opts: { category?: string; q?: string; page?: number; size?: number; home_only?: boolean } = {},
+): Promise<{ list: MarketplaceProject[]; total: number; categories: MarketplaceCategory[] }> {
+  return await postJson('/marketplace/projects/list', {
+    category: opts.category || null,
+    q: opts.q || null,
+    page: opts.page || 1,
+    ...(typeof opts.size === 'number' ? { size: opts.size } : {}),
+    home_only: opts.home_only === true,
+  });
+}
+
 // ── detail (cache-aware) ──────────────────────────────────────────────────
 // Detail-page entry. Caller provides the list-row's freshness pair so we can short-circuit
 // when cache is hot; we still fetch + repopulate cache on miss / stale.
@@ -226,12 +263,13 @@ export class MarketplaceInstallError extends Error {
 
   constructor(kind: MarketplaceInstallKind, id: string, name: string | undefined, reason: string) {
     const label = kind === 'agent' ? 'agent' : 'skill';
-    const displayName = (name || id || '').trim();
+    const cleanName = String(name || '').trim();
+    const displayName = cleanName || (id || '').trim();
     super(`${label} ${displayName}: ${reason}`);
     this.name = 'MarketplaceInstallError';
     this.marketplaceKind = kind;
     this.marketplaceId = id;
-    this.marketplaceName = displayName;
+    this.marketplaceName = cleanName;
     this.marketplaceReason = reason;
   }
 }
@@ -241,13 +279,15 @@ export function getMarketplaceInstallErrorInfo(err: unknown): {
   id?: string;
   name?: string;
   reason: string;
+  qualityReport?: QualityReport;
 } {
-  const e = err as Partial<MarketplaceInstallError> & { message?: string };
+  const e = err as Partial<MarketplaceInstallError> & { message?: string; qualityReport?: QualityReport };
   return {
     kind: e.marketplaceKind,
     id: e.marketplaceId,
     name: e.marketplaceName,
     reason: e.marketplaceReason || e.message || String(err),
+    qualityReport: e.qualityReport,
   };
 }
 
@@ -259,7 +299,10 @@ function _wrapMarketplaceInstallError(
 ): MarketplaceInstallError {
   if (err instanceof MarketplaceInstallError) return err;
   const reason = (err as Error)?.message || String(err);
-  return new MarketplaceInstallError(kind, id, name, reason);
+  const wrapped = new MarketplaceInstallError(kind, id, name, reason);
+  const qualityReport = (err as { qualityReport?: QualityReport })?.qualityReport;
+  if (qualityReport) (wrapped as { qualityReport?: QualityReport }).qualityReport = qualityReport;
+  return wrapped;
 }
 
 function _agentJsonName(agentJson: Record<string, unknown>): string {
@@ -330,7 +373,7 @@ export async function getSkillDetail(
 async function _fetchAndCacheSkill(
   skillId: string, meta: { bundle_url: string; version: string; published_at: number; updated_at?: number },
 ): Promise<void> {
-  const res = await fetch(meta.bundle_url);
+  const res = await fetchWithRetry(`marketplace:skill-bundle:${skillId}`, meta.bundle_url);
   if (!res.ok) throw new Error(`download bundle failed (${res.status})`);
   const ab = await res.arrayBuffer();
   const zipBuf = Buffer.from(ab);
@@ -420,20 +463,22 @@ async function _installMarketplaceAgentLocked(
     const missingSkillIds = skillList.filter((sid) => !_skillAlreadyOnDisk(sid));
     if (missingSkillIds.length > 0) {
       await Promise.all(missingSkillIds.map(async (sid) => {
+        let depSkillName = '';
         try {
           // Direct hit on /skills/bundle for meta — avoids paging /skills/list (O(catalog) lookup
           // that breaks once the catalog grows past 500 skills).
           const meta = await postJson<{ bundle_url: string; version: string; category: string; published_at: number; updated_at?: number; name?: string }>(
             '/marketplace/skills/bundle', { id: sid },
           );
+          depSkillName = meta.name || '';
           await installMarketplaceSkill(sid, {
             version: meta.version,
             published_at: meta.published_at,
             updated_at: meta.updated_at,
-          }, { force: opts.force === true, name: meta.name });
+          }, { force: opts.force === true, name: depSkillName });
           log.info(`  dep-installed skill ${sid}`);
         } catch (err) {
-          throw _wrapMarketplaceInstallError('skill', sid, undefined, err);
+          throw _wrapMarketplaceInstallError('skill', sid, depSkillName, err);
         }
       }));
     }
@@ -611,12 +656,17 @@ function _skillAlreadyOnDisk(skillId: string): boolean {
 function _qualityInstallError(
   kind: 'agent' | 'skill', id: string, report: QualityReport,
 ): Error {
-  const top = report.violations.find((v) => v.level === 'EXTREME');
+  const blockingViolations = report.violations.filter((v) => v.level === 'EXTREME');
+  const top = blockingViolations[0];
   const reason = top ? `${top.rule}: ${top.suggested_fix}` : 'validation failed';
   const e = new Error(`Quality validation rejected ${kind} ${id} (${reason})`);
   (e as { qualityKind?: string }).qualityKind = kind;
   (e as { qualityId?: string }).qualityId = id;
-  (e as { qualityReport?: QualityReport }).qualityReport = report;
+  (e as { qualityReport?: QualityReport }).qualityReport = {
+    ...report,
+    ok: false,
+    violations: blockingViolations,
+  };
   return e;
 }
 
@@ -640,15 +690,19 @@ async function _seedAgentSkillDependencies(
   agentId: string,
   installedSkills: Set<string>,
   deletedSkills: Set<string>,
+  shouldContinue: () => boolean = () => true,
 ): Promise<{ seeded: number; blocked: boolean }> {
+  if (!shouldContinue()) return { seeded: 0, blocked: true };
   const detail = await postJson<{ agent_json: Record<string, unknown> }>(
     '/marketplace/agents/detail', { id: agentId },
   );
+  if (!shouldContinue()) return { seeded: 0, blocked: true };
   const skillList = Array.isArray(detail.agent_json?.skill_list)
     ? (detail.agent_json.skill_list as unknown[]).filter((x): x is string => typeof x === 'string' && x.trim() !== '')
     : [];
   let seeded = 0;
   for (const sid of skillList) {
+    if (!shouldContinue()) return { seeded, blocked: true };
     if (installedSkills.has(sid)) continue;
     if (deletedSkills.has(sid)) {
       log.info(`skip default agent ${agentId}; dependency skill ${sid} was previously uninstalled`);
@@ -658,6 +712,7 @@ async function _seedAgentSkillDependencies(
       const meta = await postJson<{ bundle_url: string; version: string; published_at: number; updated_at?: number; create_uid?: string; default_install?: boolean; status?: string; state?: string }>(
         '/marketplace/skills/bundle', { id: sid },
       );
+      if (!shouldContinue()) return { seeded, blocked: true };
       await addSkillInstall(uid, {
         id: sid,
         version: meta.version || '1.0.0',
@@ -696,13 +751,118 @@ async function _seedAgentSkillDependencies(
 // The marker file records the last observed default id set for diagnostics and crash recovery.
 // It is written only AFTER every eligible row is persisted. If the process crashes mid-loop,
 // `add*Install` upserts make the next boot safe to retry.
-export async function ensureDefaultInstalls(uid: string): Promise<{ seeded_agents: number; seeded_skills: number }> {
+export type DefaultInstallsSeedResult = {
+  seeded_agents: number;
+  seeded_skills: number;
+  skipped?: boolean;
+  failed?: boolean;
+  error?: string;
+};
+
+interface DefaultInstallMarker {
+  seeded_at?: number;
+  checked_at?: number;
+  version?: number;
+  agent_ids?: unknown;
+  skill_ids?: unknown;
+}
+
+function _stringIdSet(ids: unknown): Set<string> {
+  return new Set((Array.isArray(ids) ? ids : [])
+    .filter((id): id is string => typeof id === 'string' && id.trim().length > 0));
+}
+
+async function _readDefaultInstallMarker(uid: string): Promise<DefaultInstallMarker | null> {
+  try {
+    const raw = JSON.parse(await fsp.readFile(marketplaceDefaultsSeededFile(uid), 'utf8')) as DefaultInstallMarker;
+    return raw && typeof raw === 'object' ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+function _markerRecentlyChecked(marker: DefaultInstallMarker | null, minIntervalMs: number, now = Date.now()): boolean {
+  if (!marker || minIntervalMs <= 0) return false;
+  const checkedAt = Number(marker.checked_at || marker.seeded_at || 0);
+  return checkedAt > 0 && now - checkedAt < minIntervalMs;
+}
+
+function _hasLocalMarketplaceAgent(uid: string, id: string): boolean {
+  return fs.existsSync(path.join(userMarketplaceAgentDir(uid, id), 'agent.json'));
+}
+
+function _hasLocalMarketplaceSkill(uid: string, id: string): boolean {
+  return fs.existsSync(path.join(userMarketplaceSkillDir(uid, id), 'SKILL.md'));
+}
+
+function _hasAnyLocalMarketplaceInstall(uid: string): boolean {
+  const hasEntries = (dir: string): boolean => {
+    try { return fs.readdirSync(dir).some((name) => !!name && !name.startsWith('.')); }
+    catch { return false; }
+  };
+  return hasEntries(userMarketplaceAgentsDir(uid)) || hasEntries(userMarketplaceSkillsDir(uid));
+}
+
+export async function hasKnownDefaultInstallWork(uid: string): Promise<boolean> {
+  if (!uid || isAnonymousLocalId(uid)) return false;
+  try {
+    const manifest = await readInstalls(uid);
+    const installedAgents = new Set(manifest.agents.map((a) => a.id));
+    const installedSkills = new Set(manifest.skills.map((s) => s.id));
+    const deletedAgents = new Set(Object.keys(manifest._deleted_at?.agents || {}));
+    const deletedSkills = new Set(Object.keys(manifest._deleted_at?.skills || {}));
+
+    const marker = await _readDefaultInstallMarker(uid);
+
+    if (marker) {
+      for (const id of _stringIdSet(marker.agent_ids)) {
+        if (deletedAgents.has(id)) continue;
+        if (!installedAgents.has(id) || !_hasLocalMarketplaceAgent(uid, id)) return true;
+      }
+      for (const id of _stringIdSet(marker.skill_ids)) {
+        if (deletedSkills.has(id)) continue;
+        if (!installedSkills.has(id) || !_hasLocalMarketplaceSkill(uid, id)) return true;
+      }
+      return false;
+    }
+
+    const defaultAgents = manifest.agents.filter((a) => a.default_install === true);
+    const defaultSkills = manifest.skills.filter((s) => s.default_install === true);
+    if (defaultAgents.some((a) => !_hasLocalMarketplaceAgent(uid, a.id))) return true;
+    if (defaultSkills.some((s) => !_hasLocalMarketplaceSkill(uid, s.id))) return true;
+
+    // Fresh logged-in account: no marker, no manifest rows, no local marketplace installs.
+    // Existing installs without an old marker should not flash the default-install banner.
+    return manifest.agents.length === 0
+      && manifest.skills.length === 0
+      && !_hasAnyLocalMarketplaceInstall(uid);
+  } catch {
+    return false;
+  }
+}
+
+export async function ensureDefaultInstalls(
+  uid: string,
+  opts: { shouldContinue?: () => boolean; minIntervalMs?: number; force?: boolean } = {},
+): Promise<DefaultInstallsSeedResult> {
+  const canContinue = (): boolean => !isAnonymousLocalId(uid) && (opts.shouldContinue ? opts.shouldContinue() : true);
+  if (!canContinue()) {
+    log.info('skip default installs seed: login required');
+    return { seeded_agents: 0, seeded_skills: 0 };
+  }
   const markerFile = marketplaceDefaultsSeededFile(uid);
   try {
+    const minIntervalMs = Number.isFinite(opts.minIntervalMs) ? Math.max(0, Number(opts.minIntervalMs)) : 0;
+    const marker = await _readDefaultInstallMarker(uid);
+    if (!opts.force && _markerRecentlyChecked(marker, minIntervalMs) && !(await hasKnownDefaultInstallWork(uid))) {
+      log.info('skip default installs seed: checked recently');
+      return { seeded_agents: 0, seeded_skills: 0, skipped: true };
+    }
     const data = await postJson<{
       agents: { id: string; version: string; published_at: number; updated_at?: number; agent_json_url: string; create_uid?: string; status?: string; state?: string }[];
       skills: { id: string; version: string; published_at: number; updated_at?: number; bundle_url: string; create_uid?: string; status?: string; state?: string }[];
     }>('/marketplace/defaults', {});
+    if (!canContinue()) return { seeded_agents: 0, seeded_skills: 0 };
     const manifest = await readInstalls(uid);
     const installedAgents = new Set(manifest.agents.map((a) => a.id));
     const installedSkills = new Set(manifest.skills.map((s) => s.id));
@@ -711,10 +871,12 @@ export async function ensureDefaultInstalls(uid: string): Promise<{ seeded_agent
     let seededAgents = 0;
     let seededSkills = 0;
     for (const a of data.agents || []) {
+      if (!canContinue()) return { seeded_agents: seededAgents, seeded_skills: seededSkills };
       if (!a || !a.id) continue;
       if (deletedAgents.has(a.id)) continue;
       try {
-        const depSeed = await _seedAgentSkillDependencies(uid, a.id, installedSkills, deletedSkills);
+        const depSeed = await _seedAgentSkillDependencies(uid, a.id, installedSkills, deletedSkills, canContinue);
+        if (!canContinue()) return { seeded_agents: seededAgents, seeded_skills: seededSkills };
         seededSkills += depSeed.seeded;
         if (installedAgents.has(a.id) || depSeed.blocked) continue;
         await addAgentInstall(uid, {
@@ -733,6 +895,7 @@ export async function ensureDefaultInstalls(uid: string): Promise<{ seeded_agent
       }
     }
     for (const s of data.skills || []) {
+      if (!canContinue()) return { seeded_agents: seededAgents, seeded_skills: seededSkills };
       if (!s || !s.id) continue;
       if (installedSkills.has(s.id) || deletedSkills.has(s.id)) continue;
       try {
@@ -754,9 +917,11 @@ export async function ensureDefaultInstalls(uid: string): Promise<{ seeded_agent
     // Marker is written LAST so any crash above leaves a partially-seeded manifest + stale/no
     // marker → next launch retries the whole loop, and add*Install upserts rows already there.
     // Failure here (rare disk issue) likewise → retry next launch.
+    if (!canContinue()) return { seeded_agents: seededAgents, seeded_skills: seededSkills };
     await fsp.mkdir(userMarketplaceDirCloud(uid), { recursive: true });
     await fsp.writeFile(markerFile, JSON.stringify({
       seeded_at: Date.now(),
+      checked_at: Date.now(),
       version: 1,
       agent_ids: (data.agents || []).map((a) => a.id),
       skill_ids: (data.skills || []).map((s) => s.id),
@@ -767,8 +932,10 @@ export async function ensureDefaultInstalls(uid: string): Promise<{ seeded_agent
     // Stale/no marker → next launch retries. Manifest may be partially populated; that's fine
     // because `reconcileInstalls` will pick up rows that are there and the next ensure pass
     // will finish the rest.
-    log.warn(`default installs incremental seed failed (will retry on next launch): ${(err as Error).message}`);
-    return { seeded_agents: 0, seeded_skills: 0 };
+    if (!canContinue()) return { seeded_agents: 0, seeded_skills: 0 };
+    const message = (err as Error).message;
+    log.warn(`default installs incremental seed failed (will retry): ${message}`);
+    return { seeded_agents: 0, seeded_skills: 0, failed: true, error: message };
   }
 }
 

@@ -19,6 +19,7 @@ let _kbStatusByPath = {};           // {[path]: {status, chunks?, error?, kind?}
 let _kbEventsAbort = null;
 let _kbStatusRefreshTimer = null;
 let _kbReconcileInFlight = false;
+const _kbVectorizeStartedAtByPath = new Map();
 
 function _ctxUiIconHtml(name, className) {
   if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
@@ -159,6 +160,7 @@ function _ensureKbEventSubscription() {
 function _applyKbEvent(ev) {
   const p = ev.relPath;
   if (!p) return;
+  _trackKbVectorizeEvent(p, ev);
   if (ev.status === 'deleted') {
     delete _kbStatusByPath[p];
   } else {
@@ -188,6 +190,8 @@ function _applyKbEvent(ev) {
   }
   _scheduleKbStatusRefreshIfNeeded();
 }
+
+function _trackKbVectorizeEvent() {}
 
 function _cssEscape(s) {
   return String(s).replace(/(["\\])/g, '\\$1');
@@ -901,6 +905,7 @@ async function handleCtxUpload(fileList, targetDir = '') {
       const buf = await file.arrayBuffer();
       const target = targetDir ? `${targetDir}/${file.name}` : file.name;
       _kbStatusByPath[target] = { status: 'pending' };
+      _kbVectorizeStartedAtByPath.set(target, performance.now());
       const res = await apiFetch('/api/contexts/upload', {
         method: 'POST',
         headers: {

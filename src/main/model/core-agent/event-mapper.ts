@@ -9,6 +9,7 @@
  *   tool_start → {type:'event', event:{stream:'tool', data:{phase:'start', id, name}}}
  *                + a {type:'progress'} line so the UI's log shows it even if
  *                  the process panel filters events
+ *   tool_progress → {type:'event', event:{stream:'tool', data:{phase:'progress', id, name, message}}}
  *   tool_end   → {type:'event', event:{stream:'tool', data:{phase:'end', id, name, isError, result_preview}}}
  *   retry      → {type:'progress', text: 'retrying · <friendly reason>'} —
  *                the raw reason (e.g. undici "terminated", "fetch failed",
@@ -65,6 +66,26 @@ function resultPreview(s: string, max = 300): string {
   if (!s) return '';
   const oneLine = s.replace(/\s+/g, ' ').trim();
   return oneLine.length > max ? oneLine.slice(0, max) + '…' : oneLine;
+}
+
+const TOOL_INPUT_STREAM_START_NAMES = new Set([
+  'write_file',
+  'edit_file',
+  'create_artifact',
+  'markdown_to_pdf',
+  'html_to_pdf',
+]);
+
+function partialJsonStringField(source: string, field: string): string {
+  if (!source) return '';
+  const re = new RegExp(`"${field}"\\s*:\\s*"([^"\\\\]*(?:\\\\.[^"\\\\]*)*)`);
+  const m = re.exec(source);
+  if (!m) return '';
+  try {
+    return JSON.parse(`"${m[1].replace(/"$/, '')}"`);
+  } catch {
+    return m[1].replace(/\\n/g, ' ').replace(/\\"/g, '"');
+  }
 }
 
 /**
@@ -222,6 +243,9 @@ export async function* mapCoreAgentEvents(
   let error: string | null = null;
   const skillReadByToolId = new Map<string, SkillReadEventMetadata>();
   const agentReadByToolId = new Map<string, AgentReadEventMetadata>();
+  const earlyToolStarts = new Set<string>();
+  const toolDeltaNames = new Map<string, string>();
+  const toolDeltaInputPreviews = new Map<string, string>();
 
   // Separator between turns (tool-loop interim commentary + final answer).
   // Inserted lazily on the first delta of a new turn so we don't append a
@@ -246,11 +270,43 @@ export async function* mapCoreAgentEvents(
         break;
       }
 
+      case 'tool_delta': {
+        const id = ev.id || 'stream_tool';
+        const name = String(ev.name || toolDeltaNames.get(id) || '');
+        if (name) toolDeltaNames.set(id, name);
+        if (!name || !TOOL_INPUT_STREAM_START_NAMES.has(name) || earlyToolStarts.has(id)) break;
+        const delta = String(ev.inputDelta || '');
+        if (!delta) break;
+        const inputPreview = (toolDeltaInputPreviews.get(id) || '') + delta;
+        toolDeltaInputPreviews.set(id, inputPreview.slice(0, 8192));
+        const pathHint = partialJsonStringField(inputPreview, 'path')
+          || partialJsonStringField(inputPreview, 'filename')
+          || partialJsonStringField(inputPreview, 'title');
+        if (!pathHint) break;
+        earlyToolStarts.add(id);
+        yield {
+          type: 'event',
+          event: {
+            stream: 'tool',
+            data: {
+              phase: 'start',
+              id,
+              name,
+              ...(pathHint ? { arguments: { path: pathHint } } : {}),
+            },
+          },
+        };
+        break;
+      }
+
       case 'tool_start': {
+        toolDeltaNames.delete(ev.id);
+        toolDeltaInputPreviews.delete(ev.id);
         const skillMeta = skillReadMetadataForToolStart(ev.name, ev.input, opts);
         if (skillMeta) skillReadByToolId.set(ev.id, skillMeta);
         const agentMeta = agentReadMetadataForToolStart(ev.name, ev.input, opts);
         if (agentMeta) agentReadByToolId.set(ev.id, agentMeta);
+        if (earlyToolStarts.has(ev.id)) break;
         yield {
           type: 'event',
           event: {
@@ -274,9 +330,30 @@ export async function* mapCoreAgentEvents(
         break;
       }
 
+      case 'tool_progress': {
+        yield {
+          type: 'event',
+          event: {
+            stream: 'tool',
+            data: {
+              phase: 'progress',
+              id: ev.id,
+              name: ev.name,
+              message: ev.message,
+              ...(ev.phase ? { progress_phase: ev.phase } : {}),
+              ...(ev.data ? { progress_data: ev.data } : {}),
+            },
+          },
+        };
+        break;
+      }
+
       case 'tool_end': {
         const rawResult = ev.result || '';
         const preview = resultPreview(rawResult);
+        earlyToolStarts.delete(ev.id);
+        toolDeltaNames.delete(ev.id);
+        toolDeltaInputPreviews.delete(ev.id);
         const skillMeta = skillReadByToolId.get(ev.id) || null;
         skillReadByToolId.delete(ev.id);
         const agentMeta = agentReadByToolId.get(ev.id) || null;

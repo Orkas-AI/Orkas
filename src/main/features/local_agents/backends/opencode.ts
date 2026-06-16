@@ -25,6 +25,7 @@ import {
   StderrTail,
   spawnCli,
   bindAbort,
+  armKillWatchdog,
   LineSplitter,
 } from './base.js';
 
@@ -39,7 +40,6 @@ export const opencodeBackend: LocalBackend = {
     const startedAt = Date.now();
 
     let exited = false;
-    let timedOut = false;
     let textOut = '';
     let resultStatus: 'completed' | 'failed' | undefined;
     let resultError: string | undefined;
@@ -57,12 +57,11 @@ export const opencodeBackend: LocalBackend = {
       args,
     });
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try { child.kill('SIGTERM'); } catch { /* */ }
-      setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* */ } }, 10_000).unref();
-    }, opts.timeoutMs);
-    if (typeof timer.unref === 'function') timer.unref();
+    const watchdog = armKillWatchdog(child, {
+      timeoutMs: opts.timeoutMs,
+      idleKillMs: opts.idleKillMs,
+      lastEventAt: opts.lastEventAt,
+    });
 
     // opencode reads prompt from argv; close stdin so it doesn't wait.
     child.stdin.end();
@@ -112,7 +111,7 @@ export const opencodeBackend: LocalBackend = {
       const finish = (status: 'completed' | 'failed' | 'cancelled' | 'timeout', extra: Record<string, unknown> = {}) => {
         if (exited) return;
         exited = true;
-        clearTimeout(timer);
+        watchdog.disarm();
         detachAbort();
         opts.onEvent({
           type: 'done', status,
@@ -129,7 +128,7 @@ export const opencodeBackend: LocalBackend = {
       });
       child.on('close', code => {
         if (opts.signal.aborted) return finish('cancelled', { output: textOut });
-        if (timedOut) return finish('timeout', { error: `cli exceeded ${opts.timeoutMs}ms`, output: textOut, stderrTail: tail.toString() });
+        if (watchdog.fired()) return finish('timeout', { error: `cli ${watchdog.reason()}`, output: textOut, stderrTail: tail.toString() });
         if (code === 0 && (resultStatus === 'completed' || resultStatus === undefined)) {
           return finish('completed', { output: textOut });
         }

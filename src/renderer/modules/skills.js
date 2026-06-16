@@ -2,6 +2,12 @@ const _skillsLog = createLogger('skills');
 // ─── Skills ───
 
 let _skillsCache = null;
+// Read-only open-tier skills (external packages + global folders). Rendered
+// separately from trusted skills; users can enable/disable them here, while
+// package lifecycle actions stay package-scoped.
+let _openSkillsCache = [];
+let _packagesCache = [];
+let _skillsLoadInFlight = null;
 let _selectedSkill = null;    // { source, id }
 
 function _skillSource(source) {
@@ -99,27 +105,66 @@ async function refreshSkillsAfterMarketplaceReconcile() {
   }
 }
 
-async function loadSkills(forceRefresh) {
-  if (_skillsCache && !forceRefresh) { renderSkillsList(_skillsCache); return; }
+async function _refreshOpenSkillsCache() {
   try {
-    const res = await apiFetch(forceRefresh ? '/api/skills/list?force=1' : '/api/skills/list');
-    const data = await res.json();
-    if (data.ok) {
-      _skillsCache = (data.skills || []).map((s) => ({
-        ...s,
-        source: _skillSource(s.source),
-      })).sort((a, b) => {
-        const ka = _skillNameSortKey(a);
-        const kb = _skillNameSortKey(b);
-        if (ka < kb) return -1;
-        if (ka > kb) return 1;
-        return String(a.id || '').localeCompare(String(b.id || ''), undefined, { numeric: true, sensitivity: 'base' });
-      });
-      renderSkillsList(_skillsCache);
-    }
-  } catch (e) {
-    _skillsLog.error('load skills failed', e);
+    const openRes = await window.orkas.invoke('skills.listOpen');
+    _openSkillsCache = (openRes && openRes.ok && Array.isArray(openRes.skills)) ? openRes.skills : [];
+  } catch { _openSkillsCache = []; }
+}
+
+async function _refreshPackagesCache() {
+  try {
+    const res = await window.orkas.invoke('packages.list');
+    _packagesCache = (res && res.ok && Array.isArray(res.packages)) ? res.packages : [];
+  } catch (err) {
+    _skillsLog.warn('packages load failed', err);
+    _packagesCache = [];
   }
+}
+
+async function loadSkills(forceRefresh) {
+  if (_skillsLoadInFlight) {
+    if (!forceRefresh) return _skillsLoadInFlight;
+    await _skillsLoadInFlight.catch(() => {});
+  }
+  if (_skillsCache && !forceRefresh) {
+    // External packages are installed by an out-of-process CLI, so the
+    // trusted skills cache can still be current while the open-tier list has
+    // changed underneath us. Refresh it whenever the Skills page is revisited.
+    await _refreshOpenSkillsCache();
+    await _refreshPackagesCache();
+    renderSkillsList(_skillsCache);
+    return;
+  }
+  _skillsLoadInFlight = (async () => {
+    try {
+      const res = await apiFetch(forceRefresh ? '/api/skills/list?force=1' : '/api/skills/list');
+      const data = await res.json();
+      // Open-tier skills (from external packages + global folders) are
+      // read-only and live in a separate listing; fetched alongside so the
+      // panel can show them under their own group with a source badge.
+      await _refreshOpenSkillsCache();
+      await _refreshPackagesCache();
+      if (data.ok) {
+        _skillsCache = (data.skills || []).map((s) => ({
+          ...s,
+          source: _skillSource(s.source),
+        })).sort((a, b) => {
+          const ka = _skillNameSortKey(a);
+          const kb = _skillNameSortKey(b);
+          if (ka < kb) return -1;
+          if (ka > kb) return 1;
+          return String(a.id || '').localeCompare(String(b.id || ''), undefined, { numeric: true, sensitivity: 'base' });
+        });
+        renderSkillsList(_skillsCache);
+      }
+    } catch (e) {
+      _skillsLog.error('load skills failed', e);
+    } finally {
+      _skillsLoadInFlight = null;
+    }
+  })();
+  return _skillsLoadInFlight;
 }
 
 function _skillNameSortKey(skill) {
@@ -236,7 +281,12 @@ function refreshChatUseChips() {
   _renderChatUseChip('project');
 }
 
-function isChatUseAllowedForTarget(target) {
+function isChatUseAllowedForTarget(target, kind) {
+  // Connectors are commander-only (orchestration-side, permission-gated).
+  // Skills may target any recipient: the commander runs them; an agent
+  // recipient runs them itself (CLI agents via the orkas bridge's
+  // orkas_run_skill).
+  if (kind !== 'connector') return true;
   if (typeof getChatRecipient !== 'function') return true;
   const rec = getChatRecipient(target);
   return !rec || rec.kind !== 'agent';
@@ -244,7 +294,7 @@ function isChatUseAllowedForTarget(target) {
 
 function setChatUseSelection(target, selection, opts = {}) {
   const prev = JSON.stringify(_normalizeChatUseSelection(_chatUse[target]) || null);
-  const next = isChatUseAllowedForTarget(target)
+  const next = isChatUseAllowedForTarget(target, selection && selection.kind)
     ? _normalizeChatUseSelection(selection)
     : null;
   _chatUse[target] = next;
@@ -277,7 +327,8 @@ function consumeChatSkill(target) {
 
 function consumeChatUseSelection(target) {
   // Currently a one-way read. Chip persists until user removes it via the ×.
-  return isChatUseAllowedForTarget(target) ? getChatUseSelection(target) : null;
+  const sel = getChatUseSelection(target);
+  return sel && isChatUseAllowedForTarget(target, sel.kind) ? sel : null;
 }
 
 function transformWithSkill(content, skill) {
@@ -308,9 +359,23 @@ function renderSkillsGrid(skills) {
 
   if (!skills.length) {
     if (chipsHost) chipsHost.innerHTML = '';
+    // Even with no editable skills, open-tier skills (packages/global) may
+    // exist — render them so they're visible + togglable.
+    const openHtml = _openSkillsSectionHtml();
+    if (openHtml) {
+      gridEl.classList.add('is-sectioned');
+      gridEl.innerHTML = openHtml;
+      _wireOpenSkillCards(gridEl);
+      if (emptyEl) emptyEl.style.display = 'none';
+      return;
+    }
     gridEl.classList.remove('is-sectioned');
     gridEl.innerHTML = '';
-    if (emptyEl) emptyEl.style.display = '';
+    if (emptyEl) {
+      if (typeof _mpUpdateInstallingEmptyStates === 'function') _mpUpdateInstallingEmptyStates();
+      else emptyEl.textContent = t('skills.empty');
+      emptyEl.style.display = '';
+    }
     return;
   }
   if (emptyEl) emptyEl.style.display = 'none';
@@ -437,10 +502,17 @@ function renderSkillsGrid(skills) {
   };
   gridEl.classList.add('is-sectioned');
   gridEl.innerHTML = sectionHtml(customChipLabel, groups.custom)
-    + sectionHtml(marketplaceGroupLabel, groups.marketplace);
+    + sectionHtml(marketplaceGroupLabel, groups.marketplace)
+    + _openSkillsSectionHtml();
+  _wireOpenSkillCards(gridEl);
 
   // Wire card / ▶ / ⋯ click handlers. (Enable/disable lives in the ⋯ menu now.)
-  for (const card of gridEl.querySelectorAll('.skill-card')) {
+  // Scope to editable-tier cards (`data-id`): open-tier cards (`data-open-id`,
+  // external/global) are read-only and intentionally not navigable to a detail
+  // view — they only carry an enable/disable toggle, wired by
+  // `_wireOpenSkillCards`. Binding them here would open a broken detail page
+  // (no `data-id`/`data-source` → `invalid source` read).
+  for (const card of gridEl.querySelectorAll('.skill-card[data-id]')) {
     const id = card.dataset.id;
     const source = card.dataset.source;
     card.addEventListener('click', (e) => {
@@ -460,6 +532,299 @@ function renderSkillsGrid(skills) {
       _showSkillsDetailView(source, id);
     });
   }
+}
+
+/** Read-only section for open-tier skills (external packages + global
+ *  folders). Cards have no edit/use/detail affordances; management lives in
+ *  the per-card menu. Returns '' when none. */
+function _openSkillsSectionHtml() {
+  const rows = _openSkillsCache || [];
+  const representedPackages = new Set(rows
+    .filter((s) => s.source === 'external' && s.package_name)
+    .map((s) => String(s.package_name)));
+  const packageOnlyRows = (_packagesCache || [])
+    .filter((p) => p && p.name && !representedPackages.has(String(p.name)));
+  if (!rows.length && !packageOnlyRows.length) return '';
+  const card = (s) => {
+    // Same desc treatment as trusted/platform cards (flex:1, 3-line clamp,
+    // empty placeholder) so open-tier cards match them in size and pin the
+    // play button to the bottom regardless of description length.
+    const descText = String(s.description || '').trim();
+    const desc = `<div class="skill-card-desc${descText ? '' : ' is-empty'}">${escapeHtml(descText || t('skills.no_desc'))}</div>`;
+    const packageName = s.source === 'external' ? String(s.package_name || '') : '';
+    const displayName = String(s.name || s.id || '');
+    const kindLabel = packageName ? _packageKindLabel(s.package_kind) : '';
+    const packageMetaBits = [];
+    if (packageName && packageName !== displayName) packageMetaBits.push(packageName);
+    if (kindLabel) packageMetaBits.push(kindLabel);
+    const packageMeta = packageMetaBits.length
+      ? `<div class="skill-card-meta">${escapeHtml(packageMetaBits.join(' · '))}</div>`
+      : '';
+    const moreTitle = escapeHtml(t('skills.more_actions'));
+    const useTitle = escapeHtml(t('skills.use_tooltip'));
+    const enabled = s.enabled !== false;
+    const moreAttr = packageName ? 'data-open-more data-open-package-more' : 'data-open-more';
+    const moreBtn = `<button type="button" class="skill-card-more" ${moreAttr} title="${moreTitle}" aria-label="${moreTitle}">⋯</button>`;
+    const packageAttr = packageName ? ` data-open-package-name="${escapeHtml(packageName)}"` : '';
+    const sourceAttr = ` data-open-source="${escapeHtml(s.source || '')}"`;
+    // "Use" runs the skill from a fresh commander chat (useSkill forces the
+    // commander recipient), so it stays within the open-tier commander-only
+    // rule. Disabled when the skill is turned off, mirroring trusted cards.
+    const useBtn = `<button type="button" class="skill-card-use" data-open-use title="${useTitle}" aria-label="${useTitle}" ${enabled ? '' : 'disabled aria-disabled="true" tabindex="-1"'}>${_skillUiIconHtml('play-triangle', 'icon-play')}</button>`;
+    return `
+      <div class="skill-card is-readonly${enabled ? '' : ' is-disabled'}" data-open-id="${escapeHtml(s.id)}"${sourceAttr}${packageAttr}>
+        <div class="skill-card-header">
+          <span class="skill-card-name">${escapeHtml(displayName)}</span>
+          ${moreBtn}
+        </div>
+        ${packageMeta}
+        ${desc}
+        <div class="skill-card-actions">
+          ${useBtn}
+        </div>
+      </div>`;
+  };
+  const packageCard = (p) => {
+    const packageName = String(p.name || '');
+    const kindLabel = _packageKindLabel(p.kind);
+    const metaBits = [];
+    if (kindLabel) metaBits.push(kindLabel);
+    if (p.skill_count) metaBits.push(t('settings.packages.skills_count', { count: p.skill_count }));
+    if (p.bin_names && p.bin_names.length) metaBits.push(p.bin_names.map((b) => `\`${b}\``).join(' '));
+    const meta = metaBits.length
+      ? `<div class="skill-card-meta">${escapeHtml(metaBits.join(' · '))}</div>`
+      : '';
+    const moreTitle = escapeHtml(t('skills.more_actions'));
+    return `
+      <div class="skill-card is-readonly${p.enabled ? '' : ' is-disabled'}" data-open-package-card="1" data-open-package-name="${escapeHtml(packageName)}">
+        <div class="skill-card-header">
+          <span class="skill-card-name">${escapeHtml(packageName)}</span>
+          <button type="button" class="skill-card-more" data-open-package-more title="${moreTitle}" aria-label="${moreTitle}">⋯</button>
+        </div>
+        ${meta}
+      </div>`;
+  };
+  // Split external packages and global folders into their own sections so
+  // user-installed packages read distinctly from machine-global skill dirs
+  // (both are open-tier, but they have different provenance/management). A
+  // short hint next to each title explains the provenance to the user.
+  const section = (label, hint, list) => {
+    if (!list.length) return '';
+    const hintHtml = hint ? `<span class="skills-source-section-hint">${escapeHtml(hint)}</span>` : '';
+    return `
+    <section class="skills-source-section">
+      <div class="skills-source-section-head">
+        <span>${escapeHtml(label)}</span>
+        <span class="skills-source-section-count">${list.length}</span>
+        ${hintHtml}
+      </div>
+      <div class="skills-source-section-grid">${list.map(card).join('')}</div>
+    </section>`;
+  };
+  const externalSkillRows = rows.filter((s) => s.source === 'external');
+  const externalHtml = (externalSkillRows.length || packageOnlyRows.length)
+    ? `
+    <section class="skills-source-section">
+      <div class="skills-source-section-head">
+        <span>${escapeHtml(t('skills.external_group'))}</span>
+        <span class="skills-source-section-count">${externalSkillRows.length + packageOnlyRows.length}</span>
+        <span class="skills-source-section-hint">${escapeHtml(t('skills.external_group_hint'))}</span>
+      </div>
+      <div class="skills-source-section-grid">${externalSkillRows.map(card).join('')}${packageOnlyRows.map(packageCard).join('')}</div>
+    </section>`
+    : '';
+  return externalHtml
+    + section(t('skills.global_group'), t('skills.global_group_hint'), rows.filter((s) => s.source === 'global'));
+}
+
+function _wireOpenSkillCards(gridEl) {
+  for (const card of gridEl.querySelectorAll('.skill-card[data-open-id], .skill-card[data-open-package-card]')) {
+    const id = card.dataset.openId;
+    const source = card.dataset.openSource || '';
+    const useBtn = card.querySelector('[data-open-use]');
+    if (useBtn) {
+      useBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (card.classList.contains('is-disabled')) return;
+        const packageName = card.dataset.openPackageName || '';
+        const row = _openSkillsCache.find((s) => (
+          s.id === id
+          && (s.source || '') === source
+          && (source !== 'external' || String(s.package_name || '') === packageName)
+        ));
+        useSkill(id, (row && row.name) || id);
+      });
+    }
+    const menuBtn = card.querySelector('[data-open-more]');
+    const packageOnlyMenuBtn = card.querySelector('[data-open-package-more]');
+    if (packageOnlyMenuBtn && card.dataset.openPackageCard === '1') {
+      packageOnlyMenuBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const packageName = card.dataset.openPackageName || '';
+        const pkg = (_packagesCache || []).find((p) => String(p.name || '') === packageName);
+        if (pkg) {
+          _openExternalPackageMenu(packageOnlyMenuBtn, {
+            id: packageName,
+            package_name: packageName,
+            package_kind: pkg.kind,
+            package_enabled: pkg.enabled !== false,
+            enabled: pkg.enabled !== false,
+          });
+        }
+      });
+    } else if (menuBtn) {
+      menuBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (source === 'external') {
+          const packageName = card.dataset.openPackageName || '';
+          const row = _openSkillsCache.find((s) => (
+            s.id === id
+            && s.source === 'external'
+            && String(s.package_name || '') === packageName
+          ));
+          if (row) _openExternalPackageMenu(menuBtn, row);
+          return;
+        }
+        if (source === 'global') _openSkillRowMenu(menuBtn, id, source);
+      });
+    }
+  }
+}
+
+async function _setOpenSkillEnabled(id, nextEnabled) {
+  try {
+    const res = await window.orkas.invoke('skills.setEnabled', { id, enabled: nextEnabled });
+    if (!res || !res.ok) { await uiAlert(t('component.toggle_failed')); return false; }
+    // enable/disable is keyed by id; the same skill can appear under both
+    // external and global, so flip every matching row's optimistic state.
+    for (const r of _openSkillsCache) if (r.id === id) r.enabled = nextEnabled;
+    renderSkillsList(_skillsCache || []);
+    return true;
+  } catch {
+    await uiAlert(t('component.toggle_failed'));
+    return false;
+  }
+}
+
+function _packageKindLabel(kind) {
+  if (kind === 'skill' || kind === 'cli' || kind === 'both') {
+    const label = t(`settings.packages.kind_${kind}`);
+    return label && label !== `settings.packages.kind_${kind}` ? label : kind;
+  }
+  return '';
+}
+
+function _packageActionBusyLabel(command) {
+  if (command === 'update') return t('settings.packages.updating');
+  if (command === 'enable') return t('settings.packages.enabling');
+  if (command === 'disable') return t('settings.packages.disabling');
+  if (command === 'remove') return t('settings.packages.removing');
+  return t('common.loading');
+}
+
+// Per-card busy overlay shown while an external-package action (update /
+// enable / disable / remove) runs — these spawn orkas-pkg.cjs (git pull +
+// optional dep install) and can take several seconds. Without it the card
+// sits inert with no feedback. Cleared by the post-action re-render on
+// success, or in `_runOpenPackageAction`'s finally on the error path.
+function _setSkillCardBusy(card, command) {
+  if (!card) return;
+  card.classList.add('is-busy');
+  card.setAttribute('aria-busy', 'true');
+  if (card.querySelector('.skill-card-busy')) return;
+  const overlay = document.createElement('div');
+  overlay.className = 'skill-card-busy';
+  overlay.innerHTML = `<span class="skill-card-busy-spinner" aria-hidden="true"></span>`
+    + `<span class="skill-card-busy-label">${escapeHtml(_packageActionBusyLabel(command))}</span>`;
+  card.appendChild(overlay);
+}
+
+function _clearSkillCardBusy(card) {
+  if (!card) return;
+  card.classList.remove('is-busy');
+  card.removeAttribute('aria-busy');
+  card.querySelector('.skill-card-busy')?.remove();
+}
+
+function _openExternalPackageMenu(anchorBtn, row) {
+  const packageName = String(row?.package_name || '');
+  if (!packageName) return;
+  const card = anchorBtn.closest('.skill-card');
+  let menu = document.getElementById('skill-row-menu');
+  if (!menu) {
+    menu = document.createElement('div');
+    menu.id = 'skill-row-menu';
+    menu.className = 'skill-row-menu';
+    menu.style.display = 'none';
+    document.body.appendChild(menu);
+  }
+  const sameAnchor = menu.dataset.packageName === packageName
+    && menu.dataset.openSkillId === row.id
+    && menu.style.display !== 'none';
+  if (sameAnchor) { _closeSkillRowMenu(); return; }
+  _closeSkillRowMenu();
+  menu.dataset.packageName = packageName;
+  menu.dataset.openSkillId = row.id;
+  menu.dataset.source = 'external';
+  const packageEnabled = row.package_enabled !== false;
+  const toggleLabel = packageEnabled ? t('component.disable') : t('component.enable');
+  menu.innerHTML = [
+    `<div class="skill-row-menu-item" data-action="update-package">${escapeHtml(t('settings.packages.update'))}</div>`,
+    `<div class="skill-row-menu-item" data-action="toggle-package">${escapeHtml(toggleLabel)}</div>`,
+    `<div class="skill-row-menu-item is-danger" data-action="remove-package">${escapeHtml(t('settings.packages.remove'))}</div>`,
+  ].join('');
+  for (const c of document.querySelectorAll('.skill-card.is-menu-open')) c.classList.remove('is-menu-open');
+  anchorBtn.closest('.skill-card')?.classList.add('is-menu-open');
+  _positionSkillRowMenu(menu, anchorBtn);
+  for (const item of menu.querySelectorAll('.skill-row-menu-item')) {
+    item.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const action = item.dataset.action;
+      _closeSkillRowMenu();
+      if (action === 'update-package') {
+        await _runOpenPackageAction('update', packageName, card);
+      } else if (action === 'toggle-package') {
+        await _runOpenPackageAction(packageEnabled ? 'disable' : 'enable', packageName, card);
+      } else if (action === 'remove-package') {
+        const ok = await uiConfirmDanger({
+          title: t('settings.packages.remove_title', { name: packageName }),
+          message: t('settings.packages.remove_msg'),
+          dangerLabel: t('settings.packages.remove'),
+        });
+        if (ok) await _runOpenPackageAction('remove', packageName, card);
+      }
+    });
+  }
+}
+
+async function _runOpenPackageAction(command, packageName, cardEl) {
+  const card = cardEl && cardEl.isConnected ? cardEl : null;
+  if (card) _setSkillCardBusy(card, command);
+  const startedAt = Date.now();
+  try {
+    const res = await window.orkas.invoke('packages.action', { command, name: packageName });
+    if (!res || res.ok === false) {
+      const errorMessage = (res && res.error) || t('settings.packages.action_failed');
+      await uiAlert((res && res.error) || t('settings.packages.action_failed'));
+      return;
+    }
+    if (command === 'update' && typeof uiToast === 'function') {
+      uiToast(t('settings.packages.updated', { name: packageName }), { variant: 'success' });
+    }
+    await loadSkills(true);
+  } catch (err) {
+    _skillsLog.warn('package action failed', err);
+    await uiAlert(t('settings.packages.action_failed'));
+  } finally {
+    // Success re-renders the grid (card replaced), so this only fires on the
+    // failure path where the original card is still mounted.
+    if (card && card.isConnected) _clearSkillCardBusy(card);
+  }
+}
+
+async function _flipOpenSkillEnabled(id) {
+  const row = (_openSkillsCache || []).find((s) => s.id === id);
+  return _setOpenSkillEnabled(id, !(row && row.enabled));
 }
 
 /** Flip a skill's enabled override (used by both the ⋯ menu's toggle item
@@ -486,6 +851,29 @@ async function _flipSkillEnabled(skillId, nextEnabled) {
 }
 
 // ─── View switching: grid ↔ detail ─────────────────────────────────────
+
+// Back from the skill detail/edit view. An unconfirmed URL-import draft (a
+// placeholder that was never authored — set in `_saveSkillFromUrl`, cleared
+// once real content is written or the user clicks Done) prompts before
+// leaving: the user explicitly chooses to discard the half-finished import or
+// keep working. Authored/committed skills and ordinary edits just leave.
+async function _onSkillsBack() {
+  if (_importDraftId) {
+    const discard = await uiConfirm({
+      message: t('skills.import.back_confirm'),
+      okLabel: t('skills.import.back_discard'),
+      cancelLabel: t('skills.import.back_continue'),
+    });
+    if (!discard) return; // "keep editing" — stay in the edit chat
+    const draftId = _importDraftId;
+    _importDraftId = null;
+    try {
+      const r = await window.orkas.invoke('skills.discardImportDraft', { id: draftId });
+      if (r && r.discarded) { _skillsCache = null; await loadSkills(); }
+    } catch (_) { /* best effort — a leftover empty draft is non-fatal */ }
+  }
+  _showSkillsGridView();
+}
 
 function _showSkillsGridView() {
   const grid = document.getElementById('skills-grid-view');
@@ -515,7 +903,7 @@ function _showSkillsGridView() {
   _closeSkillRowMenu();
 }
 
-async function _showSkillsDetailView(source, id) {
+async function _showSkillsDetailView(source, id, opts = {}) {
   source = _skillSource(source);
   const grid = document.getElementById('skills-grid-view');
   const detail = document.getElementById('skills-detail-view');
@@ -533,10 +921,63 @@ async function _showSkillsDetailView(source, id) {
   if (body) body.style.minHeight = '';
   await selectSkillFile(source, id, 'SKILL.md', null);
   // Auto-expand the source view so the file tree is visible alongside the
-  // body content — establishes the visual link between "active row in tree"
-  // and "content shown below". scripts/ stays collapsed (user opens it
-  // manually to reveal individual scripts).
-  await _ensureSkillsSourceExpanded();
+  // body content. Creation/import flows skip this on the critical path so
+  // the edit chat opens immediately; they can refresh the tree in the
+  // background after edit mode is active.
+  if (opts.expandSource !== false) {
+    await _ensureSkillsSourceExpanded();
+  }
+}
+
+// Switch the detail pane to the "installed as an external package" state.
+// A URL import can resolve to a verbatim package (in the per-user packages
+// tree) rather than an editable skill; main already removed the placeholder
+// skill, so there is no skill content to render. Point the user to package
+// management instead.
+function _showSkillAsPackageState(name) {
+  _skillEditMode = false;
+  _skillEditSkillId = null;
+  _selectedSkill = null;
+  _skillsCache = null;
+  const grid = document.getElementById('skills-grid-view');
+  const detail = document.getElementById('skills-detail-view');
+  if (grid) grid.style.display = 'none';
+  if (detail) detail.style.display = 'flex';
+  const detailCol = document.getElementById('skills-detail-col');
+  if (detailCol) detailCol.style.display = 'none';
+  const chatCol = document.getElementById('skills-chat-col');
+  if (chatCol) chatCol.style.display = 'none';
+  const panel = document.getElementById('skills-as-package');
+  if (panel) panel.style.display = '';
+  const nameEl = document.getElementById('skills-as-package-name');
+  if (nameEl) nameEl.textContent = name || t('skills.as_package.title');
+  const descEl = document.getElementById('skills-as-package-desc');
+  if (descEl) descEl.textContent = t('skills.as_package.desc');
+  const manageBtn = document.getElementById('skills-as-package-manage');
+  if (manageBtn) manageBtn.onclick = () => {
+    _showSkillsGridView();
+    Promise.resolve(loadSkills(true)).finally(() => {
+      _scrollPackageCardIntoView(name);
+    });
+  };
+  const backBtn = document.getElementById('skills-as-package-back');
+  if (backBtn) backBtn.onclick = () => _onSkillsBack();
+  // Placeholder skill is gone and a package may now contribute skills —
+  // refresh the grid in the background so a later "Back" shows fresh state.
+  Promise.resolve().then(() => loadSkills()).catch(() => {});
+}
+
+function _scrollPackageCardIntoView(packageName) {
+  const wanted = String(packageName || '');
+  const cards = document.querySelectorAll('.skill-card[data-open-package-name]');
+  for (const card of cards) {
+    if (String(card.dataset.openPackageName || '') !== wanted) continue;
+    card.scrollIntoView({ block: 'center' });
+    card.classList.add('is-menu-open');
+    setTimeout(() => card.classList.remove('is-menu-open'), 1200);
+    return;
+  }
+  document.querySelector('.skills-source-section')?.scrollIntoView({ block: 'start' });
 }
 
 function _dropSkillTreeCache(source, id) {
@@ -585,7 +1026,7 @@ function _markActiveSkillFileInTree(filepath) {
   if (target) target.classList.add('active');
 }
 
-// ─── Per-card ⋯ popover menu (custom skills only) ─────────────────────
+// ─── Per-card ⋯ popover menu (custom / platform / open-tier) ──────────
 
 function _openSkillRowMenu(anchorBtn, id, source) {
   let menu = document.getElementById('skill-row-menu');
@@ -606,12 +1047,18 @@ function _openSkillRowMenu(anchorBtn, id, source) {
   // Edit/delete are gated: custom always allowed; built-in only in dev mode.
   // Enable/disable is always shown (lives in this menu now since cards no
   // longer carry a toggle).
-  const cached = _skillsCache?.find((s) => s.id === id && s.source === source);
+  // Open-tier (external package / global folder): package/filesystem managed —
+  // enable/disable only, no edit/delete/upload. Its rows live in a separate
+  // cache.
+  const isOpenTier = source === 'external' || source === 'global';
+  const cached = isOpenTier
+    ? (_openSkillsCache || []).find((s) => s.id === id)
+    : _skillsCache?.find((s) => s.id === id && s.source === source);
   const enabled = cached ? cached.enabled !== false : true;
-  const canEdit = source === 'custom' || (_isSkillPlatformSource(source) && false);
+  const canEdit = !isOpenTier && (source === 'custom' );
   // Dev-only entry on marketplace items: tag the label so the user knows this isn't a
   // normal user capability (mirrors marketplace.upload's "(dev)" treatment).
-  const editLabelSuffix = (_isSkillPlatformSource(source) && false) ? t('common.dev_suffix') : '';
+  const editLabelSuffix = '';
   const items = [];
   if (canEdit) {
     items.push(`<div class="skill-row-menu-item" data-action="edit">${escapeHtml(t('skills.edit') + editLabelSuffix)}</div>`);
@@ -621,7 +1068,7 @@ function _openSkillRowMenu(anchorBtn, id, source) {
   );
   // Upload-to-marketplace owned by marketplace_dev.js (absent in OrkasOpen). typeof check
   // naturally hides the entry on builds that don't ship the dev module.
-  if (typeof openMarketplaceUpload === 'function') {
+  if (!isOpenTier && typeof openMarketplaceUpload === 'function') {
     items.push(
       `<div class="skill-row-menu-item" data-action="upload-marketplace">${escapeHtml(t('marketplace.upload'))}</div>`,
     );
@@ -651,9 +1098,13 @@ function _openSkillRowMenu(anchorBtn, id, source) {
       } else if (action === 'upload-marketplace') {
         if (typeof openMarketplaceUpload === 'function') await openMarketplaceUpload('skill', id, source);
       } else if (action === 'toggle-enabled') {
-        const cur = _skillsCache?.find((s) => s.id === id && s.source === source);
-        const nextEnabled = !(cur ? cur.enabled !== false : true);
-        await _flipSkillEnabled(id, nextEnabled);
+        if (isOpenTier) {
+          await _flipOpenSkillEnabled(id);
+        } else {
+          const cur = _skillsCache?.find((s) => s.id === id && s.source === source);
+          const nextEnabled = !(cur ? cur.enabled !== false : true);
+          await _flipSkillEnabled(id, nextEnabled);
+        }
       }
     });
   }
@@ -664,6 +1115,8 @@ function _closeSkillRowMenu() {
   if (menu) {
     menu.style.display = 'none';
     delete menu.dataset.skillId;
+    delete menu.dataset.openSkillId;
+    delete menu.dataset.packageName;
     delete menu.dataset.source;
   }
   for (const c of document.querySelectorAll('.skill-card.is-menu-open')) c.classList.remove('is-menu-open');
@@ -845,6 +1298,11 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   // Defer to CSS — was 'flex' from the old 3-column layout, which now
   // overrides `display: block` and forces sections into horizontal flex.
   if (content) content.style.display = '';
+  // Leaving any external-package result state: restore the normal columns.
+  const asPkgPanel = document.getElementById('skills-as-package');
+  if (asPkgPanel) asPkgPanel.style.display = 'none';
+  const detailCol = document.getElementById('skills-detail-col');
+  if (detailCol) detailCol.style.display = '';
 
   const nameEl = document.getElementById('skills-detail-name');
   nameEl.textContent = skill?.name || id;
@@ -879,7 +1337,7 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   // Order: use (icon) / edit / enable-disable / delete.
   // In edit mode only the "done" button (the relabeled "edit") is
   // shown; everything else hides.
-  const canEditThisSkill = source === 'custom' || (_isSkillPlatformSource(source) && false);
+  const canEditThisSkill = source === 'custom' ;
   const editingThis = _skillEditMode && _skillEditSkillId === id && canEditThisSkill;
   const actions = document.getElementById('skills-detail-actions');
   if (actions) {
@@ -906,7 +1364,7 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   // the `description_*:` frontmatter in SKILL.md, not via a separate UI
   // block). In dev mode, marketplace skill names are display metadata only:
   // saving writes SKILL.md frontmatter without renaming the marketplace id dir.
-  const nameEditable = editingThis && (source === 'custom' || (_isSkillPlatformSource(source) && false));
+  const nameEditable = editingThis && (source === 'custom' );
   _toggleSkillNameEditable(nameEl, nameEditable);
   const summarySection = document.getElementById('skills-section-summary');
   if (summarySection) summarySection.style.display = editingThis ? 'none' : '';
@@ -1006,6 +1464,16 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
 // Mirrors the server-side parser in `core-agent/src/skills/frontmatter.ts`
 // but also collects indented block values (`key:` followed by `  - item`
 // or `  text`) so multi-line fields like `read_when:` render correctly.
+function _normalizeSkillFrontmatterDisplayValue(value) {
+  if (typeof normalizeDisplayText === 'function') return normalizeDisplayText(value);
+  return String(value || '')
+    .replace(/\\"/g, '"')
+    .replace(/\\'/g, "'")
+    .replace(/\\{2,}/g, '\\')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function _parseSkillFrontmatterPairs(content) {
   if (!content) return [];
   const first = content.indexOf('\n');
@@ -1034,6 +1502,7 @@ function _parseSkillFrontmatterPairs(content) {
         (value.startsWith("'") && value.endsWith("'") && value.length >= 2)) {
       value = value.slice(1, -1);
     }
+    value = _normalizeSkillFrontmatterDisplayValue(value);
     if (!value) {
       // Collect indented continuation (block list or folded scalar).
       const block = [];
@@ -1235,8 +1704,8 @@ function _isValidSkillNameCharset(name) {
   return SKILL_NAME_RE.test(name);
 }
 
-function _isEditablePlatformSkill(skill) {
-  return !!skill && _isSkillPlatformSource(skill.source) && false;
+function _isEditablePlatformSkill(_skill) {
+  return false;
 }
 
 function _canEditSelectedSkillName() {
@@ -1408,6 +1877,11 @@ async function _flushSkillFieldSave({ validate = false } = {}) {
 
 let _skillEditMode = false;
 let _skillEditSkillId = null;
+// Id of an unconfirmed URL-import placeholder skill. While set, leaving the
+// import chat discards the draft if it was never authored (e.g. the source was
+// installed as an external package, or the install failed). Cleared once the
+// import produces real content or finalizes as a package.
+let _importDraftId = null;
 
 function _updateEditButtonLabel() {
   const btn = document.getElementById('skill-edit-btn');
@@ -1418,22 +1892,37 @@ function _updateEditButtonLabel() {
   }
   // Tag the "Edit" label on marketplace skills (dev-only entry); the "Done"
   // branch above stays bare — in edit mode the marker is redundant.
-  const suffix = (_isSkillPlatformSource(_selectedSkill?.source) && false) ? t('common.dev_suffix') : '';
+  const suffix = '';
   btn.textContent = t('skills.edit_btn_edit') + suffix;
 }
 
-// When called with {autoSeed: true} (e.g. right after skill creation),
-// sends a short "help me refine this skill" message to kick off the
-// LLM. When autoSeed is a non-empty string, sends that exact string
-// instead — used by URL / Dir import flows to inject their own
-// "help me install this skill: <...>" seed. In plain edit mode (user
-// clicks "edit" on an existing skill) no message is sent
+function _skillImportAutoSeedFromResponse(data) {
+  if (data?.seedModelText === false || data?.seedMessage === false) return false;
+  const modelText = typeof data?.seedModelText === 'string' && data.seedModelText.trim()
+    ? data.seedModelText.trim()
+    : (typeof data?.seedMessage === 'string' ? data.seedMessage.trim() : '');
+  if (!modelText) return true;
+  const displayText = typeof data?.seedDisplayText === 'string' && data.seedDisplayText.trim()
+    ? data.seedDisplayText.trim()
+    : t('skills.import_seed_display');
+  return { displayText, modelText, force: true };
+}
+
+function _skillAutoSeedHasModelText(autoSeed) {
+  if (typeof autoSeed === 'string') return !!autoSeed.trim();
+  return !!(autoSeed && typeof autoSeed === 'object' && typeof autoSeed.modelText === 'string' && autoSeed.modelText.trim());
+}
+
+// When called with {autoSeed: true} (e.g. right after skill creation), sends
+// a short "help me refine this skill" message to kick off the LLM. Import
+// flows pass {displayText, modelText}: the chat bubble stays concise, while
+// model_text carries the full source-inspection instructions. In plain edit
+// mode (user clicks "edit" on an existing skill) no message is sent
 // automatically — the user drives the conversation from a blank input.
 async function toggleSkillEditMode(opts = {}) {
   if (!_selectedSkill) return;
   // Marketplace editing is dev-only; lift the source guard accordingly.
-  if (_selectedSkill.source !== 'custom'
-      && !(_isSkillPlatformSource(_selectedSkill.source) && false)) return;
+  if (_selectedSkill.source !== 'custom') return;
   if (_skillEditMode && _skillEditSkillId === _selectedSkill.id) {
     // Abort any in-flight reply so "done" means "stop + exit", not
     // "exit but keep streaming". The chat controller is a singleton;
@@ -1449,6 +1938,9 @@ async function toggleSkillEditMode(opts = {}) {
     // rename + refreshes caches before we re-render readonly view.
     const committed = await _flushSkillFieldSave({ validate: true });
     if (committed === false) return;
+    // Explicit "Done" is a commit: keep the skill (even an empty import draft
+    // the user chose to finalize) and stop the back-prompt from firing.
+    _importDraftId = null;
     _skillEditMode = false;
     _skillEditSkillId = null;
     document.getElementById('skills-chat-col').style.display = 'none';
@@ -1472,11 +1964,23 @@ async function toggleSkillEditMode(opts = {}) {
   await _chatAttachRefreshFromServer(_skillEditAttachmentCid(_skillEditSkillId));
   if (opts.autoSeed) {
     const existing = document.querySelectorAll('#skills-chat-messages .chat-message');
-    if (existing.length === 0) {
-      const seed = typeof opts.autoSeed === 'string'
-        ? opts.autoSeed
+    const forceAutoSeed = !!(opts.autoSeed && typeof opts.autoSeed === 'object' && opts.autoSeed.force === true);
+    if (forceAutoSeed || existing.length === 0) {
+      const baseSeed = t('skills.help_finish_seed_model');
+      const importSeed = typeof opts.autoSeed === 'string'
+        ? opts.autoSeed.trim()
+        : (opts.autoSeed && typeof opts.autoSeed === 'object' && typeof opts.autoSeed.modelText === 'string'
+            ? opts.autoSeed.modelText.trim()
+            : '');
+      const seed = importSeed
+        ? [baseSeed, importSeed].filter(Boolean).join('\n\n')
+        : baseSeed;
+      const displayText = importSeed
+        ? (opts.autoSeed && typeof opts.autoSeed === 'object' && typeof opts.autoSeed.displayText === 'string' && opts.autoSeed.displayText.trim()
+            ? opts.autoSeed.displayText.trim()
+            : t('skills.import_seed_display'))
         : t('skills.help_finish_seed');
-      await _skillChatCtrl.send(seed);
+      await _skillChatCtrl.send(displayText, { model_text: seed });
     }
   }
 }
@@ -1485,6 +1989,7 @@ async function toggleSkillEditMode(opts = {}) {
 // resolver so it follows the currently active skill.
 let _skillChatCtrl = null;
 let _skillEditAttachmentsBound = false;
+let _pendingSkillImportReplacementId = null;
 
 function _skillEditAttachmentCid(skillId) {
   return skillId ? `skill-edit-${skillId}` : '';
@@ -1500,7 +2005,7 @@ function _bindSkillEditAttachments() {
   if (btn) {
     btn.addEventListener('click', async () => {
       const cid = currentCid();
-      if (cid) await _chatAttachPickAndUpload(cid);
+      if (cid) await _chatAttachPickAndUpload(cid, 'picker');
     });
   }
   if (area) {
@@ -1519,13 +2024,13 @@ function _bindSkillEditAttachments() {
       if (internal.length) {
         e.preventDefault();
         area.classList.remove('drag-over');
-        await _chatAttachImportPaths(cid, internal);
+        await _chatAttachImportPaths(cid, internal, 'internal_drop');
         return;
       }
       if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
         e.preventDefault();
         area.classList.remove('drag-over');
-        await _chatAttachUpload(cid, e.dataTransfer.files);
+        await _chatAttachUpload(cid, e.dataTransfer.files, 'drop');
       }
     });
   }
@@ -1535,7 +2040,7 @@ function _bindSkillEditAttachments() {
       const cid = currentCid();
       if (!cid) return;
       e.preventDefault();
-      await _chatAttachUpload(cid, e.clipboardData.files);
+      await _chatAttachUpload(cid, e.clipboardData.files, 'paste');
     });
   }
 }
@@ -1579,20 +2084,56 @@ function _ensureSkillChatController() {
     hooks: {
       buildExtraBody: _buildSkillEditChatExtraBody,
       async onFinal(ev, msgEl, id) {
+        // Authoring wrote real files → this import produced a genuine custom
+        // skill; commit it so backing out no longer prompts/discards.
+        if (ev?.written?.length || ev?.created?.length) _importDraftId = null;
+        if (_pendingSkillImportReplacementId) {
+          const nextId = _pendingSkillImportReplacementId;
+          _pendingSkillImportReplacementId = null;
+          _importDraftId = null;
+          _skillEditSkillId = nextId;
+          _selectedSkill = { source: 'custom', id: nextId, filepath: 'SKILL.md' };
+          _skillsCache = null;
+          await _showSkillsDetailView('custom', nextId);
+          await _skillChatCtrl.loadHistory();
+          return;
+        }
         // Skill chat may rewrite files on disk; refresh the detail pane so
         // the tree and SKILL.md display reflect the new state.
         await _refreshSkillView();
       },
       onStreamEvent(ev, msgEl, id) {
+        const inner = ev?.event;
+        if (!inner) return;
+        // `skill_as_package`: the URL import was installed as an external
+        // package and main deleted the placeholder skill. Switch the detail
+        // pane to the package result state (no skill content to show).
+        if (inner.stream === 'skill_as_package') {
+          // Placeholder already deleted by main; clear the draft guard so the
+          // grid-view exit doesn't try to re-discard a gone id.
+          _importDraftId = null;
+          _showSkillAsPackageState(inner.data?.name || '');
+          return;
+        }
+        if (inner.stream === 'skill_import_replaced') {
+          const nextId = inner.data?.skillId || inner.data?.skills?.[0]?.skill_id || '';
+          if (nextId) {
+            _pendingSkillImportReplacementId = nextId;
+            _importDraftId = null;
+            _skillsCache = null;
+          }
+          return;
+        }
         // Auto-rename on `skill_renamed` event from main: the skill's
         // SKILL.md `name:` differs from its dir id, so main moved the dir
         // (and its chat dir + session id) to the new id. Switch the
         // active edit chat to the new id transparently.
-        const inner = ev?.event;
-        if (!inner || inner.stream !== 'skill_renamed') return;
+        if (inner.stream !== 'skill_renamed') return;
         const { oldId, newId } = inner.data || {};
         if (!oldId || !newId || oldId === newId) return;
         if (id !== oldId && _skillEditSkillId !== oldId) return;
+        // A rename means real content was authored — commit the import draft.
+        _importDraftId = null;
         // Update active selection / id-resolver target
         _skillEditSkillId = newId;
         if (_selectedSkill && _selectedSkill.id === oldId) {
@@ -1661,7 +2202,38 @@ async function _refreshSkillView() {
 
 // ─── Custom skill CRUD ───
 
+let _skillModalBusy = false;
+
+function _setSkillModalBusy(busy) {
+  _skillModalBusy = !!busy;
+  const modal = document.getElementById('skill-modal');
+  if (modal) modal.setAttribute('aria-busy', _skillModalBusy ? 'true' : 'false');
+  const ids = [
+    'skill-save-btn',
+    'skill-dir-pick-btn',
+    'skill-url-input',
+    'skill-name',
+    'skill-description',
+  ];
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = _skillModalBusy;
+  }
+  document.querySelectorAll('#skill-modal .modal-actions .btn, #skill-modal .skill-modal-tab')
+    .forEach((el) => { el.disabled = _skillModalBusy; });
+}
+
+function _waitForSkillModalBusyPaint() {
+  return new Promise((resolve) => {
+    const raf = typeof requestAnimationFrame === 'function'
+      ? requestAnimationFrame
+      : (cb) => setTimeout(cb, 0);
+    raf(() => resolve());
+  });
+}
+
 function _switchSkillTab(tab) {
+  if (_skillModalBusy) return;
   const tabs = document.querySelectorAll('.skill-modal-tab');
   tabs.forEach((el) => el.classList.toggle('is-active', el.dataset.skillTab === tab));
   const panels = document.querySelectorAll('.skill-modal-panel');
@@ -1687,6 +2259,7 @@ async function openSkillModal(editId) {
   const msgEl = document.getElementById('skill-form-msg');
   const saveBtn = document.getElementById('skill-save-btn');
   const tabBar = document.getElementById('skill-modal-tabs');
+  _setSkillModalBusy(false);
   msgEl.textContent = '';
   msgEl.className = 'form-msg';
 
@@ -1768,6 +2341,7 @@ async function pickSkillImportDir() {
 window.pickSkillImportDir = pickSkillImportDir;
 
 async function saveSkill() {
+  if (_skillModalBusy) return;
   const editId = document.getElementById('skill-edit-id').value;
   const msgEl = document.getElementById('skill-form-msg');
 
@@ -1843,6 +2417,10 @@ async function _saveSkillFromUrl({ msgEl }) {
     return;
   }
   try {
+    msgEl.textContent = t('skills.saving');
+    msgEl.className = 'form-msg';
+    _setSkillModalBusy(true);
+    await _waitForSkillModalBusyPaint();
     const res = await apiFetch('/api/skills/create-from-url', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1852,12 +2430,20 @@ async function _saveSkillFromUrl({ msgEl }) {
     if (!data.ok) {
       msgEl.textContent = data.error || t('skills.save_failed');
       msgEl.className = 'form-msg err';
+      _setSkillModalBusy(false);
       return;
     }
-    await _afterSkillCreated(data.skill?.id, true, data.seedMessage);
+    const createdId = data.skill?.id || data.skills?.[0]?.id;
+    const autoSeed = _skillImportAutoSeedFromResponse(data);
+    // URL imports start as empty placeholders. If the user backs out before
+    // the edit chat authors real content, offer to discard that placeholder.
+    _importDraftId = data.skill?.id && _skillAutoSeedHasModelText(autoSeed) ? data.skill.id : null;
+    await _afterSkillCreated(createdId, true, autoSeed);
   } catch (_) {
     msgEl.textContent = t('skills.network_error_plain');
     msgEl.className = 'form-msg err';
+  } finally {
+    _setSkillModalBusy(false);
   }
 }
 
@@ -1886,6 +2472,10 @@ function _qualityImportRejectedTitle(name) {
 
 async function _saveSkillFromDirWithQuality({ msgEl, srcDir, force }) {
   try {
+    msgEl.textContent = t('skills.saving');
+    msgEl.className = 'form-msg';
+    _setSkillModalBusy(true);
+    await _waitForSkillModalBusyPaint();
     const res = await apiFetch('/api/skills/create-from-dir', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1893,6 +2483,7 @@ async function _saveSkillFromDirWithQuality({ msgEl, srcDir, force }) {
     });
     const data = await res.json();
     if (!data.ok) {
+      _setSkillModalBusy(false);
       if (!force && data.report && typeof showValidationReport === 'function') {
         const titleName = data.skillId || srcDir.split(/[\\/]/).filter(Boolean).pop() || srcDir;
         const action = await showValidationReport({
@@ -1901,25 +2492,28 @@ async function _saveSkillFromDirWithQuality({ msgEl, srcDir, force }) {
           forceLabel: _qualityForceImportLabel(),
         });
         if (action === 'force') {
-          return _saveSkillFromDirWithQuality({ msgEl, srcDir, force: true });
+          return await _saveSkillFromDirWithQuality({ msgEl, srcDir, force: true });
         }
       }
       msgEl.textContent = data.error || t('skills.save_failed');
       msgEl.className = 'form-msg err';
       return;
     }
-    await _afterSkillCreated(data.skill?.id, true, data.seedMessage);
+    await _afterSkillCreated(data.skill?.id || data.skills?.[0]?.id, true, _skillImportAutoSeedFromResponse(data));
   } catch (_) {
     msgEl.textContent = t('skills.network_error_plain');
     msgEl.className = 'form-msg err';
+  } finally {
+    _setSkillModalBusy(false);
   }
 }
 
 // Shared "after create" tail: close modal, refresh list, jump to edit view.
-// `seedMessage` — custom first message to seed the skill edit chat with.
-//                 Pass null to let toggleSkillEditMode use its default seed
-//                 ("help me refine this skill"). Ignored in edit mode (isNew=false).
-async function _afterSkillCreated(sid, isNew, seedMessage) {
+// `autoSeed` — optional first message descriptor for the skill edit chat.
+//              Pass null to let toggleSkillEditMode use its default seed
+//              ("help me refine this skill"). Pass false to skip entering
+//              edit chat. Ignored in edit mode (isNew=false).
+async function _afterSkillCreated(sid, isNew, autoSeed) {
   closeSkillModal();
   _skillsCache = null;
   await loadSkills();
@@ -1927,10 +2521,21 @@ async function _afterSkillCreated(sid, isNew, seedMessage) {
   setView('skills');
   // Jump straight into detail view for the new skill (skipping the grid
   // landing) so the user can see what they just created and start editing.
-  _showSkillsDetailView('custom', sid);
+  // This must finish before entering edit chat: selectSkillFile() owns the
+  // detail/chat visibility state, so racing it against toggleSkillEditMode()
+  // can leave imports on the readonly detail page.
+  await _showSkillsDetailView('custom', sid, { expandSource: false });
   if (isNew) {
-    _selectedSkill = { source: 'custom', id: sid, filepath: 'SKILL.md' };
-    await toggleSkillEditMode({ autoSeed: seedMessage || true });
+    if (!_selectedSkill || _selectedSkill.source !== 'custom' || _selectedSkill.id !== sid) {
+      _selectedSkill = { source: 'custom', id: sid, filepath: 'SKILL.md' };
+    }
+    if (autoSeed === false) return;
+    await toggleSkillEditMode({ autoSeed: autoSeed || true });
+    Promise.resolve().then(() => {
+      if (_selectedSkill?.source === 'custom' && _selectedSkill?.id === sid) {
+        return _ensureSkillsSourceExpanded();
+      }
+    }).catch(() => {});
   }
 }
 
@@ -1948,7 +2553,7 @@ function editSelectedSkill() {
 async function deleteSelectedSkill() {
   if (!_selectedSkill) return;
   const src = _selectedSkill.source;
-  if (src !== 'custom' && !(_isSkillPlatformSource(src) && false)) return;
+  if (src !== 'custom') return;
   const sid = _selectedSkill.id;
   const cached = _skillsCache?.find(s => s.id === sid && s.source === src);
   if (!(await uiConfirm(t('skills.delete_confirm', { name: cached?.name || sid })))) return;

@@ -110,23 +110,20 @@ function runModelFetch() {
   }
 }
 
-// In macOS dev mode the Dock tooltip + Cmd-Tab name + menu bar header
-// all come from `Electron.app/Contents/Info.plist` (`CFBundleName` /
-// `CFBundleDisplayName`). `app.setName()` only changes the first menu
-// bar item -- it does NOT change the Dock.
+// macOS dev 模式下 Dock tooltip + Cmd-Tab + 菜单栏左上角的应用名，全部
+// 来自 `Electron.app/Contents/Info.plist` 的 CFBundleName / CFBundleDisplayName。
+// `app.setName()` 只改菜单栏第一项，**改不了 Dock**。
 //
-// Editing the plist alone is not enough: macOS Launch Services keeps a
-// persistent cache keyed by bundle id `com.github.Electron`, and even
-// `lsregister -f` often refuses to refresh. The only reliable approach
-// is to rename the .app directory itself (so macOS treats it as a new
-// app and re-registers), and update `electron/path.txt` alongside (the
-// npm electron launcher reads that to locate the binary). Rename +
-// plist edit + ad-hoc resign + lsregister + killall Dock are all
-// required for the change to stick.
+// 单独改 plist 不够：macOS Launch Services 对 bundle identifier
+// `com.github.Electron` 有持久缓存，即使 `lsregister -f` 也常常拒绝刷新。
+// 唯一可靠方案是把 .app 目录本身重命名（让 macOS 当成新 app 重新登记），
+// 同时同步更新 `electron/path.txt`（npm electron launcher 就是靠它定位
+// 二进制的）。重命名 + 改 plist + ad-hoc 重签 + lsregister + killall Dock
+// 一套打下来才算数。
 //
-// Idempotent: skip when node_modules/electron/dist/Orkas.app already
-// exists. `npm install` re-lands Electron.app (overwriting Orkas.app
-// is fine -- the next launch redoes the patch).
+// 幂等：node_modules/electron/dist/Orkas.app 已存在就跳过。npm install
+// 会重新落地 Electron.app（覆盖 Orkas.app 的话也无所谓，下次启动重新走
+// 这套流程）。
 function patchElectronAppName() {
   if (process.platform !== 'darwin') return;
   const distDir = path.join(NODE_MODULES, 'electron', 'dist');
@@ -135,26 +132,26 @@ function patchElectronAppName() {
   const pathTxt = path.join(NODE_MODULES, 'electron', 'path.txt');
   if (!fs.existsSync(distDir)) return;
 
-  // Already patched: bail out. Verify Orkas.app exists + path.txt is updated.
+  // 已经 patched 过：直接返回。检查 Orkas.app 存在 + path.txt 已更新。
   if (fs.existsSync(newApp) && !fs.existsSync(oldApp)) {
     let pathTxtContent = '';
     try { pathTxtContent = fs.readFileSync(pathTxt, 'utf8').trim(); } catch { /* */ }
     if (pathTxtContent.startsWith('Orkas.app/')) return;
   }
 
-  // Rename Electron.app -> Orkas.app. If both exist, drop the new one first so the rename does not collide.
+  // 重命名 Electron.app → Orkas.app（如果两者都在，先把旧的删掉避免混淆）。
   if (fs.existsSync(oldApp)) {
     if (fs.existsSync(newApp)) fs.rmSync(newApp, { recursive: true, force: true });
     try { fs.renameSync(oldApp, newApp); }
     catch (err) {
-      console.warn('[Orkas] rename Electron.app failed (' + err.message + '): a process may still be holding it; skipping this patch pass');
+      console.warn('[Orkas] 重命名 Electron.app 失败（' + err.message + '）：可能有进程仍在占用，跳过此次 patch');
       return;
     }
   } else if (!fs.existsSync(newApp)) {
-    return; // Neither old nor new -- Electron install is broken; leave it for npm install to handle.
+    return; // 既没有旧也没有新，电子组件可能损坏，留给上层 npm install 处理
   }
 
-  // Set the plist keys.
+  // 改 plist 三键。
   const plistPath = path.join(newApp, 'Contents', 'Info.plist');
   for (const [key, val] of [
     ['CFBundleName', 'Orkas'],
@@ -162,28 +159,28 @@ function patchElectronAppName() {
   ]) {
     const r = spawnSync('plutil', ['-replace', key, '-string', val, plistPath], { stdio: 'pipe' });
     if (r.status !== 0) {
-      console.warn('[Orkas] plutil -replace ' + key + ' failed:', (r.stderr || '').toString().trim());
+      console.warn('[Orkas] plutil -replace ' + key + ' 失败：', (r.stderr || '').toString().trim());
     }
   }
 
-  // Editing the plist invalidates the existing signature; ad-hoc resign.
+  // 改完 plist 后旧签名失效，必须 ad-hoc 重签。
   const cs = spawnSync('codesign', ['--force', '--deep', '--sign', '-', newApp], { stdio: 'pipe' });
   if (cs.status !== 0) {
-    console.warn('[Orkas] Orkas.app ad-hoc resign failed (manual fix: codesign --force --deep --sign - "' + newApp + '"):', (cs.stderr || '').toString().trim());
+    console.warn('[Orkas] Orkas.app ad-hoc 重签失败（手动修复：codesign --force --deep --sign - "' + newApp + '"）：', (cs.stderr || '').toString().trim());
   }
 
-  // The electron npm launcher uses path.txt to locate the binary; point it at the new name.
+  // electron npm launcher 通过 path.txt 定位二进制；指向新名字。
   try { fs.writeFileSync(pathTxt, 'Orkas.app/Contents/MacOS/Electron'); }
   catch (err) {
-    console.warn('[Orkas] update electron/path.txt failed (' + err.message + '): the electron CLI may fail to find the binary');
+    console.warn('[Orkas] 更新 electron/path.txt 失败（' + err.message + '）：electron CLI 可能找不到二进制');
   }
 
-  // Launch Services: unregister the old path + register the new one. Restart Dock to drop any running-instance cache.
+  // Launch Services：注销旧路径 + 注册新路径。重启 Dock 丢掉运行实例缓存。
   const lsregister = '/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister';
   spawnSync(lsregister, ['-u', oldApp], { stdio: 'pipe' });
   spawnSync(lsregister, ['-f', newApp], { stdio: 'pipe' });
   spawnSync('killall', ['Dock'], { stdio: 'pipe' });
-  console.log('[Orkas] Dock name set to Orkas (renamed Electron.app -> Orkas.app; effective next launch)');
+  console.log('[Orkas] Dock 名称已改为 Orkas（重命名 Electron.app → Orkas.app；下次启动生效）');
 }
 
 function main() {
@@ -228,8 +225,8 @@ function main() {
   } catch (err) {
     console.warn('[Orkas] 警告：写入依赖 stamp 失败（不影响启动）：', err.message);
   }
-  // npm install re-lands an Electron with the upstream "Electron"
-  // Info.plist; re-patch immediately or the Dock reverts.
+  // npm install 重新落地的 Electron 会带回 "Electron" 字样的 Info.plist —
+  // 必须紧接着再 patch 一遍，否则 Dock 又会显示 Electron。
   patchElectronAppName();
 }
 

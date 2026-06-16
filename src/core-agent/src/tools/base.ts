@@ -4,8 +4,19 @@ import type { ToolDefinition } from "../providers/base.js";
 export type ToolContext = {
   workingDir?: string;
   signal?: AbortSignal;
+  /** Emit user-visible progress while a long-running tool is still executing. */
+  emitProgress?: (progress: ToolProgress) => void;
   /** Arbitrary context data tools can read/write. */
   state: Record<string, unknown>;
+};
+
+export type ToolProgress = {
+  /** Short phase id, e.g. "upload", "poll", "download". */
+  phase?: string;
+  /** Human-readable status text for the process rail. */
+  message: string;
+  /** Optional structured metadata for renderers / logs. */
+  data?: Record<string, unknown>;
 };
 
 /** Image content that can ride along with a tool result. */

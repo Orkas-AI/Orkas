@@ -27,6 +27,7 @@ import {
   storeDcrServerManaged,
 } from './oauth-dcr';
 import { createLogger } from '../../logger';
+import { deriveCustomId, validateCustomTransport, validateDisplayName, type CustomConnectorInput } from './custom-transport';
 import type { CatalogEntry, ConnectorInstance, OAuthGrant, ToolSchema, Transport } from './types';
 
 const log = createLogger('connectors:manager');
@@ -388,7 +389,17 @@ async function _refreshGrantIfStale(
   return p;
 }
 
-async function _resolveTransport(uid: string, inst: ConnectorInstance): Promise<{ transport: Transport; grant: OAuthGrant } | null> {
+async function _resolveTransport(uid: string, inst: ConnectorInstance): Promise<{ transport: Transport; grant: OAuthGrant | null } | null> {
+  // Custom instances use their stored transport verbatim — no catalog
+  // template, no OAuth grant, no refresh cycle. The transport (incl. any
+  // API-key headers/env) lives inside secrets_enc like every other one.
+  if (inst.origin === 'custom') {
+    if (!inst.transport) {
+      log.warn('custom instance has no transport', { id: inst.id });
+      return null;
+    }
+    return { transport: inst.transport, grant: null };
+  }
   const entry = findCatalogEntry(inst.id);
   if (!entry) {
     log.warn('catalog entry missing for instance', { id: inst.id });
@@ -746,6 +757,46 @@ async function _provisionMemberInstance(
   if (_isGitHubEntry(entry)) {
     await registry.setReauthorizeHint(uid, entry.id, true);
   }
+  return _connectAndCacheTools(uid, draft);
+}
+
+/**
+ * Add a user-supplied MCP server (plan §C — the single validated install
+ * route for custom connectors; both the settings form and any future
+ * commander-driven flow call this through `connectors.add_custom`).
+ *
+ * The renderer form is the consent surface: the user typed (and sees) the
+ * exact command/url that will be used, so no second confirmation dialog is
+ * required here. Probes the server immediately — a failed probe keeps the
+ * instance in `error` status (visible in the UI, fixable by remove+re-add)
+ * instead of silently discarding the user's input.
+ */
+export async function addCustomInstance(uid: string, input: CustomConnectorInput): Promise<ConnectorInstance> {
+  if (!uid) throw new Error('uid required');
+  const displayName = validateDisplayName(input?.display_name);
+  const transport = validateCustomTransport(input?.transport);
+
+  // Unique id derived from the name; suffix on collision with an existing
+  // row. The `custom-` prefix guarantees catalog ids can never be shadowed.
+  const base = deriveCustomId(displayName);
+  const existing = registry.load(uid).connections;
+  let id = base;
+  for (let n = 2; existing[id]; n++) id = `${base}-${n}`;
+
+  const draft: ConnectorInstance = {
+    id,
+    display_name: displayName,
+    origin: 'custom',
+    transport,
+    enabled_subtools: null,
+    tools_cache: [],
+    tools_cached_at: 0,
+    status: { kind: 'connecting' },
+    created_at: _nowIso(),
+    updated_at: _nowIso(),
+  };
+  log.info('custom connector add', { id, kind: transport.kind });
+  await registry.upsert(uid, draft);
   return _connectAndCacheTools(uid, draft);
 }
 

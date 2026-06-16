@@ -28,7 +28,8 @@ import {
 import { evictSession } from '../model/core-agent/session-store';
 import { getActiveUserId } from './users';
 import { createLogger } from '../logger';
-import { t, buildLanguageDirective } from '../i18n';
+import { t, buildLanguageDirective, descriptionLang } from '../i18n';
+import { getLanguage } from './config';
 import { getWorkspacePath } from './user_workspace';
 import { buildAttachmentManifest } from './chat_attachments';
 
@@ -768,11 +769,7 @@ let _agentListCache: AgentListCache | null = null;
 
 function _invalidateAgentListCache(opts: { markDirty?: boolean } = {}): void {
   _agentListCache = null;
-  if (opts.markDirty === false) return;
-  // Notify the sync engine (lazy-require — stripped in OrkasOpen builds). Every cache-invalidate
-  // is also a disk-mutation point, so co-locating the dirty signal here covers all the
-  // existing call sites without sprinkling sync calls across the file. The relPath here is
-  // informational only — the engine ignores it and walks `cloud/` itself.
+  void opts;
 }
 
 /** Public re-export of `_invalidateAgentListCache` for cross-module callers (sync engine).
@@ -898,9 +895,9 @@ function customAgentFile(agentId: string): string {
 
 export interface CreateAgentOptions {
   name?: string;
-  /** Legacy single-language seed; routed into description_zh OR description_en
-   *  by Chinese-character heuristic. Use `description_zh` / `description_en`
-   *  directly when both languages are known. */
+  /** Single-language seed; routed into the current UI language slot. Use
+   *  `description_zh` / `description_en` directly only when both languages
+   *  are explicitly known. */
   description?: string;
   description_zh?: string;
   description_en?: string;
@@ -920,9 +917,8 @@ export interface CreateAgentOptions {
   output_format?: OutputFormat;
 }
 
-/** Route a legacy `description` input into the matching language slot.
- *  Explicit `description_zh` / `description_en` always win; legacy fills
- *  the empty side based on whether it contains CJK ideographs. Returns the
+/** Route a single `description` input into the current UI language slot.
+ *  Explicit `description_zh` / `description_en` always win. Returns the
  *  pair of resolved values (already trimmed; `''` when nothing to set). */
 function resolveBilingualDescription(
   legacy: string | undefined,
@@ -932,10 +928,10 @@ function resolveBilingualDescription(
   const l = (legacy || '').trim();
   const z = (zh || '').trim();
   const e = (en || '').trim();
-  const hasChinese = /[一-鿿]/.test(l);
+  const lang = descriptionLang(getLanguage());
   return {
-    description_zh: z || (l && hasChinese ? l : ''),
-    description_en: e || (l && !hasChinese ? l : ''),
+    description_zh: z || (l && lang === 'zh' ? l : ''),
+    description_en: e || (l && lang !== 'zh' ? l : ''),
   };
 }
 
@@ -1190,9 +1186,10 @@ async function _applyAgentUpdates(
     }
   }
   // First migrate any persisted legacy `description` into the bilingual pair
-  // (lossless). Then apply incoming updates: explicit `description_zh` /
-  // `description_en` write through; legacy `description` routes via Chinese-
-  // character heuristic into whichever side wasn't already set this turn.
+  // (lossless, content-based for historical data). Then apply incoming
+  // updates: explicit `description_zh` / `description_en` write through;
+  // single `description` routes to the current UI language slot unless that
+  // slot was explicitly set this turn.
   // Strip legacy `description` from the JSON at the end so it can't shadow
   // explicit values on the next read.
   {
@@ -1222,9 +1219,9 @@ async function _applyAgentUpdates(
     if (typeof v === 'string') {
       const legacy = v.trim();
       if (legacy) {
-        const isChinese = /[一-鿿]/.test(legacy);
-        if (isChinese && !hasZh) data.description_zh = legacy;
-        if (!isChinese && !hasEn) data.description_en = legacy;
+        const lang = descriptionLang(getLanguage());
+        if (lang === 'zh' && !hasZh) data.description_zh = legacy;
+        if (lang !== 'zh' && !hasEn) data.description_en = legacy;
       }
     }
   }
@@ -1339,10 +1336,8 @@ async function _applyAgentUpdates(
   data.updated_at = nowIso();
 }
 
-/** Edit-chat dispatcher: routes to custom write for custom agents, and to
- *  the dev-only built-in dual-write (src + data) for built-in agents in
- *  dev mode. Returns null if the id resolves to neither, or if a built-in
- *  write is attempted outside dev mode. */
+/** Edit-chat dispatcher: routes to custom write for custom agents. Platform
+ *  and marketplace agents are read-only in OrkasOpen. */
 export async function updateAgentSpec(
   agentId: string, updates: UpdateAgentFields,
 ): Promise<Agent | null> {
@@ -1350,7 +1345,6 @@ export async function updateAgentSpec(
   if (fs.existsSync(customAgentFile(agentId))) {
     return updateCustomAgent(agentId, updates);
   }
-  if (fs.existsSync(_platformAgentSpecFile(agentId))) return null;
   return null;
 }
 
@@ -1630,10 +1624,8 @@ async function _appendAgentChatMessage(userId: string, agentId: string, record: 
 
 export async function clearAgentChat(userId: string, agentId: string): Promise<boolean> {
   const agent = await getAgent(agentId);
-  // Custom agents always allow clearing; built-in chat dirs only exist when
-  // dev mode has been editing them — allow clearing those too.
   if (!agent) return false;
-  if (agent.source !== 'custom' && !false) return false;
+  if (agent.source !== 'custom') return false;
   for (const p of [agentChatMsgsPath(userId, agentId), agentChatMetaPath(userId, agentId)]) {
     if (fs.existsSync(p)) {
       try { await fsp.unlink(p); }
@@ -1709,7 +1701,7 @@ export function buildAgentEditSystemPrompt(agent: {
         workflow: (agent.workflow || '').trim() || '(not provided)',
         interactive: agent.interactive === true ? 'true' : 'false',
       });
-  const tail = buildLanguageDirective();
+  const tail = buildLanguageDirective(getLanguage());
   return `${body}\n\n---\n\n${tail}\n\n---\n\n${buildRuntimeDatetimeBlock()}`;
 }
 
@@ -1753,11 +1745,11 @@ export async function sendToAgentEditChat(
   userId: string,
   agentId: string,
   content: string,
-  opts: { attachments?: string[] } = {},
+  opts: { attachments?: string[]; modelText?: string } = {},
 ): Promise<AgentEditResult> {
   const agent = await getAgent(agentId);
   if (!agent) return { ok: false, error: 'agent not found' };
-  if (agent.source !== 'custom' && !false) {
+  if (agent.source !== 'custom') {
     return { ok: false, error: t('errors.builtin_agent_not_editable') };
   }
 
@@ -1765,11 +1757,14 @@ export async function sendToAgentEditChat(
   const sessionId = meta.session_id || defaultAgentEditSessionId(agentId);
 
   const systemPrompt = buildAgentEditSystemPrompt(agent);
-  const attachmentCtx = await buildAgentEditMessageWithAttachments(userId, agentId, content, opts.attachments);
+  const modelText = typeof opts.modelText === 'string' ? opts.modelText.trim() : '';
+  const modelContent = modelText || content;
+  const attachmentCtx = await buildAgentEditMessageWithAttachments(userId, agentId, modelContent, opts.attachments);
 
   await _appendAgentChatMessage(userId, agentId,
     {
       time: nowIso(), role: 'user', content,
+      ...(modelText ? { model_text: modelText } : {}),
       ...(attachmentCtx.attachmentNames.length ? { attachments: attachmentCtx.attachmentNames, attachment_cid: attachmentCtx.attachmentCid } : {}),
     });
 
@@ -1819,7 +1814,7 @@ const MAX_AGENT_PROCESS_ITEMS = 300;
 
 export async function* streamSendToAgentEditChat(
   userId: string, agentId: string, content: string,
-  opts: { abortSignal?: AbortSignal; attachments?: string[] } = {},
+  opts: { abortSignal?: AbortSignal; attachments?: string[]; modelText?: string } = {},
 ): AsyncGenerator<any, void, unknown> {
   const agent = await getAgent(agentId);
   if (!agent) {
@@ -1827,7 +1822,7 @@ export async function* streamSendToAgentEditChat(
     yield { type: 'done' };
     return;
   }
-  if (agent.source !== 'custom' && !false) {
+  if (agent.source !== 'custom') {
     yield { type: 'error', text: t('errors.builtin_agent_not_editable') };
     yield { type: 'done' };
     return;
@@ -1837,11 +1832,14 @@ export async function* streamSendToAgentEditChat(
   const sessionId = meta.session_id || defaultAgentEditSessionId(agentId);
 
   const systemPrompt = buildAgentEditSystemPrompt(agent);
-  const attachmentCtx = await buildAgentEditMessageWithAttachments(userId, agentId, content, opts.attachments);
+  const modelText = typeof opts.modelText === 'string' ? opts.modelText.trim() : '';
+  const modelContent = modelText || content;
+  const attachmentCtx = await buildAgentEditMessageWithAttachments(userId, agentId, modelContent, opts.attachments);
 
   await _appendAgentChatMessage(userId, agentId,
     {
       time: nowIso(), role: 'user', content,
+      ...(modelText ? { model_text: modelText } : {}),
       ...(attachmentCtx.attachmentNames.length ? { attachments: attachmentCtx.attachmentNames, attachment_cid: attachmentCtx.attachmentCid } : {}),
     });
 

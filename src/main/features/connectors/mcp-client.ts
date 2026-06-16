@@ -17,6 +17,7 @@
  * `require` entries; `await import(...)` keeps the loader path identical regardless of which
  * resolver is active and avoids surprise top-level await issues during tsx transpile.
  */
+import * as path from 'node:path';
 import type { Transport, ToolSchema } from './types';
 import { createLogger } from '../../logger';
 
@@ -61,7 +62,14 @@ export class McpConnection {
     let transport: import('@modelcontextprotocol/sdk/shared/transport.js').Transport;
     if (this.transport.kind === 'stdio') {
       const envFull: Record<string, string> = { ...this.transport.env };
-      log.info('spawning stdio MCP server', { id: this.id, command: this.transport.command, args: this.transport.args });
+      // Custom connectors can legitimately carry secrets in argv (e.g.
+      // `--api-key sk-…`); log only the command basename + arg count so a key
+      // never lands in the persistent app log.
+      log.info('spawning stdio MCP server', {
+        id: this.id,
+        command: path.basename(this.transport.command),
+        argCount: this.transport.args.length,
+      });
       transport = new sdk.StdioClientTransport({
         command: this.transport.command,
         args: this.transport.args,
@@ -70,7 +78,9 @@ export class McpConnection {
       });
     } else {
       const url = new URL(this.transport.url);
-      log.info('connecting streamable-http MCP server', { id: this.id, url: this.transport.url });
+      // A custom URL may carry credentials in the query string (`?key=…`); log
+      // only origin + pathname, never the query.
+      log.info('connecting streamable-http MCP server', { id: this.id, url: url.origin + url.pathname });
       const opts: { requestInit?: { headers?: Record<string, string> } } = {};
       if (this.transport.headers && Object.keys(this.transport.headers).length) {
         opts.requestInit = { headers: this.transport.headers };

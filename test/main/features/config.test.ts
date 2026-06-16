@@ -145,27 +145,48 @@ describe('features/config › setLanguage', () => {
 
 describe('features/config › getLanguage', () => {
   it('returns en when unset', async () => {
-    const { appConfig } = await load();
+    const { appConfig, i18n } = await load();
+    i18n.setCurrentLang('zh');
     expect(appConfig.getLanguage()).toBe('en');
+    expect(i18n.getCurrentLang()).toBe('en');
+    expect(process.env.ORKAS_ACCEPT_LANGUAGE).toMatch(/^en-US/);
   });
 
   it('detects system language when no user preference exists', async () => {
     const electron = await import('electron');
     (electron.app.getLocale as unknown as { mockReturnValue: (v: string) => void }).mockReturnValue('zh-CN');
-    const { appConfig } = await load();
+    const { appConfig, i18n } = await load();
 
     expect(appConfig.getLanguage()).toBe('zh');
+    expect(i18n.getCurrentLang()).toBe('zh');
+    expect(process.env.ORKAS_ACCEPT_LANGUAGE).toMatch(/^zh-CN/);
   });
 
   it('returns persisted value', async () => {
-    const { appConfig } = await load();
+    const { appConfig, i18n } = await load();
     appConfig.writeConfig({ language: 'zh' });
     expect(appConfig.getLanguage()).toBe('zh');
+    expect(i18n.getCurrentLang()).toBe('zh');
   });
 
   it('returns en when persisted value is not a valid Lang', async () => {
-    const { appConfig } = await load();
+    const { appConfig, i18n } = await load();
+    i18n.setCurrentLang('zh');
     appConfig.writeConfig({ language: 'xx' as unknown as 'en' });
     expect(appConfig.getLanguage()).toBe('en');
+    expect(i18n.getCurrentLang()).toBe('en');
+  });
+
+  it('can resolve and sync language for an explicit user id', async () => {
+    const { appConfig, i18n } = await load();
+    const paths = await import('../../../src/main/paths');
+    const prefPath = paths.userPreferencesFile('u2');
+    fs.mkdirSync(path.dirname(prefPath), { recursive: true });
+    fs.writeFileSync(prefPath, JSON.stringify({ language: 'ja' }));
+    i18n.setCurrentLang('en');
+
+    expect(appConfig.getLanguageForUser('u2')).toBe('ja');
+    expect(i18n.getCurrentLang()).toBe('ja');
+    expect(process.env.ORKAS_ACCEPT_LANGUAGE).toMatch(/^ja-JP/);
   });
 });

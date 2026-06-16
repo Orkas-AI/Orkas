@@ -22,4 +22,11 @@ describe('markdown math rendering', () => {
   it('keeps normal single-subscript TeX unchanged', () => {
     expect(sanitizeMathExpressionForMathJax('x_i + a_{n+1}')).toBe('x_i + a_{n+1}');
   });
+
+  it('normalizes boldsymbol so the offline MathJax bundle does not lazy-load extensions', () => {
+    const html = renderMarkdown('抛物线解析式： $\\boldsymbol{y=2x^2-8x+6}$');
+
+    expect(html).toContain('$\\mathbf{y=2x^2-8x+6}$');
+    expect(html).not.toContain('\\boldsymbol');
+  });
 });

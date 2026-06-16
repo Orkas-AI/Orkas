@@ -35,11 +35,9 @@
   }
 
   function _track(action, data) {
-    
   }
 
   function _trackError(action, data) {
-    
   }
 
   function _esc(s) {
@@ -215,7 +213,7 @@
       if (!r || r.ok === false || !r.url) throw new Error((r && r.error) || 'open failed');
       const app = (_appsCache || []).find((a) => a && a.id === appId);
       _openAppViewer(r.url, (app && app.title) || _t('artifact.title', 'Interactive app'));
-    } catch (err) { _trackError('saved_app_open', { app_id: String(appId || ''), msg: String(err && err.message || err) }); _fail(_t('apps.open_failed', 'Could not open the app'), err); }
+    } catch (err) { _trackError('saved_app_open', { app_id: String(appId || ''), error_message: String(err && err.message || err) }); _fail(_t('apps.open_failed', 'Could not open the app'), err); }
   }
 
   // "Edit" — backend creates a fresh conversation with the app's source bundled
@@ -301,6 +299,27 @@
 
   // Short relative formatter for the meta row's "updated" slot.
   // Buckets: <60s → just now; same day → HH:mm; <7d → Nd; else YYYY-MM-DD.
+  function _currentLang() {
+    try {
+      if (typeof getLang === 'function') return getLang();
+    } catch (_) {}
+    try {
+      return document.documentElement.getAttribute('lang') || navigator.language || 'en';
+    } catch (_) {
+      return 'en';
+    }
+  }
+
+  function _relativeTime(value, unit) {
+    try {
+      return new Intl.RelativeTimeFormat(_currentLang(), { numeric: 'auto' }).format(value, unit);
+    } catch (_) {
+      if (unit === 'day') return `${Math.abs(value)} days ago`;
+      if (unit === 'hour') return `${Math.abs(value)} hours ago`;
+      return `${Math.abs(value)} minutes ago`;
+    }
+  }
+
   function _formatRelative(iso) {
     if (!iso) return '';
     const d = new Date(iso);
@@ -308,17 +327,10 @@
     const now = new Date();
     const diffMs = now.getTime() - d.getTime();
     if (diffMs < 60_000) return _t('common.just_now', 'just now');
-    const sameDay = d.toDateString() === now.toDateString();
-    if (sameDay) {
-      const hh = String(d.getHours()).padStart(2, '0');
-      const mm = String(d.getMinutes()).padStart(2, '0');
-      return `${hh}:${mm}`;
-    }
-    const yesterday = new Date(now);
-    yesterday.setDate(yesterday.getDate() - 1);
-    if (d.toDateString() === yesterday.toDateString()) return _t('sidebar.bucket.yesterday', 'Yesterday');
+    if (diffMs < 60 * 60_000) return _relativeTime(-Math.floor(diffMs / 60_000), 'minute');
+    if (diffMs < 24 * 60 * 60_000) return _relativeTime(-Math.floor(diffMs / 3_600_000), 'hour');
     const days = Math.floor(diffMs / 86_400_000);
-    if (days < 7) return `${days}d`;
+    if (days < 7) return _relativeTime(-Math.max(1, days), 'day');
     const yyyy = d.getFullYear();
     const mo = String(d.getMonth() + 1).padStart(2, '0');
     const da = String(d.getDate()).padStart(2, '0');

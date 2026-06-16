@@ -36,6 +36,7 @@ export interface ValidationReport {
  *  embedded code-block extraction first, etc.). */
 export type ScanKind =
   | 'skill_md'      // SKILL.md (frontmatter + embedded code blocks)
+  | 'skill_meta'    // Orkas _meta.json sidecar
   | 'script'        // executable file under scripts/ (.py / .sh / .ts / ...)
   | 'agent_json'    // agent.json spec
   | 'other';        // README / assets — skipped
@@ -52,4 +53,4 @@ export interface RuleDef {
 
 /** Bumped on every rule list change so persisted reports record the schema
  *  they were produced under. Loosely follows the validator module version. */
-export const VALIDATOR_VERSION = '0.1.0';
+export const VALIDATOR_VERSION = '0.2.0';

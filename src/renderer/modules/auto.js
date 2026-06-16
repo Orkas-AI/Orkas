@@ -25,13 +25,34 @@ const _autoLog = (typeof createLogger === 'function')
   ? createLogger('auto')
   : { info() {}, warn() {}, error() {} };
 
+function _autoTrackClick(action, data) {
+}
+
+function _autoTrackEvent(action, data) {
+}
+
+function _autoTrackError(action, data) {
+}
+
+function _autoAttachmentPayload(files, source) {
+  const list = Array.from(files || []);
+  let totalBytes = 0;
+  for (const file of list) totalBytes += Number((file && (file.size || file.bytes)) || 0);
+  return {
+    source,
+    file_count: list.length,
+    total_bytes: totalBytes,
+    mode: _autoEditingTaskId ? 'edit' : 'create',
+  };
+}
+
 let _autoTasks = [];           // last fetched global list
 let _autoLoadedOnce = false;
 let _autoEventsHandle = null;
 let _autoFormMounted = false;  // _aiSelectMount only once
 let _autoEditingTaskId = null; // null = create mode, taskId = edit mode
 // Current device fingerprint — fetched lazily on first row render. Used to
-// decide which device chip to show ("本机" vs. the task's stored hostname).
+// decide which device chip to show ("this device" vs. the task's stored hostname).
 let _autoCurrentDevice = null; // { id, name } | null
 async function _ensureAutoCurrentDevice() {
   if (_autoCurrentDevice) return _autoCurrentDevice;
@@ -40,6 +61,30 @@ async function _ensureAutoCurrentDevice() {
     _autoCurrentDevice = (res && res.device) ? res.device : { id: '', name: '' };
   } catch (_) { _autoCurrentDevice = { id: '', name: '' }; }
   return _autoCurrentDevice;
+}
+let _autoCloudSyncEnabled = false;
+function _autoSyncApiAvailable() {
+  return false;
+}
+async function _refreshAutoSyncNotice() {
+  _autoCloudSyncEnabled = false;
+  _paintAutoSyncNotice();
+  return false;
+}
+function _paintAutoSyncNotice() {
+  const listText = t('auto.sync_note_list');
+  const createText = t('auto.sync_note_create');
+  const targets = [
+    { id: 'auto-sync-note', text: listText },
+    { id: 'project-auto-sync-note', text: listText },
+    { id: 'auto-task-dialog-sync-note', text: createText },
+  ];
+  for (const item of targets) {
+    const el = document.getElementById(item.id);
+    if (!el) continue;
+    el.hidden = !_autoCloudSyncEnabled;
+    el.textContent = _autoCloudSyncEnabled ? item.text : '';
+  }
 }
 let _autoCurrentRecipient = { kind: 'commander' };
 // Skill / connector pinned to this draft. Mirrors the commander composer's
@@ -432,10 +477,11 @@ function _openAutoRowMenu(anchorBtn, task, opts) {
 // ─── Global auto tab — list rendering + form wiring ────────────────
 
 async function loadAutoList(force) {
-  if (_autoLoadedOnce && !force) return;
   const listEl = document.getElementById('auto-list');
   const emptyEl = document.getElementById('auto-empty');
   if (!listEl) return;
+  await _refreshAutoSyncNotice();
+  if (_autoLoadedOnce && !force) return;
   // Fetch device fingerprint in parallel with the task list so the device
   // chip can paint on the first render.
   await _ensureAutoCurrentDevice();
@@ -476,6 +522,7 @@ async function loadProjectAutoList(projectId) {
   const countEl = document.getElementById('project-auto-tab-count');
   if (!listEl) return;
   await _ensureAutoCurrentDevice();
+  await _refreshAutoSyncNotice();
   if (!projectId) {
     listEl.innerHTML = '';
     if (emptyEl) emptyEl.style.display = '';
@@ -689,7 +736,10 @@ function _mountAutoForm() {
     _autoProjectSel = _aiSelectMount(projectMount, {
       options: _autoProjectOptions(),
       value: '',
-      onChange: () => { _autoClearRecipientIfOutsideProject().catch(() => {}); },
+      onChange: () => {
+        _autoTrackClick('auto_project_select', { has_project: !!(_autoProjectSel && _autoProjectSel.getValue()) });
+        _autoClearRecipientIfOutsideProject().catch(() => {});
+      },
     });
   }
 
@@ -729,6 +779,7 @@ function _mountAutoForm() {
   _autoFormMounted = true;
   _repaintAutoRecipientChip();
   _autoRepaintLabels();
+  _paintAutoSyncNotice();
   _renderAutoAttachmentChips();
 }
 
@@ -747,12 +798,16 @@ async function _ensureAutoDraftId() {
   return _autoCurrentTaskId;
 }
 
-async function _autoUploadFiles(files) {
+async function _autoUploadFiles(files, source = 'drop') {
   const taskId = await _ensureAutoDraftId();
   if (!taskId) {
     await uiAlert(t('auto.save_failed', { reason: 'no_draft_id' }));
     return;
   }
+  const payload = _autoAttachmentPayload(files, source);
+  _autoTrackClick('auto_attachment_upload', payload);
+  let uploadedCount = 0;
+  let failedCount = 0;
   for (const file of files) {
     try {
       const buf = await file.arrayBuffer();
@@ -767,12 +822,22 @@ async function _autoUploadFiles(files) {
         // side too since uploadAttachment writes the file).
         _autoCurrentAttachments = _autoCurrentAttachments.filter((a) => a.name !== res.name);
         _autoCurrentAttachments.push({ name: res.name });
+        uploadedCount += 1;
+      } else {
+        failedCount += 1;
       }
     } catch (err) {
+      failedCount += 1;
       _autoLog.warn('upload failed', err);
       await uiAlert(t('auto.save_failed', { reason: (err && err.message) || err }));
     }
   }
+  _autoTrackEvent('auto_attachment_upload_result', {
+    ...payload,
+    result: failedCount ? (uploadedCount ? 'partial_failure' : 'failure') : 'success',
+    uploaded_count: uploadedCount,
+    failed_count: failedCount,
+  });
   _renderAutoAttachmentChips();
 }
 
@@ -782,11 +847,19 @@ async function _autoPickAndUploadFiles() {
     await uiAlert(t('auto.save_failed', { reason: 'no_draft_id' }));
     return;
   }
+  const payload = { source: 'picker', mode: _autoEditingTaskId ? 'edit' : 'create' };
+  _autoTrackClick('auto_attachment_upload', payload);
   let data;
   try {
     data = await window.orkas.invoke('autoTasks.attachments.pickAndUpload', { taskId });
   } catch (err) {
     _autoLog.warn('native picker upload failed', err);
+    _autoTrackEvent('auto_attachment_upload_result', {
+      ...payload,
+      result: 'failure',
+      uploaded_count: 0,
+      failed_count: 1,
+    });
     await uiAlert(t('auto.save_failed', { reason: (err && err.message) || err }));
     return;
   }
@@ -796,6 +869,13 @@ async function _autoPickAndUploadFiles() {
     _autoCurrentAttachments.push({ name });
   }
   const failed = Array.isArray(data && data.failed) ? data.failed : [];
+  _autoTrackEvent('auto_attachment_upload_result', {
+    ...payload,
+    result: failed.length ? (names.length ? 'partial_failure' : 'failure') : 'success',
+    uploaded_count: names.length,
+    failed_count: failed.length,
+    file_count: names.length + failed.length,
+  });
   if (failed.length) {
     await uiAlert(t('auto.save_failed', {
       reason: failed.map((x) => `${x.name || ''}: ${x.error || 'unknown'}`).join('\n'),
@@ -930,6 +1010,7 @@ function _autoRepaintLabels() {
   }
   const cancelBtn = document.getElementById('auto-dialog-cancel-btn');
   if (cancelBtn) cancelBtn.textContent = t('auto.cancel_btn');
+  _paintAutoSyncNotice();
 }
 
 function _autoResetForm() {
@@ -973,6 +1054,7 @@ function _autoResetForm() {
  *                    Project-detail uses this to refresh its list. */
 function openAutoTaskDialog(opts = {}) {
   if (!_autoFormMounted) _mountAutoForm();
+  _refreshAutoSyncNotice().catch(() => {});
   const task = opts.task || null;
   _autoLockedProjectId = (opts.projectId && typeof opts.projectId === 'string') ? opts.projectId : '';
   _autoOnSaved = (typeof opts.onSaved === 'function') ? opts.onSaved : null;
@@ -1000,6 +1082,7 @@ function openAutoTaskDialog(opts = {}) {
 function _showAutoDialog() {
   const overlay = document.getElementById('auto-task-dialog-overlay');
   if (!overlay) return;
+  _paintAutoSyncNotice();
   overlay.style.display = 'flex';
   overlay.classList.add('open');
   const ta = document.getElementById('auto-task-input');
@@ -1119,6 +1202,17 @@ async function _autoSubmitForm() {
   }
 
   const projectId = _autoSelectedProjectId();
+  const isUpdate = !!_autoEditingTaskId;
+  const startedAt = performance.now();
+  _autoTrackClick(isUpdate ? 'auto_task_update_submit' : 'auto_task_create_submit', {
+    schedule_type: type,
+    recipient_type: _autoCurrentRecipient.kind || 'commander',
+    has_skill: !!_autoCurrentSkill,
+    has_connector: !!_autoCurrentConnector,
+    has_project: !!projectId,
+    attachment_count: _autoCurrentAttachments.length,
+    content_length: content.length,
+  });
 
   submitBtn.disabled = true;
   try {
@@ -1161,10 +1255,30 @@ async function _autoSubmitForm() {
       res = await window.orkas.invoke('autoTasks.create', payload);
     }
     if (!res || !res.task) {
+      _autoTrackEvent(isUpdate ? 'auto_task_update_result' : 'auto_task_create_result', {
+        result: 'failure',
+        schedule_type: type,
+        duration_ms: Math.round(performance.now() - startedAt),
+      });
+      _autoTrackError(isUpdate ? 'auto_task_update' : 'auto_task_create', {
+        error_type: 'api',
+      });
       await uiAlert(t('auto.save_failed', { reason: (res && res.error) || '' }));
       return;
     }
     const savedTask = res.task;
+    _autoTrackEvent(isUpdate ? 'auto_task_update_result' : 'auto_task_create_result', {
+      result: 'success',
+      task_id: savedTask.id || '',
+      schedule_type: type,
+      recipient_type: recipientField.kind || 'commander',
+      has_skill: !!skillField,
+      has_connector: !!connectorField,
+      has_project: !!projectId,
+      attachment_count: attachmentNames.length,
+      content_length: content.length,
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
     const savedCb = _autoOnSaved;
     _hideAutoDialog();
     _autoResetForm();
@@ -1179,6 +1293,14 @@ async function _autoSubmitForm() {
       try { savedCb(savedTask); } catch (_) { /* ignore */ }
     }
   } catch (err) {
+    _autoTrackEvent(isUpdate ? 'auto_task_update_result' : 'auto_task_create_result', {
+      result: 'failure',
+      schedule_type: type,
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
+    _autoTrackError(isUpdate ? 'auto_task_update' : 'auto_task_create', {
+      error_type: 'ipc',
+    });
     await uiAlert(t('auto.save_failed', { reason: (err && err.message) || err }));
   } finally {
     submitBtn.disabled = false;
@@ -1213,6 +1335,11 @@ function startAutoEventsSubscription() {
     _autoEventsHandle = window.orkas.stream('autoTasks.events', {}, (ev) => {
       const inner = ev && ev.event;
       if (!inner || inner.type !== 'conv_created') return;
+      _autoTrackEvent('auto_task_fire_result', {
+        result: 'success',
+        task_id: inner.taskId || inner.task_id || '',
+        conversation_id: inner.cid || inner.conversation_id || '',
+      });
       if (typeof loadConversations === 'function') {
         loadConversations().catch((err) => _autoLog.warn('reload after fire failed', err));
       }

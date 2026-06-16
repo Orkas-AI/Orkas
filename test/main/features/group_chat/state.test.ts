@@ -173,3 +173,42 @@ describe('group_chat state › markInFlight does NOT touch status', () => {
     expect(st.in_flight).toEqual([]);
   });
 });
+
+describe('group_chat state › touchActivity (stuck-turn watchdog heartbeat)', () => {
+  // `touchActivity` is what keeps `processing_since` (= last_active_at) fresh
+  // during a long single turn so the renderer's 12-min stuck-turn watchdog
+  // doesn't false-positive. Invariants: bumps while running, throttles bursts
+  // to one write per window, and never resurrects an idle conversation.
+  it('bumps while running, throttles within the window, ignores idle convs', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 5, 12, 16, 0, 0, 0));
+    try {
+      const s = await import('../../../../src/main/features/group_chat/state');
+      await s.setStatus(TEST_UID, TEST_CID, 'running');
+      const t0 = (await s.readState(TEST_UID, TEST_CID)).last_active_at;
+
+      // Past the 30s throttle window → first touch writes a fresh stamp.
+      vi.advanceTimersByTime(40_000);
+      await s.touchActivity(TEST_UID, TEST_CID);
+      const t1 = (await s.readState(TEST_UID, TEST_CID)).last_active_at;
+      expect(t1).not.toBe(t0);
+
+      // Immediate second touch is inside the window → no new write.
+      vi.advanceTimersByTime(5_000);
+      await s.touchActivity(TEST_UID, TEST_CID);
+      const t2 = (await s.readState(TEST_UID, TEST_CID)).last_active_at;
+      expect(t2).toBe(t1);
+
+      // Conversation goes idle; a later touch must NOT re-stamp it (would
+      // otherwise keep a crashed/finished turn looking "fresh" forever).
+      await s.setStatus(TEST_UID, TEST_CID, 'idle');
+      const tIdle = (await s.readState(TEST_UID, TEST_CID)).last_active_at;
+      vi.advanceTimersByTime(40_000);
+      await s.touchActivity(TEST_UID, TEST_CID);
+      const tAfter = (await s.readState(TEST_UID, TEST_CID)).last_active_at;
+      expect(tAfter).toBe(tIdle);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

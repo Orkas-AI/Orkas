@@ -99,6 +99,9 @@ const TRANSIENT_MESSAGE_PATTERNS: Array<[RetryableErrorKind, RegExp]> = [
   ["server_error", /\b500\b|internal server error/i],
 ];
 
+const NON_RETRYABLE_BALANCE_RE =
+  /orkas_(llm|points)_quota_exceeded|insufficient[_\s-]?(balance|quota|credits|funds)|payment[_\s-]?required|balance[_\s-]?not[_\s-]?enough|余额不足|账户余额|积分不足|out of credits|credit[_\s-]?exhausted/i;
+
 function retryKindForProviderStatus(statusCode: number | undefined): RetryableErrorKind | null {
   if (!statusCode || !RETRYABLE_PROVIDER_STATUS.has(statusCode)) return null;
   if (statusCode === 429) return "rate_limit";
@@ -141,6 +144,20 @@ function errorCauseOf(err: unknown): unknown {
   return null;
 }
 
+function hasNonRetryableBalanceSignal(err: unknown): boolean {
+  let cur: unknown = err;
+  let depth = 0;
+  while (cur && depth < 8) {
+    const msg = errorMessageOf(cur);
+    if (msg && NON_RETRYABLE_BALANCE_RE.test(msg)) return true;
+    const code = errorCodeOf(cur);
+    if (code && NON_RETRYABLE_BALANCE_RE.test(code)) return true;
+    cur = errorCauseOf(cur);
+    depth++;
+  }
+  return false;
+}
+
 export function classifyTransientNetworkError(err: unknown): RetryableErrorKind | null {
   let cur: unknown = err;
   let depth = 0;
@@ -163,6 +180,7 @@ export function classifyTransientNetworkError(err: unknown): RetryableErrorKind 
 }
 
 export function classifyRetryableError(err: unknown): RetryableErrorKind | null {
+  if (hasNonRetryableBalanceSignal(err)) return null;
   if (err instanceof RateLimitError) return "rate_limit";
   if (err instanceof TimeoutError) return "timeout";
   if (err instanceof ProviderError) {

@@ -13,6 +13,8 @@ function escapeHtml(s: unknown) {
 }
 
 function loadConversationRenderer() {
+  const pendingConvs = new Map<string, any>();
+  const groupBusyConvs = new Map<string, boolean>();
   const context: any = {
     console,
     setTimeout,
@@ -33,6 +35,10 @@ function loadConversationRenderer() {
     RegExp,
     currentCid: '',
     conversations: [],
+    pendingConvs,
+    groupBusyConvs,
+    isGroupConversationBusy: (cid: string) => groupBusyConvs.has(cid),
+    isConvPending: (cid: string) => pendingConvs.has(cid) || groupBusyConvs.has(cid),
     createLogger: () => ({ warn() {}, info() {}, error() {}, debug() {} }),
     escapeHtml,
     t: (key: string, params: any = {}) => ({
@@ -75,6 +81,38 @@ function loadConversationRenderer() {
   vm.runInContext(source, context);
   return context;
 }
+
+describe('conversation create-agent inline gate', () => {
+  it('hides while the current task is pending even without a scroll spacer', () => {
+    const context = loadConversationRenderer();
+    context.currentCid = 'c1';
+    context.pendingConvs.set('c1', { loadingEl: null, aborted: false });
+
+    const busy = context._isConvCreateAgentInlineRuntimeBusy('c1');
+
+    expect(busy).toBe(true);
+    expect(context._shouldShowConvCreateAgentInline(true, busy, false)).toBe(false);
+  });
+
+  it('also hides for group-runtime work that has no request controller', () => {
+    const context = loadConversationRenderer();
+    context.currentCid = 'c1';
+    context.groupBusyConvs.set('c1', true);
+
+    const busy = context._isConvCreateAgentInlineRuntimeBusy('c1');
+
+    expect(busy).toBe(true);
+    expect(context._shouldShowConvCreateAgentInline(true, busy, false)).toBe(false);
+  });
+
+  it('shows only for an idle user-only conversation', () => {
+    const context = loadConversationRenderer();
+
+    expect(context._shouldShowConvCreateAgentInline(true, false, false)).toBe(true);
+    expect(context._shouldShowConvCreateAgentInline(true, false, true)).toBe(false);
+    expect(context._shouldShowConvCreateAgentInline(false, false, false)).toBe(false);
+  });
+});
 
 describe('conversation sidebar task row actions', () => {
   it('renders a single menu button after the title', () => {
@@ -341,123 +379,14 @@ describe('conversation sticky scroll', () => {
     expect(el.scrollTop).toBe(500);
   });
 
-  it('keeps task chat auto-stick disabled by default', () => {
+  it('uses generic sticky scrolling for chat history', () => {
     const context = loadConversationRenderer();
     const el = fakeScrollEl();
     el.id = 'chat-history';
 
     context._stickBottomIfPinned(el);
-
-    expect(el.scrollTop).toBe(500);
-  });
-
-  it('softly follows task chat output when the devtools switch is enabled', async () => {
-    const context = loadConversationRenderer();
-    const el = fakeScrollEl();
-    el.id = 'chat-history';
-    let scrollOptions: any = null;
-    el.scrollTo = (opts: any) => {
-      scrollOptions = opts;
-      el.scrollTop = opts.top;
-    };
-    context.localStorage.getItem = (key: string) => (
-      key === 'orkas.dev.taskChatAutoStick' ? '1' : null
-    );
-
-    context._stickBottomIfPinned(el);
-    expect(el.scrollTop).toBe(500);
-
-    await new Promise((resolve) => setTimeout(resolve, 20));
 
     expect(el.scrollTop).toBe(1200);
-    expect(scrollOptions).toEqual({ top: 1200, behavior: 'smooth' });
-  });
-
-  it('arms task chat auto-stick when the devtools switch is turned on', async () => {
-    const context = loadConversationRenderer();
-    const el = fakeScrollEl();
-    el.id = 'chat-history';
-    el._stickyEnabled = false;
-    el._stickyUserPaused = true;
-    el.scrollTop = 200;
-    el.scrollTo = (opts: any) => {
-      el.scrollTop = opts.top;
-    };
-    context.document.getElementById = (id: string) => (id === 'chat-history' ? el : null);
-    context.localStorage.getItem = (key: string) => (
-      key === 'orkas.dev.taskChatAutoStick' ? '1' : null
-    );
-
-    context._setTaskChatAutoStickEnabled(true);
-
-    await new Promise((resolve) => setTimeout(resolve, 20));
-
-    expect(el._stickyEnabled).toBe(true);
-    expect(el._stickyUserPaused).toBe(false);
-    expect(el.scrollTop).toBe(1200);
-  });
-
-  it('sticks task chat to the last bubble instead of bottom whitespace', async () => {
-    const context = loadConversationRenderer();
-    const bubble = {
-      getBoundingClientRect: () => ({ bottom: 520 }),
-    } as any;
-    const el = fakeScrollEl();
-    el.id = 'chat-history';
-    el.scrollTop = 100;
-    el.scrollHeight = 1600;
-    el.clientHeight = 400;
-    el.getBoundingClientRect = () => ({ top: 0 });
-    el.querySelectorAll = (selector: string) => (
-      selector === ':scope > .chat-message' ? [bubble] : []
-    );
-    let scrollOptions: any = null;
-    el.scrollTo = (opts: any) => {
-      scrollOptions = opts;
-      el.scrollTop = opts.top;
-    };
-    context.localStorage.getItem = (key: string) => (
-      key === 'orkas.dev.taskChatAutoStick' ? '1' : null
-    );
-
-    context._stickBottomIfPinned(el);
-
-    await new Promise((resolve) => setTimeout(resolve, 20));
-
-    expect(scrollOptions).toEqual({ top: 244, behavior: 'smooth' });
-    expect(el.scrollTop).toBe(244);
-  });
-
-  it('sticks task chat while the scroll-pin spacer is active', async () => {
-    const context = loadConversationRenderer();
-    const bubble = {
-      getBoundingClientRect: () => ({ bottom: 560 }),
-    } as any;
-    const el = fakeScrollEl();
-    el.id = 'chat-history';
-    el._scrollPinActive = true;
-    el.scrollTop = 100;
-    el.scrollHeight = 1800;
-    el.clientHeight = 400;
-    el.getBoundingClientRect = () => ({ top: 0 });
-    el.querySelectorAll = (selector: string) => (
-      selector === ':scope > .chat-message' ? [bubble] : []
-    );
-    let scrollOptions: any = null;
-    el.scrollTo = (opts: any) => {
-      scrollOptions = opts;
-      el.scrollTop = opts.top;
-    };
-    context.localStorage.getItem = (key: string) => (
-      key === 'orkas.dev.taskChatAutoStick' ? '1' : null
-    );
-
-    context._stickBottomIfPinned(el);
-
-    await new Promise((resolve) => setTimeout(resolve, 20));
-
-    expect(scrollOptions).toEqual({ top: 284, behavior: 'smooth' });
-    expect(el.scrollTop).toBe(284);
   });
 
   it('preserves scroll position during background history reconcile', () => {
@@ -695,7 +624,7 @@ describe('conversation process read_file resource labels', () => {
         phase: 'start',
         name: 'read_file',
         arguments: {
-          path: '/Users/user/.orkas/data/u1/local/marketplace/agents/4430ca181349/agent.json',
+          path: '/Users/test/.orkas/data/u1/local/marketplace/agents/4430ca181349/agent.json',
         },
       },
     });

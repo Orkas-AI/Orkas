@@ -15,6 +15,15 @@
 
 const _projectsLog = createLogger('projects');
 
+function _projectsTrackClick(action, data) {
+}
+
+function _projectsTrackEvent(action, data) {
+}
+
+function _projectsTrackError(action, data) {
+}
+
 function _projectUiIconHtml(name, className) {
   if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
     return window.uiIconHtml(name, className);
@@ -223,6 +232,7 @@ function _bindProjectsHandlers(container) {
         return;
       }
       if (!_isProjectSelected(pid)) {
+        _projectsTrackClick('project_open', { project_id: pid });
         if (typeof setView === 'function') setView('project', pid);
         renderProjectsSection();
         return;
@@ -251,6 +261,10 @@ function _bindProjectsHandlers(container) {
 
 function _toggleProjectExpand(pid) {
   _projectsExpanded[pid] = !_projectsExpanded[pid];
+  _projectsTrackClick('project_expand_toggle', {
+    project_id: pid,
+    expanded: !!_projectsExpanded[pid],
+  });
   _saveProjectsExpanded();
   renderProjectsSection();
 }
@@ -259,6 +273,7 @@ function _toggleProjectExpand(pid) {
 
 function _startProjectInlineCreate() {
   if (_projectsInlineCreate) return;
+  _projectsTrackClick('project_create_open', {});
   _projectsInlineRenamePid = null;
   _projectsInlineCreate = true;
   renderProjectsSection();
@@ -286,9 +301,15 @@ function _bindInlineCreateInput(input) {
       _cancelProjectInlineCreate();
       return;
     }
+    const startedAt = performance.now();
+    _projectsTrackClick('project_create_submit', { name_length: name.length });
     try {
       const res = await window.orkas.invoke('projects.create', { name });
       if (!res || !res.ok) {
+        _projectsTrackEvent('project_create_result', {
+          result: 'failure',
+          duration_ms: Math.round(performance.now() - startedAt),
+        });
         // Re-enter editing mode + show inline error.
         committed = false;
         _showProjectInlineError(input, res && res.error);
@@ -297,6 +318,11 @@ function _bindInlineCreateInput(input) {
       // Auto-expand the freshly created project so users see it's empty &
       // ready for new convs.
       const pid = res.project && res.project.project_id;
+      _projectsTrackEvent('project_create_result', {
+        result: 'success',
+        project_id: pid || '',
+        duration_ms: Math.round(performance.now() - startedAt),
+      });
       if (pid) {
         _projectsExpanded[pid] = true;
         _saveProjectsExpanded();
@@ -304,6 +330,13 @@ function _bindInlineCreateInput(input) {
       _projectsInlineCreate = false;
       await loadProjects(true);
     } catch (err) {
+      _projectsTrackEvent('project_create_result', {
+        result: 'failure',
+        duration_ms: Math.round(performance.now() - startedAt),
+      });
+      _projectsTrackError('project_create', {
+        error_type: 'exception',
+      });
       committed = false;
       _showProjectInlineError(input, err && err.message);
     }
@@ -354,16 +387,40 @@ function _bindInlineRenameInput(input) {
       _cancelProjectInlineRename();
       return;
     }
+    const startedAt = performance.now();
+    _projectsTrackClick('project_rename_submit', {
+      project_id: pid,
+      name_length: next.length,
+    });
     try {
       const res = await window.orkas.invoke('projects.rename', { projectId: pid, name: next });
       if (!res || !res.ok) {
+        _projectsTrackEvent('project_rename_result', {
+          project_id: pid,
+          result: 'failure',
+          duration_ms: Math.round(performance.now() - startedAt),
+        });
         committed = false;
         _showProjectInlineError(input, res && res.error);
         return;
       }
+      _projectsTrackEvent('project_rename_result', {
+        project_id: pid,
+        result: 'success',
+        duration_ms: Math.round(performance.now() - startedAt),
+      });
       _projectsInlineRenamePid = null;
       await loadProjects(true);
     } catch (err) {
+      _projectsTrackEvent('project_rename_result', {
+        project_id: pid,
+        result: 'failure',
+        duration_ms: Math.round(performance.now() - startedAt),
+      });
+      _projectsTrackError('project_rename', {
+        project_id: pid,
+        error_type: 'exception',
+      });
       committed = false;
       _showProjectInlineError(input, err && err.message);
     }
@@ -519,9 +576,20 @@ async function _confirmDeleteProject(pid) {
   });
   if (!ok) return;
 
+  const startedAt = performance.now();
+  _projectsTrackClick('project_delete', {
+    project_id: pid,
+    conversation_count: count,
+    auto_count: autoCount,
+  });
   try {
     const res = await window.orkas.invoke('projects.delete', { projectId: pid });
     if (!res || !res.ok) {
+      _projectsTrackEvent('project_delete_result', {
+        project_id: pid,
+        result: 'failure',
+        duration_ms: Math.round(performance.now() - startedAt),
+      });
       const code = res && res.error;
       if (code === 'has_running_conv') {
         await uiAlert(t('project.has_running_conv'));
@@ -532,6 +600,11 @@ async function _confirmDeleteProject(pid) {
       }
       return;
     }
+    _projectsTrackEvent('project_delete_result', {
+      project_id: pid,
+      result: 'success',
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
     // Drop expanded entry.
     if (_projectsExpanded[pid]) {
       delete _projectsExpanded[pid];
@@ -547,6 +620,15 @@ async function _confirmDeleteProject(pid) {
     await loadConversations();
     await loadProjects(true);
   } catch (err) {
+    _projectsTrackEvent('project_delete_result', {
+      project_id: pid,
+      result: 'failure',
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
+    _projectsTrackError('project_delete', {
+      project_id: pid,
+      error_type: 'exception',
+    });
     _projectsLog.error('delete project failed', err);
     await uiAlert(t('project.delete_failed_generic'));
   }

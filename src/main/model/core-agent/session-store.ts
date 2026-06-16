@@ -4,20 +4,6 @@
  * `data/<user_id>/{cloud,local}/sessions/<session_id>.jsonl`.
  *
  * session_id format (see CLAUDE.md §5):
- *   `<uid>-<kind>-<tail>`
- *   uid MUST be the first segment; ids that don't fit are rejected
- *   outright, to prevent regressions like the early extract/organizer
- *   bug where the first segment was stuffed with a feature name.
- *   Currently-used kinds: gconv (group-chat commander) / gmember
- *     (group-chat agent) / skill / agent / extract-img / reflect /
- *     memory-extract / anon.
- *   Builders: features/group_chat/state.ts's buildGconvSessionId /
- *     buildGmemberSessionId; features/agents.ts's
- *     defaultAgentEditSessionId; features/skills.ts's skill chat is
- *     analogous.
- *   Legacy brand prefixes are stripped once at startup by the
- *   migration tool in features/users.ts and should not appear here;
- *   any id carrying such a prefix is treated as illegal.
  *   `<kind>-<tail>` — kind ∈ {gconv | gmember | skill | agent | extract-img |
  *   reflect | memory-extract | anon | cli}. The kind keyword is the FIRST
  *   segment, never an arbitrary prefix.

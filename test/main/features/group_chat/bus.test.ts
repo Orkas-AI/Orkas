@@ -6,6 +6,9 @@ import * as path from 'node:path';
 const streamGate = vi.hoisted(() => ({
   releaseActiveTurn: null as null | (() => void),
 }));
+const streamProbe = vi.hoisted(() => ({
+  messages: [] as string[],
+}));
 
 // Mock the model client so `runTurn` doesn't try to do a real LLM call.
 // `streamChatWithModel` returns an async iterator that yields one final
@@ -15,8 +18,36 @@ const streamGate = vi.hoisted(() => ({
 // state, not actual model output.
 vi.mock('../../../../src/main/model/client', () => ({
   async *streamChatWithModel(_opts: any) {
+    streamProbe.messages.push(String(_opts?.message || ''));
     if (String(_opts?.message || '').includes('ARTIFACT_EVENT_TEST')) {
       _opts?.onArtifactCreated?.({ id: 'art-live-1', title: 'Live App' });
+    }
+    const xmlMarker = 'SYNC_CONFLICT_XML_RESULT:';
+    const xmlIdx = String(_opts?.message || '').indexOf(xmlMarker);
+    if (xmlIdx >= 0) {
+      const encoded = String(_opts.message).slice(xmlIdx + xmlMarker.length).split(/\s/, 1)[0];
+      const esc = (value: string) => String(value || '')
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+      const data = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+      yield {
+        type: 'final',
+        text: `<sync-conflict-result conflict_id="${esc(data.conflictId)}" rel_path="${esc(data.relPath)}" target_path="${esc(data.targetPath)}" status="${esc(data.status || 'resolved')}" action="${esc(data.action || 'use_current')}" />`,
+      };
+      yield { type: 'done' };
+      return;
+    }
+    const producedMarker = 'PRODUCED_FILTER_TEST:';
+    const producedIdx = String(_opts?.message || '').indexOf(producedMarker);
+    if (producedIdx >= 0) {
+      const encoded = String(_opts.message).slice(producedIdx + producedMarker.length).split(/\s/, 1)[0];
+      const data = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+      for (const p of data.paths || []) _opts?.onFileWritten?.(p);
+      yield { type: 'final', text: 'produced filter ok' };
+      yield { type: 'done' };
+      return;
     }
     if (String(_opts?.message || '').includes('ACTIVE_TURN_TEST')) {
       yield { type: 'progress', text: 'active turn started' };
@@ -51,6 +82,7 @@ beforeEach(async () => {
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
   cliRunMock.calls.length = 0;
+  streamProbe.messages.length = 0;
   streamGate.releaseActiveTurn = null;
   const users = await import('../../../../src/main/features/users');
   users.activateUser(TEST_UID);
@@ -69,7 +101,14 @@ beforeEach(async () => {
   }));
 });
 
-afterEach(() => {
+afterEach(async () => {
+  try {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    await bus.abort(TEST_UID, TEST_CID);
+    bus.dropConv(TEST_UID, TEST_CID);
+  } catch {
+    // Some skipped/failed setup paths may not have loaded the bus module yet.
+  }
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -98,6 +137,29 @@ describe('group_chat bus › enqueue routing + persistence', () => {
 
     // listener saw message event for the user msg
     expect(events.find((e) => e.type === 'message' && e.msg.id === msg.id)).toBeTruthy();
+  });
+
+  it('persists short visible text while sending model_text to the worker', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const visibility = await import('../../../../src/main/features/group_chat/visibility');
+    const cid = 'cid-model-text';
+
+    const msg = await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: '请帮我处理冲突。',
+      model_text: 'Please resolve the conflict using the hidden protocol.',
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    expect(msg.text).toBe('请帮我处理冲突。');
+    expect(msg.model_text).toBe('Please resolve the conflict using the hidden protocol.');
+    expect(streamProbe.messages.some((m) => m.includes('Please resolve the conflict using the hidden protocol.'))).toBe(true);
+    expect(streamProbe.messages.some((m) => m.includes('请帮我处理冲突。'))).toBe(false);
+
+    const slice = await visibility.readSlice(TEST_UID, cid, 'commander');
+    expect(visibility.buildReplayPrefix(slice, 'missing').prefix).toContain('Please resolve the conflict using the hidden protocol.');
   });
 
   it('user → @<name> resolves to agent_id and auto-adds the agent to the roster', async () => {
@@ -139,7 +201,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
 
       expect(processEv.turn_id).toEqual(expect.any(String));
       const running = bus.runtimeSnapshot(TEST_UID, TEST_CID);
-      expect(running.activeTurns).toContainEqual({ actor: 'commander', turn_id: processEv.turn_id });
+      expect(running.activeTurns).toEqual([{ actor: 'commander', turn_id: processEv.turn_id }]);
       expect(running.inFlight).toContain('commander');
 
       streamGate.releaseActiveTurn?.();
@@ -202,6 +264,73 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(events[finalIdx].msg.artifacts).toEqual([
       { id: 'art-live-1', title: 'Live App', agent_id: 'commander' },
     ]);
+  });
+
+  it('filters stale produced paths before persisting the final message', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const cid = 'cid-produced-filter';
+    const stalePath = path.join(tmpDir, 'workspace', 'projects', 'business_planning.md');
+    const finalPath = path.join(tmpDir, 'workspace', 'projects', 'deck', 'sources', 'business_planning.md');
+    fs.mkdirSync(path.dirname(finalPath), { recursive: true });
+    fs.writeFileSync(finalPath, 'final source');
+
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `PRODUCED_FILTER_TEST:${Buffer.from(JSON.stringify({
+        paths: [stalePath, finalPath],
+      })).toString('base64')}`,
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const commanderMsg = rows.find((row: any) => row.from === 'commander' && row.text === 'produced filter ok');
+    expect(commanderMsg?.produced).toEqual([finalPath]);
+    expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(stalePath)).toBe(false);
+    expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(finalPath)).toBe(true);
+  });
+
+  it('auto-closes sync conflicts from a structured XML result', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const conflicts = await import('../../../../src/main/features/sync/conflicts');
+    const cid = 'cid-sync-conflict-xml';
+    const relPath = 'cloud/memory/CONFLICT.md';
+    const currentPath = path.join(paths.userCloudRoot(TEST_UID), 'memory', 'CONFLICT.md');
+    fs.mkdirSync(path.dirname(currentPath), { recursive: true });
+    fs.writeFileSync(currentPath, 'initial current');
+    const entry = await conflicts.archiveConflict(TEST_UID, relPath, 'local', 'cloud', {
+      kind: 'binary',
+      currentSide: 'local',
+      nowMs: Date.UTC(2026, 5, 10, 1, 0, 0),
+    });
+    await state.setToolExtraRoots(TEST_UID, cid, [path.dirname(currentPath)]);
+    await state.setSyncConflictResolution(TEST_UID, cid, [{
+      id: entry.id,
+      rel_path: relPath,
+      current_path: currentPath,
+    }]);
+
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: `SYNC_CONFLICT_XML_RESULT:${Buffer.from(JSON.stringify({
+        conflictId: entry.id,
+        relPath,
+        targetPath: currentPath,
+        status: 'resolved',
+        action: 'use_current',
+      })).toString('base64')}`,
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    expect(fs.readFileSync(currentPath, 'utf8')).toBe('initial current');
+    expect(await conflicts.listConflicts(TEST_UID)).toEqual([]);
   });
 
   // `isQuiescent` reflects the in-memory queue/running state — exercised

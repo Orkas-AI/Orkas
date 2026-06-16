@@ -48,6 +48,10 @@ vi.mock('../../../../src/main/features/connectors/catalog', () => ({
   },
 }));
 
+vi.mock('../../../../src/main/features/connectors/availability', () => ({
+  isConnectorRuntimeEnabled: () => true,
+}));
+
 vi.mock('../../../../src/main/i18n', () => ({
   getCurrentLang: () => 'en',
   descriptionLang: (lang: 'zh' | 'en' | 'ja') => (lang === 'zh' ? 'zh' : 'en'),
@@ -165,6 +169,21 @@ describe('connectorExposureFromSessionId', () => {
     const { connectorExposureFromSessionId } = await import('../../../../src/main/model/core-agent/runner');
     expect(connectorExposureFromSessionId('D69594E0-CF31-424C-9318-30231197E3A9-gconv-cv1')).toBe('none');
     expect(connectorExposureFromSessionId('99999999-agent-agt-1')).toBe('none');
+  });
+});
+
+describe('systemSkillsExposureFromSessionId', () => {
+  it('exposes system skills to authoring sessions only', async () => {
+    const { systemSkillsExposureFromSessionId } = await import('../../../../src/main/model/core-agent/runner');
+    expect(systemSkillsExposureFromSessionId('gconv-ac5559863d42')).toBe(true);
+    expect(systemSkillsExposureFromSessionId('agent-agt-7')).toBe(true);
+    expect(systemSkillsExposureFromSessionId('skill-sk1')).toBe(true);
+    expect(systemSkillsExposureFromSessionId('gmember-cv1-agt-42')).toBe(false);
+    expect(systemSkillsExposureFromSessionId('extract-img-deadbeef')).toBe(false);
+    expect(systemSkillsExposureFromSessionId('cli-claude-run-1')).toBe(false);
+    expect(systemSkillsExposureFromSessionId('reflect-x')).toBe(false);
+    expect(systemSkillsExposureFromSessionId('memory-extract-x')).toBe(false);
+    expect(systemSkillsExposureFromSessionId('anon')).toBe(false);
   });
 });
 

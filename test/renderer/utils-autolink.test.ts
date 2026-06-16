@@ -23,10 +23,14 @@ const {
   _BARE_URL_RE,
   _linkifyBareUrls,
   inlineFormat,
+  _markdownImageHtml,
+  _markdownVideoHtml,
 } = utils as {
   _BARE_URL_RE: RegExp;
   _linkifyBareUrls: (text: string) => string;
   inlineFormat: (text: string) => string;
+  _markdownImageHtml: (src: string, alt: string, title?: string) => string;
+  _markdownVideoHtml: (src: string, label: string, title?: string) => string;
 };
 
 const A = (url: string) =>
@@ -139,6 +143,49 @@ describe('set B — already-wrapped URLs must not be re-wrapped', () => {
   it('B4. URL inside an existing img src attr is not re-matched', () => {
     const wrapped = `<img src="https://x.com/img.png" alt="">`;
     expect(_linkifyBareUrls(wrapped)).toBe(wrapped);
+  });
+});
+
+describe('markdown media links', () => {
+  it('renders normal markdown images with the chat image class', () => {
+    const out = inlineFormat('![car](chat-media://local/Users/test/car.png "preview")');
+    expect(out).toContain('<img class="chat-md-img"');
+    expect(out).toContain('src="chat-media://local/Users/test/car.png"');
+    expect(out).toContain('alt="car"');
+    expect(out).toContain('title="preview"');
+  });
+
+  it('escapes markdown image attributes', () => {
+    const out = _markdownImageHtml('https://x.test/a.png?x="y"', '<car>', '"preview"');
+    expect(out).toContain('src="https://x.test/a.png?x=&quot;y&quot;"');
+    expect(out).toContain('alt="&lt;car&gt;"');
+    expect(out).toContain('title="&quot;preview&quot;"');
+  });
+
+  it('renders a normal markdown link to chat-media mp4 as an inline player', () => {
+    const out = inlineFormat('[video](chat-media://local/Users/test/car_driving.mp4)');
+    expect(out).toContain('<video class="chat-md-video"');
+    expect(out).toContain('controls');
+    expect(out).toContain('controlslist="nodownload nofullscreen noremoteplayback"');
+    expect(out).toContain('disablepictureinpicture');
+    expect(out).toContain('disableremoteplayback');
+    expect(out).toContain('preload="metadata"');
+    expect(out).toContain('src="chat-media://local/Users/test/car_driving.mp4"');
+    expect(out).not.toContain('<a ');
+  });
+
+  it('escapes markdown video attributes', () => {
+    const out = _markdownVideoHtml('https://x.test/a.mp4?x="y"', '<clip>', '"preview"');
+    expect(out).toContain('src="https://x.test/a.mp4?x=&quot;y&quot;"');
+    expect(out).toContain('aria-label="&lt;clip&gt;"');
+    expect(out).toContain('title="&quot;preview&quot;"');
+  });
+
+  it('keeps non-video markdown links as anchors', () => {
+    const out = inlineFormat('[clip](chat-media://local/Users/test/notes.txt)');
+    expect(out).toContain('<a ');
+    expect(out).toContain('href="chat-media://local/Users/test/notes.txt"');
+    expect(out).not.toContain('<video ');
   });
 });
 

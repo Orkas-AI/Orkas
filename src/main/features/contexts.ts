@@ -296,7 +296,13 @@ const IMAGE_MEDIA_TYPE: Record<string, string> = {
  * makes that window irrelevant in practice.
  */
 function checkDuplicateContent(sha1: string): Result<null> | null {
-  const existing = kbVector.findBySha1(getActiveUserId(), sha1);
+  let existing: kbVector.KbFileRow | null;
+  try {
+    existing = kbVector.findBySha1(getActiveUserId(), sha1);
+  } catch (err) {
+    log.warn(`duplicate content check skipped: ${(err as Error).message}`);
+    return null;
+  }
   if (!existing) return null;
   return {
     ok: false,
@@ -304,7 +310,12 @@ function checkDuplicateContent(sha1: string): Result<null> | null {
   };
 }
 
-function notifyDeletedContext(_relPath: string): void {
+function notifyDeletedContext(relPath: string): void {
+  void relPath;
+}
+
+function notifyDirtyContext(relPath: string): void {
+  void relPath;
 }
 
 export function writeContextFile(relpath: string, content: string): Result<{ path: string }> {
@@ -339,6 +350,7 @@ export function writeContextFile(relpath: string, content: string): Result<{ pat
     const uid = getActiveUserId();
     search.upsertContext(uid, relpath);
     kbIndexer.enqueue(uid, relpath, 'upsert');
+    notifyDirtyContext(relpath);
   }
   return { ok: true, path: relpath };
 }
@@ -370,6 +382,7 @@ export function updateContextFile(relpath: string, content: string): Result<{ pa
   const uid = getActiveUserId();
   search.upsertContext(uid, relpath);
   kbIndexer.enqueue(uid, relpath, 'upsert');
+  notifyDirtyContext(relpath);
   return { ok: true, path: relpath };
 }
 
@@ -412,6 +425,7 @@ export function uploadContextFile(relpath: string, raw: Buffer | Uint8Array | nu
   const uid = getActiveUserId();
   search.upsertContext(uid, relpath);
   kbIndexer.enqueue(uid, relpath, 'upsert');
+  notifyDirtyContext(relpath);
   return { ok: true, path: relpath, bytes: buf.length };
 }
 
@@ -501,6 +515,7 @@ export function renameContextEntry(srcRel: string, dstRel: string): Result<{ src
   for (const r of _collectRelsUnder(dst, dstRel)) {
     search.upsertContext(uid, r);
     kbIndexer.enqueue(uid, r, 'upsert');
+    notifyDirtyContext(r);
   }
   return { ok: true, src: srcRel, dst: dstRel };
 }

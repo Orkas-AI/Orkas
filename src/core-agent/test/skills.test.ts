@@ -48,6 +48,37 @@ describe("parseFrontmatter", () => {
     expect(data).toEqual({});
     expect(body).toContain("(no closing fence)");
   });
+
+  it("reads a literal block scalar (description: |) instead of the bare indicator", () => {
+    const { data } = parseFrontmatter(
+      "---\nname: web\ndescription: |\n  Capture a website. Use when: (1) a URL is given.\n---\n",
+    );
+    expect(data.name).toBe("web");
+    // Regression: previously parsed as the literal "|" with the body dropped.
+    expect(data.description).toBe("Capture a website. Use when: (1) a URL is given.");
+  });
+
+  it("preserves line breaks in a multi-line literal block scalar", () => {
+    const { data } = parseFrontmatter(
+      "---\ndescription: |\n  line one\n  line two\n---\n",
+    );
+    expect(data.description).toBe("line one\nline two");
+  });
+
+  it("folds a `>` block scalar onto a single line", () => {
+    const { data } = parseFrontmatter(
+      "---\ndescription: >\n  folded line one\n  folded line two\n---\n",
+    );
+    expect(data.description).toBe("folded line one folded line two");
+  });
+
+  it("tolerates chomping indicators and ends the block at a dedented key", () => {
+    const { data } = parseFrontmatter(
+      "---\ndescription: |-\n  the description\nname: after-block\n---\n",
+    );
+    expect(data.description).toBe("the description");
+    expect(data.name).toBe("after-block");
+  });
 });
 
 describe("SkillLoader", () => {
@@ -94,6 +125,33 @@ describe("SkillLoader", () => {
     expect(list[0].name).toBe("no-fm");
     expect(list[0].description_zh).toBe("");
     expect(list[0].description_en).toBe("");
+  });
+
+  it("follows symlinked skill dirs (e.g. ~/.claude/skills entries)", () => {
+    // Real skill bodies live in a shared store; the scanned root holds
+    // symlinks into it — the common `~/.claude/skills` layout.
+    const store = path.join(root, "store");
+    writeSkill(store, "linked", { name: "linked", description: "via symlink" });
+    const base = path.join(root, "skills");
+    fs.mkdirSync(base, { recursive: true });
+    fs.symlinkSync(path.join(store, "linked"), path.join(base, "linked"), "dir");
+
+    const loader = new SkillLoader({ dirs: [base] });
+    const list = loader.list();
+    expect(list.map((s) => s.id)).toEqual(["linked"]);
+    expect(list[0].description_en).toBe("via symlink");
+  });
+
+  it("ignores symlinks that don't resolve to a directory", () => {
+    const base = path.join(root, "skills");
+    writeSkill(base, "real", { name: "real" });
+    // A dangling symlink and a symlink to a plain file must not be listed.
+    fs.symlinkSync(path.join(root, "nowhere"), path.join(base, "dangling"), "dir");
+    fs.writeFileSync(path.join(root, "afile"), "x");
+    fs.symlinkSync(path.join(root, "afile"), path.join(base, "tofile"));
+
+    const loader = new SkillLoader({ dirs: [base] });
+    expect(loader.list().map((s) => s.id)).toEqual(["real"]);
   });
 
   it("skips dirs without SKILL.md", () => {

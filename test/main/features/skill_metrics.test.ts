@@ -177,3 +177,82 @@ describe('aggregateSkillMetrics — empty / display_name fallback', () => {
     expect(row.display_name).toBe('definitely-not-installed-skill-id-xyz');
   });
 });
+
+describe('aggregateSkillMetrics — health report fields', () => {
+  it('classifies skill health and summarizes status counts', async () => {
+    for (let i = 0; i < 5; i += 1) {
+      emitSignal(UID, buildSkillAdvertisedSignal({
+        cid: 'cid_health_underused', aid: 'agent_h', turn_id: `t_underused_${i}`,
+        system: 'A.custom', skill_ids: ['underused-health-skill'],
+      }));
+    }
+
+    for (let i = 0; i < 2; i += 1) {
+      const turn = `t_review_health_${i}`;
+      emitSignal(UID, buildSkillInvokedSignal({
+        cid: 'cid_health_review', aid: 'agent_h', turn_id: turn,
+        system: 'A.custom', skill_id: 'review-health-skill', trigger: 'read_file',
+      }));
+      emitSignal(UID, {
+        type: 'correction', source: 'event', cid: 'cid_health_review', aid: 'agent_h',
+        turn_id: turn, context_ref: { msg_ids: [turn] },
+        extractor_version: 'text@1.0',
+        delta: { matched_patterns: ['不对'] },
+      } as any);
+    }
+
+    emitSignal(UID, buildSkillInvokedSignal({
+      cid: 'cid_health_bad', aid: 'agent_h', turn_id: 't_bad_health',
+      system: 'A.custom', skill_id: 'ineffective-health-skill', trigger: 'read_file',
+    }));
+    emitSignal(UID, buildSkillIneffectiveSignal({
+      cid: 'cid_health_bad', aid: 'agent_h', turn_id: 't_bad_health',
+      system: 'A.custom', skill_id: 'ineffective-health-skill',
+      error_excerpt: 'permanent: parse failure',
+    }));
+
+    for (let i = 0; i < 3; i += 1) {
+      emitSignal(UID, buildSkillAdvertisedSignal({
+        cid: 'cid_health_ok', aid: 'agent_h', turn_id: `t_ok_ad_${i}`,
+        system: 'A.custom', skill_ids: ['healthy-health-skill'],
+      }));
+    }
+    emitSignal(UID, buildSkillInvokedSignal({
+      cid: 'cid_health_ok', aid: 'agent_h', turn_id: 't_ok_invoke',
+      system: 'A.custom', skill_id: 'healthy-health-skill', trigger: 'read_file',
+    }));
+    await wait();
+
+    const r = await aggregateSkillMetrics({ sinceDays: 1 });
+    expect(findRow(r.rows, 'underused-health-skill', 'A.custom')).toMatchObject({
+      health_status: 'underused',
+      health_score: 45,
+      recommendation: 'Tighten routing hints or remove the skill from broad prompts.',
+    });
+    expect(findRow(r.rows, 'review-health-skill', 'A.custom')).toMatchObject({
+      health_status: 'needs_review',
+      recommendation: 'Inspect recent turns and refine expected output or preconditions.',
+    });
+    expect(findRow(r.rows, 'ineffective-health-skill', 'A.custom')).toMatchObject({
+      health_status: 'ineffective',
+      recommendation: 'Review trigger scope and implementation before widening usage.',
+    });
+    expect(findRow(r.rows, 'healthy-health-skill', 'A.custom')).toMatchObject({
+      health_status: 'healthy',
+      recommendation: 'No action needed.',
+    });
+
+    for (const id of ['underused-health-skill', 'review-health-skill', 'ineffective-health-skill', 'healthy-health-skill']) {
+      const row = findRow(r.rows, id, 'A.custom');
+      expect(row).not.toBeNull();
+      expect(row!.findings.length).toBeGreaterThan(0);
+      expect(row!.health_score).toBeGreaterThanOrEqual(0);
+      expect(row!.health_score).toBeLessThanOrEqual(100);
+    }
+    expect(r.summary.underused).toBeGreaterThanOrEqual(1);
+    expect(r.summary.needs_review).toBeGreaterThanOrEqual(1);
+    expect(r.summary.ineffective).toBeGreaterThanOrEqual(1);
+    expect(r.summary.healthy).toBeGreaterThanOrEqual(1);
+    expect(r.summary.total).toBe(r.rows.length);
+  });
+});

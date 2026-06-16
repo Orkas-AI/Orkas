@@ -22,6 +22,7 @@ import { marketplaceBizFile, userLocalBizDir } from '../paths';
 import { getActiveUserId } from './users';
 import { apiBase } from './marketplace';
 import { createLogger } from '../logger';
+import { fetchWithRetry } from '../util/retry';
 
 const log = createLogger('marketplace_biz');
 
@@ -96,7 +97,7 @@ async function _writePersisted(data: PersistedBiz): Promise<void> {
 }
 
 async function _fetchFromServer(): Promise<MarketplaceCategory[]> {
-  const res = await fetch(`${apiBase()}/marketplace/categories`, {
+  const res = await fetchWithRetry('marketplace:categories', `${apiBase()}/marketplace/categories`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({}),
@@ -170,10 +171,11 @@ export async function getMarketplaceCategories(
 }
 
 /** Boot-time priming. Called from `main/index.ts` after user activation so the first
- *  `openMarketplace` IPC roundtrip finds the in-memory cache hot. Errors are swallowed —
- *  failure is recovered by the lazy path. */
-export async function primeCategoryCache(): Promise<void> {
-  try { await getMarketplaceCategories(); }
+ *  `openMarketplace` IPC roundtrip finds the in-memory cache hot. Startup callers pass
+ *  `localOnly` to avoid spending first-paint bandwidth on reference data; the normal lazy
+ *  path still refreshes from Server when the marketplace UI needs fresh data. */
+export async function primeCategoryCache(opts: { localOnly?: boolean } = {}): Promise<void> {
+  try { await getMarketplaceCategories({ localOnly: opts.localOnly }); }
   catch { /* swallowed — lazy fallback will recover */ }
 }
 

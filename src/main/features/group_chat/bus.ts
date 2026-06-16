@@ -28,8 +28,9 @@ import * as fs from 'node:fs';
 import {
   Actor, ActorKind, COMMANDER_ID, USER_ID, RESERVED_IDS,
   actorSessionId, addMember, ensureAgentMember, readMembers, seedReservedActors,
-  setStatus, markInFlight, readState, transitionStatus, setCodingProjectDir,
+  setStatus, markInFlight, readState, transitionStatus, setCodingProjectDir, touchActivity,
 } from './state';
+import type { StateFile } from './state';
 import {
   GroupMessage, appendVisible, readSlice, buildReplayPrefix,
   type MarketplaceInstallRequest,
@@ -41,6 +42,7 @@ import {
   type PlanInteractionStatus,
 } from './router';
 import * as skillsFeat from '../skills';
+import * as autoTasksFeat from '../auto_tasks';
 import {
   setPlan, updateStep, readPlan, formatPlanAnnouncement, formatPlanForPrompt,
   PlanSetInput, StepStatus, PlanFile,
@@ -51,15 +53,18 @@ import {
   userMarketplaceSkillsDir, userMarketplaceAgentsDir,
 } from '../../paths';
 import * as agentsFeat from '../agents';
-import { isAgentEnabled } from '../component_enabled';
+import { isAgentEnabled, readDisabledSets } from '../component_enabled';
 import { buildLanguageDirective, descriptionLang, t } from '../../i18n';
+import { getLanguage } from '../config';
 import * as marketplaceFeat from '../marketplace';
 import { readInstalls } from '../marketplace_installs';
 import { createSkillTurnBuffer, onAgentTurnEnd, onUserMessage } from '../expert_signals/turn_hooks';
 import {
   compactPromptDescription,
   listSkillSpecs,
+  openSkillReadRoots,
   resolveSkillAllowlistRefs,
+  searchOpenTierSkills,
   type SkillAllowlistRef,
 } from '../../model/core-agent/skill-registry';
 import { buildRuntimeDatetimeBlock } from '../../prompts/runtime_context';
@@ -76,6 +81,82 @@ function escapeHtmlForBubble(s: string): string {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+function isExistingProducedFile(absPath: string): boolean {
+  try {
+    return fs.statSync(absPath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function existingProducedFiles(paths: Iterable<string>, onStale?: (absPath: string) => void): string[] {
+  const out: string[] = [];
+  for (const p of paths) {
+    if (!p) continue;
+    if (isExistingProducedFile(p)) {
+      out.push(p);
+    } else {
+      onStale?.(p);
+    }
+  }
+  return out;
+}
+
+function decodeXmlAttr(value: string): string {
+  return value
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
+function parseXmlAttrs(raw: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  const re = /([A-Za-z_][A-Za-z0-9_.:-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(raw)) !== null) {
+    attrs[m[1]] = decodeXmlAttr(m[2] ?? m[3] ?? '');
+  }
+  return attrs;
+}
+
+function xmlChild(body: string, tag: string): string {
+  const re = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i');
+  const m = re.exec(body);
+  return m ? decodeXmlAttr(m[1].trim()) : '';
+}
+
+function extractSyncConflictResults(text: string): Array<{
+  conflictId: string;
+  relPath: string;
+  targetPath: string;
+  status: string;
+  action: string;
+}> {
+  const out: Array<{
+    conflictId: string;
+    relPath: string;
+    targetPath: string;
+    status: string;
+    action: string;
+  }> = [];
+  const re = /<sync-conflict-result\b([^>]*?)(?:\/>|>([\s\S]*?)<\/sync-conflict-result>)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const attrs = parseXmlAttrs(m[1] || '');
+    const body = m[2] || '';
+    out.push({
+      conflictId: (attrs.conflict_id || attrs.id || xmlChild(body, 'conflict_id') || xmlChild(body, 'id')).trim(),
+      relPath: (attrs.rel_path || xmlChild(body, 'rel_path')).trim(),
+      targetPath: (attrs.target_path || attrs.current_path || xmlChild(body, 'target_path') || xmlChild(body, 'current_path')).trim(),
+      status: (attrs.status || xmlChild(body, 'status')).trim().toLowerCase(),
+      action: (attrs.action || xmlChild(body, 'action')).trim().toLowerCase(),
+    });
+  }
+  return out;
 }
 
 function _normaliseSkillMentionText(s: string): string {
@@ -481,6 +562,7 @@ export interface EnqueueParams {
   cid: string;
   fromActorId: string;
   text: string;
+  model_text?: string;
   attachments?: string[];
   produced?: string[];
   form?: ChatFormPayload;
@@ -786,6 +868,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     ...(unknown.length ? { unknown_mentions: unknown } : {}),
     ...(mentions.length ? { mentions } : {}),
     text: rewrittenText,
+    ...(params.model_text && params.model_text.trim() ? { model_text: params.model_text } : {}),
     ...(params.attachments && params.attachments.length ? { attachments: params.attachments } : {}),
     ...(params.produced && params.produced.length ? { produced: params.produced } : {}),
     ...(params.form ? { form: params.form } : {}),
@@ -899,7 +982,7 @@ function composeLlmTurnPayload(fromActorId: string, msg: GroupMessage): string {
   // a stray @ targeted multiple actors).
   const head = `<msg from="${fromActorId}" to="${(msg.to || []).join(',')}">`;
   const tail = '</msg>';
-  return `${head}\n${msg.text}\n${tail}`;
+  return `${head}\n${msg.model_text || msg.text}\n${tail}`;
 }
 
 /** Reverse of `composeLlmTurnPayload`: extract the user-visible text from
@@ -1079,6 +1162,27 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       log.warn(`resolve project scope cid=${cid} pid=${turnProjectId}: ${(err as Error).message}`);
     }
   }
+  let turnToolExtraRoots: string[] = [];
+  let turnSyncConflictResolution: NonNullable<StateFile['sync_conflict_resolution']>['conflicts'] = [];
+  try {
+    const stateFile = await readState(uid, cid);
+    turnToolExtraRoots = Array.isArray(stateFile.tool_extra_roots)
+      ? stateFile.tool_extra_roots.filter((r) => typeof r === 'string' && path.isAbsolute(r))
+      : [];
+    turnSyncConflictResolution = Array.isArray(stateFile.sync_conflict_resolution?.conflicts)
+      ? stateFile.sync_conflict_resolution.conflicts
+      : [];
+  } catch { /* no conversation-scoped extra roots */ }
+  // User-granted sandbox roots (plan §B2): directories the user explicitly
+  // authorized in Settings, available to every conversation's file/bash
+  // tools on top of the workspace + attachment scope. Deny-list + realpath
+  // re-checked at read time inside the feature.
+  try {
+    const granted = require('../granted_roots') as typeof import('../granted_roots');
+    for (const root of granted.grantedRootsForSandbox(uid)) {
+      if (!turnToolExtraRoots.includes(root)) turnToolExtraRoots.push(root);
+    }
+  } catch (err) { log.warn(`granted roots unavailable: ${(err as Error).message}`); }
   // First-turn replay: if the persistent session jsonl doesn't exist yet,
   // prepend a `<group-chat-history>` block built from the visibility slice
   // so the agent / commander has context. After the first turn, the
@@ -1148,7 +1252,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   let actorInteractive = false;
   if (isCommander) {
     systemPrompt = await buildCommanderSystemPrompt(uid, cid, turnProjectScope?.agents ?? null);
-    extraTools = await buildCommanderExtraTools(state, w, item.attachments);
+    extraTools = await buildCommanderExtraTools(state, w, item.attachments, turnProjectId);
     // skillList stays undefined for commander — every skill is globally
     // visible (skills are NOT project-scoped this round; see CLAUDE.md §6).
   } else {
@@ -1274,9 +1378,16 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // edit_file would skip safeId / validateAgentInputs / bilingual
   // description normalisation / cache invalidation / the "view detail"
   // chip, so the sandbox-level lock keeps the LLM honest even if the
-  // prompt strays. Builtin first to match the prompt's "locate by
-  // source" guidance.
+  // prompt strays. Keep these roots aligned with the trusted skill registry.
   const skillRoots = [userMarketplaceSkillsDir(uid), userSkillsDir(uid)];
+  // OPEN-tier roots (external packages + global skill dirs) are rendered in
+  // the commander's skills block only (plan D5), so the matching read scope
+  // is commander-only too — agent workers never see those ROOT paths and
+  // must not be able to read them either.
+  if (isCommander) {
+    try { skillRoots.push(...openSkillReadRoots(uid)); }
+    catch (err) { log.warn(`open skill read roots unavailable: ${(err as Error).message}`); }
+  }
   const agentRoots = [userMarketplaceAgentsDir(uid), userAgentsDir(uid)];
   if (cliAgent) {
     // CLI-backed agent path: spawn the local CLI in the user's workspace
@@ -1321,6 +1432,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       const cliOut = await _runCliAgentTurn({
         uid, cid, actor, agent: cliAgent,
         item, slice, workingDir: cliWorkingDir,
+        ...(turnProjectId ? { projectId: turnProjectId } : {}),
         signal: w.abortController.signal,
         onProcess: data => {
           // Mirror the LLM path: count every event for activity, but
@@ -1328,6 +1440,10 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
           // — `delta` text streams into the live bubble and is recovered
           // from the final body, not the rail.
           activityEvents += 1;
+          // Keep `processing_since` fresh so the renderer's stuck-turn
+          // watchdog doesn't false-positive on a long CLI run. Self-throttled
+          // + self-catching; fire-and-forget on the hot path.
+          void touchActivity(uid, cid);
           if (processItems.length < MAX_PROCESS_ITEMS_PER_TURN) {
             if (data.type === 'progress' && typeof data.text === 'string' && data.text) {
               processItems.push({ type: 'progress', text: data.text });
@@ -1363,37 +1479,38 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       await emitStateChanged(state);
     }
   } else {
-  try {
-    for await (const ev of streamChatWithModel({
-      userId: uid,
-      message: messageText,
-      sessionId,
-      systemPrompt,
-      workingDir,
-      agentName: 'orkas_chat',
-      ...(actor.kind === 'agent' ? { agentId: actor.id } : {}),
-      cid,
-      turnId: item.turnId,
-      ...(turnProjectId ? { projectId: turnProjectId } : {}),
-      onFileWritten,
-      hasProducedPath,
-      onArtifactCreated,
-      onSkillAdvertised: (id, sys) => skillBuffer.recordAdvertised(id, sys),
-      onSkillInvoked: (id, sys, trig) => skillBuffer.recordInvoked(id, sys, trig),
-      cacheRetention: 'short',
-      abortSignal: w.abortController.signal,
-      readOnlyExtraRoots: [
-        ...skillRoots,
-        ...agentRoots,
-      ],
-      ...(turnImages.length ? { images: turnImages } : {}),
-      ...(extraTools.length ? { extraTools } : {}),
-      ...(skillList !== undefined ? { skillList } : {}),
-      // Skills are NOT project-scoped this round — every conversation sees
-      // every skill (gated only by per-user enable + agent.skill_list).
-      // The runner's `projectAllowedSkillIds` plumbing is preserved for
-      // a future re-enable; bus just doesn't pass it.
-    })) {
+    try {
+      for await (const ev of streamChatWithModel({
+        userId: uid,
+        message: messageText,
+        sessionId,
+        systemPrompt,
+        workingDir,
+        agentName: 'orkas_chat',
+        ...(actor.kind === 'agent' ? { agentId: actor.id } : {}),
+        cid,
+        turnId: item.turnId,
+        ...(turnProjectId ? { projectId: turnProjectId } : {}),
+        onFileWritten,
+        hasProducedPath,
+        onArtifactCreated,
+        onSkillAdvertised: (id, sys) => skillBuffer.recordAdvertised(id, sys),
+        onSkillInvoked: (id, sys, trig) => skillBuffer.recordInvoked(id, sys, trig),
+        cacheRetention: 'short',
+        abortSignal: w.abortController.signal,
+        ...(turnToolExtraRoots.length ? { extraRoots: turnToolExtraRoots } : {}),
+        readOnlyExtraRoots: [
+          ...skillRoots,
+          ...agentRoots,
+        ],
+        ...(turnImages.length ? { images: turnImages } : {}),
+        ...(extraTools.length ? { extraTools } : {}),
+        ...(skillList !== undefined ? { skillList } : {}),
+        // Skills are NOT project-scoped this round — every conversation sees
+        // every skill (gated only by per-user enable + agent.skill_list).
+        // The runner's `projectAllowedSkillIds` plumbing is preserved for
+        // a future re-enable; bus just doesn't pass it.
+      })) {
       // Stream events → process channel.
       if (ev.type === 'final') {
         finalText = ev.text || '';
@@ -1405,6 +1522,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
         const piece = (ev as { text?: string }).text;
         if (typeof piece === 'string') streamingText += piece;
         activityEvents += 1;
+        void touchActivity(uid, cid);
         emit(state, {
           type: 'process', cid, actor: actor.id,
           turn_id: item.turnId,
@@ -1418,6 +1536,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
         log.warn(`stream error cid=${cid} actor=${actor.id}: ${errText}${aborted ? ' (aborted)' : ''}`);
       } else if (ev.type !== 'done') {
         activityEvents += 1;
+        void touchActivity(uid, cid);
         if (processItems.length < MAX_PROCESS_ITEMS_PER_TURN) {
           if (ev.type === 'progress') {
             const text = (ev as { text?: string }).text;
@@ -1462,11 +1581,25 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   }
   } // end LLM branch (paired with `if (cliAgent) { ... } else {` above)
 
+  let workingText = finalText || '';
+  if (turnSyncConflictResolution.length && workingText && !errText && !aborted) {
+    const results = extractSyncConflictResults(workingText);
+    const allowedIds = new Set(turnSyncConflictResolution.map((item) => item.id));
+    try {
+      const syncFeature = await import('../sync');
+      for (const result of results) {
+        if (!allowedIds.has(result.conflictId)) continue;
+        await syncFeature.completeConflictResolutionResult(uid, result);
+      }
+    } catch (err) {
+      log.warn(`sync conflict result apply failed cid=${cid}: ${(err as Error).message}`);
+    }
+  }
+
   // ── Post-stream parsing (pure data extraction; no decisions) ──────────
   // Form / <agent> container extraction stays in bus because they're pure
   // text → structured-data parsing. Decisions (silent / done / blocked /
   // failed) live in plan_executor.onTurnFinished.
-  let workingText = finalText || '';
   let form: ChatFormPayload | undefined;
   let planInteraction: PlanInteractionStatus | undefined;
   const createdAgents: Array<{ agent_id: string; name: string; kind: 'created' | 'updated' }> = [];
@@ -1508,18 +1641,12 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
             const target = await agentsFeat.getAgent(editId);
             if (!target) {
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent edit failed: agent not found (id=${editId}).</span>`;
-            } else if (target.source !== 'custom' && !false) {
+            } else if (target.source !== 'custom') {
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Marketplace agents can't be edited from the main chat; fork one in the right-hand detail panel and edit there.</span>`;
             } else if (agentsFeat.isCliAgent(target)) {
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ External agents can only be edited from the right-hand detail panel.</span>`;
             } else {
-              // `updateAgentSpec` dispatches: custom → updateCustomAgent,
-              // marketplace + dev → agents_dev.updateBuiltinAgentSpec
-              // (which writes the local marketplace install dir). The
-              // dev-env source guard above is what makes the marketplace
-              // branch reachable; the direct `updateCustomAgent` call this
-              // replaces would short-circuit to null because the custom
-              // agent.json doesn't exist for marketplace ids.
+              // `updateAgentSpec` dispatches only custom agents in OrkasOpen.
               const updated = await agentsFeat.updateAgentSpec(editId, fields);
               if (updated) {
                 createdAgents.push({ agent_id: updated.agent_id, name: updated.name, kind: 'updated' });
@@ -1626,9 +1753,41 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
         }
       }
     }
+
+    // `<auto-task>` container — commander-only automation CRUD. The skill
+    // teaches the model the field protocol; bus executes it through
+    // features/auto_tasks so renderer and model mutations share validation.
+    const autoR = autoTasksFeat.extractAutoTaskContainers(workingText);
+    if (autoR.containers.length) {
+      workingText = autoR.cleanText;
+      for (const container of autoR.containers) {
+        try {
+          const result = await autoTasksFeat.applyAutoTaskContainerFromCommander(uid, container, {
+            sourceAttachmentCid: cid,
+          });
+          if (result.ok) {
+            const name = escapeHtmlForBubble(result.title || result.taskId || 'auto task');
+            const verb = result.kind || 'updated';
+            const label = verb === 'created' ? 'created'
+              : verb === 'updated' ? 'updated'
+                : verb === 'deleted' ? 'deleted'
+                  : verb === 'enabled' ? 'enabled'
+                    : 'disabled';
+            workingText = `${workingText}\n\n<span>Automation ${label}: ${name}</span>`;
+          } else {
+            workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Automation operation failed: ${escapeHtmlForBubble(result.error || 'unknown error')}</span>`;
+          }
+        } catch (err) {
+          log.error(`auto-task container failed cid=${cid}: ${(err as Error).message}`);
+          workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Automation operation failed: ${escapeHtmlForBubble((err as Error).message)}</span>`;
+        }
+      }
+    }
   }
 
-  const produced = Array.from(turnProduced);
+  const produced = existingProducedFiles(turnProduced, (stalePath) => {
+    state.producedPaths.delete(stalePath);
+  });
 
   // ── Trigger derivation ───────────────────────────────────────────────
   // Map the raw `triggered_step` (kept for back-compat with the executor
@@ -1953,12 +2112,20 @@ async function buildCommanderSystemPrompt(
   // next to the entries that consume them. Reintroducing $*_dir vars would
   // recreate the cross-section path-constants design that mis-fires under
   // training-prior layouts.
+  const envSummary = (() => {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+      const pkgs = require('../packages') as typeof import('../packages');
+      return pkgs.buildEnvSummaryLine(uid);
+    } catch { return 'No external package CLIs installed.'; }
+  })();
   const main = prompts.load('chat_commander', {
     agents_index: allAgentsList,
     plan_state: formatPlanForPrompt(plan),
     os: process.platform === 'darwin' ? 'macOS' : process.platform === 'win32' ? 'Windows' : process.platform,
     working_dir: workingDir,
     local_exec_state: permState,
+    env_summary: envSummary,
     output_format_hint: buildOutputFormatHint('auto'),
   });
   const shared = prompts.load('chat_shared_rules', {});
@@ -1978,11 +2145,16 @@ function concatSharedRules(main: string, shared: string): string {
   return `${main.slice(0, idx)}---\n\n${shared}\n\n${main.slice(idx)}`;
 }
 
-/** Append volatile prompt tail after the runtime injection block. Current
- *  datetime stays last because it changes every turn; keeping it at the tail
- *  preserves the largest cacheable prefix. */
+/** Put low-frequency language context at the head of the dynamic region, while
+ *  keeping the date tail last because it can change between turns. */
 function appendLanguageDirective(prompt: string): string {
-  return `${prompt}\n\n---\n\n${buildLanguageDirective()}\n\n---\n\n${buildRuntimeDatetimeBlock()}`;
+  const language = buildLanguageDirective(getLanguage());
+  const marker = '## Runtime injection';
+  const idx = prompt.indexOf(marker);
+  const withLanguage = idx < 0
+    ? `${prompt}\n\n---\n\n${language}`
+    : `${prompt.slice(0, idx)}${language}\n\n---\n\n${prompt.slice(idx)}`;
+  return `${withLanguage}\n\n---\n\n${buildRuntimeDatetimeBlock()}`;
 }
 
 // Render the agents-index block injected into commander's system prompt.
@@ -2021,9 +2193,8 @@ export async function _buildAgentsIndexBlockForTest(uid: string): Promise<string
  *  has zero bound agents. Unknown ids in the allowlist are silently
  *  dropped (loader is the source of truth). */
 async function buildAgentsIndexBlock(uid: string, allowedIds?: readonly string[] | null): Promise<string> {
-  const { getCurrentLang } = await import('../../i18n');
   const { pickDescription } = await import('#core-agent');
-  const lang = descriptionLang(getCurrentLang());
+  const lang = descriptionLang(getLanguage());
   const customRoot = path.resolve(userAgentsDir(uid));
   const marketplaceRoot = path.resolve(userMarketplaceAgentsDir(uid));
   const header = [
@@ -2097,9 +2268,11 @@ function buildPlanInteractionHint(interactive: boolean): string {
   if (!interactive) return '';
   return [
     '### Plan interaction',
-    'For plan steps, when Information sufficiency requires user input before completing this step, include `<plan-interaction status="open" />` with the `<agent-input-form>`.',
-    'An open reply pauses the step: briefly state the blocker, ask at most 2-3 focused form fields, and do not include a final recommendation, diagnosis, plan, or report.',
-    'Keep including `<plan-interaction status="open" />` while waiting for more user input. When the step is complete, include `<plan-interaction status="closed" />`.',
+    'In a plan step, user input is a structured pause protocol.',
+    'Run your own Information sufficiency check before completing the step. If it fails, output only: a brief blocker sentence, one `<agent-input-form>` with at most 2-3 focused fields, and `<plan-interaction status="open" />`.',
+    'Required open shape: brief blocker sentence, then `<agent-input-form>` JSON, then `<plan-interaction status="open" />`.',
+    'Do not include a recommendation, diagnosis, plan, report, or a "needed information" section in an open reply; the form fields are the questions.',
+    'Keep using `<plan-interaction status="open" />` on follow-up turns until the step has enough information. When the step is complete, include `<plan-interaction status="closed" />`.',
   ].join('\n');
 }
 
@@ -2114,24 +2287,24 @@ function buildOutputFormatHint(format: string | undefined): string {
   switch (format) {
     case 'text':
     case 'markdown_only':
-      return '### Output format\nstandard reply output: use plain text or Markdown only. Do NOT emit `:::dashboard` blocks or call `create_artifact`.';
+      return '### Presentation preference\nstandard reply output: use plain text or Markdown only. Do NOT emit `:::dashboard` blocks or call `create_artifact`.';
     case 'dashboard':
       return [
-        '### Output format',
+        '### Presentation preference',
         'dashboard output: use a valid fenced `:::dashboard` JSON block for read-only structured snapshots.',
         'Follow the `Output formats` schema exactly. Do NOT call `create_artifact`.',
       ].join('\n');
     case 'artifact':
     case 'allow_artifacts':
       return [
-        '### Output format',
+        '### Presentation preference',
         'This agent is configured to allow interactive apps: use `:::dashboard` for static/read-only structured snapshots; call `create_artifact` only when the user must operate the result.',
         'Choose artifacts for click/type/filter/sort/calculate/drill-down/simulate; static results prefer `:::dashboard`.',
       ].join('\n');
     case 'auto':
     default:
       return [
-        '### Output format',
+        '### Presentation preference',
         'This actor is configured for automatic output layout: choose the lightest useful presentation.',
         '- Use plain text or Markdown for narrative answers, lists, code, fixed-format requests, progress, wrap-ups.',
         '- Use `:::dashboard` for static/read-only structured snapshots; emit a valid fenced `:::dashboard` JSON block per `Output formats`.',
@@ -2252,6 +2425,7 @@ async function buildCommanderExtraTools(
   // file bytes follow the dispatch chain. Same flow as `dispatch_to` flush,
   // but persisted because plan steps live across worker turn boundaries.
   currentTurnAttachments?: string[],
+  currentProjectId?: string,
 ): Promise<AgentTool[]> {
   const { uid, cid } = w;
   const tools: AgentTool[] = [];
@@ -2352,6 +2526,78 @@ async function buildCommanderExtraTools(
       // synchronously here, so user immediately sees the plan card; only
       // the agent dispatch waits for commander to wrap up.
       return { content: JSON.stringify({ ok: true, plan: { steps: plan.steps } }) };
+    },
+  });
+
+  tools.push({
+    name: 'auto_tasks_list',
+    description: [
+      'List existing automation tasks for the active user. Read-only.',
+      'Use before updating, deleting, enabling, or disabling an automation so you can choose the correct task_id.',
+      'Mutations are not done by this tool; emit an <auto-task> container in your final reply after reading the autotask-creator system skill.',
+    ].join(' '),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        project_id: {
+          type: 'string',
+          description: 'Optional project id filter. Use "__current__" for the current conversation project when one exists.',
+        },
+        include_global: {
+          type: 'boolean',
+          description: 'When project_id is "__current__", also include global tasks with no project. Default false.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum tasks to return (1-200). Default 50.',
+        },
+      },
+      additionalProperties: false,
+    },
+    async execute(input) {
+      const limit = _clampLimit(input?.limit, 50, 1, 200);
+      const rawProject = _trimText(input?.project_id, 128);
+      const includeGlobal = input?.include_global === true;
+      try {
+        let tasks: autoTasksFeat.AutoTask[];
+        if (rawProject === '__current__') {
+          if (currentProjectId) {
+            tasks = await autoTasksFeat.listTasks(uid, { projectId: currentProjectId });
+            if (includeGlobal) {
+              const globalTasks = await autoTasksFeat.listTasks(uid, { projectId: null });
+              tasks = [...tasks, ...globalTasks];
+            }
+          } else {
+            tasks = await autoTasksFeat.listTasks(uid, includeGlobal ? { projectId: null } : undefined);
+          }
+        } else if (rawProject) {
+          tasks = await autoTasksFeat.listTasks(uid, { projectId: rawProject });
+        } else {
+          tasks = await autoTasksFeat.listTasks(uid);
+        }
+        return _toolJson({
+          ok: true,
+          current_project_id: currentProjectId || '',
+          tasks: tasks.slice(0, limit).map((t) => ({
+            id: t.id,
+            title: t.title || '',
+            content: t.content,
+            enabled: t.enabled,
+            schedule: t.schedule,
+            recipient: t.recipient || { kind: 'commander' },
+            ...(t.skill ? { skill: t.skill } : {}),
+            ...(t.connector ? { connector: t.connector } : {}),
+            ...(t.project_id ? { project_id: t.project_id } : {}),
+            attachments: Array.isArray(t.attachments) ? t.attachments : [],
+            device_name: t.device_name || '',
+            last_run_at: t.last_run_at || '',
+            created_at: t.created_at,
+            updated_at: t.updated_at,
+          })),
+        });
+      } catch (err) {
+        return _toolError((err as Error).message || 'auto_tasks_list failed');
+      }
     },
   });
 
@@ -2496,6 +2742,42 @@ async function buildCommanderExtraTools(
         return _toolJson(result);
       } catch (err) {
         return _toolError((err as Error).message || 'marketplace search failed');
+      }
+    },
+  });
+
+  tools.push({
+    name: 'skill_search',
+    description: [
+      'Find skills contributed by the user\'s installed external packages and global skill folders.',
+      'These open-tier skills are NOT listed in the "## Available skills" block — use this when the listed skills and built-in tools do not cover the task.',
+      'Returns each match\'s name, source, and SKILL.md path; read_file that path before invoking the skill.',
+      'Matching is keyword-based over names + descriptions, which are often English (package skills) — if a user-language query returns nothing, retry once with English keywords before concluding none exist.',
+      'This does NOT search the marketplace catalog (use marketplace_search for installable resources) and installs nothing.',
+    ].join(' '),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Capability text matched against skill names and descriptions. Leave empty to list available open-tier skills. Use the user language when possible.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum results to return (1-20). Default: 8.',
+        },
+      },
+      additionalProperties: false,
+    },
+    async execute(input) {
+      const query = _trimText(input?.query, 300);
+      const limit = _clampLimit(input?.limit, 8, 1, 20);
+      try {
+        const { skills: disabledSkillIds } = readDisabledSets(uid);
+        const res = await searchOpenTierSkills(uid, query, limit, disabledSkillIds);
+        return _toolJson({ ok: true, query, ...res });
+      } catch (err) {
+        return _toolError((err as Error).message || 'skill search failed');
       }
     },
   });
@@ -2755,6 +3037,18 @@ export async function abort(uid: string, cid: string): Promise<void> {
   } catch (err) {
     log.warn(`abort model-session fallback failed cid=${cid}: ${(err as Error).message}`);
   }
+  // Abandon any pending custom-connector install confirmation for this
+  // conversation — the agent that requested it is being stopped.
+  try {
+    const installConfirm = await import('../connectors/install_confirm');
+    installConfirm.cancelForCid(cid);
+  } catch { /* feature stripped / not loaded */ }
+  // Abandon any pending bash risk-permission prompt for this conversation and
+  // drop its run-scoped grants — the agent that requested it is being stopped.
+  try {
+    const bashPermissions = await import('../../model/core-agent/bash-permissions');
+    bashPermissions.cancelForCid(cid);
+  } catch { /* not loaded */ }
   await setStatus(uid, cid, 'aborted');
   if (state) {
     emit(state, { type: 'aborted', cid });
@@ -2977,6 +3271,7 @@ async function _runCliAgentTurn(opts: {
   agent: import('../agents').Agent;
   item: QueueItem;
   slice: GroupMessage[];
+  projectId?: string;
   workingDir: string;
   signal: AbortSignal;
   onProcess: (data: Record<string, unknown>) => void;
@@ -3044,6 +3339,8 @@ async function _runCliAgentTurn(opts: {
     uid: opts.uid,
     cid: opts.cid,
     agentId: opts.agent.agent_id,
+    agentName: opts.agent.name || opts.agent.agent_id,
+    ...(opts.projectId ? { projectId: opts.projectId } : {}),
     cli: runtime.cli as import('../local_agents/registry').LocalCliType,
     model: runtime.model,
     customArgs: runtime.custom_args,
@@ -3129,6 +3426,22 @@ async function _runCliAgentTurn(opts: {
       .catch(() => { /* logged inside sessions.ts */ });
   }
 
+  // Persist the (possibly new) session id for EVERY terminal status that
+  // reported one — not just success. Claude reports its session id at
+  // turn start (system/init), so a watchdog-killed or failed turn still
+  // has its partial conversation in the CLI's own session store —
+  // persisting the id lets the plan-step transient retry (and any manual
+  // resend) `--resume` that context instead of replaying from the
+  // pre-kill session. If a `--resume` landed on an expired session, the
+  // CLI silently allocates a new one and reports it — we save what's
+  // freshest (the stale binding was already cleared above on
+  // resumeRejected). The write is fire-and-forget — failures only affect
+  // the next turn's optimisation, not correctness.
+  if (backendSessionId) {
+    cliSessions
+      .setSessionId(opts.uid, opts.cid, opts.agent.agent_id, runtime.cli, backendSessionId)
+      .catch(() => { /* logged inside sessions.ts */ });
+  }
   if (result.status === 'missing_cli') {
     const msg = t('cli_agent.missing', { name: opts.agent.name || runtime.cli, cli: runtime.cli });
     return { text: '', error: msg, aborted: false, produced: Array.from(produced) };
@@ -3142,18 +3455,6 @@ async function _runCliAgentTurn(opts: {
     // simple resend will recover (the binding has been cleared above).
     const hint = resumeRejected ? ' — session expired; retry will start fresh.' : '';
     return { text: resultText || accText, error: detail + hint, produced: Array.from(produced) };
-  }
-  // Successful turn — persist the (possibly new) session id so the
-  // next dispatch can resume. Claude reports its session id every
-  // turn; if a `--resume` lands on an expired session, claude
-  // silently allocates a new one and reports that as `sessionId` in
-  // the system/init record. Either way we save what's freshest. The
-  // write is fire-and-forget — failures only affect the next turn's
-  // optimisation, not correctness.
-  if (backendSessionId) {
-    cliSessions
-      .setSessionId(opts.uid, opts.cid, opts.agent.agent_id, runtime.cli, backendSessionId)
-      .catch(() => { /* logged inside sessions.ts */ });
   }
   const finalText = resultText || accText;
   if (slashCommandName && _looksLikeNoOutput(finalText)) {
@@ -3308,6 +3609,7 @@ async function _buildCliPrompt(
     agent_name: agent.name || agent.agent_id,
     agent_description: (agent.description_en || agent.description_zh || '').trim(),
     output_protocol_block: outputProtocolBlock,
+    language_block: buildLanguageDirective(getLanguage()),
     attachments_block: filesBlock,
     conversation_block: conversationBlock,
     task_body: taskBody,

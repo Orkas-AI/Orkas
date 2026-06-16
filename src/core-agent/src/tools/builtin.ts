@@ -74,6 +74,10 @@ export const bashTool: AgentTool = defineTool({
     properties: {
       command: { type: "string", description: "The shell command to execute." },
       timeoutMs: { type: "number", description: "Timeout in milliseconds (default: 300000 = 5 min). Pass a larger value (e.g. 600000 / 900000) for long-running commands like builds, large installs, network fetches, video processing." },
+      run_in_background: {
+        type: "boolean",
+        description: "Run detached and return immediately with a pid + log file path instead of waiting. Use for commands that may outlast any reasonable timeout (long builds, renders, big downloads). Poll progress by reading the log file; stop the process with `kill <pid>`. The process is NOT stopped automatically when the conversation ends.",
+      },
     },
     required: ["command"],
   },
@@ -86,6 +90,23 @@ export const bashTool: AgentTool = defineTool({
       timeoutMs,
       env: ctx.state.sandboxEnv as Record<string, string> | undefined,
     });
+
+    if (input.run_in_background === true) {
+      // Log file lands in the per-turn output dir when the host provides
+      // one (Orkas sets ORKAS_OUTPUT_DIR in the sandbox env), else cwd.
+      const sandboxEnv = (ctx.state.sandboxEnv ?? {}) as Record<string, string>;
+      const baseDir = sandboxEnv.ORKAS_OUTPUT_DIR || ctx.workingDir || ".";
+      const logPath = path.resolve(baseDir, `bg-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}.log`);
+      const bg = sandbox.executeBackground(command, logPath);
+      if (bg.error || bg.pid == null) {
+        return { content: `Failed to start background command: ${bg.error ?? "no pid"}`, isError: true };
+      }
+      return {
+        content: `Started in background.\npid: ${bg.pid}\nlog: ${logPath}\n`
+          + `Poll with read_file on the log (or \`tail\` it); stop with \`kill ${bg.pid}\`. `
+          + `The process keeps running after this conversation ends.`,
+      };
+    }
 
     const result = await sandbox.execute(command);
 

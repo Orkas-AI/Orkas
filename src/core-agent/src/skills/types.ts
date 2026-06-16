@@ -1,19 +1,15 @@
 /**
  * A single skill discovered on disk.
  *
- * `id` is the subdirectory name (matches openclaw conventions); `description`
- * comes from the SKILL.md YAML frontmatter. `dir` is the absolute path to
+ * `id` is the subdirectory name (matches openclaw conventions);
+ * descriptions come from Orkas `_meta.json` when present, falling back to
+ * SKILL.md frontmatter for portable skills. `dir` is the absolute path to
  * the skill's root — callers read SKILL.md or other files relative to this.
- *
- * Invariant: `name === id` always. Frontmatter `name` is enforced equal to
- * the directory name by `features/skills.ts` on write, and re-aligned by
- * `SkillLoader.parseSpec` on read. The separate `name` field is kept only
- * for consumer API stability.
  */
 export interface SkillSpec {
   /** Subdirectory name (also the skill id). */
   id: string;
-  /** Display name — always equal to `id`. */
+  /** Display name from SKILL.md `name`, falling back to `id`. */
   name: string;
   /** Chinese description (zh locale). May be empty. */
   description_zh: string;

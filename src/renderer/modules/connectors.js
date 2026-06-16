@@ -18,6 +18,34 @@
 
 const _connectorsLog = createLogger('connectors');
 
+function _connectorsTrackClick(action, data) {
+}
+
+function _connectorsTrackEvent(action, data) {
+}
+
+function _connectorsTrackError(action, data) {
+}
+
+function _connectorTrackPayload(entry, instance) {
+  const e = entry || {};
+  const inst = instance || {};
+  return {
+    connector_id: String(e.id || inst.id || ''),
+    origin: inst.origin === 'custom' || e._custom ? 'custom' : 'catalog',
+    is_bundle: !!(Array.isArray(e.bundle_member_ids) && e.bundle_member_ids.length),
+  };
+}
+
+function _connectorTrackErrorType(err) {
+  const msg = String((err && (err.message || err.error)) || err || '').toLowerCase();
+  if (/timeout|timed out/.test(msg)) return 'timeout';
+  if (/network|fetch failed|econnreset|econnrefused|eai_again|enotfound/.test(msg)) return 'network';
+  if (/cancelled|canceled|superseded/.test(msg)) return 'cancelled';
+  if (/auth|grant|scope|oauth/.test(msg)) return 'auth';
+  return 'exception';
+}
+
 let _connectorsState = {
   catalog: [],
   instances: [],
@@ -177,6 +205,16 @@ function _renderConnectorsGrid() {
   if (!gridView) return;
   gridView.style.display = '';
 
+  // Idempotent header-button wiring — the panel HTML is static, so bind once.
+  const addBtn = document.getElementById('connectors-add-custom-btn');
+  if (addBtn && !addBtn.dataset.bound) {
+    addBtn.dataset.bound = '1';
+    addBtn.addEventListener('click', () => {
+      _connectorsTrackClick('connector_custom_open', {});
+      _openAddCustomDialog();
+    });
+  }
+
   const groupConn = document.getElementById('connectors-group-connected');
   const groupAvail = document.getElementById('connectors-group-available');
   const gridConn = document.getElementById('connectors-grid-connected');
@@ -209,6 +247,15 @@ function _renderConnectorsGrid() {
     } else {
       availableItems.push({ entry, instance: inst });
     }
+  }
+  // Custom MCP instances have no catalog entry — render them from the
+  // instance itself (derived entry carries the `_custom` marker so the card
+  // renderer swaps OAuth actions for remove-only handling).
+  for (const inst of _connectorsState.instances) {
+    if (!inst || inst.origin !== 'custom') continue;
+    const item = { entry: _entryFromInstance(inst), instance: inst };
+    if (inst.status && inst.status.kind === 'connected') connectedItems.push(item);
+    else availableItems.push(item);
   }
   // A→Z within each group (CLAUDE.md §8 inventory ordering).
   const cmp = (a, b) => (a.entry.display_name || '').localeCompare(b.entry.display_name || '', undefined, { sensitivity: 'base', numeric: true });
@@ -267,7 +314,11 @@ function _renderCatalogCard(entry, instance) {
   const iconHtml = e.icon_svg
     ? `<div class="connector-card-icon is-svg">${e.icon_svg}</div>`
     : `<div class="connector-card-icon is-fallback" style="background:${brandTint}">${escapeHtml((e.display_name || '?').slice(0, 1).toUpperCase())}</div>`;
-  const desc = pickDesc(e, (typeof getLang === 'function') ? getLang() : 'en');
+  // Custom cards have no authored description — show the server summary
+  // (url / command) so the user can tell their entries apart.
+  const desc = e._custom
+    ? _customTransportSummary(instance)
+    : pickDesc(e, (typeof getLang === 'function') ? getLang() : 'en');
 
   const accountLabel = (instance && instance.oauth_grant && instance.oauth_grant.account_label) || '';
   const errorMsg = errored && instance && instance.status && instance.status.message;
@@ -303,6 +354,13 @@ function _renderCatalogCard(entry, instance) {
     const label = enabledFlag ? t('component.disable') : t('component.enable');
     const cls = enabledFlag ? 'btn btn-sm' : 'btn btn-sm btn-primary';
     action = `<button class="${cls}" data-act="toggle-enabled">${escapeHtml(label)}</button>`;
+  } else if (e._custom) {
+    // Custom server, not connected: retry probes the stored transport
+    // (`connectors.refresh`), never OAuth. Disconnect stays available so a
+    // dead entry can be removed.
+    action = `
+      <button class="btn btn-sm btn-primary" data-act="retry-custom">${escapeHtml(t('connectors.action.retry'))}</button>
+      <button class="btn btn-sm btn-danger" data-act="disconnect">${escapeHtml(t('connectors.action.disconnect'))}</button>`;
   } else if (_isReconnectableError(e, instance)) {
     action = `<button class="btn btn-sm btn-primary" data-act="connect">${escapeHtml(t('connectors.action.connect'))}</button>`;
   } else if (errored) {
@@ -352,6 +410,7 @@ function _renderCatalogCard(entry, instance) {
       else if (act === 'disconnect') _quickDisconnect(e, instance);
       else if (act === 'menu') _openCardMenu(btn, e, instance);
       else if (act === 'toggle-enabled') _toggleConnectorEnabled(e, instance, !enabledFlag);
+      else if (act === 'retry-custom') _retryCustomConnect(e);
     });
   });
   return card;
@@ -413,18 +472,40 @@ function _openCardMenu(anchorBtn, entry, instance) {
 }
 
 async function _authorizeGoogleSheetsFiles() {
+  const startedAt = performance.now();
+  _connectorsTrackClick('connector_authorize_files', { connector_id: 'gsheets' });
   try {
     const res = await window.orkas.invoke('connectors.google_sheets_authorize_files', {});
     if (!res || !res.ok) {
+      _connectorsTrackEvent('connector_authorize_files_result', {
+        connector_id: 'gsheets',
+        result: 'failure',
+        duration_ms: Math.round(performance.now() - startedAt),
+      });
       uiAlert((res && res.error) || t('connectors.errors.authorize_sheet_failed'));
       return;
     }
     const count = Array.isArray(res.picked_file_ids) ? res.picked_file_ids.length : 0;
+    _connectorsTrackEvent('connector_authorize_files_result', {
+      connector_id: 'gsheets',
+      result: 'success',
+      file_count: count,
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
     await uiAlert(count > 0
       ? t('connectors.toast.sheet_selected', { count })
       : t('connectors.toast.sheet_authorized'));
     await loadConnectors();
   } catch (err) {
+    _connectorsTrackEvent('connector_authorize_files_result', {
+      connector_id: 'gsheets',
+      result: 'failure',
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
+    _connectorsTrackError('connector_authorize_files', {
+      connector_id: 'gsheets',
+      error_type: _connectorTrackErrorType(err),
+    });
     uiAlert((err && err.message) || t('connectors.errors.authorize_sheet_failed'));
   }
 }
@@ -434,16 +515,42 @@ async function _toggleConnectorEnabled(entry, instance, nextEnabled) {
   const ids = Array.isArray(entry.bundle_member_ids) && entry.bundle_member_ids.length
     ? entry.bundle_member_ids.slice()
     : [(instance && instance.id) || entry.id];
+  const payload = {
+    ..._connectorTrackPayload(entry, instance),
+    enabled: !!nextEnabled,
+    instance_count: ids.length,
+  };
+  const startedAt = performance.now();
+  _connectorsTrackClick('connector_enable_toggle', payload);
   try {
     for (const id of ids) {
       const res = await window.orkas.invoke('connectors.set_enabled', { id, enabled: nextEnabled });
       if (!res || !res.ok) {
+        _connectorsTrackEvent('connector_enable_result', {
+          ...payload,
+          result: 'failure',
+          duration_ms: Math.round(performance.now() - startedAt),
+        });
         uiAlert((res && res.error) || t('component.toggle_failed'));
         return;
       }
     }
+    _connectorsTrackEvent('connector_enable_result', {
+      ...payload,
+      result: 'success',
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
     await loadConnectors();
   } catch (err) {
+    _connectorsTrackEvent('connector_enable_result', {
+      ...payload,
+      result: 'failure',
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
+    _connectorsTrackError('connector_enable', {
+      ...payload,
+      error_type: _connectorTrackErrorType(err),
+    });
     uiAlert((err && err.message) || t('component.toggle_failed'));
   }
 }
@@ -454,7 +561,17 @@ function _entryFromInstance(instance) {
     display_name: instance.display_name || instance.id,
     description_zh: '',
     description_en: '',
+    _custom: instance.origin === 'custom',
   };
+}
+
+// One-line server summary for a custom card. Main strips transport secrets and
+// sends only a display summary.
+function _customTransportSummary(instance) {
+  const tr = instance && instance.transport;
+  if (!tr) return '';
+  if (tr.kind === 'streamable-http' || tr.kind === 'stdio') return tr.summary || '';
+  return '';
 }
 
 async function _quickDisconnect(entry, instance) {
@@ -470,16 +587,41 @@ async function _quickDisconnect(entry, instance) {
   const ids = Array.isArray(entry.bundle_member_ids) && entry.bundle_member_ids.length
     ? entry.bundle_member_ids.slice()
     : [(instance && instance.id) || entry.id];
+  const payload = {
+    ..._connectorTrackPayload(entry, instance),
+    instance_count: ids.length,
+  };
+  const startedAt = performance.now();
+  _connectorsTrackClick('connector_disconnect', payload);
   try {
     for (const id of ids) {
       const res = await window.orkas.invoke('connectors.remove', { id });
       if (!res || (!res.ok && !/not found/i.test(res.error || ''))) {
+        _connectorsTrackEvent('connector_disconnect_result', {
+          ...payload,
+          result: 'failure',
+          duration_ms: Math.round(performance.now() - startedAt),
+        });
         uiAlert((res && res.error) || t('connectors.errors.remove_failed'));
         return;
       }
     }
+    _connectorsTrackEvent('connector_disconnect_result', {
+      ...payload,
+      result: 'success',
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
     await loadConnectors();
   } catch (err) {
+    _connectorsTrackEvent('connector_disconnect_result', {
+      ...payload,
+      result: 'failure',
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
+    _connectorsTrackError('connector_disconnect', {
+      ...payload,
+      error_type: _connectorTrackErrorType(err),
+    });
     uiAlert((err && err.message) || t('connectors.errors.remove_failed'));
   }
 }
@@ -489,6 +631,9 @@ async function _runConnect(entry) {
     _showConnectorUnsupportedToast();
     return;
   }
+  const payload = _connectorTrackPayload(entry, null);
+  const startedAt = performance.now();
+  _connectorsTrackClick('connector_connect', payload);
   // Mark "connecting" so the card's foot button shows a spinner. The button stays clickable —
   // re-clicks supersede the prior pending flow on the main side (oauth.ts::startOAuth calls
   // _cancelPending before installing a new listener), and the prior _runConnect's await
@@ -501,10 +646,21 @@ async function _runConnect(entry) {
   try {
     const res = await window.orkas.invoke('connectors.start_oauth', { catalog_id: entry.id });
     if (res && res.ok && res.instance) {
+      _connectorsTrackEvent('connector_connect_result', {
+        ...payload,
+        result: 'success',
+        duration_ms: Math.round(performance.now() - startedAt),
+      });
       // Refresh state + re-render the grid. The new instance shows up in the connected group.
       await loadConnectors();
     } else if (res && !res.ok) {
       const msg = (res.error || '').toLowerCase();
+      const softCancel = msg.includes('superseded') || msg.includes('cancelled');
+      _connectorsTrackEvent('connector_connect_result', {
+        ...payload,
+        result: softCancel ? 'cancelled' : 'failure',
+        duration_ms: Math.round(performance.now() - startedAt),
+      });
       if (!msg.includes('superseded') && !msg.includes('cancelled')) {
         uiAlert(_formatConnectError(res));
       }
@@ -512,6 +668,18 @@ async function _runConnect(entry) {
     }
   } catch (err) {
     const msg = ((err && err.message) || '').toLowerCase();
+    const softCancel = msg.includes('superseded') || msg.includes('cancelled');
+    _connectorsTrackEvent('connector_connect_result', {
+      ...payload,
+      result: softCancel ? 'cancelled' : 'failure',
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
+    if (!softCancel) {
+      _connectorsTrackError('connector_connect', {
+        ...payload,
+        error_type: _connectorTrackErrorType(err),
+      });
+    }
     if (!msg.includes('superseded') && !msg.includes('cancelled')) {
       uiAlert(_formatConnectError(err));
     }
@@ -523,6 +691,212 @@ async function _runConnect(entry) {
     // clears even when the connect flow exits without a reload.
     _renderConnectorsGrid();
   }
+}
+
+async function _retryCustomConnect(entry) {
+  const payload = _connectorTrackPayload(entry, null);
+  const startedAt = performance.now();
+  _connectorsTrackClick('connector_custom_retry', payload);
+  _connectorsState.connecting.add(entry.id);
+  _renderConnectorsGrid();
+  try {
+    const res = await window.orkas.invoke('connectors.refresh', { id: entry.id });
+    if (res && !res.ok) {
+      _connectorsTrackEvent('connector_custom_retry_result', {
+        ...payload,
+        result: 'failure',
+        duration_ms: Math.round(performance.now() - startedAt),
+      });
+      uiAlert(_formatConnectorStatusError(res.error || ''));
+    } else {
+      _connectorsTrackEvent('connector_custom_retry_result', {
+        ...payload,
+        result: 'success',
+        duration_ms: Math.round(performance.now() - startedAt),
+      });
+    }
+  } catch (err) {
+    _connectorsTrackEvent('connector_custom_retry_result', {
+      ...payload,
+      result: 'failure',
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
+    _connectorsTrackError('connector_custom_retry', {
+      ...payload,
+      error_type: _connectorTrackErrorType(err),
+    });
+    uiAlert(_formatConnectorStatusError((err && err.message) || ''));
+  } finally {
+    _connectorsState.connecting.delete(entry.id);
+    await loadConnectors();
+  }
+}
+
+// "KEY: value" per line → object. Returns null on a malformed line so the
+// dialog can refuse submission instead of silently dropping the line.
+function _parseHeaderLines(text) {
+  const out = {};
+  for (const rawLine of String(text || '').split('\n')) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const idx = line.indexOf(':');
+    if (idx <= 0) return null;
+    out[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+  }
+  return out;
+}
+
+// "KEY=value" per line → object. Same null-on-malformed contract.
+function _parseEnvLines(text) {
+  const out = {};
+  for (const rawLine of String(text || '').split('\n')) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const idx = line.indexOf('=');
+    if (idx <= 0) return null;
+    out[line.slice(0, idx).trim()] = line.slice(idx + 1).trim();
+  }
+  return out;
+}
+
+// Add-custom-MCP-server dialog. The form IS the consent surface (plan §C3):
+// for stdio the user types the exact command that will run on their machine,
+// and the warning line states that plainly. Submission funnels into the
+// single validated IPC route `connectors.add_custom`.
+function _openAddCustomDialog() {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay ui-dialog-overlay open';
+  overlay.innerHTML = `
+    <div class="modal ui-dialog connector-custom-dialog" role="dialog" aria-modal="true">
+      <div class="ui-dialog-title">${escapeHtml(t('connectors.custom.title'))}</div>
+      <div class="form-row">
+        <label>${escapeHtml(t('connectors.custom.name_label'))}</label>
+        <input type="text" data-f="name" maxlength="64" />
+      </div>
+      <div class="form-row">
+        <label>${escapeHtml(t('connectors.custom.kind_label'))}</label>
+        <select data-f="kind">
+          <option value="streamable-http">${escapeHtml(t('connectors.custom.kind_http'))}</option>
+          <option value="stdio">${escapeHtml(t('connectors.custom.kind_stdio'))}</option>
+        </select>
+      </div>
+      <div data-sec="http">
+        <div class="form-row">
+          <label>${escapeHtml(t('connectors.custom.url_label'))}</label>
+          <input type="text" data-f="url" placeholder="https://example.com/mcp" />
+        </div>
+        <div class="form-row">
+          <label>${escapeHtml(t('connectors.custom.headers_label'))}</label>
+          <textarea data-f="headers" rows="2" placeholder="Authorization: Bearer ..."></textarea>
+        </div>
+      </div>
+      <div data-sec="stdio" style="display:none">
+        <div class="form-row">
+          <label>${escapeHtml(t('connectors.custom.command_label'))}</label>
+          <input type="text" data-f="command" placeholder="npx" />
+        </div>
+        <div class="form-row">
+          <label>${escapeHtml(t('connectors.custom.args_label'))}</label>
+          <textarea data-f="args" rows="2" placeholder="-y&#10;@scope/mcp-server"></textarea>
+        </div>
+        <div class="form-row">
+          <label>${escapeHtml(t('connectors.custom.env_label'))}</label>
+          <textarea data-f="env" rows="2" placeholder="API_KEY=..."></textarea>
+        </div>
+        <div class="muted connector-custom-warning">${escapeHtml(t('connectors.custom.stdio_warning'))}</div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" data-act="cancel">${escapeHtml(t('common.cancel'))}</button>
+        <button class="btn btn-primary" data-act="ok">${escapeHtml(t('connectors.custom.submit'))}</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  const f = (name) => overlay.querySelector(`[data-f="${name}"]`);
+  const secHttp = overlay.querySelector('[data-sec="http"]');
+  const secStdio = overlay.querySelector('[data-sec="stdio"]');
+  f('kind').addEventListener('change', () => {
+    const stdio = f('kind').value === 'stdio';
+    secHttp.style.display = stdio ? 'none' : '';
+    secStdio.style.display = stdio ? '' : 'none';
+  });
+
+  const close = () => { document.removeEventListener('keydown', onKey, true); overlay.remove(); };
+  const onKey = (ev) => {
+    if (ev.isComposing || ev.keyCode === 229) return;
+    if (ev.key === 'Escape') close();
+  };
+  document.addEventListener('keydown', onKey, true);
+  overlay.querySelector('[data-act="cancel"]').addEventListener('click', close);
+
+  const okBtn = overlay.querySelector('[data-act="ok"]');
+  okBtn.addEventListener('click', async () => {
+    const kind = f('kind').value;
+    let transport;
+    if (kind === 'stdio') {
+      const env = _parseEnvLines(f('env').value);
+      if (env === null) { uiAlert(t('connectors.custom.bad_env')); return; }
+      transport = {
+        kind: 'stdio',
+        command: f('command').value.trim(),
+        args: f('args').value.split('\n').map((s) => s.trim()).filter(Boolean),
+        env,
+      };
+    } else {
+      const headers = _parseHeaderLines(f('headers').value);
+      if (headers === null) { uiAlert(t('connectors.custom.bad_headers')); return; }
+      transport = { kind: 'streamable-http', url: f('url').value.trim(), headers };
+    }
+    okBtn.disabled = true;
+    okBtn.textContent = t('connectors.action.connecting');
+    const payload = { transport_kind: kind };
+    const startedAt = performance.now();
+    _connectorsTrackClick('connector_custom_add', payload);
+    try {
+      const res = await window.orkas.invoke('connectors.add_custom', {
+        display_name: f('name').value.trim(),
+        transport,
+      });
+      if (res && res.ok && res.instance) {
+        _connectorsTrackEvent('connector_custom_add_result', {
+          ...payload,
+          result: 'success',
+          duration_ms: Math.round(performance.now() - startedAt),
+        });
+        close();
+        const st = res.instance.status || {};
+        if (st.kind === 'connected') {
+          if (typeof uiToast === 'function') uiToast(t('connectors.custom.added'), { variant: 'success' });
+        } else if (st.kind === 'error') {
+          uiAlert(`${t('connectors.status.error')}: ${_formatConnectorStatusError(st.message)}`);
+        }
+        await loadConnectors();
+      } else {
+        _connectorsTrackEvent('connector_custom_add_result', {
+          ...payload,
+          result: 'failure',
+          duration_ms: Math.round(performance.now() - startedAt),
+        });
+        uiAlert((res && res.error) || t('connectors.errors.connect_failed'));
+      }
+    } catch (err) {
+      _connectorsTrackEvent('connector_custom_add_result', {
+        ...payload,
+        result: 'failure',
+        duration_ms: Math.round(performance.now() - startedAt),
+      });
+      _connectorsTrackError('connector_custom_add', {
+        ...payload,
+        error_type: _connectorTrackErrorType(err),
+      });
+      uiAlert((err && err.message) || t('connectors.errors.connect_failed'));
+    } finally {
+      okBtn.disabled = false;
+      okBtn.textContent = t('connectors.custom.submit');
+    }
+  });
+  setTimeout(() => f('name').focus(), 0);
 }
 
 function _formatConnectError(errLike) {
@@ -550,7 +924,7 @@ window.addEventListener('i18n-change', () => {
   if (currentView === 'connectors') _renderConnectorsGrid();
 });
 
-// Refresh the grid when an account changed or connector:connected push arrives. Right now the
+// Refresh the grid when a connector or client-config push arrives. Right now the
 // only consumer is the connectors panel itself, but registering at module load lets future
 // background events (token expiry notifications etc.) refresh the panel automatically.
 if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
@@ -561,5 +935,48 @@ if (window.orkas && typeof window.orkas.onPushEvent === 'function') {
     window.orkas.onPushEvent('client-config:changed', () => {
       if (currentView === 'connectors') loadConnectors();
     });
+    // Commander-driven custom MCP install: the agent calls add_custom_connector,
+    // main pushes the confirm request, the user must approve here before it
+    // installs (the stdio command / http url is shown verbatim — the consent
+    // surface). Queue FIFO so concurrent installs don't stack dialogs.
+    window.orkas.onPushEvent('connectors:install-confirm', (info) => {
+      if (!info || typeof info.request_id !== 'string') return;
+      _connectorInstallQueue.push(info);
+      _drainConnectorInstallQueue();
+    });
   } catch (_err) { /* event not supported; harmless */ }
+}
+
+const _connectorInstallQueue = [];
+let _connectorInstallDialogOpen = false;
+
+async function _drainConnectorInstallQueue() {
+  if (_connectorInstallDialogOpen) return;
+  _connectorInstallDialogOpen = true;
+  try {
+    while (_connectorInstallQueue.length) {
+      const info = _connectorInstallQueue.shift();
+      const warn = info.kind === 'stdio' ? `\n\n${t('connectors.install_confirm.stdio_warning')}` : '';
+      const ok = await uiConfirm({
+        message: `${t('connectors.install_confirm.message', { name: info.display_name })}\n\n${info.summary}${warn}`,
+        okLabel: t('connectors.install_confirm.approve'),
+        cancelLabel: t('connectors.install_confirm.decline'),
+      });
+      try {
+        _connectorsTrackClick('connector_install_confirm_response', {
+          approved: !!ok,
+          transport_kind: info.kind || '',
+        });
+        await window.orkas.invoke('connectors.install_confirm_response', {
+          request_id: info.request_id,
+          approved: !!ok,
+        });
+        if (ok && currentView === 'connectors') loadConnectors();
+      } catch (err) {
+        _connectorsLog.warn('install confirm response failed', { error: err && err.message });
+      }
+    }
+  } finally {
+    _connectorInstallDialogOpen = false;
+  }
 }

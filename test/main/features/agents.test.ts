@@ -33,7 +33,7 @@ beforeEach(async () => {
 afterEach(() => {
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   streamImpl.current = null;
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
 });
 
 async function loadAgents() {
@@ -703,8 +703,7 @@ describe('agents › extractAgentFieldBlocks › inputs', () => {
   });
 });
 
-// hashTree / syncBuiltinAgents removed: there is no globally-shared `data/builtin/`
-// tree anymore. Platform agents now arrive via marketplace install and live at
+// hashTree / syncBuiltinAgents removed. Platform agents now arrive via marketplace install and live at
 // `<uid>/local/marketplace/agents/<id>/` per machine — see features/marketplace_*.ts.
 
 describe('agents › createCustomAgent', () => {
@@ -716,6 +715,26 @@ describe('agents › createCustomAgent', () => {
     expect(agent?.source).toBe('custom');
     const file = path.join(customAgentsDir(), agent?.agent_id || '', 'agent.json');
     expect(fs.existsSync(file)).toBe(true);
+  });
+
+  it('routes a single custom description to the current UI language slot', async () => {
+    const { setLanguage } = await import('../../../src/main/features/config');
+    setLanguage('zh');
+    const a = await loadAgents();
+
+    const agent = await a.createCustomAgent({
+      name: '中文Agent',
+      description: 'plain English while UI is zh',
+      category: 'general',
+    });
+
+    expect(agent?.description_zh).toBe('plain English while UI is zh');
+    expect(agent?.description_en).toBe('');
+    const file = path.join(customAgentsDir(), agent?.agent_id || '', 'agent.json');
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    expect(raw.description_zh).toBe('plain English while UI is zh');
+    expect(raw.description_en).toBe('');
+    expect(raw).not.toHaveProperty('description');
   });
 
   it('defaults empty name to the localized no-space fallback', async () => {
@@ -891,12 +910,26 @@ describe('agents › updateCustomAgent', () => {
   it('updates only the supplied fields', async () => {
     writeCustomAgent('abc', { name: 'Old', description: 'oldDesc', workflow: 'wf' });
     const a = await loadAgents();
-    // Legacy `description` updates route through Chinese-character heuristic.
-    // English string ("newDesc") goes to `description_en`.
     const updated = await a.updateCustomAgent('abc', { description: 'newDesc' });
     expect(updated?.name).toBe('Old');  // preserved
     expect(updated?.description_en).toBe('newDesc');
     expect(updated?.workflow).toBe('wf');  // preserved
+  });
+
+  it('routes a single description update by current UI language, preserving historical other-language text', async () => {
+    const { setLanguage } = await import('../../../src/main/features/config');
+    setLanguage('zh');
+    writeCustomAgent('abc', { name: 'Old', description: 'old English', workflow: 'wf' });
+    const a = await loadAgents();
+
+    const updated = await a.updateCustomAgent('abc', { description: 'plain English while UI is zh' });
+
+    expect(updated?.description_zh).toBe('plain English while UI is zh');
+    expect(updated?.description_en).toBe('old English');
+    const raw = JSON.parse(fs.readFileSync(path.join(customAgentsDir(), 'abc', 'agent.json'), 'utf8'));
+    expect(raw.description_zh).toBe('plain English while UI is zh');
+    expect(raw.description_en).toBe('old English');
+    expect(raw).not.toHaveProperty('description');
   });
 
   it('normalizes workflow skill references on update', async () => {
@@ -1194,8 +1227,8 @@ describe('agents › appendAgentSkill', () => {
 
 describe('agents › streamSendToAgentEditChat synthesized progress', () => {
   beforeEach(async () => {
-    const { setCurrentLang } = await import('../../../src/main/i18n');
-    setCurrentLang('zh');
+    const { setLanguage } = await import('../../../src/main/features/config');
+    setLanguage('zh');
   });
 
   it('emits progress events for each field block extracted from the final text', async () => {
@@ -1258,6 +1291,29 @@ describe('agents › streamSendToAgentEditChat synthesized progress', () => {
     }
     // Only the final event should fire — no progress noise.
     expect(events.filter((e) => e.type === 'progress')).toHaveLength(0);
+  });
+
+  it('uses modelText for the model while persisting short visible content', async () => {
+    let seenOpts: any = null;
+    streamImpl.current = async function* (opts: any) {
+      seenOpts = opts;
+      yield { type: 'final', text: 'done' };
+    };
+    writeCustomAgent('abc', { name: 'N' });
+
+    const a = await loadAgents();
+    for await (const _ev of a.streamSendToAgentEditChat('u1', 'abc', '帮我完善这个智能体', {
+      modelText: '请基于名称和简介完善智能体工作流。',
+    })) {
+      // drain
+    }
+
+    expect(seenOpts.message).toBe('请基于名称和简介完善智能体工作流。');
+    const chatPath = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'agent', 'abc', 'chat.jsonl');
+    const first = JSON.parse(fs.readFileSync(chatPath, 'utf8').trim().split('\n')[0]);
+    expect(first.role).toBe('user');
+    expect(first.content).toBe('帮我完善这个智能体');
+    expect(first.model_text).toBe('请基于名称和简介完善智能体工作流。');
   });
 
   it('passes edit-chat attachments into the model prompt and history', async () => {
@@ -1398,24 +1454,32 @@ describe('agents › list cache invalidation', () => {
     expect(list[0].name).toBe('V2');
   });
 
-  it('keeps marketplace agent specs read-only in OrkasOpen', async () => {
-    const dir = path.join(builtinAgentsDir(), 'platform-agent');
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'agent.json'), JSON.stringify({
-      agent_id: 'platform-agent',
-      name: 'OldPlatformAgent',
-      description: '',
-      workflow: '',
-    }));
+  it('updates marketplace agent spec in dev', async () => {
+    const prevDevtools = process.env.ORKAS_DEVTOOLS;
+    process.env.ORKAS_DEVTOOLS = '1';
+    try {
+      const dir = path.join(builtinAgentsDir(), 'platform-agent');
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'agent.json'), JSON.stringify({
+        agent_id: 'platform-agent',
+        name: 'OldPlatformAgent',
+        description: '',
+        workflow: '',
+      }));
 
-    const a = await loadAgents();
-    const updated = await a.updateAgentSpec('platform-agent', { name: 'RenamedPlatformAgent' });
+      const dev = await import('../../../src/main/features/agents_dev');
+      const updated = await dev.updateBuiltinAgentSpec('platform-agent', { name: 'RenamedPlatformAgent' });
 
-    expect(updated).toBeNull();
-    expect(JSON.parse(fs.readFileSync(path.join(dir, 'agent.json'), 'utf8')).name)
-      .toBe('OldPlatformAgent');
-    expect((await a.listAgents()).find((x) => x.agent_id === 'platform-agent')?.name)
-      .toBe('OldPlatformAgent');
+      expect(updated?.name).toBe('RenamedPlatformAgent');
+      expect(JSON.parse(fs.readFileSync(path.join(dir, 'agent.json'), 'utf8')).name)
+        .toBe('RenamedPlatformAgent');
+      const a = await loadAgents();
+      expect((await a.listAgents()).find((x) => x.agent_id === 'platform-agent')?.name)
+        .toBe('RenamedPlatformAgent');
+    } finally {
+      if (prevDevtools === undefined) delete process.env.ORKAS_DEVTOOLS;
+      else process.env.ORKAS_DEVTOOLS = prevDevtools;
+    }
   });
 
   it('cache-only invalidator picks up marketplace file rewrites', async () => {
@@ -1475,6 +1539,6 @@ describe('agents › list cache invalidation', () => {
   });
 });
 
-// (The legacy marketplace-sentinel / data/builtin sync tests are gone. Marketplace
-// installs now live at `<uid>/local/marketplace/agents/<id>/` and are reconciled from
+// (The legacy marketplace-sentinel sync tests are gone. Marketplace installs now live at
+// `<uid>/local/marketplace/agents/<id>/` and are reconciled from
 // the cloud-synced `installs.json` manifest — see features/marketplace_*.ts.)

@@ -142,6 +142,26 @@ function _tveRender(state) {
   else _tveRenderView(state);
 }
 
+function _tveTrack() {}
+
+function _tveRenderView(state) {
+  state.mode = 'view';
+  state.bodyEl.innerHTML = `<pre class="chat-file-viewer-text">${escapeHtml(state.content)}</pre>`;
+  const actions = [];
+  if (state.caps.edit) actions.push(_tveActionButton(state, 'edit', 'contexts.viewer.edit', 'edit-pencil'));
+  state.actionsEl.innerHTML = actions.join('');
+  state.actionsEl.querySelector('[data-tve-action="edit"]')?.addEventListener('click', () => { _tveTrack('text_editor_edit', state); _tveEnterEdit(state); });
+  _tveEmitDirty(state);
+}
+
+function _tveEnterEdit(state) {
+  if (!state.caps.edit) return;
+  state.mode = 'edit';
+  state.draft = state.content;
+  _tveRenderEditor(state);
+  _tveEmitDirty(state);
+}
+
 function _tveRenderEditor(state) {
   // Tab key in the textarea inserts \t instead of moving focus — for code /
   // config files this matters (the alternative — sending tab to focus the
@@ -153,8 +173,8 @@ function _tveRenderEditor(state) {
     actions.push(_tveActionButton(state, 'cancel', 'contexts.viewer.cancel', 'x'));
   }
   state.actionsEl.innerHTML = actions.join('');
-  state.actionsEl.querySelector('[data-tve-action="save"]')?.addEventListener('click', () => _tveSave(state));
-  state.actionsEl.querySelector('[data-tve-action="cancel"]')?.addEventListener('click', () => _tveCancelEdit(state));
+  state.actionsEl.querySelector('[data-tve-action="save"]')?.addEventListener('click', () => { _tveTrack('text_editor_save', state, { chars: (state.draft || '').length }); _tveSave(state); });
+  state.actionsEl.querySelector('[data-tve-action="cancel"]')?.addEventListener('click', () => { _tveTrack('text_editor_cancel', state, { dirty: state.draft !== state.content }); _tveCancelEdit(state); });
 
   const ta = state.bodyEl.querySelector('[data-tve-textarea]');
   if (ta) {

@@ -1,5 +1,5 @@
 // ─── Marketplace (full-page panel: grid + detail sub-views) ───
-// Browse + install approved agents / skills from the Orkas Server. Entered via the "More"
+// Browse + install official agents / skills from the Orkas Server. Entered via the "More"
 // button on the agents / skills tabs (#agents-more-btn / #skills-more-btn — wired in state.js).
 //
 // Two sub-views inside panel-marketplace (mirrors the agents / skills panel shape):
@@ -14,12 +14,17 @@
 // Per-card Install button (in detail) materializes the cached item into the local
 // platform-install tree (<uid>/local/marketplace/{agents,skills}/<id>/).
 //
+// Dev-only upload (`openMarketplaceUpload`) is exposed for agents.js / skills.js (⋯ menu +
+// detail-page actions). Category is NO LONGER asked — it lives in the spec now (agent.json
+// `category` field / SKILL.md `category` frontmatter).
+
 let _mpState = null;
 let _mpBound = false;
 let _mpReturnView = 'agents';
 
 // Renderer-side in-memory cache of the category registry. Main also caches in-memory + on disk
-// + boots with primeCategoryCache so the very first openMarketplace finds main's cache hot;
+// + boots with a local-only primeCategoryCache so the first openMarketplace avoids startup
+// network pressure while still finding main's cache hot;
 // keeping a copy here too avoids paying the IPC roundtrip when the panel reopens within the
 // same session. Cleared on i18n-change is unnecessary — the API surface doesn't include the
 // translated labels (locale picking happens at render time in _mpCategoryLabel).
@@ -161,7 +166,15 @@ function _mpPersistInstalled() {
 // Latest reconcile snapshot pushed from main (boot-time marketplace install reconcile).
 // Bootstrap subscription runs at module load — see _mpInitReconcileWatch() — so a hot reconcile
 // transitioning to `running` reaches the panel even if the user opens it mid-fetch.
-let _mpReconcileStatus = { state: 'idle', total: 0, pulled: 0 };
+let _mpReconcileStatus = {
+  state: 'idle',
+  total: 0,
+  total_agents: 0,
+  total_skills: 0,
+  pulled: 0,
+  pulled_agents: 0,
+  pulled_skills: 0,
+};
 
 // Paginated listings cache (cross-process via main `marketplace.{get,set}ListingsCache`).
 // Key = `${kind}|${category||''}|${status||''}|${q||''}`. Value:
@@ -214,8 +227,8 @@ function openMarketplace(initialTab = 'agent', opts = {}) {
   const panel = document.getElementById('panel-marketplace');
   if (!panel) return;
 
-  // Kick off the reconcile watcher on first marketplace open (rather than at script load) so
-  // we don't fire IPC during early renderer init. Idempotent on later calls.
+  // Idempotent; normally already started at module load so the Agents/Skills pages can show
+  // boot-time default-install progress before the user opens Marketplace.
   _mpInitReconcileWatch();
 
   _mpReturnView = (typeof currentView === 'string' && currentView !== 'marketplace')
@@ -223,8 +236,20 @@ function openMarketplace(initialTab = 'agent', opts = {}) {
 
   _mpState = {
     view: 'grid',
-    tab: initialTab === 'skill' ? 'skill' : 'agent',
+    tab: (initialTab === 'skill' || initialTab === 'oss') ? initialTab : 'agent',
     category: '',
+    // Open-source projects专区 (curated, config-as-code; isolated from the
+    // agent/skill SWR path — see _mpLoadOss / _mpRenderOss).
+    ossProjects: [],
+    ossCategories: [],
+    ossInstalled: new Set(),
+    ossCategory: '',
+    ossQ: '',
+    ossLoadKey: '',
+    ossLoaded: false,
+    ossLoading: false,
+    ossError: '',
+    ossSearchBusy: false,
     status: '',
     q: '',
     agents: [],
@@ -262,7 +287,6 @@ function openMarketplace(initialTab = 'agent', opts = {}) {
 
   if (!_mpBound) {
     _mpBindPanel(panel);
-    window.addEventListener('i18n-change', _mpOnI18n);
     document.addEventListener('keydown', _mpKey, true);
     _mpBound = true;
   }
@@ -289,6 +313,7 @@ function openMarketplace(initialTab = 'agent', opts = {}) {
   }
 
   _mpLoadAll();
+  if (_mpState.tab === 'oss') _mpLoadOss();
 }
 
 function closeMarketplace() {
@@ -296,7 +321,10 @@ function closeMarketplace() {
   if (typeof setView === 'function') setView(_mpReturnView || 'agents');
 }
 
-function _mpOnI18n() { if (isMarketplaceOpen()) _mpRender(); }
+function _mpOnI18n() {
+  if (isMarketplaceOpen()) _mpRender();
+  _mpUpdateReconcileBanner();
+}
 
 function _mpKey(e) {
   if (e.key !== 'Escape' || !isMarketplaceOpen()) return;
@@ -322,63 +350,86 @@ function _mpShowDetailView() {
   if (_mpState) _mpState.view = 'detail';
 }
 
-// Initialize on module load: snapshot current state via IPC, then subscribe to push-events.
-// Order matters — if we subscribed first the snapshot could land before the push handler is
-// attached and we'd miss in-flight progress. Idempotent: only the first call performs setup.
+// Initialize on module load so Agents/Skills pages can show boot-time default-install progress
+// without requiring the Marketplace panel to be opened first. Subscribe before taking the
+// snapshot: the snapshot returns the current main-process state, and the push handler then keeps
+// it live.
 let _mpReconcileWatchStarted = false;
+let _mpReconcileWatchStarting = false;
+let _mpReconcileLastState = _mpReconcileStatus.state;
+
 async function _mpInitReconcileWatch() {
-  if (_mpReconcileWatchStarted) return;
-  _mpReconcileWatchStarted = true;
+  if (_mpReconcileWatchStarted || _mpReconcileWatchStarting) return;
+  if (!window.orkas || typeof window.orkas.invoke !== 'function' || typeof window.orkas.onPushEvent !== 'function') {
+    return;
+  }
+  _mpReconcileWatchStarting = true;
+  try {
+    window.orkas.onPushEvent('marketplace:reconcile-status', (status) => {
+      _mpApplyReconcileStatus(status);
+    });
+    _mpReconcileWatchStarted = true;
+  } catch {
+    _mpReconcileWatchStarting = false;
+    return;
+  }
   try {
     const initial = await window.orkas.invoke('marketplace.reconcileStatus');
-    if (initial) _mpReconcileStatus = initial;
+    _mpApplyReconcileStatus(initial);
   } catch { /* main not ready yet — push event will fill us in */ }
-  try {
-    let lastState = _mpReconcileStatus.state;
-    window.orkas.onPushEvent('marketplace:reconcile-status', (status) => {
-      if (!status) return;
-      const prevState = lastState;
-      _mpReconcileStatus = status;
-      lastState = status.state;
-      // Auto-hide a finished banner after 3s so a successful reconcile doesn't linger.
-      if (status.state === 'done') {
-        setTimeout(() => {
-          if (_mpReconcileStatus === status) {
-            _mpReconcileStatus = { ...status, state: 'idle' };
-            _mpUpdateReconcileBanner();
-          }
-        }, 3000);
+  _mpReconcileWatchStarting = false;
+}
+
+function _mpApplyReconcileStatus(status) {
+  if (!status) return;
+  const prevState = _mpReconcileLastState;
+  _mpReconcileStatus = status;
+  _mpReconcileLastState = status.state;
+  // Auto-hide a finished banner after 3s so a successful reconcile doesn't linger.
+  if (status.state === 'done') {
+    setTimeout(() => {
+      if (_mpReconcileStatus === status) {
+        _mpReconcileStatus = { ...status, state: 'idle' };
+        _mpUpdateReconcileBanner();
       }
-      _mpUpdateReconcileBanner();
-      // Reconcile just pulled new content into install dirs. Refresh the agents / skills /
-      // marketplace-installed-state caches so the new items appear without the user having to
-      // switch tabs. Force re-fetch (loadAgents(true) / loadSkills(true)) bypasses the renderer
-      // module-level lists cache; the marketplace listed-state hydrates from those.
-      if (status.state === 'done' && prevState === 'running' && status.pulled > 0) {
-        Promise.resolve().then(async () => {
-          try {
-            if (typeof refreshAgentsAfterMarketplaceReconcile === 'function') {
-              await refreshAgentsAfterMarketplaceReconcile();
-            } else if (typeof loadAgents === 'function') {
-              await loadAgents(true);
-            }
-          } catch { /* ignore */ }
-          try {
-            if (typeof refreshSkillsAfterMarketplaceReconcile === 'function') {
-              await refreshSkillsAfterMarketplaceReconcile();
-            } else if (typeof loadSkills === 'function') {
-              await loadSkills(true);
-            }
-          } catch { /* ignore */ }
-          // If marketplace panel is open right now, also re-run the install-state hydration
-          // so card buttons flip from Install to Installed without a tab switch.
-          if (isMarketplaceOpen()) {
-            try { await _mpLoadAll(); } catch { /* ignore */ }
-          }
-        }).catch(() => { /* ignore */ });
+    }, 3000);
+  }
+  _mpUpdateReconcileBanner();
+  // Reconcile just pulled new content into install dirs. Refresh the agents / skills /
+  // marketplace-installed-state caches so the new items appear without the user having to
+  // switch tabs. Force re-fetch (loadAgents(true) / loadSkills(true)) bypasses the renderer
+  // module-level lists cache; the marketplace listed-state hydrates from those.
+  if (status.state === 'done' && prevState === 'running' && status.pulled > 0) {
+    Promise.resolve().then(async () => {
+      try {
+        if (typeof refreshAgentsAfterMarketplaceReconcile === 'function') {
+          await refreshAgentsAfterMarketplaceReconcile();
+        } else if (typeof loadAgents === 'function') {
+          await loadAgents(true);
+        }
+      } catch { /* ignore */ }
+      try {
+        if (typeof refreshSkillsAfterMarketplaceReconcile === 'function') {
+          await refreshSkillsAfterMarketplaceReconcile();
+        } else if (typeof loadSkills === 'function') {
+          await loadSkills(true);
+        }
+      } catch { /* ignore */ }
+      // If marketplace panel is open right now, also re-run the install-state hydration
+      // so card buttons flip from Install to Installed without a tab switch.
+      if (isMarketplaceOpen()) {
+        try { await _mpLoadAll(); } catch { /* ignore */ }
       }
-    });
-  } catch { /* push channel not allowed (shouldn't happen) — silently degrade to no banner */ }
+    }).catch(() => { /* ignore */ });
+  }
+}
+
+function _mpScheduleReconcileWatchInit(attempt = 0) {
+  if (_mpReconcileWatchStarted) return;
+  _mpInitReconcileWatch();
+  if (_mpReconcileWatchStarted) return;
+  if (attempt >= 40) return;
+  setTimeout(() => _mpScheduleReconcileWatchInit(attempt + 1), 250);
 }
 
 // Updates ALL banners with `data-reconcile-banner` (marketplace panel + agents-grid-view +
@@ -389,21 +440,70 @@ function _mpUpdateReconcileBanner() {
   const banners = document.querySelectorAll('[data-reconcile-banner]');
   if (!banners.length) return;
   const s = _mpReconcileStatus;
-  let text = '';
-  let visible = false;
-  if (s.state === 'running') {
-    visible = true;
-    text = t('marketplace.reconcile_running')
-      .replace('{pulled}', String(s.pulled))
-      .replace('{total}', String(s.total));
-  } else if (s.state === 'done' && (s.failed || []).length > 0) {
-    visible = true;
-    text = t('marketplace.reconcile_partial').replace('{failed}', String(s.failed.length));
-  }
   for (const banner of banners) {
+    const kind = banner.dataset.reconcileKind || '';
+    let visible = false;
+    let text = '';
+    if (s.state === 'running') {
+      visible = kind ? _mpReconcileKindTotal(kind) > 0 : true;
+      const key = kind === 'agent'
+        ? (s.phase === 'default_seed' ? 'agents.default_install_empty' : 'agents.default_install_running')
+        : (kind === 'skill'
+          ? (s.phase === 'default_seed' ? 'skills.default_install_empty' : 'skills.default_install_running')
+          : 'marketplace.reconcile_running');
+      text = t(key)
+        .replace('{pulled}', String(kind ? _mpReconcileKindPulled(kind) : s.pulled))
+        .replace('{total}', String(kind ? _mpReconcileKindTotal(kind) : s.total));
+    } else if (s.state === 'done' && (s.failed || []).length > 0) {
+      visible = true;
+      text = t('marketplace.reconcile_partial').replace('{failed}', String(s.failed.length));
+    }
     banner.style.display = visible ? '' : 'none';
     banner.textContent = text;
   }
+  _mpUpdateInstallingEmptyStates();
+}
+
+function _mpSetInstallingEmptyState({ emptyId, gridId, normalKey, installingKey }) {
+  const emptyEl = document.getElementById(emptyId);
+  const gridEl = document.getElementById(gridId);
+  if (!emptyEl || !gridEl) return;
+  const hasRenderedItems = gridEl.children.length > 0;
+  const kind = gridId === 'agents-grid' ? 'agent' : (gridId === 'skills-grid' ? 'skill' : '');
+  const installing = _mpReconcileStatus.state === 'running'
+    && !hasRenderedItems
+    && (!kind || _mpReconcileKindTotal(kind) > 0);
+  emptyEl.textContent = t(installing ? installingKey : normalKey);
+  if (installing) emptyEl.style.display = '';
+}
+
+function _mpReconcileKindTotal(kind) {
+  const key = kind === 'agent' ? 'total_agents' : (kind === 'skill' ? 'total_skills' : 'total');
+  const n = Number(_mpReconcileStatus[key]);
+  if (Number.isFinite(n)) return n;
+  return Number(_mpReconcileStatus.total) || 0;
+}
+
+function _mpReconcileKindPulled(kind) {
+  const key = kind === 'agent' ? 'pulled_agents' : (kind === 'skill' ? 'pulled_skills' : 'pulled');
+  const n = Number(_mpReconcileStatus[key]);
+  if (Number.isFinite(n)) return n;
+  return Number(_mpReconcileStatus.pulled) || 0;
+}
+
+function _mpUpdateInstallingEmptyStates() {
+  _mpSetInstallingEmptyState({
+    emptyId: 'agents-empty',
+    gridId: 'agents-grid',
+    normalKey: 'agents.empty',
+    installingKey: 'agents.default_install_empty',
+  });
+  _mpSetInstallingEmptyState({
+    emptyId: 'skills-empty',
+    gridId: 'skills-grid',
+    normalKey: 'skills.empty',
+    installingKey: 'skills.default_install_empty',
+  });
 }
 
 function _mpBindPanel(panel) {
@@ -431,6 +531,16 @@ function _mpBindPanel(panel) {
       if (!_mpState || _mpState.tab === btn.dataset.mpTab) return;
       _mpState.tab = btn.dataset.mpTab;
       _mpState.category = '';
+      if (_mpState.tab === 'oss') {
+        // Open-source projects专区 — its own render + (cached) fetch, fully
+        // bypassing the agent/skill listings cache machinery.
+        _mpState.ossCategory = '';
+        _mpState.ossQ = '';
+        _mpSyncSearchInputForTab(panel);
+        _mpRender();
+        _mpLoadOss();
+        return;
+      }
       // Re-hydrate from cache for the new (kind, '', q) and re-fetch — same cache-first path
       // as category clicks, so the grid doesn't show the previous tab's rows under "All".
       _mpRefreshListings();
@@ -568,6 +678,7 @@ async function _mpRefreshOpenDetailFromListings() {
 // `skills-grid-view` lights up DURING boot reconcile, not only after the user enters
 // marketplace. Idempotent — `_mpInitReconcileWatch` runs once and a second call no-ops.
 setTimeout(() => { _mpInitReconcileWatch().catch(() => {}); }, 0);
+window.addEventListener('i18n-change', () => { _mpUpdateReconcileBanner(); });
 
 // Public hook: re-pull the SWR network half while the marketplace panel is the active view.
 // Cheap when stale — the cache stays on screen and only the slices whose IPC returns fresh
@@ -671,6 +782,11 @@ async function _mpRefreshListings(opts = {}) {
 function _mpRunSearch() {
   if (!_mpState) return;
   const input = document.getElementById('panel-marketplace')?.querySelector('[data-mp-search]');
+  if (_mpState.tab === 'oss') {
+    _mpState.ossQ = (input?.value || '').trim();
+    _mpLoadOss({ force: true, searchBusy: true });
+    return;
+  }
   _mpState.q = (input?.value || '').trim();
   _mpRefreshListings({ searchBusy: true });
 }
@@ -682,6 +798,13 @@ function _mpClearSearch() {
   const input = document.getElementById('panel-marketplace')?.querySelector('[data-mp-search]');
   if (input) { input.value = ''; input.focus(); }
   _mpRenderSearchClear();
+  if (_mpState.tab === 'oss') {
+    if (_mpState.ossQ) {
+      _mpState.ossQ = '';
+      _mpLoadOss({ force: true, searchBusy: true });
+    }
+    return;
+  }
   if (_mpState.q) {
     _mpState.q = '';
     _mpRefreshListings({ searchBusy: true });
@@ -693,11 +816,19 @@ function _mpClearSearch() {
 function _mpRenderSearchBtn() {
   const btn = document.getElementById('panel-marketplace')?.querySelector('[data-mp-search-btn]');
   if (!btn) return;
-  const busy = !!(_mpState && _mpState.searchBusy);
+  const busy = !!(_mpState && (_mpState.tab === 'oss' ? _mpState.ossSearchBusy : _mpState.searchBusy));
   btn.className = busy ? 'btn btn-sm is-disabled marketplace-search-btn' : 'btn btn-sm btn-primary marketplace-search-btn';
   btn.disabled = busy;
   const label = escapeHtml(t('marketplace.search'));
   btn.innerHTML = busy ? `<span class="marketplace-btn-spinner"></span>${label}` : label;
+}
+
+function _mpSyncSearchInputForTab(panel = document.getElementById('panel-marketplace'), opts = {}) {
+  const input = panel?.querySelector('[data-mp-search]');
+  if (!input || !_mpState) return;
+  if (!opts.force && document.activeElement === input) return;
+  input.value = _mpState.tab === 'oss' ? (_mpState.ossQ || '') : (_mpState.q || '');
+  _mpRenderSearchClear();
 }
 
 // Show the clear (×) button only when the input has text.
@@ -707,6 +838,12 @@ function _mpRenderSearchClear() {
   const clearBtn = panel?.querySelector('[data-mp-search-clear]');
   if (!clearBtn) return;
   clearBtn.hidden = !(input && input.value.length > 0);
+}
+
+function _mpRenderStatusSelect(panel) {
+  const host = panel.querySelector('.marketplace-status-filter');
+  if (host) host.style.display = 'none';
+  if (_mpState) _mpState.status = '';
 }
 
 // Re-point _mpState.agents/skills at the cached rows for the current (kind, category, q).
@@ -758,12 +895,12 @@ function _mpSpreadAllIntoCategoryCaches(kind, rows, q) {
 async function _mpLoadListingsPage(kind, { append, page }) {
   if (!_mpState._loadGen) _mpState._loadGen = { agent: 0, skill: 0 };
   const myGen = ++_mpState._loadGen[kind];
-  const cat = _mpState.category, q = _mpState.q;
-  const key = _mpListingsKey(kind, cat, _mpState.status, q);
+  const cat = _mpState.category, status = _mpState.status, q = _mpState.q;
+  const key = _mpListingsKey(kind, cat, status, q);
   const channel = kind === 'agent' ? 'marketplace.listAgents' : 'marketplace.listSkills';
   try {
     const r = await window.orkas.invoke(channel, {
-      category: cat || null, q: q || null, page, size: MP_LISTINGS_PAGE_SIZE,
+      category: cat || null, status: status || null, q: q || null, page, size: MP_LISTINGS_PAGE_SIZE,
     });
     if (_mpState._loadGen[kind] !== myGen) return;
     const rows = (r && r.list) || [];
@@ -836,13 +973,22 @@ function _mpRender() {
 
   const lang = getLang();
   for (const btn of panel.querySelectorAll('[data-mp-tab]')) {
-    btn.textContent = btn.dataset.mpTab === 'agent' ? t('marketplace.tab_agent') : t('marketplace.tab_skill');
-    btn.classList.toggle('is-active', btn.dataset.mpTab === _mpState.tab);
+    const k = btn.dataset.mpTab;
+    // 'oss' keeps its static markup (label span + NEW badge); only its active
+    // state toggles. agent/skill labels are set here.
+    if (k === 'agent') btn.textContent = t('marketplace.tab_agent');
+    else if (k === 'skill') btn.textContent = t('marketplace.tab_skill');
+    btn.classList.toggle('is-active', k === _mpState.tab);
   }
+  // Hide the agent/skill-only status select on the oss tab via CSS.
+  panel.classList.toggle('mp-oss-mode', _mpState.tab === 'oss');
   const searchEl = panel.querySelector('[data-mp-search]');
   if (searchEl) searchEl.setAttribute('placeholder', t('marketplace.search_ph'));
+  _mpSyncSearchInputForTab(panel);
   _mpRenderSearchBtn();
   _mpRenderSearchClear();
+  if (_mpState.tab === 'oss') { _mpRenderOss(panel, lang); return; }
+  _mpRenderStatusSelect(panel);
 
   const cats = _mpState.categories;
   const chips = [
@@ -917,6 +1063,154 @@ function _mpAttachInfiniteScroll(body) {
     if (entries.some((e) => e.isIntersecting)) _mpLoadMoreCurrentKind();
   }, { root: body, rootMargin: '0px 0px 300px 0px' });
   _mpScrollObserver.observe(sentinel);
+}
+
+// ─── Open-source projects专区 (②) ───
+// Curated catalog fetched via oss.js::loadOssCatalog (keyed SWR cache).
+// Fully isolated from the agent/skill SWR path: own state on _mpState.oss*,
+// own render, Server-side category/search filtering. No install/detail/pagination.
+
+function _mpOssLoadKey() {
+  if (!_mpState) return '';
+  return [
+    _mpState.ossCategory || '',
+    _mpState.ossQ || '',
+    (typeof OSS_MARKETPLACE_PAGE_SIZE === 'number' ? OSS_MARKETPLACE_PAGE_SIZE : 100),
+  ].join('|');
+}
+
+async function _mpLoadOss(opts = {}) {
+  if (!_mpState) return;
+  const loadKey = _mpOssLoadKey();
+  if (_mpState.ossLoaded && _mpState.ossLoadKey === loadKey && !opts.force && !opts.forceState) {
+    if (_mpState.tab === 'oss') _mpRender();
+    return;
+  }
+  const myGen = (_mpState._ossLoadGen || 0) + 1;
+  _mpState._ossLoadGen = myGen;
+  _mpState.ossLoading = !_mpState.ossProjects.length;
+  _mpState.ossError = '';
+  if (opts.searchBusy) _mpState.ossSearchBusy = true;
+  if (_mpState.tab === 'oss') _mpRender();
+  try {
+    // Catalog + locally-installed external packages, in parallel — the latter
+    // decides whether each card shows 接入 (Connect) or 已安装 (Installed).
+    const [data, installed] = await Promise.all([
+      loadOssCatalog({
+        category: _mpState.ossCategory || '',
+        q: _mpState.ossQ || '',
+        size: typeof OSS_MARKETPLACE_PAGE_SIZE === 'number' ? OSS_MARKETPLACE_PAGE_SIZE : 100,
+        force: opts.force === true,
+        revalidate: opts.revalidate !== false,
+      }),
+      loadOssInstalled(),
+    ]);
+    if (!_mpState || _mpState._ossLoadGen !== myGen) return;
+    _mpState.ossProjects = data.projects || [];
+    _mpState.ossCategories = data.categories || [];
+    _mpState.ossInstalled = installed instanceof Set ? installed : new Set();
+    _mpState.ossLoaded = true;
+    _mpState.ossLoadKey = loadKey;
+  } catch (err) {
+    if (!_mpState || _mpState._ossLoadGen !== myGen) return;
+    _mpState.ossError = (err && err.message) || 'load failed';
+  } finally {
+    if (!_mpState || _mpState._ossLoadGen !== myGen) return;
+    _mpState.ossLoading = false;
+    if (opts.searchBusy) _mpState.ossSearchBusy = false;
+    if (_mpState.tab === 'oss') _mpRender();
+  }
+}
+
+function _mpRenderOss(panel, lang) {
+  const catsEl = panel.querySelector('[data-mp-categories]');
+  if (catsEl) catsEl.innerHTML = ''; // chips live inside the body for oss
+  const body = panel.querySelector('[data-mp-body]');
+  if (!body) return;
+
+  const hero = `
+    <div class="mp-oss-hero">
+      <span class="mp-oss-hero-icon">${uiIconHtml('code', 'mp-oss-hero-svg')}</span>
+      <div class="mp-oss-hero-text">
+        <div class="mp-oss-hero-title">${escapeHtml(t('marketplace.oss_hero_title'))}</div>
+        <div class="mp-oss-hero-sub">${escapeHtml(t('marketplace.oss_hero_sub'))}</div>
+      </div>
+    </div>`;
+
+  if (_mpState.ossLoading && !_mpState.ossLoaded) {
+    body.innerHTML = hero + `
+      <div class="marketplace-detail-loading">
+        <div class="marketplace-upload-spinner"></div>
+        <div class="marketplace-detail-loading-text">${escapeHtml(t('marketplace.list_loading'))}</div>
+      </div>`;
+    return;
+  }
+  if (_mpState.ossError) {
+    body.innerHTML = hero + `<div class="empty">${escapeHtml(t('marketplace.load_failed'))}: ${escapeHtml(_mpState.ossError)}</div>`;
+    return;
+  }
+
+  const cats = _mpState.ossCategories || [];
+  const chips = [
+    `<button type="button" class="marketplace-chip${_mpState.ossCategory === '' ? ' is-active' : ''}" data-oss-cat="">${escapeHtml(t('marketplace.all'))}</button>`,
+    ...cats.map((c) => {
+      const label = pickLocalizedName(c, lang) || c.code;
+      const active = _mpState.ossCategory === c.code ? ' is-active' : '';
+      return `<button type="button" class="marketplace-chip${active}" data-oss-cat="${escapeHtml(c.code)}">${escapeHtml(label)}</button>`;
+    }),
+  ].join('');
+
+  const installed = _mpState.ossInstalled instanceof Set ? _mpState.ossInstalled : new Set();
+  const items = _mpState.ossProjects || [];
+  const grid = items.length
+    ? `<div class="marketplace-grid mp-oss-grid">${items.map((p) => _mpOssCardHtml(p, cats, lang, installed.has(p.id))).join('')}</div>`
+    : `<div class="empty">${escapeHtml(t('marketplace.empty'))}</div>`;
+
+  body.innerHTML = hero + `<div class="mp-oss-chips">${chips}</div>` + grid;
+
+  body.querySelectorAll('[data-oss-cat]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      _mpState.ossCategory = btn.dataset.ossCat || '';
+      _mpLoadOss();
+    });
+  });
+  // Card click → open the project's GitHub page; the 接入 button → prefill the
+  // Commander (install-then-use). The 已安装 chip is inert.
+  body.querySelectorAll('.mp-oss-card').forEach((card) => {
+    const p = (_mpState.ossProjects || []).find((x) => x.id === card.dataset.ossId);
+    card.addEventListener('click', (e) => {
+      // 接入 is an explicit install request (button shows only when not
+      // installed) → install prompt, no task slot.
+      if (e.target.closest('[data-oss-connect]')) { e.stopPropagation(); if (p) prefillCommander(ossInstallPromptFor(p)); return; }
+      if (e.target.closest('[data-oss-installed]')) { e.stopPropagation(); return; }
+      if (p) ossOpenRepo(p);
+    });
+  });
+}
+
+function _mpOssCardHtml(p, cats, lang, isInstalled) {
+  const desc = escapeHtml(ossDescFor(p));
+  const icon = uiIconHtml(ossIconFor(p.category), 'mp-oss-card-icon');
+  const catLabel = escapeHtml(ossCatLabel(p.category, cats));
+  const action = isInstalled
+    ? `<span class="mp-oss-installed" data-oss-installed>${uiIconHtml('check', 'mp-oss-installed-icon')}${escapeHtml(t('marketplace.oss_installed'))}</span>`
+    : `<button type="button" class="btn btn-sm btn-primary mp-oss-connect" data-oss-connect>${escapeHtml(t('marketplace.oss_connect'))}</button>`;
+  return `
+    <div class="mp-oss-card" data-oss-id="${escapeHtml(p.id)}">
+      <div class="mp-oss-card-head">
+        <span class="mp-oss-card-glyph" style="--oss-c:${escapeHtml(p.color || 'var(--primary)')}">${icon}</span>
+        <div class="mp-oss-card-id">
+          <div class="mp-oss-card-name">${escapeHtml(p.name)}</div>
+          <div class="mp-oss-card-repo">${escapeHtml(p.repo)}</div>
+        </div>
+      </div>
+      <div class="mp-oss-card-desc">${desc}</div>
+      <div class="mp-oss-card-foot">
+        ${ossDriverBadgeHtml(p.driver)}
+        <span class="mp-oss-card-cat">${catLabel}</span>
+        ${action}
+      </div>
+    </div>`;
 }
 
 function _mpCardHtml(item, lang) {
@@ -1246,9 +1540,20 @@ function _mpInstallKindLabel(kind) {
   return kind === 'skill' ? 'Skill' : 'Agent';
 }
 
+function _mpInstallFailedName(kind, item, err) {
+  const failedKind = err?.marketplaceKind || kind;
+  const failedId = err?.marketplaceId || '';
+  const itemId = item?.id || '';
+  const itemName = item?.name || '';
+  if (failedKind === kind && failedId && failedId === itemId && itemName) return itemName;
+  if (err?.marketplaceName && err.marketplaceName !== failedId) return err.marketplaceName;
+  if (failedKind === kind && itemName) return itemName;
+  return err?.marketplaceName || itemName || itemId || failedId || '';
+}
+
 function _mpInstallFailedText(kind, item, err) {
   const failedKind = err?.marketplaceKind || kind;
-  const failedName = err?.marketplaceName || item?.name || item?.id || err?.marketplaceId || '';
+  const failedName = _mpInstallFailedName(kind, item, err);
   const reason = err?.marketplaceReason || err?.message || String(err || '');
   const tmpl = t('marketplace.install_failed_resource');
   if (tmpl && tmpl !== 'marketplace.install_failed_resource') {
@@ -1269,6 +1574,7 @@ function _mpInstallErrorFromResponse(r) {
   if (r && r.marketplaceId) err.marketplaceId = r.marketplaceId;
   if (r && r.marketplaceName) err.marketplaceName = r.marketplaceName;
   if (r && r.marketplaceReason) err.marketplaceReason = r.marketplaceReason;
+  if (r && r.qualityReport) err.qualityReport = r.qualityReport;
   return err;
 }
 
@@ -1309,7 +1615,7 @@ async function _mpInstall(kind, id, itemOverride = null) {
       const rejectedKind = err?.marketplaceKind || kind;
       const rejectedId = err?.marketplaceId || id;
       const rejectedName = err?.marketplaceName || item.name || id;
-      const report = await readQualityReport(rejectedKind, rejectedId);
+      const report = err?.qualityReport || await readQualityReport(rejectedKind, rejectedId);
       if (report) {
         const title = t('quality.install_rejected_title').replace('{name}', rejectedName);
         const forceLabel = (() => {
@@ -1461,7 +1767,7 @@ async function mountMarketplaceCategorySelect(elId, initialValue = '') {
     const r = await window.orkas.invoke('marketplace.categories', { local_only: true });
     categories = (r && r.list) || [];
   } catch { /* swallowed — main's fallback handles it */ }
-  const lang = (typeof getLang === 'function') ? getLang() : 'zh';
+  const lang = (typeof getLang === 'function') ? getLang() : 'en';
   _aiSelectMount(el, {
     options: categories.map((c) => ({
       value: c.code,
@@ -1476,3 +1782,13 @@ async function mountMarketplaceCategorySelect(elId, initialValue = '') {
 // Callers (agents.js / skills.js per-row menu) check `typeof openMarketplaceUpload === 'function'`
 // to decide whether to show the upload entry — OrkasOpen has no marketplace_dev.js loaded,
 // so the menu items just don't appear.
+window.addEventListener('i18n-change', _mpOnI18n);
+window.addEventListener('oss-catalog-updated', (e) => {
+  if (!isMarketplaceOpen() || !_mpState || _mpState.tab !== 'oss') return;
+  const d = (e && e.detail) || {};
+  if (d.homeOnly) return;
+  if ((d.category || '') !== (_mpState.ossCategory || '')) return;
+  if ((d.q || '') !== (_mpState.ossQ || '')) return;
+  _mpLoadOss({ forceState: true, revalidate: false }).catch(() => {});
+});
+_mpScheduleReconcileWatchInit();

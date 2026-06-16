@@ -13,7 +13,7 @@ import type { CoreAgentConfig } from "../config/schema.js";
 import type { EvolutionConfig } from "../evolution/types.js";
 import type { LLMProvider, CompletionResult } from "../providers/base.js";
 import { ProviderRegistry } from "../providers/registry.js";
-import type { AgentTool, ToolContext } from "../tools/base.js";
+import type { AgentTool, ToolContext, ToolResult } from "../tools/base.js";
 import { toToolDefinition } from "../tools/base.js";
 import { getBuiltinTools } from "../tools/builtin.js";
 import { SkillStore } from "../evolution/skill-store.js";
@@ -28,7 +28,7 @@ const RETRY_AFTER_MAX_DELAY_MS = 120_000;
 const RETRY_JITTER_RATIO = 0.2;
 
 function retryDelayMs(err: unknown, attempt: number): number {
-  if (err instanceof RateLimitError && err.retryAfterMs) {
+  if (err instanceof RateLimitError && err.retryAfterMs != null) {
     return Math.min(Math.max(0, err.retryAfterMs), RETRY_AFTER_MAX_DELAY_MS);
   }
   const base = Math.min(RETRY_BASE_DELAY_MS * 2 ** attempt, RETRY_MAX_DELAY_MS);
@@ -231,11 +231,43 @@ export class AgentRunner {
         let streamStopReason: import("../shared/types.js").StopReason = "end_turn";
         let streamUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 } as import("../shared/types.js").Usage;
         let streamModel = modelId;
+        let streamingToolSeq = 0;
+        let streamingTool: { id: string; name?: string; inputBytes: number } | null = null;
         for await (const ev of streamIter) {
           if (ev.type === "text_delta") {
             streamText += ev.text;
             // Forward to callers so UI can render incrementally.
             yield { type: "text_delta", text: ev.text };
+          } else if (ev.type === "tool_use_start") {
+            const id = ev.id || `stream_tool_${++streamingToolSeq}`;
+            streamingTool = { id, name: ev.name, inputBytes: 0 };
+            yield { type: "tool_delta", id, name: ev.name, inputDelta: "", inputBytes: 0 };
+          } else if (ev.type === "tool_use_delta") {
+            const id = ev.id || streamingTool?.id || `stream_tool_${++streamingToolSeq}`;
+            if (!streamingTool || streamingTool.id !== id) {
+              streamingTool = { id, inputBytes: 0 };
+            }
+            const delta = ev.input || "";
+            streamingTool.inputBytes += delta.length;
+            yield {
+              type: "tool_delta",
+              id,
+              name: streamingTool.name,
+              inputDelta: delta,
+              inputBytes: streamingTool.inputBytes,
+            };
+          } else if (ev.type === "tool_use_end") {
+            const id = ev.id || streamingTool?.id || "";
+            if (id || streamingTool) {
+              yield {
+                type: "tool_delta",
+                id: id || streamingTool?.id || "",
+                name: streamingTool?.name,
+                inputDelta: "",
+                inputBytes: streamingTool?.inputBytes,
+              };
+            }
+            streamingTool = null;
           } else if (ev.type === "retry") {
             yield { type: "retry", attempt: ev.attempt, reason: ev.reason };
           } else if (ev.type === "message_end") {
@@ -336,12 +368,10 @@ export class AgentRunner {
           return;
         }
 
-        // Execute each tool call and add results
-        const toolCtx: ToolContext = {
-          workingDir: params.workingDir,
-          signal: params.signal,
-          state: params.sandboxEnv ? { sandboxEnv: params.sandboxEnv } : {},
-        };
+        // Execute each tool call and add results. `toolState` is shared across
+        // calls in this loop as before; per-call progress callbacks are wired
+        // below so long-running tools can keep the UI/idle-watchdog alive.
+        const toolState: ToolContext["state"] = params.sandboxEnv ? { sandboxEnv: params.sandboxEnv } : {};
 
         for (const call of toolCalls) {
           if (call.type !== "tool_use") continue;
@@ -363,7 +393,57 @@ export class AgentRunner {
           }
           try {
             log.debug(`Executing tool: ${call.name}`);
-            const toolResult = await tool.execute(call.input, toolCtx);
+            const progressQueue: Array<Extract<AgentRunEvent, { type: "tool_progress" }>> = [];
+            let notifyProgress: (() => void) | null = null;
+            const toolCtx: ToolContext = {
+              workingDir: params.workingDir,
+              signal: params.signal,
+              state: toolState,
+              emitProgress: (progress) => {
+                const message = String(progress?.message || "").trim();
+                if (!message) return;
+                progressQueue.push({
+                  type: "tool_progress",
+                  id: call.id,
+                  name: call.name,
+                  ...(progress.phase ? { phase: String(progress.phase) } : {}),
+                  message,
+                  ...(progress.data ? { data: progress.data } : {}),
+                });
+                if (notifyProgress) {
+                  const notify = notifyProgress;
+                  notifyProgress = null;
+                  notify();
+                }
+              },
+            };
+            type ToolCompletion =
+              | { ok: true; result: ToolResult }
+              | { ok: false; err: unknown };
+            const toolPromise: Promise<ToolCompletion> = Promise.resolve()
+              .then(() => tool.execute(call.input, toolCtx))
+              .then(
+                (result) => ({ ok: true as const, result }),
+                (err) => ({ ok: false as const, err }),
+              );
+            let completed: ToolCompletion | null = null;
+            while (!completed) {
+              while (progressQueue.length) {
+                yield progressQueue.shift()!;
+              }
+              const progressWait = new Promise<"progress">((resolve) => {
+                notifyProgress = () => resolve("progress");
+              });
+              const raced = await Promise.race([toolPromise, progressWait]);
+              if (raced === "progress") continue;
+              completed = raced;
+              notifyProgress = null;
+            }
+            while (progressQueue.length) {
+              yield progressQueue.shift()!;
+            }
+            if (completed.ok !== true) throw completed.err;
+            const toolResult = completed.result;
             this.session.addToolResult(call.id, toolResult.content, toolResult.images, toolResult.isError);
             yield {
               type: "tool_end",

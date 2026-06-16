@@ -147,6 +147,16 @@ export class SandboxExecutor {
         ...(this.config.env ?? {}),
       };
 
+      // ORKAS_PATH_PREPEND: host-supplied dirs (e.g. the per-user external
+      // packages `.bin/` shim dir) that must rank ahead of the augmented
+      // PATH. A plain `PATH` override via config.env would *replace* the
+      // augmentation above and lose brew/system locations, so the host
+      // passes a prepend list instead and we compose here. The marker stays
+      // in the child env for debuggability.
+      if (env.ORKAS_PATH_PREPEND) {
+        env.PATH = `${env.ORKAS_PATH_PREPEND}${path.delimiter}${env.PATH}`;
+      }
+
       // Restrict network if configured
       if (this.config.allowNetwork === false) {
         // On macOS/Linux, we can't easily block network without sandboxing tools
@@ -231,6 +241,61 @@ export class SandboxExecutor {
         });
       });
     });
+  }
+
+  /**
+   * Launch a command detached, with stdout+stderr appended to `logPath`.
+   * Same env construction (PATH augmentation + ORKAS_PATH_PREPEND) and
+   * blocked-command policy as `execute`, but no timeout and no output
+   * buffering — the process intentionally outlives the agent turn (long
+   * builds, renders, downloads). The caller reports `pid` + `logPath` to
+   * the model, which polls the log and may `kill <pid>` to stop it.
+   */
+  executeBackground(command: string, logPath: string): { pid: number | null; error?: string } {
+    const violation = this.checkBlockedCommand(command);
+    if (violation) {
+      return { pid: null, error: `Command blocked by sandbox policy: ${violation}` };
+    }
+    const env: Record<string, string> = {
+      HOME: process.env.HOME ?? "/tmp",
+      PATH: augmentPath(process.env.PATH),
+      TERM: "dumb",
+      LANG: process.env.LANG ?? "en_US.UTF-8",
+      ...(this.config.env ?? {}),
+    };
+    if (env.ORKAS_PATH_PREPEND) {
+      env.PATH = `${env.ORKAS_PATH_PREPEND}${path.delimiter}${env.PATH}`;
+    }
+    let logFd: number;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const fs = require("node:fs") as typeof import("node:fs");
+      fs.mkdirSync(path.dirname(logPath), { recursive: true });
+      logFd = fs.openSync(logPath, "a");
+    } catch (err) {
+      return { pid: null, error: `cannot open log file: ${(err as Error).message}` };
+    }
+    try {
+      const child = spawn(this.config.shell, ["-c", command], {
+        cwd: this.config.workingDir,
+        env,
+        detached: process.platform !== "win32",
+        stdio: ["ignore", logFd, logFd],
+        windowsHide: true,
+      });
+      child.unref();
+      const pid = child.pid ?? null;
+      log.info(`background command started pid=${pid} log=${logPath}`);
+      return { pid };
+    } catch (err) {
+      return { pid: null, error: (err as Error).message };
+    } finally {
+      // The child holds its own duplicated descriptors after spawn.
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        (require("node:fs") as typeof import("node:fs")).closeSync(logFd);
+      } catch { /* already closed */ }
+    }
   }
 
   /** Check if a command matches the blocklist. */

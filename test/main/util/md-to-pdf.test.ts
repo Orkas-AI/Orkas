@@ -172,6 +172,7 @@ describe('markdownToHtml › edge cases', () => {
 
 let tmpDir: string;
 const printToPDF = vi.fn(async () => Buffer.from('%PDF-1.4 fake', 'utf8'));
+const insertCSS = vi.fn(async () => 'pdf-color-css');
 const loadURL = vi.fn(async (_url: string) => {});
 const once = vi.fn((evt: string, cb: (...args: any[]) => void) => {
   if (evt === 'did-finish-load') setImmediate(cb);
@@ -179,7 +180,7 @@ const once = vi.fn((evt: string, cb: (...args: any[]) => void) => {
 const destroy = vi.fn();
 
 class FakeBrowserWindow {
-  webContents = { once, printToPDF, loadURL };
+  webContents = { once, printToPDF, insertCSS, loadURL };
   constructor(public opts: any) {}
   async loadURL(url: string) { return loadURL(url); }
   destroy() { destroy(); }
@@ -192,6 +193,7 @@ vi.mock('electron', () => ({
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-pdf-'));
   printToPDF.mockClear();
+  insertCSS.mockClear();
   loadURL.mockClear();
   once.mockClear();
   destroy.mockClear();
@@ -217,6 +219,18 @@ describe('htmlToPdf › behaviour', () => {
     expect(printToPDF).toHaveBeenCalledTimes(1);
     const args = printToPDF.mock.calls[0][0];
     expect(args).toMatchObject({ pageSize: 'A4', landscape: false, printBackground: true });
+  });
+
+  it('preserves author colors for print output', async () => {
+    const { htmlToPdf } = await import('../../../src/main/util/md-to-pdf');
+    await htmlToPdf('<html></html>', path.join(tmpDir, 'colors.pdf'));
+    expect(insertCSS).toHaveBeenCalledTimes(1);
+    const [css, opts] = insertCSS.mock.calls[0];
+    expect(css).toContain('@media print');
+    expect(css).toContain('-webkit-print-color-adjust: exact');
+    expect(css).toContain('print-color-adjust: exact');
+    expect(opts).toMatchObject({ cssOrigin: 'user' });
+    expect(insertCSS.mock.invocationCallOrder[0]).toBeLessThan(printToPDF.mock.invocationCallOrder[0]);
   });
 
   it('honors landscape + custom page size', async () => {

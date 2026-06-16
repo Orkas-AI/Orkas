@@ -21,6 +21,7 @@ import {
   StderrTail,
   spawnCli,
   bindAbort,
+  armKillWatchdog,
   LineSplitter,
   levelOrInfo,
 } from './base.js';
@@ -47,7 +48,6 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
       const startedAt = Date.now();
 
       let exited = false;
-      let timedOut = false;
       let sessionId: string | undefined;
       let resultText = '';
       let resultStatus: 'completed' | 'failed' | undefined;
@@ -70,12 +70,11 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         args: def.argv,
       });
 
-      const timer = setTimeout(() => {
-        timedOut = true;
-        try { child.kill('SIGTERM'); } catch { /* */ }
-        setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* */ } }, 10_000).unref();
-      }, opts.timeoutMs);
-      if (typeof timer.unref === 'function') timer.unref();
+      const watchdog = armKillWatchdog(child, {
+        timeoutMs: opts.timeoutMs,
+        idleKillMs: opts.idleKillMs,
+        lastEventAt: opts.lastEventAt,
+      });
 
       const send = (msg: object) => {
         try { child.stdin.write(JSON.stringify(msg) + '\n'); }
@@ -216,7 +215,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         const finish = (status: 'completed' | 'failed' | 'cancelled' | 'timeout', extra: Record<string, unknown> = {}) => {
           if (exited) return;
           exited = true;
-          clearTimeout(timer);
+          watchdog.disarm();
           clearTimeout(initTimer);
           detachAbort();
           opts.onEvent({
@@ -234,7 +233,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         });
         child.on('close', code => {
           if (opts.signal.aborted) return finish('cancelled', { output: resultText });
-          if (timedOut) return finish('timeout', { error: `cli exceeded ${opts.timeoutMs}ms`, output: resultText, stderrTail: tail.toString() });
+          if (watchdog.fired()) return finish('timeout', { error: `cli ${watchdog.reason()}`, output: resultText, stderrTail: tail.toString() });
           if (code === 0 && resultStatus === 'completed') {
             // Demote silent failure: server claimed success via
             // stopReason=end_turn but never streamed any text AND

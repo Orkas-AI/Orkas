@@ -48,10 +48,8 @@ import { createLogger } from '../logger';
 
 const log = createLogger('component-enabled');
 
-// Lazy require sync: the module is stripped from OrkasOpen builds, and a static import would
-// break that build at module-load time. When sync is absent we silently no-op — the file
-// still sits at `cloud/config/` for whenever sync becomes available.
 function _notifyDirty(): void {
+  // OrkasOpen is local-only; cloud sync notification is intentionally absent.
 }
 
 const SCHEMA_VERSION = 1;

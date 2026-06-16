@@ -36,20 +36,18 @@ import { getSession as _getCachedSession } from './session-store';
 import { app } from 'electron';
 import * as paths from '../../paths';
 
-interface DebugRecorder {
+interface NoopRecorder {
   record(event: unknown): void;
   setActiveCandidate(info: unknown): void;
-  finish(result: { text: string; aborted: boolean; error: string | null }): void;
+  finish(output: unknown): void;
 }
 
-const NOOP_DEBUG_RECORDER: DebugRecorder = {
-  record() {},
-  setActiveCandidate() {},
-  finish() {},
-};
-
-function createDebugRecorder(): DebugRecorder {
-  return NOOP_DEBUG_RECORDER;
+function startRecording(_input: unknown): NoopRecorder {
+  return {
+    record() {},
+    setActiveCandidate() {},
+    finish() {},
+  };
 }
 
 /**
@@ -68,22 +66,50 @@ function createDebugRecorder(): DebugRecorder {
  * child process. Never set on the host `process.env`: that would leak to
  * Electron's own GPU/renderer/utility helpers and crash the app at boot.
  */
-let _skillSandboxEnv: Record<string, string> | null = null;
-export function buildSkillSandboxEnv(): Record<string, string> {
-  if (_skillSandboxEnv) return _skillSandboxEnv;
+let _skillSandboxEnvStatic: Record<string, string> | null = null;
+function buildSkillSandboxEnvStatic(): Record<string, string> {
+  if (_skillSandboxEnvStatic) return _skillSandboxEnvStatic;
   // `app` is undefined when running under vitest (no Electron runtime). Treat
   // missing/!isPackaged the same — dev layout has everything on real disk.
   const isPackaged = !!app && app.isPackaged;
   const pcDir = isPackaged
     ? paths.PC_ROOT.replace(/\bapp\.asar\b/, 'app.asar.unpacked')
     : paths.PC_ROOT;
-  _skillSandboxEnv = {
+  _skillSandboxEnvStatic = {
     ORKAS_NODE: process.execPath,
     ORKAS_PC_DIR: pcDir,
     ORKAS_WORKSPACE_ROOT: paths.WS_ROOT,
     ELECTRON_RUN_AS_NODE: '1',
   };
-  return _skillSandboxEnv;
+  return _skillSandboxEnvStatic;
+}
+
+/**
+ * Per-turn sandbox env = cached static part + uid-derived dynamic part
+ * (never cached module-level — CLAUDE.md §4):
+ *   - `ORKAS_UID` = the turn's user id, so `bin/orkas-pkg.cjs` (and other
+ *     bash-driven CLIs) resolve the right per-user data tree without
+ *     parsing users.json.
+ *   - `ORKAS_PATH_PREPEND` = `<uid>/local/packages/.bin` when an enabled
+ *     external package ships CLI shims. Composed into PATH by the sandbox
+ *     executor (see core-agent sandbox/executor.ts) so the augmented
+ *     brew/system PATH is preserved.
+ */
+export function buildSkillSandboxEnv(userId?: string): Record<string, string> {
+  const env = { ...buildSkillSandboxEnvStatic() };
+  if (userId) {
+    env.ORKAS_UID = userId;
+    try {
+      // Lazy require keeps module-load order safe (client.ts loads before
+      // some features in boot paths) and avoids a static feature import in
+      // the model layer beyond what's already here.
+      // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+      const pkgs = require('../../features/packages') as typeof import('../../features/packages');
+      const binDir = pkgs.packagesBinDirIfActive(userId);
+      if (binDir) env.ORKAS_PATH_PREPEND = binDir;
+    } catch { /* packages feature unavailable → no shim PATH this turn */ }
+  }
+  return env;
 }
 
 type ActiveSessionAbort = {
@@ -154,7 +180,6 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     readOnlyExtraRoots,
     agentId,
     cid,
-    turnId,
     projectId,
     onFileWritten,
     hasProducedPath,
@@ -250,9 +275,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     else abortSignal.addEventListener('abort', onExternalAbort, { once: true });
   }
 
-  // PC dev builds attach an archive recorder here. OrkasOpen keeps the same
-  // interface as a no-op object so stripped debug code cannot affect model calls.
-  const recorder = createDebugRecorder();
+  const recorder = startRecording(null);
   let finalText = '';
   let errText: string | null = null;
   let abortedFlag = false;
@@ -260,19 +283,13 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   try {
 
     // Called back when pi-ai's onPayload hook injects the native web
-    // search tool — write the event straight into the recorder so the
-    // devtools archive's events[] shows
-    // `progress/native_search/injected`. The recorder is instantiated
-    // after buildRunner, but onPayload only fires after
-    // runner.runStream, by which time the recorder is ready, so the
-    // closure can simply read the outer `let` variable.
+    // search tool. The OrkasOpen recorder is a non-null no-op object.
     const built = await buildRunner({
       sessionId,
       systemPrompt,
       userId,
       agentId,
       ...(cid ? { cid } : {}),
-      ...(turnId ? { turnId } : {}),
       ...(projectId ? { projectId } : {}),
       ...(skillList !== undefined ? { skillList } : {}),
       ...(projectAllowedSkillIds !== undefined ? { projectAllowedSkillIds } : {}),
@@ -290,20 +307,13 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
           event: { stream: 'native_search', data: { phase: 'injected', ...info } },
         });
       },
-      // rotating-provider commits / surfaced-error candidate notice. Rewrite
-      // the archive row so model / provider / profile reflect the candidate
-      // that actually owned this call's visible outcome, not the rotating-
-      // provider's primary label. Recorder may not be set yet at the moment
-      // buildRunner eagerly constructs the rotating-provider; fires at runtime
-      // when complete()/stream() actually picks a candidate, so the recorder
-      // is always live by then.
       onCandidateChosen: (info) => {
         recorder.setActiveCandidate(info);
       },
     });
-    const { runner, providerId, modelId, resolvedSystemPrompt, profileId, entryId, toolDefs, skillDisplayNameById, agentDisplayNameById } = built;
+    const { runner, providerId, modelId, skillDisplayNameById, agentDisplayNameById } = built;
 
-    const sandboxEnv = buildSkillSandboxEnv();
+    const sandboxEnv = buildSkillSandboxEnv(userId);
 
     log.info(`turn start ${turnTag} user=${userId} provider=${providerId} model=${modelId}`);
     const rawEvents = runner.runStream({

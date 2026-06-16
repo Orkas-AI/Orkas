@@ -125,4 +125,38 @@ describe("augmentPath", () => {
     const out = augmentPath(input).split(":");
     expect(out.indexOf("/Users/me/tools/bin")).toBeLessThan(out.indexOf("/usr/bin"));
   });
+
+  describe("executeBackground", () => {
+    it("returns a pid immediately and writes output to the log file", async () => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-bg-"));
+      try {
+        const logPath = path.join(dir, "run.log");
+        const sandbox = new SandboxExecutor({ workingDir: dir });
+        const { pid, error } = sandbox.executeBackground("printf done; echo", logPath);
+        expect(error).toBeUndefined();
+        expect(typeof pid).toBe("number");
+        // The detached child writes asynchronously — poll the log briefly.
+        let body = "";
+        for (let i = 0; i < 40 && !body.includes("done"); i++) {
+          await new Promise((r) => setTimeout(r, 50));
+          try { body = await fs.readFile(logPath, "utf8"); } catch { /* not yet */ }
+        }
+        expect(body).toContain("done");
+      } finally {
+        await fs.rm(dir, { recursive: true, force: true });
+      }
+    }, 10000);
+
+    it("refuses blocked commands without spawning", async () => {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-bg-"));
+      try {
+        const sandbox = new SandboxExecutor({ workingDir: dir });
+        const { pid, error } = sandbox.executeBackground("rm -rf /", path.join(dir, "x.log"));
+        expect(pid).toBeNull();
+        expect(error).toMatch(/blocked/i);
+      } finally {
+        await fs.rm(dir, { recursive: true, force: true });
+      }
+    });
+  });
 });

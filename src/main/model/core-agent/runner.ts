@@ -26,7 +26,7 @@ import {
   getConfiguredModelCooldown,
   type ChatEntryChoice,
 } from '../../features/auth';
-import { getSystemPromptBlock } from './skill-registry';
+import { getSystemPromptBlock, getSystemSkillsPromptBlock } from './skill-registry';
 import { t } from '../../i18n';
 // tool-catalog.ts: TOOL_CATALOG kept as the source of truth for the drift
 // test (tool-catalog.test.ts asserts injected names ⊆ catalog) and for any
@@ -41,7 +41,7 @@ import { createKbTools } from './kb-tools';
 import { createChatHistoryTools } from './chat-history-tools';
 import { createImageGenTool } from './image-gen-tool';
 import { createWebSearchOverrideTool } from './search-tools';
-import { sessionToolResultsDir, agentEvolvedSkillsDir } from '../../paths';
+import { sessionToolResultsDir, agentEvolvedSkillsDir, userSystemSkillsDir } from '../../paths';
 import {
   wrapToolWithCap,
   MAX_RESULT_CHARS_BY_TOOL,
@@ -97,10 +97,6 @@ export interface BuildRunnerParams {
    *  / process_file_full calls whose path targets the attachment dir of the
    *  current conv. */
   cid?: string;
-  /** Stable id for the visible actor turn. Threaded to local-tools so bash
-   *  can expose a per-turn ORKAS_OUTPUT_DIR for script-generated deliverables
-   *  without racing parallel agents in the same conversation workspace. */
-  turnId?: string;
   /** Project id of the conversation, when it belongs to one. Threaded
    *  through to local-tools / file-tools / image-gen-tool so workspace
    *  resolution picks up the project-scoped selection. Resolved once at
@@ -188,6 +184,58 @@ export interface ToolDefSnapshot {
   source: 'core-agent' | 'orkas' | 'extra';
 }
 
+function splitVolatilePromptTail(prompt: string | undefined): { stable: string; volatileTail: string } {
+  const raw = (prompt || '').trim();
+  if (!raw) return { stable: '', volatileTail: '' };
+  const marker = '\n\n---\n\n## Current date\n';
+  const idx = raw.lastIndexOf(marker);
+  if (idx < 0) return { stable: raw, volatileTail: '' };
+  const stable = raw.slice(0, idx).trim();
+  const volatileTail = raw.slice(idx + 2).trim();
+  return { stable, volatileTail };
+}
+
+function splitCommanderAgentsBlock(prompt: string): { stable: string; agentsBlock: string } {
+  const marker = '\n\n### Agents list\n\n';
+  const idx = prompt.indexOf(marker);
+  if (idx < 0) return { stable: prompt, agentsBlock: '' };
+  const blockStart = idx + 2;
+  const nextSection = prompt.slice(blockStart + marker.trimStart().length).search(/\n\n#{2,3} /);
+  const blockEnd = nextSection < 0
+    ? prompt.length
+    : blockStart + marker.trimStart().length + nextSection;
+  return {
+    stable: `${prompt.slice(0, idx)}${prompt.slice(blockEnd)}`.trim(),
+    agentsBlock: prompt.slice(blockStart, blockEnd).trim().replace(/^### Agents list/, '## Agents list'),
+  };
+}
+
+function splitCommanderPlanStateBlock(prompt: string): { stable: string; planStateBlock: string } {
+  const marker = '\n\n### Current plan state';
+  const idx = prompt.indexOf(marker);
+  if (idx < 0) return { stable: prompt, planStateBlock: '' };
+  const blockStart = idx + 2;
+  const nextSection = prompt.slice(blockStart + marker.trimStart().length).search(/\n\n#{2,3} /);
+  const blockEnd = nextSection < 0
+    ? prompt.length
+    : blockStart + marker.trimStart().length + nextSection;
+  return {
+    stable: `${prompt.slice(0, idx)}${prompt.slice(blockEnd)}`.trim(),
+    planStateBlock: prompt.slice(blockStart, blockEnd).trim().replace(/^### Current plan state/, '## Current plan state'),
+  };
+}
+
+function splitRuntimeInjectionBlock(prompt: string): { stable: string; runtimeInjectionBlock: string } {
+  const marker = '\n\n## Runtime injection';
+  const idx = prompt.indexOf(marker);
+  if (idx < 0) return { stable: prompt, runtimeInjectionBlock: '' };
+  const blockStart = idx + 2;
+  return {
+    stable: prompt.slice(0, idx).trim(),
+    runtimeInjectionBlock: prompt.slice(blockStart).trim(),
+  };
+}
+
 export async function buildRunner(params: BuildRunnerParams): Promise<{
   runner: AgentRunnerInstance;
   resolvedSystemPrompt: string;
@@ -242,14 +290,18 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // SkillStore (System B) stays gated by `skillList` alone — see line ~429.
   const renderAllowlist = _intersectRenderAllowlist(params.skillList, params.projectAllowedSkillIds);
   const skillDisplayNameById = new Map<string, string>();
-  const [mod, session, skillsBlock] = await Promise.all([
+  const systemSkillsVisible = systemSkillsExposureFromSessionId(params.sessionId);
+  const openSkillSourcesVisible = openSkillSourcesExposureFromSessionId(params.sessionId);
+  const [mod, session, systemSkillsBlock, skillsBlock] = await Promise.all([
     ca(),
     getSession(params.sessionId),
+    systemSkillsVisible ? getSystemSkillsPromptBlock(earlyUid || undefined) : Promise.resolve(''),
     getSystemPromptBlock({
       ...(renderAllowlist === undefined ? {} : { allowlist: [...renderAllowlist] }),
       disabledIds: disabledSkillIds,
       ...(params.onSkillAdvertised ? { onSkillAdvertised: params.onSkillAdvertised } : {}),
       displayNameById: skillDisplayNameById,
+      ...(openSkillSourcesVisible ? { includeOpenSources: true } : {}),
     }),
   ]);
 
@@ -302,11 +354,16 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // markdown_to_pdf / html_to_pdf. These MUST come after core-agent's
   // builtins in the list so `AgentRunner`'s last-write-wins tool map
   // overrides `bash` and `write_file` with the permission-gated versions.
+  const systemSkillReadRoots = uid ? [userSystemSkillsDir(uid)] : [];
+  const fileReadOnlyExtraRoots = [
+    ...(params.readOnlyExtraRoots || []),
+    ...systemSkillReadRoots,
+  ];
+
   const localTools = createLocalTools({
     ...(uid ? { userId: uid } : {}),
     ...(params.cid ? { cid: params.cid } : {}),
     ...(agentId ? { agentId } : {}),
-    ...(params.turnId ? { turnId: params.turnId } : {}),
     ...(params.projectId ? { projectId: params.projectId } : {}),
     ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
     // `readOnlyExtraRoots` is threaded to localTools too — but ONLY the
@@ -337,7 +394,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         ...(params.cid ? { cid: params.cid } : {}),
         ...(params.projectId ? { projectId: params.projectId } : {}),
         ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
-        ...(params.readOnlyExtraRoots?.length ? { readOnlyExtraRoots: params.readOnlyExtraRoots } : {}),
+        ...(fileReadOnlyExtraRoots.length ? { readOnlyExtraRoots: fileReadOnlyExtraRoots } : {}),
         ...(params.onSkillInvoked ? { onSkillInvoked: params.onSkillInvoked } : {}),
       })
     : [];
@@ -362,7 +419,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
 
   // Image generation. Permission-gated like local-tools; reuses
   // localExec.granted (writing image bytes is the same blast radius as
-  // write_file). Skipped when uid is unknown — generateImage needs the
+  // write_file). Skipped when uid is unknown — generators need the
   // workspace + attachment scope to validate paths.
   const imageGenTools: AgentTool[] = uid
     ? [createImageGenTool({
@@ -418,7 +475,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     : '';
   const connectorMetaTools = uid && exposure !== 'none'
     ? await createConnectorMetaTools(
-        { userId: uid, ...(agentId ? { agentId } : {}) },
+        { userId: uid, ...(agentId ? { agentId } : {}), ...(params.cid ? { cid: params.cid } : {}) },
         exposure === 'discover+block' ? 'discover' : 'full',
       )
     : [];
@@ -490,20 +547,32 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const toolDefs: ToolDefSnapshot[] = Array.from(toolDefMap.values())
     .sort((a, b) => a.name.localeCompare(b.name));
 
-  // Finalize system prompt. Order: [base prompt] → [skills block]. Tool list
-  // is no longer in the prompt (see toolsBlock removal note above) — the
-  // SDK tool-use protocol delivers it via a separate API field so it doesn't
-  // need to live in the messages context.
+  // Finalize system prompt. Cache-friendly order:
+  //   [base prompt] → [connectors] → [system skills] → [skills]
+  //   → [agents] → [runtime injection] → [memory] → [plan state]
+  //   → [volatile datetime tail].
+  // Tool list is no longer in the prompt (see toolsBlock removal note above)
+  // because the SDK tool-use protocol delivers it via a separate API field.
   const parts: string[] = [];
-  if (params.systemPrompt) parts.push(params.systemPrompt.trim());
+  const { stable: stableSystemPrompt, volatileTail } = splitVolatilePromptTail(params.systemPrompt);
+  const { stable: stableWithoutAgents, agentsBlock } = splitCommanderAgentsBlock(stableSystemPrompt);
+  const { stable: stableWithoutPlan, planStateBlock } = splitCommanderPlanStateBlock(stableWithoutAgents);
+  const { stable: stableWithoutRuntime, runtimeInjectionBlock } = splitRuntimeInjectionBlock(stableWithoutPlan);
+  if (stableWithoutRuntime) parts.push(stableWithoutRuntime);
+  if (connectorBlock) parts.push(connectorBlock.trim());
+  if (systemSkillsBlock) parts.push(systemSkillsBlock.trim());
+  if (skillsBlock) parts.push(skillsBlock.trim());
+  if (agentsBlock) parts.push(agentsBlock);
+  if (runtimeInjectionBlock) parts.push(runtimeInjectionBlock);
   // Cross-session memory (read side): the user's stored profile + notes as
-  // background context. Sits right after the role prompt as a session-stable
-  // segment; empty string when nothing is stored (no tokens for new users).
+  // background context. It is more turn-volatile than resource indexes, so
+  // it sits after connectors / skills / agents but before per-plan state.
+  // Empty string when nothing is stored (no tokens for new users).
   // Re-read each turn — a mid-conversation write shows up next turn.
   const memoryBlock = uid ? formatMemoryForSystemPrompt(uid) : '';
   if (memoryBlock) parts.push(memoryBlock);
-  if (skillsBlock) parts.push(skillsBlock.trim());
-  if (connectorBlock) parts.push(connectorBlock.trim());
+  if (planStateBlock) parts.push(planStateBlock);
+  if (volatileTail) parts.push(volatileTail);
   const resolvedSystemPrompt = parts.join('\n\n');
 
   // Evolution (the self-evolving skill store) is per-agent: when an
@@ -637,6 +706,21 @@ export function connectorExposureFromSessionId(sessionId: string): 'tools+block'
   // effects. See `connector-meta-tools.ts::createConnectorMetaTools` mode handling.
   if (/^agent-/.test(sessionId)) return 'discover+block';
   return 'none';
+}
+
+/** System skills are authoring/orchestration affordances, not worker context.
+ *  Keep them visible to the group-chat commander, agent editor, and skill editor only; ordinary
+ *  agent workers should receive just the concrete skills exposed by their allowlist. */
+export function systemSkillsExposureFromSessionId(sessionId: string): boolean {
+  return /^gconv-/.test(sessionId) || /^agent-/.test(sessionId) || /^skill-/.test(sessionId);
+}
+
+/** OPEN-tier skills (external packages + global roots) render for the
+ *  commander only — plan decision D5 (open-ecosystem-architecture.md).
+ *  Agent workers, edit sessions, one-shots, and background kinds never
+ *  see them; opening them to agents is a P2 item. */
+export function openSkillSourcesExposureFromSessionId(sessionId: string): boolean {
+  return /^gconv-/.test(sessionId);
 }
 
 /**

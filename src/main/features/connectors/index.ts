@@ -3,6 +3,7 @@ export {
   listInstances,
   getInstance,
   connectViaOAuth,
+  addCustomInstance,
   removeInstance,
   refreshTools,
   setEnabledSubtools,
@@ -10,6 +11,7 @@ export {
   callTool,
   shutdownAll,
 } from './manager';
+export { CustomTransportError } from './custom-transport';
 export { resolveVisibleConnectors, stringifyMcpResult } from './tools-adapter';
 export { isValidInstanceId } from './registry';
 export { CONNECTOR_CATALOG, findCatalogEntry } from './catalog';

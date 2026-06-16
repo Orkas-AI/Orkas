@@ -59,7 +59,7 @@ describe('connectors registry secret storage', () => {
     expect(raw).not.toContain('refresh-secret');
     const disk = JSON.parse(raw);
     expect(disk.connections.github.oauth_grant).toBeUndefined();
-    expect(String(disk.connections.github.secrets_enc)).toMatch(/^T1JLVkFVTFQx/);
+    expect(String(disk.connections.github.secrets_enc)).toMatch(/^ORKLSEC1:/);
 
     const loaded = registry.load(TEST_UID);
     expect(loaded.connections.github.oauth_grant?.access_token).toBe('access-secret');
@@ -89,7 +89,7 @@ describe('connectors registry secret storage', () => {
     expect(loaded.connections.github.oauth_grant?.refresh_token).toBe('refresh-secret');
 
     const migrated = JSON.parse(fs.readFileSync(file, 'utf8'));
-    expect(String(migrated.connections.github.secrets_enc)).toMatch(/^T1JLVkFVTFQx/);
+    expect(String(migrated.connections.github.secrets_enc)).toMatch(/^ORKLSEC1:/);
     expect(JSON.stringify(migrated)).not.toContain('refresh-secret');
   });
 });

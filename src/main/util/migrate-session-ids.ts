@@ -1,27 +1,4 @@
 /**
- * One-shot data migration: strip the legacy brand prefix from session jsonl
- * filenames.
- *
- * Older builds wrote session_ids as `<brand>-<uid>-<kind>-<tail>`; the
- * current canonical form is `<uid>-<kind>-<tail>` (no brand prefix, so any
- * future fork or rename can't break history again).
- *
- * Migration strategy:
- *   1. Scan `<uid>/cloud/sessions/*.jsonl`
- *   2. Match `^<legacy-prefix>-<uid>-(.+)\.jsonl$` and rename to
- *      `<uid>-$1.jsonl`
- *   3. Already-new-format files are skipped
- *   4. Same-name conflicts (extremely rare — in theory there should not
- *      be two copies of one sid) are log.warn'd and skipped for manual
- *      handling
- *   5. `<uid>/local/.migrations` is stamped with a single line
- *      `decouple-session-id-from-brand-v1` to prevent re-runs
- *
- * Legacy kinds (`organizer` / `sub` / `conv`) aren't on the whitelist, but
- * since the migration only looks at the prefix and not the kind, those
- * sessions also get the prefix stripped. Their jsonl content is still
- * valid (users can open old group-chat history); new code just no
- * longer generates those kinds.
  * One-shot data migration: strip any prefix segments before the kind keyword from session_id —
  * both in jsonl filenames AND in stored references inside `_index.json` / `chat.json` —
  * normalising every shape to `<kind>-<tail>` (CLAUDE.md §5 — uid no longer in session_id).

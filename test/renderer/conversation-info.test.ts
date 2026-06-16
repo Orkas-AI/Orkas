@@ -227,7 +227,7 @@ describe('ConversationInfo files tab', () => {
     expect(result.counts.files).toBe('1');
   });
 
-  it('does not show the cloud-sync scope note in OrkasOpen', async () => {
+  it('shows a cloud-sync scope note above the file list when sync is enabled', async () => {
     const html = await renderFilesHtml({
       syncEnabled: true,
       history: [],
@@ -248,8 +248,8 @@ describe('ConversationInfo files tab', () => {
       },
     });
 
-    expect(html).not.toContain('ci-files-sync-note');
-    expect(html).not.toContain('Cloud sync does not include these files');
+    expect(html).toContain('ci-files-sync-note');
+    expect(html).toContain('Cloud sync does not include these files');
   });
 });
 
@@ -307,5 +307,33 @@ describe('ConversationInfo tasks tab', () => {
     expect(html).toContain('ci-tasks-step is-blocked');
     expect(html).toContain('[document-pencil]');
     expect(html).not.toContain('[x]');
+  });
+
+  it('keeps fully completed plans visible in the task details tab', async () => {
+    const result = await renderFilesResult({
+      activeTab: 'tasks',
+      history: [],
+      plan: {
+        steps: [
+          { index: 1, title: '搜集资料', assignee: 'Alpha', status: 'done' },
+          { index: 2, title: '整理结论', assignee: 'Beta', status: 'done' },
+        ],
+      },
+      planControl: { action: null },
+      files: {
+        root: '/tmp/workspace',
+        rootExists: true,
+        truncated: false,
+        count: 0,
+        items: [],
+      },
+    });
+
+    expect(result.html).toContain('ci-tasks');
+    expect(result.html).toContain('搜集资料');
+    expect(result.html).toContain('整理结论');
+    expect(result.html).toContain('ci-tasks-step is-done');
+    expect(result.html).not.toContain('id="ci-tasks-plan-control"');
+    expect(result.counts.tasks).toBe('2/2');
   });
 });

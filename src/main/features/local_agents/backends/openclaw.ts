@@ -41,6 +41,7 @@ import {
   StderrTail,
   spawnCli,
   bindAbort,
+  armKillWatchdog,
 } from './base.js';
 
 const log = createLogger('local-agents:openclaw');
@@ -55,7 +56,6 @@ export const openclawBackend: LocalBackend = {
     const startedAt = Date.now();
 
     let exited = false;
-    let timedOut = false;
     // openclaw writes everything to stderr; we accumulate the FULL
     // stderr (no cap — the trailing JSON blob we need to parse can
     // run several KB) AND keep a separate StderrTail for the
@@ -70,12 +70,11 @@ export const openclawBackend: LocalBackend = {
       args,
     });
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try { child.kill('SIGTERM'); } catch { /* */ }
-      setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* */ } }, 10_000).unref();
-    }, opts.timeoutMs);
-    if (typeof timer.unref === 'function') timer.unref();
+    const watchdog = armKillWatchdog(child, {
+      timeoutMs: opts.timeoutMs,
+      idleKillMs: opts.idleKillMs,
+      lastEventAt: opts.lastEventAt,
+    });
 
     // openclaw doesn't read stdin; close so it doesn't wait.
     child.stdin.end();
@@ -103,7 +102,7 @@ export const openclawBackend: LocalBackend = {
       const finish = (status: 'completed' | 'failed' | 'cancelled' | 'timeout', extra: Record<string, unknown> = {}) => {
         if (exited) return;
         exited = true;
-        clearTimeout(timer);
+        watchdog.disarm();
         detachAbort();
         opts.onEvent({
           type: 'done', status,
@@ -118,7 +117,7 @@ export const openclawBackend: LocalBackend = {
       });
       child.on('close', code => {
         if (opts.signal.aborted) return finish('cancelled');
-        if (timedOut) return finish('timeout', { error: `cli exceeded ${opts.timeoutMs}ms`, stderrTail: tail.toString() });
+        if (watchdog.fired()) return finish('timeout', { error: `cli ${watchdog.reason()}`, stderrTail: tail.toString() });
 
         const parsed = parseOpenclawReply(fullStderr);
         const replyText = parsed?.text || '';

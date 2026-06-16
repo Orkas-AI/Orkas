@@ -7,6 +7,21 @@ import { pickDescription } from "./types.js";
 
 const log = createLogger("skill-loader");
 
+interface SkillOrkasMeta {
+  descriptions?: { zh?: string; en?: string; [lang: string]: string | undefined };
+  description_zh?: string;
+  description_en?: string;
+}
+
+function normalizeDescription(value: string | undefined): string {
+  return String(value || "")
+    .replace(/\\"/g, '"')
+    .replace(/\\'/g, "'")
+    .replace(/\\{2,}/g, "\\")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 /**
  * SkillLoader scans one or more directories for `SKILL.md` files and
  * returns a de-duplicated `SkillSpec[]`.
@@ -18,8 +33,8 @@ const log = createLogger("skill-loader");
  *
  * De-duplication: when the same skill id appears in multiple dirs, the
  * FIRST occurrence wins. Put higher-priority roots earlier — for example,
- * Orkas passes `[customDir, builtinDir]` so user overrides beat shipped
- * defaults, matching openclaw's skill resolution.
+ * Orkas passes `[customDir, marketplaceDir]` so user overrides beat platform
+ * installs.
  *
  * No skill bodies are loaded here — only frontmatter. Callers that need the
  * body read `spec.skillFile` themselves. This keeps list() cheap enough to
@@ -49,8 +64,13 @@ export class SkillLoader {
         continue;
       }
       for (const e of entries) {
-        if (!e.isDirectory()) continue;
         if (e.name.startsWith(".")) continue;
+        // Accept real dirs AND symlinks that resolve to a directory. Global
+        // skill roots like `~/.claude/skills` commonly hold each skill as a
+        // symlink into a shared store; `Dirent.isDirectory()` is false for a
+        // symlink, so it must be resolved (statSync follows links) or those
+        // skills silently vanish from the listing.
+        if (!e.isDirectory() && !(e.isSymbolicLink() && this.isDir(path.join(dir, e.name)))) continue;
         const skillDir = path.join(dir, e.name);
         const skillFile = path.join(skillDir, "SKILL.md");
         if (!fs.existsSync(skillFile)) continue;
@@ -112,6 +132,7 @@ export class SkillLoader {
       return null;
     }
     const { data } = parseFrontmatter(raw);
+    const sidecar = this.readOrkasMeta(dir);
     // `id` = dir basename (always unique within the loader's roots, used as the read_file
     // path component). `name` = frontmatter human-readable display label; falls back to
     // the id when frontmatter is missing one. Decoupled because marketplace installs land
@@ -123,19 +144,32 @@ export class SkillLoader {
     // Heuristic: if it contains any CJK ideograph it lands in `_zh`, else
     // `_en`. Explicit `description_zh` / `description_en` always win, even
     // when legacy field is also present — explicit > inferred.
-    const legacy = (data.description && data.description.trim()) || "";
-    const explicitZh = (data.description_zh && data.description_zh.trim()) || "";
-    const explicitEn = (data.description_en && data.description_en.trim()) || "";
+    const legacy = normalizeDescription(data.description);
+    const explicitZh = normalizeDescription(data.description_zh);
+    const explicitEn = normalizeDescription(data.description_en);
     const legacyHasChinese = /[一-鿿]/.test(legacy);
+    const sidecarDescriptions = sidecar.descriptions || {};
+    const sidecarZh = normalizeDescription(sidecarDescriptions.zh || sidecar.description_zh);
+    const sidecarEn = normalizeDescription(sidecarDescriptions.en || sidecar.description_en);
     return {
       id,
       name: declaredName,
-      description_zh: explicitZh || (legacy && legacyHasChinese ? legacy : ""),
-      description_en: explicitEn || (legacy && !legacyHasChinese ? legacy : ""),
+      description_zh: sidecarZh || explicitZh || (legacy && legacyHasChinese ? legacy : ""),
+      description_en: sidecarEn || explicitEn || (legacy && !legacyHasChinese ? legacy : ""),
       dir,
       skillFile,
       source,
     };
+  }
+
+  private readOrkasMeta(dir: string): SkillOrkasMeta {
+    const file = path.join(dir, "_meta.json");
+    try {
+      const raw = JSON.parse(fs.readFileSync(file, "utf-8"));
+      return raw && typeof raw === "object" && !Array.isArray(raw) ? raw as SkillOrkasMeta : {};
+    } catch {
+      return {};
+    }
   }
 
   private dirStamp(): string {

@@ -141,7 +141,7 @@ describe('PC core regression unit coverage', () => {
     expect((await auth.listEntries()).entries.map((entry) => entry.profileId)).toEqual([backup.profileId]);
 
     const raw = fs.readFileSync(paths.userAuthProfilesFile(TEST_UID), 'utf8');
-    expect(raw).toMatch(/^T1JLVkFVTFQx/);
+    expect(raw).toMatch(/^ORKLSEC1:/);
     expect(raw).not.toContain('sk-primary-regression-xxxxxxxx');
     expect(raw).not.toContain('sk-backup-regression-xxxxxxxx');
     expect(raw).not.toContain('tvly-regression-secret');
@@ -349,7 +349,8 @@ describe('PC core regression unit coverage', () => {
     expect(permissions.getLocalExecGranted()).toBe(true);
 
     const file = userPath('local', 'config', 'permissions.json');
-    expect(JSON.parse(fs.readFileSync(file, 'utf8')).localExec.granted).toBe(true);
+    // Persisted shape is now the three-mode model; grantLocalExec → allow_all.
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).localExec.mode).toBe('allow_all');
   });
 
   it('[PC-CONN-002] stores connector soft-disable separately from disconnect state', async () => {

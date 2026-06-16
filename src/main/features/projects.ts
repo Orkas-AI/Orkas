@@ -198,11 +198,8 @@ async function _writeBindings(uid: string, pid: string, b: ProjectBindings): Pro
   _notifyDirty();
 }
 
-// Sync engine dirty signal (lazy-require — `features/sync` is stripped from OrkasOpen). Mirrors
-// the pattern in `agents.ts::_invalidateAgentListCache`: any write to a `cloud/projects/...`
-// file should kick the sync debounce so the change propagates within seconds rather than the
-// 5-min periodic.
 function _notifyDirty(): void {
+  // OrkasOpen is local-only; cloud sync notification is intentionally absent.
 }
 
 // ── Validation ────────────────────────────────────────────────────────────

@@ -154,6 +154,10 @@ const ConversationInfo = (() => {
     return 'text';
   }
 
+  function _canAddEntryToLibrary(kind) {
+    return kind !== 'video' && kind !== 'dir';
+  }
+
   function _formatBytes(bytes) {
     const n = Number(bytes);
     if (!Number.isFinite(n) || n <= 0) return '';
@@ -256,7 +260,6 @@ const ConversationInfo = (() => {
       syncEnabled: syncEnabled === true,
     };
   }
-
   async function _loadSyncEnabled() {
     return false;
   }
@@ -1092,7 +1095,7 @@ const ConversationInfo = (() => {
     const addItem = entryKind === 'file'
       ? `<div class="ctx-row-menu-item" data-action="add-to-chat">${escapeHtml(addLabel)}</div>`
       : '';
-    const addLibraryItem = entryKind === 'file'
+    const addLibraryItem = entryKind === 'file' && _canAddEntryToLibrary(kind)
       ? `<div class="ctx-row-menu-item" data-action="add-to-library">${escapeHtml(addLibraryLabel)}</div>`
       : '';
     const saveAppItem = canSaveApp
@@ -1155,7 +1158,7 @@ const ConversationInfo = (() => {
   }
 
   async function _addEntryToLibrary(absPath, kind) {
-    if (kind === 'dir') return;
+    if (!_canAddEntryToLibrary(kind)) return;
     try {
       const res = await window.orkas.invoke('library.importProduced', _fileActionPayload(absPath));
       if (!res || !res.ok) throw new Error((res && res.error) || 'failed');

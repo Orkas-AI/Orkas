@@ -8,12 +8,13 @@ vi.mock('electron', () => ({
   shell: { openExternal: electronMock.openExternal },
 }));
 
-vi.mock('../../../../src/main/features/connectors/_server_bridge', () => ({
+vi.mock('../../../../src/main/features/account/server', () => ({
   accountApiBase: () => 'https://account.example/api',
-  tokenStore: {
-    getDeviceId: () => 'device-1',
-    authHeaders: () => ({}),
-  },
+}));
+
+vi.mock('../../../../src/main/features/account/token_store', () => ({
+  getDeviceId: () => 'device-1',
+  authHeaders: () => ({ user_id: 'uid-1', session_id: 'sid-1' }),
 }));
 
 vi.mock('../../../../src/main/features/config', () => ({
@@ -176,7 +177,7 @@ describe('features/connectors/oauth-dcr', () => {
         expect(body.refresh_token).toBe('refresh-local');
         expect(body.dcr_client.client_id).toBe('client-1');
         expect(body.dcr_client.client_secret).toBe('secret-1');
-        expect((init?.headers as Record<string, string>).user_id).toBeUndefined();
+        expect((init?.headers as Record<string, string>).user_id).toBe('uid-1');
         return jsonResponse({
           code: 0,
           access_token: 'access-server',

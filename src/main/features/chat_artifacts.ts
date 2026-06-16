@@ -126,6 +126,35 @@ function safeRelPath(rel: unknown): string {
   return segs.join('/');
 }
 
+function artifactRelPath(cid: string, artifactId: string, rel = ''): string {
+  return ['cloud/chat_artifacts', cid, artifactId, rel].filter(Boolean).join('/');
+}
+
+function notifyArtifactDirty(cid: string, artifactId: string): void {
+  void cid;
+  void artifactId;
+}
+
+function notifyArtifactDeleted(cid: string, artifactId: string, rel: string): void {
+  void cid;
+  void artifactId;
+  void rel;
+}
+
+function listArtifactFilesRel(dir: string, prefix = ''): string[] {
+  const out: string[] = [];
+  let entries: fs.Dirent[];
+  try { entries = fs.readdirSync(path.join(dir, prefix), { withFileTypes: true }); }
+  catch { return out; }
+  for (const entry of entries) {
+    if (entry.name.startsWith('.')) continue;
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) out.push(...listArtifactFilesRel(dir, rel));
+    else if (entry.isFile()) out.push(rel);
+  }
+  return out;
+}
+
 function extOf(name: string): string {
   return path.extname(name).toLowerCase();
 }
@@ -309,6 +338,7 @@ export function createArtifact(
     return { ok: false, error: `failed to write artifact: ${(err as Error).message}` };
   }
   log.info(`createArtifact user=${userId} cid=${safeConvId} id=${artifactId} files=${prepared.length} bytes=${totalBytes} agent=${meta.agentId}`);
+  notifyArtifactDirty(safeConvId, artifactId);
   return { ok: true, artifactId, title };
 }
 
@@ -414,12 +444,21 @@ export async function purgeByCid(userId: string, cid: string): Promise<number> {
   catch { return 0; }
   const dir = chatArtifactCidDir(userId, safeConvId);
   let count = 0;
+  const deleted: Array<{ artifactId: string; rel: string }> = [];
   try {
     if (fs.existsSync(dir)) {
-      try { count = fs.readdirSync(dir).filter((n) => !n.startsWith('.')).length; }
+      try {
+        const artifactIds = fs.readdirSync(dir).filter((n) => !n.startsWith('.'));
+        count = artifactIds.length;
+        for (const artifactId of artifactIds) {
+          const artifactRoot = path.join(dir, artifactId);
+          for (const rel of listArtifactFilesRel(artifactRoot)) deleted.push({ artifactId, rel });
+        }
+      }
       catch { /* ignore */ }
       fs.rmSync(dir, { recursive: true, force: true });
     }
   } catch (err) { log.warn(`purgeByCid(${cid}): ${(err as Error).message}`); }
+  for (const item of deleted) notifyArtifactDeleted(safeConvId, item.artifactId, item.rel);
   return count;
 }

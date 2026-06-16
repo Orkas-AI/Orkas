@@ -117,6 +117,20 @@ function writeMeta(dir: string, meta: SavedAppMeta): void {
   fs.writeFileSync(path.join(dir, META_FILENAME), Buffer.from(JSON.stringify(meta, null, 2), 'utf8'));
 }
 
+function savedAppRelPath(appId: string, rel = ''): string {
+  return ['cloud/saved_apps', appId, rel].filter(Boolean).join('/');
+}
+
+function notifySavedAppDirty(appId: string, rel = ''): void {
+  void appId;
+  void rel;
+}
+
+function notifySavedAppDeleted(appId: string, rel: string): void {
+  void appId;
+  void rel;
+}
+
 function isInsideAnyRoot(candidate: string, roots: string[]): boolean {
   if (!roots.length) return true;
   const c = path.resolve(candidate);
@@ -401,6 +415,7 @@ export function saveFromArtifact(userId: string, cid: string, artifactId: string
     conversation_id: maskId(cid),
     artifact_id: maskId(artifactId),
   });
+  notifySavedAppDirty(appId);
   return { ok: true, id: appId, title };
 }
 
@@ -448,6 +463,7 @@ export function saveFromPath(
       file_count: copied.fileCount,
       total_bytes: copied.totalBytes,
     });
+    notifySavedAppDirty(appId);
     return { ok: true, id: appId, title, rootDir: inspected.rootDir, entry: inspected.entry, ...copied };
   } catch (err) {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
@@ -580,6 +596,7 @@ export function renameSavedApp(userId: string, appId: string, title: unknown): R
   try { writeMeta(dir, meta); }
   catch (err) { return { ok: false, error: `failed to rename: ${(err as Error).message}` }; }
   log.info('renameSavedApp completed', { user_id: maskId(userId), app_id: maskId(safeId) });
+  notifySavedAppDirty(safeId, META_FILENAME);
   return { ok: true, title: meta.title };
 }
 
@@ -589,6 +606,7 @@ export function deleteSavedApp(userId: string, appId: string): Result {
   try { safeId = safeAppId(appId); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   const dir = savedAppDir(userId, safeId);
+  const deleted = fs.existsSync(dir) ? listAppFilesRel(dir) : [];
   try {
     if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
   } catch (err) {
@@ -596,6 +614,7 @@ export function deleteSavedApp(userId: string, appId: string): Result {
     return { ok: false, error: `failed to delete: ${(err as Error).message}` };
   }
   log.info('deleteSavedApp completed', { user_id: maskId(userId), app_id: maskId(safeId) });
+  for (const rel of deleted) notifySavedAppDeleted(safeId, rel);
   return { ok: true };
 }
 

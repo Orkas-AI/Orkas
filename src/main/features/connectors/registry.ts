@@ -62,7 +62,7 @@ interface SecretsBlob { oauth_grant?: OAuthGrant; dcr_client?: DcrClientCredenti
 const PRESERVED_SECRETS = Symbol('preservedConnectorSecrets');
 type ConnectorInstanceWithPreservedSecrets = ConnectorInstance & { [PRESERVED_SECRETS]?: string };
 
-// Secret-owner resolver for OrkasOpen: connector grants are encrypted to the local profile id.
+// Secret-owner resolver. OrkasOpen stores connector secrets under the local uid.
 function _secretOwner(uid: string): string {
   return uid;
 }
@@ -76,6 +76,7 @@ function _secretContext(uid: string, instanceId: string): localSecrets.LocalSecr
 }
 
 function _notifyDirty(): void {
+  // OrkasOpen is local-only; cloud sync notification is intentionally absent.
 }
 
 function _notifyRendererChanged(): void {

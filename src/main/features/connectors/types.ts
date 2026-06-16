@@ -44,6 +44,12 @@ export interface ConnectorInstance {
    *  every tool name emitted into the AgentRunner tool list: `<id>__<tool_name>`. */
   id: string;
   display_name: string;
+  /** Where the instance came from. Missing/undefined = 'catalog' (pre-existing rows).
+   *  'custom' = user-supplied MCP server (id always carries the `custom-` prefix so it can
+   *  never collide with a catalog entry id); its transport is used verbatim — no catalog
+   *  template, no OAuth grant, no server-side refresh. See
+   *  docs/plans/open-ecosystem-architecture.md §C. */
+  origin?: 'catalog' | 'custom';
   transport: Transport;
   /** Tool subset to expose. `null` = all reported tools; `string[]` = whitelist of tool names. */
   enabled_subtools: string[] | null;

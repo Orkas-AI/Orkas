@@ -10,6 +10,27 @@
 
 const _projectDetailLog = createLogger('project-detail');
 
+function _projectTrackClick(action, data) {
+}
+
+function _projectTrackEvent(action, data) {
+}
+
+function _projectTrackError(action, data) {
+}
+
+function _projectFileUploadPayload(fileList, source, targetDir) {
+  const files = Array.from(fileList || []);
+  let totalBytes = 0;
+  for (const file of files) totalBytes += Number((file && (file.size || file.bytes)) || 0);
+  return {
+    source,
+    file_count: files.length,
+    total_bytes: totalBytes,
+    has_target_dir: !!targetDir,
+  };
+}
+
 let _projectDetailPid = '';     // pid currently rendered in the panel
 let _projectDetailMeta = null;  // { project, agentDetails, skillDetails, files, libraryStatus? }
 let _projectKbStatusByName = {}; // {[name]: {status, chunks?, error?, kind?}}
@@ -180,6 +201,7 @@ function _bindProjectAutoAddBtn() {
   btn.dataset.bound = '1';
   btn.addEventListener('click', () => {
     if (!_projectDetailPid || typeof openAutoTaskDialog !== 'function') return;
+    _projectTrackClick('project_auto_task_open', { project_id: _projectDetailPid });
     openAutoTaskDialog({
       projectId: _projectDetailPid,
       onSaved: () => {
@@ -745,6 +767,10 @@ async function _openProjectFile(name) {
   if (!_projectDetailPid || !name) return;
   const row = _findProjectFileRow(name);
   const kind = row?.dataset?.projectFileKind || '';
+  _projectTrackClick('project_file_open', {
+    project_id: _projectDetailPid,
+    file_kind: kind || 'other',
+  });
   _projectLibraryActiveName = name;
   _markProjectLibraryActive();
   try {
@@ -959,6 +985,8 @@ async function _revealProjectFile(name) {
 
 async function _reprocessProjectFile(name) {
   if (!_projectDetailPid || !name) return;
+  const startedAt = performance.now();
+  _projectTrackClick('project_file_reprocess', { project_id: _projectDetailPid });
   try {
     _projectKbStatusByName[name] = {
       ...(_projectKbStatusByName[name] || {}),
@@ -971,7 +999,21 @@ async function _reprocessProjectFile(name) {
       name,
     });
     if (!res?.ok) throw new Error(res?.error || 'reprocess_failed');
+    _projectTrackEvent('project_file_reprocess_result', {
+      project_id: _projectDetailPid,
+      result: 'success',
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
   } catch (err) {
+    _projectTrackEvent('project_file_reprocess_result', {
+      project_id: _projectDetailPid,
+      result: 'failure',
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
+    _projectTrackError('project_file_reprocess', {
+      project_id: _projectDetailPid,
+      error_type: 'exception',
+    });
     _projectDetailLog.warn('reprocess project file failed', err);
     if (typeof uiAlert === 'function') uiAlert(t('project.files.reprocess_failed'));
   }
@@ -979,6 +1021,13 @@ async function _reprocessProjectFile(name) {
 
 async function _deleteProjectFile(name) {
   if (!_projectDetailPid || !name) return;
+  const row = _findProjectFileRow(name);
+  const kind = row?.dataset?.projectFileKind || '';
+  const startedAt = performance.now();
+  _projectTrackClick('project_file_delete', {
+    project_id: _projectDetailPid,
+    file_kind: kind || 'other',
+  });
   try {
     const res = await window.orkas.invoke('projects.files.delete', {
       projectId: _projectDetailPid,
@@ -993,7 +1042,23 @@ async function _deleteProjectFile(name) {
     }
     _projectLibraryExpanded.delete(name);
     await loadProjectDetail(_projectDetailPid);
+    _projectTrackEvent('project_file_delete_result', {
+      project_id: _projectDetailPid,
+      result: 'success',
+      file_kind: kind || 'other',
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
   } catch (err) {
+    _projectTrackEvent('project_file_delete_result', {
+      project_id: _projectDetailPid,
+      result: 'failure',
+      file_kind: kind || 'other',
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
+    _projectTrackError('project_file_delete', {
+      project_id: _projectDetailPid,
+      error_type: 'exception',
+    });
     _projectDetailLog.warn('delete project file failed', err);
     if (typeof uiAlert === 'function') uiAlert(t('project.files.delete_failed'));
   }
@@ -1225,6 +1290,11 @@ async function _createProjectTextFile(parentDir = '') {
   if (!_projectDetailPid) return;
   const stem = t('contexts.new.untitled_stem');
   const fullPath = _projectJoinPath(parentDir, `${stem}.md`);
+  const startedAt = performance.now();
+  _projectTrackClick('project_file_create_text', {
+    project_id: _projectDetailPid,
+    has_target_dir: !!parentDir,
+  });
   try {
     const res = await window.orkas.invoke('projects.files.createText', {
       projectId: _projectDetailPid,
@@ -1237,7 +1307,21 @@ async function _createProjectTextFile(parentDir = '') {
     await loadProjectDetail(_projectDetailPid);
     await _openProjectFile(name);
     if (_projectLibraryMveController) _projectLibraryMveController.setMode('edit');
+    _projectTrackEvent('project_file_create_text_result', {
+      project_id: _projectDetailPid,
+      result: 'success',
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
   } catch (err) {
+    _projectTrackEvent('project_file_create_text_result', {
+      project_id: _projectDetailPid,
+      result: 'failure',
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
+    _projectTrackError('project_file_create_text', {
+      project_id: _projectDetailPid,
+      error_type: 'exception',
+    });
     _projectDetailLog.warn('create project text failed', err);
     if (typeof uiAlert === 'function') uiAlert(t('contexts.file.create_failed'));
   }
@@ -1252,6 +1336,11 @@ async function _createProjectDir(parentDir = '') {
     return;
   }
   const rel = _projectJoinPath(parentDir, nameRaw);
+  const startedAt = performance.now();
+  _projectTrackClick('project_folder_create', {
+    project_id: _projectDetailPid,
+    has_target_dir: !!parentDir,
+  });
   try {
     const res = await window.orkas.invoke('projects.files.mkdir', {
       projectId: _projectDetailPid,
@@ -1261,7 +1350,21 @@ async function _createProjectDir(parentDir = '') {
     if (parentDir) _projectLibraryExpanded.add(parentDir);
     _projectLibraryExpanded.add(res.path || rel);
     await loadProjectDetail(_projectDetailPid);
+    _projectTrackEvent('project_folder_create_result', {
+      project_id: _projectDetailPid,
+      result: 'success',
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
   } catch (err) {
+    _projectTrackEvent('project_folder_create_result', {
+      project_id: _projectDetailPid,
+      result: 'failure',
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
+    _projectTrackError('project_folder_create', {
+      project_id: _projectDetailPid,
+      error_type: 'exception',
+    });
     _projectDetailLog.warn('create project folder failed', err);
     if (typeof uiAlert === 'function') uiAlert(t('contexts.dir.create_failed'));
   }
@@ -1280,6 +1383,13 @@ async function _renameProjectFile(name) {
   const nextBase = (await uiPrompt(t('project.files.rename_prompt'), base) || '').trim();
   if (!nextBase || nextBase === base) return;
   const next = nextBase.includes('/') ? nextBase : _projectJoinPath(parentDir, nextBase);
+  const row = _findProjectFileRow(name);
+  const kind = row?.dataset?.projectFileKind || '';
+  const startedAt = performance.now();
+  _projectTrackClick('project_file_rename', {
+    project_id: _projectDetailPid,
+    file_kind: kind || 'other',
+  });
   try {
     const res = await window.orkas.invoke('projects.files.rename', {
       projectId: _projectDetailPid,
@@ -1310,7 +1420,23 @@ async function _renameProjectFile(name) {
       }
     }
     await loadProjectDetail(_projectDetailPid);
+    _projectTrackEvent('project_file_rename_result', {
+      project_id: _projectDetailPid,
+      result: 'success',
+      file_kind: kind || 'other',
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
   } catch (err) {
+    _projectTrackEvent('project_file_rename_result', {
+      project_id: _projectDetailPid,
+      result: 'failure',
+      file_kind: kind || 'other',
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
+    _projectTrackError('project_file_rename', {
+      project_id: _projectDetailPid,
+      error_type: 'exception',
+    });
     _projectDetailLog.warn('rename project file failed', err);
     if (typeof uiAlert === 'function') uiAlert(t('contexts.entry.rename_failed'));
   }
@@ -1400,11 +1526,14 @@ function _setProjectFilesStatus(text) {
   status.style.display = body ? '' : 'none';
 }
 
-async function _uploadProjectFiles(fileList, targetDir = '') {
+async function _uploadProjectFiles(fileList, targetDir = '', source = 'drop') {
   if (!_projectDetailPid || !fileList || !fileList.length) return;
   const files = Array.from(fileList).filter(Boolean);
   if (!files.length) return;
   if (targetDir) _projectLibraryExpanded.add(targetDir);
+  const payload = _projectFileUploadPayload(files, source, targetDir);
+  const startedAt = performance.now();
+  _projectTrackClick('project_file_upload', { project_id: _projectDetailPid, ...payload });
   _setProjectFilesStatus(t('project.files.uploading'));
   const failed = [];
   await Promise.all(files.map(async (file) => {
@@ -1430,6 +1559,14 @@ async function _uploadProjectFiles(fileList, targetDir = '') {
     }
   }));
   await loadProjectDetail(_projectDetailPid);
+  _projectTrackEvent('project_file_upload_result', {
+    project_id: _projectDetailPid,
+    ...payload,
+    result: failed.length ? (failed.length < files.length ? 'partial_failure' : 'failure') : 'success',
+    uploaded_count: Math.max(0, files.length - failed.length),
+    failed_count: failed.length,
+    duration_ms: Math.round(performance.now() - startedAt),
+  });
   if (failed.length && typeof uiAlert === 'function') {
     await uiAlert(t('project.files.upload_failed_list', { list: failed.join('\n') }));
   }
@@ -1438,6 +1575,9 @@ async function _uploadProjectFiles(fileList, targetDir = '') {
 async function _uploadProjectFilesNative(targetDir = '') {
   if (!_projectDetailPid) return;
   if (targetDir) _projectLibraryExpanded.add(targetDir);
+  const payload = { source: 'picker', has_target_dir: !!targetDir };
+  const startedAt = performance.now();
+  _projectTrackClick('project_file_upload', { project_id: _projectDetailPid, ...payload });
   _setProjectFilesStatus(t('project.files.uploading'));
   let data;
   try {
@@ -1447,6 +1587,18 @@ async function _uploadProjectFilesNative(targetDir = '') {
     });
   } catch (err) {
     _setProjectFilesStatus('');
+    _projectTrackEvent('project_file_upload_result', {
+      project_id: _projectDetailPid,
+      ...payload,
+      result: 'failure',
+      uploaded_count: 0,
+      failed_count: 1,
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
+    _projectTrackError('project_file_upload', {
+      project_id: _projectDetailPid,
+      error_type: 'exception',
+    });
     if (typeof uiAlert === 'function') {
       await uiAlert(t('project.files.upload_failed_list', { list: err?.message || String(err) }));
     }
@@ -1454,7 +1606,17 @@ async function _uploadProjectFilesNative(targetDir = '') {
   }
   _setProjectFilesStatus('');
   await loadProjectDetail(_projectDetailPid);
-  const failed = (Array.isArray(data && data.files) ? data.files : []).filter((r) => !r || r.ok === false);
+  const rows = Array.isArray(data && data.files) ? data.files : [];
+  const failed = rows.filter((r) => !r || r.ok === false);
+  _projectTrackEvent('project_file_upload_result', {
+    project_id: _projectDetailPid,
+    ...payload,
+    result: failed.length ? (failed.length < rows.length ? 'partial_failure' : 'failure') : 'success',
+    uploaded_count: Math.max(0, rows.length - failed.length),
+    failed_count: failed.length,
+    file_count: rows.length,
+    duration_ms: Math.round(performance.now() - startedAt),
+  });
   if (failed.length && typeof uiAlert === 'function') {
     const list = failed.map((r) => t('project.files.upload_failed', {
       name: r.name || 'file',
@@ -1483,6 +1645,19 @@ async function _submitProjectChat() {
   const content = (typeof applyRecipientPrefix === 'function')
     ? applyRecipientPrefix(withUse, 'project')
     : withUse;
+  const recipientType = recipient && recipient.kind ? recipient.kind : 'commander';
+  const sendPayload = {
+    project_id: _projectDetailPid,
+    source_view: 'project',
+    content_length: raw.length,
+    recipient_type: recipientType,
+    has_skill: !!(useSelection && useSelection.kind === 'skill'),
+    has_connector: !!(useSelection && useSelection.kind === 'connector'),
+    attachment_count: 0,
+    has_project: true,
+  };
+  _projectTrackClick('project_chat_send', sendPayload);
+  _projectTrackClick('chat_send', sendPayload);
   if (btn) btn.disabled = true;
   let convId = '';
   try {
@@ -1572,12 +1747,35 @@ function _bindRemoveButtons() {
       if (!row) return;
       const kind = row.dataset.kind;
       const id = row.dataset.id;
+      const startedAt = performance.now();
+      _projectTrackClick('project_binding_remove', {
+        project_id: _projectDetailPid,
+        binding_kind: kind,
+        binding_id: id,
+      });
       try {
         await window.orkas.invoke('projects.bindings.remove', {
           projectId: _projectDetailPid, kind, id,
         });
         await loadProjectDetail(_projectDetailPid);
+        _projectTrackEvent('project_binding_remove_result', {
+          project_id: _projectDetailPid,
+          binding_kind: kind,
+          result: 'success',
+          duration_ms: Math.round(performance.now() - startedAt),
+        });
       } catch (err) {
+        _projectTrackEvent('project_binding_remove_result', {
+          project_id: _projectDetailPid,
+          binding_kind: kind,
+          result: 'failure',
+          duration_ms: Math.round(performance.now() - startedAt),
+        });
+        _projectTrackError('project_binding_remove', {
+          project_id: _projectDetailPid,
+          binding_kind: kind,
+          error_type: 'exception',
+        });
         _projectDetailLog.warn('remove binding failed', err);
       }
     });
@@ -1589,6 +1787,10 @@ function _bindRemoveButtons() {
 async function _openAddPicker(kind) {
   // Dispose any previously-open picker so re-clicks don't stack.
   document.getElementById('project-binding-picker-overlay')?.remove();
+  _projectTrackClick('project_binding_picker_open', {
+    project_id: _projectDetailPid,
+    binding_kind: kind,
+  });
 
   let candidates;
   try {
@@ -1680,11 +1882,23 @@ async function _openAddPicker(kind) {
         if (!row) return;
         const id = row.dataset.id;
         const k = row.dataset.kind;
+        const startedAt = performance.now();
+        _projectTrackClick('project_binding_add', {
+          project_id: _projectDetailPid,
+          binding_kind: k,
+          binding_id: id,
+        });
         try {
           const res = await window.orkas.invoke('projects.bindings.add', {
             projectId: _projectDetailPid, kind: k, id,
           });
           if (!res?.ok) throw new Error(res?.error || 'add_failed');
+          _projectTrackEvent('project_binding_add_result', {
+            project_id: _projectDetailPid,
+            binding_kind: k,
+            result: 'success',
+            duration_ms: Math.round(performance.now() - startedAt),
+          });
           // Drop the picked id from the local candidate set so it
           // disappears from subsequent renders without a server round-trip.
           candidates = candidates.filter((c) => {
@@ -1696,6 +1910,17 @@ async function _openAddPicker(kind) {
           // items appear in the rail behind the modal.
           loadProjectDetail(_projectDetailPid).catch((err) => _projectDetailLog.warn('refresh failed', err));
         } catch (err) {
+          _projectTrackEvent('project_binding_add_result', {
+            project_id: _projectDetailPid,
+            binding_kind: k,
+            result: 'failure',
+            duration_ms: Math.round(performance.now() - startedAt),
+          });
+          _projectTrackError('project_binding_add', {
+            project_id: _projectDetailPid,
+            binding_kind: k,
+            error_type: 'exception',
+          });
           _projectDetailLog.warn('add binding failed', err);
         }
       });
@@ -1749,6 +1974,12 @@ async function _commitRename(newName) {
     return;
   }
   let code = '';
+  const startedAt = performance.now();
+  _projectTrackClick('project_rename_submit', {
+    project_id: _projectDetailPid,
+    name_length: trimmed.length,
+    source: 'detail',
+  });
   try {
     const res = await window.orkas.invoke('projects.rename', {
       projectId: _projectDetailPid, name: trimmed,
@@ -1756,6 +1987,12 @@ async function _commitRename(newName) {
     if (!res || !res.ok) {
       code = (res && res.error) || 'generic';
     } else {
+      _projectTrackEvent('project_rename_result', {
+        project_id: _projectDetailPid,
+        result: 'success',
+        source: 'detail',
+        duration_ms: Math.round(performance.now() - startedAt),
+      });
       _projectDetailMeta.project = res.project;
       if (typeof loadProjects === 'function') loadProjects(true);
       _exitRenameMode();
@@ -1765,6 +2002,17 @@ async function _commitRename(newName) {
   } catch (err) {
     code = (err && err.message) || 'generic';
   }
+  _projectTrackEvent('project_rename_result', {
+    project_id: _projectDetailPid,
+    result: 'failure',
+    source: 'detail',
+    duration_ms: Math.round(performance.now() - startedAt),
+  });
+  _projectTrackError('project_rename', {
+    project_id: _projectDetailPid,
+    source: 'detail',
+    error_type: code || 'exception',
+  });
   if (code === 'name_dup') {
     await uiAlert(t('project.name_dup_inline'));
   } else if (code === 'name_empty') {

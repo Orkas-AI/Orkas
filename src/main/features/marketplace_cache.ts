@@ -153,9 +153,9 @@ export async function writeSkillCache(
   });
 }
 
-/** Skill cache dir (caller copies its contents into builtin/skills/<id>/ on install, OR reads
- *  files directly for detail-page rendering). The `_cache.json` sentinel must NOT propagate to
- *  the install target — `installFromSkillCache` in `marketplace.ts` strips it on copy. */
+/** Skill cache dir (caller copies its contents into the marketplace install dir, OR reads files
+ *  directly for detail-page rendering). The `_cache.json` sentinel must NOT propagate to the
+ *  install target — `installFromSkillCache` in `marketplace.ts` strips it on copy. */
 export function getSkillCacheDir(id: string): string {
   return _cacheDir('skill', id);
 }
@@ -220,6 +220,8 @@ export async function listSkillCacheFiles(id: string): Promise<{ path: string; b
 export interface ListingsCacheEntry {
   items: unknown[];
   ts: number;
+  categories?: unknown[];
+  total?: number;
 }
 export interface ListingsCacheFile {
   version: 3;
@@ -229,6 +231,10 @@ const LISTINGS_VERSION = 3;
 
 export async function getListingsCache(): Promise<ListingsCacheFile> {
   const file = marketplaceListingsCacheFile(getActiveUserId());
+  return _readListingsCacheFile(file);
+}
+
+async function _readListingsCacheFile(file: string): Promise<ListingsCacheFile> {
   if (!fs.existsSync(file)) return { version: LISTINGS_VERSION, entries: {} };
   try {
     const text = await fsp.readFile(file, 'utf8');
@@ -245,20 +251,39 @@ export async function getListingsCache(): Promise<ListingsCacheFile> {
   }
 }
 
+async function _writeListingsCacheFile(uid: string, entries: Record<string, ListingsCacheEntry>): Promise<void> {
+  const file = marketplaceListingsCacheFile(uid);
+  await fsp.mkdir(path.dirname(file), { recursive: true });
+  const tmp = `${file}.tmp`;
+  const data: ListingsCacheFile = { version: LISTINGS_VERSION, entries };
+  await fsp.writeFile(tmp, JSON.stringify(data), 'utf8');
+  await fsp.rename(tmp, file);
+}
+
 // Serialize writes so renderer-burst saves (multiple fresh listings landing back-to-back)
 // don't trample each other. Atomic via temp + rename — partial writes never publish.
 let _listingsWriteQueue: Promise<void> = Promise.resolve();
 export function setListingsCache(entries: Record<string, ListingsCacheEntry>): Promise<void> {
   const uid = getActiveUserId();
   _listingsWriteQueue = _listingsWriteQueue.then(async () => {
-    const file = marketplaceListingsCacheFile(uid);
-    await fsp.mkdir(path.dirname(file), { recursive: true });
-    const tmp = `${file}.tmp`;
-    const data: ListingsCacheFile = { version: LISTINGS_VERSION, entries };
-    await fsp.writeFile(tmp, JSON.stringify(data), 'utf8');
-    await fsp.rename(tmp, file);
+    await _writeListingsCacheFile(uid, entries);
   }).catch((err) => {
     log.warn(`write listings cache failed: ${(err as Error).message}`);
+  });
+  return _listingsWriteQueue;
+}
+
+export function mergeListingsCache(entries: Record<string, ListingsCacheEntry>): Promise<void> {
+  const uid = getActiveUserId();
+  _listingsWriteQueue = _listingsWriteQueue.then(async () => {
+    const file = marketplaceListingsCacheFile(uid);
+    const current = await _readListingsCacheFile(file);
+    await _writeListingsCacheFile(uid, {
+      ...(current.entries || {}),
+      ...entries,
+    });
+  }).catch((err) => {
+    log.warn(`merge listings cache failed: ${(err as Error).message}`);
   });
   return _listingsWriteQueue;
 }

@@ -45,4 +45,27 @@ describe('marketplace install manifest', () => {
     expect(reinstalled.agents).toHaveLength(1);
     expect(reinstalled._deleted_at?.agents?.['agent-a']).toBeUndefined();
   });
+
+  it('prunes uninstall tombstones older than the retention window when reading', async () => {
+    const dir = path.join(tmpDir, 'u1', 'cloud', 'marketplace');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'installs.json'), JSON.stringify({
+      version: 1,
+      agents: [],
+      skills: [],
+      _deleted_at: {
+        agents: {
+          'agent-old': Date.now() - 31 * 24 * 60 * 60 * 1000,
+          'agent-recent': Date.now(),
+        },
+      },
+    }, null, 2), 'utf8');
+
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    const manifest = await installs.readInstalls('u1');
+
+    expect(manifest._deleted_at?.agents).toEqual({
+      'agent-recent': expect.any(Number),
+    });
+  });
 });

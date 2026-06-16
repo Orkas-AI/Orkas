@@ -75,6 +75,36 @@ function _alertStepActionFailure(action, reason) {
   }
 }
 
+async function _continuePlan(cid, control = null) {
+  if (!cid) return false;
+  const recoveryStream = _beginConversationRecoveryStream(cid);
+  let recoveryStarted = false;
+  if (control) control.disabled = true;
+  try {
+    const res = await apiFetch(
+      `/api/conversations/${encodeURIComponent(cid)}/plan/continue`,
+      { method: 'POST' },
+    );
+    const data = await res.json().catch(() => ({}));
+    if (!data?.ok) {
+      _alertStepActionFailure('continue', data?.error);
+      _cancelConversationRecoveryStream(recoveryStream);
+      return false;
+    }
+    recoveryStarted = true;
+    return true;
+  } catch (err) {
+    _cancelConversationRecoveryStream(recoveryStream);
+    _alertStepActionFailure('continue', err && err.message);
+    return false;
+  } finally {
+    if (!recoveryStarted) _cancelConversationRecoveryStream(recoveryStream);
+    if (control) control.disabled = false;
+    await PlanRail.refresh(cid, { force: true });
+    _refreshConversationInfo(cid);
+  }
+}
+
 function _formatAssigneeMeta(raw) {
   const a = (raw || '').trim();
   if (!a) return '';
@@ -281,6 +311,16 @@ const PlanRail = {
     _rerenderCachedPlan();
     PlanRail.refresh(cid);
   },
+
+  currentAction() {
+    return _lastControl && _lastControl.action ? _lastControl.action : null;
+  },
+
+  continueCurrent() {
+    if (!_currentCid || PlanRail.currentAction() !== 'continue') return false;
+    const control = document.getElementById('plan-rail-control');
+    return _continuePlan(_currentCid, control);
+  },
 };
 
 // Expose on the global namespace for conversation.js to hook.
@@ -353,29 +393,7 @@ document.addEventListener('click', async (ev) => {
       return;
     }
     if (action === 'continue') {
-      const recoveryStream = _beginConversationRecoveryStream(cid);
-      let recoveryStarted = false;
-      try {
-        const res = await apiFetch(
-          `/api/conversations/${encodeURIComponent(cid)}/plan/continue`,
-          { method: 'POST' },
-        );
-        const data = await res.json().catch(() => ({}));
-        if (!data?.ok) {
-          _alertStepActionFailure('continue', data?.error);
-          _cancelConversationRecoveryStream(recoveryStream);
-        } else {
-          recoveryStarted = true;
-        }
-      } catch (err) {
-        _cancelConversationRecoveryStream(recoveryStream);
-        _alertStepActionFailure('continue', err && err.message);
-      } finally {
-        if (!recoveryStarted) _cancelConversationRecoveryStream(recoveryStream);
-        control.disabled = false;
-        await PlanRail.refresh(cid, { force: true });
-        _refreshConversationInfo(cid);
-      }
+      await _continuePlan(cid, control);
       return;
     }
     return;

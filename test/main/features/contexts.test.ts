@@ -218,6 +218,28 @@ describe('contexts › content-level dedup', () => {
     expect(c.writeContextFile('a.md', '').ok).toBe(true);
     expect(c.writeContextFile('b.md', '').ok).toBe(true);
   });
+
+  it('allows writes and uploads when duplicate lookup is unavailable', async () => {
+    const kb = await import('../../../src/main/features/kb_vector');
+    const spy = vi.spyOn(kb, 'findBySha1').mockImplementation(() => {
+      throw new Error('sqlite-vec load failed: 找不到指定的模块。');
+    });
+
+    try {
+      const c = await loadContexts();
+      const written = c.writeContextFile('LICENSE.electron.txt', 'license body');
+      const uploaded = c.uploadContextFile('upload.txt', Buffer.from('upload body'));
+
+      expect(written.ok).toBe(true);
+      expect(uploaded.ok).toBe(true);
+      expect(fs.existsSync(path.join(ctxRoot(), 'LICENSE.electron.txt'))).toBe(true);
+      expect(fs.existsSync(path.join(ctxRoot(), 'upload.txt'))).toBe(true);
+      expect(kbEnqueueCalls).toContainEqual({ userId: TEST_UID, relPath: 'LICENSE.electron.txt', op: 'upsert' });
+      expect(kbEnqueueCalls).toContainEqual({ userId: TEST_UID, relPath: 'upload.txt', op: 'upsert' });
+    } finally {
+      spy.mockRestore();
+    }
+  });
 });
 
 describe('contexts › uploadContextFile', () => {

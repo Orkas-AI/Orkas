@@ -136,6 +136,20 @@ function ensureDir(userId: string, cid: string): string {
   return dir;
 }
 
+function attachmentRelPath(cid: string, name: string): string {
+  return `cloud/chat_attachments/${cid}/${name}`;
+}
+
+function notifyAttachmentDirty(cid: string, name: string): void {
+  void cid;
+  void name;
+}
+
+function notifyAttachmentDeleted(cid: string, name: string): void {
+  void cid;
+  void name;
+}
+
 function uniqueTarget(dir: string, name: string): string {
   let target = path.join(dir, name);
   if (!fs.existsSync(target)) return target;
@@ -284,6 +298,7 @@ export async function uploadAttachment(
     const st = fs.statSync(target);
     const kind = kindOf(ext);
     log.info(`upload user=${userId} cid=${safeConvId} name=${finalName} kind=${kind} bytes=${st.size}`);
+    notifyAttachmentDirty(safeConvId, finalName);
     return {
       ok: true,
       info: {
@@ -355,6 +370,7 @@ export async function importAttachmentFromPath(
     const st = fs.statSync(target);
     const kind = kindOf(ext);
     log.info(`import user=${userId} cid=${safeConvId} name=${finalName} kind=${kind} bytes=${st.size}`);
+    notifyAttachmentDirty(safeConvId, finalName);
     return {
       ok: true,
       info: {
@@ -453,6 +469,7 @@ export function deleteAttachment(userId: string, cid: string, name: string): Res
   try {
     if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
   } catch { /* best-effort */ }
+  notifyAttachmentDeleted(safeConvId, safeName);
   return { ok: true };
 }
 
@@ -622,6 +639,9 @@ export function adoptDraftAttachments(
   const src = chatAttachmentDir(userId, srcSafe);
   if (!fs.existsSync(src)) return { ok: true, count: 0 };
   const dst = chatAttachmentDir(userId, dstSafe);
+  let movedNames: string[] = [];
+  try { movedNames = fs.readdirSync(src).filter((n) => !n.startsWith('.')); }
+  catch { /* ignore */ }
 
   try {
     if (!fs.existsSync(dst)) {
@@ -647,6 +667,10 @@ export function adoptDraftAttachments(
   let count = 0;
   try { count = fs.readdirSync(dst).filter((n) => !n.startsWith('.')).length; }
   catch { /* ignore */ }
+  for (const name of movedNames) {
+    notifyAttachmentDeleted(srcSafe, name);
+    notifyAttachmentDirty(dstSafe, name);
+  }
   log.info(`adopt user=${userId} ${srcSafe} → ${dstSafe} count=${count}`);
   return { ok: true, count };
 }
@@ -659,9 +683,12 @@ export async function purgeByCid(userId: string, cid: string): Promise<number> {
   catch { return 0; }
   const dir = chatAttachmentDir(userId, safeConvId);
   let count = 0;
+  let names: string[] = [];
   try {
     if (fs.existsSync(dir)) {
-      for (const n of fs.readdirSync(dir)) {
+      const entries = fs.readdirSync(dir);
+      names = entries.filter((n) => !n.startsWith('.'));
+      for (const n of entries) {
         try { fs.unlinkSync(path.join(dir, n)); count++; } catch { /* best-effort */ }
       }
       try { fs.rmdirSync(dir); } catch { /* best-effort */ }
@@ -669,6 +696,7 @@ export async function purgeByCid(userId: string, cid: string): Promise<number> {
   } catch (err) { log.warn(`purgeByCid(${cid}): ${(err as Error).message}`); }
   try { await purgeFileCacheByCid(userId, safeConvId); }
   catch (err) { log.warn(`purge file_cache cid=${safeConvId}: ${(err as Error).message}`); }
+  for (const name of names) notifyAttachmentDeleted(safeConvId, name);
   return count;
 }
 

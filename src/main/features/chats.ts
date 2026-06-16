@@ -38,6 +38,7 @@ import {
   RECORD_SYNC_DEVICE_FIELD,
   RECORD_SYNC_REV_FIELD,
   bumpRecordSyncVersion,
+  recordSyncRev,
 } from '../util/record_sync_fields';
 import { limitNameDisplayText } from '../util/name-limit';
 
@@ -93,6 +94,10 @@ export interface Conversation {
   /** Optional sidebar pin timestamp. Pinned conversations sort to the top of
    *  whichever sidebar list currently contains them (project or unprojected). */
   pinned_at?: string;
+  /** Logical clock for pin/unpin state. Unlike `updated_at`, this does not
+   *  affect last-activity ordering; it exists so sync/meta merges can tell a
+   *  deliberate unpin from an old missing/duplicated `pinned_at` value. */
+  pin_state_updated_at?: string;
   /** True after an explicit user rename. Auto-title must never overwrite a
    *  title once the user has named the task, even if they chose default-like
    *  text such as "New conversation". */
@@ -191,6 +196,7 @@ function _normaliseConversation(raw: any, fallbackCid = ''): Conversation | null
   if (typeof raw.project_id === 'string' && raw.project_id) out.project_id = raw.project_id;
   if (typeof raw.origin_auto_task_id === 'string' && raw.origin_auto_task_id) out.origin_auto_task_id = raw.origin_auto_task_id;
   if (typeof raw.pinned_at === 'string' && raw.pinned_at) out.pinned_at = raw.pinned_at;
+  if (typeof raw.pin_state_updated_at === 'string' && raw.pin_state_updated_at) out.pin_state_updated_at = raw.pin_state_updated_at;
   if (raw.title_manually_set === true) out.title_manually_set = true;
   if (typeof raw.deleted_at === 'string' && raw.deleted_at) out.deleted_at = raw.deleted_at;
   const syncRev = Number(raw[RECORD_SYNC_REV_FIELD]) || 0;
@@ -232,14 +238,60 @@ function _stampConversationSync(userId: string, c: Conversation): Conversation {
   return bumpRecordSyncVersion(c, _recordDeviceId(userId)) as Conversation;
 }
 
+const CLEARABLE_CONVERSATION_FIELDS = [
+  'project_id',
+  'origin_auto_task_id',
+  'pinned_at',
+  'pin_state_updated_at',
+  'title_manually_set',
+  'deleted_at',
+] as const satisfies readonly (keyof Conversation)[];
+
+function hasOwn(obj: object, key: PropertyKey): boolean {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+function _mergeWithWinningConversationFields(
+  loser: Conversation,
+  winner: Conversation,
+  clearMissingWinnerFields = false,
+): Conversation {
+  const out = { ...loser, ...winner };
+  if (clearMissingWinnerFields) {
+    for (const field of CLEARABLE_CONVERSATION_FIELDS) {
+      if (!hasOwn(winner, field)) delete (out as any)[field];
+    }
+  }
+  return out;
+}
+
+function _mergeWithWinningMetaFields(indexRow: Conversation, metaRow: Conversation): Conversation {
+  const out = { ...indexRow, ...metaRow };
+  const metaPinClock = tsMs(metaRow.pin_state_updated_at);
+  const indexPinClock = tsMs(indexRow.pin_state_updated_at);
+  if (metaPinClock && metaPinClock >= indexPinClock && !hasOwn(metaRow, 'pinned_at')) {
+    delete out.pinned_at;
+  }
+  return out;
+}
+
 function _mergeConversationRecord(indexRow: Conversation | undefined, metaRow: Conversation): Conversation {
   if (!indexRow) return metaRow;
   const indexMs = _lastActionMs(indexRow);
   const metaMs = _lastActionMs(metaRow);
-  if (metaMs > indexMs) return { ...indexRow, ...metaRow };
-  if (indexMs > metaMs) return { ...metaRow, ...indexRow };
-  if (isDeletedConversation(indexRow) && !isDeletedConversation(metaRow)) return { ...metaRow, ...indexRow };
-  return { ...indexRow, ...metaRow };
+  if (metaMs > indexMs) return _mergeWithWinningMetaFields(indexRow, metaRow);
+  if (indexMs > metaMs) return _mergeWithWinningConversationFields(metaRow, indexRow, true);
+  if (isDeletedConversation(indexRow) && !isDeletedConversation(metaRow)) {
+    return _mergeWithWinningConversationFields(metaRow, indexRow, true);
+  }
+  // When sync pulls a newer `_index.json` before the matching per-cid
+  // `meta.json`, timestamps can tie because pin/unpin intentionally does not
+  // bump `updated_at`. In that case the sync-stamped index row is the better
+  // authority; otherwise stale meta can resurrect an old `pinned_at`.
+  if (recordSyncRev(indexRow) > 0) {
+    return _mergeWithWinningConversationFields(metaRow, indexRow, true);
+  }
+  return _mergeWithWinningMetaFields(indexRow, metaRow);
 }
 
 async function _readIndexConversations(userId: string): Promise<Conversation[]> {
@@ -320,6 +372,7 @@ async function _removeConversationMeta(userId: string, cid: string): Promise<voi
 }
 
 function _notifyChatIndexDirty(): void {
+  // OrkasOpen is local-only; cloud sync notification is intentionally absent.
 }
 
 function _messageText(raw: any): string {
@@ -609,6 +662,7 @@ export async function saveConversations(userId: string, items: Conversation[]): 
   const cleaned = pruneExpiredDeletedRecords(rawCleaned) as Conversation[];
   await writeJson(path.join(ensureUserDir(userId), conversationIndexName()), cleaned);
   await _saveConversationMetas(userId, rawCleaned);
+  _notifyChatIndexDirty();
 }
 
 /** Stamp `updated_at` on the cid's index row to the timestamp of the message
@@ -650,11 +704,9 @@ export interface CreateConversationOptions {
    *  validating the projectId exists for this user — chats.ts persists it
    *  verbatim. */
   projectId?: string;
-  /** Optional explicit conversation id. Used when an external source already
-   *  minted the id (e.g. `remote command handler` adopting the cid the
-   *  Server assigned to a relayed command so iOS and PC agree on it). Must be
-   *  a `safeId`; if it collides with an existing conv, that conv is returned
-   *  unchanged. Defaults to a fresh generated id. */
+  /** Optional explicit conversation id. Used when an external caller already
+   *  minted the id. Must be a `safeId`; if it collides with an existing conv,
+   *  that conv is returned unchanged. Defaults to a fresh generated id. */
   conversationId?: string;
   /** Set by `features/auto_tasks.ts::_fireTask` so the conversation carries
    *  a back-link to the task that spawned it. Used by the renderer for the
@@ -749,14 +801,17 @@ export async function setConversationPinned(
   const i = items.findIndex((c) => c.conversation_id === cid);
   if (i < 0) return null;
   if (isDeletedConversation(items[i])) return null;
+  const pinStateUpdatedAt = nowIso();
   if (pinned) {
     if (!items[i].pinned_at) {
-      items[i].pinned_at = nowIso();
+      items[i].pinned_at = pinStateUpdatedAt;
+      items[i].pin_state_updated_at = pinStateUpdatedAt;
       _stampConversationSync(userId, items[i]);
     }
   } else {
     if (items[i].pinned_at) {
       delete items[i].pinned_at;
+      items[i].pin_state_updated_at = pinStateUpdatedAt;
       _stampConversationSync(userId, items[i]);
     }
   }

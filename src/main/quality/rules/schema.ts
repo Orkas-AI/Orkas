@@ -1,14 +1,14 @@
 /**
- * Schema-level checks for SKILL.md frontmatter + agent.json. Catches
+ * Schema-level checks for SKILL.md frontmatter, skill _meta.json, and agent.json. Catches
  * structural breakage prompt rules can't reliably prevent (truncation,
  * malformed YAML, wrong name pattern).
  *
  * EXTREME = spec is unusable; MEDIUM = spec works but should be cleaned up.
  *
- * Field set matches `PC/CLAUDE.md` §6 — allowed frontmatter keys are
- * `name / description_zh / description_en / category`. Legacy `description`
- * is tolerated (migrated by the loader's CJK heuristic) but does not satisfy
- * the bilingual-pair requirement.
+ * Portable SKILL.md frontmatter stays host-generic: `name / description`.
+ * Orkas extensions such as category, localized descriptions, and routing
+ * hints live in `_meta.json`. Legacy frontmatter extension fields are
+ * tolerated as advisory findings so existing skills remain importable.
  */
 
 import { Violation } from '../types';
@@ -26,6 +26,28 @@ const AGENT_NAME_RE = /^[A-Za-z0-9_一-鿿-]+$/;
 const MAX_DESC_LEN = 800;
 
 const CATEGORY_CODE_RE = /^[a-z][a-z0-9_-]{0,79}$/;
+const SKILL_FRONTMATTER_EXTENSION_KEYS = new Set([
+  'description_zh',
+  'description_en',
+  'category',
+  'status',
+  'state',
+]);
+
+function _stringField(obj: Record<string, unknown>, key: string): string {
+  return typeof obj[key] === 'string' ? String(obj[key]).trim() : '';
+}
+
+function _skillMetaDescriptions(meta: Record<string, unknown> | undefined): { zh: string; en: string } {
+  if (!meta || typeof meta !== 'object') return { zh: '', en: '' };
+  const descriptions = meta.descriptions && typeof meta.descriptions === 'object' && !Array.isArray(meta.descriptions)
+    ? meta.descriptions as Record<string, unknown>
+    : {};
+  return {
+    zh: _stringField(descriptions, 'zh') || _stringField(meta, 'description_zh'),
+    en: _stringField(descriptions, 'en') || _stringField(meta, 'description_en'),
+  };
+}
 
 /**
  * Validate SKILL.md frontmatter. Body content is scanned separately by
@@ -33,6 +55,7 @@ const CATEGORY_CODE_RE = /^[a-z][a-z0-9_-]{0,79}$/;
  */
 export function validateSkillFrontmatter(
   frontmatter: Record<string, unknown>,
+  skillMeta: Record<string, unknown> = {},
 ): Violation[] {
   const out: Violation[] = [];
 
@@ -58,23 +81,33 @@ export function validateSkillFrontmatter(
     });
   }
 
-  // Bilingual description is required for marketplace distribution but the
-  // loader migrates a single legacy `description` via CJK heuristic — treat
-  // "at least one of zh/en/legacy is non-empty" as the minimum bar.
-  const zh = typeof frontmatter.description_zh === 'string' ? frontmatter.description_zh.trim() : '';
-  const en = typeof frontmatter.description_en === 'string' ? frontmatter.description_en.trim() : '';
-  const legacy = typeof frontmatter.description === 'string' ? frontmatter.description.trim() : '';
-  if (!zh && !en && !legacy) {
+  for (const key of Object.keys(frontmatter)) {
+    if (!SKILL_FRONTMATTER_EXTENSION_KEYS.has(key)) continue;
     out.push({
-      level: 'EXTREME',
+      level: 'LOW',
+      rule: 'frontmatter_extension_field',
+      field: `frontmatter:${key}`,
+      snippet: String(frontmatter[key] || '').slice(0, 120),
+      suggested_fix: 'Keep SKILL.md frontmatter portable (`name` and `description` only); store Orkas metadata in `_meta.json`.',
+    });
+  }
+
+  const metaDescriptions = _skillMetaDescriptions(skillMeta);
+  const zh = _stringField(frontmatter, 'description_zh');
+  const en = _stringField(frontmatter, 'description_en');
+  const legacy = _stringField(frontmatter, 'description');
+  if (!zh && !en && !legacy && !metaDescriptions.zh && !metaDescriptions.en) {
+    out.push({
+      level: 'MEDIUM',
       rule: 'frontmatter_description_missing',
       field: 'frontmatter:description',
       snippet: '',
-      suggested_fix: 'Add `description_zh:` and `description_en:` fields so the commander can pick this skill in either UI language.',
+      suggested_fix: 'Add a concise `description:` in SKILL.md, or localized descriptions under `_meta.json.descriptions`.',
     });
   } else {
     for (const [field, value] of [
       ['description_zh', zh], ['description_en', en], ['description', legacy],
+      ['_meta.descriptions.zh', metaDescriptions.zh], ['_meta.descriptions.en', metaDescriptions.en],
     ] as const) {
       if (value.length > MAX_DESC_LEN) {
         out.push({
@@ -88,26 +121,63 @@ export function validateSkillFrontmatter(
     }
   }
 
-  const category = typeof frontmatter.category === 'string' ? frontmatter.category.trim() : '';
+  return out;
+}
+
+export function validateSkillMeta(
+  skillMeta: Record<string, unknown>,
+): Violation[] {
+  const out: Violation[] = [];
+  const category = _stringField(skillMeta, 'category');
   if (!category) {
     out.push({
       level: 'MEDIUM',
-      rule: 'frontmatter_category_missing',
-      field: 'frontmatter:category',
+      rule: 'skill_meta_category_missing',
+      field: '_meta.json:category',
       snippet: '',
-      suggested_fix: 'Add `category:` using the category codes defined in skill-creator; the writer can backfill the default when missing.',
+      suggested_fix: 'Add `category` to `_meta.json` using a safe marketplace category code.',
     });
   } else if (!CATEGORY_CODE_RE.test(category)) {
     out.push({
       level: 'MEDIUM',
-      rule: 'frontmatter_category_invalid',
-      field: 'frontmatter:category',
+      rule: 'skill_meta_category_invalid',
+      field: '_meta.json:category',
       snippet: category.slice(0, 80),
-      suggested_fix: 'Use a safe marketplace category code from skill-creator.',
+      suggested_fix: 'Use a safe marketplace category code in `_meta.json`.',
+    });
+  }
+
+  const routing = skillMeta.routing && typeof skillMeta.routing === 'object' && !Array.isArray(skillMeta.routing)
+    ? skillMeta.routing as Record<string, unknown>
+    : {};
+  const negativeExamples = Array.isArray(routing.negative_examples) && routing.negative_examples.length > 0;
+  const applicableDomain = (
+    typeof routing.applicable_domain === 'string' && routing.applicable_domain.trim()
+  ) || (
+    Array.isArray(routing.applicable_domain) && routing.applicable_domain.length > 0
+  );
+  const prerequisites = Array.isArray(routing.prerequisites);
+  if (!negativeExamples || !applicableDomain || !prerequisites) {
+    out.push({
+      level: 'LOW',
+      rule: 'skill_meta_routing_incomplete',
+      field: '_meta.json:routing',
+      snippet: '',
+      suggested_fix: 'Add routing.applicable_domain, routing.negative_examples, and routing.prerequisites when they help distinguish this skill.',
     });
   }
 
   return out;
+}
+
+export function skillMetaParseViolation(message: string): Violation {
+  return {
+    level: 'MEDIUM',
+    rule: 'skill_meta_unparseable',
+    field: '_meta.json',
+    snippet: message.slice(0, 200),
+    suggested_fix: 'Make `_meta.json` valid JSON so Orkas can read category, localized descriptions, and routing hints.',
+  };
 }
 
 /**

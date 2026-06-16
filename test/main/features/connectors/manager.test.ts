@@ -8,6 +8,20 @@ const TEST_UID = 'u-connectors-manager';
 let tmpDir: string;
 let prevWs: string | undefined;
 
+async function writeGoogleConnectorsConfig(value: unknown): Promise<void> {
+  const users = await import('../../../../src/main/features/users');
+  const paths = await import('../../../../src/main/paths');
+  const storage = await import('../../../../src/main/storage');
+  users.activateUser(TEST_UID);
+  storage.writeJsonSync(paths.userRemoteConfigFile(TEST_UID), {
+    version: 1,
+    active: {
+      immediate: { google_connectors: value },
+      restart: {},
+    },
+  });
+}
+
 function mockMcpClient() {
   vi.doMock('../../../../src/main/features/connectors/mcp-client', () => ({
     McpConnection: vi.fn().mockImplementation(function MockMcpConnection() {
@@ -97,13 +111,14 @@ function notionInstance() {
   };
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-connectors-manager-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
   vi.clearAllMocks();
   mockMcpClient();
+  await writeGoogleConnectorsConfig(true);
 });
 
 afterEach(() => {

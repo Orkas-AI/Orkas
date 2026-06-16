@@ -82,6 +82,13 @@ describe('renderDashboard — component coverage (set A)', () => {
     expect(html).toContain('Check uplink');
   });
 
+  it('Alert: accepts common model-guess text aliases', () => {
+    const html = renderDashboard({ root: { type: 'Alert', props: { level: 'warning', message: 'Quota near limit' } } });
+    expect(html).toMatch(/data-level="warning"/);
+    expect(html).toContain('Quota near limit');
+    expect(html).not.toContain('db-alert-body');
+  });
+
   it('Table: emits columns + rows with numeric alignment', () => {
     const html = renderDashboard({ root: { type: 'Table', props: {
       columns: [{ key: 'host', label: 'Host' }, { key: 'rtt', label: 'RTT', numeric: true }],
@@ -178,6 +185,42 @@ describe('renderDashboard — component coverage (set A)', () => {
     expect((html.match(/db-metric"/g) || []).length).toBe(3);
     expect(html).toMatch(/data-columns="3"/);
   });
+
+  it('children nested under props (React-style) still render', () => {
+    const html = renderDashboard({ root: { type: 'Stack', props: { gap: 'md', children: [
+      { type: 'Card', props: { children: [
+        { type: 'Metric', props: { label: 'Stars', value: '103k' } },
+      ] } },
+      { type: 'Grid', props: { columns: 2, children: [
+        { type: 'Metric', props: { label: 'A', value: '1' } },
+        { type: 'Metric', props: { label: 'B', value: '2' } },
+      ] } },
+    ] } } });
+    expect((html.match(/db-metric"/g) || []).length).toBe(3);
+    expect(html).toContain('Stars');
+    expect(html).toContain('103k');
+    expect(html).toMatch(/data-columns="2"/);
+  });
+
+  it('node-level children win over props.children when both present', () => {
+    const html = renderDashboard({ root: { type: 'Card', props: { children: [
+      { type: 'Metric', props: { label: 'FromProps', value: 'x' } },
+    ] }, children: [
+      { type: 'Metric', props: { label: 'FromNode', value: 'y' } },
+    ] } });
+    expect(html).toContain('FromNode');
+    expect(html).not.toContain('FromProps');
+  });
+
+  it('Alert: renders child nodes as body when no text prop is present', () => {
+    const html = renderDashboard({ root: { type: 'Alert', props: { level: 'info', children: [
+      { type: 'Markdown', props: { text: '**one-liner** summary' } },
+    ] } } });
+    expect(html).toMatch(/data-level="info"/);
+    expect(html).toContain('class="db-alert-body"');
+    expect(html).toContain('<strong>one-liner</strong>');
+    expect(html).toContain('summary');
+  });
 });
 
 describe('renderDashboard — defensive / unknown shapes (set A safety)', () => {
@@ -206,6 +249,13 @@ describe('renderDashboard — defensive / unknown shapes (set A safety)', () => 
   it('handles $ in value without regex-replacement breakage', () => {
     const html = renderDashboard({ root: { type: 'Metric', props: { label: 'Cost', value: '$1,234' } } });
     expect(html).toContain('$1,234');
+  });
+
+  it('empty Alert → no blank colored block', () => {
+    const html = renderDashboard({ root: { type: 'Alert', props: { level: 'info' } } });
+    expect(html).toContain('class="dashboard"');
+    expect(html).not.toContain('class="db-alert"');
+    expect(html).not.toContain('class="db-alert-icon"');
   });
 });
 

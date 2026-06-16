@@ -47,6 +47,16 @@ describe('local_agents/which › whichBin', () => {
       expect(await whichBin('fakebin')).toBe(binPath);
     });
 
+    it('can search caller-provided directories when PATH omits them', async () => {
+      const extraDir = path.join(tmpDir, 'extra-bin');
+      fs.mkdirSync(extraDir);
+      const binPath = path.join(extraDir, 'sidecar');
+      fs.writeFileSync(binPath, '#!/bin/sh\necho hi\n');
+      fs.chmodSync(binPath, 0o755);
+      process.env.PATH = '';
+      expect(await whichBin('sidecar', { extraDirs: [extraDir] })).toBe(binPath);
+    });
+
     it('rejects a non-executable file on POSIX (no x bit)', async () => {
       const binPath = path.join(tmpDir, 'plain');
       fs.writeFileSync(binPath, 'not exec\n');

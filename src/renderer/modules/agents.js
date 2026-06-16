@@ -1,7 +1,11 @@
 const _agentsLog = createLogger('agents');
 // ─── Agents (three-column: list / detail / inline edit chat) ───
 
+function _agentsTrackClick(action, data) {
+}
+
 let _agentsCache = null;
+let _agentsLoadInFlight = null;
 let _selectedAgent = null; // { id, name, source }
 let _agentEditing = false;
 let _agentFieldSaveTimer = null;
@@ -126,7 +130,7 @@ async function _detailCategoryOptions() {
       if (Array.isArray(r && r.list)) list = r.list;
     } catch (_) { /* fallback below */ }
   }
-  const lang = (typeof getLang === 'function') ? getLang() : 'zh';
+  const lang = (typeof getLang === 'function') ? getLang() : 'en';
   const seen = new Set();
   const options = [];
   for (const c of list) {
@@ -172,59 +176,68 @@ function _isValidAgentNameCharset(name) {
 }
 
 async function loadAgents(forceRefresh) {
-  if (_agentsCache && !forceRefresh) { renderAgentsList(_agentsCache); return; }
-  try {
-    const res = await apiFetch(forceRefresh ? '/api/agents/list?force=1' : '/api/agents/list');
-    const data = await res.json();
-    if (data.ok) {
-      // Sort once on cache fill so picker + grid share the order.
-      // Order: custom group first, then within each group sort by a key
-      // built from "Chinese chars → pinyin first letter, Latin / digits
-      // / punctuation pass through unchanged" and compare as a plain
-      // string. Electron ships small ICU; Intl.Collator does not
-      // recognize zh pinyin tailoring (neither co-pinyin nor
-      // zh-Hans-CN works), so Chinese ends up clumped together and
-      // Latin clumped together. We use vendor/pinyin-firstletter's
-      // table to map e.g. '悲观' → 'bg' / 'Claude' → 'claude' /
-      // 'Orkas' → 'orkas' before comparing, yielding the user-expected
-      // mixed-script ordering ('agent < 悲(b) < 本(b) < claude < 乐(l)
-      // < orkas < 全(q)'). Without this, the backend's listAgents
-      // internal sort (by agent_id, a 12-char nanoid) feels random to
-      // users. The override here fixes that.
-      _agentsCache = (data.agents || []).map((a) => ({
-        ...a,
-        source: _agentSource(a.source),
-      })).sort((a, b) => {
-        if (a.source !== b.source) return a.source === 'custom' ? -1 : 1;
-        const ka = pinyinSortKey(a.name || a.agent_id || '');
-        const kb = pinyinSortKey(b.name || b.agent_id || '');
-        return ka < kb ? -1 : ka > kb ? 1 : 0;
-      });
-      renderAgentsList(_agentsCache);
-      // Sidebar conv-row badges read agent icon+color from `_agentsCache`
-      // (via `_renderConvAgentStackHtml`). Boot order is loadConversations
-      // → loadAgents, so the first sidebar render lands before the cache
-      // is populated and the badges fall back to seed-derived avatars —
-      // re-render once the cache exists so they pick up the authored
-      // icon. Projects section subscribes to the same render call.
-      if (typeof renderConversationList === 'function') renderConversationList();
-      if (typeof renderProjectsSection === 'function') renderProjectsSection();
-      // Backfill avatars to disk when older specs lack them — derive
-      // from the seed for cross-device consistency (the same agent_id
-      // produces the same icon/color combination on every machine, so
-      // cloud sync won't see two ends writing different values and
-      // colliding). Entries that already have icon + color are
-      // skipped, so repeated loadAgents calls don't re-write.
-      // Asynchronous so it doesn't block rendering — the render layer
-      // also seeds an avatar fallback whose value matches what we
-      // backfill, so the user sees no visual change.
-      _backfillMissingAvatars(_agentsCache).catch((e) => {
-        _agentsLog.warn('avatar backfill failed', e);
-      });
-    }
-  } catch (e) {
-    _agentsLog.error('load agents failed', e);
+  if (_agentsLoadInFlight) {
+    if (!forceRefresh) return _agentsLoadInFlight;
+    await _agentsLoadInFlight.catch(() => {});
   }
+  if (_agentsCache && !forceRefresh) { renderAgentsList(_agentsCache); return; }
+  _agentsLoadInFlight = (async () => {
+    try {
+      const res = await apiFetch(forceRefresh ? '/api/agents/list?force=1' : '/api/agents/list');
+      const data = await res.json();
+      if (data.ok) {
+        // Sort once on cache fill so picker + grid share the order.
+        // Order: custom group first, then within each group sort by a key
+        // built from "Chinese chars → pinyin first letter, Latin / digits
+        // / punctuation pass through unchanged" and compare as a plain
+        // string. Electron ships small ICU; Intl.Collator does not
+        // recognize zh pinyin tailoring (neither co-pinyin nor
+        // zh-Hans-CN works), so Chinese ends up clumped together and
+        // Latin clumped together. We use vendor/pinyin-firstletter's
+        // table to map e.g. '悲观' → 'bg' / 'Claude' → 'claude' /
+        // 'Orkas' → 'orkas' before comparing, yielding the user-expected
+        // mixed-script ordering ('agent < 悲(b) < 本(b) < claude < 乐(l)
+        // < orkas < 全(q)'). Without this, the backend's listAgents
+        // internal sort (by agent_id, a 12-char nanoid) feels random to
+        // users. The override here fixes that.
+        _agentsCache = (data.agents || []).map((a) => ({
+          ...a,
+          source: _agentSource(a.source),
+        })).sort((a, b) => {
+          if (a.source !== b.source) return a.source === 'custom' ? -1 : 1;
+          const ka = pinyinSortKey(a.name || a.agent_id || '');
+          const kb = pinyinSortKey(b.name || b.agent_id || '');
+          return ka < kb ? -1 : ka > kb ? 1 : 0;
+        });
+        renderAgentsList(_agentsCache);
+        // Sidebar conv-row badges read agent icon+color from `_agentsCache`
+        // (via `_renderConvAgentStackHtml`). Boot order is loadConversations
+        // → loadAgents, so the first sidebar render lands before the cache
+        // is populated and the badges fall back to seed-derived avatars —
+        // re-render once the cache exists so they pick up the authored
+        // icon. Projects section subscribes to the same render call.
+        if (typeof renderConversationList === 'function') renderConversationList();
+        if (typeof renderProjectsSection === 'function') renderProjectsSection();
+        // Backfill avatars to disk when older specs lack them — derive
+        // from the seed for cross-device consistency (the same agent_id
+        // produces the same icon/color combination on every machine, so
+        // cloud sync won't see two ends writing different values and
+        // colliding). Entries that already have icon + color are
+        // skipped, so repeated loadAgents calls don't re-write.
+        // Asynchronous so it doesn't block rendering — the render layer
+        // also seeds an avatar fallback whose value matches what we
+        // backfill, so the user sees no visual change.
+        _backfillMissingAvatars(_agentsCache).catch((e) => {
+          _agentsLog.warn('avatar backfill failed', e);
+        });
+      }
+    } catch (e) {
+      _agentsLog.error('load agents failed', e);
+    } finally {
+      _agentsLoadInFlight = null;
+    }
+  })();
+  return _agentsLoadInFlight;
 }
 
 async function _backfillMissingAvatars(agents) {
@@ -272,7 +285,11 @@ function renderAgentsGrid(agents) {
     if (chipsHost) chipsHost.innerHTML = '';
     gridEl.classList.remove('is-sectioned');
     gridEl.innerHTML = '';
-    if (emptyEl) emptyEl.style.display = '';
+    if (emptyEl) {
+      if (typeof _mpUpdateInstallingEmptyStates === 'function') _mpUpdateInstallingEmptyStates();
+      else emptyEl.textContent = t('agents.empty');
+      emptyEl.style.display = '';
+    }
     return;
   }
   if (emptyEl) emptyEl.style.display = 'none';
@@ -593,10 +610,10 @@ function _renderAgentRowMenuItems(menu, agentId, source = '') {
   const enabled = a ? a.enabled !== false : true;
   const isCustom = a?.source === 'custom';
   // Dev mode lifts the source guard for marketplace edit / delete.
-  const canEdit = isCustom || (_isAgentPlatformSource(a?.source) && false);
+  const canEdit = isCustom ;
   // Dev-only entry on builtin: tag the label so the user knows this isn't a
   // normal user capability (mirrors marketplace.upload's "(dev)" treatment).
-  const editLabelSuffix = (_isAgentPlatformSource(a?.source) && false) ? t('common.dev_suffix') : '';
+  const editLabelSuffix = '';
   const toggleLabel = enabled ? t('component.disable') : t('component.enable');
   const items = [];
   if (canEdit) {
@@ -687,7 +704,7 @@ function _renderSourceMetaHtml(item) {
     const versionLabel = t('marketplace.version').replace('{version}', String(item.version));
     parts.push(`<span class="agents-detail-source is-version">${escapeHtml(versionLabel)}</span>`);
   }
-  const lang = (typeof getLang === 'function') ? getLang() : 'zh';
+  const lang = (typeof getLang === 'function') ? getLang() : 'en';
   const label = _resolveCategoryLabel(item.category, lang);
   parts.push(`<span class="agents-detail-source is-category">${escapeHtml(label)}</span>`);
   return parts.join('');
@@ -747,7 +764,7 @@ function _renderAgentDetail(agent, editing) {
   const uploadBtn = document.getElementById('agent-upload-marketplace-btn');
   const delBtn = document.getElementById('agent-delete-btn');
   const isCustom = agent.source === 'custom';
-  const canEdit = isCustom || (_isAgentPlatformSource(agent.source) && false);
+  const canEdit = isCustom ;
   if (useBtn) {
     useBtn.style.display = editing ? 'none' : '';
     useBtn.disabled = agent.enabled === false;
@@ -762,7 +779,7 @@ function _renderAgentDetail(agent, editing) {
     // Tag the "Edit" label on marketplace agents (dev-only entry); "Done" stays
     // bare because the user is already in edit mode and the marker would be
     // redundant noise.
-    const editSuffix = (!editing && _isAgentPlatformSource(agent.source) && false) ? t('common.dev_suffix') : '';
+    const editSuffix = '';
     editBtn.textContent = editing ? t('agents.edit_btn_done') : (t('agents.edit_btn_edit') + editSuffix);
   }
   _renderAgentEnabledButton({ id: agent.agent_id, enabled: agent.enabled !== false });
@@ -819,7 +836,7 @@ function _renderAgentOutputFormatSection(agent) {
   section.style.display = '';
 
   const canEdit = agent.source === 'custom'
-    || (_isAgentPlatformSource(agent.source) && typeof isDevMode === 'function' && false);
+    ;
 
   slot.innerHTML = '';
   const mount = document.createElement('div');
@@ -948,7 +965,7 @@ async function _renderAgentDetailRuntime(agent) {
       // description are still the defaults of the previous CLI (or empty),
       // follow the new CLI's defaults. Otherwise, leave their edits alone.
       const updates = { runtime: { kind: 'cli', cli: newCli } };
-      const lang = (typeof getLang === 'function') ? getLang() : 'zh';
+      const lang = (typeof getLang === 'function') ? getLang() : 'en';
       const prev = (typeof getCliDefaults === 'function') ? getCliDefaults(currentType) : null;
       const next2 = (typeof getCliDefaults === 'function') ? getCliDefaults(newCli) : null;
       const prevDescLocal = prev ? pickDesc(prev, lang) : '';
@@ -1013,7 +1030,7 @@ async function _renderAgentDetailProjectDir(agent) {
   slot.dataset.agentId = agent.agent_id;
 
   const canEdit = agent.source === 'custom'
-    || (_isAgentPlatformSource(agent.source) && typeof isDevMode === 'function' && false);
+    ;
 
   const renderInfo = (info) => {
     if (_selectedAgent?.id !== agent.agent_id || slot.dataset.agentId !== agent.agent_id) return;
@@ -1186,7 +1203,7 @@ function _toggleAgentFieldEditable(on) {
 async function toggleAgentEditMode() {
   if (!_selectedAgent) return;
   // Marketplace editing is dev-only; lift the source guard accordingly.
-  if (_isAgentPlatformSource(_selectedAgent.source) && !false) return;
+  if (_isAgentPlatformSource(_selectedAgent.source)) return;
   if (_agentEditing) {
     await _exitAgentEditMode();
   } else {
@@ -1264,7 +1281,7 @@ function _restoreAgentNameField() {
 
 function _scheduleAgentFieldSave(field, value) {
   if (!_selectedAgent) return;
-  if (_isAgentPlatformSource(_selectedAgent.source) && !false) return;
+  if (_isAgentPlatformSource(_selectedAgent.source)) return;
   _pendingAgentField = { field, value };
   clearTimeout(_agentFieldSaveTimer);
   _agentFieldSaveTimer = setTimeout(_flushAgentFieldSave, 800);
@@ -1398,7 +1415,7 @@ function _applyExternalCliDefaults(cliType, { force = false } = {}) {
   const descEl = document.getElementById('agent-ext-desc-input');
   if (!nameEl || !descEl) return;
 
-  const lang = (typeof getLang === 'function') ? getLang() : 'zh';
+  const lang = (typeof getLang === 'function') ? getLang() : 'en';
   const localizedDesc = defaults ? pickDesc(defaults, lang) : '';
   const targetName = defaults ? defaults.name : '';
   const targetDesc = localizedDesc;
@@ -1540,6 +1557,7 @@ async function _saveCreateAgent({ msgEl }) {
   // dataset wasn't stamped (defensive — _mountAgentOutputFormatCreateSelect always sets it).
   const outputFormat = document.getElementById('agent-output-format-select')?.dataset.value || 'auto';
 
+  const startedAt = performance.now();
   try {
     const avatar = randomAgentAvatar();
     const body = { name, description, icon: avatar.icon, color: avatar.color, category: 'general', output_format: outputFormat };
@@ -1552,15 +1570,15 @@ async function _saveCreateAgent({ msgEl }) {
     if (!data.ok || !data.agent) {
       msgEl.textContent = _agentCreateErrorMessage(data) || t('agents.create_failed');
       msgEl.className = 'form-msg err';
-            return;
+      return;
     }
-        closeAgentModal();
+    closeAgentModal();
     setView('agents');
     await loadAgents(true);
     await _showAgentsDetailView(data.agent.agent_id);
     await _enterAgentEditMode();
-    const seed = t('agents.seed_workflow', { description });
-    await _autoSendAgentChat(seed);
+    const seed = t('agents.seed_workflow_model', { name, description, output_format: outputFormat });
+    await _autoSendAgentChat(t('agents.seed_workflow'), { model_text: seed });
   } catch (e) {
     msgEl.textContent = t('agents.network_error', { reason: e.message || e });
     msgEl.className = 'form-msg err';
@@ -1605,22 +1623,12 @@ async function _saveExternalAgent({ msgEl }) {
     return;
   }
 
-  // Both `description_zh` + `description_en` are stored so locale switches
-  // are zero-cost. The locale we're currently editing in goes into that
-  // side; the other side gets the canonical CLI default. Users who want
-  // both fully-translated can edit each side later.
-  const defaults = (typeof getCliDefaults === 'function') ? getCliDefaults(cli) : null;
-  const lang = (typeof getLang === 'function') ? getLang() : 'zh';
-  const editingZh = descriptionLocale(lang) === 'zh';
-  const description_zh = editingZh ? desc : (defaults ? defaults.description_zh : desc);
-  const description_en = editingZh ? (defaults ? defaults.description_en : desc) : desc;
-
+  const startedAt = performance.now();
   try {
     const avatar = randomAgentAvatar();
     const body = {
       name,
       description: desc,
-      description_zh, description_en,
       icon: avatar.icon, color: avatar.color,
       runtime: { kind: 'cli', cli },
       category: 'general',
@@ -1634,9 +1642,9 @@ async function _saveExternalAgent({ msgEl }) {
     if (!data.ok || !data.agent) {
       msgEl.textContent = _agentCreateErrorMessage(data) || t('agents.create_failed');
       msgEl.className = 'form-msg err';
-            return;
+      return;
     }
-        closeAgentModal();
+    closeAgentModal();
     setView('agents');
     await loadAgents(true);
     // External agents go straight to the detail view but skip the LLM
@@ -1663,7 +1671,7 @@ function _agentCreateErrorMessage(data) {
   return data.error || '';
 }
 
-async function _autoSendAgentChat(content) {
+async function _autoSendAgentChat(content, extraBody) {
   if (!_selectedAgent) return;
   const container = document.getElementById('agents-chat-messages');
   if (!container) return;
@@ -1671,16 +1679,16 @@ async function _autoSendAgentChat(content) {
   const existing = container.querySelectorAll('.chat-message');
   if (existing.length > 0) return;
   _ensureAgentChatController();
-  await _agentChatCtrl.send(content);
+  await _agentChatCtrl.send(content, extraBody);
 }
 
 async function deleteSelectedAgent() {
   if (!_selectedAgent) return;
   const isMarketplace = _isAgentPlatformSource(_selectedAgent.source);
-  if (isMarketplace && !false) return;
+  if (isMarketplace) return;
   const agentId = _selectedAgent.id;
   if (!(await uiConfirm(t('agents.delete_confirm', { name: _selectedAgent.name || agentId })))) return;
-    try {
+  try {
     const data = isMarketplace
       ? await window.orkas.invoke('agents.builtin.delete', { agent_id: agentId })
       : await (await apiFetch(`/api/agents/${encodeURIComponent(agentId)}`, { method: 'DELETE' })).json();
@@ -1715,7 +1723,7 @@ function _bindAgentEditAttachments() {
   if (btn) {
     btn.addEventListener('click', async () => {
       const cid = currentCid();
-      if (cid) await _chatAttachPickAndUpload(cid);
+      if (cid) await _chatAttachPickAndUpload(cid, 'picker');
     });
   }
   if (area) {
@@ -1734,13 +1742,13 @@ function _bindAgentEditAttachments() {
       if (internal.length) {
         e.preventDefault();
         area.classList.remove('drag-over');
-        await _chatAttachImportPaths(cid, internal);
+        await _chatAttachImportPaths(cid, internal, 'internal_drop');
         return;
       }
       if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
         e.preventDefault();
         area.classList.remove('drag-over');
-        await _chatAttachUpload(cid, e.dataTransfer.files);
+        await _chatAttachUpload(cid, e.dataTransfer.files, 'drop');
       }
     });
   }
@@ -1750,7 +1758,7 @@ function _bindAgentEditAttachments() {
       const cid = currentCid();
       if (!cid) return;
       e.preventDefault();
-      await _chatAttachUpload(cid, e.clipboardData.files);
+      await _chatAttachUpload(cid, e.clipboardData.files, 'paste');
     });
   }
 }
@@ -1865,7 +1873,8 @@ async function useAgent(agentId, seedText) {
     if (agent.enabled === false) return;
 
     _agentsLog.info('use agent', { agent_id: agentId, has_seed: !!(seedText && seedText.trim()) });
-    
+    _agentsTrackClick('agent_use', { agent_id: agentId });
+
     const visible = (seedText || '').trim() || t('agents.run_prefix', { name: agent.name || agent.agent_id });
 
     // Don't pass a custom title — let backend `groupChat.send` auto-title
@@ -1905,10 +1914,15 @@ async function useAgent(agentId, seedText) {
 
 async function useSkill(skillId, skillName) {
   if (_skillsCache?.some((s) => s.id === skillId && s.enabled === false)) return;
+  // Open-tier skills (external packages / global folders) live in their own
+  // cache; a disabled one must not run from its card's play button either.
+  if (typeof _openSkillsCache !== 'undefined' && Array.isArray(_openSkillsCache)
+      && _openSkillsCache.some((s) => s.id === skillId && s.enabled === false)) return;
   // Skill "use" flow: navigate to the new-chat page with the skill
   // pre-selected and wait for user input.
   _agentsLog.info('use skill', { skill_id: skillId, skill_name: skillName || skillId });
-    setView('new-chat');
+  _agentsTrackClick('skill_use', { skill_id: skillId });
+  setView('new-chat');
   if (typeof setChatRecipient === 'function') {
     setChatRecipient('new-chat', { kind: 'commander' });
   }
@@ -2002,7 +2016,12 @@ function _normalizeAgentPickerTab(tab) {
   return _AGENT_PICKER_TABS.has(tab) ? tab : 'agents';
 }
 
-function _agentPickerAllowsUseTabs(anchorId) {
+// True when the picker's recipient is the commander (not a specific agent).
+// Connectors and open-tier (external-package / global) skills are
+// commander-only surfaces; trusted skills (custom / marketplace) are offered
+// to agent recipients too — a CLI agent runs them via the orkas bridge's
+// orkas_run_skill.
+function _pickerRecipientIsCommander(anchorId) {
   const target = _targetFromPickerAnchor(anchorId);
   if (target === 'auto') {
     const rec = (typeof window !== 'undefined' && typeof window._autoGetRecipient === 'function')
@@ -2015,10 +2034,29 @@ function _agentPickerAllowsUseTabs(anchorId) {
   return !rec || rec.kind !== 'agent';
 }
 
+// Open-tier (external-package / global) skills are commander-only and must
+// never be handed to an agent recipient — orkas_run_skill would execute them.
+// The picker render already hides them for agents; this backs that at the
+// selection handler. Matches by id (what the picker passes) or display name.
+function _isOpenTierSkillRef(id, name) {
+  if (typeof _openSkillsCache === 'undefined' || !Array.isArray(_openSkillsCache)) return false;
+  return _openSkillsCache.some((s) => s.id === id || s.name === id || (name && s.name === name));
+}
+
 function _agentPickerVisibleTabs(anchorId) {
-  return _agentPickerAllowsUseTabs(anchorId)
-    ? _AGENT_PICKER_TAB_ORDER
-    : ['agents'];
+  const isCommander = _pickerRecipientIsCommander(anchorId);
+  // Auto-task form keeps skill + connector commander-only: its chip slots are
+  // managed separately (auto.js `recipientAllowsUse`) and don't dispatch to an
+  // agent the way the chat composer does.
+  if (_targetFromPickerAnchor(anchorId) === 'auto') {
+    return isCommander ? _AGENT_PICKER_TAB_ORDER : ['agents'];
+  }
+  // Chat composer: agents + skills are always available — an agent recipient
+  // runs a trusted skill itself (via the orkas bridge). Connectors stay
+  // commander-only.
+  const tabs = ['agents', 'skills'];
+  if (isCommander) tabs.push('connectors');
+  return tabs;
 }
 
 function _agentPickerSearchPlaceholder() {
@@ -2252,26 +2290,44 @@ function _pickerMatchScore(q, name) {
 function _renderSkillPickerList(listEl, filterText, anchorId) {
   const lang = getLang();
   const q = (filterText || '').toLowerCase();
-  let skills = (_skillsCache || []).filter((s) => s.enabled !== false);
-  const filtered = q
-    ? skills
-        .filter((s) => _matchPickerItem(q, s.name || s.id, pickDesc(s, lang), s.id))
+  const trustedDesc = (s) => pickDesc(s, lang);
+  const openDesc = (s) => s.description || '';
+  const applyFilter = (list, descOf) => q
+    ? list
+        .filter((s) => _matchPickerItem(q, s.name || s.id, descOf(s), s.id))
         .sort((a, b) => _pickerMatchScore(q, a.name || a.id) - _pickerMatchScore(q, b.name || b.id))
-    : skills;
-  if (!filtered.length) {
+    : list;
+
+  const trusted = applyFilter((_skillsCache || []).filter((s) => s.enabled !== false), trustedDesc);
+  // Open-tier skills (external packages + global folders) stay commander-only
+  // (CLAUDE.md: open-tier never enters an agent's skill_list / listSkillSpecs).
+  // The skills tab now also shows for agent recipients, so suppress open-tier
+  // there and list only trusted skills (custom / marketplace) — the same set
+  // the orkas bridge can run for the agent. Selecting one prepends a "use"
+  // hint; the commander system prompt already enumerates open-tier skills.
+  const allowOpenTier = _pickerRecipientIsCommander(anchorId);
+  const openRows = (allowOpenTier && typeof _openSkillsCache !== 'undefined' && Array.isArray(_openSkillsCache))
+    ? applyFilter(_openSkillsCache.filter((s) => s.enabled !== false), openDesc)
+    : [];
+
+  if (!trusted.length && !openRows.length) {
     listEl.innerHTML = `<div class="skill-picker-empty">${escapeHtml(t('skills.no_match'))}</div>`;
     return;
   }
+
   const groups = { custom: [], marketplace: [] };
-  for (const s of filtered) {
+  for (const s of trusted) {
     const source = (typeof normalizeCatalogSource === 'function') ? normalizeCatalogSource(s.source) : s.source;
     (groups[source] || groups.custom).push(s);
   }
-  const groupHtml = (label, list) => {
+  const externalRows = openRows.filter((s) => s.source === 'external');
+  const globalRows = openRows.filter((s) => s.source === 'global');
+
+  const groupHtml = (label, list, descOf) => {
     if (!list.length) return '';
     return `<div class="skill-picker-group-label">${escapeHtml(label)}</div>` +
       list.map((s) => {
-        const desc = pickDesc(s, lang).trim();
+        const desc = (descOf(s) || '').trim();
         const name = s.name || s.id;
         return `
         <div class="skill-picker-item" data-kind="skill" data-id="${escapeHtml(s.id)}" data-name="${escapeHtml(name)}">
@@ -2280,8 +2336,10 @@ function _renderSkillPickerList(listEl, filterText, anchorId) {
         </div>`;
       }).join('');
   };
-  listEl.innerHTML = groupHtml(t('skills.source_custom'), groups.custom)
-    + groupHtml(t('skills.source_marketplace'), groups.marketplace);
+  listEl.innerHTML = groupHtml(t('skills.source_custom'), groups.custom, trustedDesc)
+    + groupHtml(t('skills.source_marketplace'), groups.marketplace, trustedDesc)
+    + groupHtml(t('skills.external_group'), externalRows, openDesc)
+    + groupHtml(t('skills.global_group'), globalRows, openDesc);
   _bindAgentPickerListItems(listEl, anchorId);
 }
 
@@ -2360,7 +2418,13 @@ function _targetFromPickerAnchor(anchorId) {
 
 async function _triggerPickerItem(kind, itemId, itemName, anchorId) {
   const target = _targetFromPickerAnchor(anchorId);
-  if ((kind === 'skill' || kind === 'connector') && !_agentPickerAllowsUseTabs(anchorId)) {
+  // Connectors are commander-only; open-tier skills are commander-only too
+  // (they would otherwise reach an agent via orkas_run_skill). Trusted skills
+  // are allowed for agent recipients.
+  const blockedForAgent = !_pickerRecipientIsCommander(anchorId) && (
+    kind === 'connector' || (kind === 'skill' && _isOpenTierSkillRef(itemId, itemName))
+  );
+  if (blockedForAgent) {
     _consumeAtKeyChar();
     const inputId = target === 'new-chat'
       ? 'new-chat-input'
@@ -2374,6 +2438,7 @@ async function _triggerPickerItem(kind, itemId, itemName, anchorId) {
   // these refs + the `*.use_prefix` i18n templates, mirroring how the
   // commander composer wraps text from its chip state.
   if (target === 'auto' && kind === 'skill') {
+    _agentsTrackClick('auto_skill_select', { target, skill_id: String(itemId || itemName || '') });
     if (typeof window !== 'undefined' && typeof window._autoOnSkillPicked === 'function') {
       window._autoOnSkillPicked({ id: String(itemId || itemName), name: String(itemName || itemId) });
     }
@@ -2382,6 +2447,7 @@ async function _triggerPickerItem(kind, itemId, itemName, anchorId) {
     return;
   }
   if (target === 'auto' && kind === 'connector') {
+    _agentsTrackClick('auto_connector_select', { target, connector_id: String(itemId || '') });
     if (typeof window !== 'undefined' && typeof window._autoOnConnectorPicked === 'function') {
       window._autoOnConnectorPicked({ id: String(itemId), name: String(itemName || itemId) });
     }
@@ -2390,6 +2456,7 @@ async function _triggerPickerItem(kind, itemId, itemName, anchorId) {
     return;
   }
   if (kind === 'skill') {
+    _agentsTrackClick('chat_skill_select', { target, skill_id: String(itemId || itemName || '') });
     setChatSkill(target, itemName || itemId);
     _consumeAtKeyChar();
     const inputId = target === 'new-chat' ? 'new-chat-input' : (target === 'project' ? 'project-chat-input' : 'chat-input');
@@ -2397,6 +2464,7 @@ async function _triggerPickerItem(kind, itemId, itemName, anchorId) {
     return;
   }
   if (kind === 'connector') {
+    _agentsTrackClick('chat_connector_select', { target, connector_id: String(itemId || '') });
     setChatConnector(target, itemId, itemName || itemId);
     _consumeAtKeyChar();
     const inputId = target === 'new-chat' ? 'new-chat-input' : (target === 'project' ? 'project-chat-input' : 'chat-input');
@@ -2418,6 +2486,11 @@ async function _triggerAgent(agentId, agentName, anchorId) {
     const rec = (agentId === '__commander__')
       ? { kind: 'commander' }
       : { kind: 'agent', id: agentId, name: agentName || agentId };
+    _agentsTrackClick('auto_agent_select', {
+      target: 'auto',
+      recipient_type: rec.kind,
+      agent_id: rec.kind === 'agent' ? String(agentId || '') : '',
+    });
     if (typeof window !== 'undefined' && typeof window._autoOnRecipientPicked === 'function') {
       window._autoOnRecipientPicked(rec);
     }
@@ -2430,6 +2503,11 @@ async function _triggerAgent(agentId, agentName, anchorId) {
     || anchorId === 'project-chat-recipient-chip';
   if (isRecipientAnchor) {
     const target = _targetFromPickerAnchor(anchorId);
+    _agentsTrackClick('chat_agent_select', {
+      target,
+      recipient_type: agentId === '__commander__' ? 'commander' : 'agent',
+      agent_id: agentId === '__commander__' ? '' : String(agentId || ''),
+    });
     if (agentId === '__commander__') {
       setChatRecipient(target, { kind: 'commander' });
     } else {

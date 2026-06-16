@@ -30,10 +30,12 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-// Register tsx/cjs so that any same-feature CJS require call resolves .ts
-// files under vitest. Without this hook vitest's plain-node CJS resolver
-// fails the require and chats.deleteConversation silently skips purgeGroupDir,
-// breaking the delete-cascade tests.
+// Register tsx/cjs so that any `require('./group_chat/bus')`-style CJS lookups
+// (used inside features/chats.ts to break the bus ↔ chats import cycle without
+// triggering the ESM dual-load bug described in 0268bce7) resolve `.ts` files
+// under vitest. Without this hook vitest's plain-node CJS resolver fails the
+// require with `Cannot find module './group_chat/bus'` and chats.deleteConversation
+// silently skips purgeGroupDir, breaking the delete-cascade tests.
 import 'tsx/cjs';
 
 if (!process.env.ORKAS_WORKSPACE_ROOT) {

@@ -18,15 +18,33 @@ let _settingsState = {
   pickerProviderSel: null,
   pickerModelSel: null,
   addBtnBound: false,
-  dragState: null
+  dragState: null,
+  clientConfigBound: false,
 };
+
+function _settingsTrackClick() {}
+
+function _settingsTrackModelProviderSelect(surface, provider) {
+  const value = String(provider || '').trim();
+  if (!value) return;
+  _settingsTrackClick('model_provider_select', { surface, provider: value });
+}
+
+function _settingsTrackModelSelect(surface, provider, model) {
+  const modelValue = String(model || '').trim();
+  if (!modelValue) return;
+  const payload = { surface, model: modelValue };
+  const providerValue = String(provider || '').trim();
+  if (providerValue) payload.provider = providerValue;
+  _settingsTrackClick('model_model_select', payload);
+}
 
 async function loadSettings() {
   // 4-tab structure (batch 6). Initialize switching + activate default tab
   // (通用 by default — matches the is-active class on the markup).
   if (typeof initSettingsTabs === 'function') initSettingsTabs();
   _settingsBindLanguageOnce();
-  if (typeof initFeedbackSettings === 'function') initFeedbackSettings();
+  _settingsBindClientConfigOnce();
   _settingsSyncLanguageRadio();
   await Promise.all([
     _settingsRefreshProviders(),
@@ -46,10 +64,17 @@ async function loadSettings() {
   _settingsRenderCommanderAvatar();
   _settingsRenderMetacognition();
   _settingsRenderDataRoot();
-  // Account card (views/login/account_settings.js) is absent in OrkasOpen, so this
-  // is a no-op here.
-  if (typeof renderAccountSettings === 'function') renderAccountSettings();
+  // Account card + subscription card (views/login/account_settings.js — absent in
+  // OrkasOpen, so these are no-ops there). renderSubscriptionSettings rebinds the
+  // action button's click handler with the current subscription state on every
+  // render — opening the panel is the canonical "guarantee fresh button binding"
+  // moment, so call it explicitly here (not just from the account.onChange listener
+  // which only fires on state changes — for a Free user with no transitions the
+  // listener never fires after boot, leaving the button bound to whatever its
+  // first render captured).
 }
+
+function _settingsBindClientConfigOnce() {}
 
 // ── Commander avatar ──
 // Commander avatar goes through the prefs IPC and lands in
@@ -105,42 +130,43 @@ function _settingsRenderCommanderAvatar() {
 
 // ── Tool execution access permission ──
 
+const _LOCALEXEC_MODES = ['off', 'risk_prompt', 'allow_all'];
+
 async function _settingsRefreshLocalExec() {
   const res = await window.orkas.invoke('permissions.getLocalExec');
-  _settingsState.localExec = (res && res.ok) ? {
-    granted: !!res.granted,
-    grantedAt: res.grantedAt || null,
-    revokedAt: res.revokedAt || null,
-  } : { granted: true, grantedAt: null, revokedAt: null };
+  const mode = (res && res.ok && _LOCALEXEC_MODES.includes(res.mode)) ? res.mode : 'risk_prompt';
+  _settingsState.localExec = { mode };
 }
 
 function _settingsRenderLocalExec() {
-  const toggle = document.getElementById('settings-localexec-toggle');
-  if (!toggle) return;
-  const s = _settingsState.localExec || { granted: true };
-  toggle.checked = !!s.granted;
-  if (!toggle.dataset.bound) {
-    toggle.addEventListener('change', async () => {
-      const next = !!toggle.checked;
-      const channel = next ? 'permissions.grantLocalExec' : 'permissions.revokeLocalExec';
-      try {
-        const res = await window.orkas.invoke(channel);
-        if (res && res.ok) {
-          _settingsState.localExec = {
-            granted: !!res.granted,
-            grantedAt: res.grantedAt || null,
-            revokedAt: res.revokedAt || null,
-          };
+  const container = document.getElementById('settings-localexec-modes');
+  if (!container) return;
+  const mode = (_settingsState.localExec && _settingsState.localExec.mode) || 'risk_prompt';
+  const radios = container.querySelectorAll('input[name="localexec-mode"]');
+  radios.forEach((r) => { r.checked = (r.value === mode); });
+  if (!container.dataset.bound) {
+    radios.forEach((radio) => {
+      radio.addEventListener('change', async () => {
+        if (!radio.checked) return;
+        const next = radio.value;
+        const prev = (_settingsState.localExec && _settingsState.localExec.mode) || 'risk_prompt';
+        try {
+          const res = await window.orkas.invoke('permissions.setLocalExecMode', { mode: next });
+          if (res && res.ok && res.mode) {
+            _settingsState.localExec = { mode: res.mode };
+            _settingsRenderLocalExec();
+          } else {
+            _settingsState.localExec = { mode: prev };
+            _settingsRenderLocalExec();
+          }
+        } catch (err) {
+          _settingsState.localExec = { mode: prev };
           _settingsRenderLocalExec();
-                  } else {
-          toggle.checked = !next;
+          _settingsLog.warn('local exec mode set failed', err);
         }
-      } catch (err) {
-        toggle.checked = !next;
-        _settingsLog.warn('local exec toggle failed', err);
-      }
+      });
     });
-    toggle.dataset.bound = '1';
+    container.dataset.bound = '1';
   }
 }
 
@@ -179,7 +205,7 @@ function _settingsRenderMetacognition() {
         const res = await window.orkas.invoke('prefs.setMetacognition', { enabled: next });
         if (res && res.ok) {
           _settingsState.metacognition = { ..._settingsState.metacognition, enabled: !!res.enabled };
-                  } else {
+        } else {
           // Roll back the UI on write failure.
           cb.checked = !next;
           _settingsLog.warn('setMetacognition rejected', res);
@@ -215,7 +241,7 @@ function _settingsRenderDataRoot() {
     btn.addEventListener('click', async () => {
       try {
         await window.orkas.invoke('app.openDataRoot');
-              } catch (err) {
+      } catch (err) {
         _settingsLog.warn('open data root failed', { error: (err && err.message) || String(err) });
       }
     });
@@ -255,7 +281,7 @@ function _settingsBindLanguageOnce() {
     try {
       await setLang(next);
       _settingsLog.info('language changed', { lang: next });
-          } catch (err) {
+    } catch (err) {
       _settingsLog.warn('setLang failed', { error: (err && err.message) || String(err) });
     }
   });
@@ -277,6 +303,7 @@ window.addEventListener('i18n-change', () => {
   _settingsRenderEntries();
   _settingsRenderSearchSection();
   _settingsRenderImageSection();
+  _settingsRenderVideoSection();
   _settingsRenderMetacognition();
 });
 
@@ -288,6 +315,7 @@ async function _settingsRefreshProviders() {
 async function _settingsRefreshEntries() {
   const res = await window.orkas.invoke('auth.listEntries');
   _settingsState.entries = (res && res.ok && Array.isArray(res.entries)) ? res.entries : [];
+  if (typeof trackModelConfigSnapshot === 'function') trackModelConfigSnapshot(_settingsState.entries);
 }
 
 async function _settingsGetModels(providerId) {
@@ -328,6 +356,7 @@ async function _settingsRenderPicker() {
       placeholder: t('settings.picker.select_provider'),
     });
     _settingsState.pickerProviderSel.onChange(async (val) => {
+      _settingsTrackModelProviderSelect('model_auth_picker', val);
       await _settingsPopulatePickerModel(val, '');
       _settingsSetStatus('settings-picker-status', '', '');
     });
@@ -342,7 +371,8 @@ async function _settingsRenderPicker() {
     _settingsState.pickerModelSel = _aiSelectMount(modelEl, {
       placeholder: t('settings.picker.pick_provider_first'),
     });
-    _settingsState.pickerModelSel.onChange(() => {
+    _settingsState.pickerModelSel.onChange((val) => {
+      _settingsTrackModelSelect('model_auth_picker', _settingsState.pickerProviderSel?.getValue(), val);
       _settingsSetStatus('settings-picker-status', '', '');
     });
   }
@@ -384,6 +414,7 @@ async function _settingsClickAddEntry() {
 // ── Method chooser + credential forms ──
 
 function _settingsChooseAccountMethod(provider, modelId) {
+
   const hasApi   = !!provider.supportsApiKey;
   const hasOAuth = !!provider.supportsOAuth;
 
@@ -484,7 +515,7 @@ function _settingsShowApiKeyForm(provider, modelId) {
     saveBtn.disabled = true;
     msg.textContent = t('settings.save_loading'); msg.className = 'form-msg';
     _settingsLog.info('add api key', { provider: provider.id, model: modelId, has_label: !!label });
-        const addRes = await window.orkas.invoke('auth.addApiKey', {
+    const addRes = await window.orkas.invoke('auth.addApiKey', {
       provider: provider.id,
       apiKey,
       label: label || undefined,
@@ -494,7 +525,7 @@ function _settingsShowApiKeyForm(provider, modelId) {
       msg.textContent = (addRes && addRes.error) || t('settings.save_failed');
       msg.className = 'form-msg error';
       _settingsLog.warn('add api key failed', { provider: provider.id, error: addRes && addRes.error });
-            return;
+      return;
     }
     const entryRes = await window.orkas.invoke('auth.addEntry', {
       provider: provider.id,
@@ -584,11 +615,11 @@ async function _settingsStartOAuthFlow(provider, modelId) {
   document.addEventListener('keydown', onKey, true);
 
   _settingsLog.info('oauth start', { provider: oauthProviderId });
-    const startRes = await window.orkas.invoke('auth.startOAuth', { provider: oauthProviderId });
+  const startRes = await window.orkas.invoke('auth.startOAuth', { provider: oauthProviderId });
   if (!startRes || !startRes.ok) {
     body.innerHTML = `<div class="oauth-flow-stage error">${escapeHtml((startRes && startRes.error) || t('settings.oauth.start_failed'))}</div>`;
     _settingsLog.warn('oauth start failed', { provider: oauthProviderId, error: startRes && startRes.error });
-        return;
+    return;
   }
   _oauthFlowId = startRes.flowId;
 
@@ -794,6 +825,7 @@ function _settingsRenderEntryRow(entry, idx) {
     modelSel.setOptions(options, { value: entry.model });
     modelSel.onChange(async (val) => {
       if (!val || val === entry.model) return;
+      _settingsTrackModelSelect('configured_model_entry', entry.provider, val);
       const up = await window.orkas.invoke('auth.updateEntryModel', { entryId: entry.entryId, model: val });
       if (!up || !up.ok) {
         await uiAlert((up && up.error) || t('settings.entries.switch_model_failed'));
@@ -810,6 +842,9 @@ function _settingsRenderEntryRow(entry, idx) {
   if (entry.profileType === 'oauth') {
     badge.className = 'account-type-badge oauth' + (entry.oauthExpired ? ' expired' : '');
     badge.textContent = entry.oauthExpired ? t('settings.entries.oauth_expired') : t('settings.entries.oauth_badge');
+  } else if (entry.profileType === 'managed') {
+    badge.className = 'account-type-badge';
+    badge.textContent = 'Orkas';
   } else {
     badge.className = 'account-type-badge';
     badge.textContent = 'API Key';
@@ -947,7 +982,7 @@ async function _settingsRemoveEntry(entry) {
     provider: entry.provider,
     model: entry.model,
   });
-    const res = await window.orkas.invoke('auth.removeEntry', { entryId: entry.entryId });
+  const res = await window.orkas.invoke('auth.removeEntry', { entryId: entry.entryId });
   if (!res || !res.ok) {
     _settingsLog.warn('remove entry failed', { entry_id: entry.entryId, error: res && res.error });
     await uiAlert((res && res.error) || t('settings.entries.delete_failed'));

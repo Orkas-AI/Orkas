@@ -91,9 +91,9 @@ export interface ChatOptions {
    *  read_file / search_files / grep_files scope to this conv's attachment
    *  dir in addition to the user's active workspace. */
   cid?: string;
-  /** Stable id for the visible actor turn. Used to derive a per-turn bash
-   *  output directory so script-generated files can be chip-tracked without
-   *  racing parallel agents in the same conversation workspace. */
+  /** Stable id for the visible actor turn. Group chat passes this through as
+   *  part of its turn-scoped execution contract; file output now stays in the
+   *  conversation workspace rather than a turn-specific subdirectory. */
   turnId?: string;
   /** Project id of the conversation, when it belongs to one. Threaded
    *  through to local-tools / file-tools / image-gen-tool so workspace
@@ -114,7 +114,7 @@ export interface ChatOptions {
    *  channels. */
   readOnlyExtraRoots?: readonly string[];
   /** Fired with the absolute path of every file produced by the local-exec
-   * tools (`write_file`, `markdown_to_pdf`, `html_to_pdf`, `bash` output dir)
+   * tools (`write_file`, `markdown_to_pdf`, `html_to_pdf`, `bash`)
    * during this run.
    * `features/chats` uses this to attach a `produced[]` list to the
    * assistant message so the UI can offer a "reveal in Finder" chip. */

@@ -30,14 +30,16 @@ function _memToast(msg, variant) {
 }
 
 function _memTrack(action, data) {
-  
 }
 
 function _memTrackError(action, data) {
-  
 }
 
 async function _memInvoke(channel, payload) {
+  if (!window.orkas || typeof window.orkas.invoke !== 'function') {
+    return { ok: false, error: 'ipc bridge unavailable' };
+  }
+
   try {
     const res = await window.orkas.invoke(channel, payload || {});
     if (res && res.ok === false) _memTrackError('memory_ipc_result', { channel, msg: res.error || 'failed' });

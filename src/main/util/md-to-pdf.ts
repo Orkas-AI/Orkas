@@ -225,6 +225,18 @@ const PRINT_CSS = `
   strong { font-weight: 600; }
 `;
 
+// Chromium can economize print colors even when backgrounds are enabled.
+// Preserve dark code blocks and other authored color pairs in generated PDFs.
+const PDF_PRINT_COLOR_CSS = `
+  @media print {
+    html, body, body * {
+      -webkit-print-color-adjust: exact !important;
+      print-color-adjust: exact !important;
+      color-adjust: exact !important;
+    }
+  }
+`;
+
 // ── HTML → PDF (Electron-backed) ─────────────────────────────────────────
 
 export interface HtmlToPdfOpts {
@@ -268,6 +280,7 @@ export async function htmlToPdf(
     });
     await win.loadURL(dataUrl);
     await loaded;
+    await win.webContents.insertCSS(PDF_PRINT_COLOR_CSS, { cssOrigin: 'user' });
 
     const pdfBuffer: Buffer = await win.webContents.printToPDF({
       pageSize: opts.pageSize ?? 'A4',

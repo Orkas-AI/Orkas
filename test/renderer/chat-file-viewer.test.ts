@@ -7,10 +7,11 @@
 import { describe, it, expect } from 'vitest';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const viewer = require('../../src/renderer/modules/chat-file-viewer.js');
-const { _kindOf, _extOf, _chatMediaLocalUrl } = viewer as {
+const { _kindOf, _extOf, _chatMediaLocalUrl, _viewerCanAddToLibrary } = viewer as {
   _kindOf: (name: string) => string;
   _extOf: (name: string) => string;
   _chatMediaLocalUrl: (abs: string) => string;
+  _viewerCanAddToLibrary: (kind: string) => boolean;
 };
 
 describe('chat-file-viewer › _kindOf', () => {
@@ -65,7 +66,7 @@ describe('chat-file-viewer › _kindOf', () => {
   });
 
   it('handles paths with directories — only the basename ext matters', () => {
-    expect(_kindOf('/Users/me/Documents/note.md')).toBe('markdown');
+    expect(_kindOf('/Users/test/Documents/note.md')).toBe('markdown');
     expect(_kindOf('C:\\\\work\\\\report.pdf')).toBe('pdf');
   });
 });
@@ -88,10 +89,10 @@ describe('chat-file-viewer › _chatMediaLocalUrl', () => {
   // `_pathnameToAbsPath`, so it must encode spaces / non-ASCII but
   // preserve `/` separators. encodeURI does both.
   it('builds chat-media://local/ + path for a unix abs path', () => {
-    expect(_chatMediaLocalUrl('/Users/me/file.pdf')).toBe('chat-media://local/Users/me/file.pdf');
+    expect(_chatMediaLocalUrl('/Users/test/file.pdf')).toBe('chat-media://local/Users/test/file.pdf');
   });
   it('URL-encodes spaces in the path', () => {
-    expect(_chatMediaLocalUrl('/Users/me/has space.pdf')).toBe('chat-media://local/Users/me/has%20space.pdf');
+    expect(_chatMediaLocalUrl('/Users/test/has space.pdf')).toBe('chat-media://local/Users/test/has%20space.pdf');
   });
   it('preserves "/" separators (doesn\'t use encodeURIComponent)', () => {
     const url = _chatMediaLocalUrl('/a/b/c/d.pdf');
@@ -99,6 +100,19 @@ describe('chat-file-viewer › _chatMediaLocalUrl', () => {
     expect(url).toContain('/a/b/c/d.pdf');
   });
   it('converts Windows-style "\\\\" to "/" so URL parsing stays well-formed', () => {
-    expect(_chatMediaLocalUrl('C:\\Users\\me\\file.pdf')).toBe('chat-media://local/C:/Users/me/file.pdf');
+    expect(_chatMediaLocalUrl('C:\\Users\\alice\\file.pdf')).toBe('chat-media://local/C:/Users/test/file.pdf');
+  });
+});
+
+describe('chat-file-viewer › _viewerCanAddToLibrary', () => {
+  it('does not offer Add to Library for video previews', () => {
+    expect(_viewerCanAddToLibrary('video')).toBe(false);
+  });
+
+  it('keeps Add to Library available for supported preview kinds', () => {
+    expect(_viewerCanAddToLibrary('pdf')).toBe(true);
+    expect(_viewerCanAddToLibrary('text')).toBe(true);
+    expect(_viewerCanAddToLibrary('markdown')).toBe(true);
+    expect(_viewerCanAddToLibrary('html')).toBe(true);
   });
 });

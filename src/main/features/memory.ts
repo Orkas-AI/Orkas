@@ -67,6 +67,10 @@ function limitForTarget(target: 'memory' | 'user'): number {
   return target === 'memory' ? MEMORY_CHAR_LIMIT : USER_CHAR_LIMIT;
 }
 
+function notifyMemoryDirty(target: 'memory' | 'user'): void {
+  void target;
+}
+
 /** Load §-separated entries from a markdown file. */
 export function loadEntries(filePath: string): MemoryEntry[] {
   let raw: string;
@@ -135,6 +139,7 @@ export function addEntry(userId: string, target: 'memory' | 'user', content: str
   const entries = loadEntries(filePath);
   entries.push({ text: trimmed });
   saveEntries(filePath, entries, limit);
+  notifyMemoryDirty(target);
   return buildResult(userId, target, true);
 }
 
@@ -156,6 +161,7 @@ export function replaceEntry(userId: string, target: 'memory' | 'user', oldText:
 
   entries[idx] = { text: trimmed };
   saveEntries(filePath, entries, limit);
+  notifyMemoryDirty(target);
   return buildResult(userId, target, true);
 }
 
@@ -168,6 +174,7 @@ export function removeEntry(userId: string, target: 'memory' | 'user', oldText: 
 
   entries.splice(idx, 1);
   saveEntries(filePath, entries, limit);
+  notifyMemoryDirty(target);
   return buildResult(userId, target, true);
 }
 
@@ -180,6 +187,7 @@ export function clearMemory(userId: string, target: 'memory' | 'user'): void {
   try {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     writeTextAtomicSync(filePath, '');
+    notifyMemoryDirty(target);
   } catch (err) {
     log.warn(`clearMemory failed: ${(err as Error).message}`);
   }

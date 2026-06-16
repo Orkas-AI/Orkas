@@ -31,17 +31,55 @@ import { maybeSpillToolResult } from '../../util/tool-result-cap.js';
 
 const log = createLogger('local-agents:runner');
 
-/** Wall-clock cap for a single CLI dispatch. Override at deploy /
- *  debugging time via env. 20 min covers nontrivial coding tasks
- *  while bounding zombie processes if the CLI hangs. */
-const DEFAULT_TIMEOUT_MS = 20 * 60 * 1000;
+/** Hard wall-clock cap for a single CLI dispatch — zombie insurance
+ *  only. The hang detector is the idle-kill below, so this can be
+ *  generous: healthy coding dispatches routinely pass 20 minutes
+ *  (builds, model downloads, renders). The old 20-min value doubled as
+ *  the hang detector and killed an actively-working 20-min claude turn
+ *  (run 1dffe7c48d18). Override via ORKAS_LOCAL_AGENT_TIMEOUT_MS. */
+const DEFAULT_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 
-function resolveTimeoutMs(): number {
+/** Backends with no mid-run event stream can't be idle-killed (silence
+ *  is normal for them), so they keep the old tight wall-clock cap as
+ *  their only hang bound. */
+const BACKEND_TIMEOUT_MS: Partial<Record<LocalCliType, number>> = {
+  openclaw: 20 * 60 * 1000,
+};
+
+function resolveTimeoutMs(cli: LocalCliType): number {
+  const fallback = BACKEND_TIMEOUT_MS[cli] ?? DEFAULT_TIMEOUT_MS;
   const raw = process.env.ORKAS_LOCAL_AGENT_TIMEOUT_MS;
-  if (!raw) return DEFAULT_TIMEOUT_MS;
+  if (!raw) return fallback;
   const n = Number(raw);
-  if (!Number.isFinite(n) || n < 1000) return DEFAULT_TIMEOUT_MS;
+  if (!Number.isFinite(n) || n < 1000) return fallback;
   return n;
+}
+
+/** Kill the CLI when it emits NO events for this long. This is the
+ *  actual hang detector (vs the wall cap above). Long quiet stretches
+ *  are real — a single Bash tool call sat silent ~10 min downloading a
+ *  whisper model — so the default stays comfortably above them.
+ *  Override via ORKAS_LOCAL_AGENT_IDLE_KILL_MS; 0 disables. */
+const DEFAULT_IDLE_KILL_MS = 15 * 60 * 1000;
+
+/** Idle-kill is meaningless for backends that emit nothing mid-run
+ *  (their silence carries no hang signal) — disable it there and rely
+ *  on the per-backend wall cap instead. */
+const BACKEND_IDLE_KILL_DISABLED: Partial<Record<LocalCliType, boolean>> = {
+  openclaw: true,
+};
+
+function resolveIdleKillMs(cli: LocalCliType): number | undefined {
+  if (BACKEND_IDLE_KILL_DISABLED[cli]) return undefined;
+  const raw = process.env.ORKAS_LOCAL_AGENT_IDLE_KILL_MS;
+  if (raw !== undefined) {
+    const n = Number(raw);
+    if (Number.isFinite(n)) {
+      if (n <= 0) return undefined;          // explicit disable
+      if (n >= 60_000) return n;             // floor guards against drumming kills
+    }
+  }
+  return DEFAULT_IDLE_KILL_MS;
 }
 
 /** How long the runner waits without seeing ANY backend event before
@@ -101,10 +139,33 @@ const BACKENDS: Partial<Record<LocalCliType, LocalBackend>> = {
   hermes: hermesBackend,
 };
 
+/** CLIs with a supported MCP-config injection path (claude:
+ *  `--mcp-config`; codex: `-c mcp_servers.…`). Others run without the
+ *  bridge until an injection mechanism exists for them. */
+function _bridgeSupported(cli: LocalCliType): boolean {
+  return cli === 'claude' || cli === 'codex';
+}
+
+/** Appended to the CLI agent's system prompt when the bridge is live.
+ *  Runtime-generated (not a tracked prompt md); keep it to capability
+ *  discovery — the tool descriptions carry the details. */
+const BRIDGE_SYSTEM_PROMPT =
+  'You are running inside Orkas, the user\'s agent workspace. An MCP server named "orkas" is '
+  + 'connected: it lists and reads the user\'s Orkas skills (orkas_list_skills / orkas_read_skill / '
+  + 'orkas_run_skill), reaches their connected services (orkas_list_connector_tools / '
+  + 'orkas_call_connector_tool — calls may wait for the user to approve a permission prompt in '
+  + 'Orkas), and browses/searches their knowledge base (orkas_kb_list / orkas_kb_search / '
+  + 'orkas_kb_read). Prefer these '
+  + 'tools when the task involves the user\'s skills, services, or library content.';
+
 export interface RunCliAgentOpts {
   uid: string;
   cid: string;
   agentId: string;
+  /** Display name for permission dialogs; falls back to agentId. */
+  agentName?: string;
+  /** Conversation project scope, when the CLI turn belongs to a project. */
+  projectId?: string;
   cli: LocalCliType;
   model?: string;
   customArgs?: string[];
@@ -159,8 +220,6 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   // a renderer crash mid-run still leaves a complete jsonl trail.
   let streamedOutput = '';
   let terminal: { status: RunCliAgentResult['status']; output?: string; error?: string; sessionId?: string } | null = null;
-  // The dev devtools LLM-call archive is stripped from this build; the runtime
-  // `local-agent-runs/<runId>/` directory is the only persistence path.
   const idleThresholdMs = resolveIdleMs(BACKEND_IDLE_MS[opts.cli]);
   // CLI dispatch session id (matches the devtools-archive session id
   // built below). The per-session spill dir is anchored on this so
@@ -209,11 +268,12 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     opts.onEvent(e);
   };
 
-  // Idle ticker — purely informational; never kills the process. The
-  // existing 20-minute wall-clock timeout stays the only kill path. We
-  // re-emit at IDLE_TICK_MS cadence so the user gets a steady drumbeat
-  // ("○ no output for 30s" repeated) confirming the run is still
-  // ostensibly alive, rather than a single heartbeat that ages out.
+  // Idle ticker — purely informational; never kills the process itself.
+  // Killing is the backend watchdog's job (idle-kill at `idleKillMs` +
+  // wall cap, see resolveIdleKillMs/resolveTimeoutMs above); this
+  // threshold sits far below the kill window so the user sees a steady
+  // drumbeat ("○ no output for 30s" repeated) well before any kill,
+  // rather than a single heartbeat that ages out.
   const idleTickMs = resolveIdleTickMs(idleThresholdMs);
   const idleTimer = setInterval(() => {
     if (terminal) return;  // run already finished, don't keep pulsing
@@ -223,6 +283,34 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     }
   }, idleTickMs);
   if (typeof idleTimer.unref === 'function') idleTimer.unref();
+
+  // orkas-bridge (plan §D): per-run host exposing the user's Orkas
+  // skills / connectors / KB to the CLI agent over a local socket. Bridge
+  // failures never fail the dispatch — the CLI just runs without the
+  // `orkas` MCP server, same as before the bridge existed.
+  let bridge: import('./bridge').BridgeHandle | null = null;
+  if (_bridgeSupported(opts.cli) && process.env.ORKAS_BRIDGE_DISABLED !== '1') {
+    try {
+      const [{ startBridge }, { buildSkillSandboxEnv }] = await Promise.all([
+        import('./bridge.js'),
+        import('../../model/core-agent/client.js'),
+      ]);
+      bridge = await startBridge({
+        uid: opts.uid,
+        cid: opts.cid,
+        agentId: opts.agentId,
+        agentName: opts.agentName || opts.agentId,
+        ...(opts.projectId ? { projectId: opts.projectId } : {}),
+        runId: handle.runId,
+        configDir: handle.dir,
+        sandboxEnv: buildSkillSandboxEnv(opts.uid),
+      });
+    } catch (err) {
+      log.warn('bridge start failed — running without orkas MCP server', {
+        runId: handle.runId, error: (err as Error).message,
+      });
+    }
+  }
 
   try {
     await backend.run({
@@ -234,14 +322,35 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
       resumeSessionId: opts.resumeSessionId,
       signal: opts.signal,
       onEvent,
-      timeoutMs: resolveTimeoutMs(),
+      timeoutMs: resolveTimeoutMs(opts.cli),
+      idleKillMs: resolveIdleKillMs(opts.cli),
+      // Activity clock for the backend's idle-kill watchdog. Reads the
+      // same `lastEventAt` the idle heartbeat uses (self-emitted idle
+      // pulses excluded), so heartbeat rows always precede a kill.
+      lastEventAt: () => lastEventAt,
       idleMs: BACKEND_IDLE_MS[opts.cli],
+      ...(bridge ? {
+        bridge: {
+          mcpConfigPath: bridge.mcpConfigPath,
+          server: {
+            command: bridge.serverEnv.ORKAS_NODE || process.execPath,
+            args: [`${bridge.serverEnv.ORKAS_PC_DIR}/bin/orkas-bridge.cjs`],
+            env: bridge.serverEnv,
+          },
+          appendSystemPrompt: BRIDGE_SYSTEM_PROMPT,
+        },
+      } : {}),
     });
   } catch (err) {
     const msg = (err as Error).message || String(err);
     log.error('backend threw', { runId: handle.runId, error: msg });
     if (!terminal) {
       onEvent({ type: 'done', status: 'failed', error: msg });
+    }
+  } finally {
+    if (bridge) {
+      try { await bridge.close(); }
+      catch (err) { log.warn('bridge close failed', { runId: handle.runId, error: (err as Error).message }); }
     }
   }
 
@@ -266,10 +375,6 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   log.info('end', {
     runId: handle.runId, cli: opts.cli, status: terminal.status, bytes: finalOutput?.length ?? 0,
   });
-  // The per-run jsonl under `local-agent-runs/<runId>/` (written by `persist`)
-  // is the only post-run artifact in this build.
-  void entry.version;
-  void endedAtMs;
   return { runId: handle.runId, status: terminal.status, output: finalOutput, error: terminal.error };
 }
 

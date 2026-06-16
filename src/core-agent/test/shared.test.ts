@@ -53,6 +53,12 @@ describe("Errors", () => {
       expect(isRetryableError(new ProviderError("429", "test", 429))).toBe(true);
     });
 
+    it("returns false for 429 balance/quota-exhausted errors", () => {
+      const body = '429 {"error":{"message":"积分不足","type":"insufficient_quota","code":"quota_exceeded"}}';
+      expect(isRetryableError(new ProviderError(body, "deepseek", 429))).toBe(false);
+      expect(classifyRetryableError(new RateLimitError(`deepseek rate limited: ${body}`))).toBeNull();
+    });
+
     it("returns true for 500/502/503 ProviderError", () => {
       expect(isRetryableError(new ProviderError("500", "test", 500))).toBe(true);
       expect(isRetryableError(new ProviderError("502", "test", 502))).toBe(true);

@@ -381,6 +381,7 @@ async function _afterRecycleRestore(ctx: IpcContext, paths: string[]): Promise<v
       log.warn('auto task reschedule after recycle restore failed', { error: logErrorRef(err) });
     });
   }
+  void change;
 }
 
 // ── Invoke handlers ──────────────────────────────────────────────────────
@@ -1138,7 +1139,17 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!agents.isValidAgentId(agent_id)) throw new Error('invalid agent_id');
     let data = await agents.updateCustomAgent(agent_id, updates || {});
     if (!data) {
-      data = await agents.updateAgentSpec(agent_id, updates || {});
+      try {
+        const dev = await import('../features/agents_dev');
+        data = await dev.updateBuiltinAgentSpec(agent_id, updates || {});
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === 'MODULE_NOT_FOUND' || code === 'ERR_MODULE_NOT_FOUND') {
+          data = null;
+        } else {
+          throw err;
+        }
+      }
     }
     if (!data) throw new Error('agent not found or read-only');
     return { agent: data };
@@ -1187,12 +1198,16 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { cleared: await agents.clearAgentChat(ctx.userId, agent_id) };
   },
 
-  'agents.chat.send': async ({ agent_id, content, attachments }, ctx) => {
+  'agents.chat.send': async ({ agent_id, content, model_text, attachments }, ctx) => {
     if (!agents.isValidAgentId(agent_id)) throw new Error('invalid agent_id');
     const text = (content || '').trim();
     if (!text) throw new Error('empty message');
+    const modelText = typeof model_text === 'string' ? model_text.trim() : '';
     const atts = Array.isArray(attachments) ? attachments.filter((n: any) => typeof n === 'string' && n) : [];
-    return agents.sendToAgentEditChat(ctx.userId, agent_id, text, atts.length ? { attachments: atts } : {});
+    return agents.sendToAgentEditChat(ctx.userId, agent_id, text, {
+      ...(atts.length ? { attachments: atts } : {}),
+      ...(modelText ? { modelText } : {}),
+    });
   },
 
   // ── Skills ──
@@ -1245,13 +1260,18 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'skills.createFromUrl': async ({ name, description, url }) => {
     const r = await skills.createFromUrl(name ?? null, description ?? null, String(url || ''));
     if (!r.ok) return r;
-    return { skill: r.skill, seedMessage: r.seedMessage };
+    return { skill: r.skill, skills: r.skills, seedModelText: r.seedModelText, seedMessage: r.seedMessage };
   },
 
   'skills.createFromDir': async ({ name, description, srcDir, force }) => {
     const r = await skills.createFromDir(name ?? null, description ?? null, String(srcDir || ''), { force: force === true });
     if (!r.ok) return r;
-    return { skill: r.skill, seedMessage: r.seedMessage };
+    return { skill: r.skill, skills: r.skills, seedModelText: r.seedModelText, seedMessage: r.seedMessage };
+  },
+
+  'skills.discardImportDraft': async ({ id }) => {
+    if (!skills.isValidSkillId(id)) throw new Error('invalid skill id');
+    return { discarded: await skills.discardImportDraftIfPristine(id) };
   },
 
   'skills.update': async ({ id, updates, skipRename }) => {
@@ -1313,18 +1333,21 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { cleared: await skills.clearSkillChat(ctx.userId, id) };
   },
 
-  'skills.chat.send': async ({ id, content, attachments }, ctx) => {
+  'skills.chat.send': async ({ id, content, model_text, attachments }, ctx) => {
     if (!skills.isValidSkillId(id)) throw new Error('invalid skill id');
     const text = (content || '').trim();
     if (!text) throw new Error('empty message');
+    const modelText = typeof model_text === 'string' ? model_text.trim() : '';
     const atts = Array.isArray(attachments) ? attachments.filter((n: any) => typeof n === 'string' && n) : [];
-    return skills.sendToSkillChat(ctx.userId, id, text, atts.length ? { attachments: atts } : {});
+    return skills.sendToSkillChat(ctx.userId, id, text, {
+      ...(atts.length ? { attachments: atts } : {}),
+      ...(modelText ? { modelText } : {}),
+    });
   },
 
   // ── Marketplace ──
   // Listing + detail + install endpoints hit the public Server catalog; categories are served
   // from the local biz cache when callers pass `local_only`, otherwise refreshed on stale cache.
-  // Upload endpoints live in `dev_handlers.ts` (dev builds only).
   'marketplace.categories': async (opts = {}) => ({
     list: await marketplaceBiz.getMarketplaceCategories({
       localOnly: !!opts.local_only,
@@ -1335,6 +1358,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'marketplace.listAgents': async (opts = {}) => marketplace.listMarketplaceAgents(opts),
 
   'marketplace.listSkills': async (opts = {}) => marketplace.listMarketplaceSkills(opts),
+
+  // Curated open-source projects catalog (read-only). Returns { list, total, categories }.
+  'marketplace.listProjects': async (opts = {}) => marketplace.listMarketplaceProjects(opts),
 
   // Detail endpoints (cache-first) — used by the marketplace panel's detail view to render
   // full content. Caller passes the list-row's (version, freshness timestamp) so we can short-circuit
@@ -1412,6 +1438,12 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'marketplace.setListingsCache': async ({ entries }) => {
     if (!entries || typeof entries !== 'object') throw new Error('entries required');
     await marketplaceCache.setListingsCache(entries);
+    return { ok: true as const };
+  },
+
+  'marketplace.mergeListingsCache': async ({ entries }) => {
+    if (!entries || typeof entries !== 'object') throw new Error('entries required');
+    await marketplaceCache.mergeListingsCache(entries);
     return { ok: true as const };
   },
 
@@ -1706,6 +1738,82 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'permissions.getLocalExec':    async () => permissions.getLocalExecState(),
   'permissions.grantLocalExec':  async () => permissions.grantLocalExec(),
   'permissions.revokeLocalExec': async () => permissions.revokeLocalExec(),
+  // Three-mode setter (off / risk_prompt / allow_all). Returns the new state
+  // in the same shape as getLocalExec so settings.js can read it back.
+  'permissions.setLocalExecMode': async ({ mode }: { mode?: unknown }) => {
+    if (mode !== 'off' && mode !== 'risk_prompt' && mode !== 'allow_all') {
+      throw new Error('invalid mode');
+    }
+    return permissions.setLocalExecMode(mode);
+  },
+
+  // ── User-granted folder access (plan §B2) ──────────────────────────────
+  // Extra directories the file/bash tools may touch beyond workspace +
+  // attachments. Grant goes through a native folder picker; the feature
+  // enforces the deny-list (credential/system dirs) + realpath.
+  'grantedRoots.list': async (_payload: unknown, ctx: { userId: string }) => {
+    const granted = await import('../features/granted_roots');
+    return { roots: granted.listGrantedRoots(ctx.userId) };
+  },
+  'grantedRoots.add': async (_payload: unknown, ctx: { userId: string }) => {
+    const selected = await userWorkspace.selectDirectory();
+    if (!selected) return { ok: false as const, cancelled: true };
+    const granted = await import('../features/granted_roots');
+    try {
+      const row = granted.grantRoot(ctx.userId, selected);
+      return { ok: true as const, root: row };
+    } catch (err) {
+      const code = err instanceof granted.GrantedRootError ? err.code : 'E_UNKNOWN';
+      return { ok: false as const, error: code };
+    }
+  },
+  'grantedRoots.remove': async (payload: { path?: unknown }, ctx: { userId: string }) => {
+    if (typeof payload?.path !== 'string') throw new Error('invalid path');
+    const granted = await import('../features/granted_roots');
+    return { ok: true as const, removed: granted.revokeRoot(ctx.userId, payload.path) };
+  },
+
+  // ── External packages management (plan §A; UI is read + manage only) ────
+  // Install stays on the commander/CLI path (it needs the clone + dependency
+  // consent flow). The registry's single-writer is bin/orkas-pkg.cjs.
+  'packages.list': async (_payload: unknown, ctx: { userId: string }) => {
+    const pkgs = await import('../features/packages');
+    return { ok: true as const, packages: pkgs.listPackagesForUi(ctx.userId) };
+  },
+  'packages.action': async (payload: { command?: unknown; name?: unknown }, ctx: { userId: string }) => {
+    if (typeof payload?.command !== 'string' || typeof payload?.name !== 'string') {
+      throw new Error('invalid command/name');
+    }
+    const pkgs = await import('../features/packages');
+    const result = await pkgs.runPackageCommand(ctx.userId, payload.command, payload.name);
+    // Skill listing reflects enable/disable + remove immediately.
+    try { (await import('../model/core-agent/skill-registry')).invalidateSkills(); } catch { /* runner not loaded */ }
+    return result;
+  },
+  // Open-tier skills (external packages + global folders) for the read-only
+  // "From packages & global folders" group in the skills panel. External and
+  // global are listed independently (no cross-tier display-name dedupe) so a
+  // skill present in BOTH an installed package and a global folder shows under
+  // each provenance. Disabled ids are NOT filtered here — the panel renders the
+  // toggle state itself. (enable/disable is keyed by id, so a same-id skill in
+  // both tiers shares one toggle state.)
+  'skills.listOpen': async (_payload: unknown, ctx: { userId: string }) => {
+    const reg = await import('../model/core-agent/skill-registry');
+    const componentEnabled = await import('../features/component_enabled');
+    const disabled = componentEnabled.readDisabledSets(ctx.userId).skills;
+    const { external, global } = await reg.listOpenSkillsByTier(ctx.userId);
+    const rows = [...external, ...global].map((r) => ({
+      id: r.id,
+      name: r.name,
+      description: r.description,
+      source: r.source,
+      enabled: r.package_name ? r.package_enabled !== false : !disabled.has(r.id),
+      ...(r.package_name ? { package_name: r.package_name } : {}),
+      ...(r.package_kind ? { package_kind: r.package_kind } : {}),
+      ...(typeof r.package_enabled === 'boolean' ? { package_enabled: r.package_enabled } : {}),
+    }));
+    return { ok: true as const, skills: rows };
+  },
 
   // Renderer reply for the inline `delete_file` confirmation card. The
   // main-side tool is NOT blocking on this — it returned a token-bearing
@@ -1857,11 +1965,6 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       fileIndexer.invalidateFileCache?.(ctx.userId, norm);
     } catch { /* cache invalidation is best-effort */ }
 
-    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
-    const projectFileScope = _projectFileScopeForUser(ctx.userId, projectId);
-    if (projectId && projectFileScope && isPathAllowed(norm, [projectFileScope])) {
-    }
-
     return { ok: true, path: norm };
   },
 
@@ -1938,20 +2041,11 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (!isPathAllowed(norm, await _ipcFileSandboxAllowedRoots(ctx.userId, payload))) {
       throw new Error('path is outside the user workspace');
     }
-    // Used below to gate sync.markDirty: we want to bump the project-files
-    // sync domain ONLY when the write actually landed inside the
-    // project-files scope (so a workspace-only write doesn't tickle the
-    // project-sync engine). Computed via isPathAllowed on the narrow scope
-    // so the symlink-safe semantics match the outer gate.
-    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
-    const projectFileScope = _projectFileScopeForUser(ctx.userId, projectId);
-    const inProjectFile = !!projectFileScope && isPathAllowed(norm, [projectFileScope]);
+
     try {
       fs.writeFileSync(norm, content, 'utf8');
     } catch (err) {
       return { ok: false, error: String((err as Error).message || 'write failed') };
-    }
-    if (inProjectFile && payload?.projectId) {
     }
     return { ok: true, size: bytes };
   },
@@ -1970,33 +2064,24 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { ok: true, path: target };
   },
 
+  // Internal debug panel data is stripped from OrkasOpen. Keep stable
+  // handler shapes so stale renderer calls receive empty results.
   'devtools.listArchives':  async () => ({ items: [] }),
   'devtools.readArchive':   async () => ({ item: null }),
   'devtools.clearArchives': async () => ({ ok: true }),
   'devtools.getNativeSearchEnabled': async () => ({ enabled: true }),
   'devtools.setNativeSearchEnabled': async () => ({ enabled: true }),
-  // Skill metrics — phase-1 consumer of expert_signals. Aggregates the
-  // last N days of skill_advertised / skill_invoked / correction / edit /
-  // skill_ineffective into a per-skill dashboard row. UI lives in the
-  // devtools panel for v0; not dev-only at the backend (data is general
-  // user-private signals, surfaced inside devtools per plan §3.3
-  // "先给专家自己看").
   'devtools.skillMetricsReport': async ({ sinceDays } = {}) => {
     const { aggregateSkillMetrics } = await import('../features/skill_metrics');
     return aggregateSkillMetrics({ sinceDays: Number.isFinite(sinceDays) ? Number(sinceDays) : undefined });
   },
 
-  // Local CLI agent discovery (claude / codex / openclaw / opencode / hermes).
-  // Discovery + model catalogs only; actual spawning happens inside group_chat
-  // dispatch via `features/local_agents/runner.ts`, never as a standalone IPC.
-  ...localAgentsHandlers,
-
   // User-account login (Google OAuth). Stripped from the OrkasOpen build.
-  
+
   // User feedback from Settings. Depends on the account session for Server auth.
-  
+
   // Multi-device sync. Stripped from the OrkasOpen build (depends on account).
-  
+
   // Quality validator — renderer reads persisted ValidationReports to display
   // why a spec write / marketplace install was rejected.
   ...qualityHandlers,
@@ -2201,7 +2286,7 @@ const streamHandlers: Record<string, StreamHandler> = {
     }
   },
 
-  'skills.chat.sendStream': async function* ({ id, content, attachments }, ctx, signal) {
+  'skills.chat.sendStream': async function* ({ id, content, model_text, attachments }, ctx, signal) {
     if (!skills.isValidSkillId(id)) {
       yield { type: 'error', text: 'invalid skill id' };
       return;
@@ -2211,14 +2296,16 @@ const streamHandlers: Record<string, StreamHandler> = {
       yield { type: 'error', text: 'empty message' };
       return;
     }
+    const modelText = typeof model_text === 'string' ? model_text.trim() : '';
     const atts = Array.isArray(attachments) ? attachments.filter((n: any) => typeof n === 'string' && n) : [];
     yield* skills.streamSendToSkillChat(ctx.userId, id, text, {
       abortSignal: signal,
       ...(atts.length ? { attachments: atts } : {}),
+      ...(modelText ? { modelText } : {}),
     });
   },
 
-  'agents.chat.sendStream': async function* ({ id, content, attachments }, ctx, signal) {
+  'agents.chat.sendStream': async function* ({ id, content, model_text, attachments }, ctx, signal) {
     if (!safeId(id)) {
       yield { type: 'error', text: 'invalid agent id' };
       return;
@@ -2228,10 +2315,12 @@ const streamHandlers: Record<string, StreamHandler> = {
       yield { type: 'error', text: 'empty message' };
       return;
     }
+    const modelText = typeof model_text === 'string' ? model_text.trim() : '';
     const atts = Array.isArray(attachments) ? attachments.filter((n: any) => typeof n === 'string' && n) : [];
     yield* agents.streamSendToAgentEditChat(ctx.userId, id, text, {
       abortSignal: signal,
       ...(atts.length ? { attachments: atts } : {}),
+      ...(modelText ? { modelText } : {}),
     });
   },
 
@@ -2345,12 +2434,15 @@ export function register(): void {
         marketplaceId?: string;
         marketplaceName?: string;
         marketplaceReason?: string;
+        qualityReport?: unknown;
       } = {
         ok: false,
         error: (err as Error).message || String(err),
       };
       const code = (err as { code?: unknown }).code;
       if (typeof code === 'string' || typeof code === 'number') out.code = code;
+      const qualityReport = (err as { qualityReport?: unknown }).qualityReport;
+      if (qualityReport) out.qualityReport = qualityReport;
       const installInfo = marketplace.getMarketplaceInstallErrorInfo(err);
       if (installInfo.kind) {
         out.marketplaceKind = installInfo.kind;

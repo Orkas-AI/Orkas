@@ -36,10 +36,9 @@
  * names (`bash` / `write_file`) or the LLM will see both — broken.
  *
  * Note on `bash`: shell-side writes (`cat > foo.py`, `tee`, document
- * generators, etc.) still bypass write_file's conflict protection. To keep
- * produced-file chip ownership precise under parallel agent runs, bash only
- * auto-reports files created / modified under its per-turn
- * `ORKAS_OUTPUT_DIR`; shared workspace writes are left unclaimed.
+ * generators, etc.) still bypass write_file's conflict protection. Bash
+ * auto-reports files created / modified under the current conversation
+ * workspace, exposed to scripts as `ORKAS_OUTPUT_DIR`.
  */
 
 import * as fs from 'node:fs';
@@ -47,7 +46,9 @@ import * as path from 'node:path';
 
 import type { AgentTool, ToolContext, ToolResult } from '#core-agent';
 import { bashTool as coreBashTool, writeFileTool as coreWriteFileTool } from '../../../core-agent/src/tools/builtin';
-import { getLocalExecGranted } from '../../features/permissions';
+import { getLocalExecGranted, getLocalExecMode } from '../../features/permissions';
+import { classifyBashCommand } from './bash-risk';
+import { requestBashDecision } from './bash-permissions';
 import { markdownToPdf, htmlToPdf } from '../../util/md-to-pdf';
 import { uniquifyPath, renderRenameSignal } from '../../util/uniquify-path';
 import { isPathAllowed } from '../../util/path-sandbox';
@@ -78,10 +79,9 @@ export interface LocalToolsOpts {
    *  metadata so the renderer knows which actor to route an interaction
    *  result back to. */
   agentId?: string;
-  /** Stable id for the current visible turn. Used to derive the per-turn
-   * `ORKAS_OUTPUT_DIR` consumed by bash so generated files can be attributed
-   * without racing other agents writing the same conversation workspace. */
-  turnId?: string;
+  /** Display name for the bash risk-permission dialog. Falls back to
+   *  `agentId` when absent. */
+  agentName?: string;
   /** Project id of the current conversation, when it belongs to one.
    *  Threaded through from group_chat at runTurn so workspace resolution
    *  picks up the project-scoped selection (per CLAUDE.md projects feature).
@@ -137,7 +137,10 @@ function resolveAbs(ctx: ToolContext, p: string): string {
 
 function isMineFor(opts: LocalToolsOpts): (p: string) => boolean {
   const fn = opts.hasProducedPath;
-  return fn ? (p) => fn(p) : () => false;
+  return (p) => {
+    if (fn?.(p)) return true;
+    return !!opts.extraRoots?.length && isPathAllowed(path.resolve(p), opts.extraRoots);
+  };
 }
 
 function errText(code: string, msg: string): string {
@@ -148,7 +151,9 @@ const BASH_PRODUCED_SCAN_LIMIT = 5000;
 const BASH_PRODUCED_SKIP_DIRS = new Set([
   '.cache',
   '.git',
+  '.github',
   '.hg',
+  '.idea',
   '.mypy_cache',
   '.next',
   '.parcel-cache',
@@ -157,6 +162,8 @@ const BASH_PRODUCED_SKIP_DIRS = new Set([
   '.svn',
   '.turbo',
   '.venv',
+  '.vs',
+  '.vscode',
   '__pycache__',
   'node_modules',
   'venv',
@@ -164,32 +171,56 @@ const BASH_PRODUCED_SKIP_DIRS = new Set([
 const BASH_PRODUCED_SKIP_FILES = new Set([
   '.DS_Store',
 ]);
+// Repo/package scaffolding that arrives when a skill clones or unpacks its own
+// source tree into the workspace. These are never user deliverables, so the bash
+// diff must not surface them as produced-file chips. Matched case-insensitively
+// against the basename's stem (so README.md / README_CN.md / LICENCE all hit).
+const BASH_PRODUCED_SKIP_NAME_STEMS = new Set([
+  'agents',
+  'authors',
+  'changelog',
+  'claude',
+  'code_of_conduct',
+  'contributing',
+  'copying',
+  'funding',
+  'licence',
+  'license',
+  'notice',
+  'readme',
+  'security',
+]);
+// Dotfiles (no meaningful stem) that are repo config, never deliverables.
+const BASH_PRODUCED_SKIP_DOTFILES = new Set([
+  '.editorconfig',
+  '.gitattributes',
+  '.gitignore',
+  '.npmrc',
+  '.nvmrc',
+]);
 
 type BashFileSnapshotEntry = { mtimeMs: number; size: number };
 type BashFileSnapshot = Map<string, BashFileSnapshotEntry>;
-
-function safeOutputSegment(value: string | undefined, fallback: string): string {
-  const raw = String(value || '').trim();
-  const safe = raw.replace(/[^A-Za-z0-9_.-]+/g, '_').replace(/^_+|_+$/g, '');
-  return safe || fallback;
-}
-
-function randomOutputSegment(): string {
-  return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-}
-
-function bashOutputDir(opts: LocalToolsOpts, workingDir: string): string {
-  const actor = safeOutputSegment(opts.agentId || 'commander', 'actor');
-  const turn = safeOutputSegment(opts.turnId, randomOutputSegment());
-  return path.join(workingDir, '__orkas_outputs', actor, turn);
-}
 
 function shouldSkipBashProducedDir(name: string): boolean {
   return BASH_PRODUCED_SKIP_DIRS.has(name);
 }
 
 function shouldSkipBashProducedFile(name: string): boolean {
-  return BASH_PRODUCED_SKIP_FILES.has(name);
+  if (BASH_PRODUCED_SKIP_FILES.has(name)) return true;
+  const lower = name.toLowerCase();
+  if (BASH_PRODUCED_SKIP_DOTFILES.has(lower)) return true;
+  // `.env`, `.env.example`, `.env.local`, …
+  if (lower === '.env' || lower.startsWith('.env.')) return true;
+  // Stem = name before the first dot, so README.md → "readme". Dotfiles have an
+  // empty stem and are handled above; this only matches real scaffold files.
+  const stem = lower.split('.')[0];
+  if (stem.length === 0) return false;
+  if (BASH_PRODUCED_SKIP_NAME_STEMS.has(stem)) return true;
+  // Localized readme variants (README_CN, README_EN, README_zh) are common in
+  // cloned repos. Only readme prefix-matches; other scaffold names stay exact so
+  // a real deliverable like "license_terms.pdf" is never dropped.
+  return stem.split('_')[0] === 'readme';
 }
 
 function collectBashFileSnapshot(root: string): BashFileSnapshot {
@@ -243,35 +274,13 @@ function withBashOutputEnv(ctx: ToolContext, outputDir: string): () => void {
   };
 }
 
-function cleanupEmptyBashOutputDir(outputDir: string, workingDir: string): void {
-  try {
-    if (fs.existsSync(outputDir) && fs.readdirSync(outputDir).length === 0) {
-      fs.rmdirSync(outputDir);
-    }
-  } catch { /* best-effort */ }
-  try {
-    const actorDir = path.dirname(outputDir);
-    if (actorDir.startsWith(path.join(workingDir, '__orkas_outputs')) && fs.existsSync(actorDir) && fs.readdirSync(actorDir).length === 0) {
-      fs.rmdirSync(actorDir);
-    }
-  } catch { /* best-effort */ }
-  try {
-    const outputsDir = path.join(workingDir, '__orkas_outputs');
-    if (fs.existsSync(outputsDir) && fs.readdirSync(outputsDir).length === 0) {
-      fs.rmdirSync(outputsDir);
-    }
-  } catch { /* best-effort */ }
-}
-
 async function executeCoreBashWithOutputTracking(
   opts: LocalToolsOpts,
   input: Record<string, unknown>,
   ctx: ToolContext,
   workingDir: string,
 ): Promise<ToolResult> {
-  const outputDir = bashOutputDir(opts, workingDir);
-  try { fs.mkdirSync(outputDir, { recursive: true }); }
-  catch { /* let the command surface any downstream path failure */ }
+  const outputDir = workingDir;
   const before = opts.onFileWritten ? collectBashFileSnapshot(outputDir) : new Map<string, BashFileSnapshotEntry>();
   const restoreEnv = withBashOutputEnv(ctx, outputDir);
   try {
@@ -280,7 +289,6 @@ async function executeCoreBashWithOutputTracking(
     return result;
   } finally {
     restoreEnv();
-    cleanupEmptyBashOutputDir(outputDir, workingDir);
   }
 }
 
@@ -413,16 +421,44 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
       'the user\'s current workspace directory. For files generated by scripts that ' +
       'should be shown to the user as produced-file chips (for example .docx, .xlsx, ' +
       '.pptx, .pdf, images, HTML, CSV, Markdown), write them under the absolute ' +
-      '$ORKAS_OUTPUT_DIR path. Scratch/cache files should stay elsewhere and will not ' +
-      'be surfaced as chips.',
+      '$ORKAS_OUTPUT_DIR path, which is the current conversation workspace. ' +
+      'Scratch/cache files should stay in temporary or cache directories.',
     inputSchema: coreBashTool.inputSchema,
     async execute(input, ctx) {
-      if (!getLocalExecGranted()) return deniedResult();
+      const mode = getLocalExecMode();
+      if (mode === 'off') return deniedResult();
       const command = String(input.command ?? '');
       const disabledSkillErr = guardDisabledSkillBash(opts, command);
       if (disabledSkillErr) {
         log.warn(`bash disabled skill reject user=${opts.userId ?? '?'} command=${command.slice(0, 160)}`);
         return { content: disabledSkillErr, isError: true };
+      }
+      // risk_prompt: classify the command and block on user confirmation when
+      // it trips a risk category (network exfil / dangerous delete / priv-esc
+      // / sensitive path). allow_all skips this; off already returned above.
+      if (mode === 'risk_prompt' && command.trim()) {
+        const { risky, reasons } = classifyBashCommand(command);
+        if (risky) {
+          const decision = await requestBashDecision({
+            uid: opts.userId ?? '',
+            cid: opts.cid ?? '',
+            agentId: opts.agentId ?? '',
+            agentName: opts.agentName ?? opts.agentId ?? '',
+            command,
+            reasons,
+          });
+          if (decision === 'deny') {
+            log.warn(`bash risk-denied user=${opts.userId ?? '?'} reasons=${reasons.join(',')}`);
+            return {
+              content: errText(
+                'E_BASH_RISK_DENIED',
+                `the user declined to run this command (flagged: ${reasons.join(', ')}). `
+                + 'Do not retry the same command or work around the prompt; explain in prose what you intended and ask the user how to proceed.',
+              ),
+              isError: true,
+            };
+          }
+        }
       }
       // `conv_workspace.ts` intentionally defers materialising the
       // per-conversation workspace dir; bash is a frequent first toucher
@@ -481,6 +517,13 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
       if (!getLocalExecGranted()) return deniedResult();
       const inputPath = String(input.path ?? '');
       const inputAbs = resolveAbs(ctx, inputPath);
+      if (opts.userId) {
+        const scopeErr = guardEditPath(opts, inputAbs);
+        if (scopeErr) {
+          log.warn(`write_file scope reject user=${opts.userId ?? '?'} path=${inputAbs}`);
+          return { content: scopeErr, isError: true };
+        }
+      }
       const { finalPath, renamed } = await uniquifyPath(inputAbs, isMineFor(opts));
       const rewritten = finalPath !== inputAbs
         ? { ...input, path: finalPath }

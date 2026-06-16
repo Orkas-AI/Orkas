@@ -24,6 +24,12 @@ function builtinDir(): string {
 function customDir(): string {
   return path.join(tmpDir, TEST_UID, 'cloud', 'skills');
 }
+function systemDir(): string {
+  return path.join(tmpDir, TEST_UID, 'local', 'system', 'skills');
+}
+function systemDirFor(uid: string): string {
+  return path.join(tmpDir, uid, 'local', 'system', 'skills');
+}
 
 function writeSkill(root: string, id: string, name: string, description: string) {
   const skillDir = path.join(root, id);
@@ -203,6 +209,43 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     expect(text).toContain('internal read id: 222222222222');
     expect(text).not.toContain('333333333333');
     expect(text).not.toContain('other desc');
+  });
+});
+
+describe('skill-registry › getSystemSkillsPromptBlock', () => {
+  it('renders system skills in a separate block with SYSTEM_SKILLS_ROOT', async () => {
+    writeSkill(systemDir(), 'agent-creator', 'agent-creator', 'Create agents');
+    writeSkill(systemDir(), 'autotask-creator', 'autotask-creator', 'Create automations');
+    writeSkill(systemDir(), 'package-installer', 'package-installer', 'Install packages');
+    writeSkill(systemDir(), 'skill-creator', 'skill-creator', 'Create skills');
+    const { getSystemSkillsPromptBlock, getSystemPromptBlock } = await loadRegistry();
+
+    const systemText = await getSystemSkillsPromptBlock();
+    expect(systemText).toContain('## System skills');
+    expect(systemText).toContain('SYSTEM_SKILLS_ROOT');
+    expect(systemText).toContain(path.resolve(systemDir()));
+    expect(systemText).toContain('**agent-creator**');
+    expect(systemText).toContain('**autotask-creator**');
+    expect(systemText).toContain('**package-installer**');
+    expect(systemText).toContain('**skill-creator**');
+
+    const regularText = await getSystemPromptBlock();
+    expect(regularText).not.toContain('agent-creator');
+    expect(regularText).not.toContain('autotask-creator');
+    expect(regularText).not.toContain('package-installer');
+    expect(regularText).not.toContain('skill-creator');
+  });
+
+  it('uses an explicit user id for SYSTEM_SKILLS_ROOT', async () => {
+    const otherUid = 'u2';
+    const systemSkills = await import('../../../src/main/features/system_skills');
+    const { getSystemSkillsPromptBlock } = await loadRegistry();
+    await systemSkills.reconcileAllForUser(otherUid);
+
+    const systemText = await getSystemSkillsPromptBlock(otherUid);
+    expect(systemText).toContain(path.resolve(systemDirFor(otherUid)));
+    expect(systemText).not.toContain(path.resolve(systemDir()));
+    expect(fs.existsSync(path.join(systemDirFor(otherUid), 'agent-creator', 'SKILL.md'))).toBe(true);
   });
 });
 

@@ -69,9 +69,18 @@ export interface BackendRunOptions {
   /** Cancellation; backend wires this to SIGTERM (10s) → SIGKILL. */
   signal: AbortSignal;
   onEvent: (e: LocalEvent) => void;
-  /** Wall-clock cap. Backends should arm a timer and emit
-   *  `done({status:'timeout'})` when it fires before the CLI exits. */
+  /** Hard wall-clock cap — zombie insurance, NOT the hang detector
+   *  (that's `idleKillMs`). Backends arm `armKillWatchdog` with both and
+   *  emit `done({status:'timeout'})` when either fires before exit. */
   timeoutMs: number;
+  /** Kill the CLI when it emits no events for this long (ms). Unset /
+   *  0 disables idle-kill — the runner disables it for backends with no
+   *  mid-run event stream (openclaw), where silence is normal. */
+  idleKillMs?: number;
+  /** Activity clock maintained by the runner (ms epoch of the last
+   *  non-idle backend event). Read by the idle-kill watchdog; unset
+   *  means no activity tracking and idle-kill stays off. */
+  lastEventAt?: () => number;
   /** Per-backend idle threshold override (ms). Read by `runner.ts`'s
    *  idle-heartbeat to decide when to emit `{type:'idle'}` events. When
    *  unset the runner uses its own default (90 s; configurable via
@@ -79,6 +88,18 @@ export interface BackendRunOptions {
    *  openclaw) should pass a smaller value so users get an early "still
    *  alive" pulse instead of staring at a blank rail for the full run. */
   idleMs?: number;
+  /** orkas-bridge injection (plan §D — set by runner.ts when a bridge
+   *  host is live for this run). Backends that support adding an MCP
+   *  server pass the config through (claude: `--mcp-config`; codex:
+   *  `-c mcp_servers.…` overrides); others ignore the field. The env
+   *  block must be launch-safe: no bridge token/socket values. */
+  bridge?: {
+    mcpConfigPath: string;
+    /** The raw MCP server entry, for backends that take config values
+     *  instead of a config file (codex `-c` overrides). */
+    server: { command: string; args: string[]; env: Record<string, string> };
+    appendSystemPrompt?: string;
+  };
 }
 
 export interface LocalBackend {
@@ -171,6 +192,75 @@ export function levelOrInfo(raw: unknown): 'debug' | 'info' | 'warn' | 'error' {
   if (s === 'warn' || s === 'warning') return 'warn';
   if (s === 'error' || s === 'err' || s === 'fatal') return 'error';
   return 'info';
+}
+
+/**
+ * Activity-aware kill watchdog shared by every backend. Two independent
+ * limits, polled on a coarse interval:
+ *
+ *   - `timeoutMs` — hard wall-clock cap. Zombie insurance; generous by
+ *     design. It used to double as the hang detector at 20 min, which
+ *     killed healthy long dispatches mid-work (a 20-min claude turn with
+ *     80 tool events died at exactly 1200000 ms — run 1dffe7c48d18).
+ *   - `idleKillMs` + `lastEventAt` — fires only when the CLI emitted NO
+ *     events for the whole window. This is the actual hang detector.
+ *     Long quiet tool calls are real (observed ~10 min for a model
+ *     download), so callers keep this comfortably above them.
+ *
+ * On fire: SIGTERM, then SIGKILL after 10 s. The backend's close handler
+ * reads `fired()` to map the exit to `done({status:'timeout'})`, and
+ * `reason()` for the error text — worded inside the `isTransientError`
+ * timeout family so plan-step retry can resume the session.
+ */
+export function armKillWatchdog(
+  child: ChildProcessWithoutNullStreams,
+  opts: { timeoutMs: number; idleKillMs?: number; lastEventAt?: () => number },
+): { fired: () => 'wall' | 'idle' | null; reason: () => string; disarm: () => void } {
+  const startedAt = Date.now();
+  const idleKillMs = opts.idleKillMs && opts.idleKillMs > 0 && opts.lastEventAt
+    ? opts.idleKillMs
+    : 0;
+  let firedKind: 'wall' | 'idle' | null = null;
+  let firedIdleMs = 0;
+
+  const kill = () => {
+    try { child.kill('SIGTERM'); } catch { /* already gone */ }
+    const hardKill = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* */ } }, 10_000);
+    if (typeof hardKill.unref === 'function') hardKill.unref();
+  };
+
+  // Poll instead of one-shot timers so the idle window slides with
+  // activity. Coarse 5 s tick in production; sub-second limits (tests)
+  // divide down so they still fire promptly.
+  const minLimit = idleKillMs ? Math.min(opts.timeoutMs, idleKillMs) : opts.timeoutMs;
+  const tickMs = Math.max(25, Math.min(5_000, Math.floor(minLimit / 4)));
+  const ticker = setInterval(() => {
+    const now = Date.now();
+    if (now - startedAt >= opts.timeoutMs) {
+      firedKind = 'wall';
+    } else if (idleKillMs) {
+      const idleFor = now - opts.lastEventAt!();
+      if (idleFor >= idleKillMs) {
+        firedKind = 'idle';
+        firedIdleMs = idleFor;
+      }
+    }
+    if (firedKind) {
+      clearInterval(ticker);
+      kill();
+    }
+  }, tickMs);
+  if (typeof ticker.unref === 'function') ticker.unref();
+
+  return {
+    fired: () => firedKind,
+    reason: () => (
+      firedKind === 'idle'
+        ? `timed out: no activity for ${firedIdleMs}ms (idle cap ${idleKillMs}ms)`
+        : `timed out: exceeded ${opts.timeoutMs}ms wall-clock cap`
+    ),
+    disarm: () => clearInterval(ticker),
+  };
 }
 
 /**

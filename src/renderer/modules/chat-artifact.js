@@ -58,11 +58,9 @@
   let _menuAnchor = null;  // the ⋯ button that opened it
 
   function _track(action, data) {
-    
   }
 
   function _trackError(action, data) {
-    
   }
   let _viewerEl = null;
   let _viewerFrame = null;
@@ -317,7 +315,7 @@
   function _doOpen(ctx) {
     _track('artifact_open_viewer', { cid: String(ctx.cid || ''), artifact_id: String(ctx.artifactId || '') });
     try { _openViewer(ctx); }
-    catch (err) { _trackError('artifact_open_viewer', { msg: String(err && err.message || err) }); _notifyFail(_t('artifact.open_failed', 'Could not open'), err); }
+    catch (err) { _trackError('artifact_open_viewer', { error_message: String(err && err.message || err) }); _notifyFail(_t('artifact.open_failed', 'Could not open'), err); }
   }
 
   async function _doSave(ctx) {
@@ -335,7 +333,7 @@
       } catch (_) {}
       // Refresh the "My Apps" tab if its module is loaded.
       try { if (typeof loadSavedApps === 'function') loadSavedApps(true); } catch (_) {}
-    } catch (err) { _trackError('artifact_save', { msg: String(err && err.message || err) }); _notifyFail(_t('apps.save_failed', 'Could not save the app'), err); }
+    } catch (err) { _trackError('artifact_save', { error_message: String(err && err.message || err) }); _notifyFail(_t('apps.save_failed', 'Could not save the app'), err); }
   }
 
   // ── render ──────────────────────────────────────────────────────────────

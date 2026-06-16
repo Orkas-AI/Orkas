@@ -8,6 +8,15 @@ function descriptionLocale(lang) {
   return _baseLang(lang) === 'zh' ? 'zh' : 'en';
 }
 
+function normalizeDisplayText(value) {
+  return String(value || '')
+    .replace(/\\"/g, '"')
+    .replace(/\\'/g, "'")
+    .replace(/\\{2,}/g, '\\')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function pickLocalizedField(obj, base, lang, fallbackLang = 'en') {
   if (!obj || !base) return '';
   const cur = _baseLang(lang);
@@ -23,7 +32,7 @@ function pickLocalizedField(obj, base, lang, fallbackLang = 'en') {
     if (seen.has(key)) continue;
     seen.add(key);
     const v = obj[key];
-    if (v !== null && v !== undefined && String(v).trim()) return String(v).trim();
+    if (v !== null && v !== undefined && String(v).trim()) return normalizeDisplayText(v);
   }
   return '';
 }
@@ -68,11 +77,16 @@ function isMarketplaceCatalogSource(source) {
 }
 
 function sanitizeMathExpressionForMathJax(expr) {
-  return String(expr || '').replace(/(^|[^\\])_{2,}/g, (match, prefix) => {
-    const len = match.length - prefix.length;
-    const em = Math.max(1.5, Math.min(4, len * 0.5));
-    return `${prefix}\\underline{\\hspace{${em}em}}`;
-  });
+  return String(expr || '')
+    // `\boldsymbol` lives in a MathJax extension that our offline vendor
+    // bundle cannot lazy-load. Use base TeX bold instead so one macro does
+    // not make the whole bubble fall back to raw TeX.
+    .replace(/\\boldsymbol\b/g, '\\mathbf')
+    .replace(/(^|[^\\])_{2,}/g, (match, prefix) => {
+      const len = match.length - prefix.length;
+      const em = Math.max(1.5, Math.min(4, len * 0.5));
+      return `${prefix}\\underline{\\hspace{${em}em}}`;
+    });
 }
 
 function catalogSourceLabel(source, kind = 'agents') {
@@ -459,7 +473,12 @@ function renderDashboard(spec) {
 function _renderDbNode(node) {
   if (!node || typeof node !== 'object') return '';
   const props = (node.props && typeof node.props === 'object') ? node.props : {};
-  const children = Array.isArray(node.children) ? node.children : [];
+  // Children belong at the node level (sibling of `props`), but many models
+  // nest them React-style under `props.children`. Without this fallback those
+  // subtrees vanish and the container renders empty — accept either shape.
+  const children = Array.isArray(node.children)
+    ? node.children
+    : (Array.isArray(props.children) ? props.children : []);
   switch (node.type) {
     // ── Layout ────────────────────────────────────────────────────────
     case 'Stack':     return _dbStack(props, children);
@@ -470,7 +489,7 @@ function _renderDbNode(node) {
     case 'Metric':    return _dbMetric(props);
     case 'Chart':     return _dbChart(props);
     case 'Table':     return _dbTable(props);
-    case 'Alert':     return _dbAlert(props);
+    case 'Alert':     return _dbAlert(props, children);
     case 'Timeline':  return _dbTimeline(props);
     case 'Code':      return _dbCode(props);
     case 'Markdown':  return _dbMarkdown(props);
@@ -518,13 +537,24 @@ function _dbMetric(props) {
   </div>`;
 }
 
-function _dbAlert(props) {
+function _dbAlert(props, children = []) {
   const level = _dbEnum(_DB_LEVEL, props.level, 'info');
-  const title = escapeHtml(props.title || '');
-  const body = props.body ? `<div class="db-alert-body">${escapeHtml(props.body)}</div>` : '';
+  const titleRaw = props.title ?? props.heading ?? props.label ?? props.name;
+  const bodyRaw = props.body ?? props.message ?? props.text ?? props.content ?? props.description;
+  const titleText = String(titleRaw == null ? '' : titleRaw);
+  const bodyText = String(bodyRaw == null ? '' : bodyRaw);
+  // Fallback: some models put the alert copy in child nodes (e.g. a nested
+  // Markdown) instead of a text prop. Render those as the body so the alert
+  // is not silently dropped to an empty string.
+  const childHtml = (!titleText && !bodyText && children.length) ? _dbChildren(children) : '';
+  if (!titleText && !bodyText && !childHtml) return '';
+  const content = childHtml
+    ? `<div class="db-alert-body">${childHtml}</div>`
+    : `<div class="db-alert-title">${escapeHtml(titleText || bodyText)}</div>${
+        titleText && bodyText ? `<div class="db-alert-body">${escapeHtml(bodyText)}</div>` : ''}`;
   return `<div class="db-alert" data-level="${level}" role="status">
     <span class="db-alert-icon" aria-hidden="true"></span>
-    <div class="db-alert-content"><div class="db-alert-title">${title}</div>${body}</div>
+    <div class="db-alert-content">${content}</div>
   </div>`;
 }
 
@@ -590,7 +620,7 @@ function _dbImage(props) {
   const alt = escapeHtml(props.alt || '');
   const caption = props.caption
     ? `<figcaption class="db-image-caption">${escapeHtml(props.caption)}</figcaption>` : '';
-  return `<figure class="db-image"><img src="${src}" alt="${alt}">${caption}</figure>`;
+  return `<figure class="db-image"><img src="${escapeHtml(src)}" alt="${alt}">${caption}</figure>`;
 }
 
 // ── Chart (minimal inline SVG; line/bar/area/pie) ─────────────────────
@@ -691,6 +721,108 @@ function _isVideoSrc(src) {
   return _VIDEO_EXT_RE.test(String(src || ''));
 }
 
+function _markdownVideoHtml(src, label, title) {
+  const t = title ? ` title="${escapeHtml(title)}"` : '';
+  return `<video class="chat-md-video" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${escapeHtml(src)}"${t} aria-label="${escapeHtml(label || 'video')}"></video>`;
+}
+
+function _markdownImageHtml(src, alt, title) {
+  const t = title ? ` title="${escapeHtml(title)}"` : '';
+  return `<img class="chat-md-img" src="${escapeHtml(src)}" alt="${escapeHtml(alt)}"${t}>`;
+}
+
+function _missingMarkdownImageLabel() {
+  const key = 'chat.image_missing_placeholder';
+  try {
+    if (typeof t === 'function') {
+      const val = t(key);
+      if (val && val !== key) return val;
+    }
+  } catch (_) { /* fall through */ }
+  return 'Image missing';
+}
+
+function _missingMarkdownVideoLabel() {
+  const key = 'chat.video_missing_placeholder';
+  try {
+    if (typeof t === 'function') {
+      const val = t(key);
+      if (val && val !== key) return val;
+    }
+  } catch (_) { /* fall through */ }
+  return 'Video missing';
+}
+
+function _replaceMissingMarkdownImage(img) {
+  if (!img || !img.parentNode || img.dataset?.missingImageHandled === '1') return;
+  if (img.dataset) img.dataset.missingImageHandled = '1';
+  const label = _missingMarkdownImageLabel();
+  const alt = String(img.getAttribute('alt') || '').trim();
+  const title = alt ? `${label}: ${alt}` : label;
+  const chip = document.createElement('span');
+  chip.className = 'chat-md-img-missing';
+  chip.setAttribute('role', 'img');
+  chip.setAttribute('aria-label', title);
+  chip.setAttribute('title', title);
+
+  const icon = document.createElement('span');
+  icon.className = 'chat-md-img-missing-icon';
+  icon.setAttribute('aria-hidden', 'true');
+  if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+    icon.innerHTML = window.uiIconHtml('image', 'ui-icon chat-md-img-missing-svg');
+  }
+
+  const text = document.createElement('span');
+  text.className = 'chat-md-img-missing-text';
+  text.textContent = label;
+
+  chip.appendChild(icon);
+  chip.appendChild(text);
+  img.replaceWith(chip);
+}
+
+function _replaceMissingMarkdownVideo(video) {
+  if (!video || !video.parentNode || video.dataset?.missingVideoHandled === '1') return;
+  if (video.dataset) video.dataset.missingVideoHandled = '1';
+  const label = _missingMarkdownVideoLabel();
+  const alt = String(video.getAttribute('aria-label') || '').trim();
+  const title = alt ? `${label}: ${alt}` : label;
+  const chip = document.createElement('span');
+  chip.className = 'chat-md-video-missing';
+  chip.setAttribute('role', 'img');
+  chip.setAttribute('aria-label', title);
+  chip.setAttribute('title', title);
+
+  const icon = document.createElement('span');
+  icon.className = 'chat-md-video-missing-icon';
+  icon.setAttribute('aria-hidden', 'true');
+  if (typeof window !== 'undefined' && typeof window.fileKindIconHtml === 'function') {
+    icon.innerHTML = window.fileKindIconHtml('video.mp4', 'video');
+  } else if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+    icon.innerHTML = window.uiIconHtml('play-triangle', 'ui-icon chat-md-video-missing-svg');
+  }
+
+  const text = document.createElement('span');
+  text.className = 'chat-md-video-missing-text';
+  text.textContent = label;
+
+  chip.appendChild(icon);
+  chip.appendChild(text);
+  video.replaceWith(chip);
+}
+
+if (typeof document !== 'undefined') document.addEventListener('error', (e) => {
+  const target = e.target;
+  if (!target || target.nodeType !== 1) return;
+  if (target.tagName === 'IMG' && target.classList?.contains('chat-md-img')) {
+    _replaceMissingMarkdownImage(target);
+    return;
+  }
+  if (target.tagName === 'VIDEO' && target.classList?.contains('chat-md-video')) {
+    _replaceMissingMarkdownVideo(target);
+  }
+}, true);
+
 // Bare URL autolink termination set. URLs per RFC 3986 are ASCII; CJK
 // ideographs / kana / hangul / CJK punctuation never appear in a real URL
 // (IRIs encode the host as punycode and the path as percent-encoded UTF-8).
@@ -748,18 +880,19 @@ function inlineFormat(text) {
     // file, else <img>. Must run before link syntax.
     .replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g,
       (_, alt, src, title) => {
-        const t = title ? ` title="${escapeHtml(title)}"` : '';
         if (_isVideoSrc(src)) {
           // `preload=metadata` so listings don't auto-fetch the whole file;
           // controls visible so user can play/seek.
-          return `<video class="chat-md-video" controls preload="metadata" src="${src}"${t} aria-label="${escapeHtml(alt)}"></video>`;
+          return _markdownVideoHtml(src, alt, title);
         }
-        return `<img class="chat-md-img" src="${src}" alt="${escapeHtml(alt)}"${t}>`;
+        return _markdownImageHtml(src, alt, title);
       })
     // Markdown links: [text](url "title")
     .replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g,
-      (_, txt, url, title) =>
-        `<a href="${url}" target="_blank" rel="noopener"${title ? ` title="${escapeHtml(title)}"` : ''}>${txt}</a>`)
+      (_, txt, url, title) => {
+        if (_isVideoSrc(url)) return _markdownVideoHtml(url, txt, title);
+        return `<a href="${url}" target="_blank" rel="noopener"${title ? ` title="${escapeHtml(title)}"` : ''}>${txt}</a>`;
+      })
     // <url> and <email> autolinks
     .replace(/<((?:https?:\/\/|mailto:)[^>\s]+)>/g,
       (_, u) => `<a href="${u}" target="_blank" rel="noopener">${u}</a>`)
@@ -1137,7 +1270,11 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     _BARE_EMAIL_RE,
     _linkifyBareUrls,
     _linkifyBareEmails,
+    normalizeDisplayText,
+    pickDesc,
     inlineFormat,
+    _markdownImageHtml,
+    _markdownVideoHtml,
     escapeHtml,
     renderMarkdown,
     renderDashboard,

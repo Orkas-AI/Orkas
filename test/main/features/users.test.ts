@@ -11,6 +11,15 @@ let tmpDir: string;
 let prevWs: string | undefined;
 let prevAuth: string | undefined;
 
+function writeUsersJson(obj: unknown): void {
+  fs.mkdirSync(tmpDir, { recursive: true });
+  fs.writeFileSync(path.join(tmpDir, 'users.json'), JSON.stringify(obj, null, 2), 'utf8');
+}
+
+function readUsersJson(): any {
+  return JSON.parse(fs.readFileSync(path.join(tmpDir, 'users.json'), 'utf8'));
+}
+
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-users-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
@@ -129,6 +138,71 @@ describe('features/users › initActiveUser', () => {
     const rec = users.initActiveUser();
     expect(rec.user_id).toBe('u1');
     expect(rec.created_at).toBe('2026-01-01T00:00:00');
+  });
+});
+
+describe('features/users › current-user environment pointers', () => {
+  it('migrates missing dev_current_user_id from current_user_id', async () => {
+    writeUsersJson({
+      current_user_id: 'prod_user',
+      users: [{ user_id: 'prod_user', created_at: '2026-01-01T00:00:00' }],
+    });
+
+    const users = await import('../../../src/main/features/users');
+    users.setUseDevCurrentUserId(true);
+
+    const rec = users.initActiveUser();
+    const got = readUsersJson();
+
+    expect(rec.user_id).toBe('prod_user');
+    expect(got.current_user_id).toBe('prod_user');
+    expect(got.dev_current_user_id).toBe('prod_user');
+  });
+
+  it('uses dev_current_user_id in dev mode without changing current_user_id', async () => {
+    writeUsersJson({
+      current_user_id: 'prod_user',
+      dev_current_user_id: 'dev_user',
+      users: [
+        { user_id: 'prod_user', created_at: '2026-01-01T00:00:00' },
+        { user_id: 'dev_user', created_at: '2026-01-02T00:00:00' },
+      ],
+    });
+
+    const users = await import('../../../src/main/features/users');
+    users.setUseDevCurrentUserId(true);
+
+    expect(users.initActiveUser().user_id).toBe('dev_user');
+    users.activateUser('dev_user_2');
+
+    const got = readUsersJson();
+    expect(got.current_user_id).toBe('prod_user');
+    expect(got.dev_current_user_id).toBe('dev_user_2');
+    expect(got.users.map((u: any) => u.user_id).sort()).toEqual([
+      'dev_user',
+      'dev_user_2',
+      'prod_user',
+    ]);
+  });
+
+  it('uses current_user_id in prod mode without changing dev_current_user_id', async () => {
+    writeUsersJson({
+      current_user_id: 'prod_user',
+      dev_current_user_id: 'dev_user',
+      users: [
+        { user_id: 'prod_user', created_at: '2026-01-01T00:00:00' },
+        { user_id: 'dev_user', created_at: '2026-01-02T00:00:00' },
+      ],
+    });
+
+    const users = await import('../../../src/main/features/users');
+
+    expect(users.initActiveUser().user_id).toBe('prod_user');
+    users.activateUser('prod_user_2');
+
+    const got = readUsersJson();
+    expect(got.current_user_id).toBe('prod_user_2');
+    expect(got.dev_current_user_id).toBe('dev_user');
   });
 });
 

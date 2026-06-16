@@ -2,10 +2,12 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { createRequire } from 'node:module';
 
 let tmpDir: string;
 let prevWs: string | undefined;
 const TEST_UID = 'u-connectors-migrate';
+const cjsRequire = createRequire(import.meta.url);
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-migrate-connectors-'));
@@ -15,8 +17,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  if (prevWs === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
-  else process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+  process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -42,10 +43,12 @@ describe('util/migrate-connectors-to-cloud', () => {
     expect(fs.existsSync(stamp)).toBe(false);
   });
 
-  it('keeps connector registry local in OrkasOpen even when a local user is active', async () => {
+  it('copies plaintext connector registry to cloud and removes the legacy local file', async () => {
     const { paths, migration } = await loadMigration();
-    const users = await import('../../../src/main/features/users');
+    const users = cjsRequire('../../../src/main/features/users') as typeof import('../../../src/main/features/users');
+    const tokenStore = cjsRequire('../../../src/main/features/account/token_store') as typeof import('../../../src/main/features/account/token_store');
     users.activateUser(TEST_UID);
+    tokenStore.setSession({ user_id: 'oauth-user-1', session_id: 'sid' });
 
     const oldPath = path.join(paths.userLocalConfigDir(TEST_UID), 'connectors.json');
     const newPath = path.join(paths.userCloudConfigDir(TEST_UID), 'connectors.json');
@@ -54,10 +57,10 @@ describe('util/migrate-connectors-to-cloud', () => {
     fs.mkdirSync(path.dirname(oldPath), { recursive: true });
     fs.writeFileSync(oldPath, body, 'utf8');
 
-    expect(migration.migrateConnectorsToCloud(TEST_UID)).toBe(false);
+    expect(migration.migrateConnectorsToCloud(TEST_UID)).toBe(true);
 
-    expect(fs.readFileSync(oldPath, 'utf8')).toBe(body);
-    expect(fs.existsSync(newPath)).toBe(false);
-    expect(fs.existsSync(stamp)).toBe(false);
+    expect(fs.existsSync(oldPath)).toBe(false);
+    expect(fs.readFileSync(newPath, 'utf8')).toBe(body);
+    expect(fs.existsSync(stamp)).toBe(true);
   });
 });

@@ -7,6 +7,8 @@
  *   - `localAgents.listModels`       → static model catalog for a CLI type
  *   - `localAgents.readToolResult`   → read a spilled CLI tool_result file
  *                                       (renderer click-to-expand)
+ *   - `bridge.permission_response`   → renderer answer to a `bridge:permission`
+ *                                       push event (orkas-bridge connector-call gate)
  *
  * No `run` channel here — the renderer doesn't spawn CLIs directly;
  * dispatch goes through the existing `groupChat` channel and `bus.ts`
@@ -16,6 +18,8 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { detectAll, detectOne, invalidateCache, LOCAL_CLI_TYPES, type LocalCliType, type LocalCliEntry } from '../features/local_agents/registry.js';
+import * as bridgePermissions from '../features/local_agents/bridge_permissions.js';
+import * as bashPermissions from '../model/core-agent/bash-permissions.js';
 import { listModels } from '../features/local_agents/models.js';
 import { getActiveUserId } from '../features/users.js';
 import { userToolResultsDir } from '../paths.js';
@@ -107,6 +111,33 @@ export const invokeHandlers = {
    * never throws across the IPC boundary so a UI bug can't crash the
    * renderer.
    */
+  /** Renderer answer to a `bridge:permission` push event. Unknown /
+   *  already-timed-out request ids return handled:false (the dialog was
+   *  stale); validation is shape-only — the verdict semantics live in
+   *  features/local_agents/bridge_permissions.ts. */
+  'bridge.permission_response': async (
+    payload: { request_id?: unknown; allow?: unknown; always?: unknown },
+  ) => {
+    if (typeof payload?.request_id !== 'string' || !payload.request_id) throw new Error('invalid request_id');
+    if (typeof payload?.allow !== 'boolean') throw new Error('invalid allow flag');
+    const handled = bridgePermissions.respond(payload.request_id, payload.allow, payload?.always === true);
+    return { handled };
+  },
+
+  /** Renderer answer to a `bash:permission` push event (risk_prompt mode).
+   *  `decision` ∈ allow_once | allow_run | deny. Unknown / timed-out ids
+   *  return handled:false (stale dialog). Verdict semantics live in
+   *  model/core-agent/bash-permissions.ts. */
+  'bash.permission_response': async (
+    payload: { request_id?: unknown; decision?: unknown },
+  ) => {
+    if (typeof payload?.request_id !== 'string' || !payload.request_id) throw new Error('invalid request_id');
+    const d = payload.decision;
+    if (d !== 'allow_once' && d !== 'allow_run' && d !== 'deny') throw new Error('invalid decision');
+    const handled = bashPermissions.respond(payload.request_id, d);
+    return { handled };
+  },
+
   'localAgents.readToolResult': async ({ path: filePath }: { path?: unknown }) => {
     if (typeof filePath !== 'string' || !filePath) {
       return { ok: false as const, error: 'invalid path' };

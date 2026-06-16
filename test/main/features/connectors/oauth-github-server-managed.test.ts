@@ -12,12 +12,9 @@ vi.mock('electron', () => ({
   shell: { openExternal: electronMock.openExternal },
 }));
 
-vi.mock('../../../../src/main/features/connectors/_server_bridge', () => ({
-  accountApiBase: () => 'http://account.example/api',
-  tokenStore: {
-    getDeviceId: () => 'dev-1',
-    authHeaders: () => ({}),
-  },
+vi.mock('../../../../src/main/features/account/token_store', () => ({
+  getDeviceId: () => 'dev-1',
+  authHeaders: () => ({ user_id: 'uid-1', session_id: 'sid-1' }),
 }));
 
 vi.mock('../../../../src/main/features/config', () => ({
@@ -26,18 +23,22 @@ vi.mock('../../../../src/main/features/config', () => ({
 
 let tmpDir: string;
 let prevWs: string | undefined;
+let prevApi: string | undefined;
 
 beforeEach(() => {
   vi.clearAllMocks();
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-github-oauth-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
+  prevApi = process.env.ORKAS_API_BASE_URL;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
+  process.env.ORKAS_API_BASE_URL = 'http://account.example/api';
   vi.resetModules();
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+  process.env.ORKAS_API_BASE_URL = prevApi;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -117,7 +118,7 @@ describe('connector OAuth GitHub server-managed grants', () => {
     expect(body.refresh_token).toBe('ghr-old');
     expect(body.access_token).toBe('ghu-old');
     expect(body.grant_id).toBeUndefined();
-    expect((init.headers as Record<string, string>).user_id).toBeUndefined();
+    expect((init.headers as Record<string, string>).user_id).toBe('uid-1');
   });
 
   it('does not call the server when an existing server-managed GitHub token is fresh', async () => {

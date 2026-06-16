@@ -17,16 +17,29 @@
  * Resolution order (matches SkillRegistry — see model/core-agent/skill-registry.ts):
  *   1. <uid>/cloud/skills/<id>/scripts/<basename>.<ext>            (custom)
  *   2. <uid>/local/marketplace/skills/<id>/scripts/<basename>.<ext> (installed)
- *   3. <PC>/src/builtin/skills/<id>/scripts/<basename>.<ext>       (dev / asar.unpacked)
- *   4. Same roots by SKILL.md frontmatter `name` when marketplace id != authored name
+ *   3. External-package skill roots from <uid>/local/packages/_registry.json
+ *      (enabled packages only; `.` roots resolve against the packages dir)
+ *   4. Global roots: ~/.claude/skills, ~/.codex/skills (interop, read-only)
+ *   5. Same roots by SKILL.md frontmatter `name` when dir id != authored name
  *   For each candidate dir we try py → ts → mjs → js → sh → rb in order.
+ *
+ * Dependency resolution for scripts living under an external package (or any
+ * skill dir that vendors its own deps): the NEAREST `node_modules` walking up
+ * from the skill dir is prepended to NODE_PATH ahead of PC/node_modules, and
+ * a `.venv` found the same way supplies the python interpreter. The package
+ * tree itself is never modified.
  *
  * Env inputs:
  *   ORKAS_PC_DIR          — points at PC root (or asar.unpacked equivalent).
+ *   ORKAS_UID             — active user id. When present, only that user's
+ *                           cloud / marketplace / package skill dirs are
+ *                           scanned.
  *   ORKAS_WORKSPACE_ROOT  — canonical workspace-data root (set by main process
  *                           in install-data-root.ts). ORKAS_WS_ROOT is honoured
  *                           as a back-compat alias. When neither is set the
  *                           platform default ~/.orkas/data is used.
+ *   ORKAS_RUN_SKILL_DIR   — optional trusted caller allow-list override:
+ *                           resolve only inside this concrete skill dir.
  *   ELECTRON_RUN_AS_NODE  — set to 1 when running through Electron binary.
  *
  * This file is CommonJS so it can be required directly without import-hook
@@ -55,6 +68,9 @@ function parseArgs(argv) {
     die(64, 'usage: run-skill.cjs <skill-id> <script-basename> [-- <script args>]');
   }
   const [skillId, scriptBase, ...rest] = args;
+  if (scriptBase.includes('/') || scriptBase.includes('\\') || scriptBase === '.' || scriptBase === '..') {
+    die(64, 'script basename must not contain path separators');
+  }
   // Everything after `--` (or all of `rest`, whichever) is the script's args.
   let scriptArgs;
   const dashIdx = rest.indexOf('--');
@@ -136,12 +152,20 @@ function readSkillDisplayName(skillDir) {
 }
 
 function collectSkillDirs(skillRef) {
+  const forcedDir = process.env.ORKAS_RUN_SKILL_DIR;
+  if (forcedDir) {
+    const resolved = path.resolve(forcedDir);
+    if (!isDir(resolved)) {
+      die(66, 'allowed skill dir is not available', { dir: resolved });
+    }
+    return [resolved];
+  }
+
   const wsRoot = process.env.ORKAS_WORKSPACE_ROOT
     || process.env.ORKAS_WS_ROOT
     || path.join(require('os').homedir(), '.orkas', 'data');
   // Candidate skill dirs — mirror SkillRegistry's
-  // [<uid>/cloud/skills, <uid>/local/marketplace/skills] resolution, with a
-  // dev/source-tree fallback for unpacked builtins.
+  // [<uid>/cloud/skills, <uid>/local/marketplace/skills] resolution.
   //
   // Per-user skills live under <ws>/<uid>/cloud/skills/<id> and
   // <ws>/<uid>/local/marketplace/skills/<id>. uid can be numeric or a UUID,
@@ -163,22 +187,64 @@ function collectSkillDirs(skillRef) {
     const candidate = path.join(root, skillRef);
     if (isDir(candidate)) pushUnique(directDirs, directSeen, candidate);
   }
-  try {
-    for (const entry of fs.readdirSync(wsRoot, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      if (entry.name.startsWith('.')) continue;
-      const cloudRoot = path.join(wsRoot, entry.name, 'cloud', 'skills');
-      const marketplaceRoot = path.join(wsRoot, entry.name, 'local', 'marketplace', 'skills');
-      addRoot(cloudRoot);
-      addRoot(marketplaceRoot);
-      addDirect(cloudRoot);
-      addDirect(marketplaceRoot);
+  // External-package skill roots come from the per-uid packages registry —
+  // registry-driven, not a blind scan, so disabled packages stay invisible.
+  // Schema contract: src/main/features/packages.ts.
+  function packageSkillRoots(uidDir) {
+    const packagesRoot = path.join(uidDir, 'local', 'packages');
+    const roots = [];
+    let registry;
+    try {
+      registry = JSON.parse(fs.readFileSync(path.join(packagesRoot, '_registry.json'), 'utf8'));
+    } catch { return roots; }
+    if (!registry || !Array.isArray(registry.packages)) return roots;
+    for (const pkg of registry.packages) {
+      if (!pkg || typeof pkg.name !== 'string' || pkg.enabled === false) continue;
+      if (/[\\/]|\.\./.test(pkg.name)) continue;
+      for (const rel of Array.isArray(pkg.skill_roots) ? pkg.skill_roots : []) {
+        if (typeof rel !== 'string' || path.isAbsolute(rel) || rel.split(/[\\/]/).includes('..')) continue;
+        roots.push(rel === '.' ? packagesRoot : path.join(packagesRoot, pkg.name, rel));
+      }
     }
-  } catch { /* no data dir yet */ }
-  if (process.env.ORKAS_PC_DIR) {
-    const builtinRoot = path.join(process.env.ORKAS_PC_DIR, 'src', 'builtin', 'skills');
-    addRoot(builtinRoot);
-    addDirect(builtinRoot);
+    return roots;
+  }
+
+  function addUidDir(uidDir) {
+    const cloudRoot = path.join(uidDir, 'cloud', 'skills');
+    const marketplaceRoot = path.join(uidDir, 'local', 'marketplace', 'skills');
+    addRoot(cloudRoot);
+    addRoot(marketplaceRoot);
+    addDirect(cloudRoot);
+    addDirect(marketplaceRoot);
+    for (const pkgRoot of packageSkillRoots(uidDir)) {
+      addRoot(pkgRoot);
+      addDirect(pkgRoot);
+    }
+  }
+
+  const envUid = (process.env.ORKAS_UID || '').trim();
+  if (envUid && !/[\\/]/.test(envUid) && envUid !== '.' && envUid !== '..') {
+    addUidDir(path.join(wsRoot, envUid));
+  } else {
+    try {
+      for (const entry of fs.readdirSync(wsRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        if (entry.name.startsWith('.')) continue;
+        addUidDir(path.join(wsRoot, entry.name));
+      }
+    } catch {
+      /* no data dir yet */
+    }
+  }
+  // Global roots last — lowest priority, mirroring SkillRegistry's open tier.
+  // Keep this list in sync with paths.ts::globalSkillRoots(); a root listed
+  // there but missing here is advertised/readable yet its scripts fail to run.
+  for (const globalRoot of [
+    path.join(require('os').homedir(), '.claude', 'skills'),
+    path.join(require('os').homedir(), '.codex', 'skills'),
+  ]) {
+    addRoot(globalRoot);
+    addDirect(globalRoot);
   }
   if (directDirs.length) return directDirs;
 
@@ -223,6 +289,26 @@ function locateSkillScript(skillId, scriptBase) {
   });
 }
 
+/**
+ * Walk up from `startDir` looking for `relProbe` (e.g. `node_modules` or a
+ * `.venv` interpreter), at most `maxLevels` levels — enough to climb from a
+ * nested skill dir (`<pkg>/skills/<id>`) to its package root without ever
+ * scanning past the data root into unrelated trees.
+ */
+function findUpwards(startDir, relProbe, maxLevels) {
+  let dir = path.resolve(startDir);
+  for (let i = 0; i <= maxLevels; i++) {
+    const candidate = path.join(dir, relProbe);
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch { /* keep climbing */ }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
 function registerTsxLoader() {
   if (!process.env.ORKAS_PC_DIR) {
     die(69, 'ORKAS_PC_DIR env not set — cannot locate tsx for .ts transpile');
@@ -247,7 +333,17 @@ function runViaSubprocess(scriptPath, scriptArgs, skillId) {
   // to `python` if missing — handled by trying spawn.
   let cmd; let argv0Args = [];
   if (ext === 'py') {
-    if (isWin) {
+    // External packages / vendored skills: a `.venv` found walking up from
+    // the skill dir supplies the interpreter, so `pip install -e .` deps
+    // resolve without touching the system python.
+    const venvPython = findUpwards(
+      skillDir,
+      isWin ? path.join('.venv', 'Scripts', 'python.exe') : path.join('.venv', 'bin', 'python3'),
+      3,
+    );
+    if (venvPython) {
+      cmd = venvPython;
+    } else if (isWin) {
       const tryPy = trySpawn('py', ['-3', scriptPath, ...scriptArgs], skillDir, skillId);
       if (tryPy.spawned) return; // spawned() means we already wired it up + will exit
       cmd = 'python';
@@ -293,10 +389,20 @@ async function runAsModule(scriptPath, scriptArgs, skillId) {
   // the script lives under data/<uid>/cloud/skills/... (outside PC). NODE_PATH
   // is honoured by Node's module resolution at initial require; this helps any
   // transitive resolver used by tsx + user code.
+  //
+  // External packages / vendored skills: the NEAREST node_modules walking up
+  // from the skill dir ranks FIRST so a package's own pinned deps beat
+  // same-name modules in PC/node_modules. PC/node_modules stays as fallback.
+  const skillDir = path.dirname(path.dirname(scriptPath));
+  const ownNodeModules = findUpwards(skillDir, 'node_modules', 3);
   const pcNodeModules = path.join(process.env.ORKAS_PC_DIR, 'node_modules');
-  process.env.NODE_PATH = process.env.NODE_PATH
-    ? `${pcNodeModules}${path.delimiter}${process.env.NODE_PATH}`
-    : pcNodeModules;
+  const nodePathParts = [];
+  if (ownNodeModules && path.resolve(ownNodeModules) !== path.resolve(pcNodeModules)) {
+    nodePathParts.push(ownNodeModules);
+  }
+  nodePathParts.push(pcNodeModules);
+  if (process.env.NODE_PATH) nodePathParts.push(process.env.NODE_PATH);
+  process.env.NODE_PATH = nodePathParts.join(path.delimiter);
   require('node:module').Module._initPaths();
 
   let mod;

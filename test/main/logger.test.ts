@@ -63,7 +63,7 @@ describe('logger › redact', () => {
     const out = redact({
       url: 'https://example.test/oauth/callback?code=abc123&state=csrf456&ok=1',
       note: 'contact alice@example.com phone 13800138000',
-      absPath: '/Users/user/Secret Project/report.pdf',
+      absPath: '/Users/test/Secret Project/report.pdf',
       relPath: 'cloud/contexts/private/customer-plan.md',
       user_id: 'ABCDEF1234567890',
       session_id: 'session-secret-value',
@@ -72,7 +72,7 @@ describe('logger › redact', () => {
     expect(out.note).toBe('contact a***@example.com phone 138****8000');
     expect(out.absPath).toContain('<abs-path:');
     expect(out.relPath).toContain('<cloud-path:');
-    expect(JSON.stringify(out)).not.toContain('/Users/user');
+    expect(JSON.stringify(out)).not.toContain('/Users/test');
     expect(JSON.stringify(out)).not.toContain('customer-plan.md');
     expect(out.user_id).toBe('ABCD...7890');
     expect(out.session_id).toBe('***REDACTED***');

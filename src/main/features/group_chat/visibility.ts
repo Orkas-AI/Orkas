@@ -42,6 +42,10 @@ export interface GroupMessage {
   mentions?: string[];
   /** Markdown text body. */
   text: string;
+  /** Internal model-facing text. UI renders `text`; workers use this when
+   * present so system-created messages can stay terse for humans while
+   * preserving full instructions for the model. */
+  model_text?: string;
   /** Attachment filenames (only meaningful for user messages). */
   attachments?: string[];
   /** Absolute paths produced by local-exec tools during this turn (only on
@@ -187,7 +191,7 @@ export function buildReplayPrefix(slice: GroupMessage[], currentMsgId: string): 
   for (const m of history) {
     const mention = m.to && m.to.length ? ` to=${m.to.join(',')}` : '';
     lines.push(`<msg from=${m.from}${mention} ts=${m.ts}>`);
-    lines.push(m.text);
+    lines.push(m.model_text || m.text);
     lines.push('</msg>');
   }
   lines.push('</group-chat-history>');

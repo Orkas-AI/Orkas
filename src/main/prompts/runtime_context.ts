@@ -11,14 +11,11 @@ function formatOffset(minutesBehindUtc: number): string {
   return `${sign}${pad2(hours)}:${pad2(minutes)}`;
 }
 
-export function formatCurrentDatetime(date = new Date()): string {
+export function formatCurrentDate(date = new Date()): string {
   const yyyy = date.getFullYear();
   const mm = pad2(date.getMonth() + 1);
   const dd = pad2(date.getDate());
-  const hh = pad2(date.getHours());
-  const mi = pad2(date.getMinutes());
-  const ss = pad2(date.getSeconds());
-  return `${yyyy}-${mm}-${dd}T${hh}:${mi}:${ss}${formatOffset(date.getTimezoneOffset())}`;
+  return `${yyyy}-${mm}-${dd}`;
 }
 
 export function getRuntimeTimezone(): string {
@@ -27,11 +24,11 @@ export function getRuntimeTimezone(): string {
 }
 
 export function buildRuntimeDatetimeBlock(date = new Date()): string {
-  const currentDatetime = formatCurrentDatetime(date);
+  const currentDate = formatCurrentDate(date);
   return [
-    '## Current datetime',
+    '## Current date',
     '',
-    `Current datetime: ${currentDatetime}`,
     `Timezone: ${getRuntimeTimezone()}`,
+    `Current date: ${currentDate}`,
   ].join('\n');
 }

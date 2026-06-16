@@ -86,9 +86,9 @@ export const RED_FLAGS: ReadonlyArray<RuleDef> = [
     appliesTo: ['script', 'skill_md'],
     // Shell redirect / shell write commands / JS write APIs targeting a spec file.
     // Each form requires syntactically valid usage so the rule doesn't false-positive
-    // on prose mentions like `<capability> SKILL.md` (the `>` is part of a
-    // template placeholder, not a redirect).
-    pattern: /(?:^|\s|;|&&|\|\|)(?:>>?|tee|cp|mv)\s+[^\n;|&]*?(?:SKILL\.md|agent\.json|_install\.json)\b|(?:writeFileSync|fs\.writeFile|fs\.promises\.writeFile|open\s*\([^)]*['"](?:w|wb)['"])\s*[^\n;]*?(?:SKILL\.md|agent\.json|_install\.json)\b/i,
+    // on prose mentions like `<capability> SKILL.md` or Python strings such as
+    // `estimated_total_nodes > 100(SKILL.md ...)`.
+    pattern: /(?:^|\s|;|&&|\|\|)(?:>>?)\s*['"]?(?:(?:\.{1,2}|~|\$[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][\w.-]*|\/)[^'"\s;|&]*\/)?(?:SKILL\.md|agent\.json|_install\.json)\b|(?:^|\s|;|&&|\|\|)(?:tee|cp|mv)\s+[^\n;|&]*?(?:SKILL\.md|agent\.json|_install\.json)\b|(?:writeFileSync|fs\.writeFile|fs\.promises\.writeFile|open\s*\([^)]*['"](?:w|wb)['"])\s*[^\n;]*?(?:SKILL\.md|agent\.json|_install\.json)\b/i,
     suggested_fix: 'Skill or agent code must not mutate its own spec or another skill\'s spec. Spec changes go through the editor or the spec_patch_suggester evolution flow.',
   },
   {

@@ -127,7 +127,7 @@ function _dispatchNextQueued(cid) {
   // Recipient prefix (`@<agent>`) is also applied at dispatch time so the
   // message routes to whoever is currently selected in the chip.
   let use = _queueItemUseSelection(next);
-  if (use && typeof isChatUseAllowedForTarget === 'function' && !isChatUseAllowedForTarget('conversation')) {
+  if (use && typeof isChatUseAllowedForTarget === 'function' && !isChatUseAllowedForTarget('conversation', use.kind)) {
     use = null;
   }
   // Drop a connector prefix whose target is no longer live (disconnected /

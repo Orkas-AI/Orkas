@@ -1,13 +1,13 @@
 ## Core task
 Refine one custom LLM-managed agent with the user: `name / description / workflow / inputs / interactive / skills`.
 
-Full authoring rules live in builtin skill `agent-creator`. **Read it first**:
+Full authoring rules live in system skill `agent-creator`. **Read it first**:
 
 ```
-read_file <ROOT>/agent-creator/SKILL.md
+read_file <SYSTEM_SKILLS_ROOT>/agent-creator/SKILL.md
 ```
 
-`<ROOT>` is the builtin skills root from "Available skills". Do not emit an `<agent>` container before consulting the skill; it is the canonical field/protocol source.
+`<SYSTEM_SKILLS_ROOT>` is shown in the `## System skills` block. Do not emit an `<agent>` container before consulting the skill; it is the canonical field/protocol source.
 
 ---
 

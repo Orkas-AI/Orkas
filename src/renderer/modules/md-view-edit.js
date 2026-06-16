@@ -345,6 +345,38 @@ function _mveActionButton(state, action, labelKey, iconName, extraClass) {
   return `<button type="button" class="${cls}" data-mve-action="${action}" aria-label="${escapeHtml(label)}" title="${escapeHtml(label)}">${icon}</button>`;
 }
 
+function _mveTrack() {}
+
+function _mveRenderView(state) {
+  state.mode = 'view';
+  const bodyEl = state.bodyEl;
+  const actionsEl = state.actionsEl;
+  const content = state.content || '';
+  bodyEl.innerHTML = `<div class="ctx-viewer-md markdown-body">${renderMarkdown(content)}</div>`;
+  if (state.caps.taskCheckbox) _mveBindTaskCheckboxes(state, bodyEl);
+
+  const actions = [];
+  if (state.caps.edit)   actions.push(_mveActionButton(state, 'edit', 'contexts.viewer.edit', 'edit-pencil'));
+  if (state.caps.reveal) actions.push(_mveActionButton(state, 'reveal', 'contexts.viewer.open_system', 'folder-open'));
+  if (state.caps.delete) actions.push(_mveActionButton(state, 'delete', 'contexts.viewer.delete', 'trash', 'btn-danger'));
+  actionsEl.innerHTML = actions.join('');
+
+  actionsEl.querySelector('[data-mve-action="edit"]')?.addEventListener('click', () => { _mveTrack('markdown_editor_edit', state); _mveEnterEdit(state); });
+  actionsEl.querySelector('[data-mve-action="reveal"]')?.addEventListener('click', () => { _mveTrack('markdown_editor_reveal', state); state.callbacks.onReveal?.(); });
+  actionsEl.querySelector('[data-mve-action="delete"]')?.addEventListener('click', () => { _mveTrack('markdown_editor_delete', state); state.callbacks.onDelete?.(); });
+
+  _mveEmitDirty(state);
+}
+
+function _mveEnterEdit(state) {
+  state.mode = 'edit';
+  // Only seed the draft from canonical content if we don't have a draft yet
+  // — caller-provided initialDraft and prior edit state both reach here.
+  if (!state.draft) state.draft = state.content || '';
+  _mveRenderEditor(state);
+  _mveEmitDirty(state);
+}
+
 function _mveRenderEditor(state) {
   const bodyEl = state.bodyEl;
   const actionsEl = state.actionsEl;
@@ -359,7 +391,7 @@ function _mveRenderEditor(state) {
   }).join('');
   const toggleKey = state.preview ? 'contexts.editor.tb.edit_back' : 'contexts.editor.tb.preview';
   const toggleIcon = typeof window !== 'undefined' && typeof window.uiIconHtml === 'function'
-    ? window.uiIconHtml(state.preview ? 'pencil' : 'eye', 'ui-icon ctx-editor-toggle-icon')
+    ? window.uiIconHtml(state.preview ? 'edit-pencil' : 'eye', 'ui-icon ctx-editor-toggle-icon')
     : '';
   const draft = state.draft;
   const bodyHtml = state.preview
@@ -385,16 +417,17 @@ function _mveRenderEditor(state) {
   }
   actionsEl.innerHTML = actions.join('');
 
-  actionsEl.querySelector('[data-mve-action="save"]')?.addEventListener('click', () => _mveSave(state));
-  actionsEl.querySelector('[data-mve-action="cancel"]')?.addEventListener('click', () => _mveCancelEdit(state));
-  actionsEl.querySelector('[data-mve-action="copy-draft"]')?.addEventListener('click', () => _mveCopyDraft(state));
-  actionsEl.querySelector('[data-mve-action="send-to-chat"]')?.addEventListener('click', () => _mveSendDraftToChat(state));
+  actionsEl.querySelector('[data-mve-action="save"]')?.addEventListener('click', () => { _mveTrack('markdown_editor_save', state, { chars: (state.draft || '').length }); _mveSave(state); });
+  actionsEl.querySelector('[data-mve-action="cancel"]')?.addEventListener('click', () => { _mveTrack('markdown_editor_cancel', state, { dirty: state.draft !== state.content }); _mveCancelEdit(state); });
+  actionsEl.querySelector('[data-mve-action="copy-draft"]')?.addEventListener('click', () => { _mveTrack('markdown_editor_copy_draft', state, { chars: (state.draft || '').length }); _mveCopyDraft(state); });
+  actionsEl.querySelector('[data-mve-action="send-to-chat"]')?.addEventListener('click', () => { _mveTrack('markdown_editor_send_to_chat', state, { chars: (state.draft || '').length }); _mveSendDraftToChat(state); });
 
-  bodyEl.querySelector('[data-mve-toggle]')?.addEventListener('click', () => _mveTogglePreview(state));
+  bodyEl.querySelector('[data-mve-toggle]')?.addEventListener('click', () => { _mveTrack('markdown_editor_preview_toggle', state, { preview: !state.preview }); _mveTogglePreview(state); });
   bodyEl.querySelectorAll('.ctx-editor-tb-btn').forEach(btn => {
     btn.addEventListener('mousedown', (e) => e.preventDefault());
     btn.addEventListener('click', () => {
       if (state.preview) return;
+      _mveTrack('markdown_editor_toolbar', state, { tool: btn.dataset.kind || '' });
       const ta = bodyEl.querySelector('[data-mve-textarea]');
       if (!ta) return;
       _mveApplyMd(state, ta, btn.dataset.kind);

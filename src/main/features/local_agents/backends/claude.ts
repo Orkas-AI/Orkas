@@ -21,6 +21,7 @@ import {
   StderrTail,
   spawnCli,
   bindAbort,
+  armKillWatchdog,
   LineSplitter,
   levelOrInfo,
 } from './base.js';
@@ -37,7 +38,6 @@ export const claudeBackend: LocalBackend = {
 
     let sessionId: string | undefined;
     let exited = false;
-    let timedOut = false;
     let resultText = '';
     let resultStatus: 'completed' | 'failed' | undefined;
     let resultError: string | undefined;
@@ -64,12 +64,11 @@ export const claudeBackend: LocalBackend = {
       args,
     });
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try { child.kill('SIGTERM'); } catch { /* already gone */ }
-      setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* */ } }, 10_000).unref();
-    }, opts.timeoutMs);
-    if (typeof timer.unref === 'function') timer.unref();
+    const watchdog = armKillWatchdog(child, {
+      timeoutMs: opts.timeoutMs,
+      idleKillMs: opts.idleKillMs,
+      lastEventAt: opts.lastEventAt,
+    });
 
     // Build and send the single user message, but keep stdin OPEN —
     // claude code's stream-json protocol uses stdin for two channels:
@@ -210,7 +209,7 @@ export const claudeBackend: LocalBackend = {
       const finish = (status: 'completed' | 'failed' | 'cancelled' | 'timeout', extra: Partial<LocalEvent> = {}) => {
         if (exited) return;
         exited = true;
-        clearTimeout(timer);
+        watchdog.disarm();
         detachAbort();
         const durationMs = Date.now() - startedAt;
         opts.onEvent({
@@ -229,7 +228,7 @@ export const claudeBackend: LocalBackend = {
       });
       child.on('close', code => {
         if (opts.signal.aborted) return finish('cancelled');
-        if (timedOut) return finish('timeout', { error: `claude exceeded ${opts.timeoutMs}ms`, stderrTail: tail.toString() });
+        if (watchdog.fired()) return finish('timeout', { error: `claude ${watchdog.reason()}`, stderrTail: tail.toString() });
         if (code === 0 && resultStatus === 'completed') {
           return finish('completed', { output: resultText, usage: resultUsage });
         }
@@ -245,7 +244,7 @@ export const claudeBackend: LocalBackend = {
 /** Args mirroring the multica skeleton, distilled to what we actually
  *  use in v1: stream-json in/out, `--print` (non-interactive),
  *  bypass permissions for daemon-style execution, optional model. */
-export function buildClaudeArgs(opts: Pick<BackendRunOptions, 'model' | 'resumeSessionId' | 'customArgs'>): string[] {
+export function buildClaudeArgs(opts: Pick<BackendRunOptions, 'model' | 'resumeSessionId' | 'customArgs' | 'bridge'>): string[] {
   // `--include-partial-messages` is the flag that turns claude code's
   // stream-json output from "one assistant message per completed turn"
   // into "many partial chunks streamed as the model generates". Without
@@ -263,6 +262,15 @@ export function buildClaudeArgs(opts: Pick<BackendRunOptions, 'model' | 'resumeS
   ];
   if (opts.model) args.push('--model', opts.model);
   if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
+  // orkas-bridge: ADD the per-run MCP server alongside the user's own MCP
+  // config (no --strict-mcp-config — their servers must keep working), and
+  // tell the agent the bridge exists via an appended system prompt.
+  if (opts.bridge) {
+    args.push('--mcp-config', opts.bridge.mcpConfigPath);
+    if (opts.bridge.appendSystemPrompt) {
+      args.push('--append-system-prompt', opts.bridge.appendSystemPrompt);
+    }
+  }
   if (opts.customArgs && opts.customArgs.length) args.push(...opts.customArgs);
   return args;
 }

@@ -24,6 +24,12 @@ describe('isTransientError — set A (network-class blips)', () => {
     'stream disconnected before completion',
     '504 Gateway Timeout',
     'rate limit exceeded',
+    // Local CLI watchdog kills — old fixed-timer wording and the two
+    // armKillWatchdog reasons. Retry resumes the CLI session, so these
+    // are recoverable by construction.
+    'claude exceeded 1200000ms',
+    'cli timed out: exceeded 7200000ms wall-clock cap',
+    'cli timed out: no activity for 912345ms (idle cap 900000ms)',
   ])('matches transient pattern: %s', (msg) => {
     expect(isTransientError(msg)).toBe(true);
   });
@@ -43,6 +49,10 @@ describe('isTransientError — set B (permanent / non-network)', () => {
     'tool rejected: bad arguments',
     'permission denied',
     'aborted by user',
+    // Look-alikes for the watchdog patterns: "exceeded" without a
+    // millisecond figure is a quota/limit error, not a watchdog kill.
+    'quota exceeded',
+    'file size exceeded the maximum',
   ])('does NOT match: %s', (msg) => {
     expect(isTransientError(msg)).toBe(false);
   });

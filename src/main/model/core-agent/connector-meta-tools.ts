@@ -34,8 +34,11 @@ import {
   resolveVisibleConnectors,
   stringifyMcpResult,
 } from '../../features/connectors/tools-adapter';
+import { validateCustomTransport, validateDisplayName, CustomTransportError } from '../../features/connectors/custom-transport';
+import { requestInstallConfirm } from '../../features/connectors/install_confirm';
 import { findCatalogEntry } from '../../features/connectors/catalog';
-import { descriptionLang, getCurrentLang } from '../../i18n';
+import { getLanguageForUser } from '../../features/config';
+import { descriptionLang } from '../../i18n';
 import { createLogger } from '../../logger';
 import type { ConnectorInstance, ToolSchema } from '../../features/connectors/types';
 
@@ -46,13 +49,25 @@ export interface ConnectorMetaToolsOpts {
   userId: string;
   /** Optional actor filter. Empty / undefined = commander scope. */
   agentId?: string;
+  /** Conversation id — required for the commander `add_custom_connector`
+   *  tool so its confirmation dialog routes to the right conversation.
+   *  Omitted for discover-mode (agent-edit) where add is not exposed. */
+  cid?: string;
 }
 
 function errResult(code: string, msg: string): ToolResult {
   return { content: `${code}: ${msg}`, isError: true };
 }
 
-function _renderConnectorLine(instance: ConnectorInstance): string {
+function _descriptionLangForUser(uid: string): 'zh' | 'en' {
+  try {
+    return descriptionLang(getLanguageForUser(uid));
+  } catch {
+    return 'en';
+  }
+}
+
+function _renderConnectorLine(instance: ConnectorInstance, lang: 'zh' | 'en'): string {
   // Catalog entry holds the bilingual description; instance.id doubles as the catalog id (per
   // types.ts: instance.id is the catalog entry id, used both for routing and as the
   // `<id>__<tool>` prefix). Falls back to display_name alone when the catalog has no
@@ -62,7 +77,6 @@ function _renderConnectorLine(instance: ConnectorInstance): string {
   // every line is implicitly healthy. Disconnected / errored / connecting instances are hidden
   // from the LLM entirely — see tools-adapter.ts for the filter + rationale.
   const catalog = findCatalogEntry(instance.id);
-  const lang = descriptionLang(getCurrentLang());
   const descKey = `description_${lang}` as 'description_zh' | 'description_en';
   const desc = catalog ? (catalog[descKey] || '') : '';
   const acct = instance.oauth_grant?.account_label ? ` (account: ${instance.oauth_grant.account_label})` : '';
@@ -82,8 +96,9 @@ export async function getConnectorPromptBlock(uid: string, agentId: string | und
   if (!uid) return '';
   const visible = await resolveVisibleConnectors(uid, agentId);
   if (!visible.length) return '';
+  const lang = _descriptionLangForUser(uid);
   const lines: string[] = ['## Connectors', ''];
-  for (const { instance } of visible) lines.push(_renderConnectorLine(instance));
+  for (const { instance } of visible) lines.push(_renderConnectorLine(instance, lang));
   return lines.join('\n');
 }
 
@@ -245,6 +260,67 @@ function createCallConnectorToolTool(opts: ConnectorMetaToolsOpts): AgentTool {
   };
 }
 
+/** Commander-only tool: install a user-described custom MCP server. The
+ *  install ALWAYS requires the user to approve a confirmation dialog
+ *  (plan §C2 / §C3) — for stdio that dialog shows the exact command that
+ *  will run. The LLM can describe the server but cannot complete the
+ *  install on its own. Bound to a cid so the confirm dialog routes to the
+ *  right conversation. */
+function createAddCustomConnectorTool(opts: ConnectorMetaToolsOpts & { cid: string }): AgentTool {
+  return {
+    name: 'add_custom_connector',
+    description:
+      'Add a custom MCP server the user described (e.g. pasted from an mcp.json or docs). '
+      + 'Use ONLY when the user explicitly wants to connect a specific MCP server that is not in '
+      + 'the built-in Connectors list. The user must approve a confirmation dialog before it is '
+      + 'installed — for a local command, that dialog shows the exact command that will run, so '
+      + 'present what you are about to add in plain terms first. On approval the server is '
+      + 'connected and its tools become available via `list_connector_tools` / '
+      + '`call_connector_tool` like any other connector.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'A short display name for the server.' },
+        transport: {
+          type: 'object',
+          description:
+            'Either { kind: "streamable-http", url, headers? } for a remote server, or '
+            + '{ kind: "stdio", command, args?, env? } for a local command. Put API keys in '
+            + 'headers (http) or env (stdio).',
+        },
+      },
+      required: ['name', 'transport'],
+    },
+    async execute(input) {
+      const i = input as { name?: unknown; transport?: unknown };
+      let displayName: string;
+      let transport;
+      try {
+        displayName = validateDisplayName(i.name);
+        transport = validateCustomTransport(i.transport as never);
+      } catch (err) {
+        const code = err instanceof CustomTransportError ? err.code : 'E_INVALID';
+        return errResult(code, `invalid custom connector: ${(err as Error).message}`);
+      }
+
+      const approved = await requestInstallConfirm({ cid: opts.cid, displayName, transport });
+      if (!approved) {
+        return { content: 'The user declined to add this connector. Do not retry; ask if they want to adjust it.' };
+      }
+      try {
+        const inst = await manager.addCustomInstance(opts.userId, { display_name: displayName, transport });
+        if (inst.status.kind === 'connected') {
+          return { content: `Connected "${inst.display_name}" (id: ${inst.id}). Its tools are now available via list_connector_tools({connector_id: "${inst.id}"}).` };
+        }
+        const msg = inst.status.kind === 'error' ? inst.status.message : inst.status.kind;
+        return { content: `Added "${inst.display_name}" (id: ${inst.id}) but it could not connect yet: ${msg}. The user can retry it from the Connectors panel.` };
+      } catch (err) {
+        return errResult('E_INSTALL_FAILED', `could not add connector: ${(err as Error).message}`);
+      }
+    },
+  };
+}
+
 /** Build the connector meta-tools for a single runner.
  *
  *  `mode` selects exposure (mirrors the tri-state gate in `runner.ts::connectorExposureFromSessionId`):
@@ -264,11 +340,21 @@ export async function createConnectorMetaTools(
   mode: 'full' | 'discover' = 'full',
 ): Promise<AgentTool[]> {
   if (!opts.userId) return [];
+  // The commander (full mode) always gets `add_custom_connector`, even with
+  // zero connectors installed — that's the path to the FIRST one. The
+  // discover-mode add tool is intentionally absent (agent-edit must not
+  // produce side effects). The add tool needs a cid to route its confirm
+  // dialog; without one we cannot safely expose it.
+  const addTool = mode === 'full' && opts.cid
+    ? [createAddCustomConnectorTool({ ...opts, cid: opts.cid })]
+    : [];
+
   const visible = await resolveVisibleConnectors(opts.userId, opts.agentId);
-  if (!visible.length) return [];
+  if (!visible.length) return addTool;
   if (mode === 'discover') return [createListConnectorToolsTool(opts)];
   return [
     createListConnectorToolsTool(opts),
     createCallConnectorToolTool(opts),
+    ...addTool,
   ];
 }

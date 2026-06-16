@@ -65,11 +65,11 @@ describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
 
   it('masks local absolute paths and file URLs', () => {
     const out = sanitizeLogTextForUpload(
-      'open /Users/user/Secret Project/report.pdf then file:///Users/user/Secret Project/index.html',
+      'open /Users/test/Secret Project/report.pdf then file:///Users/test/Secret Project/index.html',
     );
     expect(out).toContain('<abs-path:');
     expect(out).toContain('<file-url-path:');
-    expect(out).not.toContain('/Users/user');
+    expect(out).not.toContain('/Users/test');
     expect(out).not.toContain('Secret Project');
   });
 
@@ -81,7 +81,7 @@ describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
   });
 
   it('masks common provider token prefixes', () => {
-    const out = sanitizeLogTextForUpload('key sk-test-placeholder');
+    const out = sanitizeLogTextForUpload('key test-openai-key-redacted');
     expect(out).toBe('key ***TOKEN***');
   });
 

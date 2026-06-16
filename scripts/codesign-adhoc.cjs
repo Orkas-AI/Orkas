@@ -6,7 +6,7 @@
  * Ad-hoc 签名让 bundle 至少有一个完整的签名结构,Gatekeeper 退化成
  * "未验证开发者",用户右键 → 打开一次就放行。
  *
- * 仅 darwin 平台生效;其它 platform no-op。Windows / Linux 出包不受影响。
+ * 依赖清理对 macOS / Windows 都生效;签名补救仅 darwin 平台生效。
  */
 'use strict';
 
@@ -26,6 +26,12 @@ function removeIfExists(target) {
   if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
 }
 
+function requiredFile(label, file) {
+  if (!fs.existsSync(file) || !fs.statSync(file).isFile()) {
+    throw new Error(`[native-deps-gate] missing ${label}: ${file}`);
+  }
+}
+
 function listDirs(dir) {
   if (!fs.existsSync(dir)) return [];
   return fs.readdirSync(dir, { withFileTypes: true })
@@ -33,7 +39,7 @@ function listDirs(dir) {
     .map((entry) => entry.name);
 }
 
-function pruneOnnxRuntimePackage(pkgDir, targetArch) {
+function pruneOnnxRuntimePackage(pkgDir, targetPlatform, targetArch) {
   const binDir = path.join(pkgDir, 'bin');
   if (!fs.existsSync(binDir)) return;
 
@@ -41,40 +47,273 @@ function pruneOnnxRuntimePackage(pkgDir, targetArch) {
   for (const napiDirName of listDirs(binDir)) {
     const napiDir = path.join(binDir, napiDirName);
     for (const platformDirName of listDirs(napiDir)) {
-      if (platformDirName !== 'darwin') {
+      if (platformDirName !== targetPlatform) {
         removeIfExists(path.join(napiDir, platformDirName));
       }
     }
 
     if (!keepArch) continue;
-    const darwinDir = path.join(napiDir, 'darwin');
-    for (const archDirName of listDirs(darwinDir)) {
+    const platformDir = path.join(napiDir, targetPlatform);
+    for (const archDirName of listDirs(platformDir)) {
       if (archDirName !== keepArch) {
-        removeIfExists(path.join(darwinDir, archDirName));
+        removeIfExists(path.join(platformDir, archDirName));
       }
     }
   }
 }
 
-function prunePackedNativePayload(appPath, targetArch) {
-  const nodeModules = path.join(appPath, 'Contents', 'Resources', 'app.asar.unpacked', 'node_modules');
+function targetEsbuildPackage(targetPlatform, targetArch) {
+  if (targetPlatform === 'darwin' && (targetArch === 'arm64' || targetArch === 'x64')) {
+    return `darwin-${targetArch}`;
+  }
+  if (targetPlatform === 'win32' && targetArch === 'x64') return 'win32-x64';
+  return null;
+}
+
+function pruneEsbuildPackage(nodeModules, targetPlatform, targetArch) {
+  const esbuildDir = path.join(nodeModules, '@esbuild');
+  if (!fs.existsSync(esbuildDir)) return;
+
+  const keepPackage = targetEsbuildPackage(targetPlatform, targetArch);
+  for (const dirName of listDirs(esbuildDir)) {
+    if (keepPackage && dirName !== keepPackage) {
+      removeIfExists(path.join(esbuildDir, dirName));
+    }
+  }
+
+  if (!keepPackage) return;
+  const bin = targetPlatform === 'win32'
+    ? path.join(esbuildDir, keepPackage, 'esbuild.exe')
+    : path.join(esbuildDir, keepPackage, 'bin', 'esbuild');
+  if (!fs.existsSync(bin)) {
+    throw new Error(`[codesign-adhoc] missing ${targetPlatform} ${targetArch} esbuild runtime binary: ${bin}`);
+  }
+}
+
+function targetSqliteVecPackage(targetPlatform, targetArch) {
+  if (targetPlatform === 'darwin' && (targetArch === 'arm64' || targetArch === 'x64')) {
+    return `sqlite-vec-darwin-${targetArch}`;
+  }
+  if (targetPlatform === 'win32' && targetArch === 'x64') return 'sqlite-vec-windows-x64';
+  return null;
+}
+
+function pruneSqliteVecPackages(nodeModules, targetPlatform, targetArch) {
+  const keepPackage = targetSqliteVecPackage(targetPlatform, targetArch);
+  for (const dirName of listDirs(nodeModules)) {
+    if (/^sqlite-vec-(darwin|linux|windows)-/i.test(dirName) && dirName !== keepPackage) {
+      removeIfExists(path.join(nodeModules, dirName));
+    }
+  }
+}
+
+function targetCanvasPackage(targetPlatform, targetArch) {
+  if (targetPlatform === 'darwin' && (targetArch === 'arm64' || targetArch === 'x64')) {
+    return `canvas-darwin-${targetArch}`;
+  }
+  if (targetPlatform === 'win32' && targetArch === 'x64') return 'canvas-win32-x64-msvc';
+  if (targetPlatform === 'win32' && targetArch === 'arm64') return 'canvas-win32-arm64-msvc';
+  return null;
+}
+
+function pruneCanvasPackages(nodeModules, targetPlatform, targetArch) {
+  const napiDir = path.join(nodeModules, '@napi-rs');
+  const keepPackage = targetCanvasPackage(targetPlatform, targetArch);
+  for (const dirName of listDirs(napiDir)) {
+    if (/^canvas-/i.test(dirName) && dirName !== keepPackage) {
+      removeIfExists(path.join(napiDir, dirName));
+    }
+  }
+}
+
+function targetTokenizersPackage(targetPlatform, targetArch) {
+  if (targetPlatform === 'darwin') return 'tokenizers-darwin-universal';
+  if (targetPlatform === 'win32' && targetArch === 'x64') return 'tokenizers-win32-x64-msvc';
+  return null;
+}
+
+function pruneTokenizersPackages(nodeModules, targetPlatform, targetArch) {
+  const tokenizersDir = path.join(nodeModules, '@anush008');
+  const keepPackage = targetTokenizersPackage(targetPlatform, targetArch);
+  for (const dirName of listDirs(tokenizersDir)) {
+    if (/^tokenizers-/i.test(dirName) && dirName !== keepPackage) {
+      removeIfExists(path.join(tokenizersDir, dirName));
+    }
+  }
+}
+
+function packageDir(nodeModules, packageName) {
+  return path.join(nodeModules, ...packageName.split('/'));
+}
+
+function requireOnlyPackages(parentDir, pattern, allowedPackages) {
+  const allowed = new Set(allowedPackages.filter(Boolean));
+  for (const dirName of listDirs(parentDir)) {
+    if (pattern.test(dirName) && !allowed.has(dirName)) {
+      throw new Error(`[native-deps-gate] unexpected native package for target: ${path.join(parentDir, dirName)}`);
+    }
+  }
+}
+
+function verifyOnnxRuntimePackage(pkgDir, targetPlatform, targetArch, verified) {
+  const binDir = path.join(pkgDir, 'bin');
+  if (!fs.existsSync(binDir)) return;
+
+  for (const napiDirName of listDirs(binDir)) {
+    const napiDir = path.join(binDir, napiDirName);
+    const platformDirs = listDirs(napiDir);
+    for (const platformDirName of platformDirs) {
+      if (platformDirName !== targetPlatform) {
+        throw new Error(`[native-deps-gate] unexpected onnxruntime platform ${platformDirName}: ${path.join(napiDir, platformDirName)}`);
+      }
+    }
+
+    const platformDir = path.join(napiDir, targetPlatform);
+    const archDirs = listDirs(platformDir);
+    for (const archDirName of archDirs) {
+      if (archDirName !== targetArch) {
+        throw new Error(`[native-deps-gate] unexpected onnxruntime arch ${archDirName}: ${path.join(platformDir, archDirName)}`);
+      }
+    }
+
+    requiredFile(
+      `onnxruntime ${targetPlatform}/${targetArch} binding`,
+      path.join(platformDir, targetArch, 'onnxruntime_binding.node'),
+    );
+    verified.push(`${path.relative(pkgDir, path.join(platformDir, targetArch))}`);
+  }
+}
+
+function verifyPackedNativePayload(nodeModules, targetPlatform, targetArch) {
+  const esbuildPackage = targetEsbuildPackage(targetPlatform, targetArch);
+  const sqlitePackage = targetSqliteVecPackage(targetPlatform, targetArch);
+  const canvasPackage = targetCanvasPackage(targetPlatform, targetArch);
+  const tokenizersPackage = targetTokenizersPackage(targetPlatform, targetArch);
+  const verified = [];
+
+  requireOnlyPackages(path.join(nodeModules, '@esbuild'), /^.+$/, [esbuildPackage]);
+  requireOnlyPackages(nodeModules, /^sqlite-vec-(darwin|linux|windows)-/i, [sqlitePackage]);
+  requireOnlyPackages(path.join(nodeModules, '@napi-rs'), /^canvas-/i, [canvasPackage]);
+  requireOnlyPackages(path.join(nodeModules, '@anush008'), /^tokenizers-/i, [tokenizersPackage]);
+
+  if (targetPlatform !== 'darwin' && fs.existsSync(path.join(nodeModules, 'fsevents'))) {
+    throw new Error('[native-deps-gate] fsevents must not be included in non-macOS packages');
+  }
+
+  if (targetPlatform === 'darwin') {
+    requiredFile(
+      `${esbuildPackage} binary`,
+      path.join(packageDir(nodeModules, `@esbuild/${esbuildPackage}`), 'bin', 'esbuild'),
+    );
+    requiredFile(
+      `${sqlitePackage} binary`,
+      path.join(packageDir(nodeModules, sqlitePackage), 'vec0.dylib'),
+    );
+    requiredFile(
+      `${canvasPackage} binary`,
+      path.join(packageDir(nodeModules, `@napi-rs/${canvasPackage}`), `skia.darwin-${targetArch}.node`),
+    );
+    requiredFile(
+      `${tokenizersPackage} binary`,
+      path.join(packageDir(nodeModules, `@anush008/${tokenizersPackage}`), 'tokenizers.darwin-universal.node'),
+    );
+  } else if (targetPlatform === 'win32') {
+    requiredFile(
+      `${esbuildPackage} binary`,
+      path.join(packageDir(nodeModules, `@esbuild/${esbuildPackage}`), 'esbuild.exe'),
+    );
+    requiredFile(
+      `${sqlitePackage} binary`,
+      path.join(packageDir(nodeModules, sqlitePackage), 'vec0.dll'),
+    );
+    requiredFile(
+      `${canvasPackage} binary`,
+      path.join(packageDir(nodeModules, `@napi-rs/${canvasPackage}`), 'skia.win32-x64-msvc.node'),
+    );
+    requiredFile(
+      `${tokenizersPackage} binary`,
+      path.join(packageDir(nodeModules, `@anush008/${tokenizersPackage}`), 'tokenizers.win32-x64-msvc.node'),
+    );
+  }
+
+  requiredFile(
+    'better-sqlite3 Electron native binding',
+    path.join(nodeModules, 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node'),
+  );
+
+  verified.push(esbuildPackage, sqlitePackage, canvasPackage, tokenizersPackage, 'better-sqlite3');
+  for (const pkgDir of [
+    path.join(nodeModules, 'onnxruntime-node'),
+    path.join(nodeModules, 'fastembed', 'node_modules', 'onnxruntime-node'),
+  ]) {
+    verifyOnnxRuntimePackage(pkgDir, targetPlatform, targetArch, verified);
+  }
+
+  return verified.filter(Boolean);
+}
+
+function appNodeModules(context, appPath) {
+  if (context.electronPlatformName === 'darwin') {
+    return path.join(appPath, 'Contents', 'Resources', 'app.asar.unpacked', 'node_modules');
+  }
+  return path.join(context.appOutDir, 'resources', 'app.asar.unpacked', 'node_modules');
+}
+
+function prunePackedNativePayload(context, appPath, targetPlatform, targetArch) {
+  const nodeModules = appNodeModules(context, appPath);
+  if (!fs.existsSync(nodeModules)) return [];
   const packages = [
     path.join(nodeModules, 'onnxruntime-node'),
     path.join(nodeModules, 'fastembed', 'node_modules', 'onnxruntime-node'),
   ];
 
-  for (const pkgDir of packages) {
-    pruneOnnxRuntimePackage(pkgDir, targetArch);
+  pruneEsbuildPackage(nodeModules, targetPlatform, targetArch);
+  pruneSqliteVecPackages(nodeModules, targetPlatform, targetArch);
+  pruneCanvasPackages(nodeModules, targetPlatform, targetArch);
+  pruneTokenizersPackages(nodeModules, targetPlatform, targetArch);
+  if (targetPlatform !== 'darwin') {
+    removeIfExists(path.join(nodeModules, 'fsevents'));
   }
+
+  for (const pkgDir of packages) {
+    pruneOnnxRuntimePackage(pkgDir, targetPlatform, targetArch);
+  }
+
+  return verifyPackedNativePayload(nodeModules, targetPlatform, targetArch);
+}
+
+function writeNativeGateMarker(context, targetPlatform, targetArch, verified) {
+  const marker = {
+    status: 'passed',
+    phase: 'post-package/pre-sign',
+    platform: targetPlatform,
+    arch: targetArch,
+    verified,
+    checkedAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(
+    path.join(context.appOutDir, '.orkas-native-deps-verified.json'),
+    `${JSON.stringify(marker, null, 2)}\n`,
+  );
 }
 
 module.exports = async function afterPack(context) {
-  if (context.electronPlatformName !== 'darwin') return;
-  const appName = context.packager.appInfo.productFilename;
-  const appPath = path.join(context.appOutDir, `${appName}.app`);
+  const targetPlatform = context.electronPlatformName;
   const targetArch = ARCH_NAMES[context.arch] || process.arch;
+  const appName = context.packager.appInfo.productFilename;
+  const appPath = targetPlatform === 'darwin'
+    ? path.join(context.appOutDir, `${appName}.app`)
+    : context.appOutDir;
 
-  prunePackedNativePayload(appPath, targetArch);
+  console.log('==== Native dependency gate: post-package/pre-sign ====');
+  console.log(`[native-deps-gate] target=${targetPlatform}/${targetArch}`);
+  const verified = prunePackedNativePayload(context, appPath, targetPlatform, targetArch);
+  writeNativeGateMarker(context, targetPlatform, targetArch, verified);
+  console.log(`[native-deps-gate] verified: ${verified.join(', ')}`);
+  console.log('[native-deps-gate] result=passed; signing may continue');
+
+  if (targetPlatform !== 'darwin') return;
+
 
   if (process.env.ORKAS_FORCE_ADHOC_CODESIGN !== '1' && (process.env.CSC_LINK || process.env.CSC_NAME)) {
     console.log('[codesign-adhoc] formal signing env detected; skipping ad-hoc signing');

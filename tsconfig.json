@@ -28,7 +28,6 @@
     "node_modules",
     "data",
     "src/core-agent",
-    "src/builtin",
     "src/resources",
     "src/renderer",
     "dist",

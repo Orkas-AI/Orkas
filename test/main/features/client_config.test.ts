@@ -20,9 +20,16 @@ vi.mock('electron', () => ({
   powerMonitor: electronMock.powerMonitor,
 }));
 
-import { ClientConfigManager, refresh, stop } from '../../../src/main/features/client_config';
+import { ClientConfigManager, getMinimumAppVersion, refresh, start, stop } from '../../../src/main/features/client_config';
 
 const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
+
+async function waitForCondition(predicate: () => boolean, attempts = 20): Promise<void> {
+  for (let i = 0; i < attempts; i += 1) {
+    if (predicate()) return;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
 
 describe('client_config', () => {
   beforeEach(() => {
@@ -33,12 +40,22 @@ describe('client_config', () => {
     electronMock.app.off.mockClear();
     electronMock.powerMonitor.on.mockClear();
     electronMock.powerMonitor.off.mockClear();
+    delete process.env.ORKAS_ACCOUNT_API_BASE;
+    delete process.env.ORKAS_API_BASE_URL;
+    delete process.env.ORKAS_PROFILE;
+    delete process.env.ORKAS_CLIENT_CHANNEL;
+    delete process.env.ORKAS_CHANNEL;
   });
 
   afterEach(() => {
     stop();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+    delete process.env.ORKAS_ACCOUNT_API_BASE;
+    delete process.env.ORKAS_API_BASE_URL;
+    delete process.env.ORKAS_PROFILE;
+    delete process.env.ORKAS_CLIENT_CHANNEL;
+    delete process.env.ORKAS_CHANNEL;
   });
 
   it('returns registered local defaults before any Server config is available', () => {
@@ -67,6 +84,36 @@ describe('client_config', () => {
       const manager = new ClientConfigManager();
       manager.registerDefault('feature.local-default', true);
       expect(manager.get('feature.local-default')).toBe(false);
+    } finally {
+      fs.rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it('reads the minimum app version from direct or object app update config', async () => {
+    const users = await import('../../../src/main/features/users');
+    const paths = await import('../../../src/main/paths');
+    const uid = 'clientconfigappupdate';
+    users.activateUser(uid);
+    const file = paths.userRemoteConfigFile(uid);
+
+    try {
+      const manager = new ClientConfigManager();
+      manager.applyServerPayload({
+        immediate: { app_update: { min_version: '1.2.0' } },
+        restart: {},
+        config_hash: 'sha256:app-update-object',
+      }, '"sha256:app-update-object"');
+      expect(getMinimumAppVersion()).toBe('1.2.0');
+
+      manager.applyServerPayload({
+        immediate: {
+          app_update: { min_version: '1.2.0' },
+          'app_update.min_version': '1.3.0',
+        },
+        restart: {},
+        config_hash: 'sha256:app-update-direct',
+      }, '"sha256:app-update-direct"');
+      expect(getMinimumAppVersion()).toBe('1.3.0');
     } finally {
       fs.rmSync(path.dirname(file), { recursive: true, force: true });
     }
@@ -185,6 +232,35 @@ describe('client_config', () => {
     }
   });
 
+  it('can delay and throttle startup refresh work', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      code: 0,
+      immediate: {},
+      restart: {},
+      config_hash: 'sha256:delayed',
+    }), {
+      headers: { etag: '"sha256:delayed"' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    try {
+      start({ startupDelayMs: 1_000, forceStartupRefresh: false });
+      await waitForCondition(() => electronMock.app.on.mock.calls.length > 0);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(999);
+      expect(fetchMock).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await waitForCondition(() => fetchMock.mock.calls.length === 1);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      stop();
+      vi.useRealTimers();
+    }
+  });
+
   it('refreshes remote config with client context and cached ETag', async () => {
     const users = await import('../../../src/main/features/users');
     const paths = await import('../../../src/main/paths');
@@ -201,6 +277,7 @@ describe('client_config', () => {
 
     const now = 1_234_567;
     vi.spyOn(Date, 'now').mockReturnValue(now);
+    process.env.ORKAS_API_BASE_URL = 'https://config.example/api/';
     let requestedUrl = '';
     let requestedInit: RequestInit | undefined;
     vi.stubGlobal('fetch', async (input: string | URL | Request, init?: RequestInit) => {
@@ -222,10 +299,10 @@ describe('client_config', () => {
       expect(result).toEqual({ updated: true });
 
       const url = new URL(requestedUrl);
-      expect(url.origin + url.pathname).toBe('https://orkas.ai/api/config/client');
+      expect(url.origin + url.pathname).toBe('https://config.example/api/config/client');
       expect(url.searchParams.get('platform')).toBe('pc');
       expect(url.searchParams.get('version')).toBe('9.8.7');
-      expect(url.searchParams.get('channel')).toBe('open');
+      expect(url.searchParams.get('channel')).toBe('dev');
       expect(url.searchParams.get('region')).toBe('global');
       expect(url.searchParams.get('os')).toBe(process.platform);
       expect(url.searchParams.get('arch')).toBe(process.arch);
@@ -244,13 +321,17 @@ describe('client_config', () => {
     }
   });
 
-  it('uses the open channel for OrkasOpen config requests', async () => {
+  it('uses the open channel when the open-source package marker is present', async () => {
     const users = await import('../../../src/main/features/users');
     const paths = await import('../../../src/main/paths');
     const uid = 'clientconfigopenchannel';
     users.activateUser(uid);
     const file = paths.userRemoteConfigFile(uid);
     fs.mkdirSync(path.dirname(file), { recursive: true });
+    const appDir = fs.mkdtempSync(path.join(path.dirname(file), 'open-app-'));
+    fs.writeFileSync(path.join(appDir, 'package.json'), JSON.stringify({ license: 'MIT' }), 'utf8');
+    (electronMock.app as any).getAppPath = vi.fn(() => appDir);
+
     let requestedUrl = '';
     vi.stubGlobal('fetch', async (input: string | URL | Request) => {
       requestedUrl = String(input);
@@ -328,27 +409,35 @@ describe('client_config', () => {
       fetched_at_ms: now,
     });
 
-    const fetchMock = vi.fn();
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      code: 0,
+      immediate: {},
+      restart: {},
+      config_hash: 'sha256:startup',
+    }), {
+      status: 200,
+      headers: { etag: '"startup-etag"' },
+    }));
     const intervalSpy = vi.spyOn(globalThis, 'setInterval');
     vi.spyOn(Date, 'now').mockReturnValue(now);
     vi.stubGlobal('fetch', fetchMock);
 
     try {
       clientConfigModule.start();
-      await Promise.resolve();
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      await waitForCondition(() => fetchMock.mock.calls.length > 0);
 
       expect(electronMock.app.on).toHaveBeenCalledWith('browser-window-focus', expect.any(Function));
       expect(electronMock.app.on).toHaveBeenCalledWith('activate', expect.any(Function));
       expect(electronMock.powerMonitor.on).toHaveBeenCalledWith('resume', expect.any(Function));
       expect(intervalSpy).not.toHaveBeenCalled();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
 
       const focusHandler = electronMock.app.on.mock.calls
         .find(([event]) => event === 'browser-window-focus')?.[1] as (() => void) | undefined;
       expect(focusHandler).toBeTruthy();
       focusHandler?.();
       await Promise.resolve();
-      expect(fetchMock).not.toHaveBeenCalled();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
       fs.rmSync(path.dirname(file), { recursive: true, force: true });
     }

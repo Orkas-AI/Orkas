@@ -5,8 +5,9 @@
  * tight, and the logic is short. Single source of truth so registry.ts
  * doesn't carry path-search code.
  *
- * POSIX: scan `process.env.PATH` (split by ':'), stat `<dir>/<name>`,
- * accept if it's a regular file with any executable bit set.
+ * POSIX: scan `process.env.PATH` (split by ':'), plus optional
+ * caller-provided directories, stat `<dir>/<name>`, accept if it's a
+ * regular file with any executable bit set.
  *
  * Windows: scan PATH (split by ';'), multiply each candidate by
  * `process.env.PATHEXT` (e.g. `.COM;.EXE;.BAT;.CMD`); first stat hit
@@ -20,7 +21,7 @@ import * as path from 'node:path';
 const isWindows = process.platform === 'win32';
 
 /** Scan PATH and return the first absolute path matching `name`, or null. */
-export async function whichBin(name: string): Promise<string | null> {
+export async function whichBin(name: string, opts: { extraDirs?: string[] } = {}): Promise<string | null> {
   if (!name) return null;
 
   // Absolute or relative path with separator → caller already resolved.
@@ -29,7 +30,10 @@ export async function whichBin(name: string): Promise<string | null> {
   }
 
   const pathEnv = process.env.PATH ?? '';
-  const dirs = pathEnv.split(path.delimiter).filter(Boolean);
+  const dirs = uniqueDirs([
+    ...pathEnv.split(path.delimiter).filter(Boolean),
+    ...(opts.extraDirs ?? []),
+  ]);
   if (dirs.length === 0) return null;
 
   const exts = isWindows ? winExtCandidates() : [''];
@@ -43,6 +47,21 @@ export async function whichBin(name: string): Promise<string | null> {
     }
   }
   return null;
+}
+
+function uniqueDirs(dirs: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const dir of dirs) {
+    const trimmed = String(dir || '').trim();
+    if (!trimmed) continue;
+    const resolved = path.resolve(trimmed);
+    const key = isWindows ? resolved.toLowerCase() : resolved;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(resolved);
+  }
+  return out;
 }
 
 /**

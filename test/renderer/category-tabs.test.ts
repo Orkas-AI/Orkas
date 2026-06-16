@@ -19,8 +19,10 @@ class FakeElement {
   innerHTML = '';
   style: Record<string, string> = {};
   classList = new FakeClassList();
+  focused = false;
   querySelectorAll() { return []; }
   addEventListener() {}
+  focus() { this.focused = true; }
 }
 
 function loadCategoryRenderers() {
@@ -31,6 +33,7 @@ function loadCategoryRenderers() {
   };
   const context: any = {
     console,
+    setTimeout,
     createLogger: () => ({ warn: () => {}, error: () => {}, info: () => {} }),
     document: { getElementById: (id: string) => el(id), querySelectorAll: () => [] },
     window: { addEventListener: () => {}, orkas: { invoke: async () => ({ list: [] }) } },
@@ -50,6 +53,17 @@ function loadCategoryRenderers() {
       'skills.use_tooltip': '使用',
       'skills.more_actions': '更多',
       'skills.no_desc': '无描述',
+      'skills.external_group': '外部包',
+      'skills.global_group': '全局文件夹',
+      'skills.no_match': '无匹配技能',
+      'skills.source_custom': '自定义',
+      'skills.source_marketplace': '市场',
+      'component.disable': '停用',
+      'component.enable': '启用',
+      'settings.packages.update': '更新',
+      'settings.packages.remove': '移除',
+      'settings.packages.kind_cli': '命令行',
+      'settings.packages.kind_both': '技能 + 命令行',
       'marketplace.all': '全部',
     } as Record<string, string>)[key] || key,
     pickLocalizedName: (c: any) => c?.name_zh || c?.name_en || c?.code || '',
@@ -63,6 +77,7 @@ function loadCategoryRenderers() {
     ],
     _mpCanonicalCategoryCode: (code: unknown) => String(code || '').trim() === 'writing' ? 'creation' : String(code || '').trim(),
     _mpMaybeRefreshCategoriesForCodes: () => {},
+    _mpReviewStatusLabel: (status: string) => status,
   };
   vm.createContext(context);
   for (const file of ['agents.js', 'skills.js']) {
@@ -109,5 +124,167 @@ describe('agent and skill category tabs', () => {
     expect(el('skills-grid').innerHTML).toContain('No Category');
     expect(el('skills-grid').innerHTML).toContain('Bad Category');
     expect(el('skills-grid').innerHTML).not.toContain('Data Skill');
+  });
+
+  it('refreshes open-tier skills even when the trusted skills cache is reused', async () => {
+    const { context, el } = loadCategoryRenderers();
+    let openRows: any[] = [];
+    let openFetches = 0;
+    context.apiFetch = async () => ({
+      json: async () => ({
+        ok: true,
+        skills: [{ id: 'trusted', name: 'Trusted Skill', source: 'custom', category: 'general' }],
+      }),
+    });
+    context.window.orkas.invoke = async (channel: string) => {
+      if (channel === 'skills.listOpen') {
+        openFetches += 1;
+        return { ok: true, skills: openRows };
+      }
+      return { ok: true };
+    };
+
+    await context.loadSkills();
+    expect(openFetches).toBe(1);
+    expect(el('skills-grid').innerHTML).not.toContain('External Smoke');
+
+    openRows = [{
+      id: 'external-smoke',
+      name: 'External Smoke',
+      source: 'external',
+      enabled: true,
+      package_name: 'smoke-pack',
+      package_kind: 'both',
+      package_enabled: true,
+    }];
+    await context.loadSkills();
+
+    expect(openFetches).toBe(2);
+    expect(el('skills-grid').innerHTML).toContain('外部包');
+    expect(el('skills-grid').innerHTML).toContain('External Smoke');
+    expect(el('skills-grid').innerHTML).toContain('smoke-pack · 技能 + 命令行');
+    expect(el('skills-grid').innerHTML).toContain('data-open-more');
+    // Open-tier cards carry a "use" (play) button like trusted cards.
+    expect(el('skills-grid').innerHTML).toContain('data-open-use');
+    expect(el('skills-grid').innerHTML).not.toContain('skill-card-chip is-external');
+    expect(el('skills-grid').innerHTML).not.toContain('data-open-toggle');
+
+    openRows = [{
+      id: 'external-smoke',
+      name: 'External Smoke',
+      source: 'external',
+      enabled: false,
+      package_name: 'smoke-pack',
+      package_kind: 'both',
+      package_enabled: false,
+    }];
+    await context.loadSkills();
+
+    expect(openFetches).toBe(3);
+    expect(el('skills-grid').innerHTML).toContain('External Smoke');
+    expect(el('skills-grid').innerHTML).toContain('is-disabled');
+  });
+
+  it('renders CLI-only external packages as cards in the Skills tab', () => {
+    const { context, el } = loadCategoryRenderers();
+    vm.runInContext(`
+      _skillsCache = [];
+      _openSkillsCache = [];
+      _packagesCache = [{
+        name: 'orkas-cli-smoke',
+        kind: 'cli',
+        enabled: true,
+        skill_count: 0,
+        bin_names: ['orkas-cli-smoke']
+      }];
+      renderSkillsGrid([]);
+    `, context);
+
+    const html = el('skills-grid').innerHTML;
+    expect(html).toContain('外部包');
+    expect(html).toContain('orkas-cli-smoke');
+    expect(html).toContain('命令行 · `orkas-cli-smoke`');
+    expect(html).toContain('skill-card is-readonly');
+    expect(html).toContain('data-open-package-card');
+    expect(html).toContain('data-open-package-more');
+    expect(html).not.toContain('packages-list');
+    expect(html).not.toContain('package-row');
+  });
+
+  it('lists open-tier skills in the commander skill picker groups', () => {
+    const { context, el } = loadCategoryRenderers();
+    vm.runInContext(`
+      _skillsCache = [
+        { id: 'trusted', name: 'Trusted Skill', source: 'custom', enabled: true, description_zh: 'trusted desc' }
+      ];
+      _openSkillsCache = [
+        { id: 'external-smoke', name: 'External Smoke', source: 'external', enabled: true, description: 'package skill' },
+        { id: 'global-helper', name: 'Global Helper', source: 'global', enabled: true, description: 'global skill' },
+        { id: 'disabled-package', name: 'Disabled Package', source: 'external', enabled: false, description: 'disabled' }
+      ];
+      _renderSkillPickerList(document.getElementById('agent-picker-list'), '', 'new-chat-recipient-chip');
+    `, context);
+
+    const html = el('agent-picker-list').innerHTML;
+    expect(html).toContain('自定义');
+    expect(html).toContain('Trusted Skill');
+    expect(html).toContain('外部包');
+    expect(html).toContain('External Smoke');
+    expect(html).toContain('全局文件夹');
+    expect(html).toContain('Global Helper');
+    expect(html).not.toContain('Disabled Package');
+  });
+
+  it('keeps open-tier skills commander-only but offers trusted skills to agent recipients', async () => {
+    const { context } = loadCategoryRenderers();
+    context.pickedSkillCalls = [];
+    context.getChatRecipient = () => ({ kind: 'commander' });
+    vm.runInContext(`
+      _skillsCache = [
+        { id: 'trusted', name: 'Trusted Skill', source: 'custom', enabled: true, description_zh: 'd' }
+      ];
+      _openSkillsCache = [
+        { id: 'external-smoke', name: 'External Smoke', source: 'external', enabled: true, description: 'pkg' }
+      ];
+      setChatSkill = (target, name) => { pickedSkillCalls.push([target, name]); };
+    `, context);
+
+    // Commander: all three tabs; open-tier skill selectable.
+    expect(vm.runInContext('_agentPickerVisibleTabs("new-chat-recipient-chip")', context))
+      .toEqual(['agents', 'skills', 'connectors']);
+    await context._triggerPickerItem('skill', 'external-smoke', 'External Smoke', 'new-chat-recipient-chip');
+    expect(context.pickedSkillCalls).toEqual([['new-chat', 'External Smoke']]);
+
+    // Agent recipient: skills tab stays (connectors drop). Open-tier skill is
+    // refused; a trusted (custom/marketplace) skill goes through — the agent
+    // runs it via the orkas bridge.
+    context.pickedSkillCalls = [];
+    context.getChatRecipient = () => ({ kind: 'agent', id: 'agent-1', name: 'Agent One' });
+    expect(vm.runInContext('_agentPickerVisibleTabs("new-chat-recipient-chip")', context))
+      .toEqual(['agents', 'skills']);
+    await context._triggerPickerItem('skill', 'external-smoke', 'External Smoke', 'new-chat-recipient-chip');
+    expect(context.pickedSkillCalls).toEqual([]);
+    await context._triggerPickerItem('skill', 'trusted', 'Trusted Skill', 'new-chat-recipient-chip');
+    expect(context.pickedSkillCalls).toEqual([['new-chat', 'Trusted Skill']]);
+  });
+
+  it('hides open-tier skill groups from the picker for an agent recipient', () => {
+    const { context, el } = loadCategoryRenderers();
+    context.getChatRecipient = () => ({ kind: 'agent', id: 'agent-1', name: 'Agent One' });
+    vm.runInContext(`
+      _skillsCache = [
+        { id: 'trusted', name: 'Trusted Skill', source: 'custom', enabled: true, description_zh: 'trusted desc' }
+      ];
+      _openSkillsCache = [
+        { id: 'external-smoke', name: 'External Smoke', source: 'external', enabled: true, description: 'package skill' },
+        { id: 'global-helper', name: 'Global Helper', source: 'global', enabled: true, description: 'global skill' }
+      ];
+      _renderSkillPickerList(document.getElementById('agent-picker-list'), '', 'new-chat-recipient-chip');
+    `, context);
+
+    const html = el('agent-picker-list').innerHTML;
+    expect(html).toContain('Trusted Skill');
+    expect(html).not.toContain('External Smoke');
+    expect(html).not.toContain('Global Helper');
   });
 });

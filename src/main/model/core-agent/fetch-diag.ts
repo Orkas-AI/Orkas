@@ -8,15 +8,21 @@
  *     UND_ERR_SOCKET, ECONNRESET, ENOTFOUND, …) is on `err.cause` / `err
  *     .cause.cause`.
  *   - pi-ai catches those errors internally, keeps only `error.message`,
- *     and retries up to 3 times. By the time the error reaches the host,
- *     the cause chain is long gone — so the `fetch failed` the user sees
- *     has no actionable signal.
+ *     and retries up to 3 times. By the time the error reaches Orkas, the
+ *     cause chain is long gone — so the `fetch failed` the user sees has
+ *     no actionable signal.
+ *
+ * When it runs:
+ *   - OrkasOpen installs it unconditionally so provider fetch failures surface
+ *     their real cause in both development and packaged builds.
  *
  * Scope:
- *   - Wraps `globalThis.fetch` once at boot, unconditionally.
+ *   - Wraps `globalThis.fetch` once.
  *   - Filters by URL so only LLM-provider traffic is logged — not
- *     arbitrary `web_fetch` or KB embedder downloads.
- *   - Output lands in `data/logs/YYYY-MM-DD.log`; grep for `fetch-diag`.
+ *     arbitrary `web_fetch`, KB embedder downloads, or telemetry pings.
+ *
+ * Usage:
+ *   grep "fetch-diag" data/logs/YYYY-MM-DD.log
  */
 import { createLogger } from '../../logger';
 
@@ -33,8 +39,8 @@ export function installFetchDiag(): void {
       typeof input === 'string' ? input :
       input?.url ? String(input.url) :
       String(input);
-    // Only watch provider traffic. Skip everything else so KB model
-    // downloads etc. don't flood the log.
+    // Only watch provider traffic. Skip everything else so dev-mode KB
+    // model downloads etc. don't flood the log.
     if (!PROVIDER_HOST_RE.test(url)) return original(input, init);
 
     const t0 = Date.now();

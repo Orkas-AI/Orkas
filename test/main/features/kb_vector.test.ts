@@ -44,6 +44,27 @@ function fakeVec(a: number, b = 0, c = 0): number[] {
   return v;
 }
 
+describe('vec_store › packaged sqlite-vec path', () => {
+  it('loads native extensions from app.asar.unpacked when available', async () => {
+    const vecStore = await import('../../../src/main/features/vec_store');
+    const raw = path.join(
+      tmpDir,
+      'resources',
+      'app.asar',
+      'node_modules',
+      'sqlite-vec',
+      'node_modules',
+      'sqlite-vec-windows-x64',
+      'vec0.dll',
+    );
+    const unpacked = raw.replace(`${path.sep}app.asar${path.sep}`, `${path.sep}app.asar.unpacked${path.sep}`);
+    fs.mkdirSync(path.dirname(unpacked), { recursive: true });
+    fs.writeFileSync(unpacked, '');
+
+    expect(vecStore._resolveSqliteVecLoadablePathForTests(raw)).toBe(unpacked);
+  });
+});
+
 describe('kb_vector › openKb / schema', () => {
   it('creates tables + config file on first open', async () => {
     const kb = await loadKb();

@@ -24,6 +24,7 @@ import {
   StderrTail,
   spawnCli,
   bindAbort,
+  armKillWatchdog,
 } from './base.js';
 
 export interface TextBackendDef {
@@ -48,7 +49,6 @@ export function makeTextBackend(def: TextBackendDef): LocalBackend {
       const startedAt = Date.now();
 
       let exited = false;
-      let timedOut = false;
       let outBody = '';
 
       opts.onEvent({
@@ -59,12 +59,11 @@ export function makeTextBackend(def: TextBackendDef): LocalBackend {
         args,
       });
 
-      const timer = setTimeout(() => {
-        timedOut = true;
-        try { child.kill('SIGTERM'); } catch { /* */ }
-        setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* */ } }, 10_000).unref();
-      }, opts.timeoutMs);
-      if (typeof timer.unref === 'function') timer.unref();
+      const watchdog = armKillWatchdog(child, {
+        timeoutMs: opts.timeoutMs,
+        idleKillMs: opts.idleKillMs,
+        lastEventAt: opts.lastEventAt,
+      });
 
       if (def.promptOnStdin) {
         // Write & close so the CLI knows there's no further input.
@@ -91,7 +90,7 @@ export function makeTextBackend(def: TextBackendDef): LocalBackend {
         const finish = (status: 'completed' | 'failed' | 'cancelled' | 'timeout', extra: Record<string, unknown> = {}) => {
           if (exited) return;
           exited = true;
-          clearTimeout(timer);
+          watchdog.disarm();
           detachAbort();
           opts.onEvent({
             type: 'done',
@@ -107,7 +106,7 @@ export function makeTextBackend(def: TextBackendDef): LocalBackend {
         });
         child.on('close', code => {
           if (opts.signal.aborted) return finish('cancelled', { output: outBody });
-          if (timedOut) return finish('timeout', { error: `cli exceeded ${opts.timeoutMs}ms`, output: outBody, stderrTail: tail.toString() });
+          if (watchdog.fired()) return finish('timeout', { error: `cli ${watchdog.reason()}`, output: outBody, stderrTail: tail.toString() });
           if (code === 0) return finish('completed', { output: outBody });
           finish('failed', {
             error: `cli exited with code ${code}`,

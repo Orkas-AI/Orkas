@@ -143,8 +143,74 @@ describe('auth › multi-profile store (addApiKey / removeCredential / renamePro
     const paths = await import('../../../src/main/paths');
     await a.addApiKey('openai', 'sk-local-secret-xxxxxxxx');
     const raw = fs.readFileSync(paths.userAuthProfilesFile(TEST_UID), 'utf8');
-    expect(raw).toMatch(/^T1JLVkFVTFQx/);
+    expect(raw).toMatch(/^ORKLSEC1:/);
     expect(raw).not.toContain('sk-local-secret-xxxxxxxx');
+  });
+
+  it('uses the account uid, not the local directory id, as the auth-profiles secret owner when logged in', async () => {
+    const accountUid = 'A0653F11-9F05-4A8B-89CE-0026D809EAFC';
+    const tokenStore = await import('../../../src/main/features/account/token_store');
+    tokenStore.setSession({ user_id: accountUid, session_id: 'session-1' });
+
+    const a = await import('../../../src/main/features/auth');
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    await a.addApiKey('openai', 'sk-account-owner-xxxxxxxx');
+
+    const raw = fs.readFileSync(paths.userAuthProfilesFile(TEST_UID), 'utf8');
+    expect(() => localSecrets.decryptLocalSecret({
+      namespace: 'auth.profiles',
+      ownerId: TEST_UID,
+      recordId: 'auth-profiles.json',
+    }, raw)).toThrow();
+    const json = localSecrets.decryptLocalSecret({
+      namespace: 'auth.profiles',
+      ownerId: accountUid,
+      recordId: 'auth-profiles.json',
+    }, raw);
+    expect(json).toContain('sk-account-owner-xxxxxxxx');
+  });
+
+  it('rewrites local-id-owned auth-profiles to the account uid on read', async () => {
+    const accountUid = 'A0653F11-9F05-4A8B-89CE-0026D809EAFC';
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, localSecrets.encryptLocalSecret({
+      namespace: 'auth.profiles',
+      ownerId: TEST_UID,
+      recordId: 'auth-profiles.json',
+    }, JSON.stringify({
+      version: 4,
+      profiles: {
+        'openai:default': {
+          type: 'api_key',
+          provider: 'openai',
+          label: 'default',
+          key: 'sk-local-owner-xxxxxxxx',
+          createdAt: 1,
+          lastUsed: 0,
+        },
+      },
+      entries: [],
+      searchProfiles: [],
+      imageProfiles: [],
+    })), 'utf8');
+
+    const tokenStore = await import('../../../src/main/features/account/token_store');
+    tokenStore.setSession({ user_id: accountUid, session_id: 'session-1' });
+    const a = await import('../../../src/main/features/auth');
+    const { providers } = await a.listProviders();
+    expect(providers.find((p) => p.id === 'openai')?.profiles[0]?.masked).toBe('sk-l…xxxx');
+
+    const raw = fs.readFileSync(file, 'utf8');
+    const json = localSecrets.decryptLocalSecret({
+      namespace: 'auth.profiles',
+      ownerId: accountUid,
+      recordId: 'auth-profiles.json',
+    }, raw);
+    expect(json).toContain('sk-local-owner-xxxxxxxx');
   });
 
   it('migrates legacy crypto-vault auth-profiles on read', async () => {
@@ -173,7 +239,7 @@ describe('auth › multi-profile store (addApiKey / removeCredential / renamePro
     const { providers } = await a.listProviders();
     expect(providers.find((p) => p.id === 'openai')?.profiles[0]?.masked).toBe('sk-l…xxxx');
     const raw = fs.readFileSync(file, 'utf8');
-    expect(raw).toMatch(/^T1JLVkFVTFQx/);
+    expect(raw).toMatch(/^ORKLSEC1:/);
     expect(raw).not.toContain('sk-legacy-xxxxxxxx');
   });
 

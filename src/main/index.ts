@@ -16,14 +16,13 @@
  *      The env var name is core-agent's public API — kept as
  *      `AUTH_DIR` for stability even though the dir now also holds
  *      `user.json` and `web-search-cache.json`.
- *   3. Require paths + features → triggers builtin skill content sync.
- *   4. Create BrowserWindow loading renderer/index.html.
- *   5. IPC handlers serve invoke + stream calls from the renderer.
+ *   3. Create BrowserWindow loading renderer/index.html.
+ *   4. IPC handlers serve invoke + stream calls from the renderer.
  *
  * File location: `PC/src/main/index.ts`. `bootstrap.cjs`'s
  * `require('./src/main')` resolves here automatically via Node's
  * folder → index resolution rule. `__dirname` points at `PC/src/main/`;
- * cross-tree references to renderer / builtin / resources go through
+ * cross-tree references to renderer / resources go through
  * `paths.SRC_ROOT` — never splice `__dirname` directly.
  */
 
@@ -36,19 +35,17 @@ import { app, BrowserWindow, Menu, ipcMain, nativeImage, protocol, session, shel
 // container, runs the one-shot PC/data → <container>/data migration, and
 // sets process.env.ORKAS_WORKSPACE_ROOT. Must be the FIRST project import
 // — any module loaded before this would not see the env var. See
-// install-data-root.cjs header for why the side effect lives at load time.
-import './install-data-root.cjs';
+// install-data-root.ts header for why the side effect lives at load time
+// rather than in index.ts body (esbuild CJS hoists imports → body runs
+// after paths.ts loads, which is too late to set the env var).
+import './install-data-root';
 
-// Force the user-visible app name to "Orkas" before anything else
-// reads it. In dev (running `electron .`) Electron defaults to the
-// `name` field in package.json (lowercase "orkas") or — when launched
-// without that being effective — to literally "Electron", which leaks
-// to the macOS Dock tooltip and the menu bar. Packaged builds set this
-// via electron-builder's `productName`; this call covers dev + any
-// edge case where productName isn't picked up early.
+const APP_USER_MODEL_ID = 'com.orkas.desktop';
+
+// OrkasOpen source and packaged builds share one app identity and one server
+// environment: global prod. This keeps local data paths and OS app grouping
+// stable across run modes.
 app.setName('Orkas');
-
-// OrkasOpen has exactly one server environment: global prod.
 
 // Register the KB file protocol BEFORE `app.whenReady()` — privileged
 // schemes can't be added after. `kb-file:///<relpath>` serves a single
@@ -88,7 +85,7 @@ protocol.registerSchemesAsPrivileged([
 
 import * as paths from './paths';
 import { parseByteRange } from './util/http-range';
-import { registerImmediate, registerDeferred, runBootPhases } from './util/boot_init';
+import { registerDeferred, runBootPhases } from './util/boot_init';
 
 // `CORE_AGENT_AUTH_DIR` is pinned per-uid by `features/users.activateUser()`
 // (runs inside `runBootSelfCheck` below). `resolveAuthDir()` in core-agent
@@ -108,9 +105,7 @@ const log = createLogger('orkas');
 
 // Replay any pin / migration warnings buffered by install-data-root
 // (which runs before logger.ts can be imported) into the daily log.
-const { flushEarlyDiagnostics } = require('./install-data-root.cjs') as {
-  flushEarlyDiagnostics: (sink: (message: string) => void) => void;
-};
+import { flushEarlyDiagnostics } from './install-data-root';
 {
   const installLog = createLogger('install-data-root');
   flushEarlyDiagnostics((m) => installLog.warn(m));
@@ -126,6 +121,8 @@ installSdkTimeoutPatch();
 import { installSseHeaderTimeoutPatch } from './model/core-agent/sse-header-timeout-patch';
 installSseHeaderTimeoutPatch();
 
+// Provider-fetch diagnostics: dump the real undici cause chain for model
+// endpoint failures.
 import { installFetchDiag } from './model/core-agent/fetch-diag';
 installFetchDiag();
 
@@ -142,14 +139,17 @@ import * as appConfig from './features/config';
 import { getRendererTables } from './i18n';
 import * as reflectionOrchestrator from './features/reflection-orchestrator';
 import * as autoTasks from './features/auto_tasks';
+import * as systemSkills from './features/system_skills';
 import * as chatAttachments from './features/chat_attachments';
 import * as chatArtifacts from './features/chat_artifacts';
 import * as savedApps from './features/saved_apps';
 import * as clientConfigFeature from './features/client_config';
 import * as connectorsFeature from './features/connectors';
 import * as windowState from './features/window_state';
-// Server-backed multi-device and remote-control features are stripped in OrkasOpen.
-// Connectors, including Google, remain available through the open server bridge.
+// Server-backed account, multi-device sync, remote-control relay, and
+// auto-update features are stripped in OrkasOpen. Connectors remain available
+// through the open server bridge.
+
 function createWindow(): BrowserWindow {
   const dev = !app.isPackaged;
   const restored = windowState.restoreWindowState();
@@ -238,13 +238,15 @@ function registerIpc(): void {
   ipcMain.handle('orkas.env', () => {
     return {
       ok: true,
-      isDev: false,
+      isDev: !app.isPackaged,
       isPackaged: app.isPackaged,
       version: app.getVersion(),
+      platform: process.platform,
+      arch: process.arch,
     };
   });
 
-  if (false) {
+  if (!app.isPackaged) {
     // The relaunch button shells out to run.sh / run.cmd instead of using
     // `app.relaunch()` so we can reuse `scripts/ensure-deps.cjs` for
     // dependency self-healing — otherwise pulling new code + relaunching
@@ -367,26 +369,15 @@ async function runBootSelfCheck(): Promise<void> {
     log.info('i18n language resolved', { lang });
   } catch (err) { log.warn('i18n init failed', { error: (err as Error).message }); }
 
-  // Stage 2: one-shot migration of any pre-marketplace `data/builtin/{agents,skills}/`
-  // tree into the active uid's cloud/. Idempotent via marker file; no-op on fresh
-  // installs. After this runs there is no more globally-shared builtin tree — every
-  // marketplace install lives at `<uid>/local/marketplace/` and gets reconciled from
-  // the cloud `installs.json` manifest.
-  try {
-    const { migrateLegacyBuiltinToCloud } = await import('./util/migrate-marketplace');
-    const out = await migrateLegacyBuiltinToCloud(users.getActiveUserId());
-    if (out.moved_agents || out.moved_skills) {
-      log.info('legacy builtin migrated', out);
-    }
-  } catch (err) {
-    log.warn('legacy builtin migrate failed', { error: (err as Error).message });
-  }
-
-  // Stage 3: clear stale processing=true conversations from a previous crash.
+  // Stage 2: clear stale processing=true conversations from a previous crash.
   try { await chatsFeature.sweepStaleProcessing(); }
   catch (err) { log.warn('chats sweep failed', { error: (err as Error).message }); }
 
-  // Stage 4: file_cache orphan sweep — cheap stat-based scan.
+}
+
+async function runBootMaintenanceSweeps(): Promise<void> {
+  // file_cache orphan sweep — stat-based maintenance, not needed before the
+  // first BrowserWindow exists.
   try {
     const uid = users.getActiveUserId();
     if (uid) {
@@ -396,10 +387,10 @@ async function runBootSelfCheck(): Promise<void> {
     }
   } catch (err) { log.warn('file_cache sweep failed', { error: (err as Error).message }); }
 
-  // Stage 5: workspace empty-subdir sweep — clean up legacy per-conv slug
-  // dirs that were materialised by bash's defensive mkdir on a turn that
-  // produced nothing. Boot-time is the safe moment: no in-flight bash
-  // process is holding cwd open. Top-level scan only.
+  // Workspace empty-subdir sweep — clean up legacy per-conv slug dirs that
+  // were materialised by bash's defensive mkdir on a turn that produced
+  // nothing. Deferred boot is still safe: no in-flight bash process exists
+  // this early in the app lifetime. Top-level scan only.
   try {
     const uid = users.getActiveUserId();
     if (uid) {
@@ -756,28 +747,16 @@ if (!gotLock) {
 } else {
   app.whenReady().then(async () => {
     await runBootSelfCheck();
-    // Dev-mode dock icon: packaged macOS picks up .icns from Info.plist,
-    // but dev runs the bundled Electron.app's own Info.plist — we must
-    // setIcon at runtime to see our logo. The Windows taskbar reads
-    // BrowserWindow.icon directly so this branch isn't needed there
-    // (same on Linux).
+    // Source-run macOS uses Electron.app's own Info.plist, so set the dock
+    // icon at runtime. Packaged builds still pick up the configured icns.
     if (process.platform === 'darwin' && app.dock) {
       const iconPath = path.join(paths.SRC_ROOT, 'resources', 'icons', 'icon.png');
       const img = nativeImage.createFromPath(iconPath);
       if (!img.isEmpty()) app.dock.setIcon(img);
     }
-    // Windows taskbar: by default the Electron dev process inherits
-    // electron.exe's AppUserModelID, and the taskbar uses that ID to look
-    // up the icon → it ends up showing the default Electron logo. Setting
-    // our own ID here makes Windows fall back to BrowserWindow.icon.
-    // Packaged NSIS writes the same ID.
     if (process.platform === 'win32') {
-      app.setAppUserModelId('com.orkas.desktop');
+      app.setAppUserModelId(APP_USER_MODEL_ID);
     }
-    // Strip the default Electron menu. On macOS we still need a minimal
-    // menu bar so native shortcuts (Cmd+C/V/Q/A, Hide, Services, …) keep
-    // working — keep only `appMenu` + `editMenu`. On Win/Linux just pass
-    // null, which removes the in-window menu bar entirely.
     if (process.platform === 'darwin') {
       Menu.setApplicationMenu(Menu.buildFromTemplate([
         { role: 'appMenu' },
@@ -789,8 +768,8 @@ if (!gotLock) {
     registerKbFileProtocol();
     registerChatMediaProtocol();
     registerChatAppProtocol();
-    // Renderer permission gate (identical in dev and packaged). Clipboard:
-    // copy-to-clipboard UI actions. Everything else is denied.
+    // Renderer permission gate. Voice input is stripped from OrkasOpen, so media
+    // capture is denied; clipboard permissions are kept for copy/paste flows.
     session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
       callback(permission === 'clipboard-read' || permission === 'clipboard-sanitized-write');
     });
@@ -798,14 +777,25 @@ if (!gotLock) {
     clientConfigFeature.clientConfig.subscribeAll((keys) => {
       ipc.broadcastToRenderer('client-config:changed', { keys });
     });
-    clientConfigFeature.start();
-    connectorsFeature.bootstrap(users.getActiveUserId()).catch(() => { /* logged inside feature */ });
+    const CLIENT_CONFIG_STARTUP_DELAY_MS = 8_000;
+    const CONNECTORS_BOOTSTRAP_DELAY_MS = 5_000;
+    const BOOT_BACKGROUND_DEFER_MS = 6_000;
+    clientConfigFeature.start({
+      startupDelayMs: CLIENT_CONFIG_STARTUP_DELAY_MS,
+      forceStartupRefresh: false,
+    });
+    const connectorsTimer = setTimeout(() => {
+      connectorsFeature.bootstrap(users.getActiveUserId()).catch(() => {
+        /* errors logged inside the feature; never block app startup */
+      });
+    }, CONNECTORS_BOOTSTRAP_DELAY_MS);
+    connectorsTimer.unref?.();
     createWindow();
 
     // Boot tasks declared via util/boot_init.ts. Two phases × two modes:
     //
     //   registerImmediate(name, fn[, 'serial'])  → runs now, parallel by default
-    //   registerDeferred(name, fn[, 'serial'])   → runs ~3s after immediate phase completes
+    //   registerDeferred(name, fn[, 'serial'])   → runs after BOOT_BACKGROUND_DEFER_MS
     //
     // The runner swallows per-task errors (logged at warn) so one bad
     // module can't keep the rest of boot from progressing. Slow tasks
@@ -814,64 +804,35 @@ if (!gotLock) {
     // Replaces the pre-existing `setImmediate(...)` / `setTimeout(...)` /
     // `import().then()` / async-IIFE soup that had grown around here.
 
-    registerImmediate('search:reconcile', () => searchFeature.reconcileAll());
-    registerImmediate('auth:warmup', () => authFeature.warmup());
-    registerImmediate('kb:reconcile', async () => {
+    registerDeferred('auth:warmup', () => authFeature.warmup());
+    registerDeferred('boot:maintenance-sweeps', () => runBootMaintenanceSweeps());
+    registerDeferred('search:reconcile', () => searchFeature.reconcileAll());
+    registerDeferred('kb:reconcile', async () => {
       // Picks up files dropped into contexts/ via Finder while the app was
       // off + any divergence from a just-synced vector.db. UI gets live
       // updates through the `kb.events` stream as files transition status.
       const { reconcile } = await import('./features/kb_indexer');
       await reconcile(users.getActiveUserId());
     });
-    registerImmediate('marketplace:prime-cache', async () => {
-      // Primes the category cache so first openMarketplace doesn't pay
-      // the round-trip on cold start. Lazy path in features/marketplace_biz.ts
-      // is the real safety net.
+    registerDeferred('marketplace:prime-cache', async () => {
+      // Primes the in-memory category cache from disk/fallback only; the lazy
+      // path in features/marketplace_biz.ts refreshes from Server when needed.
       const m = await import('./features/marketplace_biz');
-      await m.primeCategoryCache();
-    });
-    registerImmediate('marketplace:seed+reconcile', async () => {
-      // Step 1: seed the default installs manifest on first launch.
-      // Step 2: reconcile downloads any manifest rows whose local content
-      // is missing. Step 1 populates what step 2 consumes; ordered.
-      // Reconcile status broadcasts to renderers via IPC so the
-      // marketplace panel can show a "syncing" banner (broadcast wiring
-      // stays here so `features/` doesn't import `ipc/`).
-      try {
-        const mp = await import('./features/marketplace');
-        const seeded = await mp.ensureDefaultInstalls(users.getActiveUserId());
-        if (seeded.seeded_agents || seeded.seeded_skills) {
-          createLogger('marketplace_defaults').info('seeded default installs', seeded);
-        }
-      } catch (err) {
-        createLogger('marketplace_defaults').warn('default installs seed failed', {
-          error: (err as Error).message,
-        });
-      }
-      const m = await import('./features/marketplace_reconcile');
-      m.subscribeReconcileStatus((status) => {
-        ipc.broadcastToRenderer('marketplace:reconcile-status', status);
-      });
-      // Server-side update sweep first so the manifest leads the per-machine
-      // `_install.json` for items the admin has republished — reconcile then
-      // picks up the mismatch and re-pulls the new blob. Network failures here
-      // are swallowed by the helper itself; reconcile still runs against the
-      // stale manifest.
-      await m.checkServerUpdatesForInstalls(users.getActiveUserId());
-      await m.reconcileInstalls(users.getActiveUserId());
+      await m.primeCategoryCache({ localOnly: true });
     });
 
-    // Deferred (~3s after immediate). Per-agent metacognitive reflection
-    // (single 12h-chained loop; the delay just stops the first cycle from
-    // racing first paint — the loop self-schedules thereafter) and the
-    // auto-tasks per-task setTimeout scheduler bootstrap.
+    // Deferred after the renderer has had a few seconds to paint. Per-agent
+    // metacognitive reflection (single 12h-chained loop; the delay just stops
+    // the first cycle from racing first paint) and the auto-tasks per-task
+    // setTimeout scheduler bootstrap.
     registerDeferred('reflection:loop', () => {
       reflectionOrchestrator.startReflectionLoop(users.getActiveUserId());
     });
+    registerDeferred('system-skills:reconcile', () => systemSkills.reconcileAllForActiveUserWithRetry({ retries: 2, reason: 'startup' }));
     registerDeferred('auto-tasks:scheduler', () => autoTasks.startScheduler());
 
     // Drive the immediate batch + schedule the deferred one.
-    void runBootPhases();
+    void runBootPhases(BOOT_BACKGROUND_DEFER_MS);
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();

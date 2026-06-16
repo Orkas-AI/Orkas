@@ -34,6 +34,7 @@ import {
   StderrTail,
   spawnCli,
   bindAbort,
+  armKillWatchdog,
   LineSplitter,
 } from './base.js';
 
@@ -58,13 +59,13 @@ const TRUSTED_LOCAL_SANDBOX_POLICY = { type: 'dangerFullAccess' } as const;
 export const codexBackend: LocalBackend = {
   async run(opts: BackendRunOptions): Promise<void> {
     const args = buildCodexArgs(opts);
-    const child = spawnCli(opts.binPath, args, opts.cwd);
+    const childEnv = opts.bridge?.server.env ? { ...process.env, ...opts.bridge.server.env } : process.env;
+    const child = spawnCli(opts.binPath, args, opts.cwd, childEnv);
     const detachAbort = bindAbort(child, opts.signal);
     const tail = new StderrTail();
     const startedAt = Date.now();
 
     let exited = false;
-    let timedOut = false;
     let resolveOuter!: () => void;
     const outerPromise = new Promise<void>(resolve => { resolveOuter = resolve; });
 
@@ -76,12 +77,11 @@ export const codexBackend: LocalBackend = {
       args,
     });
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      try { child.kill('SIGTERM'); } catch { /* */ }
-      setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* */ } }, 10_000).unref();
-    }, opts.timeoutMs);
-    if (typeof timer.unref === 'function') timer.unref();
+    const watchdog = armKillWatchdog(child, {
+      timeoutMs: opts.timeoutMs,
+      idleKillMs: opts.idleKillMs,
+      lastEventAt: opts.lastEventAt,
+    });
 
     // ─── JSON-RPC client state ────────────────────────────────────────
     let nextRpcId = 1;
@@ -391,7 +391,7 @@ export const codexBackend: LocalBackend = {
     function finish(status: 'completed' | 'failed' | 'cancelled' | 'timeout', extra: Record<string, unknown> = {}) {
       if (exited) return;
       exited = true;
-      clearTimeout(timer);
+      watchdog.disarm();
       detachAbort();
       closePending(new Error('codex shutting down'));
       opts.onEvent({
@@ -410,7 +410,7 @@ export const codexBackend: LocalBackend = {
     });
     child.on('close', code => {
       if (opts.signal.aborted) return finish('cancelled', { output: collectedText });
-      if (timedOut) return finish('timeout', { error: `cli exceeded ${opts.timeoutMs}ms`, output: collectedText, stderrTail: tail.toString() });
+      if (watchdog.fired()) return finish('timeout', { error: `cli ${watchdog.reason()}`, output: collectedText, stderrTail: tail.toString() });
       if (turnAborted) return finish('cancelled', { output: collectedText });
       if (turnError) return finish('failed', { error: turnError, output: collectedText, stderrTail: tail.toString() });
       if (code === 0 && (turnCompleted || collectedText)) {
@@ -455,6 +455,7 @@ export const codexBackend: LocalBackend = {
     })();
 
     async function startOrResumeThread(o: BackendRunOptions): Promise<string | undefined> {
+      const developerInstructions = codexDeveloperInstructions(o);
       if (o.resumeSessionId) {
         try {
           const r = await rpc('thread/resume', {
@@ -462,7 +463,7 @@ export const codexBackend: LocalBackend = {
             cwd: o.cwd,
             model: o.model || null,
             ...buildCodexThreadPermissionOverrides(),
-            developerInstructions: null,
+            developerInstructions,
           });
           const tid = extractThreadId(r);
           if (tid) return tid;
@@ -479,7 +480,7 @@ export const codexBackend: LocalBackend = {
         ...buildCodexThreadPermissionOverrides(),
         config: null,
         baseInstructions: null,
-        developerInstructions: null,
+        developerInstructions,
         compactPrompt: null,
         includeApplyPatchTool: null,
         experimentalRawEvents: false,
@@ -492,12 +493,60 @@ export const codexBackend: LocalBackend = {
   },
 };
 
+/**
+ * orkas-bridge context for codex (plan §D3): the prompt that tells the
+ * agent it runs inside Orkas and which `orkas` MCP tools exist. Passed as
+ * codex's `developerInstructions` — the protocol-level slot for this —
+ * preferred over writing an AGENTS.md into cwd (no file pollution, no
+ * cleanup-on-crash, never clobbers the user's own AGENTS.md). The bridge
+ * config injection (`-c mcp_servers.orkas.*`) already connects the server;
+ * this makes the agent reach for it. Returns null when no bridge is live.
+ * Exported for tests.
+ */
+export function codexDeveloperInstructions(opts: BackendRunOptions): string | null {
+  return opts.bridge?.appendSystemPrompt || null;
+}
+
 function buildCodexArgs(opts: BackendRunOptions): string[] {
   // Per multica: `codex app-server --listen stdio://` is the entry
   // point for the JSON-RPC protocol. customArgs trail.
   const args = ['app-server', '--listen', 'stdio://'];
+  // orkas-bridge: codex takes config-layer overrides (`-c key=value`,
+  // TOML-parsed) instead of a config file. Codex spawns stdio MCP servers
+  // with a sanitized env (PATH/HOME only) — it does NOT inherit this Codex
+  // process's env — so the non-secret bridge env must be injected via `-c
+  // mcp_servers.orkas.env.*`. The token/socket are NOT here; they live in
+  // the 0600 file that ORKAS_BRIDGE_ENV_FILE points at, so they never hit argv.
+  if (opts.bridge) args.push(...buildCodexBridgeOverrides(opts.bridge.server));
   if (opts.customArgs && opts.customArgs.length) args.push(...opts.customArgs);
   return args;
+}
+
+/** Secret-bearing bridge env keys that must never be serialized into argv.
+ *  They reach orkas-bridge.cjs through the 0600 file referenced by
+ *  ORKAS_BRIDGE_ENV_FILE, which IS injected (it is just a path). */
+const CODEX_BRIDGE_SECRET_ENV_KEYS = new Set(['ORKAS_BRIDGE_TOKEN', 'ORKAS_BRIDGE_SOCKET']);
+
+/** `-c mcp_servers.orkas.*` override args from the bridge server entry.
+ *  Values are TOML: strings quoted, args as an inline array. The non-secret
+ *  env is injected as `mcp_servers.orkas.env.<KEY>` because Codex spawns MCP
+ *  servers with a sanitized env and does NOT inherit this process's env —
+ *  without it orkas-bridge.cjs exits "env required" and the agent gets no
+ *  orkas_* tools (skills/connectors/KB). Token/socket are filtered out so
+ *  they never land in argv/events.
+ *  Exported for tests. */
+export function buildCodexBridgeOverrides(server: { command: string; args: string[]; env?: Record<string, string> }): string[] {
+  const tomlStr = (s: string) => `"${String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  const argsToml = `[${server.args.map(tomlStr).join(', ')}]`;
+  const overrides = [
+    '-c', `mcp_servers.orkas.command=${tomlStr(server.command)}`,
+    '-c', `mcp_servers.orkas.args=${argsToml}`,
+  ];
+  for (const [key, value] of Object.entries(server.env || {})) {
+    if (value == null || CODEX_BRIDGE_SECRET_ENV_KEYS.has(key)) continue;
+    overrides.push('-c', `mcp_servers.orkas.env.${key}=${tomlStr(value)}`);
+  }
+  return overrides;
 }
 
 export function buildCodexThreadPermissionOverrides(): { approvalPolicy: string; sandbox: string } {

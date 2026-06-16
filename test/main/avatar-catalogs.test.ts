@@ -5,7 +5,21 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(here, '../..');
+const repoRoot = path.resolve(here, '../../..');
+
+const catalogs = [
+  ['PC', 'PC/src/main/data/avatars.json'],
+  ['iOS', 'iOS/webui/data/avatars.json'],
+  ['Web', 'Web/res/data/avatars.json'],
+] as const;
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify((value as Record<string, unknown>)[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
 
 function validateCatalog(label: string, relPath: string, catalog: any): void {
   expect(catalog && typeof catalog, `${label} must be an object: ${relPath}`).toBe('object');
@@ -38,9 +52,20 @@ function validateCatalog(label: string, relPath: string, catalog: any): void {
 }
 
 describe('avatar catalogs', () => {
-  it('validates the OrkasOpen avatar resource catalog', () => {
-    const relPath = 'src/main/data/avatars.json';
-    const catalog = JSON.parse(fs.readFileSync(path.join(repoRoot, relPath), 'utf8'));
-    validateCatalog('OrkasOpen', relPath, catalog);
+  it('keeps PC, iOS, and Web avatar resources consistent', () => {
+    const rows = catalogs.map(([label, relPath]) => {
+      const catalog = JSON.parse(fs.readFileSync(path.join(repoRoot, relPath), 'utf8'));
+      validateCatalog(label, relPath, catalog);
+      return { label, relPath, normalized: stableStringify(catalog) };
+    });
+
+    const first = rows[0];
+    for (const row of rows.slice(1)) {
+      expect(
+        row.normalized,
+        `${row.label} (${row.relPath}) differs from ${first.label} (${first.relPath})`,
+      ).toBe(first.normalized);
+    }
+    expect(first.normalized.length).toBeGreaterThan(0);
   });
 });

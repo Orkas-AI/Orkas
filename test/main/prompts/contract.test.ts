@@ -175,6 +175,22 @@ describe('prompts ↔ code contract', () => {
     expect(commanderPrompt).toContain('skill-creator');
   });
 
+  it('skill edit prompt completes imported-file skills without proactive clarification', () => {
+    const skillPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_skill_setup.md'), 'utf-8');
+
+    expect(skillPrompt).toContain('treat those files as source material and complete the skill from them directly');
+    expect(skillPrompt).toContain('Make the first emitted source skill become this current draft skill');
+    expect(skillPrompt).toContain('If imported docs, references, scripts, or examples are present, inspect them and write the best skill you can without asking for confirmation');
+  });
+
+  it('commander prompt routes automation CRUD through autotask-creator', () => {
+    const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
+
+    expect(commanderPrompt).toContain('autotask-creator');
+    expect(commanderPrompt).toContain('<auto-task>');
+    expect(commanderPrompt).toContain('auto_tasks_list');
+  });
+
   it('commander prompt requires serial plans', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
 
@@ -188,8 +204,11 @@ describe('prompts ↔ code contract', () => {
 
     expect(commanderPrompt).toMatch(/required inputs, files, context, or user decisions/i);
     expect(commanderPrompt).toMatch(/does not prove the next step has everything needed/i);
-    expect(commanderPrompt).toMatch(/put this in the step `input`/i);
+    expect(commanderPrompt).toMatch(/In the step `input`, remind it/i);
+    expect(commanderPrompt).toMatch(/agent owns the final information-sufficiency check/i);
+    expect(commanderPrompt).toMatch(/<agent-input-form>/i);
     expect(commanderPrompt).toContain('<plan-interaction status="open" />');
+    expect(commanderPrompt).toMatch(/Missing information must become form fields/i);
     expect(commanderPrompt).toMatch(/do NOT let downstream analysis\/synthesis run on generic assumptions/i);
     expect(commanderPrompt).toMatch(/Interactive specialist/i);
   });
@@ -213,6 +232,9 @@ describe('prompts ↔ code contract', () => {
     expect(agentPrompt).toMatch(/do not fill gaps with generic assumptions/i);
     expect(agentPrompt).toMatch(/smallest useful missing set/i);
     expect(agentPrompt).toMatch(/<agent-input-form>/i);
+    expect(agentPrompt).toMatch(/fixed execution rule for every inbound task/i);
+    expect(agentPrompt).toMatch(/does not depend on the commander mentioning missing information/i);
+    expect(agentPrompt).toMatch(/Do not replace a form with a "need these details" section/i);
     expect(agentPrompt).toMatch(/quick assumption-based answer/i);
   });
 
@@ -228,15 +250,29 @@ describe('prompts ↔ code contract', () => {
     expect(cliSetupPrompt).toMatch(/one task field plus one optional context field/i);
   });
 
-  it('runtime datetime context is appended after language directives', () => {
+  it('runtime datetime context is appended to group chat system prompts', () => {
     const bus = readFile('src/main/features/group_chat/bus.ts');
+    const runner = readFile('src/main/model/core-agent/runner.ts');
     const agents = readFile('src/main/features/agents.ts');
     const skills = readFile('src/main/features/skills.ts');
     const cliPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_cli_agent.md'), 'utf-8');
 
-    expect(bus).toMatch(/buildLanguageDirective\(\)\}\\n\\n---\\n\\n\$\{buildRuntimeDatetimeBlock\(\)\}/);
-    expect(agents).toMatch(/buildLanguageDirective\(\)[\s\S]+buildRuntimeDatetimeBlock\(\)/);
-    expect(skills).toMatch(/buildLanguageDirective\(\)[\s\S]+buildRuntimeDatetimeBlock\(\)/);
+    expect(bus).toContain("const marker = '## Runtime injection';");
+    expect(bus).toMatch(/prompt\.slice\(0, idx\)[\s\S]+\$\{language\}[\s\S]+prompt\.slice\(idx\)/);
+    expect(bus).not.toContain('<runtime-context');
+    expect(runner).toContain('splitVolatilePromptTail');
+    expect(runner).toContain('splitRuntimeInjectionBlock');
+    expect(runner).toContain('## Current date');
+    expect(runner).not.toContain("## User language\\n'");
+    expect(runner).toContain('splitCommanderAgentsBlock');
+    expect(runner).toContain('splitCommanderPlanStateBlock');
+    expect(runner).toMatch(/if \(connectorBlock\) parts\.push\(connectorBlock\.trim\(\)\);\s+if \(systemSkillsBlock\) parts\.push\(systemSkillsBlock\.trim\(\)\);\s+if \(skillsBlock\) parts\.push\(skillsBlock\.trim\(\)\);\s+if \(agentsBlock\) parts\.push\(agentsBlock\);/);
+    expect(runner).toMatch(/if \(agentsBlock\) parts\.push\(agentsBlock\);\s+if \(runtimeInjectionBlock\) parts\.push\(runtimeInjectionBlock\);/);
+    expect(runner).toMatch(/if \(memoryBlock\) parts\.push\(memoryBlock\);\s+if \(planStateBlock\) parts\.push\(planStateBlock\);\s+if \(volatileTail\) parts\.push\(volatileTail\);/);
+    expect(agents).toMatch(/buildLanguageDirective\([^)]*\)[\s\S]+buildRuntimeDatetimeBlock\(\)/);
+    expect(skills).toMatch(/buildLanguageDirective\([^)]*\)[\s\S]+buildRuntimeDatetimeBlock\(\)/);
+    expect(bus).toMatch(/language_block:\s*buildLanguageDirective\(getLanguage\(\)\)/);
+    expect(cliPrompt).toContain('$language_block');
     expect(cliPrompt).toMatch(/\$task_body\n\n\$runtime_datetime_block\s*$/);
   });
 });

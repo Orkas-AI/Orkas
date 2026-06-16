@@ -2,7 +2,16 @@
  * One-shot migration: relocate the connectors registry from `<uid>/local/config/connectors.json`
  * to `<uid>/cloud/config/connectors.json`.
  *
- * OrkasOpen keeps connector credentials local, so this migration always skips.
+ * Historical PC-only migration. OrkasOpen has no account-backed connector
+ * sync, so this function always defers and leaves existing local connector
+ * files in place.
+ *
+ * Failure modes:
+ *   - legacy whole-file encrypted local files are no longer migrated; leave the local file
+ *     alone, log, return false. User reconnects when they hit a connector card.
+ *   - write of current-format plaintext envelope fails → leave both, the next launch retries.
+ *   - both succeed → unlink the old file. The cloud file is now authoritative.
+ *
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';

@@ -106,6 +106,7 @@ describe('chats › setConversationPinned', () => {
 
     const pinned = await chats.setConversationPinned(TEST_UID, older.conversation_id, true);
     expect(pinned?.pinned_at).toBeTruthy();
+    expect(pinned?.pin_state_updated_at).toBeTruthy();
     expect(pinned?.updated_at).toBe(before?.updated_at);
 
     const listed = await chats.listConversations(TEST_UID);
@@ -126,6 +127,11 @@ describe('chats › setConversationPinned', () => {
     const idx = JSON.parse(fs.readFileSync(
       path.join(tmpDir, TEST_UID, 'cloud', 'chats', '_index.json'), 'utf-8'));
     expect(idx[0].pinned_at).toBeUndefined();
+    expect(idx[0].pin_state_updated_at).toBeTruthy();
+    const meta = JSON.parse(fs.readFileSync(
+      path.join(tmpDir, TEST_UID, 'cloud', 'chats', conv.conversation_id, 'meta.json'), 'utf-8'));
+    expect(meta.pinned_at).toBeUndefined();
+    expect(meta.pin_state_updated_at).toBeTruthy();
   });
 });
 
@@ -209,6 +215,45 @@ describe('chats › index repair', () => {
     expect(repaired?.title).toBe('项目任务');
     expect(repaired?.project_id).toBe('p_project1');
     expect(repaired?.session_id).toBe(`gconv-${cid}`);
+  });
+
+  it('does not let stale per-conversation meta resurrect an index-level unpin', async () => {
+    const cid = 'abc123def456';
+    const chatsDir = path.join(tmpDir, TEST_UID, 'cloud', 'chats');
+    fs.mkdirSync(path.join(chatsDir, cid), { recursive: true });
+    fs.writeFileSync(path.join(chatsDir, `${cid}.jsonl`), '');
+    fs.writeFileSync(path.join(chatsDir, '_index.json'), JSON.stringify([
+      {
+        conversation_id: cid,
+        title: 'synced task',
+        kind: 'normal',
+        agent_id: '',
+        skill_id: '',
+        session_id: `gconv-${cid}`,
+        created_at: '2026-06-10T01:00:00.000Z',
+        updated_at: '2026-06-10T01:00:00.000Z',
+        _sync_rev: 4,
+        _sync_device_id: 'device-remote',
+      },
+    ], null, 2));
+    fs.writeFileSync(path.join(chatsDir, cid, 'meta.json'), JSON.stringify({
+      conversation_id: cid,
+      title: 'synced task',
+      kind: 'normal',
+      agent_id: '',
+      skill_id: '',
+      session_id: `gconv-${cid}`,
+      pinned_at: '2026-06-09T23:00:00.000Z',
+      created_at: '2026-06-10T01:00:00.000Z',
+      updated_at: '2026-06-10T01:00:00.000Z',
+    }, null, 2));
+
+    const chats = await loadChats();
+    const listed = await chats.listConversations(TEST_UID);
+
+    expect(listed).toHaveLength(1);
+    expect(listed[0].conversation_id).toBe(cid);
+    expect(listed[0].pinned_at).toBeUndefined();
   });
 
   it('recovers a synced top-level jsonl that is missing from _index.json', async () => {

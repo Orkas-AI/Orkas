@@ -15,6 +15,7 @@ const _guardLog = createLogger('model-guard');
 let _hasConfiguredModel = true;   // optimistic — flipped to false after refresh if empty
 let _guardBannerEl = null;
 let _guardChecked = false;
+let _modelConfigSnapshotSignature = '';
 
 function _ensureGuardBanner() {
   if (_guardBannerEl) return _guardBannerEl;
@@ -70,6 +71,7 @@ async function refreshModelGuard() {
     if (res && res.ok) {
       _hasConfiguredModel = !!res.configured;
       _guardChecked = true;
+      await refreshModelConfigSnapshot();
     } else {
       _guardLog.warn('refresh ipc not-ok', { error: res && res.error });
     }
@@ -79,6 +81,19 @@ async function refreshModelGuard() {
   _applyGuardVisuals();
   return _hasConfiguredModel;
 }
+
+async function refreshModelConfigSnapshot() {
+  try {
+    const res = await window.orkas.invoke('auth.listEntries');
+    if (res && res.ok && Array.isArray(res.entries)) {
+      trackModelConfigSnapshot(res.entries);
+    }
+  } catch (err) {
+    _guardLog.warn('model config snapshot refresh failed', { error: (err && err.message) || String(err) });
+  }
+}
+
+function trackModelConfigSnapshot() {}
 
 function isModelConfigured() {
   return _hasConfiguredModel;

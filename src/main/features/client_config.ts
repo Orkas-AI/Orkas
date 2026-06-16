@@ -6,14 +6,12 @@
  * views such as the provider model catalog.
  */
 
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-
 import { getActiveUserId, hasActiveUser } from './users';
 import { userRemoteConfigFile } from '../paths';
 import { readJsonSync, writeJsonSync } from '../storage';
 import { createLogger } from '../logger';
 import { getCurrentDevice } from '../util/device';
+import { fetchWithRetry } from '../util/retry';
 
 export type ClientConfigEffect = 'immediate' | 'restart';
 
@@ -55,6 +53,11 @@ let started = false;
 let inFlight: Promise<ConfigRefreshResult> | null = null;
 let runtimeApp: ElectronAppLike | null = null;
 let runtimePowerMonitor: ElectronPowerMonitorLike | null = null;
+
+export interface ClientConfigStartOptions {
+  startupDelayMs?: number;
+  forceStartupRefresh?: boolean;
+}
 
 export interface RemoteConfigCache {
   version: 1;
@@ -428,7 +431,7 @@ export async function refresh(
       const { app } = runtimeApp ? { app: runtimeApp } : await loadElectronRuntime();
       const headers: Record<string, string> = {};
       if (current.etag) headers['If-None-Match'] = current.etag;
-      const res = await fetch(buildUrl(app), { method: 'GET', headers });
+      const res = await fetchWithRetry('client-config:refresh', buildUrl(app), { method: 'GET', headers });
       const etag = res.headers.get('etag') || '';
       if (res.status === 304) {
         clientConfig.markNotModified(etag || current.etag || '');
@@ -454,9 +457,11 @@ function onReturnToApp(): void {
   void refresh('return');
 }
 
-export function start(): void {
+export function start(opts: ClientConfigStartOptions = {}): void {
   if (started) return;
   started = true;
+  const startupDelayMs = Number.isFinite(opts.startupDelayMs) ? Math.max(0, Number(opts.startupDelayMs)) : 0;
+  const forceStartupRefresh = opts.forceStartupRefresh !== false;
   void loadElectronRuntime().then(({ app, powerMonitor }) => {
     runtimeApp = app;
     runtimePowerMonitor = powerMonitor;
@@ -467,7 +472,13 @@ export function start(): void {
     } catch (err) {
       log.warn('promote pending restart config failed', { error: (err as Error).message });
     }
-    setImmediate(() => { void refresh('startup'); });
+    const runStartupRefresh = (): void => { void refresh('startup', { force: forceStartupRefresh }); };
+    if (startupDelayMs > 0) {
+      const timer = setTimeout(runStartupRefresh, startupDelayMs);
+      timer.unref?.();
+    } else {
+      setImmediate(runStartupRefresh);
+    }
     app.on('browser-window-focus', onReturnToApp);
     app.on('activate', onReturnToApp);
     powerMonitor.on('resume', onReturnToApp);
@@ -508,6 +519,10 @@ export type ConnectorSwitchState = 'enabled' | 'disabled' | 'visible_disabled';
 export interface GoogleConnectorsConfig {
   google: ConnectorSwitchState;
   gmail: ConnectorSwitchState;
+}
+
+export interface AppUpdatePolicyConfig {
+  min_version: string;
 }
 
 interface ModelCatalogConfig {
@@ -701,6 +716,22 @@ function mergeGoogleConnectorsConfig(baseRaw: unknown, overrideRaw: unknown): Go
   };
 }
 
+function normalizeAppUpdatePolicyConfig(raw: unknown): Partial<AppUpdatePolicyConfig> {
+  if (typeof raw === 'string') return { min_version: raw.trim() };
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const r = raw as Record<string, unknown>;
+  const min = r.min_version ?? r.minimum_version ?? r.minimumVersion ?? r.minVersion;
+  return typeof min === 'string' ? { min_version: min.trim() } : {};
+}
+
+function mergeAppUpdatePolicyConfig(baseRaw: unknown, overrideRaw: unknown): AppUpdatePolicyConfig {
+  const base = normalizeAppUpdatePolicyConfig(baseRaw);
+  const override = normalizeAppUpdatePolicyConfig(overrideRaw);
+  return {
+    min_version: override.min_version ?? base.min_version ?? '',
+  };
+}
+
 function mergeModelCatalogConfig(baseRaw: unknown, overrideRaw: unknown): ModelCatalogConfig {
   const base = normalizeModelCatalogConfig(baseRaw);
   const override = normalizeModelCatalogConfig(overrideRaw);
@@ -740,6 +771,15 @@ clientConfig.registerDefault<boolean>('model.deepseek.enabled', true, {
   effect: 'immediate',
 });
 
+clientConfig.registerDefault<AppUpdatePolicyConfig>('app_update', { min_version: '' }, {
+  effect: 'immediate',
+  merge: mergeAppUpdatePolicyConfig,
+});
+
+clientConfig.registerDefault<string>('app_update.min_version', '', {
+  effect: 'immediate',
+});
+
 function loadModelCatalog(): ModelCatalogConfig {
   return normalizeModelCatalogConfig(clientConfig.get('model_catalog', DEFAULT_MODEL_CATALOG));
 }
@@ -770,4 +810,14 @@ export function getGoogleConnectorsConfig(): GoogleConnectorsConfig {
 
 export function isDeepSeekModelConfigEnabled(): boolean {
   return clientConfig.get<boolean>('model.deepseek.enabled', true) !== false;
+}
+
+export function getMinimumAppVersion(): string {
+  const direct = clientConfig.get<string>('app_update.min_version', '');
+  if (typeof direct === 'string' && direct.trim()) return direct.trim();
+  const policy = mergeAppUpdatePolicyConfig(
+    { min_version: '' },
+    clientConfig.get('app_update', { min_version: '' }),
+  );
+  return policy.min_version.trim();
 }

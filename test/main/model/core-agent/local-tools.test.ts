@@ -43,6 +43,24 @@ async function buildEditTool(opts: { onFileWritten?: (p: string) => void; extraR
   return { edit, wsDir };
 }
 
+async function buildWriteTool(opts: { onFileWritten?: (p: string) => void; extraRoots?: string[] } = {}) {
+  const localTools = await import('../../../../src/main/model/core-agent/local-tools');
+  const ws = await import('../../../../src/main/features/user_workspace');
+  const wsDir = path.join(tmpDir, 'ws');
+  fs.mkdirSync(wsDir, { recursive: true });
+  const r = ws.setWorkspacePath(UID, wsDir);
+  if (!r.ok) throw new Error(`setWorkspacePath failed: ${r.error}`);
+  const tools = localTools.createLocalTools({
+    userId: UID,
+    cid: CID,
+    ...(opts.onFileWritten ? { onFileWritten: opts.onFileWritten } : {}),
+    ...(opts.extraRoots ? { extraRoots: opts.extraRoots } : {}),
+  });
+  const write = tools.find((t) => t.name === 'write_file');
+  if (!write) throw new Error('write_file tool missing');
+  return { write, wsDir };
+}
+
 async function grant() {
   const perm = await import('../../../../src/main/features/permissions');
   perm.grantLocalExec();
@@ -137,6 +155,26 @@ describe('local-tools › edit_file › sandbox', () => {
     const r = await run(edit, { path: p, old_string: 'foo', new_string: 'baz' });
     expect(r.isError).toBeFalsy();
     expect(fs.readFileSync(p, 'utf8')).toBe('baz bar');
+  });
+
+  it('allows write_file inside extraRoots but rejects outside scope', async () => {
+    await grant();
+    const conflictDir = path.join(tmpDir, 'sync-conflict');
+    fs.mkdirSync(conflictDir, { recursive: true });
+    const target = path.join(conflictDir, 'merged.md');
+    fs.writeFileSync(target, 'before');
+    const outside = path.join(tmpDir, 'outside-write.txt');
+    const { write } = await buildWriteTool({ extraRoots: [conflictDir] });
+
+    const ok = await run(write, { path: target, content: 'merged' });
+    expect(ok.isError).toBeFalsy();
+    expect(ok.content).not.toContain('<file-renamed>');
+    expect(fs.readFileSync(target, 'utf8')).toBe('merged');
+
+    const denied = await run(write, { path: outside, content: 'nope' });
+    expect(denied.isError).toBe(true);
+    expect(denied.content).toContain('E_PATH_OUT_OF_SCOPE');
+    expect(fs.existsSync(outside)).toBe(false);
   });
 });
 

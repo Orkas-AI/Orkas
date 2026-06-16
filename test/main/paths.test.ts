@@ -23,9 +23,9 @@ afterEach(() => {
 });
 
 describe('paths › roots', () => {
-  it('PC_ROOT points at the OrkasOpen repo root and APP_ROOT aliases it', async () => {
+  it('PC_ROOT ends with /PC and APP_ROOT aliases it', async () => {
     const p = await import('../../src/main/paths');
-    expect(path.basename(p.PC_ROOT)).toBe('OrkasOpen');
+    expect(p.PC_ROOT.endsWith('/PC')).toBe(true);
     expect(p.APP_ROOT).toBe(p.PC_ROOT);
   });
 

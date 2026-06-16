@@ -19,9 +19,7 @@ describe('quality › validateSkillFile', () => {
     const content = [
       '---',
       'name: pdf-summarize',
-      'description_en: Summarize PDFs',
-      'description_zh: PDF 摘要',
-      'category: data',
+      'description: Summarize PDFs',
       '---',
       'Body text explaining how to use this skill.',
     ].join('\n');
@@ -30,11 +28,12 @@ describe('quality › validateSkillFile', () => {
     expect(r.violations).toEqual([]);
   });
 
-  it('flags missing frontmatter description as EXTREME (blocks write)', () => {
+  it('flags missing frontmatter description as advisory', () => {
     const content = '---\nname: x\n---\n';
     const r = validateSkillFile({ relpath: 'SKILL.md', content });
-    expect(r.ok).toBe(false);
-    expect(r.violations.map((v) => v.rule)).toContain('frontmatter_description_missing');
+    expect(r.ok).toBe(true);
+    const missing = r.violations.find((v) => v.rule === 'frontmatter_description_missing');
+    expect(missing?.level).toBe('MEDIUM');
   });
 
   it('flags unparseable frontmatter (missing closing ---)', () => {
@@ -48,7 +47,7 @@ describe('quality › validateSkillFile', () => {
     const content = [
       '---',
       'name: x',
-      'description_en: x', 'description_zh: x', 'category: general',
+      'description: x',
       '---',
       '```bash',
       'cat ~/.ssh/config',
@@ -76,7 +75,7 @@ describe('quality › validateSkillFile', () => {
   });
 
   it('treats SKILL.md case-insensitively', () => {
-    const content = '---\nname: x\ndescription_en: x\ndescription_zh: x\ncategory: general\n---\n';
+    const content = '---\nname: x\ndescription: x\n---\n';
     const a = validateSkillFile({ relpath: 'skill.md', content });
     const b = validateSkillFile({ relpath: 'SKILL.MD', content });
     expect(a.violations).toEqual([]);
@@ -109,14 +108,15 @@ describe('quality › validateSkillDir', () => {
 
   it('passes a directory with only a valid SKILL.md', () => {
     fs.writeFileSync(path.join(dir, 'SKILL.md'),
-      '---\nname: x\ndescription_zh: x\ndescription_en: x\ncategory: general\n---\n');
+      '---\nname: x\ndescription: x\n---\n');
     const r = validateSkillDir(dir);
     expect(r.ok).toBe(true);
+    expect(r.violations.map((v) => v.rule)).toContain('skill_meta_category_missing');
   });
 
   it('aggregates findings from SKILL.md + scripts/', () => {
     fs.writeFileSync(path.join(dir, 'SKILL.md'),
-      '---\nname: x\ndescription_zh: x\ndescription_en: x\ncategory: general\n---\n');
+      '---\nname: x\ndescription: x\n---\n');
     fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true });
     fs.writeFileSync(path.join(dir, 'scripts', 'x.sh'),
       'cat ~/.bash_history\n');
@@ -128,11 +128,21 @@ describe('quality › validateSkillDir', () => {
 
   it('skips _install.json and other meta files', () => {
     fs.writeFileSync(path.join(dir, 'SKILL.md'),
-      '---\nname: x\ndescription_zh: x\ndescription_en: x\ncategory: general\n---\n');
+      '---\nname: x\ndescription: x\n---\n');
     fs.writeFileSync(path.join(dir, '_install.json'),
       '{"version":"1","published_at":0,"create_uid":""}');
     const r = validateSkillDir(dir);
     expect(r.ok).toBe(true);
+  });
+
+  it('reads _meta.json advisories alongside SKILL.md', () => {
+    fs.writeFileSync(path.join(dir, 'SKILL.md'),
+      '---\nname: x\ndescription: x\n---\n');
+    fs.writeFileSync(path.join(dir, '_meta.json'), JSON.stringify({ category: 'data' }));
+    const r = validateSkillDir(dir);
+    expect(r.ok).toBe(true);
+    expect(r.violations.map((v) => v.rule)).not.toContain('skill_meta_category_missing');
+    expect(r.violations.map((v) => v.rule)).toContain('skill_meta_routing_incomplete');
   });
 });
 
@@ -199,7 +209,7 @@ describe('quality › validateAgentDir', () => {
 
 describe('quality › report shape', () => {
   it('always includes validated_at + validator_version', () => {
-    const r = validateSkillFile({ relpath: 'SKILL.md', content: '---\nname: x\ndescription_en: x\ndescription_zh: x\ncategory: general\n---\n' });
+    const r = validateSkillFile({ relpath: 'SKILL.md', content: '---\nname: x\ndescription: x\n---\n' });
     expect(r.validated_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(r.validator_version).toMatch(/^\d+\.\d+/);
   });

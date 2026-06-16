@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import log from 'electron-log/main';
 import {
   detectAll,
   detectOne,
@@ -14,6 +15,8 @@ const isWindows = process.platform === 'win32';
 describe('local_agents/registry', () => {
   let tmpDir: string;
   let savedPath: string | undefined;
+  let savedHome: string | undefined;
+  let savedFileLevel: unknown;
   let savedEnvOverrides: Record<string, string | undefined> = {};
 
   const ENV_KEYS = [
@@ -27,6 +30,12 @@ describe('local_agents/registry', () => {
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-registry-'));
     savedPath = process.env.PATH;
+    savedHome = process.env.HOME;
+    process.env.HOME = path.join(tmpDir, 'home');
+    fs.mkdirSync(process.env.HOME, { recursive: true });
+    fs.mkdirSync(path.join(process.env.HOME, 'Library', 'Logs', 'orkas'), { recursive: true });
+    savedFileLevel = log.transports.file.level;
+    log.transports.file.level = false;
     savedEnvOverrides = {};
     for (const k of ENV_KEYS) {
       savedEnvOverrides[k] = process.env[k];
@@ -37,6 +46,9 @@ describe('local_agents/registry', () => {
 
   afterEach(() => {
     process.env.PATH = savedPath;
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    log.transports.file.level = savedFileLevel as any;
     for (const k of ENV_KEYS) {
       const v = savedEnvOverrides[k];
       if (v === undefined) delete process.env[k];
@@ -75,6 +87,21 @@ describe('local_agents/registry', () => {
     expect(r.version).toBe('2.0.0');
     expect(r.available).toBe(true);
     expect(r.error).toBeUndefined();
+  });
+
+  it('finds Codex in the standalone default ~/.local/bin even when PATH omits it', async () => {
+    if (isWindows) return;
+    const binDir = path.join(process.env.HOME!, '.local', 'bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    const fake = path.join(binDir, 'codex');
+    fs.writeFileSync(fake, '#!/bin/sh\necho "codex-cli 0.139.0"\n');
+    fs.chmodSync(fake, 0o755);
+    process.env.PATH = '/usr/bin:/bin:/usr/sbin:/sbin';
+
+    const r = await detectOne('codex');
+    expect(r.path).toBe(fake);
+    expect(r.version).toBe('0.139.0');
+    expect(r.available).toBe(true);
   });
 
   it('marks version_too_old when below minimum', async () => {

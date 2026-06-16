@@ -371,7 +371,7 @@ function bindStaticHandlers() {
 
   // Detail-view chrome: "← Back to skill library" + collapsible-section
   // toggle + Esc to return + outside-click to close the ⋯ menu.
-  document.getElementById('skills-back-btn')?.addEventListener('click', () => _showSkillsGridView());
+  document.getElementById('skills-back-btn')?.addEventListener('click', () => _onSkillsBack());
   document.getElementById('skills-source-toggle')?.addEventListener('click', () => _toggleSkillsSource());
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
@@ -379,7 +379,7 @@ function bindStaticHandlers() {
     if (!skillsPanel || !skillsPanel.classList.contains('active')) return;
     const detail = document.getElementById('skills-detail-view');
     if (detail && detail.style.display !== 'none') {
-      _showSkillsGridView();
+      _onSkillsBack();
       e.preventDefault();
     }
   });

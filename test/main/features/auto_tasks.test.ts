@@ -28,6 +28,8 @@ import {
 import {
   createTask,
   deleteAttachment,
+  applyAutoTaskContainerFromCommander,
+  extractAutoTaskContainers,
   getTask,
   isDue,
   listAttachments,
@@ -224,6 +226,93 @@ describe('task CRUD normalization', () => {
     }));
     expect(await getTask(TEST_UID, 'at_44444444')).toBeNull();
     expect(await listTasks(TEST_UID)).toEqual([]);
+  });
+});
+
+describe('commander auto-task container', () => {
+  it('extracts and applies create, update, disable, and delete containers', async () => {
+    const createdBlock = [
+      '<auto-task>',
+      '<action>create</action>',
+      '<title>Morning review</title>',
+      '<content>Summarize yesterday and plan today.</content>',
+      '<schedule>{"type":"daily","hour":9,"minute":0}</schedule>',
+      '<recipient>{"kind":"commander"}</recipient>',
+      '</auto-task>',
+    ].join('\n');
+    const createExtract = extractAutoTaskContainers(`done\n${createdBlock}\nvisible`);
+    expect(createExtract.cleanText).toBe('done\n\nvisible');
+    expect(createExtract.containers).toHaveLength(1);
+
+    const created = await applyAutoTaskContainerFromCommander(TEST_UID, createExtract.containers[0]);
+    expect(created.ok).toBe(true);
+    expect(created.kind).toBe('created');
+    expect(created.task?.title).toBe('Morning review');
+    expect(created.task?.schedule).toEqual({ type: 'daily', hour: 9, minute: 0 });
+
+    const taskId = created.taskId!;
+    const updateExtract = extractAutoTaskContainers([
+      '<auto-task>',
+      '<action>update</action>',
+      `<task_id>${taskId}</task_id>`,
+      '<schedule>{"type":"weekly","weekday":5,"hour":10,"minute":30}</schedule>',
+      '<skill>{"id":"research","name":"Research"}</skill>',
+      '</auto-task>',
+    ].join('\n'));
+    const updated = await applyAutoTaskContainerFromCommander(TEST_UID, updateExtract.containers[0]);
+    expect(updated.ok).toBe(true);
+    expect(updated.kind).toBe('updated');
+    expect(updated.task?.schedule).toEqual({ type: 'weekly', weekday: 5, hour: 10, minute: 30 });
+    expect(updated.task?.skill).toEqual({ id: 'research', name: 'Research' });
+
+    const disabled = await applyAutoTaskContainerFromCommander(TEST_UID, {
+      action: 'disable',
+      taskId,
+      updates: {},
+    });
+    expect(disabled.ok).toBe(true);
+    expect(disabled.kind).toBe('disabled');
+    expect(disabled.task?.enabled).toBe(false);
+
+    const deleted = await applyAutoTaskContainerFromCommander(TEST_UID, {
+      action: 'delete',
+      taskId,
+      updates: {},
+    });
+    expect(deleted.ok).toBe(true);
+    expect(deleted.kind).toBe('deleted');
+    expect(await getTask(TEST_UID, taskId)).toBeNull();
+  });
+
+  it('stages current conversation attachments referenced by a container', async () => {
+    const sourceCid = 'cid_auto_source';
+    const sourceDir = chatAttachmentDir(TEST_UID, sourceCid);
+    fs.mkdirSync(sourceDir, { recursive: true });
+    fs.writeFileSync(path.join(sourceDir, 'brief.md'), 'brief body');
+
+    const extracted = extractAutoTaskContainers([
+      '<auto-task>',
+      '<action>create</action>',
+      '<content>Use the attached brief every morning.</content>',
+      '<schedule>{"type":"daily","hour":8,"minute":0}</schedule>',
+      '<attachments>["brief.md"]</attachments>',
+      '</auto-task>',
+    ].join('\n'));
+    const created = await applyAutoTaskContainerFromCommander(TEST_UID, extracted.containers[0], {
+      sourceAttachmentCid: sourceCid,
+    });
+
+    expect(created.ok).toBe(true);
+    const taskId = created.taskId!;
+    expect(created.task?.attachments).toEqual(['brief.md']);
+    expect(fs.readFileSync(path.join(autoTaskAttachmentsDir(TEST_UID, taskId), 'brief.md'), 'utf8')).toBe('brief body');
+  });
+
+  it('does not extract literal auto-task examples in non-xml code fences or inline mentions', () => {
+    const fenced = 'Format:\n```\n<auto-task><action>delete</action></auto-task>\n```\nreal text';
+    expect(extractAutoTaskContainers(fenced).containers).toEqual([]);
+    const inline = 'Use `<auto-task>` after reading the system skill.';
+    expect(extractAutoTaskContainers(inline).containers).toEqual([]);
   });
 });
 

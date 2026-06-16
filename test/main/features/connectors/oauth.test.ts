@@ -10,12 +10,12 @@ beforeEach(() => {
   vi.resetModules();
   vi.clearAllMocks();
   mockElectron();
-  vi.doMock('../../../../src/main/features/connectors/_server_bridge', () => ({
+  vi.doMock('../../../../src/main/features/account/server', () => ({
     accountApiBase: () => 'https://api.test',
-    tokenStore: {
-      getDeviceId: () => 'device-1',
-      authHeaders: () => ({}),
-    },
+  }));
+  vi.doMock('../../../../src/main/features/account/token_store', () => ({
+    getDeviceId: () => 'device-1',
+    authHeaders: () => ({}),
   }));
   vi.doMock('../../../../src/main/features/config', () => ({
     getLanguage: () => 'en',
@@ -25,7 +25,8 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.doUnmock('electron');
-  vi.doUnmock('../../../../src/main/features/connectors/_server_bridge');
+  vi.doUnmock('../../../../src/main/features/account/server');
+  vi.doUnmock('../../../../src/main/features/account/token_store');
   vi.doUnmock('../../../../src/main/features/config');
 });
 

@@ -4,9 +4,9 @@ $agent_description
 
 $output_protocol_block
 
----
-
 ## Runtime injection
+
+$language_block
 
 $attachments_block
 

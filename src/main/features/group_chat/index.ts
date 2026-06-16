@@ -108,13 +108,14 @@ export interface SendInput {
   userId: string;
   cid: string;
   text: string;
+  model_text?: string;
   attachments?: string[];
 }
 
 export async function send(
   input: SendInput,
 ): Promise<{ ok: boolean; msg?: GroupMessage; error?: string }> {
-  const { userId, cid, text, attachments } = input;
+  const { userId, cid, text, model_text, attachments } = input;
   if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
   if (!text || !text.trim()) return { ok: false, error: 'empty message' };
   await seedReservedActors(userId, cid);
@@ -135,6 +136,7 @@ export async function send(
       uid: userId, cid,
       fromActorId: USER_ID,
       text,
+      ...(model_text && model_text.trim() ? { model_text } : {}),
       ...(attachments && attachments.length ? { attachments: [...attachments] } : {}),
     });
     return { ok: true, msg };
@@ -187,9 +189,6 @@ export async function readPlanForCid(
 ): Promise<{ ok: boolean; plan?: PlanFile | null; has_plan?: boolean; control?: PlanControlState; error?: string }> {
   if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
   const plan = await readPlan(userId, cid);
-  if (isPlanFullyCompleted(plan || null)) {
-    return { ok: true, plan: null, has_plan: true, control: { action: null } };
-  }
   return {
     ok: true,
     plan: plan || null,

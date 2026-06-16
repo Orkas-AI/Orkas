@@ -11,6 +11,8 @@ describe('group_chat output_format prompt hints', () => {
     for (const value of ['auto', undefined, 'future-mode']) {
       const hint = _buildOutputFormatHintForTest(value);
 
+      expect(hint).toContain('### Presentation preference');
+      expect(hint).not.toContain('### Output format');
       expect(hint).toContain('automatic output layout');
       expect(hint).toContain('Use plain text or Markdown');
       expect(hint).toContain('Use `:::dashboard`');
@@ -25,6 +27,8 @@ describe('group_chat output_format prompt hints', () => {
     for (const value of ['text', 'markdown_only']) {
       const hint = _buildOutputFormatHintForTest(value);
 
+      expect(hint).toContain('### Presentation preference');
+      expect(hint).not.toContain('### Output format');
       expect(hint).toContain('standard reply output');
       expect(hint).toContain('plain text or Markdown');
       expect(hint).toContain('NOT emit `:::dashboard`');
@@ -35,6 +39,8 @@ describe('group_chat output_format prompt hints', () => {
   it('turns dashboard into dashboard-preferred and artifact-blocked instructions', () => {
     const hint = _buildOutputFormatHintForTest('dashboard');
 
+    expect(hint).toContain('### Presentation preference');
+    expect(hint).not.toContain('### Output format');
     expect(hint).toContain('dashboard output');
     expect(hint).toContain('read-only structured snapshots');
     expect(hint).toContain('Follow the `Output formats` schema exactly');
@@ -45,6 +51,8 @@ describe('group_chat output_format prompt hints', () => {
     for (const value of ['artifact', 'allow_artifacts']) {
       const hint = _buildOutputFormatHintForTest(value);
 
+      expect(hint).toContain('### Presentation preference');
+      expect(hint).not.toContain('### Output format');
       expect(hint).toContain('allow interactive apps');
       expect(hint).toContain('static/read-only structured snapshots');
       expect(hint).toContain('create_artifact');
@@ -60,10 +68,11 @@ describe('group_chat CLI output_format prompt hints', () => {
       agent_name: 'CliAgent',
       agent_description: 'Runs local CLI tasks.',
       output_protocol_block: '',
+      language_block: '## User language\n\nUser UI language: **English**.',
       attachments_block: '',
       conversation_block: '',
       task_body: 'Summarize status.',
-      runtime_datetime_block: '## Current datetime\n\nCurrent datetime: 2026-06-05T14:30:00+08:00\nTimezone: Asia/Shanghai',
+      runtime_datetime_block: '## Current date\n\nTimezone: Asia/Shanghai\nCurrent date: 2026-06-05',
     });
 
     expect(rendered).not.toContain('Use plain text or Markdown');
@@ -72,6 +81,24 @@ describe('group_chat CLI output_format prompt hints', () => {
     expect(rendered).not.toContain(':::dashboard');
     expect(rendered).not.toContain('create_artifact');
     expect(rendered).not.toMatch(/\$output_[A-Za-z0-9_]+/);
+  });
+
+  it('includes the language directive in CLI prompts', () => {
+    const rendered = prompts.load('chat_cli_agent', {
+      agent_name: 'CliAgent',
+      agent_description: 'Runs local CLI tasks.',
+      output_protocol_block: '',
+      language_block: '## User language\n\nUser UI language: **Simplified Chinese**. Write all human-readable prose in Simplified Chinese.',
+      attachments_block: '',
+      conversation_block: '',
+      task_body: 'Summarize status.',
+      runtime_datetime_block: '## Current date\n\nTimezone: Asia/Shanghai\nCurrent date: 2026-06-05',
+    });
+
+    expect(rendered).toContain('## User language');
+    expect(rendered).toContain('Write all human-readable prose in Simplified Chinese');
+    expect(rendered.indexOf('## Runtime injection')).toBeLessThan(rendered.indexOf('## User language'));
+    expect(rendered).toContain('## Current date');
   });
 });
 
@@ -84,11 +111,13 @@ describe('group_chat plan interaction prompt hints', () => {
     const hint = _buildPlanInteractionHintForTest(true);
 
     expect(hint).toContain('### Plan interaction');
-    expect(hint).toMatch(/Information sufficiency requires user input/i);
-    expect(hint).toMatch(/with the `<agent-input-form>`/i);
+    expect(hint).toMatch(/Run your own Information sufficiency check/i);
+    expect(hint).toMatch(/output only/i);
+    expect(hint).toMatch(/one `<agent-input-form>`/i);
+    expect(hint).toMatch(/Required open shape/i);
     expect(hint).toContain('<plan-interaction status="open" />');
-    expect(hint).toMatch(/open reply pauses the step/i);
-    expect(hint).toMatch(/ask at most 2-3 focused form fields/i);
-    expect(hint).toMatch(/final recommendation, diagnosis, plan, or report/i);
+    expect(hint).toMatch(/at most 2-3 focused fields/i);
+    expect(hint).toMatch(/recommendation, diagnosis, plan, report/i);
+    expect(hint).toMatch(/form fields are the questions/i);
   });
 });

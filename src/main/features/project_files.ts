@@ -172,10 +172,13 @@ async function ensureProjectFilesDir(userId: string, projectId: string): Promise
   return dir;
 }
 
-function _notifyDirty(_projectId: string): void {
+function _notifyDirty(projectId: string): void {
+  void projectId;
 }
 
-function _notifyDeleted(_projectId: string, _relPath: string): void {
+function _notifyDeleted(projectId: string, relPath: string): void {
+  void projectId;
+  void relPath;
 }
 
 function infoFor(absPath: string, root?: string): ProjectFileInfo | null {

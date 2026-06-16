@@ -157,7 +157,7 @@ function handleFor(dbDir: string): Handle {
   db.pragma('synchronous = NORMAL');
   db.pragma('foreign_keys = ON');
 
-  try { sqliteVec.load(db); }
+  try { loadSqliteVec(db); }
   catch (err) {
     db.close();
     throw new Error(`sqlite-vec load failed: ${(err as Error).message}`);
@@ -169,6 +169,23 @@ function handleFor(dbDir: string): Handle {
   const h: Handle = { db, dbDir, dbPath, writeLock: new Mutex() };
   _cache.set(dbDir, h);
   return h;
+}
+
+function resolveSqliteVecLoadablePath(loadablePath: string, exists: (p: string) => boolean = fs.existsSync): string {
+  const unpacked = loadablePath.replace(/([\\/])app\.asar([\\/])/g, '$1app.asar.unpacked$2');
+  return unpacked !== loadablePath && exists(unpacked) ? unpacked : loadablePath;
+}
+
+function loadSqliteVec(db: Database.Database): void {
+  if (typeof sqliteVec.getLoadablePath === 'function') {
+    db.loadExtension(resolveSqliteVecLoadablePath(sqliteVec.getLoadablePath()));
+    return;
+  }
+  sqliteVec.load(db);
+}
+
+export function _resolveSqliteVecLoadablePathForTests(loadablePath: string): string {
+  return resolveSqliteVecLoadablePath(loadablePath);
 }
 
 function ensureSchema(db: Database.Database, dbPath: string): void {

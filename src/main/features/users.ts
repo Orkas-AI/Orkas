@@ -3,7 +3,9 @@
  *
  * `data/users.json` holds the local profile registry. The persisted field
  * names (`current_user_id`, `users[].user_id`) are historical; hosted builds
- * store the real account uid there while logged in.
+ * store the real account uid there while logged in. Dev builds use
+ * `dev_current_user_id` so local dev account switches do not overwrite the
+ * packaged/prod active profile pointer.
  *
  * Hosted Orkas uses:
  *   - `anonymous` while logged out.
@@ -13,8 +15,8 @@
  * keeps the original 8-digit local id.
  *
  * Boot sequence:
- *   1. Read users.json; if absent, create the first profile id and point
- *      current_user_id at it.
+ *   1. Read users.json; if absent, create the first profile id and point the
+ *      environment-specific current-user field at it.
  *   2. `activateUser(uid)` mkdir's the uid sub-tree, pins
  *      CORE_AGENT_AUTH_DIR, and clears the relevant caches.
  *   3. From there, every feature uses `getActiveUserId()` to obtain the
@@ -57,6 +59,7 @@ export interface UserRecord {
 
 interface UsersRegistry {
   current_user_id: string;
+  dev_current_user_id: string;
   users: UserRecord[];
 }
 
@@ -82,6 +85,17 @@ export interface LegacyAccountLocalIdMigrationResult {
 // ── In-memory active uid ─────────────────────────────────────────────────
 
 let ACTIVE_UID: string | null = null;
+type CurrentUserField = 'current_user_id' | 'dev_current_user_id';
+let CURRENT_USER_FIELD: CurrentUserField = 'current_user_id';
+
+/**
+ * Select which persisted pointer this process owns. `index.ts` calls this
+ * once during boot before any registry reads. Tests and OrkasOpen can omit it
+ * and keep the historical `current_user_id` behavior.
+ */
+export function setUseDevCurrentUserId(useDev: boolean): void {
+  CURRENT_USER_FIELD = useDev ? 'dev_current_user_id' : 'current_user_id';
+}
 
 /**
  * Return the currently-activated user id. Throws if `activateUser()` has not
@@ -106,10 +120,34 @@ function readRegistry(): UsersRegistry | null {
   if (!fs.existsSync(USERS_FILE)) return null;
   const data = readJsonSync<Partial<UsersRegistry>>(USERS_FILE);
   if (!data || typeof data !== 'object') return null;
-  const cur = typeof data.current_user_id === 'string' ? data.current_user_id : '';
+  let cur = typeof data.current_user_id === 'string' ? data.current_user_id : '';
+  let devCur = typeof data.dev_current_user_id === 'string' ? data.dev_current_user_id : '';
   const users = Array.isArray(data.users) ? data.users.filter(isValidRecord) : [];
-  if (!cur || !users.some((u) => u.user_id === cur)) return null;
-  return { current_user_id: cur, users };
+  const hasUser = (uid: string) => !!uid && users.some((u) => u.user_id === uid);
+  const wanted = CURRENT_USER_FIELD === 'dev_current_user_id' ? devCur : cur;
+  const fallback = CURRENT_USER_FIELD === 'dev_current_user_id' ? cur : devCur;
+  let active = wanted;
+  let migrated = false;
+
+  if (!active || !hasUser(active)) {
+    if (!hasUser(fallback)) return null;
+    active = fallback;
+  }
+
+  if (!hasUser(cur)) {
+    cur = active;
+    migrated = true;
+  }
+  if (!hasUser(devCur)) {
+    // Migration: older files did not have dev_current_user_id. Seed it from
+    // current_user_id so dev starts from the same uid once, then diverges.
+    devCur = cur;
+    migrated = true;
+  }
+
+  const reg: UsersRegistry = { current_user_id: cur, dev_current_user_id: devCur, users };
+  if (migrated) writeRegistry(reg);
+  return reg;
 }
 
 function isValidRecord(v: unknown): v is UserRecord {
@@ -132,7 +170,11 @@ function replaceCurrentLocalId(reg: UsersRegistry, from: string, to: string): Us
   const existingTarget = reg.users.find((u) => u.user_id === to);
   const nextUsers = reg.users.filter((u) => u.user_id !== from && u.user_id !== to);
   nextUsers.push(existingTarget || { user_id: to, created_at: fromRecord?.created_at || nowIso() });
-  return { current_user_id: to, users: nextUsers };
+  return {
+    current_user_id: reg.current_user_id === from ? to : reg.current_user_id,
+    dev_current_user_id: reg.dev_current_user_id === from ? to : reg.dev_current_user_id,
+    users: nextUsers,
+  };
 }
 
 function localRoot(localId: string): string {
@@ -180,7 +222,7 @@ export function migrateLegacyLoggedInLocalIdToAccountLocalId(): LegacyAccountLoc
   const reg = readRegistry();
   if (!reg) return { migrated: false, reason: 'no_registry' };
 
-  const from = reg.current_user_id;
+  const from = reg[CURRENT_USER_FIELD];
   const accountUserId = readStoredAccountUserIdForLocalId(from);
   if (!accountUserId) return { migrated: false, from, reason: 'no_stored_account' };
 
@@ -225,7 +267,7 @@ export function migrateLegacyLoggedInLocalIdToAccountLocalId(): LegacyAccountLoc
  *     switching is safe.
  *   - Clear the relevant module-level caches (session-store, auth,
  *     config).
- *   - Write `current_user_id` back to users.json.
+ *   - Write the environment-specific current-user pointer back to users.json.
  *
  * Callers are typically `boot` and account login/logout transitions.
  */
@@ -299,11 +341,11 @@ export function activateUser(uid: string): void {
 
   ACTIVE_UID = uid;
 
-  // Persist the current_user_id flip.
+  // Persist the current-user flip for this environment.
   const reg = readRegistry();
   if (reg) {
-    if (reg.current_user_id !== uid) {
-      reg.current_user_id = uid;
+    if (reg[CURRENT_USER_FIELD] !== uid) {
+      reg[CURRENT_USER_FIELD] = uid;
       if (!reg.users.some((u) => u.user_id === uid)) {
         reg.users.push({ user_id: uid, created_at: nowIso() });
       }
@@ -312,6 +354,7 @@ export function activateUser(uid: string): void {
   } else {
     writeRegistry({
       current_user_id: uid,
+      dev_current_user_id: uid,
       users: [{ user_id: uid, created_at: nowIso() }],
     });
   }
@@ -320,15 +363,16 @@ export function activateUser(uid: string): void {
 }
 
 /**
- * Boot-time entrypoint — read users.json and activate current_user_id. If
- * none exists, activate `defaultLocalId` (hosted: anonymous) or generate the
- * legacy 8-digit uid (OrkasOpen).
+ * Boot-time entrypoint — read users.json and activate this environment's
+ * current-user pointer. If none exists, activate `defaultLocalId` (hosted:
+ * anonymous) or generate the legacy 8-digit uid (OrkasOpen).
  */
 export function initActiveUser(opts: InitActiveUserOptions = {}): UserRecord {
   const reg = readRegistry();
   if (reg) {
-    const rec = reg.users.find((u) => u.user_id === reg.current_user_id) || {
-      user_id: reg.current_user_id,
+    const activeUid = reg[CURRENT_USER_FIELD];
+    const rec = reg.users.find((u) => u.user_id === activeUid) || {
+      user_id: activeUid,
       created_at: nowIso(),
     };
     activateUser(rec.user_id);

@@ -10,14 +10,14 @@
  *     bootstrap.cjs package.json node_modules/ test/ docs/
  *     src/
  *       main/                     ← index.ts + preload.js + features/...
- *       renderer/ builtin/ resources/ core-agent/
+ *       renderer/ resources/ core-agent/
  *
  *   <container>/                  ← ~/.orkas (mac/linux) or <drive>:\.orkas (Windows, pinned)
  *     data/                       ← WS_ROOT
- *       users.json                ← Local uid registry + current_user_id
+ *       users.json                ← Local uid registry + current_user_id / dev_current_user_id
  *       window-state.json         ← Last desktop window bounds (machine-local)
  *       logs/                     ← Local logs (rolled daily, global)
- *       builtin/                  ← Local public builtin runtime copy (hash-synced from src/builtin/ at startup)
+ *       local/marketplace/        ← Per-user platform installs reconciled from cloud manifests
  *         agents/<agent_id>/
  *         skills/<skill_id>/
  *       <user_id>/
@@ -41,6 +41,7 @@
 
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 
 // ── Roots ────────────────────────────────────────────────────────────────
 // __dirname = PC/src/main → parents[0]=main, [1]=src, [2]=PC.
@@ -66,14 +67,14 @@ export const WS_ROOT = path.resolve(process.env.ORKAS_WORKSPACE_ROOT);
 // Machine-local profile registry. Persisted keys remain
 // current_user_id/users[].user_id for compatibility. Hosted builds store
 // `anonymous` while logged out and the real account uid while logged in.
+// Dev builds use dev_current_user_id so they do not overwrite the packaged
+// active profile pointer in the shared install-container users.json.
 export const USERS_FILE        = path.join(WS_ROOT, 'users.json');
 export const WINDOW_STATE_FILE = path.join(WS_ROOT, 'window-state.json');
 // Machine-local logs (daily rolling, single global file shared across uids).
 export const LOGS_DIR          = path.join(WS_ROOT, 'logs');
-// (The legacy globally-shared `data/builtin/{agents,skills}/` tree is gone. Marketplace
-// installs now land under `<uid>/local/marketplace/` per machine — see `userMarketplace*`
-// helpers below. A one-shot migration in `util/migrate-marketplace.ts` moves any pre-cutover
-// `data/builtin/` content into the active uid's cloud tree on first launch.)
+// Marketplace installs land under `<uid>/local/marketplace/` per machine — see
+// `userMarketplace*` helpers below. There is no top-level platform install tree.
 
 // ── Per-user roots ───────────────────────────────────────────────────────
 export const userRoot       = (uid: string) => path.join(WS_ROOT, uid);
@@ -218,6 +219,18 @@ export const userPreferencesFile = (uid: string) => path.join(userCloudConfigDir
 // Per-user enable/disable config (agents + skills). Schema in features/component_enabled.ts.
 // Same dir + cloud-sync policy as preferences.json; only `false` is stored.
 export const userComponentEnabledFile = (uid: string) => path.join(userCloudConfigDir(uid), 'component-enabled.json');
+
+// Hidden system skills (product protocols, not user skills). Source files ship
+// with the app under `src/main/system_skills/`; startup mirrors them here so
+// model file tools can read a stable per-user data-root path. Local-only:
+// never cloud-synced, never shown in the Skills UI, never editable.
+export const packagedSystemSkillsDir = () => path.join(__dirname, 'system_skills');
+export const packagedSystemSkillsManifestFile = () => path.join(packagedSystemSkillsDir(), '_system.json');
+export const userSystemDir = (uid: string) => path.join(userLocalRoot(uid), 'system');
+export const userSystemSkillsDir = (uid: string) => path.join(userSystemDir(uid), 'skills');
+export const userSystemSkillDir = (uid: string, id: string) => path.join(userSystemSkillsDir(uid), id);
+export const userSystemSkillsManifestFile = (uid: string) => path.join(userSystemSkillsDir(uid), '_system.json');
+
 // Per-user auto tasks (sidebar "Automation" tab). Each task is a
 // self-contained directory at `<uid>/cloud/auto_tasks/<task_id>/`:
 //
@@ -307,6 +320,8 @@ export const localCacheBucketDir = (uid: string, bucket: string) =>
 export const userLocalBizDir = (uid: string) => path.join(userLocalRoot(uid), 'biz');
 export const marketplaceBizFile = (uid: string) =>
   path.join(userLocalBizDir(uid), 'marketplace.json');
+export const marketplaceReconcileStateFile = (uid: string) =>
+  path.join(userLocalBizDir(uid), 'marketplace-reconcile.json');
 
 // ── Marketplace content cache (`<uid>/local/cache/marketplace/`) ────────
 // Mirror of agent.json / skill bundle content fetched from the server, used
@@ -381,6 +396,51 @@ export const userLocalCliSessionsDir = (uid: string) =>
   path.join(userLocalRoot(uid), 'cli-sessions');
 export const localCliSessionsFile = (uid: string, cid: string) =>
   path.join(userLocalCliSessionsDir(uid), `${cid}.json`);
+
+// ── External packages (machine-private, verbatim third-party repos) ─────
+// `<uid>/local/packages/<name>/` hosts a cloned open-source repo UNMODIFIED
+// (including its node_modules / .venv — which is why this is local/, never
+// cloud-synced). Package metadata lives OUTSIDE the package dirs in the
+// sidecar `_registry.json` so `git pull` updates never conflict with Orkas
+// bookkeeping. The registry is written only by `bin/orkas-pkg.cjs` (the
+// bash-driven installer CLI); main-process code reads it via
+// `features/packages.ts`. Marketplace reconcile must never touch this tree.
+// `.bin/` holds generated shims for CLI-shaped packages; it is injected into
+// the bash tool PATH (see `model/core-agent/client.ts`).
+// See docs/plans/open-ecosystem-architecture.md §A.
+export const userPackagesDir          = (uid: string) => path.join(userLocalRoot(uid), 'packages');
+export const userPackageDir           = (uid: string, name: string) => path.join(userPackagesDir(uid), name);
+export const userPackagesRegistryFile = (uid: string) => path.join(userPackagesDir(uid), '_registry.json');
+export const userPackagesBinDir       = (uid: string) => path.join(userPackagesDir(uid), '.bin');
+
+// ── CLI-package companion skills (machine-private, main+CLI-owned) ──────
+// `<uid>/local/package_skills/<pkg>/SKILL.md` is an auto-authored usage skill
+// that teaches the commander how to drive a CLI-only external package. It is
+// kept OUTSIDE the verbatim `local/packages/<pkg>/` tree (which orkas-pkg.cjs
+// never writes Orkas files into) and OUTSIDE cloud/ (so a machine-specific CLI
+// wrapper never syncs to a device where the package is not installed). Written
+// out-of-process by `bin/orkas-pkg.cjs skill-write`; read in main via
+// `features/package_skills.ts`. Lifecycle is keyed to the package by dir name.
+export const userPackageSkillsDir = (uid: string) => path.join(userLocalRoot(uid), 'package_skills');
+export const userPackageSkillDir  = (uid: string, name: string) => path.join(userPackageSkillsDir(uid), name);
+
+// ── Global skill roots (machine-global, read-only, outside WS_ROOT) ─────
+// Skills the user already keeps for OTHER agent hosts on this machine, read
+// purely for interop: `~/.claude/skills` (claude-code) and `~/.codex/skills`
+// (codex). Both CLIs use the same `<id>/SKILL.md` layout, and each ships its
+// system skills under a dot dir (`.system` etc.) which SkillLoader skips.
+// There is intentionally NO Orkas-native `~/.orkas/skills` root: it was unused
+// (no installer ever populated it) and only widened the untrusted-content
+// attack surface, so it was dropped — Orkas skills live under the data root
+// (custom / marketplace) or in tracked external packages instead. All roots
+// here are READ-ONLY to Orkas: never write, normalize, or reconcile them.
+// Gated by the `global_skill_roots_enabled` preference and injected
+// commander-only — never through the orkas-bridge, because each CLI reads its
+// own global dir natively (see skill-registry.ts::listSkillsForBridge).
+export const globalSkillRoots = (): string[] => [
+  path.join(os.homedir(), '.claude', 'skills'),
+  path.join(os.homedir(), '.codex', 'skills'),
+];
 
 // ── Global recycle bin (machine-private, user-managed) ──────────────────
 // `<uid>/local/recycle/` stores recoverable snapshots for destructive
@@ -504,6 +564,7 @@ export function ensureUserLayout(uid: string): void {
     userProjectsDir(uid),
     userMarketplaceAgentsDir(uid),
     userMarketplaceSkillsDir(uid),
+    userSystemSkillsDir(uid),
     userMarketplaceDirCloud(uid),
     // userMetaDir is deprecated — per-agent meta now lands in the
     // `agents/<aid>/meta/` sub-directory, mkdir'd on demand at agent
@@ -521,6 +582,7 @@ export function ensureUserLayout(uid: string): void {
     userQualitySkillsDir(uid),
     userQualityAgentsDir(uid),
     userSignalsDir(uid),
+    userPackagesDir(uid),
   ];
   for (const d of dirs) fs.mkdirSync(d, { recursive: true });
 
