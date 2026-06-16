@@ -36,7 +36,7 @@ export function listVideoProfiles(): VideoProfile[] {
 
 export interface AddVideoProfileInput {
   provider: string;
-  model: string;
+  model?: string;
   apiKey: string;
   label?: string;
 }
@@ -45,12 +45,15 @@ export function isVideoProviderModelAllowed(provider: string, model: string): bo
   return !!VIDEO_AUTH_MODELS_BY_PROVIDER[provider]?.some((m) => m.id === model);
 }
 
+function defaultVideoModel(provider: string): string {
+  return VIDEO_AUTH_MODELS_BY_PROVIDER[provider]?.[0]?.id || '';
+}
+
 export function addVideoProfile(input: AddVideoProfileInput): { ok: true; id: string } | { ok: false; error: string } {
   const provider = String(input.provider || '').trim();
-  const model = String(input.model || '').trim();
+  const model = String(input.model || '').trim() || defaultVideoModel(provider);
   const apiKey = String(input.apiKey || '').trim();
   if (!provider) return { ok: false, error: 'provider required' };
-  if (!model) return { ok: false, error: 'model required' };
   if (!isVideoProviderModelAllowed(provider, model)) {
     return { ok: false, error: `unsupported video model "${provider}/${model}"` };
   }

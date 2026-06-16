@@ -1197,7 +1197,7 @@ function _settingsRenderSearchEntries() {
 const _IMAGE_PROVIDER_OPTIONS = [
   { id: 'openai',  label: 'OpenAI · GPT Image 2', docs: 'https://platform.openai.com/api-keys' },
   { id: 'google',  label: 'Google · Nano Banana 2', docs: 'https://aistudio.google.com/app/apikey' },
-  { id: 'doubao',  label: 'DouBao · Seedream 3.0', docs: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey' },
+  { id: 'doubao',  label: 'DouBao · Seedream', docs: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey' },
 ];
 
 function _imageProviderLabel(id) {
@@ -1365,17 +1365,6 @@ function _settingsSelectedVideoProvider() {
     || '';
 }
 
-function _videoDefaultModel(provider) {
-  return (_settingsVideoModelsByProvider()[provider] || [])[0]?.id || '';
-}
-
-function _settingsSelectedVideoModel() {
-  return _settingsState.videoModelSel?.getValue()
-    || document.getElementById('settings-video-model')?.dataset?.value
-    || _videoDefaultModel(_settingsSelectedVideoProvider())
-    || '';
-}
-
 async function _settingsRefreshVideoProfiles() {
   const res = await window.orkas.invoke('videoAuth.list');
   _settingsState.videoProfiles = (res && res.ok && Array.isArray(res.profiles)) ? res.profiles : [];
@@ -1394,7 +1383,6 @@ function _settingsRenderVideoSection() {
 
 function _settingsRenderVideoPicker() {
   const providerEl = document.getElementById('settings-video-provider');
-  const modelEl = document.getElementById('settings-video-model');
   if (!providerEl) return;
   if (!_settingsState.videoProviderSel) {
     _settingsState.videoProviderSel = _aiSelectMount(providerEl, {
@@ -1402,16 +1390,6 @@ function _settingsRenderVideoPicker() {
     });
     _settingsState.videoProviderSel.onChange((provider) => {
       _settingsTrackModelProviderSelect('video_auth_picker', provider);
-      if (modelEl) _settingsRenderVideoModelPicker(provider);
-      _settingsSetStatus('settings-video-status', '', '');
-    });
-  }
-  if (modelEl && !_settingsState.videoModelSel) {
-    _settingsState.videoModelSel = _aiSelectMount(modelEl, {
-      placeholder: t('settings.video.pick_model'),
-    });
-    _settingsState.videoModelSel.onChange((model) => {
-      _settingsTrackModelSelect('video_auth_picker', _settingsState.videoProviderSel?.getValue(), model);
       _settingsSetStatus('settings-video-status', '', '');
     });
   }
@@ -1424,7 +1402,6 @@ function _settingsRenderVideoPicker() {
     })),
     { value: prevProvider || '', placeholder: t('settings.video.pick_provider') },
   );
-  if (modelEl) _settingsRenderVideoModelPicker(_settingsState.videoProviderSel.getValue());
   const addBtn = document.getElementById('settings-video-add-btn');
   if (addBtn && !addBtn.dataset.bound) {
     addBtn.dataset.bound = '1';
@@ -1432,29 +1409,15 @@ function _settingsRenderVideoPicker() {
   }
 }
 
-function _settingsRenderVideoModelPicker(provider) {
-  const sel = _settingsState.videoModelSel;
-  if (!sel) return;
-  const list = _settingsVideoModelsByProvider()[provider] || [];
-  const prev = sel.getValue();
-  const nextValue = list.some((m) => m.id === prev) ? prev : (list[0]?.id || '');
-  sel.setOptions(
-    list.map((m) => ({ value: m.id, label: m.name || m.id })),
-    { value: nextValue, placeholder: t('settings.video.pick_model') },
-  );
-}
-
 async function _settingsClickAddVideoKey() {
   const provider = _settingsSelectedVideoProvider();
-  const model = _settingsSelectedVideoModel();
   const input = document.getElementById('settings-video-key-input');
   const apiKey = (input?.value || '').trim();
   if (!provider) { _settingsSetStatus('settings-video-status', 'error', t('settings.video.error_provider_needed')); return; }
-  if (!model) { _settingsSetStatus('settings-video-status', 'error', t('settings.video.error_model_needed')); return; }
   if (!apiKey) { _settingsSetStatus('settings-video-status', 'error', t('settings.video.error_key_needed')); return; }
   _settingsSetStatus('settings-video-status', 'busy', t('settings.video.adding'));
   try {
-    const res = await window.orkas.invoke('videoAuth.add', { provider, model, apiKey, label: 'default' });
+    const res = await window.orkas.invoke('videoAuth.add', { provider, apiKey, label: 'default' });
     if (!res || !res.ok) {
       _settingsSetStatus('settings-video-status', 'error', (res && res.error) || t('settings.video.add_failed'));
       return;

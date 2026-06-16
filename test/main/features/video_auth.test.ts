@@ -35,13 +35,11 @@ describe('video_auth', () => {
     const videoAuth = await import('../../../src/main/features/video_auth');
     const first = videoAuth.addVideoProfile({
       provider: 'doubao',
-      model: 'doubao-seedance-2-0-260128',
       apiKey: 'video-secret-one',
       label: 'one',
     });
     const second = videoAuth.addVideoProfile({
       provider: 'doubao',
-      model: 'doubao-seedance-2-0-260128',
       apiKey: 'video-secret-two',
       label: 'two',
     });
@@ -51,6 +49,10 @@ describe('video_auth', () => {
     const firstId = first.ok ? first.id : '';
     const secondId = second.ok ? second.id : '';
     expect(videoAuth.listVideoProfiles().map((p) => p.label)).toEqual(['two', 'one']);
+    expect(videoAuth.listVideoProfiles().map((p) => p.model)).toEqual([
+      'doubao-seedance-2-0-260128',
+      'doubao-seedance-2-0-260128',
+    ]);
 
     expect(videoAuth.reorderVideoProfiles([secondId, firstId])).toEqual({ ok: true });
     expect(videoAuth.listVideoProfiles().map((p) => p.id)).toEqual([secondId, firstId]);

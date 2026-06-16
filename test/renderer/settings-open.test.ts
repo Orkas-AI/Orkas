@@ -61,6 +61,18 @@ describe('open-source Settings sync guards', () => {
     expect(settingsJs).toContain('videoAuth.add');
   });
 
+  it('keeps video key setup provider-only and hides image Seedream version details', () => {
+    expect(indexHtml).toContain('id="settings-video-provider"');
+    expect(indexHtml).not.toContain('id="settings-video-model"');
+    expect(settingsJs).not.toContain('videoModelSel');
+    expect(settingsJs).not.toContain('_settingsRenderVideoModelPicker');
+    expect(settingsJs).not.toContain('settings.video.pick_model');
+    expect(settingsJs).not.toContain('settings.video.error_model_needed');
+
+    expect(settingsJs).toContain('DouBao · Seedream');
+    expect(settingsJs).not.toContain('Seedream 3.0');
+  });
+
   it('keeps model authorization add flow usable after open-source stripping', () => {
     for (const id of [
       'settings-picker-provider',
