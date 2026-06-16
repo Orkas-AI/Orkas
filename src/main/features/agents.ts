@@ -1337,7 +1337,7 @@ async function _applyAgentUpdates(
 }
 
 /** Edit-chat dispatcher: routes to custom write for custom agents. Platform
- *  and marketplace agents are read-only in OrkasOpen. */
+ *  and marketplace agents are read-only in the open-source build. */
 export async function updateAgentSpec(
   agentId: string, updates: UpdateAgentFields,
 ): Promise<Agent | null> {

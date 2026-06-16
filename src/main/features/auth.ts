@@ -15,7 +15,7 @@
  *       imageProfiles:  [ { id, provider, apiKey, label, createdAt } ]              // v4+
  *     }
  *     The file body is encrypted through `util/local-secret-store`: Hosted Orkas writes
- *     `ORKLSEC1:`, while OrkasOpen falls back to the open-source backend. The read path accepts
+ *     `ORKLSEC1:`, while the open-source build falls back to the open backend. The read path accepts
  *     the previous whole-file `crypto-vault` payload and plaintext JSON as one-shot migration
  *     inputs, then rewrites with the preferred backend.
  *
@@ -260,7 +260,7 @@ function authSecretOwner(localId: string): string {
     if (obj && typeof obj === 'object' && typeof obj.user_id === 'string' && obj.user_id) {
       return obj.user_id;
     }
-  } catch { /* logged out / OrkasOpen / unreadable account file */ }
+  } catch { /* logged out / open-source build / unreadable account file */ }
   return localId;
 }
 

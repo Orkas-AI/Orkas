@@ -372,7 +372,7 @@ async function _removeConversationMeta(userId: string, cid: string): Promise<voi
 }
 
 function _notifyChatIndexDirty(): void {
-  // OrkasOpen is local-only; cloud sync notification is intentionally absent.
+  // The open-source build is local-only; cloud sync notification is intentionally absent.
 }
 
 function _messageText(raw: any): string {

@@ -13,7 +13,7 @@
  *     no actionable signal.
  *
  * When it runs:
- *   - OrkasOpen installs it unconditionally so provider fetch failures surface
+ *   - The open-source build installs it unconditionally so provider fetch failures surface
  *     their real cause in both development and packaged builds.
  *
  * Scope:

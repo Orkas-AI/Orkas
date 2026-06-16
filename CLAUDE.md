@@ -55,7 +55,7 @@ Residual shared prompt rules should have one canonical source, with downstream p
 All user-scoped data lives under `<container>/data/<uid>/{cloud,local}/`.
 
 - Top-level data may contain only `users.json`, `logs/`, and user directories.
-- Hosted builds use `anonymous` while logged out and the Server account uid while logged in. OrkasOpen first boot keeps the legacy generated local id.
+- Hosted builds use `anonymous` while logged out and the Server account uid while logged in. The open-source build first boot keeps the legacy generated local id.
 - `uid` is an opaque single path segment. Do not parse it or embed it into session ids.
 - `cloud/` is syncable user-private state: chats, resumable sessions, attachments, artifacts, saved apps, contexts source files, memory, custom agents/skills, projects, marketplace install manifest, auto tasks, and user config.
 - `local/` is machine-private state: account/session cache, marketplace installed content, caches, indexes, vector DB, workspace selection, tool-result spills, local-agent archives, and dev archives.
@@ -64,13 +64,13 @@ All user-scoped data lives under `<container>/data/<uid>/{cloud,local}/`.
 - Project membership is an index field on a conversation. Do not encode `project_id` into paths, cids, or session ids.
 - Project lists are directory scans; do not restore an aggregate `projects/_index.json`.
 
-## Account, Sync, And OrkasOpen
+## Account, Sync, And Open-Source Builds
 
 - Hosted account login uses the Server `SessionMgr` pair (`user_id`, `session_id`), stored through `util/local-secret-store.ts`. There is no client refresh-token loop.
 - Authenticated HTTP calls carry `user_id` + `session_id`; WebSocket URLs carry the same pair only where required.
 - Optimistic login state may come from disk, but network revalidation must refresh or clear it.
 - Private hosted secret backends stay behind the local-secret facade. Do not import `features/hosted_secrets/` outside that facade.
-- Account, relay, voice, sync, billing, and marketplace-dev surfaces that depend on hosted Server features are stripped from OrkasOpen according to `OpenSource/SyncCode/strip-rules.json`. Do not add new hosted-only files without updating strip rules.
+- Account, relay, voice, sync, billing, and marketplace-dev surfaces that depend on hosted Server features are stripped from the open-source build according to `OpenSource/SyncCode/strip-rules.json`. Do not add new hosted-only files without updating strip rules.
 - PC never writes `private/<oauth_user_id>/manifest.json`; Server `/sync/manifest/commit` is the only writer.
 - Cloud sync paths use OAuth `user_id`, not an unrelated local uid.
 - Object transfers under the sync prefix go through `features/sync/transport.ts`.

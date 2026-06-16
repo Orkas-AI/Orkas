@@ -54,7 +54,7 @@ import { isExpiredMsTombstone } from '../util/tombstone_retention';
 const log = createLogger('marketplace_installs');
 
 function _markInstallsDirty(): void {
-  // OrkasOpen is local-only; cloud sync notification is intentionally absent.
+  // The open-source build is local-only; cloud sync notification is intentionally absent.
 }
 
 // Per-uid mutex covering the RMW cycle of add*/remove* (read manifest → mutate → write).

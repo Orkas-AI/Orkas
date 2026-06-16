@@ -36,7 +36,7 @@ function count(raw: string, needle: string) {
   return raw.split(needle).length - 1;
 }
 
-describe('OrkasOpen Settings sync guards', () => {
+describe('open-source Settings sync guards', () => {
   it('loads the standalone settings tabs module before settings.js', () => {
     const tabsScript = '<script src="./modules/settings_tabs.js"></script>';
     const settingsScript = '<script src="./modules/settings.js"></script>';
@@ -50,7 +50,7 @@ describe('OrkasOpen Settings sync guards', () => {
     expect(indexHtml).toMatch(/class=["'][^"']*\bsettings-tab\b[^"']*\bis-active\b[^"']*["'][^>]*data-settings-tab=["']data["']/);
   });
 
-  it('keeps unsupported search and image provider controls hidden from OrkasOpen', () => {
+  it('keeps unsupported search and image provider controls hidden from Orkas', () => {
     for (const controlId of ['settings-search-provider', 'settings-image-provider']) {
       const groupTag = previousSettingsGroupTag(controlId);
       expect(groupTag).toMatch(/\bhidden\b/);

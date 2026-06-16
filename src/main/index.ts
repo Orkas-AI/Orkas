@@ -42,7 +42,7 @@ import './install-data-root.cjs';
 
 const APP_USER_MODEL_ID = 'com.orkas.desktop';
 
-// OrkasOpen source and packaged builds share one app identity and one server
+// Source and packaged builds share one app identity and one server
 // environment: global prod. This keeps local data paths and OS app grouping
 // stable across run modes.
 app.setName('Orkas');
@@ -147,7 +147,7 @@ import * as clientConfigFeature from './features/client_config';
 import * as connectorsFeature from './features/connectors';
 import * as windowState from './features/window_state';
 // Server-backed account, multi-device sync, remote-control relay, and
-// auto-update features are stripped in OrkasOpen. Connectors remain available
+// auto-update features are stripped in the open-source build. Connectors remain available
 // through the open server bridge.
 
 function createWindow(): BrowserWindow {
@@ -768,7 +768,7 @@ if (!gotLock) {
     registerKbFileProtocol();
     registerChatMediaProtocol();
     registerChatAppProtocol();
-    // Renderer permission gate. Voice input is stripped from OrkasOpen, so media
+    // Renderer permission gate. Voice input is stripped from the open-source build, so media
     // capture is denied; clipboard permissions are kept for copy/paste flows.
     session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
       callback(permission === 'clipboard-read' || permission === 'clipboard-sanitized-write');

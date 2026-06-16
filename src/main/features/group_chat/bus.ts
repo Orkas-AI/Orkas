@@ -1585,7 +1585,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   if (turnSyncConflictResolution.length && workingText && !errText && !aborted) {
     const results = extractSyncConflictResults(workingText);
     if (results.length) {
-      log.warn(`sync conflict result ignored in OrkasOpen cid=${cid}: sync feature is stripped`);
+      log.warn(`sync conflict result ignored in open-source build cid=${cid}: sync feature is stripped`);
     }
   }
 
@@ -1639,7 +1639,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
             } else if (agentsFeat.isCliAgent(target)) {
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ External agents can only be edited from the right-hand detail panel.</span>`;
             } else {
-              // `updateAgentSpec` dispatches only custom agents in OrkasOpen.
+              // `updateAgentSpec` dispatches only custom agents in the open-source build.
               const updated = await agentsFeat.updateAgentSpec(editId, fields);
               if (updated) {
                 createdAgents.push({ agent_id: updated.agent_id, name: updated.name, kind: 'updated' });

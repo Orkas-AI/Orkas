@@ -8,7 +8,7 @@
  *
  * Why not reuse `features/account/token_store.ts::getDeviceId`?
  *   - That returns a random UUID, not the MAC the user asked for.
- *   - The whole `features/account/` module is stripped from OrkasOpen
+ *   - The whole `features/account/` module is stripped from the open-source build
  *     builds; auto-tasks must work offline-first.
  *
  * Stable for the process lifetime — cached on first read. Network adapter

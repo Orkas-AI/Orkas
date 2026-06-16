@@ -47,7 +47,7 @@ export interface UserPreferences {
   metacognition_enabled?: boolean;
   /** Whether machine-global skill roots such as ~/.codex/skills are visible
    * to commander open-tier skill search. Missing means enabled, preserving
-   * the historical OrkasOpen behavior. */
+   * the historical open-source behavior. */
   global_skill_roots_enabled?: boolean;
   /** Per-field update clocks used by cloud-sync to merge independent
    * preference changes without treating the whole JSON file as one blob. */

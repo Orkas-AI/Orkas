@@ -99,7 +99,7 @@ const _pending = new Map<string, Pending>();
 
 /** Lazy ipc lookup — same pattern `connectors/registry.ts` uses for
  *  `connectors:changed`; avoids a static feature→ipc import cycle and
- *  degrades cleanly in tests / OrkasOpen builds without the IPC bridge. */
+ *  degrades cleanly in tests / open-source builds without the IPC bridge. */
 function _broadcast(channel: string, payload: unknown): boolean {
   if (_broadcastOverride) {
     _broadcastOverride(channel, payload);

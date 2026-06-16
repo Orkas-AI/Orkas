@@ -87,7 +87,7 @@ async function loadSettings() {
   await _settingsSafeCall('settings metacognition render', _settingsRenderMetacognition);
   await _settingsSafeCall('settings data root render', _settingsRenderDataRoot);
   // Account card + subscription card (views/login/account_settings.js — absent in
-  // OrkasOpen, so these are no-ops there). renderSubscriptionSettings rebinds the
+  // the open-source build, so these are no-ops there). renderSubscriptionSettings rebinds the
   // action button's click handler with the current subscription state on every
   // render — opening the panel is the canonical "guarantee fresh button binding"
   // moment, so call it explicitly here (not just from the account.onChange listener

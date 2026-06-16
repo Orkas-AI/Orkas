@@ -199,7 +199,7 @@ async function _writeBindings(uid: string, pid: string, b: ProjectBindings): Pro
 }
 
 function _notifyDirty(): void {
-  // OrkasOpen is local-only; cloud sync notification is intentionally absent.
+  // The open-source build is local-only; cloud sync notification is intentionally absent.
 }
 
 // ── Validation ────────────────────────────────────────────────────────────

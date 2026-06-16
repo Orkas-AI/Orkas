@@ -558,7 +558,7 @@ function _mpBindPanel(panel) {
   panel.querySelector('[data-mp-search-clear]')?.addEventListener('click', _mpClearSearch);
   panel.querySelector('[data-mp-detail-install]')?.addEventListener('click', _mpInstallFromDetail);
   // Dev-only delete button click handler is bound by marketplace_dev.js (file absent in
-  // OrkasOpen). HTML element ships in index.html with display:none — dev module flips it
+  // the open-source build). HTML element ships in index.html with display:none — dev module flips it
   // on via the `onMarketplaceDetailRendered` hook (see below).
 }
 
@@ -1394,7 +1394,7 @@ function _mpRenderDetail() {
   }
 
   // Dev-only delete button is rendered + revealed by marketplace_dev.js via the
-  // `onMarketplaceDetailRendered` hook below. OrkasOpen has no such file — hook is undefined
+  // `onMarketplaceDetailRendered` hook below. The open-source build has no such file, so the hook is undefined
   // and the button stays hidden (display:none from HTML).
   if (typeof onMarketplaceDetailRendered === 'function') {
     onMarketplaceDetailRendered({ kind, item });
@@ -1778,9 +1778,9 @@ async function mountMarketplaceCategorySelect(elId, initialValue = '') {
 }
 
 // Dev-only `openMarketplaceUpload` + `_mpShowUploadWithCategoryDialog` live in
-// `marketplace_dev.js` (physically excluded from OrkasOpen via SyncCode strip-rules).
+// `marketplace_dev.js` (physically excluded from the open-source build via SyncCode strip-rules).
 // Callers (agents.js / skills.js per-row menu) check `typeof openMarketplaceUpload === 'function'`
-// to decide whether to show the upload entry — OrkasOpen has no marketplace_dev.js loaded,
+// to decide whether to show the upload entry — the open-source build has no marketplace_dev.js loaded,
 // so the menu items just don't appear.
 window.addEventListener('i18n-change', _mpOnI18n);
 window.addEventListener('oss-catalog-updated', (e) => {

@@ -76,7 +76,7 @@ import { persistReport as persistQualityReport } from '../quality/report';
 const log = createLogger('marketplace');
 
 // ── server URL ────────────────────────────────────────────────────────────
-// OrkasOpen has exactly one server environment: global prod. Use the apex host directly
+// The open-source build has exactly one server environment: global prod. Use the apex host directly
 // so POST marketplace calls do not first hit a www -> apex 301 redirect.
 const GLOBAL_PROD_API_BASE = 'https://orkas.ai' + '/api';
 

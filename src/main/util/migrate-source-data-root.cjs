@@ -4,7 +4,7 @@
  * (`<container>/data` + `<container>/userWorkSpace`).
  *
  * Before the data-root unification, source-run (`./run.sh`) wrote into
- * `OpenSource/OrkasOpen/data/`, while packaged builds wrote into
+ * the old source-tree `data/`, while packaged builds wrote into
  * `~/.orkas/data/`. This migration runs once at boot to fold the
  * source-run tree into the container, so dev and packaged share data
  * going forward.
@@ -38,7 +38,7 @@ const path = require('node:path');
 const STAMP_FILENAME = '.migrated-from-source';
 
 function migrateSourceDataRoot(targetContainer, repoRootOverride) {
-  // __dirname = OrkasOpen/src/main/util → up three for OrkasOpen/.
+  // __dirname = <repo>/src/main/util → up three for the repo root.
   const repoRoot = repoRootOverride || path.resolve(__dirname, '..', '..', '..');
   const srcData = path.join(repoRoot, 'data');
   const srcWs = path.join(repoRoot, 'userWorkSpace');

@@ -2,7 +2,7 @@
  * One-shot migration: relocate the connectors registry from `<uid>/local/config/connectors.json`
  * to `<uid>/cloud/config/connectors.json`.
  *
- * Historical PC-only migration. OrkasOpen has no account-backed connector
+ * Historical PC-only migration. The open-source build has no account-backed connector
  * sync, so this function always defers and leaves existing local connector
  * files in place.
  *

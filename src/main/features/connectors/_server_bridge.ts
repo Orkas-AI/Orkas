@@ -1,16 +1,16 @@
 /**
- * Server-bridge stubs for connector OAuth in the OrkasOpen build.
+ * Server-bridge stubs for connector OAuth in the open-source build.
  *
  * PC's `features/connectors/oauth*.ts` reaches into `features/account/{server,token_store}` for:
  *   - `accountApiBase()` — the Orkas global prod Server base URL
  *   - `tokenStore.getDeviceId()` — stable per-machine UUID
  *   - `tokenStore.authHeaders()` — `{user_id, session_id}` for the logged-in user
  *
- * `features/account/` is stripped from OrkasOpen (no account backend). Connectors still need the
+ * `features/account/` is stripped from the open-source build (no account backend). Connectors still need the
  * first two pieces because the Server bridges every connector OAuth flow regardless of login
  * state (`/connectors/oauth/exchange` accepts a `device_id`-only request, per PC/CLAUDE.md §6.5
- * "OrkasOpen connectors" section). The third piece is always empty here — there is no Orkas
- * session in OrkasOpen — but exposing the same signature keeps the call sites identical.
+ * "open-source connectors" section). The third piece is always empty here because there is no Orkas
+ * session in the open-source build, but exposing the same signature keeps the call sites identical.
  *
  * Where each piece comes from:
  *   - `accountApiBase` aliases `features/marketplace.apiBase()` (global prod only — single
@@ -71,7 +71,7 @@ export const tokenStore = {
   },
 
   authHeaders(): Record<string, string> {
-    // OrkasOpen has no Orkas account session. The Server's `/connectors/oauth/exchange`
+    // The open-source build has no Orkas account session. The Server's `/connectors/oauth/exchange`
     // endpoint accepts device_id-only requests for this build (per PC/CLAUDE.md §6.5).
     return {};
   },

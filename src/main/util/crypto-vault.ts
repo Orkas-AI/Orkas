@@ -19,7 +19,7 @@
  *   - Targeted forensic recovery from a stolen device.
  *
  * Hosted Orkas should normally go through `util/local-secret-store.ts`, which uses the private
- * `ORKLSEC1:` backend when available and calls this module only as an OrkasOpen fallback or for
+ * `ORKLSEC1:` backend when available and calls this module only as an open-source fallback or for
  * one-shot migration of older files.
  *
  * File layout written to disk:

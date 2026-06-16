@@ -11,7 +11,7 @@
  *   - `anonymous` while logged out.
  *   - the server account uid while logged in.
  *
- * OrkasOpen still calls `initActiveUser()` without options, so first boot
+ * The open-source build still calls `initActiveUser()` without options, so first boot
  * keeps the original 8-digit local id.
  *
  * Boot sequence:
@@ -64,7 +64,7 @@ interface UsersRegistry {
 }
 
 export interface InitActiveUserOptions {
-  /** Hosted Orkas passes `anonymous`; OrkasOpen omits this and gets a generated 8-digit uid. */
+  /** Hosted Orkas passes `anonymous`; the open-source build omits this and gets a generated 8-digit uid. */
   defaultLocalId?: string;
 }
 
@@ -90,7 +90,7 @@ let CURRENT_USER_FIELD: CurrentUserField = 'current_user_id';
 
 /**
  * Select which persisted pointer this process owns. `index.ts` calls this
- * once during boot before any registry reads. Tests and OrkasOpen can omit it
+ * once during boot before any registry reads. Tests and the open-source build can omit it
  * and keep the historical `current_user_id` behavior.
  */
 export function setUseDevCurrentUserId(useDev: boolean): void {
@@ -365,7 +365,7 @@ export function activateUser(uid: string): void {
 /**
  * Boot-time entrypoint — read users.json and activate this environment's
  * current-user pointer. If none exists, activate `defaultLocalId` (hosted:
- * anonymous) or generate the legacy 8-digit uid (OrkasOpen).
+ * anonymous) or generate the legacy 8-digit uid (open-source build).
  */
 export function initActiveUser(opts: InitActiveUserOptions = {}): UserRecord {
   const reg = readRegistry();

@@ -283,7 +283,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   try {
 
     // Called back when pi-ai's onPayload hook injects the native web
-    // search tool. The OrkasOpen recorder is a non-null no-op object.
+    // search tool. The open-source recorder is a non-null no-op object.
     const built = await buildRunner({
       sessionId,
       systemPrompt,

@@ -1,6 +1,6 @@
 /**
  * Google Workspace catalog entries — extracted from `catalog.ts` so the Google bundle and
- * per-service connectors stay isolated while still syncing to OrkasOpen. Both PC and OrkasOpen
+ * per-service connectors stay isolated while still syncing to the open-source build. Both hosted and open-source
  * include this file via a try/require in `catalog.ts`; the catch path only keeps older open-source
  * checkouts without this file from crashing.
  *

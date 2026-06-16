@@ -72,15 +72,15 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
     },
   },
   // Google Workspace entries (`google-workspace` bundle + 5 service members) live in
-  // `catalog-google.ts` and are loaded via `_loadGoogleEntries` below. PC and OrkasOpen both
-  // ship them; the try/require keeps older OrkasOpen checkouts that lack the file from crashing.
+  // `catalog-google.ts` and are loaded via `_loadGoogleEntries` below. Hosted and open-source
+  // builds both ship them; the try/require keeps older open-source checkouts that lack the file from crashing.
   ..._loadGoogleEntries(),
 ];
 
 function _loadGoogleEntries(): CatalogEntry[] {
   try {
     // `require` (not `import`) so the path isn't statically resolved at bundle time. Older
-    // OrkasOpen builds may lack this file; swallow and return [] for that compatibility case.
+    // Older open-source builds may lack this file; swallow and return [] for that compatibility case.
     // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
     const mod = require('./catalog-google') as { GOOGLE_ENTRIES?: CatalogEntry[] };
     return Array.isArray(mod.GOOGLE_ENTRIES) ? mod.GOOGLE_ENTRIES : [];

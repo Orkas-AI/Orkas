@@ -49,7 +49,7 @@ import { createLogger } from '../logger';
 const log = createLogger('component-enabled');
 
 function _notifyDirty(): void {
-  // OrkasOpen is local-only; cloud sync notification is intentionally absent.
+  // The open-source build is local-only; cloud sync notification is intentionally absent.
 }
 
 const SCHEMA_VERSION = 1;

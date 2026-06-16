@@ -251,7 +251,7 @@ export const autoTaskAttachmentsDir = (uid: string, taskId: string) => path.join
 // (local-secret encrypted with the active Orkas account's OAuth user_id as owner — see
 // `features/connectors/registry.ts`). Cloud-synced as of 2026-05-15 so a user authorizing on
 // one device sees the same connectors on another. **Secret owner:** OAuth user_id (not local uid)
-// so any device logged into the same Orkas account can decrypt; OrkasOpen / not-logged-in
+// so any device logged into the same Orkas account can decrypt; open-source / not-logged-in
 // users fall back to local uid (the file then sits in cloud/config/ but doesn't actually
 // sync — sync engine is inactive without an account).
 export const userConnectorsConfigFile = (uid: string) => path.join(userCloudConfigDir(uid), 'connectors.json');

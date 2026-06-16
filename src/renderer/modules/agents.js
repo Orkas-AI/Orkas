@@ -619,10 +619,10 @@ function _renderAgentRowMenuItems(menu, agentId, source = '') {
   if (canEdit) {
     items.push(`<div class="agent-row-menu-item" data-action="edit">${escapeHtml(t('agents.edit') + editLabelSuffix)}</div>`);
   }
-  // Upload-to-marketplace is owned by marketplace_dev.js (renderer-side dev module). OrkasOpen
+  // Upload-to-marketplace is owned by marketplace_dev.js (renderer-side dev module). The open-source build
   // doesn't ship that file, so `typeof openMarketplaceUpload === 'function'` is false there
   // and the menu item simply doesn't appear — no isDevMode check needed (and would be banned
-  // by OrkasOpen's strip-rules anyway).
+  // by the open-source strip-rules anyway).
   if (typeof openMarketplaceUpload === 'function') {
     items.push(`<div class="agent-row-menu-item" data-action="upload-marketplace">${escapeHtml(t('marketplace.upload'))}</div>`);
   }
@@ -771,7 +771,7 @@ function _renderAgentDetail(agent, editing) {
     useBtn.setAttribute('aria-disabled', agent.enabled === false ? 'true' : 'false');
   }
   if (enableBtn) enableBtn.style.display = editing ? 'none' : '';
-  // Upload button visibility: gated by marketplace_dev.js's presence (OrkasOpen lacks it).
+  // Upload button visibility: gated by marketplace_dev.js's presence (the open-source build lacks it).
   if (uploadBtn) uploadBtn.style.display = (typeof openMarketplaceUpload === 'function' && !editing) ? '' : 'none';
   if (delBtn) delBtn.style.display = (canEdit && !editing) ? '' : 'none';
   if (editBtn) {

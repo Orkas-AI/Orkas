@@ -5,7 +5,7 @@
 # Usage:
 #   ./run.sh
 #
-# OrkasOpen has exactly one server environment: global prod.
+# Orkas source builds use exactly one server environment: global prod.
 set -e
 
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -37,7 +37,7 @@ EOF
   exit 1
 fi
 
-echo "[Orkas] Starting OrkasOpen (global prod)"
+echo "[Orkas] Starting Orkas (global prod)"
 
 node "$APP_DIR/scripts/ensure-deps.cjs"
 

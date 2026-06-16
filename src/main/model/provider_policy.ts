@@ -3,7 +3,7 @@ import { isDeepSeekModelConfigEnabled } from '../features/client_config';
 /**
  * DeepSeek availability is controlled by Server client config
  * `model.deepseek.enabled`. The desktop default is enabled so offline and
- * OrkasOpen runs keep the provider available until Server says otherwise.
+ * Open-source runs keep the provider available until Server says otherwise.
  */
 export function isDeepSeekIntegrationEnabled(): boolean {
   return isDeepSeekModelConfigEnabled();

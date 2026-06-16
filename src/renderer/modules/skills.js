@@ -1066,7 +1066,7 @@ function _openSkillRowMenu(anchorBtn, id, source) {
   items.push(
     `<div class="skill-row-menu-item" data-action="toggle-enabled">${escapeHtml(enabled ? t('component.disable') : t('component.enable'))}</div>`,
   );
-  // Upload-to-marketplace owned by marketplace_dev.js (absent in OrkasOpen). typeof check
+  // Upload-to-marketplace owned by marketplace_dev.js (absent in the open-source build). typeof check
   // naturally hides the entry on builds that don't ship the dev module.
   if (!isOpenTier && typeof openMarketplaceUpload === 'function') {
     items.push(
@@ -1354,7 +1354,7 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
     }
     if (editBtn) editBtn.style.display = canEditThisSkill ? '' : 'none';
     if (enableBtn) enableBtn.style.display = editingThis ? 'none' : '';
-    // Upload button visibility: gated by marketplace_dev.js's presence (OrkasOpen lacks it).
+    // Upload button visibility: gated by marketplace_dev.js's presence (the open-source build lacks it).
     if (uploadBtn) uploadBtn.style.display = (typeof openMarketplaceUpload === 'function' && !editingThis) ? '' : 'none';
     if (delBtn) delBtn.style.display = (canEditThisSkill && !editingThis) ? '' : 'none';
   }

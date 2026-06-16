@@ -2,7 +2,7 @@
  * Shared facade for local secret persistence.
  *
  * Hosted Orkas uses the private backend in `features/hosted_secrets/` and writes
- * `ORKLSEC1:` payloads. OrkasOpen does not ship that backend; the same facade
+ * `ORKLSEC1:` payloads. The open-source build does not ship that backend; the same facade
  * then falls back to the open-source `crypto-vault` implementation. Callers
  * pass explicit context so secrets are bound to their business owner/record.
  */
@@ -36,7 +36,7 @@ function contextSeed(ctx: LocalSecretContext): string {
 
 function hostedBackend(): any | null {
   try {
-    // Dynamic require by design: OrkasOpen strips this directory, while Hosted Orkas keeps it.
+    // Dynamic require by design: the open-source build strips this directory, while Hosted Orkas keeps it.
     // Keep the specifier computed so the OSS orphan-import checker does not treat this optional
     // backend as a hard dependency after the private directory is removed.
     const spec = ['..', 'features', 'hosted_secrets', 'local_secret_store'].join('/');

@@ -1,8 +1,8 @@
 // Settings tab switching.
 //
-// Lifted out of `sync_settings.js` (stripped from the OrkasOpen build) so the
+// Lifted out of `sync_settings.js` (stripped from the open-source build) so the
 // 4-tab restructure still binds. Sync-card init is gone here on purpose —
-// OrkasOpen has no cloud sync, so the 数据 tab only shows the 本地 section.
+// The open-source build has no cloud sync, so the 数据 tab only shows the 本地 section.
 //
 // Settings.js calls `initSettingsTabs()` under a `typeof === 'function'` guard,
 // which is what made the old "tabs unclickable" bug silent.

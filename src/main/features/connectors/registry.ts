@@ -17,14 +17,14 @@
  *
  * **Secret owner = Orkas-account OAuth user_id (when logged in), else local uid**. Same OAuth
  * user_id on every device the user signs into → cross-device decryption after cloud sync.
- * OrkasOpen / not-logged-in falls back to local uid (file then sits in cloud/config/ but the
+ * Open-source / not-logged-in falls back to local uid (file then sits in cloud/config/ but the
  * sync engine is inactive without an account, so it stays machine-private de facto). See
  * `_secretOwner` for the resolution.
  *
  * Sync trigger: each write fires `syncFeature.markDirty('connectors', 'cloud/config/connectors.json')`
  * so user actions (install / disconnect / refresh) push within the debounce window rather than
  * waiting for the 5-min periodic. Like sync itself, gracefully no-ops in builds that strip
- * `features/sync` (OrkasOpen).
+ * `features/sync` (open-source build).
  *
  * All writes are serialized via async-mutex so two concurrent IPC calls can't race-overwrite.
  */
@@ -62,7 +62,7 @@ interface SecretsBlob { oauth_grant?: OAuthGrant; dcr_client?: DcrClientCredenti
 const PRESERVED_SECRETS = Symbol('preservedConnectorSecrets');
 type ConnectorInstanceWithPreservedSecrets = ConnectorInstance & { [PRESERVED_SECRETS]?: string };
 
-// Secret-owner resolver. OrkasOpen stores connector secrets under the local uid.
+// Secret-owner resolver. The open-source build stores connector secrets under the local uid.
 function _secretOwner(uid: string): string {
   return uid;
 }
@@ -76,7 +76,7 @@ function _secretContext(uid: string, instanceId: string): localSecrets.LocalSecr
 }
 
 function _notifyDirty(): void {
-  // OrkasOpen is local-only; cloud sync notification is intentionally absent.
+  // The open-source build is local-only; cloud sync notification is intentionally absent.
 }
 
 function _notifyRendererChanged(): void {
@@ -84,7 +84,7 @@ function _notifyRendererChanged(): void {
     // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
     const ipc = require('../../ipc') as { broadcastToRenderer?: (channel: string, payload: unknown) => void };
     ipc.broadcastToRenderer?.('connectors:changed', { changed: true });
-  } catch { /* tests / OrkasOpen may not have the IPC bridge loaded */ }
+  } catch { /* tests / open-source build may not have the IPC bridge loaded */ }
 }
 
 function _notifyChanged(): void {

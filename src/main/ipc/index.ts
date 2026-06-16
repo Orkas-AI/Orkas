@@ -2051,7 +2051,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { ok: true, path: target };
   },
 
-  // Internal debug panel data is stripped from OrkasOpen. Keep stable
+  // Internal debug panel data is stripped from the open-source build. Keep stable
   // handler shapes so stale renderer calls receive empty results.
   'devtools.listArchives':  async () => ({ items: [] }),
   'devtools.readArchive':   async () => ({ item: null }),
@@ -2063,17 +2063,17 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return aggregateSkillMetrics({ sinceDays: Number.isFinite(sinceDays) ? Number(sinceDays) : undefined });
   },
 
-  // User-account login (Google OAuth). Stripped from the OrkasOpen build.
+  // User-account login (Google OAuth). Stripped from the open-source build.
 
   // User feedback from Settings. Depends on the account session for Server auth.
 
-  // Multi-device sync. Stripped from the OrkasOpen build (depends on account).
+  // Multi-device sync. Stripped from the open-source build (depends on account).
 
   // Quality validator — renderer reads persisted ValidationReports to display
   // why a spec write / marketplace install was rejected.
   ...qualityHandlers,
   // Connectors (MCP-based). User-installed MCP servers expose tools to commander + selected
-  // agents. No Server dependency → kept in OrkasOpen.
+  // agents. No Server dependency, so kept in the open-source build.
   ...connectorsHandlers,
 
   // Cross-session memory UI — view/edit/import/export over features/memory.ts.

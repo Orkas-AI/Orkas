@@ -1814,7 +1814,7 @@ export function _writeSkillFileAt(
 }
 
 /** Edit-chat dispatcher (with validation report). Routes to custom write for
- *  custom ids. Platform and marketplace skills are read-only in OrkasOpen. */
+ *  custom ids. Platform and marketplace skills are read-only in the open-source build. */
 export async function writeSkillFileForEditChecked(
   skillId: string,
   relpath: string,
