@@ -12,9 +12,10 @@ directory the user provides) as external packages. The project is cloned
 verbatim into the per-user packages directory — never edit, normalize, or
 reorganize its files.
 
-All operations go through one CLI via the bash tool:
+Run the Orkas CLI command below through the command execution tool; Orkas
+handles this runner form directly on Windows:
 
-```bash
+```text
 $ORKAS_NODE "$ORKAS_PC_DIR/bin/orkas-pkg.cjs" <command> [args]
 ```
 
@@ -39,8 +40,9 @@ Every command prints a JSON result; non-zero exit prints `{ok:false,error}`.
      (agent-driven-only projects cannot be installed).
 3. Report what was installed, from the result fields:
    - `skill_roots` non-empty → its skills become available in new turns.
-   - `shims` non-empty → those commands are directly callable in bash from
-     the next turn (e.g. `hyperframes --help`).
+   - `shims` non-empty → those commands are directly callable from the host
+     shell/PATH in the next turn (e.g. `hyperframes --help`). On Windows the
+     installer creates `.cmd` shims for CLI entries.
 
 ## Author a usage skill for CLI-only installs
 

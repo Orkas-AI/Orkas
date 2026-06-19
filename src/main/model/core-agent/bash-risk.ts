@@ -202,7 +202,11 @@ const PRIV_ESC_CMDS = new Set(['sudo', 'su', 'doas', 'pkexec']);
 const NET_DOWNLOADERS = new Set(['curl', 'wget']);
 const RAW_SOCKET_CMDS = new Set(['nc', 'ncat', 'netcat', 'telnet', 'socat']);
 const REMOTE_COPY_CMDS = new Set(['scp', 'sftp', 'rsync']);
-const SHELL_INTERPRETERS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'python', 'python3', 'perl', 'ruby', 'node']);
+const SHELL_INTERPRETERS = new Set([
+  'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish',
+  'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe', 'cmd', 'cmd.exe',
+  'python', 'python3', 'perl', 'ruby', 'node',
+]);
 const CURL_UPLOAD_FLAGS = new Set([
   '-d', '--data', '--data-binary', '--data-raw', '--data-urlencode',
   '-F', '--form', '-T', '--upload-file', '--post-file', '--post-data',

@@ -160,7 +160,7 @@ describe("augmentPath", () => {
     expect(parts).not.toContain("\\Tools\\bin");
   });
 
-  it("adds common Windows Node.js and npm shim locations", () => {
+  it("adds common Windows tool and shim locations", () => {
     const out = augmentPath("C:\\Windows\\System32", "win32", {
       SystemRoot: "C:\\Windows",
       ProgramFiles: "C:\\Program Files",
@@ -174,6 +174,10 @@ describe("augmentPath", () => {
     expect(parts).toContain("C:\\Users\\me\\AppData\\Roaming\\npm");
     expect(parts).toContain("C:\\Users\\me\\AppData\\Local\\npm");
     expect(parts).toContain("C:\\Users\\me\\AppData\\Local\\Programs\\nodejs");
+    expect(parts).toContain("C:\\Program Files\\Git\\cmd");
+    expect(parts).toContain("C:\\Program Files\\Git\\bin");
+    expect(parts).toContain("C:\\Users\\me\\AppData\\Local\\Programs\\Git\\cmd");
+    expect(parts).toContain("C:\\Users\\me\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin");
   });
 
   describe("Windows shell selection", () => {

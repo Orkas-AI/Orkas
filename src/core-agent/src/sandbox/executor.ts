@@ -5,6 +5,7 @@
  * and timeout enforcement. Inspired by OpenClaw's sandbox execution layer.
  */
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 import { TextDecoder } from "node:util";
 import { createLogger } from "../shared/logger.js";
@@ -220,13 +221,38 @@ function buildWindowsCanonicalPathEntries(env: NodeJS.ProcessEnv): string[] {
   add(path.win32.join(root, "System32", "WindowsPowerShell", "v1.0"));
   add(path.win32.join(programFiles, "nodejs"));
   add(path.win32.join(programFilesX86, "nodejs"));
+  add(path.win32.join(programFiles, "Git", "cmd"));
+  add(path.win32.join(programFiles, "Git", "bin"));
+  add(path.win32.join(programFilesX86, "Git", "cmd"));
+  add(path.win32.join(programFilesX86, "Git", "bin"));
   if (appData) add(path.win32.join(appData, "npm"));
   if (localAppData) {
     add(path.win32.join(localAppData, "npm"));
     add(path.win32.join(localAppData, "Programs", "nodejs"));
+    add(path.win32.join(localAppData, "Programs", "Git", "cmd"));
+    add(path.win32.join(localAppData, "Programs", "Git", "bin"));
+    add(path.win32.join(localAppData, "Programs", "OpenAI", "Codex", "bin"));
+    addPythonInstallDirs(path.win32.join(localAppData, "Programs", "Python"), add);
   }
+  addPythonInstallDirs(programFiles, add);
 
   return out;
+}
+
+function addPythonInstallDirs(root: string | undefined, add: (entry: string | undefined) => void): void {
+  if (!root) return;
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(root);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!/^Python\d+/i.test(entry)) continue;
+    const dir = path.win32.join(root, entry);
+    add(dir);
+    add(path.win32.join(dir, "Scripts"));
+  }
 }
 
 function getEnvValue(env: NodeJS.ProcessEnv, names: string[]): string | undefined {

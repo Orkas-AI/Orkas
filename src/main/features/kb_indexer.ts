@@ -52,7 +52,7 @@ const TEXT_EXTS = new Set(['.md', '.markdown', '.txt', '.csv', '.tsv', '.json', 
 for (const ext of [
   '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
   '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
-  '.sh', '.bash', '.zsh', '.rb', '.go', '.rs', '.java', '.kt',
+  '.sh', '.bash', '.zsh', '.ps1', '.cmd', '.bat', '.rb', '.go', '.rs', '.java', '.kt',
   '.c', '.cpp', '.cc', '.h', '.hpp', '.css', '.scss', '.less',
   '.sql', '.graphql', '.gql',
 ]) TEXT_EXTS.add(ext);

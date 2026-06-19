@@ -305,7 +305,7 @@ function registerIpc(): void {
       builtin_agents_dir: 'X', custom_agents_dir: 'X',
       builtin_skills_dir: 'X', custom_skills_dir: 'X',
       agents_index: '', plan_state: '',
-      os: 'X', working_dir: 'X', local_exec_state: 'X',
+      os: 'X', working_dir: 'X', shell_hint: '', local_exec_state: 'X',
       output_format_hint: 'X',
       project_files_block: '',
     });

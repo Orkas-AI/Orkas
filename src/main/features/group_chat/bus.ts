@@ -2117,6 +2117,9 @@ async function buildCommanderSystemPrompt(
     plan_state: formatPlanForPrompt(plan),
     os: process.platform === 'darwin' ? 'macOS' : process.platform === 'win32' ? 'Windows' : process.platform,
     working_dir: workingDir,
+    shell_hint: process.platform === 'win32'
+      ? 'On native Windows, command execution runs in PowerShell by default; write ad-hoc commands for PowerShell, not POSIX shell syntax.'
+      : '',
     local_exec_state: permState,
     env_summary: envSummary,
     output_format_hint: buildOutputFormatHint('auto'),

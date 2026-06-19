@@ -11,7 +11,10 @@
  *                       `async (args) => result`, JSON.stringify result to stdout.
  *   .py              — spawn `python3` (Windows: `py -3` then `python`),
  *                       inherit stdio, exit with child's code.
- *   .sh              — spawn `bash`, inherit stdio, exit with child's code.
+ *   .ps1             — spawn PowerShell (Windows-native script).
+ *   .cmd / .bat      — spawn `cmd.exe` (Windows-native batch script).
+ *   .sh              — spawn `bash` (Windows: Git Bash only; WSL is not
+ *                       auto-selected),
  *   .rb              — spawn `ruby`, inherit stdio, exit with child's code.
  *
  * Resolution order (matches SkillRegistry — see model/core-agent/skill-registry.ts):
@@ -21,7 +24,7 @@
  *      (enabled packages only; `.` roots resolve against the packages dir)
  *   4. Global roots: ~/.claude/skills, ~/.codex/skills (interop, read-only)
  *   5. Same roots by SKILL.md frontmatter `name` when dir id != authored name
- *   For each candidate dir we try py → ts → mjs → js → sh → rb in order.
+ *   For each candidate dir we try extensions in platform-specific order.
  *
  * Dependency resolution for scripts living under an external package (or any
  * skill dir that vendors its own deps): the NEAREST `node_modules` walking up
@@ -52,7 +55,12 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 
-const SCRIPT_EXTS = ['py', 'ts', 'mjs', 'js', 'sh', 'rb'];
+const SCRIPT_EXTS = ['py', 'ts', 'mjs', 'js', 'ps1', 'cmd', 'bat', 'sh', 'rb'];
+
+function scriptExtsForPlatform(platform = process.platform) {
+  if (platform === 'win32') return SCRIPT_EXTS;
+  return ['py', 'ts', 'mjs', 'js', 'sh', 'rb', 'ps1'];
+}
 
 function die(exitCode, message, extra) {
   const payload = { ok: false, error: message };
@@ -270,9 +278,10 @@ function collectSkillDirs(skillRef) {
 
 function locateSkillScript(skillId, scriptBase) {
   const skillDirs = collectSkillDirs(skillId);
+  const scriptExts = scriptExtsForPlatform();
   const candidates = [];
   for (const dir of skillDirs) {
-    for (const ext of SCRIPT_EXTS) {
+    for (const ext of scriptExts) {
       candidates.push(path.join(dir, 'scripts', `${scriptBase}.${ext}`));
     }
   }
@@ -283,7 +292,7 @@ function locateSkillScript(skillId, scriptBase) {
       /* next */
     }
   }
-  die(66, `skill script not found: ${skillId}/${scriptBase}.{${SCRIPT_EXTS.join(',')}}`, {
+  die(66, `skill script not found: ${skillId}/${scriptBase}.{${scriptExts.join(',')}}`, {
     searched: candidates,
     hint: 'check skill id/display name and script name; ORKAS_PC_DIR / ORKAS_WORKSPACE_ROOT env',
   });
@@ -307,6 +316,64 @@ function findUpwards(startDir, relProbe, maxLevels) {
     dir = parent;
   }
   return null;
+}
+
+function existingFile(p) {
+  try {
+    return fs.statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function findOnPath(names, env = process.env) {
+  const pathValue = env.PATH || env.Path || env.path || '';
+  const dirs = pathValue.split(path.delimiter).filter(Boolean);
+  const rawPathext = env.PATHEXT || '.COM;.EXE;.BAT;.CMD';
+  const pathext = rawPathext.split(';').map((x) => x.trim()).filter(Boolean);
+  for (const dir of dirs) {
+    for (const name of names) {
+      const variants = path.extname(name) ? [name] : [name, ...pathext.map((ext) => `${name}${ext}`)];
+      for (const variant of variants) {
+        const candidate = path.join(dir, variant);
+        if (existingFile(candidate)) return candidate;
+      }
+    }
+  }
+  return null;
+}
+
+function findGitBash() {
+  const envCandidates = [
+    process.env.ORKAS_GIT_BASH_PATH,
+    process.env.CLAUDE_CODE_GIT_BASH_PATH,
+  ].filter(Boolean);
+  for (const p of envCandidates) {
+    if (existingFile(p)) return p;
+  }
+
+  const roots = [
+    process.env.ProgramFiles,
+    process.env['ProgramFiles(x86)'],
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs'),
+  ].filter(Boolean);
+  for (const root of roots) {
+    for (const rel of [
+      path.join('Git', 'bin', 'bash.exe'),
+      path.join('Git', 'usr', 'bin', 'bash.exe'),
+    ]) {
+      const candidate = path.join(root, rel);
+      if (existingFile(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+function findPowerShell() {
+  for (const p of [process.env.ORKAS_POWERSHELL_PATH, process.env.POWERSHELL_PATH].filter(Boolean)) {
+    if (existingFile(p)) return p;
+  }
+  return process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
 }
 
 function registerTsxLoader() {
@@ -344,14 +411,43 @@ function runViaSubprocess(scriptPath, scriptArgs, skillId) {
     if (venvPython) {
       cmd = venvPython;
     } else if (isWin) {
-      const tryPy = trySpawn('py', ['-3', scriptPath, ...scriptArgs], skillDir, skillId);
-      if (tryPy.spawned) return; // spawned() means we already wired it up + will exit
-      cmd = 'python';
+      const pyLauncher = findOnPath(['py.exe', 'py']);
+      if (pyLauncher) {
+        cmd = pyLauncher;
+        argv0Args = ['-3'];
+      } else {
+        cmd = 'python';
+      }
     } else {
       cmd = 'python3';
     }
   } else if (ext === 'sh') {
-    cmd = isWin ? 'bash' : 'bash';   // Git Bash / WSL on Windows
+    if (isWin) {
+      cmd = findGitBash();
+      if (!cmd) {
+        die(
+          76,
+          'Git Bash is required to run .sh skill scripts on native Windows. Install Git for Windows, set ORKAS_GIT_BASH_PATH, or provide a .ps1/.cmd/.py/.js script for this skill.',
+          { scriptPath },
+        );
+      }
+    } else {
+      cmd = 'bash';
+    }
+  } else if (ext === 'ps1') {
+    cmd = findPowerShell();
+    argv0Args = [
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-File',
+    ];
+  } else if (ext === 'cmd' || ext === 'bat') {
+    if (!isWin) die(75, `Windows batch script requires native Windows: ${scriptPath}`);
+    cmd = 'cmd.exe';
+    argv0Args = ['/d', '/s', '/c'];
   } else if (ext === 'rb') {
     cmd = 'ruby';
   } else {

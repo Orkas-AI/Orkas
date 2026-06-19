@@ -87,7 +87,7 @@ const _TEXT_EXTS = new Set([
   '.xml', '.ini', '.toml', '.conf',
   '.py', '.pyi',
   '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
-  '.sh', '.bash', '.zsh',
+  '.sh', '.bash', '.zsh', '.ps1', '.cmd', '.bat',
   '.rb', '.go', '.rs', '.java', '.kt',
   '.c', '.cpp', '.cc', '.h', '.hpp',
   '.css', '.scss', '.less',

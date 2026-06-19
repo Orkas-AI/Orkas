@@ -193,7 +193,7 @@ function detectSkillFileKind(relpath: string): ScanKind {
   if (norm.toUpperCase() === 'SKILL.MD') return 'skill_md';
   if (norm === '_meta.json') return 'skill_meta';
   const ext = path.extname(norm).toLowerCase();
-  if (['.py', '.sh', '.bash', '.zsh', '.ts', '.mjs', '.js', '.rb'].includes(ext)) {
+  if (['.py', '.sh', '.bash', '.zsh', '.ts', '.mjs', '.js', '.rb', '.ps1', '.cmd', '.bat'].includes(ext)) {
     return 'script';
   }
   // Anything else (README.md, .json, .yaml, images, …) is skipped.

@@ -5,6 +5,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 let tmpDir: string;
+const itOnNonWindows = process.platform === 'win32' ? it.skip : it;
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-run-skill-'));
@@ -66,5 +67,23 @@ describe('run-skill.cjs', () => {
     expect(r.status).toBe(0);
     expect(r.stderr).toBe('');
     expect(JSON.parse(r.stdout.trim())).toEqual({ ok: true, argv: 'youtube' });
+  });
+
+  itOnNonWindows('prefers POSIX scripts over Windows-native scripts outside Windows', () => {
+    const skillDir = path.join(tmpDir, 'u1', 'local', 'marketplace', 'skills', 'dual');
+    const scriptsDir = path.join(skillDir, 'scripts');
+    fs.mkdirSync(scriptsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      '---\nname: dual\ndescription: test\n---\n\nbody\n',
+    );
+    fs.writeFileSync(path.join(scriptsDir, 'run.sh'), 'printf \'{"runner":"sh"}\\n\'\n');
+    fs.writeFileSync(path.join(scriptsDir, 'run.ps1'), 'Write-Output \'{"runner":"ps1"}\'\n');
+
+    const r = runSkill('dual', 'run');
+
+    expect(r.status).toBe(0);
+    expect(r.stderr).toBe('');
+    expect(JSON.parse(r.stdout.trim())).toEqual({ runner: 'sh' });
   });
 });

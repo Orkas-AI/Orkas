@@ -24,7 +24,7 @@ const TEXT_EXTS: ReadonlySet<string> = new Set([
   '.json', '.yaml', '.yml', '.log',
   '.html', '.htm', '.xml', '.toml', '.ini', '.conf',
   '.py', '.pyi', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs',
-  '.sh', '.bash', '.zsh', '.rb', '.go', '.rs', '.java', '.kt',
+  '.sh', '.bash', '.zsh', '.ps1', '.cmd', '.bat', '.rb', '.go', '.rs', '.java', '.kt',
   '.c', '.cpp', '.cc', '.h', '.hpp', '.css', '.scss', '.less',
   '.sql', '.graphql', '.gql',
 ]);

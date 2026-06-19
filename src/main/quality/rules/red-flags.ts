@@ -10,7 +10,7 @@
  * sandbox layer that catches the rest.
  *
  * Scope:
- *   - 'script' files (scripts/<file>.{py,sh,ts,js,mjs,rb,bash})
+ *   - 'script' files (scripts/<file>.{py,sh,ts,js,mjs,rb,bash,ps1,cmd,bat})
  *   - 'skill_md' embedded fenced code blocks (```bash / ```sh / ```python)
  *   - 'agent_json' path-string fields
  *   Prose in SKILL.md is NOT scanned — false-positive rate is too high
@@ -42,8 +42,8 @@ export const RED_FLAGS: ReadonlyArray<RuleDef> = [
     id: 'no_download_then_execute',
     level: 'EXTREME',
     appliesTo: ['script', 'skill_md'],
-    // curl|bash / wget|sh / pip install <url-or-git>
-    pattern: /(?:curl|wget)\b[^\n]*\|\s*(?:bash|sh|zsh)\b|pip\s+install\s+(?:https?:\/\/|git\+)/i,
+    // curl|bash / wget|sh / curl|powershell / curl|cmd / pip install <url-or-git>
+    pattern: /(?:curl|wget)\b[^\n]*\|\s*(?:bash|sh|zsh|powershell(?:\.exe)?|pwsh(?:\.exe)?|cmd(?:\.exe)?)\b|pip\s+install\s+(?:https?:\/\/|git\+)/i,
     suggested_fix: 'Do not pipe remote content into a shell. Require the user to install dependencies through normal package managers.',
   },
   {
@@ -70,7 +70,7 @@ export const RED_FLAGS: ReadonlyArray<RuleDef> = [
     //   1. `base64 -d | <interpreter>` shell pipeline
     //   2. `atob(...) ; eval(...)` (two separate calls in sequence)
     //   3. `eval(atob(...))` / `Function(atob(...))` (nested call)
-    pattern: /base64\s+(?:-d|--decode)[^\n]*?\|\s*(?:bash|sh|python|python3|node|tsx)\b|atob\s*\([^)]*\)\s*[;,]?\s*(?:eval|new\s+Function)\s*\(|(?:eval|new\s+Function)\s*\(\s*atob\s*\(/i,
+    pattern: /base64\s+(?:-d|--decode)[^\n]*?\|\s*(?:bash|sh|powershell(?:\.exe)?|pwsh(?:\.exe)?|cmd(?:\.exe)?|python|python3|node|tsx)\b|atob\s*\([^)]*\)\s*[;,]?\s*(?:eval|new\s+Function)\s*\(|(?:eval|new\s+Function)\s*\(\s*atob\s*\(/i,
     suggested_fix: 'Do not decode and execute encoded payloads. Write the executable logic in clear text so it can be reviewed.',
   },
   {
@@ -141,7 +141,8 @@ export function scanRedFlags(args: {
  * Extract fenced code blocks of executable languages from a SKILL.md body
  * and yield each block paired with its kind for further scanning.
  *
- * Languages: bash / sh / zsh / python / py / js / ts / ruby / rb.
+ * Languages: bash / sh / zsh / powershell / ps1 / batch / bat / cmd /
+ * python / py / js / ts / ruby / rb.
  * Code blocks of other languages (markdown / json / yaml / text / unspecified)
  * are skipped — they're documentation, not execution surface.
  */
@@ -151,7 +152,7 @@ export function extractExecutableBlocks(skillMdBody: string): Array<{
   startLine: number;
 }> {
   const out: Array<{ lang: string; content: string; startLine: number }> = [];
-  const re = /```(bash|sh|zsh|python|py|js|javascript|ts|typescript|ruby|rb)\s*\n([\s\S]*?)```/gi;
+  const re = /```(bash|sh|zsh|powershell|ps1|batch|bat|cmd|python|py|js|javascript|ts|typescript|ruby|rb)\s*\n([\s\S]*?)```/gi;
   let m: RegExpExecArray | null;
   while ((m = re.exec(skillMdBody)) !== null) {
     out.push({
