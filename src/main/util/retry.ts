@@ -6,6 +6,14 @@ const log = createLogger('retry');
 export const DEFAULT_NETWORK_RETRY_ATTEMPTS = 3;
 export const DEFAULT_NETWORK_RETRY_DELAYS_MS = [500, 1_000, 2_000];
 
+type FetchImplementation = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+
+let fetchImplementation: FetchImplementation | null = null;
+
+export function setFetchImplementation(impl: FetchImplementation | null): void {
+  fetchImplementation = impl;
+}
+
 export class RetriableHttpStatusError extends Error {
   status: number;
 
@@ -67,7 +75,7 @@ export async function fetchWithRetry(
   } = {},
 ): Promise<Response> {
   return retryAsync(label, async () => {
-    const res = await fetch(input, init);
+    const res = await (fetchImplementation || fetch)(input, init);
     if (isRetriableHttpStatus(res.status)) {
       throw new RetriableHttpStatusError(res.status, label);
     }

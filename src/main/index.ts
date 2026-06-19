@@ -30,7 +30,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import { Readable } from 'node:stream';
-import { app, BrowserWindow, Menu, ipcMain, nativeImage, protocol, session, shell } from 'electron';
+import { app, BrowserWindow, Menu, ipcMain, nativeImage, net, protocol, session, shell } from 'electron';
 // Side-effect import: at module-load time this resolves the install
 // container, runs the one-shot PC/data → <container>/data migration, and
 // sets process.env.ORKAS_WORKSPACE_ROOT. Must be the FIRST project import
@@ -125,6 +125,9 @@ installSseHeaderTimeoutPatch();
 // endpoint failures.
 import { installFetchDiag } from './model/core-agent/fetch-diag';
 installFetchDiag();
+
+import { setFetchImplementation } from './util/retry';
+setFetchImplementation((input, init) => net.fetch(input as Parameters<typeof net.fetch>[0], init));
 
 import { prompts } from './prompts/loader';
 import * as ipc from './ipc';
