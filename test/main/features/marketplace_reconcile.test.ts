@@ -89,6 +89,12 @@ describe('marketplace reconcile', () => {
     const result = await reconcile.checkServerUpdatesForInstalls('u1');
 
     expect(result).toEqual({ updated_agents: 1, updated_skills: 0 });
+    expect(postJsonMock).toHaveBeenCalledTimes(1);
+    expect(postJsonMock).toHaveBeenCalledWith('/marketplace/agents/list', {
+      page: 1,
+      size: 100,
+      ids: ['agent1'],
+    });
     const manifest = await installs.readInstalls('u1');
     expect(manifest.agents[0]).toMatchObject({
       id: 'agent1',
@@ -119,6 +125,71 @@ describe('marketplace reconcile', () => {
 
     expect(result).toEqual({ updated_agents: 0, updated_skills: 0, skipped: true });
     expect(postJsonMock).not.toHaveBeenCalled();
+  });
+
+  it('checks server updates with installed ids instead of scanning every review status', async () => {
+    postJsonMock.mockImplementation(async (p: string) => {
+      if (p === '/marketplace/agents/list') {
+        return {
+          list: [{
+            id: 'agent-a',
+            version: '1.0.0',
+            published_at: 100,
+            updated_at: 100,
+            status: 'approved',
+          }],
+          total: 1,
+        };
+      }
+      if (p === '/marketplace/skills/list') {
+        return {
+          list: [{
+            id: 'skill-a',
+            version: '1.0.0',
+            published_at: 200,
+            updated_at: 200,
+            status: 'approved',
+          }],
+          total: 1,
+        };
+      }
+      throw new Error(`unexpected path ${p}`);
+    });
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    await installs.addAgentInstall('u1', {
+      id: 'agent-a',
+      version: '1.0.0',
+      published_at: 100,
+      updated_at: 100,
+      agent_json_url: 'https://example.test/agent-a.json',
+      create_uid: '0',
+      status: 'approved',
+    });
+    await installs.addSkillInstall('u1', {
+      id: 'skill-a',
+      version: '1.0.0',
+      published_at: 200,
+      updated_at: 200,
+      bundle_url: 'https://example.test/skill-a.zip',
+      create_uid: '0',
+      status: 'approved',
+    });
+
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const result = await reconcile.checkServerUpdatesForInstalls('u1');
+
+    expect(result).toEqual({ updated_agents: 0, updated_skills: 0 });
+    expect(postJsonMock).toHaveBeenCalledTimes(2);
+    expect(postJsonMock).toHaveBeenNthCalledWith(1, '/marketplace/agents/list', {
+      page: 1,
+      size: 100,
+      ids: ['agent-a'],
+    });
+    expect(postJsonMock).toHaveBeenNthCalledWith(2, '/marketplace/skills/list', {
+      page: 1,
+      size: 100,
+      ids: ['skill-a'],
+    });
   });
 
   it('restores a local-only new skill install into the cloud manifest', async () => {

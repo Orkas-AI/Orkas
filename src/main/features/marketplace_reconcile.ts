@@ -188,9 +188,11 @@ export async function checkServerUpdatesForInstalls(
   let agentMap: Map<string, _CatalogRow>;
   let skillMap: Map<string, _CatalogRow>;
   try {
+    const agentIds = manifest.agents.map((a) => a.id).filter(Boolean);
+    const skillIds = manifest.skills.map((s) => s.id).filter(Boolean);
     [agentMap, skillMap] = await Promise.all([
-      _fetchServerCatalogMap('agents'),
-      _fetchServerCatalogMap('skills'),
+      agentIds.length ? _fetchServerCatalogMap('agents', agentIds) : Promise.resolve(new Map()),
+      skillIds.length ? _fetchServerCatalogMap('skills', skillIds) : Promise.resolve(new Map()),
     ]);
   } catch (err) {
     log.warn(`server-check fetch failed (offline?): ${(err as Error).message}`);
@@ -321,33 +323,35 @@ function _markServerCheckSuccess(uid: string): void {
 interface _CatalogRow { version: string; published_at: number; updated_at?: number; default_install?: boolean; status?: string }
 
 /** Paginate the public `/marketplace/{kind}/list` endpoint and collapse to (id → version + ts).
- *  Page-size 100 × 20 pages = 2000 row cap (well above current catalog scale). */
-async function _fetchServerCatalogMap(kind: 'agents' | 'skills'): Promise<Map<string, _CatalogRow>> {
+ *  The optional `ids` filter is supported by newer Servers. Older Servers ignore the extra body
+ *  field, so we still page defensively; the client-side id set prevents unrelated rows from
+ *  entering the update map. Page-size 100 × 20 pages = 2000 row cap. */
+async function _fetchServerCatalogMap(kind: 'agents' | 'skills', ids: string[]): Promise<Map<string, _CatalogRow>> {
   const out = new Map<string, _CatalogRow>();
   const PAGE_SIZE = 100;
-  for (const status of ['unreviewed', 'reviewing', 'approved', 'rejected', 'archived']) {
-    for (let page = 1; page <= 20; page++) {
-      const r = await postJson<{ list: Array<{ id?: string; version?: string; published_at?: number; updated_at?: number; default_install?: boolean | number; status?: string; state?: string }>; total?: number }>(
-        `/marketplace/${kind}/list`, { page, size: PAGE_SIZE, status },
-      );
-      const list = r.list || [];
-      for (const row of list) {
-        if (typeof row.id === 'string' && typeof row.version === 'string' && typeof row.published_at === 'number') {
-          out.set(row.id, {
-            version: row.version,
-            published_at: row.published_at,
-            ...(typeof row.updated_at === 'number' ? { updated_at: row.updated_at } : {}),
-            ...(typeof row.default_install === 'boolean' || typeof row.default_install === 'number'
-              ? { default_install: row.default_install === true || row.default_install === 1 }
-              : {}),
-            ...(typeof row.status === 'string' ? { status: row.status } : (
-              typeof row.state === 'string' ? { status: row.state } : {}
-            )),
-          });
-        }
+  const wanted = new Set(ids.filter(Boolean));
+  for (let page = 1; page <= 20; page++) {
+    const r = await postJson<{ list: Array<{ id?: string; version?: string; published_at?: number; updated_at?: number; default_install?: boolean | number; status?: string; state?: string }>; total?: number }>(
+      `/marketplace/${kind}/list`, { page, size: PAGE_SIZE, ids: [...wanted] },
+    );
+    const list = r.list || [];
+    for (const row of list) {
+      if (typeof row.id !== 'string' || !wanted.has(row.id)) continue;
+      if (typeof row.version === 'string' && typeof row.published_at === 'number') {
+        out.set(row.id, {
+          version: row.version,
+          published_at: row.published_at,
+          ...(typeof row.updated_at === 'number' ? { updated_at: row.updated_at } : {}),
+          ...(typeof row.default_install === 'boolean' || typeof row.default_install === 'number'
+            ? { default_install: row.default_install === true || row.default_install === 1 }
+            : {}),
+          ...(typeof row.status === 'string' ? { status: row.status } : (
+            typeof row.state === 'string' ? { status: row.state } : {}
+          )),
+        });
       }
-      if (list.length < PAGE_SIZE) break;
     }
+    if (out.size >= wanted.size || list.length < PAGE_SIZE) break;
   }
   return out;
 }
