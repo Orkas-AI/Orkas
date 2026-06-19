@@ -28,6 +28,8 @@ export interface SandboxConfig {
   allowNetwork?: boolean;
   /** Environment variables to pass through. */
   env?: Record<string, string>;
+  /** Abort signal used by the runner to stop a wedged tool without aborting the whole turn. */
+  signal?: AbortSignal;
   /** Shell to use (default: /bin/sh on POSIX, PowerShell on Windows). */
   shell?: string;
 }
@@ -444,6 +446,7 @@ export class SandboxExecutor {
       let stderrTruncated = false;
       let settled = false;
       let forceSettleTimer: NodeJS.Timeout | null = null;
+      let abortListener: (() => void) | null = null;
 
       const env = buildSandboxEnv(this.config.env);
 
@@ -462,6 +465,13 @@ export class SandboxExecutor {
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
       });
+
+      const abortSignal = this.config.signal;
+      if (abortSignal) {
+        abortListener = () => killChild();
+        if (abortSignal.aborted) abortListener();
+        else abortSignal.addEventListener("abort", abortListener, { once: true });
+      }
 
       // Close stdin immediately — no interactive input
       child.stdin.end();
@@ -507,6 +517,7 @@ export class SandboxExecutor {
         settled = true;
         clearTimeout(timeoutId);
         if (forceSettleTimer) clearTimeout(forceSettleTimer);
+        if (abortSignal && abortListener) abortSignal.removeEventListener("abort", abortListener);
         let stdout = decodeProcessOutput(Buffer.concat(stdoutChunks), process.platform, env);
         let stderr = decodeProcessOutput(Buffer.concat(stderrChunks), process.platform, env);
         if (stdoutTruncated) stdout += "\n... [output truncated by sandbox]";
@@ -540,6 +551,7 @@ export class SandboxExecutor {
         if (settled) return;
         clearTimeout(timeoutId);
         if (forceSettleTimer) clearTimeout(forceSettleTimer);
+        if (abortSignal && abortListener) abortSignal.removeEventListener("abort", abortListener);
         settled = true;
         const stdout = decodeProcessOutput(Buffer.concat(stdoutChunks), process.platform, env);
         resolve({

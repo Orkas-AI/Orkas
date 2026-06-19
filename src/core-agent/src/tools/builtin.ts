@@ -103,6 +103,7 @@ export const bashTool: AgentTool = defineTool({
       workingDir: ctx.workingDir ?? ".",
       timeoutMs,
       env: ctx.state.sandboxEnv as Record<string, string> | undefined,
+      signal: ctx.signal,
     });
 
     if (input.run_in_background === true) {
@@ -151,7 +152,7 @@ function startBashHeartbeat(ctx: ToolContext, timeoutMs: number): () => void {
     ctx.emitProgress?.({
       phase: "running",
       message: `Command still running (${formatDuration(elapsedMs)} elapsed; timeout ${formatDuration(timeoutMs)})`,
-      data: { elapsedMs, timeoutMs },
+      data: { elapsedMs, timeoutMs, heartbeat: true },
     });
   }, BASH_PROGRESS_INTERVAL_MS);
   if (typeof timer.unref === "function") timer.unref();

@@ -15,7 +15,9 @@ export type ToolProgress = {
   phase?: string;
   /** Human-readable status text for the process rail. */
   message: string;
-  /** Optional structured metadata for renderers / logs. */
+  /** Optional structured metadata for renderers / logs.
+   * Set `heartbeat: true` for "still running" keepalive updates that should
+   * not reset the runner's tool-idle watchdog. */
   data?: Record<string, unknown>;
 };
 

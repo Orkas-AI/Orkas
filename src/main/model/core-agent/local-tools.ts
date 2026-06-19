@@ -455,6 +455,7 @@ async function executeDirectOrkasCli(
     const startedAt = Date.now();
     let heartbeat: NodeJS.Timeout | null = null;
     let settleTimer: NodeJS.Timeout | null = null;
+    let abortListener: (() => void) | null = null;
 
     const child = spawn(invocation.nodePath, [invocation.scriptPath, ...invocation.args], {
       cwd: workingDir,
@@ -470,6 +471,7 @@ async function executeDirectOrkasCli(
       clearTimeout(timeout);
       if (heartbeat) clearInterval(heartbeat);
       if (settleTimer) clearTimeout(settleTimer);
+      if (ctx.signal && abortListener) ctx.signal.removeEventListener('abort', abortListener);
       resolve(result);
     };
 
@@ -530,13 +532,19 @@ async function executeDirectOrkasCli(
     }, timeoutMs);
     if (typeof timeout.unref === 'function') timeout.unref();
 
+    if (ctx.signal) {
+      abortListener = () => killChild();
+      if (ctx.signal.aborted) abortListener();
+      else ctx.signal.addEventListener('abort', abortListener, { once: true });
+    }
+
     if (ctx.emitProgress) {
       heartbeat = setInterval(() => {
         const elapsedMs = Date.now() - startedAt;
         ctx.emitProgress?.({
           phase: 'running',
           message: `Command still running (${formatBashDuration(elapsedMs)} elapsed; timeout ${formatBashDuration(timeoutMs)})`,
-          data: { elapsedMs, timeoutMs },
+          data: { elapsedMs, timeoutMs, heartbeat: true },
         });
       }, BASH_PROGRESS_INTERVAL_MS);
       if (typeof heartbeat.unref === 'function') heartbeat.unref();

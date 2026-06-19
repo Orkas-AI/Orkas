@@ -13,7 +13,7 @@ import type { CoreAgentConfig } from "../config/schema.js";
 import type { EvolutionConfig } from "../evolution/types.js";
 import type { LLMProvider, CompletionResult } from "../providers/base.js";
 import { ProviderRegistry } from "../providers/registry.js";
-import type { AgentTool, ToolContext, ToolResult } from "../tools/base.js";
+import type { AgentTool, ToolContext, ToolProgress, ToolResult } from "../tools/base.js";
 import { toToolDefinition } from "../tools/base.js";
 import { getBuiltinTools } from "../tools/builtin.js";
 import { SkillStore } from "../evolution/skill-store.js";
@@ -26,6 +26,7 @@ const RETRY_BASE_DELAY_MS = 1_000;
 const RETRY_MAX_DELAY_MS = 30_000;
 const RETRY_AFTER_MAX_DELAY_MS = 120_000;
 const RETRY_JITTER_RATIO = 0.2;
+const TOOL_HEARTBEAT_TIMEOUT_GRACE_MS = 30_000;
 
 function retryDelayMs(err: unknown, attempt: number): number {
   if (err instanceof RateLimitError && err.retryAfterMs != null) {
@@ -399,6 +400,9 @@ export class AgentRunner {
             return true;
           };
           const abortedToolMessage = "Tool execution aborted: Run aborted";
+          const toolIdleTimeoutMs = this.config.agent.toolIdleTimeoutMs;
+          const stalledToolMessage =
+            `Tool execution stalled after ${toolIdleTimeoutMs}ms without substantive progress`;
           try {
             if (params.signal?.aborted) {
               addToolResultOnce(abortedToolMessage, undefined, true);
@@ -415,14 +419,19 @@ export class AgentRunner {
             const progressQueue: Array<Extract<AgentRunEvent, { type: "tool_progress" }>> = [];
             let notifyProgress: (() => void) | null = null;
             let acceptingProgress = true;
+            let toolStalled = false;
+            const toolAbort = createChildAbortController(params.signal);
+            const toolIdle = createToolIdleWatchdog(toolIdleTimeoutMs);
             const toolCtx: ToolContext = {
               workingDir: params.workingDir,
-              signal: params.signal,
+              signal: toolAbort.signal,
               state: toolState,
               emitProgress: (progress) => {
                 if (!acceptingProgress) return;
                 const message = String(progress?.message || "").trim();
                 if (!message) return;
+                const idleDelayMs = toolIdleDelayForProgress(progress, toolIdleTimeoutMs);
+                if (idleDelayMs != null) toolIdle.reset(idleDelayMs);
                 progressQueue.push({
                   type: "tool_progress",
                   id: call.id,
@@ -457,11 +466,22 @@ export class AgentRunner {
                 const progressWait = new Promise<"progress">((resolve) => {
                   notifyProgress = () => resolve("progress");
                 });
-                const waits: Array<Promise<ToolCompletion | "progress" | "abort">> = [toolPromise, progressWait];
+                const waits: Array<Promise<ToolCompletion | "progress" | "abort" | "tool_idle">> = [
+                  toolPromise,
+                  progressWait,
+                  toolIdle.promise,
+                ];
                 if (abortWait.promise) waits.push(abortWait.promise);
                 const raced = await Promise.race(waits);
                 if (raced === "progress") continue;
+                if (raced === "tool_idle") {
+                  toolStalled = true;
+                  toolAbort.abort();
+                  break;
+                }
                 if (raced === "abort") {
+                  acceptingProgress = false;
+                  progressQueue.length = 0;
                   addToolResultOnce(abortedToolMessage, undefined, true);
                   yield {
                     type: "tool_end",
@@ -477,11 +497,26 @@ export class AgentRunner {
               }
             } finally {
               abortWait.cleanup();
+              toolIdle.cancel();
+              toolAbort.cleanup();
               notifyProgress = null;
               acceptingProgress = false;
             }
             while (progressQueue.length) {
               yield progressQueue.shift()!;
+            }
+            if (toolStalled) {
+              addToolResultOnce(stalledToolMessage, undefined, true);
+              yield {
+                type: "tool_end",
+                id: call.id,
+                name: call.name,
+                result: stalledToolMessage,
+                isError: true,
+              };
+              permanentToolErrors++;
+              log.warn(`Tool ${call.name} stalled: ${stalledToolMessage}`);
+              continue;
             }
             if (completed.ok !== true) throw completed.err;
             const toolResult = completed.result;
@@ -845,6 +880,76 @@ function waitForAbort(signal: AbortSignal | undefined): {
     cleanup = () => signal.removeEventListener("abort", onAbort);
   });
   return { promise, cleanup };
+}
+
+function createChildAbortController(parent: AbortSignal | undefined): {
+  signal: AbortSignal;
+  abort: () => void;
+  cleanup: () => void;
+} {
+  const controller = new AbortController();
+  let cleanup = () => undefined;
+  if (parent) {
+    const onAbort = () => controller.abort();
+    if (parent.aborted) {
+      onAbort();
+    } else {
+      parent.addEventListener("abort", onAbort, { once: true });
+      cleanup = () => parent.removeEventListener("abort", onAbort);
+    }
+  }
+  return {
+    signal: controller.signal,
+    abort: () => controller.abort(),
+    cleanup,
+  };
+}
+
+function createToolIdleWatchdog(timeoutMs: number): {
+  promise: Promise<"tool_idle">;
+  reset: (nextTimeoutMs?: number) => void;
+  cancel: () => void;
+} {
+  let timer: NodeJS.Timeout | null = null;
+  let settled = false;
+  let resolveIdle!: (value: "tool_idle") => void;
+  const promise = new Promise<"tool_idle">((resolve) => {
+    resolveIdle = resolve;
+  });
+  const reset = (nextTimeoutMs = timeoutMs) => {
+    if (settled) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      settled = true;
+      resolveIdle("tool_idle");
+    }, nextTimeoutMs);
+    if (typeof timer.unref === "function") timer.unref();
+  };
+  const cancel = () => {
+    settled = true;
+    if (timer) clearTimeout(timer);
+    timer = null;
+  };
+  reset();
+  return { promise, reset, cancel };
+}
+
+function isHeartbeatProgress(progress: ToolProgress): boolean {
+  return progress.data?.heartbeat === true;
+}
+
+function toolIdleDelayForProgress(progress: ToolProgress, defaultTimeoutMs: number): number | null {
+  if (!isHeartbeatProgress(progress)) return defaultTimeoutMs;
+  const declaredTimeoutMs = finiteProgressNumber(progress.data?.timeoutMs);
+  const elapsedMs = finiteProgressNumber(progress.data?.elapsedMs);
+  if (declaredTimeoutMs == null || elapsedMs == null) return null;
+  const remainingMs = declaredTimeoutMs - elapsedMs;
+  if (remainingMs <= 0) return null;
+  return Math.max(defaultTimeoutMs, remainingMs + TOOL_HEARTBEAT_TIMEOUT_GRACE_MS);
+}
+
+function finiteProgressNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
 /**

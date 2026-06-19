@@ -501,6 +501,147 @@ describe("AgentRunner", () => {
     });
   });
 
+  it("runStream converts a heartbeat-only wedged tool into an error result and continues", async () => {
+    const mockProvider = createMockProvider([
+      {
+        content: [
+          { type: "tool_use", id: "call_1", name: "wedged_tool", input: {} },
+        ],
+        stopReason: "tool_use",
+        usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "continued after tool stall" }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 7, outputTokens: 5, totalTokens: 12 },
+        model: "mock-model",
+      },
+    ]);
+
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const wedgedTool = defineTool({
+      name: "wedged_tool",
+      description: "Only emits keepalive progress and never resolves",
+      inputSchema: { type: "object", properties: {} },
+      async execute(_input, ctx) {
+        const timer = setInterval(() => {
+          ctx.emitProgress?.({
+            phase: "running",
+            message: "still running",
+            data: { heartbeat: true },
+          });
+        }, 5);
+        ctx.signal?.addEventListener("abort", () => clearInterval(timer), { once: true });
+        return new Promise(() => undefined);
+      },
+    });
+    const config = createConfig({
+      agent: {
+        defaultProvider: "mock",
+        defaultModel: "mock-model",
+        toolIdleTimeoutMs: 30,
+      },
+    });
+
+    const runner = new AgentRunner({ config, providers: registry, tools: [wedgedTool] });
+    const collected: Array<{ type: string; [k: string]: unknown }> = [];
+    for await (const ev of runner.runStream({ message: "go" })) {
+      collected.push(ev as { type: string; [k: string]: unknown });
+    }
+
+    const toolEnd = collected.find((e) => e.type === "tool_end");
+    expect(toolEnd).toMatchObject({
+      type: "tool_end",
+      id: "call_1",
+      name: "wedged_tool",
+      isError: true,
+      result: "Tool execution stalled after 30ms without substantive progress",
+    });
+    const done = collected[collected.length - 1] as { type: string; result?: { text?: string; meta?: { aborted?: boolean; permanentToolErrors?: number } } };
+    expect(done.type).toBe("done");
+    expect(done.result?.text).toBe("continued after tool stall");
+    expect(done.result?.meta?.aborted).toBeUndefined();
+    expect(done.result?.meta?.permanentToolErrors).toBe(1);
+    const toolResults = runner.getSession().getMessages().flatMap((msg) =>
+      msg.content.filter((content) => content.type === "tool_result"),
+    );
+    expect(toolResults).toHaveLength(1);
+    expect(toolResults[0]).toMatchObject({
+      type: "tool_result",
+      toolUseId: "call_1",
+      content: "Tool execution stalled after 30ms without substantive progress",
+      isError: true,
+    });
+  });
+
+  it("runStream lets heartbeat-only tools finish when they advertise their own timeout", async () => {
+    const mockProvider = createMockProvider([
+      {
+        content: [
+          { type: "tool_use", id: "call_1", name: "bounded_tool", input: {} },
+        ],
+        stopReason: "tool_use",
+        usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "bounded tool completed" }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 7, outputTokens: 5, totalTokens: 12 },
+        model: "mock-model",
+      },
+    ]);
+
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const boundedTool = defineTool({
+      name: "bounded_tool",
+      description: "Emits keepalive progress with a declared timeout before resolving",
+      inputSchema: { type: "object", properties: {} },
+      async execute(_input, ctx) {
+        const startedAt = Date.now();
+        const timer = setInterval(() => {
+          ctx.emitProgress?.({
+            phase: "running",
+            message: "still running",
+            data: { heartbeat: true, elapsedMs: Date.now() - startedAt, timeoutMs: 500 },
+          });
+        }, 5);
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        clearInterval(timer);
+        return { content: "ok" };
+      },
+    });
+    const config = createConfig({
+      agent: {
+        defaultProvider: "mock",
+        defaultModel: "mock-model",
+        toolIdleTimeoutMs: 30,
+      },
+    });
+
+    const runner = new AgentRunner({ config, providers: registry, tools: [boundedTool] });
+    const collected: Array<{ type: string; [k: string]: unknown }> = [];
+    for await (const ev of runner.runStream({ message: "go" })) {
+      collected.push(ev as { type: string; [k: string]: unknown });
+    }
+
+    const toolEnd = collected.find((e) => e.type === "tool_end");
+    expect(toolEnd).toMatchObject({
+      type: "tool_end",
+      id: "call_1",
+      name: "bounded_tool",
+      isError: undefined,
+      result: "ok",
+    });
+    const done = collected[collected.length - 1] as { type: string; result?: { text?: string; meta?: { permanentToolErrors?: number } } };
+    expect(done.type).toBe("done");
+    expect(done.result?.text).toBe("bounded tool completed");
+    expect(done.result?.meta?.permanentToolErrors).toBeUndefined();
+  });
+
   it("runStream forwards tool input deltas before tool execution", async () => {
     const mockProvider = createMockProvider([
       {
