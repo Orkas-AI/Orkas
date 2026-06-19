@@ -12,6 +12,7 @@ import { readJsonSync, writeJsonSync } from '../storage';
 import { createLogger } from '../logger';
 import { getCurrentDevice } from '../util/device';
 import { fetchWithRetry } from '../util/retry';
+import { desktopPlatform } from '../system_info';
 
 export type ClientConfigEffect = 'immediate' | 'restart';
 
@@ -375,6 +376,10 @@ function region(): string {
   return 'global';
 }
 
+export function clientConfigPlatform(platform = process.platform): string {
+  return desktopPlatform(platform);
+}
+
 function apiBase(_app: ElectronAppLike): string {
   return PROD_DEFAULT;
 }
@@ -382,7 +387,7 @@ function apiBase(_app: ElectronAppLike): string {
 function buildUrl(app: ElectronAppLike): string {
   const url = new URL(`${apiBase(app)}/config/client`);
   const device = getCurrentDevice();
-  url.searchParams.set('platform', 'pc');
+  url.searchParams.set('platform', clientConfigPlatform());
   url.searchParams.set('version', app.getVersion());
   url.searchParams.set('channel', channel(app));
   url.searchParams.set('region', region());

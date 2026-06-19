@@ -39,6 +39,7 @@ import { app, BrowserWindow, Menu, ipcMain, nativeImage, net, protocol, session,
 // rather than in index.ts body (esbuild CJS hoists imports → body runs
 // after paths.ts loads, which is too late to set the env var).
 import './install-data-root.cjs';
+import { desktopPlatform, osVersion } from './system_info';
 
 const APP_USER_MODEL_ID = 'com.orkas.desktop';
 
@@ -239,12 +240,15 @@ function registerIpc(): void {
   });
 
   ipcMain.handle('orkas.env', () => {
+    const systemVersion = osVersion();
+    const platform = desktopPlatform();
     return {
       ok: true,
       isDev: !app.isPackaged,
       isPackaged: app.isPackaged,
       version: app.getVersion(),
-      platform: process.platform,
+      platform,
+      osVersion: systemVersion,
       arch: process.arch,
     };
   });

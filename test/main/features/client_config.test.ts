@@ -20,7 +20,14 @@ vi.mock('electron', () => ({
   powerMonitor: electronMock.powerMonitor,
 }));
 
-import { ClientConfigManager, getMinimumAppVersion, refresh, start, stop } from '../../../src/main/features/client_config';
+import {
+  ClientConfigManager,
+  clientConfigPlatform,
+  getMinimumAppVersion,
+  refresh,
+  start,
+  stop,
+} from '../../../src/main/features/client_config';
 
 const FOUR_HOURS_MS = 4 * 60 * 60 * 1000;
 
@@ -62,6 +69,12 @@ describe('client_config', () => {
     const manager = new ClientConfigManager();
     manager.registerDefault('feature.local-default', true);
     expect(manager.get('feature.local-default')).toBe(true);
+  });
+
+  it('maps desktop OS names to client config platform buckets', () => {
+    expect(clientConfigPlatform('darwin')).toBe('mac');
+    expect(clientConfigPlatform('win32')).toBe('windows');
+    expect(clientConfigPlatform('linux')).toBe('pc');
   });
 
   it('lets Server immediate config override registered defaults', async () => {
@@ -300,7 +313,7 @@ describe('client_config', () => {
 
       const url = new URL(requestedUrl);
       expect(url.origin + url.pathname).toBe('https://config.example/api/config/client');
-      expect(url.searchParams.get('platform')).toBe('pc');
+      expect(url.searchParams.get('platform')).toBe(clientConfigPlatform());
       expect(url.searchParams.get('version')).toBe('9.8.7');
       expect(url.searchParams.get('channel')).toBe('dev');
       expect(url.searchParams.get('region')).toBe('global');
