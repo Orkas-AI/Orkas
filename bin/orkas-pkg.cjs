@@ -183,6 +183,7 @@ function run(cmd, args, opts) {
     env: { ...process.env, ...((opts && opts.env) || {}) },
     // npm/pip/git progress goes to our stderr so the bash tool surfaces it.
     stdio: ['ignore', 'pipe', 'inherit'],
+    windowsHide: true,
   });
   if (res.error) {
     if (res.error.code === 'ENOENT') {

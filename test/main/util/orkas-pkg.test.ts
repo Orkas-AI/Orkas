@@ -109,6 +109,15 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
+describe('orkas-pkg.cjs source invariants', () => {
+  it('hides dependency subprocess windows on Windows', () => {
+    const source = fs.readFileSync(path.join(process.cwd(), 'bin', 'orkas-pkg.cjs'), 'utf8');
+    const body = source.match(/function run\(cmd, args, opts\) \{[\s\S]*?\n\}/)?.[0] ?? '';
+
+    expect(body).toContain('windowsHide: true');
+  });
+});
+
 describe.skipIf(!gitAvailable)('orkas-pkg.cjs', () => {
   it('installs a skill-shaped repo verbatim and records skill roots', () => {
     const repo = makeRepo('skillpack', {

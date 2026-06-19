@@ -306,7 +306,7 @@ function runFfmpeg(
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     try { throwIfAborted(opts.signal); } catch (err) { reject(err); return; }
-    const child = spawn(cmd, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    const child = spawn(cmd, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
     let stderr = '';
     let settled = false;
     const started = Date.now();

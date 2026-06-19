@@ -551,6 +551,7 @@ function trySpawn(cmd, argv, skillDir, skillId, fatalOnEnoent = false) {
     child = spawn(cmd, argv, {
       stdio: 'inherit',
       env: { ...process.env, ORKAS_SKILL_ID: skillId, ORKAS_SKILL_DIR: skillDir },
+      windowsHide: true,
     });
   } catch (e) {
     if (fatalOnEnoent) die(76, `failed to spawn ${cmd}: ${e && e.message}`);

@@ -58,6 +58,13 @@ describe('run-skill.cjs', () => {
     expect(body.indexOf('findOnPath')).toBeLessThan(body.indexOf('const roots'));
   });
 
+  it('hides spawned script windows on Windows', () => {
+    const source = fs.readFileSync(path.join(process.cwd(), 'bin', 'run-skill.cjs'), 'utf8');
+    const body = source.match(/function trySpawn\([\s\S]*?\n\}/)?.[0] ?? '';
+
+    expect(body).toContain('windowsHide: true');
+  });
+
   it('resolves marketplace scripts by SKILL.md display name when dir id differs', () => {
     writeMarketplaceSkill('252af214f470', 'social-fetch', 'fetch');
 
