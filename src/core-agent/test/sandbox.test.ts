@@ -40,6 +40,24 @@ describe("SandboxExecutor", () => {
     expect(result.timedOut).toBe(true);
   }, 10000);
 
+  it("times out commands whose background child keeps stdout open", async () => {
+    if (process.platform === "win32") return;
+    const quote = (s: string) => `"${s.replace(/(["\\$`])/g, "\\$1")}"`;
+    const script = [
+      "const { spawn } = require('node:child_process');",
+      "spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'inherit' });",
+      "console.log('parent done');",
+    ].join("");
+    const sandbox = new SandboxExecutor({
+      workingDir: os.tmpdir(),
+      timeoutMs: 500,
+    });
+    const started = Date.now();
+    const result = await sandbox.execute(`${quote(process.execPath)} -e ${quote(script)}`);
+    expect(result.timedOut).toBe(true);
+    expect(Date.now() - started).toBeLessThan(5000);
+  }, 10000);
+
   it("blocks dangerous commands", async () => {
     const sandbox = new SandboxExecutor({ workingDir: os.tmpdir() });
     const result = await sandbox.execute("rm -rf /");

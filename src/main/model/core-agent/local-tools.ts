@@ -46,7 +46,12 @@ import * as path from 'node:path';
 import { spawn } from 'node:child_process';
 
 import type { AgentTool, ToolContext, ToolResult } from '#core-agent';
-import { bashTool as coreBashTool, writeFileTool as coreWriteFileTool } from '../../../core-agent/src/tools/builtin';
+import {
+  BASH_PROGRESS_INTERVAL_MS,
+  DEFAULT_BASH_TIMEOUT_MS,
+  bashTool as coreBashTool,
+  writeFileTool as coreWriteFileTool,
+} from '../../../core-agent/src/tools/builtin';
 import { buildSandboxEnv, decodeProcessOutput } from '../../../core-agent/src/sandbox/executor';
 import { getLocalExecGranted, getLocalExecMode } from '../../features/permissions';
 import { classifyBashCommand } from './bash-risk';
@@ -434,7 +439,7 @@ async function executeDirectOrkasCli(
   ctx: ToolContext,
   workingDir: string,
 ): Promise<ToolResult> {
-  const timeoutMs = (input.timeoutMs as number | undefined) ?? 300_000;
+  const timeoutMs = (input.timeoutMs as number | undefined) ?? DEFAULT_BASH_TIMEOUT_MS;
   const sandboxEnv = (ctx.state.sandboxEnv ?? {}) as Record<string, string>;
   const env = buildSandboxEnv(sandboxEnv);
 
@@ -446,6 +451,8 @@ async function executeDirectOrkasCli(
     let outputLimitExceeded = false;
     let truncatedKind: 'stdout' | 'stderr' | null = null;
     let settled = false;
+    const startedAt = Date.now();
+    let heartbeat: NodeJS.Timeout | null = null;
 
     const child = spawn(invocation.nodePath, [invocation.scriptPath, ...invocation.args], {
       cwd: workingDir,
@@ -458,6 +465,7 @@ async function executeDirectOrkasCli(
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      if (heartbeat) clearInterval(heartbeat);
       resolve(result);
     };
 
@@ -493,6 +501,18 @@ async function executeDirectOrkasCli(
     }, timeoutMs);
     if (typeof timeout.unref === 'function') timeout.unref();
 
+    if (ctx.emitProgress) {
+      heartbeat = setInterval(() => {
+        const elapsedMs = Date.now() - startedAt;
+        ctx.emitProgress?.({
+          phase: 'running',
+          message: `Command still running (${formatBashDuration(elapsedMs)} elapsed; timeout ${formatBashDuration(timeoutMs)})`,
+          data: { elapsedMs, timeoutMs },
+        });
+      }, BASH_PROGRESS_INTERVAL_MS);
+      if (typeof heartbeat.unref === 'function') heartbeat.unref();
+    }
+
     child.on('error', (err) => {
       finish({ content: bashMsg('start_failed', { command: invocation.script, error: err.message }), isError: true });
     });
@@ -520,6 +540,13 @@ async function executeDirectOrkasCli(
 
     child.stdin.end(invocation.stdin ?? '');
   });
+}
+
+function formatBashDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return `${ms}ms`;
+  if (ms >= 60_000) return `${Math.max(1, Math.round(ms / 60_000))}m`;
+  if (ms >= 1_000) return `${Math.max(1, Math.round(ms / 1_000))}s`;
+  return `${Math.round(ms)}ms`;
 }
 
 async function executeCoreBashWithOutputTracking(
@@ -673,7 +700,10 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
       'should be shown to the user as produced-file chips (for example .docx, .xlsx, ' +
       '.pptx, .pdf, images, HTML, CSV, Markdown), write them under the absolute ' +
       '$ORKAS_OUTPUT_DIR path, which is the current conversation workspace. ' +
-      'Scratch/cache files should stay in temporary or cache directories.',
+      'Scratch/cache files should stay in temporary or cache directories. ' +
+      'For GUI apps, browsers, servers, watchers, or any command you would normally ' +
+      'background with `&`, set run_in_background=true instead of shell-backgrounding it; ' +
+      'inherited stdout/stderr can otherwise keep the tool waiting.',
     inputSchema: coreBashTool.inputSchema,
     async execute(input, ctx) {
       const mode = getLocalExecMode();

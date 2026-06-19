@@ -369,6 +369,7 @@ export class SandboxExecutor {
       const child = spawn(invocation.command, invocation.args, {
         cwd,
         env,
+        detached: process.platform !== "win32",
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
       });
@@ -415,15 +416,26 @@ export class SandboxExecutor {
       function killChild() {
         if (killed) return;
         killed = true;
-        child.kill("SIGTERM");
+        killChildWithSignal("SIGTERM");
         // Escalate to SIGKILL after 5 seconds
-        setTimeout(() => {
-          try {
-            child.kill("SIGKILL");
-          } catch {
-            // Process may already be dead
+        const killTimer = setTimeout(() => killChildWithSignal("SIGKILL"), 5000);
+        if (typeof killTimer.unref === "function") killTimer.unref();
+      }
+
+      function killChildWithSignal(signal: NodeJS.Signals) {
+        try {
+          if (process.platform !== "win32" && child.pid) {
+            process.kill(-child.pid, signal);
+            return;
           }
-        }, 5000);
+        } catch {
+          // Fall back to killing the shell process below.
+        }
+        try {
+          child.kill(signal);
+        } catch {
+          // Process may already be dead.
+        }
       }
 
       child.on("close", (code) => {

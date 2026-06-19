@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { defineTool, type AgentTool } from "./base.js";
+import { defineTool, type AgentTool, type ToolContext } from "./base.js";
 import { SandboxExecutor } from "../sandbox/executor.js";
 import { webFetchTool } from "./web-fetch.js";
 import { webSearchTool } from "./web-search.js";
@@ -66,14 +66,17 @@ export const writeFileTool: AgentTool = defineTool({
  * Uses SandboxExecutor for timeout enforcement, output limits,
  * and blocked command filtering.
  */
+export const DEFAULT_BASH_TIMEOUT_MS = 30 * 60_000;
+export const BASH_PROGRESS_INTERVAL_MS = 60_000;
+
 export const bashTool: AgentTool = defineTool({
   name: "bash",
-  description: "Execute a shell command in a sandboxed environment and return its output. Use for system operations, builds, etc.",
+  description: "Execute a shell command in a sandboxed environment and return its output. Use for system operations, builds, etc. For GUI apps, browsers, servers, watchers, or any command you would normally background with `&`, set run_in_background=true instead of shell-backgrounding it; inherited stdout/stderr can otherwise keep the tool waiting.",
   inputSchema: {
     type: "object",
     properties: {
       command: { type: "string", description: "The shell command to execute." },
-      timeoutMs: { type: "number", description: "Timeout in milliseconds (default: 300000 = 5 min). Pass a larger value (e.g. 600000 / 900000) for long-running commands like builds, large installs, network fetches, video processing." },
+      timeoutMs: { type: "number", description: "Timeout in milliseconds (default: 1800000 = 30 min). Pass a larger value (e.g. 3600000) for long-running commands like builds, large installs, network fetches, video processing." },
       run_in_background: {
         type: "boolean",
         description: "Run detached and return immediately with a pid + log file path instead of waiting. Use for commands that may outlast any reasonable timeout (long builds, renders, big downloads). Poll progress by reading the log file; stop the process with `kill <pid>`. The process is NOT stopped automatically when the conversation ends.",
@@ -83,7 +86,7 @@ export const bashTool: AgentTool = defineTool({
   },
   async execute(input, ctx) {
     const command = input.command as string;
-    const timeoutMs = (input.timeoutMs as number) ?? 300_000;
+    const timeoutMs = (input.timeoutMs as number) ?? DEFAULT_BASH_TIMEOUT_MS;
 
     const sandbox = new SandboxExecutor({
       workingDir: ctx.workingDir ?? ".",
@@ -108,7 +111,13 @@ export const bashTool: AgentTool = defineTool({
       };
     }
 
-    const result = await sandbox.execute(command);
+    const stopHeartbeat = startBashHeartbeat(ctx, timeoutMs);
+    let result;
+    try {
+      result = await sandbox.execute(command);
+    } finally {
+      stopHeartbeat();
+    }
 
     if (result.timedOut) {
       return { content: `Command timed out after ${timeoutMs}ms`, isError: true };
@@ -122,6 +131,28 @@ export const bashTool: AgentTool = defineTool({
     return { content: result.stdout };
   },
 });
+
+function startBashHeartbeat(ctx: ToolContext, timeoutMs: number): () => void {
+  if (!ctx.emitProgress) return () => undefined;
+  const startedAt = Date.now();
+  const timer = setInterval(() => {
+    const elapsedMs = Date.now() - startedAt;
+    ctx.emitProgress?.({
+      phase: "running",
+      message: `Command still running (${formatDuration(elapsedMs)} elapsed; timeout ${formatDuration(timeoutMs)})`,
+      data: { elapsedMs, timeoutMs },
+    });
+  }, BASH_PROGRESS_INTERVAL_MS);
+  if (typeof timer.unref === "function") timer.unref();
+  return () => clearInterval(timer);
+}
+
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return `${ms}ms`;
+  if (ms >= 60_000) return `${Math.max(1, Math.round(ms / 60_000))}m`;
+  if (ms >= 1_000) return `${Math.max(1, Math.round(ms / 1_000))}s`;
+  return `${Math.round(ms)}ms`;
+}
 
 /** List files in a directory. */
 export const listFilesTool: AgentTool = defineTool({

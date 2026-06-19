@@ -392,6 +392,7 @@ export class AgentRunner {
             skillsLoadedSet.add((call.input as any).id as string);
           }
           try {
+            if (params.signal?.aborted) throw new Error("Run aborted");
             log.debug(`Executing tool: ${call.name}`);
             const progressQueue: Array<Extract<AgentRunEvent, { type: "tool_progress" }>> = [];
             let notifyProgress: (() => void) | null = null;
@@ -426,17 +427,26 @@ export class AgentRunner {
                 (result) => ({ ok: true as const, result }),
                 (err) => ({ ok: false as const, err }),
               );
+            const abortWait = waitForAbort(params.signal);
             let completed: ToolCompletion | null = null;
-            while (!completed) {
-              while (progressQueue.length) {
-                yield progressQueue.shift()!;
+            try {
+              while (!completed) {
+                while (progressQueue.length) {
+                  yield progressQueue.shift()!;
+                }
+                const progressWait = new Promise<"progress">((resolve) => {
+                  notifyProgress = () => resolve("progress");
+                });
+                const waits: Array<Promise<ToolCompletion | "progress" | "abort">> = [toolPromise, progressWait];
+                if (abortWait.promise) waits.push(abortWait.promise);
+                const raced = await Promise.race(waits);
+                if (raced === "progress") continue;
+                if (raced === "abort") throw new Error("Run aborted");
+                completed = raced;
+                notifyProgress = null;
               }
-              const progressWait = new Promise<"progress">((resolve) => {
-                notifyProgress = () => resolve("progress");
-              });
-              const raced = await Promise.race([toolPromise, progressWait]);
-              if (raced === "progress") continue;
-              completed = raced;
+            } finally {
+              abortWait.cleanup();
               notifyProgress = null;
             }
             while (progressQueue.length) {
@@ -457,6 +467,7 @@ export class AgentRunner {
               log.warn(`Tool ${call.name} returned error: ${toolResult.content.slice(0, 150)}`);
             }
           } catch (err) {
+            if (params.signal?.aborted) throw err;
             const errMsg = formatError(err);
             const isTransient = isRetryableError(err);
             log.error(`Tool ${call.name} failed (${isTransient ? 'transient' : 'permanent'}): ${errMsg}`);
@@ -772,6 +783,24 @@ export class AgentRunner {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function waitForAbort(signal: AbortSignal | undefined): {
+  promise: Promise<"abort"> | null;
+  cleanup: () => void;
+} {
+  if (!signal) return { promise: null, cleanup: () => undefined };
+  let cleanup = () => undefined;
+  const promise = new Promise<"abort">((resolve) => {
+    if (signal.aborted) {
+      resolve("abort");
+      return;
+    }
+    const onAbort = () => resolve("abort");
+    signal.addEventListener("abort", onAbort, { once: true });
+    cleanup = () => signal.removeEventListener("abort", onAbort);
+  });
+  return { promise, cleanup };
 }
 
 /**

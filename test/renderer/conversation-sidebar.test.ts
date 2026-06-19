@@ -114,6 +114,20 @@ describe('conversation create-agent inline gate', () => {
   });
 });
 
+describe('conversation run observer cleanup', () => {
+  it('defers cleanup only while the primary send stream still owns the turn', () => {
+    const context = loadConversationRenderer();
+
+    expect(context._observerShouldDeferCleanup('c1', true)).toBe(false);
+    expect(context._observerShouldDeferCleanup('c1', false)).toBe(false);
+
+    vm.runInContext('_convChatCtrls.set("c1", { abort() {} })', context);
+
+    expect(context._observerShouldDeferCleanup('c1', true)).toBe(true);
+    expect(context._observerShouldDeferCleanup('c1', false)).toBe(false);
+  });
+});
+
 describe('conversation sidebar task row actions', () => {
   it('renders a single menu button after the title', () => {
     const context = loadConversationRenderer();

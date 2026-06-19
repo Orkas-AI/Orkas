@@ -432,6 +432,58 @@ describe("AgentRunner", () => {
     expect(iEnd).toBeGreaterThan(iFirstProgress);
   });
 
+  it("runStream stops waiting when a tool ignores abort", async () => {
+    const mockProvider = createMockProvider([
+      {
+        content: [
+          { type: "tool_use", id: "call_1", name: "wedged_tool", input: {} },
+        ],
+        stopReason: "tool_use",
+        usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+        model: "mock-model",
+      },
+    ]);
+
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    let toolStarted!: () => void;
+    const toolStartedPromise = new Promise<void>((resolve) => { toolStarted = resolve; });
+    const wedgedTool = defineTool({
+      name: "wedged_tool",
+      description: "Never resolves",
+      inputSchema: { type: "object", properties: {} },
+      async execute() {
+        toolStarted();
+        return new Promise(() => undefined);
+      },
+    });
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model" },
+    });
+
+    const runner = new AgentRunner({ config, providers: registry, tools: [wedgedTool] });
+    const controller = new AbortController();
+    const collected: Array<{ type: string; [k: string]: unknown }> = [];
+    const run = (async () => {
+      for await (const ev of runner.runStream({ message: "go", signal: controller.signal })) {
+        collected.push(ev as { type: string; [k: string]: unknown });
+      }
+    })();
+
+    await toolStartedPromise;
+    controller.abort();
+    const settled = await Promise.race([
+      run.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1000)),
+    ]);
+
+    expect(settled).toBe(true);
+    const done = collected[collected.length - 1] as { type: string; result?: { meta?: { aborted?: boolean } } };
+    expect(done.type).toBe("done");
+    expect(done.result?.meta?.aborted).toBe(true);
+    expect(collected.some((e) => e.type === "tool_end")).toBe(false);
+  });
+
   it("runStream forwards tool input deltas before tool execution", async () => {
     const mockProvider = createMockProvider([
       {

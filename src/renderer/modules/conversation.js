@@ -4934,6 +4934,10 @@ async function handleChatSubmit() {
 // own AbortController. Entries are dropped on done via the hooks below.
 const _convChatCtrls = new Map();  // cid → controller
 
+function _observerShouldDeferCleanup(cid, allowWithController) {
+  return !!allowWithController && _convChatCtrls.has(cid);
+}
+
 function _makeConvChatController(cid) {
   // Captured into the hooks below so we can compare identity before deleting
   // — see onDone for why.
@@ -5263,7 +5267,7 @@ function _observeConversationRunFromPlanAction(cid, opts = {}) {
         _convChatCtrls.delete(cid);
       }
       if (activated) {
-        if (allowWithController) {
+        if (_observerShouldDeferCleanup(cid, allowWithController)) {
           if (window.PlanRail) window.PlanRail.refresh(cid, { force: true });
           if (window.ConversationInfo) window.ConversationInfo.refreshTasks(cid, { silent: true });
           return;
