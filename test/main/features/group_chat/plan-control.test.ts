@@ -19,6 +19,8 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  vi.doUnmock('../../../../src/main/features/group_chat/bus');
+  vi.restoreAllMocks();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -49,18 +51,43 @@ async function readPlanPayload(cid: string) {
 }
 
 describe('group_chat plan control state', () => {
-  it('shows stop while the runtime is running, including in_flight-only snapshots', async () => {
+  it('shows continue for stale persisted running/in_flight snapshots when no worker is active', async () => {
     const state = await import('../../../../src/main/features/group_chat/state');
 
     const runningCid = newCid();
     await seedPlan(runningCid);
     await state.setStatus(TEST_UID, runningCid, 'running');
-    expect(await controlAction(runningCid)).toBe('stop');
+    expect(await controlAction(runningCid)).toBe('continue');
+    expect((await state.readState(TEST_UID, runningCid)).status).toBe('idle');
 
     const inFlightCid = newCid();
     await seedPlan(inFlightCid);
     await state.markInFlight(TEST_UID, inFlightCid, 'commander', true);
-    expect(await controlAction(inFlightCid)).toBe('stop');
+    expect(await controlAction(inFlightCid)).toBe('continue');
+    expect((await state.readState(TEST_UID, inFlightCid)).in_flight).toEqual([]);
+  });
+
+  it('shows stop while the in-memory runtime is active', async () => {
+    const activeCid = newCid();
+    await seedPlan(activeCid);
+
+    vi.doMock('../../../../src/main/features/group_chat/bus', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('../../../../src/main/features/group_chat/bus')>();
+      return {
+        ...actual,
+        runtimeSnapshot: (uid: string, cid: string) => (
+          uid === TEST_UID && cid === activeCid
+            ? {
+              processing: true,
+              inFlight: ['commander'],
+              activeTurns: [{ actor: 'commander', turn_id: 'turn-active' }],
+            }
+            : actual.runtimeSnapshot(uid, cid)
+        ),
+      };
+    });
+
+    expect(await controlAction(activeCid)).toBe('stop');
   });
 
   it('shows continue for recoverable plan states when no worker is active', async () => {

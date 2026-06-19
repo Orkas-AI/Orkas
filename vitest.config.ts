@@ -1,4 +1,7 @@
 import { defineConfig } from 'vitest/config';
+import { cpus } from 'node:os';
+
+const testWorkers = Math.max(1, Math.min(4, cpus().length || 1));
 
 export default defineConfig({
   test: {
@@ -16,5 +19,12 @@ export default defineConfig({
     setupFiles: ['./test/setup-env.ts'],
     // Default reporter is a per-file dot list — keep CI output compact.
     reporters: ['default'],
+    // The desktop suite exercises native modules, file IO, child processes,
+    // and sqlite-backed features. Leaving Vitest at the host default can
+    // oversubscribe local dev machines and make otherwise healthy tests trip
+    // the 5s default timeout in full-suite runs.
+    maxWorkers: testWorkers,
+    testTimeout: 30_000,
+    hookTimeout: 30_000,
   },
 });
