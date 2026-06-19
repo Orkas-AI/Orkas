@@ -6,6 +6,7 @@
  */
 import { spawn } from "node:child_process";
 import path from "node:path";
+import { TextDecoder } from "node:util";
 import { createLogger } from "../shared/logger.js";
 
 const log = createLogger("sandbox");
@@ -26,7 +27,7 @@ export interface SandboxConfig {
   allowNetwork?: boolean;
   /** Environment variables to pass through. */
   env?: Record<string, string>;
-  /** Shell to use (default: /bin/sh). */
+  /** Shell to use (default: /bin/sh on POSIX, PowerShell on Windows). */
   shell?: string;
 }
 
@@ -46,6 +47,21 @@ export interface SandboxResult {
   durationMs: number;
 }
 
+type ShellKind = "posix" | "cmd" | "powershell";
+
+export interface ShellInvocation {
+  command: string;
+  args: string[];
+  kind: ShellKind;
+}
+
+type OutputEncodingEnv = {
+  LANG?: string;
+  LC_ALL?: string;
+  ORKAS_UI_LANG?: string;
+  [key: string]: string | undefined;
+};
+
 /** Default blocked commands — destructive or dangerous operations. */
 const DEFAULT_BLOCKED_COMMANDS = [
   "rm -rf /",
@@ -61,6 +77,184 @@ const DEFAULT_BLOCKED_COMMANDS = [
   "init 0",
   "init 6",
 ];
+
+function shellBaseName(shell: string): string {
+  return (shell.split(/[\\/]/).pop() || shell).toLowerCase();
+}
+
+function inferShellKind(shell: string, platform: NodeJS.Platform = process.platform): ShellKind {
+  const base = shellBaseName(shell).replace(/\.exe$/i, "");
+  if (platform !== "win32") return "posix";
+  if (base === "cmd" || base === "comspec") return "cmd";
+  if (base === "powershell" || base === "pwsh") return "powershell";
+  return "posix";
+}
+
+export function defaultShellForPlatform(platform: NodeJS.Platform = process.platform): string {
+  if (platform === "win32") {
+    return process.env.ORKAS_WINDOWS_SHELL || "powershell.exe";
+  }
+  return "/bin/sh";
+}
+
+export function buildShellInvocation(
+  shell: string,
+  command: string,
+  platform: NodeJS.Platform = process.platform,
+): ShellInvocation {
+  const kind = inferShellKind(shell, platform);
+  if (platform === "win32" && kind === "powershell") {
+    return {
+      command: shell,
+      args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+      kind,
+    };
+  }
+  if (platform === "win32" && kind === "cmd") {
+    return {
+      command: shell,
+      args: ["/d", "/s", "/c", command],
+      kind,
+    };
+  }
+  return {
+    command: shell,
+    args: [platform === "win32" ? "-lc" : "-c", command],
+    kind,
+  };
+}
+
+function countMatches(input: string, re: RegExp): number {
+  const matches = input.match(re);
+  return matches ? matches.length : 0;
+}
+
+function decodeWithEncoding(bytes: Buffer, encoding: string): string | null {
+  try {
+    return new TextDecoder(encoding).decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+function decodedTextScore(text: string): number {
+  if (!text) return 0;
+  let score = countMatches(text, /\uFFFD/g) * 100;
+  score += countMatches(text, /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g) * 20;
+  // Common mojibake produced when UTF-8 text is decoded with a legacy ANSI
+  // code page. Keep this as a light penalty so valid English/ASCII remains
+  // neutral while obviously broken mixed output loses ties.
+  score += countMatches(text, /(?:Ã.|Â.|å.|æ.|ç.|ä.)/g) * 2;
+  return score;
+}
+
+function windowsFallbackEncodings(env: OutputEncodingEnv = process.env): string[] {
+  const lang = String(env.ORKAS_UI_LANG || env.LC_ALL || env.LANG || "").toLowerCase();
+  const preferred = lang.startsWith("ja")
+    ? ["shift_jis"]
+    : lang.startsWith("ko")
+      ? ["euc-kr"]
+      : lang.includes("tw") || lang.includes("hk") || lang.includes("hant")
+        ? ["big5", "gb18030"]
+        : ["gb18030", "big5"];
+  const out: string[] = [];
+  for (const encoding of [...preferred, "shift_jis", "euc-kr", "windows-1252"]) {
+    if (!out.includes(encoding)) out.push(encoding);
+  }
+  return out;
+}
+
+export function decodeProcessOutput(
+  bytes: Buffer,
+  platform: NodeJS.Platform = process.platform,
+  env: OutputEncodingEnv = process.env,
+): string {
+  if (bytes.length === 0) return "";
+  const utf8 = decodeWithEncoding(bytes, "utf-8") ?? bytes.toString("utf8");
+  if (platform !== "win32") return utf8;
+
+  const utf8Score = decodedTextScore(utf8);
+  if (utf8Score === 0) return utf8;
+
+  let best = utf8;
+  let bestScore = utf8Score;
+  for (const encoding of windowsFallbackEncodings(env)) {
+    const decoded = decodeWithEncoding(bytes, encoding);
+    if (decoded == null) continue;
+    const score = decodedTextScore(decoded);
+    if (score < bestScore) {
+      best = decoded;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+function buildWindowsCanonicalPathEntries(env: NodeJS.ProcessEnv): string[] {
+  const root = getEnvValue(env, ["SystemRoot", "WINDIR"]) || "C:\\Windows";
+  return [
+    path.win32.join(root, "System32"),
+    root,
+    path.win32.join(root, "System32", "WindowsPowerShell", "v1.0"),
+  ];
+}
+
+function getEnvValue(env: NodeJS.ProcessEnv, names: string[]): string | undefined {
+  for (const name of names) {
+    const value = env[name];
+    if (typeof value === "string") return value;
+  }
+  const wanted = new Set(names.map((n) => n.toLowerCase()));
+  for (const [key, value] of Object.entries(env)) {
+    if (wanted.has(key.toLowerCase()) && typeof value === "string") return value;
+  }
+  return undefined;
+}
+
+function windowsHostEnv(env: NodeJS.ProcessEnv): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const key of [
+    "SystemRoot",
+    "WINDIR",
+    "COMSPEC",
+    "ComSpec",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramData",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+  ]) {
+    const value = getEnvValue(env, [key]);
+    if (value) out[key] = value;
+  }
+  return out;
+}
+
+export function buildSandboxEnv(
+  injected: Record<string, string> | undefined,
+  platform: NodeJS.Platform = process.platform,
+): Record<string, string> {
+  const hostPath = getEnvValue(process.env, ["PATH", "Path"]);
+  const env: Record<string, string> = {
+    ...(platform === "win32" ? windowsHostEnv(process.env) : {}),
+    HOME: process.env.HOME ?? process.env.USERPROFILE ?? (platform === "win32" ? "C:\\" : "/tmp"),
+    PATH: augmentPath(hostPath, platform, process.env),
+    TERM: "dumb",
+    LANG: process.env.LANG ?? "en_US.UTF-8",
+    ...(injected ?? {}),
+  };
+
+  if (env.ORKAS_PATH_PREPEND) {
+    const delimiter = platform === "win32" ? ";" : ":";
+    env.PATH = `${env.ORKAS_PATH_PREPEND}${delimiter}${env.PATH}`;
+  }
+
+  return env;
+}
 
 /**
  * SandboxExecutor wraps command execution with safety controls.
@@ -81,11 +275,7 @@ export class SandboxExecutor {
     this.config = {
       timeoutMs: 30_000,
       maxOutputBytes: 1024 * 1024, // 1MB
-      // Windows uses cmd.exe (resolved via the COMSPEC env var);
-      // POSIX uses /bin/sh.
-      shell: process.platform === "win32"
-        ? (process.env.COMSPEC || "cmd.exe")
-        : "/bin/sh",
+      shell: defaultShellForPlatform(),
       ...config,
       workingDir: path.resolve(config.workingDir),
       allowedDirs: config.allowedDirs?.map((d) => path.resolve(d)),
@@ -126,36 +316,17 @@ export class SandboxExecutor {
     const cwd = this.config.workingDir;
 
     return new Promise<SandboxResult>((resolve) => {
-      let stdout = "";
-      let stderr = "";
+      const stdoutChunks: Buffer[] = [];
+      const stderrChunks: Buffer[] = [];
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
       let timedOut = false;
       let outputLimitExceeded = false;
       let killed = false;
+      let stdoutTruncated = false;
+      let stderrTruncated = false;
 
-      // Build environment.
-      // PATH: Electron apps launched from Finder / the dock inherit a minimal
-      // PATH that often excludes brew-installed locations (especially
-      // `/opt/homebrew/bin` on Apple Silicon). Without augmentation, agents
-      // that try `brew install pandoc` or `pip --version` would hit "command
-      // not found" even when the CLI is installed. Prepend the canonical
-      // locations that don't already appear.
-      const env: Record<string, string> = {
-        HOME: process.env.HOME ?? "/tmp",
-        PATH: augmentPath(process.env.PATH),
-        TERM: "dumb",
-        LANG: process.env.LANG ?? "en_US.UTF-8",
-        ...(this.config.env ?? {}),
-      };
-
-      // ORKAS_PATH_PREPEND: host-supplied dirs (e.g. the per-user external
-      // packages `.bin/` shim dir) that must rank ahead of the augmented
-      // PATH. A plain `PATH` override via config.env would *replace* the
-      // augmentation above and lose brew/system locations, so the host
-      // passes a prepend list instead and we compose here. The marker stays
-      // in the child env for debuggability.
-      if (env.ORKAS_PATH_PREPEND) {
-        env.PATH = `${env.ORKAS_PATH_PREPEND}${path.delimiter}${env.PATH}`;
-      }
+      const env = buildSandboxEnv(this.config.env);
 
       // Restrict network if configured
       if (this.config.allowNetwork === false) {
@@ -164,10 +335,12 @@ export class SandboxExecutor {
         env.SANDBOX_NO_NETWORK = "1";
       }
 
-      const child = spawn(this.config.shell, ["-c", command], {
+      const invocation = buildShellInvocation(this.config.shell, command);
+      const child = spawn(invocation.command, invocation.args, {
         cwd,
         env,
         stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
       });
 
       // Close stdin immediately — no interactive input
@@ -176,25 +349,31 @@ export class SandboxExecutor {
       // Collect stdout with size limit
       child.stdout.on("data", (data: Buffer) => {
         if (outputLimitExceeded) return;
-        stdout += data.toString("utf-8");
-        if (stdout.length > this.config.maxOutputBytes) {
+        stdoutBytes += data.length;
+        if (stdoutBytes > this.config.maxOutputBytes) {
           outputLimitExceeded = true;
-          stdout = stdout.slice(0, this.config.maxOutputBytes) +
-            "\n... [output truncated by sandbox]";
+          stdoutTruncated = true;
+          const allowed = Math.max(0, data.length - (stdoutBytes - this.config.maxOutputBytes));
+          if (allowed > 0) stdoutChunks.push(data.subarray(0, allowed));
           killChild();
+          return;
         }
+        stdoutChunks.push(data);
       });
 
       // Collect stderr with size limit
       child.stderr.on("data", (data: Buffer) => {
         if (outputLimitExceeded) return;
-        stderr += data.toString("utf-8");
-        if (stderr.length > this.config.maxOutputBytes) {
+        stderrBytes += data.length;
+        if (stderrBytes > this.config.maxOutputBytes) {
           outputLimitExceeded = true;
-          stderr = stderr.slice(0, this.config.maxOutputBytes) +
-            "\n... [stderr truncated by sandbox]";
+          stderrTruncated = true;
+          const allowed = Math.max(0, data.length - (stderrBytes - this.config.maxOutputBytes));
+          if (allowed > 0) stderrChunks.push(data.subarray(0, allowed));
           killChild();
+          return;
         }
+        stderrChunks.push(data);
       });
 
       // Timeout handler
@@ -219,6 +398,10 @@ export class SandboxExecutor {
 
       child.on("close", (code) => {
         clearTimeout(timeoutId);
+        let stdout = decodeProcessOutput(Buffer.concat(stdoutChunks), process.platform, env);
+        let stderr = decodeProcessOutput(Buffer.concat(stderrChunks), process.platform, env);
+        if (stdoutTruncated) stdout += "\n... [output truncated by sandbox]";
+        if (stderrTruncated) stderr += "\n... [stderr truncated by sandbox]";
         resolve({
           stdout,
           stderr,
@@ -231,6 +414,7 @@ export class SandboxExecutor {
 
       child.on("error", (err) => {
         clearTimeout(timeoutId);
+        const stdout = decodeProcessOutput(Buffer.concat(stdoutChunks), process.platform, env);
         resolve({
           stdout,
           stderr: err.message,
@@ -256,16 +440,7 @@ export class SandboxExecutor {
     if (violation) {
       return { pid: null, error: `Command blocked by sandbox policy: ${violation}` };
     }
-    const env: Record<string, string> = {
-      HOME: process.env.HOME ?? "/tmp",
-      PATH: augmentPath(process.env.PATH),
-      TERM: "dumb",
-      LANG: process.env.LANG ?? "en_US.UTF-8",
-      ...(this.config.env ?? {}),
-    };
-    if (env.ORKAS_PATH_PREPEND) {
-      env.PATH = `${env.ORKAS_PATH_PREPEND}${path.delimiter}${env.PATH}`;
-    }
+    const env = buildSandboxEnv(this.config.env);
     let logFd: number;
     try {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -276,7 +451,8 @@ export class SandboxExecutor {
       return { pid: null, error: `cannot open log file: ${(err as Error).message}` };
     }
     try {
-      const child = spawn(this.config.shell, ["-c", command], {
+      const invocation = buildShellInvocation(this.config.shell, command);
+      const child = spawn(invocation.command, invocation.args, {
         cwd: this.config.workingDir,
         env,
         detached: process.platform !== "win32",
@@ -328,10 +504,18 @@ const CANONICAL_PATH_ENTRIES = [
   "/sbin",
 ];
 
-export function augmentPath(input: string | undefined): string {
-  const existing = (input ?? "").split(":").filter(Boolean);
+export function augmentPath(
+  input: string | undefined,
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const delimiter = platform === "win32" ? ";" : ":";
+  const canonical = platform === "win32"
+    ? buildWindowsCanonicalPathEntries(env)
+    : CANONICAL_PATH_ENTRIES;
+  const existing = (input ?? "").split(delimiter).filter(Boolean);
   const existingSet = new Set(existing);
-  const missing = CANONICAL_PATH_ENTRIES.filter((p) => !existingSet.has(p));
+  const missing = canonical.filter((p) => !existingSet.has(p));
   const merged = [...missing, ...existing];
-  return merged.length ? merged.join(":") : CANONICAL_PATH_ENTRIES.join(":");
+  return merged.length ? merged.join(delimiter) : canonical.join(delimiter);
 }

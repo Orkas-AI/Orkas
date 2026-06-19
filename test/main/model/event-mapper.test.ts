@@ -7,6 +7,7 @@ import {
   agentReadMetadataForToolStart,
 } from '../../../src/main/model/core-agent/event-mapper';
 import { userMarketplaceAgentsDir, userMarketplaceSkillsDir } from '../../../src/main/paths';
+import { setCurrentLang } from '../../../src/main/i18n';
 
 type AgentRunEvent =
   | { type: 'text_delta'; text: string }
@@ -244,6 +245,18 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     // click handler exclusively goes through the IPC path. Avoids
     // duplicating the (potentially large) marker text on the wire.
     expect(endEvent.event.data.output).toBeUndefined();
+  });
+
+  it('localizes known runner fallback text', async () => {
+    setCurrentLang('zh');
+    try {
+      const out = await collect([
+        { type: 'done', result: { text: '(Tool loop limit reached)', meta: { error: null } } },
+      ]);
+      expect(out).toEqual([{ type: 'final', text: '（工具调用次数已达上限）' }]);
+    } finally {
+      setCurrentLang('en');
+    }
   });
 });
 

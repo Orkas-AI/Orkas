@@ -66,22 +66,100 @@ export function readJsonSync<T = Record<string, any>>(filePath: string): T {
   }
 }
 
+const RENAME_RETRY_DELAYS_MS = [10, 25, 50, 100, 200, 400, 800];
+const RENAME_RETRY_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+
+function atomicTmpPath(filePath: string): string {
+  return `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+}
+
+function isRetryableRenameError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === 'string' && RENAME_RETRY_CODES.has(code);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function sleepSync(ms: number): void {
+  const buffer = new SharedArrayBuffer(4);
+  const view = new Int32Array(buffer);
+  Atomics.wait(view, 0, 0, ms);
+}
+
+async function renameWithRetryUsing(
+  tmp: string,
+  filePath: string,
+  renameFn: (oldPath: string, newPath: string) => Promise<void>,
+): Promise<void> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await renameFn(tmp, filePath);
+      return;
+    } catch (err) {
+      if (!isRetryableRenameError(err) || attempt >= RENAME_RETRY_DELAYS_MS.length) throw err;
+      await sleep(RENAME_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+}
+
+function renameWithRetry(tmp: string, filePath: string): Promise<void> {
+  return renameWithRetryUsing(tmp, filePath, fsp.rename);
+}
+
+function renameWithRetrySyncUsing(
+  tmp: string,
+  filePath: string,
+  renameFn: (oldPath: string, newPath: string) => void,
+): void {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      renameFn(tmp, filePath);
+      return;
+    } catch (err) {
+      if (!isRetryableRenameError(err) || attempt >= RENAME_RETRY_DELAYS_MS.length) throw err;
+      sleepSync(RENAME_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+}
+
+function renameWithRetrySync(tmp: string, filePath: string): void {
+  return renameWithRetrySyncUsing(tmp, filePath, fs.renameSync);
+}
+
+export const __storageTestHooks = {
+  renameWithRetryUsing,
+  renameWithRetrySyncUsing,
+};
+
 /**
  * Atomically write JSON with UTF-8 and 2-space indent.
- * Writes to <path>.tmp then renames over the target to prevent torn reads.
+ * Writes to a same-directory temp file then renames over the target to
+ * prevent torn reads.
  */
 export async function writeJson(filePath: string, data: unknown): Promise<void> {
   await fsp.mkdir(path.dirname(filePath), { recursive: true });
-  const tmp = `${filePath}.tmp`;
+  const tmp = atomicTmpPath(filePath);
   await fsp.writeFile(tmp, JSON.stringify(data, null, 2), 'utf8');
-  await fsp.rename(tmp, filePath);
+  try {
+    await renameWithRetry(tmp, filePath);
+  } catch (err) {
+    await fsp.rm(tmp, { force: true }).catch(() => {});
+    throw err;
+  }
 }
 
 export function writeJsonSync(filePath: string, data: unknown): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tmp = `${filePath}.tmp`;
+  const tmp = atomicTmpPath(filePath);
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
-  fs.renameSync(tmp, filePath);
+  try {
+    renameWithRetrySync(tmp, filePath);
+  } catch (err) {
+    try { fs.rmSync(tmp, { force: true }); } catch {}
+    throw err;
+  }
 }
 
 /**
@@ -92,9 +170,14 @@ export function writeJsonSync(filePath: string, data: unknown): void {
  */
 export function writeTextAtomicSync(filePath: string, text: string, encoding: BufferEncoding = 'utf8'): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tmp = `${filePath}.tmp`;
+  const tmp = atomicTmpPath(filePath);
   fs.writeFileSync(tmp, text, { encoding });
-  fs.renameSync(tmp, filePath);
+  try {
+    renameWithRetrySync(tmp, filePath);
+  } catch (err) {
+    try { fs.rmSync(tmp, { force: true }); } catch {}
+    throw err;
+  }
 }
 
 /** Append one JSON record as a single line. */
@@ -209,9 +292,14 @@ export async function rewriteJsonlLine<T extends object>(
     const out = body.join('\n') + '\n';
     // Write to tmp + rename — rewrite is a "full file" op; we can't use
     // append here. Line count stays the same.
-    const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+    const tmp = atomicTmpPath(filePath);
     await fsp.writeFile(tmp, out, 'utf8');
-    await fsp.rename(tmp, filePath);
+    try {
+      await renameWithRetry(tmp, filePath);
+    } catch (err) {
+      await fsp.rm(tmp, { force: true }).catch(() => {});
+      throw err;
+    }
     return { ok: true, record: next };
   });
 }

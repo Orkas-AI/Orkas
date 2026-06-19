@@ -6,7 +6,7 @@ import {
   nowIso, genUserId, genId12, safeId,
   readJson, readJsonSync, writeJson, writeJsonSync,
   writeTextAtomicSync, appendJsonl, appendJsonlAtomic,
-  invalidateLineCount, readJsonl,
+  invalidateLineCount, readJsonl, __storageTestHooks,
 } from '../../src/main/storage';
 
 let tmpDir: string;
@@ -18,6 +18,12 @@ beforeEach(() => {
 afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
+
+function eperm(): NodeJS.ErrnoException {
+  const err = new Error('locked by another process') as NodeJS.ErrnoException;
+  err.code = 'EPERM';
+  return err;
+}
 
 describe('storage › timestamps & ids', () => {
   it('nowIso renders local time as YYYY-MM-DDTHH:MM:SS without TZ', () => {
@@ -87,6 +93,21 @@ describe('storage › JSON IO', () => {
     expect(fs.existsSync(p)).toBe(true);
   });
 
+  it('writeJson retries transient EPERM rename failures', async () => {
+    const p = path.join(tmpDir, 'retry.json');
+    let calls = 0;
+    fs.writeFileSync(`${p}.tmp`, '{"ok":true}', 'utf8');
+
+    await __storageTestHooks.renameWithRetryUsing(`${p}.tmp`, p, async (from, to) => {
+      calls += 1;
+      if (calls <= 2) throw eperm();
+      await fs.promises.rename(from, to);
+    });
+
+    expect(await readJson(p)).toEqual({ ok: true });
+    expect(calls).toBe(3);
+  });
+
   it('readJson returns {} on missing file', async () => {
     expect(await readJson(path.join(tmpDir, 'missing.json'))).toEqual({});
   });
@@ -108,6 +129,21 @@ describe('storage › JSON IO', () => {
     const p = path.join(tmpDir, 'deeply', 'nested', 'x.json');
     writeJsonSync(p, { ok: 1 });
     expect(fs.existsSync(p)).toBe(true);
+  });
+
+  it('writeJsonSync retries transient EPERM rename failures', () => {
+    const p = path.join(tmpDir, 'sync-retry.json');
+    let calls = 0;
+    fs.writeFileSync(`${p}.tmp`, '{"ok":true}', 'utf8');
+
+    __storageTestHooks.renameWithRetrySyncUsing(`${p}.tmp`, p, (from, to) => {
+      calls += 1;
+      if (calls <= 2) throw eperm();
+      fs.renameSync(from, to);
+    });
+
+    expect(readJsonSync(p)).toEqual({ ok: true });
+    expect(calls).toBe(3);
   });
 });
 

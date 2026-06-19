@@ -43,9 +43,11 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { spawn } from 'node:child_process';
 
 import type { AgentTool, ToolContext, ToolResult } from '#core-agent';
 import { bashTool as coreBashTool, writeFileTool as coreWriteFileTool } from '../../../core-agent/src/tools/builtin';
+import { buildSandboxEnv, decodeProcessOutput } from '../../../core-agent/src/sandbox/executor';
 import { getLocalExecGranted, getLocalExecMode } from '../../features/permissions';
 import { classifyBashCommand } from './bash-risk';
 import { requestBashDecision } from './bash-permissions';
@@ -59,6 +61,7 @@ import * as chatArtifacts from '../../features/chat_artifacts';
 import { readDisabledSets } from '../../features/component_enabled';
 import { requestConfirmation as requestDeleteConfirmation, consumeGrantedConfirmation } from './delete-file-confirm';
 import { createLogger } from '../../logger';
+import { t } from '../../i18n';
 
 const log = createLogger('local-tools');
 
@@ -148,6 +151,29 @@ function isMineFor(opts: LocalToolsOpts): (p: string) => boolean {
 
 function errText(code: string, msg: string): string {
   return `${code}: ${msg}`;
+}
+
+function bashMsg(key: string, vars?: Record<string, string | number>): string {
+  return t(`bash.error.${key}`, vars);
+}
+
+function translateFixedBashError(result: ToolResult): ToolResult {
+  const content = result.content || '';
+  if (!content) return result;
+
+  let m = /^Command timed out after (\d+)ms$/.exec(content);
+  if (m) return { ...result, content: bashMsg('timeout', { ms: m[1] }) };
+
+  m = /^Exit code: (.+)$/.exec(content);
+  if (m) return { ...result, content: bashMsg('exit_code', { code: m[1] }) };
+
+  m = /^Failed to start background command: (.+)$/.exec(content);
+  if (m) return { ...result, content: bashMsg('background_start_failed', { error: m[1] }) };
+
+  m = /^Command blocked by sandbox policy: (.+)$/.exec(content);
+  if (m) return { ...result, content: bashMsg('blocked', { reason: m[1] }) };
+
+  return result;
 }
 
 const BASH_PRODUCED_SCAN_LIMIT = 5000;
@@ -277,6 +303,225 @@ function withBashOutputEnv(ctx: ToolContext, outputDir: string): () => void {
   };
 }
 
+type OrkasCliInvocation = {
+  script: 'run-skill.cjs' | 'orkas-pkg.cjs';
+  nodePath: string;
+  scriptPath: string;
+  args: string[];
+  stdin?: string;
+};
+
+const ORKAS_DIRECT_CLI_SCRIPTS = new Set(['run-skill.cjs', 'orkas-pkg.cjs']);
+const ORKAS_DIRECT_OUTPUT_LIMIT = 1024 * 1024;
+
+function splitTrailingHeredoc(command: string): { command: string; stdin: string } | null {
+  const open = /<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?\s*\r?\n/.exec(command);
+  if (!open) return null;
+  const marker = open[1];
+  const bodyAndEnd = command.slice(open.index + open[0].length);
+  const endRe = new RegExp(`\\r?\\n${marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[ \\t]*(?:\\r?\\n)?$`);
+  const end = endRe.exec(bodyAndEnd);
+  if (!end) return null;
+  return {
+    command: command.slice(0, open.index).trimEnd(),
+    stdin: bodyAndEnd.slice(0, end.index),
+  };
+}
+
+function shellWords(input: string): string[] | null {
+  const words: string[] = [];
+  let cur = '';
+  let quote: "'" | '"' | null = null;
+  let hasCur = false;
+  const push = () => {
+    if (!hasCur) return;
+    words.push(cur);
+    cur = '';
+    hasCur = false;
+  };
+
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      else { cur += ch; hasCur = true; }
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') { quote = null; continue; }
+      if (ch === '\\' && i + 1 < input.length) {
+        cur += input[++i];
+      } else {
+        cur += ch;
+      }
+      hasCur = true;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      hasCur = true;
+      continue;
+    }
+    if (ch === '\\' && i + 1 < input.length) {
+      cur += input[++i];
+      hasCur = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      push();
+      continue;
+    }
+    cur += ch;
+    hasCur = true;
+  }
+  if (quote) return null;
+  push();
+  return words;
+}
+
+function expandOrkasEnvToken(token: string, env: Record<string, string>): string {
+  return token
+    .replace(/\$\{ORKAS_NODE\}/g, env.ORKAS_NODE || '')
+    .replace(/\$ORKAS_NODE/g, env.ORKAS_NODE || '')
+    .replace(/\$\{ORKAS_PC_DIR\}/g, env.ORKAS_PC_DIR || '')
+    .replace(/\$ORKAS_PC_DIR/g, env.ORKAS_PC_DIR || '');
+}
+
+function sameResolvedPath(a: string, b: string): boolean {
+  const ra = path.resolve(a);
+  const rb = path.resolve(b);
+  return process.platform === 'win32'
+    ? ra.toLowerCase() === rb.toLowerCase()
+    : ra === rb;
+}
+
+function parseOrkasCliInvocation(
+  input: Record<string, unknown>,
+  ctx: ToolContext,
+): OrkasCliInvocation | null {
+  if (input.run_in_background === true) return null;
+  const rawCommand = String(input.command ?? '');
+  const heredoc = splitTrailingHeredoc(rawCommand);
+  const command = heredoc?.command ?? rawCommand;
+  const words = shellWords(command);
+  if (!words || words.length < 2) return null;
+
+  const sandboxEnv = (ctx.state.sandboxEnv ?? {}) as Record<string, string>;
+  const nodePath = sandboxEnv.ORKAS_NODE;
+  const pcDir = sandboxEnv.ORKAS_PC_DIR;
+  if (!nodePath || !pcDir) return null;
+
+  const resolvedNode = expandOrkasEnvToken(words[0], sandboxEnv);
+  if (!sameResolvedPath(resolvedNode, nodePath)) return null;
+
+  const scriptPath = expandOrkasEnvToken(words[1], sandboxEnv);
+  const script = path.basename(scriptPath) as OrkasCliInvocation['script'];
+  if (!ORKAS_DIRECT_CLI_SCRIPTS.has(script)) return null;
+  if (!sameResolvedPath(scriptPath, path.join(pcDir, 'bin', script))) return null;
+
+  return {
+    script,
+    nodePath,
+    scriptPath: path.resolve(scriptPath),
+    args: words.slice(2),
+    ...(heredoc ? { stdin: heredoc.stdin } : {}),
+  };
+}
+
+async function executeDirectOrkasCli(
+  invocation: OrkasCliInvocation,
+  input: Record<string, unknown>,
+  ctx: ToolContext,
+  workingDir: string,
+): Promise<ToolResult> {
+  const timeoutMs = (input.timeoutMs as number | undefined) ?? 300_000;
+  const sandboxEnv = (ctx.state.sandboxEnv ?? {}) as Record<string, string>;
+  const env = buildSandboxEnv(sandboxEnv);
+
+  return await new Promise<ToolResult>((resolve) => {
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let totalBytes = 0;
+    let timedOut = false;
+    let outputLimitExceeded = false;
+    let truncatedKind: 'stdout' | 'stderr' | null = null;
+    let settled = false;
+
+    const child = spawn(invocation.nodePath, [invocation.scriptPath, ...invocation.args], {
+      cwd: workingDir,
+      env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+
+    const finish = (result: ToolResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve(result);
+    };
+
+    const killChild = () => {
+      try { child.kill('SIGTERM'); } catch { /* already gone */ }
+      setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      }, 5000);
+    };
+
+    const append = (kind: 'stdout' | 'stderr', data: Buffer) => {
+      if (outputLimitExceeded) return;
+      totalBytes += data.length;
+      if (totalBytes > ORKAS_DIRECT_OUTPUT_LIMIT) {
+        outputLimitExceeded = true;
+        truncatedKind = kind;
+        const allowed = Math.max(0, data.length - (totalBytes - ORKAS_DIRECT_OUTPUT_LIMIT));
+        if (allowed > 0) {
+          (kind === 'stdout' ? stdoutChunks : stderrChunks).push(data.subarray(0, allowed));
+        }
+        killChild();
+        return;
+      }
+      (kind === 'stdout' ? stdoutChunks : stderrChunks).push(data);
+    };
+
+    child.stdout.on('data', (data: Buffer) => append('stdout', data));
+    child.stderr.on('data', (data: Buffer) => append('stderr', data));
+
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      killChild();
+    }, timeoutMs);
+    if (typeof timeout.unref === 'function') timeout.unref();
+
+    child.on('error', (err) => {
+      finish({ content: bashMsg('start_failed', { command: invocation.script, error: err.message }), isError: true });
+    });
+    child.on('close', (code) => {
+      let stdout = decodeProcessOutput(Buffer.concat(stdoutChunks), process.platform, env);
+      let stderr = decodeProcessOutput(Buffer.concat(stderrChunks), process.platform, env);
+      if (outputLimitExceeded) {
+        if (truncatedKind === 'stdout') stdout += '\n... [output truncated by sandbox]';
+        else stderr += '\n... [output truncated by sandbox]';
+      }
+      if (timedOut) {
+        finish({ content: bashMsg('timeout', { ms: timeoutMs }), isError: true });
+        return;
+      }
+      if (outputLimitExceeded) {
+        finish({ content: stderr || stdout, isError: code !== 0 });
+        return;
+      }
+      if (code !== 0) {
+        finish({ content: stderr || stdout || bashMsg('exit_code', { code: code ?? 'null' }), isError: true });
+        return;
+      }
+      finish({ content: stdout });
+    });
+
+    child.stdin.end(invocation.stdin ?? '');
+  });
+}
+
 async function executeCoreBashWithOutputTracking(
   opts: LocalToolsOpts,
   input: Record<string, unknown>,
@@ -287,9 +532,12 @@ async function executeCoreBashWithOutputTracking(
   const before = opts.onFileWritten ? collectBashFileSnapshot(outputDir) : new Map<string, BashFileSnapshotEntry>();
   const restoreEnv = withBashOutputEnv(ctx, outputDir);
   try {
-    const result = await coreBashTool.execute(input, ctx);
+    const direct = parseOrkasCliInvocation(input, ctx);
+    const result = direct
+      ? await executeDirectOrkasCli(direct, input, ctx, workingDir)
+      : await coreBashTool.execute(input, ctx);
     if (!result.isError) emitBashProducedFiles(opts, before, outputDir);
-    return result;
+    return translateFixedBashError(result);
   } finally {
     restoreEnv();
   }
@@ -483,7 +731,7 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
       //               Best-effort cleanup: any rmdir failure (concurrent
       //               bash on same cwd, ENOTEMPTY, EACCES) is silently
       //               swallowed.
-      if (!ctx.workingDir) return coreBashTool.execute(input, ctx);
+      if (!ctx.workingDir) return translateFixedBashError(await coreBashTool.execute(input, ctx));
       const workingDir = path.resolve(ctx.workingDir);
       if (fs.existsSync(workingDir)) {
         return executeCoreBashWithOutputTracking(opts, input, ctx, workingDir);

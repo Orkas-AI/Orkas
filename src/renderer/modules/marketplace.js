@@ -283,6 +283,8 @@ function openMarketplace(initialTab = 'agent', opts = {}) {
     detailSkillFiles: [],
     detailSkillSelected: 'SKILL.md',
     detailSkillFileText: '',
+    detailSkillLoadError: '',
+    detailSkillSourceOpen: false,
   };
 
   if (!_mpBound) {
@@ -1288,6 +1290,7 @@ async function _mpOpenDetail(kind, item, opts = {}) {
   _mpState.detailSkillFiles = [];
   _mpState.detailSkillSelected = prevSelected;
   _mpState.detailSkillFileText = '';
+  _mpState.detailSkillLoadError = '';
   _mpState.detailSkillSourceOpen = prevSourceOpen;
   _mpShowDetailView();
   _mpRenderDetail();
@@ -1301,20 +1304,24 @@ async function _mpOpenDetail(kind, item, opts = {}) {
       if (!detail || detail.ok === false) throw new Error((detail && detail.error) || 'detail failed');
       _mpState.detailAgentJson = detail.agent_json;
     } else {
-      const detail = await window.orkas.invoke('marketplace.detailSkill', {
-        id: item.id, version: item.version,
-        published_at: item.published_at, updated_at: item.updated_at,
-      });
-      if (!detail || detail.ok === false) throw new Error((detail && detail.error) || 'detail failed');
-      const files = await window.orkas.invoke('marketplace.cacheSkillFiles', { id: item.id });
-      _mpState.detailSkillFiles = (files && files.list) || [];
-      const selected = _mpState.detailSkillFiles.find((f) => f.path === _mpState.detailSkillSelected)
-        ? _mpState.detailSkillSelected
-        : 'SKILL.md';
-      _mpState.detailSkillSelected = selected;
-      if (_mpState.detailSkillFiles.find((f) => f.path === selected)) {
-        const r = await window.orkas.invoke('marketplace.cacheSkillRead', { id: item.id, file: selected });
-        _mpState.detailSkillFileText = (r && r.content) || '';
+      try {
+        const detail = await window.orkas.invoke('marketplace.detailSkill', {
+          id: item.id, version: item.version,
+          published_at: item.published_at, updated_at: item.updated_at,
+        });
+        if (!detail || detail.ok === false) throw new Error((detail && detail.error) || 'detail failed');
+        const files = await window.orkas.invoke('marketplace.cacheSkillFiles', { id: item.id });
+        _mpState.detailSkillFiles = (files && files.list) || [];
+        const selected = _mpState.detailSkillFiles.find((f) => f.path === _mpState.detailSkillSelected)
+          ? _mpState.detailSkillSelected
+          : 'SKILL.md';
+        _mpState.detailSkillSelected = selected;
+        if (_mpState.detailSkillFiles.find((f) => f.path === selected)) {
+          const r = await window.orkas.invoke('marketplace.cacheSkillRead', { id: item.id, file: selected });
+          _mpState.detailSkillFileText = (r && r.content) || '';
+        }
+      } catch (err) {
+        _mpState.detailSkillLoadError = (err && err.message) || String(err);
       }
     }
   } catch (err) {
@@ -1492,19 +1499,30 @@ function _mpSkillDetailHtml() {
   const files = _mpState.detailSkillFiles || [];
   const selected = _mpState.detailSkillSelected;
   const text = _mpState.detailSkillFileText || '';
+  const loadError = _mpState.detailSkillLoadError || '';
 
-  const treeHtml = files.map((f) => {
-    const active = f.path === selected ? ' active' : '';
-    return `<div class="skill-tree-node skill-tree-file${active}" data-mp-skill-file="${escapeHtml(f.path)}">
-      <span class="skill-tree-label">${escapeHtml(f.path)}</span>
-      <span class="muted" style="margin-left:auto;font-size:11px">${_fmtBytes(f.bytes)}</span>
-    </div>`;
-  }).join('');
+  let treeHtml = '';
+  if (loadError && !files.length) {
+    treeHtml = `<div class="empty">${escapeHtml(t('marketplace.load_failed'))}: ${escapeHtml(loadError)}</div>`;
+  } else {
+    treeHtml = files.map((f) => {
+      const active = f.path === selected ? ' active' : '';
+      return `<div class="skill-tree-node skill-tree-file${active}" data-mp-skill-file="${escapeHtml(f.path)}">
+        <span class="skill-tree-label">${escapeHtml(f.path)}</span>
+        <span class="muted" style="margin-left:auto;font-size:11px">${_fmtBytes(f.bytes)}</span>
+      </div>`;
+    }).join('');
+  }
 
   const isMd = selected.toLowerCase().endsWith('.md');
-  const bodyHtml = isMd
-    ? renderMarkdownFull(text)
-    : `<pre class="code-view"><code>${escapeHtml(text)}</code></pre>`;
+  let bodyHtml = '';
+  if (loadError) {
+    bodyHtml = `<div class="empty">${escapeHtml(t('marketplace.load_failed'))}: ${escapeHtml(loadError)}</div>`;
+  } else if (isMd) {
+    bodyHtml = renderMarkdownFull(text);
+  } else {
+    bodyHtml = `<pre class="code-view"><code>${escapeHtml(text)}</code></pre>`;
+  }
   const placeholderHtml = `<span class="agents-detail-placeholder">${escapeHtml(t('agents.placeholder_unset'))}</span>`;
 
   return `

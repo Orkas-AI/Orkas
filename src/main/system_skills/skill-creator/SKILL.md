@@ -246,7 +246,7 @@ Add implementation-specific subsections only when they are needed:
 **Default preference: guide-type (no script)**.
 
 - If the task can be done with main-conversation generic tools (file IO / `kb_search` / `web_fetch` / `bash` / etc.), the body lists 3–7 actionable steps and `scripts/` is empty.
-- Add `scripts/<basename>.<ext>` ONLY when the task needs dedicated code (complex parsing, local state, third-party API state, signature verification). **No placeholder skeletons** — `{"ok": true}` + empty data is not an implementation; if you can't write the real thing this turn, fall back to guide-type and tell the user "the interface is in place; once we agree on the implementation direction, I'll add the script next message".
+- Add `scripts/<basename>.<ext>` ONLY when the task needs dedicated code (complex parsing, local state, third-party API state, signature verification). Prefer `.py`, `.js`, `.mjs`, or `.ts` for new scripts; do not author new `.sh` scripts unless preserving an existing source skill that already uses shell. **No placeholder skeletons** — `{"ok": true}` + empty data is not an implementation; if you can't write the real thing this turn, fall back to guide-type and tell the user "the interface is in place; once we agree on the implementation direction, I'll add the script next message".
 
 ## Script invocation (when there is a script)
 
@@ -258,10 +258,12 @@ $ORKAS_NODE $ORKAS_PC_DIR/bin/run-skill.cjs <skill-id> <script-basename> [-- arg
 
 **Do NOT prefix with `bash`** — the bash tool runs `command` itself as a shell command; a `bash` prefix tells the shell to execute the Electron binary as a script and produces "cannot execute binary file". The command starts with `$ORKAS_NODE`. The `<script-basename>` does NOT include the extension — only one file per basename per directory.
 
+Use this exact Orkas runner shape for cross-platform skill execution. Orkas can dispatch this standard command directly on Windows without requiring Bash; generic Unix shell pipelines remain OS/shell-specific and should not be the primary implementation of a new skill.
+
 The runner picks the runtime by file extension:
 - `.py` → `python3` (Windows automatically tries `py -3` → `python`). **Default language; broadest coverage**.
 - `.ts` / `.mjs` / `.js` → require + default export. **`.ts` scripts MUST `export default async function(args)`**, return JSON-serializable result, runner auto-`JSON.stringify`s it to stdout.
-- `.sh` → `bash`.
+- `.sh` → `bash` / a POSIX-compatible shell. Use only for preserved upstream shell scripts; do not choose it for newly authored Orkas skills.
 - `.rb` → `ruby`.
 
 In subprocess mode, stdio is passed through, exit code propagated, the script handles argv / stdout / errors itself. The runner injects `ORKAS_SKILL_ID` / `ORKAS_SKILL_DIR` (pointing at the skill root) so the script can address its bundled resource files.

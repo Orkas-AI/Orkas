@@ -35,6 +35,7 @@ import { mapCoreAgentEvents } from './event-mapper';
 import { getSession as _getCachedSession } from './session-store';
 import { app } from 'electron';
 import * as paths from '../../paths';
+import { getCurrentLang } from '../../i18n';
 
 interface NoopRecorder {
   record(event: unknown): void;
@@ -97,6 +98,7 @@ function buildSkillSandboxEnvStatic(): Record<string, string> {
  */
 export function buildSkillSandboxEnv(userId?: string): Record<string, string> {
   const env = { ...buildSkillSandboxEnvStatic() };
+  env.ORKAS_UI_LANG = getCurrentLang();
   if (userId) {
     env.ORKAS_UID = userId;
     try {

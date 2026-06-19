@@ -144,6 +144,15 @@ export function friendlyRetryReason(reason: string): string {
   return t('errors.network');
 }
 
+function localizeKnownRunnerText(text: string): string {
+  const trimmed = String(text || '').trim();
+  if (trimmed === '(Tool loop limit reached)') return t('model.tool_loop_limit_reached');
+  if (trimmed === 'Run aborted') return t('model.run_aborted');
+  if (trimmed === 'Max retries exceeded') return t('model.max_retries_exceeded');
+  if (trimmed === 'empty response') return t('model.empty_response');
+  return text;
+}
+
 function toolInputPath(input: unknown): string {
   if (!input) return '';
   if (typeof input === 'string') return input;
@@ -433,7 +442,7 @@ export async function* mapCoreAgentEvents(
           };
         }
         if (result.meta.error) {
-          error = result.meta.error.message || 'unknown error';
+          error = localizeKnownRunnerText(result.meta.error.message || 'unknown error');
           // meta.error is `{kind, message}` — cause/stack live on the
           // ProviderError that runner.ts already logged via `log.warn(...)`
           // on the retry path. Keep this line focused on what survives.
@@ -447,7 +456,7 @@ export async function* mapCoreAgentEvents(
         } else {
           // Prefer the explicit `result.text` over our accumulated delta —
           // the runner may have trimmed trailing whitespace etc.
-          if (result.text) finalText = result.text;
+          if (result.text) finalText = localizeKnownRunnerText(result.text);
         }
         break;
       }
@@ -464,7 +473,7 @@ export async function* mapCoreAgentEvents(
   } else if (finalText) {
     yield { type: 'final', text: finalText };
   } else {
-    yield { type: 'error', text: 'empty response' };
+    yield { type: 'error', text: localizeKnownRunnerText('empty response') };
   }
 
   return { finalText, error };

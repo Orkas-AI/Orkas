@@ -2,7 +2,13 @@ import { describe, it, expect } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs/promises";
-import { SandboxExecutor, augmentPath } from "../src/sandbox/executor.js";
+import {
+  SandboxExecutor,
+  augmentPath,
+  buildShellInvocation,
+  decodeProcessOutput,
+  defaultShellForPlatform,
+} from "../src/sandbox/executor.js";
 
 describe("SandboxExecutor", () => {
   it("executes a simple command", async () => {
@@ -126,6 +132,49 @@ describe("augmentPath", () => {
     expect(out.indexOf("/Users/me/tools/bin")).toBeLessThan(out.indexOf("/usr/bin"));
   });
 
+  it("uses Windows PATH delimiters without splitting drive letters", () => {
+    const input = "D:\\Tools\\bin;C:\\Windows\\System32";
+    const out = augmentPath(input, "win32", { SystemRoot: "C:\\Windows" });
+    const parts = out.split(";");
+    expect(parts).toContain("D:\\Tools\\bin");
+    expect(parts).toContain("C:\\Windows\\System32");
+    expect(parts).not.toContain("D");
+    expect(parts).not.toContain("\\Tools\\bin");
+  });
+
+  describe("Windows shell selection", () => {
+    it("defaults Windows to PowerShell instead of a POSIX-incompatible cmd -c path", () => {
+      expect(defaultShellForPlatform("win32")).toBe("powershell.exe");
+    });
+
+    it("uses cmd.exe /d /s /c when cmd is explicitly selected", () => {
+      const inv = buildShellInvocation("cmd.exe", "echo hi", "win32");
+      expect(inv.kind).toBe("cmd");
+      expect(inv.args).toEqual(["/d", "/s", "/c", "echo hi"]);
+    });
+
+    it("passes PowerShell commands through without bash-syntax rewriting", () => {
+      const command = '$ORKAS_NODE "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval';
+      const inv = buildShellInvocation("powershell.exe", command, "win32");
+      expect(inv.kind).toBe("powershell");
+      expect(inv.args).toEqual([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        command,
+      ]);
+    });
+
+    it("keeps explicit Git Bash-style shells POSIX-shaped on Windows", () => {
+      const inv = buildShellInvocation("bash.exe", "echo $ORKAS_UID", "win32");
+      expect(inv.kind).toBe("posix");
+      expect(inv.args).toEqual(["-lc", "echo $ORKAS_UID"]);
+    });
+  });
+
   describe("executeBackground", () => {
     it("returns a pid immediately and writes output to the log file", async () => {
       const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-bg-"));
@@ -158,5 +207,17 @@ describe("augmentPath", () => {
         await fs.rm(dir, { recursive: true, force: true });
       }
     });
+  });
+});
+
+describe("decodeProcessOutput", () => {
+  it("falls back to GB18030 for Chinese Windows console output", () => {
+    const gbkVersion = Buffer.from([0xb0, 0xe6, 0xb1, 0xbe]);
+    expect(decodeProcessOutput(gbkVersion, "win32", { ORKAS_UI_LANG: "zh" })).toBe("版本");
+  });
+
+  it("keeps valid UTF-8 output unchanged on Windows", () => {
+    const utf8 = Buffer.from("版本", "utf8");
+    expect(decodeProcessOutput(utf8, "win32", { ORKAS_UI_LANG: "zh" })).toBe("版本");
   });
 });

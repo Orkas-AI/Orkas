@@ -112,6 +112,21 @@ describe('local-tools › bash permission gate', () => {
     expect(res.content).toContain('orkas-test-sentinel-42');
   });
 
+  it('localizes fixed bash errors with the current UI language', async () => {
+    const { lt, perm } = await loadModules();
+    const i18n = await import('../../../src/main/i18n');
+    perm.grantLocalExec();
+    i18n.setCurrentLang('zh');
+    try {
+      const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+      const res = await bash.execute({ command: 'exit 7', timeoutMs: 5000 }, makeCtx());
+      expect(res.isError).toBe(true);
+      expect(res.content).toBe('退出码：7');
+    } finally {
+      i18n.setCurrentLang('en');
+    }
+  });
+
   it('re-checks permission per-call (revoke mid-run blocks the next call)', async () => {
     const { lt, perm } = await loadModules();
     perm.grantLocalExec();
@@ -122,6 +137,70 @@ describe('local-tools › bash permission gate', () => {
     const denied = await bash.execute({ command: 'echo second', timeoutMs: 5000 }, makeCtx());
     expect(denied.isError).toBe(true);
     expect(denied.content).toBe(lt.DENY_MESSAGE);
+  });
+});
+
+describe('local-tools › Orkas CLI direct execution', () => {
+  function writeFakePcScript(name: 'run-skill.cjs' | 'orkas-pkg.cjs', source: string): string {
+    const binDir = path.join(tmpDir, 'fake-pc', 'bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    const script = path.join(binDir, name);
+    fs.writeFileSync(script, source, 'utf8');
+    return path.join(tmpDir, 'fake-pc');
+  }
+
+  function makeOrkasCtx(pcDir: string): any {
+    return {
+      workingDir: tmpDir,
+      state: {
+        sandboxEnv: {
+          ORKAS_NODE: process.execPath,
+          ORKAS_PC_DIR: pcDir,
+          ELECTRON_RUN_AS_NODE: '1',
+        },
+      },
+    };
+  }
+
+  it('runs the standard run-skill.cjs command without requiring shell expansion', async () => {
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    const pcDir = writeFakePcScript(
+      'run-skill.cjs',
+      "process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), out: process.env.ORKAS_OUTPUT_DIR }));",
+    );
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+
+    const res = await bash.execute({
+      command: '$ORKAS_NODE "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval -- 1+1',
+      timeoutMs: 5000,
+    }, makeOrkasCtx(pcDir));
+
+    expect(res.isError).toBeFalsy();
+    const parsed = JSON.parse(String(res.content));
+    expect(parsed.argv).toEqual(['calculator', 'eval', '--', '1+1']);
+    expect(parsed.out).toBe(tmpDir);
+  });
+
+  it('pipes heredoc stdin into the standard orkas-pkg.cjs command', async () => {
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    const pcDir = writeFakePcScript(
+      'orkas-pkg.cjs',
+      "let body=''; process.stdin.on('data', d => body += d); process.stdin.on('end', () => process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), body })));",
+    );
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+    const body = "---\nname: Demo\n---\n\n# Demo";
+
+    const res = await bash.execute({
+      command: `$ORKAS_NODE "$ORKAS_PC_DIR/bin/orkas-pkg.cjs" skill-write demo <<'SKILL'\n${body}\nSKILL`,
+      timeoutMs: 5000,
+    }, makeOrkasCtx(pcDir));
+
+    expect(res.isError).toBeFalsy();
+    const parsed = JSON.parse(String(res.content));
+    expect(parsed.argv).toEqual(['skill-write', 'demo']);
+    expect(parsed.body).toBe(body);
   });
 });
 

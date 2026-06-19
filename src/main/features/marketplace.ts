@@ -465,13 +465,26 @@ export async function getSkillDetail(
 async function _fetchAndCacheSkill(
   skillId: string, meta: { bundle_url: string; version: string; published_at: number; updated_at?: number },
 ): Promise<void> {
-  const res = await fetchWithRetry(`marketplace:skill-bundle:${skillId}`, meta.bundle_url);
-  if (!res.ok) throw new Error(`download bundle failed (${res.status})`);
+  let res: Response;
+  try {
+    res = await fetchWithRetry(`marketplace:skill-bundle:${skillId}`, meta.bundle_url);
+  } catch (err) {
+    throw new Error(`download bundle failed from ${_bundleHost(meta.bundle_url)}: ${(err as Error)?.message || String(err)}`);
+  }
+  if (!res.ok) throw new Error(`download bundle failed from ${_bundleHost(meta.bundle_url)} (${res.status})`);
   const ab = await res.arrayBuffer();
   const zipBuf = Buffer.from(ab);
   await writeSkillCache(skillId, async (dir) => {
     extractBundleSafely(new AdmZip(zipBuf), dir);
   }, { version: meta.version, published_at: meta.published_at, updated_at: meta.updated_at });
+}
+
+function _bundleHost(bundleUrl: string): string {
+  try {
+    return new URL(bundleUrl).host || 'bundle host';
+  } catch {
+    return 'bundle host';
+  }
 }
 
 // zip-bomb defense, mirrored at server (see `api/marketplace.py::_validate_skill_bundle`).
