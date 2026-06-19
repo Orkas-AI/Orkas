@@ -34,6 +34,7 @@ import { buildRunner } from './runner';
 import { mapCoreAgentEvents } from './event-mapper';
 import { getSession as _getCachedSession } from './session-store';
 import { app } from 'electron';
+import * as fs from 'node:fs';
 import * as paths from '../../paths';
 import { getCurrentLang } from '../../i18n';
 import { bundledRuntimeEnv, bundledRuntimePathEntries } from '../../util/bundled-runtime';
@@ -98,6 +99,9 @@ export async function* stopStreamOnAbort<T>(
  *     find installed per-user skills under `<uid>/local/marketplace/skills`
  *   - `ORKAS_PYTHON` / `ORKAS_UV` = optional bundled Python runtime and uv
  *     binary under resources/runtime, used for `.py` skills and package deps
+ *   - `ORKAS_VENV_ROOT` = shared machine-local dependency env root under
+ *     data/venv, plus uv/pip cache dirs there so package installs survive app
+ *     updates and are reused across Orkas accounts on this device
  *   - `ELECTRON_RUN_AS_NODE` = makes the Electron binary boot as Node
  *
  * Injected via `AgentRunParams.sandboxEnv` → `ToolContext.state.sandboxEnv`
@@ -137,7 +141,16 @@ function buildSkillSandboxEnvStatic(): Record<string, string> {
 export function buildSkillSandboxEnv(userId?: string): Record<string, string> {
   const env = { ...buildSkillSandboxEnvStatic(), ...bundledRuntimeEnv() };
   env.ORKAS_UI_LANG = getCurrentLang();
+  env.ORKAS_VENV_ROOT = paths.VENV_ROOT;
+  env.ORKAS_PYTHON_VENV_ROOT = paths.PYTHON_VENV_ROOT;
+  env.UV_CACHE_DIR = paths.PYTHON_VENV_UV_CACHE_DIR;
+  env.PIP_CACHE_DIR = paths.PYTHON_VENV_PIP_CACHE_DIR;
   const pathEntries = bundledRuntimePathEntries();
+  try {
+    if (fs.statSync(paths.PYTHON_VENV_BIN_DIR).isDirectory()) {
+      pathEntries.push(paths.PYTHON_VENV_BIN_DIR);
+    }
+  } catch { /* shared venv shims are created on demand */ }
   if (userId) {
     env.ORKAS_UID = userId;
     try {

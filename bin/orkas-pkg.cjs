@@ -50,6 +50,8 @@
  *                           Python package venv creation.
  *   ORKAS_UV              — optional bundled uv executable used for Python
  *                           package dependency installs.
+ *   ORKAS_VENV_ROOT       — optional shared machine-local venv root.
+ *                           Defaults to `<ORKAS_WORKSPACE_ROOT>/venv`.
  */
 
 'use strict';
@@ -57,6 +59,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 
 const REGISTRY_VERSION = 1;
@@ -80,6 +83,16 @@ function wsRoot() {
   return process.env.ORKAS_WORKSPACE_ROOT
     || process.env.ORKAS_WS_ROOT
     || path.join(os.homedir(), '.orkas', 'data');
+}
+
+function sharedVenvRoot() { return process.env.ORKAS_VENV_ROOT || path.join(wsRoot(), 'venv'); }
+function pythonVenvRoot() { return path.join(sharedVenvRoot(), 'python'); }
+function pythonVenvCacheEnv() {
+  return {
+    ORKAS_VENV_ROOT: sharedVenvRoot(),
+    UV_CACHE_DIR: process.env.UV_CACHE_DIR || path.join(pythonVenvRoot(), 'cache', 'uv'),
+    PIP_CACHE_DIR: process.env.PIP_CACHE_DIR || path.join(pythonVenvRoot(), 'cache', 'pip'),
+  };
 }
 
 function resolveUid() {
@@ -167,7 +180,7 @@ function run(cmd, args, opts) {
     cwd: opts && opts.cwd,
     encoding: 'utf8',
     timeout: (opts && opts.timeoutMs) || 10 * 60 * 1000,
-    env: process.env,
+    env: { ...process.env, ...((opts && opts.env) || {}) },
     // npm/pip/git progress goes to our stderr so the bash tool surfaces it.
     stdio: ['ignore', 'pipe', 'inherit'],
   });
@@ -214,16 +227,37 @@ function uvCommand() {
   return null;
 }
 
-function venvPythonPath(pkgDir) {
+function venvPythonPath(venvDir) {
   return process.platform === 'win32'
-    ? path.join(pkgDir, '.venv', 'Scripts', 'python.exe')
-    : path.join(pkgDir, '.venv', 'bin', 'python');
+    ? path.join(venvDir, 'Scripts', 'python.exe')
+    : path.join(venvDir, 'bin', 'python');
 }
 
-function venvPipPath(pkgDir) {
+function venvPipPath(venvDir) {
   return process.platform === 'win32'
-    ? path.join(pkgDir, '.venv', 'Scripts', 'pip.exe')
-    : path.join(pkgDir, '.venv', 'bin', 'pip');
+    ? path.join(venvDir, 'Scripts', 'pip.exe')
+    : path.join(venvDir, 'bin', 'pip');
+}
+
+function venvConsoleScriptPath(venvDir, name) {
+  return process.platform === 'win32'
+    ? path.join(venvDir, 'Scripts', `${name}.exe`)
+    : path.join(venvDir, 'bin', name);
+}
+
+function shortHash(input) {
+  return crypto.createHash('sha256').update(String(input)).digest('hex').slice(0, 12);
+}
+
+function packageVenvKey(pkg) {
+  const rawName = (pkg && pkg.name) || 'package';
+  const name = PKG_NAME_RE.test(rawName) ? rawName : 'package';
+  const basis = [name, (pkg && pkg.repo_url) || '', (pkg && pkg.commit) || ''].join('\n');
+  return `${name}-${shortHash(basis)}`;
+}
+
+function packageVenvDir(pkg) {
+  return path.join(pythonVenvRoot(), 'packages', packageVenvKey(pkg), '.venv');
 }
 
 /** Candidate rel dirs whose children (or, for '.', the dir itself) hold SKILL.md. */
@@ -266,9 +300,9 @@ function scanNodeBinEntries(pkgDir) {
 /**
  * `[project.scripts]` console entries from pyproject.toml. Naive
  * line-oriented TOML section walk — enough for the `name = "module:func"`
- * shape; anything fancier is ignored. Targets resolve to the venv console
- * script (created by `pip install -e .`), so they only become shims once
- * deps are installed.
+ * shape; anything fancier is ignored. Targets keep the legacy package-local
+ * `.venv` shape for registry compatibility; shim generation resolves shared
+ * `data/venv` console scripts first.
  */
 function scanPythonBinEntries(pkgDir) {
   const entries = [];
@@ -317,46 +351,49 @@ function hasPythonProject(pkgDir) {
   return isFile(path.join(pkgDir, 'pyproject.toml')) || isFile(path.join(pkgDir, 'setup.py'));
 }
 
-function describeDepCommands(pkgDir) {
+function describeDepCommands(pkgDir, pkgMeta) {
   const cmds = [];
   if (hasNodeDeps(pkgDir)) cmds.push('npm install --omit=dev');
   if (hasPythonProject(pkgDir)) {
+    const venv = packageVenvDir(pkgMeta);
     const uv = uvCommand();
     if (uv) {
       const venvCmd = process.env.ORKAS_PYTHON
-        ? '$ORKAS_UV venv --python $ORKAS_PYTHON .venv'
-        : '$ORKAS_UV venv .venv';
-      cmds.push(`${venvCmd} && $ORKAS_UV pip install --python .venv -e .`);
+        ? `$ORKAS_UV venv --python $ORKAS_PYTHON "${venv}"`
+        : `$ORKAS_UV venv "${venv}"`;
+      cmds.push(`${venvCmd} && $ORKAS_UV pip install --python "${venvPythonPath(venv)}" .`);
     } else {
-      cmds.push(`${pythonCommand().label} -m venv .venv && ${process.platform === 'win32' ? '.venv\\Scripts\\pip.exe' : '.venv/bin/pip'} install -e .`);
+      cmds.push(`${pythonCommand().label} -m venv "${venv}" && "${venvPipPath(venv)}" install .`);
     }
   }
   return cmds;
 }
 
-function installDeps(pkgDir) {
+function installDeps(pkgDir, pkgMeta) {
   const performed = [];
   if (hasNodeDeps(pkgDir)) {
     runOrDie('npm', ['install', '--omit=dev', '--no-fund', '--no-audit'], { cwd: pkgDir }, 'npm install');
     performed.push('npm install --omit=dev');
   }
   if (hasPythonProject(pkgDir)) {
-    const venv = path.join(pkgDir, '.venv');
+    const venv = packageVenvDir(pkgMeta);
+    const cacheEnv = pythonVenvCacheEnv();
+    fs.mkdirSync(path.dirname(venv), { recursive: true });
     const uv = uvCommand();
     if (uv) {
       if (!isDir(venv)) {
         const args = ['venv'];
         if (process.env.ORKAS_PYTHON) args.push('--python', process.env.ORKAS_PYTHON);
-        args.push('.venv');
-        runOrDie(uv, args, { cwd: pkgDir }, 'uv venv');
+        args.push(venv);
+        runOrDie(uv, args, { cwd: pkgDir, env: cacheEnv }, 'uv venv');
       }
-      runOrDie(uv, ['pip', 'install', '--python', venvPythonPath(pkgDir), '-e', '.'], { cwd: pkgDir }, 'uv pip install');
-      performed.push('uv pip install -e .');
+      runOrDie(uv, ['pip', 'install', '--python', venvPythonPath(venv), '.'], { cwd: pkgDir, env: cacheEnv }, 'uv pip install');
+      performed.push('uv pip install .');
     } else {
       const py = pythonCommand();
-      if (!isDir(venv)) runOrDie(py.cmd, [...py.args, '-m', 'venv', '.venv'], { cwd: pkgDir }, 'venv creation');
-      runOrDie(venvPipPath(pkgDir), ['install', '-e', '.'], { cwd: pkgDir }, 'pip install');
-      performed.push('pip install -e .');
+      if (!isDir(venv)) runOrDie(py.cmd, [...py.args, '-m', 'venv', venv], { cwd: pkgDir, env: cacheEnv }, 'venv creation');
+      runOrDie(venvPipPath(venv), ['install', '.'], { cwd: pkgDir, env: cacheEnv }, 'pip install');
+      performed.push('pip install .');
     }
   }
   return performed;
@@ -372,9 +409,14 @@ function regenerateShims(uid, registry) {
   for (const pkg of registry.packages) {
     if (pkg.enabled === false) continue;
     for (const entry of pkg.bin_entries || []) {
-      const targetAbs = path.join(packagesDir(uid), pkg.name, entry.target);
-      // Python console scripts only exist after pip install -e — skip until then.
-      if (entry.runtime === 'python' && !isFile(targetAbs)) continue;
+      let targetAbs = path.join(packagesDir(uid), pkg.name, entry.target);
+      if (entry.runtime === 'python') {
+        const sharedTarget = venvConsoleScriptPath(packageVenvDir(pkg), entry.name);
+        targetAbs = isFile(sharedTarget) ? sharedTarget : targetAbs;
+        // Python console scripts only exist after dependency install — skip
+        // until either the shared venv or a legacy package-local venv has one.
+        if (!isFile(targetAbs)) continue;
+      }
       wanted.push({ pkg: pkg.name, ...entry, targetAbs });
     }
   }
@@ -460,10 +502,12 @@ function cmdInstall(args) {
           { source });
       }
 
-      const depCommands = describeDepCommands(staging);
+      const commit = headCommit(staging);
+      const pkgMeta = { name, repo_url: source, commit };
+      const depCommands = describeDepCommands(staging, pkgMeta);
       let depsInstalled = [];
       if (depCommands.length && consentDeps) {
-        depsInstalled = installDeps(staging);
+        depsInstalled = installDeps(staging, pkgMeta);
       }
 
       fs.renameSync(staging, finalDir);
@@ -474,7 +518,7 @@ function cmdInstall(args) {
       registry.packages.push({
         name,
         repo_url: source,
-        commit: headCommit(finalDir),
+        commit,
         kind: scan.kind,
         skill_roots: scan.skillRoots,
         bin_entries: scan.binEntries,
@@ -518,9 +562,10 @@ function cmdConsentDeps(args) {
     const pkgDir = path.join(packagesDir(uid), name);
     if (!entry || !isDir(pkgDir)) die(66, `package "${name}" is not installed`);
 
-    const depsInstalled = installDeps(pkgDir);
+    if (!entry.commit) entry.commit = headCommit(pkgDir);
+    const depsInstalled = installDeps(pkgDir, entry);
     entry.deps_consent = true;
-    // Python console-script targets only materialize after pip install -e,
+    // Python console-script targets only materialize after dependency install,
     // so rescan bin entries before regenerating shims.
     const scan = scanPackage(pkgDir);
     if (scan.kind) {
@@ -552,13 +597,15 @@ function cmdUpdate(args) {
     if (!scan.kind) {
       die(65, `after update, "${name}" no longer has a supported skill/CLI shape — leaving files in place; review manually`);
     }
+    const commit = headCommit(pkgDir);
     let depsInstalled = [];
-    const depCommands = describeDepCommands(pkgDir);
+    const pkgMeta = { ...entry, commit };
+    const depCommands = describeDepCommands(pkgDir, pkgMeta);
     if (depCommands.length && entry.deps_consent === true) {
-      depsInstalled = installDeps(pkgDir);
+      depsInstalled = installDeps(pkgDir, pkgMeta);
     }
 
-    entry.commit = headCommit(pkgDir);
+    entry.commit = commit;
     entry.kind = scan.kind;
     entry.skill_roots = scan.skillRoots;
     entry.bin_entries = scan.binEntries;

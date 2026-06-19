@@ -17,6 +17,7 @@
  *       users.json                ← Local uid registry + current_user_id / dev_current_user_id
  *       window-state.json         ← Last desktop window bounds (machine-local)
  *       logs/                     ← Local logs (rolled daily, global)
+ *       venv/                     ← Machine-global dependency envs/caches
  *       local/marketplace/        ← Per-user platform installs reconciled from cloud manifests
  *         agents/<agent_id>/
  *         skills/<skill_id>/
@@ -73,6 +74,17 @@ export const USERS_FILE        = path.join(WS_ROOT, 'users.json');
 export const WINDOW_STATE_FILE = path.join(WS_ROOT, 'window-state.json');
 // Machine-local logs (daily rolling, single global file shared across uids).
 export const LOGS_DIR          = path.join(WS_ROOT, 'logs');
+// Machine-local dependency environments shared across Orkas accounts on this
+// device. Lives directly under data/ so app updates never overwrite it and
+// multiple uids do not redownload the same package wheels.
+export const VENV_ROOT         = path.join(WS_ROOT, 'venv');
+export const PYTHON_VENV_ROOT  = path.join(VENV_ROOT, 'python');
+export const PYTHON_VENV_BIN_DIR = path.join(PYTHON_VENV_ROOT, 'bin');
+export const PYTHON_VENV_CACHE_DIR = path.join(PYTHON_VENV_ROOT, 'cache');
+export const PYTHON_VENV_UV_CACHE_DIR = path.join(PYTHON_VENV_CACHE_DIR, 'uv');
+export const PYTHON_VENV_PIP_CACHE_DIR = path.join(PYTHON_VENV_CACHE_DIR, 'pip');
+export const pythonPackageVenvDir = (key: string) =>
+  path.join(PYTHON_VENV_ROOT, 'packages', key, '.venv');
 // Marketplace installs land under `<uid>/local/marketplace/` per machine — see
 // `userMarketplace*` helpers below. There is no top-level platform install tree.
 
@@ -399,8 +411,9 @@ export const localCliSessionsFile = (uid: string, cid: string) =>
 
 // ── External packages (machine-private, verbatim third-party repos) ─────
 // `<uid>/local/packages/<name>/` hosts a cloned open-source repo UNMODIFIED
-// (including its node_modules / .venv — which is why this is local/, never
-// cloud-synced). Package metadata lives OUTSIDE the package dirs in the
+// (including node_modules when consented — Python venvs live under top-level
+// data/venv so they can be reused across Orkas accounts on this device).
+// Package metadata lives OUTSIDE the package dirs in the
 // sidecar `_registry.json` so `git pull` updates never conflict with Orkas
 // bookkeeping. The registry is written only by `bin/orkas-pkg.cjs` (the
 // bash-driven installer CLI); main-process code reads it via
@@ -552,7 +565,7 @@ export const DEFAULT_USER_WORKSPACE = path.join(WS_ROOT, '..', 'userWorkSpace');
 // Only the top-level shared directories are created here; per-uid sub-trees
 // are mkdir'd on demand by `features/users.activateUser(uid)`.
 export function ensureTopLevelLayout(): void {
-  for (const d of [LOGS_DIR, DEFAULT_USER_WORKSPACE]) {
+  for (const d of [LOGS_DIR, VENV_ROOT, DEFAULT_USER_WORKSPACE]) {
     fs.mkdirSync(d, { recursive: true });
   }
 }

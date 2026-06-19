@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -10,9 +11,15 @@ import * as path from 'node:path';
 
 const TEST_UID = 'u1';
 let tmpDir: string;
+const itOnNonWindows = process.platform === 'win32' ? it.skip : it;
 
 function pkgsDir(): string {
   return path.join(tmpDir, TEST_UID, 'local', 'packages');
+}
+
+function packageVenvKey(name: string, repoUrl: string, commit: string): string {
+  const hash = createHash('sha256').update([name, repoUrl, commit].join('\n')).digest('hex').slice(0, 12);
+  return `${name}-${hash}`;
 }
 
 function writeRegistry(registry: unknown): void {
@@ -41,6 +48,17 @@ function writePackageSkill(pkgName: string, skillId: string, displayName: string
     path.join(scriptsDir, 'hello.js'),
     'const marker = require("pkg-marker");\nmodule.exports = async ({ args }) => ({ marker, args });\n',
   );
+}
+
+function writePackagePythonSkill(pkgName: string, skillId: string): void {
+  const skillDir = path.join(pkgsDir(), pkgName, 'skills', skillId);
+  const scriptsDir = path.join(skillDir, 'scripts');
+  fs.mkdirSync(scriptsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(skillDir, 'SKILL.md'),
+    `---\nname: ${skillId}\ndescription: pkg py skill\n---\nbody\n`,
+  );
+  fs.writeFileSync(path.join(scriptsDir, 'run.py'), 'print("package-local python should not run")\n');
 }
 
 function runSkill(skillRef: string, scriptBase: string, args: string[] = [], extraEnv: Record<string, string> = {}) {
@@ -119,6 +137,50 @@ describe('run-skill.cjs › external packages root', () => {
     // No _registry.json on purpose.
     const r = runSkill('pkg-hello', 'hello');
     expect(r.status).toBe(66);
+  });
+
+  itOnNonWindows('uses shared data/venv Python for package skill scripts', () => {
+    const repoUrl = 'https://example.test/mypack.git';
+    const commit = 'abc123';
+    writePackagePythonSkill('mypack', 'pkg-py');
+    writeRegistry({
+      version: 1,
+      packages: [{
+        name: 'mypack',
+        repo_url: repoUrl,
+        commit,
+        kind: 'skill',
+        skill_roots: ['skills'],
+        bin_entries: [],
+        enabled: true,
+      }],
+    });
+    const python = path.join(
+      tmpDir,
+      'venv',
+      'python',
+      'packages',
+      packageVenvKey('mypack', repoUrl, commit),
+      '.venv',
+      'bin',
+      'python',
+    );
+    fs.mkdirSync(path.dirname(python), { recursive: true });
+    fs.writeFileSync(python, [
+      '#!/bin/sh',
+      'printf \'{"python":"shared","script":"%s","arg":"%s"}\\n\' "$1" "$2"',
+      '',
+    ].join('\n'));
+    fs.chmodSync(python, 0o755);
+
+    const r = runSkill('pkg-py', 'run', ['x']);
+
+    expect(r.status).toBe(0);
+    expect(JSON.parse(r.stdout.trim())).toEqual({
+      python: 'shared',
+      script: path.join(pkgsDir(), 'mypack', 'skills', 'pkg-py', 'scripts', 'run.py'),
+      arg: 'x',
+    });
   });
 
   it('honors ORKAS_RUN_SKILL_DIR without falling back to other roots', () => {

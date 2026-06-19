@@ -9,9 +9,10 @@
  * of skill language:
  *   .ts / .mjs / .js — require() with tsx/cjs hook, call default export as
  *                       `async (args) => result`, JSON.stringify result to stdout.
- *   .py              — spawn nearest package `.venv`, else `ORKAS_PYTHON`,
- *                       else system Python (`python3`; Windows: `py -3`
- *                       then `python`), inherit stdio, exit with child code.
+ *   .py              — spawn shared data/venv package Python, else nearest
+ *                       package `.venv`, else `ORKAS_PYTHON`, else system
+ *                       Python (`python3`; Windows: `py -3` then `python`),
+ *                       inherit stdio, exit with child code.
  *   .ps1             — spawn PowerShell (Windows-native script).
  *   .cmd / .bat      — spawn `cmd.exe` (Windows-native batch script).
  *   .sh              — spawn `bash` (Windows: Git Bash only; WSL is not
@@ -30,8 +31,9 @@
  * Dependency resolution for scripts living under an external package (or any
  * skill dir that vendors its own deps): the NEAREST `node_modules` walking up
  * from the skill dir is prepended to NODE_PATH ahead of PC/node_modules, and
- * a `.venv` found the same way supplies the python interpreter. The package
- * tree itself is never modified.
+ * Python package deps prefer the shared machine-local data/venv interpreter
+ * keyed by package source+commit; legacy/vendored `.venv` dirs still work as
+ * fallback. The package tree itself is never modified.
  *
  * Env inputs:
  *   ORKAS_PC_DIR          — points at PC root (or asar.unpacked equivalent).
@@ -47,6 +49,8 @@
  *   ORKAS_PYTHON          — optional bundled Python executable injected by
  *                           the main process when resources/runtime is
  *                           available.
+ *   ORKAS_VENV_ROOT       — optional shared venv root. Defaults to
+ *                           `<ORKAS_WORKSPACE_ROOT>/venv`.
  *   ELECTRON_RUN_AS_NODE  — set to 1 when running through Electron binary.
  *
  * This file is CommonJS so it can be required directly without import-hook
@@ -57,9 +61,11 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 
 const SCRIPT_EXTS = ['py', 'ts', 'mjs', 'js', 'ps1', 'cmd', 'bat', 'sh', 'rb'];
+const PKG_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 function scriptExtsForPlatform(platform = process.platform) {
   if (platform === 'win32') return SCRIPT_EXTS;
@@ -96,6 +102,27 @@ function isDir(p) {
   } catch {
     return false;
   }
+}
+
+function workspaceRoot() {
+  return process.env.ORKAS_WORKSPACE_ROOT
+    || process.env.ORKAS_WS_ROOT
+    || path.join(require('os').homedir(), '.orkas', 'data');
+}
+
+function sharedVenvRoot() {
+  return process.env.ORKAS_VENV_ROOT || path.join(workspaceRoot(), 'venv');
+}
+
+function shortHash(input) {
+  return crypto.createHash('sha256').update(String(input)).digest('hex').slice(0, 12);
+}
+
+function packageVenvKey(pkg) {
+  const rawName = (pkg && pkg.name) || 'package';
+  const name = PKG_NAME_RE.test(rawName) ? rawName : 'package';
+  const basis = [name, (pkg && pkg.repo_url) || '', (pkg && pkg.commit) || ''].join('\n');
+  return `${name}-${shortHash(basis)}`;
 }
 
 function pushUnique(arr, seen, value) {
@@ -173,9 +200,7 @@ function collectSkillDirs(skillRef) {
     return [resolved];
   }
 
-  const wsRoot = process.env.ORKAS_WORKSPACE_ROOT
-    || process.env.ORKAS_WS_ROOT
-    || path.join(require('os').homedir(), '.orkas', 'data');
+  const wsRoot = workspaceRoot();
   // Candidate skill dirs — mirror SkillRegistry's
   // [<uid>/cloud/skills, <uid>/local/marketplace/skills] resolution.
   //
@@ -330,6 +355,42 @@ function existingFile(p) {
   }
 }
 
+function packageEntryForScript(scriptPath) {
+  const root = path.resolve(workspaceRoot());
+  const rel = path.relative(root, path.resolve(scriptPath));
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  const parts = rel.split(path.sep);
+  if (parts.length < 5 || parts[1] !== 'local' || parts[2] !== 'packages') return null;
+  const uid = parts[0];
+  const pkgName = parts[3];
+  if (!PKG_NAME_RE.test(pkgName)) return null;
+  let registry;
+  try {
+    registry = JSON.parse(fs.readFileSync(path.join(root, uid, 'local', 'packages', '_registry.json'), 'utf8'));
+  } catch {
+    return null;
+  }
+  if (!registry || !Array.isArray(registry.packages)) return null;
+  const entry = registry.packages.find((pkg) =>
+    pkg && pkg.name === pkgName && pkg.enabled !== false);
+  if (!entry) return null;
+  return {
+    name: pkgName,
+    repo_url: typeof entry.repo_url === 'string' ? entry.repo_url : '',
+    commit: typeof entry.commit === 'string' ? entry.commit : '',
+  };
+}
+
+function sharedPackageVenvPython(scriptPath, isWin) {
+  const entry = packageEntryForScript(scriptPath);
+  if (!entry) return null;
+  const venv = path.join(sharedVenvRoot(), 'python', 'packages', packageVenvKey(entry), '.venv');
+  const python = isWin
+    ? path.join(venv, 'Scripts', 'python.exe')
+    : path.join(venv, 'bin', 'python');
+  return existingFile(python) ? python : null;
+}
+
 function findOnPath(names, env = process.env) {
   const pathValue = env.PATH || env.Path || env.path || '';
   const dirs = pathValue.split(path.delimiter).filter(Boolean);
@@ -427,15 +488,18 @@ function runViaSubprocess(scriptPath, scriptArgs, skillId) {
   // to `python` if missing — handled by trying spawn.
   let cmd; let argv0Args = [];
   if (ext === 'py') {
-    // External packages / vendored skills: a `.venv` found walking up from
-    // the skill dir supplies the interpreter, so `pip install -e .` deps
-    // resolve without touching the system python.
+    // External package skills prefer the shared data/venv interpreter keyed
+    // by package source+commit. Legacy/vendored skills can still supply a
+    // nearest `.venv` walking up from the skill dir.
+    const sharedPython = sharedPackageVenvPython(scriptPath, isWin);
     const venvPython = findUpwards(
       skillDir,
       isWin ? path.join('.venv', 'Scripts', 'python.exe') : path.join('.venv', 'bin', 'python3'),
       3,
     );
-    if (venvPython) {
+    if (sharedPython) {
+      cmd = sharedPython;
+    } else if (venvPython) {
       cmd = venvPython;
     } else if (isWin) {
       const py = findPython(isWin);

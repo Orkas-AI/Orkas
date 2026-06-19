@@ -1,6 +1,6 @@
 /**
  * External packages — read-side accessor for the `<uid>/local/packages/`
- * domain (verbatim third-party repos; see paths.ts and
+ * domain (verbatim third-party repos; Python envs live under data/venv; see paths.ts and
  * docs/plans/open-ecosystem-architecture.md §A).
  *
  * Write-side lives in `bin/orkas-pkg.cjs` (the bash-driven installer CLI,

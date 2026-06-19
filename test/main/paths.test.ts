@@ -40,7 +40,7 @@ describe('paths › roots', () => {
   });
 });
 
-describe('paths › top-level (users.json / logs)', () => {
+describe('paths › top-level (users.json / logs / venv)', () => {
   it('USERS_FILE sits at the data root', async () => {
     const p = await import('../../src/main/paths');
     expect(p.USERS_FILE).toBe(path.join(p.WS_ROOT, 'users.json'));
@@ -49,6 +49,14 @@ describe('paths › top-level (users.json / logs)', () => {
   it('LOGS_DIR is a top-level sibling', async () => {
     const p = await import('../../src/main/paths');
     expect(p.LOGS_DIR).toBe(path.join(p.WS_ROOT, 'logs'));
+  });
+
+  it('VENV_ROOT is a top-level shared dependency directory', async () => {
+    const p = await import('../../src/main/paths');
+    expect(p.VENV_ROOT).toBe(path.join(p.WS_ROOT, 'venv'));
+    expect(p.PYTHON_VENV_ROOT).toBe(path.join(p.WS_ROOT, 'venv', 'python'));
+    expect(p.pythonPackageVenvDir('pkg-abc'))
+      .toBe(path.join(p.WS_ROOT, 'venv', 'python', 'packages', 'pkg-abc', '.venv'));
   });
 });
 
@@ -141,6 +149,7 @@ describe('paths › ensureTopLevelLayout side effect', () => {
   it('mkdirs the top-level skeleton on import (no uid-specific dirs)', async () => {
     await import('../../src/main/paths');
     expect(fs.existsSync(path.join(tmpDir, 'logs')), 'expected logs/ to exist').toBe(true);
+    expect(fs.existsSync(path.join(tmpDir, 'venv')), 'expected venv/ to exist').toBe(true);
     // Crucially: no `config/` at the top level any more — that was legacy.
     expect(fs.existsSync(path.join(tmpDir, 'config'))).toBe(false);
     // And no `shared/` — folded into `<uid>/cloud/`.

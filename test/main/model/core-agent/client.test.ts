@@ -42,6 +42,10 @@ describe('core-agent client skill sandbox env', () => {
       ELECTRON_RUN_AS_NODE: '1',
       ORKAS_PC_DIR: expect.stringMatching(/PC$/),
       ORKAS_WORKSPACE_ROOT: path.resolve(tmpDir),
+      ORKAS_VENV_ROOT: path.join(path.resolve(tmpDir), 'venv'),
+      ORKAS_PYTHON_VENV_ROOT: path.join(path.resolve(tmpDir), 'venv', 'python'),
+      UV_CACHE_DIR: path.join(path.resolve(tmpDir), 'venv', 'python', 'cache', 'uv'),
+      PIP_CACHE_DIR: path.join(path.resolve(tmpDir), 'venv', 'python', 'cache', 'pip'),
     });
   });
 

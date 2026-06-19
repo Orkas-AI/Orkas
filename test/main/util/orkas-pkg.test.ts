@@ -218,13 +218,15 @@ describe.skipIf(!gitAvailable)('orkas-pkg.cjs', () => {
       '#!/bin/sh',
       'set -eu',
       'if [ "$1" = "venv" ]; then',
-      '  mkdir -p .venv/bin',
-      '  printf "#!/bin/sh\\nexit 0\\n" > .venv/bin/python',
-      '  chmod +x .venv/bin/python',
+      '  if [ "$2" = "--python" ]; then venv="$4"; else venv="$2"; fi',
+      '  mkdir -p "$venv/bin"',
+      '  printf "#!/bin/sh\\nexit 0\\n" > "$venv/bin/python"',
+      '  chmod +x "$venv/bin/python"',
       'elif [ "$1" = "pip" ]; then',
-      '  mkdir -p .venv/bin',
-      '  printf "#!/bin/sh\\necho real-entry\\n" > .venv/bin/real-entry',
-      '  chmod +x .venv/bin/real-entry',
+      '  venv="$(dirname "$(dirname "$4")")"',
+      '  mkdir -p "$venv/bin"',
+      '  printf "#!/bin/sh\\necho real-entry\\n" > "$venv/bin/real-entry"',
+      '  chmod +x "$venv/bin/real-entry"',
       'else',
       '  exit 2',
       'fi',
@@ -235,16 +237,19 @@ describe.skipIf(!gitAvailable)('orkas-pkg.cjs', () => {
 
     const install = runPkgWithEnv(env, 'install', repo);
     expect(install.status).toBe(0);
-    expect(install.json.deps_pending_consent).toEqual([
-      '$ORKAS_UV venv --python $ORKAS_PYTHON .venv && $ORKAS_UV pip install --python .venv -e .',
-    ]);
+    expect(install.json.deps_pending_consent).toHaveLength(1);
+    expect(install.json.deps_pending_consent[0]).toContain(path.join(wsRoot, 'venv', 'python', 'packages', 'pyuv-'));
+    expect(install.json.deps_pending_consent[0]).toContain('$ORKAS_UV pip install --python');
+    expect(install.json.deps_pending_consent[0]).not.toContain(' -e ');
     expect(fs.existsSync(path.join(pkgsDir(), '.bin', 'real-entry'))).toBe(false);
 
     const consent = runPkgWithEnv(env, 'consent-deps', 'pyuv');
     expect(consent.status).toBe(0);
-    expect(consent.json.deps_installed).toEqual(['uv pip install -e .']);
+    expect(consent.json.deps_installed).toEqual(['uv pip install .']);
     expect(consent.json.shims).toEqual(['real-entry']);
-    expect(fs.existsSync(path.join(pkgsDir(), 'pyuv', '.venv', 'bin', 'real-entry'))).toBe(true);
+    expect(fs.existsSync(path.join(pkgsDir(), 'pyuv', '.venv', 'bin', 'real-entry'))).toBe(false);
+    const shim = fs.readFileSync(path.join(pkgsDir(), '.bin', 'real-entry'), 'utf8');
+    expect(shim).toContain(path.join(wsRoot, 'venv', 'python', 'packages'));
     expect(fs.existsSync(path.join(pkgsDir(), '.bin', 'real-entry'))).toBe(true);
   });
 
