@@ -333,6 +333,37 @@ function splitTrailingHeredoc(command: string): { command: string; stdin: string
   };
 }
 
+function hasUnquotedShellControlSyntax(input: string): boolean {
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') {
+        quote = null;
+        continue;
+      }
+      if (ch === '\\' && i + 1 < input.length) i++;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === '\\' && i + 1 < input.length) {
+      i++;
+      continue;
+    }
+    if (ch === '\n' || ch === '\r' || ch === ';' || ch === '|' || ch === '&' || ch === '<' || ch === '>') {
+      return true;
+    }
+  }
+  return false;
+}
+
 function shellWords(input: string): string[] | null {
   const words: string[] = [];
   let cur = '';
@@ -408,6 +439,7 @@ function parseOrkasCliInvocation(
   const rawCommand = String(input.command ?? '');
   const heredoc = splitTrailingHeredoc(rawCommand);
   const command = heredoc?.command ?? rawCommand;
+  if (hasUnquotedShellControlSyntax(command)) return null;
   const words = shellWords(command);
   if (!words || words.length < 2) return null;
 

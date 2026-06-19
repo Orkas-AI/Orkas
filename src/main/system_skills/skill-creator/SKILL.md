@@ -253,10 +253,10 @@ Add implementation-specific subsections only when they are needed:
 Single entry point template (write this in the body's "How to call" section):
 
 ```
-$ORKAS_NODE $ORKAS_PC_DIR/bin/run-skill.cjs <skill-id> <script-basename> [-- args...]
+"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" <skill-id> <script-basename> [-- args...]
 ```
 
-**Do NOT prefix the command with `bash`** — the command execution tool runs `command` itself; a `bash` prefix tells the shell to execute the Electron binary as a script and produces "cannot execute binary file". The command starts with `$ORKAS_NODE`. The `<script-basename>` does NOT include the extension — only one file per basename per directory.
+**Do NOT prefix the command with `bash`** — the command execution tool runs `command` itself; a `bash` prefix tells the shell to execute the Electron binary as a script and produces "cannot execute binary file". The command starts with `"$ORKAS_NODE"`; keep both runner path parts quoted because app paths can contain spaces. The `<script-basename>` does NOT include the extension — only one file per basename per directory.
 
 Use this exact Orkas runner shape for cross-platform skill execution. It is handled by Orkas's direct CLI path; generic Unix shell pipelines remain OS/shell-specific and should not be the primary implementation of a new skill.
 

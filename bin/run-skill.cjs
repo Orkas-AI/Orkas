@@ -3,7 +3,7 @@
  * Orkas skill runner.
  *
  * Invoked by LLM bash tool as:
- *   $ORKAS_NODE $ORKAS_PC_DIR/bin/run-skill.cjs <skill-id-or-name> <script-basename> [-- args...]
+ *   "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" <skill-id-or-name> <script-basename> [-- args...]
  *
  * Dispatches by file extension so the LLM uses one invocation form regardless
  * of skill language:

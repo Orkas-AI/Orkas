@@ -4,7 +4,7 @@
  *
  * Invoked by the LLM bash tool (guided by the `package-installer` system
  * skill) as:
- *   $ORKAS_NODE $ORKAS_PC_DIR/bin/orkas-pkg.cjs <command> [args...]
+ *   "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/orkas-pkg.cjs" <command> [args...]
  *
  * Commands:
  *   install <git-url-or-local-path> [--name <name>] [--consent-deps]

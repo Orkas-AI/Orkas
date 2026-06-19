@@ -172,7 +172,7 @@ describe('local-tools › Orkas CLI direct execution', () => {
     const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
 
     const res = await bash.execute({
-      command: '$ORKAS_NODE "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval -- 1+1',
+      command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval -- 1+1',
       timeoutMs: 5000,
     }, makeOrkasCtx(pcDir));
 
@@ -193,7 +193,7 @@ describe('local-tools › Orkas CLI direct execution', () => {
     const body = "---\nname: Demo\n---\n\n# Demo";
 
     const res = await bash.execute({
-      command: `$ORKAS_NODE "$ORKAS_PC_DIR/bin/orkas-pkg.cjs" skill-write demo <<'SKILL'\n${body}\nSKILL`,
+      command: `"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/orkas-pkg.cjs" skill-write demo <<'SKILL'\n${body}\nSKILL`,
       timeoutMs: 5000,
     }, makeOrkasCtx(pcDir));
 
@@ -201,6 +201,29 @@ describe('local-tools › Orkas CLI direct execution', () => {
     const parsed = JSON.parse(String(res.content));
     expect(parsed.argv).toEqual(['skill-write', 'demo']);
     expect(parsed.body).toBe(body);
+  });
+
+  it('lets the host shell handle redirection for standard Orkas CLI commands', async () => {
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    const pcDir = writeFakePcScript(
+      'run-skill.cjs',
+      "process.stdout.write(JSON.stringify({ argv: process.argv.slice(2) }));",
+    );
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+    const outPath = path.join(tmpDir, 'run-skill-output.json');
+    const errPath = path.join(tmpDir, 'run-skill-stderr.txt');
+
+    const res = await bash.execute({
+      command: `"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval -- 1+1 2> "${errPath}" > "${outPath}"`,
+      timeoutMs: 5000,
+    }, makeOrkasCtx(pcDir));
+
+    expect(res.isError).toBeFalsy();
+    expect(String(res.content)).toBe('');
+    const parsed = JSON.parse(fs.readFileSync(outPath, 'utf8'));
+    expect(parsed.argv).toEqual(['calculator', 'eval', '--', '1+1']);
+    expect(fs.readFileSync(errPath, 'utf8')).toBe('');
   });
 
   it('times out direct Orkas CLI commands whose child keeps stdout open', async () => {
@@ -218,7 +241,7 @@ describe('local-tools › Orkas CLI direct execution', () => {
 
     const started = Date.now();
     const res = await bash.execute({
-      command: '$ORKAS_NODE "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval -- 1+1',
+      command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval -- 1+1',
       timeoutMs: 500,
     }, makeOrkasCtx(pcDir));
 

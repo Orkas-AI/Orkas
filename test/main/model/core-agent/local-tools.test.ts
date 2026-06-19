@@ -92,7 +92,7 @@ describe('local-tools › bash › disabled skills', () => {
 
     const bash = await buildBashTool();
     const r = await run(bash, {
-      command: '$ORKAS_NODE $ORKAS_PC_DIR/bin/run-skill.cjs disabled-skill search -- query',
+      command: '"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" disabled-skill search -- query',
     });
 
     expect(r.isError).toBe(true);

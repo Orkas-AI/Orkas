@@ -16,7 +16,7 @@ Run the Orkas CLI command below through the command execution tool; Orkas
 handles this runner form directly on Windows:
 
 ```text
-$ORKAS_NODE "$ORKAS_PC_DIR/bin/orkas-pkg.cjs" <command> [args]
+"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/orkas-pkg.cjs" <command> [args]
 ```
 
 Commands: `install <git-url> [--name <name>] [--consent-deps]`,
@@ -58,7 +58,7 @@ a successful CLI install — the user already approved installing it. Skip for
 2. Write the skill via stdin (the file lands outside the package tree):
 
    ```bash
-   $ORKAS_NODE "$ORKAS_PC_DIR/bin/orkas-pkg.cjs" skill-write <name> <<'SKILL'
+   "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/orkas-pkg.cjs" skill-write <name> <<'SKILL'
    ---
    name: <human name>
    description: <one line: what it does + when to use it>
