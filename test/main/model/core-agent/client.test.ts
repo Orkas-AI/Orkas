@@ -37,10 +37,11 @@ afterEach(() => {
 describe('core-agent client skill sandbox env', () => {
   it('passes the canonical workspace root through to bash skill invocations', async () => {
     const client = await import('../../../../src/main/model/core-agent/client');
+    const paths = await import('../../../../src/main/paths');
 
     expect(client.buildSkillSandboxEnv()).toMatchObject({
       ELECTRON_RUN_AS_NODE: '1',
-      ORKAS_PC_DIR: expect.stringMatching(/PC$/),
+      ORKAS_PC_DIR: paths.PC_ROOT,
       ORKAS_WORKSPACE_ROOT: path.resolve(tmpDir),
       ORKAS_VENV_ROOT: path.join(path.resolve(tmpDir), 'venv'),
       ORKAS_PYTHON_VENV_ROOT: path.join(path.resolve(tmpDir), 'venv', 'python'),
