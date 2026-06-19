@@ -5,12 +5,10 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(here, '../../..');
+const repoRoot = path.resolve(here, '../..');
 
 const catalogs = [
-  ['PC', 'PC/src/main/data/avatars.json'],
-  ['iOS', 'iOS/webui/data/avatars.json'],
-  ['Web', 'Web/res/data/avatars.json'],
+  ['desktop', 'src/main/data/avatars.json'],
 ] as const;
 
 function stableStringify(value: unknown): string {
@@ -52,7 +50,7 @@ function validateCatalog(label: string, relPath: string, catalog: any): void {
 }
 
 describe('avatar catalogs', () => {
-  it('keeps PC, iOS, and Web avatar resources consistent', () => {
+  it('keeps the desktop avatar catalog structurally valid', () => {
     const rows = catalogs.map(([label, relPath]) => {
       const catalog = JSON.parse(fs.readFileSync(path.join(repoRoot, relPath), 'utf8'));
       validateCatalog(label, relPath, catalog);
@@ -60,12 +58,6 @@ describe('avatar catalogs', () => {
     });
 
     const first = rows[0];
-    for (const row of rows.slice(1)) {
-      expect(
-        row.normalized,
-        `${row.label} (${row.relPath}) differs from ${first.label} (${first.relPath})`,
-      ).toBe(first.normalized);
-    }
     expect(first.normalized.length).toBeGreaterThan(0);
   });
 });

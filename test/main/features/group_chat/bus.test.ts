@@ -293,24 +293,19 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(finalPath)).toBe(true);
   });
 
-  it('auto-closes sync conflicts from a structured XML result', async () => {
+  it('ignores structured sync conflict results in the open build', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
     const paths = await import('../../../../src/main/paths');
     const state = await import('../../../../src/main/features/group_chat/state');
-    const conflicts = await import('../../../../src/main/features/sync/conflicts');
     const cid = 'cid-sync-conflict-xml';
     const relPath = 'cloud/memory/CONFLICT.md';
     const currentPath = path.join(paths.userCloudRoot(TEST_UID), 'memory', 'CONFLICT.md');
     fs.mkdirSync(path.dirname(currentPath), { recursive: true });
     fs.writeFileSync(currentPath, 'initial current');
-    const entry = await conflicts.archiveConflict(TEST_UID, relPath, 'local', 'cloud', {
-      kind: 'binary',
-      currentSide: 'local',
-      nowMs: Date.UTC(2026, 5, 10, 1, 0, 0),
-    });
+    const conflictId = 'conflict-xml-1';
     await state.setToolExtraRoots(TEST_UID, cid, [path.dirname(currentPath)]);
     await state.setSyncConflictResolution(TEST_UID, cid, [{
-      id: entry.id,
+      id: conflictId,
       rel_path: relPath,
       current_path: currentPath,
     }]);
@@ -320,7 +315,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       cid,
       fromActorId: 'user',
       text: `SYNC_CONFLICT_XML_RESULT:${Buffer.from(JSON.stringify({
-        conflictId: entry.id,
+        conflictId,
         relPath,
         targetPath: currentPath,
         status: 'resolved',
@@ -330,7 +325,8 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     await waitForQuiescent(TEST_UID, cid);
 
     expect(fs.readFileSync(currentPath, 'utf8')).toBe('initial current');
-    expect(await conflicts.listConflicts(TEST_UID)).toEqual([]);
+    expect((await state.readState(TEST_UID, cid)).sync_conflict_resolution?.conflicts)
+      .toEqual([{ id: conflictId, rel_path: relPath, current_path: currentPath }]);
   });
 
   // `isQuiescent` reflects the in-memory queue/running state — exercised

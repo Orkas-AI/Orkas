@@ -17,6 +17,13 @@ beforeEach(() => {
     getDeviceId: () => 'device-1',
     authHeaders: () => ({}),
   }));
+  vi.doMock('../../../../src/main/features/connectors/_server_bridge', () => ({
+    accountApiBase: () => 'https://orkas.ai/api',
+    tokenStore: {
+      getDeviceId: () => 'device-1',
+      authHeaders: () => ({}),
+    },
+  }));
   vi.doMock('../../../../src/main/features/config', () => ({
     getLanguage: () => 'en',
   }));
@@ -27,6 +34,7 @@ afterEach(() => {
   vi.doUnmock('electron');
   vi.doUnmock('../../../../src/main/features/account/server');
   vi.doUnmock('../../../../src/main/features/account/token_store');
+  vi.doUnmock('../../../../src/main/features/connectors/_server_bridge');
   vi.doUnmock('../../../../src/main/features/config');
 });
 
@@ -109,7 +117,7 @@ describe('features/connectors/oauth', () => {
     const pending = oauth.startGoogleSheetsPicker(['sheet-1']);
     expect(shell.openExternal).toHaveBeenCalledTimes(1);
     const opened = new URL((shell.openExternal as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0]);
-    expect(opened.pathname).toBe('/connectors/oauth/google/picker/start');
+    expect(opened.pathname).toBe('/api/connectors/oauth/google/picker/start');
     expect(opened.searchParams.get('catalog_id')).toBe('gsheets');
     expect(opened.searchParams.get('file_ids')).toBe('sheet-1');
 

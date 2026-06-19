@@ -42,8 +42,21 @@ afterEach(async () => {
   else process.env.ORKAS_API_BASE_URL = prevApi;
   if (prevProfile === undefined) delete process.env.ORKAS_PROFILE;
   else process.env.ORKAS_PROFILE = prevProfile;
+  vi.unstubAllGlobals();
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+function routeOf(input: string | URL | Request): string {
+  const url = new URL(String(input));
+  return `${url.origin}${url.pathname}`;
+}
 
 describe('marketplace default installs', () => {
   it('uses bare production API domains so POST requests are not downgraded by www redirects', async () => {
@@ -57,10 +70,10 @@ describe('marketplace default installs', () => {
     process.env.ORKAS_PROFILE = 'cn';
     vi.resetModules();
     marketplace = await import('../../../src/main/features/marketplace');
-    expect(marketplace.apiBase()).toBe('https://orkas.work/api');
+    expect(marketplace.apiBase()).toBe('https://orkas.ai/api');
   });
 
-  it('canonicalizes www API env overrides before marketplace POST requests', async () => {
+  it('ignores API env overrides before marketplace POST requests', async () => {
     process.env.ORKAS_API_BASE_URL = `https://${'www.'}orkas.ai/api/`;
     vi.resetModules();
 
@@ -87,19 +100,18 @@ describe('marketplace default installs', () => {
   });
 
   it('installs legacy marketplace skills when only _meta category advisories are present', async () => {
-    process.env.ORKAS_API_BASE_URL = await listen((req, res) => {
-      expect(req.method).toBe('POST');
-      expect(req.url).toBe('/api/marketplace/skills/bundle');
-      res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      expect(init?.method).toBe('POST');
+      expect(routeOf(input)).toBe('https://orkas.ai/api/marketplace/skills/bundle');
+      return jsonResponse({
         code: 0,
         bundle_url: 'https://cdn.test/legacy-skill.zip',
         version: '1.0.0',
         published_at: 10,
         create_uid: '0',
         status: 'approved',
-      }));
-    });
+      });
+    }));
 
     const users = await import('../../../src/main/features/users');
     users.activateUser('u1');
@@ -133,19 +145,18 @@ describe('marketplace default installs', () => {
   });
 
   it('returns only blocking quality findings in marketplace install rejection details', async () => {
-    process.env.ORKAS_API_BASE_URL = await listen((req, res) => {
-      expect(req.method).toBe('POST');
-      expect(req.url).toBe('/api/marketplace/skills/bundle');
-      res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      expect(init?.method).toBe('POST');
+      expect(routeOf(input)).toBe('https://orkas.ai/api/marketplace/skills/bundle');
+      return jsonResponse({
         code: 0,
         bundle_url: 'https://cdn.test/unsafe-skill.zip',
         version: '1.0.0',
         published_at: 10,
         create_uid: '0',
         status: 'approved',
-      }));
-    });
+      });
+    }));
 
     const users = await import('../../../src/main/features/users');
     users.activateUser('u1');
@@ -281,13 +292,12 @@ describe('marketplace default installs', () => {
 
   it('reports transient default seed failures so logged-in startup can retry', async () => {
     let calls = 0;
-    process.env.ORKAS_API_BASE_URL = await listen((req, res) => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       calls++;
-      expect(req.method).toBe('POST');
-      expect(req.url).toBe('/api/marketplace/defaults');
-      res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ code: 1, msg: '系统繁忙，请稍后重试' }));
-    });
+      expect(init?.method).toBe('POST');
+      expect(routeOf(input)).toBe('https://orkas.ai/api/marketplace/defaults');
+      return jsonResponse({ code: 1, msg: '系统繁忙，请稍后重试' });
+    }));
 
     const users = await import('../../../src/main/features/users');
     users.activateUser('u1');
@@ -303,10 +313,10 @@ describe('marketplace default installs', () => {
   });
 
   it('incrementally seeds new defaults while respecting installed rows and uninstall tombstones', async () => {
-    process.env.ORKAS_API_BASE_URL = await listen((req, res) => {
-      if (req.method === 'POST' && req.url === '/api/marketplace/defaults') {
-        res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const route = routeOf(input);
+      if (init?.method === 'POST' && route === 'https://orkas.ai/api/marketplace/defaults') {
+        return jsonResponse({
           code: 0,
           agents: [{
             id: 'agent-new',
@@ -368,57 +378,42 @@ describe('marketplace default installs', () => {
               status: 'approved',
             },
           ],
-        }));
-        return;
-      }
-      if (req.method === 'POST' && req.url === '/api/marketplace/agents/detail') {
-        let raw = '';
-        req.on('data', (chunk) => { raw += chunk; });
-        req.on('end', () => {
-          const body = JSON.parse(raw || '{}');
-          res.setHeader('Content-Type', 'application/json');
-          if (body.id === 'agent-failing') {
-            res.end(JSON.stringify({ code: 1, msg: 'temporary detail failure' }));
-            return;
-          }
-          res.end(JSON.stringify({
-            code: 0,
-            agent_json: {
-              name: body.id,
-              skill_list: body.id === 'agent-blocked' ? ['skill-deleted'] : ['skill-dep'],
-            },
-            version: '1.0.0',
-            category: 'general',
-            published_at: 10,
-            agent_json_url: `https://cdn.test/${body.id}.json`,
-            create_uid: '0',
-            status: 'approved',
-          }));
         });
-        return;
       }
-      if (req.method === 'POST' && req.url === '/api/marketplace/skills/bundle') {
-        let raw = '';
-        req.on('data', (chunk) => { raw += chunk; });
-        req.on('end', () => {
-          const body = JSON.parse(raw || '{}');
-          res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify({
-            code: 0,
-            bundle_url: `https://cdn.test/${body.id}.zip`,
-            version: '1.0.0',
-            published_at: 70,
-            updated_at: 80,
-            create_uid: '0',
-            status: 'approved',
-            default_install: false,
-          }));
+      if (init?.method === 'POST' && route === 'https://orkas.ai/api/marketplace/agents/detail') {
+        const body = JSON.parse(String(init.body || '{}'));
+        if (body.id === 'agent-failing') {
+          return jsonResponse({ code: 1, msg: 'temporary detail failure' });
+        }
+        return jsonResponse({
+          code: 0,
+          agent_json: {
+            name: body.id,
+            skill_list: body.id === 'agent-blocked' ? ['skill-deleted'] : ['skill-dep'],
+          },
+          version: '1.0.0',
+          category: 'general',
+          published_at: 10,
+          agent_json_url: `https://cdn.test/${body.id}.json`,
+          create_uid: '0',
+          status: 'approved',
         });
-        return;
       }
-      res.statusCode = 404;
-      res.end('not found');
-    });
+      if (init?.method === 'POST' && route === 'https://orkas.ai/api/marketplace/skills/bundle') {
+        const body = JSON.parse(String(init.body || '{}'));
+        return jsonResponse({
+          code: 0,
+          bundle_url: `https://cdn.test/${body.id}.zip`,
+          version: '1.0.0',
+          published_at: 70,
+          updated_at: 80,
+          create_uid: '0',
+          status: 'approved',
+          default_install: false,
+        });
+      }
+      return jsonResponse({ code: 1, msg: `unexpected route ${route}` }, 404);
+    }));
 
     const users = await import('../../../src/main/features/users');
     users.activateUser('u1');

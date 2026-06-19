@@ -290,7 +290,6 @@ describe('client_config', () => {
 
     const now = 1_234_567;
     vi.spyOn(Date, 'now').mockReturnValue(now);
-    process.env.ORKAS_API_BASE_URL = 'https://config.example/api/';
     let requestedUrl = '';
     let requestedInit: RequestInit | undefined;
     vi.stubGlobal('fetch', async (input: string | URL | Request, init?: RequestInit) => {
@@ -312,10 +311,10 @@ describe('client_config', () => {
       expect(result).toEqual({ updated: true });
 
       const url = new URL(requestedUrl);
-      expect(url.origin + url.pathname).toBe('https://config.example/api/config/client');
+      expect(url.origin + url.pathname).toBe('https://orkas.ai/api/config/client');
       expect(url.searchParams.get('platform')).toBe(clientConfigPlatform());
       expect(url.searchParams.get('version')).toBe('9.8.7');
-      expect(url.searchParams.get('channel')).toBe('dev');
+      expect(url.searchParams.get('channel')).toBe('open');
       expect(url.searchParams.get('region')).toBe('global');
       expect(url.searchParams.get('os')).toBe(process.platform);
       expect(url.searchParams.get('arch')).toBe(process.arch);

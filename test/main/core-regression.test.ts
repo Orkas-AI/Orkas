@@ -115,7 +115,7 @@ describe('PC core regression unit coverage', () => {
     });
 
     let entries = (await auth.listEntries()).entries;
-    expect(entries.map((entry) => entry.profileId)).toEqual([primary.profileId, backup.profileId]);
+    expect(entries.map((entry) => entry.profileId)).toEqual([backup.profileId, primary.profileId]);
     await auth.reorderEntries([second.entryId, first.entryId]);
     entries = (await auth.listEntries()).entries;
     expect(entries.map((entry) => entry.entryId)).toEqual([second.entryId, first.entryId]);
@@ -141,7 +141,8 @@ describe('PC core regression unit coverage', () => {
     expect((await auth.listEntries()).entries.map((entry) => entry.profileId)).toEqual([backup.profileId]);
 
     const raw = fs.readFileSync(paths.userAuthProfilesFile(TEST_UID), 'utf8');
-    expect(raw).toMatch(/^ORKLSEC1:/);
+    const localSecrets = await import('../../src/main/util/local-secret-store');
+    expect(localSecrets.isEncryptedSecret(raw)).toBe(true);
     expect(raw).not.toContain('sk-primary-regression-xxxxxxxx');
     expect(raw).not.toContain('sk-backup-regression-xxxxxxxx');
     expect(raw).not.toContain('tvly-regression-secret');

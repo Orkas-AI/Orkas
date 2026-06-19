@@ -227,7 +227,7 @@ describe('ConversationInfo files tab', () => {
     expect(result.counts.files).toBe('1');
   });
 
-  it('shows a cloud-sync scope note above the file list when sync is enabled', async () => {
+  it('does not render the stripped cloud-sync scope note above the file list', async () => {
     const html = await renderFilesHtml({
       syncEnabled: true,
       history: [],
@@ -248,8 +248,8 @@ describe('ConversationInfo files tab', () => {
       },
     });
 
-    expect(html).toContain('ci-files-sync-note');
-    expect(html).toContain('Cloud sync does not include these files');
+    expect(html).not.toContain('ci-files-sync-note');
+    expect(html).not.toContain('Cloud sync does not include these files');
   });
 });
 

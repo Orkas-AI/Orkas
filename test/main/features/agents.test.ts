@@ -1454,32 +1454,24 @@ describe('agents › list cache invalidation', () => {
     expect(list[0].name).toBe('V2');
   });
 
-  it('updates marketplace agent spec in dev', async () => {
-    const prevDevtools = process.env.ORKAS_DEVTOOLS;
-    process.env.ORKAS_DEVTOOLS = '1';
-    try {
-      const dir = path.join(builtinAgentsDir(), 'platform-agent');
-      fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(path.join(dir, 'agent.json'), JSON.stringify({
-        agent_id: 'platform-agent',
-        name: 'OldPlatformAgent',
-        description: '',
-        workflow: '',
-      }));
+  it('keeps marketplace agent specs read-only through the custom edit path', async () => {
+    const dir = path.join(builtinAgentsDir(), 'platform-agent');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'agent.json'), JSON.stringify({
+      agent_id: 'platform-agent',
+      name: 'OldPlatformAgent',
+      description: '',
+      workflow: '',
+    }));
 
-      const dev = await import('../../../src/main/features/agents_dev');
-      const updated = await dev.updateBuiltinAgentSpec('platform-agent', { name: 'RenamedPlatformAgent' });
+    const a = await loadAgents();
+    const updated = await a.updateCustomAgent('platform-agent', { name: 'RenamedPlatformAgent' });
 
-      expect(updated?.name).toBe('RenamedPlatformAgent');
-      expect(JSON.parse(fs.readFileSync(path.join(dir, 'agent.json'), 'utf8')).name)
-        .toBe('RenamedPlatformAgent');
-      const a = await loadAgents();
-      expect((await a.listAgents()).find((x) => x.agent_id === 'platform-agent')?.name)
-        .toBe('RenamedPlatformAgent');
-    } finally {
-      if (prevDevtools === undefined) delete process.env.ORKAS_DEVTOOLS;
-      else process.env.ORKAS_DEVTOOLS = prevDevtools;
-    }
+    expect(updated).toBeNull();
+    expect(JSON.parse(fs.readFileSync(path.join(dir, 'agent.json'), 'utf8')).name)
+      .toBe('OldPlatformAgent');
+    expect((await a.listAgents()).find((x) => x.agent_id === 'platform-agent')?.name)
+      .toBe('OldPlatformAgent');
   });
 
   it('cache-only invalidator picks up marketplace file rewrites', async () => {

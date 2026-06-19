@@ -17,6 +17,14 @@ vi.mock('../../../../src/main/features/account/token_store', () => ({
   authHeaders: () => ({ user_id: 'uid-1', session_id: 'sid-1' }),
 }));
 
+vi.mock('../../../../src/main/features/connectors/_server_bridge', () => ({
+  accountApiBase: () => 'https://orkas.ai/api',
+  tokenStore: {
+    getDeviceId: () => 'dev-1',
+    authHeaders: () => ({}),
+  },
+}));
+
 vi.mock('../../../../src/main/features/config', () => ({
   getLanguage: () => 'zh',
 }));
@@ -118,7 +126,7 @@ describe('connector OAuth GitHub server-managed grants', () => {
     expect(body.refresh_token).toBe('ghr-old');
     expect(body.access_token).toBe('ghu-old');
     expect(body.grant_id).toBeUndefined();
-    expect((init.headers as Record<string, string>).user_id).toBe('uid-1');
+    expect((init.headers as Record<string, string>).user_id).toBeUndefined();
   });
 
   it('does not call the server when an existing server-managed GitHub token is fresh', async () => {

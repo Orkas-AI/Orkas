@@ -57,9 +57,10 @@ describe('connectors registry secret storage', () => {
     const raw = fs.readFileSync(paths.userConnectorsConfigFile(TEST_UID), 'utf8');
     expect(raw).not.toContain('access-secret');
     expect(raw).not.toContain('refresh-secret');
+    const localSecrets = await import('../../../../src/main/util/local-secret-store');
     const disk = JSON.parse(raw);
     expect(disk.connections.github.oauth_grant).toBeUndefined();
-    expect(String(disk.connections.github.secrets_enc)).toMatch(/^ORKLSEC1:/);
+    expect(localSecrets.isEncryptedSecret(String(disk.connections.github.secrets_enc))).toBe(true);
 
     const loaded = registry.load(TEST_UID);
     expect(loaded.connections.github.oauth_grant?.access_token).toBe('access-secret');
@@ -89,7 +90,9 @@ describe('connectors registry secret storage', () => {
     expect(loaded.connections.github.oauth_grant?.refresh_token).toBe('refresh-secret');
 
     const migrated = JSON.parse(fs.readFileSync(file, 'utf8'));
-    expect(String(migrated.connections.github.secrets_enc)).toMatch(/^ORKLSEC1:/);
+    const localSecrets = await import('../../../../src/main/util/local-secret-store');
+    expect(localSecrets.isEncryptedSecret(String(migrated.connections.github.secrets_enc))).toBe(true);
+    expect(() => cryptoVault.decrypt(TEST_UID, String(migrated.connections.github.secrets_enc))).toThrow();
     expect(JSON.stringify(migrated)).not.toContain('refresh-secret');
   });
 });

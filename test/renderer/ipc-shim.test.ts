@@ -64,6 +64,6 @@ describe('ipc-shim streams', () => {
     const reader = res.body.getReader();
 
     await expect(reader.read()).rejects.toThrow('boom');
-    expect(monitorError).toHaveBeenCalledWith('ipc_stream', expect.any(Object));
+    expect(monitorError).not.toHaveBeenCalled();
   });
 });

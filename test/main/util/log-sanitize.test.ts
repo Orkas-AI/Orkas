@@ -81,7 +81,7 @@ describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
   });
 
   it('masks common provider token prefixes', () => {
-    const out = sanitizeLogTextForUpload('key test-openai-key-redacted');
+    const out = sanitizeLogTextForUpload('key sk-testopenaiKeyredacted123');
     expect(out).toBe('key ***TOKEN***');
   });
 

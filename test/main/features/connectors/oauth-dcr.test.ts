@@ -3,18 +3,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const electronMock = vi.hoisted(() => ({
   openExternal: vi.fn(async () => undefined),
 }));
+const OSS_API_BASE = vi.hoisted(() => 'https://orkas.ai/api');
 
 vi.mock('electron', () => ({
   shell: { openExternal: electronMock.openExternal },
 }));
 
-vi.mock('../../../../src/main/features/account/server', () => ({
-  accountApiBase: () => 'https://account.example/api',
-}));
-
-vi.mock('../../../../src/main/features/account/token_store', () => ({
-  getDeviceId: () => 'device-1',
-  authHeaders: () => ({ user_id: 'uid-1', session_id: 'sid-1' }),
+vi.mock('../../../../src/main/features/connectors/_server_bridge', () => ({
+  accountApiBase: () => OSS_API_BASE,
+  tokenStore: {
+    getDeviceId: () => 'device-1',
+    authHeaders: () => ({}),
+  },
 }));
 
 vi.mock('../../../../src/main/features/config', () => ({
@@ -70,7 +70,7 @@ describe('features/connectors/oauth-dcr', () => {
       }
       if (String(url) === 'https://auth.notion.example/register') {
         const body = JSON.parse(String(init?.body || '{}'));
-        expect(body.redirect_uris).toEqual(['https://account.example/api/connectors/oauth/dcr-callback']);
+        expect(body.redirect_uris).toEqual([`${OSS_API_BASE}/connectors/oauth/dcr-callback`]);
         expect(body.grant_types).toContain('authorization_code');
         return jsonResponse({ client_id: 'client-1', client_secret: 'secret-1' });
       }
@@ -88,7 +88,7 @@ describe('features/connectors/oauth-dcr', () => {
     expect(opened.href.startsWith('https://auth.notion.example/authorize?')).toBe(true);
     expect(opened.searchParams.get('response_type')).toBe('code');
     expect(opened.searchParams.get('client_id')).toBe('client-1');
-    expect(opened.searchParams.get('redirect_uri')).toBe('https://account.example/api/connectors/oauth/dcr-callback');
+    expect(opened.searchParams.get('redirect_uri')).toBe(`${OSS_API_BASE}/connectors/oauth/dcr-callback`);
     expect(opened.searchParams.get('resource')).toBe('https://mcp.notion.example/mcp');
     expect(opened.searchParams.get('code_challenge_method')).toBe('S256');
     expect(opened.searchParams.get('code_challenge')).toBeTruthy();
@@ -114,7 +114,7 @@ describe('features/connectors/oauth-dcr', () => {
       if (String(url) === 'https://auth.notion.example/register') {
         return jsonResponse({ client_id: 'client-1', client_secret: 'secret-1' });
       }
-      if (String(url) === 'https://account.example/api/connectors/oauth/dcr-exchange') {
+      if (String(url) === `${OSS_API_BASE}/connectors/oauth/dcr-exchange`) {
         const body = JSON.parse(String(init?.body || '{}'));
         expect(body.exchange_code).toBe('exchange-1');
         return jsonResponse({ code: 0, oauth_code: 'provider-code', oauth_state: 'wrong-state' });
@@ -156,7 +156,7 @@ describe('features/connectors/oauth-dcr', () => {
       if (String(url) === 'https://auth.notion.example/register') {
         return jsonResponse({ client_id: 'client-1', client_secret: 'secret-1' });
       }
-      if (String(url) === 'https://account.example/api/connectors/oauth/dcr-exchange') {
+      if (String(url) === `${OSS_API_BASE}/connectors/oauth/dcr-exchange`) {
         return jsonResponse({ code: 0, oauth_code: 'provider-code', oauth_state: openedState });
       }
       if (String(url) === 'https://auth.notion.example/token') {
@@ -171,13 +171,13 @@ describe('features/connectors/oauth-dcr', () => {
           scope: 'read write',
         });
       }
-      if (String(url) === 'https://account.example/api/connectors/oauth/dcr-store') {
+      if (String(url) === `${OSS_API_BASE}/connectors/oauth/dcr-store`) {
         const body = JSON.parse(String(init?.body || '{}'));
         expect(body.provider).toBe('notion');
         expect(body.refresh_token).toBe('refresh-local');
         expect(body.dcr_client.client_id).toBe('client-1');
         expect(body.dcr_client.client_secret).toBe('secret-1');
-        expect((init?.headers as Record<string, string>).user_id).toBe('uid-1');
+        expect((init?.headers as Record<string, string>).user_id).toBeUndefined();
         return jsonResponse({
           code: 0,
           access_token: 'access-server',
@@ -262,7 +262,7 @@ describe('features/connectors/oauth-dcr', () => {
       if (fetchMock.mock.calls.length === 1) {
         throw new TypeError('fetch failed');
       }
-      expect(String(url)).toBe('https://account.example/api/connectors/oauth/refresh');
+      expect(String(url)).toBe(`${OSS_API_BASE}/connectors/oauth/refresh`);
       const body = JSON.parse(String(init.body));
       expect(body.provider).toBe('notion');
       expect(body.grant_id).toBe('grant-1');
