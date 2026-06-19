@@ -709,6 +709,12 @@ function guardDisabledSkillBash(opts: LocalToolsOpts, command: string): string |
 
 /** Wrapped `bash` tool — identical schema, permission-gated, host-shell wording. */
 function createBashTool(opts: LocalToolsOpts): AgentTool {
+  const windowsShellDescription = process.platform === 'win32'
+    ? 'On Windows, commands run through PowerShell by default: use `$env:NAME` for ' +
+      'environment variables and avoid POSIX-only syntax such as `&&`, heredocs, ' +
+      '`source`/`export`, and `/dev/null` unless Git Bash is explicitly available. '
+    : '';
+
   return {
     name: 'bash',
     description:
@@ -719,6 +725,7 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
       'should be shown to the user as produced-file chips (for example .docx, .xlsx, ' +
       '.pptx, .pdf, images, HTML, CSV, Markdown), write them under the absolute ' +
       '$ORKAS_OUTPUT_DIR path, which is the current conversation workspace. ' +
+      windowsShellDescription +
       'Scratch/cache files should stay in temporary or cache directories. ' +
       'For GUI apps, browsers, servers, watchers, or any command you would normally ' +
       'background with `&`, set run_in_background=true instead of shell-backgrounding it; ' +
