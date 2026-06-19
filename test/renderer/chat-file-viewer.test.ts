@@ -107,7 +107,7 @@ describe('chat-file-viewer › _chatMediaLocalUrl', () => {
     expect(url).toContain('/a/b/c/d.pdf');
   });
   it('converts Windows-style "\\\\" to "/" so URL parsing stays well-formed', () => {
-    expect(_chatMediaLocalUrl('C:\\Users\\alice\\file.pdf')).toBe('chat-media://local/C:/Users/test/file.pdf');
+    expect(_chatMediaLocalUrl('C:\\Users\\test\\file.pdf')).toBe('chat-media://local/C:/Users/test/file.pdf');
   });
 });
 

@@ -23,9 +23,9 @@ afterEach(() => {
 });
 
 describe('paths › roots', () => {
-  it('PC_ROOT ends with /PC and APP_ROOT aliases it', async () => {
+  it('PC_ROOT is the app root and APP_ROOT aliases it', async () => {
     const p = await import('../../src/main/paths');
-    expect(p.PC_ROOT.endsWith('/PC')).toBe(true);
+    expect(p.PC_ROOT).toBe(process.cwd());
     expect(p.APP_ROOT).toBe(p.PC_ROOT);
   });
 
