@@ -7,15 +7,17 @@
  *   1. LLM calls `delete_file({ path })` (no token).
  *      Tool calls `requestConfirmation(absPath, ctx)` → gets a fresh
  *      `confirmation_token` synchronously, returns it to the LLM along
- *      with `requires_user_confirmation: true`. The renderer renders an
- *      inline card.
+ *      with `requires_user_confirmation: true`. The renderer renders it in
+ *      an inline card; multiple pending tokens from the same turn may be
+ *      grouped into one card.
  *   2. LLM sees the token-bearing result; per skill-creator's SKILL.md
  *      rule, it MUST end the turn with a prose ask, NOT immediately
  *      re-call delete_file in the same turn. The token is in `pending`
  *      state until the user clicks the card.
  *   3. User clicks Confirm / Cancel → renderer invokes
- *      `delete_file.respond` → `resolveConfirmation(token, granted)`
- *      flips the state to `granted` / `denied`.
+ *      `delete_file.respond` for each token in that card →
+ *      `resolveConfirmation(token, granted)` flips each state to
+ *      `granted` / `denied`.
  *   4. LLM (in a later turn, after the user has replied) calls
  *      `delete_file({ path, confirmation_token })` → tool calls
  *      `consumeGrantedConfirmation(token, absPath)`:
@@ -76,6 +78,9 @@ export interface DeleteConfirmContext {
   display_path: string;
   /** Active conv id; lets the renderer optionally scope its UI hint. */
   cid?: string;
+  /** Stable id for the current visible actor turn. Used by the renderer to
+   *  batch only confirmations produced by the same model turn. */
+  turn_id?: string;
 }
 
 /** Mint a fresh confirmation token, emit the inline card to the renderer,
@@ -90,6 +95,7 @@ export function requestConfirmation(absPath: string, ctx: DeleteConfirmContext):
       path: ctx.display_path,
       abs_path: absPath,
       cid: ctx.cid ?? '',
+      turn_id: ctx.turn_id ?? '',
     });
   } catch (err) {
     log.warn(`emit confirmation_required failed token=${token}: ${(err as Error).message}`);

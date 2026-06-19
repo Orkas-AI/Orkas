@@ -97,6 +97,9 @@ export interface BuildRunnerParams {
    *  / process_file_full calls whose path targets the attachment dir of the
    *  current conv. */
   cid?: string;
+  /** Stable id for the current visible actor/model turn. Used by delete_file
+   *  confirmation UI so batching never crosses prior conversation turns. */
+  turnId?: string;
   /** Project id of the conversation, when it belongs to one. Threaded
    *  through to local-tools / file-tools / image-gen-tool so workspace
    *  resolution picks up the project-scoped selection. Resolved once at
@@ -363,6 +366,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const localTools = createLocalTools({
     ...(uid ? { userId: uid } : {}),
     ...(params.cid ? { cid: params.cid } : {}),
+    ...(params.turnId ? { turnId: params.turnId } : {}),
     ...(agentId ? { agentId } : {}),
     ...(params.projectId ? { projectId: params.projectId } : {}),
     ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
@@ -371,7 +375,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     // write-side tools (`write_file` / `edit_file`) still use
     // `guardEditPath`, which ignores readOnly roots and keeps them
     // immutable. The asymmetry exists because `delete_file` carries a
-    // per-call UI confirm modal (`delete-file-confirm.ts`) that the user
+    // per-call UI confirm card (`delete-file-confirm.ts`) that the user
     // physically has to click — that gate justifies allowing deletion of
     // paths the caller marked read-only for silent writes.
     ...(params.readOnlyExtraRoots?.length ? { readOnlyExtraRoots: params.readOnlyExtraRoots } : {}),

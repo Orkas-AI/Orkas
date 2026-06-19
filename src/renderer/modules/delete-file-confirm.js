@@ -2,9 +2,9 @@
 // Main emits a `delete_file.confirmation_required` push when an LLM agent
 // calls `delete_file(path)`; we render an inline card at the bottom of the
 // chat history (NOT a modal — the modal was disruptive and blocked the rest
-// of the UI). The card carries the path + Cancel / Delete buttons; clicking
-// either sends `delete_file.respond` back through IPC and the main-side
-// tool unblocks.
+// of the UI). Multiple pending deletes from the same visible actor turn are
+// grouped into one card, so the user can confirm/cancel that turn's batch with
+// a single click. Each path still keeps its own main-side confirmation token.
 //
 // See: src/main/model/core-agent/delete-file-confirm.ts (request side)
 //      src/main/ipc/index.ts          (`delete_file.respond` handler)
@@ -18,6 +18,8 @@ const _deleteFileLog = (typeof createLogger === 'function')
   : { info: () => {}, warn: () => {} };
 
 let _deleteFileSubscription = null;
+const _deleteFileBatches = new Map();
+const _DELETE_CONFIRM_FALLBACK_BATCH_MS = 1000;
 
 function startDeleteFileConfirmSubscription() {
   if (_deleteFileSubscription) return;  // idempotent
@@ -88,52 +90,100 @@ function _mountDeleteConfirmCard(payload) {
     _respondDeleteConfirm(payload.confirm_id, false);
     return;
   }
-  const displayPath = String(payload.path || payload.abs_path || '');
-  const title       = _tDelete('local.delete_file.title',        '确认删除文件');
-  const message     = _tDelete('local.delete_file.message',      '是否删除以下文件?该操作不可撤销。');
-  const okLabel     = _tDelete('local.delete_file.confirm_button', '删除');
+  const key = _deleteConfirmBatchKey(container, payload);
+  const hasTurnId = _deleteConfirmHasTurnId(payload);
+  let batch = _deleteFileBatches.get(key);
+  if (!batch || batch.settled || batch.container !== container || batch.card.parentNode !== container || (!hasTurnId && !batch.accepting)) {
+    batch = _createDeleteConfirmBatch(container, key, hasTurnId);
+    _deleteFileBatches.set(key, batch);
+  }
+  _addDeleteConfirmEntry(batch, payload);
+}
+
+function _deleteConfirmTurnId(payload) {
+  return String((payload && (payload.turn_id || payload.turnId)) || '');
+}
+
+function _deleteConfirmHasTurnId(payload) {
+  return !!_deleteConfirmTurnId(payload);
+}
+
+function _deleteConfirmBatchKey(container, payload) {
+  const surface = container.id || 'chat-history';
+  const cid = String(payload && payload.cid ? payload.cid : '');
+  const turnId = _deleteConfirmTurnId(payload);
+  return surface + ':' + cid + ':' + (turnId ? ('turn:' + turnId) : 'fallback');
+}
+
+function _createDeleteConfirmBatch(container, key, hasTurnId) {
   const cancelLabel = _tDelete('local.delete_file.cancel_button',  '取消');
-  const confirmedText = _tDelete('local.delete_file.confirmed',  '已确认删除');
-  const cancelledText = _tDelete('local.delete_file.cancelled',  '已取消');
 
   const card = document.createElement('div');
   card.className = 'delete-confirm-card';
-  card.dataset.deleteConfirmId = payload.confirm_id;
+  card.dataset.deleteConfirmBatch = key;
   card.innerHTML = `
-    <div class="delete-confirm-title">${escapeHtml(title)}</div>
-    <div class="delete-confirm-path"><code></code></div>
-    <div class="delete-confirm-message">${escapeHtml(message)}</div>
+    <div class="delete-confirm-title"></div>
+    <div class="delete-confirm-path-list"></div>
+    <div class="delete-confirm-message"></div>
     <div class="delete-confirm-actions">
-      <button class="btn" type="button" data-delete-act="cancel">${escapeHtml(cancelLabel)}</button>
-      <button class="btn btn-danger" type="button" data-delete-act="ok">${escapeHtml(okLabel)}</button>
+      <button class="btn" type="button" data-delete-act="cancel"></button>
+      <button class="btn btn-danger" type="button" data-delete-act="ok"></button>
     </div>
     <div class="delete-confirm-result" hidden></div>
   `;
-  // Set the path via textContent to avoid any HTML interpretation of slashes
-  // / quoting that escapeHtml on long abs paths can mangle visually.
-  card.querySelector('.delete-confirm-path code').textContent = displayPath;
   container.appendChild(card);
   _scrollDeleteConfirmIntoView(card);
 
+  const titleEl = card.querySelector('.delete-confirm-title');
+  const pathListEl = card.querySelector('.delete-confirm-path-list');
+  const messageEl = card.querySelector('.delete-confirm-message');
   const okBtn = card.querySelector('[data-delete-act="ok"]');
   const cancelBtn = card.querySelector('[data-delete-act="cancel"]');
   const resultEl = card.querySelector('.delete-confirm-result');
+  cancelBtn.textContent = cancelLabel;
 
-  let settled = false;
+  const batch = {
+    key,
+    container,
+    card,
+    titleEl,
+    pathListEl,
+    messageEl,
+    okBtn,
+    cancelBtn,
+    resultEl,
+    entries: [],
+    ids: new Set(),
+    settled: false,
+    accepting: true,
+    hasTurnId,
+    fallbackTimer: null,
+  };
+  _refreshDeleteConfirmFallbackWindow(batch);
+
   const settle = async (granted) => {
-    if (settled) return;
-    settled = true;
+    if (batch.settled) return;
+    batch.settled = true;
+    _deleteFileBatches.delete(batch.key);
+    if (batch.fallbackTimer) {
+      clearTimeout(batch.fallbackTimer);
+      batch.fallbackTimer = null;
+    }
+    const entries = batch.entries.slice();
+    const count = entries.length;
     okBtn.disabled = true;
     cancelBtn.disabled = true;
     card.classList.add(granted ? 'is-confirmed' : 'is-cancelled');
-    resultEl.textContent = granted ? confirmedText : cancelledText;
+    resultEl.textContent = _deleteConfirmResultText(granted, count);
     resultEl.hidden = false;
-    await _respondDeleteConfirm(payload.confirm_id, granted);
+    for (const entry of entries) {
+      await _respondDeleteConfirm(entry.confirm_id, granted);
+    }
     // The token state flip alone doesn't wake the LLM — Step 1 already
     // ended the turn, so without a fresh user message Step 2 never fires
     // and the file isn't actually unlinked. Auto-dispatch a short user
-    // message via the active surface's input + send button so the LLM
-    // gets a new turn and retries with the token. Cancel doesn't need
+    // message via the active surface's input + send button once per batch
+    // so the LLM gets a new turn and retries with the tokens. Cancel doesn't need
     // this — the LLM treats `denied` as terminal.
     if (granted) {
       const trigger = _tDelete('local.delete_file.user_continue', '已确认,请继续。');
@@ -147,6 +197,66 @@ function _mountDeleteConfirmCard(payload) {
 
   okBtn.addEventListener('click', () => settle(true));
   cancelBtn.addEventListener('click', () => settle(false));
+  return batch;
+}
+
+function _addDeleteConfirmEntry(batch, payload) {
+  const confirmId = String(payload.confirm_id || '');
+  if (!confirmId || batch.ids.has(confirmId) || batch.settled) return;
+  _refreshDeleteConfirmFallbackWindow(batch);
+  const displayPath = String(payload.path || payload.abs_path || '');
+  batch.ids.add(confirmId);
+  batch.entries.push({ confirm_id: confirmId, path: displayPath });
+  batch.card.dataset.deleteConfirmId = batch.entries[0].confirm_id;
+  batch.card.dataset.deleteConfirmCount = String(batch.entries.length);
+  _renderDeleteConfirmBatch(batch);
+  _scrollDeleteConfirmIntoView(batch.card);
+}
+
+function _refreshDeleteConfirmFallbackWindow(batch) {
+  if (!batch || batch.hasTurnId) return;
+  if (batch.fallbackTimer) clearTimeout(batch.fallbackTimer);
+  batch.accepting = true;
+  batch.fallbackTimer = setTimeout(() => {
+    batch.accepting = false;
+    batch.fallbackTimer = null;
+  }, _DELETE_CONFIRM_FALLBACK_BATCH_MS);
+}
+
+function _renderDeleteConfirmBatch(batch) {
+  const count = batch.entries.length;
+  const isBatch = count > 1;
+  batch.titleEl.textContent = isBatch
+    ? _tDelete('local.delete_file.batch_title', '确认删除 {count} 个文件', { count })
+    : _tDelete('local.delete_file.title', '确认删除文件');
+  batch.messageEl.textContent = isBatch
+    ? _tDelete('local.delete_file.batch_message', '智能体请求删除以下 {count} 个文件,确认后立即从磁盘移除,不可撤销。', { count })
+    : _tDelete('local.delete_file.message', '是否删除以下文件?该操作不可撤销。');
+  batch.okBtn.textContent = isBatch
+    ? _tDelete('local.delete_file.batch_confirm_button', '删除全部 {count} 个', { count })
+    : _tDelete('local.delete_file.confirm_button', '删除');
+
+  while (batch.pathListEl.firstChild) batch.pathListEl.removeChild(batch.pathListEl.firstChild);
+  for (const entry of batch.entries) {
+    const row = document.createElement('div');
+    row.className = 'delete-confirm-path';
+    row.dataset.deleteConfirmId = entry.confirm_id;
+    const code = document.createElement('code');
+    code.textContent = entry.path;
+    row.appendChild(code);
+    batch.pathListEl.appendChild(row);
+  }
+}
+
+function _deleteConfirmResultText(granted, count) {
+  if (count > 1) {
+    return granted
+      ? _tDelete('local.delete_file.batch_confirmed', '已确认删除 {count} 个文件', { count })
+      : _tDelete('local.delete_file.batch_cancelled', '已取消 {count} 个文件', { count });
+  }
+  return granted
+    ? _tDelete('local.delete_file.confirmed', '已确认删除')
+    : _tDelete('local.delete_file.cancelled', '已取消');
 }
 
 /** Fire a fresh user message in the currently active chat surface so the

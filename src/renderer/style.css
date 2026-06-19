@@ -6529,6 +6529,16 @@ body.model-not-configured .main-content { flex-direction: column; }
   font-weight: 600;
   color: var(--danger, #dc2626);
 }
+.delete-confirm-path-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 180px;
+  overflow: auto;
+}
+.delete-confirm-path {
+  min-width: 0;
+}
 .delete-confirm-path code {
   display: block;
   padding: 6px 10px;

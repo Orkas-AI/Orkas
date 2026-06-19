@@ -135,14 +135,14 @@ Each file under the skill directory is written via this whole-file replacement b
 
 Use the `delete_file` tool (NOT a `<<<skill-file>>>` block) — two-step token flow:
 
-1. **Step 1: ask** — `delete_file({ path: "<abs path>" })` without a token. Tool returns immediately with `requires_user_confirmation: true` + a `confirmation_token`, and an inline card appears for the user. Do NOT call delete_file again this turn. In your reply prose, tell the user what file you're about to delete and ask them to click the card. End the turn.
+1. **Step 1: ask** — `delete_file({ path: "<abs path>" })` without a token. Tool returns immediately with `requires_user_confirmation: true` + a `confirmation_token`, and the path is added to an inline confirmation card for the user. For multiple intended deletes, issue one Step 1 call per file in the same turn, then stop. Do NOT call delete_file with any token again this turn. In your reply prose, tell the user what file(s) you're about to delete and ask them to click the card. End the turn.
 2. **Step 2: complete** — after the user's next reply (which can be anything: "yes", "go ahead", silence, or unrelated chat — the card click is what matters), call `delete_file({ path, confirmation_token: "<token from step 1>" })`. Tool checks the card state:
    - `granted` → file is unlinked.
    - `pending` (`E_AWAITING_USER`) → user hasn't clicked yet; stop and wait for the next reply, then retry with the same token.
    - `denied` (`E_USER_DENIED`) → user declined; do not retry, treat the file as kept.
    - `invalid` (`E_INVALID_TOKEN`) → token expired or path changed; call Step 1 again to mint a fresh card.
 
-**Only call `delete_file` for files inside the current skill directory.** If the user explicitly names files, delete only those. If the user asked to import / create / clean up a skill, that request implicitly authorizes you to propose cleanup for unrelated files you found inside the copied skill directory; still use the two-step confirmation card and name the evidence for each proposed deletion. Bundle multiple deletes by issuing one Step 1 call per file in the same turn (each gets its own card + token); the user then clicks each card and you complete them all in the next turn(s).
+**Only call `delete_file` for files inside the current skill directory.** If the user explicitly names files, delete only those. If the user asked to import / create / clean up a skill, that request implicitly authorizes you to propose cleanup for unrelated files you found inside the copied skill directory; still use the two-step confirmation card and name the evidence for each proposed deletion. Bundle multiple deletes by issuing one Step 1 call per file in the same turn; each call gets its own token, and the UI groups pending paths into one confirmation card when possible. After the user confirms, complete each file on the next turn with its matching token.
 
 ## Container shape
 
@@ -381,7 +381,7 @@ Audit protocol:
 4. Delete-unneeded when the file is not referenced, not read/executed, not an input asset/template/example, and not needed to reproduce behavior. Typical delete-unneeded files include source marketplace metadata (`_skillhub_meta.json`, `.skillhub*`, install manifests), repository metadata (`.git/`, `.github/`, `.gitignore`, `.gitattributes`, `.editorconfig`), dependency/build/cache outputs (`node_modules/`, `.venv/`, `__pycache__/`, `dist/`, `build/`, `coverage/`), logs, release/contribution docs, copied workspace notes, prompt drafts, and one-off evaluation output.
 5. Source marketplace metadata is delete-unneeded even when it came from the source package and even when source/current diff is empty. Example: `_skillhub_meta.json` records installation/source bookkeeping and is not read by the skill runtime.
 6. Keep uncertain files only when they may contain domain knowledge, placeholders, templates, examples, assets, or tests; summarize why they were kept.
-7. When deleting, use `delete_file` confirmation cards for each path, then complete the deletion on the next user turn. If this surface cannot delete automatically, list exact absolute paths and the evidence for deletion; do not claim the directory is clean.
+7. When deleting, use `delete_file` once per path, let the UI group those paths into a confirmation card, then complete each deletion on the next user turn with its matching token. If this surface cannot delete automatically, list exact absolute paths and the evidence for deletion; do not claim the directory is clean.
 8. Do not finish with "no cleanup needed" until the tree inventory has been checked and every non-SKILL.md file has a keep/delete reason.
 
 **Scope = the original skill's full feature set**: by default migrate everything. If the original has 20 commands, migrate 20. Do NOT present "option A vs B" choices; do NOT drop features citing "less code / no new dependencies". If the source is a multi-skill package, install each sub-skill as an independent skill and keep each source skill's boundary. **Exception**: if the user explicitly requests a subset ("I only want the search capability"), follow what the user said.

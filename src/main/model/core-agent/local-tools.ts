@@ -74,6 +74,9 @@ export interface LocalToolsOpts {
    *  (artifacts live under `chat_artifacts/<cid>/`); the tool errors out
    *  when it's missing. */
   cid?: string;
+  /** Stable id for the current actor/model turn. Renderer uses this to group
+   *  only delete confirmations produced by that same turn. */
+  turnId?: string;
   /** The actor id producing this turn (an agent's id, or `''` for the
    *  group-chat commander / edit chats). Stamped into `create_artifact`'s
    *  metadata so the renderer knows which actor to route an interaction
@@ -93,7 +96,7 @@ export interface LocalToolsOpts {
   extraRoots?: readonly string[];
   /** Extra absolute roots that are **read-only** for write-side tools
    *  (`write_file` / `edit_file`) but in-scope for `delete_file`. The
-   *  per-call UI confirmation modal on `delete_file` is the safety gate
+   *  per-call UI confirmation card on `delete_file` is the safety gate
    *  that makes this asymmetry safe — every delete requires explicit
    *  user click, so a path the caller marked read-only is still
    *  protected from silent overwrite by `write_file` / `edit_file`
@@ -851,12 +854,14 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
 /** Wrapped `delete_file` tool — single-file unlink, sandboxed identically to
  *  `edit_file` (workspace + current attachment dir + extraRoots / readonly).
  *  Destructive, so on top of `localExec` we require a per-call user click
- *  in the inline confirm card.
+ *  in the inline confirm card. The renderer may group multiple pending
+ *  per-file tokens from the same turn into one card, but the tool still
+ *  consumes one token per file.
  *
  *  Async token model (does NOT block the LLM turn — see
  *  delete-file-confirm.ts header):
  *    - First call: `delete_file({path})` (no token). Tool mints a token,
- *      emits the card, and returns IMMEDIATELY with `requires_user_confirmation`
+ *      emits/adds to a card, and returns IMMEDIATELY with `requires_user_confirmation`
  *      so the LLM can keep doing other tool calls / finish the turn.
  *      Skill-creator authoring rules require the LLM to stop in prose
  *      after this and ask the user; never retry in the same turn.
@@ -880,7 +885,8 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
       'Flow:\n' +
       '  Step 1 — `delete_file({path})` (no token). Tool emits an inline ' +
       'confirm card to the user and returns `requires_user_confirmation: ' +
-      'true` with a `confirmation_token`. The tool does NOT block. Tell ' +
+      'true` with a `confirmation_token`. Multiple Step 1 calls from the ' +
+      'same turn may be grouped into one user-facing card. The tool does NOT block. Tell ' +
       'the user in prose what you intend to delete; do NOT retry with ' +
       'the token in the same turn — wait for the user to click the card ' +
       'and reply, then retry on the next turn.\n' +
@@ -996,13 +1002,17 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
           isError: true,
         };
       }
-      const newToken = requestDeleteConfirmation(abs, { display_path: rawPath, cid: opts.cid });
+      const newToken = requestDeleteConfirmation(abs, {
+        display_path: rawPath,
+        cid: opts.cid,
+        turn_id: opts.turnId,
+      });
       log.info(`delete_file confirmation requested user=${opts.userId ?? '?'} path=${abs} token=${newToken}`);
       return {
         content:
-          `requires_user_confirmation: a confirmation card for "${rawPath}" has been shown to the user.\n` +
+          `requires_user_confirmation: "${rawPath}" has been added to the user's confirmation card.\n` +
           `confirmation_token: ${newToken}\n` +
-          `Next step: stop calling tools this turn. In your reply prose, tell the user what you plan to delete and ask them to click the card. ` +
+          `Next step: stop calling tools this turn after requesting all intended deletes. In your reply prose, tell the user what you plan to delete and ask them to click the card. ` +
           `On the user's next reply, call delete_file again with BOTH \`path\` and \`confirmation_token\` set to complete the deletion.`,
       };
     },
