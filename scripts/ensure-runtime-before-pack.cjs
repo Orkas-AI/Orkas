@@ -2,6 +2,7 @@
 'use strict';
 
 const path = require('node:path');
+const fs = require('node:fs');
 const { spawnSync } = require('node:child_process');
 
 const ARCH_MAP = new Map([
@@ -21,8 +22,29 @@ function normalizeArch(value) {
   return ARCH_MAP.get(String(value)) || String(value || process.arch);
 }
 
+function platformKey(platform, arch) {
+  return `${platform}-${arch}`;
+}
+
+function pruneRuntimeRoot(root, keys) {
+  const allowed = new Set(keys);
+  for (const kind of ['python', 'uv']) {
+    const kindDir = path.join(root, kind);
+    if (!fs.existsSync(kindDir) || !fs.statSync(kindDir).isDirectory()) {
+      continue;
+    }
+    for (const entry of fs.readdirSync(kindDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || allowed.has(entry.name)) {
+        continue;
+      }
+      fs.rmSync(path.join(kindDir, entry.name), { recursive: true, force: true });
+    }
+  }
+}
+
 module.exports = async function ensureRuntimeBeforePack(context) {
   const pcRoot = path.resolve(__dirname, '..');
+  const runtimeRoot = path.join(pcRoot, 'resources', 'runtime');
   const platform = context && context.electronPlatformName
     ? String(context.electronPlatformName)
     : process.platform;
@@ -32,7 +54,7 @@ module.exports = async function ensureRuntimeBeforePack(context) {
   for (const targetArch of arches) {
     const res = spawnSync(process.execPath, [
       path.join(pcRoot, 'bin', 'ensure-runtime.cjs'),
-      '--root', path.join(pcRoot, 'resources', 'runtime'),
+      '--root', runtimeRoot,
       '--platform', platform,
       '--arch', targetArch,
     ], {
@@ -46,4 +68,6 @@ module.exports = async function ensureRuntimeBeforePack(context) {
       throw new Error(`ensure-runtime failed for ${platform}-${targetArch} with status ${res.status}`);
     }
   }
+
+  pruneRuntimeRoot(runtimeRoot, arches.map(targetArch => platformKey(platform, targetArch)));
 };
