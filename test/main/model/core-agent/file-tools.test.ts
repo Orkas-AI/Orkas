@@ -5,6 +5,7 @@ import * as path from 'node:path';
 
 import { makeMinimalPdf } from '../../../fixtures/make-minimal-pdf';
 import { makeMinimalDocx } from '../../../fixtures/make-minimal-docx';
+import { makeMinimalXlsx, makeMinimalPptx } from '../../../fixtures/make-minimal-office';
 
 const UID = 'u-ftools-001';
 const CID = 'conv-x';
@@ -95,11 +96,20 @@ describe('file-tools › read_file (text)', () => {
   });
 });
 
-describe('file-tools › read_file (pdf/docx requires stat_file first)', () => {
+describe('file-tools › read_file (rich documents require stat_file first)', () => {
   it('returns E_NEED_STAT when pdf has never been stated', async () => {
     const { tools, wsDir } = await buildTools();
     const p = path.join(wsDir, 'fresh.pdf');
     fs.writeFileSync(p, makeMinimalPdf(['Alpha', 'Bravo']));
+    const r = await run(getTool(tools, 'read_file'), { path: p });
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_NEED_STAT');
+  });
+
+  it('returns E_NEED_STAT when xlsx has never been stated', async () => {
+    const { tools, wsDir } = await buildTools();
+    const p = path.join(wsDir, 'fresh.xlsx');
+    fs.writeFileSync(p, makeMinimalXlsx({ rows: [['Name'], ['Ada']] }));
     const r = await run(getTool(tools, 'read_file'), { path: p });
     expect(r.isError).toBe(true);
     expect(r.content).toContain('E_NEED_STAT');
@@ -131,6 +141,43 @@ describe('file-tools › read_file (pdf/docx requires stat_file first)', () => {
     const r = await run(getTool(tools, 'read_file'), { path: p, charStart: 0, charEnd: 4 });
     expect(r.isError).toBeFalsy();
     expect(r.content).toContain('covered="0-4"');
+  });
+
+  it('reads xlsx after stat_file', async () => {
+    const { tools, wsDir } = await buildTools();
+    const p = path.join(wsDir, 'scores.xlsx');
+    fs.writeFileSync(p, makeMinimalXlsx({ sheetName: 'Scores', rows: [['Name', 'Score'], ['Ada', '99']] }));
+    const s = await run(getTool(tools, 'stat_file'), { path: p });
+    expect(s.isError).toBeFalsy();
+    expect(s.content).toContain('kind="spreadsheet"');
+
+    const r = await run(getTool(tools, 'read_file'), { path: p });
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('Row 1: Name\tScore');
+    expect(r.content).toContain('Row 2: Ada\t99');
+  });
+
+  it('reads pptx after stat_file', async () => {
+    const { tools, wsDir } = await buildTools();
+    const p = path.join(wsDir, 'slides.pptx');
+    fs.writeFileSync(p, makeMinimalPptx({ slides: [['Roadmap', 'Launch in June']] }));
+    const s = await run(getTool(tools, 'stat_file'), { path: p });
+    expect(s.isError).toBeFalsy();
+    expect(s.content).toContain('kind="presentation"');
+
+    const r = await run(getTool(tools, 'read_file'), { path: p });
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('- Roadmap');
+    expect(r.content).toContain('- Launch in June');
+  });
+
+  it('returns E_UNSUPPORTED_FILE for legacy Office formats', async () => {
+    const { tools, wsDir } = await buildTools();
+    const p = path.join(wsDir, 'legacy.xls');
+    fs.writeFileSync(p, Buffer.from('legacy'));
+    const r = await run(getTool(tools, 'stat_file'), { path: p });
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_UNSUPPORTED_FILE');
   });
 });
 
@@ -255,6 +302,24 @@ describe('file-tools › stat_file', () => {
     expect(r.content).toMatch(/total_chars="\d+"/);
   });
 
+  it('extracts xlsx and pptx and returns total_chars', async () => {
+    const { tools, wsDir } = await buildTools();
+    const sheet = path.join(wsDir, 'scores.xlsx');
+    const deck = path.join(wsDir, 'slides.pptx');
+    fs.writeFileSync(sheet, makeMinimalXlsx({ rows: [['Name'], ['Ada']] }));
+    fs.writeFileSync(deck, makeMinimalPptx({ slides: [['Roadmap']] }));
+
+    const s1 = await run(getTool(tools, 'stat_file'), { path: sheet });
+    const s2 = await run(getTool(tools, 'stat_file'), { path: deck });
+
+    expect(s1.isError).toBeFalsy();
+    expect(s1.content).toContain('kind="spreadsheet"');
+    expect(s1.content).toMatch(/total_chars="\d+"/);
+    expect(s2.isError).toBeFalsy();
+    expect(s2.content).toContain('kind="presentation"');
+    expect(s2.content).toMatch(/total_chars="\d+"/);
+  });
+
   it('returns E_NO_TEXT for image kind', async () => {
     const { tools, wsDir } = await buildTools();
     const p = path.join(wsDir, 'chart.png');
@@ -377,6 +442,17 @@ describe('file-tools › grep_files', () => {
     expect(r.isError).toBeFalsy();
     expect(r.content).toContain('clause.pdf');
     expect(r.content).toContain('Termination');
+  });
+
+  it('extracts xlsx/pptx on cache-miss then greps', async () => {
+    const { tools, wsDir } = await buildTools();
+    fs.writeFileSync(path.join(wsDir, 'scores.xlsx'), makeMinimalXlsx({ rows: [['Name'], ['Banana KPI']] }));
+    fs.writeFileSync(path.join(wsDir, 'slides.pptx'), makeMinimalPptx({ slides: [['Roadmap Banana']] }));
+    const r = await run(getTool(tools, 'grep_files'), { pattern: 'Banana' });
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('scores.xlsx');
+    expect(r.content).toContain('slides.pptx');
+    expect(r.content).toContain('Banana');
   });
 
   it('rejects invalid regex under regex=true', async () => {

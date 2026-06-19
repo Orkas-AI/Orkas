@@ -5,15 +5,17 @@
  * Supported kinds — mirrors `contexts` upload whitelist:
  *   text   — .md / .markdown / .txt / .csv / .tsv / .json / .yaml / .yml / .log
  *   pdf    — .pdf
- *   docx   — .docx
+ *   docx   — .docx / .docm
+ *   spreadsheet  — .xlsx / .xlsm
+ *   presentation — .pptx / .pptm
  *   image  — .png / .jpg / .jpeg / .webp / .gif
  *   video  — .mp4 / .webm / .mov / .m4v / .ogv (display-only, not sent to
  *            the model; bytes streamed to the renderer via the
  *            `chat-media://` protocol)
  *
  * Lifecycle:
- *   uploadAttachment   — write original to disk; NO preprocessing. PDF/DOCX
- *                        extract + image grayscale happen lazily on read via
+ *   uploadAttachment   — write original to disk; NO preprocessing. PDF/DOCX/
+ *                        XLSX/PPTX extract + image grayscale happen lazily on read via
  *                        features/file_indexer (which caches under
  *                        <uid>/local/file_cache/<hash>/). Video is kept raw
  *                        and never cached.
@@ -59,13 +61,18 @@ const TEXT_EXTS: ReadonlySet<string> = new Set([
 const IMAGE_EXTS: ReadonlySet<string> = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 const VIDEO_EXTS: ReadonlySet<string> = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
 const PDF_EXT = '.pdf';
-const DOCX_EXT = '.docx';
+const DOCX_EXTS: ReadonlySet<string> = new Set(['.docx', '.docm']);
+const SPREADSHEET_EXTS: ReadonlySet<string> = new Set(['.xlsx', '.xlsm']);
+const PRESENTATION_EXTS: ReadonlySet<string> = new Set(['.pptx', '.pptm']);
 export const ALLOWED_EXTENSIONS: ReadonlySet<string> = new Set([
-  ...TEXT_EXTS, PDF_EXT, DOCX_EXT, ...IMAGE_EXTS, ...VIDEO_EXTS,
+  ...TEXT_EXTS,
+  PDF_EXT, ...DOCX_EXTS, ...SPREADSHEET_EXTS, ...PRESENTATION_EXTS,
+  ...IMAGE_EXTS, ...VIDEO_EXTS,
 ]);
 
 const MAX_BYTES_TEXT  = 5   * 1024 * 1024;
 const MAX_BYTES_DOCX  = 20  * 1024 * 1024;
+const MAX_BYTES_OFFICE = 50 * 1024 * 1024;
 const MAX_BYTES_IMAGE = 20  * 1024 * 1024;
 const MAX_BYTES_PDF   = 100 * 1024 * 1024;
 const MAX_BYTES_VIDEO = 200 * 1024 * 1024;
@@ -74,7 +81,14 @@ const MAX_FILENAME_LEN = 200;
 
 // ── Types ────────────────────────────────────────────────────────────────
 
-export type AttachmentKind = 'text' | 'pdf' | 'docx' | 'image' | 'video';
+export type AttachmentKind =
+  | 'text'
+  | 'pdf'
+  | 'docx'
+  | 'spreadsheet'
+  | 'presentation'
+  | 'image'
+  | 'video';
 export type ImageMimeType = 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif';
 
 export interface AttachmentInfo {
@@ -115,7 +129,9 @@ function safeCid(cid: unknown): string {
 function kindOf(ext: string): AttachmentKind {
   const e = ext.toLowerCase();
   if (e === PDF_EXT) return 'pdf';
-  if (e === DOCX_EXT) return 'docx';
+  if (DOCX_EXTS.has(e)) return 'docx';
+  if (SPREADSHEET_EXTS.has(e)) return 'spreadsheet';
+  if (PRESENTATION_EXTS.has(e)) return 'presentation';
   if (IMAGE_EXTS.has(e)) return 'image';
   if (VIDEO_EXTS.has(e)) return 'video';
   return 'text';
@@ -124,7 +140,8 @@ function kindOf(ext: string): AttachmentKind {
 function maxBytesFor(ext: string): number {
   const e = ext.toLowerCase();
   if (e === PDF_EXT) return MAX_BYTES_PDF;
-  if (e === DOCX_EXT) return MAX_BYTES_DOCX;
+  if (DOCX_EXTS.has(e)) return MAX_BYTES_DOCX;
+  if (SPREADSHEET_EXTS.has(e) || PRESENTATION_EXTS.has(e)) return MAX_BYTES_OFFICE;
   if (IMAGE_EXTS.has(e)) return MAX_BYTES_IMAGE;
   if (VIDEO_EXTS.has(e)) return MAX_BYTES_VIDEO;
   return MAX_BYTES_TEXT;
@@ -703,8 +720,8 @@ export async function purgeByCid(userId: string, cid: string): Promise<number> {
 // ── Prompt injection (manifest + images) ─────────────────────────────────
 
 export interface AttachmentManifest {
-  /** `<attachments>…</attachments>` XML listing text/pdf/docx attachments
-   *  with absolute paths + kind + byte count. Empty string when no text-ish
+  /** `<attachments>…</attachments>` XML listing model-readable attachments
+   *  with absolute paths + kind + optional total_chars. Empty string when no text-ish
    *  attachments are attached. The model uses this as a directory listing
    *  and calls the on-demand file tools for content. */
   manifest: string;
@@ -725,11 +742,13 @@ export interface BuildManifestOpts {
  *   - text            → listed with `total_chars` (cheap: one fs.readFileSync
  *                       + .length via file_indexer.statFile). Model can go
  *                       straight to read_file.
- *   - pdf / docx      → listed with `total_chars` ONLY if the cache already
- *                       has it (i.e. someone has read/stated this file
- *                       before). Otherwise `total_chars` is omitted and the
- *                       model must call stat_file before read_file.
- *                       Never eagerly extract here — upload stays zero-cost.
+ *   - pdf / docx /
+ *     spreadsheet /
+ *     presentation   → listed with `total_chars` ONLY if the cache already has
+ *                       it (i.e. someone has read/stated this file before).
+ *                       Otherwise `total_chars` is omitted and the model must
+ *                       call stat_file before read_file. Never eagerly extract
+ *                       here — upload stays zero-cost.
  *   - image           → compressed grayscale JPEG via real-time
  *                       toCompressedGrayJpeg on the raw source → images[]
  *                       for pi-ai vision.
@@ -786,7 +805,7 @@ export async function buildAttachmentManifest(
       continue;
     }
 
-    // text / pdf / docx → manifest entry (path + kind + total_chars if known).
+    // text / pdf / modern Office → manifest entry (path + kind + total_chars if known).
     let totalChars: number | undefined;
     if (kind === 'text') {
       // Text is cheap to stat (one fs.readFileSync). Always include total_chars
@@ -798,8 +817,8 @@ export async function buildAttachmentManifest(
         log.warn(`manifest statFile text failed name=${nm}: ${(err as Error).message}`);
       }
     } else {
-      // pdf / docx: peek only — no extract. total_chars appears only when a
-      // prior read/stat already materialised the cache.
+      // Rich documents: peek only — no extract. total_chars appears only when
+      // a prior read/stat already materialised the cache.
       const cached = getCachedMeta(userId, abs);
       if (cached?.totalChars !== undefined) totalChars = cached.totalChars;
     }

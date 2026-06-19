@@ -1850,7 +1850,7 @@ const DRAFT_CID = 'main_chat';
 
 const CHAT_ATTACH_ACCEPT = [
   '.md', '.markdown', '.txt', '.csv', '.tsv', '.json', '.yaml', '.yml', '.log',
-  '.pdf', '.docx',
+  '.pdf', '.docx', '.docm', '.xlsx', '.xlsm', '.pptx', '.pptm',
   '.png', '.jpg', '.jpeg', '.webp', '.gif',
   '.mp4', '.webm', '.mov', '.m4v', '.ogv',
 ];
@@ -1873,7 +1873,9 @@ function _chatAttachKindFromExt(ext) {
   if (CHAT_IMAGE_EXTS.includes(ext)) return 'image';
   if (CHAT_VIDEO_EXTS.includes(ext)) return 'video';
   if (ext === '.pdf') return 'pdf';
-  if (ext === '.docx') return 'docx';
+  if (ext === '.docx' || ext === '.docm') return 'docx';
+  if (ext === '.xlsx' || ext === '.xlsm') return 'spreadsheet';
+  if (ext === '.pptx' || ext === '.pptm') return 'presentation';
   return 'text';
 }
 
@@ -1901,7 +1903,9 @@ function _chatAttachPayload(cid, files, source) {
     total_bytes: totalBytes,
     image_count: kinds.image || 0,
     video_count: kinds.video || 0,
-    document_count: (kinds.pdf || 0) + (kinds.docx || 0),
+    document_count:
+      (kinds.pdf || 0) + (kinds.docx || 0) + (kinds.spreadsheet || 0)
+      + (kinds.presentation || 0),
     text_count: kinds.text || 0,
   };
 }
@@ -2401,7 +2405,7 @@ function _renderMessageAttachmentsHtml(names, cid) {
 // Files written by the LLM via write_file / markdown_to_pdf / html_to_pdf.
 // Chips use the same visual language as attachments; clicking opens an
 // in-app preview overlay (chat-file-viewer.js) that renders the file's
-// final form (PDF / HTML / markdown / text) or falls through to a dialog
+// final form (PDF / Office / HTML / markdown / text) or falls through to a dialog
 // offering "open the containing folder" for unsupported kinds.
 
 function _iconForProduced(name) {
@@ -2608,7 +2612,7 @@ function _showFileMissingToast(name) {
 
 function _hydrateMessageAttachmentThumbs(msgDiv, cid) {
   // Image chips have a thumb we want to enlarge via the lightbox; the rest
-  // (pdf / docx / text / video) get the same kind-aware viewer as produced
+  // (pdf / office / text / video) get the same kind-aware viewer as produced
   // chips. Video chips have inline <video> controls in the bubble already,
   // so clicking the chip body shouldn't re-open the same playback — skip
   // them. We rely on `_chatMediaUrl(cid, name)` having loaded the bytes for

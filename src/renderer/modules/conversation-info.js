@@ -150,7 +150,10 @@ const ConversationInfo = (() => {
     if (['png', 'jpg', 'jpeg', 'webp', 'gif'].includes(ext)) return 'image';
     if (['mp4', 'webm', 'mov', 'm4v', 'ogv'].includes(ext)) return 'video';
     if (ext === 'pdf') return 'pdf';
-    if (ext === 'docx') return 'docx';
+    if (ext === 'docx' || ext === 'docm') return 'docx';
+    if (ext === 'xlsx' || ext === 'xlsm') return 'spreadsheet';
+    if (ext === 'pptx' || ext === 'pptm') return 'presentation';
+    if (['doc', 'xls', 'ppt'].includes(ext)) return 'legacy_office';
     return 'text';
   }
 
@@ -732,7 +735,9 @@ const ConversationInfo = (() => {
     const n = String(name || '').toLowerCase();
     if (kind === 'image' || /\.(png|jpe?g|gif|webp|svg)$/i.test(n)) return { cls: 'is-image', label: 'IMG' };
     if (kind === 'pdf' || /\.pdf$/i.test(n)) return { cls: '', label: 'PDF' };
-    if (/\.docx?$/i.test(n)) return { cls: 'is-doc', label: 'DOC' };
+    if (/\.(docx?|docm)$/i.test(n)) return { cls: 'is-doc', label: 'DOC' };
+    if (/\.(xlsx?|xlsm)$/i.test(n)) return { cls: 'is-doc', label: 'XLS' };
+    if (/\.(pptx?|pptm)$/i.test(n)) return { cls: 'is-doc', label: 'PPT' };
     if (/\.(md|markdown|txt|csv|tsv|json|yaml|yml|log)$/i.test(n)) return { cls: 'is-doc', label: (n.split('.').pop() || 'TXT').slice(0, 4).toUpperCase() };
     return { cls: 'is-doc', label: 'FILE' };
   }

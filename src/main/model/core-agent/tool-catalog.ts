@@ -62,14 +62,14 @@ export interface ToolCatalogEntry {
  */
 export const TOOL_CATALOG: ToolCatalogEntry[] = [
   // Files / workspace
-  { name: 'read_file',     group: 'fs', summary: 'Read a slice of text from a workspace or attachment file (PDF/DOCX text or image as multimodal).' },
+  { name: 'read_file',     group: 'fs', summary: 'Read a slice of text from a workspace or attachment file (PDF/modern Office text or image as multimodal).' },
   { name: 'write_file',    group: 'fs', permission: 'localExec', summary: 'Write text/code/markdown into the workspace; resolves under $working_dir.' },
   { name: 'edit_file',     group: 'fs', permission: 'localExec', summary: 'In-place `old_string → new_string` replacement on an existing text file (instead of rewriting the whole file).' },
   { name: 'delete_file',   group: 'fs', permission: 'localExec', summary: 'Delete a single file from the workspace / current attachment dir / extraRoots. The first call shows an inline confirmation card and returns a token; multiple deletes from the same turn are grouped in one card when possible. Use instead of `bash rm` for removals.' },
   { name: 'list_files',    group: 'fs', summary: 'List the workspace directory tree.' },
-  { name: 'stat_file',     group: 'fs', summary: 'Trigger PDF/DOCX extraction and return total_chars; call before read_file.' },
+  { name: 'stat_file',     group: 'fs', summary: 'Trigger PDF/modern Office extraction and return total_chars; call before read_file.' },
   { name: 'search_files',  group: 'fs', summary: 'Find files by name / glob across the workspace + attachment scope.' },
-  { name: 'grep_files',    group: 'fs', summary: 'Grep text across the workspace + attachment scope (PDF/DOCX auto-extracted, then searched).' },
+  { name: 'grep_files',    group: 'fs', summary: 'Grep text across the workspace + attachment scope (PDF/modern Office auto-extracted, then searched).' },
   { name: 'create_artifact', group: 'fs', permission: 'localExec', summary: 'Build an interactive multi-file app (HTML/CSS/JS) rendered live & clickable inside the chat bubble; for interactive dashboards / calculators / visualizations / mini-tools. Static/read-only dashboards should use :::dashboard; not documents (html_to_pdf) or images (generate_image).' },
 
   // Shell

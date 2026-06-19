@@ -5378,15 +5378,19 @@ body.model-not-configured .main-content { flex-direction: column; }
   overflow: auto;
   background: #fff;
 }
+.chat-file-viewer.is-office .chat-file-viewer-body {
+  background: #eef2f7;
+}
 .chat-file-viewer.is-markdown .chat-file-viewer-body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
 }
-/* iframe-based body (pdf / html) fills the body slot. The body itself
+/* iframe-based body (pdf / html / office) fills the body slot. The body itself
    handles scroll for non-iframe bodies (md / text). */
 .chat-file-viewer-pdf,
-.chat-file-viewer-html {
+.chat-file-viewer-html,
+.chat-file-viewer-office {
   width: 100%;
   height: 100%;
   border: none;

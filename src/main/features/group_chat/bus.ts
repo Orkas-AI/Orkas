@@ -83,6 +83,14 @@ function escapeHtmlForBubble(s: string): string {
     .replace(/"/g, '&quot;');
 }
 
+function escapeXmlAttr(s: string): string {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 function isExistingProducedFile(absPath: string): boolean {
   try {
     return fs.statSync(absPath).isFile();
@@ -1201,18 +1209,47 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   }
 
   // Attach a `<attachments>` manifest block listing files uploaded on this
-  // user turn (text / pdf / docx / image with absolute paths + kinds).
+  // user turn (text / pdf / Office docs / image with absolute paths + kinds).
   // Library files are intentionally not path-injected; use kb_search/kb_read.
   // Image bytes ride alongside via ChatOptions.images so the vision model sees
   // them on the same user turn — the manifest entry carries `attached="inline"`
   // so the LLM doesn't waste a read_file round-trip re-fetching what it already has.
   let turnImages: Array<{ data: string; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' }> = [];
+  // Capture the process trail to persist on the end-of-turn message so
+  // history reload can rerender the rail (renderer accumulates it live, but
+  // without persistence it vanishes on refresh). Cap the array so a runaway
+  // tool storm can't bloat the jsonl. Skip `delta` and `assistant` events.
+  type ProcessItem =
+    | { type: 'progress'; text: string }
+    | { type: 'event'; event: { stream: string; data?: unknown } };
+  const processItems: ProcessItem[] = [];
   if (item.attachments && item.attachments.length) {
     try {
       const { buildAttachmentManifest } = await import('../chat_attachments');
-      const { manifest, images } = await buildAttachmentManifest(uid, cid, item.attachments);
+      const { manifest, images, skipped } = await buildAttachmentManifest(uid, cid, item.attachments);
       if (manifest) messageText = `${manifest}\n${messageText}`;
       if (images.length) turnImages = images;
+      if (skipped.length) {
+        const skippedEvent = { stream: 'attachment', data: { phase: 'skipped', items: skipped } };
+        if (processItems.length < MAX_PROCESS_ITEMS_PER_TURN) {
+          processItems.push({ type: 'event', event: skippedEvent });
+        }
+        emit(state, {
+          type: 'process',
+          cid,
+          actor: actor.id,
+          turn_id: item.turnId,
+          data: { type: 'event', event: skippedEvent },
+        });
+        const skippedXml = skipped
+          .map((s) => {
+            const name = escapeXmlAttr(String(s.name || ''));
+            const reason = escapeXmlAttr(String(s.reason || ''));
+            return `<file name="${name}" status="skipped" reason="${reason}"/>`;
+          })
+          .join('\n');
+        messageText = `<attachments-skipped>\n${skippedXml}\n</attachments-skipped>\n${messageText}`;
+      }
     } catch (err) {
       log.warn(`attachments manifest build failed cid=${cid} actor=${actor.id}: ${(err as Error).message}`);
     }
@@ -1350,18 +1387,6 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // tool-only turns (final empty is normal) from config / auth bugs (the
   // stream produced literally nothing).
   let activityEvents = 0;
-  // Capture the process trail to persist on the end-of-turn message so
-  // history reload can rerender the rail (renderer accumulates it live, but
-  // without persistence it vanishes on refresh — `_renderPersistedProcess`
-  // in conversation.js needs `message.process`). Cap the array so a runaway
-  // tool storm can't bloat the jsonl. Skip `delta` (token stream — that's
-  // the final text body) and `assistant` events (`_formatEventLine` would
-  // drop them anyway). Mirrors the shape used by skills.ts/agents.ts edit
-  // chats.
-  type ProcessItem =
-    | { type: 'progress'; text: string }
-    | { type: 'event'; event: { stream: string; data?: unknown } };
-  const processItems: ProcessItem[] = [];
   // Commander needs to inspect skill / agent specs before mutating them:
   // `cat .../<id>/SKILL.md` to ground a skill rewrite, `read_file` an
   // agent.json before emitting an `<agent>` edit container. The ROOT

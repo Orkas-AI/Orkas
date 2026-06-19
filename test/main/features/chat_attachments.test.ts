@@ -5,6 +5,7 @@ import * as path from 'node:path';
 
 import { makeMinimalPdf } from '../../fixtures/make-minimal-pdf';
 import { makeMinimalDocx } from '../../fixtures/make-minimal-docx';
+import { makeMinimalXlsx, makeMinimalPptx } from '../../fixtures/make-minimal-office';
 
 const UID = 'u-attach-001';
 const CID = 'conv-123';
@@ -69,6 +70,39 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(r.ok).toBe(true);
     const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.'));
     expect(siblings).toEqual([]);
+  });
+
+  it('stores modern Office files without pre-extracting', async () => {
+    const m = await loadMod();
+    const docm = await m.uploadAttachment(UID, CID, 'macro.docm', makeMinimalDocx({ heading: 'Macro', paragraphs: ['Docm body.'] }));
+    const sheet = await m.uploadAttachment(UID, CID, 'scores.xlsx', makeMinimalXlsx());
+    const deck = await m.uploadAttachment(UID, CID, 'slides.pptx', makeMinimalPptx());
+    const macroSheet = await m.uploadAttachment(UID, CID, 'scores.xlsm', makeMinimalXlsx({ rows: [['Kind'], ['Macro sheet']] }));
+    const macroDeck = await m.uploadAttachment(UID, CID, 'slides.pptm', makeMinimalPptx({ slides: [['Macro deck']] }));
+
+    expect(docm.ok && sheet.ok && deck.ok && macroSheet.ok && macroDeck.ok).toBe(true);
+    if (!(docm.ok && sheet.ok && deck.ok && macroSheet.ok && macroDeck.ok)) return;
+    expect(docm.info.kind).toBe('docx');
+    expect(sheet.info.kind).toBe('spreadsheet');
+    expect(deck.info.kind).toBe('presentation');
+    expect(macroSheet.info.kind).toBe('spreadsheet');
+    expect(macroDeck.info.kind).toBe('presentation');
+    const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.'));
+    expect(siblings).toEqual([]);
+  });
+
+  it('rejects legacy Office binary formats before they enter the attachment pool', async () => {
+    const m = await loadMod();
+    const doc = await m.uploadAttachment(UID, CID, 'old.doc', Buffer.from('legacy'));
+    const xls = await m.uploadAttachment(UID, CID, 'old.xls', Buffer.from('legacy'));
+    const ppt = await m.uploadAttachment(UID, CID, 'old.ppt', Buffer.from('legacy'));
+
+    expect(doc.ok).toBe(false);
+    expect(xls.ok).toBe(false);
+    expect(ppt.ok).toBe(false);
+    expect(fs.existsSync(path.join(attDir(), 'old.doc'))).toBe(false);
+    expect(fs.existsSync(path.join(attDir(), 'old.xls'))).toBe(false);
+    expect(fs.existsSync(path.join(attDir(), 'old.ppt'))).toBe(false);
   });
 
   it('stores image without any sibling cache (preview generated on read)', async () => {
@@ -683,6 +717,22 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     expect(r.manifest).not.toContain('chunks=');
   });
 
+  it('emits modern Office entries WITHOUT total_chars when never extracted', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'scores.xlsx', makeMinimalXlsx({ rows: [['Name'], ['Ada']] }));
+    await m.uploadAttachment(UID, CID, 'slides.pptx', makeMinimalPptx({ slides: [['Roadmap']] }));
+
+    const r = await m.buildAttachmentManifest(UID, CID, ['scores.xlsx', 'slides.pptx']);
+
+    expect(r.manifest).toContain('name="scores.xlsx"');
+    expect(r.manifest).toContain('kind="spreadsheet"');
+    expect(r.manifest).not.toMatch(/scores\.xlsx[^>]*total_chars=/);
+    expect(r.manifest).toContain('name="slides.pptx"');
+    expect(r.manifest).toContain('kind="presentation"');
+    expect(r.manifest).not.toMatch(/slides\.pptx[^>]*total_chars=/);
+    expect(r.skipped).toEqual([]);
+  });
+
   it('emits PDF entry WITH total_chars when cache already exists', async () => {
     const m = await loadMod();
     const indexer = await import('../../../src/main/features/file_indexer');
@@ -693,6 +743,33 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     await indexer.statFile(UID, abs);
     const r = await m.buildAttachmentManifest(UID, CID, ['cached.pdf']);
     expect(r.manifest).toMatch(/cached\.pdf[^>]*total_chars="\d+"/);
+  });
+
+  it('emits modern Office entries WITH total_chars when cache already exists', async () => {
+    const m = await loadMod();
+    const indexer = await import('../../../src/main/features/file_indexer');
+    const { chatAttachmentDir } = await import('../../../src/main/paths');
+    await m.uploadAttachment(UID, CID, 'cached.xlsx', makeMinimalXlsx({ rows: [['Name'], ['Ada']] }));
+    await m.uploadAttachment(UID, CID, 'cached.pptx', makeMinimalPptx({ slides: [['Roadmap']] }));
+    await indexer.statFile(UID, path.join(chatAttachmentDir(UID, CID), 'cached.xlsx'));
+    await indexer.statFile(UID, path.join(chatAttachmentDir(UID, CID), 'cached.pptx'));
+
+    const r = await m.buildAttachmentManifest(UID, CID, ['cached.xlsx', 'cached.pptx']);
+
+    expect(r.manifest).toMatch(/cached\.xlsx[^>]*total_chars="\d+"/);
+    expect(r.manifest).toMatch(/cached\.pptx[^>]*total_chars="\d+"/);
+  });
+
+  it('skips legacy Office names if a stale caller tries to build a manifest for them', async () => {
+    const m = await loadMod();
+
+    const r = await m.buildAttachmentManifest(UID, CID, ['old.xls']);
+
+    expect(r.manifest).toBe('');
+    expect(r.images).toEqual([]);
+    expect(r.skipped).toHaveLength(1);
+    expect(r.skipped[0].name).toBe('old.xls');
+    expect(r.skipped[0].reason).toMatch(/unsupported|不支持|未対応/i);
   });
 
   it('skips video attachments entirely — manifest empty, images empty, one skipped entry', async () => {

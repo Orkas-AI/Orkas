@@ -3,20 +3,21 @@
  *
  *   - `read_file`     — read a slice of a file's text by char offsets. All
  *                       kinds use `charStart` / `charEnd` (0-based, half-open);
- *                       the server does not truncate. Text works as-is; pdf/
- *                       docx require a prior `stat_file` call so this tool
+ *                       the server does not truncate. Text works as-is; rich
+ *                       document kinds require a prior `stat_file` call so this tool
  *                       never triggers extract side-effects. Image returns an
  *                       inline compressed grayscale JPEG (no range).
  *                       Overrides core-agent's builtin of the same name.
  *   - `stat_file`     — extract (if needed) and return `total_chars` for a
- *                       file. The only tool that triggers pdfjs / mammoth.
+ *                       file. The only tool that triggers pdfjs / mammoth /
+ *                       OOXML extraction.
  *   - `search_files`  — locate files by name/glob across the current
  *                       conversation's attachment dir + active workspace.
  *                       Never triggers extract; `total_chars` is included
  *                       only when the cache already has it.
  *   - `grep_files`    — cross-file text search in that same scanned scope.
- *                       text/md/code → direct; pdf/docx → extract (cached);
- *                       image skipped.
+ *                       text/md/code → direct; PDF/modern Office → extract
+ *                       (cached); image and unsupported legacy Office skipped.
  *
  * Scope is enforced via `util/path-sandbox.isPathAllowed`: path-taking tools
  * first verify the target falls under
@@ -42,6 +43,7 @@ import {
   kindOf,
   NeedStatError,
   NoTextError,
+  UnsupportedFileKindError,
 } from '../../features/file_indexer';
 import { chatAttachmentDir, userMarketplaceSkillsDir, userSkillsDir } from '../../paths';
 import { getWorkspacePath } from '../../features/user_workspace';
@@ -64,7 +66,7 @@ const MAX_SEARCH_RESULTS = 200;
 /** Max matches returned by grep_files per call. */
 const MAX_GREP_MATCHES = 200;
 
-/** Concurrent extract workers in grep_files. PDF/DOCX cache miss path. */
+/** Concurrent extract workers in grep_files. Rich-document cache miss path. */
 const GREP_EXTRACT_CONCURRENCY = 4;
 
 // ── Opts + scope ─────────────────────────────────────────────────────────
@@ -162,6 +164,10 @@ function guardDisabledSkillAccess(opts: FileToolsOpts, abs: string): string | nu
   );
 }
 
+function isExtractableRichKind(kind: string): boolean {
+  return kind === 'pdf' || kind === 'docx' || kind === 'spreadsheet' || kind === 'presentation';
+}
+
 // ── read_file ─────────────────────────────────────────────────────────────
 
 function createReadFileTool(opts: FileToolsOpts): AgentTool {
@@ -184,8 +190,10 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
       + '  - Continue: set charStart = previous response\'s covered end.\n'
       + '  - total_chars is usually already in the `<attachments>` manifest or in a prior\n'
       + '    `search_files` hit — use it to plan charStart/charEnd.\n'
-      + '  - If a pdf/docx has never been read/stated before, this tool returns E_NEED_STAT.\n'
+      + '  - If a PDF or modern Office file has never been read/stated before, this tool returns E_NEED_STAT.\n'
       + '    Call `stat_file(path)` first to trigger extraction, then come back.\n'
+      + '  - Legacy Office files (.doc/.xls/.ppt) return E_UNSUPPORTED_FILE; ask the user\n'
+      + '    for a .docx/.xlsx/.pptx export if the content is required.\n'
       + '  - For image kind, no range applies; a compressed grayscale JPEG is returned inline\n'
       + '    as a user-turn image.\n'
       + '\n'
@@ -266,7 +274,7 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
         // skill_invoked attribution: when the LLM read_file's a SKILL.md
         // body, the body is the progressive-disclosure "use this skill"
         // signal (per Claude Code conventions). Emit AFTER the successful
-        // text read — image / pdf / docx SKILL.md is not a real shape.
+        // text read — image / rich-document SKILL.md is not a real shape.
         if (opts.onSkillInvoked) {
           const parsed = parseSkillPath(abs, opts.userId);
           if (parsed) {
@@ -290,6 +298,16 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
           log.warn(`read_file no-text user=${opts.userId} path=${abs}`);
           return { content: errText('E_NO_TEXT', `${abs}: image has no text representation`), isError: true };
         }
+        if (err instanceof UnsupportedFileKindError) {
+          log.warn(`read_file unsupported user=${opts.userId} kind=${err.kind} path=${abs}`);
+          return {
+            content: errText(
+              'E_UNSUPPORTED_FILE',
+              `${abs}: ${err.kind} cannot be read by the model. Convert it to .docx/.xlsx/.pptx and attach again.`,
+            ),
+            isError: true,
+          };
+        }
         const msg = (err as Error).message;
         log.warn(`read_file failed user=${opts.userId} path=${abs}: ${msg}`);
         return { content: errText('E_READ_FAILED', msg), isError: true };
@@ -306,18 +324,18 @@ function createStatFileTool(opts: FileToolsOpts): AgentTool {
     description:
       'Ensure a file\'s text is extracted and return its `total_chars`. Use this when the\n'
       + '`<attachments>` manifest or a `search_files` result did NOT already include\n'
-      + '`total_chars` for the file — typically for a pdf/docx that has never been read.\n'
+      + '`total_chars` for the file — typically for a PDF or modern Office file that has never been read.\n'
       + '\n'
       + 'Parameters:\n'
       + '  path — required. Absolute path inside workspace or current attachment dir.\n'
       + '\n'
       + 'Response:\n'
-      + '  <file path="..." kind="text|pdf|docx" total_chars="N"/>\n'
+      + '  <file path="..." kind="text|pdf|docx|spreadsheet|presentation" total_chars="N"/>\n'
       + '\n'
       + 'Notes:\n'
       + '  - Skip this call when total_chars is already provided — go straight to read_file.\n'
-      + '  - This tool does the pdfjs / mammoth extraction; first call on a large pdf may\n'
-      + '    take a few seconds, subsequent read_file calls hit the cache instantly.\n'
+      + '  - This tool does pdfjs / mammoth / OOXML extraction; first call on a large\n'
+      + '    document may take a few seconds, subsequent read_file calls hit the cache instantly.\n'
       + '  - Returns E_NO_TEXT for image kind; images are displayed via read_file directly.',
     inputSchema: {
       type: 'object',
@@ -364,6 +382,16 @@ function createStatFileTool(opts: FileToolsOpts): AgentTool {
         if (err instanceof NoTextError) {
           log.warn(`stat_file no-text user=${opts.userId} path=${abs}`);
           return { content: errText('E_NO_TEXT', `${abs}: image has no text representation`), isError: true };
+        }
+        if (err instanceof UnsupportedFileKindError) {
+          log.warn(`stat_file unsupported user=${opts.userId} kind=${err.kind} path=${abs}`);
+          return {
+            content: errText(
+              'E_UNSUPPORTED_FILE',
+              `${abs}: ${err.kind} cannot be read by the model. Convert it to .docx/.xlsx/.pptx and attach again.`,
+            ),
+            isError: true,
+          };
         }
         const msg = (err as Error).message;
         log.warn(`stat_file failed user=${opts.userId} path=${abs}: ${msg}`);
@@ -575,9 +603,9 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
       'Search for a pattern across files visible to this conversation (workspace + attachment dir).\n'
       + 'File type handling:\n'
       + '  • text / md / csv / code → searched directly on the source file\n'
-      + '  • pdf / docx             → extracted to text (cached) and searched\n'
-      + '  • images / binaries      → skipped\n'
-      + 'First cross-file grep on a fresh set of pdfs/docx may be slow (parallel extract);\n'
+      + '  • PDF / modern Office → extracted to text (cached) and searched\n'
+      + '  • images / legacy Office / binaries → skipped\n'
+      + 'First cross-file grep on a fresh set of rich documents may be slow (parallel extract);\n'
       + 'subsequent calls in the same session are cached. Use `search_files` to narrow the\n'
       + 'set before grepping when the scope is large.',
     inputSchema: {
@@ -646,7 +674,7 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
       });
       const extractTargets = targets.filter((t) => {
         const k = kindOf(t.abs);
-        return k === 'pdf' || k === 'docx';
+        return isExtractableRichKind(k);
       });
       // Images + unknown → skipped
       skipped += targets.length - textTargets.length - extractTargets.length;

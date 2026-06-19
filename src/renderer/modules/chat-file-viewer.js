@@ -9,6 +9,8 @@
 //   image (.png/.jpg/.jpeg/.webp/.gif) → delegate to openChatImageLightbox
 //   video (.mp4/.webm/.mov/.m4v/.ogv)  → <video controls>
 //   pdf   (.pdf)                       → <iframe> + Chromium PDFium
+//   office(.docx/.docm/.xlsx/.xlsm/.pptx/.pptm)
+//                                      → readonly sandboxed HTML iframe
 //   html  (.html/.htm)                 → sandbox="allow-scripts" iframe
 //   md    (.md/.markdown)              → mountMdViewEdit (markdown toolbar
 //                                        only fires here — that's the
@@ -59,6 +61,7 @@ let _viewerEditController = null;
 let _viewerDirty = false;
 let _viewerDiscardConfirmPending = false;
 let _viewerRenderSeq = 0;
+let _viewerBlobUrl = null;
 
 const _viewerLog = (typeof createLogger === 'function')
   ? createLogger('chat-file-viewer')
@@ -76,6 +79,7 @@ function _viewerTrackError(action, data) {
 // something useful to do with it; otherwise the fallback is the better UX.
 const _IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 const _VIDEO_EXTS = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
+const _OFFICE_EXTS = new Set(['.docx', '.docm', '.xlsx', '.xlsm', '.pptx', '.pptm']);
 const _MARKDOWN_EXTS = new Set(['.md', '.markdown']);
 // Text exts: the source-as-text bucket. Keep code-ish exts here too so the
 // user can peek at a generated script without leaving the app. No syntax
@@ -107,6 +111,7 @@ function _kindOf(name) {
   if (_IMAGE_EXTS.has(ext)) return 'image';
   if (_VIDEO_EXTS.has(ext)) return 'video';
   if (ext === '.pdf') return 'pdf';
+  if (_OFFICE_EXTS.has(ext)) return 'office';
   if (ext === '.html' || ext === '.htm') return 'html';
   if (_MARKDOWN_EXTS.has(ext)) return 'markdown';
   if (_TEXT_EXTS.has(ext)) return 'text';
@@ -173,10 +178,10 @@ function _setSaveAppVisible(visible) {
 }
 
 function _viewerCanAddToLibrary(kind) {
-  // The Library index supports text/PDF/DOCX/images, but not video. Images
-  // are delegated to chat-lightbox before this shell opens; the guard here
-  // keeps the video preview from offering an action the backend rejects.
-  return kind !== 'video';
+  // Images are delegated to chat-lightbox before this shell opens; the guard
+  // here keeps unsupported inline previews from offering an action the
+  // backend rejects.
+  return kind !== 'video' && kind !== 'office';
 }
 
 function _isViewerOpen() {
@@ -275,9 +280,18 @@ function _teardownViewerContent() {
   }
   _viewerEditController = null;
   _viewerDirty = false;
+  if (_viewerBlobUrl) {
+    try {
+      if (typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') {
+        URL.revokeObjectURL(_viewerBlobUrl);
+      }
+    }
+    catch (_) { /* non-fatal */ }
+    _viewerBlobUrl = null;
+  }
   if (_viewerBody) _viewerBody.innerHTML = '';
   if (_viewerMdActions) _viewerMdActions.innerHTML = '';
-  if (_viewerEl) _viewerEl.classList.remove('is-markdown', 'is-text');
+  if (_viewerEl) _viewerEl.classList.remove('is-markdown', 'is-text', 'is-office');
 }
 
 function _typesetViewerMarkdown() {
@@ -432,6 +446,7 @@ async function _openViewerShell(displayName, opts) {
   // for the per-class rules.
   if (opts && opts.kind === 'markdown') el.classList.add('is-markdown');
   if (opts && opts.kind === 'text') el.classList.add('is-text');
+  if (opts && opts.kind === 'office') el.classList.add('is-office');
   el.classList.add('is-open');
   el.setAttribute('aria-hidden', 'false');
   if (!_viewerKeyHandler) {
@@ -493,6 +508,51 @@ async function _renderHtmlBody(absPath, displayName, cid, projectId) {
   // scripts and styles.
   const sandbox = 'allow-scripts';
   _viewerBody.innerHTML = `<iframe class="chat-file-viewer-html" sandbox="${sandbox}" src="${url}" title="${escapeHtml(displayName || '')}"></iframe>`;
+}
+
+async function _renderOfficeBody(absPath, displayName, cid, projectId) {
+  const seq = await _openViewerShell(displayName, { kind: 'office', absPath, cid, projectId });
+  if (!seq) return;
+  _viewerBody.innerHTML = `<div class="chat-file-viewer-loading">…</div>`;
+  try {
+    const payload = { path: absPath };
+    if (cid) payload.cid = cid;
+    if (projectId) payload.projectId = projectId;
+    const res = await window.orkas.invoke('produced.officePreviewHtml', payload);
+    if (seq !== _viewerRenderSeq || !_isViewerOpen()) return;
+    if (!res || !res.ok) {
+      const err = (res && res.error) || 'unknown';
+      await closeChatFileViewer({ force: true });
+      if (err === 'too_large') {
+        const sizeMb = ((res && res.size) || 0) / 1024 / 1024;
+        const capMb = ((res && res.cap) || 50 * 1024 * 1024) / 1024 / 1024;
+        await _showUnsupportedDialog(absPath, cid, projectId, {
+          messageKey: 'chat.preview_too_large_message',
+          vars: { name: displayName || absPath.split(/[\\/]/).pop() || absPath, size: sizeMb.toFixed(1), cap: capMb.toFixed(0) },
+          fallback: `File is ${sizeMb.toFixed(1)} MB (over the ${capMb.toFixed(0)} MB preview cap). Open the containing folder?`,
+        });
+      } else {
+        await _showUnsupportedDialog(absPath, cid, projectId, {
+          messageKey: 'chat.preview_read_failed_message',
+          vars: { name: displayName || absPath.split(/[\\/]/).pop() || absPath },
+          fallback: 'Could not read this file. Open the containing folder?',
+        });
+      }
+      return;
+    }
+    const blob = new Blob([String(res.html || '')], { type: 'text/html;charset=utf-8' });
+    _viewerBlobUrl = URL.createObjectURL(blob);
+    _viewerBody.innerHTML = `<iframe class="chat-file-viewer-office" sandbox="" src="${_viewerBlobUrl}" title="${escapeHtml(displayName || '')}"></iframe>`;
+  } catch (err) {
+    if (seq !== _viewerRenderSeq) return;
+    _viewerLog.warn('office preview threw', { path: absPath, error: String(err && err.message || err) });
+    await closeChatFileViewer({ force: true });
+    await _showUnsupportedDialog(absPath, cid, projectId, {
+      messageKey: 'chat.preview_read_failed_message',
+      vars: { name: displayName || absPath.split(/[\\/]/).pop() || absPath },
+      fallback: 'Could not read this file. Open the containing folder?',
+    });
+  }
 }
 
 async function _renderVideoBody(absPath, displayName, cid, projectId) {
@@ -696,6 +756,7 @@ async function openChatFileViewer(absPath, displayName, opts) {
     return;
   }
   if (kind === 'pdf')      return _renderPdfBody(absPath, name, cid, projectId);
+  if (kind === 'office')   return _renderOfficeBody(absPath, name, cid, projectId);
   if (kind === 'video')    return _renderVideoBody(absPath, name, cid, projectId);
   if (kind === 'html')     return _renderHtmlBody(absPath, name, cid, projectId);
   if (kind === 'markdown') return _renderMarkdownBody(absPath, name, cid, projectId);

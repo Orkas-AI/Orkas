@@ -19,7 +19,7 @@
  *                       an existing text file. Sandbox-checked
  *                       (workspace + current attachment dir + extraRoots);
  *                       does NOT uniquify (semantics are "modify
- *                       existing"); pdf/docx/image kinds rejected; on
+ *                       existing"); non-text/extracted kinds rejected; on
  *                       success fires `onFileWritten` so the UI can show
  *                       the green chip. Companion to `write_file` for
  *                       cheap targeted edits without a full overwrite.
@@ -849,7 +849,7 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
 
 /** Wrapped `edit_file` tool — in-place string replacement on existing text files.
  *  Sandbox-checked, permission-gated, no uniquify (semantics is "modify in place").
- *  pdf/docx/image kinds rejected — those are extracted-only. */
+ *  Non-text and extracted kinds are rejected. */
 function createEditFileTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'edit_file',
@@ -867,7 +867,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
       '  - Prefer this over `write_file` for targeted edits to existing files.\n' +
       '  - To CREATE a new file, use `write_file` instead — `edit_file` does not create files.\n' +
       '  - Make `old_string` long enough to be unique. On `E_MULTIPLE_MATCHES`, expand `old_string` with surrounding context, or set `replace_all=true` if every occurrence should change.\n' +
-      '  - Cannot edit pdf / docx / image files (text from those is extracted, not the source). Use `write_file` if you really need to overwrite the binary.\n' +
+      '  - Cannot edit pdf / Office / image files in place (text from those is extracted, not the source). Use `write_file` if you really need to overwrite the binary.\n' +
       '\n' +
       'Permission: requires local execution permission (same gate as `write_file` / `bash`).',
     inputSchema: {
@@ -919,7 +919,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
       }
 
       const kind = kindOf(abs);
-      if (kind === 'pdf' || kind === 'docx' || kind === 'image') {
+      if (kind !== 'text') {
         return {
           content: errText(
             'E_NOT_EDITABLE',

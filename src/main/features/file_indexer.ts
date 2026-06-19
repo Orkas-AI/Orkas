@@ -9,9 +9,9 @@
  *   <uid>/local/file_cache/<sha1(absPath).slice(0,16)>/
  *     meta.json   { absPath, mtime, size, kind, source: 'attachment'|'workspace',
  *                   cid?, totalChars?, pageMap?, cacheVersion, lastAccessed }
- *     text.md     (pdf / docx only) — full extracted text; enables range reads
- *                 without re-parsing. text files read directly from source;
- *                 images never cached (realtime compress+grayscale).
+ *     text.md     (pdf / docx / xlsx / pptx) — full extracted text; enables
+ *                 range reads without re-parsing. text files read directly
+ *                 from source; images never cached (realtime compress+grayscale).
  *
  * Scope is recorded in `meta.source` / `meta.cid` for cleanup routing only —
  * the cache location does NOT depend on scope. Tool-layer path-sandbox is
@@ -21,9 +21,9 @@
  *   - `getCachedMeta` / `peekMeta`  — pure read-only; never materialises. Used
  *     by manifest + search_files so "list a file" doesn't pay extract cost.
  *   - `statFile`                    — `ensureFresh` + return FileMeta. Triggers
- *     extract when needed. For pdf/docx this is the only path that runs
- *     pdfjs / mammoth.
- *   - `readRange`                   — pure slice by char offsets. For pdf/docx
+ *     extract when needed. For rich documents this is the only path that runs
+ *     pdfjs / mammoth / OOXML parsers.
+ *   - `readRange`                   — pure slice by char offsets. For rich docs
  *     throws `NeedStatError` when cache is missing so the caller decides
  *     whether to extract first.
  *
@@ -44,13 +44,14 @@ import { createLogger } from '../logger';
 import { macosTccSensitivePath } from '../util/macos-tcc';
 import { pdfBufferToPages, EXTRACT_CACHE_VERSION } from '../util/extract-pdf';
 import { docxBufferToMarkdown } from '../util/extract-docx';
+import { xlsxBufferToMarkdown, pptxBufferToMarkdown } from '../util/extract-office';
 import { toCompressedGrayJpeg } from '../util/image-transform';
 
 const log = createLogger('file_indexer');
 
 export { EXTRACT_CACHE_VERSION };
 
-/** Thrown by `readRange` when the target is pdf/docx and no cache exists yet.
+/** Thrown by `readRange` when the target is rich-document kind and no cache exists yet.
  *  Caller decides whether to `statFile` (which triggers extract) or surface
  *  an error to the model. */
 export class NeedStatError extends Error {
@@ -69,17 +70,29 @@ export class NoTextError extends Error {
   }
 }
 
+/** Thrown when the file extension is uploadable/listable but cannot be
+ *  converted to text by the current model-side extractor. */
+export class UnsupportedFileKindError extends Error {
+  constructor(public readonly absPath: string, public readonly kind: FileKind) {
+    super(`${kind} is not readable by the model: ${absPath}`);
+    this.name = 'UnsupportedFileKindError';
+  }
+}
+
 const TEXT_EXTS: ReadonlySet<string> = new Set([
   '.md', '.markdown', '.txt', '.csv', '.tsv',
   '.json', '.yaml', '.yml', '.log',
 ]);
 const IMAGE_EXTS: ReadonlySet<string> = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 const PDF_EXT = '.pdf';
-const DOCX_EXT = '.docx';
+const DOCX_EXTS: ReadonlySet<string> = new Set(['.docx', '.docm']);
+const SPREADSHEET_EXTS: ReadonlySet<string> = new Set(['.xlsx', '.xlsm']);
+const PRESENTATION_EXTS: ReadonlySet<string> = new Set(['.pptx', '.pptm']);
+const LEGACY_OFFICE_EXTS: ReadonlySet<string> = new Set(['.doc', '.xls', '.ppt']);
 
 // ── Types ────────────────────────────────────────────────────────────────
 
-export type FileKind = 'text' | 'pdf' | 'docx' | 'image';
+export type FileKind = 'text' | 'pdf' | 'docx' | 'spreadsheet' | 'presentation' | 'legacy_office' | 'image';
 export type SourceScope = 'attachment' | 'workspace';
 
 export interface FileMeta {
@@ -90,7 +103,7 @@ export interface FileMeta {
   source: SourceScope;
   cid?: string;
   /** Total character length of the text representation. Populated after
-   *  materialisation for text / pdf / docx; undefined for image (no text). */
+   *  materialisation for text / rich documents; undefined for image (no text). */
   totalChars?: number;
   /** pdf only: the extractor (pdfjs) produced empty text on EVERY page —
    *  almost always a font-mapping failure (embedded / subset / CJK cmap
@@ -123,7 +136,10 @@ export interface ImageReadResult {
 export function kindOf(absPath: string): FileKind {
   const e = path.extname(absPath).toLowerCase();
   if (e === PDF_EXT) return 'pdf';
-  if (e === DOCX_EXT) return 'docx';
+  if (DOCX_EXTS.has(e)) return 'docx';
+  if (SPREADSHEET_EXTS.has(e)) return 'spreadsheet';
+  if (PRESENTATION_EXTS.has(e)) return 'presentation';
+  if (LEGACY_OFFICE_EXTS.has(e)) return 'legacy_office';
   if (IMAGE_EXTS.has(e)) return 'image';
   if (TEXT_EXTS.has(e)) return 'text';
   // Unknown extension: treat as text so the model can still peek at it.
@@ -228,7 +244,7 @@ function statSource(absPath: string): { size: number; mtime: number; stat: fs.St
   return { size: stat.size, mtime: Math.floor(stat.mtimeMs), stat };
 }
 
-// ── Materialisation (pdf/docx build text.md + pageMap) ─────────────────
+// ── Materialisation (rich docs build text.md + pdf pageMap) ─────────────
 
 async function materialise(
   userId: string,
@@ -278,6 +294,18 @@ async function materialise(
     const md = await docxBufferToMarkdown(buf);
     fs.writeFileSync(path.join(dir, 'text.md'), md, 'utf8');
     base.totalChars = md.length;
+  } else if (kind === 'spreadsheet') {
+    const buf = fs.readFileSync(absPath);
+    const md = xlsxBufferToMarkdown(buf);
+    fs.writeFileSync(path.join(dir, 'text.md'), md, 'utf8');
+    base.totalChars = md.length;
+  } else if (kind === 'presentation') {
+    const buf = fs.readFileSync(absPath);
+    const md = pptxBufferToMarkdown(buf);
+    fs.writeFileSync(path.join(dir, 'text.md'), md, 'utf8');
+    base.totalChars = md.length;
+  } else if (kind === 'legacy_office') {
+    throw new UnsupportedFileKindError(absPath, kind);
   } else if (kind === 'text') {
     // No text.md for text kind — source IS the text.
     try {
@@ -355,11 +383,12 @@ export function getCachedMeta(userId: string, absPath: string): FileMeta | null 
   return m ? metaToPublic(m) : null;
 }
 
-/** Force-fresh meta — triggers extract (pdfjs / mammoth) if cache is missing
- *  or stale. For image kind throws `NoTextError` since image has no text
+/** Force-fresh meta — triggers text extraction if cache is missing or stale.
+ *  For image kind throws `NoTextError` since image has no text
  *  representation (use `readImageAsGrayJpeg` instead). */
 export async function statFile(userId: string, absPath: string): Promise<FileMeta> {
   if (kindOf(absPath) === 'image') throw new NoTextError(absPath);
+  if (kindOf(absPath) === 'legacy_office') throw new UnsupportedFileKindError(absPath, 'legacy_office');
   const meta = await ensureFresh(userId, absPath);
   return metaToPublic(meta);
 }
@@ -369,7 +398,7 @@ export async function statFile(userId: string, absPath: string): Promise<FileMet
  *
  *  Contract by kind:
  *   - text        → always works (materialise is cheap: fs.read + .length)
- *   - pdf / docx  → throws `NeedStatError` when no cache exists. Callers
+ *   - rich docs   → throws `NeedStatError` when no cache exists. Callers
  *                   must `statFile` first (which extracts) and then retry.
  *                   This keeps extract side-effects out of read_file.
  *   - image       → throws `NoTextError`. Caller must branch to
@@ -381,6 +410,7 @@ export async function readRange(
 ): Promise<TextReadResult> {
   const kind = kindOf(absPath);
   if (kind === 'image') throw new NoTextError(absPath);
+  if (kind === 'legacy_office') throw new UnsupportedFileKindError(absPath, kind);
 
   let meta: OnDiskMeta;
   if (kind === 'text') {
@@ -389,7 +419,7 @@ export async function readRange(
     // call instead of forcing the model through stat_file first.
     meta = await ensureFresh(userId, absPath);
   } else {
-    // pdf / docx: require an existing fresh cache. Do NOT extract here — the
+    // Rich documents require an existing fresh cache. Do NOT extract here — the
     // model is expected to call stat_file first when the manifest / search
     // result didn't include total_chars.
     const peeked = peekMeta(userId, absPath);
@@ -435,13 +465,14 @@ export async function readImageAsGrayJpeg(
 }
 
 /** Full extracted text + meta — used by grep_files to scan many files. Text
- *  kind reads source directly; pdf/docx return cached text.md. Image throws. */
+ *  kind reads source directly; rich docs return cached text.md. Image throws. */
 export async function getExtractedText(
   userId: string,
   absPath: string,
 ): Promise<{ text: string; meta: FileMeta }> {
   const meta = await ensureFresh(userId, absPath);
   if (meta.kind === 'image') throw new Error(`getExtractedText: image not supported: ${absPath}`);
+  if (meta.kind === 'legacy_office') throw new UnsupportedFileKindError(absPath, meta.kind);
   const text = meta.kind === 'text'
     ? fs.readFileSync(absPath, 'utf8')
     : fs.readFileSync(path.join(cacheDirFor(userId, absPath), 'text.md'), 'utf8');

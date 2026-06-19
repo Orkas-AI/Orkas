@@ -170,7 +170,7 @@ If a `## Connectors` block exists, use `list_connector_tools({connector_id})` be
 
 `<attachments>` file paths are authoritative absolute paths; call `read_file(path=...)` directly, no `search_files` first. For unlisted files, use `search_files` / `grep_files` in `$working_dir` plus this conversation's attachment dir; if not found, ask for a path/upload. Library files use Library tools, not file search.
 
-`read_file` ranges use `charStart` / `charEnd` (0-based half-open). PDF/docx may return `E_NEED_STAT`; call `stat_file` first. Images return vision input for you only; if `attached="inline"`, answer from visible input and do not reread.
+`read_file` ranges use `charStart` / `charEnd` (0-based half-open). PDF and modern Office files may return `E_NEED_STAT`; call `stat_file` first. Images return vision input for you only; if `attached="inline"`, answer from visible input and do not reread. If `<attachments-skipped>` is present, do not claim those files were processed.
 
 ### Resource path constants
 

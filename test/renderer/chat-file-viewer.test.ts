@@ -25,6 +25,12 @@ describe('chat-file-viewer › _kindOf', () => {
     ['art.webp', 'image'],
     ['art.gif', 'image'],
     ['report.pdf', 'pdf'],
+    ['doc.docx', 'office'],
+    ['macro.docm', 'office'],
+    ['workbook.xlsx', 'office'],
+    ['sheet.xlsm', 'office'],
+    ['slides.pptx', 'office'],
+    ['deck.pptm', 'office'],
     ['page.html', 'html'],
     ['old.htm', 'html'],
     ['note.md', 'markdown'],
@@ -46,9 +52,9 @@ describe('chat-file-viewer › _kindOf', () => {
   // "html-ish" → html when the actual ext doesn't match.
   it.each([
     ['archive.zip', 'unsupported'],
-    ['workbook.xlsx', 'unsupported'],
-    ['slides.pptx', 'unsupported'],
-    ['doc.docx', 'unsupported'],   // we deliberately don't preview docx in this round
+    ['legacy.doc', 'unsupported'],
+    ['legacy.xls', 'unsupported'],
+    ['legacy.ppt', 'unsupported'],
     ['binary.exe', 'unsupported'],
     ['photo.heic', 'unsupported'], // image-ish but not in the allow-list
     ['no-extension', 'unsupported'],
@@ -61,6 +67,7 @@ describe('chat-file-viewer › _kindOf', () => {
 
   it('is case-insensitive on the extension portion', () => {
     expect(_kindOf('REPORT.PDF')).toBe('pdf');
+    expect(_kindOf('REPORT.XLSX')).toBe('office');
     expect(_kindOf('Note.MD')).toBe('markdown');
     expect(_kindOf('Page.Html')).toBe('html');
   });
@@ -105,8 +112,9 @@ describe('chat-file-viewer › _chatMediaLocalUrl', () => {
 });
 
 describe('chat-file-viewer › _viewerCanAddToLibrary', () => {
-  it('does not offer Add to Library for video previews', () => {
+  it('does not offer Add to Library for video or office previews', () => {
     expect(_viewerCanAddToLibrary('video')).toBe(false);
+    expect(_viewerCanAddToLibrary('office')).toBe(false);
   });
 
   it('keeps Add to Library available for supported preview kinds', () => {

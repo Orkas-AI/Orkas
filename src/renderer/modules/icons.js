@@ -8,7 +8,7 @@
   const VIDEO_EXTS = new Set(['mp4', 'webm', 'mov', 'm4v', 'ogv', 'avi', 'mkv']);
   const AUDIO_EXTS = new Set(['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac']);
   const TEXT_EXTS = new Set(['md', 'markdown', 'txt', 'log', 'rst', 'tex']);
-  const DATA_EXTS = new Set(['json', 'yaml', 'yml', 'toml', 'csv', 'tsv', 'xlsx', 'xls', 'xml', 'ini', 'conf']);
+  const DATA_EXTS = new Set(['json', 'yaml', 'yml', 'toml', 'csv', 'tsv', 'xlsx', 'xlsm', 'xls', 'xml', 'ini', 'conf']);
   const ARCHIVE_EXTS = new Set(['zip', 'tar', 'gz', 'tgz', 'bz2', 'xz', '7z', 'rar']);
   const CODE_EXTS = new Set([
     'py', 'pyi', 'ipynb',
@@ -121,13 +121,14 @@
     const raw = String(kind || '').toLowerCase();
     if (raw === 'docx' || raw === 'doc') return 'doc';
     if (raw === 'spreadsheet') return 'data';
+    if (raw === 'presentation' || raw === 'legacy_office') return 'doc';
     if (raw === 'binary') return 'file';
     if (['image', 'video', 'audio', 'pdf', 'doc', 'text', 'data', 'archive', 'code', 'file'].includes(raw)) return raw;
     if (IMAGE_EXTS.has(ext)) return 'image';
     if (VIDEO_EXTS.has(ext)) return 'video';
     if (AUDIO_EXTS.has(ext)) return 'audio';
     if (ext === 'pdf') return 'pdf';
-    if (ext === 'docx' || ext === 'doc') return 'doc';
+    if (ext === 'docx' || ext === 'docm' || ext === 'doc' || ext === 'pptx' || ext === 'pptm' || ext === 'ppt') return 'doc';
     if (TEXT_EXTS.has(ext)) return 'text';
     if (DATA_EXTS.has(ext)) return 'data';
     if (ARCHIVE_EXTS.has(ext)) return 'archive';
