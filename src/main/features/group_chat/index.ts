@@ -42,8 +42,16 @@ export async function runtimeStatus(
   try {
     const state = await readState(userId, cid);
     const runtime = runtimeSnapshot(userId, cid);
+    const diskInFlight = Array.isArray(state.in_flight)
+      ? state.in_flight.filter(Boolean)
+      : [];
+    if ((state.status === 'running' || diskInFlight.length > 0) && !runtime.processing) {
+      log.warn(`healing orphan running state user=${userId} cid=${cid} status=${state.status} in_flight=${diskInFlight.join(',')}`);
+      await setStatus(userId, cid, 'idle');
+      return { processing: false, processing_since: null, in_flight: [], active_turns: [] };
+    }
     const inFlight = Array.from(new Set([
-      ...(Array.isArray(state.in_flight) ? state.in_flight : []),
+      ...diskInFlight,
       ...runtime.inFlight,
     ].filter(Boolean)));
     const processing = state.status === 'running' || inFlight.length > 0 || runtime.processing;

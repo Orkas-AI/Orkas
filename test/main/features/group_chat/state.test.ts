@@ -212,3 +212,24 @@ describe('group_chat state › touchActivity (stuck-turn watchdog heartbeat)', (
     }
   });
 });
+
+describe('group_chat facade › runtimeStatus orphan recovery', () => {
+  it('heals persisted running/in_flight state when no worker exists in this process', async () => {
+    const s = await import('../../../../src/main/features/group_chat/state');
+    await s.setStatus(TEST_UID, TEST_CID, 'running');
+    await s.markInFlight(TEST_UID, TEST_CID, 'commander', true);
+
+    const facade = await import('../../../../src/main/features/group_chat');
+    const runtime = await facade.runtimeStatus(TEST_UID, TEST_CID);
+    expect(runtime).toEqual({
+      processing: false,
+      processing_since: null,
+      in_flight: [],
+      active_turns: [],
+    });
+
+    const healed = await s.readState(TEST_UID, TEST_CID);
+    expect(healed.status).toBe('idle');
+    expect(healed.in_flight).toEqual([]);
+  });
+});
