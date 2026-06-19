@@ -102,6 +102,14 @@ export function buildShellInvocation(
   command: string,
   platform: NodeJS.Platform = process.platform,
 ): ShellInvocation {
+  if (platform === "win32" && /^\s*cmd(?:\.exe)?\s+(?:\/d\s+)?(?:\/s\s+)?\/c\b/i.test(command)) {
+    return {
+      command: "cmd.exe",
+      args: ["/d", "/s", "/c", command],
+      kind: "cmd",
+    };
+  }
+
   const kind = inferShellKind(shell, platform);
   if (platform === "win32" && kind === "powershell") {
     return {
@@ -192,11 +200,33 @@ export function decodeProcessOutput(
 
 function buildWindowsCanonicalPathEntries(env: NodeJS.ProcessEnv): string[] {
   const root = getEnvValue(env, ["SystemRoot", "WINDIR"]) || "C:\\Windows";
-  return [
-    path.win32.join(root, "System32"),
-    root,
-    path.win32.join(root, "System32", "WindowsPowerShell", "v1.0"),
-  ];
+  const programFiles = getEnvValue(env, ["ProgramFiles"]) || "C:\\Program Files";
+  const programFilesX86 = getEnvValue(env, ["ProgramFiles(x86)"]) || "C:\\Program Files (x86)";
+  const appData = getEnvValue(env, ["APPDATA"]);
+  const localAppData = getEnvValue(env, ["LOCALAPPDATA"]);
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (entry: string | undefined) => {
+    if (!entry) return;
+    const normalized = path.win32.normalize(entry);
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(normalized);
+  };
+
+  add(path.win32.join(root, "System32"));
+  add(root);
+  add(path.win32.join(root, "System32", "WindowsPowerShell", "v1.0"));
+  add(path.win32.join(programFiles, "nodejs"));
+  add(path.win32.join(programFilesX86, "nodejs"));
+  if (appData) add(path.win32.join(appData, "npm"));
+  if (localAppData) {
+    add(path.win32.join(localAppData, "npm"));
+    add(path.win32.join(localAppData, "Programs", "nodejs"));
+  }
+
+  return out;
 }
 
 function getEnvValue(env: NodeJS.ProcessEnv, names: string[]): string | undefined {

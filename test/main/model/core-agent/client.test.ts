@@ -44,4 +44,20 @@ describe('core-agent client skill sandbox env', () => {
       ORKAS_WORKSPACE_ROOT: path.resolve(tmpDir),
     });
   });
+
+  it('stops waiting for a wedged event stream when the abort signal fires', async () => {
+    const client = await import('../../../../src/main/model/core-agent/client');
+    const controller = new AbortController();
+
+    async function* stuckStream() {
+      yield { type: 'delta', text: 'started' };
+      await new Promise(() => { /* never resolves */ });
+    }
+
+    const iterator = client.stopStreamOnAbort(stuckStream(), controller.signal, 'test')[Symbol.asyncIterator]();
+    expect(await iterator.next()).toEqual({ value: { type: 'delta', text: 'started' }, done: false });
+    const pending = iterator.next();
+    controller.abort();
+    await expect(pending).resolves.toEqual({ value: undefined, done: true });
+  });
 });

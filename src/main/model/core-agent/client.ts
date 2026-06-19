@@ -51,6 +51,41 @@ function startRecording(_input: unknown): NoopRecorder {
   };
 }
 
+export async function* stopStreamOnAbort<T>(
+  events: AsyncIterable<T>,
+  signal: AbortSignal,
+  label = 'stream',
+): AsyncGenerator<T, void, unknown> {
+  const iterator = events[Symbol.asyncIterator]();
+  const aborted = Symbol('aborted');
+  let abortListener: (() => void) | null = null;
+  const abortPromise = new Promise<typeof aborted>((resolve) => {
+    abortListener = () => resolve(aborted);
+    if (signal.aborted) resolve(aborted);
+    else signal.addEventListener('abort', abortListener, { once: true });
+  });
+
+  try {
+    while (true) {
+      const next = iterator.next();
+      const result = await Promise.race([next, abortPromise]);
+      if (result === aborted) {
+        const ret = iterator.return?.();
+        if (ret) {
+          void Promise.resolve(ret).catch((err) => {
+            log.warn(`abortable ${label} return failed: ${(err as Error).message}`);
+          });
+        }
+        return;
+      }
+      if (result.done) return;
+      yield result.value;
+    }
+  } finally {
+    if (abortListener) signal.removeEventListener('abort', abortListener);
+  }
+}
+
 /**
  * Env vars injected into the sandbox child process so skill scripts can
  * run under Electron-as-Node:
@@ -343,7 +378,8 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     // terminal final/error synthesis. We re-yield every event it produces,
     // resetting the idle timer on each one.
     let eventCount = 0;
-    for await (const ev of mapCoreAgentEvents(captureResult(rawEvents), { userId, skillDisplayNameById, agentDisplayNameById })) {
+    const mappedEvents = mapCoreAgentEvents(captureResult(rawEvents), { userId, skillDisplayNameById, agentDisplayNameById });
+    for await (const ev of stopStreamOnAbort(mappedEvents, controller.signal, turnTag)) {
       resetIdle();
       eventCount += 1;
       recorder.record(ev as any);

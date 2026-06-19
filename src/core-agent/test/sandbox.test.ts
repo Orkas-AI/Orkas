@@ -142,6 +142,22 @@ describe("augmentPath", () => {
     expect(parts).not.toContain("\\Tools\\bin");
   });
 
+  it("adds common Windows Node.js and npm shim locations", () => {
+    const out = augmentPath("C:\\Windows\\System32", "win32", {
+      SystemRoot: "C:\\Windows",
+      ProgramFiles: "C:\\Program Files",
+      "ProgramFiles(x86)": "C:\\Program Files (x86)",
+      APPDATA: "C:\\Users\\me\\AppData\\Roaming",
+      LOCALAPPDATA: "C:\\Users\\me\\AppData\\Local",
+    });
+    const parts = out.split(";");
+    expect(parts).toContain("C:\\Program Files\\nodejs");
+    expect(parts).toContain("C:\\Program Files (x86)\\nodejs");
+    expect(parts).toContain("C:\\Users\\me\\AppData\\Roaming\\npm");
+    expect(parts).toContain("C:\\Users\\me\\AppData\\Local\\npm");
+    expect(parts).toContain("C:\\Users\\me\\AppData\\Local\\Programs\\nodejs");
+  });
+
   describe("Windows shell selection", () => {
     it("defaults Windows to PowerShell instead of a POSIX-incompatible cmd -c path", () => {
       expect(defaultShellForPlatform("win32")).toBe("powershell.exe");
@@ -151,6 +167,14 @@ describe("augmentPath", () => {
       const inv = buildShellInvocation("cmd.exe", "echo hi", "win32");
       expect(inv.kind).toBe("cmd");
       expect(inv.args).toEqual(["/d", "/s", "/c", "echo hi"]);
+    });
+
+    it("routes explicit cmd /c commands to cmd even when PowerShell is the default shell", () => {
+      const command = 'cmd /c dir "%USERPROFILE%\\.orkas\\skills" 2>nul || echo missing';
+      const inv = buildShellInvocation("powershell.exe", command, "win32");
+      expect(inv.kind).toBe("cmd");
+      expect(inv.command).toBe("cmd.exe");
+      expect(inv.args).toEqual(["/d", "/s", "/c", command]);
     });
 
     it("passes PowerShell commands through without bash-syntax rewriting", () => {
