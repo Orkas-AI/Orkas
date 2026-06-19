@@ -1,0 +1,123 @@
+{
+  "schema": 1,
+  "lockedAt": "2026-06-18",
+  "selectionPolicy": {
+    "python": "Pin CPython 3.12 as Orkas' conservative skill/runtime baseline for broad third-party wheel compatibility. 3.12.13 is the Python.org 3.12 security release available in python-build-standalone 20260610. Move to a newer Python minor only after package smoke tests pass on macOS, Windows, and Linux.",
+    "uv": "Pin the upstream uv release used to create and install Python package venvs. 0.11.21 was the latest astral-sh/uv GitHub release checked on 2026-06-18. Move only with manifest digest refresh and package install smoke tests.",
+    "sources": [
+      "https://www.python.org/downloads/release/python-31213/",
+      "https://github.com/astral-sh/python-build-standalone/releases/tag/20260610",
+      "https://github.com/astral-sh/uv/releases/tag/0.11.21"
+    ]
+  },
+  "python": {
+    "version": "3.12.13+20260610",
+    "source": "astral-sh/python-build-standalone",
+    "release": "20260610",
+    "assets": {
+      "darwin-arm64": {
+        "name": "cpython-3.12.13+20260610-aarch64-apple-darwin-install_only_stripped.tar.gz",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260610/cpython-3.12.13%2B20260610-aarch64-apple-darwin-install_only_stripped.tar.gz",
+        "sha256": "f0a7fa7decc75df2b1a789329a44f657c4a15c0a683f197ce46a5cb621bc6ef4",
+        "size": 25000199,
+        "archive": "tar.gz",
+        "executable": "python/bin/python3"
+      },
+      "darwin-x64": {
+        "name": "cpython-3.12.13+20260610-x86_64-apple-darwin-install_only_stripped.tar.gz",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260610/cpython-3.12.13%2B20260610-x86_64-apple-darwin-install_only_stripped.tar.gz",
+        "sha256": "c56c2dfe3fb5569430f4eabcff1fc1334c66db708bf17c103eef3dd237f3e3ab",
+        "size": 24690110,
+        "archive": "tar.gz",
+        "executable": "python/bin/python3"
+      },
+      "win32-arm64": {
+        "name": "cpython-3.12.13+20260610-aarch64-pc-windows-msvc-install_only_stripped.tar.gz",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260610/cpython-3.12.13%2B20260610-aarch64-pc-windows-msvc-install_only_stripped.tar.gz",
+        "sha256": "45cef3d23be2bbf950e33f1ed2517aaab5b5efb2f1bf2ae5b2c16ad9a7acc176",
+        "size": 20655217,
+        "archive": "tar.gz",
+        "executable": "python/python.exe"
+      },
+      "win32-x64": {
+        "name": "cpython-3.12.13+20260610-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260610/cpython-3.12.13%2B20260610-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+        "sha256": "99dce0b23bf3c3b28d350cdd7bfe3cd3be51cc4f285faae7c0df110d106d1a8d",
+        "size": 21932694,
+        "archive": "tar.gz",
+        "executable": "python/python.exe"
+      },
+      "linux-arm64": {
+        "name": "cpython-3.12.13+20260610-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260610/cpython-3.12.13%2B20260610-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz",
+        "sha256": "eb85c6903552b1cb40b183a119681a9326fa97e31cf0e4b8c78bf26735ff1552",
+        "size": 29197829,
+        "archive": "tar.gz",
+        "executable": "python/bin/python3"
+      },
+      "linux-x64": {
+        "name": "cpython-3.12.13+20260610-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260610/cpython-3.12.13%2B20260610-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+        "sha256": "6682afef6b510037a0ad84e61150e5121af2e2785c9ca27b047e029270a840fe",
+        "size": 34145919,
+        "archive": "tar.gz",
+        "executable": "python/bin/python3"
+      }
+    }
+  },
+  "uv": {
+    "version": "0.11.21",
+    "source": "astral-sh/uv",
+    "release": "0.11.21",
+    "assets": {
+      "darwin-arm64": {
+        "name": "uv-aarch64-apple-darwin.tar.gz",
+        "url": "https://github.com/astral-sh/uv/releases/download/0.11.21/uv-aarch64-apple-darwin.tar.gz",
+        "sha256": "1f921d491ba5ffeea774eb04d6681ecee379101341cbb1500394993b541bf3f4",
+        "size": 20835123,
+        "archive": "tar.gz",
+        "executable": "uv"
+      },
+      "darwin-x64": {
+        "name": "uv-x86_64-apple-darwin.tar.gz",
+        "url": "https://github.com/astral-sh/uv/releases/download/0.11.21/uv-x86_64-apple-darwin.tar.gz",
+        "sha256": "f3c8e5708a84b920c18b691214d54d2b0da6b984789caae95d47c95120cb7765",
+        "size": 22349034,
+        "archive": "tar.gz",
+        "executable": "uv"
+      },
+      "win32-arm64": {
+        "name": "uv-aarch64-pc-windows-msvc.zip",
+        "url": "https://github.com/astral-sh/uv/releases/download/0.11.21/uv-aarch64-pc-windows-msvc.zip",
+        "sha256": "74e443f8004022dde57a1bd0d10c097830f9ea8feb4ec927db52cd5d805c2f48",
+        "size": 21936792,
+        "archive": "zip",
+        "executable": "uv.exe"
+      },
+      "win32-x64": {
+        "name": "uv-x86_64-pc-windows-msvc.zip",
+        "url": "https://github.com/astral-sh/uv/releases/download/0.11.21/uv-x86_64-pc-windows-msvc.zip",
+        "sha256": "ace861f360c6de2babedc1607d0f454b6b09a820dbc8182dc15af927e4df9589",
+        "size": 23452481,
+        "archive": "zip",
+        "executable": "uv.exe"
+      },
+      "linux-arm64": {
+        "name": "uv-aarch64-unknown-linux-gnu.tar.gz",
+        "url": "https://github.com/astral-sh/uv/releases/download/0.11.21/uv-aarch64-unknown-linux-gnu.tar.gz",
+        "sha256": "88e800834007cc5efd4675f166eb2a51e7e3ad19876d85fa8805a6fb5c922397",
+        "size": 22805727,
+        "archive": "tar.gz",
+        "executable": "uv"
+      },
+      "linux-x64": {
+        "name": "uv-x86_64-unknown-linux-gnu.tar.gz",
+        "url": "https://github.com/astral-sh/uv/releases/download/0.11.21/uv-x86_64-unknown-linux-gnu.tar.gz",
+        "sha256": "8c88519b0ef0af9801fcdee419bbb12116bd9e6b18e162ae093c932d8b264050",
+        "size": 24437894,
+        "archive": "tar.gz",
+        "executable": "uv"
+      }
+    }
+  }
+}

@@ -68,8 +68,9 @@ export interface StartBridgeOpts {
   /** Where to write the per-run mcp-config file (the persist run dir). */
   configDir: string;
   /** Static skill-sandbox env (ORKAS_NODE / ORKAS_PC_DIR /
-   *  ORKAS_WORKSPACE_ROOT / ELECTRON_RUN_AS_NODE) — reused so the bridge
-   *  server resolves the SDK and run-skill.cjs exactly like bash does. */
+   *  ORKAS_WORKSPACE_ROOT / ELECTRON_RUN_AS_NODE plus optional bundled
+   *  ORKAS_PYTHON / ORKAS_UV) — reused so the bridge server resolves the
+   *  SDK and run-skill.cjs exactly like command execution does. */
   sandboxEnv: Record<string, string>;
 }
 

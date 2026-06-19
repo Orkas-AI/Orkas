@@ -9,8 +9,9 @@
  * of skill language:
  *   .ts / .mjs / .js — require() with tsx/cjs hook, call default export as
  *                       `async (args) => result`, JSON.stringify result to stdout.
- *   .py              — spawn `python3` (Windows: `py -3` then `python`),
- *                       inherit stdio, exit with child's code.
+ *   .py              — spawn nearest package `.venv`, else `ORKAS_PYTHON`,
+ *                       else system Python (`python3`; Windows: `py -3`
+ *                       then `python`), inherit stdio, exit with child code.
  *   .ps1             — spawn PowerShell (Windows-native script).
  *   .cmd / .bat      — spawn `cmd.exe` (Windows-native batch script).
  *   .sh              — spawn `bash` (Windows: Git Bash only; WSL is not
@@ -43,6 +44,9 @@
  *                           platform default ~/.orkas/data is used.
  *   ORKAS_RUN_SKILL_DIR   — optional trusted caller allow-list override:
  *                           resolve only inside this concrete skill dir.
+ *   ORKAS_PYTHON          — optional bundled Python executable injected by
+ *                           the main process when resources/runtime is
+ *                           available.
  *   ELECTRON_RUN_AS_NODE  — set to 1 when running through Electron binary.
  *
  * This file is CommonJS so it can be required directly without import-hook
@@ -329,11 +333,12 @@ function existingFile(p) {
 function findOnPath(names, env = process.env) {
   const pathValue = env.PATH || env.Path || env.path || '';
   const dirs = pathValue.split(path.delimiter).filter(Boolean);
-  const rawPathext = env.PATHEXT || '.COM;.EXE;.BAT;.CMD';
-  const pathext = rawPathext.split(';').map((x) => x.trim()).filter(Boolean);
+  const pathext = process.platform === 'win32'
+    ? String(env.PATHEXT || '.COM;.EXE;.BAT;.CMD').split(';').map((x) => x.trim()).filter(Boolean)
+    : [''];
   for (const dir of dirs) {
     for (const name of names) {
-      const variants = path.extname(name) ? [name] : [name, ...pathext.map((ext) => `${name}${ext}`)];
+      const variants = path.extname(name) ? [name] : pathext.map((ext) => `${name}${ext}`);
       for (const variant of variants) {
         const candidate = path.join(dir, variant);
         if (existingFile(candidate)) return candidate;
@@ -376,6 +381,25 @@ function findPowerShell() {
   return process.platform === 'win32' ? 'powershell.exe' : 'pwsh';
 }
 
+function commandFromEnv(value) {
+  if (!value) return null;
+  if (path.isAbsolute(value) || value.includes('/') || value.includes('\\')) {
+    return existingFile(value) ? value : null;
+  }
+  return value;
+}
+
+function findPython(isWin) {
+  const configured = commandFromEnv(process.env.ORKAS_PYTHON);
+  if (configured) return { cmd: configured, args: [] };
+  if (isWin) {
+    const pyLauncher = findOnPath(['py.exe', 'py']);
+    if (pyLauncher) return { cmd: pyLauncher, args: ['-3'] };
+    return { cmd: 'python', args: [] };
+  }
+  return { cmd: 'python3', args: [] };
+}
+
 function registerTsxLoader() {
   if (!process.env.ORKAS_PC_DIR) {
     die(69, 'ORKAS_PC_DIR env not set — cannot locate tsx for .ts transpile');
@@ -411,15 +435,13 @@ function runViaSubprocess(scriptPath, scriptArgs, skillId) {
     if (venvPython) {
       cmd = venvPython;
     } else if (isWin) {
-      const pyLauncher = findOnPath(['py.exe', 'py']);
-      if (pyLauncher) {
-        cmd = pyLauncher;
-        argv0Args = ['-3'];
-      } else {
-        cmd = 'python';
-      }
+      const py = findPython(isWin);
+      cmd = py.cmd;
+      argv0Args = py.args;
     } else {
-      cmd = 'python3';
+      const py = findPython(isWin);
+      cmd = py.cmd;
+      argv0Args = py.args;
     }
   } else if (ext === 'sh') {
     if (isWin) {

@@ -524,6 +524,20 @@ export function embeddingModelDir(): string {
   return path.join(PC_ROOT, 'resources', 'embedding-model');
 }
 
+/** Runtime binaries shipped via electron-builder `extraResources`.
+ *
+ *   dev:    PC/resources/runtime/
+ *   packed: <app>/Contents/Resources/runtime/      (darwin)
+ *           <app>/resources/runtime/               (win/linux)
+ */
+export function runtimeResourcesDir(): string {
+  const rp = (process as unknown as { resourcesPath?: string }).resourcesPath;
+  if (rp && !rp.includes(`${path.sep}node_modules${path.sep}electron${path.sep}`)) {
+    return path.join(rp, 'runtime');
+  }
+  return path.join(PC_ROOT, 'resources', 'runtime');
+}
+
 // (No shipped builtin source tree anymore. The marketplace is the only source for
 // platform agents/skills, fetched at install time and reconciled from the cloud manifest.)
 

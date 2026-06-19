@@ -46,6 +46,10 @@
  *                           current_user_id, then 'anonymous'.
  *   ORKAS_WORKSPACE_ROOT  — data root (ORKAS_WS_ROOT honoured as alias;
  *                           default ~/.orkas/data).
+ *   ORKAS_PYTHON          — optional bundled Python executable used for
+ *                           Python package venv creation.
+ *   ORKAS_UV              — optional bundled uv executable used for Python
+ *                           package dependency installs.
  */
 
 'use strict';
@@ -189,6 +193,39 @@ function runOrDie(cmd, args, opts, what) {
 function isFile(p) { try { return fs.statSync(p).isFile(); } catch { return false; } }
 function isDir(p) { try { return fs.statSync(p).isDirectory(); } catch { return false; } }
 
+function commandFromEnv(value) {
+  if (!value) return null;
+  if (path.isAbsolute(value) || value.includes('/') || value.includes('\\')) {
+    return isFile(value) ? value : null;
+  }
+  return value;
+}
+
+function pythonCommand() {
+  const configured = commandFromEnv(process.env.ORKAS_PYTHON);
+  if (configured) return { cmd: configured, args: [], label: '$ORKAS_PYTHON' };
+  if (process.platform === 'win32') return { cmd: 'python', args: [], label: 'python' };
+  return { cmd: 'python3', args: [], label: 'python3' };
+}
+
+function uvCommand() {
+  const configured = commandFromEnv(process.env.ORKAS_UV);
+  if (configured) return configured;
+  return null;
+}
+
+function venvPythonPath(pkgDir) {
+  return process.platform === 'win32'
+    ? path.join(pkgDir, '.venv', 'Scripts', 'python.exe')
+    : path.join(pkgDir, '.venv', 'bin', 'python');
+}
+
+function venvPipPath(pkgDir) {
+  return process.platform === 'win32'
+    ? path.join(pkgDir, '.venv', 'Scripts', 'pip.exe')
+    : path.join(pkgDir, '.venv', 'bin', 'pip');
+}
+
 /** Candidate rel dirs whose children (or, for '.', the dir itself) hold SKILL.md. */
 const SKILL_ROOT_CANDIDATES = ['skills', path.join('.claude', 'skills')];
 
@@ -283,7 +320,17 @@ function hasPythonProject(pkgDir) {
 function describeDepCommands(pkgDir) {
   const cmds = [];
   if (hasNodeDeps(pkgDir)) cmds.push('npm install --omit=dev');
-  if (hasPythonProject(pkgDir)) cmds.push('python3 -m venv .venv && .venv/bin/pip install -e .');
+  if (hasPythonProject(pkgDir)) {
+    const uv = uvCommand();
+    if (uv) {
+      const venvCmd = process.env.ORKAS_PYTHON
+        ? '$ORKAS_UV venv --python $ORKAS_PYTHON .venv'
+        : '$ORKAS_UV venv .venv';
+      cmds.push(`${venvCmd} && $ORKAS_UV pip install --python .venv -e .`);
+    } else {
+      cmds.push(`${pythonCommand().label} -m venv .venv && ${process.platform === 'win32' ? '.venv\\Scripts\\pip.exe' : '.venv/bin/pip'} install -e .`);
+    }
+  }
   return cmds;
 }
 
@@ -295,13 +342,22 @@ function installDeps(pkgDir) {
   }
   if (hasPythonProject(pkgDir)) {
     const venv = path.join(pkgDir, '.venv');
-    const py = process.platform === 'win32' ? 'python' : 'python3';
-    if (!isDir(venv)) runOrDie(py, ['-m', 'venv', '.venv'], { cwd: pkgDir }, 'venv creation');
-    const pip = process.platform === 'win32'
-      ? path.join(venv, 'Scripts', 'pip.exe')
-      : path.join(venv, 'bin', 'pip');
-    runOrDie(pip, ['install', '-e', '.'], { cwd: pkgDir }, 'pip install');
-    performed.push('pip install -e .');
+    const uv = uvCommand();
+    if (uv) {
+      if (!isDir(venv)) {
+        const args = ['venv'];
+        if (process.env.ORKAS_PYTHON) args.push('--python', process.env.ORKAS_PYTHON);
+        args.push('.venv');
+        runOrDie(uv, args, { cwd: pkgDir }, 'uv venv');
+      }
+      runOrDie(uv, ['pip', 'install', '--python', venvPythonPath(pkgDir), '-e', '.'], { cwd: pkgDir }, 'uv pip install');
+      performed.push('uv pip install -e .');
+    } else {
+      const py = pythonCommand();
+      if (!isDir(venv)) runOrDie(py.cmd, [...py.args, '-m', 'venv', '.venv'], { cwd: pkgDir }, 'venv creation');
+      runOrDie(venvPipPath(pkgDir), ['install', '-e', '.'], { cwd: pkgDir }, 'pip install');
+      performed.push('pip install -e .');
+    }
   }
   return performed;
 }

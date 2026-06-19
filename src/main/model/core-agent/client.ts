@@ -36,6 +36,7 @@ import { getSession as _getCachedSession } from './session-store';
 import { app } from 'electron';
 import * as paths from '../../paths';
 import { getCurrentLang } from '../../i18n';
+import { bundledRuntimeEnv } from '../../util/bundled-runtime';
 
 interface NoopRecorder {
   record(event: unknown): void;
@@ -95,6 +96,8 @@ export async function* stopStreamOnAbort<T>(
  *     packaged mode so `bin/run-skill.cjs` + tsx + skills resolve on real disk
  *   - `ORKAS_WORKSPACE_ROOT` = canonical data root so `run-skill.cjs` can
  *     find installed per-user skills under `<uid>/local/marketplace/skills`
+ *   - `ORKAS_PYTHON` / `ORKAS_UV` = optional bundled Python runtime and uv
+ *     binary under resources/runtime, used for `.py` skills and package deps
  *   - `ELECTRON_RUN_AS_NODE` = makes the Electron binary boot as Node
  *
  * Injected via `AgentRunParams.sandboxEnv` → `ToolContext.state.sandboxEnv`
@@ -132,7 +135,7 @@ function buildSkillSandboxEnvStatic(): Record<string, string> {
  *     brew/system PATH is preserved.
  */
 export function buildSkillSandboxEnv(userId?: string): Record<string, string> {
-  const env = { ...buildSkillSandboxEnvStatic() };
+  const env = { ...buildSkillSandboxEnvStatic(), ...bundledRuntimeEnv() };
   env.ORKAS_UI_LANG = getCurrentLang();
   if (userId) {
     env.ORKAS_UID = userId;

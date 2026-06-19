@@ -29,7 +29,7 @@ function writeMarketplaceSkill(dirId: string, displayName: string, scriptBase: s
   );
 }
 
-function runSkill(skillRef: string, scriptBase: string, args: string[] = []) {
+function runSkill(skillRef: string, scriptBase: string, args: string[] = [], extraEnv: Record<string, string> = {}) {
   const pcRoot = process.cwd();
   return spawnSync(process.execPath, [
     path.join(pcRoot, 'bin', 'run-skill.cjs'),
@@ -42,6 +42,7 @@ function runSkill(skillRef: string, scriptBase: string, args: string[] = []) {
     encoding: 'utf8',
     env: {
       ...process.env,
+      ...extraEnv,
       ORKAS_WORKSPACE_ROOT: tmpDir,
       ORKAS_PC_DIR: pcRoot,
     },
@@ -85,5 +86,33 @@ describe('run-skill.cjs', () => {
     expect(r.status).toBe(0);
     expect(r.stderr).toBe('');
     expect(JSON.parse(r.stdout.trim())).toEqual({ runner: 'sh' });
+  });
+
+  itOnNonWindows('uses ORKAS_PYTHON for plain Python skill scripts', () => {
+    const skillDir = path.join(tmpDir, 'u1', 'local', 'marketplace', 'skills', 'py-skill');
+    const scriptsDir = path.join(skillDir, 'scripts');
+    fs.mkdirSync(scriptsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      '---\nname: py-skill\ndescription: test\n---\n\nbody\n',
+    );
+    fs.writeFileSync(path.join(scriptsDir, 'run.py'), 'print("system python should not run this")\n');
+
+    const fakePython = path.join(tmpDir, 'fake-python');
+    fs.writeFileSync(fakePython, [
+      '#!/bin/sh',
+      'printf \'{"python":"bundled","script":"%s","argv":"%s"}\\n\' "$1" "$2"',
+      '',
+    ].join('\n'));
+    fs.chmodSync(fakePython, 0o755);
+
+    const r = runSkill('py-skill', 'run', ['arg1'], { ORKAS_PYTHON: fakePython });
+
+    expect(r.status).toBe(0);
+    expect(r.stderr).toBe('');
+    const out = JSON.parse(r.stdout.trim());
+    expect(out.python).toBe('bundled');
+    expect(out.script).toMatch(/run\.py$/);
+    expect(out.argv).toBe('arg1');
   });
 });

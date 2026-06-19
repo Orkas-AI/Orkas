@@ -14,6 +14,7 @@ let tmpDir: string;
 let wsRoot: string;
 
 const gitAvailable = spawnSync('git', ['--version'], { encoding: 'utf8' }).status === 0;
+const itOnNonWindows = process.platform === 'win32' ? it.skip : it;
 
 function pkgsDir(): string {
   return path.join(wsRoot, TEST_UID, 'local', 'packages');
@@ -47,13 +48,14 @@ function makeRepo(name: string, files: Record<string, string>): string {
   return repo;
 }
 
-function runPkg(...args: string[]) {
+function runPkgWithEnv(extraEnv: Record<string, string>, ...args: string[]) {
   const pcRoot = process.cwd();
   const r = spawnSync(process.execPath, [path.join(pcRoot, 'bin', 'orkas-pkg.cjs'), ...args], {
     cwd: pcRoot,
     encoding: 'utf8',
     env: {
       ...process.env,
+      ...extraEnv,
       ORKAS_WORKSPACE_ROOT: wsRoot,
       ORKAS_UID: TEST_UID,
       ORKAS_PC_DIR: pcRoot,
@@ -68,6 +70,10 @@ function runPkg(...args: string[]) {
     try { json = JSON.parse(text.slice(start)); } catch { /* asserted by callers */ }
   }
   return { status: r.status, json, stdout: r.stdout, stderr: r.stderr };
+}
+
+function runPkg(...args: string[]) {
+  return runPkgWithEnv({}, ...args);
 }
 
 function runPkgInput(input: string, ...args: string[]) {
@@ -191,6 +197,55 @@ describe.skipIf(!gitAvailable)('orkas-pkg.cjs', () => {
     expect(names).not.toContain('homepage');
     // Console script not materialized (no venv) → no shim generated.
     expect(fs.existsSync(path.join(pkgsDir(), '.bin', 'real-entry'))).toBe(false);
+  });
+
+  itOnNonWindows('uses ORKAS_UV and ORKAS_PYTHON for Python package dependency consent', () => {
+    const repo = makeRepo('pyuv', {
+      'pyproject.toml': [
+        '[build-system]',
+        'requires = ["setuptools"]',
+        '',
+        '[project.scripts]',
+        'real-entry = "pkg.cli:main"',
+      ].join('\n'),
+      'pkg/__init__.py': '',
+    });
+    const fakePython = path.join(tmpDir, 'fake-python');
+    fs.writeFileSync(fakePython, '#!/bin/sh\nexit 0\n');
+    fs.chmodSync(fakePython, 0o755);
+    const fakeUv = path.join(tmpDir, 'fake-uv');
+    fs.writeFileSync(fakeUv, [
+      '#!/bin/sh',
+      'set -eu',
+      'if [ "$1" = "venv" ]; then',
+      '  mkdir -p .venv/bin',
+      '  printf "#!/bin/sh\\nexit 0\\n" > .venv/bin/python',
+      '  chmod +x .venv/bin/python',
+      'elif [ "$1" = "pip" ]; then',
+      '  mkdir -p .venv/bin',
+      '  printf "#!/bin/sh\\necho real-entry\\n" > .venv/bin/real-entry',
+      '  chmod +x .venv/bin/real-entry',
+      'else',
+      '  exit 2',
+      'fi',
+      '',
+    ].join('\n'));
+    fs.chmodSync(fakeUv, 0o755);
+    const env = { ORKAS_UV: fakeUv, ORKAS_PYTHON: fakePython };
+
+    const install = runPkgWithEnv(env, 'install', repo);
+    expect(install.status).toBe(0);
+    expect(install.json.deps_pending_consent).toEqual([
+      '$ORKAS_UV venv --python $ORKAS_PYTHON .venv && $ORKAS_UV pip install --python .venv -e .',
+    ]);
+    expect(fs.existsSync(path.join(pkgsDir(), '.bin', 'real-entry'))).toBe(false);
+
+    const consent = runPkgWithEnv(env, 'consent-deps', 'pyuv');
+    expect(consent.status).toBe(0);
+    expect(consent.json.deps_installed).toEqual(['uv pip install -e .']);
+    expect(consent.json.shims).toEqual(['real-entry']);
+    expect(fs.existsSync(path.join(pkgsDir(), 'pyuv', '.venv', 'bin', 'real-entry'))).toBe(true);
+    expect(fs.existsSync(path.join(pkgsDir(), '.bin', 'real-entry'))).toBe(true);
   });
 
   it('refuses duplicate install and supports remove', () => {

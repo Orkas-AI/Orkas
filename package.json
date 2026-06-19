@@ -10,17 +10,18 @@
     "#core-agent": "./src/core-agent/src/index.ts"
   },
   "scripts": {
-    "start": "electron .",
+    "start": "node bin/ensure-runtime.cjs --root resources/runtime && electron .",
     "stop": "pkill -9 -f \"$PWD/node_modules/electron/dist\" || true",
     "smoke": "tsx src/main/smoke.ts",
     "typecheck": "tsc --noEmit",
     "test": "node scripts/run-tests.mjs run",
     "test:watch": "node scripts/run-tests.mjs",
+    "runtime:ensure": "node bin/ensure-runtime.cjs --root resources/runtime",
     "rebuild:sqlite:electron": "node scripts/swap-sqlite-abi.mjs electron",
     "rebuild:sqlite:node": "node scripts/swap-sqlite-abi.mjs node",
     "postinstall": "node scripts/swap-sqlite-abi.mjs electron && node scripts/fetch-embedding-model.mjs",
     "prepare": "node scripts/install-git-hooks.mjs",
-    "prepack": "node scripts/swap-sqlite-abi.mjs electron"
+    "prepack": "node bin/ensure-runtime.cjs --root resources/runtime && node scripts/swap-sqlite-abi.mjs electron"
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.7",
@@ -107,6 +108,13 @@
         ]
       },
       {
+        "from": "resources/runtime",
+        "to": "runtime",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
         "from": "resources/mac-locales",
         "to": ".",
         "filter": [
@@ -114,6 +122,7 @@
         ]
       }
     ],
+    "beforePack": "scripts/ensure-runtime-before-pack.cjs",
     "afterPack": "scripts/codesign-adhoc.cjs",
     "mac": {
       "category": "public.app-category.productivity",
