@@ -751,7 +751,7 @@ export class AgentRunner {
     const provider = resolved.provider;
     const modelId = resolved.modelId;
     const toolDefs = [...this.tools.values()].map(toToolDefinition);
-    const toolCtx: ToolContext = { state: sandboxEnv ? { sandboxEnv } : {} };
+    const toolState: ToolContext["state"] = sandboxEnv ? { sandboxEnv } : {};
 
     // Single-turn reflection: send prompt, execute any tool calls, done.
     log.info(`Reflection starting: model=${modelId}`);
@@ -793,7 +793,13 @@ export class AgentRunner {
           }
           try {
             log.info(`Reflection tool: ${call.name}(${JSON.stringify(call.input).slice(0, 200)})`);
-            const toolResult = await tool.execute(call.input, toolCtx);
+            const toolResult = await executeReflectionTool(
+              tool,
+              call.input,
+              toolState,
+              signal,
+              this.config.agent.toolIdleTimeoutMs,
+            );
             reflectSession.addToolResult(call.id, toolResult.content, toolResult.images, toolResult.isError);
             if (toolResult.isError) {
               log.warn(`Reflection tool ${call.name} returned error: ${toolResult.content.slice(0, 200)}`);
@@ -857,6 +863,68 @@ export class AgentRunner {
         permanentToolErrors: permanentToolErrs || undefined,
       },
     };
+  }
+}
+
+async function executeReflectionTool(
+  tool: AgentTool,
+  input: Record<string, unknown>,
+  state: ToolContext["state"],
+  signal: AbortSignal | undefined,
+  toolIdleTimeoutMs: number,
+): Promise<ToolResult> {
+  const abortedToolMessage = "Tool execution aborted: Run aborted";
+  const stalledToolMessage =
+    `Tool execution stalled after ${toolIdleTimeoutMs}ms without substantive progress`;
+
+  if (signal?.aborted) {
+    return { content: abortedToolMessage, isError: true };
+  }
+
+  const toolAbort = createChildAbortController(signal);
+  const toolIdle = createToolIdleWatchdog(toolIdleTimeoutMs);
+  const toolCtx: ToolContext = {
+    signal: toolAbort.signal,
+    state,
+    emitProgress: (progress) => {
+      const message = String(progress?.message || "").trim();
+      if (!message) return;
+      const idleDelayMs = toolIdleDelayForProgress(progress, toolIdleTimeoutMs);
+      if (idleDelayMs != null) toolIdle.reset(idleDelayMs);
+    },
+  };
+  type ToolCompletion =
+    | { ok: true; result: ToolResult }
+    | { ok: false; err: unknown };
+  const toolPromise: Promise<ToolCompletion> = Promise.resolve()
+    .then(() => tool.execute(input, toolCtx))
+    .then(
+      (result) => ({ ok: true as const, result }),
+      (err) => ({ ok: false as const, err }),
+    );
+  const abortWait = waitForAbort(signal);
+
+  try {
+    const waits: Array<Promise<ToolCompletion | "abort" | "tool_idle">> = [
+      toolPromise,
+      toolIdle.promise,
+    ];
+    if (abortWait.promise) waits.push(abortWait.promise);
+    const raced = await Promise.race(waits);
+    if (raced === "tool_idle") {
+      toolAbort.abort();
+      return { content: stalledToolMessage, isError: true };
+    }
+    if (raced === "abort") {
+      toolAbort.abort();
+      return { content: abortedToolMessage, isError: true };
+    }
+    if (raced.ok === false) throw raced.err;
+    return raced.result;
+  } finally {
+    abortWait.cleanup();
+    toolIdle.cancel();
+    toolAbort.cleanup();
   }
 }
 

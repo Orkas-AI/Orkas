@@ -50,6 +50,14 @@ function runSkill(skillRef: string, scriptBase: string, args: string[] = [], ext
 }
 
 describe('run-skill.cjs', () => {
+  it('checks PATH when locating Git Bash for Windows shell scripts', () => {
+    const source = fs.readFileSync(path.join(process.cwd(), 'bin', 'run-skill.cjs'), 'utf8');
+    const body = source.match(/function findGitBash\(\) \{[\s\S]*?\n\}/)?.[0] ?? '';
+
+    expect(body).toContain("findOnPath(['bash.exe', 'bash'])");
+    expect(body.indexOf('findOnPath')).toBeLessThan(body.indexOf('const roots'));
+  });
+
   it('resolves marketplace scripts by SKILL.md display name when dir id differs', () => {
     writeMarketplaceSkill('252af214f470', 'social-fetch', 'fetch');
 

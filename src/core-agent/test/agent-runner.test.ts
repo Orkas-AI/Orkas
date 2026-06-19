@@ -642,6 +642,79 @@ describe("AgentRunner", () => {
     expect(done.result?.meta?.permanentToolErrors).toBeUndefined();
   });
 
+  it("runReflection converts a wedged tool into an error result and continues", async () => {
+    const seenMessages: Message[][] = [];
+    const mockProvider: LLMProvider = {
+      id: "mock",
+      name: "Mock Provider",
+      async complete(params) {
+        seenMessages.push(params.messages);
+        if (seenMessages.length === 1) {
+          return {
+            content: [
+              { type: "tool_use", id: "call_1", name: "wedged_tool", input: {} },
+            ],
+            stopReason: "tool_use",
+            usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+            model: "mock-model",
+          };
+        }
+        return {
+          content: [{ type: "text", text: "reflection continued" }],
+          stopReason: "end_turn",
+          usage: { inputTokens: 7, outputTokens: 5, totalTokens: 12 },
+          model: "mock-model",
+        };
+      },
+      async *stream() {
+        throw new Error("stream not used");
+      },
+      async validateAuth() {
+        return true;
+      },
+    };
+
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    let capturedSignal: AbortSignal | undefined;
+    const wedgedTool = defineTool({
+      name: "wedged_tool",
+      description: "Never resolves",
+      inputSchema: { type: "object", properties: {} },
+      async execute(_input, ctx) {
+        capturedSignal = ctx.signal;
+        return new Promise<never>(() => undefined);
+      },
+    });
+    const config = createConfig({
+      agent: {
+        defaultProvider: "mock",
+        defaultModel: "mock-model",
+        toolIdleTimeoutMs: 30,
+      },
+    });
+
+    const runner = new AgentRunner({ config, providers: registry, tools: [wedgedTool] });
+    const result = await Promise.race([
+      runner.runReflection("reflect"),
+      new Promise<string>((_, reject) => setTimeout(() => reject(new Error("timed out")), 1000)),
+    ]);
+
+    expect(result).toBe("reflection continued");
+    expect(capturedSignal?.aborted).toBe(true);
+    expect(seenMessages).toHaveLength(2);
+    const toolResults = seenMessages[1].flatMap((msg) =>
+      msg.content.filter((content) => content.type === "tool_result"),
+    );
+    expect(toolResults).toHaveLength(1);
+    expect(toolResults[0]).toMatchObject({
+      type: "tool_result",
+      toolUseId: "call_1",
+      content: "Tool execution stalled after 30ms without substantive progress",
+      isError: true,
+    });
+  });
+
   it("runStream forwards tool input deltas before tool execution", async () => {
     const mockProvider = createMockProvider([
       {

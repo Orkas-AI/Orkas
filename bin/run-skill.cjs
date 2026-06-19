@@ -357,6 +357,9 @@ function findGitBash() {
     if (existingFile(p)) return p;
   }
 
+  const pathCandidate = findOnPath(['bash.exe', 'bash']);
+  if (pathCandidate) return pathCandidate;
+
   const roots = [
     process.env.ProgramFiles,
     process.env['ProgramFiles(x86)'],

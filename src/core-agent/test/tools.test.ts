@@ -118,10 +118,13 @@ describe("Tools", () => {
   });
 
   describe("bash tool", () => {
-    it("normalizes legacy default timeout values to the long bash timeout", () => {
+    it("uses the long default only for missing or legacy-synthetic timeout values", () => {
       expect(normalizeBashTimeoutMs(undefined)).toBe(DEFAULT_BASH_TIMEOUT_MS);
-      expect(normalizeBashTimeoutMs(30_000)).toBe(DEFAULT_BASH_TIMEOUT_MS);
-      expect(normalizeBashTimeoutMs(300_000)).toBe(DEFAULT_BASH_TIMEOUT_MS);
+      expect(normalizeBashTimeoutMs(-1)).toBe(DEFAULT_BASH_TIMEOUT_MS);
+      expect(normalizeBashTimeoutMs(30_000)).toBe(30_000);
+      expect(normalizeBashTimeoutMs(300_000)).toBe(300_000);
+      expect(normalizeBashTimeoutMs(30_000, { legacyDefault: true })).toBe(DEFAULT_BASH_TIMEOUT_MS);
+      expect(normalizeBashTimeoutMs(300_000, { legacyDefault: true })).toBe(DEFAULT_BASH_TIMEOUT_MS);
       expect(normalizeBashTimeoutMs(5_000)).toBe(5_000);
     });
 
