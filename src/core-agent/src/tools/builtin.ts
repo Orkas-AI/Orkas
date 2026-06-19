@@ -68,6 +68,17 @@ export const writeFileTool: AgentTool = defineTool({
  */
 export const DEFAULT_BASH_TIMEOUT_MS = 30 * 60_000;
 export const BASH_PROGRESS_INTERVAL_MS = 60_000;
+const LEGACY_DEFAULT_BASH_TIMEOUTS_MS = new Set([30_000, 300_000]);
+
+export function normalizeBashTimeoutMs(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return DEFAULT_BASH_TIMEOUT_MS;
+  }
+  const timeoutMs = Math.round(value);
+  return LEGACY_DEFAULT_BASH_TIMEOUTS_MS.has(timeoutMs)
+    ? DEFAULT_BASH_TIMEOUT_MS
+    : timeoutMs;
+}
 
 export const bashTool: AgentTool = defineTool({
   name: "bash",
@@ -86,7 +97,7 @@ export const bashTool: AgentTool = defineTool({
   },
   async execute(input, ctx) {
     const command = input.command as string;
-    const timeoutMs = (input.timeoutMs as number) ?? DEFAULT_BASH_TIMEOUT_MS;
+    const timeoutMs = normalizeBashTimeoutMs(input.timeoutMs);
 
     const sandbox = new SandboxExecutor({
       workingDir: ctx.workingDir ?? ".",

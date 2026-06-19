@@ -48,11 +48,11 @@ import { spawn } from 'node:child_process';
 import type { AgentTool, ToolContext, ToolResult } from '#core-agent';
 import {
   BASH_PROGRESS_INTERVAL_MS,
-  DEFAULT_BASH_TIMEOUT_MS,
   bashTool as coreBashTool,
+  normalizeBashTimeoutMs,
   writeFileTool as coreWriteFileTool,
 } from '../../../core-agent/src/tools/builtin';
-import { buildSandboxEnv, decodeProcessOutput } from '../../../core-agent/src/sandbox/executor';
+import { buildSandboxEnv, decodeProcessOutput, killProcessTree } from '../../../core-agent/src/sandbox/executor';
 import { getLocalExecGranted, getLocalExecMode } from '../../features/permissions';
 import { classifyBashCommand } from './bash-risk';
 import { requestBashDecision } from './bash-permissions';
@@ -439,7 +439,7 @@ async function executeDirectOrkasCli(
   ctx: ToolContext,
   workingDir: string,
 ): Promise<ToolResult> {
-  const timeoutMs = (input.timeoutMs as number | undefined) ?? DEFAULT_BASH_TIMEOUT_MS;
+  const timeoutMs = normalizeBashTimeoutMs(input.timeoutMs);
   const sandboxEnv = (ctx.state.sandboxEnv ?? {}) as Record<string, string>;
   const env = buildSandboxEnv(sandboxEnv);
 
@@ -451,12 +451,15 @@ async function executeDirectOrkasCli(
     let outputLimitExceeded = false;
     let truncatedKind: 'stdout' | 'stderr' | null = null;
     let settled = false;
+    let killed = false;
     const startedAt = Date.now();
     let heartbeat: NodeJS.Timeout | null = null;
+    let settleTimer: NodeJS.Timeout | null = null;
 
     const child = spawn(invocation.nodePath, [invocation.scriptPath, ...invocation.args], {
       cwd: workingDir,
       env,
+      detached: process.platform !== 'win32',
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     });
@@ -466,14 +469,40 @@ async function executeDirectOrkasCli(
       settled = true;
       clearTimeout(timeout);
       if (heartbeat) clearInterval(heartbeat);
+      if (settleTimer) clearTimeout(settleTimer);
       resolve(result);
     };
 
+    const finishFromChunks = (code: number | null) => {
+      let stdout = decodeProcessOutput(Buffer.concat(stdoutChunks), process.platform, env);
+      let stderr = decodeProcessOutput(Buffer.concat(stderrChunks), process.platform, env);
+      if (outputLimitExceeded) {
+        if (truncatedKind === 'stdout') stdout += '\n... [output truncated by sandbox]';
+        else stderr += '\n... [output truncated by sandbox]';
+      }
+      if (timedOut) {
+        finish({ content: bashMsg('timeout', { ms: timeoutMs }), isError: true });
+        return;
+      }
+      if (outputLimitExceeded) {
+        finish({ content: stderr || stdout, isError: code !== 0 });
+        return;
+      }
+      if (code !== 0) {
+        finish({ content: stderr || stdout || bashMsg('exit_code', { code: code ?? 'null' }), isError: true });
+        return;
+      }
+      finish({ content: stdout });
+    };
+
     const killChild = () => {
-      try { child.kill('SIGTERM'); } catch { /* already gone */ }
-      setTimeout(() => {
-        try { child.kill('SIGKILL'); } catch { /* already gone */ }
-      }, 5000);
+      if (killed) return;
+      killed = true;
+      killProcessTree(child, 'SIGTERM');
+      const killTimer = setTimeout(() => killProcessTree(child, 'SIGKILL'), 5000);
+      if (typeof killTimer.unref === 'function') killTimer.unref();
+      settleTimer = setTimeout(() => finishFromChunks(null), 6000);
+      if (typeof settleTimer.unref === 'function') settleTimer.unref();
     };
 
     const append = (kind: 'stdout' | 'stderr', data: Buffer) => {
@@ -517,25 +546,7 @@ async function executeDirectOrkasCli(
       finish({ content: bashMsg('start_failed', { command: invocation.script, error: err.message }), isError: true });
     });
     child.on('close', (code) => {
-      let stdout = decodeProcessOutput(Buffer.concat(stdoutChunks), process.platform, env);
-      let stderr = decodeProcessOutput(Buffer.concat(stderrChunks), process.platform, env);
-      if (outputLimitExceeded) {
-        if (truncatedKind === 'stdout') stdout += '\n... [output truncated by sandbox]';
-        else stderr += '\n... [output truncated by sandbox]';
-      }
-      if (timedOut) {
-        finish({ content: bashMsg('timeout', { ms: timeoutMs }), isError: true });
-        return;
-      }
-      if (outputLimitExceeded) {
-        finish({ content: stderr || stdout, isError: code !== 0 });
-        return;
-      }
-      if (code !== 0) {
-        finish({ content: stderr || stdout || bashMsg('exit_code', { code: code ?? 'null' }), isError: true });
-        return;
-      }
-      finish({ content: stdout });
+      finishFromChunks(code);
     });
 
     child.stdin.end(invocation.stdin ?? '');

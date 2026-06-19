@@ -60,6 +60,22 @@ function runEnsure(root: string, manifest: string, key: string) {
   });
 }
 
+function runEnsureMutable(root: string, manifest: string, key: string) {
+  const [platform, arch] = key.split('-');
+  return spawnSync(process.execPath, [
+    path.join(process.cwd(), 'bin', 'ensure-runtime.cjs'),
+    '--root', root,
+    '--manifest', manifest,
+    '--platform', platform,
+    '--arch', arch,
+    '--kind', 'python',
+    '--no-download',
+  ], {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+  });
+}
+
 describe('ensure-runtime.cjs', () => {
   it('accepts a runtime dir with a matching marker and executable', () => {
     const key = `${process.platform}-${process.arch}`;
@@ -140,5 +156,35 @@ describe('ensure-runtime.cjs', () => {
     expect(out.ok).toBe(true);
     expect(out.results[0].status).toBe('ready');
     expect(out.results[0].dir).toBe(dir);
+  });
+
+  it('repairs ready Windows Python runtimes with pip command shims', () => {
+    const key = 'win32-x64';
+    const executable = 'python/python.exe';
+    const manifest = writeManifest(key, executable);
+    const root = path.join(tmpDir, 'runtime');
+    const dir = path.join(root, 'python', key);
+    const exe = path.join(dir, ...executable.split('/'));
+    fs.mkdirSync(path.dirname(exe), { recursive: true });
+    fs.writeFileSync(exe, '');
+    fs.writeFileSync(path.join(dir, '.orkas-runtime.json'), JSON.stringify({
+      schema: 1,
+      kind: 'python',
+      platformKey: key,
+      version: 'test-python',
+      source: 'test',
+      release: 'test',
+      asset: 'python-test.tar.gz',
+      sha256: 'abc123',
+      size: 123,
+    }, null, 2));
+
+    const r = runEnsureMutable(root, manifest, key);
+
+    expect(r.status).toBe(0);
+    for (const name of ['pip', 'pip3']) {
+      const shim = path.join(dir, 'python', 'Scripts', `${name}.cmd`);
+      expect(fs.readFileSync(shim, 'utf8')).toContain('-m pip');
+    }
   });
 });

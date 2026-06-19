@@ -4,7 +4,7 @@
  * Provides resource limits, directory restrictions, command filtering,
  * and timeout enforcement. Inspired by OpenClaw's sandbox execution layer.
  */
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { TextDecoder } from "node:util";
@@ -16,7 +16,7 @@ const log = createLogger("sandbox");
 export interface SandboxConfig {
   /** Working directory for commands. */
   workingDir: string;
-  /** Maximum execution time in milliseconds (default: 30000). */
+  /** Maximum execution time in milliseconds (default: 30 min). */
   timeoutMs?: number;
   /** Maximum output buffer size in bytes (default: 1MB). */
   maxOutputBytes?: number;
@@ -49,11 +49,68 @@ export interface SandboxResult {
 }
 
 type ShellKind = "posix" | "cmd" | "powershell";
+type KillableChild = Pick<ChildProcess, "kill" | "pid">;
+type ProcessKiller = typeof process.kill;
+type SpawnFn = typeof spawn;
+
+export const DEFAULT_SANDBOX_TIMEOUT_MS = 30 * 60_000;
+const KILL_GRACE_MS = 5_000;
+const KILL_SETTLE_GRACE_MS = KILL_GRACE_MS + 1_000;
 
 export interface ShellInvocation {
   command: string;
   args: string[];
   kind: ShellKind;
+}
+
+function windowsSystem32Tool(name: string): string {
+  const root = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
+  return path.win32.join(root, "System32", name);
+}
+
+export function killProcessTree(
+  child: KillableChild,
+  signal: NodeJS.Signals = "SIGTERM",
+  opts: {
+    platform?: NodeJS.Platform;
+    processKill?: ProcessKiller;
+    spawnFn?: SpawnFn;
+  } = {},
+): void {
+  const platform = opts.platform ?? process.platform;
+  if (platform === "win32" && child.pid) {
+    try {
+      const killer = (opts.spawnFn ?? spawn)(windowsSystem32Tool("taskkill.exe"), ["/pid", String(child.pid), "/t", "/f"], {
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      const fallback = () => {
+        try { child.kill(signal); } catch { /* Process may already be dead. */ }
+      };
+      killer.once("error", fallback);
+      killer.once("exit", (code) => {
+        if (code !== 0) fallback();
+      });
+      if (typeof killer.unref === "function") killer.unref();
+      return;
+    } catch {
+      // Fall back to killing the direct child below.
+    }
+  }
+
+  try {
+    if (platform !== "win32" && child.pid) {
+      (opts.processKill ?? process.kill)(-child.pid, signal);
+      return;
+    }
+  } catch {
+    // Fall back to killing the shell process below.
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    // Process may already be dead.
+  }
 }
 
 type OutputEncodingEnv = {
@@ -301,6 +358,10 @@ export function buildSandboxEnv(
     PATH: augmentPath(hostPath, platform, process.env),
     TERM: "dumb",
     LANG: process.env.LANG ?? "en_US.UTF-8",
+    ...(platform === "win32" ? {
+      PYTHONIOENCODING: process.env.PYTHONIOENCODING ?? "utf-8",
+      PYTHONUTF8: process.env.PYTHONUTF8 ?? "1",
+    } : {}),
     ...(injected ?? {}),
   };
 
@@ -329,7 +390,7 @@ export class SandboxExecutor {
 
   constructor(config: SandboxConfig) {
     this.config = {
-      timeoutMs: 30_000,
+      timeoutMs: DEFAULT_SANDBOX_TIMEOUT_MS,
       maxOutputBytes: 1024 * 1024, // 1MB
       shell: defaultShellForPlatform(),
       ...config,
@@ -381,6 +442,8 @@ export class SandboxExecutor {
       let killed = false;
       let stdoutTruncated = false;
       let stderrTruncated = false;
+      let settled = false;
+      let forceSettleTimer: NodeJS.Timeout | null = null;
 
       const env = buildSandboxEnv(this.config.env);
 
@@ -439,33 +502,11 @@ export class SandboxExecutor {
         killChild();
       }, this.config.timeoutMs);
 
-      function killChild() {
-        if (killed) return;
-        killed = true;
-        killChildWithSignal("SIGTERM");
-        // Escalate to SIGKILL after 5 seconds
-        const killTimer = setTimeout(() => killChildWithSignal("SIGKILL"), 5000);
-        if (typeof killTimer.unref === "function") killTimer.unref();
-      }
-
-      function killChildWithSignal(signal: NodeJS.Signals) {
-        try {
-          if (process.platform !== "win32" && child.pid) {
-            process.kill(-child.pid, signal);
-            return;
-          }
-        } catch {
-          // Fall back to killing the shell process below.
-        }
-        try {
-          child.kill(signal);
-        } catch {
-          // Process may already be dead.
-        }
-      }
-
-      child.on("close", (code) => {
+      const finish = (code: number | null) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timeoutId);
+        if (forceSettleTimer) clearTimeout(forceSettleTimer);
         let stdout = decodeProcessOutput(Buffer.concat(stdoutChunks), process.platform, env);
         let stderr = decodeProcessOutput(Buffer.concat(stderrChunks), process.platform, env);
         if (stdoutTruncated) stdout += "\n... [output truncated by sandbox]";
@@ -478,10 +519,28 @@ export class SandboxExecutor {
           outputLimitExceeded,
           durationMs: Date.now() - startTime,
         });
+      };
+
+      function killChild() {
+        if (killed) return;
+        killed = true;
+        killProcessTree(child, "SIGTERM");
+        // Escalate to SIGKILL after 5 seconds
+        const killTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), KILL_GRACE_MS);
+        if (typeof killTimer.unref === "function") killTimer.unref();
+        forceSettleTimer = setTimeout(() => finish(null), KILL_SETTLE_GRACE_MS);
+        if (typeof forceSettleTimer.unref === "function") forceSettleTimer.unref();
+      }
+
+      child.on("close", (code) => {
+        finish(code);
       });
 
       child.on("error", (err) => {
+        if (settled) return;
         clearTimeout(timeoutId);
+        if (forceSettleTimer) clearTimeout(forceSettleTimer);
+        settled = true;
         const stdout = decodeProcessOutput(Buffer.concat(stdoutChunks), process.platform, env);
         resolve({
           stdout,

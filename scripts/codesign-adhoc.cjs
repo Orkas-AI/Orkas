@@ -10,7 +10,7 @@
  */
 'use strict';
 
-const { execSync } = require('node:child_process');
+const { execFileSync, execSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -259,6 +259,105 @@ function appNodeModules(context, appPath) {
   return path.join(context.appOutDir, 'resources', 'app.asar.unpacked', 'node_modules');
 }
 
+function appResourcesDir(context, appPath) {
+  if (context.electronPlatformName === 'darwin') {
+    return path.join(appPath, 'Contents', 'Resources');
+  }
+  return path.join(context.appOutDir, 'resources');
+}
+
+function readJsonFile(label, file) {
+  requiredFile(label, file);
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (err) {
+    throw new Error(`[native-deps-gate] invalid ${label}: ${file}: ${err.message}`);
+  }
+}
+
+function runtimeAsset(manifest, kind, platformKey) {
+  const spec = manifest[kind];
+  const asset = spec && spec.assets && spec.assets[platformKey];
+  if (!spec || !asset) {
+    throw new Error(`[native-deps-gate] missing runtime manifest entry for ${kind}/${platformKey}`);
+  }
+  return { spec, asset };
+}
+
+function markerMatches(marker, kind, platformKey, spec, asset) {
+  return marker
+    && marker.kind === kind
+    && marker.platformKey === platformKey
+    && marker.version === spec.version
+    && marker.asset === asset.name
+    && marker.sha256 === asset.sha256
+    && marker.size === asset.size;
+}
+
+function pythonVersionSuffix(spec) {
+  const m = /^(\d+)\.(\d+)/.exec(String(spec.version || ''));
+  return m ? `${m[1]}.${m[2]}` : '';
+}
+
+function verifyPythonPipShims(executable, targetPlatform, spec) {
+  const suffix = pythonVersionSuffix(spec);
+  const names = ['pip', 'pip3', ...(suffix ? [`pip${suffix}`] : [])];
+  const shimDir = targetPlatform === 'win32'
+    ? path.join(path.dirname(executable), 'Scripts')
+    : path.dirname(executable);
+  for (const name of names) {
+    requiredFile(
+      `python runtime ${name} shim`,
+      path.join(shimDir, targetPlatform === 'win32' ? `${name}.cmd` : name),
+    );
+  }
+}
+
+function requireOnlyRuntimeDirs(runtimeRoot, kind, allowedKey) {
+  const kindDir = path.join(runtimeRoot, kind);
+  if (!fs.existsSync(kindDir) || !fs.statSync(kindDir).isDirectory()) {
+    throw new Error(`[native-deps-gate] missing runtime ${kind} directory: ${kindDir}`);
+  }
+  for (const dirName of listDirs(kindDir)) {
+    if (dirName !== allowedKey) {
+      throw new Error(`[native-deps-gate] unexpected runtime ${kind} payload for target: ${path.join(kindDir, dirName)}`);
+    }
+  }
+}
+
+function assertDarwinExecutableArch(file, targetArch) {
+  const expected = targetArch === 'x64' ? 'x86_64' : targetArch;
+  if (!expected || !fs.existsSync('/usr/bin/file')) return;
+  const out = execFileSync('/usr/bin/file', [file], { encoding: 'utf8' });
+  if (!out.includes(expected)) {
+    throw new Error(`[native-deps-gate] runtime binary arch mismatch: expected ${expected}, file=${file}, output=${out.trim()}`);
+  }
+}
+
+function verifyPackedRuntimePayload(context, appPath, targetPlatform, targetArch) {
+  const runtimeRoot = path.join(appResourcesDir(context, appPath), 'runtime');
+  const manifest = readJsonFile('runtime manifest', path.join(runtimeRoot, 'manifest.json'));
+  const key = `${targetPlatform}-${targetArch}`;
+  const verified = [];
+
+  for (const kind of ['python', 'uv']) {
+    const { spec, asset } = runtimeAsset(manifest, kind, key);
+    requireOnlyRuntimeDirs(runtimeRoot, kind, key);
+    const dir = path.join(runtimeRoot, kind, key);
+    const executable = path.join(dir, ...String(asset.executable || '').split(/[\\/]/).filter(Boolean));
+    const marker = readJsonFile(`${kind} runtime marker`, path.join(dir, '.orkas-runtime.json'));
+    if (!markerMatches(marker, kind, key, spec, asset)) {
+      throw new Error(`[native-deps-gate] runtime marker mismatch for ${kind}/${key}: ${path.join(dir, '.orkas-runtime.json')}`);
+    }
+    requiredFile(`${kind} runtime executable`, executable);
+    if (kind === 'python') verifyPythonPipShims(executable, targetPlatform, spec);
+    if (targetPlatform === 'darwin') assertDarwinExecutableArch(executable, targetArch);
+    verified.push(`runtime:${kind}:${key}`);
+  }
+
+  return verified;
+}
+
 function prunePackedNativePayload(context, appPath, targetPlatform, targetArch) {
   const nodeModules = appNodeModules(context, appPath);
   if (!fs.existsSync(nodeModules)) return [];
@@ -307,7 +406,10 @@ module.exports = async function afterPack(context) {
 
   console.log('==== Native dependency gate: post-package/pre-sign ====');
   console.log(`[native-deps-gate] target=${targetPlatform}/${targetArch}`);
-  const verified = prunePackedNativePayload(context, appPath, targetPlatform, targetArch);
+  const verified = [
+    ...prunePackedNativePayload(context, appPath, targetPlatform, targetArch),
+    ...verifyPackedRuntimePayload(context, appPath, targetPlatform, targetArch),
+  ];
   writeNativeGateMarker(context, targetPlatform, targetArch, verified);
   console.log(`[native-deps-gate] verified: ${verified.join(', ')}`);
   console.log('[native-deps-gate] result=passed; signing may continue');

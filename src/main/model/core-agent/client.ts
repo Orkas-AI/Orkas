@@ -36,7 +36,7 @@ import { getSession as _getCachedSession } from './session-store';
 import { app } from 'electron';
 import * as paths from '../../paths';
 import { getCurrentLang } from '../../i18n';
-import { bundledRuntimeEnv } from '../../util/bundled-runtime';
+import { bundledRuntimeEnv, bundledRuntimePathEntries } from '../../util/bundled-runtime';
 
 interface NoopRecorder {
   record(event: unknown): void;
@@ -130,13 +130,14 @@ function buildSkillSandboxEnvStatic(): Record<string, string> {
  *     bash-driven CLIs) resolve the right per-user data tree without
  *     parsing users.json.
  *   - `ORKAS_PATH_PREPEND` = `<uid>/local/packages/.bin` when an enabled
- *     external package ships CLI shims. Composed into PATH by the sandbox
- *     executor (see core-agent sandbox/executor.ts) so the augmented
- *     brew/system PATH is preserved.
+ *     external package ships CLI shims, plus bundled runtime bins when
+ *     present. Composed into PATH by the sandbox executor (see core-agent
+ *     sandbox/executor.ts) so the augmented brew/system PATH is preserved.
  */
 export function buildSkillSandboxEnv(userId?: string): Record<string, string> {
   const env = { ...buildSkillSandboxEnvStatic(), ...bundledRuntimeEnv() };
   env.ORKAS_UI_LANG = getCurrentLang();
+  const pathEntries = bundledRuntimePathEntries();
   if (userId) {
     env.ORKAS_UID = userId;
     try {
@@ -146,8 +147,11 @@ export function buildSkillSandboxEnv(userId?: string): Record<string, string> {
       // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
       const pkgs = require('../../features/packages') as typeof import('../../features/packages');
       const binDir = pkgs.packagesBinDirIfActive(userId);
-      if (binDir) env.ORKAS_PATH_PREPEND = binDir;
+      if (binDir) pathEntries.push(binDir);
     } catch { /* packages feature unavailable → no shim PATH this turn */ }
+  }
+  if (pathEntries.length) {
+    env.ORKAS_PATH_PREPEND = pathEntries.join(process.platform === 'win32' ? ';' : ':');
   }
   return env;
 }

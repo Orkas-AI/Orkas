@@ -9,6 +9,12 @@ function isFile(p: string | undefined): p is string {
   catch { return false; }
 }
 
+function isDir(p: string | undefined): p is string {
+  if (!p) return false;
+  try { return fs.statSync(p).isDirectory(); }
+  catch { return false; }
+}
+
 function platformKey(platform = process.platform, arch = process.arch): string {
   return `${platform}-${arch}`;
 }
@@ -72,6 +78,30 @@ function resolveUvExecutable(): string | undefined {
     if (isFile(candidate)) return candidate;
   }
   return undefined;
+}
+
+function pushPathDir(out: string[], seen: Set<string>, dir: string | undefined): void {
+  if (!isDir(dir)) return;
+  const resolved = path.resolve(dir);
+  const key = process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  if (seen.has(key)) return;
+  seen.add(key);
+  out.push(resolved);
+}
+
+export function bundledRuntimePathEntries(): string[] {
+  const entries: string[] = [];
+  const seen = new Set<string>();
+  const python = resolvePythonExecutable();
+  if (python) {
+    const pythonDir = path.dirname(python);
+    pushPathDir(entries, seen, pythonDir);
+    pushPathDir(entries, seen, path.join(pythonDir, 'Scripts'));
+    pushPathDir(entries, seen, path.join(pythonDir, 'bin'));
+  }
+  const uv = resolveUvExecutable();
+  if (uv) pushPathDir(entries, seen, path.dirname(uv));
+  return entries;
 }
 
 export function bundledRuntimeEnv(): Record<string, string> {

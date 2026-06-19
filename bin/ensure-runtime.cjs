@@ -314,7 +314,60 @@ function preparePayload(kind, extractDir, payloadDir, asset) {
   copyTree(extractDir, payloadDir);
 }
 
-function doctorDir(dir, kind, asset, opts) {
+function pythonVersionSuffix(spec) {
+  const m = /^(\d+)\.(\d+)/.exec(String(spec.version || ''));
+  return m ? `${m[1]}.${m[2]}` : '';
+}
+
+function writeFileIfChanged(file, content, mode) {
+  try {
+    if (fs.readFileSync(file, 'utf8') === content) {
+      if (mode != null) {
+        try { fs.chmodSync(file, mode); } catch { /* best-effort */ }
+      }
+      return;
+    }
+  } catch {
+    /* missing or unreadable -> write below */
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, content, 'utf8');
+  if (mode != null) {
+    try { fs.chmodSync(file, mode); } catch { /* best-effort */ }
+  }
+}
+
+function createPythonPipShims(dir, spec, asset, opts) {
+  const pythonExe = relPath(dir, asset.executable);
+  if (!isFile(pythonExe)) return;
+  const suffix = pythonVersionSuffix(spec);
+  const names = ['pip', 'pip3', ...(suffix ? [`pip${suffix}`] : [])];
+
+  if (opts.platform === 'win32') {
+    const shimDir = path.join(path.dirname(pythonExe), 'Scripts');
+    const relPython = path.relative(shimDir, pythonExe).split(path.sep).join('\\');
+    for (const name of names) {
+      writeFileIfChanged(
+        path.join(shimDir, `${name}.cmd`),
+        `@echo off\r\nsetlocal\r\n"%~dp0${relPython}" -m pip %*\r\n`,
+        null,
+      );
+    }
+    return;
+  }
+
+  const shimDir = path.dirname(pythonExe);
+  const relPython = path.relative(shimDir, pythonExe).split(path.sep).join('/');
+  for (const name of names) {
+    writeFileIfChanged(
+      path.join(shimDir, name),
+      `#!/bin/sh\nSCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexec "$SCRIPT_DIR/${relPython}" -m pip "$@"\n`,
+      0o755,
+    );
+  }
+}
+
+function doctorDir(dir, kind, spec, asset, opts) {
   const executable = relPath(dir, asset.executable);
   if (isFile(executable)) {
     try { fs.chmodSync(executable, 0o755); } catch { /* best-effort */ }
@@ -326,6 +379,7 @@ function doctorDir(dir, kind, asset, opts) {
         try { fs.chmodSync(p, 0o755); } catch { /* best-effort */ }
       }
     }
+    createPythonPipShims(dir, spec, asset, opts);
   }
   if (opts.platform === 'darwin') {
     runCommand('xattr', ['-dr', 'com.apple.quarantine', dir], { ...opts, quiet: true, timeoutMs: 30_000 });
@@ -395,7 +449,10 @@ function selfCheck(kind, dir, asset, key, opts) {
 async function ensureInRoot(root, kind, key, spec, asset, opts) {
   fs.mkdirSync(root, { recursive: true });
   const current = statusInRoot(root, kind, key, spec, asset);
-  if (current.ok) return { kind, key, ...current };
+  if (current.ok) {
+    if (!opts.check) doctorDir(current.dir, kind, spec, asset, opts);
+    return { kind, key, ...current };
+  }
   if (opts.check || opts.noDownload) return { kind, key, ...current };
 
   const dest = runtimeDir(root, kind, key);
@@ -416,7 +473,7 @@ async function ensureInRoot(root, kind, key, spec, asset, opts) {
     }
     extractArchive(archive, extractDir, asset, opts);
     preparePayload(kind, extractDir, payloadDir, asset);
-    doctorDir(payloadDir, kind, asset, opts);
+    doctorDir(payloadDir, kind, spec, asset, opts);
     writeMarker(payloadDir, kind, key, spec, asset);
     replaceDir(dest, payloadDir);
     fs.rmSync(tmp, { recursive: true, force: true });

@@ -3,6 +3,7 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import os from "node:os";
 import { defineTool, toToolDefinition, getBuiltinTools } from "../src/tools/index.js";
+import { DEFAULT_BASH_TIMEOUT_MS, normalizeBashTimeoutMs } from "../src/tools/builtin.js";
 import type { ToolContext } from "../src/tools/index.js";
 
 describe("Tools", () => {
@@ -117,6 +118,13 @@ describe("Tools", () => {
   });
 
   describe("bash tool", () => {
+    it("normalizes legacy default timeout values to the long bash timeout", () => {
+      expect(normalizeBashTimeoutMs(undefined)).toBe(DEFAULT_BASH_TIMEOUT_MS);
+      expect(normalizeBashTimeoutMs(30_000)).toBe(DEFAULT_BASH_TIMEOUT_MS);
+      expect(normalizeBashTimeoutMs(300_000)).toBe(DEFAULT_BASH_TIMEOUT_MS);
+      expect(normalizeBashTimeoutMs(5_000)).toBe(5_000);
+    });
+
     it("executes a shell command", async () => {
       const tools = getBuiltinTools();
       const bash = tools.find((t) => t.name === "bash")!;

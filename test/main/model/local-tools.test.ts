@@ -202,6 +202,30 @@ describe('local-tools › Orkas CLI direct execution', () => {
     expect(parsed.argv).toEqual(['skill-write', 'demo']);
     expect(parsed.body).toBe(body);
   });
+
+  it('times out direct Orkas CLI commands whose child keeps stdout open', async () => {
+    const { lt, perm } = await loadModules();
+    perm.grantLocalExec();
+    const pcDir = writeFakePcScript(
+      'run-skill.cjs',
+      [
+        "const { spawn } = require('node:child_process');",
+        "spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'inherit' });",
+        "console.log('parent done');",
+      ].join(''),
+    );
+    const bash = lt.createLocalTools({}).find((t) => t.name === 'bash')!;
+
+    const started = Date.now();
+    const res = await bash.execute({
+      command: '$ORKAS_NODE "$ORKAS_PC_DIR/bin/run-skill.cjs" calculator eval -- 1+1',
+      timeoutMs: 500,
+    }, makeOrkasCtx(pcDir));
+
+    expect(res.isError).toBe(true);
+    expect(String(res.content)).toMatch(/timed out|超时/i);
+    expect(Date.now() - started).toBeLessThan(7000);
+  }, 10000);
 });
 
 // ── End-to-end: risk_prompt mode drives the real bash tool ────────────────

@@ -45,3 +45,7 @@ runtime/
 The app resolves `current` first, then `<platform>-<arch>`, and injects
 `ORKAS_PYTHON` / `ORKAS_UV` into command execution when binaries are present.
 Resolution checks an explicit `ORKAS_RUNTIME_DIR`, then packaged resources.
+
+`ensure-runtime.cjs` also writes lightweight `pip` / `pip3` shims for the
+bundled Python. They forward to `python -m pip`, because the standalone Python
+asset includes the pip module but may not ship `Scripts/pip.exe`.

@@ -391,16 +391,36 @@ export class AgentRunner {
           if (call.name === "skill_manage" && call.input && (call.input as any).action === "read" && (call.input as any).id) {
             skillsLoadedSet.add((call.input as any).id as string);
           }
+          let toolResultRecorded = false;
+          const addToolResultOnce = (content: string, images?: ToolResult["images"], isError?: boolean): boolean => {
+            if (toolResultRecorded) return false;
+            this.session.addToolResult(call.id, content, images, isError);
+            toolResultRecorded = true;
+            return true;
+          };
+          const abortedToolMessage = "Tool execution aborted: Run aborted";
           try {
-            if (params.signal?.aborted) throw new Error("Run aborted");
+            if (params.signal?.aborted) {
+              addToolResultOnce(abortedToolMessage, undefined, true);
+              yield {
+                type: "tool_end",
+                id: call.id,
+                name: call.name,
+                result: abortedToolMessage,
+                isError: true,
+              };
+              throw new Error("Run aborted");
+            }
             log.debug(`Executing tool: ${call.name}`);
             const progressQueue: Array<Extract<AgentRunEvent, { type: "tool_progress" }>> = [];
             let notifyProgress: (() => void) | null = null;
+            let acceptingProgress = true;
             const toolCtx: ToolContext = {
               workingDir: params.workingDir,
               signal: params.signal,
               state: toolState,
               emitProgress: (progress) => {
+                if (!acceptingProgress) return;
                 const message = String(progress?.message || "").trim();
                 if (!message) return;
                 progressQueue.push({
@@ -441,39 +461,63 @@ export class AgentRunner {
                 if (abortWait.promise) waits.push(abortWait.promise);
                 const raced = await Promise.race(waits);
                 if (raced === "progress") continue;
-                if (raced === "abort") throw new Error("Run aborted");
+                if (raced === "abort") {
+                  addToolResultOnce(abortedToolMessage, undefined, true);
+                  yield {
+                    type: "tool_end",
+                    id: call.id,
+                    name: call.name,
+                    result: abortedToolMessage,
+                    isError: true,
+                  };
+                  throw new Error("Run aborted");
+                }
                 completed = raced;
                 notifyProgress = null;
               }
             } finally {
               abortWait.cleanup();
               notifyProgress = null;
+              acceptingProgress = false;
             }
             while (progressQueue.length) {
               yield progressQueue.shift()!;
             }
             if (completed.ok !== true) throw completed.err;
             const toolResult = completed.result;
-            this.session.addToolResult(call.id, toolResult.content, toolResult.images, toolResult.isError);
-            yield {
-              type: "tool_end",
-              id: call.id,
-              name: call.name,
-              result: toolResult.content,
-              isError: toolResult.isError,
-            };
+            if (addToolResultOnce(toolResult.content, toolResult.images, toolResult.isError)) {
+              yield {
+                type: "tool_end",
+                id: call.id,
+                name: call.name,
+                result: toolResult.content,
+                isError: toolResult.isError,
+              };
+            }
             if (toolResult.isError) {
               permanentToolErrors++;
               log.warn(`Tool ${call.name} returned error: ${toolResult.content.slice(0, 150)}`);
             }
           } catch (err) {
-            if (params.signal?.aborted) throw err;
+            if (params.signal?.aborted) {
+              if (addToolResultOnce(abortedToolMessage, undefined, true)) {
+                yield {
+                  type: "tool_end",
+                  id: call.id,
+                  name: call.name,
+                  result: abortedToolMessage,
+                  isError: true,
+                };
+              }
+              throw err;
+            }
             const errMsg = formatError(err);
             const isTransient = isRetryableError(err);
             log.error(`Tool ${call.name} failed (${isTransient ? 'transient' : 'permanent'}): ${errMsg}`);
             const msg = `Tool execution error: ${errMsg}`;
-            this.session.addToolResult(call.id, msg, undefined, true);
-            yield { type: "tool_end", id: call.id, name: call.name, result: msg, isError: true };
+            if (addToolResultOnce(msg, undefined, true)) {
+              yield { type: "tool_end", id: call.id, name: call.name, result: msg, isError: true };
+            }
             if (isTransient) transientToolErrors++;
             else permanentToolErrors++;
           }

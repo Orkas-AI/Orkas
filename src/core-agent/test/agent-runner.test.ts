@@ -481,7 +481,24 @@ describe("AgentRunner", () => {
     const done = collected[collected.length - 1] as { type: string; result?: { meta?: { aborted?: boolean } } };
     expect(done.type).toBe("done");
     expect(done.result?.meta?.aborted).toBe(true);
-    expect(collected.some((e) => e.type === "tool_end")).toBe(false);
+    const toolEnd = collected.find((e) => e.type === "tool_end");
+    expect(toolEnd).toMatchObject({
+      type: "tool_end",
+      id: "call_1",
+      name: "wedged_tool",
+      isError: true,
+      result: "Tool execution aborted: Run aborted",
+    });
+    const toolResults = runner.getSession().getMessages().flatMap((msg) =>
+      msg.content.filter((content) => content.type === "tool_result"),
+    );
+    expect(toolResults).toHaveLength(1);
+    expect(toolResults[0]).toMatchObject({
+      type: "tool_result",
+      toolUseId: "call_1",
+      content: "Tool execution aborted: Run aborted",
+      isError: true,
+    });
   });
 
   it("runStream forwards tool input deltas before tool execution", async () => {

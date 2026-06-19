@@ -1,16 +1,23 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import os from "node:os";
 import path from "node:path";
 import fs from "node:fs/promises";
 import {
   SandboxExecutor,
   augmentPath,
+  buildSandboxEnv,
   buildShellInvocation,
   decodeProcessOutput,
+  DEFAULT_SANDBOX_TIMEOUT_MS,
   defaultShellForPlatform,
+  killProcessTree,
 } from "../src/sandbox/executor.js";
 
 describe("SandboxExecutor", () => {
+  it("defaults command execution to the long bash timeout", () => {
+    expect(DEFAULT_SANDBOX_TIMEOUT_MS).toBe(30 * 60_000);
+  });
+
   it("executes a simple command", async () => {
     const sandbox = new SandboxExecutor({ workingDir: os.tmpdir() });
     const result = await sandbox.execute("echo hello");
@@ -114,6 +121,50 @@ describe("SandboxExecutor", () => {
   });
 });
 
+describe("killProcessTree", () => {
+  it("uses taskkill to terminate Windows child process trees", () => {
+    const callbacks = new Map<string, (...args: any[]) => void>();
+    const killer = {
+      once: vi.fn((event: string, cb: (...args: any[]) => void) => {
+        callbacks.set(event, cb);
+        return killer;
+      }),
+      unref: vi.fn(),
+    };
+    const spawnFn = vi.fn(() => killer);
+    const child = { pid: 1234, kill: vi.fn() };
+
+    killProcessTree(child as any, "SIGTERM", {
+      platform: "win32",
+      spawnFn: spawnFn as any,
+    });
+
+    expect(String(spawnFn.mock.calls[0][0]).toLowerCase()).toMatch(/taskkill\.exe$/);
+    expect(spawnFn).toHaveBeenCalledWith(expect.any(String), ["/pid", "1234", "/t", "/f"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    expect(killer.unref).toHaveBeenCalled();
+    expect(child.kill).not.toHaveBeenCalled();
+
+    callbacks.get("exit")?.(1);
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
+  it("kills POSIX process groups when a pid is available", () => {
+    const child = { pid: 4321, kill: vi.fn() };
+    const processKill = vi.fn();
+
+    killProcessTree(child as any, "SIGKILL", {
+      platform: "linux",
+      processKill: processKill as any,
+    });
+
+    expect(processKill).toHaveBeenCalledWith(-4321, "SIGKILL");
+    expect(child.kill).not.toHaveBeenCalled();
+  });
+});
+
 describe("augmentPath", () => {
   it("prepends /opt/homebrew/bin when it's missing (Apple Silicon case)", () => {
     const out = augmentPath("/usr/bin:/bin");
@@ -178,6 +229,16 @@ describe("augmentPath", () => {
     expect(parts).toContain("C:\\Program Files\\Git\\bin");
     expect(parts).toContain("C:\\Users\\me\\AppData\\Local\\Programs\\Git\\cmd");
     expect(parts).toContain("C:\\Users\\me\\AppData\\Local\\Programs\\OpenAI\\Codex\\bin");
+  });
+
+  it("defaults Windows Python subprocesses to UTF-8 stdio", () => {
+    const env = buildSandboxEnv(undefined, "win32");
+    expect(env.PYTHONIOENCODING).toBe("utf-8");
+    expect(env.PYTHONUTF8).toBe("1");
+
+    const overridden = buildSandboxEnv({ PYTHONIOENCODING: "gb18030", PYTHONUTF8: "0" }, "win32");
+    expect(overridden.PYTHONIOENCODING).toBe("gb18030");
+    expect(overridden.PYTHONUTF8).toBe("0");
   });
 
   describe("Windows shell selection", () => {
