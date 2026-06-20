@@ -2,4 +2,8 @@
 /data
 /node_modules
 /resources/embedding-model
+/resources/runtime/.python-*
+/resources/runtime/.uv-*
+/resources/runtime/python
+/resources/runtime/uv
 /userWorkSpace

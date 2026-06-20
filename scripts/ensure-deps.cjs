@@ -68,11 +68,16 @@ function writeStamp(hash) {
 }
 
 function runNpmInstall() {
-  const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-  const res = spawnSync(npmCmd, ['install'], {
+  const cmd = process.platform === 'win32'
+    ? (process.env.ComSpec || process.env.COMSPEC || 'cmd.exe')
+    : 'npm';
+  const args = process.platform === 'win32'
+    ? ['/d', '/s', '/c', 'npm', 'install']
+    : ['install'];
+  const res = spawnSync(cmd, args, {
     cwd: PC_DIR,
     stdio: 'inherit',
-    shell: true,
+    shell: false,
   });
   if (res.error) {
     console.error('[Orkas] npm install 启动失败：', res.error.message);

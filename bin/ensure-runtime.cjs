@@ -477,6 +477,7 @@ async function ensureInRoot(root, kind, key, spec, asset, opts) {
     writeMarker(payloadDir, kind, key, spec, asset);
     replaceDir(dest, payloadDir);
     fs.rmSync(tmp, { recursive: true, force: true });
+    doctorDir(dest, kind, spec, asset, opts);
     const versionOutput = selfCheck(kind, dest, asset, key, opts);
     return {
       kind,

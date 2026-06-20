@@ -201,6 +201,17 @@ describe('local_agents/runner', () => {
 
       const runner = await loadRunner();
       const events: any[] = [];
+      const idleCount = () => events.filter(e => e.type === 'idle').length;
+      const waitForIdleCount = async (minCount: number) => {
+        const deadline = Date.now() + 1500;
+        let count = idleCount();
+        while (Date.now() < deadline) {
+          if (count >= minCount) return count;
+          await new Promise(r => setTimeout(r, 25));
+          count = idleCount();
+        }
+        return count;
+      };
       const promise = runner.run({
         uid: TEST_UID, cid: 'c', agentId: 'a',
         cli: 'claude', prompt: 'p', cwd: tmpDir,
@@ -208,23 +219,22 @@ describe('local_agents/runner', () => {
         onEvent: e => events.push(e),
       });
 
-      // Threshold=120ms, tick = max(50, 120/3=40) → 50ms. Wait ~250ms:
-      // at least 2 idle pulses should fire after the 120ms quiet period.
-      await new Promise(r => setTimeout(r, 250));
-      const idleCount1 = events.filter(e => e.type === 'idle').length;
+      // Threshold=120ms, tick = max(50, 120/3=40) → 50ms. Poll instead
+      // of sleeping for a fixed window so full-suite worker contention
+      // does not turn timer scheduling jitter into a false negative.
+      const idleCount1 = await waitForIdleCount(1);
       expect(idleCount1).toBeGreaterThanOrEqual(1);
 
       // Continue waiting → steady drumbeat (more idle events).
-      await new Promise(r => setTimeout(r, 150));
-      const idleCount2 = events.filter(e => e.type === 'idle').length;
+      const idleCount2 = await waitForIdleCount(idleCount1 + 1);
       expect(idleCount2).toBeGreaterThan(idleCount1);
 
       // Backend emits a real event — deadline should reset, so no new
       // idle pulse during the next sub-threshold window.
       onEventCb!({ type: 'text-delta', text: 'still here' });
-      const beforeReset = events.filter(e => e.type === 'idle').length;
+      const beforeReset = idleCount();
       await new Promise(r => setTimeout(r, 80));  // less than 120ms threshold
-      const afterReset = events.filter(e => e.type === 'idle').length;
+      const afterReset = idleCount();
       expect(afterReset).toBe(beforeReset);  // no new idle fired
 
       resolveBackend();
