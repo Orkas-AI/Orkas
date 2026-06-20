@@ -42,6 +42,9 @@ import './install-data-root.cjs';
 import { desktopPlatform, osVersion } from './system_info';
 
 const APP_USER_MODEL_ID = 'com.orkas.desktop';
+const MARKETPLACE_DEFAULTS_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
+const MARKETPLACE_SERVER_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000;
+const MARKETPLACE_DEFAULTS_RETRY_DELAYS_MS = [3_000, 3_000, 3_000] as const;
 
 // Source and packaged builds share one app identity and one server
 // environment: global prod. This keeps local data paths and OS app grouping
@@ -103,6 +106,7 @@ import * as storage from './storage';
 import { initLogger, createLogger } from './logger';
 initLogger();
 const log = createLogger('orkas');
+const marketplaceBootLog = createLogger('marketplace_boot');
 
 // Replay any pin / migration warnings buffered by install-data-root
 // (which runs before logger.ts can be imported) into the daily log.
@@ -405,6 +409,158 @@ async function runBootMaintenanceSweeps(): Promise<void> {
       userWs.sweepEmptyConvDirs(uid);
     }
   } catch (err) { log.warn('workspace empty-dir sweep failed', { error: (err as Error).message }); }
+}
+
+let marketplaceReconcileStatusSubscribed = false;
+let marketplaceReconcileInFlight: Promise<void> | null = null;
+let marketplaceReconcileInFlightKey = '';
+const marketplaceDefaultsRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const marketplaceDefaultsRetryAttempts = new Map<string, number>();
+
+function subscribeMarketplaceReconcileStatus(m: typeof import('./features/marketplace_reconcile')): void {
+  if (marketplaceReconcileStatusSubscribed) return;
+  marketplaceReconcileStatusSubscribed = true;
+  m.subscribeReconcileStatus((status) => {
+    ipc.broadcastToRenderer('marketplace:reconcile-status', status);
+  });
+}
+
+function marketplaceBootContextStillActive(uid: string): boolean {
+  if (!uid || users.isAnonymousLocalId(uid)) return false;
+  try { return users.getActiveUserId() === uid; }
+  catch { return false; }
+}
+
+function clearMarketplaceDefaultsRetry(runKey: string): void {
+  const timer = marketplaceDefaultsRetryTimers.get(runKey);
+  if (timer) clearTimeout(timer);
+  marketplaceDefaultsRetryTimers.delete(runKey);
+  marketplaceDefaultsRetryAttempts.delete(runKey);
+}
+
+function scheduleMarketplaceDefaultsRetry(runKey: string, uid: string, error: string): void {
+  if (marketplaceDefaultsRetryTimers.has(runKey)) return;
+  const attempt = marketplaceDefaultsRetryAttempts.get(runKey) || 0;
+  const delayMs = MARKETPLACE_DEFAULTS_RETRY_DELAYS_MS[attempt];
+  if (delayMs === undefined) {
+    marketplaceBootLog.warn('marketplace default installs retry exhausted', { error });
+    marketplaceDefaultsRetryAttempts.delete(runKey);
+    return;
+  }
+  marketplaceDefaultsRetryAttempts.set(runKey, attempt + 1);
+  const timer = setTimeout(() => {
+    marketplaceDefaultsRetryTimers.delete(runKey);
+    if (!marketplaceBootContextStillActive(uid)) {
+      marketplaceDefaultsRetryAttempts.delete(runKey);
+      return;
+    }
+    runMarketplaceInstallReconcile('marketplace-defaults-retry').catch((err) => {
+      marketplaceBootLog.warn('marketplace default installs retry failed', {
+        error: (err as Error).message,
+      });
+    });
+  }, delayMs);
+  timer.unref?.();
+  marketplaceDefaultsRetryTimers.set(runKey, timer);
+  marketplaceBootLog.info('scheduled marketplace default installs retry', {
+    attempt: attempt + 1,
+    delay_ms: delayMs,
+    error,
+  });
+}
+
+async function runMarketplaceInstallReconcile(reason: string): Promise<void> {
+  const uid = users.getActiveUserId();
+  if (!marketplaceBootContextStillActive(uid)) {
+    marketplaceBootLog.info('skip marketplace reconcile: local user unavailable', { reason });
+    return;
+  }
+
+  const runKey = uid;
+  if (marketplaceReconcileInFlight && marketplaceReconcileInFlightKey === runKey) {
+    await marketplaceReconcileInFlight;
+    return;
+  }
+
+  const shouldContinue = (): boolean => marketplaceBootContextStillActive(uid);
+  marketplaceReconcileInFlightKey = runKey;
+  marketplaceReconcileInFlight = (async () => {
+    let defaultSeedStatusActive = false;
+    let marketplaceReconcileModule: typeof import('./features/marketplace_reconcile') | null = null;
+    const clearDefaultSeedStatus = (): void => {
+      if (marketplaceReconcileModule && defaultSeedStatusActive) {
+        marketplaceReconcileModule.setDefaultInstallSeedStatus(false);
+        defaultSeedStatusActive = false;
+      }
+    };
+
+    try {
+      const [mp, m] = await Promise.all([
+        import('./features/marketplace'),
+        import('./features/marketplace_reconcile'),
+      ]);
+      marketplaceReconcileModule = m;
+      subscribeMarketplaceReconcileStatus(m);
+
+      if (await mp.hasKnownDefaultInstallWork(uid)) {
+        m.setDefaultInstallSeedStatus(true);
+        defaultSeedStatusActive = true;
+      }
+
+      if (!shouldContinue()) {
+        clearDefaultSeedStatus();
+        return;
+      }
+
+      const forceMarketplaceNetwork = reason === 'marketplace-defaults-retry';
+      const seeded = await mp.ensureDefaultInstalls(uid, {
+        shouldContinue,
+        minIntervalMs: forceMarketplaceNetwork ? 0 : MARKETPLACE_DEFAULTS_REFRESH_INTERVAL_MS,
+        force: forceMarketplaceNetwork,
+      });
+      if (seeded.failed) {
+        clearDefaultSeedStatus();
+        scheduleMarketplaceDefaultsRetry(runKey, uid, seeded.error || 'unknown error');
+      } else {
+        clearMarketplaceDefaultsRetry(runKey);
+      }
+      if ((seeded.seeded_agents || seeded.seeded_skills) && !defaultSeedStatusActive) {
+        m.setDefaultInstallSeedStatus(true);
+        defaultSeedStatusActive = true;
+      }
+
+      if (!shouldContinue()) {
+        clearDefaultSeedStatus();
+        return;
+      }
+
+      await m.checkServerUpdatesForInstalls(uid, {
+        shouldContinue,
+        minIntervalMs: MARKETPLACE_SERVER_CHECK_INTERVAL_MS,
+      });
+      const result = await m.reconcileInstalls(uid, { shouldContinue });
+      if (
+        result.pulled_agents || result.pulled_skills
+        || result.pruned_agents || result.pruned_skills
+        || result.restored_agents || result.restored_skills
+        || result.patched_agents || result.patched_skills
+      ) {
+        marketplaceBootLog.info('marketplace install reconcile completed', { reason, ...result });
+      }
+    } catch (err) {
+      clearDefaultSeedStatus();
+      marketplaceBootLog.warn('marketplace install reconcile failed', {
+        reason,
+        error: (err as Error).message,
+      });
+    }
+  })().finally(() => {
+    if (marketplaceReconcileInFlightKey === runKey) {
+      marketplaceReconcileInFlight = null;
+      marketplaceReconcileInFlightKey = '';
+    }
+  });
+  await marketplaceReconcileInFlight;
 }
 
 // `kb-file://<relpath>` — maps a KB-relative path to the active user's
@@ -827,6 +983,7 @@ if (!gotLock) {
       const m = await import('./features/marketplace_biz');
       await m.primeCategoryCache({ localOnly: true });
     });
+    registerDeferred('marketplace:reconcile', () => runMarketplaceInstallReconcile('startup'));
 
     // Deferred after the renderer has had a few seconds to paint. Per-agent
     // metacognitive reflection (single 12h-chained loop; the delay just stops

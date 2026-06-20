@@ -19,7 +19,12 @@ if errorlevel 1 exit /b 1
 
 pushd "%APP_DIR%"
 taskkill /F /IM electron.exe >nul 2>nul
-call npm start
+set "ELECTRON_USER_DATA_DIR=%TEMP%\orkas-electron-source"
+if exist "%APP_DIR%\node_modules\.bin\electron.cmd" (
+  call "%APP_DIR%\node_modules\.bin\electron.cmd" "--user-data-dir=%ELECTRON_USER_DATA_DIR%" "%APP_DIR%"
+) else (
+  call npm start
+)
 set "RC=%ERRORLEVEL%"
 popd
 exit /b %RC%
