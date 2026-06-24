@@ -3,12 +3,16 @@
  *
  * One bus instance per process. Per-cid state holds:
  *   - queues       : per-actor FIFO of inbound messages
- *   - workers      : per-actor worker loop handle (idle / running)
+ *   - workers      : holds one entry — the conversation's top-level turn
+ *                    runtime (single FIFO inbox). G8d collapsed the old
+ *                    per-actor worker map to this one runtime.
  *   - listeners    : IPC stream subscribers for that conversation
- *   - aborters     : per-actor AbortController (running turn)
  *
- * Workers are lazy: `enqueue` calls `ensureWorker(cid, actor)` which spins
- * the worker loop on first use and binds it to the actor's session id.
+ * The runtime is lazy: `enqueue` calls `ensureRuntime(cid)` which spins the
+ * loop on first use. Every top-level turn (user→commander, user→agent) runs
+ * through it serially; the target actor rides on each queued item. Dispatch
+ * fan-out happens in-process inside a turn (`runNestedDispatch`), not via
+ * concurrent peer workers.
  *
  * Routing: bus only ever routes based on the resolved `to[]` from
  * `router.resolveRecipients`. Messages with `user` in `to[]` are written
@@ -19,6 +23,7 @@
 import type { AgentTool } from '#core-agent';
 
 import { createLogger } from '../../logger';
+import { dispatchSlots } from '../../util/locks';
 import {
   appendJsonlAtomic, genId12, nowIso, safeId,
 } from '../../storage';
@@ -29,6 +34,8 @@ import {
   Actor, ActorKind, COMMANDER_ID, USER_ID, RESERVED_IDS,
   actorSessionId, addMember, ensureAgentMember, readMembers, seedReservedActors,
   setStatus, markInFlight, readState, transitionStatus, setCodingProjectDir, touchActivity,
+  setActiveRecipient, setOrchestrationLedger, markOrchestrationInterrupted,
+  takeOrchestrationLedgerForAgent, takeOrchestrationLedgerForForm, clearOrchestrationLedger,
 } from './state';
 import type { StateFile } from './state';
 import {
@@ -38,15 +45,12 @@ import {
 import {
   resolveRecipients, parseMentions, buildMention,
   extractFormFromFinal, computeFormId, ChatFormPayload,
+  extractHandbackFromFinal,
   extractPlanInteractionFromFinal, extractAgentFieldBlocks, extractSkillContainers, decodeSubmission,
   type PlanInteractionStatus,
 } from './router';
 import * as skillsFeat from '../skills';
 import * as autoTasksFeat from '../auto_tasks';
-import {
-  setPlan, updateStep, readPlan, formatPlanAnnouncement, formatPlanForPrompt,
-  PlanSetInput, StepStatus, PlanFile,
-} from './plan';
 import * as planExecutor from './plan_executor';
 import {
   userChatsDir, userSkillsDir, userAgentsDir,
@@ -61,11 +65,8 @@ import { readInstalls } from '../marketplace_installs';
 import { createSkillTurnBuffer, onAgentTurnEnd, onUserMessage } from '../expert_signals/turn_hooks';
 import {
   compactPromptDescription,
-  listSkillSpecs,
   openSkillReadRoots,
-  resolveSkillAllowlistRefs,
   searchOpenTierSkills,
-  type SkillAllowlistRef,
 } from '../../model/core-agent/skill-registry';
 import { buildRuntimeDatetimeBlock } from '../../prompts/runtime_context';
 
@@ -87,6 +88,13 @@ function escapeXmlAttr(s: string): string {
   return String(s)
     .replace(/&/g, '&amp;')
     .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function escapeXmlText(s: string): string {
+  return String(s)
+    .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 }
@@ -175,42 +183,6 @@ function _hasSkillUseIntent(text: string): boolean {
   return /(?:使用|调用|運行|运行|执行|use|run|call|execute)/i.test(text);
 }
 
-function _escapeRe(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function _workflowMentionsSkill(workflow: string, spec: SkillAllowlistRef): boolean {
-  const hay = String(workflow || '').toLowerCase();
-  const refs = [spec.id, spec.name].filter((v): v is string => typeof v === 'string' && !!v.trim());
-  for (const ref of refs) {
-    const needle = ref.toLowerCase().trim();
-    if (!needle) continue;
-    if (/^[a-z0-9_.-]+$/i.test(needle)) {
-      const re = new RegExp(`(^|[^a-z0-9_.-])${_escapeRe(needle)}(?=$|[^a-z0-9_.-])`, 'i');
-      if (re.test(hay)) return true;
-    } else if (hay.includes(needle)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-async function _runtimeSkillListForAgent(agent: agentsFeat.Agent): Promise<string[]> {
-  const workflow = String(agent.workflow || '');
-  if (!workflow.trim()) return [];
-  const specs = await listSkillSpecs().catch((err) => {
-    log.warn(`skill workflow filter list failed agent=${agent.agent_id}: ${(err as Error).message}`);
-    return [] as SkillAllowlistRef[];
-  });
-  if (!specs.length) return [];
-  const refs = Array.isArray(agent.skill_list) ? agent.skill_list : specs.map((s) => s.id);
-  if (!refs.length) return [];
-  const allowedIds = new Set(resolveSkillAllowlistRefs(specs, refs).ids);
-  return specs
-    .filter((s) => allowedIds.has(s.id) && _workflowMentionsSkill(workflow, s))
-    .map((s) => s.id);
-}
-
 async function _findDisabledSkillUseRequest(uid: string, text: string):
   Promise<{ id: string; name: string } | null> {
   if (!_hasSkillUseIntent(text)) return null;
@@ -265,6 +237,13 @@ function _formatValidationWarnings(
 
 const MAX_PROCESS_ITEMS_PER_TURN = 300;
 const MAX_WORKER_TURNS = 100; // hard ceiling against runaway loops
+// The commander orchestrates long multi-step builds (e.g. a hyperframes video:
+// read several SKILL.md, scaffold, lint, render, fix, re-render) that legitimately
+// exceed core-agent's default 50 tool rounds in a single turn. Raise its per-turn
+// tool-loop cap so such a build isn't truncated mid-task; the identical-call
+// loop_detection (5 repeats) still guards true runaway loops. Other actor kinds
+// (agents, ephemeral workers, one-shots) keep the default 50.
+const COMMANDER_MAX_TOOL_LOOPS = 120;
 
 // ── Listener events (mirror the IPC streamEvents shape) ─────────────────
 
@@ -279,14 +258,13 @@ export type GroupEvent =
    * a tool-emitted mid-turn message wrongly consumes commander's placeholder
    * and a NEW placeholder gets recreated by post-tool process events, ending
    * up as a stuck "thinking" bubble when commander's turn ends silently. */
-  | { type: 'message'; cid: string; msg: GroupMessage; turn_end?: boolean; turn_id?: string }
+  | { type: 'message'; cid: string; msg: GroupMessage; turn_end?: boolean; turn_id?: string; seg?: number }
   | { type: 'process'; cid: string; actor: string; turn_id?: string; data: Record<string, unknown> }
   /** A `create_artifact` tool call finished writing its bundle. The final
    * end-of-turn message still carries `msg.artifacts` for persistence; this
    * live event lets the renderer mount the iframe immediately instead of
    * waiting for the whole actor turn to finish. */
   | { type: 'artifact_created'; cid: string; actor: string; turn_id?: string; artifact: { id: string; title: string; agent_id: string } }
-  | { type: 'plan_changed'; cid: string }
   | { type: 'state_changed'; cid: string; state: Awaited<ReturnType<typeof readState>>; active_turns?: ActiveTurn[] }
   | { type: 'member_joined'; cid: string; actor: Actor }
   | { type: 'aborted'; cid: string }
@@ -307,6 +285,11 @@ export interface ActiveTurn {
 // ── Per-cid state ────────────────────────────────────────────────────────
 
 interface QueueItem {
+  /** Target actor of this turn — who runs it. G8d: top-level turns funnel
+   * through one per-conversation runtime (not a per-actor worker map), so the
+   * target rides on the item and the runtime sets its `actor` per turn before
+   * `runTurn`. */
+  actor: Actor;
   /** Stable identity for exactly one actor execution. Renderer placeholders,
    * process events, final messages and silent-turn cleanup all use this key
    * instead of actor id so a later turn cannot re-adopt an older bubble. */
@@ -331,11 +314,11 @@ interface QueueItem {
    * post-turn enqueue is suppressed — otherwise every silent observation
    * would emit a "(no reply)" placeholder bubble and pollute the chat. */
   tap?: boolean;
-  /** Plan-executor stamp: the plan step (1-based index) whose dispatch
-   * created this turn. When the turn ends, `plan_executor.reconcile` uses
-   * this to mark exactly THAT step as done (no actor-id guessing). `-1`
-   * marks plan-complete fallback turns where no individual step terminates. */
-  triggered_step?: number;
+  /** G8d: this turn is an in-process nested sub-run (a dispatch tool running a
+   * worker/agent turn inside its caller's turn). Threaded into
+   * `streamChatWithModel` so the run skips the global concurrency slot the
+   * parent already holds (charter §6). Top-level turns leave it unset. */
+  nested?: boolean;
 }
 
 interface WorkerState {
@@ -356,17 +339,6 @@ interface WorkerState {
   /** Set by `dropConv` so the worker loop can exit cleanly instead of
    * blocking forever on `wake` after the cid state is gone. */
   terminated: boolean;
-  /** Plan announcement text staged by `plan_set` mid-turn; merged into the
-   * commander's turn-end message at runTurn end so the thinking process
-   * rail and the plan card render in a single bubble (instead of two
-   * separate ones, with the placeholder cleaned up by turn_silent). */
-  pendingPlanAnnouncement?: string;
-  /** Single-agent dispatches staged by `dispatch_to` mid-turn; flushed via
-   * `bus.enqueue(forceTo=[X], dispatch:true)` at runTurn end so the recipient
-   * worker can't jump the gun — it only wakes after commander's text reply persisted +
-   * placeholder cleaned. Same staging pattern as pendingPlanAnnouncement +
-   * deferred planExecutor.reconcile, just for direct dispatches. */
-  pendingDispatches?: Array<{ to: string; message: string }>;
   /** Marketplace install confirmations requested during a commander turn.
    * The model can stage these via `marketplace_request_install`; the user
    * decides in the renderer before any install side effect happens. */
@@ -392,6 +364,14 @@ interface CidState {
    * declare the bus done in the gap. */
   pendingEnqueues: number;
   nextTurnOrder: number;
+  /** Visible nested dispatches (dispatch_to / hand_off_to / named run_worker)
+   *  currently running in-process, keyed by their turnId. The nested worker is
+   *  deliberately NOT in `workers` (quiescence / abort / scheduler ignore it),
+   *  so its live turn is mirrored here for `activeTurnsForState` — that's what
+   *  lets the renderer paint the agent's "thinking" placeholder during the gap
+   *  between the commander's narration and the agent's first token. Anonymous
+   *  workers (kind:'worker') are NOT mirrored: their stream is suppressed. */
+  nestedTurns: Map<string, ActiveTurn & { order: number }>;
   /** Absolute paths written by any actor in THIS conversation since the
    *  bus was loaded. Feeds the write-tools' uniquify `isMine` predicate
    *  so refining a file across turns overwrites in place — the LLM's
@@ -441,6 +421,7 @@ function getOrInitCid(uid: string, cid: string): CidState {
       listeners: new Set(),
       pendingEnqueues: 0,
       nextTurnOrder: 0,
+      nestedTurns: new Map(),
       producedPaths: new Set(),
     };
     _cids.set(k, s);
@@ -462,10 +443,22 @@ function emit(state: CidState, ev: GroupEvent): void {
 
 function activeTurnsForState(state: CidState): ActiveTurn[] {
   const turns: Array<ActiveTurn & { order: number }> = [];
+  // A visible nested dispatch runs the agent's turn in-process WHILE the
+  // commander is suspended awaiting the tool result — its pre-dispatch reasoning
+  // was already flushed as a finalized `seg` bubble, so it is not streaming.
+  // Drop the commander from active_turns for that window: otherwise the renderer
+  // would seed a fresh empty commander placeholder (ABOVE the agent's reply, in
+  // the wrong loop order) instead of just the agent's live "thinking" bubble.
+  // Only the commander dispatches, so the suspended actor is always it.
+  const suspendCommander = state.nestedTurns.size > 0;
   for (const [, w] of state.workers) {
+    if (suspendCommander && w.actor.kind === 'commander') continue;
     if (w.running && w.currentTurnId) {
       turns.push({ actor: w.actor.id, turn_id: w.currentTurnId, order: w.currentTurnOrder || 0 });
     }
+  }
+  for (const [, nt] of state.nestedTurns) {
+    turns.push({ actor: nt.actor, turn_id: nt.turn_id, order: nt.order });
   }
   turns.sort((a, b) => a.order - b.order);
   return turns.map(({ actor, turn_id }) => ({ actor, turn_id }));
@@ -585,10 +578,6 @@ export interface EnqueueParams {
   /** Override resolved recipients (commander emitting plan announcement
    *  uses this to force `to=[user]`). Otherwise router decides. */
   forceTo?: string[];
-  /** Plan-executor passes the dispatching step's index here so the recipient
-   * worker's QueueItem carries it; when the recipient's turn ends, the
-   * executor can mark THAT exact step as done (precise, no actor-id guess). */
-  triggered_step?: number;
   /** True when this enqueue IS the actor's own end-of-turn message (called
    * from runTurn after the LLM stream completed). False / absent for any
    * tool-side-effect or plan-executor mid-turn enqueues. Renderer routes
@@ -609,6 +598,10 @@ export interface EnqueueParams {
    * renderer hides it from the user view — the plan announcement already
    * surfaced who's working on what. */
   dispatch?: boolean;
+  /** Commander reasoning-segment index within one turn (see GroupMessage.seg).
+   * Set on each mid-turn segment flush + the end-of-turn message when the turn
+   * was split at visible-dispatch boundaries; absent for ordinary turns. */
+  seg?: number;
   /** Captured process trail (progress lines + non-assistant tool/lifecycle
    * events) accumulated during the actor's stream. `runTurn` collects these
    * and passes them through on the end-of-turn `persist` enqueue so a
@@ -669,6 +662,15 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   const fromActor = members.actors.find((a) => a.id === fromActorId);
   const fromKind: ActorKind = fromActor?.kind || (fromActorId === USER_ID ? 'user' : fromActorId === COMMANDER_ID ? 'commander' : 'agent');
 
+  // The conversation floor: a no-`@` USER message routes here (the agent the
+  // commander handed off to), else the commander. Only read for user messages —
+  // commander/agent messages default to the user and never consult it.
+  let floorRecipient = '';
+  if (fromKind === 'user') {
+    try { floorRecipient = (await readState(uid, cid)).active_recipient || ''; }
+    catch { floorRecipient = ''; }
+  }
+
   let to: string[] = [];
   let unknown: string[] = [];
   if (params.forceTo && params.forceTo.length) {
@@ -714,6 +716,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
       members: members.actors,
       agentNameToId,
       agentDisplayNames,
+      ...(floorRecipient ? { activeRecipient: floorRecipient } : {}),
       resolveUnknown: (token) => {
         // Last-resort raw-id fallback. We can't sync-await getAgent here,
         // so just pass through; the post-resolve loop below does an async
@@ -778,6 +781,20 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   if (!to.length) {
     if (fromKind === 'user') to = [COMMANDER_ID];
     else to = [USER_ID];
+  }
+
+  // Floor reset: while handed off to an agent, a user message that resolves to
+  // the commander means the user explicitly addressed the commander (the no-`@`
+  // default would have been the floor agent) — or the floor agent became
+  // unroutable and we fell back to commander. Either way the hand-off is over;
+  // return the floor to the commander. A one-shot `@<otherAgent>` (to does NOT
+  // contain commander) leaves the floor untouched.
+  if (fromKind === 'user' && floorRecipient && to.includes(COMMANDER_ID)) {
+    try {
+      await setActiveRecipient(uid, cid, COMMANDER_ID);
+      await markOrchestrationInterrupted(uid, cid, text, floorRecipient);
+    }
+    catch (err) { log.warn(`floor reset failed cid=${cid}: ${(err as Error).message}`); }
   }
 
   // Auto-add any non-reserved recipient that isn't already a member.
@@ -888,6 +905,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
       : {}),
     ...(params.plan_announcement ? { plan_announcement: true } : {}),
     ...(params.dispatch ? { dispatch: true } : {}),
+    ...(params.seg !== undefined ? { seg: params.seg } : {}),
     ...(params.process && params.process.length ? { process: params.process } : {}),
   };
 
@@ -912,6 +930,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     msg,
     ...(params.turn_end ? { turn_end: true } : {}),
     ...(params.turn_id ? { turn_id: params.turn_id } : {}),
+    ...(params.seg !== undefined ? { seg: params.seg } : {}),
   });
   log.info(`enqueue user=${uid} cid=${cid} msg=${msgId} from=${fromActorId} to=${to.join(',')} len=${rewrittenText.length}${params.turn_end ? ' turn_end=1' : ''}${unknown.length ? ` unknown=${unknown.join(',')}` : ''}`);
 
@@ -928,14 +947,14 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
       log.warn(`agent ${actor.id} disabled — skipping dispatch (cid=${cid})`);
       continue;
     }
-    const w = ensureWorker(state, actor);
+    const w = ensureRuntime(state);
     w.queue.push({
+      actor,
       turnId: genId12(),
       msgId,
       fromActorId,
       llmPayload: composeLlmTurnPayload(fromActorId, msg),
       ...(msg.attachments && msg.attachments.length ? { attachments: msg.attachments.slice() } : {}),
-      ...(typeof params.triggered_step === 'number' ? { triggered_step: params.triggered_step } : {}),
     });
     const wake = w.wake; w.wake = null;
     wake?.();
@@ -974,11 +993,6 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     // RunMetrics — acceptable double-judgment for v0).
     onUserMessage({ uid, cid, userMsg: { id: msgId, text: rewrittenText } })
       .catch((err) => log.warn(`onUserMessage threw cid=${cid}: ${(err as Error).message}`));
-
-    await planExecutor.reconcile(uid, cid, {
-      finishedActorId: USER_ID,
-      finishedMessage: { id: msgId, text: rewrittenText, files: [], failed: false },
-    }).catch((err) => log.warn(`plan reconcile (user) threw cid=${cid}: ${(err as Error).message}`));
   }
 
   return msg;
@@ -1000,6 +1014,113 @@ function composeLlmTurnPayload(fromActorId: string, msg: GroupMessage): string {
 function _unwrapLlmTurnPayload(payload: string): string | null {
   const m = /^<msg from="[^"]*" to="[^"]*">\n([\s\S]*)\n<\/msg>$/.exec(payload);
   return m ? m[1] : null;
+}
+
+function _clipForOrchestration(s: string, max = 6000): string {
+  return String(s || '').replace(/\0/g, '').trim().slice(0, max);
+}
+
+function _buildOrchestrationStateBlock(ledger: NonNullable<StateFile['orchestration_ledger']> | undefined): string {
+  if (!ledger) return '(none)';
+  return [
+    '<orchestration-ledger>',
+    JSON.stringify({
+      id: ledger.id,
+      kind: ledger.kind,
+      status: ledger.status,
+      blocked_on: ledger.blocked_on,
+      source_tool: ledger.source_tool || '',
+      owner_agent_id: ledger.owner_agent_id,
+      owner_agent_name: ledger.owner_agent_name || '',
+      form_id: ledger.form_id || '',
+      user_goal: ledger.user_goal,
+      handoff_message: ledger.handoff_message,
+      resume_instruction: ledger.resume_instruction,
+      created_at: ledger.created_at,
+      updated_at: ledger.updated_at,
+      interrupted_at: ledger.interrupted_at || '',
+      interrupt_message: ledger.interrupt_message || '',
+    }, null, 2),
+    '</orchestration-ledger>',
+  ].join('\n');
+}
+
+function _buildOrchestrationResumeModelText(
+  ledger: NonNullable<StateFile['orchestration_ledger']>,
+  agentResult: string,
+): string {
+  return [
+    '<orchestration-resume>',
+    JSON.stringify({
+      id: ledger.id,
+      kind: ledger.kind,
+      status: ledger.status,
+      blocked_on: ledger.blocked_on,
+      source_tool: ledger.source_tool || '',
+      owner_agent_id: ledger.owner_agent_id,
+      owner_agent_name: ledger.owner_agent_name || '',
+      form_id: ledger.form_id || '',
+      user_goal: ledger.user_goal,
+      handoff_message: ledger.handoff_message,
+      resume_instruction: ledger.resume_instruction,
+      agent_result: _clipForOrchestration(agentResult),
+    }, null, 2),
+    '</orchestration-resume>',
+    '',
+    'Continue the suspended commander-owned task from this state. Do not re-ask for information already supplied by the agent or form. If the blocking outcome completed, run any remaining independent agent/tool work or synthesize the final answer. If the agent reported a blocker or out-of-scope result, decide whether to retry, route to a different owner, answer directly with caveats, or ask the user for the smallest missing input.',
+  ].join('\n');
+}
+
+function _defaultResumeInstructionForBlockedForm(agentName: string): string {
+  return `After ${agentName || 'the agent'} receives the required form input and completes, continue the original user goal. Use the agent's completed result, then run any remaining agent/tool work or synthesize the final answer.`;
+}
+
+async function _setFormWaitLedgerFromWorkerResult(params: {
+  uid: string;
+  cid: string;
+  result: string;
+  ownerAgentId: string;
+  ownerAgentName?: string;
+  userGoal: string;
+  agentTask: string;
+  resume?: string;
+  sourceTool: 'dispatch_to' | 'run_worker' | 'hand_off_to';
+}): Promise<boolean> {
+  const blockedForm = extractBlockedFormFromWorkerResult(params.result);
+  if (!blockedForm || blockedForm.agent_id !== params.ownerAgentId) return false;
+  await setOrchestrationLedger(params.uid, params.cid, {
+    status: 'waiting_for_form',
+    blocked_on: 'agent_form',
+    source_tool: params.sourceTool,
+    owner_agent_id: params.ownerAgentId,
+    ...(params.ownerAgentName ? { owner_agent_name: params.ownerAgentName } : {}),
+    form_id: blockedForm.form_id,
+    user_goal: _clipForOrchestration(params.userGoal),
+    handoff_message: _clipForOrchestration(params.agentTask),
+    resume_instruction: params.resume && params.resume.trim()
+      ? params.resume.trim()
+      : _defaultResumeInstructionForBlockedForm(params.ownerAgentName || params.ownerAgentId),
+  });
+  return true;
+}
+
+async function _enqueueOrchestrationResumeFromAgent(params: {
+  state: CidState;
+  fromActorId: string;
+  fromActorName?: string;
+  ledger: NonNullable<StateFile['orchestration_ledger']>;
+  agentResult: string;
+}): Promise<void> {
+  const targetName = params.ledger.owner_agent_name || params.fromActorName || params.fromActorId;
+  await enqueue({
+    uid: params.state.uid,
+    cid: params.state.cid,
+    fromActorId: params.fromActorId,
+    text: `Orchestration resume from @${targetName}.`,
+    model_text: _buildOrchestrationResumeModelText(params.ledger, params.agentResult),
+    forceTo: [COMMANDER_ID],
+    dispatch: true,
+  });
 }
 
 /** True when `text` looks like a CLI slash command (`/foo`, `/my-cmd …`).
@@ -1042,16 +1163,28 @@ function _stripLeadingRecipientMention(
 
 // ── Worker loop ──────────────────────────────────────────────────────────
 
-function ensureWorker(state: CidState, actor: Actor): WorkerState {
-  const existing = state.workers.get(actor.id);
+/** Map key for the conversation's single top-level-turn runtime. G8d collapsed
+ * the old per-actor worker map to ONE runtime per conversation: every top-level
+ * turn (user→commander, user→agent) runs through one FIFO inbox, serially —
+ * dispatch fan-out now happens in-process inside a turn (`runNestedDispatch`),
+ * not via concurrent peer workers. The map stays a Map (so quiescence / abort /
+ * snapshot / dropConv iterate it unchanged) but holds at most this one entry. */
+const RUNTIME_KEY = '__runtime__';
+
+function ensureRuntime(state: CidState): WorkerState {
+  const existing = state.workers.get(RUNTIME_KEY);
   if (existing) return existing;
   const w: WorkerState = {
-    uid: state.uid, cid: state.cid, actor,
+    uid: state.uid, cid: state.cid,
+    // Placeholder; the loop sets `actor` from each queued item before runTurn.
+    // Never read while `running` is false (quiescence/snapshot/activeTurns all
+    // guard on `running`), so the placeholder is never observed.
+    actor: { kind: 'commander', id: COMMANDER_ID, name: 'Commander', joined_at: nowIso() },
     queue: [], running: false, wake: null,
     abortController: null, currentTurnId: null, currentTurnOrder: null, turnsThisActivation: 0,
     terminated: false,
   };
-  state.workers.set(actor.id, w);
+  state.workers.set(RUNTIME_KEY, w);
   // Spawn loop. No await — runs in background; failures log + retry on next msg.
   void runWorkerLoop(state, w);
   return w;
@@ -1074,11 +1207,33 @@ async function runWorkerLoop(state: CidState, w: WorkerState): Promise<void> {
     }
     if (w.turnsThisActivation >= MAX_WORKER_TURNS) {
       log.error(`worker ${w.actor.id} hit MAX_WORKER_TURNS (${MAX_WORKER_TURNS}) cid=${w.cid} — dropping queue + halting`);
+      const dropped = w.queue.slice();
       w.queue.length = 0;
       w.turnsThisActivation = 0;
+      // Surface the halt instead of silently dropping queued work: clear every
+      // dropped item's streaming placeholder, persist one visible notice, then
+      // reconcile status. Without this the renderer keeps a permanent
+      // "thinking" chip and the queued user messages vanish until a refresh.
+      for (const it of dropped) {
+        emit(state, { type: 'turn_silent', cid: w.cid, actor: it.actor.id, turn_id: it.turnId });
+      }
+      try {
+        await enqueue({ uid: w.uid, cid: w.cid, fromActorId: COMMANDER_ID, text: t('chat.turn_limit_reached') });
+      } catch (err) {
+        log.warn(`turn-limit notice enqueue failed cid=${w.cid}: ${(err as Error).message}`);
+      }
+      // The normal post-turn `_syncStateStatus` at the bottom of the loop is
+      // skipped by `continue`, so status would stick at 'running' forever.
+      await _syncStateStatus(state).catch((err) => {
+        log.warn(`turn-limit syncStateStatus failed cid=${w.cid}: ${(err as Error).message}`);
+      });
       continue;
     }
     const item = w.queue.shift()!;
+    // Bind the runtime to THIS turn's target actor before flipping `running`,
+    // so quiescence/snapshot/activeTurns (which read `w.actor` only while
+    // running) always report the actor actually executing.
+    w.actor = item.actor;
     // Claim `running=true` BEFORE the async hop into runTurn AND clear
     // it AFTER runTurn fully returns (including its post-turn enqueue).
     // Why not let runTurn's finally clear it: there's a sync window
@@ -1095,6 +1250,18 @@ async function runWorkerLoop(state: CidState, w: WorkerState): Promise<void> {
       await runTurn(state, w, item);
     } catch (err) {
       log.error(`worker turn failed cid=${w.cid} actor=${w.actor.id}: ${(err as Error).message}`);
+      // Deterministic termination: an unexpected throw means runTurn skipped its
+      // normal terminal emit (the persist `turn_end` message / `turn_silent`).
+      // Without a terminal signal the renderer's in-progress placeholder for this
+      // actor never clears and shows a stuck "thinking" bubble until reload. Emit
+      // turn_silent here so the placeholder always resolves; it's safe if a
+      // terminal was already emitted (the renderer clears idempotently), and the
+      // post-finally `_syncStateStatus` below reconciles conversation status.
+      try {
+        emit(state, { type: 'turn_silent', cid: w.cid, actor: item.actor.id, turn_id: item.turnId });
+      } catch (emitErr) {
+        log.warn(`turn_silent after worker-turn failure failed cid=${w.cid}: ${(emitErr as Error).message}`);
+      }
     } finally {
       w.currentTurnId = null;
       w.currentTurnOrder = null;
@@ -1122,10 +1289,45 @@ async function runWorkerLoop(state: CidState, w: WorkerState): Promise<void> {
   }
 }
 
+/** interrupt-steer (G9): pull pending USER messages aimed at the running actor
+ *  off the FIFO so the runner can fold them into the current run (as user turns)
+ *  instead of running them as a separate follow-up turn. Only plain text-only
+ *  user messages are folded — items WITH attachments stay queued so their
+ *  attachment manifest is built normally on their own turn; dispatches, nested
+ *  sub-runs, and messages for other actors are left untouched. Mutates `w.queue`
+ *  and returns the folded LLM payloads in FIFO order. Synchronous: the runner
+ *  calls it at a tool-loop boundary between awaits (Node single-thread → no
+ *  race with enqueue/the worker loop). Exported for focused unit tests. */
+export function drainSteerInto(w: WorkerState, actor: Actor): string[] {
+  const folded: string[] = [];
+  for (let i = 0; i < w.queue.length; ) {
+    const q = w.queue[i];
+    if (
+      !q.nested
+      && q.fromActorId === USER_ID
+      && q.actor.id === actor.id
+      && !(q.attachments && q.attachments.length)
+    ) {
+      folded.push(q.llmPayload);
+      w.queue.splice(i, 1);
+    } else {
+      i += 1;
+    }
+  }
+  if (folded.length) {
+    log.info(`interrupt-steer: folding ${folded.length} queued user message(s) into cid=${w.cid} actor=${actor.id}`);
+  }
+  return folded;
+}
+
 async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promise<void> {
   const { uid, cid, actor } = w;
   const turnStartedAt = Date.now();
 
+  // Loop bookkeeping (running flag, in-flight marker, turn-start log) is the
+  // scheduler's; the reusable turn body lives in `runActorTurn`. The current
+  // loop ignores the returned result — it's there for G8d's nested dispatch
+  // path, which runs an actor turn in-process and reads back text/produced.
   w.running = true;
   w.abortController = new AbortController();
   await _syncStateStatus(state, /*forceRunning*/ true);
@@ -1133,6 +1335,35 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   await emitStateChanged(state);
   log.info(`turn-start user=${uid} cid=${cid} actor=${actor.id} kind=${actor.kind} turn=${item.turnId} fromMsg=${item.msgId} from=${item.fromActorId}`);
 
+  await runActorTurn(state, w, item, turnStartedAt);
+}
+
+/** Result of one actor turn. `early` = a pre-stream guard already handled the
+ *  turn (emitted its own bubble + cleared in-flight) and the caller must do
+ *  nothing more. `completed` carries the turn's synthesized output: G8d's
+ *  dispatch tool runs an actor turn as a nested sub-run and reads `text` /
+ *  `produced` to hand back to its caller; the top-level loop ignores it. */
+type ActorTurnResult =
+  | { kind: 'early' }
+  | {
+      kind: 'completed';
+      text: string;
+      produced: string[];
+      outcome: planExecutor.TurnOutcome;
+      persistedMsg: GroupMessage | null;
+      errText?: string;
+    };
+
+// One actor turn: per-role prompt/tools, model (or CLI agent) stream,
+// structured-output parsing, visible-bubble persistence, and (still, until
+// G8d step 3) handback / dispatch flush / ephemeral cleanup. See charter §5.
+async function runActorTurn(
+  state: CidState,
+  w: WorkerState,
+  item: QueueItem,
+  turnStartedAt: number,
+): Promise<ActorTurnResult> {
+  const { uid, cid, actor } = w;
   const sessionId = actorSessionId(cid, actor);
   const isCommander = actor.kind === 'commander';
   // Per-conv subdir under the user's root workspace — keeps repeat
@@ -1155,10 +1386,10 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     if (typeof _pid === 'string' && _pid) turnProjectId = _pid;
   } catch { /* default scope */ }
 
-  // Project bindings (strict scope of agents/skills visible to the LLM).
+  // Project bindings (strict scope of agents visible to the commander LLM).
   // `null` = orphan conversation OR stale projectId — falls back to legacy
   // global visibility. Resolved once per turn alongside the workspace
-  // resolver and threaded into commander prompt + agent skillList. See
+  // resolver and threaded into the commander prompt. See
   // CLAUDE.md §6: project scope is the outer intersection BEFORE the 4
   // enable-filter sites; do not add a 5th.
   let turnProjectScope: import('../projects').ProjectBindings | null = null;
@@ -1269,29 +1500,51 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
         text: reply,
         forceTo: [USER_ID],
         turn_end: true,
-        turn_id: item.turnId,
-        ...(typeof item.triggered_step === 'number' ? { triggered_step: item.triggered_step } : {}),
-      });
+        turn_id: item.turnId,      });
       await _syncStateStatus(state);
       log.info(`turn-end user=${uid} cid=${cid} actor=${actor.id} ms=${Date.now() - turnStartedAt} outcome=disabled_skill_request`);
-      return;
+      return { kind: 'early' };
     }
   }
 
   // Build system prompt + extra tools per role.
   let systemPrompt: string;
   let extraTools: AgentTool[] = [];
-  let skillList: string[] | undefined;
-  // CLI-backed agents fetch the spec but skip systemPrompt / skillList /
-  // extraTools — the LLM stream is replaced below by `runCliAgentTurn`.
+  // CLI-backed agents fetch the spec but skip systemPrompt and extraTools;
+  // the LLM stream is replaced below by `runCliAgentTurn`.
   // Hoisted here so the branch below can read it without re-fetching.
   let cliAgent: import('../agents').Agent | null = null;
   let actorInteractive = false;
+  // Commander loop bubbles: split a commander turn into reasoning segments at
+  // each VISIBLE dispatch boundary. `flush` is wired up after `streamingText`
+  // exists (below); the dispatch tools call it via `onVisibleDispatch`.
+  const segState: { segStart: number; seg: number; flushedAny: boolean; flush: () => Promise<void> } =
+    { segStart: 0, seg: 0, flushedAny: false, flush: async () => {} };
   if (isCommander) {
     systemPrompt = await buildCommanderSystemPrompt(uid, cid, turnProjectScope?.agents ?? null);
-    extraTools = await buildCommanderExtraTools(state, w, item.attachments, turnProjectId);
-    // skillList stays undefined for commander — every skill is globally
-    // visible (skills are NOT project-scoped this round; see CLAUDE.md §6).
+    extraTools = await buildCommanderExtraTools(
+      state,
+      w,
+      item.llmPayload,
+      item.attachments,
+      turnProjectId,
+      () => segState.flush(),
+    );
+    // Commander and in-process agents intentionally share skill visibility:
+    // no per-agent runtime skill filter; per-user disabled skills still gate
+    // the rendered block and direct reads.
+  } else if (actor.kind === 'worker') {
+    // G8b ephemeral worker — no agent.json. Synthesize a minimal worker config
+    // and reuse the agent-in-group prompt (duck-typed). The default tool set
+    // (files / shell / kb / …) comes from the runner like any LLM turn; no
+    // extraTools, no skills, no inputs/forms (headless — see WORKER_WORKFLOW).
+    systemPrompt = await buildAgentInGroupSystemPrompt(uid, {
+      agent_id: actor.id,
+      name: actor.name || 'Worker',
+      description: 'Ephemeral sub-task worker spun up by the commander.',
+      workflow: WORKER_WORKFLOW,
+      interactive: false,
+    }, workingDir);
   } else {
     const agent = await agentsFeat.getAgent(actor.id);
     if (!agent) {
@@ -1311,14 +1564,12 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
         text: errBubble,
         forceTo: [USER_ID],
         turn_end: true,
-        turn_id: item.turnId,
-        ...(typeof item.triggered_step === 'number' ? { triggered_step: item.triggered_step } : {}),
-      });
+        turn_id: item.turnId,      });
       await markInFlight(uid, cid, actor.id, false);
       await emitStateChanged(state);
       // Note: runWorkerLoop owns w.running — its finally clears the flag
       // when this returns. We DON'T touch it here.
-      return;
+      return { kind: 'early' };
     }
     actorInteractive = agent.interactive === true;
     if (agentsFeat.isCliAgent(agent)) {
@@ -1326,10 +1577,10 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       systemPrompt = ''; // unused on CLI path
     } else {
       systemPrompt = await buildAgentInGroupSystemPrompt(uid, agent, workingDir);
-      // Runtime skills are the intersection of the agent's whitelist and
-      // workflow references. A broad whitelist is authoring metadata; only
-      // skills the workflow actually names should reach the prompt.
-      skillList = await _runtimeSkillListForAgent(agent);
+      // In-process agents use the same skill surface as the commander. The
+      // agent's authored skill_list remains metadata for editing/compat, not
+      // a runtime restriction.
+      extraTools = [buildSkillSearchTool(uid)];
     }
   }
 
@@ -1381,6 +1632,33 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   let streamingText = '';
   let errText: string | null = null;
   let aborted = false;
+  // Wire the commander segment flush now that `streamingText` exists. Called
+  // from a visible-dispatch tool BEFORE the dispatched agent runs, so the
+  // commander's reasoning since the last flush is persisted as its own `seg`
+  // bubble (ts < the agent's), and the post-handback synthesis becomes the next
+  // segment. Empty pre-dispatch text → no bubble, but the cursor still advances
+  // so the synthesis is a distinct segment. `forceTo:[user]` keeps the segment
+  // from re-dispatching agents named in the prose.
+  segState.flush = async () => {
+    const text = streamingText.slice(segState.segStart).trim();
+    segState.segStart = streamingText.length;
+    if (!text) return;
+    const segIndex = segState.seg;
+    segState.seg += 1;
+    segState.flushedAny = true;
+    // Files produced up to this boundary belong to THIS segment's bubble. Attach
+    // + drain `turnProduced` so the end-of-turn message doesn't re-surface them
+    // as a trailing bubble. Critical for `hand_off_to`: its narration seg carries
+    // the produced chip and the end-of-turn then has no tail + no side-effect, so
+    // it goes silent instead of persisting an empty commander bubble.
+    const segProduced = existingProducedFiles(turnProduced);
+    for (const p of segProduced) turnProduced.delete(p);
+    await enqueue({
+      uid, cid, fromActorId: actor.id, text,
+      forceTo: [USER_ID], turn_id: item.turnId, seg: segIndex,
+      ...(segProduced.length ? { produced: segProduced } : {}),
+    });
+  };
 
   // activityEvents = count of non-error, non-final, non-done events the
   // LLM stream emitted. Used by plan_executor.onTurnFinished to distinguish
@@ -1405,11 +1683,10 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // chip, so the sandbox-level lock keeps the LLM honest even if the
   // prompt strays. Keep these roots aligned with the trusted skill registry.
   const skillRoots = [userMarketplaceSkillsDir(uid), userSkillsDir(uid)];
-  // OPEN-tier roots (external packages + global skill dirs) are rendered in
-  // the commander's skills block only (plan D5), so the matching read scope
-  // is commander-only too — agent workers never see those ROOT paths and
-  // must not be able to read them either.
-  if (isCommander) {
+  // OPEN-tier roots (external packages + global skill dirs) are rendered for
+  // commander + in-process agent sessions, so their read scope follows the
+  // same actor set.
+  if (isCommander || actor.kind === 'agent') {
     try { skillRoots.push(...openSkillReadRoots(uid)); }
     catch (err) { log.warn(`open skill read roots unavailable: ${(err as Error).message}`); }
   }
@@ -1523,6 +1800,13 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
         onSkillInvoked: (id, sys, trig) => skillBuffer.recordInvoked(id, sys, trig),
         cacheRetention: 'short',
         abortSignal: w.abortController.signal,
+        ...(actor.kind === 'commander' ? { maxToolLoops: COMMANDER_MAX_TOOL_LOOPS } : {}),
+        ...(item.nested ? { nested: true } : {}),
+        // interrupt-steer (G9): on the top-level turn, fold user messages the
+        // user sends mid-run into THIS run. Nested sub-runs (dispatched
+        // workers) get no steer — the user can't address a worker, and their
+        // synthetic queue is empty anyway.
+        ...(item.nested ? {} : { drainSteer: () => drainSteerInto(w, actor) }),
         ...(turnToolExtraRoots.length ? { extraRoots: turnToolExtraRoots } : {}),
         readOnlyExtraRoots: [
           ...skillRoots,
@@ -1530,11 +1814,8 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
         ],
         ...(turnImages.length ? { images: turnImages } : {}),
         ...(extraTools.length ? { extraTools } : {}),
-        ...(skillList !== undefined ? { skillList } : {}),
-        // Skills are NOT project-scoped this round — every conversation sees
-        // every skill (gated only by per-user enable + agent.skill_list).
-        // The runner's `projectAllowedSkillIds` plumbing is preserved for
-        // a future re-enable; bus just doesn't pass it.
+        // Skills are NOT project-scoped or agent-scoped this round — every
+        // group-chat LLM actor sees the same enabled skill surface.
       })) {
       // Stream events → process channel.
       if (ev.type === 'final') {
@@ -1548,11 +1829,18 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
         if (typeof piece === 'string') streamingText += piece;
         activityEvents += 1;
         void touchActivity(uid, cid);
-        emit(state, {
-          type: 'process', cid, actor: actor.id,
-          turn_id: item.turnId,
-          data: ev as unknown as Record<string, unknown>,
-        });
+        // Anonymous workers are the commander's internal hands (silent, handed
+        // back via the dispatch tool result), so their stream is NOT surfaced
+        // to the UI — otherwise each one renders as a stray "智能体" bubble with
+        // a process trail. The commander's own turn is the only visible one.
+        // Named agents (kind:'agent') still stream (Option B visible bubble).
+        if (actor.kind !== 'worker') {
+          emit(state, {
+            type: 'process', cid, actor: actor.id,
+            turn_id: item.turnId,
+            data: ev as unknown as Record<string, unknown>,
+          });
+        }
       } else if (ev.type === 'error') {
         // Capture so onTurnFinished can decide between surfacing a ⚠️
         // failure bubble vs treating 'empty response' as a tool-only turn.
@@ -1562,6 +1850,13 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       } else if (ev.type !== 'done') {
         activityEvents += 1;
         void touchActivity(uid, cid);
+        // A dispatch tool's result IS the worker's full output (the handback).
+        // The commander still gets it on its tool_result channel; but in the
+        // user-facing process rail we redact it so worker output never shows
+        // there (worker process is already suppressed). Mutates the event in
+        // place so both the persisted processItems and the live emit are
+        // redacted. See `_redactDispatchToolResult`.
+        if (ev.type === 'event') _redactDispatchToolResult((ev as { event?: unknown }).event);
         if (processItems.length < MAX_PROCESS_ITEMS_PER_TURN) {
           if (ev.type === 'progress') {
             const text = (ev as { text?: string }).text;
@@ -1573,11 +1868,14 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
             }
           }
         }
-        emit(state, {
-          type: 'process', cid, actor: actor.id,
-          turn_id: item.turnId,
-          data: ev as unknown as Record<string, unknown>,
-        });
+        // See the delta branch: anonymous workers don't surface to the UI.
+        if (actor.kind !== 'worker') {
+          emit(state, {
+            type: 'process', cid, actor: actor.id,
+            turn_id: item.turnId,
+            data: ev as unknown as Record<string, unknown>,
+          });
+        }
       }
     }
   } catch (err) {
@@ -1608,10 +1906,7 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
 
   let workingText = finalText || '';
   if (turnSyncConflictResolution.length && workingText && !errText && !aborted) {
-    const results = extractSyncConflictResults(workingText);
-    if (results.length) {
-      log.warn(`sync conflict result ignored in open-source build cid=${cid}: sync feature is stripped`);
-    }
+    void extractSyncConflictResults(workingText);
   }
 
   // ── Post-stream parsing (pure data extraction; no decisions) ──────────
@@ -1620,6 +1915,14 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   // failed) live in plan_executor.onTurnFinished.
   let form: ChatFormPayload | undefined;
   let planInteraction: PlanInteractionStatus | undefined;
+  let resumeAfterHandback: {
+    ledger: NonNullable<StateFile['orchestration_ledger']>;
+    agentResult: string;
+  } | null = null;
+  let resumeAfterForm: {
+    ledger: NonNullable<StateFile['orchestration_ledger']>;
+    agentResult: string;
+  } | null = null;
   const createdAgents: Array<{ agent_id: string; name: string; kind: 'created' | 'updated' }> = [];
   const createdSkills: Array<{ skill_id: string; name: string; kind: 'created' | 'updated' }> = [];
 
@@ -1632,6 +1935,19 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   }
 
   if (actor.kind === 'agent' && workingText) {
+    // Hand-back: an agent holding the floor returns control to the commander.
+    // Strip the marker for display; reset the floor only if THIS agent actually
+    // holds it (a non-floor agent's marker is a no-op, never steals the floor).
+    const hb = extractHandbackFromFinal(workingText);
+    if (hb.handback) {
+      workingText = hb.cleanText;
+      try {
+        const cur = (await readState(uid, cid)).active_recipient || '';
+        if (cur === actor.id) await setActiveRecipient(uid, cid, COMMANDER_ID);
+        const ledger = await takeOrchestrationLedgerForAgent(uid, cid, actor.id);
+        if (ledger) resumeAfterHandback = { ledger, agentResult: workingText };
+      } catch (err) { log.warn(`handback floor reset failed cid=${cid}: ${(err as Error).message}`); }
+    }
     const r = extractFormFromFinal(workingText, actor.id);
     if (r.form) {
       workingText = r.cleanText;
@@ -1643,7 +1959,42 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
         submitted: false,
       };
     }
-  } else if (isCommander && workingText) {
+    const submittedForm = decodeSubmission(item.llmPayload);
+    if (submittedForm) {
+      try {
+        const cur = await readState(uid, cid);
+        const ledger = cur.orchestration_ledger;
+        if (
+          ledger
+          && ledger.status === 'waiting_for_form'
+          && ledger.owner_agent_id === actor.id
+          && (!ledger.form_id || ledger.form_id === submittedForm.form_id)
+        ) {
+          if (form) {
+            await setOrchestrationLedger(uid, cid, {
+              ...ledger,
+              status: 'waiting_for_form',
+              blocked_on: 'agent_form',
+              form_id: form.form_id,
+              handoff_message: ledger.handoff_message,
+              resume_instruction: ledger.resume_instruction,
+            });
+          } else {
+            const taken = await takeOrchestrationLedgerForForm(uid, cid, actor.id, submittedForm.form_id);
+            if (taken) resumeAfterForm = { ledger: taken, agentResult: workingText };
+          }
+        }
+      } catch (err) {
+        log.warn(`form ledger update/resume failed cid=${cid} actor=${actor.id}: ${(err as Error).message}`);
+      }
+    }
+  } else if (isCommander && workingText && !aborted) {
+    // `!aborted`: a user Stop is the single stop path — never apply container
+    // mutations (create/overwrite agent, write+validate skill, CRUD auto-task)
+    // from a salvaged partial reply, even if a complete container was emitted
+    // before Stop. Mirrors the sync-conflict guard above. The raw container
+    // markup left in workingText is stripped on display by the renderer's
+    // _stripSurvivingStructuralBlocks, so the aborted bubble stays clean.
     const r = extractAgentFieldBlocks(workingText);
     if (r.blocks.length) {
       workingText = r.cleanText;
@@ -1664,7 +2015,13 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
             } else if (agentsFeat.isCliAgent(target)) {
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ External agents can only be edited from the right-hand detail panel.</span>`;
             } else {
-              // `updateAgentSpec` dispatches only custom agents in the open-source build.
+              // `updateAgentSpec` dispatches: custom → updateCustomAgent,
+              // marketplace + dev → agents_dev.updateBuiltinAgentSpec
+              // (which writes the local marketplace install dir). The
+              // dev-env source guard above is what makes the marketplace
+              // branch reachable; the direct `updateCustomAgent` call this
+              // replaces would short-circuit to null because the custom
+              // agent.json doesn't exist for marketplace ids.
               const updated = await agentsFeat.updateAgentSpec(editId, fields);
               if (updated) {
                 createdAgents.push({ agent_id: updated.agent_id, name: updated.name, kind: 'updated' });
@@ -1807,21 +2164,9 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     state.producedPaths.delete(stalePath);
   });
 
-  // ── Trigger derivation ───────────────────────────────────────────────
-  // Map the raw `triggered_step` (kept for back-compat with the executor
-  // pushCommanderTurn path) to the structured TurnTrigger consumed by
-  // onTurnFinished.
-  const trigger: planExecutor.TurnTrigger =
-    item.triggered_step === -1
-      ? { kind: 'plan_synth' }
-    : typeof item.triggered_step === 'number'
-      ? { kind: 'plan_step', step_index: item.triggered_step }
-    : { kind: 'user_direct' };
-
   // ── Single hand-off to plan_executor ─────────────────────────────────
-  // Executor decides: state transitions, downstream dispatch, terminal
-  // signaling, AND whether bus should persist a user-visible bubble.
-  // Bus is now pure I/O: it executes the returned outcome and that's it.
+  // It decides only whether the bus should persist a user-visible bubble
+  // (and what it carries). Bus is pure I/O: it executes the returned outcome.
   let outcome: planExecutor.TurnOutcome = { kind: 'silent' };
   try {
     outcome = await planExecutor.onTurnFinished(uid, cid, {
@@ -1834,7 +2179,6 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       produced,
       ...(createdAgents.length ? { createdAgents } : {}),
       ...(createdSkills.length ? { createdSkills } : {}),
-      trigger,
       activityEvents,
     });
   } catch (err) {
@@ -1850,55 +2194,6 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       ...(createdSkills.length ? { createdSkills } : {}),
     };
   }
-  const transitionedPlanStep = outcome.planTransition?.step_index;
-
-  // Merge a staged plan announcement into commander's end-of-turn message
-  // so the thinking rail (placeholder) and the plan card finalize into a
-  // single bubble. Promotes a silent commander turn to persist when the
-  // only thing the user needs to see IS the plan.
-  const pendingPlan = w.pendingPlanAnnouncement;
-  w.pendingPlanAnnouncement = undefined;
-  if (pendingPlan && actor.kind === 'commander') {
-    if (outcome.kind === 'persist') {
-      const merged = outcome.text && outcome.text.trim()
-        ? `${outcome.text}\n\n${pendingPlan}`
-        : pendingPlan;
-      outcome = { ...outcome, text: merged };
-    } else {
-      outcome = { kind: 'persist', text: pendingPlan };
-    }
-  }
-
-  // Same UX rationale as the plan announcement merge: a commander turn
-  // that ONLY emitted dispatch_to(s) leaves an empty bubble below the
-  // process rail, which reads as "broken" to the user. Surface a brief
-  // summary line so the bubble is informative. Skipped when there's
-  // already a body (the LLM wrote prose alongside the dispatch — common
-  // for fallback flows), and when the bubble already carries the plan
-  // card from the merge above.
-  // "Visually empty" — also strips zero-width chars some LLMs emit as the
-  // body of a tool-only turn to dodge the framework's "empty response"
-  // detection (we've seen U+200B as a single-char body alongside a
-  // dispatch_to call). `.trim()` alone wouldn't catch them.
-  // U+200B–U+200D (ZWSP / ZWNJ / ZWJ) + U+FEFF (BOM).
-  const _isVisuallyEmpty = (s: string | undefined): boolean =>
-    !s || !s.replace(/[​-‍﻿]/g, '').trim();
-  if (actor.kind === 'commander'
-      && w.pendingDispatches && w.pendingDispatches.length
-      && outcome.kind === 'persist'
-      && _isVisuallyEmpty(outcome.text)) {
-    const tags: string[] = [];
-    for (const d of w.pendingDispatches) {
-      let name = d.to;
-      try {
-        const ag = await agentsFeat.getAgent(d.to);
-        if (ag && (ag as any).name) name = (ag as any).name;
-      } catch { /* fall back to raw id */ }
-      tags.push(buildMention(name));
-    }
-    outcome = { ...outcome, text: t('chat.commander_dispatch_only', { agents: tags.join(', ') }) };
-  }
-
   // Marketplace install requests are visible side effects of a commander
   // turn. They are staged by `marketplace_request_install` and attached to
   // the final message so the renderer can show user-confirmation cards. If
@@ -1937,6 +2232,25 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     outcome = { kind: 'persist', text: '' };
   }
 
+  // Commander loop bubbles: when this turn was split at visible-dispatch
+  // boundaries, the pre-dispatch reasoning is already persisted as its own
+  // `seg` bubbles. The end-of-turn message must carry ONLY the final segment
+  // (text streamed since the last flush) — else reload duplicates earlier
+  // segments. If that tail is empty and nothing else needs surfacing, go silent
+  // so no empty commander bubble is persisted.
+  if (segState.flushedAny && outcome.kind === 'persist') {
+    const tail = streamingText.slice(segState.segStart);
+    const hasSide = !!(
+      outcome.form
+      || (outcome.produced && outcome.produced.length)
+      || (outcome.createdAgents && outcome.createdAgents.length)
+      || (outcome.createdSkills && outcome.createdSkills.length)
+      || turnArtifacts.length
+      || turnMarketplaceRequests.length
+    );
+    outcome = (!tail.trim() && !hasSide) ? { kind: 'silent' } : { ...outcome, text: tail };
+  }
+
   if (aborted) {
     if (outcome.kind === 'silent' && processItems.length > 0) {
       outcome = { kind: 'persist', text: '' };
@@ -1947,6 +2261,14 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
         ? `${outcome.text}\n\n${aborted}` : aborted;
       outcome = { ...outcome, text: body };
     }
+  }
+
+  // G8b ephemeral worker: produces NO user-visible bubble. Its entire output
+  // is handed back to the commander below (read from `workingText`), so force
+  // silent here to skip the user-facing persist. The worker is internal — the
+  // user sees the commander's synthesis, not the raw worker turn.
+  if (actor.kind === 'worker') {
+    outcome = { kind: 'silent' };
   }
 
   let persistedMsg: GroupMessage | null = null;
@@ -1965,9 +2287,10 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
         ? { artifacts: turnArtifacts.map((a) => ({ id: a.id, title: a.title, agent_id: actor.id })) }
         : {}),
       ...(turnMarketplaceRequests.length ? { marketplace_requests: turnMarketplaceRequests } : {}),
-      ...(pendingPlan && actor.kind === 'commander'
-        ? { plan_announcement: true, forceTo: [USER_ID] } : {}),
       ...(processItems.length ? { process: processItems } : {}),
+      // Final segment index when this turn was split at visible-dispatch
+      // boundaries; lets the renderer finalize the last per-segment placeholder.
+      ...(segState.flushedAny ? { seg: segState.seg } : {}),
       // Mark this as the actor's official end-of-turn message — renderer
       // consumes the streaming placeholder + finalizes in place. Without
       // this flag, mid-turn tool-emitted messages (plan_executor's
@@ -1975,87 +2298,30 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
       turn_end: true,
       turn_id: item.turnId,
     });
-    if (typeof transitionedPlanStep === 'number') {
-      try {
-        await planExecutor.recordPersistedStepMessage(uid, cid, transitionedPlanStep, {
-          id: persistedMsg.id,
-          text: persistedMsg.text || '',
-          files: persistedMsg.produced || [],
-        });
-      } catch (err) {
-        log.warn(`plan-step output message backfill failed cid=${cid} step=${transitionedPlanStep}: ${(err as Error).message}`);
-      }
-    }
-  } else if (outcome.kind === 'silent') {
+  } else if (outcome.kind === 'silent' && actor.kind !== 'worker') {
     // outcome=silent → bus is NOT going to enqueue a message for this turn.
     // Any placeholder the renderer parked for this actor (e.g. a fresh one
     // created by post-tool process events after the original was consumed
     // by a mid-turn message) needs an explicit signal to clean up; otherwise
     // a "thinking + process info" bubble lingers, vanishing only on
-    // page refresh.
+    // page refresh. Anonymous workers never emit UI events (see the stream
+    // branch), so they have no placeholder to clean — skip.
     emit(state, { type: 'turn_silent', cid, actor: actor.id, turn_id: item.turnId });
   }
 
-  // Reconcile only after this turn has fully settled in chat history. This
-  // keeps downstream plan dispatches and any completion fallback from
-  // creating live placeholders before the step's own final message appears.
-  if (typeof transitionedPlanStep === 'number') {
+  // Ephemeral worker (anonymous run_worker, run via runNestedDispatch) is
+  // one-shot: purge its throwaway session so it doesn't accumulate on disk.
+  // It was never a roster member nor in the worker map (synthetic WorkerState),
+  // so the map delete is a defensive no-op for any legacy path.
+  if (actor.kind === 'worker') {
+    w.terminated = true;
+    state.workers.delete(actor.id);
     try {
-      await planExecutor.reconcileAfterStepTransition(uid, cid);
+      const ss = await import('../../model/core-agent/session-store');
+      ss.evictSession(sessionId);
+      ss.deleteSessionFile(sessionId);
     } catch (err) {
-      log.warn(`post-persist plan reconcile failed cid=${cid} step=${transitionedPlanStep}: ${(err as Error).message}`);
-    }
-  }
-
-  // Deferred plan dispatch: if commander wrote a fresh plan via `plan_set`
-  // this turn, its first wave of ready steps is dispatched HERE — after
-  // commander's own turn fully settled (announcement + final emitted,
-  // placeholder finalized or cleaned). This avoids the "agent worker
-  // starts while commander is still streaming" overlap that confused the
-  // visual order. `reconcile` is idempotent + mutex-serialized, so for
-  // turns that didn't touch the plan it's a cheap no-op.
-  // Skipped for plan_step / plan_synth turns — those already ran their
-  // own reconcileAfterStepTransition inside `onTurnFinished`; a second
-  // reconcile here is redundant.
-  if (actor.kind === 'commander' && trigger.kind === 'user_direct') {
-    try {
-      await planExecutor.reconcile(uid, cid);
-    } catch (err) {
-      log.warn(`deferred reconcile threw cid=${cid}: ${(err as Error).message}`);
-    }
-  }
-
-  // Flush any `dispatch_to` calls staged during commander's turn. Same
-  // anti-jump-the-gun reasoning as the plan reconcile above: recipient workers are
-  // only woken after commander's own turn fully settled (text persisted +
-  // placeholder cleaned), so the user sees commander's reply before any
-  // dispatched agent's reply. See WorkerState.pendingDispatches.
-  if (actor.kind === 'commander' && w.pendingDispatches && w.pendingDispatches.length) {
-    const pending = w.pendingDispatches;
-    w.pendingDispatches = undefined;
-    // Inherit the commander turn's user-uploaded attachments so the recipient
-    // worker sees the same image / file bytes the commander saw. Without this
-    // a worker honestly answers "I can't see the image" because turnImages
-    // only fires when `item.attachments` is populated. Plan-step dispatches
-    // get the same inheritance via PlanFile.initial_attachments (persisted
-    // because steps live across worker turn boundaries); dispatch_to is one-
-    // shot so per-turn flush is enough.
-    const inheritedAttachments = item.attachments;
-    for (const d of pending) {
-      try {
-        await enqueue({
-          uid, cid,
-          fromActorId: actor.id,
-          text: d.message,
-          forceTo: [d.to],
-          dispatch: true,
-          ...(inheritedAttachments && inheritedAttachments.length
-            ? { attachments: inheritedAttachments }
-            : {}),
-        });
-      } catch (err) {
-        log.warn(`dispatch_to flush failed cid=${cid} to=${d.to}: ${(err as Error).message}`);
-      }
+      log.warn(`ephemeral worker cleanup failed cid=${cid} worker=${actor.id}: ${(err as Error).message}`);
     }
   }
 
@@ -2087,6 +2353,36 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     });
   }
 
+  if (resumeAfterHandback && actor.kind === 'agent') {
+    await _enqueueOrchestrationResumeFromAgent({
+      state,
+      fromActorId: actor.id,
+      fromActorName: actor.name,
+      ledger: resumeAfterHandback.ledger,
+      agentResult: resumeAfterHandback.agentResult,
+    });
+  }
+  if (resumeAfterForm && actor.kind === 'agent') {
+    await _enqueueOrchestrationResumeFromAgent({
+      state,
+      fromActorId: actor.id,
+      fromActorName: actor.name,
+      ledger: resumeAfterForm.ledger,
+      agentResult: resumeAfterForm.agentResult,
+    });
+  }
+
+  if (isCommander && item.fromActorId === USER_ID) {
+    try {
+      const cur = await readState(uid, cid);
+      if (cur.orchestration_ledger?.status === 'interrupted') {
+        await clearOrchestrationLedger(uid, cid);
+      }
+    } catch (err) {
+      log.warn(`interrupted ledger cleanup failed cid=${cid}: ${(err as Error).message}`);
+    }
+  }
+
   await _syncStateStatus(state);
   log.info(
     `turn-end user=${uid} cid=${cid} actor=${actor.id} ms=${Date.now() - turnStartedAt}`
@@ -2096,10 +2392,11 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
     + (createdAgents.length ? ` created_agents=${createdAgents.map(a => a.agent_id).join(',')}` : '')
     + (createdSkills.length ? ` created_skills=${createdSkills.map(s => s.skill_id).join(',')}` : '')
     + (produced.length ? ` produced=${produced.length}` : '')
-    + (item.triggered_step !== undefined ? ` step=${item.triggered_step}` : '')
     + (errText ? ` err=${errText}` : '')
     + (aborted ? ' aborted=1' : ''),
   );
+
+  return { kind: 'completed', text: workingText, produced, outcome, persistedMsg, errText: errText || undefined };
 }
 
 // ── System prompts ───────────────────────────────────────────────────────
@@ -2110,7 +2407,6 @@ async function buildCommanderSystemPrompt(
   allowedAgentIds?: readonly string[] | null,
 ): Promise<string> {
   const { prompts } = await import('../../prompts/loader');
-  const plan = await readPlan(uid, cid);
   const allAgentsList = await buildAgentsIndexBlock(uid, allowedAgentIds);
   const { getConversationWorkspacePath } = await import('./conv_workspace');
   const workingDir = await getConversationWorkspacePath(uid, cid);
@@ -2137,9 +2433,10 @@ async function buildCommanderSystemPrompt(
       return pkgs.buildEnvSummaryLine(uid);
     } catch { return 'No external package CLIs installed.'; }
   })();
+  const stateFile = await readState(uid, cid).catch(() => null);
   const main = prompts.load('chat_commander', {
     agents_index: allAgentsList,
-    plan_state: formatPlanForPrompt(plan),
+    orchestration_state: _buildOrchestrationStateBlock(stateFile?.orchestration_ledger),
     os: process.platform === 'darwin' ? 'macOS' : process.platform === 'win32' ? 'Windows' : process.platform,
     working_dir: workingDir,
     shell_hint: process.platform === 'win32'
@@ -2351,6 +2648,218 @@ function _toolJson(data: unknown): { content: string } {
   return { content: JSON.stringify(data) };
 }
 
+/** Resolve a dispatch target token (agent name / agent_id / `commander` /
+ * `user` aliases) → canonical actor id, or null if nothing enabled matches.
+ * Shared by `dispatch_to` and `run_worker` so both honour the same name-map
+ * rules the router uses. */
+async function resolveDispatchTarget(cid: string, toRaw: string): Promise<string | null> {
+  const key = toRaw.toLowerCase().replace(/\s+/g, '');
+  if (key === 'commander' || key === '指挥官') return COMMANDER_ID;
+  if (key === 'user' || key === '用户') return USER_ID;
+  try {
+    const all = await agentsFeat.listAgents();
+    for (const a of all) {
+      if (a.enabled === false) continue;
+      if (a.name && a.name.toLowerCase().replace(/\s+/g, '') === key) return a.agent_id;
+    }
+  } catch (err) {
+    log.warn(`resolveDispatchTarget listAgents failed cid=${cid}: ${(err as Error).message}`);
+  }
+  if (safeId(toRaw)) {
+    try {
+      const ag = await agentsFeat.getAgent(toRaw);
+      if (ag && (ag as any).enabled !== false) return toRaw;
+    } catch { /* ignore */ }
+  }
+  return null;
+}
+
+/** Dispatch tools whose RESULT is a worker/agent's full reply (the handback). */
+const _DISPATCH_TOOL_NAMES = new Set(['run_worker', 'dispatch_to']);
+
+/** Redact a dispatch tool's result from the user-facing process rail. The
+ *  result is the worker's full output, which the commander synthesises — the
+ *  user should never see raw worker output in the rail (worker process is
+ *  already suppressed; this is the tool-result line). The commander STILL gets
+ *  the real result on its own tool_result channel; this only scrubs the
+ *  display-side `result_preview` on the tool 'end' event. Mutates in place (the
+ *  event object is per-iteration display data, not the handback). Exported for
+ *  fixture tests (matching dispatch results vs look-alike non-dispatch tools). */
+export function _redactDispatchToolResult(inner: unknown): void {
+  const e = inner as { stream?: string; data?: Record<string, unknown> } | undefined;
+  const d = e?.data;
+  if (e?.stream !== 'tool' || !d) return;
+  const name = String((d.name as string) || (d.toolName as string) || '');
+  const phase = d.phase ?? d.status;
+  if ((phase === 'end' || phase === 'result') && _DISPATCH_TOOL_NAMES.has(name)) {
+    if (d.result_preview != null) d.result_preview = t('chat.dispatch_result_hidden');
+  }
+}
+
+/** Wrap a sub-actor's reply + produced files as the `<worker-result>` block the
+ * commander reads back. Single source for both the async handback wake and the
+ * G8d in-process nested dispatch, so the format the commander parses never
+ * drifts between the two. */
+function buildWorkerResultPayload(
+  workerName: string,
+  text: string,
+  produced?: string[],
+  form?: ChatFormPayload,
+): string {
+  const files = produced && produced.length
+    ? `\n<files>\n${produced.join('\n')}\n</files>` : '';
+  const blocked = form
+    ? `\n<blocked-on-form form_id="${escapeXmlAttr(form.form_id)}" agent_id="${escapeXmlAttr(form.agent_id)}" />`
+    : '';
+  return [
+    `<worker-result from="${escapeXmlAttr(workerName)}">`,
+    text && text.trim() ? text : '(no textual reply)',
+    `${blocked}${files}</worker-result>`,
+  ].join('\n');
+}
+
+function buildWorkerErrorPayload(workerName: string, errorText: string): string {
+  const message = String(errorText || '').trim() || 'Worker failed without an error message.';
+  return [
+    `<worker-error from="${escapeXmlAttr(workerName)}">`,
+    escapeXmlText(message),
+    `</worker-error>`,
+  ].join('\n');
+}
+
+function extractBlockedFormFromWorkerResult(payload: string): { form_id: string; agent_id: string } | null {
+  const m = /<blocked-on-form\b([^>]*)\/>/i.exec(payload || '');
+  if (!m) return null;
+  const attrs = parseXmlAttrs(m[1] || '');
+  const formId = attrs.form_id || '';
+  const agentId = attrs.agent_id || '';
+  if (!/^[a-f0-9]{8,64}$/.test(formId) || !safeId(agentId)) return null;
+  return { form_id: formId, agent_id: agentId };
+}
+
+/** G8d step 3: run a dispatched sub-actor's turn IN-PROCESS, synchronously,
+ * inside the caller's (commander's) turn, and return its result as a
+ * `<worker-result>` block — the dispatch tool returns this as its tool result,
+ * so the commander's stream resumes with the sub-run's full reply in context.
+ * This is the single-layer replacement for the old stage → turn-end flush →
+ * async worker → `wakeWithWorkerResult` re-wake: the handback IS the tool
+ * result. The sub-run is `nested` (skips the global concurrency slot the caller
+ * already holds — charter §6) and chains its abort to the caller's tool signal
+ * so a group abort cascades into it. NOT registered in `state.workers`: it is a
+ * transient sub-turn, not a scheduled roster worker. */
+async function runNestedDispatch(
+  state: CidState,
+  parentSignal: AbortSignal | undefined,
+  actor: Actor,
+  task: string,
+  attachments?: string[],
+): Promise<string> {
+  // A named agent must be a roster member so its handed-back bubble renders with
+  // proper attribution. The old async dispatch path seeded this via enqueue's
+  // `to` resolution; the in-process path seeds it here. Anonymous workers
+  // (kind:'worker') are intentionally never roster members.
+  if (actor.kind === 'agent') {
+    try {
+      const added = await ensureAgentMember(state.uid, state.cid, actor.id, actor.name);
+      if (added) {
+        const refreshed = await readMembers(state.uid, state.cid);
+        const m = refreshed.actors.find((a) => a.id === actor.id);
+        if (m) emit(state, { type: 'member_joined', cid: state.cid, actor: m });
+      }
+    } catch (err) {
+      log.warn(`nested-dispatch member seed failed cid=${state.cid} agent=${actor.id}: ${(err as Error).message}`);
+    }
+  }
+  const ac = new AbortController();
+  if (parentSignal) {
+    if (parentSignal.aborted) ac.abort();
+    else parentSignal.addEventListener('abort', () => ac.abort(), { once: true });
+  }
+  // Synthetic, throwaway WorkerState — runActorTurn only reads uid/cid/actor +
+  // abortController off it on the worker path; it is never added to
+  // state.workers, so quiescence / abort enumeration / the scheduler ignore it.
+  const w: WorkerState = {
+    uid: state.uid, cid: state.cid, actor,
+    queue: [], running: true, wake: null, abortController: ac,
+    currentTurnId: null, currentTurnOrder: null, turnsThisActivation: 0, terminated: false,
+  };
+  const payload = composeLlmTurnPayload(COMMANDER_ID, {
+    id: genId12(), ts: nowIso(), from: COMMANDER_ID, to: [actor.id], text: task,
+  });
+  const item: QueueItem = {
+    actor,
+    turnId: genId12(), msgId: genId12(), fromActorId: COMMANDER_ID,
+    llmPayload: payload, nested: true,
+    ...(attachments && attachments.length ? { attachments } : {}),
+  };
+  // Bound concurrent nested dispatches: when the commander fans out several
+  // run_worker/dispatch_to calls in one turn (G4 runs them concurrently),
+  // dispatchSlots caps how many actually run at once — the bound that replaces
+  // the global slot these nested runs skip (charter §6/§9). Acquired only here
+  // (the commander dispatches; workers/agents have no dispatch tools), so it is
+  // never re-entrant → no deadlock.
+  const [, releaseDispatch] = await dispatchSlots.acquire();
+  log.info(`nested-dispatch start cid=${state.cid} worker=${actor.id} kind=${actor.kind}`);
+  // Surface a VISIBLE nested agent (dispatch_to / hand_off_to / named
+  // run_worker) as an active turn BEFORE its inference begins, so the renderer
+  // paints its "thinking" placeholder during the gap between the commander's
+  // narration and the agent's first token — instead of an empty pause. Anonymous
+  // workers (kind:'worker') stay silent (their stream is suppressed + handed
+  // back to the commander), so they are not surfaced. The bus already runs
+  // runActorTurn directly here (bypassing runTurn's markInFlight/emitStateChanged),
+  // which is exactly why no start-of-turn state_changed listed this actor before.
+  const surfaced = actor.kind === 'agent';
+  if (surfaced) {
+    state.nestedTurns.set(item.turnId, { actor: actor.id, turn_id: item.turnId, order: ++state.nextTurnOrder });
+    await emitStateChanged(state);
+  }
+  try {
+    let r: ActorTurnResult;
+    try {
+      r = await runActorTurn(state, w, item, Date.now());
+    } catch (err) {
+      const message = (err as Error).message || String(err);
+      log.warn(`nested-dispatch threw cid=${state.cid} worker=${actor.id}: ${message}`);
+      return buildWorkerErrorPayload(actor.name || actor.id, message);
+    }
+    if (r.kind !== 'completed') {
+      return buildWorkerErrorPayload(actor.name || actor.id, 'Worker turn ended before producing a result.');
+    }
+    if (r.errText) {
+      const partial = r.text && r.text.trim()
+        ? `${r.errText}\n\nPartial result:\n${r.text}`
+        : r.errText;
+      return buildWorkerErrorPayload(actor.name || actor.id, partial);
+    }
+    const text = r.text || '';
+    const produced = r.produced;
+    const form = r.outcome.kind === 'persist' ? r.outcome.form : undefined;
+    return buildWorkerResultPayload(actor.name || actor.id, text, produced, form);
+  } finally {
+    if (surfaced) {
+      // Turn ended (its bubble was already emitted + consumed the placeholder
+      // inside runActorTurn). Drop the mirror and re-emit so the commander
+      // re-enters active_turns for its post-dispatch synthesis (dispatch_to), or
+      // the renderer's sweep clears any stray empty bubble (hand_off ends here).
+      state.nestedTurns.delete(item.turnId);
+      await emitStateChanged(state);
+    }
+    releaseDispatch();
+  }
+}
+
+/** Generic role guidance for an ephemeral anonymous worker — fed as the
+ * `workflow` field of a synthesized agent config (same template var the
+ * agent-in-group prompt reads), so no new prompt file is needed. Headless: the
+ * worker has no user to ask and its reply goes back to the commander, not the
+ * chat. */
+const WORKER_WORKFLOW = [
+  'You are an ephemeral worker spun up by the commander to complete ONE bounded sub-task — you are the commander\'s hands, not an independent specialist.',
+  'The task is in the incoming message. Do it end to end using your available tools (files, shell, web, library, etc.).',
+  'There is no user in this turn: never ask a question, request input, or emit a form — if something is ambiguous, make the most reasonable assumption and state it in your result.',
+  'Your reply is handed back to the commander verbatim (not shown to anyone else), so return the COMPLETE result it needs to act on. Put large artifacts in files and reference their paths; keep the reply itself focused on the result and any pointers.',
+].join(' ');
+
 function _toolError(error: string): { content: string; isError: true } {
   return { content: JSON.stringify({ ok: false, error }), isError: true };
 }
@@ -2436,10 +2945,49 @@ function _marketplaceSearchTerms(query: string): string[] {
   return out.slice(0, 12);
 }
 
+function buildSkillSearchTool(uid: string): AgentTool {
+  return {
+    name: 'skill_search',
+    description: [
+      'Find skills contributed by the user\'s global skill folders when the listed skills do not cover the task.',
+      'These open-tier skills are NOT listed in the "## Available skills" block — use this when the listed skills and built-in tools do not cover the task.',
+      'Returns each match\'s name, source, and SKILL.md path; read_file that path before invoking the skill.',
+      'Matching is keyword-based over names + descriptions, which are often English — if a user-language query returns nothing, retry once with English keywords before concluding none exist.',
+      'This does NOT search the marketplace catalog (use marketplace_search for installable resources) and installs nothing.',
+    ].join(' '),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Capability text matched against skill names and descriptions. Leave empty to list available open-tier skills. Use the user language when possible.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum results to return (1-20). Default: 8.',
+        },
+      },
+      additionalProperties: false,
+    },
+    async execute(input) {
+      const query = _trimText(input?.query, 300);
+      const limit = _clampLimit(input?.limit, 8, 1, 20);
+      try {
+        const { skills: disabledSkillIds } = readDisabledSets(uid);
+        const res = await searchOpenTierSkills(uid, query, limit, disabledSkillIds);
+        return _toolJson({ ok: true, query, ...res });
+      } catch (err) {
+        return _toolError((err as Error).message || 'skill search failed');
+      }
+    },
+  };
+}
+
 
 async function buildCommanderExtraTools(
   state: CidState,
   w: WorkerState,
+  currentTurnPayload: string,
   // Attachments on the current commander turn's source item — passed through
   // to plan_set so the plan persists them under `initial_attachments`. Worker
   // dispatches in subsequent reconciles read it back from the plan so image /
@@ -2447,109 +2995,14 @@ async function buildCommanderExtraTools(
   // but persisted because plan steps live across worker turn boundaries.
   currentTurnAttachments?: string[],
   currentProjectId?: string,
+  // Called right before a VISIBLE agent dispatch runs (dispatch_to / named
+  // run_worker), so the commander's accumulated reasoning so far is flushed as
+  // its own bubble and the post-handback synthesis starts a fresh one. Not
+  // called for anonymous run_worker (invisible — no bubble to interleave with).
+  onVisibleDispatch?: () => Promise<void>,
 ): Promise<AgentTool[]> {
   const { uid, cid } = w;
   const tools: AgentTool[] = [];
-  tools.push({
-    name: 'plan_set',
-    description: [
-      'Record the full execution plan — the bus auto-dispatches per the plan, tracks state, and runs steps serially; **you do NOT need to @ dispatch anything afterwards**.',
-      'Every step must specify `assignee` (user / commander / agent name) and `input` (dispatch text; can reference `{{user_initial_message}}` and `{{step_N.output_summary}}` template variables to pull in context).',
-      'Steps run serially by default (each waits for the previous to be done). Use `wait_for: [N]` only to declare a real dependency on a non-previous step or multiple prior outputs.',
-      'Do not design parallel fan-out. If multiple agents are useful, order them so each step can use prior outputs; use an early `user` or interactive agent step when information is missing.',
-      'The first call also posts a group announcement so the user sees the rough path; later overwrites just update the file. Step count 1–15.',
-    ].join(' '),
-    inputSchema: {
-      type: 'object',
-      properties: {
-        initial_message: {
-          type: 'string',
-          description: 'Optional: the original user message that triggered this plan; stored in the plan for `{{user_initial_message}}` references. Strongly recommended on first plan write — otherwise downstream step input templates cannot pull the user\'s original wording.',
-        },
-        steps: {
-          type: 'array',
-          minItems: 1,
-          items: {
-            type: 'object',
-            properties: {
-              title: { type: 'string', description: 'One-line step goal (imperative).' },
-              assignee: {
-                type: 'string',
-                description: 'Executor: agent name / commander (you yourself, typical for synthesis) / user (ask the user a question and wait for the reply).',
-              },
-              input: {
-                type: 'string',
-                description: 'Dispatch text (template) sent to the assignee. The bus renders the variables and forwards the result **verbatim** as a message. Variables include `{{user_initial_message}}`, `{{step_1.output_summary}}`, `{{step_2.output_files}}`, etc. This is the actual "dispatch script" of the plan.',
-              },
-              wait_for: {
-                type: 'array',
-                items: { type: 'number' },
-                description: 'Optional: list of step indices (1-based) this step depends on. Default = [previous step] (linear serial). Use `[]` only for the first step. Multiple deps means wait for all of them to be done before this serial step runs.',
-              },
-              on_failure: {
-                type: 'string',
-                enum: ['abort_plan', 'continue', 'ask_commander'],
-                description: 'Optional failure policy: `abort_plan` stops the whole plan / `continue` skips this step and proceeds / `ask_commander` (default) wakes the commander to decide.',
-              },
-              notes: { type: 'string', description: 'Optional supplementary notes (does not affect execution).' },
-            },
-            required: ['title', 'assignee'],
-            additionalProperties: false,
-          },
-        },
-      },
-      required: ['steps'],
-      additionalProperties: false,
-    },
-    async execute(input) {
-      const raw = (input?.steps || []) as Array<{
-        title?: string; assignee?: string; input?: string;
-        wait_for?: number[];
-        on_failure?: string; notes?: string;
-      }>;
-      const stepsIn: PlanSetInput = {
-        ...(typeof input?.initial_message === 'string' && input.initial_message.trim()
-          ? { initial_message: String(input.initial_message) }
-          : {}),
-        ...(currentTurnAttachments && currentTurnAttachments.length
-          ? { initial_attachments: currentTurnAttachments.slice() }
-          : {}),
-        steps: raw.filter((s) => s && typeof s.title === 'string' && s.title.trim() && typeof s.assignee === 'string' && s.assignee.trim())
-          .map((s) => ({
-            title: String(s.title),
-            assignee: String(s.assignee),
-            ...(s.input && typeof s.input === 'string' ? { input: String(s.input) } : {}),
-            ...(Array.isArray(s.wait_for) ? { wait_for: s.wait_for.map(Number).filter(Number.isFinite) } : {}),
-            ...(s.on_failure && ['abort_plan', 'continue', 'ask_commander'].includes(s.on_failure)
-              ? { on_failure: s.on_failure as any } : {}),
-            ...(s.notes ? { notes: String(s.notes) } : {}),
-          })),
-      };
-      if (!stepsIn.steps.length) {
-        return { content: JSON.stringify({ ok: false, error: 'empty or invalid steps (each step needs `title` + `assignee`)' }), isError: true };
-      }
-      const { plan } = await setPlan(uid, cid, stepsIn);
-      emit(state, { type: 'plan_changed', cid });
-      // Stage the announcement on the worker; runTurn end merges it into
-      // commander's turn-end message so thinking rail + plan card share
-      // a single bubble. See WorkerState.pendingPlanAnnouncement.
-      // Always announce, including on re-plans — a silent re-plan would
-      // leave the user with only the process rail (the "user pings
-      // commander → must respond" invariant).
-      w.pendingPlanAnnouncement = formatPlanAnnouncement(plan);
-      // NOTE: dispatch is DEFERRED to runTurn-end (see bus.runTurn for the
-      // post-outcome `planExecutor.reconcile` call). Doing it here would
-      // mean the agent worker starts running while commander's own LLM
-      // stream is still going — visually two placeholders thinking at
-      // once + agent's reply potentially landing before commander's final
-      // text. Letting commander's turn fully settle first keeps the UX
-      // sequential. The plan + announcement are still written/emitted
-      // synchronously here, so user immediately sees the plan card; only
-      // the agent dispatch waits for commander to wrap up.
-      return { content: JSON.stringify({ ok: true, plan: { steps: plan.steps } }) };
-    },
-  });
-
   tools.push({
     name: 'auto_tasks_list',
     description: [
@@ -2767,41 +3220,7 @@ async function buildCommanderExtraTools(
     },
   });
 
-  tools.push({
-    name: 'skill_search',
-    description: [
-      'Find skills contributed by the user\'s installed external packages and global skill folders.',
-      'These open-tier skills are NOT listed in the "## Available skills" block — use this when the listed skills and built-in tools do not cover the task.',
-      'Returns each match\'s name, source, and SKILL.md path; read_file that path before invoking the skill.',
-      'Matching is keyword-based over names + descriptions, which are often English (package skills) — if a user-language query returns nothing, retry once with English keywords before concluding none exist.',
-      'This does NOT search the marketplace catalog (use marketplace_search for installable resources) and installs nothing.',
-    ].join(' '),
-    inputSchema: {
-      type: 'object',
-      properties: {
-        query: {
-          type: 'string',
-          description: 'Capability text matched against skill names and descriptions. Leave empty to list available open-tier skills. Use the user language when possible.',
-        },
-        limit: {
-          type: 'number',
-          description: 'Maximum results to return (1-20). Default: 8.',
-        },
-      },
-      additionalProperties: false,
-    },
-    async execute(input) {
-      const query = _trimText(input?.query, 300);
-      const limit = _clampLimit(input?.limit, 8, 1, 20);
-      try {
-        const { skills: disabledSkillIds } = readDisabledSets(uid);
-        const res = await searchOpenTierSkills(uid, query, limit, disabledSkillIds);
-        return _toolJson({ ok: true, query, ...res });
-      } catch (err) {
-        return _toolError((err as Error).message || 'skill search failed');
-      }
-    },
-  });
+  tools.push(buildSkillSearchTool(uid));
 
   tools.push({
     name: 'marketplace_request_install',
@@ -2917,12 +3336,17 @@ async function buildCommanderExtraTools(
 
   tools.push({
     name: 'dispatch_to',
+    // Parallel-safe: independent dispatches in one turn run concurrently (G4),
+    // bounded by dispatchSlots. Nested runs skip the global slot + use distinct
+    // sessions; member-seed + jsonl-append are lock-serialized.
+    executionMode: 'parallel',
     description: [
-      'Dispatch a task to a single agent — the **sole channel** for single-agent dispatch. Multi-agent coordination goes through `plan_set`.',
-      'Calling this tool **only records intent**; the recipient agent does not start immediately — it is woken up only after this turn\'s text reply is fully sent and placeholders are cleared (avoiding races).',
-      '`to` can be the agent name (recommended, matching the `name` in the "Agents list") or the agent_id; the `commander` / `user` aliases are also accepted.',
-      '`message` is the dispatch text to send verbatim to the target agent.',
-      '**Note**: `@<X>` written in prose is markdown decoration; the system no longer recognizes it as a dispatch signal — to dispatch, call this tool.',
+      'Delegate a task to a single named agent and get its FULL result back so you can read it, synthesise, and continue — you stay in the loop. The agent runs and returns its result within this same call (no separate later turn); it also posts its own reply, and you add your synthesis on top.',
+      'Use this to bring in a specific domain agent, or to orchestrate several agents across turns; for a generic bounded sub-task you own, use `run_worker`.',
+      'If the agent asks the user for missing information with a form while this is part of a broader commander-owned task, include `resume` so the system can resume you after the form is submitted and the agent completes.',
+      '`to` is the agent name (recommended, matching the `name` in the "Agents list") or the agent_id — it must be an agent (not `commander` / `user`).',
+      '`message` is the task text, sent verbatim to the agent.',
+      '**Note**: `@<X>` written in prose is decoration, not a dispatch signal — call this tool to dispatch.',
     ].join(' '),
     inputSchema: {
       type: 'object',
@@ -2935,92 +3359,253 @@ async function buildCommanderExtraTools(
           type: 'string',
           description: 'Dispatch text, sent verbatim to the target.',
         },
+        resume: {
+          type: 'string',
+          description: 'Optional. What the commander should do after this agent blocks on a form, receives the user input, and completes.',
+        },
       },
       required: ['to', 'message'],
       additionalProperties: false,
     },
-    async execute(input) {
+    async execute(input, ctx) {
       const toRaw = String(input?.to || '').trim();
       const message = String(input?.message || '').trim();
+      const resume = String(input?.resume || '').trim();
       if (!toRaw) {
         return { content: JSON.stringify({ ok: false, error: '`to` is required' }), isError: true };
       }
       if (!message) {
         return { content: JSON.stringify({ ok: false, error: '`message` is required' }), isError: true };
       }
-      // Resolve `to` → actor id, mirroring the name-map logic used in enqueue's
-      // router pass. Reserved aliases first, then enabled agent display names,
-      // then raw agent_id fallback.
-      const key = toRaw.toLowerCase().replace(/\s+/g, '');
-      let resolvedId: string | null = null;
-      if (key === 'commander' || key === '指挥官') resolvedId = COMMANDER_ID;
-      else if (key === 'user' || key === '用户') resolvedId = USER_ID;
-      else {
-        try {
-          const all = await agentsFeat.listAgents();
-          for (const a of all) {
-            if (a.enabled === false) continue;
-            if (a.name && a.name.toLowerCase().replace(/\s+/g, '') === key) {
-              resolvedId = a.agent_id;
-              break;
-            }
-          }
-        } catch (err) {
-          log.warn(`dispatch_to listAgents failed cid=${cid}: ${(err as Error).message}`);
-        }
-        if (!resolvedId && safeId(toRaw)) {
-          try {
-            const ag = await agentsFeat.getAgent(toRaw);
-            if (ag && (ag as any).enabled !== false) resolvedId = toRaw;
-          } catch { /* ignore */ }
-        }
-      }
+      // Resolve `to` → actor id via the shared name-map resolver.
+      const resolvedId = await resolveDispatchTarget(cid, toRaw);
       if (!resolvedId) {
         return {
           content: JSON.stringify({ ok: false, error: t('errors.unknown_actor', { name: toRaw }) }),
           isError: true,
         };
       }
-      if (!w.pendingDispatches) w.pendingDispatches = [];
-      w.pendingDispatches.push({ to: resolvedId, message });
-      return {
-        content: JSON.stringify({
-          ok: true,
-          dispatched_to: resolvedId,
-          when: 'after-turn-end',
-          note: 'Dispatch recorded; will be delivered after you finish this turn.',
-        }),
-      };
+      if (resolvedId === COMMANDER_ID || resolvedId === USER_ID) {
+        return _toolError('dispatch_to target must be an agent (not commander / user)');
+      }
+      // Run the agent's turn in-process and hand its FULL result back as this
+      // tool's result; the agent also persists its own visible bubble and the
+      // commander then synthesises (Option B). The commander stays in the loop.
+      const dispatchAgent = await agentsFeat.getAgent(resolvedId);
+      const dispatchActor: Actor = { kind: 'agent', id: resolvedId, name: dispatchAgent?.name || resolvedId, joined_at: nowIso() };
+      // Flush the commander's pre-dispatch reasoning as its own bubble first, so
+      // this visible agent's reply lands AFTER it and the synthesis opens a fresh
+      // bubble (commander loop bubbles).
+      await onVisibleDispatch?.();
+      const dispatchResult = await runNestedDispatch(state, ctx?.signal, dispatchActor, message, currentTurnAttachments);
+      try {
+        await _setFormWaitLedgerFromWorkerResult({
+          uid, cid,
+          result: dispatchResult,
+          ownerAgentId: resolvedId,
+          ownerAgentName: dispatchAgent?.name || resolvedId,
+          userGoal: _unwrapLlmTurnPayload(currentTurnPayload) || currentTurnPayload,
+          agentTask: message,
+          resume,
+          sourceTool: 'dispatch_to',
+        });
+      } catch (err) {
+        log.warn(`dispatch_to form ledger set failed cid=${cid}: ${(err as Error).message}`);
+      }
+      return { content: dispatchResult };
     },
   });
 
   tools.push({
-    name: 'plan_update',
-    description: 'Update a step\'s status (`in_progress` / `done` / `failed`). Sends no message; only updates the file and notifies the front-end panel.',
+    name: 'hand_off_to',
+    // NOT parallel: hand-off is the deliberate LAST act of the turn (it ends the
+    // turn via endTurn), so it never co-runs with sibling dispatches.
+    description: [
+      'Hand the conversation to a named agent: the agent answers the USER directly and you STEP OUT — you do NOT synthesize on top, and your turn ends here (this saves the wasted "summary" turn).',
+      'Use this when the agent\'s reply IS the deliverable the user wants: a specialist delivering the final result, OR an interactive agent (teach / coach / guide) the user should keep working with. Do any prep first (search, download, set things up), then hand off as your final action.',
+      'For an interactive agent the floor moves to it, so the user\'s follow-up messages go straight to it (no need to mention it again) until it hands back or the user addresses you. For a one-shot agent it just answers and control returns to you.',
+      'If this hand-off is only one outcome inside a broader commander-owned task, include `resume` with exactly what the commander must do after the agent finishes or asks the user for a form; that creates a lightweight suspended-orchestration ledger and will wake the commander when the blocking outcome completes.',
+      'Contrast with `dispatch_to`, which you use ONLY when you need the agent\'s result back to continue your OWN work (you stay in the loop and synthesize).',
+      '`to` is the agent name or agent_id (not `commander` / `user`); `message` is the task text, sent verbatim.',
+    ].join(' '),
     inputSchema: {
       type: 'object',
       properties: {
-        step_index: { type: 'number', description: '1-based step index.' },
-        status: { type: 'string', enum: ['in_progress', 'done', 'failed'] },
-        notes: { type: 'string' },
+        to: { type: 'string', description: 'Target agent — name (matching the "Agents list") or agent_id.' },
+        message: { type: 'string', description: 'Task text, sent verbatim to the agent.' },
+        resume: {
+          type: 'string',
+          description: 'Optional. Use only when this hand-off blocks a broader commander-owned task; say what the commander should do after this agent completes or finishes collecting user input.',
+        },
       },
-      required: ['step_index', 'status'],
+      required: ['to', 'message'],
       additionalProperties: false,
     },
-    async execute(input) {
-      const idx = Number(input?.step_index);
-      const status = String(input?.status) as StepStatus;
-      const notes = typeof input?.notes === 'string' ? input.notes : undefined;
-      if (!Number.isFinite(idx) || !['in_progress', 'done', 'failed'].includes(status)) {
-        return { content: JSON.stringify({ ok: false, error: 'invalid input' }), isError: true };
+    async execute(input, ctx) {
+      const toRaw = String(input?.to || '').trim();
+      const message = String(input?.message || '').trim();
+      const resume = String(input?.resume || '').trim();
+      if (!toRaw) return _toolError('`to` is required');
+      if (!message) return _toolError('`message` is required');
+      const resolvedId = await resolveDispatchTarget(cid, toRaw);
+      if (!resolvedId) return _toolError(t('errors.unknown_actor', { name: toRaw }));
+      if (resolvedId === COMMANDER_ID || resolvedId === USER_ID) {
+        return _toolError('hand_off_to target must be an agent (not commander / user)');
       }
-      // updateStep's 5th arg is a `patch` object, not a bare notes string — wrap.
-      const updated = await updateStep(uid, cid, idx, status, notes !== undefined ? { notes } : undefined);
-      if (!updated) {
-        return { content: JSON.stringify({ ok: false, error: 'step not found or no plan yet' }), isError: true };
+      const handoffAgent = await agentsFeat.getAgent(resolvedId);
+      const handoffActor: Actor = { kind: 'agent', id: resolvedId, name: handoffAgent?.name || resolvedId, joined_at: nowIso() };
+      // Flush the commander's pre-hand-off narration as its own bubble first.
+      await onVisibleDispatch?.();
+      // Move the floor to an interactive agent BEFORE running it, so the
+      // state_changed events emitted during its run already carry the floor —
+      // the renderer then suppresses an empty commander placeholder for the rest
+      // of this turn (no flicker). A one-shot (non-interactive) agent answers and
+      // is done, so the floor stays with the commander.
+      if (handoffAgent?.interactive === true) {
+        try { await setActiveRecipient(uid, cid, resolvedId); }
+        catch (err) { log.warn(`hand_off floor set failed cid=${cid}: ${(err as Error).message}`); }
+        if (resume) {
+          try {
+            await setOrchestrationLedger(uid, cid, {
+              status: 'waiting_for_agent',
+              blocked_on: 'agent_handoff',
+              source_tool: 'hand_off_to',
+              owner_agent_id: resolvedId,
+              ...(handoffAgent?.name ? { owner_agent_name: handoffAgent.name } : {}),
+              user_goal: _clipForOrchestration(_unwrapLlmTurnPayload(currentTurnPayload) || currentTurnPayload),
+              handoff_message: message,
+              resume_instruction: resume,
+            });
+          } catch (err) {
+            log.warn(`hand_off ledger set failed cid=${cid}: ${(err as Error).message}`);
+          }
+        }
       }
-      emit(state, { type: 'plan_changed', cid });
-      return { content: JSON.stringify({ ok: true, step: updated.steps.find((s) => s.index === idx) }) };
+      // Run the agent's turn — it posts its reply straight to the user (same path
+      // as dispatch, but we do NOT read the result back to synthesize).
+      const handoffResult = await runNestedDispatch(state, ctx?.signal, handoffActor, message, currentTurnAttachments);
+      if (resume && handoffAgent?.interactive !== true) {
+        try {
+          const blocked = await _setFormWaitLedgerFromWorkerResult({
+            uid, cid,
+            result: handoffResult,
+            ownerAgentId: resolvedId,
+            ownerAgentName: handoffAgent?.name || resolvedId,
+            userGoal: _unwrapLlmTurnPayload(currentTurnPayload) || currentTurnPayload,
+            agentTask: message,
+            resume,
+            sourceTool: 'hand_off_to',
+          });
+          if (!blocked) {
+            await _enqueueOrchestrationResumeFromAgent({
+              state,
+              fromActorId: resolvedId,
+              fromActorName: handoffAgent?.name || resolvedId,
+              ledger: {
+                version: 1,
+                id: genId12(),
+                kind: 'suspended_orchestration',
+                status: 'waiting_for_agent',
+                blocked_on: 'agent_handoff',
+                source_tool: 'hand_off_to',
+                owner_agent_id: resolvedId,
+                ...(handoffAgent?.name ? { owner_agent_name: handoffAgent.name } : {}),
+                user_goal: _clipForOrchestration(_unwrapLlmTurnPayload(currentTurnPayload) || currentTurnPayload),
+                handoff_message: message,
+                resume_instruction: resume,
+                created_at: nowIso(),
+                updated_at: nowIso(),
+              },
+              agentResult: handoffResult,
+            });
+          }
+        } catch (err) {
+          log.warn(`hand_off resume handling failed cid=${cid}: ${(err as Error).message}`);
+        }
+      }
+      // endTurn: end the commander's turn with no synthesis inference. The
+      // agent's reply is the user-facing deliverable.
+      return { content: JSON.stringify({ ok: true, handed_off_to: resolvedId }), endTurn: true };
+    },
+  });
+
+  tools.push({
+    name: 'run_worker',
+    // Parallel-safe: independent sub-tasks in one turn run concurrently (G4),
+    // bounded by dispatchSlots. See dispatch_to above.
+    executionMode: 'parallel',
+    description: [
+      'Run a bounded sub-task and get its FULL result handed back to YOU (the commander) within this same call, so you can read it, synthesise, and decide the next step — the in-loop coordinator pattern.',
+      'Use this for a sub-task you own: a bounded job whose output you will build on, or heavy scanning whose bulk you do not want to keep in your own context.',
+      'Omit `to` to spin up a fresh anonymous worker (your own hands); set `to` to a named agent when that specialist\'s output is what you need back. To bring a domain agent into the conversation as its own visible participant, prefer `dispatch_to`.',
+      'For a named agent, if the agent may ask the user for missing information with a form and this is part of a broader commander-owned task, include `resume` so the system can resume you after the form is submitted and the agent completes.',
+      'The worker runs and returns its result here (with any file pointers) — there is no separate later turn. `task` is the instruction, sent verbatim.',
+    ].join(' '),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        to: {
+          type: 'string',
+          description: 'Optional. A worker agent — name (matching the "Agents list") or agent_id — when you specifically need that specialist\'s output back. Omit to spin up an anonymous worker for a generic bounded sub-task.',
+        },
+        task: {
+          type: 'string',
+          description: 'Sub-task instruction, sent verbatim to the worker.',
+        },
+        resume: {
+          type: 'string',
+          description: 'Optional for named agents. What the commander should do after this agent blocks on a form, receives the user input, and completes.',
+        },
+      },
+      required: ['task'],
+      additionalProperties: false,
+    },
+    async execute(input, ctx) {
+      const toRaw = String(input?.to || '').trim();
+      const task = String(input?.task || '').trim();
+      const resume = String(input?.resume || '').trim();
+      if (!task) return _toolError('`task` is required');
+      if (!toRaw) {
+        // Anonymous ephemeral worker — the commander's own hands. G8d step 3:
+        // run it in-process, synchronously, and hand its FULL result straight
+        // back as this tool's result (single-layer dispatch — no staging, no
+        // turn-end flush, no re-wake; the handback IS the tool result).
+        const workerActor: Actor = { kind: 'worker', id: genId12(), name: 'Worker', joined_at: nowIso() };
+        const result = await runNestedDispatch(state, ctx?.signal, workerActor, task, currentTurnAttachments);
+        return { content: result };
+      }
+      const resolvedId = await resolveDispatchTarget(cid, toRaw);
+      if (!resolvedId) {
+        return _toolError(t('errors.unknown_actor', { name: toRaw }));
+      }
+      if (resolvedId === COMMANDER_ID || resolvedId === USER_ID) {
+        return _toolError('run_worker target must be an agent (not commander / user)');
+      }
+      // Named worker: run the agent's turn in-process and hand its FULL result
+      // back as this tool's result (same single-layer dispatch as the anonymous
+      // branch). The agent also persists its own visible bubble; the commander
+      // then synthesises (Option B).
+      const namedAgent = await agentsFeat.getAgent(resolvedId);
+      const namedActor: Actor = { kind: 'agent', id: resolvedId, name: namedAgent?.name || resolvedId, joined_at: nowIso() };
+      // Named run_worker is also a visible agent bubble — flush the commander's
+      // pre-dispatch reasoning first (commander loop bubbles).
+      await onVisibleDispatch?.();
+      const namedResult = await runNestedDispatch(state, ctx?.signal, namedActor, task, currentTurnAttachments);
+      try {
+        await _setFormWaitLedgerFromWorkerResult({
+          uid, cid,
+          result: namedResult,
+          ownerAgentId: resolvedId,
+          ownerAgentName: namedAgent?.name || resolvedId,
+          userGoal: _unwrapLlmTurnPayload(currentTurnPayload) || currentTurnPayload,
+          agentTask: task,
+          resume,
+          sourceTool: 'run_worker',
+        });
+      } catch (err) {
+        log.warn(`run_worker form ledger set failed cid=${cid}: ${(err as Error).message}`);
+      }
+      return { content: namedResult };
     },
   });
 
@@ -3122,94 +3707,6 @@ export function _cidStateForTest(uid: string, cid: string): CidState | null {
   return _cids.get(cidKey(uid, cid)) || null;
 }
 
-// ── Plan-executor wiring ──────────────────────────────────────────────────
-//
-// Bind the plan_executor's bus hooks ONCE at module load. These hooks let
-// the executor enqueue dispatch messages, push synthesis turns directly to
-// commander's worker, and resolve agent names — all without the executor
-// having to import bus internals (which would be a circular import). Bus is
-// the only authority that mutates worker queues; executor speaks through
-// these hooks.
-//
-// Catastrophic-if-broken invariant: bus.ts MUST be loaded exactly once per
-// process. If a second copy gets loaded (e.g. CJS + ESM dual load when
-// `bootstrap.cjs` requires src/main as CJS but somewhere does `await
-// import('./group_chat/bus')` — Node always resolves dynamic `import()` to
-// ESM regardless of caller context, producing a SEPARATE module instance
-// with its own `_cids`), the second load's bindBusHooks call wins because
-// plan_executor's `_hooks` is a module-level singleton. Then `groupChat.send`
-// (in module A) routes through `planExecutor.reconcile → _hooks.enqueue`
-// which now points at module B's enqueue. Module B has empty `_cids`, so
-// it creates a fresh state for the cid — agent workers run in B's state,
-// events emit to B's listeners (empty), and the IPC subscriber (registered
-// on module A) sees zero. Symptom: "loading 一直显示，中断后才看到 process
-// info"; chats sidebar sometimes-shows phantom `processing=true`. Bug fixed
-// at the load-path side: see chats.ts `require('./group_chat/bus')` (CJS
-// require, hits the same module cache as our static `from './bus'` import
-// chain) — never `await import` this file.
-
-planExecutor.bindBusHooks({
-  async enqueue(params) {
-    await enqueue({
-      uid: params.uid,
-      cid: params.cid,
-      fromActorId: params.fromActorId,
-      text: params.text,
-      ...(params.forceTo ? { forceTo: params.forceTo } : {}),
-      ...(typeof params.triggered_step === 'number' ? { triggered_step: params.triggered_step } : {}),
-      ...(params.dispatch ? { dispatch: true } : {}),
-      ...(params.attachments && params.attachments.length ? { attachments: params.attachments } : {}),
-      ...(params.form ? { form: params.form } : {}),
-    });
-  },
-
-  async pushCommanderTurn(uid, cid, payload) {
-    // Wake commander privately — no chat message persisted; the eventual
-    // commander → user reply IS the user-visible output (synthesis bubble).
-    const state = getOrInitCid(uid, cid);
-    await seedReservedActors(uid, cid);
-    const members = await readMembers(uid, cid);
-    const commander = members.actors.find((a) => a.id === COMMANDER_ID);
-    if (!commander) return;
-    const w = ensureWorker(state, commander);
-    w.queue.push({
-      turnId: genId12(),
-      msgId: genId12(),
-      fromActorId: 'plan',
-      llmPayload: payload.llmPayload,
-      triggered_step: payload.triggered_step,
-    });
-    const wake = w.wake; w.wake = null;
-    wake?.();
-  },
-
-  async resolveAgent(uid, nameOrId) {
-    try {
-      // Try as id first (LLM may have written the literal id).
-      if (safeId(nameOrId)) {
-        const ag = await agentsFeat.getAgent(nameOrId);
-        if (ag && isAgentEnabled(uid, ag.agent_id)) return ag.agent_id;
-      }
-      // Otherwise scan by display name (case + whitespace insensitive).
-      const norm = (s: string) => s.toLowerCase().replace(/\s+/g, '');
-      const target = norm(nameOrId);
-      const list = await agentsFeat.listAgents();
-      for (const a of list) {
-        if (a.enabled === false) continue;
-        if (a.name && norm(a.name) === target) return a.agent_id;
-      }
-    } catch (err) {
-      log.warn(`plan executor resolveAgent threw: ${(err as Error).message}`);
-    }
-    return null;
-  },
-
-  emitPlanChanged(uid, cid) {
-    const state = _cids.get(cidKey(uid, cid));
-    if (state) emit(state, { type: 'plan_changed', cid });
-  },
-});
-
 // ── CLI agent turn ────────────────────────────────────────────────────────
 //
 // CLI-backed agents replace the LLM stream loop in runTurn. We pack the
@@ -3288,7 +3785,7 @@ async function _maybeBuildCliInputForm(
 async function _runCliAgentTurn(opts: {
   uid: string;
   cid: string;
-  actor: { id: string; kind: 'agent' | 'commander' | 'user' };
+  actor: { id: string; kind: ActorKind };
   agent: import('../agents').Agent;
   item: QueueItem;
   slice: GroupMessage[];

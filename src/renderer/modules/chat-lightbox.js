@@ -37,6 +37,17 @@ let _panStart = null;
 const MIN_SCALE = 0.5;
 const MAX_SCALE = 8;
 const ZOOM_STEP = 1.2;
+const _LIGHTBOX_LIBRARY_IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
+
+function _lightboxExtOf(name) {
+  if (!name) return '';
+  const i = String(name).lastIndexOf('.');
+  return i >= 0 ? String(name).slice(i).toLowerCase() : '';
+}
+
+function _lightboxCanAddToLibrary(file) {
+  return !!(file && file.absPath && file.cid && _LIGHTBOX_LIBRARY_IMAGE_EXTS.has(_lightboxExtOf(file.absPath)));
+}
 
 function _absPathFromChatMediaLocalUrl(src) {
   if (!src) return '';
@@ -251,6 +262,7 @@ async function _onLightboxAddLibrary(e) {
   e.stopPropagation();
   if (!_lightboxCurrentFile || !_lightboxAddLibraryBtn || _lightboxAddLibraryBtn.disabled) return;
   const file = _lightboxCurrentFile;
+  if (!_lightboxCanAddToLibrary(file)) return;
   const original = _lightboxAddLibraryBtn.innerHTML;
   _lightboxAddLibraryBtn.disabled = true;
   try {
@@ -299,7 +311,7 @@ function openChatImageLightbox(src, alt, opts) {
     cid: fileOpts.cid || null,
     projectId: fileOpts.projectId || null,
   } : null;
-  if (_lightboxAddLibraryBtn) _lightboxAddLibraryBtn.hidden = !_lightboxCurrentFile;
+  if (_lightboxAddLibraryBtn) _lightboxAddLibraryBtn.hidden = !_lightboxCanAddToLibrary(_lightboxCurrentFile);
   if (_lightboxRevealBtn) _lightboxRevealBtn.hidden = !_lightboxCurrentFile;
   el.classList.add('is-open');
   el.setAttribute('aria-hidden', 'false');

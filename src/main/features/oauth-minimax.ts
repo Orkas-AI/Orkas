@@ -43,6 +43,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import type { OAuthCredentials, OAuthProviderInterface, OAuthLoginCallbacks } from '@earendil-works/pi-ai';
 import { t } from '../i18n';
+import { fetchWithTimeout } from '../util/abort';
 
 // ── Endpoint config ──────────────────────────────────────────────────────
 
@@ -60,6 +61,8 @@ const MINIMAX_BASE_URL: Record<MiniMaxRegion, string> = {
 
 // Default polling interval when server doesn't specify one.
 const MIN_POLL_INTERVAL_MS = 2000;
+const MINIMAX_OAUTH_HTTP_TIMEOUT_MS = 60_000;
+const MINIMAX_TOKEN_POLL_HTTP_TIMEOUT_MS = 30_000;
 
 // ── Token payload shapes (server contract) ───────────────────────────────
 
@@ -124,6 +127,26 @@ function toFormBody(data: Record<string, string>): string {
     .join('&');
 }
 
+function fetchMiniMax(
+  label: string,
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<Response> {
+  return fetchWithTimeout(
+    url,
+    init,
+    timeoutMs,
+    signal,
+    `${label} timed out after ${Math.round(timeoutMs / 1000)}s`,
+  );
+}
+
+function isMiniMaxPollTimeout(err: unknown): boolean {
+  return err instanceof Error && /MiniMax token poll timed out after/.test(err.message);
+}
+
 // ── HTTP: request device code ────────────────────────────────────────────
 
 async function requestAuthorization(opts: {
@@ -133,9 +156,8 @@ async function requestAuthorization(opts: {
   signal?: AbortSignal;
 }): Promise<AuthorizationResponse> {
   const base = MINIMAX_BASE_URL[opts.region];
-  const res = await fetch(`${base}/oauth/code`, {
+  const res = await fetchMiniMax('MiniMax authorization request', `${base}/oauth/code`, {
     method: 'POST',
-    signal: opts.signal,
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
       'Accept':       'application/json',
@@ -148,7 +170,7 @@ async function requestAuthorization(opts: {
       code_challenge_method: 'S256',
       state:                 opts.state,
     }),
-  });
+  }, MINIMAX_OAUTH_HTTP_TIMEOUT_MS, opts.signal);
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');
@@ -174,20 +196,27 @@ async function pollToken(opts: {
   signal?: AbortSignal;
 }): Promise<TokenPayload> {
   const base = MINIMAX_BASE_URL[opts.region];
-  const res = await fetch(`${base}/oauth/token`, {
-    method: 'POST',
-    signal: opts.signal,
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'Accept':       'application/json',
-    },
-    body: toFormBody({
-      grant_type:    MINIMAX_GRANT_TYPE,
-      client_id:     MINIMAX_CLIENT_ID,
-      user_code:     opts.userCode,
-      code_verifier: opts.verifier,
-    }),
-  });
+  let res: Response;
+  try {
+    res = await fetchMiniMax('MiniMax token poll', `${base}/oauth/token`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept':       'application/json',
+      },
+      body: toFormBody({
+        grant_type:    MINIMAX_GRANT_TYPE,
+        client_id:     MINIMAX_CLIENT_ID,
+        user_code:     opts.userCode,
+        code_verifier: opts.verifier,
+      }),
+    }, MINIMAX_TOKEN_POLL_HTTP_TIMEOUT_MS, opts.signal);
+  } catch (err) {
+    if (isMiniMaxPollTimeout(err)) {
+      return { status: 'pending', base_resp: { status_msg: (err as Error).message } };
+    }
+    throw err;
+  }
 
   const text = await res.text();
   let parsed: TokenPayload | undefined;
@@ -213,9 +242,8 @@ async function refreshTokenCall(opts: {
   signal?: AbortSignal;
 }): Promise<TokenSuccessPayload> {
   const base = MINIMAX_BASE_URL[opts.region];
-  const res = await fetch(`${base}/oauth/token`, {
+  const res = await fetchMiniMax('MiniMax token refresh', `${base}/oauth/token`, {
     method: 'POST',
-    signal: opts.signal,
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
       'Accept':       'application/json',
@@ -225,7 +253,7 @@ async function refreshTokenCall(opts: {
       client_id:     MINIMAX_CLIENT_ID,
       refresh_token: opts.refresh,
     }),
-  });
+  }, MINIMAX_OAUTH_HTTP_TIMEOUT_MS, opts.signal);
 
   if (!res.ok) {
     const body = await res.text().catch(() => '');

@@ -25,7 +25,7 @@ This session is bound to the agent in Runtime injection.
 
 1. Clarify the agent's real job, user, recurrence, and missing info in one concise batch.
 2. Iterate one topic at a time; keep replies short.
-3. For workflow capabilities, choose the smallest fit: built-in tool name directly, then skills from Available skills, then connector action discovered via `list_connector_tools`, then "needs a new skill" only as fallback. For web access write `web_search`; runtime upgrades automatically.
+3. For workflow capabilities, choose the smallest fit: built-in tool name directly, then skills from Available skills, then `skill_search` for global-folder skills, then connector action discovered via `list_connector_tools`, then "needs a new skill" only as fallback. For web access write `web_search`; runtime upgrades automatically.
 4. On failure, state cause + remedy. For unrelated questions, answer normally and ask whether to continue refining.
 
 ---

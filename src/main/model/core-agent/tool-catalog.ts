@@ -33,6 +33,7 @@ export type ToolGroup =
   | 'fs'         // files / workspace
   | 'shell'      // command line
   | 'pdf'        // PDF rendering
+  | 'office'     // Office documents
   | 'kb'         // Library
   | 'chat'       // conversation history
   | 'image'      // image generation
@@ -79,6 +80,14 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   { name: 'markdown_to_pdf', group: 'pdf', permission: 'localExec', summary: 'Markdown → PDF (CJK-friendly, zero external dependency).' },
   { name: 'html_to_pdf',     group: 'pdf', permission: 'localExec', summary: 'HTML → PDF (same renderer).' },
 
+  // Office documents (bundled OfficeCLI engine)
+  { name: 'create_docx',   group: 'office', permission: 'localExec', summary: 'Create a Word (.docx) document from paragraphs, tables, and images, with a PNG preview.' },
+  { name: 'create_xlsx',   group: 'office', permission: 'localExec', summary: 'Create an Excel (.xlsx) workbook from rows, formulas, formats, and multiple sheets, with a PNG preview.' },
+  { name: 'create_pptx',   group: 'office', permission: 'localExec', summary: 'Create a PowerPoint (.pptx) deck with layouts, styled shapes, images, tables, and a PNG preview.' },
+  { name: 'office_read',   group: 'office', permission: 'localExec', summary: 'Read an existing .docx/.xlsx/.pptx with element paths so edits can target them.' },
+  { name: 'edit_office',   group: 'office', permission: 'localExec', summary: 'Edit an existing .docx/.xlsx/.pptx in place, preserving document structure and returning a preview.' },
+  { name: 'office_render', group: 'office', permission: 'localExec', summary: 'Render a page of an existing .docx/.xlsx/.pptx to PNG to inspect layout.' },
+
   // Library
   { name: 'kb_list',       group: 'kb', summary: 'List Library files and indexing status before choosing what to search or read.' },
   { name: 'kb_search',     group: 'kb', summary: 'Semantic search over the user\'s Library.' },
@@ -116,6 +125,7 @@ const GROUP_ORDER: ReadonlyArray<{ group: ToolGroup; title: string }> = [
   { group: 'fs',    title: 'Files / workspace' },
   { group: 'shell', title: 'Shell' },
   { group: 'pdf',   title: 'PDF' },
+  { group: 'office', title: 'Office documents' },
   { group: 'kb',    title: 'Library' },
   { group: 'chat',  title: 'Conversation history' },
   { group: 'image', title: 'Image' },

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { docxBufferToMarkdown } from '../../../src/main/util/extract-docx';
+import { docxBufferToHtml, docxBufferToMarkdown } from '../../../src/main/util/extract-docx';
 import { makeMinimalDocx } from '../../fixtures/make-minimal-docx';
 
 describe('extract-docx › docxBufferToMarkdown', () => {
@@ -20,5 +20,19 @@ describe('extract-docx › docxBufferToMarkdown', () => {
 
   it('rejects empty buffer', async () => {
     await expect(docxBufferToMarkdown(Buffer.alloc(0))).rejects.toThrow(/empty|invalid/i);
+  });
+});
+
+describe('extract-docx › docxBufferToHtml', () => {
+  it('extracts preview HTML for paragraphs', async () => {
+    const docx = makeMinimalDocx({ heading: 'Preview Title', paragraphs: ['Preview body.'] });
+    const html = await docxBufferToHtml(docx);
+
+    expect(html).toContain('Preview Title');
+    expect(html).toMatch(/Preview body\\?\./);
+  });
+
+  it('rejects empty buffer', async () => {
+    await expect(docxBufferToHtml(Buffer.alloc(0))).rejects.toThrow(/empty|invalid/i);
   });
 });

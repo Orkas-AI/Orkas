@@ -16,6 +16,7 @@ import { t } from '../i18n';
 import { invalidateFileCache } from './file_indexer';
 import { projectExists } from './projects';
 import * as projectLibraryIndexer from './project_library_indexer';
+import { officeBufferToPreviewHtml, officePreviewKindForExt } from '../util/office-preview';
 
 const log = createLogger('project_files');
 
@@ -31,9 +32,13 @@ const TEXT_EXTS: ReadonlySet<string> = new Set([
 const IMAGE_EXTS: ReadonlySet<string> = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 const VIDEO_EXTS: ReadonlySet<string> = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
 const PDF_EXT = '.pdf';
-const DOCX_EXT = '.docx';
+const DOCX_EXTS: ReadonlySet<string> = new Set(['.docx', '.docm']);
+const SPREADSHEET_EXTS: ReadonlySet<string> = new Set(['.xlsx', '.xlsm']);
+const PRESENTATION_EXTS: ReadonlySet<string> = new Set(['.pptx', '.pptm']);
 const ALLOWED_EXTENSIONS: ReadonlySet<string> = new Set([
-  ...TEXT_EXTS, PDF_EXT, DOCX_EXT, ...IMAGE_EXTS, ...VIDEO_EXTS,
+  ...TEXT_EXTS,
+  PDF_EXT, ...DOCX_EXTS, ...SPREADSHEET_EXTS, ...PRESENTATION_EXTS,
+  ...IMAGE_EXTS, ...VIDEO_EXTS,
 ]);
 const IMAGE_MEDIA_TYPE: Record<string, string> = {
   '.png': 'image/png',
@@ -45,12 +50,13 @@ const IMAGE_MEDIA_TYPE: Record<string, string> = {
 
 const MAX_BYTES_TEXT = 5 * 1024 * 1024;
 const MAX_BYTES_DOCX = 20 * 1024 * 1024;
+const MAX_BYTES_OFFICE = 50 * 1024 * 1024;
 const MAX_BYTES_IMAGE = 20 * 1024 * 1024;
 const MAX_BYTES_PDF = 100 * 1024 * 1024;
 const MAX_BYTES_VIDEO = 200 * 1024 * 1024;
 const MAX_FILENAME_LEN = 200;
 
-export type ProjectFileKind = 'text' | 'pdf' | 'docx' | 'image' | 'video';
+export type ProjectFileKind = 'text' | 'pdf' | 'docx' | 'spreadsheet' | 'presentation' | 'image' | 'video';
 
 export interface ProjectFileInfo {
   name: string;
@@ -133,7 +139,9 @@ function resolveUnder(root: string, relPath: string): string {
 function kindOfName(name: string): ProjectFileKind {
   const ext = path.extname(name).toLowerCase();
   if (ext === PDF_EXT) return 'pdf';
-  if (ext === DOCX_EXT) return 'docx';
+  if (DOCX_EXTS.has(ext)) return 'docx';
+  if (SPREADSHEET_EXTS.has(ext)) return 'spreadsheet';
+  if (PRESENTATION_EXTS.has(ext)) return 'presentation';
   if (IMAGE_EXTS.has(ext)) return 'image';
   if (VIDEO_EXTS.has(ext)) return 'video';
   return 'text';
@@ -142,7 +150,8 @@ function kindOfName(name: string): ProjectFileKind {
 function maxBytesFor(name: string): number {
   const ext = path.extname(name).toLowerCase();
   if (ext === PDF_EXT) return MAX_BYTES_PDF;
-  if (ext === DOCX_EXT) return MAX_BYTES_DOCX;
+  if (DOCX_EXTS.has(ext)) return MAX_BYTES_DOCX;
+  if (SPREADSHEET_EXTS.has(ext) || PRESENTATION_EXTS.has(ext)) return MAX_BYTES_OFFICE;
   if (IMAGE_EXTS.has(ext)) return MAX_BYTES_IMAGE;
   if (VIDEO_EXTS.has(ext)) return MAX_BYTES_VIDEO;
   return MAX_BYTES_TEXT;
@@ -589,6 +598,25 @@ export async function readProjectDocxHtml(
     return { ok: true, html };
   } catch (err) {
     log.warn(`project docx→html ${projectId}/${name}: ${(err as Error).message}`);
+    return { ok: false, error: (err as Error).message };
+  }
+}
+
+export async function readProjectOfficeHtml(
+  userId: string,
+  projectId: string,
+  name: string,
+): Promise<Result<{ html: string; kind: 'word' | 'spreadsheet' | 'presentation'; previewHeight?: number }>> {
+  const r = await resolveProjectFileAbsPath(userId, projectId, name);
+  if (!r.ok) return { ok: false, error: (r as { error?: string }).error || 'not_found' };
+  const kind = officePreviewKindForExt(path.extname(r.absPath).toLowerCase());
+  if (!kind) return { ok: false, error: 'not a supported office file' };
+  try {
+    const buf = fs.readFileSync(r.absPath);
+    const preview = await officeBufferToPreviewHtml(kind, path.basename(r.absPath), buf);
+    return { ok: true, ...preview };
+  } catch (err) {
+    log.warn(`project office→html ${projectId}/${name}: ${(err as Error).message}`);
     return { ok: false, error: (err as Error).message };
   }
 }

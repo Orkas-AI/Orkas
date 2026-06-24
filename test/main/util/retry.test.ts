@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fetchWithRetry, retryAsync } from '../../../src/main/util/retry';
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -39,5 +40,23 @@ describe('fetchWithRetry', () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(res.status).toBe(404);
+  });
+
+  it('aborts a hung request when timeoutMs is provided', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn((_url, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const promise = expect(fetchWithRetry(
+      'test:timeout',
+      'https://example.test/slow',
+      undefined,
+      { retries: 0, timeoutMs: 100 },
+    )).rejects.toThrow(/test:timeout timed out after 100ms/);
+
+    await vi.advanceTimersByTimeAsync(100);
+    await promise;
   });
 });

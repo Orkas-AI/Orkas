@@ -156,6 +156,13 @@ export interface ResolveOpts {
    *  the bus will auto-add the actor). Mostly a fallback for raw-id @
    *  mentions in case the LLM falls back to ids. */
   resolveUnknown?: (token: string) => string | null;
+  /** The conversation floor (`StateFile.active_recipient`): the agent the
+   *  commander handed the user off to. When a USER message carries no `@`
+   *  mention, it routes here instead of the commander, so the user keeps
+   *  talking to that agent without re-`@`-ing. Absent / commander ⇒ the
+   *  default (user → commander). Only consulted for the sender-default route;
+   *  an explicit `@<target>` the user types always wins for that message. */
+  activeRecipient?: string;
 }
 
 /**
@@ -240,15 +247,25 @@ export function resolveRecipients(opts: ResolveOpts): RouteResolution {
   }
 
   // No `@` mentions at all → default route based on sender role.
-  //   - user → commander (orchestrator picks up the request)
+  //   - user → the conversation floor (`activeRecipient`): the agent the
+  //     commander handed off to, else the commander (orchestrator picks up
+  //     the request). This is what lets a handed-off agent keep the user's
+  //     follow-ups without re-`@`-ing every message.
   //   - commander → user (its replies are user-facing summaries)
   //   - agent → user (default surface output to the human; agents only
   //     reach commander via an explicit `@<commander-name>` mention)
   // See the "Group-chat mechanics" section of `chat_agent_in_group.md`
   // and `chat_commander.md`.
   let def: string;
-  if (opts.fromKind === 'user') def = COMMANDER_ID;
-  else def = USER_ID;
+  if (opts.fromKind === 'user') {
+    const floor = opts.activeRecipient;
+    // Only honour a floor that is a real agent still on the roster (a deleted
+    // or absent agent falls back to commander, never a dead route).
+    def = (floor && floor !== COMMANDER_ID && floor !== USER_ID && memberIds.has(floor))
+      ? floor : COMMANDER_ID;
+  } else {
+    def = USER_ID;
+  }
   return { to: [def], unknown };
 }
 
@@ -343,6 +360,32 @@ export function extractFormFromFinal(text: string, defaultAgentId?: string): Ext
 
   const cleanText = text.replace(re, '\n').replace(/\n{3,}/g, '\n\n').trim();
   return { cleanText, form: { agent_id: agentId, fields } };
+}
+
+// Hand-back marker: an agent holding the conversation floor (after the commander
+// handed off to it) emits `<handback />` to return control to the commander —
+// when its task is done or the user's ask is out of its scope. Display-only
+// markup; stripped from the visible bubble. Tolerant of attributes /
+// self-closing vs paired form, same as the plan-interaction marker.
+const HANDBACK_RE =
+  /<handback\b[^>]*\/>|<handback\b[^>]*>\s*<\/handback>/gi;
+
+export interface ExtractHandbackResult { cleanText: string; handback?: true }
+
+/** Strip a `<handback />` marker from an agent's visible text and report
+ *  whether it was present. The caller resets the floor to the commander only
+ *  when the emitting agent actually holds it. */
+export function extractHandbackFromFinal(text: string): ExtractHandbackResult {
+  if (!text || typeof text !== 'string') return { cleanText: text || '' };
+  if (!text.toLowerCase().includes('<handback')) return { cleanText: text };
+  // The cheap substring check above also passes on look-alikes (`<handbackfoo>`,
+  // `<handback-note>`, prose mentioning the token) — only the strict marker regex
+  // should count as a real hand-back, otherwise control is wrongly returned to
+  // the commander. (`g`-flag regex is stateful, so reset lastIndex before test.)
+  HANDBACK_RE.lastIndex = 0;
+  if (!HANDBACK_RE.test(text)) return { cleanText: text };
+  const cleanText = text.replace(HANDBACK_RE, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  return { cleanText, handback: true };
 }
 
 const PLAN_INTERACTION_RE =

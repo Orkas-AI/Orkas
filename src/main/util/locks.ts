@@ -23,8 +23,39 @@ export function sessionLock(sessionId: string): MutexInterface {
   return m;
 }
 
+const fileEditLocks = new Map<string, MutexInterface>();
+
+/** Per-file Mutex (keyed by absolute path) serializing the read-modify-write
+ *  inside `edit_file`. Parallel workers run on separate runs but share one
+ *  process and filesystem, so two concurrent edits of the SAME file would
+ *  otherwise interleave stat→read→write and lose an update; this makes the
+ *  freshness check + write atomic per file. Distinct files never contend. */
+export function fileEditLock(absPath: string): MutexInterface {
+  let m = fileEditLocks.get(absPath);
+  if (!m) {
+    m = new Mutex();
+    fileEditLocks.set(absPath, m);
+  }
+  return m;
+}
+
 /** Cap concurrent LLM calls across all users. */
 export const globalSlots: SemaphoreInterface = new Semaphore(10);
+
+/** Cap concurrent in-process nested dispatches (commander → worker/agent
+ *  sub-runs, G8d). Nested runs intentionally SKIP `globalSlots` to avoid the
+ *  parent-holds / child-waits deadlock (a nested acquire while the parent turn
+ *  already holds a slot), so they need their OWN bound: without it a single
+ *  commander fan-out of N `run_worker` calls would spawn N concurrent model
+ *  calls unbounded by `globalSlots`. Lower than `globalSlots` because each
+ *  nested run is itself a full LLM turn. Only the commander dispatches
+ *  (workers/agents get no dispatch tools), so this is never acquired
+ *  re-entrantly — no deadlock. Override with ORKAS_MAX_DISPATCH_CONCURRENCY. */
+const _dispatchCap = (() => {
+  const n = Number.parseInt(process.env.ORKAS_MAX_DISPATCH_CONCURRENCY ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : 4;
+})();
+export const dispatchSlots: SemaphoreInterface = new Semaphore(_dispatchCap);
 
 export type Releaser = MutexInterface.Releaser;
 

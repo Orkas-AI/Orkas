@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Ensure Orkas' pinned Python/uv runtime exists.
+ * Ensure Orkas' pinned Python/uv/Node runtime exists.
  *
  * Build-time use:
  *   node bin/ensure-runtime.cjs --root resources/runtime --platform darwin --arch arm64
@@ -17,9 +17,10 @@ const path = require('node:path');
 const https = require('node:https');
 const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
+const { verifyRuntimeDir } = require('./runtime-gate.cjs');
 
 const MARKER = '.orkas-runtime.json';
-const KINDS = ['python', 'uv'];
+const KINDS = ['python', 'uv', 'node'];
 const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 
 function die(message, extra) {
@@ -59,7 +60,7 @@ function parseArgs(argv) {
       process.stdout.write([
         'Usage: ensure-runtime.cjs [--platform p --arch a] [--root dir]',
         '                          [--check] [--no-download] [--quiet]',
-        '                          [--kind python|uv] [--all]',
+        '                          [--kind python|uv|node] [--all]',
         '',
         'Default --root is resources/runtime. Production app startup must not',
         'call this script; dev launchers and packaging hooks call it before boot.',
@@ -145,30 +146,26 @@ function isDir(p) {
   try { return fs.statSync(p).isDirectory(); } catch { return false; }
 }
 
-function readMarker(dir) {
-  try { return JSON.parse(fs.readFileSync(markerFile(dir), 'utf8')); } catch { return null; }
-}
-
-function markerMatches(marker, kind, key, spec, asset) {
-  return !!marker
-    && marker.kind === kind
-    && marker.platformKey === key
-    && marker.version === spec.version
-    && marker.asset === asset.name
-    && marker.sha256 === asset.sha256
-    && marker.size === asset.size;
-}
-
 function statusInRoot(root, kind, key, spec, asset) {
   let unverified = null;
+  const [targetPlatform, targetArch] = key.split('-');
   for (const dir of [currentDir(root, kind), runtimeDir(root, kind, key)]) {
     const executable = relPath(dir, asset.executable);
-    const marker = readMarker(dir);
-    if (isFile(executable) && markerMatches(marker, kind, key, spec, asset)) {
-      return { ok: true, status: 'ready', root, dir, executable, verified: true };
-    }
-    if (isFile(executable)) {
-      unverified ||= { ok: false, status: 'unverified', root, dir, executable, verified: false };
+    try {
+      const verifiedExecutable = verifyRuntimeDir(kind, dir, key, spec, asset, targetPlatform, targetArch, { checkArch: false });
+      return { ok: true, status: 'ready', root, dir, executable: verifiedExecutable, verified: true };
+    } catch (err) {
+      if (isFile(executable)) {
+        unverified ||= {
+          ok: false,
+          status: 'unverified',
+          root,
+          dir,
+          executable,
+          verified: false,
+          reason: err && err.message ? err.message : String(err),
+        };
+      }
     }
   }
   if (unverified) return unverified;
@@ -285,7 +282,14 @@ function findByBasename(root, names) {
 
 function copyTree(src, dest) {
   fs.rmSync(dest, { recursive: true, force: true });
-  fs.cpSync(src, dest, { recursive: true, dereference: true });
+  // Preserve symlinks verbatim. python-build-standalone ships `python3` / `python`
+  // (and others) as RELATIVE symlinks to the real `python3.12` binary co-located in
+  // `bin/`. Both `dereference: true` AND cpSync's default (verbatimSymlinks: false)
+  // rewrite those links to ABSOLUTE paths inside the temp extract dir; once
+  // ensureInRoot removes that temp dir the links dangle, so selfCheck fails with
+  // "runtime executable missing after install". verbatimSymlinks copies the link
+  // target string unchanged, keeping it relative and valid after the move into place.
+  fs.cpSync(src, dest, { recursive: true, verbatimSymlinks: true });
 }
 
 function preparePayload(kind, extractDir, payloadDir, asset) {
@@ -308,6 +312,20 @@ function preparePayload(kind, extractDir, payloadDir, asset) {
       fs.copyFileSync(uvx, uvxDest);
       try { fs.chmodSync(uvxDest, 0o755); } catch { /* best-effort */ }
     }
+    return;
+  }
+
+  if (kind === 'node') {
+    // Official Node archives extract to a single top-level
+    // `node-vX.Y.Z-<os>-<arch>/` dir. Flatten it so the payload root holds
+    // `bin/node` (mac/linux) / `node.exe` (win) directly — matching the
+    // manifest `executable` and keeping bundled-runtime resolution simple.
+    // copyTree uses verbatimSymlinks, so `bin/npm` / `bin/npx` (relative
+    // symlinks into lib/node_modules/npm) survive the move intact.
+    const dirs = fs.readdirSync(extractDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && e.name.startsWith('node-v'));
+    const top = dirs.length === 1 ? path.join(extractDir, dirs[0].name) : extractDir;
+    copyTree(top, payloadDir);
     return;
   }
 
@@ -423,6 +441,19 @@ function shouldRunSelfCheck(key) {
 }
 
 function selfCheck(kind, dir, asset, key, opts) {
+  const spec = opts.manifestSpec;
+  if (spec) {
+    const [targetPlatform, targetArch] = key.split('-');
+    try {
+      verifyRuntimeDir(kind, dir, key, spec, asset, targetPlatform, targetArch, { checkArch: false });
+    } catch (err) {
+      die('runtime payload failed self-check', {
+        kind,
+        dir,
+        error: err && err.message ? err.message : String(err),
+      });
+    }
+  }
   if (!shouldRunSelfCheck(key)) return '';
   const executable = relPath(dir, asset.executable);
   if (!isFile(executable)) die('runtime executable missing after install', { kind, executable });
@@ -441,6 +472,17 @@ function selfCheck(kind, dir, asset, key, opts) {
       stderr: String(res.stderr || '').slice(-1200),
     });
   }
+  if (kind === 'node') {
+    // node --version passing doesn't prove the flattened tree kept working
+    // npm/npx (relative symlinks on mac/linux, .cmd on win). isFile follows the
+    // symlink, so a dropped/broken link fails here at build, not on a user box.
+    const binDir = path.dirname(executable);
+    const npm = path.join(binDir, key.startsWith('win32') ? 'npm.cmd' : 'npm');
+    const npx = path.join(binDir, key.startsWith('win32') ? 'npx.cmd' : 'npx');
+    if (!isFile(npm) || !isFile(npx)) {
+      die('node runtime npm/npx missing after install', { kind, npm, npx });
+    }
+  }
   const version = String(res.stdout || res.stderr || '').trim();
   log(opts, `runtime ${kind} self-check ok`, { version });
   return version;
@@ -452,6 +494,11 @@ async function ensureInRoot(root, kind, key, spec, asset, opts) {
   if (current.ok) {
     if (!opts.check) doctorDir(current.dir, kind, spec, asset, opts);
     return { kind, key, ...current };
+  }
+  if (!opts.check && current.status === 'unverified' && isFile(current.executable)) {
+    doctorDir(current.dir, kind, spec, asset, opts);
+    const repaired = statusInRoot(root, kind, key, spec, asset);
+    if (repaired.ok) return { kind, key, ...repaired };
   }
   if (opts.check || opts.noDownload) return { kind, key, ...current };
 
@@ -477,8 +524,7 @@ async function ensureInRoot(root, kind, key, spec, asset, opts) {
     writeMarker(payloadDir, kind, key, spec, asset);
     replaceDir(dest, payloadDir);
     fs.rmSync(tmp, { recursive: true, force: true });
-    doctorDir(dest, kind, spec, asset, opts);
-    const versionOutput = selfCheck(kind, dest, asset, key, opts);
+    const versionOutput = selfCheck(kind, dest, asset, key, { ...opts, manifestSpec: spec });
     return {
       kind,
       key,

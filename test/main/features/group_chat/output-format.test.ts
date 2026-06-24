@@ -3,8 +3,50 @@ import { describe, it, expect } from 'vitest';
 import {
   _buildOutputFormatHintForTest,
   _buildPlanInteractionHintForTest,
+  _redactDispatchToolResult,
 } from '../../../../src/main/features/group_chat/bus';
 import { prompts } from '../../../../src/main/prompts/loader';
+
+describe('dispatch tool-result redaction in the process rail', () => {
+  // Assert the worker OUTPUT is gone (robust to the i18n'd replacement wording),
+  // not an exact replacement string.
+  it('scrubs a dispatch tool result (run_worker / dispatch_to) on end', () => {
+    for (const name of ['run_worker', 'dispatch_to']) {
+      const inner = { stream: 'tool', data: { name, phase: 'end', result_preview: '<worker-result>secret worker output</worker-result>' } };
+      _redactDispatchToolResult(inner);
+      expect(inner.data.result_preview, `${name} output must be removed`).not.toContain('secret worker output');
+      expect(inner.data.result_preview).not.toContain('<worker-result>');
+      expect(inner.data.result_preview, `${name} keeps a short note`).toBeTruthy();
+    }
+  });
+
+  it('also handles the `result` phase + toolName/status field aliases', () => {
+    const inner = { stream: 'tool', data: { toolName: 'dispatch_to', status: 'result', result_preview: 'raw worker text' } };
+    _redactDispatchToolResult(inner as unknown);
+    expect((inner.data as { result_preview: string }).result_preview).not.toContain('raw worker text');
+  });
+
+  it('leaves NON-dispatch tools untouched (read_file end keeps its preview)', () => {
+    const inner = { stream: 'tool', data: { name: 'read_file', phase: 'end', result_preview: 'file contents preview' } };
+    _redactDispatchToolResult(inner);
+    expect(inner.data.result_preview).toBe('file contents preview');
+  });
+
+  it('leaves the dispatch tool START event untouched (only end carries the result)', () => {
+    const inner = { stream: 'tool', data: { name: 'run_worker', phase: 'start', arguments: { task: 'do a thing' } } };
+    _redactDispatchToolResult(inner);
+    expect((inner.data as { result_preview?: string }).result_preview).toBeUndefined();
+    expect(inner.data.arguments).toEqual({ task: 'do a thing' });
+  });
+
+  it('ignores non-tool streams and malformed events', () => {
+    const a = { stream: 'lifecycle', data: { phase: 'end', result_preview: 'x' } };
+    _redactDispatchToolResult(a);
+    expect(a.data.result_preview).toBe('x');
+    expect(() => _redactDispatchToolResult(undefined)).not.toThrow();
+    expect(() => _redactDispatchToolResult({})).not.toThrow();
+  });
+});
 
 describe('group_chat output_format prompt hints', () => {
   it('turns auto, missing, and unknown values into the automatic chooser', () => {

@@ -7,7 +7,7 @@
  *   - `createContextDir` — new subdirectory
  *   - `writeContextFile`  — new / overwrite a text file
  *   - `updateContextFile` — edit an existing text file
- *   - `uploadContextFile` — save a binary upload (pdf / docx / image)
+ *   - `uploadContextFile` — save a binary upload (pdf / modern Office / image)
  *   - `renameContextEntry` — rename a file or directory
  *   - `deleteContextTarget` — delete a file or directory (recursive)
  *   - `listContextsTree`  — browse
@@ -34,6 +34,7 @@ import * as kbVector from './kb_vector';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
 import { getActiveUserId } from './users';
+import { officeBufferToPreviewHtml, officePreviewKindForExt } from '../util/office-preview';
 
 const log = createLogger('contexts');
 
@@ -64,7 +65,11 @@ const TEXT_EXTS: ReadonlySet<string> = new Set([
   '.sql', '.graphql', '.gql',
 ]);
 const BINARY_EXTS: ReadonlySet<string> = new Set([
-  '.pdf', '.docx', '.png', '.jpg', '.jpeg', '.webp', '.gif',
+  '.pdf',
+  '.docx', '.docm',
+  '.xlsx', '.xlsm',
+  '.pptx', '.pptm',
+  '.png', '.jpg', '.jpeg', '.webp', '.gif',
 ]);
 const ALLOWED_EXTS: ReadonlySet<string> = new Set([...TEXT_EXTS, ...BINARY_EXTS]);
 const MAX_FILE_BYTES = 200 * 1024 * 1024; // 200MB — defensive cap per plan §3.3
@@ -122,6 +127,15 @@ interface IndexCache {
 
 interface ResolveOpts { mustExist?: boolean }
 
+function contextPathSegments(relpath: string): string[] {
+  const s = String(relpath || '').trim().replace(/^\/+|\/+$/g, '');
+  return s ? s.split('/') : [];
+}
+
+export function hasHiddenContextPathSegment(relpath: string): boolean {
+  return contextPathSegments(relpath).some((p) => p.startsWith('.'));
+}
+
 /**
  * Resolve a user-supplied relative path safely under contextsRoot().
  * Returns absolute path; throws on traversal, absolute inputs, empty
@@ -131,12 +145,12 @@ function resolvePath(relpath: string, { mustExist = false }: ResolveOpts = {}): 
   if (typeof relpath !== 'string') throw new Error('path required');
   const s = relpath.trim().replace(/^\/+|\/+$/g, '');
   if (!s) return path.resolve(contextsRoot());
-  const parts = s.split('/');
+  const parts = contextPathSegments(s);
   if (parts.some((p) => p === '' || p === '.' || p === '..')) throw new Error('invalid path segment');
   if (parts.some((p) => p.includes('\x00'))) throw new Error('invalid character');
   // Reject any segment starting with '.' — keeps `.kb/` (vector db) and other
   // hidden dirs off-limits to user mutations.
-  if (parts.some((p) => p.startsWith('.'))) throw new Error('hidden entries are reserved');
+  if (hasHiddenContextPathSegment(s)) throw new Error('hidden entries are reserved');
   // Length cap (per-segment, weighted — see MAX_BASENAME_WEIGHT).
   // The first offending segment is surfaced verbatim so the user knows which
   // part of the path is too long (file basename vs. some parent dir).
@@ -157,12 +171,24 @@ function resolvePath(relpath: string, { mustExist = false }: ResolveOpts = {}): 
   return target;
 }
 
+/** Absolute path of a context file for a user-supplied relpath, with the same
+ *  safety checks as readContextFile (traversal / hidden / must-exist). Used by
+ *  the "ask the commander about this file" flow to import the KB file as a chat
+ *  attachment. Throws on an invalid or missing path. */
+export function resolveContextFileAbsPath(relpath: string): string {
+  return resolvePath(relpath, { mustExist: true });
+}
+
 function extOf(name: string): string {
   return path.extname(name).toLowerCase();
 }
 
 function isAllowedName(name: string): boolean {
   return ALLOWED_EXTS.has(extOf(name));
+}
+
+export function isSupportedContextFileName(name: string): boolean {
+  return isAllowedName(name);
 }
 
 // ── Listing / Reading ────────────────────────────────────────────────────
@@ -230,6 +256,27 @@ export async function readContextDocxHtml(relpath: string): Promise<Result<{ htm
     return { ok: true, html };
   } catch (err) {
     log.warn(`docx→html ${relpath}: ${(err as Error).message}`);
+    return { ok: false, error: (err as Error).message };
+  }
+}
+
+/** Convert a modern Office file to a full, sandbox-friendly HTML preview.
+ *  This is a lightweight content preview, not a high-fidelity layout render. */
+export async function readContextOfficeHtml(
+  relpath: string,
+): Promise<Result<{ html: string; kind: 'word' | 'spreadsheet' | 'presentation'; previewHeight?: number }>> {
+  let p: string;
+  try { p = resolvePath(relpath, { mustExist: true }); }
+  catch (err) { return { ok: false, error: (err as Error).message }; }
+  if (!fs.statSync(p).isFile()) return { ok: false, error: 'not a file' };
+  const kind = officePreviewKindForExt(extOf(p));
+  if (!kind) return { ok: false, error: 'not a supported office file' };
+  try {
+    const buf = fs.readFileSync(p);
+    const preview = await officeBufferToPreviewHtml(kind, path.basename(p), buf);
+    return { ok: true, ...preview };
+  } catch (err) {
+    log.warn(`office→html ${relpath}: ${(err as Error).message}`);
     return { ok: false, error: (err as Error).message };
   }
 }
@@ -387,7 +434,7 @@ export function updateContextFile(relpath: string, content: string): Result<{ pa
 }
 
 /**
- * Save an uploaded binary (pdf / docx / image) at `relpath`. Text types are
+ * Save an uploaded binary (pdf / modern Office / image) at `relpath`. Text types are
  * accepted too — the buffer is written byte-for-byte; UTF-8 validation is
  * the caller's job (text uploads usually go through `writeContextFile`
  * after the renderer reads the file as string).

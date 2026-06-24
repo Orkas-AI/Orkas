@@ -87,6 +87,7 @@ export function rankChatHitsForTest(hits: search.SearchResult[], currentCid?: st
 function createChatSearchTool(opts: ChatHistoryToolsOpts): AgentTool {
   return {
     name: 'chat_search',
+    executionMode: 'parallel',
     description:
       'Search across the current user\'s conversation history. Use this only after\n'
       + '`kb_search` / `kb_read` when the user asks about prior chats, previous\n'
@@ -145,6 +146,7 @@ function createChatSearchTool(opts: ChatHistoryToolsOpts): AgentTool {
 function createChatReadTool(opts: ChatHistoryToolsOpts): AgentTool {
   return {
     name: 'chat_read',
+    executionMode: 'parallel',
     description:
       'Read messages from one conversation. Pair with `chat_search`: pass a hit\'s\n'
       + '`cid` and `msg_index` to fetch nearby context. If `msg_index` is omitted,\n'

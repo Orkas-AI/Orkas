@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseOpenclawReply } from '../../../../src/main/features/local_agents/backends/openclaw';
+import { buildOpenclawArgs, parseOpenclawReply } from '../../../../src/main/features/local_agents/backends/openclaw';
 
 describe('local_agents/backends/openclaw › parseOpenclawReply', () => {
   it('returns null for empty input', () => {
@@ -110,5 +110,29 @@ describe('local_agents/backends/openclaw › parseOpenclawReply', () => {
     const r = parseOpenclawReply(stderr);
     expect(r?.text).toBe('ok');
     expect((r as any).usage).toBeUndefined();
+  });
+});
+
+describe('local_agents/backends/openclaw › buildOpenclawArgs', () => {
+  it('passes Orkas watchdog timeout through to the CLI timeout', () => {
+    const args = buildOpenclawArgs({
+      prompt: 'do work',
+      timeoutMs: 60 * 60 * 1000,
+    }, 'session-1');
+
+    expect(args).toContain('--timeout');
+    expect(args[args.indexOf('--timeout') + 1]).toBe('3600');
+    expect(args.slice(-2)).toEqual(['--message', 'do work']);
+  });
+
+  it('does not override an explicit custom timeout', () => {
+    const args = buildOpenclawArgs({
+      prompt: 'do work',
+      timeoutMs: 60 * 60 * 1000,
+      customArgs: ['--timeout', '120'],
+    }, 'session-1');
+
+    expect(args.filter((arg) => arg === '--timeout')).toHaveLength(1);
+    expect(args[args.indexOf('--timeout') + 1]).toBe('120');
   });
 });

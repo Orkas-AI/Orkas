@@ -7,7 +7,11 @@ import { toCompressedGrayJpeg } from '../util/image-transform';
 
 const log = createLogger('library_image_describer');
 
-const IMAGE_DESCRIBE_TIMEOUT_MS = 45_000;
+// Per-image cap for KB / project-library vision summaries. This is not an
+// interactive chat turn, but slow model routing can exceed two minutes; 5min
+// avoids premature fallback while keeping a bad image from stalling a whole
+// indexing batch for too long.
+const IMAGE_DESCRIBE_TIMEOUT_MS = 5 * 60 * 1000;
 const IMAGE_DESCRIBE_IDLE_TIMEOUT_SEC = Math.ceil(IMAGE_DESCRIBE_TIMEOUT_MS / 1000);
 
 interface VisionResult {

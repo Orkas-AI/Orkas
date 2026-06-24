@@ -37,6 +37,8 @@ import * as metacognition from '../../features/metacognition';
 import { appendAgentSkill, listAgents } from '../../features/agents';
 const log = createLogger('model/runner');
 import { createLocalTools, createFileTools } from './local-tools';
+import { createOfficeTools } from './office-tools';
+import { officeCliAvailable } from '../../features/office/office_engine';
 import { createKbTools } from './kb-tools';
 import { createChatHistoryTools } from './chat-history-tools';
 import { createImageGenTool } from './image-gen-tool';
@@ -107,6 +109,9 @@ export interface BuildRunnerParams {
   projectId?: string;
   /** Agent id bound to the conversation. Empty/undefined = default scope. */
   agentId?: string;
+  /** Max tool-call rounds per turn before force-end. Undefined keeps the
+   *  core-agent default. */
+  maxToolLoops?: number;
 
   /** Optional subset of skill ids; undefined = full global listing. See
    * `skill-registry.getSystemPromptBlock` for the exact semantics. */
@@ -435,6 +440,20 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       })]
     : [];
 
+  // Office document tools (bundled OfficeCLI engine). Permission-gated like
+  // local-tools: creating/editing Office files has the same blast radius as
+  // write_file. Skipped when the engine is not bundled or uid is unknown.
+  const officeTools: AgentTool[] = uid && officeCliAvailable()
+    ? createOfficeTools({
+        userId: uid,
+        ...(params.cid ? { cid: params.cid } : {}),
+        ...(params.projectId ? { projectId: params.projectId } : {}),
+        ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
+        ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
+        ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
+      })
+    : [];
+
   // `web_search` override — last-write-wins replacement for core-agent's
   // built-in keyless web_search. Routes to a paid search API when the user
   // has any `searchProfiles` configured; otherwise delegates back to the
@@ -492,6 +511,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...kbTools,
     ...chatHistoryTools,
     ...imageGenTools,
+    ...officeTools,
     ...searchOverrideTools,
     ...(params.extraTools || []),
     ...connectorMetaTools,
@@ -598,6 +618,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       defaultProvider: providerId,
       defaultModel: modelId,
       ...(resolvedSystemPrompt ? { systemPrompt: resolvedSystemPrompt } : {}),
+      ...(params.maxToolLoops ? { maxToolLoops: params.maxToolLoops } : {}),
     },
     evolution: evolutionConfig,
     // We deliberately do NOT populate `models.providers` —

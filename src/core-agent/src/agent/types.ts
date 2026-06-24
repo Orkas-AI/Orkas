@@ -35,6 +35,15 @@ export type AgentRunParams = {
    * / OpenAI 24h), `"none"` to opt out. Provider-specific; providers without
    * caching silently ignore. */
   cacheRetention?: "none" | "short" | "long";
+  /**
+   * interrupt-steer hook. Called at each successful tool-loop boundary (after
+   * tool results are committed, before the next LLM call). Return any user
+   * messages the host wants folded into THIS run — each becomes a `user` turn
+   * so the agent course-corrects mid-task instead of finishing the now-stale
+   * work and handling the message as a separate follow-up turn. Synchronous
+   * (the runner calls it between awaits); return `[]`/undefined for no steer.
+   */
+  drainSteer?: () => string[] | undefined;
 };
 
 /** Result of a single agent run. */

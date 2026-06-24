@@ -7,6 +7,16 @@ export const DEFAULT_NETWORK_RETRY_ATTEMPTS = 3;
 export const DEFAULT_NETWORK_RETRY_DELAYS_MS = [500, 1_000, 2_000];
 
 type FetchImplementation = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+interface RetryOptions {
+  retries?: number;
+  delaysMs?: number[];
+}
+
+interface FetchRetryOptions extends RetryOptions {
+  /** Per-attempt wall-clock timeout. Omitted by default so large downloads can opt in deliberately. */
+  timeoutMs?: number;
+  timeoutMessage?: string;
+}
 
 let fetchImplementation: FetchImplementation | null = null;
 
@@ -35,9 +45,7 @@ function delay(ms: number): Promise<void> {
 export async function retryAsync<T>(
   label: string,
   fn: () => Promise<T>,
-  opts: {
-    retries?: number;
-    delaysMs?: number[];
+  opts: RetryOptions & {
     isRetriable?: (err: unknown) => boolean;
   } = {},
 ): Promise<T> {
@@ -65,20 +73,58 @@ export async function retryAsync<T>(
   throw lastErr;
 }
 
+function composeTimeoutSignal(
+  parent: AbortSignal | undefined,
+  timeoutMs: number | undefined,
+  timeoutMessage: string,
+): { signal?: AbortSignal; cleanup: () => void; timedOut: () => boolean } {
+  if (!timeoutMs || timeoutMs <= 0) {
+    return { signal: parent, cleanup: () => {}, timedOut: () => false };
+  }
+  const controller = new AbortController();
+  let didTimeout = false;
+  const timer = setTimeout(() => {
+    didTimeout = true;
+    controller.abort(new Error(timeoutMessage));
+  }, timeoutMs);
+  const onAbort = () => {
+    const reason = (parent as (AbortSignal & { reason?: unknown }) | undefined)?.reason;
+    controller.abort(reason || new Error('operation aborted'));
+  };
+  if (parent) {
+    if (parent.aborted) onAbort();
+    else parent.addEventListener('abort', onAbort, { once: true });
+  }
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      clearTimeout(timer);
+      if (parent) parent.removeEventListener?.('abort', onAbort);
+    },
+    timedOut: () => didTimeout,
+  };
+}
+
 export async function fetchWithRetry(
   label: string,
   input: RequestInfo | URL,
   init?: RequestInit,
-  opts: {
-    retries?: number;
-    delaysMs?: number[];
-  } = {},
+  opts: FetchRetryOptions = {},
 ): Promise<Response> {
   return retryAsync(label, async () => {
-    const res = await (fetchImplementation || fetch)(input, init);
-    if (isRetriableHttpStatus(res.status)) {
-      throw new RetriableHttpStatusError(res.status, label);
+    const timeoutMessage = opts.timeoutMessage || `${label} timed out after ${opts.timeoutMs}ms`;
+    const composed = composeTimeoutSignal(init?.signal ?? undefined, opts.timeoutMs, timeoutMessage);
+    try {
+      const res = await (fetchImplementation || fetch)(input, { ...init, signal: composed.signal });
+      if (isRetriableHttpStatus(res.status)) {
+        throw new RetriableHttpStatusError(res.status, label);
+      }
+      return res;
+    } catch (err) {
+      if (composed.timedOut()) throw new Error(timeoutMessage);
+      throw err;
+    } finally {
+      composed.cleanup();
     }
-    return res;
   }, opts);
 }

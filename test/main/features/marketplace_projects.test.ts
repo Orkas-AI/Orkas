@@ -20,8 +20,8 @@ describe('marketplace projects catalog', () => {
     const marketplace = await loadMarketplace();
     const home = await marketplace.listMarketplaceProjects({ home_only: true });
 
-    expect(home.list.map((p) => p.id)).toEqual(['hyperframes', 'ppt-master', 'crawl4ai']);
-    expect(home.categories.map((c) => c.code)).toEqual(['anim', 'browser', 'slides']);
+    expect(home.list.map((p) => p.id)).toEqual(['hyperframes', 'ppt-master', 'OfficeCLI', 'crawl4ai']);
+    expect(home.categories.map((c) => c.code)).toEqual(['anim', 'browser', 'office', 'slides']);
     expect(home.source).toBe('bundled');
     expect(home.stale).toBe(true);
   });
@@ -55,5 +55,41 @@ describe('marketplace projects catalog', () => {
     expect(data.source).toBe('server');
     expect(data.stale).toBe(false);
     expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it('sends If-None-Match and replays the cached list on a 304', async () => {
+    process.env.ORKAS_API_BASE_URL = 'https://marketplace.test/api';
+    const fetchMock = vi.fn(async (_url: unknown, init: RequestInit) => {
+      const headers = (init.headers || {}) as Record<string, string>;
+      if (!headers['If-None-Match']) {
+        return new Response(JSON.stringify({
+          code: 0,
+          list: [{ id: 'server-project', name: 'Server Project' }],
+          total: 1,
+          categories: [],
+        }), { status: 200, headers: { ETag: '"abc123"' } });
+      }
+      // Conditional revalidation: the client must echo the prior ETag.
+      expect(headers['If-None-Match']).toBe('"abc123"');
+      // undici's Response constructor rejects a 304 (null-body status), so hand
+      // back a minimal response shape — the client only reads `.status` here.
+      return {
+        status: 304,
+        headers: { get: (k: string) => (k.toLowerCase() === 'etag' ? '"abc123"' : null) },
+        text: async () => '',
+      } as unknown as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const marketplace = await loadMarketplace();
+    const first = await marketplace.listMarketplaceProjects({ home_only: true });
+    const second = await marketplace.listMarketplaceProjects({ home_only: true });
+
+    expect(first.list.map((p) => p.id)).toEqual(['server-project']);
+    // 304 → replay the cached body, still flagged as a fresh Server result.
+    expect(second.list.map((p) => p.id)).toEqual(['server-project']);
+    expect(second.source).toBe('server');
+    expect(second.stale).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

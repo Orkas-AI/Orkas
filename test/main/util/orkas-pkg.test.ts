@@ -175,7 +175,56 @@ describe.skipIf(!gitAvailable)('orkas-pkg.cjs', () => {
     const shim = path.join(pkgsDir(), '.bin', 'clitool');
     const content = fs.readFileSync(shim, 'utf8');
     expect(content).toContain(path.join(pkgsDir(), 'clitool', 'bin/cli.js'));
-    expect(content).toContain('ORKAS_NODE');
+    expect(content).toContain('ORKAS_BUNDLED_NODE');
+    expect(content).not.toContain('ORKAS_NODE');
+  });
+
+  itOnNonWindows('installs Node deps under the user package tree with Orkas npm cache/prefix', () => {
+    const repo = makeRepo('npmpkg', {
+      'package.json': JSON.stringify({
+        name: 'npmpkg',
+        version: '1.0.0',
+        bin: { npmpkg: 'bin/cli.js' },
+        dependencies: { 'left-pad': '1.3.0' },
+      }),
+      'package-lock.json': JSON.stringify({ name: 'npmpkg', lockfileVersion: 3, packages: {} }),
+      'bin/cli.js': '#!/usr/bin/env node\nconsole.log("hi")\n',
+    });
+    const fakeBin = path.join(tmpDir, 'fake-bin');
+    const fakeNpm = path.join(fakeBin, 'npm');
+    const argsLog = path.join(tmpDir, 'npm-args.log');
+    const cacheLog = path.join(tmpDir, 'npm-cache.log');
+    const prefixLog = path.join(tmpDir, 'npm-prefix.log');
+    fs.mkdirSync(fakeBin, { recursive: true });
+    fs.writeFileSync(fakeNpm, [
+      '#!/bin/sh',
+      'printf "%s\\n" "$*" > "$NPM_ARGS_LOG"',
+      'printf "%s\\n" "$NPM_CONFIG_CACHE" > "$NPM_CACHE_LOG"',
+      'printf "%s\\n" "$NPM_CONFIG_PREFIX" > "$NPM_PREFIX_LOG"',
+      'mkdir -p node_modules/fake-dep',
+      '',
+    ].join('\n'));
+    fs.chmodSync(fakeNpm, 0o755);
+
+    const install = runPkg('install', repo);
+    expect(install.status).toBe(0);
+    expect(install.json.deps_pending_consent).toEqual(['npm ci --omit=dev']);
+    expect(fs.existsSync(path.join(pkgsDir(), 'npmpkg', 'node_modules'))).toBe(false);
+
+    const consent = runPkgWithEnv({
+      PATH: `${fakeBin}${path.delimiter}${process.env.PATH || ''}`,
+      NPM_ARGS_LOG: argsLog,
+      NPM_CACHE_LOG: cacheLog,
+      NPM_PREFIX_LOG: prefixLog,
+    }, 'consent-deps', 'npmpkg');
+
+    expect(consent.status).toBe(0);
+    expect(consent.json.deps_installed).toEqual(['npm ci --omit=dev']);
+    expect(fs.readFileSync(argsLog, 'utf8').trim()).toBe('ci --omit=dev --no-fund --no-audit');
+    expect(fs.readFileSync(cacheLog, 'utf8').trim()).toBe(path.join(wsRoot, 'venv', 'node', 'cache', 'npm'));
+    expect(fs.readFileSync(prefixLog, 'utf8').trim()).toBe(path.join(wsRoot, 'venv', 'node', 'prefix'));
+    expect(fs.existsSync(path.join(pkgsDir(), 'npmpkg', 'node_modules', 'fake-dep'))).toBe(true);
+    expect(path.join(pkgsDir(), 'npmpkg', 'node_modules')).toContain(path.join(TEST_UID, 'local', 'packages'));
   });
 
   it('parses pyproject [project.scripts] but not look-alike sections', () => {
@@ -347,5 +396,33 @@ describe.skipIf(!gitAvailable)('orkas-pkg.cjs', () => {
 
   it('enable/disable on an unknown package errors', () => {
     expect(runPkg('disable', 'ghost').status).toBe(66);
+  });
+
+  itOnNonWindows('refuses to install a repo containing a symbolic link (escape defense)', () => {
+    // A public repo can legitimately ship symlinks; one pointing outside the
+    // package would let the scan/read follow it out of the tree. Reject install.
+    const repo = path.join(tmpDir, 'repos', 'evilpack');
+    fs.mkdirSync(repo, { recursive: true });
+    fs.writeFileSync(path.join(repo, 'README.md'), 'hi');
+    const secret = path.join(tmpDir, 'secret.txt');
+    fs.writeFileSync(secret, 'TOPSECRET');
+    fs.symlinkSync(secret, path.join(repo, 'SKILL.md')); // SKILL.md -> outside the package
+    git(repo, 'init', '-q');
+    git(repo, 'add', '-A');
+    git(repo, 'commit', '-qm', 'init');
+
+    const r = runPkg('install', repo);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr + r.stdout).toMatch(/symbolic link/i);
+    const regPath = path.join(pkgsDir(), '_registry.json');
+    const installed = fs.existsSync(regPath) ? JSON.parse(fs.readFileSync(regPath, 'utf8')).packages.length : 0;
+    expect(installed).toBe(0);
+  });
+
+  it('refuses a non-allowlisted git source scheme (ext:: command-execution vector)', () => {
+    // --name so the source passes name validation and reaches the scheme check.
+    const r = runPkg('install', 'ext::sh -c "echo pwned"', '--name', 'evilpkg');
+    expect(r.status).not.toBe(0);
+    expect(r.stderr + r.stdout).toMatch(/unsupported source/i);
   });
 });

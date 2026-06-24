@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { makeMinimalPptx, makeMinimalXlsx } from '../../fixtures/make-minimal-office';
 
 /**
  * contexts.ts tests for the single-region user-owned model. Mocks
@@ -92,6 +93,13 @@ describe('contexts › path safety', () => {
     const c = await loadContexts();
     const r = c.uploadContextFile('../evil.pdf', Buffer.from([1, 2, 3]));
     expect(r.ok).toBe(false);
+  });
+
+  it('uploadContextFile rejects dot-prefixed target', async () => {
+    const c = await loadContexts();
+    const r = c.uploadContextFile('.orkas-native-deps-verified.json', Buffer.from('{}'));
+    expect(r.ok).toBe(false);
+    expect((r as any).error).toMatch(/hidden/i);
   });
 
   it('createContextDir rejects dot-prefixed', async () => {
@@ -248,6 +256,35 @@ describe('contexts › uploadContextFile', () => {
     const r = c.uploadContextFile('doc.pdf', Buffer.from('%PDF-1.4\n'));
     expect(r.ok).toBe(true);
     expect(fs.existsSync(path.join(ctxRoot(), 'doc.pdf'))).toBe(true);
+  });
+
+  it('accepts modern Office bytes', async () => {
+    const c = await loadContexts();
+    const sheet = c.uploadContextFile('scores.xlsx', makeMinimalXlsx());
+    const deck = c.uploadContextFile('slides.pptx', makeMinimalPptx());
+    const macroDeck = c.uploadContextFile('slides-macro.pptm', makeMinimalPptx({ slides: [['Macro deck']] }));
+
+    expect(sheet.ok).toBe(true);
+    expect(deck.ok).toBe(true);
+    expect(macroDeck.ok).toBe(true);
+    expect(fs.existsSync(path.join(ctxRoot(), 'scores.xlsx'))).toBe(true);
+    expect(fs.existsSync(path.join(ctxRoot(), 'slides.pptx'))).toBe(true);
+    expect(kbEnqueueCalls).toContainEqual({ userId: TEST_UID, relPath: 'scores.xlsx', op: 'upsert' });
+    expect(kbEnqueueCalls).toContainEqual({ userId: TEST_UID, relPath: 'slides.pptx', op: 'upsert' });
+    expect(kbEnqueueCalls).toContainEqual({ userId: TEST_UID, relPath: 'slides-macro.pptm', op: 'upsert' });
+  });
+
+  it('renders modern Office preview HTML', async () => {
+    const c = await loadContexts();
+    c.uploadContextFile('scores.xlsx', makeMinimalXlsx({
+      rows: [['Name'], ['Ada']],
+    }));
+
+    const preview = await c.readContextOfficeHtml('scores.xlsx');
+    expect(preview.ok).toBe(true);
+    expect((preview as any).kind).toBe('spreadsheet');
+    expect((preview as any).html).toContain('Ada');
+    expect((preview as any).html).toContain('office-preview office-spreadsheet');
   });
 
   it('accepts image bytes (non-UTF8 ok)', async () => {
@@ -449,4 +486,20 @@ describe('contexts › rebuildIndex', () => {
     expect(entries.map((e) => e.path).sort()).toEqual(['a.md', 'sub/b.md', 'sub/c.pdf']);
   });
 
+});
+
+describe('contexts › resolveContextFileAbsPath (ask-commander attach uses this)', () => {
+  it('resolves a valid relpath to an existing abs path; rejects traversal / hidden / missing', async () => {
+    const c = await loadContexts();
+    expect(c.writeContextFile('notes.md', 'hello').ok).toBe(true);
+
+    const abs = c.resolveContextFileAbsPath('notes.md');
+    expect(path.isAbsolute(abs)).toBe(true);
+    expect(abs.endsWith(`${path.sep}notes.md`)).toBe(true);
+    expect(fs.existsSync(abs)).toBe(true);
+
+    expect(() => c.resolveContextFileAbsPath('../escape.md')).toThrow();   // traversal
+    expect(() => c.resolveContextFileAbsPath('.kb/secret.md')).toThrow();  // hidden segment
+    expect(() => c.resolveContextFileAbsPath('does-not-exist.md')).toThrow(); // mustExist
+  });
 });

@@ -228,7 +228,9 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     systemPrompt,
     workingDir,
     images,
-    idleTimeout = 600,
+    idleTimeout = 1800,
+    streamIdleTimeout = 180,
+    maxToolLoops,
     abortSignal = null,
     skillList,
     projectAllowedSkillIds,
@@ -298,6 +300,9 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   let idleHit = false;
   let externalAbort = false;
   let directSessionAbort = false;
+  let toolDepth = 0;
+  let sawFirstEvent = false;
+  let idleHitWindow = idleTimeout;
   const activeAbortEntry: ActiveSessionAbort = {
     abort: () => {
       directSessionAbort = true;
@@ -311,13 +316,16 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
 
   const resetIdle = () => {
     if (idleTimer) clearTimeout(idleTimer);
+    const inToolPhase = toolDepth > 0;
+    const window = !inToolPhase && sawFirstEvent ? streamIdleTimeout : idleTimeout;
     idleTimer = setTimeout(() => {
       idleHit = true;
-      log.warn(`idle-watchdog fired ${turnTag} — no event for ${idleTimeout}s, aborting + releasing locks`);
+      idleHitWindow = window;
+      log.warn(`idle-watchdog fired ${turnTag} — no event for ${window}s (phase=${inToolPhase ? 'tool' : 'model'}), aborting + releasing locks`);
       controller.abort();
       releaseSlotOnce('idle-watchdog');
       releaseSessionOnce('idle-watchdog');
-    }, idleTimeout * 1000);
+    }, window * 1000);
   };
   resetIdle();
 
@@ -347,6 +355,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       systemPrompt,
       userId,
       agentId,
+      ...(maxToolLoops ? { maxToolLoops } : {}),
       ...(cid ? { cid } : {}),
       ...(turnId ? { turnId } : {}),
       ...(projectId ? { projectId } : {}),
@@ -390,6 +399,8 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     async function* captureResult(events: AsyncIterable<import('#core-agent').AgentRunEvent>) {
       for await (const ev of events) {
         if (ev.type === 'done') agentRunResult = ev.result;
+        else if (ev.type === 'tool_start') toolDepth += 1;
+        else if (ev.type === 'tool_end') toolDepth = Math.max(0, toolDepth - 1);
         yield ev;
       }
     }
@@ -400,6 +411,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     let eventCount = 0;
     const mappedEvents = mapCoreAgentEvents(captureResult(rawEvents), { userId, skillDisplayNameById, agentDisplayNameById });
     for await (const ev of stopStreamOnAbort(mappedEvents, controller.signal, turnTag)) {
+      sawFirstEvent = true;
       resetIdle();
       eventCount += 1;
       recorder.record(ev as any);
@@ -425,7 +437,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       abortedFlag = true;
       yield { type: 'error', text: 'aborted', aborted: true };
     } else if (idleHit) {
-      errText = errText || `Model exceeded ${idleTimeout}s with no response (aborted)`;
+      errText = errText || `Model exceeded ${idleHitWindow}s with no response (aborted)`;
       yield { type: 'error', text: errText };
     }
   } catch (err) {

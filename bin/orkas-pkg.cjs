@@ -52,6 +52,11 @@
  *                           package dependency installs.
  *   ORKAS_VENV_ROOT       — optional shared machine-local venv root.
  *                           Defaults to `<ORKAS_WORKSPACE_ROOT>/venv`.
+ *                           Python envs/caches live under `python/`; npm
+ *                           cache/prefix live under `node/`.
+ *   ORKAS_BUNDLED_NODE    — optional bundled stock Node executable for
+ *                           third-party package CLI shims. ORKAS_NODE is
+ *                           reserved for Orkas internal Electron-as-Node.
  */
 
 'use strict';
@@ -59,6 +64,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const https = require('node:https');
 const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 
@@ -87,11 +93,22 @@ function wsRoot() {
 
 function sharedVenvRoot() { return process.env.ORKAS_VENV_ROOT || path.join(wsRoot(), 'venv'); }
 function pythonVenvRoot() { return path.join(sharedVenvRoot(), 'python'); }
+function nodeVenvRoot() { return path.join(sharedVenvRoot(), 'node'); }
 function pythonVenvCacheEnv() {
   return {
     ORKAS_VENV_ROOT: sharedVenvRoot(),
     UV_CACHE_DIR: process.env.UV_CACHE_DIR || path.join(pythonVenvRoot(), 'cache', 'uv'),
     PIP_CACHE_DIR: process.env.PIP_CACHE_DIR || path.join(pythonVenvRoot(), 'cache', 'pip'),
+  };
+}
+function nodePackageEnv() {
+  return {
+    ORKAS_VENV_ROOT: sharedVenvRoot(),
+    NPM_CONFIG_CACHE: process.env.NPM_CONFIG_CACHE || path.join(nodeVenvRoot(), 'cache', 'npm'),
+    NPM_CONFIG_PREFIX: process.env.NPM_CONFIG_PREFIX || path.join(nodeVenvRoot(), 'prefix'),
+    NPM_CONFIG_FUND: process.env.NPM_CONFIG_FUND || 'false',
+    NPM_CONFIG_AUDIT: process.env.NPM_CONFIG_AUDIT || 'false',
+    NPM_CONFIG_UPDATE_NOTIFIER: process.env.NPM_CONFIG_UPDATE_NOTIFIER || 'false',
   };
 }
 
@@ -136,7 +153,7 @@ function writeRegistry(uid, registry) {
   fs.renameSync(tmp, p);
 }
 
-function withRegistryLock(uid, fn) {
+async function withRegistryLock(uid, fn) {
   fs.mkdirSync(packagesDir(uid), { recursive: true });
   const lockPath = path.join(packagesDir(uid), '_registry.lock');
   let fd = null;
@@ -166,7 +183,11 @@ function withRegistryLock(uid, fn) {
       }
     }
     fs.writeSync(fd, String(process.pid));
-    return fn();
+    // `await` so an async fn (e.g. a GitHub tarball download) completes BEFORE
+    // the lock is released in `finally`; a bare `return fn()` would release the
+    // lock the instant fn returned its promise, while network I/O was still in
+    // flight. The exit hook still guards against the lock outliving the process.
+    return await fn();
   } finally {
     releaseLock();
     process.removeListener('exit', releaseLock);
@@ -206,6 +227,44 @@ function runOrDie(cmd, args, opts, what) {
 
 function isFile(p) { try { return fs.statSync(p).isFile(); } catch { return false; } }
 function isDir(p) { try { return fs.statSync(p).isDirectory(); } catch { return false; } }
+// No-follow regular-file check: used on the (untrusted) package tree so a
+// symlinked SKILL.md is never treated as a real file. See assertNoSymlinks.
+function isRegularFileNoFollow(p) { try { return fs.lstatSync(p).isFile(); } catch { return false; } }
+
+/**
+ * Fail-closed defense against symlink escape. A public repo (tarball or clone)
+ * may legitimately carry symlinks; our statSync-based scan/read and the
+ * cwd-in-package skill execution would follow them OUT of the package tree
+ * (e.g. `SKILL.md -> ~/.ssh/id_rsa` exfiltrating the target's content into the
+ * prompt, or a relative symlink resolving outside the sandbox). Reject any
+ * symlink member before the tree is scanned/promoted. `.git` is git-managed
+ * metadata we never read, so the top-level `.git` is skipped to avoid false
+ * positives. Returns the first offending path relative to `root`, or null.
+ */
+function findSymlink(root) {
+  const stack = [root];
+  while (stack.length) {
+    const dir = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const entry of entries) {
+      const abs = path.join(dir, entry.name);
+      if (entry.isSymbolicLink()) return path.relative(root, abs) || entry.name;
+      if (entry.isDirectory()) {
+        if (dir === root && entry.name === '.git') continue;
+        stack.push(abs);
+      }
+    }
+  }
+  return null;
+}
+
+function assertNoSymlinks(root, action) {
+  const sl = findSymlink(root);
+  if (sl) {
+    die(1, `refusing to ${action || 'install'}: package contains a symbolic link, which could read files outside the package`, { path: sl });
+  }
+}
 
 function commandFromEnv(value) {
   if (!value) return null;
@@ -266,14 +325,17 @@ const SKILL_ROOT_CANDIDATES = ['skills', path.join('.claude', 'skills')];
 
 function scanSkillRoots(pkgDir) {
   const roots = [];
-  if (isFile(path.join(pkgDir, 'SKILL.md'))) roots.push('.');
+  // No-follow checks (defense-in-depth alongside assertNoSymlinks): a symlinked
+  // SKILL.md must never count as a skill root. `entry.isDirectory()` from
+  // readdir withFileTypes is already lstat-based, so a symlinked dir is skipped.
+  if (isRegularFileNoFollow(path.join(pkgDir, 'SKILL.md'))) roots.push('.');
   for (const rel of SKILL_ROOT_CANDIDATES) {
     const abs = path.join(pkgDir, rel);
     if (!isDir(abs)) continue;
     let hasSkill = false;
     try {
       for (const entry of fs.readdirSync(abs, { withFileTypes: true })) {
-        if (entry.isDirectory() && isFile(path.join(abs, entry.name, 'SKILL.md'))) { hasSkill = true; break; }
+        if (entry.isDirectory() && isRegularFileNoFollow(path.join(abs, entry.name, 'SKILL.md'))) { hasSkill = true; break; }
       }
     } catch { /* unreadable → skip */ }
     if (hasSkill) roots.push(rel.split(path.sep).join('/'));
@@ -354,7 +416,9 @@ function hasPythonProject(pkgDir) {
 
 function describeDepCommands(pkgDir, pkgMeta) {
   const cmds = [];
-  if (hasNodeDeps(pkgDir)) cmds.push('npm install --omit=dev');
+  if (hasNodeDeps(pkgDir)) {
+    cmds.push(isFile(path.join(pkgDir, 'package-lock.json')) ? 'npm ci --omit=dev' : 'npm install --omit=dev');
+  }
   if (hasPythonProject(pkgDir)) {
     const venv = packageVenvDir(pkgMeta);
     const uv = uvCommand();
@@ -373,8 +437,14 @@ function describeDepCommands(pkgDir, pkgMeta) {
 function installDeps(pkgDir, pkgMeta) {
   const performed = [];
   if (hasNodeDeps(pkgDir)) {
-    runOrDie('npm', ['install', '--omit=dev', '--no-fund', '--no-audit'], { cwd: pkgDir }, 'npm install');
-    performed.push('npm install --omit=dev');
+    // npm writes package-local node_modules under <data>/<uid>/local/packages,
+    // while cache/prefix live under <data>/venv/node so app updates never
+    // overwrite installed dependencies or npm's reusable cache.
+    const useCi = isFile(path.join(pkgDir, 'package-lock.json'));
+    const args = [useCi ? 'ci' : 'install', '--omit=dev', '--no-fund', '--no-audit'];
+    const label = useCi ? 'npm ci' : 'npm install';
+    runOrDie('npm', args, { cwd: pkgDir, env: nodePackageEnv() }, label);
+    performed.push(`${label} --omit=dev`);
   }
   if (hasPythonProject(pkgDir)) {
     const venv = packageVenvDir(pkgMeta);
@@ -427,10 +497,10 @@ function regenerateShims(uid, registry) {
   for (const w of wanted) {
     const shPath = path.join(dir, w.name);
     if (w.runtime === 'node') {
-      // ORKAS_NODE (Electron-as-Node) is in the bash sandbox env; plain
-      // `node` is the fallback for hand-run shells.
-      fs.writeFileSync(shPath, `#!/bin/sh\nexec "\${ORKAS_NODE:-node}" "${w.targetAbs}" "$@"\n`, { mode: 0o755 });
-      fs.writeFileSync(`${shPath}.cmd`, `@echo off\r\nif defined ORKAS_NODE ("%ORKAS_NODE%" "${w.targetAbs}" %*) else (node "${w.targetAbs}" %*)\r\n`);
+      // Package CLIs should run under the bundled stock Node/npm toolchain, not
+      // ORKAS_NODE (Electron-as-Node), so runtime behavior matches installs.
+      fs.writeFileSync(shPath, `#!/bin/sh\nexec "\${ORKAS_BUNDLED_NODE:-node}" "${w.targetAbs}" "$@"\n`, { mode: 0o755 });
+      fs.writeFileSync(`${shPath}.cmd`, `@echo off\r\nif defined ORKAS_BUNDLED_NODE ("%ORKAS_BUNDLED_NODE%" "${w.targetAbs}" %*) else (node "${w.targetAbs}" %*)\r\n`);
     } else {
       fs.writeFileSync(shPath, `#!/bin/sh\nexec "${w.targetAbs}" "$@"\n`, { mode: 0o755 });
       fs.writeFileSync(`${shPath}.cmd`, `@echo off\r\n"${w.targetAbs}" %*\r\n`);
@@ -450,6 +520,199 @@ function headCommit(pkgDir) {
 function deriveName(source) {
   const tail = source.replace(/\/+$/, '').split(/[/\\]/).pop() || '';
   return tail.replace(/\.git$/i, '');
+}
+
+// ── Source routing & git-free GitHub fetch ────────────────────────────────
+//
+// "Has git → git; no git → tarball; private repo → git". A user without git
+// can still install a PUBLIC GitHub repo: we download the source tarball over
+// plain https (no git binary). Anything that genuinely needs git (private
+// repos, non-GitHub git URLs, local git clones) keeps the git path. This is
+// purely additive — the git clone path below is unchanged for anyone who has
+// git, so existing installs do not regress.
+
+/** Classify an install source. Returns { kind, owner?, repo?, ref? }. */
+// GitHub owner/repo charset (per GitHub's own rules); reject `..` so a crafted
+// identifier can't become a path-traversal segment in the API URL.
+function validGithubId(s) {
+  return typeof s === 'string' && /^[A-Za-z0-9._-]+$/.test(s) && !s.includes('..');
+}
+
+function classifySource(source) {
+  const s = String(source || '').trim();
+  if (!s) return { kind: 'git' };
+  if (isDir(s)) return { kind: 'local' };
+
+  // ssh form: git@github.com:owner/repo(.git)?
+  let m = /^git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/i.exec(s);
+  if (m && validGithubId(m[1]) && validGithubId(m[2])) return { kind: 'github', owner: m[1], repo: m[2] };
+
+  // https / scheme-less: [https://][www.]github.com/owner/repo[/tree/<ref>][#<ref>]
+  m = /^(?:https?:\/\/)?(?:www\.)?github\.com\/([^/]+)\/([^/?#]+?)(?:\.git)?(?:\/([^?#]*))?(?:[?#](.*))?$/i.exec(s);
+  if (m && validGithubId(m[1]) && validGithubId(m[2].replace(/\.git$/i, ''))) {
+    const owner = m[1];
+    const repo = m[2].replace(/\.git$/i, '');
+    const rest = m[3] || '';
+    const frag = m[4] || '';
+    let ref = '';
+    const treeM = /^tree\/(.+)$/.exec(rest);
+    if (treeM) ref = decodeURIComponent(treeM[1]);
+    else if (frag) ref = decodeURIComponent(frag);
+    return { kind: 'github', owner, repo, ...(ref ? { ref } : {}) };
+  }
+
+  // Any other git URL (gitlab, self-hosted, bare ssh) → git path.
+  return { kind: 'git' };
+}
+
+function gitAvailable() {
+  const res = spawnSync('git', ['--version'], { encoding: 'utf8', timeout: 15_000, windowsHide: true });
+  return !res.error && res.status === 0;
+}
+
+/**
+ * GitHub's API tarball endpoint 302-redirects to codeload with the default
+ * branch already resolved, so we don't have to guess main/master. httpsDownload
+ * follows the redirect. A User-Agent is mandatory or api.github.com returns 403.
+ */
+function githubTarballUrl(cls) {
+  const owner = encodeURIComponent(String(cls.owner || ''));
+  const repo = encodeURIComponent(String(cls.repo || '').replace(/\.git$/i, ''));
+  const base = `https://api.github.com/repos/${owner}/${repo}/tarball`;
+  if (!cls.ref) return base;
+  // ref may legitimately contain `/` (e.g. feature/branch); encode each segment
+  // but keep the separators, and reject traversal/empty segments so the ref can
+  // never steer the request path off the named repo's /tarball endpoint.
+  const segs = String(cls.ref).split('/');
+  if (segs.some((seg) => seg === '' || seg === '.' || seg === '..')) {
+    die(1, `invalid ref: ${cls.ref}`, { ref: cls.ref });
+  }
+  return `${base}/${segs.map(encodeURIComponent).join('/')}`;
+}
+
+// Cap the tarball size: a model-controlled URL must not be able to stream an
+// arbitrarily large body (or gzip-bomb on extract) and fill the disk under the
+// registry lock. 500MB is generous for any real source repo tarball.
+const MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024;
+// Defense-in-depth: only follow redirects to GitHub-owned hosts. The initial
+// request is pinned to api.github.com, which only redirects to codeload; this
+// stops an open-redirect from steering the fetch elsewhere if that ever changes.
+function isGithubHost(hostname) {
+  return /(^|\.)github\.com$/i.test(hostname) || /(^|\.)githubusercontent\.com$/i.test(hostname);
+}
+
+function httpsDownload(url, dest) {
+  const TIMEOUT_MS = 10 * 60 * 1000;
+  return new Promise((resolve, reject) => {
+    const request = (currentUrl, redirectsLeft) => {
+      // User-Agent is mandatory for api.github.com (403 without it). Do NOT
+      // send an `Accept: application/octet-stream` — the API tarball endpoint
+      // rejects it with 415; its default Accept already 302s to the tarball.
+      const req = https.get(
+        currentUrl,
+        { headers: { 'User-Agent': 'orkas-pkg' } },
+        (res) => {
+          const code = res.statusCode || 0;
+          if (code >= 300 && code < 400 && res.headers.location) {
+            res.resume();
+            if (redirectsLeft <= 0) { reject(new Error('too many redirects')); return; }
+            let next;
+            try { next = new URL(res.headers.location, currentUrl); } catch { reject(new Error('bad redirect target')); return; }
+            if (next.protocol !== 'https:' || !isGithubHost(next.hostname)) {
+              reject(new Error(`refusing redirect to ${next.protocol}//${next.hostname}`));
+              return;
+            }
+            request(next.toString(), redirectsLeft - 1);
+            return;
+          }
+          if (code !== 200) { res.resume(); reject(new Error(`download failed with HTTP ${code}`)); return; }
+          const declared = Number(res.headers['content-length'] || 0);
+          if (declared && declared > MAX_DOWNLOAD_BYTES) {
+            res.resume();
+            reject(new Error(`download too large: ${declared} bytes (cap ${MAX_DOWNLOAD_BYTES})`));
+            return;
+          }
+          const out = fs.createWriteStream(dest);
+          let received = 0;
+          res.on('data', (chunk) => {
+            received += chunk.length;
+            if (received > MAX_DOWNLOAD_BYTES) {
+              req.destroy(new Error(`download exceeded size cap (${MAX_DOWNLOAD_BYTES} bytes)`));
+              out.destroy();
+            }
+          });
+          res.pipe(out);
+          out.on('finish', () => out.close(() => resolve()));
+          out.on('error', reject);
+        },
+      );
+      req.setTimeout(TIMEOUT_MS, () => req.destroy(new Error('download timed out')));
+      req.on('error', reject);
+    };
+    request(url, 5);
+  });
+}
+
+/**
+ * Extract a GitHub source tarball into `destDir`. GitHub tarballs wrap
+ * everything in a single `<repo>-<sha>/` directory; we flatten that away and
+ * recover the commit sha from its name (a tarball has no `.git` to query).
+ * Relies on `tar` (bundled on macOS/Linux and Windows 10 1803+).
+ */
+function extractGithubTarball(archivePath, destDir) {
+  const extractDir = `${destDir}.x-${process.pid}`;
+  fs.rmSync(extractDir, { recursive: true, force: true });
+  fs.mkdirSync(extractDir, { recursive: true });
+  try {
+    const res = run('tar', ['-xzf', archivePath, '-C', extractDir], { timeoutMs: 5 * 60 * 1000 });
+    if (res.status !== 0) {
+      die(1, 'failed to extract GitHub tarball', { stdout: (res.stdout || '').slice(-2000) });
+    }
+    const dirs = fs.readdirSync(extractDir, { withFileTypes: true }).filter((e) => e.isDirectory());
+    if (dirs.length !== 1) {
+      die(1, `unexpected GitHub tarball layout (${dirs.length} top-level entries)`, { archive: archivePath });
+    }
+    const top = dirs[0].name;
+    const m = /-([0-9a-f]{7,40})$/.exec(top);
+    const commit = m ? m[1] : '';
+    fs.rmSync(destDir, { recursive: true, force: true });
+    fs.renameSync(path.join(extractDir, top), destDir);
+    return { commit };
+  } finally {
+    fs.rmSync(extractDir, { recursive: true, force: true });
+  }
+}
+
+/** Download + extract a public GitHub repo into `destDir`. Returns { commit }. */
+async function fetchGithubTarballInto(cls, destDir) {
+  fs.mkdirSync(path.dirname(destDir), { recursive: true });
+  const archive = `${destDir}.tgz-${process.pid}`;
+  fs.rmSync(archive, { force: true });
+  try {
+    process.stderr.write(`orkas-pkg: git not used — downloading ${cls.owner}/${cls.repo} tarball\n`);
+    await httpsDownload(githubTarballUrl(cls), archive);
+    return extractGithubTarball(archive, destDir);
+  } finally {
+    fs.rmSync(archive, { force: true });
+  }
+}
+
+/** Atomically replace `dest` with `src` (rename + backup + rollback on error). */
+function replaceDirAtomic(dest, src) {
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  const backup = `${dest}.bak-${process.pid}-${Date.now()}`;
+  const hadDest = isDir(dest);
+  if (hadDest) fs.renameSync(dest, backup);
+  try {
+    fs.renameSync(src, dest);
+    if (hadDest) fs.rmSync(backup, { recursive: true, force: true });
+  } catch (err) {
+    try { fs.rmSync(dest, { recursive: true, force: true }); } catch { /* ignore */ }
+    if (hadDest && isDir(backup)) {
+      try { fs.renameSync(backup, dest); } catch { /* ignore */ }
+    }
+    throw err;
+  }
 }
 
 // ── Commands ─────────────────────────────────────────────────────────────
@@ -474,7 +737,7 @@ function cmdInstall(args) {
   }
 
   const uid = resolveUid();
-  return withRegistryLock(uid, () => {
+  return withRegistryLock(uid, async () => {
     const finalDir = path.join(packagesDir(uid), name);
     if (isDir(finalDir)) {
       die(73, `package "${name}" already exists — use \`orkas-pkg.cjs update ${name}\` or remove it first`);
@@ -492,8 +755,49 @@ function cmdInstall(args) {
     };
     process.on('exit', cleanupStaging);
     try {
-      runOrDie('git', ['clone', '--depth', '1', source, staging], {}, 'git clone');
+      const cls = classifySource(source);
+      // Protocol allowlist: a non-GitHub `git`-kind source (LLM-controllable)
+      // must be a real remote git URL, never `ext::sh -c ...` (arbitrary command
+      // execution) or `file://`/bare local paths that clone in-scope-bypassing
+      // local dirs. Local directory installs are the separate `local` kind.
+      if (cls.kind === 'git' && !/^(https:\/\/|ssh:\/\/|git@)/i.test(source)) {
+        die(76,
+          'unsupported source: only https:// / ssh:// / git@ git URLs, public GitHub repos, or local directories are allowed',
+          { source });
+      }
+      let commit = '';
+      if (gitAvailable()) {
+        // Harden the clone: disable the `ext` transport entirely (blocks
+        // `ext::sh -c`), restrict `file` to user-initiated top-level only
+        // (blocks submodule file:// re-injection), suppress credential prompts,
+        // and never recurse submodules (a submodule URL is another injection point).
+        const clone = run('git', [
+          '-c', 'protocol.ext.allow=never',
+          '-c', 'protocol.file.allow=user',
+          'clone', '--depth', '1', '--no-recurse-submodules', source, staging,
+        ], { env: { GIT_TERMINAL_PROMPT: '0' } });
+        if (clone.status === 0) {
+          commit = headCommit(staging);
+        } else if (cls.kind === 'github') {
+          // Git is present but the clone failed (broken git env, credential
+          // prompt, network). For a public GitHub repo, fall back to the tarball.
+          fs.rmSync(staging, { recursive: true, force: true });
+          ({ commit } = await fetchGithubTarballInto(cls, staging));
+        } else {
+          die(1, `git clone failed (git exited ${clone.status})`, { source, stdout: (clone.stdout || '').slice(-2000) });
+        }
+      } else if (cls.kind === 'github') {
+        ({ commit } = await fetchGithubTarballInto(cls, staging));
+      } else {
+        die(76,
+          'git is required for this source. Without git, only public GitHub '
+          + 'repositories can be installed (downloaded as a tarball). Install git, '
+          + 'or use a public GitHub URL.',
+          { source });
+      }
 
+      // Reject before scanning/reading any file in the tree (symlink escape).
+      assertNoSymlinks(staging, 'install');
       const scan = scanPackage(staging);
       if (!scan.kind) {
         die(65,
@@ -502,8 +806,6 @@ function cmdInstall(args) {
           + 'Agent-driven-only projects are not supported.',
           { source });
       }
-
-      const commit = headCommit(staging);
       const pkgMeta = { name, repo_url: source, commit };
       const depCommands = describeDepCommands(staging, pkgMeta);
       let depsInstalled = [];
@@ -586,19 +888,56 @@ function cmdUpdate(args) {
   const name = args[0];
   if (!name || !PKG_NAME_RE.test(name)) die(64, 'usage: orkas-pkg.cjs update <name>');
   const uid = resolveUid();
-  return withRegistryLock(uid, () => {
+  return withRegistryLock(uid, async () => {
     const registry = readRegistry(uid);
     const entry = registry.packages.find((p) => p && p.name === name);
     const pkgDir = path.join(packagesDir(uid), name);
     if (!entry || !isDir(pkgDir)) die(66, `package "${name}" is not installed`);
 
-    runOrDie('git', ['pull', '--ff-only'], { cwd: pkgDir }, 'git pull');
+    // Route by how it was installed: a `.git` dir means git clone (pull it);
+    // otherwise it was a GitHub tarball — re-fetch and atomically swap in place.
+    const hasDotGit = isDir(path.join(pkgDir, '.git'));
+    let tarballCommit = '';
+    if (hasDotGit) {
+      const before = headCommit(pkgDir);
+      runOrDie('git', ['pull', '--ff-only'], { cwd: pkgDir }, 'git pull');
+      // Upstream could have introduced a symlink since install; reject + revert
+      // so the in-place tree never gains a file that reads outside the package.
+      const sl = findSymlink(pkgDir);
+      if (sl) {
+        if (before) run('git', ['reset', '--hard', before], { cwd: pkgDir });
+        die(1, 'refusing to update: upstream now contains a symbolic link (reverted to the prior revision)', { path: sl });
+      }
+    } else {
+      const cls = classifySource(entry.repo_url || '');
+      if (cls.kind !== 'github') {
+        die(65, `cannot update "${name}": it was installed without git and "${entry.repo_url}" is not a GitHub repo — remove and reinstall`);
+      }
+      const staging = path.join(packagesDir(uid), `.staging-${name}-${process.pid}`);
+      fs.rmSync(staging, { recursive: true, force: true });
+      const cleanupStaging = () => {
+        try { fs.rmSync(staging, { recursive: true, force: true }); } catch { /* already gone */ }
+      };
+      process.on('exit', cleanupStaging);
+      try {
+        ({ commit: tarballCommit } = await fetchGithubTarballInto(cls, staging));
+        // Reject symlinks + validate the new tree BEFORE destroying the current install.
+        assertNoSymlinks(staging, 'update');
+        if (!scanPackage(staging).kind) {
+          die(65, `after update, "${name}" no longer has a supported skill/CLI shape — keeping the current install`);
+        }
+        replaceDirAtomic(pkgDir, staging);
+      } finally {
+        cleanupStaging();
+        process.removeListener('exit', cleanupStaging);
+      }
+    }
 
     const scan = scanPackage(pkgDir);
     if (!scan.kind) {
       die(65, `after update, "${name}" no longer has a supported skill/CLI shape — leaving files in place; review manually`);
     }
-    const commit = headCommit(pkgDir);
+    const commit = hasDotGit ? headCommit(pkgDir) : tarballCommit;
     let depsInstalled = [];
     const pkgMeta = { ...entry, commit };
     const depCommands = describeDepCommands(pkgDir, pkgMeta);
@@ -748,7 +1087,7 @@ function cmdInfo(args) {
   out({ ok: true, action: 'info', package: entry, dir: path.join(packagesDir(uid), name) });
 }
 
-function main() {
+async function main() {
   const [, , command, ...rest] = process.argv;
   switch (command) {
     case 'install': return cmdInstall(rest);
@@ -765,4 +1104,13 @@ function main() {
   }
 }
 
-main();
+if (require.main === module) {
+  main().catch((err) => die(1, 'orkas-pkg failed', { error: err && err.message }));
+} else {
+  // Required from a test — expose the pure source-routing/fetch helpers without
+  // running a command. (Run-as-CLI takes the branch above.)
+  module.exports = {
+    classifySource, githubTarballUrl, extractGithubTarball,
+    findSymlink, isGithubHost, validGithubId,
+  };
+}

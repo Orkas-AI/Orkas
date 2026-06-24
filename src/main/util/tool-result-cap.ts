@@ -11,9 +11,10 @@
  *                                wrapper (preview + reference); the model can
  *                                pull the original back via read_file(path)
  *
- * Read-class tools (`read_file` / `kb_read`) have a cap of Infinity and the
- * decorator returns the original tool untouched — the model may re-inspect
- * file content repeatedly, so it must not be wiped.
+ * Read-class tools (`read_file` / `kb_read`) cap at 100K like other
+ * content-returning tools. The original content is spilled to disk when
+ * oversized, so the model can re-page it with charStart/charEnd instead of
+ * carrying an uncapped blob in context.
  *
  * Pure-function util: Node stdlib only, never imports features/ or model/.
  */
@@ -39,8 +40,12 @@ const log = createLogger('util/tool-result-cap');
  *  strings — no point giving them 100K headroom.
  */
 export const MAX_RESULT_CHARS_BY_TOOL: Record<string, number> = {
-  read_file: Infinity,
-  kb_read: Infinity,
+  // Read-class tools used to be Infinity (exempt). They now cap at 100K like
+  // the other content-returning tools: a single lazy whole-file read of a large
+  // file otherwise dumps uncapped into context. Re-inspection stays lossless
+  // because read_file/kb_read can re-page any range via charStart/charEnd.
+  read_file: 100_000,
+  kb_read: 100_000,
   bash: 30_000,
   search_file: 20_000,
   kb_search: 20_000,
@@ -97,6 +102,7 @@ export function wrapToolWithCap(tool: AgentTool, opts: WrapOpts): AgentTool {
     name: tool.name,
     description: tool.description,
     inputSchema: tool.inputSchema,
+    ...(tool.executionMode ? { executionMode: tool.executionMode } : {}),
     async execute(input: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
       const result = await tool.execute(input, ctx);
       const content = result.content || '';

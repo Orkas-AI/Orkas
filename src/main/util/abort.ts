@@ -52,3 +52,25 @@ export async function fetchWithTimeout(
     composed.cleanup();
   }
 }
+
+export async function fetchAndReadWithTimeout<T>(
+  input: Parameters<typeof fetch>[0],
+  init: RequestInit,
+  timeoutMs: number,
+  parentSignal: AbortSignal | undefined | null,
+  timeoutMessage: string,
+  readBody: (response: Response) => Promise<T>,
+): Promise<{ response: Response; body: T }> {
+  const composed = composeAbortSignal(parentSignal, timeoutMs, timeoutMessage);
+  try {
+    const response = await fetch(input, { ...init, signal: composed.signal });
+    const body = await readBody(response);
+    return { response, body };
+  } catch (err) {
+    if (parentSignal?.aborted) throw new Error('operation aborted');
+    if (composed.signal.aborted) throw new Error(timeoutMessage);
+    throw err;
+  } finally {
+    composed.cleanup();
+  }
+}

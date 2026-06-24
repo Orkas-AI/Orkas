@@ -23,7 +23,10 @@ import type { Transport } from './types';
 
 const log = createLogger('connector-install-confirm');
 
-const RESPONSE_TIMEOUT_MS = 120 * 1000;
+// Human-in-the-loop confirmation window. Unanswered requests still decline,
+// but custom MCP installs can happen mid-agent-run and 2 minutes was too
+// likely to fail a valid task while the user was away.
+const RESPONSE_TIMEOUT_MS = 10 * 60 * 1000;
 
 export interface InstallConfirmInfo {
   request_id: string;

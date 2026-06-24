@@ -35,7 +35,7 @@ function runtimeRoots(): string[] {
   return roots;
 }
 
-function runtimeVariantDirs(kind: 'python' | 'uv'): string[] {
+function runtimeVariantDirs(kind: 'python' | 'uv' | 'node'): string[] {
   const dirs: string[] = [];
   for (const runtimeRoot of runtimeRoots()) {
     const root = path.join(runtimeRoot, kind);
@@ -80,6 +80,25 @@ function resolveUvExecutable(): string | undefined {
   return undefined;
 }
 
+function resolveNodeExecutable(): string | undefined {
+  const configured = process.env.ORKAS_BUNDLED_NODE;
+  if (isFile(configured)) return configured;
+
+  // ensure-runtime flattens the official Node archive so the payload root holds
+  // `bin/node` (mac/linux) / `node.exe` (win) directly — see manifest `executable`.
+  const names = process.platform === 'win32'
+    ? ['node.exe']
+    : [path.join('bin', 'node')];
+
+  for (const dir of runtimeVariantDirs('node')) {
+    for (const name of names) {
+      const candidate = path.join(dir, name);
+      if (isFile(candidate)) return candidate;
+    }
+  }
+  return undefined;
+}
+
 function pushPathDir(out: string[], seen: Set<string>, dir: string | undefined): void {
   if (!isDir(dir)) return;
   const resolved = path.resolve(dir);
@@ -101,6 +120,11 @@ export function bundledRuntimePathEntries(): string[] {
   }
   const uv = resolveUvExecutable();
   if (uv) pushPathDir(entries, seen, path.dirname(uv));
+  // Node's `bin` (mac/linux) or install root (win) holds `node`, `npm`, `npx`.
+  // Injecting it lets the bash tool AND orkas-pkg's `npm install` resolve a
+  // bundled Node on machines without a user-installed toolchain.
+  const node = resolveNodeExecutable();
+  if (node) pushPathDir(entries, seen, path.dirname(node));
   return entries;
 }
 
@@ -108,7 +132,9 @@ export function bundledRuntimeEnv(): Record<string, string> {
   const env: Record<string, string> = {};
   const python = resolvePythonExecutable();
   const uv = resolveUvExecutable();
+  const node = resolveNodeExecutable();
   if (python) env.ORKAS_PYTHON = python;
   if (uv) env.ORKAS_UV = uv;
+  if (node) env.ORKAS_BUNDLED_NODE = node;
   return env;
 }

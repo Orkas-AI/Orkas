@@ -82,24 +82,38 @@ export class Session {
   /**
    * Compact the session by summarizing older messages.
    * Returns a summary of the compacted context.
-   *
-   * Pairing invariant: the kept tail must NOT begin with a tool_result-only
-   * user message — its corresponding tool_use is in the older slice that's
-   * about to be replaced by the summary, leaving it orphaned. The next
-   * provider call after compaction would then send a function_call_output
-   * with no matching function_call and the API rejects with
-   * "No tool call found for function call output with call_id ...". Drop
-   * leading tool_result-only user messages from `kept` until the first
-   * message is either a non-tool-result user message or an assistant
-   * message — that point is a safe cut boundary.
    */
   compact(summary: string): void {
     if (this.messages.length <= 2) return;
 
-    // Keep the last few messages and replace older ones with a summary
+    const kept = this.computeKeptTail();
+
+    this.messages = [
+      { role: "user", content: [{ type: "text", text: `[Previous conversation summary]\n${summary}` }] },
+      { role: "assistant", content: [{ type: "text", text: "Understood. I have context from our previous conversation." }] },
+      ...kept,
+    ];
+  }
+
+  /**
+   * The recent tail compact() preserves verbatim: the last few messages, minus
+   * any leading tool_result-only user message.
+   *
+   * Pairing invariant: the kept tail must NOT begin with a tool_result-only
+   * user message — its corresponding tool_use is in the older slice that's
+   * about to be replaced by the summary, leaving it orphaned. The next provider
+   * call after compaction would then send a function_call_output with no
+   * matching function_call and the API rejects with "No tool call found for
+   * function call output with call_id ...". Drop leading tool_result-only user
+   * messages until the first message is a non-tool-result user message or an
+   * assistant message — that point is a safe cut boundary.
+   *
+   * Shared by compact() and estimateKeptTailTokens() so the "what survives a
+   * compaction" definition can't drift between the two.
+   */
+  private computeKeptTail(): Message[] {
     const keepCount = Math.min(4, this.messages.length);
     const kept = this.messages.slice(-keepCount);
-
     while (kept.length > 0) {
       const head = kept[0];
       if (head.role !== "user") break;
@@ -109,12 +123,21 @@ export class Session {
       if (!allToolResults) break;
       kept.shift();
     }
+    return kept;
+  }
 
-    this.messages = [
-      { role: "user", content: [{ type: "text", text: `[Previous conversation summary]\n${summary}` }] },
-      { role: "assistant", content: [{ type: "text", text: "Understood. I have context from our previous conversation." }] },
-      ...kept,
-    ];
+  /**
+   * Estimated tokens of the tail compact() keeps verbatim. If this alone already
+   * exceeds the window threshold (e.g. a large cap-exempt read_file / kb_read
+   * result is sitting in the recent tail), a compaction pass can only summarize
+   * the smaller remainder and cannot get the session under the threshold — so
+   * the runner uses this to skip a no-progress pass that would otherwise burn a
+   * summary LLM call every turn and discard the prior summary's detail. As later
+   * turns push that big result out of the kept window, real compaction resumes.
+   */
+  estimateKeptTailTokens(): number {
+    if (this.messages.length <= 2) return this.estimateTokens();
+    return sumMessageTokens(this.computeKeptTail());
   }
 
   /** Estimate token count without a real tokenizer.
@@ -128,15 +151,7 @@ export class Session {
    * guard in the runner effectively never fired for CJK users. Still heuristic
    * — real token count comes from provider `usage` at response time. */
   estimateTokens(): number {
-    let total = 0;
-    for (const msg of this.messages) {
-      for (const c of msg.content) {
-        if (c.type === "text") total += estimateStringTokens(c.text);
-        else if (c.type === "tool_result") total += estimateStringTokens(c.content);
-        else if (c.type === "tool_use") total += estimateStringTokens(JSON.stringify(c.input));
-      }
-    }
-    return total;
+    return sumMessageTokens(this.messages);
   }
 
   private trimHistory(): void {
@@ -147,6 +162,21 @@ export class Session {
     const excess = turns - this.maxHistoryTurns;
     this.messages = this.messages.slice(excess * 2);
   }
+}
+
+/** Sum the heuristic token estimate across a set of messages. Shared by
+ *  Session.estimateTokens() (whole history) and estimateKeptTailTokens() (the
+ *  tail a compaction would preserve). */
+function sumMessageTokens(messages: Message[]): number {
+  let total = 0;
+  for (const msg of messages) {
+    for (const c of msg.content) {
+      if (c.type === "text") total += estimateStringTokens(c.text);
+      else if (c.type === "tool_result") total += estimateStringTokens(c.content);
+      else if (c.type === "tool_use") total += estimateStringTokens(JSON.stringify(c.input));
+    }
+  }
+  return total;
 }
 
 /** CJK-aware token estimator. CJK chars count as 1.5 tokens, other chars as 0.25. */

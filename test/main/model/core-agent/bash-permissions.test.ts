@@ -92,7 +92,7 @@ describe('bash-permissions', () => {
   it('denies on timeout when no answer arrives', async () => {
     vi.useFakeTimers();
     const p = ask();
-    await vi.advanceTimersByTimeAsync(120 * 1000 + 10);
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000 + 10);
     expect(await p).toBe('deny');
   });
 

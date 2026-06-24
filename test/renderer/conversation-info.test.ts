@@ -7,18 +7,16 @@ type RenderFilesResult = {
   html: string;
   counts: {
     files: string;
-    tasks: string;
     attachments: string;
   };
 };
 
 function renderFilesResult(snapshot: {
   history: any[];
-  plan?: any;
-  planControl?: any;
   files: any;
+  attachments?: any[];
   syncEnabled?: boolean;
-  activeTab?: 'tasks' | 'files' | 'attachments';
+  activeTab?: 'files' | 'attachments';
 }, afterMount?: (context: any) => Promise<void> | void): Promise<RenderFilesResult> {
   const elements = new Map<string, any>();
   const getEl = (id: string) => {
@@ -37,7 +35,6 @@ function renderFilesResult(snapshot: {
     return elements.get(id);
   };
   const tabs = [
-    { dataset: { infoTab: 'tasks' }, classList: { toggle() {} }, addEventListener(type: string, fn: () => void) { (this as any)[`on${type}`] = fn; } },
     { dataset: { infoTab: 'files' }, classList: { toggle() {} }, addEventListener(type: string, fn: () => void) { (this as any)[`on${type}`] = fn; } },
     { dataset: { infoTab: 'attachments' }, classList: { toggle() {} }, addEventListener(type: string, fn: () => void) { (this as any)[`on${type}`] = fn; } },
   ];
@@ -65,10 +62,8 @@ function renderFilesResult(snapshot: {
     apiFetch: async (url: string) => ({
       json: async () => {
         if (url.includes('/history')) return { ok: true, conversation: { title: 'Current title' }, history: snapshot.history };
-        if (url.includes('/plan')) return { ok: true, plan: snapshot.plan || null, control: snapshot.planControl || null };
-        if (url.includes('/members')) return { ok: true, actors: [] };
         if (url.includes('/files')) return { ok: true, ...snapshot.files };
-        if (url.includes('/attachments')) return { ok: true, items: [] };
+        if (url.includes('/attachments')) return { ok: true, items: snapshot.attachments || [] };
         return { ok: false, error: 'unknown' };
       },
     }),
@@ -94,7 +89,7 @@ function renderFilesResult(snapshot: {
   const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation-info.js'), 'utf8');
   vm.runInContext(source, context);
   context.window.ConversationInfo.bind('c1');
-  const tabIndex = snapshot.activeTab === 'tasks' ? 0 : snapshot.activeTab === 'attachments' ? 2 : 1;
+  const tabIndex = snapshot.activeTab === 'attachments' ? 1 : 0;
   (tabs[tabIndex] as any).onclick();
   getEl('conversation-info-toggle').onclick();
   return new Promise((resolve, reject) => setTimeout(async () => {
@@ -104,7 +99,6 @@ function renderFilesResult(snapshot: {
         html: getEl('conversation-info-body').innerHTML,
         counts: {
           files: String(getEl('conversation-info-tab-count-files').textContent || ''),
-          tasks: String(getEl('conversation-info-tab-count-tasks').textContent || ''),
           attachments: String(getEl('conversation-info-tab-count-attachments').textContent || ''),
         },
       });
@@ -116,11 +110,10 @@ function renderFilesResult(snapshot: {
 
 function renderFilesHtml(snapshot: {
   history: any[];
-  plan?: any;
-  planControl?: any;
   files: any;
+  attachments?: any[];
   syncEnabled?: boolean;
-  activeTab?: 'tasks' | 'files' | 'attachments';
+  activeTab?: 'files' | 'attachments';
 }, afterMount?: (context: any) => Promise<void> | void): Promise<string> {
   return renderFilesResult(snapshot, afterMount).then((result) => result.html);
 }
@@ -155,8 +148,30 @@ describe('ConversationInfo files tab', () => {
     expect(html).toContain('draggable="true"');
     expect(html).toContain('conversation-info-file-menu-btn');
     expect(html).toContain('data-entry-kind="dir"');
-    expect(html).toContain('data-entry-kind="file"');
+    expect(html).toContain('data-entry-kind="text"');
     expect(html).not.toMatch(/<details[^>]*\sopen(?:\s|>|=)/);
+  });
+
+  it('marks unsupported workspace files distinctly for Library menu filtering', async () => {
+    const html = await renderFilesHtml({
+      history: [],
+      files: {
+        root: '/tmp/workspace',
+        rootExists: true,
+        truncated: false,
+        count: 3,
+        items: [
+          { path: '/tmp/workspace/archive.zip', relPath: 'archive.zip', name: 'archive.zip', bytes: 10, mtime: 1700000000000 },
+          { path: '/tmp/workspace/slides.pptx', relPath: 'slides.pptx', name: 'slides.pptx', bytes: 10, mtime: 1700000000000 },
+          { path: '/tmp/workspace/movie.mp4', relPath: 'movie.mp4', name: 'movie.mp4', bytes: 10, mtime: 1700000000000 },
+        ],
+      },
+    });
+
+    expect(html).toContain('data-entry-name="archive.zip"');
+    expect(html).toContain('data-entry-kind="unsupported"');
+    expect(html).toContain('data-entry-kind="presentation"');
+    expect(html).toContain('data-entry-kind="video"');
   });
 
   it('refreshes the files tab without reloading the whole side panel', async () => {
@@ -251,89 +266,25 @@ describe('ConversationInfo files tab', () => {
     expect(html).not.toContain('ci-files-sync-note');
     expect(html).not.toContain('Cloud sync does not include these files');
   });
-});
 
-describe('ConversationInfo tasks tab', () => {
-  it('renders the unified plan control in the progress area without legacy step actions', async () => {
+  it('does not show internal attachment kind labels in the attachment row meta', async () => {
     const html = await renderFilesHtml({
-      activeTab: 'tasks',
+      activeTab: 'attachments',
       history: [],
-      planControl: { action: 'continue' },
-      plan: {
-        steps: [
-          { index: 1, title: '搜集', assignee: 'Alpha', status: 'done' },
-          { index: 2, title: '分析', assignee: 'Beta', status: 'failed', failure_reason: 'fetch failed' },
-        ],
-      },
-      files: {
-        root: '/tmp/workspace',
-        rootExists: true,
-        truncated: false,
-        count: 0,
-        items: [],
-      },
+      files: { root: '/tmp/workspace', rootExists: true, truncated: false, count: 0, items: [] },
+      attachments: [
+        {
+          name: 'grades.xlsx',
+          displayName: '初中几何成绩下滑-沟通准备.xlsx',
+          kind: 'spreadsheet',
+          bytes: 0,
+          mtime: Math.floor(new Date('2026-06-23T14:46:00Z').getTime() / 1000),
+        },
+      ],
     });
 
-    expect(html).toContain('id="ci-tasks-plan-control"');
-    expect(html).toContain('data-plan-action="continue"');
-    expect(html).toContain('Continue');
-    expect(html).not.toContain('Retry');
-    expect(html).not.toContain('Skip');
-    expect(html).not.toContain('Stop all');
-    expect(html).not.toContain('停止全部');
-  });
-
-  it('renders blocked plan steps as waiting for input instead of failed', async () => {
-    const html = await renderFilesHtml({
-      activeTab: 'tasks',
-      history: [],
-      plan: {
-        steps: [
-          { index: 1, title: '先收集最小诊断证据', assignee: 'FamilyTutor', status: 'blocked' },
-          { index: 2, title: '分析数学学习问题类型', assignee: 'MathTutor', status: 'pending' },
-        ],
-      },
-      files: {
-        root: '/tmp/workspace',
-        rootExists: true,
-        truncated: false,
-        count: 0,
-        items: [],
-      },
-    });
-
-    expect(html).toContain('ci-tasks-bar-cell is-blocked');
-    expect(html).not.toContain('ci-tasks-bar-cell is-failed');
-    expect(html).toContain('ci-tasks-step is-blocked');
-    expect(html).toContain('[document-pencil]');
-    expect(html).not.toContain('[x]');
-  });
-
-  it('keeps fully completed plans visible in the task details tab', async () => {
-    const result = await renderFilesResult({
-      activeTab: 'tasks',
-      history: [],
-      plan: {
-        steps: [
-          { index: 1, title: '搜集资料', assignee: 'Alpha', status: 'done' },
-          { index: 2, title: '整理结论', assignee: 'Beta', status: 'done' },
-        ],
-      },
-      planControl: { action: null },
-      files: {
-        root: '/tmp/workspace',
-        rootExists: true,
-        truncated: false,
-        count: 0,
-        items: [],
-      },
-    });
-
-    expect(result.html).toContain('ci-tasks');
-    expect(result.html).toContain('搜集资料');
-    expect(result.html).toContain('整理结论');
-    expect(result.html).toContain('ci-tasks-step is-done');
-    expect(result.html).not.toContain('id="ci-tasks-plan-control"');
-    expect(result.counts.tasks).toBe('2/2');
+    expect(html).toContain('初中几何成绩下滑-沟通准备.xlsx');
+    expect(html).toContain('XLS');
+    expect(html).not.toContain('spreadsheet');
   });
 });

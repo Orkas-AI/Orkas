@@ -288,6 +288,19 @@ describe('_parseDashboardSpec — tolerant parse (matching + look-alike non-matc
     expect(_parseDashboardSpec('{"q":"a\\"b"}\n}')).toEqual({ q: 'a"b' });
   });
 
+  it('quote repair: unescaped quote pair inside a string value is escaped', () => {
+    const body = `{"root":{"type":"Table","props":{"columns":[{"key":"title","label":"标题"}],"rows":[{"title":"【TF家族练习生】挑战给爸爸打电话说出"我爱你""}]}}}`;
+    expect(_parseDashboardSpec(body)).toEqual({
+      root: {
+        type: 'Table',
+        props: {
+          columns: [{ key: 'title', label: '标题' }],
+          rows: [{ title: '【TF家族练习生】挑战给爸爸打电话说出"我爱你"' }],
+        },
+      },
+    });
+  });
+
   it('non-matching: leading non-JSON garbage is NOT repaired → undefined', () => {
     expect(_parseDashboardSpec('not { valid: json }')).toBeUndefined();
   });
@@ -347,6 +360,16 @@ describe('renderMarkdown integration — set B (must not break existing surfaces
     expect(html).toMatch(/class="dashboard"/);
     expect(html).toMatch(/data-level="warning"/);
     expect(html).toContain('Funding');
+  });
+
+  it('unescaped quotes inside a dashboard string still render the dashboard', () => {
+    const md = `:::dashboard
+{"root":{"type":"Table","props":{"columns":[{"key":"title","label":"标题"}],"rows":[{"title":"【TF家族练习生】挑战给爸爸打电话说出"我爱你""}]}}}
+:::`;
+    const html = renderMarkdown(md);
+    expect(html).not.toContain('dashboard-parse-error');
+    expect(html).toContain('class="db-table"');
+    expect(html).toContain('说出&quot;我爱你&quot;');
   });
 
   it('unclosed :::dashboard at end of doc → not a dashboard, body kept', () => {

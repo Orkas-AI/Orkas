@@ -54,6 +54,7 @@
     'chevron-left': '<path d="m15 6-6 6 6 6"></path>',
     plus: '<path d="M12 5v14M5 12h14"></path>',
     'file-text': '<path d="M7 3.5h7l4 4v13H7z"></path><path d="M14 3.5v4h4"></path><path d="M9.5 11h5"></path><path d="M9.5 14h5"></path><path d="M9.5 17h3"></path>',
+    presentation: '<rect x="4" y="4" width="16" height="11" rx="2"></rect><path d="M12 15v5"></path><path d="M8 20h8"></path><path d="M8 9h8"></path><path d="M8 12h5"></path>',
     'arrow-right': '<path d="M5 12h14"></path><path d="m13 6 6 6-6 6"></path>',
     zap: '<path d="M13 2 4 14h7l-1 8 9-12h-7z"></path>',
     external: '<path d="M14 4h6v6"></path><path d="M20 4 10 14"></path><path d="M19 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h6"></path>',

@@ -22,6 +22,13 @@ vi.mock('../../../../src/main/features/local_agents/backends/claude', () => ({
   },
 }));
 
+let mockOpenclawBackendImpl: ((opts: any) => Promise<void>) | null = null;
+vi.mock('../../../../src/main/features/local_agents/backends/openclaw', () => ({
+  openclawBackend: {
+    run: (opts: any) => (mockOpenclawBackendImpl ? mockOpenclawBackendImpl(opts) : Promise.resolve()),
+  },
+}));
+
 let tmpDir: string;
 let prevWs: string | undefined;
 const TEST_UID = 'u1';
@@ -35,6 +42,7 @@ beforeEach(async () => {
   users.activateUser(TEST_UID);
   mockDetect.mockReset();
   mockBackendImpl = null;
+  mockOpenclawBackendImpl = null;
 });
 
 afterEach(() => {
@@ -179,6 +187,28 @@ describe('local_agents/runner', () => {
     expect(result.error).toMatch(/timeout/);
   });
 
+  it('uses a long wall cap and no idle kill for OpenClaw no-stream runs', async () => {
+    mockDetect.mockResolvedValue({ type: 'openclaw', available: true, path: '/fake/openclaw', version: '2026.4.11' });
+    let captured: any = null;
+    mockOpenclawBackendImpl = async (opts) => {
+      captured = opts;
+      opts.onEvent({ type: 'done', status: 'completed', output: '', durationMs: 0 });
+    };
+
+    const events: any[] = [];
+    const result = await (await import('../../../../src/main/features/local_agents/runner')).run({
+      uid: TEST_UID, cid: 'c', agentId: 'a',
+      cli: 'openclaw', prompt: 'p', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: e => events.push(e),
+    });
+
+    expect(result.status).toBe('completed');
+    expect(captured?.timeoutMs).toBe(60 * 60 * 1000);
+    expect(captured?.idleKillMs).toBeUndefined();
+    expect(captured?.idleMs).toBe(90 * 1000);
+  });
+
   it('emits idle events when the backend goes quiet beyond the threshold', async () => {
     // Use real timers but shrink the threshold via env vars. The
     // ORKAS_LOCAL_AGENT_IDLE_MIN_MS escape hatch exists exactly so
@@ -201,17 +231,6 @@ describe('local_agents/runner', () => {
 
       const runner = await loadRunner();
       const events: any[] = [];
-      const idleCount = () => events.filter(e => e.type === 'idle').length;
-      const waitForIdleCount = async (minCount: number) => {
-        const deadline = Date.now() + 1500;
-        let count = idleCount();
-        while (Date.now() < deadline) {
-          if (count >= minCount) return count;
-          await new Promise(r => setTimeout(r, 25));
-          count = idleCount();
-        }
-        return count;
-      };
       const promise = runner.run({
         uid: TEST_UID, cid: 'c', agentId: 'a',
         cli: 'claude', prompt: 'p', cwd: tmpDir,
@@ -219,22 +238,23 @@ describe('local_agents/runner', () => {
         onEvent: e => events.push(e),
       });
 
-      // Threshold=120ms, tick = max(50, 120/3=40) → 50ms. Poll instead
-      // of sleeping for a fixed window so full-suite worker contention
-      // does not turn timer scheduling jitter into a false negative.
-      const idleCount1 = await waitForIdleCount(1);
+      // Threshold=120ms, tick = max(50, 120/3=40) → 50ms. Wait ~250ms:
+      // at least 2 idle pulses should fire after the 120ms quiet period.
+      await new Promise(r => setTimeout(r, 250));
+      const idleCount1 = events.filter(e => e.type === 'idle').length;
       expect(idleCount1).toBeGreaterThanOrEqual(1);
 
       // Continue waiting → steady drumbeat (more idle events).
-      const idleCount2 = await waitForIdleCount(idleCount1 + 1);
+      await new Promise(r => setTimeout(r, 150));
+      const idleCount2 = events.filter(e => e.type === 'idle').length;
       expect(idleCount2).toBeGreaterThan(idleCount1);
 
       // Backend emits a real event — deadline should reset, so no new
       // idle pulse during the next sub-threshold window.
       onEventCb!({ type: 'text-delta', text: 'still here' });
-      const beforeReset = idleCount();
+      const beforeReset = events.filter(e => e.type === 'idle').length;
       await new Promise(r => setTimeout(r, 80));  // less than 120ms threshold
-      const afterReset = idleCount();
+      const afterReset = events.filter(e => e.type === 'idle').length;
       expect(afterReset).toBe(beforeReset);  // no new idle fired
 
       resolveBackend();

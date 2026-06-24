@@ -27,6 +27,7 @@ import { fetchWithRetry } from '../util/retry';
 const log = createLogger('marketplace_biz');
 
 const TTL_MS = 24 * 60 * 60 * 1000;  // 24 hours
+const MARKETPLACE_CATEGORIES_TIMEOUT_MS = 60_000;
 export const DEFAULT_MARKETPLACE_CATEGORY_CODE = 'general';
 
 // In-memory mirror of `marketplace.json::categories`. Populated on first read from disk; refreshed
@@ -101,6 +102,8 @@ async function _fetchFromServer(): Promise<MarketplaceCategory[]> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({}),
+  }, {
+    timeoutMs: MARKETPLACE_CATEGORIES_TIMEOUT_MS,
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = await res.json() as { code: number; msg?: string; list?: unknown };

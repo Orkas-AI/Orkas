@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { AgentRunner } from "../src/agent/runner.js";
+import { AgentRunner, LOOP_HARD } from "../src/agent/runner.js";
 import { createConfig } from "../src/config/loader.js";
 import { ProviderRegistry } from "../src/providers/registry.js";
 import { defineTool } from "../src/tools/base.js";
@@ -120,6 +120,117 @@ describe("AgentRunner", () => {
 
     expect(result.text).toBe("The result is 5.");
     expect(result.meta.toolLoops).toBe(1);
+  });
+
+  it("endTurn terminal tool ends the run with NO follow-up inference", async () => {
+    // Round 0: model narrates + calls the terminal tool. Round 1 (a synthesis)
+    // must NEVER be consumed — that is the saved LLM call.
+    const mockProvider = createMockProvider([
+      {
+        content: [
+          { type: "text", text: "Handing off now." },
+          { type: "tool_use", id: "h1", name: "hand_off", input: {} },
+        ],
+        stopReason: "tool_use",
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "SYNTHESIS — must not be reached" }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+        model: "mock-model",
+      },
+    ]);
+    const streamSpy = vi.spyOn(mockProvider, "stream");
+
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+
+    let executed = false;
+    const handOffTool = defineTool({
+      name: "hand_off",
+      description: "Terminal tool — ends the turn",
+      inputSchema: { type: "object", properties: {} },
+      async execute() {
+        executed = true;
+        return { content: JSON.stringify({ ok: true }), endTurn: true };
+      },
+    });
+
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const runner = new AgentRunner({ config, providers: registry, tools: [handOffTool] });
+    const result = await runner.run({ message: "do the prep then hand off" });
+
+    expect(executed).toBe(true);
+    // The round-0 text is the final reply; the round-1 synthesis was never used.
+    expect(result.text).toBe("Handing off now.");
+    expect(result.text).not.toContain("must not be reached");
+    expect(result.meta.stopReason).toBe("end_turn");
+    expect(result.meta.toolLoops).toBe(1);
+    // Exactly ONE inference happened — the saved synthesis call.
+    expect(streamSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("endTurn terminal tool skips later sibling tool calls in the same assistant turn", async () => {
+    const mockProvider = createMockProvider([
+      {
+        content: [
+          { type: "text", text: "Handing off now." },
+          { type: "tool_use", id: "h1", name: "hand_off", input: {} },
+          { type: "tool_use", id: "w1", name: "write_after", input: {} },
+        ],
+        stopReason: "tool_use",
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "SYNTHESIS — must not be reached" }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+        model: "mock-model",
+      },
+    ]);
+    const streamSpy = vi.spyOn(mockProvider, "stream");
+
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+
+    let handoffExecuted = false;
+    let writeExecuted = false;
+    const handOffTool = defineTool({
+      name: "hand_off",
+      description: "Terminal tool — ends the turn",
+      inputSchema: { type: "object", properties: {} },
+      async execute() {
+        handoffExecuted = true;
+        return { content: JSON.stringify({ ok: true }), endTurn: true };
+      },
+    });
+    const writeAfterTool = defineTool({
+      name: "write_after",
+      description: "Side-effect tool that must not run after terminal handoff",
+      inputSchema: { type: "object", properties: {} },
+      async execute() {
+        writeExecuted = true;
+        return { content: "wrote" };
+      },
+    });
+
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const runner = new AgentRunner({ config, providers: registry, tools: [handOffTool, writeAfterTool] });
+    const events: any[] = [];
+    for await (const ev of runner.runStream({ message: "hand off then stop" })) events.push(ev);
+
+    expect(handoffExecuted).toBe(true);
+    expect(writeExecuted).toBe(false);
+    expect(streamSpy).toHaveBeenCalledTimes(1);
+    const skipped = events.find((ev) => ev.type === "tool_end" && ev.id === "w1");
+    expect(skipped).toMatchObject({ name: "write_after", isError: true });
+    expect(String(skipped?.result || '')).toContain("terminal tool ended");
+    const done = events.find((ev) => ev.type === "done");
+    expect(done?.result.text).toBe("Handing off now.");
+    expect(done?.result.text).not.toContain("must not be reached");
   });
 
   it("handles unknown tool gracefully", async () => {
@@ -841,8 +952,349 @@ describe("AgentRunner", () => {
     expect(captured).toEqual({ ORKAS_NODE: "/fake/electron", ELECTRON_RUN_AS_NODE: "1" });
   });
 
+  it("loop_detection: force-stops after LOOP_HARD identical tool calls, nudging first", async () => {
+    const captured: Message[][] = [];
+    let calls = 0;
+    const provider: LLMProvider = {
+      id: "mock",
+      name: "Mock",
+      async complete(): Promise<CompletionResult> { throw new Error("unused"); },
+      async *stream(params: CompletionParams) {
+        calls++;
+        captured.push([...params.messages]);
+        const id = `c${calls}`;
+        yield { type: "message_start" as const };
+        yield { type: "tool_use_start" as const, id, name: "noop" };
+        yield { type: "tool_use_delta" as const, id, input: "{}" };
+        yield { type: "tool_use_end" as const, id };
+        yield {
+          type: "message_end" as const,
+          stopReason: "tool_use" as const,
+          usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+          content: [{ type: "tool_use" as const, id, name: "noop", input: {} }],
+          model: "mock-model",
+        };
+      },
+      async validateAuth() { return true; },
+    };
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    let execCount = 0;
+    const noop = defineTool({
+      name: "noop",
+      description: "no-op",
+      inputSchema: { type: "object", properties: {} },
+      async execute() { execCount++; return { content: "ok" }; },
+    });
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const runner = new AgentRunner({ config, providers: registry, tools: [noop] });
+
+    const result = await runner.run({ message: "go" });
+
+    expect(calls).toBe(LOOP_HARD);          // stopped ON the LOOP_HARD-th identical proposal
+    expect(execCount).toBe(LOOP_HARD - 1);  // ...without executing that last repeat
+    expect(result.text).toContain("Stopped");
+    // The one-time warn nudge (armed at LOOP_WARN) was delivered before a later round.
+    const nudged = captured.some((msgs) =>
+      msgs.some((m) => m.role === "user"
+        && m.content.some((c) => c.type === "text" && c.text.includes("same tool with the same arguments"))));
+    expect(nudged).toBe(true);
+  });
+
+  it("loop_detection: distinct tool calls never trip (varied args)", async () => {
+    let calls = 0;
+    const provider: LLMProvider = {
+      id: "mock",
+      name: "Mock",
+      async complete(): Promise<CompletionResult> { throw new Error("unused"); },
+      async *stream() {
+        calls++;
+        if (calls <= LOOP_HARD + 1) {
+          const id = `c${calls}`;
+          yield { type: "message_start" as const };
+          yield { type: "tool_use_start" as const, id, name: "noop" };
+          yield { type: "tool_use_delta" as const, id, input: JSON.stringify({ i: calls }) };
+          yield { type: "tool_use_end" as const, id };
+          yield {
+            type: "message_end" as const,
+            stopReason: "tool_use" as const,
+            usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+            content: [{ type: "tool_use" as const, id, name: "noop", input: { i: calls } }],
+            model: "mock-model",
+          };
+        } else {
+          yield { type: "message_start" as const };
+          yield { type: "text_delta" as const, text: "done" };
+          yield {
+            type: "message_end" as const,
+            stopReason: "end_turn" as const,
+            usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 },
+            content: [{ type: "text" as const, text: "done" }],
+            model: "mock-model",
+          };
+        }
+      },
+      async validateAuth() { return true; },
+    };
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const noop = defineTool({
+      name: "noop",
+      description: "no-op",
+      inputSchema: { type: "object", properties: {} },
+      async execute() { return { content: "ok" }; },
+    });
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const runner = new AgentRunner({ config, providers: registry, tools: [noop] });
+
+    const result = await runner.run({ message: "go" });
+
+    // Ran past LOOP_HARD distinct calls of the SAME tool without stopping.
+    expect(result.text).toBe("done");
+    expect(calls).toBe(LOOP_HARD + 2); // LOOP_HARD+1 tool rounds + the final text turn
+  });
+
+  it("interrupt-steer: folds drainSteer messages into the next LLM round", async () => {
+    // round 1 calls a no-op tool → loop boundary → drainSteer yields a steer →
+    // round 2 must see it as a user message; round 1 must NOT (folded only after
+    // the tool round).
+    const captured: Message[][] = [];
+    let streamCalls = 0;
+    const provider: LLMProvider = {
+      id: "mock",
+      name: "Mock",
+      async complete(): Promise<CompletionResult> { throw new Error("unused"); },
+      async *stream(params: CompletionParams) {
+        streamCalls++;
+        captured.push([...params.messages]);
+        if (streamCalls === 1) {
+          const id = "c1";
+          yield { type: "message_start" as const };
+          yield { type: "tool_use_start" as const, id, name: "noop" };
+          yield { type: "tool_use_delta" as const, id, input: "{}" };
+          yield { type: "tool_use_end" as const, id };
+          yield {
+            type: "message_end" as const,
+            stopReason: "tool_use" as const,
+            usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+            content: [{ type: "tool_use" as const, id, name: "noop", input: {} }],
+            model: "mock-model",
+          };
+        } else {
+          yield { type: "message_start" as const };
+          yield { type: "text_delta" as const, text: "done" };
+          yield {
+            type: "message_end" as const,
+            stopReason: "end_turn" as const,
+            usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 },
+            content: [{ type: "text" as const, text: "done" }],
+            model: "mock-model",
+          };
+        }
+      },
+      async validateAuth() { return true; },
+    };
+
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const noop = defineTool({
+      name: "noop",
+      description: "no-op",
+      inputSchema: { type: "object", properties: {} },
+      async execute() { return { content: "ok" }; },
+    });
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const runner = new AgentRunner({ config, providers: registry, tools: [noop] });
+
+    let drained = false;
+    const STEER = "STEER: actually do Y instead";
+    await runner.run({
+      message: "do the task",
+      drainSteer: () => {
+        if (drained) return [];
+        drained = true;
+        return [STEER];
+      },
+    });
+
+    expect(streamCalls).toBe(2);
+    const sawSteer = (msgs: Message[]) =>
+      msgs.some((m) => m.role === "user"
+        && m.content.some((c) => c.type === "text" && c.text.includes(STEER)));
+    expect(sawSteer(captured[1])).toBe(true);  // round 2 sees the folded steer
+    expect(sawSteer(captured[0])).toBe(false); // round 1 (pre-tool) does not
+  });
+
+  it("interrupt-steer: folds a steer that arrives on a no-tool terminal turn", async () => {
+    // round 1 produces a FINAL text answer with NO tool calls. A steer arrives
+    // at that terminal boundary → the run must NOT end; round 2 runs and sees
+    // the folded steer. Without the terminal-path drain the run would end on
+    // round 1 and the steer would be deferred to a follow-up turn (P1-8).
+    const captured: Message[][] = [];
+    let streamCalls = 0;
+    const provider: LLMProvider = {
+      id: "mock",
+      name: "Mock",
+      async complete(): Promise<CompletionResult> { throw new Error("unused"); },
+      async *stream(params: CompletionParams) {
+        streamCalls++;
+        captured.push([...params.messages]);
+        const text = streamCalls === 1 ? "first" : "second";
+        yield { type: "message_start" as const };
+        yield { type: "text_delta" as const, text };
+        yield {
+          type: "message_end" as const,
+          stopReason: "end_turn" as const,
+          usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 },
+          content: [{ type: "text" as const, text }],
+          model: "mock-model",
+        };
+      },
+      async validateAuth() { return true; },
+    };
+
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const runner = new AgentRunner({ config, providers: registry, tools: [] });
+
+    let drained = false;
+    const STEER = "STEER: changed my mind, do Z";
+    const result = await runner.run({
+      message: "do the task",
+      drainSteer: () => {
+        if (drained) return [];
+        drained = true;
+        return [STEER];
+      },
+    });
+
+    expect(streamCalls).toBe(2); // terminal turn re-looped instead of ending
+    const sawSteer = (msgs: Message[]) =>
+      msgs.some((m) => m.role === "user"
+        && m.content.some((c) => c.type === "text" && c.text.includes(STEER)));
+    expect(sawSteer(captured[1])).toBe(true);  // round 2 sees the folded steer
+    expect(sawSteer(captured[0])).toBe(false); // round 1 (first answer) does not
+    expect(result.text).toBe("second");        // final answer is the post-steer turn
+  });
+
+  it("interrupt-steer: no drainSteer / empty steer leaves the run unchanged", async () => {
+    // Same shape, but drainSteer returns [] — round 2 must not gain any extra
+    // user message beyond the tool_result.
+    const userTextCounts: number[] = [];
+    let streamCalls = 0;
+    const provider: LLMProvider = {
+      id: "mock",
+      name: "Mock",
+      async complete(): Promise<CompletionResult> { throw new Error("unused"); },
+      async *stream(params: CompletionParams) {
+        streamCalls++;
+        userTextCounts.push(
+          params.messages.filter((m) => m.role === "user"
+            && m.content.some((c) => c.type === "text")).length,
+        );
+        if (streamCalls === 1) {
+          const id = "c1";
+          yield { type: "message_start" as const };
+          yield { type: "tool_use_start" as const, id, name: "noop" };
+          yield { type: "tool_use_delta" as const, id, input: "{}" };
+          yield { type: "tool_use_end" as const, id };
+          yield {
+            type: "message_end" as const,
+            stopReason: "tool_use" as const,
+            usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+            content: [{ type: "tool_use" as const, id, name: "noop", input: {} }],
+            model: "mock-model",
+          };
+        } else {
+          yield { type: "message_start" as const };
+          yield { type: "text_delta" as const, text: "done" };
+          yield {
+            type: "message_end" as const,
+            stopReason: "end_turn" as const,
+            usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 },
+            content: [{ type: "text" as const, text: "done" }],
+            model: "mock-model",
+          };
+        }
+      },
+      async validateAuth() { return true; },
+    };
+
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const noop = defineTool({
+      name: "noop",
+      description: "no-op",
+      inputSchema: { type: "object", properties: {} },
+      async execute() { return { content: "ok" }; },
+    });
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const runner = new AgentRunner({ config, providers: registry, tools: [noop] });
+
+    await runner.run({ message: "do the task", drainSteer: () => [] });
+
+    expect(streamCalls).toBe(2);
+    // Only the original user message carries text in both rounds — no fold.
+    expect(userTextCounts[0]).toBe(1);
+    expect(userTextCounts[1]).toBe(1);
+  });
+
+  it("injects a run-scoped readFileState Map shared across tool rounds", async () => {
+    // Read-before-edit + OCC (G6) needs the baseline a read records to survive
+    // into the (later) edit round. `toolState` is rebuilt every round, so the
+    // map must be the SAME instance each round. If this regresses, every edit
+    // after a read would see an empty map → spurious E_NOT_READ.
+    const mockProvider = createMockProvider([
+      {
+        content: [{ type: "tool_use", id: "c1", name: "capture_state", input: {} }],
+        stopReason: "tool_use",
+        usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "tool_use", id: "c2", name: "capture_state", input: {} }],
+        stopReason: "tool_use",
+        usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "done" }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 },
+        model: "mock-model",
+      },
+    ]);
+
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+
+    const seen: unknown[] = [];
+    const captureTool = defineTool({
+      name: "capture_state",
+      description: "capture readFileState for assertion",
+      inputSchema: { type: "object", properties: {} },
+      async execute(_input, ctx) {
+        seen.push(ctx.state.readFileState);
+        return { content: "ok" };
+      },
+    });
+
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model" },
+    });
+    const runner = new AgentRunner({ config, providers: registry, tools: [captureTool] });
+    await runner.run({ message: "capture it twice" });
+
+    expect(seen.length).toBe(2);
+    expect(seen[0]).toBeInstanceOf(Map);
+    // Same instance both rounds → the read baseline persists across rounds.
+    expect(seen[1]).toBe(seen[0]);
+  });
+
   it("omits sandboxEnv from state when not provided", async () => {
-    // Preserves the pre-change default: state starts as {} if caller didn't opt in.
+    // Preserves the pre-change default: sandboxEnv is absent from state when the
+    // caller didn't opt in (the run-scoped readFileState map is always present).
     const mockProvider = createMockProvider([
       {
         content: [{ type: "tool_use", id: "c1", name: "capture_env", input: {} }],

@@ -49,13 +49,13 @@ const log = createLogger('model');
  * stays in `cloud/sessions/`, life-cycled with its owning entity (cid /
  * sid / aid).
  */
-const EPHEMERAL_KINDS = ['extract-img', 'reflect', 'memory-extract', 'anon'] as const;
+const EPHEMERAL_KINDS = ['extract-img', 'reflect', 'memory-extract', 'anon', 'gworker'] as const;
 
 /** All recognised kind keywords (used by `resolveSessionPath`'s kind-anchor assertion).
  *  Order matters in the regex alternation: longer alternatives must come before their
  *  shorter prefix overlaps so that e.g. `extract-img-…` matches as one kind, not as
  *  `extract` + leftover. */
-const KNOWN_KINDS_RE = /^(gmember|gconv|memory-extract|extract-img|reflect|skill|agent|anon|cli)(?:-|$)/;
+const KNOWN_KINDS_RE = /^(gmember|gworker|gconv|memory-extract|extract-img|reflect|skill|agent|anon|cli)(?:-|$)/;
 
 export function isEphemeralSessionId(sessionId: string): boolean {
   for (const kind of EPHEMERAL_KINDS) {
@@ -83,7 +83,7 @@ export function resolveSessionPath(userId: string, sessionId: string): string {
   if (!KNOWN_KINDS_RE.test(sessionId)) {
     throw new Error(
       `invalid session id "${sessionId}" — must start with a known kind ` +
-      `(gconv | gmember | skill | agent | extract-img | reflect | memory-extract | anon | cli)`,
+      `(gconv | gmember | gworker | skill | agent | extract-img | reflect | memory-extract | anon | cli)`,
     );
   }
   return isEphemeralSessionId(sessionId)

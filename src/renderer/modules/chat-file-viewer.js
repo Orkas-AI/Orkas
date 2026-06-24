@@ -68,9 +68,11 @@ const _viewerLog = (typeof createLogger === 'function')
   : { warn: () => {}, info: () => {}, error: () => {} };
 
 function _viewerTrack(action, data) {
+  void 0;
 }
 
 function _viewerTrackError(action, data) {
+  void 0;
 }
 
 // Extensions we'll try to render inline. Anything else falls through to the
@@ -96,6 +98,14 @@ const _TEXT_EXTS = new Set([
   '.c', '.cpp', '.cc', '.h', '.hpp',
   '.css', '.scss', '.less',
   '.sql', '.graphql', '.gql',
+]);
+const _LIBRARY_IMPORT_EXTS = new Set([
+  ..._IMAGE_EXTS,
+  ..._OFFICE_EXTS,
+  ..._MARKDOWN_EXTS,
+  ..._TEXT_EXTS,
+  '.pdf',
+  '.html', '.htm',
 ]);
 
 function _extOf(name) {
@@ -177,11 +187,11 @@ function _setSaveAppVisible(visible) {
   _viewerSaveAppBtn.disabled = !visible;
 }
 
-function _viewerCanAddToLibrary(kind) {
-  // Images are delegated to chat-lightbox before this shell opens; the guard
-  // here keeps unsupported inline previews from offering an action the
-  // backend rejects.
-  return kind !== 'video' && kind !== 'office';
+function _viewerCanAddToLibrary(nameOrKind) {
+  const raw = String(nameOrKind || '');
+  const ext = _extOf(raw);
+  if (ext) return _LIBRARY_IMPORT_EXTS.has(ext);
+  return ['image', 'pdf', 'office', 'markdown', 'text', 'html'].includes(raw);
 }
 
 function _isViewerOpen() {
@@ -291,7 +301,7 @@ function _teardownViewerContent() {
   }
   if (_viewerBody) _viewerBody.innerHTML = '';
   if (_viewerMdActions) _viewerMdActions.innerHTML = '';
-  if (_viewerEl) _viewerEl.classList.remove('is-markdown', 'is-text', 'is-office');
+  if (_viewerEl) _viewerEl.classList.remove('is-markdown', 'is-text', 'is-office', 'is-office-fit');
 }
 
 function _typesetViewerMarkdown() {
@@ -321,6 +331,7 @@ async function _onRevealClick() {
 async function _onAddLibraryClick() {
   const p = _viewerCurrentPath;
   if (!p || !_viewerCurrentCid || !_viewerAddLibraryBtn || _viewerAddLibraryBtn.disabled) return;
+  if (!_viewerCanAddToLibrary(p)) return;
   _viewerTrack('file_preview_add_library', { kind: _kindOf(p), has_project: !!_viewerCurrentProjectId });
   const label = _viewerLabel('chat.preview_add_library_title', 'Add to Library');
   const doneLabel = _viewerLabel('chat.preview_add_library_done', 'Added');
@@ -437,7 +448,7 @@ async function _openViewerShell(displayName, opts) {
   _viewerCurrentPath = absPath || null;
   _viewerCurrentCid = cid;
   _viewerCurrentProjectId = projectId;
-  if (_viewerAddLibraryBtn) _viewerAddLibraryBtn.hidden = !cid || !_viewerCanAddToLibrary(kind);
+  if (_viewerAddLibraryBtn) _viewerAddLibraryBtn.hidden = !cid || !_viewerCanAddToLibrary(absPath || displayName || kind);
   void _refreshSaveAppButton(_viewerCurrentPath);
   _viewerTitle.textContent = displayName || '';
   // `is-markdown` / `is-text` switch the body to a flex column so an editor
@@ -542,7 +553,10 @@ async function _renderOfficeBody(absPath, displayName, cid, projectId) {
     }
     const blob = new Blob([String(res.html || '')], { type: 'text/html;charset=utf-8' });
     _viewerBlobUrl = URL.createObjectURL(blob);
-    _viewerBody.innerHTML = `<iframe class="chat-file-viewer-office" sandbox="" src="${_viewerBlobUrl}" title="${escapeHtml(displayName || '')}"></iframe>`;
+    const fitHeight = _officeFitFrameHeight(res);
+    if (fitHeight) _viewerEl.classList.add('is-office-fit');
+    const style = fitHeight ? ` style="height:${fitHeight}px"` : '';
+    _viewerBody.innerHTML = `<iframe class="chat-file-viewer-office" sandbox="" src="${_viewerBlobUrl}"${style} title="${escapeHtml(displayName || '')}"></iframe>`;
   } catch (err) {
     if (seq !== _viewerRenderSeq) return;
     _viewerLog.warn('office preview threw', { path: absPath, error: String(err && err.message || err) });
@@ -553,6 +567,14 @@ async function _renderOfficeBody(absPath, displayName, cid, projectId) {
       fallback: 'Could not read this file. Open the containing folder?',
     });
   }
+}
+
+function _officeFitFrameHeight(res) {
+  if (!res || res.kind !== 'spreadsheet') return 0;
+  const raw = Number(res.previewHeight || 0);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  const max = Math.max(260, Math.floor((window.innerHeight || 800) * 0.92 - 50));
+  return Math.max(260, Math.min(max, Math.ceil(raw)));
 }
 
 async function _renderVideoBody(absPath, displayName, cid, projectId) {

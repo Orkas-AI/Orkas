@@ -19,6 +19,8 @@ import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 
+import type { AgentTool } from '#core-agent';
+
 import {
   userAgentsDir, userSkillsDir, userAgentChatDir, userSessionFile, WS_ROOT,
   agentDir, agentDefinitionFile,
@@ -47,9 +49,11 @@ import {
   appendJsonlAtomic, invalidateLineCount, readJsonl,
 } from '../storage';
 import {
-  listSkillSpecs,
+  listSkillSpecsForAgentMetadata,
   normalizeKnownSkillRefsForDisplay,
+  openSkillReadRoots,
   resolveSkillAllowlistRefs,
+  searchOpenTierSkills,
   type SkillAllowlistRef,
 } from '../model/core-agent/skill-registry';
 import { readDisabledSets, setAgentEnabled } from './component_enabled';
@@ -936,7 +940,7 @@ function resolveBilingualDescription(
 }
 
 async function _skillSpecsForDisplay(): Promise<SkillAllowlistRef[]> {
-  try { return await listSkillSpecs(); }
+  try { return await listSkillSpecsForAgentMetadata(getActiveUserId()); }
   catch (err) {
     log.warn(`skill display-name map unavailable: ${(err as Error).message}`);
     return [];
@@ -1232,7 +1236,7 @@ async function _applyAgentUpdates(
       delete data.skill_list;
     } else if (Array.isArray(v)) {
       const raw = v.filter((x) => typeof x === 'string' && safeId(x));
-      const specs = await listSkillSpecs();
+      const specs = await listSkillSpecsForAgentMetadata(getActiveUserId());
       const { ids, unknown } = resolveSkillAllowlistRefs(specs, raw);
       if (unknown.length) {
         log.warn(`agent ${agentId}: unknown skills dropped: ${unknown.join(',')}`);
@@ -1741,6 +1745,72 @@ async function buildAgentEditMessageWithAttachments(
   };
 }
 
+function _trimText(raw: unknown, max = 2000): string {
+  const s = typeof raw === 'string' ? raw.trim() : '';
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+function _clampLimit(raw: unknown, fallback: number, min: number, max: number): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+function buildAgentEditSkillSearchTool(uid: string): AgentTool {
+  return {
+    name: 'skill_search',
+    description: [
+      'Find skills contributed by the user\'s global skill folders when the listed skills do not cover the agent being authored.',
+      'Returns each match\'s name, source, and SKILL.md path; read_file that path before referencing the skill in an agent workflow.',
+      'Matching is keyword-based over names + descriptions, which may be English. If a user-language query returns nothing, retry once with English keywords before concluding none exist.',
+      'This does not search the marketplace catalog and installs nothing.',
+    ].join(' '),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Capability text matched against skill names and descriptions. Leave empty to list available global skills. Use the user language when possible.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum results to return (1-20). Default: 8.',
+        },
+      },
+      additionalProperties: false,
+    },
+    async execute(input) {
+      const query = _trimText(input?.query, 300);
+      const limit = _clampLimit(input?.limit, 8, 1, 20);
+      try {
+        const { skills: disabledSkillIds } = readDisabledSets(uid);
+        const res = await searchOpenTierSkills(uid, query, limit, disabledSkillIds);
+        return { content: JSON.stringify({ ok: true, query, ...res }) };
+      } catch (err) {
+        return { content: JSON.stringify({ ok: false, error: (err as Error).message || 'skill search failed' }), isError: true };
+      }
+    },
+  };
+}
+
+function agentEditExtraTools(userId: string): AgentTool[] {
+  return [buildAgentEditSkillSearchTool(userId)];
+}
+
+function agentEditReadOnlyRoots(userId: string, attachmentCid?: string): string[] {
+  const roots = [
+    userMarketplaceSkillsDir(userId),
+    userSkillsDir(userId),
+  ];
+  try {
+    roots.push(...openSkillReadRoots(userId));
+  } catch (err) {
+    log.warn(`agent edit open skill read roots unavailable: ${(err as Error).message}`);
+  }
+  if (attachmentCid) roots.push(chatAttachmentDir(userId, attachmentCid));
+  return roots;
+}
+
 export async function sendToAgentEditChat(
   userId: string,
   agentId: string,
@@ -1760,6 +1830,10 @@ export async function sendToAgentEditChat(
   const modelText = typeof opts.modelText === 'string' ? opts.modelText.trim() : '';
   const modelContent = modelText || content;
   const attachmentCtx = await buildAgentEditMessageWithAttachments(userId, agentId, modelContent, opts.attachments);
+  const readOnlyRoots = agentEditReadOnlyRoots(
+    userId,
+    attachmentCtx.attachmentNames.length ? attachmentCtx.attachmentCid : undefined,
+  );
 
   await _appendAgentChatMessage(userId, agentId,
     {
@@ -1776,15 +1850,9 @@ export async function sendToAgentEditChat(
   const result = await chatWithModel({
     userId, message: attachmentCtx.message, sessionId, systemPrompt,
     agentName: 'orkas_chat', timeout: 300,
-    readOnlyExtraRoots: [userMarketplaceSkillsDir(userId), userSkillsDir(userId)],
-    ...(attachmentCtx.attachmentNames.length ? {
-      images: attachmentCtx.images,
-      readOnlyExtraRoots: [
-        userMarketplaceSkillsDir(userId),
-        userSkillsDir(userId),
-        chatAttachmentDir(userId, attachmentCtx.attachmentCid),
-      ],
-    } : {}),
+    readOnlyExtraRoots: readOnlyRoots,
+    extraTools: agentEditExtraTools(userId),
+    ...(attachmentCtx.attachmentNames.length ? { images: attachmentCtx.images } : {}),
   });
 
   if (!result.ok) {
@@ -1835,6 +1903,10 @@ export async function* streamSendToAgentEditChat(
   const modelText = typeof opts.modelText === 'string' ? opts.modelText.trim() : '';
   const modelContent = modelText || content;
   const attachmentCtx = await buildAgentEditMessageWithAttachments(userId, agentId, modelContent, opts.attachments);
+  const readOnlyRoots = agentEditReadOnlyRoots(
+    userId,
+    attachmentCtx.attachmentNames.length ? attachmentCtx.attachmentCid : undefined,
+  );
 
   await _appendAgentChatMessage(userId, agentId,
     {
@@ -1858,11 +1930,8 @@ export async function* streamSendToAgentEditChat(
       userId, message: attachmentCtx.message, sessionId, systemPrompt,
       agentName: 'orkas_chat',
       cacheRetention: 'short',
-      readOnlyExtraRoots: [
-        userMarketplaceSkillsDir(userId),
-        userSkillsDir(userId),
-        ...(attachmentCtx.attachmentNames.length ? [chatAttachmentDir(userId, attachmentCtx.attachmentCid)] : []),
-      ],
+      readOnlyExtraRoots: readOnlyRoots,
+      extraTools: agentEditExtraTools(userId),
       ...(attachmentCtx.images.length ? { images: attachmentCtx.images } : {}),
       ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
     }) as AsyncIterable<any>) {

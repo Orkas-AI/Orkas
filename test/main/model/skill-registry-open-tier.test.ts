@@ -5,8 +5,8 @@ import * as path from 'node:path';
 
 // OPEN-tier rendering (external packages + global roots) in
 // `getSystemPromptBlock`. Companion to skill-registry.test.ts (trusted
-// tier). Plan: docs/plans/open-ecosystem-architecture.md §A3/§B1, decision
-// D5 (commander-only → callers gate via `includeOpenSources`).
+// tier). Plan: docs/plans/open-ecosystem-architecture.md §A3/§B1; callers
+// gate exposure via `includeOpenSources`.
 
 let tmpDir: string;
 let prevWs: string | undefined;
@@ -198,6 +198,20 @@ describe('skill-registry › open tier (includeOpenSources)', () => {
     expect(roots).toContain(globalRoot);
     // ~/.codex/skills doesn't exist in the sandbox → filtered out.
     expect(roots).not.toContain(path.join(homeDir(), '.codex', 'skills'));
+  });
+
+  it('listSkillSpecsForAgentMetadata includes trusted + enabled external, but not global', async () => {
+    writeSkill(customDir(), 'mine', 'mine', 'trusted custom');
+    writePackage('mypack', ['skills']);
+    writeSkill(path.join(pkgsDir(), 'mypack', 'skills'), 'pkg-skill', 'pkg-skill', 'from package');
+    writeSkill(path.join(homeDir(), '.claude', 'skills'), 'global-skill', 'global-skill', 'global skill');
+
+    const { listSkillSpecsForAgentMetadata } = await loadRegistry();
+    const ids = (await listSkillSpecsForAgentMetadata(TEST_UID)).map((s) => s.id);
+
+    expect(ids).toContain('mine');
+    expect(ids).toContain('pkg-skill');
+    expect(ids).not.toContain('global-skill');
   });
 });
 

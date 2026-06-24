@@ -25,7 +25,7 @@ You **must** consult before emitting any `<agent>` container. The protocol below
 - **No silent category defaults.** Before the final reply for any create / edit / import, run the category sanity pass below. Do not say "done" while `<category>` is missing, invalid, inherited from an invalid source value such as `code`, or merely the fallback `general` without evidence.
 - **Output language follows the user's UI language** — `<name>`, `<description>`, `<workflow>` step titles + body, `<inputs>` `label` values, and the prose around the container all go in the user's current UI language (per the "User language" directive in the system prompt; that directive's coverage applies even though this file reaches you as a `read_file` result). Use `<description_zh>` / `<description_en>` only when the user explicitly asks for multilingual/bilingual descriptions. XML tag names, backticked tool / skill names, JSON keys, file paths, and `select` `value` strings stay as-is. The English used in this file is illustrative shape, not literal text to copy.
 - **Do not hard-code other agent display names inside agent content.** Agent names are user-editable and may change after creation. In `<workflow>`, meta notes, handoff text, and routing rules, refer to downstream agents by capability or role boundary (for example, "route to the dedicated math learning agent" or "route to the appropriate planning agent"), not by a concrete display name. The only required concrete name is the current agent's own `<name>` field.
-- **Keep `<skills>` aligned with workflow skill use.** `<skills>` is authored by the model, so it MUST use the model-visible skill name exactly as shown in Available skills, not hidden/internal ids. If `<workflow>` invokes, follows, or depends on any available skill, `<skills>` MUST list every required skill name. Do not leave `<skills>` empty in that case: an empty list means the agent opts out of all skills at runtime, so referenced skills will not be visible. The server resolves skill names to internal ids when needed. Use an empty `<skills></skills>` only when the workflow uses built-in tools alone and no skills.
+- **Keep `<skills>` aligned with workflow skill use.** `<skills>` is authored by the model as dependency metadata, so it MUST use the model-visible skill name exactly as shown in Available skills, not hidden/internal ids. If `<workflow>` invokes, follows, or depends on any available skill, `<skills>` MUST list every required skill name. Use an empty `<skills></skills>` only when the workflow uses built-in tools/connectors alone and no skills. Runtime agents still receive the enabled skill surface, but this dependency list keeps the agent spec understandable and backward-compatible.
 
 ## Quality bar — designing the agent
 
@@ -158,10 +158,12 @@ The previous step's result / inbound message / accumulated context are the defau
 
 **Tool / skill names: required in backticks where invoked, forbidden where not.** Every invoked tool or skill name appears in backticks (`read_file` / `kb_search` / `social-fetch` skill / `markdown_to_pdf` / `web_search` — no abstract verbs like "read the file"). Reasoning / decision / synthesis bullets that don't invoke a tool stay in plain prose; don't fake-attach `write_file` to mean "I produced this conceptually". **Why**: workflow is injected into the runtime agent's system prompt, and invoked tools / skills need canonical names so the runtime picks the right capability.
 
-**Tool / skill priority** when authoring workflow actions:
+**Tool / skill / connector priority** when authoring workflow actions:
 1. Built-in tools (file IO, `bash`, `kb_search`, `kb_read`, `markdown_to_pdf`, `html_to_pdf`, `generate_image`, `web_search`, `web_fetch`) — write the tool name directly.
 2. Existing skills from the "Available skills" block — use the displayed skill name.
-3. Only when neither covers it, mention the missing capability in user-perspective prose; do NOT invent skill names.
+3. If no listed skill fits and the `skill_search` tool is available, search global-folder skills, read the returned `SKILL.md`, then use the displayed skill name if it fits.
+4. Connected services from the `## Connectors` block — call `list_connector_tools` to discover action names/schemas, then write the connector id/action in workflow prose; connector actions do NOT belong in `<skills>`.
+5. Only when none of the above covers it, mention the missing capability in user-perspective prose; do NOT invent skill names, connector ids, or action names.
 
 Built-in tool names are NOT skills and must never appear in `<skills>`.
 
@@ -174,8 +176,8 @@ Do NOT include a top-level `# Workflow` heading inside the sub-tag — the UI al
 > _LLM-managed agents only. CLI-backed agents bring their own tooling via the bound CLI — skip._
 
 - One skill name per line. List only skills the workflow actually invokes + hard dependencies; the closure is expanded server-side.
-- Skill names must come from the system prompt's "Available skills" section; do not invent or misspell. The model should output the visible skill name only. Internal ids are an implementation detail for the server and compatibility layer, not an authoring target.
-- An empty `<skills></skills>` is **legal only when the workflow uses built-in tools alone**. If the workflow names or depends on skills, list those skill names here; otherwise the agent's runtime `skill_list` becomes empty and the skills block is filtered out.
+- Skill names must come from the system prompt's "Available skills" section or a `skill_search` result whose `SKILL.md` you read; do not invent or misspell. The model should output the visible skill name only. Internal ids are an implementation detail for the server and compatibility layer, not an authoring target.
+- An empty `<skills></skills>` is **legal only when the workflow uses built-in tools/connectors alone**. If the workflow names or depends on skills, list those skill names here as dependency metadata.
 
 ### `<inputs>` — the one-shot form before the agent runs
 

@@ -11,12 +11,15 @@
 const _projectDetailLog = createLogger('project-detail');
 
 function _projectTrackClick(action, data) {
+  void 0;
 }
 
 function _projectTrackEvent(action, data) {
+  void 0;
 }
 
 function _projectTrackError(action, data) {
+  void 0;
 }
 
 function _projectFileUploadPayload(fileList, source, targetDir) {
@@ -38,6 +41,7 @@ let _projectKbEventsHandle = null;
 let _projectKbEventsPid = '';
 let _projectLibraryActiveName = '';
 let _projectLibraryMveController = null;
+let _projectOfficeBlobUrl = null;
 const _projectLibraryExpanded = new Set();
 const _projectLibraryDrafts = new Map();
 let _projectKbStatusRefreshTimer = null;
@@ -58,6 +62,9 @@ async function loadProjectDetail(pid) {
     _renderProjectDetailEmpty();
     return;
   }
+  // Surface any pending commander-draft attachment for this project (e.g. a KB
+  // file queued via "ask the commander about this file").
+  if (typeof _chatAttachRenderChips === 'function') _chatAttachRenderChips(_projectChatDraftCid(_projectDetailPid));
   if (_projectKbEventsPid && _projectKbEventsPid !== _projectDetailPid) {
     _stopProjectKbEventSubscription();
   }
@@ -486,7 +493,7 @@ function _renderBindingsRows(kind, items) {
 }
 
 function _isProjectLibraryVectorizableKind(kind) {
-  return ['text', 'pdf', 'docx', 'image'].includes(String(kind || ''));
+  return ['text', 'pdf', 'docx', 'spreadsheet', 'presentation', 'image'].includes(String(kind || ''));
 }
 
 function _projectLibraryRel(node) {
@@ -778,6 +785,7 @@ async function _openProjectFile(name) {
     if (kind === 'image') return await _showProjectImageViewer(name);
     if (kind === 'pdf') return await _showProjectPdfViewer(name);
     if (kind === 'docx') return await _showProjectDocxViewer(name);
+    if (kind === 'spreadsheet' || kind === 'presentation') return await _showProjectOfficeViewer(name);
     return await _showProjectBinaryViewer(name, kind || 'other');
   } catch (err) {
     _projectDetailLog.warn('open project file failed', err);
@@ -814,6 +822,10 @@ function _markProjectLibraryActive() {
 }
 
 function _prepProjectLibraryViewer(name) {
+  if (_projectOfficeBlobUrl) {
+    try { URL.revokeObjectURL(_projectOfficeBlobUrl); } catch (_) { /* ignore */ }
+    _projectOfficeBlobUrl = null;
+  }
   if (_projectLibraryMveController) {
     try { _projectLibraryMveController.destroy(); } catch (_) { /* ignore */ }
     _projectLibraryMveController = null;
@@ -841,6 +853,10 @@ function _clearProjectLibraryViewer() {
   if (_projectLibraryMveController) {
     try { _projectLibraryMveController.destroy(); } catch (_) { /* ignore */ }
     _projectLibraryMveController = null;
+  }
+  if (_projectOfficeBlobUrl) {
+    try { URL.revokeObjectURL(_projectOfficeBlobUrl); } catch (_) { /* ignore */ }
+    _projectOfficeBlobUrl = null;
   }
   _projectLibraryActiveName = '';
   const modal = document.getElementById('project-library-viewer-modal');
@@ -929,6 +945,25 @@ async function _showProjectDocxViewer(name) {
   });
   if (!res?.ok) throw new Error(res?.error || 'read_failed');
   els.bodyEl.innerHTML = `<div class="ctx-viewer-docx markdown-body">${res.html || `<p class="muted">${escapeHtml(t('contexts.viewer.docx_empty'))}</p>`}</div>`;
+  _renderProjectLibraryViewerActions(els.actionsEl, name);
+  els.bodyEl.scrollTop = 0;
+}
+
+async function _showProjectOfficeViewer(name) {
+  const els = _prepProjectLibraryViewer(name);
+  if (!els || !els.bodyEl || !els.actionsEl) return;
+  els.bodyEl.innerHTML = `<div class="chat-file-viewer-loading">…</div>`;
+  const res = await window.orkas.invoke('projects.files.officeHtml', {
+    projectId: _projectDetailPid,
+    name,
+  });
+  if (!res?.ok) throw new Error(res?.error || 'read_failed');
+  if (_projectOfficeBlobUrl) {
+    try { URL.revokeObjectURL(_projectOfficeBlobUrl); } catch (_) { /* ignore */ }
+  }
+  _projectOfficeBlobUrl = URL.createObjectURL(new Blob([String(res.html || '')], { type: 'text/html;charset=utf-8' }));
+  const style = res.previewHeight ? ` style="height:${Math.max(120, Number(res.previewHeight) || 0)}px"` : '';
+  els.bodyEl.innerHTML = `<iframe class="ctx-viewer-office" sandbox="" src="${_projectOfficeBlobUrl}"${style} title="${escapeHtml(name)}"></iframe>`;
   _renderProjectLibraryViewerActions(els.actionsEl, name);
   els.bodyEl.scrollTop = 0;
 }
@@ -1068,6 +1103,7 @@ function _projectFileMenuItemsFor(name) {
   const row = _findProjectFileRow(name);
   const kind = row?.dataset?.projectFileKind || '';
   const items = [];
+  items.push({ action: 'ask_commander', label: t('contexts.menu.ask_commander') });
   if (kind === 'text') items.push({ action: 'edit', label: t('contexts.menu.edit') });
   items.push({ action: 'reveal', label: t('project.files.reveal') });
   items.push({ action: 'rename', label: t('contexts.menu.rename') });
@@ -1260,6 +1296,34 @@ async function _runProjectFileMenuAction(action, name) {
   else if (action === 'reveal') await _revealProjectFile(name);
   else if (action === 'rename') await _renameProjectFile(name);
   else if (action === 'delete') await _deleteProjectFile(name);
+  else if (action === 'ask_commander') await _askProjectFileCommander(name);
+}
+
+// The project composer's per-project draft attachment pool cid.
+function _projectChatDraftCid(pid) {
+  return 'projchat-' + pid;
+}
+
+// Attach a project file to the project composer's draft pool and stay on the
+// project page (no new conversation — _submitProjectChat adopts the draft on
+// send). Main resolves the path + validates the project + imports the file.
+async function _askProjectFileCommander(name) {
+  if (!_projectDetailPid || !name) return;
+  if (typeof ensureModelConfigured === 'function' && !ensureModelConfigured()) return;
+  const pid = _projectDetailPid;
+  try {
+    await window.attachKbFileToDraft(
+      'projects.files.attachToDraft',
+      { projectId: pid, name },
+      _projectChatDraftCid(pid),
+      () => {
+        if (typeof setView === 'function') setView('project', pid);
+        document.getElementById('project-chat-input')?.focus();
+      },
+    );
+  } catch (e) {
+    if (typeof uiAlert === 'function') await uiAlert(t('contexts.ask_commander_failed', { reason: (e && e.message) || e }));
+  }
 }
 
 async function _runProjectDirMenuAction(action, name) {
@@ -1682,6 +1746,30 @@ async function _submitProjectChat() {
     return;
   }
 
+  // Adopt the project composer's draft attachments (e.g. a KB file added via
+  // "ask the commander about this file") into the new conversation — mirrors the
+  // new-chat draft adopt. No-op when there are none, so normal sends are
+  // unaffected.
+  const _draftCid = _projectChatDraftCid(_projectDetailPid);
+  const _draftNames = (typeof _chatAttachList === 'function' ? _chatAttachList(_draftCid) : [])
+    .map((it) => it && it.name).filter(Boolean);
+  let _adopted = [];
+  if (_draftNames.length) {
+    try {
+      const aRes = await apiFetch('/api/conversations/attachments/adopt', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from_cid: _draftCid, to_cid: convId }),
+      });
+      const aData = await aRes.json();
+      if (aData.ok) _adopted = _draftNames;
+    } catch (_) { /* best-effort: fall through, file simply not attached */ }
+    if (typeof _chatAttachClear === 'function') {
+      if (_adopted.length) _chatAttachClear(_draftCid);
+      else await _chatAttachClear(_draftCid, { deleteFiles: true });
+    }
+  }
+
   if (input) {
     input.value = '';
     if (typeof autoGrow === 'function') autoGrow(input, 180);
@@ -1700,7 +1788,7 @@ async function _submitProjectChat() {
   }
   if (btn) btn.disabled = false;
   if (typeof sendInCurrentConversation === 'function') {
-    await sendInCurrentConversation(content);
+    await sendInCurrentConversation(content, _adopted.length ? { attachments: _adopted } : undefined);
   }
 }
 

@@ -65,6 +65,8 @@ import { chatAttachmentDir, userMarketplaceSkillsDir, userSkillsDir } from '../.
 import * as chatArtifacts from '../../features/chat_artifacts';
 import { readDisabledSets } from '../../features/component_enabled';
 import { requestConfirmation as requestDeleteConfirmation, consumeGrantedConfirmation } from './delete-file-confirm';
+import { fileEditLock } from '../../util/locks';
+import { checkEditFreshness, recordRead } from './read-tracker';
 import { createLogger } from '../../logger';
 import { t } from '../../i18n';
 
@@ -868,6 +870,12 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
         ? { ...input, path: finalPath }
         : input;
       const result = await coreWriteFileTool.execute(rewritten, ctx);
+      if (!result.isError) {
+        // Stamp the just-written bytes so a follow-up edit_file accepts an edit
+        // without an intervening read_file (the model already knows the content
+        // it wrote), and so OCC compares against this write, not a stale read.
+        recordRead(ctx, finalPath);
+      }
       if (!result.isError && opts.onFileWritten) {
         try {
           opts.onFileWritten(finalPath);
@@ -904,6 +912,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
       '\n' +
       'How to use:\n' +
       '  - Prefer this over `write_file` for targeted edits to existing files.\n' +
+      '  - Read the file with `read_file` first so `old_string` matches its current contents. `read_file` shows each line as `<n>\\t<text>` — `old_string` must be the raw text WITHOUT that line-number+tab prefix. On `E_STALE` the file changed since you read it (e.g. another worker) — `read_file` it again, then redo the edit.\n' +
       '  - To CREATE a new file, use `write_file` instead — `edit_file` does not create files.\n' +
       '  - Make `old_string` long enough to be unique. On `E_MULTIPLE_MATCHES`, expand `old_string` with surrounding context, or set `replace_all=true` if every occurrence should change.\n' +
       '  - Cannot edit pdf / Office / image files in place (text from those is extracted, not the source). Use `write_file` if you really need to overwrite the binary.\n' +
@@ -944,73 +953,95 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
         return { content: scopeErr, isError: true };
       }
 
-      let st: fs.Stats;
-      try { st = fs.statSync(abs); }
-      catch (err) {
-        log.warn(`edit_file not-found user=${opts.userId ?? '?'} path=${abs}: ${(err as Error).message}`);
-        return {
-          content: errText('E_NOT_FOUND', `${abs}: file does not exist (use write_file to create new files)`),
-          isError: true,
-        };
-      }
-      if (!st.isFile()) {
-        return { content: errText('E_NOT_FOUND', `${abs}: not a regular file`), isError: true };
-      }
-
-      const kind = kindOf(abs);
-      if (kind !== 'text') {
-        return {
-          content: errText(
-            'E_NOT_EDITABLE',
-            `${abs}: kind=${kind} is not editable in place (extracted format). Use write_file to overwrite the file if you really need to.`,
-          ),
-          isError: true,
-        };
-      }
-
-      let body: string;
-      try { body = fs.readFileSync(abs, 'utf8'); }
-      catch (err) {
-        const msg = (err as Error).message;
-        log.warn(`edit_file read failed user=${opts.userId ?? '?'} path=${abs}: ${msg}`);
-        return { content: errText('E_EDIT_FAILED', `${abs}: read failed: ${msg}`), isError: true };
-      }
-
-      const count = countOccurrences(body, oldStr);
-      if (count === 0) {
-        return { content: errText('E_NO_MATCH', `${abs}: \`old_string\` not found in file`), isError: true };
-      }
-      if (count > 1 && !replaceAll) {
-        return {
-          content: errText(
-            'E_MULTIPLE_MATCHES',
-            `${abs}: \`old_string\` matches ${count} occurrences. Provide more surrounding context to make it unique, or set replace_all=true.`,
-          ),
-          isError: true,
-        };
-      }
-
-      const next = replaceAll ? body.split(oldStr).join(newStr) : body.replace(oldStr, newStr);
-
+      // Serialize the read-modify-write per file: parallel workers share this
+      // process + filesystem, so two concurrent edits of the same file must not
+      // interleave stat→read→write (lost update). Distinct files never contend.
+      const release = await fileEditLock(abs).acquire();
       try {
-        fs.writeFileSync(abs, next, 'utf8');
-      } catch (err) {
-        const msg = (err as Error).message;
-        log.warn(`edit_file write failed user=${opts.userId ?? '?'} path=${abs}: ${msg}`);
-        return { content: errText('E_EDIT_FAILED', `${abs}: write failed: ${msg}`), isError: true };
+        let st: fs.Stats;
+        try { st = fs.statSync(abs); }
+        catch (err) {
+          log.warn(`edit_file not-found user=${opts.userId ?? '?'} path=${abs}: ${(err as Error).message}`);
+          return {
+            content: errText('E_NOT_FOUND', `${abs}: file does not exist (use write_file to create new files)`),
+            isError: true,
+          };
+        }
+        if (!st.isFile()) {
+          return { content: errText('E_NOT_FOUND', `${abs}: not a regular file`), isError: true };
+        }
+
+        const kind = kindOf(abs);
+        if (kind !== 'text') {
+          return {
+            content: errText(
+              'E_NOT_EDITABLE',
+              `${abs}: kind=${kind} is not editable in place (extracted format). Use write_file to overwrite the file if you really need to.`,
+            ),
+            isError: true,
+          };
+        }
+
+        // Read-before-edit + OCC: the model must have read this file this run,
+        // and it must not have changed on disk since (parallel worker, a bash
+        // command, an external edit). See read-tracker.ts. No-op when the host
+        // didn't inject the read-state map.
+        const block = checkEditFreshness(ctx, abs, st);
+        if (block) {
+          log.warn(`edit_file ${block.code} user=${opts.userId ?? '?'} path=${abs}`);
+          return { content: errText(block.code, block.msg), isError: true };
+        }
+
+        let body: string;
+        try { body = fs.readFileSync(abs, 'utf8'); }
+        catch (err) {
+          const msg = (err as Error).message;
+          log.warn(`edit_file read failed user=${opts.userId ?? '?'} path=${abs}: ${msg}`);
+          return { content: errText('E_EDIT_FAILED', `${abs}: read failed: ${msg}`), isError: true };
+        }
+
+        const count = countOccurrences(body, oldStr);
+        if (count === 0) {
+          return { content: errText('E_NO_MATCH', `${abs}: \`old_string\` not found in file`), isError: true };
+        }
+        if (count > 1 && !replaceAll) {
+          return {
+            content: errText(
+              'E_MULTIPLE_MATCHES',
+              `${abs}: \`old_string\` matches ${count} occurrences. Provide more surrounding context to make it unique, or set replace_all=true.`,
+            ),
+            isError: true,
+          };
+        }
+
+        const next = replaceAll ? body.split(oldStr).join(newStr) : body.replace(oldStr, newStr);
+
+        try {
+          fs.writeFileSync(abs, next, 'utf8');
+        } catch (err) {
+          const msg = (err as Error).message;
+          log.warn(`edit_file write failed user=${opts.userId ?? '?'} path=${abs}: ${msg}`);
+          return { content: errText('E_EDIT_FAILED', `${abs}: write failed: ${msg}`), isError: true };
+        }
+
+        // Refresh the baseline to the post-edit bytes so a follow-up edit in a
+        // later round doesn't trip OCC on this same intended change.
+        recordRead(ctx, abs);
+
+        const replaced = replaceAll ? count : 1;
+        log.info(`edit_file user=${opts.userId ?? '?'} replaced=${replaced} path=${abs}`);
+
+        if (opts.onFileWritten) {
+          try { opts.onFileWritten(abs); }
+          catch (err) { log.warn(`onFileWritten callback failed: ${(err as Error).message}`); }
+        }
+
+        return {
+          content: `<file path="${abs}" edited="${replaced}" kind="${kind}"/>`,
+        };
+      } finally {
+        release();
       }
-
-      const replaced = replaceAll ? count : 1;
-      log.info(`edit_file user=${opts.userId ?? '?'} replaced=${replaced} path=${abs}`);
-
-      if (opts.onFileWritten) {
-        try { opts.onFileWritten(abs); }
-        catch (err) { log.warn(`onFileWritten callback failed: ${(err as Error).message}`); }
-      }
-
-      return {
-        content: `<file path="${abs}" edited="${replaced}" kind="${kind}"/>`,
-      };
     },
   };
 }

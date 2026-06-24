@@ -34,11 +34,18 @@ export interface KbToolsOpts {
 const PREVIEW_CHARS = 400;
 const DEFAULT_LIST_LIMIT = 80;
 const MAX_LIST_LIMIT = 300;
+const KB_KIND_VALUES = ['text', 'pdf', 'docx', 'spreadsheet', 'presentation', 'image'] as const;
 
 function previewOf(text: string): string {
   const s = (text || '').trim();
   if (s.length <= PREVIEW_CHARS) return s;
   return s.slice(0, PREVIEW_CHARS) + '…';
+}
+
+function parseKbKind(raw: unknown): kb.KbKind | undefined {
+  return typeof raw === 'string' && (KB_KIND_VALUES as readonly string[]).includes(raw)
+    ? raw as kb.KbKind
+    : undefined;
 }
 
 type LibraryScope = 'global' | 'project';
@@ -94,6 +101,7 @@ function createKbListTool(opts: KbToolsOpts): AgentTool {
   const hasProject = !!opts.projectId;
   return {
     name: 'kb_list',
+    executionMode: 'parallel',
     description:
       'List files in the user Library before deciding what to search or read'
       + (hasProject ? ' (current project + global by default)' : '')
@@ -118,7 +126,7 @@ function createKbListTool(opts: KbToolsOpts): AgentTool {
         },
         kind: {
           type: 'string',
-          enum: ['text', 'pdf', 'docx', 'image'],
+          enum: [...KB_KIND_VALUES],
           description: 'Optional: restrict to one file kind.',
         },
         status: {
@@ -136,8 +144,7 @@ function createKbListTool(opts: KbToolsOpts): AgentTool {
       const scope = parseListScope(input.scope, hasProject);
       const rawDir = typeof input.dir === 'string' ? input.dir.trim().replace(/^\/+|\/+$/g, '') : '';
       const dir = rawDir ? `${rawDir}/` : '';
-      const rawKind = typeof input.kind === 'string' ? input.kind : '';
-      const kind = ['text', 'pdf', 'docx', 'image'].includes(rawKind) ? rawKind as kb.KbKind : undefined;
+      const kind = parseKbKind(input.kind);
       const rawStatus = typeof input.status === 'string' ? input.status : '';
       const status = ['pending', 'processing', 'ready', 'failed'].includes(rawStatus) ? rawStatus as kb.KbStatus : undefined;
       const limit = Math.min(
@@ -203,6 +210,17 @@ function createKbSearchTool(opts: KbToolsOpts): AgentTool {
   const hasProject = !!opts.projectId;
   return {
     name: 'kb_search',
+    // Parallel-safe (verified 2026-06-18 by reading fastembed@2.1.0). kb_search
+    // embeds the query on the process-wide shared ONNX embedder singleton, but
+    // CONCURRENT calls on that ONE session are safe: fastembed's embed() keeps
+    // all state local and already calls the tokenizer concurrently within a
+    // batch (`Promise.all(...encode)`), and onnxruntime `InferenceSession.run()`
+    // is concurrency-safe on a shared session (the documented serving pattern).
+    // PC/CLAUDE.md's ONNX rule warns against multiple SESSIONS (worker_threads
+    // each holding their own → memory blowup), NOT concurrent run() on one
+    // session — which is all this is. (Same reason in-process indexing×search
+    // concurrent embed is fine.)
+    executionMode: 'parallel',
     description:
       'Semantic search over the user Library'
       + (hasProject ? ' (current project + global by default)' : '')
@@ -234,7 +252,7 @@ function createKbSearchTool(opts: KbToolsOpts): AgentTool {
         },
         kind: {
           type: 'string',
-          enum: ['text', 'pdf', 'docx', 'image'],
+          enum: [...KB_KIND_VALUES],
           description: 'Optional: restrict to one file kind.',
         },
         scope: {
@@ -251,9 +269,7 @@ function createKbSearchTool(opts: KbToolsOpts): AgentTool {
       const query = String(input.query ?? '').trim();
       if (!query) return { content: 'kb_search: `query` is required', isError: true };
       const k = Math.min(30, Math.max(1, Math.floor(Number(input.k ?? 8))));
-      const rawKind = typeof input.kind === 'string' ? (input.kind as string) : undefined;
-      const kind = rawKind && ['text', 'pdf', 'docx', 'image'].includes(rawKind)
-        ? (rawKind as kb.KbKind) : undefined;
+      const kind = parseKbKind(input.kind);
       const rawDir = typeof input.dir === 'string' ? input.dir.trim() : '';
       const dir = rawDir || undefined;
       const rawPath = typeof input.path === 'string' ? input.path.trim().replace(/^\/+/, '') : '';
@@ -329,6 +345,7 @@ function createKbReadTool(opts: KbToolsOpts): AgentTool {
   const hasProject = !!opts.projectId;
   return {
     name: 'kb_read',
+    executionMode: 'parallel',
     description:
       'Read a Library file\'s chunk content directly from the vector store.\n'
       + 'Use the `scope` and `path` fields returned by `kb_search`. Omit `chunk`\n'

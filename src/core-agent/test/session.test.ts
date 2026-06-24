@@ -95,7 +95,7 @@ describe("Session", () => {
   // function_call and OpenAI / Anthropic reject with
   // "No tool call found for function call output with call_id ...".
   // Reproduced as the user-reported bug at runner.ts:374 (mid-turn
-  // compaction triggered by the 60% context guard) where post-compact
+  // compaction triggered by the 80% context guard) where post-compact
   // heal hadn't run yet.
   it("compact drops leading orphan tool_result whose tool_use was sliced off", () => {
     const session = new Session();
@@ -150,6 +150,37 @@ describe("Session", () => {
     const flat = msgs.flatMap((m) => m.content);
     expect(flat.some((c) => (c as { type?: string }).type === "tool_use" && (c as { id?: string }).id === "call-Z")).toBe(true);
     expect(flat.some((c) => (c as { type?: string }).type === "tool_result" && (c as { toolUseId?: string }).toolUseId === "call-Z")).toBe(true);
+  });
+
+  // estimateKeptTailTokens powers the runner's "skip a no-progress compaction"
+  // guard: it must report the tokens of exactly the tail compact() preserves.
+  it("estimateKeptTailTokens counts only the tail compact() would keep", () => {
+    const session = new Session();
+    for (let i = 0; i < 8; i++) {
+      session.addUserMessage(`older message number ${i} with several words`);
+      session.addAssistantMessage([{ type: "text", text: `older response ${i}` }]);
+    }
+    const tail = session.estimateKeptTailTokens();
+    const all = session.estimateTokens();
+    // The kept tail is at most the last 4 messages — a strict subset of 16.
+    expect(tail).toBeGreaterThan(0);
+    expect(tail).toBeLessThan(all);
+  });
+
+  it("estimateKeptTailTokens ~= total when a huge result dominates the kept tail", () => {
+    const session = new Session();
+    session.addUserMessage("kick off");                                              // 0 (older)
+    session.addAssistantMessage([{ type: "text", text: "starting" }]);               // 1
+    session.addAssistantMessage([{ type: "tool_use", id: "call-read", name: "read_file", input: { path: "big.txt" } }]); // 2
+    session.addToolResult("call-read", "x".repeat(400_000), undefined, false);       // 3 (huge, cap-exempt)
+    session.addAssistantMessage([{ type: "text", text: "read it" }]);                // 4
+
+    const tail = session.estimateKeptTailTokens();
+    const all = session.estimateTokens();
+    // The huge read_file result sits in the kept tail (last 4), so a compaction
+    // would free almost nothing (only message 0). The runner's guard reads this
+    // as "no progress" and skips the wasteful summary pass.
+    expect(all - tail).toBeLessThan(all * 0.05);
   });
 
   it("clear removes all messages", () => {

@@ -4,8 +4,9 @@
 // sent immediately. Queue is per-cid, persisted in localStorage so a refresh
 // mid-stream doesn't drop pending messages. Drained one-by-one when the
 // current reply finishes (or is aborted). Each entry records the raw user
-// text plus the selected skill / connector — the "use X" prefix is applied
-// at dispatch time so a later selection change is reflected correctly.
+// text, selected skill / connector, and the recipient snapshot visible when
+// the user pressed send. The "use X" prefix is still validated at dispatch
+// time, but recipient routing must not be recomputed from a later chip state.
 
 function _loadQueueFromStorage(cid) {
   if (!cid) return [];
@@ -55,6 +56,9 @@ function _queueItemUseSelection(item) {
 function enqueueMessage(cid, content, useSelection, opts = {}) {
   const q = _getQueue(cid);
   const extra = opts && opts.extra && typeof opts.extra === 'object' ? opts.extra : null;
+  const recipient = opts && typeof _normaliseRecipientSnapshot === 'function'
+    ? _normaliseRecipientSnapshot(opts.recipient)
+    : null;
   const use = typeof _normalizeChatUseSelection === 'function'
     ? _normalizeChatUseSelection(useSelection)
     : null;
@@ -64,6 +68,7 @@ function enqueueMessage(cid, content, useSelection, opts = {}) {
     use: use || null,
     skill: use && use.kind === 'skill' ? (use.name || use.id || '') : '',
     direct: !!(opts && opts.direct),
+    ...(recipient ? { recipient } : {}),
     ...(extra ? { extra } : {}),
   });
   _saveQueueToStorage(cid);
@@ -124,8 +129,9 @@ function _dispatchNextQueued(cid) {
   // Skill / connector is an inline text prefix (applied at dispatch time so
   // later selection changes take effect). Agent runs are just "run <name>"
   // text — no flag.
-  // Recipient prefix (`@<agent>`) is also applied at dispatch time so the
-  // message routes to whoever is currently selected in the chip.
+  // Recipient prefix (`@<agent>`) is applied from the enqueue-time snapshot.
+  // Falling back to current chip is only for legacy queue rows persisted before
+  // snapshots existed.
   let use = _queueItemUseSelection(next);
   if (use && typeof isChatUseAllowedForTarget === 'function' && !isChatUseAllowedForTarget('conversation', use.kind)) {
     use = null;
@@ -145,7 +151,9 @@ function _dispatchNextQueued(cid) {
     try { uiAlert(t('connectors.dropped_at_drain', { connector: label })); } catch (_) {}
   }
   const withUse = use ? transformWithChatUse(next.content, use) : next.content;
-  const content = next.direct ? next.content : applyRecipientPrefix(withUse, 'conversation');
+  const content = next.direct
+    ? next.content
+    : applyRecipientPrefix(withUse, 'conversation', { recipientSnapshot: next.recipient });
   // Fire-and-forget: sendInCurrentConversation handles its own errors via
   // _streamingSetError + _finishStreamingMsg (which will re-enter this fn).
   sendInCurrentConversation(content, next.extra);

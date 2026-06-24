@@ -67,6 +67,7 @@ function req(rel) {
 const { McpServer } = req('@modelcontextprotocol/sdk/dist/cjs/server/mcp.js');
 const { StdioServerTransport } = req('@modelcontextprotocol/sdk/dist/cjs/server/stdio.js');
 const { z } = req('zod');
+const KB_KIND_VALUES = ['text', 'pdf', 'docx', 'spreadsheet', 'presentation', 'image'];
 
 // ── Socket RPC client ────────────────────────────────────────────────────
 
@@ -263,7 +264,7 @@ server.tool(
   {
     scope: z.enum(['all', 'project', 'global']).optional().describe('List scope. Default all when a project is active, otherwise global.'),
     dir: z.string().optional().describe('Optional: limit results to relative paths under this directory prefix.'),
-    kind: z.enum(['text', 'pdf', 'docx', 'image']).optional().describe('Optional: restrict to one file kind.'),
+    kind: z.enum(KB_KIND_VALUES).optional().describe('Optional: restrict to one file kind.'),
     status: z.enum(['pending', 'processing', 'ready', 'failed']).optional().describe('Optional: restrict to one indexing status.'),
   },
   async (params) => {
@@ -282,6 +283,8 @@ server.tool(
     k: z.number().int().min(1).max(30).optional().describe('Top-k result count, default 8'),
     dir: z.string().optional().describe('Limit to files under this Library-relative subdirectory'),
     path: z.string().optional().describe('Limit to one exact Library-relative file path'),
+    kind: z.enum(KB_KIND_VALUES).optional().describe('Optional: restrict to one file kind.'),
+    scope: z.enum(['all', 'project', 'global']).optional().describe('Search scope. Default all when a project is active, otherwise global.'),
   },
   async (params) => {
     try {
@@ -296,6 +299,7 @@ server.tool(
   'Read source text from a knowledge-base file found via orkas_kb_search.',
   {
     path: z.string().describe('Library-relative file path as returned by orkas_kb_search hits'),
+    scope: z.enum(['all', 'project', 'global']).optional().describe('Read scope. Prefer the scope returned by orkas_kb_search.'),
     chunk: z.number().int().min(1).optional().describe('1-based chunk index; omit for the full body'),
     window: z.number().int().min(0).optional().describe('Include ±window neighbour chunks around `chunk`'),
   },

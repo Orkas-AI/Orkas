@@ -17,7 +17,7 @@ import { createLogger } from '../../logger';
 
 const log = createLogger('sdk-timeout-patch');
 
-/** 1 hour. Paired with `idleTimeout` (600s) in `client.ts` as the two real
+/** 1 hour. Paired with `idleTimeout` (1800s) in `client.ts` as the two real
  * guards on LLM calls; every other "timeout" in the app is either a short
  * external-IO failfast or a debounce. */
 const LLM_TIMEOUT_MS = 3_600_000;

@@ -4,10 +4,12 @@
   "selectionPolicy": {
     "python": "Pin CPython 3.12 as Orkas' conservative skill/runtime baseline for broad third-party wheel compatibility. 3.12.13 is the Python.org 3.12 security release available in python-build-standalone 20260610. Move to a newer Python minor only after package smoke tests pass on macOS, Windows, and Linux.",
     "uv": "Pin the upstream uv release used to create and install Python package venvs. 0.11.21 was the latest astral-sh/uv GitHub release checked on 2026-06-18. Move only with manifest digest refresh and package install smoke tests.",
+    "node": "Pin Node.js 24.x Active LTS as the baseline for Node-based skills/packages (bash `node`/`npm`/`npx` and orkas-pkg `npm install`). Newest LTS chosen so libraries requiring high node versions are covered; official nodejs.org binaries bundle npm/npx. 24.17.0 was the latest v24 LTS on nodejs.org dist/latest-v24.x checked on 2026-06-22. Libraries needing an even newer major are out of scope for the built-in single version. Move only after package install/run smoke tests pass on macOS and Windows.",
     "sources": [
       "https://www.python.org/downloads/release/python-31213/",
       "https://github.com/astral-sh/python-build-standalone/releases/tag/20260610",
-      "https://github.com/astral-sh/uv/releases/tag/0.11.21"
+      "https://github.com/astral-sh/uv/releases/tag/0.11.21",
+      "https://nodejs.org/dist/v24.17.0/"
     ]
   },
   "python": {
@@ -117,6 +119,61 @@
         "size": 24437894,
         "archive": "tar.gz",
         "executable": "uv"
+      }
+    }
+  },
+  "node": {
+    "version": "24.17.0",
+    "source": "nodejs.org",
+    "release": "v24.17.0",
+    "assets": {
+      "darwin-arm64": {
+        "name": "node-v24.17.0-darwin-arm64.tar.gz",
+        "url": "https://nodejs.org/dist/v24.17.0/node-v24.17.0-darwin-arm64.tar.gz",
+        "sha256": "4fc3266a3702eebc39cc37661cf4eeceeade307e242ab64e4d7ce7949197e11f",
+        "size": 51886390,
+        "archive": "tar.gz",
+        "executable": "bin/node"
+      },
+      "darwin-x64": {
+        "name": "node-v24.17.0-darwin-x64.tar.gz",
+        "url": "https://nodejs.org/dist/v24.17.0/node-v24.17.0-darwin-x64.tar.gz",
+        "sha256": "80da552fe037290cb130e9dea590f5eeeb7aa450636f0c89ab41415511c1ec27",
+        "size": 53067264,
+        "archive": "tar.gz",
+        "executable": "bin/node"
+      },
+      "win32-arm64": {
+        "name": "node-v24.17.0-win-arm64.zip",
+        "url": "https://nodejs.org/dist/v24.17.0/node-v24.17.0-win-arm64.zip",
+        "sha256": "4957712f67fce55779cc794d9b4df9e0e802a18c841ad5a4e42f17be490e634d",
+        "size": 33190180,
+        "archive": "zip",
+        "executable": "node.exe"
+      },
+      "win32-x64": {
+        "name": "node-v24.17.0-win-x64.zip",
+        "url": "https://nodejs.org/dist/v24.17.0/node-v24.17.0-win-x64.zip",
+        "sha256": "f2aa33b35b75aca5f3f7b85675a6f6423201053e9381911e64961f3bda2528ab",
+        "size": 36948900,
+        "archive": "zip",
+        "executable": "node.exe"
+      },
+      "linux-arm64": {
+        "name": "node-v24.17.0-linux-arm64.tar.gz",
+        "url": "https://nodejs.org/dist/v24.17.0/node-v24.17.0-linux-arm64.tar.gz",
+        "sha256": "faa0d59ba7fe7045c950ed09b190578fb8eee73e4358686d38fcc99ca58c1480",
+        "size": 56767465,
+        "archive": "tar.gz",
+        "executable": "bin/node"
+      },
+      "linux-x64": {
+        "name": "node-v24.17.0-linux-x64.tar.gz",
+        "url": "https://nodejs.org/dist/v24.17.0/node-v24.17.0-linux-x64.tar.gz",
+        "sha256": "e0472427aa791ad80bdc426ff7cc73cdd28ed0f616d1ff9689a23a7f47f1265f",
+        "size": 57017543,
+        "archive": "tar.gz",
+        "executable": "bin/node"
       }
     }
   }

@@ -61,7 +61,22 @@ export interface ChatOptions {
    * (no `data:` prefix). Used by `features/contexts_extract` for vision-based
    * description of uploaded images in the knowledge base staging area. */
   images?: Array<{ data: string; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' }>;
+  /** Hard idle window (seconds) for the tool-execution phase and cold start
+   *  (before the first stream event). Default 1800. core-agent's per-tool
+   *  watchdog stays authoritative for tool stalls; this is the outer backstop. */
   idleTimeout?: number;
+  /** Short idle window (seconds) applied ONLY while waiting for the model to
+   *  stream tokens with NO tool in flight, after the first event has arrived.
+   *  Catches a provider stream that started then went silent mid-generation,
+   *  without false-killing long/silent tools (those run under `idleTimeout` +
+   *  the per-tool watchdog). Default 180. */
+  streamIdleTimeout?: number;
+  /** Max tool-call rounds in a single turn before the run is force-ended with
+   *  "(Tool loop limit reached)". Undefined → core-agent default (50). Group
+   *  chat raises this for the commander, which legitimately runs long
+   *  multi-step builds (e.g. hyperframes video) that exceed 50 tool rounds;
+   *  the identical-call loop_detection still guards true runaway loops. */
+  maxToolLoops?: number;
   abortSignal?: AbortSignal | null;
   /** Legacy openclaw CLI timeout — ignored, retained for signature parity. */
   timeout?: number;
@@ -156,6 +171,20 @@ export interface ChatOptions {
    *  preserving). Set `'off'` to suppress thinking even on a reasoner;
    *  set `'low'` / `'high'` to override. */
   thinkingLevel?: 'off' | 'low' | 'high';
+  /** G8d in-process nested sub-run (a dispatch tool running a worker/agent turn
+   *  inside its caller's turn). When true, the run does NOT acquire a global
+   *  concurrency slot — the parent turn already holds one, and a nested
+   *  acquire would deadlock once the slot pool is exhausted (parent holds a
+   *  slot, waits for the child's slot, pool full). Nested concurrency is bounded
+   *  by the caller's dispatch cap instead. The per-session lock is still taken
+   *  (the nested session is fresh/unique, so it's uncontended). Default false =
+   *  top-level turn = current behavior. */
+  nested?: boolean;
+  /** interrupt-steer (G9). Called at each tool-loop boundary; returns user
+   *  messages to fold into THIS run instead of running them as a follow-up
+   *  turn. The group-chat bus passes a closure that drains pending user
+   *  messages aimed at the running actor from its FIFO. Synchronous. */
+  drainSteer?: () => string[] | undefined;
 }
 
 export const chatWithModel = _chatWithModel;

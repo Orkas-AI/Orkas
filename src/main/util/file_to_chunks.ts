@@ -5,6 +5,8 @@
  *           paragraphs split at sentence boundaries with char overlap)
  *   pdf   → `util/extract-pdf` + page-range titles
  *   docx  → `util/extract-docx` + heading-derived titles
+ *   spreadsheet / presentation → lightweight OOXML text extraction + text
+ *           chunking
  *   image → `imageDescriber` callback (required for image kind) turns the
  *           raw image bytes into a text description that then gets chunked
  *           as a single entry
@@ -16,8 +18,9 @@
 
 import { pdfBufferToChunks } from './extract-pdf';
 import { docxBufferToChunks } from './extract-docx';
+import { pptxBufferToMarkdown, xlsxBufferToMarkdown } from './extract-office';
 
-export type ChunkableKind = 'text' | 'pdf' | 'docx' | 'image';
+export type ChunkableKind = 'text' | 'pdf' | 'docx' | 'spreadsheet' | 'presentation' | 'image';
 
 export interface ExtractedChunk {
   title: string;
@@ -65,6 +68,12 @@ export async function fileToChunks(opts: FileToChunksOptions): Promise<Extracted
       title: firstLineOrIndex(c.text, c.index),
       content: c.text || `(empty section ${c.index})`,
     }));
+  }
+  if (opts.kind === 'spreadsheet') {
+    return chunkPlainText(xlsxBufferToMarkdown(opts.buf), budget, overlap);
+  }
+  if (opts.kind === 'presentation') {
+    return chunkPlainText(pptxBufferToMarkdown(opts.buf), budget, overlap);
   }
   if (opts.kind === 'image') {
     if (!opts.imageDescriber) {

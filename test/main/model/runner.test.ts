@@ -98,8 +98,13 @@ describe('runner › buildRunner auth gate', () => {
     cooldown.markCooldown(profile.profileId, 'auth', 'invalid key', 30_000);
 
     const { buildRunner } = await loadRunner();
-    await expect(buildRunner({ sessionId: 'u1-gconv-x' })).rejects.toThrow(
-      /configured model is temporarily unavailable.*30s/i,
-    );
+    let message = '';
+    try {
+      await buildRunner({ sessionId: 'u1-gconv-x' });
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toMatch(/configured model is temporarily unavailable/i);
+    expect(message).not.toMatch(/30s|30 seconds|seconds?/i);
   });
 });

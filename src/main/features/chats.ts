@@ -45,7 +45,6 @@ import { limitNameDisplayText } from '../util/name-limit';
 const log = createLogger('chats');
 import * as search from './search';
 import { purgeGroupDir, readState, readMembers, setStatus } from './group_chat/state';
-import { readPlan, updateStep } from './group_chat/plan';
 import type { GroupMessage } from './group_chat/visibility';
 
 function conversationIndexName(): string {
@@ -372,7 +371,7 @@ async function _removeConversationMeta(userId: string, cid: string): Promise<voi
 }
 
 function _notifyChatIndexDirty(): void {
-  // The open-source build is local-only; cloud sync notification is intentionally absent.
+  // The open-source build is local-only; cloud sync notification is absent.
 }
 
 function _messageText(raw: any): string {
@@ -704,9 +703,10 @@ export interface CreateConversationOptions {
    *  validating the projectId exists for this user — chats.ts persists it
    *  verbatim. */
   projectId?: string;
-  /** Optional explicit conversation id. Used when an external caller already
-   *  minted the id. Must be a `safeId`; if it collides with an existing conv,
-   *  that conv is returned unchanged. Defaults to a fresh generated id. */
+  /** Optional explicit conversation id. Used when an owned caller already
+   *  minted the id and needs to preserve it across the create path. Must be
+   *  a `safeId`; if it collides with an existing conv, that conv is returned
+   *  unchanged. Defaults to a fresh generated id. */
   conversationId?: string;
   /** Set by `features/auto_tasks.ts::_fireTask` so the conversation carries
    *  a back-link to the task that spawned it. Used by the renderer for the
@@ -1017,17 +1017,6 @@ export async function sweepStaleProcessing(): Promise<{ swept: number }> {
         const s = await readState(uid, cid);
         if (s.status === 'running') {
           await setStatus(uid, cid, 'idle');
-          const plan = await readPlan(uid, cid);
-          if (plan) {
-            for (const step of plan.steps) {
-              if (step.status === 'in_progress') {
-                await updateStep(uid, cid, step.index, 'failed', {
-                  failure_reason: 'execution interrupted',
-                  output_msg_id: '',
-                });
-              }
-            }
-          }
           swept += 1;
         }
       } catch { /* no state file = idle */ }

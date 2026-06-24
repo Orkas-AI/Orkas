@@ -43,6 +43,7 @@ const _IPC_ROUTES = [
   ['POST',   '/api/contexts/upload',          { upload: 'contexts.upload' }],
   ['GET',    '/api/contexts/image',           'contexts.image'],
   ['GET',    '/api/contexts/docx',            'contexts.docxHtml'],
+  ['GET',    '/api/contexts/office',          'contexts.officeHtml'],
   ['POST',   '/api/contexts/reveal',          'contexts.reveal'],
   ['POST',   '/api/library/write-text',        'library.writeText'],
   ['POST',   '/api/search/global',            'search.global'],
@@ -71,10 +72,6 @@ const _IPC_ROUTES = [
   ['POST',   /^\/api\/conversations\/([^/]+)\/abort$/,     'groupChat.abort',            ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/members$/,   'groupChat.listMembers',      ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/runtime$/,   'groupChat.runtimeStatus',    ['cid']],
-  ['GET',    /^\/api\/conversations\/([^/]+)\/plan$/,      'groupChat.readPlan',         ['cid']],
-  ['POST',   /^\/api\/conversations\/([^/]+)\/plan\/continue$/, 'groupChat.continuePlan', ['cid']],
-  ['POST',   /^\/api\/conversations\/([^/]+)\/plan\/steps\/(\d+)\/retry$/, 'groupChat.retryStep', ['cid', 'stepIndex']],
-  ['POST',   /^\/api\/conversations\/([^/]+)\/plan\/steps\/(\d+)\/skip$/,  'groupChat.skipStep',  ['cid', 'stepIndex']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/events\/stream$/, 'groupChat.events',      ['cid'], { stream: true }],
   ['POST',   /^\/api\/conversations\/([^/]+)\/form-submitted$/, 'groupChat.markFormSubmitted', ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/marketplace-install$/, 'groupChat.resolveMarketplaceInstallRequest', ['cid']],
@@ -143,7 +140,9 @@ function _mockErrorResponse(error, status) {
   };
 }
 
-function _monitorIpcError() {}
+function _monitorIpcError(kind, channel, data) {
+  void 0;
+}
 
 function _hasOrkasInvoke() {
   return !!(window.orkas && typeof window.orkas.invoke === 'function');

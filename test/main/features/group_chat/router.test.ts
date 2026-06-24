@@ -3,7 +3,7 @@ import { describe, it, expect } from 'vitest';
 import {
   parseMentions, resolveRecipients,
   extractFormFromFinal, computeFormId, decodeSubmission, encodeSubmission,
-  extractPlanInteractionFromFinal,
+  extractPlanInteractionFromFinal, extractHandbackFromFinal,
 } from '../../../../src/main/features/group_chat/router';
 
 describe('group_chat router › parseMentions', () => {
@@ -90,6 +90,49 @@ describe('group_chat router › resolveRecipients', () => {
     expect(r.unknown).toEqual([]);
   });
 
+  // active_recipient (the conversation floor): a no-`@` user message follows the
+  // agent the commander handed off to, instead of always the commander.
+  it('user with no @ + active floor agent → routes to the floor agent', () => {
+    const r = resolveRecipients({
+      fromKind: 'user', fromId: 'user', text: 'I didn\'t get part 2', members,
+      activeRecipient: 'writer',
+    });
+    expect(r.to).toEqual(['writer']);
+  });
+
+  it('user explicit @commander overrides the floor (routes to commander)', () => {
+    const r = resolveRecipients({
+      fromKind: 'user', fromId: 'user', text: '@commander switch tasks', members,
+      activeRecipient: 'writer',
+    });
+    expect(r.to).toEqual(['commander']);
+  });
+
+  it('user one-shot @<otherAgent> while handed off routes only to that agent', () => {
+    const members2 = [...members, { kind: 'agent' as const, id: 'coder', joined_at: 't' }];
+    const r = resolveRecipients({
+      fromKind: 'user', fromId: 'user', text: '@coder quick q', members: members2,
+      activeRecipient: 'writer',
+    });
+    expect(r.to).toEqual(['coder']);
+  });
+
+  it('floor agent no longer on the roster → falls back to [commander]', () => {
+    const r = resolveRecipients({
+      fromKind: 'user', fromId: 'user', text: 'still there?', members,
+      activeRecipient: 'ghost-agent-id',
+    });
+    expect(r.to).toEqual(['commander']);
+  });
+
+  it('commander reply ignores the floor (commander/agent always → user)', () => {
+    const r = resolveRecipients({
+      fromKind: 'commander', fromId: 'commander', text: 'done', members,
+      activeRecipient: 'writer',
+    });
+    expect(r.to).toEqual(['user']);
+  });
+
   it('commander with no @ → defaults to [user]', () => {
     const r = resolveRecipients({ fromKind: 'commander', fromId: 'commander', text: 'done', members });
     expect(r.to).toEqual(['user']);
@@ -150,6 +193,45 @@ describe('group_chat router › resolveRecipients', () => {
       text: '辛苦 @commander 接力', members,
     });
     expect(r.to).toEqual(['user']);
+  });
+});
+
+describe('group_chat router › extractHandbackFromFinal', () => {
+  it('detects + strips a self-closing <handback /> marker', () => {
+    const r = extractHandbackFromFinal('All done for now.\n<handback />');
+    expect(r.handback).toBe(true);
+    expect(r.cleanText).toBe('All done for now.');
+    expect(r.cleanText).not.toContain('handback');
+  });
+
+  it('detects the paired <handback></handback> form too', () => {
+    const r = extractHandbackFromFinal('Out of my scope.\n<handback></handback>');
+    expect(r.handback).toBe(true);
+    expect(r.cleanText).toBe('Out of my scope.');
+  });
+
+  it('no marker → handback undefined, text untouched', () => {
+    const r = extractHandbackFromFinal('Here is lesson 2, any questions?');
+    expect(r.handback).toBeUndefined();
+    expect(r.cleanText).toBe('Here is lesson 2, any questions?');
+  });
+
+  it('look-alikes that pass the cheap <handback substring check but not the marker regex are NOT handback', () => {
+    for (const text of [
+      'See <handbackfoo /> for details.',        // \b after handback fails
+      'The <handback-note> tag is documented.',  // not self-closing, no </handback>
+      '<handbackish>content</handbackish>',       // \b fails on the word char
+    ]) {
+      const r = extractHandbackFromFinal(text);
+      expect(r.handback).toBeUndefined();
+      expect(r.cleanText).toBe(text);
+    }
+  });
+
+  it('a real marker amid look-alike noise still detects handback and strips only the marker', () => {
+    const r = extractHandbackFromFinal('Mentioning <handback-note> but actually done.\n<handback />');
+    expect(r.handback).toBe(true);
+    expect(r.cleanText).toBe('Mentioning <handback-note> but actually done.');
   });
 });
 

@@ -41,9 +41,9 @@ function cleanup(dir: string): void {
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 describe('tool-result-cap › config table', () => {
-  it('Read-type tools are exempted via Infinity', () => {
-    expect(MAX_RESULT_CHARS_BY_TOOL.read_file).toBe(Infinity);
-    expect(MAX_RESULT_CHARS_BY_TOOL.kb_read).toBe(Infinity);
+  it('Read-type tools cap at the 100K default (no longer Infinity-exempt)', () => {
+    expect(MAX_RESULT_CHARS_BY_TOOL.read_file).toBe(100_000);
+    expect(MAX_RESULT_CHARS_BY_TOOL.kb_read).toBe(100_000);
   });
 
   it('PERSIST_THRESHOLD matches Claude Code default (50_000)', () => {
@@ -111,6 +111,27 @@ describe('tool-result-cap › wrapToolWithCap', () => {
     expect(fs.existsSync(dir) ? fs.readdirSync(dir) : []).toEqual([]);
   });
 
+  it('read_file ≤100K passes through verbatim (normal reads unaffected)', async () => {
+    const content = 'r'.repeat(90_000);
+    const tool = stubTool('read_file', { content });
+    const wrapped = wrapToolWithCap(tool, { maxChars: MAX_RESULT_CHARS_BY_TOOL.read_file, toolResultsDir: dir });
+    const r = await wrapped.execute({}, ctx);
+    expect(r.content).toBe(content);
+    expect(fs.existsSync(dir) ? fs.readdirSync(dir) : []).toEqual([]);
+  });
+
+  it('read_file >100K spills + returns a <persisted-output> reference (re-pageable via charStart/charEnd)', async () => {
+    const content = 'z'.repeat(120_000);
+    const tool = stubTool('read_file', { content });
+    const wrapped = wrapToolWithCap(tool, { maxChars: MAX_RESULT_CHARS_BY_TOOL.read_file, toolResultsDir: dir });
+    const r = await wrapped.execute({}, ctx);
+    expect(r.content).toMatch(/^<persisted-output tool="read_file" size="120000" path="/);
+    expect(r.content).toMatch(/Use read_file\(path\)/);
+    const files = fs.readdirSync(dir);
+    expect(files).toHaveLength(1);
+    expect(files[0]).toMatch(/^read_file\.[0-9a-f]{12}\.txt$/);
+  });
+
   it('images field preserved regardless of content size', async () => {
     const big = 'z'.repeat(40_000);
     const img = { data: 'Zm9v', mediaType: 'image/jpeg' }; // base64 "foo"
@@ -135,6 +156,29 @@ describe('tool-result-cap › wrapToolWithCap', () => {
     const tool = stubTool('read_file', { content: 'doesnt matter' });
     const wrapped = wrapToolWithCap(tool, { maxChars: Infinity, toolResultsDir: dir });
     expect(wrapped).toBe(tool);
+  });
+
+  it('preserves executionMode on a CAPPED tool (G4 parallel flag must survive wrapping)', () => {
+    // Regression: the wrapper used to rebuild the tool with only
+    // name/description/inputSchema/execute, silently dropping executionMode —
+    // which made every capped parallel tool (search/grep/web + run_worker /
+    // dispatch_to) run SEQUENTIALLY in the runner's G4 partitioner.
+    const tool: AgentTool = {
+      name: 'grep_files',
+      description: 'stub',
+      inputSchema: { type: 'object', properties: {} },
+      executionMode: 'parallel',
+      async execute() { return { content: 'x' }; },
+    };
+    const wrapped = wrapToolWithCap(tool, { maxChars: 30_000, toolResultsDir: dir });
+    expect(wrapped).not.toBe(tool);          // it IS wrapped (finite cap)
+    expect(wrapped.executionMode).toBe('parallel');
+  });
+
+  it('a wrapped sequential (default) tool stays sequential — executionMode undefined', () => {
+    const tool = stubTool('bash', { content: 'x' }); // no executionMode
+    const wrapped = wrapToolWithCap(tool, { maxChars: 30_000, toolResultsDir: dir });
+    expect(wrapped.executionMode).toBeUndefined();
   });
 });
 

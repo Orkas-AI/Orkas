@@ -457,20 +457,4 @@ describe('PC core regression unit coverage', () => {
     expect(fs.existsSync(userPath('cloud', 'auto_tasks', taskId))).toBe(false);
     auto.stopScheduler();
   });
-
-  it('[PC-COLLAB-003] keeps plan state as structured files that can be asserted', async () => {
-    const chats = await import('../../src/main/features/chats');
-    const plan = await import('../../src/main/features/group_chat/plan');
-
-    const conv = await chats.createConversation(TEST_UID, { title: 'plan task' });
-    await plan.setPlan(TEST_UID, conv.conversation_id, {
-      steps: [
-        { title: 'Step 1', assignee: 'agent_a', input: 'Do it' },
-        { title: 'Step 2', assignee: 'agent_b', input: 'Check it' },
-      ],
-    });
-    const state = await plan.readPlan(TEST_UID, conv.conversation_id);
-    expect(state.steps.map((s: any) => s.status)).toEqual(['pending', 'pending']);
-    expect(state.steps.map((s: any) => s.title)).toEqual(['Step 1', 'Step 2']);
-  });
 });

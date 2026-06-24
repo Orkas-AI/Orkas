@@ -34,9 +34,21 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
 
-import { userPackagesDir, userPackageDir, userPackagesRegistryFile, userPackagesBinDir, PC_ROOT } from '../paths';
+import {
+  userPackagesDir,
+  userPackageDir,
+  userPackagesRegistryFile,
+  userPackagesBinDir,
+  PC_ROOT,
+  WS_ROOT,
+  VENV_ROOT,
+  NODE_NPM_CACHE_DIR,
+  NODE_NPM_PREFIX_DIR,
+  NODE_NPM_GLOBAL_BIN_DIR,
+} from '../paths';
 import { createLogger } from '../logger';
 import { companionSkillFileExists } from './package_skills';
+import { bundledRuntimeEnv, bundledRuntimePathEntries } from '../util/bundled-runtime';
 
 const log = createLogger('packages');
 
@@ -166,6 +178,17 @@ export function enabledPackageSkillRoots(uid: string): string[] {
  * binaries, so re-listing the bare names here would be duplicate prompt
  * weight and churn the cache prefix twice.
  */
+// Stated without version numbers on purpose: versions live in the runtime
+// manifest, and embedding them here would churn the prompt cache prefix on
+// every runtime bump. The model gets exact versions from `node --version`
+// etc. on demand. This line exists so the model uses the bundled runtimes
+// instead of trying to install them (the failure mode behind long brew/curl
+// thrash loops); it does NOT discourage using bash + code for long-tail work.
+const BUILTIN_RUNTIME_LINE =
+  'Built-in runtimes, always available in `bash` (no install needed): `node`, `npm`, `npx`, `python`, `uv`. '
+  + 'Use them directly; never install or upgrade these runtimes via brew/apt/curl. '
+  + 'If a library requires a newer runtime version than the built-in one, report that instead of installing a runtime.';
+
 export function buildEnvSummaryLine(uid: string): string {
   try {
     const names: string[] = [];
@@ -174,11 +197,11 @@ export function buildEnvSummaryLine(uid: string): string {
       if (companionSkillFileExists(uid, pkg.name)) continue;
       for (const b of pkg.bin_entries) names.push(b.name);
     }
-    if (!names.length) return 'No external package CLIs installed.';
+    if (!names.length) return `${BUILTIN_RUNTIME_LINE}\nNo external package CLIs installed.`;
     names.sort((a, b) => a.localeCompare(b));
-    return `Installed package CLIs (callable directly in \`bash\`): ${names.map((n) => `\`${n}\``).join(', ')}.`;
+    return `${BUILTIN_RUNTIME_LINE}\nInstalled package CLIs (callable directly in \`bash\`): ${names.map((n) => `\`${n}\``).join(', ')}.`;
   } catch {
-    return 'No external package CLIs installed.';
+    return `${BUILTIN_RUNTIME_LINE}\nNo external package CLIs installed.`;
   }
 }
 
@@ -196,6 +219,34 @@ export interface PackageActionResult {
   ok: boolean;
   stdout: string;
   error?: string;
+}
+
+function buildPackageCommandEnv(uid: string, pcDir: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...bundledRuntimeEnv(),
+    ELECTRON_RUN_AS_NODE: '1',
+    ORKAS_UID: uid,
+    ORKAS_PC_DIR: pcDir,
+    ORKAS_WORKSPACE_ROOT: WS_ROOT,
+    ORKAS_VENV_ROOT: VENV_ROOT,
+    NPM_CONFIG_CACHE: NODE_NPM_CACHE_DIR,
+    NPM_CONFIG_PREFIX: NODE_NPM_PREFIX_DIR,
+    NPM_CONFIG_FUND: 'false',
+    NPM_CONFIG_AUDIT: 'false',
+    NPM_CONFIG_UPDATE_NOTIFIER: 'false',
+  };
+  const pathEntries = bundledRuntimePathEntries();
+  try {
+    if (fs.statSync(NODE_NPM_GLOBAL_BIN_DIR).isDirectory()) {
+      pathEntries.push(NODE_NPM_GLOBAL_BIN_DIR);
+    }
+  } catch { /* npm global shims are created on demand */ }
+  if (pathEntries.length) {
+    const existingPath = env.PATH || env.Path || '';
+    env.PATH = [pathEntries.join(path.delimiter), existingPath].filter(Boolean).join(path.delimiter);
+  }
+  return env;
 }
 
 export function runPackageCommand(uid: string, command: string, name: string): Promise<PackageActionResult> {
@@ -247,7 +298,7 @@ export function runPackageCommand(uid: string, command: string, name: string): P
     const node = process.execPath;
     const script = path.join(pcDir, 'bin', 'orkas-pkg.cjs');
     const child = spawn(node, [script, command, name], {
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', ORKAS_UID: uid },
+      env: buildPackageCommandEnv(uid, pcDir),
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     });

@@ -16,11 +16,14 @@ const _ossLog = createLogger('oss');
 // render the unicode project glyph as an icon (CLAUDE.md: icons go through the
 // icon module).
 // Keyed by the OSS category codes the Server actually serves (see
-// marketplace_mgr.py::_OSS_CATEGORIES). Unknown codes fall back to 'sparkles',
-// so re-add an icon here when a category is restored Server-side.
+// oss_catalog_mgr.py::DEFAULT_OSS_CATEGORIES + conf/marketplace/oss_projects.json).
+// Unknown codes fall back to 'sparkles', so keep this in sync when a category is
+// added Server-side (office/slides were added for OfficeCLI / PPT-Master).
 const _OSS_CAT_ICON = {
   anim: 'sparkles',
   browser: 'globe',
+  office: 'file-text',
+  slides: 'presentation',
 };
 function ossIconFor(cat) { return _OSS_CAT_ICON[cat] || 'sparkles'; }
 
@@ -30,7 +33,6 @@ function ossIconFor(cat) { return _OSS_CAT_ICON[cat] || 'sparkles'; }
 // network refreshes are throttled per key so re-renders/i18n changes do not
 // hammer the Server.
 const OSS_CATALOG_REVALIDATE_MS = 5 * 60 * 1000;
-const OSS_HOME_COLD_REVALIDATE_MS = 4 * 60 * 60 * 1000;
 const OSS_MARKETPLACE_PAGE_SIZE = 100;
 let _ossCatalogHydrated = false;
 let _ossCatalogHydratePromise = null;
@@ -179,9 +181,12 @@ function _ossShouldRefreshCached(key, cached, opts) {
   if (!opts.revalidate || _ossCatalogInflight.has(key)) return false;
   if (opts.revalidate === 'always') return true;
   if (opts.revalidate === 'cold-start') {
+    // One background refresh per renderer boot (cached entry still paints
+    // first). No staleness gate on purpose: a just-launched OSS project must
+    // reach users on their next app open, not after a multi-hour window.
     if (_ossCatalogColdRefreshChecked.has(key)) return false;
     _ossCatalogColdRefreshChecked.add(key);
-    return !cached || !cached.ts || (Date.now() - cached.ts > OSS_HOME_COLD_REVALIDATE_MS);
+    return true;
   }
   const now = Date.now();
   const stale = !cached || !cached.ts || (now - cached.ts > OSS_CATALOG_REVALIDATE_MS);
@@ -244,17 +249,21 @@ function ossGithubUrl(p) { return (p && p.repo) ? ('https://github.com/' + p.rep
 
 // Prompt for ① capability cards: NAMES the project + URL, leaves the user's
 // concrete task blank (a `[...]` placeholder the caret lands on), and tells the
-// Commander to use the project (install first only if needed).
+// Commander to use the project. OfficeCLI is special: it is also the bundled
+// Office engine, so point the model at built-in Office tools instead of install.
 function ossPromptFor(p) {
-  const tmpl = (typeof t === 'function') ? t('oss.prompt') : '';
+  const isOfficeCli = p && (p.id === 'OfficeCLI' || p.name === 'OfficeCLI');
+  const tmpl = (typeof t === 'function') ? t(isOfficeCli ? 'oss.office_prompt' : 'oss.prompt') : '';
   return tmpl.replace(/\{name\}/g, (p && p.name) || '').replace(/\{url\}/g, ossGithubUrl(p));
 }
 
 // Prompt for the ② marketplace「接入」button: an explicit install request (the
 // button only shows for NOT-yet-installed packages, and there is no user task
-// here) — so it just asks the Commander to install the project, no task slot.
+// here). OfficeCLI is already bundled, so its marketplace action explains the
+// built-in Office tools instead of asking for install.
 function ossInstallPromptFor(p) {
-  const tmpl = (typeof t === 'function') ? t('oss.install_prompt') : '';
+  const isOfficeCli = p && (p.id === 'OfficeCLI' || p.name === 'OfficeCLI');
+  const tmpl = (typeof t === 'function') ? t(isOfficeCli ? 'oss.office_install_prompt' : 'oss.install_prompt') : '';
   return tmpl.replace(/\{name\}/g, (p && p.name) || '').replace(/\{url\}/g, ossGithubUrl(p));
 }
 

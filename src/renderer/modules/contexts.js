@@ -9,6 +9,7 @@ let _ctxTree = [];                  // tree of {name, path, type:'dir'|'file', c
 let _ctxExpanded = new Set();       // dir paths that are open
 let _ctxActive = null;              // {id} — currently opened file in right-pane
 let _ctxMveController = null;       // active mountMdViewEdit controller for the right-pane md viewer
+let _ctxOfficeBlobUrl = null;       // object URL for the current sandboxed Office preview iframe
 let _ctxPendingRename = null;       // {path} — flagged for inline-rename on the
                                     // next renderCtxTree() (set by the "new
                                     // text file" action after creating an
@@ -191,7 +192,27 @@ function _applyKbEvent(ev) {
   _scheduleKbStatusRefreshIfNeeded();
 }
 
-function _trackKbVectorizeEvent() {}
+function _trackKbVectorizeEvent(relPath, ev) {
+  if (!window.Monitor || !ev || !ev.status) return;
+  if (ev.status === 'pending' || ev.status === 'processing') {
+    if (!_kbVectorizeStartedAtByPath.has(relPath)) _kbVectorizeStartedAtByPath.set(relPath, performance.now());
+    return;
+  }
+  if (ev.status !== 'ready' && ev.status !== 'failed') return;
+  const startedAt = _kbVectorizeStartedAtByPath.get(relPath);
+  _kbVectorizeStartedAtByPath.delete(relPath);
+  const payload = {
+    result: ev.status === 'ready' ? 'success' : 'failure',
+    file_ext: _ctxExtOf(relPath),
+    file_type: ev.kind || _kindOfPath(relPath),
+    chunk_count: Number(ev.chunks || 0),
+    duration_ms: startedAt ? Math.round(performance.now() - startedAt) : 0,
+  };
+  if (ev.status === 'failed') {
+    try {
+    } catch (_) {}
+  }
+}
 
 function _cssEscape(s) {
   return String(s).replace(/(["\\])/g, '\\$1');
@@ -591,6 +612,7 @@ function _ctxMenuItemsFor(kind, relPath) {
   }
   // file
   const items = [];
+  items.push({ action: 'ask_commander', label: t('contexts.menu.ask_commander') });
   if (CTX_TEXT_EXTS.has(_ctxExtOf(relPath))) {
     items.push({ action: 'edit', label: t('contexts.menu.edit') });
   }
@@ -614,6 +636,28 @@ async function _runCtxMenuAction(action, kind, relPath) {
     case 'delete':     return deleteCtxEntry(relPath, kind);
     case 'edit':       { await openCtxFile(relPath); _enterCtxEdit(); return; }
     case 'open_in_system': return revealCtxFile(relPath);
+    case 'ask_commander': return askCommanderAboutCtxFile(relPath);
+  }
+}
+
+// Open a fresh GLOBAL commander conversation with this KB file attached as a
+// reference, then navigate there so the user can ask about it. Main creates the
+// conversation + imports the file (path resolution is server-side); we just
+// surface it in the sidebar and open it (mirrors project-detail::_runProjectAgent).
+async function askCommanderAboutCtxFile(relPath) {
+  if (!relPath) return;
+  if (typeof ensureModelConfigured === 'function' && !ensureModelConfigured()) return;
+  try {
+    // Attach the file to the commander draft pool and go to the chat home; the
+    // user then types their question (no new conversation is created here).
+    await window.attachKbFileToDraft(
+      'contexts.attachToDraft',
+      { relPath },
+      window.COMMANDER_DRAFT_CID,
+      () => { if (typeof setView === 'function') setView('new-chat'); },
+    );
+  } catch (e) {
+    if (typeof uiAlert === 'function') await uiAlert(t('contexts.ask_commander_failed', { reason: (e && e.message) || e }));
   }
 }
 
@@ -868,12 +912,17 @@ const CTX_ALLOWED_EXTS = [
   '.sh', '.bash', '.zsh', '.ps1', '.cmd', '.bat', '.rb', '.go', '.rs', '.java', '.kt',
   '.c', '.cpp', '.cc', '.h', '.hpp', '.css', '.scss', '.less',
   '.sql', '.graphql', '.gql',
-  '.pdf', '.docx', '.png', '.jpg', '.jpeg', '.webp', '.gif',
+  '.pdf', '.docx', '.docm', '.xlsx', '.xlsm', '.pptx', '.pptm',
+  '.png', '.jpg', '.jpeg', '.webp', '.gif',
 ];
 
 function _ctxExtOf(name) {
   const i = (name || '').lastIndexOf('.');
   return i >= 0 ? name.slice(i).toLowerCase() : '';
+}
+
+function _ctxHasHiddenPathSegment(name) {
+  return String(name || '').split('/').some(part => part.startsWith('.'));
 }
 
 async function handleCtxUpload(fileList, targetDir = '') {
@@ -899,6 +948,7 @@ async function handleCtxUpload(fileList, targetDir = '') {
   // actual vectorization stays serial and predictable). Failures are
   // collected and surfaced once at the end, not per-file.
   const jobs = files.map(async (file) => {
+    if (_ctxHasHiddenPathSegment(file.name)) return { ok: false, name: file.name, reason: 'hidden' };
     const ext = _ctxExtOf(file.name);
     if (!CTX_ALLOWED_EXTS.includes(ext)) return { ok: false, name: file.name, reason: 'ext' };
     try {
@@ -919,7 +969,7 @@ async function handleCtxUpload(fileList, targetDir = '') {
         delete _kbStatusByPath[target];
         return { ok: false, name: file.name, reason: data.error || 'unknown' };
       }
-      return { ok: true, name: file.name };
+            return { ok: true, name: file.name };
     } catch (e) {
       return { ok: false, name: file.name, reason: e.message || String(e) };
     }
@@ -936,11 +986,24 @@ async function handleCtxUpload(fileList, targetDir = '') {
   const rejected = results.filter((r) => !r.ok);
   for (const r of rejected) {
     _contextsLog.warn('upload failed', r.name, r.reason);
-  }
-  if (rejected.length) {
+      }
+  const extRejected = rejected.filter((r) => r.reason === 'ext');
+  const hiddenRejected = rejected.filter((r) => r.reason === 'hidden');
+  const failed = rejected.filter((r) => r.reason !== 'ext' && r.reason !== 'hidden');
+  if (extRejected.length) {
     await uiAlert(t('contexts.upload_rejected', {
       exts: CTX_ALLOWED_EXTS.join(' / '),
-      list: rejected.map((r) => r.reason === 'ext' ? r.name : `${r.name}(${r.reason})`).join('\n'),
+      list: extRejected.map((r) => r.name || '').join('\n'),
+    }));
+  }
+  if (hiddenRejected.length) {
+    await uiAlert(t('contexts.upload_hidden_rejected', {
+      list: hiddenRejected.map((r) => r.name || '').join('\n'),
+    }));
+  }
+  if (failed.length) {
+    await uiAlert(t('contexts.upload_failed', {
+      name: failed.map((r) => `${r.name || ''}: ${r.reason || 'unknown'}`).join('\n'),
     }));
   }
 }
@@ -965,7 +1028,20 @@ async function handleCtxNativeUpload(targetDir = '') {
     if (statusEl) statusEl.style.display = 'none';
   }
   const files = Array.isArray(data && data.files) ? data.files : [];
-  const failed = files.filter((r) => !r || r.ok === false);
+  const extRejected = files.filter((r) => r && r.ok === false && r.reason === 'ext');
+  if (extRejected.length) {
+    await uiAlert(t('contexts.upload_rejected', {
+      exts: CTX_ALLOWED_EXTS.join(' / '),
+      list: extRejected.map((r) => r.name || '').join('\n'),
+    }));
+  }
+  const hiddenRejected = files.filter((r) => r && r.ok === false && r.reason === 'hidden');
+  if (hiddenRejected.length) {
+    await uiAlert(t('contexts.upload_hidden_rejected', {
+      list: hiddenRejected.map((r) => r.name || '').join('\n'),
+    }));
+  }
+  const failed = files.filter((r) => !r || (r.ok === false && r.reason !== 'ext' && r.reason !== 'hidden'));
   if (failed.length) {
     const list = failed.map((r) => `${r.name || ''}: ${r.error || r.reason || 'unknown'}`).join('\n');
     await uiAlert(t('contexts.upload_failed', { name: list }));
@@ -976,7 +1052,7 @@ async function handleCtxNativeUpload(targetDir = '') {
 // Dispatches on file extension:
 //   - text kinds        → markdown editor (read + edit + delete)
 //   - image kinds       → inline <img> via base64
-//   - pdf / docx / else → stub card ("use system app"); clicking opens the
+//   - pdf / office / else → inline preview or stub card; binary fallback opens the
 //                         file in the OS default viewer. We still provide
 //                         delete + "open in system" actions for consistency.
 
@@ -989,13 +1065,14 @@ const CTX_TEXT_EXTS = new Set([
   '.sql', '.graphql', '.gql',
 ]);
 const CTX_IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
+const CTX_OFFICE_EXTS = new Set(['.docx', '.docm', '.xlsx', '.xlsm', '.pptx', '.pptm']);
 
 function _kindOfPath(rel) {
   const ext = _ctxExtOf(rel);
   if (CTX_TEXT_EXTS.has(ext)) return 'text';
   if (CTX_IMAGE_EXTS.has(ext)) return 'image';
   if (ext === '.pdf') return 'pdf';
-  if (ext === '.docx') return 'docx';
+  if (CTX_OFFICE_EXTS.has(ext)) return 'office';
   return 'other';
 }
 
@@ -1042,11 +1119,8 @@ async function openCtxFile(rel) {
       // URL-encoded individually so CJK filenames survive but `/` boundaries
       // stay visible to the router.
       _showCtxPdfViewer(rel);
-    } else if (kind === 'docx') {
-      const res = await apiFetch(`/api/contexts/docx?path=${encodeURIComponent(rel)}`);
-      const data = await res.json();
-      if (!data.ok) { await uiAlert(data.error || t('contexts.read_failed')); return; }
-      _showCtxDocxViewer(rel, data.html || '');
+    } else if (kind === 'office') {
+      await _showCtxOfficeViewer(rel);
     } else {
       _showCtxBinaryViewer(rel, kind);
       revealCtxFile(rel);
@@ -1097,6 +1171,28 @@ function _showCtxDocxViewer(rel, html) {
   els.bodyEl.scrollTop = 0;
 }
 
+async function _showCtxOfficeViewer(rel) {
+  const els = _prepCtxViewerShell(rel);
+  if (!els) return;
+  els.bodyEl.innerHTML = `<div class="chat-file-viewer-loading">…</div>`;
+  const res = await apiFetch(`/api/contexts/office?path=${encodeURIComponent(rel)}`);
+  const data = await res.json();
+  if (!data.ok) { await uiAlert(data.error || t('contexts.read_failed')); return; }
+  if (_ctxOfficeBlobUrl) {
+    try { URL.revokeObjectURL(_ctxOfficeBlobUrl); } catch (_) { /* ignore */ }
+  }
+  _ctxOfficeBlobUrl = URL.createObjectURL(new Blob([String(data.html || '')], { type: 'text/html;charset=utf-8' }));
+  const style = data.previewHeight ? ` style="height:${Math.max(120, Number(data.previewHeight) || 0)}px"` : '';
+  els.bodyEl.innerHTML = `<iframe class="ctx-viewer-office" sandbox="" src="${_ctxOfficeBlobUrl}"${style} title="${escapeHtml(rel)}"></iframe>`;
+  els.actionsEl.innerHTML = `
+    <button class="btn btn-sm" id="ctx-viewer-reveal">${escapeHtml(t('contexts.viewer.open_system'))}</button>
+    <button class="btn btn-sm btn-danger" id="ctx-viewer-del">${escapeHtml(t('contexts.viewer.delete'))}</button>
+  `;
+  els.actionsEl.querySelector('#ctx-viewer-reveal').addEventListener('click', () => revealCtxFile(rel));
+  els.actionsEl.querySelector('#ctx-viewer-del').addEventListener('click', _deleteCtxFromViewer);
+  els.bodyEl.scrollTop = 0;
+}
+
 async function revealCtxFile(rel) {
   try {
     const res = await apiFetch('/api/contexts/reveal', {
@@ -1113,6 +1209,10 @@ async function revealCtxFile(rel) {
 
 function _prepCtxViewerShell(rel) {
   _ctxActive = { id: rel };
+  if (_ctxOfficeBlobUrl) {
+    try { URL.revokeObjectURL(_ctxOfficeBlobUrl); } catch (_) { /* ignore */ }
+    _ctxOfficeBlobUrl = null;
+  }
   // Tear down the previous md mount before switching files — otherwise the
   // outgoing controller's textarea-input listeners would still react to the
   // about-to-be-replaced DOM and the drafts map could record updates against

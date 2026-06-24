@@ -64,7 +64,9 @@ function loadOss(opts: LoadOpts = {}) {
     pickLocalizedName: (c: any) => c?.name_zh || c?.name_en || c?.code || '',
     t: (key: string) => {
       if (key === 'oss.prompt') return 'Use {name} ({url}) to help me with: [describe your task here]. Install from {url} if {name} is not present.';
+      if (key === 'oss.office_prompt') return 'OfficeCLI is built in. Use built-in Office tools for: [describe your task here].';
       if (key === 'oss.install_prompt') return 'Please install the open-source project {name} ({url}) for me.';
+      if (key === 'oss.office_install_prompt') return 'OfficeCLI is already built in as Office tools. Briefly explain what it can do.';
       return key;
     },
     setView: (v: string) => { calls.setView.push(v); },
@@ -222,8 +224,13 @@ describe('oss.js', () => {
     expect(current.projects.map((p: any) => p.id)).toEqual(['server-cached']);
   });
 
-  it('homepage cold-start policy skips refresh when server cache is under 4h old', async () => {
+  it('homepage cold-start refreshes once per renderer boot even when the cached entry is fresh', async () => {
+    // Behavior contract: a just-launched OSS project must reach users on their
+    // next app open, so cold-start has NO staleness gate — it always does one
+    // background refresh per boot, even when the cached entry is brand new.
     const cachedProject = { id: 'warm', name: 'Warm', task_zh: '缓存', task_en: 'cached', category: 'anim', driver: 'cli' };
+    let resolveList: (value: unknown) => void = () => {};
+    const listPromise = new Promise((resolve) => { resolveList = resolve; });
     const { context, invokeCalls } = loadOss({
       invoke: async (channel) => {
         if (channel === 'marketplace.getListingsCache') {
@@ -234,22 +241,29 @@ describe('oss.js', () => {
           };
         }
         if (channel === 'marketplace.mergeListingsCache') return { ok: true };
-        return {
-          source: 'server',
-          list: [{ id: 'fresh', name: 'Fresh', task_zh: '新', task_en: 'new', category: 'anim', driver: 'cli' }],
-          categories: [],
-          total: 1,
-        };
+        return listPromise;
       },
     });
 
+    // Cached entry paints immediately...
     const data = await context.loadOssCatalog({ homeOnly: true, revalidate: 'cold-start' });
-
     expect(data.projects.map((p: any) => p.id)).toEqual(['warm']);
-    expect(invokeCalls.filter((c) => c.channel === 'marketplace.listProjects')).toHaveLength(0);
+    // ...but a background refresh still fires this boot despite the fresh cache.
+    expect(invokeCalls.filter((c) => c.channel === 'marketplace.listProjects')).toHaveLength(1);
+
+    resolveList({
+      source: 'server',
+      list: [{ id: 'fresh', name: 'Fresh', task_zh: '新', task_en: 'new', category: 'anim', driver: 'cli' }],
+      categories: [],
+      total: 1,
+    });
+    await listPromise;
+    await Promise.resolve();
+    const current = await context.loadOssCatalog({ homeOnly: true, revalidate: false });
+    expect(current.projects.map((p: any) => p.id)).toEqual(['fresh']);
   });
 
-  it('homepage cold-start policy refreshes stale cache once per renderer boot', async () => {
+  it('homepage cold-start policy refreshes at most once per renderer boot', async () => {
     const cachedProject = { id: 'old', name: 'Old', task_zh: '旧', task_en: 'old', category: 'anim', driver: 'cli' };
     let resolveList: (value: unknown) => void = () => {};
     const listPromise = new Promise((resolve) => { resolveList = resolve; });
@@ -258,12 +272,7 @@ describe('oss.js', () => {
         if (channel === 'marketplace.getListingsCache') {
           return {
             entries: {
-              'project|home|||': {
-                items: [cachedProject],
-                categories: [],
-                total: 1,
-                ts: Date.now() - (4 * 60 * 60 * 1000) - 1,
-              },
+              'project|home|||': { items: [cachedProject], categories: [], total: 1, ts: Date.now() },
             },
           };
         }
@@ -321,6 +330,17 @@ describe('oss.js', () => {
     expect(prompt).toMatch(/\[[^\]]+\]/); // a blank task placeholder remains
   });
 
+  it('ossPromptFor tells OfficeCLI to use built-in Office tools', () => {
+    const { context } = loadOss();
+    const prompt = context.ossPromptFor({ id: 'OfficeCLI', name: 'OfficeCLI', repo: 'iOfficeAI/OfficeCLI' });
+    expect(prompt).toContain('OfficeCLI is built in');
+    expect(prompt).toContain('built-in Office tools');
+    expect(prompt).not.toContain('https://github.com/iOfficeAI/OfficeCLI');
+    expect(prompt).not.toContain('create_docx');
+    expect(prompt.toLowerCase()).not.toContain('install');
+    expect(prompt).toMatch(/\[[^\]]+\]/);
+  });
+
   it('ossInstallPromptFor is an install request with no blank task slot', () => {
     const { context } = loadOss();
     const prompt = context.ossInstallPromptFor({ name: 'PPT-Master', repo: 'hugohe3/ppt-master' });
@@ -328,6 +348,15 @@ describe('oss.js', () => {
     expect(prompt).toContain('https://github.com/hugohe3/ppt-master');
     expect(prompt.toLowerCase()).toContain('install');
     expect(prompt).not.toMatch(/\[[^\]]*\]/); // no task placeholder — nothing to fill in
+  });
+
+  it('ossInstallPromptFor explains bundled OfficeCLI instead of installing it', () => {
+    const { context } = loadOss();
+    const prompt = context.ossInstallPromptFor({ id: 'OfficeCLI', name: 'OfficeCLI', repo: 'iOfficeAI/OfficeCLI' });
+    expect(prompt).toContain('OfficeCLI is already built in as Office tools');
+    expect(prompt).not.toContain('https://github.com/iOfficeAI/OfficeCLI');
+    expect(prompt.toLowerCase()).not.toContain('install');
+    expect(prompt).not.toMatch(/\[[^\]]*\]/);
   });
 
   it('prefillCommander selects the [...] placeholder so the user types over it', () => {
@@ -347,5 +376,10 @@ describe('oss.js', () => {
     expect(en.ossTaskFor(p)).toBe('english');
     expect(zh.ossDescFor(p)).toBe('描述');
     expect(en.ossDescFor(p)).toBe('desc');
+  });
+
+  it('maps the slides category to the presentation icon', () => {
+    const { context } = loadOss();
+    expect(context.ossIconFor('slides')).toBe('presentation');
   });
 });

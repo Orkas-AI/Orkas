@@ -16,7 +16,7 @@ const log = createLogger("sandbox");
 export interface SandboxConfig {
   /** Working directory for commands. */
   workingDir: string;
-  /** Maximum execution time in milliseconds (default: 30 min). */
+  /** Maximum execution time in milliseconds (default: 60 min). */
   timeoutMs?: number;
   /** Maximum output buffer size in bytes (default: 1MB). */
   maxOutputBytes?: number;
@@ -55,7 +55,7 @@ type KillableChild = Pick<ChildProcess, "kill" | "pid">;
 type ProcessKiller = typeof process.kill;
 type SpawnFn = typeof spawn;
 
-export const DEFAULT_SANDBOX_TIMEOUT_MS = 30 * 60_000;
+export const DEFAULT_SANDBOX_TIMEOUT_MS = 60 * 60_000;
 const KILL_GRACE_MS = 5_000;
 const KILL_SETTLE_GRACE_MS = KILL_GRACE_MS + 1_000;
 

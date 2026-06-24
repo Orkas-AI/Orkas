@@ -109,7 +109,9 @@ function resolveProjectFilePath(uid: string, projectId: string, relPath: string)
 function kindFor(name: string): ProjectLibraryKind | null {
   const ext = path.extname(name).toLowerCase();
   if (ext === '.pdf') return 'pdf';
-  if (ext === '.docx') return 'docx';
+  if (ext === '.docx' || ext === '.docm') return 'docx';
+  if (ext === '.xlsx' || ext === '.xlsm') return 'spreadsheet';
+  if (ext === '.pptx' || ext === '.pptm') return 'presentation';
   if (IMAGE_EXTS.has(ext)) return 'image';
   if (TEXT_EXTS.has(ext)) return 'text';
   return null;

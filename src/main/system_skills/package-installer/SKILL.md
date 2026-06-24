@@ -89,5 +89,6 @@ a successful CLI install — the user already approved installing it. Skip for
 - Never run `npm install` / `pip install` yourself inside a package — the
   CLI owns dependency installs and the consent record.
 - Do not modify files under the packages directory; treat it as read-only.
-- If `git` is missing, the CLI reports it — relay the install hint to the
-  user instead of trying alternative download methods.
+- Public GitHub repos install without git (the CLI downloads a tarball when git
+  is absent). Git is only needed for private repos and non-GitHub git URLs; if
+  the CLI reports git is required for such a source, relay that to the user.

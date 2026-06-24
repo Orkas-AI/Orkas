@@ -638,7 +638,7 @@ describe('conversation process read_file resource labels', () => {
         phase: 'start',
         name: 'read_file',
         arguments: {
-          path: '/Users/test/.orkas/data/u1/local/marketplace/agents/4430ca181349/agent.json',
+          path: '/Users/user/.orkas/data/u1/local/marketplace/agents/4430ca181349/agent.json',
         },
       },
     });
@@ -648,65 +648,138 @@ describe('conversation process read_file resource labels', () => {
 });
 
 describe('conversation auto recipient', () => {
-  const members = [
-    { kind: 'agent', id: 'a1', name: '交互老师', interactive: true },
-    { kind: 'agent', id: 'a2', name: '普通助手', interactive: false },
-  ];
-
-  it('keeps live or blocked interactive agents as the input recipient', () => {
+  it('mirrors the server conversation floor into the input recipient', async () => {
     const context = loadConversationRenderer();
+    vm.runInContext(`
+      currentCid = "c1";
+      _groupMembersCache.set("c1", [
+        { kind: "agent", id: "a1", name: "交互老师" },
+      ]);
+      _serverFloorByCid.set("c1", "a1");
+    `, context);
 
-    expect(context._pickInteractiveAgent({
-      steps: [{ index: 1, assignee: '交互老师', status: 'done' }],
-    }, members, [])).toBeNull();
+    await vm.runInContext('_evaluateAutoRecipient("c1")', context);
 
-    expect(context._pickInteractiveAgent({
-      steps: [{ index: 1, assignee: '交互老师', status: 'in_progress' }],
-    }, members, ['a1'])).toMatchObject({ id: 'a1', name: '交互老师' });
-
-    expect(context._pickInteractiveAgent({
-      steps: [{ index: 1, assignee: '普通助手', status: 'blocked' }],
-    }, members, [])).toBeNull();
-
-    expect(context._pickInteractiveAgent({
-      steps: [{ index: 1, assignee: '交互老师', status: 'blocked' }],
-    }, members, [])).toMatchObject({ id: 'a1', name: '交互老师' });
+    expect(context.getChatRecipient('conversation'))
+      .toMatchObject({ id: 'a1', name: '交互老师' });
   });
 
-  it('keeps direct interactive-agent conversations on that agent', () => {
+  it('does not infer a recipient from in-flight actors when the server floor is empty', async () => {
     const context = loadConversationRenderer();
-    vm.runInContext('currentCid = "c1"; _lastInteractiveTurnAgent.set("c1", "a1")', context);
+    vm.runInContext(`
+      currentCid = "c1";
+      _groupMembersCache.set("c1", [
+        { kind: "agent", id: "a1", name: "交互老师" },
+      ]);
+      _latestInFlight.set("c1", ["a1"]);
+      _serverFloorByCid.set("c1", "");
+    `, context);
 
-    expect(context._pickInteractiveAgent(null, members, ['a1']))
-      .toMatchObject({ id: 'a1', name: '交互老师' });
+    await vm.runInContext('_evaluateAutoRecipient("c1")', context);
 
-    expect(context._pickInteractiveAgent(null, members, []))
-      .toMatchObject({ id: 'a1', name: '交互老师' });
-
-    expect(context._pickInteractiveAgent({ steps: [], completed: true }, members, []))
-      .toBeNull();
-
-    expect(context._pickInteractiveAgent({
-      steps: [{ index: 1, assignee: '交互老师', status: 'done' }],
-    }, members, [])).toBeNull();
+    expect(context.getChatRecipient('conversation'))
+      .toMatchObject({ kind: 'commander' });
   });
 
-  it('restores the non-plan interactive candidate from visible history', () => {
+  it('clears the auto recipient when the server floor clears', async () => {
     const context = loadConversationRenderer();
-    vm.runInContext('currentCid = "c1"', context);
-
-    context._restoreInteractiveTurnCandidateFromHistory('c1', [
-      { from: 'user', text: 'teach me' },
-      { from: 'a1', text: 'try this question' },
-    ]);
-    expect(context._pickInteractiveAgent(null, members, []))
+    vm.runInContext(`
+      currentCid = "c1";
+      _groupMembersCache.set("c1", [
+        { kind: "agent", id: "a1", name: "交互老师" },
+      ]);
+      _serverFloorByCid.set("c1", "a1");
+    `, context);
+    await vm.runInContext('_evaluateAutoRecipient("c1")', context);
+    expect(context.getChatRecipient('conversation'))
       .toMatchObject({ id: 'a1', name: '交互老师' });
 
-    context._restoreInteractiveTurnCandidateFromHistory('c1', [
-      { from: 'a1', text: 'try this question' },
-      { from: 'user', text: 'my answer' },
-    ]);
-    expect(context._pickInteractiveAgent(null, members, [])).toBeNull();
+    vm.runInContext('_serverFloorByCid.set("c1", "")', context);
+    await vm.runInContext('_evaluateAutoRecipient("c1")', context);
+
+    expect(context.getChatRecipient('conversation'))
+      .toMatchObject({ kind: 'commander' });
+  });
+
+  it('suppresses the floor and prefixes @commander when the user explicitly returns to commander', async () => {
+    const context = loadConversationRenderer();
+    vm.runInContext(`
+      currentCid = "c1";
+      _groupMembersCache.set("c1", [
+        { kind: "agent", id: "a1", name: "交互老师" },
+      ]);
+      _serverFloorByCid.set("c1", "a1");
+    `, context);
+    await vm.runInContext('_evaluateAutoRecipient("c1")', context);
+    expect(context.getChatRecipient('conversation'))
+      .toMatchObject({ id: 'a1', name: '交互老师' });
+
+    context.setChatRecipient('conversation', { kind: 'commander' });
+    await vm.runInContext('_evaluateAutoRecipient("c1")', context);
+
+    expect(context.getChatRecipient('conversation'))
+      .toMatchObject({ kind: 'commander' });
+    expect(context.applyRecipientPrefix('先回到你这里', 'conversation'))
+      .toBe('@commander 先回到你这里');
+  });
+
+  it('prefixes from a send-time recipient snapshot instead of a later chip state', () => {
+    const context = loadConversationRenderer();
+    context._agentsCache = [
+      { agent_id: 'a1', name: 'FamilyTutor' },
+      { agent_id: 'a2', name: 'OtherTutor' },
+    ];
+    vm.runInContext(`
+      currentCid = "c1";
+      setChatRecipient("conversation", { kind: "agent", id: "a1", name: "FamilyTutor" });
+      __snap = _takeRecipientSnapshotForSend("conversation");
+      setChatRecipient("conversation", { kind: "agent", id: "a2", name: "OtherTutor" });
+    `, context);
+
+    expect(context.applyRecipientPrefix('继续', 'conversation', { recipientSnapshot: context.__snap }))
+      .toBe('@FamilyTutor 继续');
+  });
+
+  it('stores the commander floor reset in the send-time snapshot', () => {
+    const context = loadConversationRenderer();
+    vm.runInContext(`
+      currentCid = "c1";
+      _serverFloorByCid.set("c1", "a1");
+      setChatRecipient("conversation", { kind: "commander" });
+      __snap = _takeRecipientSnapshotForSend("conversation");
+      __stillPending = _pendingFloorResetByCid.has("c1");
+    `, context);
+
+    expect(context.__snap).toMatchObject({ kind: 'commander', resetFloor: true });
+    expect(context.__stillPending).toBe(false);
+    expect(context.applyRecipientPrefix('回来', 'conversation', { recipientSnapshot: context.__snap }))
+      .toBe('@commander 回来');
+  });
+
+  it('drains queued messages with the enqueue-time recipient snapshot', () => {
+    const context = loadConversationRenderer();
+    context.messageQueues = new Map();
+    context._QUEUE_KEY = (cid: string) => `queue_${cid}`;
+    context._DRAFT_KEY = (cid: string) => `draft_${cid}`;
+    context._agentsCache = [
+      { agent_id: 'a1', name: 'FamilyTutor' },
+      { agent_id: 'a2', name: 'OtherTutor' },
+    ];
+    const queueSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/queue-draft.js'), 'utf8');
+    vm.runInContext(queueSource, context);
+    vm.runInContext(`
+      currentCid = "c1";
+      __sent = [];
+      sendInCurrentConversation = (content) => { __sent.push(content); };
+      setChatRecipient("conversation", { kind: "agent", id: "a1", name: "FamilyTutor" });
+      enqueueMessage("c1", "还有吗？", null, {
+        recipient: _takeRecipientSnapshotForSend("conversation"),
+      });
+      setChatRecipient("conversation", { kind: "agent", id: "a2", name: "OtherTutor" });
+      _dispatchNextQueued("c1");
+    `, context);
+
+    expect(context.__sent).toEqual(['@FamilyTutor 还有吗？']);
   });
 });
 

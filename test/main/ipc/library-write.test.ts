@@ -125,4 +125,31 @@ describe('library.importProduced', () => {
 
     await projectLibrary.drain(TEST_UID);
   });
+
+  it('rejects unsupported produced files before importing into a project Library', async () => {
+    const projects = await import('../../../src/main/features/projects');
+    const chats = await import('../../../src/main/features/chats');
+    const userWorkspace = await import('../../../src/main/features/user_workspace');
+    const { projectFilesDir } = await import('../../../src/main/paths');
+    const { _libraryImportProducedForTest } = await import('../../../src/main/ipc/index');
+
+    const project = await projects.createProject(TEST_UID, 'Produced Import Filter');
+    if (!project.ok) throw new Error('project precondition failed');
+    const projectId = project.project.project_id;
+    const conv = await chats.createConversation(TEST_UID, { projectId });
+
+    const ws = userWorkspace.getWorkspacePath(TEST_UID, projectId);
+    fs.mkdirSync(ws, { recursive: true });
+    const source = path.join(ws, 'archive.zip');
+    fs.writeFileSync(source, 'zip-ish bytes', 'utf8');
+
+    const res = await _libraryImportProducedForTest({
+      cid: conv.conversation_id,
+      path: source,
+    }, ctx());
+
+    expect(res.ok).toBe(false);
+    expect(String(res.error)).toMatch(/Unsupported file type|不支持的文件类型|未対応/);
+    expect(fs.existsSync(path.join(projectFilesDir(TEST_UID, projectId), 'archive.zip'))).toBe(false);
+  });
 });

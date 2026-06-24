@@ -78,6 +78,14 @@ export interface GroupMessage {
    * agent's visibility slice has it for context) but hidden from the user
    * view, since the user already saw the plan announcement. */
   dispatch?: boolean;
+  /** Commander reasoning-segment index within one turn. A commander turn that
+   * dispatches visible agents is split into segments at each dispatch boundary
+   * (pre-dispatch reasoning → its own bubble, post-handback synthesis → the
+   * next), so the loop is visible and reload ordering matches the live view.
+   * Present on every segment of such a turn (0-based); absent on ordinary
+   * single-bubble messages. The renderer uses it to finalize the live
+   * placeholder at a boundary instead of appending a duplicate bubble. */
+  seg?: number;
   /** Captured process trail from this actor's turn — progress lines + non-
    * assistant tool/lifecycle events. Stored on the actor's end-of-turn
    * message in the main `<cid>.jsonl` so a history reload can rerender the

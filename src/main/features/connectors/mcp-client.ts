@@ -47,6 +47,15 @@ async function _loadSdk(): Promise<SdkBundle> {
 }
 
 const CLIENT_INFO = { name: 'orkas-pc', version: '0.1.0' };
+const DEFAULT_MCP_CONNECT_TIMEOUT_MS = 3 * 60 * 1000;
+
+function resolveMcpConnectTimeoutMs(): number {
+  const raw = process.env.ORKAS_MCP_CONNECT_TIMEOUT_MS;
+  if (!raw) return DEFAULT_MCP_CONNECT_TIMEOUT_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 30_000) return DEFAULT_MCP_CONNECT_TIMEOUT_MS;
+  return Math.min(Math.trunc(n), 10 * 60 * 1000);
+}
 
 export class McpConnection {
   private _client: import('@modelcontextprotocol/sdk/client/index.js').Client | null = null;
@@ -89,13 +98,14 @@ export class McpConnection {
     }
     const client = new sdk.Client(CLIENT_INFO, {});
     try {
-      // First-run `npx -y @modelcontextprotocol/server-github` can download ~10-30 MB; bound
-      // the wait so a stuck spawn surfaces as a clear error instead of an indefinite hang.
-      // 60s is generous for cold install on a slow link; warm runs finish in < 1s.
-      const SPAWN_TIMEOUT_MS = 60_000;
+      // First-run `npx -y @modelcontextprotocol/server-github` can download ~10-30 MB. Bound
+      // the wait so a stuck spawn surfaces as a clear error, but keep the default above weak-link
+      // cold-install time so a working connector is not reported as failed too early.
+      const connectTimeoutMs = resolveMcpConnectTimeoutMs();
       let to: NodeJS.Timeout | undefined;
       const timeout = new Promise<never>((_resolve, reject) => {
-        to = setTimeout(() => reject(new Error('MCP connect timed out (>60s); likely npx/network is slow or the server crashed on launch')), SPAWN_TIMEOUT_MS);
+        const seconds = Math.round(connectTimeoutMs / 1000);
+        to = setTimeout(() => reject(new Error(`MCP connect timed out (>${seconds}s); likely npx/network is slow or the server crashed on launch`)), connectTimeoutMs);
       });
       try {
         await Promise.race([client.connect(transport), timeout]);

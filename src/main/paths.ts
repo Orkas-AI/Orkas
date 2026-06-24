@@ -4,7 +4,7 @@
  * All path constants live here — never hardcode paths elsewhere.
  *
  * Layout (dev and packaged both use this tree; the only platform variation
- * is in `<container>` — see install-data-root.cjs):
+ * is in `<container>` — see install-data-root.ts):
  *
  *   PC_ROOT/                      ← source + per-install binaries (asar-packed in prod)
  *     bootstrap.cjs package.json node_modules/ test/ docs/
@@ -85,6 +85,12 @@ export const PYTHON_VENV_UV_CACHE_DIR = path.join(PYTHON_VENV_CACHE_DIR, 'uv');
 export const PYTHON_VENV_PIP_CACHE_DIR = path.join(PYTHON_VENV_CACHE_DIR, 'pip');
 export const pythonPackageVenvDir = (key: string) =>
   path.join(PYTHON_VENV_ROOT, 'packages', key, '.venv');
+export const NODE_VENV_ROOT    = path.join(VENV_ROOT, 'node');
+export const NODE_NPM_CACHE_DIR = path.join(NODE_VENV_ROOT, 'cache', 'npm');
+export const NODE_NPM_PREFIX_DIR = path.join(NODE_VENV_ROOT, 'prefix');
+export const NODE_NPM_GLOBAL_BIN_DIR = process.platform === 'win32'
+  ? NODE_NPM_PREFIX_DIR
+  : path.join(NODE_NPM_PREFIX_DIR, 'bin');
 // Marketplace installs land under `<uid>/local/marketplace/` per machine — see
 // `userMarketplace*` helpers below. There is no top-level platform install tree.
 
@@ -263,7 +269,7 @@ export const autoTaskAttachmentsDir = (uid: string, taskId: string) => path.join
 // (local-secret encrypted with the active Orkas account's OAuth user_id as owner — see
 // `features/connectors/registry.ts`). Cloud-synced as of 2026-05-15 so a user authorizing on
 // one device sees the same connectors on another. **Secret owner:** OAuth user_id (not local uid)
-// so any device logged into the same Orkas account can decrypt; open-source / not-logged-in
+// so any device logged into the same Orkas account can decrypt; the open-source build / not-logged-in
 // users fall back to local uid (the file then sits in cloud/config/ but doesn't actually
 // sync — sync engine is inactive without an account).
 export const userConnectorsConfigFile = (uid: string) => path.join(userCloudConfigDir(uid), 'connectors.json');
@@ -447,9 +453,9 @@ export const userPackageSkillDir  = (uid: string, name: string) => path.join(use
 // attack surface, so it was dropped — Orkas skills live under the data root
 // (custom / marketplace) or in tracked external packages instead. All roots
 // here are READ-ONLY to Orkas: never write, normalize, or reconcile them.
-// Gated by the `global_skill_roots_enabled` preference and injected
-// commander-only — never through the orkas-bridge, because each CLI reads its
-// own global dir natively (see skill-registry.ts::listSkillsForBridge).
+// Gated by the `global_skill_roots_enabled` preference and injected only into
+// in-app task/authoring sessions — never through the orkas-bridge, because
+// each CLI reads its own global dir natively (see skill-registry.ts::listSkillsForBridge).
 export const globalSkillRoots = (): string[] => [
   path.join(os.homedir(), '.claude', 'skills'),
   path.join(os.homedir(), '.codex', 'skills'),
@@ -465,6 +471,12 @@ export const userRecycleDir = (uid: string) => path.join(userLocalRoot(uid), 're
 // absolute path of the folder the user picked + a recents list. Absolute
 // paths are machine-specific, so this is never synced.
 export const userWorkspaceConfigFile = (uid: string) => path.join(userLocalRoot(uid), 'workspace.json');
+
+// One-time marker: the native file picker seeds its first-ever open at the
+// user's workspace, then hands off to the OS's remembered last-used directory.
+// Local (machine-specific, never synced) so it survives restarts the same way
+// the OS last-used does — without persistence a restart would wrongly re-seed.
+export const pickerFirstOpenMarkerFile = (uid: string) => path.join(userLocalRoot(uid), '.picker-first-open-seeded');
 
 // ── Expert signals (machine-private, append-only) ───────────────────────
 // Per-day jsonl of T0/T1 user behavior signals emitted by bus.ts turn-end
@@ -549,6 +561,32 @@ export function runtimeResourcesDir(): string {
     return path.join(rp, 'runtime');
   }
   return path.join(PC_ROOT, 'resources', 'runtime');
+}
+
+/** `${process.platform}-${process.arch}` → vendored OfficeCLI asset name.
+ *  Mirrors `scripts/fetch-officecli.cjs`. Desktop targets only (mac + win). */
+const OFFICECLI_ASSETS: Readonly<Record<string, string>> = {
+  'darwin-arm64': 'officecli-mac-arm64',
+  'darwin-x64': 'officecli-mac-x64',
+  'win32-x64': 'officecli-win-x64.exe',
+  'win32-arm64': 'officecli-win-arm64.exe',
+};
+
+/** Absolute path to the OfficeCLI binary for the current platform/arch, or
+ *  null when no asset ships for it. Shipped via electron-builder
+ *  `extraResources`:
+ *    dev:    PC/resources/officecli/
+ *    packed: <app>/Contents/Resources/officecli/   (darwin)
+ *            <app>/resources/officecli/             (win)
+ */
+export function officeCliBinaryPath(): string | null {
+  const asset = OFFICECLI_ASSETS[`${process.platform}-${process.arch}`];
+  if (!asset) return null;
+  const rp = (process as unknown as { resourcesPath?: string }).resourcesPath;
+  const dir = (rp && !rp.includes(`${path.sep}node_modules${path.sep}electron${path.sep}`))
+    ? path.join(rp, 'officecli')
+    : path.join(PC_ROOT, 'resources', 'officecli');
+  return path.join(dir, asset);
 }
 
 // (No shipped builtin source tree anymore. The marketplace is the only source for

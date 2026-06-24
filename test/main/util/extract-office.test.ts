@@ -6,7 +6,14 @@ import {
   pptxBufferToHtml,
   pptxBufferToMarkdown,
 } from '../../../src/main/util/extract-office';
-import { makeMinimalXlsx, makeMinimalPptx } from '../../fixtures/make-minimal-office';
+import {
+  makeMinimalXlsx,
+  makeNamespacedDirectXlsx,
+  makeReorderedPptx,
+  makeReorderedSheetsXlsx,
+  makeSparseXlsx,
+  makeMinimalPptx,
+} from '../../fixtures/make-minimal-office';
 
 describe('extract-office › xlsxBufferToMarkdown', () => {
   it('extracts shared-string worksheet rows', () => {
@@ -22,6 +29,34 @@ describe('extract-office › xlsxBufferToMarkdown', () => {
     expect(md).toContain('## Scores');
     expect(md).toContain('Row 1: Name\tScore');
     expect(md).toContain('Row 2: Ada\t99');
+  });
+
+  it('extracts namespaced direct-string worksheet rows', () => {
+    const md = xlsxBufferToMarkdown(makeNamespacedDirectXlsx({
+      sheetName: 'Sheet1',
+      rows: [
+        ['序号', '姓名', '身高(cm)'],
+        ['1', '张伟', '178'],
+      ],
+    }));
+
+    expect(md).toContain('## Sheet1');
+    expect(md).toContain('Row 1: 序号\t姓名\t身高(cm)');
+    expect(md).toContain('Row 2: 1\t张伟\t178');
+  });
+
+  it('preserves blank columns instead of shifting sparse worksheet cells left', () => {
+    const md = xlsxBufferToMarkdown(makeSparseXlsx());
+
+    expect(md).toContain('Row 1: Left\t\tRight');
+    expect(md).toContain('Row 2: \t\tOnly C');
+  });
+
+  it('uses workbook sheet order instead of worksheet filename order', () => {
+    const md = xlsxBufferToMarkdown(makeReorderedSheetsXlsx());
+
+    expect(md.indexOf('## First In Workbook')).toBeLessThan(md.indexOf('## Second In Workbook'));
+    expect(md.indexOf('First sheet body')).toBeLessThan(md.indexOf('Second sheet body'));
   });
 
   it('rejects empty buffers', () => {
@@ -44,6 +79,19 @@ describe('extract-office › xlsxBufferToHtml', () => {
     expect(html).toContain('Scores &amp; Totals');
     expect(html).toContain('Ada &lt;admin&gt;');
   });
+
+  it('renders namespaced direct-string worksheets without treating them as empty', () => {
+    const html = xlsxBufferToHtml(makeNamespacedDirectXlsx({
+      rows: [
+        ['姓名', '身高(cm)'],
+        ['张伟', '178'],
+      ],
+    }));
+
+    expect(html).toContain('张伟');
+    expect(html).toContain('身高(cm)');
+    expect(html).not.toContain('(empty sheet)');
+  });
 });
 
 describe('extract-office › pptxBufferToMarkdown', () => {
@@ -61,6 +109,14 @@ describe('extract-office › pptxBufferToMarkdown', () => {
     expect(md).toContain('- Launch in June');
     expect(md).toContain('## Slide 2');
     expect(md).toContain('- Risks');
+  });
+
+  it('uses presentation slide order instead of slide filename order', () => {
+    const md = pptxBufferToMarkdown(makeReorderedPptx());
+
+    expect(md.indexOf('- First slide in deck')).toBeLessThan(md.indexOf('- Second slide in deck'));
+    expect(md).toContain('## Slide 1\n- First slide in deck');
+    expect(md).toContain('## Slide 2\n- Second slide in deck');
   });
 
   it('rejects empty buffers', () => {

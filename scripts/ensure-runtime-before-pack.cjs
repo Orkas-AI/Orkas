@@ -4,6 +4,8 @@
 const path = require('node:path');
 const fs = require('node:fs');
 const { spawnSync } = require('node:child_process');
+const { slimRuntimeRoot } = require('./slim-runtime.cjs');
+const { runtimeKey, verifyRuntimeRoot } = require('../bin/runtime-gate.cjs');
 
 const ARCH_MAP = new Map([
   ['0', 'ia32'],
@@ -22,13 +24,9 @@ function normalizeArch(value) {
   return ARCH_MAP.get(String(value)) || String(value || process.arch);
 }
 
-function platformKey(platform, arch) {
-  return `${platform}-${arch}`;
-}
-
 function pruneRuntimeRoot(root, keys) {
   const allowed = new Set(keys);
-  for (const kind of ['python', 'uv']) {
+  for (const kind of ['python', 'uv', 'node']) {
     const kindDir = path.join(root, kind);
     if (!fs.existsSync(kindDir) || !fs.statSync(kindDir).isDirectory()) {
       continue;
@@ -69,5 +67,13 @@ module.exports = async function ensureRuntimeBeforePack(context) {
     }
   }
 
-  pruneRuntimeRoot(runtimeRoot, arches.map(targetArch => platformKey(platform, targetArch)));
+  slimRuntimeRoot(runtimeRoot, { platform, arch });
+  const allowedKeys = arches.map(targetArch => runtimeKey(platform, targetArch));
+  pruneRuntimeRoot(runtimeRoot, allowedKeys);
+
+  const verified = [];
+  for (const targetArch of arches) {
+    verified.push(...verifyRuntimeRoot(runtimeRoot, platform, targetArch, { allowedKeys }));
+  }
+  console.log(`[runtime-gate] pre-pack verified: ${verified.join(', ')}`);
 };

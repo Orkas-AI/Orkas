@@ -37,6 +37,12 @@ export type ToolResult = {
    *  even when the provider's tool_result channel doesn't accept images). */
   images?: ToolResultImage[];
   isError?: boolean;
+  /** Terminal tool: end the run after committing this result, WITHOUT a
+   *  follow-up inference. The model's text streamed in the same round becomes
+   *  the final reply; no synthesis call is made. Used for actions that are the
+   *  deliberate last act of a turn — e.g. handing the conversation off to
+   *  another agent, where a commander "synthesis" turn would be wasted. */
+  endTurn?: boolean;
 };
 
 /** A tool that can be called by the agent during an LLM interaction. */
@@ -47,6 +53,14 @@ export interface AgentTool {
   readonly description: string;
   /** JSON Schema for the tool's input parameters. */
   readonly inputSchema: Record<string, unknown>;
+
+  /** Whether this tool may run concurrently with ADJACENT same-mode tool
+   *  calls in one tool-use batch. Defaults to "sequential". Only
+   *  side-effect-free, `ctx.state`-non-mutating tools (read / list / grep /
+   *  search / web / kb_read …) should opt into "parallel"; write / edit /
+   *  delete / bash / pdf / generate / connector-call / skill tools stay
+   *  sequential. Engine-internal — never sent to the model. */
+  readonly executionMode?: "sequential" | "parallel";
 
   /** Execute the tool with the given input. */
   execute(input: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult>;
@@ -66,12 +80,14 @@ export function defineTool(opts: {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  executionMode?: "sequential" | "parallel";
   execute: (input: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
 }): AgentTool {
   return {
     name: opts.name,
     description: opts.description,
     inputSchema: opts.inputSchema,
+    ...(opts.executionMode ? { executionMode: opts.executionMode } : {}),
     execute: opts.execute,
   };
 }

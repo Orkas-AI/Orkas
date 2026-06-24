@@ -25,14 +25,16 @@ import { Mutex } from 'async-mutex';
 import {
   groupChatDir, groupChatMembersFile, groupChatStateFile, userChatsDir,
 } from '../../paths';
-import { nowIso, readJson, writeJson, safeId } from '../../storage';
+import {
+  genId12, nowIso, readJson, writeJson, safeId,
+} from '../../storage';
 import { createLogger } from '../../logger';
 
 const log = createLogger('group_chat.state');
 
 // ── Types ────────────────────────────────────────────────────────────────
 
-export type ActorKind = 'commander' | 'user' | 'agent';
+export type ActorKind = 'commander' | 'user' | 'agent' | 'worker';
 
 export interface Actor {
   kind: ActorKind;
@@ -49,6 +51,25 @@ export interface MembersFile {
 }
 
 export type GroupStatus = 'idle' | 'running' | 'aborted';
+
+export interface OrchestrationLedger {
+  version: 1;
+  id: string;
+  kind: 'suspended_orchestration';
+  status: 'waiting_for_agent' | 'waiting_for_form' | 'interrupted';
+  blocked_on: 'agent_handoff' | 'agent_form';
+  source_tool?: 'hand_off_to' | 'dispatch_to' | 'run_worker';
+  owner_agent_id: string;
+  owner_agent_name?: string;
+  form_id?: string;
+  user_goal: string;
+  handoff_message: string;
+  resume_instruction: string;
+  created_at: string;
+  updated_at: string;
+  interrupted_at?: string;
+  interrupt_message?: string;
+}
 
 export interface StateFile {
   version: 1;
@@ -82,6 +103,22 @@ export interface StateFile {
    *  system-created workflows such as sync-conflict resolution where the
    *  target file lives outside the active workspace. */
   tool_extra_roots?: string[];
+  /** The "floor": the actor a no-`@` user message currently routes to.
+   *  Absent ⇒ commander (the default orchestrator). Set to an agent id when
+   *  the commander hands the conversation off to that agent via `hand_off_to`
+   *  (so the user keeps talking to it without re-`@`-ing every message), and
+   *  reset to commander when the agent hands back, the user `@commander`s, or
+   *  the UI returns control. Server-authoritative + model-decided: it is the
+   *  single source of truth for "who the user is talking to", mirrored to the
+   *  renderer for free since `state_changed` carries the whole StateFile. */
+  active_recipient?: string;
+  /** Lightweight suspended-orchestration state. This is deliberately NOT the
+   *  old plan DAG: it records only the interactive hand-off that is currently
+   *  blocking a larger commander-owned task, plus the instruction needed to
+   *  resume after the agent hands back. `active_recipient` answers "who gets
+   *  the next no-@ user message"; this answers "what commander task should be
+   *  resumed when that interaction completes." */
+  orchestration_ledger?: OrchestrationLedger;
   /** System-created sync-conflict resolution metadata. A commander turn may
    *  close only these records, and only by emitting a matching XML result. */
   sync_conflict_resolution?: {
@@ -98,6 +135,62 @@ export const COMMANDER_ID = 'commander';
 export const USER_ID = 'user';
 export const RESERVED_IDS: ReadonlySet<string> = new Set([COMMANDER_ID, USER_ID]);
 
+function _cleanLedgerText(v: unknown, max = 4000): string {
+  return String(typeof v === 'string' ? v : '')
+    .replace(/\0/g, '')
+    .trim()
+    .slice(0, max);
+}
+
+function _sanitizeOrchestrationLedger(v: unknown): OrchestrationLedger | undefined {
+  if (!v || typeof v !== 'object') return undefined;
+  const row = v as Record<string, unknown>;
+  const owner = typeof row.owner_agent_id === 'string' ? row.owner_agent_id.trim() : '';
+  if (!owner || !safeId(owner) || RESERVED_IDS.has(owner)) return undefined;
+  const status = row.status === 'interrupted'
+    ? 'interrupted'
+    : row.status === 'waiting_for_form'
+      ? 'waiting_for_form'
+      : 'waiting_for_agent';
+  const blocked_on = row.blocked_on === 'agent_form' || status === 'waiting_for_form'
+    ? 'agent_form'
+    : 'agent_handoff';
+  const sourceTool = row.source_tool === 'hand_off_to' || row.source_tool === 'dispatch_to' || row.source_tool === 'run_worker'
+    ? row.source_tool
+    : undefined;
+  const formId = typeof row.form_id === 'string' && /^[a-f0-9]{8,64}$/.test(row.form_id)
+    ? row.form_id
+    : undefined;
+  const id = typeof row.id === 'string' && /^[A-Za-z0-9_.-]+$/.test(row.id) ? row.id : genId12();
+  const now = nowIso();
+  const user_goal = _cleanLedgerText(row.user_goal);
+  const handoff_message = _cleanLedgerText(row.handoff_message);
+  const resume_instruction = _cleanLedgerText(row.resume_instruction);
+  if (!resume_instruction) return undefined;
+  return {
+    version: 1,
+    id,
+    kind: 'suspended_orchestration',
+    status,
+    blocked_on,
+    ...(sourceTool ? { source_tool: sourceTool } : {}),
+    owner_agent_id: owner,
+    ...(formId ? { form_id: formId } : {}),
+    ...(typeof row.owner_agent_name === 'string' && row.owner_agent_name.trim()
+      ? { owner_agent_name: _cleanLedgerText(row.owner_agent_name, 200) }
+      : {}),
+    user_goal,
+    handoff_message,
+    resume_instruction,
+    created_at: typeof row.created_at === 'string' && row.created_at ? row.created_at : now,
+    updated_at: typeof row.updated_at === 'string' && row.updated_at ? row.updated_at : now,
+    ...(typeof row.interrupted_at === 'string' && row.interrupted_at ? { interrupted_at: row.interrupted_at } : {}),
+    ...(typeof row.interrupt_message === 'string' && row.interrupt_message.trim()
+      ? { interrupt_message: _cleanLedgerText(row.interrupt_message) }
+      : {}),
+  };
+}
+
 // ── session_id builders ──────────────────────────────────────────────────
 // Format: `<kind>-<tail>` (CLAUDE.md §5). User scoping comes from the path root
 // (`<activeUid>/{cloud,local}/sessions/<sid>.jsonl`), not from the session_id.
@@ -113,11 +206,21 @@ export function buildGmemberSessionId(cid: string, agentId: string): string {
   return `gmember-${cid}-${agentId}`;
 }
 
+/** Ephemeral anonymous-worker session (G8b). One per spun-up worker; throwaway
+ * — lands under `local/sessions/` (machine-private, GC'd, never synced) since
+ * the worker is one-shot and explicitly purged after it hands its result back
+ * to the commander. The `gworker` kind is registered as ephemeral in
+ * `session-store.ts`. */
+export function buildGworkerSessionId(cid: string, workerId: string): string {
+  return `gworker-${cid}-${workerId}`;
+}
+
 /** Resolve an actor's session id from its kind/id. The user actor has no
  * session — it's the human. Throws on unknown kind. */
 export function actorSessionId(cid: string, actor: Actor): string {
   if (actor.kind === 'commander') return buildGconvSessionId(cid);
   if (actor.kind === 'agent') return buildGmemberSessionId(cid, actor.id);
+  if (actor.kind === 'worker') return buildGworkerSessionId(cid, actor.id);
   throw new Error(`actor ${actor.kind}/${actor.id} has no session`);
 }
 
@@ -248,6 +351,7 @@ export async function readState(uid: string, cid: string): Promise<StateFile> {
   try {
     const data: any = await readJson(file);
     if (data && typeof data === 'object') {
+      const orchestrationLedger = _sanitizeOrchestrationLedger(data.orchestration_ledger);
       return {
         version: 1,
         status: (data.status as GroupStatus) || 'idle',
@@ -267,6 +371,11 @@ export async function readState(uid: string, cid: string): Promise<StateFile> {
               typeof s === 'string' && path.isAbsolute(s)
             )) }
           : {}),
+        ...(typeof data.active_recipient === 'string' && data.active_recipient
+          && data.active_recipient !== COMMANDER_ID
+          ? { active_recipient: data.active_recipient }
+          : {}),
+        ...(orchestrationLedger ? { orchestration_ledger: orchestrationLedger } : {}),
         ...(Array.isArray(data.sync_conflict_resolution?.conflicts)
           ? {
               sync_conflict_resolution: {
@@ -347,6 +456,130 @@ export async function transitionStatus(
     if (next !== 'running') s.in_flight = [];
     await writeStateRaw(uid, cid, s);
     return { changed: true, state: s };
+  });
+}
+
+/** Set the conversation floor (`active_recipient`). Pass an agent id to hand the
+ *  user off to that agent; pass `commander` / `user` / empty to reset the floor
+ *  to the commander (stored as absence). Mutex-guarded like `setStatus` so a
+ *  hand-off can't race a concurrent status write. Returns the new state. */
+export async function setActiveRecipient(uid: string, cid: string, recipientId: string): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    const next = (recipientId && recipientId !== COMMANDER_ID && recipientId !== USER_ID)
+      ? recipientId : '';
+    if (next) s.active_recipient = next;
+    else delete s.active_recipient;
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return s;
+  });
+}
+
+export async function setOrchestrationLedger(
+  uid: string,
+  cid: string,
+  ledger: Omit<OrchestrationLedger, 'version' | 'id' | 'kind' | 'status' | 'created_at' | 'updated_at'>
+    & Partial<Pick<OrchestrationLedger, 'id' | 'status' | 'created_at'>>,
+): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    const now = nowIso();
+    s.orchestration_ledger = {
+      version: 1,
+      id: ledger.id || genId12(),
+      kind: 'suspended_orchestration',
+      status: ledger.status || 'waiting_for_agent',
+      blocked_on: ledger.blocked_on,
+      ...(ledger.source_tool ? { source_tool: ledger.source_tool } : {}),
+      owner_agent_id: ledger.owner_agent_id,
+      ...(ledger.form_id ? { form_id: ledger.form_id } : {}),
+      ...(ledger.owner_agent_name ? { owner_agent_name: ledger.owner_agent_name } : {}),
+      user_goal: _cleanLedgerText(ledger.user_goal),
+      handoff_message: _cleanLedgerText(ledger.handoff_message),
+      resume_instruction: _cleanLedgerText(ledger.resume_instruction),
+      created_at: ledger.created_at || now,
+      updated_at: now,
+    };
+    s.last_active_at = now;
+    await writeStateRaw(uid, cid, s);
+    return s;
+  });
+}
+
+export async function clearOrchestrationLedger(uid: string, cid: string): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    delete s.orchestration_ledger;
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return s;
+  });
+}
+
+export async function markOrchestrationInterrupted(
+  uid: string,
+  cid: string,
+  interruptMessage: string,
+  ownerAgentId?: string,
+): Promise<StateFile> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    if (
+      s.orchestration_ledger
+      && s.orchestration_ledger.status !== 'interrupted'
+      && (!ownerAgentId || s.orchestration_ledger.owner_agent_id === ownerAgentId)
+    ) {
+      const now = nowIso();
+      s.orchestration_ledger = {
+        ...s.orchestration_ledger,
+        status: 'interrupted',
+        interrupt_message: _cleanLedgerText(interruptMessage),
+        interrupted_at: now,
+        updated_at: now,
+      };
+      s.last_active_at = now;
+      await writeStateRaw(uid, cid, s);
+    }
+    return s;
+  });
+}
+
+export async function takeOrchestrationLedgerForAgent(
+  uid: string,
+  cid: string,
+  agentId: string,
+): Promise<OrchestrationLedger | null> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    const ledger = s.orchestration_ledger;
+    if (!ledger || ledger.owner_agent_id !== agentId || ledger.status !== 'waiting_for_agent') return null;
+    delete s.orchestration_ledger;
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return ledger;
+  });
+}
+
+export async function takeOrchestrationLedgerForForm(
+  uid: string,
+  cid: string,
+  agentId: string,
+  formId: string,
+): Promise<OrchestrationLedger | null> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    const ledger = s.orchestration_ledger;
+    if (
+      !ledger
+      || ledger.owner_agent_id !== agentId
+      || ledger.status !== 'waiting_for_form'
+      || (ledger.form_id && ledger.form_id !== formId)
+    ) return null;
+    delete s.orchestration_ledger;
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return ledger;
   });
 }
 

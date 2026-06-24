@@ -133,7 +133,17 @@ export class StderrTail {
   }
 }
 
-/** Standard spawn options. Returns a child with stdio: pipe/pipe/pipe. */
+/** Standard spawn options. Returns a child with stdio: pipe/pipe/pipe.
+ *
+ *  `detached` (POSIX only) makes the child a process-group leader so
+ *  `killProcessTree` can signal the WHOLE group, not just the CLI itself.
+ *  Without it, killing the CLI on abort/timeout leaves its descendants
+ *  (tool subprocesses, the orkas-bridge MCP child, a shell's forked last
+ *  command) orphaned but still holding the inherited stdout/stderr pipes
+ *  — so the run's `close` event never fires until those descendants exit
+ *  on their own, making abort/timeout appear to hang. We do NOT `unref`:
+ *  the run still awaits the child's lifetime. Windows has no POSIX process
+ *  groups, so it stays on the direct-child kill path. */
 export function spawnCli(
   binPath: string,
   args: string[],
@@ -145,11 +155,37 @@ export function spawnCli(
     env: env ?? process.env,
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
+    detached: process.platform !== 'win32',
   });
   // Swallow EPIPE during cancel; the OS will close the pipe when the
   // child dies before we finish writing the prompt.
   child.stdin.on('error', () => { /* noop */ });
   return child;
+}
+
+/** Send `signal` to the child's whole process group on POSIX (the child
+ *  is spawned detached, so its pgid == pid and `-pid` addresses the
+ *  group). This reaps grandchildren that inherited the stdio pipes;
+ *  signaling only the direct child leaves them orphaned and the run's
+ *  `close` hangs for their full lifetime (see `spawnCli`). Falls back to
+ *  a direct child kill on Windows or when the group is already gone. */
+export function killProcessTree(
+  child: ChildProcessWithoutNullStreams,
+  signal: NodeJS.Signals,
+): void {
+  const pid = child.pid;
+  if (pid && process.platform !== 'win32') {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch (err) {
+      // ESRCH: the group is already gone — nothing left to signal.
+      if ((err as NodeJS.ErrnoException).code === 'ESRCH') return;
+      // Any other error (e.g. the child never became a group leader):
+      // fall through to a best-effort direct kill.
+    }
+  }
+  try { child.kill(signal); } catch { /* already gone */ }
 }
 
 /**
@@ -224,8 +260,8 @@ export function armKillWatchdog(
   let firedIdleMs = 0;
 
   const kill = () => {
-    try { child.kill('SIGTERM'); } catch { /* already gone */ }
-    const hardKill = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* */ } }, 10_000);
+    killProcessTree(child, 'SIGTERM');
+    const hardKill = setTimeout(() => killProcessTree(child, 'SIGKILL'), 10_000);
     if (typeof hardKill.unref === 'function') hardKill.unref();
   };
 
@@ -270,9 +306,9 @@ export function armKillWatchdog(
 export function bindAbort(child: ChildProcessWithoutNullStreams, signal: AbortSignal, graceMs = 10_000): () => void {
   let killTimer: NodeJS.Timeout | null = null;
   const onAbort = () => {
-    try { child.kill('SIGTERM'); } catch { /* already gone */ }
+    killProcessTree(child, 'SIGTERM');
     killTimer = setTimeout(() => {
-      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      killProcessTree(child, 'SIGKILL');
     }, graceMs);
     if (typeof killTimer.unref === 'function') killTimer.unref();
   };

@@ -27,7 +27,10 @@ const log = createLogger('bash-permissions');
 
 export type BashDecision = 'allow_once' | 'allow_run' | 'deny';
 
-const RESPONSE_TIMEOUT_MS = 120 * 1000;
+// Human-in-the-loop confirmation window. Unanswered requests still deny, but
+// risky bash approvals can occur in the middle of a long agent run; 2 minutes
+// was too short for users who switch away before approving.
+const RESPONSE_TIMEOUT_MS = 10 * 60 * 1000;
 /** Renderer dialog command preview cap — the user must see what will run, but
  *  an unbounded command would bloat the push payload. */
 const COMMAND_PREVIEW_MAX = 800;

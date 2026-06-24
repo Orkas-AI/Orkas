@@ -21,8 +21,6 @@ import {
   setCodingProjectDir, setStatus,
 } from './state';
 import { isPlaceholderTitle } from './conv_title';
-import { findReadySteps, isPlanTerminal, readPlan, type PlanFile } from './plan';
-import * as planExecutor from './plan_executor';
 import {
   abort as busAbort, dropConv as busDropConv, enqueue, subscribe, isQuiescent, runtimeSnapshot,
   type GroupEvent,
@@ -37,7 +35,7 @@ export const busIsQuiescent = isQuiescent;
 export async function runtimeStatus(
   userId: string,
   cid: string,
-): Promise<{ processing: boolean; processing_since: string | null; in_flight: string[]; active_turns: Array<{ actor: string; turn_id: string }> }> {
+): Promise<{ processing: boolean; processing_since: string | null; in_flight: string[]; active_turns: Array<{ actor: string; turn_id: string }>; active_recipient?: string }> {
   if (!safeId(cid)) return { processing: false, processing_since: null, in_flight: [], active_turns: [] };
   try {
     const state = await readState(userId, cid);
@@ -45,10 +43,14 @@ export async function runtimeStatus(
     const diskInFlight = Array.isArray(state.in_flight)
       ? state.in_flight.filter(Boolean)
       : [];
+    // The conversation floor — included so a renderer reload / recovery poll
+    // restores the composer target (the agent the commander handed off to)
+    // instead of dropping back to the commander until the next state_changed.
+    const floor = state.active_recipient ? { active_recipient: state.active_recipient } : {};
     if ((state.status === 'running' || diskInFlight.length > 0) && !runtime.processing) {
       log.warn(`healing orphan running state user=${userId} cid=${cid} status=${state.status} in_flight=${diskInFlight.join(',')}`);
       await setStatus(userId, cid, 'idle');
-      return { processing: false, processing_since: null, in_flight: [], active_turns: [] };
+      return { processing: false, processing_since: null, in_flight: [], active_turns: [], ...floor };
     }
     const inFlight = Array.from(new Set([
       ...diskInFlight,
@@ -60,35 +62,11 @@ export async function runtimeStatus(
       processing_since: processing ? (state.last_active_at || null) : null,
       in_flight: inFlight,
       active_turns: runtime.activeTurns,
+      ...floor,
     };
   } catch {
     return { processing: false, processing_since: null, in_flight: [], active_turns: [] };
   }
-}
-
-export type PlanControlAction = 'stop' | 'continue' | null;
-export interface PlanControlState {
-  action: PlanControlAction;
-}
-
-function isPlanFullyCompleted(plan: PlanFile | null): boolean {
-  const steps = Array.isArray(plan?.steps) ? plan.steps : [];
-  return steps.length > 0 && steps.every((s) => s.status === 'done' || s.status === 'skipped');
-}
-
-async function planControlStateFor(
-  userId: string,
-  cid: string,
-  plan: PlanFile | null,
-): Promise<PlanControlState> {
-  if (!plan || !plan.steps?.length) return { action: null };
-  if (isPlanFullyCompleted(plan)) return { action: null };
-  const runtime = await runtimeStatus(userId, cid);
-  if (runtime.processing) return { action: 'stop' };
-  if (plan.steps.some((s) => s.status === 'failed')) return { action: 'continue' };
-  if (plan.steps.some((s) => s.status === 'in_progress')) return { action: 'continue' };
-  if (!isPlanTerminal(plan) && findReadySteps(plan).length > 0) return { action: 'continue' };
-  return { action: null };
 }
 
 /** Re-export so the IPC layer can subscribe to the bus BEFORE calling
@@ -158,7 +136,6 @@ export async function send(
 
 export async function abort(userId: string, cid: string): Promise<{ ok: boolean }> {
   await busAbort(userId, cid);
-  await planExecutor.failInProgressSteps(userId, cid, 'aborted by user');
   return { ok: true };
 }
 
@@ -190,98 +167,6 @@ export async function listMembers(userId: string, cid: string) {
     }
   }));
   return { ok: true, actors: enriched };
-}
-
-export async function readPlanForCid(
-  userId: string, cid: string,
-): Promise<{ ok: boolean; plan?: PlanFile | null; has_plan?: boolean; control?: PlanControlState; error?: string }> {
-  if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
-  const plan = await readPlan(userId, cid);
-  return {
-    ok: true,
-    plan: plan || null,
-    has_plan: !!plan,
-    control: await planControlStateFor(userId, cid, plan || null),
-  };
-}
-
-/** Plan-level continue action for the unified rail / task-details control. */
-export async function continuePlan(
-  userId: string, cid: string,
-): Promise<{ ok: boolean; error?: string }> {
-  if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
-  await clearAbortedStatusForRecovery(userId, cid);
-  return planExecutor.continuePlan(userId, cid);
-}
-
-/** User-initiated retry of a failed plan step (rail "Retry" button). */
-export async function retryStep(
-  userId: string, cid: string, stepIndex: number,
-): Promise<{ ok: boolean; error?: string }> {
-  if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
-  if (!Number.isFinite(stepIndex) || stepIndex < 1) return { ok: false, error: 'invalid stepIndex' };
-  await clearAbortedStatusForRecovery(userId, cid);
-  const result = await planExecutor.retryStep(userId, cid, stepIndex);
-  if (result.ok) _emitPlanSignal(userId, cid, stepIndex, 'retry');
-  return result;
-}
-
-/** User-initiated skip of a failed plan step (rail "Skip" button). */
-export async function skipStep(
-  userId: string, cid: string, stepIndex: number,
-): Promise<{ ok: boolean; error?: string }> {
-  if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
-  if (!Number.isFinite(stepIndex) || stepIndex < 1) return { ok: false, error: 'invalid stepIndex' };
-  await clearAbortedStatusForRecovery(userId, cid);
-  const result = await planExecutor.skipStep(userId, cid, stepIndex);
-  if (result.ok) _emitPlanSignal(userId, cid, stepIndex, 'skip');
-  return result;
-}
-
-/** Expert-signals hook (plan §5 mounts #2/#3) — read the plan to recover
- *  the agent_id assigned to this step + the source agent msg id, then emit
- *  retry/skip signal. Fire-and-forget; failures never block the IPC reply.
- *
- *  turn_id = `step.output_msg_id` (the agent msg this step produced).
- *  Per expert-signals plan §3.4 + types.ts Signal.turn_id doc: `turn_id` is
- *  the agent msg id this signal reacts to / is produced by. For retry/skip
- *  that's the source output being retried — letting consumers JOIN this
- *  signal against `skill_invoked` / `tool_failure` from the same agent
- *  turn. Previous design used synthetic `<cid>:plan:<step>` shared across
- *  every retry on the same step; the shared-id property is now recovered
- *  via `metadata.step_index` group-by (consumers count repeat retries
- *  there). When the step has no `output_msg_id` (rare — step in_progress
- *  with no output yet), the signal is dropped: a turn_id-less retry signal
- *  can't be attributed to a specific agent turn. */
-function _emitPlanSignal(uid: string, cid: string, stepIndex: number, kind: 'retry' | 'skip'): void {
-  (async () => {
-    try {
-      const plan = await readPlan(uid, cid);
-      const step = plan?.steps?.[stepIndex - 1];
-      const aid = (step && typeof (step as any).assignee === 'string') ? (step as any).assignee : '';
-      if (!aid) return;            // user-assignee or missing — no signal target
-      const turn_id = (step as any)?.output_msg_id;
-      if (!turn_id) return;        // no source agent msg id → drop (see fn doc)
-      const { emitSignal } = await import('../expert_signals');
-      const { buildRetrySignal, buildSkipSignal } = await import('../expert_signals/extractors/event');
-      emitSignal(uid, (kind === 'retry' ? buildRetrySignal : buildSkipSignal)({
-        cid, aid, turn_id, step_index: stepIndex,
-        msg_ids: [turn_id],
-      }));
-    } catch (err) {
-      log.warn(`expert-signals plan ${kind} emit failed cid=${cid} step=${stepIndex}: ${(err as Error).message}`);
-    }
-  })();
-}
-
-async function clearAbortedStatusForRecovery(userId: string, cid: string): Promise<void> {
-  try {
-    const state = await readState(userId, cid);
-    if (state.status === 'aborted') await setStatus(userId, cid, 'idle');
-  } catch {
-    // Recovery actions should still reach the plan executor even if the
-    // runtime status file is temporarily unavailable.
-  }
 }
 
 // ── Streaming events ─────────────────────────────────────────────────────
@@ -631,6 +516,12 @@ export async function resolveMarketplaceInstallRequest(
   ok: boolean;
   error?: string;
   request?: MarketplaceInstallRequest;
+  install_error?: {
+    kind?: MarketplaceInstallRequest['kind'];
+    id: string;
+    name: string;
+    reason: string;
+  };
   submission?: { text: string; agent_id: string };
 }> {
   const { userId, cid, msgId, requestId, decision } = input;
@@ -701,7 +592,7 @@ export async function resolveMarketplaceInstallRequest(
   } catch (err) {
     const installInfo = marketplace.getMarketplaceInstallErrorInfo(err);
     const failedKind = installInfo.kind || req.kind;
-    const failedName = installInfo.name || req.name || req.id;
+    const failedName = installInfo.name || (failedKind !== req.kind ? installInfo.id : '') || req.name || req.id;
     const failedKindLabel = failedKind === 'skill'
       ? t('marketplace_install_result.kind_skill')
       : t('marketplace_install_result.kind_agent');
@@ -715,6 +606,12 @@ export async function resolveMarketplaceInstallRequest(
     return {
       ok: true,
       request,
+      install_error: {
+        kind: failedKind,
+        id: installInfo.id || '',
+        name: failedName,
+        reason: installInfo.reason,
+      },
       submission: {
         text: _encodeMarketplaceInstallResult(request, 'failed', error),
         agent_id: COMMANDER_ID,

@@ -309,6 +309,131 @@ describe('local-tools › edit_file › onFileWritten', () => {
   });
 });
 
+// ── read-before-edit + optimistic concurrency control (G6) ────────────────
+// Enforcement is gated on a run-scoped `readFileState` map the runner injects
+// into ctx.state; the tests above run with `state: {}` (enforcement off), so
+// they exercise the pure edit logic. Here we inject the map (mirroring the
+// runner) and pin the read-before-edit + OCC behaviour.
+describe('local-tools › edit_file › read-before-edit + OCC', () => {
+  const READ_KEY = 'readFileState';
+
+  // A ctx carrying the run-scoped read-state map → enforcement ON. The same
+  // ctx is reused across calls in a test so the read baseline survives, exactly
+  // as it does across LLM rounds in a real run.
+  function runCtx(): any {
+    return { workingDir: '.', signal: undefined, state: { [READ_KEY]: new Map() } };
+  }
+
+  async function buildReadTool() {
+    const fileTools = await import('../../../../src/main/model/core-agent/file-tools');
+    const tools = fileTools.createFileTools({ userId: UID, cid: CID });
+    const read = tools.find((t) => t.name === 'read_file');
+    if (!read) throw new Error('read_file tool missing');
+    return read;
+  }
+
+  it('rejects an edit when the file was never read this run (E_NOT_READ)', async () => {
+    await grant();
+    const { edit, wsDir } = await buildEditTool();
+    const p = path.join(wsDir, 'a.md');
+    fs.writeFileSync(p, 'hello world');
+    const r = await edit.execute({ path: p, old_string: 'hello', new_string: 'hi' }, runCtx());
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_NOT_READ');
+    expect(fs.readFileSync(p, 'utf8')).toBe('hello world'); // untouched
+  });
+
+  it('allows the edit after read_file stamps the baseline, end to end', async () => {
+    await grant();
+    const { edit, wsDir } = await buildEditTool();
+    const read = await buildReadTool();
+    const p = path.join(wsDir, 'a.md');
+    fs.writeFileSync(p, '# T\n\nhello world\n');
+    const ctx = runCtx();
+    const rr = await read.execute({ path: p }, ctx);
+    expect(rr.isError).toBeFalsy();
+    const r = await edit.execute({ path: p, old_string: 'hello world', new_string: 'goodbye' }, ctx);
+    expect(r.isError).toBeFalsy();
+    expect(fs.readFileSync(p, 'utf8')).toContain('goodbye');
+  });
+
+  it('rejects a stale edit when the file changed since the read (E_STALE)', async () => {
+    await grant();
+    const { edit, wsDir } = await buildEditTool();
+    const read = await buildReadTool();
+    const p = path.join(wsDir, 'a.md');
+    fs.writeFileSync(p, 'hello world');
+    const ctx = runCtx();
+    await read.execute({ path: p }, ctx); // stamps baseline
+    fs.writeFileSync(p, 'hello brave new world'); // another writer changes it (size differs)
+    const r = await edit.execute({ path: p, old_string: 'hello', new_string: 'hi' }, ctx);
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_STALE');
+  });
+
+  it('allows a second consecutive edit without re-reading (post-edit stamp refresh)', async () => {
+    await grant();
+    const { edit, wsDir } = await buildEditTool();
+    const read = await buildReadTool();
+    const p = path.join(wsDir, 'a.md');
+    fs.writeFileSync(p, 'one two three');
+    const ctx = runCtx();
+    await read.execute({ path: p }, ctx);
+    const r1 = await edit.execute({ path: p, old_string: 'one', new_string: 'ONE' }, ctx);
+    expect(r1.isError).toBeFalsy();
+    const r2 = await edit.execute({ path: p, old_string: 'three', new_string: 'THREE' }, ctx);
+    expect(r2.isError).toBeFalsy();
+    expect(fs.readFileSync(p, 'utf8')).toBe('ONE two THREE');
+  });
+
+  it('write_file stamps, so a follow-up edit needs no intervening read', async () => {
+    await grant();
+    const { write, wsDir } = await buildWriteTool();
+    const localTools = await import('../../../../src/main/model/core-agent/local-tools');
+    const tools = localTools.createLocalTools({ userId: UID, cid: CID });
+    const edit = tools.find((t) => t.name === 'edit_file')!;
+    const p = path.join(wsDir, 'fresh.md');
+    const ctx = runCtx();
+    const w = await write.execute({ path: p, content: 'alpha beta' }, ctx);
+    expect(w.isError).toBeFalsy();
+    const r = await edit.execute({ path: p, old_string: 'alpha', new_string: 'ALPHA' }, ctx);
+    expect(r.isError).toBeFalsy();
+    expect(fs.readFileSync(p, 'utf8')).toBe('ALPHA beta');
+  });
+
+  it('serializes concurrent edits to the same file — the loser sees E_STALE, no lost update', async () => {
+    await grant();
+    const { edit, wsDir } = await buildEditTool();
+    const p = path.join(wsDir, 'shared.md');
+    const original = 'AAA and BBB';
+    fs.writeFileSync(p, original);
+
+    // Two SEPARATE runs (distinct maps) that both read the original, then race
+    // to edit. The per-file lock serializes them; OCC makes the second observe
+    // the first's write and bail, instead of clobbering it.
+    const seed = () => {
+      const ctx = runCtx();
+      const st = fs.statSync(p);
+      (ctx.state[READ_KEY] as Map<string, any>).set(p, { mtimeMs: st.mtimeMs, size: st.size });
+      return ctx;
+    };
+    const [r1, r2] = await Promise.all([
+      edit.execute({ path: p, old_string: 'AAA', new_string: 'aaa' }, seed()),
+      edit.execute({ path: p, old_string: 'BBB', new_string: 'bbb' }, seed()),
+    ]);
+
+    const results = [r1, r2];
+    const errs = results.filter((r) => r.isError);
+    expect(errs.length).toBe(1);
+    expect(errs[0].content).toContain('E_STALE');
+    // Exactly one edit landed; the file is no longer the original and the loser's
+    // change was NOT silently lost-updated over the winner's.
+    const after = fs.readFileSync(p, 'utf8');
+    expect(after).not.toBe(original);
+    expect(after === 'aaa and BBB' || after === 'AAA and bbb').toBe(true);
+  });
+});
+
 // ── create_artifact ──────────────────────────────────────────────────────
 // Deep input validation lives in `chat_artifacts.test.ts`; here we pin the
 // runner-side wiring: the gate, the cid+sink presence condition, the

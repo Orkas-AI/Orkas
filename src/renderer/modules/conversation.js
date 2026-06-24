@@ -2,11 +2,57 @@ const _convLog = createLogger('conversation');
 let _conversationInlineRenameCid = null;
 let _conversationHeaderRenameCid = null;
 const _conversationExpandedBuckets = new Set();
+const _modelOutputIssueKeys = new Set();
 
 function _convTrackClick(action, data) {
+  void 0;
 }
 
 function _convTrackEvent(action, data) {
+  void 0;
+}
+
+function _convTrackError(action, data) {
+  void 0;
+}
+
+function _trimTelemetryText(value, max) {
+  const text = _normalizeFeedbackFieldText(value);
+  const limit = Math.max(0, Number(max) || 0);
+  if (!text || limit <= 0 || text.length <= limit) return text;
+  return text.slice(0, limit) + '...';
+}
+
+function _noteModelOutputIssue(cid, msgDiv, rawError, extra) {
+  extra = extra || {};
+  if (extra && extra.aborted) return;
+  const errorMessage = _trimTelemetryText(rawError || 'unknown error', 800);
+  if (!errorMessage || /^aborted$/i.test(errorMessage)) return;
+
+  const conversationId = String(cid || currentCid || '');
+  const messageId = msgDiv ? String(msgDiv.dataset.msgId || '') : '';
+  const turnId = msgDiv ? String(msgDiv.dataset.turnId || '') : '';
+  const actorId = String(
+    (extra && extra.actor_id)
+    || (msgDiv && (msgDiv.dataset.fromActor || msgDiv.dataset.from))
+    || '',
+  );
+  const stage = String((extra && extra.stage) || 'stream');
+  const key = [conversationId, messageId, turnId, actorId, stage, errorMessage].join('|');
+  if (_modelOutputIssueKeys.has(key)) return;
+  if (_modelOutputIssueKeys.size > 1000) _modelOutputIssueKeys.clear();
+  _modelOutputIssueKeys.add(key);
+
+  _convTrackError('model_output', {
+    conversation_id: conversationId,
+    message_id: messageId,
+    turn_id: turnId,
+    actor_id: actorId,
+    actor: actorId ? (_groupActorLabel(actorId) || actorId) : '',
+    error_type: String((extra && extra.error_type) || 'model_output'),
+    error_message: errorMessage,
+    stage,
+  });
 }
 
 function _uiIconHtml(name, className) {
@@ -93,6 +139,28 @@ function _isFailedAssistantContent(rawContent, message = null) {
     || /color\s*:\s*var\(--danger\)/i.test(raw)
     || /style=["'][^"']*var\(--danger\)/i.test(raw)
     || /(?:模型调用失败|model\s+(?:call|invocation)\s+failed)/i.test(raw);
+}
+
+function _normalizeFeedbackFieldText(value) {
+  return String(value == null ? '' : value)
+    .replace(/\r\n?/g, '\n')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function _tailFeedbackText(value, max) {
+  const text = _normalizeFeedbackFieldText(value);
+  const limit = Math.max(0, Number(max) || 0);
+  if (!text || limit <= 0) return '';
+  if (text.length <= limit) return text;
+  return text.slice(text.length - limit);
+}
+
+function _buildFailedAssistantFeedbackContent(details, max = 300) {
+  const errorText = _normalizeFeedbackFieldText(details && details.errorText);
+  const replyText = _normalizeFeedbackFieldText(details && details.replyText);
+  return _tailFeedbackText([replyText, errorText].filter(Boolean).join('\n'), max);
 }
 
 function _skillsForDisplayNameRewrite() {
@@ -365,6 +433,17 @@ let _newChatRecipient = { ..._COMMANDER }; // ephemeral, reset on view-enter
 let _pendingNewChatRecipient = null;        // captured at send time, transferred to new cid
 let _projectChatRecipient = { ..._COMMANDER }; // ephemeral recipient for project detail composer
 const _autoRecipientByCid = new Map(); // cid → transient agent recipient while plan waits on user input
+// The conversation "floor": server-authoritative `StateFile.active_recipient`,
+// mirrored here from every `state_changed` event. The commander sets it via
+// `hand_off_to` (model-decided); the agent's `<handback />`, the user's
+// `@commander`, or the picker's return-to-commander reset it. This is the SINGLE
+// source of truth for "who the user is talking to" — `_evaluateAutoRecipient`
+// derives the composer target from it instead of guessing client-side.
+const _serverFloorByCid = new Map();   // cid → agent id ('' / absent ⇒ commander)
+// One-shot: the user picked "commander" in the composer while an agent held the
+// floor. The next send injects `@commander` (the server parses it and resets the
+// floor); the auto-target evaluation respects this until the reset is confirmed.
+const _pendingFloorResetByCid = new Set();
 
 function _loadRecipientMap() {
   try {
@@ -414,10 +493,9 @@ function _onRecipientChanged(_target) { /* reserved for future hooks */ }
 /** When the active project's bindings change (commander chip → switch
  *  project, or project rename/binding edit while a chat is open), the
  *  current recipient may no longer be a valid agent for the new scope.
- *  Reset to commander silently — the user will see the chip flip and the
- *  recipient picker collapse to commander-only on next open. Called from
- *  `projects.js` post project-pick. No-op for `commander` recipients and
- *  for orphan contexts (pid empty). */
+ *  Reset to commander silently — the user will see the chip flip on next
+ *  render. Called from `projects.js` post project-pick. No-op for `commander`
+ *  recipients and for orphan contexts (pid empty). */
 async function validateRecipientAgainstProject(target, pid) {
   const cur = _activeRecipient(target);
   if (!cur || cur.kind !== 'agent') return;
@@ -446,19 +524,18 @@ function setChatRecipient(target, next, _opts = {}) {
       else _autoRecipientByCid.delete(currentCid);
     } else {
       _autoRecipientByCid.delete(currentCid);
-      if (r.kind === 'commander') delete _recipientByCid[currentCid];
-      else _recipientByCid[currentCid] = r;
+      if (r.kind === 'commander') {
+        delete _recipientByCid[currentCid];
+        // Returning to the commander while an agent holds the floor: arm a
+        // one-shot `@commander` on the next send so the server resets the floor
+        // (the model-owned floor can only be moved by a routed message).
+        if (_serverFloorByCid.get(currentCid)) _pendingFloorResetByCid.add(currentCid);
+      } else {
+        _recipientByCid[currentCid] = r;
+        _pendingFloorResetByCid.delete(currentCid);
+      }
       _saveRecipientMap();
     }
-  }
-  if (r.kind === 'agent' && typeof setChatUseSelection === 'function') {
-    // Switching INTO an agent clears any pending use chip. This keeps an
-    // open-tier (global / external-package) skill chip — pickable only while
-    // on the commander — from being carried into agent execution, which would
-    // run it via orkas_run_skill and break the open-tier commander-only rule.
-    // Picking a (trusted) skill while already on the agent is unaffected: that
-    // path never calls setChatRecipient.
-    setChatUseSelection(target, null, { focus: false });
   }
   _renderRecipientChip(target);
   _onRecipientChanged(target);
@@ -586,14 +663,10 @@ let _emptyStateAccountStatus = null;
 let _emptyStateAccountSubBound = false;
 function _ensureEmptyStateAccountSub() {
   _emptyStateAccountSubBound = true;
+  _emptyStateAccountStatus = null;
 }
 function _emptyStateUserDisplayName() {
-  const u = (_emptyStateAccountStatus && _emptyStateAccountStatus.userInfo) || null;
-  if (!u) return '';
-  // Prefer nickname; fall back to the email local-part so the greeting never
-  // shows a full email address (privacy + visual).
-  const raw = String(u.nickname || u.email || '').trim();
-  return raw.split('@')[0].trim();
+  return '';
 }
 function _refreshEmptyStateGreeting() {
   const el = document.getElementById('new-chat-greeting');
@@ -827,16 +900,11 @@ function onEnterConversationView() {
   // renders is preserved (the auto-expand does not run inside
   // renderProjectsSection — see comments in projects.js).
   if (typeof autoExpandActiveConvProject === 'function') autoExpandActiveConvProject();
-  // Kick a one-shot evaluation so that a cid mid-plan picks up its current
-  // interactive assignee even if no plan_changed/state_changed event fires
+  // Kick a one-shot evaluation so that a cid with a live interactive agent
+  // picks it up as the composer target even if no state_changed event fires
   // before the user types. View-enter never reverts to commander (see
   // `_evaluateAutoRecipient`); the persisted per-cid pick stays sticky.
   if (currentCid) _evaluateAutoRecipient(currentCid);
-  // Bind the plan rail to the active cid on EVERY conversation-view enter,
-  // including the `skipLoad: true` path used by fresh conversations (where
-  // loadConversationHistory is intentionally skipped). Without this hook,
-  // the rail would keep displaying the previous cid's plan content.
-  if (window.PlanRail) window.PlanRail.bind(currentCid || null);
   if (window.ConversationInfo) window.ConversationInfo.bind(currentCid || null);
   // Returning to a conversation while its original send-stream is still
   // alive can miss state/process events that fired while another view was
@@ -866,9 +934,10 @@ function _forgetCidRecipient(cid) {
     _saveRecipientMap();
   }
   _autoRecipientByCid.delete(cid);
+  _serverFloorByCid.delete(cid);
+  _pendingFloorResetByCid.delete(cid);
   setGroupConversationBusy(cid, false);
   _latestInFlight.delete(cid);
-  _lastInteractiveTurnAgent.delete(cid);
   _clearBackgroundGroupEvents(cid);
   const infoTimer = _conversationInfoFileRefreshTimers.get(cid);
   if (infoTimer) clearTimeout(infoTimer);
@@ -877,26 +946,16 @@ function _forgetCidRecipient(cid) {
   _quoteByCid.delete(cid);
 }
 
-// ─── Auto-recipient: route genuine human-in-loop plan pauses ─────────────
-// Goal: when an `interactive: true` agent is actively talking with the user,
-// keep the input box pointed at that agent so the user's next reply lands
-// there without manual @-mention. This is transient UI state only: it does
-// not overwrite the user's persisted recipient pick, and it clears once the
-// interactive thread is no longer the live/default target.
+// ─── Auto-recipient: route genuine human-in-loop interactive threads ─────
+// Goal: when an agent holds the conversation floor (the commander handed off to
+// it via `hand_off_to`), keep the composer pointed at that agent so the user's
+// next reply lands there without a manual @-mention. The floor is server state
+// (`_serverFloorByCid`); `_evaluateAutoRecipient` mirrors it into the composer
+// target. Transient UI state only — it does not overwrite the user's explicit
+// pick, and it clears when the server resets the floor.
 //
-// Concurrency notes:
-//   - Multiple blocked interactive steps → take the latest plan index
-//     ("most recently blocked" matches user intent in linear chains; in true
-//     fan-out interactive pauses are a degenerate case the user can correct
-//     manually).
-//   - Re-entrancy guarded by `_autoEvalInflight` so back-to-back plan_changed
-//     + state_changed events coalesce into one fetch round.
-//   - A live in-flight interactive agent wins even before it reaches a blocked
-//     state. Otherwise the chip flashes back to commander between "send to
-//     StudyTutor" and StudyTutor's turn-end reply.
-//   - `interactive: true` alone is not enough. A plan step that simply runs to
-//     `done` produced output, but it did not ask the user anything; auto-
-//     routing those replies makes the composer feel like it guessed wrong.
+// Concurrency: re-entrancy guarded by `_autoEvalInflight` so back-to-back
+// state_changed events coalesce.
 const _autoEvalInflight = new Set(); // cid set
 const _latestInFlight = new Map();   // cid → string[] (mirrors state_changed.state.in_flight)
 const _runtimeRecoveryTimers = new Map(); // cid → timeout id
@@ -906,11 +965,6 @@ const _groupEventDedupe = new Map();     // cid → recently handled visible gro
 const _backgroundGroupEventBuffers = new Map(); // cid → GroupEvent[] captured while another cid owns the DOM
 const _backgroundGroupEventKeys = new Map();    // cid → stable keys already buffered
 const _conversationInfoFileRefreshTimers = new Map(); // cid → timeout id
-// cid → most recent agent that completed a non-plan interactive turn. The
-// final pick still validates against enriched members (`interactive: true`);
-// storing the id here before member enrichment catches fast dispatch→reply
-// paths where the local members cache is still the raw on-disk roster.
-const _lastInteractiveTurnAgent = new Map();
 const GROUP_EVENT_DEDUPE_LIMIT = 600;
 const BACKGROUND_GROUP_EVENT_BUFFER_LIMIT = 1200;
 
@@ -988,7 +1042,9 @@ function _backgroundGroupEventDedupeKey(evData) {
     const active = Array.isArray(evData.active_turns)
       ? evData.active_turns.map((t) => `${t?.actor || ''}:${t?.turn_id || t?.turnId || ''}`).join(',')
       : '';
-    return `state:${st.status || ''}:${inFlight}:${active}`;
+    // Include the floor so a pure hand-off / hand-back (active_recipient flips
+    // but status + in_flight are unchanged) isn't deduped away.
+    return `state:${st.status || ''}:${inFlight}:${active}:${st.active_recipient || ''}`;
   }
   if (evData.type === 'member_joined') return `member:${evData.actor?.id || ''}`;
   if (evData.type === 'aborted') return 'aborted';
@@ -1158,14 +1214,8 @@ async function _syncPendingActorsFromRuntime(cid, opts = {}) {
   const hasActiveTurnsField = Array.isArray(data.active_turns);
   const activeTurns = _normaliseActiveTurns(data.active_turns);
   const processing = data.processing === true || inFlight.length > 0 || activeTurns.length > 0;
-  if (window.PlanRail) {
-    try {
-      window.PlanRail.setInFlight(cid, inFlight);
-      window.PlanRail.refresh(cid, { force: true });
-    } catch (_) {}
-  }
   if (window.ConversationInfo) {
-    try { window.ConversationInfo.refreshTasks(cid, { silent: true }); } catch (_) {}
+    try { window.ConversationInfo.refreshFiles(cid, { silent: true }); } catch (_) {}
   }
   if (!processing) {
     _stopGroupEventObserver(cid);
@@ -1191,6 +1241,8 @@ async function _syncPendingActorsFromRuntime(cid, opts = {}) {
 
   setGroupConversationBusy(cid, true);
   _latestInFlight.set(cid, inFlight);
+  _serverFloorByCid.set(cid, typeof data.active_recipient === 'string' ? data.active_recipient : '');
+  if (cid === currentCid) _evaluateAutoRecipient(cid);
   _updateConvSidebarBadge(cid, true);
   startPolling(cid);
   if (cid === currentCid) _updateConvSendUI(cid);
@@ -1269,16 +1321,14 @@ async function _evaluateAutoRecipient(cid) {
   if (_autoEvalInflight.has(cid)) return;
   _autoEvalInflight.add(cid);
   try {
-    // Fetch members + plan in parallel. Members carry the per-agent
-    // `interactive` flag (server enriches in `groupChat.listMembers`).
-    const [members, plan] = await Promise.all([
-      _refreshGroupMembers(cid),
-      _fetchPlanForAutoRecipient(cid),
-    ]);
-    if (cid !== currentCid) return; // user navigated away mid-fetch
-    const inFlight = _latestInFlight.get(cid) || [];
-    const interactiveAgent = _pickInteractiveAgent(plan, members || [], inFlight);
-    if (!interactiveAgent) {
+    // Server-authoritative floor: the composer target is whatever the server's
+    // `active_recipient` says (set by the commander's `hand_off_to`), NOT a
+    // client-side guess. Empty / commander → clear the auto-target (chip falls
+    // back to commander or the user's explicit pick).
+    // A pending floor-reset (user chose to return to commander) suppresses the
+    // floor until the next send confirms it server-side.
+    const floorId = _pendingFloorResetByCid.has(cid) ? '' : (_serverFloorByCid.get(cid) || '');
+    if (!floorId) {
       if (_autoRecipientByCid.has(cid)) {
         _autoRecipientByCid.delete(cid);
         _renderRecipientChip('conversation');
@@ -1286,9 +1336,15 @@ async function _evaluateAutoRecipient(cid) {
       return;
     }
     const cur = _activeRecipient('conversation');
-    if (cur.kind === 'agent' && cur.id === interactiveAgent.id) return;
+    if (cur.kind === 'agent' && cur.id === floorId) return;
+    // Resolve a display name for the floor agent (roster label, then registry).
+    let name = _knownGroupActorLabel(cid, floorId) || '';
+    if (!name && typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
+      const a = _agentsCache.find((x) => x && x.agent_id === floorId);
+      if (a && a.name) name = a.name;
+    }
     setChatRecipient('conversation',
-      { kind: 'agent', id: interactiveAgent.id, name: interactiveAgent.name },
+      { kind: 'agent', id: floorId, name: name || floorId },
       { auto: true });
   } catch (err) {
     _convLog?.warn?.('auto-recipient evaluate failed', err);
@@ -1349,104 +1405,83 @@ if (typeof window !== 'undefined') {
   }
 }
 
-async function _fetchPlanForAutoRecipient(cid) {
-  try {
-    const res = await apiFetch(`/api/conversations/${cid}/plan`);
-    const data = await res.json();
-    if (data?.ok && data.plan && Array.isArray(data.plan.steps)) return data.plan;
-    if (data?.ok && data.has_plan === true) return { steps: [], completed: true };
-  } catch (_) { /* best-effort */ }
-  return null;
-}
-
-function _pickInteractiveAgent(plan, members, inFlight) {
-  // Commander mid-turn → don't auto-switch to an agent (commander's reply is
-  // about to land); leave the persisted recipient as-is.
-  if (Array.isArray(inFlight) && inFlight.includes('commander')) return null;
-
-  const byName = new Map();
-  const byId = new Map();
-  for (const m of members) {
-    if (m && m.kind === 'agent') {
-      if (m.name) byName.set(m.name, m);
-      if (m.id) byId.set(m.id, m);
-    }
-  }
-  const isReserved = (a) => a === 'commander' || a === '指挥官';
-  const isUser = (a) => a === 'user' || a === '用户';
-  const lookup = (a) => byName.get(a) || byId.get(a);
-
-  // Phase 0 — any interactive agent in flight right now (covers direct
-  // user→agent replies via the recipient chip / @-mention, and plan steps
-  // that are still running). Last-wins among interactive in-flight agents; a
-  // non-interactive live agent should not steal the composer.
-  if (Array.isArray(inFlight) && inFlight.length) {
-    let livePick = null;
-    let nonInteractive = false;
-    for (const id of inFlight) {
-      if (isReserved(id) || isUser(id)) continue;
-      const actor = lookup(id);
-      if (!actor) continue;
-      if (actor.interactive === true) livePick = actor;
-      else nonInteractive = true;
-    }
-    if (livePick) return livePick;
-    if (nonInteractive) return null;
-  }
-
-  if (!plan || !Array.isArray(plan.steps)) {
-    const noLiveTurn = !Array.isArray(inFlight) || inFlight.length === 0;
-    const stickyId = currentCid && noLiveTurn ? _lastInteractiveTurnAgent.get(currentCid) : '';
-    const actor = stickyId ? lookup(stickyId) : null;
-    return actor && actor.interactive === true ? actor : null;
-  }
-
-  if (plan.completed === true || plan.steps.length === 0) return null;
-
-  // Only a blocked agent step represents a real human-in-loop wait. Running
-  // and terminal steps may involve an interactive-capable agent, but no user
-  // input is currently required, so the composer should stay on the manual
-  // recipient / commander.
-  let blockedPick = null;
-  for (const s of plan.steps) {
-    if (s.status !== 'blocked') continue;
-    const a = String(s.assignee || '').trim();
-    if (isReserved(a)) return null;
-    if (isUser(a)) continue;
-    const actor = lookup(a);
-    if (actor && actor.interactive === true) blockedPick = actor;
-  }
-  return blockedPick;
-}
-
-function _rememberInteractiveTurnCandidate(cid, gm) {
-  if (!cid || !gm) return;
-  const from = String(gm.from || '');
-  if (!from || from === 'user' || from === 'commander') {
-    _lastInteractiveTurnAgent.delete(cid);
-    return;
-  }
-  _lastInteractiveTurnAgent.set(cid, from);
-}
-
-function _restoreInteractiveTurnCandidateFromHistory(cid, messages) {
-  if (!cid || !Array.isArray(messages)) return;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const gm = messages[i];
-    if (!gm || gm.dispatch) continue;
-    _rememberInteractiveTurnCandidate(cid, gm);
-    return;
-  }
-  _lastInteractiveTurnAgent.delete(cid);
-}
-
 // Strip a leading `@<name>` token so the mention regex matches the bus
 // router's charset. Used to detect whether the user already typed an
 // @-prefix that would route somewhere.
 const _LEADING_MENTION_RE = /^@([A-Za-z0-9_一-鿿-]+)\s?/u;
 
-function applyRecipientPrefix(raw, target) {
-  const r = _activeRecipient(target || 'conversation');
+function _normaliseRecipientSnapshot(snapshot) {
+  const r = _normRecipient(snapshot);
+  if (!r) return null;
+  return {
+    ...r,
+    resetFloor: snapshot && snapshot.resetFloor === true,
+  };
+}
+
+function _recipientSnapshotForSend(target) {
+  const tg = target || 'conversation';
+  const r = _activeRecipient(tg);
+  const snap = _normaliseRecipientSnapshot(r) || { ..._COMMANDER, resetFloor: false };
+  snap.resetFloor = tg === 'conversation'
+    && !!currentCid
+    && _pendingFloorResetByCid.has(currentCid);
+  return snap;
+}
+
+function _takeRecipientSnapshotForSend(target) {
+  const tg = target || 'conversation';
+  const snap = _recipientSnapshotForSend(tg);
+  if (tg === 'conversation' && currentCid && snap.resetFloor) {
+    _pendingFloorResetByCid.delete(currentCid);
+  }
+  return snap;
+}
+
+function _recipientPrefixName(r) {
+  if (!r || r.kind !== 'agent' || !r.id) return '';
+  let display = '';
+  if (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
+    const a = _agentsCache.find((x) => x && x.agent_id === r.id);
+    if (a && a.name) display = a.name;
+  }
+  return display || r.name || r.id;
+}
+
+function _applyRecipientPrefixWithSnapshot(raw, snapshot) {
+  const text = String(raw || '');
+  const snap = _normaliseRecipientSnapshot(snapshot);
+  if (!snap) return raw;
+  if (snap.resetFloor) {
+    if (_LEADING_MENTION_RE.exec(text)) return text;
+    const sep = /^>/.test(text) ? '\n' : ' ';
+    return '@commander' + sep + text;
+  }
+  if (snap.kind !== 'agent' || !snap.id) return raw;
+  if (_LEADING_MENTION_RE.exec(text)) return text;
+  const display = _recipientPrefixName(snap);
+  if (!display) return raw;
+  const sep = /^>/.test(text) ? '\n' : ' ';
+  return '@' + String(display) + sep + text;
+}
+
+function applyRecipientPrefix(raw, target, opts = {}) {
+  if (opts && opts.recipientSnapshot) {
+    return _applyRecipientPrefixWithSnapshot(raw, opts.recipientSnapshot);
+  }
+  const tg = target || 'conversation';
+  const text0 = String(raw || '');
+  // One-shot floor reset: user returned to the commander while handed off.
+  // Inject `@commander` so the server resets the floor, then disarm.
+  if (tg === 'conversation' && currentCid && _pendingFloorResetByCid.has(currentCid)) {
+    _pendingFloorResetByCid.delete(currentCid);
+    if (!_LEADING_MENTION_RE.exec(text0)) {
+      const sep = /^>/.test(text0) ? '\n' : ' ';
+      return '@commander' + sep + text0;
+    }
+    return text0;
+  }
+  const r = _activeRecipient(tg);
   if (r.kind !== 'agent' || !r.id) return raw;
   const text = String(raw || '');
   if (_LEADING_MENTION_RE.exec(text)) return text;
@@ -1455,12 +1490,7 @@ function applyRecipientPrefix(raw, target) {
   // outgoing `@<token>` would still carry the old name. Fall back to the
   // snapshot when the registry doesn't know the agent (deleted), then to
   // the id as last resort.
-  let display = '';
-  if (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
-    const a = _agentsCache.find((x) => x && x.agent_id === r.id);
-    if (a && a.name) display = a.name;
-  }
-  if (!display) display = r.name || r.id;
+  const display = _recipientPrefixName(r);
   const tag = '@' + String(display);
   // When the raw body starts with a blockquote (e.g. the quote-reply prefix
   // injected by applyQuotePrefix), use a newline separator so the @-mention
@@ -1525,7 +1555,7 @@ function _actorLinkAttrs(fromId) {
 async function _openActorAgentDetail(actorId) {
   const aid = String(actorId || '').trim();
   if (!_isAgentActor(aid)) return;
-  setView('agents');
+    setView('agents');
   try {
     const res = await apiFetch(`/api/agents/${encodeURIComponent(aid)}`);
     const data = await res.json();
@@ -2022,6 +2052,8 @@ function _chatAttachHostIdFor(cid) {
   if (cid && cid === currentCid) return 'chat-attachments';
   if (typeof cid === 'string' && cid.startsWith('agent-edit-')) return 'agents-chat-attachments';
   if (typeof cid === 'string' && cid.startsWith('skill-edit-')) return 'skills-chat-attachments';
+  // Per-project commander draft pool (KB "ask the commander about this file").
+  if (typeof cid === 'string' && cid.startsWith('projchat-')) return 'project-chat-attachments';
   return null;
 }
 
@@ -2354,6 +2386,38 @@ window.addChatAttachmentsFromPaths = async function addChatAttachmentsFromPaths(
   return _chatAttachImportPaths(cid || currentCid, entries, 'external_import');
 };
 
+// Add an already-imported attachment (from a KB "ask the commander about this
+// file" action) to a draft pool's chips. The file is imported server-side into
+// the draft cid's pool; here we just surface it as a ready chip.
+function _addReadyDraftAttachment(cid, info) {
+  if (!info || !info.name) return;
+  const items = _chatAttachList(cid).slice();
+  items.push({
+    name: info.name,
+    displayName: info.displayName || info.name,
+    kind: info.kind,
+    bytes: info.bytes,
+    dataUrl: (info.kind === 'image' || info.kind === 'video') ? _chatMediaUrl(cid, info.name) : null,
+    reused: !!info.reused,
+    status: 'ready',
+  });
+  _chatAttachSet(cid, items);
+}
+
+// Exposed for the KB "ask the commander about this file" menu actions
+// (contexts.js / project-detail.js). Imports the KB file into `draftCid`'s pool
+// server-side via `channel`, runs `afterNavigate` (navigation must happen BEFORE
+// the chip render so it lands in the now-visible composer), then surfaces the
+// draft chip. No conversation is created — the user's first message creates it
+// and adopts the draft attachments.
+window.COMMANDER_DRAFT_CID = DRAFT_CID;
+window.attachKbFileToDraft = async function attachKbFileToDraft(channel, payload, draftCid, afterNavigate) {
+  const data = await window.orkas.invoke(channel, { ...(payload || {}), cid: draftCid });
+  if (!data || !data.ok) throw new Error((data && data.error) || 'failed');
+  if (typeof afterNavigate === 'function') afterNavigate();
+  _addReadyDraftAttachment(draftCid, data.info);
+};
+
 async function _chatAttachRefreshFromServer(cid) {
   try {
     const res = await apiFetch(`/api/conversations/${encodeURIComponent(cid)}/attachments`);
@@ -2521,7 +2585,7 @@ function _hydrateMessageCreatedAgentChip(msgDiv) {
     chip.addEventListener('click', async () => {
       const aid = chip.dataset.agentId;
       if (!aid) return;
-      setView('agents');
+            setView('agents');
       // Pre-check the agent is still loadable; if it was deleted (or its
       // record is broken) the detail view would render an empty shell —
       // bail to the grid instead.
@@ -2561,7 +2625,7 @@ function _hydrateMessageCreatedSkillChip(msgDiv) {
     chip.addEventListener('click', async () => {
       const sid = chip.dataset.skillId;
       if (!sid) return;
-      setView('skills');
+            setView('skills');
       // Pre-check SKILL.md is readable; covers both "skill was deleted" and
       // "skill row exists but its files are missing" (entering the detail
       // would render a 'file not found' shell otherwise).
@@ -2777,7 +2841,7 @@ async function loadConversations() {
     }
   } catch (e) {
     _convLog.error('load conversations failed', e);
-  }
+      }
 }
 
 let _relayActivityWatchStarted = false;
@@ -3377,7 +3441,7 @@ function _ensureConvCreateAgentInline() {
     btn.textContent = t('chat.create_agent_inline');
     btn.addEventListener('click', () => {
       if (!currentCid) return;
-      const input = document.getElementById('chat-input');
+            const input = document.getElementById('chat-input');
       if (!input) return;
       input.value = t('chat.create_agent_message');
       autoGrow(input, 200);
@@ -3449,8 +3513,6 @@ async function loadConversationHistory(cid, opts = {}) {
     container.innerHTML = `<div class="empty">${escapeHtml(t('chat.loading'))}</div>`;
   }
   _ensureCreateAgentInlineObserver();
-  // (Plan rail bind happens in onEnterConversationView — covers both this
-  // load path AND the skipLoad freshly-created-conv path.)
   try {
     // Warm `_agentsCache` if a chat-first session never visited the agents
     // tab — `_buildMentionRe` / `_groupActorLabel` both read it for current
@@ -3472,6 +3534,8 @@ async function loadConversationHistory(cid, opts = {}) {
     ]);
     const data = await res.json();
     if (!data.ok) throw new Error(data.error || 'load failed');
+    const convMeta = data.conversation || {};
+    _serverFloorByCid.set(cid, typeof convMeta.active_recipient === 'string' ? convMeta.active_recipient : '');
     // History reload: drop ALL per-actor placeholder map entries — the
     // `container.innerHTML=''` below detaches every placeholder DOM node,
     // including the ones for this cid. Keeping `${cid}:*` entries leaves
@@ -3492,7 +3556,6 @@ async function loadConversationHistory(cid, opts = {}) {
     // the dispatch text in its own context.
     const visibleGroupHistory = (data.history || [])
       .filter((gm) => !(gm && gm.dispatch));
-    _restoreInteractiveTurnCandidateFromHistory(cid, visibleGroupHistory);
     const history = visibleGroupHistory
       .map(_groupMsgToLegacy)
       // Defensive sort by ts: jsonl is append-ordered (already chronological),
@@ -3505,7 +3568,7 @@ async function loadConversationHistory(cid, opts = {}) {
       container.innerHTML = '';
       history.forEach((msg, idx) => appendChatMessage(msg, false, { cid, msgIndex: idx }));
     }
-    _evaluateAutoRecipient(cid);
+    await _evaluateAutoRecipient(cid);
 
     // Detect unanswered user message (e.g. after page refresh while server was processing).
     // Only show the "thinking…" bubble if the server *really* still has this
@@ -3513,7 +3576,6 @@ async function loadConversationHistory(cid, opts = {}) {
     // `processing: true` from a crashed prior run is swept on boot, but we
     // also belt-and-braces check the flag here so no flash occurs.
     const lastMsg = history[history.length - 1];
-    const convMeta = data.conversation || {};
     // Cache the conv-bound agent's enabled state so _updateConvSendUI can
     // grey out the input without a second IPC round trip. Backend stamps
     // `agent_enabled` on the conversation payload (true when no agent_id).
@@ -3607,12 +3669,15 @@ async function loadConversationHistory(cid, opts = {}) {
     _ensureConvCreateAgentInline();
     if (preserveScroll) _restoreHistoryReloadScroll(container, scrollSnapshot);
     else _scrollToBottomNoAnim(container);
-    if (window.ConversationInfo) window.ConversationInfo.refreshTasks(cid);
+    if (window.ConversationInfo) window.ConversationInfo.refreshFiles(cid);
+    if (cid === currentCid && !isConvPending(cid) && (messageQueues.get(cid) || []).length) {
+      _dispatchNextQueued(cid);
+    }
   } catch (e) {
     if (!preserveScroll) {
       container.innerHTML = `<div class="empty">${escapeHtml(t('chat.load_failed', { msg: e.message || '' }))}</div>`;
     }
-    if (window.ConversationInfo) window.ConversationInfo.refreshTasks(cid);
+    if (window.ConversationInfo) window.ConversationInfo.refreshFiles(cid);
   }
 }
 
@@ -3693,8 +3758,7 @@ async function _recoverPolledVisibleMessages(cid, rawMessages) {
     changed = true;
   }
   if (changed) {
-    try { if (window.PlanRail) window.PlanRail.refresh(cid, { force: true }); } catch (_) {}
-    try { if (window.ConversationInfo) window.ConversationInfo.refreshTasks(cid); } catch (_) {}
+    try { if (window.ConversationInfo) window.ConversationInfo.refreshFiles(cid); } catch (_) {}
     _scheduleConversationInfoFileRefresh(cid);
   }
   return changed;
@@ -4044,7 +4108,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     else if (role === 'assistant') displayContent = _stripSurvivingStructuralBlocks(rawContent);
   }
   const contentHtml = isHtmlSnippet
-    ? rawContent
+    ? sanitizeHtml(rawContent)
     : `<div class="markdown-body">${_renderMessageMarkdown(displayContent)}</div>`;
 
   const attachmentCid = message.attachment_cid || message.attachments_cid || opts.cid || currentCid;
@@ -4260,6 +4324,26 @@ function _marketplaceInstallFailedText(kind, name, reason) {
   return t('marketplace.install_failed').replace('{reason}', `${kindLabel}: ${displayName}: ${text}`);
 }
 
+function _marketplaceIsMissingDependencySkillError(requestedKind, installError, reason) {
+  const text = String(installError?.reason || reason || '').toLowerCase();
+  return requestedKind === 'agent'
+    && installError?.kind === 'skill'
+    && (text === 'not_found' || text.includes('not_found'));
+}
+
+function _marketplaceTrackInstallFailure(req, installError, surface = 'conversation') {
+  if (!_marketplaceIsMissingDependencySkillError(req?.kind, installError, installError?.reason)) return;
+  _convTrackError('marketplace_dependency_skill_missing', {
+    surface,
+    requested_kind: req?.kind || '',
+    requested_id: req?.id || '',
+    requested_name: req?.name || '',
+    dependency_skill_id: installError?.id || '',
+    dependency_skill_name: installError?.name || '',
+    reason: installError?.reason || '',
+  });
+}
+
 function _marketplaceRequestStatusLabel(status) {
   if (status === 'installed') return t('marketplace_request.status_installed');
   if (status === 'skipped') return t('marketplace_request.status_skipped');
@@ -4418,6 +4502,9 @@ async function _resolveMarketplaceInstallRequest(card, req, cid, msgId, decision
     }
     const updated = data.request || { ...req, status: decision === 'install' ? 'installed' : 'skipped' };
     _renderMarketplaceInstallCard(card, updated, cid, msgId);
+    if (updated.status === 'failed') {
+      _marketplaceTrackInstallFailure(req, data.install_error);
+    }
     if (updated.status === 'installed') {
       if (updated.kind === 'agent') { try { loadAgents?.(true); } catch (_) {} }
       else { try { loadSkills?.(true); } catch (_) {} }
@@ -4572,6 +4659,56 @@ function _messageTextForActions(msgDiv, fallback = '') {
   return (bubble && bubble.textContent ? bubble.textContent : text).trim();
 }
 
+function _textFromBubbleWithout(msgDiv, selectors) {
+  const bubble = msgDiv && msgDiv.querySelector ? msgDiv.querySelector('.chat-bubble') : null;
+  if (!bubble) return '';
+  const clone = bubble.cloneNode(true);
+  clone.querySelectorAll(selectors).forEach((el) => el.remove());
+  return _normalizeFeedbackFieldText(clone.textContent || '');
+}
+
+function _failedAssistantErrorText(msgDiv) {
+  const bubble = msgDiv && msgDiv.querySelector ? msgDiv.querySelector('.chat-bubble') : null;
+  if (!bubble) return '';
+  const errorLines = Array.from(bubble.querySelectorAll('.msg-error'))
+    .map((el) => _normalizeFeedbackFieldText(el.textContent || ''))
+    .filter(Boolean);
+  if (errorLines.length) return errorLines.join('\n');
+
+  const bubbleText = _normalizeFeedbackFieldText(bubble.textContent || '');
+  const modelMatch = bubbleText.match(/(?:模型调用失败|model\s+(?:call|invocation)\s+failed)[:：]?\s*[^\n]*/i);
+  if (modelMatch) return modelMatch[0].trim();
+  const sendMatch = bubbleText.match(/(?:发送失败|send failed)[:：]?\s*[^\n]*/i);
+  if (sendMatch) return sendMatch[0].trim();
+  return bubbleText;
+}
+
+function _failedAssistantReplyText(msgDiv, getContent) {
+  const bodyText = _textFromBubbleWithout(
+    msgDiv,
+    '.msg-error, .stream-process, .stream-aborted-note, .chat-input-form, .chat-artifacts, iframe',
+  );
+  const errorText = _failedAssistantErrorText(msgDiv);
+  if (bodyText && bodyText !== errorText) return bodyText;
+
+  const fallback = typeof getContent === 'function' ? _normalizeFeedbackFieldText(getContent() || '') : '';
+  if (fallback && fallback !== errorText) return fallback;
+  return '';
+}
+
+function _failedAssistantFeedbackDetails(msgDiv, getContent) {
+  const actorId = msgDiv ? (msgDiv.dataset.fromActor || msgDiv.dataset.from || '') : '';
+  const actorName = actorId ? (_groupActorLabel(actorId) || actorId) : '';
+  const msgId = msgDiv ? (msgDiv.dataset.msgId || '') : '';
+  return {
+    cid: currentCid || '',
+    actor: actorName,
+    msgId,
+    errorText: _failedAssistantErrorText(msgDiv),
+    replyText: _failedAssistantReplyText(msgDiv, getContent),
+  };
+}
+
 function _attachBubbleRetryBtn(actions, msgDiv) {
   if (!actions || actions.querySelector('.bubble-retry-btn')) return;
   const retryBtn = document.createElement('button');
@@ -4585,12 +4722,31 @@ function _attachBubbleRetryBtn(actions, msgDiv) {
   actions.appendChild(retryBtn);
 }
 
+function _attachBubbleReportBtn(actions, msgDiv, getContent) {
+  if (!actions || actions.querySelector('.bubble-report-btn')) return;
+  const reportBtn = document.createElement('button');
+  reportBtn.className = 'bubble-report-btn';
+  reportBtn.title = t('chat.report_btn_title');
+  if (msgDiv && msgDiv.dataset.feedbackReported === '1') {
+    reportBtn.disabled = true;
+    reportBtn.innerHTML = `${_uiIconHtml('check', 'ui-icon btn-inline-icon')}<span>${escapeHtml(t('chat.report_done'))}</span>`;
+  } else {
+    reportBtn.textContent = t('chat.report_btn');
+  }
+  reportBtn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    await _reportFailedAssistantMessage(msgDiv, reportBtn, getContent);
+  });
+  actions.appendChild(reportBtn);
+}
+
 function _attachFailedAssistantActions(msgDiv, getContent) {
   if (!msgDiv) return;
   msgDiv.dataset.failed = '1';
   _attachBubbleActions(msgDiv, getContent, {
     archive: false,
     retry: true,
+    report: false,
   });
 }
 
@@ -4600,6 +4756,7 @@ function _attachFailedAssistantActions(msgDiv, getContent) {
 function _attachBubbleActions(msgDiv, getContent, opts = {}) {
   const includeArchive = opts.archive !== false;
   const includeRetry = opts.retry === true;
+  const includeReport = opts.report === true;
   // Archive button lives in the `.chat-msg-actions` row below the bubble
   // (alongside produced-file chips). Lazily create the row if a caller
   // (e.g. streaming placeholders that didn't allocate one) needs it.
@@ -4613,6 +4770,7 @@ function _attachBubbleActions(msgDiv, getContent, opts = {}) {
   const existingActions = actionsRow.querySelector('.chat-bubble-actions');
   if (existingActions) {
     if (includeRetry) _attachBubbleRetryBtn(existingActions, msgDiv);
+    if (includeReport) _attachBubbleReportBtn(existingActions, msgDiv, getContent);
     return;
   }
   const actions = document.createElement('span');
@@ -4626,6 +4784,7 @@ function _attachBubbleActions(msgDiv, getContent, opts = {}) {
   const copyBtn = actions.querySelector('.bubble-copy-btn');
   const quoteBtn = actions.querySelector('.bubble-quote-btn');
   if (includeRetry) _attachBubbleRetryBtn(actions, msgDiv);
+  if (includeReport) _attachBubbleReportBtn(actions, msgDiv, getContent);
   quoteBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     const text = typeof getContent === 'function' ? (getContent() || '') : '';
@@ -4644,7 +4803,7 @@ function _attachBubbleActions(msgDiv, getContent, opts = {}) {
     _setQuote(currentCid, { fromActor, fromName, msgId, text, produced });
     const input = document.getElementById('chat-input');
     if (input) { input.focus(); }
-  });
+      });
   copyBtn.addEventListener('click', async (e) => {
     e.stopPropagation();
     const text = typeof getContent === 'function' ? (getContent() || '') : '';
@@ -4712,6 +4871,23 @@ function _attachBubbleArchiveBtn(msgDiv, getContent) {
   _attachBubbleActions(msgDiv, getContent, { archive: true });
 }
 
+function _setReportButtonLoading(btn, loading) {
+  if (!btn) return;
+  if (loading) {
+    btn.disabled = true;
+    btn.setAttribute('aria-busy', 'true');
+    btn.innerHTML = `<span class="bubble-action-spinner" aria-hidden="true"></span><span>${escapeHtml(t('chat.report_running'))}</span>`;
+  } else {
+    btn.removeAttribute('aria-busy');
+  }
+}
+
+async function _reportFailedAssistantMessage(msgDiv, btn, getContent) {
+  void msgDiv;
+  void btn;
+  void getContent;
+}
+
 function _findUserMessageForRetry(msgDiv) {
   let cur = msgDiv ? msgDiv.previousElementSibling : null;
   while (cur) {
@@ -4746,20 +4922,13 @@ async function _retryFailedAssistantMessage(msgDiv, btn) {
   if (btn) btn.disabled = true;
   const orig = btn ? btn.textContent : '';
   try {
-    if (window.PlanRail
-        && typeof window.PlanRail.currentAction === 'function'
-        && window.PlanRail.currentAction() === 'continue'
-        && typeof window.PlanRail.continueCurrent === 'function') {
-      await window.PlanRail.continueCurrent();
-      return;
-    }
     const userMsgEl = _findUserMessageForRetry(msgDiv);
     const payload = _retryPayloadFromUserMessage(userMsgEl);
     if (!payload) {
       await uiAlert(t('chat.retry_no_source'));
       return;
     }
-    if (btn) btn.textContent = t('chat.retry_running');
+        if (btn) btn.textContent = t('chat.retry_running');
     await sendInConversation(currentCid, payload.content, payload.extra);
   } finally {
     if (btn) {
@@ -4779,8 +4948,11 @@ async function handleNewChatSubmit() {
   const useSelection = consumeChatUseSelection('new-chat');
   // Snapshot the new-chat recipient *now* so a stray view-change between
   // here and conv-create doesn't reset it before we can transfer.
-  _pendingNewChatRecipient = { ..._newChatRecipient };
-  const content = applyRecipientPrefix(transformWithChatUse(raw, useSelection), 'new-chat');
+  const recipientSnapshot = _recipientSnapshotForSend('new-chat');
+  _pendingNewChatRecipient = _normaliseRecipientSnapshot(recipientSnapshot) || { ..._COMMANDER };
+  const content = applyRecipientPrefix(transformWithChatUse(raw, useSelection), 'new-chat', {
+    recipientSnapshot,
+  });
   const draftItems = _chatAttachList(DRAFT_CID);
   if (draftItems.some((a) => a.status === 'uploading')) {
     await uiAlert(t('chat.attach_still_uploading'));
@@ -4906,12 +5078,15 @@ async function handleChatSubmit() {
   // the user may have already cleared/replaced the quote in the preview;
   // capture-at-enqueue keeps each queued message tied to the quote that was
   // visible when the user pressed send.
+  const recipientSnapshot = _takeRecipientSnapshotForSend('conversation');
   if (isConvPending(cid) || (messageQueues.get(cid) || []).length) {
     if (attachments.length) {
       await uiAlert(t('chat.attach_queue_blocked'));
       return;
     }
-    enqueueMessage(cid, applyQuotePrefix(raw, 'conversation'), useSelection);
+    enqueueMessage(cid, applyQuotePrefix(raw, 'conversation'), useSelection, {
+      recipient: recipientSnapshot,
+    });
     _clearQuote(cid);
     input.value = '';
     autoGrow(input, 200);
@@ -4919,7 +5094,11 @@ async function handleChatSubmit() {
     return;
   }
 
-  const content = applyRecipientPrefix(applyQuotePrefix(transformWithChatUse(raw, useSelection), 'conversation'), 'conversation');
+  const content = applyRecipientPrefix(
+    applyQuotePrefix(transformWithChatUse(raw, useSelection), 'conversation'),
+    'conversation',
+    { recipientSnapshot },
+  );
   _clearQuote(cid);
   input.value = '';
   autoGrow(input, 200);
@@ -4940,6 +5119,231 @@ const _convChatCtrls = new Map();  // cid → controller
 
 function _observerShouldDeferCleanup(cid, allowWithController) {
   return !!allowWithController && _convChatCtrls.has(cid);
+}
+
+const _taskTurnRuns = new Map();
+
+function _taskTurnRunId() {
+  try {
+    if (crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  } catch (_) { /* ignore */ }
+  return `run_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`;
+}
+
+function _taskTurnStart(cid, content, extra, startedAt) {
+  if (!cid) return;
+  const attachments = Array.isArray(extra && extra.attachments) ? extra.attachments.map(String) : [];
+  const ts = Math.round(startedAt || Date.now());
+  _taskTurnRuns.set(cid, {
+    cid,
+    runId: _taskTurnRunId(),
+    userText: String(content || ''),
+    startedAtMs: ts,
+    messages: [{
+      role: 'user',
+      actor: 'user',
+      text: String(content || ''),
+      created_at_ms: ts,
+      attachment_count: attachments.length,
+      attachment_names: attachments,
+      initial: true,
+    }],
+    messageKeys: new Set(['initial_user']),
+    initialUserEventMatched: false,
+    assistantMessages: [],
+    agentIds: [],
+    agentNameById: {},
+    skillIds: [],
+    skillNameById: {},
+    toolNames: [],
+    toolCallCount: 0,
+    attachmentNames: attachments,
+    attachmentCount: attachments.length,
+    errorMessage: '',
+    errorType: '',
+    errorStage: '',
+    partial: false,
+  });
+}
+
+function _taskTurnRun(cid) {
+  return _taskTurnRuns.get(cid) || null;
+}
+
+function _taskTurnAgentName(actorId, cid) {
+  const id = String(actorId || '').trim();
+  if (!id || id === 'user') return '';
+  if (id === 'commander') {
+    return (typeof t === 'function') ? t('chat.from_commander') : 'Commander';
+  }
+  if (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
+    const found = _agentsCache.find((a) => a && a.agent_id === id);
+    if (found && found.name) return String(found.name);
+  }
+  const cached = _groupMembersCache.get(cid || currentCid);
+  if (cached) {
+    const found = cached.find((a) => a && a.id === id);
+    if (found && found.name) return String(found.name);
+  }
+  return '';
+}
+
+function _taskTurnSkillName(skillId) {
+  const id = String(skillId || '').trim();
+  if (!id) return '';
+  const skills = _skillsForDisplayNameRewrite();
+  const found = skills.find((s) => s && s.id === id);
+  return found && found.name ? String(found.name) : '';
+}
+
+function _taskTurnAddAgent(run, actorId) {
+  const id = String(actorId || '').trim();
+  if (!id || id === 'user') return;
+  if (!run.agentIds.includes(id)) run.agentIds.push(id);
+  const name = _taskTurnAgentName(id, run.cid);
+  if (name) run.agentNameById[id] = name;
+}
+
+function _taskTurnAddSkill(run, skillId, skillName) {
+  const id = String(skillId || '').trim();
+  if (!id) return;
+  if (!run.skillIds.includes(id)) run.skillIds.push(id);
+  const name = String(skillName || _taskTurnSkillName(id) || '').trim();
+  if (name) run.skillNameById[id] = name;
+}
+
+function _taskTurnAddTool(run, name) {
+  const n = String(name || '').trim().slice(0, 128);
+  if (!n) return;
+  if (!run.toolNames.includes(n)) run.toolNames.push(n);
+}
+
+function _taskTurnMessageKey(role, gm, fallbackText) {
+  if (gm && gm.id) return `${role}:id:${gm.id}`;
+  return `${role}:${gm && gm.from ? gm.from : ''}:${gm && gm.ts ? gm.ts : ''}:${String(fallbackText || '').slice(0, 120)}`;
+}
+
+function _taskTurnAddMessage(run, msg) {
+  if (!run || !msg) return;
+  const role = msg.role === 'user' ? 'user' : 'assistant';
+  const text = String(msg.text || '');
+  if (!text.trim()) return;
+  const key = msg.key || `${role}:${msg.actor || ''}:${msg.created_at_ms || ''}:${text.slice(0, 120)}`;
+  if (run.messageKeys.has(key)) return;
+  run.messageKeys.add(key);
+  const actor = String(msg.actor || (role === 'user' ? 'user' : ''));
+  const actorName = role === 'assistant'
+    ? String(msg.actor_name || _taskTurnAgentName(actor, run.cid) || '').trim()
+    : '';
+  run.messages.push({
+    role,
+    actor,
+    ...(actorName ? { actor_name: actorName } : {}),
+    text,
+    created_at_ms: Math.max(0, Math.round(Number(msg.created_at_ms) || Date.now())),
+    ...(msg.message_id ? { message_id: String(msg.message_id).slice(0, 64) } : {}),
+    ...(msg.partial ? { partial: true } : {}),
+    ...(msg.attachment_count ? { attachment_count: msg.attachment_count } : {}),
+    ...(Array.isArray(msg.attachment_names) && msg.attachment_names.length ? { attachment_names: msg.attachment_names.map(String) } : {}),
+  });
+}
+
+function _taskTurnRecordProcess(run, evData) {
+  const processData = evData && evData.data ? evData.data : {};
+  const payload = processData && processData.event && typeof processData.event === 'object'
+    ? processData.event
+    : processData;
+  const stream = String(payload.stream || '');
+  const data = payload.data && typeof payload.data === 'object' ? payload.data : {};
+  const cliType = stream === 'cli' ? String(data.type || '').toLowerCase() : '';
+  const phase = String(data.phase || data.status || '').toLowerCase();
+  const isTool = stream === 'tool' || cliType === 'tool-event';
+  if (!isTool) return;
+  _taskTurnAddSkill(run, data.skill_id || data.skillId, data.skill_name || data.skillName);
+  if (phase && !/^(start|running|request|call|begin)$/.test(phase)) return;
+  run.toolCallCount += 1;
+  _taskTurnAddTool(run, data.name || data.tool || data.tool_name || data.command || payload.name);
+}
+
+function _taskTurnRecordStreamEvent(cid, ev) {
+  const run = _taskTurnRun(cid);
+  if (!run || !ev) return;
+  if (ev.type === 'final' && ev.text) {
+    const text = String(ev.text || '');
+    run.assistantMessages.push({ actor: '', text });
+    _taskTurnAddMessage(run, {
+      role: 'assistant',
+      actor: '',
+      text,
+      created_at_ms: Date.now(),
+      key: `assistant:final:${text.slice(0, 120)}`,
+    });
+    return;
+  }
+  if (ev.type === 'error') {
+    run.errorMessage = String(ev.text || '');
+    run.errorType = ev.aborted ? 'abort' : 'model_output';
+    run.errorStage = 'stream_event';
+    return;
+  }
+  const inner = ev.event || {};
+  const evData = inner.stream === 'group' ? inner.data : null;
+  if (!evData || typeof evData !== 'object') return;
+  if (evData.type === 'message' && evData.msg && !evData.msg.dispatch) {
+    const gm = evData.msg;
+    const text = String(gm.text || '');
+    const role = gm.from === 'user' ? 'user' : 'assistant';
+    const actor = String(gm.from || evData.actor || (role === 'user' ? 'user' : ''));
+    if (role === 'user') {
+      if (!run.initialUserEventMatched && text === run.userText) {
+        run.initialUserEventMatched = true;
+        const first = run.messages.find((m) => m.initial);
+        if (first) {
+          first.created_at_ms = Math.max(0, Math.round(Number(gm.ts ? Date.parse(gm.ts) : 0) || first.created_at_ms || run.startedAtMs));
+          if (gm.id) first.message_id = String(gm.id).slice(0, 64);
+        }
+        return;
+      }
+      _taskTurnAddMessage(run, {
+        role: 'user',
+        actor: 'user',
+        text,
+        created_at_ms: gm.ts ? Date.parse(gm.ts) : Date.now(),
+        message_id: gm.id || '',
+        key: _taskTurnMessageKey('user', gm, text),
+        attachment_count: Array.isArray(gm.attachments) ? gm.attachments.length : 0,
+        attachment_names: Array.isArray(gm.attachments) ? gm.attachments : [],
+      });
+    } else if (text.trim()) {
+      _taskTurnAddAgent(run, actor);
+      run.assistantMessages.push({ actor, text });
+      _taskTurnAddMessage(run, {
+        role: 'assistant',
+        actor,
+        text,
+        created_at_ms: gm.ts ? Date.parse(gm.ts) : Date.now(),
+        message_id: gm.id || '',
+        key: _taskTurnMessageKey('assistant', gm, text),
+        partial: !!evData.partial,
+      });
+    }
+    return;
+  }
+  if (evData.type === 'process') {
+    _taskTurnAddAgent(run, evData.actor);
+    _taskTurnRecordProcess(run, evData);
+    return;
+  }
+  if (evData.type === 'artifact_created') {
+    _taskTurnAddAgent(run, evData.actor);
+  }
+}
+
+function _taskTurnFinish(cid, opts = {}) {
+  const run = _taskTurnRun(cid);
+  if (!run) return;
+  _taskTurnRuns.delete(cid);
+  void opts;
 }
 
 function _makeConvChatController(cid) {
@@ -4989,12 +5393,24 @@ function _makeConvChatController(cid) {
         startPolling(id);
         _startRuntimeActorRecovery(id);
       },
-      onAbort(_msgEl, id) {
+      onAbort(msgEl, id) {
         const state = pendingConvs.get(id);
         if (state) state.aborted = true;
+        _taskTurnFinish(id, { msgEl, aborted: true });
         _finishStreamingMsg(id);
       },
-      onDone(_msgEl, id) {
+      onStreamEvent(ev, _msgEl, id) {
+        _taskTurnRecordStreamEvent(id, ev);
+      },
+      onError(text, _msgEl, id) {
+        const run = _taskTurnRun(id);
+        if (run) {
+          run.errorMessage = String(text || '');
+          run.errorType = 'model_output';
+          run.errorStage = 'stream';
+        }
+      },
+      onDone(msgEl, id, result = {}) {
         // Unconditional cleanup — safe even if polling already resolved.
         // `_finishStreamingMsg` synchronously drains the next queued
         // message (via `_dispatchNextQueued` → new `ctrl.send`), which
@@ -5004,6 +5420,7 @@ function _makeConvChatController(cid) {
         // before invoking us, so a second removal would strip the spacer
         // the new turn just added and the queued user message would render
         // off-screen until later layout shifts pushed it into view.
+        _taskTurnFinish(id, { msgEl, aborted: !!result.aborted, errored: !!result.errored });
         _finishStreamingMsg(id);
         _scheduleHistoryReconcileAfterStream(id);
         // Only drop the map entry if it still refers to *this* controller.
@@ -5020,9 +5437,9 @@ function _makeConvChatController(cid) {
 
 async function sendInConversation(cid, content, extra) {
   if (!cid) return;
-  const startedAt = performance.now();
-  const attachmentCount = Array.isArray(extra && extra.attachments) ? extra.attachments.length : 0;
   if (isConvPending(cid)) {
+    // Queued input starts a new execution stream after the current one ends,
+    // so it must not be merged into the active task-turn sample.
     enqueueMessage(cid, content, '', { direct: true, extra });
     return;
   }
@@ -5033,9 +5450,14 @@ async function sendInConversation(cid, content, extra) {
 
   const ctrl = _makeConvChatController(cid);
   _convChatCtrls.set(cid, ctrl);
+  _taskTurnStart(cid, content, extra, Date.now());
   try {
     await ctrl.send(content, extra);
   } catch (err) {
+        _taskTurnFinish(cid, {
+      errored: true,
+      error: err && err.message ? err.message : String(err),
+    });
     throw err;
   }
 }
@@ -5272,16 +5694,14 @@ function _observeConversationRunFromPlanAction(cid, opts = {}) {
       }
       if (activated) {
         if (_observerShouldDeferCleanup(cid, allowWithController)) {
-          if (window.PlanRail) window.PlanRail.refresh(cid, { force: true });
-          if (window.ConversationInfo) window.ConversationInfo.refreshTasks(cid, { silent: true });
+          if (window.ConversationInfo) window.ConversationInfo.refreshFiles(cid, { silent: true });
           return;
         }
         setGroupConversationBusy(cid, false);
         _removeEmptyStreamingPlaceholder(msgEl);
         _finishStreamingMsg(cid);
         _scheduleHistoryReconcileAfterStream(cid);
-        if (window.PlanRail) window.PlanRail.refresh(cid, { force: true });
-        if (window.ConversationInfo) window.ConversationInfo.refreshTasks(cid, { silent: true });
+        if (window.ConversationInfo) window.ConversationInfo.refreshFiles(cid, { silent: true });
       }
     }
   })();
@@ -6412,11 +6832,24 @@ function createChatController(config) {
             // its buffer — drop them so the bubble stays frozen at the "stopped" state
             // instead of accumulating more deltas / a final reply behind it.
             if (pending?.aborted) continue;
-            _handleStreamEvent(id, msgEl, ev, { archive: features.archive });
+            // Switched away mid-stream: the placeholder bubble was detached by
+            // the new view's history reset, so rendering deltas into it is wasted
+            // work on an orphan node (markdown / typeset / strip). The turn keeps
+            // running server-side and switch-back rebuilds from disk, so we just
+            // skip the render while off-view — do NOT abort (that would stop the
+            // agent's turn). Scene hooks still run so edit-scene state is intact.
+            if (id === config.getCurrentId()) {
+              _handleStreamEvent(id, msgEl, ev, { archive: features.archive });
+            }
             if (hooks.onStreamEvent) hooks.onStreamEvent(ev, msgEl, id);
             if (ev.type === 'final' && hooks.onFinal) hooks.onFinal(ev, msgEl, id);
             if (ev.type === 'error') {
               pending.errored = true;
+              _noteModelOutputIssue(id, msgEl, ev.text, {
+                stage: 'stream_event',
+                error_type: ev.aborted ? 'abort' : 'model_output',
+                aborted: !!ev.aborted,
+              });
               if (hooks.onError) hooks.onError(ev.text, msgEl, id);
             }
             const paintWait = maybeYieldToPaint();
@@ -6436,6 +6869,10 @@ function createChatController(config) {
       } else {
         _streamingSetError(msgEl, err.message || String(err));
         pending.errored = true;
+        _noteModelOutputIssue(id, msgEl, err.message || String(err), {
+          stage: 'stream_request',
+          error_type: 'stream',
+        });
         if (hooks.onError) hooks.onError(err.message || String(err), msgEl, id);
       }
     } finally {
@@ -6583,6 +7020,11 @@ function _handleStreamEvent(cid, msg, ev, { archive = false } = {}) {
     }
   } else if (ev.type === 'error') {
     _streamingSetError(msg, ev.text);
+    _noteModelOutputIssue(cid, msg, ev.text, {
+      stage: 'stream_event',
+      error_type: ev.aborted ? 'abort' : 'model_output',
+      aborted: !!ev.aborted,
+    });
   }
 }
 
@@ -6701,6 +7143,18 @@ function _ensureActorPlaceholder(cid, actorId, fallbackPh, turnId) {
   }
   const container = document.getElementById('chat-history');
   if (!container) return null;
+  // Hand-off flicker guard: once the commander has handed the floor to an agent
+  // (server `active_recipient` is an agent), it ends its turn with no more
+  // output — so an in_flight/active_turns sweep must NOT mint a fresh empty
+  // commander placeholder that would flash during the agent's reply and vanish
+  // at turn end. dispatch_to does NOT set the floor, so its post-dispatch
+  // synthesis still creates a placeholder normally (and arrives via a real delta
+  // event, which adopts the bubble it streams into). The commander's pre-hand-off
+  // seg bubble was already created + finalized before the floor was set.
+  if (actorId === 'commander') {
+    const floor = _serverFloorByCid.get(cid) || '';
+    if (floor && floor !== 'commander' && floor !== 'user') return null;
+  }
   ph = _createStreamingAssistantMessage(container, { hiddenUntilActor: true });
   if (tid) ph.dataset.turnId = tid;
   _setPlaceholderActor(ph, actorId, { cid, allowFallback });
@@ -6806,6 +7260,10 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
   _streamingSetFinal(ph, text, { archive: archive && !failedAssistant });
   if (failedAssistant) {
     _attachFailedAssistantActions(ph, () => _messageTextForActions(ph, text));
+    _noteModelOutputIssue(cid, ph, _failedAssistantErrorText(ph) || text, {
+      stage: 'actor_final',
+      error_type: 'model_output',
+    });
   }
 
   // Lazily allocate the below-bubble actions row (post-stream placeholders
@@ -6888,7 +7346,6 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
 //   { type: 'message', cid, msg: GroupMessage, turn_id? }
 //   { type: 'process', cid, actor, turn_id?, data: { type, text?, event? } }
 //   { type: 'artifact_created', cid, actor, turn_id?, artifact: { id, title, agent_id } }
-//   { type: 'plan_changed', cid }
 //   { type: 'state_changed', cid, state: { status, in_flight }, active_turns? }
 //   { type: 'member_joined', cid, actor }
 //   { type: 'aborted', cid }
@@ -6908,7 +7365,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
   // user's view; visible end-of-turn replies will bump shortly after).
   if (evData.type === 'message' && evData.msg && !evData.msg.dispatch) {
     _bumpConvToTop(cid);
-    if (window.ConversationInfo) window.ConversationInfo.refreshTasks(cid);
+    if (window.ConversationInfo) window.ConversationInfo.refreshFiles(cid);
     // Mark commander as "in chat" the moment it speaks here, so the
     // sidebar/header badges add the commander avatar without waiting for
     // the next `listConversations` to re-derive it from <cid>.jsonl.
@@ -6975,8 +7432,16 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     // post-tool process events recreate a new placeholder that nothing
     // ends up consuming when the actor's actual turn finishes silent.
     const isTurnEnd = !!evData.turn_end;
-    if (isTurnEnd) {
-      _rememberInteractiveTurnCandidate(cid, gm);
+    // A commander reasoning segment (a turn split at a visible-dispatch
+    // boundary) carries `seg` with turn_end:false. Like a turn-end message it
+    // must CONSUME + finalize the live placeholder rather than append a
+    // duplicate bubble alongside it: that finalizes the pre-dispatch reasoning
+    // as its own bubble, and the next commander delta opens a fresh placeholder
+    // BELOW the dispatched agent, so the post-handback synthesis reads as a new
+    // bubble in the loop.
+    const isCommanderSegment = !isTurnEnd
+      && gm.seg !== undefined && String(gm.from || '') === 'commander';
+    if (isTurnEnd || isCommanderSegment) {
       // Finalize THIS actor's placeholder in place — preserves the process
       // rail (tool calls, progress lines) accumulated during the turn so
       // it stays readable after the reply settles. If we don't have a
@@ -6999,10 +7464,11 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
         if (_normalizeCreatedAgents(gm)) { try { loadAgents?.(true); } catch (_) {} }
         if (_normalizeCreatedSkills(gm)) { try { loadSkills?.(true); } catch (_) {} }
       }
-      _evaluateAutoRecipient(cid);
+      if (isTurnEnd) _evaluateAutoRecipient(cid);
     } else {
-      // Mid-turn message — append a new bubble alongside, leave the
-      // streaming placeholder alive for the rest of the actor's turn.
+      // Mid-turn side-effect message (plan announcement etc., no `seg`) —
+      // append a new bubble alongside, leave the streaming placeholder alive
+      // for the rest of the actor's turn.
       const legacy = _groupMsgToLegacy(gm);
       const bubble = appendChatMessage(legacy, true, { cid, archive });
       if (bubble) bubble.dataset.fromActor = String(gm.from || '');
@@ -7014,8 +7480,9 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     // B_dispatch, B_ph, ...`) — exactly the "messy realtime order" the user
     // complained about.
     //
-    // Bus naturally serializes worker startup (sync ensureWorker + queue.push
-    // + wake → microtask), and `markInFlight` is mutex-guarded. So
+    // Bus naturally serializes top-level turns (one per-conversation runtime
+    // inbox; sync queue.push + wake → microtask), and `markInFlight` is
+    // mutex-guarded. So
     // `state_changed` events arrive at renderer in dispatch order. The
     // `state_changed` handler creates each agent's placeholder at the end
     // of `chat-history` in turn, AFTER all dispatch bubbles. Final layout:
@@ -7110,14 +7577,6 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
       window.mountMessageArtifacts(bubble, [artifact], cid);
       _stickBottomFromMsg(target);
     }
-  } else if (evData.type === 'plan_changed') {
-    // Plan step transitions are the trigger for the input-box auto-target:
-    // when an interactive agent's step enters in_progress, the user's next
-    // reply should default to that agent without them having to @-mention.
-    _evaluateAutoRecipient(cid);
-    if (window.PlanRail) window.PlanRail.refresh(cid, { force: true });
-    if (window.ConversationInfo) window.ConversationInfo.refreshTasks(cid, { silent: true });
-    _scheduleConversationInfoFileRefresh(cid);
   } else if (evData.type === 'state_changed') {
     // Each in_flight actor gets a placeholder so its delta tokens / tool
     // calls render in its own bubble even before its `message` arrives.
@@ -7126,6 +7585,12 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     const inFlight = Array.isArray(st.in_flight) ? st.in_flight.slice() : [];
     const hasActiveTurnsField = Array.isArray(evData.active_turns);
     const activeTurns = _normaliseActiveTurns(evData.active_turns);
+    // Mirror the server floor BEFORE seeding placeholders below: the hand-off
+    // guard in `_ensureActorPlaceholder` (skip an empty commander placeholder
+    // while the floor points at an agent) reads `_serverFloorByCid`, so it must
+    // be current for THIS event or the commander bubble flickers during the
+    // handed-off agent's reply.
+    _serverFloorByCid.set(cid, typeof st.active_recipient === 'string' ? st.active_recipient : '');
     setGroupConversationBusy(cid, st.status === 'running' || inFlight.length > 0 || activeTurns.length > 0);
     if (hasActiveTurnsField) {
       for (const turn of activeTurns) {
@@ -7166,20 +7631,10 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
       _groupPlaceholders.delete(k);
       if (ph && ph.parentElement) ph.remove();
     }
-    // Mirror in_flight so _evaluateAutoRecipient knows when commander is
-    // mid-turn (release the chip back to commander even if plan still has
-    // an interactive agent's done step as the most-recent terminal).
     _latestInFlight.set(cid, inFlight);
-    // state_changed also fires on plan reconcile boundaries — re-evaluate
-    // the auto-target so the chip matches the current dispatch state even
-    // when a plan_changed event was missed (e.g. on first connect).
+    // Floor already mirrored above (before seeding). Re-point the composer chip.
     _evaluateAutoRecipient(cid);
-    // Plan rail derives its unified stop/continue control from the live
-    // runtime state (avoids racing user actions against an in-progress turn).
-    if (window.PlanRail) {
-      window.PlanRail.setInFlight(cid, inFlight);
-    }
-    if (window.ConversationInfo) window.ConversationInfo.refreshTasks(cid, { silent: true });
+    if (window.ConversationInfo) window.ConversationInfo.refreshFiles(cid, { silent: true });
     _updateConvSidebarBadge(cid, false);
     if (cid === currentCid) _updateConvSendUI(cid);
   } else if (evData.type === 'aborted') {
@@ -7916,6 +8371,10 @@ function _resolveConvReply(cid, text, isError) {
       }
     } else {
       _attachFailedAssistantActions(el, () => _messageTextForActions(el, text));
+      _noteModelOutputIssue(cid, el, text, {
+        stage: 'pending_reply',
+        error_type: 'model_output',
+      });
     }
   } else if (cid === currentCid) {
     // loadingEl was replaced (user navigated away and back); reload history to show result
@@ -7989,13 +8448,7 @@ function _renderConvDisabledBanner(cid) {
 function _refreshTaskSurfacesAfterAbort(cid) {
   if (!cid) return;
   try {
-    if (window.PlanRail) {
-      window.PlanRail.setInFlight(cid, []);
-      window.PlanRail.refresh(cid, { force: true });
-    }
-  } catch (_) {}
-  try {
-    if (window.ConversationInfo) window.ConversationInfo.refreshTasks(cid, { silent: true });
+    if (window.ConversationInfo) window.ConversationInfo.refreshFiles(cid, { silent: true });
   } catch (_) {}
 }
 

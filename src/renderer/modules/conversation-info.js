@@ -145,20 +145,51 @@ const ConversationInfo = (() => {
     return '';
   }
 
-  function _kindForName(name) {
-    const ext = (String(name || '').split('.').pop() || '').toLowerCase();
-    if (['png', 'jpg', 'jpeg', 'webp', 'gif'].includes(ext)) return 'image';
-    if (['mp4', 'webm', 'mov', 'm4v', 'ogv'].includes(ext)) return 'video';
-    if (ext === 'pdf') return 'pdf';
-    if (ext === 'docx' || ext === 'docm') return 'docx';
-    if (ext === 'xlsx' || ext === 'xlsm') return 'spreadsheet';
-    if (ext === 'pptx' || ext === 'pptm') return 'presentation';
-    if (['doc', 'xls', 'ppt'].includes(ext)) return 'legacy_office';
-    return 'text';
+  const _CI_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif']);
+  const _CI_OFFICE_WORD_EXTS = new Set(['docx', 'docm']);
+  const _CI_OFFICE_SHEET_EXTS = new Set(['xlsx', 'xlsm']);
+  const _CI_OFFICE_PRESENTATION_EXTS = new Set(['pptx', 'pptm']);
+  const _CI_TEXT_EXTS = new Set([
+    'md', 'markdown', 'txt', 'csv', 'tsv', 'json', 'yaml', 'yml', 'log',
+    'html', 'htm', 'xml', 'toml', 'ini', 'conf',
+    'py', 'pyi', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs',
+    'sh', 'bash', 'zsh', 'ps1', 'cmd', 'bat', 'rb', 'go', 'rs', 'java', 'kt',
+    'c', 'cpp', 'cc', 'h', 'hpp', 'css', 'scss', 'less',
+    'sql', 'graphql', 'gql',
+  ]);
+  const _CI_LIBRARY_IMPORT_EXTS = new Set([
+    ..._CI_IMAGE_EXTS,
+    ..._CI_OFFICE_WORD_EXTS,
+    ..._CI_OFFICE_SHEET_EXTS,
+    ..._CI_OFFICE_PRESENTATION_EXTS,
+    ..._CI_TEXT_EXTS,
+    'pdf',
+  ]);
+
+  function _extForName(name) {
+    const parts = String(name || '').split('.');
+    return parts.length > 1 ? (parts.pop() || '').toLowerCase() : '';
   }
 
-  function _canAddEntryToLibrary(kind) {
-    return kind !== 'video' && kind !== 'dir';
+  function _kindForName(name) {
+    const ext = _extForName(name);
+    if (_CI_IMAGE_EXTS.has(ext)) return 'image';
+    if (['mp4', 'webm', 'mov', 'm4v', 'ogv'].includes(ext)) return 'video';
+    if (ext === 'pdf') return 'pdf';
+    if (_CI_OFFICE_WORD_EXTS.has(ext)) return 'docx';
+    if (_CI_OFFICE_SHEET_EXTS.has(ext)) return 'spreadsheet';
+    if (_CI_OFFICE_PRESENTATION_EXTS.has(ext)) return 'presentation';
+    if (['doc', 'xls', 'ppt'].includes(ext)) return 'legacy_office';
+    if (_CI_TEXT_EXTS.has(ext)) return 'text';
+    return 'unsupported';
+  }
+
+  function _canAddEntryToLibrary(nameOrKind) {
+    const raw = String(nameOrKind || '');
+    if (!raw || raw === 'dir') return false;
+    const ext = _extForName(raw);
+    if (ext) return _CI_LIBRARY_IMPORT_EXTS.has(ext);
+    return ['image', 'pdf', 'docx', 'spreadsheet', 'presentation', 'text'].includes(raw);
   }
 
   function _formatBytes(bytes) {
@@ -659,16 +690,19 @@ const ConversationInfo = (() => {
       </details>
     `;
     }).join('');
-    const fileHtml = files.map((file) => `
+    const fileHtml = files.map((file) => {
+      const kind = file.kind || _kindForName(file.name || file.path);
+      return `
       <div class="conversation-info-file" role="button" tabindex="0" style="--depth:${depth}"
               data-file-path="${escapeHtml(file.path)}" draggable="true" title="${escapeHtml(file.path)}">
         <span class="conversation-info-file-icon">${_iconForName(file.name)}</span>
         <span class="conversation-info-file-name">${escapeHtml(file.name)}</span>
         <button type="button" class="conversation-info-file-menu-btn" data-file-menu
-                data-entry-kind="file" data-entry-path="${escapeHtml(file.path)}" data-entry-name="${escapeHtml(file.name)}"
+                data-entry-kind="${escapeHtml(kind)}" data-entry-path="${escapeHtml(file.path)}" data-entry-name="${escapeHtml(file.name)}"
                 title="${escapeHtml(moreTitle)}" aria-label="${escapeHtml(moreTitle)}">⋯</button>
       </div>
-    `).join('');
+    `;
+    }).join('');
     return dirHtml + fileHtml;
   }
 
@@ -752,7 +786,7 @@ const ConversationInfo = (() => {
       const label = String(item.displayName || item.name || '');
       const size = _formatBytes(item.bytes);
       const time = item.time ? new Date(item.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
-      const meta = [item.kind || '', size, time].filter(Boolean).join(' · ');
+      const meta = [size, time].filter(Boolean).join(' · ');
       const thumb = _ciThumbForKind(item.kind, label);
       return `
         <button type="button" class="ci-attach-row" data-attachment-name="${escapeHtml(name)}" title="${escapeHtml(label)}">

@@ -31,7 +31,10 @@ import { createLogger } from '../../logger';
 
 const log = createLogger('bridge-permissions');
 
-const RESPONSE_TIMEOUT_MS = 120 * 1000;
+// Human-in-the-loop confirmation window. A connector call is still denied if
+// unanswered, but 2 minutes was too easy to hit when the user stepped away
+// during a long-running agent task.
+const RESPONSE_TIMEOUT_MS = 10 * 60 * 1000;
 
 interface StoreFile {
   version: 1;
@@ -99,7 +102,7 @@ const _pending = new Map<string, Pending>();
 
 /** Lazy ipc lookup — same pattern `connectors/registry.ts` uses for
  *  `connectors:changed`; avoids a static feature→ipc import cycle and
- *  degrades cleanly in tests / open-source builds without the IPC bridge. */
+ *  degrades cleanly in tests / the open-source build builds without the IPC bridge. */
 function _broadcast(channel: string, payload: unknown): boolean {
   if (_broadcastOverride) {
     _broadcastOverride(channel, payload);

@@ -66,7 +66,7 @@ export const writeFileTool: AgentTool = defineTool({
  * Uses SandboxExecutor for timeout enforcement, output limits,
  * and blocked command filtering.
  */
-export const DEFAULT_BASH_TIMEOUT_MS = 30 * 60_000;
+export const DEFAULT_BASH_TIMEOUT_MS = 60 * 60_000;
 export const BASH_PROGRESS_INTERVAL_MS = 60_000;
 const LEGACY_DEFAULT_BASH_TIMEOUTS_MS = new Set([30_000, 300_000]);
 
@@ -90,7 +90,7 @@ export const bashTool: AgentTool = defineTool({
     type: "object",
     properties: {
       command: { type: "string", description: "The shell command to execute." },
-      timeoutMs: { type: "number", description: "Timeout in milliseconds (default: 1800000 = 30 min). Pass a larger value (e.g. 3600000) for long-running commands like builds, large installs, network fetches, video processing." },
+      timeoutMs: { type: "number", description: "Timeout in milliseconds (default: 3600000 = 60 min). Pass a larger value for unusually long-running commands like full builds, large installs, network fetches, video processing." },
       run_in_background: {
         type: "boolean",
         description: "Run detached and return immediately with a pid + log file path instead of waiting. Use for commands that may outlast any reasonable timeout (long builds, renders, big downloads). Poll progress by reading the log file; stop the process with `kill <pid>`. The process is NOT stopped automatically when the conversation ends.",

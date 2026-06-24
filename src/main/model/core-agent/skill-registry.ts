@@ -11,7 +11,8 @@
  *   2. <uid>/local/marketplace/skills/    (platform-installed; per-machine copy reconciled
  *                                          from the cloud-synced installs.json manifest)
  *
- * OPEN tier (separate loader; commander sessions only, per `includeOpenSources`):
+ * OPEN tier (separate loader; group-chat task + agent-edit authoring sessions,
+ * per `includeOpenSources`):
  *   3. enabled external-package skill roots (<uid>/local/packages/, registry-driven)
  *      — INLINED into `## Available skills` (registry-bounded, quality source;
  *        so the model uses an installed package instead of re-installing it).
@@ -19,8 +20,8 @@
  *      — NOT inlined; reached on demand via the `skill_search` tool (unbounded
  *        user content kept out of the cache-prefix). `searchOpenTierSkills`
  *        returns this global tier only.
- * Open-tier specs never enter `resolveSkillAllowlistRefs` /
- * `listSkillSpecs`, so agent-edit cannot adopt them into skill_list.
+ * Open-tier specs never enter generic `resolveSkillAllowlistRefs` /
+ * `listSkillSpecs`; agent metadata uses an explicit trusted+external helper.
  * Open-tier SKILL.md is read leniently and NEVER normalized or written.
  *
  * The loaders cache by per-dir mtime, so `list()` is effectively free
@@ -440,10 +441,10 @@ async function getOpenLoader(dirs: OpenTierDirs): Promise<SkillLoaderInstance | 
   return loader;
 }
 
-/** OPEN-tier dirs the commander's read scope must cover so the rendered
+/** OPEN-tier dirs the caller's read scope must cover so the rendered
  *  `read_file(<ROOT>/<id>/SKILL.md)` paths actually resolve. Existing dirs
- *  only. Callers (bus.ts) pass these as `readOnlyExtraRoots` for commander
- *  turns — same mechanism as the custom/marketplace roots. */
+ *  only. Callers pass these as `readOnlyExtraRoots` for group-chat task and
+ *  agent-edit authoring turns — same mechanism as the custom/marketplace roots. */
 export function openSkillReadRoots(uid: string): string[] {
   const dirs = _computeOpenTierDirs(uid);
   return [...dirs.external, ...dirs.global];
@@ -477,16 +478,16 @@ export interface OpenSkillSearchResult {
 }
 
 /**
- * Search OPEN-tier skills (enabled external packages + global roots) by
- * capability. Backs the commander's `skill_search` tool — the on-demand
- * replacement for inlining open-tier into the system prompt. Trusted-tier ids
- * win id collisions (dropped here) so a result never points at an ambiguous
- * read path. Ranking is lexical token overlap on name + description; an empty
- * query returns a bounded list ordered by name. Results are capped to `limit`
- * (default 8, max 20); `total_matched` lets the caller know more exist.
- * `disabledIds` (the user's component-disable set, passed in by the feature
- * caller so this model-layer module stays free of `features/*`) is filtered
- * out — a disabled skill never surfaces in search.
+ * Search GLOBAL-folder skills by capability. External-package skills are
+ * inlined into task/authoring prompts, so this backs the `skill_search` tool
+ * only for the still-lazy global tier. Trusted-tier ids win id collisions
+ * (dropped here) so a result never points at an ambiguous read path. Ranking
+ * is lexical token overlap on name + description; an empty query returns a
+ * bounded list ordered by name. Results are capped to `limit` (default 8,
+ * max 20); `total_matched` lets the caller know more exist. `disabledIds`
+ * (the user's component-disable set, passed in by the feature caller so this
+ * model-layer module stays free of `features/*`) is filtered out — a disabled
+ * skill never surfaces in search.
  */
 export async function searchOpenTierSkills(
   uid: string, query: string, limit?: number, disabledIds?: Iterable<string>,
@@ -546,8 +547,8 @@ export interface SystemPromptBlockOptions {
   /**
    * Restrict the skills listing to a subset. When undefined, every skill
    * discovered by the loader is rendered (legacy behavior). When an empty
-   * array is passed, renders an empty block — used when an agent declares
-   * `skill_list: []` to opt out of all skills.
+   * array is passed, renders an empty block — legacy explicit-empty allowlist
+   * semantics.
    *
    * Unknown ids/names are silently dropped (skill may have been deleted
    * since the agent was configured). Display-name matching preserves legacy
@@ -579,13 +580,14 @@ export interface SystemPromptBlockOptions {
    */
   displayNameById?: Map<string, string>;
   /**
-   * Commander (`gconv`) sessions only. Inlines enabled EXTERNAL-package skills
-   * into the block (registry-bounded, quality source — so the model sees what's
-   * installed and won't re-install it), and appends a static one-line hint
+   * Group-chat task sessions (`gconv` commander + `gmember` in-process agents)
+   * and agent-edit authoring sessions only. Inlines enabled EXTERNAL-package
+   * skills into the block (registry-bounded, quality source — so the model sees
+   * what's installed and won't re-install it), and appends a static one-line hint
    * pointing at `skill_search` (-> `searchOpenTierSkills`) for the still-lazy
    * GLOBAL-folder tier (unbounded user content). Ignored under an allowlist
-   * (project pinning / agent skill_list stay trusted-tier-only) — open-tier
-   * never enters agent workers or skill_list.
+   * (project pinning stays trusted-tier-only). Agent metadata uses a separate
+   * trusted+external helper and still excludes global-folder skills.
    */
   includeOpenSources?: boolean;
 }
@@ -629,13 +631,14 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
     rendered = filterDisabled(specs.filter((s) => allow.has(s.id)));
   }
 
-  // EXTERNAL-package skills are inlined for the commander (registry-bounded,
-  // quality source). GLOBAL-folder skills stay behind `skill_search` (unbounded
-  // user content; the hint below points there). Inlining external means a
-  // package install/enable busts the commander cache prefix — an accepted
-  // trade for the model directly seeing installed packages (so it won't try to
-  // re-install something already present). Allowlist / non-commander paths are
-  // unchanged (trusted-only — open-tier never enters agent skill_list).
+  // EXTERNAL-package skills are inlined for task/authoring sessions
+  // (registry-bounded, quality source). GLOBAL-folder skills stay behind
+  // `skill_search` (unbounded user content; the hint below points there).
+  // Inlining external means a package install/enable busts the session cache
+  // prefix — an accepted trade for the model directly seeing installed
+  // packages (so it won't try to re-install something already present).
+  // Allowlist / edit-session paths are unchanged (trusted-only — open-tier
+  // never enters authored agent skill_list).
   const externalRootSet = new Set<string>();
   let externalRankByRoot: Map<string, number> | null = null;
   if (opts.includeOpenSources && !allowlisted) {
@@ -694,10 +697,10 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
   }
 
   const block = await renderSkillLines(rendered, rootEntries);
-  // Commander-only hint that GLOBAL-folder skills exist behind `skill_search`
+  // Task/authoring hint that GLOBAL-folder skills exist behind `skill_search`
   // (external packages are inlined above). Constant (no count) so global-folder
   // changes don't churn the cache prefix. Skipped under an allowlist —
-  // pinned/agent skill_list stays trusted-only.
+  // pinned/authored agent skill_list stays trusted-only.
   if (opts.includeOpenSources && !allowlisted) {
     return block ? `${block}\n\n${OPEN_TIER_SKILL_HINT}` : OPEN_TIER_SKILL_HINT;
   }
@@ -880,4 +883,30 @@ export async function listSkills(): Promise<Array<{ id: string; name: string; de
 export async function listSkillSpecs(): Promise<SkillSpec[]> {
   const loader = await getLoader();
   return loader.list();
+}
+
+/**
+ * Skill refs an agent authoring session may persist in `<skills>` metadata.
+ * Includes trusted skills plus enabled external-package skills that are
+ * inlined into the edit prompt. Deliberately excludes global-folder skills:
+ * they remain searchable/readable for authoring context, but are unbounded
+ * machine-global content and should not become synced agent metadata.
+ */
+export async function listSkillSpecsForAgentMetadata(uid: string): Promise<SkillAllowlistRef[]> {
+  const loader = await getLoader();
+  let specs: SkillAllowlistRef[] = loader.list();
+  const dirs = _computeOpenTierDirs(uid);
+  if (!dirs.external.length) return specs;
+  const openLoader = await getOpenLoader(dirs);
+  if (!openLoader) return specs;
+  const externalSet = new Set(dirs.external.map((d) => path.resolve(d)));
+  const trustedIds = new Set(specs.map((s) => s.id));
+  const externalSpecs = openLoader.list().filter((s) => {
+    if (!externalSet.has(path.resolve(s.source))) return false;
+    if (trustedIds.has(s.id)) return false;
+    const meta = packageMetaForSkillDir(uid, s.dir);
+    return !!meta.package_name && meta.package_enabled !== false;
+  });
+  specs = [...specs, ...externalSpecs];
+  return specs;
 }

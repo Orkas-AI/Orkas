@@ -81,6 +81,36 @@ function writeSkillOnDisk(id: string, name = id): void {
   fs.writeFileSync(path.join(dir, 'SKILL.md'), lines.join('\n'));
 }
 
+function packagesDir(): string {
+  return path.join(tmpDir, TEST_UID, 'local', 'packages');
+}
+
+function writeExternalPackageSkill(pkgName: string, skillId: string): string {
+  const root = path.join(packagesDir(), pkgName, 'skills');
+  const skillDir = path.join(root, skillId);
+  fs.mkdirSync(skillDir, { recursive: true });
+  fs.writeFileSync(path.join(skillDir, 'SKILL.md'), [
+    '---',
+    `name: ${skillId}`,
+    `description: external skill ${skillId}`,
+    '---',
+    '',
+    'body',
+  ].join('\n'));
+  fs.mkdirSync(packagesDir(), { recursive: true });
+  fs.writeFileSync(path.join(packagesDir(), '_registry.json'), JSON.stringify({
+    version: 1,
+    packages: [{
+      name: pkgName,
+      kind: 'skill',
+      skill_roots: ['skills'],
+      bin_entries: [],
+      enabled: true,
+    }],
+  }));
+  return root;
+}
+
 describe('agents › normalizeAgent', () => {
   it('returns null for missing agent_id', async () => {
     const a = await loadAgents();
@@ -115,7 +145,7 @@ describe('agents › normalizeAgent', () => {
       enabled: true,
     });
     // skill_list omitted from raw → not set on norm (undefined sentinel,
-    // NOT []); runtime uses this to bypass filtering entirely.
+    // NOT []); kept as absent dependency metadata.
     expect('skill_list' in (norm as any)).toBe(false);
   });
 
@@ -1130,6 +1160,14 @@ describe('agents › updateCustomAgent', () => {
     expect(updated?.skill_list).toEqual(['known']);
   });
 
+  it('keeps enabled external-package skills in skill_list metadata', async () => {
+    writeExternalPackageSkill('pkg-tools', 'external-helper');
+    writeCustomAgent('abc', { name: 'N' });
+    const a = await loadAgents();
+    const updated = await a.updateCustomAgent('abc', { skill_list: ['external-helper'] });
+    expect(updated?.skill_list).toEqual(['external-helper']);
+  });
+
   it('keeps skill_list verbatim when all ids are known (no closure expansion)', async () => {
     writeSkillOnDisk('a');
     writeSkillOnDisk('b');
@@ -1196,7 +1234,7 @@ describe('agents › appendAgentSkill', () => {
     expect(reread?.skill_list).toEqual(['existing', 'learned-via-reflection']);
   });
 
-  it('is a no-op when skill_list is undefined (unrestricted agent)', async () => {
+  it('is a no-op when skill_list metadata is undefined', async () => {
     writeCustomAgent('abc', { name: 'N' }); // no skill_list
     const a = await loadAgents();
     const ok = await a.appendAgentSkill('abc', 'new-skill');
@@ -1314,6 +1352,24 @@ describe('agents › streamSendToAgentEditChat synthesized progress', () => {
     expect(first.role).toBe('user');
     expect(first.content).toBe('帮我完善这个智能体');
     expect(first.model_text).toBe('请基于名称和简介完善智能体工作流。');
+  });
+
+  it('exposes open-tier skills and skill_search to the agent edit model call', async () => {
+    let seenOpts: any = null;
+    streamImpl.current = async function* (opts: any) {
+      seenOpts = opts;
+      yield { type: 'final', text: 'done' };
+    };
+    writeCustomAgent('abc', { name: 'N' });
+    const externalRoot = writeExternalPackageSkill('pkg-tools', 'external-helper');
+
+    const a = await loadAgents();
+    for await (const _ev of a.streamSendToAgentEditChat('u1', 'abc', '帮我完善这个智能体')) {
+      // drain
+    }
+
+    expect(seenOpts.extraTools.map((t: any) => t.name)).toContain('skill_search');
+    expect(seenOpts.readOnlyExtraRoots).toContain(externalRoot);
   });
 
   it('passes edit-chat attachments into the model prompt and history', async () => {

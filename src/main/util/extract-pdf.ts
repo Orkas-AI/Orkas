@@ -24,7 +24,7 @@ const DEFAULT_MAX_CHARS = 8_000;
  *  in a way that invalidates on-disk caches (chat_attachments /
  *  contexts_extract / file_indexer). Each cache layer records this
  *  version and wipes the directory on mismatch. */
-export const EXTRACT_CACHE_VERSION = 2;
+export const EXTRACT_CACHE_VERSION = 3;
 
 /** Lazy module handle so we only pay the import cost once per process. */
 let _pdfjsPromise: Promise<any> | null = null;

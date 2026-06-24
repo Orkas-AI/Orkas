@@ -51,6 +51,7 @@ import { isPathAllowed } from '../../util/path-sandbox';
 import { macosTccSensitivePath } from '../../util/macos-tcc';
 import { parseSkillPath } from '../../features/expert_signals/skill_path';
 import { isSkillEnabled } from '../../features/component_enabled';
+import { recordRead } from './read-tracker';
 
 const log = createLogger('file-tools');
 
@@ -65,6 +66,11 @@ const MAX_SEARCH_RESULTS = 200;
 
 /** Max matches returned by grep_files per call. */
 const MAX_GREP_MATCHES = 200;
+
+/** grep_files yields to the event loop every N files scanned so a large text
+ *  bucket can't stall the main process (reads are async; this also caps the
+ *  CPU-burst between awaits). */
+const GREP_YIELD_EVERY = 64;
 
 /** Concurrent extract workers in grep_files. Rich-document cache miss path. */
 const GREP_EXTRACT_CONCURRENCY = 4;
@@ -127,6 +133,22 @@ function resolveAbs(ctx: ToolContext, p: string): string {
   return path.resolve(ctx.workingDir ?? '.', p);
 }
 
+/** Prefix each line with its 1-based absolute line number + tab (compact
+ *  `cat -n` style; no padding, to keep it token-cheap). `startLine` is the
+ *  number of the slice's first line, so a mid-file slice still shows true line
+ *  numbers. The `<n>\t` prefix is a DISPLAY annotation — NOT part of the file —
+ *  so `edit_file` old_string must omit it. Returns the numbered text plus the
+ *  last line number shown (for the `lines="a-b"` header). */
+function addLineNumbers(text: string, startLine: number): { text: string; lastLine: number } {
+  if (text === '') return { text: '', lastLine: startLine };
+  const endsWithNewline = text.endsWith('\n');
+  const lines = text.split('\n');
+  if (endsWithNewline) lines.pop(); // drop the '' that trails a final newline
+  const numbered = lines.map((line, i) => `${startLine + i}\t${line}`).join('\n');
+  const lastLine = startLine + lines.length - 1;
+  return { text: endsWithNewline ? `${numbered}\n` : numbered, lastLine };
+}
+
 function errText(code: string, msg: string): string {
   return `${code}: ${msg}`;
 }
@@ -173,6 +195,7 @@ function isExtractableRichKind(kind: string): boolean {
 function createReadFileTool(opts: FileToolsOpts): AgentTool {
   return {
     name: 'read_file',
+    executionMode: 'parallel',
     description:
       'Read a slice of a file\'s text by absolute path.\n'
       + '\n'
@@ -182,8 +205,14 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
       + '  charEnd   — 0-based exclusive end offset.  Default = total_chars (end of file).\n'
       + '\n'
       + 'Response header:\n'
-      + '  <file path="..." kind="..." total_chars="N" covered="a-b"> … </file>\n'
-      + '  `covered` echoes the clamped [charStart, charEnd) actually returned.\n'
+      + '  <file path="..." kind="..." total_chars="N" covered="a-b" lines="x-y"> … </file>\n'
+      + '  `covered` echoes the clamped [charStart, charEnd) actually returned; `lines` is the\n'
+      + '  absolute line range shown.\n'
+      + '\n'
+      + 'Body format:\n'
+      + '  Each line is prefixed with its absolute line number and a tab: `<n>\\t<line text>`.\n'
+      + '  The `<n>\\t` prefix is a DISPLAY annotation, NOT part of the file — when you pass text\n'
+      + '  back to `edit_file` as old_string, use the raw line WITHOUT the number+tab prefix.\n'
       + '\n'
       + 'How to use:\n'
       + '  - Whole file: omit charStart/charEnd. Header tells you total_chars.\n'
@@ -260,11 +289,15 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
         const total = result.meta.totalChars ?? 0;
         const cs = result.range.charStart;
         const ce = result.range.charEnd;
+        // Number the lines for display (the model thinks in lines for code);
+        // char offsets remain the addressing/paging unit.
+        const { text: numberedContent, lastLine } = addLineNumbers(result.content, result.startLine);
         const attrs = [
           `path="${abs}"`,
           `kind="${kind}"`,
           `total_chars="${total}"`,
           `covered="${cs}-${ce}"`,
+          `lines="${result.startLine}-${lastLine}"`,
           ...(result.meta.extractionEmpty ? ['extraction="empty_pages"'] : []),
         ];
         const header = `<file ${attrs.join(' ')}>`;
@@ -282,7 +315,11 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
             catch (err) { log.warn(`onSkillInvoked callback failed: ${(err as Error).message}`); }
           }
         }
-        return { content: `${header}\n${result.content}\n</file>` };
+        // Stamp the read-state baseline so a later edit_file accepts an edit
+        // built on these bytes (read-before-edit) and rejects it if the file
+        // changed since (OCC). See read-tracker.ts.
+        recordRead(ctx, abs);
+        return { content: `${header}\n${numberedContent}\n</file>` };
       } catch (err) {
         if (err instanceof NeedStatError) {
           log.warn(`read_file need-stat user=${opts.userId} kind=${err.kind} path=${abs}`);
@@ -462,6 +499,7 @@ function walkFiles(root: string, max: number): { files: string[]; skippedReason?
 function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
   return {
     name: 'search_files',
+    executionMode: 'parallel',
     description:
       'Discover files when you do NOT already have the path. Scans the active workspace +\n'
       + 'the current conversation\'s attachment dir.\n'
@@ -537,12 +575,9 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
           const cached = getCachedMeta(opts.userId, abs);
           if (cached?.totalChars !== undefined) hit.totalChars = cached.totalChars;
           hits.push(hit);
-          if (hits.length >= MAX_SEARCH_RESULTS) break;
         }
-        if (hits.length >= MAX_SEARCH_RESULTS) break;
       }
 
-      hits.sort((a, b) => b.mtime - a.mtime);
       if (!hits.length) {
         if (skippedScans.length) {
           return {
@@ -551,7 +586,13 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
         }
         return { content: query ? `No matches for "${query}".` : 'No files found.' };
       }
-      const lines = hits.map((h) => {
+      // Newest-first, THEN cap — so the cap keeps the most recently modified
+      // files (previously the cap was applied during the walk, which dropped
+      // recent files that happened to be visited late in the traversal).
+      hits.sort((a, b) => b.mtime - a.mtime);
+      const total = hits.length;
+      const shown = total > MAX_SEARCH_RESULTS ? hits.slice(0, MAX_SEARCH_RESULTS) : hits;
+      const lines = shown.map((h) => {
         const bits = [
           `path=${h.path}`,
           `size=${h.size}`,
@@ -561,8 +602,11 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
         ];
         return `- ${h.name}  (${bits.join(', ')})`;
       });
-      log.info(`search_files user=${opts.userId} query="${query}" hits=${hits.length}`);
-      return { content: `${hits.length} match(es):\n${lines.join('\n')}` };
+      log.info(`search_files user=${opts.userId} query="${query}" hits=${total} shown=${shown.length}`);
+      const header = total > shown.length
+        ? `${total} match(es), showing the ${MAX_SEARCH_RESULTS} most recently modified:`
+        : `${total} match(es):`;
+      return { content: `${header}\n${lines.join('\n')}` };
     },
   };
 }
@@ -574,6 +618,20 @@ interface GrepHit {
   line: number;
   snippet: string;
   source: 'attachment' | 'workspace' | 'extra';
+}
+
+/** Minimal glob → RegExp for grep_files scoping. `*` = a run of non-slash
+ *  chars, `**` = any directories, `?` = one non-slash char. A glob WITHOUT
+ *  `/` is matched against the basename at any depth (e.g. `*.ts`); a glob WITH
+ *  `/` is matched against the path relative to its root (e.g. `src/**`). */
+function grepGlobToRegExp(glob: string): RegExp {
+  const esc = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&'); // escape regex specials, keep * ? /
+  const re = esc
+    .replace(/\*\*\//g, '(?:.*/)?')
+    .replace(/\*\*/g, '.*')
+    .replace(/\*/g, '[^/]*')
+    .replace(/\?/g, '[^/]');
+  return new RegExp('^' + re + '$', 'i');
 }
 
 async function pMapLimit<T, U>(
@@ -599,6 +657,7 @@ async function pMapLimit<T, U>(
 function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
   return {
     name: 'grep_files',
+    executionMode: 'parallel',
     description:
       'Search for a pattern across files visible to this conversation (workspace + attachment dir).\n'
       + 'File type handling:\n'
@@ -606,13 +665,15 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
       + '  • PDF / modern Office → extracted to text (cached) and searched\n'
       + '  • images / legacy Office / binaries → skipped\n'
       + 'First cross-file grep on a fresh set of rich documents may be slow (parallel extract);\n'
-      + 'subsequent calls in the same session are cached. Use `search_files` to narrow the\n'
-      + 'set before grepping when the scope is large.',
+      + 'subsequent calls in the same session are cached. On a large project, pass `glob` to\n'
+      + 'scope the files and `output_mode:"files"` when you only need to know WHICH files match.',
     inputSchema: {
       type: 'object',
       properties: {
         pattern: { type: 'string', description: 'Pattern to search for.' },
         regex: { type: 'boolean', description: 'Default false — treat pattern as a case-insensitive substring.' },
+        glob: { type: 'string', description: 'Optional. Limit the search to files matching this glob. No "/" → match the basename at any depth (e.g. "*.ts", "*.{vue}"); with "/" → match the path relative to its root (e.g. "src/**", "src/**/*.ts"). Use it to cut noise + tokens on large projects.' },
+        output_mode: { type: 'string', enum: ['content', 'files', 'count'], description: 'content (default): one line per match. files: just the file paths that contain a match — much cheaper when you only need which files. count: number of matches per file.' },
       },
       required: ['pattern'],
     },
@@ -631,6 +692,14 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
         return { content: errText('E_BAD_INPUT', `invalid regex: ${(err as Error).message}`), isError: true };
       }
 
+      const globStr = typeof input.glob === 'string' ? input.glob.trim() : '';
+      const globHasSlash = globStr.includes('/');
+      let globRe: RegExp | null = null;
+      if (globStr) { try { globRe = grepGlobToRegExp(globStr); } catch { globRe = null; } }
+      const mode: 'content' | 'files' | 'count' =
+        input.output_mode === 'files' || input.output_mode === 'count' ? input.output_mode : 'content';
+      const filesMode = mode === 'files';
+
       const rootKinds: Array<{ root: string; source: 'attachment' | 'workspace' | 'extra' }> = [];
       try { rootKinds.push({ root: getWorkspacePath(opts.userId, opts.projectId), source: 'workspace' }); }
       catch { /* workspace unavailable */ }
@@ -642,7 +711,7 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
         return { content: errText('E_NO_SCOPE', 'no visible roots for this conversation'), isError: true };
       }
 
-      const targets: Array<{ abs: string; source: 'attachment' | 'workspace' | 'extra' }> = [];
+      const targets: Array<{ abs: string; source: 'attachment' | 'workspace' | 'extra'; root: string }> = [];
       const skippedScans: string[] = [];
       let budget = MAX_SCAN_FILES;
       for (const { root, source } of rootKinds) {
@@ -654,7 +723,7 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
         }
         const files = scan.files;
         budget -= files.length;
-        for (const abs of files) targets.push({ abs, source });
+        for (const abs of files) targets.push({ abs, source, root });
       }
       if (!targets.length && skippedScans.length) {
         return {
@@ -662,37 +731,56 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
         };
       }
 
+      // Scope by glob (when given). No-slash globs match the basename at any
+      // depth; slash globs match the root-relative path (normalized to "/").
+      const scoped = globRe
+        ? targets.filter((t) => {
+            const cmp = globHasSlash
+              ? path.relative(t.root, t.abs).split(path.sep).join('/')
+              : path.basename(t.abs);
+            return globRe!.test(cmp);
+          })
+        : targets;
+      if (globRe && !scoped.length) {
+        return { content: `No files matched glob "${globStr}" in the visible scope.` };
+      }
+
       let scanned = 0, skipped = 0, extracted = 0;
       const hits: GrepHit[] = [];
 
       // Split into text-direct vs extract-required buckets. Text bucket is
       // fast (sync read + scan); extract bucket is bounded-concurrency async.
-      const textTargets = targets.filter((t) => {
+      const textTargets = scoped.filter((t) => {
         const k = kindOf(t.abs);
         if (k === 'image') return false;
         return k === 'text';
       });
-      const extractTargets = targets.filter((t) => {
+      const extractTargets = scoped.filter((t) => {
         const k = kindOf(t.abs);
         return isExtractableRichKind(k);
       });
       // Images + unknown → skipped
-      skipped += targets.length - textTargets.length - extractTargets.length;
+      skipped += scoped.length - textTargets.length - extractTargets.length;
 
-      // Text bucket — synchronous line scan.
+      // Text bucket — async, non-blocking line scan: read each file off the
+      // event loop and yield every GREP_YIELD_EVERY files, so a large workspace
+      // can't stall the main process (was a synchronous readFileSync loop).
+      let sinceYield = 0;
       for (const t of textTargets) {
+        if (hits.length >= MAX_GREP_MATCHES) break;
         scanned++;
+        if (++sinceYield >= GREP_YIELD_EVERY) { sinceYield = 0; await new Promise<void>((r) => setImmediate(r)); }
         let body: string;
-        try { body = fs.readFileSync(t.abs, 'utf8'); }
+        try { body = await fs.promises.readFile(t.abs, 'utf8'); }
         catch { continue; }
         const lines = body.split('\n');
         for (let i = 0; i < lines.length; i++) {
           if (matcher.test(lines[i])) {
             hits.push({ path: t.abs, line: i + 1, snippet: snippetFromLine(lines[i], matcher), source: t.source });
+            if (filesMode) break;   // files/count: one snippet per file is enough for files-mode
             if (hits.length >= MAX_GREP_MATCHES) break;
           }
         }
-        if (hits.length >= MAX_GREP_MATCHES) break;
       }
 
       // Extract bucket — parallel extract with cache, then line scan.
@@ -714,6 +802,7 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
             if (hits.length >= MAX_GREP_MATCHES) return;
             if (matcher.test(lines[i])) {
               hits.push({ path: t.abs, line: i + 1, snippet: snippetFromLine(lines[i], matcher), source: t.source });
+              if (filesMode) return;   // one hit per file is enough for files-mode
             }
           }
         });
@@ -730,10 +819,25 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
             + `scanned=${scanned} extracted=${extracted} skipped=${skipped}`,
         };
       }
+      const tail = `  scanned=${scanned} extracted=${extracted} skipped=${skipped}`;
+      const capped = hits.length >= MAX_GREP_MATCHES;
+      if (mode === 'files') {
+        const files = [...new Set(hits.map((h) => h.path))];
+        const header = `${files.length} file(s) with matches`
+          + (capped ? ` (capped — narrow with glob)` : '') + tail;
+        return { content: `${header}\n${files.map((f) => `  ${f}`).join('\n')}` };
+      }
+      if (mode === 'count') {
+        const counts = new Map<string, number>();
+        for (const h of hits) counts.set(h.path, (counts.get(h.path) || 0) + 1);
+        const body = [...counts.entries()].map(([p, n]) => `  ${p}: ${n}`).join('\n');
+        const header = `${counts.size} file(s), ${hits.length} match(es)`
+          + (capped ? ` (capped at ${MAX_GREP_MATCHES})` : '') + tail;
+        return { content: `${header}\n${body}` };
+      }
       const lines = hits.map((h) => `  ${h.path}:${h.line}  ${h.snippet}`);
       const header = `${hits.length} match(es)`
-        + (hits.length >= MAX_GREP_MATCHES ? ` (capped at ${MAX_GREP_MATCHES})` : '')
-        + `  scanned=${scanned} extracted=${extracted} skipped=${skipped}`;
+        + (capped ? ` (capped at ${MAX_GREP_MATCHES})` : '') + tail;
       return { content: `${header}\n${lines.join('\n')}` };
     },
   };
@@ -782,6 +886,7 @@ function snippetFromLine(line: string, matcher: RegExp): string {
 function createListFilesTool(opts: FileToolsOpts): AgentTool {
   return {
     name: 'list_files',
+    executionMode: 'parallel',
     description:
       'List the entries (files and subdirectories) of a directory by absolute path.\n'
       + '\n'

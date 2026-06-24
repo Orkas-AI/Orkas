@@ -2,6 +2,7 @@
   "categories": [
     { "code": "anim", "name_zh": "动画 / 视频", "name_en": "Animation / Video", "name_ja": "アニメ / 動画", "sort_order": 10 },
     { "code": "browser", "name_zh": "浏览器", "name_en": "Browser", "name_ja": "ブラウザ", "sort_order": 30 },
+    { "code": "office", "name_zh": "办公", "name_en": "Office", "name_ja": "オフィス", "sort_order": 60 },
     { "code": "slides", "name_zh": "演示 / PPT", "name_en": "Slides / PPT", "name_ja": "スライド / PPT", "sort_order": 70 }
   ],
   "projects": [
@@ -49,6 +50,21 @@
       "description_en": "Generate an editable slide deck from an outline or a few bullet points.",
       "task_zh": "把要点做成一份 PPT",
       "task_en": "Turn my outline into a slide deck"
+    },
+    {
+      "id": "OfficeCLI",
+      "name": "OfficeCLI",
+      "repo": "iOfficeAI/OfficeCLI",
+      "category": "office",
+      "driver": "cli",
+      "glyph": "▤",
+      "color": "#2563eb",
+      "by": "OfficeCLI",
+      "home": true,
+      "description_zh": "让 AI 读写、生成和预览 Word、Excel、PowerPoint 文件, 无需本机安装 Office。",
+      "description_en": "Create, read, edit, and preview Word, Excel, and PowerPoint files without a local Office installation.",
+      "task_zh": "帮我生成或修改一份 Office 文档",
+      "task_en": "Create or edit an Office document"
     },
     {
       "id": "crawl4ai",

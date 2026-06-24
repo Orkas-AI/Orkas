@@ -105,7 +105,7 @@ describe('packages › buildEnvSummaryLine de-dup', () => {
     writeCompanion('crawl4ai');
     const { buildEnvSummaryLine } = await loadPackages();
     const line = buildEnvSummaryLine(TEST_UID);
-    expect(line).toBe('No external package CLIs installed.');
+    expect(line).toContain('No external package CLIs installed.');
   });
 
   it('keeps a second CLI package that has no companion', async () => {
@@ -121,5 +121,16 @@ describe('packages › buildEnvSummaryLine de-dup', () => {
     const line = buildEnvSummaryLine(TEST_UID);
     expect(line).toContain('`oth`');
     expect(line).not.toContain('`crwl`');
+  });
+
+  it('always states built-in runtimes are available and must not be reinstalled', async () => {
+    writeRegistry({ version: 1, packages: [] });
+    const { buildEnvSummaryLine } = await loadPackages();
+    const line = buildEnvSummaryLine(TEST_UID);
+    // Tells the model node/npm/npx/python/uv are bundled so it uses them
+    // instead of brew/curl-installing a runtime (the long-thrash failure mode).
+    expect(line).toContain('Built-in runtimes');
+    for (const rt of ['`node`', '`npm`', '`npx`', '`python`', '`uv`']) expect(line).toContain(rt);
+    expect(line).toContain('never install or upgrade these runtimes');
   });
 });

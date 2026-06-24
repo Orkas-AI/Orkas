@@ -61,10 +61,10 @@ import { resolveConfirmation as resolveDeleteConfirmation } from '../model/core-
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { shell } from 'electron';
-import { WS_ROOT, chatAttachmentDir, projectFilesDir } from '../paths';
+import { DEFAULT_USER_WORKSPACE, WS_ROOT, chatAttachmentDir, projectFilesDir } from '../paths';
 import { readState as readGroupChatState } from '../features/group_chat/state';
-import { readPlan as readGroupChatPlan } from '../features/group_chat/plan';
 import { logErrorRef } from '../util/log-redact';
+import { macosTccSensitivePath } from '../util/macos-tcc';
 
 const log = createLogger('ipc');
 
@@ -83,6 +83,32 @@ type StreamHandler = (
   signal: AbortSignal,
 ) => AsyncGenerator<any, void, unknown>;
 
+function _activeUserIdForPicker(): string {
+  try { return users.getActiveUserId(); } catch { return ''; }
+}
+
+function _usableDialogDefaultPath(candidate: string | undefined): string | undefined {
+  if (!candidate || !path.isAbsolute(candidate)) return undefined;
+  const abs = path.resolve(candidate);
+  if (macosTccSensitivePath(abs, { recursive: true })) return undefined;
+  try { return fs.statSync(abs).isDirectory() ? abs : undefined; }
+  catch { return undefined; }
+}
+
+function _safeDialogDefaultPath(preferred?: string): string | undefined {
+  const uid = _activeUserIdForPicker();
+  const candidates: Array<string | undefined> = [preferred];
+  if (uid) {
+    try { candidates.push(userWorkspace.getWorkspacePath(uid)); } catch { /* ignore */ }
+  }
+  candidates.push(DEFAULT_USER_WORKSPACE, WS_ROOT);
+  for (const candidate of candidates) {
+    const usable = _usableDialogDefaultPath(candidate);
+    if (usable) return usable;
+  }
+  return undefined;
+}
+
 const CHAT_PICK_EXTENSIONS = [
   'md', 'markdown', 'txt', 'csv', 'tsv', 'json', 'yaml', 'yml', 'log',
   'pdf', 'docx', 'docm', 'xlsx', 'xlsm', 'pptx', 'pptm',
@@ -96,7 +122,8 @@ const CONTEXT_PICK_EXTENSIONS = [
   'sh', 'bash', 'zsh', 'ps1', 'cmd', 'bat', 'rb', 'go', 'rs', 'java', 'kt',
   'c', 'cpp', 'cc', 'h', 'hpp', 'css', 'scss', 'less',
   'sql', 'graphql', 'gql',
-  'pdf', 'docx', 'png', 'jpg', 'jpeg', 'webp', 'gif',
+  'pdf', 'docx', 'docm', 'xlsx', 'xlsm', 'pptx', 'pptm',
+  'png', 'jpg', 'jpeg', 'webp', 'gif',
 ];
 const PROJECT_PICK_EXTENSIONS = [
   ...CONTEXT_PICK_EXTENSIONS,
@@ -107,6 +134,7 @@ async function _pickLocalFiles(
   title: string,
   extensions: string[],
   multiSelections = true,
+  seedWorkspaceOnFirstOpen = false,
 ): Promise<string[]> {
   const parent = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
   const ext = Array.from(new Set(extensions.map((x) => String(x || '').replace(/^\./, '').toLowerCase()).filter(Boolean)));
@@ -115,6 +143,12 @@ async function _pickLocalFiles(
     properties: multiSelections ? ['openFile', 'multiSelections'] : ['openFile'],
     filters: ext.length ? [{ name: 'Supported files', extensions: ext }] : undefined,
   };
+  let preferred: string | undefined;
+  if (seedWorkspaceOnFirstOpen) {
+    const uid = _activeUserIdForPicker();
+    preferred = uid ? userWorkspace.consumePickerFirstOpenDefault(uid) : undefined;
+  }
+  opts.defaultPath = _safeDialogDefaultPath(preferred);
   const res = parent
     ? await dialog.showOpenDialog(parent, opts)
     : await dialog.showOpenDialog(opts);
@@ -388,14 +422,6 @@ async function _isConversationRecordedFile(userId: string, cid: string, absPath:
     for (const msg of messages as any[]) {
       const produced = Array.isArray(msg?.produced) ? msg.produced : [];
       if (produced.some(matches)) return true;
-    }
-  } catch { /* best-effort allow-list */ }
-
-  try {
-    const plan = await readGroupChatPlan(userId, cid);
-    for (const step of plan?.steps || []) {
-      const files = Array.isArray(step.output_files) ? step.output_files : [];
-      if (files.some(matches)) return true;
     }
   } catch { /* best-effort allow-list */ }
 
@@ -741,7 +767,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
         results.push({ ok: false, name, error: (err as Error)?.message || String(err) });
       }
     }
-    return { files: results };
+    return { ok: true, files: results };
   },
 
   'projects.files.createText': async ({ projectId, name }, ctx) => {
@@ -1046,29 +1072,9 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return groupChat.listMembers(ctx.userId, cid);
   },
 
-  'groupChat.readPlan': async ({ cid }, ctx) => {
-    if (!safeId(cid)) throw new Error('invalid cid');
-    return groupChat.readPlanForCid(ctx.userId, cid);
-  },
-
   'groupChat.runtimeStatus': async ({ cid }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
     return groupChat.runtimeStatus(ctx.userId, cid);
-  },
-
-  'groupChat.continuePlan': async ({ cid }, ctx) => {
-    if (!safeId(cid)) throw new Error('invalid cid');
-    return groupChat.continuePlan(ctx.userId, cid);
-  },
-
-  'groupChat.retryStep': async ({ cid, stepIndex }, ctx) => {
-    if (!safeId(cid)) throw new Error('invalid cid');
-    return groupChat.retryStep(ctx.userId, cid, Number(stepIndex));
-  },
-
-  'groupChat.skipStep': async ({ cid, stepIndex }, ctx) => {
-    if (!safeId(cid)) throw new Error('invalid cid');
-    return groupChat.skipStep(ctx.userId, cid, Number(stepIndex));
   },
 
   'groupChat.markFormSubmitted': async ({ cid, msgId, formId, values }, ctx) => {
@@ -1703,13 +1709,21 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   'contexts.pickAndUpload': async ({ targetDir } = {}) => {
-    const picked = await _pickLocalFiles('Choose files', CONTEXT_PICK_EXTENSIONS, true);
+    const picked = await _pickLocalFiles('Choose files', CONTEXT_PICK_EXTENSIONS, true, /* seedWorkspaceOnFirstOpen */ true);
     const results = [];
     for (const filePath of picked) {
       const name = path.basename(filePath);
       try {
-        const buf = fs.readFileSync(filePath);
         const target = _targetInDir(targetDir, name);
+        if (contexts.hasHiddenContextPathSegment(target)) {
+          results.push({ ok: false, name, target, reason: 'hidden' });
+          continue;
+        }
+        if (!contexts.isSupportedContextFileName(target)) {
+          results.push({ ok: false, name, target, reason: 'ext' });
+          continue;
+        }
+        const buf = fs.readFileSync(filePath);
         const res = contexts.uploadContextFile(target, buf);
         results.push({ name, target, ...res });
       } catch (err) {

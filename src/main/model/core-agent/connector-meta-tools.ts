@@ -18,13 +18,13 @@
  *   3. When NO connector is visible to this actor, both the prompt block and the meta-tools are
  *      omitted entirely — `tools[]` shrinks by two slots and the system prompt stays smaller.
  *
- * Visibility: commander sees every connected instance. The `enabled_subtools` instance-level
- * whitelist further filters which actions each connector advertises. The resolver still accepts
- * an optional actor filter for tests / future gates, but runner.ts no longer exposes connector
- * tools to group-chat agent workers.
+ * Visibility: group-chat commander and agent workers see every connected instance. The
+ * `enabled_subtools` instance-level whitelist further filters which actions each connector
+ * advertises. The resolver still accepts an optional actor filter for tests / future gates,
+ * but runner.ts intentionally does not pass one for group-chat actors.
  *
  * Session-kind gate: callers (runner.ts) invoke this module for `gconv` full access and
- * `agent` edit-session discovery. Group-chat agent workers / skill edit chats / KB-image
+ * `gmember` full access, plus `agent` edit-session discovery. Skill edit chats / KB-image
  * extraction / CLI dispatch / reflect / memory-extract / anon stay free of connector exposure.
  */
 import type { AgentTool, ToolResult } from '#core-agent';
@@ -47,9 +47,9 @@ const log = createLogger('connector-meta-tools');
 export interface ConnectorMetaToolsOpts {
   /** Active uid. Required — without it the meta-tools have no scope. */
   userId: string;
-  /** Optional actor filter. Empty / undefined = commander scope. */
+  /** Optional actor filter. Empty / undefined = full task-session scope. */
   agentId?: string;
-  /** Conversation id — required for the commander `add_custom_connector`
+  /** Conversation id — required for the task-session `add_custom_connector`
    *  tool so its confirmation dialog routes to the right conversation.
    *  Omitted for discover-mode (agent-edit) where add is not exposed. */
   cid?: string;
@@ -105,6 +105,10 @@ export async function getConnectorPromptBlock(uid: string, agentId: string | und
 function createListConnectorToolsTool(opts: ConnectorMetaToolsOpts): AgentTool {
   return {
     name: 'list_connector_tools',
+    // Kept sequential to match the connector-tool rule in
+    // core-agent/src/tools/base.ts (connector tools stay sequential). Although
+    // discovery is read-only, aligning with the documented rule avoids a future
+    // side-effectful connector tool inheriting `parallel` by copy-paste.
     description:
       'Discover the actions available on a specific connector (the system prompt\'s `## Connectors` ' +
       'block lists which connector ids exist for this conversation). Returns each action\'s name, ' +
@@ -260,7 +264,7 @@ function createCallConnectorToolTool(opts: ConnectorMetaToolsOpts): AgentTool {
   };
 }
 
-/** Commander-only tool: install a user-described custom MCP server. The
+/** Task-session tool: install a user-described custom MCP server. The
  *  install ALWAYS requires the user to approve a confirmation dialog
  *  (plan §C2 / §C3) — for stdio that dialog shows the exact command that
  *  will run. The LLM can describe the server but cannot complete the
@@ -324,7 +328,7 @@ function createAddCustomConnectorTool(opts: ConnectorMetaToolsOpts & { cid: stri
 /** Build the connector meta-tools for a single runner.
  *
  *  `mode` selects exposure (mirrors the tri-state gate in `runner.ts::connectorExposureFromSessionId`):
- *    - `'full'`     → both `list_connector_tools` + `call_connector_tool` (gconv commander
+ *    - `'full'`     → both `list_connector_tools` + `call_connector_tool` (gconv/gmember
  *                     sessions — actual user tasks invoking external services).
  *    - `'discover'` → `list_connector_tools` only (agent-edit session — the editor LLM uses
  *                     it to learn each connector's actions so the authored workflow can name
@@ -340,11 +344,11 @@ export async function createConnectorMetaTools(
   mode: 'full' | 'discover' = 'full',
 ): Promise<AgentTool[]> {
   if (!opts.userId) return [];
-  // The commander (full mode) always gets `add_custom_connector`, even with
-  // zero connectors installed — that's the path to the FIRST one. The
-  // discover-mode add tool is intentionally absent (agent-edit must not
-  // produce side effects). The add tool needs a cid to route its confirm
-  // dialog; without one we cannot safely expose it.
+  // Full task sessions (commander and group-chat agent workers) always get
+  // `add_custom_connector`, even with zero connectors installed — that's the
+  // path to the FIRST one. The discover-mode add tool is intentionally absent
+  // (agent-edit must not produce side effects). The add tool needs a cid to
+  // route its confirm dialog; without one we cannot safely expose it.
   const addTool = mode === 'full' && opts.cid
     ? [createAddCustomConnectorTool({ ...opts, cid: opts.cid })]
     : [];

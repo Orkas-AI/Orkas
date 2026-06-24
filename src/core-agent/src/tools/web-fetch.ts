@@ -8,7 +8,7 @@
 import { defineTool, type AgentTool } from "./base.js";
 
 const DEFAULT_MAX_CHARS = 50_000;
-const DEFAULT_TIMEOUT_MS = 15_000;
+const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_RESPONSE_BYTES = 2_000_000;
 const USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
@@ -115,6 +115,7 @@ function extractTitle(html: string): string | undefined {
 
 export const webFetchTool: AgentTool = defineTool({
   name: "web_fetch",
+  executionMode: "parallel",
   description:
     "Fetch a web page by URL and return its content as readable text. " +
     "Use this to read articles, documentation, or any web page content. " +
@@ -144,79 +145,83 @@ export const webFetchTool: AgentTool = defineTool({
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+      let resp: Response;
+      try {
+        resp = await fetch(url, {
+          method: "GET",
+          headers: {
+            "User-Agent": USER_AGENT,
+            Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": acceptLanguage(),
+          },
+          signal: controller.signal,
+          redirect: "follow",
+        });
 
-      const resp = await fetch(url, {
-        method: "GET",
-        headers: {
-          "User-Agent": USER_AGENT,
-          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "Accept-Language": acceptLanguage(),
-        },
-        signal: controller.signal,
-        redirect: "follow",
-      });
-
-      clearTimeout(timer);
-
-      if (!resp.ok) {
-        return {
-          content: `HTTP ${resp.status} ${resp.statusText} for ${url}`,
-          isError: true,
-        };
-      }
-
-      const contentType = resp.headers.get("content-type") ?? "";
-
-      // Read response body with size limit
-      const reader = resp.body?.getReader();
-      if (!reader) {
-        return { content: "Error: empty response body", isError: true };
-      }
-
-      const chunks: Uint8Array[] = [];
-      let totalBytes = 0;
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        totalBytes += value.byteLength;
-        if (totalBytes > MAX_RESPONSE_BYTES) {
-          reader.cancel();
-          break;
+        if (!resp.ok) {
+          return {
+            content: `HTTP ${resp.status} ${resp.statusText} for ${url}`,
+            isError: true,
+          };
         }
-      }
 
-      const buf = Buffer.concat(chunks);
-      const charset = resolveCharset(contentType, buf);
-      const raw = decodeBytes(buf, charset);
+        const contentType = resp.headers.get("content-type") ?? "";
 
-      // JSON responses: return as-is (pretty-printed if possible)
-      if (contentType.includes("json")) {
-        try {
-          const pretty = JSON.stringify(JSON.parse(raw), null, 2);
-          const truncated = pretty.length > maxChars ? pretty.slice(0, maxChars) + "\n...(truncated)" : pretty;
-          return { content: truncated };
-        } catch {
+        // Read response body with size limit. Keep the timeout active until
+        // the body is consumed; slow pages often send headers quickly and then
+        // stall during the read.
+        const reader = resp.body?.getReader();
+        if (!reader) {
+          return { content: "Error: empty response body", isError: true };
+        }
+
+        const chunks: Uint8Array[] = [];
+        let totalBytes = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          totalBytes += value.byteLength;
+          if (totalBytes > MAX_RESPONSE_BYTES) {
+            reader.cancel();
+            break;
+          }
+        }
+
+        const buf = Buffer.concat(chunks);
+        const charset = resolveCharset(contentType, buf);
+        const raw = decodeBytes(buf, charset);
+
+        // JSON responses: return as-is (pretty-printed if possible)
+        if (contentType.includes("json")) {
+          try {
+            const pretty = JSON.stringify(JSON.parse(raw), null, 2);
+            const truncated = pretty.length > maxChars ? pretty.slice(0, maxChars) + "\n...(truncated)" : pretty;
+            return { content: truncated };
+          } catch {
+            const truncated = raw.length > maxChars ? raw.slice(0, maxChars) + "\n...(truncated)" : raw;
+            return { content: truncated };
+          }
+        }
+
+        // Plain text: return as-is
+        if (contentType.includes("text/plain")) {
           const truncated = raw.length > maxChars ? raw.slice(0, maxChars) + "\n...(truncated)" : raw;
           return { content: truncated };
         }
-      }
 
-      // Plain text: return as-is
-      if (contentType.includes("text/plain")) {
-        const truncated = raw.length > maxChars ? raw.slice(0, maxChars) + "\n...(truncated)" : raw;
-        return { content: truncated };
-      }
+        // HTML: extract text
+        const title = extractTitle(raw);
+        let text = htmlToText(raw);
+        if (text.length > maxChars) {
+          text = text.slice(0, maxChars) + "\n...(truncated)";
+        }
 
-      // HTML: extract text
-      const title = extractTitle(raw);
-      let text = htmlToText(raw);
-      if (text.length > maxChars) {
-        text = text.slice(0, maxChars) + "\n...(truncated)";
+        const header = title ? `Title: ${title}\nURL: ${url}\n\n` : `URL: ${url}\n\n`;
+        return { content: header + text };
+      } finally {
+        clearTimeout(timer);
       }
-
-      const header = title ? `Title: ${title}\nURL: ${url}\n\n` : `URL: ${url}\n\n`;
-      return { content: header + text };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("abort")) {

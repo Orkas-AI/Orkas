@@ -61,6 +61,62 @@ function escapeHtml(str) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 }
 
+// Safe-URI allow-list. Mirrors DOMPurify's default scheme regex plus the
+// app's own privileged schemes (chat-media / chat-app / kb-file, registered
+// in main/index.ts) and blob: (attachment object URLs), so media / artifact /
+// KB links survive sanitization. Scheme-less (relative / anchor / path) refs
+// pass via the `[^a-z]` / trailing-non-scheme-char branches; javascript: /
+// data: / vbscript: / file: do NOT match and are dropped.
+const _SAFE_URI_RE = /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|chat-media|chat-app|kb-file|blob):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i;
+
+// Return the href if it is a safe URI, else '' (dropped). Used by the link
+// builders below so a `javascript:`/`data:` href never reaches the DOM even
+// before DOMPurify runs; callers still escapeHtml() the result into the
+// attribute to prevent quote breakout on otherwise-allowed schemes.
+function _safeHref(url) {
+  const u = String(url === null || url === undefined ? '' : url).trim();
+  return _SAFE_URI_RE.test(u) ? u : '';
+}
+
+// XSS sanitizer for HTML that ends up in innerHTML and may carry untrusted
+// text (chat message bodies, LLM / relay / marketplace / skill / KB content).
+// DOMPurify (vendored, loaded before this module) strips scripts, event
+// handlers, and dangerous URL schemes while preserving the markdown
+// renderer's legitimate output: tables, lists, code, links, images, the
+// :::chart-bar / :::dashboard SVG, and the MathJax delimiters (typeset later
+// on the live DOM). In the Node test env DOMPurify is absent (no DOM) so this
+// returns the input unchanged — the pure `_safeHref` / escaping in the link
+// builders is the node-tested layer; DOMPurify is the authoritative backstop
+// in the real renderer.
+let _sanitizeHookInstalled = false;
+let _sanitizeMissingWarned = false;
+function _domPurify() {
+  if (typeof window !== 'undefined' && window.DOMPurify) return window.DOMPurify;
+  if (typeof DOMPurify !== 'undefined') return DOMPurify; // eslint-disable-line no-undef
+  return null;
+}
+function sanitizeHtml(html) {
+  const s = (html === null || html === undefined) ? '' : String(html);
+  const DP = _domPurify();
+  if (!DP || typeof DP.sanitize !== 'function') {
+    if (typeof window !== 'undefined' && !_sanitizeMissingWarned) {
+      _sanitizeMissingWarned = true;
+      try { console.error('[security] DOMPurify unavailable — HTML sanitization is OFF'); } catch (_) {}
+    }
+    return s;
+  }
+  if (!_sanitizeHookInstalled && typeof DP.addHook === 'function') {
+    // Any link opening a new browsing context must carry rel=noopener noreferrer.
+    DP.addHook('afterSanitizeAttributes', (node) => {
+      if (node.tagName === 'A' && node.getAttribute && node.getAttribute('target')) {
+        node.setAttribute('rel', 'noopener noreferrer');
+      }
+    });
+    _sanitizeHookInstalled = true;
+  }
+  return DP.sanitize(s, { ADD_ATTR: ['target'], ALLOWED_URI_REGEXP: _SAFE_URI_RE });
+}
+
 function normalizeCatalogSource(source) {
   const s = String(source || '').trim().toLowerCase();
   if (s === 'builtin' || s === 'platform') return 'marketplace';
@@ -317,7 +373,10 @@ function renderMarkdownFull(md) {
     });
     if (!changed) break;
   }
-  return html;
+  // Single sanitize chokepoint: every renderMarkdown caller (chat bubbles,
+  // skill detail, KB viewer, agent workflow, streaming finals) gets XSS-safe
+  // HTML. Runs after block restore so code/chart/math placeholders are intact.
+  return sanitizeHtml(html);
 }
 
 // ── Table builder ──
@@ -408,25 +467,52 @@ function _dbEnum(table, val, dflt) {
   return (val && Object.prototype.hasOwnProperty.call(table, val)) ? table[val] : dflt;
 }
 
-// Tolerant parse for a `:::dashboard` JSON body. LLMs (DeepSeek especially,
-// when hand-writing a deeply-nested tree) reliably miscount the trailing
-// brackets — a single extra `}` after the root close, trailing prose, or a
-// truncated tail with closers missing. Strict `JSON.parse` rejects all three
-// and the whole dashboard collapses to a raw code-view block. We retry with
-// two bounded repairs before giving up:
-//   1. drop trailing garbage after the root value's balanced close
-//      (the common "one extra }" / trailing-prose case)
-//   2. append the missing closers for an unclosed (truncated) tree
-// Returns the parsed spec, or `undefined` if nothing parses — the caller then
-// shows the parse-error fallback so the raw body is never silently dropped.
-// The scan is string-aware: brackets inside string values (e.g. an Alert body
-// containing `}`) never shift the depth count, and we never trim leading
-// garbage (over-repair risk) — only the trailing tail is dropped.
-function _parseDashboardSpec(body) {
-  const text = String(body == null ? '' : body).trim();
-  if (!text) return undefined;
-  try { return JSON.parse(text); } catch (_) { /* fall through to repair */ }
+function _tryParseDashboardJson(text) {
+  try { return JSON.parse(text); } catch (_) { return undefined; }
+}
 
+function _escapeLikelyUnescapedStringQuotes(text) {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  let changed = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (!inString) {
+      out += c;
+      if (c === '"') { inString = true; escaped = false; }
+      continue;
+    }
+    if (escaped) {
+      out += c;
+      escaped = false;
+      continue;
+    }
+    if (c === '\\') {
+      out += c;
+      escaped = true;
+      continue;
+    }
+    if (c === '"') {
+      let j = i + 1;
+      while (j < text.length && /\s/.test(text[j])) j++;
+      const next = text[j] || '';
+      if (next === ':' || next === ',' || next === '}' || next === ']' || next === '') {
+        out += c;
+        inString = false;
+      } else {
+        out += '\\"';
+        changed = true;
+      }
+      continue;
+    }
+    out += c;
+  }
+  return changed ? out : text;
+}
+
+function _repairDashboardJsonTail(text) {
   let inString = false;
   let escaped = false;
   let opened = false;
@@ -451,14 +537,48 @@ function _parseDashboardSpec(body) {
 
   // Repair 1: a complete root value followed by trailing garbage (extra `}`).
   if (balancedEnd > 0 && balancedEnd < text.length) {
-    try { return JSON.parse(text.slice(0, balancedEnd)); } catch (_) { /* try next */ }
+    const parsed = _tryParseDashboardJson(text.slice(0, balancedEnd));
+    if (parsed !== undefined) return parsed;
   }
   // Repair 2: unclosed tree — append the closers it still needs, innermost first.
   if (opened && stack.length && !inString) {
     const closers = stack.reverse().map((c) => (c === '{' ? '}' : ']')).join('');
-    try { return JSON.parse(text + closers); } catch (_) { /* give up */ }
+    const parsed = _tryParseDashboardJson(text + closers);
+    if (parsed !== undefined) return parsed;
   }
   return undefined;
+}
+
+// Tolerant parse for a `:::dashboard` JSON body. LLMs (DeepSeek especially,
+// when hand-writing a deeply-nested tree) reliably produce small JSON defects:
+// unescaped double quotes inside string values, a single extra `}` after the
+// root close, trailing prose, or a truncated tail with closers missing. Strict
+// `JSON.parse` rejects all of these and the whole dashboard collapses to a raw
+// code-view block. We retry with bounded repairs before giving up:
+//   1. escape likely-unescaped `"` characters inside string values
+//   2. drop trailing garbage after the root value's balanced close
+//      (the common "one extra }" / trailing-prose case)
+//   3. append the missing closers for an unclosed (truncated) tree
+// Returns the parsed spec, or `undefined` if nothing parses — the caller then
+// shows the parse-error fallback so the raw body is never silently dropped.
+// The scan is string-aware: brackets inside string values (e.g. an Alert body
+// containing `}`) never shift the depth count, and we never trim leading
+// garbage (over-repair risk) — only the trailing tail is dropped.
+function _parseDashboardSpec(body) {
+  const text = String(body == null ? '' : body).trim();
+  if (!text) return undefined;
+  const strict = _tryParseDashboardJson(text);
+  if (strict !== undefined) return strict;
+
+  const quoteRepaired = _escapeLikelyUnescapedStringQuotes(text);
+  if (quoteRepaired !== text) {
+    const parsed = _tryParseDashboardJson(quoteRepaired);
+    if (parsed !== undefined) return parsed;
+  }
+
+  const tailRepaired = _repairDashboardJsonTail(text);
+  if (tailRepaired !== undefined) return tailRepaired;
+  return quoteRepaired !== text ? _repairDashboardJsonTail(quoteRepaired) : undefined;
 }
 
 function renderDashboard(spec) {
@@ -891,11 +1011,14 @@ function inlineFormat(text) {
     .replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g,
       (_, txt, url, title) => {
         if (_isVideoSrc(url)) return _markdownVideoHtml(url, txt, title);
-        return `<a href="${url}" target="_blank" rel="noopener"${title ? ` title="${escapeHtml(title)}"` : ''}>${txt}</a>`;
+        // href: scheme-checked + escaped (blocks javascript:/data: and quote
+        // breakout). text stays raw so nested image/emphasis still render;
+        // DOMPurify scrubs any raw HTML in the text at the output layer.
+        return `<a href="${escapeHtml(_safeHref(url))}" target="_blank" rel="noopener"${title ? ` title="${escapeHtml(title)}"` : ''}>${txt}</a>`;
       })
     // <url> and <email> autolinks
     .replace(/<((?:https?:\/\/|mailto:)[^>\s]+)>/g,
-      (_, u) => `<a href="${u}" target="_blank" rel="noopener">${u}</a>`)
+      (_, u) => `<a href="${escapeHtml(u)}" target="_blank" rel="noopener">${escapeHtml(u)}</a>`)
     .replace(/<([\w.+-]+@[\w.-]+\.[A-Za-z]{2,})>/g,
       (_, e) => `<a href="mailto:${e}">${e}</a>`)
     // Emphasis
@@ -1276,6 +1399,9 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     _markdownImageHtml,
     _markdownVideoHtml,
     escapeHtml,
+    sanitizeHtml,
+    _safeHref,
+    _SAFE_URI_RE,
     renderMarkdown,
     renderDashboard,
     _parseDashboardSpec,

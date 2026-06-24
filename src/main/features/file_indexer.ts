@@ -120,6 +120,10 @@ export interface TextReadResult {
   /** Echo of the applied range (what was actually returned, clamped to
    *  `[0, totalChars)`). */
   range: { charStart: number; charEnd: number };
+  /** 1-based line number of the first returned character (the line `charStart`
+   *  falls on). Lets `read_file` show absolute line numbers even for a slice
+   *  that begins mid-file. Always 1 for a whole-file read. */
+  startLine: number;
 }
 
 export interface ImageReadResult {
@@ -439,10 +443,15 @@ export async function readRange(
     ? fs.readFileSync(absPath, 'utf8')
     : fs.readFileSync(path.join(cacheDirFor(userId, absPath), 'text.md'), 'utf8');
 
+  // 1-based line of the slice's first char: count newlines in [0, start).
+  let startLine = 1;
+  for (let i = 0; i < start; i++) if (body.charCodeAt(i) === 10) startLine++;
+
   return {
     content: body.slice(start, end),
     meta: metaToPublic(meta),
     range: { charStart: start, charEnd: end },
+    startLine,
   };
 }
 

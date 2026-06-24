@@ -40,10 +40,10 @@ const log = createLogger('local-agents:runner');
 const DEFAULT_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 
 /** Backends with no mid-run event stream can't be idle-killed (silence
- *  is normal for them), so they keep the old tight wall-clock cap as
- *  their only hang bound. */
+ *  is normal for them), so they keep a long-but-bounded wall-clock cap
+ *  as their only hang bound. */
 const BACKEND_TIMEOUT_MS: Partial<Record<LocalCliType, number>> = {
-  openclaw: 20 * 60 * 1000,
+  openclaw: 60 * 60 * 1000,
 };
 
 function resolveTimeoutMs(cli: LocalCliType): number {
@@ -60,7 +60,7 @@ function resolveTimeoutMs(cli: LocalCliType): number {
  *  are real — a single Bash tool call sat silent ~10 min downloading a
  *  whisper model — so the default stays comfortably above them.
  *  Override via ORKAS_LOCAL_AGENT_IDLE_KILL_MS; 0 disables. */
-const DEFAULT_IDLE_KILL_MS = 15 * 60 * 1000;
+const DEFAULT_IDLE_KILL_MS = 30 * 60 * 1000;
 
 /** Idle-kill is meaningless for backends that emit nothing mid-run
  *  (their silence carries no hang signal) — disable it there and rely
@@ -124,11 +124,11 @@ function resolveIdleTickMs(idleMs: number): number {
 }
 
 /** Default idle threshold per backend. Override only when the backend
- *  semantics deviate from "streams events through the turn"; today
- *  openclaw is the only one (no streaming at all — see openclaw.ts
- *  header). */
+ *  semantics deviate from "streams events through the turn"; openclaw
+ *  emits no mid-run stream, so use the normal 90s/30s heartbeat cadence
+ *  instead of the older 30s/10s cadence that was too noisy for long runs. */
 const BACKEND_IDLE_MS: Partial<Record<LocalCliType, number>> = {
-  openclaw: 30 * 1000,
+  openclaw: DEFAULT_IDLE_MS,
 };
 
 const BACKENDS: Partial<Record<LocalCliType, LocalBackend>> = {

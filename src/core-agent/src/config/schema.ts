@@ -66,7 +66,7 @@ export const AgentConfigSchema = z.object({
   /** Maximum number of tool-use loop iterations per run. */
   maxToolLoops: z.number().int().positive().default(50),
   /** Max time a tool may run without completing or reporting substantive progress. */
-  toolIdleTimeoutMs: z.number().int().positive().default(600_000),
+  toolIdleTimeoutMs: z.number().int().positive().default(1_800_000),
   /** System prompt override or additions. */
   systemPrompt: z.string().optional(),
   /** Thinking/reasoning level: off, low, high. */

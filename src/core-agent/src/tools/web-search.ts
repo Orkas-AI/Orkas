@@ -26,7 +26,7 @@ import { createLogger } from "../shared/logger.js";
 
 const log = createLogger("web-search");
 
-const SEARCH_TIMEOUT_MS = 15_000;
+const SEARCH_TIMEOUT_MS = 30_000;
 const PROBE_TIMEOUT_MS = 4_000;
 const DEFAULT_COUNT = 8;
 const MAX_COUNT = 20;
@@ -360,6 +360,7 @@ export async function runBuiltinWebSearch(
 
 export const webSearchTool: AgentTool = defineTool({
   name: "web_search",
+  executionMode: "parallel",
   description:
     "Search the web for information. Returns a list of search results with titles, URLs, and snippets. " +
     "Use this when you need to find current information, news, documentation, or any web content. " +

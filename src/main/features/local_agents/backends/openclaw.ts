@@ -157,19 +157,27 @@ export const openclawBackend: LocalBackend = {
   },
 };
 
-function buildOpenclawArgs(opts: BackendRunOptions, sessionId: string): string[] {
+export function buildOpenclawArgs(opts: Pick<BackendRunOptions, 'model' | 'resumeSessionId' | 'customArgs' | 'prompt' | 'timeoutMs'>, sessionId: string): string[] {
   // Per `openclaw agent --help` (2026.4.11):
   //   --local      run embedded agent (no gateway daemon needed)
   //   --json       structured output (lands on stderr in this version)
   //   --session-id required for any deterministic session
   //   --message    prompt body (argv, NOT stdin)
   // Optional: --agent <name> selects a pre-registered agent; --timeout
-  //   overrides the 600s default.
+  //   overrides the 600s default. Keep it aligned with the outer watchdog
+  //   so the CLI does not self-timeout before Orkas' long-task cap.
   const args = ['agent', '--local', '--json', '--session-id', sessionId];
   if (opts.model) args.push('--agent', opts.model);
   if (opts.customArgs && opts.customArgs.length) args.push(...opts.customArgs);
+  if (!hasOpenclawTimeoutArg(opts.customArgs)) {
+    args.push('--timeout', String(Math.max(1, Math.ceil(opts.timeoutMs / 1000))));
+  }
   args.push('--message', opts.prompt);
   return args;
+}
+
+function hasOpenclawTimeoutArg(args: string[] | undefined): boolean {
+  return (args || []).some((arg) => arg === '--timeout' || arg.startsWith('--timeout='));
 }
 
 /** Strip ANSI color escape sequences. openclaw's `[skills]` /

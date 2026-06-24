@@ -64,7 +64,7 @@ async function run(tool: any, input: Record<string, any>) {
 }
 
 describe('file-tools › read_file (text)', () => {
-  it('reads whole file when no range given and reports total_chars + covered', async () => {
+  it('reads whole file when no range given and reports total_chars + covered + lines', async () => {
     const { tools, wsDir } = await buildTools();
     const body = 'A\nB\nC\nD\nE';
     const p = path.join(wsDir, 'note.md');
@@ -73,7 +73,22 @@ describe('file-tools › read_file (text)', () => {
     expect(r.isError).toBeFalsy();
     expect(r.content).toContain(`total_chars="${body.length}"`);
     expect(r.content).toContain(`covered="0-${body.length}"`);
-    expect(r.content).toContain(body);
+    expect(r.content).toContain('lines="1-5"');
+    // Lines are shown with absolute 1-based number + tab prefixes (G5).
+    expect(r.content).toContain('1\tA\n2\tB\n3\tC\n4\tD\n5\tE');
+  });
+
+  it('numbers lines from the absolute line of a mid-file char slice', async () => {
+    const { tools, wsDir } = await buildTools();
+    const p = path.join(wsDir, 'code.txt');
+    fs.writeFileSync(p, 'L1\nL2\nL3\nL4\nL5');
+    // char 6 is the start of "L3" ("L1\n"=0-2, "L2\n"=3-5).
+    const r = await run(getTool(tools, 'read_file'), { path: p, charStart: 6 });
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('lines="3-5"');
+    expect(r.content).toContain('3\tL3\n4\tL4\n5\tL5');
+    // The number+tab is a display prefix, not the raw file bytes.
+    expect(r.content).not.toContain('1\tL3');
   });
 
   it('slices by charStart/charEnd', async () => {
@@ -422,6 +437,23 @@ describe('file-tools › search_files', () => {
     expect(r.content).toContain('privacy-protected workspace');
     expect(r.content).not.toContain('secret-contract.md');
   });
+
+  it('lists results most-recently-modified first', async () => {
+    const { tools, wsDir } = await buildTools();
+    for (const f of ['old.md', 'mid.md', 'new.md']) fs.writeFileSync(path.join(wsDir, f), 'x');
+    const base = 1_700_000_000; // seconds
+    fs.utimesSync(path.join(wsDir, 'old.md'), base, base);
+    fs.utimesSync(path.join(wsDir, 'mid.md'), base + 100, base + 100);
+    fs.utimesSync(path.join(wsDir, 'new.md'), base + 200, base + 200);
+    const r = await run(getTool(tools, 'search_files'), { query: '*.md' });
+    expect(r.isError).toBeFalsy();
+    const iNew = r.content.indexOf('new.md');
+    const iMid = r.content.indexOf('mid.md');
+    const iOld = r.content.indexOf('old.md');
+    expect(iNew).toBeGreaterThanOrEqual(0);
+    expect(iNew).toBeLessThan(iMid);    // newest first
+    expect(iMid).toBeLessThan(iOld);
+  });
 });
 
 describe('file-tools › grep_files', () => {
@@ -460,5 +492,54 @@ describe('file-tools › grep_files', () => {
     const r = await run(getTool(tools, 'grep_files'), { pattern: '(', regex: true });
     expect(r.isError).toBe(true);
     expect(r.content).toContain('E_BAD_INPUT');
+  });
+
+  it('glob without "/" scopes by basename at any depth', async () => {
+    const { tools, wsDir } = await buildTools();
+    fs.writeFileSync(path.join(wsDir, 'a.md'), 'banana');
+    fs.writeFileSync(path.join(wsDir, 'a.txt'), 'banana');
+    const r = await run(getTool(tools, 'grep_files'), { pattern: 'banana', glob: '*.md' });
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('a.md');
+    expect(r.content).not.toContain('a.txt');
+  });
+
+  it('glob with "/" matches the root-relative path', async () => {
+    const { tools, wsDir } = await buildTools();
+    fs.mkdirSync(path.join(wsDir, 'sub'), { recursive: true });
+    fs.writeFileSync(path.join(wsDir, 'sub', 'x.md'), 'banana');
+    fs.writeFileSync(path.join(wsDir, 'top.md'), 'banana');
+    const r = await run(getTool(tools, 'grep_files'), { pattern: 'banana', glob: 'sub/**' });
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain(path.join('sub', 'x.md'));
+    expect(r.content).not.toContain('top.md');
+  });
+
+  it('output_mode "files" returns file paths only (no line snippets)', async () => {
+    const { tools, wsDir } = await buildTools();
+    fs.writeFileSync(path.join(wsDir, 'a.md'), 'banana\nbanana again');
+    fs.writeFileSync(path.join(wsDir, 'b.md'), 'banana');
+    const r = await run(getTool(tools, 'grep_files'), { pattern: 'banana', output_mode: 'files' });
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('a.md');
+    expect(r.content).toContain('b.md');
+    expect(r.content).toContain('file(s) with matches');
+    expect(r.content).not.toMatch(/a\.md:\d/);   // no per-line snippet form
+  });
+
+  it('output_mode "count" reports matches per file', async () => {
+    const { tools, wsDir } = await buildTools();
+    fs.writeFileSync(path.join(wsDir, 'a.md'), 'banana\nbanana again\nno');
+    const r = await run(getTool(tools, 'grep_files'), { pattern: 'banana', output_mode: 'count' });
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toMatch(/a\.md: 2/);
+  });
+
+  it('reports no glob match distinctly', async () => {
+    const { tools, wsDir } = await buildTools();
+    fs.writeFileSync(path.join(wsDir, 'a.md'), 'banana');
+    const r = await run(getTool(tools, 'grep_files'), { pattern: 'banana', glob: '*.nope' });
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('No files matched glob');
   });
 });

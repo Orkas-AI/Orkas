@@ -78,31 +78,6 @@ describe('prompts ↔ code contract', () => {
   });
 
   // ─────────────────────────────────────────────────────────────────────
-  // Invariant 3: PlanStep status enum is consistent between code and
-  // prompt-formatter (so the runtime plan injection uses values the
-  // prompt understands).
-  // ─────────────────────────────────────────────────────────────────────
-  it('plan StepStatus enum is consistent between plan.ts and prompt formatter', () => {
-    const planTs = readFile('src/main/features/group_chat/plan.ts');
-
-    // Pull the StepStatus union from plan.ts.
-    const m = /export type StepStatus\s*=\s*([\s\S]+?);/m.exec(planTs);
-    expect(m).toBeTruthy();
-    const union = m![1];
-    const declared = Array.from(union.matchAll(/'(\w+)'/g)).map((mm) => mm[1]);
-    expect(declared.sort()).toEqual(
-      ['blocked', 'done', 'failed', 'in_progress', 'pending', 'skipped'].sort(),
-    );
-
-    // formatPlanForPrompt must handle every declared status with a
-    // distinct icon — otherwise the prompt would render unknown statuses
-    // ambiguously. We just check each status name appears in the formatter.
-    for (const status of declared) {
-      expect(planTs).toContain(`'${status}'`);
-    }
-  });
-
-  // ─────────────────────────────────────────────────────────────────────
   // Invariant 4: shared rules included by both commander and agent
   // system-prompt builders (so PDF / search / chat-media rules stay
   // synced).
@@ -191,26 +166,109 @@ describe('prompts ↔ code contract', () => {
     expect(commanderPrompt).toContain('auto_tasks_list');
   });
 
-  it('commander prompt requires serial plans', () => {
+  it('commander prompt uses routing-first quality priority before direct self-service', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
 
-    expect(commanderPrompt).toMatch(/Plans run serially/i);
-    expect(commanderPrompt).toMatch(/Do not design parallel fan-out/i);
+    // Cost-saving must be a tie-breaker, not the routing objective. Installed
+    // agents are product capabilities; direct commander work is the fallback
+    // after capability routing.
+    expect(commanderPrompt).toMatch(/Routing-first algorithm/i);
+    expect(commanderPrompt).toMatch(/Quality, correctness, and task completion come first/i);
+    expect(commanderPrompt).toMatch(/Cost, latency, and coordination overhead are tie-breakers/i);
+    expect(commanderPrompt).toMatch(/Do not start from "can I do this myself\?"/i);
+    expect(commanderPrompt).toMatch(/best owner for each user-visible outcome/i);
+    expect(commanderPrompt).toMatch(/installed agents are first-class capabilities/i);
+    expect(commanderPrompt).toMatch(/not expensive fallbacks/i);
+    expect(commanderPrompt).toMatch(/Commander self-service[\s\S]+only after capability routing/i);
+    expect(commanderPrompt).toMatch(/learning diagnosis/i);
+  });
+
+  it('commander prompt fans out multi-outcome specialist bundles before direct drafting', () => {
+    const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
+
+    // A normal user request for distinct materials can map to several specialist
+    // agents; multi-agent routing is triggered by outcome diversity, not just
+    // task size.
+    expect(commanderPrompt).toMatch(/Keep outcomes separate/i);
+    expect(commanderPrompt).toMatch(/Multiple independent outcomes with different high-confidence owners/i);
+    expect(commanderPrompt).toMatch(/named `run_worker\(\{ to, task \}\)`/i);
+    expect(commanderPrompt).toMatch(/SINGLE response/i);
+    expect(commanderPrompt).toMatch(/run concurrently/i);
+    expect(commanderPrompt).toMatch(/outcome diversity, not just task size/i);
+    expect(commanderPrompt).toMatch(/Do not collapse these into one direct response/i);
+    expect(commanderPrompt).toMatch(/research\/framework \+ tutoring\/diagnostic questions \+ parent\/user-facing copy/i);
+  });
+
+  it('commander prompt covers both dependent-serial and independent-parallel delegation', () => {
+    const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
+
+    // Dependent chains: one step at a time, deciding the next from the last.
+    expect(commanderPrompt).toMatch(/one at a time/i);
+    expect(commanderPrompt).toMatch(/decide and run the next/i);
+    // Independent sub-tasks fan out by emitting all run_worker calls in a single
+    // response so they run concurrently (G4 partitioner; the executionMode fix
+    // makes plain run_worker actually parallelize).
+    expect(commanderPrompt).toMatch(/single response/i);
+    expect(commanderPrompt).toMatch(/concurrently/i);
+    // Decoupling is the delegation gate: only cleanly-separable work is delegated;
+    // tightly-coupled work stays inline.
+    expect(commanderPrompt).toMatch(/cleanly separable/i);
+    expect(commanderPrompt).toMatch(/coupled/i);
+    // Plan-DAG concepts must not creep back into the in-loop model.
     expect(commanderPrompt).not.toContain('parallel_group');
   });
 
-  it('commander prompt blocks generic downstream synthesis before required inputs are available', () => {
+  it('commander prompt teaches hand_off_to (step-out, no synthesis) vs dispatch_to (handback)', () => {
+    const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
+
+    // hand_off_to is taught as a distinct tool that ends the turn without synthesis.
+    expect(commanderPrompt).toMatch(/hand_off_to\(\{ to, message, resume\? \}\)/);
+    expect(commanderPrompt).toMatch(/no synthesis|stop after the narration|step out/i);
+    // dispatch_to is scoped to "I need the result back to continue my own work".
+    expect(commanderPrompt).toMatch(/need the agent's result back to continue/i);
+    // The teach/coach/guide-with-me case must point at hand_off, not dispatch.
+    expect(commanderPrompt).toMatch(/teach|coach|guide|walk me through/i);
+    expect(commanderPrompt).toMatch(/blocking part of a broader commander-owned task/i);
+    expect(commanderPrompt).toMatch(/A good `resume` says exactly what remains/i);
+  });
+
+  it('commander prompt separates conversation floor from suspended orchestration resume', () => {
+    const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
+
+    expect(commanderPrompt).toMatch(/Orchestration state/i);
+    expect(commanderPrompt).toMatch(/active_recipient[\s\S]+conversation floor/i);
+    expect(commanderPrompt).toMatch(/orchestration_ledger[\s\S]+suspended task/i);
+    expect(commanderPrompt).toMatch(/agent handoff or on an agent form/i);
+    expect(commanderPrompt).toMatch(/\$orchestration_state/);
+    expect(commanderPrompt).toMatch(/<orchestration-resume>/);
+    expect(commanderPrompt).toMatch(/Do not re-ask for information already supplied by the agent or form/i);
+    expect(commanderPrompt).toMatch(/ledger status is `interrupted`/i);
+    expect(commanderPrompt).toMatch(/User-input blocking outcome inside a broader task/i);
+    expect(commanderPrompt).toMatch(/<blocked-on-form/i);
+    expect(commanderPrompt).toMatch(/do not keep routing dependent work/i);
+  });
+
+  it('agent prompt teaches <handback /> to return the floor when done / out of scope', () => {
+    const agentPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_agent_in_group.md'), 'utf-8');
+
+    expect(agentPrompt).toMatch(/<handback \/>/);
+    expect(agentPrompt).toMatch(/handed off to you/i);
+    expect(agentPrompt).toMatch(/outside your scope|complete/i);
+    // Must warn against emitting it on an ordinary one-shot reply.
+    expect(agentPrompt).toMatch(/one-shot reply/i);
+    expect(agentPrompt).toMatch(/concrete result the commander needs to continue/i);
+  });
+
+  it('commander prompt blocks fabricating steps from missing inputs and pre-planning unknown stages', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
 
     expect(commanderPrompt).toMatch(/required inputs, files, context, or user decisions/i);
-    expect(commanderPrompt).toMatch(/does not prove the next step has everything needed/i);
-    expect(commanderPrompt).toMatch(/In the step `input`, remind it/i);
-    expect(commanderPrompt).toMatch(/agent owns the final information-sufficiency check/i);
-    expect(commanderPrompt).toMatch(/<agent-input-form>/i);
-    expect(commanderPrompt).toContain('<plan-interaction status="open" />');
-    expect(commanderPrompt).toMatch(/Missing information must become form fields/i);
-    expect(commanderPrompt).toMatch(/do NOT let downstream analysis\/synthesis run on generic assumptions/i);
-    expect(commanderPrompt).toMatch(/Interactive specialist/i);
+    expect(commanderPrompt).toMatch(/must not be fabricated/i);
+    // Dynamic in-loop: each step is decided from the previous result, not pre-planned.
+    // (The dependent-step mechanics live canonically in the Dispatch tools "Sequencing"
+    // block; the decision tree references it instead of restating it.)
+    expect(commanderPrompt).toMatch(/no predeclared plan/i);
+    expect(commanderPrompt).toMatch(/Decide each step from what the previous one/i);
   });
 
   it('agent prompt keeps generated input forms minimal', () => {

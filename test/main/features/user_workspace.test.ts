@@ -450,3 +450,34 @@ describe('user_workspace › openWorkspaceInFileManager', () => {
     expect(shell.openPath).toHaveBeenCalledWith(p.DEFAULT_USER_WORKSPACE);
   });
 });
+
+describe('user_workspace › consumePickerFirstOpenDefault', () => {
+  it('seeds the workspace on the FIRST open only, then hands off to the OS last-used', async () => {
+    const ws = await import('../../../src/main/features/user_workspace');
+    const p = await import('../../../src/main/paths');
+    const uid = 'userFirstOpen';
+
+    // First open → workspace, and a persisted marker is written.
+    expect(ws.consumePickerFirstOpenDefault(uid)).toBe(p.DEFAULT_USER_WORKSPACE);
+    expect(fs.existsSync(p.pickerFirstOpenMarkerFile(uid))).toBe(true);
+
+    // Every later open → undefined so the picker leaves defaultPath unset and
+    // the OS's remembered last-used directory takes over.
+    expect(ws.consumePickerFirstOpenDefault(uid)).toBeUndefined();
+    expect(ws.consumePickerFirstOpenDefault(uid)).toBeUndefined();
+  });
+
+  it('is per-user (one user seeding does not consume another user\'s first open)', async () => {
+    const ws = await import('../../../src/main/features/user_workspace');
+    const p = await import('../../../src/main/paths');
+    expect(ws.consumePickerFirstOpenDefault('userA')).toBe(p.DEFAULT_USER_WORKSPACE);
+    // A different user still gets their first-open seed.
+    expect(ws.consumePickerFirstOpenDefault('userB')).toBe(p.DEFAULT_USER_WORKSPACE);
+    expect(ws.consumePickerFirstOpenDefault('userA')).toBeUndefined();
+  });
+
+  it('returns undefined for an empty userId', async () => {
+    const ws = await import('../../../src/main/features/user_workspace');
+    expect(ws.consumePickerFirstOpenDefault('')).toBeUndefined();
+  });
+});

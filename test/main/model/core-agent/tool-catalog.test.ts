@@ -10,6 +10,7 @@ import { createLocalTools, createFileTools } from '../../../../src/main/model/co
 import { createKbTools } from '../../../../src/main/model/core-agent/kb-tools';
 import { createChatHistoryTools } from '../../../../src/main/model/core-agent/chat-history-tools';
 import { createImageGenTool } from '../../../../src/main/model/core-agent/image-gen-tool';
+import { createOfficeTools } from '../../../../src/main/model/core-agent/office-tools';
 
 /**
  * Collect the tool names runner.ts injects under "everything available"
@@ -48,6 +49,7 @@ function enumerateAllInjectedToolNames(): Set<string> {
   for (const t of createKbTools({ userId: 'testuid' })) names.add(t.name);
   for (const t of createChatHistoryTools({ userId: 'testuid' })) names.add(t.name);
   names.add(createImageGenTool({ userId: 'testuid', cid: 'testcid' }).name);
+  for (const t of createOfficeTools({ userId: 'testuid', cid: 'testcid' })) names.add(t.name);
 
   // Connector umbrella meta-tools: two fixed tools, only injected when ≥1 connector is visible
   // to the actor. Asserting presence in the catalog independent of runtime visibility — calling

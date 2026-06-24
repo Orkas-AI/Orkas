@@ -99,16 +99,13 @@ function startPolling(cid) {
       const runtimeBusy = hasServerRuntime
         ? data.conversation.processing === true
         : isGroupConversationBusy(cid);
-      if (runtimeBusy && cid === currentCid && window.PlanRail) {
-        try { window.PlanRail.refresh(cid, { force: true }); } catch (_) {}
-      }
 
       if (msgs.length > known && _isPolledAssistantMsg(last)) {
-        // New visible assistant message arrived. During plan execution this
-        // may be a mid-turn announcement while other actors are still
-        // running; reloading history then detaches live placeholders and
-        // makes bubbles flash. Treat polling as rescue only once runtime is
-        // idle; the live stream owns in-flight DOM updates.
+        // New visible assistant message arrived. While the commander is
+        // still orchestrating, this may be a mid-turn reply while other
+        // actors are still running; reloading history then detaches live
+        // placeholders and makes bubbles flash. Treat polling as rescue only
+        // once runtime is idle; the live stream owns in-flight DOM updates.
         if (runtimeBusy) {
           const recovered = await window.ConversationRuntime?.recoverPolledMessages?.(cid, msgs);
           if (recovered) pollMsgCounts.set(cid, msgs.length);
@@ -138,12 +135,12 @@ function startPolling(cid) {
       }
 
       // Server crashed mid-request: processing=true but stuck longer than the
-      // model idle watchdog (10 min) + a small buffer. Shorter thresholds would
+      // model idle watchdog (30 min) + a small buffer. Shorter thresholds would
       // trip on genuine long agent runs.
       const since = data.conversation?.processing_since;
       if (_isPolledUserMsg(last) && data.conversation?.processing === true && since) {
         const elapsedSec = (Date.now() - new Date(since).getTime()) / 1000;
-        if (elapsedSec > 720) {
+        if (elapsedSec > 2100) {
           stopPolling(cid);
           _onPolledResponse(cid, t('chat.reply_timeout'), true);
         }

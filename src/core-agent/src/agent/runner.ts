@@ -37,6 +37,70 @@ function retryDelayMs(err: unknown, attempt: number): number {
   return base + jitter;
 }
 
+/** Concurrency cap for a parallel (read-only) tool batch (G4). Env-overridable;
+ *  conservative default. This is the READ-TOOL cap only — the group-chat layer
+ *  applies a separate, lower cap to agent/worker dispatch tools. */
+function parallelToolCap(): number {
+  const raw = Number.parseInt(process.env.ORKAS_MAX_TOOL_CONCURRENCY ?? "", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 8;
+}
+
+/** Partition tool calls into execution batches that PRESERVE declared order:
+ *  a maximal run of ADJACENT parallel-safe calls becomes one concurrent batch;
+ *  any non-parallel call is its own singleton batch and acts as a barrier
+ *  (mirrors Claude Code's `partitionToolCalls`). Calls are never reordered, so
+ *  results can be committed in declared order and a write/exec tool always
+ *  separates the reads before it from the reads after it. */
+export function partitionToolBatches<T>(
+  calls: readonly T[],
+  isParallel: (call: T) => boolean,
+): T[][] {
+  const batches: T[][] = [];
+  for (const call of calls) {
+    const last = batches[batches.length - 1];
+    if (isParallel(call) && last && isParallel(last[0])) last.push(call);
+    else batches.push([call]);
+  }
+  return batches;
+}
+
+/** loop_detection thresholds: nudge the model once after this many CONSECUTIVE
+ *  identical tool calls, force-stop the run after this many. */
+export const LOOP_WARN = 3;
+export const LOOP_HARD = 5;
+
+/** Compaction skips a pass that would free less than this fraction of the context
+ *  window — when the verbatim-kept tail dominates the window, summarising the
+ *  small remainder makes no real progress and just burns a summary LLM call each
+ *  turn. See the compaction guard in the run loop. */
+export const MIN_COMPACTION_SAVINGS_RATIO = 0.1;
+
+/** Stable signature of a tool call for loop detection: name + canonical args.
+ *  Only EXACT repeats (same tool, same input) share a signature, so legitimate
+ *  varied calls never collide. */
+export function toolCallSignature(call: { name: string; input: unknown }): string {
+  let args: string;
+  try { args = JSON.stringify(call.input ?? {}); }
+  catch { args = String(call.input); }
+  return `${call.name}\u0000${args}`;
+}
+
+type ToolUseCall = {
+  type: "tool_use";
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+};
+
+type ToolExecutionEvent = Extract<AgentRunEvent, { type: "tool_progress" | "tool_end" }>;
+
+type ToolExecutionOutcome = {
+  result: ToolResult;
+  err?: unknown;
+  aborted?: boolean;
+  stalled?: boolean;
+};
+
 /**
  * AgentRunner is the core agent execution harness.
  *
@@ -172,6 +236,27 @@ export class AgentRunner {
     );
   }
 
+  /** interrupt-steer (G9): drain any host-queued user messages and fold them
+   *  into the session as user turns. Returns how many were folded. Called at the
+   *  tool-loop boundary AND on the no-tool terminal path, so a message that
+   *  arrives while the model is producing its FINAL answer still course-corrects
+   *  this run instead of being deferred to a separate follow-up turn. */
+  private foldSteer(params: AgentRunParams): number {
+    if (!params.drainSteer) return 0;
+    let steered: string[] = [];
+    try { steered = params.drainSteer() ?? []; }
+    catch (err) { log.warn(`drainSteer failed: ${formatError(err)}`); }
+    let folded = 0;
+    for (const text of steered) {
+      if (text && text.trim()) {
+        this.session.addMessage("user", [{ type: "text", text }]);
+        folded++;
+      }
+    }
+    if (folded) log.info(`interrupt-steer: folded ${folded} queued user message(s) into the run`);
+    return folded;
+  }
+
   private async *runWithProvider(
     params: AgentRunParams,
     provider: LLMProvider,
@@ -201,6 +286,25 @@ export class AgentRunner {
     let transientToolErrors = 0;
     let permanentToolErrors = 0;
 
+    // loop_detection state (run-scoped): a runaway agent emits the SAME tool
+    // call (name + args) over and over. We count CONSECUTIVE identical calls
+    // across the run, nudge once at LOOP_WARN, and force-stop at LOOP_HARD. A
+    // differing call resets the streak, so distinct/parallel calls never trip.
+    let loopSig: string | null = null;
+    let loopRepeat = 0;
+    let loopWarnedForStreak = false;
+    let pendingLoopNudge: string | null = null;
+
+    // Run-scoped read-tracking map for read-before-edit + OCC. Per-round
+    // `toolState` (below) is rebuilt every LLM round, but read and edit always
+    // land in different rounds (the model must see the read result before it
+    // can form an edit), so the baseline a read records must outlive the round.
+    // Injected by reference into each round's `toolState` under the
+    // `readFileState` key — a host/tool contract (like `sandboxEnv`): file
+    // tools stamp it on read and check/refresh it on edit. The runner itself
+    // never reads it.
+    const readFileState = new Map<string, unknown>();
+
     // Main agent loop: call LLM, process tool calls, repeat.
     // Every exit point yields `{ type: "done", result }` then returns so the
     // consumer sees a terminal event no matter which branch wins.
@@ -216,7 +320,14 @@ export class AgentRunner {
           messages: this.session.getMessages(),
           systemPrompt,
           tools: toolDefs.length > 0 ? toolDefs : undefined,
-          maxTokens: 4096,
+          // Main-turn output cap. Do NOT hard-code: a fixed cap (was 4096)
+          // overrides the per-model `model.maxTokens` that pi-ai applies as the
+          // default `max_tokens` (clamped at 32000), truncating long edits and
+          // reports mid-stream with `stopReason: "length"`. Use an explicit
+          // per-model config override when present; otherwise leave undefined so
+          // pi-ai falls back to the model's real cap. Auxiliary calls
+          // (compaction summary / reflection below) keep their own small caps.
+          maxTokens: this.config.models.catalog[modelId]?.maxOutputTokens,
           signal: params.signal,
           cacheRetention: params.cacheRetention,
           sessionId: this.session.getSessionId(),
@@ -322,6 +433,15 @@ export class AgentRunner {
         const toolCalls = result.content.filter((c) => c.type === "tool_use");
 
         if (toolCalls.length === 0 || result.stopReason !== "tool_use") {
+          // interrupt-steer (G9): a user message can land while the model is
+          // producing its FINAL answer (no tool calls), which the tool-loop
+          // drain below never reaches. Drain here too; if anything folded, loop
+          // again so the model responds to it instead of ending the run — the
+          // exact stale-task case G9 exists to fix.
+          if (this.foldSteer(params) > 0) {
+            attempt = -1;
+            continue;
+          }
           // No tool calls — we're done
           const final: AgentRunResult = {
             text: turnText,
@@ -369,208 +489,344 @@ export class AgentRunner {
           return;
         }
 
+        // loop_detection (afterModel): update the consecutive-identical-call
+        // streak from this round's proposed calls. Force-stop BEFORE executing a
+        // call that would be the LOOP_HARD-th identical one; arm a one-time nudge
+        // at LOOP_WARN (injected at the post-tool-result boundary below).
+        let loopHardTripped = false;
+        for (const call of toolCalls as ReadonlyArray<{ name: string; input: unknown }>) {
+          const sig = toolCallSignature(call);
+          if (sig === loopSig) {
+            loopRepeat += 1;
+          } else {
+            loopSig = sig;
+            loopRepeat = 1;
+            loopWarnedForStreak = false;
+          }
+          if (loopRepeat >= LOOP_HARD) { loopHardTripped = true; break; }
+          if (loopRepeat >= LOOP_WARN && !loopWarnedForStreak) {
+            loopWarnedForStreak = true;
+            pendingLoopNudge =
+              `You have called the same tool with the same arguments ${LOOP_WARN} times in a row. `
+              + `This is not making progress. Change your approach (different arguments or a different tool), `
+              + `or stop and report what you have so far. Repeating the identical call again will end the run.`;
+          }
+        }
+        if (loopHardTripped) {
+          log.warn(`loop_detection: identical tool call repeated ${LOOP_HARD}x — stopping run`);
+          const final: AgentRunResult = {
+            text: turnText || "(Stopped: the same tool call was repeated too many times without progress.)",
+            content: result.content,
+            meta: {
+              durationMs: Date.now() - startTime,
+              model: result.model,
+              provider: provider.id,
+              stopReason: result.stopReason,
+              usage: lastUsage,
+              toolLoops,
+              compactionCount,
+              toolNames: [...toolNamesSet],
+              skillsLoaded: [...skillsLoadedSet],
+              transientToolErrors: transientToolErrors || undefined,
+              permanentToolErrors: permanentToolErrors || undefined,
+            },
+          };
+          yield { type: "done", result: final };
+          return;
+        }
+
         // Execute each tool call and add results. `toolState` is shared across
         // calls in this loop as before; per-call progress callbacks are wired
         // below so long-running tools can keep the UI/idle-watchdog alive.
-        const toolState: ToolContext["state"] = params.sandboxEnv ? { sandboxEnv: params.sandboxEnv } : {};
+        // `readFileState` is the SAME map every round (run-scoped) so the
+        // edit-freshness baseline a read records survives into the edit round.
+        const toolState: ToolContext["state"] = {
+          ...(params.sandboxEnv ? { sandboxEnv: params.sandboxEnv } : {}),
+          readFileState,
+        };
 
-        for (const call of toolCalls) {
-          if (call.type !== "tool_use") continue;
+        // Batch tool calls: a run of ADJACENT parallel-safe tools executes
+        // concurrently (G4); every other tool is a singleton barrier. Declared
+        // order is preserved, so results are committed in order and a write/exec
+        // tool separates the reads before it from the reads after it.
+        const parallelCap = parallelToolCap();
+        const toolUseCalls = toolCalls as ReadonlyArray<ToolUseCall>;
+        const toolBatches = partitionToolBatches(
+          toolUseCalls,
+          (c) => this.tools.get(c.name)?.executionMode === "parallel",
+        );
 
-          const tool = this.tools.get(call.name);
-          if (!tool) {
-            yield { type: "tool_start", id: call.id, name: call.name, input: call.input };
-            const msg = `Unknown tool: ${call.name}`;
-            this.session.addToolResult(call.id, msg, undefined, true);
-            yield { type: "tool_end", id: call.id, name: call.name, result: msg, isError: true };
-            continue;
-          }
+        // A terminal tool (ToolResult.endTurn) ends the run after its result is
+        // committed, with no follow-up inference. If the model emitted sibling
+        // tool calls after that terminal call in the same assistant turn, we
+        // commit synthetic skipped results for them so the tool_use/tool_result
+        // invariant stays valid without executing stale side effects.
+        let endTurnRequested = false;
+        let terminalBatchIndex = -1;
+        const terminalSkipMessage = "A prior terminal tool ended this turn before this tool could run.";
 
-          yield { type: "tool_start", id: call.id, name: call.name, input: call.input };
-          toolNamesSet.add(call.name);
-          // Track skill reads for metacognition metrics
-          if (call.name === "skill_manage" && call.input && (call.input as any).action === "read" && (call.input as any).id) {
-            skillsLoadedSet.add((call.input as any).id as string);
-          }
-          let toolResultRecorded = false;
-          const addToolResultOnce = (content: string, images?: ToolResult["images"], isError?: boolean): boolean => {
-            if (toolResultRecorded) return false;
-            this.session.addToolResult(call.id, content, images, isError);
-            toolResultRecorded = true;
-            return true;
-          };
-          const abortedToolMessage = "Tool execution aborted: Run aborted";
-          const toolIdleTimeoutMs = this.config.agent.toolIdleTimeoutMs;
-          const stalledToolMessage =
-            `Tool execution stalled after ${toolIdleTimeoutMs}ms without substantive progress`;
-          try {
-            if (params.signal?.aborted) {
-              addToolResultOnce(abortedToolMessage, undefined, true);
-              yield {
-                type: "tool_end",
-                id: call.id,
-                name: call.name,
-                result: abortedToolMessage,
-                isError: true,
-              };
-              throw new Error("Run aborted");
-            }
-            log.debug(`Executing tool: ${call.name}`);
-            const progressQueue: Array<Extract<AgentRunEvent, { type: "tool_progress" }>> = [];
-            let notifyProgress: (() => void) | null = null;
-            let acceptingProgress = true;
-            let toolStalled = false;
-            const toolAbort = createChildAbortController(params.signal);
-            const toolIdle = createToolIdleWatchdog(toolIdleTimeoutMs);
-            const toolCtx: ToolContext = {
-              workingDir: params.workingDir,
-              signal: toolAbort.signal,
-              state: toolState,
-              emitProgress: (progress) => {
-                if (!acceptingProgress) return;
-                const message = String(progress?.message || "").trim();
-                if (!message) return;
-                const idleDelayMs = toolIdleDelayForProgress(progress, toolIdleTimeoutMs);
-                if (idleDelayMs != null) toolIdle.reset(idleDelayMs);
-                progressQueue.push({
-                  type: "tool_progress",
-                  id: call.id,
-                  name: call.name,
-                  ...(progress.phase ? { phase: String(progress.phase) } : {}),
-                  message,
-                  ...(progress.data ? { data: progress.data } : {}),
-                });
-                if (notifyProgress) {
-                  const notify = notifyProgress;
-                  notifyProgress = null;
-                  notify();
-                }
-              },
-            };
-            type ToolCompletion =
-              | { ok: true; result: ToolResult }
-              | { ok: false; err: unknown };
-            const toolPromise: Promise<ToolCompletion> = Promise.resolve()
-              .then(() => tool.execute(call.input, toolCtx))
-              .then(
-                (result) => ({ ok: true as const, result }),
-                (err) => ({ ok: false as const, err }),
-              );
-            const abortWait = waitForAbort(params.signal);
-            let completed: ToolCompletion | null = null;
-            try {
-              while (!completed) {
-                while (progressQueue.length) {
-                  yield progressQueue.shift()!;
-                }
-                const progressWait = new Promise<"progress">((resolve) => {
-                  notifyProgress = () => resolve("progress");
-                });
-                const waits: Array<Promise<ToolCompletion | "progress" | "abort" | "tool_idle">> = [
-                  toolPromise,
-                  progressWait,
-                  toolIdle.promise,
-                ];
-                if (abortWait.promise) waits.push(abortWait.promise);
-                const raced = await Promise.race(waits);
-                if (raced === "progress") continue;
-                if (raced === "tool_idle") {
-                  toolStalled = true;
-                  toolAbort.abort();
-                  break;
-                }
-                if (raced === "abort") {
-                  acceptingProgress = false;
-                  progressQueue.length = 0;
-                  addToolResultOnce(abortedToolMessage, undefined, true);
-                  yield {
-                    type: "tool_end",
-                    id: call.id,
-                    name: call.name,
-                    result: abortedToolMessage,
-                    isError: true,
-                  };
-                  throw new Error("Run aborted");
-                }
-                completed = raced;
-                notifyProgress = null;
-              }
-            } finally {
-              abortWait.cleanup();
-              toolIdle.cancel();
-              toolAbort.cleanup();
-              notifyProgress = null;
-              acceptingProgress = false;
-            }
-            while (progressQueue.length) {
-              yield progressQueue.shift()!;
-            }
-            if (toolStalled) {
-              addToolResultOnce(stalledToolMessage, undefined, true);
-              yield {
-                type: "tool_end",
-                id: call.id,
-                name: call.name,
-                result: stalledToolMessage,
-                isError: true,
-              };
-              permanentToolErrors++;
-              log.warn(`Tool ${call.name} stalled: ${stalledToolMessage}`);
+        for (let batchIndex = 0; batchIndex < toolBatches.length; batchIndex++) {
+          const batch = toolBatches[batchIndex];
+          if (batch.length === 1) {
+            // ── Sequential: one tool (unchanged per-call behavior) ──
+            const call = batch[0];
+            const tool = this.tools.get(call.name);
+            if (!tool) {
+              yield { type: "tool_start", id: call.id, name: call.name, input: call.input };
+              const msg = `Unknown tool: ${call.name}`;
+              this.session.addToolResult(call.id, msg, undefined, true);
+              yield { type: "tool_end", id: call.id, name: call.name, result: msg, isError: true };
               continue;
             }
-            if (completed.ok !== true) throw completed.err;
-            const toolResult = completed.result;
-            if (addToolResultOnce(toolResult.content, toolResult.images, toolResult.isError)) {
-              yield {
-                type: "tool_end",
-                id: call.id,
-                name: call.name,
-                result: toolResult.content,
-                isError: toolResult.isError,
-              };
+
+            yield { type: "tool_start", id: call.id, name: call.name, input: call.input };
+            toolNamesSet.add(call.name);
+            // Track skill reads for metacognition metrics
+            if (call.name === "skill_manage" && call.input && (call.input as any).action === "read" && (call.input as any).id) {
+              skillsLoadedSet.add((call.input as any).id as string);
             }
-            if (toolResult.isError) {
+            log.debug(`Executing tool: ${call.name}`);
+            const toolEvents: ToolExecutionEvent[] = [];
+            let notifyToolEvent: (() => void) | null = null;
+            const pushToolEvent = (event: ToolExecutionEvent) => {
+              toolEvents.push(event);
+              if (notifyToolEvent) {
+                const notify = notifyToolEvent;
+                notifyToolEvent = null;
+                notify();
+              }
+            };
+            const toolRun = runToolWithWatchdog({
+              call,
+              tool,
+              workingDir: params.workingDir,
+              signal: params.signal,
+              state: toolState,
+              toolIdleTimeoutMs: this.config.agent.toolIdleTimeoutMs,
+              emitEvent: pushToolEvent,
+            });
+            let outcome: ToolExecutionOutcome | null = null;
+            while (!outcome || toolEvents.length) {
+              while (toolEvents.length) yield toolEvents.shift()!;
+              if (!outcome) {
+                const eventWait = new Promise<"event">((resolve) => {
+                  notifyToolEvent = () => resolve("event");
+                });
+                const raced = await Promise.race([toolRun, eventWait]);
+                if (raced === "event") continue;
+                outcome = raced;
+                notifyToolEvent = null;
+              }
+            }
+            const toolResult = outcome.result;
+            this.session.addToolResult(call.id, toolResult.content, toolResult.images, toolResult.isError);
+            if (!outcome.aborted && !outcome.stalled && !outcome.err && toolResult.endTurn) {
+              endTurnRequested = true;
+            }
+            if (outcome.aborted) {
+              throw new Error("Run aborted");
+            }
+            if (outcome.stalled) {
+              permanentToolErrors++;
+              log.warn(`Tool ${call.name} stalled: ${toolResult.content}`);
+            } else if (outcome.err) {
+              const errMsg = formatError(outcome.err);
+              const isTransient = isRetryableError(outcome.err);
+              log.error(`Tool ${call.name} failed (${isTransient ? 'transient' : 'permanent'}): ${errMsg}`);
+              if (isTransient) transientToolErrors++;
+              else permanentToolErrors++;
+            } else if (toolResult.isError) {
               permanentToolErrors++;
               log.warn(`Tool ${call.name} returned error: ${toolResult.content.slice(0, 150)}`);
             }
-          } catch (err) {
-            if (params.signal?.aborted) {
-              if (addToolResultOnce(abortedToolMessage, undefined, true)) {
-                yield {
-                  type: "tool_end",
-                  id: call.id,
-                  name: call.name,
-                  result: abortedToolMessage,
-                  isError: true,
-                };
-              }
-              throw err;
+            if (endTurnRequested) {
+              terminalBatchIndex = batchIndex;
+              break;
             }
-            const errMsg = formatError(err);
-            const isTransient = isRetryableError(err);
-            log.error(`Tool ${call.name} failed (${isTransient ? 'transient' : 'permanent'}): ${errMsg}`);
-            const msg = `Tool execution error: ${errMsg}`;
-            if (addToolResultOnce(msg, undefined, true)) {
-              yield { type: "tool_end", id: call.id, name: call.name, result: msg, isError: true };
+            continue;
+          }
+
+          // ── Parallel: >=2 adjacent concurrency-safe tools, run concurrently ──
+          // tool_start in declared order; tool_progress / tool_end stream as they
+          // arrive (renderer routes by id); results committed in declared order.
+          for (const call of batch) {
+            yield { type: "tool_start", id: call.id, name: call.name, input: call.input };
+            toolNamesSet.add(call.name);
+          }
+          const pResults = new Map<string, ToolExecutionOutcome>();
+          const pQueue: ToolExecutionEvent[] = [];
+          let pWake: (() => void) | null = null;
+          const pBump = () => { if (pWake) { const w = pWake; pWake = null; w(); } };
+          let pActive = 0;
+          let pLaunched = 0;
+          let pSettled = 0;
+          const pPump = () => {
+            while (pActive < parallelCap && pLaunched < batch.length) pStart(batch[pLaunched++]);
+          };
+          const pStart = (call: ToolUseCall) => {
+            pActive++;
+            const tool = this.tools.get(call.name);
+            if (!tool) {
+              const msg = `Unknown tool: ${call.name}`;
+              pResults.set(call.id, {
+                result: { content: msg, isError: true },
+                err: new Error(msg),
+              });
+              pQueue.push({ type: "tool_end", id: call.id, name: call.name, result: msg, isError: true });
+              pSettled++; pActive--; pBump(); pPump();
+              return;
             }
-            if (isTransient) transientToolErrors++;
-            else permanentToolErrors++;
+            runToolWithWatchdog({
+              call,
+              tool,
+              workingDir: params.workingDir,
+              signal: params.signal,
+              state: toolState,
+              toolIdleTimeoutMs: this.config.agent.toolIdleTimeoutMs,
+              emitEvent: (event) => {
+                pQueue.push(event);
+                pBump();
+              },
+            })
+              .then((outcome) => {
+                pResults.set(call.id, outcome);
+              })
+              .then(() => { pSettled++; pActive--; pBump(); pPump(); });
+          };
+          pPump();
+          while (pSettled < batch.length || pQueue.length) {
+            while (pQueue.length) yield pQueue.shift()!;
+            if (pSettled < batch.length) await new Promise<void>((resolve) => { pWake = resolve; });
+          }
+          // Commit results in DECLARED order (tool_use<->tool_result invariant).
+          let parallelAborted = false;
+          for (const call of batch) {
+            const c = pResults.get(call.id)!;
+            this.session.addToolResult(call.id, c.result.content, c.result.images, c.result.isError);
+            if (!c.aborted && !c.stalled && !c.err && c.result.endTurn) {
+              endTurnRequested = true;
+            }
+            if (c.aborted) {
+              parallelAborted = true;
+            } else if (c.stalled) {
+              permanentToolErrors++;
+              log.warn(`Tool ${call.name} stalled: ${c.result.content}`);
+            } else if (c.err) {
+              const errMsg = formatError(c.err);
+              const isTransient = isRetryableError(c.err);
+              log.error(`Tool ${call.name} failed (${isTransient ? 'transient' : 'permanent'}): ${errMsg}`);
+              if (isTransient) transientToolErrors++;
+              else permanentToolErrors++;
+            } else if (c.result.isError) {
+              permanentToolErrors++;
+              log.warn(`Tool ${call.name} returned error: ${c.result.content.slice(0, 150)}`);
+            }
+          }
+          if (parallelAborted) {
+            throw new Error("Run aborted");
+          }
+          if (endTurnRequested) {
+            terminalBatchIndex = batchIndex;
+            break;
           }
         }
 
-        // Check context window - attempt compaction if needed
-        const tokensBefore = this.session.estimateTokens();
-        const contextWindow = this.config.models.catalog[modelId]?.contextWindow ?? 200_000;
-        if (tokensBefore > contextWindow * 0.6) {
-          log.info(`Context nearing limit (${tokensBefore}/${contextWindow}), compacting...`);
-          const compactSummary = await this.compactSession(provider, modelId, systemPrompt, params.cacheRetention);
-          compactionCount++;
-          yield {
-            type: "compaction",
-            tokensBefore,
-            tokensAfter: this.session.estimateTokens(),
-            summary: compactSummary || undefined,
+        if (endTurnRequested && terminalBatchIndex >= 0) {
+          for (let i = terminalBatchIndex + 1; i < toolBatches.length; i++) {
+            for (const call of toolBatches[i]) {
+              yield { type: "tool_start", id: call.id, name: call.name, input: call.input };
+              this.session.addToolResult(call.id, terminalSkipMessage, undefined, true);
+              yield {
+                type: "tool_end",
+                id: call.id,
+                name: call.name,
+                result: terminalSkipMessage,
+                isError: true,
+              };
+            }
+          }
+        }
+
+        // Terminal tool: a tool requested endTurn. Stop the run now — the text
+        // streamed this round (`turnText`) is the final reply; we skip the
+        // follow-up inference (the saved "synthesis" call). The tool_use +
+        // tool_result are already committed to the session, so resume is valid.
+        if (endTurnRequested) {
+          const final: AgentRunResult = {
+            text: turnText,
+            content: result.content,
+            meta: {
+              durationMs: Date.now() - startTime,
+              model: result.model,
+              provider: provider.id,
+              stopReason: "end_turn",
+              usage: lastUsage,
+              toolLoops,
+              compactionCount,
+              toolNames: [...toolNamesSet],
+              skillsLoaded: [...skillsLoadedSet],
+              transientToolErrors: transientToolErrors || undefined,
+              permanentToolErrors: permanentToolErrors || undefined,
+            },
           };
+          yield { type: "done", result: final };
+          return;
+        }
+
+        // Check context window - attempt compaction if needed. Compact at 80%
+        // (matches Claude Code's 60%→80% move): 0.6 threw away 40% of the window
+        // every time. The real `contextWindow` comes from the catalog the host
+        // fills (PC: buildRunner from the resolved model); only an unknown model
+        // hits the 200K fallback. ContextOverflowError (caught below) still
+        // recovers if a single turn blows past the threshold.
+        const tokensBefore = this.session.estimateTokens();
+        // Look the window up by the model the stream ACTUALLY used: rotating-
+        // provider can fail over to a different-window candidate mid-run, and the
+        // host fills the catalog for every candidate (PC buildRunner). Fall back
+        // to the primary's window, then the 200K default for an unknown model.
+        const contextModelId = streamModel || modelId;
+        const contextWindow = this.config.models.catalog[contextModelId]?.contextWindow
+          ?? this.config.models.catalog[modelId]?.contextWindow
+          ?? 200_000;
+        if (tokensBefore > contextWindow * 0.8) {
+          // Compaction keeps the recent tail verbatim and replaces only the
+          // OLDER messages with a short summary. If the kept tail alone already
+          // dominates the window — e.g. a large cap-exempt read_file / kb_read
+          // result sitting in the last few messages — summarising the small
+          // remainder frees almost nothing, yet costs a summary LLM call every
+          // turn and discards the prior summary's detail (re-summarising a
+          // summary). Skip that no-progress pass; later turns push the big
+          // result out of the kept window and real compaction resumes (and a
+          // genuine overflow is still caught by ContextOverflowError below).
+          const keptTailTokens = this.session.estimateKeptTailTokens();
+          const wouldFree = tokensBefore - keptTailTokens;
+          if (wouldFree > contextWindow * MIN_COMPACTION_SAVINGS_RATIO) {
+            log.info(`Context nearing limit (${tokensBefore}/${contextWindow}), compacting...`);
+            const compactSummary = await this.compactSession(provider, modelId, systemPrompt, params.cacheRetention);
+            compactionCount++;
+            yield {
+              type: "compaction",
+              tokensBefore,
+              tokensAfter: this.session.estimateTokens(),
+              summary: compactSummary || undefined,
+            };
+          } else {
+            log.warn(`Context over threshold (${tokensBefore}/${contextWindow}) but the kept tail (${keptTailTokens}) dominates; skipping no-progress compaction`);
+          }
+        }
+
+        // interrupt-steer: fold any user messages the host queued mid-run into
+        // THIS run (as user turns) after the committed tool results and before
+        // the next LLM call, so the agent course-corrects instead of finishing a
+        // now-stale task. (The no-tool terminal path above drains the same way.)
+        this.foldSteer(params);
+
+        // loop_detection: deliver the one-time warn nudge (armed above) so the
+        // model sees it on the next round, after the tool results.
+        if (pendingLoopNudge) {
+          this.session.addMessage("user", [{ type: "text", text: pendingLoopNudge }]);
+          log.warn("loop_detection: nudged the model after repeated identical tool calls");
+          pendingLoopNudge = null;
         }
 
         // Reset retry counter on successful tool loop iteration
@@ -866,43 +1122,69 @@ export class AgentRunner {
   }
 }
 
-async function executeReflectionTool(
-  tool: AgentTool,
-  input: Record<string, unknown>,
-  state: ToolContext["state"],
-  signal: AbortSignal | undefined,
-  toolIdleTimeoutMs: number,
-): Promise<ToolResult> {
+async function runToolWithWatchdog(opts: {
+  call: ToolUseCall;
+  tool: AgentTool;
+  workingDir?: string;
+  signal?: AbortSignal;
+  state: ToolContext["state"];
+  toolIdleTimeoutMs: number;
+  emitEvent: (event: ToolExecutionEvent) => void;
+}): Promise<ToolExecutionOutcome> {
+  const { call, tool, workingDir, signal, state, toolIdleTimeoutMs, emitEvent } = opts;
   const abortedToolMessage = "Tool execution aborted: Run aborted";
   const stalledToolMessage =
     `Tool execution stalled after ${toolIdleTimeoutMs}ms without substantive progress`;
+  const emitToolEnd = (result: ToolResult) => {
+    emitEvent({
+      type: "tool_end",
+      id: call.id,
+      name: call.name,
+      result: result.content,
+      isError: result.isError,
+    });
+  };
+  const abortResult = (): ToolExecutionOutcome => {
+    const result = { content: abortedToolMessage, isError: true };
+    emitToolEnd(result);
+    return { result, aborted: true };
+  };
 
-  if (signal?.aborted) {
-    return { content: abortedToolMessage, isError: true };
-  }
+  if (signal?.aborted) return abortResult();
 
   const toolAbort = createChildAbortController(signal);
   const toolIdle = createToolIdleWatchdog(toolIdleTimeoutMs);
+  const abortWait = waitForAbort(signal);
+  let acceptingProgress = true;
   const toolCtx: ToolContext = {
+    workingDir,
     signal: toolAbort.signal,
     state,
     emitProgress: (progress) => {
+      if (!acceptingProgress) return;
       const message = String(progress?.message || "").trim();
       if (!message) return;
       const idleDelayMs = toolIdleDelayForProgress(progress, toolIdleTimeoutMs);
       if (idleDelayMs != null) toolIdle.reset(idleDelayMs);
+      emitEvent({
+        type: "tool_progress",
+        id: call.id,
+        name: call.name,
+        ...(progress.phase ? { phase: String(progress.phase) } : {}),
+        message,
+        ...(progress.data ? { data: progress.data } : {}),
+      });
     },
   };
   type ToolCompletion =
     | { ok: true; result: ToolResult }
     | { ok: false; err: unknown };
   const toolPromise: Promise<ToolCompletion> = Promise.resolve()
-    .then(() => tool.execute(input, toolCtx))
+    .then(() => tool.execute(call.input, toolCtx))
     .then(
       (result) => ({ ok: true as const, result }),
       (err) => ({ ok: false as const, err }),
     );
-  const abortWait = waitForAbort(signal);
 
   try {
     const waits: Array<Promise<ToolCompletion | "abort" | "tool_idle">> = [
@@ -911,21 +1193,53 @@ async function executeReflectionTool(
     ];
     if (abortWait.promise) waits.push(abortWait.promise);
     const raced = await Promise.race(waits);
+    acceptingProgress = false;
+
     if (raced === "tool_idle") {
       toolAbort.abort();
-      return { content: stalledToolMessage, isError: true };
+      const result = { content: stalledToolMessage, isError: true };
+      emitToolEnd(result);
+      return { result, stalled: true };
     }
     if (raced === "abort") {
       toolAbort.abort();
-      return { content: abortedToolMessage, isError: true };
+      return abortResult();
     }
-    if (raced.ok === false) throw raced.err;
-    return raced.result;
+    if (raced.ok === false) {
+      if (signal?.aborted) {
+        toolAbort.abort();
+        return abortResult();
+      }
+      const result = { content: `Tool execution error: ${formatError(raced.err)}`, isError: true };
+      emitToolEnd(result);
+      return { result, err: raced.err };
+    }
+    emitToolEnd(raced.result);
+    return { result: raced.result };
   } finally {
+    acceptingProgress = false;
     abortWait.cleanup();
     toolIdle.cancel();
     toolAbort.cleanup();
   }
+}
+
+async function executeReflectionTool(
+  tool: AgentTool,
+  input: Record<string, unknown>,
+  state: ToolContext["state"],
+  signal: AbortSignal | undefined,
+  toolIdleTimeoutMs: number,
+): Promise<ToolResult> {
+  const outcome = await runToolWithWatchdog({
+    call: { type: "tool_use", id: "reflection", name: tool.name, input },
+    tool,
+    signal,
+    state,
+    toolIdleTimeoutMs,
+    emitEvent: () => undefined,
+  });
+  return outcome.result;
 }
 
 function sleep(ms: number): Promise<void> {

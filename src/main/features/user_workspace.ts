@@ -38,7 +38,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { dialog, BrowserWindow, shell } from 'electron';
 
-import { DEFAULT_USER_WORKSPACE, userWorkspaceConfigFile } from '../paths';
+import { DEFAULT_USER_WORKSPACE, userWorkspaceConfigFile, pickerFirstOpenMarkerFile } from '../paths';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
 import { macosTccSensitivePath } from '../util/macos-tcc';
@@ -220,6 +220,44 @@ export function getWorkspacePath(userId: string, projectId?: string): string {
 }
 
 /**
+ * First-open default for the native file picker. The FIRST time a picker that
+ * opts in is shown for this user on this machine, return the user's workspace
+ * dir so the dialog starts there; on every later call return undefined so the
+ * OS's own remembered last-used directory takes over (we never override it).
+ *
+ * The one-time flag is a marker file under local/ so it survives restarts —
+ * without persistence a restart would re-seed the workspace and clobber the OS
+ * last-used. We mark on the first call (i.e. first open), not on a successful
+ * pick. If the marker can't be persisted we do NOT seed: returning the
+ * workspace without recording it would re-seed every call and keep clobbering
+ * the OS last-used.
+ */
+export function consumePickerFirstOpenDefault(userId: string): string | undefined {
+  if (!userId) return undefined;
+  const marker = pickerFirstOpenMarkerFile(userId);
+  try {
+    if (fs.existsSync(marker)) return undefined;
+  } catch {
+    return undefined;
+  }
+  let ws: string;
+  try {
+    ws = getWorkspacePath(userId);
+  } catch {
+    return undefined;
+  }
+  if (!ws) return undefined;
+  try {
+    fs.mkdirSync(path.dirname(marker), { recursive: true });
+    fs.writeFileSync(marker, '', 'utf-8');
+  } catch (err) {
+    log.warn(`picker first-open marker write failed — not seeding: ${(err as Error).message}`);
+    return undefined;
+  }
+  return ws;
+}
+
+/**
  * Async helper that does the cid → project_id lookup before calling the
  * sync resolver. IPC handlers that take `{cid?}` from the renderer use
  * this; main-side feature code that already knows the projectId should
@@ -353,6 +391,13 @@ export function getWorkspaceInfo(userId: string, projectId?: string): {
   };
 }
 
+function _safeDirectoryPickerDefault(): string | undefined {
+  const abs = path.resolve(DEFAULT_USER_WORKSPACE);
+  if (macosTccSensitivePath(abs, { recursive: true })) return undefined;
+  try { return fs.statSync(abs).isDirectory() ? abs : undefined; }
+  catch { return undefined; }
+}
+
 /**
  * Open a native folder picker dialog and return the selected path, or
  * `null` if the user cancelled. Must be called from the main process.
@@ -362,6 +407,7 @@ export async function selectDirectory(): Promise<string | null> {
   const result = await dialog.showOpenDialog(win ? win : undefined as any, {
     title: t('workspace.picker_title'),
     properties: ['openDirectory', 'createDirectory'],
+    defaultPath: _safeDirectoryPickerDefault(),
   });
   if (result.canceled || !result.filePaths.length) return null;
   return result.filePaths[0];

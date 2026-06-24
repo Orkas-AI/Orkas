@@ -220,7 +220,7 @@ describe('createConnectorMetaTools', () => {
     expect(await createConnectorMetaTools({ userId: UID })).toEqual([]);
   });
 
-  it('returns [] when agent worker has empty enabled_connectors (matches the prompt-block omission)', async () => {
+  it('returns [] when an explicit actor filter has empty enabled_connectors', async () => {
     fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
     fixtures.agents = { 'a1': { agent_id: 'a1', enabled_connectors: [] } };
     const { createConnectorMetaTools } = await loadModule();
@@ -320,7 +320,7 @@ describe('getConnectorPromptBlock', () => {
     expect(block).not.toContain(': '); // no description colon when fallback
   });
 
-  it('respects the agent enabled_connectors whitelist (only allowed connectors appear)', async () => {
+  it('respects the optional actor enabled_connectors filter (only allowed connectors appear)', async () => {
     fixtures.instances = [
       makeInstance({ id: 'notion', tools: NOTION_TOOLS }),
       makeInstance({ id: 'github', tools: GITHUB_TOOLS }),
@@ -338,7 +338,7 @@ describe('getConnectorPromptBlock', () => {
     expect(await getConnectorPromptBlock(UID, undefined)).toBe('');
   });
 
-  it('returns "" when agent enabled_connectors is undefined (stricter than skill_list)', async () => {
+  it('returns "" when an explicit actor filter has undefined enabled_connectors', async () => {
     fixtures.instances = [makeInstance({ id: 'notion', tools: NOTION_TOOLS })];
     fixtures.agents = { 'a1': { agent_id: 'a1' } };
     const { getConnectorPromptBlock } = await loadModule();
@@ -410,7 +410,7 @@ describe('list_connector_tools', () => {
     expect(r.content).toContain('E_BAD_INPUT');
   });
 
-  it('respects agent whitelist at execution time (not just at build time)', async () => {
+  it('respects the optional actor filter at execution time (not just at build time)', async () => {
     fixtures.instances = [
       makeInstance({ id: 'notion', tools: NOTION_TOOLS }),
       makeInstance({ id: 'github', tools: GITHUB_TOOLS }),

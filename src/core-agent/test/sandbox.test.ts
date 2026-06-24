@@ -15,7 +15,7 @@ import {
 
 describe("SandboxExecutor", () => {
   it("defaults command execution to the long bash timeout", () => {
-    expect(DEFAULT_SANDBOX_TIMEOUT_MS).toBe(30 * 60_000);
+    expect(DEFAULT_SANDBOX_TIMEOUT_MS).toBe(60 * 60_000);
   });
 
   it("executes a simple command", async () => {
