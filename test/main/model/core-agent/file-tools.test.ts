@@ -28,6 +28,8 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  vi.doUnmock('../../../../src/main/features/ocr_runtime');
+  vi.restoreAllMocks();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   if (prevHome === undefined) delete process.env.HOME;
   else process.env.HOME = prevHome;
@@ -208,6 +210,92 @@ describe('file-tools › read_file (image)', () => {
     expect(Array.isArray(r.images)).toBe(true);
     expect(r.images.length).toBe(1);
     expect(r.images[0].mediaType).toBe('image/jpeg');
+  });
+});
+
+describe('file-tools › ocr_file', () => {
+  it('runs local OCR for images and returns OCR markdown', async () => {
+    const mockOcr = vi.fn(async () => ({
+      ok: true,
+      content: '<ocr-file path="/x" kind="image" pages="1" engine="local:rapidocr-onnxruntime" cached="false">\nhello\n</ocr-file>',
+      pages: [1],
+      cached: false,
+      engine: 'local:rapidocr-onnxruntime',
+    }));
+    vi.doMock('../../../../src/main/features/ocr_runtime', () => ({ ocrFile: mockOcr }));
+    const { tools, wsDir } = await buildTools();
+    const p = path.join(wsDir, 'scan.png');
+    const { Jimp } = await import('jimp' as any);
+    const img: any = new Jimp({ width: 20, height: 20, color: 0xFFFFFFFF });
+    fs.writeFileSync(p, await img.getBuffer('image/png'));
+
+    const r = await run(getTool(tools, 'ocr_file'), { path: p });
+
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toContain('hello');
+    expect(mockOcr).toHaveBeenCalledWith(expect.objectContaining({
+      userId: UID,
+      absPath: p,
+    }));
+  });
+
+  it('passes PDF page ranges to the local OCR runtime', async () => {
+    const mockOcr = vi.fn(async () => ({
+      ok: true,
+      content: '<ocr-file path="/x" kind="pdf" pages="1,3" engine="local:rapidocr-onnxruntime" cached="false">\npage text\n</ocr-file>',
+      pages: [1, 3],
+      cached: false,
+      engine: 'local:rapidocr-onnxruntime',
+    }));
+    vi.doMock('../../../../src/main/features/ocr_runtime', () => ({ ocrFile: mockOcr }));
+    const { tools, wsDir } = await buildTools();
+    const p = path.join(wsDir, 'scan.pdf');
+    fs.writeFileSync(p, makeMinimalPdf(['']));
+
+    const r = await run(getTool(tools, 'ocr_file'), { path: p, pages: '1,3' });
+
+    expect(r.isError).toBeFalsy();
+    expect(mockOcr).toHaveBeenCalledWith(expect.objectContaining({ absPath: p, pages: '1,3' }));
+  });
+
+  it('surfaces local OCR runtime errors with process info', async () => {
+    vi.doMock('../../../../src/main/features/ocr_runtime', () => ({
+      ocrFile: vi.fn(async () => ({
+        ok: false,
+        errorCode: 'E_OCR_INSTALL_FAILED',
+        message: 'Local OCR runtime install failed.',
+        processLog: [
+          'Preparing local OCR runtime',
+          'Checking local OCR runtime',
+          'Downloading and installing local OCR packages',
+        ],
+      })),
+    }));
+    const { tools, wsDir } = await buildTools();
+    const p = path.join(wsDir, 'scan.pdf');
+    fs.writeFileSync(p, makeMinimalPdf(['']));
+
+    const r = await run(getTool(tools, 'ocr_file'), { path: p });
+
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_OCR_INSTALL_FAILED');
+    expect(r.content).toContain('Local OCR runtime install failed');
+    expect(r.content).toContain('<ocr-process>');
+    expect(r.content).toContain('Downloading and installing local OCR packages');
+  });
+
+  it('rejects unsupported file kinds before invoking OCR runtime', async () => {
+    const mockOcr = vi.fn();
+    vi.doMock('../../../../src/main/features/ocr_runtime', () => ({ ocrFile: mockOcr }));
+    const { tools, wsDir } = await buildTools();
+    const p = path.join(wsDir, 'notes.docx');
+    fs.writeFileSync(p, makeMinimalDocx({ paragraphs: ['not visual'] }));
+
+    const r = await run(getTool(tools, 'ocr_file'), { path: p });
+
+    expect(r.isError).toBe(true);
+    expect(r.content).toContain('E_OCR_UNSUPPORTED_FILE');
+    expect(mockOcr).not.toHaveBeenCalled();
   });
 });
 

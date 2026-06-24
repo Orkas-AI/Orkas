@@ -45,6 +45,7 @@ import {
   NoTextError,
   UnsupportedFileKindError,
 } from '../../features/file_indexer';
+import { ocrFile } from '../../features/ocr_runtime';
 import { chatAttachmentDir, userMarketplaceSkillsDir, userSkillsDir } from '../../paths';
 import { getWorkspacePath } from '../../features/user_workspace';
 import { isPathAllowed } from '../../util/path-sandbox';
@@ -434,6 +435,86 @@ function createStatFileTool(opts: FileToolsOpts): AgentTool {
         log.warn(`stat_file failed user=${opts.userId} path=${abs}: ${msg}`);
         return { content: errText('E_STAT_FAILED', msg), isError: true };
       }
+    },
+  };
+}
+
+// ── ocr_file ─────────────────────────────────────────────────────────────
+
+function createOcrFileTool(opts: FileToolsOpts): AgentTool {
+  return {
+    name: 'ocr_file',
+    executionMode: 'sequential',
+    description:
+      'Run local OCR on visual text in a file and return Markdown. Use this when read_file/stat_file cannot recover text from visual content: scanned PDFs, image-only PDF pages, screenshots, photos of documents, or text embedded in images. For normal text PDFs/Office files, use stat_file/read_file first. For mixed PDFs, combine read_file text with ocr_file visual text.\n'
+      + '\n'
+      + 'Parameters:\n'
+      + '  path  — required. Absolute path inside the current workspace or this conversation\'s attachment dir.\n'
+      + '  pages — optional for PDFs. Page list/ranges like "1-3,5". Omit to OCR all pages.\n'
+      + '\n'
+      + 'Supported inputs in this version: PDF pages and image files (.png/.jpg/.jpeg/.webp/.gif). Office documents should be read with read_file; embedded-image OCR for Office is not supported yet.\n'
+      + 'The OCR engine is local RapidOCR + ONNXRuntime and does not consume cloud model credits. If the local OCR runtime is not installed, this tool installs it into Orkas\'s managed runtime directory. If this tool returns an E_OCR_* error, do not try to install or repair OCR dependencies with bash/pip/uv; report the tool error and process log.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute path. Must be inside workspace or current attachment dir.' },
+        pages: { type: 'string', description: 'Optional PDF pages, e.g. "1-3,5". Omit to OCR all pages.' },
+      },
+      required: ['path'],
+    },
+    async execute(input, ctx) {
+      const raw = String(input.path ?? '');
+      if (!raw) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
+      const abs = resolveAbs(ctx, raw);
+
+      const scopeErr = guardPath(opts, abs);
+      if (scopeErr) {
+        log.warn(`ocr_file scope reject user=${opts.userId} path=${abs}`);
+        return { content: scopeErr, isError: true };
+      }
+      const disabledSkillErr = guardDisabledSkillAccess(opts, abs);
+      if (disabledSkillErr) {
+        log.warn(`ocr_file disabled skill reject user=${opts.userId} path=${abs}`);
+        return { content: disabledSkillErr, isError: true };
+      }
+      try { fs.statSync(abs); }
+      catch (err) {
+        log.warn(`ocr_file not-found user=${opts.userId} path=${abs}: ${(err as Error).message}`);
+        return { content: errText('E_NOT_FOUND', `${abs}: ${(err as Error).message}`), isError: true };
+      }
+
+      const kind = kindOf(abs);
+      if (kind !== 'pdf' && kind !== 'image') {
+        return {
+          content: errText(
+            'E_OCR_UNSUPPORTED_FILE',
+            `ocr_file currently supports PDF and image files only; got kind=${kind}. Use read_file/stat_file for normal text or Office files.`,
+          ),
+          isError: true,
+        };
+      }
+
+      const pages = typeof input.pages === 'string' ? input.pages : undefined;
+      const result = await ocrFile({
+        userId: opts.userId,
+        absPath: abs,
+        ...(pages ? { pages } : {}),
+        ...(ctx.signal ? { signal: ctx.signal } : {}),
+        onProgress: (event) => ctx.emitProgress?.({
+          phase: event.phase,
+          message: event.message,
+          ...(event.data ? { data: event.data } : {}),
+        }),
+      });
+      if (result.ok === false) {
+        const processBlock = result.processLog?.length
+          ? `\n\n<ocr-process>\n${result.processLog.map((line) => `- ${line}`).join('\n')}\n</ocr-process>`
+          : '';
+        const repairHint = '\n\nDo not install or repair OCR dependencies with bash/pip/uv; ocr_file owns its local runtime.';
+        return { content: errText(result.errorCode, `${result.message}${processBlock}${repairHint}`), isError: true };
+      }
+      log.info(`ocr_file user=${opts.userId} kind=${kind} cached=${result.cached} path=${abs}`);
+      return { content: result.content };
     },
   };
 }
@@ -934,6 +1015,7 @@ export function createFileTools(opts: FileToolsOpts): AgentTool[] {
   return [
     createReadFileTool(opts),
     createStatFileTool(opts),
+    createOcrFileTool(opts),
     createSearchFilesTool(opts),
     createGrepFilesTool(opts),
     createListFilesTool(opts),

@@ -69,6 +69,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
   { name: 'delete_file',   group: 'fs', permission: 'localExec', summary: 'Delete a single file from the workspace / current attachment dir / extraRoots. The first call shows an inline confirmation card and returns a token; multiple deletes from the same turn are grouped in one card when possible. Use instead of `bash rm` for removals.' },
   { name: 'list_files',    group: 'fs', summary: 'List the workspace directory tree.' },
   { name: 'stat_file',     group: 'fs', summary: 'Trigger PDF/modern Office extraction and return total_chars; call before read_file.' },
+  { name: 'ocr_file',      group: 'fs', summary: 'Run local OCR on PDF pages or image files when visual text is not available through read_file/stat_file.' },
   { name: 'search_files',  group: 'fs', summary: 'Find files by name / glob across the workspace + attachment scope.' },
   { name: 'grep_files',    group: 'fs', summary: 'Grep text across the workspace + attachment scope (PDF/modern Office auto-extracted, then searched).' },
   { name: 'create_artifact', group: 'fs', permission: 'localExec', summary: 'Build an interactive multi-file app (HTML/CSS/JS) rendered live & clickable inside the chat bubble; for interactive dashboards / calculators / visualizations / mini-tools. Static/read-only dashboards should use :::dashboard; not documents (html_to_pdf) or images (generate_image).' },
