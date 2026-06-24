@@ -2,8 +2,10 @@
 /data
 /node_modules
 /resources/embedding-model
+/resources/officecli
 /resources/runtime/.python-*
 /resources/runtime/.uv-*
+/resources/runtime/node
 /resources/runtime/python
 /resources/runtime/uv
 /userWorkSpace
