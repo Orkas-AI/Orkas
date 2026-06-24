@@ -16,6 +16,8 @@ call node "%APP_DIR%\scripts\ensure-deps.cjs"
 if errorlevel 1 exit /b 1
 call node "%APP_DIR%\bin\ensure-runtime.cjs" --root "%APP_DIR%\resources\runtime"
 if errorlevel 1 exit /b 1
+call node "%APP_DIR%\scripts\fetch-officecli.cjs"
+if errorlevel 1 exit /b 1
 
 pushd "%APP_DIR%"
 taskkill /F /IM electron.exe >nul 2>nul

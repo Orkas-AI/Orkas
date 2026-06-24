@@ -41,6 +41,7 @@ echo "[Orkas] Starting Orkas (global prod)"
 
 node "$APP_DIR/scripts/ensure-deps.cjs"
 node "$APP_DIR/bin/ensure-runtime.cjs" --root "$APP_DIR/resources/runtime"
+node "$APP_DIR/scripts/fetch-officecli.cjs"
 
 cd "$APP_DIR"
 pkill -9 -f "$APP_DIR/node_modules/electron/dist" >/dev/null 2>&1 || true
