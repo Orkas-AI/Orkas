@@ -67,20 +67,42 @@ function writeStamp(hash) {
   fs.writeFileSync(STAMP, hash + '\n', 'utf8');
 }
 
+function npmInstallInvocation() {
+  let packageManager = '';
+  try {
+    const pkg = JSON.parse(fs.readFileSync(PKG, 'utf8'));
+    packageManager = String(pkg.packageManager || '').trim();
+  } catch {
+    packageManager = '';
+  }
+
+  if (/^npm@\d/.test(packageManager)) {
+    return {
+      cmd: process.platform === 'win32' ? 'corepack.cmd' : 'corepack',
+      args: ['npm', 'install'],
+      shell: process.platform === 'win32',
+      label: `corepack npm install (${packageManager})`,
+    };
+  }
+
+  return {
+    cmd: process.platform === 'win32' ? 'npm.cmd' : 'npm',
+    args: ['install'],
+    shell: process.platform === 'win32',
+    label: 'npm install',
+  };
+}
+
 function runNpmInstall() {
-  const cmd = process.platform === 'win32'
-    ? (process.env.ComSpec || process.env.COMSPEC || 'cmd.exe')
-    : 'npm';
-  const args = process.platform === 'win32'
-    ? ['/d', '/s', '/c', 'npm', 'install']
-    : ['install'];
-  const res = spawnSync(cmd, args, {
+  const invocation = npmInstallInvocation();
+  console.log(`[Orkas] Installing dependencies with ${invocation.label}...`);
+  const res = spawnSync(invocation.cmd, invocation.args, {
     cwd: PC_DIR,
     stdio: 'inherit',
-    shell: false,
+    shell: invocation.shell,
   });
   if (res.error) {
-    console.error('[Orkas] npm install 启动失败：', res.error.message);
+    console.error(`[Orkas] ${invocation.label} failed to start:`, res.error.message);
     process.exit(1);
   }
   if (res.status !== 0) {
@@ -113,6 +135,80 @@ function runModelFetch() {
   if (res.status !== 0) {
     process.exit(res.status ?? 1);
   }
+}
+
+const ELECTRON_DIR = path.join(NODE_MODULES, 'electron');
+const ELECTRON_INSTALL = path.join(ELECTRON_DIR, 'install.js');
+const ELECTRON_PATH_TXT = path.join(ELECTRON_DIR, 'path.txt');
+
+function electronExpectedVersion() {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(ELECTRON_DIR, 'package.json'), 'utf8'));
+    return String(pkg.version || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+function electronBinaryPath() {
+  try {
+    const rel = fs.readFileSync(ELECTRON_PATH_TXT, 'utf8').trim();
+    if (!rel) return '';
+    return path.join(ELECTRON_DIR, 'dist', rel);
+  } catch {
+    return '';
+  }
+}
+
+function electronReady() {
+  const bin = electronBinaryPath();
+  if (!bin || !fs.existsSync(bin)) return false;
+
+  const expected = electronExpectedVersion();
+  if (!expected) return false;
+  try {
+    const actual = fs.readFileSync(path.join(ELECTRON_DIR, 'dist', 'version'), 'utf8').trim().replace(/^v/, '');
+    if (actual !== expected) return false;
+  } catch {
+    return false;
+  }
+
+  return true;
+}
+
+function runElectronInstall(reason) {
+  if (!fs.existsSync(ELECTRON_INSTALL)) {
+    console.error('[Orkas] Electron package is incomplete: node_modules/electron/install.js is missing.');
+    console.error('[Orkas] Run `corepack npm install` in PC/ or remove PC/node_modules and start again.');
+    process.exit(1);
+  }
+
+  console.log(`[Orkas] Electron binary is not ready (${reason}); repairing Electron install...`);
+  const res = spawnSync(process.execPath, [ELECTRON_INSTALL], {
+    cwd: PC_DIR,
+    stdio: 'inherit',
+    shell: false,
+  });
+  if (res.error) {
+    console.error('[Orkas] Electron install script failed to start:', res.error.message);
+    process.exit(1);
+  }
+  if (res.status !== 0) {
+    process.exit(res.status ?? 1);
+  }
+}
+
+function ensureElectronReady(reason = 'missing binary') {
+  if (electronReady()) return;
+
+  runElectronInstall(reason);
+  if (electronReady()) return;
+
+  const bin = electronBinaryPath() || '<missing path.txt>';
+  console.error('[Orkas] Electron is still incomplete after repair.');
+  console.error(`[Orkas] Expected Electron binary: ${bin}`);
+  console.error('[Orkas] Check network access to the Electron download host, then rerun Orkas.');
+  process.exit(1);
 }
 
 // macOS dev 模式下 Dock tooltip + Cmd-Tab + 菜单栏左上角的应用名，全部
@@ -204,7 +300,9 @@ function main() {
       console.log('[Orkas] 知识库 embedding 模型缺失，补下载（约 90MB）...');
       runModelFetch();
     }
+    ensureElectronReady('dependency stamp is current but Electron files are incomplete');
     patchElectronAppName();
+    ensureElectronReady('Electron app-name patch left Electron files incomplete');
     return;
   }
 
@@ -215,6 +313,7 @@ function main() {
   }
 
   runNpmInstall();
+  ensureElectronReady('npm install finished without a complete Electron binary');
 
   // 双保险：npm install 的 postinstall 已跑 fetch-embedding-model，若因 npm
   // 的 postinstall 被 --ignore-scripts / CI 配置跳过，这里再兜底补一次。
@@ -223,6 +322,11 @@ function main() {
     runModelFetch();
   }
 
+  // npm install 重新落地的 Electron 会带回 "Electron" 字样的 Info.plist —
+  // 必须紧接着再 patch 一遍，否则 Dock 又会显示 Electron。
+  patchElectronAppName();
+  ensureElectronReady('Electron app-name patch left Electron files incomplete');
+
   // 安装后重新算一次（postinstall 钩子不会改 package.json/lockfile，但保险起见）
   const finalHash = depFingerprint();
   try {
@@ -230,9 +334,6 @@ function main() {
   } catch (err) {
     console.warn('[Orkas] 警告：写入依赖 stamp 失败（不影响启动）：', err.message);
   }
-  // npm install 重新落地的 Electron 会带回 "Electron" 字样的 Info.plist —
-  // 必须紧接着再 patch 一遍，否则 Dock 又会显示 Electron。
-  patchElectronAppName();
 }
 
 main();
