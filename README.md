@@ -1,6 +1,8 @@
 # Orkas
 
-**Open-source, local-first desktop app to build and command a team of AI agents — in one chat, with your own LLM keys. Fully offline-capable. macOS · Windows · Linux.**
+**Command a team of AI agents from one chat — not a single chatbot.**
+
+Orkas is an open-source, local-first desktop app: a capable **commander agent** does the work itself and directs specialized sub-agents, all with your own LLM keys. Fully offline-capable. macOS · Windows · Linux.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![Stars](https://img.shields.io/github/stars/Orkas-AI/Orkas?style=social)](https://github.com/Orkas-AI/Orkas/stargazers)
@@ -13,16 +15,18 @@
 
 ![Orkas demo](./resources/app-ui/demo.gif)
 
-> A commander LLM assembles a team of sub-agents and dispatches them in parallel or in series. Agents self-evolve through reflection. Your conversations, files, and API keys never leave your machine.
+> One capable commander agent — with the strengths of a coding agent — does the work itself and directs a team of specialized sub-agents, all by conversation. No flowcharts, no orchestration code. Your conversations, files, and API keys never leave your machine.
 
 ---
 
 ## What is Orkas?
 
-- **What it is** — a desktop GUI app where you build a *team* of specialized AI agents and command them through a single chat. Not a code framework, not a hosted SaaS.
+- **What it is** — a desktop GUI app where you command a *team* of specialized AI agents through one chat. Not a single chatbot, not a code framework, not a hosted SaaS.
+- **A commander that does, not just delegates** — the lead agent brings coding-agent strengths (precise file edits, careful tool use, engineering discipline, multi-step and long-horizon reasoning) and does the work itself; when a job needs a team, it assembles sub-agents to run in parallel or in series.
+- **Drives the open-source ecosystem** — plug in external CLI coding agents (Claude Code, Codex, OpenCode, Cline) and onboard open-source projects like HyperFrames as local tools — so one commander can deliver code, research, data, video, and slides.
 - **Local-first** — conversations, files, API keys, knowledge bases, and custom agents all stay on your disk. Model calls go straight from your machine to the provider — never through Orkas servers.
-- **Multi-agent (lead + sub-agents)** — one commander LLM dispatches sub-agents in parallel or in series; each agent has its own private skills and memory, and self-evolves after each task.
 - **Bring your own LLM keys** — plug in Claude, OpenAI, Gemini, DeepSeek, Kimi, GLM, Qwen, MiniMax, or Doubao. Mix providers across agents. No vendor lock-in.
+- **Self-evolving** — each agent has its own private skills and memory, and improves through reflection after each task.
 
 > ⭐ If Orkas is useful to you, a star helps more people find the project.
 
@@ -33,7 +37,9 @@
 - **Automate recurring reports & market research** — a sub-agent that gathers, summarizes, and ships a weekly report.
 - **Turn a product spec into dev tasks** — the commander breaks a PRD into tasks and dispatches them across agents.
 - **Chat with your documents & run local data analysis** — drop files in, keep the data on your machine.
-- **Orchestrate existing CLI agents** — OpenClaw, Hermes-Agent, Claude Code, Codex and other local CLI agents plug in as backends and take handoffs.
+- **Go beyond code — video, slides, and more** — the commander drives open-source tools like HyperFrames and hands off to CLI coding agents (Claude Code, Codex, OpenCode, Cline) and other local agents, so one chat produces code, research, video, and slide decks.
+
+**Explore use cases →** [research workflows](https://orkas.ai/use/researchers) · [data analysis](https://orkas.ai/use/data-analysis) · [chat with documents](https://orkas.ai/use/chat-with-documents) · [for developers](https://orkas.ai/use/developers) · [automate your workspace](https://orkas.ai/use/automate-workspace)
 
 ---
 
@@ -55,6 +61,35 @@
 | **Hermes-Agent** | Nous Research's self-improving personal agent (TUI + multi-channel gateway). | Orkas is desktop-GUI and team-shaped, with per-agent private skills and meta-cognition — and Hermes-Agent plugs in as an Orkas CLI backend. |
 
 **Orkas is for you if** you want a *team* of agents (not one assistant), a desktop GUI with file drop-in and visual agent management, and your data, keys, and agents on your own disk rather than a vendor cloud.
+
+**Not for you if** you just want a single all-purpose chatbot, a fully hosted/cloud team where your data lives on a vendor's servers, or a pure code library to embed in your own app.
+
+**Full side-by-side comparisons →** [vs Claude Code](https://orkas.ai/compare/orkas-vs-claude-code) · [vs Cline](https://orkas.ai/compare/orkas-vs-cline) · [vs LangChain](https://orkas.ai/compare/orkas-vs-langchain) · [vs ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt) · [vs OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw)
+
+---
+
+## FAQ
+
+**What is Orkas?**
+A local-first desktop app where you command a team of AI agents from one chat. A capable commander agent does the work itself and directs specialized sub-agents — not a single chatbot, not a code framework, not a hosted SaaS.
+
+**Is Orkas a local LLM?**
+No. Orkas runs on your machine but calls the models you choose through your own API keys (or a local model endpoint). It orchestrates agents and tools — it is not itself a model.
+
+**Where are my API keys and data stored?**
+On your disk. Conversations, files, knowledge bases, agents, and keys stay local; model calls go straight from your machine to the provider and are never proxied or archived by Orkas.
+
+**Does Orkas work offline?**
+The app is fully offline-capable — only the model calls need network. Point agents at a local model endpoint and you can run without the cloud.
+
+**Can Orkas drive Claude Code and other CLI coding agents?**
+Yes. Beyond its own commander and sub-agents, Orkas can drive external CLI coding agents — Claude Code, Codex, OpenCode, Cline — as local subprocesses, and onboard open-source projects like HyperFrames, all directed from the same chat.
+
+**How is Orkas different from Claude Desktop / CrewAI / LangChain?**
+Claude Desktop is a single assistant; CrewAI and LangChain are code-first frameworks. Orkas is a no-code desktop app that commands a *team* of agents, keeps data and keys local, and gives each agent its own private skills and memory. See the [full comparisons](https://orkas.ai/compare/orkas-vs-langchain).
+
+**Is Orkas free and open source?**
+Yes — MIT licensed. Bring your own model keys; you only ever pay your model providers.
 
 ---
 

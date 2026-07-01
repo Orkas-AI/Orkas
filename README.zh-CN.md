@@ -1,6 +1,8 @@
 # Orkas
 
-**开源、本地优先的桌面应用：在一个对话里组建并指挥一支 AI agent 团队，用你自己的大模型 key，可完全离线运行。支持 macOS · Windows · Linux。**
+**在一个对话里指挥一支 AI agent 团队 —— 而不是单个聊天机器人。**
+
+Orkas 是一个开源、本地优先的桌面应用：一个能力强的**指挥官 agent** 亲自干活，并调度专精的 sub-agent，全程用你自己的大模型 key，可完全离线运行。支持 macOS · Windows · Linux。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![Stars](https://img.shields.io/github/stars/Orkas-AI/Orkas?style=social)](https://github.com/Orkas-AI/Orkas/stargazers)
@@ -13,16 +15,18 @@
 
 ![Orkas 演示](./resources/app-ui/demo.gif)
 
-> 一个指挥官 LLM 组建一支 sub-agent 团队，并行或串行地分派任务；agent 通过复盘自我进化。你的对话、文件和 API key 始终不离开本机。
+> 一个能力强的指挥官 agent —— 具备 coding agent 的强项 —— 亲自完成硬核工作，并通过对话调度一支专精的 sub-agent 团队。无需流程图、无需编排代码。你的对话、文件和 API key 始终不离开本机。
 
 ---
 
 ## Orkas 是什么？
 
-- **它是什么** —— 一个桌面 GUI 应用，让你组建一支专精的 AI agent 团队，并在同一个对话里指挥它们。不是代码框架，也不是托管 SaaS。
+- **它是什么** —— 一个桌面 GUI 应用，让你在同一个对话里指挥一支专精的 AI agent *团队*。不是单个聊天机器人，不是代码框架，也不是托管 SaaS。
+- **指挥官亲自干，而不只是派活** —— 主 agent 具备 coding agent 的强项（精细的文件读写、稳健的工具操作、工程纪律、多步与长程推理），能亲自完成工作；当任务需要一支团队时，它再调度 sub-agent 并行或串行执行。
+- **驱动开源生态** —— 接入外部 CLI coding agent（Claude Code、Codex、OpenCode、Cline），并把 HyperFrames 等开源项目作为本地工具接入 —— 于是一个指挥官就能产出代码、研究、数据、视频和幻灯片。
 - **本地优先** —— 对话、文件、API key、知识库、自定义 agent 全部留在你的硬盘上。模型调用从你的机器直连服务商，绝不经过 Orkas 服务器。
-- **多 agent（指挥官 + sub-agent）** —— 一个指挥官 LLM 并行或串行地分派 sub-agent；每个 agent 拥有自己私有的技能与记忆，并在每次任务后自我进化。
 - **自带大模型 key** —— 接入 Claude、OpenAI、Gemini、DeepSeek、Kimi、GLM、Qwen、MiniMax、Doubao，不同 agent 可混用不同服务商，无厂商锁定。
+- **自我进化** —— 每个 agent 拥有自己私有的技能与记忆，并在每次任务后通过复盘自我改进。
 
 > ⭐ 如果 Orkas 对你有用，点个 star 能帮助更多人发现这个项目。
 
@@ -33,7 +37,9 @@
 - **自动化周期性报告与市场调研** —— 一个 sub-agent 负责收集、汇总并产出每周报告。
 - **把产品需求拆成开发任务** —— 指挥官把 PRD 拆成任务，分派给多个 agent。
 - **与你的文档对话、做本地数据分析** —— 拖入文件，数据全程留在本机。
-- **编排现有 CLI agent** —— OpenClaw、Hermes-Agent、Claude Code、Codex 等本地 CLI agent 可作为后端接入并接收任务交接。
+- **不止于代码 —— 视频、幻灯片等** —— 指挥官可驱动 HyperFrames 等开源工具，并把任务交接给 CLI coding agent（Claude Code、Codex、OpenCode、Cline）及其他本地 agent，于是一个对话就能产出代码、研究、视频与幻灯片。
+
+**查看使用场景 →** [研究工作流](https://orkas.ai/use/researchers) · [数据分析](https://orkas.ai/use/data-analysis) · [与文档对话](https://orkas.ai/use/chat-with-documents) · [面向开发者](https://orkas.ai/use/developers) · [自动化你的工作区](https://orkas.ai/use/automate-workspace)
 
 ---
 
@@ -55,6 +61,35 @@
 | **Hermes-Agent** | Nous Research 的自我改进个人 agent（TUI + 多渠道网关）。 | Orkas 是桌面 GUI、团队化形态，每个 agent 拥有私有技能与元认知 —— 且 Hermes-Agent 可作为 Orkas 的 CLI 后端接入。 |
 
 **如果你想要的是：**一支 agent *团队*（而非单个助理）、一个支持拖入文件与可视化管理 agent 的桌面 GUI、并希望数据/key/agent 都在自己的硬盘上而非厂商云端 —— 那么 Orkas 适合你。
+
+**以下情况 Orkas 不适合你：**只想要一个万能单点聊天机器人、想要一个数据托管在厂商服务器上的全云端团队、或想要一个嵌入自己应用的纯代码库。
+
+**逐项对比 →** [vs Claude Code](https://orkas.ai/compare/orkas-vs-claude-code) · [vs Cline](https://orkas.ai/compare/orkas-vs-cline) · [vs LangChain](https://orkas.ai/compare/orkas-vs-langchain) · [vs ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt) · [vs OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw)
+
+---
+
+## 常见问题（FAQ）
+
+**Orkas 是什么？**
+一个本地优先的桌面应用，让你在一个对话里指挥一支 AI agent 团队。一个能力强的指挥官 agent 亲自干活并调度专精的 sub-agent —— 不是单个聊天机器人，不是代码框架，也不是托管 SaaS。
+
+**Orkas 是本地大模型吗？**
+不是。Orkas 运行在你的机器上，但通过你自己的 API key（或本地模型端点）调用你选择的模型。它编排 agent 与工具，本身不是模型。
+
+**我的 API key 和数据存在哪里？**
+在你的硬盘上。对话、文件、知识库、agent 和 key 都留在本地；模型调用从你的机器直连服务商，绝不被 Orkas 代理或归档。
+
+**Orkas 能离线用吗？**
+应用本身可完全离线运行 —— 只有模型调用需要网络。把 agent 指向本地模型端点，就能脱离云端运行。
+
+**Orkas 能驱动 Claude Code 等 CLI coding agent 吗？**
+能。除了自己的指挥官与 sub-agent，Orkas 还能把外部 CLI coding agent（Claude Code、Codex、OpenCode、Cline）作为本地子进程驱动，并接入 HyperFrames 等开源项目，全部在同一个对话里指挥。
+
+**Orkas 和 Claude Desktop / CrewAI / LangChain 有什么不同？**
+Claude Desktop 是单个助理；CrewAI 和 LangChain 是代码优先的框架。Orkas 是无代码桌面应用，指挥一支 agent *团队*，数据与 key 留在本地，每个 agent 拥有私有技能与记忆。见[逐项对比](https://orkas.ai/compare/orkas-vs-langchain)。
+
+**Orkas 免费且开源吗？**
+是的 —— MIT 许可证。自带模型 key，你只需为你的模型服务商付费。
 
 ---
 
