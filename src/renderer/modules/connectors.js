@@ -328,7 +328,7 @@ function _renderCatalogCard(entry, instance) {
   // disconnect action as a bottom-row button (they need it visible to recover; the disable toggle
   // doesn't apply when there's nothing to disable).
   const menuHtml = connected
-    ? `<button class="connector-card-menu-btn" data-act="menu" aria-label="${escapeHtml(t('common.more'))}">⋯</button>`
+    ? `<button class="connector-card-menu-btn" data-act="menu" aria-label="${escapeHtml(t('common.more'))}" aria-expanded="false">⋯</button>`
     : '';
 
   // Bottom-row action:
@@ -338,7 +338,7 @@ function _renderCatalogCard(entry, instance) {
   //     before `_runConnect`'s `finally` clears the connecting flag, and the user sees
   //     the spinner vanish "the moment they return from the browser" even though the
   //     IPC chain (loadConnectors + grid re-render) is still finishing.
-  //   - connected: enable / disable toggle (per-user soft switch — hides instance from LLM)
+  //   - connected: use in the Commander composer; enable / disable lives in the ⋯ menu
   //   - errored:   disconnect (recover from a stuck error state)
   //   - oauth_pending: disabled unavailable button
   //   - default (uninstalled): connect (start OAuth)
@@ -351,9 +351,8 @@ function _renderCatalogCard(entry, instance) {
   } else if (isVisibleDisabled) {
     action = `<button class="btn btn-sm btn-primary" data-act="unsupported-connect">${escapeHtml(t('connectors.action.connect'))}</button>`;
   } else if (connected) {
-    const label = enabledFlag ? t('component.disable') : t('component.enable');
-    const cls = enabledFlag ? 'btn btn-sm' : 'btn btn-sm btn-primary';
-    action = `<button class="${cls}" data-act="toggle-enabled">${escapeHtml(label)}</button>`;
+    const useTitle = escapeHtml(formatChatUseLabel({ kind: 'connector', id: e.id, name: e.display_name || e.id }));
+    action = `<button class="agent-card-use connector-card-use" data-act="use-connector" title="${useTitle}" aria-label="${useTitle}" ${enabledFlag ? '' : 'disabled aria-disabled="true" tabindex="-1"'}>${escapeHtml(t('common.use'))}</button>`;
   } else if (e._custom) {
     // Custom server, not connected: retry probes the stored transport
     // (`connectors.refresh`), never OAuth. Disconnect stays available so a
@@ -409,7 +408,7 @@ function _renderCatalogCard(entry, instance) {
       else if (act === 'unsupported-connect') _showConnectorUnsupportedToast();
       else if (act === 'disconnect') _quickDisconnect(e, instance);
       else if (act === 'menu') _openCardMenu(btn, e, instance);
-      else if (act === 'toggle-enabled') _toggleConnectorEnabled(e, instance, !enabledFlag);
+      else if (act === 'use-connector' && enabledFlag) _useConnector(e, instance);
       else if (act === 'retry-custom') _retryCustomConnect(e);
     });
   });
@@ -419,19 +418,35 @@ function _renderCatalogCard(entry, instance) {
 // Tiny absolute-positioned popover anchored under the ⋯ button — one disconnect item for now.
 // Closes on outside click / Esc / window scroll. Keeping it inline so we don't pull in a generic
 // menu primitive for one use site; if a second connector-card menu item ever lands, refactor.
+function _clearConnectorCardMenuState() {
+  document.querySelectorAll('.connector-card.is-menu-open').forEach((card) => card.classList.remove('is-menu-open'));
+  document.querySelectorAll('.connector-card-menu-btn[aria-expanded="true"]').forEach((btn) => {
+    btn.setAttribute('aria-expanded', 'false');
+  });
+}
+
 function _openCardMenu(anchorBtn, entry, instance) {
+  const card = anchorBtn.closest('.connector-card');
+  const openCard = document.querySelector('.connector-card.is-menu-open');
   const existing = document.querySelector('.connector-card-menu-popover');
-  if (existing) { existing.remove(); return; }
+  if (existing) {
+    existing.remove();
+    _clearConnectorCardMenuState();
+    if (openCard === card) return;
+  }
+  if (card) card.classList.add('is-menu-open');
+  anchorBtn.setAttribute('aria-expanded', 'true');
   const rect = anchorBtn.getBoundingClientRect();
   const pop = document.createElement('div');
   pop.className = 'connector-card-menu-popover';
   pop.style.top = '-9999px';
   pop.style.left = '-9999px';
-  const pickerItem = entry && entry.id === 'gsheets'
-    ? `<div class="connector-card-menu-item" data-act="authorize-sheets">${escapeHtml(t('connectors.action.select_sheet'))}</div>`
-    : '';
+  const enabledFlag = instance && Object.prototype.hasOwnProperty.call(instance, 'enabled')
+    ? !!instance.enabled
+    : true;
+  const toggleLabel = enabledFlag ? t('component.disable') : t('component.enable');
   pop.innerHTML = `
-    ${pickerItem}
+    <div class="connector-card-menu-item" data-act="toggle-enabled">${escapeHtml(toggleLabel)}</div>
     <div class="connector-card-menu-item is-danger" data-act="disconnect">${escapeHtml(t('connectors.action.disconnect'))}</div>
   `;
   document.body.appendChild(pop);
@@ -448,6 +463,7 @@ function _openCardMenu(anchorBtn, entry, instance) {
 
   const close = () => {
     pop.remove();
+    _clearConnectorCardMenuState();
     document.removeEventListener('mousedown', onOutside, true);
     document.removeEventListener('keydown', onKey, true);
     window.removeEventListener('scroll', close, true);
@@ -458,56 +474,28 @@ function _openCardMenu(anchorBtn, entry, instance) {
   document.addEventListener('keydown', onKey, true);
   window.addEventListener('scroll', close, true);
 
-  pop.querySelector('[data-act="disconnect"]').addEventListener('click', () => {
-    close();
-    _quickDisconnect(entry, instance);
-  });
-  const sheetPicker = pop.querySelector('[data-act="authorize-sheets"]');
-  if (sheetPicker) {
-    sheetPicker.addEventListener('click', () => {
+  pop.querySelectorAll('[data-act]').forEach((item) => {
+    item.addEventListener('click', () => {
       close();
-      _authorizeGoogleSheetsFiles();
+      const act = item.dataset.act;
+      if (act === 'disconnect') _quickDisconnect(entry, instance);
+      else if (act === 'toggle-enabled') _toggleConnectorEnabled(entry, instance, !enabledFlag);
     });
-  }
+  });
 }
 
-async function _authorizeGoogleSheetsFiles() {
-  const startedAt = performance.now();
-  _connectorsTrackClick('connector_authorize_files', { connector_id: 'gsheets' });
-  try {
-    const res = await window.orkas.invoke('connectors.google_sheets_authorize_files', {});
-    if (!res || !res.ok) {
-      _connectorsTrackEvent('connector_authorize_files_result', {
-        connector_id: 'gsheets',
-        result: 'failure',
-        duration_ms: Math.round(performance.now() - startedAt),
-      });
-      uiAlert((res && res.error) || t('connectors.errors.authorize_sheet_failed'));
-      return;
-    }
-    const count = Array.isArray(res.picked_file_ids) ? res.picked_file_ids.length : 0;
-    _connectorsTrackEvent('connector_authorize_files_result', {
-      connector_id: 'gsheets',
-      result: 'success',
-      file_count: count,
-      duration_ms: Math.round(performance.now() - startedAt),
-    });
-    await uiAlert(count > 0
-      ? t('connectors.toast.sheet_selected', { count })
-      : t('connectors.toast.sheet_authorized'));
-    await loadConnectors();
-  } catch (err) {
-    _connectorsTrackEvent('connector_authorize_files_result', {
-      connector_id: 'gsheets',
-      result: 'failure',
-      duration_ms: Math.round(performance.now() - startedAt),
-    });
-    _connectorsTrackError('connector_authorize_files', {
-      connector_id: 'gsheets',
-      error_type: _connectorTrackErrorType(err),
-    });
-    uiAlert((err && err.message) || t('connectors.errors.authorize_sheet_failed'));
+function _useConnector(entry, instance) {
+  if (!instance || !instance.status || instance.status.kind !== 'connected' || instance.enabled === false) return;
+  const id = String((instance && instance.id) || (entry && entry.id) || '').trim();
+  const name = String((instance && instance.display_name) || (entry && entry.display_name) || id).trim();
+  if (!id && !name) return;
+  _connectorsTrackClick('connector_use', { ..._connectorTrackPayload(entry, instance), connector_id: id || name });
+  setView('new-chat');
+  if (typeof setChatRecipient === 'function') {
+    setChatRecipient('new-chat', { kind: 'commander' });
   }
+  setChatConnector('new-chat', id || name, name || id);
+  setTimeout(() => document.getElementById('new-chat-input')?.focus(), 50);
 }
 
 async function _toggleConnectorEnabled(entry, instance, nextEnabled) {

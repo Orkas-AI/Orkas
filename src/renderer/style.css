@@ -11815,7 +11815,7 @@ body.model-not-configured .main-content { flex-direction: column; }
   flex-direction: column;
   gap: 8px;
   min-width: 0;
-  padding: 14px;
+  padding: 14px 16px;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -11841,6 +11841,9 @@ body.model-not-configured .main-content { flex-direction: column; }
 }
 .connector-card-icon.is-svg {
   padding: 6px;
+}
+.connector-card[data-id="sentry"] .connector-card-icon.is-svg {
+  padding: 4px;
 }
 .connector-card-icon.is-svg svg {
   width: 100%;
@@ -11897,23 +11900,33 @@ body.model-not-configured .main-content { flex-direction: column; }
   overflow: hidden;
   text-wrap: pretty;
 }
-/* Connected card's ⋯ menu lives at the top-right of `.connector-card-top`. Hosts the destructive
-   "disconnect" action; kept off the visible foot row so it's one extra click away from the
-   common "enable / disable" toggle. */
+/* Match skill / agent card ⋯ placement: compact, hover-only, nudged toward the card edge. */
 .connector-card-menu-btn {
   margin-left: auto;
-  width: 28px;
-  height: 28px;
+  margin-top: -2px;
+  margin-right: -4px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
   border: 0;
   background: transparent;
-  border-radius: 6px;
-  font-size: 18px;
+  border-radius: 4px;
+  font-size: 16px;
   line-height: 1;
-  color: #6b7280;
+  color: var(--muted);
   cursor: pointer;
   flex-shrink: 0;
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  visibility: hidden;
+  transition: background 0.1s, color 0.1s;
 }
-.connector-card-menu-btn:hover { background: rgba(15, 23, 42, 0.06); color: #111827; }
+.connector-card:hover .connector-card-menu-btn,
+.connector-card:focus-within .connector-card-menu-btn,
+.connector-card.is-menu-open .connector-card-menu-btn { visibility: visible; }
+.connector-card-menu-btn:hover { background: rgba(15, 23, 42, 0.08); color: #334155; }
 .connector-card-menu-popover {
   position: fixed;
   z-index: 1000;
@@ -11955,7 +11968,17 @@ body.model-not-configured .main-content { flex-direction: column; }
   animation: marketplace-upload-spin 0.8s linear infinite;
 }
 
-.connector-card-foot { margin-top: auto; display: flex; justify-content: flex-end; gap: 6px; align-items: center; }
+.connector-card-foot {
+  margin-top: auto;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+.connector-card-foot .btn {
+  flex: 0 0 auto;
+}
 .connector-card-foot .btn-link {
   background: transparent;
   border: none;
