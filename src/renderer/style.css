@@ -4746,6 +4746,92 @@ body.model-not-configured .main-content { flex-direction: column; }
   font-weight: 500;
 }
 
+.chat-input-rich-wrap {
+  position: relative;
+  width: 100%;
+  flex: 0 1 auto;
+}
+
+.chat-input-rich-wrap .chat-rich-source,
+.chat-input-area .chat-input-rich-wrap textarea.chat-rich-source,
+.new-chat-input-area .chat-input-rich-wrap textarea.chat-rich-source {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  min-height: 0;
+  max-height: none;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  opacity: 0;
+  pointer-events: none;
+  resize: none;
+  overflow: hidden;
+}
+
+.chat-rich-editor {
+  width: 100%;
+  min-height: 35px;
+  max-height: 260px;
+  padding: 4px 4px;
+  border: none;
+  outline: none;
+  overflow-x: hidden;
+  overflow-y: hidden;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: break-word;
+  font-size: 15px;
+  line-height: 1.55;
+  font-family: inherit;
+  color: var(--text);
+  caret-color: var(--text);
+  letter-spacing: 0;
+  tab-size: 4;
+  box-sizing: border-box;
+}
+
+.chat-rich-editor:empty::before {
+  content: attr(data-placeholder);
+  color: #94a3b8;
+  pointer-events: none;
+}
+
+.chat-input-mirror .chat-use-inline-chip,
+.chat-rich-editor .chat-use-inline-chip {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  min-height: 1.45em;
+  margin: 0 1px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: inherit;
+  font-weight: inherit;
+  line-height: 1.35;
+  vertical-align: 0.08em;
+  box-sizing: border-box;
+}
+
+.chat-input-mirror .chat-use-inline-prefix,
+.chat-rich-editor .chat-use-inline-prefix {
+  color: var(--muted);
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.chat-input-mirror .chat-use-inline-name,
+.chat-rich-editor .chat-use-inline-name {
+  min-width: 0;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  color: var(--primary);
+}
+
 .chat-send-btn {
   width: 32px;
   height: 32px;
