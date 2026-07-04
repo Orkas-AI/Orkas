@@ -12,6 +12,10 @@ function cssBlock(css: string, selector: RegExp) {
   return css.match(selector)?.[1] || '';
 }
 
+function cssBlockLast(css: string, selector: RegExp) {
+  return [...css.matchAll(selector)].at(-1)?.[1] || '';
+}
+
 describe('synced PC surface regressions', () => {
   it('keeps card Use actions as text buttons and reserves icon sizing for icon buttons', () => {
     const css = read('src/renderer/style.css');
@@ -33,6 +37,33 @@ describe('synced PC surface regressions', () => {
     expect(css).toContain('.skill-card-disclosure');
     expect(html).toContain('class="skill-card-use skill-dialog-btn" id="skill-use-btn"');
     expect(html).toContain('class="agent-card-use agent-dialog-btn" id="agent-use-btn"');
+  });
+
+  it('keeps synced tab card layout sizing for agent and marketplace chips', () => {
+    const css = read('src/renderer/style.css');
+
+    const agentCardBlock = cssBlockLast(css, /\.agent-card\s*{([\s\S]*?)}/g);
+    expect(agentCardBlock).toContain('gap: 2px;');
+    expect(agentCardBlock).toContain('min-height: 132px;');
+
+    const agentHeaderBlock = cssBlockLast(css, /\.agent-card-header\s*{([\s\S]*?)}/g);
+    expect(agentHeaderBlock).toContain('padding-right: 26px;');
+    expect(css).toContain('.agent-card-title');
+    expect(css).toContain('.agent-card-meta');
+
+    const agentMoreBlock = cssBlockLast(css, /(?:^|\n)\.agent-card-more\s*{([\s\S]*?)}/g);
+    expect(agentMoreBlock).toContain('position: absolute;');
+    expect(agentMoreBlock).toContain('right: 12px;');
+    expect(agentMoreBlock).toContain('width: 22px;');
+
+    const skillDescBlock = cssBlock(css, /\.skill-card-desc\s*{([\s\S]*?)}/);
+    expect(skillDescBlock).toContain('color: var(--text-2);');
+
+    const chipBlock = cssBlock(css, /\.marketplace-card-chip,\s*\.skill-card-chip,\s*\.agent-card-chip\s*{([\s\S]*?)}/);
+    expect(chipBlock).toContain('display: inline-flex;');
+    expect(chipBlock).toContain('box-sizing: border-box;');
+    expect(chipBlock).toContain('min-height: 20px;');
+    expect(chipBlock).toContain('line-height: 1.2;');
   });
 
   it('keeps the external-agent entry copy aligned with external agents, not coding tools only', () => {

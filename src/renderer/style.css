@@ -2822,7 +2822,7 @@ body.model-not-configured .main-content { flex-direction: column; }
   flex: 1;
   font-size: 13px;
   line-height: 1.5;
-  color: var(--muted);
+  color: var(--text-2);
   display: -webkit-box;
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
@@ -8936,7 +8936,7 @@ body.model-not-configured .main-content { flex-direction: column; }
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 2px;
   padding: 14px 16px;
   background: #fff;
   border: 1px solid var(--border);
@@ -8958,6 +8958,15 @@ body.model-not-configured .main-content { flex-direction: column; }
   align-items: center;
   gap: 10px;
   min-height: 32px;
+  padding-right: 26px;
+}
+
+.agent-card-title {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
 }
 
 .agent-card-name {
@@ -8971,13 +8980,37 @@ body.model-not-configured .main-content { flex-direction: column; }
   white-space: nowrap;
 }
 
+.agent-card-title .agent-card-name {
+  flex: none;
+  display: block;
+}
+
+.agent-card-meta {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+
+.agent-card-meta .agent-card-chip {
+  flex: 0 0 auto;
+}
+
 .agent-card-source {
   flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-height: 20px;
   font-size: 11px;
+  line-height: 1.2;
   font-weight: 600;
   padding: 2px 8px;
-  border-radius: 10px;
-  letter-spacing: 0.4px;
+  border-radius: 999px;
+  letter-spacing: 0;
 }
 .agent-card-source.is-builtin {
   background: rgba(148, 163, 184, 0.15);
@@ -8989,12 +9022,13 @@ body.model-not-configured .main-content { flex-direction: column; }
 }
 
 .agent-card-more {
-  flex-shrink: 0;
+  position: absolute;
+  top: 12px;
+  right: 12px;
   width: 22px;
   height: 22px;
   padding: 0;
-  margin-top: -2px;
-  margin-right: -4px;
+  margin: 0;
   border: none;
   background: transparent;
   color: var(--muted);
@@ -9023,7 +9057,8 @@ body.model-not-configured .main-content { flex-direction: column; }
   flex: 1;
   font-size: 13px;
   line-height: 1.5;
-  color: var(--muted);
+  color: var(--text-2);
+  max-height: calc(13px * 1.5 * 3);
   display: -webkit-box;
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
@@ -9040,6 +9075,7 @@ body.model-not-configured .main-content { flex-direction: column; }
   align-items: center;
   justify-content: space-between;
   gap: 6px;
+  margin-top: 8px;
   flex-wrap: wrap;
 }
 /* When no chip is present, the play button still hugs the right edge.
@@ -11160,7 +11196,13 @@ body.model-not-configured .main-content { flex-direction: column; }
 .marketplace-card-chip,
 .skill-card-chip,
 .agent-card-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-height: 20px;
   font-size: 11px;
+  line-height: 1.2;
   padding: 2px 8px;
   border-radius: 999px;
   background: rgba(79,70,229,0.08);
