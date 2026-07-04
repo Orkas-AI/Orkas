@@ -433,7 +433,10 @@
         <!-- Grid view (default) -->
         <div class="agents-grid-view" id="agents-grid-view">
           <div class="agents-grid-header">
-            <span data-i18n="agents.title">Agents</span>
+            <div class="agents-grid-header-titles">
+              <span class="agents-grid-title" data-i18n="agents.title">AI Team</span>
+              <span class="agents-grid-subtitle" data-i18n="agents.subtitle">Every member is an agent — @ it, form squads, assign tasks.</span>
+            </div>
             <div class="header-actions">
               <button class="btn btn-sm" id="create-agent-btn" data-i18n="agents.create_btn">+ Create</button>
               <button class="btn btn-sm" id="agents-more-btn" data-i18n="agents.more_btn">More</button>
@@ -471,29 +474,55 @@
                 </div>
               </div>
               <div class="agents-detail-body">
-                <div class="agents-detail-section" id="agents-detail-runtime-section" style="display:none">
-                  <div class="agents-detail-label" data-i18n="agents.label_runtime">External agent</div>
-                  <div class="agents-detail-runtime" id="agents-detail-runtime"></div>
+                <div class="agents-detail-hero">
+                  <div class="agents-detail-section" id="agents-detail-runtime-section" style="display:none">
+                    <div class="agents-detail-label" data-i18n="agents.label_runtime">External agent</div>
+                    <div class="agents-detail-runtime" id="agents-detail-runtime"></div>
+                  </div>
+                  <div class="agents-detail-section agents-detail-intro-section" id="agents-detail-intro-section">
+                    <div class="agents-detail-label" data-i18n="agents.label_desc">Summary</div>
+                    <div class="agents-detail-desc" id="agents-detail-desc" contenteditable="false"></div>
+                  </div>
+                  <div class="agents-detail-section agents-detail-stats-section" id="agents-detail-stats-section" style="display:none">
+                    <div class="agents-detail-label" data-i18n="agents.label_runtime_stats">Runtime data</div>
+                    <div class="agents-detail-stats" id="agents-detail-stats"></div>
+                  </div>
+                </div>
+                <div class="agents-detail-section" id="agents-detail-memory-section" style="display:none">
+                  <div class="agents-detail-label" data-i18n="agents.label_core_memory">Core memory</div>
+                  <p class="agents-detail-section-desc" data-i18n="agents.core_memory_desc">Persistent memory this agent has built with you.</p>
+                  <div class="agents-detail-list" id="agents-detail-memory"></div>
+                </div>
+                <div class="agents-detail-section" id="agents-detail-knowhow-section" style="display:none">
+                  <div class="agents-detail-label" data-i18n="agents.label_knowhow">Know-how</div>
+                  <p class="agents-detail-section-desc" data-i18n="agents.knowhow_desc">Task areas this agent is better at.</p>
+                  <div class="agents-detail-list" id="agents-detail-knowhow"></div>
                 </div>
                 <div class="agents-detail-section" id="agents-detail-project-dir-section" style="display:none">
                   <div class="agents-detail-label" data-i18n="agents.label_project_dir">Project directory</div>
                   <div class="agents-detail-project-dir" id="agents-detail-project-dir"></div>
                 </div>
-                <div class="agents-detail-section">
-                  <div class="agents-detail-label" data-i18n="agents.label_desc">Summary</div>
-                  <div class="agents-detail-desc" id="agents-detail-desc" contenteditable="false"></div>
+                <div class="agents-detail-section" id="agents-detail-output-standards-section" style="display:none">
+                  <div class="agents-detail-label" data-i18n="agents.label_delivery_standards">Delivery standards</div>
+                  <p class="agents-detail-section-desc" data-i18n="agents.delivery_standards_desc">Standards this agent checks before delivering.</p>
+                  <div class="agents-detail-list" id="agents-detail-output-standards"></div>
                 </div>
-                <div class="agents-detail-section" id="agents-detail-category-section">
-                  <div class="agents-detail-label" data-i18n="agents.label_category">Category</div>
-                  <div class="agents-detail-category" id="agents-detail-category"></div>
+                <div class="agents-detail-section" id="agents-detail-input-output-section" style="display:none">
+                  <div class="agents-detail-label" data-i18n="agents.label_input_output">Input / output</div>
+                  <div class="agents-detail-io" id="agents-detail-input-output">
+                    <div class="agents-detail-io-row" id="agents-detail-inputs-row">
+                      <div class="agents-detail-io-label" data-i18n="agents.label_inputs">Inputs</div>
+                      <div class="agents-detail-tag-row" id="agents-detail-inputs"></div>
+                    </div>
+                    <div class="agents-detail-io-row" id="agents-detail-output-format-control">
+                      <div class="agents-detail-io-label" data-i18n="agents.label_output_format">Output format</div>
+                      <div class="agents-detail-output-format" id="agents-detail-output-format"></div>
+                    </div>
+                  </div>
                 </div>
                 <div class="agents-detail-section agents-detail-section-workflow">
                   <div class="agents-detail-label" data-i18n="agents.label_workflow">Workflow</div>
                   <div class="agents-detail-workflow markdown-body" id="agents-detail-workflow" contenteditable="false"></div>
-                </div>
-                <div class="agents-detail-section" id="agents-detail-output-format-section">
-                  <div class="agents-detail-label" data-i18n="agents.label_output_format">Output format</div>
-                  <div class="agents-detail-output-format" id="agents-detail-output-format"></div>
                 </div>
               </div>
             </div>
@@ -886,7 +915,7 @@
               <div class="settings-group">
                 <div class="settings-group-head">
                   <div class="settings-group-title" data-i18n="settings.commander_avatar.title">Commander avatar</div>
-                  <div class="settings-group-sub" data-i18n="settings.commander_avatar.sub">Click the avatar to pick a new icon and color.</div>
+                  <div class="settings-group-sub" data-i18n="settings.commander_avatar.sub">Click the avatar to pick a new color.</div>
                 </div>
                 <div class="settings-row">
                   <span class="settings-commander-avatar-slot" id="settings-commander-avatar"></span>
@@ -901,24 +930,24 @@
                 </div>
                 <div class="settings-row settings-mode-list" id="settings-localexec-modes">
                   <label class="settings-mode-opt">
-                    <input type="radio" name="localexec-mode" value="off" />
+                    <input type="radio" name="localexec-mode" value="workspace_approval" />
                     <span class="settings-mode-text">
-                      <span class="settings-mode-label" data-i18n="settings.localexec.mode.off">Read-only</span>
-                      <span class="settings-mode-desc" data-i18n="settings.localexec.mode.off_desc">Agents can only read and analyze files. They cannot run commands or modify files.</span>
+                      <span class="settings-mode-label" data-i18n="settings.localexec.mode.workspace_approval">Cautious</span>
+                      <span class="settings-mode-desc" data-i18n="settings.localexec.mode.workspace_approval_desc">Workspace files only, approve sensitive actions</span>
                     </span>
                   </label>
                   <label class="settings-mode-opt">
-                    <input type="radio" name="localexec-mode" value="risk_prompt" />
+                    <input type="radio" name="localexec-mode" value="all_files_approval" />
                     <span class="settings-mode-text">
-                      <span class="settings-mode-label" data-i18n="settings.localexec.mode.risk_prompt">On, ask before risky actions (recommended)</span>
-                      <span class="settings-mode-desc" data-i18n="settings.localexec.mode.risk_prompt_desc">Agents can run commands and modify files. They ask for your approval before risky actions such as going online, deleting, or escalating privileges.</span>
+                      <span class="settings-mode-label" data-i18n="settings.localexec.mode.all_files_approval">Standard</span>
+                      <span class="settings-mode-desc" data-i18n="settings.localexec.mode.all_files_approval_desc">All files, approve sensitive actions</span>
                     </span>
                   </label>
                   <label class="settings-mode-opt">
-                    <input type="radio" name="localexec-mode" value="allow_all" />
+                    <input type="radio" name="localexec-mode" value="all_files_auto" />
                     <span class="settings-mode-text">
-                      <span class="settings-mode-label" data-i18n="settings.localexec.mode.allow_all">Always allow</span>
-                      <span class="settings-mode-desc" data-i18n="settings.localexec.mode.allow_all_desc">Agents run any action without asking. Use this only when you fully trust the current task.</span>
+                      <span class="settings-mode-label" data-i18n="settings.localexec.mode.all_files_auto">Trusted</span>
+                      <span class="settings-mode-desc" data-i18n="settings.localexec.mode.all_files_auto_desc">All files, no sensitive approvals</span>
                     </span>
                   </label>
                 </div>

@@ -1648,5 +1648,8 @@
   "skills.global_group_expand": "展开",
   "skills.global_group_collapse": "收起",
   "skills.source_external": "包",
-  "skills.source_global": "全局"
+  "skills.source_global": "全局",
+  "settings.commander_avatar.title": "指挥官头像",
+  "settings.commander_avatar.sub": "点击头像可更换颜色。",
+  "settings.commander_avatar.hint": "点击左侧头像进行更换"
 }

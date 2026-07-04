@@ -1648,5 +1648,8 @@
   "skills.global_group_expand": "展開",
   "skills.global_group_collapse": "折りたたむ",
   "skills.source_external": "パッケージ",
-  "skills.source_global": "グローバル"
+  "skills.source_global": "グローバル",
+  "settings.commander_avatar.title": "コマンダーのアバター",
+  "settings.commander_avatar.sub": "アバターをクリックして色を変更できます。",
+  "settings.commander_avatar.hint": "左のアバターをクリックして変更"
 }

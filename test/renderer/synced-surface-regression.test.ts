@@ -8,6 +8,10 @@ function read(rel: string) {
   return fs.readFileSync(path.join(root, rel), 'utf8');
 }
 
+function readJson(rel: string) {
+  return JSON.parse(read(rel));
+}
+
 function cssBlock(css: string, selector: RegExp) {
   return css.match(selector)?.[1] || '';
 }
@@ -80,6 +84,7 @@ describe('synced PC surface regressions', () => {
   it('exposes the local Commander profile to the renderer', () => {
     const ipc = read('src/main/ipc/index.ts');
     const profile = read('src/main/data/commander.json');
+    const parsed = JSON.parse(profile);
     const fromToken = ['fr', 'om'].join('');
     const commanderProfileImport = ['im', 'port * as commanderProfile ', fromToken, " '", '..', "/features/commander_profile'"].join('');
 
@@ -87,6 +92,47 @@ describe('synced PC surface regressions', () => {
     expect(ipc).toContain("'commander.getProfile'");
     expect(ipc).toContain("'commander.runtimeStats.get'");
     expect(profile).toContain('Orkas 的总调度者');
+    expect(parsed.knowhow.zh.length).toBeGreaterThan(0);
+    expect(parsed.standards.zh.length).toBeGreaterThan(0);
+    expect(parsed.workflow.zh.length).toBeGreaterThan(0);
+  });
+
+  it('keeps the synced Agent detail shell that can render the Commander profile', () => {
+    const html = read('src/renderer/index.html');
+    const css = read('src/renderer/style.css');
+
+    for (const marker of [
+      'agents-grid-header-titles',
+      'agents-grid-subtitle',
+      'agents-detail-hero',
+      'agents-detail-stats-section',
+      'agents-detail-memory-section',
+      'agents-detail-knowhow-section',
+      'agents-detail-output-standards-section',
+      'agents-detail-input-output-section',
+      'agents-detail-output-format-control',
+    ]) {
+      expect(html).toContain(marker);
+    }
+
+    for (const staleMarker of [
+      'agents-detail-category-section',
+      'agents-detail-output-format-section',
+    ]) {
+      expect(html).not.toContain(staleMarker);
+    }
+
+    for (const selector of [
+      '.agents-detail-hero',
+      '.agents-detail-stats',
+      '.agents-detail-list',
+      '.agents-detail-io',
+      '.agents-profile-chip',
+      '.agents-memory-grid',
+      '.agents-detail-label::before',
+    ]) {
+      expect(css).toContain(selector);
+    }
   });
 
   it('restores user-owned speech key configuration without exposing managed Orkas voice', () => {
@@ -118,5 +164,51 @@ describe('synced PC surface regressions', () => {
     expect(ttsAuth).toContain("id: 'openai'");
     expect(ttsAuth).not.toContain('ORKAS_VOICE');
     expect(ttsAuth).not.toContain('Orkas · Voice');
+  });
+
+  it('keeps Settings local execution modes and Open commander avatar copy usable', () => {
+    const html = read('src/renderer/index.html');
+    const settings = read('src/renderer/modules/settings.js');
+    const locales = ['en', 'zh', 'ja', 'pt'].map((lang) => readJson(`src/renderer/locales/${lang}.json`));
+
+    for (const marker of [
+      'value="workspace_approval"',
+      'value="all_files_approval"',
+      'value="all_files_auto"',
+      'settings.localexec.mode.workspace_approval',
+      'settings.localexec.mode.all_files_approval',
+      'settings.localexec.mode.all_files_auto',
+    ]) {
+      expect(html).toContain(marker);
+    }
+
+    for (const marker of [
+      'value="off"',
+      'value="risk_prompt"',
+      'value="allow_all"',
+      'settings.localexec.mode.off',
+      'settings.localexec.mode.risk_prompt',
+      'settings.localexec.mode.allow_all',
+    ]) {
+      expect(html).not.toContain(marker);
+    }
+
+    expect(settings).toContain("const _LOCALEXEC_MODES = ['workspace_approval', 'all_files_approval', 'all_files_auto'];");
+    expect(settings).toContain("'all_files_approval'");
+    expect(settings).not.toContain("const _LOCALEXEC_MODES = ['off', 'risk_prompt', 'allow_all'];");
+
+    for (const locale of locales) {
+      for (const key of [
+        'settings.commander_avatar.title',
+        'settings.commander_avatar.sub',
+        'settings.commander_avatar.hint',
+        'settings.localexec.mode.workspace_approval',
+        'settings.localexec.mode.all_files_approval',
+        'settings.localexec.mode.all_files_auto',
+      ]) {
+        expect(locale[key]).toEqual(expect.any(String));
+        expect(locale[key].length).toBeGreaterThan(0);
+      }
+    }
   });
 });

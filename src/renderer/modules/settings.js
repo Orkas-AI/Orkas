@@ -160,18 +160,18 @@ function _settingsRenderCommanderAvatar() {
 
 // ── Tool execution access permission ──
 
-const _LOCALEXEC_MODES = ['off', 'risk_prompt', 'allow_all'];
+const _LOCALEXEC_MODES = ['workspace_approval', 'all_files_approval', 'all_files_auto'];
 
 async function _settingsRefreshLocalExec() {
   const res = await window.orkas.invoke('permissions.getLocalExec');
-  const mode = (res && res.ok && _LOCALEXEC_MODES.includes(res.mode)) ? res.mode : 'risk_prompt';
+  const mode = (res && res.ok && _LOCALEXEC_MODES.includes(res.mode)) ? res.mode : 'all_files_approval';
   _settingsState.localExec = { mode };
 }
 
 function _settingsRenderLocalExec() {
   const container = document.getElementById('settings-localexec-modes');
   if (!container) return;
-  const mode = (_settingsState.localExec && _settingsState.localExec.mode) || 'risk_prompt';
+  const mode = (_settingsState.localExec && _settingsState.localExec.mode) || 'all_files_approval';
   const radios = container.querySelectorAll('input[name="localexec-mode"]');
   radios.forEach((r) => { r.checked = (r.value === mode); });
   if (!container.dataset.bound) {
@@ -179,7 +179,7 @@ function _settingsRenderLocalExec() {
       radio.addEventListener('change', async () => {
         if (!radio.checked) return;
         const next = radio.value;
-        const prev = (_settingsState.localExec && _settingsState.localExec.mode) || 'risk_prompt';
+        const prev = (_settingsState.localExec && _settingsState.localExec.mode) || 'all_files_approval';
         try {
           const res = await window.orkas.invoke('permissions.setLocalExecMode', { mode: next });
           if (res && res.ok && res.mode) {

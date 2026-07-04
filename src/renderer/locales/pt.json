@@ -1643,5 +1643,8 @@
   "settings.video.sub": "",
   "settings.entries.oauth_badge": "OAuth",
   "devtools.skill_metrics.system_unknown": "?",
-  "bash.permission.reason_sep": ", "
+  "bash.permission.reason_sep": ", ",
+  "settings.commander_avatar.title": "Avatar do comandante",
+  "settings.commander_avatar.sub": "Clique no avatar para escolher uma nova cor.",
+  "settings.commander_avatar.hint": "Clique no avatar à esquerda para alterar"
 }

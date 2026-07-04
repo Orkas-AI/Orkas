@@ -1648,5 +1648,8 @@
   "skills.global_group_expand": "Expand",
   "skills.global_group_collapse": "Collapse",
   "skills.source_external": "Package",
-  "skills.source_global": "Global"
+  "skills.source_global": "Global",
+  "settings.commander_avatar.title": "Commander avatar",
+  "settings.commander_avatar.sub": "Click the avatar to pick a new color.",
+  "settings.commander_avatar.hint": "Click the avatar on the left to change it"
 }
