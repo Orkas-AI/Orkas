@@ -21,18 +21,26 @@
  *   stripped once at startup by `util/migrate-session-ids.ts` and should not appear
  *   here at runtime.
  *
- * session jsonl only carries the LLM-facing view (including tool_use /
- * tool_result / compaction); it's a separate file from
+ * session jsonl carries the raw resumable LLM-turn history (tool_use /
+ * tool_result pairs included). `Session.getMessagesForModel()` may apply a
+ * transient send-time view (old image stripping / old tool_result compaction);
+ * it's a separate file from
  * `<uid>/cloud/chats/<cid>.jsonl` (the UI-facing view).
  */
 
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 
-import { userSessionFile, userLocalSessionFile } from '../../paths';
+import {
+  sessionCloudToolResultsDir,
+  sessionToolResultsDir,
+  userSessionFile,
+  userLocalSessionFile,
+} from '../../paths';
 import { getActiveUserId } from '../../features/users';
 import { createLogger } from '../../logger';
 import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
+import { persistToolResult } from '../../util/tool-result-cap';
 
 const log = createLogger('model');
 
@@ -117,6 +125,14 @@ export function sessionFileFor(sessionId: string): string {
   return resolveSessionPath(getActiveUserId(), sessionId);
 }
 
+export function toolResultsDirForSession(userId: string, sessionId: string): string {
+  // Validate the id with the same router that owns the session jsonl path.
+  resolveSessionPath(userId, sessionId);
+  return isEphemeralSessionId(sessionId)
+    ? sessionToolResultsDir(userId, sessionId)
+    : sessionCloudToolResultsDir(userId, sessionId);
+}
+
 /**
  * Lazy cache of loaded `PersistentSession` instances keyed by session_id.
  * Two concurrent calls with the same session_id get the same instance so
@@ -144,11 +160,20 @@ export async function getSession(sessionId: string): Promise<PersistentSessionIn
   const cached = cache.get(sessionId);
   if (cached) return cached;
 
-  const file = sessionFileFor(sessionId);
+  const userId = getActiveUserId();
+  const file = resolveSessionPath(userId, sessionId);
   fs.mkdirSync(path.dirname(file), { recursive: true });
 
   const Ctor = await getCtor();
-  const session = new Ctor({ sessionFile: file });
+  const session = new Ctor({
+    sessionFile: file,
+    toolResultCompaction: {
+      persistToolResult: ({ toolName, content }) => {
+        const safeToolName = sanitizeToolResultName(toolName);
+        return persistToolResult(toolResultsDirForSession(userId, sessionId), safeToolName, content);
+      },
+    },
+  });
   cache.set(sessionId, session);
   return session;
 }
@@ -160,7 +185,8 @@ export function evictSession(sessionId: string): void {
 
 /** Delete the on-disk jsonl. Caller is responsible for also evicting. */
 export function deleteSessionFile(sessionId: string): void {
-  const file = sessionFileFor(sessionId);
+  const userId = getActiveUserId();
+  const file = resolveSessionPath(userId, sessionId);
   try { fs.unlinkSync(file); }
   catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
@@ -171,6 +197,8 @@ export function deleteSessionFile(sessionId: string): void {
       });
     }
   }
+  try { fs.rmSync(toolResultsDirForSession(userId, sessionId), { recursive: true, force: true }); }
+  catch (err) { log.warn('session tool-results delete failed', { session_id: maskId(sessionId), error: logErrorRef(err) }); }
 }
 
 /** Same as deleteSessionFile but takes an explicit userId (caller has the
@@ -189,6 +217,14 @@ export function deleteSessionFileForUser(userId: string, sessionId: string): voi
       });
     }
   }
+  try { fs.rmSync(toolResultsDirForSession(userId, sessionId), { recursive: true, force: true }); }
+  catch (err) {
+    log.warn('session tool-results delete failed', {
+      user_id: maskId(userId),
+      session_id: maskId(sessionId),
+      error: logErrorRef(err),
+    });
+  }
 }
 
 /** Flush all cached sessions — called by `features/users.activateUser()` on uid switch. */
@@ -199,4 +235,11 @@ export function _evictAll(): void {
 /** For diagnostics / tests. */
 export function _cacheSize(): number {
   return cache.size;
+}
+
+function sanitizeToolResultName(name: string): string {
+  const safe = String(name || 'tool_result')
+    .replace(/[^A-Za-z0-9_.-]/g, '_')
+    .slice(0, 64);
+  return safe || 'tool_result';
 }

@@ -93,7 +93,7 @@ export const bashTool: AgentTool = defineTool({
       timeoutMs: { type: "number", description: "Timeout in milliseconds (default: 3600000 = 60 min). Pass a larger value for unusually long-running commands like full builds, large installs, network fetches, video processing." },
       run_in_background: {
         type: "boolean",
-        description: "Run detached and return immediately with a pid + log file path instead of waiting. Use for commands that may outlast any reasonable timeout (long builds, renders, big downloads). Poll progress by reading the log file; stop the process with `kill <pid>`. The process is NOT stopped automatically when the conversation ends.",
+        description: "Run detached and return immediately with pid + log path. Use for long builds, renders, downloads, or servers. Poll by reading the log; stop with `kill <pid>`. It keeps running after the conversation ends.",
       },
     },
     required: ["command"],

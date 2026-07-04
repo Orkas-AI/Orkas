@@ -160,6 +160,8 @@ export const savedAppDir      = (uid: string, appId: string) => path.join(userSa
 // and is the single place that decides which side an id lands on.
 export const userSessionsDir        = (uid: string) => path.join(userCloudRoot(uid), 'sessions');
 export const userSessionFile        = (uid: string, sessionId: string) => path.join(userSessionsDir(uid), `${sessionId}.jsonl`);
+export const sessionCloudToolResultsDir = (uid: string, sessionId: string) =>
+  path.join(userSessionsDir(uid), `${sessionId}.tool-results`);
 export const userLocalSessionsDir   = (uid: string) => path.join(userLocalRoot(uid), 'sessions');
 export const userLocalSessionFile   = (uid: string, sessionId: string) => path.join(userLocalSessionsDir(uid), `${sessionId}.jsonl`);
 
@@ -344,11 +346,9 @@ export const userChatsIndexPath      = (uid: string) => path.join(userSearchDir(
 // Dev-only LLM-call archive (features/devtools.ts + model/core-agent/client.ts).
 export const userTestDir = (uid: string) => path.join(userLocalRoot(uid), 'test');
 
-// Spill copy for oversized tool output (>50K chars): the tool_result keeps
-// only a preview + file reference; the model can pull back the full text
-// via read_file(path). One subdirectory per session_id; startup
-// `sweepToolResults(uid)` cleans entries older than 7 days by mtime.
-// Never synced.
+// Machine-local spill copy for oversized CLI/local-agent tool output. Core
+// agent resumable sessions use `sessionCloudToolResultsDir()` instead so the
+// persisted-output refs travel with `cloud/sessions/<sid>.jsonl`.
 export const userToolResultsDir = (uid: string) => path.join(userLocalRoot(uid), 'tool-results');
 export const sessionToolResultsDir = (uid: string, sessionId: string) =>
   path.join(userToolResultsDir(uid), sessionId);
@@ -550,6 +550,11 @@ export const qualitySkillReportFile = (uid: string, sid: string) =>
 export const qualityAgentReportFile = (uid: string, aid: string) =>
   path.join(userQualityAgentsDir(uid), `${aid}.json`);
 
+// Composer-only attachment drafts. These bytes are not message content yet, so
+// they stay local until a send flow adopts them into cloud/chat_attachments/<cid>/.
+export const userChatAttachmentDraftsDir = (uid: string) => path.join(userLocalRoot(uid), 'chat_attachment_drafts');
+export const chatAttachmentDraftDir      = (uid: string, cid: string) => path.join(userChatAttachmentDraftsDir(uid), cid);
+
 // ── Multi-device sync (machine-private state) ────────────────────────────
 // `<uid>/local/sync/` is the engine's per-machine bookkeeping; nothing here
 // crosses devices (per plan §3.2). `index.json` is the last-synced snapshot
@@ -682,6 +687,7 @@ export function ensureUserLayout(uid: string): void {
     userSearchDir(uid),
     userTestDir(uid),
     userFileCacheDir(uid),
+    userChatAttachmentDraftsDir(uid),
     userToolResultsDir(uid),
     userSyncDir(uid),
     userSyncConflictsDir(uid),

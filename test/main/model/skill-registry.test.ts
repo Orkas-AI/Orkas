@@ -32,6 +32,9 @@ function systemDirFor(uid: string): string {
 function agentPrivateDir(agentId: string): string {
   return path.join(tmpDir, TEST_UID, 'cloud', 'agents', agentId, 'private_skills');
 }
+function agentEvolvedDir(agentId: string): string {
+  return path.join(tmpDir, TEST_UID, 'cloud', 'agents', agentId, 'skills');
+}
 
 function writeSkill(root: string, id: string, name: string, description: string, installMeta?: Record<string, unknown>) {
   const skillDir = path.join(root, id);
@@ -98,6 +101,37 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     const { getSystemPromptBlock } = await loadRegistry();
     const text = await getSystemPromptBlock({ allowlist: [] });
     expect(text).toBe('');
+  });
+
+  it('still renders the acting agent private skills under an empty allowlist', async () => {
+    writeSkill(builtinDir(), 'translate', 'Translate', 'T');
+    writeSkill(agentPrivateDir('agent-a'), 'private-helper', 'private-helper', 'private help');
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock({ agentId: 'agent-a', allowlist: [] });
+    expect(text).toContain('private-helper');
+    expect(text).not.toContain('translate');
+  });
+
+  it('does not render self-evolved skills under an empty allowlist', async () => {
+    writeSkill(builtinDir(), 'translate', 'Translate', 'T');
+    writeSkill(agentEvolvedDir('agent-a'), 'evolved-helper', 'evolved-helper', 'evolved help');
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock({ agentId: 'agent-a', allowlist: [] });
+    expect(text).not.toContain('evolved-helper');
+    expect(text).not.toContain('translate');
+  });
+
+  it('preserves allowlist order when mixing agent-scoped and trusted skills', async () => {
+    writeSkill(customDir(), 'selected-helper', 'selected-helper', 'selected help');
+    writeSkill(agentPrivateDir('agent-a'), 'default-helper', 'default-helper', 'default help');
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock({
+      agentId: 'agent-a',
+      allowlist: ['default-helper', 'selected-helper'],
+      forceOpenSkillRefs: ['selected-helper'],
+    });
+    expect(text.indexOf('default-helper')).toBeGreaterThanOrEqual(0);
+    expect(text.indexOf('selected-helper')).toBeGreaterThan(text.indexOf('default-helper'));
   });
 
   it('silently drops unknown ids in the allowlist', async () => {
@@ -253,6 +287,16 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     expect(second).toContain('private-one');
     expect(second).toContain('private-two');
     expect(constructed).toBe(2);
+  });
+
+  it('lists agent-owned private and self-evolved skill ids', async () => {
+    writeSkill(agentPrivateDir('video-studio'), 'private-one', 'private-one', 'first private skill');
+    writeSkill(agentEvolvedDir('video-studio'), 'evolved-one', 'evolved-one', 'first evolved skill');
+    const { listAgentOwnedSkillIds } = await loadRegistry();
+    await expect(listAgentOwnedSkillIds(TEST_UID, 'video-studio')).resolves.toEqual([
+      'private-one',
+      'evolved-one',
+    ]);
   });
 });
 

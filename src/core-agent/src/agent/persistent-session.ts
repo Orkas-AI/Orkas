@@ -6,7 +6,7 @@ import type {
   ToolResultContent,
   ToolUseContent,
 } from "../shared/types.js";
-import { Session } from "./session.js";
+import { Session, type ToolResultCompactionOptions } from "./session.js";
 
 /** Synthetic content written when a prior run aborted after the model
  * issued a tool_use but before the tool produced a tool_result. Both
@@ -41,8 +41,13 @@ export class PersistentSession extends Session {
     sessionFile: string;
     /** Per-parent-class option: cap on how many turns stay in memory. */
     maxHistoryTurns?: number;
+    /** Optional LLM-facing tool_result compaction. Raw JSONL history stays intact. */
+    toolResultCompaction?: ToolResultCompactionOptions | false;
   }) {
-    super({ maxHistoryTurns: opts.maxHistoryTurns });
+    super({
+      maxHistoryTurns: opts.maxHistoryTurns,
+      toolResultCompaction: opts.toolResultCompaction,
+    });
     this.sessionFile = opts.sessionFile;
     this.loadFromDisk();
   }

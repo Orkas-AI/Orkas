@@ -594,7 +594,7 @@ async function probeBasic(ffprobe: string, input: string, signal?: AbortSignal):
 
 /** Public duration probe (resolves the bundled ffprobe itself). Best-effort:
  *  returns null when ffprobe is missing or the file has no readable duration.
- *  Used by video_speech to report synthesized-narration length. */
+ *  Used by skill scripts to report synthesized-narration length. */
 export async function probeMediaDurationSec(inputAbsPath: string, signal?: AbortSignal): Promise<number | null> {
   const bins = resolveBins();
   if (!bins) return null;

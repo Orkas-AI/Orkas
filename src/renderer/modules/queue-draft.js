@@ -133,6 +133,9 @@ function _dispatchNextQueued(cid) {
   // Falling back to current chip is only for legacy queue rows persisted before
   // snapshots existed.
   let use = _queueItemUseSelection(next);
+  const inlineUseSelections = (typeof _chatUseSelectionsFromText === 'function')
+    ? _chatUseSelectionsFromText(next.content || '')
+    : [];
   if (use && typeof isChatUseAllowedForTarget === 'function' && !isChatUseAllowedForTarget('conversation', use.kind)) {
     use = null;
   }
@@ -156,9 +159,17 @@ function _dispatchNextQueued(cid) {
   const content = next.direct
     ? next.content
     : applyRecipientPrefix(withUse, 'conversation', { recipientSnapshot: next.recipient });
+  const extra = next.extra && typeof next.extra === 'object' ? { ...next.extra } : {};
+  if (!Array.isArray(extra.use_selections) && typeof _normalizeChatUseSelections === 'function') {
+    const selections = _normalizeChatUseSelections([
+      ...inlineUseSelections,
+      ...(use ? [use] : []),
+    ]);
+    if (selections.length) extra.use_selections = selections;
+  }
   // Fire-and-forget: sendInCurrentConversation handles its own errors via
   // _streamingSetError + _finishStreamingMsg (which will re-enter this fn).
-  sendInCurrentConversation(content, next.extra);
+  sendInCurrentConversation(content, Object.keys(extra).length ? extra : undefined);
 }
 
 function renderMessageQueue(cid) {

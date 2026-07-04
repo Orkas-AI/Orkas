@@ -170,6 +170,8 @@ describe('markdown media links', () => {
     const out = inlineFormat('[video](chat-media://local/Users/test/car_driving.mp4)');
     expect(out).toContain('<span class="chat-md-video-shell">');
     expect(out).toContain('<video class="chat-md-video"');
+    expect(out).toContain('width="640"');
+    expect(out).toContain('height="360"');
     expect(out).toContain('controls');
     expect(out).toContain('controlslist="nodownload nofullscreen noremoteplayback"');
     expect(out).toContain('disablepictureinpicture');

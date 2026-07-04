@@ -6,7 +6,7 @@
  * assembly in runner.ts. Three-tier handling:
  *   len ≤ maxChars            → pass through unchanged
  *   maxChars < len ≤ PERSIST  → in-place truncation + trailing marker
- *   len > PERSIST             → spill to tool-results/<sid>/<name>.<id>.txt,
+ *   len > PERSIST             → spill to the caller-provided tool-results dir,
  *                                rewrite tool_result into a <persisted-output>
  *                                wrapper (preview + reference); the model can
  *                                pull the original back via read_file(path)
@@ -87,7 +87,7 @@ export interface WrapOpts {
   /** maxChars cap for this tool. Infinity → decorator returns the original
    *  tool directly. */
   maxChars: number;
-  /** Spill directory (typically `sessionToolResultsDir(uid, sessionId)`).
+  /** Spill directory (local for CLI/local-agent; cloud-adjacent for resumable core-agent sessions).
    *  The decorator does not care about uid / sessionId; the caller assembles
    *  the path and passes it in. The directory is mkdir'd on demand, not
    *  required to exist beforehand. */

@@ -5,21 +5,19 @@
  * platform agents/skills. It is not a third source tier at runtime: this module
  * copies missing packaged content into the normal per-user marketplace install
  * tree, writes ordinary installs.json rows, and lets marketplace reconcile take
- * over once the server is reachable. In dev, a newer packaged builtin can also
- * overlay the same-id marketplace install while preserving install metadata; this
- * keeps git-managed builtin changes runnable before they are published upstream.
+ * over once the server is reachable. A newer packaged builtin can also overlay
+ * the same-id marketplace install while preserving install metadata; this keeps
+ * git-managed builtin changes runnable before they are published upstream.
  */
 
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
-import * as crypto from 'node:crypto';
 
 import {
   packagedBuiltinMarketplaceAgentsDir,
   packagedBuiltinMarketplaceSkillsDir,
   userMarketplaceAgentDir,
-  userMarketplaceAgentSkillsDir,
   userMarketplaceSkillDir,
 } from '../paths';
 import { createLogger } from '../logger';
@@ -27,11 +25,9 @@ import { safeId } from '../storage';
 import { sha256OfFile } from '../util/sha256';
 import {
   MARKETPLACE_RESOURCE_MANIFEST_NAME,
-  MARKETPLACE_TREE_HASH_ALGORITHM,
   MARKETPLACE_TREE_HASH_SKIP_NAMES,
   marketplaceContentTreeFiles,
   marketplaceContentTreeHash,
-  marketplaceContentTreeHashForFiles,
 } from '../util/marketplace-tree-hash';
 import {
   DEFAULT_MARKETPLACE_VERSION,
@@ -45,7 +41,6 @@ import { postJson } from './marketplace';
 
 const log = createLogger('builtin-marketplace');
 const BUILTIN_CREATE_UID = '0';
-const ENABLE_BUILTIN_DEV_OVERLAY = false;
 
 export interface BuiltinMarketplaceSeedOptions {
   shouldContinue?: () => boolean;
@@ -77,17 +72,6 @@ function _safeDirEntries(root: string): fs.Dirent[] {
       .sort((a, b) => a.name.localeCompare(b.name));
   } catch {
     return [];
-  }
-}
-
-async function _copyDir(src: string, dst: string): Promise<void> {
-  await fsp.mkdir(dst, { recursive: true });
-  for (const entry of await fsp.readdir(src, { withFileTypes: true })) {
-    if (entry.name === '.' || entry.name === '..' || entry.name === '_install.json') continue;
-    const from = path.join(src, entry.name);
-    const to = path.join(dst, entry.name);
-    if (entry.isDirectory()) await _copyDir(from, to);
-    else if (entry.isFile()) await fsp.copyFile(from, to);
   }
 }
 
@@ -152,19 +136,25 @@ function _builtinAgentUpdatedAt(agentJson: Record<string, unknown>): number {
   return _timestampMs(agentJson.updated_at);
 }
 
+function _builtinAgentReseedIfDeletedBefore(srcDir: string, agentJson: Record<string, unknown>): number {
+  const meta = _readJsonObject(path.join(srcDir, '_meta.json'));
+  return _timestampMs(meta?.reseed_if_deleted_before)
+    || _timestampMs(agentJson.reseed_if_deleted_before);
+}
+
 function _builtinSkillVersion(srcDir: string): string {
   const meta = _readJsonObject(path.join(srcDir, '_meta.json'));
   return normalizeInstallVersion(meta?.version);
 }
 
+function _builtinSkillUpdatedAt(srcDir: string): number {
+  const meta = _readJsonObject(path.join(srcDir, '_meta.json'));
+  return _timestampMs(meta?.updated_at);
+}
+
 function _builtinSkillReseedIfDeletedBefore(srcDir: string): number {
   const meta = _readJsonObject(path.join(srcDir, '_meta.json'));
   return _timestampMs(meta?.reseed_if_deleted_before);
-}
-
-function _freshnessAt(row: { published_at?: number; updated_at?: number } | null | undefined): number {
-  if (!row) return 0;
-  return typeof row.updated_at === 'number' ? row.updated_at : (typeof row.published_at === 'number' ? row.published_at : 0);
 }
 
 function _emptyUrl(value: unknown): boolean {
@@ -190,6 +180,49 @@ function _readInstallMetaObject(dir: string): Record<string, unknown> | null {
   return _readJsonObject(path.join(dir, '_install.json'));
 }
 
+function _rawVersion(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function _localInstallVersion(
+  meta: Record<string, unknown> | null,
+  manifestRow: { version?: string; updated_at?: number } | null | undefined,
+): { missing: boolean; version: string } {
+  const metaVersion = _rawVersion(meta?.version);
+  if (meta && !metaVersion) return { missing: true, version: '' };
+  const rowVersion = _rawVersion(manifestRow?.version);
+  const version = metaVersion || rowVersion;
+  return version
+    ? { missing: false, version }
+    : { missing: true, version: '' };
+}
+
+function _localInstallUpdatedAt(
+  meta: Record<string, unknown> | null,
+  manifestRow: { published_at?: number; updated_at?: number } | null | undefined,
+): number {
+  return Math.max(
+    _timestampMs(meta?.updated_at),
+    _timestampMs(meta?.published_at),
+    _timestampMs(manifestRow?.updated_at),
+    _timestampMs(manifestRow?.published_at),
+  );
+}
+
+function _shouldSyncBuiltinInstall(
+  packagedVersion: string,
+  packagedUpdatedAt: number,
+  meta: Record<string, unknown> | null,
+  manifestRow: { version?: string; published_at?: number; updated_at?: number } | null | undefined,
+): boolean {
+  const local = _localInstallVersion(meta, manifestRow);
+  if (local.missing) return true;
+  const versionCompare = _compareVersions(packagedVersion, local.version);
+  if (versionCompare > 0) return true;
+  if (versionCompare < 0) return false;
+  return packagedUpdatedAt > 0 && packagedUpdatedAt > _localInstallUpdatedAt(meta, manifestRow);
+}
+
 function _isLocalBuiltinSeedMeta(meta: Record<string, unknown> | null): boolean {
   return _isLegacyBuiltinSeedMeta(meta, 'agent_json_url');
 }
@@ -210,76 +243,18 @@ function _isLocalResourceSeedMeta(meta: Record<string, unknown> | null): boolean
   return !!meta && meta.seed_source === 'resource';
 }
 
-type ResourceSeedManifest = {
-  resource_hash: string;
-  files: string[];
-};
-
-function _readResourceSeedManifest(
-  target: string,
+function _shouldTakeOverResourceSeedFromBuiltin(
+  uid: string,
   kind: 'agent' | 'skill',
   id: string,
-): ResourceSeedManifest | null {
-  const manifest = _readJsonObject(path.join(target, MARKETPLACE_RESOURCE_MANIFEST_NAME));
-  if (!manifest) return null;
-  if (manifest.kind !== kind || manifest.id !== id) return null;
-  if (manifest.hashAlgorithm && manifest.hashAlgorithm !== MARKETPLACE_TREE_HASH_ALGORITHM) return null;
-  const resourceHash = typeof manifest.resource_hash === 'string' ? manifest.resource_hash.trim() : '';
-  const files = _safeManagedFiles(manifest.files);
-  return resourceHash && files.length ? { resource_hash: resourceHash, files } : null;
-}
-
-function _legacyLocaleContentTreeHashForFiles(root: string, files: Iterable<string>): string {
-  const normalized = Array.from(new Set(Array.from(files)
-    .map((rel) => _normalizeManagedRel(rel))
-    .filter((rel): rel is string => !!rel)))
-    .sort((a, b) => a.localeCompare(b));
-  if (!normalized.length) return '';
-
-  const h = crypto.createHash('sha256');
-  h.update(`${MARKETPLACE_TREE_HASH_ALGORITHM}\0`);
-  for (const rel of normalized) {
-    let bytes: Buffer;
-    try {
-      bytes = fs.readFileSync(path.join(root, rel));
-    } catch {
-      return '';
-    }
-    h.update(rel.replace(/\\/g, '/'));
-    h.update('\0');
-    h.update(String(bytes.length));
-    h.update('\0');
-    h.update(bytes);
-    h.update('\0');
-  }
-  return h.digest('hex');
-}
-
-function _resourceSeedLocallyModified(target: string, kind: 'agent' | 'skill', id: string): boolean {
-  const manifest = _readResourceSeedManifest(target, kind, id);
-  if (!manifest) return true;
-  const currentHash = marketplaceContentTreeHashForFiles(target, manifest.files);
-  if (
-    currentHash !== manifest.resource_hash
-    && _legacyLocaleContentTreeHashForFiles(target, manifest.files) !== manifest.resource_hash
-  ) {
-    return true;
-  }
-
-  const managed = new Set(manifest.files);
-  return marketplaceContentTreeFiles(target).some((rel) => !managed.has(rel));
-}
-
-function _shouldTakeOverResourceSeedFromBuiltin(uid: string, kind: 'agent' | 'skill', id: string): boolean {
-  if (!ENABLE_BUILTIN_DEV_OVERLAY) return false;
+  packagedVersion: string,
+  packagedUpdatedAt: number,
+  manifestRow: { version?: string; published_at?: number; updated_at?: number } | null,
+): boolean {
   const target = kind === 'agent' ? userMarketplaceAgentDir(uid, id) : userMarketplaceSkillDir(uid, id);
   const meta = _readInstallMetaObject(target);
   if (!_isLocalResourceSeedMeta(meta)) return false;
-  if (_resourceSeedLocallyModified(target, kind, id)) {
-    log.warn(`skip builtin ${kind} resource handoff ${id}: local install was modified`);
-    return false;
-  }
-  return true;
+  return _shouldSyncBuiltinInstall(packagedVersion, packagedUpdatedAt, meta, manifestRow);
 }
 
 async function _removeResourceSeedManifest(target: string): Promise<void> {
@@ -309,6 +284,15 @@ function _shouldBypassBuiltinSkillTombstone(srcDir: string, deletedAt: number): 
   return cutoff > 0 && deletedAt > 0 && deletedAt < cutoff;
 }
 
+function _shouldBypassBuiltinAgentTombstone(
+  srcDir: string,
+  agentJson: Record<string, unknown>,
+  deletedAt: number,
+): boolean {
+  const cutoff = _builtinAgentReseedIfDeletedBefore(srcDir, agentJson);
+  return cutoff > 0 && deletedAt > 0 && deletedAt < cutoff;
+}
+
 function _shouldRefreshBuiltinAgent(
   uid: string,
   installId: string,
@@ -321,17 +305,7 @@ function _shouldRefreshBuiltinAgent(
   if (!canRefresh) return false;
 
   const packagedVersion = _builtinAgentVersion(agentJson);
-  const localVersion = normalizeInstallVersion(meta.version || manifestRow?.version);
-  const versionCmp = _compareVersions(packagedVersion, localVersion);
-  if (versionCmp > 0) return true;
-  if (versionCmp < 0) return false;
-
-  const packagedFresh = _builtinAgentUpdatedAt(agentJson);
-  const localFresh = _freshnessAt({
-    published_at: typeof meta.published_at === 'number' ? meta.published_at : manifestRow?.published_at,
-    updated_at: typeof meta.updated_at === 'number' ? meta.updated_at : manifestRow?.updated_at,
-  });
-  return packagedFresh > localFresh;
+  return _shouldSyncBuiltinInstall(packagedVersion, _builtinAgentUpdatedAt(agentJson), meta, manifestRow);
 }
 
 function _shouldRefreshBuiltinSkill(
@@ -345,15 +319,8 @@ function _shouldRefreshBuiltinSkill(
   const canRefresh = _isBuiltinSeedSkillRow(manifestRow) || (!manifestRow && _isLocalBuiltinSeedSkillMeta(meta));
   if (!canRefresh) return false;
 
-  const packagedTreeHash = marketplaceContentTreeHash(srcDir);
-  if (!packagedTreeHash) return false;
-
-  if (_builtinSkillLocallyModified(target, meta)) {
-    log.warn(`skip builtin skill refresh ${installId}: local install was modified`);
-    return false;
-  }
-
-  return meta.content_tree_hash !== packagedTreeHash;
+  const packagedVersion = _builtinSkillVersion(srcDir);
+  return _shouldSyncBuiltinInstall(packagedVersion, _builtinSkillUpdatedAt(srcDir), meta, manifestRow);
 }
 
 function _shouldOverlayMarketplaceAgentFromBuiltin(
@@ -362,20 +329,13 @@ function _shouldOverlayMarketplaceAgentFromBuiltin(
   agentJson: Record<string, unknown>,
   manifestRow: AgentInstall | null,
 ): boolean {
-  if (!ENABLE_BUILTIN_DEV_OVERLAY || !manifestRow?.agent_json_url) return false;
+  if (!manifestRow?.agent_json_url) return false;
   const target = userMarketplaceAgentDir(uid, installId);
   const meta = _readInstallMetaObject(target) || {};
   if (_isLocalResourceSeedMeta(meta)) return false;
 
   const packagedVersion = _builtinAgentVersion(agentJson);
-  const localVersion = normalizeInstallVersion(meta.version || manifestRow.version);
-  if (_compareVersions(packagedVersion, localVersion) <= 0) return false;
-
-  if (_agentLocallyModified(target, meta)) {
-    log.warn(`skip builtin agent overlay ${installId}: local install was modified`);
-    return false;
-  }
-  return true;
+  return _shouldSyncBuiltinInstall(packagedVersion, _builtinAgentUpdatedAt(agentJson), meta, manifestRow);
 }
 
 function _shouldOverlayMarketplaceSkillFromBuiltin(
@@ -384,69 +344,13 @@ function _shouldOverlayMarketplaceSkillFromBuiltin(
   srcDir: string,
   manifestRow: SkillInstall | null,
 ): boolean {
-  if (!ENABLE_BUILTIN_DEV_OVERLAY || !manifestRow?.bundle_url) return false;
+  if (!manifestRow?.bundle_url) return false;
   const target = userMarketplaceSkillDir(uid, installId);
   const meta = _readInstallMetaObject(target) || {};
   if (_isLocalResourceSeedMeta(meta)) return false;
 
   const packagedVersion = _builtinSkillVersion(srcDir);
-  const localVersion = normalizeInstallVersion(meta.version || manifestRow.version);
-  if (_compareVersions(packagedVersion, localVersion) <= 0) return false;
-
-  if (_builtinSkillLocallyModified(target, meta)) {
-    log.warn(`skip builtin skill overlay ${installId}: local install was modified`);
-    return false;
-  }
-  return true;
-}
-
-function _agentLocallyModified(target: string, meta: Record<string, unknown>): boolean {
-  const agentJsonFile = path.join(target, 'agent.json');
-  if (typeof meta.content_sha === 'string' && meta.content_sha) {
-    const diskSha = sha256OfFile(agentJsonFile);
-    if (diskSha && diskSha !== meta.content_sha) return true;
-  }
-  if (typeof meta.content_tree_hash === 'string' && meta.content_tree_hash) {
-    const managedFiles = _safeManagedFiles(meta.builtin_files);
-    const currentTreeHash = managedFiles.length
-      ? marketplaceContentTreeHashForFiles(target, managedFiles)
-      : marketplaceContentTreeHash(target);
-    return !!currentTreeHash && currentTreeHash !== meta.content_tree_hash;
-  }
-  return false;
-}
-
-function _builtinSkillLocallyModified(target: string, meta: Record<string, unknown>): boolean {
-  const skillMdFile = path.join(target, 'SKILL.md');
-  if (typeof meta.content_sha === 'string' && meta.content_sha) {
-    const diskSha = sha256OfFile(skillMdFile);
-    if (diskSha && diskSha !== meta.content_sha) return true;
-  }
-  if (typeof meta.content_tree_hash === 'string' && meta.content_tree_hash) {
-    const managedFiles = _safeManagedFiles(meta.builtin_files);
-    const currentTreeHash = managedFiles.length
-      ? marketplaceContentTreeHashForFiles(target, managedFiles)
-      : marketplaceContentTreeHash(target);
-    return !!currentTreeHash && currentTreeHash !== meta.content_tree_hash;
-  }
-  return false;
-}
-
-function _installMetaBase(
-  installedAt: number,
-  contentSha: string | null,
-  opts: { version?: string; updated_at?: number } = {},
-): Record<string, unknown> {
-  return {
-    version: normalizeInstallVersion(opts.version),
-    published_at: 0,
-    ...(typeof opts.updated_at === 'number' && opts.updated_at > 0 ? { updated_at: opts.updated_at } : {}),
-    installed_at: installedAt,
-    create_uid: BUILTIN_CREATE_UID,
-    default_install: true,
-    seed_source: 'builtin',
-    ...(contentSha ? { content_sha: contentSha } : {}),
-  };
+  return _shouldSyncBuiltinInstall(packagedVersion, _builtinSkillUpdatedAt(srcDir), meta, manifestRow);
 }
 
 function _agentSeedInstallRow(installId: string, agentJson: Record<string, unknown>, installedAt: number): AgentInstall {
@@ -465,11 +369,17 @@ function _agentSeedInstallRow(installId: string, agentJson: Record<string, unkno
   };
 }
 
-function _skillSeedInstallRow(installId: string, installedAt: number, version = DEFAULT_MARKETPLACE_VERSION): SkillInstall {
+function _skillSeedInstallRow(
+  installId: string,
+  installedAt: number,
+  version = DEFAULT_MARKETPLACE_VERSION,
+  updatedAt = 0,
+): SkillInstall {
   return {
     id: installId,
     version: normalizeInstallVersion(version),
     published_at: 0,
+    ...(updatedAt > 0 ? { updated_at: updatedAt } : {}),
     bundle_url: '',
     installed_at: installedAt,
     create_uid: BUILTIN_CREATE_UID,
@@ -486,29 +396,38 @@ async function _writeAgentSeed(
   installedAt = Date.now(),
 ): Promise<void> {
   const target = userMarketplaceAgentDir(uid, installId);
-  await fsp.rm(target, { recursive: true, force: true });
+  const existing = _readInstallMetaObject(target) || {};
+  const previousFiles = _safeManagedFiles(existing.builtin_files);
+  const files = marketplaceContentTreeFiles(srcDir);
   await fsp.mkdir(target, { recursive: true });
+  await _removeStaleManagedFiles(target, previousFiles, files);
+  await _copyManagedFiles(srcDir, target, files);
   await fsp.writeFile(
     path.join(target, 'agent.json'),
     `${JSON.stringify({ ...agentJson, agent_id: installId }, null, 2)}\n`,
     'utf8',
   );
-  const srcSkills = path.join(srcDir, 'skills');
-  try {
-    if (fs.statSync(srcSkills).isDirectory()) {
-      await _copyDir(srcSkills, userMarketplaceAgentSkillsDir(uid, installId));
-    }
-  } catch { /* agent has no bundled private skills */ }
   const contentSha = sha256OfFile(path.join(target, 'agent.json'));
+  const contentTreeHash = marketplaceContentTreeHash(srcDir);
+  const updatedAt = _builtinAgentUpdatedAt(agentJson);
   await fsp.writeFile(
     path.join(target, '_install.json'),
     `${JSON.stringify({
-      ..._installMetaBase(installedAt, contentSha || null, {
-        version: _builtinAgentVersion(agentJson),
-        updated_at: _builtinAgentUpdatedAt(agentJson),
-      }),
-      agent_json_url: '',
-      agent_skills_bundle_url: '',
+      ...existing,
+      version: _builtinAgentVersion(agentJson),
+      published_at: typeof existing.published_at === 'number' ? existing.published_at : 0,
+      ...(updatedAt > 0
+        ? { updated_at: updatedAt }
+        : (typeof existing.updated_at === 'number' ? { updated_at: existing.updated_at } : {})),
+      installed_at: typeof existing.installed_at === 'number' ? existing.installed_at : installedAt,
+      create_uid: typeof existing.create_uid === 'string' ? existing.create_uid : BUILTIN_CREATE_UID,
+      default_install: typeof existing.default_install === 'boolean' ? existing.default_install : true,
+      seed_source: 'builtin',
+      agent_json_url: typeof existing.agent_json_url === 'string' ? existing.agent_json_url : '',
+      agent_skills_bundle_url: typeof existing.agent_skills_bundle_url === 'string' ? existing.agent_skills_bundle_url : '',
+      ...(contentSha ? { content_sha: contentSha } : {}),
+      ...(contentTreeHash ? { content_tree_hash: contentTreeHash } : {}),
+      builtin_files: files,
     }, null, 2)}\n`,
     'utf8',
   );
@@ -537,15 +456,18 @@ async function _writeAgentMarketplaceOverlay(
 
   const contentSha = sha256OfFile(path.join(target, 'agent.json'));
   const contentTreeHash = marketplaceContentTreeHash(srcDir);
+  const updatedAt = _builtinAgentUpdatedAt(agentJson);
   await fsp.writeFile(
     path.join(target, '_install.json'),
     `${JSON.stringify({
       ...existing,
       version: _builtinAgentVersion(agentJson),
       published_at: typeof existing.published_at === 'number' ? existing.published_at : manifestRow.published_at,
-      ...(typeof existing.updated_at === 'number'
-        ? { updated_at: existing.updated_at }
-        : (typeof manifestRow.updated_at === 'number' ? { updated_at: manifestRow.updated_at } : {})),
+      ...(updatedAt > 0
+        ? { updated_at: updatedAt }
+        : (typeof existing.updated_at === 'number'
+          ? { updated_at: existing.updated_at }
+          : (typeof manifestRow.updated_at === 'number' ? { updated_at: manifestRow.updated_at } : {}))),
       installed_at: typeof existing.installed_at === 'number' ? existing.installed_at : manifestRow.installed_at,
       create_uid: typeof existing.create_uid === 'string' ? existing.create_uid : (manifestRow.create_uid || BUILTIN_CREATE_UID),
       default_install: typeof existing.default_install === 'boolean'
@@ -646,11 +568,22 @@ async function _writeSkillSeed(
   const contentSha = sha256OfFile(path.join(target, 'SKILL.md'));
   const contentTreeHash = marketplaceContentTreeHash(srcDir);
   const version = _builtinSkillVersion(srcDir);
+  const updatedAt = _builtinSkillUpdatedAt(srcDir);
   await fsp.writeFile(
     path.join(target, '_install.json'),
     `${JSON.stringify({
-      ..._installMetaBase(installedAt, contentSha || null, { version }),
-      bundle_url: '',
+      ...existing,
+      version,
+      published_at: typeof existing.published_at === 'number' ? existing.published_at : 0,
+      ...(updatedAt > 0
+        ? { updated_at: updatedAt }
+        : (typeof existing.updated_at === 'number' ? { updated_at: existing.updated_at } : {})),
+      installed_at: typeof existing.installed_at === 'number' ? existing.installed_at : installedAt,
+      create_uid: typeof existing.create_uid === 'string' ? existing.create_uid : BUILTIN_CREATE_UID,
+      default_install: typeof existing.default_install === 'boolean' ? existing.default_install : true,
+      seed_source: 'builtin',
+      bundle_url: typeof existing.bundle_url === 'string' ? existing.bundle_url : '',
+      ...(contentSha ? { content_sha: contentSha } : {}),
       ...(contentTreeHash ? { content_tree_hash: contentTreeHash } : {}),
       builtin_files: files,
     }, null, 2)}\n`,
@@ -675,15 +608,18 @@ async function _writeSkillMarketplaceOverlay(
   const contentSha = sha256OfFile(path.join(target, 'SKILL.md'));
   const contentTreeHash = marketplaceContentTreeHash(srcDir);
   const version = _builtinSkillVersion(srcDir);
+  const updatedAt = _builtinSkillUpdatedAt(srcDir);
   await fsp.writeFile(
     path.join(target, '_install.json'),
     `${JSON.stringify({
       ...existing,
       version,
       published_at: typeof existing.published_at === 'number' ? existing.published_at : manifestRow.published_at,
-      ...(typeof existing.updated_at === 'number'
-        ? { updated_at: existing.updated_at }
-        : (typeof manifestRow.updated_at === 'number' ? { updated_at: manifestRow.updated_at } : {})),
+      ...(updatedAt > 0
+        ? { updated_at: updatedAt }
+        : (typeof existing.updated_at === 'number'
+          ? { updated_at: existing.updated_at }
+          : (typeof manifestRow.updated_at === 'number' ? { updated_at: manifestRow.updated_at } : {}))),
       installed_at: typeof existing.installed_at === 'number' ? existing.installed_at : manifestRow.installed_at,
       create_uid: typeof existing.create_uid === 'string' ? existing.create_uid : (manifestRow.create_uid || BUILTIN_CREATE_UID),
       default_install: typeof existing.default_install === 'boolean'
@@ -718,7 +654,6 @@ export async function seedBuiltinMarketplaceForUser(
   const manifest = await readInstalls(uid);
   const installedAgents = new Set(manifest.agents.map((a) => a.id));
   const installedSkills = new Set(manifest.skills.map((s) => s.id));
-  const deletedAgents = new Set(Object.keys(manifest._deleted_at?.agents || {}));
   let manifestChanged = false;
 
   for (const entry of _safeDirEntries(packagedBuiltinMarketplaceAgentsDir())) {
@@ -734,7 +669,12 @@ export async function seedBuiltinMarketplaceForUser(
       log.warn(`skip builtin agent ${entry.name}: directory name must equal 12-hex agent_id`);
       continue;
     }
-    if (deletedAgents.has(installId)) continue;
+    const agentDeletedAt = _deletedAt(manifest._deleted_at?.agents, installId);
+    if (agentDeletedAt > 0) {
+      if (!_shouldBypassBuiltinAgentTombstone(srcDir, agentJson, agentDeletedAt)) continue;
+      if (_clearDeletedAt(manifest, 'agents', installId)) manifestChanged = true;
+      log.info(`reseed builtin agent ${installId}: packaged content supersedes old uninstall tombstone`);
+    }
     const manifestAgentIndex = manifest.agents.findIndex((a) => a.id === installId);
     const manifestAgent = manifestAgentIndex >= 0 ? manifest.agents[manifestAgentIndex] : null;
     const targetAgentJson = path.join(userMarketplaceAgentDir(uid, installId), 'agent.json');
@@ -742,7 +682,14 @@ export async function seedBuiltinMarketplaceForUser(
       const installedAt = manifestAgent?.installed_at || Date.now();
       await _writeAgentSeed(uid, installId, srcDir, agentJson, installedAt);
       result.seeded_agents++;
-    } else if (_shouldTakeOverResourceSeedFromBuiltin(uid, 'agent', installId)) {
+    } else if (_shouldTakeOverResourceSeedFromBuiltin(
+      uid,
+      'agent',
+      installId,
+      _builtinAgentVersion(agentJson),
+      _builtinAgentUpdatedAt(agentJson),
+      manifestAgent,
+    )) {
       if (manifestAgent?.agent_json_url) {
         await _writeAgentMarketplaceOverlay(uid, installId, srcDir, agentJson, manifestAgent);
       } else {
@@ -789,6 +736,7 @@ export async function seedBuiltinMarketplaceForUser(
       log.info(`reseed builtin skill ${installId}: packaged content supersedes old uninstall tombstone`);
     }
     const packagedVersion = _builtinSkillVersion(srcDir);
+    const packagedUpdatedAt = _builtinSkillUpdatedAt(srcDir);
     const manifestSkillIndex = manifest.skills.findIndex((s) => s.id === installId);
     const manifestSkill = manifestSkillIndex >= 0 ? manifest.skills[manifestSkillIndex] : null;
     const targetSkillMd = path.join(userMarketplaceSkillDir(uid, installId), 'SKILL.md');
@@ -796,14 +744,26 @@ export async function seedBuiltinMarketplaceForUser(
       const installedAt = manifestSkill?.installed_at || Date.now();
       await _writeSkillSeed(uid, installId, srcDir, installedAt);
       result.seeded_skills++;
-    } else if (_shouldTakeOverResourceSeedFromBuiltin(uid, 'skill', installId)) {
+    } else if (_shouldTakeOverResourceSeedFromBuiltin(
+      uid,
+      'skill',
+      installId,
+      packagedVersion,
+      packagedUpdatedAt,
+      manifestSkill,
+    )) {
       if (manifestSkill?.bundle_url) {
         await _writeSkillMarketplaceOverlay(uid, installId, srcDir, manifestSkill);
       } else {
         const installedAt = manifestSkill?.installed_at || Date.now();
         await _writeSkillSeed(uid, installId, srcDir, installedAt);
         if (manifestSkillIndex >= 0) {
-          manifest.skills[manifestSkillIndex] = _skillSeedInstallRow(installId, installedAt, packagedVersion);
+          manifest.skills[manifestSkillIndex] = _skillSeedInstallRow(
+            installId,
+            installedAt,
+            packagedVersion,
+            packagedUpdatedAt,
+          );
           manifestChanged = true;
         }
       }
@@ -813,7 +773,12 @@ export async function seedBuiltinMarketplaceForUser(
       await _writeSkillSeed(uid, installId, srcDir, installedAt);
       result.seeded_skills++;
       if (manifestSkillIndex >= 0) {
-        manifest.skills[manifestSkillIndex] = _skillSeedInstallRow(installId, installedAt, packagedVersion);
+        manifest.skills[manifestSkillIndex] = _skillSeedInstallRow(
+          installId,
+          installedAt,
+          packagedVersion,
+          packagedUpdatedAt,
+        );
         manifestChanged = true;
       }
     } else if (manifestSkill && _shouldOverlayMarketplaceSkillFromBuiltin(uid, installId, srcDir, manifestSkill)) {
@@ -821,7 +786,7 @@ export async function seedBuiltinMarketplaceForUser(
       result.seeded_skills++;
     }
     if (!installedSkills.has(installId)) {
-      manifest.skills.push(_skillSeedInstallRow(installId, Date.now(), packagedVersion));
+      manifest.skills.push(_skillSeedInstallRow(installId, Date.now(), packagedVersion, packagedUpdatedAt));
       installedSkills.add(installId);
       result.manifest_skills++;
     }

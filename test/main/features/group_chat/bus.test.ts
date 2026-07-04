@@ -172,6 +172,33 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(visibility.buildReplayPrefix(slice, 'missing').prefix).toContain('Please resolve the conflict using the hidden protocol.');
   });
 
+  it('keeps earlier conversation attachments visible on later turns without reattaching', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const attachments = await import('../../../../src/main/features/chat_attachments');
+    const cid = 'cid-attachment-index';
+
+    await attachments.uploadAttachment(
+      TEST_UID,
+      cid,
+      'orkas-1.0.5-update.md',
+      Buffer.from('# Orkas 1.0.5\nAttachment index keeps old files discoverable.', 'utf8'),
+    );
+
+    await bus.enqueue({
+      uid: TEST_UID,
+      cid,
+      fromActorId: 'user',
+      text: 'please check the old md again',
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const call = streamProbe.messages.find((m) => m.includes('please check the old md again')) || '';
+    expect(call).toContain('<conversation-attachments');
+    expect(call).toContain('name="orkas-1.0.5-update.md"');
+    expect(call).toContain('kind="text"');
+    expect(call).toContain('total_chars=');
+  });
+
   it('strips commander result markers and records commander model failures', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
     const paths = await import('../../../../src/main/paths');

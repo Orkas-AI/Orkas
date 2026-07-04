@@ -969,6 +969,55 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     expect(commanderCallsAfter, 'commander must NOT run for the no-@ follow-up while handed off').toBe(commanderCallsBefore);
   }, 15_000);
 
+  it('manual @ to another agent while handed off makes that agent the sticky floor', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+
+    const tutorId = 'a11122223333';
+    const tutorName = 'TutorA';
+    const tutorDir = paths.agentDir(TEST_UID, tutorId);
+    fs.mkdirSync(tutorDir, { recursive: true });
+    fs.writeFileSync(path.join(tutorDir, 'agent.json'), JSON.stringify({
+      agent_id: tutorId, name: tutorName, description: 'interactive tutor', workflow: 'teach',
+      interactive: true, created_at: 't', updated_at: 't',
+    }));
+
+    _setScript(state.buildGconvSessionId(cid), [
+      { type: '__call_tool__', name: 'hand_off_to', input: { to: tutorName, message: 'teach this' } },
+      { type: 'final', text: 'Over to TutorA.' },
+    ]);
+    _setScript(state.buildGmemberSessionId(cid, tutorId), [
+      { type: 'final', text: 'TutorA: ready.' },
+    ]);
+
+    bus.subscribe(TEST_UID, cid, () => {});
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'teach me' });
+    await waitForQuiescent(TEST_UID, cid, 4000);
+    expect((await state.readState(TEST_UID, cid)).active_recipient).toBe(tutorId);
+
+    _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [
+      { type: 'final', text: 'Writer: switching context.' },
+    ]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: `@${AGENT_NAME} quick aside` });
+    await waitForQuiescent(TEST_UID, cid, 4000);
+    expect((await state.readState(TEST_UID, cid)).active_recipient).toBe(AGENT_ID);
+
+    const tutorCallsBefore = _recordedCalls.filter((c) => c.sid === state.buildGmemberSessionId(cid, tutorId)).length;
+    const writerCallsBefore = _recordedCalls.filter((c) => c.sid === state.buildGmemberSessionId(cid, AGENT_ID)).length;
+    _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [
+      { type: 'final', text: 'Writer: still here.' },
+    ]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'continue with that' });
+    await waitForQuiescent(TEST_UID, cid, 4000);
+
+    const tutorCallsAfter = _recordedCalls.filter((c) => c.sid === state.buildGmemberSessionId(cid, tutorId)).length;
+    const writerCallsAfter = _recordedCalls.filter((c) => c.sid === state.buildGmemberSessionId(cid, AGENT_ID)).length;
+    expect(writerCallsAfter, 'no-@ follow-up should stay with the manually selected agent').toBe(writerCallsBefore + 1);
+    expect(tutorCallsAfter, 'no-@ follow-up must not snap back to the previous hand-off agent').toBe(tutorCallsBefore);
+  }, 15_000);
+
   // hand_off_to a NON-interactive agent: it answers the user (one-shot, saving the
   // commander's synthesis call), but the floor stays with the commander.
   it('hand_off_to non-interactive agent: one-shot answer, floor stays commander', async () => {

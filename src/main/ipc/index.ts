@@ -1054,12 +1054,17 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // ── Group chat (replaces legacy conversations.send / .stream / .markFormSubmitted) ──
-  'groupChat.send': async ({ cid, content, attachments }, ctx) => {
+  'groupChat.send': async ({ cid, content, attachments, use_selections }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
     const text = (content || '').trim();
     if (!text) throw new Error('empty message');
     const atts = Array.isArray(attachments) ? attachments.filter((n: any) => typeof n === 'string') : [];
-    return groupChat.send({ userId: ctx.userId, cid, text, ...(atts.length ? { attachments: atts } : {}) });
+    const useSelections = Array.isArray(use_selections) ? use_selections : [];
+    return groupChat.send({
+      userId: ctx.userId, cid, text,
+      ...(atts.length ? { attachments: atts } : {}),
+      ...(useSelections.length ? { use_selections: useSelections } : {}),
+    });
   },
 
   'groupChat.abort': async ({ cid }, ctx) => {
@@ -1193,11 +1198,13 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 
   'conversations.attachments.delete': async ({ cid, name }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
-    await recycleBin.createAppRecycleBatchForCloudEntry(
-      ctx.userId,
-      `cloud/chat_attachments/${cid}/${name || ''}`,
-      'attachment',
-    );
+    if (!chatAttachments.isDraftAttachmentCid(cid)) {
+      await recycleBin.createAppRecycleBatchForCloudEntry(
+        ctx.userId,
+        `cloud/chat_attachments/${cid}/${name || ''}`,
+        'attachment',
+      );
+    }
     return chatAttachments.deleteAttachment(ctx.userId, cid, name || '');
   },
 
@@ -2374,7 +2381,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 // unexpected throws.
 
 const streamHandlers: Record<string, StreamHandler> = {
-  'conversations.sendStream': async function* ({ cid, content, attachments }, ctx, signal) {
+  'conversations.sendStream': async function* ({ cid, content, attachments, use_selections }, ctx, signal) {
     if (!safeId(cid)) {
       yield { type: 'error', text: 'invalid cid' };
       return;
@@ -2385,6 +2392,7 @@ const streamHandlers: Record<string, StreamHandler> = {
       return;
     }
     const atts = Array.isArray(attachments) ? attachments.filter((n: any) => typeof n === 'string') : [];
+    const useSelections = Array.isArray(use_selections) ? use_selections : [];
     // Legacy `conversations.stream` is now a thin wrapper around the
     // group_chat bus. Subscribe to the bus directly BEFORE calling
     // `groupChat.send` — `send` internally wakes the recipient worker
@@ -2424,6 +2432,7 @@ const streamHandlers: Record<string, StreamHandler> = {
         sendRes = await groupChat.send({
           userId: ctx.userId, cid, text,
           ...(atts.length ? { attachments: atts } : {}),
+          ...(useSelections.length ? { use_selections: useSelections } : {}),
         });
       } catch (err) {
         sendErr = err;

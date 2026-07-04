@@ -26,6 +26,12 @@ import { createLogger } from '../../logger';
 
 const log = createLogger('group_chat.visibility');
 
+export interface ChatUseSelection {
+  kind: 'skill' | 'connector';
+  id: string;
+  name?: string;
+}
+
 export interface GroupMessage {
   /** Stable per-message id (not jsonl line index). Used by visibility +
    * dedupe. */
@@ -48,6 +54,10 @@ export interface GroupMessage {
   model_text?: string;
   /** Attachment filenames (only meaningful for user messages). */
   attachments?: string[];
+  /** Structured composer selections captured at send time. The text still
+   * carries the human-readable "use X" wording; this preserves the internal
+   * id so agent skill allowlists can include explicit user choices. */
+  use_selections?: ChatUseSelection[];
   /** Absolute paths produced by local-exec tools during this turn (only on
    * commander/agent messages). */
   produced?: string[];

@@ -94,6 +94,9 @@ export interface ChatOptions {
    * `skill_list: []`. Sourced from the target agent's `skill_list` field
    * (see `features/agents.ts`). */
   skillList?: string[];
+  /** User-explicit skill refs selected in the composer. Open/global skills
+   *  named here may be rendered even when an agent skill allowlist is active. */
+  forceOpenSkillRefs?: readonly string[];
   /** Project-scope skill allowlist applied ONLY to the System A render
    *  block (`getSystemPromptBlock`). Resolved from the conversation's
    *  project bindings at the top of `runTurn`. The runner intersects this

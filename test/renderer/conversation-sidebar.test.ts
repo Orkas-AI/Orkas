@@ -632,6 +632,45 @@ describe('conversation history reconcile', () => {
 });
 
 describe('conversation streaming math detection', () => {
+  it('reuses inline video nodes across streaming markdown repaints', () => {
+    const context = loadConversationRenderer();
+    const src = 'chat-media://local/Users/test/clip.mp4';
+    const existingVideo = {
+      getAttribute(name: string) { return name === 'src' ? src : ''; },
+    };
+    const existingShell = {
+      querySelector(selector: string) {
+        if (selector === 'video.chat-md-video[src]') return existingVideo;
+        if (selector === 'video.chat-md-video[src], audio.chat-md-audio[src]') return existingVideo;
+        return null;
+      },
+    };
+    const freshVideo = {
+      getAttribute(name: string) { return name === 'src' ? src : ''; },
+    };
+    let replacement: unknown = null;
+    const freshShell = {
+      replaceWith(node: unknown) { replacement = node; },
+      querySelector(selector: string) {
+        if (selector === 'video.chat-md-video[src]') return freshVideo;
+        if (selector === 'video.chat-md-video[src], audio.chat-md-audio[src]') return freshVideo;
+        return null;
+      },
+    };
+    const freshRoot = {
+      querySelectorAll(selector: string) {
+        if (selector === '.chat-md-video-shell') return [freshShell];
+        if (selector === '.chat-md-audio-card') return [];
+        return [];
+      },
+    };
+    const stable = new Map([[context._streamingStableMediaKey('video', src), [existingShell]]]);
+
+    context._streamingRestoreStableMedia(freshRoot, stable);
+
+    expect(replacement).toBe(existingShell);
+  });
+
   it('detects closed inline and display math while streaming', () => {
     const context = loadConversationRenderer();
 

@@ -1,6 +1,8 @@
 /**
  * Per-conversation file attachments for main chat (`normal`).
- * Layout: `data/<uid>/cloud/chat_attachments/<cid>/`.
+ * Layout:
+ *   sent/committed attachments: `data/<uid>/cloud/chat_attachments/<cid>/`
+ *   composer-only drafts:       `data/<uid>/local/chat_attachment_drafts/<draftCid>/`
  *
  * Supported kinds — mirrors `contexts` upload whitelist:
  *   text   — .md / .markdown / .txt / .csv / .tsv / .json / .yaml / .yml / .log
@@ -14,7 +16,10 @@
  *            `chat-media://` protocol)
  *
  * Lifecycle:
- *   uploadAttachment   — write original to disk; NO preprocessing. PDF/DOCX/
+ *   uploadAttachment   — write original to disk; NO preprocessing. Draft CIDs
+ *                        (`main_chat`, `projchat-*`) are local-only until
+ *                        adoptDraftAttachments moves them into a real cid.
+ *                        PDF/DOCX/
  *                        XLSX/PPTX extract + image grayscale happen lazily on read via
  *                        features/file_indexer (which caches under
  *                        <uid>/local/file_cache/<hash>/). Video is kept raw
@@ -39,7 +44,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 
-import { chatAttachmentDir, userChatAttachmentsDir, userChatsDir } from '../paths';
+import { chatAttachmentDir, chatAttachmentDraftDir, userChatAttachmentsDir, userChatsDir } from '../paths';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
 import { toCompressedGrayJpeg } from '../util/image-transform';
@@ -80,6 +85,7 @@ const MAX_BYTES_VIDEO = 200 * 1024 * 1024;
 const MAX_BYTES_AUDIO = 50  * 1024 * 1024;
 
 const MAX_FILENAME_LEN = 200;
+const MAX_CONVERSATION_ATTACHMENT_INDEX_FILES = 40;
 
 // ── Types ────────────────────────────────────────────────────────────────
 
@@ -129,6 +135,16 @@ function safeCid(cid: unknown): string {
   return cid;
 }
 
+const COMMANDER_DRAFT_CID = 'main_chat';
+const PROJECT_DRAFT_PREFIX = 'projchat-';
+
+export function isDraftAttachmentCid(cid: unknown): boolean {
+  return typeof cid === 'string' && (
+    cid === COMMANDER_DRAFT_CID
+    || cid.startsWith(PROJECT_DRAFT_PREFIX)
+  );
+}
+
 function kindOf(ext: string): AttachmentKind {
   const e = ext.toLowerCase();
   if (e === PDF_EXT) return 'pdf';
@@ -152,8 +168,61 @@ function maxBytesFor(ext: string): number {
   return MAX_BYTES_TEXT;
 }
 
+function _moveFileBestEffort(from: string, to: string): void {
+  try { fs.renameSync(from, to); }
+  catch {
+    fs.copyFileSync(from, to);
+    try { fs.unlinkSync(from); } catch { /* best-effort */ }
+  }
+}
+
+function _legacyDraftCloudDir(userId: string, cid: string): string {
+  return chatAttachmentDir(userId, cid);
+}
+
+function migrateLegacyDraftCloudDir(userId: string, cid: string): void {
+  if (!isDraftAttachmentCid(cid)) return;
+  const legacy = _legacyDraftCloudDir(userId, cid);
+  if (!fs.existsSync(legacy)) return;
+
+  const local = chatAttachmentDraftDir(userId, cid);
+  let names: string[] = [];
+  try { names = fs.readdirSync(legacy).filter((n) => !n.startsWith('.')); }
+  catch { /* ignore */ }
+
+  try {
+    if (!fs.existsSync(local)) {
+      fs.mkdirSync(path.dirname(local), { recursive: true });
+      fs.renameSync(legacy, local);
+    } else {
+      fs.mkdirSync(local, { recursive: true });
+      for (const name of fs.readdirSync(legacy)) {
+        const from = path.join(legacy, name);
+        let st: fs.Stats;
+        try { st = fs.statSync(from); } catch { continue; }
+        if (!st.isFile()) continue;
+        _moveFileBestEffort(from, uniqueTarget(local, name));
+      }
+      try { fs.rmdirSync(legacy); } catch { /* best-effort */ }
+    }
+  } catch (err) {
+    log.warn(`migrate legacy draft attachments user=${userId} cid=${cid}: ${(err as Error).message}`);
+    return;
+  }
+
+  for (const name of names) notifyAttachmentDeleted(cid, name);
+}
+
+function attachmentDirForCid(userId: string, cid: string): string {
+  if (isDraftAttachmentCid(cid)) {
+    migrateLegacyDraftCloudDir(userId, cid);
+    return chatAttachmentDraftDir(userId, cid);
+  }
+  return chatAttachmentDir(userId, cid);
+}
+
 function ensureDir(userId: string, cid: string): string {
-  const dir = chatAttachmentDir(userId, cid);
+  const dir = attachmentDirForCid(userId, cid);
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 }
@@ -176,6 +245,14 @@ function notifyAttachmentDeleted(cid: string, name: string): void {
     const sync = null as { markDeleted?: (relPath: string) => Promise<void> | void };
     void sync?.markDeleted?.(attachmentRelPath(cid, name));
   } catch { /* features/sync stripped */ }
+}
+
+function notifyAttachmentDirtyIfSyncable(cid: string, name: string): void {
+  if (!isDraftAttachmentCid(cid)) notifyAttachmentDirty(cid, name);
+}
+
+function notifyAttachmentDeletedIfSyncable(cid: string, name: string): void {
+  if (!isDraftAttachmentCid(cid)) notifyAttachmentDeleted(cid, name);
 }
 
 function uniqueTarget(dir: string, name: string): string {
@@ -326,7 +403,7 @@ export async function uploadAttachment(
     const st = fs.statSync(target);
     const kind = kindOf(ext);
     log.info(`upload user=${userId} cid=${safeConvId} name=${finalName} kind=${kind} bytes=${st.size}`);
-    notifyAttachmentDirty(safeConvId, finalName);
+    notifyAttachmentDirtyIfSyncable(safeConvId, finalName);
     return {
       ok: true,
       info: {
@@ -398,7 +475,7 @@ export async function importAttachmentFromPath(
     const st = fs.statSync(target);
     const kind = kindOf(ext);
     log.info(`import user=${userId} cid=${safeConvId} name=${finalName} kind=${kind} bytes=${st.size}`);
-    notifyAttachmentDirty(safeConvId, finalName);
+    notifyAttachmentDirtyIfSyncable(safeConvId, finalName);
     return {
       ok: true,
       info: {
@@ -415,7 +492,7 @@ export function listAttachments(userId: string, cid: string): AttachmentInfo[] {
   let safeConvId: string;
   try { safeConvId = safeCid(cid); }
   catch { return []; }
-  const dir = chatAttachmentDir(userId, safeConvId);
+  const dir = attachmentDirForCid(userId, safeConvId);
   let items: fs.Dirent[];
   try { items = fs.readdirSync(dir, { withFileTypes: true }); }
   catch { return []; }
@@ -483,7 +560,7 @@ export function deleteAttachment(userId: string, cid: string, name: string): Res
     safeName = safeAttachmentName(name);
     safeConvId = safeCid(cid);
   } catch (err) { return { ok: false, error: (err as Error).message }; }
-  const dir = chatAttachmentDir(userId, safeConvId);
+  const dir = attachmentDirForCid(userId, safeConvId);
   const p = path.join(dir, safeName);
   if (!fs.existsSync(p)) return { ok: false, error: 'not found' };
   try { fs.unlinkSync(p); }
@@ -497,7 +574,7 @@ export function deleteAttachment(userId: string, cid: string, name: string): Res
   try {
     if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
   } catch { /* best-effort */ }
-  notifyAttachmentDeleted(safeConvId, safeName);
+  notifyAttachmentDeletedIfSyncable(safeConvId, safeName);
   return { ok: true };
 }
 
@@ -528,7 +605,7 @@ export function resolveAttachmentAbsPath(
   } catch (err) {
     return { ok: false, code: 'bad_input', error: (err as Error).message };
   }
-  const root = path.resolve(chatAttachmentDir(userId, safeConvId));
+  const root = path.resolve(attachmentDirForCid(userId, safeConvId));
   const abs = path.resolve(root, safeName);
   const rel = path.relative(root, abs);
   if (rel.startsWith('..') || path.isAbsolute(rel)) {
@@ -671,7 +748,7 @@ export function adoptDraftAttachments(
   catch (err) { return { ok: false, error: (err as Error).message }; }
   if (srcSafe === dstSafe) return { ok: false, error: 'same cid' };
 
-  const src = chatAttachmentDir(userId, srcSafe);
+  const src = attachmentDirForCid(userId, srcSafe);
   if (!fs.existsSync(src)) return { ok: true, count: 0 };
   const dst = chatAttachmentDir(userId, dstSafe);
   let movedNames: string[] = [];
@@ -703,7 +780,7 @@ export function adoptDraftAttachments(
   try { count = fs.readdirSync(dst).filter((n) => !n.startsWith('.')).length; }
   catch { /* ignore */ }
   for (const name of movedNames) {
-    notifyAttachmentDeleted(srcSafe, name);
+    notifyAttachmentDeletedIfSyncable(srcSafe, name);
     notifyAttachmentDirty(dstSafe, name);
   }
   log.info(`adopt user=${userId} ${srcSafe} → ${dstSafe} count=${count}`);
@@ -716,7 +793,7 @@ export async function purgeByCid(userId: string, cid: string): Promise<number> {
   let safeConvId: string;
   try { safeConvId = safeCid(cid); }
   catch { return 0; }
-  const dir = chatAttachmentDir(userId, safeConvId);
+  const dir = attachmentDirForCid(userId, safeConvId);
   let count = 0;
   let names: string[] = [];
   try {
@@ -731,7 +808,7 @@ export async function purgeByCid(userId: string, cid: string): Promise<number> {
   } catch (err) { log.warn(`purgeByCid(${cid}): ${(err as Error).message}`); }
   try { await purgeFileCacheByCid(userId, safeConvId); }
   catch (err) { log.warn(`purge file_cache cid=${safeConvId}: ${(err as Error).message}`); }
-  for (const name of names) notifyAttachmentDeleted(safeConvId, name);
+  for (const name of names) notifyAttachmentDeletedIfSyncable(safeConvId, name);
   return count;
 }
 
@@ -760,6 +837,13 @@ export interface AttachmentRequestMetadata {
 export interface BuildManifestOpts {
   /** Max number of images attached to a single message. Default 5. */
   maxImages?: number;
+}
+
+export interface BuildConversationAttachmentIndexOpts {
+  /** Attachment names already represented by the current-turn manifest. */
+  excludeNames?: readonly string[];
+  /** Max files listed in the lightweight conversation-wide index. */
+  maxFiles?: number;
 }
 
 /**
@@ -877,6 +961,87 @@ export async function buildAttachmentManifest(
     ? `<attachments>\n${entries.join('\n')}\n</attachments>`
     : '';
   return { manifest, images, skipped, metadata: metadata() };
+}
+
+/**
+ * Build a cheap, conversation-wide attachment directory listing. Unlike the
+ * current-turn manifest above, this is meant to survive session history trims:
+ * it lists already-uploaded files by name/path/kind, without inlining image
+ * bytes or file contents.
+ */
+export async function buildConversationAttachmentIndex(
+  userId: string,
+  cid: string,
+  opts: BuildConversationAttachmentIndexOpts = {},
+): Promise<string> {
+  let safeConvId: string;
+  try { safeConvId = safeCid(cid); }
+  catch { return ''; }
+
+  const dir = chatAttachmentDir(userId, safeConvId);
+  let dirents: fs.Dirent[];
+  try { dirents = fs.readdirSync(dir, { withFileTypes: true }); }
+  catch { return ''; }
+
+  const excluded = new Set<string>();
+  for (const rawName of opts.excludeNames || []) {
+    try { excluded.add(safeAttachmentName(rawName)); }
+    catch { /* ignore invalid caller input */ }
+  }
+
+  const maxFiles = Math.max(1, Math.min(200, opts.maxFiles ?? MAX_CONVERSATION_ATTACHMENT_INDEX_FILES));
+  const files = dirents
+    .filter((d) => d.isFile() && !d.name.startsWith('.') && !excluded.has(d.name))
+    .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+
+  if (!files.length) return '';
+
+  const entries: string[] = [];
+  for (const d of files.slice(0, maxFiles)) {
+    let nm: string;
+    try { nm = safeAttachmentName(d.name); }
+    catch { continue; }
+    const abs = path.join(dir, nm);
+    let st: fs.Stats;
+    try { st = fs.statSync(abs); }
+    catch { continue; }
+    const ext = path.extname(nm).toLowerCase();
+    const kind = kindOf(ext);
+    const attrs = [
+      `name="${escapeAttr(nm)}"`,
+      `path="${escapeAttr(abs)}"`,
+      `kind="${kind}"`,
+      `size="${st.size}"`,
+    ];
+
+    if (kind === 'text') {
+      try {
+        const meta = await statFile(userId, abs);
+        attrs.push(`total_chars="${meta.totalChars}"`);
+      } catch (err) {
+        log.warn(`attachment index statFile text failed name=${nm}: ${(err as Error).message}`);
+      }
+    } else {
+      const cached = getCachedMeta(userId, abs);
+      if (cached?.totalChars !== undefined) attrs.push(`total_chars="${cached.totalChars}"`);
+    }
+
+    if (kind === 'image') attrs.push('inline="false"');
+    if (kind === 'video' || kind === 'audio') attrs.push('model_readable="false"');
+    entries.push(`<file ${attrs.join(' ')}/>`);
+  }
+
+  if (!entries.length) return '';
+  const omitted = files.length > entries.length
+    ? `\n<omitted count="${files.length - entries.length}"/>`
+    : '';
+  return (
+    `<conversation-attachments cid="${escapeAttr(safeConvId)}">\n` +
+    '<!-- Files uploaded earlier in this conversation. Use read_file/stat_file with path for content; images/videos are not inline. -->\n' +
+    entries.join('\n') +
+    omitted +
+    '\n</conversation-attachments>'
+  );
 }
 
 function escapeAttr(s: string): string {

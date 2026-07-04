@@ -62,8 +62,10 @@ protocol.registerSchemesAsPrivileged([
     scheme: 'kb-file',
     privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true },
   },
-  // `chat-media://cid/<encCid>/<encName>` — serves image + video bytes out
-  // of the active user's `<uid>/cloud/chat_attachments/<cid>/`. `stream:true`
+  // `chat-media://cid/<encCid>/<encName>` — serves image + video bytes for a
+  // cid attachment. Sent attachments resolve under cloud/chat_attachments/;
+  // composer-only draft cids resolve under local/chat_attachment_drafts/.
+  // `stream:true`
   // only enables a streamed Response body — it does NOT make Chromium issue
   // byte-range requests on its own; the handler must advertise
   // `Accept-Ranges: bytes` and serve `206` itself (see `serveFileRange`).
@@ -697,9 +699,10 @@ function registerKbFileProtocol(): void {
   });
 }
 
-// `chat-media://cid/<encCid>/<encName>` — streams a single attachment file
-// out of the active user's `<uid>/cloud/chat_attachments/<cid>/` for the
-// renderer's `<img>` / `<video>` tags. The two-segment path (fixed host +
+// `chat-media://cid/<encCid>/<encName>` — streams a single attachment file for
+// the renderer's `<img>` / `<video>` tags. Sent attachments resolve under
+// cloud/chat_attachments/; composer-only draft cids resolve under local drafts.
+// The two-segment path (fixed host +
 // cid + name) sidesteps URL-parser divergence the way `kb-file` does.
 //
 // All the safety work (name + cid validation, path-traversal guard, file

@@ -790,7 +790,7 @@ export class AgentRunner {
         // fills (PC: buildRunner from the resolved model); only an unknown model
         // hits the 200K fallback. ContextOverflowError (caught below) still
         // recovers if a single turn blows past the threshold.
-        const tokensBefore = this.session.estimateTokens();
+        const tokensBefore = this.session.estimateModelTokens();
         // Look the window up by the model the stream ACTUALLY used: rotating-
         // provider can fail over to a different-window candidate mid-run, and the
         // host fills the catalog for every candidate (PC buildRunner). Fall back
@@ -809,7 +809,7 @@ export class AgentRunner {
           // summary). Skip that no-progress pass; later turns push the big
           // result out of the kept window and real compaction resumes (and a
           // genuine overflow is still caught by ContextOverflowError below).
-          const keptTailTokens = this.session.estimateKeptTailTokens();
+          const keptTailTokens = Math.min(this.session.estimateKeptTailTokens(), tokensBefore);
           const wouldFree = tokensBefore - keptTailTokens;
           if (wouldFree > contextWindow * MIN_COMPACTION_SAVINGS_RATIO) {
             log.info(`Context nearing limit (${tokensBefore}/${contextWindow}), compacting...`);
@@ -818,7 +818,7 @@ export class AgentRunner {
             yield {
               type: "compaction",
               tokensBefore,
-              tokensAfter: this.session.estimateTokens(),
+              tokensAfter: this.session.estimateModelTokens(),
               summary: compactSummary || undefined,
             };
           } else {
@@ -865,13 +865,13 @@ export class AgentRunner {
         if (err instanceof ContextOverflowError) {
           // Try compaction
           try {
-            const tokensBefore = this.session.estimateTokens();
+            const tokensBefore = this.session.estimateModelTokens();
             const overflowSummary = await this.compactSession(provider, modelId, systemPrompt, params.cacheRetention);
             compactionCount++;
             yield {
               type: "compaction",
               tokensBefore,
-              tokensAfter: this.session.estimateTokens(),
+              tokensAfter: this.session.estimateModelTokens(),
               summary: overflowSummary || undefined,
             };
             continue;

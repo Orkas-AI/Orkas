@@ -101,9 +101,11 @@ function targetSqliteVecPackage(targetPlatform, targetArch) {
 
 function pruneSqliteVecPackages(nodeModules, targetPlatform, targetArch) {
   const keepPackage = targetSqliteVecPackage(targetPlatform, targetArch);
-  for (const dirName of listDirs(nodeModules)) {
-    if (/^sqlite-vec-(darwin|linux|windows)-/i.test(dirName) && dirName !== keepPackage) {
-      removeIfExists(path.join(nodeModules, dirName));
+  for (const parentDir of sqliteVecPackageParentDirs(nodeModules)) {
+    for (const dirName of listDirs(parentDir)) {
+      if (/^sqlite-vec-(darwin|linux|windows)-/i.test(dirName) && dirName !== keepPackage) {
+        removeIfExists(path.join(parentDir, dirName));
+      }
     }
   }
 }
@@ -118,11 +120,12 @@ function targetCanvasPackage(targetPlatform, targetArch) {
 }
 
 function pruneCanvasPackages(nodeModules, targetPlatform, targetArch) {
-  const napiDir = path.join(nodeModules, '@napi-rs');
   const keepPackage = targetCanvasPackage(targetPlatform, targetArch);
-  for (const dirName of listDirs(napiDir)) {
-    if (/^canvas-/i.test(dirName) && dirName !== keepPackage) {
-      removeIfExists(path.join(napiDir, dirName));
+  for (const parentDir of canvasPackageParentDirs(nodeModules)) {
+    for (const dirName of listDirs(parentDir)) {
+      if (/^canvas-/i.test(dirName) && dirName !== keepPackage) {
+        removeIfExists(path.join(parentDir, dirName));
+      }
     }
   }
 }
@@ -134,17 +137,69 @@ function targetTokenizersPackage(targetPlatform, targetArch) {
 }
 
 function pruneTokenizersPackages(nodeModules, targetPlatform, targetArch) {
-  const tokenizersDir = path.join(nodeModules, '@anush008');
   const keepPackage = targetTokenizersPackage(targetPlatform, targetArch);
-  for (const dirName of listDirs(tokenizersDir)) {
-    if (/^tokenizers-/i.test(dirName) && dirName !== keepPackage) {
-      removeIfExists(path.join(tokenizersDir, dirName));
+  for (const parentDir of tokenizersPackageParentDirs(nodeModules)) {
+    for (const dirName of listDirs(parentDir)) {
+      if (/^tokenizers-/i.test(dirName) && dirName !== keepPackage) {
+        removeIfExists(path.join(parentDir, dirName));
+      }
     }
   }
 }
 
 function packageDir(nodeModules, packageName) {
   return path.join(nodeModules, ...packageName.split('/'));
+}
+
+function sqliteVecPackageParentDirs(nodeModules) {
+  return [
+    nodeModules,
+    path.join(nodeModules, 'sqlite-vec', 'node_modules'),
+  ];
+}
+
+function sqliteVecPackageDir(nodeModules, packageName) {
+  for (const parentDir of sqliteVecPackageParentDirs(nodeModules)) {
+    const candidate = path.join(parentDir, packageName);
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+      return candidate;
+    }
+  }
+  return path.join(nodeModules, packageName);
+}
+
+function canvasPackageParentDirs(nodeModules) {
+  return [
+    path.join(nodeModules, '@napi-rs'),
+    path.join(nodeModules, '@napi-rs', 'canvas', 'node_modules', '@napi-rs'),
+  ];
+}
+
+function canvasPackageDir(nodeModules, packageName) {
+  for (const parentDir of canvasPackageParentDirs(nodeModules)) {
+    const candidate = path.join(parentDir, packageName);
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+      return candidate;
+    }
+  }
+  return path.join(nodeModules, '@napi-rs', packageName);
+}
+
+function tokenizersPackageParentDirs(nodeModules) {
+  return [
+    path.join(nodeModules, '@anush008'),
+    path.join(nodeModules, '@anush008', 'tokenizers', 'node_modules', '@anush008'),
+  ];
+}
+
+function tokenizersPackageDir(nodeModules, packageName) {
+  for (const parentDir of tokenizersPackageParentDirs(nodeModules)) {
+    const candidate = path.join(parentDir, packageName);
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+      return candidate;
+    }
+  }
+  return path.join(nodeModules, '@anush008', packageName);
 }
 
 function requireOnlyPackages(parentDir, pattern, allowedPackages) {
@@ -195,8 +250,11 @@ function verifyPackedNativePayload(nodeModules, targetPlatform, targetArch) {
 
   requireOnlyPackages(path.join(nodeModules, '@esbuild'), /^.+$/, [esbuildPackage]);
   requireOnlyPackages(nodeModules, /^sqlite-vec-(darwin|linux|windows)-/i, [sqlitePackage]);
+  requireOnlyPackages(path.join(nodeModules, 'sqlite-vec', 'node_modules'), /^sqlite-vec-(darwin|linux|windows)-/i, [sqlitePackage]);
   requireOnlyPackages(path.join(nodeModules, '@napi-rs'), /^canvas-/i, [canvasPackage]);
+  requireOnlyPackages(path.join(nodeModules, '@napi-rs', 'canvas', 'node_modules', '@napi-rs'), /^canvas-/i, [canvasPackage]);
   requireOnlyPackages(path.join(nodeModules, '@anush008'), /^tokenizers-/i, [tokenizersPackage]);
+  requireOnlyPackages(path.join(nodeModules, '@anush008', 'tokenizers', 'node_modules', '@anush008'), /^tokenizers-/i, [tokenizersPackage]);
 
   if (targetPlatform !== 'darwin' && fs.existsSync(path.join(nodeModules, 'fsevents'))) {
     throw new Error('[native-deps-gate] fsevents must not be included in non-macOS packages');
@@ -209,15 +267,15 @@ function verifyPackedNativePayload(nodeModules, targetPlatform, targetArch) {
     );
     requiredFile(
       `${sqlitePackage} binary`,
-      path.join(packageDir(nodeModules, sqlitePackage), 'vec0.dylib'),
+      path.join(sqliteVecPackageDir(nodeModules, sqlitePackage), 'vec0.dylib'),
     );
     requiredFile(
       `${canvasPackage} binary`,
-      path.join(packageDir(nodeModules, `@napi-rs/${canvasPackage}`), `skia.darwin-${targetArch}.node`),
+      path.join(canvasPackageDir(nodeModules, canvasPackage), `skia.darwin-${targetArch}.node`),
     );
     requiredFile(
       `${tokenizersPackage} binary`,
-      path.join(packageDir(nodeModules, `@anush008/${tokenizersPackage}`), 'tokenizers.darwin-universal.node'),
+      path.join(tokenizersPackageDir(nodeModules, tokenizersPackage), 'tokenizers.darwin-universal.node'),
     );
   } else if (targetPlatform === 'win32') {
     requiredFile(
@@ -226,15 +284,15 @@ function verifyPackedNativePayload(nodeModules, targetPlatform, targetArch) {
     );
     requiredFile(
       `${sqlitePackage} binary`,
-      path.join(packageDir(nodeModules, sqlitePackage), 'vec0.dll'),
+      path.join(sqliteVecPackageDir(nodeModules, sqlitePackage), 'vec0.dll'),
     );
     requiredFile(
       `${canvasPackage} binary`,
-      path.join(packageDir(nodeModules, `@napi-rs/${canvasPackage}`), 'skia.win32-x64-msvc.node'),
+      path.join(canvasPackageDir(nodeModules, canvasPackage), 'skia.win32-x64-msvc.node'),
     );
     requiredFile(
       `${tokenizersPackage} binary`,
-      path.join(packageDir(nodeModules, `@anush008/${tokenizersPackage}`), 'tokenizers.win32-x64-msvc.node'),
+      path.join(tokenizersPackageDir(nodeModules, tokenizersPackage), 'tokenizers.win32-x64-msvc.node'),
     );
   }
 
@@ -244,9 +302,9 @@ function verifyPackedNativePayload(nodeModules, targetPlatform, targetArch) {
   );
 
   verifyPackageVersion(nodeModules, lock, `@esbuild/${esbuildPackage}`, verified);
-  verifyPackageVersion(nodeModules, lock, sqlitePackage, verified);
-  verifyPackageVersion(nodeModules, lock, `@napi-rs/${canvasPackage}`, verified);
-  verifyPackageVersion(nodeModules, lock, `@anush008/${tokenizersPackage}`, verified);
+  verifyPackageVersionAtDir(sqliteVecPackageDir(nodeModules, sqlitePackage), lock, sqlitePackage, verified);
+  verifyPackageVersionAtDir(canvasPackageDir(nodeModules, canvasPackage), lock, `@napi-rs/${canvasPackage}`, verified);
+  verifyPackageVersionAtDir(tokenizersPackageDir(nodeModules, tokenizersPackage), lock, `@anush008/${tokenizersPackage}`, verified);
   verifyPackageVersion(nodeModules, lock, 'better-sqlite3', verified);
   for (const pkgDir of [
     path.join(nodeModules, 'onnxruntime-node'),
@@ -347,7 +405,11 @@ function packageJsonPath(nodeModules, packageName) {
 }
 
 function verifyPackageVersion(nodeModules, lock, packageName, verified, lockPath = packageLockEntryPath(packageName)) {
-  const pkg = readJsonFile(`${packageName} package.json`, packageJsonPath(nodeModules, packageName));
+  verifyPackageVersionAtDir(packageDir(nodeModules, packageName), lock, packageName, verified, lockPath);
+}
+
+function verifyPackageVersionAtDir(pkgDir, lock, packageName, verified, lockPath = packageLockEntryPath(packageName)) {
+  const pkg = readJsonFile(`${packageName} package.json`, path.join(pkgDir, 'package.json'));
   const expected = lockPackageVersion(lock, packageName, lockPath);
   if (String(pkg.version || '') !== String(expected)) {
     throw new Error(`[native-deps-gate] ${packageName} version mismatch: packaged=${pkg.version || '(missing)'} lock=${expected}`);

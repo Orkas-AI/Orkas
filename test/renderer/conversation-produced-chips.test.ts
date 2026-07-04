@@ -53,7 +53,7 @@ describe('conversation produced chips', () => {
     expect(source).toContain("row.classList.add('is-expanded')");
     expect(source).not.toContain("window.ConversationInfo.openAndSetTab('files')");
     expect(styleSource).toContain('.chat-msg-produced.is-expanded');
-    expect(styleSource).toContain('max-height: 240px;');
+    expect(styleSource).toContain('max-height: 168px;');
     expect(styleSource).toContain('overflow-y: auto;');
   });
 
@@ -79,5 +79,14 @@ describe('conversation produced chips', () => {
 
     expect(ordered).toHaveLength(1);
     expect(ordered[0].path).toBe('/workspace/b/report.md');
+  });
+});
+
+describe('chat video layout', () => {
+  it('reserves a stable 16:9 slot for inline chat videos', () => {
+    expect(styleSource).toContain('.chat-md-video-shell');
+    expect(styleSource).toContain('aspect-ratio: 16 / 9;');
+    expect(styleSource).toContain('width: min(640px, 100%);');
+    expect(styleSource).toContain('.chat-msg-attach-video-shell');
   });
 });

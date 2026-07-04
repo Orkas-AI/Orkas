@@ -40,6 +40,7 @@ import {
 import type { StateFile } from './state';
 import {
   GroupMessage, appendVisible, readSlice, buildReplayPrefix,
+  type ChatUseSelection,
   type MarketplaceInstallRequest,
 } from './visibility';
 import {
@@ -68,6 +69,7 @@ import { readInstalls } from '../marketplace_installs';
 import { createSkillTurnBuffer, onAgentTurnEnd, onUserMessage } from '../expert_signals/turn_hooks';
 import {
   compactPromptDescription,
+  listAgentOwnedSkillIds,
   listSkillSpecs,
   openSkillReadRoots,
   resolveSkillAllowlistRefs,
@@ -185,46 +187,76 @@ function _normaliseSkillMentionText(s: string): string {
   return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
+function _normalizeUseSelections(value: unknown): ChatUseSelection[] {
+  const raw = Array.isArray(value) ? value : [];
+  const out: ChatUseSelection[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const rec = item as Record<string, unknown>;
+    const kind = rec.kind === 'skill' ? 'skill' : (rec.kind === 'connector' ? 'connector' : '');
+    if (!kind) continue;
+    const id = String(rec.id || rec.name || '').trim();
+    const name = String(rec.name || rec.id || '').trim();
+    if (!id && !name) continue;
+    const cleanId = id || name;
+    const key = `${kind}:${cleanId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      kind,
+      id: cleanId,
+      ...(name && name !== cleanId ? { name } : {}),
+    });
+  }
+  return out;
+}
+
+function _selectedSkillRefs(useSelections: readonly ChatUseSelection[] | undefined): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const sel of useSelections || []) {
+    if (sel?.kind !== 'skill') continue;
+    const ref = String(sel.id || sel.name || '').trim();
+    if (!ref || seen.has(ref)) continue;
+    seen.add(ref);
+    out.push(ref);
+  }
+  return out;
+}
+
+function _appendSkillRefs(base: readonly string[], extra: readonly string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const id of [...base, ...extra]) {
+    const clean = String(id || '').trim();
+    if (!clean || seen.has(clean)) continue;
+    seen.add(clean);
+    out.push(clean);
+  }
+  return out;
+}
+
 function _hasSkillUseIntent(text: string): boolean {
   return /(?:使用|调用|運行|运行|执行|use|run|call|execute)/i.test(text);
 }
 
-function _escapeRe(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function _workflowMentionsSkill(workflow: string, spec: SkillAllowlistRef): boolean {
-  const hay = String(workflow || '').toLowerCase();
-  const refs = [spec.id, spec.name].filter((v): v is string => typeof v === 'string' && !!v.trim());
-  for (const ref of refs) {
-    const needle = ref.toLowerCase().trim();
-    if (!needle) continue;
-    if (/^[a-z0-9_.-]+$/i.test(needle)) {
-      const re = new RegExp(`(^|[^a-z0-9_.-])${_escapeRe(needle)}(?=$|[^a-z0-9_.-])`, 'i');
-      if (re.test(hay)) return true;
-    } else if (hay.includes(needle)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-async function _runtimeSkillListForAgent(agent: agentsFeat.Agent): Promise<string[]> {
-  const workflow = String(agent.workflow || '');
-  if (!workflow.trim()) return [];
+async function _runtimeSkillListForAgent(uid: string, agent: agentsFeat.Agent): Promise<string[]> {
   // Owner-scoped: a private (`ownerAgent`) skill of another agent never
   // resolves here, so it can't enter this agent's runtime skill list.
   const specs = await listSkillSpecs({ forAgentId: agent.agent_id }).catch((err) => {
-    log.warn(`skill workflow filter list failed agent=${agent.agent_id}: ${(err as Error).message}`);
+    log.warn(`skill allowlist resolution failed agent=${agent.agent_id}: ${(err as Error).message}`);
     return [] as SkillAllowlistRef[];
   });
-  if (!specs.length) return [];
-  const refs = Array.isArray(agent.skill_list) ? agent.skill_list : specs.map((s) => s.id);
-  if (!refs.length) return [];
-  const allowedIds = new Set(resolveSkillAllowlistRefs(specs, refs).ids);
-  return specs
-    .filter((s) => allowedIds.has(s.id) && _workflowMentionsSkill(workflow, s))
-    .map((s) => s.id);
+  const refs = Array.isArray(agent.skill_list) ? agent.skill_list : [];
+  const resolved = specs.length && refs.length
+    ? resolveSkillAllowlistRefs(specs, refs).ids
+    : refs.filter((id): id is string => typeof id === 'string' && !!id.trim());
+  const owned = await listAgentOwnedSkillIds(uid, agent.agent_id).catch((err) => {
+    log.warn(`agent-owned skill scan failed agent=${agent.agent_id}: ${(err as Error).message}`);
+    return [] as string[];
+  });
+  return _appendSkillRefs(resolved, owned);
 }
 
 async function _findDisabledSkillUseRequest(uid: string, text: string):
@@ -352,6 +384,7 @@ interface QueueItem {
    * LLM payload so commander / agent can see file paths + kinds and
    * extract values for `inputs_schema` (especially `type=file` fields). */
   attachments?: string[];
+  useSelections?: ChatUseSelection[];
   /** Shadow-tap marker: this turn was triggered NOT because the actor was
    * a declared recipient (`to` includes them), but because the bus woke
    * them as an observer (e.g. commander wakes on every agent → user reply
@@ -617,6 +650,7 @@ export interface EnqueueParams {
   text: string;
   model_text?: string;
   attachments?: string[];
+  use_selections?: ChatUseSelection[];
   produced?: string[];
   form?: ChatFormPayload;
   created_agents?: Array<{ agent_id: string; name: string; kind?: 'created' | 'updated' }>;
@@ -835,18 +869,29 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     else to = [USER_ID];
   }
 
-  // Floor reset: while handed off to an agent, a user message that resolves to
-  // the commander means the user explicitly addressed the commander (the no-`@`
-  // default would have been the floor agent) — or the floor agent became
-  // unroutable and we fell back to commander. Either way the hand-off is over;
-  // return the floor to the commander. A one-shot `@<otherAgent>` (to does NOT
-  // contain commander) leaves the floor untouched.
-  if (fromKind === 'user' && floorRecipient && to.includes(COMMANDER_ID)) {
-    try {
-      await setActiveRecipient(uid, cid, COMMANDER_ID);
-      await markOrchestrationInterrupted(uid, cid, text, floorRecipient);
+  // Floor update: a user-visible recipient choice is the conversation floor.
+  // Manual @ / chip selection should stick until the user switches again, the
+  // agent hands back, or the commander performs a new hand_off_to.
+  if (fromKind === 'user') {
+    const agentRecipients = to.filter((id) => !RESERVED_IDS.has(id));
+    if (to.includes(COMMANDER_ID)) {
+      if (floorRecipient) {
+        try {
+          await setActiveRecipient(uid, cid, COMMANDER_ID);
+          await markOrchestrationInterrupted(uid, cid, text, floorRecipient);
+        }
+        catch (err) { log.warn(`floor reset failed cid=${cid}: ${(err as Error).message}`); }
+      }
+    } else if (agentRecipients.length === 1) {
+      const nextFloor = agentRecipients[0];
+      try {
+        await setActiveRecipient(uid, cid, nextFloor);
+        if (floorRecipient && floorRecipient !== nextFloor) {
+          await markOrchestrationInterrupted(uid, cid, text, floorRecipient);
+        }
+      }
+      catch (err) { log.warn(`floor switch failed cid=${cid}: ${(err as Error).message}`); }
     }
-    catch (err) { log.warn(`floor reset failed cid=${cid}: ${(err as Error).message}`); }
   }
 
   // Auto-add any non-reserved recipient that isn't already a member.
@@ -939,6 +984,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   const msgId = genId12();
   const ts = nowIso();
   const mentions = parseMentions(rewrittenText);
+  const useSelections = _normalizeUseSelections(params.use_selections);
 
   const msg: GroupMessage = {
     id: msgId, ts, from: fromActorId, to,
@@ -947,6 +993,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     text: rewrittenText,
     ...(params.model_text && params.model_text.trim() ? { model_text: params.model_text } : {}),
     ...(params.attachments && params.attachments.length ? { attachments: params.attachments } : {}),
+    ...(useSelections.length ? { use_selections: useSelections } : {}),
     ...(params.produced && params.produced.length ? { produced: params.produced } : {}),
     ...(params.form ? { form: params.form } : {}),
     ...(params.created_agents && params.created_agents.length ? { created_agents: params.created_agents } : {}),
@@ -1007,6 +1054,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
       fromActorId,
       llmPayload: composeLlmTurnPayload(fromActorId, msg),
       ...(msg.attachments && msg.attachments.length ? { attachments: msg.attachments.slice() } : {}),
+      ...(msg.use_selections && msg.use_selections.length ? { useSelections: msg.use_selections.slice() } : {}),
     });
     const wake = w.wake; w.wake = null;
     wake?.();
@@ -1019,7 +1067,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   // the DAG demands. Adding a shadow-tap on top was double-firing: it
   // created an extra commander turn whose only output (per prompt) was an
   // empty final (silently dropped), wasting one LLM call per agent reply.
-  // For non-plan flows (one-shot @-mention dispatch), commander has no
+  // For non-plan flows (direct @-mention dispatch), commander has no
   // orchestration role at all — letting it stay asleep keeps the chat
   // clean and avoids prompt-driven mistakes (the model second-guessing the
   // agent's form / re-dispatching for "polish").
@@ -1536,6 +1584,21 @@ async function runActorTurn(
     }
   }
 
+  // Conversation-level attachment index. The current-turn manifest above is
+  // stored in session history, so after many tool-loop turns it can be trimmed
+  // away. Re-list persisted conversation attachments every turn as cheap path
+  // metadata so an agent can recover files uploaded earlier without relying on
+  // the first attachment-bearing message still being in context.
+  try {
+    const { buildConversationAttachmentIndex } = await import('../chat_attachments');
+    const index = await buildConversationAttachmentIndex(uid, cid, {
+      excludeNames: item.attachments || [],
+    });
+    if (index) messageText = `${index}\n${messageText}`;
+  } catch (err) {
+    log.warn(`conversation attachment index build failed cid=${cid} actor=${actor.id}: ${(err as Error).message}`);
+  }
+
   if (isCommander && item.fromActorId === USER_ID) {
     const disabledSkill = await _findDisabledSkillUseRequest(uid, item.llmPayload);
     if (disabledSkill) {
@@ -1561,6 +1624,8 @@ async function runActorTurn(
   let systemPrompt: string;
   let extraTools: AgentTool[] = [];
   let skillList: string[] | undefined;
+  const selectedSkillRefs = _selectedSkillRefs(item.useSelections);
+  const forceOpenSkillRefs: string[] = selectedSkillRefs;
   // CLI-backed agents fetch the spec but skip systemPrompt / skillList /
   // extraTools — the LLM stream is replaced below by `runCliAgentTurn`.
   // Hoisted here so the branch below can read it without re-fetching.
@@ -1627,10 +1692,13 @@ async function runActorTurn(
       systemPrompt = ''; // unused on CLI path
     } else {
       systemPrompt = await buildAgentInGroupSystemPrompt(uid, agent, workingDir);
-      // Runtime skills are the intersection of the agent's whitelist and
-      // workflow references. A broad whitelist is authoring metadata; only
-      // skills the workflow actually names should reach the prompt.
-      skillList = await _runtimeSkillListForAgent(agent);
+      // Runtime skills start from the agent-authored skill_list and append
+      // agent-owned private/self-evolved skills. User-explicit picker choices
+      // are appended at the tail even if they are outside the authored list.
+      skillList = _appendSkillRefs(
+        await _runtimeSkillListForAgent(uid, agent),
+        selectedSkillRefs,
+      );
       extraTools = [buildSkillSearchTool(uid)];
     }
   }
@@ -1874,6 +1942,7 @@ async function runActorTurn(
         attachmentMetadata: turnAttachmentMetadata,
         ...(extraTools.length ? { extraTools } : {}),
         ...(skillList !== undefined ? { skillList } : {}),
+        ...(forceOpenSkillRefs.length ? { forceOpenSkillRefs } : {}),
         // Skills are NOT project-scoped this round; agent skillList still
         // gates in-process agents' rendered skills and SkillStore.
       })) {
@@ -2083,18 +2152,14 @@ async function runActorTurn(
             const target = await agentsFeat.getAgent(editId);
             if (!target) {
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent edit failed: agent not found (id=${editId}).</span>`;
-            } else if (target.source !== 'custom' && !false) {
+            } else if (target.source !== 'custom') {
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Marketplace agents can't be edited from the main chat; fork one in the right-hand detail panel and edit there.</span>`;
             } else if (agentsFeat.isCliAgent(target)) {
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ External agents can only be edited from the right-hand detail panel.</span>`;
             } else {
-              // `updateAgentSpec` dispatches: custom → updateCustomAgent,
-              // marketplace + dev → agents_dev.updateBuiltinAgentSpec
-              // (which writes the local marketplace install dir). The
-              // dev-env source guard above is what makes the marketplace
-              // branch reachable; the direct `updateCustomAgent` call this
-              // replaces would short-circuit to null because the custom
-              // agent.json doesn't exist for marketplace ids.
+              // The open-source build only permits main-chat edits for
+              // user-owned custom agents. Marketplace/external agents are
+              // edited through their detail surfaces or forked first.
               const updated = await agentsFeat.updateAgentSpec(editId, fields);
               if (updated) {
                 createdAgents.push({ agent_id: updated.agent_id, name: updated.name, kind: 'updated' });

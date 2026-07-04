@@ -99,6 +99,241 @@ describe("Session", () => {
     });
   });
 
+  it("compacts old large tool results only in the model view and keeps a re-readable ref", () => {
+    const persisted: string[] = [];
+    const session = new Session({
+      toolResultCompaction: {
+        minChars: 100,
+        keepRecentAssistantSteps: 0,
+        keepRecentToolResults: 0,
+        previewHeadChars: 10,
+        previewTailChars: 5,
+        persistToolResult: ({ toolName, toolUseId, content }) => {
+          expect(toolName).toBe("bash");
+          expect(toolUseId).toBe("call-old");
+          expect(content.length).toBeGreaterThan(100);
+          persisted.push("/tmp/tool-results/bash.call-old.txt");
+          return "/tmp/tool-results/bash.call-old.txt";
+        },
+      },
+    });
+    const raw = "0123456789" + "x".repeat(2_000) + "TAIL!";
+
+    session.addAssistantMessage([{ type: "tool_use", id: "call-old", name: "bash", input: { command: "big" } }]);
+    session.addToolResult("call-old", raw, undefined, false);
+    session.addAssistantMessage([{ type: "text", text: "I saw the output." }]);
+
+    const modelMessages = session.getMessagesForModel();
+    const compacted = modelMessages[1].content[0];
+    expect(compacted.type).toBe("tool_result");
+    expect((compacted as { content: string }).content).toContain("<compacted-tool-result");
+    expect((compacted as { content: string }).content).toContain('tool="bash"');
+    expect((compacted as { content: string }).content).toContain("/tmp/tool-results/bash.call-old.txt");
+    expect((compacted as { content: string }).content).toContain("preview_head:\n0123456789");
+    expect((compacted as { content: string }).content).toContain("preview_tail:\nTAIL!");
+    expect((compacted as { content: string }).content.length).toBeLessThan(raw.length);
+    expect(persisted).toHaveLength(1);
+
+    const rawMessages = session.getMessages();
+    expect((rawMessages[1].content[0] as { content: string }).content).toBe(raw);
+
+    session.getMessagesForModel();
+    expect(persisted).toHaveLength(1);
+  });
+
+  it("keeps fresh large tool results verbatim for the next model call", () => {
+    const persisted: string[] = [];
+    const session = new Session({
+      toolResultCompaction: {
+        minChars: 100,
+        keepRecentAssistantSteps: 0,
+        keepRecentToolResults: 0,
+        persistToolResult: () => {
+          persisted.push("unexpected");
+          return "/tmp/unexpected.txt";
+        },
+      },
+    });
+    const raw = "x".repeat(500);
+
+    session.addAssistantMessage([{ type: "tool_use", id: "call-fresh", name: "bash", input: {} }]);
+    session.addToolResult("call-fresh", raw, undefined, false);
+
+    const modelMessages = session.getMessagesForModel();
+    expect((modelMessages[1].content[0] as { content: string }).content).toBe(raw);
+    expect(persisted).toHaveLength(0);
+  });
+
+  it("compacts old medium tool results once aggregate tool_result text exceeds the threshold", () => {
+    const persisted: string[] = [];
+    const session = new Session({
+      toolResultCompaction: {
+        minChars: 8 * 1024,
+        aggregateMinChars: 1_000,
+        aggregateMinResultChars: 100,
+        aggregatePreviewChars: 16,
+        keepRecentAssistantSteps: 0,
+        keepRecentToolResults: 0,
+        persistToolResult: ({ toolUseId, content }) => {
+          persisted.push(content);
+          return `/tmp/tool-results/${toolUseId}.txt`;
+        },
+      },
+    });
+    const first = "alpha-" + "a".repeat(700);
+    const second = "beta-" + "b".repeat(700);
+
+    session.addAssistantMessage([{ type: "tool_use", id: "call-1", name: "bash", input: {} }]);
+    session.addToolResult("call-1", first, undefined, false);
+    session.addAssistantMessage([{ type: "tool_use", id: "call-2", name: "bash", input: {} }]);
+    session.addToolResult("call-2", second, undefined, false);
+    session.addAssistantMessage([{ type: "text", text: "seen" }]);
+
+    const modelMessages = session.getMessagesForModel();
+    const compacted = modelMessages
+      .flatMap((m) => m.content)
+      .filter((c) => c.type === "tool_result")
+      .map((c) => (c as { content: string }).content);
+
+    expect(compacted).toHaveLength(2);
+    expect(compacted[0]).toContain('mode="aggregate"');
+    expect(compacted[0]).toContain("total tool_result context exceeded 1000 chars");
+    expect(compacted[0]).toContain('path="/tmp/tool-results/call-1.txt"');
+    expect(compacted[0]).toContain("preview: alpha-");
+    expect(compacted[0]).not.toContain("preview_tail:");
+    expect(compacted[0].length).toBeLessThan(first.length);
+    expect(compacted[1]).toContain('path="/tmp/tool-results/call-2.txt"');
+    expect(persisted).toEqual([first, second]);
+    expect((session.getMessages()[1].content[0] as { content: string }).content).toBe(first);
+  });
+
+  it("keeps recent tool results verbatim even when aggregate compaction is active", () => {
+    const persisted: string[] = [];
+    const session = new Session({
+      toolResultCompaction: {
+        minChars: 8 * 1024,
+        aggregateMinChars: 1_000,
+        aggregateMinResultChars: 100,
+        keepRecentAssistantSteps: 0,
+        keepRecentToolResults: 2,
+        persistToolResult: ({ toolUseId }) => {
+          persisted.push(toolUseId);
+          return `/tmp/tool-results/${toolUseId}.txt`;
+        },
+      },
+    });
+    const raws = ["one-", "two-", "three-"].map((prefix) => prefix + "x".repeat(600));
+    for (let i = 0; i < raws.length; i++) {
+      const id = `call-${i + 1}`;
+      session.addAssistantMessage([{ type: "tool_use", id, name: "bash", input: {} }]);
+      session.addToolResult(id, raws[i], undefined, false);
+    }
+    session.addAssistantMessage([{ type: "text", text: "seen" }]);
+
+    const contents = session.getMessagesForModel()
+      .flatMap((m) => m.content)
+      .filter((c) => c.type === "tool_result")
+      .map((c) => (c as { content: string }).content);
+
+    expect(contents[0]).toContain('mode="aggregate"');
+    expect(contents[1]).toBe(raws[1]);
+    expect(contents[2]).toBe(raws[2]);
+    expect(persisted).toEqual(["call-1"]);
+  });
+
+  it("compacts old tool_use inputs only in the model view", () => {
+    const session = new Session({
+      toolResultCompaction: {
+        minChars: 999_999,
+        aggregateMinChars: 999_999,
+        toolUseInputMinChars: 999_999,
+        toolUseInputAggregateMinChars: 1_000,
+        toolUseInputAggregateMinInputChars: 100,
+        toolUseInputStringMinChars: 80,
+        toolUseInputPreviewChars: 48,
+        keepRecentAssistantSteps: 0,
+        keepRecentToolResults: 0,
+        keepRecentToolUses: 0,
+      },
+    });
+    const fileContent = "START-" + "x".repeat(900) + "-END";
+    const command = "printf " + "y".repeat(900);
+
+    session.addAssistantMessage([{ type: "tool_use", id: "call-write", name: "write_file", input: { path: "/tmp/a.txt", content: fileContent } }]);
+    session.addToolResult("call-write", "ok", undefined, false);
+    session.addAssistantMessage([{ type: "tool_use", id: "call-bash", name: "bash", input: { command } }]);
+    session.addToolResult("call-bash", "ok", undefined, false);
+    session.addAssistantMessage([{ type: "text", text: "seen" }]);
+
+    const toolUses = session.getMessagesForModel()
+      .flatMap((m) => m.content)
+      .filter((c) => c.type === "tool_use") as Array<{ input: Record<string, unknown> }>;
+
+    expect(toolUses).toHaveLength(2);
+    expect(toolUses[0].input.path).toBe("/tmp/a.txt");
+    expect(toolUses[0].input.__orkas_context_note).toEqual(expect.stringContaining("original_json_chars"));
+    expect(toolUses[0].input.content).toEqual(expect.stringContaining("old tool input string compacted"));
+    expect(toolUses[0].input.content).toEqual(expect.stringContaining("START-"));
+    expect(toolUses[0].input.content).toEqual(expect.stringContaining("-END"));
+    expect(toolUses[0].input.content).not.toBe(fileContent);
+    expect(toolUses[1].input.command).toEqual(expect.stringContaining("old tool input string compacted"));
+
+    const rawToolUse = session.getMessages()[0].content[0];
+    expect(rawToolUse.type).toBe("tool_use");
+    expect((rawToolUse as { input: Record<string, unknown> }).input.content).toBe(fileContent);
+  });
+
+  it("keeps recent tool_use inputs verbatim even when input compaction is active", () => {
+    const session = new Session({
+      toolResultCompaction: {
+        minChars: 999_999,
+        aggregateMinChars: 999_999,
+        toolUseInputMinChars: 999_999,
+        toolUseInputAggregateMinChars: 1_000,
+        toolUseInputAggregateMinInputChars: 100,
+        toolUseInputStringMinChars: 80,
+        keepRecentAssistantSteps: 0,
+        keepRecentToolResults: 0,
+        keepRecentToolUses: 1,
+      },
+    });
+    const oldCommand = "old-" + "x".repeat(900);
+    const freshCommand = "fresh-" + "y".repeat(900);
+
+    session.addAssistantMessage([{ type: "tool_use", id: "call-old", name: "bash", input: { command: oldCommand } }]);
+    session.addToolResult("call-old", "ok", undefined, false);
+    session.addAssistantMessage([{ type: "tool_use", id: "call-fresh", name: "bash", input: { command: freshCommand } }]);
+    session.addToolResult("call-fresh", "ok", undefined, false);
+    session.addAssistantMessage([{ type: "text", text: "seen" }]);
+
+    const commands = session.getMessagesForModel()
+      .flatMap((m) => m.content)
+      .filter((c) => c.type === "tool_use")
+      .map((c) => (c as { input: Record<string, unknown> }).input.command);
+
+    expect(commands[0]).toEqual(expect.stringContaining("old tool input string compacted"));
+    expect(commands[1]).toBe(freshCommand);
+  });
+
+  it("estimateModelTokens uses the compacted provider view", () => {
+    const session = new Session({
+      toolResultCompaction: {
+        minChars: 100,
+        keepRecentAssistantSteps: 0,
+        keepRecentToolResults: 0,
+        previewHeadChars: 10,
+        previewTailChars: 10,
+        persistToolResult: () => "/tmp/tool-results/bash.big.txt",
+      },
+    });
+    session.addAssistantMessage([{ type: "tool_use", id: "call-big", name: "bash", input: {} }]);
+    session.addToolResult("call-big", "a".repeat(20_000), undefined, false);
+    session.addAssistantMessage([{ type: "text", text: "seen" }]);
+
+    expect(session.estimateTokens()).toBeGreaterThan(4_000);
+    expect(session.estimateModelTokens()).toBeLessThan(1_000);
+  });
+
   it("trims history to exactly maxHistoryTurns and keeps the newest turns", () => {
     const session = new Session({ maxHistoryTurns: 2 });
     for (let i = 0; i < 4; i++) {
@@ -111,6 +346,36 @@ describe("Session", () => {
     // Newest two turns (i=2, i=3) must survive; older ones must be dropped
     expect((msgs[0].content[0] as { text: string }).text).toBe("User message 2");
     expect((msgs[3].content[0] as { text: string }).text).toBe("Response 3");
+  });
+
+  it("trims at a provider-safe boundary when the cut lands on a tool_result", () => {
+    const session = new Session({ maxHistoryTurns: 2 });
+    session.addUserMessage("start");
+    session.addAssistantMessage([{ type: "tool_use", id: "call-old", name: "bash", input: {} }]);
+    session.addToolResult("call-old", "ok", undefined, false);
+    session.addAssistantMessage([{ type: "text", text: "tool done" }]);
+    session.addUserMessage("next");
+    session.addAssistantMessage([{ type: "text", text: "next response" }]);
+
+    const msgs = session.getMessages();
+    expect(msgs[0].content[0].type).not.toBe("tool_result");
+    expect(msgs.flatMap((m) => m.content).some(
+      (c) => c.type === "tool_result" && c.toolUseId === "call-old",
+    )).toBe(false);
+    expect((msgs.at(-1)?.content[0] as { text: string }).text).toBe("next response");
+  });
+
+  it("defaults to keeping the newest 50 internal turns", () => {
+    const session = new Session();
+    for (let i = 0; i < 55; i++) {
+      session.addUserMessage(`User message ${i}`);
+      session.addAssistantMessage([{ type: "text", text: `Response ${i}` }]);
+    }
+
+    expect(session.length).toBe(100);
+    const msgs = session.getMessages();
+    expect((msgs[0].content[0] as { text: string }).text).toBe("User message 5");
+    expect((msgs[99].content[0] as { text: string }).text).toBe("Response 54");
   });
 
   it("compacts session with summary", () => {

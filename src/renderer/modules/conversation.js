@@ -587,24 +587,33 @@ function _chatRichCreateApi(textarea, editor) {
       const end = typeof textarea.selectionEnd === 'number' ? textarea.selectionEnd : start;
       _chatRichSetSelection(editor, start, end);
     },
-    setTextareaSelection(start, end = start) {
+    setTextareaSelection(start, end = start, opts = {}) {
+      const next = { start, end: typeof end === 'number' ? end : start };
       if (nativeSetSelectionRange) {
-        try { nativeSetSelectionRange(start, end); } catch (_) {}
+        try { nativeSetSelectionRange(next.start, next.end); } catch (_) {}
       } else {
-        textarea.selectionStart = start;
-        textarea.selectionEnd = end;
+        textarea.selectionStart = next.start;
+        textarea.selectionEnd = next.end;
       }
-      this.pendingSelection = { start, end };
+      if (!opts || opts.pending !== false) {
+        this.pendingSelection = next;
+      }
     },
     syncTextareaSelectionFromEditor() {
       const sel = _chatRichSelectionIndexes(editor);
       if (!sel) return;
-      this.setTextareaSelection(sel.start, sel.end);
+      // This mirrors the browser-owned contenteditable caret into the hidden
+      // textarea. It must not schedule a reverse editor selection update,
+      // otherwise normal ArrowLeft/ArrowRight movement gets snapped back by
+      // the next sync tick.
+      this.setTextareaSelection(sel.start, sel.end, { pending: false });
     },
-    renderFromTextarea() {
+    renderFromTextarea(opts = {}) {
       const value = String(textarea.value || '');
       const changed = value !== this.lastValue;
+      let shouldAutoGrow = !!(opts && opts.forceHeight);
       if (changed) {
+        shouldAutoGrow = true;
         this.lastValue = value;
         const start = typeof textarea.selectionStart === 'number' ? textarea.selectionStart : value.length;
         const end = typeof textarea.selectionEnd === 'number' ? textarea.selectionEnd : start;
@@ -618,7 +627,7 @@ function _chatRichCreateApi(textarea, editor) {
         _chatRichSetSelection(editor, this.pendingSelection.start, this.pendingSelection.end);
         this.pendingSelection = null;
       }
-      this.autoGrow(_chatRichAutoGrowMax(textarea.id));
+      if (shouldAutoGrow) this.autoGrow(_chatRichAutoGrowMax(textarea.id));
     },
     syncFromEditor(emit) {
       this.syncTextareaSelectionFromEditor();
@@ -2345,10 +2354,9 @@ function _findRenderedMessageForHistoryRecord(container, gm) {
 
 const _chatAttachments = new Map();   // cid → Array<{name, displayName?, kind, bytes, dataUrl?, sha256?, reused?}>
 
-// Draft cid used by the commander (new-chat) tab — files land under
-// `data/<uid>/chat_attachments/main_chat/` until the user hits send, at which
-// point the backend renames that dir to the freshly-minted conversation cid
-// (see `adoptDraftAttachments`).
+// Draft cid used by the commander (new-chat) tab — files land in a local-only
+// draft pool until the user hits send, at which point the backend adopts that
+// dir into the freshly-minted conversation cid (see `adoptDraftAttachments`).
 const DRAFT_CID = 'main_chat';
 
 const CHAT_ATTACH_ACCEPT = [
@@ -2943,7 +2951,7 @@ function _renderMessageAttachmentsHtml(names, cid) {
       const floatingTitle = escapeHtml(_chatVideoFloatingTitle());
       return `<span class="chat-msg-attach is-video" data-attach-name="${label}" data-attach-cid="${escapeHtml(cid)}" title="${label}">
         <span class="chat-msg-attach-video-shell">
-          <video class="chat-msg-attach-video" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${url}"></video>
+          <video class="chat-msg-attach-video" width="320" height="180" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${url}"></video>
           <button type="button" class="chat-msg-attach-video-float" data-attach-video-open="1" aria-label="${floatingTitle}" title="${floatingTitle}">${_uiIconHtml('maximize', 'ui-icon chat-msg-attach-video-float-svg')}</button>
         </span>
         <span class="chat-msg-attach-label">${label}</span>
@@ -3198,6 +3206,9 @@ function _hydrateMessageAttachmentThumbs(msgDiv, cid) {
         if (!name || !chipCid) return;
         const video = chip.querySelector('video.chat-msg-attach-video');
         const startTime = video && Number.isFinite(Number(video.currentTime)) ? Math.max(0, Number(video.currentTime) || 0) : 0;
+        const duration = video && Number.isFinite(Number(video.duration)) ? Math.max(0, Number(video.duration) || 0) : 0;
+        const ended = !!(video && video.ended);
+        const playbackOpts = { cid: chipCid, autoplay: true, startTime, duration, ended };
         try { if (video && typeof video.pause === 'function') video.pause(); } catch (_) {}
         try { if (window.Monitor) (() => {})('chat_attachment_video_floating_open'); } catch (_) {}
         try {
@@ -3207,7 +3218,7 @@ function _hydrateMessageAttachmentThumbs(msgDiv, cid) {
             _showFileMissingToast(name);
             return;
           }
-          openChatFileViewer(res.path, name, { cid: chipCid, autoplay: true, startTime });
+          openChatFileViewer(res.path, name, playbackOpts);
         } catch (err) {
           _convLog.warn('attachments.absPath video threw', { cid: chipCid, name, error: String(err && err.message || err) });
           _showFileMissingToast(name);
@@ -3348,8 +3359,8 @@ function _initChatAttachInput() {
 // The commander (new-chat) tab's "+" button uses the same upload
 // pipeline; the only difference is that it passes DRAFT_CID instead of
 // a real conversation cid. After the user clicks send,
-// handleNewChatSubmit calls adopt to rename the whole `main_chat/`
-// directory to the freshly-minted cid; the pre-processing cache
+// handleNewChatSubmit calls adopt to move the whole local `main_chat/`
+// draft directory to the freshly-minted cid; the pre-processing cache
 // follows in place and doesn't need to be rerun.
 
 function _initNewChatAttachInput() {
@@ -4538,6 +4549,109 @@ function _streamingMarkdownBodyHtml(display) {
   return `<div class="markdown-body">${_renderMessageMarkdown(display)}</div>`;
 }
 
+function _streamingStableMediaKey(kind, src) {
+  const normalizedKind = String(kind || '').trim().toLowerCase();
+  const normalizedSrc = String(src || '').trim();
+  if (!normalizedKind || !normalizedSrc) return '';
+  return `${normalizedKind}\x1f${normalizedSrc}`;
+}
+
+function _streamingCollectStableMedia(root) {
+  const stable = new Map();
+  if (!root || typeof root.querySelectorAll !== 'function') return stable;
+  const add = (kind, src, node) => {
+    const key = _streamingStableMediaKey(kind, src);
+    if (!key || !node) return;
+    const list = stable.get(key) || [];
+    list.push(node);
+    stable.set(key, list);
+  };
+  root.querySelectorAll('.chat-md-video-shell').forEach((shell) => {
+    const video = shell && shell.querySelector ? shell.querySelector('video.chat-md-video[src]') : null;
+    add('video', video && video.getAttribute ? video.getAttribute('src') : '', shell);
+  });
+  root.querySelectorAll('.chat-md-audio-card').forEach((card) => {
+    const audio = card && card.querySelector ? card.querySelector('audio.chat-md-audio[src]') : null;
+    add('audio', audio && audio.getAttribute ? audio.getAttribute('src') : '', card);
+  });
+  return stable;
+}
+
+function _streamingCopyElementAttributes(target, source) {
+  if (!target || !source || !target.attributes || !source.attributes) return;
+  const keep = new Set();
+  Array.from(source.attributes).forEach((attr) => {
+    keep.add(attr.name);
+    if (target.getAttribute(attr.name) !== attr.value) target.setAttribute(attr.name, attr.value);
+  });
+  Array.from(target.attributes).forEach((attr) => {
+    if (!keep.has(attr.name)) target.removeAttribute(attr.name);
+  });
+}
+
+function _streamingSyncStableMediaNode(existing, fresh) {
+  if (!existing || !fresh) return existing;
+  _streamingCopyElementAttributes(existing, fresh);
+  const existingMedia = existing.querySelector
+    ? existing.querySelector('video.chat-md-video[src], audio.chat-md-audio[src]')
+    : null;
+  const freshMedia = fresh.querySelector
+    ? fresh.querySelector('video.chat-md-video[src], audio.chat-md-audio[src]')
+    : null;
+  if (existingMedia && freshMedia) _streamingCopyElementAttributes(existingMedia, freshMedia);
+
+  const existingOpen = existing.querySelector
+    ? existing.querySelector('[data-chat-md-video-open="1"]')
+    : null;
+  const freshOpen = fresh.querySelector
+    ? fresh.querySelector('[data-chat-md-video-open="1"]')
+    : null;
+  if (existingOpen && freshOpen) _streamingCopyElementAttributes(existingOpen, freshOpen);
+  else if (!existingOpen && freshOpen && existing.appendChild) existing.appendChild(freshOpen);
+  else if (existingOpen && !freshOpen && existingOpen.remove) existingOpen.remove();
+  return existing;
+}
+
+function _streamingRestoreStableMedia(nextRoot, stable) {
+  if (!nextRoot || !stable || !stable.size || typeof nextRoot.querySelectorAll !== 'function') return;
+  nextRoot.querySelectorAll('.chat-md-video-shell').forEach((freshShell) => {
+    const video = freshShell && freshShell.querySelector ? freshShell.querySelector('video.chat-md-video[src]') : null;
+    const key = _streamingStableMediaKey('video', video && video.getAttribute ? video.getAttribute('src') : '');
+    const reusable = key ? stable.get(key) : null;
+    const existing = reusable && reusable.shift ? reusable.shift() : null;
+    if (existing && freshShell.replaceWith) freshShell.replaceWith(_streamingSyncStableMediaNode(existing, freshShell));
+  });
+  nextRoot.querySelectorAll('.chat-md-audio-card').forEach((freshCard) => {
+    const audio = freshCard && freshCard.querySelector ? freshCard.querySelector('audio.chat-md-audio[src]') : null;
+    const key = _streamingStableMediaKey('audio', audio && audio.getAttribute ? audio.getAttribute('src') : '');
+    const reusable = key ? stable.get(key) : null;
+    const existing = reusable && reusable.shift ? reusable.shift() : null;
+    if (existing && freshCard.replaceWith) freshCard.replaceWith(_streamingSyncStableMediaNode(existing, freshCard));
+  });
+}
+
+function _setStreamingFinalHtml(finalEl, html) {
+  if (!finalEl) return;
+  if (
+    typeof document === 'undefined'
+    || !document.createElement
+    || typeof finalEl.querySelectorAll !== 'function'
+    || typeof finalEl.replaceChildren !== 'function'
+  ) {
+    finalEl.innerHTML = html;
+    return;
+  }
+  const stable = _streamingCollectStableMedia(finalEl);
+  if (!stable.size) {
+    finalEl.innerHTML = html;
+    return;
+  }
+  const tmp = document.createElement('div');
+  tmp.innerHTML = html;
+  _streamingRestoreStableMedia(tmp, stable);
+  finalEl.replaceChildren(...Array.from(tmp.childNodes));
+}
+
 function _invalidateStreamingMathPaint(msg) {
   if (!msg) return;
   if (msg._streamMathTimer) {
@@ -4576,7 +4690,7 @@ async function _flushStreamingMathPaint(msg) {
     && latest.finalEl === job.finalEl
     && job.finalEl.isConnected !== false
   ) {
-    job.finalEl.innerHTML = rendered;
+    _setStreamingFinalHtml(job.finalEl, rendered);
     msg.dataset.streamPaintedDisplay = job.display;
     msg._streamMathLatestPaint = null;
     if (job.stickBottom) _stickBottomFromMsg(msg);
@@ -4592,7 +4706,7 @@ function _paintStreamingFinalMarkdown(msg, finalEl, display, { stickBottom = fal
   const sig = _streamMathSignatureForText(display);
   if (!sig || typeof typesetMathHtml !== 'function') {
     _invalidateStreamingMathPaint(msg);
-    finalEl.innerHTML = html;
+    _setStreamingFinalHtml(finalEl, html);
     msg.dataset.streamPaintedDisplay = display;
     if (sig && typeof typesetMath === 'function') typesetMath(finalEl);
     if (stickBottom) _stickBottomFromMsg(msg);
@@ -5633,8 +5747,9 @@ async function handleNewChatSubmit() {
     return;
   }
 
-  // Rename `main_chat/` → `<convId>/` on disk. Preprocessing caches
-  // (`.<name>.extracted.NNN.md`) move with their source — nothing to re-run.
+  // Adopt local `main_chat/` draft files into `<convId>/` on disk.
+  // Preprocessing caches (`.<name>.extracted.NNN.md`) move with their source
+  // when present — nothing to re-run.
   let attachments = [];
   if (draftNames.length) {
     try {
@@ -5680,7 +5795,11 @@ async function handleNewChatSubmit() {
   _transferNewChatRecipientTo(convId);
   _renderRecipientChip('conversation');
   if (newBtn) newBtn.disabled = false;
-  await sendInCurrentConversation(content, attachments.length ? { attachments } : undefined);
+  const extra = {
+    ...(attachments.length ? { attachments } : {}),
+    ...(useSelections.length ? { use_selections: useSelections } : {}),
+  };
+  await sendInCurrentConversation(content, Object.keys(extra).length ? extra : undefined);
 }
 
 async function handleChatSubmit() {
@@ -5726,6 +5845,7 @@ async function handleChatSubmit() {
     }
     enqueueMessage(cid, applyQuotePrefix(raw, 'conversation'), null, {
       recipient: recipientSnapshot,
+      extra: useSelections.length ? { use_selections: useSelections } : undefined,
     });
     _clearQuote(cid);
     input.value = '';
@@ -5748,7 +5868,11 @@ async function handleChatSubmit() {
   // is aborted, the files remain on disk but the user can re-attach via the
   // "+" button (listAttachments shows what's still there).
   if (attachments.length) _chatAttachClear(cid);
-  await sendInCurrentConversation(content, attachments.length ? { attachments } : undefined);
+  const extra = {
+    ...(attachments.length ? { attachments } : {}),
+    ...(useSelections.length ? { use_selections: useSelections } : {}),
+  };
+  await sendInCurrentConversation(content, Object.keys(extra).length ? extra : undefined);
 }
 
 // One transient controller per conversation send. Multi-cid support comes

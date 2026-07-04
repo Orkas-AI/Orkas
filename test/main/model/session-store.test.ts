@@ -37,12 +37,14 @@ afterAll(() => {
 // the post-reset module graph (importing at the top would capture the stale default `WS_ROOT`
 // before beforeAll runs).
 async function loadRouting() {
-  const { sessionFileFor } = await import('../../../src/main/model/core-agent/session-store');
+  const { sessionFileFor, toolResultsDirForSession } = await import('../../../src/main/model/core-agent/session-store');
   const { WS_ROOT } = await import('../../../src/main/paths');
   return {
     sessionFileFor,
+    toolResultsDirForSession,
     cloudDir: path.join(WS_ROOT, uid, 'cloud', 'sessions'),
     localDir: path.join(WS_ROOT, uid, 'local', 'sessions'),
+    localToolResultsDir: path.join(WS_ROOT, uid, 'local', 'tool-results'),
   };
 }
 
@@ -59,6 +61,12 @@ describe('session-store.sessionFileFor', () => {
     expect(sessionFileFor(id)).toBe(path.join(cloudDir, `${id}.jsonl`));
   });
 
+  it('routes resumable tool-results next to the cloud session file', async () => {
+    const { toolResultsDirForSession, cloudDir } = await loadRouting();
+    const id = 'gmember-cid01-agentX';
+    expect(toolResultsDirForSession(uid, id)).toBe(path.join(cloudDir, `${id}.tool-results`));
+  });
+
   it('routes skill-edit → <uid>/cloud/sessions/', async () => {
     const { sessionFileFor, cloudDir } = await loadRouting();
     const id = 'skill-my_skill_id';
@@ -72,7 +80,7 @@ describe('session-store.sessionFileFor', () => {
   });
 
   it('routes ephemeral kinds (extract-img / reflect / memory-extract / anon) → <uid>/local/sessions/', async () => {
-    const { sessionFileFor, localDir } = await loadRouting();
+    const { sessionFileFor, toolResultsDirForSession, localDir, localToolResultsDir } = await loadRouting();
     for (const id of [
       'extract-img-077355b2',
       'reflect-abc123',
@@ -80,6 +88,7 @@ describe('session-store.sessionFileFor', () => {
       'anon-12345678',
     ]) {
       expect(sessionFileFor(id)).toBe(path.join(localDir, `${id}.jsonl`));
+      expect(toolResultsDirForSession(uid, id)).toBe(path.join(localToolResultsDir, id));
     }
   });
 

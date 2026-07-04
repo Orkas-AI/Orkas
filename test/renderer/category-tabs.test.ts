@@ -380,14 +380,14 @@ describe('agent and skill category tabs', () => {
       _openSkillsCache = [
         { id: 'global-helper', name: 'Global Helper', source: 'global', enabled: true, description: 'pkg' }
       ];
-      setChatSkill = (target, name) => { pickedSkillCalls.push([target, name]); };
+      setChatSkill = (target, id, name) => { pickedSkillCalls.push([target, id, name]); };
     `, context);
 
     // Commander: all picker tabs; global open-tier skill selectable.
     expect(vm.runInContext('_agentPickerVisibleTabs("new-chat-recipient-chip")', context))
       .toEqual(['agents', 'skills', 'connectors', 'library']);
     await context._triggerPickerItem('skill', 'global-helper', 'Global Helper', 'new-chat-recipient-chip');
-    expect(context.pickedSkillCalls).toEqual([['new-chat', 'Global Helper']]);
+    expect(context.pickedSkillCalls).toEqual([['new-chat', 'global-helper', 'Global Helper']]);
 
     // Agent recipient uses the same visible picker tabs; runtime capability
     // gates live in the main process. Trusted skill selection still works.
@@ -396,7 +396,7 @@ describe('agent and skill category tabs', () => {
     expect(vm.runInContext('_agentPickerVisibleTabs("new-chat-recipient-chip")', context))
       .toEqual(['agents', 'skills', 'connectors', 'library']);
     await context._triggerPickerItem('skill', 'trusted', 'Trusted Skill', 'new-chat-recipient-chip');
-    expect(context.pickedSkillCalls).toEqual([['new-chat', 'Trusted Skill']]);
+    expect(context.pickedSkillCalls).toEqual([['new-chat', 'trusted', 'Trusted Skill']]);
   });
 
   it('hides external package recipe groups from the picker for an agent recipient', () => {

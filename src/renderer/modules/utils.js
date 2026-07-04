@@ -1163,7 +1163,7 @@ function _markdownVideoHtml(src, label, title) {
   const openButton = localPath
     ? `<button type="button" class="chat-md-video-float" data-chat-md-video-open="1" data-video-src="${escapeHtml(src)}" aria-label="${escapeHtml(openLabel)}" title="${escapeHtml(openLabel)}">${_markdownVideoOpenIconHtml()}</button>`
     : '';
-  return `<span class="chat-md-video-shell"><video class="chat-md-video" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${escapeHtml(src)}"${t} aria-label="${escapeHtml(label || 'video')}"></video>${openButton}</span>`;
+  return `<span class="chat-md-video-shell"><video class="chat-md-video" width="640" height="360" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${escapeHtml(src)}"${t} aria-label="${escapeHtml(label || 'video')}"></video>${openButton}</span>`;
 }
 
 function _markdownMediaLabel(src, label, fallback) {
@@ -1302,13 +1302,16 @@ if (typeof document !== 'undefined') document.addEventListener('click', (e) => {
   const shell = btn.closest('.chat-md-video-shell');
   const video = shell && shell.querySelector ? shell.querySelector('video.chat-md-video') : null;
   const startTime = video && Number.isFinite(Number(video.currentTime)) ? Math.max(0, Number(video.currentTime) || 0) : 0;
+  const duration = video && Number.isFinite(Number(video.duration)) ? Math.max(0, Number(video.duration) || 0) : 0;
+  const ended = !!(video && video.ended);
+  const playbackOpts = { autoplay: true, startTime, duration, ended };
   try { if (video && typeof video.pause === 'function') video.pause(); } catch (_) {}
   try { if (window.Monitor) (() => {})('chat_md_video_floating_open'); } catch (_) {}
   if (typeof openChatVideoUrlViewer === 'function') {
-    openChatVideoUrlViewer(src, name, { autoplay: true, startTime });
+    openChatVideoUrlViewer(src, name, playbackOpts);
     return;
   }
-  openChatFileViewer(absPath, name, { autoplay: true, startTime });
+  openChatFileViewer(absPath, name, playbackOpts);
 }, true);
 
 // Bare URL autolink termination set. URLs per RFC 3986 are ASCII; CJK

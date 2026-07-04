@@ -75,6 +75,8 @@ describe('paths › cloud-synced per-user', () => {
     expect(p.chatAttachmentDir(uid, 'c1'))
       .toBe(path.join(p.WS_ROOT, uid, 'cloud', 'chat_attachments', 'c1'));
     expect(p.userSessionsDir(uid)).toBe(path.join(p.WS_ROOT, uid, 'cloud', 'sessions'));
+    expect(p.sessionCloudToolResultsDir(uid, 'gconv-c1'))
+      .toBe(path.join(p.WS_ROOT, uid, 'cloud', 'sessions', 'gconv-c1.tool-results'));
     expect(p.userContextsDir(uid)).toBe(path.join(p.WS_ROOT, uid, 'cloud', 'contexts'));
     expect(p.userMemoryFile(uid)).toBe(path.join(p.WS_ROOT, uid, 'cloud', 'memory', 'MEMORY.md'));
   });
@@ -125,6 +127,8 @@ describe('paths › local (per-user, not synced)', () => {
     expect(p.userChatsIndexPath(uid))
       .toBe(path.join(p.WS_ROOT, uid, 'local', 'search', 'chats.idx.json'));
     expect(p.userTestDir(uid)).toBe(path.join(p.WS_ROOT, uid, 'local', 'test'));
+    expect(p.chatAttachmentDraftDir(uid, 'main_chat'))
+      .toBe(path.join(p.WS_ROOT, uid, 'local', 'chat_attachment_drafts', 'main_chat'));
     expect(p.userWorkspaceConfigFile(uid))
       .toBe(path.join(p.WS_ROOT, uid, 'local', 'workspace.json'));
   });
@@ -182,6 +186,7 @@ describe('paths › ensureTopLevelLayout side effect', () => {
       path.join(tmpDir, 'u1', 'local', 'config'),
       path.join(tmpDir, 'u1', 'local', 'search'),
       path.join(tmpDir, 'u1', 'local', 'test'),
+      path.join(tmpDir, 'u1', 'local', 'chat_attachment_drafts'),
     ]) {
       expect(fs.existsSync(d), `expected ${d} to exist`).toBe(true);
     }

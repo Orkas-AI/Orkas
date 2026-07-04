@@ -104,6 +104,21 @@ describe('skill-registry › open tier (includeOpenSources)', () => {
     expect(text).toContain('skill_search');
   });
 
+  it('renders a user-forced global skill even when an allowlist is active', async () => {
+    writeSkill(customDir(), 'mine', 'mine', 'custom skill');
+    const globalRoot = path.join(homeDir(), '.claude', 'skills');
+    writeSkill(globalRoot, 'claude-skill', 'claude-skill', 'global skill');
+
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock({
+      allowlist: ['mine'],
+      forceOpenSkillRefs: ['claude-skill'],
+    });
+    expect(text).toContain('**mine** (Source: custom)');
+    expect(text).toContain('**claude-skill** (Source: global)');
+    expect(text).not.toContain('skill_search');
+  });
+
   it('omits the skill_search hint when open sources are not requested', async () => {
     writeSkill(customDir(), 'mine', 'mine', 'custom skill');
     const { getSystemPromptBlock } = await loadRegistry();

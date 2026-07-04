@@ -593,8 +593,10 @@ function setChatUseSelection(target, selection, opts = {}) {
   input?.focus();
 }
 
-function setChatSkill(target, name) {
-  setChatUseSelection(target, name ? { kind: 'skill', id: name, name } : null);
+function setChatSkill(target, idOrName, maybeName) {
+  const id = String(idOrName || maybeName || '').trim();
+  const name = String(maybeName || idOrName || '').trim();
+  setChatUseSelection(target, id || name ? { kind: 'skill', id: id || name, name: name || id } : null);
 }
 
 function setChatConnector(target, connectorId, connectorName) {

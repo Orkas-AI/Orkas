@@ -4861,14 +4861,14 @@ body.model-not-configured .main-content { flex-direction: column; }
   display: inline-flex;
   align-items: center;
   max-width: 100%;
-  min-height: 1.45em;
+  min-height: 1.35em;
   margin: 0 1px;
-  padding: 0 6px;
+  padding: 0 5px;
   border: 1px solid var(--border);
   border-radius: 7px;
   background: var(--surface-2);
   color: var(--text-2);
-  font-size: inherit;
+  font-size: 13px;
   font-weight: inherit;
   line-height: 1.35;
   vertical-align: 0.08em;
@@ -5250,16 +5250,28 @@ body.model-not-configured .main-content { flex-direction: column; }
 /* Video attachment — inline playable. Wider than images so controls fit;
    max-height keeps it from dominating a long bubble. */
 .chat-msg-attach.is-video {
+  box-sizing: border-box;
   padding: 4px;
   flex-direction: column;
   align-items: stretch;
-  max-width: 320px;
+  width: min(320px, 100%);
+  max-width: 100%;
+}
+.chat-msg-attach-video-shell {
+  position: relative;
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border-radius: 4px;
+  background: #000;
 }
 .chat-msg-attach-video {
   display: block;
   width: 100%;
-  max-height: 240px;
-  border-radius: 4px;
+  height: 100%;
+  border-radius: 0;
+  object-fit: contain;
   background: #000;
 }
 .chat-msg-attach.is-video .chat-msg-attach-label {
@@ -5325,12 +5337,24 @@ body.model-not-configured .main-content { flex-direction: column; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.chat-md-video-shell {
+  position: relative;
+  display: block;
+  width: min(640px, 100%);
+  max-width: 100%;
+  aspect-ratio: 16 / 9;
+  margin: 6px 0;
+  overflow: hidden;
+  border-radius: 6px;
+  background: #000;
+}
 .chat-md-video {
   display: block;
-  max-width: 100%;
-  max-height: 360px;
-  border-radius: 6px;
-  margin: 6px 0;
+  width: 100%;
+  height: 100%;
+  border-radius: 0;
+  margin: 0;
+  object-fit: contain;
   background: #000;
 }
 .chat-md-video::-webkit-media-controls-fullscreen-button,
@@ -5855,6 +5879,13 @@ body.model-not-configured .main-content { flex-direction: column; }
 /* Overflow chips stay hidden until the "+N more" toggle expands the row. */
 .chat-msg-produced .chat-msg-produced-item.is-produced-overflow {
   display: none;
+}
+.chat-msg-produced.is-expanded {
+  max-height: 168px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 2px;
+  scrollbar-gutter: stable;
 }
 .chat-msg-produced.is-expanded .chat-msg-produced-item.is-produced-overflow {
   display: inline-flex;

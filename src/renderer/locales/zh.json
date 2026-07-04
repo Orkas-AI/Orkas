@@ -193,7 +193,7 @@
   "new_chat.quick.creation": "文章写作",
   "new_chat.quick.data": "深度研究",
   "new_chat.quick.video": "制作视频",
-  "new_chat.quick.seo_geo": "SeoGeo",
+  "new_chat.quick.seo_geo": "AI/搜索曝光",
   "new_chat.quick.office": "整理文档",
   "new_chat.external_agent_entry": "接入 Codex、Claude Code 等 AI 编程工具",
   "new_chat.quick.agent_required": "需要先安装或启用「{name}」后才可使用这个入口。",

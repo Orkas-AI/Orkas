@@ -108,7 +108,7 @@ describe('group_chat router › resolveRecipients', () => {
     expect(r.to).toEqual(['commander']);
   });
 
-  it('user one-shot @<otherAgent> while handed off routes only to that agent', () => {
+  it('user explicit @<otherAgent> while handed off routes only to that agent', () => {
     const members2 = [...members, { kind: 'agent' as const, id: 'coder', joined_at: 't' }];
     const r = resolveRecipients({
       fromKind: 'user', fromId: 'user', text: '@coder quick q', members: members2,

@@ -27,16 +27,15 @@ describe('createMetacognitionTool', () => {
 
   it('omits the limit block when no limits are supplied', () => {
     const tool = createMetacognitionTool(mockHandler());
-    expect(tool.description).not.toMatch(/CONTENT LIMITS/);
+    expect(tool.description).not.toMatch(/oversize writes are rejected/);
   });
 
   it('embeds char limits in description when supplied', () => {
     const tool = createMetacognitionTool(mockHandler(), { competence: 3000, strategies: 2500 });
-    expect(tool.description).toMatch(/CONTENT LIMITS/);
+    expect(tool.description).toMatch(/Limits \(oversize writes are rejected\)/);
     expect(tool.description).toMatch(/competence: 3000 characters/);
     expect(tool.description).toMatch(/strategies: 2500 characters/);
-    expect(tool.description).toMatch(/REJECTED/);
-    expect(tool.description).toMatch(/CONDENSE/);
+    expect(tool.description).toMatch(/condensed living summaries/);
   });
 });
 

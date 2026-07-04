@@ -181,7 +181,7 @@
   "new_chat.quick.creation": "文章作成",
   "new_chat.quick.data": "深掘り調査",
   "new_chat.quick.video": "動画制作",
-  "new_chat.quick.seo_geo": "SeoGeo",
+  "new_chat.quick.seo_geo": "AI検索での露出",
   "new_chat.quick.office": "資料整理",
   "new_chat.external_agent_entry": "Codex・Claude Code など AI コーディングツールを接続",
   "new_chat.quick.agent_required": "このショートカットを使うには「{name}」をインストールまたは有効化してください。",

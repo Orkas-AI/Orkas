@@ -272,6 +272,10 @@ function editConversationRootFromRelPath(relPath: string): { kind: 'agent' | 'sk
   if (chat && safeId(chat[2])) return { kind: chat[1] as 'agent' | 'skill', id: chat[2] };
   const session = /^cloud\/sessions\/(agent|skill)-(.+)\.jsonl$/.exec(relPath);
   if (session && safeId(session[2])) return { kind: session[1] as 'agent' | 'skill', id: session[2] };
+  const sessionToolResults = /^cloud\/sessions\/(agent|skill)-(.+?)\.tool-results(?:\/|$)/.exec(relPath);
+  if (sessionToolResults && safeId(sessionToolResults[2])) {
+    return { kind: sessionToolResults[1] as 'agent' | 'skill', id: sessionToolResults[2] };
+  }
   return null;
 }
 
@@ -353,6 +357,22 @@ async function collectCloudFilesMatching(uid: string, relDir: string, predicate:
     .filter(isSafeCloudRelPath);
 }
 
+async function collectCloudFilesUnderMatchingDirs(uid: string, relDir: string, predicate: (name: string) => boolean): Promise<string[]> {
+  const safeRelDir = relDir.replace(/\/+$/, '');
+  if (!isSafeCloudRelPath(`${safeRelDir}/__probe__`)) return [];
+  let entries: fs.Dirent[] = [];
+  try {
+    const abs = resolveCloudRelPath(userCloudRoot(uid), safeRelDir);
+    entries = await fsp.readdir(abs, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const batches = await Promise.all(entries
+    .filter((entry) => entry.isDirectory() && predicate(entry.name))
+    .map((entry) => collectCloudFilesUnder(uid, `${safeRelDir}/${entry.name}`)));
+  return batches.flat();
+}
+
 export async function collectCloudEntryFiles(uid: string, relPath: string): Promise<string[]> {
   if (!isSafeCloudRelPath(relPath)) return [];
   try {
@@ -390,10 +410,16 @@ async function expandRecycleRelPaths(uid: string, relPaths: string[]): Promise<s
     }
     const commanderSession = `cloud/sessions/gconv-${cid}.jsonl`;
     if ((await collectCloudEntryFiles(uid, commanderSession)).length) out.add(commanderSession);
+    for (const relPath of await collectCloudFilesUnder(uid, `cloud/sessions/gconv-${cid}.tool-results`)) out.add(relPath);
     for (const relPath of await collectCloudFilesMatching(
       uid,
       'cloud/sessions',
       (name) => name.startsWith(`gmember-${cid}-`) && name.endsWith('.jsonl'),
+    )) out.add(relPath);
+    for (const relPath of await collectCloudFilesUnderMatchingDirs(
+      uid,
+      'cloud/sessions',
+      (name) => name.startsWith(`gmember-${cid}-`) && name.endsWith('.tool-results'),
     )) out.add(relPath);
   }
   for (const pid of projectIds) {
@@ -1599,6 +1625,7 @@ export async function createAppRecycleBatchForAgent(
     `cloud/agents/${agentId}`,
     `cloud/chats/agent/${agentId}`,
     `cloud/sessions/agent-${agentId}.jsonl`,
+    `cloud/sessions/agent-${agentId}.tool-results`,
   ]);
   return createAppRecycleBatch(uid, Array.from(rels), { kind: 'agent' });
 }
@@ -1612,6 +1639,7 @@ export async function createAppRecycleBatchForSkill(
     `cloud/skills/${skillId}`,
     `cloud/chats/skill/${skillId}`,
     `cloud/sessions/skill-${skillId}.jsonl`,
+    `cloud/sessions/skill-${skillId}.tool-results`,
   ], { kind: 'skill' });
 }
 

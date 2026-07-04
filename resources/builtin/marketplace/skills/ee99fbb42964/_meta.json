@@ -1,4 +1,5 @@
 {
-  "version": "1.0.2",
+  "version": "1.0.3",
+  "updated_at": "2026-07-04T00:00:00",
   "reseed_if_deleted_before": "2026-07-03T00:00:00Z"
 }

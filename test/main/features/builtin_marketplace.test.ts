@@ -4,14 +4,16 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+import {
+  MARKETPLACE_RESOURCE_MANIFEST_NAME,
+  marketplaceContentTreeFiles,
+  marketplaceContentTreeHash,
+} from '../../../src/main/util/marketplace-tree-hash';
+
 const postJsonMock = vi.hoisted(() => vi.fn());
-const devtoolsMock = vi.hoisted(() => ({ isDev: false }));
 
 vi.mock('../../../src/main/features/marketplace', () => ({
   postJson: postJsonMock,
-}));
-vi.mock('../../../src/main/features/devtools', () => ({
-  isDevEnv: () => devtoolsMock.isDev,
 }));
 
 let tmpDir: string;
@@ -26,7 +28,6 @@ beforeEach(() => {
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   process.env.ORKAS_BUILTIN_ROOT = path.join(tmpDir, 'builtin');
   postJsonMock.mockReset();
-  devtoolsMock.isDev = false;
   vi.resetModules();
 });
 
@@ -43,6 +44,12 @@ function writeBuiltinAgent(dir: string, agentJson: Record<string, unknown>): voi
   const root = path.join(tmpDir, 'builtin', 'marketplace', 'agents', dir);
   fs.mkdirSync(root, { recursive: true });
   fs.writeFileSync(path.join(root, 'agent.json'), JSON.stringify({ agent_id: dir, ...agentJson }, null, 2), 'utf8');
+}
+
+function writeBuiltinAgentMeta(dir: string, meta: Record<string, unknown>): void {
+  const root = path.join(tmpDir, 'builtin', 'marketplace', 'agents', dir);
+  fs.mkdirSync(root, { recursive: true });
+  fs.writeFileSync(path.join(root, '_meta.json'), JSON.stringify(meta, null, 2), 'utf8');
 }
 
 function writeBuiltinAgentSkill(agentDir: string, skillDir: string, name = skillDir): void {
@@ -65,6 +72,18 @@ function writeBuiltinSkillMeta(dir: string, meta: Record<string, unknown>): void
 
 function sha256(text: string): string {
   return crypto.createHash('sha256').update(text).digest('hex');
+}
+
+function writeResourceSeedManifest(dir: string, kind: 'agent' | 'skill', id: string): void {
+  fs.writeFileSync(path.join(dir, MARKETPLACE_RESOURCE_MANIFEST_NAME), JSON.stringify({
+    schemaVersion: 1,
+    hashAlgorithm: 'sha256-tree-v1',
+    kind,
+    id,
+    resource_hash: marketplaceContentTreeHash(dir),
+    resource_online_hash: 'online-hash',
+    files: marketplaceContentTreeFiles(dir),
+  }, null, 2), 'utf8');
 }
 
 describe('builtin marketplace seed', () => {
@@ -145,6 +164,14 @@ describe('builtin marketplace seed', () => {
     const paths = await import('../../../src/main/paths');
     const installs = await import('../../../src/main/features/marketplace_installs');
     await seed.seedBuiltinMarketplaceForUser('u1');
+    const localAgentDir = paths.userMarketplaceAgentDir('u1', TEST_AGENT_ID);
+    fs.writeFileSync(path.join(localAgentDir, 'runtime-note.txt'), 'keep me\n', 'utf8');
+    const initialMetaPath = path.join(localAgentDir, '_install.json');
+    const initialMeta = JSON.parse(fs.readFileSync(initialMetaPath, 'utf8'));
+    fs.writeFileSync(initialMetaPath, JSON.stringify({
+      ...initialMeta,
+      status: 'approved',
+    }, null, 2), 'utf8');
 
     writeBuiltinAgent(TEST_AGENT_ID, {
       agent_id: TEST_AGENT_ID,
@@ -164,9 +191,12 @@ describe('builtin marketplace seed', () => {
     const agentJson = JSON.parse(fs.readFileSync(path.join(paths.userMarketplaceAgentDir('u1', TEST_AGENT_ID), 'agent.json'), 'utf8'));
     expect(agentJson.version).toBe('1.1.0');
     expect(agentJson.workflow).toBe('Write new.');
+    expect(fs.readFileSync(path.join(localAgentDir, 'runtime-note.txt'), 'utf8')).toBe('keep me\n');
     const meta = JSON.parse(fs.readFileSync(path.join(paths.userMarketplaceAgentDir('u1', TEST_AGENT_ID), '_install.json'), 'utf8'));
     expect(meta.version).toBe('1.1.0');
     expect(meta.seed_source).toBe('builtin');
+    expect(meta.status).toBe('approved');
+    expect(meta.builtin_files).toContain('agent.json');
     const manifest = await installs.readInstalls('u1');
     expect(manifest.agents[0]).toMatchObject({
       id: TEST_AGENT_ID,
@@ -209,7 +239,122 @@ describe('builtin marketplace seed', () => {
     expect(agentJson.workflow).toBe('Write revised.');
   });
 
-  it('does not overwrite resolved marketplace agent content with packaged builtin content', async () => {
+  it('refreshes builtin agent content when the local install has no version', async () => {
+    writeBuiltinAgent(TEST_AGENT_ID, {
+      agent_id: TEST_AGENT_ID,
+      version: '1.0.0',
+      name: 'Writer',
+      description: 'Writes things',
+      category: 'general',
+      workflow: 'Write old.',
+      updated_at: '2026-01-01T00:00:00Z',
+    });
+
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const paths = await import('../../../src/main/paths');
+    await seed.seedBuiltinMarketplaceForUser('u1');
+
+    const localRoot = paths.userMarketplaceAgentDir('u1', TEST_AGENT_ID);
+    fs.writeFileSync(path.join(localRoot, 'agent.json'), JSON.stringify({
+      agent_id: TEST_AGENT_ID,
+      version: '1.0.0',
+      name: 'Writer',
+      description: 'Local stale copy',
+      category: 'general',
+      workflow: 'Write stale.',
+    }, null, 2), 'utf8');
+    const metaPath = path.join(localRoot, '_install.json');
+    const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+    delete meta.version;
+    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf8');
+
+    writeBuiltinAgent(TEST_AGENT_ID, {
+      agent_id: TEST_AGENT_ID,
+      version: '1.0.0',
+      name: 'Writer',
+      description: 'Writes things',
+      category: 'general',
+      workflow: 'Write restored.',
+      updated_at: '2026-01-01T00:00:00Z',
+    });
+
+    await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toMatchObject({
+      seeded_agents: 1,
+      manifest_agents: 0,
+    });
+
+    const agentJson = JSON.parse(fs.readFileSync(path.join(localRoot, 'agent.json'), 'utf8'));
+    expect(agentJson.workflow).toBe('Write restored.');
+    const refreshedMeta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+    expect(refreshedMeta.version).toBe('1.0.0');
+  });
+
+  it('does not overwrite resolved marketplace agent content when packaged builtin is not newer', async () => {
+    writeBuiltinAgent(TEST_AGENT_ID, {
+      agent_id: TEST_AGENT_ID,
+      version: '1.0.0',
+      name: 'Writer',
+      description: 'Writes things',
+      category: 'general',
+      workflow: 'Write bundled.',
+      updated_at: '2026-01-01T00:00:00Z',
+    });
+
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const paths = await import('../../../src/main/paths');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    await seed.seedBuiltinMarketplaceForUser('u1');
+    const localUpdatedAt = Date.parse('2026-01-05T00:00:00Z');
+    await installs.addAgentInstall('u1', {
+      id: TEST_AGENT_ID,
+      version: '1.0.0',
+      published_at: localUpdatedAt,
+      agent_json_url: 'https://cdn.test/writer.json',
+      agent_skills_bundle_url: '',
+      create_uid: '0',
+      default_install: true,
+    });
+    const officialAgentJson = JSON.stringify({
+      agent_id: TEST_AGENT_ID,
+      version: '1.0.0',
+      name: 'Writer',
+      description: 'Official copy',
+      category: 'general',
+      workflow: 'Write official.',
+    }, null, 2);
+    const localAgentDir = paths.userMarketplaceAgentDir('u1', TEST_AGENT_ID);
+    fs.writeFileSync(path.join(localAgentDir, 'agent.json'), officialAgentJson, 'utf8');
+    fs.writeFileSync(path.join(localAgentDir, '_install.json'), JSON.stringify({
+      version: '1.0.0',
+      published_at: localUpdatedAt,
+      agent_json_url: 'https://cdn.test/writer.json',
+      agent_skills_bundle_url: '',
+      installed_at: 12,
+      create_uid: '0',
+      default_install: true,
+      content_sha: sha256(officialAgentJson),
+    }, null, 2), 'utf8');
+
+    writeBuiltinAgent(TEST_AGENT_ID, {
+      agent_id: TEST_AGENT_ID,
+      version: '1.0.0',
+      name: 'Writer',
+      description: 'Bundled same-version copy',
+      category: 'general',
+      workflow: 'Write bundled same version.',
+      updated_at: '2026-01-04T00:00:00Z',
+    });
+
+    await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toMatchObject({
+      seeded_agents: 0,
+      manifest_agents: 0,
+    });
+
+    const agentJson = JSON.parse(fs.readFileSync(path.join(paths.userMarketplaceAgentDir('u1', TEST_AGENT_ID), 'agent.json'), 'utf8'));
+    expect(agentJson.workflow).toBe('Write official.');
+  });
+
+  it('overlays newer builtin agent content onto a lower-version marketplace install', async () => {
     writeBuiltinAgent(TEST_AGENT_ID, {
       agent_id: TEST_AGENT_ID,
       version: '1.0.0',
@@ -234,22 +379,31 @@ describe('builtin marketplace seed', () => {
       create_uid: '0',
       default_install: true,
     });
-    fs.writeFileSync(
-      path.join(paths.userMarketplaceAgentDir('u1', TEST_AGENT_ID), 'agent.json'),
-      JSON.stringify({
-        agent_id: TEST_AGENT_ID,
-        version: '1.0.0',
-        name: 'Writer',
-        description: 'Official copy',
-        category: 'general',
-        workflow: 'Write official.',
-      }, null, 2),
-      'utf8',
-    );
+    const officialAgentJson = JSON.stringify({
+      agent_id: TEST_AGENT_ID,
+      version: '1.0.0',
+      name: 'Writer',
+      description: 'Official copy',
+      category: 'general',
+      workflow: 'Write official.',
+    }, null, 2);
+    const localAgentDir = paths.userMarketplaceAgentDir('u1', TEST_AGENT_ID);
+    fs.writeFileSync(path.join(localAgentDir, 'agent.json'), officialAgentJson, 'utf8');
+    fs.writeFileSync(path.join(localAgentDir, '_install.json'), JSON.stringify({
+      version: '1.0.0',
+      published_at: 10,
+      updated_at: 10,
+      agent_json_url: 'https://cdn.test/writer.json',
+      agent_skills_bundle_url: '',
+      installed_at: 12,
+      create_uid: '0',
+      default_install: true,
+      content_sha: sha256(officialAgentJson),
+    }, null, 2), 'utf8');
 
     writeBuiltinAgent(TEST_AGENT_ID, {
       agent_id: TEST_AGENT_ID,
-      version: '9.0.0',
+      version: '1.1.0',
       name: 'Writer',
       description: 'Bundled newer copy',
       category: 'general',
@@ -258,17 +412,99 @@ describe('builtin marketplace seed', () => {
     });
 
     await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toMatchObject({
-      seeded_agents: 0,
+      seeded_agents: 1,
       manifest_agents: 0,
     });
 
-    const agentJson = JSON.parse(fs.readFileSync(path.join(paths.userMarketplaceAgentDir('u1', TEST_AGENT_ID), 'agent.json'), 'utf8'));
-    expect(agentJson.workflow).toBe('Write official.');
+    const agentJson = JSON.parse(fs.readFileSync(path.join(localAgentDir, 'agent.json'), 'utf8'));
+    expect(agentJson.version).toBe('1.1.0');
+    expect(agentJson.workflow).toBe('Write bundled newer.');
+    const meta = JSON.parse(fs.readFileSync(path.join(localAgentDir, '_install.json'), 'utf8'));
+    expect(meta).toMatchObject({
+      version: '1.1.0',
+      seed_source: 'builtin',
+      agent_json_url: 'https://cdn.test/writer.json',
+    });
+  });
+
+  it('overlays newer builtin agent content even when the marketplace install was locally edited', async () => {
+    writeBuiltinAgent(TEST_AGENT_ID, {
+      agent_id: TEST_AGENT_ID,
+      version: '1.1.0',
+      name: 'Writer',
+      description: 'Bundled newer copy',
+      category: 'general',
+      workflow: 'Write bundled newer.',
+      updated_at: '2026-01-04T00:00:00Z',
+    });
+
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const paths = await import('../../../src/main/paths');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    await installs.addAgentInstall('u1', {
+      id: TEST_AGENT_ID,
+      version: '1.0.0',
+      published_at: 10,
+      updated_at: 10,
+      agent_json_url: 'https://cdn.test/writer.json',
+      agent_skills_bundle_url: '',
+      create_uid: '0',
+      default_install: true,
+    });
+
+    const originalAgentJson = JSON.stringify({
+      agent_id: TEST_AGENT_ID,
+      version: '1.0.0',
+      name: 'Writer',
+      description: 'Official copy',
+      category: 'general',
+      workflow: 'Write official.',
+    }, null, 2);
+    const editedAgentJson = JSON.stringify({
+      agent_id: TEST_AGENT_ID,
+      version: '1.0.0',
+      name: 'Writer',
+      description: 'Locally edited copy',
+      category: 'general',
+      workflow: 'Write locally edited.',
+    }, null, 2);
+    const localAgentDir = paths.userMarketplaceAgentDir('u1', TEST_AGENT_ID);
+    fs.mkdirSync(localAgentDir, { recursive: true });
+    fs.writeFileSync(path.join(localAgentDir, 'agent.json'), editedAgentJson, 'utf8');
+    fs.writeFileSync(path.join(localAgentDir, '_install.json'), JSON.stringify({
+      version: '1.0.0',
+      published_at: 10,
+      updated_at: 10,
+      agent_json_url: 'https://cdn.test/writer.json',
+      agent_skills_bundle_url: '',
+      installed_at: 12,
+      create_uid: '0',
+      default_install: true,
+      content_sha: sha256(originalAgentJson),
+    }, null, 2), 'utf8');
+
+    await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toMatchObject({
+      seeded_agents: 1,
+      manifest_agents: 0,
+    });
+
+    const agentJson = JSON.parse(fs.readFileSync(path.join(localAgentDir, 'agent.json'), 'utf8'));
+    expect(agentJson.version).toBe('1.1.0');
+    expect(agentJson.workflow).toBe('Write bundled newer.');
+    const meta = JSON.parse(fs.readFileSync(path.join(localAgentDir, '_install.json'), 'utf8'));
+    expect(meta).toMatchObject({
+      version: '1.1.0',
+      seed_source: 'builtin',
+      agent_json_url: 'https://cdn.test/writer.json',
+    });
   });
 
   it('refreshes builtin skill content without replacing local-only files', async () => {
     writeBuiltinSkill('ee99fbb42964', 'deep-research');
-    writeBuiltinSkillMeta('ee99fbb42964', { version: '1.0.1' });
+    writeBuiltinSkillMeta('ee99fbb42964', {
+      version: '1.0.1',
+      updated_at: '2026-01-01T00:00:00Z',
+    });
 
     const seed = await import('../../../src/main/features/builtin_marketplace');
     const paths = await import('../../../src/main/paths');
@@ -280,6 +516,10 @@ describe('builtin marketplace seed', () => {
     const builtinRoot = path.join(tmpDir, 'builtin', 'marketplace', 'skills', 'ee99fbb42964');
     fs.mkdirSync(path.join(builtinRoot, 'scripts'), { recursive: true });
     fs.writeFileSync(path.join(builtinRoot, 'scripts', 'guard.py'), 'print("ok")\n', 'utf8');
+    writeBuiltinSkillMeta('ee99fbb42964', {
+      version: '1.0.1',
+      updated_at: '2026-01-02T00:00:00Z',
+    });
 
     await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toMatchObject({
       seeded_skills: 1,
@@ -291,14 +531,98 @@ describe('builtin marketplace seed', () => {
     const meta = JSON.parse(fs.readFileSync(path.join(localRoot, '_install.json'), 'utf8'));
     expect(meta.seed_source).toBe('builtin');
     expect(meta.version).toBe('1.0.1');
+    expect(meta.updated_at).toBe(Date.parse('2026-01-02T00:00:00Z'));
     expect(meta.content_tree_hash).toEqual(expect.any(String));
     expect(meta.builtin_files).toContain('scripts/guard.py');
     const manifest = await installs.readInstalls('u1');
     expect(manifest.skills[0]).toMatchObject({
       id: 'ee99fbb42964',
       version: '1.0.1',
+      updated_at: Date.parse('2026-01-02T00:00:00Z'),
       seed_source: 'builtin',
     });
+  });
+
+  it('refreshes builtin skill seed when packaged version is newer even after local edits', async () => {
+    const skillId = 'ee99fbb42964';
+    writeBuiltinSkill(skillId, 'deep-research');
+    writeBuiltinSkillMeta(skillId, { version: '1.0.0' });
+
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const paths = await import('../../../src/main/paths');
+    await seed.seedBuiltinMarketplaceForUser('u1');
+
+    const localRoot = paths.userMarketplaceSkillDir('u1', skillId);
+    fs.writeFileSync(
+      path.join(localRoot, 'SKILL.md'),
+      '---\nname: deep-research\ndescription: edited\n---\n\nlocal edit\n',
+      'utf8',
+    );
+
+    const builtinRoot = path.join(tmpDir, 'builtin', 'marketplace', 'skills', skillId);
+    fs.writeFileSync(
+      path.join(builtinRoot, 'SKILL.md'),
+      '---\nname: deep-research\ndescription: newer\n---\n\nnew builtin body\n',
+      'utf8',
+    );
+    writeBuiltinSkillMeta(skillId, { version: '1.0.1' });
+
+    await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toMatchObject({
+      seeded_skills: 1,
+      manifest_skills: 0,
+    });
+
+    expect(fs.readFileSync(path.join(localRoot, 'SKILL.md'), 'utf8')).toBe(
+      '---\nname: deep-research\ndescription: newer\n---\n\nnew builtin body\n',
+    );
+    const meta = JSON.parse(fs.readFileSync(path.join(localRoot, '_install.json'), 'utf8'));
+    expect(meta).toMatchObject({
+      version: '1.0.1',
+      seed_source: 'builtin',
+    });
+  });
+
+  it('refreshes builtin skill content when the local install has no version', async () => {
+    const skillId = 'ee99fbb42964';
+    writeBuiltinSkill(skillId, 'deep-research');
+    writeBuiltinSkillMeta(skillId, {
+      version: '1.0.1',
+      updated_at: '2026-01-01T00:00:00Z',
+    });
+
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const paths = await import('../../../src/main/paths');
+    await seed.seedBuiltinMarketplaceForUser('u1');
+
+    const localRoot = paths.userMarketplaceSkillDir('u1', skillId);
+    fs.writeFileSync(
+      path.join(localRoot, 'SKILL.md'),
+      '---\nname: deep-research\ndescription: edited\n---\n\nlocal edit\n',
+      'utf8',
+    );
+    const metaPath = path.join(localRoot, '_install.json');
+    const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+    delete meta.version;
+    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf8');
+
+    const builtinRoot = path.join(tmpDir, 'builtin', 'marketplace', 'skills', skillId);
+    fs.writeFileSync(
+      path.join(builtinRoot, 'SKILL.md'),
+      '---\nname: deep-research\ndescription: public\n---\n\nrestored builtin body\n',
+      'utf8',
+    );
+
+    await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toMatchObject({
+      seeded_skills: 1,
+      manifest_skills: 0,
+    });
+
+    expect(fs.readFileSync(path.join(localRoot, 'SKILL.md'), 'utf8')).toBe(
+      '---\nname: deep-research\ndescription: public\n---\n\nrestored builtin body\n',
+    );
+    const refreshedMeta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+    expect(refreshedMeta.version).toBe('1.0.1');
+    expect(refreshedMeta.updated_at).toBe(Date.parse('2026-01-01T00:00:00Z'));
   });
 
   it('refreshes legacy builtin skill seeds that predate seed_source and tree hashes', async () => {
@@ -392,6 +716,87 @@ describe('builtin marketplace seed', () => {
     ]);
   });
 
+  it('re-seeds a builtin agent when packaged metadata supersedes an old uninstall tombstone', async () => {
+    const agentId = '78900d8758bc';
+    writeBuiltinAgent(agentId, {
+      version: '1.0.2',
+      name: 'DeepResearcher',
+      description: 'Research deeply',
+      category: 'data',
+      workflow: 'Research.',
+      updated_at: '2026-07-04T00:00:00Z',
+    });
+    writeBuiltinAgentMeta(agentId, {
+      reseed_if_deleted_before: '2026-07-05T00:00:00Z',
+    });
+
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const paths = await import('../../../src/main/paths');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    await installs.writeInstalls('u1', {
+      version: installs.CURRENT_VERSION,
+      agents: [],
+      skills: [],
+      _deleted_at: {
+        agents: { [agentId]: Date.parse('2026-07-04T23:59:59Z') },
+      },
+    });
+
+    await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toMatchObject({
+      seeded_agents: 1,
+      manifest_agents: 1,
+    });
+
+    const agentJson = JSON.parse(fs.readFileSync(path.join(paths.userMarketplaceAgentDir('u1', agentId), 'agent.json'), 'utf8'));
+    expect(agentJson.name).toBe('DeepResearcher');
+    const manifest = await installs.readInstalls('u1');
+    expect(manifest._deleted_at?.agents?.[agentId]).toBeUndefined();
+    expect(manifest.agents).toEqual([
+      expect.objectContaining({
+        id: agentId,
+        version: '1.0.2',
+        seed_source: 'builtin',
+      }),
+    ]);
+  });
+
+  it('keeps a newer builtin agent uninstall tombstone respected', async () => {
+    const agentId = '78900d8758bc';
+    writeBuiltinAgent(agentId, {
+      version: '1.0.2',
+      name: 'DeepResearcher',
+      description: 'Research deeply',
+      category: 'data',
+      workflow: 'Research.',
+      updated_at: '2026-07-04T00:00:00Z',
+    });
+    writeBuiltinAgentMeta(agentId, {
+      reseed_if_deleted_before: '2026-07-05T00:00:00Z',
+    });
+
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const paths = await import('../../../src/main/paths');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    await installs.writeInstalls('u1', {
+      version: installs.CURRENT_VERSION,
+      agents: [],
+      skills: [],
+      _deleted_at: {
+        agents: { [agentId]: Date.parse('2026-07-05T00:00:00Z') },
+      },
+    });
+
+    await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toMatchObject({
+      seeded_agents: 0,
+      manifest_agents: 0,
+    });
+
+    expect(fs.existsSync(path.join(paths.userMarketplaceAgentDir('u1', agentId), 'agent.json'))).toBe(false);
+    const manifest = await installs.readInstalls('u1');
+    expect(manifest._deleted_at?.agents?.[agentId]).toEqual(Date.parse('2026-07-05T00:00:00Z'));
+    expect(manifest.agents).toEqual([]);
+  });
+
   it('keeps a newer builtin skill uninstall tombstone respected', async () => {
     const skillId = 'ee99fbb42964';
     writeBuiltinSkill(skillId, 'deep-research');
@@ -421,6 +826,240 @@ describe('builtin marketplace seed', () => {
     const manifest = await installs.readInstalls('u1');
     expect(manifest._deleted_at?.skills?.[skillId]).toEqual(Date.parse('2026-07-03T00:00:00Z'));
     expect(manifest.skills).toEqual([]);
+  });
+
+  it('overlays newer builtin skill content onto a lower-version marketplace install', async () => {
+    const skillId = 'ee99fbb42964';
+    writeBuiltinSkill(skillId, 'deep-research');
+    const builtinRoot = path.join(tmpDir, 'builtin', 'marketplace', 'skills', skillId);
+    writeBuiltinSkillMeta(skillId, { version: '1.0.1' });
+    fs.mkdirSync(path.join(builtinRoot, 'scripts'), { recursive: true });
+    fs.writeFileSync(path.join(builtinRoot, 'scripts', 'guard.py'), 'print("ok")\n', 'utf8');
+
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const paths = await import('../../../src/main/paths');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    const localRoot = paths.userMarketplaceSkillDir('u1', skillId);
+    fs.mkdirSync(localRoot, { recursive: true });
+    const oldSkill = '---\nname: deep-research\ndescription: old\n---\n\nold body\n';
+    fs.writeFileSync(path.join(localRoot, 'SKILL.md'), oldSkill, 'utf8');
+    fs.writeFileSync(path.join(localRoot, 'runtime-note.txt'), 'keep me\n', 'utf8');
+    fs.writeFileSync(path.join(localRoot, '_install.json'), JSON.stringify({
+      version: '1.0.0',
+      published_at: 10,
+      updated_at: 11,
+      bundle_url: 'https://cdn.test/deep-research.zip',
+      installed_at: 12,
+      create_uid: '0',
+      default_install: false,
+      status: 'approved',
+      content_sha: sha256(oldSkill),
+    }, null, 2), 'utf8');
+    await installs.addSkillInstall('u1', {
+      id: skillId,
+      version: '1.0.0',
+      published_at: 10,
+      updated_at: 11,
+      bundle_url: 'https://cdn.test/deep-research.zip',
+      installed_at: 12,
+      create_uid: '0',
+      default_install: false,
+      status: 'approved',
+    });
+
+    await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toMatchObject({
+      seeded_skills: 1,
+      manifest_skills: 0,
+    });
+
+    expect(fs.readFileSync(path.join(localRoot, 'runtime-note.txt'), 'utf8')).toBe('keep me\n');
+    expect(fs.existsSync(path.join(localRoot, 'scripts', 'guard.py'))).toBe(true);
+    const localMeta = JSON.parse(fs.readFileSync(path.join(localRoot, '_install.json'), 'utf8'));
+    expect(localMeta).toMatchObject({
+      version: '1.0.1',
+      published_at: 10,
+      updated_at: 11,
+      bundle_url: 'https://cdn.test/deep-research.zip',
+      installed_at: 12,
+      create_uid: '0',
+      default_install: false,
+      status: 'approved',
+      seed_source: 'builtin',
+    });
+    expect(localMeta.content_sha).toEqual(expect.any(String));
+    expect(localMeta.content_tree_hash).toEqual(expect.any(String));
+    expect(localMeta.builtin_files).toContain('scripts/guard.py');
+
+    const manifest = await installs.readInstalls('u1');
+    expect(manifest.skills).toEqual([
+      expect.objectContaining({
+        id: skillId,
+        version: '1.0.0',
+        bundle_url: 'https://cdn.test/deep-research.zip',
+      }),
+    ]);
+    expect((manifest.skills[0] as any).seed_source).toBeUndefined();
+
+    const users = await import('../../../src/main/features/users');
+    users.activateUser('u1');
+    const skills = await import('../../../src/main/features/skills');
+    expect((await skills.listSkills()).find((s) => s.id === skillId)?.version).toBe('1.0.1');
+  });
+
+  it('does not hand off a resource-owned marketplace skill when packaged builtin is not newer', async () => {
+    const skillId = '9be6fda271a5';
+    writeBuiltinSkill(skillId, 'material-organizer');
+    writeBuiltinSkillMeta(skillId, { version: '1.0.1' });
+
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const paths = await import('../../../src/main/paths');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    const localRoot = paths.userMarketplaceSkillDir('u1', skillId);
+    fs.mkdirSync(localRoot, { recursive: true });
+    const skillBody = '---\nname: material-organizer\ndescription: public\n---\n\npublic body\n';
+    fs.writeFileSync(path.join(localRoot, 'SKILL.md'), skillBody, 'utf8');
+    writeResourceSeedManifest(localRoot, 'skill', skillId);
+    fs.writeFileSync(path.join(localRoot, '_install.json'), JSON.stringify({
+      version: '1.0.1',
+      published_at: 10,
+      updated_at: 11,
+      bundle_url: 'https://cdn.test/material-organizer.zip',
+      installed_at: 12,
+      create_uid: '0',
+      default_install: false,
+      status: 'approved',
+      content_sha: sha256(skillBody),
+      seed_source: 'resource',
+    }, null, 2), 'utf8');
+    await installs.addSkillInstall('u1', {
+      id: skillId,
+      version: '1.0.0',
+      published_at: 10,
+      updated_at: 11,
+      bundle_url: 'https://cdn.test/material-organizer.zip',
+      installed_at: 12,
+      create_uid: '0',
+      default_install: false,
+      status: 'approved',
+    });
+
+    await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toMatchObject({
+      seeded_skills: 0,
+      manifest_skills: 0,
+    });
+
+    expect(fs.readFileSync(path.join(localRoot, 'SKILL.md'), 'utf8')).toBe(skillBody);
+    expect(fs.existsSync(path.join(localRoot, MARKETPLACE_RESOURCE_MANIFEST_NAME))).toBe(true);
+    const localMeta = JSON.parse(fs.readFileSync(path.join(localRoot, '_install.json'), 'utf8'));
+    expect(localMeta).toMatchObject({
+      version: '1.0.1',
+      bundle_url: 'https://cdn.test/material-organizer.zip',
+      seed_source: 'resource',
+    });
+    const manifest = await installs.readInstalls('u1');
+    expect(manifest.skills[0]).toMatchObject({
+      id: skillId,
+      version: '1.0.0',
+      bundle_url: 'https://cdn.test/material-organizer.zip',
+    });
+    expect((manifest.skills[0] as any).seed_source).toBeUndefined();
+  });
+
+  it('overlays newer builtin skill over a resource-owned marketplace skill even after local edits', async () => {
+    const skillId = '6743aa0797a2';
+    writeBuiltinSkill(skillId, 'brand-research');
+    writeBuiltinSkillMeta(skillId, { version: '1.0.2' });
+
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const paths = await import('../../../src/main/paths');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    const localRoot = paths.userMarketplaceSkillDir('u1', skillId);
+    fs.mkdirSync(localRoot, { recursive: true });
+    const originalSkill = '---\nname: brand-research\ndescription: public\n---\n\npublic body\n';
+    const editedSkill = '---\nname: brand-research\ndescription: edited\n---\n\nlocal edit\n';
+    fs.writeFileSync(path.join(localRoot, 'SKILL.md'), originalSkill, 'utf8');
+    writeResourceSeedManifest(localRoot, 'skill', skillId);
+    fs.writeFileSync(path.join(localRoot, 'SKILL.md'), editedSkill, 'utf8');
+    fs.writeFileSync(path.join(localRoot, '_install.json'), JSON.stringify({
+      version: '1.0.1',
+      published_at: 10,
+      updated_at: 11,
+      bundle_url: 'https://cdn.test/brand-research.zip',
+      installed_at: 12,
+      create_uid: '0',
+      content_sha: sha256(originalSkill),
+      seed_source: 'resource',
+    }, null, 2), 'utf8');
+    await installs.addSkillInstall('u1', {
+      id: skillId,
+      version: '1.0.0',
+      published_at: 10,
+      updated_at: 11,
+      bundle_url: 'https://cdn.test/brand-research.zip',
+      installed_at: 12,
+      create_uid: '0',
+    });
+
+    await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toMatchObject({
+      seeded_skills: 1,
+      manifest_skills: 0,
+    });
+
+    expect(fs.readFileSync(path.join(localRoot, 'SKILL.md'), 'utf8')).toBe(originalSkill);
+    const localMeta = JSON.parse(fs.readFileSync(path.join(localRoot, '_install.json'), 'utf8'));
+    expect(localMeta).toMatchObject({
+      version: '1.0.2',
+      seed_source: 'builtin',
+      bundle_url: 'https://cdn.test/brand-research.zip',
+    });
+    expect(fs.existsSync(path.join(localRoot, MARKETPLACE_RESOURCE_MANIFEST_NAME))).toBe(false);
+  });
+
+  it('overlays newer builtin skill content even when the marketplace install was locally edited', async () => {
+    const skillId = 'ee99fbb42964';
+    writeBuiltinSkill(skillId, 'deep-research');
+    const builtinRoot = path.join(tmpDir, 'builtin', 'marketplace', 'skills', skillId);
+    writeBuiltinSkillMeta(skillId, { version: '1.0.1' });
+
+    const seed = await import('../../../src/main/features/builtin_marketplace');
+    const paths = await import('../../../src/main/paths');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    const localRoot = paths.userMarketplaceSkillDir('u1', skillId);
+    fs.mkdirSync(localRoot, { recursive: true });
+    const originalSkill = '---\nname: deep-research\ndescription: old\n---\n\nold body\n';
+    const editedSkill = '---\nname: deep-research\ndescription: edited\n---\n\nlocal edit\n';
+    fs.writeFileSync(path.join(localRoot, 'SKILL.md'), editedSkill, 'utf8');
+    fs.writeFileSync(path.join(localRoot, '_install.json'), JSON.stringify({
+      version: '1.0.0',
+      published_at: 10,
+      updated_at: 11,
+      bundle_url: 'https://cdn.test/deep-research.zip',
+      installed_at: 12,
+      create_uid: '0',
+      content_sha: sha256(originalSkill),
+    }, null, 2), 'utf8');
+    await installs.addSkillInstall('u1', {
+      id: skillId,
+      version: '1.0.0',
+      published_at: 10,
+      updated_at: 11,
+      bundle_url: 'https://cdn.test/deep-research.zip',
+      installed_at: 12,
+      create_uid: '0',
+    });
+
+    await expect(seed.seedBuiltinMarketplaceForUser('u1')).resolves.toMatchObject({
+      seeded_skills: 1,
+      manifest_skills: 0,
+    });
+
+    expect(fs.readFileSync(path.join(localRoot, 'SKILL.md'), 'utf8')).toBe('---\nname: deep-research\ndescription: public\n---\n\npublic body\n');
+    const localMeta = JSON.parse(fs.readFileSync(path.join(localRoot, '_install.json'), 'utf8'));
+    expect(localMeta).toMatchObject({
+      version: '1.0.1',
+      seed_source: 'builtin',
+      bundle_url: 'https://cdn.test/deep-research.zip',
+    });
   });
 
   it('resolves builtin skill seed rows to official marketplace rows by exact id', async () => {

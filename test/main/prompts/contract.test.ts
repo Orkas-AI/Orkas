@@ -151,13 +151,12 @@ describe('prompts ↔ code contract', () => {
     const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
     const memoryTool = readFile('src/core-agent/src/tools/memory-tool.ts');
 
-    expect(memoryTool).toContain('Three scopes (default "agent")');
-    expect(memoryTool).toContain('"agent" (DEFAULT): YOUR OWN durable agent memory');
-    expect(memoryTool).toContain('"shared": durable facts that EVERY agent should know');
-    expect(memoryTool).toContain('"user": the user\'s global profile/preferences');
-    expect(memoryTool).toContain('LANGUAGE:');
-    expect(memoryTool).toContain('current UI/response language');
-    expect(memoryTool).toContain('Preserve proper nouns, commands, file paths');
+    expect(memoryTool).toContain('- agent (default):');
+    expect(memoryTool).toContain('- shared: stable project/environment facts every agent should know');
+    expect(memoryTool).toContain('- user: stable user-wide profile/preferences every agent should know');
+    expect(memoryTool).toContain('Write in the user\'s current language');
+    expect(memoryTool).toContain('preserving code, paths, commands, URLs');
+    expect(memoryTool).toContain('exact quoted wording');
 
     expect(agentPrompt).toContain('`target: "agent"` = your own agent memory');
     expect(agentPrompt).toContain('`target: "user"` = global user profile/preferences');

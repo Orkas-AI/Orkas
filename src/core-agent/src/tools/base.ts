@@ -70,9 +70,62 @@ export interface AgentTool {
 export function toToolDefinition(tool: AgentTool): ToolDefinition {
   return {
     name: tool.name,
-    description: tool.description,
-    inputSchema: tool.inputSchema,
+    description: compactDescription(tool.description, 480),
+    inputSchema: compactSchema(tool.inputSchema),
   };
+}
+
+const SCHEMA_DESCRIPTION_MAX_CHARS = 220;
+const DROPPED_SCHEMA_KEYS = new Set([
+  "$comment",
+  "$schema",
+  "example",
+  "examples",
+  "markdownDescription",
+]);
+
+function compactSchema(value: Record<string, unknown>): Record<string, unknown> {
+  const compacted = compactSchemaValue(value);
+  return isRecord(compacted) ? compacted : value;
+}
+
+function compactSchemaValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(compactSchemaValue);
+  if (!isRecord(value)) return value;
+
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (DROPPED_SCHEMA_KEYS.has(key)) continue;
+    if (key === "description" && typeof entry === "string") {
+      out[key] = compactDescription(entry, SCHEMA_DESCRIPTION_MAX_CHARS);
+    } else {
+      out[key] = compactSchemaValue(entry);
+    }
+  }
+  return out;
+}
+
+function compactDescription(text: string, maxChars: number): string {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxChars) return normalized;
+
+  const sentenceCut = findSentenceBoundary(normalized, maxChars);
+  const cut = sentenceCut > Math.floor(maxChars * 0.55) ? sentenceCut : maxChars;
+  return `${normalized.slice(0, cut).trimEnd()}...`;
+}
+
+function findSentenceBoundary(text: string, before: number): number {
+  for (let i = Math.min(before, text.length - 1); i >= 0; i--) {
+    const ch = text[i];
+    if (ch === "." || ch === "!" || ch === "?" || ch === ";" || ch === "\u3002" || ch === "\uff01" || ch === "\uff1f") {
+      return i + 1;
+    }
+  }
+  return -1;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
 /** Helper to define a tool inline. */

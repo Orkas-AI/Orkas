@@ -7,7 +7,7 @@ import {
   getToolsSystemPromptBlock,
   isToolVisibleToAgent,
 } from '../../../../src/main/model/core-agent/tool-catalog';
-import { getBuiltinTools } from '../../../../src/core-agent/src/tools';
+import { getBuiltinTools, toToolDefinition, type AgentTool } from '../../../../src/core-agent/src/tools';
 import { createCrossSessionMemoryTool } from '../../../../src/core-agent/src/tools/memory-tool';
 import { createMetacognitionTool } from '../../../../src/core-agent/src/tools/metacognition-tool';
 import { createLocalTools, createFileTools } from '../../../../src/main/model/core-agent/local-tools';
@@ -17,9 +17,13 @@ import { createImageGenTool } from '../../../../src/main/model/core-agent/image-
 import { createOfficeTools } from '../../../../src/main/model/core-agent/office-tools';
 
 const DEEP_RESEARCH_SKILL_ID = 'ee99fbb42964';
+const TOOL_DESCRIPTION_REVIEW_CHARS = 900;
+const PARAM_DESCRIPTION_REVIEW_CHARS = 280;
+const SOURCE_DESCRIPTION_BUDGET_EXCEPTIONS = new Set([
+  'generate_image:/inputSchema/properties/output_path',
+]);
 
 const RERANK_OWNER_AGENT_RESOURCES = [
-  { id: 'b6ddc5e6b432', name: '深度研究', kind: 'builtin', hasDeepResearchSkill: true },
   { id: '78900d8758bc', name: 'DeepResearcher', kind: 'builtin', hasDeepResearchSkill: true },
   { id: '5dd962efb425', name: 'KnowledgeManager', kind: 'resource', hasDeepResearchSkill: false },
   { id: '17c0a2e95df3', name: 'SocialResearcher', kind: 'resource', hasDeepResearchSkill: true },
@@ -47,37 +51,45 @@ function agentJsonPath(spec: typeof RERANK_OWNER_AGENT_RESOURCES[number]): strin
  * Avoid buildRunner here because that pulls in auth / session / network; call
  * the same factories runner.ts uses to assemble allTools.
  */
-function enumerateAllInjectedToolNames(): Set<string> {
-  const names = new Set<string>();
+function enumerateAllInjectedTools(): AgentTool[] {
+  const tools: AgentTool[] = [];
 
   // core-agent builtins (always merged into AgentRunner's tool map)
-  for (const t of getBuiltinTools()) names.add(t.name);
+  tools.push(...getBuiltinTools());
 
   // injected (memory + metacognition)
-  names.add(
+  tools.push(
     createCrossSessionMemoryTool({
-      add: async () => {},
-      replace: async () => {},
-      remove: async () => {},
-      list: async () => '',
-    }).name,
+      add: () => ({ ok: true, entries: [], usage: { current: 0, limit: 1 } }),
+      replace: () => ({ ok: true, entries: [], usage: { current: 0, limit: 1 } }),
+      remove: () => ({ ok: true, entries: [], usage: { current: 0, limit: 1 } }),
+      list: () => ({ ok: true, entries: [], usage: { current: 0, limit: 1 } }),
+    }),
   );
-  names.add(
+  tools.push(
     createMetacognitionTool({
-      read: async () => '',
-      write: async () => {},
-    }).name,
+      read: () => ({ ok: true, content: '', usage: { current: 0, limit: 1 } }),
+      write: () => ({ ok: true, usage: { current: 0, limit: 1 } }),
+    }),
   );
 
   // local + file + kb + image gen.
   // Pass cid + onArtifactCreated so `create_artifact` is included — runner.ts
   // wires both through for group-chat turns (see local-tools.createLocalTools).
-  for (const t of createLocalTools({ userId: 'testuid', cid: 'testcid', onArtifactCreated: () => {} })) names.add(t.name);
-  for (const t of createFileTools({ userId: 'testuid', cid: 'testcid' })) names.add(t.name);
-  for (const t of createKbTools({ userId: 'testuid' })) names.add(t.name);
-  for (const t of createChatHistoryTools({ userId: 'testuid' })) names.add(t.name);
-  names.add(createImageGenTool({ userId: 'testuid', cid: 'testcid' }).name);
-  for (const t of createOfficeTools({ userId: 'testuid', cid: 'testcid' })) names.add(t.name);
+  tools.push(...createLocalTools({ userId: 'testuid', cid: 'testcid', onArtifactCreated: () => {} }));
+  tools.push(...createFileTools({ userId: 'testuid', cid: 'testcid' }));
+  tools.push(...createKbTools({ userId: 'testuid' }));
+  tools.push(...createChatHistoryTools({ userId: 'testuid' }));
+  tools.push(createImageGenTool({ userId: 'testuid', cid: 'testcid' }));
+  tools.push(...createOfficeTools({ userId: 'testuid', cid: 'testcid' }));
+
+  const byName = new Map<string, AgentTool>();
+  for (const tool of tools) byName.set(tool.name, tool);
+  return [...byName.values()];
+}
+
+function enumerateAllInjectedToolNames(): Set<string> {
+  const names = new Set(enumerateAllInjectedTools().map((t) => t.name));
 
   // Connector umbrella meta-tools: two fixed tools, only injected when ≥1 connector is visible
   // to the actor. Asserting presence in the catalog independent of runtime visibility — calling
@@ -88,6 +100,62 @@ function enumerateAllInjectedToolNames(): Set<string> {
   names.add('call_connector_tool');
 
   return names;
+}
+
+function walkSchemaDescriptions(
+  schema: unknown,
+  visit: (path: string, description: string) => void,
+  path = '/inputSchema',
+): void {
+  if (!schema || typeof schema !== 'object') return;
+  if (Array.isArray(schema)) {
+    schema.forEach((item, index) => walkSchemaDescriptions(item, visit, `${path}/${index}`));
+    return;
+  }
+  const obj = schema as Record<string, unknown>;
+  if (typeof obj.description === 'string') visit(path, obj.description);
+  for (const [key, value] of Object.entries(obj)) {
+    if (key === 'description') continue;
+    walkSchemaDescriptions(value, visit, `${path}/${escapePointerSegment(key)}`);
+  }
+}
+
+function descriptionAtPath(schema: unknown, path: string): string | undefined {
+  const parts = path
+    .replace(/^\/inputSchema/, '')
+    .split('/')
+    .filter(Boolean);
+  let cursor: unknown = schema;
+  for (const part of parts) {
+    const key = unescapePointerSegment(part);
+    if (Array.isArray(cursor)) {
+      cursor = cursor[Number(key)];
+    } else {
+      cursor = (cursor as Record<string, unknown>)?.[key];
+    }
+  }
+  return typeof (cursor as Record<string, unknown> | undefined)?.description === 'string'
+    ? ((cursor as Record<string, unknown>).description as string)
+    : undefined;
+}
+
+function escapePointerSegment(value: string): string {
+  return value.replace(/~/g, '~0').replace(/\//g, '~1');
+}
+
+function unescapePointerSegment(value: string): string {
+  return value.replace(/~1/g, '/').replace(/~0/g, '~');
+}
+
+function providerGuidanceText(tool: AgentTool): string {
+  const def = toToolDefinition(tool);
+  return `${def.description}\n${JSON.stringify(def.inputSchema)}`.toLowerCase();
+}
+
+function toolByName(name: string): AgentTool {
+  const tool = enumerateAllInjectedTools().find((t) => t.name === name);
+  if (!tool) throw new Error(`tool not enumerated: ${name}`);
+  return tool;
 }
 
 describe('tool-catalog', () => {
@@ -101,6 +169,68 @@ describe('tool-catalog', () => {
   it('TOOL_CATALOG has no duplicate names', () => {
     const names = TOOL_CATALOG.map((e) => e.name);
     expect(names.length).toBe(new Set(names).size);
+  });
+
+  it('provider tool definition compaction preserves existing parameter descriptions', () => {
+    const lost: string[] = [];
+    for (const tool of enumerateAllInjectedTools()) {
+      const def = toToolDefinition(tool);
+      walkSchemaDescriptions(tool.inputSchema, (path, description) => {
+        if (!description.trim()) return;
+        const compacted = descriptionAtPath(def.inputSchema, path);
+        if (!compacted?.trim()) lost.push(`${tool.name}:${path}`);
+      });
+      expect(def.description.length, `${tool.name} provider description budget`).toBeLessThanOrEqual(480);
+    }
+    expect(lost).toEqual([]);
+  });
+
+  it('source tool descriptions stay under the review budget', () => {
+    const overBudget: string[] = [];
+    for (const tool of enumerateAllInjectedTools()) {
+      if (tool.description.length > TOOL_DESCRIPTION_REVIEW_CHARS) {
+        overBudget.push(`${tool.name}:description=${tool.description.length}`);
+      }
+      walkSchemaDescriptions(tool.inputSchema, (path, description) => {
+        const key = `${tool.name}:${path}`;
+        if (description.length > PARAM_DESCRIPTION_REVIEW_CHARS && !SOURCE_DESCRIPTION_BUDGET_EXCEPTIONS.has(key)) {
+          overBudget.push(`${tool.name}:${path}.description=${description.length}`);
+        }
+      });
+    }
+    expect(
+      overBudget,
+      `Tool descriptions above ${TOOL_DESCRIPTION_REVIEW_CHARS} chars or parameter descriptions above ${PARAM_DESCRIPTION_REVIEW_CHARS} chars need explicit review before landing.`,
+    ).toEqual([]);
+  });
+
+  it('critical tools keep enough provider-visible guidance to choose and call them', () => {
+    const checks: Record<string, string[]> = {
+      read_file: ['read', 'charstart', 'charend', 'stat_file'],
+      stat_file: ['total_chars', 'before', 'read_file'],
+      search_files: ['path is unknown', 'substring', 'glob'],
+      grep_files: ['pattern', 'glob', 'output_mode'],
+      write_file: ['write', 'path', 'content'],
+      edit_file: ['old_string', 'new_string', 'unique', 'e_stale'],
+      create_artifact: ['interactive', 'files', 'path', 'content', 'index.html'],
+      delete_file: ['confirmation', 'confirmation_token', 'path'],
+      interactive_cli_start: ['live user stdin', 'command', 'purpose'],
+      generate_image: ['generate', 'image', 'prompt', 'output_path', 'reference'],
+      create_docx: ['paragraphs', 'tables', 'images', 'path'],
+      create_xlsx: ['rows', 'sheets', 'formula', 'path'],
+      create_pptx: ['slides', 'shapes', 'images', 'path'],
+      cross_session_memory: ['remember', 'agent', 'shared', 'user', 'add', 'replace', 'remove', 'list'],
+      metacognition: ['competence', 'strategies', 'read', 'write'],
+    };
+
+    const missing: string[] = [];
+    for (const [name, needles] of Object.entries(checks)) {
+      const text = providerGuidanceText(toolByName(name));
+      for (const needle of needles) {
+        if (!text.includes(needle)) missing.push(`${name}:${needle}`);
+      }
+    }
+    expect(missing).toEqual([]);
   });
 
   it('empty names input returns an empty block', () => {
@@ -152,7 +282,7 @@ describe('tool-catalog', () => {
 describe('isToolVisibleToAgent (ownerAgent gate)', () => {
   it('un-owned catalog tools are visible to every actor', () => {
     expect(isToolVisibleToAgent('read_file', '')).toBe(true);
-    expect(isToolVisibleToAgent('generate_image', 'video-studio')).toBe(true);
+    expect(isToolVisibleToAgent('generate_image', 'image-studio')).toBe(true);
     expect(isToolVisibleToAgent('generate_image', 'anything')).toBe(true);
   });
 
@@ -187,7 +317,7 @@ describe('isToolVisibleToAgent (ownerAgent gate)', () => {
       }
       checked.push(spec.id);
     }
-    expect(checked).toEqual(['b6ddc5e6b432', '78900d8758bc']);
+    expect(checked).toEqual(['78900d8758bc']);
   });
 
   it('an array ownerAgent still hides the tool from the commander and non-owners', () => {

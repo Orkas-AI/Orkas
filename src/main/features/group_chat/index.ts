@@ -75,7 +75,7 @@ export async function runtimeStatus(
  *  if subscribe runs after send, those first events are lost. */
 export const subscribeBus = subscribe;
 
-import type { GroupMessage } from './visibility';
+import type { ChatUseSelection, GroupMessage } from './visibility';
 import {
   type ChatFormPayload, encodeSubmission, buildMention,
 } from './router';
@@ -96,12 +96,13 @@ export interface SendInput {
   text: string;
   model_text?: string;
   attachments?: string[];
+  use_selections?: ChatUseSelection[];
 }
 
 export async function send(
   input: SendInput,
 ): Promise<{ ok: boolean; msg?: GroupMessage; error?: string }> {
-  const { userId, cid, text, model_text, attachments } = input;
+  const { userId, cid, text, model_text, attachments, use_selections } = input;
   if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
   if (!text || !text.trim()) return { ok: false, error: 'empty message' };
   await seedReservedActors(userId, cid);
@@ -124,6 +125,7 @@ export async function send(
       text,
       ...(model_text && model_text.trim() ? { model_text } : {}),
       ...(attachments && attachments.length ? { attachments: [...attachments] } : {}),
+      ...(use_selections && use_selections.length ? { use_selections } : {}),
     });
     return { ok: true, msg };
   } catch (err) {

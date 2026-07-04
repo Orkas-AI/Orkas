@@ -1883,17 +1883,7 @@ function createInteractiveCliStartTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'interactive_cli_start',
     description:
-      'Start a local CLI command as a live interactive session with persistent stdin/stdout. ' +
-      'The model decides per command: use this instead of bash for any local CLI, built-in or external, ' +
-      'when the command is expected to wait for live stdin from the user, such as OAuth login, ' +
-      'verification/device codes, password prompts, yes/no confirmations, setup wizards, or other interactive prompts. ' +
-      'Set `purpose` to a short user-facing phrase that explains what the user is being asked to do, for example "Authorize Google Workspace access". ' +
-      'For OAuth login commands, prefer the browser/callback flow and do not pass --no-browser or --no-launch-browser unless the user explicitly says a browser flow is unavailable. ' +
-      'Do not use this for discovery, validation, --help, install checks, commands that merely print errors, or any command expected to finish without user input; use bash for those. ' +
-      'Do not ask the user to paste authorization codes, passwords, tokens, or other secrets into chat. ' +
-      'When user input is needed, tell the user to enter it in the Orkas interactive CLI panel; that input goes directly to the CLI and is not part of chat history. ' +
-      'For ordinary one-shot commands that do not need later stdin, use bash instead. ' +
-      'The session is pipe-backed, not a full terminal TTY, so avoid curses/full-screen TUI programs.',
+      'Start a local CLI command that needs live user stdin, such as OAuth/device-code login, password prompts, confirmations, or setup wizards. Use bash for one-shot commands, --help, validation, and installs. Tell users to enter secrets/codes in the interactive CLI panel, not chat. Avoid full-screen TUI programs.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2070,13 +2060,7 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'write_file',
     description:
-      'Write content to a file. Use this for workspace artefacts the user wants to keep ' +
-      '(notes, source code, markdown, CSV, etc.). Creates parent directories as needed. ' +
-      'If the target path already exists and was not written by you earlier in this turn, ' +
-      'the basename is automatically suffixed (`-2 / -3 / ...`) to avoid clobbering, and ' +
-      'the rename is surfaced in a `<file-renamed>` block in the tool result. Always read ' +
-      'that block (when present) and use the saved path verbatim in any subsequent read or ' +
-      'message to the user.',
+      'Write a kept workspace artifact such as source, notes, markdown, or CSV. Creates parents. On collision with a file not written by you this turn, the basename is auto-suffixed and reported in <file-renamed>; use that final path afterward.',
     inputSchema: coreWriteFileTool.inputSchema,
     async execute(input, ctx) {
       if (!getLocalExecGranted()) return deniedResult();
@@ -2129,23 +2113,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'edit_file',
     description:
-      'Replace `old_string` with `new_string` inside an existing text file. ' +
-      'Cheaper and safer than rewriting the whole file via `write_file`; the rest of the file is preserved verbatim.\n' +
-      '\n' +
-      'Parameters:\n' +
-      '  path        — required. Absolute or workspace-relative path. The file MUST already exist.\n' +
-      '  old_string  — required. Exact text to find. Must be unique in the file unless `replace_all=true`.\n' +
-      '  new_string  — required. Replacement text. May be empty (deletes `old_string`).\n' +
-      '  replace_all — optional, default false. When true, every occurrence of `old_string` is replaced.\n' +
-      '\n' +
-      'How to use:\n' +
-      '  - Prefer this over `write_file` for targeted edits to existing files.\n' +
-      '  - Read the file with `read_file` first so `old_string` matches its current contents. `read_file` shows each line as `<n>\\t<text>` — `old_string` must be the raw text WITHOUT that line-number+tab prefix. On `E_STALE` the file changed since you read it (e.g. another worker) — `read_file` it again, then redo the edit.\n' +
-      '  - To CREATE a new file, use `write_file` instead — `edit_file` does not create files.\n' +
-      '  - Make `old_string` long enough to be unique. On `E_MULTIPLE_MATCHES`, expand `old_string` with surrounding context, or set `replace_all=true` if every occurrence should change.\n' +
-      '  - Cannot edit pdf / Office / image files in place (text from those is extracted, not the source). Use `write_file` if you really need to overwrite the binary.\n' +
-      '\n' +
-      'Permission: requires local execution permission (same gate as `write_file` / `bash`).',
+      'Replace old_string with new_string in an existing text file. Prefer this for targeted edits; use write_file to create files. old_string must match raw file text (not read_file line-number prefixes) and be unique unless replace_all=true. On E_STALE, reread then retry. Cannot edit PDF/Office/image sources in place.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2411,25 +2379,7 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'create_artifact',
     description:
-      'Build a small interactive app (self-contained HTML/CSS/JS) that is rendered LIVE and clickable inside this chat reply, embedded in a sandboxed iframe.\n' +
-      '\n' +
-      'Use it for: interactive dashboards, calculators, data visualizations with filters or drill-down, configurators, simulators, quizzes, mini-games — anything the user should operate directly. For static/read-only KPI, table, timeline, alert, or simple chart summaries, prefer `:::dashboard`. Do NOT use it for static documents (use `html_to_pdf`) or images (use `generate_image`).\n' +
-      '\n' +
-      'Input: `{ title?, files: [{ path, content, encoding? }, ...] }`\n' +
-      '  - `files` MUST include a top-level `index.html` (the entry point). Up to 20 files, 256 KB per file, 1 MB total.\n' +
-      '  - `path` is a forward-slash relative path (e.g. `index.html`, `assets/app.js`). No `..`, no leading `/`, no dotfiles, no `__orkas/...`.\n' +
-      '  - Allowed extensions: text — `.html .htm .js .mjs .css .json .svg .xml .txt .csv`; binary (base64 only) — `.png .jpg .jpeg .gif .webp .ico .wasm .woff .woff2 .ttf .otf`.\n' +
-      '  - `content` is UTF-8 text by default; for a binary extension set `"encoding":"base64"` and pass base64 bytes.\n' +
-      '\n' +
-      'Constraints: the app runs OFFLINE — no network, no external CDN. Inline your CSS/JS or split into sibling files referenced by RELATIVE URL. The iframe is sandboxed (scripts + forms allowed; it cannot reach the host app).\n' +
-      '\n' +
-      'To get what the user does back: the app sends a message to its parent —\n' +
-      '  `parent.postMessage({ __orkasArtifact: true, type: "submit", payload: <json-serialisable value> }, "*")`\n' +
-      'and that arrives as the user\'s next message to you (a readable summary plus a machine tag). Optionally include `<script src="__orkas/bridge.js"></script>` to get `window.orkasArtifact.send(payload)` plus automatic iframe height — without the bridge the iframe is a fixed height (call `window.orkasArtifact.resize(px)` or post `{type:"resize",height:px}` to change it).\n' +
-      '\n' +
-      'After calling this tool, do NOT also paste the artifact\'s HTML in your reply — it is already shown.\n' +
-      '\n' +
-      'Permission: requires local execution permission (same gate as `write_file` / `html_to_pdf`).',
+      'Create an offline interactive HTML/CSS/JS artifact rendered live in chat. Use for calculators, dashboards, filters, simulations, quizzes, mini-games; prefer :::dashboard for static summaries. Input files: [{path, content, encoding?}], including top-level index.html; no network/CDN, use relative sibling files. Optional __orkas/bridge.js provides send(payload)/resize. Do not paste HTML after calling.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2541,24 +2491,7 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'delete_file',
     description:
-      'Delete a single file from disk via a two-step user-confirmed flow.\n' +
-      '\n' +
-      'Sandbox is identical to `edit_file` (workspace + current attachment ' +
-      'dir + writable extraRoots). Use instead of `bash rm` — `bash` is ' +
-      'unaware of the sandbox + the confirm gate.\n' +
-      '\n' +
-      'Flow:\n' +
-      '  Step 1 — `delete_file({path})` (no token). Tool emits an inline ' +
-      'confirm card to the user and returns `requires_user_confirmation: ' +
-      'true` with a `confirmation_token`. Multiple Step 1 calls from the ' +
-      'same turn may be grouped into one user-facing card. The tool does NOT block. Tell ' +
-      'the user in prose what you intend to delete; do NOT retry with ' +
-      'the token in the same turn — wait for the user to click the card ' +
-      'and reply, then retry on the next turn.\n' +
-      '  Step 2 — `delete_file({path, confirmation_token})`. Tool checks ' +
-      'the token state: granted → unlink + return success; pending → user ' +
-      "hasn't clicked yet, stop and wait; denied → user declined, give up; " +
-      'invalid → token expired or path changed, call Step 1 again.',
+      'Delete one visible file through a two-step user confirmation flow. First call with path only to show a confirm card and get confirmation_token; do not retry in the same turn. After the user confirms, call again with path and token. Use this instead of bash rm.',
     inputSchema: {
       type: 'object',
       properties: {

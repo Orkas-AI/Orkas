@@ -3538,7 +3538,7 @@ async function _triggerPickerItem(kind, itemId, itemName, anchorId, dataset) {
   if (kind === 'skill') {
     _agentsTrackClick('chat_skill_select', { target, skill_id: String(itemId || itemName || '') });
     _consumeAtKeyChar();
-    setChatSkill(target, itemName || itemId);
+    setChatSkill(target, itemId, itemName || itemId);
     const inputId = target === 'new-chat' ? 'new-chat-input' : (target === 'project' ? 'project-chat-input' : 'chat-input');
     _focusInput(document.getElementById(inputId));
     return;

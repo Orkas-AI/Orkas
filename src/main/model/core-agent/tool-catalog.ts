@@ -71,13 +71,12 @@ export interface ToolCatalogEntry {
  */
 /**
  * Agent ids that share the deep-research engine, so its `research_rerank` tool
- * is visible to all of them: the in-repo Deep Research front-door plus the
- * hosted data/research agents that can hand work into the research flow —
+ * is visible to the platform DeepResearcher and hosted data/research agents
+ * that can hand work into the research flow:
  * DeepResearcher / KnowledgeManager / SocialResearcher / BrandResearcher.
  * Referenced by opaque marketplace id (as skill_list does), not by name.
  */
 export const DEEP_RESEARCH_AGENT_IDS = [
-  'b6ddc5e6b432', // DeepResearch
   '78900d8758bc', // DeepResearcher
   '5dd962efb425', // KnowledgeManager
   '17c0a2e95df3', // SocialResearcher

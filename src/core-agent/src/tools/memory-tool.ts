@@ -37,39 +37,18 @@ export interface MemoryToolHandler {
   };
 }
 
-const TOOL_DESCRIPTION = `Manage your persistent cross-session memory. This memory survives across conversations.
+const TOOL_DESCRIPTION = `Manage durable cross-session memory.
 
-Three scopes (default "agent"):
-- "agent" (DEFAULT): YOUR OWN durable agent memory — preferences for how this agent should work, task-domain conventions, reusable lessons, and facts/decisions specific to what you do. Other agents do NOT see these, and you do NOT see theirs. Use this for most saves in a specific-agent conversation.
-- "shared": durable facts that EVERY agent should know — project/environment facts, cross-cutting decisions, repo layout, shared conventions. Use sparingly because it lands in every agent's context.
-- "user": the user's global profile/preferences — identity, role, expertise, broad preferences, communication style, or tech stack that should follow the user across every agent.
+Targets:
+- agent (default): this agent's private lessons, workflow preferences, recurring task facts, and corrections.
+- shared: stable project/environment facts every agent should know. Use sparingly.
+- user: stable user-wide profile/preferences every agent should know.
 
-TARGET ROUTING:
-- If the user says "remember this", "note this", or corrects how YOU should work while talking to a specific agent, use target "agent" unless they clearly say it should apply globally.
-- Use target "user" only for stable user-wide preferences/profile facts every agent should know: identity, broad preferences, communication style, expertise, or tech stack.
-- Use target "shared" only for stable non-user facts every agent should know: project/environment facts, shared decisions, shared conventions, or repo/workspace facts.
-- Never put agent-specific lessons, output preferences, workflow corrections, or task-domain conventions into target "user" or "shared".
+Use when the user asks to remember something, gives a durable correction/preference, or states a future-relevant fact. Do not save trivia, raw dumps/logs, rediscoverable facts, one-off task state, plans, progress, or temporary debug notes.
 
-LANGUAGE:
-- Write new or replaced entries in the user's current UI/response language.
-- If the remembered fact was stated in another language, translate/summarize it into the current UI/response language before saving.
-- Preserve proper nouns, commands, file paths, code identifiers, URLs, and quoted user wording when exact text matters.
+Routing: agent-specific lessons -> agent; user identity/style/preferences -> user; repo/project conventions -> shared. Write in the user's current language while preserving code, paths, commands, URLs, and exact quoted wording when needed.
 
-WHEN TO SAVE:
-- User explicitly says "remember this" or "note that"
-- User corrections or preferences (highest priority)
-- Durable decisions or milestones that will still matter in future conversations (NOT the current task's working decisions)
-- User's role, expertise, or global communication preferences (→ target "user")
-- Stable project conventions or environment facts (→ target "shared")
-- This agent's reusable working preferences, recurring task facts, output corrections, or domain lessons (→ target "agent")
-
-WHEN TO SKIP:
-- Trivial or obvious information
-- Easily re-discoverable facts
-- Raw data dumps, code blocks, or logs
-- Session-specific ephemera or the current task's state: temporary debug info, one-off questions, and your plan / progress / status this session — what you are doing, have done, or still need to do (e.g. "X is updated, but Y still needs checking"). Memory is for durable facts about the user and project, not work-in-progress.
-
-Actions: "add" (append new entry), "replace" (update existing by substring match), "remove" (delete by substring match), "list" (view current entries).`;
+Actions: add, replace (by old_text substring), remove (by old_text substring), list.`;
 
 export function createCrossSessionMemoryTool(handler: MemoryToolHandler): AgentTool {
   return {

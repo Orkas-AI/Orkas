@@ -38,7 +38,7 @@ import * as path from 'node:path';
 import { userSessionsDir, userLocalSessionsDir } from '../paths';
 import { createLogger } from '../logger';
 import { listConversations } from './chats';
-import { isEphemeralSessionId } from '../model/core-agent/session-store';
+import { isEphemeralSessionId, toolResultsDirForSession } from '../model/core-agent/session-store';
 
 const log = createLogger('sessions-sweep');
 
@@ -124,6 +124,7 @@ async function sweepCloud(userId: string, result: SweepResult): Promise<void> {
     if (!reason) continue;
     try {
       await fsp.unlink(path.join(dir, name));
+      await fsp.rm(toolResultsDirForSession(userId, sid), { recursive: true, force: true });
       result[reason]++;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
@@ -153,6 +154,8 @@ async function sweepLocalByAge(userId: string, result: SweepResult, now: number)
     if (now - st.mtimeMs <= EPHEMERAL_AGE_MS) continue;
     try {
       await fsp.unlink(full);
+      const sid = name.slice(0, -'.jsonl'.length);
+      await fsp.rm(toolResultsDirForSession(userId, sid), { recursive: true, force: true });
       result.local_aged_out++;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {

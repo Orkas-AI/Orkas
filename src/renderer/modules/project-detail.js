@@ -1788,7 +1788,11 @@ async function _submitProjectChat() {
   }
   if (btn) btn.disabled = false;
   if (typeof sendInCurrentConversation === 'function') {
-    await sendInCurrentConversation(content, _adopted.length ? { attachments: _adopted } : undefined);
+    const extra = {
+      ...(_adopted.length ? { attachments: _adopted } : {}),
+      ...(useSelections.length ? { use_selections: useSelections } : {}),
+    };
+    await sendInCurrentConversation(content, Object.keys(extra).length ? extra : undefined);
   }
 }
 

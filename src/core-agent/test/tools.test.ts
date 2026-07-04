@@ -58,6 +58,48 @@ describe("Tools", () => {
         inputSchema: { type: "object" },
       });
     });
+
+    it("compacts descriptions without changing schema semantics", () => {
+      const longDescription = "Use this tool carefully. " + "detail ".repeat(120);
+      const tool = defineTool({
+        name: "schema_tool",
+        description: longDescription,
+        inputSchema: {
+          $schema: "https://json-schema.org/draft/2020-12/schema",
+          type: "object",
+          required: ["mode"],
+          properties: {
+            mode: {
+              type: "string",
+              enum: ["fast", "safe"],
+              description: "Choose execution mode. " + "extra ".repeat(80),
+              examples: ["fast"],
+            },
+            count: { type: "number", minimum: 1, maximum: 10 },
+          },
+          examples: [{ mode: "fast" }],
+        },
+        async execute() {
+          return { content: "" };
+        },
+      });
+
+      const def = toToolDefinition(tool);
+      expect(def.description.length).toBeLessThan(longDescription.length);
+      expect(def.inputSchema).toMatchObject({
+        type: "object",
+        required: ["mode"],
+        properties: {
+          mode: { type: "string", enum: ["fast", "safe"] },
+          count: { type: "number", minimum: 1, maximum: 10 },
+        },
+      });
+      expect(def.inputSchema).not.toHaveProperty("$schema");
+      expect(def.inputSchema).not.toHaveProperty("examples");
+      const modeSchema = (def.inputSchema.properties as Record<string, Record<string, unknown>>).mode;
+      expect(modeSchema.description).toEqual(expect.stringContaining("Choose execution mode."));
+      expect(modeSchema).not.toHaveProperty("examples");
+    });
   });
 
   describe("getBuiltinTools", () => {

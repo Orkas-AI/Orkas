@@ -7,13 +7,14 @@
 import { describe, it, expect } from 'vitest';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const viewer = require('../../src/renderer/modules/chat-file-viewer.js');
-const { _kindOf, _extOf, _chatMediaLocalUrl, _viewerAbsPathFromChatMediaLocalUrl, _viewerCanAddToLibrary, _viewerVideoPlaybackOptions } = viewer as {
+const { _kindOf, _extOf, _chatMediaLocalUrl, _viewerAbsPathFromChatMediaLocalUrl, _viewerCanAddToLibrary, _viewerVideoPlaybackOptions, _viewerVideoSeekTarget } = viewer as {
   _kindOf: (name: string) => string;
   _extOf: (name: string) => string;
   _chatMediaLocalUrl: (abs: string) => string;
   _viewerAbsPathFromChatMediaLocalUrl: (src: string) => string;
   _viewerCanAddToLibrary: (nameOrKind: string) => boolean;
-  _viewerVideoPlaybackOptions: (opts?: { autoplay?: boolean; startTime?: number }) => { autoplay: boolean; startTime: number };
+  _viewerVideoPlaybackOptions: (opts?: { autoplay?: boolean; startTime?: number; duration?: number; ended?: boolean }) => { autoplay: boolean; startTime: number };
+  _viewerVideoSeekTarget: (startTime: number, duration?: number) => number;
 };
 
 describe('chat-file-viewer › _kindOf', () => {
@@ -149,5 +150,27 @@ describe('chat-file-viewer › _viewerVideoPlaybackOptions', () => {
   it('normalizes missing or invalid playback options', () => {
     expect(_viewerVideoPlaybackOptions()).toEqual({ autoplay: false, startTime: 0 });
     expect(_viewerVideoPlaybackOptions({ autoplay: false, startTime: -1 })).toEqual({ autoplay: false, startTime: 0 });
+  });
+
+  it('replays from the beginning when the source video has ended', () => {
+    expect(_viewerVideoPlaybackOptions({ autoplay: true, startTime: 9.5, duration: 10, ended: true })).toEqual({ autoplay: true, startTime: 0 });
+  });
+
+  it('replays from the beginning when the source position is at the end', () => {
+    expect(_viewerVideoPlaybackOptions({ autoplay: true, startTime: 9.9, duration: 10 })).toEqual({ autoplay: true, startTime: 0 });
+  });
+
+  it('keeps mid-video resume positions', () => {
+    expect(_viewerVideoPlaybackOptions({ autoplay: true, startTime: 5, duration: 10 })).toEqual({ autoplay: true, startTime: 5 });
+  });
+});
+
+describe('chat-file-viewer › _viewerVideoSeekTarget', () => {
+  it('seeks to the beginning when metadata reveals an end position', () => {
+    expect(_viewerVideoSeekTarget(9.9, 10)).toBe(0);
+  });
+
+  it('keeps a safe in-range mid-video seek target', () => {
+    expect(_viewerVideoSeekTarget(4.25, 10)).toBe(4.25);
   });
 });

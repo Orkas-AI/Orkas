@@ -32,7 +32,7 @@ import { t } from '../../i18n';
 // tool-catalog.ts: TOOL_CATALOG kept as the source of truth for the drift
 // test (tool-catalog.test.ts asserts injected names ⊆ catalog) and for any
 // future targeted use; runtime no longer renders the prompt block from it.
-import { getSession, memoryScopeForSession } from './session-store';
+import { getSession, memoryScopeForSession, toolResultsDirForSession } from './session-store';
 import {
   addEntry,
   replaceEntry,
@@ -54,7 +54,6 @@ import { createResearchRerankTool } from './research-rerank-tool';
 import { isToolVisibleToAgent } from './tool-catalog';
 import { createWebSearchOverrideTool } from './search-tools';
 import {
-  sessionToolResultsDir,
   agentEvolvedSkillsDir,
   agentPrivateSkillsDir,
   userMarketplaceAgentSkillsDir,
@@ -186,6 +185,9 @@ export interface BuildRunnerParams {
    *  agents in projects retain access to their own evolved skills. See
    *  CLAUDE.md §6 + `features/projects.ts::resolveProjectScope`. */
   projectAllowedSkillIds?: readonly string[];
+  /** User-explicit skill refs selected in the composer. These are rendered
+   *  even when they live in open/global skill roots that are normally lazy. */
+  forceOpenSkillRefs?: readonly string[];
   /** Extra tools added to core-agent's builtins (e.g. group_chat commander
    * gets dispatch tools (`run_worker` / `dispatch_to`) plus marketplace /
    * skill-search / automation-listing tools). */
@@ -384,6 +386,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       ...(params.onSkillAdvertised ? { onSkillAdvertised: params.onSkillAdvertised } : {}),
       displayNameById: skillDisplayNameById,
       ...(openSkillSourcesVisible ? { includeOpenSources: true } : {}),
+      ...(params.forceOpenSkillRefs?.length ? { forceOpenSkillRefs: [...params.forceOpenSkillRefs] } : {}),
     }),
   ]);
 
@@ -446,7 +449,11 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // overrides `bash` and `write_file` with the permission-gated versions.
   const systemSkillReadRoots = uid ? [userSystemSkillsDir(uid)] : [];
   const agentPrivateSkillReadRoots = uid && agentId
-    ? [userMarketplaceAgentSkillsDir(uid, agentId), agentPrivateSkillsDir(uid, agentId)]
+    ? [
+      userMarketplaceAgentSkillsDir(uid, agentId),
+      agentPrivateSkillsDir(uid, agentId),
+      agentEvolvedSkillsDir(uid, agentId),
+    ]
     : [];
   const fileReadOnlyExtraRoots = [
     ...(params.fileReadOnlyExtraRoots || []),
@@ -488,7 +495,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         ...(params.projectId ? { projectId: params.projectId } : {}),
         ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
         ...(fileReadOnlyExtraRoots.length || params.sessionId
-          ? { readOnlyExtraRoots: [...fileReadOnlyExtraRoots, sessionToolResultsDir(uid, params.sessionId)] }
+          ? { readOnlyExtraRoots: [...fileReadOnlyExtraRoots, toolResultsDirForSession(uid, params.sessionId)] }
           : {}),
         ...(params.onSkillInvoked ? { onSkillInvoked: params.onSkillInvoked } : {}),
       })
@@ -625,13 +632,14 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // >100K read spills + stays re-pageable via charStart/charEnd); a tool still
   // exempts itself only by an Infinity entry in MAX_RESULT_CHARS_BY_TOOL.
   // `uid` being empty happens in ad-hoc test scenarios; skip wrapping there —
-  // no sessionToolResultsDir to resolve and no LLM in the loop that would
+  // no per-session tool-results dir to resolve and no LLM in the loop that would
   // over-feed context anyway.
+  const toolResultsDir = uid ? toolResultsDirForSession(uid, params.sessionId) : '';
   const wrappedTools = uid
     ? visibleTools.map((t) =>
         wrapToolWithCap(t, {
           maxChars: MAX_RESULT_CHARS_BY_TOOL[t.name] ?? DEFAULT_MAX_RESULT_CHARS,
-          toolResultsDir: sessionToolResultsDir(uid, params.sessionId),
+          toolResultsDir,
         }),
       )
     : visibleTools;
@@ -641,7 +649,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // our wrappedTools via last-write-wins. Used by the snapshot below and by
   // the catalog-drift test (`tool-catalog.test.ts`); we no longer render a
   // `## Available tools` block into the system prompt because the model
-  // already receives every tool's full description + JSON schema via the
+  // already receives every tool's compact description + JSON schema via the
   // SDK tool-use protocol — the prompt block was an information subset
   // duplicating ~800 chars per call without giving the model anything new.
   const builtinTools = mod.getBuiltinTools();
@@ -656,21 +664,20 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // tracks where each definition came from so the debug panel can call out
   // injected vs. caller-supplied tools.
   const toolDefMap = new Map<string, ToolDefSnapshot>();
+  const snapshotTool = (t: AgentTool, source: ToolDefSnapshot['source']): ToolDefSnapshot => {
+    const def = mod.toToolDefinition(t);
+    return {
+      name: def.name,
+      description: def.description,
+      inputSchema: def.inputSchema,
+      source,
+    };
+  };
   for (const t of builtinTools) {
-    toolDefMap.set(t.name, {
-      name: t.name,
-      description: t.description,
-      inputSchema: t.inputSchema,
-      source: 'core-agent',
-    });
+    toolDefMap.set(t.name, snapshotTool(t, 'core-agent'));
   }
   for (const t of wrappedTools) {
-    toolDefMap.set(t.name, {
-      name: t.name,
-      description: t.description,
-      inputSchema: t.inputSchema,
-      source: extraToolNameSet.has(t.name) ? 'extra' : 'orkas',
-    });
+    toolDefMap.set(t.name, snapshotTool(t, extraToolNameSet.has(t.name) ? 'extra' : 'orkas'));
   }
   const toolDefs: ToolDefSnapshot[] = Array.from(toolDefMap.values())
     .sort((a, b) => a.name.localeCompare(b.name));

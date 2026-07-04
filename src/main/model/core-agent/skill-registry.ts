@@ -42,6 +42,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import {
+  agentEvolvedSkillsDir,
   agentPrivateSkillsDir,
   userMarketplaceAgentSkillsDir,
   userMarketplaceSkillsDir,
@@ -435,6 +436,25 @@ function _buildDisplayNameByInternalId(specs: SkillAllowlistRef[]): Map<string, 
   return out;
 }
 
+function orderSkillsByRefs<T extends SkillAllowlistRef>(specs: T[], refs: string[]): T[] {
+  if (specs.length < 2 || !refs.length) return specs;
+  const order = new Map<string, number>();
+  for (const ref of refs) {
+    const key = String(ref || '').trim().toLowerCase();
+    if (!key || order.has(key)) continue;
+    order.set(key, order.size);
+  }
+  if (!order.size) return specs;
+  return specs
+    .map((s, idx) => {
+      const keys = [s.id, s.name].map((v) => String(v || '').trim().toLowerCase()).filter(Boolean);
+      const rank = Math.min(...keys.map((k) => order.get(k) ?? Number.POSITIVE_INFINITY));
+      return { s, idx, rank };
+    })
+    .sort((a, b) => (a.rank - b.rank) || (a.idx - b.idx))
+    .map((row) => row.s);
+}
+
 function _buildDisplayNameByRef(specs: SkillAllowlistRef[]): Map<string, string> {
   const out = new Map<string, string>();
   for (const s of specs || []) {
@@ -723,6 +743,13 @@ export interface SystemPromptBlockOptions {
    * Mirrors the agent-private tool `ownerAgent` default-deny gate.
    */
   agentId?: string;
+  /**
+   * User-explicit skills selected from the composer/picker in addition to an
+   * agent's default allowlist. This is primarily for open/global skills, which
+   * stay lazy by default but must become visible when the user explicitly asks
+   * an agent to use one.
+   */
+  forceOpenSkillRefs?: string[];
 }
 
 /**
@@ -730,10 +757,10 @@ export interface SystemPromptBlockOptions {
  * system prompt so the LLM knows what's available. Empty string when
  * no skills are found (core-agent treats `""` as "skip the section").
  *
- * When `opts.allowlist` is provided, only skills whose `id` is in the
- * allowlist are rendered. Rendering always goes through
- * `renderSkillLines` so the `Source` label is derived from the exact root
- * path rather than basename.
+ * When `opts.allowlist` is provided, trusted skills are restricted to that
+ * list, then the acting agent's private skills and user-forced open skills
+ * are appended. Rendering always goes through `renderSkillLines` so the
+ * `Source` label is derived from the exact root path rather than basename.
  */
 export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}): Promise<string> {
   const loader = await getLoader();
@@ -755,17 +782,19 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
 
   let rendered: typeof specs;
   let allowlisted = false;
-  let explicitAllow: Set<string> | null = null;
+  let rawAllow: string[] = [];
   if (opts.allowlist === undefined) {
     rendered = filterDisabled(specs);
   } else {
     allowlisted = true;
-    const rawAllow = opts.allowlist.filter((id) => typeof id === 'string' && id.length > 0);
-    if (rawAllow.length === 0) return '';
-    const { ids } = resolveSkillAllowlistRefs(specs, rawAllow);
-    const allow = new Set([...ids, ...rawAllow]);
-    explicitAllow = allow;
-    rendered = filterDisabled(specs.filter((s) => allow.has(s.id)));
+    rawAllow = opts.allowlist.filter((id) => typeof id === 'string' && id.length > 0);
+    if (rawAllow.length === 0) {
+      rendered = [];
+    } else {
+      const { ids } = resolveSkillAllowlistRefs(specs, rawAllow);
+      const allow = new Set([...ids, ...rawAllow]);
+      rendered = filterDisabled(specs.filter((s) => allow.has(s.id)));
+    }
   }
 
   const actorAgentId = (opts.agentId || '').trim();
@@ -775,7 +804,6 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
     for (const { root, specs: privateList } of await loadAgentPrivateSkillSpecs(uid, actorAgentId)) {
       const privateSpecs = filterDisabled(privateList)
         .filter((s) => !s.ownerAgent || s.ownerAgent === actorAgentId)
-        .filter((s) => !explicitAllow || explicitAllow.has(s.id))
         .filter((s) => !existingIds.has(s.id));
       if (!privateSpecs.length) continue;
       rootEntries.push({ label: privateIndex === 0 ? 'agent' : `agent${privateIndex + 1}`, root });
@@ -793,23 +821,27 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
   // packages (so it won't try to re-install something already present).
   // Allowlisted render paths stay trusted-only. Agent metadata has its own
   // trusted+external helper, and still excludes the unbounded global tier.
-  const externalRootSet = new Set<string>();
-  let externalRankByRoot: Map<string, number> | null = null;
+  const openRootSet = new Set<string>();
+  const openRankByRoot = new Map<string, number>();
+  const addPromptRoot = (label: string, root: string) => {
+    const resolved = path.resolve(root);
+    if (rootEntries.some((r) => r.label === label && path.resolve(r.root) === resolved)) return;
+    rootEntries.push({ label, root: resolved });
+  };
   if (opts.includeOpenSources && !allowlisted) {
     const openDirs = _computeOpenTierDirs(uid);
     if (openDirs.external.length) {
       const openLoader = await getOpenLoader(openDirs);
       if (openLoader) {
-        externalRankByRoot = new Map();
         openDirs.external.forEach((dir, i) => {
           const resolved = path.resolve(dir);
-          externalRootSet.add(resolved);
-          externalRankByRoot!.set(resolved, SOURCE_DEDUPE_RANK.external);
-          rootEntries.push({ label: i === 0 ? 'external' : `external${i + 1}`, root: resolved });
+          openRootSet.add(resolved);
+          openRankByRoot.set(resolved, SOURCE_DEDUPE_RANK.external);
+          addPromptRoot(i === 0 ? 'external' : `external${i + 1}`, resolved);
         });
         const trustedIds = new Set(rendered.map((s) => s.id));
         const externalSpecs = openLoader.list().filter((s) => {
-          if (!externalRootSet.has(path.resolve(s.source))) return false;
+          if (!openRootSet.has(path.resolve(s.source))) return false;
           if (trustedIds.has(s.id)) return false;
           if (disabled && disabled.has(s.id)) return false;
           // Registry-backed only: drops a companion whose package was removed
@@ -822,13 +854,55 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
     }
   }
 
+  const forcedOpenRefs = (opts.forceOpenSkillRefs || [])
+    .filter((id) => typeof id === 'string' && id.length > 0);
+  if (forcedOpenRefs.length) {
+    const openDirs = _computeOpenTierDirs(uid);
+    const openLoader = await getOpenLoader(openDirs);
+    if (openLoader) {
+      const externalRoots = openDirs.external.map((d) => path.resolve(d));
+      const globalRoots = openDirs.global.map((d) => path.resolve(d));
+      const externalSet = new Set(externalRoots);
+      const globalSet = new Set(globalRoots);
+      const openSpecs = openLoader.list().filter((s) => {
+        const root = path.resolve(s.source);
+        if (!externalSet.has(root) && !globalSet.has(root)) return false;
+        if (disabled && disabled.has(s.id)) return false;
+        if (externalSet.has(root)) {
+          const meta = packageMetaForSkillDir(uid, s.dir);
+          if (!meta.package_name || meta.package_enabled === false) return false;
+        }
+        return true;
+      });
+      const { ids } = resolveSkillAllowlistRefs(openSpecs, forcedOpenRefs);
+      const allow = new Set([...ids, ...forcedOpenRefs]);
+      const existingIds = new Set(rendered.map((s) => s.id));
+      const forcedSpecs = openSpecs.filter((s) => allow.has(s.id) && !existingIds.has(s.id));
+      for (const s of forcedSpecs) {
+        const root = path.resolve(s.source);
+        const externalIdx = externalRoots.indexOf(root);
+        const globalIdx = globalRoots.indexOf(root);
+        if (externalIdx >= 0) {
+          openRootSet.add(root);
+          openRankByRoot.set(root, SOURCE_DEDUPE_RANK.external);
+          addPromptRoot(externalIdx === 0 ? 'external' : `external${externalIdx + 1}`, root);
+        } else if (globalIdx >= 0) {
+          openRootSet.add(root);
+          openRankByRoot.set(root, SOURCE_DEDUPE_RANK.global);
+          addPromptRoot(globalIdx === 0 ? 'global' : `global${globalIdx + 1}`, root);
+        }
+      }
+      rendered = [...rendered, ...forcedSpecs];
+    }
+  }
+
   // Dedupe by display name; product/platform shadows custom/open tiers
   // (builtin > platform > custom > external > global). When external is merged
   // we pass a root-aware rank so the external roots map to their tier rank;
   // otherwise the default rank applies.
-  rendered = externalRankByRoot
+  rendered = openRankByRoot.size
     ? dedupeSkillsByDisplayName(rendered, (s) => {
-      const r = externalRankByRoot!.get(path.resolve(s.source || ''));
+      const r = openRankByRoot.get(path.resolve(s.source || ''));
       return r !== undefined ? r : skillSourceRank(s);
     })
     : dedupeSkillsByDisplayName(rendered);
@@ -840,14 +914,20 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
   // same-name shared one for a non-owner. (Mirrors agent-private tool gating.)
   rendered = rendered.filter((s) => !s.ownerAgent || s.ownerAgent === actorAgentId);
 
+  if (allowlisted) {
+    rendered = orderSkillsByRefs(rendered, [...rawAllow, ...forcedOpenRefs]);
+  }
+
   // Advertise signal stays trusted-only (`A.custom` / `A.platform`); external
   // entries are rendered but not advertised — their invocation is still
   // attributed downstream via `onSkillInvoked` (B tier).
   if (opts.onSkillAdvertised && rendered.length) {
     for (const s of rendered) {
-      if (externalRootSet.has(path.resolve(s.source || ''))) continue;
+      if (openRootSet.has(path.resolve(s.source || ''))) continue;
+      const label = skillSourceLabelForSpec(s);
+      if (label === 'unknown') continue;
       try {
-        opts.onSkillAdvertised(s.id, skillSourceLabelForSpec(s) === 'custom' ? 'A.custom' : 'A.platform');
+        opts.onSkillAdvertised(s.id, label === 'custom' ? 'A.custom' : 'A.platform');
       } catch { /* callback throws are non-fatal; signal emission is best-effort */ }
     }
   }
@@ -1040,6 +1120,43 @@ export async function listSkills(): Promise<Array<{ id: string; name: string; de
   const lang = descriptionLang(getLanguage());
   const pick = await getPickDescription();
   return loader.list().map((s) => ({ id: s.id, name: s.name, description: pick(s, lang) }));
+}
+
+function scanSkillIds(root: string): string[] {
+  try {
+    if (!fs.statSync(root).isDirectory()) return [];
+    return fs.readdirSync(root, { withFileTypes: true })
+      .filter((entry) => {
+        if (entry.name.startsWith('.')) return false;
+        const dir = path.join(root, entry.name);
+        if (!entry.isDirectory() && !(entry.isSymbolicLink() && fs.statSync(dir).isDirectory())) return false;
+        return fs.existsSync(path.join(dir, 'SKILL.md'));
+      })
+      .map((entry) => entry.name)
+      .sort((a, b) => a.localeCompare(b));
+  } catch {
+    return [];
+  }
+}
+
+export async function listAgentOwnedSkillIds(uid: string, agentId: string): Promise<string[]> {
+  const owner = String(agentId || '').trim();
+  if (!uid || !owner) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (id: string) => {
+    const clean = String(id || '').trim();
+    if (!clean || seen.has(clean)) return;
+    seen.add(clean);
+    out.push(clean);
+  };
+  for (const { specs: privateList } of await loadAgentPrivateSkillSpecs(uid, owner)) {
+    for (const s of privateList) {
+      if (!s.ownerAgent || s.ownerAgent === owner) add(s.id);
+    }
+  }
+  for (const id of scanSkillIds(agentEvolvedSkillsDir(uid, owner))) add(id);
+  return out;
 }
 
 /**

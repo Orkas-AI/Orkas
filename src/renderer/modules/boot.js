@@ -336,8 +336,8 @@ function setView(view, cid, opts = {}) {
     // the landing page is entered — the user explicitly asked for a clean
     // slate here, so prior in-session picks don't leak forward.
     if (typeof onEnterNewChatView === 'function') onEnterNewChatView();
-    // Draft attachment chips (commander tab's pool under `main_chat/`): re-paint from
-    // the in-memory Map immediately, and re-sync with disk in case a prior
+    // Draft attachment chips (commander tab's local `main_chat/` pool): re-paint
+    // from the in-memory Map immediately, and re-sync with disk in case a prior
     // session left files on disk without a dataUrl.
     if (typeof _chatAttachRenderChips === 'function') _chatAttachRenderChips(DRAFT_CID);
     if (typeof _chatAttachRefreshFromServer === 'function') _chatAttachRefreshFromServer(DRAFT_CID);

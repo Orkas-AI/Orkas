@@ -597,12 +597,31 @@ function _officeFitFrameHeight(res) {
   return Math.max(260, Math.min(max, Math.ceil(raw)));
 }
 
+const _VIEWER_VIDEO_END_REPLAY_SECONDS = 0.25;
+
+function _viewerVideoShouldReplayFromStart(startTime, duration, ended) {
+  if (ended) return true;
+  const rawDuration = Number(duration);
+  if (!Number.isFinite(rawDuration) || rawDuration <= 0) return false;
+  return startTime >= Math.max(0, rawDuration - _VIEWER_VIDEO_END_REPLAY_SECONDS);
+}
+
 function _viewerVideoPlaybackOptions(opts) {
   const rawTime = Number(opts && opts.startTime);
+  const startTime = Number.isFinite(rawTime) && rawTime > 0 ? rawTime : 0;
+  const rawDuration = Number(opts && opts.duration);
   return {
     autoplay: !!(opts && opts.autoplay),
-    startTime: Number.isFinite(rawTime) && rawTime > 0 ? rawTime : 0,
+    startTime: _viewerVideoShouldReplayFromStart(startTime, rawDuration, !!(opts && opts.ended)) ? 0 : startTime,
   };
+}
+
+function _viewerVideoSeekTarget(startTime, duration) {
+  if (!Number.isFinite(startTime) || startTime <= 0) return 0;
+  const rawDuration = Number(duration);
+  if (!Number.isFinite(rawDuration) || rawDuration <= 0) return startTime;
+  if (_viewerVideoShouldReplayFromStart(startTime, rawDuration, false)) return 0;
+  return Math.min(startTime, Math.max(0, rawDuration - 0.05));
 }
 
 function _applyViewerVideoPlayback(video, opts) {
@@ -612,11 +631,7 @@ function _applyViewerVideoPlayback(video, opts) {
   const seek = () => {
     if (playback.startTime > 0) {
       try {
-        const duration = Number(video.duration);
-        const target = Number.isFinite(duration) && duration > 0
-          ? Math.min(playback.startTime, Math.max(0, duration - 0.05))
-          : playback.startTime;
-        video.currentTime = target;
+        video.currentTime = _viewerVideoSeekTarget(playback.startTime, video.duration);
       } catch (_) { /* setting currentTime can throw before metadata on some codecs */ }
     }
   };
@@ -879,5 +894,5 @@ async function openChatFileViewer(absPath, displayName, opts) {
 
 // CJS bridge for vitest — pure functions only, per PC/CLAUDE.md §9.
 if (typeof module !== 'undefined' && typeof module.exports === 'object') {
-  module.exports = { _kindOf, _extOf, _chatMediaLocalUrl, _viewerAbsPathFromChatMediaLocalUrl, _viewerCanAddToLibrary, _viewerVideoPlaybackOptions };
+  module.exports = { _kindOf, _extOf, _chatMediaLocalUrl, _viewerAbsPathFromChatMediaLocalUrl, _viewerCanAddToLibrary, _viewerVideoPlaybackOptions, _viewerVideoSeekTarget };
 }

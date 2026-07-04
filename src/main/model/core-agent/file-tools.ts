@@ -265,37 +265,7 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
     name: 'read_file',
     executionMode: 'parallel',
     description:
-      'Read a slice of a file\'s text by absolute path.\n'
-      + '\n'
-      + 'Parameters:\n'
-      + '  path      — required. Must be inside the current workspace or this conversation\'s attachment dir.\n'
-      + '  charStart — 0-based inclusive start offset. Default 0.\n'
-      + '  charEnd   — 0-based exclusive end offset.  Default = total_chars (end of file).\n'
-      + '\n'
-      + 'Response header:\n'
-      + '  <file path="..." kind="..." total_chars="N" covered="a-b" lines="x-y"> … </file>\n'
-      + '  `covered` echoes the clamped [charStart, charEnd) actually returned; `lines` is the\n'
-      + '  absolute line range shown.\n'
-      + '\n'
-      + 'Body format:\n'
-      + '  Each line is prefixed with its absolute line number and a tab: `<n>\\t<line text>`.\n'
-      + '  The `<n>\\t` prefix is a DISPLAY annotation, NOT part of the file — when you pass text\n'
-      + '  back to `edit_file` as old_string, use the raw line WITHOUT the number+tab prefix.\n'
-      + '\n'
-      + 'How to use:\n'
-      + '  - Whole file: omit charStart/charEnd. Header tells you total_chars.\n'
-      + '  - Continue: set charStart = previous response\'s covered end.\n'
-      + '  - total_chars is usually already in the `<attachments>` manifest or in a prior\n'
-      + '    `search_files` hit — use it to plan charStart/charEnd.\n'
-      + '  - If a PDF or modern Office file has never been read/stated before, this tool returns E_NEED_STAT.\n'
-      + '    Call `stat_file(path)` first to trigger extraction, then come back.\n'
-      + '  - Legacy Office files (.doc/.xls/.ppt) return E_UNSUPPORTED_FILE; ask the user\n'
-      + '    for a .docx/.xlsx/.pptx export if the content is required.\n'
-      + '  - For image kind, no range applies; a compressed grayscale JPEG is returned inline\n'
-      + '    as a user-turn image.\n'
-      + '\n'
-      + 'The server does NOT truncate and has NO size cap — you receive exactly the range you ask for.\n'
-      + 'You are responsible for your own context budget.',
+      'Read a file or character slice inside the visible workspace/attachments. Text lines are returned as "<line>\\t<text>"; do not include that prefix in edit_file old_string. Use charStart/charEnd for large files. For new PDF/Office files, stat_file may be required first; images return an inline compressed preview.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -444,21 +414,7 @@ function createStatFileTool(opts: FileToolsOpts): AgentTool {
   return {
     name: 'stat_file',
     description:
-      'Ensure a file\'s text is extracted and return its `total_chars`. Use this when the\n'
-      + '`<attachments>` manifest or a `search_files` result did NOT already include\n'
-      + '`total_chars` for the file — typically for a PDF or modern Office file that has never been read.\n'
-      + '\n'
-      + 'Parameters:\n'
-      + '  path — required. Absolute path inside workspace or current attachment dir.\n'
-      + '\n'
-      + 'Response:\n'
-      + '  <file path="..." kind="text|pdf|docx|spreadsheet|presentation" total_chars="N"/>\n'
-      + '\n'
-      + 'Notes:\n'
-      + '  - Skip this call when total_chars is already provided — go straight to read_file.\n'
-      + '  - This tool does pdfjs / mammoth / OOXML extraction; first call on a large\n'
-      + '    document may take a few seconds, subsequent read_file calls hit the cache instantly.\n'
-      + '  - Returns E_NO_TEXT for image kind; images are displayed via read_file directly.',
+      'Extract/cache readable text metadata and return total_chars for a visible file. Use before first read_file when attachments/search_files did not provide total_chars, especially for PDF/Office. Skip when total_chars is already known. Images return E_NO_TEXT; use read_file for image previews.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -533,14 +489,7 @@ function createOcrFileTool(opts: FileToolsOpts): AgentTool {
     name: 'ocr_file',
     executionMode: 'sequential',
     description:
-      'Run local OCR on visual text in a file and return Markdown. Use this when read_file/stat_file cannot recover text from visual content: scanned PDFs, image-only PDF pages, screenshots, photos of documents, or text embedded in images. For normal text PDFs/Office files, use stat_file/read_file first. For mixed PDFs, combine read_file text with ocr_file visual text.\n'
-      + '\n'
-      + 'Parameters:\n'
-      + '  path  — required. Absolute path inside the current workspace or this conversation\'s attachment dir.\n'
-      + '  pages — optional for PDFs. Page list/ranges like "1-3,5". Omit to OCR all pages.\n'
-      + '\n'
-      + 'Supported inputs in this version: PDF pages and image files (.png/.jpg/.jpeg/.webp/.gif). Office documents should be read with read_file; embedded-image OCR for Office is not supported yet.\n'
-      + 'The OCR engine is local RapidOCR + ONNXRuntime and does not consume cloud model credits. If the local OCR runtime is not installed, this tool installs it into Orkas\'s managed runtime directory. If this tool returns an E_OCR_* error, do not try to install or repair OCR dependencies with bash/pip/uv; report the tool error and process log.',
+      'Run local OCR on visible PDFs/images and return Markdown. Use for scanned PDFs, screenshots, photos, or image-only pages when read_file/stat_file cannot recover visual text. For normal text PDFs/Office, use stat_file/read_file first. If E_OCR_* occurs, report it; do not repair OCR with shell package installs.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -675,23 +624,7 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
     name: 'search_files',
     executionMode: 'parallel',
     description:
-      'Discover files when you do NOT already have the path. Scans the active workspace +\n'
-      + 'the current conversation\'s attachment dir.\n'
-      + 'Query forms:\n'
-      + '  • substring (case-insensitive): "contract" matches "Contract_v2.pdf"\n'
-      + '  • glob:                         "*.pdf", "design*"\n'
-      + 'Returns each hit with path/name/size/mtime/ext/source. If the file\'s text has\n'
-      + 'already been extracted (cache hit), `total_chars` is also included — use it to\n'
-      + 'plan read_file without an extra stat_file round-trip. If `total_chars` is absent,\n'
-      + 'you need `stat_file(path)` before your first read_file on that file.\n'
-      + 'This tool does NOT trigger extract — it stays cheap even over large directories.\n'
-      + 'Use this when:\n'
-      + '  • the user names a file that is NOT in the current <attachments> block — try here\n'
-      + '    before telling them the file is missing; the workspace is in scope too\n'
-      + '  • the user refers to a file by a fuzzy phrase ("the contract")\n'
-      + '  • exploring the workspace for files matching a pattern\n'
-      + 'Do NOT call this on a filename that is already listed in <attachments> — the `path`\n'
-      + 'attribute there is the authoritative absolute path; feed it straight to `read_file`.',
+      'Find files by substring or glob when the path is unknown. Scans visible workspace/attachments and returns path/name/size/mtime/ext/source; cached total_chars may be included. Does not extract content. If a file is already listed in <attachments>, use that path directly.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -851,7 +784,7 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
       properties: {
         pattern: { type: 'string', description: 'Pattern to search for.' },
         regex: { type: 'boolean', description: 'Default false — treat pattern as a case-insensitive substring.' },
-        glob: { type: 'string', description: 'Optional. Limit the search to files matching this glob. No "/" → match the basename at any depth (e.g. "*.ts", "*.{vue}"); with "/" → match the path relative to its root (e.g. "src/**", "src/**/*.ts"). Use it to cut noise + tokens on large projects.' },
+        glob: { type: 'string', description: 'Optional file glob. No "/" matches basenames; with "/" matches relative paths, e.g. "src/**/*.ts".' },
         output_mode: { type: 'string', enum: ['content', 'files', 'count'], description: 'content (default): one line per match. files: just the file paths that contain a match — much cheaper when you only need which files. count: number of matches per file.' },
       },
       required: ['pattern'],
@@ -1072,13 +1005,7 @@ function createListFilesTool(opts: FileToolsOpts): AgentTool {
     name: 'list_files',
     executionMode: 'parallel',
     description:
-      'List the entries (files and subdirectories) of a directory by absolute path.\n'
-      + '\n'
-      + 'Parameters:\n'
-      + '  path — required. Must be inside the current workspace, this conversation\'s\n'
-      + '         attachment dir, or a user-granted folder.\n'
-      + '\n'
-      + 'Each line is `d <name>` for a directory or `f <name>` for a file.',
+      'List files and subdirectories in a visible directory. Output lines are "d <name>" for directories and "f <name>" for files.',
     inputSchema: {
       type: 'object',
       properties: {

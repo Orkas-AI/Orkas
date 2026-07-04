@@ -276,10 +276,11 @@ export function activateUser(uid: string): void {
 
   ensureUserLayout(uid);
 
-  // Purge tool-results/ entries older than 7 days. Best-effort (nothrow);
+  // Purge machine-local tool-results/ entries older than 7 days. Best-effort (nothrow);
   // failure here should not block uid activation. See util/tool-result-cap.ts
-  // — these are oversized tool outputs persisted to disk with a
-  // <persisted-output> reference in the tool_result that went to the LLM.
+  // — these are oversized CLI/local-agent tool outputs persisted to disk with a
+  // <persisted-output> reference. Resumable core-agent session refs live next to
+  // cloud/sessions/<sid>.jsonl and are cleaned with the session lifecycle.
   // We only clean on activate (not on session end) because the individual
   // files are small and the 7-day window is comfortably above typical
   // conversation lifetimes.

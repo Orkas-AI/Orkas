@@ -30,37 +30,20 @@ function buildDescription(limits?: { competence?: number; strategies?: number })
     compLimit && stratLimit
       ? [
           '',
-          `CONTENT LIMITS (hard cap; oversize writes are REJECTED — not truncated):`,
+          `Limits (oversize writes are rejected):`,
           `- competence: ${compLimit} characters`,
           `- strategies: ${stratLimit} characters`,
-          '',
-          `The file is a living summary, not a log. When approaching the limit,`,
-          `CONDENSE before adding: merge related bullets, drop stale items, keep`,
-          `the most actionable insights. A "read" before "write" returns the`,
-          `current usage so you know the remaining budget.`,
+          `Keep these files condensed living summaries, not logs.`,
         ].join('\n')
       : '';
 
-  return `Manage your metacognitive self-assessment and learning strategies. These persist across conversations.
+  return `Read or replace this agent's persistent metacognition notes.
 
-Two targets:
-- "competence": Your self-assessment — what you're good at, known weaknesses, learning priorities.
-- "strategies": Your learning strategies library — which approaches work best for which tasks.
+Targets:
+- competence: strengths, weaknesses, limits, and learning priorities.
+- strategies: which learning/work approaches help for which task types.
 
-WHEN TO UPDATE COMPETENCE:
-- After succeeding at a previously weak area → note the improvement
-- After user corrections → note the weakness
-- After discovering a new capability or limitation
-- Periodically review and update priorities
-
-WHEN TO UPDATE STRATEGIES:
-- After discovering that a learning approach works well or poorly
-- After trying a new approach to skill creation
-- To record which strategy types suit which task categories
-
-Actions: "read" (view current content), "write" (replace entire content).
-Content is free-form markdown. Structure with ## headings for different sections.
-Language: when the host prompt specifies a user/UI language, write human-readable metacognition content in that language while preserving code, file paths, commands, and exact quoted wording.${limitBlock}`;
+Update after meaningful user corrections, newly discovered capabilities/limits, or useful strategy lessons. Skip routine task progress. Action "write" replaces the whole markdown file; read first if you need current content/usage. Use the user's current language for prose and preserve code, paths, commands, and quoted wording.${limitBlock}`;
 }
 
 export function createMetacognitionTool(

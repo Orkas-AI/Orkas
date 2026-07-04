@@ -31,6 +31,14 @@ function attDir(): string {
   return path.join(tmpDir, UID, 'cloud', 'chat_attachments', CID);
 }
 
+function cloudAttDir(cid: string): string {
+  return path.join(tmpDir, UID, 'cloud', 'chat_attachments', cid);
+}
+
+function draftAttDir(cid: string): string {
+  return path.join(tmpDir, UID, 'local', 'chat_attachment_drafts', cid);
+}
+
 async function loadMod() {
   return import('../../../src/main/features/chat_attachments');
 }
@@ -52,6 +60,16 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(fs.existsSync(path.join(attDir(), 'hello.txt'))).toBe(true);
     const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.'));
     expect(siblings).toEqual([]);
+  });
+
+  it('stores commander draft attachments in local-only storage', async () => {
+    const m = await loadMod();
+    const r = await m.uploadAttachment(UID, 'main_chat', 'draft.txt', Buffer.from('hi', 'utf8'));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(fs.existsSync(path.join(draftAttDir('main_chat'), 'draft.txt'))).toBe(true);
+    expect(fs.existsSync(path.join(cloudAttDir('main_chat'), 'draft.txt'))).toBe(false);
+    expect(m.listPendingAttachments(UID, 'main_chat').map((i) => i.name)).toEqual(['draft.txt']);
   });
 
   it('stores PDF without pre-extracting (no sibling cache files)', async () => {
@@ -360,23 +378,20 @@ describe('chat_attachments › purgeByCid', () => {
 describe('chat_attachments › adoptDraftAttachments', () => {
   const DRAFT = 'main_chat';
 
-  function dirFor(cid: string): string {
-    return path.join(tmpDir, UID, 'cloud', 'chat_attachments', cid);
-  }
-
   it('renames draft dir to target cid when target does not exist', async () => {
     const m = await loadMod();
     await m.uploadAttachment(UID, DRAFT, 'note.txt', Buffer.from('hi'));
     await m.uploadAttachment(UID, DRAFT, 'doc.pdf', makeMinimalPdf(['p1']));
-    expect(fs.existsSync(dirFor(DRAFT))).toBe(true);
+    expect(fs.existsSync(draftAttDir(DRAFT))).toBe(true);
+    expect(fs.existsSync(cloudAttDir(DRAFT))).toBe(false);
 
     const r = m.adoptDraftAttachments(UID, DRAFT, CID);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.count).toBe(2);
-    expect(fs.existsSync(dirFor(DRAFT))).toBe(false);
-    expect(fs.existsSync(path.join(dirFor(CID), 'note.txt'))).toBe(true);
-    expect(fs.existsSync(path.join(dirFor(CID), 'doc.pdf'))).toBe(true);
+    expect(fs.existsSync(draftAttDir(DRAFT))).toBe(false);
+    expect(fs.existsSync(path.join(cloudAttDir(CID), 'note.txt'))).toBe(true);
+    expect(fs.existsSync(path.join(cloudAttDir(CID), 'doc.pdf'))).toBe(true);
   });
 
   it('returns count=0 without error when draft dir is absent', async () => {
@@ -401,9 +416,20 @@ describe('chat_attachments › adoptDraftAttachments', () => {
     const r = m.adoptDraftAttachments(UID, DRAFT, CID);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(fs.existsSync(path.join(dirFor(CID), 'kept.txt'))).toBe(true);
-    expect(fs.existsSync(path.join(dirFor(CID), 'new.txt'))).toBe(true);
-    expect(fs.existsSync(dirFor(DRAFT))).toBe(false);
+    expect(fs.existsSync(path.join(cloudAttDir(CID), 'kept.txt'))).toBe(true);
+    expect(fs.existsSync(path.join(cloudAttDir(CID), 'new.txt'))).toBe(true);
+    expect(fs.existsSync(draftAttDir(DRAFT))).toBe(false);
+  });
+
+  it('migrates legacy cloud draft attachments back to local storage on access', async () => {
+    const m = await loadMod();
+    fs.mkdirSync(cloudAttDir(DRAFT), { recursive: true });
+    fs.writeFileSync(path.join(cloudAttDir(DRAFT), 'legacy.txt'), 'old draft');
+
+    const items = m.listPendingAttachments(UID, DRAFT);
+    expect(items.map((i) => i.name)).toEqual(['legacy.txt']);
+    expect(fs.existsSync(path.join(draftAttDir(DRAFT), 'legacy.txt'))).toBe(true);
+    expect(fs.existsSync(cloudAttDir(DRAFT))).toBe(false);
   });
 });
 
@@ -862,5 +888,42 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     expect(r.manifest).toBe('');
     expect(r.skipped.length).toBe(1);
     expect(r.skipped[0].reason).toMatch(/no longer exists|不存在/);
+  });
+});
+
+describe('chat_attachments › buildConversationAttachmentIndex', () => {
+  it('lists persisted conversation attachments without leaking file bodies', async () => {
+    const m = await loadMod();
+    const body = '# Orkas 1.0.5\nRelease note: local attachment index stays lightweight.';
+    await m.uploadAttachment(UID, CID, 'orkas-1.0.5-update.md', Buffer.from(body, 'utf8'));
+    await m.uploadAttachment(UID, CID, 'intro.mp4', Buffer.from('fake-video'));
+    await m.uploadAttachment(UID, CID, 'logo.png', Buffer.from('fake-image'));
+
+    const index = await m.buildConversationAttachmentIndex(UID, CID);
+
+    expect(index).toContain('<conversation-attachments');
+    expect(index).toContain('name="orkas-1.0.5-update.md"');
+    expect(index).toContain('kind="text"');
+    expect(index).toContain(`total_chars="${body.length}"`);
+    expect(index).toContain('name="intro.mp4"');
+    expect(index).toContain('kind="video"');
+    expect(index).toContain('model_readable="false"');
+    expect(index).toContain('name="logo.png"');
+    expect(index).toContain('kind="image"');
+    expect(index).toContain('inline="false"');
+    expect(index).not.toContain('local attachment index stays lightweight');
+  });
+
+  it('excludes current-turn attachment names already covered by the manifest', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'old.md', Buffer.from('old', 'utf8'));
+    await m.uploadAttachment(UID, CID, 'current.md', Buffer.from('current', 'utf8'));
+
+    const index = await m.buildConversationAttachmentIndex(UID, CID, {
+      excludeNames: ['current.md'],
+    });
+
+    expect(index).toContain('name="old.md"');
+    expect(index).not.toContain('name="current.md"');
   });
 });

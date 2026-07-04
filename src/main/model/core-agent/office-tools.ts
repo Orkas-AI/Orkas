@@ -217,16 +217,7 @@ function createDocxTool(opts: OfficeToolsOpts): AgentTool {
   return {
     name: 'create_docx',
     description:
-      'Create a Word (.docx) document from structured content, using the built-in Office engine ' +
-      '(no Microsoft Office required; macOS + Windows). Provide an output `path` plus ordered `paragraphs`; ' +
-      'an optional `title` is added as a Heading 1. Each paragraph may set `style` (Heading1/Heading2/Normal/Quote), ' +
-      '`align`, `list` (bullet/ordered), and inline run styling: `bold`, `italic`, `font`, `size` (e.g. "14pt"), ' +
-      '`color` (e.g. "#1F4E79"), `underline`, `highlight`. Add data `tables` (each `{ rows: [[…]], colWidths? }`) and ' +
-      '`images` (each `{ src, width?, height?, align? }`; `src` must be a file inside this conversation\'s ' +
-      'workspace/attachments). Body order is paragraphs, then tables, then images. For CJK content pass `locale` ' +
-      '(e.g. "zh-CN"). Returns the saved path and a first-page PNG preview. If the path already exists and was not ' +
-      'written by you this turn, the basename is auto-suffixed (`-2 / -3 / ...`); use the `<file-renamed>` path ' +
-      'verbatim afterwards.',
+      'Create a .docx with path plus optional title, paragraphs, tables, images, locale, preview. paragraphs: [{text, style?, align?, list?, bold?, italic?, font?, size?, color?}]. tables: [{rows:[[cell]], colWidths?}]. images: [{src,width?,height?,align?}], src in workspace/attachments. Returns saved path/preview; collisions return <file-renamed>.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -324,15 +315,7 @@ function createXlsxTool(opts: OfficeToolsOpts): AgentTool {
   return {
     name: 'create_xlsx',
     description:
-      'Create an Excel (.xlsx) spreadsheet from a grid of rows, using the built-in Office engine ' +
-      '(no Microsoft Office required; macOS + Windows). Provide an output `path` and `rows` (an array of rows, each an ' +
-      'array of cells). A cell is a string/number, or an object `{ value, formula, format, bold }` plus optional ' +
-      'styling: `fill` (cell background, e.g. "#1F4E79"), `font.color`, `font.size`, `italic`, `underline`, `halign` ' +
-      '(left/center/right), `valign`, `wrap`, `border` (e.g. "thin"), `merge` (e.g. "A1:C1"). `formula` is an Excel ' +
-      'formula WITHOUT the leading "=" (e.g. "SUM(B2:B10)"). Cells are placed A1, B1, … by position; empty cells ' +
-      'are skipped. Optional `sheet` (default "Sheet1") and `columns` (per-column `{ name:"A", width, hidden }`). ' +
-      'For a multi-sheet workbook pass `sheets` instead — an array of `{ name, rows, columns }`. Returns the saved ' +
-      'path and a PNG preview. Auto-suffixes on collision (see the `<file-renamed>` block).',
+      'Create a .xlsx workbook with path plus rows or sheets. rows is [[cell]], where cell is string/number or {value, formula?, format?, bold?, fill?, font.color?, font.size?, merge?}; formulas omit the leading "=". sheets: [{name, rows, columns?}]. Returns saved path/preview; collisions return <file-renamed>.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -436,16 +419,7 @@ function createPptxTool(opts: OfficeToolsOpts): AgentTool {
   return {
     name: 'create_pptx',
     description:
-      'Create a PowerPoint (.pptx) deck from a list of slides, using the built-in Office engine ' +
-      '(no Microsoft Office required; macOS + Windows). Provide an output `path` and `slides`. ' +
-      'For a simple deck, set `title`, `body` (newlines become separate body lines), and `layout` ' +
-      '(e.g. "Title Slide", "Title and Content"). For a designed slide, set `background` ' +
-      '(hex like "#06101D", scheme color, or gradient "C1-C2-angle"), `transition` (fade/push/wipe/morph), and ' +
-      '`shapes` — free-positioned text boxes: each needs a position (`x`/`y`/`width`/`height` in units like "1in" / ' +
-      '"120pt") and may add any style prop (`text`, `fill`, `color`, `size`, `bold`, `align`, `font`, `geometry`). ' +
-      'A slide may also carry `images` (each `{ src, x, y, width, height }`; `src` must be a file in this ' +
-      'conversation\'s workspace/attachments) and `tables` (each `{ rows: [[…]], x?, y?, colWidths? }`). ' +
-      'Returns the saved path and a first-slide PNG preview. Auto-suffixes on collision (see the `<file-renamed>` block).',
+      'Create a .pptx with path and slides. slides: [{title?, body?, layout?, background?, transition?, shapes?, images?, tables?}]. shapes need text/x/y/width/height plus style fields; images need src/x/y/width/height with src in workspace/attachments. Returns saved path/preview; collisions return <file-renamed>.',
     inputSchema: {
       type: 'object',
       properties: {

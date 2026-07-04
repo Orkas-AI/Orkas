@@ -709,6 +709,7 @@ export function modelTurnContextForLog(input: {
   streamIdleTimeout?: number;
   maxToolLoops?: number;
   skillList?: readonly string[];
+  forceOpenSkillRefs?: readonly string[];
   projectAllowedSkillIds?: readonly string[];
   extraTools?: readonly AgentTool[];
   extraRoots?: readonly string[];
@@ -757,6 +758,7 @@ export function modelTurnContextForLog(input: {
     max_tool_loops: input.maxToolLoops,
     skill_list_mode: input.skillList === undefined ? 'all' : 'allowlist',
     skill_list_count: input.skillList === undefined ? undefined : input.skillList.length,
+    force_open_skill_count: input.forceOpenSkillRefs?.length,
     project_skill_allowlist_count: input.projectAllowedSkillIds?.length,
     extra_tool_count: input.extraTools?.length || 0,
     extra_root_count: input.extraRoots?.length || 0,
@@ -793,6 +795,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     maxToolLoops,
     abortSignal = null,
     skillList,
+    forceOpenSkillRefs,
     projectAllowedSkillIds,
     extraTools,
     extraRoots,
@@ -829,6 +832,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     streamIdleTimeout,
     maxToolLoops,
     skillList,
+    forceOpenSkillRefs,
     projectAllowedSkillIds,
     extraTools,
     extraRoots,
@@ -994,6 +998,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(turnId ? { turnId } : {}),
       ...(projectId ? { projectId } : {}),
       ...(skillList !== undefined ? { skillList } : {}),
+      ...(forceOpenSkillRefs && forceOpenSkillRefs.length ? { forceOpenSkillRefs } : {}),
       ...(projectAllowedSkillIds !== undefined ? { projectAllowedSkillIds } : {}),
       ...(extraTools && extraTools.length ? { extraTools } : {}),
       ...(extraRoots && extraRoots.length ? { extraRoots } : {}),
@@ -1037,6 +1042,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       streamIdleTimeout,
       maxToolLoops,
       skillList,
+      forceOpenSkillRefs,
       projectAllowedSkillIds,
       extraTools,
       extraRoots,
