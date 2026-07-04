@@ -1,21 +1,48 @@
 /**
  * Runtime availability gates for catalogued connectors.
  *
- * Runtime availability gate for catalogued connectors. Released Composio cards are bundled in
- * the PC catalog, while Server config supplies runtime auth/tool metadata and can append new
- * catalog rows. If a connector is in the resolved catalog, it is enabled unless the entry itself
- * is marked `availability: visible_disabled`.
+ * Server remote-config can temporarily hide or soft-disable Google connectors without shipping a
+ * new desktop build. The gate is enforced in three places: catalog IPC (what the user sees),
+ * OAuth start (no bypass by stale renderer state), and model-tool visibility (already-connected
+ * connectors must stop being usable when disabled remotely).
  */
+import { getGoogleConnectorsConfig, type ConnectorSwitchState } from '../client_config';
 import type { CatalogEntry } from './types';
 
 export type ConnectorAvailability = 'enabled' | 'hidden' | 'visible_disabled';
 
+const GOOGLE_CONNECTOR_IDS = new Set([
+  'google-workspace',
+  'gmail',
+  'gdrive',
+  'gcal',
+  'gdocs',
+  'gsheets',
+  'gtasks',
+  'gsearch-console',
+]);
+const GMAIL_SCOPE_CONNECTOR_IDS = new Set(['google-workspace', 'gmail']);
+
+function _stateToAvailability(state: ConnectorSwitchState): ConnectorAvailability {
+  if (state === 'enabled') return 'enabled';
+  if (state === 'visible_disabled') return 'visible_disabled';
+  return 'hidden';
+}
+
+function _overallStateToAvailability(state: ConnectorSwitchState): ConnectorAvailability {
+  return state === 'enabled' ? 'enabled' : 'hidden';
+}
+
 export function isGoogleConnectorId(id: string): boolean {
-  return ['google-workspace', 'gmail', 'gdrive', 'gcal', 'gdocs', 'gsheets', 'gtasks'].includes(id);
+  return GOOGLE_CONNECTOR_IDS.has(id);
 }
 
 export function connectorAvailabilityForId(id: string): ConnectorAvailability {
-  void id;
+  if (!isGoogleConnectorId(id)) return 'enabled';
+  const cfg = getGoogleConnectorsConfig();
+  const overall = _overallStateToAvailability(cfg.google);
+  if (overall !== 'enabled') return overall;
+  if (GMAIL_SCOPE_CONNECTOR_IDS.has(id)) return _stateToAvailability(cfg.gmail);
   return 'enabled';
 }
 

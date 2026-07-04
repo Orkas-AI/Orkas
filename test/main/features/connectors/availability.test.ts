@@ -52,24 +52,25 @@ function connectedInstance(id: string) {
   };
 }
 
-describe('connector availability gates', () => {
+describe('Google connector remote switches', () => {
   const releasedGoogleIds = ['google-workspace', 'gmail', 'gcal', 'gdocs', 'gsheets', 'gtasks', 'gsearch-console'];
 
-  it('keeps released Google connectors visible by default', async () => {
+  it('hides Google connectors by default', async () => {
     const catalog = await import('../../../../src/main/features/connectors/catalog');
     const availability = await import('../../../../src/main/features/connectors/availability');
 
     const out = availability.catalogWithAvailability(catalog.CONNECTOR_CATALOG);
     const outIds = ids(out);
 
-    expect(outIds).toEqual(expect.arrayContaining(releasedGoogleIds));
+    expect(outIds).not.toEqual(expect.arrayContaining(releasedGoogleIds));
     expect(outIds).toContain('github');
-    expect(availability.connectorAvailabilityForId('gmail')).toBe('enabled');
+    expect(availability.connectorAvailabilityForId('gmail')).toBe('hidden');
+    expect(availability.connectorAvailabilityForId('gsearch-console')).toBe('hidden');
     expect(availability.connectorAvailabilityForId('github')).toBe('enabled');
   });
 
-  it('ignores the deprecated google_connectors remote switch for released Google entries', async () => {
-    await writeRemoteConfig({ google: 'disabled', gmail: 'visible_disabled' });
+  it('lets the direct remote switch re-enable every Google connector', async () => {
+    await writeRemoteConfig(true);
     const catalog = await import('../../../../src/main/features/connectors/catalog');
     const availability = await import('../../../../src/main/features/connectors/availability');
 
@@ -77,19 +78,68 @@ describe('connector availability gates', () => {
     const outIds = ids(out);
 
     expect(outIds).toEqual(expect.arrayContaining(releasedGoogleIds));
-    expect(out.find((entry) => entry.id === 'gmail')).not.toHaveProperty('availability');
     expect(availability.connectorAvailabilityForId('gmail')).toBe('enabled');
     expect(() => availability.assertConnectorRuntimeEnabled('gmail')).not.toThrow();
   });
 
-  it('keeps model-visible connector tools independent of the deprecated Google switch', async () => {
+  it('hides every Google connector when the overall switch is disabled', async () => {
+    await writeRemoteConfig({ google: 'disabled', gmail: 'enabled' });
+    const catalog = await import('../../../../src/main/features/connectors/catalog');
+    const availability = await import('../../../../src/main/features/connectors/availability');
+
+    const out = availability.catalogWithAvailability(catalog.CONNECTOR_CATALOG);
+    const outIds = ids(out);
+
+    expect(outIds).not.toEqual(expect.arrayContaining(releasedGoogleIds));
+    expect(outIds).toContain('github');
+    expect(() => availability.assertConnectorRuntimeEnabled('gmail')).toThrow(/connector_unsupported/);
+  });
+
+  it('hides every Google connector when the overall switch is visible_disabled', async () => {
+    await writeRemoteConfig({ google: 'visible_disabled', gmail: 'enabled' });
+    const catalog = await import('../../../../src/main/features/connectors/catalog');
+    const availability = await import('../../../../src/main/features/connectors/availability');
+
+    const out = availability.catalogWithAvailability(catalog.CONNECTOR_CATALOG);
+
+    expect(ids(out)).not.toEqual(expect.arrayContaining(releasedGoogleIds));
+    expect(availability.connectorAvailabilityForId('gmail')).toBe('hidden');
+  });
+
+  it('lets the Gmail switch hide Gmail and Google Workspace while other Google services remain enabled', async () => {
+    await writeRemoteConfig({ google: 'enabled', gmail: 'disabled' });
+    const catalog = await import('../../../../src/main/features/connectors/catalog');
+    const availability = await import('../../../../src/main/features/connectors/availability');
+
+    const out = availability.catalogWithAvailability(catalog.CONNECTOR_CATALOG);
+    const outIds = ids(out);
+
+    expect(outIds).not.toContain('gmail');
+    expect(outIds).not.toContain('google-workspace');
+    expect(outIds).toEqual(expect.arrayContaining(['gcal', 'gdocs', 'gsheets', 'gtasks', 'gsearch-console']));
+  });
+
+  it('lets the Gmail switch show Gmail and Google Workspace as disabled cards', async () => {
+    await writeRemoteConfig({ google: 'enabled', gmail: 'visible_disabled' });
+    const catalog = await import('../../../../src/main/features/connectors/catalog');
+    const availability = await import('../../../../src/main/features/connectors/availability');
+
+    const out = availability.catalogWithAvailability(catalog.CONNECTOR_CATALOG);
+
+    expect(out.find((entry) => entry.id === 'gmail')).toMatchObject({ availability: 'visible_disabled' });
+    expect(out.find((entry) => entry.id === 'google-workspace')).toMatchObject({ availability: 'visible_disabled' });
+    expect(out.find((entry) => entry.id === 'gcal')).not.toHaveProperty('availability');
+  });
+
+  it('filters disabled Google connectors from model-visible connector tools', async () => {
     await writeRemoteConfig({ google: 'enabled', gmail: 'disabled' });
     vi.doMock('../../../../src/main/features/connectors/manager', () => ({
       restoreComposioConnectionsFromServer: vi.fn(async () => 0),
       refreshStaleToolCaches: vi.fn(async () => 0),
       listInstances: vi.fn(() => [
+        connectedInstance('google-workspace'),
         connectedInstance('gmail'),
-        connectedInstance('gdrive'),
+        connectedInstance('gcal'),
         connectedInstance('notion'),
       ]),
     }));
@@ -103,6 +153,6 @@ describe('connector availability gates', () => {
     const toolsAdapter = await import('../../../../src/main/features/connectors/tools-adapter');
 
     const visible = await toolsAdapter.resolveVisibleConnectors(TEST_UID, undefined);
-    expect(visible.map((item) => item.instance.id).sort()).toEqual(['gdrive', 'gmail', 'notion']);
+    expect(visible.map((item) => item.instance.id).sort()).toEqual(['gcal', 'notion']);
   });
 });
