@@ -195,7 +195,7 @@
   "new_chat.quick.video": "制作视频",
   "new_chat.quick.seo_geo": "SeoGeo",
   "new_chat.quick.office": "整理文档",
-  "new_chat.external_agent_entry": "接入 Codex、Claude Code 等外部智能体",
+  "new_chat.external_agent_entry": "接入 Codex、Claude Code 等 AI 编程工具",
   "new_chat.quick.agent_required": "需要先安装或启用「{name}」后才可使用这个入口。",
   "new_chat.quick.tmpl.education": "带我学会 [知识点/题目/材料]：先判断我哪里没懂，再用例子和提问一步步讲清楚，最后给我几道练习",
   "new_chat.quick.tmpl.ecommerce": "帮我判断 [商品/类目] 值不值得做：看需求、竞品、价格带、利润空间、供应链风险，最后给结论和下一步验证方法",

@@ -66,15 +66,15 @@ describe('synced PC surface regressions', () => {
     expect(chipBlock).toContain('line-height: 1.2;');
   });
 
-  it('keeps the external-agent entry copy aligned with external agents, not coding tools only', () => {
+  it('keeps the external-agent entry copy aligned with Orkas AI coding tools wording', () => {
     const html = read('src/renderer/index.html');
     const en = read('src/renderer/locales/en.json');
     const zh = read('src/renderer/locales/zh.json');
 
-    expect(html).toContain('other external agents');
-    expect(en).toContain('other external agents');
-    expect(zh).toContain('等外部智能体');
-    expect(zh).not.toContain('AI 编程工具');
+    expect(html).toContain('other AI coding tools');
+    expect(en).toContain('other AI coding tools');
+    expect(zh).toContain('等 AI 编程工具');
+    expect(zh).not.toContain('外部智能体');
   });
 
   it('exposes the local Commander profile to the renderer', () => {

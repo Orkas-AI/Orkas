@@ -188,7 +188,7 @@
   "new_chat.quick.creation": "Escrita",
   "new_chat.quick.data": "Pesquisa",
   "new_chat.quick.office": "Documentos",
-  "new_chat.external_agent_entry": "Conecte Codex, Claude Code e outros agentes externos",
+  "new_chat.external_agent_entry": "Conecte Codex, Claude Code e outras ferramentas de IA para programação",
   "new_chat.quick.agent_required": "Instale ou ative “{name}” antes de usar este atalho.",
   "new_chat.quick.tmpl.education": "[tópico / problema / material] Oriente-me passo a passo: descubra onde estou preso, explique com exemplos e me dê um plano de prática",
   "new_chat.quick.tmpl.ecommerce": "Pesquisa [produto/categoria]: analise a demanda, concorrentes, faixas de preço, premissas de lucro, risco de fornecimento e se vale a pena vender",
