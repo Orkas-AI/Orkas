@@ -84,6 +84,44 @@ describe('chat_artifacts › createArtifact', () => {
     expect([...buf.subarray(0, 4)]).toEqual([0x89, 0x50, 0x4e, 0x47]);
   });
 
+  it('rejects compacted history markers in artifact text files', async () => {
+    const m = await loadMod();
+    const r = m.createArtifact(UID, CID, AGENT, {
+      files: [
+        {
+          path: 'index.html',
+          content:
+            '[old tool input string compacted: original_size=13653 chars]\n' +
+            'preview_head:\n<!doctype html><h1>stale preview</h1>',
+        },
+      ],
+    });
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.error).toContain('compacted conversation-history marker');
+    expect(fs.existsSync(cidDir())).toBe(false);
+  });
+
+  it('reports compacted history artifacts as unavailable without rewriting them', async () => {
+    const m = await loadMod();
+    const r = m.createArtifact(UID, CID, AGENT, { title: 'Ok app', files: MIN_FILES });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+
+    expect(m.inspectArtifactIndex(UID, CID, r.artifactId)).toEqual({ ok: true, status: 'ok' });
+
+    const indexPath = path.join(cidDir(), r.artifactId, 'index.html');
+    fs.writeFileSync(indexPath, '__orkas_compacted_tool_use', 'utf8');
+    const inspected = m.inspectArtifactIndex(UID, CID, r.artifactId);
+    expect(inspected).toMatchObject({
+      ok: true,
+      status: 'unavailable',
+      marker: '__orkas_compacted_tool_use',
+    });
+    expect(fs.readFileSync(indexPath, 'utf8')).toBe('__orkas_compacted_tool_use');
+  });
+
   it('rejects: no index.html', async () => {
     const m = await loadMod();
     const r = m.createArtifact(UID, CID, AGENT, { files: [{ path: 'main.html', content: 'x' }] });

@@ -303,6 +303,59 @@
     _positionMenu(el, anchorBtn);
   }
 
+  function _clearArtifactUnavailable(frame) {
+    if (!frame) return;
+    const panel = frame._orkasUnavailablePanel;
+    if (panel && panel.remove) panel.remove();
+    frame._orkasUnavailablePanel = null;
+    frame.style.display = 'block';
+  }
+
+  function _showArtifactUnavailable(frame, reason) {
+    if (!frame || !frame.parentNode) return;
+    let panel = frame._orkasUnavailablePanel;
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.className = 'chat-artifact-unavailable';
+      frame._orkasUnavailablePanel = panel;
+      frame.parentNode.insertBefore(panel, frame.nextSibling);
+    }
+    panel.innerHTML = '';
+    const title = document.createElement('div');
+    title.className = 'chat-artifact-unavailable-title';
+    title.textContent = _t('artifact.unavailable_title', 'Preview unavailable');
+    const detail = document.createElement('div');
+    detail.className = 'chat-artifact-unavailable-detail';
+    detail.textContent = _t('artifact.unavailable_detail', 'This app preview cannot be displayed from the saved history.');
+    panel.appendChild(title);
+    panel.appendChild(detail);
+    if (reason) panel.title = String(reason);
+    frame.removeAttribute('src');
+    frame.style.display = 'none';
+  }
+
+  async function _checkArtifactAvailability(frame, ctx) {
+    if (!frame || !ctx || !ctx.cid || !ctx.artifactId) return;
+    if (!window.orkas || typeof window.orkas.invoke !== 'function') return;
+    const expectedCid = String(ctx.cid);
+    const expectedArtifactId = String(ctx.artifactId);
+    try {
+      const r = await window.orkas.invoke('conversations.artifacts.inspect', {
+        cid: expectedCid,
+        artifactId: expectedArtifactId,
+      });
+      if (!frame.isConnected) return;
+      if (frame.dataset.artifactCid !== expectedCid || frame.dataset.artifactId !== expectedArtifactId) return;
+      if (r && r.ok === true && r.status === 'unavailable') {
+        _showArtifactUnavailable(frame, r.reason || '');
+      } else if (r && r.ok === true && r.status === 'ok') {
+        _clearArtifactUnavailable(frame);
+      }
+    } catch (err) {
+      _trackError('artifact_inspect', { error_message: String(err && err.message || err) });
+    }
+  }
+
   function _doReload(ctx) {
     const f = ctx && ctx.frame;
     if (!f || !f.isConnected) return;
@@ -310,8 +363,10 @@
     // Reset height to default; the artifact re-reports on load. Reassigning
     // `src` forces a fresh load (the protocol handler sends `Cache-Control:
     // private` and dev reload ignores cache; this just re-runs the app).
+    _clearArtifactUnavailable(f);
     f.style.height = `${DEFAULT_FRAME_HEIGHT}px`;
     f.src = _artifactUrl(ctx.cid, ctx.artifactId);
+    _checkArtifactAvailability(f, ctx);
   }
 
   function _doOpen(ctx) {
@@ -390,6 +445,7 @@
     card.appendChild(header);
     card.appendChild(frame);
     host.appendChild(card);
+    _checkArtifactAvailability(frame, ctx);
   }
 
   // Render every artifact on a message into the given bubble. Idempotent —

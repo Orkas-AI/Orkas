@@ -1228,6 +1228,12 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     if (err) throw new Error(err);
     return { ok: true, path: absPath };
   },
+  // Read-only health check used by the renderer to avoid displaying a stale
+  // compacted-history preview as if it were a real interactive app.
+  'conversations.artifacts.inspect': async ({ cid, artifactId }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    return chatArtifacts.inspectArtifactIndex(ctx.userId, String(cid), String(artifactId || ''));
+  },
   // Copy a chat artifact into the persistent "My Apps" pool
   // (`<uid>/cloud/saved_apps/<appId>/`). Surfaced as the artifact card's
   // `⋯` → "保存".

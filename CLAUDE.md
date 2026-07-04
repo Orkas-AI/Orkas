@@ -125,6 +125,7 @@ Attachments:
 ## Skills, Agents, And Marketplace
 
 - Skill sources are custom cloud skills plus platform local marketplace installs. Custom overrides platform by id.
+- Platform builtin agents/skills are product content, not platform libraries. Runtime-facing platform code must not import/require files from `resources/builtin/...`, hard-code a builtin agent/skill id as a business dependency, or call a builtin skill script directly for shared logic. The only allowed direct reads of `resources/builtin` are seed/reconcile/build/eval flows that materialize or verify marketplace content. If platform code and a skill need the same logic, move that logic into a generic `src/main/features/*` or `src/main/util/*` module; skill scripts may call platform modules, but platform modules must not depend on a marketplace agent/skill. Runtime skill execution goes through `bin/run-skill.cjs` against the installed skill tier, not a packaged builtin path.
 - Agent/skill category belongs in the spec (`agent.json` or SKILL.md frontmatter); install freshness belongs in `_install.json` / install manifests.
 - Creator skills (`agent-creator`, `skill-creator`) are the canonical source for authoring semantics, validation details, and category candidates.
 - Creator skill paths under the PC data root: `<uid>/local/marketplace/skills/16e1bfcb3426/SKILL.md` (`agent-creator`) and `<uid>/local/marketplace/skills/efb0fe5d9664/SKILL.md` (`skill-creator`).

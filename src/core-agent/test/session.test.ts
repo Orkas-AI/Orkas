@@ -241,7 +241,7 @@ describe("Session", () => {
     expect(persisted).toEqual(["call-1"]);
   });
 
-  it("compacts old tool_use inputs only in the model view", () => {
+  it("compacts old tool_use inputs to inert metadata only in the model view", () => {
     const session = new Session({
       toolResultCompaction: {
         minChars: 999_999,
@@ -270,13 +270,25 @@ describe("Session", () => {
       .filter((c) => c.type === "tool_use") as Array<{ input: Record<string, unknown> }>;
 
     expect(toolUses).toHaveLength(2);
-    expect(toolUses[0].input.path).toBe("/tmp/a.txt");
-    expect(toolUses[0].input.__orkas_context_note).toEqual(expect.stringContaining("original_json_chars"));
-    expect(toolUses[0].input.content).toEqual(expect.stringContaining("old tool input string compacted"));
-    expect(toolUses[0].input.content).toEqual(expect.stringContaining("START-"));
-    expect(toolUses[0].input.content).toEqual(expect.stringContaining("-END"));
-    expect(toolUses[0].input.content).not.toBe(fileContent);
-    expect(toolUses[1].input.command).toEqual(expect.stringContaining("old tool input string compacted"));
+    expect(toolUses[0].input).not.toHaveProperty("path");
+    expect(toolUses[0].input).not.toHaveProperty("content");
+    expect(toolUses[0].input.__orkas_compacted_tool_use).toMatchObject({
+      tool: "write_file",
+      mode: "aggregate-ref",
+      input_keys: ["path", "content"],
+    });
+    expect(toolUses[1].input).not.toHaveProperty("command");
+    expect(toolUses[1].input.__orkas_compacted_tool_use).toMatchObject({
+      tool: "bash",
+      mode: "aggregate-ref",
+      input_keys: ["command"],
+    });
+    const serialized = JSON.stringify(toolUses.map((u) => u.input));
+    expect(serialized).not.toContain("old tool input string compacted");
+    expect(serialized).not.toContain("START-");
+    expect(serialized).not.toContain("-END");
+    expect(serialized).not.toContain(fileContent);
+    expect(serialized).not.toContain(command);
 
     const rawToolUse = session.getMessages()[0].content[0];
     expect(rawToolUse.type).toBe("tool_use");
@@ -309,10 +321,35 @@ describe("Session", () => {
     const commands = session.getMessagesForModel()
       .flatMap((m) => m.content)
       .filter((c) => c.type === "tool_use")
-      .map((c) => (c as { input: Record<string, unknown> }).input.command);
+      .map((c) => (c as { input: Record<string, unknown> }).input);
 
-    expect(commands[0]).toEqual(expect.stringContaining("old tool input string compacted"));
-    expect(commands[1]).toBe(freshCommand);
+    expect(commands[0]).toHaveProperty("__orkas_compacted_tool_use");
+    expect(commands[0]).not.toHaveProperty("command");
+    expect(commands[1].command).toBe(freshCommand);
+  });
+
+  it("uses inert old tool_use metadata in the summary view", () => {
+    const session = new Session({
+      toolResultCompaction: {
+        minChars: 999_999,
+        aggregateMinChars: 999_999,
+        toolUseInputMinChars: 100,
+        keepRecentAssistantSteps: 0,
+        keepRecentToolResults: 0,
+        keepRecentToolUses: 0,
+      },
+    });
+    const html = "<!doctype html>" + "x".repeat(1_000);
+
+    session.addAssistantMessage([{ type: "tool_use", id: "call-html", name: "create_artifact", input: { files: [{ path: "index.html", content: html }] } }]);
+    session.addToolResult("call-html", "Artifact created", undefined, false);
+    session.addAssistantMessage([{ type: "text", text: "seen" }]);
+
+    const serialized = JSON.stringify(session.getMessagesForSummary());
+    expect(serialized).toContain("__orkas_compacted_tool_use");
+    expect(serialized).not.toContain("old tool input string compacted");
+    expect(serialized).not.toContain("<!doctype html>");
+    expect(serialized).not.toContain(html);
   });
 
   it("estimateModelTokens uses the compacted provider view", () => {

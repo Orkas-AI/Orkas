@@ -19,7 +19,7 @@ import { toToolDefinition } from "../tools/base.js";
 import { getBuiltinTools } from "../tools/builtin.js";
 import { SkillStore } from "../evolution/skill-store.js";
 import { createSkillManageTool } from "../evolution/skill-tools.js";
-import { Session } from "./session.js";
+import { COMPACTED_TOOL_USE_INPUT_KEY, Session } from "./session.js";
 import type { AgentRunParams, AgentRunResult, AgentRunMeta, AgentRunEvent } from "./types.js";
 
 const log = createLogger("agent-runner");
@@ -917,7 +917,7 @@ export class AgentRunner {
     systemPrompt: string,
     cacheRetention?: "none" | "short" | "long",
   ): Promise<string> {
-    const messages = this.session.getMessagesForModel();
+    const messages = this.session.getMessagesForSummary();
     if (messages.length <= 4) return '';
 
     // Ask the LLM to summarize the conversation
@@ -1162,6 +1162,18 @@ async function runToolWithWatchdog(opts: {
   };
 
   if (signal?.aborted) return abortResult();
+  const compactedInputMarker = findCompactedToolInputMarker(call.input);
+  if (compactedInputMarker) {
+    const result = {
+      content:
+        `Rejected ${call.name}: tool input contains an Orkas compacted-history marker (${compactedInputMarker}). ` +
+        "This is only a preview of an already executed old tool call, not valid tool input. " +
+        "Inspect the paired tool_result, read the current file, or regenerate the full arguments before calling a tool.",
+      isError: true,
+    };
+    emitToolEnd(result);
+    return { result };
+  }
 
   const toolAbort = createChildAbortController(signal);
   const toolIdle = createToolIdleWatchdog(toolIdleTimeoutMs);
@@ -1233,6 +1245,45 @@ async function runToolWithWatchdog(opts: {
     toolIdle.cancel();
     toolAbort.cleanup();
   }
+}
+
+function findCompactedToolInputMarker(value: unknown): string | null {
+  const visit = (entry: unknown): string | null => {
+    if (typeof entry === "string") {
+      if (entry.startsWith("[old tool input string compacted:")) {
+        return "[old tool input string compacted]";
+      }
+      if (entry.startsWith("[old nested tool input ")) {
+        return "[old nested tool input]";
+      }
+      if (/^Old .+ tool input compacted for repeated context;/.test(entry)) {
+        return "old tool input context note";
+      }
+      return null;
+    }
+    if (Array.isArray(entry)) {
+      for (const item of entry) {
+        const found = visit(item);
+        if (found) return found;
+      }
+      return null;
+    }
+    if (entry && typeof entry === "object") {
+      const record = entry as Record<string, unknown>;
+      if (Object.prototype.hasOwnProperty.call(record, "__orkas_context_note")) {
+        return "__orkas_context_note";
+      }
+      if (Object.prototype.hasOwnProperty.call(record, COMPACTED_TOOL_USE_INPUT_KEY)) {
+        return COMPACTED_TOOL_USE_INPUT_KEY;
+      }
+      for (const item of Object.values(record)) {
+        const found = visit(item);
+        if (found) return found;
+      }
+    }
+    return null;
+  };
+  return visit(value);
 }
 
 async function executeReflectionTool(

@@ -6328,6 +6328,25 @@ body.model-not-configured .main-content { flex-direction: column; }
   border: 0;
   background: #fff;
 }
+.chat-artifact-unavailable {
+  min-height: 180px;
+  padding: 22px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 6px;
+  background: #fff;
+  color: var(--muted);
+}
+.chat-artifact-unavailable-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.chat-artifact-unavailable-detail {
+  font-size: 13px;
+  line-height: 1.4;
+}
 /* Card-header `⋯` popover (reload / open / save) + the My Apps
    panel's per-card `⋯` popover — both mirror `.agent-row-menu`'s look. */
 .chat-artifact-menu,

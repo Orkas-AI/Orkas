@@ -158,6 +158,112 @@ describe("AgentRunner", () => {
     expect(result.meta.toolLoops).toBe(1);
   });
 
+  it("rejects compacted historical tool input before executing the tool", async () => {
+    const mockProvider = createMockProvider([
+      {
+        content: [
+          {
+            type: "tool_use",
+            id: "call_compacted",
+            name: "write_file",
+            input: {
+              path: "index.html",
+              content:
+                "[old tool input string compacted: original_size=13653 chars]\n" +
+                "preview_head:\n<!doctype html>",
+              __orkas_context_note:
+                "Old write_file tool input compacted for repeated context; mode=full-preview, original_json_chars=14000.",
+            },
+          },
+          {
+            type: "tool_use",
+            id: "call_new_compacted",
+            name: "write_file",
+            input: {
+              __orkas_compacted_tool_use: {
+                tool: "write_file",
+                mode: "full-preview",
+                original_json_chars: 14000,
+                input_keys: ["path", "content"],
+              },
+            },
+          },
+        ],
+        stopReason: "tool_use",
+        usage: { inputTokens: 20, outputTokens: 10, totalTokens: 30 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "I will regenerate the file instead." }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 30, outputTokens: 8, totalTokens: 38 },
+        model: "mock-model",
+      },
+    ]);
+
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+
+    let executed = 0;
+    const writeTool = defineTool({
+      name: "write_file",
+      description: "Write a file",
+      inputSchema: { type: "object", properties: {} },
+      async execute() {
+        executed++;
+        return { content: "wrote" };
+      },
+    });
+
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model" },
+    });
+
+    const runner = new AgentRunner({ config, providers: registry, tools: [writeTool] });
+    const collected: Array<{ type: string; [k: string]: unknown }> = [];
+    for await (const ev of runner.runStream({ message: "go" })) {
+      collected.push(ev as { type: string; [k: string]: unknown });
+    }
+    expect(executed).toBe(0);
+    const toolEnd = collected.find((e) => e.type === "tool_end");
+    expect(toolEnd).toMatchObject({
+      type: "tool_end",
+      id: "call_compacted",
+      name: "write_file",
+      isError: true,
+    });
+    expect(String(toolEnd?.result)).toContain("compacted-history marker");
+    const newToolEnd = collected.find((e) => e.type === "tool_end" && e.id === "call_new_compacted");
+    expect(newToolEnd).toMatchObject({
+      type: "tool_end",
+      id: "call_new_compacted",
+      name: "write_file",
+      isError: true,
+    });
+    expect(String(newToolEnd?.result)).toContain("__orkas_compacted_tool_use");
+
+    const toolResults = runner.getSession().getMessages().flatMap((msg) =>
+      msg.content.filter((content) => content.type === "tool_result"),
+    );
+    expect(toolResults).toHaveLength(2);
+    expect(toolResults[0]).toMatchObject({
+      type: "tool_result",
+      toolUseId: "call_compacted",
+      isError: true,
+    });
+    expect((toolResults[0] as { content: string }).content).toContain("not valid tool input");
+    expect(toolResults[1]).toMatchObject({
+      type: "tool_result",
+      toolUseId: "call_new_compacted",
+      isError: true,
+    });
+
+    const done = collected[collected.length - 1] as { type: string; result?: { text?: string; meta?: { permanentToolErrors?: number } } };
+    expect(done.type).toBe("done");
+    expect(done.result?.text).toBe("I will regenerate the file instead.");
+    expect(done.result?.meta?.permanentToolErrors).toBe(2);
+  });
+
   it("endTurn terminal tool ends the run with NO follow-up inference", async () => {
     // Round 0: model narrates + calls the terminal tool. Round 1 (a synthesis)
     // must NEVER be consumed — that is the saved LLM call.

@@ -71,6 +71,13 @@ const META_FILENAME = '__orkas-meta.json';
 export const RESERVED_PREFIX = '__orkas/';
 export const BRIDGE_RELPATH = '__orkas/bridge.js';
 
+const COMPACTED_HISTORY_MARKERS = [
+  '[old tool input string compacted:',
+  '[old nested tool input ',
+  '__orkas_context_note',
+  '__orkas_compacted_tool_use',
+];
+
 // ── Types ────────────────────────────────────────────────────────────────
 
 export type Result<T = {}> = ({ ok: true } & T) | { ok: false; error: string };
@@ -90,6 +97,10 @@ export interface ArtifactMeta {
 interface ResolveOk { ok: true; absPath: string; mime: string }
 interface ResolveErr { ok: false; code: 'bad_input' | 'forbidden' | 'not_found'; error: string }
 export type ResolveResult = ResolveOk | ResolveErr;
+export type ArtifactInspection =
+  | { ok: true; status: 'ok' }
+  | { ok: true; status: 'unavailable'; reason: string; marker?: string }
+  | { ok: false; error: string };
 
 // ── Safe-name helpers ────────────────────────────────────────────────────
 
@@ -293,6 +304,13 @@ export function createArtifact(
       }
       buf = Buffer.from(f.content, 'base64'); // tolerant of url-safe alphabet + whitespace
     } else {
+      const compactedMarker = findCompactedHistoryMarker(f.content);
+      if (compactedMarker) {
+        return {
+          ok: false,
+          error: `file "${rel}": contains compacted conversation-history marker ${compactedMarker}; regenerate the full artifact content before creating it`,
+        };
+      }
       buf = Buffer.from(f.content, 'utf8');
       if (buf.toString('utf8') !== f.content) return { ok: false, error: `file "${rel}": content is not valid UTF-8` };
     }
@@ -345,6 +363,38 @@ export function createArtifact(
   log.info(`createArtifact user=${userId} cid=${safeConvId} id=${artifactId} files=${prepared.length} bytes=${totalBytes} agent=${meta.agentId}`);
   notifyArtifactDirty(safeConvId, artifactId);
   return { ok: true, artifactId, title };
+}
+
+function findCompactedHistoryMarker(content: string): string | null {
+  for (const marker of COMPACTED_HISTORY_MARKERS) {
+    if (content.includes(marker)) return marker;
+  }
+  if (/Old .+ tool input compacted for repeated context;/.test(content)) {
+    return 'old tool input context note';
+  }
+  return null;
+}
+
+export function inspectArtifactIndex(userId: string, cid: string, artifactId: string): ArtifactInspection {
+  const resolved = resolveArtifactFilePath(userId, cid, artifactId, 'index.html');
+  if (!resolved.ok) {
+    return { ok: true, status: 'unavailable', reason: (resolved as { error?: string }).error || 'artifact index is unavailable' };
+  }
+  try {
+    const content = fs.readFileSync((resolved as { absPath: string }).absPath, 'utf8');
+    const marker = findCompactedHistoryMarker(content);
+    if (marker) {
+      return {
+        ok: true,
+        status: 'unavailable',
+        reason: 'artifact index contains compacted conversation-history content',
+        marker,
+      };
+    }
+    return { ok: true, status: 'ok' };
+  } catch (err) {
+    return { ok: false, error: (err as Error).message || 'failed to inspect artifact index' };
+  }
 }
 
 /** Resolve (uid, cid, artifactId) → the validated, existing artifact directory.

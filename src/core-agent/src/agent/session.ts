@@ -63,6 +63,8 @@ const DEFAULT_TOOL_RESULT_COMPACTION: NormalizedToolResultCompactionOptions = {
 type ToolResultCompactionMode = "full-preview" | "aggregate-ref";
 type ToolUseInputCompactionMode = "full-preview" | "aggregate-ref";
 
+export const COMPACTED_TOOL_USE_INPUT_KEY = "__orkas_compacted_tool_use";
+
 /**
  * Session manages the conversation history for an agent run.
  *
@@ -141,6 +143,22 @@ export class Session {
    * old image bytes. The image can still be reopened by calling read_file(path).
    */
   getMessagesForModel(): Message[] {
+    return this.buildMessagesForModel();
+  }
+
+  /**
+   * Get the summarizer-facing view of the session.
+   *
+   * This is intentionally built from raw session messages, not by reusing a
+   * previously materialized model view. Old tool inputs are represented as
+   * inert metadata so compaction summaries cannot learn executable-looking
+   * preview arguments from historical tool calls.
+   */
+  getMessagesForSummary(): Message[] {
+    return this.buildMessagesForModel();
+  }
+
+  private buildMessagesForModel(): Message[] {
     let lastAssistantIndex = -1;
     for (let i = this.messages.length - 1; i >= 0; i--) {
       if (this.messages[i].role === "assistant") {
@@ -430,18 +448,16 @@ export class Session {
     rawInputJson: string,
     mode: ToolUseInputCompactionMode,
   ): Record<string, unknown> {
-    const opts = this.toolResultCompaction;
-    if (!opts) return input;
-
-    const compacted = compactToolUseValue(input, opts, 0);
-    if (!isPlainObject(compacted)) return input;
-
-    const note = (
-      `Old ${toolName} tool input compacted for repeated context; ` +
-      `mode=${mode}, original_json_chars=${rawInputJson.length}. ` +
-      "The tool call already executed; inspect the paired tool_result or current files if more detail is needed."
-    );
-    return { ...compacted, __orkas_context_note: note };
+    return {
+      [COMPACTED_TOOL_USE_INPUT_KEY]: {
+        tool: toolName,
+        mode,
+        original_json_chars: rawInputJson.length,
+        input_keys: Object.keys(input).slice(0, 20),
+        note:
+          "Historical tool input omitted from model context. This call already executed; inspect the paired tool_result or current files instead of reusing this object as tool input.",
+      },
+    };
   }
 
   private compactToolResultContent(
@@ -562,74 +578,12 @@ function isImageOnlyMessage(msg: Message): boolean {
   return msg.role === "user" && msg.content.length > 0 && msg.content.every((c) => c.type === "image");
 }
 
-const TOOL_USE_ARRAY_HEAD_ITEMS = 16;
-const TOOL_USE_ARRAY_TAIL_ITEMS = 4;
-const TOOL_USE_INPUT_MAX_DEPTH = 8;
-
-function compactToolUseValue(
-  value: unknown,
-  opts: NormalizedToolResultCompactionOptions,
-  depth: number,
-): unknown {
-  if (typeof value === "string") return compactToolUseString(value, opts);
-  if (Array.isArray(value)) {
-    if (depth >= TOOL_USE_INPUT_MAX_DEPTH) {
-      return `[old nested tool input array omitted: items=${value.length}]`;
-    }
-    const compactItem = (item: unknown) => compactToolUseValue(item, opts, depth + 1);
-    const keepCount = TOOL_USE_ARRAY_HEAD_ITEMS + TOOL_USE_ARRAY_TAIL_ITEMS;
-    if (value.length <= keepCount + 1) return value.map(compactItem);
-    return [
-      ...value.slice(0, TOOL_USE_ARRAY_HEAD_ITEMS).map(compactItem),
-      { __orkas_omitted_array_items: value.length - keepCount },
-      ...value.slice(-TOOL_USE_ARRAY_TAIL_ITEMS).map(compactItem),
-    ];
-  }
-  if (isPlainObject(value)) {
-    if (depth >= TOOL_USE_INPUT_MAX_DEPTH) {
-      return `[old nested tool input object omitted: keys=${Object.keys(value).length}]`;
-    }
-    const out: Record<string, unknown> = {};
-    for (const [key, entry] of Object.entries(value)) {
-      out[key] = compactToolUseValue(entry, opts, depth + 1);
-    }
-    return out;
-  }
-  return value;
-}
-
-function compactToolUseString(
-  value: string,
-  opts: NormalizedToolResultCompactionOptions,
-): string {
-  if (value.length < opts.toolUseInputStringMinChars) return value;
-
-  const previewChars = Math.max(32, opts.toolUseInputPreviewChars);
-  const headChars = Math.ceil(previewChars * 0.7);
-  const tailChars = Math.max(0, previewChars - headChars);
-  const head = value.slice(0, headChars);
-  const tail = tailChars > 0 && value.length > headChars + tailChars
-    ? value.slice(-tailChars)
-    : "";
-  const tailBlock = tail ? `\npreview_tail:\n${tail}` : "";
-  const compacted = (
-    `[old tool input string compacted: original_size=${value.length} chars]\n` +
-    `preview_head:\n${head}` +
-    tailBlock
-  );
-  return compacted.length < value.length ? compacted : value;
-}
-
 function stringifyToolInput(input: Record<string, unknown>): string {
   try {
     return JSON.stringify(input) ?? "";
   } catch {
     return String(input);
   }
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
 function escapeAttr(value: string): string {
