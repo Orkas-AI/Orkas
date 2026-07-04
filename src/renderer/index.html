@@ -71,6 +71,13 @@
            Greeting is filled in by JS lifecycle hooks; see
            _refreshEmptyStateGreeting. -->
       <section class="panel active" id="panel-new-chat">
+        <button type="button" class="new-chat-external-agent-btn" id="new-chat-external-agent-btn">
+          <span data-ui-icon="terminal" data-ui-icon-class="new-chat-external-agent-icon"></span>
+          <span class="new-chat-external-agent-label">
+            <span data-i18n="new_chat.external_agent_entry">Connect Codex, Claude Code &amp; other AI coding tools</span>
+            <span data-ui-icon="arrow-right" data-ui-icon-class="new-chat-external-agent-arrow"></span>
+          </span>
+        </button>
         <div class="new-chat-center">
           <div class="new-chat-header">
             <h1 class="new-chat-greeting" id="new-chat-greeting"></h1>
@@ -85,14 +92,15 @@
               <div class="chat-input-overlay">
                 <div class="chat-attachments" id="new-chat-attachments" style="display:none"></div>
               </div>
-              <textarea id="new-chat-input" data-i18n-placeholder="new_chat.input_placeholder" placeholder="Type @ to choose agents, skills, connectors." rows="2"></textarea>
+              <textarea id="new-chat-input" data-i18n-placeholder="new_chat.input_placeholder" placeholder="Type @ to choose agents, skills, connectors, Library files." rows="2"></textarea>
               <!-- Composer bottom bar order matches PC/docs/design/PATTERNS.md
                    P11: [+] | divider | [To] | [workspace - JS-injected] |
-                   [skill] | spacer | [send].                    right by `chat-send-btn { margin-left: auto }`. -->
+                   [skill] | spacer | [send]. The open-source build strips
+                   voice input, so send owns the right spacer. -->
               <div class="chat-bottom-bar">
                 <button type="button" class="chat-attach-btn" id="new-chat-attach-btn" data-i18n-title="new_chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
                 <span class="chat-composer-divider" aria-hidden="true"></span>
-                <button type="button" class="chat-recipient-chip" id="new-chat-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Choose agent, skill, or connector">
+                <button type="button" class="chat-recipient-chip" id="new-chat-recipient-chip" data-i18n-title="chat.recipient_picker_title_with_library" title="Choose agent, skill, connector, or Library file">
                   <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
                   <span class="chat-recipient-name" id="new-chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
                 </button>
@@ -102,7 +110,9 @@
                      sync without duplicating the markup. -->
                 <div class="chat-skill-chip" id="new-chat-skill-chip" data-target="new-chat" style="display:none">
                   <span class="chip-label"></span>
-                  <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
+                  <button type="button" class="chip-close" data-i18n-title="chat.chip_remove_title" data-i18n-aria-label="chat.chip_remove_title" title="Remove" aria-label="Remove">
+                    <span data-ui-icon="x" data-ui-icon-class="chip-close-icon"></span>
+                  </button>
                 </div>
                 <button id="new-chat-send-btn" class="chat-send-btn" data-i18n-title="new_chat.send_title" title="Send">
                   <span data-ui-icon="send" data-ui-icon-class="send-icon"></span>
@@ -115,29 +125,29 @@
                the caret to the first [...] placeholder. Wired by
                _initEmptyStateScenarios() in conversation.js. -->
           <div class="new-chat-scenarios" id="new-chat-scenarios">
-            <button type="button" class="new-chat-scenario-chip" data-scenario="education">
-              <span data-ui-icon="book-open" data-ui-icon-class="new-chat-scenario-icon"></span>
-              <span class="new-chat-scenario-label" data-i18n="new_chat.quick.education">Learning</span>
-            </button>
-            <button type="button" class="new-chat-scenario-chip" data-scenario="ecommerce">
+            <button type="button" class="new-chat-scenario-chip" data-scenario="data">
               <span data-ui-icon="search" data-ui-icon-class="new-chat-scenario-icon"></span>
-              <span class="new-chat-scenario-label" data-i18n="new_chat.quick.ecommerce">Ecommerce</span>
+              <span class="new-chat-scenario-label" data-i18n="new_chat.quick.data">Research</span>
+            </button>
+            <button type="button" class="new-chat-scenario-chip" data-scenario="video">
+              <span data-ui-icon="film" data-ui-icon-class="new-chat-scenario-icon"></span>
+              <span class="new-chat-scenario-label" data-i18n="new_chat.quick.video">Make video</span>
+            </button>
+            <button type="button" class="new-chat-scenario-chip" data-scenario="seo_geo">
+              <span data-ui-icon="globe" data-ui-icon-class="new-chat-scenario-icon"></span>
+              <span class="new-chat-scenario-label" data-i18n="new_chat.quick.seo_geo">SeoGeo</span>
+            </button>
+            <button type="button" class="new-chat-scenario-chip" data-scenario="office">
+              <span data-ui-icon="file-text" data-ui-icon-class="new-chat-scenario-icon"></span>
+              <span class="new-chat-scenario-label" data-i18n="new_chat.quick.office">Documents</span>
             </button>
             <button type="button" class="new-chat-scenario-chip" data-scenario="rnd">
               <span data-ui-icon="code" data-ui-icon-class="new-chat-scenario-icon"></span>
               <span class="new-chat-scenario-label" data-i18n="new_chat.quick.rnd">Build app</span>
             </button>
-            <button type="button" class="new-chat-scenario-chip" data-scenario="creation">
-              <span data-ui-icon="document-pencil" data-ui-icon-class="new-chat-scenario-icon"></span>
-              <span class="new-chat-scenario-label" data-i18n="new_chat.quick.creation">Writing</span>
-            </button>
-            <button type="button" class="new-chat-scenario-chip" data-scenario="data">
-              <span data-ui-icon="globe" data-ui-icon-class="new-chat-scenario-icon"></span>
-              <span class="new-chat-scenario-label" data-i18n="new_chat.quick.data">Research</span>
-            </button>
-            <button type="button" class="new-chat-scenario-chip" data-scenario="office">
-              <span data-ui-icon="file-text" data-ui-icon-class="new-chat-scenario-icon"></span>
-              <span class="new-chat-scenario-label" data-i18n="new_chat.quick.office">Documents</span>
+            <button type="button" class="new-chat-scenario-chip" data-scenario="education">
+              <span data-ui-icon="book-open" data-ui-icon-class="new-chat-scenario-icon"></span>
+              <span class="new-chat-scenario-label" data-i18n="new_chat.quick.education">Learning</span>
             </button>
           </div>
           <!-- Open-source-driven「还能帮你做这些」capability strip. Task cards are
