@@ -175,20 +175,62 @@ function electronBinaryPath() {
   }
 }
 
-function electronReady() {
-  const bin = electronBinaryPath();
+function electronPlatformPath() {
+  switch (process.platform) {
+    case 'darwin':
+      return 'Electron.app/Contents/MacOS/Electron';
+    case 'win32':
+      return 'electron.exe';
+    default:
+      return 'electron';
+  }
+}
+
+function electronDarwinAppRoot(bin) {
+  const marker = `${path.sep}Contents${path.sep}MacOS${path.sep}Electron`;
+  if (!bin.endsWith(marker)) return '';
+  return bin.slice(0, -marker.length);
+}
+
+function electronDistReady(distDir, relPath, expected) {
+  const bin = path.join(distDir, relPath);
   if (!bin || !fs.existsSync(bin)) return false;
 
-  const expected = electronExpectedVersion();
-  if (!expected) return false;
   try {
-    const actual = fs.readFileSync(path.join(ELECTRON_DIR, 'dist', 'version'), 'utf8').trim().replace(/^v/, '');
+    const actual = fs.readFileSync(path.join(distDir, 'version'), 'utf8').trim().replace(/^v/, '');
     if (actual !== expected) return false;
   } catch {
     return false;
   }
 
+  if (process.platform === 'darwin') {
+    const appRoot = electronDarwinAppRoot(bin);
+    if (!appRoot) return false;
+    const framework = path.join(
+      appRoot,
+      'Contents',
+      'Frameworks',
+      'Electron Framework.framework',
+      'Versions',
+      'A',
+      'Electron Framework',
+    );
+    if (!fs.existsSync(framework)) return false;
+  }
+
   return true;
+}
+
+function electronReady() {
+  const expected = electronExpectedVersion();
+  if (!expected) return false;
+  try {
+    const rel = fs.readFileSync(ELECTRON_PATH_TXT, 'utf8').trim();
+    if (!rel) return false;
+    return electronDistReady(path.join(ELECTRON_DIR, 'dist'), rel, expected);
+  } catch {
+    return false;
+  }
 }
 
 function runElectronInstall(reason) {
@@ -213,11 +255,97 @@ function runElectronInstall(reason) {
   }
 }
 
+function electronDownloadArch() {
+  const envArch = process.env.npm_config_arch || '';
+  if (envArch) return envArch;
+  return process.arch;
+}
+
+function electronDownloadPlatform() {
+  return process.env.npm_config_platform || process.platform;
+}
+
+function downloadElectronZip(expected) {
+  const script = `
+const { downloadArtifact } = require('@electron/get');
+const path = require('node:path');
+downloadArtifact({
+  version: ${JSON.stringify(expected)},
+  artifactName: 'electron',
+  platform: ${JSON.stringify(electronDownloadPlatform())},
+  arch: ${JSON.stringify(electronDownloadArch())},
+  checksums: require(${JSON.stringify(path.join(ELECTRON_DIR, 'checksums.json'))}),
+}).then((p) => process.stdout.write(String(p))).catch((err) => {
+  console.error(err && err.stack || err);
+  process.exit(1);
+});
+`;
+  const res = spawnSync(process.execPath, ['-e', script], {
+    cwd: PC_DIR,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    shell: false,
+  });
+  if (res.error) {
+    console.warn('[Orkas] Electron zip lookup failed to start:', res.error.message);
+    return '';
+  }
+  if (res.status !== 0) {
+    const err = String(res.stderr || '').trim();
+    console.warn('[Orkas] Electron zip lookup failed:', err || `exit ${res.status}`);
+    return '';
+  }
+  return String(res.stdout || '').trim();
+}
+
+function repairElectronByUnzip(reason) {
+  if (process.platform === 'win32') return false;
+  const expected = electronExpectedVersion();
+  if (!expected) return false;
+
+  const zip = downloadElectronZip(expected);
+  if (!zip || !fs.existsSync(zip)) return false;
+
+  const relPath = electronPlatformPath();
+  const distDir = path.join(ELECTRON_DIR, 'dist');
+  const tmpDir = path.join(ELECTRON_DIR, `.dist-extract-${process.pid}`);
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.mkdirSync(tmpDir, { recursive: true });
+
+  console.log(`[Orkas] Electron install script did not complete (${reason}); extracting cached Electron archive...`);
+  const unzip = spawnSync('unzip', ['-q', '-o', zip, '-d', tmpDir], {
+    cwd: PC_DIR,
+    stdio: 'inherit',
+    shell: false,
+  });
+  if (unzip.error) {
+    console.warn('[Orkas] unzip failed to start:', unzip.error.message);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    return false;
+  }
+  if (unzip.status !== 0) {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    return false;
+  }
+
+  if (!electronDistReady(tmpDir, relPath, expected)) {
+    console.warn('[Orkas] Extracted Electron archive is incomplete.');
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    return false;
+  }
+
+  fs.rmSync(distDir, { recursive: true, force: true });
+  fs.renameSync(tmpDir, distDir);
+  fs.writeFileSync(ELECTRON_PATH_TXT, relPath, 'utf8');
+  return true;
+}
+
 function ensureElectronReady(reason = 'missing binary') {
   if (electronReady()) return;
 
   runElectronInstall(reason);
   if (electronReady()) return;
+  if (repairElectronByUnzip(reason) && electronReady()) return;
 
   const bin = electronBinaryPath() || '<missing path.txt>';
   console.error('[Orkas] Electron is still incomplete after repair.');
