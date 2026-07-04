@@ -11815,6 +11815,22 @@ body.model-not-configured .main-content { flex-direction: column; }
    skills-grid-header. Keeps `+ Create` / `More` glued together while the parent
    header's `justify-content: space-between` still separates title from cluster. */
 .header-actions { display: flex; gap: 8px; align-items: center; }
+/* AI Team page header: bold title with a muted definition subtitle inline to
+   its RIGHT (baseline-aligned); action buttons stay right-aligned. The title
+   never shrinks; the subtitle truncates so a long definition can't push the
+   buttons off the row. */
+.agents-grid-header-titles { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.agents-grid-title { flex-shrink: 0; }
+.agents-grid-subtitle {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-2);
+  line-height: 1.4;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* ─── Marketplace panel ─── */
 /* Full-page panel mirroring .agents-grid-view sizing: fill the parent .panel column. */
@@ -12057,6 +12073,19 @@ body.model-not-configured .main-content { flex-direction: column; }
   padding: 8px 0 16px;
 }
 .marketplace-grid:empty { display: none; }
+/* Tab card grids use the same max-4-column responsive formula as connectors:
+   cards stay compact enough for four columns on normal desktop widths, then
+   expand evenly instead of drifting into extra-wide three-column rows. */
+.skills-grid,
+.skills-source-section-grid,
+.agents-grid,
+.agents-source-section-grid,
+.marketplace-grid {
+  --tab-card-min: 240px;
+  --tab-grid-gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, max(var(--tab-card-min), calc((100% - (3 * var(--tab-grid-gap))) / 4))), 1fr));
+  gap: var(--tab-grid-gap);
+}
 /* Invisible IntersectionObserver target for infinite scroll. Real preload margin comes
    from `rootMargin` in JS — this just needs to be a reliably-observable element. */
 .mp-load-more-sentinel { height: 1px; width: 100%; }

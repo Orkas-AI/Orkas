@@ -68,6 +68,12 @@ describe('synced PC surface regressions', () => {
     expect(chipBlock).toContain('box-sizing: border-box;');
     expect(chipBlock).toContain('min-height: 20px;');
     expect(chipBlock).toContain('line-height: 1.2;');
+
+    expect(css).toContain('.skills-grid,\n.skills-source-section-grid,\n.agents-grid,\n.agents-source-section-grid,\n.marketplace-grid');
+    expect(css).toContain('--tab-card-min: 240px;');
+    expect(css).toContain('calc((100% - (3 * var(--tab-grid-gap))) / 4)');
+    expect(css).toContain('.agents-grid-header-titles');
+    expect(css).toContain('.agents-grid-subtitle');
   });
 
   it('keeps the external-agent entry copy aligned with Orkas AI coding tools wording', () => {
