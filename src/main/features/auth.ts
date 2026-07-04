@@ -240,14 +240,32 @@ export interface VideoProfile {
   createdAt: number;
 }
 
+/** BYO text-to-speech provider. Open-source builds only store user-owned keys:
+ *  - OpenAI-compatible `/audio/speech`: `baseUrl`, `model`, bearer `apiKey`.
+ *  - `doubao`: V3 X-Api-Key plus optional `resourceId` and speaker `voice`.
+ *  `voice`/`format` are per-request defaults for downstream speech tools. */
+export interface TtsProfile {
+  id: string;
+  provider: string;          // openai | doubao | elevenlabs | custom
+  baseUrl: string;           // e.g. https://api.openai.com/v1
+  model: string;             // OpenAI-compatible TTS model id ('' for doubao)
+  apiKey: string;            // bearer key, or doubao V3 X-Api-Key
+  resourceId?: string;       // doubao only: optional X-Api-Resource-Id override
+  voice?: string;            // default voice id / voice_type
+  format?: string;           // default response_format / encoding
+  label: string;
+  createdAt: number;
+}
+
 interface ProfilesFile {
-  /** v3 = chat profiles only. v4 adds BYO search / image / video profiles. */
+  /** v3 = chat profiles only. v4 adds BYO search / image / video / speech profiles. */
   version: number;
   profiles: Record<string, StoredProfile>;
   entries: Entry[];
   searchProfiles?: SearchProfile[];
   imageProfiles?: ImageProfile[];
   videoProfiles?: VideoProfile[];
+  ttsProfiles?: TtsProfile[];
 }
 
 const PROFILES_FILE_VERSION = 4;
@@ -351,7 +369,8 @@ function loadProfiles(): ProfilesFile {
       const searchProfiles = parseSearchProfilesArray((data as any).searchProfiles);
       const imageProfiles = parseImageProfilesArray((data as any).imageProfiles);
       const videoProfiles = parseVideoProfilesArray((data as any).videoProfiles);
-      const store = { version: PROFILES_FILE_VERSION, profiles, entries, searchProfiles, imageProfiles, videoProfiles };
+      const ttsProfiles = parseTtsProfilesArray((data as any).ttsProfiles);
+      const store = { version: PROFILES_FILE_VERSION, profiles, entries, searchProfiles, imageProfiles, videoProfiles, ttsProfiles };
       if (needsRewrite) saveProfiles(store);
       return store;
     }
@@ -360,7 +379,7 @@ function loadProfiles(): ProfilesFile {
       log.warn('failed to load profiles store:', (err as Error).message);
     }
   }
-  return { version: PROFILES_FILE_VERSION, profiles: {}, entries: [], searchProfiles: [], imageProfiles: [], videoProfiles: [] };
+  return { version: PROFILES_FILE_VERSION, profiles: {}, entries: [], searchProfiles: [], imageProfiles: [], videoProfiles: [], ttsProfiles: [] };
 }
 
 function parseSearchProfilesArray(arr: unknown): SearchProfile[] {
@@ -418,10 +437,37 @@ function parseVideoProfilesArray(arr: unknown): VideoProfile[] {
   return out;
 }
 
-// ── Search / Image / Video profiles store IO (low-level) ─────────────────
+function parseTtsProfilesArray(arr: unknown): TtsProfile[] {
+  if (!Array.isArray(arr)) return [];
+  const out: TtsProfile[] = [];
+  for (const raw of arr) {
+    const p = raw as any;
+    if (!p || typeof p !== 'object' || !p.id || !p.provider || !p.apiKey) continue;
+    const provider = String(p.provider || 'custom');
+    if (provider === 'orkas-voice') continue;
+    if (provider !== 'doubao' && !p.baseUrl) continue;
+    if (provider !== 'doubao' && !p.model) continue;
+    out.push({
+      id: String(p.id),
+      provider,
+      baseUrl: String(p.baseUrl || ''),
+      model: String(p.model || ''),
+      apiKey: String(p.apiKey),
+      ...(p.resourceId ? { resourceId: String(p.resourceId) } : {}),
+      ...(p.voice ? { voice: String(p.voice) } : {}),
+      ...(p.format ? { format: String(p.format) } : {}),
+      label: String(p.label || 'default'),
+      createdAt: typeof p.createdAt === 'number' ? p.createdAt : Date.now(),
+    });
+  }
+  return out;
+}
+
+// ── Search / Image / Video / TTS profiles store IO (low-level) ────────────
 //
 // These helpers expose the new top-level fields so feature modules
-// (`features/search_auth.ts`, `features/image_auth.ts`, `features/video_auth.ts`) can manage them
+// (`features/search_auth.ts`, `features/image_auth.ts`, `features/video_auth.ts`,
+// `features/tts_auth.ts`) can manage them
 // without re-implementing the load/save round-trip. Live in auth.ts so
 // the entire `auth-profiles.json` file has a single owner.
 
@@ -452,6 +498,16 @@ export function loadVideoProfiles(): VideoProfile[] {
 export function saveVideoProfiles(list: VideoProfile[]): void {
   const store = loadProfiles();
   store.videoProfiles = [...list];
+  saveProfiles(store);
+}
+
+export function loadTtsProfiles(): TtsProfile[] {
+  return loadProfiles().ttsProfiles || [];
+}
+
+export function saveTtsProfiles(list: TtsProfile[]): void {
+  const store = loadProfiles();
+  store.ttsProfiles = [...list];
   saveProfiles(store);
 }
 

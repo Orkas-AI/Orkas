@@ -20,6 +20,9 @@ let _settingsState = {
   pickerProviderEl: null,
   pickerModelEl: null,
   addBtnEl: null,
+  ttsPresets: [],
+  ttsProfiles: [],
+  ttsProviderSel: null,
   dragState: null,
   clientConfigBound: false,
 };
@@ -64,6 +67,7 @@ async function loadSettings() {
     _settingsSafeCall('settings search refresh', _settingsRefreshSearchProfiles),
     _settingsSafeCall('settings image refresh', _settingsRefreshImageProfiles),
     _settingsSafeCall('settings video refresh', _settingsRefreshVideoProfiles),
+    _settingsSafeCall('settings tts refresh', _settingsRefreshTtsProfiles),
     _settingsSafeCall('settings commander avatar refresh', _settingsRefreshCommanderAvatar),
     _settingsSafeCall('settings metacognition refresh', _settingsRefreshMetacognition),
     _settingsSafeCall('settings data root refresh', _settingsRefreshDataRoot),
@@ -74,6 +78,7 @@ async function loadSettings() {
   await _settingsSafeCall('settings search render', _settingsRenderSearchSection);
   await _settingsSafeCall('settings image render', _settingsRenderImageSection);
   await _settingsSafeCall('settings video render', _settingsRenderVideoSection);
+  await _settingsSafeCall('settings tts render', _settingsRenderTtsEntries);
   await _settingsSafeCall('settings commander avatar render', _settingsRenderCommanderAvatar);
   await _settingsSafeCall('settings metacognition render', _settingsRenderMetacognition);
   await _settingsSafeCall('settings data root render', _settingsRenderDataRoot);
@@ -1467,6 +1472,182 @@ function _settingsRenderVideoEntries() {
       onSuccess: async () => {
         await _settingsRefreshVideoProfiles();
         _settingsRenderVideoEntries();
+      },
+    });
+
+    container.appendChild(row);
+  });
+}
+
+// ── Text-to-speech API key section ─────────────────────────────────────────
+
+async function _settingsRefreshTtsProfiles() {
+  const res = await window.orkas.invoke('ttsAuth.list');
+  if (!res || !res.ok) return;
+  _settingsState.ttsPresets = Array.isArray(res.presets) ? res.presets : [];
+  _settingsState.ttsProfiles = Array.isArray(res.profiles) ? res.profiles : [];
+  const providerEl = document.getElementById('settings-tts-provider');
+  if (providerEl && !_settingsState.ttsProviderSel) {
+    _settingsState.ttsProviderSel = _aiSelectMount(providerEl, { placeholder: t('settings.tts.pick_provider') });
+    _settingsState.ttsProviderSel.onChange((id) => {
+      _settingsTtsPrefillProvider(id);
+      _settingsTtsApplyProviderFields(id);
+      _settingsSetStatus('settings-tts-status', '', '');
+    });
+  }
+  if (_settingsState.ttsProviderSel) {
+    const prev = _settingsState.ttsProviderSel.getValue();
+    _settingsState.ttsProviderSel.setOptions(
+      (_settingsState.ttsPresets || []).map((p) => ({ value: p.id, label: p.label, hint: p.docs })),
+      { value: prev || '', placeholder: t('settings.tts.pick_provider') },
+    );
+    _settingsTtsApplyProviderFields(_settingsState.ttsProviderSel.getValue());
+  }
+  const addBtn = document.getElementById('settings-tts-add-btn');
+  if (addBtn && !addBtn.dataset.bound) {
+    addBtn.dataset.bound = '1';
+    addBtn.addEventListener('click', _settingsClickAddTts);
+  }
+  _settingsRenderTtsEntries();
+}
+
+function _settingsTtsPreset(providerId) {
+  return (_settingsState.ttsPresets || []).find((p) => p.id === providerId);
+}
+
+function _ttsProviderLabel(id) {
+  const hit = (_settingsState.ttsPresets || []).find((p) => p.id === id);
+  return hit ? hit.label : (id || 'custom');
+}
+
+function _settingsTtsPrefillProvider(providerId) {
+  const preset = _settingsTtsPreset(providerId);
+  const baseInput = document.getElementById('settings-tts-base-input');
+  const modelInput = document.getElementById('settings-tts-model-input');
+  const voiceInput = document.getElementById('settings-tts-voice-input');
+  const resInput = document.getElementById('settings-tts-doubao-resource');
+  if (baseInput) baseInput.value = preset?.baseUrl || '';
+  if (modelInput) modelInput.value = preset?.defaultModel || '';
+  if (voiceInput) {
+    voiceInput.value = '';
+    voiceInput.placeholder = preset?.defaultVoice || 'alloy';
+  }
+  if (resInput) resInput.value = preset?.defaultResourceId || '';
+}
+
+function _settingsTtsSetRowHidden(selector, hidden) {
+  document.querySelectorAll(selector).forEach((el) => {
+    el.hidden = !!hidden;
+    el.style.display = hidden ? 'none' : '';
+    el.setAttribute('aria-hidden', hidden ? 'true' : 'false');
+  });
+}
+
+function _settingsTtsApplyProviderFields(providerId) {
+  const preset = _settingsTtsPreset(providerId);
+  const isCustom = providerId === 'custom';
+  const needsVoice = !!providerId && !preset?.defaultVoice;
+  _settingsTtsSetRowHidden('#settings-tts-key-row', false);
+  _settingsTtsSetRowHidden('.tts-row-base, .tts-row-model', !isCustom);
+  _settingsTtsSetRowHidden('.tts-row-voice', !needsVoice);
+  _settingsTtsSetRowHidden('.tts-row-doubao-res', true);
+}
+
+async function _settingsClickAddTts() {
+  const provider = _settingsState.ttsProviderSel?.getValue() || '';
+  if (!provider) { _settingsSetStatus('settings-tts-status', 'error', t('settings.tts.error_provider_needed')); return; }
+  const preset = _settingsTtsPreset(provider);
+  const apiKey = (document.getElementById('settings-tts-key-input')?.value || '').trim();
+  const voice = (document.getElementById('settings-tts-voice-input')?.value || '').trim();
+  if (!apiKey) { _settingsSetStatus('settings-tts-status', 'error', t('settings.tts.error_key_needed')); return; }
+
+  let payload;
+  if (provider === 'doubao') {
+    const resourceId = (document.getElementById('settings-tts-doubao-resource')?.value || '').trim();
+    payload = { provider, apiKey, voice: voice || (preset?.defaultVoice || ''), resourceId };
+  } else {
+    const baseUrl = (document.getElementById('settings-tts-base-input')?.value || '').trim() || (preset?.baseUrl || '');
+    const model = (document.getElementById('settings-tts-model-input')?.value || '').trim() || (preset?.defaultModel || '');
+    const finalVoice = voice || (preset?.defaultVoice || '');
+    if (!baseUrl) { _settingsSetStatus('settings-tts-status', 'error', t('settings.tts.error_base_needed')); return; }
+    if (!model) { _settingsSetStatus('settings-tts-status', 'error', t('settings.tts.error_model_needed')); return; }
+    if (!finalVoice) { _settingsSetStatus('settings-tts-status', 'error', t('settings.tts.error_voice_needed')); return; }
+    payload = { provider, baseUrl, model, apiKey, voice: finalVoice };
+  }
+
+  _settingsSetStatus('settings-tts-status', 'busy', t('settings.tts.adding'));
+  try {
+    const res = await window.orkas.invoke('ttsAuth.add', payload);
+    if (!res || !res.ok) {
+      _settingsSetStatus('settings-tts-status', 'error', (res && res.error) || t('settings.tts.add_failed'));
+      return;
+    }
+    const keyInput = document.getElementById('settings-tts-key-input');
+    if (keyInput) keyInput.value = '';
+    _settingsSetStatus('settings-tts-status', 'ok', t('settings.tts.add_ok'));
+    await _settingsRefreshTtsProfiles();
+  } catch (err) {
+    _settingsSetStatus('settings-tts-status', 'error', (err && err.message) || String(err));
+  }
+}
+
+function _settingsRenderTtsEntries() {
+  const container = document.getElementById('settings-tts-entries');
+  if (!container) return;
+  container.innerHTML = '';
+  const list = _settingsState.ttsProfiles || [];
+  if (!list.length) {
+    container.innerHTML = `<div class="settings-empty">${escapeHtml(t('settings.tts.empty'))}</div>`;
+    return;
+  }
+  list.forEach((p, idx) => {
+    const row = document.createElement('div');
+    row.className = 'entry-row' + (idx === 0 ? ' is-default' : '');
+    row.dataset.profileId = p.id;
+
+    const rank = document.createElement('div');
+    rank.className = 'entry-rank';
+    rank.textContent = idx === 0 ? t('settings.tts.active_tag') : `#${idx + 1}`;
+    row.appendChild(rank);
+
+    const main = document.createElement('div');
+    main.className = 'entry-main';
+    const primary = document.createElement('div');
+    primary.className = 'entry-primary';
+    const detail = p.provider === 'doubao' ? (p.resourceId || '') : (p.model || '');
+    primary.innerHTML = `
+      <span class="entry-provider">${escapeHtml(_ttsProviderLabel(p.provider))}</span>
+      ${detail ? `<span class="entry-sep">·</span><span class="entry-model">${escapeHtml(detail)}</span>` : ''}
+      ${p.voice ? `<span class="entry-sep">·</span><span class="entry-model">${escapeHtml(p.voice)}</span>` : ''}
+      <span class="entry-sep">·</span>
+      <span class="entry-account-chip">@ ${escapeHtml(p.label || 'default')}</span>
+      ${p.apiKeyMasked ? `<span class="account-mask">${escapeHtml(p.apiKeyMasked)}</span>` : ''}
+    `;
+    main.appendChild(primary);
+    row.appendChild(main);
+
+    const actions = document.createElement('div');
+    actions.className = 'entry-actions';
+    const delBtn = document.createElement('button');
+    delBtn.className = 'btn btn-sm btn-danger';
+    delBtn.textContent = t('settings.delete');
+    delBtn.addEventListener('click', async () => {
+      const ok = await uiConfirm(t('settings.tts.confirm_delete', { provider: _ttsProviderLabel(p.provider) }));
+      if (!ok) return;
+      const res = await window.orkas.invoke('ttsAuth.remove', { id: p.id });
+      if (res && res.ok) await _settingsRefreshTtsProfiles();
+    });
+    actions.appendChild(delBtn);
+    row.appendChild(actions);
+
+    _settingsAttachReorderDnd(row, {
+      kind: 'tts',
+      id: p.id,
+      getIds: () => (_settingsState.ttsProfiles || []).map((x) => x.id),
+      ipcName: 'ttsAuth.reorder',
+      onSuccess: async () => {
+        await _settingsRefreshTtsProfiles();
+        _settingsRenderTtsEntries();
       },
     });
 

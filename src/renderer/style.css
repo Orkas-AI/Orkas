@@ -2879,16 +2879,88 @@ body.model-not-configured .main-content { flex-direction: column; }
 /* When platform chips (version/category) sit on the actions row, the play button still
    hugs the right edge — `margin-left:auto` handles the absent-chip case too. */
 .skill-card-actions > .skill-card-use { margin-left: auto; }
+.skill-card--global-group {
+  background: rgba(248, 250, 252, 0.82);
+}
+.skill-card-disclosure {
+  margin-left: auto;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 28px;
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+}
+.skill-card-disclosure:hover {
+  border-color: rgba(79, 70, 229, 0.32);
+  color: var(--primary);
+  background: rgba(79, 70, 229, 0.04);
+}
+.skill-card-disclosure-icon {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+}
 
-.skill-card-use,
 .agent-card-use,
+.skill-card-use,
+.agent-dialog-btn {
+  flex-shrink: 0;
+  min-width: auto;
+  padding: 4px 10px;
+  border: 1px solid var(--primary);
+  border-radius: 8px;
+  background: var(--primary);
+  color: #fff;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  line-height: normal;
+  font-weight: 500;
+  font-family: inherit;
+  transition: background 0.12s, box-shadow 0.12s;
+}
+
+.agent-dialog-btn,
+.skill-dialog-btn {
+  flex-shrink: 0;
+}
+
+.agent-card-use:hover,
+.skill-card-use:hover,
+.agent-dialog-btn:hover {
+  background: var(--primary-hover, #4f46e5);
+  box-shadow: 0 6px 14px rgba(91, 87, 214, 0.18);
+}
+
+.agent-card-use:disabled,
+.agent-card-use:disabled:hover,
+.skill-card-use:disabled,
+.skill-card-use:disabled:hover {
+  cursor: default;
+  color: #94a3b8;
+  background: rgba(148, 163, 184, 0.14);
+  box-shadow: none;
+}
+
 .btn-icon-use {
   flex-shrink: 0;
   width: 26px;
   height: 26px;
   padding: 0;
   border: none;
-  border-radius: 50%;
+  border-radius: 8px;
   background: rgba(37, 99, 235, 0.1);
   color: var(--primary);
   cursor: pointer;
@@ -2897,30 +2969,17 @@ body.model-not-configured .main-content { flex-direction: column; }
   justify-content: center;
   transition: background 0.12s, transform 0.12s;
 }
-.skill-card-use:hover,
-.agent-card-use:hover,
 .btn-icon-use:hover {
   background: rgba(37, 99, 235, 0.2);
   transform: scale(1.05);
 }
-.skill-card-use:disabled,
-.agent-card-use:disabled,
-.btn-icon-use:disabled {
+.btn-icon-use:disabled,
+.btn-icon-use:disabled:hover {
   cursor: default;
   color: #94a3b8;
   background: rgba(148, 163, 184, 0.14);
   transform: none;
 }
-.skill-card-use:disabled:hover,
-.agent-card-use:disabled:hover,
-.btn-icon-use:disabled:hover {
-  background: rgba(148, 163, 184, 0.14);
-  transform: none;
-}
-/* Centered SVG triangle inside the round play button. The SVG path itself
-   is balanced; the wrapper is plain flex-center, so no padding hacks needed. */
-.skill-card-use .icon-play,
-.agent-card-use .icon-play,
 .btn-icon-use .icon-play {
   width: 14px;
   height: 14px;

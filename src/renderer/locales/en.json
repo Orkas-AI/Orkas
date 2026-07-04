@@ -195,7 +195,7 @@
   "new_chat.quick.video": "Make video",
   "new_chat.quick.seo_geo": "SeoGeo",
   "new_chat.quick.office": "Documents",
-  "new_chat.external_agent_entry": "Connect Codex, Claude Code & other AI coding tools",
+  "new_chat.external_agent_entry": "Connect Codex, Claude Code & other external agents",
   "new_chat.quick.agent_required": "Install or enable “{name}” before using this shortcut.",
   "new_chat.quick.tmpl.education": "[topic / problem / material] Tutor me step by step: find where I am stuck, explain with examples, and give me a practice plan",
   "new_chat.quick.tmpl.ecommerce": "Research [product / category]: analyze demand, competitors, price bands, profit assumptions, sourcing risk, and whether it is worth selling",

@@ -183,7 +183,7 @@
   "new_chat.quick.video": "動画制作",
   "new_chat.quick.seo_geo": "SeoGeo",
   "new_chat.quick.office": "資料整理",
-  "new_chat.external_agent_entry": "Codex・Claude Code など AI コーディングツールを接続",
+  "new_chat.external_agent_entry": "Codex・Claude Code など外部エージェントを接続",
   "new_chat.quick.agent_required": "このショートカットを使うには「{name}」をインストールまたは有効化してください。",
   "new_chat.quick.tmpl.education": "[テーマ / 問題 / 教材] を段階的に教えてください。つまずいている箇所を見つけ、例を使って説明し、練習計画を出してください",
   "new_chat.quick.tmpl.ecommerce": "[商品 / カテゴリ] を調査してください。需要、競合、価格帯、利益の見込み、仕入れリスクを分析し、販売する価値があるか判断してください",

@@ -45,9 +45,12 @@ import * as auth from '../features/auth';
 import * as imageAuth from '../features/image_auth';
 import * as searchAuth from '../features/search_auth';
 import * as videoAuth from '../features/video_auth';
+import * as ttsAuth from '../features/tts_auth';
 import * as permissions from '../features/permissions';
 import * as appConfig from '../features/config';
 import * as avatars from '../features/avatars';
+import * as commanderProfile from '../features/commander_profile';
+import * as commanderRuntimeStats from '../features/commander_runtime_stats';
 import { getRendererTables, isLang, t } from '../i18n';
 import { isPathAllowed } from '../util/path-sandbox';
 import * as userWorkspace from '../features/user_workspace';
@@ -1836,6 +1839,14 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // startup, then uses its local cache.
   'avatars.getCatalog': async () => ({ catalog: avatars.getCatalog() }),
 
+  // Commander display/profile catalog. Static localized content lives in
+  // src/main/data/commander.json; mutable state (avatar, memory, stats) is
+  // stored separately.
+  'commander.getProfile': async () => ({ profile: commanderProfile.getProfile() }),
+  'commander.runtimeStats.get': async (_payload, ctx) => ({
+    runtime_stats: await commanderRuntimeStats.readCommanderRuntimeStats(ctx.userId),
+  }),
+
   // Commander avatar preference (cloud-synced). avatar = { icon, color };
   // tokens are validated against the catalog allow-list. When absent the
   // renderer falls back to the commander default (crown + gold).
@@ -1913,6 +1924,22 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'videoAuth.add':      async ({ provider, model, apiKey, label }) => videoAuth.addVideoProfile({ provider, model, apiKey, label }),
   'videoAuth.remove':   async ({ id }) => videoAuth.removeVideoProfile(id),
   'videoAuth.reorder':  async ({ orderedIds }) => videoAuth.reorderVideoProfiles(orderedIds || []),
+
+  // ── Text-to-speech API key (user-owned speech providers) ──
+  'ttsAuth.list':       async () => ({
+    ok: true,
+    presets: ttsAuth.listTtsProviderPresets(),
+    profiles: ttsAuth.listTtsProfiles().map((p) => ({
+      id: p.id, provider: p.provider, baseUrl: p.baseUrl, model: p.model,
+      resourceId: p.resourceId,
+      voice: p.voice, format: p.format, label: p.label, createdAt: p.createdAt,
+      apiKeyMasked: auth.maskKey(p.apiKey),
+    })),
+  }),
+  'ttsAuth.add':        async ({ provider, baseUrl, model, apiKey, resourceId, voice, format, label }) =>
+    ttsAuth.addTtsProfile({ provider, baseUrl, model, apiKey, resourceId, voice, format, label }),
+  'ttsAuth.remove':     async ({ id }) => ttsAuth.removeTtsProfile(id),
+  'ttsAuth.reorder':    async ({ orderedIds }) => ttsAuth.reorderTtsProfiles(orderedIds || []),
 
   // ── Search-tool API key (overrides built-in keyless web_search) ──
   'searchAuth.list':    async () => ({

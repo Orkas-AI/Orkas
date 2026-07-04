@@ -74,7 +74,7 @@
         <button type="button" class="new-chat-external-agent-btn" id="new-chat-external-agent-btn">
           <span data-ui-icon="terminal" data-ui-icon-class="new-chat-external-agent-icon"></span>
           <span class="new-chat-external-agent-label">
-            <span data-i18n="new_chat.external_agent_entry">Connect Codex, Claude Code &amp; other AI coding tools</span>
+            <span data-i18n="new_chat.external_agent_entry">Connect Codex, Claude Code &amp; other external agents</span>
             <span data-ui-icon="arrow-right" data-ui-icon-class="new-chat-external-agent-arrow"></span>
           </span>
         </button>
@@ -350,9 +350,7 @@
                 <h1 class="skills-doc-title" id="skills-detail-name" data-editable="false"></h1>
                 <span class="skills-doc-source" id="skills-detail-source"></span>
                 <div class="skills-doc-actions" id="skills-detail-actions">
-                  <button class="btn-icon-use" id="skill-use-btn" data-i18n-title="skills.use_tooltip" data-i18n-aria-label="skills.use_tooltip" aria-label="Use this skill">
-                    <span data-ui-icon="play-triangle" data-ui-icon-class="icon-play"></span>
-                  </button>
+                  <button type="button" class="skill-card-use skill-dialog-btn" id="skill-use-btn" data-i18n="skills.use" data-i18n-title="skills.use_tooltip" data-i18n-aria-label="skills.use_tooltip" aria-label="Use this skill">Use</button>
                   <button class="btn btn-sm" id="skill-edit-btn" data-i18n="skills.edit">Edit</button>
                   <button class="btn btn-sm" id="skill-enabled-btn" data-i18n="component.disable">Disable</button>
                   <button class="btn btn-sm" id="skill-upload-marketplace-btn" style="display:none" data-i18n="marketplace.upload">Upload to marketplace (dev)</button>
@@ -464,9 +462,7 @@
                   <input type="text" class="agents-detail-name-input" id="agents-detail-name-input" autocomplete="off" spellcheck="false" hidden />
                   <span class="agents-detail-source" id="agents-detail-source"></span>
                   <div class="detail-actions" id="agents-detail-actions">
-                    <button class="btn-icon-use" id="agent-use-btn" data-i18n-title="agents.use_tooltip" data-i18n-aria-label="agents.use_tooltip" aria-label="Use this agent">
-                      <span data-ui-icon="play-triangle" data-ui-icon-class="icon-play"></span>
-                    </button>
+                    <button type="button" class="agent-card-use agent-dialog-btn" id="agent-use-btn" data-i18n="agents.use" data-i18n-title="agents.use_tooltip" data-i18n-aria-label="agents.use_tooltip" aria-label="Use this agent">Use</button>
                     <button class="btn btn-sm" id="agent-edit-btn" data-i18n="agents.edit_btn_edit">Edit</button>
                     <button class="btn btn-sm" id="agent-enabled-btn" data-i18n="component.disable">Disable</button>
                     <button class="btn btn-sm" id="agent-upload-marketplace-btn" style="display:none" data-i18n="marketplace.upload">Upload to marketplace (dev)</button>
@@ -1038,6 +1034,43 @@
                   <span class="settings-status" id="settings-video-status"></span>
                 </div>
                 <div class="settings-entries" id="settings-video-entries">
+                  <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
+                </div>
+              </div>
+
+              <div class="settings-group">
+                <div class="settings-group-head">
+                  <div class="settings-group-title" data-i18n="settings.tts.title">Text-to-speech API Key</div>
+                </div>
+                <div class="settings-row">
+                  <label data-i18n="settings.tts.provider">Provider</label>
+                  <div class="ai-select" id="settings-tts-provider"></div>
+                </div>
+                <div class="settings-row" id="settings-tts-key-row">
+                  <label data-i18n="settings.tts.api_key">API Key</label>
+                  <input type="text" class="form-input" id="settings-tts-key-input" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="settings-row tts-row-voice" hidden>
+                  <label data-i18n="settings.tts.voice">Voice</label>
+                  <input type="text" class="form-input" id="settings-tts-voice-input" placeholder="alloy / zh_female_..._bigtts" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="settings-row tts-row-base" hidden>
+                  <label data-i18n="settings.tts.base_url">Base URL</label>
+                  <input type="text" class="form-input" id="settings-tts-base-input" placeholder="https://api.openai.com/v1" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="settings-row tts-row-model" hidden>
+                  <label data-i18n="settings.tts.model">Model</label>
+                  <input type="text" class="form-input" id="settings-tts-model-input" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="settings-row tts-row-doubao-res" hidden>
+                  <label><span data-i18n="settings.tts.doubao_resource">Resource ID</span> <span class="form-hint" data-i18n="settings.tts.doubao_resource_hint">Auto-detected from the voice; set only to override.</span></label>
+                  <input type="text" class="form-input" id="settings-tts-doubao-resource" placeholder="auto (seed-tts-2.0 / 1.0 / icl-2.0)" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="settings-row">
+                  <button class="btn btn-primary" id="settings-tts-add-btn" data-i18n="settings.tts.add">+ Add speech key</button>
+                  <span class="settings-status" id="settings-tts-status"></span>
+                </div>
+                <div class="settings-entries" id="settings-tts-entries">
                   <div class="settings-empty" data-i18n="settings.loading">Loading…</div>
                 </div>
               </div>
