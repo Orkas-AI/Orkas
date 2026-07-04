@@ -4,9 +4,9 @@
 // sent immediately. Queue is per-cid, persisted in localStorage so a refresh
 // mid-stream doesn't drop pending messages. Drained one-by-one when the
 // current reply finishes (or is aborted). Each entry records the raw user
-// text, selected skill / connector, and the recipient snapshot visible when
-// the user pressed send. The "use X" prefix is still validated at dispatch
-// time, but recipient routing must not be recomputed from a later chip state.
+// text and the recipient snapshot visible when the user pressed send. Inline
+// skill / connector tokens stay in `content`; legacy rows may still carry
+// `use`, which is expanded at dispatch time for compatibility.
 
 function _loadQueueFromStorage(cid) {
   if (!cid) return [];
@@ -126,9 +126,9 @@ function _dispatchNextQueued(cid) {
   _saveQueueToStorage(cid);
   _updateConvSidebarBadge(cid);
   renderMessageQueue(cid);
-  // Skill / connector is an inline text prefix (applied at dispatch time so
-  // later selection changes take effect). Agent runs are just "run <name>"
-  // text — no flag.
+  // Inline skill / connector tokens are expanded at dispatch time. Agent runs
+  // are just "run <name>" text — no flag. Legacy queued rows may still carry a
+  // separate `use` field; keep honoring it until old localStorage drains.
   // Recipient prefix (`@<agent>`) is applied from the enqueue-time snapshot.
   // Falling back to current chip is only for legacy queue rows persisted before
   // snapshots existed.
@@ -150,7 +150,9 @@ function _dispatchNextQueued(cid) {
     use = null;
     try { uiAlert(t('connectors.dropped_at_drain', { connector: label })); } catch (_) {}
   }
-  const withUse = use ? transformWithChatUse(next.content, use) : next.content;
+  const withUse = (typeof transformWithChatUse === 'function')
+    ? transformWithChatUse(next.content, use)
+    : next.content;
   const content = next.direct
     ? next.content
     : applyRecipientPrefix(withUse, 'conversation', { recipientSnapshot: next.recipient });
@@ -177,7 +179,10 @@ function renderMessageQueue(cid) {
     const use = _queueItemUseSelection(item);
     const useChip = use
       ? `<span class="chat-queue-skill">${escapeHtml(formatChatUseLabel(use))}</span>` : '';
-    const preview = escapeHtml((item.content || '').replace(/\s+/g, ' ')).slice(0, 200);
+    const displayContent = (typeof formatChatUseTextForDisplay === 'function')
+      ? formatChatUseTextForDisplay(item.content || '')
+      : (item.content || '');
+    const preview = escapeHtml(displayContent.replace(/\s+/g, ' ')).slice(0, 200);
     return `
       <div class="chat-queue-item" draggable="true" data-qid="${item.id}">
         <div class="chat-queue-drag" title="${escapeHtml(t('chat.queue_drag_title'))}">⋮⋮</div>
@@ -289,8 +294,8 @@ function _startQueueItemEdit(cid, row) {
 // ─── Input draft persistence (per-conversation) ───
 //
 // Typed-but-unsent text is bound to the conversation id and survives tab
-// switches, panel navigation, and reloads. The selected skill / connector
-// chip for the conversation input is persisted alongside so it's restored too.
+// switches, panel navigation, and reloads. Inline skill / connector chips live
+// inside the text itself; old saved `use` fields are restored as inline tokens.
 
 let _draftSaveTimer = null;
 
@@ -300,14 +305,9 @@ function _saveDraft(cid) {
   _draftSaveTimer = setTimeout(() => {
     const input = document.getElementById('chat-input');
     const text = input ? input.value : '';
-    const use = getChatUseSelection('conversation');
     try {
-      if (text || use) {
-        localStorage.setItem(_DRAFT_KEY(cid), JSON.stringify({
-          text,
-          use,
-          skill: use && use.kind === 'skill' ? (use.name || use.id || '') : '',
-        }));
+      if (text) {
+        localStorage.setItem(_DRAFT_KEY(cid), JSON.stringify({ text }));
       } else {
         localStorage.removeItem(_DRAFT_KEY(cid));
       }
@@ -337,6 +337,13 @@ function _restoreDraft(cid) {
       : null);
   input.value = text;
   autoGrow(input, 200);
-  // Apply or clear the chip without re-persisting the draft (no input event fires).
-  setChatUseSelection('conversation', use);
+  if (use && typeof _chatUseSelectionsFromText === 'function' && !_chatUseSelectionsFromText(text).length) {
+    try { input.setSelectionRange(0, 0); } catch (_) {}
+    setChatUseSelection('conversation', use, { focus: false });
+    try { input.setSelectionRange(input.value.length, input.value.length); } catch (_) {}
+  } else if (!text) {
+    setChatUseSelection('conversation', null, { focus: false });
+  } else {
+    try { input.setSelectionRange(input.value.length, input.value.length); } catch (_) {}
+  }
 }

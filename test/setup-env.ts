@@ -29,7 +29,6 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { vi } from 'vitest';
 
 // Register tsx/cjs so that any `require('./group_chat/bus')`-style CJS lookups
 // (used inside features/chats.ts to break the bus ↔ chats import cycle without
@@ -43,19 +42,3 @@ if (!process.env.ORKAS_WORKSPACE_ROOT) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-vitest-'));
   process.env.ORKAS_WORKSPACE_ROOT = tmp;
 }
-
-// `activateUser()` starts session GC as a fire-and-forget startup task. In
-// full-suite Vitest runs, hundreds of isolated module graphs activate users
-// concurrently, and those late dynamic imports can race teardown. The sweep
-// itself is covered by its module contract; unit tests that merely need an
-// active uid should not inherit that background work.
-vi.mock('../src/main/features/sessions_sweep', () => ({
-  sweepSessions: vi.fn(async () => ({
-    scanned: 0,
-    orphan_cid: 0,
-    ephemeral_on_cloud: 0,
-    legacy: 0,
-    local_aged_out: 0,
-    errors: 0,
-  })),
-}));

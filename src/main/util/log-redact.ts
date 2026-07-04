@@ -73,6 +73,18 @@ export function logErrorRef(err: unknown): Record<string, unknown> {
   };
 }
 
+export function logErrorSummary(err: unknown): Record<string, unknown> {
+  const e = err as any;
+  const message = String(e?.message || err || '');
+  return {
+    name: e?.name ? String(e.name) : undefined,
+    code: e?.code || e?.Code || undefined,
+    status: e?.status || e?.statusCode || undefined,
+    message_hash: hashForLog(message),
+    message_chars: message.length,
+  };
+}
+
 export function logFailureRef(result: {
   code?: unknown;
   error_key?: unknown;

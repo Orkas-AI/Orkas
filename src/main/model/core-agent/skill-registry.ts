@@ -7,9 +7,9 @@
  *
  * TRUSTED tier (one loader; specs flow into agent `skill_list`
  * resolution, advertise signals, and every session kind):
- *   1. <uid>/cloud/skills/                (user-custom; same id overrides platform install)
- *   2. <uid>/local/marketplace/skills/    (platform-installed; per-machine copy reconciled
+ *   1. <uid>/local/marketplace/skills/    (builtin/platform-installed; per-machine copy reconciled
  *                                          from the cloud-synced installs.json manifest)
+ *   2. <uid>/cloud/skills/                (user-custom; platform/builtin override same id)
  *
  * OPEN tier (separate loader; group-chat task + agent-edit authoring sessions,
  * per `includeOpenSources`):
@@ -31,17 +31,25 @@
  * changes (package installs happen out-of-process via bin/orkas-pkg.cjs,
  * so the dir list is recomputed — cheap registry JSON read — per call).
  *
- * The `Source` label is computed in this layer (root-path comparison), not
- * by the loader's basename inference — several roots end in `/skills`, so
- * basename is non-discriminating. 'builtin' is preserved as the label
- * string for marketplace installs for backwards compatibility; UI renders
- * it as "Platform".
+ * The `Source` label is computed in this layer (root-path + install metadata),
+ * not by the loader's basename inference — several roots end in `/skills`, so
+ * basename is non-discriminating. Marketplace-root skills with
+ * `_install.json::seed_source === "builtin"` are labelled `builtin`; the rest
+ * are labelled `platform`.
  */
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import { userMarketplaceSkillsDir, userPackageDir, userSkillsDir, userSystemSkillsDir, globalSkillRoots } from '../../paths';
+import {
+  agentPrivateSkillsDir,
+  userMarketplaceAgentSkillsDir,
+  userMarketplaceSkillsDir,
+  userPackageDir,
+  userSkillsDir,
+  userSystemSkillsDir,
+  globalSkillRoots,
+} from '../../paths';
 import { enabledPackageSkillRoots, packageSkillRoots, readPackagesRegistry } from '../../features/packages';
 import { companionSkillsRootIfPopulated, companionPackageForDir } from '../../features/package_skills';
 import { getActiveUserId } from '../../features/users';
@@ -60,7 +68,7 @@ async function getPickDescription(): Promise<PickDescription> {
   return _pickDescription;
 }
 
-export type SkillSourceLabel = 'custom' | 'builtin' | 'external' | 'global' | 'unknown';
+export type SkillSourceLabel = 'builtin' | 'platform' | 'custom' | 'external' | 'global' | 'unknown';
 
 // `Source` is decided by root path, not by `path.basename(source)` — several skill roots
 // end in `/skills`, so basename is non-discriminating (see CLAUDE.md §4). Resolved per-call
@@ -68,11 +76,11 @@ export type SkillSourceLabel = 'custom' | 'builtin' | 'external' | 'global' | 'u
 // Open-tier roots (external packages / global dirs) are matched by the caller-supplied
 // label map in `renderSkillLines`; this fast path only distinguishes the trusted tier and
 // is what allowlist ranking + advertise signals rely on.
-function skillSourceLabel(source: string): 'builtin' | 'custom' | 'unknown' {
+function skillSourceLabel(source: string): 'platform' | 'custom' | 'unknown' {
   try {
     const resolved = path.resolve(source);
     if (resolved === path.resolve(userSkillsDir(getActiveUserId()))) return 'custom';
-    if (resolved === path.resolve(userMarketplaceSkillsDir(getActiveUserId()))) return 'builtin';
+    if (resolved === path.resolve(userMarketplaceSkillsDir(getActiveUserId()))) return 'platform';
     // Catch-all. custom is now matched EXPLICITLY above, so an unrecognized
     // root falls here as `unknown` (lowest dedupe priority) instead of being
     // silently treated as `custom` (highest). Open-tier roots are ranked via
@@ -83,10 +91,55 @@ function skillSourceLabel(source: string): 'builtin' | 'custom' | 'unknown' {
   } catch { return 'unknown'; }
 }
 
+function _readObjectJson(file: string): Record<string, unknown> | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+function _isBuiltinMarketplaceSkillDir(dir: string | undefined): boolean {
+  if (!dir) return false;
+  return _readObjectJson(path.join(dir, '_install.json'))?.seed_source === 'builtin';
+}
+
+function skillSourceLabelForSpec(s: Pick<SkillAllowlistRef, 'source' | 'dir'>): SkillSourceLabel {
+  const base = skillSourceLabel(s.source || '');
+  if (base === 'platform' && _isBuiltinMarketplaceSkillDir(s.dir)) return 'builtin';
+  return base;
+}
+
+function skillSourceRank(s: Pick<SkillAllowlistRef, 'source' | 'dir'>): number {
+  return SOURCE_DEDUPE_RANK[skillSourceLabelForSpec(s)];
+}
+
+// A compacted roster/skill-list entry shorter than this conveys no domain for
+// the commander to route on. Some descriptions open with a tagline first
+// sentence (e.g. video-studio's "做视频，也剪视频。") whose real capability +
+// routing guidance lives in LATER sentences; collapsing to that tagline
+// silently broke commander routing to the agent. See the floor in
+// compactPromptDescription.
+const MIN_USEFUL_SUMMARY = 16;
+// Never let an extended summary blow up the cache prefix.
+const MAX_COMPACT_SUMMARY = 240;
+
 export function compactPromptDescription(description: string): string {
   const text = String(description || '').trim();
   if (!text) return '';
 
+  const primary = firstSummarySegment(text);
+  // Floor: if the first segment is a too-short tagline, extend it up to the
+  // trigger/适合 section (or a hard cap) so the entry still carries the
+  // routing-critical content. Currently-adequate descriptions (the vast
+  // majority) are returned byte-identical — the floor only fires when the
+  // first segment is shorter than a usable domain phrase.
+  if (primary.length >= MIN_USEFUL_SUMMARY || primary.length >= text.length) return primary;
+  return expandShortSummary(text);
+}
+
+function firstSummarySegment(text: string): string {
   const markerPatterns: Array<{ re: RegExp; keepDelimiter?: boolean }> = [
     { re: /[；;]\s*适合/u },
     { re: /[；;]\s*适用/u },
@@ -120,24 +173,56 @@ export function compactPromptDescription(description: string): string {
   return text;
 }
 
-// Shadowing rank for display-name dedupe. Lower wins; ties all stay —
-// custom shadows platform (legacy behavior), any trusted entry shadows a
-// same-name open-tier entry, but platform-platform (and external-external,
-// global-global) duplicates are NOT globally deduped (CLAUDE.md §6).
+// Extend a too-short first segment up to the start of the trigger/适合/触发词
+// enumeration, recognising a 。 / newline boundary (a tagline-first description
+// ends sentences with 。, not ；, before those lists — which is exactly why the
+// ；-only markers in firstSummarySegment miss them). Falls back to a sentence-
+// clipped cap when there is no such section.
+function expandShortSummary(text: string): string {
+  const sectionPatterns: RegExp[] = [
+    /[。；;\n]\s*适合/u,
+    /[。；;\n]\s*适用/u,
+    /[。；;\n]\s*触发词?/u,
+    /[。；;\n]\s*关键词/u,
+    /[。.；;\n]\s*(?:suitable for|use when|use for|best for|ideal for|triggers?|keywords?)\b/i,
+  ];
+  let end = text.length;
+  for (const re of sectionPatterns) {
+    const m = re.exec(text);
+    if (!m) continue;
+    const delim = text[m.index];
+    // Keep a sentence-ending 。/. so the kept text reads as whole sentences;
+    // drop a ；/;/newline clause boundary.
+    const stop = delim === '。' || delim === '.' ? m.index + 1 : m.index;
+    if (stop < end) end = stop;
+  }
+  let out = text.slice(0, end).trim();
+  if (out.length > MAX_COMPACT_SUMMARY) {
+    const clipped = out.slice(0, MAX_COMPACT_SUMMARY);
+    const lastStop = clipped.lastIndexOf('。');
+    out = (lastStop >= 0 ? clipped.slice(0, lastStop + 1) : clipped).trim();
+  }
+  return out || firstSummarySegment(text);
+}
+
+// Shadowing rank for display-name / role-conflict dedupe. Lower wins; ties
+// all stay. Product-owned capability beats user/open tiers only when there is
+// an actual conflict; unrelated lower-tier skills still render normally.
 // `unknown` is the catch-all for an unrecognized source root: it sits at the
 // LOWEST priority so a mis-classified/future source can never shadow a real
 // tier by display name (fail toward least trust, not most).
 const SOURCE_DEDUPE_RANK: Record<SkillSourceLabel, number> = {
-  custom: 0,
-  builtin: 1,
-  external: 2,
-  global: 3,
+  builtin: 0,
+  platform: 1,
+  custom: 2,
+  external: 3,
+  global: 4,
   unknown: 99,
 };
 
 function dedupeSkillsByDisplayName<T extends SkillAllowlistRef>(
   specs: T[],
-  rankOf: (s: T) => number = (s) => SOURCE_DEDUPE_RANK[skillSourceLabel(s.source || '')],
+  rankOf: (s: T) => number = (s) => skillSourceRank(s),
 ): T[] {
   if (specs.length < 2) return specs;
   const byName = new Map<string, T[]>();
@@ -165,10 +250,11 @@ function dedupeSkillsByDisplayName<T extends SkillAllowlistRef>(
 // Format:
 //   `## Available skills (skills)\n\n` +
 //   `\`read_file(<ROOT>/<id>/SKILL.md)\` — ROOT by Source:\n` +
-//   `- custom:  <abs path>\n` +
 //   `- builtin: <abs path>\n` +
+//   `- platform: <abs path>\n` +
+//   `- custom:  <abs path>\n` +
 //   `Use these ROOT values verbatim.\n\n` +
-//   per-entry lines `- **<display name>** (Source: custom|builtin; internal read id: <id>) — desc`
+//   per-entry lines `- **<display name>** (Source: builtin|platform|custom; internal read id: <id>) — desc`
 //
 // Why the inline ROOT header (added 2026-05): putting only `(Source: ...)` on
 // each entry and listing the path constants in a separate `## Resource locations`
@@ -198,12 +284,18 @@ async function renderSkillLines(
   const lang = descriptionLang(getLanguage());
   const pick = await getPickDescription();
   const labelByRoot = new Map<string, string>();
-  for (const r of rootEntries) labelByRoot.set(path.resolve(r.root), r.label);
+  for (const r of rootEntries) {
+    const resolved = path.resolve(r.root);
+    if (!labelByRoot.has(resolved)) labelByRoot.set(resolved, r.label);
+  }
   // Only print ROOT rows the entry list actually references — open-tier
   // roots with zero surviving entries would be prompt noise.
   const usedLabels = new Set<string>();
-  const labelOf = (s: SkillSpec): string =>
-    labelByRoot.get(path.resolve(s.source)) || skillSourceLabel(s.source);
+  const labelOf = (s: SkillSpec): string => {
+    const trusted = skillSourceLabelForSpec(s);
+    if (trusted !== 'unknown') return trusted;
+    return labelByRoot.get(path.resolve(s.source)) || 'unknown';
+  };
   for (const s of specs) usedLabels.add(labelOf(s));
 
   // Each entry shows the human `name` (what the model uses to decide *whether* to reach
@@ -216,11 +308,10 @@ async function renderSkillLines(
     '`read_file(<ROOT>/<id>/SKILL.md)` — ROOT by Source:',
   ];
   for (const r of rootEntries) {
-    // custom + builtin rows always render (stable prompt prefix); other
-    // tiers render only when referenced. `custom:` keeps its historical
-    // two-space alignment so the legacy two-root block stays byte-identical
-    // (KV-cache prefix stability).
-    if (r.label === 'custom' || r.label === 'builtin' || usedLabels.has(r.label)) {
+    // builtin + platform + custom rows always render (stable prompt prefix);
+    // other tiers render only when referenced. `custom:` keeps its historical
+    // two-space alignment.
+    if (r.label === 'builtin' || r.label === 'platform' || r.label === 'custom' || usedLabels.has(r.label)) {
       lines.push(`- ${r.label}:${r.label === 'custom' ? '  ' : ' '}${r.root}`);
     }
   }
@@ -247,15 +338,49 @@ type CoreAgent = typeof import('#core-agent');
 type SkillLoaderCtor = CoreAgent['SkillLoader'];
 type SkillLoaderInstance = InstanceType<SkillLoaderCtor>;
 type SkillSpec = ReturnType<SkillLoaderInstance['list']>[number];
+
+function agentPrivateSkillRoots(uid: string, agentId: string): string[] {
+  if (!agentId) return [];
+  return [
+    userMarketplaceAgentSkillsDir(uid, agentId),
+    agentPrivateSkillsDir(uid, agentId),
+  ].map((root) => path.resolve(root));
+}
+
+let _agentPrivateLoaders = new Map<string, SkillLoaderInstance>();
+
+async function getAgentPrivateLoader(root: string): Promise<SkillLoaderInstance> {
+  const resolved = path.resolve(root);
+  const existing = _agentPrivateLoaders.get(resolved);
+  if (existing) return existing;
+  const m = await import('#core-agent');
+  const loader = new m.SkillLoader({ dirs: [resolved] });
+  _agentPrivateLoaders.set(resolved, loader);
+  return loader;
+}
+
+async function loadAgentPrivateSkillSpecs(uid: string, agentId: string): Promise<Array<{ root: string; specs: SkillSpec[] }>> {
+  const roots = agentPrivateSkillRoots(uid, agentId).filter((root) => {
+    try { return fs.statSync(root).isDirectory(); } catch { return false; }
+  });
+  if (!roots.length) return [];
+  return Promise.all(roots.map(async (root) => {
+    const loader = await getAgentPrivateLoader(root);
+    return { root, specs: loader.list() as SkillSpec[] };
+  }));
+}
+
 export interface SkillAllowlistRef {
   id: string;
   name?: string;
   source?: string;
+  dir?: string;
+  ownerAgent?: string;
 }
 
 function _skillRefRank(s: SkillAllowlistRef): number {
-  if (!s.source) return 1;
-  return skillSourceLabel(s.source) === 'custom' ? 0 : 1;
+  if (!s.source) return SOURCE_DEDUPE_RANK.unknown;
+  return skillSourceRank(s);
 }
 
 export function resolveSkillAllowlistRefs(
@@ -363,8 +488,8 @@ async function getLoader(): Promise<SkillLoaderInstance> {
   if (!_loaderPromise) {
     _loaderPromise = import('#core-agent').then((m) => {
       return new m.SkillLoader({
-        // custom (cloud, per-uid) listed first → user overrides same-id platform installs.
-        dirs: [userSkillsDir(getActiveUserId()), userMarketplaceSkillsDir(getActiveUserId())],
+        // builtin/platform listed first → product/platform override same-id custom skills.
+        dirs: [userMarketplaceSkillsDir(getActiveUserId()), userSkillsDir(getActiveUserId())],
       });
     });
   }
@@ -590,6 +715,14 @@ export interface SystemPromptBlockOptions {
    * trusted+external helper and still excludes global-folder skills.
    */
   includeOpenSources?: boolean;
+  /**
+   * The acting agent's `agent_id` for this render (empty/undefined for the
+   * commander and non-agent sessions). Skills tagged `ownerAgent` render ONLY
+   * when their owner matches this id — so an agent-private skill never leaks
+   * into the commander or any other agent, even when an allowlist names it.
+   * Mirrors the agent-private tool `ownerAgent` default-deny gate.
+   */
+  agentId?: string;
 }
 
 /**
@@ -613,13 +746,16 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
   // `activateUser` which calls `invalidateSkills` to drop the loader cache,
   // but the ROOT values must reflect the CURRENT uid regardless of cache age.
   const uid = getActiveUserId();
+  const marketplaceRoot = path.resolve(userMarketplaceSkillsDir(uid));
   const rootEntries: PromptRootEntry[] = [
+    { label: 'builtin', root: marketplaceRoot },
+    { label: 'platform', root: marketplaceRoot },
     { label: 'custom', root: path.resolve(userSkillsDir(uid)) },
-    { label: 'builtin', root: path.resolve(userMarketplaceSkillsDir(uid)) },
   ];
 
   let rendered: typeof specs;
   let allowlisted = false;
+  let explicitAllow: Set<string> | null = null;
   if (opts.allowlist === undefined) {
     rendered = filterDisabled(specs);
   } else {
@@ -627,8 +763,26 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
     const rawAllow = opts.allowlist.filter((id) => typeof id === 'string' && id.length > 0);
     if (rawAllow.length === 0) return '';
     const { ids } = resolveSkillAllowlistRefs(specs, rawAllow);
-    const allow = new Set(ids);
+    const allow = new Set([...ids, ...rawAllow]);
+    explicitAllow = allow;
     rendered = filterDisabled(specs.filter((s) => allow.has(s.id)));
+  }
+
+  const actorAgentId = (opts.agentId || '').trim();
+  if (actorAgentId) {
+    const existingIds = new Set(rendered.map((s) => s.id));
+    let privateIndex = 0;
+    for (const { root, specs: privateList } of await loadAgentPrivateSkillSpecs(uid, actorAgentId)) {
+      const privateSpecs = filterDisabled(privateList)
+        .filter((s) => !s.ownerAgent || s.ownerAgent === actorAgentId)
+        .filter((s) => !explicitAllow || explicitAllow.has(s.id))
+        .filter((s) => !existingIds.has(s.id));
+      if (!privateSpecs.length) continue;
+      rootEntries.push({ label: privateIndex === 0 ? 'agent' : `agent${privateIndex + 1}`, root });
+      privateIndex++;
+      for (const s of privateSpecs) existingIds.add(s.id);
+      rendered = [...rendered, ...privateSpecs];
+    }
   }
 
   // EXTERNAL-package skills are inlined for task/authoring sessions
@@ -637,8 +791,8 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
   // Inlining external means a package install/enable busts the session cache
   // prefix — an accepted trade for the model directly seeing installed
   // packages (so it won't try to re-install something already present).
-  // Allowlist / edit-session paths are unchanged (trusted-only — open-tier
-  // never enters authored agent skill_list).
+  // Allowlisted render paths stay trusted-only. Agent metadata has its own
+  // trusted+external helper, and still excludes the unbounded global tier.
   const externalRootSet = new Set<string>();
   let externalRankByRoot: Map<string, number> | null = null;
   if (opts.includeOpenSources && !allowlisted) {
@@ -668,15 +822,23 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
     }
   }
 
-  // Dedupe by display name; trusted shadows external (rank custom 0 > builtin 1
-  // > external 2). When external is merged we pass a root-aware rank so the
-  // external roots map to their tier rank; otherwise the default rank applies.
+  // Dedupe by display name; product/platform shadows custom/open tiers
+  // (builtin > platform > custom > external > global). When external is merged
+  // we pass a root-aware rank so the external roots map to their tier rank;
+  // otherwise the default rank applies.
   rendered = externalRankByRoot
     ? dedupeSkillsByDisplayName(rendered, (s) => {
       const r = externalRankByRoot!.get(path.resolve(s.source || ''));
-      return r !== undefined ? r : SOURCE_DEDUPE_RANK[skillSourceLabel(s.source || '')];
+      return r !== undefined ? r : skillSourceRank(s);
     })
     : dedupeSkillsByDisplayName(rendered);
+
+  // Agent-private skills (frontmatter `ownerAgent`) render only for their
+  // owning agent. Drop owner-tagged specs whose owner isn't THIS actor — hides
+  // them from the commander, every other agent, and an allowlist that happens
+  // to name them. Applied after dedupe so a private skill can't shadow a
+  // same-name shared one for a non-owner. (Mirrors agent-private tool gating.)
+  rendered = rendered.filter((s) => !s.ownerAgent || s.ownerAgent === actorAgentId);
 
   // Advertise signal stays trusted-only (`A.custom` / `A.platform`); external
   // entries are rendered but not advertised — their invocation is still
@@ -685,7 +847,7 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
     for (const s of rendered) {
       if (externalRootSet.has(path.resolve(s.source || ''))) continue;
       try {
-        opts.onSkillAdvertised(s.id, skillSourceLabel(s.source) === 'custom' ? 'A.custom' : 'A.platform');
+        opts.onSkillAdvertised(s.id, skillSourceLabelForSpec(s) === 'custom' ? 'A.custom' : 'A.platform');
       } catch { /* callback throws are non-fatal; signal emission is best-effort */ }
     }
   }
@@ -699,8 +861,8 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
   const block = await renderSkillLines(rendered, rootEntries);
   // Task/authoring hint that GLOBAL-folder skills exist behind `skill_search`
   // (external packages are inlined above). Constant (no count) so global-folder
-  // changes don't churn the cache prefix. Skipped under an allowlist —
-  // pinned/authored agent skill_list stays trusted-only.
+  // changes don't churn the cache prefix. Skipped under an allowlist — pinned
+  // render lists stay trusted-only, while authored metadata excludes global.
   if (opts.includeOpenSources && !allowlisted) {
     return block ? `${block}\n\n${OPEN_TIER_SKILL_HINT}` : OPEN_TIER_SKILL_HINT;
   }
@@ -765,7 +927,9 @@ export async function listSkillsForBridge(uid: string): Promise<BridgeSkillRow[]
   const loader = await getLoader();
   const lang = descriptionLang(getLanguage());
   const pick = await getPickDescription();
-  let specs: SkillSpec[] = loader.list();
+  // Agent-private skills never reach external CLI agents — the orkas-bridge
+  // serves the CLI actor, never the in-process owning agent.
+  let specs: SkillSpec[] = loader.list().filter((s) => !s.ownerAgent);
   const rankByRoot = new Map<string, number>();
   const openDirs = _computeOpenTierDirs(uid);
   const openLoader = await getOpenLoader(openDirs);
@@ -784,11 +948,11 @@ export async function listSkillsForBridge(uid: string): Promise<BridgeSkillRow[]
   }
   specs = dedupeSkillsByDisplayName(specs, (s) => {
     const openRank = s.source ? rankByRoot.get(path.resolve(s.source)) : undefined;
-    return openRank !== undefined ? openRank : SOURCE_DEDUPE_RANK[skillSourceLabel(s.source || '')];
+    return openRank !== undefined ? openRank : skillSourceRank(s);
   });
   return specs.map((s) => {
     const openRank = rankByRoot.get(path.resolve(s.source));
-    const source = openRank === SOURCE_DEDUPE_RANK.external ? 'external' : skillSourceLabel(s.source);
+    const source = openRank === SOURCE_DEDUPE_RANK.external ? 'external' : skillSourceLabelForSpec(s);
     return {
       id: s.id,
       name: s.name || s.id,
@@ -862,9 +1026,12 @@ export async function listOpenSkillsByTier(uid: string): Promise<OpenTierListing
  *  open loader (per-uid package roots). */
 export async function invalidateSkills(): Promise<void> {
   _openLoader = null;
-  if (!_loaderPromise) return;
-  const loader = await _loaderPromise;
-  loader.invalidate();
+  for (const loader of _agentPrivateLoaders.values()) loader.invalidate();
+  _agentPrivateLoaders = new Map();
+  if (_loaderPromise) {
+    const loader = await _loaderPromise;
+    loader.invalidate();
+  }
 }
 
 /** For diagnostics: return the skill list. Picks a description per the active UI language. */
@@ -879,10 +1046,28 @@ export async function listSkills(): Promise<Array<{ id: string; name: string; de
  * Full `SkillSpec[]` snapshot — used by `features/agents.ts` to filter
  * unknown ids out of `agent.skill_list` writes. Goes through the registry
  * singleton so loader caching is shared with `getSystemPromptBlock`.
+ *
+ * `opts.forAgentId` scopes agent-private (`ownerAgent`) skills: when set,
+ * skills owned by a DIFFERENT agent are dropped, so an agent can neither pin
+ * another agent's private skill into its `skill_list` nor resolve it at
+ * runtime — the owner keeps its own. With no agent context the full list is
+ * returned (display-name normalization needs every name).
  */
-export async function listSkillSpecs(): Promise<SkillSpec[]> {
+export async function listSkillSpecs(opts: { forAgentId?: string } = {}): Promise<SkillSpec[]> {
   const loader = await getLoader();
-  return loader.list();
+  let specs = loader.list();
+  if (opts.forAgentId === undefined) return specs;
+  const forAgentId = opts.forAgentId.trim();
+  specs = specs.filter((s) => !s.ownerAgent || s.ownerAgent === forAgentId);
+  const knownIds = new Set(specs.map((s) => s.id));
+  for (const { specs: privateList } of await loadAgentPrivateSkillSpecs(getActiveUserId(), forAgentId)) {
+    const next = privateList
+      .filter((s) => !s.ownerAgent || s.ownerAgent === forAgentId)
+      .filter((s) => !knownIds.has(s.id));
+    for (const s of next) knownIds.add(s.id);
+    specs = [...specs, ...next];
+  }
+  return specs;
 }
 
 /**
@@ -891,10 +1076,28 @@ export async function listSkillSpecs(): Promise<SkillSpec[]> {
  * inlined into the edit prompt. Deliberately excludes global-folder skills:
  * they remain searchable/readable for authoring context, but are unbounded
  * machine-global content and should not become synced agent metadata.
+ * `opts.forAgentId` applies the same agent-private owner gate as
+ * `listSkillSpecs`: another agent's `ownerAgent` skill cannot be persisted in
+ * this agent's metadata.
  */
-export async function listSkillSpecsForAgentMetadata(uid: string): Promise<SkillAllowlistRef[]> {
+export async function listSkillSpecsForAgentMetadata(
+  uid: string,
+  opts: { forAgentId?: string } = {},
+): Promise<SkillAllowlistRef[]> {
   const loader = await getLoader();
+  const forAgentId = opts.forAgentId === undefined ? null : opts.forAgentId.trim();
   let specs: SkillAllowlistRef[] = loader.list();
+  if (forAgentId !== null) {
+    specs = specs.filter((s) => !s.ownerAgent || s.ownerAgent === forAgentId);
+    const knownIds = new Set(specs.map((s) => s.id));
+    for (const { specs: privateList } of await loadAgentPrivateSkillSpecs(uid, forAgentId)) {
+      const next = privateList
+        .filter((s) => !s.ownerAgent || s.ownerAgent === forAgentId)
+        .filter((s) => !knownIds.has(s.id));
+      for (const s of next) knownIds.add(s.id);
+      specs = [...specs, ...next];
+    }
+  }
   const dirs = _computeOpenTierDirs(uid);
   if (!dirs.external.length) return specs;
   const openLoader = await getOpenLoader(dirs);
@@ -902,6 +1105,7 @@ export async function listSkillSpecsForAgentMetadata(uid: string): Promise<Skill
   const externalSet = new Set(dirs.external.map((d) => path.resolve(d)));
   const trustedIds = new Set(specs.map((s) => s.id));
   const externalSpecs = openLoader.list().filter((s) => {
+    if (forAgentId !== null && s.ownerAgent && s.ownerAgent !== forAgentId) return false;
     if (!externalSet.has(path.resolve(s.source))) return false;
     if (trustedIds.has(s.id)) return false;
     const meta = packageMetaForSkillDir(uid, s.dir);

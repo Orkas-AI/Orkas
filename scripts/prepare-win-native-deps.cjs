@@ -4,56 +4,26 @@ const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const {
+  ensureFile,
+  isPeX64,
+  markerMatches,
+  packagePath,
+  packageVersion,
+  readElectronVersion,
+  readLockPackage,
+  scriptHashes,
+  writeMarker,
+} = require('./native-prepare-cache.cjs');
 
 const PC_DIR = path.resolve(__dirname, '..');
 const LOCK_FILE = path.join(PC_DIR, 'package-lock.json');
-
-function readLockPackage(name) {
-  const lock = JSON.parse(fs.readFileSync(LOCK_FILE, 'utf8'));
-  const item = lock.packages?.[`node_modules/${name}`];
-  if (!item?.version) {
-    throw new Error(`package-lock.json is missing node_modules/${name}`);
-  }
-  return item.version;
-}
-
-function readElectronVersion() {
-  const pkg = JSON.parse(fs.readFileSync(path.join(PC_DIR, 'package.json'), 'utf8'));
-  const spec = String(pkg.devDependencies?.electron || '');
-  const match = spec.match(/\d+(?:\.\d+){0,2}/);
-  if (!match) {
-    throw new Error(`package.json is missing a concrete Electron version: ${spec}`);
-  }
-  return match[0];
-}
+const CACHE_HELPER = path.join(__dirname, 'native-prepare-cache.cjs');
+const TARGET_PLATFORM = 'win32';
+const TARGET_ARCH = 'x64';
 
 function npmCmd() {
   return process.platform === 'win32' ? 'npm.cmd' : 'npm';
-}
-
-function quoteCmdArg(value) {
-  const raw = String(value);
-  if (/^[A-Za-z0-9_@./:=+-]+$/.test(raw)) {
-    return raw;
-  }
-  return `"${raw.replace(/"/g, '""')}"`;
-}
-
-function runNpm(cwd, args) {
-  const command = npmCmd();
-  const spawnArgs = args;
-  const spawnOptions = {
-    cwd,
-    stdio: 'inherit',
-    shell: false,
-  };
-  const result = process.platform === 'win32'
-    ? spawnSync(process.env.ComSpec || 'cmd.exe', ['/d', '/c', [command, ...args].map(quoteCmdArg).join(' ')], spawnOptions)
-    : spawnSync(command, spawnArgs, spawnOptions);
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    throw new Error(`npm ${args.join(' ')} failed with exit code ${result.status}`);
-  }
 }
 
 function run(cwd, command, args) {
@@ -87,13 +57,18 @@ function npmPack(cwd, spec) {
   return path.join(cwd, filename);
 }
 
-function packagePath(packageName) {
-  return path.join(PC_DIR, 'node_modules', ...packageName.split('/'));
+function allFilesExist(files) {
+  return files.every((file) => fs.existsSync(file) && fs.statSync(file).isFile());
 }
 
-function ensurePackageFromRegistry(packageName) {
-  const version = readLockPackage(packageName);
-  const targetDir = packagePath(packageName);
+function ensurePackageFromRegistry(packageName, requiredFiles = []) {
+  const version = readLockPackage(LOCK_FILE, packageName);
+  const targetDir = packagePath(PC_DIR, packageName);
+
+  if (packageVersion(PC_DIR, packageName) === version && allFilesExist(requiredFiles)) {
+    console.log(`[prepare-win-native-deps] reusing ${packageName}@${version}`);
+    return;
+  }
 
   console.log(`[prepare-win-native-deps] ensuring ${packageName}@${version}`);
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-win-native-deps-'));
@@ -107,10 +82,28 @@ function ensurePackageFromRegistry(packageName) {
   }
 }
 
-function ensureFile(label, file) {
-  if (!fs.existsSync(file) || !fs.statSync(file).isFile()) {
-    throw new Error(`missing ${label}: ${file}`);
-  }
+function expectedState(electronVersion) {
+  return {
+    schema: 1,
+    platform: TARGET_PLATFORM,
+    arch: TARGET_ARCH,
+    electronVersion,
+    scriptHashes: scriptHashes({
+      prepareWinNativeDeps: __filename,
+      nativePrepareCache: CACHE_HELPER,
+    }),
+    packages: {
+      '@esbuild/win32-x64': readLockPackage(LOCK_FILE, '@esbuild/win32-x64'),
+      'sqlite-vec-windows-x64': readLockPackage(LOCK_FILE, 'sqlite-vec-windows-x64'),
+      '@napi-rs/canvas-win32-x64-msvc': readLockPackage(LOCK_FILE, '@napi-rs/canvas-win32-x64-msvc'),
+      '@anush008/tokenizers-win32-x64-msvc': readLockPackage(LOCK_FILE, '@anush008/tokenizers-win32-x64-msvc'),
+      'better-sqlite3': readLockPackage(LOCK_FILE, 'better-sqlite3'),
+    },
+  };
+}
+
+function removeLegacyMarker() {
+  fs.rmSync(path.join(PC_DIR, 'node_modules', '.orkas-native-prepared'), { recursive: true, force: true });
 }
 
 function removeDirectories(parentDir, shouldRemove) {
@@ -125,11 +118,18 @@ function removeDirectories(parentDir, shouldRemove) {
 }
 
 function main() {
-  const esbuildVersion = readLockPackage('@esbuild/win32-x64');
-  const sqliteVecVersion = readLockPackage('sqlite-vec-windows-x64');
-  const electronVersion = readElectronVersion();
+  const electronVersion = readElectronVersion(PC_DIR);
+  const state = expectedState(electronVersion);
   const sqliteVecDir = path.join(PC_DIR, 'node_modules', 'sqlite-vec');
   const betterSqliteDir = path.join(PC_DIR, 'node_modules', 'better-sqlite3');
+  const betterSqliteBinary = path.join(betterSqliteDir, 'build', 'Release', 'better_sqlite3.node');
+  const required = {
+    esbuild: path.join(PC_DIR, 'node_modules', '@esbuild', 'win32-x64', 'esbuild.exe'),
+    sqliteVec: path.join(PC_DIR, 'node_modules', 'sqlite-vec-windows-x64', 'vec0.dll'),
+    betterSqlite: betterSqliteBinary,
+    canvas: path.join(PC_DIR, 'node_modules', '@napi-rs', 'canvas-win32-x64-msvc', 'skia.win32-x64-msvc.node'),
+    tokenizers: path.join(PC_DIR, 'node_modules', '@anush008', 'tokenizers-win32-x64-msvc', 'tokenizers.win32-x64-msvc.node'),
+  };
 
   if (!fs.existsSync(sqliteVecDir) || !fs.statSync(sqliteVecDir).isDirectory()) {
     throw new Error(`sqlite-vec is not installed: ${sqliteVecDir}`);
@@ -138,34 +138,36 @@ function main() {
     throw new Error(`better-sqlite3 is not installed: ${betterSqliteDir}`);
   }
 
-  console.log(`[prepare-win-native-deps] ensuring @esbuild/win32-x64@${esbuildVersion}`);
-  runNpm(PC_DIR, [
-    'install',
-    '--no-save',
-    '--ignore-scripts',
-    '--include=optional',
-    '--force',
-    `@esbuild/win32-x64@${esbuildVersion}`,
-  ]);
+  const prepared = markerMatches(PC_DIR, state, Object.values(required), () => isPeX64(betterSqliteBinary));
+  removeLegacyMarker();
+  if (prepared) {
+    console.log(`[prepare-win-native-deps] using cached Windows native dependencies for Electron ${electronVersion}`);
+    return;
+  }
 
-  console.log(`[prepare-win-native-deps] ensuring sqlite-vec-windows-x64@${sqliteVecVersion}`);
-  ensurePackageFromRegistry('sqlite-vec-windows-x64');
-  ensurePackageFromRegistry('@napi-rs/canvas-win32-x64-msvc');
-  ensurePackageFromRegistry('@anush008/tokenizers-win32-x64-msvc');
+  ensurePackageFromRegistry('@esbuild/win32-x64', [required.esbuild]);
 
-  console.log(`[prepare-win-native-deps] ensuring better-sqlite3 Electron ${electronVersion} win32-x64 prebuild`);
-  run(betterSqliteDir, process.execPath, [
-    require.resolve('prebuild-install/bin.js'),
-    '--runtime',
-    'electron',
-    '--target',
-    electronVersion,
-    '--platform',
-    'win32',
-    '--arch',
-    'x64',
-    '--force',
-  ]);
+  ensurePackageFromRegistry('sqlite-vec-windows-x64', [required.sqliteVec]);
+  ensurePackageFromRegistry('@napi-rs/canvas-win32-x64-msvc', [required.canvas]);
+  ensurePackageFromRegistry('@anush008/tokenizers-win32-x64-msvc', [required.tokenizers]);
+
+  if (packageVersion(PC_DIR, 'better-sqlite3') === state.packages['better-sqlite3'] && isPeX64(betterSqliteBinary)) {
+    console.log(`[prepare-win-native-deps] reusing better-sqlite3 Electron ${electronVersion} win32-x64 prebuild`);
+  } else {
+    console.log(`[prepare-win-native-deps] ensuring better-sqlite3 Electron ${electronVersion} win32-x64 prebuild`);
+    run(betterSqliteDir, process.execPath, [
+      require.resolve('prebuild-install/bin.js'),
+      '--runtime',
+      'electron',
+      '--target',
+      electronVersion,
+      '--platform',
+      TARGET_PLATFORM,
+      '--arch',
+      TARGET_ARCH,
+      '--force',
+    ]);
+  }
 
   console.log('[prepare-win-native-deps] pruning non-Windows native runtime packages');
   removeDirectories(path.join(PC_DIR, 'node_modules', '@esbuild'), (name) => name !== 'win32-x64');
@@ -176,24 +178,28 @@ function main() {
 
   ensureFile(
     'Windows esbuild runtime binary',
-    path.join(PC_DIR, 'node_modules', '@esbuild', 'win32-x64', 'esbuild.exe'),
+    required.esbuild,
   );
   ensureFile(
     'Windows sqlite-vec runtime binary',
-    path.join(PC_DIR, 'node_modules', 'sqlite-vec-windows-x64', 'vec0.dll'),
+    required.sqliteVec,
   );
   ensureFile(
     'Windows better-sqlite3 runtime binary',
-    path.join(betterSqliteDir, 'build', 'Release', 'better_sqlite3.node'),
+    required.betterSqlite,
   );
+  if (!isPeX64(required.betterSqlite)) {
+    throw new Error(`Windows better-sqlite3 runtime binary is not PE x64: ${required.betterSqlite}`);
+  }
   ensureFile(
     'Windows canvas runtime binary',
-    path.join(PC_DIR, 'node_modules', '@napi-rs', 'canvas-win32-x64-msvc', 'skia.win32-x64-msvc.node'),
+    required.canvas,
   );
   ensureFile(
     'Windows tokenizers runtime binary',
-    path.join(PC_DIR, 'node_modules', '@anush008', 'tokenizers-win32-x64-msvc', 'tokenizers.win32-x64-msvc.node'),
+    required.tokenizers,
   );
+  writeMarker(PC_DIR, state);
 }
 
 main();

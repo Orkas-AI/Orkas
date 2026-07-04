@@ -85,7 +85,7 @@ export interface SkillTurnBuffer {
 }
 
 export function createSkillTurnBuffer(): SkillTurnBuffer {
-  // `Set<string>` keyed on `${system}${skill_id}` — bus may call the
+  // `Set<string>` keyed on `${system}::${skill_id}` — bus may call the
   // recorders multiple times (e.g. ChatOptions wired to two layers); dedup
   // keeps the emitted signal payload clean. Invoked uses the same shape
   // since same SKILL.md can be read more than once per turn.

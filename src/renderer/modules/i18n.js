@@ -34,6 +34,7 @@ const _LOCALES = [
   { code: 'zh', label: '简体中文', htmlLang: 'zh-CN', intlLocale: 'zh-CN', fallback: 'en' },
   { code: 'en', label: 'English', htmlLang: 'en', intlLocale: 'en-US', fallback: null },
   { code: 'ja', label: '日本語', htmlLang: 'ja', intlLocale: 'ja-JP', fallback: 'en' },
+  { code: 'pt', label: 'Português (Brasil)', htmlLang: 'pt-BR', intlLocale: 'pt-BR', fallback: 'en' },
 ];
 const _LOCALE_BY_CODE = _LOCALES.reduce((acc, meta) => {
   acc[meta.code] = meta;

@@ -9,10 +9,9 @@ import * as path from 'node:path';
 // scan them — the loader is pure FS + frontmatter parsing, no network/LLM.
 //
 // Post-refactor layout:
-//   platform skills → `<WS_ROOT>/<uid>/local/marketplace/skills/<id>/SKILL.md`
-//   custom skills   → `<WS_ROOT>/<uid>/cloud/skills/<id>/SKILL.md`
-// The loader scans `[userSkillsDir(activeUid), userMarketplaceSkillsDir(activeUid)]`,
-// with custom listed first so same-id custom overrides platform.
+//   platform/builtin skills → `<WS_ROOT>/<uid>/local/marketplace/skills/<id>/SKILL.md`
+//   custom skills           → `<WS_ROOT>/<uid>/cloud/skills/<id>/SKILL.md`
+// The loader scans marketplace first so same-id platform/builtin overrides custom.
 
 let tmpDir: string;
 let prevWs: string | undefined;
@@ -30,12 +29,18 @@ function systemDir(): string {
 function systemDirFor(uid: string): string {
   return path.join(tmpDir, uid, 'local', 'system', 'skills');
 }
+function agentPrivateDir(agentId: string): string {
+  return path.join(tmpDir, TEST_UID, 'cloud', 'agents', agentId, 'private_skills');
+}
 
-function writeSkill(root: string, id: string, name: string, description: string) {
+function writeSkill(root: string, id: string, name: string, description: string, installMeta?: Record<string, unknown>) {
   const skillDir = path.join(root, id);
   fs.mkdirSync(skillDir, { recursive: true });
   const md = `---\nname: ${name}\ndescription: ${description}\n---\nbody`;
   fs.writeFileSync(path.join(skillDir, 'SKILL.md'), md);
+  if (installMeta) {
+    fs.writeFileSync(path.join(skillDir, '_install.json'), JSON.stringify(installMeta));
+  }
 }
 
 beforeEach(async () => {
@@ -48,6 +53,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  vi.doUnmock('#core-agent');
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -82,8 +88,8 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     writeSkill(builtinDir(), 'daa4378ab55a', 'find-skill', 'Find skill');
     const { getSystemPromptBlock } = await loadRegistry();
     const text = await getSystemPromptBlock({ allowlist: ['github', 'find-skill'] });
-    expect(text).toContain('**github** (Source: builtin; internal read id: 6bb95f967501)');
-    expect(text).toContain('**find-skill** (Source: builtin; internal read id: daa4378ab55a)');
+    expect(text).toContain('**github** (Source: platform; internal read id: 6bb95f967501)');
+    expect(text).toContain('**find-skill** (Source: platform; internal read id: daa4378ab55a)');
     expect(text).not.toContain('(id: 6bb95f967501)');
   });
 
@@ -112,16 +118,23 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
   // Regression: per-uid migration (CLAUDE.md §4) made both skill roots end
   // in `/skills`, so deriving the `Source` tag from basename collapses to
   // `skills` for every entry. `chat_commander.md` / `chat_agent_in_group.md`
-  // tell the LLM to pick a root by `Source: builtin|custom` — a degenerate label
+  // tell the LLM to pick a root by `Source: builtin|platform|custom` — a degenerate label
   // sends it guessing and half the SKILL.md reads ENOENT on first try.
-  it('labels `Source` as builtin vs custom by root path, not basename', async () => {
-    writeSkill(builtinDir(), 'shipped', 'Shipped', 'desc-builtin');
+  it('labels `Source` as platform vs custom by root path, not basename', async () => {
+    writeSkill(builtinDir(), 'shipped', 'Shipped', 'desc-platform');
     writeSkill(customDir(), 'mine', 'Mine', 'desc-custom');
     const { getSystemPromptBlock } = await loadRegistry();
     const text = await getSystemPromptBlock();
-    expect(text).toContain('Source: builtin');
+    expect(text).toContain('Source: platform');
     expect(text).toContain('Source: custom');
     expect(text).not.toContain('Source: skills');
+  });
+
+  it('labels packaged seed skills as builtin from install metadata', async () => {
+    writeSkill(builtinDir(), 'seeded', 'Seeded', 'desc-builtin', { seed_source: 'builtin' });
+    const { getSystemPromptBlock } = await loadRegistry();
+    const text = await getSystemPromptBlock();
+    expect(text).toContain('**Seeded** (Source: builtin; internal read id: seeded) — desc-builtin');
   });
 
   // The block embeds a Read-pattern header with resolved ROOT values for
@@ -138,6 +151,7 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     const text = await getSystemPromptBlock();
     expect(text).toContain('`read_file(<ROOT>/<id>/SKILL.md)`');
     expect(text).toContain(`- custom:  ${path.resolve(customDir())}`);
+    expect(text).toContain(`- platform: ${path.resolve(builtinDir())}`);
     expect(text).toContain(`- builtin: ${path.resolve(builtinDir())}`);
     expect(text).toContain('Use these ROOT values verbatim');
     expect(text).toContain('These entries are skills, not tool names');
@@ -165,14 +179,14 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     expect(text).not.toContain('Triggers: logs');
   });
 
-  it('dedupes same display-name skills with custom shadowing builtin', async () => {
-    writeSkill(builtinDir(), 'builtin-reviewer', 'agent-static-review', 'builtin desc');
+  it('dedupes same display-name skills with platform shadowing custom', async () => {
+    writeSkill(builtinDir(), 'platform-reviewer', 'agent-static-review', 'platform desc');
     writeSkill(customDir(), 'custom-reviewer', 'agent-static-review', 'custom desc');
     const { getSystemPromptBlock } = await loadRegistry();
     const text = await getSystemPromptBlock();
-    expect(text).toContain('**agent-static-review** (Source: custom; internal read id: custom-reviewer) — custom desc');
-    expect(text).not.toContain('builtin-reviewer');
-    expect(text).not.toContain('builtin desc');
+    expect(text).toContain('**agent-static-review** (Source: platform; internal read id: platform-reviewer) — platform desc');
+    expect(text).not.toContain('custom-reviewer');
+    expect(text).not.toContain('custom desc');
   });
 
   it('keeps same display-name marketplace skills with different internal ids', async () => {
@@ -188,8 +202,8 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
       },
     });
 
-    expect(text).toContain('**agent-static-review** (Source: builtin; internal read id: 111111111111) — first marketplace desc');
-    expect(text).toContain('**agent-static-review** (Source: builtin; internal read id: 222222222222) — second marketplace desc');
+    expect(text).toContain('**agent-static-review** (Source: platform; internal read id: 111111111111) — first marketplace desc');
+    expect(text).toContain('**agent-static-review** (Source: platform; internal read id: 222222222222) — second marketplace desc');
     expect(advertised).toEqual([
       { id: '111111111111', system: 'A.platform' },
       { id: '222222222222', system: 'A.platform' },
@@ -209,6 +223,36 @@ describe('skill-registry › getSystemPromptBlock(allowlist)', () => {
     expect(text).toContain('internal read id: 222222222222');
     expect(text).not.toContain('333333333333');
     expect(text).not.toContain('other desc');
+  });
+
+  it('reuses agent-private SkillLoader instances while still seeing root mtime changes', async () => {
+    let constructed = 0;
+    vi.doMock('#core-agent', async (importOriginal) => {
+      const actual = await importOriginal<any>();
+      class CountingSkillLoader extends actual.SkillLoader {
+        constructor(opts: any) {
+          super(opts);
+          constructed++;
+        }
+      }
+      return { ...actual, SkillLoader: CountingSkillLoader };
+    });
+
+    writeSkill(agentPrivateDir('video-studio'), 'private-one', 'private-one', 'first private skill');
+    const { getSystemPromptBlock } = await loadRegistry();
+    const first = await getSystemPromptBlock({ agentId: 'video-studio' });
+
+    expect(first).toContain('private-one');
+    expect(constructed).toBe(2); // trusted loader + one agent-private root loader
+
+    writeSkill(agentPrivateDir('video-studio'), 'private-two', 'private-two', 'second private skill');
+    const later = new Date(Date.now() + 2000);
+    fs.utimesSync(agentPrivateDir('video-studio'), later, later);
+    const second = await getSystemPromptBlock({ agentId: 'video-studio' });
+
+    expect(second).toContain('private-one');
+    expect(second).toContain('private-two');
+    expect(constructed).toBe(2);
   });
 });
 
@@ -266,5 +310,75 @@ describe('skill-registry › replaceKnownSkillIdsForDisplay', () => {
       [{ id: '16e1bfcb3426', name: 'agent-creator' }],
     );
     expect(text).toBe('`agent-creator` skill — create agents');
+  });
+});
+
+describe('skill-registry › compactPromptDescription', () => {
+  // The commander's "Agents list" and skill list inject this compacted entry.
+  // The bug it guards: an agent/skill whose FIRST sentence is a throwaway
+  // tagline (ends with 。 before the real capability + routing guidance) used to
+  // collapse to that 9-char tagline, so the commander never saw the routing
+  // instruction and self-served the task instead of dispatching.
+
+  it('keeps a substantive first sentence as-is (the common, adequate case)', async () => {
+    const { compactPromptDescription } = await loadRegistry();
+    const desc =
+      '办公写作与交付入口：把用户想做、想改、想整理的办公材料落成可交付文档、表格、演示或 PDF；适合写报告。触发词：写文档';
+    // `；适合` marker fires → cut before the 适合 tail; unchanged by the floor.
+    expect(compactPromptDescription(desc)).toBe(
+      '办公写作与交付入口：把用户想做、想改、想整理的办公材料落成可交付文档、表格、演示或 PDF',
+    );
+  });
+
+  it('extends a too-short tagline-first description past the tagline (the floor)', async () => {
+    const { compactPromptDescription } = await loadRegistry();
+    const desc =
+      '做视频，也剪视频。三条产线：①解说②AI 生成③剪辑你上传的真实视频。' +
+      '凡是“对一段已有视频做处理”的都路由到它，而不是 commander 自己拿命令行拼。' +
+      '适合“做个动画”。触发词：做视频、加字幕、剪辑';
+    const out = compactPromptDescription(desc);
+    // Must not collapse to the 9-char "做视频，也剪视频。" tagline …
+    expect(out.length).toBeGreaterThan('做视频，也剪视频。'.length);
+    // … must carry the routing instruction the commander needs …
+    expect(out).toContain('路由到它');
+    // … and must stop before the 适合/触发词 enumeration (recognising the 。
+    // delimiter the ；-only markers miss), not bleed the whole description in.
+    expect(out).not.toContain('适合');
+    expect(out).not.toContain('触发');
+  });
+
+  it('does not over-extend a short BUT complete description (no tail to add)', async () => {
+    const { compactPromptDescription } = await loadRegistry();
+    // Below the floor length, but there is nothing after it — return as-is,
+    // never pad from absent content.
+    expect(compactPromptDescription('查天气。')).toBe('查天气。');
+  });
+
+  it('preserves the existing English ". Triggers"/"。触发词" marker cut', async () => {
+    const { compactPromptDescription } = await loadRegistry();
+    const en =
+      'Makes and edits videos for you across explainer, generated footage, and real-clip editing. Triggers: make a video, add captions, edit video';
+    // Long-enough lead → floor never fires; period-keyword marker still trims
+    // the Triggers tail (regression guard on the original behavior).
+    expect(compactPromptDescription(en)).toBe(
+      'Makes and edits videos for you across explainer, generated footage, and real-clip editing.',
+    );
+  });
+
+  it('caps a runaway extension at a sentence boundary', async () => {
+    const { compactPromptDescription } = await loadRegistry();
+    // Tagline first, then many sentences and NO 适合/触发 section → the floor
+    // extends but must clip at a 。 under the hard cap, not return 1000 chars.
+    const long = '短。' + '这是一段没有触发段的很长描述内容用来测试上限。'.repeat(40);
+    const out = compactPromptDescription(long);
+    expect(out.length).toBeGreaterThan('短。'.length);
+    expect(out.length).toBeLessThanOrEqual(240);
+    expect(out.endsWith('。')).toBe(true);
+  });
+
+  it('returns empty string for empty/whitespace input', async () => {
+    const { compactPromptDescription } = await loadRegistry();
+    expect(compactPromptDescription('   ')).toBe('');
+    expect(compactPromptDescription('')).toBe('');
   });
 });

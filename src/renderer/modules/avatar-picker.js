@@ -14,8 +14,8 @@
 //                                  filtered out (used by the
 //                                  commander avatar settings).
 //     hideIcons: false           — when true, only the color row is
-//                                  rendered (the commander avatar's
-//                                  icon is always crown).
+//                                  rendered (legacy / constrained callers).
+//     colorLabelKey: ''          — optional i18n key for the color row label.
 //   onChange:  ({ icon, color }) => void, fires on every selection.
 
 let _avatarPickerEl = null;
@@ -36,7 +36,7 @@ function _ensureAvatarPickerDom() {
       <div class="avatar-picker-grid" data-role="icon-grid"></div>
     </div>
     <div class="avatar-picker-section">
-      <div class="avatar-picker-label" data-i18n="avatar.color_label">Color</div>
+      <div class="avatar-picker-label" data-role="color-label" data-i18n="avatar.color_label">Color</div>
       <div class="avatar-picker-grid" data-role="color-grid"></div>
     </div>
   `;
@@ -73,6 +73,7 @@ function _renderAvatarPicker() {
   const hideIcons = !!(_avatarPickerOpts && _avatarPickerOpts.hideIcons);
   const iconSection = el.querySelector('[data-role="icon-section"]');
   const iconGrid = el.querySelector('[data-role="icon-grid"]');
+  const colorLabel = el.querySelector('[data-role="color-label"]');
   const colorGrid = el.querySelector('[data-role="color-grid"]');
   const cur = _avatarPickerCurrent || { icon: '', color: '' };
 
@@ -88,6 +89,10 @@ function _renderAvatarPicker() {
     const r = t(key);
     return r === key ? fallback : r;
   };
+  if (colorLabel) {
+    const key = _avatarPickerOpts?.colorLabelKey || 'avatar.color_label';
+    colorLabel.textContent = _avatarLabel(key, _avatarPickerOpts?.colorLabel || 'Color');
+  }
 
   iconGrid.innerHTML = icons.map((i) => {
     const active = i.id === cur.icon ? ' is-active' : '';

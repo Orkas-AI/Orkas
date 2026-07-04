@@ -7,21 +7,26 @@
  * and mutated via an agent tool during the conversation.
  *
  * Storage:
- *   data/<user_id>/memory/MEMORY.md   — agent notes (~2200 char cap)
- *   data/<user_id>/memory/USER.md     — user profile (~1375 char cap)
+ *   cloud/memory/MEMORY.md              — shared project notes
+ *   cloud/memory/USER.md                — user profile
+ *   cloud/memory/agents/<agent>/MEMORY.md — per-agent notes
  */
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { userMemoryFile, userProfileFile, userMemoryDir } from '../paths';
+import { userMemoryFile, userProfileFile, agentMemoryFile, userAgentMemoryFile } from '../paths';
 import { writeTextAtomicSync } from '../storage';
 import { createLogger } from '../logger';
 
 const log = createLogger('memory');
 
 // ── Constants ────────────────────────────────────────────────────────────
-export const MEMORY_CHAR_LIMIT = 2500;   // facts: keep room for several durable notes
-export const USER_CHAR_LIMIT   = 1500;   // profile/preferences: should stay concise
+export const MEMORY_CHAR_LIMIT = 2500;   // SHARED/project tier (the legacy MEMORY.md): cross-agent facts
+export const USER_CHAR_LIMIT   = 1500;   // user profile/preferences (cross-agent): stays concise
+export const AGENT_CHAR_LIMIT  = 2000;   // per-agent domain notes: each agent gets its own budget
+export const MEMORY_ENTRY_LIMIT = 16;    // keep memory prompts bounded by item count as well as chars
+export const USER_ENTRY_LIMIT   = 16;
+export const AGENT_ENTRY_LIMIT  = MEMORY_ENTRY_LIMIT;
 export const ENTRY_SEPARATOR   = '\n§\n';
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -29,11 +34,20 @@ export interface MemoryEntry {
   text: string;
 }
 
+/** Which memory store an op targets. The legacy string targets are kept so all
+ *  existing callers (auth / sync / ipc) work unchanged:
+ *    'user'        → USER.md       (user profile, global, cross-agent)
+ *    'memory'      → MEMORY.md     (SHARED/project notes, global, cross-agent)
+ *    {agent: id}   → agents/<id>/MEMORY.md (per-agent domain notes)
+ *  Per-agent writes are bound to the calling agent by the runner; the model
+ *  cannot target another agent's store. */
+export type MemoryScope = 'memory' | 'user' | { agent: string };
+
 export interface MemoryOpResult {
   ok: boolean;
   error?: string;
   entries: string[];
-  usage: { current: number; limit: number };
+  usage: { current: number; limit: number; entries_current?: number; entries_limit?: number };
 }
 
 // ── Security: injection pattern scanning ─────────────────────────────────
@@ -59,16 +73,44 @@ export function scanForInjection(content: string): string | null {
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-function fileForTarget(userId: string, target: 'memory' | 'user'): string {
-  return target === 'memory' ? userMemoryFile(userId) : userProfileFile(userId);
+function fileForTarget(userId: string, target: MemoryScope): string {
+  if (target === 'user') return userProfileFile(userId);
+  if (target === 'memory') return userMemoryFile(userId);
+  return agentMemoryFile(userId, target.agent);
 }
 
-function limitForTarget(target: 'memory' | 'user'): number {
-  return target === 'memory' ? MEMORY_CHAR_LIMIT : USER_CHAR_LIMIT;
+function limitForTarget(target: MemoryScope): number {
+  if (target === 'user') return USER_CHAR_LIMIT;
+  if (target === 'memory') return MEMORY_CHAR_LIMIT;
+  return AGENT_CHAR_LIMIT;
 }
 
-function notifyMemoryDirty(target: 'memory' | 'user'): void {
-  void target;
+function entryLimitForTarget(target: MemoryScope): number {
+  if (target === 'user') return USER_ENTRY_LIMIT;
+  if (target === 'memory') return MEMORY_ENTRY_LIMIT;
+  return AGENT_ENTRY_LIMIT;
+}
+
+function syncRelForTarget(target: MemoryScope): string {
+  if (target === 'user') return 'cloud/memory/USER.md';
+  if (target === 'memory') return 'cloud/memory/MEMORY.md';
+  return `cloud/memory/agents/${target.agent}/MEMORY.md`;
+}
+
+function notifyMemoryDirty(target: MemoryScope): void {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
+    sync?.markDirty?.('memory', syncRelForTarget(target));
+  } catch { /* features/sync stripped */ }
+}
+
+function notifyLegacyAgentMemoryDirty(agentId: string): void {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
+    sync?.markDirty?.('agents', `cloud/agents/${agentId}/memory/MEMORY.md`);
+  } catch { /* features/sync stripped */ }
 }
 
 /** Load §-separated entries from a markdown file. */
@@ -87,85 +129,183 @@ export function loadEntries(filePath: string): MemoryEntry[] {
     .map(text => ({ text }));
 }
 
-/** Save entries atomically, respecting char limit (drops excess from end). */
-export function saveEntries(filePath: string, entries: MemoryEntry[], charLimit: number): void {
-  // Deduplicate (keep first occurrence)
+/** Save entries atomically, respecting count + char limits.
+ *
+ * Entries are ordered oldest → newest. New writes are appended by callers, so
+ * when a cap is exceeded we evict from the front and preserve the latest
+ * memory. Duplicate text keeps the newest occurrence for the same reason.
+ */
+export function saveEntries(filePath: string, entries: MemoryEntry[], charLimit: number, entryLimit = Number.POSITIVE_INFINITY): void {
+  // Deduplicate (keep newest occurrence) and normalize whitespace around items.
   const seen = new Set<string>();
   const deduped: MemoryEntry[] = [];
-  for (const e of entries) {
-    if (!seen.has(e.text)) {
-      seen.add(e.text);
-      deduped.push(e);
-    }
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const text = String(entries[i]?.text || '').trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    deduped.unshift({ text });
   }
 
-  // Build text, trim from end if over limit
-  let kept = [...deduped];
+  const maxEntries = Number.isFinite(entryLimit) && entryLimit > 0 ? Math.floor(entryLimit) : deduped.length;
+  let kept = deduped.slice(-maxEntries);
   let text = kept.map(e => e.text).join(ENTRY_SEPARATOR);
   while (text.length > charLimit && kept.length > 1) {
-    kept.pop();
+    kept.shift();
     text = kept.map(e => e.text).join(ENTRY_SEPARATOR);
+  }
+  if (text.length > charLimit && kept.length === 1) {
+    kept = [{ text: kept[0].text.slice(0, charLimit).trim() }];
+    text = kept[0].text;
   }
 
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   writeTextAtomicSync(filePath, text);
 }
 
-function buildResult(userId: string, target: 'memory' | 'user', ok: boolean, error?: string): MemoryOpResult {
+function buildResult(userId: string, target: MemoryScope, ok: boolean, error?: string): MemoryOpResult {
   const entries = loadEntries(fileForTarget(userId, target));
   const text = entries.map(e => e.text).join(ENTRY_SEPARATOR);
   return {
     ok,
     ...(error ? { error } : {}),
     entries: entries.map(e => e.text),
-    usage: { current: text.length, limit: limitForTarget(target) },
+    usage: { current: text.length, limit: limitForTarget(target), entries_current: entries.length, entries_limit: entryLimitForTarget(target) },
+  };
+}
+
+function legacyAgentMemoryPath(userId: string, agentId: string): string {
+  return userAgentMemoryFile(userId, agentId);
+}
+
+const migratedLegacyAgentMemory = new Set<string>();
+
+function dedupeNewest(entries: MemoryEntry[]): MemoryEntry[] {
+  const seen = new Set<string>();
+  const out: MemoryEntry[] = [];
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const text = String(entries[i]?.text || '').trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    out.unshift({ text });
+  }
+  return out;
+}
+
+function migrateLegacyAgentMemoryOnce(userId: string, agentId: string): void {
+  const key = `${userId}\0${agentId}`;
+  if (migratedLegacyAgentMemory.has(key)) return;
+  const legacyPath = legacyAgentMemoryPath(userId, agentId);
+  try {
+    const legacyEntries = loadEntries(legacyPath);
+    if (legacyEntries.length > 0) {
+      const canonicalPath = agentMemoryFile(userId, agentId);
+      const merged = dedupeNewest([
+        ...legacyEntries,
+        ...loadEntries(canonicalPath),
+      ]);
+      saveEntries(canonicalPath, merged, AGENT_CHAR_LIMIT, AGENT_ENTRY_LIMIT);
+      writeTextAtomicSync(legacyPath, '');
+      notifyMemoryDirty({ agent: agentId });
+      notifyLegacyAgentMemoryDirty(agentId);
+    }
+    migratedLegacyAgentMemory.add(key);
+  } catch (err) {
+    log.warn(`legacy agent memory migration failed: ${(err as Error).message}`);
+  }
+}
+
+function loadAgentEntries(userId: string, agentId: string): MemoryEntry[] {
+  migrateLegacyAgentMemoryOnce(userId, agentId);
+  return loadEntries(agentMemoryFile(userId, agentId));
+}
+
+function buildAgentResult(userId: string, agentId: string, ok: boolean, error?: string): MemoryOpResult {
+  const entries = loadAgentEntries(userId, agentId);
+  const text = entries.map(e => e.text).join(ENTRY_SEPARATOR);
+  return {
+    ok,
+    ...(error ? { error } : {}),
+    entries: entries.map(e => e.text),
+    usage: { current: text.length, limit: AGENT_CHAR_LIMIT, entries_current: entries.length, entries_limit: AGENT_ENTRY_LIMIT },
   };
 }
 
 // ── Public API ───────────────────────────────────────────────────────────
 
-export function addEntry(userId: string, target: 'memory' | 'user', content: string): MemoryOpResult {
+export function addEntry(userId: string, target: MemoryScope, content: string): MemoryOpResult {
   const trimmed = content.trim();
   if (!trimmed) return buildResult(userId, target, false, 'empty content');
 
   const threat = scanForInjection(trimmed);
   if (threat) {
-    log.warn(`blocked memory write (${threat}): ${trimmed.slice(0, 80)}...`);
+    log.warn('blocked memory write', { threat, content_chars: trimmed.length });
     return buildResult(userId, target, false, `blocked: suspicious content (${threat})`);
   }
 
   const filePath = fileForTarget(userId, target);
   const limit = limitForTarget(target);
+  const entryLimit = entryLimitForTarget(target);
   const entries = loadEntries(filePath);
   entries.push({ text: trimmed });
-  saveEntries(filePath, entries, limit);
+  saveEntries(filePath, entries, limit, entryLimit);
   notifyMemoryDirty(target);
   return buildResult(userId, target, true);
 }
 
-export function replaceEntry(userId: string, target: 'memory' | 'user', oldText: string, content: string): MemoryOpResult {
+export function addAgentEntry(userId: string, agentId: string, content: string): MemoryOpResult {
+  const res = addEntry(userId, { agent: agentId }, content);
+  return buildAgentResult(userId, agentId, res.ok, res.error);
+}
+
+export function replaceEntry(userId: string, target: MemoryScope, oldText: string, content: string): MemoryOpResult {
   const trimmed = content.trim();
   if (!trimmed) return buildResult(userId, target, false, 'empty content');
 
   const threat = scanForInjection(trimmed);
   if (threat) {
-    log.warn(`blocked memory write (${threat}): ${trimmed.slice(0, 80)}...`);
+    log.warn('blocked memory write', { threat, content_chars: trimmed.length });
     return buildResult(userId, target, false, `blocked: suspicious content (${threat})`);
   }
 
   const filePath = fileForTarget(userId, target);
   const limit = limitForTarget(target);
+  const entryLimit = entryLimitForTarget(target);
   const entries = loadEntries(filePath);
   const idx = entries.findIndex(e => e.text.includes(oldText));
   if (idx === -1) return buildResult(userId, target, false, 'old_text not found');
 
   entries[idx] = { text: trimmed };
-  saveEntries(filePath, entries, limit);
+  saveEntries(filePath, entries, limit, entryLimit);
   notifyMemoryDirty(target);
   return buildResult(userId, target, true);
 }
 
-export function removeEntry(userId: string, target: 'memory' | 'user', oldText: string): MemoryOpResult {
+export function replaceAgentEntry(userId: string, agentId: string, oldText: string, content: string): MemoryOpResult {
+  const trimmed = content.trim();
+  if (!trimmed) return buildAgentResult(userId, agentId, false, 'empty content');
+
+  const threat = scanForInjection(trimmed);
+  if (threat) {
+    log.warn('blocked agent memory write', { threat, content_chars: trimmed.length });
+    return buildAgentResult(userId, agentId, false, `blocked: suspicious content (${threat})`);
+  }
+
+  let changed = false;
+  migrateLegacyAgentMemoryOnce(userId, agentId);
+  const canonicalPath = agentMemoryFile(userId, agentId);
+  const canonicalEntries = loadEntries(canonicalPath);
+  const canonicalIdx = canonicalEntries.findIndex(e => e.text.includes(oldText));
+  if (canonicalIdx !== -1) {
+    canonicalEntries[canonicalIdx] = { text: trimmed };
+    saveEntries(canonicalPath, canonicalEntries, AGENT_CHAR_LIMIT, AGENT_ENTRY_LIMIT);
+    notifyMemoryDirty({ agent: agentId });
+    changed = true;
+  }
+
+  return buildAgentResult(userId, agentId, changed, changed ? undefined : 'old_text not found');
+}
+
+export function removeEntry(userId: string, target: MemoryScope, oldText: string): MemoryOpResult {
   const filePath = fileForTarget(userId, target);
   const limit = limitForTarget(target);
   const entries = loadEntries(filePath);
@@ -173,16 +313,36 @@ export function removeEntry(userId: string, target: 'memory' | 'user', oldText: 
   if (idx === -1) return buildResult(userId, target, false, 'old_text not found');
 
   entries.splice(idx, 1);
-  saveEntries(filePath, entries, limit);
+  saveEntries(filePath, entries, limit, entryLimitForTarget(target));
   notifyMemoryDirty(target);
   return buildResult(userId, target, true);
 }
 
-export function listEntries(userId: string, target: 'memory' | 'user'): MemoryOpResult {
+export function removeAgentEntry(userId: string, agentId: string, oldText: string): MemoryOpResult {
+  let changed = false;
+  migrateLegacyAgentMemoryOnce(userId, agentId);
+  const canonicalPath = agentMemoryFile(userId, agentId);
+  const canonicalEntries = loadEntries(canonicalPath);
+  const canonicalIdx = canonicalEntries.findIndex(e => e.text.includes(oldText));
+  if (canonicalIdx !== -1) {
+    canonicalEntries.splice(canonicalIdx, 1);
+    saveEntries(canonicalPath, canonicalEntries, AGENT_CHAR_LIMIT, AGENT_ENTRY_LIMIT);
+    notifyMemoryDirty({ agent: agentId });
+    changed = true;
+  }
+
+  return buildAgentResult(userId, agentId, changed, changed ? undefined : 'old_text not found');
+}
+
+export function listEntries(userId: string, target: MemoryScope): MemoryOpResult {
   return buildResult(userId, target, true);
 }
 
-export function clearMemory(userId: string, target: 'memory' | 'user'): void {
+export function listAgentEntries(userId: string, agentId: string): MemoryOpResult {
+  return buildAgentResult(userId, agentId, true);
+}
+
+export function clearMemory(userId: string, target: MemoryScope): void {
   const filePath = fileForTarget(userId, target);
   try {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -204,7 +364,7 @@ export function clearMemory(userId: string, target: 'memory' | 'user'): void {
 
 export interface ParsedImportEntry {
   text: string;
-  target: 'memory' | 'user';
+  target: MemoryScope;
   kind: string;
   threat: string | null;
 }
@@ -232,7 +392,7 @@ const MEMORY_HINTS: Array<{ re: RegExp; kind: string }> = [
   { re: /(约定|规范|项目.*(用|约定)|部署在|环境)/, kind: 'convention' },
 ];
 
-function classifyImportEntry(text: string): { target: 'memory' | 'user'; kind: string } {
+function classifyImportEntry(text: string): { target: MemoryScope; kind: string } {
   for (const { re, kind } of MEMORY_HINTS) {
     if (re.test(text)) return { target: 'memory', kind };
   }
@@ -291,22 +451,38 @@ export function parseImportText(text: string): ParsedImportEntry[] {
  * write mid-conversation is visible on the next turn (cache re-prefills only on
  * the rare write turns; writes are infrequent by design).
  */
-export function formatForSystemPrompt(userId: string): string {
-  const userEntries = loadEntries(userProfileFile(userId));
-  const memEntries = loadEntries(userMemoryFile(userId));
-  if (userEntries.length === 0 && memEntries.length === 0) return '';
+export function formatForSystemPrompt(userId: string, agentId?: string): string {
+  const userEntries = loadEntries(userProfileFile(userId));     // cross-agent profile
+  const sharedEntries = loadEntries(userMemoryFile(userId));    // cross-agent project notes
+  const agentEntries = agentId ? loadAgentEntries(userId, agentId) : []; // this agent only
+  if (userEntries.length === 0 && sharedEntries.length === 0 && agentEntries.length === 0) return '';
 
   const parts: string[] = [
-    '## What you already know about this user',
-    'Persistent across sessions — treat as background context. Keep it current with the `cross_session_memory` tool when the user corrects or adds something.',
+    '## Persistent memory',
+    'Persistent across sessions — treat as background context. The sections below are separate stores: user profile/preferences, shared facts, and this agent\'s own memory. Keep them current with the `cross_session_memory` tool when the user corrects or adds durable information.',
   ];
   if (userEntries.length > 0) {
-    parts.push('### User profile (role, preferences, communication style, tech stack)');
+    parts.push('### User profile (role, preferences, communication style, tech stack) — shared across every agent');
     parts.push(userEntries.map(e => e.text).join(ENTRY_SEPARATOR));
   }
-  if (memEntries.length > 0) {
-    parts.push('### Notes (durable facts, decisions, conventions)');
-    parts.push(memEntries.map(e => e.text).join(ENTRY_SEPARATOR));
+  if (sharedEntries.length > 0) {
+    parts.push('### Shared project notes (durable facts, decisions, conventions) — shared across every agent');
+    parts.push(sharedEntries.map(e => e.text).join(ENTRY_SEPARATOR));
+  }
+  if (agentEntries.length > 0) {
+    parts.push('### Your own notes (this agent only)');
+    parts.push(agentEntries.map(e => e.text).join(ENTRY_SEPARATOR));
   }
   return parts.join('\n\n');
+}
+
+export function formatAgentForSystemPrompt(userId: string, agentId: string, agentName = ''): string {
+  const entries = loadAgentEntries(userId, agentId);
+  if (!entries.length) return '';
+  const title = agentName ? `## Durable memory for this agent: ${agentName}` : '## Durable memory for this agent';
+  return [
+    title,
+    'Persistent across sessions for this agent only. Treat as this agent\'s own working preferences, durable lessons, and recurring task facts. Keep it current with `cross_session_memory` target "agent" when the user corrects this agent or when a stable lesson should affect this agent in future runs.',
+    entries.map(e => e.text).join(ENTRY_SEPARATOR),
+  ].join('\n\n');
 }

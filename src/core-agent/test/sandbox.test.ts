@@ -14,6 +14,8 @@ import {
 } from "../src/sandbox/executor.js";
 
 describe("SandboxExecutor", () => {
+  const shQuote = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+
   it("defaults command execution to the long bash timeout", () => {
     expect(DEFAULT_SANDBOX_TIMEOUT_MS).toBe(60 * 60_000);
   });
@@ -104,6 +106,35 @@ describe("SandboxExecutor", () => {
     await fs.rm(tmpDir, { recursive: true });
   });
 
+  it("uses allowedDirs as a macOS write sandbox when sandbox-exec is available", async () => {
+    if (process.platform !== "darwin") return;
+    try { await fs.access("/usr/bin/sandbox-exec"); }
+    catch { return; }
+
+    const allowedDir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-allowed-"));
+    const deniedDir = await fs.mkdtemp(path.join(process.cwd(), ".sandbox-denied-"));
+    try {
+      const allowedFile = path.join(allowedDir, "ok.txt");
+      const deniedFile = path.join(deniedDir, "blocked.txt");
+      const script = [
+        "const fs = require('node:fs');",
+        `fs.writeFileSync(${JSON.stringify(allowedFile)}, 'ok');`,
+        `fs.writeFileSync(${JSON.stringify(deniedFile)}, 'blocked');`,
+      ].join("");
+      const sandbox = new SandboxExecutor({
+        workingDir: allowedDir,
+        allowedDirs: [allowedDir],
+      });
+      const result = await sandbox.execute(`${shQuote(process.execPath)} -e ${shQuote(script)}`);
+      expect(result.exitCode).not.toBe(0);
+      await expect(fs.readFile(allowedFile, "utf8")).resolves.toBe("ok");
+      await expect(fs.access(deniedFile)).rejects.toThrow();
+    } finally {
+      await fs.rm(allowedDir, { recursive: true, force: true });
+      await fs.rm(deniedDir, { recursive: true, force: true });
+    }
+  });
+
   it("passes custom environment variables", async () => {
     const sandbox = new SandboxExecutor({
       workingDir: os.tmpdir(),
@@ -191,6 +222,14 @@ describe("augmentPath", () => {
     expect(out.split(":")).toContain("/opt/homebrew/bin");
     expect(out.split(":")).toContain("/usr/local/bin");
     expect(out.split(":")).toContain("/usr/bin");
+  });
+
+  it("adds common Google Cloud SDK install locations on POSIX", () => {
+    const out = augmentPath("/usr/bin:/bin", "darwin", { HOME: "/Users/me" });
+    const parts = out.split(":");
+    expect(parts).toContain("/opt/homebrew/share/google-cloud-sdk/bin");
+    expect(parts).toContain("/usr/local/share/google-cloud-sdk/bin");
+    expect(parts).toContain("/Users/me/google-cloud-sdk/bin");
   });
 
   it("keeps user-supplied entries BEFORE canonical ones when the user put them first", () => {

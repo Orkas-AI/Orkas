@@ -303,6 +303,10 @@ function bindStaticHandlers() {
 
   // Agents (grid + detail)
   // "Done" button (only visible while editing) — exits edit mode.
+  document.getElementById('new-chat-external-agent-btn')?.addEventListener('click', () => {
+    setView('agents', null, { entryPoint: 'new_chat_external_agent' });
+    openAgentModal({ initialTab: 'external' });
+  });
   document.getElementById('create-agent-btn')?.addEventListener('click', () => openAgentModal());
   document.getElementById('agents-more-btn')?.addEventListener('click', () => openMarketplace('agent'));
   document.getElementById('agents-back-btn')?.addEventListener('click', () => _showAgentsGridView());
@@ -319,6 +323,7 @@ function bindStaticHandlers() {
     // (agents.js) already does this; the detail-page handler had a stale
     // `source === 'custom'` guard that silently swallowed clicks on builtin
     // detail pages.
+    if (_selectedAgent && typeof _isAgentProfileMock === 'function' && _isAgentProfileMock(_selectedAgent.id)) return;
     if (_selectedAgent && typeof openMarketplaceUpload === 'function') {
       openMarketplaceUpload('agent', _selectedAgent.id, _selectedAgent.source);
     }
@@ -402,21 +407,14 @@ function bindStaticHandlers() {
 
   bindSkillPicker();
 
-  // Library (two-region: per-user staging + shared organized)
   document.getElementById('ctx-tmp-new-btn')?.addEventListener('click', createNewCtxTmpDraft);
-  document.getElementById('ctx-tmp-upload-btn')?.addEventListener('click', () => {
-    document.getElementById('ctx-tmp-file-input')?.click();
-  });
-  document.getElementById('ctx-tmp-file-input')?.addEventListener('change', (e) => {
-    handleCtxTmpUpload(e.target.files);
-    e.target.value = '';
-  });
   document.getElementById('ctx-tmp-new-name')?.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); saveCtxTmpNew(); }
   });
 }
 
 function autoGrow(el, maxPx) {
+  if (typeof syncChatRichComposerHeight === 'function' && syncChatRichComposerHeight(el, maxPx)) return;
   el.style.height = 'auto';
   el.style.height = Math.min(el.scrollHeight, maxPx) + 'px';
 }

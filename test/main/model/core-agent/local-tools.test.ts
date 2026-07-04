@@ -61,6 +61,23 @@ async function buildWriteTool(opts: { onFileWritten?: (p: string) => void; extra
   return { write, wsDir };
 }
 
+async function buildDeleteTool(opts: Record<string, any> = {}) {
+  const localTools = await import('../../../../src/main/model/core-agent/local-tools');
+  const ws = await import('../../../../src/main/features/user_workspace');
+  const wsDir = path.join(tmpDir, 'ws');
+  fs.mkdirSync(wsDir, { recursive: true });
+  const r = ws.setWorkspacePath(UID, wsDir);
+  if (!r.ok) throw new Error(`setWorkspacePath failed: ${r.error}`);
+  const tools = localTools.createLocalTools({
+    userId: UID,
+    cid: CID,
+    ...opts,
+  } as any);
+  const del = tools.find((t) => t.name === 'delete_file');
+  if (!del) throw new Error('delete_file tool missing');
+  return { del, wsDir };
+}
+
 async function grant() {
   const perm = await import('../../../../src/main/features/permissions');
   perm.grantLocalExec();
@@ -69,6 +86,11 @@ async function grant() {
 async function revoke() {
   const perm = await import('../../../../src/main/features/permissions');
   perm.revokeLocalExec();
+}
+
+async function workspaceOnly() {
+  const perm = await import('../../../../src/main/features/permissions');
+  perm.setLocalExecMode('workspace_approval');
 }
 
 async function run(tool: any, input: Record<string, any>) {
@@ -118,23 +140,21 @@ describe('local-tools › bash › disabled skills', () => {
   });
 });
 
-describe('local-tools › edit_file › permission gate', () => {
-  it('rejects when localExec not granted', async () => {
+describe('local-tools › edit_file › permission mode', () => {
+  it('allows workspace edits after legacy revoke maps to workspace_approval', async () => {
     await revoke();
     const { edit, wsDir } = await buildEditTool();
     const p = path.join(wsDir, 'a.txt');
     fs.writeFileSync(p, 'hello world');
     const r = await run(edit, { path: p, old_string: 'hello', new_string: 'hi' });
-    expect(r.isError).toBe(true);
-    expect(r.content).toContain('E_TOOL_EXECUTION_ACCESS_DISABLED');
-    // file untouched
-    expect(fs.readFileSync(p, 'utf8')).toBe('hello world');
+    expect(r.isError).toBeFalsy();
+    expect(fs.readFileSync(p, 'utf8')).toBe('hi world');
   });
 });
 
 describe('local-tools › edit_file › sandbox', () => {
   it('rejects path outside workspace + attachment + extraRoots', async () => {
-    await grant();
+    await workspaceOnly();
     const { edit } = await buildEditTool();
     const outside = path.join(tmpDir, 'outside.txt');
     fs.writeFileSync(outside, 'hello');
@@ -146,7 +166,7 @@ describe('local-tools › edit_file › sandbox', () => {
   });
 
   it('accepts a path inside extraRoots', async () => {
-    await grant();
+    await workspaceOnly();
     const skillDir = path.join(tmpDir, 'skill-x');
     fs.mkdirSync(skillDir, { recursive: true });
     const p = path.join(skillDir, 'SKILL.md');
@@ -158,7 +178,7 @@ describe('local-tools › edit_file › sandbox', () => {
   });
 
   it('allows write_file inside extraRoots but rejects outside scope', async () => {
-    await grant();
+    await workspaceOnly();
     const conflictDir = path.join(tmpDir, 'sync-conflict');
     fs.mkdirSync(conflictDir, { recursive: true });
     const target = path.join(conflictDir, 'merged.md');
@@ -175,6 +195,22 @@ describe('local-tools › edit_file › sandbox', () => {
     expect(denied.isError).toBe(true);
     expect(denied.content).toContain('E_PATH_OUT_OF_SCOPE');
     expect(fs.existsSync(outside)).toBe(false);
+  });
+
+  it('does not allow delete_file under readOnlyExtraRoots', async () => {
+    await workspaceOnly();
+    const readOnlyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-ro-delete-'));
+    const p = path.join(readOnlyDir, 'keep.md');
+    fs.writeFileSync(p, 'do not delete');
+    try {
+      const { del } = await buildDeleteTool({ readOnlyExtraRoots: [readOnlyDir] });
+      const r = await run(del, { path: p });
+      expect(r.isError).toBe(true);
+      expect(r.content).toContain('E_PATH_OUT_OF_SCOPE');
+      expect(fs.readFileSync(p, 'utf8')).toBe('do not delete');
+    } finally {
+      fs.rmSync(readOnlyDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -462,14 +498,14 @@ describe('local-tools › create_artifact › availability', () => {
   });
 });
 
-describe('local-tools › create_artifact › permission gate', () => {
-  it('rejects when localExec not granted', async () => {
+describe('local-tools › create_artifact › permission mode', () => {
+  it('allows artifacts after legacy revoke maps to workspace_approval', async () => {
     await revoke();
     const tool = await buildCreateArtifactTool({ onArtifactCreated: () => {} });
     expect(tool).toBeTruthy();
     const r = await run(tool, { title: 'X', files: MIN_FILES });
-    expect(r.isError).toBe(true);
-    expect(r.content).toContain('E_TOOL_EXECUTION_ACCESS_DISABLED');
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toMatch(/do NOT paste/i);
   });
 });
 

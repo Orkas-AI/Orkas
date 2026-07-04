@@ -142,7 +142,14 @@ function _tveRender(state) {
   else _tveRenderView(state);
 }
 
-function _tveTrack() {}
+function _tveTrack(action, state, data) {
+  try {
+    if (!window.Monitor) return;
+    (() => {})(action, Object.assign({
+      can_save: !!(state && state.caps && state.caps.save),
+    }, data || {}));
+  } catch (_) {}
+}
 
 function _tveRenderView(state) {
   state.mode = 'view';

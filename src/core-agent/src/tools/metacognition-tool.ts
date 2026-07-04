@@ -59,7 +59,8 @@ WHEN TO UPDATE STRATEGIES:
 - To record which strategy types suit which task categories
 
 Actions: "read" (view current content), "write" (replace entire content).
-Content is free-form markdown. Structure with ## headings for different sections.${limitBlock}`;
+Content is free-form markdown. Structure with ## headings for different sections.
+Language: when the host prompt specifies a user/UI language, write human-readable metacognition content in that language while preserving code, file paths, commands, and exact quoted wording.${limitBlock}`;
 }
 
 export function createMetacognitionTool(

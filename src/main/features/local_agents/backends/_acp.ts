@@ -15,6 +15,7 @@
  */
 
 import { createLogger } from '../../../logger.js';
+import { logErrorSummary } from '../../../util/log-redact.js';
 import {
   type LocalBackend,
   type BackendRunOptions,
@@ -78,7 +79,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
 
       const send = (msg: object) => {
         try { child.stdin.write(JSON.stringify(msg) + '\n'); }
-        catch (err) { log.warn('acp stdin write failed', { error: (err as Error).message }); }
+        catch (err) { log.warn('acp stdin write failed', { error: logErrorSummary(err) }); }
       };
 
       // Step 1: initialize
@@ -228,7 +229,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
           resolve();
         };
         child.on('error', err => {
-          log.warn('acp spawn error', { error: (err as Error).message });
+          log.warn('acp spawn error', { error: logErrorSummary(err) });
           finish('failed', { error: (err as Error).message, stderrTail: tail.toString() });
         });
         child.on('close', code => {

@@ -51,6 +51,15 @@ export const PC_ROOT       = path.resolve(__dirname, '..', '..');      // PC
 export const APP_ROOT      = PC_ROOT;
 export const PROJECT_ROOT  = path.resolve(PC_ROOT, '..');              // Orkas
 
+function packagedResourceDir(name: string): string {
+  if (name === 'builtin' && process.env.ORKAS_BUILTIN_ROOT) {
+    return path.resolve(process.env.ORKAS_BUILTIN_ROOT);
+  }
+  const rp = (process as unknown as { resourcesPath?: string }).resourcesPath;
+  const looksPackaged = rp && !rp.includes(`${path.sep}node_modules${path.sep}electron${path.sep}`);
+  return looksPackaged ? path.join(rp, name) : path.join(PC_ROOT, 'resources', name);
+}
+
 // ── Data root ────────────────────────────────────────────────────────────
 // `index.ts` always sets `ORKAS_WORKSPACE_ROOT` before this module loads
 // (resolveInstallContainer + one-shot migration runs first). The constant
@@ -180,17 +189,33 @@ export const userKbConfigPath    = (uid: string) => path.join(userKbDir(uid), 'c
 
 // Cross-session memory
 export const userMemoryDir   = (uid: string) => path.join(userCloudRoot(uid), 'memory');
-export const userMemoryFile  = (uid: string) => path.join(userMemoryDir(uid), 'MEMORY.md');
+export const userMemoryFile  = (uid: string) => path.join(userMemoryDir(uid), 'MEMORY.md'); // shared/project tier
 export const userProfileFile = (uid: string) => path.join(userMemoryDir(uid), 'USER.md');
+
+/** Guard an agent id used as a single path segment for agent-scoped memory.
+ *  The id is bound by the runner to the calling agent (never model-supplied),
+ *  but memory paths derive from it, so reject traversal / separators defensively. */
+function assertAgentSegment(agentId: string): string {
+  if (!agentId || agentId.includes('/') || agentId.includes('\\') || agentId.includes('..') || agentId.includes('\0')) {
+    throw new Error(`invalid agent id for memory path: ${JSON.stringify(agentId)}`);
+  }
+  return agentId;
+}
+export const agentMemoryDir  = (uid: string, agentId: string) => path.join(userMemoryDir(uid), 'agents', assertAgentSegment(agentId));
+export const agentMemoryFile = (uid: string, agentId: string) => path.join(agentMemoryDir(uid, agentId), 'MEMORY.md');
 
 // User-custom agents / skills (business kind = 'custom'; the loader scans
 // cloud first). Agents use the directory shape
-// `agents/<aid>/{agent.json, meta/, skills/}` — see CLAUDE.md §4 +
+// `agents/<aid>/{agent.json, meta/, skills/, private_skills/}` — see CLAUDE.md §4 +
 // docs/plans/agent-as-directory.md. The spec comes from the user; meta and
 // skills are runtime-dynamic products (metacognition + the agent's
-// self-evolved skills).
+// self-evolved skills). `private_skills/` is an author-controlled publish
+// source for agent-bundled skills; it is deliberately separate from the
+// self-evolution store.
 export const userAgentsDir = (uid: string) => path.join(userCloudRoot(uid), 'agents');
 export const userSkillsDir = (uid: string) => path.join(userCloudRoot(uid), 'skills');
+export const commanderDir = (uid: string) => path.join(userCloudRoot(uid), 'commander');
+export const commanderRuntimeStatsFile = (uid: string) => path.join(commanderDir(uid), 'runtime_stats.json');
 
 // Per-user projects (logical group of conversations + bindings + scoped
 // workspace). Each project is a self-contained directory:
@@ -215,6 +240,9 @@ export const projectLocalDir        = (uid: string, pid: string) => path.join(us
 export const projectLibraryVectorDbPath = (uid: string, pid: string) => path.join(projectLocalDir(uid, pid), 'files', '.kb', 'vector.db');
 export const agentDir            = (uid: string, agentId: string) => path.join(userAgentsDir(uid), agentId || '_default');
 export const agentDefinitionFile = (uid: string, agentId: string) => path.join(agentDir(uid, agentId), 'agent.json');
+export const userAgentMemoryDir  = (uid: string, agentId: string) => path.join(agentDir(uid, agentId), 'memory');
+export const userAgentMemoryFile = (uid: string, agentId: string) => path.join(userAgentMemoryDir(uid, agentId), 'MEMORY.md');
+export const agentRuntimeStatsFile = (uid: string, agentId: string) => path.join(agentDir(uid, agentId), 'runtime_stats.json');
 
 // Agent metacognition (per-agent self-assessment + learning strategies).
 // Writes go through features/metacognition.ts; reflection-orchestrator fires
@@ -230,6 +258,7 @@ export const agentStrategiesFile = (uid: string, agentId: string) => path.join(a
 // block; other agents / commander cannot see it. See CLAUDE.md §6 (dual system
 // boundary).
 export const agentEvolvedSkillsDir = (uid: string, agentId: string) => path.join(agentDir(uid, agentId), 'skills');
+export const agentPrivateSkillsDir = (uid: string, agentId: string) => path.join(agentDir(uid, agentId), 'private_skills');
 
 // Cross-device user preferences (language, etc.)
 export const userCloudConfigDir  = (uid: string) => path.join(userCloudRoot(uid), 'config');
@@ -237,12 +266,24 @@ export const userPreferencesFile = (uid: string) => path.join(userCloudConfigDir
 // Per-user enable/disable config (agents + skills). Schema in features/component_enabled.ts.
 // Same dir + cloud-sync policy as preferences.json; only `false` is stored.
 export const userComponentEnabledFile = (uid: string) => path.join(userCloudConfigDir(uid), 'component-enabled.json');
+// Per-user local-execution permission mode. Synced intentionally: this is the
+// user's account-level safety posture, unlike granted-roots which contain
+// machine-specific absolute paths and stay local-only.
+export const userPermissionsFile = (uid: string) => path.join(userCloudConfigDir(uid), 'permissions.json');
+
+// Packaged builtin resources. Source files ship with the app under
+// `resources/builtin/` (extraResources in packaged builds); startup/login
+// mirrors the relevant pieces into per-user runtime roots.
+export const packagedBuiltinDir = () => packagedResourceDir('builtin');
+export const packagedBuiltinMarketplaceDir = () => path.join(packagedBuiltinDir(), 'marketplace');
+export const packagedBuiltinMarketplaceAgentsDir = () => path.join(packagedBuiltinMarketplaceDir(), 'agents');
+export const packagedBuiltinMarketplaceSkillsDir = () => path.join(packagedBuiltinMarketplaceDir(), 'skills');
 
 // Hidden system skills (product protocols, not user skills). Source files ship
-// with the app under `src/main/system_skills/`; startup mirrors them here so
-// model file tools can read a stable per-user data-root path. Local-only:
-// never cloud-synced, never shown in the Skills UI, never editable.
-export const packagedSystemSkillsDir = () => path.join(__dirname, 'system_skills');
+// with the app under `resources/builtin/system/skills/`; startup mirrors them
+// here so model file tools can read a stable per-user data-root path.
+// Local-only: never cloud-synced, never shown in the Skills UI, never editable.
+export const packagedSystemSkillsDir = () => path.join(packagedBuiltinDir(), 'system', 'skills');
 export const packagedSystemSkillsManifestFile = () => path.join(packagedSystemSkillsDir(), '_system.json');
 export const userSystemDir = (uid: string) => path.join(userLocalRoot(uid), 'system');
 export const userSystemSkillsDir = (uid: string) => path.join(userSystemDir(uid), 'skills');
@@ -381,6 +422,8 @@ export const userMarketplaceAgentsDir  = (uid: string) => path.join(userMarketpl
 export const userMarketplaceSkillsDir  = (uid: string) => path.join(userMarketplaceDir(uid), 'skills');
 export const userMarketplaceAgentDir   = (uid: string, id: string) =>
   path.join(userMarketplaceAgentsDir(uid), id);
+export const userMarketplaceAgentSkillsDir = (uid: string, id: string) =>
+  path.join(userMarketplaceAgentDir(uid, id), 'skills');
 export const userMarketplaceSkillDir   = (uid: string, id: string) =>
   path.join(userMarketplaceSkillsDir(uid), id);
 
@@ -472,10 +515,9 @@ export const userRecycleDir = (uid: string) => path.join(userLocalRoot(uid), 're
 // paths are machine-specific, so this is never synced.
 export const userWorkspaceConfigFile = (uid: string) => path.join(userLocalRoot(uid), 'workspace.json');
 
-// One-time marker: the native file picker seeds its first-ever open at the
-// user's workspace, then hands off to the OS's remembered last-used directory.
-// Local (machine-specific, never synced) so it survives restarts the same way
-// the OS last-used does — without persistence a restart would wrongly re-seed.
+// Legacy one-time marker kept only so old installs/tests that reference the
+// path do not break. Native pickers now always provide a safe Orkas-owned
+// defaultPath and never intentionally hand off to the OS last-used directory.
 export const pickerFirstOpenMarkerFile = (uid: string) => path.join(userLocalRoot(uid), '.picker-first-open-seeded');
 
 // ── Expert signals (machine-private, append-only) ───────────────────────
@@ -589,8 +631,9 @@ export function officeCliBinaryPath(): string | null {
   return path.join(dir, asset);
 }
 
-// (No shipped builtin source tree anymore. The marketplace is the only source for
-// platform agents/skills, fetched at install time and reconciled from the cloud manifest.)
+// Builtin marketplace resources under `resources/builtin/marketplace/` are only
+// a first-run/offline seed. Installed runtime content still lands in
+// `<uid>/local/marketplace/` and is reconciled from the cloud manifest.
 
 // ── User workspace (user-facing working directory for agent output) ──────
 // Default: `userWorkSpace/` next to the workspace root (i.e. inside the

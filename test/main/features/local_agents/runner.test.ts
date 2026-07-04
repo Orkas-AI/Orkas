@@ -55,6 +55,149 @@ async function loadRunner() {
 }
 
 describe('local_agents/runner', () => {
+  it('builds local agent log context without raw prompts, args, resume ids, or paths', async () => {
+    const runner = await loadRunner();
+    const ctx = runner.localAgentRunContextForLog({
+      uid: 'user-secret-123456789',
+      cid: 'conversation-private-abcdef',
+      agentId: 'agent-private-abcdef',
+      projectId: 'project-private-abcdef',
+      cli: 'claude',
+      model: 'claude-test',
+      customArgs: ['--token', 'super-secret-token'],
+      resumeSessionId: 'resume-private-session-id',
+      prompt: 'private prompt body',
+      cwd: '/Users/test/Secret Workspace',
+      runId: 'abcdef123456',
+      cliAvailable: true,
+      cliVersion: '2.0.0',
+      bridgeSupported: true,
+      timeoutMs: 1000,
+      idleKillMs: 500,
+      idleMs: 100,
+    });
+
+    expect(ctx.prompt_chars).toBe('private prompt body'.length);
+    expect(ctx.custom_arg_count).toBe(2);
+    expect(ctx.has_resume_session).toBe(true);
+    expect(ctx.has_cwd).toBe(true);
+    const serialized = JSON.stringify(ctx);
+    expect(serialized).not.toContain('private prompt body');
+    expect(serialized).not.toContain('super-secret-token');
+    expect(serialized).not.toContain('resume-private-session-id');
+    expect(serialized).not.toContain('/Users/alice');
+    expect(serialized).not.toContain('Secret Workspace');
+    expect(serialized).not.toContain('conversation-private');
+    expect(serialized).not.toContain('agent-private');
+  });
+
+  it('summarizes local agent events without raw stdout, stderr, tool output, or file paths', async () => {
+    const runner = await loadRunner();
+    const stats = runner.createLocalAgentRunLogDiagnostics(1000);
+
+    runner.recordLocalAgentEventForLog(stats, {
+      type: 'process-info',
+      pid: 42,
+      cwd: '/Users/test/Secret Workspace',
+      cmd: 'claude',
+      args: ['--api-key', 'super-secret-token'],
+    }, 1010);
+    runner.recordLocalAgentEventForLog(stats, { type: 'text-delta', text: 'private answer text' }, 1100);
+    runner.recordLocalAgentEventForLog(stats, { type: 'thinking', text: 'private chain text' }, 1110);
+    runner.recordLocalAgentEventForLog(stats, { type: 'stderr-line', line: 'stderr with private path /Users/test/x' }, 1120);
+    runner.recordLocalAgentEventForLog(stats, { type: 'raw-line', line: 'raw private protocol body' }, 1130);
+    runner.recordLocalAgentEventForLog(stats, {
+      type: 'tool-event',
+      tool: 'bash',
+      callId: 'local-secret-123456',
+      phase: 'use',
+      input: { command: 'cat /Users/test/private.txt' },
+    }, 1140);
+    runner.recordLocalAgentEventForLog(stats, {
+      type: 'tool-event',
+      tool: 'bash',
+      callId: 'local-secret-123456',
+      phase: 'result',
+      isError: true,
+      output: 'private tool output',
+      outputPath: '/Users/test/private-output.txt',
+    }, 1150);
+    runner.recordLocalAgentEventForLog(stats, {
+      type: 'tool-event',
+      tool: 'read_file',
+      callId: 'local-secret-abcdef',
+      phase: 'use',
+      input: { path: '/Users/test/other.txt' },
+    }, 1155);
+    runner.recordLocalAgentEventForLog(stats, {
+      type: 'tool-event',
+      tool: 'read_file',
+      callId: 'local-secret-abcdef',
+      phase: 'result',
+      output: 'second private tool output',
+    }, 1158);
+    runner.recordLocalAgentEventForLog(stats, {
+      type: 'permission-request',
+      tool: 'bash',
+      input: { command: 'rm private.txt' },
+      autoDecided: 'deny',
+    }, 1160);
+    runner.recordLocalAgentEventForLog(stats, {
+      type: 'file-change',
+      paths: ['/Users/test/private.txt', '/Users/test/other.txt'],
+    }, 1170);
+    runner.recordLocalAgentEventForLog(stats, { type: 'status', status: 'usage', usage: { input: 5, output: 7, secretText: 'nope' } }, 1180);
+    runner.recordLocalAgentEventForLog(stats, { type: 'done', status: 'completed', output: 'private final', usage: { input: 5, output: 8 } }, 1200);
+
+    const summary = runner.summarizeLocalAgentRunForLog(stats, 1300);
+    expect(summary.eventCount).toBe(13);
+    expect(summary.textDeltaChars).toBe('private answer text'.length);
+    expect(summary.stderrLines).toBe(1);
+    expect(summary.rawLines).toBe(1);
+    expect(summary.toolEvents).toBe(4);
+    expect(summary.toolResultEvents).toBe(2);
+    expect(summary.spilledToolResults).toBe(1);
+    expect(summary.fileChangePathCount).toBe(2);
+    expect(summary.permissionAutoDeny).toBe(1);
+    expect(summary.usage).toMatchObject({ input: 5, output: 8 });
+    expect(summary.toolTimeline).toEqual([
+      '#1 +140ms bash use call=loca...3456',
+      `#2 +150ms bash result call=loca...3456 error=true output_chars=${'private tool output'.length} spilled=true`,
+      '#3 +155ms read_file use call=loca...cdef',
+      `#4 +158ms read_file result call=loca...cdef output_chars=${'second private tool output'.length} spilled=false`,
+    ]);
+    expect(summary.toolTimelineTruncated).toBe(0);
+    expect(summary.eventTimeline).toEqual([
+      '#1 +10ms process_info pid=42',
+      `#2 +100ms text_delta chars=${'private answer text'.length}`,
+      `#3 +110ms thinking chars=${'private chain text'.length}`,
+      `#4 +120ms stderr_line chars=${'stderr with private path /Users/test/x'.length}`,
+      `#5 +130ms raw_line chars=${'raw private protocol body'.length}`,
+      '#6 +140ms tool_event tool=bash phase=use',
+      '#7 +150ms tool_event tool=bash phase=result',
+      '#8 +155ms tool_event tool=read_file phase=use',
+      '#9 +158ms tool_event tool=read_file phase=result',
+      '#10 +160ms permission_request tool=bash auto=deny',
+      '#11 +170ms file_change paths=2',
+      '#12 +180ms status status=usage',
+      '#13 +200ms done status=completed error=false',
+    ]);
+    expect(summary.eventTimelineTruncated).toBe(0);
+    const serialized = JSON.stringify(summary);
+    expect(serialized).not.toContain('private answer text');
+    expect(serialized).not.toContain('private chain text');
+    expect(serialized).not.toContain('stderr with private path');
+    expect(serialized).not.toContain('raw private protocol body');
+    expect(serialized).not.toContain('cat /Users');
+    expect(serialized).not.toContain('private tool output');
+    expect(serialized).not.toContain('second private tool output');
+    expect(serialized).not.toContain('private final');
+    expect(serialized).not.toContain('/Users/alice');
+    expect(serialized).not.toContain('secretText');
+    expect(serialized).not.toContain('local-secret-123456');
+    expect(serialized).not.toContain('local-secret-abcdef');
+  });
+
   it('emits missing_cli when registry reports unavailable', async () => {
     mockDetect.mockResolvedValue({
       type: 'claude', available: false, path: null, version: null,

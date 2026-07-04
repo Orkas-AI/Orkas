@@ -25,13 +25,16 @@ import { URL, URLSearchParams } from 'node:url';
 import { shell } from 'electron';
 
 import { accountApiBase, tokenStore } from './_server_bridge';
+import { withCommonHeaders } from '../api_common';
 import { getLanguage } from '../config';
 import { createLogger } from '../../logger';
+import { fetchWithTimeout } from '../../util/abort';
 import type { CatalogEntry, DcrClientCredentials, OAuthGrant, Transport } from './types';
 
 const log = createLogger('connectors:oauth-dcr');
 
 const FLOW_TIMEOUT_MS = 10 * 60 * 1000;
+const DCR_HTTP_TIMEOUT_MS = 60_000;
 const REFRESH_BUFFER_MS = 5 * 60 * 1000;
 const SERVER_REFRESH_RETRY_DELAY_MS = 500;
 const CLIENT_NAME = 'Orkas';
@@ -62,14 +65,14 @@ function _cancelPending(reason: string): void {
 
 interface ProtectedResourceMetadata {
   authorization_servers?: string[];
-  resource?: string;
+  resource?: string | string[];
 }
 
 interface AuthServerMetadata {
   authorization_endpoint: string;
   token_endpoint: string;
   registration_endpoint?: string;
-  // others not relevant here
+  token_endpoint_auth_methods_supported?: string[];
 }
 
 /** Format `fetch` errors so the underlying cause (DNS / TLS / refused / …) surfaces in logs.
@@ -89,19 +92,32 @@ function _fmtFetchErr(label: string, err: unknown): Error {
   return new Error(parts.join(' | '));
 }
 
+function _fetchDcr(label: string, url: string, init: RequestInit = {}): Promise<Response> {
+  return fetchWithTimeout(
+    url,
+    init,
+    DCR_HTTP_TIMEOUT_MS,
+    undefined,
+    `${label} timed out after ${Math.round(DCR_HTTP_TIMEOUT_MS / 1000)}s`,
+  );
+}
+
 /** Fetch `<base>/.well-known/<name>`, falling back to root-level discovery if path-suffixed
  *  fails (per MCP authorization spec — providers can serve discovery at either location). */
 async function _fetchWellKnown<T>(mcpUrl: string, wellKnownName: string): Promise<T> {
   const url = new URL(mcpUrl);
-  // Path-suffixed first (e.g. https://mcp.notion.com/mcp/.well-known/oauth-protected-resource).
+  // Path-suffixed first (e.g. https://mcp.notion.com/mcp/.well-known/oauth-protected-resource),
+  // then root well-known with the MCP path appended (e.g. Atlassian's
+  // https://mcp.atlassian.com/.well-known/oauth-protected-resource/v1/mcp/authv2).
   const candidates: string[] = [];
   const trimmed = url.pathname.replace(/\/+$/, '');
   if (trimmed) candidates.push(`${url.origin}${trimmed}/.well-known/${wellKnownName}`);
+  if (trimmed) candidates.push(`${url.origin}/.well-known/${wellKnownName}${trimmed}`);
   candidates.push(`${url.origin}/.well-known/${wellKnownName}`);
   let lastErr: Error | null = null;
-  for (const cand of candidates) {
+  for (const cand of Array.from(new Set(candidates))) {
     try {
-      const r = await fetch(cand);
+      const r = await _fetchDcr(`DCR ${wellKnownName}`, cand);
       if (r.ok) return await r.json() as T;
       lastErr = new Error(`${cand} → HTTP ${r.status}`);
     } catch (err) {
@@ -109,6 +125,30 @@ async function _fetchWellKnown<T>(mcpUrl: string, wellKnownName: string): Promis
     }
   }
   throw lastErr || new Error(`failed to fetch ${wellKnownName}`);
+}
+
+async function _fetchAuthServerMetadata(authServer: string, mcpUrl: string): Promise<AuthServerMetadata> {
+  const url = new URL(authServer);
+  const trimmed = url.pathname.replace(/\/+$/, '');
+  const mcp = new URL(mcpUrl);
+  const candidates = Array.from(new Set([
+    ...(trimmed ? [`${url.origin}${trimmed}/.well-known/oauth-authorization-server`] : []),
+    `${url.origin}/.well-known/oauth-authorization-server`,
+    `${mcp.origin}/.well-known/oauth-authorization-server`,
+  ]));
+  let lastErr: Error | null = null;
+  for (const cand of candidates) {
+    let r: Response;
+    try {
+      r = await _fetchDcr('DCR auth server metadata', cand);
+    } catch (err) {
+      lastErr = _fmtFetchErr(`${cand} fetch failed`, err);
+      continue;
+    }
+    if (r.ok) return await r.json() as AuthServerMetadata;
+    lastErr = new Error(`auth server metadata HTTP ${r.status}`);
+  }
+  throw lastErr || new Error('failed to fetch auth server metadata');
 }
 
 async function _discoverAuthServer(mcpUrl: string): Promise<{ meta: AuthServerMetadata; resource: string }> {
@@ -120,26 +160,61 @@ async function _discoverAuthServer(mcpUrl: string): Promise<{ meta: AuthServerMe
   // access_token isn't audience-bound to this MCP server and the server rejects it with
   // `invalid_token` at the first protected request. PRM is authoritative; fall back to
   // mcpUrl origin only when PRM omits the field (shouldn't happen per spec).
-  const resource = prm.resource || new URL(mcpUrl).origin;
-  const asUrl = new URL('/.well-known/oauth-authorization-server', authServer).toString();
-  let r: Response;
-  try {
-    r = await fetch(asUrl);
-  } catch (err) {
-    throw _fmtFetchErr(`${asUrl} fetch failed`, err);
+  const resource = Array.isArray(prm.resource) ? prm.resource[0] : prm.resource;
+  const meta = await _fetchAuthServerMetadata(authServer, mcpUrl);
+  return { meta, resource: resource || new URL(mcpUrl).origin };
+}
+
+type DcrTokenAuthMethod = NonNullable<DcrClientCredentials['token_endpoint_auth_method']>;
+
+function _chooseTokenAuthMethod(meta: AuthServerMetadata): DcrTokenAuthMethod {
+  const supported = Array.isArray(meta.token_endpoint_auth_methods_supported)
+    ? meta.token_endpoint_auth_methods_supported
+    : ['client_secret_post'];
+  if (supported.includes('client_secret_post')) return 'client_secret_post';
+  if (supported.includes('client_secret_basic')) return 'client_secret_basic';
+  if (supported.includes('none')) return 'none';
+  throw new Error(`provider does not support a compatible token_endpoint_auth_method: ${supported.join(',')}`);
+}
+
+function _basicAuthValue(clientId: string, clientSecret: string): string {
+  return `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`;
+}
+
+function _tokenAuthMethod(client: DcrClientCredentials): DcrTokenAuthMethod {
+  return client.token_endpoint_auth_method || 'client_secret_post';
+}
+
+function _buildTokenRequest(
+  client: DcrClientCredentials,
+  params: Record<string, string>,
+): { body: URLSearchParams; headers: Record<string, string> } {
+  const method = _tokenAuthMethod(client);
+  const body = new URLSearchParams(params);
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/x-www-form-urlencoded',
+    Accept: 'application/json',
+  };
+  if (method === 'client_secret_basic') {
+    if (!client.client_secret) throw new Error('client_secret_basic requires client_secret');
+    headers.Authorization = _basicAuthValue(client.client_id, client.client_secret);
+  } else {
+    body.set('client_id', client.client_id);
+    if (method === 'client_secret_post' && client.client_secret) {
+      body.set('client_secret', client.client_secret);
+    }
   }
-  if (!r.ok) throw new Error(`auth server metadata HTTP ${r.status}`);
-  const meta = await r.json() as AuthServerMetadata;
-  return { meta, resource };
+  return { body, headers };
 }
 
 async function _registerClient(
   registrationEndpoint: string,
   redirectUri: string,
-): Promise<{ client_id: string; client_secret?: string }> {
+  tokenEndpointAuthMethod: DcrTokenAuthMethod,
+): Promise<{ client_id: string; client_secret?: string; token_endpoint_auth_method?: string }> {
   let r: Response;
   try {
-    r = await fetch(registrationEndpoint, {
+    r = await _fetchDcr('DCR client registration', registrationEndpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({
@@ -147,7 +222,7 @@ async function _registerClient(
         redirect_uris: [redirectUri],
         grant_types: ['authorization_code', 'refresh_token'],
         response_types: ['code'],
-        token_endpoint_auth_method: 'client_secret_post',
+        token_endpoint_auth_method: tokenEndpointAuthMethod,
       }),
     });
   } catch (err) {
@@ -157,7 +232,7 @@ async function _registerClient(
     const text = await r.text();
     throw new Error(`DCR registration failed: ${r.status} ${text}`);
   }
-  return await r.json() as { client_id: string; client_secret?: string };
+  return await r.json() as { client_id: string; client_secret?: string; token_endpoint_auth_method?: string };
 }
 
 // ── PKCE ───────────────────────────────────────────────────────────────
@@ -193,11 +268,13 @@ export async function startMcpDcrOAuth(
   if (!meta.registration_endpoint) {
     throw new Error(`provider ${entry.id} does not advertise registration_endpoint — DCR unsupported`);
   }
+  const tokenEndpointAuthMethod = _chooseTokenAuthMethod(meta);
   log.info('DCR endpoints discovered', {
     auth_url: meta.authorization_endpoint,
     token_url: meta.token_endpoint,
     reg_url: meta.registration_endpoint,
     resource,
+    token_auth: tokenEndpointAuthMethod,
   });
 
   // Register client. The redirect_uri must point at our Server's `/connectors/oauth/dcr-callback`
@@ -208,12 +285,18 @@ export async function startMcpDcrOAuth(
   // under. (A dev-mode install does NOT migrate to prod automatically; the user would
   // reconnect.)
   const redirectUri = `${accountApiBase().replace(/\/+$/, '')}/connectors/oauth/dcr-callback`;
-  const registered = await _registerClient(meta.registration_endpoint, redirectUri);
+  const registered = await _registerClient(meta.registration_endpoint, redirectUri, tokenEndpointAuthMethod);
   log.info('DCR registration done', { client_id_tail: registered.client_id.slice(-6) });
 
+  const registeredTokenAuthMethod = registered.token_endpoint_auth_method === 'client_secret_basic'
+    || registered.token_endpoint_auth_method === 'client_secret_post'
+    || registered.token_endpoint_auth_method === 'none'
+    ? registered.token_endpoint_auth_method
+    : tokenEndpointAuthMethod;
   const dcrClient: DcrClientCredentials = {
     client_id: registered.client_id,
     ...(registered.client_secret ? { client_secret: registered.client_secret } : {}),
+    token_endpoint_auth_method: registeredTokenAuthMethod,
     authorization_endpoint: meta.authorization_endpoint,
     token_endpoint: meta.token_endpoint,
     registration_endpoint: meta.registration_endpoint,
@@ -279,12 +362,12 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
   // collide with the response status `code` field. See Server `api/connectors.py` comment.
   let payload: { code: string; state: string };
   try {
-    const res = await fetch(`${accountApiBase()}/connectors/oauth/dcr-exchange`, {
+    const res = await _fetchDcr('DCR exchange', `${accountApiBase()}/connectors/oauth/dcr-exchange`, {
       method: 'POST',
-      headers: {
+      headers: withCommonHeaders({
         'Content-Type': 'application/json',
         Accept: 'application/json',
-      },
+      }),
       body: JSON.stringify({ exchange_code: exchangeCode, device_id: tokenStore.getDeviceId() }),
     });
     if (!res.ok) throw new Error(`/dcr-exchange HTTP ${res.status}`);
@@ -311,22 +394,17 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
 
   // Exchange code for tokens against provider's token endpoint.
   try {
-    const body = new URLSearchParams({
+    const tokenReq = _buildTokenRequest(pending.client, {
       grant_type: 'authorization_code',
       code: payload.code,
       redirect_uri: pending.redirectUri,
-      client_id: pending.client.client_id,
       code_verifier: pending.codeVerifier,
       resource: pending.resource,
     });
-    if (pending.client.client_secret) body.set('client_secret', pending.client.client_secret);
-    const res = await fetch(pending.client.token_endpoint, {
+    const res = await _fetchDcr('DCR token exchange', pending.client.token_endpoint, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        Accept: 'application/json',
-      },
-      body: body.toString(),
+      headers: tokenReq.headers,
+      body: tokenReq.body.toString(),
     });
     if (!res.ok) {
       const text = await res.text();
@@ -383,13 +461,13 @@ async function _fetchDcrServerRefresh(provider: string, body: Record<string, unk
   let lastErr: unknown = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      return await fetch(url, {
+      return await _fetchDcr('DCR server-managed refresh', url, {
         method: 'POST',
-        headers: {
+        headers: withCommonHeaders({
           'Content-Type': 'application/json',
           Accept: 'application/json',
           ...tokenStore.authHeaders(),
-        },
+        }),
         body: JSON.stringify(body),
       });
     } catch (err) {
@@ -441,13 +519,13 @@ export async function storeDcrServerManaged(
   grant: OAuthGrant,
   opts: { force?: boolean } = {},
 ): Promise<OAuthGrant> {
-  const res = await fetch(`${accountApiBase()}/connectors/oauth/dcr-store`, {
+  const res = await _fetchDcr('DCR server-managed store', `${accountApiBase()}/connectors/oauth/dcr-store`, {
     method: 'POST',
-    headers: {
+    headers: withCommonHeaders({
       'Content-Type': 'application/json',
       Accept: 'application/json',
       ...tokenStore.authHeaders(),
-    },
+    }),
     body: JSON.stringify({
       provider,
       access_token: grant.access_token,
@@ -523,22 +601,18 @@ export async function refreshDcrIfStale(
   if (!grant.refresh_token) {
     throw new Error('access_token expired and no refresh_token available; reconnect required');
   }
-  const body = new URLSearchParams({
+  const params: Record<string, string> = {
     grant_type: 'refresh_token',
     refresh_token: grant.refresh_token,
-    client_id: client.client_id,
-  });
-  if (client.resource) body.set('resource', client.resource);
-  if (client.client_secret) body.set('client_secret', client.client_secret);
+  };
+  if (client.resource) params.resource = client.resource;
+  const tokenReq = _buildTokenRequest(client, params);
   let res: Response;
   try {
-    res = await fetch(client.token_endpoint, {
+    res = await _fetchDcr('DCR token refresh', client.token_endpoint, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        Accept: 'application/json',
-      },
-      body: body.toString(),
+      headers: tokenReq.headers,
+      body: tokenReq.body.toString(),
     });
   } catch (err) {
     throw _fmtFetchErr(`${client.token_endpoint} fetch failed`, err);

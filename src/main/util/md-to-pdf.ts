@@ -242,6 +242,7 @@ const PDF_PRINT_COLOR_CSS = `
 export interface HtmlToPdfOpts {
   pageSize?: 'A4' | 'A3' | 'Letter' | 'Legal' | 'Tabloid';
   landscape?: boolean;
+  footerText?: string;
 }
 
 /**
@@ -271,7 +272,8 @@ export async function htmlToPdf(
   });
 
   try {
-    const dataUrl = `data:text/html;charset=utf-8;base64,${Buffer.from(html, 'utf8').toString('base64')}`;
+    const printableHtml = opts.footerText ? injectPrintFooter(html, opts.footerText) : html;
+    const dataUrl = `data:text/html;charset=utf-8;base64,${Buffer.from(printableHtml, 'utf8').toString('base64')}`;
     const loaded = new Promise<void>((resolve, reject) => {
       win.webContents.once('did-finish-load', () => resolve());
       win.webContents.once('did-fail-load', (_e: unknown, _code: number, desc: string) =>
@@ -305,4 +307,32 @@ export async function markdownToPdf(
 ): Promise<string> {
   const html = markdownToHtml(md, { ...(opts.title ? { title: opts.title } : {}) });
   return htmlToPdf(html, outputPath, opts);
+}
+
+function injectPrintFooter(html: string, footerText: string): string {
+  const label = escapeHtml(String(footerText || '').trim());
+  if (!label) return html;
+  const block = [
+    '<style data-generated-output-footer="1">',
+    '@media print {',
+    '  body { padding-bottom: 18mm !important; }',
+    '  .generated-output-footer {',
+    '    position: fixed;',
+    '    left: 0;',
+    '    right: 0;',
+    '    bottom: 0;',
+    '    font-size: 8pt;',
+    '    line-height: 1.2;',
+    '    color: rgba(0,0,0,0.48);',
+    '    text-align: center;',
+    '    pointer-events: none;',
+    '  }',
+    '}',
+    '</style>',
+    `<div class="generated-output-footer">${label}</div>`,
+  ].join('\n');
+  if (/<\/body\s*>/i.test(html)) {
+    return html.replace(/<\/body\s*>/i, `${block}\n</body>`);
+  }
+  return `${html}\n${block}`;
 }

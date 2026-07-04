@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
 import {
   CoreAgentError,
   AuthError,
@@ -6,13 +6,20 @@ import {
   ContextOverflowError,
   ProviderError,
   TimeoutError,
+  configureRetryErrorPolicy,
   classifyRetryableError,
+  classifyRetryableErrorWithPolicy,
   classifyTransientNetworkError,
+  getRetryErrorPolicy,
   isRetryableError,
   isTransientNetworkError,
   formatError,
 } from "../src/shared/errors.js";
 import { createLogger } from "../src/shared/logger.js";
+
+afterEach(() => {
+  configureRetryErrorPolicy();
+});
 
 describe("Errors", () => {
   it("CoreAgentError has code and name", () => {
@@ -73,8 +80,18 @@ describe("Errors", () => {
       expect(isRetryableError(new ProviderError("400", "test", 400))).toBe(false);
     });
 
-    it("returns false for plain Error", () => {
-      expect(isRetryableError(new Error("plain"))).toBe(false);
+    it("returns false for statusless 400 tool-call contract errors", () => {
+      const err = new ProviderError(
+        "400 Messages with role 'tool' must be a response to a preceding message with 'tool_calls'",
+        "deepseek",
+      );
+      expect(isRetryableError(err)).toBe(false);
+      expect(classifyRetryableError(err)).toBeNull();
+    });
+
+    it("defaults unknown errors to retryable network failures", () => {
+      expect(isRetryableError(new Error("plain"))).toBe(true);
+      expect(classifyRetryableError(new Error("plain"))).toBe("network");
     });
 
     it("returns true for undici 'terminated' (mid-stream SSE cutoff)", () => {
@@ -82,6 +99,13 @@ describe("Errors", () => {
       // pi-provider wraps it into a statusCode-less ProviderError — must
       // still classify as retryable (this is the primary bug we're fixing)
       expect(isRetryableError(new ProviderError("terminated", "openai-codex"))).toBe(true);
+    });
+
+    it("returns true for streams that end without a final finish_reason", () => {
+      const err = new ProviderError("Stream ended without finish_reason", "openai-completions");
+      expect(isRetryableError(err)).toBe(true);
+      expect(classifyRetryableError(err)).toBe("connection_dropped");
+      expect(classifyTransientNetworkError(err)).toBe("connection_dropped");
     });
 
     it("returns true for hosted WebSocket stream drops", () => {
@@ -141,6 +165,46 @@ describe("Errors", () => {
     it("returns false for unrelated TypeErrors", () => {
       expect(isRetryableError(new TypeError("invalid argument"))).toBe(false);
     });
+
+    it("returns false for explicit permanent failures", () => {
+      expect(isRetryableError(new ContextOverflowError("context_length_exceeded"))).toBe(false);
+      expect(isRetryableError(new ProviderError("model_not_found", "test", 404))).toBe(false);
+      expect(isRetryableError(new ProviderError("content_filter triggered", "test", 400))).toBe(false);
+      expect(isRetryableError(new Error("Request was aborted by user"))).toBe(false);
+
+      const wrappedAuth = Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("Unauthorized"), { status: 401 }),
+      });
+      expect(isRetryableError(wrappedAuth)).toBe(false);
+    });
+
+    it("allows runtime retry policy to override the permanent blacklist", () => {
+      configureRetryErrorPolicy({
+        permanent_statuses: [],
+        permanent_message_patterns: [],
+        permanent_code_patterns: [],
+      });
+      expect(isRetryableError(new ProviderError("400", "test", 400))).toBe(true);
+      expect(isRetryableError(new TypeError("invalid argument"))).toBe(true);
+      expect(getRetryErrorPolicy().permanent_statuses).toEqual([]);
+    });
+
+    it("allows runtime retry policy to add permanent message patterns", () => {
+      configureRetryErrorPolicy({
+        permanent_message_patterns: ["custom_hard_stop"],
+      });
+      expect(isRetryableError(new Error("custom_hard_stop"))).toBe(false);
+      expect(classifyRetryableErrorWithPolicy(new Error("inline_hard_stop"), {
+        permanent_message_patterns: ["inline_hard_stop"],
+      })).toBeNull();
+    });
+
+    it("ignores invalid runtime regex patterns instead of throwing", () => {
+      expect(() => configureRetryErrorPolicy({
+        permanent_message_patterns: ["["],
+      })).not.toThrow();
+      expect(isRetryableError(new Error("plain"))).toBe(true);
+    });
   });
 
   describe("isTransientNetworkError", () => {
@@ -168,6 +232,11 @@ describe("Errors", () => {
       expect(isTransientNetworkError(new Error("stream disconnected before completion"))).toBe(true);
       expect(isTransientNetworkError(new Error("ERR_STREAM_PREMATURE_CLOSE"))).toBe(true);
       expect(isTransientNetworkError(new Error("read ECONNRESET"))).toBe(true);
+    });
+
+    it("matches missing final stream markers", () => {
+      expect(isTransientNetworkError(new Error("Stream ended without finish_reason"))).toBe(true);
+      expect(classifyTransientNetworkError(new Error("missing final chunk"))).toBe("connection_dropped");
     });
 
     it("matches via code on direct error", () => {

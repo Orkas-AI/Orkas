@@ -345,7 +345,15 @@ function _mveActionButton(state, action, labelKey, iconName, extraClass) {
   return `<button type="button" class="${cls}" data-mve-action="${action}" aria-label="${escapeHtml(label)}" title="${escapeHtml(label)}">${icon}</button>`;
 }
 
-function _mveTrack() {}
+function _mveTrack(action, state, data) {
+  try {
+    if (!window.Monitor) return;
+    (() => {})(action, Object.assign({
+      source: state && state.source ? String(state.source.kind || '') : '',
+      can_save: !!(state && state.caps && state.caps.save),
+    }, data || {}));
+  } catch (_) {}
+}
 
 function _mveRenderView(state) {
   state.mode = 'view';

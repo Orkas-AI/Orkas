@@ -2,18 +2,22 @@ const _convLog = createLogger('conversation');
 let _conversationInlineRenameCid = null;
 let _conversationHeaderRenameCid = null;
 const _conversationExpandedBuckets = new Set();
-const _modelOutputIssueKeys = new Set();
 
 function _convTrackClick(action, data) {
-  void 0;
+  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
 function _convTrackEvent(action, data) {
-  void 0;
+  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
 function _convTrackError(action, data) {
-  void 0;
+  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
+}
+
+function _maybeShowOrkasCreditGuidance(rawError, source) {
+  void rawError;
+  void source;
 }
 
 function _trimTelemetryText(value, max) {
@@ -23,36 +27,11 @@ function _trimTelemetryText(value, max) {
   return text.slice(0, limit) + '...';
 }
 
-function _noteModelOutputIssue(cid, msgDiv, rawError, extra) {
-  extra = extra || {};
-  if (extra && extra.aborted) return;
-  const errorMessage = _trimTelemetryText(rawError || 'unknown error', 800);
-  if (!errorMessage || /^aborted$/i.test(errorMessage)) return;
-
-  const conversationId = String(cid || currentCid || '');
-  const messageId = msgDiv ? String(msgDiv.dataset.msgId || '') : '';
-  const turnId = msgDiv ? String(msgDiv.dataset.turnId || '') : '';
-  const actorId = String(
-    (extra && extra.actor_id)
-    || (msgDiv && (msgDiv.dataset.fromActor || msgDiv.dataset.from))
-    || '',
-  );
-  const stage = String((extra && extra.stage) || 'stream');
-  const key = [conversationId, messageId, turnId, actorId, stage, errorMessage].join('|');
-  if (_modelOutputIssueKeys.has(key)) return;
-  if (_modelOutputIssueKeys.size > 1000) _modelOutputIssueKeys.clear();
-  _modelOutputIssueKeys.add(key);
-
-  _convTrackError('model_output', {
-    conversation_id: conversationId,
-    message_id: messageId,
-    turn_id: turnId,
-    actor_id: actorId,
-    actor: actorId ? (_groupActorLabel(actorId) || actorId) : '',
-    error_type: String((extra && extra.error_type) || 'model_output'),
-    error_message: errorMessage,
-    stage,
-  });
+function _handleModelOutputErrorForUi(cid, msgDiv, rawError, extra) {
+  void cid;
+  void msgDiv;
+  void rawError;
+  void extra;
 }
 
 function _uiIconHtml(name, className) {
@@ -161,6 +140,31 @@ function _buildFailedAssistantFeedbackContent(details, max = 300) {
   const errorText = _normalizeFeedbackFieldText(details && details.errorText);
   const replyText = _normalizeFeedbackFieldText(details && details.replyText);
   return _tailFeedbackText([replyText, errorText].filter(Boolean).join('\n'), max);
+}
+
+function _isInternalFeedbackSubmitError(value) {
+  const text = _normalizeFeedbackFieldText(value);
+  if (!text) return true;
+  return /(?:^|[\s(:])account:\/pms\/feedback\/submit\b/i.test(text)
+    || /\/pms\/feedback\/submit\b/i.test(text)
+    || /\btimed out after \d+\s*(?:ms|s)\b/i.test(text)
+    || /^(?:failed to fetch|networkerror|load failed|fetch failed)$/i.test(text)
+    || /^HTTP\s+\d{3}$/i.test(text)
+    || /^code\s+\d+$/i.test(text)
+    || /^feedback submit failed$/i.test(text);
+}
+
+function _feedbackSubmitDisplayMessage(value) {
+  if (typeof userErrorMessage === 'function') {
+    return userErrorMessage(value, {
+      fallbackText: t('chat.unknown_error'),
+      authKey: 'chat.report_login_required',
+    });
+  }
+  const raw = _normalizeFeedbackFieldText(value);
+  if (raw === t('chat.report_login_required')) return raw;
+  if (_isInternalFeedbackSubmitError(raw)) return t('chat.unknown_error');
+  return raw;
 }
 
 function _skillsForDisplayNameRewrite() {
@@ -289,13 +293,9 @@ function _renderMessageMarkdown(text) {
   return tmp.innerHTML;
 }
 
-// Build the mirror HTML for a textarea's raw value. Escapes everything
-// EXCEPT `@<token>` matches, which become accent-coloured spans. The
-// trailing-newline special-case (`\n` → `\n​`) keeps the mirror's
-// content height matching the textarea after the user just hit Enter,
-// otherwise CSS `pre-wrap` collapses the trailing line and the mirror
-// shows a half-line less than the textarea.
-function _buildMirrorHtml(text) {
+// Build the mention-highlight portion of the textarea mirror. Escapes
+// everything EXCEPT `@<token>` matches, which become accent-coloured spans.
+function _buildMentionMirrorHtml(text) {
   if (!text) return '';
   const re = _buildMentionRe();
   let html = '';
@@ -309,49 +309,489 @@ function _buildMirrorHtml(text) {
     last = re.lastIndex;
   }
   if (last < text.length) html += escapeHtml(text.slice(last));
-  if (text.endsWith('\n')) html += '​';
   return html;
 }
 
-// Wrap a chat textarea with a synced mirror div for inline mention
-// highlighting. Idempotent — flagged via dataset.mentionMirror so a
-// re-init (e.g. theme switch) doesn't double-wrap. Quietly skips if the
-// element is already mounted (e.g. when called too early at boot, the
-// caller can retry on `DOMContentLoaded`).
+// Build the legacy mirror HTML for tests / fallback callers. The active
+// composer now uses real DOM chips in `_initMentionMirror` below; this helper
+// stays tiny because some focused renderer tests still extract it.
+function _buildMirrorHtml(text) {
+  if (!text) return '';
+  const base = (typeof _renderChatUseMirrorHtml === 'function')
+    ? _renderChatUseMirrorHtml(text, _buildMentionMirrorHtml)
+    : _buildMentionMirrorHtml(text);
+  return text.endsWith('\n') ? base + '​' : base;
+}
+
+const _chatRichComposers = new Map();
+
+function _chatRichInputId(inputOrId) {
+  if (!inputOrId) return '';
+  if (typeof inputOrId === 'string') return inputOrId;
+  return inputOrId.id || inputOrId.dataset?.richInputId || '';
+}
+
+function getChatRichComposerEditor(inputOrId) {
+  const id = _chatRichInputId(inputOrId);
+  return id ? (_chatRichComposers.get(id)?.editor || null) : null;
+}
+
+function getChatRichComposerSelection(inputOrId) {
+  const id = _chatRichInputId(inputOrId);
+  const api = id ? _chatRichComposers.get(id) : null;
+  if (!api) return null;
+  api.syncTextareaSelectionFromEditor();
+  return {
+    start: api.input.selectionStart || 0,
+    end: api.input.selectionEnd || api.input.selectionStart || 0,
+  };
+}
+
+function focusChatRichComposer(inputOrId) {
+  const id = _chatRichInputId(inputOrId);
+  const api = id ? _chatRichComposers.get(id) : null;
+  if (!api) return false;
+  api.focus();
+  return true;
+}
+
+function syncChatRichComposerFromTextarea(inputOrId) {
+  const id = _chatRichInputId(inputOrId);
+  const api = id ? _chatRichComposers.get(id) : null;
+  if (!api) return false;
+  api.renderFromTextarea();
+  return true;
+}
+
+function syncChatRichComposerHeight(inputOrId, maxPx) {
+  const id = _chatRichInputId(inputOrId);
+  const api = id ? _chatRichComposers.get(id) : null;
+  if (!api) return false;
+  api.renderFromTextarea();
+  api.autoGrow(maxPx);
+  return true;
+}
+
+function insertChatUseTokenIntoComposer(inputOrId, selection) {
+  const id = _chatRichInputId(inputOrId);
+  const api = id ? _chatRichComposers.get(id) : null;
+  if (!api) return false;
+  return api.insertUse(selection);
+}
+
+function _chatRichSerializeNode(node) {
+  if (!node) return '';
+  if (node.nodeType === Node.TEXT_NODE) return node.nodeValue || '';
+  if (node.nodeType !== Node.ELEMENT_NODE && node.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) return '';
+  if (node.nodeType === Node.ELEMENT_NODE) {
+    const el = node;
+    if (el.dataset?.chatUseChip === '1') return el.dataset.token || '';
+    if (el.tagName === 'BR') return '\n';
+  }
+  let out = '';
+  node.childNodes.forEach((child) => { out += _chatRichSerializeNode(child); });
+  if (node.nodeType === Node.ELEMENT_NODE && /^(DIV|P)$/i.test(node.tagName || '')) {
+    if (out && !out.endsWith('\n')) out += '\n';
+  }
+  return out;
+}
+
+function _chatRichTextLength(node) {
+  return _chatRichSerializeNode(node).length;
+}
+
+function _chatRichRangeLength(editor, container, offset) {
+  try {
+    const range = document.createRange();
+    range.selectNodeContents(editor);
+    range.setEnd(container, offset);
+    const len = _chatRichSerializeNode(range.cloneContents()).length;
+    if (typeof range.detach === 'function') range.detach();
+    return len;
+  } catch (_) {
+    return editor ? _chatRichSerializeNode(editor).length : 0;
+  }
+}
+
+function _chatRichSelectionIndexes(editor) {
+  const sel = window.getSelection ? window.getSelection() : null;
+  if (!sel || sel.rangeCount < 1) return null;
+  const range = sel.getRangeAt(0);
+  if (!editor.contains(range.startContainer) || !editor.contains(range.endContainer)) return null;
+  const start = _chatRichRangeLength(editor, range.startContainer, range.startOffset);
+  const end = _chatRichRangeLength(editor, range.endContainer, range.endOffset);
+  return { start: Math.min(start, end), end: Math.max(start, end) };
+}
+
+function _chatRichFindPosition(root, index) {
+  let left = Math.max(0, Number(index) || 0);
+  const visit = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const len = (node.nodeValue || '').length;
+      if (left <= len) return { type: 'text', node, offset: left };
+      left -= len;
+      return null;
+    }
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const el = node;
+      if (el.dataset?.chatUseChip === '1' || el.tagName === 'BR') {
+        const len = _chatRichTextLength(el);
+        if (left <= len) return left <= len / 2
+          ? { type: 'before', node: el }
+          : { type: 'after', node: el };
+        left -= len;
+        return null;
+      }
+    }
+    for (const child of Array.from(node.childNodes || [])) {
+      const found = visit(child);
+      if (found) return found;
+    }
+    return null;
+  };
+  return visit(root) || { type: 'end', node: root };
+}
+
+function _chatRichApplyBoundary(range, boundary, which) {
+  const fn = which === 'start' ? 'setStart' : 'setEnd';
+  if (!boundary || boundary.type === 'end') {
+    range[fn](boundary?.node || range.commonAncestorContainer, (boundary?.node || range.commonAncestorContainer).childNodes.length);
+  } else if (boundary.type === 'text') {
+    range[fn](boundary.node, boundary.offset);
+  } else if (boundary.type === 'before') {
+    which === 'start' ? range.setStartBefore(boundary.node) : range.setEndBefore(boundary.node);
+  } else if (boundary.type === 'after') {
+    which === 'start' ? range.setStartAfter(boundary.node) : range.setEndAfter(boundary.node);
+  }
+}
+
+function _chatRichSetSelection(editor, start, end = start) {
+  if (!editor || !window.getSelection) return;
+  const range = document.createRange();
+  const startPos = _chatRichFindPosition(editor, start);
+  const endPos = _chatRichFindPosition(editor, end);
+  _chatRichApplyBoundary(range, startPos, 'start');
+  _chatRichApplyBoundary(range, endPos, 'end');
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+function _chatRichLabelParts(selection) {
+  try {
+    if (typeof _chatUseLabelParts === 'function') return _chatUseLabelParts(selection);
+  } catch (_) {}
+  const name = selection?.name || selection?.id || '';
+  const prefix = selection?.kind === 'connector' ? 'Connector: ' : 'Skill: ';
+  return { name, prefix, label: `${prefix}${name}` };
+}
+
+function _chatRichCreateUseChip(selection, rawToken) {
+  const chip = document.createElement('span');
+  chip.className = `chat-use-inline-chip chat-rich-use-chip ${selection?.kind === 'connector' ? 'is-connector' : 'is-skill'}`;
+  chip.contentEditable = 'false';
+  chip.dataset.chatUseChip = '1';
+  chip.dataset.kind = selection?.kind || '';
+  chip.dataset.itemId = selection?.id || selection?.name || '';
+  chip.dataset.name = selection?.name || selection?.id || '';
+  chip.dataset.token = rawToken || '';
+  const parts = _chatRichLabelParts(selection);
+  chip.title = parts.label || '';
+  chip.innerHTML = '';
+  const prefixEl = document.createElement('span');
+  prefixEl.className = 'chat-use-inline-prefix';
+  prefixEl.textContent = parts.prefix || '';
+  const nameEl = document.createElement('span');
+  nameEl.className = 'chat-use-inline-name';
+  nameEl.textContent = parts.name || '';
+  chip.append(prefixEl, nameEl);
+  return chip;
+}
+
+function _chatRichRenderValue(editor, value) {
+  const src = String(value || '');
+  editor.textContent = '';
+  const tokens = (typeof _findChatUseTokens === 'function') ? _findChatUseTokens(src) : [];
+  let last = 0;
+  tokens.forEach((token) => {
+    if (token.start > last) editor.appendChild(document.createTextNode(src.slice(last, token.start)));
+    editor.appendChild(_chatRichCreateUseChip(token.selection, token.raw));
+    last = token.end;
+  });
+  if (last < src.length) editor.appendChild(document.createTextNode(src.slice(last)));
+}
+
+function _chatRichInputTarget(inputId) {
+  if (inputId === 'new-chat-input') return 'new-chat';
+  if (inputId === 'project-chat-input') return 'project';
+  return 'conversation';
+}
+
+function _chatRichAutoGrowMax(inputId) {
+  if (inputId === 'new-chat-input') return 260;
+  if (inputId === 'project-chat-input') return 180;
+  return 200;
+}
+
+function _chatRichRecipientChipId(inputId) {
+  if (inputId === 'new-chat-input') return 'new-chat-recipient-chip';
+  if (inputId === 'project-chat-input') return 'project-chat-recipient-chip';
+  if (inputId === 'chat-input') return 'chat-recipient-chip';
+  return '';
+}
+
+function _chatRichUploadPasteFiles(inputId, files) {
+  if (!files || !files.length || typeof _chatAttachUpload !== 'function') return false;
+  if (inputId === 'new-chat-input') {
+    _chatAttachUpload(DRAFT_CID, files, 'paste');
+    return true;
+  }
+  if (inputId === 'chat-input' && currentCid) {
+    _chatAttachUpload(currentCid, files, 'paste');
+    return true;
+  }
+  return false;
+}
+
+function _chatRichInsertText(editor, text) {
+  const sel = window.getSelection ? window.getSelection() : null;
+  if (!sel || sel.rangeCount < 1 || !editor.contains(sel.anchorNode)) {
+    editor.focus();
+    _chatRichSetSelection(editor, _chatRichSerializeNode(editor).length);
+  }
+  const range = window.getSelection().getRangeAt(0);
+  range.deleteContents();
+  const node = document.createTextNode(String(text || ''));
+  range.insertNode(node);
+  range.setStart(node, node.nodeValue.length);
+  range.setEnd(node, node.nodeValue.length);
+  const next = window.getSelection();
+  next.removeAllRanges();
+  next.addRange(range);
+}
+
+function _chatRichCreateApi(textarea, editor) {
+  const nativeSetSelectionRange = typeof textarea.setSelectionRange === 'function'
+    ? textarea.setSelectionRange.bind(textarea)
+    : null;
+  const nativeFocus = typeof textarea.focus === 'function' ? textarea.focus.bind(textarea) : null;
+  const api = {
+    input: textarea,
+    editor,
+    lastValue: null,
+    pendingSelection: null,
+    syncingFromEditor: false,
+    focus() {
+      editor.focus();
+      const start = typeof textarea.selectionStart === 'number' ? textarea.selectionStart : (textarea.value || '').length;
+      const end = typeof textarea.selectionEnd === 'number' ? textarea.selectionEnd : start;
+      _chatRichSetSelection(editor, start, end);
+    },
+    setTextareaSelection(start, end = start) {
+      if (nativeSetSelectionRange) {
+        try { nativeSetSelectionRange(start, end); } catch (_) {}
+      } else {
+        textarea.selectionStart = start;
+        textarea.selectionEnd = end;
+      }
+      this.pendingSelection = { start, end };
+    },
+    syncTextareaSelectionFromEditor() {
+      const sel = _chatRichSelectionIndexes(editor);
+      if (!sel) return;
+      this.setTextareaSelection(sel.start, sel.end);
+    },
+    renderFromTextarea() {
+      const value = String(textarea.value || '');
+      const changed = value !== this.lastValue;
+      if (changed) {
+        this.lastValue = value;
+        const start = typeof textarea.selectionStart === 'number' ? textarea.selectionStart : value.length;
+        const end = typeof textarea.selectionEnd === 'number' ? textarea.selectionEnd : start;
+        _chatRichRenderValue(editor, value);
+        if (document.activeElement === editor || this.pendingSelection) {
+          const sel = this.pendingSelection || { start, end };
+          _chatRichSetSelection(editor, sel.start, sel.end);
+          this.pendingSelection = null;
+        }
+      } else if (this.pendingSelection && document.activeElement === editor) {
+        _chatRichSetSelection(editor, this.pendingSelection.start, this.pendingSelection.end);
+        this.pendingSelection = null;
+      }
+      this.autoGrow(_chatRichAutoGrowMax(textarea.id));
+    },
+    syncFromEditor(emit) {
+      this.syncTextareaSelectionFromEditor();
+      const value = _chatRichSerializeNode(editor);
+      if (value === this.lastValue && !emit) return;
+      this.lastValue = value;
+      textarea.value = value;
+      this.syncingFromEditor = true;
+      if (emit) {
+        try { textarea.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
+      }
+      this.syncingFromEditor = false;
+      this.autoGrow(_chatRichAutoGrowMax(textarea.id));
+    },
+    autoGrow(maxPx) {
+      const max = Number(maxPx) || _chatRichAutoGrowMax(textarea.id);
+      editor.style.height = 'auto';
+      const next = Math.min(editor.scrollHeight || 0, max);
+      if (next > 0) editor.style.height = `${next}px`;
+      editor.style.overflowY = (editor.scrollHeight || 0) > max ? 'auto' : 'hidden';
+    },
+    insertUse(selection) {
+      if (typeof _chatUseTokenFor !== 'function') return false;
+      const token = _chatUseTokenFor(selection);
+      if (!token) return false;
+      this.syncTextareaSelectionFromEditor();
+      const value = String(textarea.value || '');
+      const start = typeof textarea.selectionStart === 'number' ? textarea.selectionStart : value.length;
+      const end = typeof textarea.selectionEnd === 'number' ? textarea.selectionEnd : start;
+      const before = value.slice(0, start);
+      const after = value.slice(end);
+      const leading = before && !/\s$/.test(before) ? ' ' : '';
+      const trailing = after && /^\s/.test(after) ? '' : ' ';
+      const replacement = `${leading}${token}${trailing}`;
+      textarea.value = `${before}${replacement}${after}`;
+      const caret = start + replacement.length;
+      this.setTextareaSelection(caret, caret);
+      this.lastValue = null;
+      this.renderFromTextarea();
+      try { textarea.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
+      return true;
+    },
+  };
+
+  textarea.addEventListener('input', () => {
+    if (api.syncingFromEditor) return;
+    api.renderFromTextarea();
+  });
+  editor.addEventListener('input', () => api.syncFromEditor(true));
+  editor.addEventListener('focus', () => {
+    api.renderFromTextarea();
+    api.syncTextareaSelectionFromEditor();
+  });
+  editor.addEventListener('keyup', () => api.syncTextareaSelectionFromEditor());
+  editor.addEventListener('mouseup', () => api.syncTextareaSelectionFromEditor());
+  editor.addEventListener('paste', (e) => {
+    const cd = e.clipboardData;
+    if (cd?.files?.length && _chatRichUploadPasteFiles(textarea.id, cd.files)) {
+      e.preventDefault();
+      return;
+    }
+    const text = cd?.getData ? cd.getData('text/plain') : '';
+    if (!text) return;
+    e.preventDefault();
+    _chatRichInsertText(editor, text);
+    api.syncFromEditor(true);
+  });
+  editor.addEventListener('keydown', (e) => {
+    if (e.isComposing || e.keyCode === 229) return;
+    api.syncTextareaSelectionFromEditor();
+    if ((e.key === 'Backspace' || e.key === 'Delete') && typeof _deleteChatUseTokenAtCaret === 'function') {
+      const direction = e.key === 'Delete' ? 'forward' : 'backward';
+      if (_deleteChatUseTokenAtCaret(textarea, direction)) {
+        e.preventDefault();
+        return;
+      }
+    }
+    if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && typeof _moveChatUseTokenCaret === 'function') {
+      const direction = e.key === 'ArrowRight' ? 'forward' : 'backward';
+      if (_moveChatUseTokenCaret(textarea, direction)) {
+        e.preventDefault();
+        api.pendingSelection = {
+          start: textarea.selectionStart || 0,
+          end: textarea.selectionEnd || textarea.selectionStart || 0,
+        };
+        api.renderFromTextarea();
+        return;
+      }
+    }
+    if (e.key !== 'Enter') return;
+    if (e.shiftKey || e.metaKey || e.ctrlKey) {
+      e.preventDefault();
+      _chatRichInsertText(editor, '\n');
+      api.syncFromEditor(true);
+      return;
+    }
+    if (e.altKey) return;
+    e.preventDefault();
+    if (textarea.id === 'new-chat-input' && typeof handleNewChatSubmit === 'function') handleNewChatSubmit();
+    else if (textarea.id === 'project-chat-input' && typeof _submitProjectChat === 'function') _submitProjectChat();
+    else if (typeof handleChatSubmit === 'function') handleChatSubmit();
+  });
+
+  if (nativeFocus) {
+    try {
+      textarea.focus = function focus(options) {
+        if (editor.isConnected) {
+          api.focus();
+          return;
+        }
+        nativeFocus(options);
+      };
+    } catch (_) {}
+  }
+  if (nativeSetSelectionRange) {
+    try {
+      textarea.setSelectionRange = function setSelectionRange(start, end, direction) {
+        nativeSetSelectionRange(start, end, direction);
+        api.pendingSelection = { start, end: typeof end === 'number' ? end : start };
+        if (document.activeElement === editor) {
+          _chatRichSetSelection(editor, api.pendingSelection.start, api.pendingSelection.end);
+          api.pendingSelection = null;
+        }
+      };
+    } catch (_) {}
+  }
+  return api;
+}
+
+// Replace the old transparent-textarea mirror with a real rich editor. The
+// textarea remains the source-of-truth compatibility layer for send/draft/
+// voice code; the visible caret and chip blocks now belong to contenteditable
+// DOM, so browser selection can cross non-editable chips atomically.
 function _initMentionMirror(textarea) {
   if (!textarea || textarea.dataset.mentionMirror === '1') return;
   if (!textarea.parentNode) return;
   textarea.dataset.mentionMirror = '1';
 
   const wrap = document.createElement('div');
-  wrap.className = 'chat-input-mirror-wrap';
-  const mirror = document.createElement('div');
-  mirror.className = 'chat-input-mirror';
-  mirror.setAttribute('aria-hidden', 'true');
+  wrap.className = 'chat-input-rich-wrap';
+  const editor = document.createElement('div');
+  editor.className = 'chat-rich-editor';
+  editor.contentEditable = 'true';
+  editor.setAttribute('role', 'textbox');
+  editor.setAttribute('aria-multiline', 'true');
+  editor.dataset.richInputId = textarea.id || '';
+  editor.dataset.placeholder = textarea.getAttribute('placeholder') || '';
 
   // Insert wrap in place of textarea, move textarea inside.
   textarea.parentNode.insertBefore(wrap, textarea);
-  wrap.appendChild(mirror);
+  wrap.appendChild(editor);
   wrap.appendChild(textarea);
+  textarea.classList.add('chat-rich-source');
 
-  let lastSynced = '';
   let lastPlaceholder = '';
+  const api = _chatRichCreateApi(textarea, editor);
+  _chatRichComposers.set(textarea.id, api);
   const sync = () => {
     const placeholder = textarea.getAttribute('placeholder') || '';
     if (placeholder !== lastPlaceholder) {
       lastPlaceholder = placeholder;
-      mirror.dataset.placeholder = placeholder;
+      editor.dataset.placeholder = placeholder;
     }
-    const v = textarea.value || '';
-    if (v === lastSynced) return;
-    lastSynced = v;
-    mirror.innerHTML = _buildMirrorHtml(v);
+    api.renderFromTextarea();
   };
-  const syncScroll = () => {
-    mirror.scrollTop = textarea.scrollTop;
-  };
-  textarea.addEventListener('input', sync);
-  textarea.addEventListener('scroll', syncScroll, { passive: true });
+  window.addEventListener('i18n-change', () => {
+    api.lastValue = null;
+    sync();
+  });
+  const chipId = _chatRichRecipientChipId(textarea.id);
+  if (chipId && typeof bindRecipientAnchor === 'function') {
+    try { bindRecipientAnchor(chipId, textarea.id); } catch (_) {}
+  }
   // Programmatic value changes (send-clears the input, agent-picker
   // inserts `@<name>`, draft restore on conv switch) don't fire `input`
   // natively. Most call sites dispatch one explicitly, but a 100ms
@@ -362,9 +802,9 @@ function _initMentionMirror(textarea) {
   sync();
 }
 
-// Set up mirrors for the two chat panels that participate in the group-
-// chat `@` semantics. Other chat panels (skill-edit, agent-edit) don't
-// route via the bus's mention parser, so they keep the plain textarea.
+// Set up rich composers for the chat panels that participate in the group-
+// chat `@` semantics. Other chat panels (skill-edit, agent-edit) don't route
+// via the bus's mention parser, so they keep the plain textarea.
 function _initAllMentionMirrors() {
   const chatInput = document.getElementById('chat-input');
   if (chatInput) _initMentionMirror(chatInput);
@@ -609,47 +1049,47 @@ function onEnterNewChatView() {
 
 let _emptyStateClockTimer = null;
 const _SCENARIO_CONFIGS = {
-  education: {
-    templateKey: 'new_chat.quick.tmpl.education',
-    agentId: '54fc8129a8c4',
-    agentNames: ['LearningTutor'],
-  },
-  ecommerce: {
-    templateKey: 'new_chat.quick.tmpl.ecommerce',
-    agentId: '5a1d43c2f28a',
-    agentNames: ['MerchResearcher'],
-  },
-  rnd: {
-    templateKey: 'new_chat.quick.tmpl.rnd',
-    agentId: 'a316881746f9',
-    agentNames: ['ProductDeveloper'],
-  },
-  creation: {
-    templateKey: 'new_chat.quick.tmpl.creation',
-    agentId: '173d4235a431',
-    agentNames: ['ContentWriter'],
-  },
   data: {
     templateKey: 'new_chat.quick.tmpl.data',
     agentId: '78900d8758bc',
-    agentNames: ['GeneralResearcher'],
+    agentNames: ['DeepResearcher'],
+  },
+  video: {
+    templateKey: 'new_chat.quick.tmpl.video',
+    agentId: '79df9cc89f5f',
+    agentNames: ['VideoStudio'],
+  },
+  seo_geo: {
+    templateKey: 'new_chat.quick.tmpl.seo_geo',
+    agentId: 'e064dca9e1bd',
+    agentNames: ['SeoGeoAgent'],
   },
   office: {
     templateKey: 'new_chat.quick.tmpl.office',
     agentId: 'a19101ba698a',
     agentNames: ['OfficeWriter'],
   },
+  rnd: {
+    templateKey: 'new_chat.quick.tmpl.rnd',
+    agentId: 'a316881746f9',
+    agentNames: ['ProductDeveloper'],
+  },
+  education: {
+    templateKey: 'new_chat.quick.tmpl.education',
+    agentId: '54fc8129a8c4',
+    agentNames: ['LearningTutor'],
+  },
 };
 // English fallback templates — used when the i18n table doesn't yet carry
 // the scenario template key (Step 9 backfills the full set). Each template
 // has at least one `[...]` placeholder that scenario-click jumps the caret to.
 const _SCENARIO_TEMPLATES_FALLBACK_EN = {
-  education: '[topic or material] Tutor me step by step. Explain the concept, ask guiding questions, and give me a practice plan.',
-  ecommerce: 'Research [product or category]: compare demand, competitors, price bands, sourcing risk, and whether it is worth selling.',
-  rnd: 'Build [software/app/feature]: clarify requirements, design the implementation plan, write the code, test it, and verify completion.',
-  creation: 'Write [article/topic]: draft a clear structure, produce the first version, and polish it for the target audience.',
   data: 'Deep research [topic]: gather recent sources, compare evidence, cite links, and produce a structured report.',
+  video: 'Make a video for [topic/materials]: confirm the style, plan the script/timeline, produce a draft, and ask me to review it.',
+  seo_geo: 'Analyze SEO and GEO for [website/page URL]: crawl the page, diagnose technical/content/schema issues, find opportunities, and produce an action plan.',
   office: 'Organize [document/materials]: turn it into a polished document, table, presentation, or PDF-ready deliverable.',
+  rnd: 'Build [software/app/feature]: clarify requirements, design the implementation plan, write the code, test it, and verify completion.',
+  education: '[topic or material] Tutor me step by step. Explain the concept, ask guiding questions, and give me a practice plan.',
 };
 
 function _pickGreetingKey(date) {
@@ -659,14 +1099,21 @@ function _pickGreetingKey(date) {
   if (h < 18) return 'new_chat.greeting_afternoon';  // 12-17
   return 'new_chat.greeting_evening';                // 18-23
 }
+// Mirrors the latest account-status payload when an account layer exists.
+// the open-source build has no bundled account backend, so this path stays empty.
 let _emptyStateAccountStatus = null;
 let _emptyStateAccountSubBound = false;
 function _ensureEmptyStateAccountSub() {
+  if (_emptyStateAccountSubBound) return;
   _emptyStateAccountSubBound = true;
-  _emptyStateAccountStatus = null;
 }
 function _emptyStateUserDisplayName() {
-  return '';
+  const u = (_emptyStateAccountStatus && _emptyStateAccountStatus.userInfo) || null;
+  if (!u) return '';
+  // Prefer nickname; fall back to the email local-part so the greeting never
+  // shows a full email address (privacy + visual).
+  const raw = String(u.nickname || u.email || '').trim();
+  return raw.split('@')[0].trim();
 }
 function _refreshEmptyStateGreeting() {
   const el = document.getElementById('new-chat-greeting');
@@ -1276,7 +1723,7 @@ async function _syncPendingActorsFromRuntime(cid, opts = {}) {
     const activeCommander = activeTurns.some((t) => t.actor === 'commander');
     if (!activeCommander) _removeEmptyActorPlaceholder(cid, 'commander');
     for (const turn of activeTurns) {
-      _ensureActorPlaceholder(cid, turn.actor, loadingEl, turn.turn_id);
+      _ensureActorPlaceholder(cid, turn.actor, loadingEl, turn.turn_id, turn.msg_id);
     }
   } else {
     if (!inFlight.includes('commander')) _removeEmptyActorPlaceholder(cid, 'commander');
@@ -1524,38 +1971,58 @@ const GROUP_RESERVED = new Set(['user', 'commander']);
 // cache on every subsequent update. `null` = not loaded / unavailable;
 // the render layer falls back to the default itself.
 let _commanderAvatarCache = null;
+function _normalizeCommanderAvatar(avatar) {
+  const fallback = (typeof COMMANDER_DEFAULT !== 'undefined' && COMMANDER_DEFAULT)
+    ? COMMANDER_DEFAULT
+    : { icon: 'crown', color: 'gold' };
+  return {
+    icon: fallback.icon || 'crown',
+    color: avatar?.color || fallback.color || 'gold',
+  };
+}
 function _commanderAvatar() {
-  return _commanderAvatarCache || COMMANDER_DEFAULT;
+  return _commanderAvatarCache || _normalizeCommanderAvatar(null);
 }
 async function _ensureCommanderAvatarLoaded() {
   if (_commanderAvatarCache) return _commanderAvatarCache;
   try {
     const res = await window.orkas.invoke('prefs.getCommanderAvatar');
     if (res?.ok && res.avatar) {
-      _commanderAvatarCache = { icon: res.avatar.icon, color: res.avatar.color };
+      _commanderAvatarCache = _normalizeCommanderAvatar(res.avatar);
     }
   } catch (_) { /* fall back to default */ }
-  return _commanderAvatarCache || COMMANDER_DEFAULT;
+  return _commanderAvatarCache || _normalizeCommanderAvatar(null);
 }
 function setCommanderAvatarCache(avatar) {
-  if (avatar && avatar.icon && avatar.color) {
-    _commanderAvatarCache = { icon: avatar.icon, color: avatar.color };
+  if (avatar && avatar.color) {
+    _commanderAvatarCache = _normalizeCommanderAvatar(avatar);
   }
 }
 function _isAgentActor(fromId) {
   return !!fromId && !GROUP_RESERVED.has(String(fromId));
 }
 
+function _isActorDetailTarget(fromId) {
+  const id = String(fromId || '');
+  return id === 'commander' || _isAgentActor(id);
+}
+
 function _actorLinkAttrs(fromId) {
-  return _isAgentActor(fromId)
+  return _isActorDetailTarget(fromId)
     ? ` data-actor-agent-id="${escapeHtml(String(fromId))}" role="button" tabindex="0"`
     : '';
 }
 
 async function _openActorAgentDetail(actorId) {
   const aid = String(actorId || '').trim();
-  if (!_isAgentActor(aid)) return;
-    setView('agents');
+  if (!_isActorDetailTarget(aid)) return;
+  if (window.Monitor) (() => {})('message_actor_open', { agent_id: aid });
+  setView('agents');
+  if (aid === 'commander') {
+    if (typeof _showAgentsDetailView === 'function') await _showAgentsDetailView('commander');
+    else if (typeof selectAgent === 'function') await selectAgent('commander');
+    return;
+  }
   try {
     const res = await apiFetch(`/api/agents/${encodeURIComponent(aid)}`);
     const data = await res.json();
@@ -1602,7 +2069,7 @@ function _hydrateActorHeaderLinks(root) {
 function _decorateActorHeader(root, actorId) {
   if (!root) return;
   const aid = String(actorId || '');
-  const linkable = _isAgentActor(aid);
+  const linkable = _isActorDetailTarget(aid);
   const targets = [
     root.querySelector('.chat-msg-header .chat-msg-from'),
     root.querySelector('.chat-msg-header .avatar-circle'),
@@ -1652,8 +2119,8 @@ function _renderActorAvatarHtml(fromId) {
   return renderAvatarHtml(icon, color, {
     size: 28,
     seed: fromId || 'agent',
-    clickable: _isAgentActor(fromId),
-    dataAttrs: _isAgentActor(fromId) ? { 'actor-agent-id': String(fromId) } : {},
+    clickable: _isActorDetailTarget(fromId),
+    dataAttrs: _isActorDetailTarget(fromId) ? { 'actor-agent-id': String(fromId) } : {},
   });
 }
 /** Resolve an actor id (commander / user / agent_id) to a human-readable
@@ -1863,6 +2330,12 @@ function _findRenderedGroupMessage(container, message, exclude = null) {
   return null;
 }
 
+function _findRenderedMessageForHistoryRecord(container, gm) {
+  const el = _findRenderedGroupMessage(container, gm);
+  if (el) _syncRenderedGroupMessageIdentity(el, gm);
+  return el;
+}
+
 // ─── Chat attachments (pending-send pool per cid) ─────────────────────────
 // User picks files via "+" → we upload them to `<cid>/` and remember them in
 // this Map. On send we hand the filenames to the server; on success the list
@@ -1883,10 +2356,12 @@ const CHAT_ATTACH_ACCEPT = [
   '.pdf', '.docx', '.docm', '.xlsx', '.xlsm', '.pptx', '.pptm',
   '.png', '.jpg', '.jpeg', '.webp', '.gif',
   '.mp4', '.webm', '.mov', '.m4v', '.ogv',
+  '.mp3', '.wav', '.ogg', '.opus', '.m4a', '.aac', '.flac',
 ];
 
 const CHAT_IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.webp', '.gif'];
 const CHAT_VIDEO_EXTS = ['.mp4', '.webm', '.mov', '.m4v', '.ogv'];
+const CHAT_AUDIO_EXTS = ['.mp3', '.wav', '.ogg', '.opus', '.m4a', '.aac', '.flac'];
 const ORKAS_FILE_DRAG_MIME = 'application/x-orkas-file';
 
 function _chatFileIconHtml(name, kind) {
@@ -1902,6 +2377,7 @@ function _chatAttachExtOf(name) {
 function _chatAttachKindFromExt(ext) {
   if (CHAT_IMAGE_EXTS.includes(ext)) return 'image';
   if (CHAT_VIDEO_EXTS.includes(ext)) return 'video';
+  if (CHAT_AUDIO_EXTS.includes(ext)) return 'audio';
   if (ext === '.pdf') return 'pdf';
   if (ext === '.docx' || ext === '.docm') return 'docx';
   if (ext === '.xlsx' || ext === '.xlsm') return 'spreadsheet';
@@ -1933,6 +2409,7 @@ function _chatAttachPayload(cid, files, source) {
     total_bytes: totalBytes,
     image_count: kinds.image || 0,
     video_count: kinds.video || 0,
+    audio_count: kinds.audio || 0,
     document_count:
       (kinds.pdf || 0) + (kinds.docx || 0) + (kinds.spreadsheet || 0)
       + (kinds.presentation || 0),
@@ -2165,7 +2642,7 @@ async function _chatAttachUpload(cid, fileList, source = 'drop') {
     const kind = _chatAttachKindFromExt(ext);
     const tempId = `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     let localPreview = null;
-    if (kind === 'image') {
+    if (kind === 'image' || kind === 'audio') {
       try { localPreview = URL.createObjectURL(file); } catch (_) { /* ignore */ }
     }
     const entry = {
@@ -2267,7 +2744,7 @@ async function _chatAttachPickAndUpload(cid, source = 'picker') {
         displayName: item.displayName || info.name,
         kind: info.kind,
         bytes: info.bytes || 0,
-        dataUrl: info.kind === 'image' ? _chatMediaUrl(cid, info.name) : '',
+        dataUrl: (info.kind === 'image' || info.kind === 'audio') ? _chatMediaUrl(cid, info.name) : '',
         reused: !!item.reused,
         status: 'ready',
       });
@@ -2359,7 +2836,7 @@ async function _chatAttachImportPaths(cid, entries, source = 'internal_drop') {
         displayName: ph.name,
         kind: info.kind,
         bytes: info.bytes,
-        dataUrl: (info.kind === 'image' || info.kind === 'video') ? _chatMediaUrl(cid, info.name) : null,
+        dataUrl: (info.kind === 'image' || info.kind === 'video' || info.kind === 'audio') ? _chatMediaUrl(cid, info.name) : null,
         reused: !!data.reused,
         status: 'ready',
       });
@@ -2397,11 +2874,22 @@ function _addReadyDraftAttachment(cid, info) {
     displayName: info.displayName || info.name,
     kind: info.kind,
     bytes: info.bytes,
-    dataUrl: (info.kind === 'image' || info.kind === 'video') ? _chatMediaUrl(cid, info.name) : null,
+    dataUrl: (info.kind === 'image' || info.kind === 'video' || info.kind === 'audio') ? _chatMediaUrl(cid, info.name) : null,
     reused: !!info.reused,
     status: 'ready',
   });
   _chatAttachSet(cid, items);
+}
+
+function _chatVideoFloatingTitle() {
+  const key = 'chat.video_open_floating_title';
+  try {
+    if (typeof t === 'function') {
+      const v = t(key);
+      if (v && v !== key) return v;
+    }
+  } catch (_) { /* keep fallback */ }
+  return 'Fullscreen';
 }
 
 // Exposed for the KB "ask the commander about this file" menu actions
@@ -2426,7 +2914,7 @@ async function _chatAttachRefreshFromServer(cid) {
     const items = (data.items || []).map((info) => {
       // Preview URL resolves from uid + cid + name on demand via the
       // `chat-media://` protocol — no per-item IPC fetch here.
-      const dataUrl = (info.kind === 'image' || info.kind === 'video')
+      const dataUrl = (info.kind === 'image' || info.kind === 'video' || info.kind === 'audio')
         ? _chatMediaUrl(cid, info.name)
         : null;
       return { name: info.name, kind: info.kind, bytes: info.bytes, dataUrl, status: 'ready' };
@@ -2452,8 +2940,19 @@ function _renderMessageAttachmentsHtml(names, cid) {
     }
     if (kind === 'video' && cid) {
       const url = _chatMediaUrl(cid, n);
+      const floatingTitle = escapeHtml(_chatVideoFloatingTitle());
       return `<span class="chat-msg-attach is-video" data-attach-name="${label}" data-attach-cid="${escapeHtml(cid)}" title="${label}">
-        <video class="chat-msg-attach-video" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${url}"></video>
+        <span class="chat-msg-attach-video-shell">
+          <video class="chat-msg-attach-video" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${url}"></video>
+          <button type="button" class="chat-msg-attach-video-float" data-attach-video-open="1" aria-label="${floatingTitle}" title="${floatingTitle}">${_uiIconHtml('maximize', 'ui-icon chat-msg-attach-video-float-svg')}</button>
+        </span>
+        <span class="chat-msg-attach-label">${label}</span>
+      </span>`;
+    }
+    if (kind === 'audio' && cid) {
+      const url = _chatMediaUrl(cid, n);
+      return `<span class="chat-msg-attach is-audio" data-attach-name="${label}" data-attach-cid="${escapeHtml(cid)}" title="${label}">
+        <audio class="chat-msg-attach-audio" controls controlslist="nodownload noremoteplayback" preload="metadata" src="${url}"></audio>
         <span class="chat-msg-attach-label">${label}</span>
       </span>`;
     }
@@ -2486,7 +2985,7 @@ const _PRODUCED_DELIVERABLE_EXTS = new Set([
   'pdf',
   'zip',
 ]);
-const _PRODUCED_VISIBLE_LIMIT = 8;
+const _PRODUCED_VISIBLE_LIMIT = 10;
 
 function _producedDeliverableRank(name) {
   const ext = (name.split('.').pop() || '').toLowerCase();
@@ -2541,14 +3040,14 @@ function _renderMessageProducedHtml(absPaths) {
       <span class="chat-msg-produced-label">${escapeHtml(e.base)}</span>
     </span>`;
   });
-  // A long, noisy chip row (e.g. a skill that cloned its repo into the
-  // workspace) collapses past the visible limit behind a "+N more" toggle so
-  // the deliverable stays front and centre; clicking reveals the rest in place.
+  // A long, noisy chip row collapses past the visible limit behind a "more"
+  // toggle. Clicking expands the rest in place; the expanded row gets its own
+  // scroll container in CSS so the message body does not balloon forever.
   let moreHtml = '';
   const hiddenCount = ordered.length - _PRODUCED_VISIBLE_LIMIT;
   if (hiddenCount > 0) {
     const moreLabel = t('chat.produced_show_more', { count: hiddenCount });
-    moreHtml = `<span class="chat-msg-produced-more" data-role="produced-more">${escapeHtml(moreLabel)}</span>`;
+    moreHtml = `<button type="button" class="chat-msg-produced-more" data-role="produced-more">${escapeHtml(moreLabel)}</button>`;
   }
   return `<div class="chat-msg-produced">${items.join('')}${moreHtml}</div>`;
 }
@@ -2585,7 +3084,8 @@ function _hydrateMessageCreatedAgentChip(msgDiv) {
     chip.addEventListener('click', async () => {
       const aid = chip.dataset.agentId;
       if (!aid) return;
-            setView('agents');
+      if (window.Monitor) (() => {})('created_agent_chip_open', { agent_id: aid });
+      setView('agents');
       // Pre-check the agent is still loadable; if it was deleted (or its
       // record is broken) the detail view would render an empty shell —
       // bail to the grid instead.
@@ -2625,7 +3125,8 @@ function _hydrateMessageCreatedSkillChip(msgDiv) {
     chip.addEventListener('click', async () => {
       const sid = chip.dataset.skillId;
       if (!sid) return;
-            setView('skills');
+      if (window.Monitor) (() => {})('created_skill_chip_open', { skill_id: sid });
+      setView('skills');
       // Pre-check SKILL.md is readable; covers both "skill was deleted" and
       // "skill row exists but its files are missing" (entering the detail
       // would render a 'file not found' shell otherwise).
@@ -2677,13 +3178,44 @@ function _showFileMissingToast(name) {
 function _hydrateMessageAttachmentThumbs(msgDiv, cid) {
   // Image chips have a thumb we want to enlarge via the lightbox; the rest
   // (pdf / office / text / video) get the same kind-aware viewer as produced
-  // chips. Video chips have inline <video> controls in the bubble already,
-  // so clicking the chip body shouldn't re-open the same playback — skip
-  // them. We rely on `_chatMediaUrl(cid, name)` having loaded the bytes for
+  // chips. Video chips have inline <video> controls in the bubble already;
+  // their explicit floating-player button opens the same file-backed preview
+  // as the conversation sidebar so the header actions stay consistent.
+  // We rely on `_chatMediaUrl(cid, name)` having loaded the bytes for
   // images so the lightbox can reuse the already-cached resource.
   const allChips = msgDiv.querySelectorAll('.chat-msg-attach');
   allChips.forEach((chip) => {
-    if (chip.classList.contains('is-video')) return;
+    if (chip.classList.contains('is-video')) {
+      const btn = chip.querySelector('[data-attach-video-open="1"]');
+      if (!btn || btn.dataset.bound === '1') return;
+      btn.dataset.bound = '1';
+      btn.addEventListener('click', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (typeof openChatFileViewer !== 'function') return;
+        const name = chip.dataset.attachName || (chip.querySelector('.chat-msg-attach-label')?.textContent || '').trim();
+        const chipCid = chip.dataset.attachCid || cid;
+        if (!name || !chipCid) return;
+        const video = chip.querySelector('video.chat-msg-attach-video');
+        const startTime = video && Number.isFinite(Number(video.currentTime)) ? Math.max(0, Number(video.currentTime) || 0) : 0;
+        try { if (video && typeof video.pause === 'function') video.pause(); } catch (_) {}
+        try { if (window.Monitor) (() => {})('chat_attachment_video_floating_open'); } catch (_) {}
+        try {
+          const res = await window.orkas.invoke('attachments.absPath', { cid: chipCid, name });
+          if (!res || !res.ok || !res.path) {
+            _convLog.warn('attachments.absPath video failed', { cid: chipCid, name, error: res && res.error });
+            _showFileMissingToast(name);
+            return;
+          }
+          openChatFileViewer(res.path, name, { cid: chipCid, autoplay: true, startTime });
+        } catch (err) {
+          _convLog.warn('attachments.absPath video threw', { cid: chipCid, name, error: String(err && err.message || err) });
+          _showFileMissingToast(name);
+        }
+      });
+      return;
+    }
+    if (chip.classList.contains('is-audio')) return;
     if (chip.classList.contains('is-image')) {
       const img = chip.querySelector('img.chat-msg-attach-thumb');
       if (!img) return;
@@ -2831,21 +3363,31 @@ function _initNewChatAttachInput() {
 
 // ─── Conversation list ───
 
+let _loadConversationsInFlight = null;
 async function loadConversations() {
-  try {
-    const res = await apiFetch('/api/conversations/list');
-    const data = await res.json();
-    if (data.ok) {
-      conversations = data.conversations || [];
-      renderConversationList();
-    }
-  } catch (e) {
-    _convLog.error('load conversations failed', e);
+  if (_loadConversationsInFlight) return _loadConversationsInFlight;
+  _loadConversationsInFlight = (async () => {
+    try {
+      const res = await apiFetch('/api/conversations/list');
+      const data = await res.json();
+      if (data.ok) {
+        conversations = data.conversations || [];
+        renderConversationList();
       }
+    } catch (e) {
+      _convLog.error('load conversations failed', e);
+      if (window.Monitor) (() => {})('load_conversations', { error_message: (e && e.message) || String(e) });
+    } finally {
+      _loadConversationsInFlight = null;
+    }
+  })();
+  return _loadConversationsInFlight;
 }
 
+// Open build: no remote-control activity channel.
 let _relayActivityWatchStarted = false;
 function startRelayActivitySubscription() {
+  if (_relayActivityWatchStarted) return;
   _relayActivityWatchStarted = true;
 }
 
@@ -3441,7 +3983,8 @@ function _ensureConvCreateAgentInline() {
     btn.textContent = t('chat.create_agent_inline');
     btn.addEventListener('click', () => {
       if (!currentCid) return;
-            const input = document.getElementById('chat-input');
+      if (window.Monitor) (() => {})('create_agent_from_chat', { cid: currentCid });
+      const input = document.getElementById('chat-input');
       if (!input) return;
       input.value = t('chat.create_agent_message');
       autoGrow(input, 200);
@@ -3503,11 +4046,7 @@ function _ensureCreateAgentInlineObserver() {
 async function loadConversationHistory(cid, opts = {}) {
   const container = document.getElementById('chat-history');
   const preserveScroll = opts && opts.preserveScroll === true;
-  const scrollSnapshot = preserveScroll
-    ? {
-        top: Number(container.scrollTop || 0),
-      }
-    : null;
+  const scrollSnapshot = preserveScroll ? _captureHistoryReloadScroll(container) : null;
   container.classList.remove('has-scroll-offset');
   if (!preserveScroll) {
     container.innerHTML = `<div class="empty">${escapeHtml(t('chat.loading'))}</div>`;
@@ -3606,7 +4145,7 @@ async function loadConversationHistory(cid, opts = {}) {
       pendingConvs.set(cid, { loadingEl, needsIndicator: false });
       if (hasActiveTurnsField) {
         for (const turn of activeTurns) {
-          _ensureActorPlaceholder(cid, turn.actor, loadingEl, turn.turn_id);
+          _ensureActorPlaceholder(cid, turn.actor, loadingEl, turn.turn_id, turn.msg_id);
         }
       } else {
         for (const actorId of inFlightActors) {
@@ -3643,7 +4182,7 @@ async function loadConversationHistory(cid, opts = {}) {
       }
       if (hasActiveTurnsField) {
         for (const turn of activeTurns) {
-          _ensureActorPlaceholder(cid, turn.actor, state.loadingEl, turn.turn_id);
+          _ensureActorPlaceholder(cid, turn.actor, state.loadingEl, turn.turn_id, turn.msg_id);
         }
       } else {
         for (const actorId of inFlightActors) {
@@ -3719,7 +4258,7 @@ function _scheduleHistoryReconcileAfterStream(cid, opts = {}) {
       const visible = data.history.filter((gm) => !(gm && gm.dispatch));
       for (const gm of visible.slice(-8)) {
         if (!gm || !gm.id) continue;
-        const el = container.querySelector(`.chat-message[data-msg-id="${CSS.escape(String(gm.id))}"]`);
+        const el = _findRenderedMessageForHistoryRecord(container, gm);
         if (!el || !_messageRecordHasMountedSidecars(gm, el)) {
           loadConversationHistory(cid, { preserveScroll: true });
           return;
@@ -3738,7 +4277,7 @@ async function _recoverPolledVisibleMessages(cid, rawMessages) {
   const visible = rawMessages.filter((gm) => gm && !gm.dispatch && gm.from !== 'user');
   for (const gm of visible) {
     if (!gm.id) continue;
-    const existing = container.querySelector(`.chat-message[data-msg-id="${CSS.escape(String(gm.id))}"]`);
+    const existing = _findRenderedMessageForHistoryRecord(container, gm);
     if (existing) {
       if (!_messageRecordHasMountedSidecars(gm, existing, { checkMutableState: false })) {
         loadConversationHistory(cid, { preserveScroll: true });
@@ -3769,10 +4308,13 @@ function _claimPersistedUserMessage(cid, gm) {
   const container = document.getElementById('chat-history');
   if (!container) return false;
   const existing = container.querySelector(`.chat-message[data-msg-id="${CSS.escape(String(gm.id))}"]`);
-  if (existing) return true;
+  if (existing) {
+    _moveUserBeforeOrphanLivePlaceholder(container, existing);
+    return true;
+  }
 
   const pairCandidates = Array.from(
-    container.querySelectorAll('.chat-message.user[data-conv-pair="1"]:not([data-msg-id])'),
+    container.querySelectorAll('.chat-message.user[data-conv-pair]:not([data-msg-id])'),
   );
   const fallbackCandidates = Array.from(
     container.querySelectorAll('.chat-message.user:not([data-msg-id])'),
@@ -3781,12 +4323,25 @@ function _claimPersistedUserMessage(cid, gm) {
     || fallbackCandidates[fallbackCandidates.length - 1];
   if (!target) return false;
 
-  target.dataset.msgId = String(gm.id);
-  target.dataset.fromActor = 'user';
-  if (gm.ts) target.dataset.ts = String(_msTs(gm.ts));
+  _syncRenderedGroupMessageIdentity(target, gm);
+  _moveUserBeforeOrphanLivePlaceholder(container, target);
   return true;
 }
 
+function _renderOrClaimPersistedUserMessage(cid, gm, opts = {}) {
+  if (!cid || cid !== currentCid || !gm || gm.from !== 'user') return false;
+  if (_claimPersistedUserMessage(cid, gm)) return true;
+  const bubble = appendChatMessage(_groupMsgToLegacy(gm), opts.autoScroll !== false, { cid, archive: true });
+  if (!bubble) return false;
+  bubble.dataset.fromActor = 'user';
+  if (gm.id) bubble.dataset.msgId = String(gm.id);
+  _syncRenderedGroupMessageIdentity(bubble, gm);
+  const container = document.getElementById('chat-history');
+  if (container) _moveUserBeforeOrphanLivePlaceholder(container, bubble);
+  return true;
+}
+
+// Render missing persisted user messages for the open conversation.
 async function _renderRelayUserMessagesIfMissing(cid) {
   if (!cid || cid !== currentCid) return;
   const container = document.getElementById('chat-history');
@@ -3801,12 +4356,7 @@ async function _renderRelayUserMessagesIfMissing(cid) {
   for (const gm of data.history) {
     if (!gm || gm.dispatch || gm.from !== 'user' || !gm.id) continue;
     if (container.querySelector(`.chat-message[data-msg-id="${CSS.escape(String(gm.id))}"]`)) continue;
-    if (_claimPersistedUserMessage(cid, gm)) continue;
-    const bubble = appendChatMessage(_groupMsgToLegacy(gm), true, { cid, archive: true });
-    if (bubble) {
-      bubble.dataset.fromActor = 'user';
-      bubble.dataset.msgId = String(gm.id);
-    }
+    _renderOrClaimPersistedUserMessage(cid, gm);
   }
 }
 
@@ -3828,18 +4378,42 @@ function _scrollToBottomNoAnim(container) {
   });
 }
 
+function _captureHistoryReloadScroll(container) {
+  if (!container) return null;
+  const top = Number(container.scrollTop || 0);
+  const scrollHeight = Number(container.scrollHeight || 0);
+  const clientHeight = Number(container.clientHeight || 0);
+  const maxTop = Math.max(0, scrollHeight - clientHeight);
+  return {
+    top,
+    bottom: Math.max(0, maxTop - top),
+    nearBottom: _isNearFollowTarget(container),
+  };
+}
+
+function _historyReloadTopForSnapshot(container, snapshot) {
+  if (!container || !snapshot) return 0;
+  const maxTop = Math.max(0, Number(container.scrollHeight || 0) - Number(container.clientHeight || 0));
+  if (snapshot.nearBottom) {
+    return Math.min(maxTop, Math.max(0, maxTop - Number(snapshot.bottom || 0)));
+  }
+  return Math.min(Math.max(0, Number(snapshot.top || 0)), maxTop);
+}
+
 function _restoreHistoryReloadScroll(container, snapshot) {
   if (!container || !snapshot) return;
-  const maxTop = Math.max(0, Number(container.scrollHeight || 0) - Number(container.clientHeight || 0));
-  const nextTop = Math.min(Math.max(0, Number(snapshot.top || 0)), maxTop);
   const prev = container.style.scrollBehavior;
   container.style.scrollBehavior = 'auto';
   _markProgrammaticStickyScroll(container);
-  container.scrollTop = nextTop;
+  container.scrollTop = _historyReloadTopForSnapshot(container, snapshot);
   container._stickyEnabled = _isNearFollowTarget(container);
   container._stickyUserPaused = !container._stickyEnabled;
   _bindStickToBottom(container);
   requestAnimationFrame(() => {
+    _markProgrammaticStickyScroll(container);
+    container.scrollTop = _historyReloadTopForSnapshot(container, snapshot);
+    container._stickyEnabled = _isNearFollowTarget(container);
+    container._stickyUserPaused = !container._stickyEnabled;
     container.style.scrollBehavior = prev || '';
   });
 }
@@ -4145,7 +4719,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
   const avatarHtml = role === 'user' ? '' : _renderActorAvatarHtml(headerActorId);
   const headerHtml = role === 'user'
     ? `<div class="chat-msg-header chat-msg-header-user"><span class="chat-msg-time">${formatTime(message.time || new Date().toISOString())}</span></div>`
-    : `<div class="chat-msg-header">${avatarHtml}<span class="chat-msg-from${_isAgentActor(headerActorId) ? ' is-agent-link' : ''}"${_actorLinkAttrs(headerActorId)}>${escapeHtml(headerName)}</span><span class="chat-msg-time">${formatTime(message.time || new Date().toISOString())}</span></div>`;
+    : `<div class="chat-msg-header">${avatarHtml}<span class="chat-msg-from${_isActorDetailTarget(headerActorId) ? ' is-agent-link' : ''}"${_actorLinkAttrs(headerActorId)}>${escapeHtml(headerName)}</span><span class="chat-msg-time">${formatTime(message.time || new Date().toISOString())}</span></div>`;
   const planAnnHtml = message._plan_announcement
     ? `<div class="chat-plan-announce">${_uiIconHtml('clipboard-list', 'ui-icon chat-plan-announce-icon')}<span>${escapeHtml(t('chat.plan_announce'))}</span></div>` : '';
   // Below-bubble action row holds produced-file chips + created-agent chip
@@ -4177,6 +4751,7 @@ function appendChatMessage(message, autoScroll = true, opts = {}) {
     msgDiv.dataset.produced = JSON.stringify(message.produced);
   }
   _insertByTimestamp(container, msgDiv);
+  if (role === 'user') _moveUserBeforeOrphanLivePlaceholder(container, msgDiv);
   if (!isHtmlSnippet && typeof typesetMath === 'function') {
     const md = msgDiv.querySelector('.markdown-body');
     if (md) typesetMath(md);
@@ -4746,7 +5321,7 @@ function _attachFailedAssistantActions(msgDiv, getContent) {
   _attachBubbleActions(msgDiv, getContent, {
     archive: false,
     retry: true,
-    report: false,
+    report: true,
   });
 }
 
@@ -4803,7 +5378,8 @@ function _attachBubbleActions(msgDiv, getContent, opts = {}) {
     _setQuote(currentCid, { fromActor, fromName, msgId, text, produced });
     const input = document.getElementById('chat-input');
     if (input) { input.focus(); }
-      });
+    if (window.Monitor) (() => {})('bubble_quote', { cid: currentCid, has_files: produced.length > 0 });
+  });
   copyBtn.addEventListener('click', async (e) => {
     e.stopPropagation();
     const text = typeof getContent === 'function' ? (getContent() || '') : '';
@@ -4883,9 +5459,59 @@ function _setReportButtonLoading(btn, loading) {
 }
 
 async function _reportFailedAssistantMessage(msgDiv, btn, getContent) {
-  void msgDiv;
-  void btn;
-  void getContent;
+  if (!msgDiv || !currentCid) return;
+  if (btn && btn.disabled) return;
+  if (!window.orkas || typeof window.orkas.invoke !== 'function') {
+    await uiAlert(t('chat.report_failed_with_reason', { reason: t('chat.unknown_error') }));
+    return;
+  }
+
+  const details = _failedAssistantFeedbackDetails(msgDiv, getContent);
+  const content = _buildFailedAssistantFeedbackContent(details, 300);
+  if (!content.trim()) return;
+
+  const startedAt = performance.now();
+  const originalHtml = btn ? btn.innerHTML : '';
+  _convLog.info('failed assistant report submit', {
+    cid: currentCid || '',
+    msgId: details.msgId || '',
+    actor: details.actor || '',
+    contentLength: content.length,
+  });
+  _convTrackClick('message_report', {
+    conversation_id: currentCid || '',
+    has_message_id: !!details.msgId,
+    content_length: content.length,
+  });
+  _setReportButtonLoading(btn, true);
+
+  try {
+    throw new Error(t('chat.unknown_error'));
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    const displayMessage = _feedbackSubmitDisplayMessage(err);
+    if (btn) {
+      btn.innerHTML = originalHtml || escapeHtml(t('chat.report_btn'));
+      btn.disabled = false;
+      btn.removeAttribute('aria-busy');
+    }
+    await uiAlert(displayMessage === t('chat.unknown_error')
+      ? displayMessage
+      : t('chat.report_failed_with_reason', { reason: displayMessage }));
+    _convTrackEvent('message_report_result', {
+      result: 'failure',
+      conversation_id: currentCid || '',
+      content_length: content.length,
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
+    _convTrackError('message_report', {
+      conversation_id: currentCid || '',
+      error_type: message === t('chat.report_login_required') ? 'auth' : 'unknown',
+      error_code: err && err.code != null ? err.code : undefined,
+      error_message: message,
+    });
+    _convLog.warn('failed assistant report submit failed', { error: message });
+  }
 }
 
 function _findUserMessageForRetry(msgDiv) {
@@ -4928,7 +5554,8 @@ async function _retryFailedAssistantMessage(msgDiv, btn) {
       await uiAlert(t('chat.retry_no_source'));
       return;
     }
-        if (btn) btn.textContent = t('chat.retry_running');
+    if (window.Monitor) (() => {})('bubble_retry', { cid: currentCid });
+    if (btn) btn.textContent = t('chat.retry_running');
     await sendInConversation(currentCid, payload.content, payload.extra);
   } finally {
     if (btn) {
@@ -4945,12 +5572,14 @@ async function handleNewChatSubmit() {
   const raw = (input.value || '').trim();
   if (!raw) return;
   if (!ensureModelConfigured()) return;
-  const useSelection = consumeChatUseSelection('new-chat');
+  const useSelections = (typeof consumeChatUseSelections === 'function')
+    ? consumeChatUseSelections('new-chat')
+    : [];
   // Snapshot the new-chat recipient *now* so a stray view-change between
   // here and conv-create doesn't reset it before we can transfer.
   const recipientSnapshot = _recipientSnapshotForSend('new-chat');
   _pendingNewChatRecipient = _normaliseRecipientSnapshot(recipientSnapshot) || { ..._COMMANDER };
-  const content = applyRecipientPrefix(transformWithChatUse(raw, useSelection), 'new-chat', {
+  const content = applyRecipientPrefix(transformWithChatUse(raw), 'new-chat', {
     recipientSnapshot,
   });
   const draftItems = _chatAttachList(DRAFT_CID);
@@ -4961,14 +5590,16 @@ async function handleNewChatSubmit() {
   const draftNames = draftItems.filter((a) => a.status !== 'error').map((a) => a.name);
   _convLog.info('new chat submit', {
     content_length: content.length,
-    use: useSelection ? useSelection.kind : null,
+    use: useSelections.map((sel) => sel.kind),
     attachments: draftNames.length,
   });
-
-  // Mirror the selected skill / connector onto the conversation input so
-  // subsequent messages in the same thread stay consistent until the user
-  // removes the chip.
-  if (useSelection) setChatUseSelection('conversation', useSelection);
+  if (window.Monitor) (() => {})('chat_send', {
+    source_view: 'new_chat',
+    content_length: content.length,
+    has_skill: useSelections.some((sel) => sel.kind === 'skill'),
+    has_connector: useSelections.some((sel) => sel.kind === 'connector'),
+    attachment_count: draftNames.length,
+  });
 
   const newBtn = document.getElementById('new-chat-send-btn');
   if (newBtn) newBtn.disabled = true;
@@ -4983,11 +5614,12 @@ async function handleNewChatSubmit() {
     if (!data.ok) throw new Error(data.error || t('chat.create_conv_failed'));
     const conv = data.conversation;
     convId = conv.conversation_id;
-    // Optimistic title from the user-visible text (raw, not the transformed form).
+    // Optimistic title from the user-visible text (without recipient routing).
     // Use the shared `_autoTitle` so this matches backend `autoTitle` —
     // otherwise the optimistic + backend-refreshed titles disagree and
     // the sidebar entry flips on the next loadConversations.
-    conv.title = _autoTitle(raw);
+    const titleSeed = (typeof transformChatUseTokens === 'function') ? transformChatUseTokens(raw) : raw;
+    conv.title = _autoTitle(titleSeed);
     // Backend `createConversation` returns `created_at`/`updated_at` but
     // NOT the derived `last_active_at` (that lives only in `listConversations`'
     // output). Set it explicitly so `timeBucket` puts the brand-new row in
@@ -5060,19 +5692,27 @@ async function handleChatSubmit() {
   if (!raw && !_getQuote(currentCid)) return;
   if (!ensureModelConfigured()) return;
   const cid = currentCid;
-  const useSelection = getChatUseSelection('conversation');
+  const useSelections = (typeof getChatUseSelections === 'function')
+    ? getChatUseSelections('conversation')
+    : [];
   const attachList = _chatAttachList(cid);
   if (attachList.some((a) => a.status === 'uploading')) {
     await uiAlert(t('chat.attach_still_uploading'));
     return;
   }
   const attachments = attachList.filter((a) => a.status !== 'error').map((a) => a.name);
-  _convLog.info('chat submit', { cid, length: raw.length, use: useSelection ? useSelection.kind : null, attachments: attachments.length });
+  _convLog.info('chat submit', { cid, length: raw.length, use: useSelections.map((sel) => sel.kind), attachments: attachments.length });
+  if (window.Monitor) (() => {})('chat_send', {
+    source_view: 'conversation',
+    content_length: raw.length,
+    has_skill: useSelections.some((sel) => sel.kind === 'skill'),
+    has_connector: useSelections.some((sel) => sel.kind === 'connector'),
+    attachment_count: attachments.length,
+  });
 
   // If this conversation is already streaming OR has queued items waiting,
-  // enqueue the new message instead of sending it now. Keep the raw text +
-  // selected skill / connector so the prefix is applied fresh when it's
-  // actually sent.
+  // enqueue the new message instead of sending it now. Keep the raw text so
+  // inline skill / connector tokens are expanded fresh when it is sent.
   // Quote is baked into the queued content here (rather than carried as a
   // sidecar field on the queue entry) — by the time the queue dispatches,
   // the user may have already cleared/replaced the quote in the preview;
@@ -5084,7 +5724,7 @@ async function handleChatSubmit() {
       await uiAlert(t('chat.attach_queue_blocked'));
       return;
     }
-    enqueueMessage(cid, applyQuotePrefix(raw, 'conversation'), useSelection, {
+    enqueueMessage(cid, applyQuotePrefix(raw, 'conversation'), null, {
       recipient: recipientSnapshot,
     });
     _clearQuote(cid);
@@ -5095,7 +5735,7 @@ async function handleChatSubmit() {
   }
 
   const content = applyRecipientPrefix(
-    applyQuotePrefix(transformWithChatUse(raw, useSelection), 'conversation'),
+    applyQuotePrefix(transformWithChatUse(raw), 'conversation'),
     'conversation',
     { recipientSnapshot },
   );
@@ -5122,6 +5762,8 @@ function _observerShouldDeferCleanup(cid, allowWithController) {
 }
 
 const _taskTurnRuns = new Map();
+const _TASK_TURN_PROCESS_MAX_ITEMS = 120;
+const _TASK_TURN_PROCESS_MAX_CHARS = 500;
 
 function _taskTurnRunId() {
   try {
@@ -5157,6 +5799,8 @@ function _taskTurnStart(cid, content, extra, startedAt) {
     skillNameById: {},
     toolNames: [],
     toolCallCount: 0,
+    processEvents: [],
+    processKeys: new Set(),
     attachmentNames: attachments,
     attachmentCount: attachments.length,
     errorMessage: '',
@@ -5218,6 +5862,28 @@ function _taskTurnAddTool(run, name) {
   if (!run.toolNames.includes(n)) run.toolNames.push(n);
 }
 
+function _taskTurnAddProcessLine(run, evData, lineText, evt) {
+  if (!run || !lineText || run.processEvents.length >= _TASK_TURN_PROCESS_MAX_ITEMS) return;
+  const text = _processLineText(lineText).replace(/\s+/g, ' ').trim();
+  if (!text) return;
+  const key = _groupEventDedupeKey(evData) || [
+    evData && evData.actor || '',
+    evt && evt.stream || '',
+    text.slice(0, 180),
+  ].join(':');
+  if (key && run.processKeys.has(key)) return;
+  if (key) run.processKeys.add(key);
+  const actor = String(evData && evData.actor || '').slice(0, 128);
+  run.processEvents.push({
+    index: run.processEvents.length,
+    actor: actor,
+    actor_name: _taskTurnAgentName(actor, run.cid),
+    kind: _eventProcessKind(evt, lineText) || _processKindOf(lineText) || '',
+    text: text.length > _TASK_TURN_PROCESS_MAX_CHARS ? text.slice(0, _TASK_TURN_PROCESS_MAX_CHARS - 1) + '…' : text,
+    created_at_ms: Date.now(),
+  });
+}
+
 function _taskTurnMessageKey(role, gm, fallbackText) {
   if (gm && gm.id) return `${role}:id:${gm.id}`;
   return `${role}:${gm && gm.from ? gm.from : ''}:${gm && gm.ts ? gm.ts : ''}:${String(fallbackText || '').slice(0, 120)}`;
@@ -5250,6 +5916,19 @@ function _taskTurnAddMessage(run, msg) {
 
 function _taskTurnRecordProcess(run, evData) {
   const processData = evData && evData.data ? evData.data : {};
+  let processLine = '';
+  let processEvt = null;
+  try {
+    if (processData.type === 'progress' && processData.text) {
+      processLine = String(processData.text || '');
+    } else if (processData.type === 'event' && processData.event) {
+      processEvt = processData.event;
+      processLine = processEvt.stream === 'command_output' ? '' : (_formatEventLine(processEvt) || '');
+    }
+  } catch (_) {
+    processLine = '';
+  }
+  if (processLine) _taskTurnAddProcessLine(run, evData, processLine, processEvt);
   const payload = processData && processData.event && typeof processData.event === 'object'
     ? processData.event
     : processData;
@@ -5346,10 +6025,21 @@ function _taskTurnFinish(cid, opts = {}) {
   void opts;
 }
 
-function _makeConvChatController(cid) {
+function _notifyAgentRunFinished(agentId, payload = {}) {
+  const id = String(agentId || '');
+  if (!id || typeof window === 'undefined') return;
+  try {
+    window.dispatchEvent(new CustomEvent('orkas-agent-run-finished', {
+      detail: { agent_id: id, ...payload },
+    }));
+  } catch (_) {}
+}
+
+function _makeConvChatController(cid, options = {}) {
   // Captured into the hooks below so we can compare identity before deleting
   // — see onDone for why.
   let self = null;
+  let activePairId = '';
   const ctrl = createChatController({
     historyEl: 'chat-history',
     inputEl: 'chat-input',
@@ -5365,8 +6055,11 @@ function _makeConvChatController(cid) {
     },
     hooks: {
       onUserAppended(userMsgEl, _content, _id) {
-        // Remember the pair so the stream-end logic can re-pin it.
-        userMsgEl.dataset.convPair = '1';
+        // Remember the pair so server timestamp reconciliation can keep the
+        // user bubble above its own live placeholder even if the persisted
+        // user timestamp lands a few milliseconds later than the placeholder.
+        activePairId = `send-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        userMsgEl.dataset.convPair = activePairId;
       },
       onAssistantStart(msgEl, id) {
         // New send → drop any stale per-actor placeholders left over from a
@@ -5386,6 +6079,7 @@ function _makeConvChatController(cid) {
           controller: { abort: () => _convChatCtrls.get(id)?.abort() },
           aborted: false,
         });
+        if (activePairId) msgEl.dataset.convPair = activePairId;
         _lastGroupWorkEventAt.set(id, Date.now());
         _groupEventDedupe.delete(id);
         _updateConvSendUI(id);
@@ -5428,6 +6122,9 @@ function _makeConvChatController(cid) {
         // `onAbort`, which assigns a new controller into `_convChatCtrls`
         // before this finally block runs — we must not stomp on it.
         if (_convChatCtrls.get(id) === self) _convChatCtrls.delete(id);
+        if (typeof options.onDone === 'function') {
+          try { options.onDone(result); } catch (_) {}
+        }
       },
     },
   });
@@ -5435,12 +6132,24 @@ function _makeConvChatController(cid) {
   return ctrl;
 }
 
-async function sendInConversation(cid, content, extra) {
+async function sendInConversation(cid, content, extra, options = {}) {
   if (!cid) return;
+  const startedAt = performance.now();
+  const sendOptions = options && typeof options === 'object' ? options : {};
+  const statAgentId = String(sendOptions.agent_id || '');
+  let doneResult = null;
+  const attachmentCount = Array.isArray(extra && extra.attachments) ? extra.attachments.length : 0;
   if (isConvPending(cid)) {
     // Queued input starts a new execution stream after the current one ends,
     // so it must not be merged into the active task-turn sample.
     enqueueMessage(cid, content, '', { direct: true, extra });
+    if (window.Monitor) (() => {})('chat_send_result', {
+      result: 'queued',
+      conversation_id: cid,
+      content_length: String(content || '').length,
+      attachment_count: attachmentCount,
+      duration_ms: 0,
+    });
     return;
   }
 
@@ -5448,13 +6157,60 @@ async function sendInConversation(cid, content, extra) {
   // appending it here would land *before* userMsg/asstMsg in DOM order,
   // padding the top instead of the bottom and defeating the pin.
 
-  const ctrl = _makeConvChatController(cid);
+  const ctrl = _makeConvChatController(cid, {
+    onDone(result = {}) {
+      doneResult = result || {};
+      if (typeof sendOptions.onDone === 'function') {
+        try { sendOptions.onDone(doneResult); } catch (_) {}
+      }
+    },
+  });
   _convChatCtrls.set(cid, ctrl);
   _taskTurnStart(cid, content, extra, Date.now());
   try {
     await ctrl.send(content, extra);
+    const durationMs = Math.round(performance.now() - startedAt);
+    if (statAgentId && doneResult) {
+      const aborted = !!doneResult.aborted;
+      const errored = !!doneResult.errored;
+      _notifyAgentRunFinished(statAgentId, {
+        duration_ms: durationMs,
+        aborted,
+        errored,
+        success: !aborted && !errored,
+      });
+    }
+    if (window.Monitor) (() => {})('chat_send_result', {
+      result: 'success',
+      conversation_id: cid,
+      content_length: String(content || '').length,
+      attachment_count: attachmentCount,
+      duration_ms: durationMs,
+    });
   } catch (err) {
-        _taskTurnFinish(cid, {
+    const durationMs = Math.round(performance.now() - startedAt);
+    if (statAgentId) {
+      _notifyAgentRunFinished(statAgentId, {
+        duration_ms: durationMs,
+        errored: true,
+        success: false,
+      });
+    }
+    if (window.Monitor) {
+      (() => {})('chat_send_result', {
+        result: 'failure',
+        conversation_id: cid,
+        content_length: String(content || '').length,
+        attachment_count: attachmentCount,
+        duration_ms: durationMs,
+      });
+      (() => {})('chat_send', {
+        conversation_id: cid,
+        error_type: 'stream',
+        error_message: err && err.message ? err.message : String(err),
+      });
+    }
+    _taskTurnFinish(cid, {
       errored: true,
       error: err && err.message ? err.message : String(err),
     });
@@ -5462,8 +6218,15 @@ async function sendInConversation(cid, content, extra) {
   }
 }
 
-async function sendInCurrentConversation(content, extra) {
-  return sendInConversation(currentCid, content, extra);
+async function sendInCurrentConversation(content, extra, options = {}) {
+  const sendOptions = options && typeof options === 'object' ? { ...options } : {};
+  if (!sendOptions.agent_id) {
+    try {
+      const recipient = getChatRecipient('conversation');
+      if (recipient && recipient.kind === 'agent' && recipient.id) sendOptions.agent_id = recipient.id;
+    } catch (_) {}
+  }
+  return sendInConversation(currentCid, content, extra, sendOptions);
 }
 
 function _removeEmptyStreamingPlaceholder(ph) {
@@ -5896,6 +6659,72 @@ function _isTimestampPositionCorrect(container, msg) {
   return prevOk && nextOk;
 }
 
+function _isChatMessageEl(el) {
+  return !!(el && el.classList && el.classList.contains('chat-message'));
+}
+
+function _hasChatMessageClass(el, cls) {
+  return !!(_isChatMessageEl(el) && el.classList.contains(cls));
+}
+
+function _previousChatMessage(el) {
+  let prev = el ? el.previousElementSibling : null;
+  while (prev && !_isChatMessageEl(prev)) prev = prev.previousElementSibling;
+  return prev || null;
+}
+
+function _isLivePlaceholderMessage(el) {
+  return _hasChatMessageClass(el, 'assistant')
+    && el?.dataset?.placeholder === '1'
+    && el.dataset.finalized !== '1';
+}
+
+function _placeholderBlockHasTriggerUser(firstPlaceholder) {
+  for (let prev = _previousChatMessage(firstPlaceholder); prev; prev = _previousChatMessage(prev)) {
+    if (_hasChatMessageClass(prev, 'user')) return true;
+    if (_hasChatMessageClass(prev, 'assistant') && !_isLivePlaceholderMessage(prev)) return false;
+  }
+  return false;
+}
+
+// A relay/recovery path can learn "someone is thinking" before the matching
+// user message is rendered. If that placeholder has no user trigger between
+// it and the previous finalized assistant reply, put the late user bubble
+// back where the transcript naturally reads.
+function _moveUserBeforeOrphanLivePlaceholder(container, userEl) {
+  if (!container || !userEl || userEl.parentElement !== container || !_hasChatMessageClass(userEl, 'user')) {
+    return false;
+  }
+  const prev = _previousChatMessage(userEl);
+  if (!_isLivePlaceholderMessage(prev)) return false;
+  let firstPlaceholder = prev;
+  for (let p = _previousChatMessage(firstPlaceholder); _isLivePlaceholderMessage(p); p = _previousChatMessage(firstPlaceholder)) {
+    firstPlaceholder = p;
+  }
+  const userPair = String(userEl.dataset.convPair || '');
+  const userMsgId = String(userEl.dataset.msgId || '');
+  const placeholderBlock = [];
+  for (let p = prev; _isLivePlaceholderMessage(p); p = _previousChatMessage(p)) {
+    placeholderBlock.unshift(p);
+  }
+  const sameOptimisticPair = !!userPair && placeholderBlock.some((ph) => userPair === String(ph.dataset.convPair || ''));
+  if (sameOptimisticPair) {
+    container.insertBefore(userEl, firstPlaceholder);
+    return true;
+  }
+  const sameTriggerMsg = !!userMsgId && placeholderBlock.some((ph) => userMsgId === String(ph.dataset.triggerMsgId || ''));
+  if (sameTriggerMsg) {
+    container.insertBefore(userEl, firstPlaceholder);
+    return true;
+  }
+  if (_placeholderBlockHasTriggerUser(firstPlaceholder)) return false;
+  const userTs = Number(userEl.dataset.ts || 0);
+  const placeholderTs = Number(firstPlaceholder.dataset.ts || 0);
+  if (Number.isFinite(userTs) && Number.isFinite(placeholderTs) && userTs > placeholderTs) return false;
+  container.insertBefore(userEl, firstPlaceholder);
+  return true;
+}
+
 /** Convert various ts representations (ISO string, numeric ms, undefined)
  *  to ms-since-epoch for sortable comparison. Falls back to `Date.now()`
  *  so a missing ts pins the bubble at the moment of creation rather than
@@ -5957,6 +6786,7 @@ function _createStreamingAssistantMessage(container, opts = {}) {
     </div>
   `;
   msg.dataset.placeholder = '1';
+  _stampPlaceholderTriggerMsg(msg, opts.triggerMsgId);
   if (opts.hiddenUntilActor) {
     msg.dataset.identityPending = '1';
     msg.style.display = 'none';
@@ -6845,7 +7675,7 @@ function createChatController(config) {
             if (ev.type === 'final' && hooks.onFinal) hooks.onFinal(ev, msgEl, id);
             if (ev.type === 'error') {
               pending.errored = true;
-              _noteModelOutputIssue(id, msgEl, ev.text, {
+              _handleModelOutputErrorForUi(id, msgEl, ev.text, {
                 stage: 'stream_event',
                 error_type: ev.aborted ? 'abort' : 'model_output',
                 aborted: !!ev.aborted,
@@ -6869,7 +7699,7 @@ function createChatController(config) {
       } else {
         _streamingSetError(msgEl, err.message || String(err));
         pending.errored = true;
-        _noteModelOutputIssue(id, msgEl, err.message || String(err), {
+        _handleModelOutputErrorForUi(id, msgEl, err.message || String(err), {
           stage: 'stream_request',
           error_type: 'stream',
         });
@@ -7020,7 +7850,7 @@ function _handleStreamEvent(cid, msg, ev, { archive = false } = {}) {
     }
   } else if (ev.type === 'error') {
     _streamingSetError(msg, ev.text);
-    _noteModelOutputIssue(cid, msg, ev.text, {
+    _handleModelOutputErrorForUi(cid, msg, ev.text, {
       stage: 'stream_event',
       error_type: ev.aborted ? 'abort' : 'model_output',
       aborted: !!ev.aborted,
@@ -7050,8 +7880,14 @@ function _normaliseActiveTurns(raw) {
     .map((t) => ({
       actor: String(t?.actor || t?.actor_id || ''),
       turn_id: _normaliseTurnId(t?.turn_id || t?.turnId),
+      msg_id: _normaliseTurnId(t?.msg_id || t?.msgId || t?.source_msg_id || t?.sourceMsgId),
     }))
     .filter((t) => t.actor && t.turn_id);
+}
+
+function _stampPlaceholderTriggerMsg(ph, msgId) {
+  const id = _normaliseTurnId(msgId);
+  if (ph && id) ph.dataset.triggerMsgId = id;
 }
 
 function _knownGroupActorLabel(cid, actorId) {
@@ -7104,12 +7940,16 @@ function _refreshActorPlaceholders(cid, actorId) {
   }
 }
 
-function _ensureActorPlaceholder(cid, actorId, fallbackPh, turnId) {
+function _ensureActorPlaceholder(cid, actorId, fallbackPh, turnId, triggerMsgId) {
   const tid = _normaliseTurnId(turnId);
+  const sourceMsgId = _normaliseTurnId(triggerMsgId);
   const k = _phKey(cid, actorId, tid);
   const allowFallback = !!actorId && actorId !== 'commander';
   let ph = _groupPlaceholders.get(k);
-  if (ph && ph.parentElement) return ph;
+  if (ph && ph.parentElement) {
+    _stampPlaceholderTriggerMsg(ph, sourceMsgId);
+    return ph;
+  }
 
   if (tid) {
     const legacyK = _phKey(cid, actorId);
@@ -7118,6 +7958,7 @@ function _ensureActorPlaceholder(cid, actorId, fallbackPh, turnId) {
         && (!legacyPh.dataset.turnId || legacyPh.dataset.turnId === tid)) {
       _groupPlaceholders.delete(legacyK);
       legacyPh.dataset.turnId = tid;
+      _stampPlaceholderTriggerMsg(legacyPh, sourceMsgId);
       _setPlaceholderActor(legacyPh, actorId, { cid, allowFallback });
       _groupPlaceholders.set(k, legacyPh);
       return legacyPh;
@@ -7137,6 +7978,7 @@ function _ensureActorPlaceholder(cid, actorId, fallbackPh, turnId) {
       && (!fallbackPh.dataset.fromActor || fallbackPh.dataset.fromActor === actorId)
       && (!fallbackPh.dataset.turnId || !tid || fallbackPh.dataset.turnId === tid)) {
     if (tid) fallbackPh.dataset.turnId = tid;
+    _stampPlaceholderTriggerMsg(fallbackPh, sourceMsgId);
     _setPlaceholderActor(fallbackPh, actorId, { cid, allowFallback });
     _groupPlaceholders.set(k, fallbackPh);
     return fallbackPh;
@@ -7155,7 +7997,7 @@ function _ensureActorPlaceholder(cid, actorId, fallbackPh, turnId) {
     const floor = _serverFloorByCid.get(cid) || '';
     if (floor && floor !== 'commander' && floor !== 'user') return null;
   }
-  ph = _createStreamingAssistantMessage(container, { hiddenUntilActor: true });
+  ph = _createStreamingAssistantMessage(container, { hiddenUntilActor: true, triggerMsgId: sourceMsgId });
   if (tid) ph.dataset.turnId = tid;
   _setPlaceholderActor(ph, actorId, { cid, allowFallback });
   _groupPlaceholders.set(k, ph);
@@ -7260,7 +8102,7 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
   _streamingSetFinal(ph, text, { archive: archive && !failedAssistant });
   if (failedAssistant) {
     _attachFailedAssistantActions(ph, () => _messageTextForActions(ph, text));
-    _noteModelOutputIssue(cid, ph, _failedAssistantErrorText(ph) || text, {
+    _handleModelOutputErrorForUi(cid, ph, _failedAssistantErrorText(ph) || text, {
       stage: 'actor_final',
       error_type: 'model_output',
     });
@@ -7416,7 +8258,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     // the write, so history reconciliation can prove the DOM matches jsonl
     // instead of forcing a late reload.
     if (gm.from === 'user') {
-      _claimPersistedUserMessage(cid, gm);
+      _renderOrClaimPersistedUserMessage(cid, gm);
       return;
     }
     // Internal plan-step dispatch (commander → agent) — agent slice gets
@@ -7594,7 +8436,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
     setGroupConversationBusy(cid, st.status === 'running' || inFlight.length > 0 || activeTurns.length > 0);
     if (hasActiveTurnsField) {
       for (const turn of activeTurns) {
-        _ensureActorPlaceholder(cid, turn.actor, streamingMsg, turn.turn_id);
+        _ensureActorPlaceholder(cid, turn.actor, streamingMsg, turn.turn_id, turn.msg_id);
       }
     } else if (inFlight.length) {
       for (const actorId of inFlight) {
@@ -8371,7 +9213,7 @@ function _resolveConvReply(cid, text, isError) {
       }
     } else {
       _attachFailedAssistantActions(el, () => _messageTextForActions(el, text));
-      _noteModelOutputIssue(cid, el, text, {
+      _handleModelOutputErrorForUi(cid, el, text, {
         stage: 'pending_reply',
         error_type: 'model_output',
       });

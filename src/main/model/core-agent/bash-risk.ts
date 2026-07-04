@@ -1,21 +1,17 @@
 /**
- * Risk classifier for the `bash` tool, used by the `risk_prompt` execution
- * mode (features/permissions.ts). It answers ONE question: "does this command
+ * Risk classifier for the `bash` tool, used by access modes that require
+ * sensitive-operation approval (features/permissions.ts). It answers ONE question: "does this command
  * warrant a user confirmation before running?"
  *
- * Design principle — match only the *genuinely dangerous subset* of each
- * category, never a broad keyword. This runs on a default-on surface, so a
- * false positive (prompting on a routine `npm ci` / `rm -rf build`) is a
- * worse product outcome than the occasional miss, which other layers
- * (path-sandbox on write/edit/delete, delete-confirm, OS-level TCC on macOS)
- * still backstop. We deliberately stay conservative about what we flag.
+ * Design principle — match command structure, not broad keywords. This runs on
+ * a default-on surface, so we avoid text-only matches that would flag routine
+ * commands like `npm rm`; however, actual shell delete commands are sensitive
+ * because they mutate disk state directly.
  *
  * Four categories (see Common/docs/plans/agent-bash-risk-prompt.md §1):
  *   - network_egress  — UPLOAD / exfil shapes only; plain downloads pass.
- *   - destructive     — recursive delete OUTSIDE the workspace (absolute /
- *                       home / root / glob / variable), plus dd / mkfs /
- *                       writes to raw devices / fork bombs. In-workspace
- *                       recursive deletes (`rm -rf build`) pass.
+ *   - destructive     — shell delete commands (`rm`, `rmdir`, `unlink`), plus
+ *                       dd / mkfs / writes to raw devices / fork bombs.
  *   - priv_esc        — sudo / su / doas / pkexec.
  *   - sensitive_path  — credential & key files (any access), persistence /
  *                       autostart locations (writes), /etc writes. Excludes
@@ -195,6 +191,17 @@ function effectiveCommand(words: string[]): { cmd: string; args: string[] } | nu
 
 function isFlag(w: string): boolean { return w.startsWith('-'); }
 
+function commandOperands(args: string[]): string[] {
+  const out: string[] = [];
+  let endOfFlags = false;
+  for (const a of args) {
+    if (!endOfFlags && a === '--') { endOfFlags = true; continue; }
+    if (!endOfFlags && isFlag(a)) continue;
+    out.push(a);
+  }
+  return out;
+}
+
 // ── Category matchers ────────────────────────────────────────────────────────
 
 const PRIV_ESC_CMDS = new Set(['sudo', 'su', 'doas', 'pkexec']);
@@ -252,27 +259,20 @@ function matchPipeToShell(seg: Segment): boolean {
 
 const RAW_DEVICE_RE = /^\/dev\/(sd|hd|nvme|disk|rdisk|mapper)/i;
 
-function isDangerousRmTarget(t: string): boolean {
-  if (isFlag(t)) return false;
-  if (!t) return false;
-  if (t.includes('$')) return true;                 // variable expansion
-  if (t.startsWith('~')) return true;               // home
-  if (t.startsWith('/')) return true;               // absolute (outside cwd)
-  if (t === '.' || t === '..' || t === '*' || t === '.*') return true;
-  if (t.startsWith('../') || t.includes('/../')) return true; // escapes cwd
-  if (/(^|\/)\*/.test(t)) return true;              // glob at a path root, e.g. "*/"
-  return false;                                     // plain relative path in cwd
-}
-
 function hasRecursiveFlag(args: string[]): boolean {
   return args.some((a) => a === '--recursive' || (/^-[A-Za-z]+$/.test(a) && /[rR]/.test(a)));
 }
 
 function matchDestructive(cmd: string, args: string[], seg: Segment): boolean {
-  if (cmd === 'rm' && hasRecursiveFlag(args)) {
-    const targets = args.filter((a) => !isFlag(a));
-    if (targets.some(isDangerousRmTarget)) return true;
-    if (!targets.length) return true; // `rm -rf` with no clear target / glob removed by shell
+  if (cmd === 'rm') {
+    if (args.some((a) => a === '--help' || a === '--version')) return false;
+    const targets = commandOperands(args);
+    if (targets.length) return true;
+    if (hasRecursiveFlag(args)) return true; // `rm -rf` with no clear target / glob removed by shell
+  }
+  if (cmd === 'rmdir' || cmd === 'unlink') {
+    if (args.some((a) => a === '--help' || a === '--version')) return false;
+    if (commandOperands(args).length) return true;
   }
   if (cmd === 'dd') return true;
   if (/^mkfs/.test(cmd)) return true;

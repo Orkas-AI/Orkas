@@ -12,16 +12,11 @@ vi.mock('electron', () => ({
   shell: { openExternal: electronMock.openExternal },
 }));
 
-vi.mock('../../../../src/main/features/account/token_store', () => ({
-  getDeviceId: () => 'dev-1',
-  authHeaders: () => ({ user_id: 'uid-1', session_id: 'sid-1' }),
-}));
-
 vi.mock('../../../../src/main/features/connectors/_server_bridge', () => ({
-  accountApiBase: () => 'https://orkas.ai/api',
+  accountApiBase: () => 'http://account.example/api',
   tokenStore: {
     getDeviceId: () => 'dev-1',
-    authHeaders: () => ({}),
+    authHeaders: () => ({ user_id: 'uid-1', session_id: 'sid-1' }),
   },
 }));
 
@@ -56,6 +51,16 @@ function githubEntry() {
     display_name: 'GitHub',
     auth_mode: 'server_bridge',
     oauth: { provider_id: 'github' },
+    transport_template: null,
+  } as any;
+}
+
+function bingEntry() {
+  return {
+    id: 'bing-webmaster',
+    display_name: 'Bing Webmaster Tools',
+    auth_mode: 'server_bridge',
+    oauth: { provider_id: 'bing' },
     transport_template: null,
   } as any;
 }
@@ -126,7 +131,7 @@ describe('connector OAuth GitHub server-managed grants', () => {
     expect(body.refresh_token).toBe('ghr-old');
     expect(body.access_token).toBe('ghu-old');
     expect(body.grant_id).toBeUndefined();
-    expect((init.headers as Record<string, string>).user_id).toBeUndefined();
+    expect((init.headers as Record<string, string>).user_id).toBe('uid-1');
   });
 
   it('does not call the server when an existing server-managed GitHub token is fresh', async () => {
@@ -181,5 +186,25 @@ describe('connector OAuth GitHub server-managed grants', () => {
     const body = JSON.parse(String(init.body));
     expect(body.grant_id).toBe('grant-1');
     expect(body.force_refresh).toBe(true);
+  });
+
+  it('does not call the server when an existing server-managed Bing token is fresh', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    const grant = {
+      access_token: 'bing-fresh',
+      refresh_token: null,
+      server_managed: true,
+      server_grant_id: 'grant-bing',
+      expires_at: Date.now() + 60 * 60 * 1000,
+      scopes: ['webmaster.read'],
+      token_type: 'Bearer',
+    };
+    const { refreshIfStale } = await import('../../../../src/main/features/connectors/oauth');
+    const next = await refreshIfStale('uid-1', bingEntry(), grant);
+
+    expect(next).toBe(grant);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

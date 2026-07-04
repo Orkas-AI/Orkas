@@ -72,7 +72,7 @@ describe('logger › redact', () => {
     expect(out.note).toBe('contact a***@example.com phone 138****8000');
     expect(out.absPath).toContain('<abs-path:');
     expect(out.relPath).toContain('<cloud-path:');
-    expect(JSON.stringify(out)).not.toContain('/Users/test');
+    expect(JSON.stringify(out)).not.toContain('/Users/alice');
     expect(JSON.stringify(out)).not.toContain('customer-plan.md');
     expect(out.user_id).toBe('ABCD...7890');
     expect(out.session_id).toBe('***REDACTED***');

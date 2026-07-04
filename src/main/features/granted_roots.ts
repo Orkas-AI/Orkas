@@ -50,7 +50,7 @@ function read(uid: string): StoreFile {
         }));
       return { version: 1, roots };
     }
-  } catch { /* missing / corrupt → empty */ }
+  } catch { /* missing / corrupt -> empty */ }
   return { version: 1, roots: [] };
 }
 
@@ -62,14 +62,10 @@ function write(uid: string, store: StoreFile): void {
   fs.renameSync(tmp, p);
 }
 
-/** realpath when the path exists, else the literal — so deny-list roots
- *  compare on the same canonical footing as the candidate (macOS tmp/home
- *  resolve through /private symlinks). */
 function _canon(p: string): string {
   try { return fs.realpathSync(p); } catch { return p; }
 }
 
-/** Reason code when a path may not be granted (null = grantable). */
 export function denyReason(dir: string): string | null {
   const real = _canon(dir);
   const home = _canon(os.homedir());
@@ -90,11 +86,6 @@ export function denyReason(dir: string): string | null {
     path.join(home, '.claude'),
     path.join(home, '.codex'),
   ];
-  // POSIX system dirs. `/var` and `/private/var` are deliberately NOT here:
-  // the macOS tmpdir realpaths into `/private/var/folders/...`, and blocking
-  // all of /var would forbid legitimate scratch dirs. The dangerous targets
-  // are the binary/config trees below; `/usr/local` (brew, user installs)
-  // stays grantable via the exception.
   const sys = process.platform === 'win32'
     ? ['C:\\Windows', 'C:\\Program Files', 'C:\\Program Files (x86)']
     : ['/System', '/etc', '/usr', '/bin', '/sbin'];
@@ -106,9 +97,6 @@ export function denyReason(dir: string): string | null {
   return null;
 }
 
-/** Resolved, existing granted roots for the sandbox `extraRoots`. Skips
- *  entries that no longer pass the deny-list (rules tightened since the
- *  grant) or no longer exist. */
 export function grantedRootsForSandbox(uid: string): string[] {
   const out: string[] = [];
   for (const entry of read(uid).roots) {
@@ -134,8 +122,6 @@ export class GrantedRootError extends Error {
   constructor(code: string) { super(code); this.code = code; }
 }
 
-/** Grant a directory. Throws GrantedRootError(code) on deny-list hit or a
- *  non-directory path. Idempotent on an already-granted realpath. */
 export function grantRoot(uid: string, dir: string): GrantedRootRow {
   if (typeof dir !== 'string' || !dir.trim()) throw new GrantedRootError('E_PATH');
   let real: string;

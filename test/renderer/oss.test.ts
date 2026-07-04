@@ -63,9 +63,9 @@ function loadOss(opts: LoadOpts = {}) {
     getLang: () => opts.lang || 'zh',
     pickLocalizedName: (c: any) => c?.name_zh || c?.name_en || c?.code || '',
     t: (key: string) => {
-      if (key === 'oss.prompt') return 'Use {name} ({url}) to help me with: [describe your task here]. Install from {url} if {name} is not present.';
+      if (key === 'oss.prompt') return 'Use {name} ({url}) to help me with: [describe your task here]. If {name} is already installed locally, use it directly; otherwise install it from {url} as local external package {id} first, then run the task.';
       if (key === 'oss.office_prompt') return 'OfficeCLI is built in. Use built-in Office tools for: [describe your task here].';
-      if (key === 'oss.install_prompt') return 'Please install the open-source project {name} ({url}) for me.';
+      if (key === 'oss.install_prompt') return 'Please install the open-source project {name} ({url}) as local external package {id}. Once it is installed, briefly tell me what it can do.';
       if (key === 'oss.office_install_prompt') return 'OfficeCLI is already built in as Office tools. Briefly explain what it can do.';
       return key;
     },
@@ -151,7 +151,7 @@ describe('oss.js', () => {
         if (channel === 'marketplace.getListingsCache') {
           return {
             entries: {
-              'project|home|||': { items: [cachedProject], categories: [], total: 1, ts: Date.now() },
+              'project|2|home|||': { items: [cachedProject], categories: [], total: 1, ts: Date.now() },
             },
           };
         }
@@ -174,6 +174,37 @@ describe('oss.js', () => {
     expect(c.projects.map((p: any) => p.id)).toEqual(['fresh']);
   });
 
+  it('loadOssCatalog ignores legacy project cache keys after a catalog key bump', async () => {
+    const legacyProject = { id: 'legacy', name: 'Legacy', task_zh: '旧', task_en: 'old', category: 'anim', driver: 'cli' };
+    const bundledProject = { id: 'Lark-CLI', name: 'Lark-CLI', task_zh: '飞书', task_en: 'Lark', category: 'office', driver: 'cli' };
+    const { context, invokeCalls } = loadOss({
+      invoke: async (channel) => {
+        if (channel === 'marketplace.getListingsCache') {
+          return {
+            entries: {
+              'project|home|||': { items: [legacyProject], categories: [], total: 1, ts: Date.now() },
+            },
+          };
+        }
+        if (channel === 'marketplace.mergeListingsCache') return { ok: true };
+        return {
+          source: 'bundled',
+          stale: true,
+          list: [bundledProject],
+          categories: [{ code: 'office', name_zh: '办公', name_en: 'Office' }],
+          total: 1,
+        };
+      },
+    });
+
+    const data = await context.loadOssCatalog({ homeOnly: true, revalidate: false });
+
+    expect(data.projects.map((p: any) => p.id)).toEqual(['Lark-CLI']);
+    const listCalls = invokeCalls.filter((c) => c.channel === 'marketplace.listProjects');
+    expect(listCalls).toHaveLength(1);
+    expect(listCalls[0].payload).toEqual({ home_only: true, local_only: true });
+  });
+
   it('loadOssCatalog stores bundled fallback as stale cache', async () => {
     const { context, invokeCalls } = loadOss({
       invoke: async (channel) => {
@@ -192,7 +223,7 @@ describe('oss.js', () => {
     await context.loadOssCatalog({ homeOnly: true });
 
     const merge = invokeCalls.find((c) => c.channel === 'marketplace.mergeListingsCache');
-    expect(merge?.payload.entries['project|home|||'].ts).toBe(0);
+    expect(merge?.payload.entries['project|2|home|||'].ts).toBe(0);
   });
 
   it('loadOssCatalog does not replace real cache with bundled fallback', async () => {
@@ -202,7 +233,7 @@ describe('oss.js', () => {
         if (channel === 'marketplace.getListingsCache') {
           return {
             entries: {
-              'project|home|||': { items: [cachedProject], categories: [], total: 1, ts: Date.now() },
+              'project|2|home|||': { items: [cachedProject], categories: [], total: 1, ts: Date.now() },
             },
           };
         }
@@ -236,7 +267,7 @@ describe('oss.js', () => {
         if (channel === 'marketplace.getListingsCache') {
           return {
             entries: {
-              'project|home|||': { items: [cachedProject], categories: [], total: 1, ts: Date.now() },
+              'project|2|home|||': { items: [cachedProject], categories: [], total: 1, ts: Date.now() },
             },
           };
         }
@@ -272,7 +303,7 @@ describe('oss.js', () => {
         if (channel === 'marketplace.getListingsCache') {
           return {
             entries: {
-              'project|home|||': { items: [cachedProject], categories: [], total: 1, ts: Date.now() },
+              'project|2|home|||': { items: [cachedProject], categories: [], total: 1, ts: Date.now() },
             },
           };
         }
@@ -324,9 +355,11 @@ describe('oss.js', () => {
 
   it('ossPromptFor names the project + url and leaves the task blank', () => {
     const { context } = loadOss();
-    const prompt = context.ossPromptFor({ name: 'PPT-Master', repo: 'hugohe3/ppt-master' });
+    const prompt = context.ossPromptFor({ id: 'pkg-id', name: 'PPT-Master', repo: 'hugohe3/ppt-master' });
     expect(prompt).toContain('PPT-Master');
     expect(prompt).toContain('https://github.com/hugohe3/ppt-master');
+    expect(prompt).toContain('pkg-id');
+    expect(prompt).not.toContain('verification code');
     expect(prompt).toMatch(/\[[^\]]+\]/); // a blank task placeholder remains
   });
 
@@ -343,11 +376,36 @@ describe('oss.js', () => {
 
   it('ossInstallPromptFor is an install request with no blank task slot', () => {
     const { context } = loadOss();
-    const prompt = context.ossInstallPromptFor({ name: 'PPT-Master', repo: 'hugohe3/ppt-master' });
+    const prompt = context.ossInstallPromptFor({ id: 'pkg-id', name: 'PPT-Master', repo: 'hugohe3/ppt-master' });
     expect(prompt).toContain('PPT-Master');
     expect(prompt).toContain('https://github.com/hugohe3/ppt-master');
+    expect(prompt).toContain('pkg-id');
     expect(prompt.toLowerCase()).toContain('install');
+    expect(prompt).not.toContain('verification code');
     expect(prompt).not.toMatch(/\[[^\]]*\]/); // no task placeholder — nothing to fill in
+  });
+
+  it('loadOssInstalled matches packages by stable name or repo url', async () => {
+    const { context } = loadOss({
+      invoke: async (channel) => {
+        if (channel === 'packages.list') {
+          return {
+            ok: true,
+            packages: [
+              { name: 'cli', repo_url: 'https://github.com/heygen-com/hyperframes' },
+              { name: 'ppt-master', repo_url: 'https://github.com/hugohe3/ppt-master.git' },
+            ],
+          };
+        }
+        if (channel === 'marketplace.getListingsCache') return { entries: {} };
+        if (channel === 'marketplace.mergeListingsCache') return { ok: true };
+        return { list: [], categories: [] };
+      },
+    });
+    const installed = await context.loadOssInstalled(true);
+    expect(context.isOssProjectInstalled({ id: 'hyperframes', repo: 'heygen-com/hyperframes' }, installed)).toBe(true);
+    expect(context.isOssProjectInstalled({ id: 'ppt-master', repo: 'hugohe3/ppt-master' }, installed)).toBe(true);
+    expect(context.isOssProjectInstalled({ id: 'missing', repo: 'missing/project' }, installed)).toBe(false);
   });
 
   it('ossInstallPromptFor explains bundled OfficeCLI instead of installing it', () => {

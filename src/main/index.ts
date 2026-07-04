@@ -148,6 +148,7 @@ import { getRendererTables } from './i18n';
 import * as reflectionOrchestrator from './features/reflection-orchestrator';
 import * as autoTasks from './features/auto_tasks';
 import * as systemSkills from './features/system_skills';
+import * as builtinMarketplace from './features/builtin_marketplace';
 import * as chatAttachments from './features/chat_attachments';
 import * as chatArtifacts from './features/chat_artifacts';
 import * as savedApps from './features/saved_apps';
@@ -993,6 +994,7 @@ if (!gotLock) {
       reflectionOrchestrator.startReflectionLoop(users.getActiveUserId());
     });
     registerDeferred('system-skills:reconcile', () => systemSkills.reconcileAllForActiveUserWithRetry({ retries: 2, reason: 'startup' }));
+    registerDeferred('builtin-marketplace:seed', () => builtinMarketplace.seedBuiltinMarketplaceForUser(users.getActiveUserId()));
     registerDeferred('auto-tasks:scheduler', () => autoTasks.startScheduler());
 
     // Drive the immediate batch + schedule the deferred one.

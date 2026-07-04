@@ -28,6 +28,7 @@ import * as crypto from 'node:crypto';
 
 import { userLocalConfigDir } from '../../paths';
 import { createLogger } from '../../logger';
+import { logErrorRef, maskId } from '../../util/log-redact';
 
 const log = createLogger('bridge-permissions');
 
@@ -76,7 +77,7 @@ export function recordAlwaysAllow(uid: string, agentId: string, connectorId: str
   agent.connectors[connectorId] = 'allow';
   store.agents[agentId] = agent;
   writeStore(uid, store);
-  log.info('always-allow recorded', { agentId, connectorId });
+  log.info('always-allow recorded', { agent_id: maskId(agentId), connector_id: maskId(connectorId) });
 }
 
 // ── Pending requests ─────────────────────────────────────────────────────
@@ -155,13 +156,18 @@ export async function requestPermission(opts: {
   return new Promise<boolean>((resolve) => {
     const timer = setTimeout(() => {
       _pending.delete(requestId);
-      log.warn('permission request timed out → deny', { requestId, connectorId: opts.connectorId });
+      log.warn('permission request timed out → deny', {
+        request_id: maskId(requestId),
+        agent_id: maskId(opts.agentId),
+        connector_id: maskId(opts.connectorId),
+        tool: opts.toolName,
+      });
       resolve(false);
     }, RESPONSE_TIMEOUT_MS);
     if (typeof timer.unref === 'function') timer.unref();
     _pending.set(requestId, { info, uid: opts.uid, resolve, timer });
     if (!_broadcast('bridge:permission', info)) {
-      log.warn('no renderer broadcast available — permission will deny on timeout', { requestId });
+      log.warn('no renderer broadcast available — permission will deny on timeout', { request_id: maskId(requestId) });
     }
   });
 }
@@ -175,7 +181,7 @@ export function respond(requestId: string, allow: boolean, always: boolean): boo
   clearTimeout(pending.timer);
   if (allow && always) {
     try { recordAlwaysAllow(pending.uid, pending.info.agent_id, pending.info.connector_id); }
-    catch (err) { log.warn(`always-allow persist failed: ${(err as Error).message}`); }
+    catch (err) { log.warn('always-allow persist failed', { error: logErrorRef(err) }); }
   }
   pending.resolve(allow);
   return true;

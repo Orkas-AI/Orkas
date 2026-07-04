@@ -32,6 +32,7 @@ import * as fs from 'node:fs';
 import { userSessionFile, userLocalSessionFile } from '../../paths';
 import { getActiveUserId } from '../../features/users';
 import { createLogger } from '../../logger';
+import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
 
 const log = createLogger('model');
 
@@ -62,6 +63,27 @@ export function isEphemeralSessionId(sessionId: string): boolean {
     if (sessionId === kind || sessionId.startsWith(`${kind}-`)) return true;
   }
   return false;
+}
+
+/** The kind keyword anchoring a session id (`<kind>-<tail>`), or null if it
+ *  doesn't start with a known kind. Used to gate per-kind behaviour (e.g. which
+ *  sessions get cross-session memory). */
+export function sessionKindOf(sessionId: string): string | null {
+  const m = KNOWN_KINDS_RE.exec(sessionId);
+  return m ? m[1] : null;
+}
+
+/** The per-agent cross-session-memory scope id for a session, or null when the
+ *  session is NOT memory-eligible. Commander (gconv) → reserved 'commander';
+ *  agent workers (gmember / gworker / cli) → their agent id; authoring /
+ *  ephemeral sessions (agent-edit / skill-edit / extract-img / anon / reflect /
+ *  memory-extract) → null (no memory read or write). When null the runner
+ *  injects no memory block and does not expose the memory tool. */
+export function memoryScopeForSession(sessionId: string, agentId: string): string | null {
+  const kind = sessionKindOf(sessionId);
+  if (kind === 'gconv') return agentId || 'commander';
+  if (kind === 'gmember' || kind === 'gworker' || kind === 'cli') return agentId || null;
+  return null;
 }
 
 /**
@@ -142,7 +164,11 @@ export function deleteSessionFile(sessionId: string): void {
   try { fs.unlinkSync(file); }
   catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      log.warn(`delete failed ${file}: ${(err as Error).message}`);
+      log.warn('session file delete failed', {
+        session_id: maskId(sessionId),
+        path: logPathRef(file),
+        error: logErrorRef(err),
+      });
     }
   }
 }
@@ -155,7 +181,12 @@ export function deleteSessionFileForUser(userId: string, sessionId: string): voi
   try { fs.unlinkSync(file); }
   catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      log.warn(`delete failed ${file}: ${(err as Error).message}`);
+      log.warn('session file delete failed', {
+        user_id: maskId(userId),
+        session_id: maskId(sessionId),
+        path: logPathRef(file),
+        error: logErrorRef(err),
+      });
     }
   }
 }

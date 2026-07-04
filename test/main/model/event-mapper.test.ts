@@ -80,7 +80,7 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
   it('tool_progress → single structured progress event with message', async () => {
     const out = await collect([
       { type: 'tool_start', name: 'generate_image', id: 'c-image', input: { output_path: 'out.png' } },
-      { type: 'tool_progress', name: 'generate_image', id: 'c-image', phase: 'save', message: 'Saving generated image', data: { elapsedMs: 30000 } },
+      { type: 'tool_progress', name: 'generate_image', id: 'c-image', phase: 'poll', message: 'Waiting for image task (30s)', data: { elapsedMs: 30000 } },
       { type: 'tool_end', name: 'generate_image', id: 'c-image', result: 'Image written to out.png' },
       { type: 'done', result: { text: '', meta: { error: null } } },
     ]);
@@ -88,8 +88,8 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     const progressEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'progress');
     expect(progressEvent.event.stream).toBe('tool');
     expect(progressEvent.event.data.name).toBe('generate_image');
-    expect(progressEvent.event.data.message).toBe('Saving generated image');
-    expect(progressEvent.event.data.progress_phase).toBe('save');
+    expect(progressEvent.event.data.message).toBe('Waiting for image task (30s)');
+    expect(progressEvent.event.data.progress_phase).toBe('poll');
     expect(progressEvent.event.data.progress_data).toEqual({ elapsedMs: 30000 });
   });
 
@@ -197,6 +197,18 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
       (e) => e.type === 'progress' && typeof e.text === 'string' && e.text.includes('Retry attempt'),
     );
     expect(retryProgress.text).toBe('Retry attempt 2·Connection dropped');
+  });
+
+  it('retry event maps missing finish_reason to a connection drop', async () => {
+    const out = await collect([
+      { type: 'retry', attempt: 1, reason: 'Stream ended without finish_reason' },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ]);
+    const retryProgress = out.find(
+      (e) => e.type === 'progress' && typeof e.text === 'string' && e.text.startsWith('Retrying'),
+    );
+    expect(retryProgress.text).toBe('Retrying·Connection dropped');
+    expect(retryProgress.text).not.toContain('finish_reason');
   });
 
   it('tool_end with isError → end event flags isError + carries preview', async () => {

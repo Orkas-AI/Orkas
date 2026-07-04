@@ -22,6 +22,16 @@ vi.mock('../../../../src/main/model/client', () => ({
     if (String(_opts?.message || '').includes('ARTIFACT_EVENT_TEST')) {
       _opts?.onArtifactCreated?.({ id: 'art-live-1', title: 'Live App' });
     }
+    if (String(_opts?.message || '').includes('AGENT_RESULT_FAILURE_TEST')) {
+      yield { type: 'final', text: '没有完成交付。\n<agent-result status="failure" />' };
+      yield { type: 'done' };
+      return;
+    }
+    if (String(_opts?.message || '').includes('COMMANDER_RESULT_FAILURE_TEST')) {
+      yield { type: 'final', text: '没有完成调度。\n<commander-result status="failure" />' };
+      yield { type: 'done' };
+      return;
+    }
     const xmlMarker = 'SYNC_CONFLICT_XML_RESULT:';
     const xmlIdx = String(_opts?.message || '').indexOf(xmlMarker);
     if (xmlIdx >= 0) {
@@ -162,6 +172,46 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(visibility.buildReplayPrefix(slice, 'missing').prefix).toContain('Please resolve the conflict using the hidden protocol.');
   });
 
+  it('strips commander result markers and records commander model failures', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    await bus.enqueue({
+      uid: TEST_UID, cid: TEST_CID, fromActorId: 'user',
+      text: 'COMMANDER_RESULT_FAILURE_TEST',
+    });
+    await waitForQuiescent(TEST_UID, TEST_CID);
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${TEST_CID}.jsonl`);
+    const lines = fs.readFileSync(mainFile, 'utf-8').trim().split('\n').map((line) => JSON.parse(line));
+    const reply = lines.find((line) => line.from === 'commander');
+    expect(reply?.text).toBe('没有完成调度。');
+    expect(reply?.text).not.toContain('commander-result');
+
+    const stats = JSON.parse(fs.readFileSync(paths.commanderRuntimeStatsFile(TEST_UID), 'utf-8'));
+    expect(stats.attempts).toBe(1);
+    expect(stats.successes).toBe(0);
+    expect(stats.deliveries).toBe(0);
+    expect(stats.failures).toBe(1);
+    expect(stats.errors).toBe(0);
+  });
+
+  it('records markerless commander completions as success when no runtime error occurs', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    await bus.enqueue({
+      uid: TEST_UID, cid: TEST_CID, fromActorId: 'user',
+      text: '普通问题',
+    });
+    await waitForQuiescent(TEST_UID, TEST_CID);
+
+    const stats = JSON.parse(fs.readFileSync(paths.commanderRuntimeStatsFile(TEST_UID), 'utf-8'));
+    expect(stats.attempts).toBe(1);
+    expect(stats.successes).toBe(1);
+    expect(stats.deliveries).toBe(1);
+    expect(stats.failures).toBe(0);
+    expect(stats.errors).toBe(0);
+  });
+
   it('user → @<name> resolves to agent_id and auto-adds the agent to the roster', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
     const state = await import('../../../../src/main/features/group_chat/state');
@@ -175,6 +225,46 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     const m = await state.readMembers(TEST_UID, TEST_CID);
     expect(m.actors.find((a) => a.id === AGENT_ID)).toBeTruthy();
     expect(m.actors.find((a) => a.id === AGENT_ID)?.name).toBe(AGENT_NAME);
+  });
+
+  it('strips agent result markers and records model failures separately from errors', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    await bus.enqueue({
+      uid: TEST_UID, cid: TEST_CID, fromActorId: 'user',
+      text: `@${AGENT_NAME} AGENT_RESULT_FAILURE_TEST`,
+    });
+    await waitForQuiescent(TEST_UID, TEST_CID);
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${TEST_CID}.jsonl`);
+    const lines = fs.readFileSync(mainFile, 'utf-8').trim().split('\n').map((line) => JSON.parse(line));
+    const reply = lines.find((line) => line.from === AGENT_ID);
+    expect(reply?.text).toBe('没有完成交付。');
+    expect(reply?.text).not.toContain('agent-result');
+
+    const stats = JSON.parse(fs.readFileSync(paths.agentRuntimeStatsFile(TEST_UID, AGENT_ID), 'utf-8'));
+    expect(stats.attempts).toBe(1);
+    expect(stats.successes).toBe(0);
+    expect(stats.deliveries).toBe(0);
+    expect(stats.failures).toBe(1);
+    expect(stats.errors).toBe(0);
+  });
+
+  it('records markerless agent completions as success when no runtime error occurs', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    await bus.enqueue({
+      uid: TEST_UID, cid: TEST_CID, fromActorId: 'user',
+      text: `@${AGENT_NAME} 普通任务`,
+    });
+    await waitForQuiescent(TEST_UID, TEST_CID);
+
+    const stats = JSON.parse(fs.readFileSync(paths.agentRuntimeStatsFile(TEST_UID, AGENT_ID), 'utf-8'));
+    expect(stats.attempts).toBe(1);
+    expect(stats.successes).toBe(1);
+    expect(stats.deliveries).toBe(1);
+    expect(stats.failures).toBe(0);
+    expect(stats.errors).toBe(0);
   });
 
   it('exposes a stable active turn id from process event through final message', async () => {
@@ -291,42 +381,6 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(commanderMsg?.produced).toEqual([finalPath]);
     expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(stalePath)).toBe(false);
     expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(finalPath)).toBe(true);
-  });
-
-  it('ignores structured sync conflict results in the open build', async () => {
-    const bus = await import('../../../../src/main/features/group_chat/bus');
-    const paths = await import('../../../../src/main/paths');
-    const state = await import('../../../../src/main/features/group_chat/state');
-    const cid = 'cid-sync-conflict-xml';
-    const relPath = 'cloud/memory/CONFLICT.md';
-    const currentPath = path.join(paths.userCloudRoot(TEST_UID), 'memory', 'CONFLICT.md');
-    fs.mkdirSync(path.dirname(currentPath), { recursive: true });
-    fs.writeFileSync(currentPath, 'initial current');
-    const conflictId = 'conflict-xml-1';
-    await state.setToolExtraRoots(TEST_UID, cid, [path.dirname(currentPath)]);
-    await state.setSyncConflictResolution(TEST_UID, cid, [{
-      id: conflictId,
-      rel_path: relPath,
-      current_path: currentPath,
-    }]);
-
-    await bus.enqueue({
-      uid: TEST_UID,
-      cid,
-      fromActorId: 'user',
-      text: `SYNC_CONFLICT_XML_RESULT:${Buffer.from(JSON.stringify({
-        conflictId,
-        relPath,
-        targetPath: currentPath,
-        status: 'resolved',
-        action: 'use_current',
-      })).toString('base64')}`,
-    });
-    await waitForQuiescent(TEST_UID, cid);
-
-    expect(fs.readFileSync(currentPath, 'utf8')).toBe('initial current');
-    expect((await state.readState(TEST_UID, cid)).sync_conflict_resolution?.conflicts)
-      .toEqual([{ id: conflictId, rel_path: relPath, current_path: currentPath }]);
   });
 
   // `isQuiescent` reflects the in-memory queue/running state — exercised

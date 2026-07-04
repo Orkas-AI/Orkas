@@ -27,6 +27,7 @@ import * as path from 'node:path';
 
 import { localCliSessionsFile, userLocalCliSessionsDir } from '../../paths.js';
 import { createLogger } from '../../logger.js';
+import { logErrorRef, maskId } from '../../util/log-redact.js';
 
 const log = createLogger('local-agents:sessions');
 
@@ -50,7 +51,7 @@ async function read(uid: string, cid: string): Promise<CliSessionsFile> {
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code !== 'ENOENT') {
-      log.warn('read failed', { uid, cid, error: (err as Error).message });
+      log.warn('read failed', { user_id: maskId(uid), cid: maskId(cid), error: logErrorRef(err) });
     }
     return {};
   }
@@ -81,7 +82,7 @@ export async function setSessionId(uid: string, cid: string, aid: string, cli: s
   file[aid] = { cli, sessionId, updatedAt: new Date().toISOString() };
   try { await write(uid, cid, file); }
   catch (err) {
-    log.warn('setSessionId failed', { uid, cid, aid, error: (err as Error).message });
+    log.warn('setSessionId failed', { user_id: maskId(uid), cid: maskId(cid), agent_id: maskId(aid), error: logErrorRef(err) });
   }
 }
 
@@ -98,7 +99,7 @@ export async function clearForAgent(uid: string, cid: string, aid: string): Prom
       await write(uid, cid, file);
     }
   } catch (err) {
-    log.warn('clearForAgent failed', { uid, cid, aid, error: (err as Error).message });
+    log.warn('clearForAgent failed', { user_id: maskId(uid), cid: maskId(cid), agent_id: maskId(aid), error: logErrorRef(err) });
   }
 }
 
@@ -114,7 +115,7 @@ export async function clearForConversation(uid: string, cid: string): Promise<vo
   catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code !== 'ENOENT') {
-      log.warn('clearForConversation failed', { uid, cid, error: (err as Error).message });
+      log.warn('clearForConversation failed', { user_id: maskId(uid), cid: maskId(cid), error: logErrorRef(err) });
     }
   }
 }
@@ -128,7 +129,7 @@ export function clearForConversationSync(uid: string, cid: string): void {
   catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code !== 'ENOENT') {
-      log.warn('clearForConversationSync failed', { uid, cid, error: (err as Error).message });
+      log.warn('clearForConversationSync failed', { user_id: maskId(uid), cid: maskId(cid), error: logErrorRef(err) });
     }
   }
 }

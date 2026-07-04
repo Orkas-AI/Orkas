@@ -371,7 +371,11 @@ async function _removeConversationMeta(userId: string, cid: string): Promise<voi
 }
 
 function _notifyChatIndexDirty(): void {
-  // The open-source build is local-only; cloud sync notification is absent.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
+    sync?.markDirty?.('chats', `cloud/chats/${conversationIndexName()}`);
+  } catch { /* features/sync stripped */ }
 }
 
 function _messageText(raw: any): string {
@@ -703,10 +707,9 @@ export interface CreateConversationOptions {
    *  validating the projectId exists for this user — chats.ts persists it
    *  verbatim. */
   projectId?: string;
-  /** Optional explicit conversation id. Used when an owned caller already
-   *  minted the id and needs to preserve it across the create path. Must be
-   *  a `safeId`; if it collides with an existing conv, that conv is returned
-   *  unchanged. Defaults to a fresh generated id. */
+  /** Optional explicit conversation id. Used when an external source already
+   *  minted the id. Must be a `safeId`; if it collides with an existing conv,
+   *  that conv is returned unchanged. Defaults to a fresh generated id. */
   conversationId?: string;
   /** Set by `features/auto_tasks.ts::_fireTask` so the conversation carries
    *  a back-link to the task that spawned it. Used by the renderer for the

@@ -9,6 +9,10 @@ export type AgentRunParams = {
     data: string;
     mediaType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
   }>;
+  /** Host-private metadata for provider adapters. This is not rendered into
+   * the conversation and must not be exposed to generic providers unless an
+   * adapter explicitly forwards selected fields. */
+  requestMetadata?: Record<string, unknown>;
   /** Model override for this run. */
   model?: string;
   /** Provider override for this run. */

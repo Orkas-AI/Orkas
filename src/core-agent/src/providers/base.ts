@@ -53,6 +53,10 @@ export type CompletionParams = {
    * caller's session id so repeated turns on the same conversation hit the
    * same cache bucket. */
   sessionId?: string;
+  /** Host-private metadata for provider adapters. Generic providers must not
+   * forward this wholesale; adapters may pick specific fields for their own
+   * trusted endpoints. */
+  requestMetadata?: Record<string, unknown>;
 };
 
 /** Non-streaming completion result. */

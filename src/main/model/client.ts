@@ -43,6 +43,11 @@ export interface ChatResult {
   aborted: boolean;
 }
 
+export interface ChatAttachmentMetadata {
+  hasAttachments: boolean;
+  attachmentTypes: string[];
+}
+
 export interface ChatOptions {
   userId: string;
   message: string;
@@ -51,8 +56,7 @@ export interface ChatOptions {
    * Use this for conversation-level rules that must stay in context for every
    * turn (kept on the system channel, not duplicated into each user message). */
   systemPrompt?: string;
-  /** Legacy agent-name knob — ignored by the core-agent backend but kept
-   * in the signature so feature code that still passes it compiles. */
+  /** Human-readable actor name used in user-facing local permission prompts. */
   agentName?: string;
   /** Working directory for tool execution (list_files, read_file, bash, etc.).
    * Defaults to process.cwd() if omitted. */
@@ -61,6 +65,10 @@ export interface ChatOptions {
    * (no `data:` prefix). Used by `features/contexts_extract` for vision-based
    * description of uploaded images in the knowledge base staging area. */
   images?: Array<{ data: string; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' }>;
+  /** Current-turn attachment metadata forwarded only as provider request
+   * metadata. Orkas-managed LLM uses it server-side to route model families;
+   * third-party providers do not receive it. */
+  attachmentMetadata?: ChatAttachmentMetadata;
   /** Hard idle window (seconds) for the tool-execution phase and cold start
    *  (before the first stream event). Default 1800. core-agent's per-tool
    *  watchdog stays authoritative for tool stalls; this is the outer backstop. */
@@ -128,12 +136,18 @@ export interface ChatOptions {
    *  `<agent>` / `<skill>` containers remain the only sanctioned mutation
    *  channels. */
   readOnlyExtraRoots?: readonly string[];
+  /** File-tool-only read roots. These are visible to `read_file` /
+   *  `search_files` / `grep_files` / `stat_file`, but are intentionally not
+   *  passed to local-exec tools such as `delete_file`, `bash`, `write_file`,
+   *  `markdown_to_pdf`, or `html_to_pdf`. Used for user-approved read-only
+   *  folder grants. */
+  fileReadOnlyExtraRoots?: readonly string[];
   /** Fired with the absolute path of every file produced by the local-exec
    * tools (`write_file`, `markdown_to_pdf`, `html_to_pdf`, `bash`)
    * during this run.
    * `features/chats` uses this to attach a `produced[]` list to the
    * assistant message so the UI can offer a "reveal in Finder" chip. */
-  onFileWritten?: (absPath: string) => void;
+  onFileWritten?: (absPath: string) => void | Promise<void>;
   /** Predicate: true when the given absolute path was already written by
    * this caller's session (typically: a `Set` populated by `onFileWritten`
    * earlier in the same turn). Used by the write-style tools' uniquify

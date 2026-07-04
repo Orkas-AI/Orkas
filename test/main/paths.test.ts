@@ -23,9 +23,10 @@ afterEach(() => {
 });
 
 describe('paths › roots', () => {
-  it('PC_ROOT is the app root and APP_ROOT aliases it', async () => {
+  it('PC_ROOT points at the flattened app root and APP_ROOT aliases it', async () => {
     const p = await import('../../src/main/paths');
-    expect(p.PC_ROOT).toBe(process.cwd());
+    expect(fs.existsSync(path.join(p.PC_ROOT, 'package.json'))).toBe(true);
+    expect(fs.existsSync(path.join(p.PC_ROOT, 'src'))).toBe(true);
     expect(p.APP_ROOT).toBe(p.PC_ROOT);
   });
 
@@ -85,6 +86,8 @@ describe('paths › cloud-synced per-user', () => {
     expect(p.userSkillsDir(uid)).toBe(path.join(p.WS_ROOT, uid, 'cloud', 'skills'));
     expect(p.userPreferencesFile(uid))
       .toBe(path.join(p.WS_ROOT, uid, 'cloud', 'config', 'preferences.json'));
+    expect(p.userPermissionsFile(uid))
+      .toBe(path.join(p.WS_ROOT, uid, 'cloud', 'config', 'permissions.json'));
   });
 
   it('per-agent layout: spec + meta + evolved skills under agents/<aid>/', async () => {
@@ -134,7 +137,17 @@ describe('paths › local (per-user, not synced)', () => {
     expect(p.userMarketplaceAgentsDir(uid)).toBe(path.join(root, 'agents'));
     expect(p.userMarketplaceSkillsDir(uid)).toBe(path.join(root, 'skills'));
     expect(p.userMarketplaceAgentDir(uid, 'a1')).toBe(path.join(root, 'agents', 'a1'));
+    expect(p.userMarketplaceAgentSkillsDir(uid, 'a1')).toBe(path.join(root, 'agents', 'a1', 'skills'));
     expect(p.userMarketplaceSkillDir(uid, 's1')).toBe(path.join(root, 'skills', 's1'));
+  });
+
+  it('custom agent private publish skills are separate from self-evolved skills', async () => {
+    const p = await import('../../src/main/paths');
+    const uid = 'u1';
+    expect(p.agentEvolvedSkillsDir(uid, 'a1'))
+      .toBe(path.join(p.WS_ROOT, uid, 'cloud', 'agents', 'a1', 'skills'));
+    expect(p.agentPrivateSkillsDir(uid, 'a1'))
+      .toBe(path.join(p.WS_ROOT, uid, 'cloud', 'agents', 'a1', 'private_skills'));
   });
 
   it('marketplace cloud-sync manifest lands under <uid>/cloud/marketplace/installs.json', async () => {

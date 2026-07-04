@@ -322,6 +322,7 @@ function packageVenvDir(pkg) {
 
 /** Candidate rel dirs whose children (or, for '.', the dir itself) hold SKILL.md. */
 const SKILL_ROOT_CANDIDATES = ['skills', path.join('.claude', 'skills')];
+const PACKAGE_BIN_DIR_CANDIDATES = ['npm/bin', 'bin'];
 
 function scanSkillRoots(pkgDir) {
   const roots = [];
@@ -391,9 +392,45 @@ function scanPythonBinEntries(pkgDir) {
   return entries;
 }
 
+function isExecutableFile(p) {
+  try {
+    const st = fs.statSync(p);
+    if (!st.isFile()) return false;
+    if (process.platform === 'win32') return true;
+    return (st.mode & 0o111) !== 0;
+  } catch {
+    return false;
+  }
+}
+
+function scanNativeBinEntries(pkgDir) {
+  const entries = [];
+  const seen = new Set();
+  for (const relDir of PACKAGE_BIN_DIR_CANDIDATES) {
+    const absDir = path.join(pkgDir, relDir);
+    let dirents;
+    try { dirents = fs.readdirSync(absDir, { withFileTypes: true }); } catch { continue; }
+    for (const dirent of dirents) {
+      if (!dirent.isFile()) continue;
+      let name = dirent.name;
+      if (process.platform === 'win32') name = name.replace(/\.(?:exe|cmd|bat)$/i, '');
+      if (!PKG_NAME_RE.test(name) || seen.has(name)) continue;
+      const abs = path.join(absDir, dirent.name);
+      if (!isExecutableFile(abs)) continue;
+      seen.add(name);
+      entries.push({
+        name,
+        target: path.join(relDir, dirent.name).split(path.sep).join('/'),
+        runtime: 'native',
+      });
+    }
+  }
+  return entries;
+}
+
 function scanPackage(pkgDir) {
   const skillRoots = scanSkillRoots(pkgDir);
-  const binEntries = [...scanNodeBinEntries(pkgDir), ...scanPythonBinEntries(pkgDir)];
+  const binEntries = [...scanNodeBinEntries(pkgDir), ...scanPythonBinEntries(pkgDir), ...scanNativeBinEntries(pkgDir)];
   let kind = null;
   if (skillRoots.length && binEntries.length) kind = 'both';
   else if (skillRoots.length) kind = 'skill';

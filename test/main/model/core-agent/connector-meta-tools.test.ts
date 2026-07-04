@@ -19,17 +19,27 @@ type AgentMock = { agent_id: string; enabled_connectors?: string[] } | null;
 const fixtures: {
   instances: ConnectorInstance[];
   agents: Record<string, AgentMock>;
+  analyticsEvents: { event: string; payload: Record<string, unknown> }[];
   callTool: (uid: string, id: string, name: string, args: Record<string, unknown>) => Promise<unknown>;
 } = {
   instances: [],
   agents: {},
+  analyticsEvents: [],
   callTool: async () => 'OK',
 };
 
 vi.mock('../../../../src/main/features/connectors/manager', () => ({
   listInstances: (uid: string) => (uid ? fixtures.instances : []),
+  restoreComposioConnectionsFromServer: async () => 0,
+  refreshStaleToolCaches: async () => 0,
   callTool: (uid: string, id: string, name: string, args: Record<string, unknown>) =>
     fixtures.callTool(uid, id, name, args),
+}));
+
+vi.mock('../../../../src/main/features/analytics/connectors', () => ({
+  trackConnectorAnalytics: (event: string, payload: Record<string, unknown>) => {
+    fixtures.analyticsEvents.push({ event, payload });
+  },
 }));
 
 vi.mock('../../../../src/main/features/agents', () => ({
@@ -117,6 +127,7 @@ const UID = 'u-meta-001';
 beforeEach(() => {
   fixtures.instances = [];
   fixtures.agents = {};
+  fixtures.analyticsEvents = [];
   fixtures.callTool = async () => 'OK';
   vi.resetModules();
 });
@@ -141,9 +152,9 @@ describe('connectorExposureFromSessionId', () => {
     expect(connectorExposureFromSessionId('gconv-ac5559863d42')).toBe('tools+block');
   });
 
-  it('matches gmember (agent worker) including dashed aid in the tail → none', async () => {
+  it('matches gmember (agent worker) including dashed aid in the tail → tools+block', async () => {
     const { connectorExposureFromSessionId } = await import('../../../../src/main/model/core-agent/runner');
-    expect(connectorExposureFromSessionId('gmember-cv1-agt-42')).toBe('none');
+    expect(connectorExposureFromSessionId('gmember-cv1-agt-42')).toBe('tools+block');
   });
 
   it('matches agent-edit → discover+block (block + list_connector_tools, NO call_connector_tool)', async () => {
@@ -184,6 +195,21 @@ describe('systemSkillsExposureFromSessionId', () => {
     expect(systemSkillsExposureFromSessionId('reflect-x')).toBe(false);
     expect(systemSkillsExposureFromSessionId('memory-extract-x')).toBe(false);
     expect(systemSkillsExposureFromSessionId('anon')).toBe(false);
+  });
+});
+
+describe('openSkillSourcesExposureFromSessionId', () => {
+  it('exposes open-tier skills to group-chat task sessions and agent-edit only', async () => {
+    const { openSkillSourcesExposureFromSessionId } = await import('../../../../src/main/model/core-agent/runner');
+    expect(openSkillSourcesExposureFromSessionId('gconv-ac5559863d42')).toBe(true);
+    expect(openSkillSourcesExposureFromSessionId('gmember-cv1-agt-42')).toBe(true);
+    expect(openSkillSourcesExposureFromSessionId('agent-agt-7')).toBe(true);
+    expect(openSkillSourcesExposureFromSessionId('skill-sk1')).toBe(false);
+    expect(openSkillSourcesExposureFromSessionId('extract-img-deadbeef')).toBe(false);
+    expect(openSkillSourcesExposureFromSessionId('cli-claude-run-1')).toBe(false);
+    expect(openSkillSourcesExposureFromSessionId('reflect-x')).toBe(false);
+    expect(openSkillSourcesExposureFromSessionId('memory-extract-x')).toBe(false);
+    expect(openSkillSourcesExposureFromSessionId('anon')).toBe(false);
   });
 });
 

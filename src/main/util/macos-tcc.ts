@@ -73,3 +73,14 @@ export function macosTccSensitivePath(
   }
   return null;
 }
+
+/**
+ * Workspaces are long-lived execution roots: agents create, stat, list, and
+ * reveal files there across turns. Even if each individual scan is guarded,
+ * placing the workspace under a macOS TCC root can still trigger privacy
+ * prompts during normal writes or shell commands. Treat these paths as
+ * ineligible workspace/default-picker roots.
+ */
+export function macosTccWorkspaceBlockedPath(targetPath: string): TccSensitivePathResult | null {
+  return macosTccSensitivePath(targetPath, { recursive: true });
+}

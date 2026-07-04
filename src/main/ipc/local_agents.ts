@@ -20,6 +20,12 @@ import * as path from 'node:path';
 import { detectAll, detectOne, invalidateCache, LOCAL_CLI_TYPES, type LocalCliType, type LocalCliEntry } from '../features/local_agents/registry.js';
 import * as bridgePermissions from '../features/local_agents/bridge_permissions.js';
 import * as bashPermissions from '../model/core-agent/bash-permissions.js';
+import {
+  closeInteractiveCliSession,
+  listInteractiveCliSessions,
+  readInteractiveCliSession,
+  sendInteractiveCliInput,
+} from '../model/core-agent/interactive-cli-sessions.js';
 import { listModels } from '../features/local_agents/models.js';
 import { getActiveUserId } from '../features/users.js';
 import { userToolResultsDir } from '../paths.js';
@@ -124,7 +130,7 @@ export const invokeHandlers = {
     return { handled };
   },
 
-  /** Renderer answer to a `bash:permission` push event (risk_prompt mode).
+  /** Renderer answer to a `bash:permission` push event (sensitive approval modes).
    *  `decision` ∈ allow_once | allow_run | deny. Unknown / timed-out ids
    *  return handled:false (stale dialog). Verdict semantics live in
    *  model/core-agent/bash-permissions.ts. */
@@ -136,6 +142,39 @@ export const invokeHandlers = {
     if (d !== 'allow_once' && d !== 'allow_run' && d !== 'deny') throw new Error('invalid decision');
     const handled = bashPermissions.respond(payload.request_id, d);
     return { handled };
+  },
+
+  'interactiveCli.list': async (_payload: unknown, ctx: { userId: string }) => {
+    return { sessions: listInteractiveCliSessions(ctx.userId) };
+  },
+
+  'interactiveCli.read': async (
+    payload: { session_id?: unknown },
+    ctx: { userId: string },
+  ) => {
+    if (typeof payload?.session_id !== 'string' || !payload.session_id) throw new Error('invalid session_id');
+    return { session: readInteractiveCliSession(ctx.userId, payload.session_id) };
+  },
+
+  'interactiveCli.send': async (
+    payload: { session_id?: unknown; input?: unknown; add_newline?: unknown; sensitive?: unknown },
+    ctx: { userId: string },
+  ) => {
+    if (typeof payload?.session_id !== 'string' || !payload.session_id) throw new Error('invalid session_id');
+    const text = typeof payload.input === 'string' ? payload.input : '';
+    const session = sendInteractiveCliInput(ctx.userId, payload.session_id, text, {
+      addNewline: payload.add_newline !== false,
+      sensitive: payload.sensitive === true,
+    });
+    return { session };
+  },
+
+  'interactiveCli.close': async (
+    payload: { session_id?: unknown },
+    ctx: { userId: string },
+  ) => {
+    if (typeof payload?.session_id !== 'string' || !payload.session_id) throw new Error('invalid session_id');
+    return { session: closeInteractiveCliSession(ctx.userId, payload.session_id) };
   },
 
   'localAgents.readToolResult': async ({ path: filePath }: { path?: unknown }) => {

@@ -177,25 +177,30 @@ function uiConfirmDanger({ title, message, dangerLabel, cancelLabel } = {}) {
 // uiConfirm would force the user to imagine the alternative.
 //
 // `choices: [{ id, label, style? }]` — `style` may be 'primary' (default),
-// 'danger', or '' for the neutral .btn look.
-function uiChoice({ title, message, choices = [], cancelLabel } = {}) {
+// 'danger', or '' for the neutral .btn look. `leadingChoices` renders one
+// or more neutral/contextual choices on the left edge of the actions row.
+function uiChoice({ title, message, choices = [], leadingChoices = [], cancelLabel } = {}) {
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay ui-dialog-overlay open';
     const titleHtml = title ? `<div class="ui-dialog-title">${escapeHtml(String(title))}</div>` : '';
     const msgHtml = escapeHtml(String(message || '')).replace(/\n/g, '<br />');
     const cancelText = escapeHtml(cancelLabel || _dialogLabel('common.cancel', 'Cancel'));
-    const choiceHtml = choices.map((c) => {
+    const renderChoice = (c, extraClass = '') => {
       const cls = c.style === 'danger' ? 'btn btn-danger'
         : c.style === '' ? 'btn'
         : 'btn btn-primary';
-      return `<button class="${cls}" data-act="choice" data-id="${escapeHtml(String(c.id))}">${escapeHtml(String(c.label || c.id))}</button>`;
-    }).join('');
+      const className = `${cls}${extraClass ? ` ${extraClass}` : ''}`;
+      return `<button class="${className}" data-act="choice" data-id="${escapeHtml(String(c.id))}">${escapeHtml(String(c.label || c.id))}</button>`;
+    };
+    const leadingChoiceHtml = leadingChoices.map((c) => renderChoice(c, 'ui-choice-leading')).join('');
+    const choiceHtml = choices.map((c) => renderChoice(c)).join('');
     overlay.innerHTML = `
       <div class="modal ui-dialog" role="dialog" aria-modal="true">
         ${titleHtml}
         <div class="ui-dialog-message">${msgHtml}</div>
         <div class="modal-actions">
+          ${leadingChoiceHtml}
           <button class="btn" data-act="cancel">${cancelText}</button>
           ${choiceHtml}
         </div>

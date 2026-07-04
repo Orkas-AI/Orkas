@@ -255,6 +255,20 @@ describe('htmlToPdf › behaviour', () => {
     expect(decoded).toContain('<body>X</body>');
   });
 
+  it('injects footerText as a print footer before rendering', async () => {
+    const { htmlToPdf } = await import('../../../src/main/util/md-to-pdf');
+    await htmlToPdf('<html><body>Body</body></html>', path.join(tmpDir, 'footer.pdf'), {
+      footerText: 'Made with <Orkas>',
+    });
+
+    const url = loadURL.mock.calls[0][0];
+    const b64 = url.split('base64,')[1];
+    const decoded = Buffer.from(b64, 'base64').toString('utf8');
+    expect(decoded).toContain('class="generated-output-footer"');
+    expect(decoded).toContain('Made with &lt;Orkas&gt;');
+    expect(decoded).toContain('body { padding-bottom: 18mm !important; }');
+  });
+
   it('destroys the BrowserWindow even when printToPDF throws', async () => {
     printToPDF.mockRejectedValueOnce(new Error('boom'));
     const { htmlToPdf } = await import('../../../src/main/util/md-to-pdf');

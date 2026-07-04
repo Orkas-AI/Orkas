@@ -18,11 +18,16 @@ import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 
 import {
-  userMarketplaceAgentDir, userMarketplaceSkillDir,
+  userMarketplaceAgentDir, userMarketplaceAgentSkillsDir, userMarketplaceSkillDir,
   userMarketplaceAgentsDir, userMarketplaceSkillsDir,
   marketplaceReconcileStateFile,
+  userSkillsDir,
 } from '../paths';
 import { sha256OfFile } from '../util/sha256';
+import {
+  MARKETPLACE_RESOURCE_MANIFEST_NAME,
+  marketplaceContentTreeHash,
+} from '../util/marketplace-tree-hash';
 import { clearAgentListCache } from './agents';
 import { clearSkillListCache } from './skills';
 import {
@@ -37,6 +42,8 @@ import { createLogger } from '../logger';
 import { fetchWithRetry } from '../util/retry';
 
 const log = createLogger('marketplace_reconcile');
+const MARKETPLACE_AGENT_JSON_DOWNLOAD_TIMEOUT_MS = 60_000;
+const MARKETPLACE_SKILL_BUNDLE_DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** Coarse-grained reconcile state for the UI banner. `idle` covers both pre-run and a finished
  *  run with nothing to pull (banner stays hidden in both cases). */
@@ -218,7 +225,9 @@ export async function checkServerUpdatesForInstalls(
       && a.default_install !== server.default_install;
     const currentStatus = a.status || a.state;
     const statusChanged = typeof server.status === 'string' && currentStatus !== server.status;
-    if (contentChanged || defaultInstallChanged || statusChanged) {
+    const privateSkillsUrlChanged = typeof server.agent_skills_bundle_url === 'string'
+      && a.agent_skills_bundle_url !== server.agent_skills_bundle_url;
+    if (contentChanged || defaultInstallChanged || statusChanged || privateSkillsUrlChanged) {
       log.info(`server-update agent ${a.id}: v${a.version} → v${server.version} (freshness ${_freshnessAt(a)} → ${_freshnessAt(server)})`);
       try { _assertContinue(opts); } catch { return { updated_agents, updated_skills }; }
       // Replace the row in the manifest; reconcile will detect the version/freshness
@@ -227,10 +236,13 @@ export async function checkServerUpdatesForInstalls(
       await addAgentInstall(uid, {
         id: a.id, version: server.version, published_at: server.published_at,
         updated_at: server.updated_at, agent_json_url: a.agent_json_url, create_uid: a.create_uid,
+        ...(typeof server.agent_skills_bundle_url === 'string'
+          ? { agent_skills_bundle_url: server.agent_skills_bundle_url }
+          : (typeof a.agent_skills_bundle_url === 'string' ? { agent_skills_bundle_url: a.agent_skills_bundle_url } : {})),
         ...(typeof server.default_install === 'boolean' ? { default_install: server.default_install } : {}),
         ...(typeof server.status === 'string' ? { status: server.status } : {}),
       });
-      if (!contentChanged && (defaultInstallChanged || statusChanged)) {
+      if (!contentChanged && !privateSkillsUrlChanged && (defaultInstallChanged || statusChanged)) {
         await withMarketplaceInstallLock(uid, 'agent', a.id, async () => {
           await _patchInstallMeta(userMarketplaceAgentDir(uid, a.id), {
             ...(typeof server.default_install === 'boolean' ? { default_install: server.default_install } : {}),
@@ -320,7 +332,14 @@ function _markServerCheckSuccess(uid: string): void {
   _writeLocalState(uid, { server_check_succeeded_at: Date.now() });
 }
 
-interface _CatalogRow { version: string; published_at: number; updated_at?: number; default_install?: boolean; status?: string }
+interface _CatalogRow {
+  version: string;
+  published_at: number;
+  updated_at?: number;
+  default_install?: boolean;
+  status?: string;
+  agent_skills_bundle_url?: string;
+}
 
 /** Paginate the public `/marketplace/{kind}/list` endpoint and collapse to (id → version + ts).
  *  The optional `ids` filter is supported by newer Servers. Older Servers ignore the extra body
@@ -331,7 +350,7 @@ async function _fetchServerCatalogMap(kind: 'agents' | 'skills', ids: string[]):
   const PAGE_SIZE = 100;
   const wanted = new Set(ids.filter(Boolean));
   for (let page = 1; page <= 20; page++) {
-    const r = await postJson<{ list: Array<{ id?: string; version?: string; published_at?: number; updated_at?: number; default_install?: boolean | number; status?: string; state?: string }>; total?: number }>(
+    const r = await postJson<{ list: Array<{ id?: string; version?: string; published_at?: number; updated_at?: number; default_install?: boolean | number; status?: string; state?: string; agent_skills_bundle_url?: string }>; total?: number }>(
       `/marketplace/${kind}/list`, { page, size: PAGE_SIZE, ids: [...wanted] },
     );
     const list = r.list || [];
@@ -348,6 +367,9 @@ async function _fetchServerCatalogMap(kind: 'agents' | 'skills', ids: string[]):
           ...(typeof row.status === 'string' ? { status: row.status } : (
             typeof row.state === 'string' ? { status: row.state } : {}
           )),
+          ...(kind === 'agents' && typeof row.agent_skills_bundle_url === 'string'
+            ? { agent_skills_bundle_url: row.agent_skills_bundle_url }
+            : {}),
         });
       }
     }
@@ -469,6 +491,7 @@ export async function reconcileInstalls(
   }
   if (pulled_agents > 0) {
     try { clearAgentListCache(); } catch { /* list cache may not be loaded yet */ }
+    try { invalidateCoreAgentSkills(); } catch { /* runner may not be loaded yet */ }
   }
   _clearCachesAfterConvergence(localConvergence, metadataPatches);
   _setStatus({
@@ -562,6 +585,7 @@ async function _reconcileLocalOnlyInstalls(
         published_at: meta.published_at,
         ...(typeof meta.updated_at === 'number' ? { updated_at: meta.updated_at } : {}),
         agent_json_url: meta.agent_json_url!,
+        ...(typeof meta.agent_skills_bundle_url === 'string' ? { agent_skills_bundle_url: meta.agent_skills_bundle_url } : {}),
         installed_at: meta.installed_at!,
         create_uid: meta.create_uid || '',
         ...(typeof meta.default_install === 'boolean' ? { default_install: meta.default_install } : {}),
@@ -616,6 +640,8 @@ async function _patchLocalMetadataForManifest(
     _assertContinue(opts);
     if (agentPullIds.has(row.id) || !_agentContentExists(uid, row.id)) continue;
     const dir = userMarketplaceAgentDir(uid, row.id);
+    if (_resourceSyncBlocksServerPull(dir)) continue;
+    if (_builtinSyncBlocksServerPull(dir, row)) continue;
     const meta = _readInstallMeta(dir);
     if (!meta) continue;
     const patch = _installMetaFromAgentRow(row);
@@ -629,6 +655,8 @@ async function _patchLocalMetadataForManifest(
     _assertContinue(opts);
     if (skillPullIds.has(row.id) || !_skillContentExists(uid, row.id)) continue;
     const dir = userMarketplaceSkillDir(uid, row.id);
+    if (_resourceSyncBlocksServerPull(dir)) continue;
+    if (_builtinSyncBlocksServerPull(dir, row)) continue;
     const meta = _readInstallMeta(dir);
     if (!meta) continue;
     const patch = _installMetaFromSkillRow(row);
@@ -651,20 +679,75 @@ function _localInstallIds(root: string): string[] {
 }
 
 /** Need-pull check: missing dir / missing agent.json / `_install.json::version` mismatch.
- *  Mirrors the cache freshness rule from marketplace_cache.ts (version + updated_at fallback). */
+ *  Mirrors the cache freshness rule from marketplace_cache.ts (version + updated_at fallback).
+ *
+ *  **Dev-mode local-edit guard**: when running under `false` and the meta
+ *  carries a `content_sha` (= sha256 of the descriptive file at install/upload
+ *  time), compare against disk. If they differ, the dev edited the spec locally
+ *  and we must NOT clobber the change — return false + log. Production users
+ *  don't hand-edit install dirs, so this branch is dev-only. Pre-feature
+ *  installs (no `content_sha`) fall through to the legacy version+freshness
+ *  comparison, which is the same behaviour as before.
+ */
 function _agentNeedsPull(uid: string, row: AgentInstall): boolean {
   if (!_agentContentExists(uid, row.id)) return true;
   const dir = userMarketplaceAgentDir(uid, row.id);
+  const agentJsonFile = path.join(dir, 'agent.json');
+  if (_resourceSyncBlocksServerPull(dir)) return false;
   const meta = _readInstallMeta(dir);
   if (!meta) return true;
+  if (_builtinSyncBlocksServerPull(dir, row, meta)) return false;
+  if (typeof row.agent_skills_bundle_url === 'string') {
+    if (meta.agent_skills_bundle_url !== row.agent_skills_bundle_url) return true;
+    if (row.agent_skills_bundle_url && !_agentPrivateSkillsExist(uid, row.id)) return true;
+  }
+  if (false && typeof meta.content_sha === 'string') {
+    const diskSha = sha256OfFile(agentJsonFile);
+    if (diskSha && diskSha !== meta.content_sha) {
+      log.warn(`dev: agent ${row.id} agent.json locally modified (sha mismatch); skipping re-pull. Republish via the marketplace upload UI when ready, or 'reinstall from server' from the detail panel to discard local edits.`);
+      return false;
+    }
+  }
+  if (false && typeof meta.content_tree_hash === 'string') {
+    const diskTreeHash = marketplaceContentTreeHash(dir);
+    if (diskTreeHash && diskTreeHash !== meta.content_tree_hash) {
+      log.warn(`dev: agent ${row.id} install tree locally modified (hash mismatch); skipping re-pull.`);
+      return false;
+    }
+  }
   return meta.version !== row.version || _freshnessAt(meta) !== _freshnessAt(row);
+}
+
+function _agentPrivateSkillsExist(uid: string, id: string): boolean {
+  const root = userMarketplaceAgentSkillsDir(uid, id);
+  try {
+    return fs.readdirSync(root, { withFileTypes: true })
+      .some((e) => e.isDirectory() && fs.existsSync(path.join(root, e.name, 'SKILL.md')));
+  } catch { return false; }
 }
 
 function _skillNeedsPull(uid: string, row: SkillInstall): boolean {
   if (!_skillContentExists(uid, row.id)) return true;
   const dir = userMarketplaceSkillDir(uid, row.id);
+  const skillMdFile = path.join(dir, 'SKILL.md');
+  if (_resourceSyncBlocksServerPull(dir)) return false;
   const meta = _readInstallMeta(dir);
   if (!meta) return true;
+  if (_builtinSyncBlocksServerPull(dir, row, meta)) return false;
+  if (false && typeof meta.content_sha === 'string') {
+    const diskSha = sha256OfFile(skillMdFile);
+    if (diskSha && diskSha !== meta.content_sha) {
+      log.warn(`dev: skill ${row.id} SKILL.md locally modified (sha mismatch); skipping re-pull. Republish via the marketplace upload UI when ready, or 'reinstall from server' from the detail panel to discard local edits.`);
+      return false;
+    }
+  }
+  if (false && typeof meta.content_tree_hash === 'string') {
+    const diskTreeHash = marketplaceContentTreeHash(dir);
+    if (diskTreeHash && diskTreeHash !== meta.content_tree_hash) {
+      log.warn(`dev: skill ${row.id} install tree locally modified (hash mismatch); skipping re-pull.`);
+      return false;
+    }
+  }
   return meta.version !== row.version || _freshnessAt(meta) !== _freshnessAt(row);
 }
 
@@ -676,11 +759,154 @@ function _skillContentExists(uid: string, id: string): boolean {
   return fs.existsSync(path.join(userMarketplaceSkillDir(uid, id), 'SKILL.md'));
 }
 
+function _customSkillContentExists(uid: string, id: string): boolean {
+  return fs.existsSync(path.join(userSkillsDir(uid), id, 'SKILL.md'));
+}
+
+function _skillDependencySatisfied(uid: string, id: string): boolean {
+  return _customSkillContentExists(uid, id) || _skillContentExists(uid, id);
+}
+
+function _skillListFromAgentJson(agentJson: Record<string, unknown>): string[] {
+  if (!Array.isArray(agentJson.skill_list)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of agentJson.skill_list) {
+    const id = typeof value === 'string' ? value.trim() : '';
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+function _marketplaceStatus(row: { status?: string; state?: string }): string {
+  return String(row.status || row.state || '').trim().toLowerCase();
+}
+
+function _assertApprovedDependencySkill(
+  skillId: string,
+  row: { status?: string; state?: string },
+): void {
+  const status = _marketplaceStatus(row);
+  if (status !== 'approved') {
+    throw new Error(`dependency skill ${skillId} is not approved${status ? ` (${status})` : ''}`);
+  }
+}
+
+async function _ensureAgentSkillDependencies(
+  uid: string,
+  agentId: string,
+  agentJson: Record<string, unknown>,
+  opts: MarketplaceReconcileOptions = {},
+): Promise<void> {
+  const skillList = _skillListFromAgentJson(agentJson);
+  if (skillList.length === 0) return;
+  const manifest = await readInstalls(uid);
+  const manifestSkills = new Map(manifest.skills.map((s) => [s.id, s]));
+  for (const skillId of skillList) {
+    _assertContinue(opts);
+    if (_skillDependencySatisfied(uid, skillId)) continue;
+    let row = manifestSkills.get(skillId) || null;
+    if (row && _marketplaceStatus(row) && _marketplaceStatus(row) !== 'approved') {
+      throw new Error(`dependency skill ${skillId} is not approved (${_marketplaceStatus(row)})`);
+    }
+    if (!row || !row.bundle_url) {
+      const meta = await postJson<{
+        bundle_url: string;
+        version: string;
+        published_at: number;
+        updated_at?: number;
+        create_uid?: string;
+        default_install?: boolean;
+        status?: string;
+        state?: string;
+      }>('/marketplace/skills/bundle', { id: skillId });
+      _assertApprovedDependencySkill(skillId, meta);
+      row = {
+        id: skillId,
+        version: meta.version || '1.0.0',
+        published_at: meta.published_at || 0,
+        ...(typeof meta.updated_at === 'number' ? { updated_at: meta.updated_at } : {}),
+        bundle_url: meta.bundle_url || '',
+        installed_at: Date.now(),
+        create_uid: meta.create_uid || '',
+        ...(typeof meta.default_install === 'boolean' ? { default_install: meta.default_install } : {}),
+        ...((meta.status || meta.state) ? { status: meta.status || meta.state } : {}),
+      };
+      await addSkillInstall(uid, row);
+      manifestSkills.set(skillId, row);
+    }
+    if (!row.bundle_url) throw new Error(`dependency skill ${skillId} missing bundle_url`);
+    await _pullSkill(uid, row, opts);
+    try { clearSkillListCache(); } catch { /* list cache may not be loaded yet */ }
+    try { invalidateCoreAgentSkills(); } catch { /* runner may not be loaded yet */ }
+    log.info(`dependency-installed skill ${skillId} for agent ${agentId}`);
+  }
+}
+
+function _resourceSyncBlocksServerPull(dir: string): boolean {
+  if (!false) return false;
+  const manifest = _readResourceSyncManifest(dir);
+  if (!manifest?.resource_hash) return false;
+  return manifest.resource_online_hash !== manifest.resource_hash;
+}
+
+function _readResourceSyncManifest(dir: string): { resource_hash?: string; resource_online_hash?: string } | null {
+  const file = path.join(dir, MARKETPLACE_RESOURCE_MANIFEST_NAME);
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    return {
+      resource_hash: typeof parsed.resource_hash === 'string' ? parsed.resource_hash : '',
+      resource_online_hash: typeof parsed.resource_online_hash === 'string' ? parsed.resource_online_hash : '',
+    };
+  } catch {
+    return null;
+  }
+}
+
+function _builtinSyncBlocksServerPull(
+  dir: string,
+  row: AgentInstall | SkillInstall,
+  meta = _readInstallMeta(dir),
+): boolean {
+  if (!false) return false;
+  if (meta?.seed_source !== 'builtin') return false;
+  return _compareVersions(meta.version, row.version) > 0;
+}
+
+function _versionTokens(value: unknown): Array<number | string> {
+  const text = typeof value === 'string' ? value.trim() : '';
+  if (!text) return [];
+  return text
+    .replace(/^v/i, '')
+    .split(/[.+_-]/)
+    .filter(Boolean)
+    .map((part) => (/^\d+$/.test(part) ? Number(part) : part.toLowerCase()));
+}
+
+function _compareVersions(a: unknown, b: unknown): number {
+  const aa = _versionTokens(a);
+  const bb = _versionTokens(b);
+  if (!aa.length || !bb.length) return 0;
+  const n = Math.max(aa.length, bb.length);
+  for (let i = 0; i < n; i++) {
+    const x = aa[i] ?? 0;
+    const y = bb[i] ?? 0;
+    if (x === y) continue;
+    if (typeof x === 'number' && typeof y === 'number') return x > y ? 1 : -1;
+    return String(x).localeCompare(String(y), undefined, { numeric: true, sensitivity: 'base' });
+  }
+  return 0;
+}
+
 interface InstallMeta {
   version: string;
   published_at: number;
   updated_at?: number;
   agent_json_url?: string;
+  agent_skills_bundle_url?: string;
   bundle_url?: string;
   installed_at?: number;
   create_uid?: string;
@@ -688,10 +914,14 @@ interface InstallMeta {
   is_open_source?: boolean;
   status?: string;
   state?: string;
+  seed_source?: string;
   /** sha256 (hex) of the spec's descriptive file at install / upload time —
    *  agent.json for agents, SKILL.md for skills. Used only by the dev-mode
    *  local-edit guard in `_needsPull`; absent on pre-feature installs. */
   content_sha?: string;
+  /** sha256-tree-v1 of the installed marketplace content tree. Used by dev-mode
+   *  local-edit guards to catch script/reference changes beyond the main spec file. */
+  content_tree_hash?: string;
 }
 
 function _freshnessAt(row: { published_at: number; updated_at?: number }): number {
@@ -731,6 +961,7 @@ function _installMetaFromAgentRow(row: AgentInstall): Partial<InstallMeta> {
     published_at: row.published_at,
     ...(typeof row.updated_at === 'number' ? { updated_at: row.updated_at } : {}),
     agent_json_url: row.agent_json_url,
+    ...(typeof row.agent_skills_bundle_url === 'string' ? { agent_skills_bundle_url: row.agent_skills_bundle_url } : {}),
     installed_at: row.installed_at,
     create_uid: row.create_uid || '',
     ...(typeof row.default_install === 'boolean' ? { default_install: row.default_install } : {}),
@@ -770,15 +1001,18 @@ function _readInstallMeta(dir: string): InstallMeta | null {
       published_at: j.published_at,
       ...(typeof j.updated_at === 'number' ? { updated_at: j.updated_at } : {}),
       agent_json_url: typeof j.agent_json_url === 'string' ? j.agent_json_url : '',
+      ...(typeof j.agent_skills_bundle_url === 'string' ? { agent_skills_bundle_url: j.agent_skills_bundle_url } : {}),
       bundle_url: typeof j.bundle_url === 'string' ? j.bundle_url : '',
       ...(typeof j.installed_at === 'number' ? { installed_at: j.installed_at } : {}),
       create_uid: typeof j.create_uid === 'string' ? j.create_uid : '',
+      ...(typeof j.seed_source === 'string' ? { seed_source: j.seed_source } : {}),
       ...(typeof j.default_install === 'boolean' ? { default_install: j.default_install } : {}),
       ...(typeof j.is_open_source === 'boolean' ? { is_open_source: j.is_open_source } : {}),
       ...(typeof j.status === 'string' ? { status: j.status } : (
         typeof j.state === 'string' ? { status: j.state } : {}
       )),
       ...(typeof j.content_sha === 'string' ? { content_sha: j.content_sha } : {}),
+      ...(typeof j.content_tree_hash === 'string' ? { content_tree_hash: j.content_tree_hash } : {}),
     };
   } catch { return null; }
 }
@@ -802,8 +1036,11 @@ async function _pullAgent(uid: string, row: AgentInstall, opts: MarketplaceRecon
 async function _pullAgentLocked(uid: string, row: AgentInstall, opts: MarketplaceReconcileOptions = {}): Promise<void> {
   let current = row;
   _assertContinue(opts);
-  let res = await fetchWithRetry(`marketplace:pull-agent:${row.id}`, current.agent_json_url);
-  if (!res.ok && res.status === 404) {
+  let res = await fetchWithRetry(`marketplace:pull-agent:${row.id}`, current.agent_json_url, undefined, {
+    timeoutMs: MARKETPLACE_AGENT_JSON_DOWNLOAD_TIMEOUT_MS,
+  });
+  const needsDetailRefresh = !res.ok && res.status === 404;
+  if (needsDetailRefresh) {
     _assertContinue(opts);
     const fresh = await postJson<{
       agent_json: Record<string, unknown>;
@@ -811,6 +1048,7 @@ async function _pullAgentLocked(uid: string, row: AgentInstall, opts: Marketplac
       published_at: number;
       updated_at?: number;
       agent_json_url: string;
+      agent_skills_bundle_url?: string;
       create_uid: string;
       default_install?: boolean;
       status?: string;
@@ -822,13 +1060,16 @@ async function _pullAgentLocked(uid: string, row: AgentInstall, opts: Marketplac
       published_at: fresh.published_at,
       ...(typeof fresh.updated_at === 'number' ? { updated_at: fresh.updated_at } : {}),
       agent_json_url: fresh.agent_json_url,
+      agent_skills_bundle_url: fresh.agent_skills_bundle_url || '',
       create_uid: fresh.create_uid || row.create_uid,
       ...(typeof fresh.default_install === 'boolean' ? { default_install: fresh.default_install } : {}),
       ...((fresh.status || fresh.state) ? { status: fresh.status || fresh.state } : {}),
     };
     _assertContinue(opts);
     await addAgentInstall(uid, current);
-    res = await fetchWithRetry(`marketplace:pull-agent:${row.id}:fresh`, current.agent_json_url);
+    res = await fetchWithRetry(`marketplace:pull-agent:${row.id}:fresh`, current.agent_json_url, undefined, {
+      timeoutMs: MARKETPLACE_AGENT_JSON_DOWNLOAD_TIMEOUT_MS,
+    });
   }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const text = await res.text();
@@ -836,6 +1077,8 @@ async function _pullAgentLocked(uid: string, row: AgentInstall, opts: Marketplac
   // Validate it parses — manifest-stored URLs come from COS, treat as untrusted.
   const parsed = JSON.parse(text) as Record<string, unknown>;
   if (typeof parsed.agent_id !== 'string') throw new Error('agent.json missing agent_id');
+  await _ensureAgentSkillDependencies(uid, row.id, parsed, opts);
+  const privateSkillsZip = await _fetchAgentPrivateSkillsBundle(row.id, current.agent_skills_bundle_url || '', opts);
 
   const dir = userMarketplaceAgentDir(uid, row.id);
   _assertContinue(opts);
@@ -845,11 +1088,18 @@ async function _pullAgentLocked(uid: string, row: AgentInstall, opts: Marketplac
   const agentJsonFile = path.join(dir, 'agent.json');
   _assertContinue(opts);
   await fsp.writeFile(agentJsonFile, text, 'utf8');
+  if (privateSkillsZip) {
+    _assertContinue(opts);
+    const privateSkillsDir = userMarketplaceAgentSkillsDir(uid, row.id);
+    await fsp.mkdir(privateSkillsDir, { recursive: true });
+    extractBundleSafely(new AdmZip(privateSkillsZip), privateSkillsDir);
+  }
   _assertContinue(opts);
   await _writeInstallMeta(dir, {
     version: current.version, published_at: current.published_at,
     ...(typeof current.updated_at === 'number' ? { updated_at: current.updated_at } : {}),
     agent_json_url: current.agent_json_url,
+    agent_skills_bundle_url: current.agent_skills_bundle_url || '',
     installed_at: current.installed_at,
     create_uid: current.create_uid || '',
     ...(typeof current.default_install === 'boolean' ? { default_install: current.default_install } : {}),
@@ -857,6 +1107,10 @@ async function _pullAgentLocked(uid: string, row: AgentInstall, opts: Marketplac
     ...(((): { content_sha?: string } => {
       const sha = sha256OfFile(agentJsonFile);
       return sha ? { content_sha: sha } : {};
+    })()),
+    ...(((): { content_tree_hash?: string } => {
+      const hash = marketplaceContentTreeHash(dir);
+      return hash ? { content_tree_hash: hash } : {};
     })()),
   });
 }
@@ -871,7 +1125,9 @@ async function _pullSkill(uid: string, row: SkillInstall, opts: MarketplaceRecon
 async function _pullSkillLocked(uid: string, row: SkillInstall, opts: MarketplaceReconcileOptions = {}): Promise<void> {
   let current = row;
   _assertContinue(opts);
-  let res = await fetchWithRetry(`marketplace:pull-skill:${row.id}`, current.bundle_url);
+  let res = await fetchWithRetry(`marketplace:pull-skill:${row.id}`, current.bundle_url, undefined, {
+    timeoutMs: MARKETPLACE_SKILL_BUNDLE_DOWNLOAD_TIMEOUT_MS,
+  });
   if (!res.ok && res.status === 404) {
     _assertContinue(opts);
     const fresh = await postJson<{
@@ -896,7 +1152,9 @@ async function _pullSkillLocked(uid: string, row: SkillInstall, opts: Marketplac
     };
     _assertContinue(opts);
     await addSkillInstall(uid, current);
-    res = await fetchWithRetry(`marketplace:pull-skill:${row.id}:fresh`, current.bundle_url);
+    res = await fetchWithRetry(`marketplace:pull-skill:${row.id}:fresh`, current.bundle_url, undefined, {
+      timeoutMs: MARKETPLACE_SKILL_BUNDLE_DOWNLOAD_TIMEOUT_MS,
+    });
   }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const ab = await res.arrayBuffer();
@@ -927,5 +1185,24 @@ async function _pullSkillLocked(uid: string, row: SkillInstall, opts: Marketplac
       const sha = sha256OfFile(skillMdFile);
       return sha ? { content_sha: sha } : {};
     })()),
+    ...(((): { content_tree_hash?: string } => {
+      const hash = marketplaceContentTreeHash(dir);
+      return hash ? { content_tree_hash: hash } : {};
+    })()),
   });
+}
+
+async function _fetchAgentPrivateSkillsBundle(
+  agentId: string,
+  bundleUrl: string,
+  opts: MarketplaceReconcileOptions = {},
+): Promise<Buffer | null> {
+  if (!bundleUrl) return null;
+  _assertContinue(opts);
+  const res = await fetchWithRetry(`marketplace:pull-agent-private-skills:${agentId}`, bundleUrl, undefined, {
+    timeoutMs: MARKETPLACE_SKILL_BUNDLE_DOWNLOAD_TIMEOUT_MS,
+  });
+  if (!res.ok) throw new Error(`agent private skills HTTP ${res.status}`);
+  _assertContinue(opts);
+  return Buffer.from(await res.arrayBuffer());
 }

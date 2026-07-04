@@ -17,7 +17,9 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-function writeRuntime(kind: 'python' | 'uv', key: string, executable: string): void {
+const RUNTIME_SIZES: Record<'python' | 'uv' | 'node', number> = { python: 101, uv: 202, node: 303 };
+
+function writeRuntime(kind: 'python' | 'uv' | 'node', key: string, executable: string): void {
   const dir = path.join(tmpDir, 'resources', 'runtime', kind, key);
   const exe = path.join(dir, ...executable.split('/'));
   fs.mkdirSync(path.dirname(exe), { recursive: true });
@@ -28,17 +30,23 @@ function writeRuntime(kind: 'python' | 'uv', key: string, executable: string): v
     for (const name of ['pip', 'pip3', 'pip3.12']) {
       fs.writeFileSync(path.join(scriptsDir, `${name}.cmd`), '@echo off\r\n');
     }
+  } else if (kind === 'uv') {
+    fs.writeFileSync(path.join(path.dirname(exe), 'uvx.exe'), '');
+  } else if (kind === 'node') {
+    // The gate verifies npm/npx companions live next to the node executable.
+    fs.writeFileSync(path.join(path.dirname(exe), 'npm.cmd'), '');
+    fs.writeFileSync(path.join(path.dirname(exe), 'npx.cmd'), '');
   }
   fs.writeFileSync(path.join(dir, '.orkas-runtime.json'), JSON.stringify({
     schema: 1,
     kind,
     platformKey: key,
-    version: kind === 'python' ? 'test-python' : 'test-uv',
+    version: `test-${kind}`,
     source: 'test',
     release: 'test',
     asset: `${kind}.zip`,
     sha256: `${kind}-sha`,
-    size: kind === 'python' ? 101 : 202,
+    size: RUNTIME_SIZES[kind],
   }, null, 2));
 }
 
@@ -77,6 +85,21 @@ function writeManifest(key: string): void {
         },
       },
     },
+    node: {
+      version: 'test-node',
+      source: 'test',
+      release: 'test',
+      assets: {
+        [key]: {
+          name: 'node.zip',
+          url: 'https://example.invalid/node.zip',
+          sha256: 'node-sha',
+          size: 303,
+          archive: 'zip',
+          executable: 'node.exe',
+        },
+      },
+    },
   }, null, 2));
 }
 
@@ -86,6 +109,7 @@ describe('codesign-adhoc runtime gate', () => {
     writeManifest(key);
     writeRuntime('python', key, 'python/python.exe');
     writeRuntime('uv', key, 'uv.exe');
+    writeRuntime('node', key, 'node.exe');
 
     await afterPack({
       electronPlatformName: 'win32',
@@ -101,5 +125,6 @@ describe('codesign-adhoc runtime gate', () => {
     expect(marker.status).toBe('passed');
     expect(marker.verified).toContain('runtime:python:win32-x64');
     expect(marker.verified).toContain('runtime:uv:win32-x64');
+    expect(marker.verified).toContain('runtime:node:win32-x64');
   });
 });

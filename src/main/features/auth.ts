@@ -541,6 +541,10 @@ export function getConfiguredModelCooldown(): {
   return best;
 }
 
+export function getConfiguredModelOAuthExpiredMessage(): string | null {
+  return null;
+}
+
 export async function getConfig(): Promise<AuthConfig> {
   // Default (provider, model) pair is `entries[0]` — the top of the priority
   // list. Credentials + model selection share one source of truth

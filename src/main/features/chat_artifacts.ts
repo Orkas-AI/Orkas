@@ -131,14 +131,19 @@ function artifactRelPath(cid: string, artifactId: string, rel = ''): string {
 }
 
 function notifyArtifactDirty(cid: string, artifactId: string): void {
-  void cid;
-  void artifactId;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
+    sync?.markDirty?.('chat_artifacts', artifactRelPath(cid, artifactId));
+  } catch { /* features/sync stripped */ }
 }
 
 function notifyArtifactDeleted(cid: string, artifactId: string, rel: string): void {
-  void cid;
-  void artifactId;
-  void rel;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = null as { markDeleted?: (relPath: string) => Promise<void> | void };
+    void sync?.markDeleted?.(artifactRelPath(cid, artifactId, rel));
+  } catch { /* features/sync stripped */ }
 }
 
 function listArtifactFilesRel(dir: string, prefix = ''): string[] {

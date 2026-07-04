@@ -35,7 +35,7 @@ function runtimeRoots(): string[] {
   return roots;
 }
 
-function runtimeVariantDirs(kind: 'python' | 'uv' | 'node'): string[] {
+function runtimeVariantDirs(kind: 'python' | 'uv' | 'node' | 'ffmpeg'): string[] {
   const dirs: string[] = [];
   for (const runtimeRoot of runtimeRoots()) {
     const root = path.join(runtimeRoot, kind);
@@ -99,6 +99,40 @@ function resolveNodeExecutable(): string | undefined {
   return undefined;
 }
 
+function resolveFfmpegBinary(kind: 'ffmpeg' | 'ffprobe'): string | undefined {
+  const envName = kind === 'ffmpeg' ? 'ORKAS_BUNDLED_FFMPEG' : 'ORKAS_BUNDLED_FFPROBE';
+  const configured = process.env[envName];
+  if (isFile(configured)) return configured;
+
+  const name = process.platform === 'win32' ? `${kind}.exe` : kind;
+  for (const dir of runtimeVariantDirs('ffmpeg')) {
+    const candidate = path.join(dir, name);
+    if (isFile(candidate)) return candidate;
+    // Tolerate a per-binary `bin/` layout if a future vendor step nests them.
+    const nested = path.join(dir, 'bin', name);
+    if (isFile(nested)) return nested;
+  }
+  return undefined;
+}
+
+/**
+ * Bundled ffmpeg/ffprobe absolute paths, or undefined when not vendored for
+ * this platform. HyperFrames render REQUIRES system ffmpeg+ffprobe and ships
+ * neither; pointing it at these via `HYPERFRAMES_FFMPEG_PATH` /
+ * `HYPERFRAMES_FFPROBE_PATH` makes rendering deterministic instead of relying
+ * on whatever the user's machine happens to have. When undefined (e.g. a dev
+ * checkout before the vendor step), callers should leave the override unset so
+ * HyperFrames falls back to scanning common install dirs.
+ */
+export function bundledFfmpegPaths(): { ffmpeg?: string; ffprobe?: string } {
+  const result: { ffmpeg?: string; ffprobe?: string } = {};
+  const ffmpeg = resolveFfmpegBinary('ffmpeg');
+  const ffprobe = resolveFfmpegBinary('ffprobe');
+  if (ffmpeg) result.ffmpeg = ffmpeg;
+  if (ffprobe) result.ffprobe = ffprobe;
+  return result;
+}
+
 function pushPathDir(out: string[], seen: Set<string>, dir: string | undefined): void {
   if (!isDir(dir)) return;
   const resolved = path.resolve(dir);
@@ -126,6 +160,28 @@ export function bundledRuntimePathEntries(): string[] {
   const node = resolveNodeExecutable();
   if (node) pushPathDir(entries, seen, path.dirname(node));
   return entries;
+}
+
+/** Absolute path to the bundled Node executable, or undefined when not present. */
+export function bundledNodeExecutable(): string | undefined {
+  return resolveNodeExecutable();
+}
+
+/**
+ * Absolute path to the bundled npm `npx-cli.js`, or undefined when not present.
+ * Resolved relative to the bundled Node so callers can run it as
+ * `node <npx-cli.js> ...` — robust cross-platform (no shebang / `.cmd` / shell
+ * dependency, unlike spawning `npx` directly).
+ */
+export function bundledNpxCli(): string | undefined {
+  const node = resolveNodeExecutable();
+  if (!node) return undefined;
+  const dir = path.dirname(node);
+  const candidates = process.platform === 'win32'
+    ? [path.join(dir, 'node_modules', 'npm', 'bin', 'npx-cli.js')]
+    : [path.join(dir, '..', 'lib', 'node_modules', 'npm', 'bin', 'npx-cli.js')];
+  for (const c of candidates) if (isFile(c)) return c;
+  return undefined;
 }
 
 export function bundledRuntimeEnv(): Record<string, string> {

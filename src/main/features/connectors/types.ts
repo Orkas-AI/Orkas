@@ -141,6 +141,8 @@ export interface DcrClientCredentials {
   client_id: string;
   /** Most providers issue one; some omit (public clients). */
   client_secret?: string;
+  /** How the provider expects client credentials on token requests. */
+  token_endpoint_auth_method?: 'client_secret_post' | 'client_secret_basic' | 'none';
   /** Captured from provider discovery — kept for refresh + revoke later. */
   authorization_endpoint: string;
   token_endpoint: string;

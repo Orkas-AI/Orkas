@@ -21,6 +21,12 @@ export interface SkillSpec {
   skillFile: string;
   /** Where this skill was loaded from (which `dirs` entry). */
   source: string;
+  /** When set, the skill is PRIVATE to the named owning agent (its
+   *  `agent_id`). Hosts that render skills into a prompt or UI use this to
+   *  gate exposure: render only for that agent, hide from every other actor
+   *  (commander, other agents) and from user-facing skill lists. Absent =
+   *  normal shared skill. Parsed from SKILL.md frontmatter `ownerAgent`. */
+  ownerAgent?: string;
 }
 
 function descriptionLocale(lang: string): 'zh' | 'en' {

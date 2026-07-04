@@ -1,24 +1,23 @@
 // Memory detail page + import/export flows.
 //
 // A view over the main-process `features/memory.ts` (channels in
-// `ipc/memory.ts`): personal cross-session memory the agents keep about the
-// user. TWO kinds — preferences (USER.md, target="user") and facts (MEMORY.md,
-// target="memory"). Memory is PERSONAL, not team-shared.
+// `ipc/memory.ts`): cross-session memory surfaced in Settings. This page shows
+// user profile (USER.md, scope "user") and global shared notes (MEMORY.md,
+// scope "shared"). Per-agent memory still exists for agent detail/runtime, but
+// is intentionally not shown here.
 //
-// The page (breadcrumb + header + two sections) renders into #memory-page;
-// the import/export modals mount into a body overlay. Char limits live in the
-// backend and travel in each list response's `usage.limit` — never hardcoded
-// here. Stored entries are plain text (no per-entry kind/source in the model),
-// so detail cards show text only; the advisory kind pill appears only in the
-// import-review step where it's freshly computed by `memory.importParse`.
+// Char limits live in the backend and travel in each list response's
+// `usage.limit` — never hardcoded here. Stored entries are plain text.
 
-const _MEM_TARGETS = ['user', 'memory'];
 const _MEM_LIMIT_WARN = 0.85; // usage bar turns warn above this fraction
 
-// Last list result per target: { entries:[], usage:{current,limit}, path }.
-let _memData = { user: null, memory: null };
+// Ordered scope descriptors for the current render:
+//   { key, kind:'user'|'shared', title, sub, icon }
+let _memScopes = [];
+// Last list result per scope-key: { entries:[], usage:{current,limit}, path }.
+let _memData = {};
 // Inline editor state: at most one entry editable at a time.
-//   { target, mode:'edit'|'add', oldText? }  — null when no editor open.
+//   { target /* scope-key */, mode:'edit'|'add', oldText? } — null when closed.
 let _memEditor = null;
 
 function _memIc(name) {
@@ -30,9 +29,11 @@ function _memToast(msg, variant) {
 }
 
 function _memTrack(action, data) {
+  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
 function _memTrackError(action, data) {
+  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
 async function _memInvoke(channel, payload) {
@@ -50,15 +51,33 @@ async function _memInvoke(channel, payload) {
   }
 }
 
+// ── Scope plumbing ───────────────────────────────────────────────────────────
+
+// A scope-key ('user' | 'shared') → the IPC payload the backend expects.
+// 'memory' (legacy) is accepted as 'shared'.
+function _memParseScope(key) {
+  if (key === 'user') return { target: 'user' };
+  return { target: 'shared' }; // 'shared' | 'memory' | default
+}
+
+function _memScopePayload(key, extra) {
+  return Object.assign({}, _memParseScope(key), extra || {});
+}
+
 // ── Data load ──────────────────────────────────────────────────────────────
 
 async function _memLoad() {
-  const [user, mem] = await Promise.all([
-    _memInvoke('memory.list', { target: 'user' }),
-    _memInvoke('memory.list', { target: 'memory' }),
-  ]);
-  _memData.user = user && user.ok ? user : { entries: [], usage: { current: 0, limit: 0 }, path: '' };
-  _memData.memory = mem && mem.ok ? mem : { entries: [], usage: { current: 0, limit: 0 }, path: '' };
+  _memScopes = [
+    { key: 'user', kind: 'user', title: t('memory.section_user'), sub: t('memory.section_user_sub'), icon: 'users' },
+    { key: 'shared', kind: 'shared', title: t('memory.section_shared'), sub: t('memory.section_shared_sub'), icon: 'sparkles' },
+  ];
+
+  const results = await Promise.all(_memScopes.map((s) => _memInvoke('memory.list', _memParseScope(s.key))));
+  _memData = {};
+  _memScopes.forEach((s, i) => {
+    const r = results[i];
+    _memData[s.key] = (r && r.ok) ? r : { entries: [], usage: { current: 0, limit: 0 }, path: '' };
+  });
 }
 
 // ── Page render ──────────────────────────────────────────────────────────────
@@ -71,9 +90,14 @@ async function renderMemoryPage() {
 }
 
 function _memRenderInto(host) {
-  const u = _memData.user || { entries: [], usage: { current: 0, limit: 0 } };
-  const m = _memData.memory || { entries: [], usage: { current: 0, limit: 0 } };
-  const total = (u.entries || []).length + (m.entries || []).length;
+  let total = 0;
+  _memScopes.forEach((s) => { total += ((_memData[s.key] && _memData[s.key].entries) || []).length; });
+
+  const sections = [];
+  _memScopes.forEach((s) => {
+    const data = _memData[s.key] || { entries: [], usage: { current: 0, limit: 0 } };
+    sections.push(_memRenderSection(s, data));
+  });
 
   host.innerHTML = `
     <div class="memory-detail-header">
@@ -95,8 +119,7 @@ function _memRenderInto(host) {
 
     <div class="memory-scroll o-scroll">
       <div class="memory-col">
-        ${_memRenderSection('user', u, 'users', t('memory.section_user'), t('memory.section_user_sub'))}
-        ${_memRenderSection('memory', m, 'sparkles', t('memory.section_memory'), t('memory.section_memory_sub'))}
+        ${sections.join('')}
       </div>
     </div>
   `;
@@ -105,10 +128,11 @@ function _memRenderInto(host) {
   _memBindPage(host);
 }
 
-function _memRenderSection(target, data, iconName, title, sub) {
+function _memRenderSection(scope, data) {
+  const target = scope.key;
   const entries = data.entries || [];
   const usage = data.usage || { current: 0, limit: 0 };
-  const fileName = target === 'memory' ? 'MEMORY.md' : 'USER.md';
+  const fileName = scope.kind === 'user' ? 'USER.md' : 'MEMORY.md';
   const rows = [];
 
   // "Add" inline editor at the top of the section when adding here.
@@ -127,14 +151,14 @@ function _memRenderSection(target, data, iconName, title, sub) {
   return `
     <div class="memory-section">
       <div class="memory-section-head">
-        <span class="memory-section-icon">${_memIc(iconName)}</span>
-        <h2 class="memory-section-title">${escapeHtml(title)}</h2>
+        <span class="memory-section-icon">${_memIc(scope.icon)}</span>
+        <h2 class="memory-section-title">${escapeHtml(scope.title)}</h2>
         <span class="memory-section-file">${escapeHtml(fileName)} · ${t('memory.count', { n: entries.length })}</span>
         <span class="memory-flex"></span>
         ${_memRenderUsage(usage)}
-        <button type="button" class="memory-icon-btn" data-mem-action="add" data-mem-target="${target}" title="${escapeHtml(t('memory.add_entry'))}">${_memIc('plus')}</button>
+        <button type="button" class="memory-icon-btn" data-mem-action="add" data-mem-target="${escapeHtml(target)}" title="${escapeHtml(t('memory.add_entry'))}">${_memIc('plus')}</button>
       </div>
-      <p class="memory-section-sub">${escapeHtml(sub)}</p>
+      <p class="memory-section-sub">${escapeHtml(scope.sub)}</p>
       ${rows.join('')}
     </div>
   `;
@@ -159,8 +183,8 @@ function _memRenderEntry(target, text, idx) {
       <div class="memory-entry-text">${escapeHtml(text)}</div>
       <div class="memory-entry-foot">
         <span class="memory-flex"></span>
-        <button type="button" class="memory-icon-btn" data-mem-action="edit" data-mem-target="${target}" data-mem-idx="${idx}" title="${escapeHtml(t('memory.edit'))}">${_memIc('edit-pencil')}</button>
-        <button type="button" class="memory-icon-btn is-muted" data-mem-action="delete" data-mem-target="${target}" data-mem-idx="${idx}" title="${escapeHtml(t('memory.delete'))}">${_memIc('x')}</button>
+        <button type="button" class="memory-icon-btn" data-mem-action="edit" data-mem-target="${escapeHtml(target)}" data-mem-idx="${idx}" title="${escapeHtml(t('memory.edit'))}">${_memIc('edit-pencil')}</button>
+        <button type="button" class="memory-icon-btn is-muted" data-mem-action="delete" data-mem-target="${escapeHtml(target)}" data-mem-idx="${idx}" title="${escapeHtml(t('memory.delete'))}">${_memIc('x')}</button>
       </div>
     </div>
   `;
@@ -169,14 +193,14 @@ function _memRenderEntry(target, text, idx) {
 function _memRenderEditor(target, text) {
   const usage = (_memData[target] && _memData[target].usage) || { current: 0, limit: 0 };
   return `
-    <div class="memory-entry is-editing" data-mem-editor="${target}">
+    <div class="memory-entry is-editing" data-mem-editor="${escapeHtml(target)}">
       <textarea class="memory-entry-textarea" rows="3">${escapeHtml(text)}</textarea>
       <div class="memory-entry-foot">
         <span class="memory-entry-charcount" data-mem-charcount>${(text || '').length}</span>
         <span class="memory-entry-charlimit muted"> / ${usage.limit || 0}</span>
         <span class="memory-flex"></span>
         <button type="button" class="btn btn-sm" data-mem-action="cancel-edit">${escapeHtml(t('memory.cancel'))}</button>
-        <button type="button" class="btn btn-sm btn-primary" data-mem-action="save-edit" data-mem-target="${target}">${escapeHtml(t('memory.save'))}</button>
+        <button type="button" class="btn btn-sm btn-primary" data-mem-action="save-edit" data-mem-target="${escapeHtml(target)}">${escapeHtml(t('memory.save'))}</button>
       </div>
     </div>
   `;
@@ -251,7 +275,7 @@ async function _memOnPageAction(e) {
       _memRerender();
       return;
     case 'edit': {
-      const text = (_memData[target].entries || [])[Number(idx)];
+      const text = ((_memData[target] && _memData[target].entries) || [])[Number(idx)];
       if (text === undefined) return;
       _memTrack('memory_entry_edit_start', { target, idx: Number(idx) });
       _memEditor = { target, mode: 'edit', oldText: text };
@@ -268,7 +292,7 @@ async function _memOnPageAction(e) {
       await _memSaveEditor(target);
       return;
     case 'delete': {
-      const text = (_memData[target].entries || [])[Number(idx)];
+      const text = ((_memData[target] && _memData[target].entries) || [])[Number(idx)];
       if (text === undefined) return;
       _memTrack('memory_entry_delete_click', { target, idx: Number(idx) });
       await _memDelete(target, text);
@@ -292,15 +316,15 @@ function _memRerender() {
 }
 
 async function _memSaveEditor(target) {
-  const editorEl = document.querySelector(`[data-mem-editor="${target}"]`);
+  const editorEl = document.querySelector(`[data-mem-editor="${CSS.escape(target)}"]`);
   const ta = editorEl && editorEl.querySelector('.memory-entry-textarea');
   if (!ta) return;
   const content = ta.value.trim();
   if (!content) return;
   const isEdit = _memEditor && _memEditor.mode === 'edit';
   const res = isEdit
-    ? await _memInvoke('memory.replace', { target, oldText: _memEditor.oldText, content })
-    : await _memInvoke('memory.add', { target, content });
+    ? await _memInvoke('memory.replace', _memScopePayload(target, { oldText: _memEditor.oldText, content }))
+    : await _memInvoke('memory.add', _memScopePayload(target, { content }));
   if (!res.ok) {
     _memTrackError('memory_entry_save', { target, mode: isEdit ? 'edit' : 'add', msg: res.error || 'failed' });
     _memToast(_memErrorToText(res.error), 'error');
@@ -308,8 +332,9 @@ async function _memSaveEditor(target) {
   }
   _memTrack('memory_entry_save_ok', { target, mode: isEdit ? 'edit' : 'add', chars: content.length });
   _memEditor = null;
-  // Refresh just this target from the op result (it already carries entries+usage).
-  _memData[target] = { entries: res.entries || [], usage: res.usage || _memData[target].usage, path: _memData[target].path };
+  // Refresh just this scope from the op result (it already carries entries+usage).
+  const prev = _memData[target] || {};
+  _memData[target] = { entries: res.entries || [], usage: res.usage || prev.usage, path: prev.path };
   _memRerender();
 }
 
@@ -318,14 +343,15 @@ async function _memDelete(target, text) {
     ? await uiConfirm({ message: t('memory.delete_confirm'), okLabel: t('memory.delete'), cancelLabel: t('memory.cancel') })
     : true;
   if (!ok) return;
-  const res = await _memInvoke('memory.remove', { target, oldText: text });
+  const res = await _memInvoke('memory.remove', _memScopePayload(target, { oldText: text }));
   if (!res.ok) {
     _memTrackError('memory_entry_delete', { target, msg: res.error || 'failed' });
     _memToast(_memErrorToText(res.error), 'error');
     return;
   }
   _memTrack('memory_entry_delete_ok', { target });
-  _memData[target] = { entries: res.entries || [], usage: res.usage || _memData[target].usage, path: _memData[target].path };
+  const prev = _memData[target] || {};
+  _memData[target] = { entries: res.entries || [], usage: res.usage || prev.usage, path: prev.path };
   _memRerender();
 }
 
@@ -375,9 +401,9 @@ function _memModalHeader(title, step, sub) {
   `;
 }
 
-// ── Import flow ──────────────────────────────────────────────────────────────
+// ── Import flow (user + shared only; per-agent seeding is done inline) ─────────
 
-let _memImportItems = []; // [{ text, target, kind, threat, keep }]
+let _memImportItems = []; // [{ text, target:'user'|'shared', kind, threat, keep }]
 
 function _memOpenImport(mode) {
   const host = _memOpenModal(560, `
@@ -390,7 +416,6 @@ function _memOpenImport(mode) {
         <span class="memory-import-formats muted">${escapeHtml(t('memory.import_formats'))}</span>
       </div>
       <textarea class="memory-import-textarea" id="memory-import-text" placeholder="${escapeHtml(t('memory.import_placeholder'))}"></textarea>
-      <input type="file" id="memory-import-file-input" accept=".md,.txt,.json" hidden />
     </div>
     <div class="memory-modal-foot">
       <span class="memory-import-stat muted" id="memory-import-stat"></span>
@@ -402,7 +427,6 @@ function _memOpenImport(mode) {
 
   const ta = host.querySelector('#memory-import-text');
   const stat = host.querySelector('#memory-import-stat');
-  const fileInput = host.querySelector('#memory-import-file-input');
   const updateStat = () => {
     const v = ta.value;
     const lines = v.trim() ? v.trim().split(/\n+/).length : 0;
@@ -416,26 +440,39 @@ function _memOpenImport(mode) {
       const which = tab.getAttribute('data-mem-import-tab');
       _memTrack('memory_import_mode', { mode: which });
       host.querySelectorAll('[data-mem-import-tab]').forEach((tt) => tt.classList.toggle('is-active', tt === tab));
-      if (which === 'file') fileInput.click();
+      if (which === 'file') _memPickImportFile(ta, updateStat);
       else ta.focus();
     });
-  });
-  fileInput.addEventListener('change', async () => {
-    const f = fileInput.files && fileInput.files[0];
-    if (!f) return;
-    try {
-      ta.value = await f.text();
-      updateStat();
-    } catch (_) {
-      _memToast(t('memory.error_generic'), 'error');
-    }
   });
 
   host.querySelector('#memory-import-parse-btn').addEventListener('click', () => _memDoParse(ta.value));
   host.querySelectorAll('[data-mem-action="modal-close"]').forEach((b) => b.addEventListener('click', _memCloseModal));
 
-  if (mode === 'file') fileInput.click();
+  if (mode === 'file') _memPickImportFile(ta, updateStat);
   else setTimeout(() => ta.focus(), 0);
+}
+
+async function _memPickImportFile(ta, updateStat) {
+  try {
+    const res = await window.orkas.invoke('common.pickFiles', {
+      title: t('memory.import_file'),
+      extensions: ['md', 'txt', 'json'],
+      multiple: false,
+    });
+    const file = res && Array.isArray(res.files) ? res.files[0] : null;
+    if (!file) return;
+    ta.value = _memDecodeBase64Text(file.dataBase64 || '');
+    updateStat();
+  } catch (_) {
+    _memToast(t('memory.error_generic'), 'error');
+  }
+}
+
+function _memDecodeBase64Text(b64) {
+  const bin = atob(String(b64 || ''));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder('utf-8').decode(bytes);
 }
 
 async function _memDoParse(text) {
@@ -444,8 +481,13 @@ async function _memDoParse(text) {
   const res = await _memInvoke('memory.importParse', { text });
   if (!res.ok || !Array.isArray(res.items)) { _memTrackError('memory_import_parse', { msg: res.error || 'failed' }); _memToast(t('memory.error_generic'), 'error'); return; }
   if (!res.items.length) { _memToast(t('memory.import_empty'), 'warning'); return; }
-  // Flagged items default to unchecked; clean ones checked.
-  _memImportItems = res.items.map((it) => ({ ...it, keep: !it.threat }));
+  // Flagged items default to unchecked; clean ones checked. The backend
+  // classifier emits 'memory'|'user' — normalize 'memory' → 'shared'.
+  _memImportItems = res.items.map((it) => ({
+    ...it,
+    target: it.target === 'user' ? 'user' : 'shared',
+    keep: !it.threat,
+  }));
   _memOpenImportReview();
 }
 
@@ -487,7 +529,7 @@ function _memRenderImportRow(it, i) {
         <div class="memory-import-row-meta">
           <div class="memory-seg" role="group">
             <button type="button" class="memory-seg-opt${it.target === 'user' ? ' is-active' : ''}" data-mem-action="set-target" data-mem-row="${i}" data-mem-target="user">${escapeHtml(t('memory.kind_group_user'))}</button>
-            <button type="button" class="memory-seg-opt${it.target === 'memory' ? ' is-active' : ''}" data-mem-action="set-target" data-mem-row="${i}" data-mem-target="memory">${escapeHtml(t('memory.kind_group_memory'))}</button>
+            <button type="button" class="memory-seg-opt${it.target === 'shared' ? ' is-active' : ''}" data-mem-action="set-target" data-mem-row="${i}" data-mem-target="shared">${escapeHtml(t('memory.kind_group_shared'))}</button>
           </div>
           ${kindLabel ? `<span class="memory-kind-pill">${escapeHtml(kindLabel)}</span>` : ''}
           ${threatLabel ? `<span class="memory-threat-pill">${escapeHtml(threatLabel)}</span>` : ''}
@@ -528,10 +570,10 @@ function _memBindImportReview(host) {
 function _memUpdateMergeSummary(host) {
   const kept = _memImportItems.filter((it) => it.keep);
   const nUser = kept.filter((it) => it.target === 'user').length;
-  const nMem = kept.filter((it) => it.target === 'memory').length;
+  const nShared = kept.filter((it) => it.target === 'shared').length;
   const summary = host.querySelector('#memory-merge-summary');
   const label = host.querySelector('#memory-merge-label');
-  if (summary) summary.textContent = t('memory.merge_summary', { user: nUser, memory: nMem });
+  if (summary) summary.textContent = t('memory.merge_summary', { user: nUser, memory: nShared });
   if (label) label.textContent = ' ' + t('memory.merge_action', { n: kept.length });
   const mergeBtn = host.querySelector('#memory-review-merge');
   if (mergeBtn) mergeBtn.disabled = kept.length === 0;
@@ -543,7 +585,8 @@ async function _memDoMerge() {
   let added = 0;
   let failed = 0;
   for (const it of kept) {
-    const res = await _memInvoke('memory.add', { target: it.target, content: it.text });
+    // it.target is 'user' | 'shared' (a scope-key the backend accepts directly).
+    const res = await _memInvoke('memory.add', _memScopePayload(it.target, { content: it.text }));
     if (res.ok) added++;
     else failed++;
   }
@@ -560,20 +603,23 @@ async function _memOpenExport() {
   const info = await _memInvoke('memory.exportInfo', {});
   if (!info.ok || !info.files) { _memToast(t('memory.error_generic'), 'error'); return; }
   const files = info.files;
-  const fileRow = (target, name, label) => {
-    const f = files[target] || { count: 0, size: 0 };
+
+  // Each export row carries its scope-key + a raw-text payload, looked up by id.
+  const rawByScope = {};
+  const row = (scopeKey, f, name, label) => {
+    rawByScope[scopeKey] = (f && f.raw) || '';
     return `
-      <div class="memory-export-row" data-mem-export="${target}">
+      <div class="memory-export-row" data-mem-export="${escapeHtml(scopeKey)}">
         <span class="memory-export-icon">${_memIc('file-text')}</span>
         <div class="memory-export-meta">
           <div class="memory-export-namerow">
             <span class="memory-export-name">${escapeHtml(name)}</span>
             <span class="memory-export-label muted">${escapeHtml(label)}</span>
           </div>
-          <div class="memory-export-sub">${t('memory.count', { n: f.count })} · ${_memFmtSize(f.size)}</div>
+          <div class="memory-export-sub">${t('memory.count', { n: (f && f.count) || 0 })} · ${_memFmtSize((f && f.size) || 0)}</div>
         </div>
-        <button type="button" class="btn btn-sm" data-mem-action="copy" data-mem-target="${target}"><span>${escapeHtml(t('memory.copy_content'))}</span></button>
-        <button type="button" class="btn btn-sm" data-mem-action="reveal" data-mem-target="${target}"><span>${escapeHtml(t('memory.reveal_file'))}</span></button>
+        <button type="button" class="btn btn-sm" data-mem-action="copy" data-mem-target="${escapeHtml(scopeKey)}"><span>${escapeHtml(t('memory.copy_content'))}</span></button>
+        <button type="button" class="btn btn-sm" data-mem-action="reveal" data-mem-target="${escapeHtml(scopeKey)}"><span>${escapeHtml(t('memory.reveal_file'))}</span></button>
       </div>
     `;
   };
@@ -581,8 +627,8 @@ async function _memOpenExport() {
   const host = _memOpenModal(460, `
     ${_memModalHeader(t('memory.export_title'), '', t('memory.export_sub'))}
     <div class="memory-modal-body memory-export-body">
-      ${fileRow('user', 'USER.md', t('memory.kind_group_user'))}
-      ${fileRow('memory', 'MEMORY.md', t('memory.kind_group_memory'))}
+      ${row('user', files.user, t('memory.section_user'), t('memory.kind_group_user'))}
+      ${row('shared', files.shared, t('memory.section_shared'), t('memory.kind_group_shared'))}
     </div>
   `);
 
@@ -591,8 +637,8 @@ async function _memOpenExport() {
     const labelEl = b.querySelector('span');
     const original = labelEl ? labelEl.textContent : '';
     b.addEventListener('click', async () => {
-      const target = b.getAttribute('data-mem-target');
-      const raw = (files[target] && files[target].raw) || '';
+      const scopeKey = b.getAttribute('data-mem-target');
+      const raw = rawByScope[scopeKey] || '';
       // Inline feedback (not a toast) — the toast host sits below this modal,
       // so a copy-success toast would be occluded. Swap the button label.
       let ok = true;
@@ -610,7 +656,7 @@ async function _memOpenExport() {
     });
   });
   host.querySelectorAll('[data-mem-action="reveal"]').forEach((b) => {
-    b.addEventListener('click', () => _memInvoke('memory.reveal', { target: b.getAttribute('data-mem-target') }));
+    b.addEventListener('click', () => _memInvoke('memory.reveal', _memParseScope(b.getAttribute('data-mem-target'))));
   });
 }
 
@@ -646,11 +692,13 @@ window.addEventListener('i18n-change', () => {
 async function _memRefreshEntryCount() {
   const desc = document.getElementById('memory-entry-desc');
   if (!desc) return;
-  const [u, m] = await Promise.all([
-    _memInvoke('memory.list', { target: 'user' }),
-    _memInvoke('memory.list', { target: 'memory' }),
-  ]);
-  const n = ((u.entries || []).length) + ((m.entries || []).length);
+  // Settings memory count mirrors this page: user + global shared only.
+  const info = await _memInvoke('memory.exportInfo', {});
+  let n = 0;
+  if (info && info.ok && info.files) {
+    n += (info.files.user && info.files.user.count) || 0;
+    n += (info.files.shared && info.files.shared.count) || 0;
+  }
   desc.textContent = t('memory.entry_desc', { n });
 }
 

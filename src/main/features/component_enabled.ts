@@ -48,8 +48,15 @@ import { createLogger } from '../logger';
 
 const log = createLogger('component-enabled');
 
+// Lazy require sync: the module is stripped from the open-source build builds, and a static import would
+// break that build at module-load time. When sync is absent we silently no-op — the file
+// still sits at `cloud/config/` for whenever sync becomes available.
 function _notifyDirty(): void {
-  // The open-source build is local-only; cloud sync notification is intentionally absent.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
+    sync?.markDirty?.('component_enabled', 'cloud/config/component-enabled.json');
+  } catch { /* features/sync stripped */ }
 }
 
 const SCHEMA_VERSION = 1;

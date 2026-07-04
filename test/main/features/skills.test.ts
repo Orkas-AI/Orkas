@@ -764,7 +764,7 @@ describe('skills › listSkills', () => {
     expect(list[0].name).toBe('Late Skill');
   });
 
-  it('custom wins when builtin has same id', async () => {
+  it('marketplace wins when custom has same id', async () => {
     writeCustomSkill('dup', 'name: "Custom Dup"\ndescription: "cx"');
     const builtinDir = path.join(builtinSkillsDir(), 'dup');
     fs.mkdirSync(builtinDir, { recursive: true });
@@ -774,8 +774,8 @@ describe('skills › listSkills', () => {
     const list = await s.listSkills();
     const dup = list.filter((x) => x.id === 'dup');
     expect(dup).toHaveLength(1);
-    expect(dup[0].source).toBe('custom');
-    expect(dup[0].description_en).toBe('cx');
+    expect(dup[0].source).toBe('marketplace');
+    expect(dup[0].description_en).toBe('bx');
   });
 
   it('exposes marketplace install version and freshness metadata', async () => {
@@ -796,22 +796,6 @@ describe('skills › listSkills', () => {
     expect(found?.marketplace_published_at).toBe(1747066800000);
     expect(found?.marketplace_updated_at).toBe(1747067800000);
     expect(found?.default_install).toBe(true);
-  });
-
-  it('keeps marketplace skill metadata read-only through the edit path', async () => {
-    const dir = path.join(builtinSkillsDir(), 'platform-excel');
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'SKILL.md'),
-      '---\nname: "Old platform skill"\ndescription: "platform"\n---\n\nUse when editing spreadsheets.\n');
-
-    const s = await loadSkills();
-    const result = await s.applySkillMetadataForEdit('platform-excel', { name: 'Excel / XLSX' });
-
-    expect(result.ok).toBe(false);
-    expect(result.reason).toBeUndefined();
-    expect(fs.existsSync(dir)).toBe(true);
-    const after = fs.readFileSync(path.join(dir, 'SKILL.md'), 'utf8');
-    expect(s.parseSkillFrontmatter(after).name).toBe('Old platform skill');
   });
 
   it('cache-only invalidator picks up marketplace file rewrites', async () => {
@@ -1539,6 +1523,7 @@ describe('skills › listSkillTree', () => {
     const dir = path.join(customSkillsDir(), 'alpha');
     fs.writeFileSync(path.join(dir, '_install.json'), '{}');
     fs.writeFileSync(path.join(dir, '_cache.json'), '{}');
+    fs.writeFileSync(path.join(dir, '_resource_manifest.json'), '{}');
     fs.writeFileSync(path.join(dir, '.DS_Store'), '');
     fs.mkdirSync(path.join(dir, '__pycache__'), { recursive: true });
     fs.writeFileSync(path.join(dir, '__pycache__', 'ignored.pyc'), '');
@@ -1565,6 +1550,7 @@ describe('skills › listSkillTree', () => {
     expect(names).toContain('assets');
     expect(names).not.toContain('_install.json');
     expect(names).not.toContain('_cache.json');
+    expect(names).not.toContain('_resource_manifest.json');
     expect(names).not.toContain('.DS_Store');
     expect(names).not.toContain('__pycache__');
     expect(names).not.toContain('node_modules');

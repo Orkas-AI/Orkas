@@ -9,6 +9,7 @@ let tmpDir: string;
 let prevWs: string | undefined;
 
 beforeEach(() => {
+  vi.doUnmock('node:fs');
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-system-skills-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
@@ -25,7 +26,7 @@ afterEach(() => {
 
 function packagedSystemSkill(id: string): string {
   return fs.readFileSync(
-    path.resolve(process.cwd(), 'src', 'main', 'system_skills', id, 'SKILL.md'),
+    path.resolve(process.cwd(), 'resources', 'builtin', 'system', 'skills', id, 'SKILL.md'),
     'utf8',
   );
 }
@@ -48,6 +49,7 @@ describe('system skills reconciliation', () => {
     expect(results.map((r) => [r.id, r.action]).sort()).toEqual([
       ['agent-creator', 'created'],
       ['autotask-creator', 'created'],
+      ['coding', 'created'],
       ['package-installer', 'created'],
       ['skill-creator', 'created'],
     ]);
@@ -74,6 +76,7 @@ describe('system skills reconciliation', () => {
     expect(results.map((r) => [r.id, r.action]).sort()).toEqual([
       ['agent-creator', 'created'],
       ['autotask-creator', 'created'],
+      ['coding', 'created'],
       ['package-installer', 'created'],
       ['skill-creator', 'created'],
     ]);
@@ -93,7 +96,7 @@ describe('system skills reconciliation', () => {
     await systemSkills.reconcileAllForActiveUser();
     fs.writeFileSync(path.join(paths.userSystemSkillDir(UID, 'agent-creator'), '_system.json'), '{}');
     const skipped = await systemSkills.reconcileAllForActiveUser();
-    expect(skipped.map((r) => r.action)).toEqual(['skipped', 'skipped', 'skipped', 'skipped']);
+    expect(skipped.map((r) => r.action)).toEqual(['skipped', 'skipped', 'skipped', 'skipped', 'skipped']);
     expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'agent-creator'), '_system.json'))).toBe(false);
 
     const skillManifest = paths.userSystemSkillsManifestFile(UID);
@@ -123,40 +126,31 @@ describe('system skills reconciliation', () => {
   });
 
   it('retries failed reconciliation twice', async () => {
-    let failures = 2;
-    try {
-      vi.doMock('node:fs', async () => {
-        const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
-        const descriptors = Object.getOwnPropertyDescriptors(realFs);
-        delete descriptors.copyFileSync;
-        const mockFs = Object.create(null);
-        Object.defineProperties(mockFs, descriptors);
-        Object.defineProperty(mockFs, 'copyFileSync', {
-          configurable: true,
-          enumerable: true,
-          value(src: fs.PathOrFileDescriptor, dest: fs.PathOrFileDescriptor, mode?: number) {
-            if (String(src).includes(path.join('agent-creator', 'SKILL.md')) && failures > 0) {
-              failures -= 1;
-              throw new Error('temporary copy failure');
-            }
-            return realFs.copyFileSync(src, dest, mode);
-          },
-        });
-        return mockFs;
-      });
-      const users = await import('../../../src/main/features/users');
-      const systemSkills = await import('../../../src/main/features/system_skills');
-      const paths = await import('../../../src/main/paths');
-      users.activateUser(UID);
+    const users = await import('../../../src/main/features/users');
+    const systemSkills = await import('../../../src/main/features/system_skills');
+    const paths = await import('../../../src/main/paths');
+    users.activateUser(UID);
 
-      const results = await systemSkills.reconcileAllForUserWithRetry(UID, { retries: 2, delayMs: 0, reason: 'test' });
-      expect(failures).toBe(0);
-      expect(results.find((r) => r.id === 'agent-creator')?.action).toBe('created');
-      expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'agent-creator'), 'SKILL.md'))).toBe(true);
-    } finally {
-      vi.doUnmock('node:fs');
-      vi.resetModules();
-    }
+    const skillsRoot = paths.userSystemSkillsDir(UID);
+    fs.rmSync(skillsRoot, { recursive: true, force: true });
+    fs.mkdirSync(path.dirname(skillsRoot), { recursive: true });
+    fs.writeFileSync(skillsRoot, 'temporarily blocks directory creation');
+    let checks = 0;
+
+    const results = await systemSkills.reconcileAllForUserWithRetry(UID, {
+      retries: 2,
+      delayMs: 0,
+      reason: 'test',
+      shouldContinue: () => {
+        checks += 1;
+        if (checks === 3) fs.rmSync(skillsRoot, { force: true });
+        return true;
+      },
+    });
+
+    expect(checks).toBe(3);
+    expect(results.find((r) => r.id === 'agent-creator')?.action).toBe('created');
+    expect(fs.existsSync(path.join(paths.userSystemSkillDir(UID, 'agent-creator'), 'SKILL.md'))).toBe(true);
   });
 
   it('prompt rendering does not repair a missing local mirror', async () => {

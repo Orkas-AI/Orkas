@@ -29,9 +29,9 @@ const mocks = vi.hoisted(() => ({
     callTool: undefined as any,
   },
   oauth: {
+    startComposioConnect: undefined as any,
     startOAuth: undefined as any,
     refreshIfStale: undefined as any,
-    startGoogleSheetsPicker: undefined as any,
   },
   dcr: {
     startMcpDcrOAuth: undefined as any,
@@ -57,9 +57,9 @@ vi.mock('../../../../src/main/features/connectors/mcp-client', () => ({
 }));
 
 vi.mock('../../../../src/main/features/connectors/oauth', () => ({
+  startComposioConnect: (...args: any[]) => mocks.oauth.startComposioConnect(...args),
   startOAuth: (...args: any[]) => mocks.oauth.startOAuth(...args),
   refreshIfStale: (...args: any[]) => mocks.oauth.refreshIfStale(...args),
-  startGoogleSheetsPicker: (...args: any[]) => mocks.oauth.startGoogleSheetsPicker(...args),
 }));
 
 vi.mock('../../../../src/main/features/connectors/oauth-dcr', () => ({
@@ -76,9 +76,9 @@ function resetMockBehaviors() {
   mocks.mcp.listTools = vi.fn(async () => [{ name: 'noop', description: '', input_schema: {} }]);
   mocks.mcp.close = vi.fn(async () => {});
   mocks.mcp.callTool = vi.fn(async () => ({}));
+  mocks.oauth.startComposioConnect = vi.fn();
   mocks.oauth.startOAuth = vi.fn();
   mocks.oauth.refreshIfStale = vi.fn(async (_uid: string, _entry: unknown, grant: unknown) => grant);
-  mocks.oauth.startGoogleSheetsPicker = vi.fn();
   mocks.dcr.startMcpDcrOAuth = vi.fn();
   mocks.dcr.refreshDcrIfStale = vi.fn(async (_client: unknown, grant: unknown) => grant);
   mocks.dcr.refreshDcrServerManaged = vi.fn(async (_provider: unknown, grant: unknown) => grant);
@@ -127,6 +127,34 @@ function googleInstance(id: 'gmail' | 'gsheets', scopes: string[]) {
   };
 }
 
+function bingWebmasterInstance(scopes: string[]) {
+  const now = new Date().toISOString();
+  return {
+    id: 'bing-webmaster',
+    display_name: 'Bing Webmaster Tools',
+    transport: {
+      kind: 'stdio' as const,
+      command: 'node',
+      args: ['server.js'],
+      env: { BING_ACCESS_TOKEN: 'access-token' },
+    },
+    enabled_subtools: null,
+    tools_cache: [],
+    tools_cached_at: 0,
+    status: { kind: 'connected' as const, since: 1 },
+    oauth_grant: {
+      access_token: 'access-token',
+      refresh_token: 'refresh-token',
+      expires_at: Date.now() + 60 * 60 * 1000,
+      scopes,
+      token_type: 'Bearer',
+      account_label: 'webmaster@example.com',
+    },
+    created_at: now,
+    updated_at: now,
+  };
+}
+
 function githubGrant() {
   return {
     access_token: 'ghu-token',
@@ -137,6 +165,19 @@ function githubGrant() {
     account_label: 'octo',
     server_grant_id: 'grant-1',
     server_managed: true,
+  };
+}
+
+function discordGrant() {
+  return {
+    access_token: 'discord-user-access-token',
+    refresh_token: null,
+    expires_at: Date.now() + 60 * 60 * 1000,
+    scopes: ['identify', 'guilds', 'bot', 'applications.commands'],
+    token_type: 'Bearer',
+    account_label: 'Orkas',
+    server_managed: true,
+    server_grant_id: 'discord-grant-1',
   };
 }
 
@@ -174,6 +215,62 @@ function notionInstance() {
   };
 }
 
+function sentryInstance() {
+  const now = new Date().toISOString();
+  return {
+    id: 'sentry',
+    display_name: 'Sentry',
+    transport: {
+      kind: 'streamable-http' as const,
+      url: 'https://mcp.sentry.dev/mcp',
+      headers: { Authorization: 'Bearer access-token' },
+    },
+    enabled_subtools: null,
+    tools_cache: [{ name: 'list_organizations', description: '', input_schema: {} }],
+    tools_cached_at: Date.now(),
+    status: { kind: 'connected' as const, since: 1 },
+    oauth_grant: {
+      access_token: 'access-token',
+      refresh_token: null,
+      expires_at: null,
+      scopes: [],
+      token_type: 'Bearer',
+      server_grant_id: 'grant-1',
+      server_managed: true,
+    },
+    created_at: now,
+    updated_at: now,
+  };
+}
+
+function futureCatalogInstance() {
+  const now = new Date().toISOString();
+  return {
+    id: 'future-dcr',
+    display_name: 'Future DCR',
+    transport: {
+      kind: 'streamable-http' as const,
+      url: 'https://mcp.future.example/mcp',
+      headers: { Authorization: 'Bearer access-token' },
+    },
+    enabled_subtools: null,
+    tools_cache: [{ name: 'future_tool', description: '', input_schema: {} }],
+    tools_cached_at: Date.now(),
+    status: { kind: 'connected' as const, since: 1 },
+    oauth_grant: {
+      access_token: 'access-token',
+      refresh_token: null,
+      expires_at: null,
+      scopes: [],
+      token_type: 'Bearer',
+      server_grant_id: 'grant-1',
+      server_managed: true,
+    },
+    created_at: now,
+    updated_at: now,
+  };
+}
+
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-connectors-manager-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
@@ -191,42 +288,17 @@ afterEach(() => {
 });
 
 describe('features/connectors/manager authorization recovery', () => {
-  it('hides and removes persisted Google grants that lack required scopes', async () => {
+  it('keeps persisted server-bridge auth error rows visible for reconnect', async () => {
     const registry = await import('../../../../src/main/features/connectors/registry');
     const manager = await import('../../../../src/main/features/connectors/manager');
-
-    await registry.upsert(TEST_UID, googleInstance('gsheets', ['openid', 'email']));
-
-    expect(manager.listInstances(TEST_UID).map((inst) => inst.id)).not.toContain('gsheets');
-    await vi.waitFor(() => {
-      expect(registry.load(TEST_UID).connections.gsheets).toBeUndefined();
-    });
-  });
-
-  it('keeps persisted Google auth error rows visible for reconnect', async () => {
-    const registry = await import('../../../../src/main/features/connectors/registry');
-    const manager = await import('../../../../src/main/features/connectors/manager');
-    const inst = googleInstance('gsheets', ['https://www.googleapis.com/auth/drive.file']);
+    const inst = bingWebmasterInstance(['webmaster.read']);
     (inst as any).status = { kind: 'error', message: 'fetch failed', at: Date.now() };
 
     await registry.upsert(TEST_UID, inst);
 
-    const row = manager.listInstances(TEST_UID).find((item) => item.id === 'gsheets');
+    const row = manager.listInstances(TEST_UID).find((item) => item.id === 'bing-webmaster');
     expect(row?.status).toMatchObject({ kind: 'error', message: 'fetch failed' });
-    expect(registry.load(TEST_UID).connections.gsheets).toBeTruthy();
-  });
-
-  it('removes stale missing-scope grants during bootstrap instead of marking refresh error', async () => {
-    const registry = await import('../../../../src/main/features/connectors/registry');
-    const manager = await import('../../../../src/main/features/connectors/manager');
-
-    await registry.upsert(TEST_UID, googleInstance('gmail', ['openid', 'email']));
-
-    await manager.bootstrap(TEST_UID);
-
-    await vi.waitFor(() => {
-      expect(registry.load(TEST_UID).connections.gmail).toBeUndefined();
-    });
+    expect(registry.load(TEST_UID).connections['bing-webmaster']).toBeTruthy();
   });
 
   it('clears the previous connector row when reauthorization returns missing required scopes', async () => {
@@ -239,16 +311,16 @@ describe('features/connectors/manager authorization recovery', () => {
     const registry = await import('../../../../src/main/features/connectors/registry');
     const manager = await import('../../../../src/main/features/connectors/manager');
 
-    await registry.upsert(TEST_UID, googleInstance('gmail', ['https://www.googleapis.com/auth/gmail.modify']));
+    await registry.upsert(TEST_UID, bingWebmasterInstance(['webmaster.read']));
 
-    await expect(manager.connectViaOAuth(TEST_UID, 'gmail')).rejects.toMatchObject({
+    await expect(manager.connectViaOAuth(TEST_UID, 'bing-webmaster')).rejects.toMatchObject({
       message: 'missing_required_scopes',
       code: 'missing_required_scopes',
     });
-    expect(registry.load(TEST_UID).connections.gmail).toBeUndefined();
+    expect(registry.load(TEST_UID).connections['bing-webmaster']).toBeUndefined();
   });
 
-  it('keeps the previous connector row connected when Google reauthorization hits a transient fetch failure', async () => {
+  it('keeps the previous connector row connected when server-bridge reauthorization hits a transient fetch failure', async () => {
     mocks.oauth.startOAuth = vi.fn(async () => {
       throw new Error('fetch failed');
     });
@@ -256,10 +328,10 @@ describe('features/connectors/manager authorization recovery', () => {
     const registry = await import('../../../../src/main/features/connectors/registry');
     const manager = await import('../../../../src/main/features/connectors/manager');
 
-    await registry.upsert(TEST_UID, googleInstance('gsheets', ['https://www.googleapis.com/auth/drive.file']));
+    await registry.upsert(TEST_UID, bingWebmasterInstance(['webmaster.read']));
 
-    await expect(manager.connectViaOAuth(TEST_UID, 'gsheets')).rejects.toThrow(/fetch failed/);
-    expect(registry.load(TEST_UID).connections.gsheets.status).toMatchObject({ kind: 'connected' });
+    await expect(manager.connectViaOAuth(TEST_UID, 'bing-webmaster')).rejects.toThrow(/fetch failed/);
+    expect(registry.load(TEST_UID).connections['bing-webmaster'].status).toMatchObject({ kind: 'connected' });
   });
 
   it('removes the connector row if a refresh response no longer includes required scopes', async () => {
@@ -271,13 +343,13 @@ describe('features/connectors/manager authorization recovery', () => {
 
     const registry = await import('../../../../src/main/features/connectors/registry');
     const manager = await import('../../../../src/main/features/connectors/manager');
-    const inst = googleInstance('gmail', ['https://www.googleapis.com/auth/gmail.modify']);
+    const inst = bingWebmasterInstance(['webmaster.read']);
     inst.oauth_grant.expires_at = Date.now() - 1;
 
     await registry.upsert(TEST_UID, inst);
-    await manager.refreshTools(TEST_UID, 'gmail');
+    await manager.refreshTools(TEST_UID, 'bing-webmaster');
 
-    expect(registry.load(TEST_UID).connections.gmail).toBeUndefined();
+    expect(registry.load(TEST_UID).connections['bing-webmaster']).toBeUndefined();
   });
 
   it('keeps DCR refresh invalid_grant rows visible for reconnect', async () => {
@@ -516,29 +588,4 @@ describe('features/connectors/manager authorization recovery', () => {
     );
   });
 
-  it('merges Google Sheets picker grant without dropping the existing refresh token or account label', async () => {
-    mocks.oauth.startGoogleSheetsPicker = vi.fn(async () => ({
-      grant: {
-        access_token: 'picker-access-token',
-        refresh_token: null,
-        expires_at: Date.now() + 60 * 60 * 1000,
-        scopes: ['https://www.googleapis.com/auth/drive.file'],
-        token_type: 'Bearer',
-      },
-      pickedFileIds: ['sheet-1', 'sheet-2'],
-    }));
-
-    const registry = await import('../../../../src/main/features/connectors/registry');
-    const manager = await import('../../../../src/main/features/connectors/manager');
-    await registry.upsert(TEST_UID, googleInstance('gsheets', ['https://www.googleapis.com/auth/drive.file']));
-
-    const picked = await manager.authorizeGoogleSheetsFiles(TEST_UID, ['sheet-1']);
-    expect(picked).toEqual(['sheet-1', 'sheet-2']);
-
-    const grant = registry.load(TEST_UID).connections.gsheets.oauth_grant;
-    expect(grant?.access_token).toBe('picker-access-token');
-    expect(grant?.refresh_token).toBe('refresh-token');
-    expect(grant?.account_label).toBe('user@example.com');
-    expect(grant?.scopes).toEqual(['https://www.googleapis.com/auth/drive.file']);
-  });
 });

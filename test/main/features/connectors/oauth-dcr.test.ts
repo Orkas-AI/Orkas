@@ -3,17 +3,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const electronMock = vi.hoisted(() => ({
   openExternal: vi.fn(async () => undefined),
 }));
-const OSS_API_BASE = vi.hoisted(() => 'https://orkas.ai/api');
 
 vi.mock('electron', () => ({
   shell: { openExternal: electronMock.openExternal },
 }));
 
 vi.mock('../../../../src/main/features/connectors/_server_bridge', () => ({
-  accountApiBase: () => OSS_API_BASE,
+  accountApiBase: () => 'https://account.example/api',
   tokenStore: {
     getDeviceId: () => 'device-1',
-    authHeaders: () => ({}),
+    authHeaders: () => ({ user_id: 'uid-1', session_id: 'sid-1' }),
   },
 }));
 
@@ -29,6 +28,45 @@ function notionEntry() {
     transport_template: {
       kind: 'streamable-http',
       url: 'https://mcp.notion.example/mcp',
+      oauth_header_key: 'Authorization',
+    },
+  } as any;
+}
+
+function atlassianEntry() {
+  return {
+    id: 'atlassian',
+    display_name: 'Atlassian',
+    auth_mode: 'mcp_dcr',
+    transport_template: {
+      kind: 'streamable-http',
+      url: 'https://mcp.atlassian.example/v1/mcp/authv2',
+      oauth_header_key: 'Authorization',
+    },
+  } as any;
+}
+
+function airtableEntry() {
+  return {
+    id: 'airtable',
+    display_name: 'Airtable',
+    auth_mode: 'mcp_dcr',
+    transport_template: {
+      kind: 'streamable-http',
+      url: 'https://mcp.airtable.example/mcp',
+      oauth_header_key: 'Authorization',
+    },
+  } as any;
+}
+
+function stripeEntry() {
+  return {
+    id: 'stripe',
+    display_name: 'Stripe',
+    auth_mode: 'mcp_dcr',
+    transport_template: {
+      kind: 'streamable-http',
+      url: 'https://mcp.stripe.example',
       oauth_header_key: 'Authorization',
     },
   } as any;
@@ -70,7 +108,7 @@ describe('features/connectors/oauth-dcr', () => {
       }
       if (String(url) === 'https://auth.notion.example/register') {
         const body = JSON.parse(String(init?.body || '{}'));
-        expect(body.redirect_uris).toEqual([`${OSS_API_BASE}/connectors/oauth/dcr-callback`]);
+        expect(body.redirect_uris).toEqual(['https://account.example/api/connectors/oauth/dcr-callback']);
         expect(body.grant_types).toContain('authorization_code');
         return jsonResponse({ client_id: 'client-1', client_secret: 'secret-1' });
       }
@@ -88,12 +126,181 @@ describe('features/connectors/oauth-dcr', () => {
     expect(opened.href.startsWith('https://auth.notion.example/authorize?')).toBe(true);
     expect(opened.searchParams.get('response_type')).toBe('code');
     expect(opened.searchParams.get('client_id')).toBe('client-1');
-    expect(opened.searchParams.get('redirect_uri')).toBe(`${OSS_API_BASE}/connectors/oauth/dcr-callback`);
+    expect(opened.searchParams.get('redirect_uri')).toBe('https://account.example/api/connectors/oauth/dcr-callback');
     expect(opened.searchParams.get('resource')).toBe('https://mcp.notion.example/mcp');
     expect(opened.searchParams.get('code_challenge_method')).toBe('S256');
     expect(opened.searchParams.get('code_challenge')).toBeTruthy();
     expect(opened.searchParams.get('state')).toBeTruthy();
     await handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?status=cancelled');
+  });
+
+  it('discovers providers that publish path-based protected-resource and auth-server metadata', async () => {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const rawUrl = String(url);
+      if (rawUrl === 'https://mcp.atlassian.example/v1/mcp/authv2/.well-known/oauth-protected-resource') {
+        return jsonResponse({ error: 'not_found' }, false, 404);
+      }
+      if (rawUrl === 'https://mcp.atlassian.example/.well-known/oauth-protected-resource/v1/mcp/authv2') {
+        return jsonResponse({
+          authorization_servers: ['https://auth.atlassian.example/as-1'],
+          resource: 'https://mcp.atlassian.example/v1/mcp/authv2',
+        });
+      }
+      if (rawUrl === 'https://auth.atlassian.example/as-1/.well-known/oauth-authorization-server') {
+        return jsonResponse({
+          authorization_endpoint: 'https://auth.atlassian.example/authorize',
+          token_endpoint: 'https://auth.atlassian.example/oauth/token',
+          registration_endpoint: 'https://auth.atlassian.example/as-1/dcr/register',
+        });
+      }
+      if (rawUrl === 'https://auth.atlassian.example/as-1/dcr/register') {
+        const body = JSON.parse(String(init?.body || '{}'));
+        expect(body.redirect_uris).toEqual(['https://account.example/api/connectors/oauth/dcr-callback']);
+        expect(body.token_endpoint_auth_method).toBe('client_secret_post');
+        return jsonResponse({ client_id: 'atl-client-1', client_secret: 'atl-secret-1' });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { startMcpDcrOAuth, handleDcrCallbackUrl } = await import('../../../../src/main/features/connectors/oauth-dcr');
+    void startMcpDcrOAuth('uid-1', atlassianEntry()).catch(() => {});
+    await vi.waitFor(() => {
+      expect(electronMock.openExternal).toHaveBeenCalledTimes(1);
+    });
+
+    const opened = new URL(String(electronMock.openExternal.mock.calls[0][0]));
+    expect(opened.href.startsWith('https://auth.atlassian.example/authorize?')).toBe(true);
+    expect(opened.searchParams.get('client_id')).toBe('atl-client-1');
+    expect(opened.searchParams.get('resource')).toBe('https://mcp.atlassian.example/v1/mcp/authv2');
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === 'https://auth.atlassian.example/.well-known/oauth-authorization-server')).toBe(false);
+    await handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?status=cancelled');
+  });
+
+  it('falls back to MCP-host authorization metadata when the advertised auth-server host omits it', async () => {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const rawUrl = String(url);
+      if (rawUrl === 'https://mcp.stripe.example/.well-known/oauth-protected-resource') {
+        return jsonResponse({
+          authorization_servers: ['https://access.stripe.example/mcp'],
+          resource: 'https://mcp.stripe.example',
+        });
+      }
+      if (rawUrl === 'https://access.stripe.example/mcp/.well-known/oauth-authorization-server'
+        || rawUrl === 'https://access.stripe.example/.well-known/oauth-authorization-server') {
+        return jsonResponse({ error: 'not_found' }, false, 404);
+      }
+      if (rawUrl === 'https://mcp.stripe.example/.well-known/oauth-authorization-server') {
+        return jsonResponse({
+          issuer: 'https://access.stripe.example/mcp',
+          authorization_endpoint: 'https://access.stripe.example/mcp/oauth2/authorize',
+          token_endpoint: 'https://access.stripe.example/mcp/oauth2/token',
+          registration_endpoint: 'https://access.stripe.example/mcp/oauth2/register',
+          token_endpoint_auth_methods_supported: ['none'],
+        });
+      }
+      if (rawUrl === 'https://access.stripe.example/mcp/oauth2/register') {
+        const body = JSON.parse(String(init?.body || '{}'));
+        expect(body.token_endpoint_auth_method).toBe('none');
+        return jsonResponse({ client_id: 'stripe-client-1' });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { startMcpDcrOAuth, handleDcrCallbackUrl } = await import('../../../../src/main/features/connectors/oauth-dcr');
+    void startMcpDcrOAuth('uid-1', stripeEntry()).catch(() => {});
+    await vi.waitFor(() => {
+      expect(electronMock.openExternal).toHaveBeenCalledTimes(1);
+    });
+
+    const opened = new URL(String(electronMock.openExternal.mock.calls[0][0]));
+    expect(opened.href.startsWith('https://access.stripe.example/mcp/oauth2/authorize?')).toBe(true);
+    expect(opened.searchParams.get('client_id')).toBe('stripe-client-1');
+    expect(opened.searchParams.get('resource')).toBe('https://mcp.stripe.example');
+    await handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?status=cancelled');
+  });
+
+  it('uses client_secret_basic when the provider does not support client_secret_post', async () => {
+    let openedState = '';
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const rawUrl = String(url);
+      if (rawUrl === 'https://mcp.airtable.example/mcp/.well-known/oauth-protected-resource') {
+        return jsonResponse({ error: 'not_found' }, false, 404);
+      }
+      if (rawUrl === 'https://mcp.airtable.example/.well-known/oauth-protected-resource/mcp') {
+        return jsonResponse({
+          authorization_servers: ['https://airtable.example/oauth2/v1'],
+          resource: 'https://mcp.airtable.example',
+        });
+      }
+      if (rawUrl === 'https://airtable.example/oauth2/v1/.well-known/oauth-authorization-server') {
+        return jsonResponse({ error: 'not_found' }, false, 404);
+      }
+      if (rawUrl === 'https://airtable.example/.well-known/oauth-authorization-server') {
+        return jsonResponse({
+          authorization_endpoint: 'https://airtable.example/oauth2/v1/authorize',
+          token_endpoint: 'https://airtable.example/oauth2/v1/token',
+          registration_endpoint: 'https://airtable.example/oauth2/v1/register',
+          token_endpoint_auth_methods_supported: ['client_secret_basic', 'none'],
+        });
+      }
+      if (rawUrl === 'https://airtable.example/oauth2/v1/register') {
+        const body = JSON.parse(String(init?.body || '{}'));
+        expect(body.token_endpoint_auth_method).toBe('client_secret_basic');
+        return jsonResponse({
+          client_id: 'airtable-client-1',
+          client_secret: 'airtable-secret-1',
+          token_endpoint_auth_method: 'client_secret_basic',
+        });
+      }
+      if (rawUrl === 'https://account.example/api/connectors/oauth/dcr-exchange') {
+        return jsonResponse({ code: 0, oauth_code: 'provider-code', oauth_state: openedState });
+      }
+      if (rawUrl === 'https://airtable.example/oauth2/v1/token') {
+        const headers = init?.headers as Record<string, string>;
+        const body = new URLSearchParams(String(init?.body || ''));
+        expect(headers.Authorization).toBe(`Basic ${Buffer.from('airtable-client-1:airtable-secret-1').toString('base64')}`);
+        expect(body.get('client_id')).toBeNull();
+        expect(body.get('client_secret')).toBeNull();
+        expect(body.get('resource')).toBe('https://mcp.airtable.example');
+        return jsonResponse({
+          access_token: 'airtable-access-local',
+          refresh_token: 'airtable-refresh-local',
+          expires_in: 3600,
+          token_type: 'Bearer',
+          scope: 'data.records:read',
+        });
+      }
+      if (rawUrl === 'https://account.example/api/connectors/oauth/dcr-store') {
+        const body = JSON.parse(String(init?.body || '{}'));
+        expect(body.provider).toBe('airtable');
+        expect(body.dcr_client.token_endpoint_auth_method).toBe('client_secret_basic');
+        return jsonResponse({
+          code: 0,
+          access_token: 'airtable-access-server',
+          refresh_token: null,
+          grant_id: 'airtable-grant-1',
+          server_managed: true,
+          expires_in: 3600,
+          token_type: 'Bearer',
+          scope: 'data.records:read',
+        });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { startMcpDcrOAuth, handleDcrCallbackUrl } = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const pending = startMcpDcrOAuth('uid-1', airtableEntry());
+    await vi.waitFor(() => {
+      expect(electronMock.openExternal).toHaveBeenCalledTimes(1);
+    });
+    openedState = new URL(String(electronMock.openExternal.mock.calls[0][0])).searchParams.get('state') || '';
+
+    await handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?exchange_code=exchange-1');
+    const result = await pending;
+    expect(result.grant.server_grant_id).toBe('airtable-grant-1');
   });
 
   it('rejects a DCR callback with mismatched state before calling the provider token endpoint', async () => {
@@ -114,7 +321,7 @@ describe('features/connectors/oauth-dcr', () => {
       if (String(url) === 'https://auth.notion.example/register') {
         return jsonResponse({ client_id: 'client-1', client_secret: 'secret-1' });
       }
-      if (String(url) === `${OSS_API_BASE}/connectors/oauth/dcr-exchange`) {
+      if (String(url) === 'https://account.example/api/connectors/oauth/dcr-exchange') {
         const body = JSON.parse(String(init?.body || '{}'));
         expect(body.exchange_code).toBe('exchange-1');
         return jsonResponse({ code: 0, oauth_code: 'provider-code', oauth_state: 'wrong-state' });
@@ -156,7 +363,7 @@ describe('features/connectors/oauth-dcr', () => {
       if (String(url) === 'https://auth.notion.example/register') {
         return jsonResponse({ client_id: 'client-1', client_secret: 'secret-1' });
       }
-      if (String(url) === `${OSS_API_BASE}/connectors/oauth/dcr-exchange`) {
+      if (String(url) === 'https://account.example/api/connectors/oauth/dcr-exchange') {
         return jsonResponse({ code: 0, oauth_code: 'provider-code', oauth_state: openedState });
       }
       if (String(url) === 'https://auth.notion.example/token') {
@@ -171,13 +378,13 @@ describe('features/connectors/oauth-dcr', () => {
           scope: 'read write',
         });
       }
-      if (String(url) === `${OSS_API_BASE}/connectors/oauth/dcr-store`) {
+      if (String(url) === 'https://account.example/api/connectors/oauth/dcr-store') {
         const body = JSON.parse(String(init?.body || '{}'));
         expect(body.provider).toBe('notion');
         expect(body.refresh_token).toBe('refresh-local');
         expect(body.dcr_client.client_id).toBe('client-1');
         expect(body.dcr_client.client_secret).toBe('secret-1');
-        expect((init?.headers as Record<string, string>).user_id).toBeUndefined();
+        expect((init?.headers as Record<string, string>).user_id).toBe('uid-1');
         return jsonResponse({
           code: 0,
           access_token: 'access-server',
@@ -210,6 +417,52 @@ describe('features/connectors/oauth-dcr', () => {
       server_grant_id: 'grant-1',
       scopes: ['read', 'write'],
     });
+  });
+
+  it('uses the first resource when protected-resource metadata returns a resource array', async () => {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (String(url).endsWith('/api/v4/mcp/.well-known/oauth-protected-resource')) {
+        return jsonResponse({ error: 'not_found' }, false, 404);
+      }
+      if (String(url) === 'https://gitlab.example/.well-known/oauth-protected-resource/api/v4/mcp') {
+        return jsonResponse({
+          authorization_servers: ['https://gitlab.example'],
+          resource: ['https://gitlab.example/api/v4/mcp'],
+        });
+      }
+      if (String(url) === 'https://gitlab.example/.well-known/oauth-authorization-server') {
+        return jsonResponse({
+          authorization_endpoint: 'https://gitlab.example/oauth/authorize',
+          token_endpoint: 'https://gitlab.example/oauth/token',
+          registration_endpoint: 'https://gitlab.example/oauth/register',
+          token_endpoint_auth_methods_supported: ['client_secret_post'],
+        });
+      }
+      if (String(url) === 'https://gitlab.example/oauth/register') {
+        return jsonResponse({ client_id: 'gitlab-client-1', client_secret: 'gitlab-secret-1' });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { startMcpDcrOAuth, handleDcrCallbackUrl } = await import('../../../../src/main/features/connectors/oauth-dcr');
+    void startMcpDcrOAuth('uid-1', {
+      id: 'gitlab',
+      display_name: 'GitLab',
+      auth_mode: 'mcp_dcr',
+      transport_template: {
+        kind: 'streamable-http',
+        url: 'https://gitlab.example/api/v4/mcp',
+        oauth_header_key: 'Authorization',
+      },
+    } as any).catch(() => {});
+    await vi.waitFor(() => {
+      expect(electronMock.openExternal).toHaveBeenCalledTimes(1);
+    });
+
+    const opened = new URL(String(electronMock.openExternal.mock.calls[0][0]));
+    expect(opened.searchParams.get('resource')).toBe('https://gitlab.example/api/v4/mcp');
+    await handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?status=cancelled');
   });
 
   it('refreshes stale DCR grants with resource and persists rotated refresh_token fields', async () => {
@@ -262,7 +515,7 @@ describe('features/connectors/oauth-dcr', () => {
       if (fetchMock.mock.calls.length === 1) {
         throw new TypeError('fetch failed');
       }
-      expect(String(url)).toBe(`${OSS_API_BASE}/connectors/oauth/refresh`);
+      expect(String(url)).toBe('https://account.example/api/connectors/oauth/refresh');
       const body = JSON.parse(String(init.body));
       expect(body.provider).toBe('notion');
       expect(body.grant_id).toBe('grant-1');

@@ -29,7 +29,9 @@ describe('createCrossSessionMemoryTool', () => {
     expect(tool.inputSchema.type).toBe('object');
     expect((tool.inputSchema as any).properties.action).toBeDefined();
     expect((tool.inputSchema as any).properties.target).toBeDefined();
-    expect((tool.inputSchema as any).required).toEqual(['action', 'target']);
+    expect((tool.inputSchema as any).properties.target.enum).toEqual(['agent', 'shared', 'user']);
+    // target is optional (defaults to the caller's own "agent" store)
+    expect((tool.inputSchema as any).required).toEqual(['action']);
   });
 });
 
@@ -39,11 +41,11 @@ describe('cross_session_memory › add', () => {
     const tool = createCrossSessionMemoryTool(handler);
 
     const result = await tool.execute(
-      { action: 'add', target: 'memory', content: 'new fact' },
+      { action: 'add', target: 'shared', content: 'new fact' },
       dummyCtx,
     );
 
-    expect(handler.add).toHaveBeenCalledWith('memory', 'new fact');
+    expect(handler.add).toHaveBeenCalledWith('shared', 'new fact');
     const parsed = JSON.parse(result.content);
     expect(parsed.ok).toBe(true);
     expect(parsed.entries).toContain('new entry');
@@ -52,7 +54,7 @@ describe('cross_session_memory › add', () => {
 
   it('returns error when content is missing', async () => {
     const tool = createCrossSessionMemoryTool(mockHandler());
-    const result = await tool.execute({ action: 'add', target: 'memory' }, dummyCtx);
+    const result = await tool.execute({ action: 'add', target: 'shared' }, dummyCtx);
     const parsed = JSON.parse(result.content);
     expect(parsed.ok).toBe(false);
     expect(parsed.error).toMatch(/content.*required/);
@@ -68,6 +70,13 @@ describe('cross_session_memory › add', () => {
     );
     expect(handler.add).toHaveBeenCalledWith('user', 'prefers dark mode');
   });
+
+  it('defaults to the "agent" tier when target is omitted', async () => {
+    const handler = mockHandler();
+    const tool = createCrossSessionMemoryTool(handler);
+    await tool.execute({ action: 'add', content: 'plan.json is the EDL' }, dummyCtx);
+    expect(handler.add).toHaveBeenCalledWith('agent', 'plan.json is the EDL');
+  });
 });
 
 describe('cross_session_memory › replace', () => {
@@ -76,18 +85,18 @@ describe('cross_session_memory › replace', () => {
     const tool = createCrossSessionMemoryTool(handler);
 
     const result = await tool.execute(
-      { action: 'replace', target: 'memory', old_text: 'old', content: 'new' },
+      { action: 'replace', target: 'shared', old_text: 'old', content: 'new' },
       dummyCtx,
     );
 
-    expect(handler.replace).toHaveBeenCalledWith('memory', 'old', 'new');
+    expect(handler.replace).toHaveBeenCalledWith('shared', 'old', 'new');
     expect(JSON.parse(result.content).ok).toBe(true);
   });
 
   it('returns error when old_text is missing', async () => {
     const tool = createCrossSessionMemoryTool(mockHandler());
     const result = await tool.execute(
-      { action: 'replace', target: 'memory', content: 'new' },
+      { action: 'replace', target: 'shared', content: 'new' },
       dummyCtx,
     );
     expect(JSON.parse(result.content).error).toMatch(/old_text.*required/);
@@ -97,7 +106,7 @@ describe('cross_session_memory › replace', () => {
   it('returns error when content is missing', async () => {
     const tool = createCrossSessionMemoryTool(mockHandler());
     const result = await tool.execute(
-      { action: 'replace', target: 'memory', old_text: 'old' },
+      { action: 'replace', target: 'shared', old_text: 'old' },
       dummyCtx,
     );
     expect(JSON.parse(result.content).error).toMatch(/content.*required/);
@@ -111,17 +120,17 @@ describe('cross_session_memory › remove', () => {
     const tool = createCrossSessionMemoryTool(handler);
 
     await tool.execute(
-      { action: 'remove', target: 'memory', old_text: 'delete me' },
+      { action: 'remove', target: 'shared', old_text: 'delete me' },
       dummyCtx,
     );
 
-    expect(handler.remove).toHaveBeenCalledWith('memory', 'delete me');
+    expect(handler.remove).toHaveBeenCalledWith('shared', 'delete me');
   });
 
   it('returns error when old_text is missing', async () => {
     const tool = createCrossSessionMemoryTool(mockHandler());
     const result = await tool.execute(
-      { action: 'remove', target: 'memory' },
+      { action: 'remove', target: 'shared' },
       dummyCtx,
     );
     expect(JSON.parse(result.content).error).toMatch(/old_text.*required/);
@@ -159,7 +168,7 @@ describe('cross_session_memory › error handling', () => {
   it('rejects unknown action', async () => {
     const tool = createCrossSessionMemoryTool(mockHandler());
     const result = await tool.execute(
-      { action: 'destroy', target: 'memory' },
+      { action: 'destroy', target: 'shared' },
       dummyCtx,
     );
     expect(result.isError).toBe(true);
@@ -174,7 +183,7 @@ describe('cross_session_memory › error handling', () => {
 
     const tool = createCrossSessionMemoryTool(handler);
     const result = await tool.execute(
-      { action: 'add', target: 'memory', content: 'bad stuff' },
+      { action: 'add', target: 'shared', content: 'bad stuff' },
       dummyCtx,
     );
 

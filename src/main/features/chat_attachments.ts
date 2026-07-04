@@ -60,6 +60,7 @@ const TEXT_EXTS: ReadonlySet<string> = new Set([
 ]);
 const IMAGE_EXTS: ReadonlySet<string> = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 const VIDEO_EXTS: ReadonlySet<string> = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
+const AUDIO_EXTS: ReadonlySet<string> = new Set(['.mp3', '.wav', '.ogg', '.opus', '.m4a', '.aac', '.flac']);
 const PDF_EXT = '.pdf';
 const DOCX_EXTS: ReadonlySet<string> = new Set(['.docx', '.docm']);
 const SPREADSHEET_EXTS: ReadonlySet<string> = new Set(['.xlsx', '.xlsm']);
@@ -67,7 +68,7 @@ const PRESENTATION_EXTS: ReadonlySet<string> = new Set(['.pptx', '.pptm']);
 export const ALLOWED_EXTENSIONS: ReadonlySet<string> = new Set([
   ...TEXT_EXTS,
   PDF_EXT, ...DOCX_EXTS, ...SPREADSHEET_EXTS, ...PRESENTATION_EXTS,
-  ...IMAGE_EXTS, ...VIDEO_EXTS,
+  ...IMAGE_EXTS, ...VIDEO_EXTS, ...AUDIO_EXTS,
 ]);
 
 const MAX_BYTES_TEXT  = 5   * 1024 * 1024;
@@ -76,6 +77,7 @@ const MAX_BYTES_OFFICE = 50 * 1024 * 1024;
 const MAX_BYTES_IMAGE = 20  * 1024 * 1024;
 const MAX_BYTES_PDF   = 100 * 1024 * 1024;
 const MAX_BYTES_VIDEO = 200 * 1024 * 1024;
+const MAX_BYTES_AUDIO = 50  * 1024 * 1024;
 
 const MAX_FILENAME_LEN = 200;
 
@@ -88,7 +90,8 @@ export type AttachmentKind =
   | 'spreadsheet'
   | 'presentation'
   | 'image'
-  | 'video';
+  | 'video'
+  | 'audio';
 export type ImageMimeType = 'image/png' | 'image/jpeg' | 'image/webp' | 'image/gif';
 
 export interface AttachmentInfo {
@@ -134,6 +137,7 @@ function kindOf(ext: string): AttachmentKind {
   if (PRESENTATION_EXTS.has(e)) return 'presentation';
   if (IMAGE_EXTS.has(e)) return 'image';
   if (VIDEO_EXTS.has(e)) return 'video';
+  if (AUDIO_EXTS.has(e)) return 'audio';
   return 'text';
 }
 
@@ -144,6 +148,7 @@ function maxBytesFor(ext: string): number {
   if (SPREADSHEET_EXTS.has(e) || PRESENTATION_EXTS.has(e)) return MAX_BYTES_OFFICE;
   if (IMAGE_EXTS.has(e)) return MAX_BYTES_IMAGE;
   if (VIDEO_EXTS.has(e)) return MAX_BYTES_VIDEO;
+  if (AUDIO_EXTS.has(e)) return MAX_BYTES_AUDIO;
   return MAX_BYTES_TEXT;
 }
 
@@ -158,13 +163,19 @@ function attachmentRelPath(cid: string, name: string): string {
 }
 
 function notifyAttachmentDirty(cid: string, name: string): void {
-  void cid;
-  void name;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
+    sync?.markDirty?.('chat_attachments', attachmentRelPath(cid, name));
+  } catch { /* features/sync stripped */ }
 }
 
 function notifyAttachmentDeleted(cid: string, name: string): void {
-  void cid;
-  void name;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = null as { markDeleted?: (relPath: string) => Promise<void> | void };
+    void sync?.markDeleted?.(attachmentRelPath(cid, name));
+  } catch { /* features/sync stripped */ }
 }
 
 function uniqueTarget(dir: string, name: string): string {
@@ -535,7 +546,7 @@ export function resolveAttachmentAbsPath(
  * Resolve an arbitrary absolute local path → streamable media file, for the
  * `chat-media://local/<abs-path>` protocol route. Unlike per-cid attachments
  * this serves files from anywhere on the user's machine — but only when they
- * look like media (image or video extension) and aren't obscenely large.
+ * look like media (image, video, or audio extension) and aren't obscenely large.
  *
  * Threat model: the user runs the LLM on their own machine; worst case is
  * the LLM asks the renderer to display one of the user's own files. Not
@@ -548,7 +559,7 @@ export function resolveAttachmentAbsPath(
  */
 export function resolveLocalMediaPath(
   absPath: string,
-): { ok: true; absPath: string; kind: 'image' | 'video' } | { ok: false; code: 'bad_input' | 'not_found' | 'too_large'; error: string } {
+): { ok: true; absPath: string; kind: 'image' | 'video' | 'audio' } | { ok: false; code: 'bad_input' | 'not_found' | 'too_large'; error: string } {
   if (typeof absPath !== 'string' || !absPath) {
     return { ok: false, code: 'bad_input', error: 'path required' };
   }
@@ -557,7 +568,7 @@ export function resolveLocalMediaPath(
   }
   const normalized = path.resolve(absPath);
   const ext = path.extname(normalized).toLowerCase();
-  if (!IMAGE_EXTS.has(ext) && !VIDEO_EXTS.has(ext)) {
+  if (!IMAGE_EXTS.has(ext) && !VIDEO_EXTS.has(ext) && !AUDIO_EXTS.has(ext)) {
     return { ok: false, code: 'bad_input', error: `unsupported extension: ${ext || '(none)'}` };
   }
   let stat: fs.Stats;
@@ -569,7 +580,8 @@ export function resolveLocalMediaPath(
     const mb = Math.round(cap / 1024 / 1024);
     return { ok: false, code: 'too_large', error: `file exceeds ${mb}MB cap` };
   }
-  return { ok: true, absPath: normalized, kind: VIDEO_EXTS.has(ext) ? 'video' : 'image' };
+  const kind = VIDEO_EXTS.has(ext) ? 'video' : (AUDIO_EXTS.has(ext) ? 'audio' : 'image');
+  return { ok: true, absPath: normalized, kind };
 }
 
 /**
@@ -607,7 +619,7 @@ export function resolveLocalPreviewPath(
 }
 
 /** MIME lookup for the chat-media:// protocol handler. Covers images, videos,
- *  and the in-app preview docs served via `resolveLocalPreviewPath` (pdf /
+ *  audio, and the in-app preview docs served via `resolveLocalPreviewPath` (pdf /
  *  html). Text/markdown go through the `produced.readText` IPC instead. */
 export function mediaMimeFor(name: string): string {
   const ext = path.extname(name).toLowerCase();
@@ -620,6 +632,12 @@ export function mediaMimeFor(name: string): string {
   if (ext === '.mov') return 'video/quicktime';
   if (ext === '.m4v') return 'video/x-m4v';
   if (ext === '.ogv') return 'video/ogg';
+  if (ext === '.mp3') return 'audio/mpeg';
+  if (ext === '.wav') return 'audio/wav';
+  if (ext === '.ogg' || ext === '.opus') return 'audio/ogg';
+  if (ext === '.m4a') return 'audio/mp4';
+  if (ext === '.aac') return 'audio/aac';
+  if (ext === '.flac') return 'audio/flac';
   if (ext === '.pdf') return 'application/pdf';
   if (ext === '.html' || ext === '.htm') return 'text/html';
   return 'application/octet-stream';
@@ -730,6 +748,13 @@ export interface AttachmentManifest {
   images: Array<{ data: string; mediaType: ImageMimeType }>;
   /** Names of attachments we couldn't pack (missing / too big / load error). */
   skipped: Array<{ name: string; reason: string }>;
+  /** Current-turn attachment metadata for Orkas-managed server routing. */
+  metadata: AttachmentRequestMetadata;
+}
+
+export interface AttachmentRequestMetadata {
+  hasAttachments: boolean;
+  attachmentTypes: AttachmentKind[];
 }
 
 export interface BuildManifestOpts {
@@ -752,7 +777,7 @@ export interface BuildManifestOpts {
  *   - image           → compressed grayscale JPEG via real-time
  *                       toCompressedGrayJpeg on the raw source → images[]
  *                       for pi-ai vision.
- *   - video           → skipped entirely (display-only).
+ *   - video/audio     → skipped entirely (display-only).
  */
 export async function buildAttachmentManifest(
   userId: string,
@@ -764,10 +789,25 @@ export async function buildAttachmentManifest(
   const skipped: Array<{ name: string; reason: string }> = [];
   const entries: string[] = [];
   const images: Array<{ data: string; mediaType: ImageMimeType }> = [];
+  const attachmentTypes: AttachmentKind[] = [];
+  const seenTypes = new Set<AttachmentKind>();
+  let attachmentCount = 0;
+
+  const addAttachmentType = (kind: AttachmentKind) => {
+    attachmentCount += 1;
+    if (!seenTypes.has(kind)) {
+      seenTypes.add(kind);
+      attachmentTypes.push(kind);
+    }
+  };
+  const metadata = (): AttachmentRequestMetadata => ({
+    hasAttachments: attachmentCount > 0,
+    attachmentTypes: [...attachmentTypes],
+  });
 
   let safeConvId: string;
   try { safeConvId = safeCid(cid); }
-  catch (err) { return { manifest: '', images: [], skipped: [{ name: '', reason: (err as Error).message }] }; }
+  catch (err) { return { manifest: '', images: [], skipped: [{ name: '', reason: (err as Error).message }], metadata: metadata() }; }
   const dir = chatAttachmentDir(userId, safeConvId);
 
   for (const rawName of names) {
@@ -775,9 +815,10 @@ export async function buildAttachmentManifest(
     try { nm = safeAttachmentName(rawName); }
     catch (err) { skipped.push({ name: String(rawName), reason: (err as Error).message }); continue; }
     const abs = path.join(dir, nm);
-    if (!fs.existsSync(abs)) { skipped.push({ name: nm, reason: t('attachments.skipped.missing') }); continue; }
     const ext = path.extname(nm).toLowerCase();
     const kind = kindOf(ext);
+    addAttachmentType(kind);
+    if (!fs.existsSync(abs)) { skipped.push({ name: nm, reason: t('attachments.skipped.missing') }); continue; }
 
     if (kind === 'image') {
       if (images.length >= maxImages) { skipped.push({ name: nm, reason: t('attachments.skipped.too_many_images', { max: maxImages }) }); continue; }
@@ -797,8 +838,8 @@ export async function buildAttachmentManifest(
       continue;
     }
 
-    if (kind === 'video') {
-      // Videos are display-only: no vision support + no text extraction. The
+    if (kind === 'video' || kind === 'audio') {
+      // Video/audio files are display-only: no vision support + no text extraction. The
       // renderer streams bytes through the `chat-media://` protocol directly;
       // nothing to surface to the model.
       skipped.push({ name: nm, reason: t('attachments.skipped.video_for_display') });
@@ -835,7 +876,7 @@ export async function buildAttachmentManifest(
   const manifest = entries.length
     ? `<attachments>\n${entries.join('\n')}\n</attachments>`
     : '';
-  return { manifest, images, skipped };
+  return { manifest, images, skipped, metadata: metadata() };
 }
 
 function escapeAttr(s: string): string {

@@ -146,6 +146,15 @@ async function waitForQuiescent(uid: string, cid: string, timeoutMs = 2000) {
   throw new Error(`bus did not quiesce within ${timeoutMs}ms`);
 }
 
+async function waitUntil(fn: () => boolean, timeoutMs = 2000): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (fn()) return true;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  return false;
+}
+
 describe('group_chat bus integration › disabled skills', () => {
   it('does not let commander substitute another skill when user explicitly requests a disabled one', async () => {
     const cid = newCid();
@@ -673,6 +682,35 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     expect(toolResult!.content).toContain('nested worker blew &lt;up&gt; &amp; quit');
     expect(toolResult!.content).not.toContain('<worker-result');
     expect(toolResult!.content).not.toContain('(no textual reply)');
+  }, 12_000);
+
+  it('run_worker marks a nested user abort as non-retryable worker-error', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+
+    _setScript(state.buildGconvSessionId(cid), [
+      { type: '__call_tool__', name: 'run_worker', input: { task: 'scan slowly' } },
+      { type: 'final', text: 'should not matter after abort' },
+    ]);
+    _setScript('gworker-*', [
+      { type: '__wait_for_abort__' },
+    ]);
+
+    bus.subscribe(TEST_UID, cid, () => {});
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'scan it slowly' });
+
+    const started = await waitUntil(() => _recordedCalls.some((c) => c.sid.startsWith('gworker-')), 2000);
+    expect(started, 'nested worker should have started before abort').toBe(true);
+    await bus.abort(TEST_UID, cid);
+    await waitForQuiescent(TEST_UID, cid, 4000);
+
+    const toolResult = _recordedToolResults.find((r) => r.name === 'run_worker');
+    expect(toolResult, 'run_worker should return an abort-marked tool result').toBeTruthy();
+    expect(toolResult!.content).toContain('<worker-error');
+    expect(toolResult!.content).toContain('aborted="true"');
+    expect(toolResult!.content).toContain('Task was stopped by the user.');
+    expect(toolResult!.content).not.toContain('<worker-result');
   }, 12_000);
 
   it('dispatch_to (named) runs the agent IN-PROCESS, keeps the agent\'s visible bubble, and the commander synthesises (Option B) — no re-wake', async () => {

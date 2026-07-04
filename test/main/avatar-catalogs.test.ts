@@ -8,7 +8,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, '../..');
 
 const catalogs = [
-  ['desktop', 'src/main/data/avatars.json'],
+  ['Orkas', 'src/main/data/avatars.json'],
 ] as const;
 
 function stableStringify(value: unknown): string {
@@ -50,14 +50,13 @@ function validateCatalog(label: string, relPath: string, catalog: any): void {
 }
 
 describe('avatar catalogs', () => {
-  it('keeps the desktop avatar catalog structurally valid', () => {
+  it('keeps the bundled avatar resource valid', () => {
     const rows = catalogs.map(([label, relPath]) => {
       const catalog = JSON.parse(fs.readFileSync(path.join(repoRoot, relPath), 'utf8'));
       validateCatalog(label, relPath, catalog);
       return { label, relPath, normalized: stableStringify(catalog) };
     });
 
-    const first = rows[0];
-    expect(first.normalized.length).toBeGreaterThan(0);
+    expect(rows[0].normalized.length).toBeGreaterThan(0);
   });
 });

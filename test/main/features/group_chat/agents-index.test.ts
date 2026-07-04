@@ -2,11 +2,12 @@
 //
 // Format (one entry per agent, ordered by insertion):
 //   `\`read_file(<ROOT>/<id>/agent.json)\` — ROOT by Source:`
-//   `- custom:  <abs path>`
 //   `- builtin: <abs path>`
+//   `- platform: <abs path>`
+//   `- custom:  <abs path>`
 //   `Use these ROOT values verbatim. \`id:\` is tool-call input only — prose mentions agents as @<name>.`
 //   ``
-//   `- @<name> (Source: custom|builtin, id: <agent_id>) — desc`
+//   `- @<name> (Source: builtin|platform|custom, id: <agent_id>) — desc`
 //   `  inputs: read agent.json before dispatch`   ← optional, only when inputs[] non-empty
 //   `  interactive: true`                         ← optional, only when interactive=true
 //
@@ -39,13 +40,16 @@ function builtinAgentsDir(): string {
   return path.join(tmpDir, TEST_UID, 'local', 'marketplace', 'agents');
 }
 
-function writeAgent(root: string, agent_id: string, body: Record<string, unknown>) {
+function writeAgent(root: string, agent_id: string, body: Record<string, unknown>, installMeta?: Record<string, unknown>) {
   const dir = path.join(root, agent_id);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(
     path.join(dir, 'agent.json'),
     JSON.stringify({ agent_id, created_at: '2026-01-01', updated_at: '2026-01-01', ...body }),
   );
+  if (installMeta) {
+    fs.writeFileSync(path.join(dir, '_install.json'), JSON.stringify(installMeta));
+  }
 }
 
 beforeEach(async () => {
@@ -75,10 +79,19 @@ describe('agents_index block — header + per-entry shape', () => {
     writeAgent(builtinAgentsDir(), 'e5f6a7b8', { name: 'Beta', description_zh: 'B', description_en: 'B' });
     const text = await buildBlock(TEST_UID);
     expect(text).toContain('`read_file(<ROOT>/<id>/agent.json)`');
+    expect(text).toContain(`- builtin: ${path.resolve(builtinAgentsDir())}`);
+    expect(text).toContain(`- platform: ${path.resolve(builtinAgentsDir())}`);
     expect(text).toContain(`- custom:  ${path.resolve(customAgentsDir())}`);
-    expect(text).toContain(`- marketplace: ${path.resolve(builtinAgentsDir())}`);
     expect(text).toContain('Use these ROOT values verbatim');
     expect(text).toContain('@<name>');
+  });
+
+  it('labels marketplace and packaged-seed agents distinctly', async () => {
+    writeAgent(builtinAgentsDir(), 'platform-agent', { name: 'PlatformAgent', description_zh: 'P', description_en: 'P' });
+    writeAgent(builtinAgentsDir(), 'builtin-agent', { name: 'BuiltinAgent', description_zh: 'B', description_en: 'B' }, { seed_source: 'builtin' });
+    const text = await buildBlock(TEST_UID);
+    expect(text).toContain('@PlatformAgent (Source: platform, id: platform-agent) — P');
+    expect(text).toContain('@BuiltinAgent (Source: builtin, id: builtin-agent) — B');
   });
 
   it('entry includes id: <agent_id> next to Source — commander needs it for read_file + <agent_id> sub-tag', async () => {

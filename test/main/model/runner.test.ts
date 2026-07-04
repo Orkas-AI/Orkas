@@ -21,6 +21,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.doUnmock('@earendil-works/pi-ai/oauth');
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   if (prevAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
   else process.env.ANTHROPIC_API_KEY = prevAnthropicKey;
@@ -92,7 +93,7 @@ describe('runner › buildRunner auth gate', () => {
     const profile = await auth.addApiKey('anthropic', 'k-cooldown-xxxxxxxx');
     await auth.addEntry({
       provider: 'anthropic',
-      model: 'claude-opus-4-7',
+      model: 'claude-opus-4-8',
       profileId: profile.profileId,
     });
     cooldown.markCooldown(profile.profileId, 'auth', 'invalid key', 30_000);
@@ -107,4 +108,5 @@ describe('runner › buildRunner auth gate', () => {
     expect(message).toMatch(/configured model is temporarily unavailable/i);
     expect(message).not.toMatch(/30s|30 seconds|seconds?/i);
   });
+
 });

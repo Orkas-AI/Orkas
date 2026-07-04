@@ -10,7 +10,7 @@
     "#core-agent": "./src/core-agent/src/index.ts"
   },
   "scripts": {
-    "start": "node bin/ensure-runtime.cjs --root resources/runtime && node scripts/fetch-officecli.cjs && electron .",
+    "start": "node bin/ensure-runtime.cjs --root resources/runtime && node scripts/fetch-officecli.cjs && node scripts/fetch-ffmpeg.cjs && electron .",
     "stop": "pkill -9 -f \"$PWD/node_modules/electron/dist\" || true",
     "smoke": "tsx src/main/smoke.ts",
     "typecheck": "tsc --noEmit",
@@ -18,16 +18,19 @@
     "test:watch": "node scripts/run-tests.mjs",
     "runtime:ensure": "node bin/ensure-runtime.cjs --root resources/runtime",
     "officecli:fetch": "node scripts/fetch-officecli.cjs",
+    "ffmpeg:fetch": "node scripts/fetch-ffmpeg.cjs",
     "rebuild:sqlite:electron": "node scripts/swap-sqlite-abi.mjs electron",
     "rebuild:sqlite:node": "node scripts/swap-sqlite-abi.mjs node",
     "postinstall": "node scripts/swap-sqlite-abi.mjs electron && node scripts/fetch-embedding-model.mjs",
     "prepare": "node scripts/install-git-hooks.mjs",
-    "prepack": "node bin/ensure-runtime.cjs --root resources/runtime && node scripts/fetch-officecli.cjs && node scripts/swap-sqlite-abi.mjs electron"
+    "prepack": "node bin/ensure-runtime.cjs --root resources/runtime && node scripts/fetch-officecli.cjs && node scripts/fetch-ffmpeg.cjs && node scripts/swap-sqlite-abi.mjs electron"
   },
   "devDependencies": {
+    "@ffprobe-installer/ffprobe": "^2.1.2",
     "@types/adm-zip": "^0.5.7",
     "@types/node": "^25.6.0",
     "electron": "^41.7.1",
+    "ffmpeg-static": "^5.3.0",
     "typescript": "^6.0.3",
     "vitest": "^4.1.5"
   },
@@ -43,11 +46,11 @@
     "mammoth": "^1.12.0",
     "pdfjs-dist": "^5.6.205",
     "sqlite-vec": "^0.1.9",
-    "tsx": "^4.22.4",
+    "tsx": "^4.21.0",
     "zod": "^3.24.0"
   },
   "overrides": {
-    "tar": "7.5.16"
+    "tar": "7.5.15"
   },
   "build": {
     "appId": "com.orkas.desktop",
@@ -111,6 +114,13 @@
       {
         "from": "resources/runtime",
         "to": "runtime",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "resources/builtin",
+        "to": "builtin",
         "filter": [
           "**/*"
         ]

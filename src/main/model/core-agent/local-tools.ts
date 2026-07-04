@@ -2,7 +2,7 @@
  * Local-machine tool wrappers injected into every AgentRunner built by
  * this app.
  *
- * Five tools:
+ * Local-machine tools:
  *   - `bash`          — overrides core-agent's builtin (last-write-wins in
  *                       AgentRunner's tool map). Same schema; tighter
  *                       English description; permission-gated.
@@ -27,9 +27,11 @@
  *                       dependency). Renders via util/md-to-pdf +
  *                       Electron's webContents.printToPDF.
  *   - `html_to_pdf`   — same, for hand-crafted HTML input.
+ *   - `interactive_cli_*` — live stdin/stdout sessions for CLIs that need
+ *                       user interaction such as OAuth codes or setup prompts.
  *
- * Permission gate: every execute() re-reads `getLocalExecGranted()` so a
- * mid-conversation grant/revoke takes effect on the next tool call without
+ * Permission gate: every execute() re-reads the local access mode so a
+ * mid-conversation settings change takes effect on the next tool call without
  * a rebuild.
  *
  * Note on naming: the two override tools MUST keep the exact core-agent
@@ -53,7 +55,13 @@ import {
   writeFileTool as coreWriteFileTool,
 } from '../../../core-agent/src/tools/builtin';
 import { buildSandboxEnv, decodeProcessOutput, killProcessTree } from '../../../core-agent/src/sandbox/executor';
-import { getLocalExecGranted, getLocalExecMode } from '../../features/permissions';
+import {
+  getLocalExecGranted,
+  getLocalExecMode,
+  localAccessAllowsOutsideWorkspace,
+  localAccessRequiresSensitiveApproval,
+} from '../../features/permissions';
+import { classifyConfiguredBashCommand, sensitivePathReasons, type LocalAccessRiskCategory } from '../../features/local_access_policy';
 import { classifyBashCommand } from './bash-risk';
 import { requestBashDecision } from './bash-permissions';
 import { markdownToPdf, htmlToPdf } from '../../util/md-to-pdf';
@@ -63,12 +71,21 @@ import { kindOf } from '../../features/file_indexer';
 import { getWorkspacePath } from '../../features/user_workspace';
 import { chatAttachmentDir, userMarketplaceSkillsDir, userSkillsDir } from '../../paths';
 import * as chatArtifacts from '../../features/chat_artifacts';
+import { finalizeProducedArtifact, producedDocumentFooterText } from '../../features/produced_output_hooks';
 import { readDisabledSets } from '../../features/component_enabled';
 import { requestConfirmation as requestDeleteConfirmation, consumeGrantedConfirmation } from './delete-file-confirm';
 import { fileEditLock } from '../../util/locks';
 import { checkEditFreshness, recordRead } from './read-tracker';
 import { createLogger } from '../../logger';
+import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
 import { t } from '../../i18n';
+import {
+  closeInteractiveCliSession,
+  readInteractiveCliSession,
+  sendInteractiveCliInput,
+  startInteractiveCliSession,
+} from './interactive-cli-sessions';
+import type { InteractiveCliSessionView } from './interactive-cli-sessions';
 
 const log = createLogger('local-tools');
 
@@ -104,21 +121,10 @@ export interface LocalToolsOpts {
    *  on top of workspace + attachment. Used by skill-edit / agent-edit
    *  chats so the LLM can edit files inside the skill / agent dir. */
   extraRoots?: readonly string[];
-  /** Extra absolute roots that are **read-only** for write-side tools
-   *  (`write_file` / `edit_file`) but in-scope for `delete_file`. The
-   *  per-call UI confirmation card on `delete_file` is the safety gate
-   *  that makes this asymmetry safe — every delete requires explicit
-   *  user click, so a path the caller marked read-only is still
-   *  protected from silent overwrite by `write_file` / `edit_file`
-   *  while still being removable when the user explicitly says yes.
-   *  Used by skill-edit chat so the LLM can `delete_file` a script
-   *  inside the skill dir without granting it `write_file` access to
-   *  the same path. */
-  readOnlyExtraRoots?: readonly string[];
   /** Fires with absolute path after every successful write (write_file,
    * edit_file, markdown_to_pdf, html_to_pdf). Lets chats.ts surface
    * produced files to the UI. */
-  onFileWritten?: (absPath: string) => void;
+  onFileWritten?: (absPath: string) => void | Promise<void>;
   /** Fires after a successful `create_artifact` call. The caller (group_chat
    *  bus) collects these per turn and attaches `message.artifacts` to the
    *  assistant record so the renderer embeds each one in the bubble. */
@@ -160,6 +166,21 @@ function errText(code: string, msg: string): string {
   return `${code}: ${msg}`;
 }
 
+function permissionWaitProgress(ctx: ToolContext | undefined, operation: string): (elapsedMs: number) => void {
+  return (elapsedMs: number) => {
+    ctx?.emitProgress?.({
+      phase: 'permission',
+      message: `Waiting for user approval for ${operation}`,
+      data: {
+        heartbeat: true,
+        userAction: true,
+        elapsedMs,
+        timeoutMs: elapsedMs + 60_000,
+      },
+    });
+  };
+}
+
 function bashMsg(key: string, vars?: Record<string, string | number>): string {
   return t(`bash.error.${key}`, vars);
 }
@@ -187,7 +208,6 @@ const BASH_PRODUCED_SCAN_LIMIT = 5000;
 const BASH_PRODUCED_SKIP_DIRS = new Set([
   '.cache',
   '.git',
-  '.github',
   '.hg',
   '.idea',
   '.mypy_cache',
@@ -207,33 +227,6 @@ const BASH_PRODUCED_SKIP_DIRS = new Set([
 const BASH_PRODUCED_SKIP_FILES = new Set([
   '.DS_Store',
 ]);
-// Repo/package scaffolding that arrives when a skill clones or unpacks its own
-// source tree into the workspace. These are never user deliverables, so the bash
-// diff must not surface them as produced-file chips. Matched case-insensitively
-// against the basename's stem (so README.md / README_CN.md / LICENCE all hit).
-const BASH_PRODUCED_SKIP_NAME_STEMS = new Set([
-  'agents',
-  'authors',
-  'changelog',
-  'claude',
-  'code_of_conduct',
-  'contributing',
-  'copying',
-  'funding',
-  'licence',
-  'license',
-  'notice',
-  'readme',
-  'security',
-]);
-// Dotfiles (no meaningful stem) that are repo config, never deliverables.
-const BASH_PRODUCED_SKIP_DOTFILES = new Set([
-  '.editorconfig',
-  '.gitattributes',
-  '.gitignore',
-  '.npmrc',
-  '.nvmrc',
-]);
 
 type BashFileSnapshotEntry = { mtimeMs: number; size: number };
 type BashFileSnapshot = Map<string, BashFileSnapshotEntry>;
@@ -243,20 +236,7 @@ function shouldSkipBashProducedDir(name: string): boolean {
 }
 
 function shouldSkipBashProducedFile(name: string): boolean {
-  if (BASH_PRODUCED_SKIP_FILES.has(name)) return true;
-  const lower = name.toLowerCase();
-  if (BASH_PRODUCED_SKIP_DOTFILES.has(lower)) return true;
-  // `.env`, `.env.example`, `.env.local`, …
-  if (lower === '.env' || lower.startsWith('.env.')) return true;
-  // Stem = name before the first dot, so README.md → "readme". Dotfiles have an
-  // empty stem and are handled above; this only matches real scaffold files.
-  const stem = lower.split('.')[0];
-  if (stem.length === 0) return false;
-  if (BASH_PRODUCED_SKIP_NAME_STEMS.has(stem)) return true;
-  // Localized readme variants (README_CN, README_EN, README_zh) are common in
-  // cloned repos. Only readme prefix-matches; other scaffold names stay exact so
-  // a real deliverable like "license_terms.pdf" is never dropped.
-  return stem.split('_')[0] === 'readme';
+  return BASH_PRODUCED_SKIP_FILES.has(name);
 }
 
 function collectBashFileSnapshot(root: string): BashFileSnapshot {
@@ -287,14 +267,193 @@ function collectBashFileSnapshot(root: string): BashFileSnapshot {
   return out;
 }
 
-function emitBashProducedFiles(opts: LocalToolsOpts, before: BashFileSnapshot, root: string): void {
+function _bashShellWords(command: string): string[] {
+  const out: string[] = [];
+  let cur = '';
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+  const push = () => {
+    if (cur) out.push(cur);
+    cur = '';
+  };
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (escaped) {
+      cur += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = null;
+      else cur += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === '\n' || ch === '\r') {
+      push();
+      out.push(';');
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      push();
+      continue;
+    }
+    if (ch === '&' || ch === '|' || ch === ';') {
+      push();
+      if ((ch === '&' || ch === '|') && command[i + 1] === ch) {
+        out.push(ch + ch);
+        i += 1;
+      } else {
+        out.push(ch);
+      }
+      continue;
+    }
+    cur += ch;
+  }
+  push();
+  return out;
+}
+
+function _isShellBoundaryToken(token: string): boolean {
+  return token === '&&' || token === '||' || token === ';' || token === '|';
+}
+
+function _cloneOptionConsumesValue(token: string): boolean {
+  return [
+    '-b', '--branch',
+    '-c', '--config',
+    '-j', '--jobs',
+    '-o', '--origin',
+    '--depth',
+    '--reference',
+    '--reference-if-able',
+    '--separate-git-dir',
+    '--shallow-exclude',
+    '--shallow-since',
+    '--template',
+  ].includes(token);
+}
+
+function _cloneOperands(tokens: string[], start: number): string[] {
+  const operands: string[] = [];
+  for (let i = start; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (_isShellBoundaryToken(token) || token === '--') break;
+    if (token.startsWith('-')) {
+      if (!token.includes('=') && _cloneOptionConsumesValue(token)) i += 1;
+      continue;
+    }
+    operands.push(token);
+    if (operands.length >= 2) break;
+  }
+  return operands;
+}
+
+function _repoDefaultDir(repo: string): string {
+  const raw = String(repo || '').replace(/[?#].*$/, '').replace(/\/+$/, '');
+  const tail = raw.split(/[/:]/).filter(Boolean).pop() || '';
+  return tail.replace(/\.git$/i, '') || 'repo';
+}
+
+function _sameOrInside(parent: string, candidate: string): boolean {
+  const rel = path.relative(path.resolve(parent), path.resolve(candidate));
+  return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+function _addDownloadDir(out: string[], root: string, target: string): void {
+  if (!target || /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(target)) return;
+  const abs = path.resolve(root, target);
+  if (_sameOrInside(root, abs)) out.push(abs);
+}
+
+function _addDownloadFile(out: Set<string>, root: string, target: string): void {
+  if (!target || /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(target)) return;
+  const abs = path.resolve(root, target);
+  if (_sameOrInside(root, abs)) out.add(abs);
+}
+
+function _downloadNameFromUrl(raw: string): string {
+  try {
+    const u = new URL(raw);
+    const tail = u.pathname.split('/').filter(Boolean).pop() || '';
+    return tail || 'index.html';
+  } catch {
+    const clean = String(raw || '').replace(/[?#].*$/, '').replace(/\/+$/, '');
+    return clean.split('/').filter(Boolean).pop() || 'index.html';
+  }
+}
+
+function _buildExternalDownloadSkipper(command: string, root: string): (absPath: string) => boolean {
+  const tokens = _bashShellWords(command);
+  const skipDirs: string[] = [];
+  const skipFiles = new Set<string>();
+
+  for (let i = 0; i < tokens.length; i++) {
+    const a = tokens[i];
+    const b = tokens[i + 1];
+    const c = tokens[i + 2];
+    if (a === 'git' && b === 'clone') {
+      const operands = _cloneOperands(tokens, i + 2);
+      if (operands[0]) _addDownloadDir(skipDirs, root, operands[1] || _repoDefaultDir(operands[0]));
+    } else if (a === 'gh' && b === 'repo' && c === 'clone') {
+      const operands = _cloneOperands(tokens, i + 3);
+      if (operands[0]) _addDownloadDir(skipDirs, root, operands[1] || _repoDefaultDir(operands[0]));
+    } else if (a === 'curl') {
+      let output = '';
+      let remoteName = false;
+      let url = '';
+      for (let j = i + 1; j < tokens.length && !_isShellBoundaryToken(tokens[j]); j++) {
+        const token = tokens[j];
+        if (token === '-o' || token === '--output') output = tokens[++j] || '';
+        else if (token.startsWith('--output=')) output = token.slice('--output='.length);
+        else if (token === '-O' || token === '--remote-name') remoteName = true;
+        else if (/^https?:\/\//i.test(token)) url = token;
+      }
+      if (output) _addDownloadFile(skipFiles, root, output);
+      else if (remoteName && url) _addDownloadFile(skipFiles, root, _downloadNameFromUrl(url));
+    } else if (a === 'wget') {
+      let output = '';
+      let url = '';
+      for (let j = i + 1; j < tokens.length && !_isShellBoundaryToken(tokens[j]); j++) {
+        const token = tokens[j];
+        if (token === '-O' || token === '--output-document') output = tokens[++j] || '';
+        else if (token.startsWith('--output-document=')) output = token.slice('--output-document='.length);
+        else if (/^https?:\/\//i.test(token)) url = token;
+      }
+      if (output) _addDownloadFile(skipFiles, root, output);
+      else if (url) _addDownloadFile(skipFiles, root, _downloadNameFromUrl(url));
+    }
+  }
+
+  return (absPath: string) => {
+    const abs = path.resolve(absPath);
+    if (skipFiles.has(abs)) return true;
+    return skipDirs.some((dir) => _sameOrInside(dir, abs));
+  };
+}
+
+async function emitBashProducedFiles(
+  opts: LocalToolsOpts,
+  before: BashFileSnapshot,
+  root: string,
+  command: string,
+): Promise<void> {
   if (!opts.onFileWritten) return;
   const after = collectBashFileSnapshot(root);
+  const isExternalDownload = _buildExternalDownloadSkipper(command, root);
   for (const [abs, next] of after) {
     const prev = before.get(abs);
     if (prev && prev.mtimeMs === next.mtimeMs && prev.size === next.size) continue;
-    try { opts.onFileWritten(abs); }
-    catch (err) { log.warn(`onFileWritten callback failed: ${(err as Error).message}`); }
+    if (isExternalDownload(abs)) continue;
+    try { await opts.onFileWritten(abs); }
+    catch (err) { log.warn('onFileWritten callback failed', { path: logPathRef(abs), error: logErrorRef(err) }); }
   }
 }
 
@@ -307,6 +466,15 @@ function withBashOutputEnv(ctx: ToolContext, outputDir: string): () => void {
   return () => {
     if (original) ctx.state.sandboxEnv = original;
     else delete ctx.state.sandboxEnv;
+  };
+}
+
+function withBashWritableRoots(ctx: ToolContext, roots: string[]): () => void {
+  const original = ctx.state.sandboxAllowedDirs;
+  ctx.state.sandboxAllowedDirs = roots;
+  return () => {
+    if (original !== undefined) ctx.state.sandboxAllowedDirs = original;
+    else delete ctx.state.sandboxAllowedDirs;
   };
 }
 
@@ -609,34 +777,41 @@ async function executeCoreBashWithOutputTracking(
   workingDir: string,
 ): Promise<ToolResult> {
   const outputDir = workingDir;
+  const command = String(input.command ?? '');
   const before = opts.onFileWritten ? collectBashFileSnapshot(outputDir) : new Map<string, BashFileSnapshotEntry>();
   const restoreEnv = withBashOutputEnv(ctx, outputDir);
+  const restoreWritableRoots = withBashWritableRoots(ctx, bashWritableRootsFor(opts, workingDir));
   try {
     const direct = parseOrkasCliInvocation(input, ctx);
-    const result = direct
+    const macWriteSandboxActive = process.platform === 'darwin'
+      && fs.existsSync('/usr/bin/sandbox-exec')
+      && Array.isArray(ctx.state.sandboxAllowedDirs)
+      && ctx.state.sandboxAllowedDirs.length > 0;
+    const result = direct && !macWriteSandboxActive
       ? await executeDirectOrkasCli(direct, input, ctx, workingDir)
       : await coreBashTool.execute(input, ctx);
-    if (!result.isError) emitBashProducedFiles(opts, before, outputDir);
+    if (!result.isError) await emitBashProducedFiles(opts, before, outputDir, command);
     return translateFixedBashError(result);
   } finally {
+    restoreWritableRoots();
     restoreEnv();
   }
 }
 
-/** Assemble the edit-time sandbox roots for the current (uid, cid). Mirrors
- *  `file-tools.ts::allowedRoots` so the read-side and edit-side share the
- *  same visible scope. Returns [] when uid is missing — guardPath then
- *  rejects with E_NO_SCOPE rather than silently allowing an unscoped edit. */
+/** Assemble the workspace-scoped writable roots for the current (uid, cid).
+ *  The global access mode may allow paths outside these roots, but these
+ *  roots remain the default safe scope and the macOS write sandbox scope for
+ *  `workspace_approval`. */
 function allowedRootsFor(opts: LocalToolsOpts): string[] {
   const roots: string[] = [];
   if (opts.userId) {
     try {
       const ws = getWorkspacePath(opts.userId, opts.projectId);
       if (ws) roots.push(ws);
-    } catch (err) { log.warn(`edit_file resolve workspace: ${(err as Error).message}`); }
+    } catch (err) { log.warn('edit_file resolve workspace failed', { user_id: maskId(opts.userId), project_id: maskId(opts.projectId), error: logErrorRef(err) }); }
     if (opts.cid) {
       try { roots.push(chatAttachmentDir(opts.userId, opts.cid)); }
-      catch (err) { log.warn(`edit_file resolve attachment dir: ${(err as Error).message}`); }
+      catch (err) { log.warn('edit_file resolve attachment dir failed', { user_id: maskId(opts.userId), cid: maskId(opts.cid), error: logErrorRef(err) }); }
     }
   }
   if (opts.extraRoots?.length) {
@@ -647,37 +822,625 @@ function allowedRootsFor(opts: LocalToolsOpts): string[] {
 
 function guardEditPath(opts: LocalToolsOpts, abs: string): string | null {
   const roots = allowedRootsFor(opts);
-  if (!roots.length) {
+  if (!roots.length && !localAccessAllowsOutsideWorkspace()) {
     return errText('E_NO_SCOPE', 'no visible roots for this conversation');
   }
-  if (!isPathAllowed(abs, roots)) {
+  if (roots.length && isPathAllowed(abs, roots)) return null;
+  if (!localAccessAllowsOutsideWorkspace()) {
     return errText(
       'E_PATH_OUT_OF_SCOPE',
-      `path is outside the current conversation's visible scope (workspace + attachments): ${abs}`,
+      `path is outside the current workspace/attachment scope and the current access mode only allows workspace files: ${abs}`,
     );
   }
   return null;
 }
 
-/** Like `guardEditPath` but also accepts `readOnlyExtraRoots`. Used only by
- *  `delete_file`, where the per-call UI confirmation is the gate that
- *  justifies including read-only roots in the deletable set. See the
- *  `readOnlyExtraRoots` comment on `LocalToolsOpts`. */
+async function gateSensitiveLocalPath(
+  opts: LocalToolsOpts,
+  abs: string,
+  operation: string,
+  access: 'read' | 'write',
+  ctx?: ToolContext,
+): Promise<string | null> {
+  const result = await gateSensitiveLocalPathDetailed(opts, abs, operation, access, ctx);
+  return result.error;
+}
+
+async function gateSensitiveLocalPathDetailed(
+  opts: LocalToolsOpts,
+  abs: string,
+  operation: string,
+  access: 'read' | 'write',
+  ctx?: ToolContext,
+): Promise<BashPathGateResult> {
+  if (!localAccessRequiresSensitiveApproval()) return { error: null, approvedReasons: [] };
+  const reasons = sensitivePathReasons(abs, access);
+  if (!reasons.length) return { error: null, approvedReasons: [] };
+  const decision = await requestBashDecision({
+    uid: opts.userId ?? '',
+    cid: opts.cid ?? '',
+    agentId: opts.agentId ?? '',
+    agentName: opts.agentName ?? opts.agentId ?? '',
+    command: '',
+    operation,
+    subject: abs,
+    reasons,
+    onWaiting: permissionWaitProgress(ctx, operation),
+  });
+  if (decision !== 'deny') return { error: null, approvedReasons: reasons };
+  return {
+    error: errText(
+      'E_SENSITIVE_PATH_DENIED',
+      `the user declined to allow ${operation} on a sensitive path: ${abs}. Do not retry or work around it.`,
+    ),
+    approvedReasons: [],
+  };
+}
+
+/** Write-side access gate. Folder grants were removed: paths outside the
+ * workspace are controlled only by the global three-mode access setting. */
+async function gateEditPath(opts: LocalToolsOpts, abs: string, ctx?: ToolContext): Promise<string | null> {
+  const denied = guardEditPath(opts, abs);
+  if (denied) return denied;
+  return gateSensitiveLocalPath(opts, abs, 'write_file', 'write', ctx);
+}
+
 function guardDeletePath(opts: LocalToolsOpts, abs: string): string | null {
   const roots = allowedRootsFor(opts);
-  if (opts.readOnlyExtraRoots?.length) {
-    for (const r of opts.readOnlyExtraRoots) if (r) roots.push(r);
-  }
-  if (!roots.length) {
+  if (!roots.length && !localAccessAllowsOutsideWorkspace()) {
     return errText('E_NO_SCOPE', 'no visible roots for this conversation');
   }
-  if (!isPathAllowed(abs, roots)) {
+  if (roots.length && isPathAllowed(abs, roots)) return null;
+  if (!localAccessAllowsOutsideWorkspace()) {
     return errText(
       'E_PATH_OUT_OF_SCOPE',
-      `path is outside the current conversation's deletable scope (workspace + attachments + read-only roots): ${abs}`,
+      `path is outside the current workspace/attachment scope and the current access mode only allows workspace files: ${abs}`,
     );
   }
   return null;
+}
+
+type BashPathToken = { type: 'word' | 'op'; value: string };
+type BashPathCandidate = { raw: string; abs?: string; reason: string; dynamic?: boolean };
+type BashPathGateResult = { error: string | null; approvedReasons: LocalAccessRiskCategory[] };
+type BashFilesystemGuardResult = { result: ToolResult | null; approvedReasons: LocalAccessRiskCategory[] };
+
+const BASH_PATH_SEGMENT_OPS = new Set([';', '&&', '||', '|', '|&', '&']);
+const BASH_OUTPUT_REDIR_OPS = new Set(['>', '>>', '>|', '&>', '&>>', '1>', '1>>', '2>', '2>>']);
+const BASH_FILE_INPUT_REDIR_OPS = new Set(['<']);
+const BASH_NON_FILE_INPUT_REDIR_OPS = new Set(['<<', '<<<']);
+const BASH_GUARD_WRAPPERS = new Set(['env', 'command', 'builtin', 'exec', 'nohup', 'time', 'nice', 'ionice', 'stdbuf', 'setsid']);
+const BASH_GUARD_PRIV_ESC = new Set(['sudo', 'doas', 'pkexec']);
+const BASH_MUTATE_ALL_OPERANDS = new Set(['rm', 'rmdir', 'unlink', 'shred', 'mkdir', 'touch', 'chmod', 'chown', 'chgrp', 'mv', 'ln']);
+const BASH_DEST_LAST_OPERAND = new Set(['cp', 'install', 'rsync']);
+const BASH_READ_ALL_OPERANDS = new Set([
+  'cat', 'less', 'more', 'head', 'tail', 'wc', 'stat', 'file', 'du', 'ls', 'find',
+  'sort', 'uniq', 'cut', 'strings', 'realpath', 'readlink', 'open',
+]);
+const BASH_READ_PATTERN_FIRST_CMDS = new Set(['grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack']);
+const BASH_READ_SCRIPT_CMDS = new Set([
+  'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish',
+  'python', 'python3', 'node', 'ruby', 'perl', 'php',
+]);
+const BASH_ENV_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+const BASH_GENERIC_FLAGS_WITH_VALUE = new Set([
+  '-C', '-D', '-F', '-G', '-I', '-J', '-M', '-O', '-S', '-T', '-b', '-c', '-d', '-e', '-f', '-g', '-m', '-o', '-p', '-r', '-s', '-t', '-u',
+  '--backup', '--context', '--group', '--mode', '--owner', '--reference', '--suffix', '--target-directory',
+]);
+const BASH_GREP_FLAGS_WITH_VALUE = new Set([...BASH_GENERIC_FLAGS_WITH_VALUE, '-e', '-f', '-m', '-A', '-B', '-C', '--regexp', '--file', '--max-count', '--after-context', '--before-context', '--context', '--glob', '-g', '--type', '-t']);
+const BASH_AWK_FLAGS_WITH_VALUE = new Set([...BASH_GENERIC_FLAGS_WITH_VALUE, '-f', '-v', '-F']);
+
+function tokenizeBashPathGuard(input: string): BashPathToken[] {
+  const toks: BashPathToken[] = [];
+  let cur = '';
+  let hasCur = false;
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+  const push = () => {
+    if (!hasCur) return;
+    toks.push({ type: 'word', value: cur });
+    cur = '';
+    hasCur = false;
+  };
+
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (escaped) {
+      cur += ch;
+      hasCur = true;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = null;
+      else { cur += ch; hasCur = true; }
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      hasCur = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      push();
+      if (ch === '\n' || ch === '\r') toks.push({ type: 'op', value: ';' });
+      continue;
+    }
+
+    const three = input.slice(i, i + 3);
+    if (three === '&>>' || three === '<<<' || /^\d>>$/.test(three)) {
+      push(); toks.push({ type: 'op', value: three }); i += 2; continue;
+    }
+    const two = input.slice(i, i + 2);
+    if (['&&', '||', '|&', '>>', '>|', '&>', '<<'].includes(two) || /^\d>$/.test(two)) {
+      push(); toks.push({ type: 'op', value: two }); i += 1; continue;
+    }
+    if (ch === '|' || ch === '&' || ch === ';' || ch === '>' || ch === '<') {
+      push(); toks.push({ type: 'op', value: ch }); continue;
+    }
+    cur += ch;
+    hasCur = true;
+  }
+  push();
+  return toks;
+}
+
+function bashPathSegments(command: string): Array<{ words: string[]; redirectTargets: string[]; inputTargets: string[] }> {
+  const out: Array<{ words: string[]; redirectTargets: string[]; inputTargets: string[] }> = [];
+  let words: string[] = [];
+  let redirectTargets: string[] = [];
+  let inputTargets: string[] = [];
+  let expect: 'out' | 'in' | 'skip' | null = null;
+  const push = () => {
+    if (words.length || redirectTargets.length || inputTargets.length) out.push({ words, redirectTargets, inputTargets });
+    words = [];
+    redirectTargets = [];
+    inputTargets = [];
+  };
+
+  for (const tok of tokenizeBashPathGuard(command)) {
+    if (tok.type === 'op') {
+      if (BASH_PATH_SEGMENT_OPS.has(tok.value)) {
+        push();
+        expect = null;
+      } else if (BASH_OUTPUT_REDIR_OPS.has(tok.value)) {
+        expect = 'out';
+      } else if (BASH_FILE_INPUT_REDIR_OPS.has(tok.value)) {
+        expect = 'in';
+      } else if (BASH_NON_FILE_INPUT_REDIR_OPS.has(tok.value)) {
+        expect = 'skip';
+      } else {
+        expect = null;
+      }
+      continue;
+    }
+    if (expect === 'out') {
+      redirectTargets.push(tok.value);
+      expect = null;
+      continue;
+    }
+    if (expect === 'in') {
+      inputTargets.push(tok.value);
+      expect = null;
+      continue;
+    }
+    if (expect === 'skip') {
+      expect = null;
+      continue;
+    }
+    words.push(tok.value);
+  }
+  push();
+  return out;
+}
+
+function bashEffectiveCommand(words: string[]): { cmd: string; args: string[] } | null {
+  let w = words.slice();
+  while (w.length && BASH_ENV_ASSIGN_RE.test(w[0])) w = w.slice(1);
+  if (!w.length) return null;
+  let cmd = path.basename(w[0]).toLowerCase();
+
+  if (cmd === 'env') {
+    w = w.slice(1);
+    while (w.length && (BASH_ENV_ASSIGN_RE.test(w[0]) || w[0].startsWith('-'))) w = w.slice(1);
+    if (!w.length) return null;
+    cmd = path.basename(w[0]).toLowerCase();
+  }
+  while (BASH_GUARD_WRAPPERS.has(cmd)) {
+    w = w.slice(1);
+    while (w.length && BASH_ENV_ASSIGN_RE.test(w[0])) w = w.slice(1);
+    if (!w.length) return null;
+    cmd = path.basename(w[0]).toLowerCase();
+  }
+  if (BASH_GUARD_PRIV_ESC.has(cmd)) {
+    w = w.slice(1);
+    while (w.length && w[0].startsWith('-')) w = w.slice(1);
+    if (!w.length) return null;
+    cmd = path.basename(w[0]).toLowerCase();
+  }
+  return { cmd, args: w.slice(1) };
+}
+
+function bashNonFlagOperands(args: string[], flagsWithValue: Set<string> = BASH_GENERIC_FLAGS_WITH_VALUE): string[] {
+  const out: string[] = [];
+  let endOfOptions = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (!endOfOptions && a === '--') { endOfOptions = true; continue; }
+    if (!endOfOptions && a.startsWith('--target-directory=')) {
+      out.push(a.slice('--target-directory='.length));
+      continue;
+    }
+    if (!endOfOptions && a.startsWith('-')) {
+      if (!a.includes('=') && flagsWithValue.has(a)) i += 1;
+      continue;
+    }
+    out.push(a);
+  }
+  return out;
+}
+
+function bashEnvForPathResolution(ctx: ToolContext, workingDir: string): Record<string, string> {
+  return {
+    ...(ctx.state.sandboxEnv as Record<string, string> | undefined),
+    ORKAS_OUTPUT_DIR: workingDir,
+    PWD: workingDir,
+    HOME: process.env.HOME || process.env.USERPROFILE || '',
+  };
+}
+
+function expandKnownBashPathVars(raw: string, env: Record<string, string>): { value: string; dynamic: boolean } {
+  let dynamic = false;
+  const value = raw
+    .replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, name) => {
+      if (Object.prototype.hasOwnProperty.call(env, name)) return env[name] ?? '';
+      dynamic = true;
+      return _m;
+    })
+    .replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (_m, name) => {
+      if (Object.prototype.hasOwnProperty.call(env, name)) return env[name] ?? '';
+      dynamic = true;
+      return _m;
+    });
+  return { value, dynamic: dynamic || value.includes('$') || value.includes('`') || value.includes('$(') };
+}
+
+function resolveBashCandidate(raw: string, workingDir: string, env: Record<string, string>): { abs?: string; dynamic?: boolean } | null {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed || trimmed === '-' || /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) return null;
+  const expanded = expandKnownBashPathVars(trimmed, env);
+  if (expanded.dynamic) return { dynamic: true };
+  let value = expanded.value;
+  if (value === '~' || value.startsWith('~/')) {
+    const home = env.HOME || process.env.HOME || process.env.USERPROFILE || '';
+    if (!home) return { dynamic: true };
+    value = path.join(home, value.slice(2));
+  }
+  const globAt = value.search(/[*?\[\]{}]/);
+  if (globAt >= 0) {
+    const prefix = value.slice(0, globAt);
+    value = prefix.endsWith(path.sep) ? prefix.slice(0, -1) : path.dirname(prefix || '.');
+  }
+  return { abs: path.resolve(workingDir, value) };
+}
+
+function addBashCandidate(
+  out: BashPathCandidate[],
+  raw: string,
+  reason: string,
+  workingDir: string,
+  env: Record<string, string>,
+): void {
+  const resolved = resolveBashCandidate(raw, workingDir, env);
+  if (!resolved) return;
+  out.push({ raw, reason, ...(resolved.abs ? { abs: resolved.abs } : {}), ...(resolved.dynamic ? { dynamic: true } : {}) });
+}
+
+function addBashCurlTargets(out: BashPathCandidate[], args: string[], workingDir: string, env: Record<string, string>): void {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if ((a === '-o' || a === '--output') && args[i + 1]) addBashCandidate(out, args[++i], 'download output', workingDir, env);
+    else if (a.startsWith('--output=')) addBashCandidate(out, a.slice('--output='.length), 'download output', workingDir, env);
+  }
+}
+
+function addBashWgetTargets(out: BashPathCandidate[], args: string[], workingDir: string, env: Record<string, string>): void {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if ((a === '-O' || a === '--output-document') && args[i + 1]) addBashCandidate(out, args[++i], 'download output', workingDir, env);
+    else if (a.startsWith('--output-document=')) addBashCandidate(out, a.slice('--output-document='.length), 'download output', workingDir, env);
+  }
+}
+
+function gitCloneDestination(args: string[], gh = false): string | null {
+  const start = gh ? 2 : 1;
+  const operands = _cloneOperands(gh ? ['gh', 'repo', 'clone', ...args.slice(2)] : ['git', 'clone', ...args.slice(1)], gh ? 3 : 2);
+  if (!operands[0]) return null;
+  return operands[1] || _repoDefaultDir(operands[0] || args[start] || 'repo');
+}
+
+function tarFileOperand(args: string[]): string | null {
+  const fIdx = args.findIndex((a) => a === '-f' || a === '--file');
+  if (fIdx >= 0 && args[fIdx + 1]) return args[fIdx + 1];
+  const eq = args.find((a) => a.startsWith('--file='));
+  if (eq) return eq.slice('--file='.length);
+  const clustered = args.find((a) => /^-[A-Za-z]*f[A-Za-z]*$/.test(a));
+  if (clustered) {
+    const idx = args.indexOf(clustered);
+    if (idx >= 0 && args[idx + 1]) return args[idx + 1];
+  }
+  return null;
+}
+
+function bashScriptOperand(cmd: string, args: string[]): string | null {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--') return args[i + 1] || null;
+    if (a === '-') return null;
+    if (cmd === 'node' && (a === '-e' || a === '--eval' || a === '-p' || a === '--print')) {
+      i += 1;
+      continue;
+    }
+    if ((cmd === 'python' || cmd === 'python3') && (a === '-c' || a === '-m')) {
+      i += 1;
+      continue;
+    }
+    if ((cmd === 'perl' || cmd === 'ruby' || cmd === 'php') && (a === '-e' || a === '-E')) {
+      i += 1;
+      continue;
+    }
+    if (a === '-c') {
+      i += 1;
+      continue;
+    }
+    if (a.startsWith('-')) continue;
+    return a;
+  }
+  return null;
+}
+
+function grepReadOperands(args: string[]): string[] {
+  const operands = bashNonFlagOperands(args, BASH_GREP_FLAGS_WITH_VALUE);
+  if (!operands.length) return [];
+  const hasPatternFlag = args.some((a) => a === '-e' || a === '--regexp' || a.startsWith('--regexp='));
+  return hasPatternFlag ? operands : operands.slice(1);
+}
+
+function sedReadOperands(args: string[]): string[] {
+  if (args.some((a) => a === '-i' || a.startsWith('-i'))) return [];
+  const operands = bashNonFlagOperands(args);
+  if (!operands.length) return [];
+  const hasScriptFlag = args.some((a) => a === '-e' || a === '-f' || a === '--expression' || a === '--file' || a.startsWith('--expression=') || a.startsWith('--file='));
+  return hasScriptFlag ? operands : operands.slice(1);
+}
+
+function awkReadOperands(args: string[]): string[] {
+  const operands = bashNonFlagOperands(args, BASH_AWK_FLAGS_WITH_VALUE);
+  if (!operands.length) return [];
+  const hasScriptFile = args.some((a) => a === '-f' || a.startsWith('-f') || a === '--file' || a.startsWith('--file='));
+  return hasScriptFile ? operands : operands.slice(1);
+}
+
+function collectBashMutationCandidates(command: string, workingDir: string, env: Record<string, string>): BashPathCandidate[] {
+  const out: BashPathCandidate[] = [];
+  for (const seg of bashPathSegments(command)) {
+    for (const target of seg.redirectTargets) addBashCandidate(out, target, 'redirection', workingDir, env);
+    const eff = bashEffectiveCommand(seg.words);
+    if (!eff) continue;
+    const { cmd, args } = eff;
+
+    if (BASH_MUTATE_ALL_OPERANDS.has(cmd)) {
+      for (const operand of bashNonFlagOperands(args)) addBashCandidate(out, operand, cmd, workingDir, env);
+    } else if (BASH_DEST_LAST_OPERAND.has(cmd)) {
+      const operands = bashNonFlagOperands(args);
+      if (operands.length) addBashCandidate(out, operands[operands.length - 1], cmd, workingDir, env);
+    } else if (cmd === 'tee') {
+      for (const operand of bashNonFlagOperands(args, new Set(['-a', '-i', '-p', '--append', '--ignore-interrupts']))) {
+        addBashCandidate(out, operand, 'tee output', workingDir, env);
+      }
+    } else if (cmd === 'dd') {
+      for (const a of args) if (a.startsWith('of=')) addBashCandidate(out, a.slice(3), 'dd output', workingDir, env);
+    } else if (cmd === 'sed' && args.some((a) => a === '-i' || a.startsWith('-i'))) {
+      for (const operand of bashNonFlagOperands(args).filter((a) => {
+        const r = resolveBashCandidate(a, workingDir, env);
+        return !!r?.abs && fs.existsSync(r.abs);
+      })) addBashCandidate(out, operand, 'sed in-place edit', workingDir, env);
+    } else if (cmd === 'perl' && args.some((a) => /^-.*i/.test(a))) {
+      for (const operand of bashNonFlagOperands(args).filter((a) => {
+        const r = resolveBashCandidate(a, workingDir, env);
+        return !!r?.abs && fs.existsSync(r.abs);
+      })) addBashCandidate(out, operand, 'perl in-place edit', workingDir, env);
+    } else if (cmd === 'curl') {
+      addBashCurlTargets(out, args, workingDir, env);
+    } else if (cmd === 'wget') {
+      addBashWgetTargets(out, args, workingDir, env);
+    } else if (cmd === 'git' && args[0] === 'clone') {
+      const dest = gitCloneDestination(args);
+      if (dest) addBashCandidate(out, dest, 'git clone destination', workingDir, env);
+    } else if (cmd === 'gh' && args[0] === 'repo' && args[1] === 'clone') {
+      const dest = gitCloneDestination(args, true);
+      if (dest) addBashCandidate(out, dest, 'gh repo clone destination', workingDir, env);
+    } else if (cmd === 'tar' && args.some((a) => /^-.*x/.test(a) || a === '--extract')) {
+      const cIdx = args.findIndex((a) => a === '-C' || a === '--directory');
+      const eq = args.find((a) => a.startsWith('--directory='));
+      if (cIdx >= 0 && args[cIdx + 1]) addBashCandidate(out, args[cIdx + 1], 'tar extract directory', workingDir, env);
+      else if (eq) addBashCandidate(out, eq.slice('--directory='.length), 'tar extract directory', workingDir, env);
+    } else if (cmd === 'unzip') {
+      const dIdx = args.findIndex((a) => a === '-d');
+      if (dIdx >= 0 && args[dIdx + 1]) addBashCandidate(out, args[dIdx + 1], 'unzip output directory', workingDir, env);
+    }
+  }
+  return out;
+}
+
+function collectBashReadCandidates(command: string, workingDir: string, env: Record<string, string>): BashPathCandidate[] {
+  const out: BashPathCandidate[] = [];
+  for (const seg of bashPathSegments(command)) {
+    for (const target of seg.inputTargets) addBashCandidate(out, target, 'input redirection', workingDir, env);
+    const eff = bashEffectiveCommand(seg.words);
+    if (!eff) continue;
+    const { cmd, args } = eff;
+
+    if (BASH_READ_ALL_OPERANDS.has(cmd)) {
+      for (const operand of bashNonFlagOperands(args)) addBashCandidate(out, operand, cmd, workingDir, env);
+    } else if (BASH_READ_PATTERN_FIRST_CMDS.has(cmd)) {
+      for (const operand of grepReadOperands(args)) addBashCandidate(out, operand, cmd, workingDir, env);
+    } else if (cmd === 'sed') {
+      for (const operand of sedReadOperands(args)) addBashCandidate(out, operand, 'sed read', workingDir, env);
+    } else if (cmd === 'awk') {
+      for (const operand of awkReadOperands(args)) addBashCandidate(out, operand, 'awk read', workingDir, env);
+    } else if (cmd === 'cd' || cmd === 'pushd') {
+      const operand = bashNonFlagOperands(args)[0];
+      if (operand) addBashCandidate(out, operand, cmd, workingDir, env);
+    } else if (BASH_DEST_LAST_OPERAND.has(cmd)) {
+      const operands = bashNonFlagOperands(args);
+      for (const operand of operands.slice(0, -1)) addBashCandidate(out, operand, `${cmd} source`, workingDir, env);
+    } else if (BASH_READ_SCRIPT_CMDS.has(cmd)) {
+      const operand = bashScriptOperand(cmd, args);
+      if (operand) addBashCandidate(out, operand, `${cmd} script`, workingDir, env);
+    } else if (cmd === 'tar') {
+      const operand = tarFileOperand(args);
+      if (operand) addBashCandidate(out, operand, 'tar archive', workingDir, env);
+    } else if (cmd === 'unzip') {
+      const operand = bashNonFlagOperands(args)[0];
+      if (operand) addBashCandidate(out, operand, 'unzip archive', workingDir, env);
+    }
+  }
+  return out;
+}
+
+function bashScopedRootsFor(opts: LocalToolsOpts, workingDir: string): string[] {
+  if (localAccessAllowsOutsideWorkspace()) return [];
+  const roots = allowedRootsFor(opts);
+  if (!opts.userId && workingDir) roots.push(workingDir);
+  return roots;
+}
+
+function bashWritableRootsFor(opts: LocalToolsOpts, workingDir: string): string[] {
+  return bashScopedRootsFor(opts, workingDir);
+}
+
+function guardBashScopedPath(opts: LocalToolsOpts, abs: string, workingDir: string, access: 'read' | 'write'): string | null {
+  const roots = bashScopedRootsFor(opts, workingDir);
+  if (!roots.length) {
+    return localAccessAllowsOutsideWorkspace()
+      ? null
+      : errText('E_NO_SCOPE', `no ${access === 'read' ? 'readable' : 'writable'} roots for this bash command`);
+  }
+  if (isPathAllowed(abs, roots)) return null;
+  if (!localAccessAllowsOutsideWorkspace()) {
+    return errText(
+      'E_PATH_OUT_OF_SCOPE',
+      `bash target is outside the current workspace/attachment scope and the current access mode only allows workspace files: ${abs}`,
+    );
+  }
+  return null;
+}
+
+function guardBashWritablePath(opts: LocalToolsOpts, abs: string, workingDir: string): string | null {
+  return guardBashScopedPath(opts, abs, workingDir, 'write');
+}
+
+async function gateBashPathAccess(
+  opts: LocalToolsOpts,
+  abs: string,
+  workingDir: string,
+  access: 'read' | 'write',
+  ctx?: ToolContext,
+): Promise<BashPathGateResult> {
+  const denied = guardBashScopedPath(opts, abs, workingDir, access);
+  if (denied) return { error: denied, approvedReasons: [] };
+  return gateSensitiveLocalPathDetailed(opts, abs, 'bash', access, ctx);
+}
+
+function mergeRiskReasons(target: LocalAccessRiskCategory[], source: readonly LocalAccessRiskCategory[]): void {
+  for (const reason of source) if (!target.includes(reason)) target.push(reason);
+}
+
+async function guardBashPathCandidates(
+  opts: LocalToolsOpts,
+  ctx: ToolContext,
+  workingDir: string,
+  candidates: BashPathCandidate[],
+  access: 'read' | 'write',
+): Promise<BashFilesystemGuardResult> {
+  const approvedReasons: LocalAccessRiskCategory[] = [];
+  const seen = new Set<string>();
+  for (const c of candidates) {
+    const key = c.abs || `dynamic:${c.raw}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (c.dynamic || !c.abs) {
+      return {
+        result: {
+          content: errText(
+            'E_BASH_DYNAMIC_PATH_UNSUPPORTED',
+            `bash ${c.reason} target "${c.raw}" uses an unresolved variable, command substitution, or glob that Orkas cannot verify. `
+            + (access === 'write'
+              ? 'Use an explicit path inside the workspace, or use write_file/edit_file/delete_file for file changes.'
+              : 'Use an explicit path inside the workspace, or ask the user to switch to an all-files access mode.'),
+          ),
+          isError: true,
+        },
+        approvedReasons,
+      };
+    }
+    const gated = await gateBashPathAccess(opts, c.abs, workingDir, access, ctx);
+    mergeRiskReasons(approvedReasons, gated.approvedReasons);
+    if (gated.error) {
+      log.warn(access === 'write' ? 'bash filesystem mutation scope reject' : 'bash filesystem read scope reject', {
+        user_id: maskId(opts.userId),
+        path: logPathRef(c.abs),
+        reason: c.reason,
+      });
+      return {
+        result: {
+          content: errText(
+            access === 'write' ? 'E_BASH_PATH_OUT_OF_SCOPE' : 'E_BASH_READ_PATH_OUT_OF_SCOPE',
+            `bash ${c.reason} target is not ${access === 'write' ? 'writable' : 'readable'}: ${c.raw} -> ${c.abs}. ${gated.error}`,
+          ),
+          isError: true,
+        },
+        approvedReasons,
+      };
+    }
+  }
+  return { result: null, approvedReasons };
+}
+
+async function guardBashFilesystemTargets(
+  opts: LocalToolsOpts,
+  input: Record<string, unknown>,
+  ctx: ToolContext,
+  workingDir: string,
+): Promise<BashFilesystemGuardResult> {
+  const command = String(input.command ?? '');
+  const env = bashEnvForPathResolution(ctx, workingDir);
+  const approvedReasons: LocalAccessRiskCategory[] = [];
+  const mutation = await guardBashPathCandidates(
+    opts,
+    ctx,
+    workingDir,
+    collectBashMutationCandidates(command, workingDir, env),
+    'write',
+  );
+  mergeRiskReasons(approvedReasons, mutation.approvedReasons);
+  if (mutation.result) return { result: mutation.result, approvedReasons };
+
+  const read = await guardBashPathCandidates(
+    opts,
+    ctx,
+    workingDir,
+    collectBashReadCandidates(command, workingDir, env),
+    'read',
+  );
+  mergeRiskReasons(approvedReasons, read.approvedReasons);
+  if (read.result) return { result: read.result, approvedReasons };
+  return { result: null, approvedReasons };
 }
 
 function countOccurrences(haystack: string, needle: string): number {
@@ -741,6 +1504,113 @@ function guardDisabledSkillBash(opts: LocalToolsOpts, command: string): string |
   return null;
 }
 
+function commandStartsNoBrowserAuthLogin(command: string): boolean {
+  const normalized = String(command || '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return false;
+  const startsAuthLogin =
+    /\bgcloud\s+auth\s+(?:application-default\s+)?login\b/i.test(normalized)
+    || /\bgws\s+auth\s+login\b/i.test(normalized);
+  const requestsManualCode =
+    /(?:^|\s)--no-launch-browser(?:\s|$|=true\b)/i.test(normalized)
+    || /(?:^|\s)--no-browser(?:\s|$|=true\b)/i.test(normalized);
+  return startsAuthLogin && requestsManualCode;
+}
+
+function guardUnsupportedAuthCodeFlow(command: string): string | null {
+  if (!commandStartsNoBrowserAuthLogin(command)) return null;
+  return errText(
+    'E_INTERACTIVE_AUTH_CODE_UNSUPPORTED',
+    'this command starts a one-time browser verification-code flow that cannot be completed reliably through chat. '
+    + 'Do not ask the user to paste verification codes into the conversation or keep a background process waiting. '
+    + 'Use interactive_cli_start for commands that need live user input, use a browser/callback OAuth flow that completes on its own, '
+    + 'use an Orkas connector OAuth flow, or stop and give the user a one-time terminal command to run.',
+  );
+}
+
+const GOOGLE_CLOUD_SDK_OAUTH_CLIENT_IDS = [
+  '32555940559.apps.googleusercontent.com',
+  '764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com',
+];
+
+const GOOGLE_WORKSPACE_SCOPE_RE =
+  /https?:\/\/(?:www\.)?googleapis\.com\/auth\/(?:gmail(?:[.\s/&?]|$)|drive(?:[.\s/&?]|$)|documents(?:[\s/&?]|$)|spreadsheets(?:[\s/&?]|$)|calendar(?:[.\s/&?]|$)|contacts(?:[.\s/&?]|$)|tasks(?:[\s/&?]|$))/i;
+
+function decodedOAuthText(input: string): string {
+  const raw = String(input || '');
+  let decoded = raw.replace(/\+/g, ' ');
+  for (let i = 0; i < 3; i++) {
+    try {
+      const next = decodeURIComponent(decoded).replace(/\+/g, ' ');
+      if (next === decoded) break;
+      decoded = next;
+    } catch {
+      break;
+    }
+  }
+  return `${raw}\n${decoded}`;
+}
+
+function containsCloudSdkClientWithWorkspaceScope(input: string): boolean {
+  const haystack = decodedOAuthText(input);
+  return GOOGLE_CLOUD_SDK_OAUTH_CLIENT_IDS.some((clientId) => haystack.includes(clientId))
+    && GOOGLE_WORKSPACE_SCOPE_RE.test(haystack);
+}
+
+function googleWorkspaceOauthClientScopeMismatchErr(): string {
+  return errText(
+    'E_GOOGLE_OAUTH_CLIENT_SCOPE_MISMATCH',
+    'Google Cloud SDK OAuth client IDs cannot be reused with Gmail, Drive, Docs, Sheets, Calendar, Contacts, or Tasks scopes. '
+    + 'Do not synthesize Google OAuth URLs or scripts with Cloud SDK client IDs. Use an Orkas connector OAuth flow or stop and explain that Google Workspace access needs a product-managed Google connector.',
+  );
+}
+
+function guardGoogleWorkspaceOauthClientMismatchText(input: string): string | null {
+  return containsCloudSdkClientWithWorkspaceScope(input)
+    ? googleWorkspaceOauthClientScopeMismatchErr()
+    : null;
+}
+
+function unquoteShellToken(token: string): string {
+  const s = String(token || '').trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    return s.slice(1, -1);
+  }
+  return s;
+}
+
+function guardGoogleWorkspaceOauthClientMismatchCommand(command: string, cwd?: string): string | null {
+  const directErr = guardGoogleWorkspaceOauthClientMismatchText(command);
+  if (directErr) return directErr;
+
+  const re = /\b(?:python3?|node|bash|sh|zsh)\s+((?:"[^"]+"|'[^']+'|[^\s;&|]+))/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(command)) !== null) {
+    const scriptRef = unquoteShellToken(m[1]);
+    if (!scriptRef || scriptRef.startsWith('-')) continue;
+    const abs = path.isAbsolute(scriptRef)
+      ? scriptRef
+      : path.resolve(cwd || process.cwd(), scriptRef);
+    try {
+      const st = fs.statSync(abs);
+      if (!st.isFile() || st.size > 512 * 1024) continue;
+      const fileErr = guardGoogleWorkspaceOauthClientMismatchText(fs.readFileSync(abs, 'utf8'));
+      if (fileErr) return fileErr;
+    } catch {
+      // Missing/unreadable script paths should fail naturally when the command runs.
+    }
+  }
+  return null;
+}
+
+function guardInteractiveNoBrowserAuthFlow(command: string, allowNoBrowserAuth: boolean): string | null {
+  if (allowNoBrowserAuth || !commandStartsNoBrowserAuthLogin(command)) return null;
+  return errText(
+    'E_INTERACTIVE_AUTH_NO_BROWSER_UNSUPPORTED',
+    'this interactive command disables the browser OAuth callback flow. Start the same login without --no-browser/--no-launch-browser so the CLI can open the browser and complete after the user authorizes. '
+    + 'Do not switch to another OAuth method, ask for codes in chat, or install alternate auth libraries unless the user explicitly asks for a no-browser flow.',
+  );
+}
+
 /** Wrapped `bash` tool — identical schema, permission-gated, host-shell wording. */
 function createBashTool(opts: LocalToolsOpts): AgentTool {
   const windowsShellDescription = process.platform === 'win32'
@@ -755,10 +1625,10 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
       'Execute a shell command on the user\'s local machine and return its output. ' +
       'Use for installing CLIs (brew, npm, pip), running builds, converting files, ' +
       'inspecting the filesystem, and any other host-side work. The shell runs in ' +
-      'the user\'s current workspace directory. For files generated by scripts that ' +
-      'should be shown to the user as produced-file chips (for example .docx, .xlsx, ' +
-      '.pptx, .pdf, images, HTML, CSV, Markdown), write them under the absolute ' +
-      '$ORKAS_OUTPUT_DIR path, which is the current conversation workspace. ' +
+      'the user\'s current workspace directory. Files generated under the conversation ' +
+      'workspace are surfaced as produced-file chips, except for files clearly created ' +
+      'by external download/clone commands such as git clone, gh repo clone, curl, or wget. ' +
+      'Use the absolute $ORKAS_OUTPUT_DIR path for final generated outputs. ' +
       windowsShellDescription +
       'Scratch/cache files should stay in temporary or cache directories. ' +
       'For GUI apps, browsers, servers, watchers, or any command you would normally ' +
@@ -767,19 +1637,46 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
     inputSchema: coreBashTool.inputSchema,
     async execute(input, ctx) {
       const mode = getLocalExecMode();
-      if (mode === 'off') return deniedResult();
       const command = String(input.command ?? '');
+      const oauthClientMismatchErr = guardGoogleWorkspaceOauthClientMismatchCommand(command, ctx.workingDir);
+      if (oauthClientMismatchErr) {
+        log.warn('bash google oauth client/scope mismatch reject', {
+          user_id: maskId(opts.userId),
+          command_chars: command.length,
+        });
+        return { content: oauthClientMismatchErr, isError: true };
+      }
       const disabledSkillErr = guardDisabledSkillBash(opts, command);
       if (disabledSkillErr) {
-        log.warn(`bash disabled skill reject user=${opts.userId ?? '?'} command=${command.slice(0, 160)}`);
+        log.warn('bash disabled skill reject', {
+          user_id: maskId(opts.userId),
+          command_chars: command.length,
+        });
         return { content: disabledSkillErr, isError: true };
       }
-      // risk_prompt: classify the command and block on user confirmation when
-      // it trips a risk category (network exfil / dangerous delete / priv-esc
-      // / sensitive path). allow_all skips this; off already returned above.
-      if (mode === 'risk_prompt' && command.trim()) {
-        const { risky, reasons } = classifyBashCommand(command);
-        if (risky) {
+      const unsupportedAuthErr = guardUnsupportedAuthCodeFlow(command);
+      if (unsupportedAuthErr) {
+        log.warn('bash unsupported auth-code flow reject', {
+          user_id: maskId(opts.userId),
+          command_chars: command.length,
+        });
+        return { content: unsupportedAuthErr, isError: true };
+      }
+      const workingDirForGuard = path.resolve(ctx.workingDir ?? '.');
+      const filesystemGate = await guardBashFilesystemTargets(opts, input, ctx, workingDirForGuard);
+      if (filesystemGate.result) return filesystemGate.result;
+      // Approval modes: classify the command and block on user confirmation
+      // when it trips a sensitive category. all_files_auto skips this.
+      if (localAccessRequiresSensitiveApproval(mode) && command.trim()) {
+        const base = classifyBashCommand(command);
+        const pathApprovalCoveredSensitive = filesystemGate.approvedReasons.includes('sensitive_path');
+        const baseReasons = pathApprovalCoveredSensitive
+          ? base.reasons.filter((reason) => reason !== 'sensitive_path')
+          : base.reasons;
+        const reasons = classifyConfiguredBashCommand(command, baseReasons, {
+          includePathPatterns: !pathApprovalCoveredSensitive,
+        });
+        if (reasons.length) {
           const decision = await requestBashDecision({
             uid: opts.userId ?? '',
             cid: opts.cid ?? '',
@@ -787,9 +1684,16 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
             agentName: opts.agentName ?? opts.agentId ?? '',
             command,
             reasons,
+            onWaiting: permissionWaitProgress(ctx, 'bash'),
           });
           if (decision === 'deny') {
-            log.warn(`bash risk-denied user=${opts.userId ?? '?'} reasons=${reasons.join(',')}`);
+            log.warn('bash risk denied', {
+              user_id: maskId(opts.userId),
+              cid: maskId(opts.cid),
+              agent_id: maskId(opts.agentId),
+              command_chars: command.length,
+              reasons,
+            });
             return {
               content: errText(
                 'E_BASH_RISK_DENIED',
@@ -841,6 +1745,326 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
   };
 }
 
+async function gateInteractiveCliStart(
+  opts: LocalToolsOpts,
+  command: string,
+  settings?: { allowNoBrowserAuth?: boolean; workingDir?: string },
+  ctx?: ToolContext,
+): Promise<ToolResult | null> {
+  const mode = getLocalExecMode();
+  const oauthClientMismatchErr = guardGoogleWorkspaceOauthClientMismatchCommand(command, settings?.workingDir);
+  if (oauthClientMismatchErr) {
+    log.warn('interactive_cli_start google oauth client/scope mismatch reject', {
+      user_id: maskId(opts.userId),
+      command_chars: command.length,
+    });
+    return { content: oauthClientMismatchErr, isError: true };
+  }
+  const unsupportedNoBrowserAuthErr = guardInteractiveNoBrowserAuthFlow(
+    command,
+    settings?.allowNoBrowserAuth === true,
+  );
+  if (unsupportedNoBrowserAuthErr) {
+    log.warn('interactive_cli_start unsupported no-browser auth reject', {
+      user_id: maskId(opts.userId),
+      command_chars: command.length,
+    });
+    return { content: unsupportedNoBrowserAuthErr, isError: true };
+  }
+  const disabledSkillErr = guardDisabledSkillBash(opts, command);
+  if (disabledSkillErr) {
+    log.warn('interactive_cli_start disabled skill reject', {
+      user_id: maskId(opts.userId),
+      command_chars: command.length,
+    });
+    return { content: disabledSkillErr, isError: true };
+  }
+  if (localAccessRequiresSensitiveApproval(mode) && command.trim()) {
+    const base = classifyBashCommand(command);
+    const reasons = classifyConfiguredBashCommand(command, base.reasons);
+    if (reasons.length) {
+      const decision = await requestBashDecision({
+        uid: opts.userId ?? '',
+        cid: opts.cid ?? '',
+        agentId: opts.agentId ?? '',
+            agentName: opts.agentName ?? opts.agentId ?? '',
+            command,
+            reasons,
+            onWaiting: permissionWaitProgress(ctx, 'interactive_cli_start'),
+          });
+      if (decision === 'deny') {
+        log.warn('interactive_cli_start risk denied', {
+          user_id: maskId(opts.userId),
+          cid: maskId(opts.cid),
+          agent_id: maskId(opts.agentId),
+          command_chars: command.length,
+          reasons,
+        });
+        return {
+          content: errText(
+            'E_BASH_RISK_DENIED',
+            `the user declined to run this interactive command (flagged: ${reasons.join(', ')}). `
+            + 'Do not retry the same command or work around the prompt; explain in prose what you intended and ask the user how to proceed.',
+          ),
+          isError: true,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+function jsonToolResult(value: unknown): ToolResult {
+  return { content: JSON.stringify(value, null, 2) };
+}
+
+function interactiveCliUserActionState(view: InteractiveCliSessionView): {
+  userActionRequired: boolean;
+  reason?: string;
+  nextStep: string;
+} {
+  if (view.status !== 'running') {
+    return {
+      userActionRequired: false,
+      nextStep:
+        view.status === 'error'
+          ? 'The interactive command ended with an error before user input was needed. Explain the problem and next step to the user in prose; do not wait for input in the panel.'
+          : 'The interactive command already finished. Continue the task or summarize the result to the user.',
+    };
+  }
+
+  const output = String(view.output || '');
+  const urls = Array.isArray(view.urls) ? view.urls.join('\n') : '';
+  const authBrowser =
+    /browser has been opened|opened to visit|complete the sign-in prompts|accounts\.google\.com\/o\/oauth2|redirect_uri=http/i.test(output)
+    || /accounts\.google\.com\/o\/oauth2|redirect_uri=http|code_challenge=/i.test(urls);
+  if (authBrowser) {
+    return {
+      userActionRequired: true,
+      reason: 'browser_auth',
+      nextStep:
+        'The CLI has already opened or shown the browser authorization page. Stop tool use now. Do not call open/xdg-open/start, do not restart or close this auth command, do not check auth status, do not install alternate auth libraries, and do not switch to another OAuth method such as ADC or Python OAuth. Tell the user to finish authorization in the browser; continue only after the user replies, cancels, or the session exits.',
+    };
+  }
+  if (view.prompt_kind) {
+    return {
+      userActionRequired: true,
+      reason: view.prompt_kind,
+      nextStep:
+        'The CLI is waiting for user input. Stop tool use now and ask the user to enter the requested value in the Orkas interactive CLI panel, not in chat. Do not close this command, retry with another auth method, or install alternate auth libraries while it is waiting. Continue only after the user replies, cancels, or the session output changes.',
+    };
+  }
+  return {
+    userActionRequired: false,
+    nextStep:
+      'Use interactive_cli_read only after meaningful progress is expected, such as after waiting or after the user has acted. Do not repeat identical reads in a tight loop.',
+  };
+}
+
+function interactiveCliToolPayload(view: InteractiveCliSessionView): Record<string, unknown> {
+  const state = interactiveCliUserActionState(view);
+  return {
+    session_id: view.session_id,
+    ...(view.purpose ? { purpose: view.purpose } : {}),
+    status: view.status,
+    ...(view.status !== 'running' ? { exit_code: view.exit_code ?? null } : {}),
+    output: view.output,
+    urls: view.urls,
+    ...(view.prompt_kind ? { prompt_kind: view.prompt_kind } : {}),
+    ...(typeof view.sensitive_hint === 'boolean' ? { sensitive_hint: view.sensitive_hint } : {}),
+    user_action_required: state.userActionRequired,
+    agent_should_stop: state.userActionRequired,
+    ...(state.reason ? { user_action_reason: state.reason } : {}),
+    next_step: state.nextStep,
+  };
+}
+
+function createInteractiveCliStartTool(opts: LocalToolsOpts): AgentTool {
+  return {
+    name: 'interactive_cli_start',
+    description:
+      'Start a local CLI command as a live interactive session with persistent stdin/stdout. ' +
+      'The model decides per command: use this instead of bash for any local CLI, built-in or external, ' +
+      'when the command is expected to wait for live stdin from the user, such as OAuth login, ' +
+      'verification/device codes, password prompts, yes/no confirmations, setup wizards, or other interactive prompts. ' +
+      'Set `purpose` to a short user-facing phrase that explains what the user is being asked to do, for example "Authorize Google Workspace access". ' +
+      'For OAuth login commands, prefer the browser/callback flow and do not pass --no-browser or --no-launch-browser unless the user explicitly says a browser flow is unavailable. ' +
+      'Do not use this for discovery, validation, --help, install checks, commands that merely print errors, or any command expected to finish without user input; use bash for those. ' +
+      'Do not ask the user to paste authorization codes, passwords, tokens, or other secrets into chat. ' +
+      'When user input is needed, tell the user to enter it in the Orkas interactive CLI panel; that input goes directly to the CLI and is not part of chat history. ' +
+      'For ordinary one-shot commands that do not need later stdin, use bash instead. ' +
+      'The session is pipe-backed, not a full terminal TTY, so avoid curses/full-screen TUI programs.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        command: {
+          type: 'string',
+          description: 'Shell command to start in the conversation workspace. Required.',
+        },
+        max_lifetime_ms: {
+          type: 'number',
+          description: 'Optional maximum session lifetime. Defaults to 30 minutes; values below 10 minutes are raised to 10 minutes; hard cap is 2 hours.',
+        },
+        purpose: {
+          type: 'string',
+          description: 'Short user-facing title for the interactive panel. Do not put the raw command here.',
+        },
+        allow_no_browser_auth: {
+          type: 'boolean',
+          description: 'Only set true when the user explicitly says browser OAuth cannot be used. Otherwise OAuth login commands with --no-browser/--no-launch-browser are rejected.',
+        },
+      },
+      required: ['command'],
+    },
+    async execute(input, ctx) {
+      const command = String(input.command ?? '').trim();
+      if (!command) return { content: errText('E_BAD_INPUT', '`command` is required'), isError: true };
+      const workingDir = path.resolve(ctx.workingDir ?? '.');
+      const gate = await gateInteractiveCliStart(opts, command, {
+        allowNoBrowserAuth: input.allow_no_browser_auth === true,
+        workingDir,
+      }, ctx);
+      if (gate) return gate;
+      try { fs.mkdirSync(workingDir, { recursive: true }); }
+      catch { /* spawn will report the canonical error */ }
+      const view = startInteractiveCliSession({
+        uid: opts.userId ?? '',
+        cid: opts.cid,
+        agentId: opts.agentId,
+        agentName: opts.agentName ?? opts.agentId,
+        purpose: typeof input.purpose === 'string' ? input.purpose : undefined,
+        command,
+        cwd: workingDir,
+        sandboxEnv: (ctx.state.sandboxEnv ?? {}) as Record<string, string>,
+        maxLifetimeMs: Number(input.max_lifetime_ms),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const latest = readInteractiveCliSession(opts.userId ?? '', view.session_id);
+      if (latest.status !== 'running') {
+        const result = interactiveCliToolPayload(latest);
+        return {
+          content: JSON.stringify(result, null, 2),
+          isError: latest.status === 'error',
+        };
+      }
+      return jsonToolResult(interactiveCliToolPayload(latest));
+    },
+  };
+}
+
+function createInteractiveCliReadTool(opts: LocalToolsOpts): AgentTool {
+  return {
+    name: 'interactive_cli_read',
+    description:
+      'Read the current status and recent output of an interactive CLI session started with interactive_cli_start. ' +
+      'Use this after waiting or after the user has entered input in the interactive CLI panel.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', description: 'Session id returned by interactive_cli_start.' },
+      },
+      required: ['session_id'],
+    },
+    async execute(input) {
+      if (!getLocalExecGranted()) return deniedResult();
+      const sessionId = String(input.session_id ?? '').trim();
+      if (!sessionId) return { content: errText('E_BAD_INPUT', '`session_id` is required'), isError: true };
+      try {
+        return jsonToolResult(interactiveCliToolPayload(readInteractiveCliSession(opts.userId ?? '', sessionId)));
+      } catch (err) {
+        return { content: errText('E_INTERACTIVE_CLI', (err as Error).message), isError: true };
+      }
+    },
+  };
+}
+
+function createInteractiveCliSendTool(opts: LocalToolsOpts): AgentTool {
+  return {
+    name: 'interactive_cli_send',
+    description:
+      'Send non-secret input to an interactive CLI session stdin. ' +
+      'Use for agent-known responses such as y/n, menu choices, or pressing Enter. ' +
+      'Do not use this for OAuth authorization codes, passwords, tokens, API keys, or other user secrets; ask the user to type those in the Orkas interactive CLI panel instead.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', description: 'Session id returned by interactive_cli_start.' },
+        input: { type: 'string', description: 'Input to send to stdin.' },
+        add_newline: { type: 'boolean', description: 'Default true. Append a newline after input.' },
+      },
+      required: ['session_id', 'input'],
+    },
+    async execute(input) {
+      if (!getLocalExecGranted()) return deniedResult();
+      const sessionId = String(input.session_id ?? '').trim();
+      if (!sessionId) return { content: errText('E_BAD_INPUT', '`session_id` is required'), isError: true };
+      try {
+        const view = sendInteractiveCliInput(opts.userId ?? '', sessionId, String(input.input ?? ''), {
+          addNewline: input.add_newline !== false,
+          sensitive: false,
+        });
+        return jsonToolResult({ session_id: view.session_id, status: view.status, sent: true });
+      } catch (err) {
+        return { content: errText('E_INTERACTIVE_CLI', (err as Error).message), isError: true };
+      }
+    },
+  };
+}
+
+function createInteractiveCliCloseTool(opts: LocalToolsOpts): AgentTool {
+  return {
+    name: 'interactive_cli_close',
+    description:
+      'Close an interactive CLI session and terminate its process tree. Use when setup is done, the command is stuck, or the user cancels. ' +
+      'Do not close a session that is waiting for browser authorization or user input unless the user explicitly cancels; in that case set force=true and provide a brief reason.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string', description: 'Session id returned by interactive_cli_start.' },
+        force: {
+          type: 'boolean',
+          description: 'Required to close a running session that is currently waiting for user action. Use only after explicit user cancellation or test cleanup.',
+        },
+        reason: {
+          type: 'string',
+          description: 'Brief reason for forcing close, for example "user cancelled authorization".',
+        },
+      },
+      required: ['session_id'],
+    },
+    async execute(input) {
+      if (!getLocalExecGranted()) return deniedResult();
+      const sessionId = String(input.session_id ?? '').trim();
+      if (!sessionId) return { content: errText('E_BAD_INPUT', '`session_id` is required'), isError: true };
+      try {
+        const current = readInteractiveCliSession(opts.userId ?? '', sessionId);
+        const state = interactiveCliUserActionState(current);
+        if (current.status === 'running' && state.userActionRequired && input.force !== true) {
+          return {
+            content: errText(
+              'E_INTERACTIVE_CLI_WAITING_FOR_USER',
+              'this interactive CLI session is waiting for the user. Do not close, restart, poll, or switch to another auth method before the user acts. '
+              + 'Only close it with force=true after the user explicitly cancels.',
+            ),
+            isError: true,
+          };
+        }
+        if (input.force === true) {
+          const reason = String(input.reason || '').replace(/\s+/g, ' ').trim();
+          log.info('interactive_cli_close force requested', {
+            user_id: maskId(opts.userId),
+            session_id: maskId(sessionId),
+            reason_chars: reason.length,
+          });
+        }
+        return jsonToolResult(interactiveCliToolPayload(closeInteractiveCliSession(opts.userId ?? '', sessionId)));
+      } catch (err) {
+        return { content: errText('E_INTERACTIVE_CLI', (err as Error).message), isError: true };
+      }
+    },
+  };
+}
+
 /** Wrapped `write_file` tool — uniquify-on-collision + onFileWritten emit. */
 function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
   return {
@@ -856,14 +2080,18 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
     inputSchema: coreWriteFileTool.inputSchema,
     async execute(input, ctx) {
       if (!getLocalExecGranted()) return deniedResult();
+      const oauthClientMismatchErr = guardGoogleWorkspaceOauthClientMismatchText(String(input.content ?? ''));
+      if (oauthClientMismatchErr) {
+        log.warn('write_file google oauth client/scope mismatch reject', { user_id: maskId(opts.userId) });
+        return { content: oauthClientMismatchErr, isError: true };
+      }
       const inputPath = String(input.path ?? '');
+      if (!inputPath) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
       const inputAbs = resolveAbs(ctx, inputPath);
-      if (opts.userId) {
-        const scopeErr = guardEditPath(opts, inputAbs);
-        if (scopeErr) {
-          log.warn(`write_file scope reject user=${opts.userId ?? '?'} path=${inputAbs}`);
-          return { content: scopeErr, isError: true };
-        }
+      const scopeErr = await gateEditPath(opts, inputAbs, ctx);
+      if (scopeErr) {
+        log.warn('write_file scope reject', { user_id: maskId(opts.userId), path: logPathRef(inputAbs) });
+        return { content: scopeErr, isError: true };
       }
       const { finalPath, renamed } = await uniquifyPath(inputAbs, isMineFor(opts));
       const rewritten = finalPath !== inputAbs
@@ -878,9 +2106,9 @@ function createWriteFileTool(opts: LocalToolsOpts): AgentTool {
       }
       if (!result.isError && opts.onFileWritten) {
         try {
-          opts.onFileWritten(finalPath);
+          await opts.onFileWritten(finalPath);
         } catch (err) {
-          log.warn(`onFileWritten callback failed: ${(err as Error).message}`);
+          log.warn('onFileWritten callback failed', { error: logErrorRef(err) });
         }
       }
       if (!result.isError && renamed) {
@@ -947,9 +2175,9 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
       const replaceAll = input.replace_all === true;
 
       const abs = resolveAbs(ctx, rawPath);
-      const scopeErr = guardEditPath(opts, abs);
+      const scopeErr = await gateEditPath(opts, abs, ctx);
       if (scopeErr) {
-        log.warn(`edit_file scope reject user=${opts.userId ?? '?'} path=${abs}`);
+        log.warn('edit_file scope reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
         return { content: scopeErr, isError: true };
       }
 
@@ -961,7 +2189,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
         let st: fs.Stats;
         try { st = fs.statSync(abs); }
         catch (err) {
-          log.warn(`edit_file not-found user=${opts.userId ?? '?'} path=${abs}: ${(err as Error).message}`);
+          log.warn('edit_file not found', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
           return {
             content: errText('E_NOT_FOUND', `${abs}: file does not exist (use write_file to create new files)`),
             isError: true,
@@ -988,7 +2216,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
         // didn't inject the read-state map.
         const block = checkEditFreshness(ctx, abs, st);
         if (block) {
-          log.warn(`edit_file ${block.code} user=${opts.userId ?? '?'} path=${abs}`);
+          log.warn('edit_file freshness reject', { user_id: maskId(opts.userId), path: logPathRef(abs), code: block.code });
           return { content: errText(block.code, block.msg), isError: true };
         }
 
@@ -996,7 +2224,7 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
         try { body = fs.readFileSync(abs, 'utf8'); }
         catch (err) {
           const msg = (err as Error).message;
-          log.warn(`edit_file read failed user=${opts.userId ?? '?'} path=${abs}: ${msg}`);
+          log.warn('edit_file read failed', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
           return { content: errText('E_EDIT_FAILED', `${abs}: read failed: ${msg}`), isError: true };
         }
 
@@ -1015,12 +2243,17 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
         }
 
         const next = replaceAll ? body.split(oldStr).join(newStr) : body.replace(oldStr, newStr);
+        const oauthClientMismatchErr = guardGoogleWorkspaceOauthClientMismatchText(next);
+        if (oauthClientMismatchErr) {
+          log.warn('edit_file google oauth client/scope mismatch reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
+          return { content: oauthClientMismatchErr, isError: true };
+        }
 
         try {
           fs.writeFileSync(abs, next, 'utf8');
         } catch (err) {
           const msg = (err as Error).message;
-          log.warn(`edit_file write failed user=${opts.userId ?? '?'} path=${abs}: ${msg}`);
+          log.warn('edit_file write failed', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
           return { content: errText('E_EDIT_FAILED', `${abs}: write failed: ${msg}`), isError: true };
         }
 
@@ -1029,11 +2262,11 @@ function createEditFileTool(opts: LocalToolsOpts): AgentTool {
         recordRead(ctx, abs);
 
         const replaced = replaceAll ? count : 1;
-        log.info(`edit_file user=${opts.userId ?? '?'} replaced=${replaced} path=${abs}`);
+        log.info('edit_file applied', { user_id: maskId(opts.userId), path: logPathRef(abs), replaced });
 
         if (opts.onFileWritten) {
-          try { opts.onFileWritten(abs); }
-          catch (err) { log.warn(`onFileWritten callback failed: ${(err as Error).message}`); }
+          try { await opts.onFileWritten(abs); }
+          catch (err) { log.warn('onFileWritten callback failed', { error: logErrorRef(err) }); }
         }
 
         return {
@@ -1072,16 +2305,33 @@ function createMarkdownToPdfTool(opts: LocalToolsOpts): AgentTool {
     },
     async execute(input, ctx) {
       if (!getLocalExecGranted()) return deniedResult();
-      const inputAbs = resolveAbs(ctx, String(input.path ?? ''));
+      const rawPath = String(input.path ?? '');
+      if (!rawPath) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
+      const inputAbs = resolveAbs(ctx, rawPath);
+      const scopeErr = await gateEditPath(opts, inputAbs, ctx);
+      if (scopeErr) {
+        log.warn('markdown_to_pdf scope reject', { user_id: maskId(opts.userId), path: logPathRef(inputAbs) });
+        return { content: scopeErr, isError: true };
+      }
       const { finalPath, renamed } = await uniquifyPath(inputAbs, isMineFor(opts));
+      if (finalPath !== inputAbs) {
+        const finalScopeErr = await gateEditPath(opts, finalPath, ctx);
+        if (finalScopeErr) {
+          log.warn('markdown_to_pdf final scope reject', { user_id: maskId(opts.userId), path: logPathRef(finalPath) });
+          return { content: finalScopeErr, isError: true };
+        }
+      }
       try {
+        const footerText = producedDocumentFooterText({ userId: opts.userId, cid: opts.cid, source: 'markdown_to_pdf' });
         await markdownToPdf(String(input.markdown ?? ''), finalPath, {
           ...(typeof input.title === 'string' ? { title: input.title } : {}),
           ...(typeof input.pageSize === 'string' ? { pageSize: input.pageSize as any } : {}),
           ...(typeof input.landscape === 'boolean' ? { landscape: input.landscape } : {}),
+          ...(footerText ? { footerText } : {}),
         });
         if (opts.onFileWritten) {
-          try { opts.onFileWritten(finalPath); } catch (err) { log.warn(`onFileWritten: ${(err as Error).message}`); }
+          try { await opts.onFileWritten(finalPath); }
+          catch (err) { log.warn('onFileWritten callback failed', { path: logPathRef(finalPath), error: logErrorRef(err) }); }
         }
         const base = `PDF written: ${finalPath}`;
         return { content: renamed ? `${base}${renderRenameSignal(inputAbs, finalPath)}` : base };
@@ -1115,15 +2365,32 @@ function createHtmlToPdfTool(opts: LocalToolsOpts): AgentTool {
     },
     async execute(input, ctx) {
       if (!getLocalExecGranted()) return deniedResult();
-      const inputAbs = resolveAbs(ctx, String(input.path ?? ''));
+      const rawPath = String(input.path ?? '');
+      if (!rawPath) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
+      const inputAbs = resolveAbs(ctx, rawPath);
+      const scopeErr = await gateEditPath(opts, inputAbs, ctx);
+      if (scopeErr) {
+        log.warn('html_to_pdf scope reject', { user_id: maskId(opts.userId), path: logPathRef(inputAbs) });
+        return { content: scopeErr, isError: true };
+      }
       const { finalPath, renamed } = await uniquifyPath(inputAbs, isMineFor(opts));
+      if (finalPath !== inputAbs) {
+        const finalScopeErr = await gateEditPath(opts, finalPath, ctx);
+        if (finalScopeErr) {
+          log.warn('html_to_pdf final scope reject', { user_id: maskId(opts.userId), path: logPathRef(finalPath) });
+          return { content: finalScopeErr, isError: true };
+        }
+      }
       try {
+        const footerText = producedDocumentFooterText({ userId: opts.userId, cid: opts.cid, source: 'html_to_pdf' });
         await htmlToPdf(String(input.html ?? ''), finalPath, {
           ...(typeof input.pageSize === 'string' ? { pageSize: input.pageSize as any } : {}),
           ...(typeof input.landscape === 'boolean' ? { landscape: input.landscape } : {}),
+          ...(footerText ? { footerText } : {}),
         });
         if (opts.onFileWritten) {
-          try { opts.onFileWritten(finalPath); } catch (err) { log.warn(`onFileWritten: ${(err as Error).message}`); }
+          try { await opts.onFileWritten(finalPath); }
+          catch (err) { log.warn('onFileWritten callback failed', { path: logPathRef(finalPath), error: logErrorRef(err) }); }
         }
         const base = `PDF written: ${finalPath}`;
         return { content: renamed ? `${base}${renderRenameSignal(inputAbs, finalPath)}` : base };
@@ -1198,14 +2465,45 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
         // Cast in the error branch — `strictNullChecks: false` keeps the
         // whole `Result<>` union here (codebase-wide workaround).
         const errMsg = (r as { error?: string }).error || 'invalid artifact';
-        log.warn(`create_artifact reject user=${uid} cid=${cid}: ${errMsg}`);
+        log.warn('create_artifact reject', {
+          user_id: maskId(uid),
+          cid: maskId(cid),
+          agent_id: maskId(opts.agentId),
+          error: logErrorRef(new Error(errMsg)),
+        });
         return { content: errText('E_BAD_ARTIFACT', errMsg), isError: true };
+      }
+      const resolved = chatArtifacts.resolveArtifactDir(uid, cid, r.artifactId);
+      if (!resolved.ok) {
+        return { content: errText('E_ARTIFACT_FINALIZE_FAILED', 'artifact directory could not be resolved after creation'), isError: true };
+      }
+      try {
+        await finalizeProducedArtifact(resolved.dirPath, {
+          userId: uid,
+          cid,
+          artifactId: r.artifactId,
+          source: 'create_artifact',
+        });
+      } catch (err) {
+        log.warn('create_artifact finalizer failed', {
+          user_id: maskId(uid),
+          cid: maskId(cid),
+          artifact_id: maskId(r.artifactId),
+          error: logErrorRef(err),
+        });
+        return { content: errText('E_ARTIFACT_FINALIZE_FAILED', (err as Error).message || 'artifact post-processing failed'), isError: true };
       }
       if (opts.onArtifactCreated) {
         try { opts.onArtifactCreated({ id: r.artifactId, title: r.title }); }
-        catch (err) { log.warn(`onArtifactCreated callback failed: ${(err as Error).message}`); }
+        catch (err) { log.warn('onArtifactCreated callback failed', { artifact_id: maskId(r.artifactId), error: logErrorRef(err) }); }
       }
-      log.info(`create_artifact user=${uid} cid=${cid} id=${r.artifactId} agent=${opts.agentId || ''}`);
+      log.info('create_artifact created', {
+        user_id: maskId(uid),
+        cid: maskId(cid),
+        agent_id: maskId(opts.agentId),
+        artifact_id: maskId(r.artifactId),
+        file_count: Array.isArray((input as { files?: unknown }).files) ? ((input as { files: unknown[] }).files.length) : undefined,
+      });
       return {
         content:
           `Artifact "${r.title}" created (id ${r.artifactId}) — it is now shown to the user inside this reply, so do NOT paste its HTML in your message. ` +
@@ -1219,7 +2517,7 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
 }
 
 /** Wrapped `delete_file` tool — single-file unlink, sandboxed identically to
- *  `edit_file` (workspace + current attachment dir + extraRoots / readonly).
+ *  `edit_file` (workspace + current attachment dir + writable extraRoots).
  *  Destructive, so on top of `localExec` we require a per-call user click
  *  in the inline confirm card. The renderer may group multiple pending
  *  per-file tokens from the same turn into one card, but the tool still
@@ -1246,7 +2544,7 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
       'Delete a single file from disk via a two-step user-confirmed flow.\n' +
       '\n' +
       'Sandbox is identical to `edit_file` (workspace + current attachment ' +
-      'dir + extraRoots / readonly). Use instead of `bash rm` — `bash` is ' +
+      'dir + writable extraRoots). Use instead of `bash rm` — `bash` is ' +
       'unaware of the sandbox + the confirm gate.\n' +
       '\n' +
       'Flow:\n' +
@@ -1289,7 +2587,7 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
       const abs = resolveAbs(ctx, rawPath);
       const scopeErr = guardDeletePath(opts, abs);
       if (scopeErr) {
-        log.warn(`delete_file scope reject user=${opts.userId ?? '?'} path=${abs}`);
+        log.warn('delete_file scope reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
         return { content: scopeErr, isError: true };
       }
 
@@ -1306,7 +2604,7 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
           };
         }
         if (outcome.outcome === 'denied') {
-          log.info(`delete_file denied (token) user=${opts.userId ?? '?'} path=${abs}`);
+          log.info('delete_file denied by user', { user_id: maskId(opts.userId), path: logPathRef(abs) });
           return {
             content: errText(
               'E_USER_DENIED',
@@ -1328,7 +2626,7 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
         let st: fs.Stats;
         try { st = fs.statSync(abs); }
         catch (err) {
-          log.warn(`delete_file granted-but-missing user=${opts.userId ?? '?'} path=${abs}: ${(err as Error).message}`);
+          log.warn('delete_file granted but missing', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
           return {
             content: errText('E_NOT_FOUND', `${abs}: file no longer exists (already removed?)`),
             isError: true,
@@ -1343,13 +2641,13 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
         try { fs.unlinkSync(abs); }
         catch (err) {
           const msg = (err as Error).message;
-          log.warn(`delete_file unlink failed user=${opts.userId ?? '?'} path=${abs}: ${msg}`);
+          log.warn('delete_file unlink failed', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
           return {
             content: errText('E_DELETE_FAILED', `${abs}: unlink failed: ${msg}`),
             isError: true,
           };
         }
-        log.info(`delete_file user=${opts.userId ?? '?'} path=${abs}`);
+        log.info('delete_file removed', { user_id: maskId(opts.userId), path: logPathRef(abs) });
         return { content: `Deleted ${abs}` };
       }
 
@@ -1357,7 +2655,7 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
       let st: fs.Stats;
       try { st = fs.statSync(abs); }
       catch (err) {
-        log.warn(`delete_file not-found user=${opts.userId ?? '?'} path=${abs}: ${(err as Error).message}`);
+        log.warn('delete_file not found', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
         return {
           content: errText('E_NOT_FOUND', `${abs}: file does not exist`),
           isError: true,
@@ -1369,12 +2667,31 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
           isError: true,
         };
       }
+      if (!localAccessRequiresSensitiveApproval()) {
+        try { fs.unlinkSync(abs); }
+        catch (err) {
+          const msg = (err as Error).message;
+          log.warn('delete_file unlink failed', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
+          return {
+            content: errText('E_DELETE_FAILED', `${abs}: unlink failed: ${msg}`),
+            isError: true,
+          };
+        }
+        log.info('delete_file removed without confirmation in all_files_auto mode', { user_id: maskId(opts.userId), path: logPathRef(abs) });
+        return { content: `Deleted ${abs}` };
+      }
       const newToken = requestDeleteConfirmation(abs, {
         display_path: rawPath,
         cid: opts.cid,
         turn_id: opts.turnId,
       });
-      log.info(`delete_file confirmation requested user=${opts.userId ?? '?'} path=${abs} token=${newToken}`);
+      log.info('delete_file confirmation requested', {
+        user_id: maskId(opts.userId),
+        cid: maskId(opts.cid),
+        turn_id: maskId(opts.turnId),
+        path: logPathRef(abs),
+        confirmation_id: maskId(newToken),
+      });
       return {
         content:
           `requires_user_confirmation: "${rawPath}" has been added to the user's confirmation card.\n` +
@@ -1390,6 +2707,10 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
 export function createLocalTools(opts: LocalToolsOpts = {}): AgentTool[] {
   const tools: AgentTool[] = [
     createBashTool(opts),
+    createInteractiveCliStartTool(opts),
+    createInteractiveCliReadTool(opts),
+    createInteractiveCliSendTool(opts),
+    createInteractiveCliCloseTool(opts),
     createWriteFileTool(opts),
     createEditFileTool(opts),
     createDeleteFileTool(opts),

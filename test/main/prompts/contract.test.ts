@@ -119,6 +119,66 @@ describe('prompts ↔ code contract', () => {
     expect(agentPrompt).toContain('do NOT attempt a tool call with the skill');
   });
 
+  it('agent profile standards are runtime handoff criteria, not display-only metadata', () => {
+    const bus = readFile('src/main/features/group_chat/bus.ts');
+    const agentPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_agent_in_group.md'), 'utf-8');
+    const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
+    const creatorSkill = readFile('resources/builtin/system/skills/agent-creator/SKILL.md');
+
+    expect(bus).toContain('buildAgentRuntimeGuidance');
+    expect(bus).toContain('extractActorResultFromFinal');
+    expect(bus).toContain('### Delivery standards');
+    expect(bus).toContain('Mandatory handoff criteria');
+    expect(bus).toContain('Before your final reply, silently compare the result against every item');
+    expect(agentPrompt).toContain('`### Delivery standards` block');
+    expect(agentPrompt).toContain('mandatory handoff criteria');
+    expect(agentPrompt).toContain('silently check the result against every listed standard');
+    expect(agentPrompt).toContain('`### Agent strengths` block');
+    expect(agentPrompt).toContain('<agent-result status="success" />');
+    expect(agentPrompt).toContain('<agent-result status="failure" />');
+    expect(commanderPrompt).toContain('<commander-result status="success" />');
+    expect(commanderPrompt).toContain('<commander-result status="failure" />');
+    expect(agentPrompt).not.toContain('capability_context');
+    expect(bus).not.toContain('src.memory');
+    expect(bus).not.toContain('agent_memory');
+    expect(creatorSkill).toContain('runtime guidance fields');
+    expect(creatorSkill).toContain('definition of done');
+    expect(creatorSkill).toContain('Do not emit JSON here');
+  });
+
+  it('cross-session memory scopes are routed explicitly and written in the UI language', () => {
+    const agentPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_agent_in_group.md'), 'utf-8');
+    const commanderPrompt = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_commander.md'), 'utf-8');
+    const memoryTool = readFile('src/core-agent/src/tools/memory-tool.ts');
+
+    expect(memoryTool).toContain('Three scopes (default "agent")');
+    expect(memoryTool).toContain('"agent" (DEFAULT): YOUR OWN durable agent memory');
+    expect(memoryTool).toContain('"shared": durable facts that EVERY agent should know');
+    expect(memoryTool).toContain('"user": the user\'s global profile/preferences');
+    expect(memoryTool).toContain('LANGUAGE:');
+    expect(memoryTool).toContain('current UI/response language');
+    expect(memoryTool).toContain('Preserve proper nouns, commands, file paths');
+
+    expect(agentPrompt).toContain('`target: "agent"` = your own agent memory');
+    expect(agentPrompt).toContain('`target: "user"` = global user profile/preferences');
+    expect(agentPrompt).toContain('`target: "shared"` = global facts');
+    expect(agentPrompt).toContain('current response/UI language');
+
+    expect(commanderPrompt).toContain('`target: "agent"` = commander\'s own orchestration memory');
+    expect(commanderPrompt).toContain('commander-specific routing lessons');
+    expect(commanderPrompt).toContain('current response/UI language');
+  });
+
+  it('agent runtime prompt includes localized descriptions, not only legacy description', () => {
+    const bus = readFile('src/main/features/group_chat/bus.ts');
+
+    expect(bus).toContain('pickAgentRuntimeDescription');
+    expect(bus).toContain('description_zh?: string');
+    expect(bus).toContain('description_en?: string');
+    expect(bus).toMatch(/description:\s*pickAgentRuntimeDescription\(agent\)/);
+    expect(bus).toMatch(/descriptionLang\(getLanguage\(\)\).*=== 'zh'/s);
+  });
+
   it('authoring prompt shells leave category field rules to creator skills', () => {
     const authoringPrompts = [
       'chat_commander.md',
@@ -179,7 +239,9 @@ describe('prompts ↔ code contract', () => {
     expect(commanderPrompt).toMatch(/best owner for each user-visible outcome/i);
     expect(commanderPrompt).toMatch(/installed agents are first-class capabilities/i);
     expect(commanderPrompt).toMatch(/not expensive fallbacks/i);
-    expect(commanderPrompt).toMatch(/Commander self-service[\s\S]+only after capability routing/i);
+    expect(commanderPrompt).toMatch(/Direct commander self-service[\s\S]+only after the current agent pool has no stronger owner/i);
+    expect(commanderPrompt).toMatch(/builtin > platform > custom > external > global/i);
+    expect(commanderPrompt).toMatch(/builtin > platform > custom/i);
     expect(commanderPrompt).toMatch(/learning diagnosis/i);
   });
 

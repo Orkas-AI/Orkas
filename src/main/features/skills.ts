@@ -59,11 +59,11 @@ import {
   DEFAULT_MARKETPLACE_CATEGORY_CODE,
   normalizeMarketplaceCategoryCode,
 } from './marketplace_biz';
+import { normalizeInstallVersion } from './marketplace_installs';
 import { NAME_DISPLAY_MAX_UNITS, nameDisplayWidth } from '../util/name-limit';
 
-// Names hidden from the in-app skill source-tree view. `_install.json` (marketplace install
-// version pin) and `_cache.json` (marketplace cache LRU bookkeeping) are tooling sidecars,
-// not authored content — surfacing them confuses users and looks like noise in the file list.
+// Names hidden from the in-app skill source-tree view. Marketplace sidecars are tooling
+// metadata, not authored content — surfacing them confuses users and looks like noise.
 const SKILL_TREE_IGNORE: ReadonlySet<string> = new Set([
   '.DS_Store', '__pycache__', '.git', 'node_modules',
   '.venv', 'venv', '.pytest_cache', '.mypy_cache', '.ruff_cache', '.uv-cache',
@@ -72,7 +72,7 @@ const SKILL_TREE_IGNORE: ReadonlySet<string> = new Set([
   '.cache', '.parcel-cache', '.next', '.nuxt', '.turbo',
   '.npm', '.pnpm-store', '.yarn', '.vite', '.svelte-kit',
   'tmp', 'temp', '.tmp', 'logs', 'log',
-  '_install.json', '_cache.json', '_meta.json',
+  '_install.json', '_cache.json', '_resource_manifest.json', '_meta.json',
 ]);
 
 function _isGeneratedSkillSidecarName(name: string): boolean {
@@ -132,6 +132,10 @@ export interface SkillListing {
   is_open_source?: boolean;
   /** Marketplace review lifecycle status. Custom skills read it from SKILL.md, marketplace skills from `_install.json`. */
   status?: string;
+  /** Owning agent's `agent_id` when the skill is agent-private (SKILL.md
+   *  frontmatter `ownerAgent`). Set only on entries returned by
+   *  `listAgentPrivateSkills`; `listSkills` filters these out entirely. */
+  ownerAgent?: string;
 }
 
 export interface CustomSkill {
@@ -498,7 +502,15 @@ let _skillListCache: SkillListCache | null = null;
 
 function _invalidateSkillListCache(opts: { markDirty?: boolean } = {}): void {
   _skillListCache = null;
-  void opts;
+  if (opts.markDirty === false) return;
+  // Sync engine dirty signal (lazy-require — stripped in the open-source build). Mirrors the pattern in
+  // `agents.ts::_invalidateAgentListCache`: every cache-invalidate is also a disk-mutation
+  // point, co-locating keeps wiring tight.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
+    sync?.markDirty?.('skills', 'cloud/skills');
+  } catch { /* features/sync stripped */ }
 }
 
 /** Internal cache invalidator + core-agent registry invalidator. Exported for
@@ -526,12 +538,13 @@ export function isBuiltinSkill(skillId: string): boolean {
 
 /** Resolve a skill id for edit-chat use, regardless of source. Returns the
  *  same shape as `getCustomSkill` but with `source` reflecting where the dir
- *  was found. Custom is checked first (matches the loader precedence). */
+ *  was found. Platform/builtin is checked first to match runtime conflict
+ *  precedence. */
 export async function getSkillForEdit(skillId: string): Promise<SkillForEdit | null> {
   if (!skillId) return null;
   const sources: Array<[SkillSource, string]> = [
-    ['custom', CUSTOM_SKILLS_DIR()],
     ['marketplace', userMarketplaceSkillsDir(getActiveUserId())],
+    ['custom', CUSTOM_SKILLS_DIR()],
   ];
   for (const [source, base] of sources) {
     const d = path.join(base, skillId);
@@ -579,7 +592,11 @@ function _skillDirStamp(): string {
   return stamp;
 }
 
-export async function listSkills(): Promise<SkillListing[]> {
+/** Full on-disk scan (custom + marketplace), INCLUDING agent-private
+ *  (`ownerAgent`) skills, cached by per-dir mtime. The two public listers
+ *  below filter this: `listSkills` drops owner-private entries (the user
+ *  panel), `listAgentPrivateSkills` keeps only them (dev inspection). */
+async function _allSkillListingsCached(): Promise<SkillListing[]> {
   const stamp = _skillDirStamp();
   let out: SkillListing[];
   if (_skillListCache && _skillListCache.stamp === stamp) {
@@ -587,8 +604,8 @@ export async function listSkills(): Promise<SkillListing[]> {
   } else {
     out = [];
     const seen = new Set<string>();
-    // Custom first so it wins on id collision (matches openclaw symlink rule).
-    const sources: Array<[SkillSource, string]> = [['custom', CUSTOM_SKILLS_DIR()], ['marketplace', userMarketplaceSkillsDir(getActiveUserId())]];
+    // Platform/builtin first so product-owned skills win id conflicts.
+    const sources: Array<[SkillSource, string]> = [['marketplace', userMarketplaceSkillsDir(getActiveUserId())], ['custom', CUSTOM_SKILLS_DIR()]];
     for (const [source, baseDir] of sources) {
       if (!fs.existsSync(baseDir)) continue;
       const names = fs.readdirSync(baseDir, { withFileTypes: true })
@@ -597,8 +614,8 @@ export async function listSkills(): Promise<SkillListing[]> {
         .sort();
       for (const name of names) {
         if (seen.has(name)) {
-          if (isMarketplaceSource(source)) {
-            log.warn(`id conflict: custom and marketplace both define "${name}" — custom wins, rename one`);
+          if (normalizeSkillSource(source) === 'custom') {
+            log.warn(`id conflict: marketplace and custom both define "${name}" — marketplace wins, rename one`);
           }
           continue;
         }
@@ -615,6 +632,7 @@ export async function listSkills(): Promise<SkillListing[]> {
         let marketplaceUpdatedAt: number | undefined;
         let defaultInstall: boolean | undefined;
         let isOpenSource: boolean | undefined;
+        let ownerAgent = '';
         if (fs.existsSync(skillMd)) {
           try {
             const meta = parseSkillFrontmatter(fs.readFileSync(skillMd, 'utf8'));
@@ -623,6 +641,7 @@ export async function listSkills(): Promise<SkillListing[]> {
             displayName = meta.name as string || name;
             category = _resolveSkillCategory(meta, sidecar);
             status = _resolveSkillStatus(meta, sidecar) || undefined;
+            ownerAgent = typeof meta.ownerAgent === 'string' ? meta.ownerAgent.trim() : '';
           } catch { /* ignore */ }
         }
         // Marketplace-installed skills carry `_install.json` with `version`. Author uid may also
@@ -633,7 +652,7 @@ export async function listSkills(): Promise<SkillListing[]> {
             const metaFile = path.join(baseDir, name, '_install.json');
             if (fs.existsSync(metaFile)) {
               const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
-              if (meta && typeof meta.version === 'string') version = meta.version;
+              if (meta) version = normalizeInstallVersion(meta.version);
               if (meta && typeof meta.published_at === 'number') marketplacePublishedAt = meta.published_at;
               if (meta && typeof meta.updated_at === 'number') marketplaceUpdatedAt = meta.updated_at;
               if (meta && typeof meta.default_install === 'boolean') defaultInstall = meta.default_install;
@@ -653,16 +672,35 @@ export async function listSkills(): Promise<SkillListing[]> {
           ...(typeof marketplaceUpdatedAt === 'number' ? { marketplace_updated_at: marketplaceUpdatedAt } : {}),
           ...(typeof defaultInstall === 'boolean' ? { default_install: defaultInstall } : {}),
           ...(typeof isOpenSource === 'boolean' ? { is_open_source: isOpenSource } : {}),
+          ...(ownerAgent ? { ownerAgent } : {}),
         });
       }
     }
     _skillListCache = { stamp, data: out };
   }
-  // Overlay per-user enabled overrides outside the cache (same pattern as
-  // listAgents). Cheap per-call read so a toggle takes effect immediately
-  // without having to bump dir mtime.
+  return out;
+}
+
+/** Overlay per-user enabled overrides outside the cache (same pattern as
+ *  listAgents). Cheap per-call read so a toggle takes effect immediately
+ *  without having to bump dir mtime. */
+function _overlaySkillEnabled(list: SkillListing[]): SkillListing[] {
   const { skills: disabledSkillIds } = readDisabledSets(getActiveUserId());
-  return out.map((s) => ({ ...s, enabled: !disabledSkillIds.has(s.id) }));
+  return list.map((s) => ({ ...s, enabled: !disabledSkillIds.has(s.id) }));
+}
+
+/** User-facing skill list — custom + marketplace, EXCLUDING agent-private
+ *  (`ownerAgent`) skills (those belong to one agent's internal pipeline and
+ *  must not appear in the panel; see PC CLAUDE.md §Skills). */
+export async function listSkills(): Promise<SkillListing[]> {
+  return _overlaySkillEnabled((await _allSkillListingsCached()).filter((s) => !s.ownerAgent));
+}
+
+/** Dev-only: the agent-private (`ownerAgent`) skills hidden from `listSkills`.
+ *  Surfaced behind a dev-gated IPC so the skill panel can show an inspection
+ *  section in development; gated off in production. */
+export async function listAgentPrivateSkills(): Promise<SkillListing[]> {
+  return _overlaySkillEnabled((await _allSkillListingsCached()).filter((s) => !!s.ownerAgent));
 }
 
 /** Toggle the active user's enabled override for a skill. Triggers the
@@ -1088,12 +1126,11 @@ const IMPORT_FILTER_NAMES: ReadonlySet<string> = new Set([
   // up as "header noise" in the UI).
   // Orkas `_meta.json` is intentionally kept: source-backed imports should
   // restore an existing Orkas skill as faithfully as possible.
-  // Marketplace sidecars: `_install.json` (version pin written by install / reconcile —
-  // meaningless once a platform skill is imported as custom) and `_cache.json` (LRU bookkeeping
-  // for the detail-page cache). Both are tooling internal — must never propagate when a user
-  // imports a skill dir or when dev re-uploads a platform skill (see also marketplace_dev::
-  // SKIP_NAMES).
-  '_install.json', '_cache.json',
+  // Marketplace sidecars: `_install.json` (version pin written by install / reconcile),
+  // `_cache.json` (detail-page cache), and `_resource_manifest.json` (Resource dev-sync
+  // ownership map). These are tooling internal — must never propagate when a user imports
+  // a skill dir or when dev re-uploads a platform skill (see also marketplace_dev::SKIP_NAMES).
+  '_install.json', '_cache.json', '_resource_manifest.json',
   // npm packaging artefacts — skill dirs are forbidden from carrying their
   // own node_modules or package.json (see core conventions); strip the
   // sidecars too so partial copies don't linger.
@@ -1814,15 +1851,27 @@ export function _writeSkillFileAt(
 }
 
 /** Edit-chat dispatcher (with validation report). Routes to custom write for
- *  custom ids. Platform and marketplace skills are read-only in the open-source build. */
+ *  custom ids, and to the dev-only built-in dual-write for built-in ids in
+ *  dev mode. Validation runs on both branches — platform installs are not
+ *  exempt; if a dev edit introduces an EXTREME pattern it's still rejected.
+ *
+ *  Returns `{ ok: false }` (no report) for missing-id / built-in-outside-dev. */
 export async function writeSkillFileForEditChecked(
   skillId: string,
   relpath: string,
   content: string,
 ): Promise<WriteSkillFileResult> {
+  const isSkillMdWrite = relpath.toUpperCase() === 'SKILL.MD';
+  const sidecarPatch = isSkillMdWrite
+    ? _skillSidecarPatchFromFrontmatter(splitSkillMd(content).meta)
+    : {};
+  const contentForWrite = isSkillMdWrite ? normalizeSkillMdForWrite(content, skillId) : content;
   const customDir = customSkillDir(skillId);
   if (fs.existsSync(customDir) && fs.statSync(customDir).isDirectory()) {
     return writeCustomSkillFileChecked(skillId, relpath, content);
+  }
+  if (isBuiltinSkill(skillId)) {
+    return { ok: false };
   }
   return { ok: false };
 }
@@ -2600,7 +2649,13 @@ async function _applySkillContainerEdit(
     }
     return { ok: false, error: t('skills.errors.skill_not_found', { id: skillId }) };
   }
-  if (skill.source !== 'custom') {
+  // Marketplace skills are dev-mode-only from any write path (commander
+  // here + inline edit chat at sendToSkillChat). Mirrors the agent edit
+  // policy at `bus.ts` post-stream parsing. Downstream
+  // `writeSkillFileForEditChecked` routes the dev branch through
+  // `skills_dev.writeBuiltinSkillFile`, which writes the local marketplace
+  // install dir.
+  if (skill.source !== 'custom' && !false) {
     return { ok: false, error: t('errors.builtin_skill_not_editable') };
   }
   const written: string[] = [];
@@ -2744,18 +2799,28 @@ async function buildSkillEditMessageWithAttachments(
   images: Array<{ data: string; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' }>;
   attachmentNames: string[];
   attachmentCid: string;
+  attachmentMetadata: { hasAttachments: boolean; attachmentTypes: string[] };
 }> {
   const attachmentNames = Array.isArray(attachments)
     ? attachments.filter((n): n is string => typeof n === 'string' && !!n.trim())
     : [];
   const attachmentCid = skillEditAttachmentCid(skillId);
-  if (!attachmentNames.length) return { message: content, images: [], attachmentNames, attachmentCid };
-  const { manifest, images } = await buildAttachmentManifest(userId, attachmentCid, attachmentNames);
+  if (!attachmentNames.length) {
+    return {
+      message: content,
+      images: [],
+      attachmentNames,
+      attachmentCid,
+      attachmentMetadata: { hasAttachments: false, attachmentTypes: [] },
+    };
+  }
+  const { manifest, images, metadata } = await buildAttachmentManifest(userId, attachmentCid, attachmentNames);
   return {
     message: manifest ? `${manifest}\n${content}` : content,
     images,
     attachmentNames,
     attachmentCid,
+    attachmentMetadata: metadata,
   };
 }
 
@@ -2767,7 +2832,7 @@ export async function sendToSkillChat(
 ): Promise<SkillChatResult> {
   const skill = await getSkillForEdit(skillId);
   if (!skill) return { ok: false, error: 'skill not found' };
-  if (isMarketplaceSource(skill.source)) {
+  if (isMarketplaceSource(skill.source) && !false) {
     return { ok: false, error: t('errors.builtin_skill_not_editable') };
   }
 
@@ -2807,6 +2872,7 @@ export async function sendToSkillChat(
       userSystemSkillsDir(userId),
       ...(attachmentCtx.attachmentNames.length ? [chatAttachmentDir(userId, attachmentCtx.attachmentCid)] : []),
     ],
+    attachmentMetadata: attachmentCtx.attachmentMetadata,
     ...(attachmentCtx.images.length ? { images: attachmentCtx.images } : {}),
   });
 
@@ -2903,7 +2969,7 @@ export async function* streamSendToSkillChat(
     yield { type: 'done' };
     return;
   }
-  if (isMarketplaceSource(skill.source)) {
+  if (isMarketplaceSource(skill.source) && !false) {
     yield { type: 'error', text: t('errors.builtin_skill_not_editable') };
     yield { type: 'done' };
     return;
@@ -2954,6 +3020,7 @@ export async function* streamSendToSkillChat(
       userSystemSkillsDir(userId),
       ...(attachmentCtx.attachmentNames.length ? [chatAttachmentDir(userId, attachmentCtx.attachmentCid)] : []),
     ],
+      attachmentMetadata: attachmentCtx.attachmentMetadata,
       ...(attachmentCtx.images.length ? { images: attachmentCtx.images } : {}),
       ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
     }) as AsyncIterable<any>) {

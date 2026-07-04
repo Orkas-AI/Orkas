@@ -89,11 +89,27 @@ describe('bash-permissions', () => {
     await p3;
   });
 
-  it('denies on timeout when no answer arrives', async () => {
+  it('does not auto-deny while waiting for user action', async () => {
     vi.useFakeTimers();
     const p = ask();
+    let settled = false;
+    p.then(() => { settled = true; });
     await vi.advanceTimersByTimeAsync(10 * 60 * 1000 + 10);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    bp.respond(pushed[0].payload.request_id, 'deny');
     expect(await p).toBe('deny');
+  });
+
+  it('emits waiting heartbeats while the approval dialog is pending', async () => {
+    vi.useFakeTimers();
+    const onWaiting = vi.fn();
+    const p = ask({ onWaiting });
+    expect(onWaiting).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(25_000);
+    expect(onWaiting).toHaveBeenCalledTimes(2);
+    bp.respond(pushed[0].payload.request_id, 'allow_once');
+    expect(await p).toBe('allow_once');
   });
 
   it('truncates an oversized command in the push payload', async () => {

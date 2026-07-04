@@ -45,6 +45,7 @@ let _mpCategoriesCache = (() => {
 const MP_UNKNOWN_CATEGORY_REFRESH_MIN_MS = 5 * 60 * 1000;
 let _mpUnknownCategoryRefreshAt = 0;
 let _mpUnknownCategoryRefreshInFlight = null;
+const MP_REVIEW_STATUS_UI_ENABLED = false;
 
 function _mpUnknownCategoryLabel() {
   const raw = t('marketplace.category_unknown');
@@ -54,6 +55,39 @@ function _mpUnknownCategoryLabel() {
 function _mpCanonicalCategoryCode(code) {
   const c = String(code || '').trim();
   return c === 'writing' ? 'creation' : c;
+}
+
+function _mpUserErrorMessage(errLike, fallbackKey) {
+  const source = errLike && errLike.marketplaceReason
+    ? {
+        error: errLike.marketplaceReason,
+        message: errLike.marketplaceReason,
+        code: errLike.code,
+      }
+    : errLike;
+  if (typeof userErrorMessage === 'function') {
+    return userErrorMessage(source, { fallbackKey });
+  }
+  return (source && (source.error || source.message)) || String(source || '') || t(fallbackKey);
+}
+
+function _mpErrorFromResponse(res, fallbackMessage) {
+  const responseForMessage = res && res.marketplaceReason
+    ? { ...res, error: res.marketplaceReason }
+    : res;
+  const err = typeof userErrorFromResponse === 'function'
+    ? userErrorFromResponse(responseForMessage, fallbackMessage)
+    : new Error((responseForMessage && (responseForMessage.error || responseForMessage.message || responseForMessage.msg)) || fallbackMessage || 'failed');
+  if (res && res.marketplaceKind) err.marketplaceKind = res.marketplaceKind;
+  if (res && res.marketplaceId) err.marketplaceId = res.marketplaceId;
+  if (res && res.marketplaceName) err.marketplaceName = res.marketplaceName;
+  if (res && res.marketplaceReason) err.marketplaceReason = res.marketplaceReason;
+  if (res && res.qualityReport) err.qualityReport = res.qualityReport;
+  return err;
+}
+
+function _mpShowReviewStatusUi() {
+  return MP_REVIEW_STATUS_UI_ENABLED && typeof isDevMode === 'function' && false;
 }
 
 function _mpUnknownCategoryCodes(codes) {
@@ -284,7 +318,7 @@ function openMarketplace(initialTab = 'agent', opts = {}) {
     detailSkillSelected: 'SKILL.md',
     detailSkillFileText: '',
     detailSkillLoadError: '',
-    detailSkillSourceOpen: false,
+    detailSkillSourceOpen: true,
   };
 
   if (!_mpBound) {
@@ -360,6 +394,35 @@ let _mpReconcileWatchStarted = false;
 let _mpReconcileWatchStarting = false;
 let _mpReconcileLastState = _mpReconcileStatus.state;
 
+function _mpCompactResourceSyncNames(skipped) {
+  const names = [];
+  const seen = new Set();
+  for (const item of skipped || []) {
+    const name = String((item && (item.name || item.id)) || '').trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    names.push(name);
+  }
+  const visible = names.slice(0, 5);
+  const more = Math.max(0, names.length - visible.length);
+  let text = visible.join(', ');
+  if (more) text = text ? `${text} +${more}` : `+${more}`;
+  if (text.length > 160) text = `${text.slice(0, 157)}...`;
+  return { count: names.length, text };
+}
+
+function _mpShowResourceSyncSkippedToast(payload) {
+  const skipped = Array.isArray(payload && payload.skipped) ? payload.skipped : [];
+  if (!skipped.length || typeof uiToast !== 'function') return;
+  const compact = _mpCompactResourceSyncNames(skipped);
+  const names = compact.text || String(compact.count);
+  const message = t('marketplace.resource_sync_skipped', {
+    count: compact.count,
+    names,
+  });
+  uiToast(message, { variant: 'warning', timeoutMs: 9000 });
+}
+
 async function _mpInitReconcileWatch() {
   if (_mpReconcileWatchStarted || _mpReconcileWatchStarting) return;
   if (!window.orkas || typeof window.orkas.invoke !== 'function' || typeof window.orkas.onPushEvent !== 'function') {
@@ -369,6 +432,9 @@ async function _mpInitReconcileWatch() {
   try {
     window.orkas.onPushEvent('marketplace:reconcile-status', (status) => {
       _mpApplyReconcileStatus(status);
+    });
+    window.orkas.onPushEvent('marketplace:resource-sync-skipped', (payload) => {
+      _mpShowResourceSyncSkippedToast(payload);
     });
     _mpReconcileWatchStarted = true;
   } catch {
@@ -1169,7 +1235,12 @@ function _mpRenderOss(panel, lang) {
   const installed = _mpState.ossInstalled instanceof Set ? _mpState.ossInstalled : new Set();
   const items = _mpState.ossProjects || [];
   const grid = items.length
-    ? `<div class="marketplace-grid mp-oss-grid">${items.map((p) => _mpOssCardHtml(p, cats, lang, installed.has(p.id))).join('')}</div>`
+    ? `<div class="marketplace-grid mp-oss-grid">${items.map((p) => _mpOssCardHtml(
+      p,
+      cats,
+      lang,
+      (typeof isOssProjectInstalled === 'function') ? isOssProjectInstalled(p, installed) : installed.has(p.id),
+    )).join('')}</div>`
     : `<div class="empty">${escapeHtml(t('marketplace.empty'))}</div>`;
 
   body.innerHTML = hero + `<div class="mp-oss-chips">${chips}</div>` + grid;
@@ -1225,6 +1296,7 @@ function _mpCardHtml(item, lang) {
   const installing = _mpState.installing.has(`${kind}:${item.id}`);
   const desc = pickDesc(item, lang) || '';
   const catLabel = _mpCategoryLabel(item.category, lang);
+  const statusLabel = '';
   const versionLabel = t('marketplace.version').replace('{version}', String(item.version || ''));
   const avatar = kind === 'agent'
     ? renderAvatarHtml(item.icon, item.color, { size: 32, seed: item.id, extraClass: 'marketplace-card-avatar' })
@@ -1257,6 +1329,7 @@ function _mpCardHtml(item, lang) {
         <div class="marketplace-card-meta">
           ${item.version ? `<span class="marketplace-card-chip is-version">${escapeHtml(versionLabel)}</span>` : ''}
           ${catLabel ? `<span class="marketplace-card-chip">${escapeHtml(catLabel)}</span>` : ''}
+          ${statusLabel ? `<span class="marketplace-card-chip is-status">${escapeHtml(statusLabel)}</span>` : ''}
         </div>
         <div class="marketplace-card-actions">
           <button type="button" class="${btnClass}" ${btnAttrs}>${btnSpinner}${escapeHtml(btnLabel)}</button>
@@ -1281,7 +1354,7 @@ function _mpCategoryLabel(code, lang) {
 // ─── Detail view rendering ───
 async function _mpOpenDetail(kind, item, opts = {}) {
   const prevSelected = opts.preserveSkillState ? (_mpState.detailSkillSelected || 'SKILL.md') : 'SKILL.md';
-  const prevSourceOpen = opts.preserveSkillState ? !!_mpState.detailSkillSourceOpen : false;
+  const prevSourceOpen = opts.preserveSkillState ? _mpState.detailSkillSourceOpen !== false : true;
   _mpState.detailKind = kind;
   _mpState.detailItem = item;
   _mpState.detailLoading = true;
@@ -1301,7 +1374,7 @@ async function _mpOpenDetail(kind, item, opts = {}) {
         id: item.id, version: item.version,
         published_at: item.published_at, updated_at: item.updated_at,
       });
-      if (!detail || detail.ok === false) throw new Error((detail && detail.error) || 'detail failed');
+      if (!detail || detail.ok === false) throw _mpErrorFromResponse(detail, 'detail failed');
       _mpState.detailAgentJson = detail.agent_json;
     } else {
       try {
@@ -1309,7 +1382,7 @@ async function _mpOpenDetail(kind, item, opts = {}) {
           id: item.id, version: item.version,
           published_at: item.published_at, updated_at: item.updated_at,
         });
-        if (!detail || detail.ok === false) throw new Error((detail && detail.error) || 'detail failed');
+        if (!detail || detail.ok === false) throw _mpErrorFromResponse(detail, 'detail failed');
         const files = await window.orkas.invoke('marketplace.cacheSkillFiles', { id: item.id });
         _mpState.detailSkillFiles = (files && files.list) || [];
         const selected = _mpState.detailSkillFiles.find((f) => f.path === _mpState.detailSkillSelected)
@@ -1321,11 +1394,11 @@ async function _mpOpenDetail(kind, item, opts = {}) {
           _mpState.detailSkillFileText = (r && r.content) || '';
         }
       } catch (err) {
-        _mpState.detailSkillLoadError = (err && err.message) || String(err);
+        _mpState.detailSkillLoadError = _mpUserErrorMessage(err, 'marketplace.action_failed_retry_later');
       }
     }
   } catch (err) {
-    _mpState.detailError = (err && err.message) || String(err);
+    _mpState.detailError = _mpUserErrorMessage(err, 'marketplace.action_failed_retry_later');
   } finally {
     _mpState.detailLoading = false;
     _mpRenderDetail();
@@ -1342,6 +1415,7 @@ function _mpRenderDetail() {
   const lang = getLang();
   const desc = pickDesc(item, lang) || '';
   const catLabel = _mpCategoryLabel(item.category, lang);
+  const statusLabel = '';
   const versionLabel = t('marketplace.version').replace('{version}', String(item.version || ''));
   const status = _mpInstallStatus(kind, item);
   const installing = _mpState.installing.has(`${kind}:${item.id}`);
@@ -1366,6 +1440,7 @@ function _mpRenderDetail() {
   panel.querySelector('[data-mp-detail-meta]').innerHTML = [
     item.version ? `<span class="marketplace-card-chip is-version">${escapeHtml(versionLabel)}</span>` : '',
     catLabel ? `<span class="marketplace-card-chip">${escapeHtml(catLabel)}</span>` : '',
+    statusLabel ? `<span class="marketplace-card-chip is-status">${escapeHtml(statusLabel)}</span>` : '',
   ].filter(Boolean).join(' ');
   // (description used to render in a top-of-body `.marketplace-detail-desc` strip; now it's
   // the first section inside body — see `_mpAgentDetailHtml` / `_mpSkillDetailHtml`)
@@ -1405,7 +1480,7 @@ function _mpRenderDetail() {
   }
 
   // Dev-only delete button is rendered + revealed by marketplace_dev.js via the
-  // `onMarketplaceDetailRendered` hook below. The open-source build has no such file, so the hook is undefined
+  // `onMarketplaceDetailRendered` hook below. the open-source build has no such file — hook is undefined
   // and the button stays hidden (display:none from HTML).
   if (typeof onMarketplaceDetailRendered === 'function') {
     onMarketplaceDetailRendered({ kind, item });
@@ -1439,17 +1514,17 @@ function _mpRenderDetail() {
           const r = await window.orkas.invoke('marketplace.cacheSkillRead', { id: item.id, file });
           _mpState.detailSkillFileText = (r && r.content) || '';
         } catch (err) {
-          _mpState.detailSkillFileText = `// load failed: ${(err && err.message) || err}`;
+          _mpState.detailSkillFileText = `// load failed: ${_mpUserErrorMessage(err, 'marketplace.action_failed_retry_later')}`;
         }
         _mpRenderDetail();
       });
     });
-    // Source-tree toggle (collapsed by default, matches app skill detail behavior)
+    // Source tree defaults open in marketplace skill previews; preserve the user's
+    // current open/closed choice across re-renders while they stay in this detail view.
     const toggle = body.querySelector('[data-mp-source-toggle]');
     const panel = body.querySelector('[data-mp-source-panel]');
     if (toggle && panel) {
-      // Preserve open state across re-renders via _mpState
-      const open = !!_mpState.detailSkillSourceOpen;
+      const open = _mpState.detailSkillSourceOpen !== false;
       panel.style.display = open ? '' : 'none';
       toggle.setAttribute('aria-expanded', String(open));
       toggle.classList.toggle('is-open', open);
@@ -1464,23 +1539,130 @@ function _mpRenderDetail() {
   }
 }
 
-// Agent body uses the SAME CSS classes as the in-app `panel-agents` detail (Summary + Workflow
-// sections + `.markdown-body` for rendered workflow). Marketplace context is read-only browse:
-// `inputs` / `skill_list` are user-facing form schema + runtime details (only meaningful AFTER
-// install), so we don't render them here — keeps the preview focused on "what does this agent
-// do" rather than implementation. Marketplace header above stays in its own compact row layout.
+function _mpAgentTextList(agent, key) {
+  const raw = agent && (agent[key] || (agent.profile && agent.profile[key]));
+  if (!Array.isArray(raw)) return [];
+  return raw.map((item) => {
+    if (typeof item === 'string') return normalizeDisplayText(item);
+    if (!item || typeof item !== 'object') return '';
+    return normalizeDisplayText(item.description || item.title || item.name || '');
+  }).filter(Boolean).slice(0, 20);
+}
+
+function _mpAgentReadonlyListItemHtml(text, key) {
+  if (!text) return '';
+  const iconKind = key === 'standards' ? 'standard' : 'ability';
+  const iconHtml = typeof _agentDetailListIconHtml === 'function'
+    ? _agentDetailListIconHtml(iconKind)
+    : '<svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="5" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>';
+  return `
+    <div class="agents-detail-list-item">
+      <span class="agents-detail-list-icon is-${escapeHtml(iconKind)}" aria-hidden="true">${iconHtml}</span>
+      <span class="agents-detail-list-text">${escapeHtml(text)}</span>
+    </div>
+  `;
+}
+
+function _mpAgentInputRefs(agent) {
+  const cleanInputTitle = (value) => normalizeDisplayText(value)
+    .replace(/\s*[（(]\s*(可选|选填|optional)\s*[）)]\s*$/i, '')
+    .replace(/\s*[（(]\s*(必填|required)\s*[）)]\s*$/i, '')
+    .trim();
+  return Array.isArray(agent && agent.inputs)
+    ? agent.inputs.map((input) => ({
+        title: cleanInputTitle(input && (input.label || input.id || '')),
+        description: normalizeDisplayText(input && (input.description || input.type || '')),
+        required: !!(input && input.required === true),
+      })).filter((input) => input.title)
+    : [];
+}
+
+function _mpAgentInputChipHtml(input) {
+  if (!input || !input.title) return '';
+  const state = input.required ? t('agents.input_required') : t('agents.input_optional');
+  return `
+    <span class="agents-profile-chip agents-input-chip" title="${escapeHtml(input.description || '')}">
+      <span>${escapeHtml(input.title)}</span>
+      <small>${escapeHtml(state)}</small>
+    </span>
+  `;
+}
+
+function _mpOutputFormatLabel(value) {
+  switch (value) {
+    case 'text':
+    case 'markdown_only':
+      return t('agents.output_format_text');
+    case 'dashboard':
+      return t('agents.output_format_dashboard');
+    case 'artifact':
+    case 'allow_artifacts':
+      return t('agents.output_format_artifact');
+    case 'auto':
+    default:
+      return t('agents.output_format_auto');
+  }
+}
+
+function _mpAgentInputOutputHtml(agent) {
+  const inputRefs = _mpAgentInputRefs(agent);
+  const outputLabel = agent && agent.runtime && agent.runtime.kind === 'cli'
+    ? ''
+    : _mpOutputFormatLabel(agent && agent.output_format);
+  if (!inputRefs.length && !outputLabel) return '';
+  return `
+    <div class="agents-detail-section" id="marketplace-agent-input-output-section">
+      <div class="agents-detail-label">${escapeHtml(t('agents.label_input_output'))}</div>
+      <div class="agents-detail-io">
+        ${inputRefs.length ? `
+          <div class="agents-detail-io-row">
+            <div class="agents-detail-io-label">${escapeHtml(t('agents.label_inputs'))}</div>
+            <div class="agents-detail-tag-row">${inputRefs.map(_mpAgentInputChipHtml).join('')}</div>
+          </div>
+        ` : ''}
+        ${outputLabel ? `
+          <div class="agents-detail-io-row">
+            <div class="agents-detail-io-label">${escapeHtml(t('agents.label_output_format'))}</div>
+            <div class="agents-detail-output-text">${escapeHtml(outputLabel)}</div>
+          </div>
+        ` : ''}
+      </div>
+    </div>
+  `;
+}
+
+// Agent body mirrors the installed agent detail style, but marketplace previews are
+// install-time content only: no runtime data and no user-specific memory.
 function _mpAgentDetailHtml(agentJson) {
   if (!agentJson) return `<div class="empty">${escapeHtml(t('marketplace.empty'))}</div>`;
   const lang = getLang();
   const desc = pickDesc(agentJson, lang).trim();
   const workflow = String(agentJson.workflow || '').trim();
+  const knowhow = _mpAgentTextList(agentJson, 'knowhow');
+  const standards = _mpAgentTextList(agentJson, 'standards');
   const placeholderHtml = `<span class="agents-detail-placeholder">${escapeHtml(t('agents.placeholder_unset'))}</span>`;
 
   return `<div class="agents-detail-body marketplace-detail-body-inner">
-    <div class="agents-detail-section">
-      <div class="agents-detail-label">${escapeHtml(t('agents.label_desc'))}</div>
-      <div class="agents-detail-desc">${desc ? escapeHtml(desc) : placeholderHtml}</div>
+    <div class="agents-detail-hero">
+      <div class="agents-detail-section agents-detail-intro-section">
+        <div class="agents-detail-desc">${desc ? escapeHtml(desc) : placeholderHtml}</div>
+      </div>
     </div>
+    ${knowhow.length ? `
+      <div class="agents-detail-section">
+        <div class="agents-detail-label">${escapeHtml(t('agents.label_knowhow'))}</div>
+        <p class="agents-detail-section-desc">${escapeHtml(t('agents.knowhow_desc'))}</p>
+        <div class="agents-detail-list">${knowhow.map((item) => _mpAgentReadonlyListItemHtml(item, 'knowhow')).join('')}</div>
+      </div>
+    ` : ''}
+    ${standards.length ? `
+      <div class="agents-detail-section">
+        <div class="agents-detail-label">${escapeHtml(t('agents.label_delivery_standards'))}</div>
+        <p class="agents-detail-section-desc">${escapeHtml(t('agents.delivery_standards_desc'))}</p>
+        <div class="agents-detail-list">${standards.map((item) => _mpAgentReadonlyListItemHtml(item, 'standards')).join('')}</div>
+      </div>
+    ` : ''}
+    ${_mpAgentInputOutputHtml(agentJson)}
     <div class="agents-detail-section agents-detail-section-workflow">
       <div class="agents-detail-label">${escapeHtml(t('agents.label_workflow'))}</div>
       <div class="agents-detail-workflow markdown-body">${workflow ? renderMarkdownFull(workflow) : placeholderHtml}</div>
@@ -1524,6 +1706,7 @@ function _mpSkillDetailHtml() {
     bodyHtml = `<pre class="code-view"><code>${escapeHtml(text)}</code></pre>`;
   }
   const placeholderHtml = `<span class="agents-detail-placeholder">${escapeHtml(t('agents.placeholder_unset'))}</span>`;
+  const sourceOpen = _mpState.detailSkillSourceOpen !== false;
 
   return `
     <div class="skills-detail-content marketplace-detail-body-inner">
@@ -1534,12 +1717,12 @@ function _mpSkillDetailHtml() {
       <section class="skills-doc-section skills-usage-section">
         <h3 class="skills-doc-section-label skills-usage-label">
           <span>${escapeHtml(t('skills.label_usage'))}</span>
-          <button type="button" class="skills-source-toggle" data-mp-source-toggle aria-expanded="false">
+          <button type="button" class="skills-source-toggle${sourceOpen ? ' is-open' : ''}" data-mp-source-toggle aria-expanded="${sourceOpen ? 'true' : 'false'}">
             <span class="skills-source-toggle-caret" aria-hidden="true">${typeof window !== 'undefined' && typeof window.uiIconHtml === 'function' ? window.uiIconHtml('chevron-right', 'ui-icon') : ''}</span>
             <span>${escapeHtml(t('skills.label_source'))}</span>
           </button>
         </h3>
-        <div class="skills-source-panel" data-mp-source-panel style="display:none">
+        <div class="skills-source-panel" data-mp-source-panel${sourceOpen ? '' : ' style="display:none"'}>
           <div class="skills-source-tree">${treeHtml}</div>
         </div>
         <div class="skills-doc-section-body markdown-body">${bodyHtml}</div>
@@ -1569,6 +1752,7 @@ function _mpInstallFailedName(kind, item, err) {
   const itemName = item?.name || '';
   if (failedKind === kind && failedId && failedId === itemId && itemName) return itemName;
   if (err?.marketplaceName && err.marketplaceName !== failedId) return err.marketplaceName;
+  if (failedKind !== kind && failedId) return failedId;
   if (failedKind === kind && itemName) return itemName;
   return err?.marketplaceName || itemName || itemId || failedId || '';
 }
@@ -1576,7 +1760,7 @@ function _mpInstallFailedName(kind, item, err) {
 function _mpInstallFailedText(kind, item, err) {
   const failedKind = err?.marketplaceKind || kind;
   const failedName = _mpInstallFailedName(kind, item, err);
-  const reason = err?.marketplaceReason || err?.message || String(err || '');
+  const reason = _mpUserErrorMessage(err, 'marketplace.action_failed_retry_later');
   const tmpl = t('marketplace.install_failed_resource');
   if (tmpl && tmpl !== 'marketplace.install_failed_resource') {
     return tmpl
@@ -1591,13 +1775,35 @@ function _mpInstallFailedText(kind, item, err) {
 }
 
 function _mpInstallErrorFromResponse(r) {
-  const err = new Error((r && (r.marketplaceReason || r.error)) || 'install failed');
+  const err = _mpErrorFromResponse(r, 'install failed');
   if (r && r.marketplaceKind) err.marketplaceKind = r.marketplaceKind;
   if (r && r.marketplaceId) err.marketplaceId = r.marketplaceId;
   if (r && r.marketplaceName) err.marketplaceName = r.marketplaceName;
   if (r && r.marketplaceReason) err.marketplaceReason = r.marketplaceReason;
   if (r && r.qualityReport) err.qualityReport = r.qualityReport;
   return err;
+}
+
+function _mpIsMissingDependencySkillError(requestedKind, err) {
+  const reason = String(err?.marketplaceReason || err?.message || err || '').toLowerCase();
+  return requestedKind === 'agent'
+    && err?.marketplaceKind === 'skill'
+    && (reason === 'not_found' || reason.includes('not_found'));
+}
+
+function _mpTrackInstallFailure(kind, item, err, surface = 'marketplace') {
+  try {
+    if (!window.Monitor || !_mpIsMissingDependencySkillError(kind, err)) return;
+    (() => {})('marketplace_dependency_skill_missing', {
+      surface,
+      requested_kind: kind,
+      requested_id: item?.id || '',
+      requested_name: item?.name || '',
+      dependency_skill_id: err?.marketplaceId || '',
+      dependency_skill_name: err?.marketplaceName || '',
+      reason: err?.marketplaceReason || err?.message || String(err || ''),
+    });
+  } catch (_) { /* telemetry must never affect install UX */ }
 }
 
 async function _mpInstall(kind, id, itemOverride = null) {
@@ -1630,6 +1836,7 @@ async function _mpInstall(kind, id, itemOverride = null) {
     // (Failure still alerts because the user otherwise has no way to know why nothing happened.)
   } catch (err) {
     const msg = (err && err.message) || String(err);
+    _mpTrackInstallFailure(kind, item, err);
     // Quality validator rejection → show the structured violation list
     // instead of the generic install-failed alert. Falls back to alert if
     // the report can't be loaded.
@@ -1695,7 +1902,7 @@ async function _mpUninstall(kind, id) {
     if (typeof loadSkills === 'function' && kind === 'skill') await loadSkills(true);
     // Success: button flips back to "Install" — no toast needed. (Failures still alert.)
   } catch (err) {
-    const msg = (err && err.message) || String(err);
+    const msg = _mpUserErrorMessage(err, 'marketplace.action_failed_retry_later');
     uiAlert(t('marketplace.uninstall_failed').replace('{reason}', msg));
   } finally {
     _mpState.installing.delete(key);

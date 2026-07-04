@@ -358,11 +358,19 @@ function checkDuplicateContent(sha1: string): Result<null> | null {
 }
 
 function notifyDeletedContext(relPath: string): void {
-  void relPath;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = null as { markDeleted?: (relPath: string) => Promise<void> | void };
+    void sync?.markDeleted?.(`cloud/contexts/${relPath}`);
+  } catch { /* features/sync stripped */ }
 }
 
 function notifyDirtyContext(relPath: string): void {
-  void relPath;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
+    sync?.markDirty?.('contexts', `cloud/contexts/${relPath}`);
+  } catch { /* features/sync stripped */ }
 }
 
 export function writeContextFile(relpath: string, content: string): Result<{ path: string }> {

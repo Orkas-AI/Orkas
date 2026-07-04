@@ -3,7 +3,7 @@ import { describe, it, expect } from 'vitest';
 import {
   parseMentions, resolveRecipients,
   extractFormFromFinal, computeFormId, decodeSubmission, encodeSubmission,
-  extractPlanInteractionFromFinal, extractHandbackFromFinal,
+  extractPlanInteractionFromFinal, extractActorResultFromFinal, extractHandbackFromFinal,
 } from '../../../../src/main/features/group_chat/router';
 
 describe('group_chat router › parseMentions', () => {
@@ -317,6 +317,38 @@ describe('group_chat router › form encoding', () => {
     const r = extractPlanInteractionFromFinal(text);
     expect(r.status).toBeUndefined();
     expect(r.cleanText).toBe(text);
+  });
+
+  it('extractActorResultFromFinal strips valid agent success/failure markers and keeps the latest status', () => {
+    const text = [
+      '初稿已完成。',
+      '<agent-result status="failure" />',
+      '',
+      '我已修正并满足交付标准。',
+      '<agent-result status="success"></agent-result>',
+    ].join('\n');
+
+    const r = extractActorResultFromFinal(text);
+    expect(r.status).toBe('success');
+    expect(r.cleanText).toContain('初稿已完成。');
+    expect(r.cleanText).toContain('我已修正并满足交付标准。');
+    expect(r.cleanText).not.toContain('agent-result');
+  });
+
+  it('extractActorResultFromFinal strips commander markers too', () => {
+    const text = '我会交给 @分析师 处理。\n<commander-result status="success" />';
+    const r = extractActorResultFromFinal(text);
+    expect(r.status).toBe('success');
+    expect(r.cleanText).toBe('我会交给 @分析师 处理。');
+    expect(r.cleanText).not.toContain('commander-result');
+  });
+
+  it('extractActorResultFromFinal strips invalid markers without accepting the status', () => {
+    const text = '部分完成。\n<agent-result status="error" />';
+    const r = extractActorResultFromFinal(text);
+    expect(r.status).toBeUndefined();
+    expect(r.cleanText).toBe('部分完成。');
+    expect(r.cleanText).not.toContain('agent-result');
   });
 
   it('encodeSubmission leaves optional blanks empty instead of writing placeholders', () => {

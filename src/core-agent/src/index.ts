@@ -8,7 +8,25 @@ export type { CoreAgentConfig, AgentConfig, MemoryConfig, ProviderConfig, ModelC
 
 // Shared types & utilities
 export type { Message, MessageContent, Usage, StopReason, StreamEvent } from "./shared/types.js";
-export { CoreAgentError, AuthError, RateLimitError, ContextOverflowError, ProviderError, TimeoutError, isRetryableError, isTransientNetworkError, classifyRetryableError, classifyTransientNetworkError } from "./shared/errors.js";
+export {
+  CoreAgentError,
+  AuthError,
+  RateLimitError,
+  ContextOverflowError,
+  OutputLimitError,
+  ProviderError,
+  TimeoutError,
+  DEFAULT_RETRY_ERROR_POLICY,
+  configureRetryErrorPolicy,
+  getRetryErrorPolicy,
+  isRetryableError,
+  isTransientNetworkError,
+  classifyRetryableError,
+  classifyRetryableErrorWithPolicy,
+  classifyTransientNetworkError,
+  classifyTransientNetworkErrorWithPolicy,
+} from "./shared/errors.js";
+export type { RetryableErrorKind, RetryErrorPolicyConfig } from "./shared/errors.js";
 export { createLogger } from "./shared/logger.js";
 export type { Logger, LogLevel } from "./shared/logger.js";
 

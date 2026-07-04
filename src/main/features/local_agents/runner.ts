@@ -18,6 +18,7 @@
  */
 
 import { createLogger } from '../../logger.js';
+import { logErrorRef, logErrorSummary, logPathRef, maskId } from '../../util/log-redact.js';
 import { detectOne, type LocalCliEntry, type LocalCliType } from './registry.js';
 import { claudeBackend } from './backends/claude.js';
 import { codexBackend } from './backends/codex.js';
@@ -87,8 +88,7 @@ function resolveIdleKillMs(cli: LocalCliType): number | undefined {
  *  `IDLE_TICK_MS`; the first emit happens once
  *  `now - lastEventAt > threshold`. Default 90 s because a thinking
  *  turn between tool calls runs ~10-40 s — 90 s comfortably skips real
- *  activity and catches genuine stalls. Backends with no streaming at
- *  all (openclaw) pass a smaller value via `BackendRunOptions.idleMs`. */
+ *  activity and catches genuine stalls. */
 const DEFAULT_IDLE_MS = 90 * 1000;
 const DEFAULT_IDLE_TICK_MS = 30 * 1000;
 /** Lower bound on user-supplied / backend-supplied idle thresholds so a
@@ -158,6 +158,382 @@ const BRIDGE_SYSTEM_PROMPT =
   + 'orkas_kb_read). Prefer these '
   + 'tools when the task involves the user\'s skills, services, or library content.';
 
+type LocalToolRunCounter = {
+  use: number;
+  result: number;
+  other: number;
+};
+
+type LocalToolTimelineLogEntry = {
+  seq: number;
+  elapsedMs: number;
+  tool: string;
+  phase: 'use' | 'result' | 'other';
+  call_id?: string;
+  is_error?: boolean;
+  output_chars?: number;
+  spilled?: boolean;
+};
+
+type LocalEventTimelineLogEntry = {
+  seq: number;
+  elapsedMs: number;
+  event: string;
+  detail?: string;
+};
+
+export interface LocalAgentRunLogDiagnostics {
+  startedAtMs: number;
+  eventCount: number;
+  eventTypes: Record<string, number>;
+  textDeltaChars: number;
+  thinkingChars: number;
+  stderrLines: number;
+  stderrChars: number;
+  rawLines: number;
+  rawChars: number;
+  idleEvents: number;
+  maxIdleStalledMs: number;
+  permissionRequests: number;
+  permissionAutoAllow: number;
+  permissionAutoDeny: number;
+  fileChangeEvents: number;
+  fileChangePathCount: number;
+  logLevels: Record<string, number>;
+  toolEvents: number;
+  toolResultEvents: number;
+  spilledToolResults: number;
+  toolCounts: Record<string, LocalToolRunCounter>;
+  firstEventMs?: number;
+  firstTextDeltaMs?: number;
+  firstToolMs?: number;
+  doneEventMs?: number;
+  terminalStatus?: string;
+  terminalError: boolean;
+  usage?: Record<string, number>;
+  toolTimeline: LocalToolTimelineLogEntry[];
+  toolTimelineTruncated: number;
+  eventTimeline: LocalEventTimelineLogEntry[];
+  eventTimelineTruncated: number;
+  textDeltaTimelineRecorded: boolean;
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function safeUsageForLog(value: unknown): Record<string, number> | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const allowed = new Set([
+    'input', 'output', 'total',
+    'inputTokens', 'outputTokens', 'totalTokens',
+    'cacheRead', 'cacheCreate', 'cacheWrite',
+    'cacheReadTokens', 'cacheWriteTokens',
+    'costUsd', 'totalCostUsd',
+  ]);
+  const out: Record<string, number> = {};
+  for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (!allowed.has(key)) continue;
+    const n = finiteNumber(raw);
+    if (n !== undefined) out[key] = n;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+export function createLocalAgentRunLogDiagnostics(nowMs = Date.now()): LocalAgentRunLogDiagnostics {
+  return {
+    startedAtMs: nowMs,
+    eventCount: 0,
+    eventTypes: {},
+    textDeltaChars: 0,
+    thinkingChars: 0,
+    stderrLines: 0,
+    stderrChars: 0,
+    rawLines: 0,
+    rawChars: 0,
+    idleEvents: 0,
+    maxIdleStalledMs: 0,
+    permissionRequests: 0,
+    permissionAutoAllow: 0,
+    permissionAutoDeny: 0,
+    fileChangeEvents: 0,
+    fileChangePathCount: 0,
+    logLevels: {},
+    toolEvents: 0,
+    toolResultEvents: 0,
+    spilledToolResults: 0,
+    toolCounts: {},
+    terminalError: false,
+    toolTimeline: [],
+    toolTimelineTruncated: 0,
+    eventTimeline: [],
+    eventTimelineTruncated: 0,
+    textDeltaTimelineRecorded: false,
+  };
+}
+
+function noteElapsedOnce(target: LocalAgentRunLogDiagnostics, key: keyof LocalAgentRunLogDiagnostics, nowMs: number): void {
+  if (target[key] !== undefined) return;
+  (target as unknown as Record<string, unknown>)[key as string] = Math.max(0, nowMs - target.startedAtMs);
+}
+
+function localToolCounter(stats: LocalAgentRunLogDiagnostics, rawName: unknown): LocalToolRunCounter {
+  const name = String(rawName || 'unknown').slice(0, 80) || 'unknown';
+  if (!stats.toolCounts[name]) stats.toolCounts[name] = { use: 0, result: 0, other: 0 };
+  return stats.toolCounts[name];
+}
+
+const MAX_TOOL_TIMELINE_LOG_ENTRIES = 80;
+const MAX_EVENT_TIMELINE_LOG_ENTRIES = 120;
+
+function safeToolNameForLog(rawName: unknown): string {
+  return String(rawName || 'unknown').slice(0, 80) || 'unknown';
+}
+
+function safeLocalToolPhaseForLog(rawPhase: unknown): LocalToolTimelineLogEntry['phase'] {
+  const phase = String(rawPhase || '');
+  if (phase === 'use' || phase === 'result') return phase;
+  return 'other';
+}
+
+function noteLocalToolTimelineForLog(stats: LocalAgentRunLogDiagnostics, e: LocalEvent, nowMs: number): void {
+  if (stats.toolTimeline.length >= MAX_TOOL_TIMELINE_LOG_ENTRIES) {
+    stats.toolTimelineTruncated += 1;
+    return;
+  }
+  const phase = safeLocalToolPhaseForLog(e.phase);
+  const entry: LocalToolTimelineLogEntry = {
+    seq: stats.toolTimeline.length + stats.toolTimelineTruncated + 1,
+    elapsedMs: Math.max(0, nowMs - stats.startedAtMs),
+    tool: safeToolNameForLog(e.tool),
+    phase,
+  };
+  const callId = e.callId;
+  if (callId !== undefined && callId !== null && String(callId)) entry.call_id = maskId(callId);
+  const isError = !!e.isError || !!e.error;
+  if (isError) entry.is_error = true;
+  if (phase === 'result') {
+    if (typeof e.output === 'string') entry.output_chars = e.output.length;
+    entry.spilled = !!e.outputPath;
+  }
+  stats.toolTimeline.push(entry);
+}
+
+function noteLocalEventTimelineForLog(
+  stats: LocalAgentRunLogDiagnostics,
+  event: string,
+  nowMs: number,
+  detail?: string,
+): void {
+  if (stats.eventTimeline.length >= MAX_EVENT_TIMELINE_LOG_ENTRIES) {
+    stats.eventTimelineTruncated += 1;
+    return;
+  }
+  stats.eventTimeline.push({
+    seq: stats.eventTimeline.length + stats.eventTimelineTruncated + 1,
+    elapsedMs: Math.max(0, nowMs - stats.startedAtMs),
+    event,
+    ...(detail ? { detail } : {}),
+  });
+}
+
+function formatLocalEventTimelineEntryForLog(entry: LocalEventTimelineLogEntry): string {
+  return [
+    `#${entry.seq}`,
+    `+${entry.elapsedMs}ms`,
+    entry.event,
+    entry.detail,
+  ].filter(Boolean).join(' ');
+}
+
+function formatLocalToolTimelineEntryForLog(entry: LocalToolTimelineLogEntry): string {
+  const parts = [
+    `#${entry.seq}`,
+    `+${entry.elapsedMs}ms`,
+    entry.tool,
+    entry.phase,
+  ];
+  if (entry.call_id) parts.push(`call=${entry.call_id}`);
+  if (entry.is_error !== undefined) parts.push(`error=${entry.is_error ? 'true' : 'false'}`);
+  if (entry.output_chars !== undefined) parts.push(`output_chars=${entry.output_chars}`);
+  if (entry.spilled !== undefined) parts.push(`spilled=${entry.spilled ? 'true' : 'false'}`);
+  return parts.join(' ');
+}
+
+export function recordLocalAgentEventForLog(stats: LocalAgentRunLogDiagnostics, e: LocalEvent, nowMs = Date.now()): void {
+  if (!stats || !e) return;
+  stats.eventCount += 1;
+  stats.eventTypes[e.type] = (stats.eventTypes[e.type] || 0) + 1;
+  noteElapsedOnce(stats, 'firstEventMs', nowMs);
+
+  switch (e.type) {
+    case 'process-info':
+      noteLocalEventTimelineForLog(stats, 'process_info', nowMs, `pid=${finiteNumber(e.pid) ?? 'unknown'}`);
+      break;
+    case 'text-delta':
+      stats.textDeltaChars += typeof e.text === 'string' ? e.text.length : 0;
+      noteElapsedOnce(stats, 'firstTextDeltaMs', nowMs);
+      if (!stats.textDeltaTimelineRecorded) {
+        stats.textDeltaTimelineRecorded = true;
+        noteLocalEventTimelineForLog(stats, 'text_delta', nowMs, `chars=${typeof e.text === 'string' ? e.text.length : 0}`);
+      }
+      break;
+    case 'thinking':
+      stats.thinkingChars += typeof e.text === 'string' ? e.text.length : 0;
+      noteLocalEventTimelineForLog(stats, 'thinking', nowMs, `chars=${typeof e.text === 'string' ? e.text.length : 0}`);
+      break;
+    case 'stderr-line':
+      stats.stderrLines += 1;
+      stats.stderrChars += typeof e.line === 'string' ? e.line.length : 0;
+      if (stats.stderrLines === 1) noteLocalEventTimelineForLog(stats, 'stderr_line', nowMs, `chars=${typeof e.line === 'string' ? e.line.length : 0}`);
+      break;
+    case 'raw-line':
+      stats.rawLines += 1;
+      stats.rawChars += typeof e.line === 'string' ? e.line.length : 0;
+      if (stats.rawLines === 1) noteLocalEventTimelineForLog(stats, 'raw_line', nowMs, `chars=${typeof e.line === 'string' ? e.line.length : 0}`);
+      break;
+    case 'idle': {
+      stats.idleEvents += 1;
+      const stalledMs = finiteNumber(e.stalledMs) || 0;
+      stats.maxIdleStalledMs = Math.max(stats.maxIdleStalledMs, stalledMs);
+      noteLocalEventTimelineForLog(stats, 'idle', nowMs, `stalled_ms=${stalledMs}`);
+      break;
+    }
+    case 'permission-request':
+      stats.permissionRequests += 1;
+      if (e.autoDecided === 'allow') stats.permissionAutoAllow += 1;
+      if (e.autoDecided === 'deny') stats.permissionAutoDeny += 1;
+      noteLocalEventTimelineForLog(
+        stats,
+        'permission_request',
+        nowMs,
+        `tool=${safeToolNameForLog(e.tool)} auto=${String(e.autoDecided || 'manual')}`,
+      );
+      break;
+    case 'file-change':
+      stats.fileChangeEvents += 1;
+      stats.fileChangePathCount += Array.isArray(e.paths) ? e.paths.length : 0;
+      noteLocalEventTimelineForLog(stats, 'file_change', nowMs, `paths=${Array.isArray(e.paths) ? e.paths.length : 0}`);
+      break;
+    case 'log': {
+      const level = String(e.level || 'info').toLowerCase();
+      stats.logLevels[level] = (stats.logLevels[level] || 0) + 1;
+      noteLocalEventTimelineForLog(stats, 'log', nowMs, `level=${level}`);
+      break;
+    }
+    case 'tool-event': {
+      stats.toolEvents += 1;
+      const counter = localToolCounter(stats, e.tool);
+      const phase = String(e.phase || '');
+      if (phase === 'use') counter.use += 1;
+      else if (phase === 'result') {
+        counter.result += 1;
+        stats.toolResultEvents += 1;
+        if (e.outputPath) stats.spilledToolResults += 1;
+      } else {
+        counter.other += 1;
+      }
+      noteLocalToolTimelineForLog(stats, e, nowMs);
+      noteLocalEventTimelineForLog(stats, 'tool_event', nowMs, `tool=${safeToolNameForLog(e.tool)} phase=${safeLocalToolPhaseForLog(e.phase)}`);
+      noteElapsedOnce(stats, 'firstToolMs', nowMs);
+      break;
+    }
+    case 'status':
+      stats.usage = safeUsageForLog(e.usage) || stats.usage;
+      noteLocalEventTimelineForLog(stats, 'status', nowMs, `status=${String(e.status || '')}`);
+      break;
+    case 'done':
+      noteElapsedOnce(stats, 'doneEventMs', nowMs);
+      stats.terminalStatus = typeof e.status === 'string' ? e.status : stats.terminalStatus;
+      stats.terminalError = !!e.error;
+      stats.usage = safeUsageForLog(e.usage) || stats.usage;
+      noteLocalEventTimelineForLog(stats, 'done', nowMs, `status=${String(e.status || '')} error=${e.error ? 'true' : 'false'}`);
+      break;
+    default:
+      break;
+  }
+}
+
+export function summarizeLocalAgentRunForLog(stats: LocalAgentRunLogDiagnostics, nowMs = Date.now()): Record<string, unknown> {
+  return {
+    durationMs: Math.max(0, nowMs - stats.startedAtMs),
+    eventCount: stats.eventCount,
+    eventTypes: stats.eventTypes,
+    textDeltaChars: stats.textDeltaChars,
+    thinkingChars: stats.thinkingChars,
+    stderrLines: stats.stderrLines,
+    stderrChars: stats.stderrChars,
+    rawLines: stats.rawLines,
+    rawChars: stats.rawChars,
+    idleEvents: stats.idleEvents,
+    maxIdleStalledMs: stats.maxIdleStalledMs,
+    permissionRequests: stats.permissionRequests,
+    permissionAutoAllow: stats.permissionAutoAllow,
+    permissionAutoDeny: stats.permissionAutoDeny,
+    fileChangeEvents: stats.fileChangeEvents,
+    fileChangePathCount: stats.fileChangePathCount,
+    logLevels: stats.logLevels,
+    toolEvents: stats.toolEvents,
+    toolResultEvents: stats.toolResultEvents,
+    spilledToolResults: stats.spilledToolResults,
+    toolNames: Object.keys(stats.toolCounts).sort(),
+    toolCounts: stats.toolCounts,
+    toolTimeline: stats.toolTimeline.map(formatLocalToolTimelineEntryForLog),
+    toolTimelineTruncated: stats.toolTimelineTruncated,
+    eventTimeline: stats.eventTimeline.map(formatLocalEventTimelineEntryForLog),
+    eventTimelineTruncated: stats.eventTimelineTruncated,
+    firstEventMs: stats.firstEventMs,
+    firstTextDeltaMs: stats.firstTextDeltaMs,
+    firstToolMs: stats.firstToolMs,
+    doneEventMs: stats.doneEventMs,
+    terminalStatus: stats.terminalStatus,
+    terminalError: stats.terminalError,
+    usage: stats.usage,
+  };
+}
+
+export function localAgentRunContextForLog(opts: {
+  uid?: string;
+  cid?: string;
+  agentId?: string;
+  projectId?: string;
+  cli?: LocalCliType;
+  model?: string;
+  customArgs?: readonly string[];
+  resumeSessionId?: string;
+  prompt?: string;
+  cwd?: string;
+  runId?: string;
+  cliAvailable?: boolean;
+  cliVersion?: string | null;
+  bridgeSupported?: boolean;
+  timeoutMs?: number;
+  idleKillMs?: number;
+  idleMs?: number;
+}): Record<string, unknown> {
+  return {
+    run_id: maskId(opts.runId),
+    user_id: maskId(opts.uid),
+    cid: maskId(opts.cid),
+    agent_id: maskId(opts.agentId),
+    project_id: maskId(opts.projectId),
+    cli: opts.cli,
+    model: opts.model || undefined,
+    cli_available: opts.cliAvailable,
+    cli_version: opts.cliVersion || undefined,
+    bridge_supported: opts.bridgeSupported,
+    custom_arg_count: opts.customArgs?.length || 0,
+    has_resume_session: !!opts.resumeSessionId,
+    prompt_chars: String(opts.prompt || '').length,
+    has_cwd: !!opts.cwd,
+    cwd: opts.cwd ? logPathRef(opts.cwd) : undefined,
+    timeout_ms: opts.timeoutMs,
+    idle_kill_ms: opts.idleKillMs,
+    idle_ms: opts.idleMs,
+  };
+}
+
 export interface RunCliAgentOpts {
   uid: string;
   cid: string;
@@ -191,8 +567,21 @@ export interface RunCliAgentResult {
 
 export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   const backend = BACKENDS[opts.cli];
+  let runLogContext = localAgentRunContextForLog({
+    uid: opts.uid,
+    cid: opts.cid,
+    agentId: opts.agentId,
+    projectId: opts.projectId,
+    cli: opts.cli,
+    model: opts.model,
+    customArgs: opts.customArgs,
+    resumeSessionId: opts.resumeSessionId,
+    prompt: opts.prompt,
+    cwd: opts.cwd,
+    bridgeSupported: _bridgeSupported(opts.cli),
+  });
   if (!backend) {
-    log.warn('no backend registered for cli', { cli: opts.cli });
+    log.warn('local agent backend missing', runLogContext);
     const err = `local CLI backend not implemented: ${opts.cli}`;
     opts.onEvent({ type: 'done', status: 'failed', error: err });
     return { runId: '', status: 'failed', error: err };
@@ -205,6 +594,10 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     return _missing(opts, entry);
   }
 
+  const timeoutMs = resolveTimeoutMs(opts.cli);
+  const idleKillMs = resolveIdleKillMs(opts.cli);
+  const idleThresholdMs = resolveIdleMs(BACKEND_IDLE_MS[opts.cli]);
+
   const handle = await persist.start(opts.uid, {
     agentId: opts.agentId,
     cid: opts.cid,
@@ -213,17 +606,36 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     cliPath: entry.path,
     prompt: opts.prompt,
   });
-  log.info('start', { runId: handle.runId, cli: opts.cli, agentId: opts.agentId, cid: opts.cid, cwd: opts.cwd });
   const startedAtMs = Date.now();
+  const runDiagnostics = createLocalAgentRunLogDiagnostics(startedAtMs);
+  const startedAtIso = new Date(startedAtMs).toISOString();
+  runLogContext = localAgentRunContextForLog({
+    uid: opts.uid,
+    cid: opts.cid,
+    agentId: opts.agentId,
+    projectId: opts.projectId,
+    cli: opts.cli,
+    model: opts.model,
+    customArgs: opts.customArgs,
+    resumeSessionId: opts.resumeSessionId,
+    prompt: opts.prompt,
+    cwd: opts.cwd,
+    runId: handle.runId,
+    cliAvailable: entry.available,
+    cliVersion: entry.version,
+    bridgeSupported: _bridgeSupported(opts.cli),
+    timeoutMs,
+    idleKillMs,
+    idleMs: idleThresholdMs,
+  });
+  log.info('local agent run start', runLogContext);
 
   // Wrapper writes events to disk before forwarding upstream so that
   // a renderer crash mid-run still leaves a complete jsonl trail.
   let streamedOutput = '';
   let terminal: { status: RunCliAgentResult['status']; output?: string; error?: string; sessionId?: string } | null = null;
-  const idleThresholdMs = resolveIdleMs(BACKEND_IDLE_MS[opts.cli]);
-  // CLI dispatch session id (matches the devtools-archive session id
-  // built below). The per-session spill dir is anchored on this so
-  // sweep / read paths can find the file again.
+  // CLI dispatch session id. The per-session spill dir is anchored on
+  // this so sweep / read paths can find the file again.
   const cliSessionId = `cli-${opts.cli}-${handle.runId}`;
   const spillDir = sessionToolResultsDir(opts.uid, cliSessionId);
   let lastEventAt = Date.now();
@@ -252,6 +664,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
       (e as any).output = output;
       if (outputPath) (e as any).outputPath = outputPath;
     }
+    recordLocalAgentEventForLog(runDiagnostics, e);
     persist.append(handle, e);
     if (e.type === 'text-delta' && typeof e.text === 'string') {
       streamedOutput += e.text;
@@ -305,9 +718,11 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
         configDir: handle.dir,
         sandboxEnv: buildSkillSandboxEnv(opts.uid),
       });
+      log.info('local agent bridge ready', runLogContext);
     } catch (err) {
       log.warn('bridge start failed — running without orkas MCP server', {
-        runId: handle.runId, error: (err as Error).message,
+        ...runLogContext,
+        error: logErrorRef(err),
       });
     }
   }
@@ -322,8 +737,8 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
       resumeSessionId: opts.resumeSessionId,
       signal: opts.signal,
       onEvent,
-      timeoutMs: resolveTimeoutMs(opts.cli),
-      idleKillMs: resolveIdleKillMs(opts.cli),
+      timeoutMs,
+      idleKillMs,
       // Activity clock for the backend's idle-kill watchdog. Reads the
       // same `lastEventAt` the idle heartbeat uses (self-emitted idle
       // pulses excluded), so heartbeat rows always precede a kill.
@@ -343,14 +758,14 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     });
   } catch (err) {
     const msg = (err as Error).message || String(err);
-    log.error('backend threw', { runId: handle.runId, error: msg });
+    log.error('local agent backend threw', { ...runLogContext, error: logErrorSummary(err) });
     if (!terminal) {
       onEvent({ type: 'done', status: 'failed', error: msg });
     }
   } finally {
     if (bridge) {
       try { await bridge.close(); }
-      catch (err) { log.warn('bridge close failed', { runId: handle.runId, error: (err as Error).message }); }
+      catch (err) { log.warn('bridge close failed', { ...runLogContext, error: logErrorRef(err) }); }
     }
   }
 
@@ -372,15 +787,38 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     sessionId: terminal.sessionId,
     durationMs: endedAtMs - startedAtMs,
   });
-  log.info('end', {
-    runId: handle.runId, cli: opts.cli, status: terminal.status, bytes: finalOutput?.length ?? 0,
+  log.info('local agent run finish', {
+    ...runLogContext,
+    status: terminal.status,
+    output_chars: finalOutput?.length ?? 0,
+    has_error: !!terminal.error,
+    error: terminal.error ? logErrorRef(new Error(terminal.error)) : undefined,
+    duration_ms: endedAtMs - startedAtMs,
+    diagnostics: summarizeLocalAgentRunForLog(runDiagnostics, endedAtMs),
   });
   return { runId: handle.runId, status: terminal.status, output: finalOutput, error: terminal.error };
 }
 
 async function _missing(opts: RunCliAgentOpts, entry: LocalCliEntry): Promise<RunCliAgentResult> {
   const err = entry.errorDetail || `local CLI '${opts.cli}' is not installed or not on PATH`;
-  log.warn('missing cli', { cli: opts.cli, error: err });
+  log.warn('local agent cli missing', {
+    ...localAgentRunContextForLog({
+      uid: opts.uid,
+      cid: opts.cid,
+      agentId: opts.agentId,
+      projectId: opts.projectId,
+      cli: opts.cli,
+      model: opts.model,
+      customArgs: opts.customArgs,
+      resumeSessionId: opts.resumeSessionId,
+      prompt: opts.prompt,
+      cwd: opts.cwd,
+      cliAvailable: entry.available,
+      cliVersion: entry.version,
+      bridgeSupported: _bridgeSupported(opts.cli),
+    }),
+    error: logErrorRef(new Error(err)),
+  });
   opts.onEvent({ type: 'done', status: 'missing_cli', error: err });
   return { runId: '', status: 'missing_cli', error: err };
 }

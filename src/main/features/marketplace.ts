@@ -44,18 +44,20 @@ import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 
 import { sha256OfFile } from '../util/sha256';
+import { marketplaceContentTreeHash } from '../util/marketplace-tree-hash';
 import { logPathRef } from '../util/log-redact';
 import { fetchWithRetry } from '../util/retry';
 
 import {
   userSkillsDir,
-  userMarketplaceAgentDir, userMarketplaceSkillDir,
+  userMarketplaceAgentDir, userMarketplaceAgentSkillsDir, userMarketplaceSkillDir,
   userMarketplaceAgentsDir, userMarketplaceSkillsDir,
   marketplaceCacheAgentDir, marketplaceCacheSkillDir,
   userMarketplaceInstallsFile, marketplaceDefaultsSeededFile,
   userMarketplaceDirCloud,
 } from '../paths';
 import { getActiveUserId, isAnonymousLocalId } from './users';
+import { withCommonHeaders } from './api_common';
 import { getLanguage } from './config';
 import { invalidateSkills as invalidateCoreAgentSkills } from '../model/core-agent/skill-registry';
 import {
@@ -74,10 +76,12 @@ import {
 import { persistReport as persistQualityReport } from '../quality/report';
 
 const log = createLogger('marketplace');
+const MARKETPLACE_JSON_TIMEOUT_MS = 60_000;
+const MARKETPLACE_BUNDLE_DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 
 // ── server URL ────────────────────────────────────────────────────────────
-// The open-source build has exactly one server environment: global prod. Use the apex host directly
-// so POST marketplace calls do not first hit a www -> apex 301 redirect.
+// The open-source build has exactly one server environment: global prod. Use the apex host
+// directly so marketplace POST calls do not first hit a www -> apex 301 redirect.
 const GLOBAL_PROD_API_BASE = 'https://orkas.ai' + '/api';
 
 export function apiBase(): string {
@@ -90,11 +94,14 @@ interface Envelope { code: number; msg?: string; [k: string]: unknown }
 export async function postJson<T>(p: string, body: unknown): Promise<T> {
   const res = await fetchWithRetry(`marketplace:${p}`, `${apiBase()}${p}`, {
     method: 'POST',
-    headers: {
+    headers: withCommonHeaders({
       'Content-Type': 'application/json',
       'Accept-Language': getLanguage(),
-    },
+    }),
     body: JSON.stringify(body || {}),
+  }, {
+    timeoutMs: MARKETPLACE_JSON_TIMEOUT_MS,
+    timeoutMessage: `marketplace:${p} timed out after ${Math.round(MARKETPLACE_JSON_TIMEOUT_MS / 1000)}s`,
   });
   const text = await res.text();
   let data: Envelope;
@@ -109,6 +116,7 @@ export interface MarketplaceCategory {
   name_zh: string;
   name_en: string;
   name_ja?: string;
+  name_pt?: string;
   sort_order: number;
 }
 
@@ -121,6 +129,7 @@ export interface MarketplaceAgent {
   icon: string;
   color: string;
   version: string;
+  agent_skills_bundle_url?: string;
   /** Author uid. `"0"` is the official-platform marker (UI label `marketplace.author_platform`);
    *  everything else is a community uploader. Dedup is on (name, create_uid), so same name from
    *  different authors yields distinct rows — the UI shows the author badge to tell them apart. */
@@ -161,6 +170,8 @@ export interface AgentDetail {
    *  devices can fetch directly. May be empty on a cache-hit code path; install resolves
    *  via the detail endpoint when missing. */
   agent_json_url: string;
+  /** Optional zip containing this agent's private skills. Empty means none. */
+  agent_skills_bundle_url?: string;
   /** Author uid from the server row. Recorded in `_install.json` so the in-app detail can
    *  render the author badge without a marketplace round-trip. May be `''` on cache-hit. */
   create_uid: string;
@@ -194,7 +205,7 @@ export async function listMarketplaceAgents(
 ): Promise<{ list: MarketplaceAgent[]; total: number }> {
   return await postJson('/marketplace/agents/list', {
     category: opts.category || null,
-    status: 'approved',
+    status: opts.status || null,
     q: opts.q || null,
     page: opts.page || 1,
     size: opts.size || 50,
@@ -206,7 +217,7 @@ export async function listMarketplaceSkills(
 ): Promise<{ list: MarketplaceSkill[]; total: number }> {
   return await postJson('/marketplace/skills/list', {
     category: opts.category || null,
-    status: 'approved',
+    status: opts.status || null,
     q: opts.q || null,
     page: opts.page || 1,
     size: opts.size || 50,
@@ -318,12 +329,56 @@ function _listLocalMarketplaceProjects(
   };
 }
 
+// Main-process conditional cache for the OSS projects list: store the last
+// ETag + parsed body per query so PC's per-launch home-strip revalidation costs
+// a 304 instead of re-downloading the (small) catalog. In-memory only — a fresh
+// process re-establishes the ETag on its first call; bounded so ad-hoc searches
+// can't grow it without limit.
+// INVARIANT: the cache key is the request body ONLY. This is correct because the
+// OSS projects list is public / account-independent and `apiBase()` is pinned for
+// the process lifetime. If either ever becomes user/profile-scoped at runtime,
+// fold the account/profile (and apiBase) into the key or a 304 could replay
+// another scope's body.
+const _projectsConditional = new Map<string, { etag: string; result: MarketplaceProjectsListResult }>();
+const _PROJECTS_CONDITIONAL_MAX = 64;
+
+async function _fetchProjectsListConditional(body: Record<string, unknown>): Promise<MarketplaceProjectsListResult> {
+  const key = JSON.stringify(body);
+  const prior = _projectsConditional.get(key);
+  const headers: Record<string, string> = withCommonHeaders({
+    'Content-Type': 'application/json',
+    'Accept-Language': getLanguage(),
+  });
+  if (prior) headers['If-None-Match'] = prior.etag;
+  const res = await fetchWithRetry(
+    'marketplace:/marketplace/projects/list',
+    `${apiBase()}/marketplace/projects/list`,
+    { method: 'POST', headers, body: JSON.stringify(body) },
+    {
+      timeoutMs: MARKETPLACE_JSON_TIMEOUT_MS,
+      timeoutMessage: `marketplace:/marketplace/projects/list timed out after ${Math.round(MARKETPLACE_JSON_TIMEOUT_MS / 1000)}s`,
+    },
+  );
+  if (res.status === 304 && prior) return prior.result;
+  const text = await res.text();
+  let data: Envelope;
+  try { data = JSON.parse(text); } catch { throw new Error(`bad response (${res.status}): ${text.slice(0, 200)}`); }
+  if (data.code !== 0) throw new Error(data.msg || `marketplace /marketplace/projects/list failed (code=${data.code})`);
+  const result = data as unknown as MarketplaceProjectsListResult;
+  const etag = res.headers.get('etag');
+  if (etag) {
+    if (_projectsConditional.size >= _PROJECTS_CONDITIONAL_MAX) _projectsConditional.clear();
+    _projectsConditional.set(key, { etag, result });
+  }
+  return result;
+}
+
 export async function listMarketplaceProjects(
   opts: { category?: string; q?: string; page?: number; size?: number; home_only?: boolean; local_only?: boolean } = {},
 ): Promise<MarketplaceProjectsListResult> {
   if (opts.local_only === true) return _listLocalMarketplaceProjects(opts);
   try {
-    const fresh = await postJson<MarketplaceProjectsListResult>('/marketplace/projects/list', {
+    const fresh = await _fetchProjectsListConditional({
       category: opts.category || null,
       q: opts.q || null,
       page: opts.page || 1,
@@ -402,6 +457,65 @@ function _agentJsonName(agentJson: Record<string, unknown>): string {
   return typeof raw === 'string' ? raw.trim() : '';
 }
 
+const SKILL_DISPLAY_REF_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/;
+const BUILTIN_WORKFLOW_REFS = new Set([
+  'read_file', 'write_file', 'bash', 'kb_search', 'kb_read',
+  'markdown_to_pdf', 'html_to_pdf', 'generate_image', 'web_search', 'web_fetch',
+]);
+
+function _agentSkillDependencyDisplayNames(
+  agentJson: Record<string, unknown>,
+  skillList: string[],
+): Map<string, string> {
+  const out = new Map<string, string>();
+  const workflow = typeof agentJson.workflow === 'string' ? agentJson.workflow : '';
+  const names: string[] = [];
+  const seen = new Set<string>();
+  const add = (raw: string) => {
+    const name = raw.trim();
+    if (!SKILL_DISPLAY_REF_RE.test(name) || seen.has(name)) return;
+    if (BUILTIN_WORKFLOW_REFS.has(name)) return;
+    seen.add(name);
+    names.push(name);
+  };
+
+  // Marketplace-installed agents store dependency ids in skill_list, while older
+  // authored workflows often still mention the readable skill names. Pair by order
+  // so a stale id can still produce a useful user-facing failure.
+  const useRe = /\buse\s+`([^`]+)`/gi;
+  for (let m = useRe.exec(workflow); m; m = useRe.exec(workflow)) add(m[1]);
+  if (names.length < skillList.length) {
+    const skillRe = /`([^`]+)`\s+skill\b/gi;
+    for (let m = skillRe.exec(workflow); m; m = skillRe.exec(workflow)) add(m[1]);
+  }
+
+  skillList.forEach((sid, idx) => {
+    const display = names[idx] || (SKILL_DISPLAY_REF_RE.test(sid) && !/^[0-9a-f]{12}$/i.test(sid) ? sid : '');
+    if (display) out.set(sid, display);
+  });
+  return out;
+}
+
+function _marketplaceStatus(row: { status?: string; state?: string }): string {
+  return String(row.status || row.state || '').trim().toLowerCase();
+}
+
+function _assertApprovedDependencySkill(
+  skillId: string,
+  displayName: string,
+  row: { status?: string; state?: string },
+): void {
+  const status = _marketplaceStatus(row);
+  if (status !== 'approved') {
+    throw new MarketplaceInstallError(
+      'skill',
+      skillId,
+      displayName || skillId,
+      status ? `status_not_approved:${status}` : 'status_not_approved',
+    );
+  }
+}
+
 export async function getAgentDetail(
   agentId: string, expect: MarketplaceFreshness,
 ): Promise<AgentDetail> {
@@ -420,7 +534,7 @@ export async function getAgentDetail(
     }
   }
   // Miss → fetch + repopulate.
-  const data = await postJson<{ agent_json: Record<string, unknown>; version: string; category: string; published_at: number; updated_at?: number; agent_json_url: string; create_uid: string; default_install?: boolean; is_open_source?: boolean; status?: string; state?: string }>(
+  const data = await postJson<{ agent_json: Record<string, unknown>; version: string; category: string; published_at: number; updated_at?: number; agent_json_url: string; agent_skills_bundle_url?: string; create_uid: string; default_install?: boolean; is_open_source?: boolean; status?: string; state?: string }>(
     '/marketplace/agents/detail', { id: agentId },
   );
   await writeAgentCache(agentId, data.agent_json, {
@@ -430,6 +544,7 @@ export async function getAgentDetail(
     id: agentId, version: data.version, category: data.category,
     published_at: data.published_at, updated_at: data.updated_at,
     agent_json: data.agent_json, agent_json_url: data.agent_json_url || '',
+    agent_skills_bundle_url: data.agent_skills_bundle_url || '',
     create_uid: data.create_uid || '', default_install: data.default_install === true,
     is_open_source: data.is_open_source === true, status: data.status || data.state || '',
   };
@@ -467,7 +582,10 @@ async function _fetchAndCacheSkill(
 ): Promise<void> {
   let res: Response;
   try {
-    res = await fetchWithRetry(`marketplace:skill-bundle:${skillId}`, meta.bundle_url);
+    res = await fetchWithRetry(`marketplace:skill-bundle:${skillId}`, meta.bundle_url, undefined, {
+      timeoutMs: MARKETPLACE_BUNDLE_DOWNLOAD_TIMEOUT_MS,
+      timeoutMessage: `marketplace:skill-bundle:${skillId} timed out after ${Math.round(MARKETPLACE_BUNDLE_DOWNLOAD_TIMEOUT_MS / 1000)}s`,
+    });
   } catch (err) {
     throw new Error(`download bundle failed from ${_bundleHost(meta.bundle_url)}: ${(err as Error)?.message || String(err)}`);
   }
@@ -477,6 +595,21 @@ async function _fetchAndCacheSkill(
   await writeSkillCache(skillId, async (dir) => {
     extractBundleSafely(new AdmZip(zipBuf), dir);
   }, { version: meta.version, published_at: meta.published_at, updated_at: meta.updated_at });
+}
+
+async function _fetchAgentPrivateSkillsBundle(agentId: string, bundleUrl: string): Promise<Buffer | null> {
+  if (!bundleUrl) return null;
+  let res: Response;
+  try {
+    res = await fetchWithRetry(`marketplace:agent-private-skills:${agentId}`, bundleUrl, undefined, {
+      timeoutMs: MARKETPLACE_BUNDLE_DOWNLOAD_TIMEOUT_MS,
+      timeoutMessage: `marketplace:agent-private-skills:${agentId} timed out after ${Math.round(MARKETPLACE_BUNDLE_DOWNLOAD_TIMEOUT_MS / 1000)}s`,
+    });
+  } catch (err) {
+    throw new Error(`download agent private skills failed from ${_bundleHost(bundleUrl)}: ${(err as Error)?.message || String(err)}`);
+  }
+  if (!res.ok) throw new Error(`download agent private skills failed from ${_bundleHost(bundleUrl)} (${res.status})`);
+  return Buffer.from(await res.arrayBuffer());
 }
 
 function _bundleHost(bundleUrl: string): string {
@@ -543,13 +676,14 @@ async function _installMarketplaceAgentLocked(
     if (!detail.agent_json_url) {
       // Cache-hit path returns url='' (and create_uid=''); re-fetch via detail endpoint to
       // capture both — needed for manifest + `_install.json` author badge.
-      const fresh = await postJson<{ agent_json: Record<string, unknown>; version: string; category: string; published_at: number; updated_at?: number; agent_json_url: string; create_uid: string; default_install?: boolean; is_open_source?: boolean; status?: string; state?: string }>(
+      const fresh = await postJson<{ agent_json: Record<string, unknown>; version: string; category: string; published_at: number; updated_at?: number; agent_json_url: string; agent_skills_bundle_url?: string; create_uid: string; default_install?: boolean; is_open_source?: boolean; status?: string; state?: string }>(
         '/marketplace/agents/detail', { id: agentId },
       );
       detail = {
         id: agentId, version: fresh.version, category: fresh.category,
         published_at: fresh.published_at, updated_at: fresh.updated_at,
         agent_json: fresh.agent_json, agent_json_url: fresh.agent_json_url || '',
+        agent_skills_bundle_url: fresh.agent_skills_bundle_url || '',
         create_uid: fresh.create_uid || '',
         default_install: fresh.default_install === true,
         is_open_source: fresh.is_open_source === true,
@@ -563,19 +697,23 @@ async function _installMarketplaceAgentLocked(
     //    skills short-circuit via `_skillAlreadyOnDisk`). This is the atomicity guarantee called
     //    out in the file header.
     const skillList = Array.isArray((detail.agent_json as Record<string, unknown>).skill_list)
-      ? ((detail.agent_json as Record<string, unknown>).skill_list as unknown[]).filter((x): x is string => typeof x === 'string')
+      ? ((detail.agent_json as Record<string, unknown>).skill_list as unknown[])
+        .map((x) => (typeof x === 'string' ? x.trim() : ''))
+        .filter((x): x is string => x.length > 0)
       : [];
+    const depSkillNames = _agentSkillDependencyDisplayNames(detail.agent_json, skillList);
     const missingSkillIds = skillList.filter((sid) => !_skillAlreadyOnDisk(sid));
     if (missingSkillIds.length > 0) {
       await Promise.all(missingSkillIds.map(async (sid) => {
-        let depSkillName = '';
+        let depSkillName = depSkillNames.get(sid) || '';
         try {
           // Direct hit on /skills/bundle for meta — avoids paging /skills/list (O(catalog) lookup
           // that breaks once the catalog grows past 500 skills).
-          const meta = await postJson<{ bundle_url: string; version: string; category: string; published_at: number; updated_at?: number; name?: string }>(
+          const meta = await postJson<{ bundle_url: string; version: string; category: string; published_at: number; updated_at?: number; name?: string; status?: string; state?: string }>(
             '/marketplace/skills/bundle', { id: sid },
           );
-          depSkillName = meta.name || '';
+          depSkillName = meta.name || depSkillName;
+          _assertApprovedDependencySkill(sid, depSkillName, meta);
           await installMarketplaceSkill(sid, {
             version: meta.version,
             published_at: meta.published_at,
@@ -583,7 +721,7 @@ async function _installMarketplaceAgentLocked(
           }, { force: opts.force === true, name: depSkillName });
           log.info(`  dep-installed skill ${sid}`);
         } catch (err) {
-          throw _wrapMarketplaceInstallError('skill', sid, depSkillName, err);
+          throw _wrapMarketplaceInstallError('skill', sid, depSkillName || sid, err);
         }
       }));
     }
@@ -600,6 +738,7 @@ async function _installMarketplaceAgentLocked(
     if (!preReport.ok && opts.force !== true) {
       throw _qualityInstallError('agent', agentId, preReport);
     }
+    const privateSkillsZip = await _fetchAgentPrivateSkillsBundle(agentId, detail.agent_skills_bundle_url || '');
 
     // 3. Now materialize the agent: cache content → `<uid>/local/marketplace/agents/<id>/`.
     //    `_install.json` is a version pin read by `marketplace_reconcile.ts::_agentNeedsPull`
@@ -610,11 +749,17 @@ async function _installMarketplaceAgentLocked(
     await fsp.mkdir(target, { recursive: true });
     const agentJsonFile = path.join(target, 'agent.json');
     await fsp.writeFile(agentJsonFile, JSON.stringify(detail.agent_json, null, 2), 'utf8');
+    if (privateSkillsZip) {
+      const privateSkillsDir = userMarketplaceAgentSkillsDir(getActiveUserId(), agentId);
+      await fsp.mkdir(privateSkillsDir, { recursive: true });
+      extractBundleSafely(new AdmZip(privateSkillsZip), privateSkillsDir);
+    }
     // `_install.json` stores everything the in-app UI needs without re-hitting the network:
     // version/freshness timestamp for reconcile; create_uid for the author badge on the
     // agent detail page; `content_sha` for the dev-mode local-edit guard in
     // `marketplace_reconcile._agentNeedsPull` (see that function's header).
     const installContentSha = sha256OfFile(agentJsonFile);
+    const installTreeHash = marketplaceContentTreeHash(target);
     const installedAt = Date.now();
     await fsp.writeFile(path.join(target, '_install.json'),
       JSON.stringify({
@@ -622,12 +767,14 @@ async function _installMarketplaceAgentLocked(
         published_at: detail.published_at,
         ...(typeof detail.updated_at === 'number' ? { updated_at: detail.updated_at } : {}),
         agent_json_url: detail.agent_json_url,
+        agent_skills_bundle_url: detail.agent_skills_bundle_url || '',
         installed_at: installedAt,
         create_uid: detail.create_uid || '',
         ...(typeof detail.default_install === 'boolean' ? { default_install: detail.default_install } : {}),
         ...(typeof detail.is_open_source === 'boolean' ? { is_open_source: detail.is_open_source } : {}),
         ...(detail.status ? { status: detail.status } : {}),
         ...(installContentSha ? { content_sha: installContentSha } : {}),
+        ...(installTreeHash ? { content_tree_hash: installTreeHash } : {}),
       }, null, 2), 'utf8');
     await touchCacheEntry('agent', agentId);
 
@@ -636,10 +783,12 @@ async function _installMarketplaceAgentLocked(
       id: agentId, version: detail.version, published_at: detail.published_at,
       ...(typeof detail.updated_at === 'number' ? { updated_at: detail.updated_at } : {}),
       agent_json_url: detail.agent_json_url, create_uid: detail.create_uid || '',
+      agent_skills_bundle_url: detail.agent_skills_bundle_url || '',
       installed_at: installedAt,
       ...(typeof detail.default_install === 'boolean' ? { default_install: detail.default_install } : {}),
       ...(detail.status ? { status: detail.status } : {}),
     });
+    invalidateCoreAgentSkills();
     log.info('installed marketplace agent', { agentId, version: detail.version, target: logPathRef(target) });
 
     return { ok: true, id: agentId };
@@ -709,6 +858,7 @@ async function _installMarketplaceSkillLocked(
     }
 
     const skillContentSha = sha256OfFile(path.join(target, 'SKILL.md'));
+    const skillTreeHash = marketplaceContentTreeHash(target);
     const installedAt = Date.now();
     await fsp.writeFile(path.join(target, '_install.json'),
       JSON.stringify({
@@ -722,6 +872,7 @@ async function _installMarketplaceSkillLocked(
         ...(typeof detail.is_open_source === 'boolean' ? { is_open_source: detail.is_open_source } : {}),
         ...(detail.status ? { status: detail.status } : {}),
         ...(skillContentSha ? { content_sha: skillContentSha } : {}),
+        ...(skillTreeHash ? { content_tree_hash: skillTreeHash } : {}),
       }, null, 2), 'utf8');
     await touchCacheEntry('skill', skillId);
     invalidateCoreAgentSkills();
@@ -803,7 +954,9 @@ async function _seedAgentSkillDependencies(
   );
   if (!shouldContinue()) return { seeded: 0, blocked: true };
   const skillList = Array.isArray(detail.agent_json?.skill_list)
-    ? (detail.agent_json.skill_list as unknown[]).filter((x): x is string => typeof x === 'string' && x.trim() !== '')
+    ? (detail.agent_json.skill_list as unknown[])
+      .map((x) => (typeof x === 'string' ? x.trim() : ''))
+      .filter((x): x is string => x.length > 0)
     : [];
   let seeded = 0;
   for (const sid of skillList) {
@@ -814,9 +967,10 @@ async function _seedAgentSkillDependencies(
       return { seeded, blocked: true };
     }
     try {
-      const meta = await postJson<{ bundle_url: string; version: string; published_at: number; updated_at?: number; create_uid?: string; default_install?: boolean; status?: string; state?: string }>(
+      const meta = await postJson<{ bundle_url: string; version: string; published_at: number; updated_at?: number; create_uid?: string; default_install?: boolean; status?: string; state?: string; name?: string }>(
         '/marketplace/skills/bundle', { id: sid },
       );
+      _assertApprovedDependencySkill(sid, meta.name || sid, meta);
       if (!shouldContinue()) return { seeded, blocked: true };
       await addSkillInstall(uid, {
         id: sid,
@@ -964,7 +1118,7 @@ export async function ensureDefaultInstalls(
       return { seeded_agents: 0, seeded_skills: 0, skipped: true };
     }
     const data = await postJson<{
-      agents: { id: string; version: string; published_at: number; updated_at?: number; agent_json_url: string; create_uid?: string; status?: string; state?: string }[];
+      agents: { id: string; version: string; published_at: number; updated_at?: number; agent_json_url: string; agent_skills_bundle_url?: string; create_uid?: string; status?: string; state?: string }[];
       skills: { id: string; version: string; published_at: number; updated_at?: number; bundle_url: string; create_uid?: string; status?: string; state?: string }[];
     }>('/marketplace/defaults', {});
     if (!canContinue()) return { seeded_agents: 0, seeded_skills: 0 };
@@ -989,6 +1143,7 @@ export async function ensureDefaultInstalls(
           published_at: a.published_at || 0,
           ...(typeof a.updated_at === 'number' ? { updated_at: a.updated_at } : {}),
           agent_json_url: a.agent_json_url || '',
+          agent_skills_bundle_url: a.agent_skills_bundle_url || '',
           create_uid: a.create_uid || '',
           ...((a.status || a.state) ? { status: a.status || a.state } : {}),
           default_install: true,

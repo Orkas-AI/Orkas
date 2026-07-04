@@ -182,12 +182,19 @@ async function ensureProjectFilesDir(userId: string, projectId: string): Promise
 }
 
 function _notifyDirty(projectId: string): void {
-  void projectId;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
+    sync?.markDirty?.('projects', `cloud/projects/${projectId}/files`);
+  } catch { /* features/sync stripped */ }
 }
 
 function _notifyDeleted(projectId: string, relPath: string): void {
-  void projectId;
-  void relPath;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = null as { markDeleted?: (relPath: string) => Promise<void> | void };
+    void sync?.markDeleted?.(`cloud/projects/${projectId}/files/${relPath}`);
+  } catch { /* features/sync stripped */ }
 }
 
 function infoFor(absPath: string, root?: string): ProjectFileInfo | null {

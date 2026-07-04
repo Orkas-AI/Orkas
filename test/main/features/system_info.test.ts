@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { desktopPlatform } from '../../../src/main/system_info';
 
-describe('main/system_info > desktopPlatform', () => {
+describe('main/system_info › desktopPlatform', () => {
   it('normalizes desktop platform keys', () => {
     expect(desktopPlatform('darwin')).toBe('mac');
     expect(desktopPlatform('MacOS')).toBe('mac');

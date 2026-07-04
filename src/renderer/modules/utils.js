@@ -90,6 +90,7 @@ function _safeHref(url) {
 // in the real renderer.
 let _sanitizeHookInstalled = false;
 let _sanitizeMissingWarned = false;
+let _sanitizeSvgIconMissingWarned = false;
 function _domPurify() {
   if (typeof window !== 'undefined' && window.DOMPurify) return window.DOMPurify;
   if (typeof DOMPurify !== 'undefined') return DOMPurify; // eslint-disable-line no-undef
@@ -115,6 +116,25 @@ function sanitizeHtml(html) {
     _sanitizeHookInstalled = true;
   }
   return DP.sanitize(s, { ADD_ATTR: ['target'], ALLOWED_URI_REGEXP: _SAFE_URI_RE });
+}
+
+function sanitizeSvgIconHtml(svg) {
+  const dirty = (svg === null || svg === undefined) ? '' : String(svg).trim();
+  if (!dirty || !/^<svg(?:\s|>)/i.test(dirty)) return '';
+  const DP = _domPurify();
+  if (!DP || typeof DP.sanitize !== 'function') {
+    if (typeof window !== 'undefined' && !_sanitizeSvgIconMissingWarned) {
+      _sanitizeSvgIconMissingWarned = true;
+      try { console.error('[security] DOMPurify unavailable — connector SVG icons disabled'); } catch (_) {}
+    }
+    return '';
+  }
+  const clean = String(DP.sanitize(dirty, {
+    USE_PROFILES: { svg: true, svgFilters: true },
+    ALLOWED_URI_REGEXP: _SAFE_URI_RE,
+    FORBID_TAGS: ['a', 'embed', 'foreignObject', 'foreignobject', 'iframe', 'image', 'object', 'script', 'style'],
+  }) || '').trim();
+  return /^<svg(?:\s|>)/i.test(clean) ? clean : '';
 }
 
 function normalizeCatalogSource(source) {
@@ -168,10 +188,14 @@ function renderMarkdownFull(md) {
     return `\x00BLOCK${idx}\x00`;
   };
 
-  // Code blocks
-  md = md.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) =>
-    protect(`<pre><code>${escapeHtml(code.replace(/\n$/, ''))}</code></pre>`)
-  );
+  // Code blocks. Some models wrap a dashboard spec in ```json instead of the
+  // `:::dashboard` directive; render only high-confidence dashboard-shaped JSON
+  // and keep all other fenced code verbatim.
+  md = md.replace(/```([^\n`]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    const dashboard = _renderDashboardFromJsonBlock(lang, code);
+    if (dashboard) return protect(dashboard);
+    return protect(`<pre><code>${escapeHtml(code.replace(/\n$/, ''))}</code></pre>`);
+  });
 
   // :::chart-bar directives
   md = md.replace(/:::chart-bar\s*\n([\s\S]*?)\n\s*:::/g, (_, body) => {
@@ -189,10 +213,16 @@ function renderMarkdownFull(md) {
   // falls back to a code-view block so the user sees the raw body instead of
   // a silently-dropped section.
   md = md.replace(/:::dashboard\s*\n([\s\S]*?)\n\s*:::/g, (_, body) => {
+    const placeholder = _protectedDashboardPlaceholder(body, protectedBlocks);
+    if (placeholder) return placeholder;
     const spec = _parseDashboardSpec(body);
     if (spec !== undefined) return protect(renderDashboard(spec));
     return protect(`<pre class="code-view dashboard-parse-error"><code>${escapeHtml(body.trim())}</code></pre>`);
   });
+
+  // Last-chance recovery for final answers that contain a dashboard JSON block
+  // directly in prose (no :::dashboard fence, no ```json fence).
+  md = _replaceStandaloneDashboardJsonBlocks(md, protect);
 
   // Math blocks — protect so markdown phase 2 (emphasis, autolinking, html
   // escapes) doesn't mangle LaTeX before MathJax sees it. Order matters:
@@ -462,6 +492,12 @@ const _DB_GAP = { sm: 'sm', md: 'md', lg: 'lg' };
 const _DB_TONE = { positive: 'positive', negative: 'negative', neutral: 'neutral', warning: 'warning' };
 const _DB_LEVEL = { info: 'info', success: 'success', warning: 'warning', error: 'error' };
 const _DB_CHART_KIND = { line: 'line', bar: 'bar', area: 'area', pie: 'pie' };
+const _DB_COMPONENT_TYPES = {
+  Stack: true, Grid: true, Card: true, Separator: true,
+  Metric: true, Chart: true, Table: true, Alert: true, Timeline: true,
+  Code: true, Markdown: true, Image: true,
+};
+const _DB_JSON_FENCE_LANGS = { '': true, json: true, dashboard: true, jsonc: true };
 
 function _dbEnum(table, val, dflt) {
   return (val && Object.prototype.hasOwnProperty.call(table, val)) ? table[val] : dflt;
@@ -469,6 +505,128 @@ function _dbEnum(table, val, dflt) {
 
 function _tryParseDashboardJson(text) {
   try { return JSON.parse(text); } catch (_) { return undefined; }
+}
+
+function _dashboardFenceLang(lang) {
+  return String(lang || '').trim().split(/\s+/)[0].toLowerCase();
+}
+
+function _isDashboardJsonFenceLang(lang) {
+  const key = _dashboardFenceLang(lang);
+  return Object.prototype.hasOwnProperty.call(_DB_JSON_FENCE_LANGS, key);
+}
+
+function _dashboardJsonFenceCandidate(lang, code) {
+  const rawLang = String(lang || '');
+  const rawCode = String(code == null ? '' : code);
+  if (_isDashboardJsonFenceLang(rawLang)) return rawCode;
+
+  const info = rawLang.trimStart();
+  const namedInline = info.match(/^(jsonc?|dashboard)\b([\s\S]*)$/i);
+  if (namedInline) {
+    const inline = String(namedInline[2] || '').trimStart();
+    if (inline.startsWith('{') || inline.startsWith('[')) {
+      return inline + (rawCode ? `\n${rawCode}` : '');
+    }
+  }
+  if (info.startsWith('{') || info.startsWith('[')) {
+    return info + (rawCode ? `\n${rawCode}` : '');
+  }
+  return null;
+}
+
+function _unwrapDashboardSpecBody(body) {
+  const text = String(body == null ? '' : body).trim();
+  if (!text) return '';
+  const fenced = text.match(/^(```|~~~)([^\n`]*)\n([\s\S]*?)\n?\1\s*$/);
+  if (fenced && _isDashboardJsonFenceLang(fenced[2])) return fenced[3].trim();
+  return text;
+}
+
+function _isDashboardNode(node) {
+  return !!(
+    node && typeof node === 'object' && !Array.isArray(node)
+    && typeof node.type === 'string'
+    && Object.prototype.hasOwnProperty.call(_DB_COMPONENT_TYPES, node.type)
+  );
+}
+
+function _looksLikeDashboardSpec(spec) {
+  if (!spec || typeof spec !== 'object' || Array.isArray(spec)) return false;
+  const hasRoot = Object.prototype.hasOwnProperty.call(spec, 'root');
+  if (!hasRoot) return false;
+  if (spec.root == null) return spec.schema_version != null;
+  return _isDashboardNode(spec.root);
+}
+
+function _renderDashboardFromJsonBlock(lang, code) {
+  const body = _dashboardJsonFenceCandidate(lang, code);
+  if (body == null) return '';
+  const spec = _parseDashboardSpec(body);
+  if (!_looksLikeDashboardSpec(spec)) return '';
+  return renderDashboard(spec);
+}
+
+function _protectedDashboardPlaceholder(body, protectedBlocks) {
+  const m = String(body || '').trim().match(/^\x00BLOCK(\d+)\x00$/);
+  if (!m) return '';
+  const html = protectedBlocks[Number(m[1])] || '';
+  return /^<div class="dashboard"(?:\s|>)/.test(html) ? m[0] : '';
+}
+
+function _findJsonRootEnd(text, start) {
+  let inString = false;
+  let escaped = false;
+  let opened = false;
+  const stack = [];
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; continue; }
+    if (c === '{' || c === '[') { stack.push(c); opened = true; continue; }
+    if (c === '}' || c === ']') {
+      if (!stack.length) return -1;
+      const open = stack.pop();
+      if ((open === '{' && c !== '}') || (open === '[' && c !== ']')) return -1;
+      if (opened && stack.length === 0) return i + 1;
+    }
+  }
+  return -1;
+}
+
+function _replaceStandaloneDashboardJsonBlocks(md, protect) {
+  const text = String(md || '');
+  if (text.indexOf('"root"') < 0 || text.indexOf('{') < 0) return text;
+  const startRe = /(^|\n)([ \t]*)\{/g;
+  let out = '';
+  let cursor = 0;
+  let m;
+  while ((m = startRe.exec(text)) !== null) {
+    const start = m.index + m[1].length + m[2].length;
+    if (start < cursor) continue;
+    const end = _findJsonRootEnd(text, start);
+    if (end < 0) continue;
+    const tail = text.slice(end);
+    if (!/^[ \t]*(?:\r?\n|$)/.test(tail)) {
+      startRe.lastIndex = start + 1;
+      continue;
+    }
+    const candidate = text.slice(start, end);
+    const spec = _parseDashboardSpec(candidate);
+    if (!_looksLikeDashboardSpec(spec)) {
+      startRe.lastIndex = start + 1;
+      continue;
+    }
+    out += text.slice(cursor, start) + protect(renderDashboard(spec));
+    cursor = end;
+    startRe.lastIndex = end;
+  }
+  return out + text.slice(cursor);
 }
 
 function _escapeLikelyUnescapedStringQuotes(text) {
@@ -549,36 +707,156 @@ function _repairDashboardJsonTail(text) {
   return undefined;
 }
 
+function _repairDashboardJsonMismatchedClosers(text) {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  let changed = false;
+  const stack = [];
+  const closeFor = (c) => (c === '{' ? '}' : ']');
+
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      out += c;
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { out += c; inString = true; continue; }
+    if (c === '{' || c === '[') { out += c; stack.push(closeFor(c)); continue; }
+    if (c === '}' || c === ']') {
+      if (stack[stack.length - 1] === c) {
+        stack.pop();
+        out += c;
+        continue;
+      }
+      const parentIdx = stack.lastIndexOf(c);
+      if (parentIdx >= 0) {
+        while (stack.length - 1 > parentIdx) {
+          out += stack.pop();
+          changed = true;
+        }
+        stack.pop();
+      }
+      out += c;
+      continue;
+    }
+    out += c;
+  }
+  return changed ? out : text;
+}
+
+function _nextNonWhitespaceChar(text, pos) {
+  let i = pos + 1;
+  while (i < text.length && /\s/.test(text[i])) i++;
+  return text[i] || '';
+}
+
+function _repairDashboardJsonExtraClosers(text) {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  let changed = false;
+  const stack = [];
+  const closeFor = (c) => (c === '{' ? '}' : ']');
+
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      out += c;
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { out += c; inString = true; continue; }
+    if (c === '{' || c === '[') { out += c; stack.push(closeFor(c)); continue; }
+    if (c === '}' || c === ']') {
+      if (stack[stack.length - 1] === c) {
+        stack.pop();
+        out += c;
+        continue;
+      }
+      // Common model slip inside children/rows arrays: it closes a sibling
+      // node one brace too far (`] } } }, { "type": ...`). If the next real
+      // token is a comma, the array/object is still continuing, so this closer
+      // is extra rather than a missing-inner-closer case.
+      const next = _nextNonWhitespaceChar(text, i);
+      if (stack.length && (next === ',' || next === stack[stack.length - 1])) {
+        changed = true;
+        continue;
+      }
+      if (!stack.includes(c)) {
+        changed = true;
+        continue;
+      }
+    }
+    out += c;
+  }
+  return changed ? out : text;
+}
+
+function _tryDashboardRepairVariants(text) {
+  const strict = _tryParseDashboardJson(text);
+  if (strict !== undefined) return strict;
+
+  const extraCloserRepaired = _repairDashboardJsonExtraClosers(text);
+  if (extraCloserRepaired !== text) {
+    const parsed = _tryParseDashboardJson(extraCloserRepaired);
+    if (parsed !== undefined) return parsed;
+    const mismatchAfterExtra = _repairDashboardJsonMismatchedClosers(extraCloserRepaired);
+    if (mismatchAfterExtra !== extraCloserRepaired) {
+      const afterMismatch = _tryParseDashboardJson(mismatchAfterExtra);
+      if (afterMismatch !== undefined) return afterMismatch;
+      const tailAfterMismatch = _repairDashboardJsonTail(mismatchAfterExtra);
+      if (tailAfterMismatch !== undefined) return tailAfterMismatch;
+    }
+    const tailAfterExtra = _repairDashboardJsonTail(extraCloserRepaired);
+    if (tailAfterExtra !== undefined) return tailAfterExtra;
+  }
+
+  const mismatchRepaired = _repairDashboardJsonMismatchedClosers(text);
+  if (mismatchRepaired !== text) {
+    const parsed = _tryParseDashboardJson(mismatchRepaired);
+    if (parsed !== undefined) return parsed;
+    const tailAfterMismatch = _repairDashboardJsonTail(mismatchRepaired);
+    if (tailAfterMismatch !== undefined) return tailAfterMismatch;
+  }
+
+  return _repairDashboardJsonTail(text);
+}
+
 // Tolerant parse for a `:::dashboard` JSON body. LLMs (DeepSeek especially,
 // when hand-writing a deeply-nested tree) reliably produce small JSON defects:
 // unescaped double quotes inside string values, a single extra `}` after the
-// root close, trailing prose, or a truncated tail with closers missing. Strict
+// root close, trailing prose, a truncated tail with closers missing, or a child
+// object missing its close before the parent array/object closes. Strict
 // `JSON.parse` rejects all of these and the whole dashboard collapses to a raw
 // code-view block. We retry with bounded repairs before giving up:
 //   1. escape likely-unescaped `"` characters inside string values
-//   2. drop trailing garbage after the root value's balanced close
+//   2. insert missing child closers immediately before a matching parent close
+//   3. drop trailing garbage after the root value's balanced close
 //      (the common "one extra }" / trailing-prose case)
-//   3. append the missing closers for an unclosed (truncated) tree
+//   4. append the missing closers for an unclosed (truncated) tree
 // Returns the parsed spec, or `undefined` if nothing parses — the caller then
 // shows the parse-error fallback so the raw body is never silently dropped.
 // The scan is string-aware: brackets inside string values (e.g. an Alert body
 // containing `}`) never shift the depth count, and we never trim leading
 // garbage (over-repair risk) — only the trailing tail is dropped.
 function _parseDashboardSpec(body) {
-  const text = String(body == null ? '' : body).trim();
+  const text = _unwrapDashboardSpecBody(body);
   if (!text) return undefined;
-  const strict = _tryParseDashboardJson(text);
-  if (strict !== undefined) return strict;
+  const repaired = _tryDashboardRepairVariants(text);
+  if (repaired !== undefined) return repaired;
 
   const quoteRepaired = _escapeLikelyUnescapedStringQuotes(text);
   if (quoteRepaired !== text) {
-    const parsed = _tryParseDashboardJson(quoteRepaired);
+    const parsed = _tryDashboardRepairVariants(quoteRepaired);
     if (parsed !== undefined) return parsed;
   }
-
-  const tailRepaired = _repairDashboardJsonTail(text);
-  if (tailRepaired !== undefined) return tailRepaired;
-  return quoteRepaired !== text ? _repairDashboardJsonTail(quoteRepaired) : undefined;
+  return undefined;
 }
 
 function renderDashboard(spec) {
@@ -831,19 +1109,87 @@ function _dbXyChart(kind, data) {
   </div>`;
 }
 
-// Detect video src by extension. Dispatches markdown ![](src) to <video>
-// instead of <img> — covers chat-media://local/...mp4, https://..../clip.webm,
-// and any user-authored markdown pointing at a video file. The match is
+// Detect playable media src by extension. Dispatches markdown ![](src) /
+// [text](src) to a native player for video/audio instead of a generic link
+// — covers chat-media://local/...mp4, https://..../clip.webm, local .mp3
+// outputs, and user-authored markdown pointing at a media file. The match is
 // against the last extension-looking segment so query strings / fragments
 // don't defeat it.
 const _VIDEO_EXT_RE = /\.(mp4|webm|mov|m4v|ogv)(?:[?#].*)?$/i;
+const _AUDIO_EXT_RE = /\.(mp3|wav|ogg|opus|m4a|aac|flac)(?:[?#].*)?$/i;
 function _isVideoSrc(src) {
   return _VIDEO_EXT_RE.test(String(src || ''));
+}
+function _isAudioSrc(src) {
+  return _AUDIO_EXT_RE.test(String(src || ''));
+}
+
+function _chatMediaLocalPathFromUrl(src) {
+  const raw = String(src || '').trim();
+  if (!raw) return '';
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== 'chat-media:' || u.hostname.toLowerCase() !== 'local') return '';
+    const decoded = decodeURIComponent(u.pathname || '');
+    if (/^\/[A-Za-z]:[\\/]/.test(decoded)) return decoded.slice(1);
+    return decoded;
+  } catch (_) {
+    return '';
+  }
+}
+
+function _markdownVideoOpenFloatingLabel() {
+  const key = 'chat.video_open_floating_title';
+  try {
+    if (typeof t === 'function') {
+      const val = t(key);
+      if (val && val !== key) return val;
+    }
+  } catch (_) { /* fall through */ }
+  return 'Fullscreen';
+}
+
+function _markdownVideoOpenIconHtml() {
+  if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
+    return window.uiIconHtml('maximize', 'ui-icon chat-md-video-float-svg');
+  }
+  return '';
 }
 
 function _markdownVideoHtml(src, label, title) {
   const t = title ? ` title="${escapeHtml(title)}"` : '';
-  return `<video class="chat-md-video" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${escapeHtml(src)}"${t} aria-label="${escapeHtml(label || 'video')}"></video>`;
+  const localPath = _chatMediaLocalPathFromUrl(src);
+  const openLabel = _markdownVideoOpenFloatingLabel();
+  const openButton = localPath
+    ? `<button type="button" class="chat-md-video-float" data-chat-md-video-open="1" data-video-src="${escapeHtml(src)}" aria-label="${escapeHtml(openLabel)}" title="${escapeHtml(openLabel)}">${_markdownVideoOpenIconHtml()}</button>`
+    : '';
+  return `<span class="chat-md-video-shell"><video class="chat-md-video" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${escapeHtml(src)}"${t} aria-label="${escapeHtml(label || 'video')}"></video>${openButton}</span>`;
+}
+
+function _markdownMediaLabel(src, label, fallback) {
+  const explicit = String(label || '').trim();
+  if (explicit) return explicit;
+  const clean = String(src || '').split(/[?#]/)[0];
+  const base = clean.split('/').filter(Boolean).pop() || '';
+  try { return decodeURIComponent(base) || fallback; }
+  catch (_) { return base || fallback; }
+}
+
+function _markdownAudioIconHtml(label) {
+  if (typeof window !== 'undefined' && typeof window.fileKindIconHtml === 'function') {
+    return window.fileKindIconHtml(label || 'audio.mp3', 'audio');
+  }
+  return '<svg class="chat-file-kind-icon is-audio" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18V6l9-2v12"></path><circle cx="6.5" cy="18" r="2.5"></circle><circle cx="15.5" cy="16" r="2.5"></circle></svg>';
+}
+
+function _markdownAudioHtml(src, label, title) {
+  const t = title ? ` title="${escapeHtml(title)}"` : '';
+  const name = _markdownMediaLabel(src, label, 'audio');
+  return `<span class="chat-md-audio-card"${t} role="group" aria-label="${escapeHtml(name)}">
+    <span class="chat-md-audio-icon">${_markdownAudioIconHtml(name)}</span>
+    <span class="chat-md-audio-name">${escapeHtml(name)}</span>
+    <audio class="chat-md-audio" controls controlslist="nodownload noremoteplayback" preload="metadata" src="${escapeHtml(src)}" aria-label="${escapeHtml(name)}"></audio>
+  </span>`;
 }
 
 function _markdownImageHtml(src, alt, title) {
@@ -943,6 +1289,28 @@ if (typeof document !== 'undefined') document.addEventListener('error', (e) => {
   }
 }, true);
 
+if (typeof document !== 'undefined') document.addEventListener('click', (e) => {
+  const target = e.target;
+  const btn = target && target.closest ? target.closest('[data-chat-md-video-open="1"]') : null;
+  if (!btn) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const src = btn.getAttribute('data-video-src') || '';
+  const absPath = _chatMediaLocalPathFromUrl(src);
+  if (!absPath || typeof openChatFileViewer !== 'function') return;
+  const name = absPath.split(/[\\/]/).pop() || 'video';
+  const shell = btn.closest('.chat-md-video-shell');
+  const video = shell && shell.querySelector ? shell.querySelector('video.chat-md-video') : null;
+  const startTime = video && Number.isFinite(Number(video.currentTime)) ? Math.max(0, Number(video.currentTime) || 0) : 0;
+  try { if (video && typeof video.pause === 'function') video.pause(); } catch (_) {}
+  try { if (window.Monitor) (() => {})('chat_md_video_floating_open'); } catch (_) {}
+  if (typeof openChatVideoUrlViewer === 'function') {
+    openChatVideoUrlViewer(src, name, { autoplay: true, startTime });
+    return;
+  }
+  openChatFileViewer(absPath, name, { autoplay: true, startTime });
+}, true);
+
 // Bare URL autolink termination set. URLs per RFC 3986 are ASCII; CJK
 // ideographs / kana / hangul / CJK punctuation never appear in a real URL
 // (IRIs encode the host as punycode and the path as percent-encoded UTF-8).
@@ -1005,12 +1373,14 @@ function inlineFormat(text) {
           // controls visible so user can play/seek.
           return _markdownVideoHtml(src, alt, title);
         }
+        if (_isAudioSrc(src)) return _markdownAudioHtml(src, alt, title);
         return _markdownImageHtml(src, alt, title);
       })
     // Markdown links: [text](url "title")
     .replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g,
       (_, txt, url, title) => {
         if (_isVideoSrc(url)) return _markdownVideoHtml(url, txt, title);
+        if (_isAudioSrc(url)) return _markdownAudioHtml(url, txt, title);
         // href: scheme-checked + escaped (blocks javascript:/data: and quote
         // breakout). text stays raw so nested image/emphasis still render;
         // DOMPurify scrubs any raw HTML in the text at the output layer.
@@ -1398,8 +1768,11 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     inlineFormat,
     _markdownImageHtml,
     _markdownVideoHtml,
+    _markdownAudioHtml,
+    _chatMediaLocalPathFromUrl,
     escapeHtml,
     sanitizeHtml,
+    sanitizeSvgIconHtml,
     _safeHref,
     _SAFE_URI_RE,
     renderMarkdown,

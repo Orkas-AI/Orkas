@@ -36,6 +36,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { createLogger } from '../../logger';
+import { logPathRef, maskId } from '../../util/log-redact';
 import { listSkillsForBridge, type BridgeSkillRow } from '../../model/core-agent/skill-registry';
 import { readDisabledSets } from '../component_enabled';
 import { createKbTools } from '../../model/core-agent/kb-tools';
@@ -46,6 +47,18 @@ const log = createLogger('local-agents:bridge');
 
 const MAX_LINE_BYTES = 1024 * 1024;
 const CONNECTOR_RESULT_CAP = 100_000;
+
+function bridgeLogContext(opts: Pick<StartBridgeOpts, 'uid' | 'cid' | 'agentId' | 'projectId' | 'runId' | 'configDir'>, socketPath?: string): Record<string, unknown> {
+  return {
+    run_id: maskId(opts.runId),
+    user_id: maskId(opts.uid),
+    cid: maskId(opts.cid),
+    agent_id: maskId(opts.agentId),
+    project_id: maskId(opts.projectId),
+    config_dir: logPathRef(opts.configDir),
+    socket: socketPath ? logPathRef(socketPath) : undefined,
+  };
+}
 
 export interface BridgeHandle {
   socketPath: string;
@@ -231,7 +244,7 @@ export async function startBridge(opts: StartBridgeOpts): Promise<BridgeHandle> 
     if (!reqTokenBuf
       || reqTokenBuf.length !== tokenBuf.length
       || !crypto.timingSafeEqual(reqTokenBuf, tokenBuf)) {
-      log.warn('bridge auth failure — destroying connection', { runId: opts.runId });
+      log.warn('bridge auth failure — destroying connection', bridgeLogContext(opts, socketPath));
       socket.destroy();
       return;
     }
@@ -296,7 +309,11 @@ export async function startBridge(opts: StartBridgeOpts): Promise<BridgeHandle> 
   }
   fs.writeFileSync(mcpConfigPath, JSON.stringify(mcpConfig, null, 2), { mode: 0o600 });
 
-  log.info('bridge started', { runId: opts.runId, socketPath });
+  log.info('bridge started', {
+    ...bridgeLogContext(opts, socketPath),
+    mcp_config: logPathRef(mcpConfigPath),
+    env_file: logPathRef(serverEnvFilePath),
+  });
 
   return {
     socketPath,
@@ -311,7 +328,7 @@ export async function startBridge(opts: StartBridgeOpts): Promise<BridgeHandle> 
         try { fs.unlinkSync(socketPath); } catch { /* gone */ }
       }
       try { fs.unlinkSync(serverEnvFilePath); } catch { /* gone */ }
-      log.info('bridge closed', { runId: opts.runId });
+      log.info('bridge closed', bridgeLogContext(opts, socketPath));
     },
   };
 }

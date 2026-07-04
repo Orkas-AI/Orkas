@@ -349,6 +349,14 @@ describe('buildReviewPrompt', () => {
     expect(prompt).toMatch(/✗.*✓/s);
   });
 
+  it('directs metacognition writes to use the host-provided UI language', () => {
+    const prompt = buildReviewPrompt('', '', '', 'Chinese (简体中文)');
+    expect(prompt).toContain('Language');
+    expect(prompt).toContain('Chinese (简体中文)');
+    expect(prompt).toMatch(/translate or summarize/i);
+    expect(prompt).toMatch(/proper nouns, commands, file paths/i);
+  });
+
   it('overrides skill_manage tool\'s "confirm with user" default for reflection', () => {
     // skill_manage tool description says "Confirm with user before creating
     // or deleting" — written for live turns. Without an explicit override

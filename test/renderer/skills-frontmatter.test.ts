@@ -132,6 +132,58 @@ describe('skills renderer frontmatter parsing', () => {
     expect(msgEl.textContent).toBe('skills.saving');
   });
 
+  it('tracks URL skill creation success', async () => {
+    const context = loadSkillRendererHelpers();
+    const monitorCalls: any[] = [];
+    const calls: string[] = [];
+    let now = 100;
+    const msgEl = { textContent: '', className: '' };
+    context.__calls = calls;
+    context.performance = { now: () => { now += 25; return now; } };
+    context.window.Monitor = {
+      click: (action: string, payload: any) => monitorCalls.push(['click', action, payload]),
+      event: (action: string, payload: any) => monitorCalls.push(['event', action, payload]),
+      error: (action: string, payload: any) => monitorCalls.push(['error', action, payload]),
+    };
+    context.apiFetch = async (url: string, opts: any) => {
+      calls.push(`api:${url}:${opts?.method || 'GET'}`);
+      return {
+        json: async () => ({
+          ok: true,
+          skill: { id: 'url-skill' },
+        }),
+      };
+    };
+    vm.runInContext(`
+      document = {
+        getElementById: () => ({ value: 'https://example.com/skill', focus() {} }),
+      };
+      _setSkillModalBusy = (busy) => { __calls.push('busy:' + busy); };
+      _waitForSkillModalBusyPaint = async () => { __calls.push('paint'); };
+      _afterSkillCreated = async (sid, isNew) => { __calls.push('after:' + sid + ':' + isNew); };
+    `, context);
+
+    await context._saveSkillFromUrl({ msgEl });
+
+    expect(monitorCalls).toEqual([
+      ['click', 'skill_create_submit', { creation_method: 'url' }],
+      ['event', 'skill_create_result', {
+        creation_method: 'url',
+        result: 'success',
+        duration_ms: 25,
+        skill_id: 'url-skill',
+        skill_count: 1,
+      }],
+    ]);
+    expect(calls).toEqual([
+      'busy:true',
+      'paint',
+      'api:/api/skills/create-from-url:POST',
+      'after:url-skill:true',
+      'busy:false',
+    ]);
+  });
+
   it('sends forced import auto-seed even when edit chat history is not empty', async () => {
     const context = loadSkillRendererHelpers();
     const calls: string[] = [];

@@ -53,4 +53,12 @@ describe('floating layer ordering', () => {
     expect(css).not.toMatch(/(^|[,\n]\s*)\.has-dot::after\s*\{/);
     expect(css).not.toMatch(/(^|[,\n]\s*)\.has-dot\.is-(red|orange)::after\b/);
   });
+
+  it('keeps primary disabled buttons visually disabled', () => {
+    const css = readRendererCss();
+    const primaryBlock = css.match(/\.btn-primary:disabled\s*\{[\s\S]*?\}/)?.[0] || '';
+
+    expect(primaryBlock).toContain('opacity: 0.6');
+    expect(primaryBlock).toContain('cursor: not-allowed');
+  });
 });

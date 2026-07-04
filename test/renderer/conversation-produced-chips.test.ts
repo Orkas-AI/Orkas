@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import * as vm from 'node:vm';
 
 const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation.js'), 'utf8');
+const styleSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
 
 function extractFunction(name: string): string {
   const marker = `function ${name}`;
@@ -47,6 +48,15 @@ function loadOrderProducedPaths(): (paths: string[]) => Array<{ path: string; ba
 }
 
 describe('conversation produced chips', () => {
+  it('keeps chat bubbles capped at 10 files and expands overflow in place', () => {
+    expect(source).toContain('const _PRODUCED_VISIBLE_LIMIT = 10;');
+    expect(source).toContain("row.classList.add('is-expanded')");
+    expect(source).not.toContain("window.ConversationInfo.openAndSetTab('files')");
+    expect(styleSource).toContain('.chat-msg-produced.is-expanded');
+    expect(styleSource).toContain('max-height: 240px;');
+    expect(styleSource).toContain('overflow-y: auto;');
+  });
+
   it('dedupes same-basename chips to the more specific final path', () => {
     const orderProducedPaths = loadOrderProducedPaths();
     const stale = '/Users/test/.orkas/userWorkSpace/task/projects/business_planning.md';

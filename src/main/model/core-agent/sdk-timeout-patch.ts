@@ -14,6 +14,7 @@
  * imports whose transitive loads may reach core-agent.
  */
 import { createLogger } from '../../logger';
+import { logErrorSummary } from '../../util/log-redact';
 
 const log = createLogger('sdk-timeout-patch');
 
@@ -26,12 +27,12 @@ export function installSdkTimeoutPatch(): void {
   try {
     patchSdk('@anthropic-ai/sdk');
   } catch (err) {
-    log.warn(`anthropic sdk patch failed: ${(err as Error).message}`);
+    log.warn('sdk patch failed', { module: '@anthropic-ai/sdk', error: logErrorSummary(err) });
   }
   try {
     patchSdk('openai');
   } catch (err) {
-    log.warn(`openai sdk patch failed: ${(err as Error).message}`);
+    log.warn('sdk patch failed', { module: 'openai', error: logErrorSummary(err) });
   }
 }
 
@@ -40,7 +41,7 @@ function patchSdk(moduleName: string): void {
   const mod = require(moduleName);
   const Original = mod.default;
   if (typeof Original !== 'function') {
-    log.warn(`${moduleName}: no default class to patch`);
+    log.warn('sdk patch skipped', { module: moduleName, reason: 'missing_default_class' });
     return;
   }
   if ((Original as any).__orkasPatched) return;
@@ -67,5 +68,5 @@ function patchSdk(moduleName: string): void {
       /* getter-only or frozen — skip */
     }
   }
-  log.info(`patched ${moduleName} default timeout → ${LLM_TIMEOUT_MS}ms`);
+  log.info('sdk timeout patched', { module: moduleName, timeout_ms: LLM_TIMEOUT_MS });
 }

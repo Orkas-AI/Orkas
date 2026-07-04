@@ -10,9 +10,10 @@
  */
 'use strict';
 
-const { execFileSync, execSync } = require('node:child_process');
+const { execSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const { verifyRuntimeRoot } = require('../bin/runtime-gate.cjs');
 
 const ARCH_NAMES = {
   0: 'ia32',
@@ -189,6 +190,7 @@ function verifyPackedNativePayload(nodeModules, targetPlatform, targetArch) {
   const sqlitePackage = targetSqliteVecPackage(targetPlatform, targetArch);
   const canvasPackage = targetCanvasPackage(targetPlatform, targetArch);
   const tokenizersPackage = targetTokenizersPackage(targetPlatform, targetArch);
+  const lock = readPackageLock();
   const verified = [];
 
   requireOnlyPackages(path.join(nodeModules, '@esbuild'), /^.+$/, [esbuildPackage]);
@@ -241,13 +243,29 @@ function verifyPackedNativePayload(nodeModules, targetPlatform, targetArch) {
     path.join(nodeModules, 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node'),
   );
 
-  verified.push(esbuildPackage, sqlitePackage, canvasPackage, tokenizersPackage, 'better-sqlite3');
+  verifyPackageVersion(nodeModules, lock, `@esbuild/${esbuildPackage}`, verified);
+  verifyPackageVersion(nodeModules, lock, sqlitePackage, verified);
+  verifyPackageVersion(nodeModules, lock, `@napi-rs/${canvasPackage}`, verified);
+  verifyPackageVersion(nodeModules, lock, `@anush008/${tokenizersPackage}`, verified);
+  verifyPackageVersion(nodeModules, lock, 'better-sqlite3', verified);
   for (const pkgDir of [
     path.join(nodeModules, 'onnxruntime-node'),
     path.join(nodeModules, 'fastembed', 'node_modules', 'onnxruntime-node'),
   ]) {
     verifyOnnxRuntimePackage(pkgDir, targetPlatform, targetArch, verified);
   }
+  verifyExistingPackageVersion(
+    path.join(nodeModules, 'onnxruntime-node'),
+    lock,
+    'node_modules/onnxruntime-node',
+    verified,
+  );
+  verifyExistingPackageVersion(
+    path.join(nodeModules, 'fastembed', 'node_modules', 'onnxruntime-node'),
+    lock,
+    'node_modules/fastembed/node_modules/onnxruntime-node',
+    verified,
+  );
 
   return verified.filter(Boolean);
 }
@@ -275,87 +293,85 @@ function readJsonFile(label, file) {
   }
 }
 
-function runtimeAsset(manifest, kind, platformKey) {
-  const spec = manifest[kind];
-  const asset = spec && spec.assets && spec.assets[platformKey];
-  if (!spec || !asset) {
-    throw new Error(`[native-deps-gate] missing runtime manifest entry for ${kind}/${platformKey}`);
+function packageLockPath() {
+  return path.join(__dirname, '..', 'package-lock.json');
+}
+
+function packageLockEntryPath(packageName) {
+  return `node_modules/${packageName}`;
+}
+
+function readPackageLock() {
+  return readJsonFile('package lock', packageLockPath());
+}
+
+function lockPackageVersion(lock, packageName, lockPath = packageLockEntryPath(packageName)) {
+  const version = lock.packages?.[lockPath]?.version;
+  if (!version) {
+    throw new Error(`[native-deps-gate] package-lock.json missing ${lockPath}`);
   }
-  return { spec, asset };
+  return version;
 }
 
-function markerMatches(marker, kind, platformKey, spec, asset) {
-  return marker
-    && marker.kind === kind
-    && marker.platformKey === platformKey
-    && marker.version === spec.version
-    && marker.asset === asset.name
-    && marker.sha256 === asset.sha256
-    && marker.size === asset.size;
+function packageNameFromLockPath(lockPath) {
+  const marker = 'node_modules/';
+  const index = lockPath.lastIndexOf(marker);
+  return index >= 0 ? lockPath.slice(index + marker.length) : lockPath;
 }
 
-function pythonVersionSuffix(spec) {
-  const m = /^(\d+)\.(\d+)/.exec(String(spec.version || ''));
-  return m ? `${m[1]}.${m[2]}` : '';
-}
-
-function verifyPythonPipShims(executable, targetPlatform, spec) {
-  const suffix = pythonVersionSuffix(spec);
-  const names = ['pip', 'pip3', ...(suffix ? [`pip${suffix}`] : [])];
-  const shimDir = targetPlatform === 'win32'
-    ? path.join(path.dirname(executable), 'Scripts')
-    : path.dirname(executable);
-  for (const name of names) {
-    requiredFile(
-      `python runtime ${name} shim`,
-      path.join(shimDir, targetPlatform === 'win32' ? `${name}.cmd` : name),
-    );
-  }
-}
-
-function requireOnlyRuntimeDirs(runtimeRoot, kind, allowedKey) {
-  const kindDir = path.join(runtimeRoot, kind);
-  if (!fs.existsSync(kindDir) || !fs.statSync(kindDir).isDirectory()) {
-    throw new Error(`[native-deps-gate] missing runtime ${kind} directory: ${kindDir}`);
-  }
-  for (const dirName of listDirs(kindDir)) {
-    if (dirName !== allowedKey) {
-      throw new Error(`[native-deps-gate] unexpected runtime ${kind} payload for target: ${path.join(kindDir, dirName)}`);
+function lockPackageVersionByName(lock, packageName) {
+  const versions = new Set();
+  for (const [lockPath, entry] of Object.entries(lock.packages || {})) {
+    if (packageNameFromLockPath(lockPath) === packageName && entry?.version) {
+      versions.add(String(entry.version));
     }
   }
+
+  if (versions.size === 0) {
+    throw new Error(`[native-deps-gate] package-lock.json missing package ${packageName}`);
+  }
+  if (versions.size > 1) {
+    throw new Error(`[native-deps-gate] package-lock.json has multiple versions for ${packageName}: ${[...versions].join(', ')}`);
+  }
+  return [...versions][0];
 }
 
-function assertDarwinExecutableArch(file, targetArch) {
-  const expected = targetArch === 'x64' ? 'x86_64' : targetArch;
-  if (!expected || !fs.existsSync('/usr/bin/file')) return;
-  const out = execFileSync('/usr/bin/file', [file], { encoding: 'utf8' });
-  if (!out.includes(expected)) {
-    throw new Error(`[native-deps-gate] runtime binary arch mismatch: expected ${expected}, file=${file}, output=${out.trim()}`);
+function lockPackageVersionForPathOrName(lock, packageName, lockPath) {
+  const directVersion = lock.packages?.[lockPath]?.version;
+  if (directVersion) return String(directVersion);
+  return lockPackageVersionByName(lock, packageName);
+}
+
+function packageJsonPath(nodeModules, packageName) {
+  return path.join(nodeModules, ...packageName.split('/'), 'package.json');
+}
+
+function verifyPackageVersion(nodeModules, lock, packageName, verified, lockPath = packageLockEntryPath(packageName)) {
+  const pkg = readJsonFile(`${packageName} package.json`, packageJsonPath(nodeModules, packageName));
+  const expected = lockPackageVersion(lock, packageName, lockPath);
+  if (String(pkg.version || '') !== String(expected)) {
+    throw new Error(`[native-deps-gate] ${packageName} version mismatch: packaged=${pkg.version || '(missing)'} lock=${expected}`);
   }
+  verified.push(`${packageName}@${expected}`);
+}
+
+function verifyExistingPackageVersion(packageDir, lock, lockPath, verified) {
+  if (!fs.existsSync(packageDir) || !fs.statSync(packageDir).isDirectory()) return;
+  const pkg = readJsonFile(`${lockPath} package.json`, path.join(packageDir, 'package.json'));
+  const packageName = pkg.name || packageNameFromLockPath(lockPath);
+  const expected = lockPackageVersionForPathOrName(lock, packageName, lockPath);
+  if (String(pkg.version || '') !== String(expected)) {
+    throw new Error(`[native-deps-gate] ${lockPath} version mismatch: packaged=${pkg.version || '(missing)'} lock=${expected}`);
+  }
+  verified.push(`${lockPath}@${expected}`);
 }
 
 function verifyPackedRuntimePayload(context, appPath, targetPlatform, targetArch) {
   const runtimeRoot = path.join(appResourcesDir(context, appPath), 'runtime');
-  const manifest = readJsonFile('runtime manifest', path.join(runtimeRoot, 'manifest.json'));
-  const key = `${targetPlatform}-${targetArch}`;
-  const verified = [];
-
-  for (const kind of ['python', 'uv']) {
-    const { spec, asset } = runtimeAsset(manifest, kind, key);
-    requireOnlyRuntimeDirs(runtimeRoot, kind, key);
-    const dir = path.join(runtimeRoot, kind, key);
-    const executable = path.join(dir, ...String(asset.executable || '').split(/[\\/]/).filter(Boolean));
-    const marker = readJsonFile(`${kind} runtime marker`, path.join(dir, '.orkas-runtime.json'));
-    if (!markerMatches(marker, kind, key, spec, asset)) {
-      throw new Error(`[native-deps-gate] runtime marker mismatch for ${kind}/${key}: ${path.join(dir, '.orkas-runtime.json')}`);
-    }
-    requiredFile(`${kind} runtime executable`, executable);
-    if (kind === 'python') verifyPythonPipShims(executable, targetPlatform, spec);
-    if (targetPlatform === 'darwin') assertDarwinExecutableArch(executable, targetArch);
-    verified.push(`runtime:${kind}:${key}`);
-  }
-
-  return verified;
+  // npm/npx companion verification (my node-runtime hardening) is preserved by
+  // verifyRuntimeRoot → verifyRuntimeDir → runtimeCompanionFiles (runtime-gate.cjs),
+  // which the remote extracted; it also keeps marker/pip-shim/arch/dir-allowlist checks.
+  return verifyRuntimeRoot(runtimeRoot, targetPlatform, targetArch);
 }
 
 function prunePackedNativePayload(context, appPath, targetPlatform, targetArch) {
@@ -396,6 +412,66 @@ function writeNativeGateMarker(context, targetPlatform, targetArch, verified) {
   );
 }
 
+function ensureTrailingSlash(value) {
+  return value.endsWith('/') ? value : `${value}/`;
+}
+
+function publishEntries(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'object') return [value];
+  return [];
+}
+
+function genericPublishUrl(context) {
+  const publish = context?.packager?.config?.publish;
+  for (const item of publishEntries(publish)) {
+    if (!item || typeof item !== 'object') continue;
+    if (item.provider === 'generic' && typeof item.url === 'string' && item.url.trim()) {
+      return ensureTrailingSlash(item.url.trim());
+    }
+  }
+
+  const envUrl = String(process.env.DEV_FEED_URL || process.env.PRODUCT_FEED_URL || '').trim();
+  if (envUrl) return ensureTrailingSlash(envUrl);
+  return '';
+}
+
+function updaterCacheDirName(context) {
+  const fromBuilder = context?.packager?.appInfo?.updaterCacheDirName;
+  if (typeof fromBuilder === 'string' && fromBuilder.trim()) return fromBuilder.trim();
+  return 'orkas-updater';
+}
+
+function writeMacAppUpdateConfig(context, appPath) {
+  if (context.electronPlatformName !== 'darwin') return;
+  const resourcesDir = path.join(appPath, 'Contents', 'Resources');
+  const configFile = path.join(resourcesDir, 'app-update.yml');
+
+  if (process.argv.includes('--prepackaged')) {
+    if (!fs.existsSync(configFile)) {
+      console.warn(`[app-update-config] missing in prepackaged app; not mutating signed bundle: ${configFile}`);
+    }
+    return;
+  }
+
+  const url = genericPublishUrl(context);
+  if (!url) {
+    console.warn('[app-update-config] no generic publish URL; app-update.yml was not written');
+    return;
+  }
+
+  fs.mkdirSync(resourcesDir, { recursive: true });
+  const body = [
+    'provider: generic',
+    `url: ${JSON.stringify(url)}`,
+    `updaterCacheDirName: ${updaterCacheDirName(context)}`,
+    '',
+  ].join('\n');
+  fs.writeFileSync(configFile, body, 'utf8');
+  console.log(`[app-update-config] wrote ${configFile}`);
+}
+
 module.exports = async function afterPack(context) {
   const targetPlatform = context.electronPlatformName;
   const targetArch = ARCH_NAMES[context.arch] || process.arch;
@@ -404,12 +480,12 @@ module.exports = async function afterPack(context) {
     ? path.join(context.appOutDir, `${appName}.app`)
     : context.appOutDir;
 
+  writeMacAppUpdateConfig(context, appPath);
+
   console.log('==== Native dependency gate: post-package/pre-sign ====');
   console.log(`[native-deps-gate] target=${targetPlatform}/${targetArch}`);
-  const verified = [
-    ...prunePackedNativePayload(context, appPath, targetPlatform, targetArch),
-    ...verifyPackedRuntimePayload(context, appPath, targetPlatform, targetArch),
-  ];
+  const verified = prunePackedNativePayload(context, appPath, targetPlatform, targetArch);
+  verified.push(...verifyPackedRuntimePayload(context, appPath, targetPlatform, targetArch));
   writeNativeGateMarker(context, targetPlatform, targetArch, verified);
   console.log(`[native-deps-gate] verified: ${verified.join(', ')}`);
   console.log('[native-deps-gate] result=passed; signing may continue');

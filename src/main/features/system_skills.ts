@@ -2,7 +2,7 @@
  * System skills.
  *
  * These are product protocol documents (creator rules), not user-authored
- * skills. Source lives in the app bundle under `src/main/system_skills/`;
+ * skills. Source lives in the app bundle under `resources/builtin/system/skills/`;
  * each active user gets a local mirror so model file tools can read a stable
  * data-root path without relying on marketplace installs.
  */

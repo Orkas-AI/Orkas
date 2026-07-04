@@ -301,6 +301,24 @@ describe('_parseDashboardSpec — tolerant parse (matching + look-alike non-matc
     });
   });
 
+  it('repair: extra child-closing brace before the next sibling is dropped', () => {
+    const body = `{
+"root": { "type": "Stack", "children": [
+{ "type": "Table", "props": { "columns": [{"key":"x","label":"X"}], "rows": [{"x":"A"}] } } },
+{ "type": "Table", "props": { "columns": [{"key":"y","label":"Y"}], "rows": [{"y":"B"}] } } }
+] }
+}`;
+    expect(_parseDashboardSpec(body)).toEqual({
+      root: {
+        type: 'Stack',
+        children: [
+          { type: 'Table', props: { columns: [{ key: 'x', label: 'X' }], rows: [{ x: 'A' }] } },
+          { type: 'Table', props: { columns: [{ key: 'y', label: 'Y' }], rows: [{ y: 'B' }] } },
+        ],
+      },
+    });
+  });
+
   it('non-matching: leading non-JSON garbage is NOT repaired → undefined', () => {
     expect(_parseDashboardSpec('not { valid: json }')).toBeUndefined();
   });
@@ -316,6 +334,40 @@ describe('_parseDashboardSpec — tolerant parse (matching + look-alike non-matc
 });
 
 describe('renderMarkdown integration — set B (must not break existing surfaces)', () => {
+  const workBuddySpec = {
+    schema_version: 1,
+    root: {
+      type: 'Stack',
+      props: { gap: 'md' },
+      children: [
+        {
+          type: 'Grid',
+          props: { columns: 3 },
+          children: [
+            { type: 'Metric', props: { label: '内测期留存率', value: '~60%', tone: 'positive' } },
+            { type: 'Metric', props: { label: 'PC端月访问量', value: '885万', tone: 'positive' } },
+            { type: 'Metric', props: { label: '全平台DAU(估)', value: '1300万+', tone: 'positive' } },
+          ],
+        },
+        { type: 'Separator', props: {} },
+        {
+          type: 'Alert',
+          props: {
+            level: 'info',
+            children: [
+              {
+                type: 'Markdown',
+                props: {
+                  text: '以上为公开报道汇总，非腾讯官方精确披露。',
+                },
+              },
+            ],
+          },
+        },
+      ],
+    },
+  };
+
   it(':::chart-bar still renders alongside :::dashboard', () => {
     const md = ':::chart-bar\n[{"label":"x","value":5}]\n:::\n\n:::dashboard\n' +
       JSON.stringify({ root: { type: 'Metric', props: { label: 'A', value: '1' } } }) + '\n:::';
@@ -333,6 +385,70 @@ describe('renderMarkdown integration — set B (must not break existing surfaces
     expect(html).toContain('<strong>bold</strong>');
     expect(html).toContain('db-separator');
     expect(html).toContain('<li>item 1');
+  });
+
+  it('dashboard JSON emitted as a json code fence renders as a dashboard', () => {
+    const md = '基于公开资料搜索，以下是关于 WorkBuddy 用户留存的全景分析。\n\n```json\n' +
+      JSON.stringify(workBuddySpec, null, 2) +
+      '\n```\n\n---\n\n## 一、已知的留存相关数据';
+    const html = renderMarkdown(md);
+    expect(html).toMatch(/class="dashboard"/);
+    expect(html).toContain('内测期留存率');
+    expect(html).toContain('1300万+');
+    expect(html).toContain('以上为公开报道汇总');
+    expect(html).toContain('<h2>一、已知的留存相关数据</h2>');
+    expect(html).not.toContain('<pre><code>');
+  });
+
+  it('dashboard JSON still renders when a json fence opener misses the newline before JSON', () => {
+    const md = '```json' + JSON.stringify(workBuddySpec, null, 2) + '\n```';
+    const html = renderMarkdown(md);
+    expect(html).toMatch(/class="dashboard"/);
+    expect(html).toContain('内测期留存率');
+    expect(html).toContain('以上为公开报道汇总');
+    expect(html).not.toContain('<pre><code>');
+  });
+
+  it('dashboard JSON still renders when the fence info string is the JSON itself', () => {
+    const md = '```' + JSON.stringify(workBuddySpec, null, 2) + '\n```';
+    const html = renderMarkdown(md);
+    expect(html).toMatch(/class="dashboard"/);
+    expect(html).toContain('PC端月访问量');
+    expect(html).not.toContain('<pre><code>');
+  });
+
+  it('dashboard directive accepts an inner json code fence', () => {
+    const md = ':::dashboard\n```json\n' + JSON.stringify(workBuddySpec) + '\n```\n:::';
+    const html = renderMarkdown(md);
+    expect(html).not.toContain('dashboard-parse-error');
+    expect(html.match(/class="dashboard"/g)).toHaveLength(1);
+    expect(html).toContain('PC端月访问量');
+  });
+
+  it('standalone dashboard JSON block renders when the model omits fences', () => {
+    const md = '# WorkBuddy 用户留存深度分析\n\n' +
+      JSON.stringify(workBuddySpec, null, 2) +
+      '\n\n## 一、已知的留存相关数据';
+    const html = renderMarkdown(md);
+    expect(html).toContain('<h1>WorkBuddy 用户留存深度分析</h1>');
+    expect(html).toMatch(/class="dashboard"/);
+    expect(html).toContain('全平台DAU(估)');
+    expect(html).toContain('<h2>一、已知的留存相关数据</h2>');
+  });
+
+  it('ordinary json code blocks stay as code', () => {
+    const md = '```json\n{"root":{"type":"NotDashboard"},"value":1}\n```';
+    const html = renderMarkdown(md);
+    expect(html).toContain('<pre><code>');
+    expect(html).toContain('&quot;NotDashboard&quot;');
+    expect(html).not.toMatch(/class="dashboard"/);
+  });
+
+  it('ordinary same-line fenced json stays code when it is not dashboard-shaped', () => {
+    const md = '```json{"root":{"type":"NotDashboard"},"value":1}\n```';
+    const html = renderMarkdown(md);
+    expect(html).toContain('<pre><code>');
+    expect(html).not.toMatch(/class="dashboard"/);
   });
 
   it('malformed JSON in :::dashboard falls back to code-view, no throw', () => {
@@ -362,6 +478,29 @@ describe('renderMarkdown integration — set B (must not break existing surfaces
     expect(html).toContain('Funding');
   });
 
+  it('missing child object close before parent array still renders the dashboard', () => {
+    const md = `:::dashboard
+{
+"schema_version": 1,
+"root": { "type": "Stack", "props": { "gap": "md" }, "children": [
+{ "type": "Grid", "props": { "columns": 3 }, "children": [
+{ "type": "Metric", "props": { "label": "内测期留存率", "value": "~60%", "tone": "positive" } },
+{ "type": "Metric", "props": { "label": "PC端月访问量", "value": "885万", "tone": "positive" } },
+{ "type": "Metric", "props": { "label": "全平台DAU(估)", "value": "1300万+", "tone": "positive" } }
+]},
+{ "type": "Separator", "props": {} },
+{ "type": "Alert", "props": { "level": "info", "children": [ { "type": "Markdown", "props": { "text": "以上为公开报道汇总，非腾讯官方精确披露。" } } ] }
+]
+}
+}
+:::`;
+    const html = renderMarkdown(md);
+    expect(html).not.toContain('dashboard-parse-error');
+    expect(html).toMatch(/class="dashboard"/);
+    expect(html).toContain('内测期留存率');
+    expect(html).toContain('以上为公开报道汇总');
+  });
+
   it('unescaped quotes inside a dashboard string still render the dashboard', () => {
     const md = `:::dashboard
 {"root":{"type":"Table","props":{"columns":[{"key":"title","label":"标题"}],"rows":[{"title":"【TF家族练习生】挑战给爸爸打电话说出"我爱你""}]}}}
@@ -370,6 +509,24 @@ describe('renderMarkdown integration — set B (must not break existing surfaces
     expect(html).not.toContain('dashboard-parse-error');
     expect(html).toContain('class="db-table"');
     expect(html).toContain('说出&quot;我爱你&quot;');
+  });
+
+  it('extra child-closing brace between dashboard siblings still renders the dashboard', () => {
+    const md = `:::dashboard
+{
+"schema_version": 1,
+"root": { "type": "Stack", "children": [
+{ "type": "Table", "props": { "columns": [{"key":"x","label":"X"}], "rows": [{"x":"A"}] } } },
+{ "type": "Table", "props": { "columns": [{"key":"y","label":"Y"}], "rows": [{"y":"B"}] } } }
+] }
+}
+:::`;
+    const html = renderMarkdown(md);
+    expect(html).not.toContain('dashboard-parse-error');
+    expect(html).toMatch(/class="dashboard"/);
+    expect((html.match(/class="db-table"/g) || []).length).toBe(2);
+    expect(html).toContain('<td>A</td>');
+    expect(html).toContain('<td>B</td>');
   });
 
   it('unclosed :::dashboard at end of doc → not a dashboard, body kept', () => {

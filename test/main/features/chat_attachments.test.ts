@@ -464,7 +464,7 @@ describe('chat_attachments › resolveAttachmentAbsPath', () => {
 });
 
 describe('chat_attachments › mediaMimeFor', () => {
-  it('maps image + video extensions to standard MIME types', async () => {
+  it('maps image + video + audio extensions to standard MIME types', async () => {
     const m = await loadMod();
     expect(m.mediaMimeFor('a.png')).toBe('image/png');
     expect(m.mediaMimeFor('a.jpg')).toBe('image/jpeg');
@@ -476,6 +476,13 @@ describe('chat_attachments › mediaMimeFor', () => {
     expect(m.mediaMimeFor('clip.mov')).toBe('video/quicktime');
     expect(m.mediaMimeFor('clip.m4v')).toBe('video/x-m4v');
     expect(m.mediaMimeFor('clip.ogv')).toBe('video/ogg');
+    expect(m.mediaMimeFor('voice.mp3')).toBe('audio/mpeg');
+    expect(m.mediaMimeFor('voice.wav')).toBe('audio/wav');
+    expect(m.mediaMimeFor('voice.ogg')).toBe('audio/ogg');
+    expect(m.mediaMimeFor('voice.opus')).toBe('audio/ogg');
+    expect(m.mediaMimeFor('voice.m4a')).toBe('audio/mp4');
+    expect(m.mediaMimeFor('voice.aac')).toBe('audio/aac');
+    expect(m.mediaMimeFor('voice.flac')).toBe('audio/flac');
   });
 
   it('falls back to octet-stream for unknown extensions', async () => {
@@ -518,6 +525,17 @@ describe('chat_attachments › resolveLocalMediaPath', () => {
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.kind).toBe('video');
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it('accepts an audio file and reports kind="audio"', async () => {
+    const { mod, sandbox } = await setup();
+    const p = path.join(sandbox, 'voice.mp3');
+    fs.writeFileSync(p, Buffer.from('fake-bytes'));
+    const r = mod.resolveLocalMediaPath(p);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.kind).toBe('audio');
     fs.rmSync(sandbox, { recursive: true, force: true });
   });
 
@@ -704,6 +722,7 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     expect(r.manifest).not.toContain(body);
     expect(r.images).toEqual([]);
     expect(r.skipped).toEqual([]);
+    expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['text'] });
   });
 
   it('emits PDF entry WITHOUT total_chars when never extracted (no eager work)', async () => {
@@ -715,6 +734,7 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     expect(r.manifest).not.toMatch(/paper\.pdf[^>]*total_chars=/);
     expect(r.manifest).not.toMatch(/bytes="/);
     expect(r.manifest).not.toContain('chunks=');
+    expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['pdf'] });
   });
 
   it('emits modern Office entries WITHOUT total_chars when never extracted', async () => {
@@ -731,6 +751,7 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     expect(r.manifest).toContain('kind="presentation"');
     expect(r.manifest).not.toMatch(/slides\.pptx[^>]*total_chars=/);
     expect(r.skipped).toEqual([]);
+    expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['spreadsheet', 'presentation'] });
   });
 
   it('emits PDF entry WITH total_chars when cache already exists', async () => {
@@ -782,6 +803,19 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     expect(r.images).toEqual([]);
     expect(r.skipped.length).toBe(1);
     expect(r.skipped[0].name).toBe('clip.mp4');
+    expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['video'] });
+  });
+
+  it('skips audio attachments entirely — manifest empty, images empty, one skipped entry', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'voice.mp3', Buffer.from('fake-bytes'));
+    const r = await m.buildAttachmentManifest(UID, CID, ['voice.mp3']);
+    // Audio is display/playback-only. Do not surface binary bytes to the model.
+    expect(r.manifest).toBe('');
+    expect(r.images).toEqual([]);
+    expect(r.skipped.length).toBe(1);
+    expect(r.skipped[0].name).toBe('voice.mp3');
+    expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['audio'] });
   });
 
   it('packs images into images[] as real-time compressed JPEG AND lists them in the manifest with attached="inline"', async () => {
@@ -798,6 +832,7 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     expect(r.images.length).toBe(1);
     expect(r.images[0].mediaType).toBe('image/jpeg');
     expect(r.images[0].data.length).toBeGreaterThan(100);
+    expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['image'] });
   });
 
   it('caps images per message: inlined ones appear in manifest, over-cap ones go to skipped[] only', async () => {
@@ -818,6 +853,7 @@ describe('chat_attachments › buildAttachmentManifest', () => {
     expect(r.manifest).not.toMatch(/name="img6\.png"/);
     expect(r.skipped.length).toBe(4);
     expect(r.skipped.every((s) => /image cap|图片上限/.test(s.reason))).toBe(true);
+    expect(r.metadata).toEqual({ hasAttachments: true, attachmentTypes: ['image'] });
   });
 
   it('skips missing files gracefully', async () => {

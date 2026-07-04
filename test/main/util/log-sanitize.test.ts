@@ -69,7 +69,7 @@ describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
     );
     expect(out).toContain('<abs-path:');
     expect(out).toContain('<file-url-path:');
-    expect(out).not.toContain('/Users/test');
+    expect(out).not.toContain('/Users/alice');
     expect(out).not.toContain('Secret Project');
   });
 
@@ -81,7 +81,7 @@ describe('sanitizeLogTextForUpload › set A (must be masked)', () => {
   });
 
   it('masks common provider token prefixes', () => {
-    const out = sanitizeLogTextForUpload('key sk-testopenaiKeyredacted123');
+    const out = sanitizeLogTextForUpload('key sk-test-redacted');
     expect(out).toBe('key ***TOKEN***');
   });
 

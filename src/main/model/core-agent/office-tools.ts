@@ -30,6 +30,7 @@ import {
 } from './office-batch';
 import { DENY_MESSAGE } from './local-tools';
 import { createLogger } from '../../logger';
+import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
 
 const log = createLogger('office-tools');
 
@@ -43,7 +44,7 @@ export interface OfficeToolsOpts {
   /** Extra writable/readable roots (skill-edit / agent-edit dirs). */
   extraRoots?: readonly string[];
   /** Fires with the absolute path after a successful create. */
-  onFileWritten?: (absPath: string) => void;
+  onFileWritten?: (absPath: string) => void | Promise<void>;
   /** True when the path was already produced by this caller this turn →
    *  overwrite in place instead of uniquifying. */
   hasProducedPath?: (absPath: string) => boolean;
@@ -65,10 +66,10 @@ function allowedRootsFor(opts: OfficeToolsOpts): string[] {
     try {
       const ws = getWorkspacePath(opts.userId, opts.projectId);
       if (ws) roots.push(ws);
-    } catch (err) { log.warn(`resolve workspace: ${(err as Error).message}`); }
+    } catch (err) { log.warn('resolve workspace failed', { user_id: maskId(opts.userId), project_id: maskId(opts.projectId), error: logErrorRef(err) }); }
     if (opts.cid) {
       try { roots.push(chatAttachmentDir(opts.userId, opts.cid)); }
-      catch (err) { log.warn(`resolve attachment dir: ${(err as Error).message}`); }
+      catch (err) { log.warn('resolve attachment dir failed', { user_id: maskId(opts.userId), cid: maskId(opts.cid), error: logErrorRef(err) }); }
     }
   }
   if (opts.extraRoots?.length) {
@@ -118,12 +119,16 @@ async function renderToImage(file: string, cwd: string, page: string, signal?: A
       cwd, timeoutMs: 60_000, ...(signal ? { signal } : {}),
     });
     if (r.code !== 0 || !fs.existsSync(png)) {
-      log.warn(`render failed (code=${r.code}): ${r.stderr.slice(0, 200)}`);
+      log.warn('render failed', {
+        code: r.code,
+        stderr_chars: r.stderr?.length || 0,
+        stdout_chars: r.stdout?.length || 0,
+      });
       return null;
     }
     return { data: fs.readFileSync(png).toString('base64'), mediaType: 'image/png' };
   } catch (err) {
-    log.warn(`render error: ${(err as Error).message}`);
+    log.warn('render error', { error: logErrorRef(err) });
     return null;
   } finally {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -168,8 +173,8 @@ async function runCreate(
     const preview = args.wantPreview ? await renderToImage(finalPath, cwd, '1', ctx.signal) : null;
 
     if (opts.onFileWritten) {
-      try { opts.onFileWritten(finalPath); }
-      catch (err) { log.warn(`onFileWritten callback failed: ${(err as Error).message}`); }
+      try { await opts.onFileWritten(finalPath); }
+      catch (err) { log.warn('onFileWritten callback failed', { path: logPathRef(finalPath), error: logErrorRef(err) }); }
     }
 
     const n = args.ops.length;
@@ -202,7 +207,7 @@ function prepareOutput(
   }
   const scopeErr = guardPath(opts, abs, 'writable');
   if (scopeErr) {
-    log.warn(`office create scope reject user=${opts.userId ?? '?'} path=${abs}`);
+    log.warn('office create scope reject', { user_id: maskId(opts.userId), path: logPathRef(abs), ext });
     return { error: errResult('E_PATH_OUT_OF_SCOPE', scopeErr.replace(/^E_PATH_OUT_OF_SCOPE:\s*/, '')) };
   }
   return { abs };
@@ -740,8 +745,8 @@ function createEditOfficeTool(opts: OfficeToolsOpts): AgentTool {
         }
         const preview = input.preview !== false ? await renderToImage(abs, cwd, '1', ctx.signal) : null;
         if (opts.onFileWritten) {
-          try { opts.onFileWritten(abs); }
-          catch (err) { log.warn(`onFileWritten callback failed: ${(err as Error).message}`); }
+          try { await opts.onFileWritten(abs); }
+          catch (err) { log.warn('onFileWritten callback failed', { path: logPathRef(abs), error: logErrorRef(err) }); }
         }
         return { content: `Edited ${abs} (${ops.length} operation${ops.length === 1 ? '' : 's'})`, ...(preview ? { images: [preview] } : {}) };
       } finally {

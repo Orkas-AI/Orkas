@@ -141,7 +141,13 @@ function _mockErrorResponse(error, status) {
 }
 
 function _monitorIpcError(kind, channel, data) {
-  void 0;
+  try {
+    if (!window.Monitor || !(() => {})) return;
+    (() => {})(kind, {
+      channel: String(channel || '').slice(0, 120),
+      ...(data || {}),
+    });
+  } catch (_) {}
 }
 
 function _hasOrkasInvoke() {

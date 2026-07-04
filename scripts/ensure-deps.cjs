@@ -77,11 +77,26 @@ function npmInstallInvocation() {
   }
 
   if (/^npm@\d/.test(packageManager)) {
-    return {
-      cmd: process.platform === 'win32' ? 'corepack.cmd' : 'corepack',
-      args: ['npm', 'install'],
+    const corepackCmd = process.platform === 'win32' ? 'corepack.cmd' : 'corepack';
+    const corepackProbe = spawnSync(corepackCmd, ['--version'], {
+      cwd: PC_DIR,
+      stdio: 'ignore',
       shell: process.platform === 'win32',
-      label: `corepack npm install (${packageManager})`,
+    });
+    if (!corepackProbe.error) {
+      return {
+        cmd: corepackCmd,
+        args: ['npm', 'install'],
+        shell: process.platform === 'win32',
+        label: `corepack npm install (${packageManager})`,
+      };
+    }
+    console.warn(`[Orkas] corepack unavailable (${corepackProbe.error.message}); falling back to npm install.`);
+    return {
+      cmd: process.platform === 'win32' ? 'npm.cmd' : 'npm',
+      args: ['install'],
+      shell: process.platform === 'win32',
+      label: `npm install (fallback for ${packageManager})`,
     };
   }
 
@@ -179,7 +194,7 @@ function electronReady() {
 function runElectronInstall(reason) {
   if (!fs.existsSync(ELECTRON_INSTALL)) {
     console.error('[Orkas] Electron package is incomplete: node_modules/electron/install.js is missing.');
-    console.error('[Orkas] Run `corepack npm install` in PC/ or remove PC/node_modules and start again.');
+    console.error('[Orkas] Run `npm install` in PC/ or remove PC/node_modules and start again.');
     process.exit(1);
   }
 

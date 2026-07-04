@@ -120,6 +120,35 @@ describe('streamChatWithModel — phase-aware idle watchdog (Phase 1)', () => {
     expect(ms).toBeGreaterThanOrEqual(550);
   }, 8000);
 
+  it('tool-call argument assembly is NOT false-killed by the short model window', async () => {
+    // A large write_file call can emit tool input before core-agent has the
+    // complete JSON needed for tool_start. That raw tool_delta may not map to a
+    // visible UI event yet, but it is still provider activity and should switch
+    // the watchdog to the long window.
+    h.makeStream = () =>
+      (async function* () {
+        yield { type: 'text_delta', text: 'drafting file' };
+        yield { type: 'tool_delta', id: 't1', name: 'write_file', inputDelta: '', inputBytes: 0 };
+        await delay(600);
+        yield {
+          type: 'tool_start',
+          id: 't1',
+          name: 'write_file',
+          input: { path: 'composition/index.html', content: '<html></html>' },
+        };
+        yield { type: 'tool_end', id: 't1', name: 'write_file', result: 'ok', isError: false };
+        yield { type: 'text_delta', text: 'done' };
+      })();
+
+    const { events, ms } = await drain({ streamIdleTimeout: 0.2, idleTimeout: 10 });
+    const types = events.map((e) => e.type);
+    expect(types).toContain('final');
+    expect(events.find((e) => e.type === 'final')?.text || '').toContain('done');
+    expect(events.some((e) => e.type === 'error' && /no response|exceeded/i.test(e.text || ''))).toBe(false);
+    expect(types[types.length - 1]).toBe('done');
+    expect(ms).toBeGreaterThanOrEqual(550);
+  }, 8000);
+
   it('a fully silent (cold-start) stall still terminates cleanly — no wedge', async () => {
     // Regression guard for the main-side wedge: even with ZERO events the turn
     // must yield a terminal error + done and the generator must RETURN.

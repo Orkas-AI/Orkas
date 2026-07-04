@@ -20,8 +20,9 @@
  *                       (cached); image and unsupported legacy Office skipped.
  *
  * Scope is enforced via `util/path-sandbox.isPathAllowed`: path-taking tools
- * first verify the target falls under
- *   [ active workspace dir, chat_attachments/<cid>/, caller-provided extra roots ].
+ * first verify the target falls under the active workspace, chat attachments,
+ * caller-provided extra roots, or the current session's read-only tool-results
+ * directory.
  * Paths outside that set return an explicit E_PATH_OUT_OF_SCOPE error.
  *
  * These tools do NOT require localExec permission — they only read from
@@ -49,10 +50,14 @@ import { ocrFile } from '../../features/ocr_runtime';
 import { chatAttachmentDir, userMarketplaceSkillsDir, userSkillsDir } from '../../paths';
 import { getWorkspacePath } from '../../features/user_workspace';
 import { isPathAllowed } from '../../util/path-sandbox';
+import { localAccessAllowsOutsideWorkspace, localAccessRequiresSensitiveApproval } from '../../features/permissions';
+import { sensitivePathReasons } from '../../features/local_access_policy';
+import { requestBashDecision } from './bash-permissions';
 import { macosTccSensitivePath } from '../../util/macos-tcc';
 import { parseSkillPath } from '../../features/expert_signals/skill_path';
 import { isSkillEnabled } from '../../features/component_enabled';
 import { recordRead } from './read-tracker';
+import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
 
 const log = createLogger('file-tools');
 
@@ -84,6 +89,11 @@ export interface FileToolsOpts {
    *  dir (in addition to the user's active workspace). Omitted = no
    *  attachment scope (workspace-only). */
   cid?: string;
+  /** Acting agent identity — used to label sensitive-path approval prompts.
+   *  Display falls back to agentId, then a generic label. Omitted for the
+   *  commander / ad-hoc runs. */
+  agentId?: string;
+  agentName?: string;
   /** Extra absolute directory roots to allow on top of workspace + attachment.
    *  Read AND write are permitted under these roots — used by per-skill edit
    *  chats to expose the skill dir for the `<<<skill-file>>>` tooling. */
@@ -116,10 +126,10 @@ function allowedRoots(opts: FileToolsOpts): string[] {
   try {
     const ws = getWorkspacePath(opts.userId, opts.projectId);
     if (ws) roots.push(ws);
-  } catch (err) { log.warn(`resolve workspace: ${(err as Error).message}`); }
+  } catch (err) { log.warn('resolve workspace failed', { user_id: maskId(opts.userId), project_id: maskId(opts.projectId), error: logErrorRef(err) }); }
   if (opts.cid) {
     try { roots.push(chatAttachmentDir(opts.userId, opts.cid)); }
-    catch (err) { log.warn(`resolve attachment dir: ${(err as Error).message}`); }
+    catch (err) { log.warn('resolve attachment dir failed', { user_id: maskId(opts.userId), cid: maskId(opts.cid), error: logErrorRef(err) }); }
   }
   if (opts.extraRoots?.length) {
     for (const r of opts.extraRoots) if (r) roots.push(r);
@@ -154,15 +164,72 @@ function errText(code: string, msg: string): string {
   return `${code}: ${msg}`;
 }
 
+function permissionWaitProgress(ctx: ToolContext | undefined, operation: string): (elapsedMs: number) => void {
+  return (elapsedMs: number) => {
+    ctx?.emitProgress?.({
+      phase: 'permission',
+      message: `Waiting for user approval for ${operation}`,
+      data: {
+        heartbeat: true,
+        userAction: true,
+        elapsedMs,
+        timeoutMs: elapsedMs + 60_000,
+      },
+    });
+  };
+}
+
 function guardPath(opts: FileToolsOpts, abs: string): string | null {
-  if (!isPathAllowed(abs, allowedRoots(opts))) {
+  const roots = allowedRoots(opts);
+  if (roots.length && isPathAllowed(abs, roots)) return null;
+  if (!localAccessAllowsOutsideWorkspace()) {
     return errText(
       'E_PATH_OUT_OF_SCOPE',
-      `path is outside the current conversation's visible scope (workspace + attachments + user-granted folders): ${abs}. `
-      + 'If the user needs this folder, ask them to authorize it under "Settings → Folder Access" — do not retry until they do.',
+      `path is outside the current workspace/attachment scope and the current access mode only allows workspace files: ${abs}.`,
     );
   }
   return null;
+}
+
+async function gateSensitivePathAccess(
+  opts: FileToolsOpts,
+  abs: string,
+  operation: string,
+  ctx?: ToolContext,
+): Promise<string | null> {
+  if (!localAccessRequiresSensitiveApproval()) return null;
+  const reasons = sensitivePathReasons(abs, 'read');
+  if (!reasons.length) return null;
+  const decision = await requestBashDecision({
+    uid: opts.userId,
+    cid: opts.cid ?? '',
+    agentId: opts.agentId ?? '',
+    agentName: opts.agentName ?? opts.agentId ?? '',
+    command: '',
+    operation,
+    subject: abs,
+    reasons,
+    onWaiting: permissionWaitProgress(ctx, operation),
+  });
+  if (decision !== 'deny') return null;
+  return errText(
+    'E_SENSITIVE_PATH_DENIED',
+    `the user declined to allow ${operation} on a sensitive path: ${abs}. Do not retry or work around it.`,
+  );
+}
+
+/** Scope check for path-taking read tools. Folder grants were removed:
+ * workspace-vs-all-files access is controlled by the global three-mode
+ * setting, and sensitive paths use the standard approval prompt. */
+async function gatePathAccess(
+  opts: FileToolsOpts,
+  abs: string,
+  operation: string,
+  ctx?: ToolContext,
+): Promise<string | null> {
+  const denied = guardPath(opts, abs);
+  if (denied) return denied;
+  return gateSensitivePathAccess(opts, abs, operation, ctx);
 }
 
 function disabledSystemASkillIdForPath(opts: FileToolsOpts, abs: string): string | null {
@@ -243,21 +310,26 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
       if (!raw) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
       const abs = resolveAbs(ctx, raw);
 
-      const scopeErr = guardPath(opts, abs);
+      const scopeErr = await gatePathAccess(opts, abs, 'read_file', ctx);
       if (scopeErr) {
-        log.warn(`read_file scope reject user=${opts.userId} path=${abs}`);
+        log.warn('read_file scope reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
         return { content: scopeErr, isError: true };
       }
       const disabledSkillErr = guardDisabledSkillAccess(opts, abs);
       if (disabledSkillErr) {
-        log.warn(`read_file disabled skill reject user=${opts.userId} path=${abs}`);
+        log.warn('read_file disabled skill reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
         return { content: disabledSkillErr, isError: true };
       }
 
       try { fs.statSync(abs); }
       catch (err) {
         const siblings = findUniquifySiblings(abs);
-        log.warn(`read_file not-found user=${opts.userId} path=${abs}: ${(err as Error).message}`);
+        log.warn('read_file not found', {
+          user_id: maskId(opts.userId),
+          path: logPathRef(abs),
+          sibling_count: siblings.length,
+          error: logErrorRef(err),
+        });
         let content = errText('E_NOT_FOUND', `${abs}: ${(err as Error).message}`);
         if (siblings.length) {
           content +=
@@ -275,7 +347,12 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
         if (kind === 'image') {
           const img = await readImageAsGrayJpeg(opts.userId, abs);
           const header = `<file path="${abs}" kind="image" bytes="${img.bytes}" compressed="${img.width}x${img.height} gray JPEG q=70"/>`;
-          log.info(`read_file user=${opts.userId} kind=image bytes=${img.bytes} path=${abs}`);
+          log.info('read_file image loaded', {
+            user_id: maskId(opts.userId),
+            path: logPathRef(abs),
+            kind: 'image',
+            bytes: img.bytes,
+          });
           return {
             content: `${header}\nImage loaded — the compressed grayscale JPEG follows as a user-turn image.`,
             images: [{ data: img.base64, mediaType: img.mediaType }],
@@ -302,9 +379,16 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
           ...(result.meta.extractionEmpty ? ['extraction="empty_pages"'] : []),
         ];
         const header = `<file ${attrs.join(' ')}>`;
-        log.info(
-          `read_file user=${opts.userId} kind=${kind} covered=${cs}-${ce} total=${total} path=${abs}`,
-        );
+        log.info('read_file loaded', {
+          user_id: maskId(opts.userId),
+          path: logPathRef(abs),
+          kind,
+          covered_start: cs,
+          covered_end: ce,
+          total_chars: total,
+          start_line: result.startLine,
+          end_line: lastLine,
+        });
         // skill_invoked attribution: when the LLM read_file's a SKILL.md
         // body, the body is the progressive-disclosure "use this skill"
         // signal (per Claude Code conventions). Emit AFTER the successful
@@ -313,7 +397,7 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
           const parsed = parseSkillPath(abs, opts.userId);
           if (parsed) {
             try { opts.onSkillInvoked(parsed.skill_id, parsed.system, 'read_file'); }
-            catch (err) { log.warn(`onSkillInvoked callback failed: ${(err as Error).message}`); }
+            catch (err) { log.warn('onSkillInvoked callback failed', { error: logErrorRef(err) }); }
           }
         }
         // Stamp the read-state baseline so a later edit_file accepts an edit
@@ -323,7 +407,7 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
         return { content: `${header}\n${numberedContent}\n</file>` };
       } catch (err) {
         if (err instanceof NeedStatError) {
-          log.warn(`read_file need-stat user=${opts.userId} kind=${err.kind} path=${abs}`);
+          log.warn('read_file need stat', { user_id: maskId(opts.userId), path: logPathRef(abs), kind: err.kind });
           return {
             content: errText(
               'E_NEED_STAT',
@@ -333,11 +417,11 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
           };
         }
         if (err instanceof NoTextError) {
-          log.warn(`read_file no-text user=${opts.userId} path=${abs}`);
+          log.warn('read_file no text', { user_id: maskId(opts.userId), path: logPathRef(abs) });
           return { content: errText('E_NO_TEXT', `${abs}: image has no text representation`), isError: true };
         }
         if (err instanceof UnsupportedFileKindError) {
-          log.warn(`read_file unsupported user=${opts.userId} kind=${err.kind} path=${abs}`);
+          log.warn('read_file unsupported kind', { user_id: maskId(opts.userId), path: logPathRef(abs), kind: err.kind });
           return {
             content: errText(
               'E_UNSUPPORTED_FILE',
@@ -347,7 +431,7 @@ function createReadFileTool(opts: FileToolsOpts): AgentTool {
           };
         }
         const msg = (err as Error).message;
-        log.warn(`read_file failed user=${opts.userId} path=${abs}: ${msg}`);
+        log.warn('read_file failed', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
         return { content: errText('E_READ_FAILED', msg), isError: true };
       }
     },
@@ -387,20 +471,20 @@ function createStatFileTool(opts: FileToolsOpts): AgentTool {
       if (!raw) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
       const abs = resolveAbs(ctx, raw);
 
-      const scopeErr = guardPath(opts, abs);
+      const scopeErr = await gatePathAccess(opts, abs, 'stat_file', ctx);
       if (scopeErr) {
-        log.warn(`stat_file scope reject user=${opts.userId} path=${abs}`);
+        log.warn('stat_file scope reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
         return { content: scopeErr, isError: true };
       }
       const disabledSkillErr = guardDisabledSkillAccess(opts, abs);
       if (disabledSkillErr) {
-        log.warn(`stat_file disabled skill reject user=${opts.userId} path=${abs}`);
+        log.warn('stat_file disabled skill reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
         return { content: disabledSkillErr, isError: true };
       }
 
       try { fs.statSync(abs); }
       catch (err) {
-        log.warn(`stat_file not-found user=${opts.userId} path=${abs}: ${(err as Error).message}`);
+        log.warn('stat_file not found', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
         return { content: errText('E_NOT_FOUND', `${abs}: ${(err as Error).message}`), isError: true };
       }
 
@@ -409,20 +493,23 @@ function createStatFileTool(opts: FileToolsOpts): AgentTool {
         const meta = await statFile(opts.userId, abs);
         const total = meta.totalChars ?? 0;
         const emptyAttr = meta.extractionEmpty ? ' extraction="empty_pages"' : '';
-        log.info(
-          `stat_file user=${opts.userId} kind=${kind} total_chars=${total}`
-          + `${meta.extractionEmpty ? ' extraction=empty_pages' : ''} path=${abs}`,
-        );
+        log.info('stat_file loaded', {
+          user_id: maskId(opts.userId),
+          path: logPathRef(abs),
+          kind,
+          total_chars: total,
+          extraction_empty: !!meta.extractionEmpty,
+        });
         return {
           content: `<file path="${abs}" kind="${kind}" total_chars="${total}"${emptyAttr}/>`,
         };
       } catch (err) {
         if (err instanceof NoTextError) {
-          log.warn(`stat_file no-text user=${opts.userId} path=${abs}`);
+          log.warn('stat_file no text', { user_id: maskId(opts.userId), path: logPathRef(abs) });
           return { content: errText('E_NO_TEXT', `${abs}: image has no text representation`), isError: true };
         }
         if (err instanceof UnsupportedFileKindError) {
-          log.warn(`stat_file unsupported user=${opts.userId} kind=${err.kind} path=${abs}`);
+          log.warn('stat_file unsupported kind', { user_id: maskId(opts.userId), path: logPathRef(abs), kind: err.kind });
           return {
             content: errText(
               'E_UNSUPPORTED_FILE',
@@ -432,7 +519,7 @@ function createStatFileTool(opts: FileToolsOpts): AgentTool {
           };
         }
         const msg = (err as Error).message;
-        log.warn(`stat_file failed user=${opts.userId} path=${abs}: ${msg}`);
+        log.warn('stat_file failed', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
         return { content: errText('E_STAT_FAILED', msg), isError: true };
       }
     },
@@ -467,19 +554,19 @@ function createOcrFileTool(opts: FileToolsOpts): AgentTool {
       if (!raw) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
       const abs = resolveAbs(ctx, raw);
 
-      const scopeErr = guardPath(opts, abs);
+      const scopeErr = await gatePathAccess(opts, abs, 'ocr_file', ctx);
       if (scopeErr) {
-        log.warn(`ocr_file scope reject user=${opts.userId} path=${abs}`);
+        log.warn('ocr_file scope reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
         return { content: scopeErr, isError: true };
       }
       const disabledSkillErr = guardDisabledSkillAccess(opts, abs);
       if (disabledSkillErr) {
-        log.warn(`ocr_file disabled skill reject user=${opts.userId} path=${abs}`);
+        log.warn('ocr_file disabled skill reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
         return { content: disabledSkillErr, isError: true };
       }
       try { fs.statSync(abs); }
       catch (err) {
-        log.warn(`ocr_file not-found user=${opts.userId} path=${abs}: ${(err as Error).message}`);
+        log.warn('ocr_file not found', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
         return { content: errText('E_NOT_FOUND', `${abs}: ${(err as Error).message}`), isError: true };
       }
 
@@ -513,7 +600,13 @@ function createOcrFileTool(opts: FileToolsOpts): AgentTool {
         const repairHint = '\n\nDo not install or repair OCR dependencies with bash/pip/uv; ocr_file owns its local runtime.';
         return { content: errText(result.errorCode, `${result.message}${processBlock}${repairHint}`), isError: true };
       }
-      log.info(`ocr_file user=${opts.userId} kind=${kind} cached=${result.cached} path=${abs}`);
+      log.info('ocr_file completed', {
+        user_id: maskId(opts.userId),
+        path: logPathRef(abs),
+        kind,
+        cached: !!result.cached,
+        text_chars: result.content.length,
+      });
       return { content: result.content };
     },
   };
@@ -683,7 +776,12 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
         ];
         return `- ${h.name}  (${bits.join(', ')})`;
       });
-      log.info(`search_files user=${opts.userId} query="${query}" hits=${total} shown=${shown.length}`);
+      log.info('search_files completed', {
+        user_id: maskId(opts.userId),
+        query_chars: query.length,
+        hits: total,
+        shown: shown.length,
+      });
       const header = total > shown.length
         ? `${total} match(es), showing the ${MAX_SEARCH_RESULTS} most recently modified:`
         : `${total} match(es):`;
@@ -875,7 +973,7 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
             text = got;
             extracted++;
           } catch (err) {
-            log.warn(`grep_files: extract failed ${t.abs}: ${(err as Error).message}`);
+            log.warn('grep_files extract failed', { user_id: maskId(opts.userId), path: logPathRef(t.abs), error: logErrorRef(err) });
             return;
           }
           const lines = text.split('\n');
@@ -889,10 +987,15 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
         });
       }
 
-      log.info(
-        `grep_files user=${opts.userId} pattern=${useRegex ? `/${pattern}/i` : `"${pattern}"`}`
-        + ` hits=${hits.length} scanned=${scanned} extracted=${extracted} skipped=${skipped}`,
-      );
+      log.info('grep_files completed', {
+        user_id: maskId(opts.userId),
+        pattern_chars: pattern.length,
+        use_regex: useRegex,
+        hits: hits.length,
+        scanned,
+        extracted,
+        skipped,
+      });
       if (!hits.length) {
         return {
           content:
@@ -988,14 +1091,14 @@ function createListFilesTool(opts: FileToolsOpts): AgentTool {
       if (!raw) return { content: errText('E_BAD_INPUT', '`path` is required'), isError: true };
       const abs = resolveAbs(ctx, raw);
 
-      const scopeErr = guardPath(opts, abs);
+      const scopeErr = await gatePathAccess(opts, abs, 'list_files', ctx);
       if (scopeErr) {
-        log.warn(`list_files scope reject user=${opts.userId} path=${abs}`);
+        log.warn('list_files scope reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
         return { content: scopeErr, isError: true };
       }
       const disabledSkillErr = guardDisabledSkillAccess(opts, abs);
       if (disabledSkillErr) {
-        log.warn(`list_files disabled skill reject user=${opts.userId} path=${abs}`);
+        log.warn('list_files disabled skill reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
         return { content: disabledSkillErr, isError: true };
       }
 
@@ -1004,7 +1107,7 @@ function createListFilesTool(opts: FileToolsOpts): AgentTool {
         const lines = entries.map((e) => `${e.isDirectory() ? 'd' : 'f'} ${e.name}`);
         return { content: lines.join('\n') };
       } catch (err) {
-        log.warn(`list_files failed user=${opts.userId} path=${abs}: ${(err as Error).message}`);
+        log.warn('list_files failed', { user_id: maskId(opts.userId), path: logPathRef(abs), error: logErrorRef(err) });
         return { content: errText('E_LIST_FAILED', `${abs}: ${(err as Error).message}`), isError: true };
       }
     },

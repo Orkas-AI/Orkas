@@ -37,7 +37,7 @@ async function loadContexts() {
     ]);
     const treeData = await treeRes.json();
     const kbData = await kbRes.json().catch(() => ({ ok: false }));
-    if (treeData.ok) _ctxTree = treeData.tree || [];
+    if (treeData.ok !== false) _ctxTree = treeData.tree || [];
     if (kbData.ok) _kbStatusByPath = _buildKbStatusMap(_ctxTree, kbData.files || []);
     renderCtxTree();
     _ensureKbEventSubscription();
@@ -208,14 +208,41 @@ function _trackKbVectorizeEvent(relPath, ev) {
     chunk_count: Number(ev.chunks || 0),
     duration_ms: startedAt ? Math.round(performance.now() - startedAt) : 0,
   };
+  try { (() => {})('library_vectorize_result', payload); } catch (_) {}
   if (ev.status === 'failed') {
     try {
+      (() => {})('library_vectorize', {
+        file_ext: payload.file_ext,
+        file_type: payload.file_type,
+        error_message: ev.error || 'unknown',
+      });
     } catch (_) {}
   }
 }
 
 function _cssEscape(s) {
   return String(s).replace(/(["\\])/g, '\\$1');
+}
+
+function _ctxFormatMtime(mtime) {
+  const n = Number(mtime);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  const ms = n > 100000000000 ? n : n * 1000;
+  try {
+    const locale = (typeof getLocaleMeta === 'function' && typeof getLang === 'function')
+      ? getLocaleMeta(getLang()).intlLocale
+      : undefined;
+    return new Intl.DateTimeFormat(locale, {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).format(new Date(ms));
+  } catch (_) {
+    return new Date(ms).toLocaleString();
+  }
 }
 
 function _kbStatusChipHtml(relpath) {
@@ -308,9 +335,10 @@ function _renderCtxNodes(nodes, depth = 0) {
     // menu item — the label becomes an input autofocused with the stem
     // selected. Committed on Enter / blur; Esc keeps the file as-is. See
     // `_bindCtxTreeHandlers` for the handlers.
+    const mtime = _ctxFormatMtime(n.mtime);
     const labelHtml = isPendingRename
       ? `<input class="ctx-tree-rename-input" type="text" value="${escapeHtml(n.name)}" autocomplete="off" spellcheck="false" />`
-      : `<span class="skill-tree-label">${escapeHtml(n.name)}</span>`;
+      : `<span class="skill-tree-main"><span class="skill-tree-label">${escapeHtml(n.name)}</span>${mtime ? `<span class="skill-tree-meta">${escapeHtml(mtime)}</span>` : ''}</span>`;
     return `
       <div class="ctx-tree-wrap" data-path="${escapeHtml(n.path)}" data-type="file" draggable="true">
         <div class="skill-tree-node skill-tree-file${active}" data-ext="${escapeHtml(ext)}" style="padding-left:${indent}px">
@@ -969,7 +997,8 @@ async function handleCtxUpload(fileList, targetDir = '') {
         delete _kbStatusByPath[target];
         return { ok: false, name: file.name, reason: data.error || 'unknown' };
       }
-            return { ok: true, name: file.name };
+      if (window.Monitor) (() => {})('library_file_upload', { file_size_bytes: file.size || 0, file_ext: ext });
+      return { ok: true, name: file.name };
     } catch (e) {
       return { ok: false, name: file.name, reason: e.message || String(e) };
     }
@@ -986,7 +1015,8 @@ async function handleCtxUpload(fileList, targetDir = '') {
   const rejected = results.filter((r) => !r.ok);
   for (const r of rejected) {
     _contextsLog.warn('upload failed', r.name, r.reason);
-      }
+    if (window.Monitor) (() => {})('library_file_upload', { error_message: r.reason });
+  }
   const extRejected = rejected.filter((r) => r.reason === 'ext');
   const hiddenRejected = rejected.filter((r) => r.reason === 'hidden');
   const failed = rejected.filter((r) => r.reason !== 'ext' && r.reason !== 'hidden');

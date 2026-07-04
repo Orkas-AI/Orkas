@@ -2,7 +2,7 @@
  * Shared facade for local secret persistence.
  *
  * Hosted Orkas uses the private backend in `features/hosted_secrets/` and writes
- * `ORKLSEC1:` payloads. The open-source build does not ship that backend; the same facade
+ * `ORKLSEC1:` payloads. the open-source build does not ship that backend; the same facade
  * then falls back to the open-source `crypto-vault` implementation. Callers
  * pass explicit context so secrets are bound to their business owner/record.
  */

@@ -46,7 +46,7 @@ import {
   resolveRecipients, parseMentions, buildMention,
   extractFormFromFinal, computeFormId, ChatFormPayload,
   extractHandbackFromFinal,
-  extractPlanInteractionFromFinal, extractAgentFieldBlocks, extractSkillContainers, decodeSubmission,
+  extractPlanInteractionFromFinal, extractActorResultFromFinal, extractAgentFieldBlocks, extractSkillContainers, decodeSubmission,
   type PlanInteractionStatus,
 } from './router';
 import * as skillsFeat from '../skills';
@@ -57,7 +57,10 @@ import {
   userMarketplaceSkillsDir, userMarketplaceAgentsDir,
 } from '../../paths';
 import * as agentsFeat from '../agents';
+import * as commanderRuntimeStats from '../commander_runtime_stats';
+import type { AgentRunStatus } from '../agent_runtime_stats';
 import { isAgentEnabled, readDisabledSets } from '../component_enabled';
+import { finalizeProducedFile } from '../produced_output_hooks';
 import { buildLanguageDirective, descriptionLang, t } from '../../i18n';
 import { getLanguage } from '../config';
 import * as marketplaceFeat from '../marketplace';
@@ -65,8 +68,11 @@ import { readInstalls } from '../marketplace_installs';
 import { createSkillTurnBuffer, onAgentTurnEnd, onUserMessage } from '../expert_signals/turn_hooks';
 import {
   compactPromptDescription,
+  listSkillSpecs,
   openSkillReadRoots,
+  resolveSkillAllowlistRefs,
   searchOpenTierSkills,
+  type SkillAllowlistRef,
 } from '../../model/core-agent/skill-registry';
 import { buildRuntimeDatetimeBlock } from '../../prompts/runtime_context';
 
@@ -183,6 +189,44 @@ function _hasSkillUseIntent(text: string): boolean {
   return /(?:使用|调用|運行|运行|执行|use|run|call|execute)/i.test(text);
 }
 
+function _escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function _workflowMentionsSkill(workflow: string, spec: SkillAllowlistRef): boolean {
+  const hay = String(workflow || '').toLowerCase();
+  const refs = [spec.id, spec.name].filter((v): v is string => typeof v === 'string' && !!v.trim());
+  for (const ref of refs) {
+    const needle = ref.toLowerCase().trim();
+    if (!needle) continue;
+    if (/^[a-z0-9_.-]+$/i.test(needle)) {
+      const re = new RegExp(`(^|[^a-z0-9_.-])${_escapeRe(needle)}(?=$|[^a-z0-9_.-])`, 'i');
+      if (re.test(hay)) return true;
+    } else if (hay.includes(needle)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function _runtimeSkillListForAgent(agent: agentsFeat.Agent): Promise<string[]> {
+  const workflow = String(agent.workflow || '');
+  if (!workflow.trim()) return [];
+  // Owner-scoped: a private (`ownerAgent`) skill of another agent never
+  // resolves here, so it can't enter this agent's runtime skill list.
+  const specs = await listSkillSpecs({ forAgentId: agent.agent_id }).catch((err) => {
+    log.warn(`skill workflow filter list failed agent=${agent.agent_id}: ${(err as Error).message}`);
+    return [] as SkillAllowlistRef[];
+  });
+  if (!specs.length) return [];
+  const refs = Array.isArray(agent.skill_list) ? agent.skill_list : specs.map((s) => s.id);
+  if (!refs.length) return [];
+  const allowedIds = new Set(resolveSkillAllowlistRefs(specs, refs).ids);
+  return specs
+    .filter((s) => allowedIds.has(s.id) && _workflowMentionsSkill(workflow, s))
+    .map((s) => s.id);
+}
+
 async function _findDisabledSkillUseRequest(uid: string, text: string):
   Promise<{ id: string; name: string } | null> {
   if (!_hasSkillUseIntent(text)) return null;
@@ -280,6 +324,7 @@ export type GroupListener = (ev: GroupEvent) => void;
 export interface ActiveTurn {
   actor: string;
   turn_id: string;
+  msg_id?: string;
 }
 
 // ── Per-cid state ────────────────────────────────────────────────────────
@@ -332,6 +377,8 @@ interface WorkerState {
   abortController: AbortController | null;
   /** QueueItem.turnId currently owned by this worker, while `running=true`. */
   currentTurnId: string | null;
+  /** GroupMessage id that triggered the currently running turn. */
+  currentMsgId: string | null;
   /** Monotonic per-conversation order stamped when the worker claims a turn.
    * Keeps `active_turns` in execution-start order instead of worker Map order. */
   currentTurnOrder: number | null;
@@ -454,7 +501,12 @@ function activeTurnsForState(state: CidState): ActiveTurn[] {
   for (const [, w] of state.workers) {
     if (suspendCommander && w.actor.kind === 'commander') continue;
     if (w.running && w.currentTurnId) {
-      turns.push({ actor: w.actor.id, turn_id: w.currentTurnId, order: w.currentTurnOrder || 0 });
+      turns.push({
+        actor: w.actor.id,
+        turn_id: w.currentTurnId,
+        ...(w.currentMsgId ? { msg_id: w.currentMsgId } : {}),
+        order: w.currentTurnOrder || 0,
+      });
     }
   }
   for (const [, nt] of state.nestedTurns) {
@@ -1181,7 +1233,7 @@ function ensureRuntime(state: CidState): WorkerState {
     // guard on `running`), so the placeholder is never observed.
     actor: { kind: 'commander', id: COMMANDER_ID, name: 'Commander', joined_at: nowIso() },
     queue: [], running: false, wake: null,
-    abortController: null, currentTurnId: null, currentTurnOrder: null, turnsThisActivation: 0,
+    abortController: null, currentTurnId: null, currentMsgId: null, currentTurnOrder: null, turnsThisActivation: 0,
     terminated: false,
   };
   state.workers.set(RUNTIME_KEY, w);
@@ -1245,6 +1297,7 @@ async function runWorkerLoop(state: CidState, w: WorkerState): Promise<void> {
     // means it spans the WHOLE turn lifecycle.
     w.running = true;
     w.currentTurnId = item.turnId;
+    w.currentMsgId = item.msgId;
     w.currentTurnOrder = ++state.nextTurnOrder;
     try {
       await runTurn(state, w, item);
@@ -1264,6 +1317,7 @@ async function runWorkerLoop(state: CidState, w: WorkerState): Promise<void> {
       }
     } finally {
       w.currentTurnId = null;
+      w.currentMsgId = null;
       w.currentTurnOrder = null;
       w.running = false;
     }
@@ -1352,6 +1406,7 @@ type ActorTurnResult =
       outcome: planExecutor.TurnOutcome;
       persistedMsg: GroupMessage | null;
       errText?: string;
+      aborted?: boolean;
     };
 
 // One actor turn: per-role prompt/tools, model (or CLI agent) stream,
@@ -1412,16 +1467,6 @@ async function runActorTurn(
       ? stateFile.sync_conflict_resolution.conflicts
       : [];
   } catch { /* no conversation-scoped extra roots */ }
-  // User-granted sandbox roots (plan §B2): directories the user explicitly
-  // authorized in Settings, available to every conversation's file/bash
-  // tools on top of the workspace + attachment scope. Deny-list + realpath
-  // re-checked at read time inside the feature.
-  try {
-    const granted = require('../granted_roots') as typeof import('../granted_roots');
-    for (const root of granted.grantedRootsForSandbox(uid)) {
-      if (!turnToolExtraRoots.includes(root)) turnToolExtraRoots.push(root);
-    }
-  } catch (err) { log.warn(`granted roots unavailable: ${(err as Error).message}`); }
   // First-turn replay: if the persistent session jsonl doesn't exist yet,
   // prepend a `<group-chat-history>` block built from the visibility slice
   // so the agent / commander has context. After the first turn, the
@@ -1446,6 +1491,10 @@ async function runActorTurn(
   // them on the same user turn — the manifest entry carries `attached="inline"`
   // so the LLM doesn't waste a read_file round-trip re-fetching what it already has.
   let turnImages: Array<{ data: string; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' }> = [];
+  let turnAttachmentMetadata = {
+    hasAttachments: !!(item.attachments && item.attachments.length),
+    attachmentTypes: [] as string[],
+  };
   // Capture the process trail to persist on the end-of-turn message so
   // history reload can rerender the rail (renderer accumulates it live, but
   // without persistence it vanishes on refresh). Cap the array so a runaway
@@ -1457,7 +1506,8 @@ async function runActorTurn(
   if (item.attachments && item.attachments.length) {
     try {
       const { buildAttachmentManifest } = await import('../chat_attachments');
-      const { manifest, images, skipped } = await buildAttachmentManifest(uid, cid, item.attachments);
+      const { manifest, images, skipped, metadata } = await buildAttachmentManifest(uid, cid, item.attachments);
+      turnAttachmentMetadata = metadata;
       if (manifest) messageText = `${manifest}\n${messageText}`;
       if (images.length) turnImages = images;
       if (skipped.length) {
@@ -1510,8 +1560,9 @@ async function runActorTurn(
   // Build system prompt + extra tools per role.
   let systemPrompt: string;
   let extraTools: AgentTool[] = [];
-  // CLI-backed agents fetch the spec but skip systemPrompt and extraTools;
-  // the LLM stream is replaced below by `runCliAgentTurn`.
+  let skillList: string[] | undefined;
+  // CLI-backed agents fetch the spec but skip systemPrompt / skillList /
+  // extraTools — the LLM stream is replaced below by `runCliAgentTurn`.
   // Hoisted here so the branch below can read it without re-fetching.
   let cliAgent: import('../agents').Agent | null = null;
   let actorInteractive = false;
@@ -1530,9 +1581,8 @@ async function runActorTurn(
       turnProjectId,
       () => segState.flush(),
     );
-    // Commander and in-process agents intentionally share skill visibility:
-    // no per-agent runtime skill filter; per-user disabled skills still gate
-    // the rendered block and direct reads.
+    // skillList stays undefined for commander — every skill is globally
+    // visible (skills are NOT project-scoped this round; see CLAUDE.md §6).
   } else if (actor.kind === 'worker') {
     // G8b ephemeral worker — no agent.json. Synthesize a minimal worker config
     // and reuse the agent-in-group prompt (duck-typed). The default tool set
@@ -1577,9 +1627,10 @@ async function runActorTurn(
       systemPrompt = ''; // unused on CLI path
     } else {
       systemPrompt = await buildAgentInGroupSystemPrompt(uid, agent, workingDir);
-      // In-process agents use the same skill surface as the commander. The
-      // agent's authored skill_list remains metadata for editing/compat, not
-      // a runtime restriction.
+      // Runtime skills are the intersection of the agent's whitelist and
+      // workflow references. A broad whitelist is authoring metadata; only
+      // skills the workflow actually names should reach the prompt.
+      skillList = await _runtimeSkillListForAgent(agent);
       extraTools = [buildSkillSearchTool(uid)];
     }
   }
@@ -1598,7 +1649,13 @@ async function runActorTurn(
   // conversation-scoped `state.producedPaths` is what uniquify consults
   // for ownership; we keep this Set per turn purely for UI surfacing.
   const turnProduced = new Set<string>();
-  const onFileWritten = (absPath: string) => {
+  const onFileWritten = async (absPath: string) => {
+    await finalizeProducedFile(absPath, {
+      userId: uid,
+      cid,
+      ...(turnProjectId ? { projectId: turnProjectId } : {}),
+      source: 'group_chat',
+    });
     turnProduced.add(absPath);
     state.producedPaths.add(absPath);
   };
@@ -1675,7 +1732,8 @@ async function runActorTurn(
   // workspace + attachment by default, so we expose these as
   // `readOnlyExtraRoots`: file-tools (read_file / search_files /
   // grep_files / stat_file) can see them, but write-side tools
-  // (edit_file / write_file / bash / markdown_to_pdf / generate_image)
+  // (edit_file / write_file / bash / markdown_to_pdf / html_to_pdf /
+  // generate_image)
   // cannot mutate paths inside. The structured `<agent>` / `<skill>`
   // containers are the only sanctioned mutation channels — any direct
   // edit_file would skip safeId / validateAgentInputs / bilingual
@@ -1767,7 +1825,7 @@ async function runActorTurn(
           });
         },
       });
-      for (const p of cliOut.produced || []) onFileWritten(p);
+      for (const p of cliOut.produced || []) await onFileWritten(p);
       finalText = cliOut.text;
       streamingText = cliOut.text;
       if (cliOut.error) errText = cliOut.error;
@@ -1788,7 +1846,7 @@ async function runActorTurn(
         sessionId,
         systemPrompt,
         workingDir,
-        agentName: 'orkas_chat',
+        agentName: actor.name || actor.id,
         ...(actor.kind === 'agent' ? { agentId: actor.id } : {}),
         cid,
         turnId: item.turnId,
@@ -1813,9 +1871,11 @@ async function runActorTurn(
           ...agentRoots,
         ],
         ...(turnImages.length ? { images: turnImages } : {}),
+        attachmentMetadata: turnAttachmentMetadata,
         ...(extraTools.length ? { extraTools } : {}),
-        // Skills are NOT project-scoped or agent-scoped this round — every
-        // group-chat LLM actor sees the same enabled skill surface.
+        ...(skillList !== undefined ? { skillList } : {}),
+        // Skills are NOT project-scoped this round; agent skillList still
+        // gates in-process agents' rendered skills and SkillStore.
       })) {
       // Stream events → process channel.
       if (ev.type === 'final') {
@@ -1906,7 +1966,11 @@ async function runActorTurn(
 
   let workingText = finalText || '';
   if (turnSyncConflictResolution.length && workingText && !errText && !aborted) {
-    void extractSyncConflictResults(workingText);
+    const results = extractSyncConflictResults(workingText);
+    const allowedIds = new Set(turnSyncConflictResolution.map((item) => item.id));
+    for (const result of results) {
+      if (!allowedIds.has(result.conflictId)) continue;
+    }
   }
 
   // ── Post-stream parsing (pure data extraction; no decisions) ──────────
@@ -1925,6 +1989,15 @@ async function runActorTurn(
   } | null = null;
   const createdAgents: Array<{ agent_id: string; name: string; kind: 'created' | 'updated' }> = [];
   const createdSkills: Array<{ skill_id: string; name: string; kind: 'created' | 'updated' }> = [];
+  let actorRunStatus: AgentRunStatus = (errText || aborted) ? 'error' : 'success';
+
+  if ((actor.kind === 'agent' || isCommander) && workingText) {
+    const result = extractActorResultFromFinal(workingText);
+    if (result.status) {
+      workingText = result.cleanText;
+      if (!errText && !aborted) actorRunStatus = result.status;
+    }
+  }
 
   if (actor.kind === 'agent' && actorInteractive && workingText) {
     const pi = extractPlanInteractionFromFinal(workingText);
@@ -2010,7 +2083,7 @@ async function runActorTurn(
             const target = await agentsFeat.getAgent(editId);
             if (!target) {
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Agent edit failed: agent not found (id=${editId}).</span>`;
-            } else if (target.source !== 'custom') {
+            } else if (target.source !== 'custom' && !false) {
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ Marketplace agents can't be edited from the main chat; fork one in the right-hand detail panel and edit there.</span>`;
             } else if (agentsFeat.isCliAgent(target)) {
               workingText = `${workingText}\n\n<span style="color:var(--danger)">⚠️ External agents can only be edited from the right-hand detail panel.</span>`;
@@ -2384,6 +2457,30 @@ async function runActorTurn(
   }
 
   await _syncStateStatus(state);
+  if (actor.kind === 'agent') {
+    try {
+      await agentsFeat.recordAgentRuntimeStats(actor.id, {
+        duration_ms: Math.max(0, Date.now() - turnStartedAt),
+        status: actorRunStatus,
+        aborted,
+        errored: !!errText,
+      });
+    } catch (err) {
+      log.warn(`agent runtime stats record failed cid=${cid} actor=${actor.id}: ${(err as Error).message}`);
+    }
+  }
+  if (isCommander && !item.nested) {
+    try {
+      await commanderRuntimeStats.recordCommanderRuntimeStats({
+        duration_ms: Math.max(0, Date.now() - turnStartedAt),
+        status: actorRunStatus,
+        aborted,
+        errored: !!errText,
+      }, uid);
+    } catch (err) {
+      log.warn(`commander runtime stats record failed cid=${cid}: ${(err as Error).message}`);
+    }
+  }
   log.info(
     `turn-end user=${uid} cid=${cid} actor=${actor.id} ms=${Date.now() - turnStartedAt}`
     + ` outcome=${outcome.kind}`
@@ -2396,7 +2493,7 @@ async function runActorTurn(
     + (aborted ? ' aborted=1' : ''),
   );
 
-  return { kind: 'completed', text: workingText, produced, outcome, persistedMsg, errText: errText || undefined };
+  return { kind: 'completed', text: workingText, produced, outcome, persistedMsg, errText: errText || undefined, aborted };
 }
 
 // ── System prompts ───────────────────────────────────────────────────────
@@ -2479,10 +2576,11 @@ function appendLanguageDirective(prompt: string): string {
 //
 // Format:
 //   `\`read_file(<ROOT>/<id>/agent.json)\` — ROOT by Source:\n` +
+//   `- builtin: <abs path>\n` +
+//   `- platform: <abs path>\n` +
 //   `- custom:  <abs path>\n` +
-//   `- marketplace: <abs path>\n` +
 //   `Use these ROOT values verbatim. \`id:\` is tool-call input only — prose mentions agents as @<name>.\n\n` +
-//   per-entry lines `- @<name> (Source: custom|marketplace, id: <agent_id>) — desc` + optional marker lines:
+//   per-entry lines `- @<name> (Source: builtin|platform|custom, id: <agent_id>) — desc` + optional marker lines:
 //   `  inputs: read agent.json before dispatch`
 //   `  interactive: true`
 //
@@ -2517,8 +2615,9 @@ async function buildAgentsIndexBlock(uid: string, allowedIds?: readonly string[]
   const marketplaceRoot = path.resolve(userMarketplaceAgentsDir(uid));
   const header = [
     '`read_file(<ROOT>/<id>/agent.json)` — ROOT by Source:',
+    `- builtin: ${marketplaceRoot}`,
+    `- platform: ${marketplaceRoot}`,
     `- custom:  ${customRoot}`,
-    `- marketplace: ${marketplaceRoot}`,
     'Use these ROOT values verbatim. `id:` is tool-call input only — prose mentions agents as @<name>.',
     '',
   ].join('\n');
@@ -2532,7 +2631,8 @@ async function buildAgentsIndexBlock(uid: string, allowedIds?: readonly string[]
       const name = a.name || a.agent_id;
       const description = compactPromptDescription(pickDescription(a, lang));
       const desc = description ? ` — ${description}` : '';
-      const head = `- ${buildMention(name)} (Source: ${a.source}, id: ${a.agent_id})${desc}`;
+      const source = agentsFeat.agentPrioritySource(a);
+      const head = `- ${buildMention(name)} (Source: ${source}, id: ${a.agent_id})${desc}`;
       const inputs = Array.isArray(a.inputs) ? a.inputs : null;
       const markers: string[] = [];
       if (inputs && inputs.length) {
@@ -2549,7 +2649,7 @@ async function buildAgentsIndexBlock(uid: string, allowedIds?: readonly string[]
 
 async function buildAgentInGroupSystemPrompt(
   _uid: string,
-  agent: { name?: string; description?: string; workflow?: string; agent_id: string; inputs?: unknown; output_format?: string; interactive?: boolean },
+  agent: { name?: string; description?: string; description_zh?: string; description_en?: string; workflow?: string; agent_id: string; inputs?: unknown; output_format?: string; interactive?: boolean; profile?: unknown },
   workingDir: string,
 ): Promise<string> {
   const { prompts } = await import('../../prompts/loader');
@@ -2565,14 +2665,16 @@ async function buildAgentInGroupSystemPrompt(
     return rest;
   });
   const inputsSchemaJson = slimmed.length ? JSON.stringify(slimmed) : '';
+  const runtimeGuidance = buildAgentRuntimeGuidance(agent.profile);
   // Skill ROOT path constants are NOT passed in here either — the
   // skill-registry render block embeds them inline, see commander
   // counterpart above.
   const main = prompts.load('chat_agent_in_group', {
     name: agent.name || '',
     agent_id: agent.agent_id,
-    description: agent.description || '(not provided)',
+    description: pickAgentRuntimeDescription(agent),
     workflow: (agent.workflow || '').trim() || '(not provided)',
+    agent_runtime_guidance: runtimeGuidance,
     inputs_schema: inputsSchemaJson || '(none)',
     working_dir: workingDir,
     output_format_hint: buildOutputFormatHint(agent.output_format),
@@ -2580,6 +2682,57 @@ async function buildAgentInGroupSystemPrompt(
   });
   const shared = prompts.load('chat_shared_rules', {});
   return appendLanguageDirective(concatSharedRules(main, shared));
+}
+
+function pickAgentRuntimeDescription(agent: { description?: string; description_zh?: string; description_en?: string }): string {
+  const legacy = typeof agent.description === 'string' ? agent.description.trim() : '';
+  const zh = typeof agent.description_zh === 'string' ? agent.description_zh.trim() : '';
+  const en = typeof agent.description_en === 'string' ? agent.description_en.trim() : '';
+  if (legacy) return legacy;
+  return descriptionLang(getLanguage()) === 'zh'
+    ? (zh || en || '(not provided)')
+    : (en || zh || '(not provided)');
+}
+
+function buildAgentRuntimeGuidance(profile: unknown): string {
+  if (!profile || typeof profile !== 'object') return '(none)';
+  const src = profile as Record<string, unknown>;
+  const textList = (value: unknown): string[] => Array.isArray(value)
+    ? value.map((item) => {
+        if (typeof item === 'string') return item.trim();
+        if (!item || typeof item !== 'object') return '';
+        const obj = item as Record<string, unknown>;
+        return String(obj.title || obj.description || '').trim();
+      }).filter(Boolean)
+    : [];
+  const role = typeof src.role === 'string' ? src.role.trim() : '';
+  const dispatch = typeof src.dispatch === 'string' ? src.dispatch.trim() : '';
+  const knowhow = textList(src.knowhow);
+  const standards = textList(src.standards);
+  const sections: string[] = [];
+  if (role || dispatch) {
+    const lines = [
+      '### Agent role notes',
+      ...(role ? [`- Role: ${role}`] : []),
+      ...(dispatch ? [`- Dispatch fit: ${dispatch}`] : []),
+    ];
+    sections.push(lines.join('\n'));
+  }
+  if (knowhow.length) {
+    sections.push([
+      '### Agent strengths',
+      'Use these as stable task areas and capabilities where this agent should perform especially well. If the inbound task falls outside them, be explicit about the mismatch instead of overstating confidence.',
+      ...knowhow.map((item) => `- ${item}`),
+    ].join('\n'));
+  }
+  if (standards.length) {
+    sections.push([
+      '### Delivery standards',
+      'Mandatory handoff criteria. Before your final reply, silently compare the result against every item below. Revise unmet items; if a standard cannot be met, state the exact blocker clearly.',
+      ...standards.map((item) => `- ${item}`),
+    ].join('\n'));
+  }
+  return sections.length ? sections.join('\n\n') : '(none)';
 }
 
 function buildPlanInteractionHint(interactive: boolean): string {
@@ -2658,10 +2811,14 @@ async function resolveDispatchTarget(cid: string, toRaw: string): Promise<string
   if (key === 'user' || key === '用户') return USER_ID;
   try {
     const all = await agentsFeat.listAgents();
-    for (const a of all) {
-      if (a.enabled === false) continue;
-      if (a.name && a.name.toLowerCase().replace(/\s+/g, '') === key) return a.agent_id;
-    }
+    const matches = all
+      .filter((a) => a.enabled !== false)
+      .filter((a) => !!a.name && a.name.toLowerCase().replace(/\s+/g, '') === key)
+      .sort((a, b) => {
+        const byRank = agentsFeat.agentPriorityRank(a) - agentsFeat.agentPriorityRank(b);
+        return byRank || a.agent_id.localeCompare(b.agent_id);
+      });
+    if (matches[0]) return matches[0].agent_id;
   } catch (err) {
     log.warn(`resolveDispatchTarget listAgents failed cid=${cid}: ${(err as Error).message}`);
   }
@@ -2718,13 +2875,22 @@ function buildWorkerResultPayload(
   ].join('\n');
 }
 
-function buildWorkerErrorPayload(workerName: string, errorText: string): string {
+function buildWorkerErrorPayload(workerName: string, errorText: string, opts?: { aborted?: boolean }): string {
   const message = String(errorText || '').trim() || 'Worker failed without an error message.';
+  const abortedAttr = opts?.aborted ? ' aborted="true"' : '';
   return [
-    `<worker-error from="${escapeXmlAttr(workerName)}">`,
+    `<worker-error from="${escapeXmlAttr(workerName)}"${abortedAttr}>`,
     escapeXmlText(message),
     `</worker-error>`,
   ].join('\n');
+}
+
+function buildWorkerAbortPayload(workerName: string, partialText?: string): string {
+  const partial = String(partialText || '').trim();
+  const message = partial
+    ? `Task was stopped by the user.\n\nPartial result:\n${partial}`
+    : 'Task was stopped by the user.';
+  return buildWorkerErrorPayload(workerName, message, { aborted: true });
 }
 
 function extractBlockedFormFromWorkerResult(payload: string): { form_id: string; agent_id: string } | null {
@@ -2781,7 +2947,7 @@ async function runNestedDispatch(
   const w: WorkerState = {
     uid: state.uid, cid: state.cid, actor,
     queue: [], running: true, wake: null, abortController: ac,
-    currentTurnId: null, currentTurnOrder: null, turnsThisActivation: 0, terminated: false,
+    currentTurnId: null, currentMsgId: null, currentTurnOrder: null, turnsThisActivation: 0, terminated: false,
   };
   const payload = composeLlmTurnPayload(COMMANDER_ID, {
     id: genId12(), ts: nowIso(), from: COMMANDER_ID, to: [actor.id], text: task,
@@ -2810,7 +2976,12 @@ async function runNestedDispatch(
   // which is exactly why no start-of-turn state_changed listed this actor before.
   const surfaced = actor.kind === 'agent';
   if (surfaced) {
-    state.nestedTurns.set(item.turnId, { actor: actor.id, turn_id: item.turnId, order: ++state.nextTurnOrder });
+    state.nestedTurns.set(item.turnId, {
+      actor: actor.id,
+      turn_id: item.turnId,
+      msg_id: item.msgId,
+      order: ++state.nextTurnOrder,
+    });
     await emitStateChanged(state);
   }
   try {
@@ -2820,9 +2991,18 @@ async function runNestedDispatch(
     } catch (err) {
       const message = (err as Error).message || String(err);
       log.warn(`nested-dispatch threw cid=${state.cid} worker=${actor.id}: ${message}`);
+      if (ac.signal.aborted || parentSignal?.aborted) {
+        return buildWorkerAbortPayload(actor.name || actor.id);
+      }
       return buildWorkerErrorPayload(actor.name || actor.id, message);
     }
+    if (r.kind === 'completed' && r.aborted) {
+      return buildWorkerAbortPayload(actor.name || actor.id, r.text);
+    }
     if (r.kind !== 'completed') {
+      if (ac.signal.aborted || parentSignal?.aborted) {
+        return buildWorkerAbortPayload(actor.name || actor.id);
+      }
       return buildWorkerErrorPayload(actor.name || actor.id, 'Worker turn ended before producing a result.');
     }
     if (r.errText) {

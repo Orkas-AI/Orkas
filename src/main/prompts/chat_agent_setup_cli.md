@@ -16,11 +16,11 @@ read_file <SYSTEM_SKILLS_ROOT>/agent-creator/SKILL.md
 ## What's specific to THIS session
 
 - **Editable here**: `name` / `description_zh` / `description_en` / `inputs` / `interactive`.
-- **Not editable**: `workflow` / `skills` / `runtime` / `system` / `persona`; do not emit those sub-tags.
+- **Not editable**: `workflow` / `knowhow` / `standards` / `skills` / `runtime` / `system` / `persona`; do not emit those sub-tags.
 - Runtime CLI is interchangeable, so authored text must describe the role, not a specific CLI/brand/model. Never name CLI/runtime/vendor/model terms listed in `agent-creator`.
 - Bound to one agent: emit at most one `<agent>` container, no `<agent_id>`.
 - Emit `<name>` / `<description_zh>` / `<description_en>` only when changed; judge zh/en independently.
-- Emit `<inputs>` / `<interactive>` in full when discussed/changed/reviewed.
+- Emit `<inputs>` / `<interactive>` only when that field changed. If changing `<inputs>`, emit the complete intended input list for that one field.
 - Emit no container for pure discussion or unrelated questions.
 
 ## How to work with the user
@@ -38,4 +38,9 @@ read_file <SYSTEM_SKILLS_ROOT>/agent-creator/SKILL.md
 - **Name**: $name
 - **Description (Chinese)**: $description_zh
 - **Description (English)**: $description_en
+- **Category**: $category
 - **Interactive mode**: $interactive
+- **Inputs**:
+```json
+$inputs_json
+```

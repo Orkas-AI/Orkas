@@ -67,6 +67,21 @@
       "task_en": "Create or edit an Office document"
     },
     {
+      "id": "Lark-CLI",
+      "name": "Lark-CLI",
+      "repo": "larksuite/cli",
+      "category": "office",
+      "driver": "cli",
+      "glyph": "◒",
+      "color": "#00b96b",
+      "by": "LarkSuite",
+      "home": true,
+      "description_zh": "飞书官方 CLI 与 Agent Skills，接入文档、表格、多维表格、消息、日历、任务和会议纪要。",
+      "description_en": "Official Lark/Feishu CLI and Agent Skills for Docs, Sheets, Base, messages, calendar, tasks, and meeting notes.",
+      "task_zh": "接入飞书并帮我处理文档、表格或日程",
+      "task_en": "Connect Lark/Feishu and help me work with docs, sheets, or calendar events"
+    },
+    {
       "id": "crawl4ai",
       "name": "Crawl4AI",
       "repo": "unclecode/crawl4ai",

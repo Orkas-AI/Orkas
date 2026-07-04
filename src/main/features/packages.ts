@@ -21,7 +21,7 @@
  *     "commit": "<sha>",
  *     "kind": "skill" | "cli" | "both",
  *     "skill_roots": [".", "skills"],   // rel dirs whose children (or self) hold SKILL.md
- *     "bin_entries": [{"name": "hyperframes", "target": "bin/cli.js", "runtime": "node"}],
+ *     "bin_entries": [{"name": "hyperframes", "target": "bin/cli.js", "runtime": "node" | "python" | "sh" | "native"}],
  *     "deps_consent": true,             // D3: user approved dependency installs for this package
  *     "enabled": true,
  *     "installed_at": "<iso>", "updated_at": "<iso>"
@@ -55,7 +55,7 @@ const log = createLogger('packages');
 export interface PackageBinEntry {
   name: string;
   target: string;
-  runtime: 'node' | 'python' | 'sh';
+  runtime: 'node' | 'python' | 'sh' | 'native';
 }
 
 export interface PackageEntry {
@@ -102,7 +102,7 @@ function sanitiseEntry(raw: unknown): PackageEntry | null {
       const { name, target, runtime } = b as Record<string, unknown>;
       if (!isSafePackageName(name)) continue;
       if (typeof target !== 'string' || path.isAbsolute(target) || target.split(/[\\/]/).includes('..')) continue;
-      if (runtime !== 'node' && runtime !== 'python' && runtime !== 'sh') continue;
+      if (runtime !== 'node' && runtime !== 'python' && runtime !== 'sh' && runtime !== 'native') continue;
       binEntries.push({ name, target, runtime });
     }
   }
@@ -322,6 +322,54 @@ function isFile(p: string): boolean {
   try { return fs.statSync(p).isFile(); } catch { return false; }
 }
 
+function normalizeGithubRepoKey(raw: unknown): string {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  return s
+    .replace(/^git\+/i, '')
+    .replace(/^https:\/\/github\.com\//i, '')
+    .replace(/^git@github\.com:/i, '')
+    .replace(/\.git$/i, '')
+    .replace(/\/+$/g, '')
+    .toLowerCase();
+}
+
+let _ossProjectNameByRepo: Map<string, string> | null = null;
+function ossProjectNameByRepo(): Map<string, string> {
+  if (_ossProjectNameByRepo) return _ossProjectNameByRepo;
+  const out = new Map<string, string>();
+  try {
+    const file = path.join(__dirname, '..', 'data', 'oss-projects.json');
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as { projects?: unknown[] };
+    for (const raw of Array.isArray(parsed.projects) ? parsed.projects : []) {
+      if (!raw || typeof raw !== 'object') continue;
+      const row = raw as Record<string, unknown>;
+      const key = normalizeGithubRepoKey(row.repo);
+      const name = String(row.name || '').trim();
+      if (key && name) out.set(key, name);
+    }
+  } catch (err) {
+    log.warn(`oss project catalog read failed for package display names: ${(err as Error).message}`);
+  }
+  _ossProjectNameByRepo = out;
+  return out;
+}
+
+function packageJsonDisplayName(uid: string, pkg: PackageEntry): string {
+  try {
+    const file = path.join(userPackageDir(uid, pkg.name), 'package.json');
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as { name?: unknown };
+    return typeof parsed.name === 'string' ? parsed.name.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+function packageDisplayName(uid: string, pkg: PackageEntry): string {
+  const repoName = ossProjectNameByRepo().get(normalizeGithubRepoKey(pkg.repo_url || ''));
+  return repoName || packageJsonDisplayName(uid, pkg) || pkg.name;
+}
+
 function countPackageSkills(uid: string, pkg: PackageEntry): number {
   const pkgDir = userPackageDir(uid, pkg.name);
   const seen = new Set<string>();
@@ -350,6 +398,7 @@ function countPackageSkills(uid: string, pkg: PackageEntry): number {
 /** Package rows for the management UI. */
 export interface PackageUiRow {
   name: string;
+  display_name?: string;
   kind: 'skill' | 'cli' | 'both';
   enabled: boolean;
   repo_url?: string;
@@ -362,6 +411,7 @@ export interface PackageUiRow {
 export function listPackagesForUi(uid: string): PackageUiRow[] {
   return readPackagesRegistry(uid).packages.map((p) => ({
     name: p.name,
+    display_name: packageDisplayName(uid, p),
     kind: p.kind,
     enabled: p.enabled !== false,
     ...(p.repo_url ? { repo_url: p.repo_url } : {}),
@@ -384,4 +434,59 @@ export function packagesBinDirIfActive(uid: string): string | null {
   } catch {
     return null;
   }
+}
+
+const PACKAGE_BIN_REL_DIRS = ['npm/bin', 'bin'];
+
+function hasExecutableFile(dir: string): boolean {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  for (const entry of entries) {
+    if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+    const abs = path.join(dir, entry.name);
+    try {
+      const st = fs.statSync(abs);
+      if (process.platform === 'win32') return true;
+      if ((st.mode & 0o111) !== 0) return true;
+    } catch { /* ignore broken symlinks */ }
+  }
+  return false;
+}
+
+/** Directories contributed by enabled external packages that should be
+ * prepended to the bash / interactive-CLI PATH for this user. `.bin` is the
+ * normal shim location; package-local bin dirs are a compatibility fallback
+ * for repos that ship their own executable bundle but no generated shim. */
+export function packagePathEntriesIfActive(uid: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (dir: string | null | undefined) => {
+    if (!dir) return;
+    const resolved = path.resolve(dir);
+    if (seen.has(resolved)) return;
+    try {
+      if (!fs.statSync(resolved).isDirectory()) return;
+    } catch {
+      return;
+    }
+    seen.add(resolved);
+    out.push(resolved);
+  };
+
+  add(packagesBinDirIfActive(uid));
+
+  for (const pkg of readPackagesRegistry(uid).packages) {
+    if (!pkg.enabled) continue;
+    const pkgRoot = userPackageDir(uid, pkg.name);
+    for (const rel of PACKAGE_BIN_REL_DIRS) {
+      const dir = path.join(pkgRoot, rel);
+      if (hasExecutableFile(dir)) add(dir);
+    }
+  }
+
+  return out;
 }

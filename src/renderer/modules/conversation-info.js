@@ -1,9 +1,9 @@
 // ─── Conversation info side panel ───────────────────────────────────────
 // Right-side companion panel for the active conversation. It summarizes the
-// structured plan, workspace files, and attachments. The file tab reads the
-// live conversation workspace first, then merges chip-tracked produced files
-// from history so the panel stays aligned with disk even when tools create
-// files through bash / CLI flows.
+// workspace files and attachments. The file tab reads the live conversation
+// workspace first, then merges chip-tracked produced files from history so
+// the panel stays aligned with disk even when tools create files through
+// bash / CLI flows.
 
 const ConversationInfo = (() => {
   const _infoLog = (typeof createLogger === 'function')
@@ -12,20 +12,18 @@ const ConversationInfo = (() => {
 
   let _cid = null;
   let _open = false;
-  let _activeTab = 'tasks';
+  let _activeTab = 'files';
   let _seq = 0;
-  let _taskSeq = 0;
   let _fileSeq = 0;
   let _attachmentSeq = 0;
   const _locallyDeletedPaths = new Set();
   let _loading = false;
+  let _loadingSource = '';
+  let _loadingSeq = 0;
   let _error = '';
   let _snapshot = {
     conversation: null,
     history: [],
-    plan: null,
-    planControl: null,
-    members: [],
     files: [],
     fileRoot: '',
     fileRootExists: false,
@@ -35,6 +33,26 @@ const ConversationInfo = (() => {
     syncEnabled: false,
     attachments: [],
   };
+  const _CI_TEXT_EXTS = new Set([
+    'md', 'markdown', 'txt', 'csv', 'tsv', 'json', 'yaml', 'yml', 'log',
+    'html', 'htm', 'xml', 'toml', 'ini', 'conf',
+    'py', 'pyi', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs',
+    'sh', 'bash', 'zsh', 'ps1', 'cmd', 'bat', 'rb', 'go', 'rs', 'java', 'kt',
+    'c', 'cpp', 'cc', 'h', 'hpp', 'css', 'scss', 'less',
+    'sql', 'graphql', 'gql',
+  ]);
+  const _CI_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif']);
+  const _CI_OFFICE_WORD_EXTS = new Set(['docx', 'docm']);
+  const _CI_OFFICE_SHEET_EXTS = new Set(['xlsx', 'xlsm']);
+  const _CI_OFFICE_PRESENTATION_EXTS = new Set(['pptx', 'pptm']);
+  const _CI_LIBRARY_IMPORT_EXTS = new Set([
+    ..._CI_TEXT_EXTS,
+    ..._CI_IMAGE_EXTS,
+    ..._CI_OFFICE_WORD_EXTS,
+    ..._CI_OFFICE_SHEET_EXTS,
+    ..._CI_OFFICE_PRESENTATION_EXTS,
+    'pdf',
+  ]);
 
   function _label(key, fallback, vars) {
     try {
@@ -54,6 +72,12 @@ const ConversationInfo = (() => {
   function _baseName(p) {
     const parts = String(p || '').split(/[\\/]/).filter(Boolean);
     return parts.length ? parts[parts.length - 1] : String(p || '');
+  }
+
+  function _extForName(name) {
+    const base = _baseName(name);
+    const idx = base.lastIndexOf('.');
+    return idx >= 0 ? base.slice(idx + 1).toLowerCase() : '';
   }
 
   function _dirName(p) {
@@ -145,32 +169,6 @@ const ConversationInfo = (() => {
     return '';
   }
 
-  const _CI_IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif']);
-  const _CI_OFFICE_WORD_EXTS = new Set(['docx', 'docm']);
-  const _CI_OFFICE_SHEET_EXTS = new Set(['xlsx', 'xlsm']);
-  const _CI_OFFICE_PRESENTATION_EXTS = new Set(['pptx', 'pptm']);
-  const _CI_TEXT_EXTS = new Set([
-    'md', 'markdown', 'txt', 'csv', 'tsv', 'json', 'yaml', 'yml', 'log',
-    'html', 'htm', 'xml', 'toml', 'ini', 'conf',
-    'py', 'pyi', 'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs',
-    'sh', 'bash', 'zsh', 'ps1', 'cmd', 'bat', 'rb', 'go', 'rs', 'java', 'kt',
-    'c', 'cpp', 'cc', 'h', 'hpp', 'css', 'scss', 'less',
-    'sql', 'graphql', 'gql',
-  ]);
-  const _CI_LIBRARY_IMPORT_EXTS = new Set([
-    ..._CI_IMAGE_EXTS,
-    ..._CI_OFFICE_WORD_EXTS,
-    ..._CI_OFFICE_SHEET_EXTS,
-    ..._CI_OFFICE_PRESENTATION_EXTS,
-    ..._CI_TEXT_EXTS,
-    'pdf',
-  ]);
-
-  function _extForName(name) {
-    const parts = String(name || '').split('.');
-    return parts.length > 1 ? (parts.pop() || '').toLowerCase() : '';
-  }
-
   function _kindForName(name) {
     const ext = _extForName(name);
     if (_CI_IMAGE_EXTS.has(ext)) return 'image';
@@ -209,16 +207,8 @@ const ConversationInfo = (() => {
 
   async function _load(cid) {
     const enc = encodeURIComponent(cid);
-    const [historyData, planData, memberData, filesData, attachmentData, syncEnabled] = await Promise.all([
+    const [historyData, filesData, attachmentData, syncEnabled] = await Promise.all([
       _fetchJson(`/api/conversations/${enc}/history?limit=500`),
-      _fetchJson(`/api/conversations/${enc}/plan`).catch((err) => {
-        _infoLog.warn('plan load failed', { cid, error: err && err.message });
-        return { plan: null };
-      }),
-      _fetchJson(`/api/conversations/${enc}/members`).catch((err) => {
-        _infoLog.warn('member load failed', { cid, error: err && err.message });
-        return { actors: [] };
-      }),
       _fetchJson(`/api/conversations/${enc}/files`).catch((err) => {
         _infoLog.warn('file list load failed', { cid, error: err && err.message });
         return { items: [], root: '', rootExists: false, truncated: false, count: 0, scanSkipped: false };
@@ -232,9 +222,6 @@ const ConversationInfo = (() => {
     return {
       conversation: historyData.conversation || null,
       history: Array.isArray(historyData.history) ? historyData.history : [],
-      plan: planData.plan || null,
-      planControl: planData.control || null,
-      members: Array.isArray(memberData.actors) ? memberData.actors : [],
       files: Array.isArray(filesData.items) ? filesData.items : [],
       fileRoot: typeof filesData.root === 'string' ? filesData.root : '',
       fileRootExists: filesData.rootExists === true,
@@ -246,54 +233,29 @@ const ConversationInfo = (() => {
     };
   }
 
-  async function _loadTaskSnapshot(cid) {
-    const enc = encodeURIComponent(cid);
-    const [historyData, planData, memberData] = await Promise.all([
-      _fetchJson(`/api/conversations/${enc}/history?limit=500`),
-      _fetchJson(`/api/conversations/${enc}/plan`).catch((err) => {
-        _infoLog.warn('plan load failed', { cid, error: err && err.message });
-        return { plan: null };
-      }),
-      _fetchJson(`/api/conversations/${enc}/members`).catch((err) => {
-        _infoLog.warn('member load failed', { cid, error: err && err.message });
-        return { actors: [] };
-      }),
-    ]);
-    return {
-      conversation: historyData.conversation || null,
-      history: Array.isArray(historyData.history) ? historyData.history : [],
-      plan: planData.plan || null,
-      planControl: planData.control || null,
-      members: Array.isArray(memberData.actors) ? memberData.actors : [],
-    };
-  }
-
   async function _loadFileSnapshot(cid) {
     const enc = encodeURIComponent(cid);
-    const [historyData, planData, filesData, syncEnabled] = await Promise.all([
+    const [historyData, filesData] = await Promise.all([
       _fetchJson(`/api/conversations/${enc}/history?limit=500`),
-      _fetchJson(`/api/conversations/${enc}/plan`).catch((err) => {
-        _infoLog.warn('plan load failed', { cid, error: err && err.message });
-        return { plan: null };
-      }),
       _fetchJson(`/api/conversations/${enc}/files`).catch((err) => {
         _infoLog.warn('file list load failed', { cid, error: err && err.message });
         return { items: [], root: '', rootExists: false, truncated: false, count: 0, scanSkipped: false };
       }),
     ]);
+    // syncEnabled is intentionally omitted so a partial file refresh preserves
+    // the value from the last full _load instead of clobbering it.
     return {
       conversation: historyData.conversation || null,
       history: Array.isArray(historyData.history) ? historyData.history : [],
-      plan: planData.plan || null,
       files: Array.isArray(filesData.items) ? filesData.items : [],
       fileRoot: typeof filesData.root === 'string' ? filesData.root : '',
       fileRootExists: filesData.rootExists === true,
       filesTruncated: filesData.truncated === true,
       filesCount: Number(filesData.count) || 0,
       filesScanSkipped: filesData.scanSkipped === true,
-      syncEnabled: syncEnabled === true,
     };
   }
+
   async function _loadSyncEnabled() {
     return false;
   }
@@ -318,255 +280,6 @@ const ConversationInfo = (() => {
     return c && c.title ? c.title : _label('chat.new_conv_title', 'New conversation');
   }
 
-  function _normalizeActorKey(value) {
-    return String(value || '').trim().replace(/^@+/, '').replace(/\s+/g, '').toLowerCase();
-  }
-
-  function _buildMemberLookup(members) {
-    const byKey = new Map();
-    const add = (key, actor) => {
-      const norm = _normalizeActorKey(key);
-      if (norm && actor) byKey.set(norm, actor);
-    };
-    for (const actor of Array.isArray(members) ? members : []) {
-      if (!actor || !actor.id) continue;
-      add(actor.id, actor);
-      add(actor.name, actor);
-    }
-    add('commander', { id: 'commander', kind: 'commander', name: _label('chat.recipient_commander', 'Commander') });
-    add('指挥官', { id: 'commander', kind: 'commander', name: _label('chat.recipient_commander', 'Commander') });
-    add('我自己', { id: 'commander', kind: 'commander', name: _label('chat.recipient_commander', 'Commander') });
-    add('自己', { id: 'commander', kind: 'commander', name: _label('chat.recipient_commander', 'Commander') });
-    add('user', { id: 'user', kind: 'user', name: _label('chat.from_user', 'User') });
-    add('用户', { id: 'user', kind: 'user', name: _label('chat.from_user', 'User') });
-    return { byKey };
-  }
-
-
-
-  function _statusLabel(status) {
-    const raw = String(status || 'pending');
-    const fallback = {
-      pending: 'Pending',
-      in_progress: 'Running',
-      done: 'Done',
-      failed: 'Failed',
-      skipped: 'Skipped',
-      blocked: 'Blocked',
-    }[raw] || raw;
-    return _label(`conversation_info.status.${raw}`, fallback);
-  }
-
-  function _statusIcon(status) {
-    const raw = String(status || 'pending');
-    const iconName = {
-      pending: 'hourglass',
-      in_progress: 'play',
-      done: 'check-circle',
-      failed: 'x-circle',
-      skipped: 'skip-forward',
-      blocked: 'document-pencil',
-    }[raw] || 'info';
-    if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
-      return window.uiIconHtml(iconName, 'ui-icon conversation-info-step-status-icon');
-    }
-    return '';
-  }
-
-  function _assigneeLabel(raw) {
-    const a = String(raw || '').trim();
-    if (!a) return '';
-    if (a === 'commander') return _label('chat.recipient_commander', 'Commander');
-    if (a === 'user') return _label('chat.from_user', 'User');
-    const lookup = _buildMemberLookup(_snapshot.members);
-    const actor = lookup.byKey.get(_normalizeActorKey(a));
-    return '@' + (actor?.name || a);
-  }
-
-  // Deterministic id → palette pick — mirrors PC/docs/design/TOKENS.md §1.4
-  // (agent role colors). Used for assignee avatars in the new Tasks/Files
-  // body where the actor row may not carry a .color field.
-  const _CI_MEMBER_PALETTE = ['#0ea5e9', '#8b5cf6', '#10b981', '#f59e0b', '#ef4444', '#06b6d4', '#16181d'];
-  function _ciPickColor(actor) {
-    if (actor && actor.color && typeof actor.color === 'string') return actor.color;
-    const id = String((actor && actor.id) || actor || '');
-    if (!id) return _CI_MEMBER_PALETTE[0];
-    let h = 0;
-    for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
-    return _CI_MEMBER_PALETTE[h % _CI_MEMBER_PALETTE.length];
-  }
-  function _ciInitial(name) {
-    return String((name || '?').trim().slice(0, 1)).toUpperCase();
-  }
-
-  // Compact elapsed `Nm Ss` style; mono-formatted in the header strip.
-  function _ciFormatElapsed(plan) {
-    if (!plan || !plan.created_at) return '';
-    const start = new Date(plan.created_at).getTime();
-    if (!Number.isFinite(start)) return '';
-    const end = (plan.updated_at && _isPlanComplete(plan))
-      ? new Date(plan.updated_at).getTime()
-      : Date.now();
-    const diff = Math.max(0, end - start);
-    const s = Math.floor(diff / 1000);
-    if (s < 60) return `${s}s`;
-    const m = Math.floor(s / 60);
-    const rs = s % 60;
-    if (m < 60) return `${m}m ${rs}s`;
-    const h = Math.floor(m / 60);
-    return `${h}h ${m % 60}m`;
-  }
-  function _isPlanComplete(plan) {
-    const steps = (plan && plan.steps) || [];
-    return steps.length > 0 && steps.every((s) => s && (s.status === 'done' || s.status === 'skipped'));
-  }
-  function _planDoneCount(plan) {
-    const steps = (plan && plan.steps) || [];
-    return steps.filter((s) => s && (s.status === 'done' || s.status === 'skipped')).length;
-  }
-
-  /** Resolve the right-side avatar spec for a step's assignee. Returns
-   *  `{icon, color, name, seed}` ready to feed `renderAvatarHtml`, or
-   *  `null` when the caches haven't surfaced an icon yet (caller falls
-   *  back to the legacy initial-color chip).
-   *
-   *  Cross-module symbols: `_agentsCache` lives in `agents.js`,
-   *  `_commanderAvatar` in `conversation.js` — both are top-level per
-   *  PC/CLAUDE.md §8 (no ESM in the renderer), so they're directly
-   *  reachable here. Guarded with `typeof` for the cold-boot window
-   *  before those modules' loaders have populated.
-   */
-  function _resolveAssigneeAvatar(assigneeId, actor) {
-    if (!assigneeId) return null;
-    const norm = _normalizeActorKey(assigneeId);
-    // `user` / `用户` collapse into commander semantically: the plan author
-    // (commander) is the one driving user-facing steps; the human is never a
-    // worker in the orchestration model. So a step assigned to "user" is
-    // really commander asking the user — display it as @指挥官 with the
-    // commander avatar.
-    if (norm === 'commander' || norm === 'user' || norm === '用户') {
-      const av = (typeof _commanderAvatar === 'function') ? _commanderAvatar() : { icon: '', color: '' };
-      return {
-        icon: av.icon || '',
-        color: av.color || '',
-        name: _label('chat.recipient_commander', 'Commander'),
-        seed: 'commander',
-      };
-    }
-    // Plan `s.assignee` stores the @-mention text (the agent's display name,
-    // e.g. "内容整理员"), not the 12-hex `agent_id`. `_buildMemberLookup`
-    // indexes members.json by both id AND name, so `actor.id` carries the
-    // canonical id when name resolution succeeded. Fall back to name match
-    // for agents that aren't in members.json yet (fresh plan, no turn run).
-    const canonicalId = (actor && actor.id) ? String(actor.id) : '';
-    if (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) {
-      const ag = _agentsCache.find((x) => x && (
-        (canonicalId && x.agent_id === canonicalId) || x.name === assigneeId
-      ));
-      if (ag) {
-        return {
-          icon: ag.icon || '',
-          color: ag.color || '',
-          name: ag.name || (actor && actor.name) || assigneeId,
-          seed: ag.agent_id || assigneeId,
-        };
-      }
-    }
-    return null;
-  }
-
-  function _renderTasks() {
-    const plan = _snapshot.plan;
-    const control = _snapshot.planControl || {};
-    const steps = (plan && Array.isArray(plan.steps)) ? plan.steps : [];
-    if (!plan || !steps.length) {
-      return `<div class="conversation-info-empty">${escapeHtml(_label('conversation_info.empty_tasks', 'No tasks yet'))}</div>`;
-    }
-    const done = _planDoneCount(plan);
-    const elapsed = _ciFormatElapsed(plan);
-    const bar = steps.map((s) => {
-      const status = String(s && s.status || 'pending');
-      let cls = '';
-      if (status === 'done' || status === 'skipped') cls = ' is-done';
-      else if (status === 'in_progress') cls = ' is-active';
-      else if (status === 'failed') cls = ' is-failed';
-      else if (status === 'blocked') cls = ' is-blocked';
-      return `<span class="ci-tasks-bar-cell${cls}"></span>`;
-    }).join('');
-    const lookup = _buildMemberLookup(_snapshot.members);
-    const checkIcon = _uiIcon('check', 'ci-tasks-step-check');
-    const list = steps.map((s) => {
-      const status = String(s && s.status || 'pending');
-      let kind = 'queued';
-      if (status === 'done') kind = 'done';
-      else if (status === 'skipped') kind = 'skipped';
-      else if (status === 'in_progress') kind = 'active';
-      else if (status === 'failed') kind = 'failed';
-      else if (status === 'blocked') kind = 'blocked';
-      const assigneeId = String(s && s.assignee || '');
-      const actor = lookup.byKey.get(_normalizeActorKey(assigneeId));
-      const avatarSpec = _resolveAssigneeAvatar(assigneeId, actor);
-      // Right-side avatar: agent's real icon + color (from `_agentsCache`)
-      // or commander's avatar; fall back to the initial-color chip when the
-      // caches haven't loaded yet or the assignee is a bare id string.
-      let avatarHtml = '';
-      if (avatarSpec && typeof renderAvatarHtml === 'function') {
-        avatarHtml = renderAvatarHtml(avatarSpec.icon, avatarSpec.color, {
-          size: 20,
-          seed: avatarSpec.seed,
-          extraClass: 'ci-tasks-step-avatar',
-        });
-      } else if (assigneeId) {
-        const fallbackName = (actor && actor.name) || assigneeId;
-        const fallbackColor = _ciPickColor({ id: assigneeId, color: actor && actor.color });
-        avatarHtml = `<span class="ci-tasks-step-assignee" style="background:${fallbackColor}" title="${escapeHtml(fallbackName)}">${escapeHtml(_ciInitial(fallbackName))}</span>`;
-      }
-      // Assignee name line under the title — `@commander` / `@user` map
-      // through i18n so a zh user sees 指挥官/用户 instead of the raw token,
-      // matching `plan-rail.js::_formatAssigneeMeta` semantics.
-      const displayName = (avatarSpec && avatarSpec.name) || (actor && actor.name) || assigneeId;
-      const nameHtml = assigneeId
-        ? `<div class="ci-tasks-step-assignee-name">@${escapeHtml(displayName)}</div>`
-        : '';
-      let inside = '';
-      if (kind === 'done')   inside = checkIcon;
-      else if (kind === 'active') inside = `<span class="ci-tasks-step-dot"></span>`;
-      else if (kind === 'failed') inside = _uiIcon('x', 'ci-tasks-step-check');
-      else if (kind === 'blocked') inside = _uiIcon('document-pencil', 'ci-tasks-step-check');
-      return `
-        <div class="ci-tasks-step is-${kind}" data-step-index="${escapeHtml(String(s.index || ''))}">
-          <span class="ci-tasks-step-circle">${inside}</span>
-          <div class="ci-tasks-step-main">
-            <div class="ci-tasks-step-title">${escapeHtml(s.title || '')}</div>
-            ${nameHtml}
-          </div>
-          ${avatarHtml}
-        </div>
-      `;
-    }).join('');
-    const planLabel = _label('plan.title', 'Execution Plan');
-    const action = control.action;
-    const controlHtml = (action === 'stop' || action === 'continue')
-      ? `<button type="button" class="ci-tasks-control is-${escapeHtml(action)}" id="ci-tasks-plan-control" data-plan-action="${escapeHtml(action)}">${escapeHtml(action === 'stop'
-        ? _label('plan.action.stop', 'Stop')
-        : _label('plan.action.continue', 'Continue'))}</button>`
-      : '';
-    return `
-      <div class="ci-tasks">
-        <div class="ci-tasks-head">
-          <div class="ci-tasks-head-row">
-            <span class="ci-tasks-head-label">${escapeHtml(planLabel)}</span>
-            <span class="ci-tasks-head-progress">${done}/${steps.length}</span>
-            ${elapsed ? `<span class="ci-tasks-head-elapsed">${escapeHtml(elapsed)}</span>` : ''}
-            ${controlHtml}
-          </div>
-          <div class="ci-tasks-bar">${bar}</div>
-        </div>
-        <div class="ci-tasks-list">${list}</div>
-      </div>
-    `;
-  }
-
   function _collectHistoryProducedFiles() {
     const byPath = new Map();
     for (const m of _snapshot.history || []) {
@@ -577,17 +290,6 @@ const ConversationInfo = (() => {
         const abs = String(p);
         if (_isLocallyDeletedPath(abs)) continue;
         byPath.set(abs, { path: abs, time: ts });
-      }
-    }
-    const planSteps = _snapshot.plan && Array.isArray(_snapshot.plan.steps)
-      ? _snapshot.plan.steps : [];
-    for (const step of planSteps) {
-      const produced = Array.isArray(step && step.output_files) ? step.output_files : [];
-      for (const p of produced) {
-        if (!p) continue;
-        const key = String(p);
-        if (_isLocallyDeletedPath(key)) continue;
-        if (!byPath.has(key)) byPath.set(key, { path: key, time: _snapshot.plan.updated_at || '' });
       }
     }
     return Array.from(byPath.values()).sort((a, b) => String(a.path).localeCompare(String(b.path)));
@@ -606,6 +308,7 @@ const ConversationInfo = (() => {
         path: p,
         relPath,
         name: item.name || _baseName(p),
+        kind: item.kind || _kindForName(item.name || p),
         time: item.mtime ? new Date(Number(item.mtime)).toISOString() : '',
         bytes: Number(item.bytes) || 0,
         source: 'workspace',
@@ -629,6 +332,7 @@ const ConversationInfo = (() => {
         ...produced,
         relPath,
         name: _baseName(p),
+        kind: _kindForName(_baseName(p)),
         source: 'produced',
       });
     }
@@ -723,7 +427,7 @@ const ConversationInfo = (() => {
           <span class="ci-files-sync-note-icon">${_uiIcon('info', 'ui-icon ci-files-sync-note-svg')}</span>
           <span>${escapeHtml(_label(
             'conversation_info.files_sync_note',
-            'Cloud sync does not include these files. Add any file to Library if you want it synced.'
+            'Cloud sync does not include these files. Add supported files to Library if you want them synced.'
           ))}</span>
         </div>`
       : '';
@@ -804,12 +508,6 @@ const ConversationInfo = (() => {
   // Tab count chips — filled from the same _snapshot as the body renderers.
   // Tasks count is `done/total`; files / attachments mirror visible rows.
   function _refreshTabCounts() {
-    const plan = _snapshot.plan;
-    const steps = (plan && Array.isArray(plan.steps)) ? plan.steps : [];
-    const tasksEl = document.getElementById('conversation-info-tab-count-tasks');
-    if (tasksEl) {
-      tasksEl.textContent = steps.length ? `${_planDoneCount(plan)}/${steps.length}` : '';
-    }
     const filesEl = document.getElementById('conversation-info-tab-count-files');
     if (filesEl) {
       const count = _collectVisibleFiles().length;
@@ -841,9 +539,8 @@ const ConversationInfo = (() => {
       _refreshTabCounts();
       return;
     }
-    if (_activeTab === 'files') body.innerHTML = _renderFiles();
-    else if (_activeTab === 'attachments') body.innerHTML = _renderAttachments();
-    else body.innerHTML = _renderTasks();
+    if (_activeTab === 'attachments') body.innerHTML = _renderAttachments();
+    else body.innerHTML = _renderFiles();
     // Hydrate any data-ui-icon placeholders that the renderers emitted.
     if (typeof window !== 'undefined' && typeof window.hydrateUiIcons === 'function') {
       window.hydrateUiIcons(body);
@@ -864,6 +561,30 @@ const ConversationInfo = (() => {
     });
   }
 
+  function _beginLoading(source, seq) {
+    _loading = true;
+    _loadingSource = source || '';
+    _loadingSeq = seq || 0;
+    _renderBody();
+  }
+
+  function _clearLoading(source, seq, opts = {}) {
+    if (!_loading || _loadingSource !== source) return false;
+    if (opts.clearAnyForSource === true || _loadingSeq === seq) {
+      _loading = false;
+      _loadingSource = '';
+      _loadingSeq = 0;
+      return true;
+    }
+    return false;
+  }
+
+  function _resetLoading() {
+    _loading = false;
+    _loadingSource = '';
+    _loadingSeq = 0;
+  }
+
   function _setOpen(next) {
     _open = !!next;
     _syncChrome();
@@ -875,10 +596,13 @@ const ConversationInfo = (() => {
     if (!target || target !== _cid || !_open) return;
     const seq = ++_seq;
     const silent = !!opts.silent;
-    if (!silent) {
-      _loading = true;
-      _error = '';
+    if (silent && _loadingSource === 'full') {
+      _clearLoading('full', seq, { clearAnyForSource: true });
       _renderBody();
+    }
+    if (!silent) {
+      _error = '';
+      _beginLoading('full', seq);
     }
     try {
       const snapshot = await _load(target);
@@ -890,7 +614,7 @@ const ConversationInfo = (() => {
       _error = (err && err.message) || String(err);
     } finally {
       if (seq === _seq && target === _cid) {
-        _loading = false;
+        _clearLoading('full', seq, { clearAnyForSource: silent });
         _renderBody();
       }
     }
@@ -920,41 +644,18 @@ const ConversationInfo = (() => {
     }
   }
 
-  async function refreshTasks(cid, opts = {}) {
-    const target = cid || _cid;
-    if (!target || target !== _cid || !_open) return;
-    const seq = ++_taskSeq;
-    const silent = !!opts.silent;
-    if (!silent && _activeTab === 'tasks') {
-      _loading = true;
-      _error = '';
-      _renderBody();
-    }
-    try {
-      const partial = await _loadTaskSnapshot(target);
-      if (seq !== _taskSeq || target !== _cid) return;
-      _snapshot = { ..._snapshot, ...partial };
-      _error = '';
-    } catch (err) {
-      if (seq !== _taskSeq || target !== _cid) return;
-      _error = (err && err.message) || String(err);
-    } finally {
-      if (seq === _taskSeq && target === _cid) {
-        _loading = false;
-        if (_activeTab === 'tasks') _renderBody();
-      }
-    }
-  }
-
   async function refreshFiles(cid, opts = {}) {
     const target = cid || _cid;
     if (!target || target !== _cid || !_open) return;
     const seq = ++_fileSeq;
     const silent = !!opts.silent;
+    if (silent && _loadingSource === 'files') {
+      _clearLoading('files', seq, { clearAnyForSource: true });
+      if (_activeTab === 'files') _renderBody();
+    }
     if (!silent && _activeTab === 'files') {
-      _loading = true;
       _error = '';
-      _renderBody();
+      _beginLoading('files', seq);
     }
     try {
       const partial = await _loadFileSnapshot(target);
@@ -970,8 +671,8 @@ const ConversationInfo = (() => {
         if (_activeTab === 'files') _renderBody();
       }
     } finally {
-      if (seq === _fileSeq && target === _cid && !silent) {
-        _loading = false;
+      if (seq === _fileSeq && target === _cid) {
+        _clearLoading('files', seq, { clearAnyForSource: silent });
         if (_activeTab === 'files') _renderBody();
       }
     }
@@ -980,11 +681,10 @@ const ConversationInfo = (() => {
   function bind(cid) {
     _cid = cid || null;
     _open = false;
-    _snapshot = { conversation: null, history: [], plan: null, planControl: null, members: [], files: [], fileRoot: '', fileRootExists: false, filesTruncated: false, filesCount: 0, filesScanSkipped: false, syncEnabled: false, attachments: [] };
+    _snapshot = { conversation: null, history: [], files: [], fileRoot: '', fileRootExists: false, filesTruncated: false, filesCount: 0, filesScanSkipped: false, syncEnabled: false, attachments: [] };
     _error = '';
-    _loading = false;
+    _resetLoading();
     _seq++;
-    _taskSeq++;
     _fileSeq++;
     _attachmentSeq++;
     _syncChrome();
@@ -1134,7 +834,7 @@ const ConversationInfo = (() => {
     const addItem = entryKind === 'file'
       ? `<div class="ctx-row-menu-item" data-action="add-to-chat">${escapeHtml(addLabel)}</div>`
       : '';
-    const addLibraryItem = entryKind === 'file' && _canAddEntryToLibrary(kind)
+    const addLibraryItem = entryKind === 'file' && _canAddEntryToLibrary(name || absPath)
       ? `<div class="ctx-row-menu-item" data-action="add-to-library">${escapeHtml(addLibraryLabel)}</div>`
       : '';
     const saveAppItem = canSaveApp
@@ -1196,8 +896,8 @@ const ConversationInfo = (() => {
     await _fallbackImportAttachments(entries);
   }
 
-  async function _addEntryToLibrary(absPath, kind) {
-    if (!_canAddEntryToLibrary(kind)) return;
+  async function _addEntryToLibrary(absPath) {
+    if (!_canAddEntryToLibrary(absPath)) return;
     try {
       const res = await window.orkas.invoke('library.importProduced', _fileActionPayload(absPath));
       if (!res || !res.ok) throw new Error((res && res.error) || 'failed');
@@ -1268,7 +968,7 @@ const ConversationInfo = (() => {
   async function _runFileMenuAction(action, absPath, displayName, kind) {
     if (action === 'reveal') return _revealEntry(absPath);
     if (action === 'save-as-app') return _saveEntryAsApp(absPath);
-    if (action === 'add-to-library') return _addEntryToLibrary(absPath, kind);
+    if (action === 'add-to-library') return _addEntryToLibrary(absPath);
     if (action === 'add-to-chat') return _addEntryToChat(absPath, kind);
     if (action === 'delete') return _deleteEntry(absPath, displayName, kind);
   }
@@ -1293,25 +993,6 @@ const ConversationInfo = (() => {
     }
   }
 
-  async function _runPlanControl(action) {
-    if (!_cid || (action !== 'stop' && action !== 'continue')) return;
-    if (typeof uiConfirm === 'function') {
-      const ok = await uiConfirm(action === 'stop'
-        ? _label('plan.confirm.stop', 'Stop the execution plan?')
-        : _label('plan.confirm.continue', 'Continue the execution plan?'));
-      if (!ok) return;
-    }
-    try {
-      await window.orkas.invoke(action === 'stop' ? 'groupChat.abort' : 'groupChat.continuePlan', { cid: _cid });
-      if (action === 'continue' && window.ConversationRuntime && typeof window.ConversationRuntime.observePlanRecoveryRun === 'function') {
-        window.ConversationRuntime.observePlanRecoveryRun(_cid);
-      }
-      if (window.PlanRail) window.PlanRail.refresh(_cid, { force: true });
-      await refreshTasks(_cid, { silent: true });
-    } catch (err) {
-      _infoLog.warn('plan-control failed', { cid: _cid, action, error: String(err && err.message || err) });
-    }
-  }
   function _bindDom() {
     const toggle = document.getElementById('conversation-info-toggle');
     const close = document.getElementById('conversation-info-close');
@@ -1328,7 +1009,7 @@ const ConversationInfo = (() => {
       if (tab.dataset.bound === '1') return;
       tab.dataset.bound = '1';
       tab.addEventListener('click', () => {
-        _activeTab = tab.dataset.infoTab || 'tasks';
+        _activeTab = tab.dataset.infoTab || 'files';
         _syncChrome();
         _renderBody();
       });
@@ -1336,12 +1017,6 @@ const ConversationInfo = (() => {
     if (body && body.dataset.bound !== '1') {
       body.dataset.bound = '1';
       body.addEventListener('click', (ev) => {
-        const planControl = ev.target.closest('#ci-tasks-plan-control');
-        if (planControl) {
-          ev.preventDefault();
-          _runPlanControl(planControl.dataset.planAction || '');
-          return;
-        }
         const ciAttach = ev.target.closest('.ci-attach-row[data-attachment-name]');
         if (ciAttach) {
           ev.preventDefault();
@@ -1407,15 +1082,15 @@ const ConversationInfo = (() => {
     _renderBody();
   });
 
-  // External callers (chat header "详情" button, plan strip "展开详情",
-  // i18n-change listeners) read open/close/toggle via this surface. Keeping
-  // the imperative variant + `openAndSetTab(tab)` shorthand instead of
-  // exposing _setOpen + _setActiveTab separately keeps the contract narrow.
+  // External callers (chat header "详情" button, i18n-change listeners) read
+  // open/close/toggle via this surface. Keeping the imperative variant +
+  // `openAndSetTab(tab)` shorthand instead of exposing _setOpen +
+  // _setActiveTab separately keeps the contract narrow.
   function open()  { _setOpen(true); }
   function close() { _setOpen(false); }
   function toggle() { _setOpen(!_open); }
   function openAndSetTab(tab) {
-    _activeTab = tab || 'tasks';
+    _activeTab = tab || 'files';
     _setOpen(true);
     _syncChrome();
     _renderBody();
@@ -1425,7 +1100,6 @@ const ConversationInfo = (() => {
     bind,
     unbind,
     refresh,
-    refreshTasks,
     refreshFiles,
     refreshAttachments,
     open,

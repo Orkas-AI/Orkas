@@ -20,6 +20,7 @@ import * as path from 'node:path';
 
 import { marketplaceBizFile, userLocalBizDir } from '../paths';
 import { getActiveUserId } from './users';
+import { withCommonHeaders } from './api_common';
 import { apiBase } from './marketplace';
 import { createLogger } from '../logger';
 import { fetchWithRetry } from '../util/retry';
@@ -42,6 +43,7 @@ export interface MarketplaceCategory {
   name_zh: string;
   name_en: string;
   name_ja?: string;
+  name_pt?: string;
   /** Display order — lower first. Kept on the wire purely for client-side rendering. */
   sort_order: number;
 }
@@ -63,13 +65,13 @@ export function normalizeMarketplaceCategoryCode(
  *  on a cold start. Mirrors the server category registry so the UI behaves identically when
  *  the network blip clears. Keep in sync with `Server/biz/marketplace/marketplace_mgr.py`. */
 const FALLBACK_CATEGORIES: readonly MarketplaceCategory[] = [
-  { code: 'education', name_zh: '教育', name_en: 'Education',  name_ja: '教育',        sort_order: 10 },
-  { code: 'ecommerce', name_zh: '电商', name_en: 'E-commerce', name_ja: 'EC',          sort_order: 20 },
-  { code: 'rnd',       name_zh: '产研', name_en: 'R&D',        name_ja: '研究開発',    sort_order: 30 },
-  { code: 'creation',  name_zh: '创作', name_en: 'Creation',   name_ja: '創作',        sort_order: 40 },
-  { code: 'data',      name_zh: '数据', name_en: 'Data',       name_ja: 'データ',      sort_order: 50 },
-  { code: 'office',    name_zh: '办公', name_en: 'Office',     name_ja: 'オフィス',    sort_order: 60 },
-  { code: 'general',   name_zh: '通用', name_en: 'General',    name_ja: '汎用',        sort_order: 70 },
+  { code: 'education', name_zh: '教育', name_en: 'Education',  name_ja: '教育',        name_pt: 'Educação',    sort_order: 10 },
+  { code: 'ecommerce', name_zh: '电商', name_en: 'E-commerce', name_ja: 'EC',          name_pt: 'E-commerce',  sort_order: 20 },
+  { code: 'rnd',       name_zh: '产研', name_en: 'R&D',        name_ja: '研究開発',    name_pt: 'P&D',         sort_order: 30 },
+  { code: 'creation',  name_zh: '创作', name_en: 'Creation',   name_ja: '創作',        name_pt: 'Criação',     sort_order: 40 },
+  { code: 'data',      name_zh: '数据', name_en: 'Data',       name_ja: 'データ',      name_pt: 'Dados',       sort_order: 50 },
+  { code: 'office',    name_zh: '办公', name_en: 'Office',     name_ja: 'オフィス',    name_pt: 'Escritório',  sort_order: 60 },
+  { code: 'general',   name_zh: '通用', name_en: 'General',    name_ja: '汎用',        name_pt: 'Geral',       sort_order: 70 },
 ];
 
 interface PersistedBiz {
@@ -100,7 +102,7 @@ async function _writePersisted(data: PersistedBiz): Promise<void> {
 async function _fetchFromServer(): Promise<MarketplaceCategory[]> {
   const res = await fetchWithRetry('marketplace:categories', `${apiBase()}/marketplace/categories`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: withCommonHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({}),
   }, {
     timeoutMs: MARKETPLACE_CATEGORIES_TIMEOUT_MS,
@@ -117,6 +119,7 @@ async function _fetchFromServer(): Promise<MarketplaceCategory[]> {
       name_zh: String(row.name_zh || ''),
       name_en: String(row.name_en || ''),
       name_ja: String(row.name_ja || ''),
+      name_pt: String(row.name_pt || ''),
       sort_order: typeof row.sort_order === 'number' ? row.sort_order : 0,
     }))
     .filter((c) => c.code);

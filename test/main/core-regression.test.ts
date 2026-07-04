@@ -140,8 +140,8 @@ describe('PC core regression unit coverage', () => {
     expect(await auth.removeCredential(primary.profileId)).toEqual({ removed: true });
     expect((await auth.listEntries()).entries.map((entry) => entry.profileId)).toEqual([backup.profileId]);
 
-    const raw = fs.readFileSync(paths.userAuthProfilesFile(TEST_UID), 'utf8');
     const localSecrets = await import('../../src/main/util/local-secret-store');
+    const raw = fs.readFileSync(paths.userAuthProfilesFile(TEST_UID), 'utf8');
     expect(localSecrets.isEncryptedSecret(raw)).toBe(true);
     expect(raw).not.toContain('sk-primary-regression-xxxxxxxx');
     expect(raw).not.toContain('sk-backup-regression-xxxxxxxx');
@@ -342,16 +342,17 @@ describe('PC core regression unit coverage', () => {
 
     expect(permissions.getLocalExecGranted()).toBe(true);
     const revoked = permissions.revokeLocalExec();
-    expect(revoked.granted).toBe(false);
-    expect(permissions.getLocalExecGranted()).toBe(false);
+    expect(revoked.granted).toBe(true);
+    expect(revoked.mode).toBe('workspace_approval');
+    expect(permissions.getLocalExecGranted()).toBe(true);
 
     const granted = permissions.grantLocalExec();
     expect(granted.granted).toBe(true);
     expect(permissions.getLocalExecGranted()).toBe(true);
 
-    const file = userPath('local', 'config', 'permissions.json');
-    // Persisted shape is now the three-mode model; grantLocalExec → allow_all.
-    expect(JSON.parse(fs.readFileSync(file, 'utf8')).localExec.mode).toBe('allow_all');
+    const file = userPath('cloud', 'config', 'permissions.json');
+    // Persisted shape is now the three-mode access model; grantLocalExec → all_files_auto.
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).localExec.mode).toBe('all_files_auto');
   });
 
   it('[PC-CONN-002] stores connector soft-disable separately from disconnect state', async () => {

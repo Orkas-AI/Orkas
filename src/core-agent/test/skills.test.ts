@@ -112,6 +112,20 @@ describe("SkillLoader", () => {
     expect(list[0].skillFile.endsWith("SKILL.md")).toBe(true);
   });
 
+  it("parses the `ownerAgent` tag; absent/blank → undefined (agent-private gating)", () => {
+    const base = path.join(root, "skills");
+    writeSkill(base, "owned",  { name: "owned",  description: "private", ownerAgent: "video-studio" });
+    writeSkill(base, "shared", { name: "shared", description: "public" });
+    writeSkill(base, "blank",  { name: "blank",  description: "public", ownerAgent: "   " });
+
+    const byId = new Map(new SkillLoader({ dirs: [base] }).list().map((s) => [s.id, s]));
+    expect(byId.get("owned")!.ownerAgent).toBe("video-studio");
+    // Absent and whitespace-only both normalize to undefined → treated as a
+    // normal shared skill by the prompt/UI owner filters.
+    expect(byId.get("shared")!.ownerAgent).toBeUndefined();
+    expect(byId.get("blank")!.ownerAgent).toBeUndefined();
+  });
+
   it("falls back to directory name when frontmatter is missing", () => {
     const base = path.join(root, "skills");
     const d = path.join(base, "no-fm");

@@ -1937,10 +1937,19 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // Three-mode setter (off / risk_prompt / allow_all). Returns the new state
   // in the same shape as getLocalExec so settings.js can read it back.
   'permissions.setLocalExecMode': async ({ mode }: { mode?: unknown }) => {
-    if (mode !== 'off' && mode !== 'risk_prompt' && mode !== 'allow_all') {
+    let normalized: 'workspace_approval' | 'all_files_approval' | 'all_files_auto';
+    if (mode === 'workspace_approval' || mode === 'all_files_approval' || mode === 'all_files_auto') {
+      normalized = mode;
+    } else if (mode === 'off') {
+      normalized = 'workspace_approval';
+    } else if (mode === 'risk_prompt') {
+      normalized = 'all_files_approval';
+    } else if (mode === 'allow_all') {
+      normalized = 'all_files_auto';
+    } else {
       throw new Error('invalid mode');
     }
-    return permissions.setLocalExecMode(mode);
+    return permissions.setLocalExecMode(normalized);
   },
 
   // ── User-granted folder access (plan §B2) ──────────────────────────────

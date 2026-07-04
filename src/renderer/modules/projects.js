@@ -16,12 +16,15 @@
 const _projectsLog = createLogger('projects');
 
 function _projectsTrackClick(action, data) {
+  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
 function _projectsTrackEvent(action, data) {
+  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
 function _projectsTrackError(action, data) {
+  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
 function _projectUiIconHtml(name, className) {
@@ -539,11 +542,56 @@ async function _runProjectMenuAction(action, pid) {
 
 // ── Delete flow ─────────────────────────────────────────────────────────
 
+function _pickProjectDeleteFallback(deletedPid, projectsBeforeDelete, projectsAfterDelete, conversationsAfterDelete) {
+  const projects = Array.isArray(projectsAfterDelete)
+    ? projectsAfterDelete.filter((p) => p && p.project_id && p.project_id !== deletedPid)
+    : [];
+  if (projects.length) {
+    const before = Array.isArray(projectsBeforeDelete)
+      ? projectsBeforeDelete.filter((p) => p && p.project_id)
+      : [];
+    const projectIds = new Set(projects.map((p) => p.project_id));
+    const deletedIdx = before.findIndex((p) => p.project_id === deletedPid);
+    if (deletedIdx >= 0) {
+      for (let i = deletedIdx + 1; i < before.length; i += 1) {
+        const nextId = before[i]?.project_id;
+        if (nextId && projectIds.has(nextId)) return { view: 'project', id: nextId };
+      }
+      for (let i = deletedIdx - 1; i >= 0; i -= 1) {
+        const prevId = before[i]?.project_id;
+        if (prevId && projectIds.has(prevId)) return { view: 'project', id: prevId };
+      }
+    }
+    return { view: 'project', id: projects[0].project_id };
+  }
+
+  const conv = Array.isArray(conversationsAfterDelete)
+    ? conversationsAfterDelete.find((c) => c && c.conversation_id && c.project_id !== deletedPid)
+    : null;
+  if (conv) return { view: 'conversation', id: conv.conversation_id };
+  return { view: 'new-chat', id: '' };
+}
+
+function _goToProjectDeleteFallback(target) {
+  if (!target || typeof setView !== 'function') return;
+  const opts = { entryPoint: 'project_delete_fallback' };
+  if (target.view === 'project' && target.id) setView('project', target.id, opts);
+  else if (target.view === 'conversation' && target.id) setView('conversation', target.id, opts);
+  else setView('new-chat', null, opts);
+}
+
 async function _confirmDeleteProject(pid) {
   const project = (_projectsCache || []).find((p) => p.project_id === pid);
   if (!project) return;
   const name = project.name || '';
   const count = Number(project.conv_count || 0);
+  const projectsBeforeDelete = Array.isArray(_projectsCache) ? _projectsCache.slice() : [];
+  const wasViewingDeletedProject = currentView === 'project'
+    && typeof _projectDetailPid !== 'undefined'
+    && _projectDetailPid === pid;
+  const activeConversationWasDeleted = !!currentCid
+    && Array.isArray(conversations)
+    && conversations.some((c) => c && c.conversation_id === currentCid && c.project_id === pid);
   // Look up project-scoped auto tasks BEFORE confirm so the body can warn
   // the user they'll be cascade-deleted too. Best-effort: a transient IPC
   // failure falls through to the no-auto-tasks message; the backend's
@@ -610,15 +658,16 @@ async function _confirmDeleteProject(pid) {
       delete _projectsExpanded[pid];
       _saveProjectsExpanded();
     }
-    // The cascade dropped every conv in this project — if the active cid
-    // was one of them, jump back to the new-chat view (mirrors the existing
-    // single-conv delete behaviour).
-    if (currentCid && Array.isArray(conversations)) {
-      const stillExists = conversations.some((c) => c && c.conversation_id === currentCid && c.project_id !== pid);
-      if (!stillExists) setView('new-chat');
-    }
     await loadConversations();
-    await loadProjects(true);
+    const projectsAfterDelete = await loadProjects(true);
+    if (wasViewingDeletedProject || activeConversationWasDeleted) {
+      _goToProjectDeleteFallback(_pickProjectDeleteFallback(
+        pid,
+        projectsBeforeDelete,
+        projectsAfterDelete,
+        conversations,
+      ));
+    }
   } catch (err) {
     _projectsTrackEvent('project_delete_result', {
       project_id: pid,

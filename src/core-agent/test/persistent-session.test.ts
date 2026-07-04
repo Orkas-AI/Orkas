@@ -244,6 +244,56 @@ describe("PersistentSession", () => {
       expect((msgs[3].content[0] as { text: string }).text).toBe("round 2");
     });
 
+    it("drops delayed tool_result after unrelated user text", () => {
+      fs.writeFileSync(
+        file,
+        [
+          JSON.stringify({ role: "user", content: [{ type: "text", text: "round 1" }] }),
+          JSON.stringify({
+            role: "assistant",
+            content: [{ type: "tool_use", id: "call-late", name: "some_tool", input: {} }],
+          }),
+          JSON.stringify({ role: "user", content: [{ type: "text", text: "round 2" }] }),
+          JSON.stringify({
+            role: "user",
+            content: [{ type: "tool_result", toolUseId: "call-late", content: "late result", isError: false }],
+          }),
+        ].join("\n") + "\n",
+        "utf-8",
+      );
+
+      const s = new PersistentSession({ sessionFile: file });
+      const msgs = s.getMessages();
+      expect(msgs).toHaveLength(4);
+      expect(msgs[2].role).toBe("user");
+      expect(msgs[2].content[0].type).toBe("tool_result");
+      expect((msgs[2].content[0] as { isError: boolean }).isError).toBe(true);
+      expect(msgs[3].role).toBe("user");
+      expect(msgs[3].content).toEqual([{ type: "text", text: "round 2" }]);
+    });
+
+    it("removes misplaced tool_result blocks while preserving real user content", () => {
+      fs.writeFileSync(
+        file,
+        [
+          JSON.stringify({ role: "user", content: [{ type: "text", text: "hello" }] }),
+          JSON.stringify({
+            role: "user",
+            content: [
+              { type: "tool_result", toolUseId: "call-missing", content: "stray", isError: false },
+              { type: "text", text: "keep me" },
+            ],
+          }),
+        ].join("\n") + "\n",
+        "utf-8",
+      );
+
+      const s = new PersistentSession({ sessionFile: file });
+      const msgs = s.getMessages();
+      expect(msgs).toHaveLength(2);
+      expect(msgs[1].content).toEqual([{ type: "text", text: "keep me" }]);
+    });
+
     it("heals multiple orphan tool_uses in the same assistant message", () => {
       // Some providers emit parallel tool calls in one assistant turn. A
       // mid-flight abort orphans all of them at once; each needs its own

@@ -11,7 +11,7 @@
  *   - `anonymous` while logged out.
  *   - the server account uid while logged in.
  *
- * The open-source build still calls `initActiveUser()` without options, so first boot
+ * the open-source build still calls `initActiveUser()` without options, so first boot
  * keeps the original 8-digit local id.
  *
  * Boot sequence:
@@ -365,7 +365,7 @@ export function activateUser(uid: string): void {
 /**
  * Boot-time entrypoint — read users.json and activate this environment's
  * current-user pointer. If none exists, activate `defaultLocalId` (hosted:
- * anonymous) or generate the legacy 8-digit uid (open-source build).
+ * anonymous) or generate the legacy 8-digit uid (the open-source build).
  */
 export function initActiveUser(opts: InitActiveUserOptions = {}): UserRecord {
   const reg = readRegistry();

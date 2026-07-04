@@ -108,9 +108,14 @@ describe('contexts.pickAndUpload', () => {
       fs.mkdirSync(pictures, { recursive: true });
       process.env.HOME = fakeHome;
 
-      const userWorkspace = await import('../../../src/main/features/user_workspace');
-      const set = userWorkspace.setWorkspacePath(TEST_UID, pictures);
-      expect(set.ok).toBe(true);
+      const paths = await import('../../../src/main/paths');
+      const cfgFile = paths.userWorkspaceConfigFile(TEST_UID);
+      fs.mkdirSync(path.dirname(cfgFile), { recursive: true });
+      fs.writeFileSync(cfgFile, JSON.stringify({
+        selectedPath: pictures,
+        updatedAt: '2026-07-03T00:00:00.000Z',
+        recentPaths: [],
+      }), 'utf8');
 
       const electron = await import('electron') as any;
       electron.dialog.showOpenDialog.mockResolvedValueOnce({

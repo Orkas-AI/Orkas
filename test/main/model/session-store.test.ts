@@ -124,3 +124,36 @@ describe('session-store.sessionFileFor', () => {
       .toThrow(/invalid session id/);
   });
 });
+
+// Per-agent cross-session-memory eligibility (pure helpers — no workspace/IO).
+describe('memoryScopeForSession (per-agent memory eligibility)', () => {
+  it('parses the session kind anchor', async () => {
+    const { sessionKindOf } = await import('../../../src/main/model/core-agent/session-store');
+    expect(sessionKindOf('gconv-abc')).toBe('gconv');
+    expect(sessionKindOf('gmember-cid-video-studio')).toBe('gmember');
+    expect(sessionKindOf('memory-extract-x')).toBe('memory-extract');
+    expect(sessionKindOf('extract-img-x')).toBe('extract-img');
+    expect(sessionKindOf('agent-x')).toBe('agent');
+    expect(sessionKindOf('skill-x')).toBe('skill');
+    expect(sessionKindOf('cli-x')).toBe('cli');
+    expect(sessionKindOf('nope-x')).toBeNull();
+  });
+
+  it('commander (gconv) → "commander" scope; agent workers → their agent id', async () => {
+    const { memoryScopeForSession } = await import('../../../src/main/model/core-agent/session-store');
+    expect(memoryScopeForSession('gconv-abc', '')).toBe('commander');
+    expect(memoryScopeForSession('gconv-abc', 'commander')).toBe('commander');
+    expect(memoryScopeForSession('gmember-cid-video-studio', 'video-studio')).toBe('video-studio');
+    expect(memoryScopeForSession('gworker-x', 'seo-geo')).toBe('seo-geo');
+    expect(memoryScopeForSession('cli-x', 'video-studio')).toBe('video-studio');
+    // a worker without an agent id is malformed → no memory
+    expect(memoryScopeForSession('gmember-cid-x', '')).toBeNull();
+  });
+
+  it('authoring + ephemeral sessions are NOT memory-eligible (null = no tool, no injection)', async () => {
+    const { memoryScopeForSession } = await import('../../../src/main/model/core-agent/session-store');
+    for (const sid of ['agent-edit-1', 'skill-edit-1', 'extract-img-1', 'anon-1', 'reflect-1', 'memory-extract-1']) {
+      expect(memoryScopeForSession(sid, 'video-studio'), sid).toBeNull();
+    }
+  });
+});

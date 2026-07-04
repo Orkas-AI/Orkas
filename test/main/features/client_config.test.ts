@@ -23,7 +23,6 @@ vi.mock('electron', () => ({
 import {
   ClientConfigManager,
   clientConfigPlatform,
-  getMinimumAppVersion,
   refresh,
   start,
   stop,
@@ -77,6 +76,7 @@ describe('client_config', () => {
     expect(clientConfigPlatform('linux')).toBe('pc');
   });
 
+
   it('lets Server immediate config override registered defaults', async () => {
     const users = await import('../../../src/main/features/users');
     const paths = await import('../../../src/main/paths');
@@ -97,36 +97,6 @@ describe('client_config', () => {
       const manager = new ClientConfigManager();
       manager.registerDefault('feature.local-default', true);
       expect(manager.get('feature.local-default')).toBe(false);
-    } finally {
-      fs.rmSync(path.dirname(file), { recursive: true, force: true });
-    }
-  });
-
-  it('reads the minimum app version from direct or object app update config', async () => {
-    const users = await import('../../../src/main/features/users');
-    const paths = await import('../../../src/main/paths');
-    const uid = 'clientconfigappupdate';
-    users.activateUser(uid);
-    const file = paths.userRemoteConfigFile(uid);
-
-    try {
-      const manager = new ClientConfigManager();
-      manager.applyServerPayload({
-        immediate: { app_update: { min_version: '1.2.0' } },
-        restart: {},
-        config_hash: 'sha256:app-update-object',
-      }, '"sha256:app-update-object"');
-      expect(getMinimumAppVersion()).toBe('1.2.0');
-
-      manager.applyServerPayload({
-        immediate: {
-          app_update: { min_version: '1.2.0' },
-          'app_update.min_version': '1.3.0',
-        },
-        restart: {},
-        config_hash: 'sha256:app-update-direct',
-      }, '"sha256:app-update-direct"');
-      expect(getMinimumAppVersion()).toBe('1.3.0');
     } finally {
       fs.rmSync(path.dirname(file), { recursive: true, force: true });
     }
@@ -290,6 +260,7 @@ describe('client_config', () => {
 
     const now = 1_234_567;
     vi.spyOn(Date, 'now').mockReturnValue(now);
+    process.env.ORKAS_API_BASE_URL = 'https://config.example/api/';
     let requestedUrl = '';
     let requestedInit: RequestInit | undefined;
     vi.stubGlobal('fetch', async (input: string | URL | Request, init?: RequestInit) => {

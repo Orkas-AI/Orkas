@@ -73,6 +73,42 @@ describe("AgentRunner", () => {
     expect(result.meta.toolLoops).toBe(0);
   });
 
+  it("surfaces max_tokens as an incomplete turn instead of saving a partial reply", async () => {
+    const mockProvider = createMockProvider([
+      {
+        content: [{ type: "text", text: "I started a large edit\npx" }],
+        stopReason: "max_tokens",
+        usage: { inputTokens: 80, outputTokens: 4096, totalTokens: 4176 },
+        model: "mock-model",
+      },
+    ]);
+
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model" },
+      models: {
+        catalog: {
+          "mock-model": {
+            provider: "mock",
+            model: "mock-model",
+            maxOutputTokens: 4096,
+          },
+        },
+      },
+    });
+
+    const runner = new AgentRunner({ config, providers: registry, tools: [] });
+    const result = await runner.run({ message: "write a large file" });
+
+    expect(result.text).toBe("");
+    expect(result.meta.error?.kind).toBe("provider_error");
+    expect(result.meta.error?.message).toContain("max_tokens (4096)");
+    expect(result.meta.error?.message).toContain("partial response was discarded");
+    expect(result.meta.usage.outputTokens).toBe(4096);
+  });
+
   it("executes a tool-use loop", async () => {
     const mockProvider = createMockProvider([
       // First response: tool call

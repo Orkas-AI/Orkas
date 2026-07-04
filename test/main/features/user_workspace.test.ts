@@ -115,22 +115,32 @@ describe('user_workspace › setWorkspacePath', () => {
     if (result.ok) expect(result.path).toBe(dir);
   });
 
-  it('allows macOS privacy-protected workspace roots selected by the user', async () => {
+  it('rejects macOS privacy-protected workspace roots selected by the user', async () => {
+    await _pinZh();
     process.env.ORKAS_TCC_GUARD_FORCE = '1';
     const home = path.join(tmpDir, 'fake-home');
-    const downloads = path.join(home, 'Downloads');
-    fs.mkdirSync(downloads, { recursive: true });
+    const protectedRoots = [
+      path.join(home, 'Downloads'),
+      path.join(home, 'Pictures'),
+      path.join(home, 'Desktop'),
+      path.join(home, 'Library', 'Containers', 'com.apple.mail'),
+    ];
+    protectedRoots.forEach((dir) => fs.mkdirSync(dir, { recursive: true }));
     process.env.HOME = home;
     const ws = await import('../../../src/main/features/user_workspace');
+    const p = await import('../../../src/main/paths');
 
-    const result = ws.setWorkspacePath('userProtected', downloads);
+    for (const [idx, protectedRoot] of protectedRoots.entries()) {
+      const userId = `userProtected${idx}`;
+      const result = ws.setWorkspacePath(userId, protectedRoot);
 
-    expect(result.ok).toBe(true);
-    if (result.ok) expect(result.path).toBe(downloads);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toContain('隐私保护');
 
-    expect(ws.getWorkspacePath('userProtected')).toBe(downloads);
-    const info = ws.getWorkspaceInfo('userProtected');
-    expect(info.currentPath).toBe(downloads);
+      expect(ws.getWorkspacePath(userId)).toBe(p.DEFAULT_USER_WORKSPACE);
+      const info = ws.getWorkspaceInfo(userId);
+      expect(info.currentPath).toBe(p.DEFAULT_USER_WORKSPACE);
+    }
   });
 
   it('allows ordinary project directories under the home folder', async () => {
@@ -188,6 +198,19 @@ describe('user_workspace › selectDirectory (mocked)', () => {
     const ws = await import('../../../src/main/features/user_workspace');
     const result = await ws.selectDirectory();
     expect(result).toBeNull();
+  });
+
+  it('seeds the directory picker with the safe default workspace', async () => {
+    const { dialog } = await import('electron');
+    (dialog.showOpenDialog as ReturnType<typeof vi.fn>).mockClear();
+    const ws = await import('../../../src/main/features/user_workspace');
+    const p = await import('../../../src/main/paths');
+
+    await ws.selectDirectory();
+
+    const opts = (dialog.showOpenDialog as ReturnType<typeof vi.fn>).mock.calls[0]?.[1];
+    expect(opts?.defaultPath).toBe(p.DEFAULT_USER_WORKSPACE);
+    expect(fs.existsSync(p.DEFAULT_USER_WORKSPACE)).toBe(true);
   });
 
   it('returns the selected path from dialog', async () => {
@@ -302,7 +325,7 @@ describe('user_workspace › scoped (projects)', () => {
     expect(info.recentPaths).toContain(protectedRecent);
   });
 
-  it('keeps a legacy protected selectedPath without statting it', async () => {
+  it('falls back from a legacy protected selectedPath without statting it', async () => {
     process.env.ORKAS_TCC_GUARD_FORCE = '1';
     const home = path.join(tmpDir, 'fake-home');
     const desktop = path.join(home, 'Desktop');
@@ -318,11 +341,12 @@ describe('user_workspace › scoped (projects)', () => {
       recentPaths: [path.join(home, 'Downloads')],
     }));
 
-    expect(ws.getWorkspacePath('userLegacyProtected')).toBe(desktop);
+    expect(ws.getWorkspacePath('userLegacyProtected')).toBe(p.DEFAULT_USER_WORKSPACE);
     const info = ws.getWorkspaceInfo('userLegacyProtected');
-    expect(info.currentPath).toBe(desktop);
+    expect(info.currentPath).toBe(p.DEFAULT_USER_WORKSPACE);
     expect(info.defaultPath).toBe(p.DEFAULT_USER_WORKSPACE);
-    expect(info.recentPaths).toEqual([path.join(home, 'Downloads')]);
+    expect(info.isDefault).toBe(true);
+    expect(info.recentPaths).toEqual([]);
   });
 
   it('reset on project scope falls through to default; default scope intact', async () => {
@@ -452,28 +476,23 @@ describe('user_workspace › openWorkspaceInFileManager', () => {
 });
 
 describe('user_workspace › consumePickerFirstOpenDefault', () => {
-  it('seeds the workspace on the FIRST open only, then hands off to the OS last-used', async () => {
+  it('returns the safe workspace on every open', async () => {
     const ws = await import('../../../src/main/features/user_workspace');
     const p = await import('../../../src/main/paths');
     const uid = 'userFirstOpen';
 
-    // First open → workspace, and a persisted marker is written.
     expect(ws.consumePickerFirstOpenDefault(uid)).toBe(p.DEFAULT_USER_WORKSPACE);
-    expect(fs.existsSync(p.pickerFirstOpenMarkerFile(uid))).toBe(true);
-
-    // Every later open → undefined so the picker leaves defaultPath unset and
-    // the OS's remembered last-used directory takes over.
-    expect(ws.consumePickerFirstOpenDefault(uid)).toBeUndefined();
-    expect(ws.consumePickerFirstOpenDefault(uid)).toBeUndefined();
+    expect(fs.existsSync(p.pickerFirstOpenMarkerFile(uid))).toBe(false);
+    expect(ws.consumePickerFirstOpenDefault(uid)).toBe(p.DEFAULT_USER_WORKSPACE);
+    expect(ws.consumePickerFirstOpenDefault(uid)).toBe(p.DEFAULT_USER_WORKSPACE);
   });
 
-  it('is per-user (one user seeding does not consume another user\'s first open)', async () => {
+  it('does not consume another user by reading one user', async () => {
     const ws = await import('../../../src/main/features/user_workspace');
     const p = await import('../../../src/main/paths');
     expect(ws.consumePickerFirstOpenDefault('userA')).toBe(p.DEFAULT_USER_WORKSPACE);
-    // A different user still gets their first-open seed.
     expect(ws.consumePickerFirstOpenDefault('userB')).toBe(p.DEFAULT_USER_WORKSPACE);
-    expect(ws.consumePickerFirstOpenDefault('userA')).toBeUndefined();
+    expect(ws.consumePickerFirstOpenDefault('userA')).toBe(p.DEFAULT_USER_WORKSPACE);
   });
 
   it('returns undefined for an empty userId', async () => {

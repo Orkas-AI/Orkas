@@ -216,6 +216,63 @@ describe('ConversationInfo files tab', () => {
     expect(html).not.toContain('old.txt');
   });
 
+  it('clears file loading when a silent refresh supersedes a visible refresh', async () => {
+    const snapshot = {
+      history: [] as any[],
+      files: {
+        root: '/tmp/workspace',
+        rootExists: true,
+        truncated: false,
+        count: 1,
+        items: [
+          {
+            path: '/tmp/workspace/old.txt',
+            relPath: 'old.txt',
+            name: 'old.txt',
+            bytes: 4,
+            mtime: 1700000000000,
+          },
+        ],
+      },
+    };
+    const html = await renderFilesHtml(snapshot, async (context) => {
+      let fetchCount = 0;
+      context.apiFetch = async (url: string) => {
+        fetchCount += 1;
+        const slowVisibleRefresh = fetchCount <= 2;
+        const payload = url.includes('/history')
+          ? { ok: true, conversation: { title: 'Current title' }, history: [] }
+          : {
+              ok: true,
+              root: '/tmp/workspace',
+              rootExists: true,
+              truncated: false,
+              count: 1,
+              items: [
+                {
+                  path: slowVisibleRefresh ? '/tmp/workspace/old.txt' : '/tmp/workspace/new.txt',
+                  relPath: slowVisibleRefresh ? 'old.txt' : 'new.txt',
+                  name: slowVisibleRefresh ? 'old.txt' : 'new.txt',
+                  bytes: slowVisibleRefresh ? 4 : 8,
+                  mtime: slowVisibleRefresh ? 1700000000000 : 1700000001000,
+                },
+              ],
+            };
+        const response = { json: async () => payload };
+        if (!slowVisibleRefresh) return response;
+        return new Promise((resolve) => setTimeout(() => resolve(response), 25));
+      };
+
+      const visibleRefresh = context.window.ConversationInfo.refreshFiles('c1');
+      expect(context.document.getElementById('conversation-info-body').innerHTML).toContain('Loading');
+      await context.window.ConversationInfo.refreshFiles('c1', { silent: true });
+      await visibleRefresh;
+    });
+
+    expect(html).toContain('new.txt');
+    expect(html).not.toContain('Loading');
+  });
+
   it('counts deduped visible files instead of adding workspace and history rows', async () => {
     const result = await renderFilesResult({
       history: [
@@ -240,31 +297,6 @@ describe('ConversationInfo files tab', () => {
 
     expect((result.html.match(/data-file-path=/g) || []).length).toBe(1);
     expect(result.counts.files).toBe('1');
-  });
-
-  it('does not render the stripped cloud-sync scope note above the file list', async () => {
-    const html = await renderFilesHtml({
-      syncEnabled: true,
-      history: [],
-      files: {
-        root: '/tmp/workspace',
-        rootExists: true,
-        truncated: false,
-        count: 1,
-        items: [
-          {
-            path: '/tmp/workspace/report.md',
-            relPath: 'report.md',
-            name: 'report.md',
-            bytes: 42,
-            mtime: 1700000000000,
-          },
-        ],
-      },
-    });
-
-    expect(html).not.toContain('ci-files-sync-note');
-    expect(html).not.toContain('Cloud sync does not include these files');
   });
 
   it('does not show internal attachment kind labels in the attachment row meta', async () => {

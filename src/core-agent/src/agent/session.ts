@@ -60,6 +60,37 @@ export class Session {
     return [...this.messages];
   }
 
+  /**
+   * Get the LLM-facing view of the session.
+   *
+   * Image blocks are large and force multimodal routing, so only images added
+   * after the latest assistant message stay inline. That preserves the normal
+   * flow for user attachments and read_file image results: the next model call
+   * can inspect the image. Once the model has responded, later tool-loop calls
+   * retain the surrounding text/tool_result path metadata but stop replaying
+   * old image bytes. The image can still be reopened by calling read_file(path).
+   */
+  getMessagesForModel(): Message[] {
+    let lastAssistantIndex = -1;
+    for (let i = this.messages.length - 1; i >= 0; i--) {
+      if (this.messages[i].role === "assistant") {
+        lastAssistantIndex = i;
+        break;
+      }
+    }
+
+    const result: Message[] = [];
+    for (let i = 0; i < this.messages.length; i++) {
+      const msg = this.messages[i];
+      const includeImages = i > lastAssistantIndex;
+      const content = includeImages
+        ? [...msg.content]
+        : msg.content.filter((c) => c.type !== "image");
+      if (content.length > 0) result.push({ role: msg.role, content });
+    }
+    return result;
+  }
+
   /** Stable session identifier used as `prompt_cache_key`. The base `Session`
    * is anonymous (returns undefined); `PersistentSession` overrides this to
    * return its jsonl basename. A transient in-memory session (e.g. reflection)

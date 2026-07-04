@@ -1,6 +1,6 @@
 /**
  * Google Workspace catalog entries — extracted from `catalog.ts` so the Google bundle and
- * per-service connectors stay isolated while still syncing to the open-source build. Both hosted and open-source
+ * per-service connectors stay isolated while still syncing to the open-source build. Both PC and the open-source build
  * include this file via a try/require in `catalog.ts`; the catch path only keeps older open-source
  * checkouts without this file from crashing.
  *
@@ -22,6 +22,9 @@ const GOOGLE_SCOPES = {
   gdocs: ['https://www.googleapis.com/auth/documents'],
   gsheets: ['https://www.googleapis.com/auth/drive.file'],
   gtasks: ['https://www.googleapis.com/auth/tasks'],
+  // Read-only Search Console: search-analytics, sitemaps, URL inspection. Standalone connector
+  // (NOT folded into the google-workspace suite — Search Console isn't a Workspace product).
+  gsearch_console: ['https://www.googleapis.com/auth/webmasters.readonly'],
 };
 
 const GOOGLE_WORKSPACE_SCOPES = [
@@ -64,8 +67,8 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
     display_name: 'Gmail',
     icon_svg: '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#4285f4" d="M24 5.457v13.909c0 .904-.732 1.636-1.636 1.636h-3.819V11.73L12 16.64l-6.545-4.91v9.273H1.636A1.636 1.636 0 0 1 0 19.366V5.457c0-2.023 2.309-3.178 3.927-1.964L5.455 4.64 12 9.548l6.545-4.91 1.528-1.145C21.69 2.28 24 3.434 24 5.457z"/><path fill="#34a853" d="M5.455 21.003V11.73l-3.819-2.864v10.5c0 .904.732 1.637 1.636 1.637z"/><path fill="#ea4335" d="M18.545 21.003V11.73l3.819-2.864v10.5a1.636 1.636 0 0 1-1.636 1.637z"/><path fill="#fbbc04" d="M5.455 11.73 12 16.64l6.545-4.91V4.64L12 9.548 5.455 4.64z"/><path fill="#c5221f" d="M0 5.457v3.41l5.455 4.092V4.64L3.927 3.494C2.309 2.28 0 3.434 0 5.457z"/></svg>',
     category: 'communication',
-    description_zh: '读 / 发邮件、管理标签、自动化收件箱。',
-    description_en: 'Read and send mail, manage labels, automate the inbox.',
+    description_zh: '读 / 发邮件、整理收件箱。',
+    description_en: 'Read and send mail, organize the inbox.',
     auth_mode: 'server_bridge',
     oauth: { provider_id: 'google' },
     required_oauth_scopes: GOOGLE_SCOPES.gmail,
@@ -141,6 +144,23 @@ export const GOOGLE_ENTRIES: CatalogEntry[] = [
       kind: 'stdio',
       command: '${ORKAS_NODE}',
       args: ['${ORKAS_PC_DIR}/bin/gtasks-mcp-server.cjs'],
+      oauth_env_key: 'GOOGLE_ACCESS_TOKEN',
+    },
+  },
+  {
+    id: 'gsearch-console',
+    display_name: 'Google Search Console',
+    icon_svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 296 264"><path fill="#7b7b7b" fill-rule="evenodd" d="m83 22l22-22v42H83zm130 0l-22-22v42h22z"/><path fill="#5a5a5a" d="M105 0h86v21h-86z"/><g fill-rule="evenodd"><path fill="#e6e7e8" d="M272 264H24a24 24 0 0 1-24-24V83.238L41.238 42h213.524L296 83.238V240a24 24 0 0 1-24 24"/><path fill="#d0d1d2" d="M0 127V83.238L41.238 42h213.524L296 83.238V127z"/><path fill="#458cf5" d="M34 264V94a10 10 0 0 1 10-10h208a10 10 0 0 1 10 10v170z"/></g><path fill="#fff" d="M34 127h228v137H34z"/><path fill="#d2d3d4" fill-rule="evenodd" d="M194 264v-41l-20-20l-13-36l9-23l51 51l9-38l32 32v75z"/><path fill="#d2d3d4" d="M49 143h76v85H49zm0 104h98v17H49z"/><path fill="#505050" fill-rule="evenodd" d="M213 232.1V264h-42v-31.447a49.507 49.507 0 0 1-1-89.651V190l21 13l22-13v-47.1a49.518 49.518 0 0 1 0 89.2"/><path fill="#e6e7e8" fill-rule="evenodd" d="M57.5 95a8.5 8.5 0 1 1-8.5 8.5a8.5 8.5 0 0 1 8.5-8.5m25 0a8.5 8.5 0 1 1-8.5 8.5a8.5 8.5 0 0 1 8.5-8.5"/></svg>',
+    category: 'data',
+    description_zh: '查看搜索流量、关键词、点击/曝光/排名、收录与站点地图状态。',
+    description_en: 'View search traffic — queries, clicks/impressions/position, indexing and sitemap status.',
+    auth_mode: 'server_bridge',
+    oauth: { provider_id: 'google' },
+    required_oauth_scopes: GOOGLE_SCOPES.gsearch_console,
+    transport_template: {
+      kind: 'stdio',
+      command: '${ORKAS_NODE}',
+      args: ['${ORKAS_PC_DIR}/bin/gsearch-console-mcp-server.cjs'],
       oauth_env_key: 'GOOGLE_ACCESS_TOKEN',
     },
   },

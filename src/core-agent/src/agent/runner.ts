@@ -2,6 +2,7 @@ import type { MessageContent } from "../shared/types.js";
 import {
   AuthError,
   ContextOverflowError,
+  OutputLimitError,
   classifyRetryableError,
   isRetryableError,
   RateLimitError,
@@ -317,7 +318,7 @@ export class AgentRunner {
         // `CompletionResult`-shaped object at the end for the tool loop.
         const streamIter = provider.stream({
           model: modelId,
-          messages: this.session.getMessages(),
+          messages: this.session.getMessagesForModel(),
           systemPrompt,
           tools: toolDefs.length > 0 ? toolDefs : undefined,
           // Main-turn output cap. Do NOT hard-code: a fixed cap (was 4096)
@@ -331,6 +332,7 @@ export class AgentRunner {
           signal: params.signal,
           cacheRetention: params.cacheRetention,
           sessionId: this.session.getSessionId(),
+          requestMetadata: params.requestMetadata,
           // Forward thinking level so reasoner-required providers (e.g.
           // DeepSeek V4 Pro) can attach `reasoning_effort` to the request.
           // `undefined` lets the provider apply its `defaultReasoning`;
@@ -419,6 +421,15 @@ export class AgentRunner {
           outputTokens: lastUsage.outputTokens + result.usage.outputTokens,
           totalTokens: lastUsage.totalTokens + result.usage.totalTokens,
         };
+
+        if (result.stopReason === "max_tokens") {
+          const maxOutputTokens = this.config.models.catalog[streamModel]?.maxOutputTokens
+            ?? this.config.models.catalog[modelId]?.maxOutputTokens;
+          const limitHint = typeof maxOutputTokens === "number" ? ` (${maxOutputTokens})` : "";
+          throw new OutputLimitError(
+            `Model output reached max_tokens${limitHint} before completing the turn; the partial response was discarded.`,
+          );
+        }
 
         // Add assistant response to session
         this.session.addAssistantMessage(result.content);
@@ -906,7 +917,7 @@ export class AgentRunner {
     systemPrompt: string,
     cacheRetention?: "none" | "short" | "long",
   ): Promise<string> {
-    const messages = this.session.getMessages();
+    const messages = this.session.getMessagesForModel();
     if (messages.length <= 4) return '';
 
     // Ask the LLM to summarize the conversation
@@ -1018,7 +1029,7 @@ export class AgentRunner {
       try {
         const result = await provider.complete({
           model: modelId,
-          messages: reflectSession.getMessages(),
+          messages: reflectSession.getMessagesForModel(),
           systemPrompt: 'You are a self-improvement assistant. Reflect on the conversation summary and refine your skills and self-knowledge. Available tools: skill_manage (create / patch / delete skills) and metacognition (update COMPETENCE.md / LEARNING_STRATEGIES.md).',
           tools: toolDefs.length > 0 ? toolDefs : undefined,
           maxTokens: 2048,

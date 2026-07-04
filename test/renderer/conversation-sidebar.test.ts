@@ -29,6 +29,7 @@ function loadConversationRenderer() {
     JSON,
     Map,
     Set,
+    CSS: { escape: (s: string) => String(s).replace(/["\\]/g, '\\$&') },
     Array,
     String,
     Number,
@@ -408,11 +409,29 @@ describe('conversation sticky scroll', () => {
     const el = fakeScrollEl();
     el.scrollTop = 240;
 
-    context._restoreHistoryReloadScroll(el, { top: 240 });
+    context._restoreHistoryReloadScroll(el, { top: 240, bottom: 560, nearBottom: false });
 
     expect(el.scrollTop).toBe(240);
     expect(el._stickyEnabled).toBe(false);
     expect(el._stickyUserPaused).toBe(true);
+  });
+
+  it('keeps the user anchored to bottom across history reconcile relayout', async () => {
+    const context = loadConversationRenderer();
+    const el = fakeScrollEl();
+    el.scrollTop = 800;
+    const snapshot = context._captureHistoryReloadScroll(el);
+
+    el.scrollHeight = 400;
+    context._restoreHistoryReloadScroll(el, snapshot);
+    expect(el.scrollTop).toBe(0);
+
+    el.scrollHeight = 1800;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(el.scrollTop).toBe(1400);
+    expect(el._stickyEnabled).toBe(true);
+    expect(el._stickyUserPaused).toBe(false);
   });
 
   it('still jumps to bottom when opening conversation history explicitly', () => {
@@ -488,6 +507,127 @@ describe('conversation sticky scroll', () => {
     await new Promise((resolve) => setTimeout(resolve, 80));
     expect(finalEl.innerHTML).toContain('<mjx-container>y=2x+b</mjx-container>');
     expect(msg._streamMathTimer).toBeNull();
+  });
+});
+
+describe('conversation history reconcile', () => {
+  it('matches a live rendered reply by signature before forcing a reload', () => {
+    const context = loadConversationRenderer();
+    const gm = {
+      id: 'm-final',
+      from: 'commander',
+      text: 'Finished answer',
+      ts: '2026-06-28T11:20:00.000Z',
+    };
+    const el: any = { dataset: {} };
+    context._stampRenderedGroupMessage(el, gm);
+    const container = {
+      querySelector(selector: string) {
+        if (selector.includes('data-msg-id')) return null;
+        if (selector.includes('data-group-msg-sig')) return el;
+        return null;
+      },
+    };
+
+    const found = context._findRenderedMessageForHistoryRecord(container, gm);
+
+    expect(found).toBe(el);
+    expect(el.dataset.msgId).toBe('m-final');
+  });
+
+  it('repositions an optimistic queued user bubble when its persisted timestamp arrives', () => {
+    const context = loadConversationRenderer();
+    context.currentCid = 'c1';
+
+    function makeMsg(className: string, dataset: Record<string, string>) {
+      const el: any = {
+        className,
+        dataset: { ...dataset },
+        parentElement: null,
+        matches(selector: string) {
+          return selector === '.chat-message[data-ts]'
+            && this.className.includes('chat-message')
+            && this.dataset.ts != null;
+        },
+      };
+      Object.defineProperty(el, 'previousElementSibling', {
+        get() {
+          if (!this.parentElement) return null;
+          const idx = this.parentElement.children.indexOf(this);
+          return idx > 0 ? this.parentElement.children[idx - 1] : null;
+        },
+      });
+      Object.defineProperty(el, 'nextElementSibling', {
+        get() {
+          if (!this.parentElement) return null;
+          const idx = this.parentElement.children.indexOf(this);
+          return idx >= 0 && idx < this.parentElement.children.length - 1
+            ? this.parentElement.children[idx + 1]
+            : null;
+        },
+      });
+      return el;
+    }
+
+    const user = makeMsg('chat-message user', { convPair: '1', ts: '900' });
+    const assistant = makeMsg('chat-message assistant', { msgId: 'a1', ts: '1000' });
+    const container: any = {
+      children: [user, assistant],
+      querySelector(selector: string) {
+        if (selector.includes('data-msg-id')) {
+          const id = selector.match(/data-msg-id="([^"]+)"/)?.[1];
+          return this.children.find((el: any) => el.dataset.msgId === id) || null;
+        }
+        if (selector === ':scope > .chat-scroll-spacer') return null;
+        return null;
+      },
+      querySelectorAll(selector: string) {
+        if (selector === '.chat-message.user[data-conv-pair]:not([data-msg-id])') {
+          return this.children.filter((el: any) => el.className.includes('user') && !!el.dataset.convPair && !el.dataset.msgId);
+        }
+        if (selector === '.chat-message.user:not([data-msg-id])') {
+          return this.children.filter((el: any) => el.className.includes('user') && !el.dataset.msgId);
+        }
+        if (selector === ':scope > .chat-message[data-ts]') {
+          return this.children.filter((el: any) => el.dataset.ts != null);
+        }
+        return [];
+      },
+      removeChild(el: any) {
+        const idx = this.children.indexOf(el);
+        if (idx >= 0) this.children.splice(idx, 1);
+        el.parentElement = null;
+      },
+      insertBefore(el: any, ref: any) {
+        const oldIdx = this.children.indexOf(el);
+        if (oldIdx >= 0) this.children.splice(oldIdx, 1);
+        const refIdx = this.children.indexOf(ref);
+        this.children.splice(refIdx >= 0 ? refIdx : this.children.length, 0, el);
+        el.parentElement = this;
+      },
+      appendChild(el: any) {
+        const oldIdx = this.children.indexOf(el);
+        if (oldIdx >= 0) this.children.splice(oldIdx, 1);
+        this.children.push(el);
+        el.parentElement = this;
+      },
+    };
+    user.parentElement = container;
+    assistant.parentElement = container;
+    context.document.getElementById = (id: string) => (id === 'chat-history' ? container : null);
+
+    const claimed = context._claimPersistedUserMessage('c1', {
+      id: 'u1',
+      from: 'user',
+      text: 'queued follow-up',
+      ts: 1100,
+    });
+
+    expect(claimed).toBe(true);
+    expect(container.children).toEqual([assistant, user]);
+    expect(user.dataset.msgId).toBe('u1');
+    expect(user.dataset.fromActor).toBe('user');
+    expect(user.dataset.ts).toBe('1100');
   });
 });
 
@@ -638,7 +778,7 @@ describe('conversation process read_file resource labels', () => {
         phase: 'start',
         name: 'read_file',
         arguments: {
-          path: '/Users/user/.orkas/data/u1/local/marketplace/agents/4430ca181349/agent.json',
+          path: '/Users/test/.orkas/data/u1/local/marketplace/agents/4430ca181349/agent.json',
         },
       },
     });

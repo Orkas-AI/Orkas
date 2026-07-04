@@ -7,11 +7,13 @@
 import { describe, it, expect } from 'vitest';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const viewer = require('../../src/renderer/modules/chat-file-viewer.js');
-const { _kindOf, _extOf, _chatMediaLocalUrl, _viewerCanAddToLibrary } = viewer as {
+const { _kindOf, _extOf, _chatMediaLocalUrl, _viewerAbsPathFromChatMediaLocalUrl, _viewerCanAddToLibrary, _viewerVideoPlaybackOptions } = viewer as {
   _kindOf: (name: string) => string;
   _extOf: (name: string) => string;
   _chatMediaLocalUrl: (abs: string) => string;
+  _viewerAbsPathFromChatMediaLocalUrl: (src: string) => string;
   _viewerCanAddToLibrary: (nameOrKind: string) => boolean;
+  _viewerVideoPlaybackOptions: (opts?: { autoplay?: boolean; startTime?: number }) => { autoplay: boolean; startTime: number };
 };
 
 describe('chat-file-viewer › _kindOf', () => {
@@ -43,6 +45,7 @@ describe('chat-file-viewer › _kindOf', () => {
     ['style.css', 'text'],
     ['log.log', 'text'],
     ['video.mp4', 'video'],
+    ['voice.mp3', 'audio'],
   ])('classifies "%s" as %s', (name, kind) => {
     expect(_kindOf(name)).toBe(kind);
   });
@@ -70,10 +73,11 @@ describe('chat-file-viewer › _kindOf', () => {
     expect(_kindOf('REPORT.XLSX')).toBe('office');
     expect(_kindOf('Note.MD')).toBe('markdown');
     expect(_kindOf('Page.Html')).toBe('html');
+    expect(_kindOf('Voice.MP3')).toBe('audio');
   });
 
   it('handles paths with directories — only the basename ext matters', () => {
-    expect(_kindOf('/Users/user/Documents/note.md')).toBe('markdown');
+    expect(_kindOf('/Users/test/Documents/note.md')).toBe('markdown');
     expect(_kindOf('C:\\\\work\\\\report.pdf')).toBe('pdf');
   });
 });
@@ -96,10 +100,10 @@ describe('chat-file-viewer › _chatMediaLocalUrl', () => {
   // `_pathnameToAbsPath`, so it must encode spaces / non-ASCII but
   // preserve `/` separators. encodeURI does both.
   it('builds chat-media://local/ + path for a unix abs path', () => {
-    expect(_chatMediaLocalUrl('/Users/user/file.pdf')).toBe('chat-media://local/Users/user/file.pdf');
+    expect(_chatMediaLocalUrl('/Users/test/file.pdf')).toBe('chat-media://local/Users/test/file.pdf');
   });
   it('URL-encodes spaces in the path', () => {
-    expect(_chatMediaLocalUrl('/Users/user/has space.pdf')).toBe('chat-media://local/Users/user/has%20space.pdf');
+    expect(_chatMediaLocalUrl('/Users/test/has space.pdf')).toBe('chat-media://local/Users/test/has%20space.pdf');
   });
   it('preserves "/" separators (doesn\'t use encodeURIComponent)', () => {
     const url = _chatMediaLocalUrl('/a/b/c/d.pdf');
@@ -107,7 +111,19 @@ describe('chat-file-viewer › _chatMediaLocalUrl', () => {
     expect(url).toContain('/a/b/c/d.pdf');
   });
   it('converts Windows-style "\\\\" to "/" so URL parsing stays well-formed', () => {
-    expect(_chatMediaLocalUrl('C:\\Users\\user\\file.pdf')).toBe('chat-media://local/C:/Users/user/file.pdf');
+    expect(_chatMediaLocalUrl('C:\\Users\\test\\file.pdf')).toBe('chat-media://local/C:/Users/test/file.pdf');
+  });
+});
+
+describe('chat-file-viewer › _viewerAbsPathFromChatMediaLocalUrl', () => {
+  it('decodes local chat-media video URLs for file-backed preview actions', () => {
+    expect(_viewerAbsPathFromChatMediaLocalUrl('chat-media://local/Users/test/has%20space.mp4')).toBe('/Users/test/has space.mp4');
+    expect(_viewerAbsPathFromChatMediaLocalUrl('chat-media://local/C:/Users/test/clip.mp4')).toBe('C:/Users/test/clip.mp4');
+  });
+
+  it('refuses non-local media URLs', () => {
+    expect(_viewerAbsPathFromChatMediaLocalUrl('chat-media://cid/main/clip.mp4')).toBe('');
+    expect(_viewerAbsPathFromChatMediaLocalUrl('https://example.test/clip.mp4')).toBe('');
   });
 });
 
@@ -122,5 +138,16 @@ describe('chat-file-viewer › _viewerCanAddToLibrary', () => {
     expect(_viewerCanAddToLibrary('/tmp/movie.mp4')).toBe(false);
     expect(_viewerCanAddToLibrary('/tmp/archive.zip')).toBe(false);
     expect(_viewerCanAddToLibrary('/tmp/no-extension')).toBe(false);
+  });
+});
+
+describe('chat-file-viewer › _viewerVideoPlaybackOptions', () => {
+  it('keeps explicit autoplay and a positive start time', () => {
+    expect(_viewerVideoPlaybackOptions({ autoplay: true, startTime: 12.5 })).toEqual({ autoplay: true, startTime: 12.5 });
+  });
+
+  it('normalizes missing or invalid playback options', () => {
+    expect(_viewerVideoPlaybackOptions()).toEqual({ autoplay: false, startTime: 0 });
+    expect(_viewerVideoPlaybackOptions({ autoplay: false, startTime: -1 })).toEqual({ autoplay: false, startTime: 0 });
   });
 });

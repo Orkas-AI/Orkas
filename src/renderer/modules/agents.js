@@ -2,6 +2,7 @@ const _agentsLog = createLogger('agents');
 // ─── Agents (three-column: list / detail / inline edit chat) ───
 
 function _agentsTrackClick(action, data) {
+  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
 let _agentsCache = null;
@@ -9,6 +10,14 @@ let _agentsLoadInFlight = null;
 let _selectedAgent = null; // { id, name, source }
 let _agentEditing = false;
 let _agentFieldSaveTimer = null;
+let _agentSkillNameRows = null;
+let _agentSkillNameLoadInFlight = null;
+const _COMMANDER_AGENT_ID = 'commander';
+let _commanderAgentMemoryEntries = [];
+let _commanderAgentAvatar = null;
+let _commanderAgentProfile = null;
+let _commanderAgentRuntimeStats = null;
+let _commanderAgentStateInFlight = null;
 
 function _agentUiIconHtml(name, className) {
   if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
@@ -46,26 +55,371 @@ function _agentSource(source) {
     : String(source || '');
 }
 
+function _isAgentProfileMock() {
+  return false;
+}
+
 function _isAgentPlatformSource(source) {
   return (typeof isMarketplaceCatalogSource === 'function')
     ? isMarketplaceCatalogSource(source)
     : _agentSource(source) === 'marketplace';
 }
 
-/** Version + category chips for a marketplace-installed agent. Mirrors the
- *  marketplace card footer so users see the same metadata in the agents grid.
- *  `_mpCategoriesCache` is a module-level variable in `marketplace.js` (flat top-level
- *  scope per CLAUDE.md §8). */
-function _agentPlatformChipsHtml(a) {
-  const lang = getLang();
+function _isExternalCliAgent(agent) {
+  return !!(agent && agent.runtime && agent.runtime.kind === 'cli');
+}
+
+function _agentCardMetaHtml(a, lang) {
+  if (_isCommanderAgent(a)) {
+    return '';
+  }
   const parts = [];
   if (a.version) {
     const versionLabel = t('marketplace.version').replace('{version}', String(a.version));
     parts.push(`<span class="agent-card-chip is-version">${escapeHtml(versionLabel)}</span>`);
   }
   const catLabel = _resolveCategoryLabel(a.category, lang);
-  parts.push(`<span class="agent-card-chip">${escapeHtml(catLabel)}</span>`);
+  if (catLabel) parts.push(`<span class="agent-card-chip">${escapeHtml(catLabel)}</span>`);
   return parts.join('');
+}
+
+function _agentPlatformStatusChipsHtml(a) {
+  return '';
+}
+
+function _agentLabel(key, zh, en, ja) {
+  const raw = t(key);
+  if (raw && raw !== key) return raw;
+  const lang = getLang();
+  if (lang === 'zh') return zh;
+  if (lang === 'ja') return ja || en;
+  return en;
+}
+
+function _isCommanderAgent(agentOrId) {
+  if (!agentOrId) return false;
+  if (typeof agentOrId === 'string') return agentOrId === _COMMANDER_AGENT_ID || agentOrId === '__commander__';
+  return String(agentOrId.agent_id || agentOrId.id || '') === _COMMANDER_AGENT_ID
+    || _agentSource(agentOrId.source) === _COMMANDER_AGENT_ID;
+}
+
+function _commanderLocalizedText(value, fallback = '', opts = {}) {
+  const clean = (text) => {
+    if (opts.preserveNewlines) {
+      return String(text || '')
+        .replace(/\\"/g, '"')
+        .replace(/\\'/g, "'")
+        .replace(/\\{2,}/g, '\\')
+        .replace(/\r\n?/g, '\n')
+        .trim();
+    }
+    return normalizeDisplayText(text);
+  };
+  if (typeof value === 'string') return clean(value);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return fallback;
+  const lang = getLang();
+  const direct = clean(value[lang]);
+  if (direct) return direct;
+  return clean(value.zh) || clean(value.en) || clean(value.ja) || fallback;
+}
+
+function _commanderLocalizedList(value) {
+  if (Array.isArray(value)) return value.map(normalizeDisplayText).filter(Boolean);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+  const lang = getLang();
+  const direct = Array.isArray(value[lang]) ? value[lang] : null;
+  const fallback = direct || (Array.isArray(value.zh) ? value.zh : null) || (Array.isArray(value.en) ? value.en : null) || (Array.isArray(value.ja) ? value.ja : []);
+  return fallback.map(normalizeDisplayText).filter(Boolean);
+}
+
+function _commanderAvatarFallback() {
+  const fallback = (typeof COMMANDER_DEFAULT !== 'undefined' && COMMANDER_DEFAULT)
+    ? COMMANDER_DEFAULT
+    : { icon: 'crown', color: 'gold' };
+  return {
+    icon: fallback.icon || 'crown',
+    color: _commanderAgentAvatar?.color || fallback.color || 'gold',
+  };
+}
+
+async function _refreshCommanderAgentState() {
+  if (_commanderAgentStateInFlight) return _commanderAgentStateInFlight;
+  _commanderAgentStateInFlight = (async () => {
+    if (typeof window === 'undefined' || !window.orkas?.invoke) return;
+    const [memoryRes, avatarRes, profileRes, statsRes] = await Promise.allSettled([
+      window.orkas.invoke('memory.list', { target: 'agent', agentId: _COMMANDER_AGENT_ID }),
+      window.orkas.invoke('prefs.getCommanderAvatar'),
+      window.orkas.invoke('commander.getProfile'),
+      window.orkas.invoke('commander.runtimeStats.get'),
+    ]);
+    if (memoryRes.status === 'fulfilled') {
+      _commanderAgentMemoryEntries = Array.isArray(memoryRes.value?.entries)
+        ? memoryRes.value.entries.map(normalizeDisplayText).filter(Boolean)
+        : [];
+    }
+    if (avatarRes.status === 'fulfilled' && avatarRes.value?.avatar) {
+      const avatar = avatarRes.value.avatar;
+      if (avatar.icon && avatar.color) _commanderAgentAvatar = { icon: avatar.icon, color: avatar.color };
+    }
+    if (profileRes.status === 'fulfilled' && profileRes.value?.profile) {
+      _commanderAgentProfile = profileRes.value.profile;
+    }
+    if (statsRes.status === 'fulfilled') {
+      _commanderAgentRuntimeStats = statsRes.value?.runtime_stats || null;
+    }
+  })().catch((err) => {
+    _agentsLog.warn('load commander agent state failed', err);
+  }).finally(() => {
+    _commanderAgentStateInFlight = null;
+  });
+  return _commanderAgentStateInFlight;
+}
+
+function _buildCommanderAgent() {
+  const avatar = _commanderAvatarFallback();
+  const profile = _commanderAgentProfile || {};
+  const name = _commanderLocalizedText(profile.name, t('chat.recipient_commander'));
+  const description = _commanderLocalizedText(profile.description, '');
+  const workflow = _commanderLocalizedText(profile.workflow, '', { preserveNewlines: true });
+  const knowhow = _commanderLocalizedList(profile.knowhow);
+  const standards = _commanderLocalizedList(profile.standards);
+  return {
+    agent_id: _COMMANDER_AGENT_ID,
+    id: _COMMANDER_AGENT_ID,
+    name,
+    source: _COMMANDER_AGENT_ID,
+    category: 'general',
+    enabled: true,
+    icon: avatar.icon,
+    color: avatar.color,
+    description,
+    workflow,
+    knowhow,
+    standards,
+    profile: {
+      knowhow,
+      standards,
+      memory: _commanderAgentMemoryEntries.map((title) => ({ title })),
+    },
+    skill_list: [],
+    runtime_stats: _commanderAgentRuntimeStats || {},
+  };
+}
+
+function _withCommanderAgent(agents) {
+  const list = Array.isArray(agents) ? agents : [];
+  return [_buildCommanderAgent(), ...list.filter((a) => !_isCommanderAgent(a))];
+}
+
+function _agentProfile(agent) {
+  const p = agent && agent.profile;
+  const profile = p && typeof p === 'object' && !Array.isArray(p) ? { ...p } : {};
+  if (agent && Array.isArray(agent.knowhow) && !Array.isArray(profile.knowhow)) {
+    profile.knowhow = agent.knowhow;
+  }
+  if (agent && Array.isArray(agent.standards) && !Array.isArray(profile.standards)) {
+    profile.standards = agent.standards;
+  }
+  return profile;
+}
+
+function _agentProfileEntries(value) {
+  if (!Array.isArray(value)) return [];
+  const entries = [];
+  for (const item of value) {
+    if (typeof item === 'string' || typeof item === 'number') {
+      const title = normalizeDisplayText(item);
+      if (title) entries.push({ title, description: '', tool: '', source: '', updated_at: '' });
+      continue;
+    }
+    if (!item || typeof item !== 'object' || item.kept === false) continue;
+    const entry = {
+      title: normalizeDisplayText(item.title || item.name || item.t || ''),
+      description: normalizeDisplayText(item.description || item.d || ''),
+      tool: normalizeDisplayText(item.tool || item.skill || ''),
+      source: normalizeDisplayText(item.source || item.from || ''),
+      updated_at: normalizeDisplayText(item.updated_at || item.when || ''),
+    };
+    if (entry.title || entry.description) entries.push(entry);
+  }
+  return entries;
+}
+
+function _agentSummary(agent, lang) {
+  if (_isCommanderAgent(agent)) return normalizeDisplayText(agent && agent.description);
+  return (pickDesc(agent, lang) || '').trim();
+}
+
+function _agentWorkflowSteps(agent) {
+  return [];
+}
+
+function _agentMemoryEntries(agent) {
+  return _agentProfileEntries(_agentProfile(agent).memory);
+}
+
+function _agentKnownSkillRows() {
+  const rows = [];
+  if (Array.isArray(_agentSkillNameRows)) rows.push(..._agentSkillNameRows);
+  if (typeof _skillsCache !== 'undefined' && Array.isArray(_skillsCache)) rows.push(..._skillsCache);
+  if (typeof _openSkillsCache !== 'undefined' && Array.isArray(_openSkillsCache)) rows.push(..._openSkillsCache);
+  return rows;
+}
+
+function _agentSkillNameForId(skillId) {
+  const id = normalizeDisplayText(skillId);
+  if (!id) return '';
+  const row = _agentKnownSkillRows().find((s) => {
+    if (!s || typeof s !== 'object') return false;
+    return String(s.id || '') === id || String(s.skill_id || '') === id;
+  });
+  const name = normalizeDisplayText(row && (row.name || row.display_name || row.title));
+  return name || id;
+}
+
+function _agentSkillIds(agent) {
+  return Array.isArray(agent && agent.skill_list)
+    ? agent.skill_list.map(normalizeDisplayText).filter(Boolean)
+    : [];
+}
+
+function _maybeLoadAgentSkillNames(ids, agentId, opts = {}) {
+  if (!ids.length || _agentSkillNameRows) return Promise.resolve();
+  if (_agentSkillNameLoadInFlight) return _agentSkillNameLoadInFlight;
+  const hasUnresolved = ids.some((id) => _agentSkillNameForId(id) === id);
+  if (!hasUnresolved || typeof window === 'undefined' || !window.orkas?.invoke) return Promise.resolve();
+  _agentSkillNameLoadInFlight = (async () => {
+    try {
+      const [trustedRes, openRes] = await Promise.allSettled([
+        window.orkas.invoke('skills.list'),
+        window.orkas.invoke('skills.listOpen'),
+      ]);
+      const trusted = trustedRes.status === 'fulfilled' && Array.isArray(trustedRes.value?.skills)
+        ? trustedRes.value.skills
+        : [];
+      const open = openRes.status === 'fulfilled' && openRes.value?.ok && Array.isArray(openRes.value.skills)
+        ? openRes.value.skills
+        : [];
+      _agentSkillNameRows = [...trusted, ...open];
+    } catch (err) {
+      _agentsLog.warn('load skill names for agent detail failed', err);
+      _agentSkillNameRows = [];
+    } finally {
+      _agentSkillNameLoadInFlight = null;
+    }
+    const shouldRefresh = opts.refresh !== false;
+    if (shouldRefresh && !_agentEditing && _selectedAgent?.id === agentId) {
+      selectAgent(agentId).catch(() => { /* best-effort refresh */ });
+    }
+  })();
+  return _agentSkillNameLoadInFlight;
+}
+
+function _agentSkillRefs(agent) {
+  const ids = _agentSkillIds(agent);
+  _maybeLoadAgentSkillNames(ids, agent && agent.agent_id);
+  return ids
+    .map((id) => ({ id, title: _agentSkillNameForId(id) }))
+    .filter((skill) => skill.title);
+}
+
+function _agentRuntimeStats(agent) {
+  const raw = agent && typeof agent === 'object' ? agent.runtime_stats : null;
+  const attempts = Math.max(0, Number(raw && raw.attempts) || 0);
+  const deliveries = Math.max(0, Number(raw && raw.deliveries) || 0);
+  const successes = raw && raw.successes !== undefined
+    ? Math.max(0, Number(raw.successes) || 0)
+    : deliveries;
+  const totalDurationMs = Math.max(0, Number(raw && raw.total_duration_ms) || 0);
+  const successfulDurationMs = Math.max(0, Number(raw && raw.successful_duration_ms) || 0);
+  return {
+    attempts,
+    successes,
+    deliveries,
+    failures: Math.max(0, Number(raw && raw.failures) || 0),
+    errors: Math.max(0, Number(raw && raw.errors) || 0),
+    totalDurationMs,
+    successfulDurationMs,
+    updatedAt: normalizeDisplayText(raw && raw.updated_at),
+  };
+}
+
+async function _refreshAgentRuntimeStatsAfterRun(agentId) {
+  const id = String(agentId || '');
+  if (!id || _isCommanderAgent(id) || _isAgentProfileMock(id) || !window.orkas?.invoke) return;
+  try {
+    await loadAgents(true);
+    if (_selectedAgent?.id === id && !_agentEditing) await selectAgent(id);
+  } catch (err) {
+    _agentsLog.warn('refresh agent runtime stats failed', err);
+  }
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('orkas-agent-run-finished', (event) => {
+    const detail = event && event.detail ? event.detail : {};
+    _refreshAgentRuntimeStatsAfterRun(detail.agent_id).catch(() => {});
+  });
+}
+
+function _agentDeliveryCount(agent) {
+  return _agentRuntimeStats(agent).deliveries;
+}
+
+function _agentDeliveryChip(count) {
+  const n = Math.max(0, Number(count) || 0);
+  if (n <= 0) return '';
+  const label = _agentLabel('agents.card_delivery_count', '{n} 交付', '{n} delivered', '{n} 納品');
+  return `<span class="agent-card-chip">${escapeHtml(label.replace('{n}', String(n)))}</span>`;
+}
+
+function _agentRoundedSeconds(ms, count) {
+  const avg = count > 0 ? Math.round(ms / count / 1000) : 0;
+  return ms > 0 && avg === 0 ? 1 : avg;
+}
+
+function _agentDetailStats(agent) {
+  const runtime = _agentRuntimeStats(agent);
+  const assessed = runtime.successes + runtime.failures;
+  const successRate = assessed > 0 ? Math.round((runtime.successes / assessed) * 100) : 0;
+  const avgSource = runtime.deliveries > 0 ? runtime.successfulDurationMs : runtime.totalDurationMs;
+  const avgCount = runtime.deliveries > 0 ? runtime.deliveries : runtime.attempts;
+  const stats = [
+    {
+      key: _agentLabel('agents.stat_delivery_label', '交付', 'Delivered', '納品'),
+      value: String(runtime.deliveries),
+      unit: _agentLabel('agents.stat_delivery_unit', '次', 'times', '回'),
+      kind: 'delivery',
+    },
+    {
+      key: _agentLabel('agents.stat_success_label', '成功率', 'Success rate', '成功率'),
+      value: String(successRate),
+      unit: '%',
+      kind: 'success',
+    },
+    {
+      key: _agentLabel('agents.stat_avg_time_label', '耗时', 'Time', '時間'),
+      value: String(_agentRoundedSeconds(avgSource, avgCount)),
+      unit: _agentLabel('agents.stat_avg_time_unit', '秒', 's', '秒'),
+      kind: 'duration',
+    },
+  ];
+  if (!_isExternalCliAgent(agent)) {
+    const memory = _agentMemoryEntries(agent);
+    stats.push({
+      key: _agentLabel('agents.stat_memory_label', '记忆', 'Memory', '記憶'),
+      value: String(memory.length),
+      unit: _agentLabel('agents.stat_memory_unit', '项', 'items', '件'),
+      kind: 'memory',
+    });
+  }
+  return stats;
+}
+
+function _agentExplicitCountChip(label, count) {
+  return count > 0
+    ? `<span class="agent-card-chip">${escapeHtml(label.replace('{n}', String(count)))}</span>`
+    : '';
 }
 
 function _generalCategoryLabel(lang) {
@@ -117,49 +471,6 @@ function _resolveCategoryLabel(code, lang) {
   return pickLocalizedName(c, lang) || code;
 }
 
-async function _detailCategoryOptions() {
-  let list = [];
-  try {
-    if (typeof _mpCategoriesCache !== 'undefined' && Array.isArray(_mpCategoriesCache) && _mpCategoriesCache.length) {
-      list = _mpCategoriesCache;
-    }
-  } catch (_) { /* ignore */ }
-  if (!list.length && window.orkas && typeof window.orkas.invoke === 'function') {
-    try {
-      const r = await window.orkas.invoke('marketplace.categories', { local_only: true });
-      if (Array.isArray(r && r.list)) list = r.list;
-    } catch (_) { /* fallback below */ }
-  }
-  const lang = (typeof getLang === 'function') ? getLang() : 'en';
-  const seen = new Set();
-  const options = [];
-  for (const c of list) {
-    const code = String(c && c.code || '').trim();
-    if (!code || seen.has(code)) continue;
-    seen.add(code);
-    options.push({ value: code, label: pickLocalizedName(c, lang) || code });
-  }
-  if (!seen.has('general')) options.unshift({ value: 'general', label: _resolveCategoryLabel('general', lang) || 'General' });
-  return options;
-}
-
-async function _mountDetailCategorySelect(slot, {
-  value,
-  onChange,
-}) {
-  if (!slot) return null;
-  slot.innerHTML = '';
-  const options = await _detailCategoryOptions();
-  const current = String(value || 'general').trim() || 'general';
-  const api = _aiSelectMount(slot, {
-    options,
-    value: options.some((o) => o.value === current) ? current : 'general',
-    onChange,
-  });
-  return api;
-}
-
-
 // Mirror of `agents.ts::NAME_TOKEN_RE` so the form rejects junk before
 // the round-trip. Charset must round-trip through the bus's @-mention
 // regex; see backend for the full reasoning. UIs may still surface
@@ -180,7 +491,11 @@ async function loadAgents(forceRefresh) {
     if (!forceRefresh) return _agentsLoadInFlight;
     await _agentsLoadInFlight.catch(() => {});
   }
-  if (_agentsCache && !forceRefresh) { renderAgentsList(_agentsCache); return; }
+  if (_agentsCache && !forceRefresh) {
+    await _refreshCommanderAgentState();
+    renderAgentsList(_agentsCache);
+    return;
+  }
   _agentsLoadInFlight = (async () => {
     try {
       const res = await apiFetch(forceRefresh ? '/api/agents/list?force=1' : '/api/agents/list');
@@ -200,7 +515,7 @@ async function loadAgents(forceRefresh) {
         // < orkas < 全(q)'). Without this, the backend's listAgents
         // internal sort (by agent_id, a 12-char nanoid) feels random to
         // users. The override here fixes that.
-        _agentsCache = (data.agents || []).map((a) => ({
+        const sortedAgents = (data.agents || []).map((a) => ({
           ...a,
           source: _agentSource(a.source),
         })).sort((a, b) => {
@@ -209,6 +524,8 @@ async function loadAgents(forceRefresh) {
           const kb = pinyinSortKey(b.name || b.agent_id || '');
           return ka < kb ? -1 : ka > kb ? 1 : 0;
         });
+        await _refreshCommanderAgentState();
+        _agentsCache = sortedAgents;
         renderAgentsList(_agentsCache);
         // Sidebar conv-row badges read agent icon+color from `_agentsCache`
         // (via `_renderConvAgentStackHtml`). Boot order is loadConversations
@@ -268,7 +585,7 @@ async function _backfillMissingAvatars(agents) {
   _agentsLog.info(`avatar backfill: ${missing.length} agent(s)`);
 }
 
-function renderAgentsList(agents) { renderAgentsGrid(agents); }
+function renderAgentsList(agents) { renderAgentsGrid(_withCommanderAgent(agents)); }
 
 // Active category-chip selection for the Agents page. Empty string = "All";
 // matches `_mpState.category` semantics in marketplace.js. Persists across
@@ -295,6 +612,7 @@ function renderAgentsGrid(agents) {
   if (emptyEl) emptyEl.style.display = 'none';
 
   const useTitle = escapeHtml(t('agents.use_tooltip'));
+  const useLabel = escapeHtml(t('agents.use'));
   const moreTitle = escapeHtml(t('agents.more_actions'));
   const lang = getLang();
   const customChipLabel = t('agents.custom_group');
@@ -358,7 +676,7 @@ function renderAgentsGrid(agents) {
         _agentsActiveCategory = btn.dataset.agentsCat || '';
         // Only the user re-renders here — backend cache (`_agentsCache`) is
         // unchanged, so we pass it back through the same code path.
-        if (_agentsCache) renderAgentsGrid(_agentsCache);
+        if (_agentsCache) renderAgentsList(_agentsCache);
       });
     });
   }
@@ -370,57 +688,67 @@ function renderAgentsGrid(agents) {
 
   const cardHtml = (a) => {
     const enabled = a.enabled !== false;
-    const desc = pickDesc(a, lang).trim();
+    const isMock = _isAgentProfileMock(a);
+    const isCommander = _isCommanderAgent(a);
+    const desc = _agentSummary(a, lang);
+    const metaHtml = _agentCardMetaHtml(a, lang);
+    const memoryEntries = _isExternalCliAgent(a) ? [] : _agentMemoryEntries(a);
+    const memoryCount = memoryEntries.length;
+    const skillCount = Array.isArray(a.skill_list) ? a.skill_list.length : 0;
+    const deliveryCount = _agentDeliveryCount(a);
     const descClass = desc ? 'agent-card-desc' : 'agent-card-desc is-empty';
     const descText = desc || t('agents.placeholder_unset');
-    const moreBtn = `<button type="button" class="agent-card-more" data-agent-more title="${moreTitle}" aria-label="${moreTitle}">⋯</button>`;
+    const moreBtn = (isMock || isCommander) ? '' : `<button type="button" class="agent-card-more" data-agent-more title="${moreTitle}" aria-label="${moreTitle}">⋯</button>`;
     const avatarHtml = renderAvatarHtml(a.icon, a.color, { size: 32, seed: a.agent_id, extraClass: 'agent-card-avatar' });
     // CLI brand chip on the bottom row, shared with the play button.
     const cliChip = (a.runtime && a.runtime.kind === 'cli')
       ? `<span class="agent-card-chip is-cli is-cli-${escapeHtml(a.runtime.cli)}">${escapeHtml(_cliBadgeLabel(a.runtime.cli))}</span>`
       : '';
-    // Source provenance chips on the bottom row:
-    //  - custom → single "Custom" chip (the source-grouping moved out of
-    //    the page chrome; the chip is now the only signal of provenance).
-    //  - marketplace → version + category chips via _agentPlatformChipsHtml.
-    let provenanceChips = '';
-    if (a.source === 'custom') {
-      provenanceChips = `<span class="agent-card-chip is-custom">${escapeHtml(customChipLabel)}</span>`;
-    } else if (_isAgentPlatformSource(a.source)) {
-      provenanceChips = _agentPlatformChipsHtml(a);
-    }
+    // Source provenance chips on the bottom row. Version/category now live
+    // in the subtitle line under the card title, so marketplace only keeps
+    // review status here when that UI is enabled.
+    const provenanceChips = _isAgentPlatformSource(a.source) ? _agentPlatformStatusChipsHtml(a) : '';
     return `
       <div class="agent-card${enabled ? '' : ' is-disabled'}" data-id="${escapeHtml(a.agent_id)}" data-source="${escapeHtml(a.source || '')}">
         <div class="agent-card-header">
           ${avatarHtml}
-          <span class="agent-card-name">${escapeHtml(a.name || t('agents.unnamed'))}</span>
+          <div class="agent-card-title">
+            <span class="agent-card-name">${escapeHtml(a.name || t('agents.unnamed'))}</span>
+            ${metaHtml ? `<span class="agent-card-meta">${metaHtml}</span>` : ''}
+          </div>
           ${moreBtn}
         </div>
         <div class="${descClass}">${escapeHtml(descText)}</div>
         <div class="agent-card-actions">
           ${cliChip}${provenanceChips}
-          <button type="button" class="agent-card-use" data-agent-use title="${useTitle}" aria-label="${useTitle}" ${enabled ? '' : 'disabled aria-disabled="true" tabindex="-1"'}>
-            ${_agentUiIconHtml('play-triangle', 'icon-play')}
+          ${_agentDeliveryChip(deliveryCount)}
+          ${_agentExplicitCountChip(_agentLabel('agents.card_memory_count', '{n} 记忆', '{n} memory', '{n} 記憶'), memoryCount)}
+          ${_agentExplicitCountChip(_agentLabel('agents.card_skill_count', '{n} 技能', '{n} skills', '{n} スキル'), skillCount)}
+          <button type="button" class="agent-card-use" data-agent-use title="${useTitle}" aria-label="${useTitle}" ${enabled && !isMock ? '' : 'disabled aria-disabled="true" tabindex="-1"'}>
+            ${useLabel}
           </button>
         </div>
       </div>
     `;
   };
 
-  const groups = { custom: [], marketplace: [] };
+  const groups = { commander: [], custom: [], marketplace: [] };
   for (const a of filtered) {
     const source = _agentSource(a?.source);
-    if (source === 'marketplace') groups.marketplace.push(a);
+    if (_isCommanderAgent(a)) groups.commander.push(a);
+    else if (source === 'marketplace') groups.marketplace.push(a);
     else groups.custom.push(a);
   }
-  const sectionHtml = (label, list) => {
+  const sectionHtml = (label, list, opts = {}) => {
     if (!list.length) return '';
-    return `
-      <section class="agents-source-section">
+    const headHtml = opts.hideHead ? '' : `
         <div class="agents-source-section-head">
           <span>${escapeHtml(label)}</span>
           <span class="agents-source-section-count">${list.length}</span>
-        </div>
+        </div>`;
+    return `
+      <section class="agents-source-section">
+        ${headHtml}
         <div class="agents-source-section-grid">
           ${list.map(cardHtml).join('')}
         </div>
@@ -428,7 +756,8 @@ function renderAgentsGrid(agents) {
     `;
   };
   gridEl.classList.add('is-sectioned');
-  gridEl.innerHTML = sectionHtml(customChipLabel, groups.custom)
+  gridEl.innerHTML = sectionHtml('', groups.commander, { hideHead: true })
+    + sectionHtml(customChipLabel, groups.custom)
     + sectionHtml(marketplaceGroupLabel, groups.marketplace);
 
   for (const card of gridEl.querySelectorAll('.agent-card')) {
@@ -454,6 +783,7 @@ function renderAgentsGrid(agents) {
  *  and the detail-page enable/disable button). On failure, alerts; on
  *  success, refreshes the grid + detail page. */
 async function _flipAgentEnabled(agentId, nextEnabled) {
+  if (_isCommanderAgent(agentId)) return false;
   try {
     const res = await window.orkas.invoke('agents.setEnabled', { agent_id: agentId, enabled: nextEnabled });
     if (!res || !res.ok) {
@@ -543,6 +873,7 @@ function _closeAgentRowMenu() {
 }
 
 function _toggleAgentRowMenu(anchorBtn, agentId, source = '') {
+  if (_isCommanderAgent(agentId)) return;
   const menu = document.getElementById('agent-row-menu');
   if (!menu) return;
   // Toggle off if already open for this same anchor.
@@ -586,11 +917,27 @@ function _toggleAgentRowMenu(anchorBtn, agentId, source = '') {
 // through `selectAgent` so it re-fetches the full agent (the cached
 // `_selectedAgent` only holds id/name/source).
 window.addEventListener('i18n-change', () => {
-  if (_agentsCache) renderAgentsGrid(_agentsCache);
+  if (_agentsCache) renderAgentsList(_agentsCache);
   if (_selectedAgent?.id) {
     selectAgent(_selectedAgent.id).catch(() => { /* ignore */ });
   }
 });
+
+function _resetAgentDetailScroll() {
+  const detailContent = document.getElementById('agents-detail-content');
+  if (detailContent) detailContent.scrollTop = 0;
+  for (const sel of ['.agents-detail-body', '#agents-detail-desc', '#agents-detail-workflow']) {
+    const el = document.querySelector(sel);
+    if (el) el.scrollTop = 0;
+  }
+}
+
+async function _renderCommanderAgentDetail(editing = false) {
+  await _refreshCommanderAgentState();
+  const agent = _buildCommanderAgent();
+  _selectedAgent = { id: agent.agent_id, name: agent.name, source: agent.source };
+  _renderAgentDetail(agent, editing);
+}
 
 async function refreshAgentsAfterMarketplaceReconcile() {
   await loadAgents(true);
@@ -604,29 +951,34 @@ async function refreshAgentsAfterMarketplaceReconcile() {
  *  enabled state. Called fresh on each open so the toggle label is right
  *  and builtin agents see only the enable/disable item. */
 function _renderAgentRowMenuItems(menu, agentId, source = '') {
+  if (_isCommanderAgent(agentId)) {
+    menu.innerHTML = '';
+    return;
+  }
   const normalizedSource = _agentSource(source);
   const a = _agentsCache?.find((x) => x.agent_id === agentId && (!normalizedSource || _agentSource(x.source) === normalizedSource))
     || _agentsCache?.find((x) => x.agent_id === agentId);
   const enabled = a ? a.enabled !== false : true;
-  const isCustom = a?.source === 'custom';
+  const isMock = _isAgentProfileMock(a || agentId);
+  const isCustom = a?.source === 'custom' && !isMock;
   // Dev mode lifts the source guard for marketplace edit / delete.
-  const canEdit = isCustom ;
+  const canEdit = !isMock && (isCustom || (_isAgentPlatformSource(a?.source) && false));
   // Dev-only entry on builtin: tag the label so the user knows this isn't a
   // normal user capability (mirrors marketplace.upload's "(dev)" treatment).
-  const editLabelSuffix = '';
+  const editLabelSuffix = (_isAgentPlatformSource(a?.source) && false) ? t('common.dev_suffix') : '';
   const toggleLabel = enabled ? t('component.disable') : t('component.enable');
   const items = [];
   if (canEdit) {
     items.push(`<div class="agent-row-menu-item" data-action="edit">${escapeHtml(t('agents.edit') + editLabelSuffix)}</div>`);
   }
-  // Upload-to-marketplace is owned by marketplace_dev.js (renderer-side dev module). The open-source build
+  // Upload-to-marketplace is owned by marketplace_dev.js (renderer-side dev module). the open-source build
   // doesn't ship that file, so `typeof openMarketplaceUpload === 'function'` is false there
   // and the menu item simply doesn't appear — no isDevMode check needed (and would be banned
-  // by the open-source strip-rules anyway).
+  // by the open-source build's strip-rules anyway).
   if (typeof openMarketplaceUpload === 'function') {
     items.push(`<div class="agent-row-menu-item" data-action="upload-marketplace">${escapeHtml(t('marketplace.upload'))}</div>`);
   }
-  items.push(`<div class="agent-row-menu-item" data-action="toggle-enabled">${escapeHtml(toggleLabel)}</div>`);
+  if (!isMock) items.push(`<div class="agent-row-menu-item" data-action="toggle-enabled">${escapeHtml(toggleLabel)}</div>`);
   if (canEdit) {
     items.push(`<div class="agent-row-menu-item is-danger" data-action="delete">${escapeHtml(t('agents.delete'))}</div>`);
   }
@@ -655,6 +1007,8 @@ function _renderAgentRowMenuItems(menu, agentId, source = '') {
 }
 
 async function _flipAgentEnabledFromMenu(agentId) {
+  if (_isCommanderAgent(agentId)) return;
+  if (_isAgentProfileMock(agentId)) return;
   const cached = _agentsCache?.find((x) => x.agent_id === agentId);
   const next = !(cached?.enabled !== false);
   await _flipAgentEnabled(agentId, next);
@@ -665,11 +1019,17 @@ async function selectAgent(agentId) {
   if (_agentEditing && _selectedAgent && _selectedAgent.id !== agentId) {
     await _exitAgentEditMode();
   }
+  if (_isCommanderAgent(agentId)) {
+    await _renderCommanderAgentDetail(false);
+    _resetAgentDetailScroll();
+    return;
+  }
   try {
     const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}`);
     const data = await res.json();
     if (!data.ok || !data.agent) return;
     data.agent.source = _agentSource(data.agent.source);
+    await _maybeLoadAgentSkillNames(_agentSkillIds(data.agent), data.agent.agent_id, { refresh: false });
     _selectedAgent = { id: data.agent.agent_id, name: data.agent.name, source: data.agent.source };
     _renderAgentDetail(data.agent, false);
     // Reset every nested scroll container — `.agents-detail-content` and
@@ -677,41 +1037,535 @@ async function selectAgent(agentId) {
     // `.agents-detail-workflow` each have `overflow-y: auto` of their own
     // (style.css:4190). Without resetting the inner two the previous
     // agent's mid-scroll position bleeds into the next agent's view.
-    const detailContent = document.getElementById('agents-detail-content');
-    if (detailContent) detailContent.scrollTop = 0;
-    for (const sel of ['.agents-detail-body', '#agents-detail-desc', '#agents-detail-workflow']) {
-      const el = document.querySelector(sel);
-      if (el) el.scrollTop = 0;
-    }
+    _resetAgentDetailScroll();
   } catch (e) {
     _agentsLog.error('load agent failed', e);
   }
 }
 
-// Render the header meta strip for a single agent / skill detail. Used by both
-// `agents.js::_renderAgentDetail` and `skills.js::useSkill`. Two forms:
-//   - custom item: single "自定义" chip (kept for symmetry with prior chrome)
-//   - marketplace-installed item: category chip, without author uid / official tags
-  // `item.source` distinguishes custom vs marketplace-installed; `item.category` (code) maps
-// to display name via `_mpCategoriesCache` (loaded at marketplace boot, hot in localStorage).
+// Render the header meta strip for a single agent / skill detail. Custom items
+// mount an editable category select beside these static chips.
 function _renderSourceMetaHtml(item) {
   if (!item) return '';
-  if (item.source === 'custom') {
-    return `<span class="agents-detail-source is-custom">${escapeHtml(t('agents.source_custom'))}</span>`;
-  }
+  if (_isCommanderAgent(item)) return '';
   const parts = [];
   if (item.version) {
     const versionLabel = t('marketplace.version').replace('{version}', String(item.version));
     parts.push(`<span class="agents-detail-source is-version">${escapeHtml(versionLabel)}</span>`);
   }
-  const lang = (typeof getLang === 'function') ? getLang() : 'en';
-  const label = _resolveCategoryLabel(item.category, lang);
-  parts.push(`<span class="agents-detail-source is-category">${escapeHtml(label)}</span>`);
+  if (_agentSource(item.source) !== 'custom') {
+    const lang = (typeof getLang === 'function') ? getLang() : 'en';
+    const label = _resolveCategoryLabel(item.category, lang);
+    parts.push(`<span class="agents-detail-source is-category">${escapeHtml(label)}</span>`);
+  }
   return parts.join('');
+}
+
+async function _detailCategoryOptions(currentValue = '') {
+  const lang = (typeof getLang === 'function') ? getLang() : 'en';
+  const canonical = (code) => {
+    return typeof _mpCanonicalCategoryCode === 'function'
+      ? _mpCanonicalCategoryCode(code)
+      : String(code || '').trim();
+  };
+  const stateCats = (typeof _mpState !== 'undefined' && Array.isArray(_mpState?.categories)) ? _mpState.categories : [];
+  const cacheCats = (typeof _mpCategoriesCache !== 'undefined' && Array.isArray(_mpCategoriesCache)) ? _mpCategoriesCache : [];
+  let categories = stateCats.length ? stateCats : cacheCats;
+  if (!categories.length && typeof window !== 'undefined' && window.orkas?.invoke) {
+    try {
+      const res = await window.orkas.invoke('marketplace.categories', { local_only: true });
+      const list = Array.isArray(res?.list) ? res.list : [];
+      if (list.length) {
+        categories = list;
+        if (typeof _mpCategoriesCache !== 'undefined') _mpCategoriesCache = list;
+        if (typeof _mpState !== 'undefined' && _mpState) _mpState.categories = list;
+        if (typeof _mpPersistCategoriesCache === 'function') _mpPersistCategoriesCache(list);
+      }
+    } catch (_) {
+      // The current value / General fallback below keeps the control usable.
+    }
+  }
+
+  const seen = new Set();
+  const options = [];
+  for (const category of categories) {
+    const code = canonical(category && category.code);
+    if (!code || seen.has(code)) continue;
+    seen.add(code);
+    options.push({
+      value: code,
+      label: (typeof pickLocalizedName === 'function' ? pickLocalizedName(category, lang) : '') || code,
+    });
+  }
+
+  const current = canonical(currentValue || 'general') || 'general';
+  if (current && !seen.has(current)) {
+    options.unshift({
+      value: current,
+      label: _resolveCategoryLabel(current, lang) || current,
+    });
+    seen.add(current);
+  }
+  if (!options.length) options.push({ value: 'general', label: _generalCategoryLabel(lang) });
+  return options;
+}
+
+async function _mountDetailCategorySelect(host, { value = 'general', onChange, readonly = false } = {}) {
+  if (!host) return null;
+  const current = (typeof _mpCanonicalCategoryCode === 'function')
+    ? _mpCanonicalCategoryCode(value || 'general')
+    : String(value || 'general').trim();
+  const mount = document.createElement('div');
+  mount.className = 'ai-select detail-category-select';
+  host.appendChild(mount);
+  const options = await _detailCategoryOptions(current);
+  let api;
+  api = _aiSelectMount(mount, {
+    options,
+    value: current || 'general',
+    onChange: async (nextValue) => {
+      if (readonly) {
+        api.setValue(current || 'general');
+        return;
+      }
+      if (typeof onChange === 'function') await onChange(nextValue || 'general', api);
+    },
+  });
+  if (readonly) {
+    mount.classList.add('is-readonly');
+    const trigger = mount.querySelector('.ai-select-trigger');
+    if (trigger) {
+      trigger.setAttribute('disabled', '');
+      trigger.setAttribute('aria-disabled', 'true');
+    }
+  }
+  return api;
+}
+
+function _renderAgentHeaderCategory(agent) {
+  const sourceEl = document.getElementById('agents-detail-source');
+  if (!sourceEl || _isCommanderAgent(agent) || _agentSource(agent?.source) !== 'custom') return;
+  const agentId = agent?.agent_id;
+  const isMock = _isAgentProfileMock(agent);
+  _mountDetailCategorySelect(sourceEl, {
+    value: agent?.category || 'general',
+    readonly: isMock,
+    onChange: async (category, api) => {
+      try {
+        const res = await window.orkas.invoke('agents.update', {
+          agent_id: agentId,
+          updates: { category: category || 'general' },
+        });
+        if (!res || !res.ok) {
+          api.setValue(agent?.category || 'general');
+          uiAlert((res && res.error) || t('agents.update_failed'));
+          return;
+        }
+        agent.category = res.agent?.category || category || 'general';
+        await loadAgents(true);
+        if (_selectedAgent?.id === agentId && !_agentEditing) await selectAgent(agentId);
+      } catch (err) {
+        api.setValue(agent?.category || 'general');
+        uiAlert((err && err.message) || t('agents.update_failed'));
+      }
+    },
+  }).catch((err) => _agentsLog.warn('render agent category select failed', err));
+}
+
+function _agentProfileChipHtml(text, extraClass) {
+  return text ? `<span class="agents-profile-chip${extraClass ? ' ' + extraClass : ''}">${escapeHtml(text)}</span>` : '';
+}
+
+function _agentDetailListIconHtml(kind) {
+  if (kind === 'memory') {
+    return '<svg viewBox="0 0 24 24" fill="none"><path d="M7 4.5h10a1.5 1.5 0 0 1 1.5 1.5v14l-6.5-3.6L5.5 20V6A1.5 1.5 0 0 1 7 4.5Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>';
+  }
+  if (kind === 'standard') {
+    return '<svg viewBox="0 0 24 24" fill="none"><path d="m5 12 4.2 4.2L19 6.8" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  }
+  return '<svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="7.5" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="2.5" stroke="currentColor" stroke-width="2"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+}
+
+function _agentMemoryListItemHtml(text, editable) {
+  if (!text) return '';
+  const removeTitle = _agentLabel('agents.memory_remove', '删除记忆', 'Remove memory', 'メモリを削除');
+  const editTitle = _agentLabel('agents.memory_edit', '修改记忆', 'Edit memory', 'メモリを編集');
+  return `
+    <div class="agents-detail-list-item">
+      <span class="agents-detail-list-icon is-memory" aria-hidden="true">${_agentDetailListIconHtml('memory')}</span>
+      ${editable
+        ? `<button type="button" class="agents-detail-list-text is-action" data-agent-memory-edit="${escapeHtml(text)}" title="${escapeHtml(editTitle)}">${escapeHtml(text)}</button>`
+        : `<span class="agents-detail-list-text">${escapeHtml(text)}</span>`}
+      ${editable ? `<button type="button" class="agents-memory-chip-remove" data-agent-memory-remove="${escapeHtml(text)}" title="${escapeHtml(removeTitle)}" aria-label="${escapeHtml(removeTitle)}">×</button>` : ''}
+    </div>
+  `;
+}
+
+function _agentEditableListItemHtml(text, index, key) {
+  if (!text) return '';
+  const editTitle = _agentLabel('agents.tag_edit', '修改', 'Edit', '編集');
+  const removeTitle = _agentLabel('agents.tag_remove', '删除', 'Remove', '削除');
+  const iconKind = key === 'standards' ? 'standard' : 'ability';
+  return `
+    <div class="agents-detail-list-item">
+      <span class="agents-detail-list-icon is-${escapeHtml(iconKind)}" aria-hidden="true">${_agentDetailListIconHtml(iconKind)}</span>
+      <button type="button" class="agents-detail-list-text is-action" data-agent-list-edit="${escapeHtml(key)}" data-agent-list-index="${index}" title="${escapeHtml(editTitle)}">${escapeHtml(text)}</button>
+      <button type="button" class="agents-memory-chip-remove" data-agent-list-remove="${escapeHtml(key)}" data-agent-list-index="${index}" title="${escapeHtml(removeTitle)}" aria-label="${escapeHtml(removeTitle)}">×</button>
+    </div>
+  `;
+}
+
+function _agentReadonlyListItemHtml(text, key) {
+  if (!text) return '';
+  const iconKind = key === 'standards' ? 'standard' : 'ability';
+  return `
+    <div class="agents-detail-list-item">
+      <span class="agents-detail-list-icon is-${escapeHtml(iconKind)}" aria-hidden="true">${_agentDetailListIconHtml(iconKind)}</span>
+      <span class="agents-detail-list-text">${escapeHtml(text)}</span>
+    </div>
+  `;
+}
+
+function _agentWorkflowMarkdown(steps) {
+  if (!steps.length) return '';
+  return steps.map((step, idx) => {
+    const title = normalizeDisplayText(step.title || step.description);
+    const desc = normalizeDisplayText(step.description);
+    const tool = normalizeDisplayText(step.tool);
+    const line = `${idx + 1}. ${title}${tool ? `（${tool}）` : ''}`;
+    return desc && desc !== title ? `${line}\n${desc}` : line;
+  }).join('\n\n');
+}
+
+function _agentProfileEntryTags(entries) {
+  return entries
+    .map((entry) => entry.title || entry.description)
+    .map(normalizeDisplayText)
+    .filter(Boolean);
+}
+
+function _agentTextList(agent, key) {
+  return _agentProfileEntryTags(_agentProfileEntries(_agentProfile(agent)[key])).slice(0, 20);
+}
+
+function _canEditAgentDefinition(agent) {
+  const source = _agentSource(agent && agent.source);
+  return !!agent && !_isAgentProfileMock(agent)
+    && (source === 'custom' || (_isAgentPlatformSource(source) && typeof isDevMode === 'function' && false));
+}
+
+async function _saveAgentTextList(agent, key, values) {
+  if (!agent || !_canEditAgentDefinition(agent)) return false;
+  const clean = [];
+  const seen = new Set();
+  for (const raw of Array.isArray(values) ? values : []) {
+    const text = normalizeDisplayText(raw);
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    clean.push(text);
+    if (clean.length >= 20) break;
+  }
+  try {
+    const res = await window.orkas.invoke('agents.update', {
+      agent_id: agent.agent_id,
+      updates: { [key]: clean },
+    });
+    if (!res || !res.ok) {
+      await uiAlert((res && res.error) || t('agents.update_failed'));
+      return false;
+    }
+    await loadAgents(true);
+    await _refreshAgentDetail(agent.agent_id);
+    return true;
+  } catch (err) {
+    await uiAlert((err && err.message) || t('agents.update_failed'));
+    return false;
+  }
+}
+
+async function _refreshAgentDetail(agentId) {
+  if (!agentId) return;
+  if (_isCommanderAgent(agentId)) {
+    await _renderCommanderAgentDetail(!!_agentEditing);
+    return;
+  }
+  const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}`);
+  const data = await res.json();
+  if (!data.ok || !data.agent) return;
+  data.agent.source = _agentSource(data.agent.source);
+  await _maybeLoadAgentSkillNames(_agentSkillIds(data.agent), data.agent.agent_id, { refresh: false });
+  _selectedAgent = { id: data.agent.agent_id, name: data.agent.name, source: data.agent.source };
+  _renderAgentDetail(data.agent, !!_agentEditing);
+}
+
+async function _promptAgentTextListValue(kind, current = '') {
+  const label = kind === 'standards'
+    ? _agentLabel(
+        'agents.standard_prompt',
+        '输入交付标准：明确可验收的预期结果',
+        'Enter a delivery standard: an expected, verifiable result',
+        '納品基準を入力：検証できる期待結果',
+      )
+    : _agentLabel('agents.knowhow_prompt', '输入擅长点', 'Enter know-how', '得意分野を入力');
+  const value = typeof uiPrompt === 'function'
+    ? await uiPrompt(label, current)
+    : window.prompt(label, current);
+  return normalizeDisplayText(value);
+}
+
+function _renderEditableTagList(host, agent, key, tags, editing) {
+  const canEdit = !!editing && _canEditAgentDefinition(agent);
+  if (!host) return;
+  host.innerHTML = canEdit
+    ? tags.map((tag, idx) => _agentEditableListItemHtml(tag, idx, key)).join('')
+    : tags.map((tag) => _agentReadonlyListItemHtml(tag, key)).join('');
+  if (!canEdit) return;
+  host.querySelectorAll('[data-agent-list-edit]').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const idx = Number(btn.getAttribute('data-agent-list-index'));
+      if (!Number.isInteger(idx) || idx < 0 || idx >= tags.length) return;
+      const next = await _promptAgentTextListValue(key, tags[idx]);
+      if (!next || next === tags[idx]) return;
+      const values = tags.slice();
+      values[idx] = next;
+      await _saveAgentTextList(agent, key, values);
+    });
+  });
+  host.querySelectorAll('[data-agent-list-remove]').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const idx = Number(btn.getAttribute('data-agent-list-index'));
+      if (!Number.isInteger(idx) || idx < 0 || idx >= tags.length) return;
+      const ok = typeof uiConfirm === 'function'
+        ? await uiConfirm({
+            message: _agentLabel('agents.tag_remove_confirm', '确认删除这一项？', 'Remove this item?', 'この項目を削除しますか？'),
+            okLabel: _agentLabel('agents.memory_remove_ok', '删除', 'Delete', '削除'),
+            cancelLabel: _agentLabel('common.cancel', '取消', 'Cancel', 'キャンセル'),
+          })
+        : false;
+      if (!ok) return;
+      const values = tags.filter((_, i) => i !== idx);
+      await _saveAgentTextList(agent, key, values);
+    });
+  });
+}
+
+function _mountAgentListAddButton(section, agent, key, tags, editing) {
+  const title = section?.querySelector('.agents-detail-label, .agents-detail-subtitle');
+  if (!title) return;
+  title.querySelector('[data-agent-list-add]')?.remove();
+  if (!editing || !_canEditAgentDefinition(agent)) return;
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'agents-memory-add';
+  btn.dataset.agentListAdd = key;
+  btn.textContent = _agentLabel('agents.tag_add', '添加', 'Add', '追加');
+  title.appendChild(btn);
+  btn.addEventListener('click', async (e) => {
+    e.preventDefault();
+    const next = await _promptAgentTextListValue(key, '');
+    if (!next) return;
+    await _saveAgentTextList(agent, key, [...tags, next]);
+  });
+}
+
+function _agentInputRefs(agent) {
+  const cleanInputTitle = (value) => normalizeDisplayText(value)
+    .replace(/\s*[（(]\s*(可选|选填|optional)\s*[）)]\s*$/i, '')
+    .replace(/\s*[（(]\s*(必填|required)\s*[）)]\s*$/i, '')
+    .trim();
+  return Array.isArray(agent.inputs)
+    ? agent.inputs.map((input) => ({
+        title: cleanInputTitle(input.label || input.id || ''),
+        description: normalizeDisplayText(input.description || input.type || ''),
+        required: input.required === true,
+      })).filter((input) => input.title)
+    : [];
+}
+
+function _agentInputChipHtml(input) {
+  if (!input || !input.title) return '';
+  const state = input.required
+    ? _agentLabel('agents.input_required', '必填', 'Required', '必須')
+    : _agentLabel('agents.input_optional', '可选', 'Optional', '任意');
+  return `
+    <span class="agents-profile-chip agents-input-chip" title="${escapeHtml(input.description || '')}">
+      <span>${escapeHtml(input.title)}</span>
+      <small>${escapeHtml(state)}</small>
+    </span>
+  `;
+}
+
+function _renderAgentDetailStats(agent, editing = false) {
+  const section = document.getElementById('agents-detail-stats-section');
+  const host = document.getElementById('agents-detail-stats');
+  if (!host) return;
+  const runtime = _agentRuntimeStats(agent);
+  if (runtime.deliveries <= 0) {
+    if (section) section.style.display = 'none';
+    host.innerHTML = '';
+    return;
+  }
+  const stats = _agentDetailStats(agent).slice(0, 4);
+  if (section) section.style.display = stats.length ? '' : 'none';
+  const statsHtml = stats.map((s) => `
+    <div class="agents-detail-stat${s.kind === 'memory' ? ' is-memory' : ''}">
+      <div class="agents-detail-stat-value">${escapeHtml(s.value)}${s.unit ? `<small>${escapeHtml(s.unit)}</small>` : ''}</div>
+      <div class="agents-detail-stat-label">${escapeHtml(s.key)}</div>
+    </div>
+  `).join('');
+  host.innerHTML = statsHtml;
+}
+
+function _renderAgentDetailMemory(agent, editing = false) {
+  const section = document.getElementById('agents-detail-memory-section');
+  const host = document.getElementById('agents-detail-memory');
+  if (!section || !host) return;
+  if (_isExternalCliAgent(agent)) {
+    section.style.display = 'none';
+    host.innerHTML = '';
+    section.querySelector('[data-agent-memory-add]')?.remove();
+    return;
+  }
+  const memoryTags = _agentMemoryEntries(agent)
+    .map((entry) => entry.title || entry.description)
+    .filter(Boolean)
+    .slice(0, 20);
+  const canEditMemory = !!editing && !_isAgentProfileMock(agent)
+    && (agent.source === 'custom' || _isCommanderAgent(agent));
+  section.style.display = (memoryTags.length || canEditMemory) ? '' : 'none';
+  section.querySelector('[data-agent-memory-add]')?.remove();
+  const title = section.querySelector('.agents-detail-label');
+  if (title && canEditMemory) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'agents-memory-add';
+    btn.dataset.agentMemoryAdd = '';
+    btn.textContent = _agentLabel('agents.memory_add', '添加', 'Add', '追加');
+    title.appendChild(btn);
+  }
+  host.innerHTML = memoryTags.map((tag) => _agentMemoryListItemHtml(tag, canEditMemory)).join('');
+  if (canEditMemory) _wireAgentMemoryControls(section, agent);
+}
+
+async function _agentMemoryAdd(agent, text) {
+  if (_isCommanderAgent(agent)) {
+    return window.orkas.invoke('memory.add', { target: 'agent', agentId: _COMMANDER_AGENT_ID, content: text });
+  }
+  return window.orkas.invoke('agents.memory.add', { agent_id: agent.agent_id, content: text });
+}
+
+async function _agentMemoryUpdate(agent, oldText, text) {
+  if (_isCommanderAgent(agent)) {
+    return window.orkas.invoke('memory.replace', { target: 'agent', agentId: _COMMANDER_AGENT_ID, oldText, content: text });
+  }
+  return window.orkas.invoke('agents.memory.update', { agent_id: agent.agent_id, old_text: oldText, content: text });
+}
+
+async function _agentMemoryRemove(agent, text) {
+  if (_isCommanderAgent(agent)) {
+    return window.orkas.invoke('memory.remove', { target: 'agent', agentId: _COMMANDER_AGENT_ID, oldText: text });
+  }
+  return window.orkas.invoke('agents.memory.remove', { agent_id: agent.agent_id, old_text: text });
+}
+
+function _wireAgentMemoryControls(host, agent) {
+  host.querySelectorAll('[data-agent-memory-add]').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const label = _agentLabel('agents.memory_add_prompt', '请输入要添加的记忆', 'Enter memory to add', '追加するメモリを入力');
+      const content = typeof uiPrompt === 'function'
+        ? await uiPrompt(label, '')
+        : window.prompt(label, '');
+      const text = (content || '').trim();
+      if (!text) return;
+      try {
+        const res = await _agentMemoryAdd(agent, text);
+        if (!res || res.ok === false) {
+          uiAlert((res && res.error) || _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました'));
+          return;
+        }
+        await loadAgents(true);
+        await _refreshAgentDetail(agent.agent_id);
+      } catch (err) {
+        uiAlert((err && err.message) || _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました'));
+      }
+    });
+  });
+  host.querySelectorAll('[data-agent-memory-edit]').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const oldText = btn.getAttribute('data-agent-memory-edit') || '';
+      if (!oldText) return;
+      const label = _agentLabel('agents.memory_edit_prompt', '修改记忆', 'Edit memory', 'メモリを編集');
+      const content = typeof uiPrompt === 'function'
+        ? await uiPrompt(label, oldText)
+        : window.prompt(label, oldText);
+      const text = (content || '').trim();
+      if (!text || text === oldText) return;
+      try {
+        const res = await _agentMemoryUpdate(agent, oldText, text);
+        if (!res || res.ok === false) {
+          uiAlert((res && res.error) || _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました'));
+          return;
+        }
+        await loadAgents(true);
+        await _refreshAgentDetail(agent.agent_id);
+      } catch (err) {
+        uiAlert((err && err.message) || _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました'));
+      }
+    });
+  });
+  host.querySelectorAll('[data-agent-memory-remove]').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const text = btn.getAttribute('data-agent-memory-remove') || '';
+      if (!text) return;
+      const confirmText = _agentLabel('agents.memory_remove_confirm', '确认删除这条记忆？', 'Remove this memory?', 'このメモリを削除しますか？');
+      const ok = typeof uiConfirm === 'function'
+        ? await uiConfirm({
+            message: confirmText,
+            okLabel: _agentLabel('agents.memory_remove_ok', '删除', 'Delete', '削除'),
+            cancelLabel: _agentLabel('common.cancel', '取消', 'Cancel', 'キャンセル'),
+          })
+        : false;
+      if (!ok) return;
+      try {
+        const res = await _agentMemoryRemove(agent, text);
+        if (!res || res.ok === false) {
+          uiAlert((res && res.error) || _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました'));
+          return;
+        }
+        await loadAgents(true);
+        await _refreshAgentDetail(agent.agent_id);
+      } catch (err) {
+        uiAlert((err && err.message) || _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました'));
+      }
+    });
+  });
+}
+
+function _renderAgentDetailKnowhow(agent, editing = false) {
+  const section = document.getElementById('agents-detail-knowhow-section');
+  const host = document.getElementById('agents-detail-knowhow');
+  if (!section || !host) return;
+  if (_isExternalCliAgent(agent)) {
+    section.style.display = 'none';
+    host.innerHTML = '';
+    _mountAgentListAddButton(section, agent, 'knowhow', [], false);
+    return;
+  }
+  const tags = _agentTextList(agent, 'knowhow');
+  const canEdit = !!editing && _canEditAgentDefinition(agent);
+  section.style.display = (tags.length || canEdit) ? '' : 'none';
+  _mountAgentListAddButton(section, agent, 'knowhow', tags, editing);
+  _renderEditableTagList(host, agent, 'knowhow', tags, editing);
 }
 
 function _renderAgentDetail(agent, editing) {
   agent = { ...agent, source: _agentSource(agent.source) };
+  const isCommander = _isCommanderAgent(agent);
   document.getElementById('agents-detail-content').style.display = '';
 
   const nameEl = document.getElementById('agents-detail-name');
@@ -721,37 +1575,48 @@ function _renderAgentDetail(agent, editing) {
   const workflowEl = document.getElementById('agents-detail-workflow');
   const editBtn = document.getElementById('agent-edit-btn');
 
+  const lang = getLang();
   nameEl.textContent = agent.name || '';
   if (nameInput) nameInput.value = agent.name || '';
-  // Header chips: custom = single "自定义" tag; marketplace-installed items show version + category.
+  // Header chips: custom items mount an editable category dropdown;
+  // marketplace-installed items show version + category as static chips.
   sourceEl.className = 'agents-detail-source-row';
   sourceEl.innerHTML = _renderSourceMetaHtml(agent);
+  _renderAgentHeaderCategory(agent);
   // Runtime slot lives at the top of the body now (not the header):
   // an always-editable dropdown so the user can flip Orkas ↔ local CLI
   // without entering edit mode. The header chip was removed because
   // it duplicated information the dropdown already exposes.
   _renderAgentDetailRuntime(agent);
   _renderAgentDetailProjectDir(agent);
-  const localizedDesc = pickDesc(agent, getLang()).trim();
+  const localizedDesc = _agentSummary(agent, lang);
   descEl.textContent = localizedDesc;
+  descEl.classList.toggle('is-empty', !localizedDesc);
 
   _renderAgentDetailAvatar(agent);
-  _renderAgentDetailCategory(agent);
+  _renderAgentDetailStats(agent, editing);
+  _renderAgentDetailMemory(agent, editing);
+  _renderAgentDetailKnowhow(agent, editing);
 
   // CLI-backed agents have no authored workflow / skill_list — the
   // external CLI brings its own behavior. Hide the entire workflow
   // section so the detail page doesn't show an empty editor block.
   const workflowSection = document.querySelector('.agents-detail-section-workflow');
   const isCliRuntime = !!(agent.runtime && agent.runtime.kind === 'cli');
-  if (workflowSection) workflowSection.style.display = isCliRuntime ? 'none' : '';
+  const structuredWorkflow = _agentWorkflowSteps(agent);
+  const hasWorkflowToShow = structuredWorkflow.length || !!String(agent.workflow || '').trim();
+  if (workflowSection) workflowSection.style.display = (isCliRuntime && !hasWorkflowToShow) ? 'none' : '';
 
   const unsetHtml = `<span class="agents-detail-placeholder">${escapeHtml(t('agents.placeholder_unset'))}</span>`;
   // Workflow renders markdown in readonly mode; raw text in edit mode so user
   // can edit source directly.
-  if (editing) {
+  if (editing && !isCommander) {
     workflowEl.textContent = agent.workflow || '';
   } else {
-    workflowEl.innerHTML = agent.workflow ? renderMarkdownFull(agent.workflow) : unsetHtml;
+    const workflowMarkdown = structuredWorkflow.length
+      ? _agentWorkflowMarkdown(structuredWorkflow)
+      : String(agent.workflow || '').trim();
+    workflowEl.innerHTML = workflowMarkdown ? renderMarkdownFull(workflowMarkdown) : unsetHtml;
   }
   if (!editing && !localizedDesc) descEl.innerHTML = unsetHtml;
 
@@ -763,60 +1628,50 @@ function _renderAgentDetail(agent, editing) {
   const enableBtn = document.getElementById('agent-enabled-btn');
   const uploadBtn = document.getElementById('agent-upload-marketplace-btn');
   const delBtn = document.getElementById('agent-delete-btn');
-  const isCustom = agent.source === 'custom';
-  const canEdit = isCustom ;
+  const isMock = _isAgentProfileMock(agent);
+  const isCustom = agent.source === 'custom' && !isMock;
+  const canEdit = isCommander || (!isMock && (isCustom || (_isAgentPlatformSource(agent.source) && false)));
   if (useBtn) {
     useBtn.style.display = editing ? 'none' : '';
-    useBtn.disabled = agent.enabled === false;
-    useBtn.setAttribute('aria-disabled', agent.enabled === false ? 'true' : 'false');
+    useBtn.disabled = isMock || agent.enabled === false;
+    useBtn.setAttribute('aria-disabled', (isMock || agent.enabled === false) ? 'true' : 'false');
   }
-  if (enableBtn) enableBtn.style.display = editing ? 'none' : '';
+  if (enableBtn && isCommander) {
+    enableBtn.style.display = 'none';
+    enableBtn.disabled = true;
+  } else if (enableBtn && isMock) {
+    enableBtn.style.display = editing ? 'none' : '';
+    enableBtn.disabled = true;
+    enableBtn.textContent = t('component.disable');
+  } else if (enableBtn) {
+    enableBtn.style.display = editing ? 'none' : '';
+    enableBtn.disabled = false;
+  }
   // Upload button visibility: gated by marketplace_dev.js's presence (the open-source build lacks it).
-  if (uploadBtn) uploadBtn.style.display = (typeof openMarketplaceUpload === 'function' && !editing) ? '' : 'none';
-  if (delBtn) delBtn.style.display = (canEdit && !editing) ? '' : 'none';
+  if (uploadBtn) {
+    uploadBtn.style.display = isCommander
+      ? 'none'
+      : (isMock ? (editing ? 'none' : '') : ((typeof openMarketplaceUpload === 'function' && !editing) ? '' : 'none'));
+    uploadBtn.disabled = isCommander || isMock;
+  }
+  if (delBtn) {
+    delBtn.style.display = (!isCommander && (canEdit || isMock) && !editing) ? '' : 'none';
+    delBtn.disabled = isCommander || isMock;
+  }
   if (editBtn) {
-    editBtn.style.display = canEdit ? '' : 'none';
+    editBtn.style.display = (canEdit || isMock) ? '' : 'none';
+    editBtn.disabled = isMock && !isCommander;
     // Tag the "Edit" label on marketplace agents (dev-only entry); "Done" stays
     // bare because the user is already in edit mode and the marker would be
     // redundant noise.
-    const editSuffix = '';
+    const editSuffix = (!editing && _isAgentPlatformSource(agent.source) && false) ? t('common.dev_suffix') : '';
     editBtn.textContent = editing ? t('agents.edit_btn_done') : (t('agents.edit_btn_edit') + editSuffix);
   }
-  _renderAgentEnabledButton({ id: agent.agent_id, enabled: agent.enabled !== false });
+  if (!isMock && !isCommander) _renderAgentEnabledButton({ id: agent.agent_id, enabled: agent.enabled !== false });
 
-  _renderAgentOutputFormatSection(agent);
+  _renderAgentOutputFormatSection(agent, editing);
 
-  _toggleAgentFieldEditable(editing);
-}
-
-function _renderAgentDetailCategory(agent) {
-  const section = document.getElementById('agents-detail-category-section');
-  const slot = document.getElementById('agents-detail-category');
-  if (!section || !slot) return;
-  const isCustom = agent && agent.source === 'custom';
-  section.style.display = isCustom ? '' : 'none';
-  if (!isCustom) { slot.innerHTML = ''; return; }
-  const agentId = agent.agent_id;
-  _mountDetailCategorySelect(slot, {
-    value: agent.category || 'general',
-    onChange: async (category) => {
-      try {
-        const res = await window.orkas.invoke('agents.update', {
-          agent_id: agentId,
-          updates: { category: category || 'general' },
-        });
-        if (!res || res.ok === false || !res.agent) {
-          uiAlert((res && res.error) || t('agents.update_failed'));
-          return;
-        }
-        _agentsCache = null;
-        await loadAgents(true);
-        if (_selectedAgent?.id === agentId) _renderAgentDetail(res.agent, _agentEditing);
-      } catch (err) {
-        uiAlert((err && err.message) || t('agents.update_failed'));
-      }
-    },
-  }).catch((err) => _agentsLog.warn('render category select failed', err));
+  _toggleAgentFieldEditable(editing && !isCommander);
 }
 
 /** Render the output-format preference dropdown (auto / text /
@@ -828,15 +1683,46 @@ function _renderAgentDetailCategory(agent) {
  *  Legacy on-disk values map for display: `'markdown_only'` → `'text'`,
  *  `'allow_artifacts'` → `'artifact'`; `'auto'` / missing → `'auto'`
  *  (the default). */
-function _renderAgentOutputFormatSection(agent) {
-  const section = document.getElementById('agents-detail-output-format-section');
+function _renderAgentOutputFormatSection(agent, editing = false) {
+  const section = document.getElementById('agents-detail-input-output-section');
   const slot = document.getElementById('agents-detail-output-format');
+  const standardsSection = document.getElementById('agents-detail-output-standards-section');
+  const standardsHost = document.getElementById('agents-detail-output-standards');
+  const formatSection = document.getElementById('agents-detail-output-format-control');
+  const inputRow = document.getElementById('agents-detail-inputs-row');
+  const inputHost = document.getElementById('agents-detail-inputs');
   if (!section || !slot) return;
-  if (agent.runtime?.kind === 'cli') { section.style.display = 'none'; return; }
-  section.style.display = '';
+  const isCommander = _isCommanderAgent(agent);
+  const isExternalCli = _isExternalCliAgent(agent);
+  const standardTags = (isExternalCli) ? [] : _agentTextList(agent, 'standards');
+  const isMock = _isAgentProfileMock(agent);
+  const canShowFormatControl = !isExternalCli && !isCommander;
+  const canEditStandards = !isExternalCli && !isCommander && !!editing && _canEditAgentDefinition(agent);
+  const inputRefs = (isExternalCli || isCommander) ? [] : _agentInputRefs(agent);
 
-  const canEdit = agent.source === 'custom'
-    ;
+  if (standardsSection && standardsHost) {
+    standardsSection.style.display = (standardTags.length || canEditStandards) ? '' : 'none';
+    _mountAgentListAddButton(standardsSection, agent, 'standards', standardTags, editing);
+    _renderEditableTagList(standardsHost, agent, 'standards', standardTags, editing);
+  }
+  if (inputRow && inputHost) {
+    inputRow.style.display = inputRefs.length ? '' : 'none';
+    inputHost.innerHTML = inputRefs.map(_agentInputChipHtml).join('');
+  }
+  if (formatSection) formatSection.style.display = canShowFormatControl ? '' : 'none';
+  if (!inputRefs.length && !canShowFormatControl) {
+    section.style.display = 'none';
+    slot.innerHTML = '';
+    return;
+  }
+  section.style.display = '';
+  if (!canShowFormatControl) {
+    slot.innerHTML = '';
+    return;
+  }
+
+  const canEdit = !isMock && agent.source === 'custom'
+    || (_isAgentPlatformSource(agent.source) && typeof isDevMode === 'function' && false);
 
   slot.innerHTML = '';
   const mount = document.createElement('div');
@@ -1030,7 +1916,7 @@ async function _renderAgentDetailProjectDir(agent) {
   slot.dataset.agentId = agent.agent_id;
 
   const canEdit = agent.source === 'custom'
-    ;
+    || (_isAgentPlatformSource(agent.source) && typeof isDevMode === 'function' && false);
 
   const renderInfo = (info) => {
     if (_selectedAgent?.id !== agent.agent_id || slot.dataset.agentId !== agent.agent_id) return;
@@ -1119,39 +2005,62 @@ async function _renderAgentDetailProjectDir(agent) {
 function _renderAgentDetailAvatar(agent) {
   const slot = document.getElementById('agents-detail-avatar');
   if (!slot) return;
-  const isCustom = agent.source === 'custom';
-  slot.innerHTML = renderAvatarHtml(agent.icon, agent.color, {
+  const isCommander = _isCommanderAgent(agent);
+  const isCustom = agent.source === 'custom' && !_isAgentProfileMock(agent);
+  const clickable = isCustom || isCommander;
+  const avatarHtml = renderAvatarHtml(agent.icon, agent.color, {
     size: 32,
     seed: agent.agent_id,
-    clickable: isCustom,
+    clickable,
     extraClass: 'agents-detail-avatar',
   });
-  if (!isCustom) return;
+  slot.innerHTML = clickable
+    ? `<span class="agents-detail-avatar-edit-wrap">${avatarHtml}<span class="agents-detail-avatar-edit-badge" aria-hidden="true">${_agentUiIconHtml('edit-pencil', 'agents-detail-avatar-edit-icon')}</span></span>`
+    : avatarHtml;
+  if (!clickable) return;
   const trigger = slot.querySelector('.avatar-circle');
   if (!trigger) return;
   trigger.title = t('avatar.change');
   trigger.addEventListener('click', (e) => {
     e.stopPropagation();
     if (isAvatarPickerOpenFor(trigger)) { closeAvatarPicker(); return; }
-    const cur = { icon: agent.icon, color: agent.color };
-    openAvatarPicker(trigger, cur, {}, async (next) => {
+    const commanderIcon = (typeof COMMANDER_DEFAULT !== 'undefined' && COMMANDER_DEFAULT?.icon) || 'crown';
+    const cur = isCommander
+      ? { icon: commanderIcon, color: agent.color }
+      : { icon: agent.icon, color: agent.color };
+    const pickerOpts = isCommander
+      ? { allowCommanderCombo: true, hideIcons: true, colorLabelKey: 'avatar.background_label' }
+      : {};
+    openAvatarPicker(trigger, cur, pickerOpts, async (next) => {
       // Optimistic in-place update — keeps the trigger element (and its
       // click handler) intact so the picker stays interactive.
-      agent.icon = next.icon;
+      const nextIcon = isCommander ? commanderIcon : next.icon;
+      agent.icon = nextIcon;
       agent.color = next.color;
-      applyAvatarToElement(trigger, next.icon, next.color, agent.agent_id);
+      applyAvatarToElement(trigger, nextIcon, next.color, agent.agent_id);
       try {
-        const res = await window.orkas.invoke('agents.update', {
-          agent_id: agent.agent_id,
-          updates: { icon: next.icon, color: next.color },
-        });
-        if (res?.ok && res.agent) {
-          const cached = _agentsCache?.find((a) => a.agent_id === agent.agent_id);
-          if (cached) { cached.icon = next.icon; cached.color = next.color; }
-          if (_agentsCache) renderAgentsGrid(_agentsCache);
+        if (isCommander) {
+          const res = await window.orkas.invoke('prefs.setCommanderAvatar', { icon: nextIcon, color: next.color });
+          if (res?.ok && res.avatar) {
+            _commanderAgentAvatar = { icon: nextIcon, color: res.avatar.color };
+            if (typeof setCommanderAvatarCache === 'function') setCommanderAvatarCache({ icon: nextIcon, color: res.avatar.color });
+            if (_agentsCache) renderAgentsList(_agentsCache);
+            if (typeof renderConversationList === 'function') renderConversationList();
+            if (typeof renderProjectsSection === 'function') renderProjectsSection();
+          }
+        } else {
+          const res = await window.orkas.invoke('agents.update', {
+            agent_id: agent.agent_id,
+            updates: { icon: next.icon, color: next.color },
+          });
+          if (res?.ok && res.agent) {
+            const cached = _agentsCache?.find((a) => a.agent_id === agent.agent_id);
+            if (cached) { cached.icon = next.icon; cached.color = next.color; }
+            if (_agentsCache) renderAgentsList(_agentsCache);
+          }
         }
       } catch (err) {
-        _agentsLog.warn('agents.update avatar failed', err);
+        _agentsLog.warn(isCommander ? 'prefs.setCommanderAvatar failed' : 'agents.update avatar failed', err);
       }
     });
   });
@@ -1167,6 +2076,7 @@ function _renderAgentEnabledButton(agent) {
   const enabled = agent.enabled !== false;
   const btn = oldBtn.cloneNode(true);
   oldBtn.parentNode.replaceChild(btn, oldBtn);
+  btn.disabled = false;
   btn.textContent = enabled ? t('component.disable') : t('component.enable');
   btn.title = enabled ? t('component.toggle_disable_hint') : t('component.toggle_enable_hint');
   btn.addEventListener('click', async () => {
@@ -1202,8 +2112,9 @@ function _toggleAgentFieldEditable(on) {
 
 async function toggleAgentEditMode() {
   if (!_selectedAgent) return;
+  if (_isAgentProfileMock(_selectedAgent.id)) return;
   // Marketplace editing is dev-only; lift the source guard accordingly.
-  if (_isAgentPlatformSource(_selectedAgent.source)) return;
+  if (!_isCommanderAgent(_selectedAgent.id) && _isAgentPlatformSource(_selectedAgent.source) && !false) return;
   if (_agentEditing) {
     await _exitAgentEditMode();
   } else {
@@ -1213,6 +2124,12 @@ async function toggleAgentEditMode() {
 
 async function _enterAgentEditMode() {
   _agentEditing = true;
+  if (_isCommanderAgent(_selectedAgent?.id)) {
+    await _renderCommanderAgentDetail(true);
+    const chatCol = document.getElementById('agents-chat-col');
+    if (chatCol) chatCol.style.display = 'none';
+    return;
+  }
   // Re-fetch to show raw workflow (not rendered markdown) for editing.
   const res = await apiFetch(`/api/agents/${encodeURIComponent(_selectedAgent.id)}`);
   const data = await res.json();
@@ -1240,6 +2157,15 @@ async function _exitAgentEditMode() {
   // agent chat controller is a singleton; leaving it pending also leaks the
   // streaming-button state into the next agent's edit panel.
   try { _agentChatCtrl?.abort(); } catch (_) { /* ignore */ }
+  if (_isCommanderAgent(_selectedAgent?.id)) {
+    clearTimeout(_agentFieldSaveTimer);
+    _agentFieldSaveTimer = null;
+    _pendingAgentField = null;
+    document.getElementById('agents-chat-col').style.display = 'none';
+    await _renderCommanderAgentDetail(false);
+    await loadAgents(true);
+    return;
+  }
   // Flush any pending save and then re-render in readonly mode.
   // The Done button is the explicit commit point — validate name here so
   // a bad value alerts + reverts rather than silently lingering.
@@ -1281,7 +2207,7 @@ function _restoreAgentNameField() {
 
 function _scheduleAgentFieldSave(field, value) {
   if (!_selectedAgent) return;
-  if (_isAgentPlatformSource(_selectedAgent.source)) return;
+  if (_isAgentPlatformSource(_selectedAgent.source) && !false) return;
   _pendingAgentField = { field, value };
   clearTimeout(_agentFieldSaveTimer);
   _agentFieldSaveTimer = setTimeout(_flushAgentFieldSave, 800);
@@ -1444,7 +2370,9 @@ function _applyExternalCliDefaults(cliType, { force = false } = {}) {
   _extActiveCli = cliType;
 }
 
-function openAgentModal() {
+function openAgentModal(options = {}) {
+  const requestedTab = typeof options === 'string' ? options : options?.initialTab;
+  const initialTab = requestedTab === 'external' ? 'external' : 'create';
   const modal = document.getElementById('agent-modal');
   const msgEl = document.getElementById('agent-form-msg');
   msgEl.textContent = '';
@@ -1474,7 +2402,7 @@ function openAgentModal() {
     });
     tabBar.dataset.wired = '1';
   }
-  _switchAgentTab('create');
+  _switchAgentTab(initialTab);
 
   // Refresh the External-tab CLI selector. Re-mount each open so newly-
   // installed CLIs surface without an app restart.
@@ -1482,29 +2410,9 @@ function openAgentModal() {
     mountExternalCliSelect((cli) => _applyExternalCliDefaults(cli)).catch(() => {});
   }
 
-  // Output-format dropdown (Create tab only — External/CLI agents don't read
-  // the worker prompt hint). Default `auto` lets the model choose the lightest
-  // useful presentation while detail-page dropdown maps legacy values.
-  _mountAgentOutputFormatCreateSelect();
-
   modal.classList.add('open');
-  setTimeout(() => document.getElementById('agent-name-input')?.focus(), 50);
-}
-
-function _mountAgentOutputFormatCreateSelect() {
-  const slot = document.getElementById('agent-output-format-select');
-  if (!slot) return;
-  // Mount directly on the slot — _aiSelectMount stamps `dataset.value` on the
-  // element it's given, and _saveCreateAgent reads `slot.dataset.value`. An
-  // intermediate wrapper div would put the dataset out of reach of the save.
-  slot.innerHTML = '';
-  const options = [
-    { value: 'auto',          label: t('agents.output_format_auto'),          hint: t('agents.output_format_auto_hint') },
-    { value: 'text',          label: t('agents.output_format_text'),          hint: t('agents.output_format_text_hint') },
-    { value: 'dashboard',     label: t('agents.output_format_dashboard'),     hint: t('agents.output_format_dashboard_hint') },
-    { value: 'artifact',      label: t('agents.output_format_artifact'),      hint: t('agents.output_format_artifact_hint') },
-  ];
-  _aiSelectMount(slot, { options, value: 'auto' });
+  const focusId = initialTab === 'external' ? 'agent-ext-name-input' : 'agent-name-input';
+  setTimeout(() => document.getElementById(focusId)?.focus(), 50);
 }
 window.openAgentModal = openAgentModal;
 
@@ -1553,14 +2461,13 @@ async function _saveCreateAgent({ msgEl }) {
     return;
   }
 
-  // Output-format pick from the modal's dropdown. Default `auto` if for some reason the
-  // dataset wasn't stamped (defensive — _mountAgentOutputFormatCreateSelect always sets it).
-  const outputFormat = document.getElementById('agent-output-format-select')?.dataset.value || 'auto';
+  const outputFormat = 'auto';
 
   const startedAt = performance.now();
+  if (window.Monitor) (() => {})('agent_create_submit', { agent_type: 'default', output_format: outputFormat });
   try {
     const avatar = randomAgentAvatar();
-    const body = { name, description, icon: avatar.icon, color: avatar.color, category: 'general', output_format: outputFormat };
+    const body = { name, description, icon: avatar.icon, color: avatar.color, category: 'general' };
     const res = await apiFetch('/api/agents/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1570,18 +2477,55 @@ async function _saveCreateAgent({ msgEl }) {
     if (!data.ok || !data.agent) {
       msgEl.textContent = _agentCreateErrorMessage(data) || t('agents.create_failed');
       msgEl.className = 'form-msg err';
+      if (window.Monitor) {
+        (() => {})('agent_create_result', {
+          result: 'failure',
+          agent_type: 'default',
+          output_format: outputFormat,
+          duration_ms: Math.round(performance.now() - startedAt),
+          error_code: data.code || '',
+        });
+        (() => {})('agent_create', {
+          agent_type: 'default',
+          output_format: outputFormat,
+          error_type: 'api',
+          error_code: data.code || '',
+          error_message: data.error || 'unknown',
+        });
+      }
       return;
     }
+    if (window.Monitor) (() => {})('agent_create_result', {
+      result: 'success',
+      agent_id: data.agent.agent_id,
+      agent_type: 'default',
+      output_format: outputFormat,
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
     closeAgentModal();
     setView('agents');
     await loadAgents(true);
     await _showAgentsDetailView(data.agent.agent_id);
     await _enterAgentEditMode();
-    const seed = t('agents.seed_workflow_model', { name, description, output_format: outputFormat });
+    const seed = t('agents.seed_workflow_model', { name, description });
     await _autoSendAgentChat(t('agents.seed_workflow'), { model_text: seed });
   } catch (e) {
     msgEl.textContent = t('agents.network_error', { reason: e.message || e });
     msgEl.className = 'form-msg err';
+    if (window.Monitor) {
+      (() => {})('agent_create_result', {
+        result: 'failure',
+        agent_type: 'default',
+        output_format: outputFormat,
+        duration_ms: Math.round(performance.now() - startedAt),
+      });
+      (() => {})('agent_create', {
+        agent_type: 'default',
+        output_format: outputFormat,
+        error_type: 'network',
+        error_message: e.message || String(e),
+      });
+    }
   }
 }
 
@@ -1624,6 +2568,7 @@ async function _saveExternalAgent({ msgEl }) {
   }
 
   const startedAt = performance.now();
+  if (window.Monitor) (() => {})('agent_create_submit', { agent_type: 'cli', cli });
   try {
     const avatar = randomAgentAvatar();
     const body = {
@@ -1642,8 +2587,31 @@ async function _saveExternalAgent({ msgEl }) {
     if (!data.ok || !data.agent) {
       msgEl.textContent = _agentCreateErrorMessage(data) || t('agents.create_failed');
       msgEl.className = 'form-msg err';
+      if (window.Monitor) {
+        (() => {})('agent_create_result', {
+          result: 'failure',
+          agent_type: 'cli',
+          cli,
+          duration_ms: Math.round(performance.now() - startedAt),
+          error_code: data.code || '',
+        });
+        (() => {})('agent_create', {
+          agent_type: 'cli',
+          cli,
+          error_type: 'api',
+          error_code: data.code || '',
+          error_message: data.error || 'unknown',
+        });
+      }
       return;
     }
+    if (window.Monitor) (() => {})('agent_create_result', {
+      result: 'success',
+      agent_id: data.agent.agent_id,
+      agent_type: 'cli',
+      cli,
+      duration_ms: Math.round(performance.now() - startedAt),
+    });
     closeAgentModal();
     setView('agents');
     await loadAgents(true);
@@ -1654,6 +2622,20 @@ async function _saveExternalAgent({ msgEl }) {
   } catch (e) {
     msgEl.textContent = t('agents.network_error', { reason: e.message || e });
     msgEl.className = 'form-msg err';
+    if (window.Monitor) {
+      (() => {})('agent_create_result', {
+        result: 'failure',
+        agent_type: 'cli',
+        cli,
+        duration_ms: Math.round(performance.now() - startedAt),
+      });
+      (() => {})('agent_create', {
+        agent_type: 'cli',
+        cli,
+        error_type: 'network',
+        error_message: e.message || String(e),
+      });
+    }
   }
 }
 
@@ -1684,10 +2666,13 @@ async function _autoSendAgentChat(content, extraBody) {
 
 async function deleteSelectedAgent() {
   if (!_selectedAgent) return;
+  if (_isCommanderAgent(_selectedAgent.id)) return;
+  if (_isAgentProfileMock(_selectedAgent.id)) return;
   const isMarketplace = _isAgentPlatformSource(_selectedAgent.source);
-  if (isMarketplace) return;
+  if (isMarketplace && !false) return;
   const agentId = _selectedAgent.id;
   if (!(await uiConfirm(t('agents.delete_confirm', { name: _selectedAgent.name || agentId })))) return;
+  if (window.Monitor) (() => {})('agent_delete', { agent_id: agentId });
   try {
     const data = isMarketplace
       ? await window.orkas.invoke('agents.builtin.delete', { agent_id: agentId })
@@ -1850,63 +2835,45 @@ async function clearAgentChat() {
   await _agentChatCtrl.clear();
 }
 
-// ─── "Use" flow: new normal conversation seeded with "run <name>" ───
+// ─── "Use" flow: preselect in the Commander composer ───
 
 /**
- * Run an agent: creates a fresh normal conversation, navigates to it,
- * then auto-sends a short user-visible message ("run <name>"). The
- * model sees the same visible text and recognises it as a run-agent
- * directive per chat_commander.md rule 0 (instruction following) — no
- * hidden backend injection.
- *
- * `seedText` is the user-visible content. Defaults to "run <name>".
+ * Select an agent in the Commander tab and wait for the user's next message.
  */
-async function useAgent(agentId, seedText) {
+async function useAgent(agentId) {
+  if (_isAgentProfileMock(agentId)) return;
+  if (_isCommanderAgent(agentId)) {
+    _agentsLog.info('use commander');
+    _agentsTrackClick('agent_use', { agent_id: _COMMANDER_AGENT_ID });
+    setView('new-chat');
+    if (typeof setChatRecipient === 'function') setChatRecipient('new-chat', { kind: 'commander' });
+    if (typeof setChatUseSelection === 'function') setChatUseSelection('new-chat', null, { focus: false });
+    setTimeout(() => {
+      document.getElementById('new-chat-input')?.focus();
+    }, 50);
+    return;
+  }
   if (_agentsCache?.some((a) => a.agent_id === agentId && a.enabled === false)) return;
-  if (!ensureModelConfigured()) return;
   try {
-    // Look up the agent so we can title the conv + derive default seed text.
     const aRes = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}`);
     const aData = await aRes.json();
     if (!aData.ok || !aData.agent) throw new Error(aData.error || t('agents.agent_not_found'));
     const agent = aData.agent;
     if (agent.enabled === false) return;
 
-    _agentsLog.info('use agent', { agent_id: agentId, has_seed: !!(seedText && seedText.trim()) });
+    _agentsLog.info('use agent', { agent_id: agentId });
     _agentsTrackClick('agent_use', { agent_id: agentId });
 
-    const visible = (seedText || '').trim() || t('agents.run_prefix', { name: agent.name || agent.agent_id });
-
-    // Don't pass a custom title — let backend `groupChat.send` auto-title
-    // from the first user message, same rule as every other conv-creation
-    // entry point (new-chat panel, commander @-mention). Optimistic title
-    // is the run-prefix message itself so the sidebar entry shows the
-    // user's intent ("run <name>") instead of bare agent name; this
-    // matches what backend `autoTitle` will persist on the same `visible`.
-    const res = await apiFetch('/api/conversations/create', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    });
-    const data = await res.json();
-    if (!data.ok) throw new Error(data.error || t('agents.create_conv_failed'));
-    const conv = data.conversation;
-    conv.title = _autoTitle(visible);
-    // Same fix as the new-chat path in conversation.js: backend's create
-    // response carries `created_at`/`updated_at` but NOT the derived
-    // `last_active_at`, so `timeBucket` would default this brand-new row to
-    // the 'older' bucket and the user thinks it disappeared.
-    conv.last_active_at = new Date().toISOString();
-    conversations.unshift(conv);
-    renderConversationList();
-    setView('conversation', conv.conversation_id, { skipLoad: true });
-    setChatRecipient('conversation', {
+    setView('new-chat');
+    setChatRecipient('new-chat', {
       kind: 'agent',
       id: agentId,
       name: agent.name || agent.agent_id,
     });
-    // Fire the send after the view switch has the chat DOM ready.
-    setTimeout(() => sendInCurrentConversation(visible), 50);
+    if (typeof setChatUseSelection === 'function') setChatUseSelection('new-chat', null, { focus: false });
+    setTimeout(() => {
+      document.getElementById('new-chat-input')?.focus();
+    }, 50);
   } catch (e) {
     await uiAlert(t('agents.launch_failed', { reason: e.message || e }));
   }
@@ -1926,7 +2893,7 @@ async function useSkill(skillId, skillName) {
   if (typeof setChatRecipient === 'function') {
     setChatRecipient('new-chat', { kind: 'commander' });
   }
-  setChatSkill('new-chat', skillName || skillId);
+  setChatUseSelection('new-chat', { kind: 'skill', id: skillId, name: skillName || skillId });
   setTimeout(() => document.getElementById('new-chat-input')?.focus(), 50);
 }
 
@@ -2008,60 +2975,34 @@ if (typeof window !== 'undefined') {
 // Set on every `_openAgentPicker`; consumed by `_renderAgentPickerList` and
 // the search-input change handler so live filtering stays scoped.
 let _pickerBoundAgentIds = null;
+let _pickerProjectId = '';
+let _pickerLibraryRows = null;
+let _pickerLibraryLoading = null;
+let _pickerLibraryRenderSeq = 0;
 let _agentPickerTab = 'agents';
-const _AGENT_PICKER_TAB_ORDER = ['agents', 'skills', 'connectors'];
+const _AGENT_PICKER_TAB_ORDER = ['agents', 'skills', 'connectors', 'library'];
 const _AGENT_PICKER_TABS = new Set(_AGENT_PICKER_TAB_ORDER);
 
 function _normalizeAgentPickerTab(tab) {
   return _AGENT_PICKER_TABS.has(tab) ? tab : 'agents';
 }
 
-// True when the picker's recipient is the commander (not a specific agent).
-// Connectors and open-tier (external-package / global) skills are
-// commander-only surfaces; trusted skills (custom / marketplace) are offered
-// to agent recipients too — a CLI agent runs them via the orkas bridge's
-// orkas_run_skill.
-function _pickerRecipientIsCommander(anchorId) {
-  const target = _targetFromPickerAnchor(anchorId);
-  if (target === 'auto') {
-    const rec = (typeof window !== 'undefined' && typeof window._autoGetRecipient === 'function')
-      ? window._autoGetRecipient()
-      : { kind: 'commander' };
-    return !rec || rec.kind !== 'agent';
-  }
-  if (typeof getChatRecipient !== 'function') return true;
-  const rec = getChatRecipient(target);
-  return !rec || rec.kind !== 'agent';
-}
-
-// Open-tier (external-package / global) skills are commander-only and must
-// never be handed to an agent recipient — orkas_run_skill would execute them.
-// The picker render already hides them for agents; this backs that at the
-// selection handler. Matches by id (what the picker passes) or display name.
-function _isOpenTierSkillRef(id, name) {
-  if (typeof _openSkillsCache === 'undefined' || !Array.isArray(_openSkillsCache)) return false;
-  return _openSkillsCache.some((s) => s.id === id || s.name === id || (name && s.name === name));
+function _agentPickerAllowsLibrary(anchorId) {
+  return anchorId === 'chat-recipient-chip'
+    || anchorId === 'new-chat-recipient-chip'
+    || anchorId === 'project-chat-recipient-chip';
 }
 
 function _agentPickerVisibleTabs(anchorId) {
-  const isCommander = _pickerRecipientIsCommander(anchorId);
-  // Auto-task form keeps skill + connector commander-only: its chip slots are
-  // managed separately (auto.js `recipientAllowsUse`) and don't dispatch to an
-  // agent the way the chat composer does.
-  if (_targetFromPickerAnchor(anchorId) === 'auto') {
-    return isCommander ? _AGENT_PICKER_TAB_ORDER : ['agents'];
-  }
-  // Chat composer: agents + skills are always available — an agent recipient
-  // runs a trusted skill itself (via the orkas bridge). Connectors stay
-  // commander-only.
-  const tabs = ['agents', 'skills'];
-  if (isCommander) tabs.push('connectors');
-  return tabs;
+  // Skills and connectors use the same visible picker surface for commander
+  // and agent recipients; runtime capability gates live in the main process.
+  return _AGENT_PICKER_TAB_ORDER.filter((tab) => tab !== 'library' || _agentPickerAllowsLibrary(anchorId));
 }
 
 function _agentPickerSearchPlaceholder() {
   if (_agentPickerTab === 'skills') return t('agent_picker.search_skills_placeholder');
   if (_agentPickerTab === 'connectors') return t('agent_picker.search_connectors_placeholder');
+  if (_agentPickerTab === 'library') return t('agent_picker.search_library_placeholder');
   return t('agent_picker.search_placeholder');
 }
 
@@ -2077,6 +3018,8 @@ function _updateAgentPickerChrome() {
     btn.classList.toggle('active', active);
     btn.setAttribute('aria-selected', active ? 'true' : 'false');
   });
+  const tabsEl = picker.querySelector('.skill-picker-tabs');
+  if (tabsEl) tabsEl.style.gridTemplateColumns = `repeat(${Math.max(1, visibleTabs.size)}, minmax(0, 1fr))`;
   const search = document.getElementById('agent-picker-search');
   if (search) search.placeholder = _agentPickerSearchPlaceholder();
 }
@@ -2152,6 +3095,10 @@ async function _openAgentPicker(anchorBtn) {
   // project the active conv belongs to. Skills and connectors stay global.
   _pickerBoundAgentIds = null;
   const pid = _resolveActiveProjectId(anchorBtn.id);
+  _pickerProjectId = pid || '';
+  _pickerLibraryRows = null;
+  _pickerLibraryLoading = null;
+  _pickerLibraryRenderSeq += 1;
   if (pid) {
     try {
       const res = await window.orkas.invoke('projects.bindings.list', { projectId: pid });
@@ -2191,6 +3138,10 @@ function _renderAgentPickerList(filterText) {
   }
   if (_agentPickerTab === 'connectors') {
     _renderConnectorPickerList(listEl, filterText, anchorId);
+    return;
+  }
+  if (_agentPickerTab === 'library') {
+    _renderLibraryPickerList(listEl, filterText, anchorId);
     return;
   }
   // Disabled agents are filtered out — picker is a "what can I dispatch right
@@ -2299,15 +3250,11 @@ function _renderSkillPickerList(listEl, filterText, anchorId) {
     : list;
 
   const trusted = applyFilter((_skillsCache || []).filter((s) => s.enabled !== false), trustedDesc);
-  // Open-tier skills (external packages + global folders) stay commander-only
-  // (CLAUDE.md: open-tier never enters an agent's skill_list / listSkillSpecs).
-  // The skills tab now also shows for agent recipients, so suppress open-tier
-  // there and list only trusted skills (custom / marketplace) — the same set
-  // the orkas bridge can run for the agent. Selecting one prepends a "use"
-  // hint; the commander system prompt already enumerates open-tier skills.
-  const allowOpenTier = _pickerRecipientIsCommander(anchorId);
-  const openRows = (allowOpenTier && typeof _openSkillsCache !== 'undefined' && Array.isArray(_openSkillsCache))
-    ? applyFilter(_openSkillsCache.filter((s) => s.enabled !== false), openDesc)
+  // Global open-tier skills share the same picker surface as trusted skills.
+  // External package internals stay package-scoped in user UI; the agent layer
+  // can still see package-provided SKILL.md files when composing a task.
+  const openRows = (typeof _openSkillsCache !== 'undefined' && Array.isArray(_openSkillsCache))
+    ? applyFilter(_openSkillsCache.filter((s) => s.source === 'global' && s.enabled !== false), openDesc)
     : [];
 
   if (!trusted.length && !openRows.length) {
@@ -2320,7 +3267,6 @@ function _renderSkillPickerList(listEl, filterText, anchorId) {
     const source = (typeof normalizeCatalogSource === 'function') ? normalizeCatalogSource(s.source) : s.source;
     (groups[source] || groups.custom).push(s);
   }
-  const externalRows = openRows.filter((s) => s.source === 'external');
   const globalRows = openRows.filter((s) => s.source === 'global');
 
   const groupHtml = (label, list, descOf) => {
@@ -2338,7 +3284,6 @@ function _renderSkillPickerList(listEl, filterText, anchorId) {
   };
   listEl.innerHTML = groupHtml(t('skills.source_custom'), groups.custom, trustedDesc)
     + groupHtml(t('skills.source_marketplace'), groups.marketplace, trustedDesc)
-    + groupHtml(t('skills.external_group'), externalRows, openDesc)
     + groupHtml(t('skills.global_group'), globalRows, openDesc);
   _bindAgentPickerListItems(listEl, anchorId);
 }
@@ -2371,11 +3316,160 @@ function _renderConnectorPickerList(listEl, filterText, anchorId) {
   _bindAgentPickerListItems(listEl, anchorId);
 }
 
+function _agentPickerBasename(rel) {
+  const s = String(rel || '');
+  const i = s.lastIndexOf('/');
+  return i >= 0 ? s.slice(i + 1) : s;
+}
+
+function _agentPickerFormatMtime(mtime) {
+  const n = Number(mtime);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  const ms = n > 100000000000 ? n : n * 1000;
+  try {
+    const locale = (typeof getLocaleMeta === 'function' && typeof getLang === 'function')
+      ? getLocaleMeta(getLang()).intlLocale
+      : undefined;
+    return new Intl.DateTimeFormat(locale, {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).format(new Date(ms));
+  } catch (_) {
+    return new Date(ms).toLocaleString();
+  }
+}
+
+function _flattenLibraryPickerTree(nodes, scope, projectId) {
+  const rows = [];
+  const walk = (items) => {
+    for (const node of items || []) {
+      if (!node) continue;
+      if (node.type === 'dir') {
+        walk(node.children || []);
+        continue;
+      }
+      if (node.type !== 'file') continue;
+      const rel = String(node.relPath || node.path || node.name || '');
+      if (!rel) continue;
+      const name = node.name || _agentPickerBasename(rel);
+      rows.push({
+        scope,
+        projectId: projectId || '',
+        rel,
+        name,
+        group: scope === 'project' ? 'project' : 'global',
+        kind: node.kind || '',
+        bytes: Number(node.bytes || 0),
+        mtime: node.mtime,
+      });
+    }
+  };
+  walk(nodes || []);
+  return rows;
+}
+
+async function _loadLibraryPickerRows(projectId) {
+  const projectPromise = projectId
+    ? window.orkas.invoke('projects.files.tree', { projectId }).catch((err) => {
+        _agentsLog.warn('project library picker load failed', err);
+        return null;
+      })
+    : Promise.resolve(null);
+  const globalPromise = apiFetch('/api/contexts/tree')
+    .then((res) => res.json())
+    .catch((err) => {
+      _agentsLog.warn('global library picker load failed', err);
+      return null;
+    });
+  const [projectData, globalData] = await Promise.all([projectPromise, globalPromise]);
+  const rows = [];
+  if (projectId && projectData && projectData.ok !== false) {
+    rows.push(..._flattenLibraryPickerTree(projectData.tree || [], 'project', projectId));
+  }
+  if (globalData && globalData.ok !== false) {
+    rows.push(..._flattenLibraryPickerTree(globalData.tree || [], 'global', ''));
+  }
+  return rows;
+}
+
+function _libraryPickerRowHtml(row) {
+  const rel = row.rel || row.name || '';
+  const label = row.name || _agentPickerBasename(rel);
+  const time = _agentPickerFormatMtime(row.mtime);
+  const desc = rel && rel !== label ? rel : '';
+  const id = `${row.scope}:${row.projectId || ''}:${rel}`;
+  return `
+    <div class="skill-picker-item" data-kind="library" data-id="${escapeHtml(id)}"
+         data-name="${escapeHtml(label)}" data-library-scope="${escapeHtml(row.scope)}"
+         data-library-rel="${escapeHtml(rel)}" data-project-id="${escapeHtml(row.projectId || '')}">
+      <div class="skill-picker-item-meta">
+        <div class="skill-picker-item-name">${escapeHtml(label)}</div>
+        ${time ? `<span class="skill-picker-item-time">${escapeHtml(time)}</span>` : ''}
+      </div>
+      ${desc ? `<div class="skill-picker-item-desc">${escapeHtml(desc)}</div>` : ''}
+    </div>`;
+}
+
+function _renderLibraryPickerList(listEl, filterText, anchorId) {
+  const q = (filterText || '').toLowerCase();
+  const renderSeq = ++_pickerLibraryRenderSeq;
+  if (!_pickerLibraryRows) {
+    listEl.innerHTML = `<div class="skill-picker-empty">${escapeHtml(t('common.loading'))}</div>`;
+    if (!_pickerLibraryLoading) {
+      _pickerLibraryLoading = _loadLibraryPickerRows(_pickerProjectId)
+        .then((rows) => {
+          _pickerLibraryRows = rows || [];
+          _pickerLibraryLoading = null;
+        })
+        .catch((err) => {
+          _agentsLog.warn('library picker load failed', err);
+          _pickerLibraryRows = [];
+          _pickerLibraryLoading = null;
+        });
+    }
+    _pickerLibraryLoading.then(() => {
+      if (renderSeq !== _pickerLibraryRenderSeq) return;
+      const picker = document.getElementById('agent-picker');
+      if (!picker || picker.style.display === 'none' || _agentPickerTab !== 'library') return;
+      const search = document.getElementById('agent-picker-search');
+      _renderLibraryPickerList(listEl, search ? search.value : filterText, anchorId);
+    });
+    return;
+  }
+
+  const allRows = _pickerLibraryRows || [];
+  const filtered = q
+    ? allRows
+        .filter((row) => _matchPickerItem(q, row.name, row.rel, row.kind))
+        .sort((a, b) => _pickerMatchScore(q, a.name || a.rel) - _pickerMatchScore(q, b.name || b.rel))
+    : allRows;
+
+  if (!filtered.length) {
+    const key = allRows.length ? 'agent_picker.library_no_match' : 'agent_picker.library_empty';
+    listEl.innerHTML = `<div class="skill-picker-empty">${escapeHtml(t(key))}</div>`;
+    return;
+  }
+
+  const projectRows = filtered.filter((row) => row.scope === 'project');
+  const globalRows = filtered.filter((row) => row.scope === 'global');
+  const groupHtml = (label, rows) => {
+    if (!rows.length) return '';
+    return `<div class="skill-picker-group-label">${escapeHtml(label)}</div>` + rows.map(_libraryPickerRowHtml).join('');
+  };
+  listEl.innerHTML = groupHtml(t('agent_picker.library_group_project'), projectRows)
+    + groupHtml(t('agent_picker.library_group_global'), globalRows);
+  _bindAgentPickerListItems(listEl, anchorId);
+}
+
 function _bindAgentPickerListItems(listEl, anchorId) {
   for (const el of listEl.querySelectorAll('[data-id]')) {
     el.addEventListener('click', async () => {
       _closeAgentPicker();
-      await _triggerPickerItem(el.dataset.kind || 'agent', el.dataset.id, el.dataset.name, anchorId);
+      await _triggerPickerItem(el.dataset.kind || 'agent', el.dataset.id, el.dataset.name, anchorId, el.dataset);
     });
     el.addEventListener('mouseenter', () => {
       const all = listEl.querySelectorAll('.skill-picker-item[data-id]');
@@ -2416,22 +3510,8 @@ function _targetFromPickerAnchor(anchorId) {
   return 'conversation';
 }
 
-async function _triggerPickerItem(kind, itemId, itemName, anchorId) {
+async function _triggerPickerItem(kind, itemId, itemName, anchorId, dataset) {
   const target = _targetFromPickerAnchor(anchorId);
-  // Connectors are commander-only; open-tier skills are commander-only too
-  // (they would otherwise reach an agent via orkas_run_skill). Trusted skills
-  // are allowed for agent recipients.
-  const blockedForAgent = !_pickerRecipientIsCommander(anchorId) && (
-    kind === 'connector' || (kind === 'skill' && _isOpenTierSkillRef(itemId, itemName))
-  );
-  if (blockedForAgent) {
-    _consumeAtKeyChar();
-    const inputId = target === 'new-chat'
-      ? 'new-chat-input'
-      : (target === 'project' ? 'project-chat-input' : (target === 'auto' ? 'auto-task-input' : 'chat-input'));
-    _focusInput(document.getElementById(inputId));
-    return;
-  }
   // Auto form: skill / connector are first-class chip fields on the
   // task record (`task.skill` / `task.connector`). Content stays clean —
   // fire-time `_buildSeedText` in main composes the outgoing text from
@@ -2457,21 +3537,80 @@ async function _triggerPickerItem(kind, itemId, itemName, anchorId) {
   }
   if (kind === 'skill') {
     _agentsTrackClick('chat_skill_select', { target, skill_id: String(itemId || itemName || '') });
-    setChatSkill(target, itemName || itemId);
     _consumeAtKeyChar();
+    setChatSkill(target, itemName || itemId);
     const inputId = target === 'new-chat' ? 'new-chat-input' : (target === 'project' ? 'project-chat-input' : 'chat-input');
     _focusInput(document.getElementById(inputId));
     return;
   }
   if (kind === 'connector') {
     _agentsTrackClick('chat_connector_select', { target, connector_id: String(itemId || '') });
-    setChatConnector(target, itemId, itemName || itemId);
     _consumeAtKeyChar();
+    setChatConnector(target, itemId, itemName || itemId);
     const inputId = target === 'new-chat' ? 'new-chat-input' : (target === 'project' ? 'project-chat-input' : 'chat-input');
     _focusInput(document.getElementById(inputId));
     return;
   }
+  if (kind === 'library') {
+    await _triggerLibraryFile(dataset || {}, anchorId);
+    return;
+  }
   await _triggerAgent(itemId, itemName, anchorId);
+}
+
+function _libraryPickerInputIdForTarget(target) {
+  if (target === 'new-chat') return 'new-chat-input';
+  if (target === 'project') return 'project-chat-input';
+  if (target === 'auto') return 'auto-task-input';
+  return 'chat-input';
+}
+
+function _libraryPickerDraftCidFor(anchorId, target, projectId) {
+  if (target === 'new-chat') return window.COMMANDER_DRAFT_CID;
+  if (target === 'project') {
+    if (typeof _projectChatDraftCid === 'function') return _projectChatDraftCid(projectId);
+    return projectId ? `projchat-${projectId}` : '';
+  }
+  if (target === 'conversation') {
+    return (typeof currentCid !== 'undefined') ? (currentCid || '') : '';
+  }
+  return '';
+}
+
+async function _triggerLibraryFile(dataset, anchorId) {
+  const target = _targetFromPickerAnchor(anchorId);
+  const scope = dataset.libraryScope || 'global';
+  const rel = dataset.libraryRel || '';
+  const projectId = dataset.projectId || _resolveActiveProjectId(anchorId);
+  const cid = _libraryPickerDraftCidFor(anchorId, target, projectId);
+  if (!rel || !cid || target === 'auto') return;
+
+  const channel = scope === 'project' ? 'projects.files.attachToDraft' : 'contexts.attachToDraft';
+  const payload = scope === 'project'
+    ? { projectId, name: rel }
+    : { relPath: rel };
+  const inputId = _libraryPickerInputIdForTarget(target);
+  _agentsTrackClick('chat_library_select', {
+    target,
+    scope,
+    project_id: scope === 'project' ? String(projectId || '') : '',
+  });
+  try {
+    await window.attachKbFileToDraft(
+      channel,
+      payload,
+      cid,
+      () => {
+        if (target === 'new-chat' && typeof setView === 'function') setView('new-chat');
+        else if (target === 'project' && projectId && typeof setView === 'function') setView('project', projectId);
+      },
+    );
+    _consumeAtKeyChar();
+    _focusInput(document.getElementById(inputId));
+  } catch (err) {
+    const reason = String((err && err.message) || err || 'failed');
+    if (typeof uiAlert === 'function') await uiAlert(t('agent_picker.library_attach_failed', { reason }));
+  }
 }
 
 // Route an agent selection to the right behaviour based on which button
@@ -2532,21 +3671,27 @@ let _atKeyMark = null; // { inputId, posAfter } | null
 function _consumeAtKeyChar() {
   const m = _atKeyMark;
   _atKeyMark = null;
-  if (!m) return;
+  if (!m) return null;
   const ta = document.getElementById(m.inputId);
-  if (!ta) return;
+  if (!ta) return null;
   const atIdx = m.posAfter - 1;
-  if (atIdx < 0 || ta.value.charAt(atIdx) !== '@') return;
+  if (atIdx < 0 || ta.value.charAt(atIdx) !== '@') return null;
   ta.value = ta.value.slice(0, atIdx) + ta.value.slice(atIdx + 1);
   try { ta.setSelectionRange(atIdx, atIdx); } catch (_) {}
   if (typeof autoGrow === 'function') autoGrow(ta, 200);
   ta.dispatchEvent(new Event('input', { bubbles: true }));
+  return ta;
 }
 
 function _focusInput(input) {
   // Defer to the next tick so the picker's outside-click handler can finish
   // closing first; otherwise focus jumps back to the picker on some browsers.
-  setTimeout(() => { try { input.focus(); } catch (_) {} }, 0);
+  setTimeout(() => {
+    try {
+      if (typeof focusChatRichComposer === 'function' && focusChatRichComposer(input)) return;
+      input.focus();
+    } catch (_) {}
+  }, 0);
 }
 
 // Recipient chip + composer textarea anchor pairs. Three sticky composers
@@ -2566,10 +3711,20 @@ const _RECIPIENT_ANCHOR_PAIRS = [
 // CJK names work.
 const _MENTION_DELETE_RE = /@[A-Za-z0-9_一-鿿-]+ ?$/u;
 
+function _recipientTextareaFromEventTarget(target) {
+  if (!target) return null;
+  const inputId = target.dataset?.richInputId || target.id || '';
+  if (inputId) {
+    const input = document.getElementById(inputId);
+    if (input) return input;
+  }
+  return target;
+}
+
 function _onMentionBackspace(e) {
   if (e.key !== 'Backspace') return;
   if (e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return;
-  const ta = e.currentTarget;
+  const ta = _recipientTextareaFromEventTarget(e.currentTarget);
   if (!ta || typeof ta.selectionStart !== 'number') return;
   if (ta.selectionStart !== ta.selectionEnd) return; // user has a selection — let default handle
   const caret = ta.selectionStart;
@@ -2590,8 +3745,12 @@ function _atKeyOpener(chipId) {
     if (e.key !== '@') return;
     const btn = document.getElementById(chipId);
     if (!btn) return;
-    const ta = e.currentTarget;
+    const ta = _recipientTextareaFromEventTarget(e.currentTarget);
+    if (!ta) return;
     setTimeout(() => {
+      try {
+        if (typeof getChatRichComposerSelection === 'function') getChatRichComposerSelection(ta);
+      } catch (_) {}
       _atKeyMark = {
         inputId: ta.id || '',
         posAfter: typeof ta.selectionStart === 'number' ? ta.selectionStart : 0,
@@ -2623,10 +3782,17 @@ function bindRecipientAnchor(chipId, inputId) {
     });
   }
   const ta = document.getElementById(inputId);
-  if (ta && ta.dataset.atBound !== '1') {
-    ta.dataset.atBound = '1';
-    ta.addEventListener('keydown', _atKeyOpener(chipId));
-    ta.addEventListener('keydown', _onMentionBackspace);
+  const bindInput = (el) => {
+    if (!el || el.dataset.atBound === '1') return;
+    el.dataset.atBound = '1';
+    el.addEventListener('keydown', _atKeyOpener(chipId));
+    el.addEventListener('keydown', _onMentionBackspace);
+  };
+  bindInput(ta);
+  if (typeof getChatRichComposerEditor === 'function') {
+    try {
+      bindInput(getChatRichComposerEditor(inputId));
+    } catch (_) {}
   }
 }
 
@@ -2654,6 +3820,13 @@ function bindAgentPickers() {
     // English candidate would also fire our select-active-item handler.
     if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Escape') { _atKeyMark = null; _closeAgentPicker(); e.preventDefault(); return; }
+    if ((e.key === 'Backspace' || e.key === 'Delete') && !searchInput.value && _atKeyMark) {
+      const input = _consumeAtKeyChar();
+      _closeAgentPicker();
+      if (input) _focusInput(input);
+      e.preventDefault();
+      return;
+    }
     if (e.key === 'ArrowRight') { _moveAgentPickerTab(1); e.preventDefault(); return; }
     if (e.key === 'ArrowLeft')  { _moveAgentPickerTab(-1); e.preventDefault(); return; }
     if (e.key === 'ArrowDown') { _moveAgentPickerActive(1); e.preventDefault(); return; }

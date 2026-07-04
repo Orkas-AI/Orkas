@@ -221,6 +221,7 @@ export function buildReviewPrompt(
   competence: string,
   strategies: string,
   transcript: string,
+  languageName = 'the user\'s current UI language, or the transcript\'s dominant user language when no UI language is provided',
 ): string {
   const base = 'Based on the activity transcript below, review and update your self-understanding.\n\n'
     + '**Important: transient errors (network timeouts, dropped connections, rate limits) are environmental issues, not skill or capability deficits. '
@@ -255,11 +256,17 @@ export function buildReviewPrompt(
     + '  ✗ "Q4 earnings analysis skill."\n'
     + '  ✓ "WHEN handling Q4 earnings for utilities, use trailing-4-quarters not annualized."';
 
+  const languageStyle = `Write human-readable COMPETENCE.md / LEARNING_STRATEGIES.md updates in ${languageName}. `
+    + 'If a durable user preference or domain constraint appears in another language, translate or summarize it into that language before saving. '
+    + 'Preserve proper nouns, commands, file paths, code identifiers, URLs, and exact quoted user wording when exact text matters.';
+
   return [
     base,
     `**Focus**: ${focus}`,
     '',
     `**Writing style**: ${writingStyle}`,
+    '',
+    `**Language**: ${languageStyle}`,
     '',
     '**Activity transcript**:',
     transcript || '(No new activity in the window.)',

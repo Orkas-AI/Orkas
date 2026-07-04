@@ -11,15 +11,15 @@
 const _projectDetailLog = createLogger('project-detail');
 
 function _projectTrackClick(action, data) {
-  void 0;
+  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
 function _projectTrackEvent(action, data) {
-  void 0;
+  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
 function _projectTrackError(action, data) {
-  void 0;
+  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
 function _projectFileUploadPayload(fileList, source, targetDir) {
@@ -276,6 +276,7 @@ function _renderProjectAgentCards(items) {
   const sorted = (items || []).slice().sort(_byDisplayName);
   if (!sorted.length) return '';
   const useTitle = escapeHtml(t('agents.use_tooltip'));
+  const useLabel = escapeHtml(t('agents.use'));
   const removeTitle = escapeHtml(t('project.bindings.remove'));
   return sorted.map((a) => {
     const id = a.agent_id || a.id || '';
@@ -287,12 +288,12 @@ function _renderProjectAgentCards(items) {
       : '';
     return `
       <div class="project-agent-row${enabled ? '' : ' is-disabled'}" role="button" tabindex="0"
-           data-project-agent-id="${escapeHtml(id)}" data-source="${escapeHtml(a.source || '')}">
+           data-project-agent-id="${escapeHtml(id)}" data-project-agent-name="${escapeHtml(a.name || '')}" data-source="${escapeHtml(a.source || '')}">
         ${avatarHtml}
         <span class="project-agent-row-name">${escapeHtml(a.name || t('agents.unnamed'))}</span>
         <div class="project-agent-row-actions">
           <button type="button" class="project-agent-row-run agent-card-use" data-project-agent-run title="${useTitle}" aria-label="${useTitle}">
-            ${typeof _agentUiIconHtml === 'function' ? _agentUiIconHtml('play-triangle', 'icon-play') : ''}
+            ${useLabel}
           </button>
           <button type="button" class="project-agent-row-remove" data-project-agent-remove title="${removeTitle}" aria-label="${removeTitle}">
             ${_projectUiIconHtml('x', 'project-agent-remove-icon') || '×'}
@@ -320,7 +321,7 @@ function _bindProjectAgentCards() {
     });
     card.querySelector('[data-project-agent-run]')?.addEventListener('click', async (e) => {
       e.stopPropagation();
-      await _runProjectAgent(id);
+      await _selectProjectAgentRecipient(id, card.dataset.projectAgentName || '');
     });
     card.querySelector('[data-project-agent-remove]')?.addEventListener('click', async (e) => {
       e.stopPropagation();
@@ -343,40 +344,19 @@ async function _openProjectAgentDetail(agentId) {
   }
 }
 
-async function _runProjectAgent(agentId) {
-  if (!_projectDetailPid || !agentId) return;
-  if (typeof ensureModelConfigured === 'function' && !ensureModelConfigured()) return;
+async function _selectProjectAgentRecipient(agentId, agentName = '') {
+  if (!agentId) return;
   try {
-    const aRes = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}`);
-    const aData = await aRes.json();
-    if (!aData.ok || !aData.agent) throw new Error(aData.error || t('agents.agent_not_found'));
-    const agent = aData.agent;
-    const visible = t('agents.run_prefix', { name: agent.name || agent.agent_id });
-    const res = await apiFetch('/api/conversations/create', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ kind: 'normal', projectId: _projectDetailPid }),
-    });
-    const data = await res.json();
-    if (!data.ok) throw new Error(data.error || t('agents.create_conv_failed'));
-    const conv = data.conversation;
-    conv.project_id = conv.project_id || _projectDetailPid;
-    conv.title = (typeof _autoTitle === 'function') ? _autoTitle(visible) : visible.slice(0, 32);
-    conv.last_active_at = new Date().toISOString();
-    conversations.unshift(conv);
-    renderConversationList();
-    if (typeof loadProjects === 'function') loadProjects(true);
-    if (typeof setView === 'function') setView('conversation', conv.conversation_id, { skipLoad: true });
     if (typeof setChatRecipient === 'function') {
-      setChatRecipient('conversation', {
-        kind: 'agent',
-        id: agentId,
-        name: agent.name || agent.agent_id,
-      });
+      setChatRecipient('project', { kind: 'agent', id: agentId, name: agentName || agentId });
     }
+    _projectTrackClick('project_agent_select_recipient', {
+      project_id: _projectDetailPid,
+      agent_id: agentId,
+    });
     setTimeout(() => {
-      if (typeof sendInCurrentConversation === 'function') sendInCurrentConversation(visible);
-    }, 50);
+      try { document.getElementById('project-chat-input')?.focus(); } catch (_) {}
+    }, 0);
   } catch (e) {
     if (typeof uiAlert === 'function') await uiAlert(t('agents.launch_failed', { reason: e.message || e }));
   }
@@ -516,6 +496,27 @@ function _projectJoinPath(dir, name) {
   const d = String(dir || '').replace(/\/+$/, '');
   const n = String(name || '').replace(/^\/+/, '');
   return d ? `${d}/${n}` : n;
+}
+
+function _projectFormatMtime(mtime) {
+  const n = Number(mtime);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  const ms = n > 100000000000 ? n : n * 1000;
+  try {
+    const locale = (typeof getLocaleMeta === 'function' && typeof getLang === 'function')
+      ? getLocaleMeta(getLang()).intlLocale
+      : undefined;
+    return new Intl.DateTimeFormat(locale, {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).format(new Date(ms));
+  } catch (_) {
+    return new Date(ms).toLocaleString();
+  }
 }
 
 function _flattenProjectLibraryFiles(nodes) {
@@ -700,12 +701,13 @@ function _renderProjectFileNodes(nodes, depth = 0) {
     const chip = _projectKbStatusChipHtml(rel);
     const ext = _projectFileExt(name).replace(/^\./, '');
     const active = _projectLibraryActiveName === rel ? ' active' : '';
+    const mtime = _projectFormatMtime(f.mtime);
     return `
       <div class="ctx-tree-wrap project-file-row" data-project-file="${escapeHtml(rel)}" data-project-file-kind="${escapeHtml(f.kind || '')}" data-type="file">
         <div class="skill-tree-node skill-tree-file${active}" data-ext="${escapeHtml(ext)}" style="padding-left:${indent}px">
           <span class="skill-tree-caret skill-tree-caret-empty"></span>
           <span class="skill-tree-icon icon-file" data-ext="${escapeHtml(ext)}">${_projectUiIconHtml('file', 'skill-tree-node-svg')}</span>
-          <span class="skill-tree-label">${label}</span>
+          <span class="skill-tree-main"><span class="skill-tree-label">${label}</span>${mtime ? `<span class="skill-tree-meta">${escapeHtml(mtime)}</span>` : ''}</span>
           ${chip}
           <button type="button" class="ctx-row-menu-btn project-file-menu-btn" data-action="project-file-menu"
                   title="${moreLabel}" aria-label="${moreLabel}">⋯</button>
@@ -1697,14 +1699,14 @@ async function _submitProjectChat() {
   const raw = (input?.value || '').trim();
   if (!raw) return;
   if (typeof ensureModelConfigured === 'function' && !ensureModelConfigured()) return;
-  const useSelection = (typeof consumeChatUseSelection === 'function')
-    ? consumeChatUseSelection('project')
-    : null;
+  const useSelections = (typeof consumeChatUseSelections === 'function')
+    ? consumeChatUseSelections('project')
+    : [];
   const recipient = (typeof getChatRecipient === 'function')
     ? getChatRecipient('project')
     : null;
   const withUse = (typeof transformWithChatUse === 'function')
-    ? transformWithChatUse(raw, useSelection)
+    ? transformWithChatUse(raw)
     : raw;
   const content = (typeof applyRecipientPrefix === 'function')
     ? applyRecipientPrefix(withUse, 'project')
@@ -1715,8 +1717,8 @@ async function _submitProjectChat() {
     source_view: 'project',
     content_length: raw.length,
     recipient_type: recipientType,
-    has_skill: !!(useSelection && useSelection.kind === 'skill'),
-    has_connector: !!(useSelection && useSelection.kind === 'connector'),
+    has_skill: useSelections.some((sel) => sel.kind === 'skill'),
+    has_connector: useSelections.some((sel) => sel.kind === 'connector'),
     attachment_count: 0,
     has_project: true,
   };
@@ -1734,7 +1736,8 @@ async function _submitProjectChat() {
     if (!data.ok) throw new Error(data.error || t('chat.create_conv_failed'));
     const conv = data.conversation;
     convId = conv.conversation_id;
-    conv.title = (typeof _autoTitle === 'function') ? _autoTitle(raw) : raw.slice(0, 32);
+    const titleSeed = (typeof transformChatUseTokens === 'function') ? transformChatUseTokens(raw) : raw;
+    conv.title = (typeof _autoTitle === 'function') ? _autoTitle(titleSeed) : titleSeed.slice(0, 32);
     conversations.unshift(conv);
     renderConversationList();
     if (typeof loadProjects === 'function') loadProjects(true);
@@ -1782,9 +1785,6 @@ async function _submitProjectChat() {
   if (typeof setView === 'function') setView('conversation', convId, { skipLoad: true });
   if (recipient && typeof setChatRecipient === 'function') {
     setChatRecipient('conversation', recipient);
-  }
-  if (useSelection && typeof setChatUseSelection === 'function') {
-    setChatUseSelection('conversation', useSelection);
   }
   if (btn) btn.disabled = false;
   if (typeof sendInCurrentConversation === 'function') {
@@ -2140,18 +2140,10 @@ async function _onDeleteAction() {
   if (!_projectDetailPid || !_projectDetailMeta) return;
   // Reuse the sidebar's delete confirm flow so the danger label / count
   // wording stays in one place. `_confirmDeleteProject` is defined in
-  // `projects.js` and runs the IPC + post-delete cleanup. The sidebar
-  // handler doesn't navigate away on its own when the user is on the
-  // project detail panel (currentCid is null there), so we check post-hoc:
-  // if the project disappeared from the cache, jump to new-chat.
-  const targetPid = _projectDetailPid;
+  // `projects.js` and runs the IPC + post-delete cleanup, including choosing
+  // the next project/task destination when this detail page is deleted.
   if (typeof _confirmDeleteProject === 'function') {
-    await _confirmDeleteProject(targetPid);
-  }
-  const stillExists = Array.isArray(_projectsCache)
-    && _projectsCache.some((p) => p && p.project_id === targetPid);
-  if (!stillExists && currentView === 'project') {
-    if (typeof setView === 'function') setView('new-chat');
+    await _confirmDeleteProject(_projectDetailPid);
   }
 }
 

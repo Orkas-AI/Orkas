@@ -2,13 +2,16 @@ const _skillsLog = createLogger('skills');
 // ─── Skills ───
 
 let _skillsCache = null;
-// Read-only open-tier skills (external packages + global folders). Rendered
-// separately from trusted skills; users can enable/disable them here, while
-// package lifecycle actions stay package-scoped.
+// Read-only open-tier entries. External packages render as package cards,
+// while machine-global folders still render their individual skills. Package
+// SKILL.md files remain available to the agent layer, but are not expanded into
+// a wall of user-facing recipe cards.
 let _openSkillsCache = [];
 let _packagesCache = [];
 let _skillsLoadInFlight = null;
 let _selectedSkill = null;    // { source, id }
+let _expandedGlobalSkillGroups = new Set();
+const _GLOBAL_SKILL_GROUP_MIN = 2;
 
 function _skillSource(source) {
   return (typeof normalizeCatalogSource === 'function')
@@ -29,18 +32,16 @@ function _skillUiIconHtml(name, className) {
   return '';
 }
 
-/** Version + category chips for a marketplace-installed skill. Mirrors the
- *  marketplace card footer. `_resolveCategoryLabel` is defined in `agents.js` (flat top-level
- *  scope per CLAUDE.md §8). */
-function _skillPlatformChipsHtml(s) {
+function _skillCardChipsHtml(s) {
   const lang = getLang();
   const parts = [];
-  if (s.version) {
+  const isPlatform = _isSkillPlatformSource(s && s.source);
+  if (isPlatform && s.version) {
     const versionLabel = t('marketplace.version').replace('{version}', String(s.version));
     parts.push(`<span class="skill-card-chip is-version">${escapeHtml(versionLabel)}</span>`);
   }
-  const catLabel = _resolveCategoryLabel(s.category, lang);
-  parts.push(`<span class="skill-card-chip">${escapeHtml(catLabel)}</span>`);
+  const catLabel = _resolveCategoryLabel(s && s.category, lang);
+  if (catLabel) parts.push(`<span class="skill-card-chip">${escapeHtml(catLabel)}</span>`);
   return parts.join('');
 }
 
@@ -122,6 +123,25 @@ async function _refreshPackagesCache() {
   }
 }
 
+// Dev-only: agent-private (`ownerAgent`) skills are hidden from the normal
+// list. In dev mode fetch them and merge into the cache (deduped by id+source)
+// so the panel can show a separate inspection section grouped by owning agent.
+// No-op in production — the IPC is dev-gated and returns nothing there.
+async function _mergeAgentPrivateSkills() {
+  if (typeof isDevMode !== 'function' || !false || !Array.isArray(_skillsCache)) return;
+  try {
+    const res = await window.orkas.invoke('skills.listPrivate');
+    const priv = (res && res.ok && Array.isArray(res.skills)) ? res.skills : [];
+    if (!priv.length) return;
+    const key = (s) => `${s.id} ${s.source}`;
+    const seen = new Set(_skillsCache.map(key));
+    const merged = priv
+      .map((s) => ({ ...s, source: _skillSource(s.source) }))
+      .filter((s) => !seen.has(key(s)));
+    if (merged.length) _skillsCache = _skillsCache.concat(merged);
+  } catch { /* dev-only tab; ignore */ }
+}
+
 async function loadSkills(forceRefresh) {
   if (_skillsLoadInFlight) {
     if (!forceRefresh) return _skillsLoadInFlight;
@@ -156,6 +176,7 @@ async function loadSkills(forceRefresh) {
           if (ka > kb) return 1;
           return String(a.id || '').localeCompare(String(b.id || ''), undefined, { numeric: true, sensitivity: 'base' });
         });
+        await _mergeAgentPrivateSkills();
         renderSkillsList(_skillsCache);
       }
     } catch (e) {
@@ -172,13 +193,22 @@ function _skillNameSortKey(skill) {
   return (typeof pinyinSortKey === 'function') ? pinyinSortKey(name) : name.toLowerCase();
 }
 
-// ─── Chat-input tool chip ────────────────────────────────────────────────
+// ─── Chat-input inline use chips ──────────────────────────────────────────
 //
-// The composer exposes one reusable "use X" chip. Skills and connectors are
-// mutually exclusive because both are textual routing hints prepended to the
-// next message; agents remain separate in the recipient chip.
+// Skills and connectors are stored directly in the textarea as compact tokens
+// and rendered by the conversation mirror as inline chips. The textarea stays
+// the source of truth, so native selection / IME / undo keep working while the
+// send path can expand tokens into localized plain text.
 
 const _chatUse = { 'new-chat': null, 'conversation': null, project: null };
+const _CHAT_USE_TOKEN_OPEN = '@{';
+const _CHAT_USE_TOKEN_KINDS = new Set(['skill', 'connector']);
+const _CHAT_USE_TOKEN_START = '\u2063';
+const _CHAT_USE_TOKEN_META = '\u2062';
+const _CHAT_USE_TOKEN_END = '\u2064';
+const _CHAT_USE_TOKEN_ZERO = '\u200B';
+const _CHAT_USE_TOKEN_ONE = '\u200C';
+const _CHAT_USE_TOKEN_PAD = '  ';
 
 function bindSkillPicker() {
   // Chip remove (×)
@@ -188,6 +218,12 @@ function bindSkillPicker() {
       const chip = el.closest('.chat-skill-chip');
       if (chip) setChatUseSelection(chip.dataset.target, null);
     });
+  });
+  ['new-chat-input', 'chat-input', 'project-chat-input'].forEach((id) => {
+    const input = document.getElementById(id);
+    if (!input || input.dataset.chatUseTokenBound === '1') return;
+    input.dataset.chatUseTokenBound = '1';
+    input.addEventListener('keydown', _onChatUseTokenKeydown);
   });
 }
 
@@ -206,8 +242,202 @@ function _normalizeChatUseSelection(value) {
   return { kind, id: id || name, name: name || id };
 }
 
+function _normalizeChatUseSelections(value) {
+  if (!value) return [];
+  const raw = Array.isArray(value) ? value : [value];
+  const out = [];
+  const seen = new Set();
+  raw.forEach((item) => {
+    const sel = _normalizeChatUseSelection(item);
+    if (!sel) return;
+    const key = `${sel.kind}:${sel.id || sel.name}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(sel);
+  });
+  return out;
+}
+
+function _chatUseInputForTarget(target) {
+  const id = target === 'new-chat'
+    ? 'new-chat-input'
+    : (target === 'project' ? 'project-chat-input' : 'chat-input');
+  return document.getElementById(id);
+}
+
+function _chatUseAutoGrowMax(target) {
+  return target === 'new-chat' ? 260 : (target === 'project' ? 180 : 200);
+}
+
+function _escapeChatUseTokenValue(value) {
+  return String(value || '').replace(/\\/g, '\\\\').replace(/\}/g, '\\}');
+}
+
+function _unescapeChatUseTokenValue(value) {
+  let out = '';
+  let escaped = false;
+  for (const ch of String(value || '')) {
+    if (escaped) {
+      out += ch;
+      escaped = false;
+    } else if (ch === '\\') {
+      escaped = true;
+    } else {
+      out += ch;
+    }
+  }
+  if (escaped) out += '\\';
+  return out;
+}
+
+function _chatUseTokenFor(selection) {
+  const sel = _normalizeChatUseSelection(selection);
+  if (!sel) return '';
+  const visible = _chatUseVisibleTokenText(sel);
+  const encoded = _encodeChatUseTokenMeta(sel);
+  if (!visible || !encoded) return '';
+  return `${_CHAT_USE_TOKEN_START}${visible}${_CHAT_USE_TOKEN_PAD}${_CHAT_USE_TOKEN_META}${encoded}${_CHAT_USE_TOKEN_END}`;
+}
+
+function _chatUseVisibleTokenText(selection) {
+  const parts = _chatUseLabelParts(selection);
+  if (parts && parts.label) return parts.label;
+  return formatChatUseLabel(selection);
+}
+
+function _encodeChatUseTokenMeta(selection) {
+  const sel = _normalizeChatUseSelection(selection);
+  if (!sel) return '';
+  const payload = encodeURIComponent(JSON.stringify(sel));
+  let out = '';
+  for (let i = 0; i < payload.length; i += 1) {
+    const code = payload.charCodeAt(i);
+    for (let bit = 7; bit >= 0; bit -= 1) {
+      out += (code & (1 << bit)) ? _CHAT_USE_TOKEN_ONE : _CHAT_USE_TOKEN_ZERO;
+    }
+  }
+  return out;
+}
+
+function _decodeChatUseTokenMeta(encoded) {
+  const raw = String(encoded || '');
+  if (!raw) return null;
+  let payload = '';
+  for (let i = 0; i + 7 < raw.length; i += 8) {
+    let code = 0;
+    for (let bit = 0; bit < 8; bit += 1) {
+      const ch = raw.charAt(i + bit);
+      if (ch !== _CHAT_USE_TOKEN_ZERO && ch !== _CHAT_USE_TOKEN_ONE) return null;
+      code = (code << 1) | (ch === _CHAT_USE_TOKEN_ONE ? 1 : 0);
+    }
+    payload += String.fromCharCode(code);
+  }
+  try {
+    return _normalizeChatUseSelection(JSON.parse(decodeURIComponent(payload)));
+  } catch (_) {
+    return null;
+  }
+}
+
+function _findMarkedChatUseTokens(text) {
+  const src = String(text || '');
+  const tokens = [];
+  let pos = 0;
+  while (pos < src.length) {
+    const start = src.indexOf(_CHAT_USE_TOKEN_START, pos);
+    if (start < 0) break;
+    const metaStart = src.indexOf(_CHAT_USE_TOKEN_META, start + _CHAT_USE_TOKEN_START.length);
+    const end = metaStart >= 0 ? src.indexOf(_CHAT_USE_TOKEN_END, metaStart + _CHAT_USE_TOKEN_META.length) : -1;
+    if (metaStart < 0 || end < 0) {
+      pos = start + _CHAT_USE_TOKEN_START.length;
+      continue;
+    }
+    const selection = _decodeChatUseTokenMeta(src.slice(metaStart + _CHAT_USE_TOKEN_META.length, end));
+    if (selection) {
+      tokens.push({
+        start,
+        end: end + _CHAT_USE_TOKEN_END.length,
+        raw: src.slice(start, end + _CHAT_USE_TOKEN_END.length),
+        selection,
+      });
+    }
+    pos = end + _CHAT_USE_TOKEN_END.length;
+  }
+  return tokens;
+}
+
+function _findLegacyChatUseTokens(text) {
+  const src = String(text || '');
+  const tokens = [];
+  let pos = 0;
+  while (pos < src.length) {
+    const start = src.indexOf(_CHAT_USE_TOKEN_OPEN, pos);
+    if (start < 0) break;
+    const kindStart = start + _CHAT_USE_TOKEN_OPEN.length;
+    const colon = src.indexOf(':', kindStart);
+    if (colon < 0) break;
+    const kind = src.slice(kindStart, colon);
+    if (!_CHAT_USE_TOKEN_KINDS.has(kind)) {
+      pos = kindStart;
+      continue;
+    }
+    let raw = '';
+    let escaped = false;
+    let end = -1;
+    for (let i = colon + 1; i < src.length; i += 1) {
+      const ch = src.charAt(i);
+      if (escaped) {
+        raw += '\\' + ch;
+        escaped = false;
+        continue;
+      }
+      if (ch === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (ch === '}') {
+        end = i + 1;
+        break;
+      }
+      raw += ch;
+    }
+    if (end < 0) {
+      pos = kindStart;
+      continue;
+    }
+    const name = _unescapeChatUseTokenValue(raw).trim();
+    if (name) {
+      tokens.push({
+        start,
+        end,
+        raw: src.slice(start, end),
+        selection: { kind, id: name, name },
+      });
+    }
+    pos = end;
+  }
+  return tokens;
+}
+
+function _findChatUseTokens(text) {
+  return _findMarkedChatUseTokens(text)
+    .concat(_findLegacyChatUseTokens(text))
+    .sort((a, b) => a.start - b.start || a.end - b.end);
+}
+
+function _chatUseSelectionsFromText(text) {
+  return _findChatUseTokens(text).map((token) => token.selection);
+}
+
+function getChatUseSelections(target) {
+  const input = _chatUseInputForTarget(target);
+  const fromText = input ? _chatUseSelectionsFromText(input.value || '') : [];
+  const legacy = _normalizeChatUseSelection(_chatUse[target]);
+  return legacy ? fromText.concat([legacy]) : fromText;
+}
+
 function getChatUseSelection(target) {
-  const cur = _normalizeChatUseSelection(_chatUse[target]);
+  const cur = getChatUseSelections(target)[0] || null;
   return cur ? { ...cur } : null;
 }
 
@@ -282,22 +512,74 @@ function refreshChatUseChips() {
 }
 
 function isChatUseAllowedForTarget(target, kind) {
-  // Connectors are commander-only (orchestration-side, permission-gated).
-  // Skills may target any recipient: the commander runs them; an agent
-  // recipient runs them itself (CLI agents via the orkas bridge's
-  // orkas_run_skill).
-  if (kind !== 'connector') return true;
-  if (typeof getChatRecipient !== 'function') return true;
-  const rec = getChatRecipient(target);
-  return !rec || rec.kind !== 'agent';
+  if (!target || !kind) return false;
+  // Commander and agent recipients now share the same skill/connector surface.
+  // Live connector availability is still checked when the draft is consumed.
+  return true;
+}
+
+function _chatUseDispatchInput(input, target) {
+  if (typeof autoGrow === 'function') autoGrow(input, _chatUseAutoGrowMax(target));
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function _insertChatUseToken(target, selection) {
+  const sel = _normalizeChatUseSelection(selection);
+  if (!sel) return false;
+  const input = _chatUseInputForTarget(target);
+  if (!input) return false;
+  if (typeof insertChatUseTokenIntoComposer === 'function' && insertChatUseTokenIntoComposer(input, sel)) {
+    return true;
+  }
+  const token = _chatUseTokenFor(sel);
+  if (!token) return false;
+  const value = String(input.value || '');
+  const start = typeof input.selectionStart === 'number' ? input.selectionStart : value.length;
+  const end = typeof input.selectionEnd === 'number' ? input.selectionEnd : start;
+  const before = value.slice(0, start);
+  const after = value.slice(end);
+  const leading = before && !/\s$/.test(before) ? ' ' : '';
+  const trailing = after && /^\s/.test(after) ? '' : ' ';
+  const replacement = `${leading}${token}${trailing}`;
+  if (typeof input.setRangeText === 'function') {
+    input.setRangeText(replacement, start, end, 'end');
+  } else {
+    input.value = `${before}${replacement}${after}`;
+    input.selectionStart = input.selectionEnd = start + replacement.length;
+  }
+  _chatUseDispatchInput(input, target);
+  return true;
+}
+
+function _removeChatUseTokensFromInput(target) {
+  const input = _chatUseInputForTarget(target);
+  if (!input) return false;
+  const value = String(input.value || '');
+  const tokens = _findChatUseTokens(value);
+  if (!tokens.length) return false;
+  let out = '';
+  let last = 0;
+  tokens.forEach((token) => {
+    out += value.slice(last, token.start);
+    last = token.end;
+  });
+  out += value.slice(last);
+  input.value = out.replace(/[ \t]{2,}/g, ' ').trimStart();
+  try {
+    const caret = Math.min(input.value.length, tokens[0].start);
+    input.setSelectionRange(caret, caret);
+  } catch (_) {}
+  _chatUseDispatchInput(input, target);
+  return true;
 }
 
 function setChatUseSelection(target, selection, opts = {}) {
   const prev = JSON.stringify(_normalizeChatUseSelection(_chatUse[target]) || null);
-  const next = isChatUseAllowedForTarget(target, selection && selection.kind)
-    ? _normalizeChatUseSelection(selection)
-    : null;
-  _chatUse[target] = next;
+  const normalized = _normalizeChatUseSelection(selection);
+  const next = normalized && isChatUseAllowedForTarget(target, normalized.kind) ? normalized : null;
+  _chatUse[target] = null;
+  if (next) _insertChatUseToken(target, next);
+  else _removeChatUseTokensFromInput(target);
   if (target === 'conversation' && prev !== JSON.stringify(next || null) && currentCid) {
     _saveDraft(currentCid);
   }
@@ -307,6 +589,7 @@ function setChatUseSelection(target, selection, opts = {}) {
   const input = target === 'new-chat'
     ? document.getElementById('new-chat-input')
     : (target === 'project' ? document.getElementById('project-chat-input') : document.getElementById('chat-input'));
+  if (typeof focusChatRichComposer === 'function' && focusChatRichComposer(input)) return;
   input?.focus();
 }
 
@@ -326,9 +609,12 @@ function consumeChatSkill(target) {
 }
 
 function consumeChatUseSelection(target) {
-  // Currently a one-way read. Chip persists until user removes it via the ×.
   const sel = getChatUseSelection(target);
   return sel && isChatUseAllowedForTarget(target, sel.kind) ? sel : null;
+}
+
+function consumeChatUseSelections(target) {
+  return getChatUseSelections(target).filter((sel) => sel && isChatUseAllowedForTarget(target, sel.kind));
 }
 
 function transformWithSkill(content, skill) {
@@ -336,13 +622,161 @@ function transformWithSkill(content, skill) {
   return t('skills.use_prefix', { skill, content });
 }
 
-function transformWithChatUse(content, selection) {
+function _localizedChatUseText(key, params, fallback) {
+  const text = (typeof t === 'function') ? t(key, params) : '';
+  return text && text !== key ? text : fallback;
+}
+
+function _chatUseInlineText(selection) {
   const sel = _normalizeChatUseSelection(selection);
-  if (!sel) return content;
+  if (!sel) return '';
+  const name = sel.name || sel.id;
   if (sel.kind === 'connector') {
-    return t('connectors.use_prefix', { connector: sel.name || sel.id, content });
+    return _localizedChatUseText('connectors.inline_text', { connector: name }, `${name} connector`);
   }
-  return transformWithSkill(content, sel.name || sel.id);
+  return _localizedChatUseText('skills.inline_text', { skill: name }, `${name} skill`);
+}
+
+function _replaceChatUseTokens(content, mapper) {
+  const text = String(content || '');
+  const tokens = _findChatUseTokens(text);
+  if (!tokens.length) return text;
+  let out = '';
+  let last = 0;
+  tokens.forEach((token) => {
+    out += text.slice(last, token.start);
+    out += mapper(token.selection, token);
+    last = token.end;
+  });
+  out += text.slice(last);
+  return out;
+}
+
+function transformChatUseTokens(content) {
+  return _replaceChatUseTokens(content, (selection) => _chatUseInlineText(selection));
+}
+
+function transformWithChatUse(content, selection) {
+  let out = transformChatUseTokens(content);
+  const selections = _normalizeChatUseSelections(selection);
+  selections.forEach((sel) => {
+    if (sel.kind === 'connector') {
+      out = t('connectors.use_prefix', { connector: sel.name || sel.id, content: out });
+    } else {
+      out = transformWithSkill(out, sel.name || sel.id);
+    }
+  });
+  return out;
+}
+
+function formatChatUseTextForDisplay(content) {
+  return _replaceChatUseTokens(content, (selection) => formatChatUseLabel(selection));
+}
+
+function _renderChatUseMirrorHtml(text, renderPlainHtml) {
+  const renderer = typeof renderPlainHtml === 'function'
+    ? renderPlainHtml
+    : ((value) => escapeHtml(value));
+  const src = String(text || '');
+  const tokens = _findChatUseTokens(src);
+  if (!tokens.length) return renderer(src);
+  let html = '';
+  let last = 0;
+  tokens.forEach((token) => {
+    if (token.start > last) html += renderer(src.slice(last, token.start));
+    const parts = _chatUseLabelParts(token.selection);
+    const cls = token.selection.kind === 'connector' ? 'is-connector' : 'is-skill';
+    const title = parts ? parts.label : formatChatUseLabel(token.selection);
+    html += `<span class="chat-use-inline-chip ${cls}" title="${escapeHtml(title)}">`;
+    if (parts) {
+      html += `<span class="chat-use-inline-prefix">${escapeHtml(parts.prefix)}</span>`;
+      html += `<span class="chat-use-inline-name">${escapeHtml(parts.name)}</span>`;
+    } else {
+      html += escapeHtml(title);
+    }
+    html += '</span>';
+    last = token.end;
+  });
+  if (last < src.length) html += renderer(src.slice(last));
+  return html;
+}
+
+function _chatUseTokenDeleteRange(input, direction) {
+  if (!input || typeof input.selectionStart !== 'number') return false;
+  const value = String(input.value || '');
+  const tokens = _findChatUseTokens(value);
+  if (!tokens.length) return false;
+
+  if (input.selectionStart !== input.selectionEnd) {
+    let start = input.selectionStart;
+    let end = input.selectionEnd;
+    let touched = false;
+    tokens.forEach((token) => {
+      if (token.start < end && start < token.end) {
+        start = Math.min(start, token.start);
+        end = Math.max(end, token.end);
+        touched = true;
+      }
+    });
+    return touched ? { start, end } : null;
+  }
+
+  const caret = input.selectionStart;
+  const hit = tokens.find((token) => {
+    if (caret > token.start && caret < token.end) return true;
+    if (direction === 'forward') return token.start === caret;
+    return token.end === caret || (caret === token.end + 1 && value.charAt(token.end) === ' ');
+  });
+  return hit ? { start: hit.start, end: hit.end } : null;
+}
+
+function _deleteChatUseTokenAtCaret(input, direction) {
+  const range = _chatUseTokenDeleteRange(input, direction);
+  if (!range) return false;
+  const value = String(input.value || '');
+  let { start, end } = range;
+  if (value.charAt(end) === ' ') end += 1;
+  else if (start > 0 && value.charAt(start - 1) === ' ') start -= 1;
+  input.value = value.slice(0, start) + value.slice(end);
+  try { input.setSelectionRange(start, start); } catch (_) {}
+  const target = input.id === 'new-chat-input' ? 'new-chat' : (input.id === 'project-chat-input' ? 'project' : 'conversation');
+  _chatUseDispatchInput(input, target);
+  return true;
+}
+
+function _chatUseTokenMoveTarget(text, caret, direction) {
+  const value = String(text || '');
+  const pos = Number(caret);
+  if (!Number.isFinite(pos)) return null;
+  const tokens = _findChatUseTokens(value);
+  const hit = tokens.find((token) => {
+    if (direction === 'forward') return pos >= token.start && pos < token.end;
+    return (pos > token.start && pos <= token.end)
+      || (pos === token.end + 1 && value.charAt(token.end) === ' ');
+  });
+  if (!hit) return null;
+  return direction === 'forward' ? hit.end : hit.start;
+}
+
+function _moveChatUseTokenCaret(input, direction) {
+  if (!input || typeof input.selectionStart !== 'number') return false;
+  if (input.selectionStart !== input.selectionEnd) return false;
+  const next = _chatUseTokenMoveTarget(input.value || '', input.selectionStart, direction);
+  if (next === null || next === input.selectionStart) return false;
+  try { input.setSelectionRange(next, next); } catch (_) {}
+  return true;
+}
+
+function _onChatUseTokenKeydown(e) {
+  if (e.key !== 'Backspace' && e.key !== 'Delete' && e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+  if (e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+    const direction = e.key === 'ArrowRight' ? 'forward' : 'backward';
+    if (_moveChatUseTokenCaret(e.currentTarget, direction)) e.preventDefault();
+    return;
+  }
+  const direction = e.key === 'Delete' ? 'forward' : 'backward';
+  if (_deleteChatUseTokenAtCaret(e.currentTarget, direction)) e.preventDefault();
 }
 
 function renderSkillsList(skills) { renderSkillsGrid(skills); }
@@ -456,13 +890,7 @@ function renderSkillsGrid(skills) {
     const descText = desc || t('skills.no_desc');
     const moreBtn = `<button type="button" class="skill-card-more" data-skill-more title="${moreTitle}" aria-label="${moreTitle}">⋯</button>`;
     const enabled = s.enabled !== false;
-    // Source provenance: custom → "Custom" chip; marketplace → version + category chips.
-    let provenanceChips = '';
-    if (s.source === 'custom') {
-      provenanceChips = `<span class="skill-card-chip is-custom">${escapeHtml(customChipLabel)}</span>`;
-    } else if (_isSkillPlatformSource(s.source)) {
-      provenanceChips = _skillPlatformChipsHtml(s);
-    }
+    const cardChips = _skillCardChipsHtml(s);
     return `
       <div class="skill-card${enabled ? '' : ' is-disabled'}" data-id="${escapeHtml(s.id)}" data-source="${escapeHtml(s.source || '')}">
         <div class="skill-card-header">
@@ -471,17 +899,20 @@ function renderSkillsGrid(skills) {
         </div>
         <div class="${descClass}">${escapeHtml(descText)}</div>
         <div class="skill-card-actions">
-          ${provenanceChips}
+          ${cardChips}
           <button type="button" class="skill-card-use" data-skill-use title="${useTitle}" aria-label="${useTitle}" ${enabled ? '' : 'disabled aria-disabled="true" tabindex="-1"'}>
-            ${_skillUiIconHtml('play-triangle', 'icon-play')}
+            ${escapeHtml(t('skills.use'))}
           </button>
         </div>
       </div>
     `;
   };
 
-  const groups = { custom: [], marketplace: [] };
+  const groups = { custom: [], marketplace: [], private: [] };
   for (const s of filtered) {
+    // Agent-private skills (dev-only, merged in `_mergeAgentPrivateSkills`)
+    // get their own per-owner sections below; never folded into custom.
+    if (s.ownerAgent) { groups.private.push(s); continue; }
     const source = _skillSource(s?.source);
     if (source === 'marketplace') groups.marketplace.push(s);
     else groups.custom.push(s);
@@ -500,9 +931,24 @@ function renderSkillsGrid(skills) {
       </section>
     `;
   };
+  // Dev-only inspection sections — one per owning agent, reusing the same card
+  // and section markup. Empty (so absent) in production: the source IPC is
+  // dev-gated, so `groups.private` is always empty there.
+  let privateHtml = '';
+  if (groups.private.length) {
+    const baseLabel = t('skills.agent_private_group');
+    const byOwner = new Map();
+    for (const s of groups.private) {
+      const owner = s.ownerAgent || '?';
+      if (!byOwner.has(owner)) byOwner.set(owner, []);
+      byOwner.get(owner).push(s);
+    }
+    for (const [owner, list] of byOwner) privateHtml += sectionHtml(`${baseLabel} · ${owner}`, list);
+  }
   gridEl.classList.add('is-sectioned');
   gridEl.innerHTML = sectionHtml(customChipLabel, groups.custom)
     + sectionHtml(marketplaceGroupLabel, groups.marketplace)
+    + privateHtml
     + _openSkillsSectionHtml();
   _wireOpenSkillCards(gridEl);
 
@@ -534,17 +980,110 @@ function renderSkillsGrid(skills) {
   }
 }
 
-/** Read-only section for open-tier skills (external packages + global
- *  folders). Cards have no edit/use/detail affordances; management lives in
- *  the per-card menu. Returns '' when none. */
+function _externalPackageRows(openRows) {
+  const byName = new Map();
+  for (const p of (_packagesCache || [])) {
+    if (!p || !p.name) continue;
+    byName.set(String(p.name), {
+      ...p,
+      display_name: String(p.display_name || p.name),
+      enabled: p.enabled !== false,
+      bin_names: Array.isArray(p.bin_names) ? p.bin_names : [],
+    });
+  }
+  const fallbackCounts = new Map();
+  for (const s of (openRows || [])) {
+    if (!s || s.source !== 'external' || !s.package_name) continue;
+    const packageName = String(s.package_name);
+    fallbackCounts.set(packageName, (fallbackCounts.get(packageName) || 0) + 1);
+    if (!byName.has(packageName)) {
+      byName.set(packageName, {
+        name: packageName,
+        display_name: packageName,
+        kind: s.package_kind || 'skill',
+        enabled: s.package_enabled !== false,
+        skill_count: 0,
+        bin_names: [],
+      });
+    }
+  }
+  for (const [name, count] of fallbackCounts.entries()) {
+    const row = byName.get(name);
+    if (row && !row.skill_count) row.skill_count = count;
+  }
+  return Array.from(byName.values());
+}
+
+function _globalSkillNamespace(row) {
+  const id = String(row && row.id || '').trim().toLowerCase();
+  if (!id) return '';
+  const m = /^([a-z0-9]+)-[a-z0-9]/.exec(id);
+  return m ? m[1] : id;
+}
+
+function _globalSkillGroupLabel(key) {
+  return key || t('skills.global_group');
+}
+
+function _globalSkillGroupRows(key) {
+  return (_openSkillsCache || []).filter((row) => (
+    row
+    && row.source === 'global'
+    && _globalSkillNamespace(row) === key
+  ));
+}
+
+function _globalSkillGroupSummary(group) {
+  const rows = Array.isArray(group?.rows) ? group.rows : [];
+  const names = rows
+    .map((row) => String(row?.name || row?.id || '').trim())
+    .filter(Boolean)
+    .sort((a, b) => _skillNameSortKey({ name: a }).localeCompare(_skillNameSortKey({ name: b })));
+  const lang = String(typeof getLang === 'function' ? getLang() : '').toLowerCase();
+  const cjk = lang.startsWith('zh') || lang.startsWith('ja');
+  const countLabel = t('settings.packages.skills_count', { count: rows.length });
+  const separator = cjk ? '、' : ', ';
+  const colon = cjk ? '：' : ': ';
+  return names.length ? `${countLabel}${colon}${names.join(separator)}` : countLabel;
+}
+
+function _groupGlobalSkills(rows) {
+  const buckets = new Map();
+  for (const row of (rows || [])) {
+    const key = _globalSkillNamespace(row);
+    if (!key) continue;
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(row);
+  }
+  const entries = [];
+  const groupedKeys = new Set();
+  for (const [key, list] of buckets) {
+    if (list.length >= _GLOBAL_SKILL_GROUP_MIN) {
+      groupedKeys.add(key);
+      entries.push({ kind: 'group', key, rows: list });
+    }
+  }
+  for (const row of (rows || [])) {
+    if (!groupedKeys.has(_globalSkillNamespace(row))) entries.push({ kind: 'skill', row });
+  }
+  entries.sort((a, b) => {
+    const an = a.kind === 'group' ? _globalSkillGroupLabel(a.key) : (a.row.name || a.row.id || '');
+    const bn = b.kind === 'group' ? _globalSkillGroupLabel(b.key) : (b.row.name || b.row.id || '');
+    return _skillNameSortKey({ name: an }).localeCompare(_skillNameSortKey({ name: bn }));
+  });
+  return entries;
+}
+
+/** Read-only section for open-tier entries. External packages are package
+ *  cards. Global folders auto-aggregate skills by the prefix before the first
+ *  dash (`lark-*` → `lark`) so machine-shared roots don't become a wall of
+ *  one-card-per-recipe rows. Management lives in per-card menus. Returns ''
+ *  when none. */
 function _openSkillsSectionHtml() {
   const rows = _openSkillsCache || [];
-  const representedPackages = new Set(rows
-    .filter((s) => s.source === 'external' && s.package_name)
-    .map((s) => String(s.package_name)));
-  const packageOnlyRows = (_packagesCache || [])
-    .filter((p) => p && p.name && !representedPackages.has(String(p.name)));
-  if (!rows.length && !packageOnlyRows.length) return '';
+  const externalPackageRows = _externalPackageRows(rows);
+  const globalSkillRows = rows.filter((s) => s.source === 'global');
+  if (!externalPackageRows.length && !globalSkillRows.length) return '';
   const card = (s) => {
     // Same desc treatment as trusted/platform cards (flex:1, 3-line clamp,
     // empty placeholder) so open-tier cards match them in size and pin the
@@ -567,10 +1106,9 @@ function _openSkillsSectionHtml() {
     const moreBtn = `<button type="button" class="skill-card-more" ${moreAttr} title="${moreTitle}" aria-label="${moreTitle}">⋯</button>`;
     const packageAttr = packageName ? ` data-open-package-name="${escapeHtml(packageName)}"` : '';
     const sourceAttr = ` data-open-source="${escapeHtml(s.source || '')}"`;
-    // "Use" runs the skill from a fresh commander chat (useSkill forces the
-    // commander recipient), so it stays within the open-tier commander-only
-    // rule. Disabled when the skill is turned off, mirroring trusted cards.
-    const useBtn = `<button type="button" class="skill-card-use" data-open-use title="${useTitle}" aria-label="${useTitle}" ${enabled ? '' : 'disabled aria-disabled="true" tabindex="-1"'}>${_skillUiIconHtml('play-triangle', 'icon-play')}</button>`;
+    // "Use" selects the skill in the Commander composer. Disabled when the
+    // skill is turned off, mirroring trusted cards.
+    const useBtn = `<button type="button" class="skill-card-use" data-open-use title="${useTitle}" aria-label="${useTitle}" ${enabled ? '' : 'disabled aria-disabled="true" tabindex="-1"'}>${escapeHtml(t('skills.use'))}</button>`;
     return `
       <div class="skill-card is-readonly${enabled ? '' : ' is-disabled'}" data-open-id="${escapeHtml(s.id)}"${sourceAttr}${packageAttr}>
         <div class="skill-card-header">
@@ -586,6 +1124,7 @@ function _openSkillsSectionHtml() {
   };
   const packageCard = (p) => {
     const packageName = String(p.name || '');
+    const packageDisplayName = String(p.display_name || packageName);
     const kindLabel = _packageKindLabel(p.kind);
     const metaBits = [];
     if (kindLabel) metaBits.push(kindLabel);
@@ -598,46 +1137,98 @@ function _openSkillsSectionHtml() {
     return `
       <div class="skill-card is-readonly${p.enabled ? '' : ' is-disabled'}" data-open-package-card="1" data-open-package-name="${escapeHtml(packageName)}">
         <div class="skill-card-header">
-          <span class="skill-card-name">${escapeHtml(packageName)}</span>
+          <span class="skill-card-name">${escapeHtml(packageDisplayName)}</span>
           <button type="button" class="skill-card-more" data-open-package-more title="${moreTitle}" aria-label="${moreTitle}">⋯</button>
         </div>
         ${meta}
+      </div>`;
+  };
+  const globalGroupCard = (group) => {
+    const name = _globalSkillGroupLabel(group.key);
+    const expanded = _expandedGlobalSkillGroups.has(group.key);
+    const enabled = (group.rows || []).some((row) => row.enabled !== false);
+    const label = expanded ? t('skills.global_group_collapse') : t('skills.global_group_expand');
+    const icon = _skillUiIconHtml(expanded ? 'chevron-down' : 'chevron-right', 'skill-card-disclosure-icon');
+    const moreTitle = escapeHtml(t('skills.more_actions'));
+    const summary = _globalSkillGroupSummary(group);
+    return `
+      <div class="skill-card is-readonly${enabled ? '' : ' is-disabled'} skill-card--global-group" data-global-skill-group="${escapeHtml(group.key)}">
+        <div class="skill-card-header">
+          <span class="skill-card-name">${escapeHtml(name)}</span>
+          <button type="button" class="skill-card-more" data-global-skill-group-more="${escapeHtml(group.key)}" title="${moreTitle}" aria-label="${moreTitle}">⋯</button>
+        </div>
+        <div class="skill-card-desc skill-card-desc--global-summary">${escapeHtml(summary)}</div>
+        <div class="skill-card-actions">
+          <button type="button" class="skill-card-disclosure" data-global-skill-group-toggle="${escapeHtml(group.key)}" aria-expanded="${expanded ? 'true' : 'false'}">
+            ${icon}
+            <span>${escapeHtml(label)}</span>
+          </button>
+        </div>
       </div>`;
   };
   // Split external packages and global folders into their own sections so
   // user-installed packages read distinctly from machine-global skill dirs
   // (both are open-tier, but they have different provenance/management). A
   // short hint next to each title explains the provenance to the user.
-  const section = (label, hint, list) => {
+  const globalSection = (list) => {
     if (!list.length) return '';
+    const hint = t('skills.global_group_hint');
     const hintHtml = hint ? `<span class="skills-source-section-hint">${escapeHtml(hint)}</span>` : '';
+    const grouped = _groupGlobalSkills(list);
+    const tiles = [];
+    for (const item of grouped) {
+      if (item.kind === 'skill') {
+        tiles.push(card(item.row));
+        continue;
+      }
+      tiles.push(globalGroupCard(item));
+      if (_expandedGlobalSkillGroups.has(item.key)) {
+        for (const row of item.rows) tiles.push(card(row));
+      }
+    }
     return `
-    <section class="skills-source-section">
+    <section class="skills-source-section skills-source-section--global">
       <div class="skills-source-section-head">
-        <span>${escapeHtml(label)}</span>
+        <span>${escapeHtml(t('skills.global_group'))}</span>
         <span class="skills-source-section-count">${list.length}</span>
         ${hintHtml}
       </div>
-      <div class="skills-source-section-grid">${list.map(card).join('')}</div>
+      <div class="skills-source-section-grid">${tiles.join('')}</div>
     </section>`;
   };
-  const externalSkillRows = rows.filter((s) => s.source === 'external');
-  const externalHtml = (externalSkillRows.length || packageOnlyRows.length)
+  const externalHtml = externalPackageRows.length
     ? `
     <section class="skills-source-section">
       <div class="skills-source-section-head">
         <span>${escapeHtml(t('skills.external_group'))}</span>
-        <span class="skills-source-section-count">${externalSkillRows.length + packageOnlyRows.length}</span>
+        <span class="skills-source-section-count">${externalPackageRows.length}</span>
         <span class="skills-source-section-hint">${escapeHtml(t('skills.external_group_hint'))}</span>
       </div>
-      <div class="skills-source-section-grid">${externalSkillRows.map(card).join('')}${packageOnlyRows.map(packageCard).join('')}</div>
+      <div class="skills-source-section-grid">${externalPackageRows.map(packageCard).join('')}</div>
     </section>`
     : '';
   return externalHtml
-    + section(t('skills.global_group'), t('skills.global_group_hint'), rows.filter((s) => s.source === 'global'));
+    + globalSection(globalSkillRows);
 }
 
 function _wireOpenSkillCards(gridEl) {
+  for (const btn of gridEl.querySelectorAll('[data-global-skill-group-toggle]')) {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const key = btn.dataset.globalSkillGroupToggle || '';
+      if (!key) return;
+      if (_expandedGlobalSkillGroups.has(key)) _expandedGlobalSkillGroups.delete(key);
+      else _expandedGlobalSkillGroups.add(key);
+      renderSkillsList(_skillsCache || []);
+    });
+  }
+  for (const btn of gridEl.querySelectorAll('[data-global-skill-group-more]')) {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const key = btn.dataset.globalSkillGroupMore || '';
+      if (key) _openGlobalSkillGroupMenu(btn, key);
+    });
+  }
   for (const card of gridEl.querySelectorAll('.skill-card[data-open-id], .skill-card[data-open-package-card]')) {
     const id = card.dataset.openId;
     const source = card.dataset.openSource || '';
@@ -663,9 +1254,11 @@ function _wireOpenSkillCards(gridEl) {
         const packageName = card.dataset.openPackageName || '';
         const pkg = (_packagesCache || []).find((p) => String(p.name || '') === packageName);
         if (pkg) {
+          const packageDisplayName = String(pkg.display_name || packageName);
           _openExternalPackageMenu(packageOnlyMenuBtn, {
             id: packageName,
             package_name: packageName,
+            package_display_name: packageDisplayName,
             package_kind: pkg.kind,
             package_enabled: pkg.enabled !== false,
             enabled: pkg.enabled !== false,
@@ -701,6 +1294,33 @@ async function _setOpenSkillEnabled(id, nextEnabled) {
     renderSkillsList(_skillsCache || []);
     return true;
   } catch {
+    await uiAlert(t('component.toggle_failed'));
+    return false;
+  }
+}
+
+async function _setGlobalSkillGroupEnabled(key, nextEnabled) {
+  const rows = _globalSkillGroupRows(key);
+  const targetIds = new Set(rows
+    .filter((row) => (row.enabled !== false) !== nextEnabled)
+    .map((row) => row.id));
+  if (!targetIds.size) return true;
+  try {
+    const results = await Promise.allSettled(Array.from(targetIds).map((id) => (
+      window.orkas.invoke('skills.setEnabled', { id, enabled: nextEnabled })
+    )));
+    if (results.some((res) => res.status === 'rejected' || !res.value || !res.value.ok)) {
+      await loadSkills(true);
+      await uiAlert(t('component.toggle_failed'));
+      return false;
+    }
+    for (const row of (_openSkillsCache || [])) {
+      if (targetIds.has(row.id)) row.enabled = nextEnabled;
+    }
+    renderSkillsList(_skillsCache || []);
+    return true;
+  } catch {
+    await loadSkills(true);
     await uiAlert(t('component.toggle_failed'));
     return false;
   }
@@ -749,6 +1369,7 @@ function _clearSkillCardBusy(card) {
 function _openExternalPackageMenu(anchorBtn, row) {
   const packageName = String(row?.package_name || '');
   if (!packageName) return;
+  const packageDisplayName = String(row?.package_display_name || packageName);
   const card = anchorBtn.closest('.skill-card');
   let menu = document.getElementById('skill-row-menu');
   if (!menu) {
@@ -782,37 +1403,110 @@ function _openExternalPackageMenu(anchorBtn, row) {
       const action = item.dataset.action;
       _closeSkillRowMenu();
       if (action === 'update-package') {
-        await _runOpenPackageAction('update', packageName, card);
+        await _runOpenPackageAction('update', packageName, card, packageDisplayName);
       } else if (action === 'toggle-package') {
-        await _runOpenPackageAction(packageEnabled ? 'disable' : 'enable', packageName, card);
+        await _runOpenPackageAction(packageEnabled ? 'disable' : 'enable', packageName, card, packageDisplayName);
       } else if (action === 'remove-package') {
         const ok = await uiConfirmDanger({
-          title: t('settings.packages.remove_title', { name: packageName }),
+          title: t('settings.packages.remove_title', { name: packageDisplayName }),
           message: t('settings.packages.remove_msg'),
           dangerLabel: t('settings.packages.remove'),
         });
-        if (ok) await _runOpenPackageAction('remove', packageName, card);
+        if (ok) await _runOpenPackageAction('remove', packageName, card, packageDisplayName);
       }
     });
   }
 }
 
-async function _runOpenPackageAction(command, packageName, cardEl) {
+function _openGlobalSkillGroupMenu(anchorBtn, key) {
+  const rows = _globalSkillGroupRows(key);
+  if (!rows.length) return;
+  let menu = document.getElementById('skill-row-menu');
+  if (!menu) {
+    menu = document.createElement('div');
+    menu.id = 'skill-row-menu';
+    menu.className = 'skill-row-menu';
+    menu.style.display = 'none';
+    document.body.appendChild(menu);
+  }
+  const sameAnchor = menu.dataset.globalSkillGroup === key
+    && menu.style.display !== 'none';
+  if (sameAnchor) { _closeSkillRowMenu(); return; }
+  _closeSkillRowMenu();
+  menu.dataset.globalSkillGroup = key;
+  menu.dataset.source = 'global-group';
+  const enabled = rows.some((row) => row.enabled !== false);
+  const toggleLabel = enabled ? t('component.disable') : t('component.enable');
+  menu.innerHTML = `<div class="skill-row-menu-item" data-action="toggle-global-group">${escapeHtml(toggleLabel)}</div>`;
+  for (const c of document.querySelectorAll('.skill-card.is-menu-open')) c.classList.remove('is-menu-open');
+  anchorBtn.closest('.skill-card')?.classList.add('is-menu-open');
+  _positionSkillRowMenu(menu, anchorBtn);
+  for (const item of menu.querySelectorAll('.skill-row-menu-item')) {
+    item.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const action = item.dataset.action;
+      _closeSkillRowMenu();
+      if (action === 'toggle-global-group') {
+        await _setGlobalSkillGroupEnabled(key, !enabled);
+      }
+    });
+  }
+}
+
+async function _runOpenPackageAction(command, packageName, cardEl, packageDisplayName) {
   const card = cardEl && cardEl.isConnected ? cardEl : null;
+  const displayName = String(packageDisplayName || packageName);
   if (card) _setSkillCardBusy(card, command);
   const startedAt = Date.now();
+  if (window.Monitor) (() => {})('package_action', { surface: 'skills', command });
   try {
     const res = await window.orkas.invoke('packages.action', { command, name: packageName });
     if (!res || res.ok === false) {
       const errorMessage = (res && res.error) || t('settings.packages.action_failed');
+      if (window.Monitor) {
+        (() => {})('package_action_result', {
+          surface: 'skills',
+          command,
+          result: 'failure',
+          duration_ms: Date.now() - startedAt,
+        });
+        (() => {})('package_action', {
+          surface: 'skills',
+          command,
+          error_type: 'runtime',
+          error_message: errorMessage,
+        });
+      }
       await uiAlert((res && res.error) || t('settings.packages.action_failed'));
       return;
     }
+    if (window.Monitor) {
+      (() => {})('package_action_result', {
+        surface: 'skills',
+        command,
+        result: 'success',
+        duration_ms: Date.now() - startedAt,
+      });
+    }
     if (command === 'update' && typeof uiToast === 'function') {
-      uiToast(t('settings.packages.updated', { name: packageName }), { variant: 'success' });
+      uiToast(t('settings.packages.updated', { name: displayName }), { variant: 'success' });
     }
     await loadSkills(true);
   } catch (err) {
+    if (window.Monitor) {
+      (() => {})('package_action_result', {
+        surface: 'skills',
+        command,
+        result: 'failure',
+        duration_ms: Date.now() - startedAt,
+      });
+      (() => {})('package_action', {
+        surface: 'skills',
+        command,
+        error_type: 'ipc',
+        error_message: (err && err.message) || String(err || 'unknown'),
+      });
+    }
     _skillsLog.warn('package action failed', err);
     await uiAlert(t('settings.packages.action_failed'));
   } finally {
@@ -920,13 +1614,9 @@ async function _showSkillsDetailView(source, id, opts = {}) {
   const body = document.getElementById('skills-detail-body');
   if (body) body.style.minHeight = '';
   await selectSkillFile(source, id, 'SKILL.md', null);
-  // Auto-expand the source view so the file tree is visible alongside the
-  // body content. Creation/import flows skip this on the critical path so
-  // the edit chat opens immediately; they can refresh the tree in the
-  // background after edit mode is active.
-  if (opts.expandSource !== false) {
-    await _ensureSkillsSourceExpanded();
-  }
+  // Every fresh detail entry starts with source visible; the toggle's
+  // collapsed state is local to the current view and is not remembered.
+  if (opts.expandSource !== false) await _ensureSkillsSourceExpanded();
 }
 
 // Switch the detail pane to the "installed as an external package" state.
@@ -1055,10 +1745,10 @@ function _openSkillRowMenu(anchorBtn, id, source) {
     ? (_openSkillsCache || []).find((s) => s.id === id)
     : _skillsCache?.find((s) => s.id === id && s.source === source);
   const enabled = cached ? cached.enabled !== false : true;
-  const canEdit = !isOpenTier && (source === 'custom' );
+  const canEdit = !isOpenTier && (source === 'custom' || (_isSkillPlatformSource(source) && false));
   // Dev-only entry on marketplace items: tag the label so the user knows this isn't a
   // normal user capability (mirrors marketplace.upload's "(dev)" treatment).
-  const editLabelSuffix = '';
+  const editLabelSuffix = (_isSkillPlatformSource(source) && false) ? t('common.dev_suffix') : '';
   const items = [];
   if (canEdit) {
     items.push(`<div class="skill-row-menu-item" data-action="edit">${escapeHtml(t('skills.edit') + editLabelSuffix)}</div>`);
@@ -1117,6 +1807,7 @@ function _closeSkillRowMenu() {
     delete menu.dataset.skillId;
     delete menu.dataset.openSkillId;
     delete menu.dataset.packageName;
+    delete menu.dataset.globalSkillGroup;
     delete menu.dataset.source;
   }
   for (const c of document.querySelectorAll('.skill-card.is-menu-open')) c.classList.remove('is-menu-open');
@@ -1337,7 +2028,7 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   // Order: use (icon) / edit / enable-disable / delete.
   // In edit mode only the "done" button (the relabeled "edit") is
   // shown; everything else hides.
-  const canEditThisSkill = source === 'custom' ;
+  const canEditThisSkill = source === 'custom' || (_isSkillPlatformSource(source) && false);
   const editingThis = _skillEditMode && _skillEditSkillId === id && canEditThisSkill;
   const actions = document.getElementById('skills-detail-actions');
   if (actions) {
@@ -1364,7 +2055,7 @@ async function selectSkillFile(source, id, filepath, nodeEl) {
   // the `description_*:` frontmatter in SKILL.md, not via a separate UI
   // block). In dev mode, marketplace skill names are display metadata only:
   // saving writes SKILL.md frontmatter without renaming the marketplace id dir.
-  const nameEditable = editingThis && (source === 'custom' );
+  const nameEditable = editingThis && (source === 'custom' || (_isSkillPlatformSource(source) && false));
   _toggleSkillNameEditable(nameEl, nameEditable);
   const summarySection = document.getElementById('skills-section-summary');
   if (summarySection) summarySection.style.display = editingThis ? 'none' : '';
@@ -1523,14 +2214,16 @@ function _parseSkillFrontmatterPairs(content) {
 function _renderSkillDetailCategory(skill, source) {
   const section = document.getElementById('skills-section-category');
   const slot = document.getElementById('skills-detail-category');
-  if (!section || !slot) return;
+  if (section) section.style.display = 'none';
+  if (slot) slot.innerHTML = '';
   const isCustom = source === 'custom';
-  section.style.display = isCustom ? '' : 'none';
-  if (!isCustom) { slot.innerHTML = ''; return; }
+  if (!isCustom) return;
+  const sourceEl = document.getElementById('skills-detail-source');
+  if (!sourceEl) return;
   const skillId = skill?.id || _selectedSkill?.id;
-  _mountDetailCategorySelect(slot, {
+  _mountDetailCategorySelect(sourceEl, {
     value: skill?.category || 'general',
-    onChange: async (category) => {
+    onChange: async (category, api) => {
       try {
         const res = await window.orkas.invoke('skills.update', {
           id: skillId,
@@ -1538,15 +2231,18 @@ function _renderSkillDetailCategory(skill, source) {
           skipRename: true,
         });
         if (!res || res.ok === false || !res.skill) {
+          api.setValue(skill?.category || 'general');
           uiAlert((res && res.error) || t('skills.save_failed'));
           return;
         }
+        skill.category = res.skill.category || category || 'general';
         _skillsCache = null;
         await loadSkills(true);
         if (_selectedSkill?.id === skillId) {
           await selectSkillFile('custom', skillId, _selectedSkill.filepath || 'SKILL.md', null);
         }
       } catch (err) {
+        api.setValue(skill?.category || 'general');
         uiAlert((err && err.message) || t('skills.save_failed'));
       }
     },
@@ -1704,8 +2400,8 @@ function _isValidSkillNameCharset(name) {
   return SKILL_NAME_RE.test(name);
 }
 
-function _isEditablePlatformSkill(_skill) {
-  return false;
+function _isEditablePlatformSkill(skill) {
+  return !!skill && _isSkillPlatformSource(skill.source) && false;
 }
 
 function _canEditSelectedSkillName() {
@@ -1892,7 +2588,7 @@ function _updateEditButtonLabel() {
   }
   // Tag the "Edit" label on marketplace skills (dev-only entry); the "Done"
   // branch above stays bare — in edit mode the marker is redundant.
-  const suffix = '';
+  const suffix = (_isSkillPlatformSource(_selectedSkill?.source) && false) ? t('common.dev_suffix') : '';
   btn.textContent = t('skills.edit_btn_edit') + suffix;
 }
 
@@ -1922,7 +2618,8 @@ function _skillAutoSeedHasModelText(autoSeed) {
 async function toggleSkillEditMode(opts = {}) {
   if (!_selectedSkill) return;
   // Marketplace editing is dev-only; lift the source guard accordingly.
-  if (_selectedSkill.source !== 'custom') return;
+  if (_selectedSkill.source !== 'custom'
+      && !(_isSkillPlatformSource(_selectedSkill.source) && false)) return;
   if (_skillEditMode && _skillEditSkillId === _selectedSkill.id) {
     // Abort any in-flight reply so "done" means "stop + exit", not
     // "exit but keep streaming". The chat controller is a singleton;
@@ -2340,6 +3037,69 @@ async function pickSkillImportDir() {
 }
 window.pickSkillImportDir = pickSkillImportDir;
 
+function _skillCreateNow() {
+  if (typeof performance !== 'undefined' && performance && typeof performance.now === 'function') {
+    return performance.now();
+  }
+  return Date.now();
+}
+
+function _skillCreateDuration(startedAt) {
+  return Math.max(0, Math.round(_skillCreateNow() - Number(startedAt || 0)));
+}
+
+function _skillCreatePayload(creationMethod, data) {
+  return Object.assign({ creation_method: creationMethod }, data || {});
+}
+
+function _skillCreateTrackClick(creationMethod, data) {
+  try {
+    const monitor = (typeof window !== 'undefined') ? window.Monitor : null;
+    if (monitor && typeof monitor.click === 'function') {
+      monitor.click('skill_create_submit', _skillCreatePayload(creationMethod, data));
+    }
+  } catch (_) {}
+}
+
+function _skillCreateTrackResult(tracking, result, data) {
+  try {
+    const monitor = (typeof window !== 'undefined') ? window.Monitor : null;
+    if (monitor && typeof monitor.event === 'function') {
+      monitor.event('skill_create_result', _skillCreatePayload(tracking.creationMethod, Object.assign({
+        result,
+        duration_ms: _skillCreateDuration(tracking.startedAt),
+      }, data || {})));
+    }
+  } catch (_) {}
+}
+
+function _skillCreateTrackError(tracking, data) {
+  try {
+    const monitor = (typeof window !== 'undefined') ? window.Monitor : null;
+    if (monitor && typeof monitor.error === 'function') {
+      monitor.error('skill_create', _skillCreatePayload(tracking.creationMethod, data || {}));
+    }
+  } catch (_) {}
+}
+
+function _skillCreateTracking(creationMethod, clickData) {
+  const tracking = {
+    creationMethod,
+    startedAt: _skillCreateNow(),
+  };
+  _skillCreateTrackClick(creationMethod, clickData);
+  return tracking;
+}
+
+function _skillCreateIdFromResponse(data) {
+  return data?.skill?.id || data?.skills?.[0]?.id || '';
+}
+
+function _skillCreateCountFromResponse(data) {
+  if (Array.isArray(data?.skills)) return data.skills.length;
+  return data?.skill ? 1 : 0;
+}
+
 async function saveSkill() {
   if (_skillModalBusy) return;
   const editId = document.getElementById('skill-edit-id').value;
@@ -2379,6 +3139,7 @@ async function _saveSkillManual({ editId, msgEl }) {
     document.getElementById('skill-description').focus();
     return;
   }
+  const tracking = editId ? null : _skillCreateTracking('manual', { category: 'general' });
   try {
     // Create: stamp the marketplace default since the modal has no category picker.
     // Edit: omit category so the on-disk frontmatter value is preserved (LLM-authored
@@ -2399,12 +3160,39 @@ async function _saveSkillManual({ editId, msgEl }) {
     if (!data.ok) {
       msgEl.textContent = data.error || t('skills.save_failed');
       msgEl.className = 'form-msg err';
+      if (tracking) {
+        _skillCreateTrackResult(tracking, 'failure', {
+          category: 'general',
+          error_code: data.code || '',
+        });
+        _skillCreateTrackError(tracking, {
+          category: 'general',
+          error_type: 'api',
+          error_code: data.code || '',
+          error_message: data.error || 'unknown',
+        });
+      }
       return;
     }
+    if (tracking) {
+      _skillCreateTrackResult(tracking, 'success', {
+        skill_id: _skillCreateIdFromResponse(data),
+        skill_count: _skillCreateCountFromResponse(data),
+        category: 'general',
+      });
+    }
     await _afterSkillCreated(data.skill?.id || editId, !editId, null);
-  } catch (_) {
+  } catch (e) {
     msgEl.textContent = t('skills.network_error_plain');
     msgEl.className = 'form-msg err';
+    if (tracking) {
+      _skillCreateTrackResult(tracking, 'failure', { category: 'general' });
+      _skillCreateTrackError(tracking, {
+        category: 'general',
+        error_type: 'network',
+        error_message: e && e.message ? e.message : String(e),
+      });
+    }
   }
 }
 
@@ -2416,6 +3204,7 @@ async function _saveSkillFromUrl({ msgEl }) {
     document.getElementById('skill-url-input').focus();
     return;
   }
+  const tracking = _skillCreateTracking('url');
   try {
     msgEl.textContent = t('skills.saving');
     msgEl.className = 'form-msg';
@@ -2431,17 +3220,34 @@ async function _saveSkillFromUrl({ msgEl }) {
       msgEl.textContent = data.error || t('skills.save_failed');
       msgEl.className = 'form-msg err';
       _setSkillModalBusy(false);
+      _skillCreateTrackResult(tracking, 'failure', {
+        error_code: data.code || '',
+      });
+      _skillCreateTrackError(tracking, {
+        error_type: 'api',
+        error_code: data.code || '',
+        error_message: data.error || 'unknown',
+      });
       return;
     }
-    const createdId = data.skill?.id || data.skills?.[0]?.id;
+    const createdId = _skillCreateIdFromResponse(data);
     const autoSeed = _skillImportAutoSeedFromResponse(data);
     // URL imports start as empty placeholders. If the user backs out before
     // the edit chat authors real content, offer to discard that placeholder.
     _importDraftId = data.skill?.id && _skillAutoSeedHasModelText(autoSeed) ? data.skill.id : null;
+    _skillCreateTrackResult(tracking, 'success', {
+      skill_id: createdId,
+      skill_count: _skillCreateCountFromResponse(data),
+    });
     await _afterSkillCreated(createdId, true, autoSeed);
-  } catch (_) {
+  } catch (e) {
     msgEl.textContent = t('skills.network_error_plain');
     msgEl.className = 'form-msg err';
+    _skillCreateTrackResult(tracking, 'failure');
+    _skillCreateTrackError(tracking, {
+      error_type: 'network',
+      error_message: e && e.message ? e.message : String(e),
+    });
   } finally {
     _setSkillModalBusy(false);
   }
@@ -2454,7 +3260,12 @@ async function _saveSkillFromDir({ msgEl }) {
     msgEl.className = 'form-msg err';
     return;
   }
-  return _saveSkillFromDirWithQuality({ msgEl, srcDir, force: false });
+  return _saveSkillFromDirWithQuality({
+    msgEl,
+    srcDir,
+    force: false,
+    tracking: _skillCreateTracking('dir', { forced: false }),
+  });
 }
 
 function _qualityForceImportLabel() {
@@ -2470,7 +3281,8 @@ function _qualityImportRejectedTitle(name) {
     : tmpl.replace('{name}', name);
 }
 
-async function _saveSkillFromDirWithQuality({ msgEl, srcDir, force }) {
+async function _saveSkillFromDirWithQuality({ msgEl, srcDir, force, tracking }) {
+  tracking = tracking || _skillCreateTracking('dir', { forced: !!force });
   try {
     msgEl.textContent = t('skills.saving');
     msgEl.className = 'form-msg';
@@ -2492,17 +3304,52 @@ async function _saveSkillFromDirWithQuality({ msgEl, srcDir, force }) {
           forceLabel: _qualityForceImportLabel(),
         });
         if (action === 'force') {
-          return await _saveSkillFromDirWithQuality({ msgEl, srcDir, force: true });
+          return await _saveSkillFromDirWithQuality({ msgEl, srcDir, force: true, tracking });
         }
+        _skillCreateTrackResult(tracking, 'blocked', {
+          forced: false,
+          error_code: data.code || 'quality_validation',
+        });
+        _skillCreateTrackError(tracking, {
+          forced: false,
+          error_type: 'validation',
+          error_code: data.code || 'quality_validation',
+          error_message: data.error || 'quality validation failed',
+        });
+        msgEl.textContent = data.error || t('skills.save_failed');
+        msgEl.className = 'form-msg err';
+        return;
       }
       msgEl.textContent = data.error || t('skills.save_failed');
       msgEl.className = 'form-msg err';
+      _skillCreateTrackResult(tracking, 'failure', {
+        forced: !!force,
+        error_code: data.code || '',
+      });
+      _skillCreateTrackError(tracking, {
+        forced: !!force,
+        error_type: data.report ? 'validation' : 'api',
+        error_code: data.code || '',
+        error_message: data.error || 'unknown',
+      });
       return;
     }
-    await _afterSkillCreated(data.skill?.id || data.skills?.[0]?.id, true, _skillImportAutoSeedFromResponse(data));
-  } catch (_) {
+    const createdId = _skillCreateIdFromResponse(data);
+    _skillCreateTrackResult(tracking, 'success', {
+      skill_id: createdId,
+      skill_count: _skillCreateCountFromResponse(data),
+      forced: !!force,
+    });
+    await _afterSkillCreated(createdId, true, _skillImportAutoSeedFromResponse(data));
+  } catch (e) {
     msgEl.textContent = t('skills.network_error_plain');
     msgEl.className = 'form-msg err';
+    _skillCreateTrackResult(tracking, 'failure', { forced: !!force });
+    _skillCreateTrackError(tracking, {
+      forced: !!force,
+      error_type: 'network',
+      error_message: e && e.message ? e.message : String(e),
+    });
   } finally {
     _setSkillModalBusy(false);
   }
@@ -2553,7 +3400,7 @@ function editSelectedSkill() {
 async function deleteSelectedSkill() {
   if (!_selectedSkill) return;
   const src = _selectedSkill.source;
-  if (src !== 'custom') return;
+  if (src !== 'custom' && !(_isSkillPlatformSource(src) && false)) return;
   const sid = _selectedSkill.id;
   const cached = _skillsCache?.find(s => s.id === sid && s.source === src);
   if (!(await uiConfirm(t('skills.delete_confirm', { name: cached?.name || sid })))) return;

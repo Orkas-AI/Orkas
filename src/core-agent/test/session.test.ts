@@ -54,6 +54,51 @@ describe("Session", () => {
     expect(msgs[1].content[0]).toEqual({ type: "image", data: "aGVsbG8=", mediaType: "image/jpeg" });
   });
 
+  it("keeps pending images in the model view until the assistant has seen them", () => {
+    const session = new Session();
+    session.addMessage("user", [
+      { type: "text", text: "please inspect this image" },
+      { type: "image", data: "pending-image", mediaType: "image/png" },
+    ]);
+
+    expect(session.getMessagesForModel()[0].content).toEqual([
+      { type: "text", text: "please inspect this image" },
+      { type: "image", data: "pending-image", mediaType: "image/png" },
+    ]);
+
+    session.addAssistantMessage([{ type: "text", text: "I inspected it." }]);
+
+    expect(session.getMessages()[0].content).toHaveLength(2);
+    expect(session.getMessagesForModel()[0].content).toEqual([
+      { type: "text", text: "please inspect this image" },
+    ]);
+  });
+
+  it("drops old read_file image trailers from later model calls while keeping the file reference", () => {
+    const session = new Session();
+    session.addAssistantMessage([{ type: "tool_use", id: "call-read", name: "read_file", input: { path: "/tmp/frame.png" } }]);
+    session.addToolResult("call-read", '<file path="/tmp/frame.png" kind="image"/> Image loaded.', [
+      { data: "frame-bytes", mediaType: "image/jpeg" },
+    ]);
+
+    let modelMessages = session.getMessagesForModel();
+    expect(modelMessages).toHaveLength(3);
+    expect(modelMessages[2].content[0]).toEqual({ type: "image", data: "frame-bytes", mediaType: "image/jpeg" });
+
+    session.addAssistantMessage([{ type: "tool_use", id: "call-next", name: "bash", input: { command: "echo ok" } }]);
+    modelMessages = session.getMessagesForModel();
+
+    expect(session.getMessages()).toHaveLength(4);
+    expect(session.getMessages()[2].content[0]).toEqual({ type: "image", data: "frame-bytes", mediaType: "image/jpeg" });
+    expect(modelMessages).toHaveLength(3);
+    expect(modelMessages.flatMap((m) => m.content).some((c) => c.type === "image")).toBe(false);
+    expect(modelMessages[1].content[0]).toMatchObject({
+      type: "tool_result",
+      toolUseId: "call-read",
+      content: expect.stringContaining("/tmp/frame.png"),
+    });
+  });
+
   it("trims history to exactly maxHistoryTurns and keeps the newest turns", () => {
     const session = new Session({ maxHistoryTurns: 2 });
     for (let i = 0; i < 4; i++) {

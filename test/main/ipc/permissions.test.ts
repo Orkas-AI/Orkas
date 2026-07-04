@@ -59,34 +59,36 @@ describe('ipc › permissions.* routes', () => {
     const res = await call('permissions.grantLocalExec');
     expect(res.ok).toBe(true);
     expect(res.granted).toBe(true);
+    expect(res.mode).toBe('all_files_auto');
     expect(typeof res.grantedAt).toBe('string');
 
     const after = await call('permissions.getLocalExec');
     expect(after.granted).toBe(true);
   });
 
-  it('permissions.revokeLocalExec clears the flag', async () => {
+  it('permissions.revokeLocalExec maps legacy revoke to the safest mode', async () => {
     await call('permissions.grantLocalExec');
     const res = await call('permissions.revokeLocalExec');
     expect(res.ok).toBe(true);
-    expect(res.granted).toBe(false);
+    expect(res.granted).toBe(true);
+    expect(res.mode).toBe('workspace_approval');
     expect(typeof res.revokedAt).toBe('string');
   });
 
-  it('permissions.getLocalExec returns the mode and defaults to risk_prompt', async () => {
+  it('permissions.getLocalExec returns the mode and defaults to all_files_approval', async () => {
     const res = await call('permissions.getLocalExec');
     expect(res.ok).toBe(true);
-    expect(res.mode).toBe('risk_prompt');
+    expect(res.mode).toBe('all_files_approval');
   });
 
   it('permissions.setLocalExecMode persists a valid mode and is read back', async () => {
-    const res = await call('permissions.setLocalExecMode', { mode: 'allow_all' });
+    const res = await call('permissions.setLocalExecMode', { mode: 'all_files_approval' });
     expect(res.ok).toBe(true);
-    expect(res.mode).toBe('allow_all');
+    expect(res.mode).toBe('all_files_approval');
     expect(res.granted).toBe(true);
 
     const after = await call('permissions.getLocalExec');
-    expect(after.mode).toBe('allow_all');
+    expect(after.mode).toBe('all_files_approval');
   });
 
   it('permissions.setLocalExecMode rejects an invalid mode', async () => {

@@ -58,9 +58,11 @@
   let _menuAnchor = null;  // the ⋯ button that opened it
 
   function _track(action, data) {
+    try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
   }
 
   function _trackError(action, data) {
+    try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
   }
   let _viewerEl = null;
   let _viewerFrame = null;

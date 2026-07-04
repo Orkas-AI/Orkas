@@ -28,6 +28,8 @@ import * as metacognition from './metacognition';
 import { buildTranscript, listAgentGmemberFiles } from './reflection-transcript';
 import { querySignals } from './expert_signals';
 import { buildRunner } from '../model/core-agent/runner';
+import { getLanguage } from './config';
+import { getLocaleMeta } from '../i18n';
 
 const log = createLogger('reflection-orchestrator');
 
@@ -216,7 +218,8 @@ async function realReflectForAgent(uid: string, agentId: string, sinceMs: number
   const ca = await import('#core-agent');
   const comp = metacognition.readContent(agentId, 'competence');
   const strat = metacognition.readContent(agentId, 'strategies');
-  const prompt = ca.buildReviewPrompt(comp.content || '', strat.content || '', transcriptResult.text);
+  const languageName = getLocaleMeta(getLanguage()).llmName;
+  const prompt = ca.buildReviewPrompt(comp.content || '', strat.content || '', transcriptResult.text, languageName);
 
   // `runReflection` swallows provider/LLM/loop errors and returns ''; an
   // empty response is treated as a failed reflection (cooldown not stamped).

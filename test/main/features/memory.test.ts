@@ -80,15 +80,15 @@ describe('memory › saveEntries', () => {
     expect(fs.readFileSync(f, 'utf8')).toBe('a\n§\nb');
   });
 
-  it('deduplicates entries (keeps first)', async () => {
+  it('deduplicates entries (keeps newest)', async () => {
     const mem = await loadMemory();
     const f = path.join(tmpDir, 'dup.md');
     mem.saveEntries(f, [{ text: 'x' }, { text: 'y' }, { text: 'x' }], 10000);
     const entries = mem.loadEntries(f);
-    expect(entries.map(e => e.text)).toEqual(['x', 'y']);
+    expect(entries.map(e => e.text)).toEqual(['y', 'x']);
   });
 
-  it('trims from end when over char limit', async () => {
+  it('trims oldest entries when over char limit', async () => {
     const mem = await loadMemory();
     const f = path.join(tmpDir, 'limit.md');
     // Each entry is 5 chars, separator is 3 chars. "aaaaa\n§\nbbbbb" = 13 chars
@@ -98,7 +98,7 @@ describe('memory › saveEntries', () => {
       { text: 'ccccc' },
     ], 14);
     const entries = mem.loadEntries(f);
-    expect(entries.map(e => e.text)).toEqual(['aaaaa', 'bbbbb']);
+    expect(entries.map(e => e.text)).toEqual(['bbbbb', 'ccccc']);
   });
 
   it('creates parent directories', async () => {
@@ -251,7 +251,7 @@ describe('memory › formatForSystemPrompt', () => {
     mem.addEntry('u1', 'memory', 'fact one');
     mem.addEntry('u1', 'memory', 'fact two');
     const block = mem.formatForSystemPrompt('u1');
-    expect(block).toContain('Notes');
+    expect(block).toContain('Shared project notes');
     expect(block).toContain('fact one');
     expect(block).toContain('fact two');
   });
@@ -270,7 +270,7 @@ describe('memory › formatForSystemPrompt', () => {
     mem.addEntry('u1', 'user', 'prefers terse answers');
     const block = mem.formatForSystemPrompt('u1');
     expect(block).toContain('User profile');
-    expect(block).toContain('Notes');
+    expect(block).toContain('Shared project notes');
     expect(block).toContain('project uses React');
     expect(block).toContain('prefers terse answers');
   });
@@ -470,5 +470,132 @@ describe('memory › user isolation', () => {
 
     expect(mem.listEntries('alice', 'user').entries).toEqual(['data scientist']);
     expect(mem.listEntries('bob', 'user').entries).toEqual(['frontend dev']);
+  });
+});
+
+// ── Per-agent scope (three-tier: user / shared / agent) ─────────────
+
+describe('memory › per-agent scope', () => {
+  it('routes user / shared / agent writes to separate stores that do not bleed', async () => {
+    const mem = await loadMemory();
+    mem.addEntry('u1', 'user', 'replies in Chinese');               // tier: user (global)
+    mem.addEntry('u1', 'memory', 'monorepo: PC/Server/Web/iOS');    // tier: shared (global)
+    mem.addEntry('u1', { agent: 'video-studio' }, 'plan.json is the EDL');
+    mem.addEntry('u1', { agent: 'seo-geo' }, 'Bing token refresh is broken');
+
+    expect(mem.listEntries('u1', 'user').entries).toEqual(['replies in Chinese']);
+    expect(mem.listEntries('u1', 'memory').entries).toEqual(['monorepo: PC/Server/Web/iOS']);
+    // each agent sees ONLY its own domain notes — no cross-agent bleed
+    expect(mem.listEntries('u1', { agent: 'video-studio' }).entries).toEqual(['plan.json is the EDL']);
+    expect(mem.listEntries('u1', { agent: 'seo-geo' }).entries).toEqual(['Bing token refresh is broken']);
+  });
+
+  it('agent stores have their own char budget (a busy agent cannot evict another agent / shared)', async () => {
+    const mem = await loadMemory();
+    const big = 'x'.repeat(mem.AGENT_CHAR_LIMIT);
+    mem.addEntry('u1', { agent: 'video-studio' }, big);
+    mem.addEntry('u1', 'memory', 'shared survives');
+    mem.addEntry('u1', { agent: 'seo-geo' }, 'seo survives');
+    expect(mem.listEntries('u1', 'memory').entries).toEqual(['shared survives']);
+    expect(mem.listEntries('u1', { agent: 'seo-geo' }).entries).toEqual(['seo survives']);
+  });
+
+  it('rejects an agent id that escapes its path segment (sandbox)', async () => {
+    const mem = await loadMemory();
+    expect(() => mem.addEntry('u1', { agent: '../evil' }, 'x')).toThrow(/invalid agent id/);
+    expect(() => mem.addEntry('u1', { agent: 'a/b' }, 'x')).toThrow(/invalid agent id/);
+    expect(() => mem.addEntry('u1', { agent: '' }, 'x')).toThrow(/invalid agent id/);
+  });
+});
+
+describe('memory › formatForSystemPrompt assembly', () => {
+  it('an agent sees user + shared + ONLY its own notes, never another agent\'s', async () => {
+    const mem = await loadMemory();
+    mem.addEntry('u1', 'user', 'replies in Chinese');
+    mem.addEntry('u1', 'memory', 'shared fact');
+    mem.addEntry('u1', { agent: 'video-studio' }, 'video fact');
+    mem.addEntry('u1', { agent: 'seo-geo' }, 'seo fact');
+
+    const vs = mem.formatForSystemPrompt('u1', 'video-studio');
+    expect(vs).toContain('replies in Chinese');
+    expect(vs).toContain('shared fact');
+    expect(vs).toContain('video fact');
+    expect(vs).not.toContain('seo fact');           // cross-agent isolation in the prompt
+  });
+
+  it('merges legacy agent-dir memory with the shared agent memory scope without duplicating text', async () => {
+    const mem = await loadMemory();
+    const legacyFile = path.join(tmpDir, 'u1', 'cloud', 'agents', 'video-studio', 'memory', 'MEMORY.md');
+    const canonicalFile = path.join(tmpDir, 'u1', 'cloud', 'memory', 'agents', 'video-studio', 'MEMORY.md');
+    fs.mkdirSync(path.dirname(legacyFile), { recursive: true });
+    fs.writeFileSync(legacyFile, 'keeps concise endings', 'utf8');
+    mem.addEntry('u1', { agent: 'video-studio' }, 'keeps concise endings');
+    mem.addEntry('u1', { agent: 'video-studio' }, 'checks final artifact paths');
+
+    const block = mem.formatForSystemPrompt('u1', 'video-studio');
+    expect(block.match(/keeps concise endings/g) || []).toHaveLength(1);
+    expect(block).toContain('checks final artifact paths');
+    expect(block).toContain('Your own notes (this agent only)');
+    expect(fs.readFileSync(canonicalFile, 'utf8')).toContain('checks final artifact paths');
+    expect(fs.readFileSync(legacyFile, 'utf8')).toBe('');
+  });
+
+  it('migrates legacy agent memory once and does not keep re-reading the legacy path', async () => {
+    const mem = await loadMemory();
+    const legacyFile = path.join(tmpDir, 'u1', 'cloud', 'agents', 'video-studio', 'memory', 'MEMORY.md');
+    fs.mkdirSync(path.dirname(legacyFile), { recursive: true });
+    fs.writeFileSync(legacyFile, 'legacy-only note', 'utf8');
+
+    expect(mem.formatForSystemPrompt('u1', 'video-studio')).toContain('legacy-only note');
+    expect(fs.readFileSync(legacyFile, 'utf8')).toBe('');
+
+    fs.writeFileSync(legacyFile, 'stale restored legacy note', 'utf8');
+    const block = mem.formatForSystemPrompt('u1', 'video-studio');
+    expect(block).toContain('legacy-only note');
+    expect(block).not.toContain('stale restored legacy note');
+  });
+
+  it('updates and removes migrated legacy agent memory through the canonical store', async () => {
+    const mem = await loadMemory();
+    const legacyFile = path.join(tmpDir, 'u1', 'cloud', 'agents', 'video-studio', 'memory', 'MEMORY.md');
+    const canonicalFile = path.join(tmpDir, 'u1', 'cloud', 'memory', 'agents', 'video-studio', 'MEMORY.md');
+    fs.mkdirSync(path.dirname(legacyFile), { recursive: true });
+    fs.writeFileSync(legacyFile, 'old preference', 'utf8');
+
+    const updated = mem.replaceAgentEntry('u1', 'video-studio', 'old preference', 'new preference');
+    expect(updated.ok).toBe(true);
+    expect(updated.entries).toEqual(['new preference']);
+    expect(fs.readFileSync(canonicalFile, 'utf8')).toContain('new preference');
+    expect(fs.readFileSync(legacyFile, 'utf8')).toBe('');
+
+    const removed = mem.removeAgentEntry('u1', 'video-studio', 'new preference');
+    expect(removed.ok).toBe(true);
+    expect(removed.entries).toEqual([]);
+    expect(mem.formatForSystemPrompt('u1', 'video-studio')).toBe('');
+  });
+
+  it('no agentId (e.g. commander with empty scope) → user + shared only', async () => {
+    const mem = await loadMemory();
+    mem.addEntry('u1', 'user', 'profile note');
+    mem.addEntry('u1', 'memory', 'shared note');
+    mem.addEntry('u1', { agent: 'video-studio' }, 'video fact');
+    const block = mem.formatForSystemPrompt('u1');
+    expect(block).toContain('profile note');
+    expect(block).toContain('shared note');
+    expect(block).not.toContain('video fact');
+  });
+
+  it('returns empty string when the user + shared + agent stores are all empty', async () => {
+    const mem = await loadMemory();
+    expect(mem.formatForSystemPrompt('u1', 'video-studio')).toBe('');
+  });
+
+  it('migration: a pre-existing global MEMORY.md reads as the shared tier (zero data move)', async () => {
+    const mem = await loadMemory();
+    // simulate the legacy single global store written before this feature
+    mem.addEntry('u1', 'memory', 'legacy global note');
+    const vs = mem.formatForSystemPrompt('u1', 'newly-added-agent');
+    expect(vs).toContain('legacy global note');                     // surfaces as shared
+    expect(mem.listEntries('u1', { agent: 'newly-added-agent' }).entries).toEqual([]); // agent starts empty
   });
 });

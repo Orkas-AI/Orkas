@@ -93,7 +93,45 @@ async function refreshModelConfigSnapshot() {
   }
 }
 
-function trackModelConfigSnapshot() {}
+function trackModelConfigSnapshot(entries) {
+  try {
+    if (!window.Monitor || typeof Monitor.event !== 'function') return;
+    const safeEntries = (Array.isArray(entries) ? entries : [])
+      .map((entry, idx) => {
+        const provider = String((entry && entry.provider) || '').trim();
+        const model = String((entry && entry.model) || '').trim();
+        if (!provider || !model) return null;
+        return {
+          provider: provider.slice(0, 80),
+          model: model.slice(0, 120),
+          entry_rank: idx + 1,
+        };
+      })
+      .filter(Boolean);
+    const uid = (typeof globalThis.currentUserId === 'string') ? globalThis.currentUserId : '';
+    const signature = uid + '|' + safeEntries
+      .map((entry) => entry.provider + '/' + entry.model + '#' + entry.entry_rank)
+      .join('|');
+    if (signature === _modelConfigSnapshotSignature) return;
+    _modelConfigSnapshotSignature = signature;
+
+    const snapshotId = String(Date.now()) + '-' + Math.random().toString(36).slice(2, 8);
+    Monitor.event('model_config_snapshot', {
+      snapshot_id: snapshotId,
+      entry_count: safeEntries.length,
+    });
+    safeEntries.forEach((entry) => {
+      Monitor.event('model_config_entry', {
+        snapshot_id: snapshotId,
+        provider: entry.provider,
+        model: entry.model,
+        entry_rank: entry.entry_rank,
+      });
+    });
+  } catch (err) {
+    _guardLog.warn('model config snapshot telemetry failed', { error: (err && err.message) || String(err) });
+  }
+}
 
 function isModelConfigured() {
   return _hasConfiguredModel;

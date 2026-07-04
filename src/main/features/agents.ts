@@ -23,7 +23,7 @@ import type { AgentTool } from '#core-agent';
 
 import {
   userAgentsDir, userSkillsDir, userAgentChatDir, userSessionFile, WS_ROOT,
-  agentDir, agentDefinitionFile,
+  agentDir, agentDefinitionFile, agentRuntimeStatsFile,
   userMarketplaceAgentsDir, userMarketplaceAgentDir, userMarketplaceSkillsDir,
   userAgentRuntimeConfigFile, chatAttachmentDir,
 } from '../paths';
@@ -34,6 +34,13 @@ import { t, buildLanguageDirective, descriptionLang } from '../i18n';
 import { getLanguage } from './config';
 import { getWorkspacePath } from './user_workspace';
 import { buildAttachmentManifest } from './chat_attachments';
+import { addAgentEntry, listAgentEntries, removeAgentEntry, replaceAgentEntry } from './memory';
+import {
+  normalizeAgentRuntimeStatsFile,
+  recordAgentRuntimeStatsForDevice,
+  type AgentRuntimeStatsBucket,
+} from './agent_runtime_stats';
+import { getCurrentDevice } from '../util/device';
 
 const log = createLogger('agents');
 
@@ -64,10 +71,12 @@ import {
   DEFAULT_MARKETPLACE_CATEGORY_CODE,
   normalizeMarketplaceCategoryCode,
 } from './marketplace_biz';
+import { normalizeInstallVersion } from './marketplace_installs';
 import { NAME_DISPLAY_MAX_UNITS, nameDisplayWidth } from '../util/name-limit';
 
 export type AgentSource = 'marketplace' | 'custom';
 type AgentSourceInput = AgentSource | 'builtin';
+export type AgentPrioritySource = 'builtin' | 'platform' | 'custom';
 
 export type AgentInputType = 'text' | 'textarea' | 'select' | 'multiselect' | 'number' | 'boolean' | 'file' | 'directory';
 
@@ -107,6 +116,58 @@ export interface AgentInput {
   accept?: string;
 }
 
+export interface AgentProfileEntry {
+  title: string;
+  description?: string;
+  tool?: string;
+  source?: string;
+  scope?: string;
+  updated_at?: string;
+  kept?: boolean;
+}
+
+export interface AgentProfileStat {
+  key: string;
+  value: string | number;
+  unit?: string;
+  label?: string;
+}
+
+export interface AgentProfileRecent {
+  title: string;
+  when?: string;
+  project?: string;
+}
+
+export interface AgentProfileScope {
+  accepts?: string[];
+  rejects?: string[];
+}
+
+/** Structured, display-facing profile for richer agents. Old agents can omit
+ *  it entirely and still render from description/workflow/skills. New specs
+ *  persist knowhow / standards as top-level fields; `profile` is the
+ *  normalized read shape consumed by UI/runtime. */
+export interface AgentProfile {
+  role?: string;
+  dispatch?: string;
+  knowhow?: string[];
+  standards?: string[];
+  /** Legacy/read-only compatibility. New authoring must use top-level
+   *  `workflow` markdown instead of profile.workflow. */
+  workflow?: AgentProfileEntry[];
+  scope?: AgentProfileScope;
+  stats?: AgentProfileStat[];
+  recent?: AgentProfileRecent[];
+  /** Display-only memory assembled from the per-agent memory store on read.
+   *  New authoring must not generate agent.json profile.memory. */
+  memory?: AgentProfileEntry[];
+  assets?: string[];
+  serving?: string[];
+}
+
+export type AgentRuntimeStats = AgentRuntimeStatsBucket;
+
 export interface Agent {
   agent_id: string;
   name: string;
@@ -121,12 +182,12 @@ export interface Agent {
    * agents stay stable without a migration pass. */
   icon?: string;
   color?: string;
-  /** Skill ids this agent declares it needs. Three-state:
-   *   - undefined / field missing → no filter (inject every skill)
-   *   - []                        → explicitly zero skills
-   *   - string[] non-empty        → inject only these skill ids
-   * Maintained exclusively by the agent-edit LLM via the `<skills>` child
-   * of the `<agent>` container. Not exposed in the UI. */
+  /** Skill ids/names this agent declares as workflow dependencies.
+   * Runtime group-chat agents use this as an upper bound, then inject only
+   * dependencies also named in `workflow`. Undefined means no upper bound;
+   * [] means explicit zero skills.
+   * Maintained exclusively by the agent-edit LLM via the `<skills>` child of
+   * the `<agent>` container. Not exposed in the UI. */
   skill_list?: string[];
   /** User-facing input schema. Three-state:
    *   - undefined / field missing → agent needs no up-front confirmation
@@ -142,6 +203,13 @@ export interface Agent {
    * to manually @-mention every reply. Maintained by the agent-edit LLM
    * via the `<interactive>` child of `<agent>`; missing = false. */
   interactive?: boolean;
+  /** Rich display profile for "AI employee" style agents. This is optional
+   *  compatibility data: marketplace/new agents can provide it explicitly,
+   *  while legacy agents keep using description/workflow. */
+  profile?: AgentProfile;
+  /** Runtime-derived counters. Stored outside agent.json so the definition is
+   *  not rewritten on every dispatch; merged into list/detail reads. */
+  runtime_stats?: AgentRuntimeStats;
   /** Execution backend. Missing / `kind === 'in_process'` (the default)
    *  means the agent runs through `core-agent` like every existing
    *  agent. `kind === 'cli'` routes the worker turn through
@@ -154,11 +222,10 @@ export interface Agent {
   /** Marketplace category code. Empty string only for legacy/manual specs.
    *  Maintained by hidden create defaults and by the agent-edit LLM's `<category>` sub-tag. */
   category: string;
-  /** Connector instance ids this agent is allowed to call. Three-state intentionally **diverges**
-   *  from `skill_list`: `undefined` and `[]` both mean "no connectors" (collapsed to empty), only
-   *  `string[]` non-empty grants access. Why stricter than skill_list's "undefined = no filter":
-   *  connectors carry external side effects (sending emails, editing remote docs); a brand-new
-   *  agent must opt in explicitly. Maintained by the agent edit UI, NOT by the agent-edit LLM. */
+  /** Connector instance ids previously selected for this agent. Runtime
+   *  group-chat agents now share the commander's connector visibility; this is
+   *  retained as UI/compatibility metadata. Maintained by the agent edit UI,
+   *  NOT by the agent-edit LLM. */
   enabled_connectors?: string[];
   /** Output rendering preference — agent-level hint injected into the worker
    *  system prompt at dispatch time. Four user-facing values, progressive
@@ -199,10 +266,15 @@ export interface Agent {
   is_open_source?: boolean;
   /** Marketplace review lifecycle status mirrored from marketplace metadata. */
   status?: string;
+  /** Install provenance for marketplace-root agents. `builtin` means the
+   *  packaged fallback copy, which wins conflict arbitration over platform
+   *  marketplace installs and custom agents. */
+  seed_source?: string;
 }
 
 export interface AgentRaw {
   agent_id?: string;
+  _v?: unknown;
   name?: string;
   description?: string;
   description_zh?: string;
@@ -221,6 +293,21 @@ export interface AgentRaw {
   state?: unknown;
   enabled_connectors?: unknown;
   output_format?: unknown;
+  profile?: unknown;
+  role?: unknown;
+  dispatch?: unknown;
+  knowhow?: unknown;
+  standards?: unknown;
+  flow?: unknown;
+  workflow_steps?: unknown;
+  doYes?: unknown;
+  doNo?: unknown;
+  stats?: unknown;
+  runtime_stats?: unknown;
+  recent?: unknown;
+  memory?: unknown;
+  assets?: unknown;
+  serving?: unknown;
 }
 
 /** Agent output rendering preference. Four user-facing values
@@ -266,15 +353,30 @@ function _applyMarketplaceInstallMeta(agent: Agent, dir: string): void {
     if (!fs.existsSync(metaFile)) return;
     const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'));
     if (!meta || typeof meta !== 'object') return;
-    if (typeof meta.version === 'string') agent.version = meta.version;
+    agent.version = normalizeInstallVersion(meta.version);
     if (typeof meta.published_at === 'number') agent.marketplace_published_at = meta.published_at;
     if (typeof meta.updated_at === 'number') agent.marketplace_updated_at = meta.updated_at;
     if (typeof meta.default_install === 'boolean') agent.default_install = meta.default_install;
     if (typeof meta.is_open_source === 'boolean') agent.is_open_source = meta.is_open_source;
     if (typeof meta.status === 'string') agent.status = meta.status;
     else if (typeof meta.state === 'string') agent.status = meta.state;
+    if (typeof meta.seed_source === 'string') agent.seed_source = meta.seed_source;
   } catch (err) {
     log.warn(`marketplace agent install metadata unreadable dir=${dir}: ${(err as Error).message}`);
+  }
+}
+
+export function agentPrioritySource(agent: Pick<Agent, 'source' | 'seed_source'>): AgentPrioritySource {
+  if (agent.source === 'custom') return 'custom';
+  return agent.seed_source === 'builtin' ? 'builtin' : 'platform';
+}
+
+export function agentPriorityRank(agent: Pick<Agent, 'source' | 'seed_source'>): number {
+  switch (agentPrioritySource(agent)) {
+    case 'builtin': return 0;
+    case 'platform': return 1;
+    case 'custom': return 2;
+    default: return 99;
   }
 }
 
@@ -520,6 +622,216 @@ export function validateAgentInputs(raw: unknown): AgentInput[] {
   return out;
 }
 
+function _plainObj(v: unknown): Record<string, unknown> | null {
+  return v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : null;
+}
+
+function _cleanProfileString(v: unknown, max = 320): string {
+  if (typeof v !== 'string' && typeof v !== 'number') return '';
+  const text = String(v).replace(/\s+/g, ' ').trim();
+  return text.length > max ? text.slice(0, max) : text;
+}
+
+function _firstProfileString(obj: Record<string, unknown>, keys: string[], max = 320): string {
+  for (const k of keys) {
+    const v = _cleanProfileString(obj[k], max);
+    if (v) return v;
+  }
+  return '';
+}
+
+function _profileStringList(raw: unknown, limit = 16, max = 160): string[] | undefined {
+  const arr = Array.isArray(raw) ? raw : [];
+  const out: string[] = [];
+  for (const item of arr) {
+    const text = _cleanProfileString(item, max);
+    if (!text) continue;
+    out.push(text);
+    if (out.length >= limit) break;
+  }
+  return out.length ? out : undefined;
+}
+
+function _profileEntries(raw: unknown, limit = 16): AgentProfileEntry[] | undefined {
+  const input = Array.isArray(raw)
+    ? raw
+    : (_plainObj(raw)
+        ? Object.entries(raw as Record<string, unknown>).map(([key, value]) => {
+            const obj = _plainObj(value);
+            return obj ? { title: key, ...obj } : { title: key, description: value };
+          })
+        : []);
+  const out: AgentProfileEntry[] = [];
+  for (const item of input) {
+    if (typeof item === 'string' || typeof item === 'number') {
+      const title = _cleanProfileString(item, 220);
+      if (title) out.push({ title });
+    } else {
+      const obj = _plainObj(item);
+      if (!obj) continue;
+      const title = _firstProfileString(obj, ['title', 't', 'name', 'n', 'label', 'k'], 220);
+      const description = _firstProfileString(obj, ['description', 'd', 'summary', 'detail', 'body'], 520);
+      if (!title && !description) continue;
+      const entry: AgentProfileEntry = { title: title || description };
+      if (description && description !== entry.title) entry.description = description;
+      const tool = _firstProfileString(obj, ['tool', 'skill', 'action'], 120);
+      const source = _firstProfileString(obj, ['source', 'from'], 160);
+      const scope = _firstProfileString(obj, ['scope', 'visibility'], 120);
+      const updatedAt = _firstProfileString(obj, ['updated_at', 'updatedAt', 'when'], 80);
+      if (tool) entry.tool = tool;
+      if (source) entry.source = source;
+      if (scope) entry.scope = scope;
+      if (updatedAt) entry.updated_at = updatedAt;
+      if (obj.kept === false || obj.enabled === false) entry.kept = false;
+      out.push(entry);
+    }
+    if (out.length >= limit) break;
+  }
+  return out.length ? out : undefined;
+}
+
+function _profileTextList(raw: unknown, limit = 16, max = 220): string[] | undefined {
+  const input = Array.isArray(raw)
+    ? raw
+    : (_plainObj(raw) ? Object.entries(raw as Record<string, unknown>).map(([key, value]) => {
+        const obj = _plainObj(value);
+        if (!obj) return value ?? key;
+        return obj.title ?? obj.name ?? obj.t ?? obj.label ?? obj.description ?? obj.d ?? key;
+      }) : []);
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of input) {
+    let text = _cleanProfileString(item, max);
+    if (!text) {
+      const obj = _plainObj(item);
+      if (!obj || obj.kept === false || obj.enabled === false) continue;
+      text = _firstProfileString(obj, ['title', 't', 'name', 'n', 'label', 'k', 'description', 'd', 'summary', 'detail', 'body'], max);
+    }
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    out.push(text);
+    if (out.length >= limit) break;
+  }
+  return out.length ? out : undefined;
+}
+
+function _profileStats(raw: unknown, limit = 8): AgentProfileStat[] | undefined {
+  const arr = Array.isArray(raw) ? raw : [];
+  const out: AgentProfileStat[] = [];
+  for (const item of arr) {
+    const obj = _plainObj(item);
+    if (!obj) continue;
+    const key = _firstProfileString(obj, ['key', 'k', 'label', 'title'], 80);
+    const rawValue = obj.value ?? obj.v ?? obj.count;
+    const value = (typeof rawValue === 'number' && Number.isFinite(rawValue))
+      ? rawValue
+      : _cleanProfileString(rawValue, 80);
+    if (!key || value === '') continue;
+    const stat: AgentProfileStat = { key, value };
+    const unit = _firstProfileString(obj, ['unit', 'u'], 32);
+    const label = _firstProfileString(obj, ['label'], 80);
+    if (unit) stat.unit = unit;
+    if (label && label !== key) stat.label = label;
+    out.push(stat);
+    if (out.length >= limit) break;
+  }
+  return out.length ? out : undefined;
+}
+
+function _profileRecent(raw: unknown, limit = 8): AgentProfileRecent[] | undefined {
+  const arr = Array.isArray(raw) ? raw : [];
+  const out: AgentProfileRecent[] = [];
+  for (const item of arr) {
+    const obj = _plainObj(item);
+    if (!obj) continue;
+    const title = _firstProfileString(obj, ['title', 't', 'name'], 220);
+    if (!title) continue;
+    const recent: AgentProfileRecent = { title };
+    const when = _firstProfileString(obj, ['when', 'time', 'updated_at', 'updatedAt'], 80);
+    const project = _firstProfileString(obj, ['project', 'proj'], 140);
+    if (when) recent.when = when;
+    if (project) recent.project = project;
+    out.push(recent);
+    if (out.length >= limit) break;
+  }
+  return out.length ? out : undefined;
+}
+
+function _profileValue(profile: Record<string, unknown>, raw: Record<string, unknown>, keys: string[]): unknown {
+  for (const k of keys) {
+    if (Object.prototype.hasOwnProperty.call(profile, k)) return profile[k];
+  }
+  for (const k of keys) {
+    if (Object.prototype.hasOwnProperty.call(raw, k)) return raw[k];
+  }
+  return undefined;
+}
+
+function normalizeAgentProfile(raw: AgentRaw | null | undefined): AgentProfile | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const outer = raw as Record<string, unknown>;
+  const embedded = _plainObj(raw.profile) || {};
+  const profile: AgentProfile = {};
+
+  const role = _cleanProfileString(_profileValue(embedded, outer, ['role']), 140);
+  const dispatch = _cleanProfileString(_profileValue(embedded, outer, ['dispatch']), 520);
+  if (role) profile.role = role;
+  if (dispatch) profile.dispatch = dispatch;
+
+  const knowhow = _profileTextList(
+    Object.prototype.hasOwnProperty.call(outer, 'knowhow') ? outer.knowhow : embedded.knowhow,
+    16,
+  );
+  const standards = _profileTextList(
+    Object.prototype.hasOwnProperty.call(outer, 'standards') ? outer.standards : embedded.standards,
+    16,
+  );
+  if (knowhow) profile.knowhow = knowhow;
+  if (standards) profile.standards = standards;
+
+  const scopeObj = _plainObj(embedded.scope) || {};
+  const accepts = _profileStringList(
+    scopeObj.accepts ?? scopeObj.accept ?? embedded.doYes ?? outer.doYes,
+    16,
+  );
+  const rejects = _profileStringList(
+    scopeObj.rejects ?? scopeObj.reject ?? embedded.doNo ?? outer.doNo,
+    16,
+  );
+  if (accepts || rejects) {
+    profile.scope = {};
+    if (accepts) profile.scope.accepts = accepts;
+    if (rejects) profile.scope.rejects = rejects;
+  }
+
+  const stats = _profileStats(_profileValue(embedded, outer, ['stats']), 8);
+  const recent = _profileRecent(_profileValue(embedded, outer, ['recent']), 8);
+  const assets = _profileStringList(_profileValue(embedded, outer, ['assets']), 12);
+  const serving = _profileStringList(_profileValue(embedded, outer, ['serving']), 12);
+  if (stats) profile.stats = stats;
+  if (recent) profile.recent = recent;
+  if (assets) profile.assets = assets;
+  if (serving) profile.serving = serving;
+
+  return Object.keys(profile).length ? profile : undefined;
+}
+
+function normalizeAgentRuntimeStats(raw: unknown): AgentRuntimeStats | undefined {
+  const stats = normalizeAgentRuntimeStatsFile(raw);
+  return (
+    stats.attempts
+    || stats.successes
+    || stats.deliveries
+    || stats.failures
+    || stats.errors
+    || stats.total_duration_ms
+    || stats.successful_duration_ms
+    || stats.updated_at
+  )
+    ? stats
+    : undefined;
+}
+
 export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSourceInput): Agent | null {
   if (!raw || typeof raw !== 'object' || !raw.agent_id) return null;
   // Migrate legacy single-`description` into the matching language slot.
@@ -546,10 +858,13 @@ export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSo
     // it is never persisted.
     enabled: true,
   };
-  // skill_list is three-state: undefined = no filter, [] = zero skills,
-  // string[] = the explicit subset. Anything else (string, object, null)
-  // is treated as "unset" so we don't accidentally zero out skills on
-  // malformed JSON.
+  const profile = normalizeAgentProfile(raw);
+  if (profile) agent.profile = profile;
+  const runtimeStats = normalizeAgentRuntimeStats(raw.runtime_stats);
+  if (runtimeStats) agent.runtime_stats = runtimeStats;
+  // skill_list is authoring metadata / compatibility state. Anything else
+  // (string, object, null) is treated as "unset" so malformed JSON does not
+  // produce misleading dependency metadata.
   if (Array.isArray(raw.skill_list)) {
     agent.skill_list = raw.skill_list.filter(
       (v): v is string => typeof v === 'string' && safeId(v),
@@ -564,9 +879,9 @@ export function normalizeAgent(raw: AgentRaw | null | undefined, source: AgentSo
   }
   if (avatars.isKnownIcon(raw.icon)) agent.icon = raw.icon;
   if (avatars.isKnownColor(raw.color)) agent.color = raw.color;
-  // enabled_connectors: only `string[]` carries through; missing / null / non-array all collapse
-  // to "no connectors" (the field stays absent on the Agent object, which the runner treats as
-  // empty). Filtering to safeId-ish strings keeps a malformed JSON from injecting weird ids.
+  // enabled_connectors is UI/compatibility metadata. Runtime group-chat agents
+  // share the commander's connector visibility; filtering keeps malformed JSON
+  // from injecting weird ids into the detail UI.
   if (Array.isArray(raw.enabled_connectors)) {
     const filtered = raw.enabled_connectors.filter((v): v is string => typeof v === 'string' && v.length > 0);
     if (filtered.length) agent.enabled_connectors = filtered;
@@ -773,7 +1088,16 @@ let _agentListCache: AgentListCache | null = null;
 
 function _invalidateAgentListCache(opts: { markDirty?: boolean } = {}): void {
   _agentListCache = null;
-  void opts;
+  if (opts.markDirty === false) return;
+  // Notify the sync engine (lazy-require — stripped in the open-source build builds). Every cache-invalidate
+  // is also a disk-mutation point, so co-locating the dirty signal here covers all the
+  // existing call sites without sprinkling sync calls across the file. The relPath here is
+  // informational only — the engine ignores it and walks `cloud/` itself.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
+    sync?.markDirty?.('agents', 'cloud/agents');
+  } catch { /* features/sync stripped */ }
 }
 
 /** Public re-export of `_invalidateAgentListCache` for cross-module callers (sync engine).
@@ -819,7 +1143,7 @@ export async function listAgents(): Promise<Agent[]> {
   } else {
     specs = [];
     const seen = new Set<string>();
-    const sources: Array<[AgentSource, string]> = [['custom', CUSTOM_AGENTS_DIR()], ['marketplace', userMarketplaceAgentsDir(getActiveUserId())]];
+    const sources: Array<[AgentSource, string]> = [['marketplace', userMarketplaceAgentsDir(getActiveUserId())], ['custom', CUSTOM_AGENTS_DIR()]];
     for (const [source, dir] of sources) {
       if (!fs.existsSync(dir)) continue;
       const entries = (await fsp.readdir(dir, { withFileTypes: true }))
@@ -832,19 +1156,19 @@ export async function listAgents(): Promise<Agent[]> {
         try { data = await readJson<AgentRaw>(full); } catch { continue; }
         const norm = normalizeAgent(data, source);
         if (!norm) continue;
-        if (seen.has(norm.agent_id)) {
-          if (isMarketplaceSource(source)) {
-            log.warn(`id conflict: custom and marketplace both define "${norm.agent_id}" — custom wins, rename one`);
-          }
-          continue;
-        }
-        seen.add(norm.agent_id);
         if (isMarketplaceSource(source)) {
           // Marketplace-installed agents carry `_install.json` with version + freshness.
           // Author uid may also be present there for install/reconcile compatibility, but the
           // global UI intentionally does not surface it.
           _applyMarketplaceInstallMeta(norm, path.join(dir, e.name));
         }
+        if (seen.has(norm.agent_id)) {
+          if (source === 'custom') {
+            log.warn(`id conflict: marketplace and custom both define "${norm.agent_id}" — marketplace wins, rename one`);
+          }
+          continue;
+        }
+        seen.add(norm.agent_id);
         specs.push(norm);
       }
     }
@@ -857,16 +1181,18 @@ export async function listAgents(): Promise<Agent[]> {
   const displaySkillSpecs = await _skillSpecsForDisplay();
   return specs
     .map((a) => ({ ...a, enabled: !disabledAgentIds.has(a.agent_id) }))
-    .map((a) => _withDisplaySkillRefs(a, displaySkillSpecs));
+    .map((a) => _withDisplaySkillRefs(a, displaySkillSpecs))
+    .map((a) => _withAgentMemoryEntries(getActiveUserId(), a))
+    .map((a) => _withAgentRuntimeStats(getActiveUserId(), a));
 }
 
 /**
- * Look up an agent by id. Custom wins on name collision.
+ * Look up an agent by id. Marketplace/builtin wins on id collision.
  * Returns normalized agent or null.
  */
 export async function getAgent(agentId: string | null | undefined): Promise<Agent | null> {
   if (!agentId) return null;
-  for (const source of ['custom', 'marketplace'] as AgentSource[]) {
+  for (const source of ['marketplace', 'custom'] as AgentSource[]) {
     const f = isMarketplaceSource(source)
       ? _platformAgentSpecFile(agentId)
       : agentDefinitionFile(getActiveUserId(), agentId);
@@ -880,7 +1206,10 @@ export async function getAgent(agentId: string | null | undefined): Promise<Agen
         }
         const { agents: disabledAgentIds } = readDisabledSets(getActiveUserId());
         norm.enabled = !disabledAgentIds.has(norm.agent_id);
-        return _withDisplaySkillRefs(norm, await _skillSpecsForDisplay());
+        return _withAgentRuntimeStats(
+          getActiveUserId(),
+          _withAgentMemoryEntries(getActiveUserId(), _withDisplaySkillRefs(norm, await _skillSpecsForDisplay())),
+        );
       }
     } catch { /* ignore */ }
   }
@@ -909,6 +1238,11 @@ export interface CreateAgentOptions {
   icon?: string;
   color?: string;
   interactive?: boolean;
+  /** Optional structured display profile. Legacy callers omit this and keep
+   *  the old description/workflow-only shape. */
+  profile?: AgentProfile;
+  knowhow?: string[];
+  standards?: string[];
   /** Picked at create time from the modal's runtime selector. Stored as
    *  authored — `normalizeAgent` validates on read. */
   runtime?: AgentRuntime;
@@ -958,13 +1292,64 @@ function _withDisplaySkillRefs(agent: Agent, specs: SkillAllowlistRef[]): Agent 
   return workflow === agent.workflow ? agent : { ...agent, workflow };
 }
 
+function _withAgentMemoryEntries(userId: string, agent: Agent): Agent {
+  if (!agent.agent_id) return agent;
+  if (isCliAgent(agent)) return agent;
+  const res = listAgentEntries(userId, agent.agent_id);
+  const fileEntries = res.entries || [];
+  if (!fileEntries.length) return agent;
+  const existing = agent.profile?.memory || [];
+  const seen = new Set(existing.map((entry) => (entry.title || entry.description || '').trim()).filter(Boolean));
+  const memory = [...existing];
+  for (const text of fileEntries) {
+    const trimmed = String(text || '').trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    memory.push({ title: trimmed, source: 'agent_memory' });
+  }
+  return {
+    ...agent,
+    profile: {
+      ...(agent.profile || {}),
+      memory,
+    },
+  };
+}
+
+function _agentMemoryUnsupportedResult(error: string) {
+  return { ok: false, error, entries: [], usage: { current: 0, limit: 0, entries_current: 0, entries_limit: 0 } };
+}
+
+function _agentMemoryNotSupportedForExternalResult() {
+  return _agentMemoryUnsupportedResult('agent memory is not supported for external CLI agents');
+}
+
+function _readAgentRuntimeStats(userId: string, agentId: string): AgentRuntimeStats | undefined {
+  if (!safeId(agentId)) return undefined;
+  try {
+    const raw = JSON.parse(fs.readFileSync(agentRuntimeStatsFile(userId, agentId), 'utf8'));
+    return normalizeAgentRuntimeStats(raw);
+  } catch {
+    return undefined;
+  }
+}
+
+function _withAgentRuntimeStats(userId: string, agent: Agent): Agent {
+  const runtimeStats = _readAgentRuntimeStats(userId, agent.agent_id);
+  return runtimeStats ? { ...agent, runtime_stats: runtimeStats } : agent;
+}
+
+function bumpAgentSpecRevision(data: AgentRaw): void {
+  data._v = (Number(data._v) || 0) + 1;
+}
+
 /**
  * Create a custom agent. The call shape keeps historical optional fields, but
  * the quality gate requires a usable name plus at least one description variant
  * before the spec is written.
  */
 export async function createCustomAgent(
-  { name = '', description = '', description_zh, description_en, workflow = '', icon, color, interactive, runtime, category, output_format }: CreateAgentOptions = {},
+  { name = '', description = '', description_zh, description_en, workflow = '', icon, color, interactive, profile, knowhow, standards, runtime, category, output_format }: CreateAgentOptions = {},
 ): Promise<Agent | null> {
   assertAgentNameAllowed(name);
   await assertAgentNameUnique(String(name || '').trim());
@@ -985,6 +1370,7 @@ export async function createCustomAgent(
     workflow: normalizedWorkflow,
     created_at: nowIso(),
     updated_at: nowIso(),
+    _v: 1,
     status: 'approved',
   };
   // Only emit `category` to disk when supplied; empty string is omitted so existing agents
@@ -997,6 +1383,9 @@ export async function createCustomAgent(
   if (avatars.isKnownIcon(icon)) data.icon = icon;
   if (avatars.isKnownColor(color)) data.color = color;
   if (typeof interactive === 'boolean') data.interactive = interactive;
+  const cleanProfile = normalizeAgentProfile({ profile, knowhow, standards });
+  if (cleanProfile?.knowhow) data.knowhow = cleanProfile.knowhow;
+  if (cleanProfile?.standards) data.standards = cleanProfile.standards;
   // Persist `output_format` only when the caller supplied a non-auto value the
   // enum recognizes. Auto is the implicit default, so leaving it off keeps
   // agent specs clean while dispatch still injects automatic layout rules.
@@ -1077,7 +1466,7 @@ export interface UpdateAgentFields {
   color?: string;
   /** Three-way update:
    *   array → replace (filtered through `safeId`)
-   *   null  → drop the field (revert to "no filter")
+   *   null  → drop the dependency metadata
    *   omitted → untouched */
   skill_list?: string[] | null;
   /** Three-way update mirror of `skill_list`:
@@ -1090,6 +1479,15 @@ export interface UpdateAgentFields {
    *   null  → drop the field (revert to "missing" = false at read time)
    *   omitted → untouched */
   interactive?: boolean | null;
+  /** Legacy compatibility input:
+   *   object → extract knowhow / standards into top-level fields
+   *   null   → drop legacy profile plus top-level knowhow / standards
+   *   omitted → untouched */
+  profile?: AgentProfile | null;
+  /** Three-way update for display capabilities. Stored as top-level agent.json
+   *  fields; `profile` is only a legacy compatibility input. */
+  knowhow?: string[] | null;
+  standards?: string[] | null;
   /** Three-way update:
    *   AgentRuntime → replace (validated; in_process collapses to "drop")
    *   null         → drop runtime (revert to in_process default)
@@ -1104,7 +1502,8 @@ export interface UpdateAgentFields {
    *   array (possibly empty) → replace (filtered to non-empty strings)
    *   null  → drop the field
    *   omitted → untouched
-   *  Authored by the agent edit UI (connectors toggle list), NOT the agent-edit LLM. */
+   *  UI/compatibility metadata authored by the agent edit UI, NOT the
+   *  agent-edit LLM. */
   enabled_connectors?: string[] | null;
   /** Three-way update:
    *   OutputFormat string → set (one of the constrained enum values)
@@ -1158,6 +1557,53 @@ export async function updateCustomAgent(
  *  `updateCustomAgent` and the dev-mode built-in update path so the field
  *  semantics stay identical regardless of source. Throws on reserved-name
  *  collision (matches existing custom behavior). */
+function _stripEmbeddedProfileKeys(data: AgentRaw, keys: string[]): void {
+  const embedded = _plainObj(data.profile);
+  if (!embedded) return;
+  let changed = false;
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(embedded, key)) {
+      delete embedded[key];
+      changed = true;
+    }
+  }
+  if (!changed) return;
+  if (Object.keys(embedded).length) data.profile = embedded;
+  else delete data.profile;
+}
+
+function _setAgentTextListField(
+  data: AgentRaw,
+  key: 'knowhow' | 'standards',
+  value: string[] | null | undefined,
+): void {
+  _stripEmbeddedProfileKeys(data, [key]);
+  if (value === null) {
+    delete (data as Record<string, unknown>)[key];
+    return;
+  }
+  if (Array.isArray(value)) {
+    const clean = _profileTextList(value, 16);
+    if (clean) (data as Record<string, unknown>)[key] = clean;
+    else delete (data as Record<string, unknown>)[key];
+  }
+}
+
+function _applyLegacyProfileUpdate(data: AgentRaw, value: AgentProfile | null | undefined): void {
+  _stripEmbeddedProfileKeys(data, ['knowhow', 'standards', 'workflow', 'flow', 'workflow_steps', 'memory']);
+  if (value === null) {
+    delete data.profile;
+    delete (data as Record<string, unknown>).knowhow;
+    delete (data as Record<string, unknown>).standards;
+    return;
+  }
+  const cleanProfile = normalizeAgentProfile({ profile: value });
+  if (cleanProfile?.knowhow) data.knowhow = cleanProfile.knowhow;
+  else delete data.knowhow;
+  if (cleanProfile?.standards) data.standards = cleanProfile.standards;
+  else delete data.standards;
+}
+
 async function _applyAgentUpdates(
   data: AgentRaw, agentId: string, updates: UpdateAgentFields,
 ): Promise<void> {
@@ -1181,6 +1627,9 @@ async function _applyAgentUpdates(
   if (effectiveCli) {
     if ('workflow' in (updates || {})) delete (updates as any).workflow;
     if ('skill_list' in (updates || {})) delete (updates as any).skill_list;
+    if ('profile' in (updates || {})) delete (updates as any).profile;
+    if ('knowhow' in (updates || {})) delete (updates as any).knowhow;
+    if ('standards' in (updates || {})) delete (updates as any).standards;
   }
   for (const k of ['name', 'workflow'] as const) {
     if (Object.prototype.hasOwnProperty.call(updates || {}, k)) {
@@ -1236,7 +1685,10 @@ async function _applyAgentUpdates(
       delete data.skill_list;
     } else if (Array.isArray(v)) {
       const raw = v.filter((x) => typeof x === 'string' && safeId(x));
-      const specs = await listSkillSpecsForAgentMetadata(getActiveUserId());
+      // Scope metadata to this agent while preserving enabled external-package
+      // refs, so another agent's private (`ownerAgent`) skill resolves as
+      // unknown and gets dropped.
+      const specs = await listSkillSpecsForAgentMetadata(getActiveUserId(), { forAgentId: agentId });
       const { ids, unknown } = resolveSkillAllowlistRefs(specs, raw);
       if (unknown.length) {
         log.warn(`agent ${agentId}: unknown skills dropped: ${unknown.join(',')}`);
@@ -1291,6 +1743,15 @@ async function _applyAgentUpdates(
       data.interactive = v;
     }
   }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'profile')) {
+    _applyLegacyProfileUpdate(data, updates.profile);
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'knowhow')) {
+    _setAgentTextListField(data, 'knowhow', updates.knowhow);
+  }
+  if (Object.prototype.hasOwnProperty.call(updates || {}, 'standards')) {
+    _setAgentTextListField(data, 'standards', updates.standards);
+  }
   // category: explicit empty-string drops the field; any non-empty string is normalized to a
   // safe code shape. Candidate membership is prompt-time dynamic, not a static backend list.
   if (Object.prototype.hasOwnProperty.call(updates || {}, 'category')) {
@@ -1337,17 +1798,23 @@ async function _applyAgentUpdates(
     else delete data.inputs;
   }
   if (!data.name) data.name = t('agent.default_name');
+  bumpAgentSpecRevision(data);
   data.updated_at = nowIso();
 }
 
-/** Edit-chat dispatcher: routes to custom write for custom agents. Platform
- *  and marketplace agents are read-only in the open-source build. */
+/** Edit-chat dispatcher: routes to custom write for custom agents, and to
+ *  the dev-only built-in dual-write (src + data) for built-in agents in
+ *  dev mode. Returns null if the id resolves to neither, or if a built-in
+ *  write is attempted outside dev mode. */
 export async function updateAgentSpec(
   agentId: string, updates: UpdateAgentFields,
 ): Promise<Agent | null> {
   if (!agentId) return null;
   if (fs.existsSync(customAgentFile(agentId))) {
     return updateCustomAgent(agentId, updates);
+  }
+  if (fs.existsSync(_platformAgentSpecFile(agentId))) {
+    return null;
   }
   return null;
 }
@@ -1369,14 +1836,14 @@ export async function _applyAgentUpdatesAndInvalidate(
 }
 
 /**
- * Append a single skill id to the agent's skill_list. Skips the unknown-id
- * filter `updateCustomAgent` does — System B (self-evolution `SkillStore`)
- * skills live in a different directory from System A (`SkillLoader`) and
- * would be dropped.
+ * Append a single learned skill id to the agent's skill_list metadata. Skips
+ * the unknown-id filter `updateCustomAgent` does — System B (self-evolution
+ * `SkillStore`) skills live in a different directory from System A
+ * (`SkillLoader`) and would be dropped.
  *
  * No-op when:
  *   - agent missing / is builtin
- *   - agent.skill_list is undefined (unrestricted — agent already sees all)
+ *   - agent.skill_list is undefined (no explicit dependency list to extend)
  *   - skillId is already in the list
  */
 export async function appendAgentSkill(agentId: string, skillId: string): Promise<boolean> {
@@ -1387,11 +1854,88 @@ export async function appendAgentSkill(agentId: string, skillId: string): Promis
   if (!Array.isArray(data.skill_list)) return false;
   if (data.skill_list.includes(skillId)) return false;
   data.skill_list = [...data.skill_list, skillId];
+  bumpAgentSpecRevision(data);
   data.updated_at = nowIso();
   await writeJson(f, data);
   _invalidateAgentListCache();
   log.info(`appended skill "${skillId}" to agent ${agentId}.skill_list`);
   return true;
+}
+
+export async function addCustomAgentMemory(agentId: string, content: string) {
+  if (!agentId || !safeId(agentId)) return { ok: false, error: 'invalid agent_id', entries: [], usage: { current: 0, limit: 0 } };
+  const f = customAgentFile(agentId);
+  if (!fs.existsSync(f)) return { ok: false, error: 'agent not found or read-only', entries: [], usage: { current: 0, limit: 0 } };
+  const data = await readJson<AgentRaw>(f);
+  if (_normalizeRuntime(data.runtime)?.kind === 'cli') return _agentMemoryNotSupportedForExternalResult();
+  const res = addAgentEntry(getActiveUserId(), agentId, content);
+  if (res.ok) _invalidateAgentListCache();
+  return res;
+}
+
+export async function removeCustomAgentMemory(agentId: string, oldText: string) {
+  if (!agentId || !safeId(agentId)) return { ok: false, error: 'invalid agent_id', entries: [], usage: { current: 0, limit: 0 } };
+  const f = customAgentFile(agentId);
+  if (!fs.existsSync(f)) return { ok: false, error: 'agent not found or read-only', entries: [], usage: { current: 0, limit: 0 } };
+  const data = await readJson<AgentRaw>(f);
+  if (_normalizeRuntime(data.runtime)?.kind === 'cli') return _agentMemoryNotSupportedForExternalResult();
+
+  const fileRes = removeAgentEntry(getActiveUserId(), agentId, oldText);
+  if (fileRes.ok) {
+    _invalidateAgentListCache();
+    return fileRes;
+  }
+
+  const profile = normalizeAgentProfile(data);
+  const memory = profile?.memory || [];
+  const needle = String(oldText || '').trim();
+  const nextMemory = memory.filter((entry) => {
+    const text = `${entry.title || ''}\n${entry.description || ''}`.trim();
+    return !needle || !text.includes(needle);
+  });
+  if (nextMemory.length === memory.length) return fileRes;
+
+  const rawProfile = _plainObj((data as any).profile) || {};
+  if (nextMemory.length) {
+    (data as any).profile = { ...rawProfile, memory: nextMemory };
+  } else {
+    const { memory: _removed, ...rest } = rawProfile;
+    if (Object.keys(rest).length) (data as any).profile = rest;
+    else delete (data as any).profile;
+  }
+  bumpAgentSpecRevision(data);
+  data.updated_at = nowIso();
+  await writeJson(f, data);
+  _invalidateAgentListCache();
+  return listAgentEntries(getActiveUserId(), agentId);
+}
+
+export async function updateCustomAgentMemory(agentId: string, oldText: string, content: string) {
+  if (!agentId || !safeId(agentId)) return { ok: false, error: 'invalid agent_id', entries: [], usage: { current: 0, limit: 0 } };
+  const f = customAgentFile(agentId);
+  if (!fs.existsSync(f)) return { ok: false, error: 'agent not found or read-only', entries: [], usage: { current: 0, limit: 0 } };
+  const data = await readJson<AgentRaw>(f);
+  if (_normalizeRuntime(data.runtime)?.kind === 'cli') return _agentMemoryNotSupportedForExternalResult();
+  const res = replaceAgentEntry(getActiveUserId(), agentId, oldText, content);
+  if (res.ok) _invalidateAgentListCache();
+  return res;
+}
+
+export async function recordAgentRuntimeStats(
+  agentId: string,
+  result: { duration_ms?: unknown; durationMs?: unknown; success?: unknown; aborted?: unknown; errored?: unknown; status?: unknown } = {},
+): Promise<{ ok: boolean; error?: string; stats?: AgentRuntimeStats }> {
+  if (!agentId || !safeId(agentId)) return { ok: false, error: 'invalid agent_id' };
+  const agent = await getAgent(agentId);
+  if (!agent) return { ok: false, error: 'agent not found' };
+
+  const userId = getActiveUserId();
+  const raw = await readJson(agentRuntimeStatsFile(userId, agentId));
+  const device = getCurrentDevice();
+  const statsFile = recordAgentRuntimeStatsForDevice(raw, device.id || device.name, result, nowIso());
+  await writeJson(agentRuntimeStatsFile(userId, agentId), statsFile);
+  _invalidateAgentListCache();
+  return { ok: true, stats: normalizeAgentRuntimeStats(statsFile) };
 }
 
 export async function deleteCustomAgent(agentId: string): Promise<boolean> {
@@ -1468,6 +2012,10 @@ export interface ExtractedFields {
   description_zh?: string;
   description_en?: string;
   workflow?: string;
+  /** Parsed from independent `<knowhow>` / `<standards>` line lists.
+   *  JSON arrays and legacy `<profile>` remain accepted for compatibility. */
+  knowhow?: string[];
+  standards?: string[];
   /** Parsed from `<skills>` inside `<agent>`. Empty tag body → `[]` (explicit
    * zero). Absent tag → key omitted (leave `skill_list` untouched). */
   skill_list?: string[];
@@ -1514,6 +2062,56 @@ function _parseAgentBlock(inner: string): ExtractedFields {
   if (wfM) {
     const v = wfM[1].trim();
     if (v) fields.workflow = v;
+  }
+  const profileM = inner.match(AGENT_CHILD_RE('profile'));
+  if (profileM) {
+    const trimmed = profileM[1].trim();
+    if (trimmed) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        const profile = normalizeAgentProfile({ profile: parsed });
+        if (profile?.knowhow) fields.knowhow = profile.knowhow;
+        if (profile?.standards) fields.standards = profile.standards;
+      } catch (err) {
+        log.warn(`<profile> JSON parse failed: ${(err as Error).message}`);
+      }
+    }
+  }
+  const parseTextListBody = (body: string, tag: 'knowhow' | 'standards'): string[] | undefined => {
+    const trimmed = body.trim();
+    if (trimmed === '' || trimmed === '[]') return [];
+    if (/^[\[{]/.test(trimmed)) {
+      try {
+        return _profileTextList(JSON.parse(trimmed), 16);
+      } catch (err) {
+        log.warn(`<${tag}> JSON parse failed: ${(err as Error).message}`);
+        return undefined;
+      }
+    }
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const rawLine of body.split(/\r?\n/)) {
+      const line = rawLine.replace(/^\s*(?:[-*•]|\d+[.)])\s+/, '');
+      const text = _cleanProfileString(line, 220);
+      if (!text || seen.has(text)) continue;
+      seen.add(text);
+      out.push(text);
+      if (out.length >= 16) break;
+    }
+    return out.length ? out : undefined;
+  };
+
+  const knowhowM = inner.match(AGENT_CHILD_RE('knowhow'));
+  if (knowhowM) {
+    const knowhow = parseTextListBody(knowhowM[1], 'knowhow');
+    if (knowhow) fields.knowhow = knowhow;
+    else if (knowhowM[1].trim() === '' || knowhowM[1].trim() === '[]') fields.knowhow = [];
+  }
+  const standardsM = inner.match(AGENT_CHILD_RE('standards'));
+  if (standardsM) {
+    const standards = parseTextListBody(standardsM[1], 'standards');
+    if (standards) fields.standards = standards;
+    else if (standardsM[1].trim() === '' || standardsM[1].trim() === '[]') fields.standards = [];
   }
   const skM = inner.match(AGENT_CHILD_RE('skills'));
   if (skM) {
@@ -1628,8 +2226,10 @@ async function _appendAgentChatMessage(userId: string, agentId: string, record: 
 
 export async function clearAgentChat(userId: string, agentId: string): Promise<boolean> {
   const agent = await getAgent(agentId);
+  // Custom agents always allow clearing; built-in chat dirs only exist when
+  // dev mode has been editing them — allow clearing those too.
   if (!agent) return false;
-  if (agent.source !== 'custom') return false;
+  if (agent.source !== 'custom' && !false) return false;
   for (const p of [agentChatMsgsPath(userId, agentId), agentChatMetaPath(userId, agentId)]) {
     if (fs.existsSync(p)) {
       try { await fsp.unlink(p); }
@@ -1656,8 +2256,8 @@ export async function clearAgentChat(userId: string, agentId: string): Promise<b
 /**
  * Build the system prompt for the agent-edit chat. Includes the current
  * agent fields so the LLM always sees up-to-date state — re-run every turn.
- * The skill list is NOT embedded here; core-agent's SkillLoader appends it
- * to the final system prompt.
+ * Includes knowhow / standards / inputs / skill metadata so the editor can
+ * preserve and complete the richer agent structure.
  */
 export function buildAgentEditSystemPrompt(agent: {
   name?: string;
@@ -1666,6 +2266,11 @@ export function buildAgentEditSystemPrompt(agent: {
   description_zh?: string;
   description_en?: string;
   workflow?: string;
+  skill_list?: string[];
+  inputs?: AgentInput[];
+  profile?: AgentProfile;
+  knowhow?: string[];
+  standards?: string[];
   category?: string;
   interactive?: boolean;
   /** When the agent is CLI-backed, switch to `chat_agent_setup_cli.md`
@@ -1686,6 +2291,15 @@ export function buildAgentEditSystemPrompt(agent: {
   // template doesn't reference `$workflow` (workflow is hidden for CLI
   // agents) but does reference the runtime cli + model so the LLM can
   // talk concretely about which CLI it is.
+  const profile = normalizeAgentProfile({
+    profile: agent.profile,
+    knowhow: agent.knowhow,
+    standards: agent.standards,
+  });
+  const knowhowText = profile?.knowhow?.length ? profile.knowhow.join('\n') : '(not provided)';
+  const standardsText = profile?.standards?.length ? profile.standards.join('\n') : '(not provided)';
+  const inputsJson = Array.isArray(agent.inputs) ? JSON.stringify(agent.inputs, null, 2) : '(not provided)';
+  const skillsText = Array.isArray(agent.skill_list) ? agent.skill_list.join('\n') : '(not provided)';
   const body = isCli
     ? prompts.load('chat_agent_setup_cli', {
         // Runtime cli + model are deliberately NOT passed: the LLM is
@@ -1695,6 +2309,8 @@ export function buildAgentEditSystemPrompt(agent: {
         name: agent.name || '',
         description_zh: zh || '(not provided)',
         description_en: en || '(not provided)',
+        inputs_json: inputsJson,
+        category: agent.category || '(not provided)',
         interactive: agent.interactive === true ? 'true' : 'false',
       })
     : prompts.load('chat_agent_setup', {
@@ -1703,6 +2319,11 @@ export function buildAgentEditSystemPrompt(agent: {
         description_zh: zh || '(not provided)',
         description_en: en || '(not provided)',
         workflow: (agent.workflow || '').trim() || '(not provided)',
+        skills: skillsText || '(not provided)',
+        inputs_json: inputsJson,
+        knowhow_text: knowhowText,
+        standards_text: standardsText,
+        category: agent.category || '(not provided)',
         interactive: agent.interactive === true ? 'true' : 'false',
       });
   const tail = buildLanguageDirective(getLanguage());
@@ -1730,18 +2351,28 @@ async function buildAgentEditMessageWithAttachments(
   images: Array<{ data: string; mediaType: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' }>;
   attachmentNames: string[];
   attachmentCid: string;
+  attachmentMetadata: { hasAttachments: boolean; attachmentTypes: string[] };
 }> {
   const attachmentNames = Array.isArray(attachments)
     ? attachments.filter((n): n is string => typeof n === 'string' && !!n.trim())
     : [];
   const attachmentCid = agentEditAttachmentCid(agentId);
-  if (!attachmentNames.length) return { message: content, images: [], attachmentNames, attachmentCid };
-  const { manifest, images } = await buildAttachmentManifest(userId, attachmentCid, attachmentNames);
+  if (!attachmentNames.length) {
+    return {
+      message: content,
+      images: [],
+      attachmentNames,
+      attachmentCid,
+      attachmentMetadata: { hasAttachments: false, attachmentTypes: [] },
+    };
+  }
+  const { manifest, images, metadata } = await buildAttachmentManifest(userId, attachmentCid, attachmentNames);
   return {
     message: manifest ? `${manifest}\n${content}` : content,
     images,
     attachmentNames,
     attachmentCid,
+    attachmentMetadata: metadata,
   };
 }
 
@@ -1762,8 +2393,8 @@ function buildAgentEditSkillSearchTool(uid: string): AgentTool {
     description: [
       'Find skills contributed by the user\'s global skill folders when the listed skills do not cover the agent being authored.',
       'Returns each match\'s name, source, and SKILL.md path; read_file that path before referencing the skill in an agent workflow.',
-      'Matching is keyword-based over names + descriptions, which may be English. If a user-language query returns nothing, retry once with English keywords before concluding none exist.',
-      'This does not search the marketplace catalog and installs nothing.',
+      'Matching is keyword-based over names + descriptions, which may be English — if a user-language query returns nothing, retry once with English keywords before concluding none exist.',
+      'This does NOT search the marketplace catalog and installs nothing.',
     ].join(' '),
     inputSchema: {
       type: 'object',
@@ -1819,7 +2450,7 @@ export async function sendToAgentEditChat(
 ): Promise<AgentEditResult> {
   const agent = await getAgent(agentId);
   if (!agent) return { ok: false, error: 'agent not found' };
-  if (agent.source !== 'custom') {
+  if (agent.source !== 'custom' && !false) {
     return { ok: false, error: t('errors.builtin_agent_not_editable') };
   }
 
@@ -1852,6 +2483,7 @@ export async function sendToAgentEditChat(
     agentName: 'orkas_chat', timeout: 300,
     readOnlyExtraRoots: readOnlyRoots,
     extraTools: agentEditExtraTools(userId),
+    attachmentMetadata: attachmentCtx.attachmentMetadata,
     ...(attachmentCtx.attachmentNames.length ? { images: attachmentCtx.images } : {}),
   });
 
@@ -1890,7 +2522,7 @@ export async function* streamSendToAgentEditChat(
     yield { type: 'done' };
     return;
   }
-  if (agent.source !== 'custom') {
+  if (agent.source !== 'custom' && !false) {
     yield { type: 'error', text: t('errors.builtin_agent_not_editable') };
     yield { type: 'done' };
     return;
@@ -1932,6 +2564,7 @@ export async function* streamSendToAgentEditChat(
       cacheRetention: 'short',
       readOnlyExtraRoots: readOnlyRoots,
       extraTools: agentEditExtraTools(userId),
+      attachmentMetadata: attachmentCtx.attachmentMetadata,
       ...(attachmentCtx.images.length ? { images: attachmentCtx.images } : {}),
       ...(opts.abortSignal ? { abortSignal: opts.abortSignal } : {}),
     }) as AsyncIterable<any>) {
@@ -1956,6 +2589,12 @@ export async function* streamSendToAgentEditChat(
             if (fields[k] !== undefined) {
               synthesizedProgress.push(t('process.agent.update_field', { field: k }));
             }
+          }
+          if (fields.knowhow !== undefined) {
+            synthesizedProgress.push(t('process.agent.update_field', { field: 'knowhow' }));
+          }
+          if (fields.standards !== undefined) {
+            synthesizedProgress.push(t('process.agent.update_field', { field: 'standards' }));
           }
           // Collapse description / description_zh / description_en into one
           // user-facing progress event — the user sees "description updated"
@@ -2071,6 +2710,8 @@ export async function createAgentFromBlocks(fields: ExtractedFields): Promise<Ag
 
   const created = await createCustomAgent({
     name, description, description_zh, description_en, workflow, category,
+    ...(fields.knowhow ? { knowhow: fields.knowhow } : {}),
+    ...(fields.standards ? { standards: fields.standards } : {}),
     ...(typeof fields.interactive === 'boolean' ? { interactive: fields.interactive } : {}),
   });
   if (!created) return null;
@@ -2079,6 +2720,8 @@ export async function createAgentFromBlocks(fields: ExtractedFields): Promise<Ag
   const updates: UpdateAgentFields = {};
   if (Array.isArray(fields.skill_list)) updates.skill_list = fields.skill_list;
   if (Array.isArray(fields.inputs)) updates.inputs = fields.inputs;
+  if (Array.isArray(fields.knowhow)) updates.knowhow = fields.knowhow;
+  if (Array.isArray(fields.standards)) updates.standards = fields.standards;
   if (Object.keys(updates).length) {
     const updated = await updateCustomAgent(created.agent_id, updates);
     return updated || created;

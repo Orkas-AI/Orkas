@@ -22,6 +22,12 @@ describe('i18n › detectSystemLang', () => {
     }
   });
 
+  it('maps pt* locales to Brazilian Portuguese', () => {
+    for (const v of ['pt', 'pt-BR', 'pt_BR', 'PT-br']) {
+      expect(detectSystemLang(v)).toBe('pt');
+    }
+  });
+
   it('falls back to en for non-supported / malformed / empty', () => {
     for (const v of ['en-US', 'fr', '', null, undefined, 42]) {
       expect(detectSystemLang(v)).toBe('en');
@@ -34,6 +40,7 @@ describe('i18n › isLang', () => {
     expect(isLang('zh')).toBe(true);
     expect(isLang('en')).toBe(true);
     expect(isLang('ja')).toBe(true);
+    expect(isLang('pt')).toBe(true);
     expect(isLang('ZH')).toBe(false);
     expect(isLang('fr')).toBe(false);
     expect(isLang('')).toBe(false);
@@ -49,6 +56,8 @@ describe('i18n › t() lookup', () => {
     expect(t('errors.not_utf8')).toBe('Text files must be UTF-8 encoded');
     setCurrentLang('ja');
     expect(t('errors.not_utf8')).toBe('テキストファイルは UTF-8 エンコードである必要があります');
+    setCurrentLang('pt');
+    expect(t('errors.not_utf8')).toBe('Os arquivos de texto devem ser codificados em UTF-8');
   });
 
   it('falls back to en when key missing in current lang', () => {
@@ -88,6 +97,7 @@ describe('i18n › t() lookup', () => {
     setCurrentLang('en');
     expect(t('errors.not_utf8', undefined, 'zh')).toBe('文本类文件必须是 UTF-8 编码');
     expect(t('errors.not_utf8', undefined, 'ja')).toBe('テキストファイルは UTF-8 エンコードである必要があります');
+    expect(t('errors.not_utf8', undefined, 'pt')).toBe('Os arquivos de texto devem ser codificados em UTF-8');
     expect(getCurrentLang()).toBe('en'); // override does not mutate state
   });
 });
@@ -97,6 +107,7 @@ describe('i18n › descriptionLang', () => {
     expect(descriptionLang('zh')).toBe('zh');
     expect(descriptionLang('en')).toBe('en');
     expect(descriptionLang('ja')).toBe('en');
+    expect(descriptionLang('pt')).toBe('en');
   });
 });
 
@@ -104,5 +115,6 @@ describe('i18n › acceptLanguageHeader', () => {
   it('prefers the active UI locale for HTTP language negotiation', () => {
     expect(acceptLanguageHeader('ja').startsWith('ja-JP')).toBe(true);
     expect(acceptLanguageHeader('zh').startsWith('zh-CN')).toBe(true);
+    expect(acceptLanguageHeader('pt').startsWith('pt-BR')).toBe(true);
   });
 });

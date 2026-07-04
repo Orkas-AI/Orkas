@@ -33,8 +33,8 @@ function normalizeDescription(value: string | undefined): string {
  *
  * De-duplication: when the same skill id appears in multiple dirs, the
  * FIRST occurrence wins. Put higher-priority roots earlier — for example,
- * Orkas passes `[customDir, marketplaceDir]` so user overrides beat platform
- * installs.
+ * Orkas passes `[marketplaceDir, customDir]` so builtin/platform installs
+ * beat custom skills on id conflicts.
  *
  * No skill bodies are loaded here — only frontmatter. Callers that need the
  * body read `spec.skillFile` themselves. This keeps list() cheap enough to
@@ -151,6 +151,9 @@ export class SkillLoader {
     const sidecarDescriptions = sidecar.descriptions || {};
     const sidecarZh = normalizeDescription(sidecarDescriptions.zh || sidecar.description_zh);
     const sidecarEn = normalizeDescription(sidecarDescriptions.en || sidecar.description_en);
+    // Agent-private ownership tag (frontmatter `ownerAgent`). Trimmed; empty
+    // → undefined (a shared skill). Hosts gate prompt/UI exposure on this.
+    const ownerAgent = (typeof data.ownerAgent === "string" && data.ownerAgent.trim()) || undefined;
     return {
       id,
       name: declaredName,
@@ -159,6 +162,7 @@ export class SkillLoader {
       dir,
       skillFile,
       source,
+      ...(ownerAgent ? { ownerAgent } : {}),
     };
   }
 

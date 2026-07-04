@@ -1,10 +1,10 @@
 /**
- * Blocking permission gate for risky `bash` commands under the `risk_prompt`
- * execution mode (features/permissions.ts).
+ * Blocking permission gate for sensitive local operations under approval
+ * access modes (features/permissions.ts).
  *
  * Mirrors features/local_agents/bridge_permissions.ts (push `bash:permission`
- * → renderer dialog → `bash.permission_response` IPC → resolve; no answer
- * within the timeout DENIES), with two differences:
+ * → renderer dialog → `bash.permission_response` IPC → resolve), with two
+ * differences:
  *
  *   1. THREE outcomes — `allow_once`, `allow_run`, `deny` — not a boolean.
  *   2. NO persistent store. "Allow for this run" is an IN-MEMORY grant keyed
@@ -14,23 +14,27 @@
  *      this task" convenience, not a durable policy. (Durable per-pattern
  *      allow is plan option A, intentionally out of scope here.)
  *
- * Never throws: a broken push channel degrades to deny-after-timeout, so a
- * risky command can never silently run because the dialog failed to show.
+ * Never throws: a broken push channel degrades to deny, so a risky command can
+ * never silently run because the dialog failed to show. Once the prompt is
+ * delivered, waiting for user action is intentionally not auto-timed-out here;
+ * callers can emit progress heartbeats so model/tool idle watchdogs do not
+ * count human approval time as tool inactivity.
  */
 
 import * as crypto from 'node:crypto';
 
 import { createLogger } from '../../logger';
+import { maskId } from '../../util/log-redact';
 import type { RiskCategory } from './bash-risk';
 
 const log = createLogger('bash-permissions');
 
 export type BashDecision = 'allow_once' | 'allow_run' | 'deny';
 
-// Human-in-the-loop confirmation window. Unanswered requests still deny, but
-// risky bash approvals can occur in the middle of a long agent run; 2 minutes
-// was too short for users who switch away before approving.
-const RESPONSE_TIMEOUT_MS = 10 * 60 * 1000;
+// Keep watchdogs alive while the tool is waiting for a human to click the
+// renderer dialog. This is not a safety timeout: it only drives optional
+// caller progress callbacks.
+const WAITING_HEARTBEAT_MS = 25_000;
 /** Renderer dialog command preview cap — the user must see what will run, but
  *  an unbounded command would bloat the push payload. */
 const COMMAND_PREVIEW_MAX = 800;
@@ -64,6 +68,10 @@ export interface BashPermissionInfo {
   agent_name: string;
   /** Truncated for display; the user sees what is about to run. */
   command: string;
+  /** Optional non-shell operation name, e.g. read_file/list_files. */
+  operation?: string;
+  /** Optional subject for non-shell operations, typically a path. */
+  subject?: string;
   reasons: RiskCategory[];
   cid: string;
 }
@@ -73,7 +81,7 @@ interface Pending {
   agentId: string;
   reasons: RiskCategory[];
   resolve: (d: BashDecision) => void;
-  timer: NodeJS.Timeout;
+  heartbeat?: NodeJS.Timeout;
 }
 
 const _pending = new Map<string, Pending>();
@@ -85,7 +93,9 @@ export function _setBroadcastForTest(fn: ((channel: string, payload: unknown) =>
   _broadcastOverride = fn;
 }
 export function _resetForTest(): void {
-  for (const [, p] of _pending) clearTimeout(p.timer);
+  for (const [, p] of _pending) {
+    if (p.heartbeat) clearInterval(p.heartbeat);
+  }
   _pending.clear();
   _runAllow.clear();
 }
@@ -103,8 +113,8 @@ function _broadcast(channel: string, payload: unknown): boolean {
 
 /**
  * Gate one risky bash command. Resolves to the user's decision. Silent
- * `allow_run` when this run already granted every category. Deny on timeout
- * or broken push channel.
+ * `allow_run` when this run already granted every category. Deny on a broken
+ * push channel; otherwise wait for the explicit renderer response.
  */
 export async function requestBashDecision(opts: {
   uid: string;
@@ -112,7 +122,10 @@ export async function requestBashDecision(opts: {
   agentId: string;
   agentName: string;
   command: string;
+  operation?: string;
+  subject?: string;
   reasons: RiskCategory[];
+  onWaiting?: (elapsedMs: number) => void;
 }): Promise<BashDecision> {
   const reasons = opts.reasons.slice();
   if (isCoveredByRun(opts.cid, opts.agentId, reasons)) return 'allow_run';
@@ -126,23 +139,41 @@ export async function requestBashDecision(opts: {
     agent_id: opts.agentId,
     agent_name: opts.agentName || opts.agentId,
     command,
+    ...(opts.operation ? { operation: opts.operation } : {}),
+    ...(opts.subject ? { subject: opts.subject } : {}),
     reasons,
     cid: opts.cid,
   };
 
   // Privacy: log categories + length only, never the command text (CLAUDE.md).
-  log.info('bash permission requested', { requestId, cid: opts.cid, reasons, len: opts.command.length });
+  log.info('bash permission requested', {
+    request_id: maskId(requestId),
+    cid: maskId(opts.cid),
+    agent_id: maskId(opts.agentId),
+    reasons,
+    command_chars: opts.command.length,
+  });
 
   return new Promise<BashDecision>((resolve) => {
-    const timer = setTimeout(() => {
-      _pending.delete(requestId);
-      log.warn('bash permission timed out → deny', { requestId, reasons });
-      resolve('deny');
-    }, RESPONSE_TIMEOUT_MS);
-    if (typeof timer.unref === 'function') timer.unref();
-    _pending.set(requestId, { cid: opts.cid, agentId: opts.agentId, reasons, resolve, timer });
+    const startedAt = Date.now();
+    const notifyWaiting = () => {
+      if (!opts.onWaiting) return;
+      try { opts.onWaiting(Date.now() - startedAt); }
+      catch (err) { log.warn('bash permission waiting callback failed', { request_id: maskId(requestId), error: (err as Error)?.message || String(err) }); }
+    };
+    const pending: Pending = { cid: opts.cid, agentId: opts.agentId, reasons, resolve };
+    _pending.set(requestId, pending);
     if (!_broadcast('bash:permission', info)) {
-      log.warn('no renderer broadcast available — bash permission will deny on timeout', { requestId });
+      _pending.delete(requestId);
+      log.warn('no renderer broadcast available — bash permission denied', { request_id: maskId(requestId) });
+      resolve('deny');
+      return;
+    }
+    notifyWaiting();
+    if (opts.onWaiting) {
+      const heartbeat = setInterval(notifyWaiting, WAITING_HEARTBEAT_MS);
+      if (typeof heartbeat.unref === 'function') heartbeat.unref();
+      pending.heartbeat = heartbeat;
     }
   });
 }
@@ -154,7 +185,7 @@ export function respond(requestId: string, decision: BashDecision): boolean {
   const pending = _pending.get(requestId);
   if (!pending) return false;
   _pending.delete(requestId);
-  clearTimeout(pending.timer);
+  if (pending.heartbeat) clearInterval(pending.heartbeat);
   if (decision === 'allow_run') {
     recordRunAllow(pending.cid, pending.agentId, pending.reasons);
   }
@@ -168,7 +199,7 @@ export function cancelForCid(cid: string): void {
   for (const [id, pending] of _pending) {
     if (pending.cid !== cid) continue;
     _pending.delete(id);
-    clearTimeout(pending.timer);
+    if (pending.heartbeat) clearInterval(pending.heartbeat);
     pending.resolve('deny');
   }
   for (const key of [..._runAllow.keys()]) {

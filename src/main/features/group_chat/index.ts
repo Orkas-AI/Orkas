@@ -35,7 +35,7 @@ export const busIsQuiescent = isQuiescent;
 export async function runtimeStatus(
   userId: string,
   cid: string,
-): Promise<{ processing: boolean; processing_since: string | null; in_flight: string[]; active_turns: Array<{ actor: string; turn_id: string }>; active_recipient?: string }> {
+): Promise<{ processing: boolean; processing_since: string | null; in_flight: string[]; active_turns: Array<{ actor: string; turn_id: string; msg_id?: string }>; active_recipient?: string }> {
   if (!safeId(cid)) return { processing: false, processing_since: null, in_flight: [], active_turns: [] };
   try {
     const state = await readState(userId, cid);

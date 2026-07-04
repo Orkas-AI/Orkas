@@ -133,7 +133,7 @@ export function friendlyRetryReason(reason: string): string {
   if (/\bcodex sse response headers timed out after \d+ms\b|\bsse response headers timed out\b|\bresponse headers? (timed out|timeout)\b|\bheaders? (timed out|timeout)\b|\btimed out\b|\btimeout\b|etimedout|und_err_connect_timeout|und_err_headers_timeout|und_err_body_timeout/.test(r)) {
     return t('errors.network.timeout');
   }
-  if (/\bterminated\b|socket (hang up|closed|close)|fetch failed|websocket (error|closed|close)|\bws (error|closed|close)\b|connection (closed|close|reset|dropped|terminated)|stream (closed|close|interrupted|disconnected|reset|terminated)|premature close|err_stream_premature_close|econnreset|epipe|und_err_socket/.test(r)) {
+  if (/\bterminated\b|stream ended without finish_reason|missing finish_reason|without finish_reason|missing final (chunk|event)|without final (chunk|event)|socket (hang up|closed|close)|fetch failed|websocket (error|closed|close)|\bws (error|closed|close)\b|connection (closed|close|reset|dropped|terminated)|stream (closed|close|interrupted|disconnected|reset|terminated)|premature close|err_stream_premature_close|econnreset|epipe|und_err_socket/.test(r)) {
     return t('errors.network.connection_dropped');
   }
   if (/rate.?limit|429|too many requests/.test(r)) return t('errors.network.rate_limited');
@@ -447,7 +447,7 @@ export async function* mapCoreAgentEvents(
           // ProviderError that runner.ts already logged via `log.warn(...)`
           // on the retry path. Keep this line focused on what survives.
           log.warn('core-agent done with error', {
-            error,
+            error_chars: error.length,
             kind: result.meta.error.kind,
             model: result.meta.model,
             provider: result.meta.provider,

@@ -22,6 +22,7 @@ import * as crypto from 'node:crypto';
 
 import { localAgentRunDir, userLocalAgentRunsDir } from '../../paths.js';
 import { createLogger } from '../../logger.js';
+import { logErrorRef, maskId } from '../../util/log-redact.js';
 import type { LocalEvent } from './backends/base.js';
 
 const log = createLogger('local-agents:persist');
@@ -89,7 +90,7 @@ export async function start(uid: string, init: Omit<RunMeta, 'runId' | 'startedA
     await fsp.writeFile(handle.eventsPath, '', 'utf8');
     await fsp.writeFile(handle.outputPath, '', 'utf8');
   } catch (err) {
-    log.warn('persist start failed', { uid, runId, error: (err as Error).message });
+    log.warn('persist start failed', { user_id: maskId(uid), run_id: maskId(runId), error: logErrorRef(err) });
   }
   return handle;
 }
@@ -101,7 +102,7 @@ export function append(handle: RunHandle, event: LocalEvent): void {
   try {
     fs.appendFileSync(handle.eventsPath, JSON.stringify(event) + '\n', 'utf8');
   } catch (err) {
-    log.warn('persist append failed', { runId: handle.runId, error: (err as Error).message });
+    log.warn('persist append failed', { run_id: maskId(handle.runId), error: logErrorRef(err) });
   }
 }
 
@@ -111,7 +112,7 @@ export function appendOutput(handle: RunHandle, text: string): void {
   try {
     fs.appendFileSync(handle.outputPath, text, 'utf8');
   } catch (err) {
-    log.warn('persist appendOutput failed', { runId: handle.runId, error: (err as Error).message });
+    log.warn('persist appendOutput failed', { run_id: maskId(handle.runId), error: logErrorRef(err) });
   }
 }
 
@@ -134,6 +135,6 @@ export async function finalize(handle: RunHandle, patch: Partial<RunMeta>): Prom
       if (!existing) await fsp.writeFile(handle.outputPath, patch.output, 'utf8');
     }
   } catch (err) {
-    log.warn('persist finalize failed', { runId: handle.runId, error: (err as Error).message });
+    log.warn('persist finalize failed', { run_id: maskId(handle.runId), error: logErrorRef(err) });
   }
 }

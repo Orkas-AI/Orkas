@@ -24,6 +24,7 @@ import {
   bumpEntryLastUsed,
   hasConfiguredModel,
   getConfiguredModelCooldown,
+  getConfiguredModelOAuthExpiredMessage,
   type ChatEntryChoice,
 } from '../../features/auth';
 import { getSystemPromptBlock, getSystemSkillsPromptBlock } from './skill-registry';
@@ -31,8 +32,15 @@ import { t } from '../../i18n';
 // tool-catalog.ts: TOOL_CATALOG kept as the source of truth for the drift
 // test (tool-catalog.test.ts asserts injected names ⊆ catalog) and for any
 // future targeted use; runtime no longer renders the prompt block from it.
-import { getSession } from './session-store';
-import { addEntry, replaceEntry, removeEntry, listEntries, formatForSystemPrompt as formatMemoryForSystemPrompt } from '../../features/memory';
+import { getSession, memoryScopeForSession } from './session-store';
+import {
+  addEntry,
+  replaceEntry,
+  removeEntry,
+  listEntries,
+  formatForSystemPrompt as formatMemoryForSystemPrompt,
+  type MemoryScope,
+} from '../../features/memory';
 import * as metacognition from '../../features/metacognition';
 import { appendAgentSkill, listAgents } from '../../features/agents';
 const log = createLogger('model/runner');
@@ -42,14 +50,29 @@ import { officeCliAvailable } from '../../features/office/office_engine';
 import { createKbTools } from './kb-tools';
 import { createChatHistoryTools } from './chat-history-tools';
 import { createImageGenTool } from './image-gen-tool';
+import { createResearchRerankTool } from './research-rerank-tool';
+import { isToolVisibleToAgent } from './tool-catalog';
 import { createWebSearchOverrideTool } from './search-tools';
-import { sessionToolResultsDir, agentEvolvedSkillsDir, userSystemSkillsDir } from '../../paths';
+import {
+  sessionToolResultsDir,
+  agentEvolvedSkillsDir,
+  agentPrivateSkillsDir,
+  userMarketplaceAgentSkillsDir,
+  userSystemSkillsDir,
+} from '../../paths';
 import {
   wrapToolWithCap,
   MAX_RESULT_CHARS_BY_TOOL,
   DEFAULT_MAX_RESULT_CHARS,
 } from '../../util/tool-result-cap';
-import { createMoonshotProvider, createDeepSeekProvider, createDoubaoProvider } from './external-providers';
+import {
+  buildMoonshotModel,
+  buildDeepSeekModel,
+  buildDoubaoModel,
+  createMoonshotProvider,
+  createDeepSeekProvider,
+  createDoubaoProvider,
+} from './external-providers';
 import { createRotatingProvider, type RotatingCandidate } from './rotating-provider';
 import { clearCooldown } from './profile-cooldown';
 import { EXTERNAL_API_PROVIDERS, resolveConfiguredPiModel } from '../provider_catalog';
@@ -58,6 +81,7 @@ import { nativeSearchToolForApi, nativeSearchToolName } from './native-search-to
 import { hasAnySearchProfile } from '../../features/search_auth';
 import { createConnectorMetaTools, getConnectorPromptBlock } from './connector-meta-tools';
 import { createLogger } from '../../logger';
+import { logErrorSummary, maskId } from '../../util/log-redact';
 import type { MemoryToolHandler } from '../../../core-agent/src/tools/memory-tool';
 import type { MetacognitionToolHandler } from '../../../core-agent/src/tools/metacognition-tool';
 
@@ -67,15 +91,52 @@ function isNativeSearchEnabled(): boolean {
   return true;
 }
 
+function buildExternalProviderModel(providerId: string, modelId: string): { contextWindow?: number; maxTokens?: number } | null {
+  switch (providerId) {
+    case 'moonshot':
+      return buildMoonshotModel(modelId);
+    case 'deepseek':
+      return buildDeepSeekModel(modelId);
+    case 'doubao':
+      return buildDoubaoModel(modelId);
+    default:
+      return null;
+  }
+}
+
+function modelCatalogEntryFromModel(
+  model: { contextWindow?: number; maxTokens?: number } | null | undefined,
+): { contextWindow?: number; maxOutputTokens?: number } | null {
+  if (!model) return null;
+  const entry: { contextWindow?: number; maxOutputTokens?: number } = {};
+  if (typeof model.contextWindow === 'number' && model.contextWindow > 0) {
+    entry.contextWindow = model.contextWindow;
+  }
+  if (typeof model.maxTokens === 'number' && model.maxTokens > 0) {
+    entry.maxOutputTokens = model.maxTokens;
+  }
+  return Object.keys(entry).length ? entry : null;
+}
+
 type CA = typeof import('#core-agent');
 type AgentRunnerCtor = CA['AgentRunner'];
 type AgentRunnerInstance = InstanceType<AgentRunnerCtor>;
 type CoreAgentConfig = ReturnType<CA['createConfig']>;
 
 let _caPromise: Promise<CA> | null = null;
+function applyRetryErrorPolicy(mod: CA): void {
+  try {
+    mod.configureRetryErrorPolicy();
+  } catch (err) {
+    runnerLog.warn('retry error policy sync failed', { error: logErrorSummary(err) });
+  }
+}
+
 async function ca(): Promise<CA> {
   if (!_caPromise) _caPromise = import('#core-agent') as Promise<CA>;
-  return _caPromise;
+  const mod = await _caPromise;
+  applyRetryErrorPolicy(mod);
+  return mod;
 }
 
 /** No-op retained for backward compat; nothing is cached anymore. */
@@ -109,8 +170,10 @@ export interface BuildRunnerParams {
   projectId?: string;
   /** Agent id bound to the conversation. Empty/undefined = default scope. */
   agentId?: string;
-  /** Max tool-call rounds per turn before force-end. Undefined keeps the
-   *  core-agent default. */
+  /** Human-readable actor name used in user-facing local permission prompts. */
+  agentName?: string;
+  /** Max tool-call rounds per turn before force-end. Undefined → core-agent
+   *  default (50). Group chat raises it for the commander's long builds. */
   maxToolLoops?: number;
 
   /** Optional subset of skill ids; undefined = full global listing. See
@@ -124,7 +187,8 @@ export interface BuildRunnerParams {
    *  CLAUDE.md §6 + `features/projects.ts::resolveProjectScope`. */
   projectAllowedSkillIds?: readonly string[];
   /** Extra tools added to core-agent's builtins (e.g. group_chat commander
-   * gets `plan_set` + agent-management tools). */
+   * gets dispatch tools (`run_worker` / `dispatch_to`) plus marketplace /
+   * skill-search / automation-listing tools). */
   extraTools?: AgentTool[];
   /** Extra absolute directory roots whitelisted for file-tools (read_file /
    *  stat_file / search_files / grep_files) on top of workspace + attachment.
@@ -134,15 +198,19 @@ export interface BuildRunnerParams {
   /** Read-only extra roots: read tools (read_file / search_files /
    *  grep_files / stat_file) can see them, but write-side tools
    *  (edit_file / write_file / bash / markdown_to_pdf / html_to_pdf /
-   *  generate_image) cannot mutate paths inside. Used by group-chat
-   *  commander to inspect agent / skill specs without giving direct-write
-   *  access — the structured `<agent>` / `<skill>` containers are the
-   *  only sanctioned mutation channels for those resources. */
+   *  generate_image and other write-capable tools) cannot mutate paths inside.
+   *  Used by group-chat commander to inspect agent / skill specs without
+   *  giving direct-write access — the structured `<agent>` / `<skill>`
+   *  containers are the only sanctioned mutation channels for those resources. */
   readOnlyExtraRoots?: readonly string[];
+  /** Additional file-tool-only read roots. Like `readOnlyExtraRoots`, these
+   *  are never passed to localTools, so `delete_file` and other local-exec
+   *  tools cannot act on them. Used for user-approved read-only folder grants. */
+  fileReadOnlyExtraRoots?: readonly string[];
   /** Fires with the absolute path after each successful `write_file` /
    * `markdown_to_pdf` / `html_to_pdf` call or tracked bash output file. See `model/client.ts`
    * `ChatOptions.onFileWritten` for the caller-facing contract. */
-  onFileWritten?: (absPath: string) => void;
+  onFileWritten?: (absPath: string) => void | Promise<void>;
   /** Caller-supplied predicate consumed by write-style tools' uniquify
    *  logic. See `model/client.ts` `ChatOptions.hasProducedPath`. */
   hasProducedPath?: (absPath: string) => boolean;
@@ -188,7 +256,7 @@ export interface ToolDefSnapshot {
   inputSchema: Record<string, unknown>;
   /** `'core-agent'` = pi-ai builtin (read_file / write_file / bash / web_search / web_fetch / list_files);
    *  `'orkas'` = injected by buildRunner (overrides + extras like memory, kb, image_gen, web_search override);
-   *  `'extra'` = passed by caller via `extraTools` (group_chat commander uses this for plan_set / agent mgmt). */
+   *  `'extra'` = passed by caller via `extraTools` (group_chat commander uses this for dispatch + marketplace / skill / automation tools). */
   source: 'core-agent' | 'orkas' | 'extra';
 }
 
@@ -269,6 +337,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const group = await pickChatEntryGroup();
   const primary: ChatEntryChoice | undefined = group[0];
   if (!primary && !process.env.ANTHROPIC_API_KEY) {
+    const oauthExpiredMessage = getConfiguredModelOAuthExpiredMessage();
+    if (oauthExpiredMessage) throw new Error(oauthExpiredMessage);
     const cooldown = getConfiguredModelCooldown();
     if (cooldown) {
       const seconds = Math.max(1, Math.ceil((cooldown.cooledUntil - Date.now()) / 1000));
@@ -307,6 +377,10 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     getSystemPromptBlock({
       ...(renderAllowlist === undefined ? {} : { allowlist: [...renderAllowlist] }),
       disabledIds: disabledSkillIds,
+      // Acting agent id gates agent-private (`ownerAgent`) skills: an agent's
+      // own internal skills render for it, but never for the commander or
+      // other agents. Empty for commander/non-agent sessions.
+      ...(params.agentId ? { agentId: params.agentId } : {}),
       ...(params.onSkillAdvertised ? { onSkillAdvertised: params.onSkillAdvertised } : {}),
       displayNameById: skillDisplayNameById,
       ...(openSkillSourcesVisible ? { includeOpenSources: true } : {}),
@@ -321,6 +395,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // for the dev archive after this section.
   const uid = params.userId || _safeActiveUserId();
   const agentId = params.agentId || '';
+  // Cross-session memory eligibility + per-agent scope (null = not eligible →
+  // no tool, no injection). See memoryScopeForSession for the per-kind rule.
+  const memoryAgentScope = memoryScopeForSession(params.sessionId, agentId);
   const agentDisplayNameById = new Map<string, string>();
   if (uid) {
     try {
@@ -328,18 +405,23 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         if (agent?.agent_id) agentDisplayNameById.set(agent.agent_id, agent.name || agent.agent_id);
       }
     } catch (err) {
-      log.warn(`agent display-name scan failed: ${(err as Error).message}`);
+      log.warn('agent display-name scan failed', { user_id: maskId(uid), error: logErrorSummary(err) });
     }
   }
+  const agentName = (params.agentName || (agentId ? agentDisplayNameById.get(agentId) : '') || agentId || '').trim();
   const injectedTools: AgentTool[] = [];
 
-  if (uid) {
-    // Memory tool (per-user)
+  if (uid && memoryAgentScope) {
+    // Cross-session memory. `agent` tier binds to THIS caller's scope so the
+    // model can never reach another agent's store; `shared`/`user` are global.
+    const scopeId = memoryAgentScope; // narrowed to string
+    const toScope = (tier: 'agent' | 'shared' | 'user'): MemoryScope =>
+      tier === 'agent' ? { agent: scopeId } : tier === 'shared' ? 'memory' : 'user';
     const memoryHandler: MemoryToolHandler = {
-      add: (target, content) => addEntry(uid, target, content),
-      replace: (target, oldText, content) => replaceEntry(uid, target, oldText, content),
-      remove: (target, oldText) => removeEntry(uid, target, oldText),
-      list: (target) => listEntries(uid, target),
+      add: (tier, content) => addEntry(uid, toScope(tier), content),
+      replace: (tier, oldText, content) => replaceEntry(uid, toScope(tier), oldText, content),
+      remove: (tier, oldText) => removeEntry(uid, toScope(tier), oldText),
+      list: (tier) => listEntries(uid, toScope(tier)),
     };
     const { createCrossSessionMemoryTool } = await import('../../../core-agent/src/tools/memory-tool');
     injectedTools.push(createCrossSessionMemoryTool(memoryHandler));
@@ -363,9 +445,14 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // builtins in the list so `AgentRunner`'s last-write-wins tool map
   // overrides `bash` and `write_file` with the permission-gated versions.
   const systemSkillReadRoots = uid ? [userSystemSkillsDir(uid)] : [];
+  const agentPrivateSkillReadRoots = uid && agentId
+    ? [userMarketplaceAgentSkillsDir(uid, agentId), agentPrivateSkillsDir(uid, agentId)]
+    : [];
   const fileReadOnlyExtraRoots = [
+    ...(params.fileReadOnlyExtraRoots || []),
     ...(params.readOnlyExtraRoots || []),
     ...systemSkillReadRoots,
+    ...agentPrivateSkillReadRoots,
   ];
 
   const localTools = createLocalTools({
@@ -373,17 +460,13 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...(params.cid ? { cid: params.cid } : {}),
     ...(params.turnId ? { turnId: params.turnId } : {}),
     ...(agentId ? { agentId } : {}),
+    ...(agentName ? { agentName } : {}),
     ...(params.projectId ? { projectId: params.projectId } : {}),
     ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
-    // `readOnlyExtraRoots` is threaded to localTools too — but ONLY the
-    // `delete_file` tool actually consumes it via `guardDeletePath`. The
-    // write-side tools (`write_file` / `edit_file`) still use
-    // `guardEditPath`, which ignores readOnly roots and keeps them
-    // immutable. The asymmetry exists because `delete_file` carries a
-    // per-call UI confirm card (`delete-file-confirm.ts`) that the user
-    // physically has to click — that gate justifies allowing deletion of
-    // paths the caller marked read-only for silent writes.
-    ...(params.readOnlyExtraRoots?.length ? { readOnlyExtraRoots: params.readOnlyExtraRoots } : {}),
+    // Read-only roots intentionally stay out of localTools. `delete_file`,
+    // `write_file`, PDF tools, and bash-adjacent local execution only get the
+    // writable lane (`extraRoots`), while read-only roots are visible through
+    // fileTools below.
     ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
     ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
     ...(params.onArtifactCreated ? { onArtifactCreated: params.onArtifactCreated } : {}),
@@ -394,16 +477,19 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // over core-agent's builtin `read_file`. Skipped when uid is unknown
   // (e.g. ad-hoc test runs) since file-tools need it for cache scoping.
   // `readOnlyExtraRoots` is threaded here for the read scope (workspace +
-  // attachment + extraRoots + readOnlyExtraRoots all visible), while
-  // write-side tools (`write_file` / `edit_file`) still ignore it; only
-  // the dedicated `delete_file` tool above can act on those paths.
+  // attachment + extraRoots + readOnlyExtraRoots all visible). Local write
+  // and delete tools never receive those roots.
   const fileTools = uid
     ? createFileTools({
         userId: uid,
         ...(params.cid ? { cid: params.cid } : {}),
+        ...(agentId ? { agentId } : {}),
+        ...(agentName ? { agentName } : {}),
         ...(params.projectId ? { projectId: params.projectId } : {}),
         ...(params.extraRoots?.length ? { extraRoots: params.extraRoots } : {}),
-        ...(fileReadOnlyExtraRoots.length ? { readOnlyExtraRoots: fileReadOnlyExtraRoots } : {}),
+        ...(fileReadOnlyExtraRoots.length || params.sessionId
+          ? { readOnlyExtraRoots: [...fileReadOnlyExtraRoots, sessionToolResultsDir(uid, params.sessionId)] }
+          : {}),
         ...(params.onSkillInvoked ? { onSkillInvoked: params.onSkillInvoked } : {}),
       })
     : [];
@@ -426,9 +512,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...(params.cid ? { currentCid: params.cid } : {}),
   }) : [];
 
-  // Image generation. Permission-gated like local-tools; reuses
-  // localExec.granted (writing image bytes is the same blast radius as
-  // write_file). Skipped when uid is unknown — generators need the
+  // Image / video generation. Shares the localExec access mode with
+  // local-tools (writing image bytes is the same blast radius as write_file).
+  // Skipped when uid is unknown — generators need the
   // workspace + attachment scope to validate paths.
   const imageGenTools: AgentTool[] = uid
     ? [createImageGenTool({
@@ -439,10 +525,18 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
         ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
       })]
     : [];
+  // Deep-research-owned tools (ownerAgent gate). Pure local compute (embedding
+  // + ranking), so no uid / workspace scope and no Tool Execution Access needed;
+  // hidden from the commander and every other actor via isToolVisibleToAgent.
+  const deepResearchTools: AgentTool[] = [];
+  if (isToolVisibleToAgent('research_rerank', agentId)) {
+    deepResearchTools.push(createResearchRerankTool());
+  }
 
   // Office document tools (bundled OfficeCLI engine). Permission-gated like
-  // local-tools: creating/editing Office files has the same blast radius as
-  // write_file. Skipped when the engine is not bundled or uid is unknown.
+  // local-tools (writing a docx/xlsx/pptx is the same blast radius as
+  // write_file). Skipped when uid is unknown — the factory needs the
+  // workspace + attachment scope to sandbox output paths.
   const officeTools: AgentTool[] = uid && officeCliAvailable()
     ? createOfficeTools({
         userId: uid,
@@ -472,7 +566,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // selection-accuracy cliff and invalidate the prompt-cache prefix on every connect/disconnect.
   //
   // Session-kind gate (tri-state):
-  //   - `gconv` (commander)                              → block + full tools (list + call —
+  //   - `gconv` (commander) + `gmember` (agent worker)    → block + full tools (list + call —
   //                                                         actual user tasks invoking external
   //                                                         services).
   //   - `agent` (agent-edit)                              → block + discover-only tool
@@ -487,18 +581,17 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   //                                                         produce external side effects.
   //   - everything else (skill-edit / KB-image / CLI dispatch / reflect / memory-extract /
   //     anon)                                            → none.
-  // For agent-edit specifically, the block intentionally bypasses `agent.enabled_connectors`
-  // (passes undefined agentId) — the editor LLM should see EVERYTHING the user installed so it
-  // can recommend referencing a connector even if the agent's whitelist hasn't been opened to
-  // it yet (the user toggles `enabled_connectors` separately in the agent-edit UI).
+  // Group-chat agents intentionally share the commander's connector visibility:
+  // do not pass agentId here. Agent-edit also bypasses `agent.enabled_connectors`
+  // so the editor LLM can inspect every installed connector while authoring.
   const exposure = uid ? connectorExposureFromSessionId(params.sessionId) : 'none';
-  const blockAgentId = exposure === 'discover+block' ? undefined : (agentId || undefined);
+  const blockAgentId = undefined;
   const connectorBlock = exposure !== 'none' && uid
     ? await getConnectorPromptBlock(uid, blockAgentId)
     : '';
   const connectorMetaTools = uid && exposure !== 'none'
     ? await createConnectorMetaTools(
-        { userId: uid, ...(agentId ? { agentId } : {}), ...(params.cid ? { cid: params.cid } : {}) },
+        { userId: uid, ...(params.cid ? { cid: params.cid } : {}) },
         exposure === 'discover+block' ? 'discover' : 'full',
       )
     : [];
@@ -511,26 +604,37 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...kbTools,
     ...chatHistoryTools,
     ...imageGenTools,
+    ...deepResearchTools,
     ...officeTools,
     ...searchOverrideTools,
     ...(params.extraTools || []),
     ...connectorMetaTools,
   ];
 
+  // Authoritative owner-scoped visibility gate: drop any tool whose catalog
+  // entry declares an `ownerAgent` other than this actor. Defense-in-depth
+  // beyond the construction-time gate above — guarantees an owner-only tool can
+  // never reach another actor's tools[] regardless of which injection path
+  // produced it. Caller-supplied extraTools / core-agent builtins aren't in the
+  // catalog, so `isToolVisibleToAgent` returns true for them (unaffected).
+  const visibleTools = allTools.filter((tool) => isToolVisibleToAgent(tool.name, agentId));
+
   // Cap each tool's result size + persist oversized outputs. Single wrap point
   // so every tool (including core-agent's builtins like web_search/web_fetch
-  // injected inside AgentRunner) is covered. Read-type tools (Infinity cap)
-  // are auto-exempted by `wrapToolWithCap`. `uid` being empty happens in
-  // ad-hoc test scenarios; skip wrapping there — no sessionToolResultsDir to
-  // resolve and no LLM in the loop that would over-feed context anyway.
+  // injected inside AgentRunner) is covered. Read-type tools cap at 100K (a
+  // >100K read spills + stays re-pageable via charStart/charEnd); a tool still
+  // exempts itself only by an Infinity entry in MAX_RESULT_CHARS_BY_TOOL.
+  // `uid` being empty happens in ad-hoc test scenarios; skip wrapping there —
+  // no sessionToolResultsDir to resolve and no LLM in the loop that would
+  // over-feed context anyway.
   const wrappedTools = uid
-    ? allTools.map((t) =>
+    ? visibleTools.map((t) =>
         wrapToolWithCap(t, {
           maxChars: MAX_RESULT_CHARS_BY_TOOL[t.name] ?? DEFAULT_MAX_RESULT_CHARS,
           toolResultsDir: sessionToolResultsDir(uid, params.sessionId),
         }),
       )
-    : allTools;
+    : visibleTools;
 
   // Final tool name set the AgentRunner will see — core-agent builtins
   // (read_file/write_file/bash/list_files/web_search/web_fetch) merged with
@@ -593,7 +697,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // it sits after connectors / skills / agents but before per-plan state.
   // Empty string when nothing is stored (no tokens for new users).
   // Re-read each turn — a mid-conversation write shows up next turn.
-  const memoryBlock = uid ? formatMemoryForSystemPrompt(uid) : '';
+  const memoryBlock = (uid && memoryAgentScope) ? formatMemoryForSystemPrompt(uid, memoryAgentScope) : '';
   if (memoryBlock) parts.push(memoryBlock);
   if (planStateBlock) parts.push(planStateBlock);
   if (volatileTail) parts.push(volatileTail);
@@ -613,6 +717,32 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ? { enabled: true, skillsDir: agentEvolvedSkillsDir(earlyUid, agentId) }
     : { enabled: false };
 
+  // Fill the model catalog with each model's REAL context window (+ max output
+  // tokens) so core-agent's compaction trigger uses it instead of the 200K
+  // fallback — otherwise a 1M-window model compacts at 0.8×200K=160K, throwing
+  // away most of its context (G7). Populate EVERY candidate in the rotating
+  // group (keyed by its modelId), not just the primary: rotating-provider can
+  // fail over to a different-window model mid-run, and core-agent looks the
+  // window up by the model the stream actually reported (P1-6).
+  // resolveConfiguredPiModel returns the pi-ai Model (catalog or custom-built),
+  // which carries contextWindow + maxTokens.
+  // Each entry must satisfy core-agent's ModelConfigSchema, which REQUIRES
+  // `provider` + `model` (contextWindow / maxOutputTokens are optional).
+  // modelCatalogEntryFromModel only supplies the windows, so add provider/model
+  // here. These two are schema-required metadata only — core-agent reads the
+  // catalog solely for contextWindow/maxOutputTokens and routes via
+  // defaultProvider/defaultModel + the injected rotating provider, never via
+  // catalog[x].provider. (Omitting them is what crashed createConfig with a Zod
+  // "provider/model Required" error once a candidate carried a real window.)
+  const modelCatalog: Record<string, { provider: string; model: string; contextWindow?: number; maxOutputTokens?: number }> = {};
+  for (const choice of group) {
+    if (modelCatalog[choice.model]) continue;
+    const model = EXTERNAL_API_PROVIDERS.includes(choice.provider)
+      ? buildExternalProviderModel(choice.provider, choice.model)
+      : resolveConfiguredPiModel(mod, choice.provider, choice.model)?.model;
+    const entry = modelCatalogEntryFromModel(model);
+    if (entry) modelCatalog[choice.model] = { provider: choice.provider, model: choice.model, ...entry };
+  }
   const config: CoreAgentConfig = mod.createConfig({
     agent: {
       defaultProvider: providerId,
@@ -621,6 +751,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       ...(params.maxToolLoops ? { maxToolLoops: params.maxToolLoops } : {}),
     },
     evolution: evolutionConfig,
+    ...(Object.keys(modelCatalog).length ? { models: { catalog: modelCatalog } } : {}),
     // We deliberately do NOT populate `models.providers` —
     // ProviderRegistry's constructor runs the default factory
     // (anthropic / openai / pi-ai) on every entry and stuffs the
@@ -651,19 +782,19 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   }
 
   // When a skill is learned via skill_manage(create), append it to the bound
-  // agent's skill_list so the allowlist filter (in both `skill-registry` and
-  // `SkillStore.buildIndex`) exposes it on the next turn. Without this, a
-  // reflection-created skill would be immediately filtered out and the
-  // self-evolution loop wouldn't close. Goes through `appendAgentSkill`
-  // (not `updateCustomAgent`) to bypass the unknown-id filter, which would
-  // drop the new id — System B (SkillStore) skills aren't in System A's
-  // SkillLoader spec list. No-op when agentId is empty (normal
-  // conv / edit chats — those don't filter anyway) or when the agent has
-  // no skill_list (unrestricted access, already sees everything).
+  // agent's explicit skill_list metadata if one exists. Goes through
+  // `appendAgentSkill` (not `updateCustomAgent`) to bypass the unknown-id
+  // filter, which would drop the new id — System B (SkillStore) skills aren't
+  // in System A's SkillLoader spec list. No-op when agentId is empty or when
+  // the agent has no explicit dependency list.
   const onSkillCreated = agentId
     ? (skillId: string) => {
         appendAgentSkill(agentId, skillId)
-          .catch((err) => log.warn(`skill_list sync failed for "${skillId}" / agent ${agentId}: ${(err as Error).message}`));
+          .catch((err) => log.warn('skill_list sync failed', {
+            agent_id: maskId(agentId),
+            skill_id: maskId(skillId),
+            error: logErrorSummary(err),
+          }));
       }
     : undefined;
 
@@ -711,8 +842,8 @@ function _safeActiveUserId(): string | null {
 }
 
 /** Tri-state connector exposure, gated by session kind (CLAUDE.md §5 session-id table):
- *   - `tools+block`:    group-chat commander sessions (`gconv`) — block + both meta-tools
- *     (`list_connector_tools` + `call_connector_tool`). Full exposure.
+ *   - `tools+block`:    group-chat task sessions (`gconv` commander + `gmember` agent worker)
+ *     — block + both meta-tools (`list_connector_tools` + `call_connector_tool`). Full exposure.
  *   - `discover+block`: agent-edit (`agent`) — block + `list_connector_tools` ONLY. Editor LLM
  *     can discover action names + JSON schemas to write specific workflow steps; cannot invoke
  *     (an authoring session must never produce external side effects).
@@ -724,7 +855,7 @@ function _safeActiveUserId(): string | null {
  * session_id format is `<kind>-<tail>` (CLAUDE.md §5 — uid no longer in session_id), so the
  * kind keyword is anchored at the start. */
 export function connectorExposureFromSessionId(sessionId: string): 'tools+block' | 'discover+block' | 'none' {
-  if (/^gconv-/.test(sessionId)) return 'tools+block';
+  if (/^(gconv|gmember)-/.test(sessionId)) return 'tools+block';
   // Agent-edit gets `list_connector_tools` (read-only, no side effects) so the editor LLM can
   // learn each connector's action names and write specific workflow steps — but NOT
   // `call_connector_tool`, since an authoring session must never produce external side
@@ -735,17 +866,16 @@ export function connectorExposureFromSessionId(sessionId: string): 'tools+block'
 
 /** System skills are authoring/orchestration affordances, not worker context.
  *  Keep them visible to the group-chat commander, agent editor, and skill editor only; ordinary
- *  agent workers should receive just the concrete skills exposed by their allowlist. */
+ *  agent workers receive the normal user skill surface, not authoring protocols. */
 export function systemSkillsExposureFromSessionId(sessionId: string): boolean {
   return /^gconv-/.test(sessionId) || /^agent-/.test(sessionId) || /^skill-/.test(sessionId);
 }
 
-/** OPEN-tier skills (external packages + global roots) render for the
- *  commander only — plan decision D5 (open-ecosystem-architecture.md).
- *  Agent workers, edit sessions, one-shots, and background kinds never
- *  see them; opening them to agents is a P2 item. */
+/** OPEN-tier skills (external packages + global roots) render for group-chat
+ *  task sessions and agent-edit authoring sessions. One-shots and background
+ *  kinds never see them. */
 export function openSkillSourcesExposureFromSessionId(sessionId: string): boolean {
-  return /^gconv-/.test(sessionId);
+  return /^(gconv|gmember|agent)-/.test(sessionId);
 }
 
 /**

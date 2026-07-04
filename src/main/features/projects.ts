@@ -198,8 +198,16 @@ async function _writeBindings(uid: string, pid: string, b: ProjectBindings): Pro
   _notifyDirty();
 }
 
+// Sync engine dirty signal (lazy-require — `features/sync` is stripped from the open-source build). Mirrors
+// the pattern in `agents.ts::_invalidateAgentListCache`: any write to a `cloud/projects/...`
+// file should kick the sync debounce so the change propagates within seconds rather than the
+// 5-min periodic.
 function _notifyDirty(): void {
-  // The open-source build is local-only; cloud sync notification is intentionally absent.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
+    sync?.markDirty?.('projects', 'cloud/projects');
+  } catch { /* features/sync stripped */ }
 }
 
 // ── Validation ────────────────────────────────────────────────────────────

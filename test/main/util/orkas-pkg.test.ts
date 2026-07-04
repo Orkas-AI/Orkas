@@ -179,6 +179,33 @@ describe.skipIf(!gitAvailable)('orkas-pkg.cjs', () => {
     expect(content).not.toContain('ORKAS_NODE');
   });
 
+  itOnNonWindows('records package-local native executables and creates shims', () => {
+    const repo = makeRepo('nativepkg', {
+      'package.json': JSON.stringify({
+        name: '@vendor/nativepkg',
+        version: '1.0.0',
+        private: true,
+      }),
+      'skills/native/SKILL.md': '---\nname: native\ndescription: native\n---\n',
+      'npm/bin/native-tool': '#!/bin/sh\nprintf "native tool\\n"\n',
+      'npm/bin/README.md': 'not executable',
+    });
+    fs.chmodSync(path.join(repo, 'npm', 'bin', 'native-tool'), 0o755);
+    git(repo, 'add', '--chmod=+x', 'npm/bin/native-tool');
+    git(repo, 'commit', '-qm', 'mark native executable');
+
+    const r = runPkg('install', repo);
+    expect(r.status).toBe(0);
+    expect(r.json.kind).toBe('both');
+    expect(r.json.bin_entries).toEqual(['native-tool']);
+    expect(r.json.shims).toEqual(['native-tool']);
+    const regEntry = readRegistry().packages[0];
+    expect(regEntry.bin_entries).toEqual([{ name: 'native-tool', target: 'npm/bin/native-tool', runtime: 'native' }]);
+
+    const shim = fs.readFileSync(path.join(pkgsDir(), '.bin', 'native-tool'), 'utf8');
+    expect(shim).toContain(path.join(pkgsDir(), 'nativepkg', 'npm/bin/native-tool'));
+  });
+
   itOnNonWindows('installs Node deps under the user package tree with Orkas npm cache/prefix', () => {
     const repo = makeRepo('npmpkg', {
       'package.json': JSON.stringify({

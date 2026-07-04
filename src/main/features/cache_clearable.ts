@@ -5,7 +5,7 @@
  * a "clear cache" UI button. Whatever drops into `cache/` is fair game — losing it just
  * triggers a refetch / rebuild. Distinct from:
  *
- *   - `local/config/`  — user preferences (auth-profiles, permissions, …)         ← NEVER clear
+ *   - `local/config/`  — machine-private preferences (auth-profiles, device-local prefs, …) ← NEVER clear
  *   - `local/biz/`     — server-sourced reference data (marketplace categories, …) ← refresh-on-need
  *   - `local/search/`  — derived indexes, but self-healing via reconcile          ← currently outside this umbrella
  *

@@ -4,11 +4,18 @@ import * as http from 'node:http';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+import AdmZip from 'adm-zip';
+
 const postJsonMock = vi.hoisted(() => vi.fn());
+const extractBundleSafelyMock = vi.hoisted(() => vi.fn());
+const devtoolsMock = vi.hoisted(() => ({ isDev: false }));
 
 vi.mock('../../../src/main/features/marketplace', () => ({
   postJson: postJsonMock,
-  extractBundleSafely: vi.fn(),
+  extractBundleSafely: extractBundleSafelyMock,
+}));
+vi.mock('../../../src/main/features/devtools', () => ({
+  isDevEnv: () => devtoolsMock.isDev,
 }));
 
 let tmpDir: string;
@@ -33,6 +40,17 @@ beforeEach(() => {
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
   postJsonMock.mockReset();
+  extractBundleSafelyMock.mockReset();
+  extractBundleSafelyMock.mockImplementation((zip: AdmZip, dst: string) => {
+    fs.mkdirSync(dst, { recursive: true });
+    for (const entry of zip.getEntries()) {
+      if (entry.isDirectory) continue;
+      const out = path.join(dst, entry.entryName);
+      fs.mkdirSync(path.dirname(out), { recursive: true });
+      fs.writeFileSync(out, entry.getData());
+    }
+  });
+  devtoolsMock.isDev = false;
 });
 
 afterEach(async () => {
@@ -51,6 +69,26 @@ describe('marketplace reconcile', () => {
     fs.writeFileSync(path.join(dir, 'SKILL.md'), '---\nname: local-skill\n---\n', 'utf8');
     fs.writeFileSync(path.join(dir, '_install.json'), JSON.stringify(meta, null, 2), 'utf8');
     return dir;
+  }
+
+  function writeLocalAgent(id: string, meta: Record<string, unknown>): string {
+    const dir = path.join(tmpDir, 'u1', 'local', 'marketplace', 'agents', id);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'agent.json'), JSON.stringify({ agent_id: id, name: 'Local Agent' }), 'utf8');
+    fs.writeFileSync(path.join(dir, '_install.json'), JSON.stringify(meta, null, 2), 'utf8');
+    return dir;
+  }
+
+  function writeResourceManifest(dir: string, resourceHash: string, onlineHash: string): void {
+    fs.writeFileSync(path.join(dir, '_resource_manifest.json'), JSON.stringify({
+      schemaVersion: 1,
+      hashAlgorithm: 'sha256-tree-v1',
+      kind: 'agent',
+      id: path.basename(dir),
+      resource_hash: resourceHash,
+      resource_online_hash: onlineHash,
+      files: ['agent.json'],
+    }, null, 2), 'utf8');
   }
 
   function writeManifest(data: Record<string, unknown>): void {
@@ -102,6 +140,46 @@ describe('marketplace reconcile', () => {
       published_at: 100,
       updated_at: 200,
       agent_json_url: 'https://example.test/agent.json',
+    });
+  });
+
+  it('marks an installed agent stale when its private skills bundle url changes', async () => {
+    postJsonMock.mockImplementation(async (p: string) => {
+      if (p === '/marketplace/agents/list') {
+        return {
+          list: [{
+            id: 'agent-private',
+            version: '1.0.0',
+            published_at: 100,
+            updated_at: 100,
+            agent_skills_bundle_url: 'https://example.test/private-v2.zip',
+          }],
+          total: 1,
+        };
+      }
+      if (p === '/marketplace/skills/list') return { list: [], total: 0 };
+      throw new Error(`unexpected path ${p}`);
+    });
+
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    await installs.addAgentInstall('u1', {
+      id: 'agent-private',
+      version: '1.0.0',
+      published_at: 100,
+      updated_at: 100,
+      agent_json_url: 'https://example.test/agent.json',
+      agent_skills_bundle_url: 'https://example.test/private-v1.zip',
+      create_uid: '0',
+    });
+
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const result = await reconcile.checkServerUpdatesForInstalls('u1');
+
+    expect(result).toEqual({ updated_agents: 1, updated_skills: 0 });
+    const manifest = await installs.readInstalls('u1');
+    expect(manifest.agents[0]).toMatchObject({
+      id: 'agent-private',
+      agent_skills_bundle_url: 'https://example.test/private-v2.zip',
     });
   });
 
@@ -273,6 +351,43 @@ describe('marketplace reconcile', () => {
     expect(meta.status).toBe('approved');
   });
 
+  it('still re-pulls a dev Resource agent after the Resource hash matches the online baseline', async () => {
+    devtoolsMock.isDev = true;
+    const base = await listen((_req, res) => {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ agent_id: 'agent-resource', name: 'Server Agent' }));
+    });
+    const dir = writeLocalAgent('agent-resource', {
+      version: '1.0.0',
+      published_at: 100,
+      updated_at: 100,
+      agent_json_url: `${base}/agent.json`,
+      installed_at: 300,
+      create_uid: '0',
+    });
+    writeResourceManifest(dir, 'online-prod-hash', 'online-prod-hash');
+    writeManifest({
+      version: 1,
+      agents: [{
+        id: 'agent-resource',
+        version: '1.1.0',
+        published_at: 100,
+        updated_at: 200,
+        agent_json_url: `${base}/agent.json`,
+        installed_at: 300,
+      }],
+      skills: [],
+    });
+
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const result = await reconcile.reconcileInstalls('u1') as any;
+
+    expect(result.pulled_agents).toBe(1);
+    const pulled = JSON.parse(fs.readFileSync(path.join(dir, 'agent.json'), 'utf8'));
+    expect(pulled.name).toBe('Server Agent');
+    expect(fs.existsSync(path.join(dir, '_resource_manifest.json'))).toBe(false);
+  });
+
   it('does not write pulled content when the login guard is cancelled mid-run', async () => {
     const base = await listen((_req, res) => {
       res.setHeader('Content-Type', 'application/json');
@@ -345,6 +460,113 @@ describe('marketplace reconcile', () => {
       pulled_agents: 1,
       pulled_skills: 0,
     }));
+  });
+
+  it('pulls marketplace agent private skills listed in the install manifest', async () => {
+    const privateZip = new AdmZip();
+    privateZip.addFile('private-helper/SKILL.md', Buffer.from('---\nname: private-helper\n---\n'));
+    const base = await listen((req, res) => {
+      if (req.url === '/agent.json') {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ agent_id: 'agent-private', name: 'Private Agent' }));
+        return;
+      }
+      if (req.url === '/agent-skills.zip') {
+        res.setHeader('Content-Type', 'application/zip');
+        res.end(privateZip.toBuffer());
+        return;
+      }
+      res.statusCode = 404;
+      res.end('not found');
+    });
+    writeManifest({
+      version: 1,
+      agents: [{
+        id: 'agent-private',
+        version: '1.0.0',
+        published_at: 100,
+        updated_at: 100,
+        agent_json_url: `${base}/agent.json`,
+        agent_skills_bundle_url: `${base}/agent-skills.zip`,
+        installed_at: 200,
+      }],
+      skills: [],
+    });
+
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const paths = await import('../../../src/main/paths');
+    const result = await reconcile.reconcileInstalls('u1') as any;
+
+    expect(result.pulled_agents).toBe(1);
+    expect(extractBundleSafelyMock).toHaveBeenCalledWith(
+      expect.anything(),
+      paths.userMarketplaceAgentSkillsDir('u1', 'agent-private'),
+    );
+  });
+
+  it('pulls new skill_list dependencies while reconciling an updated agent', async () => {
+    const depZip = new AdmZip();
+    depZip.addFile('SKILL.md', Buffer.from('---\nname: dep-skill\n---\n'));
+    const base = await listen((req, res) => {
+      if (req.url === '/agent.json') {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({
+          agent_id: 'agent-updated',
+          name: 'Updated Agent',
+          skill_list: ['dep-skill'],
+        }));
+        return;
+      }
+      if (req.url === '/dep-skill.zip') {
+        res.setHeader('Content-Type', 'application/zip');
+        res.end(depZip.toBuffer());
+        return;
+      }
+      res.statusCode = 404;
+      res.end('not found');
+    });
+    postJsonMock.mockImplementation(async (p: string, body: any) => {
+      if (p === '/marketplace/skills/bundle' && body?.id === 'dep-skill') {
+        return {
+          bundle_url: `${base}/dep-skill.zip`,
+          version: '1.0.0',
+          published_at: 100,
+          updated_at: 110,
+          create_uid: '0',
+          status: 'approved',
+        };
+      }
+      throw new Error(`unexpected path ${p}`);
+    });
+    writeManifest({
+      version: 1,
+      agents: [{
+        id: 'agent-updated',
+        version: '2.0.0',
+        published_at: 100,
+        updated_at: 200,
+        agent_json_url: `${base}/agent.json`,
+        installed_at: 300,
+      }],
+      skills: [],
+    });
+
+    const reconcile = await import('../../../src/main/features/marketplace_reconcile');
+    const installs = await import('../../../src/main/features/marketplace_installs');
+    const result = await reconcile.reconcileInstalls('u1') as any;
+
+    expect(result.pulled_agents).toBe(1);
+    const manifest = await installs.readInstalls('u1');
+    expect(manifest.skills).toEqual([
+      expect.objectContaining({
+        id: 'dep-skill',
+        bundle_url: `${base}/dep-skill.zip`,
+        status: 'approved',
+      }),
+    ]);
+    expect(fs.existsSync(path.join(tmpDir, 'u1', 'local', 'marketplace', 'skills', 'dep-skill', 'SKILL.md'))).toBe(true);
+    const agentJson = JSON.parse(fs.readFileSync(path.join(tmpDir, 'u1', 'local', 'marketplace', 'agents', 'agent-updated', 'agent.json'), 'utf8'));
+    expect(agentJson.skill_list).toEqual(['dep-skill']);
   });
 
   it('emits a visible status while default installs are being seeded', async () => {

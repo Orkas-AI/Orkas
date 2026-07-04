@@ -72,4 +72,5 @@ describe('ipc/connectors renderer DTO', () => {
     expect(json).not.toContain('sk-secret');
     expect(json).not.toContain('header-secret');
   });
+
 });

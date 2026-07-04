@@ -46,7 +46,7 @@ describe('quality › red-flags › no_credential_path_read', () => {
 
   it('does NOT flag a variable name "env"', () => {
     const v = scanRedFlags({
-      content: 'const env = runtimeEnv;',
+      content: 'const env = runtimeEnv.current;',
       kind: 'script', field: 'scripts/x.ts',
     });
     expect(v.map((x) => x.rule)).not.toContain('no_credential_path_read');

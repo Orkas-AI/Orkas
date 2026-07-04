@@ -1,62 +1,51 @@
 /**
- * Local-execution permission state.
+ * Local access permission state.
  *
- * Per-install mode that gates tools which execute commands or write local
- * state (`bash`, write/edit/delete file, PDF/artifact generation, and
- * companion generators such as images). Three modes:
+ * This is the account-level, cloud-synced posture for local machine access.
+ * The product has three modes:
  *
- *   - `off`         — read-only agent. Every execution-class tool is denied.
- *   - `risk_prompt` — DEFAULT. Execution tools run; `bash` additionally
- *                     classifies the command (model/core-agent/bash-risk.ts)
- *                     and prompts the user before running a *risky* command
- *                     (network exfil, recursive delete outside the workspace,
- *                     privilege escalation, sensitive paths). Write/edit/delete
- *                     keep their existing path-sandbox + delete-confirm gates.
- *   - `allow_all`   — execution tools run with no bash prompting (the legacy
- *                     "granted" behavior).
+ *   - `workspace_approval` — cautious. Agents may work inside the active
+ *                            workspace / conversation attachments; sensitive
+ *                            operations require user approval.
+ *   - `all_files_approval` — default / regular. Agents may access paths
+ *                            outside the workspace; sensitive operations
+ *                            still require approval.
+ *   - `all_files_auto`     — agents may access paths outside the workspace;
+ *                            sensitive operations do not prompt.
  *
- * Stored in `<uid>/local/config/permissions.json` (local-only; not synced
- * across devices — see CLAUDE.md §4). Corrupt / missing file → DEFAULT mode
- * (`risk_prompt`): a damaged file must never silently fall open to full
- * unprompted execution.
+ * Stored in `<uid>/cloud/config/permissions.json` and synced across devices.
+ * Corrupt / missing file falls back to `all_files_approval`.
  *
- * Back-compat: the file historically stored `localExec.granted: boolean`.
- * On read, a legacy `granted:true` migrates to `risk_prompt` (the new safe
- * "on"), `granted:false` to `off`. `getLocalExecGranted()` is retained for
- * the existing tool wrappers (bash / write / edit / delete / pdf / image),
- * returning `mode !== 'off'` so "off = nothing runs" is unchanged.
- *
- * Contract:
- *   - `getLocalExecMode()` / `getLocalExecGranted()` are called at every tool
- *     execute(). Cheap: one sync read of a ~200-byte file.
- *   - `setLocalExecMode()` writes atomically (tmp + rename); "latest wins".
+ * Back-compat: older builds stored `off | risk_prompt | allow_all` or
+ * `localExec.granted: boolean`. Those shapes are accepted and migrated to the
+ * new safe equivalents on read.
  */
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import { userLocalConfigDir } from '../paths';
+import { userLocalConfigDir, userPermissionsFile } from '../paths';
 import { nowIso } from '../storage';
 import { getActiveUserId } from './users';
 import { createLogger } from '../logger';
 
 const log = createLogger('permissions');
 
-export type LocalExecMode = 'off' | 'risk_prompt' | 'allow_all';
+export type LocalExecMode = 'workspace_approval' | 'all_files_approval' | 'all_files_auto';
+type LegacyLocalExecMode = 'off' | 'risk_prompt' | 'allow_all';
 
-const MODES: readonly LocalExecMode[] = ['off', 'risk_prompt', 'allow_all'];
+const MODES: readonly LocalExecMode[] = ['workspace_approval', 'all_files_approval', 'all_files_auto'];
+const LEGACY_MODES: readonly LegacyLocalExecMode[] = ['off', 'risk_prompt', 'allow_all'];
 
-/** Damaged / missing file falls back here — never to `allow_all`. */
-const DEFAULT_MODE: LocalExecMode = 'risk_prompt';
+/** Damaged / missing file falls back here; never to the no-approval mode. */
+const DEFAULT_MODE: LocalExecMode = 'all_files_approval';
 
 export interface LocalExecState {
   mode: LocalExecMode;
-  /** Derived (`mode !== 'off'`). Kept for back-compat with callers / renderer
-   *  that only care whether execution is enabled at all. */
+  /** Kept for legacy callers. New modes all allow local execution; the mode
+   * decides filesystem breadth and approval behavior. */
   granted: boolean;
-  /** Set when leaving `off`. Cleared when entering `off`. */
   grantedAt?: string;
-  /** Set when entering `off`. */
   revokedAt?: string;
 }
 
@@ -66,103 +55,184 @@ interface StoredState {
   revokedAt?: string;
 }
 
+interface StoredFile {
+  version?: number;
+  localExec?: unknown;
+  _field_updated_at?: {
+    localExec?: number;
+  };
+}
+
 function isMode(v: unknown): v is LocalExecMode {
   return typeof v === 'string' && (MODES as readonly string[]).includes(v);
 }
 
+function isLegacyMode(v: unknown): v is LegacyLocalExecMode {
+  return typeof v === 'string' && (LEGACY_MODES as readonly string[]).includes(v);
+}
+
+function migrateLegacyMode(mode: LegacyLocalExecMode): LocalExecMode {
+  if (mode === 'allow_all') return 'all_files_auto';
+  if (mode === 'risk_prompt') return 'all_files_approval';
+  return 'workspace_approval';
+}
+
 function filePath(): string {
+  return userPermissionsFile(getActiveUserId());
+}
+
+function legacyFilePath(): string {
   return path.join(userLocalConfigDir(getActiveUserId()), 'permissions.json');
 }
 
-/** Read + migrate the persisted state. Never throws; defaults on any
- *  ambiguity. Returns the stored shape (mode + timestamps). */
+function _notifyDirty(): void {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
+    sync?.markDirty?.('permissions', 'cloud/config/permissions.json');
+  } catch { /* sync is optional in stripped builds / before account init */ }
+}
+
+function parseStoredFile(raw: string): StoredState | null {
+  const parsed = JSON.parse(raw) as StoredFile;
+  const le = parsed?.localExec;
+  if (!le || typeof le !== 'object') return null;
+
+  const rec = le as Record<string, unknown>;
+  const grantedAt = typeof rec.grantedAt === 'string' ? rec.grantedAt : undefined;
+  const revokedAt = typeof rec.revokedAt === 'string' ? rec.revokedAt : undefined;
+
+  if (isMode(rec.mode)) {
+    return { mode: rec.mode, ...(grantedAt ? { grantedAt } : {}), ...(revokedAt ? { revokedAt } : {}) };
+  }
+  if (isLegacyMode(rec.mode)) {
+    return { mode: migrateLegacyMode(rec.mode), ...(grantedAt ? { grantedAt } : {}), ...(revokedAt ? { revokedAt } : {}) };
+  }
+  if (typeof rec.granted === 'boolean') {
+    return {
+      mode: rec.granted ? 'all_files_approval' : 'workspace_approval',
+      ...(grantedAt ? { grantedAt } : {}),
+      ...(revokedAt ? { revokedAt } : {}),
+    };
+  }
+  return null;
+}
+
+/** Return:
+ *   - `undefined` when the file is missing,
+ *   - `null` when present but invalid/corrupt,
+ *   - StoredState when valid.
+ */
+function readStoredAt(p: string): StoredState | null | undefined {
+  try {
+    if (!fs.existsSync(p)) return undefined;
+    const state = parseStoredFile(fs.readFileSync(p, 'utf8'));
+    if (!state) {
+      log.warn(`${path.basename(p)} did not contain a valid localExec state, defaulting to ${DEFAULT_MODE}`);
+      return null;
+    }
+    return state;
+  } catch (err) {
+    log.warn(`${path.basename(p)} read failed, defaulting to ${DEFAULT_MODE}: ${(err as Error).message}`);
+    return null;
+  }
+}
+
+function readClock(p: string): number {
+  try {
+    if (!fs.existsSync(p)) return 0;
+    const parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
+    const n = Number(parsed?._field_updated_at?.localExec);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
 function readStored(): StoredState {
   const fallback: StoredState = { mode: DEFAULT_MODE };
-  const p = filePath();
-  try {
-    if (!fs.existsSync(p)) return fallback;
-    const parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
-    const le = parsed?.localExec;
-    if (!le || typeof le !== 'object') return fallback;
+  const current = readStoredAt(filePath());
+  if (current === null) return fallback;
+  if (current) return current;
 
-    const grantedAt = typeof le.grantedAt === 'string' ? le.grantedAt : undefined;
-    const revokedAt = typeof le.revokedAt === 'string' ? le.revokedAt : undefined;
-
-    // Preferred: explicit mode.
-    if (isMode(le.mode)) {
-      return { mode: le.mode, ...(grantedAt ? { grantedAt } : {}), ...(revokedAt ? { revokedAt } : {}) };
-    }
-    // Legacy migration: boolean `granted`.
-    if (typeof le.granted === 'boolean') {
-      const mode: LocalExecMode = le.granted ? 'risk_prompt' : 'off';
-      return { mode, ...(grantedAt ? { grantedAt } : {}), ...(revokedAt ? { revokedAt } : {}) };
-    }
-    return fallback;
-  } catch (err) {
-    log.warn(`permissions.json read failed, defaulting to ${DEFAULT_MODE}: ${(err as Error).message}`);
-    return fallback;
+  const legacy = readStoredAt(legacyFilePath());
+  if (legacy === null) return fallback;
+  if (legacy) {
+    writeStored(legacy);
+    try { fs.rmSync(legacyFilePath(), { force: true }); } catch { /* best effort */ }
+    log.info('migrated local access permission to cloud config');
+    return legacy;
   }
+
+  return fallback;
 }
 
 function writeStored(state: StoredState): void {
   const p = filePath();
   fs.mkdirSync(path.dirname(p), { recursive: true });
   const tmp = `${p}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ localExec: state }, null, 2), 'utf8');
+  const clock = Math.max(Date.now(), readClock(p) + 1);
+  fs.writeFileSync(tmp, JSON.stringify({
+    version: 2,
+    localExec: state,
+    _field_updated_at: { localExec: clock },
+  }, null, 2), 'utf8');
   fs.renameSync(tmp, p);
+  _notifyDirty();
 }
 
 function toPublic(state: StoredState): LocalExecState {
   return {
     mode: state.mode,
-    granted: state.mode !== 'off',
+    granted: true,
     ...(state.grantedAt ? { grantedAt: state.grantedAt } : {}),
     ...(state.revokedAt ? { revokedAt: state.revokedAt } : {}),
   };
 }
 
-/** Snapshot the full local-exec permission state. */
 export function getLocalExecState(): LocalExecState {
   return toPublic(readStored());
 }
 
-/** Current mode. */
 export function getLocalExecMode(): LocalExecMode {
   return readStored().mode;
 }
 
-/** Fast boolean check used by the tool wrappers on every execute(): is *any*
- *  execution allowed? `risk_prompt` and `allow_all` are both "granted"; the
- *  bash-specific prompting happens separately inside the bash tool. */
+/** Legacy boolean check retained for existing tool wrappers. New modes all
+ * allow local execution; scope/approval is enforced separately. */
 export function getLocalExecGranted(): boolean {
-  return getLocalExecMode() !== 'off';
+  return true;
 }
 
-/** Set the mode. Stamps grantedAt (leaving off) or revokedAt (entering off);
- *  "latest wins", no history kept. Returns the new public state. */
+export function localAccessAllowsOutsideWorkspace(mode: LocalExecMode = getLocalExecMode()): boolean {
+  return mode === 'all_files_approval' || mode === 'all_files_auto';
+}
+
+export function localAccessRequiresSensitiveApproval(mode: LocalExecMode = getLocalExecMode()): boolean {
+  return mode !== 'all_files_auto';
+}
+
 export function setLocalExecMode(mode: LocalExecMode): LocalExecState {
-  if (!isMode(mode)) throw new Error(`invalid local-exec mode: ${String(mode)}`);
-  const next: StoredState = mode === 'off'
-    ? { mode, revokedAt: nowIso() }
-    : { mode, grantedAt: nowIso() };
+  if (!isMode(mode)) throw new Error(`invalid local-access mode: ${String(mode)}`);
+  const next: StoredState = { mode, grantedAt: nowIso() };
   writeStored(next);
-  log.info(`tool execution mode set: ${mode}`);
+  log.info(`local access mode set: ${mode}`);
   return toPublic(next);
 }
 
 // ── Back-compat helpers (legacy IPC / tests) ─────────────────────────────
 
-/** Legacy "enable" (the old binary "grant tool access"). Maps to `allow_all`
- *  to preserve its historical behavior — execution on, no bash prompting.
- *  NOTE: this is distinct from the NEW-INSTALL / migrated default, which is
- *  the safer `risk_prompt`. A legacy boolean `granted:true` on disk migrates
- *  to `risk_prompt` (see readStored); an explicit runtime grant means "fully
- *  on". The new settings UI uses `setLocalExecMode` directly. */
+/** Legacy "enable" maps to the most permissive new mode, matching the old
+ * explicit grant behavior of "run without asking". */
 export function grantLocalExec(): LocalExecState {
-  return setLocalExecMode('allow_all');
+  return setLocalExecMode('all_files_auto');
 }
 
-/** Legacy "disable": maps to `off`. */
+/** Legacy "disable" no longer exists in the product. Map it to the safest
+ * available new mode. */
 export function revokeLocalExec(): LocalExecState {
-  return setLocalExecMode('off');
+  const next: StoredState = { mode: 'workspace_approval', revokedAt: nowIso() };
+  writeStored(next);
+  log.info('legacy local execution revoke mapped to workspace_approval');
+  return toPublic(next);
 }

@@ -11,10 +11,11 @@
  *                                wrapper (preview + reference); the model can
  *                                pull the original back via read_file(path)
  *
- * Read-class tools (`read_file` / `kb_read`) cap at 100K like other
- * content-returning tools. The original content is spilled to disk when
- * oversized, so the model can re-page it with charStart/charEnd instead of
- * carrying an uncapped blob in context.
+ * Read-class tools (`read_file` / `kb_read`) cap at 100K (DEFAULT) like the
+ * other content tools — a >100K read spills, and re-inspection stays lossless
+ * because they re-page any range via charStart/charEnd. (The Infinity =
+ * pass-through path below is still the generic exempt mechanism for any future
+ * tool that needs it.)
  *
  * Pure-function util: Node stdlib only, never imports features/ or model/.
  */
@@ -24,6 +25,7 @@ import * as path from 'path';
 import { createHash } from 'crypto';
 import type { AgentTool, ToolResult, ToolContext } from '#core-agent';
 import { createLogger } from '../logger';
+import { logErrorRef, logPathRef, maskId } from './log-redact';
 
 const log = createLogger('util/tool-result-cap');
 
@@ -40,10 +42,14 @@ const log = createLogger('util/tool-result-cap');
  *  strings — no point giving them 100K headroom.
  */
 export const MAX_RESULT_CHARS_BY_TOOL: Record<string, number> = {
-  // Read-class tools used to be Infinity (exempt). They now cap at 100K like
-  // the other content-returning tools: a single lazy whole-file read of a large
-  // file otherwise dumps uncapped into context. Re-inspection stays lossless
-  // because read_file/kb_read can re-page any range via charStart/charEnd.
+  // Read-class tools used to be Infinity (exempt). They now cap at 100K like the
+  // other content-returning tools (web_fetch / web_search): a single lazy
+  // whole-file read of a large file (read_file with no charEnd returns the WHOLE
+  // file) otherwise dumps uncapped into context and can dominate the compaction
+  // tail or even blow the window. Reads ≤100K are unchanged (the vast majority);
+  // a >100K read spills to disk + returns a preview + path, and re-inspection
+  // stays lossless because read_file/kb_read can re-page any range via
+  // charStart/charEnd — better than web_fetch's re-fetch.
   read_file: 100_000,
   kb_read: 100_000,
   bash: 30_000,
@@ -102,6 +108,13 @@ export function wrapToolWithCap(tool: AgentTool, opts: WrapOpts): AgentTool {
     name: tool.name,
     description: tool.description,
     inputSchema: tool.inputSchema,
+    // Preserve the concurrency flag — without this the wrapper silently makes
+    // EVERY capped tool sequential (the runner's G4 partitioner keys on
+    // `executionMode === 'parallel'`), defeating parallel reads/search AND
+    // concurrent dispatch (run_worker / dispatch_to). This now also matters for
+    // read_file / kb_read: they used to be returned unwrapped (Infinity) and
+    // kept their parallel mode natively, but now flow through this wrapper, so
+    // their executionMode must be carried over here.
     ...(tool.executionMode ? { executionMode: tool.executionMode } : {}),
     async execute(input: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
       const result = await tool.execute(input, ctx);
@@ -113,14 +126,28 @@ export function wrapToolWithCap(tool: AgentTool, opts: WrapOpts): AgentTool {
       // feeding back a slice for the model to triage, but spilling huge
       // error text as orphan files has no value.
       if (result.isError) {
-        log.info(`truncated (error) tool=${tool.name} session=${sid} len=${len} cap=${opts.maxChars} removed=${len - opts.maxChars}`);
+        log.info('tool result truncated', {
+          tool: tool.name,
+          session_id: maskId(sid),
+          len,
+          cap: opts.maxChars,
+          removed: len - opts.maxChars,
+          is_error: true,
+        });
         return { ...result, content: truncate(content, opts.maxChars, tool.name) };
       }
 
       // Normal result over cap but below the spill threshold: in-place
       // truncation + trailing marker.
       if (len <= PERSIST_THRESHOLD) {
-        log.info(`truncated tool=${tool.name} session=${sid} len=${len} cap=${opts.maxChars} removed=${len - opts.maxChars}`);
+        log.info('tool result truncated', {
+          tool: tool.name,
+          session_id: maskId(sid),
+          len,
+          cap: opts.maxChars,
+          removed: len - opts.maxChars,
+          is_error: false,
+        });
         return { ...result, content: truncate(content, opts.maxChars, tool.name) };
       }
 
@@ -128,14 +155,24 @@ export function wrapToolWithCap(tool: AgentTool, opts: WrapOpts): AgentTool {
       // return a <persisted-output> reference.
       try {
         const absPath = persistToolResult(opts.toolResultsDir, tool.name, content);
-        log.info(`persisted tool=${tool.name} session=${sid} size=${len} path=${absPath}`);
+        log.info('tool result persisted', {
+          tool: tool.name,
+          session_id: maskId(sid),
+          size: len,
+          path: logPathRef(absPath),
+        });
         return { ...result, content: buildPersistedOutputMarker(absPath, tool.name, content) };
       } catch (err) {
         // Disk-write failure degrades to in-place truncation — the model
         // at least gets the first maxChars characters, which is more useful
         // than a hard cut. warn level because this is a real I/O exception
         // (disk full / permission lost) and the user can trace it from logs.
-        log.warn(`persist failed, falling back to truncate tool=${tool.name} session=${sid} size=${len}: ${(err as Error).message}`);
+        log.warn('tool result persist failed; falling back to truncate', {
+          tool: tool.name,
+          session_id: maskId(sid),
+          size: len,
+          error: logErrorRef(err),
+        });
         return {
           ...result,
           content:
@@ -192,7 +229,12 @@ export function maybeSpillToolResult(opts: {
   }
   try {
     const abs = persistToolResult(toolResultsDir, toolName, output);
-    log.info(`cli tool spill tool=${toolName} session=${path.basename(toolResultsDir)} size=${output.length} path=${abs}`);
+    log.info('cli tool result spilled', {
+      tool: toolName,
+      session_id: maskId(path.basename(toolResultsDir)),
+      size: output.length,
+      path: logPathRef(abs),
+    });
     // Same preview shape as the in-process path so the renderer's
     // click-to-expand logic works identically.
     return {
@@ -202,7 +244,10 @@ export function maybeSpillToolResult(opts: {
   } catch (err) {
     // Disk-write failure: surface a truncated preview rather than the
     // full payload so we don't blow up the event stream.
-    log.warn(`cli tool spill failed, falling back to truncated preview tool=${toolName}: ${(err as Error).message}`);
+    log.warn('cli tool spill failed; falling back to truncated preview', {
+      tool: toolName,
+      error: logErrorRef(err),
+    });
     const head = output.slice(0, PREVIEW_HEAD);
     return {
       output: `${head}\n\n[note: oversized output spill failed: ${(err as Error).message}]`,
@@ -255,7 +300,11 @@ export function sweepToolResults(userToolResultsDir: string, maxAgeDays = 7): vo
       }
     } catch { /* per-entry best-effort */ }
   }
-  if (removed) log.info(`swept ${removed} stale entries dir=${userToolResultsDir} maxAgeDays=${maxAgeDays}`);
+  if (removed) log.info('swept stale tool-result entries', {
+    removed,
+    dir: logPathRef(userToolResultsDir),
+    maxAgeDays,
+  });
 }
 
 function sha1(s: string): string {

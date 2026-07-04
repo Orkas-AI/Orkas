@@ -14,6 +14,7 @@
  */
 
 import { createLogger } from '../../../logger.js';
+import { logErrorSummary } from '../../../util/log-redact.js';
 import {
   type LocalBackend,
   type BackendRunOptions,
@@ -115,7 +116,7 @@ export const claudeBackend: LocalBackend = {
       try {
         child.stdin.write(JSON.stringify(response) + '\n');
       } catch (err) {
-        log.warn('claude control_response write failed', { error: (err as Error).message });
+        log.warn('claude control_response write failed', { error: logErrorSummary(err) });
       }
     };
 
@@ -223,7 +224,7 @@ export const claudeBackend: LocalBackend = {
       };
 
       child.on('error', err => {
-        log.warn('claude spawn error', { error: (err as Error).message });
+        log.warn('claude spawn error', { error: logErrorSummary(err) });
         finish('failed', { error: (err as Error).message, stderrTail: tail.toString() });
       });
       child.on('close', code => {

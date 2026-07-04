@@ -14,6 +14,7 @@
  *       { "id": "abc123def456", "version": "1.0.0", "published_at": 1747066800000,
  *         "updated_at": 1747067800000,
  *         "agent_json_url": "https://orkas-1367889399.cos.../agent.json",
+ *         "agent_skills_bundle_url": "https://orkas-1367889399.cos.../skills.zip",
  *         "installed_at": 1747066800100 }
  *     ],
  *     "skills": [
@@ -54,7 +55,11 @@ import { isExpiredMsTombstone } from '../util/tombstone_retention';
 const log = createLogger('marketplace_installs');
 
 function _markInstallsDirty(): void {
-  // The open-source build is local-only; cloud sync notification is intentionally absent.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
+    sync?.markDirty?.('marketplace', 'cloud/marketplace/installs.json');
+  } catch { /* sync feature may be stripped or not initialized yet */ }
 }
 
 // Per-uid mutex covering the RMW cycle of add*/remove* (read manifest → mutate → write).
@@ -78,6 +83,11 @@ export interface AgentInstall {
    *  rows still parse and fall back to `published_at`. */
   updated_at?: number;
   agent_json_url: string;
+  /** Optional zip containing agent-private skills. The zip root is the agent's `skills/`
+   *  directory, so entries look like `<skill_id>/SKILL.md`. Empty string means the server
+   *  explicitly has no private skills; undefined means an old manifest row has not learned
+   *  the field yet and reconcile may resolve it through `/agents/detail`. */
+  agent_skills_bundle_url?: string;
   installed_at: number;
   /** Author uid as recorded on the server. `"0"` is the official-platform marker (label
    *  `marketplace.author_platform`); everything else is a community uploader. Optional
@@ -91,6 +101,10 @@ export interface AgentInstall {
   status?: string;
   /** Legacy local metadata name, read for compatibility during the status merge. */
   state?: string;
+  /** Internal marker for install rows seeded from `resources/builtin/marketplace/`.
+   *  These rows may start without server URLs; online resolution patches them
+   *  into ordinary marketplace rows. */
+  seed_source?: 'builtin' | string;
 }
 
 export interface SkillInstall {
@@ -109,6 +123,8 @@ export interface SkillInstall {
   status?: string;
   /** Legacy local metadata name, read for compatibility during the status merge. */
   state?: string;
+  /** Same as `AgentInstall.seed_source`. */
+  seed_source?: 'builtin' | string;
 }
 
 export const CURRENT_VERSION = 1;
@@ -124,6 +140,13 @@ export interface InstallsManifest {
 }
 
 const EMPTY: InstallsManifest = { version: CURRENT_VERSION, agents: [], skills: [] };
+
+export const DEFAULT_MARKETPLACE_VERSION = '1.0.0';
+
+export function normalizeInstallVersion(value: unknown): string {
+  const text = typeof value === 'string' ? value.trim() : '';
+  return text || DEFAULT_MARKETPLACE_VERSION;
+}
 
 export async function readInstalls(uid: string): Promise<InstallsManifest> {
   const file = userMarketplaceInstallsFile(uid);
@@ -144,8 +167,8 @@ export async function readInstalls(uid: string): Promise<InstallsManifest> {
     }
     return {
       version: CURRENT_VERSION,
-      agents: Array.isArray(parsed.agents) ? parsed.agents.filter(_isAgentRow) : [],
-      skills: Array.isArray(parsed.skills) ? parsed.skills.filter(_isSkillRow) : [],
+      agents: Array.isArray(parsed.agents) ? parsed.agents.filter(_isAgentRow).map(_normalizeAgentRow) : [],
+      skills: Array.isArray(parsed.skills) ? parsed.skills.filter(_isSkillRow).map(_normalizeSkillRow) : [],
       ...(_readDeletedAt(parsed) ? { _deleted_at: _readDeletedAt(parsed) } : {}),
     };
   } catch (err) {
@@ -175,6 +198,7 @@ export async function addAgentInstall(uid: string, row: Omit<AgentInstall, 'inst
     const entry: AgentInstall = {
       ...(previous || {}),
       ...row,
+      version: normalizeInstallVersion(row.version || previous?.version),
       installed_at: row.installed_at || previous?.installed_at || Date.now(),
     };
     if (idx >= 0) manifest.agents[idx] = entry;
@@ -182,7 +206,7 @@ export async function addAgentInstall(uid: string, row: Omit<AgentInstall, 'inst
     delete manifest._deleted_at?.agents?.[row.id];
     _pruneDeletedAt(manifest);
     await writeInstalls(uid, manifest);
-    log.info(`agent installed id=${row.id} v${row.version}`);
+    log.info(`agent installed id=${row.id} v${entry.version}`);
   });
 }
 
@@ -194,6 +218,7 @@ export async function addSkillInstall(uid: string, row: Omit<SkillInstall, 'inst
     const entry: SkillInstall = {
       ...(previous || {}),
       ...row,
+      version: normalizeInstallVersion(row.version || previous?.version),
       installed_at: row.installed_at || previous?.installed_at || Date.now(),
     };
     if (idx >= 0) manifest.skills[idx] = entry;
@@ -201,7 +226,7 @@ export async function addSkillInstall(uid: string, row: Omit<SkillInstall, 'inst
     delete manifest._deleted_at?.skills?.[row.id];
     _pruneDeletedAt(manifest);
     await writeInstalls(uid, manifest);
-    log.info(`skill installed id=${row.id} v${row.version}`);
+    log.info(`skill installed id=${row.id} v${entry.version}`);
   });
 }
 
@@ -256,6 +281,14 @@ function _isSkillRow(x: unknown): x is SkillInstall {
   return typeof r.id === 'string' && typeof r.version === 'string'
     && typeof r.published_at === 'number' && typeof r.bundle_url === 'string'
     && typeof r.installed_at === 'number';
+}
+
+function _normalizeAgentRow(row: AgentInstall): AgentInstall {
+  return { ...row, version: normalizeInstallVersion(row.version) };
+}
+
+function _normalizeSkillRow(row: SkillInstall): SkillInstall {
+  return { ...row, version: normalizeInstallVersion(row.version) };
 }
 
 function _readDeletedAt(parsed: Partial<InstallsManifest> & { version?: unknown }): InstallsManifest['_deleted_at'] | null {

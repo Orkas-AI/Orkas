@@ -101,11 +101,15 @@ export const bashTool: AgentTool = defineTool({
   async execute(input, ctx) {
     const command = input.command as string;
     const timeoutMs = normalizeBashTimeoutMs(input.timeoutMs);
+    const sandboxAllowedDirs = Array.isArray(ctx.state.sandboxAllowedDirs)
+      ? ctx.state.sandboxAllowedDirs.filter((v): v is string => typeof v === "string" && v.length > 0)
+      : undefined;
 
     const sandbox = new SandboxExecutor({
       workingDir: ctx.workingDir ?? ".",
       timeoutMs,
       env: ctx.state.sandboxEnv as Record<string, string> | undefined,
+      allowedDirs: sandboxAllowedDirs,
       signal: ctx.signal,
     });
 

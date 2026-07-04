@@ -122,13 +122,19 @@ function savedAppRelPath(appId: string, rel = ''): string {
 }
 
 function notifySavedAppDirty(appId: string, rel = ''): void {
-  void appId;
-  void rel;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
+    sync?.markDirty?.('saved_apps', savedAppRelPath(appId, rel));
+  } catch { /* features/sync stripped */ }
 }
 
 function notifySavedAppDeleted(appId: string, rel: string): void {
-  void appId;
-  void rel;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = null as { markDeleted?: (relPath: string) => Promise<void> | void };
+    void sync?.markDeleted?.(savedAppRelPath(appId, rel));
+  } catch { /* features/sync stripped */ }
 }
 
 function isInsideAnyRoot(candidate: string, roots: string[]): boolean {

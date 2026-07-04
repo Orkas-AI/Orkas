@@ -65,6 +65,11 @@ export interface ShellInvocation {
   kind: ShellKind;
 }
 
+type SpawnInvocation = {
+  command: string;
+  args: string[];
+};
+
 function windowsSystem32Tool(name: string): string {
   const root = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
   return path.win32.join(root, "System32", name);
@@ -205,6 +210,63 @@ function decodeWithEncoding(bytes: Buffer, encoding: string): string | null {
   }
 }
 
+function canonicalSandboxPath(input: string): string {
+  const abs = path.resolve(input);
+  try {
+    return fs.realpathSync.native(abs);
+  } catch {
+    return abs;
+  }
+}
+
+function uniqueSandboxDirs(input: readonly string[] | undefined): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const dir of input ?? []) {
+    if (!dir) continue;
+    const abs = canonicalSandboxPath(dir);
+    if (seen.has(abs)) continue;
+    seen.add(abs);
+    out.push(abs);
+  }
+  return out;
+}
+
+function escapeSandboxString(input: string): string {
+  return input.replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
+}
+
+function macWriteSandboxAvailable(platform: NodeJS.Platform = process.platform): boolean {
+  return platform === "darwin" && fs.existsSync("/usr/bin/sandbox-exec");
+}
+
+function macWriteSandboxProfile(allowedDirs: readonly string[]): string {
+  const forms = [
+    '(literal "/dev/null")',
+    ...allowedDirs.map((dir) => `(subpath "${escapeSandboxString(dir)}")`),
+  ];
+  return [
+    "(version 1)",
+    "(allow default)",
+    "(deny file-write*)",
+    `(allow file-write* ${forms.join(" ")})`,
+  ].join("\n");
+}
+
+function maybeWrapWithMacWriteSandbox(
+  invocation: ShellInvocation,
+  allowedDirs: readonly string[] | undefined,
+): SpawnInvocation {
+  const dirs = uniqueSandboxDirs(allowedDirs);
+  if (!dirs.length || !macWriteSandboxAvailable()) {
+    return { command: invocation.command, args: invocation.args };
+  }
+  return {
+    command: "/usr/bin/sandbox-exec",
+    args: ["-p", macWriteSandboxProfile(dirs), invocation.command, ...invocation.args],
+  };
+}
+
 function decodedTextScore(text: string): number {
   if (!text) return 0;
   let score = countMatches(text, /\uFFFD/g) * 100;
@@ -295,6 +357,26 @@ function buildWindowsCanonicalPathEntries(env: NodeJS.ProcessEnv): string[] {
   }
   addPythonInstallDirs(programFiles, add);
 
+  return out;
+}
+
+function buildPosixCanonicalPathEntries(env: NodeJS.ProcessEnv): string[] {
+  const home = getEnvValue(env, ["HOME"]);
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (entry: string | undefined) => {
+    if (!entry) return;
+    const normalized = path.posix.normalize(entry);
+    if (seen.has(normalized)) return;
+    seen.add(normalized);
+    out.push(normalized);
+  };
+
+  for (const entry of CANONICAL_PATH_ENTRIES) add(entry);
+  add("/opt/homebrew/share/google-cloud-sdk/bin");
+  add("/usr/local/share/google-cloud-sdk/bin");
+  add("/opt/google-cloud-sdk/bin");
+  if (home) add(path.posix.join(home, "google-cloud-sdk", "bin"));
   return out;
 }
 
@@ -397,7 +479,7 @@ export class SandboxExecutor {
       shell: defaultShellForPlatform(),
       ...config,
       workingDir: path.resolve(config.workingDir),
-      allowedDirs: config.allowedDirs?.map((d) => path.resolve(d)),
+      allowedDirs: uniqueSandboxDirs(config.allowedDirs),
       blockedCommands: [
         ...DEFAULT_BLOCKED_COMMANDS,
         ...(config.blockedCommands ?? []),
@@ -457,7 +539,10 @@ export class SandboxExecutor {
         env.SANDBOX_NO_NETWORK = "1";
       }
 
-      const invocation = buildShellInvocation(this.config.shell, command);
+      const invocation = maybeWrapWithMacWriteSandbox(
+        buildShellInvocation(this.config.shell, command),
+        this.config.allowedDirs,
+      );
       const child = spawn(invocation.command, invocation.args, {
         cwd,
         env,
@@ -590,7 +675,10 @@ export class SandboxExecutor {
       return { pid: null, error: `cannot open log file: ${(err as Error).message}` };
     }
     try {
-      const invocation = buildShellInvocation(this.config.shell, command);
+      const invocation = maybeWrapWithMacWriteSandbox(
+        buildShellInvocation(this.config.shell, command),
+        this.config.allowedDirs,
+      );
       const child = spawn(invocation.command, invocation.args, {
         cwd: this.config.workingDir,
         env,
@@ -651,7 +739,7 @@ export function augmentPath(
   const delimiter = platform === "win32" ? ";" : ":";
   const canonical = platform === "win32"
     ? buildWindowsCanonicalPathEntries(env)
-    : CANONICAL_PATH_ENTRIES;
+    : buildPosixCanonicalPathEntries(env);
   const existing = (input ?? "").split(delimiter).filter(Boolean);
   const existingSet = new Set(existing);
   const missing = canonical.filter((p) => !existingSet.has(p));

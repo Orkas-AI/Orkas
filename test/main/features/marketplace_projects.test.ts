@@ -20,7 +20,7 @@ describe('marketplace projects catalog', () => {
     const marketplace = await loadMarketplace();
     const home = await marketplace.listMarketplaceProjects({ home_only: true });
 
-    expect(home.list.map((p) => p.id)).toEqual(['hyperframes', 'ppt-master', 'OfficeCLI', 'crawl4ai']);
+    expect(home.list.map((p) => p.id)).toEqual(['hyperframes', 'ppt-master', 'OfficeCLI', 'Lark-CLI', 'crawl4ai']);
     expect(home.categories.map((c) => c.code)).toEqual(['anim', 'browser', 'office', 'slides']);
     expect(home.source).toBe('bundled');
     expect(home.stale).toBe(true);

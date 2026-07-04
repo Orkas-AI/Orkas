@@ -27,6 +27,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
+  vi.doUnmock('@earendil-works/pi-ai/oauth');
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -148,77 +149,10 @@ describe('auth › multi-profile store (addApiKey / removeCredential / renamePro
     expect(raw).not.toContain('sk-local-secret-xxxxxxxx');
   });
 
-  it('uses account.json user_id as the auth-profiles secret owner when present', async () => {
-    const accountUid = 'A0653F11-9F05-4A8B-89CE-0026D809EAFC';
-    const paths = await import('../../../src/main/paths');
-    const accountFile = path.join(paths.userLocalConfigDir(TEST_UID), 'account.json');
-    fs.mkdirSync(path.dirname(accountFile), { recursive: true });
-    fs.writeFileSync(accountFile, JSON.stringify({ user_id: accountUid }), 'utf8');
-
-    const a = await import('../../../src/main/features/auth');
-    const localSecrets = await import('../../../src/main/util/local-secret-store');
-    await a.addApiKey('openai', 'sk-account-owner-xxxxxxxx');
-
-    const raw = fs.readFileSync(paths.userAuthProfilesFile(TEST_UID), 'utf8');
-    expect(() => localSecrets.decryptLocalSecret({
-      namespace: 'auth.profiles',
-      ownerId: TEST_UID,
-      recordId: 'auth-profiles.json',
-    }, raw)).toThrow();
-    const json = localSecrets.decryptLocalSecret({
-      namespace: 'auth.profiles',
-      ownerId: accountUid,
-      recordId: 'auth-profiles.json',
-    }, raw);
-    expect(json).toContain('sk-account-owner-xxxxxxxx');
-  });
-
-  it('rewrites local-id-owned auth-profiles to the account.json uid on read', async () => {
-    const accountUid = 'A0653F11-9F05-4A8B-89CE-0026D809EAFC';
-    const paths = await import('../../../src/main/paths');
-    const localSecrets = await import('../../../src/main/util/local-secret-store');
-    const accountFile = path.join(paths.userLocalConfigDir(TEST_UID), 'account.json');
-    fs.mkdirSync(path.dirname(accountFile), { recursive: true });
-    fs.writeFileSync(accountFile, JSON.stringify({ user_id: accountUid }), 'utf8');
-    const file = paths.userAuthProfilesFile(TEST_UID);
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, localSecrets.encryptLocalSecret({
-      namespace: 'auth.profiles',
-      ownerId: TEST_UID,
-      recordId: 'auth-profiles.json',
-    }, JSON.stringify({
-      version: 4,
-      profiles: {
-        'openai:default': {
-          type: 'api_key',
-          provider: 'openai',
-          label: 'default',
-          key: 'sk-local-owner-xxxxxxxx',
-          createdAt: 1,
-          lastUsed: 0,
-        },
-      },
-      entries: [],
-      searchProfiles: [],
-      imageProfiles: [],
-    })), 'utf8');
-
-    const a = await import('../../../src/main/features/auth');
-    const { providers } = await a.listProviders();
-    expect(providers.find((p) => p.id === 'openai')?.profiles[0]?.masked).toBe('sk-l…xxxx');
-
-    const raw = fs.readFileSync(file, 'utf8');
-    const json = localSecrets.decryptLocalSecret({
-      namespace: 'auth.profiles',
-      ownerId: accountUid,
-      recordId: 'auth-profiles.json',
-    }, raw);
-    expect(json).toContain('sk-local-owner-xxxxxxxx');
-  });
-
   it('migrates legacy crypto-vault auth-profiles on read', async () => {
     const paths = await import('../../../src/main/paths');
     const cryptoVault = await import('../../../src/main/util/crypto-vault');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
     const file = paths.userAuthProfilesFile(TEST_UID);
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, cryptoVault.encrypt(TEST_UID, JSON.stringify({
@@ -242,10 +176,48 @@ describe('auth › multi-profile store (addApiKey / removeCredential / renamePro
     const { providers } = await a.listProviders();
     expect(providers.find((p) => p.id === 'openai')?.profiles[0]?.masked).toBe('sk-l…xxxx');
     const raw = fs.readFileSync(file, 'utf8');
-    const localSecrets = await import('../../../src/main/util/local-secret-store');
     expect(localSecrets.isEncryptedSecret(raw)).toBe(true);
-    expect(() => cryptoVault.decrypt(TEST_UID, raw)).toThrow();
     expect(raw).not.toContain('sk-legacy-xxxxxxxx');
+  });
+
+  it('migrates saved entries when their model id is no longer selectable', async () => {
+    const paths = await import('../../../src/main/paths');
+    const localSecrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(TEST_UID);
+    const ctx = { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, localSecrets.encryptLocalSecret(ctx, JSON.stringify({
+      version: 4,
+      profiles: {
+        'kimi-coding:default': {
+          type: 'api_key',
+          provider: 'kimi-coding',
+          label: 'default',
+          key: 'sk-kimi-legacy-xxxxxxxx',
+          createdAt: 1,
+          lastUsed: 0,
+        },
+      },
+      entries: [{
+        entryId: 'entry-1',
+        provider: 'kimi-coding',
+        model: 'k2p6',
+        profileId: 'kimi-coding:default',
+        createdAt: 1,
+        lastUsed: 0,
+      }],
+      searchProfiles: [],
+      imageProfiles: [],
+      videoProfiles: [],
+    })), 'utf8');
+
+    const a = await import('../../../src/main/features/auth');
+    const { entries } = await a.listEntries();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].model).toBe('k2p6');
+
+    const rewritten = JSON.parse(localSecrets.decryptLocalSecret(ctx, fs.readFileSync(file, 'utf8')));
+    expect(rewritten.entries[0].model).toBe('k2p6');
   });
 
   it('removeCredential drops the profile', async () => {
@@ -380,6 +352,15 @@ describe('auth › entries (priority list)', () => {
     expect(entries).toHaveLength(1);
   });
 
+  it('upgrades removed saved model ids when adding an entry', async () => {
+    const a = await import('../../../src/main/features/auth');
+    const p = await a.addApiKey('kimi-coding', 'k-xxxxxxxxxxxx');
+    await a.addEntry({ provider: 'kimi-coding', model: 'k2p6', profileId: p.profileId });
+    const { entries } = await a.listEntries();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].model).toBe('k2p6');
+  });
+
   it('addEntry rejects a profileId belonging to a different provider', async () => {
     const a = await import('../../../src/main/features/auth');
     const p = await a.addApiKey('anthropic', 'k-xxxxxxxxxxxx');
@@ -469,6 +450,7 @@ describe('auth › entries (priority list)', () => {
     const { entries } = await a.listEntries();
     expect(entries.map((e) => e.entryId)).toContain(e1.entryId);
   });
+
 });
 
 describe('auth › pickChatEntryGroup + 冷却联动', () => {

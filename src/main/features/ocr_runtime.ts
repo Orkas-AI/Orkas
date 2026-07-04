@@ -464,6 +464,59 @@ export async function ocrFile(input: OcrFileInput): Promise<OcrFileResult> {
   }
 }
 
+export type OcrImageTextResult =
+  | { ok: true; text: string; items: Array<{ text: string; score?: number }> }
+  | {
+      ok: false;
+      errorCode: 'E_OCR_RUNTIME_MISSING' | 'E_OCR_INSTALL_FAILED' | 'E_OCR_UNSUPPORTED_FILE' | 'E_OCR_FAILED';
+      message: string;
+    };
+
+/**
+ * Raw single-image OCR for programmatic callers (e.g. the video agent grounding
+ * narration on a slide / screen-recording's on-screen text). Reuses the SAME
+ * cross-platform RapidOCR + ONNXRuntime runtime as `ocrFile` (bundled Python/uv,
+ * first-use wheel install, per-platform venv, Windows-aware), but skips the
+ * PDF/markdown/cache layer and returns the recognized text directly.
+ *
+ * No model fallback here — on failure it returns a stable `E_OCR_*` code and the
+ * caller (workflow/skill) owns whether to fall back to its own vision or stop.
+ */
+export async function ocrImageText(input: {
+  absPath: string;
+  signal?: AbortSignal;
+  onProgress?: ProgressFn;
+}): Promise<OcrImageTextResult> {
+  if (extKind(input.absPath) !== 'image') {
+    return { ok: false, errorCode: 'E_OCR_UNSUPPORTED_FILE', message: `ocrImageText needs an image file: ${input.absPath}` };
+  }
+  const runtime = await ensureRuntime(input.onProgress);
+  if (runtime.ok === false) {
+    return { ok: false, errorCode: runtime.errorCode, message: runtime.message };
+  }
+  const payload = JSON.stringify({ path: input.absPath, kind: 'image', pages: '', scale: 2 });
+  let stdout = '';
+  try {
+    stdout = await runOcrProcess(runtime.python, payload, input.onProgress, input.signal);
+  } catch (err) {
+    return { ok: false, errorCode: 'E_OCR_FAILED', message: `Local OCR failed: ${(err as Error).message}` };
+  }
+  try {
+    const parsed = JSON.parse(stdout) as {
+      ok?: boolean;
+      error?: unknown;
+      pages?: Array<{ text?: string; items?: Array<{ text: string; score?: number }> }>;
+    };
+    if (!parsed?.ok) {
+      return { ok: false, errorCode: 'E_OCR_FAILED', message: String(parsed?.error || 'Local OCR failed') };
+    }
+    const page = (parsed.pages && parsed.pages[0]) || {};
+    return { ok: true, text: String(page.text || '').trim(), items: Array.isArray(page.items) ? page.items : [] };
+  } catch (err) {
+    return { ok: false, errorCode: 'E_OCR_FAILED', message: `Local OCR returned invalid output: ${(err as Error).message}` };
+  }
+}
+
 // Keep this script dependency-light and resilient across RapidOCR package API
 // changes. The pinned `rapidocr` package needs a string model_root_dir here:
 // passing its default pathlib.Path trips OmegaConf on some Python versions.

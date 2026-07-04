@@ -44,6 +44,7 @@ describe("Providers (pi-ai backed)", () => {
       const provider = createPiProvider({ provider: "google" });
       expect(provider.id).toBe("google");
     });
+
   });
 
   describe("listPiProviders / listPiModels", () => {

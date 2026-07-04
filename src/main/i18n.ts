@@ -17,7 +17,7 @@ import * as fs from 'node:fs';
 
 import { SRC_ROOT } from './paths';
 
-export type Lang = 'zh' | 'en' | 'ja';
+export type Lang = 'zh' | 'en' | 'ja' | 'pt';
 
 export interface LocaleMeta {
   code: Lang;
@@ -51,6 +51,14 @@ export const LOCALES: readonly LocaleMeta[] = [
     htmlLang: 'ja',
     intlLocale: 'ja-JP',
     llmName: 'Japanese (日本語)',
+    fallback: 'en',
+  },
+  {
+    code: 'pt',
+    label: 'Português (Brasil)',
+    htmlLang: 'pt-BR',
+    intlLocale: 'pt-BR',
+    llmName: 'Brazilian Portuguese (Português do Brasil)',
     fallback: 'en',
   },
 ] as const;

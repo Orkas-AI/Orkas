@@ -18,7 +18,7 @@ const _ossLog = createLogger('oss');
 // Keyed by the OSS category codes the Server actually serves (see
 // oss_catalog_mgr.py::DEFAULT_OSS_CATEGORIES + conf/marketplace/oss_projects.json).
 // Unknown codes fall back to 'sparkles', so keep this in sync when a category is
-// added Server-side (office/slides were added for OfficeCLI / PPT-Master).
+// added Server-side (office/slides are first-party curated categories).
 const _OSS_CAT_ICON = {
   anim: 'sparkles',
   browser: 'globe',
@@ -34,6 +34,10 @@ function ossIconFor(cat) { return _OSS_CAT_ICON[cat] || 'sparkles'; }
 // hammer the Server.
 const OSS_CATALOG_REVALIDATE_MS = 5 * 60 * 1000;
 const OSS_MARKETPLACE_PAGE_SIZE = 100;
+// Bump this when the built-in OSS catalog shape changes. The renderer hydrates
+// disk cache before asking main/server, so old project keys can otherwise keep
+// the home strip pinned to a pre-release catalog after an app restart.
+const OSS_CATALOG_CACHE_VERSION = 2;
 let _ossCatalogHydrated = false;
 let _ossCatalogHydratePromise = null;
 const _ossCatalogCache = new Map();
@@ -62,6 +66,7 @@ function ossCatalogCacheKey(forceOrOpts) {
   const opts = _ossNormalizeCatalogOpts(forceOrOpts);
   return [
     'project',
+    OSS_CATALOG_CACHE_VERSION,
     opts.homeOnly ? 'home' : 'all',
     opts.category || '',
     opts.q || '',
@@ -247,6 +252,19 @@ function ossDriverBadgeHtml(driver) {
 
 function ossGithubUrl(p) { return (p && p.repo) ? ('https://github.com/' + p.repo) : ''; }
 
+function ossRepoInstallKey(repoOrUrl) {
+  const raw = String(repoOrUrl || '').trim();
+  if (!raw) return '';
+  const normalized = raw
+    .replace(/^git\+/i, '')
+    .replace(/^https:\/\/github\.com\//i, '')
+    .replace(/^git@github\.com:/i, '')
+    .replace(/\.git$/i, '')
+    .replace(/\/+$/g, '')
+    .toLowerCase();
+  return normalized ? `repo:${normalized}` : '';
+}
+
 // Prompt for ① capability cards: NAMES the project + URL, leaves the user's
 // concrete task blank (a `[...]` placeholder the caret lands on), and tells the
 // Commander to use the project. OfficeCLI is special: it is also the bundled
@@ -254,7 +272,10 @@ function ossGithubUrl(p) { return (p && p.repo) ? ('https://github.com/' + p.rep
 function ossPromptFor(p) {
   const isOfficeCli = p && (p.id === 'OfficeCLI' || p.name === 'OfficeCLI');
   const tmpl = (typeof t === 'function') ? t(isOfficeCli ? 'oss.office_prompt' : 'oss.prompt') : '';
-  return tmpl.replace(/\{name\}/g, (p && p.name) || '').replace(/\{url\}/g, ossGithubUrl(p));
+  return tmpl
+    .replace(/\{id\}/g, (p && p.id) || '')
+    .replace(/\{name\}/g, (p && p.name) || '')
+    .replace(/\{url\}/g, ossGithubUrl(p));
 }
 
 // Prompt for the ② marketplace「接入」button: an explicit install request (the
@@ -264,7 +285,10 @@ function ossPromptFor(p) {
 function ossInstallPromptFor(p) {
   const isOfficeCli = p && (p.id === 'OfficeCLI' || p.name === 'OfficeCLI');
   const tmpl = (typeof t === 'function') ? t(isOfficeCli ? 'oss.office_install_prompt' : 'oss.install_prompt') : '';
-  return tmpl.replace(/\{name\}/g, (p && p.name) || '').replace(/\{url\}/g, ossGithubUrl(p));
+  return tmpl
+    .replace(/\{id\}/g, (p && p.id) || '')
+    .replace(/\{name\}/g, (p && p.name) || '')
+    .replace(/\{url\}/g, ossGithubUrl(p));
 }
 
 // Installed external packages (local/packages). Memoized; a row's `name`
@@ -275,10 +299,23 @@ function loadOssInstalled(force) {
   if (force) _ossInstalledPromise = null;
   if (!_ossInstalledPromise) {
     _ossInstalledPromise = window.orkas.invoke('packages.list')
-      .then((res) => new Set((res && res.ok && Array.isArray(res.packages) ? res.packages : []).map((p) => p.name)))
+      .then((res) => {
+        const keys = new Set();
+        for (const p of (res && res.ok && Array.isArray(res.packages) ? res.packages : [])) {
+          if (p && p.name) keys.add(String(p.name));
+          const repoKey = ossRepoInstallKey(p && p.repo_url);
+          if (repoKey) keys.add(repoKey);
+        }
+        return keys;
+      })
       .catch(() => { _ossInstalledPromise = null; return new Set(); });
   }
   return _ossInstalledPromise;
+}
+
+function isOssProjectInstalled(p, installed) {
+  if (!(installed instanceof Set) || !p) return false;
+  return installed.has(p.id) || installed.has(ossRepoInstallKey(p.repo));
 }
 
 // Open the project's GitHub page in the system browser.
@@ -373,6 +410,7 @@ window.loadOssCatalog = loadOssCatalog;
 window.ossCatalogCacheKey = ossCatalogCacheKey;
 window.OSS_MARKETPLACE_PAGE_SIZE = OSS_MARKETPLACE_PAGE_SIZE;
 window.loadOssInstalled = loadOssInstalled;
+window.isOssProjectInstalled = isOssProjectInstalled;
 window.ossIconFor = ossIconFor;
 window.ossTaskFor = ossTaskFor;
 window.ossDescFor = ossDescFor;

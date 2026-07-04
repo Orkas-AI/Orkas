@@ -173,6 +173,44 @@ describe('agents › normalizeAgent', () => {
     expect(norm?.skill_list).toEqual(['ok-one', 'also_ok']);
   });
 
+  it('normalizes rich profile fields and design aliases', async () => {
+    const a = await loadAgents();
+    const norm = a.normalizeAgent({
+      agent_id: 'x',
+      name: 'Video',
+      skill_list: ['canonical-skill'],
+      role: '短视频 · 产品片',
+      profile: {
+        skills: [{ title: 'legacy-profile-skill' }],
+        knowhow: [
+          { title: 'Legacy embedded knowhow', description: 'Should lose to the top-level field.' },
+        ],
+      },
+      knowhow: ['Task framing'],
+      standards: ['Traceable output'],
+      skills: [{ title: 'legacy-top-level-skill' }],
+      flow: [
+        { n: '读脚本', d: '确认平台、时长与风格', tool: 'docs' },
+        { n: '写分镜', d: '输出镜头表' },
+      ],
+      memory: [
+        { t: '品牌调性', d: '简洁、克制' },
+        { t: '旧反馈', d: '已忘记', kept: false },
+      ],
+      doYes: ['短视频'],
+      doNo: ['真人实拍'],
+    } as any, 'custom');
+
+    expect(norm?.profile?.role).toBe('短视频 · 产品片');
+    expect(norm?.profile?.knowhow).toEqual(['Task framing']);
+    expect(norm?.profile?.standards).toEqual(['Traceable output']);
+    expect('workflow' in ((norm?.profile || {}) as any)).toBe(false);
+    expect('memory' in ((norm?.profile || {}) as any)).toBe(false);
+    expect(norm?.profile?.scope).toEqual({ accepts: ['短视频'], rejects: ['真人实拍'] });
+    expect(norm?.skill_list).toEqual(['canonical-skill']);
+    expect('skills' in ((norm?.profile || {}) as any)).toBe(false);
+  });
+
   // interactive is read by `groupChat.listMembers` to drive the input-box
   // auto-target; the renderer treats undefined as false. Tolerant string
   // coercion exists because LLMs sometimes emit `"true"` / `"false"` instead
@@ -578,6 +616,58 @@ describe('agents › extractAgentFieldBlocks', () => {
     expect('category' in a.extractAgentFieldBlocks('<agent><category>bad category</category></agent>').blocks[0])
       .toBe(false);
   });
+
+  it('extracts independent knowhow and standards line lists', async () => {
+    const a = await loadAgents();
+    const r = a.extractAgentFieldBlocks([
+      '<agent>',
+      '<knowhow>',
+      'Task framing',
+      'Source synthesis',
+      '</knowhow>',
+      '<standards>',
+      'Traceable output',
+      'Clear next action',
+      '</standards>',
+      '</agent>',
+    ].join('\n'));
+    expect(r.blocks[0].knowhow).toEqual(['Task framing', 'Source synthesis']);
+    expect(r.blocks[0].standards).toEqual(['Traceable output', 'Clear next action']);
+    expect('profile' in r.blocks[0]).toBe(false);
+  });
+
+  it('keeps JSON array compatibility for knowhow and standards', async () => {
+    const a = await loadAgents();
+    const r = a.extractAgentFieldBlocks([
+      '<agent>',
+      '<knowhow>["Task framing"]</knowhow>',
+      '<standards>["Traceable output"]</standards>',
+      '</agent>',
+    ].join('\n'));
+    expect(r.blocks[0].knowhow).toEqual(['Task framing']);
+    expect(r.blocks[0].standards).toEqual(['Traceable output']);
+    expect('profile' in r.blocks[0]).toBe(false);
+  });
+
+  it('keeps legacy <profile> as knowhow/standards-only compatibility', async () => {
+    const a = await loadAgents();
+    const r = a.extractAgentFieldBlocks([
+      '<agent>',
+      '<profile>',
+      JSON.stringify({
+        knowhow: [{ title: 'Task framing', description: 'Clarifies scope.' }],
+        standards: [{ title: 'Traceable output', description: 'Cites assumptions.' }],
+        workflow: [{ title: 'Old structured step', description: 'Do not parse.' }],
+        memory: [{ title: 'Seed memory', description: 'Do not parse.' }],
+      }),
+      '</profile>',
+      '</agent>',
+    ].join('\n'));
+    expect(r.blocks[0].knowhow).toEqual(['Task framing']);
+    expect(r.blocks[0].standards).toEqual(['Traceable output']);
+    expect('profile' in r.blocks[0]).toBe(false);
+    expect('workflow' in r.blocks[0]).toBe(false);
+  });
 });
 
 describe('agents › validateAgentInputs', () => {
@@ -870,6 +960,26 @@ describe('agents › createAgentFromBlocks', () => {
       { id: 'topic', label: 'Topic', type: 'text', default: '', required: true },
     ]);
   });
+
+  it('persists knowhow and standards as top-level agent fields', async () => {
+    const a = await loadAgents();
+    const created = await a.createAgentFromBlocks({
+      name: 'ProfiledHelper',
+      description_en: 'desc',
+      workflow: 'Read the task, then deliver.',
+      category: 'general',
+      knowhow: ['Task framing'],
+      standards: ['Traceable output'],
+    });
+    expect(created?.profile?.knowhow).toEqual(['Task framing']);
+    expect(created?.profile?.standards).toEqual(['Traceable output']);
+
+    const file = path.join(customAgentsDir(), created?.agent_id || '', 'agent.json');
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    expect(raw.knowhow).toEqual(['Task framing']);
+    expect(raw.standards).toEqual(['Traceable output']);
+    expect('profile' in raw).toBe(false);
+  });
 });
 
 describe('agents › listAgents', () => {
@@ -892,7 +1002,7 @@ describe('agents › listAgents', () => {
     expect(sources).toEqual({ c1: 'custom', b1: 'marketplace' });
   });
 
-  it('custom wins when builtin has same id', async () => {
+  it('marketplace wins when custom has same id', async () => {
     writeCustomAgent('dup', { name: 'CustDup' });
     const builtinDup = path.join(builtinAgentsDir(), 'dup');
     fs.mkdirSync(builtinDup, { recursive: true });
@@ -903,8 +1013,8 @@ describe('agents › listAgents', () => {
     const list = await a.listAgents();
     const match = list.filter((x) => x.agent_id === 'dup');
     expect(match).toHaveLength(1);
-    expect(match[0].source).toBe('custom');
-    expect(match[0].name).toBe('CustDup');
+    expect(match[0].source).toBe('marketplace');
+    expect(match[0].name).toBe('BuiltDup');
   });
 });
 
@@ -1037,7 +1147,7 @@ describe('agents › updateCustomAgent', () => {
     expect(r?.runtime).toBeUndefined();
   });
 
-  it('strips workflow / skill_list updates on a CLI agent', async () => {
+  it('strips prompt-owned updates on a CLI agent', async () => {
     writeCustomAgent('abc', {
       name: 'N',
       runtime: { kind: 'cli', cli: 'claude' },
@@ -1046,9 +1156,22 @@ describe('agents › updateCustomAgent', () => {
     const updated = await a.updateCustomAgent('abc', {
       workflow: 'should be ignored',
       skill_list: ['x'],
+      knowhow: ['should be ignored'],
+      standards: ['should be ignored'],
+      profile: {
+        knowhow: ['legacy should be ignored'],
+        standards: ['legacy should be ignored'],
+      },
     });
     expect(updated?.workflow).toBe('');
     expect('skill_list' in (updated as any)).toBe(false);
+    expect(updated?.profile?.knowhow).toBeUndefined();
+    expect(updated?.profile?.standards).toBeUndefined();
+
+    const raw = JSON.parse(fs.readFileSync(path.join(customAgentsDir(), 'abc', 'agent.json'), 'utf8'));
+    expect(raw).not.toHaveProperty('knowhow');
+    expect(raw).not.toHaveProperty('standards');
+    expect(raw).not.toHaveProperty('profile');
   });
 
   it('coerces non-string values to empty string', async () => {
@@ -1263,6 +1386,63 @@ describe('agents › appendAgentSkill', () => {
   });
 });
 
+describe('agents › custom agent memory', () => {
+  it('updates an existing agent memory entry', async () => {
+    writeCustomAgent('abc', { name: 'N' });
+    const a = await loadAgents();
+
+    const added = await a.addCustomAgentMemory('abc', 'old delivery preference');
+    expect(added.ok).toBe(true);
+    const canonicalMemoryFile = path.join(tmpDir, TEST_UID, 'cloud', 'memory', 'agents', 'abc', 'MEMORY.md');
+    const legacyMemoryFile = path.join(customAgentsDir(), 'abc', 'memory', 'MEMORY.md');
+    expect(fs.readFileSync(canonicalMemoryFile, 'utf8')).toContain('old delivery preference');
+    expect(fs.existsSync(legacyMemoryFile)).toBe(false);
+
+    const updated = await a.updateCustomAgentMemory('abc', 'old delivery preference', 'new delivery preference');
+    expect(updated.ok).toBe(true);
+    expect(updated.entries).toEqual(['new delivery preference']);
+
+    const reread = await a.getAgent('abc');
+    expect(reread?.profile?.memory?.map((entry) => entry.title)).toEqual(['new delivery preference']);
+  });
+
+  it('reads legacy agent-dir memory while new writes use the shared memory scope', async () => {
+    writeCustomAgent('abc', { name: 'N' });
+    const legacyMemoryFile = path.join(customAgentsDir(), 'abc', 'memory', 'MEMORY.md');
+    fs.mkdirSync(path.dirname(legacyMemoryFile), { recursive: true });
+    fs.writeFileSync(legacyMemoryFile, 'legacy delivery preference', 'utf8');
+    const a = await loadAgents();
+
+    const reread = await a.getAgent('abc');
+    expect(reread?.profile?.memory?.map((entry) => entry.title)).toEqual(['legacy delivery preference']);
+
+    const added = await a.addCustomAgentMemory('abc', 'new delivery preference');
+    expect(added.ok).toBe(true);
+    expect(added.entries).toEqual(['legacy delivery preference', 'new delivery preference']);
+    const canonicalMemoryFile = path.join(tmpDir, TEST_UID, 'cloud', 'memory', 'agents', 'abc', 'MEMORY.md');
+    expect(fs.readFileSync(canonicalMemoryFile, 'utf8')).toContain('new delivery preference');
+  });
+
+  it('does not expose or mutate detail memory for external CLI agents', async () => {
+    writeCustomAgent('cli-agent', {
+      name: 'CliAgent',
+      runtime: { kind: 'cli', cli: 'codex' },
+    });
+    const memoryFile = path.join(customAgentsDir(), 'cli-agent', 'memory', 'MEMORY.md');
+    fs.mkdirSync(path.dirname(memoryFile), { recursive: true });
+    fs.writeFileSync(memoryFile, 'existing external memory', 'utf8');
+    const a = await loadAgents();
+
+    const reread = await a.getAgent('cli-agent');
+    expect(reread?.profile?.memory).toBeUndefined();
+
+    const added = await a.addCustomAgentMemory('cli-agent', 'new external memory');
+    expect(added.ok).toBe(false);
+    expect(added.error).toContain('external CLI');
+    expect(fs.readFileSync(memoryFile, 'utf8')).toBe('existing external memory');
+  });
+});
+
 describe('agents › streamSendToAgentEditChat synthesized progress', () => {
   beforeEach(async () => {
     const { setLanguage } = await import('../../../src/main/features/config');
@@ -1472,10 +1652,14 @@ describe('agents › buildAgentEditSystemPrompt', () => {
       description: '一句话简介',
       category: 'rnd',
       workflow: '1. step one\n2. step two',
+      knowhow: ['Evidence synthesis'],
+      standards: ['Every claim cites its source'],
     });
     expect(sys).toContain('Researcher');
     expect(sys).toContain('一句话简介');
     expect(sys).toContain('step one');
+    expect(sys).toContain('Evidence synthesis');
+    expect(sys).toContain('Every claim cites its source');
     // Migration check: template no longer carries the redundant skills list.
     expect(sys).not.toContain('$skills_list');
     expect(sys).not.toContain('$category');
@@ -1508,26 +1692,6 @@ describe('agents › list cache invalidation', () => {
     await a.updateCustomAgent(agent!.agent_id, { name: 'V2' });
     const list = await a.listAgents();
     expect(list[0].name).toBe('V2');
-  });
-
-  it('keeps marketplace agent specs read-only through the custom edit path', async () => {
-    const dir = path.join(builtinAgentsDir(), 'platform-agent');
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, 'agent.json'), JSON.stringify({
-      agent_id: 'platform-agent',
-      name: 'OldPlatformAgent',
-      description: '',
-      workflow: '',
-    }));
-
-    const a = await loadAgents();
-    const updated = await a.updateCustomAgent('platform-agent', { name: 'RenamedPlatformAgent' });
-
-    expect(updated).toBeNull();
-    expect(JSON.parse(fs.readFileSync(path.join(dir, 'agent.json'), 'utf8')).name)
-      .toBe('OldPlatformAgent');
-    expect((await a.listAgents()).find((x) => x.agent_id === 'platform-agent')?.name)
-      .toBe('OldPlatformAgent');
   });
 
   it('cache-only invalidator picks up marketplace file rewrites', async () => {

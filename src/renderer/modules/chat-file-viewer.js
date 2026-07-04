@@ -8,6 +8,7 @@
 // Render strategies:
 //   image (.png/.jpg/.jpeg/.webp/.gif) → delegate to openChatImageLightbox
 //   video (.mp4/.webm/.mov/.m4v/.ogv)  → <video controls>
+//   audio (.mp3/.wav/.ogg/.opus/.m4a/.aac/.flac) → <audio controls>
 //   pdf   (.pdf)                       → <iframe> + Chromium PDFium
 //   office(.docx/.docm/.xlsx/.xlsm/.pptx/.pptm)
 //                                      → readonly sandboxed HTML iframe
@@ -68,11 +69,11 @@ const _viewerLog = (typeof createLogger === 'function')
   : { warn: () => {}, info: () => {}, error: () => {} };
 
 function _viewerTrack(action, data) {
-  void 0;
+  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
 function _viewerTrackError(action, data) {
-  void 0;
+  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
 // Extensions we'll try to render inline. Anything else falls through to the
@@ -81,6 +82,7 @@ function _viewerTrackError(action, data) {
 // something useful to do with it; otherwise the fallback is the better UX.
 const _IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
 const _VIDEO_EXTS = new Set(['.mp4', '.webm', '.mov', '.m4v', '.ogv']);
+const _AUDIO_EXTS = new Set(['.mp3', '.wav', '.ogg', '.opus', '.m4a', '.aac', '.flac']);
 const _OFFICE_EXTS = new Set(['.docx', '.docm', '.xlsx', '.xlsm', '.pptx', '.pptm']);
 const _MARKDOWN_EXTS = new Set(['.md', '.markdown']);
 // Text exts: the source-as-text bucket. Keep code-ish exts here too so the
@@ -120,6 +122,7 @@ function _kindOf(name) {
   const ext = _extOf(name);
   if (_IMAGE_EXTS.has(ext)) return 'image';
   if (_VIDEO_EXTS.has(ext)) return 'video';
+  if (_AUDIO_EXTS.has(ext)) return 'audio';
   if (ext === '.pdf') return 'pdf';
   if (_OFFICE_EXTS.has(ext)) return 'office';
   if (ext === '.html' || ext === '.htm') return 'html';
@@ -142,6 +145,22 @@ function _chatMediaLocalUrl(absPath) {
   // no-op there.
   if (p.startsWith('/')) p = p.slice(1);
   return `chat-media://local/${encodeURI(p)}`;
+}
+
+function _viewerAbsPathFromChatMediaLocalUrl(src) {
+  const raw = String(src || '').trim();
+  if (!raw) return '';
+  let url;
+  try { url = new URL(raw); }
+  catch (_) { return ''; }
+  if (url.protocol !== 'chat-media:' || url.hostname.toLowerCase() !== 'local') return '';
+  let p = '';
+  try { p = decodeURIComponent(url.pathname || ''); }
+  catch (_) { return ''; }
+  if (!p) return '';
+  if (/^\/[A-Za-z]:[\\/]/.test(p)) return p.slice(1);
+  if (/^\/\/[^/]/.test(p)) p = p.replace(/^\/+/, '/');
+  return p.startsWith('/') ? p : `/${p}`;
 }
 
 // Localized label helper — falls back to the English fallback when i18n
@@ -448,6 +467,7 @@ async function _openViewerShell(displayName, opts) {
   _viewerCurrentPath = absPath || null;
   _viewerCurrentCid = cid;
   _viewerCurrentProjectId = projectId;
+  if (_viewerRevealBtn) _viewerRevealBtn.hidden = !absPath;
   if (_viewerAddLibraryBtn) _viewerAddLibraryBtn.hidden = !cid || !_viewerCanAddToLibrary(absPath || displayName || kind);
   void _refreshSaveAppButton(_viewerCurrentPath);
   _viewerTitle.textContent = displayName || '';
@@ -577,10 +597,79 @@ function _officeFitFrameHeight(res) {
   return Math.max(260, Math.min(max, Math.ceil(raw)));
 }
 
-async function _renderVideoBody(absPath, displayName, cid, projectId) {
+function _viewerVideoPlaybackOptions(opts) {
+  const rawTime = Number(opts && opts.startTime);
+  return {
+    autoplay: !!(opts && opts.autoplay),
+    startTime: Number.isFinite(rawTime) && rawTime > 0 ? rawTime : 0,
+  };
+}
+
+function _applyViewerVideoPlayback(video, opts) {
+  if (!video) return;
+  const playback = _viewerVideoPlaybackOptions(opts);
+  if (!playback.autoplay && playback.startTime <= 0) return;
+  const seek = () => {
+    if (playback.startTime > 0) {
+      try {
+        const duration = Number(video.duration);
+        const target = Number.isFinite(duration) && duration > 0
+          ? Math.min(playback.startTime, Math.max(0, duration - 0.05))
+          : playback.startTime;
+        video.currentTime = target;
+      } catch (_) { /* setting currentTime can throw before metadata on some codecs */ }
+    }
+  };
+  const play = () => {
+    if (playback.autoplay && typeof video.play === 'function') {
+      try {
+        const p = video.play();
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+      } catch (_) { /* non-fatal; user can press play */ }
+    }
+  };
+  seek();
+  if (playback.autoplay) play();
+  if (video.readyState < 1) {
+    video.addEventListener('loadedmetadata', () => {
+      seek();
+      play();
+    }, { once: true });
+  }
+}
+
+async function _renderVideoBody(absPath, displayName, cid, projectId, playbackOpts) {
   if (!(await _openViewerShell(displayName, { kind: 'video', absPath, cid, projectId }))) return;
   const url = _chatMediaLocalUrl(absPath);
   _viewerBody.innerHTML = `<div class="chat-file-viewer-video-wrap"><video class="chat-file-viewer-video" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${url}"></video></div>`;
+  _applyViewerVideoPlayback(_viewerBody.querySelector('.chat-file-viewer-video'), playbackOpts);
+}
+
+async function openChatVideoUrlViewer(src, displayName, opts) {
+  const url = String(src || '').trim();
+  if (!url) return;
+  const absPath = (opts && opts.absPath) || _viewerAbsPathFromChatMediaLocalUrl(url);
+  const cid = (opts && opts.cid) || null;
+  const projectId = (opts && opts.projectId) || null;
+  if (!(await _openViewerShell(displayName || 'video', { kind: 'video', absPath, cid, projectId }))) return;
+  _viewerTrack('file_preview_open', { kind: absPath ? 'video' : 'video_url', has_cid: !!cid, has_project: !!projectId });
+  _viewerBody.innerHTML = `<div class="chat-file-viewer-video-wrap"><video class="chat-file-viewer-video" controls controlslist="nodownload nofullscreen noremoteplayback" disablepictureinpicture disableremoteplayback playsinline preload="metadata" src="${escapeHtml(url)}"></video></div>`;
+  _applyViewerVideoPlayback(_viewerBody.querySelector('.chat-file-viewer-video'), opts);
+}
+
+async function _renderAudioBody(absPath, displayName, cid, projectId) {
+  if (!(await _openViewerShell(displayName, { kind: 'audio', absPath, cid, projectId }))) return;
+  const url = _chatMediaLocalUrl(absPath);
+  const icon = (typeof window !== 'undefined' && typeof window.fileKindIconHtml === 'function')
+    ? window.fileKindIconHtml(displayName || absPath, 'audio')
+    : '';
+  _viewerBody.innerHTML = `<div class="chat-file-viewer-audio-wrap">
+    <div class="chat-file-viewer-audio-card">
+      <span class="chat-file-viewer-audio-icon">${icon}</span>
+      <span class="chat-file-viewer-audio-name">${escapeHtml(displayName || '')}</span>
+      <audio class="chat-file-viewer-audio" controls controlslist="nodownload noremoteplayback" preload="metadata" src="${url}"></audio>
+    </div>
+  </div>`;
 }
 
 async function _renderMarkdownBody(absPath, displayName, cid, projectId) {
@@ -779,7 +868,8 @@ async function openChatFileViewer(absPath, displayName, opts) {
   }
   if (kind === 'pdf')      return _renderPdfBody(absPath, name, cid, projectId);
   if (kind === 'office')   return _renderOfficeBody(absPath, name, cid, projectId);
-  if (kind === 'video')    return _renderVideoBody(absPath, name, cid, projectId);
+  if (kind === 'video')    return _renderVideoBody(absPath, name, cid, projectId, opts);
+  if (kind === 'audio')    return _renderAudioBody(absPath, name, cid, projectId);
   if (kind === 'html')     return _renderHtmlBody(absPath, name, cid, projectId);
   if (kind === 'markdown') return _renderMarkdownBody(absPath, name, cid, projectId);
   if (kind === 'text')     return _renderTextBody(absPath, name, cid, projectId);
@@ -789,5 +879,5 @@ async function openChatFileViewer(absPath, displayName, opts) {
 
 // CJS bridge for vitest — pure functions only, per PC/CLAUDE.md §9.
 if (typeof module !== 'undefined' && typeof module.exports === 'object') {
-  module.exports = { _kindOf, _extOf, _chatMediaLocalUrl, _viewerCanAddToLibrary };
+  module.exports = { _kindOf, _extOf, _chatMediaLocalUrl, _viewerAbsPathFromChatMediaLocalUrl, _viewerCanAddToLibrary, _viewerVideoPlaybackOptions };
 }

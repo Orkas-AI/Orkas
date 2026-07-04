@@ -224,10 +224,10 @@ export interface ListingsCacheEntry {
   total?: number;
 }
 export interface ListingsCacheFile {
-  version: 3;
+  version: 4;
   entries: Record<string, ListingsCacheEntry>;
 }
-const LISTINGS_VERSION = 3;
+const LISTINGS_VERSION = 4;
 
 export async function getListingsCache(): Promise<ListingsCacheFile> {
   const file = marketplaceListingsCacheFile(getActiveUserId());

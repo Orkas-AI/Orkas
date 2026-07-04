@@ -4,18 +4,21 @@ const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const {
+  ensureFile,
+  isMachArch,
+  markerMatches,
+  packagePath,
+  packageVersion,
+  readLockPackage,
+  scriptHashes,
+  writeMarker,
+} = require('./native-prepare-cache.cjs');
 
 const PC_DIR = path.resolve(__dirname, '..');
 const LOCK_FILE = path.join(PC_DIR, 'package-lock.json');
-
-function readLockPackage(name) {
-  const lock = JSON.parse(fs.readFileSync(LOCK_FILE, 'utf8'));
-  const item = lock.packages?.[`node_modules/${name}`];
-  if (!item?.version) {
-    throw new Error(`package-lock.json is missing node_modules/${name}`);
-  }
-  return item.version;
-}
+const CACHE_HELPER = path.join(__dirname, 'native-prepare-cache.cjs');
+const TARGET_PLATFORM = 'darwin';
 
 function npmCmd() {
   return process.platform === 'win32' ? 'npm.cmd' : 'npm';
@@ -50,16 +53,22 @@ function npmPack(cwd, spec) {
 
 function ensureEsbuildPackage(platformName) {
   const packageName = `@esbuild/${platformName}`;
-  ensurePackageFromRegistry(packageName);
+  const required = [path.join(PC_DIR, 'node_modules', '@esbuild', platformName, 'bin', 'esbuild')];
+  ensurePackageFromRegistry(packageName, required);
 }
 
-function packagePath(packageName) {
-  return path.join(PC_DIR, 'node_modules', ...packageName.split('/'));
+function allFilesExist(files) {
+  return files.every((file) => fs.existsSync(file) && fs.statSync(file).isFile());
 }
 
-function ensurePackageFromRegistry(packageName) {
-  const version = readLockPackage(packageName);
-  const targetDir = packagePath(packageName);
+function ensurePackageFromRegistry(packageName, requiredFiles = []) {
+  const version = readLockPackage(LOCK_FILE, packageName);
+  const targetDir = packagePath(PC_DIR, packageName);
+
+  if (packageVersion(PC_DIR, packageName) === version && allFilesExist(requiredFiles)) {
+    console.log(`[prepare-mac-native-deps] reusing ${packageName}@${version}`);
+    return;
+  }
 
   console.log(`[prepare-mac-native-deps] ensuring ${packageName}@${version}`);
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-mac-native-deps-'));
@@ -84,9 +93,27 @@ function removeDirectories(parentDir, shouldRemove) {
   }
 }
 
-function ensureFile(label, file) {
-  if (!fs.existsSync(file) || !fs.statSync(file).isFile()) {
-    throw new Error(`missing ${label}: ${file}`);
+function expectedState(targetArch) {
+  return {
+    schema: 1,
+    platform: TARGET_PLATFORM,
+    arch: targetArch,
+    scriptHashes: scriptHashes({
+      prepareMacNativeDeps: __filename,
+      nativePrepareCache: CACHE_HELPER,
+    }),
+    packages: {
+      [`@esbuild/darwin-${targetArch}`]: readLockPackage(LOCK_FILE, `@esbuild/darwin-${targetArch}`),
+      [`sqlite-vec-darwin-${targetArch}`]: readLockPackage(LOCK_FILE, `sqlite-vec-darwin-${targetArch}`),
+      [`@napi-rs/canvas-darwin-${targetArch}`]: readLockPackage(LOCK_FILE, `@napi-rs/canvas-darwin-${targetArch}`),
+    },
+  };
+}
+
+function assertMachArch(label, file, targetArch) {
+  ensureFile(label, file);
+  if (!isMachArch(file, targetArch)) {
+    throw new Error(`${label} is not macOS ${targetArch}: ${file}`);
   }
 }
 
@@ -98,9 +125,22 @@ function main() {
 
   fs.mkdirSync(path.join(PC_DIR, 'node_modules', '@esbuild'), { recursive: true });
 
+  const required = {
+    esbuild: path.join(PC_DIR, 'node_modules', '@esbuild', `darwin-${targetArch}`, 'bin', 'esbuild'),
+    sqliteVec: path.join(PC_DIR, 'node_modules', `sqlite-vec-darwin-${targetArch}`, 'vec0.dylib'),
+    canvas: path.join(PC_DIR, 'node_modules', '@napi-rs', `canvas-darwin-${targetArch}`, `skia.darwin-${targetArch}.node`),
+  };
+  const state = expectedState(targetArch);
+  const requiredFiles = Object.values(required);
+  const targetFilesMatch = () => requiredFiles.every((file) => isMachArch(file, targetArch));
+  if (markerMatches(PC_DIR, state, requiredFiles, targetFilesMatch)) {
+    console.log(`[prepare-mac-native-deps] using cached macOS ${targetArch} native dependencies`);
+    return;
+  }
+
   ensureEsbuildPackage(`darwin-${targetArch}`);
-  ensurePackageFromRegistry(`sqlite-vec-darwin-${targetArch}`);
-  ensurePackageFromRegistry(`@napi-rs/canvas-darwin-${targetArch}`);
+  ensurePackageFromRegistry(`sqlite-vec-darwin-${targetArch}`, [required.sqliteVec]);
+  ensurePackageFromRegistry(`@napi-rs/canvas-darwin-${targetArch}`, [required.canvas]);
 
   console.log(`[prepare-mac-native-deps] pruning non-${targetArch} native runtime packages`);
   removeDirectories(path.join(PC_DIR, 'node_modules', '@esbuild'), (name) => name !== `darwin-${targetArch}`);
@@ -108,18 +148,22 @@ function main() {
   removeDirectories(path.join(PC_DIR, 'node_modules', '@napi-rs'), (name) => /^canvas-/i.test(name) && name !== `canvas-darwin-${targetArch}`);
   removeDirectories(path.join(PC_DIR, 'node_modules', '@anush008'), (name) => /^tokenizers-/i.test(name) && name !== 'tokenizers-darwin-universal');
 
-  ensureFile(
+  assertMachArch(
     `macOS ${targetArch} esbuild runtime binary`,
-    path.join(PC_DIR, 'node_modules', '@esbuild', `darwin-${targetArch}`, 'bin', 'esbuild'),
+    required.esbuild,
+    targetArch,
   );
-  ensureFile(
+  assertMachArch(
     `macOS ${targetArch} sqlite-vec runtime binary`,
-    path.join(PC_DIR, 'node_modules', `sqlite-vec-darwin-${targetArch}`, 'vec0.dylib'),
+    required.sqliteVec,
+    targetArch,
   );
-  ensureFile(
+  assertMachArch(
     `macOS ${targetArch} canvas runtime binary`,
-    path.join(PC_DIR, 'node_modules', '@napi-rs', `canvas-darwin-${targetArch}`, `skia.darwin-${targetArch}.node`),
+    required.canvas,
+    targetArch,
   );
+  writeMarker(PC_DIR, state);
 }
 
 main();

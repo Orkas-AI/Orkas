@@ -55,12 +55,12 @@ describe('connectors registry secret storage', () => {
     await registry.upsert(TEST_UID, sampleInstance());
 
     const raw = fs.readFileSync(paths.userConnectorsConfigFile(TEST_UID), 'utf8');
+    const localSecrets = await import('../../../../src/main/util/local-secret-store');
     expect(raw).not.toContain('access-secret');
     expect(raw).not.toContain('refresh-secret');
-    const localSecrets = await import('../../../../src/main/util/local-secret-store');
     const disk = JSON.parse(raw);
     expect(disk.connections.github.oauth_grant).toBeUndefined();
-    expect(localSecrets.isEncryptedSecret(String(disk.connections.github.secrets_enc))).toBe(true);
+    expect(localSecrets.isEncryptedSecret(disk.connections.github.secrets_enc)).toBe(true);
 
     const loaded = registry.load(TEST_UID);
     expect(loaded.connections.github.oauth_grant?.access_token).toBe('access-secret');
@@ -91,8 +91,40 @@ describe('connectors registry secret storage', () => {
 
     const migrated = JSON.parse(fs.readFileSync(file, 'utf8'));
     const localSecrets = await import('../../../../src/main/util/local-secret-store');
-    expect(localSecrets.isEncryptedSecret(String(migrated.connections.github.secrets_enc))).toBe(true);
-    expect(() => cryptoVault.decrypt(TEST_UID, String(migrated.connections.github.secrets_enc))).toThrow();
+    expect(localSecrets.isEncryptedSecret(migrated.connections.github.secrets_enc)).toBe(true);
     expect(JSON.stringify(migrated)).not.toContain('refresh-secret');
+  });
+
+  it('reuses decrypted data while the registry file is unchanged', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const localSecrets = await import('../../../../src/main/util/local-secret-store');
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const file = paths.userConnectorsConfigFile(TEST_UID);
+    const inst = sampleInstance();
+    const { oauth_grant, transport, ...rest } = inst;
+    const decryptSpy = vi.spyOn(localSecrets, 'decryptLocalSecretWithMeta');
+
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      version: 2,
+      connections: {
+        github: {
+          ...rest,
+          secrets_enc: localSecrets.encryptLocalSecret({
+            namespace: 'connectors.instance',
+            ownerId: TEST_UID,
+            recordId: 'github',
+          }, JSON.stringify({ oauth_grant, transport })),
+        },
+      },
+    }, null, 2), 'utf8');
+
+    const first = registry.load(TEST_UID);
+    first.connections.github.display_name = 'mutated outside registry';
+    const second = registry.load(TEST_UID);
+
+    expect(decryptSpy).toHaveBeenCalled();
+    expect(second.connections.github.display_name).toBe('GitHub');
+    expect(second.connections.github.oauth_grant?.refresh_token).toBe('refresh-secret');
   });
 });

@@ -27,6 +27,7 @@
  */
 
 import { createLogger } from '../../../logger.js';
+import { logErrorSummary } from '../../../util/log-redact.js';
 import {
   type LocalBackend,
   type BackendRunOptions,
@@ -100,7 +101,7 @@ export const codexBackend: LocalBackend = {
 
     const sendLine = (msg: object) => {
       try { child.stdin.write(JSON.stringify(msg) + '\n'); }
-      catch (err) { log.warn('codex stdin write failed', { error: (err as Error).message }); }
+      catch (err) { log.warn('codex stdin write failed', { error: logErrorSummary(err) }); }
     };
 
     const rpc = (method: string, params: Record<string, unknown>): Promise<any> =>
@@ -405,7 +406,7 @@ export const codexBackend: LocalBackend = {
     }
 
     child.on('error', err => {
-      log.warn('codex spawn error', { error: (err as Error).message });
+      log.warn('codex spawn error', { error: logErrorSummary(err) });
       finish('failed', { error: (err as Error).message, stderrTail: tail.toString() });
     });
     child.on('close', code => {
@@ -449,7 +450,7 @@ export const codexBackend: LocalBackend = {
         // close handler resolves outerPromise.
       } catch (err) {
         const msg = (err as Error).message || String(err);
-        log.warn('codex protocol error', { error: msg });
+        log.warn('codex protocol error', { error: logErrorSummary(err) });
         if (!exited) finish('failed', { error: msg, stderrTail: tail.toString() });
       }
     })();
@@ -469,7 +470,7 @@ export const codexBackend: LocalBackend = {
           if (tid) return tid;
           log.warn('codex thread/resume returned no thread id; falling back to thread/start');
         } catch (err) {
-          log.warn('codex thread/resume failed; falling back to thread/start', { error: (err as Error).message });
+          log.warn('codex thread/resume failed; falling back to thread/start', { error: logErrorSummary(err) });
         }
       }
       const r = await rpc('thread/start', {

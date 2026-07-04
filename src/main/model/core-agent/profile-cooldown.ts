@@ -17,6 +17,7 @@
  */
 
 import { createLogger } from '../../logger';
+import { maskId } from '../../util/log-redact';
 import type { KeyFailureKind } from './auth-error';
 
 const log = createLogger('auth-cooldown');
@@ -31,6 +32,18 @@ interface CooldownEntry {
 }
 
 const state = new Map<string, CooldownEntry>();
+
+function cooldownReasonKindForLog(reason: string): string {
+  const text = String(reason || '').toLowerCase();
+  if (/401|unauthori[sz]ed|invalid\s+(api\s+)?key|authentication|auth/.test(text)) return 'auth';
+  if (/402|credit|quota|balance|insufficient|payment/.test(text)) return 'balance';
+  if (/403|forbidden|permission|access denied/.test(text)) return 'forbidden';
+  if (/429|rate.?limit|too many requests|throttle/.test(text)) return 'rate_limit';
+  if (/timeout|timed out/.test(text)) return 'timeout';
+  if (/network|fetch|econn|socket|dns|enotfound|etimedout/.test(text)) return 'network';
+  if (/context|token|too long/.test(text)) return 'context';
+  return 'provider';
+}
 
 /** For tests / forced resets (e.g. on uid switch). */
 export function _clearAll(): void {
@@ -50,13 +63,24 @@ export function markCooldown(
 ): void {
   if (!profileId) return;
   if (kind === 'network') {
-    log.info(`skip cooldown profile=${profileId} kind=network reason=${reason.slice(0, 120)}`);
+    log.info('skip cooldown', {
+      profile_id: maskId(profileId),
+      kind: 'network',
+      reason_kind: cooldownReasonKindForLog(reason),
+      reason_chars: reason.length,
+    });
     return;
   }
   const ms = durationMs ?? DEFAULT_COOLDOWN_MS;
   const cooledUntil = Date.now() + Math.max(0, ms);
   state.set(profileId, { cooledUntil, kind, reason });
-  log.info(`cooldown profile=${profileId} kind=${kind} ms=${ms} reason=${reason.slice(0, 120)}`);
+  log.info('profile cooldown set', {
+    profile_id: maskId(profileId),
+    kind,
+    ms,
+    reason_kind: cooldownReasonKindForLog(reason),
+    reason_chars: reason.length,
+  });
 }
 
 /**
@@ -93,7 +117,7 @@ export function getCooldown(profileId: string): Readonly<CooldownEntry> | undefi
 export function clearCooldown(profileId: string): void {
   if (!profileId) return;
   if (state.delete(profileId)) {
-    log.info(`cleared cooldown profile=${profileId}`);
+    log.info('profile cooldown cleared', { profile_id: maskId(profileId) });
   }
 }
 

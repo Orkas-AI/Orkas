@@ -38,10 +38,10 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { dialog, BrowserWindow, shell } from 'electron';
 
-import { DEFAULT_USER_WORKSPACE, userWorkspaceConfigFile, pickerFirstOpenMarkerFile } from '../paths';
+import { DEFAULT_USER_WORKSPACE, userWorkspaceConfigFile } from '../paths';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
-import { macosTccSensitivePath } from '../util/macos-tcc';
+import { macosTccWorkspaceBlockedPath } from '../util/macos-tcc';
 import { logPathRef, logPathRefs } from '../util/log-redact';
 import { pruneOrphans } from './file_indexer';
 
@@ -144,20 +144,22 @@ function _writeEntry(cfg: WorkspaceConfig, projectId: string | undefined, entry:
   return { ...cfg, default: entry, updatedAt: new Date().toISOString() };
 }
 
+function _isWorkspaceSelectionBlocked(dirPath: string): ReturnType<typeof macosTccWorkspaceBlockedPath> {
+  return macosTccWorkspaceBlockedPath(path.resolve(dirPath));
+}
+
 /** Effective path for a given scope: project's selection (if any) → default's
- *  selection (if any) → DEFAULT_USER_WORKSPACE. For macOS privacy-protected
- *  locations, return the user-selected path without probing it; background
- *  scanners are responsible for opting out before walking those roots. */
+ *  selection (if any) → DEFAULT_USER_WORKSPACE. Privacy-protected legacy
+ *  selections are never probed and never returned as execution roots. */
 function _effectivePath(cfg: WorkspaceConfig, projectId?: string): string {
   if (projectId) {
     const entry = cfg.projects[projectId];
     if (entry?.selectedPath) {
-      const blocked = macosTccSensitivePath(path.resolve(entry.selectedPath), { recursive: true });
+      const blocked = _isWorkspaceSelectionBlocked(entry.selectedPath);
       if (blocked) {
-        log.debug('project workspace path is privacy-protected — returning without stat', {
+        log.warn('project workspace path is privacy-protected — falling back without stat', {
           projectId, path: logPathRef(entry.selectedPath), reason: blocked.reason,
         });
-        return entry.selectedPath;
       } else {
         try {
           if (fs.statSync(entry.selectedPath).isDirectory()) return entry.selectedPath;
@@ -170,12 +172,11 @@ function _effectivePath(cfg: WorkspaceConfig, projectId?: string): string {
     }
   }
   if (cfg.default.selectedPath) {
-    const blocked = macosTccSensitivePath(path.resolve(cfg.default.selectedPath), { recursive: true });
+    const blocked = _isWorkspaceSelectionBlocked(cfg.default.selectedPath);
     if (blocked) {
-      log.debug('default workspace path is privacy-protected — returning without stat', {
+      log.warn('default workspace path is privacy-protected — using DEFAULT_USER_WORKSPACE without stat', {
         path: logPathRef(cfg.default.selectedPath), reason: blocked.reason,
       });
-      return cfg.default.selectedPath;
     } else {
       try {
         if (fs.statSync(cfg.default.selectedPath).isDirectory()) return cfg.default.selectedPath;
@@ -192,10 +193,10 @@ function _effectivePath(cfg: WorkspaceConfig, projectId?: string): string {
 function _configuredDisplayPath(cfg: WorkspaceConfig, projectId?: string): string {
   if (projectId) {
     const projectSelected = cfg.projects[projectId]?.selectedPath;
-    if (projectSelected) return projectSelected;
+    if (projectSelected && !_isWorkspaceSelectionBlocked(projectSelected)) return projectSelected;
   }
   const selected = cfg.default.selectedPath;
-  if (selected) return selected;
+  if (selected && !_isWorkspaceSelectionBlocked(selected)) return selected;
   return DEFAULT_USER_WORKSPACE;
 }
 
@@ -220,41 +221,15 @@ export function getWorkspacePath(userId: string, projectId?: string): string {
 }
 
 /**
- * First-open default for the native file picker. The FIRST time a picker that
- * opts in is shown for this user on this machine, return the user's workspace
- * dir so the dialog starts there; on every later call return undefined so the
- * OS's own remembered last-used directory takes over (we never override it).
- *
- * The one-time flag is a marker file under local/ so it survives restarts —
- * without persistence a restart would re-seed the workspace and clobber the OS
- * last-used. We mark on the first call (i.e. first open), not on a successful
- * pick. If the marker can't be persisted we do NOT seed: returning the
- * workspace without recording it would re-seed every call and keep clobbering
- * the OS last-used.
+ * Native file pickers should always be seeded with a safe Orkas-owned default
+ * path. The historical marker file is ignored now; keeping the function name
+ * avoids churn in IPC call sites while preventing macOS from restoring a
+ * process-wide last-used Photos/Desktop/Library location.
  */
 export function consumePickerFirstOpenDefault(userId: string): string | undefined {
   if (!userId) return undefined;
-  const marker = pickerFirstOpenMarkerFile(userId);
-  try {
-    if (fs.existsSync(marker)) return undefined;
-  } catch {
-    return undefined;
-  }
-  let ws: string;
-  try {
-    ws = getWorkspacePath(userId);
-  } catch {
-    return undefined;
-  }
-  if (!ws) return undefined;
-  try {
-    fs.mkdirSync(path.dirname(marker), { recursive: true });
-    fs.writeFileSync(marker, '', 'utf-8');
-  } catch (err) {
-    log.warn(`picker first-open marker write failed — not seeding: ${(err as Error).message}`);
-    return undefined;
-  }
-  return ws;
+  try { return getWorkspacePath(userId); }
+  catch { return undefined; }
 }
 
 /**
@@ -286,14 +261,18 @@ export function setWorkspacePath(
   projectId?: string,
 ): { ok: true; path: string } | { ok: false; error: string } {
   const resolved = path.resolve(dirPath);
-  const protectedSelection = macosTccSensitivePath(resolved, { recursive: true });
-  if (!protectedSelection) {
-    try {
-      const stat = fs.statSync(resolved);
-      if (!stat.isDirectory()) return { ok: false, error: t('errors.path_not_dir') };
-    } catch {
-      return { ok: false, error: t('errors.dir_not_exists') };
-    }
+  const protectedSelection = _isWorkspaceSelectionBlocked(resolved);
+  if (protectedSelection) {
+    log.warn('refused privacy-protected workspace selection', {
+      userId, projectId: projectId || '(default)', path: logPathRef(resolved), reason: protectedSelection.reason,
+    });
+    return { ok: false, error: t('errors.workspace_privacy_protected') };
+  }
+  try {
+    const stat = fs.statSync(resolved);
+    if (!stat.isDirectory()) return { ok: false, error: t('errors.path_not_dir') };
+  } catch {
+    return { ok: false, error: t('errors.dir_not_exists') };
   }
 
   const cfg = readConfig(userId);
@@ -377,9 +356,11 @@ export function getWorkspaceInfo(userId: string, projectId?: string): {
   // paths like ~/Downloads even for a simple stat. Actual selection/use still
   // validates through setWorkspacePath/getWorkspacePath.
   const currentPath = _configuredDisplayPath(cfg, projectId);
-  const isDefault = !entry.selectedPath;
+  const selectedBlocked = entry.selectedPath ? _isWorkspaceSelectionBlocked(entry.selectedPath) : null;
+  const isDefault = !entry.selectedPath || !!selectedBlocked;
   const recentPaths = (entry.recentPaths || [])
     .filter((p) => p !== currentPath && p !== DEFAULT_USER_WORKSPACE)
+    .filter((p) => !_isWorkspaceSelectionBlocked(p))
     .slice(0, MAX_RECENT);
   return {
     currentPath,
@@ -393,7 +374,8 @@ export function getWorkspaceInfo(userId: string, projectId?: string): {
 
 function _safeDirectoryPickerDefault(): string | undefined {
   const abs = path.resolve(DEFAULT_USER_WORKSPACE);
-  if (macosTccSensitivePath(abs, { recursive: true })) return undefined;
+  if (macosTccWorkspaceBlockedPath(abs)) return undefined;
+  try { fs.mkdirSync(abs, { recursive: true }); } catch { /* best-effort; stat below decides */ }
   try { return fs.statSync(abs).isDirectory() ? abs : undefined; }
   catch { return undefined; }
 }

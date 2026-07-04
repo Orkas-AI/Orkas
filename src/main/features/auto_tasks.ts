@@ -207,12 +207,19 @@ async function _writeOne(uid: string, task: AutoTask): Promise<void> {
   _notifyDirty(`cloud/auto_tasks/${task.id}/config.json`);
 }
 
+// Sync engine dirty signal (lazy-require: `features/sync` is stripped from
+// the open-source build). Auto tasks live in per-task directories, so a single path hint is
+// enough to wake the sync debounce; the engine still scans the whole cloud tree.
 function _notifyDirty(relPath: string): void {
   if (_syncDirtyNotifierForTest) {
     _syncDirtyNotifierForTest('auto_tasks', relPath);
     return;
   }
-  void relPath;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
+    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
+    sync?.markDirty?.('auto_tasks', relPath);
+  } catch { /* features/sync stripped */ }
 }
 
 async function _readAll(uid: string): Promise<AutoTask[]> {

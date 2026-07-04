@@ -23,6 +23,7 @@ import { createLogger } from '../../logger';
 import * as kb from '../../features/kb_vector';
 import * as kbEmbed from '../../features/kb_embed';
 import * as projectLibrary from '../../features/project_library_indexer';
+import { logErrorRef, maskId } from '../../util/log-redact';
 
 const log = createLogger('kb-tools');
 
@@ -280,7 +281,15 @@ function createKbSearchTool(opts: KbToolsOpts): AgentTool {
       try { vec = await kbEmbed.embedQuery(query); }
       catch (err) {
         const msg = (err as Error).message;
-        log.warn(`kb_search embed failed user=${opts.userId}: ${msg}`);
+        log.warn('kb_search embed failed', {
+          user_id: maskId(opts.userId),
+          project_id: maskId(opts.projectId),
+          query_chars: query.length,
+          k,
+          kind,
+          scope,
+          error: logErrorRef(err),
+        });
         return { content: `kb_search: embedding failed — ${msg}`, isError: true };
       }
 
@@ -306,7 +315,17 @@ function createKbSearchTool(opts: KbToolsOpts): AgentTool {
         hits = collected.slice(0, k);
       } catch (err) {
         const msg = (err as Error).message;
-        log.warn(`kb_search query failed user=${opts.userId}: ${msg}`);
+        log.warn('kb_search query failed', {
+          user_id: maskId(opts.userId),
+          project_id: maskId(opts.projectId),
+          query_chars: query.length,
+          k,
+          kind,
+          scope,
+          has_dir: !!dir,
+          has_path: !!filePath,
+          error: logErrorRef(err),
+        });
         return { content: `kb_search: ${msg}`, isError: true };
       }
 

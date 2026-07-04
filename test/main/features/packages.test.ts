@@ -64,6 +64,7 @@ describe('packages › readPackagesRegistry', () => {
           skill_roots: ['skills', '../outside', '/abs', 'a/../..'],
           bin_entries: [
             { name: 'good', target: 'bin/cli.js', runtime: 'node' },
+            { name: 'native', target: 'npm/bin/native', runtime: 'native' },
             { name: 'bad-target', target: '../../etc/passwd', runtime: 'node' },
             { name: 'bad-runtime', target: 'bin/x.js', runtime: 'deno' },
           ],
@@ -75,7 +76,7 @@ describe('packages › readPackagesRegistry', () => {
     expect(reg.packages).toHaveLength(1);
     expect(reg.packages[0]!.name).toBe('ok');
     expect(reg.packages[0]!.skill_roots).toEqual(['skills']);
-    expect(reg.packages[0]!.bin_entries.map((b) => b.name)).toEqual(['good']);
+    expect(reg.packages[0]!.bin_entries.map((b) => b.name)).toEqual(['good', 'native']);
   });
 });
 
@@ -136,6 +137,26 @@ describe('packages › listPackagesForUi', () => {
     expect(alpha).toMatchObject({ kind: 'both', enabled: true, skill_count: 3, bin_names: ['alpha'] });
     expect(alpha.commit).toBe('abcdef123456'); // truncated to 12
     expect(rows.find((r) => r.name === 'beta')).toMatchObject({ enabled: false, skill_count: 1 });
+  });
+
+  it('uses the curated OSS catalog name as the external package display name', async () => {
+    writeRegistry({
+      version: 1,
+      packages: [{
+        name: 'cli',
+        repo_url: 'https://github.com/hugohe3/ppt-master',
+        kind: 'skill',
+        skill_roots: ['skills'],
+        bin_entries: [],
+        enabled: true,
+      }],
+    });
+
+    const { listPackagesForUi } = await loadPackages();
+    expect(listPackagesForUi(TEST_UID)[0]).toMatchObject({
+      name: 'cli',
+      display_name: 'PPT-Master',
+    });
   });
 });
 
@@ -204,5 +225,58 @@ describe('packages › packagesBinDirIfActive', () => {
       }],
     });
     expect(packagesBinDirIfActive(TEST_UID)).toBeNull();
+  });
+});
+
+describe('packages › packagePathEntriesIfActive', () => {
+  it('includes package-local executable bin dirs even when the registry has no generated shim', async () => {
+    writeRegistry({
+      version: 1,
+      packages: [{
+        name: 'native-cli',
+        repo_url: 'https://github.com/example/native-cli',
+        kind: 'skill',
+        skill_roots: ['skills'],
+        bin_entries: [],
+        enabled: true,
+      }],
+    });
+    const binDir = mkPkgDir('native-cli', 'npm', 'bin');
+    const exe = path.join(binDir, process.platform === 'win32' ? 'native-cli.exe' : 'native-cli');
+    fs.writeFileSync(exe, '');
+    if (process.platform !== 'win32') fs.chmodSync(exe, 0o755);
+
+    const { packagePathEntriesIfActive } = await loadPackages();
+    expect(packagePathEntriesIfActive(TEST_UID)).toContain(path.resolve(binDir));
+  });
+
+  it('keeps the generated .bin shim dir first and ignores disabled packages', async () => {
+    writeRegistry({
+      version: 1,
+      packages: [
+        {
+          name: 'tool',
+          kind: 'cli',
+          skill_roots: [],
+          bin_entries: [{ name: 'tool', target: 'bin/cli.js', runtime: 'node' }],
+          enabled: true,
+        },
+        {
+          name: 'off',
+          kind: 'skill',
+          skill_roots: ['skills'],
+          bin_entries: [],
+          enabled: false,
+        },
+      ],
+    });
+    const shimDir = mkPkgDir('.bin');
+    const offBinDir = mkPkgDir('off', 'npm', 'bin');
+    const offExe = path.join(offBinDir, process.platform === 'win32' ? 'off.exe' : 'off');
+    fs.writeFileSync(offExe, '');
+    if (process.platform !== 'win32') fs.chmodSync(offExe, 0o755);
+
+    const { packagePathEntriesIfActive } = await loadPackages();
+    expect(packagePathEntriesIfActive(TEST_UID)).toEqual([path.resolve(shimDir)]);
   });
 });

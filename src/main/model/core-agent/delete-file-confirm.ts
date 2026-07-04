@@ -44,6 +44,7 @@
 import * as crypto from 'node:crypto';
 import { broadcastToRenderer } from '../../ipc';
 import { createLogger } from '../../logger';
+import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
 
 const log = createLogger('delete_file_confirm');
 
@@ -98,7 +99,13 @@ export function requestConfirmation(absPath: string, ctx: DeleteConfirmContext):
       turn_id: ctx.turn_id ?? '',
     });
   } catch (err) {
-    log.warn(`emit confirmation_required failed token=${token}: ${(err as Error).message}`);
+    log.warn('emit confirmation_required failed', {
+      confirmation_id: maskId(token),
+      path: logPathRef(absPath),
+      cid: maskId(ctx.cid),
+      turn_id: maskId(ctx.turn_id),
+      error: logErrorRef(err),
+    });
   }
   return token;
 }
@@ -109,15 +116,15 @@ export function requestConfirmation(absPath: string, ctx: DeleteConfirmContext):
 export function resolveConfirmation(token: string, granted: boolean): boolean {
   const entry = _entries.get(token);
   if (!entry) {
-    log.warn(`resolveConfirmation: unknown token=${token} (size=${_entries.size}); state stays pending`);
+    log.warn('resolveConfirmation unknown token', { confirmation_id: maskId(token), pending_count: _entries.size });
     return false;
   }
   if (entry.state !== 'pending') {
-    log.warn(`resolveConfirmation: token=${token} already in state=${entry.state}; ignoring`);
+    log.warn('resolveConfirmation duplicate state', { confirmation_id: maskId(token), state: entry.state });
     return false;
   }
   entry.state = granted ? 'granted' : 'denied';
-  log.info(`resolveConfirmation: token=${token} → ${entry.state}`);
+  log.info('resolveConfirmation completed', { confirmation_id: maskId(token), state: entry.state });
   return true;
 }
 
@@ -139,14 +146,18 @@ export type ConsumeOutcome =
 export function consumeGrantedConfirmation(token: string, absPath: string): ConsumeOutcome {
   const entry = _entries.get(token);
   if (!entry) {
-    log.warn(`consumeGrantedConfirmation: unknown token=${token} (size=${_entries.size}); outcome=invalid`);
+    log.warn('consumeGrantedConfirmation unknown token', { confirmation_id: maskId(token), pending_count: _entries.size });
     return { outcome: 'invalid' };
   }
   if (entry.path !== absPath) {
-    log.warn(`consumeGrantedConfirmation: token=${token} path mismatch expect=${entry.path} got=${absPath}`);
+    log.warn('consumeGrantedConfirmation path mismatch', {
+      confirmation_id: maskId(token),
+      expected: logPathRef(entry.path),
+      actual: logPathRef(absPath),
+    });
     return { outcome: 'invalid' };
   }
-  log.info(`consumeGrantedConfirmation: token=${token} state=${entry.state}`);
+  log.info('consumeGrantedConfirmation state', { confirmation_id: maskId(token), path: logPathRef(absPath), state: entry.state });
   if (entry.state === 'pending') return { outcome: 'pending' };
   if (entry.state === 'denied') {
     _entries.delete(token);

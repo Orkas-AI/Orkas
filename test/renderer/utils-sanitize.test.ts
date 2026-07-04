@@ -15,18 +15,24 @@
 // survive (http/https/mailto/tel + the app's chat-media/chat-app/kb-file/blob
 // schemes + relative refs) and the dangerous shapes that MUST be dropped.
 
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const utils = require('../../src/renderer/modules/utils.js');
 const {
   _safeHref,
   inlineFormat,
   sanitizeHtml,
+  sanitizeSvgIconHtml,
 } = utils as {
   _safeHref: (url: string) => string;
   inlineFormat: (text: string) => string;
   sanitizeHtml: (html: string) => string;
+  sanitizeSvgIconHtml: (svg: string) => string;
 };
+
+afterEach(() => {
+  delete (globalThis as typeof globalThis & { DOMPurify?: unknown }).DOMPurify;
+});
 
 describe('_safeHref — safe URI allow-list', () => {
   it('keeps standard safe schemes', () => {
@@ -40,7 +46,7 @@ describe('_safeHref — safe URI allow-list', () => {
 
   it("keeps the app's privileged schemes (media/artifact/KB/blob)", () => {
     for (const u of [
-      'chat-media://local/Users/user/car.png',
+      'chat-media://local/Users/test/car.png',
       'chat-app://app/123/index.html',
       'kb-file://doc/intro.md',
       'blob:https://app/9f2c-uuid',
@@ -92,8 +98,8 @@ describe('inlineFormat — markdown link XSS hardening', () => {
   });
 
   it('preserves the app chat-media scheme in a markdown link', () => {
-    const out = inlineFormat('[clip](chat-media://local/Users/user/notes.txt)');
-    expect(out).toContain('href="chat-media://local/Users/user/notes.txt"');
+    const out = inlineFormat('[clip](chat-media://local/Users/test/notes.txt)');
+    expect(out).toContain('href="chat-media://local/Users/test/notes.txt"');
   });
 
   it('escapes the href in <url> autolinks', () => {
@@ -112,5 +118,30 @@ describe('sanitizeHtml — Node fallback (no DOM/DOMPurify)', () => {
     const s = '<div class="markdown-body"><p>hi</p></div>';
     expect(sanitizeHtml(s)).toBe(s);
     expect(sanitizeHtml(null as unknown as string)).toBe('');
+  });
+});
+
+describe('sanitizeSvgIconHtml — connector icon hardening', () => {
+  it('drops remote SVG icons when DOMPurify is unavailable', () => {
+    expect(sanitizeSvgIconHtml('<svg onload="alert(1)"></svg>')).toBe('');
+  });
+
+  it('requires an SVG root', () => {
+    expect(sanitizeSvgIconHtml('<img src=x onerror=alert(1)>')).toBe('');
+  });
+
+  it('sanitizes SVG with the restricted icon profile', () => {
+    const sanitize = vi.fn(() => '<svg viewBox="0 0 1 1"><path d="M0 0h1v1z"></path></svg>');
+    (globalThis as typeof globalThis & { DOMPurify?: unknown }).DOMPurify = { sanitize };
+
+    const out = sanitizeSvgIconHtml('<svg onload="alert(1)"><script>alert(1)</script><path /></svg>');
+
+    expect(out).toBe('<svg viewBox="0 0 1 1"><path d="M0 0h1v1z"></path></svg>');
+    expect(sanitize).toHaveBeenCalledTimes(1);
+    const config = sanitize.mock.calls[0][1];
+    expect(config.USE_PROFILES).toEqual({ svg: true, svgFilters: true });
+    expect(config.FORBID_TAGS).toContain('script');
+    expect(config.FORBID_TAGS).toContain('foreignObject');
+    expect(config.FORBID_TAGS).toContain('image');
   });
 });

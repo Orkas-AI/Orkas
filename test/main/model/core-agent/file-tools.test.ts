@@ -301,6 +301,8 @@ describe('file-tools › ocr_file', () => {
 
 describe('file-tools › read_file scope guards', () => {
   it('rejects paths outside the scope with E_PATH_OUT_OF_SCOPE', async () => {
+    const perm = await import('../../../../src/main/features/permissions');
+    perm.setLocalExecMode('workspace_approval');
     const { tools } = await buildTools();
     const outside = path.join(tmpDir, '..', 'outside', 'secret.md');
     fs.mkdirSync(path.dirname(outside), { recursive: true });
@@ -310,6 +312,68 @@ describe('file-tools › read_file scope guards', () => {
       expect(r.isError).toBe(true);
       expect(r.content).toContain('E_PATH_OUT_OF_SCOPE');
     } finally { fs.rmSync(path.dirname(outside), { recursive: true, force: true }); }
+  });
+
+  it('allows direct paths outside the workspace in all_files_approval mode', async () => {
+    const perm = await import('../../../../src/main/features/permissions');
+    perm.setLocalExecMode('all_files_approval');
+    const { tools } = await buildTools();
+    const outside = path.join(tmpDir, '..', 'outside-allowed', 'note.md');
+    fs.mkdirSync(path.dirname(outside), { recursive: true });
+    fs.writeFileSync(outside, 'outside ok');
+    try {
+      const r = await run(getTool(tools, 'read_file'), { path: outside });
+      expect(r.isError).toBeFalsy();
+      expect(r.content).toContain('outside ok');
+    } finally { fs.rmSync(path.dirname(outside), { recursive: true, force: true }); }
+  });
+
+  it('prompts and blocks sensitive outside paths in all_files_approval mode when denied', async () => {
+    const perm = await import('../../../../src/main/features/permissions');
+    const bashPerms = await import('../../../../src/main/model/core-agent/bash-permissions');
+    perm.setLocalExecMode('all_files_approval');
+    const { tools } = await buildTools();
+    const outside = path.join(tmpDir, '..', 'outside-sensitive', 'id_rsa');
+    fs.mkdirSync(path.dirname(outside), { recursive: true });
+    fs.writeFileSync(outside, 'SECRET-FILE-TOOLS');
+    let payload: any = null;
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => {
+      payload = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const r = await run(getTool(tools, 'read_file'), { path: outside });
+      expect(r.isError).toBe(true);
+      expect(r.content).toContain('E_SENSITIVE_PATH_DENIED');
+      expect(r.content).not.toContain('SECRET-FILE-TOOLS');
+      expect(payload.operation).toBe('read_file');
+      expect(payload.reasons).toEqual(['sensitive_path']);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      bashPerms._resetForTest();
+      fs.rmSync(path.dirname(outside), { recursive: true, force: true });
+    }
+  });
+
+  it('does not prompt for sensitive paths in all_files_auto mode', async () => {
+    const perm = await import('../../../../src/main/features/permissions');
+    const bashPerms = await import('../../../../src/main/model/core-agent/bash-permissions');
+    perm.setLocalExecMode('all_files_auto');
+    const { tools } = await buildTools();
+    const outside = path.join(tmpDir, '..', 'outside-auto', 'id_rsa');
+    fs.mkdirSync(path.dirname(outside), { recursive: true });
+    fs.writeFileSync(outside, 'AUTO-SECRET');
+    let prompted = false;
+    bashPerms._setBroadcastForTest(() => { prompted = true; });
+    try {
+      const r = await run(getTool(tools, 'read_file'), { path: outside });
+      expect(r.isError).toBeFalsy();
+      expect(r.content).toContain('AUTO-SECRET');
+      expect(prompted).toBe(false);
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(path.dirname(outside), { recursive: true, force: true });
+    }
   });
 
   it('reports E_NOT_FOUND for missing files inside scope', async () => {
@@ -435,6 +499,8 @@ describe('file-tools › stat_file', () => {
   });
 
   it('rejects paths outside scope', async () => {
+    const perm = await import('../../../../src/main/features/permissions');
+    perm.setLocalExecMode('workspace_approval');
     const { tools } = await buildTools();
     const outside = path.join(tmpDir, '..', 'outside2', 'x.md');
     fs.mkdirSync(path.dirname(outside), { recursive: true });
@@ -502,7 +568,7 @@ describe('file-tools › search_files', () => {
     expect(r.content).toContain('MOCK_SYNC_CONFLICT.md');
   });
 
-  it('does not recursively scan a privacy-protected workspace root', async () => {
+  it('does not recursively scan a legacy privacy-protected workspace root', async () => {
     process.env.ORKAS_TCC_GUARD_FORCE = '1';
     const home = path.join(tmpDir, 'home');
     const downloads = path.join(home, 'Downloads');
@@ -512,17 +578,26 @@ describe('file-tools › search_files', () => {
     vi.resetModules();
     const users = await import('../../../../src/main/features/users');
     users.activateUser(UID);
+    const paths = await import('../../../../src/main/paths');
+    fs.mkdirSync(paths.DEFAULT_USER_WORKSPACE, { recursive: true });
+    fs.writeFileSync(path.join(paths.DEFAULT_USER_WORKSPACE, 'public-note.md'), 'public');
+    const cfgFile = paths.userWorkspaceConfigFile(UID);
+    fs.mkdirSync(path.dirname(cfgFile), { recursive: true });
+    fs.writeFileSync(cfgFile, JSON.stringify({
+      selectedPath: downloads,
+      updatedAt: '2026-07-03T00:00:00.000Z',
+      recentPaths: [],
+    }), 'utf8');
     const ws = await import('../../../../src/main/features/user_workspace');
-    const set = ws.setWorkspacePath(UID, downloads);
-    expect(set.ok).toBe(true);
+    expect(ws.getWorkspacePath(UID)).toBe(paths.DEFAULT_USER_WORKSPACE);
     fs.mkdirSync(attachmentDir(), { recursive: true });
     const mod = await import('../../../../src/main/model/core-agent/file-tools');
     const tools = mod.createFileTools({ userId: UID, cid: CID });
 
-    const r = await run(getTool(tools, 'search_files'), { query: 'secret' });
+    const r = await run(getTool(tools, 'search_files'), { query: '' });
 
     expect(r.isError).toBeFalsy();
-    expect(r.content).toContain('privacy-protected workspace');
+    expect(r.content).toContain('public-note.md');
     expect(r.content).not.toContain('secret-contract.md');
   });
 

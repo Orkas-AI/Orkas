@@ -196,7 +196,13 @@ export class PersistentSession extends Session {
       const m = messages[i];
 
       if (m.role !== "assistant") {
-        fixed.push(m);
+        if (m.role === "user" && m.content.some((c) => (c as { type?: string }).type === "tool_result")) {
+          const kept = m.content.filter((c) => (c as { type?: string }).type !== "tool_result");
+          changed = true;
+          if (kept.length > 0) fixed.push({ ...m, content: kept });
+        } else {
+          fixed.push(m);
+        }
         i++;
         continue;
       }

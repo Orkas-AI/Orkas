@@ -39,7 +39,7 @@ function toolProgress(message: string, data: Record<string, unknown> = {}) {
         stream: 'tool',
         data: {
           phase: 'progress',
-          id: 'call-image',
+          id: 'call-video',
           name: 'generate_image',
           message,
           progress_phase: 'poll',

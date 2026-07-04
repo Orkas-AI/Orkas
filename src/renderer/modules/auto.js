@@ -26,12 +26,15 @@ const _autoLog = (typeof createLogger === 'function')
   : { info() {}, warn() {}, error() {} };
 
 function _autoTrackClick(action, data) {
+  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
 function _autoTrackEvent(action, data) {
+  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
 function _autoTrackError(action, data) {
+  try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
 }
 
 function _autoAttachmentPayload(files, source) {
@@ -67,9 +70,14 @@ function _autoSyncApiAvailable() {
   return false;
 }
 async function _refreshAutoSyncNotice() {
+  if (!_autoSyncApiAvailable()) {
+    _autoCloudSyncEnabled = false;
+    _paintAutoSyncNotice();
+    return false;
+  }
   _autoCloudSyncEnabled = false;
   _paintAutoSyncNotice();
-  return false;
+  return _autoCloudSyncEnabled;
 }
 function _paintAutoSyncNotice() {
   const listText = t('auto.sync_note_list');
@@ -672,24 +680,16 @@ function _mountAutoForm() {
   //   - connector: first-class chip field (same widget; one-at-a-time)
   // Skill + connector share the chip slot, matching the commander
   // composer's single-`_chatUse` invariant — picking one clears the other.
-  const recipientAllowsUse = () => !_autoCurrentRecipient || _autoCurrentRecipient.kind !== 'agent';
   window._autoOnRecipientPicked = (rec) => {
     _autoCurrentRecipient = rec && rec.kind ? rec : { kind: 'commander' };
-    if (!recipientAllowsUse()) {
-      _autoCurrentSkill = null;
-      _autoCurrentConnector = null;
-      _repaintAutoUseChip();
-    }
     _repaintAutoRecipientChip();
   };
   window._autoOnSkillPicked = (ref) => {
-    if (!recipientAllowsUse()) return;
     _autoCurrentSkill = (ref && ref.id) ? { id: String(ref.id), name: String(ref.name || ref.id) } : null;
     _autoCurrentConnector = null;
     _repaintAutoUseChip();
   };
   window._autoOnConnectorPicked = (ref) => {
-    if (!recipientAllowsUse()) return;
     _autoCurrentConnector = (ref && ref.id) ? { id: String(ref.id), name: String(ref.name || ref.id) } : null;
     _autoCurrentSkill = null;
     _repaintAutoUseChip();
@@ -983,10 +983,14 @@ function _repaintAutoUseChip() {
   }
   chip.classList.add(kindClass);
   const fullLabel = (skill ? t('skills.use_label', { skill: name }) : t('connectors.use_label', { connector: name }));
+  const removeTitle = t('chat.chip_remove_title');
   chip.innerHTML = `
     <span class="chip-label" title="${escapeHtml(fullLabel)}"><span class="chip-label-prefix">${escapeHtml(prefix)}</span><span class="chip-label-name">${escapeHtml(name)}</span></span>
-    <span class="chip-close" title="${escapeHtml(t('chat.chip_remove_title'))}">×</span>
+    <button type="button" class="chip-close" title="${escapeHtml(removeTitle)}" aria-label="${escapeHtml(removeTitle)}">
+      <span data-ui-icon="x" data-ui-icon-class="chip-close-icon"></span>
+    </button>
   `;
+  if (typeof hydrateUiIcons === 'function') hydrateUiIcons(chip);
   const close = chip.querySelector('.chip-close');
   if (close) {
     close.addEventListener('click', () => {

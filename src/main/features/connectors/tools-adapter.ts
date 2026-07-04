@@ -63,6 +63,12 @@ export async function resolveVisibleConnectors(
   agentId: string | undefined,
 ): Promise<Array<{ instance: ConnectorInstance; tools: ToolSchema[] }>> {
   if (!uid) return [];
+  const maybeManager = manager as typeof manager & {
+    restoreComposioConnectionsFromServer?: (uid: string, reason: string) => Promise<number>;
+    refreshStaleToolCaches?: (uid: string, reason: string) => Promise<number>;
+  };
+  await maybeManager.restoreComposioConnectionsFromServer?.(uid, 'visible_connectors').catch(() => 0);
+  await maybeManager.refreshStaleToolCaches?.(uid, 'visible_connectors').catch(() => 0);
   const all = manager.listInstances(uid);
   if (!all.length) return [];
   // Live-state filter: only currently-connected instances surface to the LLM. A `connecting` /
