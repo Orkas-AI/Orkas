@@ -1,4 +1,5 @@
 import type { Usage, StopReason, MessageContent } from "../shared/types.js";
+import type { HistoryResource } from "./session.js";
 
 /** Parameters for starting an agent run. */
 export type AgentRunParams = {
@@ -9,6 +10,8 @@ export type AgentRunParams = {
     data: string;
     mediaType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
   }>;
+  /** Durable, host-verified resources from this UI turn (attachments/results). */
+  historyResources?: HistoryResource[];
   /** Host-private metadata for provider adapters. This is not rendered into
    * the conversation and must not be exposed to generic providers unless an
    * adapter explicitly forwards selected fields. */
@@ -99,7 +102,25 @@ export type AgentRunEvent =
   | { type: "tool_delta"; name?: string; id: string; inputDelta: string; inputBytes?: number }
   | { type: "tool_start"; name: string; id: string; input: unknown }
   | { type: "tool_progress"; name: string; id: string; phase?: string; message: string; data?: Record<string, unknown> }
-  | { type: "tool_end"; name: string; id: string; result: string; isError?: boolean }
+  | {
+      type: "tool_end";
+      name: string;
+      id: string;
+      result: string;
+      isError?: boolean;
+      errorCode?: string;
+      errorSeverity?: "recoverable" | "error";
+    }
   | { type: "compaction"; tokensBefore: number; tokensAfter: number; summary?: string }
+  | {
+      type: "context_status";
+      phase:
+        | "history_summary_start"
+        | "history_summary_done"
+        | "active_process_compaction_start"
+        | "active_process_compaction_done";
+      message: string;
+      data?: Record<string, unknown>;
+    }
   | { type: "retry"; attempt: number; reason: string }
   | { type: "done"; result: AgentRunResult };

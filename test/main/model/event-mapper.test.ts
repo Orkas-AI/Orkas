@@ -14,8 +14,26 @@ type AgentRunEvent =
   | { type: 'tool_delta'; name?: string; id: string; inputDelta: string; inputBytes?: number }
   | { type: 'tool_start'; name: string; id: string; input: unknown }
   | { type: 'tool_progress'; name: string; id: string; phase?: string; message: string; data?: Record<string, unknown> }
-  | { type: 'tool_end'; name: string; id: string; result: string; isError?: boolean }
+  | {
+      type: 'tool_end';
+      name: string;
+      id: string;
+      result: string;
+      isError?: boolean;
+      errorCode?: string;
+      errorSeverity?: 'recoverable' | 'error';
+    }
   | { type: 'retry'; attempt: number; reason: string }
+  | {
+      type: 'context_status';
+      phase:
+        | 'history_summary_start'
+        | 'history_summary_done'
+        | 'active_process_compaction_start'
+        | 'active_process_compaction_done';
+      message: string;
+      data?: Record<string, unknown>;
+    }
   | { type: 'done'; result: { text: string; meta: { error: null | { message: string } } } };
 
 async function* toAsync<T>(items: T[]): AsyncIterable<T> {
@@ -188,6 +206,22 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     expect(retryProgress.text).not.toContain('retry #');
   });
 
+  it('context_status event → progress row plus structured context event', async () => {
+    const out = await collect([
+      {
+        type: 'context_status',
+        phase: 'history_summary_start',
+        message: '正在整理历史上下文...',
+        data: { turns: 13 },
+      },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ]);
+    const row = out.find((e) => e.type === 'progress' && e.event?.stream === 'context');
+    expect(row.text).toBe('正在整理历史上下文...');
+    expect(row.event.data.phase).toBe('history_summary_start');
+    expect(row.event.data.turns).toBe(13);
+  });
+
   it('retry event with attempt>=2 → shows the attempt number', async () => {
     const out = await collect([
       { type: 'retry', attempt: 2, reason: 'fetch failed' },
@@ -220,6 +254,27 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     const endEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'end');
     expect(endEvent.event.data.isError).toBe(true);
     expect(endEvent.event.data.result_preview).toContain('exit 1');
+  });
+
+  it('recoverable compacted-history guard metadata survives mapping for the renderer', async () => {
+    const out = await collect([
+      { type: 'tool_start', name: 'bash', id: 'c4', input: { command: 'old compacted preview' } },
+      {
+        type: 'tool_end',
+        name: 'bash',
+        id: 'c4',
+        result: 'Recoverable historical-placeholder input detected for bash. The bash tool is still available; this is not a tool limitation.',
+        isError: true,
+        errorCode: 'E_COMPACTED_HISTORY_PLACEHOLDER',
+        errorSeverity: 'recoverable',
+      },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ]);
+    const endEvent = out.find((e) => e.type === 'event' && e.event?.data?.phase === 'end');
+    expect(endEvent.event.data.isError).toBe(true);
+    expect(endEvent.event.data.errorCode).toBe('E_COMPACTED_HISTORY_PLACEHOLDER');
+    expect(endEvent.event.data.errorSeverity).toBe('recoverable');
+    expect(endEvent.event.data.result_preview).toContain('tool is still available');
   });
 
   it('tool_end with small raw result → end event carries `output` (in-memory expand path)', async () => {
@@ -265,7 +320,7 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
       const out = await collect([
         { type: 'done', result: { text: '(Tool loop limit reached)', meta: { error: null } } },
       ]);
-      expect(out).toEqual([{ type: 'final', text: '（工具调用次数已达上限）' }]);
+      expect(out).toEqual([{ type: 'final', text: '（工具循环轮次已达上限）' }]);
     } finally {
       setCurrentLang('en');
     }

@@ -73,7 +73,12 @@ import { chatAttachmentDir, userMarketplaceSkillsDir, userSkillsDir } from '../.
 import * as chatArtifacts from '../../features/chat_artifacts';
 import { finalizeProducedArtifact, producedDocumentFooterText } from '../../features/produced_output_hooks';
 import { readDisabledSets } from '../../features/component_enabled';
-import { requestConfirmation as requestDeleteConfirmation, consumeGrantedConfirmation } from './delete-file-confirm';
+import {
+  cancelConfirmation as cancelDeleteConfirmation,
+  consumeGrantedConfirmation,
+  requestConfirmation as requestDeleteConfirmation,
+  waitForConfirmationVisible as waitForDeleteConfirmationVisible,
+} from './delete-file-confirm';
 import { fileEditLock } from '../../util/locks';
 import { checkEditFreshness, recordRead } from './read-tracker';
 import { createLogger } from '../../logger';
@@ -898,6 +903,15 @@ function guardDeletePath(opts: LocalToolsOpts, abs: string): string | null {
     );
   }
   return null;
+}
+
+function isInWritableWorkspaceScope(opts: LocalToolsOpts, abs: string): boolean {
+  const roots = allowedRootsFor(opts);
+  return roots.length > 0 && isPathAllowed(abs, roots);
+}
+
+function deleteRequiresUserConfirmation(opts: LocalToolsOpts, abs: string): boolean {
+  return !isInWritableWorkspaceScope(opts, abs) && localAccessRequiresSensitiveApproval();
 }
 
 type BashPathToken = { type: 'word' | 'op'; value: string };
@@ -2468,16 +2482,18 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
 
 /** Wrapped `delete_file` tool — single-file unlink, sandboxed identically to
  *  `edit_file` (workspace + current attachment dir + writable extraRoots).
- *  Destructive, so on top of `localExec` we require a per-call user click
- *  in the inline confirm card. The renderer may group multiple pending
- *  per-file tokens from the same turn into one card, but the tool still
- *  consumes one token per file.
+ *  Files inside that writable workspace scope are removed immediately.
+ *  Destructive deletes outside that scope keep a per-call user click in the
+ *  inline confirm card. The renderer may group multiple pending per-file
+ *  tokens from the same turn into one card, but the tool still consumes one
+ *  token per file.
  *
  *  Async token model (does NOT block the LLM turn — see
  *  delete-file-confirm.ts header):
  *    - First call: `delete_file({path})` (no token). Tool mints a token,
- *      emits/adds to a card, and returns IMMEDIATELY with `requires_user_confirmation`
- *      so the LLM can keep doing other tool calls / finish the turn.
+ *      emits/adds to a card, waits briefly for renderer visibility ack, and
+ *      then returns with `requires_user_confirmation` so the LLM can keep
+ *      doing other tool calls / finish the turn.
  *      Skill-creator authoring rules require the LLM to stop in prose
  *      after this and ask the user; never retry in the same turn.
  *    - Second call: `delete_file({path, confirmation_token})`. Tool
@@ -2491,7 +2507,7 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
   return {
     name: 'delete_file',
     description:
-      'Delete one visible file through a two-step user confirmation flow. First call with path only to show a confirm card and get confirmation_token; do not retry in the same turn. After the user confirms, call again with path and token. Use this instead of bash rm.',
+      'Delete one visible file. Files inside the current workspace/attachment/editor scope are deleted immediately. Files outside that scope use a two-step user confirmation flow: first call with path only to request a confirm card and get confirmation_token; after the user confirms, call again with path and token. Use this instead of bash rm.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2523,9 +2539,10 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
         log.warn('delete_file scope reject', { user_id: maskId(opts.userId), path: logPathRef(abs) });
         return { content: scopeErr, isError: true };
       }
+      const requiresConfirmation = deleteRequiresUserConfirmation(opts, abs);
 
       // ── Step 2: token-bearing call → consume + unlink if granted.
-      if (token) {
+      if (token && requiresConfirmation) {
         const outcome = consumeGrantedConfirmation(token, abs);
         if (outcome.outcome === 'pending') {
           return {
@@ -2600,7 +2617,7 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
           isError: true,
         };
       }
-      if (!localAccessRequiresSensitiveApproval()) {
+      if (!requiresConfirmation) {
         try { fs.unlinkSync(abs); }
         catch (err) {
           const msg = (err as Error).message;
@@ -2610,7 +2627,11 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
             isError: true,
           };
         }
-        log.info('delete_file removed without confirmation in all_files_auto mode', { user_id: maskId(opts.userId), path: logPathRef(abs) });
+        log.info('delete_file removed without confirmation', {
+          user_id: maskId(opts.userId),
+          path: logPathRef(abs),
+          reason: isInWritableWorkspaceScope(opts, abs) ? 'workspace_scope' : 'all_files_auto',
+        });
         return { content: `Deleted ${abs}` };
       }
       const newToken = requestDeleteConfirmation(abs, {
@@ -2618,6 +2639,24 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
         cid: opts.cid,
         turn_id: opts.turnId,
       });
+      const cardVisible = await waitForDeleteConfirmationVisible(newToken);
+      if (!cardVisible) {
+        cancelDeleteConfirmation(newToken);
+        log.warn('delete_file confirmation card unavailable', {
+          user_id: maskId(opts.userId),
+          cid: maskId(opts.cid),
+          turn_id: maskId(opts.turnId),
+          path: logPathRef(abs),
+          confirmation_id: maskId(newToken),
+        });
+        return {
+          content: errText(
+            'E_CONFIRMATION_UNAVAILABLE',
+            `${abs}: could not display the delete confirmation card, so no file was deleted. Tell the user the confirmation card did not appear and ask them to retry when the chat is visible.`,
+          ),
+          isError: true,
+        };
+      }
       log.info('delete_file confirmation requested', {
         user_id: maskId(opts.userId),
         cid: maskId(opts.cid),
@@ -2627,7 +2666,7 @@ function createDeleteFileTool(opts: LocalToolsOpts): AgentTool {
       });
       return {
         content:
-          `requires_user_confirmation: "${rawPath}" has been added to the user's confirmation card.\n` +
+          `requires_user_confirmation: "${rawPath}" is outside the current writable workspace scope and needs the user's confirmation card.\n` +
           `confirmation_token: ${newToken}\n` +
           `Next step: stop calling tools this turn after requesting all intended deletes. In your reply prose, tell the user what you plan to delete and ask them to click the card. ` +
           `On the user's next reply, call delete_file again with BOTH \`path\` and \`confirmation_token\` set to complete the deletion.`,

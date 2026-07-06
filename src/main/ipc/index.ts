@@ -60,7 +60,10 @@ import { invokeHandlers as connectorsHandlers } from './connectors';
 import { invokeHandlers as memoryHandlers } from './memory';
 import { safeId } from '../storage';
 import { createLogger, logFromRenderer } from '../logger';
-import { resolveConfirmation as resolveDeleteConfirmation } from '../model/core-agent/delete-file-confirm';
+import {
+  markConfirmationVisible as markDeleteConfirmationVisible,
+  resolveConfirmation as resolveDeleteConfirmation,
+} from '../model/core-agent/delete-file-confirm';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { shell } from 'electron';
@@ -1000,6 +1003,40 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { name: res.name };
   },
 
+  'autoTasks.attachments.attachContext': async ({ taskId, relPath } = {}, ctx) => {
+    if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
+    if (typeof relPath !== 'string' || !relPath.trim()) throw new Error('missing relPath');
+    const absPath = contexts.resolveContextFileAbsPath(relPath);
+    const st = fs.statSync(absPath);
+    if (!st.isFile()) throw new Error('not_a_file');
+    const res = await autoTasks.uploadAttachment(
+      ctx.userId,
+      taskId,
+      path.basename(absPath),
+      fs.readFileSync(absPath),
+    );
+    if (!res.ok) throw new Error((res as { error: string }).error);
+    return { name: res.name };
+  },
+
+  'autoTasks.attachments.attachProjectFile': async ({ taskId, projectId, name } = {}, ctx) => {
+    if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
+    if (!safeId(projectId)) throw new Error('invalid projectId');
+    if (typeof name !== 'string' || !name.trim()) throw new Error('missing name');
+    const resolved = await projectFiles.resolveProjectFileAbsPath(ctx.userId, projectId, name);
+    if (!resolved.ok) throw new Error((resolved as { error?: string }).error || 'not_found');
+    const st = fs.statSync(resolved.absPath);
+    if (!st.isFile()) throw new Error('not_a_file');
+    const res = await autoTasks.uploadAttachment(
+      ctx.userId,
+      taskId,
+      path.basename(resolved.absPath),
+      fs.readFileSync(resolved.absPath),
+    );
+    if (!res.ok) throw new Error((res as { error: string }).error);
+    return { name: res.name };
+  },
+
   'autoTasks.attachments.pickAndUpload': async ({ taskId } = {}, ctx) => {
     if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
     const picked = await _pickLocalFiles('Choose files', CHAT_PICK_EXTENSIONS, true);
@@ -1729,21 +1766,24 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const results = [];
     for (const filePath of picked) {
       const name = path.basename(filePath);
+      const ext = path.extname(name).toLowerCase();
+      let bytes = 0;
+      try { bytes = fs.statSync(filePath).size; } catch { bytes = 0; }
       try {
         const target = _targetInDir(targetDir, name);
         if (contexts.hasHiddenContextPathSegment(target)) {
-          results.push({ ok: false, name, target, reason: 'hidden' });
+          results.push({ ok: false, name, target, bytes, ext, reason: 'hidden' });
           continue;
         }
         if (!contexts.isSupportedContextFileName(target)) {
-          results.push({ ok: false, name, target, reason: 'ext' });
+          results.push({ ok: false, name, target, bytes, ext, reason: 'ext' });
           continue;
         }
         const buf = fs.readFileSync(filePath);
         const res = contexts.uploadContextFile(target, buf);
-        results.push({ name, target, ...res });
+        results.push({ name, target, bytes: buf.length, ext, ...res });
       } catch (err) {
-        results.push({ ok: false, name, error: (err as Error)?.message || String(err) });
+        results.push({ ok: false, name, bytes, ext, error: (err as Error)?.message || String(err) });
       }
     }
     return { files: results };
@@ -2073,6 +2113,11 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     // `_entries` Maps. The IPC handler then flips state on one Map while
     // the tool reads from the other → LLM Step 2 sees `pending` forever.
     const ok = resolveDeleteConfirmation(String(confirm_id || ''), !!granted);
+    return { ok };
+  },
+
+  'delete_file.visible': async ({ confirm_id }: { confirm_id: string }) => {
+    const ok = markDeleteConfirmationVisible(String(confirm_id || ''));
     return { ok };
   },
 

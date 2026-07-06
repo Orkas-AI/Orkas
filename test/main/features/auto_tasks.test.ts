@@ -375,7 +375,9 @@ describe('scheduler dispatch', () => {
       attachments: ['brief.md'],
     });
     expect(autoRuntime.deleteConversation).not.toHaveBeenCalled();
-    expect(events).toEqual([{ type: 'conv_created', cid: 'cid_auto', task_id: taskId }]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ type: 'conv_created', cid: 'cid_auto', task_id: taskId });
+    expect(events[0].duration_ms).toEqual(expect.any(Number));
     expect(fs.readFileSync(path.join(chatAttachmentDir(TEST_UID, 'cid_auto'), 'brief.md'), 'utf8')).toBe('brief');
 
     const task = await getTask(TEST_UID, taskId);
@@ -383,7 +385,7 @@ describe('scheduler dispatch', () => {
     expect(task?.last_run_at).toBe('2026-05-22T09:00:00.000Z');
   });
 
-  it('rolls back the empty conversation and emits no fire event when dispatch fails', async () => {
+  it('rolls back the empty conversation and emits a failure fire event when dispatch fails', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-05-22T09:00:00.000Z'));
     autoRuntime.send.mockResolvedValue({ ok: false, error: 'model unavailable' });
@@ -403,10 +405,52 @@ describe('scheduler dispatch', () => {
 
     expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
     expect(autoRuntime.deleteConversation).toHaveBeenCalledWith(TEST_UID, 'cid_auto');
-    expect(events).toEqual([]);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: 'fire_failed',
+      cid: 'cid_auto',
+      task_id: taskId,
+      error_code: 'send_not_ok',
+    });
+    expect(events[0].duration_ms).toEqual(expect.any(Number));
     const task = await getTask(TEST_UID, taskId);
     expect(task?.enabled).toBe(false);
     expect(task?.last_run_at).toBe('2026-05-22T09:00:00.000Z');
+  });
+
+  it('claims a due boundary so concurrent schedulers cannot double-fire it', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
+    autoRuntime.createConversation
+      .mockResolvedValueOnce({ conversation_id: 'cid_auto_1' })
+      .mockResolvedValueOnce({ conversation_id: 'cid_auto_2' });
+
+    const taskId = 'at_88888888';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'daily run',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    expect(created.ok).toBe(true);
+
+    vi.setSystemTime(new Date(2026, 4, 22, 9, 0, 0));
+    await Promise.all([
+      _onTimerFireForTest(TEST_UID, taskId),
+      _onTimerFireForTest(TEST_UID, taskId),
+    ]);
+
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+    let task = await getTask(TEST_UID, taskId);
+    expect(task?.last_run_at).toBe(new Date(2026, 4, 22, 9, 0, 0).toISOString());
+
+    vi.setSystemTime(new Date(2026, 4, 23, 9, 0, 0));
+    await _onTimerFireForTest(TEST_UID, taskId);
+
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(2);
+    expect(autoRuntime.send).toHaveBeenCalledTimes(2);
+    task = await getTask(TEST_UID, taskId);
+    expect(task?.last_run_at).toBe(new Date(2026, 4, 23, 9, 0, 0).toISOString());
   });
 });
 

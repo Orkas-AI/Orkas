@@ -43,13 +43,16 @@ describe('group_chat router › parseMentions', () => {
     expect(parseMentions('@Software Foo Bar', { names })).toEqual(['Software']);
   });
 
-  // LLM 派活走 dispatch_to / plan_set 工具,散文里 @ 是 markdown 装饰。
+  // LLM 派活走 dispatch_to / plan_set 工具,散文里 @agent 是 markdown 装饰。
   // 这条不变量保护"commander/agent 在介绍/列举/计划里写 @ 不会误触发"
-  // 的 bug 修复(详见 docs/plans/dispatch-via-tool-call.md)。
-  it('skips scanning when fromKind is not user (commander / agent)', () => {
+  // 的 bug 修复(详见 docs/plans/dispatch-via-tool-call.md)。Agent 仍可
+  // 显式 @commander / @指挥官 升级给指挥官。
+  it('skips non-reserved scanning when fromKind is not user', () => {
     const text = '我让 @需求挖掘师 先聊,然后 **@全面评估师** 评估';
     expect(parseMentions(text, { fromKind: 'commander' })).toEqual([]);
     expect(parseMentions(text, { fromKind: 'agent' })).toEqual([]);
+    expect(parseMentions('辛苦 @需求挖掘师 继续, @commander 接力, @指挥官 看一下', { fromKind: 'agent' }))
+      .toEqual(['commander', '指挥官']);
     // user 仍然走完整扫描
     expect(parseMentions(text, { fromKind: 'user' })).toEqual(['需求挖掘师', '全面评估师']);
     // 缺省 fromKind 等价老行为(向后兼容)
@@ -187,12 +190,26 @@ describe('group_chat router › resolveRecipients', () => {
     expect(r.unknown).toEqual([]);
   });
 
-  it('agent @ in text routes to default (user) — @ no longer dispatches', () => {
+  it('agent @<agent> in text routes to default (user) — @ no longer dispatches agents', () => {
     const r = resolveRecipients({
+      fromKind: 'agent', fromId: 'writer',
+      text: '辛苦 @writer 接力', members,
+    });
+    expect(r.to).toEqual(['user']);
+  });
+
+  it('agent explicit @commander / @指挥官 routes to commander', () => {
+    const a = resolveRecipients({
       fromKind: 'agent', fromId: 'writer',
       text: '辛苦 @commander 接力', members,
     });
-    expect(r.to).toEqual(['user']);
+    expect(a.to).toEqual(['commander']);
+
+    const b = resolveRecipients({
+      fromKind: 'agent', fromId: 'writer',
+      text: '@指挥官 我这边卡住了，需要你协调。', members,
+    });
+    expect(b.to).toEqual(['commander']);
   });
 });
 

@@ -22,10 +22,13 @@
  * Resolution order (matches SkillRegistry — see model/core-agent/skill-registry.ts):
  *   1. <uid>/cloud/skills/<id>/scripts/<basename>.<ext>            (custom)
  *   2. <uid>/local/marketplace/skills/<id>/scripts/<basename>.<ext> (installed)
- *   3. External-package skill roots from <uid>/local/packages/_registry.json
+ *   3. Current-agent private installed roots when ORKAS_AGENT_ID is set:
+ *      <uid>/local/marketplace/agents/<agent-id>/skills/<id>/scripts/<basename>.<ext>
+ *      <uid>/cloud/agents/<agent-id>/private_skills/<id>/scripts/<basename>.<ext>
+ *   4. External-package skill roots from <uid>/local/packages/_registry.json
  *      (enabled packages only; `.` roots resolve against the packages dir)
- *   4. Global roots: ~/.claude/skills, ~/.codex/skills (interop, read-only)
- *   5. Same roots by SKILL.md frontmatter `name` when dir id != authored name
+ *   5. Global roots: ~/.claude/skills, ~/.codex/skills (interop, read-only)
+ *   6. Same roots by SKILL.md frontmatter `name` when dir id != authored name
  *   For each candidate dir we try extensions in platform-specific order.
  *
  * Dependency resolution for scripts living under an external package (or any
@@ -40,6 +43,8 @@
  *   ORKAS_UID             — active user id. When present, only that user's
  *                           cloud / marketplace / package skill dirs are
  *                           scanned.
+ *   ORKAS_AGENT_ID        — current acting agent id. When present, only this
+ *                           agent's private installed skill roots are scanned.
  *   ORKAS_WORKSPACE_ROOT  — canonical workspace-data root (set by main process
  *                           in install-data-root.ts). ORKAS_WS_ROOT is honoured
  *                           as a back-compat alias. When neither is set the
@@ -132,6 +137,13 @@ function pushUnique(arr, seen, value) {
   arr.push(value);
 }
 
+function safePathSegment(value) {
+  const text = String(value || '').trim();
+  if (!text || text === '.' || text === '..') return '';
+  if (text.includes('/') || text.includes('\\') || text.includes('\0') || text.includes('..')) return '';
+  return text;
+}
+
 function parseFrontmatterScalar(raw) {
   const s = String(raw || '').trim();
   if (!s) return '';
@@ -201,8 +213,10 @@ function collectSkillDirs(skillRef) {
   }
 
   const wsRoot = workspaceRoot();
-  // Candidate skill dirs — mirror SkillRegistry's
-  // [<uid>/cloud/skills, <uid>/local/marketplace/skills] resolution.
+  // Candidate skill dirs — mirror SkillRegistry's trusted + current-agent
+  // private resolution. Agent-private dirs are included only when ORKAS_UID
+  // scopes the user and ORKAS_AGENT_ID names the acting agent; otherwise
+  // commander/other agents cannot execute another agent's bundled skills.
   //
   // Per-user skills live under <ws>/<uid>/cloud/skills/<id> and
   // <ws>/<uid>/local/marketplace/skills/<id>. uid can be numeric or a UUID,
@@ -246,13 +260,23 @@ function collectSkillDirs(skillRef) {
     return roots;
   }
 
-  function addUidDir(uidDir) {
+  const envAgentId = safePathSegment(process.env.ORKAS_AGENT_ID);
+
+  function addUidDir(uidDir, includeAgentPrivate = false) {
     const cloudRoot = path.join(uidDir, 'cloud', 'skills');
     const marketplaceRoot = path.join(uidDir, 'local', 'marketplace', 'skills');
     addRoot(cloudRoot);
     addRoot(marketplaceRoot);
     addDirect(cloudRoot);
     addDirect(marketplaceRoot);
+    if (includeAgentPrivate && envAgentId) {
+      const marketplaceAgentSkillsRoot = path.join(uidDir, 'local', 'marketplace', 'agents', envAgentId, 'skills');
+      const customAgentPrivateSkillsRoot = path.join(uidDir, 'cloud', 'agents', envAgentId, 'private_skills');
+      addRoot(marketplaceAgentSkillsRoot);
+      addRoot(customAgentPrivateSkillsRoot);
+      addDirect(marketplaceAgentSkillsRoot);
+      addDirect(customAgentPrivateSkillsRoot);
+    }
     for (const pkgRoot of packageSkillRoots(uidDir)) {
       addRoot(pkgRoot);
       addDirect(pkgRoot);
@@ -261,7 +285,7 @@ function collectSkillDirs(skillRef) {
 
   const envUid = (process.env.ORKAS_UID || '').trim();
   if (envUid && !/[\\/]/.test(envUid) && envUid !== '.' && envUid !== '..') {
-    addUidDir(path.join(wsRoot, envUid));
+    addUidDir(path.join(wsRoot, envUid), true);
   } else {
     try {
       for (const entry of fs.readdirSync(wsRoot, { withFileTypes: true })) {

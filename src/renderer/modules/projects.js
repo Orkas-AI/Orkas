@@ -660,6 +660,9 @@ async function _confirmDeleteProject(pid) {
     }
     await loadConversations();
     const projectsAfterDelete = await loadProjects(true);
+    if (typeof window.refreshAutoProjectOptions === 'function') {
+      try { window.refreshAutoProjectOptions(pid); } catch (_) { /* auto dialog may be unmounted */ }
+    }
     if (wasViewingDeletedProject || activeConversationWasDeleted) {
       _goToProjectDeleteFallback(_pickProjectDeleteFallback(
         pid,

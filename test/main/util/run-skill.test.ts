@@ -29,6 +29,20 @@ function writeMarketplaceSkill(dirId: string, displayName: string, scriptBase: s
   );
 }
 
+function writeAgentMarketplaceSkill(agentId: string, dirId: string, displayName: string, scriptBase: string): void {
+  const skillDir = path.join(tmpDir, 'u1', 'local', 'marketplace', 'agents', agentId, 'skills', dirId);
+  const scriptsDir = path.join(skillDir, 'scripts');
+  fs.mkdirSync(scriptsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(skillDir, 'SKILL.md'),
+    `---\nname: ${displayName}\ndescription: agent private test\n---\n\nbody\n`,
+  );
+  fs.writeFileSync(
+    path.join(scriptsDir, `${scriptBase}.sh`),
+    'printf \'{"ok":true,"agent":"%s","argv":"%s"}\\n\' "$ORKAS_AGENT_ID" "$*"\n',
+  );
+}
+
 function runSkill(skillRef: string, scriptBase: string, args: string[] = [], extraEnv: Record<string, string> = {}) {
   const pcRoot = process.cwd();
   return spawnSync(process.execPath, [
@@ -83,6 +97,48 @@ describe('run-skill.cjs', () => {
     expect(r.status).toBe(0);
     expect(r.stderr).toBe('');
     expect(JSON.parse(r.stdout.trim())).toEqual({ ok: true, argv: 'youtube' });
+  });
+
+  it('resolves current-agent private marketplace scripts from the installed agent directory', () => {
+    writeAgentMarketplaceSkill('agent-a', 'stage-compose', 'stage-compose', 'render_composition');
+
+    const r = runSkill('stage-compose', 'render_composition', ['--op', 'inspect'], {
+      ORKAS_UID: 'u1',
+      ORKAS_AGENT_ID: 'agent-a',
+    });
+
+    expect(r.status).toBe(0);
+    expect(r.stderr).toBe('');
+    expect(JSON.parse(r.stdout.trim())).toEqual({ ok: true, agent: 'agent-a', argv: '--op inspect' });
+  });
+
+  it('does not expose another agent private marketplace skill', () => {
+    writeAgentMarketplaceSkill('agent-a', 'stage-compose', 'stage-compose', 'render_composition');
+
+    const r = runSkill('stage-compose', 'render_composition', [], {
+      ORKAS_UID: 'u1',
+      ORKAS_AGENT_ID: 'agent-b',
+    });
+
+    expect(r.status).toBe(66);
+    expect(r.stdout).toBe('');
+    const err = JSON.parse(r.stderr.trim());
+    expect(err.ok).toBe(false);
+    expect(err.error).toContain('skill script not found');
+    expect(JSON.stringify(err.searched)).not.toContain('agent-a');
+  });
+
+  it('requires ORKAS_UID before resolving agent private marketplace skills', () => {
+    writeAgentMarketplaceSkill('agent-a', 'stage-compose', 'stage-compose', 'render_composition');
+
+    const r = runSkill('stage-compose', 'render_composition', [], {
+      ORKAS_AGENT_ID: 'agent-a',
+    });
+
+    expect(r.status).toBe(66);
+    const err = JSON.parse(r.stderr.trim());
+    expect(err.ok).toBe(false);
+    expect(JSON.stringify(err.searched)).not.toContain('agent-a');
   });
 
   itOnNonWindows('prefers POSIX scripts over Windows-native scripts outside Windows', () => {

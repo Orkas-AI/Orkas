@@ -39,6 +39,7 @@ import * as path from 'node:path';
 
 import {
   userAutoTasksDir,
+  userLocalRoot,
   autoTaskDir,
   autoTaskConfigFile,
   autoTaskAttachmentsDir,
@@ -64,6 +65,7 @@ const MAX_CONTENT_LEN = 8000;
 // Per-user task cap — every tick scans + reads each task's config.json, so a
 // runaway count can't be allowed to push a tick past TICK_MS.
 const MAX_TASKS_PER_USER = 200;
+const AUTO_TASK_CLAIMS_DIR = 'auto_task_claims';
 
 export type ScheduleOneTime = { type: 'one_time'; at: string };
 export type ScheduleDaily   = { type: 'daily';   hour: number; minute: number };
@@ -779,39 +781,73 @@ function _sanitiseFilename(name: string): string {
 
 /** True iff the task should fire at `now` given its last run. */
 export function isDue(task: AutoTask, now: Date, lastRun: Date | null): boolean {
-  if (!task.enabled) return false;
+  return _dueBoundary(task, now, lastRun) !== null;
+}
+
+function _dueBoundary(task: AutoTask, now: Date, lastRun: Date | null): Date | null {
+  if (!task.enabled) return null;
   const sched = task.schedule;
   if (sched.type === 'one_time') {
-    if (lastRun) return false; // one_time fires at most once
-    return now.getTime() >= new Date(sched.at).getTime();
+    if (lastRun) return null; // one_time fires at most once
+    const at = new Date(sched.at);
+    if (Number.isNaN(at.getTime())) return null;
+    return now.getTime() >= at.getTime() ? at : null;
   }
   if (sched.type === 'daily') {
     return _crossedTodayBoundary(now, lastRun, sched.hour, sched.minute);
   }
   if (sched.type === 'weekly') {
-    if (now.getDay() !== sched.weekday) return false;
+    if (now.getDay() !== sched.weekday) return null;
     return _crossedTodayBoundary(now, lastRun, sched.hour, sched.minute);
   }
   if (sched.type === 'monthly') {
     const todayDom = now.getDate();
     const lastDom = _lastDayOfMonth(now);
     const targetDom = Math.min(sched.day, lastDom); // day=31 → last day of month
-    if (todayDom !== targetDom) return false;
+    if (todayDom !== targetDom) return null;
     return _crossedTodayBoundary(now, lastRun, sched.hour, sched.minute);
   }
-  return false;
+  return null;
 }
 
-function _crossedTodayBoundary(now: Date, lastRun: Date | null, hour: number, minute: number): boolean {
+function _crossedTodayBoundary(now: Date, lastRun: Date | null, hour: number, minute: number): Date | null {
   const boundary = new Date(now);
   boundary.setHours(hour, minute, 0, 0);
-  if (now.getTime() < boundary.getTime()) return false;
-  if (!lastRun) return true;
-  return lastRun.getTime() < boundary.getTime();
+  if (now.getTime() < boundary.getTime()) return null;
+  if (!lastRun) return boundary;
+  return lastRun.getTime() < boundary.getTime() ? boundary : null;
 }
 
 function _lastDayOfMonth(d: Date): number {
   return new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+}
+
+function _claimFile(uid: string, taskId: string, boundary: Date): string {
+  return path.join(userLocalRoot(uid), AUTO_TASK_CLAIMS_DIR, taskId, `${boundary.getTime()}.json`);
+}
+
+function _tryClaimFireBoundary(uid: string, task: AutoTask, boundary: Date, now: Date): boolean {
+  const file = _claimFile(uid, task.id, boundary);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      task_id: task.id,
+      boundary_at: boundary.toISOString(),
+      claimed_at: now.toISOString(),
+      pid: process.pid,
+      device_id: getCurrentDevice().id || '',
+      device_name: getCurrentDevice().name || '',
+    }, null, 2), { encoding: 'utf8', flag: 'wx' });
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'EEXIST') return false;
+    // If the local claim directory is temporarily unavailable, keep the task
+    // available rather than silently dropping the scheduled run. Normal data
+    // roots are writable; this branch is defensive for odd filesystem states.
+    log.warn(`fire claim unavailable uid=${uid} id=${task.id}: ${(err as Error).message}`);
+    return true;
+  }
 }
 
 // ── Dispatch ────────────────────────────────────────────────────────────
@@ -865,8 +901,18 @@ function _buildFireTitle(task: AutoTask): string {
 }
 
 async function _fireTask(uid: string, task: AutoTask): Promise<void> {
+  const startedAt = Date.now();
   const title = _buildFireTitle(task);
   let cid = '';
+  const emitFailure = (errorCode: string): void => {
+    _emitFire({
+      type: 'fire_failed',
+      task_id: task.id,
+      ...(cid ? { cid } : {}),
+      error_code: errorCode,
+      duration_ms: Math.max(0, Date.now() - startedAt),
+    });
+  };
   try {
     const conv = await chats.createConversation(uid, {
       kind: 'normal',
@@ -877,6 +923,7 @@ async function _fireTask(uid: string, task: AutoTask): Promise<void> {
     cid = conv.conversation_id;
   } catch (err) {
     log.error(`fire conv-create failed uid=${uid} id=${task.id}: ${(err as Error).message}`);
+    emitFailure('conv_create_failed');
     return;
   }
   // Copy attachments into the new conversation's chat_attachments dir
@@ -896,13 +943,20 @@ async function _fireTask(uid: string, task: AutoTask): Promise<void> {
     if (!res.ok) {
       log.warn(`fire send failed uid=${uid} id=${task.id} cid=${cid}: ${res.error || 'unknown'}`);
       await rollbackEmptyConv('send_not_ok');
+      emitFailure('send_not_ok');
       return;
     }
     log.info(`fired uid=${uid} id=${task.id} cid=${cid} project=${task.project_id || '-'} attachments=${attachmentNames.length}`);
-    _emitFire({ type: 'conv_created', cid, task_id: task.id });
+    _emitFire({
+      type: 'conv_created',
+      cid,
+      task_id: task.id,
+      duration_ms: Math.max(0, Date.now() - startedAt),
+    });
   } catch (err) {
     log.error(`fire send threw uid=${uid} id=${task.id} cid=${cid}: ${(err as Error).message}`);
     await rollbackEmptyConv('send_threw');
+    emitFailure('send_threw');
   }
 }
 
@@ -932,11 +986,20 @@ async function _copyAttachmentsForFire(uid: string, task: AutoTask, cid: string)
 
 // ── Fire pub/sub (renderer-side refresh hook) ───────────────────────────
 
-export type AutoFireEvent = {
-  type: 'conv_created';
-  cid: string;
-  task_id: string;
-};
+export type AutoFireEvent =
+  | {
+      type: 'conv_created';
+      cid: string;
+      task_id: string;
+      duration_ms?: number;
+    }
+  | {
+      type: 'fire_failed';
+      task_id: string;
+      cid?: string;
+      error_code: string;
+      duration_ms?: number;
+    };
 
 type FireListener = (ev: AutoFireEvent) => void;
 const _fireListeners = new Set<FireListener>();
@@ -1078,12 +1141,12 @@ function _cancelTimer(taskId: string): void {
 
 /** Register / refresh the timer for a single task. Idempotent: existing
  *  timer is cancelled first. Sync — safe to call inside `_runExclusive`. */
-function _scheduleTask(uid: string, task: AutoTask): void {
+function _scheduleTask(uid: string, task: AutoTask, baselineOverride?: Date | null): void {
   _cancelTimer(task.id);
   if (!task.enabled) return;
   if (task.device_id && task.device_id !== getCurrentDevice().id) return;
   const now = new Date();
-  const lastRun = _scheduleBaseline(task);
+  const lastRun = baselineOverride === undefined ? _scheduleBaseline(task) : baselineOverride;
   const nextDue = _nextDueAt(task, now, lastRun);
   if (!nextDue) return;
   const wait = nextDue.getTime() - now.getTime();
@@ -1103,17 +1166,24 @@ async function _onTimerFire(uid: string, taskId: string): Promise<void> {
   if (!task) return;
   const now = new Date();
   const lastRun = _scheduleBaseline(task);
+  const dueBoundary = _dueBoundary(task, now, lastRun);
+  let claimedElsewhereBoundary: Date | null = null;
   const canFireHere = task.enabled
     && (!task.device_id || task.device_id === getCurrentDevice().id)
-    && isDue(task, now, lastRun);
+    && dueBoundary !== null;
   if (canFireHere) {
-    try {
-      // Stamp last_run_at FIRST (and disable on one_time) so a slow fire
-      // can't get re-picked by a future re-schedule.
-      await _markRan(uid, taskId, now.toISOString(), task.schedule.type === 'one_time');
-      await _fireTask(uid, task);
-    } catch (err) {
-      log.warn(`fire failed id=${taskId}: ${(err as Error).message}`);
+    if (!_tryClaimFireBoundary(uid, task, dueBoundary, now)) {
+      claimedElsewhereBoundary = dueBoundary;
+      log.info(`fire skipped duplicate uid=${uid} id=${taskId} boundary=${dueBoundary.toISOString()}`);
+    } else {
+      try {
+        // Stamp last_run_at FIRST (and disable on one_time) so a slow fire
+        // can't get re-picked by a future re-schedule.
+        await _markRan(uid, taskId, now.toISOString(), task.schedule.type === 'one_time');
+        await _fireTask(uid, task);
+      } catch (err) {
+        log.warn(`fire failed id=${taskId}: ${(err as Error).message}`);
+      }
     }
   }
   // Re-read for fresh last_run_at / enabled state, then reschedule. This
@@ -1121,7 +1191,7 @@ async function _onTimerFire(uid: string, taskId: string): Promise<void> {
   // capped timer fired before the actual due time, no fire happens but a
   // new timer goes in for the remaining gap (or up to another MAX cap).
   const fresh = await _readOne(uid, taskId);
-  if (fresh) _scheduleTask(uid, fresh);
+  if (fresh) _scheduleTask(uid, fresh, claimedElsewhereBoundary || undefined);
 }
 
 export function _onTimerFireForTest(uid: string, taskId: string): Promise<void> {

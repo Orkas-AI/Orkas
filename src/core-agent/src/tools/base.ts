@@ -1,4 +1,7 @@
 import type { ToolDefinition } from "../providers/base.js";
+import { createLogger } from "../shared/logger.js";
+
+const log = createLogger("tool-definitions");
 
 /** Context passed to a tool when it executes. */
 export type ToolContext = {
@@ -66,16 +69,26 @@ export interface AgentTool {
   execute(input: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult>;
 }
 
+export const TOOL_DESCRIPTION_SOFT_BUDGET_CHARS = 480;
+export const SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS = 220;
+
 /** Convert an AgentTool to the provider ToolDefinition format. */
 export function toToolDefinition(tool: AgentTool): ToolDefinition {
+  const description = normalizeDescription(tool.description);
+  warnLongDescriptionOnce(
+    `tool:${tool.name}:description`,
+    tool.name,
+    "tool description",
+    description.length,
+    TOOL_DESCRIPTION_SOFT_BUDGET_CHARS,
+  );
   return {
     name: tool.name,
-    description: compactDescription(tool.description, 480),
-    inputSchema: compactSchema(tool.inputSchema),
+    description,
+    inputSchema: compactSchema(tool.inputSchema, tool.name),
   };
 }
 
-const SCHEMA_DESCRIPTION_MAX_CHARS = 220;
 const DROPPED_SCHEMA_KEYS = new Set([
   "$comment",
   "$schema",
@@ -84,44 +97,62 @@ const DROPPED_SCHEMA_KEYS = new Set([
   "markdownDescription",
 ]);
 
-function compactSchema(value: Record<string, unknown>): Record<string, unknown> {
-  const compacted = compactSchemaValue(value);
+const warnedLongDescriptions = new Set<string>();
+
+function compactSchema(value: Record<string, unknown>, toolName: string): Record<string, unknown> {
+  const compacted = compactSchemaValue(value, toolName, "/inputSchema");
   return isRecord(compacted) ? compacted : value;
 }
 
-function compactSchemaValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(compactSchemaValue);
+function compactSchemaValue(value: unknown, toolName: string, pointer: string): unknown {
+  if (Array.isArray(value)) {
+    return value.map((entry, index) => compactSchemaValue(entry, toolName, `${pointer}/${index}`));
+  }
   if (!isRecord(value)) return value;
 
   const out: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value)) {
     if (DROPPED_SCHEMA_KEYS.has(key)) continue;
     if (key === "description" && typeof entry === "string") {
-      out[key] = compactDescription(entry, SCHEMA_DESCRIPTION_MAX_CHARS);
+      const description = normalizeDescription(entry);
+      warnLongDescriptionOnce(
+        `schema:${toolName}:${pointer}/description`,
+        toolName,
+        `schema description at ${pointer}`,
+        description.length,
+        SCHEMA_DESCRIPTION_SOFT_BUDGET_CHARS,
+      );
+      out[key] = description;
     } else {
-      out[key] = compactSchemaValue(entry);
+      out[key] = compactSchemaValue(entry, toolName, `${pointer}/${escapePointerSegment(key)}`);
     }
   }
   return out;
 }
 
-function compactDescription(text: string, maxChars: number): string {
-  const normalized = String(text || "").replace(/\s+/g, " ").trim();
-  if (normalized.length <= maxChars) return normalized;
-
-  const sentenceCut = findSentenceBoundary(normalized, maxChars);
-  const cut = sentenceCut > Math.floor(maxChars * 0.55) ? sentenceCut : maxChars;
-  return `${normalized.slice(0, cut).trimEnd()}...`;
+function normalizeDescription(text: string): string {
+  return String(text || "").replace(/\s+/g, " ").trim();
 }
 
-function findSentenceBoundary(text: string, before: number): number {
-  for (let i = Math.min(before, text.length - 1); i >= 0; i--) {
-    const ch = text[i];
-    if (ch === "." || ch === "!" || ch === "?" || ch === ";" || ch === "\u3002" || ch === "\uff01" || ch === "\uff1f") {
-      return i + 1;
-    }
-  }
-  return -1;
+function warnLongDescriptionOnce(
+  key: string,
+  toolName: string,
+  field: string,
+  chars: number,
+  softBudget: number,
+): void {
+  if (chars <= softBudget || warnedLongDescriptions.has(key)) return;
+  warnedLongDescriptions.add(key);
+  log.warn("tool definition description exceeds soft budget; sent untruncated", {
+    tool: toolName,
+    field,
+    chars,
+    softBudget,
+  });
+}
+
+function escapePointerSegment(value: string): string {
+  return value.replace(/~/g, "~0").replace(/\//g, "~1");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

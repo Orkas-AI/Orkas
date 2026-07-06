@@ -20,7 +20,7 @@
  * is the human; UI is the only consumer).
  */
 
-import type { AgentTool } from '#core-agent';
+import type { AgentTool, HistoryResource } from '#core-agent';
 
 import { createLogger } from '../../logger';
 import { dispatchSlots } from '../../util/locks';
@@ -336,6 +336,9 @@ export type GroupEvent =
    * up as a stuck "thinking" bubble when commander's turn ends silently. */
   | { type: 'message'; cid: string; msg: GroupMessage; turn_end?: boolean; turn_id?: string; seg?: number }
   | { type: 'process'; cid: string; actor: string; turn_id?: string; data: Record<string, unknown> }
+  /** Low-volume model run telemetry. Emitted live for analytics only; never
+   * persisted as process history and never rendered in the process rail. */
+  | { type: 'agent_run_result'; cid: string; actor: string; actor_type: 'commander' | 'agent'; turn_id?: string; data: Record<string, unknown> }
   /** A `create_artifact` tool call finished writing its bundle. The final
    * end-of-turn message still carries `msg.artifacts` for persistence; this
    * live event lets the renderer mount the iframe immediately instead of
@@ -1543,6 +1546,7 @@ async function runActorTurn(
     hasAttachments: !!(item.attachments && item.attachments.length),
     attachmentTypes: [] as string[],
   };
+  const turnHistoryResources: HistoryResource[] = [];
   // Capture the process trail to persist on the end-of-turn message so
   // history reload can rerender the rail (renderer accumulates it live, but
   // without persistence it vanishes on refresh). Cap the array so a runaway
@@ -1553,8 +1557,19 @@ async function runActorTurn(
   const processItems: ProcessItem[] = [];
   if (item.attachments && item.attachments.length) {
     try {
-      const { buildAttachmentManifest } = await import('../chat_attachments');
-      const { manifest, images, skipped, metadata } = await buildAttachmentManifest(uid, cid, item.attachments);
+      const attachmentsMod = await import('../chat_attachments');
+      for (const name of item.attachments) {
+        const resolved = attachmentsMod.resolveAttachmentAbsPath(uid, cid, name);
+        if (resolved.ok) {
+          turnHistoryResources.push({
+            kind: 'attachment',
+            path: resolved.absPath,
+            name,
+            note: `Uploaded ${resolved.kind} attachment.`,
+          });
+        }
+      }
+      const { manifest, images, skipped, metadata } = await attachmentsMod.buildAttachmentManifest(uid, cid, item.attachments);
       turnAttachmentMetadata = metadata;
       if (manifest) messageText = `${manifest}\n${messageText}`;
       if (images.length) turnImages = images;
@@ -1732,6 +1747,23 @@ async function runActorTurn(
   // "ours" → overwrite in place. Files the user pre-created remain foreign
   // and still get `-2 / -3 / ...` suffixed via `util/uniquify-path`.
   const hasProducedPath = (absPath: string) => state.producedPaths.has(absPath);
+  const registerFinalOutputResources = async (paths: readonly string[]) => {
+    if (!paths.length) return;
+    try {
+      const { getSession } = await import('../../model/core-agent/session-store');
+      const session = await getSession(sessionId);
+      for (const absPath of paths) {
+        session.addHistoryResource({
+          kind: 'final_output',
+          path: absPath,
+          name: path.basename(absPath),
+          note: 'Produced file shown in this conversation.',
+        });
+      }
+    } catch (err) {
+      log.warn(`history final-output registration failed cid=${cid} actor=${actor.id}: ${(err as Error).message}`);
+    }
+  };
   // Interactive web-app artifacts created via `create_artifact` this turn.
   // Attached to the actor's end-of-turn message so the renderer embeds each
   // one as a sandboxed `<iframe>` (`chat-app://`); `agent_id` = this actor,
@@ -1783,6 +1815,7 @@ async function runActorTurn(
       forceTo: [USER_ID], turn_id: item.turnId, seg: segIndex,
       ...(segProduced.length ? { produced: segProduced } : {}),
     });
+    await registerFinalOutputResources(segProduced);
   };
 
   // activityEvents = count of non-error, non-final, non-done events the
@@ -1939,6 +1972,7 @@ async function runActorTurn(
           ...agentRoots,
         ],
         ...(turnImages.length ? { images: turnImages } : {}),
+        ...(turnHistoryResources.length ? { historyResources: turnHistoryResources } : {}),
         attachmentMetadata: turnAttachmentMetadata,
         ...(extraTools.length ? { extraTools } : {}),
         ...(skillList !== undefined ? { skillList } : {}),
@@ -1976,6 +2010,18 @@ async function runActorTurn(
         errText = ev.text || 'unknown error';
         aborted = !!(ev as { aborted?: boolean }).aborted;
         log.warn(`stream error cid=${cid} actor=${actor.id}: ${errText}${aborted ? ' (aborted)' : ''}`);
+      } else if (ev.type === 'event' && (ev.event as { stream?: unknown } | undefined)?.stream === 'agent_run_result') {
+        if (actor.kind !== 'worker') {
+          const inner = (ev.event as { data?: unknown } | undefined)?.data;
+          emit(state, {
+            type: 'agent_run_result',
+            cid,
+            actor: actor.id,
+            actor_type: actor.kind === 'commander' ? 'commander' : 'agent',
+            turn_id: item.turnId,
+            data: inner && typeof inner === 'object' ? (inner as Record<string, unknown>) : {},
+          });
+        }
       } else if (ev.type !== 'done') {
         activityEvents += 1;
         void touchActivity(uid, cid);
@@ -2436,6 +2482,7 @@ async function runActorTurn(
       turn_end: true,
       turn_id: item.turnId,
     });
+    await registerFinalOutputResources(outcome.produced || []);
   } else if (outcome.kind === 'silent' && actor.kind !== 'worker') {
     // outcome=silent → bus is NOT going to enqueue a message for this turn.
     // Any placeholder the renderer parked for this actor (e.g. a fresh one

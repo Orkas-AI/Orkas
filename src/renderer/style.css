@@ -12407,10 +12407,39 @@ body.model-not-configured .main-content { flex-direction: column; }
    page's automation tab via `window.openAutoTaskDialog`. Sized big enough
    for the composer + schedule row + project picker without scrolling on
    normal-height screens. */
-.auto-task-dialog { min-width: 640px; max-width: 720px; }
+.auto-task-dialog {
+  min-width: min(640px, calc(100vw - 32px));
+  width: min(720px, calc(100vw - 32px));
+  max-width: 720px;
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+}
 .auto-task-dialog-title { margin-bottom: 14px; font-weight: 600; font-size: 15px; }
 .auto-task-dialog-title + .auto-task-dialog-sync-note { margin-top: -6px; margin-bottom: 12px; }
 .auto-task-dialog-body { display: flex; flex-direction: column; gap: 14px; }
+.auto-markdown-toolbar {
+  margin: 0;
+  padding: 0 4px 2px;
+  border: 0;
+  background: transparent;
+  border-radius: 0;
+  gap: 2px;
+}
+.auto-markdown-toolbar .btn-icon {
+  min-width: 26px;
+  width: 26px;
+  height: 24px;
+  padding: 0;
+}
+.auto-markdown-toolbar .ctx-editor-toolbar-sep {
+  height: 16px;
+  margin: 0 2px;
+}
+.auto-composer-wrapper .chat-rich-editor {
+  min-height: 88px;
+  max-height: 220px;
+  font-size: 15px;
+}
 .auto-sync-note {
   color: var(--muted);
   font-size: 12px;

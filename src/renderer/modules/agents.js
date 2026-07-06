@@ -2990,7 +2990,8 @@ function _normalizeAgentPickerTab(tab) {
 function _agentPickerAllowsLibrary(anchorId) {
   return anchorId === 'chat-recipient-chip'
     || anchorId === 'new-chat-recipient-chip'
-    || anchorId === 'project-chat-recipient-chip';
+    || anchorId === 'project-chat-recipient-chip'
+    || anchorId === 'auto-recipient-chip';
 }
 
 function _agentPickerVisibleTabs(anchorId) {
@@ -3045,29 +3046,74 @@ function _moveAgentPickerTab(delta) {
   _setAgentPickerTab(tabs[next]);
 }
 
+function _agentPickerProjectExists(projectId) {
+  const pid = String(projectId || '');
+  if (!pid) return false;
+  try {
+    if (typeof _projectsCache !== 'undefined' && Array.isArray(_projectsCache)) {
+      return _projectsCache.some((p) => p && p.project_id === pid);
+    }
+  } catch (_) { /* no project cache in this renderer/test context */ }
+  return true;
+}
+
+function _agentPickerValidProjectId(projectId) {
+  const pid = String(projectId || '');
+  return pid && _agentPickerProjectExists(pid) ? pid : '';
+}
+
 function _resolveActiveProjectId(anchorId) {
   if (anchorId === 'new-chat-recipient-chip') {
     // Empty-state composer creates orphan conversations; no project scope.
     return '';
   }
   if (anchorId === 'project-chat-recipient-chip') {
-    return (typeof _projectDetailPid !== 'undefined') ? (_projectDetailPid || '') : '';
+    return _agentPickerValidProjectId(
+      (typeof _projectDetailPid !== 'undefined') ? (_projectDetailPid || '') : '',
+    );
   }
   if (anchorId === 'chat-recipient-chip') {
     if (typeof currentCid !== 'undefined' && currentCid
         && typeof conversations !== 'undefined' && Array.isArray(conversations)) {
       const conv = conversations.find((c) => c && c.conversation_id === currentCid);
-      return (conv && conv.project_id) || '';
+      return _agentPickerValidProjectId((conv && conv.project_id) || '');
     }
   }
   if (anchorId === 'auto-recipient-chip') {
     // The auto modal sets this when it opens so picker results scope
     // to the task's project (if any). See modules/auto.js.
-    return (typeof window !== 'undefined' && typeof window._autoGetProjectId === 'function')
+    const pid = (typeof window !== 'undefined' && typeof window._autoGetProjectId === 'function')
       ? (window._autoGetProjectId() || '')
       : '';
+    return _agentPickerValidProjectId(pid);
   }
   return '';
+}
+
+async function _refreshAgentPickerProjectContext(anchorId) {
+  _pickerBoundAgentIds = null;
+  _pickerProjectId = _resolveActiveProjectId(anchorId) || '';
+  _pickerLibraryRows = null;
+  _pickerLibraryLoading = null;
+  _pickerLibraryRenderSeq += 1;
+  if (_pickerProjectId) {
+    try {
+      const res = await window.orkas.invoke('projects.bindings.list', { projectId: _pickerProjectId });
+      if (res?.ok) {
+        _pickerBoundAgentIds = new Set((res.bindings && res.bindings.agents) || []);
+      }
+    } catch (_) { /* keep Library project scope; backend/file-tree handles stale ids */ }
+  }
+}
+
+async function refreshAgentPickerContext(anchorId) {
+  const picker = document.getElementById('agent-picker');
+  if (!picker || picker.style.display === 'none') return;
+  if (anchorId && picker.dataset.anchorId !== anchorId) return;
+  const activeAnchorId = picker.dataset.anchorId || anchorId || '';
+  await _refreshAgentPickerProjectContext(activeAnchorId);
+  const search = document.getElementById('agent-picker-search');
+  _renderAgentPickerList(search ? search.value : '');
 }
 
 async function _openAgentPicker(anchorBtn) {
@@ -3090,23 +3136,10 @@ async function _openAgentPicker(anchorBtn) {
     (typeof loadSkills === 'function' ? loadSkills(true) : Promise.resolve()),
     (typeof loadConnectors === 'function' ? loadConnectors() : Promise.resolve()),
   ]);
-  // Refresh project-scoped agent bindings on every open so the picker reflects
-  // whatever project the user just picked (commander chip) or whatever
-  // project the active conv belongs to. Skills and connectors stay global.
-  _pickerBoundAgentIds = null;
-  const pid = _resolveActiveProjectId(anchorBtn.id);
-  _pickerProjectId = pid || '';
-  _pickerLibraryRows = null;
-  _pickerLibraryLoading = null;
-  _pickerLibraryRenderSeq += 1;
-  if (pid) {
-    try {
-      const res = await window.orkas.invoke('projects.bindings.list', { projectId: pid });
-      if (res?.ok) {
-        _pickerBoundAgentIds = new Set((res.bindings && res.bindings.agents) || []);
-      }
-    } catch (_) { /* fall back to global listing */ }
-  }
+  // Refresh project-scoped agent bindings and Library rows on every open so
+  // the picker reflects the auto form's currently selected/locked project.
+  // A deleted project drops back to global scope instead of showing stale rows.
+  await _refreshAgentPickerProjectContext(anchorBtn.id);
   // Render first so measurement in _positionPopoverAboveOrBelow reflects
   // the real list height (not stale content from a previous open).
   _setAgentPickerTab('agents', { focusSearch: false });
@@ -3373,8 +3406,9 @@ function _flattenLibraryPickerTree(nodes, scope, projectId) {
 }
 
 async function _loadLibraryPickerRows(projectId) {
-  const projectPromise = projectId
-    ? window.orkas.invoke('projects.files.tree', { projectId }).catch((err) => {
+  const validProjectId = _agentPickerValidProjectId(projectId);
+  const projectPromise = validProjectId
+    ? window.orkas.invoke('projects.files.tree', { projectId: validProjectId }).catch((err) => {
         _agentsLog.warn('project library picker load failed', err);
         return null;
       })
@@ -3387,8 +3421,8 @@ async function _loadLibraryPickerRows(projectId) {
     });
   const [projectData, globalData] = await Promise.all([projectPromise, globalPromise]);
   const rows = [];
-  if (projectId && projectData && projectData.ok !== false) {
-    rows.push(..._flattenLibraryPickerTree(projectData.tree || [], 'project', projectId));
+  if (validProjectId && projectData && projectData.ok !== false) {
+    rows.push(..._flattenLibraryPickerTree(projectData.tree || [], 'project', validProjectId));
   }
   if (globalData && globalData.ok !== false) {
     rows.push(..._flattenLibraryPickerTree(globalData.tree || [], 'global', ''));
@@ -3582,8 +3616,26 @@ async function _triggerLibraryFile(dataset, anchorId) {
   const scope = dataset.libraryScope || 'global';
   const rel = dataset.libraryRel || '';
   const projectId = dataset.projectId || _resolveActiveProjectId(anchorId);
+  if (!rel) return;
+  if (target === 'auto') {
+    _agentsTrackClick('chat_library_select', {
+      target,
+      scope,
+      project_id: scope === 'project' ? String(projectId || '') : '',
+    });
+    try {
+      if (typeof window._autoAttachLibraryFile !== 'function') throw new Error('auto_attach_unavailable');
+      await window._autoAttachLibraryFile({ scope, rel, projectId });
+      _consumeAtKeyChar();
+      _focusInput(document.getElementById('auto-task-input'));
+    } catch (err) {
+      const reason = String((err && err.message) || err || 'failed');
+      if (typeof uiAlert === 'function') await uiAlert(t('agent_picker.library_attach_failed', { reason }));
+    }
+    return;
+  }
   const cid = _libraryPickerDraftCidFor(anchorId, target, projectId);
-  if (!rel || !cid || target === 'auto') return;
+  if (!cid) return;
 
   const channel = scope === 'project' ? 'projects.files.attachToDraft' : 'contexts.attachToDraft';
   const payload = scope === 'project'
@@ -3796,7 +3848,10 @@ function bindRecipientAnchor(chipId, inputId) {
   }
 }
 
-if (typeof window !== 'undefined') window.bindRecipientAnchor = bindRecipientAnchor;
+if (typeof window !== 'undefined') {
+  window.bindRecipientAnchor = bindRecipientAnchor;
+  window.refreshAgentPickerContext = refreshAgentPickerContext;
+}
 
 function bindAgentPickers() {
   // Re-bindable helper: wire the recipient chips on both chat panels +

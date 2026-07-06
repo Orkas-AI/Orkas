@@ -22,9 +22,10 @@
  *   here at runtime.
  *
  * session jsonl carries the raw resumable LLM-turn history (tool_use /
- * tool_result pairs included). `Session.getMessagesForModel()` may apply a
- * transient send-time view (old image stripping / old tool_result compaction);
- * it's a separate file from
+ * tool_result pairs included). `Session.getMessagesForModel()` applies a
+ * transient model-facing view: completed history is projected to summary +
+ * bounded user/final-assistant I/O, while the active turn keeps recent tool
+ * process messages. The raw JSONL remains separate from
  * `<uid>/cloud/chats/<cid>.jsonl` (the UI-facing view).
  */
 
@@ -40,7 +41,6 @@ import {
 import { getActiveUserId } from '../../features/users';
 import { createLogger } from '../../logger';
 import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
-import { persistToolResult } from '../../util/tool-result-cap';
 
 const log = createLogger('model');
 
@@ -167,12 +167,6 @@ export async function getSession(sessionId: string): Promise<PersistentSessionIn
   const Ctor = await getCtor();
   const session = new Ctor({
     sessionFile: file,
-    toolResultCompaction: {
-      persistToolResult: ({ toolName, content }) => {
-        const safeToolName = sanitizeToolResultName(toolName);
-        return persistToolResult(toolResultsDirForSession(userId, sessionId), safeToolName, content);
-      },
-    },
   });
   cache.set(sessionId, session);
   return session;
@@ -197,6 +191,16 @@ export function deleteSessionFile(sessionId: string): void {
       });
     }
   }
+  try { fs.unlinkSync(`${file}.context.json`); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn('session context file delete failed', {
+        session_id: maskId(sessionId),
+        path: logPathRef(`${file}.context.json`),
+        error: logErrorRef(err),
+      });
+    }
+  }
   try { fs.rmSync(toolResultsDirForSession(userId, sessionId), { recursive: true, force: true }); }
   catch (err) { log.warn('session tool-results delete failed', { session_id: maskId(sessionId), error: logErrorRef(err) }); }
 }
@@ -213,6 +217,17 @@ export function deleteSessionFileForUser(userId: string, sessionId: string): voi
         user_id: maskId(userId),
         session_id: maskId(sessionId),
         path: logPathRef(file),
+        error: logErrorRef(err),
+      });
+    }
+  }
+  try { fs.unlinkSync(`${file}.context.json`); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.warn('session context file delete failed', {
+        user_id: maskId(userId),
+        session_id: maskId(sessionId),
+        path: logPathRef(`${file}.context.json`),
         error: logErrorRef(err),
       });
     }
@@ -235,11 +250,4 @@ export function _evictAll(): void {
 /** For diagnostics / tests. */
 export function _cacheSize(): number {
   return cache.size;
-}
-
-function sanitizeToolResultName(name: string): string {
-  const safe = String(name || 'tool_result')
-    .replace(/[^A-Za-z0-9_.-]/g, '_')
-    .slice(0, 64);
-  return safe || 'tool_result';
 }

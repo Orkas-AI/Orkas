@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { toToolDefinition } from '../src/tools/base.js';
 import { createMetacognitionTool, type MetacognitionToolHandler } from '../src/tools/metacognition-tool.js';
 
 function mockHandler(): MetacognitionToolHandler {
@@ -27,15 +28,33 @@ describe('createMetacognitionTool', () => {
 
   it('omits the limit block when no limits are supplied', () => {
     const tool = createMetacognitionTool(mockHandler());
-    expect(tool.description).not.toMatch(/oversize writes are rejected/);
+    expect(tool.description).not.toMatch(/CONTENT LIMITS/);
   });
 
   it('embeds char limits in description when supplied', () => {
     const tool = createMetacognitionTool(mockHandler(), { competence: 3000, strategies: 2500 });
-    expect(tool.description).toMatch(/Limits \(oversize writes are rejected\)/);
+    expect(tool.description).toMatch(/CONTENT LIMITS/);
     expect(tool.description).toMatch(/competence: 3000 characters/);
     expect(tool.description).toMatch(/strategies: 2500 characters/);
-    expect(tool.description).toMatch(/condensed living summaries/);
+    expect(tool.description).toMatch(/REJECTED/);
+    expect(tool.description).toMatch(/CONDENSE/);
+  });
+
+  it('keeps language and content-limit guardrails visible in the provider definition', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const tool = createMetacognitionTool(mockHandler(), { competence: 3000, strategies: 2500 });
+      const def = toToolDefinition(tool);
+      expect(def.description).toContain('Use the user\'s current language');
+      expect(def.description).toContain('preserve code, paths, commands, and quoted wording');
+      expect(def.description).toContain('CONTENT LIMITS');
+      expect(def.description).toContain('competence: 3000 characters');
+      expect(def.description).toContain('strategies: 2500 characters');
+      expect(def.description).toContain('REJECTED');
+      expect(def.description).toContain('CONDENSE');
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

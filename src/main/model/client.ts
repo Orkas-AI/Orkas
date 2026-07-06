@@ -14,7 +14,7 @@
  * cross-module contract between features/ and model/.
  */
 
-import type { AgentTool } from '#core-agent';
+import type { AgentTool, HistoryResource } from '#core-agent';
 
 import {
   abortActiveSession as _abortActiveSession,
@@ -69,6 +69,8 @@ export interface ChatOptions {
    * metadata. Orkas-managed LLM uses it server-side to route model families;
    * third-party providers do not receive it. */
   attachmentMetadata?: ChatAttachmentMetadata;
+  /** Durable, host-verified resources that should survive history summaries. */
+  historyResources?: HistoryResource[];
   /** Hard idle window (seconds) for the tool-execution phase and cold start
    *  (before the first stream event). Default 1800. core-agent's per-tool
    *  watchdog stays authoritative for tool stalls; this is the outer backstop. */
@@ -80,9 +82,9 @@ export interface ChatOptions {
    *  the per-tool watchdog). Default 180. */
   streamIdleTimeout?: number;
   /** Max tool-call rounds in a single turn before the run is force-ended with
-   *  "(Tool loop limit reached)". Undefined → core-agent default (50). Group
+   *  "(Tool loop limit reached)". Undefined → core-agent default (100). Group
    *  chat raises this for the commander, which legitimately runs long
-   *  multi-step builds (e.g. hyperframes video) that exceed 50 tool rounds;
+   *  multi-step builds (e.g. hyperframes video) that exceed normal tool rounds;
    *  the identical-call loop_detection still guards true runaway loops. */
   maxToolLoops?: number;
   abortSignal?: AbortSignal | null;

@@ -3,6 +3,7 @@ import { AgentRunner, LOOP_HARD } from "../src/agent/runner.js";
 import { createConfig } from "../src/config/loader.js";
 import { ProviderRegistry } from "../src/providers/registry.js";
 import { defineTool } from "../src/tools/base.js";
+import type { AgentRunEvent } from "../src/agent/types.js";
 import type { LLMProvider, CompletionParams, CompletionResult } from "../src/providers/base.js";
 import type { Message } from "../src/shared/types.js";
 
@@ -231,14 +232,20 @@ describe("AgentRunner", () => {
       id: "call_compacted",
       name: "write_file",
       isError: true,
+      errorCode: "E_COMPACTED_HISTORY_PLACEHOLDER",
+      errorSeverity: "recoverable",
     });
     expect(String(toolEnd?.result)).toContain("compacted-history marker");
+    expect(String(toolEnd?.result)).toContain("tool is still available");
+    expect(String(toolEnd?.result)).toContain("not a tool limitation");
     const newToolEnd = collected.find((e) => e.type === "tool_end" && e.id === "call_new_compacted");
     expect(newToolEnd).toMatchObject({
       type: "tool_end",
       id: "call_new_compacted",
       name: "write_file",
       isError: true,
+      errorCode: "E_COMPACTED_HISTORY_PLACEHOLDER",
+      errorSeverity: "recoverable",
     });
     expect(String(newToolEnd?.result)).toContain("__orkas_compacted_tool_use");
 
@@ -251,7 +258,8 @@ describe("AgentRunner", () => {
       toolUseId: "call_compacted",
       isError: true,
     });
-    expect((toolResults[0] as { content: string }).content).toContain("not valid tool input");
+    expect((toolResults[0] as { content: string }).content).toContain("not valid new tool input");
+    expect((toolResults[0] as { content: string }).content).toContain("not a tool limitation");
     expect(toolResults[1]).toMatchObject({
       type: "tool_result",
       toolUseId: "call_new_compacted",
@@ -261,7 +269,7 @@ describe("AgentRunner", () => {
     const done = collected[collected.length - 1] as { type: string; result?: { text?: string; meta?: { permanentToolErrors?: number } } };
     expect(done.type).toBe("done");
     expect(done.result?.text).toBe("I will regenerate the file instead.");
-    expect(done.result?.meta?.permanentToolErrors).toBe(2);
+    expect(done.result?.meta?.permanentToolErrors).toBeUndefined();
   });
 
   it("endTurn terminal tool ends the run with NO follow-up inference", async () => {
@@ -515,6 +523,188 @@ describe("AgentRunner", () => {
     expect(result2.text).toContain("Response 2");
     // Second call should see previous messages in session
     expect(result2.text).toContain("saw 3"); // user1, assistant1, user2
+  });
+
+  it("registers host-verified history resources from run params", async () => {
+    const streamMessages: Message[][] = [];
+    const mockProvider: LLMProvider = {
+      id: "mock",
+      name: "Mock",
+      async complete(_params) {
+        throw new Error("not used");
+      },
+      async *stream(params) {
+        streamMessages.push(params.messages);
+        const text = `Response ${streamMessages.length}`;
+        yield { type: "message_start" as const };
+        yield { type: "text_delta" as const, text };
+        yield {
+          type: "message_end" as const,
+          stopReason: "end_turn" as const,
+          usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+          content: [{ type: "text" as const, text }],
+          model: "mock-model",
+        };
+      },
+      async validateAuth() { return true; },
+    };
+
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model" },
+    });
+    const runner = new AgentRunner({ config, providers: registry, tools: [] });
+
+    await runner.run({
+      message: "Use this file",
+      historyResources: [{
+        kind: "attachment",
+        path: "/tmp/source.pdf",
+        name: "source.pdf",
+        note: "Uploaded pdf attachment.",
+      }],
+    });
+    await runner.run({ message: "Continue from the file" });
+
+    const secondCall = JSON.stringify(streamMessages[1]);
+    expect(secondCall).toContain("[History resources]");
+    expect(secondCall).toContain("source.pdf: /tmp/source.pdf");
+    expect(secondCall).toContain("Uploaded pdf attachment");
+    expect(secondCall).toContain("Continue from the file");
+  });
+
+  it("summarizes tracked completed history before the next model call", async () => {
+    let completeCalls = 0;
+    let streamMessages: Message[] = [];
+    const mockProvider: LLMProvider = {
+      id: "mock",
+      name: "Mock",
+      async complete(_params) {
+        completeCalls++;
+        return {
+          content: [{ type: "text", text: "rolling summary" }],
+          stopReason: "end_turn",
+          usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
+          model: "mock-model",
+        };
+      },
+      async *stream(params) {
+        streamMessages = params.messages;
+        yield { type: "message_start" as const };
+        yield { type: "text_delta" as const, text: "after summary" };
+        yield {
+          type: "message_end" as const,
+          stopReason: "end_turn" as const,
+          usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+          content: [{ type: "text" as const, text: "after summary" }],
+          model: "mock-model",
+        };
+      },
+      async validateAuth() { return true; },
+    };
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model" },
+    });
+    const runner = new AgentRunner({ config, providers: registry, tools: [] });
+    const session = runner.getSession();
+    for (let i = 0; i < 15; i++) {
+      session.beginUserTurn([{ type: "text", text: `User ${i}` }]);
+      session.addAssistantMessage([{ type: "text", text: `Answer ${i}` }]);
+      session.completeActiveTurn();
+    }
+
+    const events: AgentRunEvent[] = [];
+    for await (const ev of runner.runStream({ message: "fresh" })) events.push(ev);
+
+    expect(completeCalls).toBe(1);
+    expect(events.some((e) => e.type === "context_status" && e.phase === "history_summary_start")).toBe(true);
+    expect(events.some((e) => e.type === "context_status" && e.phase === "history_summary_done")).toBe(true);
+    const serialized = JSON.stringify(streamMessages);
+    expect(serialized).toContain("rolling summary");
+    expect(serialized).not.toContain("User 0");
+    expect(serialized).toContain("User 13");
+    expect(serialized).toContain("Answer 14");
+    expect(serialized).toContain("fresh");
+  });
+
+  it("checkpoints oversized active-turn tool process before the next model call", async () => {
+    let completeCalls = 0;
+    let streamCalls = 0;
+    let finalStreamMessages: Message[] = [];
+    const mockProvider: LLMProvider = {
+      id: "mock",
+      name: "Mock",
+      async complete(_params) {
+        completeCalls++;
+        return {
+          content: [{ type: "text", text: "active checkpoint summary" }],
+          stopReason: "end_turn",
+          usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 },
+          model: "mock-model",
+        };
+      },
+      async *stream(params) {
+        const n = streamCalls++;
+        if (n < 5) {
+          const content = [{ type: "tool_use" as const, id: `call-${n}`, name: "big", input: { n } }];
+          yield { type: "message_start" as const };
+          yield { type: "tool_use_start" as const, id: `call-${n}`, name: "big" };
+          yield { type: "tool_use_delta" as const, id: `call-${n}`, input: JSON.stringify({ n }) };
+          yield { type: "tool_use_end" as const, id: `call-${n}` };
+          yield {
+            type: "message_end" as const,
+            stopReason: "tool_use" as const,
+            usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+            content,
+            model: "mock-model",
+          };
+          return;
+        }
+        finalStreamMessages = params.messages;
+        yield { type: "message_start" as const };
+        yield { type: "text_delta" as const, text: "final after checkpoint" };
+        yield {
+          type: "message_end" as const,
+          stopReason: "end_turn" as const,
+          usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+          content: [{ type: "text" as const, text: "final after checkpoint" }],
+          model: "mock-model",
+        };
+      },
+      async validateAuth() { return true; },
+    };
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const bigTool = defineTool({
+      name: "big",
+      description: "Return medium-large text",
+      inputSchema: { type: "object", properties: { n: { type: "number" } } },
+      async execute(input) {
+        return { content: `result-${input.n}\n${"x".repeat(15_000)}` };
+      },
+    });
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model" },
+    });
+    const runner = new AgentRunner({ config, providers: registry, tools: [bigTool] });
+
+    const events: AgentRunEvent[] = [];
+    for await (const ev of runner.runStream({ message: "large active process" })) events.push(ev);
+
+    expect(completeCalls).toBe(1);
+    expect(events.some((e) => e.type === "context_status" && e.phase === "active_process_compaction_start")).toBe(true);
+    expect(events.some((e) => e.type === "context_status" && e.phase === "active_process_compaction_done")).toBe(true);
+    const serialized = JSON.stringify(finalStreamMessages);
+    expect(serialized).toContain("active checkpoint summary");
+    expect(serialized).not.toContain("call-0");
+    expect(serialized).not.toContain("result-0");
+    expect(serialized).toContain("call-3");
+    expect(serialized).toContain("result-3");
+    expect(serialized).toContain("call-4");
+    expect(serialized).toContain("result-4");
   });
 
   it("streams events via runStream", async () => {
@@ -1194,6 +1384,80 @@ describe("AgentRunner", () => {
     // Ran past LOOP_HARD distinct calls of the SAME tool without stopping.
     expect(result.text).toBe("done");
     expect(calls).toBe(LOOP_HARD + 2); // LOOP_HARD+1 tool rounds + the final text turn
+  });
+
+  it("tool_loop_limit: nudges near the limit and synthesizes a final status without more tools", async () => {
+    const capturedStreamMessages: Message[][] = [];
+    let completeMessages: Message[] = [];
+    let streamCalls = 0;
+    const executed: number[] = [];
+    const provider: LLMProvider = {
+      id: "mock",
+      name: "Mock",
+      async complete(params: CompletionParams): Promise<CompletionResult> {
+        completeMessages = [...params.messages];
+        return {
+          content: [{ type: "text", text: "Summary: draft-v4.mp4 is still missing; script files were written and the next step is a focused render retry." }],
+          stopReason: "end_turn",
+          usage: { inputTokens: 7, outputTokens: 8, totalTokens: 15 },
+          model: "mock-model",
+        };
+      },
+      async *stream(params: CompletionParams) {
+        streamCalls++;
+        capturedStreamMessages.push([...params.messages]);
+        const id = `limit-${streamCalls}`;
+        yield { type: "message_start" as const };
+        yield { type: "tool_use_start" as const, id, name: "step" };
+        yield { type: "tool_use_delta" as const, id, input: JSON.stringify({ i: streamCalls }) };
+        yield { type: "tool_use_end" as const, id };
+        yield {
+          type: "message_end" as const,
+          stopReason: "tool_use" as const,
+          usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+          content: [{ type: "tool_use" as const, id, name: "step", input: { i: streamCalls } }],
+          model: "mock-model",
+        };
+      },
+      async validateAuth() { return true; },
+    };
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => provider);
+    const step = defineTool({
+      name: "step",
+      description: "varied step",
+      inputSchema: { type: "object", properties: { i: { type: "number" } } },
+      async execute(input) {
+        const i = Number((input as { i?: unknown }).i);
+        executed.push(i);
+        if (i === 2) {
+          return { content: "ls: project/render/draft-v4.mp4: No such file or directory", isError: true };
+        }
+        return { content: `ok ${i}` };
+      },
+    });
+    const config = createConfig({
+      agent: { defaultProvider: "mock", defaultModel: "mock-model", maxToolLoops: 3 },
+    });
+    const runner = new AgentRunner({ config, providers: registry, tools: [step] });
+
+    const result = await runner.run({ message: "render video" });
+
+    expect(streamCalls).toBe(4);
+    expect(executed).toEqual([1, 2, 3]);
+    expect(result.text).toContain("draft-v4.mp4 is still missing");
+    expect(result.text).not.toContain("Tool loop limit reached");
+    const nudged = capturedStreamMessages.some((msgs) =>
+      msgs.some((m) => m.role === "user"
+        && m.content.some((c) => c.type === "text" && c.text.includes("approaching the tool loop round limit"))));
+    expect(nudged).toBe(true);
+    expect(completeMessages.some((m) => m.role === "user"
+      && m.content.some((c) => c.type === "text" && c.text.includes("No more tool calls are available")))).toBe(true);
+    expect(completeMessages.some((m) => m.role === "user"
+      && m.content.some((c) => c.type === "tool_result"
+        && c.toolUseId === "limit-4"
+        && c.content.includes("No further tool calls will be executed")))).toBe(true);
+    expect(result.meta.toolLoops).toBe(4);
   });
 
   it("interrupt-steer: folds drainSteer messages into the next LLM round", async () => {

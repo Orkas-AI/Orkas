@@ -110,3 +110,45 @@ describe('runner › buildRunner auth gate', () => {
   });
 
 });
+
+describe('splitCommanderOrchestrationBlock (cache-prefix hygiene)', () => {
+  it('moves the volatile orchestration ledger out of the stable prefix, keeping surrounding rules', async () => {
+    const { _splitCommanderOrchestrationBlock } = await loadRunner();
+    const prompt = [
+      '# Commander',
+      'Stable rules here.',
+      '',
+      '---',
+      '',
+      '## Orchestration state',
+      '',
+      'Ledger explanation (static).',
+      '',
+      '<orchestration-ledger>{"status":"interrupted","updated_at":123}</orchestration-ledger>',
+      '',
+      '---',
+      '',
+      '## Routing-first algorithm',
+      '',
+      'More stable rules.',
+    ].join('\n');
+
+    const { stable, orchestrationBlock } = _splitCommanderOrchestrationBlock(prompt);
+
+    expect(orchestrationBlock).toContain('## Orchestration state');
+    expect(orchestrationBlock).toContain('orchestration-ledger');
+    expect(stable).not.toContain('orchestration-ledger');
+    expect(stable).not.toContain('## Orchestration state');
+    expect(stable).toContain('Stable rules here.');
+    expect(stable).toContain('## Routing-first algorithm');
+    expect(stable).toContain('More stable rules.');
+  });
+
+  it('is a no-op for a prompt without an orchestration block', async () => {
+    const { _splitCommanderOrchestrationBlock } = await loadRunner();
+    const prompt = 'You are an agent.\n\n## Runtime injection\n\nfoo';
+    const { stable, orchestrationBlock } = _splitCommanderOrchestrationBlock(prompt);
+    expect(orchestrationBlock).toBe('');
+    expect(stable).toBe(prompt);
+  });
+});

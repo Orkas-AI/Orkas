@@ -37,16 +37,18 @@ export interface MemoryToolHandler {
   };
 }
 
-const TOOL_DESCRIPTION = `Manage durable cross-session memory.
+const TOOL_DESCRIPTION = `Remember and manage durable cross-session memory.
 
-Targets:
-- agent (default): this agent's private lessons, workflow preferences, recurring task facts, and corrections.
-- shared: stable project/environment facts every agent should know. Use sparingly.
-- user: stable user-wide profile/preferences every agent should know.
+Three scopes (default "agent"):
+- "agent" (DEFAULT): YOUR OWN durable agent memory: lessons, preferences, recurring facts, corrections.
+- "shared": durable facts that EVERY agent should know. Use sparingly.
+- "user": the user's global profile/preferences.
 
-Use when the user asks to remember something, gives a durable correction/preference, or states a future-relevant fact. Do not save trivia, raw dumps/logs, rediscoverable facts, one-off task state, plans, progress, or temporary debug notes.
+Use when the user asks to remember something, gives a durable correction/preference, or states a future-relevant fact. Do not save trivia, dumps/logs, rediscoverable facts, one-off state, plans, progress, or temporary debug notes.
 
-Routing: agent-specific lessons -> agent; user identity/style/preferences -> user; repo/project conventions -> shared. Write in the user's current language while preserving code, paths, commands, URLs, and exact quoted wording when needed.
+Routing: agent-specific lessons -> agent; user identity/style/preferences -> user; repo/project conventions -> shared.
+
+LANGUAGE: Write in the current UI/response language. Preserve proper nouns, commands, file paths, URLs, and exact quoted wording.
 
 Actions: add, replace (by old_text substring), remove (by old_text substring), list.`;
 

@@ -6,7 +6,7 @@ import type {
   ToolResultContent,
   ToolUseContent,
 } from "../shared/types.js";
-import { Session, type ToolResultCompactionOptions } from "./session.js";
+import { Session, type HistoryResource, type SerializedSessionContextState } from "./session.js";
 
 /** Synthetic content written when a prior run aborted after the model
  * issued a tool_use but before the tool produced a tool_result. Both
@@ -35,20 +35,19 @@ const INTERRUPTED_TOOL_RESULT =
  */
 export class PersistentSession extends Session {
   private readonly sessionFile: string;
+  private readonly contextFile: string;
 
   constructor(opts: {
     /** Absolute path to the jsonl file that backs this session. */
     sessionFile: string;
     /** Per-parent-class option: cap on how many turns stay in memory. */
     maxHistoryTurns?: number;
-    /** Optional LLM-facing tool_result compaction. Raw JSONL history stays intact. */
-    toolResultCompaction?: ToolResultCompactionOptions | false;
   }) {
     super({
       maxHistoryTurns: opts.maxHistoryTurns,
-      toolResultCompaction: opts.toolResultCompaction,
     });
     this.sessionFile = opts.sessionFile;
+    this.contextFile = `${opts.sessionFile}.context.json`;
     this.loadFromDisk();
   }
 
@@ -106,6 +105,7 @@ export class PersistentSession extends Session {
         `[persistent-session] healed orphan tool_use entries in ${this.sessionFile}`,
       );
     }
+    this.loadContextFromDisk();
   }
 
   /**
@@ -331,6 +331,35 @@ export class PersistentSession extends Session {
   override addMessage(role: Message["role"], content: MessageContent[]): void {
     super.addMessage(role, content);
     this.appendToDisk({ role, content });
+    this.writeContextToDisk();
+  }
+
+  /** Override: start a tracked UI turn + atomic append to disk. */
+  override beginUserTurn(content: MessageContent[]): number {
+    const id = super.beginUserTurn(content);
+    this.appendToDisk({ role: "user", content });
+    this.writeContextToDisk();
+    return id;
+  }
+
+  override completeActiveTurn(outcome?: string): void {
+    super.completeActiveTurn(outcome);
+    this.writeContextToDisk();
+  }
+
+  override addHistoryResource(resource: HistoryResource): void {
+    super.addHistoryResource(resource);
+    this.writeContextToDisk();
+  }
+
+  override applyHistorySummary(summary: string, turnIds: readonly number[]): void {
+    super.applyHistorySummary(summary, turnIds);
+    this.writeContextToDisk();
+  }
+
+  override applyActiveCheckpointSummary(summary: string, checkpointThroughMessageIndex: number): void {
+    super.applyActiveCheckpointSummary(summary, checkpointThroughMessageIndex);
+    this.writeContextToDisk();
   }
 
   /**
@@ -340,6 +369,7 @@ export class PersistentSession extends Session {
   override compact(summary: string): void {
     super.compact(summary);
     this.flushToDisk();
+    this.writeContextToDisk();
   }
 
   /** Truncate the on-disk history to match an empty in-memory session. */
@@ -347,6 +377,7 @@ export class PersistentSession extends Session {
     super.clear();
     try {
       if (fs.existsSync(this.sessionFile)) fs.truncateSync(this.sessionFile, 0);
+      if (fs.existsSync(this.contextFile)) fs.unlinkSync(this.contextFile);
     } catch (err) {
       console.warn(`[persistent-session] truncate failed ${this.sessionFile}: ${(err as Error).message}`);
     }
@@ -386,6 +417,36 @@ export class PersistentSession extends Session {
     } catch (err) {
       console.warn(`[persistent-session] flush failed ${this.sessionFile}: ${(err as Error).message}`);
       try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  }
+
+  private loadContextFromDisk(): void {
+    if (!fs.existsSync(this.contextFile)) {
+      this.restoreContextState(null);
+      return;
+    }
+    try {
+      const raw = JSON.parse(fs.readFileSync(this.contextFile, "utf-8")) as SerializedSessionContextState;
+      this.restoreContextState(raw);
+    } catch (err) {
+      console.warn(`[persistent-session] failed to read context ${this.contextFile}: ${(err as Error).message}`);
+      this.restoreContextState(null);
+    }
+  }
+
+  private writeContextToDisk(): void {
+    const state = this.getSerializedContextState();
+    try {
+      if (!state) {
+        if (fs.existsSync(this.contextFile)) fs.unlinkSync(this.contextFile);
+        return;
+      }
+      this.ensureDir();
+      const tmp = `${this.contextFile}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(state, null, 2) + "\n", "utf-8");
+      fs.renameSync(tmp, this.contextFile);
+    } catch (err) {
+      console.warn(`[persistent-session] context write failed ${this.contextFile}: ${(err as Error).message}`);
     }
   }
 

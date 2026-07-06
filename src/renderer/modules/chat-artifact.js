@@ -323,10 +323,10 @@
     panel.innerHTML = '';
     const title = document.createElement('div');
     title.className = 'chat-artifact-unavailable-title';
-    title.textContent = _t('artifact.unavailable_title', 'Preview unavailable');
+    title.textContent = _t('artifact.unavailable_title', 'Historical content placeholder');
     const detail = document.createElement('div');
     detail.className = 'chat-artifact-unavailable-detail';
-    detail.textContent = _t('artifact.unavailable_detail', 'This app preview cannot be displayed from the saved history.');
+    detail.textContent = _t('artifact.unavailable_detail', 'This saved app contains compacted conversation history, not full artifact content. Regenerate the artifact content to preview it.');
     panel.appendChild(title);
     panel.appendChild(detail);
     if (reason) panel.title = String(reason);

@@ -99,163 +99,26 @@ describe("Session", () => {
     });
   });
 
-  it("compacts old large tool results only in the model view and keeps a re-readable ref", () => {
-    const persisted: string[] = [];
-    const session = new Session({
-      toolResultCompaction: {
-        minChars: 100,
-        keepRecentAssistantSteps: 0,
-        keepRecentToolResults: 0,
-        previewHeadChars: 10,
-        previewTailChars: 5,
-        persistToolResult: ({ toolName, toolUseId, content }) => {
-          expect(toolName).toBe("bash");
-          expect(toolUseId).toBe("call-old");
-          expect(content.length).toBeGreaterThan(100);
-          persisted.push("/tmp/tool-results/bash.call-old.txt");
-          return "/tmp/tool-results/bash.call-old.txt";
-        },
-      },
-    });
+  it("keeps old large tool results verbatim in model and summary views", () => {
+    const session = new Session();
     const raw = "0123456789" + "x".repeat(2_000) + "TAIL!";
 
     session.addAssistantMessage([{ type: "tool_use", id: "call-old", name: "bash", input: { command: "big" } }]);
     session.addToolResult("call-old", raw, undefined, false);
     session.addAssistantMessage([{ type: "text", text: "I saw the output." }]);
 
-    const modelMessages = session.getMessagesForModel();
-    const compacted = modelMessages[1].content[0];
-    expect(compacted.type).toBe("tool_result");
-    expect((compacted as { content: string }).content).toContain("<compacted-tool-result");
-    expect((compacted as { content: string }).content).toContain('tool="bash"');
-    expect((compacted as { content: string }).content).toContain("/tmp/tool-results/bash.call-old.txt");
-    expect((compacted as { content: string }).content).toContain("preview_head:\n0123456789");
-    expect((compacted as { content: string }).content).toContain("preview_tail:\nTAIL!");
-    expect((compacted as { content: string }).content.length).toBeLessThan(raw.length);
-    expect(persisted).toHaveLength(1);
+    const modelResult = session.getMessagesForModel()[1].content[0];
+    expect(modelResult.type).toBe("tool_result");
+    expect((modelResult as { content: string }).content).toBe(raw);
+    expect((modelResult as { content: string }).content).not.toContain("<compacted-tool-result");
 
-    const rawMessages = session.getMessages();
-    expect((rawMessages[1].content[0] as { content: string }).content).toBe(raw);
-
-    session.getMessagesForModel();
-    expect(persisted).toHaveLength(1);
+    const summaryResult = session.getMessagesForSummary()[1].content[0];
+    expect(summaryResult.type).toBe("tool_result");
+    expect((summaryResult as { content: string }).content).toBe(raw);
   });
 
-  it("keeps fresh large tool results verbatim for the next model call", () => {
-    const persisted: string[] = [];
-    const session = new Session({
-      toolResultCompaction: {
-        minChars: 100,
-        keepRecentAssistantSteps: 0,
-        keepRecentToolResults: 0,
-        persistToolResult: () => {
-          persisted.push("unexpected");
-          return "/tmp/unexpected.txt";
-        },
-      },
-    });
-    const raw = "x".repeat(500);
-
-    session.addAssistantMessage([{ type: "tool_use", id: "call-fresh", name: "bash", input: {} }]);
-    session.addToolResult("call-fresh", raw, undefined, false);
-
-    const modelMessages = session.getMessagesForModel();
-    expect((modelMessages[1].content[0] as { content: string }).content).toBe(raw);
-    expect(persisted).toHaveLength(0);
-  });
-
-  it("compacts old medium tool results once aggregate tool_result text exceeds the threshold", () => {
-    const persisted: string[] = [];
-    const session = new Session({
-      toolResultCompaction: {
-        minChars: 8 * 1024,
-        aggregateMinChars: 1_000,
-        aggregateMinResultChars: 100,
-        aggregatePreviewChars: 16,
-        keepRecentAssistantSteps: 0,
-        keepRecentToolResults: 0,
-        persistToolResult: ({ toolUseId, content }) => {
-          persisted.push(content);
-          return `/tmp/tool-results/${toolUseId}.txt`;
-        },
-      },
-    });
-    const first = "alpha-" + "a".repeat(700);
-    const second = "beta-" + "b".repeat(700);
-
-    session.addAssistantMessage([{ type: "tool_use", id: "call-1", name: "bash", input: {} }]);
-    session.addToolResult("call-1", first, undefined, false);
-    session.addAssistantMessage([{ type: "tool_use", id: "call-2", name: "bash", input: {} }]);
-    session.addToolResult("call-2", second, undefined, false);
-    session.addAssistantMessage([{ type: "text", text: "seen" }]);
-
-    const modelMessages = session.getMessagesForModel();
-    const compacted = modelMessages
-      .flatMap((m) => m.content)
-      .filter((c) => c.type === "tool_result")
-      .map((c) => (c as { content: string }).content);
-
-    expect(compacted).toHaveLength(2);
-    expect(compacted[0]).toContain('mode="aggregate"');
-    expect(compacted[0]).toContain("total tool_result context exceeded 1000 chars");
-    expect(compacted[0]).toContain('path="/tmp/tool-results/call-1.txt"');
-    expect(compacted[0]).toContain("preview: alpha-");
-    expect(compacted[0]).not.toContain("preview_tail:");
-    expect(compacted[0].length).toBeLessThan(first.length);
-    expect(compacted[1]).toContain('path="/tmp/tool-results/call-2.txt"');
-    expect(persisted).toEqual([first, second]);
-    expect((session.getMessages()[1].content[0] as { content: string }).content).toBe(first);
-  });
-
-  it("keeps recent tool results verbatim even when aggregate compaction is active", () => {
-    const persisted: string[] = [];
-    const session = new Session({
-      toolResultCompaction: {
-        minChars: 8 * 1024,
-        aggregateMinChars: 1_000,
-        aggregateMinResultChars: 100,
-        keepRecentAssistantSteps: 0,
-        keepRecentToolResults: 2,
-        persistToolResult: ({ toolUseId }) => {
-          persisted.push(toolUseId);
-          return `/tmp/tool-results/${toolUseId}.txt`;
-        },
-      },
-    });
-    const raws = ["one-", "two-", "three-"].map((prefix) => prefix + "x".repeat(600));
-    for (let i = 0; i < raws.length; i++) {
-      const id = `call-${i + 1}`;
-      session.addAssistantMessage([{ type: "tool_use", id, name: "bash", input: {} }]);
-      session.addToolResult(id, raws[i], undefined, false);
-    }
-    session.addAssistantMessage([{ type: "text", text: "seen" }]);
-
-    const contents = session.getMessagesForModel()
-      .flatMap((m) => m.content)
-      .filter((c) => c.type === "tool_result")
-      .map((c) => (c as { content: string }).content);
-
-    expect(contents[0]).toContain('mode="aggregate"');
-    expect(contents[1]).toBe(raws[1]);
-    expect(contents[2]).toBe(raws[2]);
-    expect(persisted).toEqual(["call-1"]);
-  });
-
-  it("compacts old tool_use inputs to inert metadata only in the model view", () => {
-    const session = new Session({
-      toolResultCompaction: {
-        minChars: 999_999,
-        aggregateMinChars: 999_999,
-        toolUseInputMinChars: 999_999,
-        toolUseInputAggregateMinChars: 1_000,
-        toolUseInputAggregateMinInputChars: 100,
-        toolUseInputStringMinChars: 80,
-        toolUseInputPreviewChars: 48,
-        keepRecentAssistantSteps: 0,
-        keepRecentToolResults: 0,
-        keepRecentToolUses: 0,
-      },
-    });
+  it("keeps old tool_use inputs verbatim in model and summary views", () => {
+    const session = new Session();
     const fileContent = "START-" + "x".repeat(900) + "-END";
     const command = "printf " + "y".repeat(900);
 
@@ -270,105 +133,111 @@ describe("Session", () => {
       .filter((c) => c.type === "tool_use") as Array<{ input: Record<string, unknown> }>;
 
     expect(toolUses).toHaveLength(2);
-    expect(toolUses[0].input).not.toHaveProperty("path");
-    expect(toolUses[0].input).not.toHaveProperty("content");
-    expect(toolUses[0].input.__orkas_compacted_tool_use).toMatchObject({
-      tool: "write_file",
-      mode: "aggregate-ref",
-      input_keys: ["path", "content"],
-    });
-    expect(toolUses[1].input).not.toHaveProperty("command");
-    expect(toolUses[1].input.__orkas_compacted_tool_use).toMatchObject({
-      tool: "bash",
-      mode: "aggregate-ref",
-      input_keys: ["command"],
-    });
-    const serialized = JSON.stringify(toolUses.map((u) => u.input));
-    expect(serialized).not.toContain("old tool input string compacted");
-    expect(serialized).not.toContain("START-");
-    expect(serialized).not.toContain("-END");
-    expect(serialized).not.toContain(fileContent);
-    expect(serialized).not.toContain(command);
+    expect(toolUses[0].input).toEqual({ path: "/tmp/a.txt", content: fileContent });
+    expect(toolUses[1].input).toEqual({ command });
 
-    const rawToolUse = session.getMessages()[0].content[0];
-    expect(rawToolUse.type).toBe("tool_use");
-    expect((rawToolUse as { input: Record<string, unknown> }).input.content).toBe(fileContent);
-  });
-
-  it("keeps recent tool_use inputs verbatim even when input compaction is active", () => {
-    const session = new Session({
-      toolResultCompaction: {
-        minChars: 999_999,
-        aggregateMinChars: 999_999,
-        toolUseInputMinChars: 999_999,
-        toolUseInputAggregateMinChars: 1_000,
-        toolUseInputAggregateMinInputChars: 100,
-        toolUseInputStringMinChars: 80,
-        keepRecentAssistantSteps: 0,
-        keepRecentToolResults: 0,
-        keepRecentToolUses: 1,
-      },
-    });
-    const oldCommand = "old-" + "x".repeat(900);
-    const freshCommand = "fresh-" + "y".repeat(900);
-
-    session.addAssistantMessage([{ type: "tool_use", id: "call-old", name: "bash", input: { command: oldCommand } }]);
-    session.addToolResult("call-old", "ok", undefined, false);
-    session.addAssistantMessage([{ type: "tool_use", id: "call-fresh", name: "bash", input: { command: freshCommand } }]);
-    session.addToolResult("call-fresh", "ok", undefined, false);
-    session.addAssistantMessage([{ type: "text", text: "seen" }]);
-
-    const commands = session.getMessagesForModel()
+    const summaryToolUses = session.getMessagesForSummary()
       .flatMap((m) => m.content)
-      .filter((c) => c.type === "tool_use")
-      .map((c) => (c as { input: Record<string, unknown> }).input);
+      .filter((c) => c.type === "tool_use") as Array<{ input: Record<string, unknown> }>;
+    expect(summaryToolUses[0].input).toEqual({ path: "/tmp/a.txt", content: fileContent });
+    expect(summaryToolUses[1].input).toEqual({ command });
 
-    expect(commands[0]).toHaveProperty("__orkas_compacted_tool_use");
-    expect(commands[0]).not.toHaveProperty("command");
-    expect(commands[1].command).toBe(freshCommand);
-  });
-
-  it("uses inert old tool_use metadata in the summary view", () => {
-    const session = new Session({
-      toolResultCompaction: {
-        minChars: 999_999,
-        aggregateMinChars: 999_999,
-        toolUseInputMinChars: 100,
-        keepRecentAssistantSteps: 0,
-        keepRecentToolResults: 0,
-        keepRecentToolUses: 0,
-      },
-    });
-    const html = "<!doctype html>" + "x".repeat(1_000);
-
-    session.addAssistantMessage([{ type: "tool_use", id: "call-html", name: "create_artifact", input: { files: [{ path: "index.html", content: html }] } }]);
-    session.addToolResult("call-html", "Artifact created", undefined, false);
-    session.addAssistantMessage([{ type: "text", text: "seen" }]);
-
-    const serialized = JSON.stringify(session.getMessagesForSummary());
-    expect(serialized).toContain("__orkas_compacted_tool_use");
+    const serialized = JSON.stringify(summaryToolUses.map((u) => u.input));
+    expect(serialized).not.toContain("__orkas_compacted_tool_use");
     expect(serialized).not.toContain("old tool input string compacted");
-    expect(serialized).not.toContain("<!doctype html>");
-    expect(serialized).not.toContain(html);
   });
 
-  it("estimateModelTokens uses the compacted provider view", () => {
-    const session = new Session({
-      toolResultCompaction: {
-        minChars: 100,
-        keepRecentAssistantSteps: 0,
-        keepRecentToolResults: 0,
-        previewHeadChars: 10,
-        previewTailChars: 10,
-        persistToolResult: () => "/tmp/tool-results/bash.big.txt",
-      },
-    });
+  it("estimateModelTokens uses the provider view without tool result compaction", () => {
+    const session = new Session();
     session.addAssistantMessage([{ type: "tool_use", id: "call-big", name: "bash", input: {} }]);
     session.addToolResult("call-big", "a".repeat(20_000), undefined, false);
     session.addAssistantMessage([{ type: "text", text: "seen" }]);
 
     expect(session.estimateTokens()).toBeGreaterThan(4_000);
-    expect(session.estimateModelTokens()).toBeLessThan(1_000);
+    expect(session.estimateModelTokens()).toBeGreaterThan(4_000);
+  });
+
+  it("tracked completed history keeps only user input and final assistant output in the model view", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "First task" }]);
+    session.addAssistantMessage([{ type: "tool_use", id: "call-old", name: "bash", input: { command: "echo secret process" } }]);
+    session.addToolResult("call-old", "secret process output", undefined, false);
+    session.addAssistantMessage([{ type: "text", text: "First final answer" }]);
+    session.completeActiveTurn();
+
+    session.beginUserTurn([{ type: "text", text: "Second task" }]);
+    const view = session.getMessagesForModel();
+    const flat = view.flatMap((m) => m.content);
+
+    expect(view.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    expect(flat.some((c) => c.type === "tool_use")).toBe(false);
+    expect(flat.some((c) => c.type === "tool_result")).toBe(false);
+    expect(JSON.stringify(view)).toContain("First task");
+    expect(JSON.stringify(view)).toContain("First final answer");
+    expect(JSON.stringify(view)).toContain("Second task");
+  });
+
+  it("history archive candidate triggers at 15 turns and retains the newest two raw turns", () => {
+    const session = new Session();
+    for (let i = 0; i < 15; i++) {
+      session.beginUserTurn([{ type: "text", text: `User ${i}` }]);
+      session.addAssistantMessage([{ type: "text", text: `Answer ${i}` }]);
+      session.completeActiveTurn();
+    }
+
+    const candidate = session.getPendingHistoryArchive();
+    expect(candidate).toBeTruthy();
+    expect(candidate?.turnIds).toHaveLength(13);
+    session.applyHistorySummary("Summary through turn 12", candidate!.turnIds);
+
+    session.beginUserTurn([{ type: "text", text: "Fresh task" }]);
+    const serialized = JSON.stringify(session.getMessagesForModel());
+    expect(serialized).toContain("Summary through turn 12");
+    expect(serialized).not.toContain("User 0");
+    expect(serialized).not.toContain("Answer 0");
+    expect(serialized).toContain("User 13");
+    expect(serialized).toContain("Answer 13");
+    expect(serialized).toContain("User 14");
+    expect(serialized).toContain("Answer 14");
+    expect(serialized).toContain("Fresh task");
+  });
+
+  it("active checkpoint candidate archives older complete tool step groups and keeps the recent tail", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Current large task" }]);
+    for (let i = 0; i < 5; i++) {
+      session.addAssistantMessage([{ type: "tool_use", id: `call-${i}`, name: "bash", input: { command: `cmd-${i}` } }]);
+      session.addToolResult(`call-${i}`, `result-${i}\n${"x".repeat(15_000)}`, undefined, false);
+    }
+
+    const candidate = session.getPendingActiveCheckpoint();
+    expect(candidate).toBeTruthy();
+    expect(candidate?.groups).toHaveLength(3);
+    session.applyActiveCheckpointSummary("Older tool work summarized", candidate!.checkpointThroughMessageIndex);
+
+    const view = session.getMessagesForModel();
+    const serialized = JSON.stringify(view);
+    expect(serialized).toContain("Older tool work summarized");
+    expect(serialized).not.toContain("call-0");
+    expect(serialized).not.toContain("result-0");
+    expect(serialized).toContain("call-3");
+    expect(serialized).toContain("result-3");
+    expect(serialized).toContain("call-4");
+    expect(serialized).toContain("result-4");
+  });
+
+  it("starting a new turn closes a prior interrupted active turn instead of dropping it", () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: "text", text: "Interrupted task" }]);
+    session.addAssistantMessage([{ type: "tool_use", id: "call-open", name: "bash", input: { command: "sleep" } }]);
+
+    session.beginUserTurn([{ type: "text", text: "Next task" }]);
+    const serialized = JSON.stringify(session.getMessagesForModel());
+
+    expect(serialized).toContain("Interrupted task");
+    expect(serialized).toContain("Previous run ended before a normal final response.");
+    expect(serialized).toContain("Next task");
+    expect(serialized).not.toContain("call-open");
   });
 
   it("trims history to exactly maxHistoryTurns and keeps the newest turns", () => {
@@ -413,6 +282,68 @@ describe("Session", () => {
     const msgs = session.getMessages();
     expect((msgs[0].content[0] as { text: string }).text).toBe("User message 5");
     expect((msgs[99].content[0] as { text: string }).text).toBe("Response 54");
+  });
+
+  it("does not let the legacy trim wipe the active turn on a long tool-heavy turn", () => {
+    // Regression: message-count trim (maxHistoryTurns) is independent of the
+    // turn-based context policy. A single active turn with many tool loops can
+    // exceed the message cap; the old trim dropped the active turn's start,
+    // shiftTurnMetadata cleared activeTurn, and getMessagesForModel then
+    // returned an EMPTY array — the model saw no history at all mid-run.
+    const session = new Session({ maxHistoryTurns: 5 }); // trims past 10 messages
+    session.beginUserTurn([{ type: "text", text: "TASK: build the whole thing" }]);
+    for (let i = 0; i < 40; i++) {
+      session.addAssistantMessage([{ type: "tool_use", id: `t${i}`, name: "read_file", input: { path: `/f${i}` } }]);
+      session.addToolResult(`t${i}`, `result ${i}`);
+    }
+    const view = session.getMessagesForModel();
+    expect(view.length).toBeGreaterThan(0);
+    const hasTask = view.some(
+      (m) => m.role === "user" && m.content.some((c) => c.type === "text" && (c as { text: string }).text.includes("TASK: build the whole thing")),
+    );
+    expect(hasTask).toBe(true);
+  });
+
+  it("does not drop completed turns still awaiting rolling-summary archival", () => {
+    // The trim must not silently lose a completed turn's raw I/O before the
+    // history summary has folded it in — those unarchived turns are the model
+    // view's raw buffer.
+    const session = new Session({ maxHistoryTurns: 3 }); // trims past 6 messages
+    for (let i = 0; i < 8; i++) {
+      session.beginUserTurn([{ type: "text", text: `Q${i}` }]);
+      session.addAssistantMessage([{ type: "text", text: `A${i}` }]);
+      session.completeActiveTurn();
+    }
+    const view = session.getMessagesForModel();
+    for (let i = 0; i < 8; i++) {
+      expect(view.some((m) => m.role === "user" && m.content.some((c) => (c as { text?: string }).text === `Q${i}`))).toBe(true);
+      expect(view.some((m) => m.role === "assistant" && m.content.some((c) => (c as { text?: string }).text === `A${i}`))).toBe(true);
+    }
+  });
+
+  it("still trims archived turns (no unbounded in-memory growth once summarized)", () => {
+    // Once a completed turn is archived into the rolling summary, its raw
+    // messages are no longer model-facing and remain eligible for the trim.
+    const session = new Session({ maxHistoryTurns: 2 });
+    const archived: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      const id = session.beginUserTurn([{ type: "text", text: `Q${i}` }]);
+      session.addAssistantMessage([{ type: "text", text: `A${i}` }]);
+      session.completeActiveTurn();
+      archived.push(id);
+    }
+    // Archive the four oldest turns into the summary.
+    session.applyHistorySummary("summary of Q0..Q3", archived.slice(0, 4));
+    // Adding another turn triggers trimHistory; archived turns' raw messages
+    // are now droppable, so in-memory length is bounded well below 12.
+    session.beginUserTurn([{ type: "text", text: "Q6" }]);
+    session.addAssistantMessage([{ type: "text", text: "A6" }]);
+    session.completeActiveTurn();
+    expect(session.length).toBeLessThan(12);
+    // The summary + the newest (non-archived) turns still project to the model.
+    const view = session.getMessagesForModel();
+    expect(view.some((m) => m.content.some((c) => (c as { text?: string }).text?.includes("summary of Q0..Q3")))).toBe(true);
+    expect(view.some((m) => m.content.some((c) => (c as { text?: string }).text === "Q6"))).toBe(true);
   });
 
   it("compacts session with summary", () => {

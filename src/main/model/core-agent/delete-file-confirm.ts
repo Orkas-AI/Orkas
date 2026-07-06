@@ -2,14 +2,16 @@
  * Per-call UI confirmation state for the `delete_file` local tool.
  *
  * Async token model — the `delete_file` tool does NOT block on the user's
- * click. The flow is:
+ * click, but it does wait briefly for the renderer to acknowledge that the
+ * inline card is visible. The flow is:
  *
  *   1. LLM calls `delete_file({ path })` (no token).
  *      Tool calls `requestConfirmation(absPath, ctx)` → gets a fresh
- *      `confirmation_token` synchronously, returns it to the LLM along
- *      with `requires_user_confirmation: true`. The renderer renders it in
- *      an inline card; multiple pending tokens from the same turn may be
- *      grouped into one card.
+ *      `confirmation_token` synchronously. The renderer renders it in an
+ *      inline card, then calls `delete_file.visible`. Only after that ack
+ *      does the tool return the token to the LLM with
+ *      `requires_user_confirmation: true`. Multiple pending tokens from the
+ *      same turn may be grouped into one card.
  *   2. LLM sees the token-bearing result; per skill-creator's SKILL.md
  *      rule, it MUST end the turn with a prose ask, NOT immediately
  *      re-call delete_file in the same turn. The token is in `pending`
@@ -57,10 +59,29 @@ type ConfirmState = 'pending' | 'granted' | 'denied';
 interface Entry {
   path: string;
   state: ConfirmState;
+  visible: boolean;
   created_at_ms: number;
 }
 
 const _entries = new Map<string, Entry>();
+const _visibleWaiters = new Map<string, Array<{ resolve: (ok: boolean) => void; timer: NodeJS.Timeout }>>();
+const CONFIRM_VISIBLE_ACK_TIMEOUT_MS = 1200;
+
+function resolveVisibleWaiters(token: string, ok: boolean): void {
+  const waiters = _visibleWaiters.get(token);
+  if (!waiters) return;
+  _visibleWaiters.delete(token);
+  for (const waiter of waiters) {
+    clearTimeout(waiter.timer);
+    waiter.resolve(ok);
+  }
+}
+
+function deleteEntry(token: string): boolean {
+  const existed = _entries.delete(token);
+  resolveVisibleWaiters(token, false);
+  return existed;
+}
 
 // One periodic GC pass — drops any entry past TTL regardless of state, so
 // `granted` tokens that the LLM never came back to consume don't sit
@@ -68,7 +89,7 @@ const _entries = new Map<string, Entry>();
 setInterval(() => {
   const now = Date.now();
   for (const [token, e] of _entries) {
-    if (now - e.created_at_ms > CONFIRM_TTL_MS) _entries.delete(token);
+    if (now - e.created_at_ms > CONFIRM_TTL_MS) deleteEntry(token);
   }
 }, _GC_INTERVAL_MS).unref?.();
 
@@ -84,12 +105,13 @@ export interface DeleteConfirmContext {
   turn_id?: string;
 }
 
-/** Mint a fresh confirmation token, emit the inline card to the renderer,
- *  and return synchronously. Caller's tool execution should NOT await
- *  anything from this module — see the file header for why. */
+/** Mint a fresh confirmation token, emit the inline card request to the
+ *  renderer, and return synchronously. The caller should then wait on
+ *  `waitForConfirmationVisible(token)` before telling the LLM that the user
+ *  has a card to click. */
 export function requestConfirmation(absPath: string, ctx: DeleteConfirmContext): string {
   const token = crypto.randomBytes(12).toString('hex');
-  _entries.set(token, { path: absPath, state: 'pending', created_at_ms: Date.now() });
+  _entries.set(token, { path: absPath, state: 'pending', visible: false, created_at_ms: Date.now() });
   try {
     broadcastToRenderer('delete_file.confirmation_required', {
       confirm_id: token,
@@ -108,6 +130,43 @@ export function requestConfirmation(absPath: string, ctx: DeleteConfirmContext):
     });
   }
   return token;
+}
+
+/** Renderer ack: called only after the inline confirmation card is actually
+ *  mounted into a visible chat surface. The tool waits briefly for this ack
+ *  before telling the LLM to ask the user to click the card. */
+export function markConfirmationVisible(token: string): boolean {
+  const entry = _entries.get(token);
+  if (!entry) {
+    log.warn('markConfirmationVisible unknown token', { confirmation_id: maskId(token), pending_count: _entries.size });
+    return false;
+  }
+  entry.visible = true;
+  resolveVisibleWaiters(token, true);
+  return true;
+}
+
+export function waitForConfirmationVisible(token: string, timeoutMs = CONFIRM_VISIBLE_ACK_TIMEOUT_MS): Promise<boolean> {
+  const entry = _entries.get(token);
+  if (!entry) return Promise.resolve(false);
+  if (entry.visible) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      const waiters = _visibleWaiters.get(token) || [];
+      const next = waiters.filter((w) => w.resolve !== resolve);
+      if (next.length) _visibleWaiters.set(token, next);
+      else _visibleWaiters.delete(token);
+      resolve(false);
+    }, timeoutMs);
+    timer.unref?.();
+    const waiters = _visibleWaiters.get(token) || [];
+    waiters.push({ resolve, timer });
+    _visibleWaiters.set(token, waiters);
+  });
+}
+
+export function cancelConfirmation(token: string): boolean {
+  return deleteEntry(token);
 }
 
 /** IPC handler entry point — called by `delete_file.respond`. Returns
@@ -160,9 +219,9 @@ export function consumeGrantedConfirmation(token: string, absPath: string): Cons
   log.info('consumeGrantedConfirmation state', { confirmation_id: maskId(token), path: logPathRef(absPath), state: entry.state });
   if (entry.state === 'pending') return { outcome: 'pending' };
   if (entry.state === 'denied') {
-    _entries.delete(token);
+    deleteEntry(token);
     return { outcome: 'denied' };
   }
-  _entries.delete(token);
+  deleteEntry(token);
   return { outcome: 'granted', path: entry.path };
 }

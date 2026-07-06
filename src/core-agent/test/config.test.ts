@@ -9,7 +9,7 @@ describe("Config", () => {
       expect(config.agent.defaultModel).toBe("claude-opus-4-8");
       expect(config.agent.defaultProvider).toBe("anthropic");
       expect(config.agent.maxRetries).toBe(3);
-      expect(config.agent.maxToolLoops).toBe(50);
+      expect(config.agent.maxToolLoops).toBe(100);
       expect(config.agent.thinkingLevel).toBe("off");
     });
 

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { toToolDefinition } from '../src/tools/base.js';
 import { createCrossSessionMemoryTool, type MemoryToolHandler } from '../src/tools/memory-tool.js';
 
 function mockHandler(): MemoryToolHandler {
@@ -32,6 +33,22 @@ describe('createCrossSessionMemoryTool', () => {
     expect((tool.inputSchema as any).properties.target.enum).toEqual(['agent', 'shared', 'user']);
     // target is optional (defaults to the caller's own "agent" store)
     expect((tool.inputSchema as any).required).toEqual(['action']);
+  });
+
+  it('keeps routing and language guardrails visible in the provider definition', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const def = toToolDefinition(createCrossSessionMemoryTool(mockHandler()));
+      expect(def.description).toContain('Three scopes (default "agent")');
+      expect(def.description).toContain('"agent" (DEFAULT): YOUR OWN durable agent memory');
+      expect(def.description).toContain('"shared": durable facts that EVERY agent should know');
+      expect(def.description).toContain('"user": the user\'s global profile/preferences');
+      expect(def.description).toContain('Routing:');
+      expect(def.description).toContain('LANGUAGE:');
+      expect(def.description).toContain('Preserve proper nouns, commands, file paths');
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

@@ -190,6 +190,33 @@ describe('conversation sidebar task row actions', () => {
     expect(html).toContain('conv-item-nested');
   });
 
+  it('refreshes time bucket headers only when foreground return crosses a local day', () => {
+    const context = loadConversationRenderer();
+    vm.runInContext(`
+      __renderCalls = 0;
+      renderConversationList = function() { __renderCalls += 1; };
+      _conversationBucketDateKey = _conversationLocalDateKey(new Date(2026, 4, 15, 23, 50, 0));
+    `, context);
+
+    const sameDay = vm.runInContext(
+      '_refreshConversationBucketsForDateChange(new Date(2026, 4, 15, 23, 55, 0))',
+      context,
+    );
+    const nextDay = vm.runInContext(
+      '_refreshConversationBucketsForDateChange(new Date(2026, 4, 16, 0, 5, 0))',
+      context,
+    );
+    const nextDayAgain = vm.runInContext(
+      '_refreshConversationBucketsForDateChange(new Date(2026, 4, 16, 9, 0, 0))',
+      context,
+    );
+
+    expect(sameDay).toBe(false);
+    expect(nextDay).toBe(true);
+    expect(nextDayAgain).toBe(false);
+    expect(context.__renderCalls).toBe(1);
+  });
+
   it('keeps tasks older than 7 days unrendered while the bucket is collapsed', () => {
     const context = loadConversationRenderer();
     context.timeBucket = () => 'last30';

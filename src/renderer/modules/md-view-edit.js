@@ -794,6 +794,101 @@ function _mveOnKey(state, ta, e) {
   }
 }
 
+function mountMarkdownToolbarForTextarea(opts = {}) {
+  const toolbarEl = typeof opts.toolbarEl === 'string'
+    ? document.getElementById(opts.toolbarEl)
+    : opts.toolbarEl;
+  const ta = typeof opts.textarea === 'string'
+    ? document.getElementById(opts.textarea)
+    : opts.textarea;
+  if (!toolbarEl || !ta) return { destroy() {} };
+
+  const state = {
+    source: { kind: 'composer' },
+    caps: { save: false },
+    callbacks: {
+      onDraftChange: () => { if (typeof opts.onChange === 'function') opts.onChange(ta.value); },
+      onDirtyChange: () => {},
+    },
+    content: ta.value || '',
+    draft: ta.value || '',
+    preview: false,
+    mode: 'edit',
+  };
+
+  const syncSelection = () => {
+    try {
+      if (typeof getChatRichComposerSelection === 'function') getChatRichComposerSelection(ta);
+    } catch (_) {}
+  };
+  const syncEditor = () => {
+    state.draft = ta.value || '';
+    try {
+      if (typeof syncChatRichComposerFromTextarea === 'function') syncChatRichComposerFromTextarea(ta);
+      if (typeof focusChatRichComposer === 'function' && focusChatRichComposer(ta)) return;
+    } catch (_) {}
+    try { ta.focus(); } catch (_) {}
+  };
+  const apply = (kind) => {
+    if (!kind) return;
+    syncSelection();
+    state.draft = ta.value || '';
+    _mveApplyMd(state, ta, kind);
+    syncEditor();
+  };
+  const onKeydown = (e) => {
+    syncSelection();
+    state.draft = ta.value || '';
+    _mveOnKey(state, ta, e);
+    if (e.defaultPrevented) syncEditor();
+  };
+  let shortcutTarget = null;
+  const bindShortcutTarget = () => {
+    const editor = typeof getChatRichComposerEditor === 'function'
+      ? getChatRichComposerEditor(ta)
+      : null;
+    const target = editor || ta;
+    if (!target || target === shortcutTarget) return;
+    if (shortcutTarget) shortcutTarget.removeEventListener('keydown', onKeydown);
+    shortcutTarget = target;
+    target.addEventListener('keydown', onKeydown);
+  };
+  const render = () => {
+    toolbarEl.innerHTML = _MVE_EDITOR_TOOLBAR.map(item => {
+      if (item.kind === 'sep') return `<span class="ctx-editor-toolbar-sep" aria-hidden="true"></span>`;
+      const extraCls = item.cls ? ` ${item.cls}` : '';
+      const icon = item.iconName && typeof window !== 'undefined' && typeof window.uiIconHtml === 'function'
+        ? window.uiIconHtml(item.iconName, 'ui-icon ctx-editor-svg-icon')
+        : escapeHtml(item.icon || '');
+      return `<button type="button" class="btn btn-sm btn-icon ctx-editor-tb-btn${extraCls}" data-kind="${item.kind}" title="${escapeHtml(t(item.label))}">${icon}</button>`;
+    }).join('');
+    toolbarEl.querySelectorAll('.ctx-editor-tb-btn').forEach((btn) => {
+      btn.addEventListener('mousedown', (e) => e.preventDefault());
+      btn.addEventListener('click', () => apply(btn.dataset.kind || ''));
+    });
+    bindShortcutTarget();
+  };
+
+  const onInput = () => { state.draft = ta.value || ''; };
+  const onI18n = () => render();
+  ta.addEventListener('input', onInput);
+  window.addEventListener('i18n-change', onI18n);
+  render();
+
+  return {
+    destroy() {
+      ta.removeEventListener('input', onInput);
+      if (shortcutTarget) shortcutTarget.removeEventListener('keydown', onKeydown);
+      window.removeEventListener('i18n-change', onI18n);
+      toolbarEl.innerHTML = '';
+    },
+  };
+}
+
+if (typeof window !== 'undefined') {
+  window.mountMarkdownToolbarForTextarea = mountMarkdownToolbarForTextarea;
+}
+
 // ── Callback emission helpers ────────────────────────────────────────────
 
 function _mveEmitDirty(state) {

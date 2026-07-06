@@ -24,6 +24,8 @@ describe("PersistentSession", () => {
   afterEach(() => {
     try { fs.unlinkSync(file); } catch { /* ignore */ }
     try { fs.unlinkSync(`${file}.tmp`); } catch { /* ignore */ }
+    try { fs.unlinkSync(`${file}.context.json`); } catch { /* ignore */ }
+    try { fs.unlinkSync(`${file}.context.json.tmp`); } catch { /* ignore */ }
   });
 
   it("starts empty when backing file does not exist", () => {
@@ -57,6 +59,28 @@ describe("PersistentSession", () => {
     expect(msgs[0].role).toBe("user");
     expect((msgs[0].content[0] as { text: string }).text).toBe("msg A");
     expect(msgs[1].role).toBe("assistant");
+  });
+
+  it("persists turn context sidecar without rewriting raw tool history", () => {
+    const s1 = new PersistentSession({ sessionFile: file });
+    s1.beginUserTurn([{ type: "text", text: "inspect" }]);
+    s1.addAssistantMessage([{ type: "tool_use", id: "call-1", name: "bash", input: { command: "echo hidden" } }]);
+    s1.addToolResult("call-1", "hidden output", undefined, false);
+    s1.addAssistantMessage([{ type: "text", text: "visible final" }]);
+    s1.completeActiveTurn();
+
+    expect(fs.existsSync(`${file}.context.json`)).toBe(true);
+    const raw = fs.readFileSync(file, "utf-8");
+    expect(raw).toContain("hidden output");
+
+    const s2 = new PersistentSession({ sessionFile: file });
+    s2.beginUserTurn([{ type: "text", text: "next" }]);
+    const model = JSON.stringify(s2.getMessagesForModel());
+    expect(model).toContain("inspect");
+    expect(model).toContain("visible final");
+    expect(model).toContain("next");
+    expect(model).not.toContain("hidden output");
+    expect(model).not.toContain("call-1");
   });
 
   it("tolerates corrupt + schema-invalid lines and keeps the valid ones", () => {

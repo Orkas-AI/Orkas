@@ -11,10 +11,12 @@
  *                  the process panel filters events
  *   tool_progress → {type:'event', event:{stream:'tool', data:{phase:'progress', id, name, message}}}
  *   tool_end   → {type:'event', event:{stream:'tool', data:{phase:'end', id, name, isError, result_preview}}}
+ *                + optional errorCode/errorSeverity for recoverable guard rails
  *   retry      → {type:'progress', text: 'retrying · <friendly reason>'} —
  *                the raw reason (e.g. undici "terminated", "fetch failed",
  *                "ECONNRESET") is mapped to a user-facing string via
  *                `friendlyRetryReason`
+ *   context_status → {type:'progress', text: '<message>'}
  *   compaction → {type:'progress', text: 'compacted <before>→<after> tokens'}
  *   done (ok)  → {type:'final', text} then {type:'done'}
  *   done (err) → {type:'error', text: meta.error.message} then {type:'done'}
@@ -384,6 +386,8 @@ export async function* mapCoreAgentEvents(
           name: ev.name,
           isError: !!ev.isError,
           result_preview: preview,
+          ...(ev.errorCode ? { errorCode: ev.errorCode } : {}),
+          ...(ev.errorSeverity ? { errorSeverity: ev.errorSeverity } : {}),
           ...skillReadEventFields(skillMeta),
           ...agentReadEventFields(agentMeta),
         };
@@ -415,6 +419,15 @@ export async function* mapCoreAgentEvents(
         const friendly = friendlyRetryReason(ev.reason);
         const prefix = ev.attempt <= 1 ? t('model.retrying') : t('model.retrying_n', { attempt: ev.attempt });
         yield { type: 'progress', text: `${prefix}·${friendly}` };
+        break;
+      }
+
+      case 'context_status': {
+        yield {
+          type: 'progress',
+          text: ev.message,
+          event: { stream: 'context', data: { phase: ev.phase, ...(ev.data || {}) } },
+        };
         break;
       }
 

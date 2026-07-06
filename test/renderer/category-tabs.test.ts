@@ -70,6 +70,11 @@ function loadCategoryRenderers() {
       'settings.packages.kind_both': '技能 + 命令行',
       'settings.packages.skills_count': '{count} 个技能',
       'marketplace.all': '全部',
+      'common.loading': '加载中',
+      'agent_picker.library_group_project': '项目资料库',
+      'agent_picker.library_group_global': '全局资料库',
+      'agent_picker.library_empty': '资料库为空',
+      'agent_picker.library_no_match': '没有匹配的资料库文件',
     } as Record<string, string>)[key]?.replace('{count}', String(vars?.count ?? '')) || key,
     normalizeDisplayText: (value: unknown) => String(value ?? '').trim(),
     pickLocalizedName: (c: any) => c?.name_zh || c?.name_en || c?.code || '',
@@ -397,6 +402,76 @@ describe('agent and skill category tabs', () => {
       .toEqual(['agents', 'skills', 'connectors', 'library']);
     await context._triggerPickerItem('skill', 'trusted', 'Trusted Skill', 'new-chat-recipient-chip');
     expect(context.pickedSkillCalls).toEqual([['new-chat', 'trusted', 'Trusted Skill']]);
+  });
+
+  it('routes Library picker selections from the auto task composer into auto attachments', async () => {
+    const { context } = loadCategoryRenderers();
+    const calls: any[] = [];
+    context.window._autoAttachLibraryFile = async (ref: any) => { calls.push(ref); };
+
+    expect(vm.runInContext('_agentPickerVisibleTabs("auto-recipient-chip")', context))
+      .toEqual(['agents', 'skills', 'connectors', 'library']);
+
+    await context._triggerPickerItem('library', 'library:global:brief.md', 'brief.md', 'auto-recipient-chip', {
+      libraryScope: 'global',
+      libraryRel: 'brief.md',
+    });
+
+    expect(calls).toEqual([{ scope: 'global', rel: 'brief.md', projectId: '' }]);
+  });
+
+  it('renders project and global Library groups for the auto task picker when a project is active', async () => {
+    const { context, el } = loadCategoryRenderers();
+    context._projectsCache = [{ project_id: 'p1', name: 'Alpha' }];
+    context.apiFetch = async () => ({
+      json: async () => ({
+        ok: true,
+        tree: [{ type: 'file', relPath: 'global.md', name: 'global.md' }],
+      }),
+    });
+    context.window.orkas.invoke = async (channel: string, payload: any) => {
+      if (channel === 'projects.files.tree') {
+        expect(payload).toEqual({ projectId: 'p1' });
+        return { ok: true, tree: [{ type: 'file', relPath: 'project.md', name: 'project.md' }] };
+      }
+      return { ok: true, bindings: { agents: [] } };
+    };
+
+    context.__rows = await context._loadLibraryPickerRows('p1');
+    vm.runInContext(`
+      _pickerLibraryRows = __rows;
+      _pickerLibraryLoading = null;
+      _renderLibraryPickerList(document.getElementById('agent-picker-list'), '', 'auto-recipient-chip');
+    `, context);
+
+    const html = el('agent-picker-list').innerHTML;
+    expect(html).toContain('项目资料库');
+    expect(html).toContain('project.md');
+    expect(html).toContain('全局资料库');
+    expect(html).toContain('global.md');
+  });
+
+  it('falls back to global Library rows when the auto task project was removed', async () => {
+    const { context } = loadCategoryRenderers();
+    let projectTreeCalls = 0;
+    context._projectsCache = [];
+    context.apiFetch = async () => ({
+      json: async () => ({
+        ok: true,
+        tree: [{ type: 'file', relPath: 'global.md', name: 'global.md' }],
+      }),
+    });
+    context.window.orkas.invoke = async (channel: string) => {
+      if (channel === 'projects.files.tree') projectTreeCalls += 1;
+      return { ok: false, error: 'not_found' };
+    };
+    context.window._autoGetProjectId = () => 'p-deleted';
+
+    const rows = await context._loadLibraryPickerRows('p-deleted');
+
+    expect(vm.runInContext('_resolveActiveProjectId("auto-recipient-chip")', context)).toBe('');
+    expect(projectTreeCalls).toBe(0);
+    expect(rows.map((row: any) => [row.scope, row.rel])).toEqual([['global', 'global.md']]);
   });
 
   it('hides external package recipe groups from the picker for an agent recipient', () => {

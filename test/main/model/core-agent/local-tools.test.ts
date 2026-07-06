@@ -93,6 +93,11 @@ async function workspaceOnly() {
   perm.setLocalExecMode('workspace_approval');
 }
 
+async function allFilesApproval() {
+  const perm = await import('../../../../src/main/features/permissions');
+  perm.setLocalExecMode('all_files_approval');
+}
+
 async function run(tool: any, input: Record<string, any>) {
   const ctx = { workingDir: '.', signal: undefined, state: {} } as any;
   return await tool.execute(input, ctx);
@@ -210,6 +215,51 @@ describe('local-tools › edit_file › sandbox', () => {
       expect(fs.readFileSync(p, 'utf8')).toBe('do not delete');
     } finally {
       fs.rmSync(readOnlyDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('local-tools › delete_file › confirmation scope', () => {
+  it('deletes files inside the writable workspace scope without confirmation', async () => {
+    await workspaceOnly();
+    const { del, wsDir } = await buildDeleteTool();
+    const p = path.join(wsDir, 'old-plan.json');
+    fs.writeFileSync(p, '{"old":true}');
+
+    const r = await run(del, { path: p });
+
+    expect(r.isError).toBeFalsy();
+    expect(r.content).toBe(`Deleted ${p}`);
+    expect(r.content).not.toContain('confirmation_token');
+    expect(fs.existsSync(p)).toBe(false);
+  });
+
+  it('keeps allowed outside-workspace deletes behind the confirmation card', async () => {
+    await allFilesApproval();
+    const broadcasts: Array<{ channel: string; payload: any }> = [];
+    vi.doMock('../../../../src/main/ipc', () => ({
+      broadcastToRenderer: (channel: string, payload: any) => {
+        broadcasts.push({ channel, payload });
+      },
+    }));
+    try {
+      const { del } = await buildDeleteTool();
+      const p = path.join(tmpDir, 'outside-plan.json');
+      fs.writeFileSync(p, '{"outside":true}');
+
+      const pending = run(del, { path: p });
+      await vi.waitFor(() => expect(broadcasts).toHaveLength(1));
+      const confirm = await import('../../../../src/main/model/core-agent/delete-file-confirm');
+      expect(confirm.markConfirmationVisible(broadcasts[0].payload.confirm_id)).toBe(true);
+      const r = await pending;
+
+      expect(broadcasts[0].channel).toBe('delete_file.confirmation_required');
+      expect(r.isError).toBeFalsy();
+      expect(r.content).toContain('requires_user_confirmation');
+      expect(r.content).toContain('confirmation_token:');
+      expect(fs.readFileSync(p, 'utf8')).toBe('{"outside":true}');
+    } finally {
+      vi.doUnmock('../../../../src/main/ipc');
     }
   });
 });

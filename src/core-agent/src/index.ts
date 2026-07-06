@@ -40,6 +40,7 @@ export { ProviderRegistry } from "./providers/index.js";
 export { AgentRunner } from "./agent/index.js";
 export { Session } from "./agent/index.js";
 export { PersistentSession } from "./agent/index.js";
+export type { HistoryResource, HistoryResourceKind } from "./agent/index.js";
 export type { AgentRunParams, AgentRunResult, AgentRunMeta, AgentRunEvent } from "./agent/index.js";
 
 // Tools

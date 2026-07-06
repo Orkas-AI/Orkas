@@ -2,6 +2,9 @@ const _convLog = createLogger('conversation');
 let _conversationInlineRenameCid = null;
 let _conversationHeaderRenameCid = null;
 const _conversationExpandedBuckets = new Set();
+let _conversationBucketDateKey = _conversationLocalDateKey();
+let _conversationBucketDateRefreshTimer = null;
+let _conversationBucketDateRefreshBound = false;
 
 function _convTrackClick(action, data) {
   try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
@@ -13,6 +16,11 @@ function _convTrackEvent(action, data) {
 
 function _convTrackError(action, data) {
   try { if (window.Monitor) (() => {})(action, data || {}); } catch (_) {}
+}
+
+function _trackAgentRunResultTelemetry(cid, evData) {
+  void cid;
+  void evData;
 }
 
 function _maybeShowOrkasCreditGuidance(rawError, source) {
@@ -38,6 +46,43 @@ function _uiIconHtml(name, className) {
   if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') return window.uiIconHtml(name, className || 'ui-icon');
   return '';
 }
+
+function _conversationLocalDateKey(now) {
+  const d = now instanceof Date ? now : (now == null ? new Date() : new Date(now));
+  if (!Number.isFinite(d.getTime())) return '';
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function _refreshConversationBucketsForDateChange(now) {
+  const nextKey = _conversationLocalDateKey(now);
+  if (!nextKey || nextKey === _conversationBucketDateKey) return false;
+  _conversationBucketDateKey = nextKey;
+  if (typeof renderConversationList === 'function') renderConversationList();
+  return true;
+}
+
+function _scheduleConversationBucketDateRefresh() {
+  if (_conversationBucketDateRefreshTimer) clearTimeout(_conversationBucketDateRefreshTimer);
+  _conversationBucketDateRefreshTimer = setTimeout(() => {
+    _conversationBucketDateRefreshTimer = null;
+    _refreshConversationBucketsForDateChange();
+  }, 100);
+}
+
+function _bindConversationBucketDateRefresh() {
+  if (_conversationBucketDateRefreshBound || typeof window === 'undefined' || typeof document === 'undefined') return;
+  _conversationBucketDateRefreshBound = true;
+  window.addEventListener('focus', _scheduleConversationBucketDateRefresh);
+  window.addEventListener('pageshow', _scheduleConversationBucketDateRefresh);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) _scheduleConversationBucketDateRefresh();
+  });
+}
+
+_bindConversationBucketDateRefresh();
 
 // ─── @-mention highlighting (post-render DOM walk) ────────────────────────
 // Wrap `@<token>` matches in a `<span class="msg-mention">` so the chat
@@ -524,18 +569,21 @@ function _chatRichRenderValue(editor, value) {
 function _chatRichInputTarget(inputId) {
   if (inputId === 'new-chat-input') return 'new-chat';
   if (inputId === 'project-chat-input') return 'project';
+  if (inputId === 'auto-task-input') return 'auto';
   return 'conversation';
 }
 
 function _chatRichAutoGrowMax(inputId) {
   if (inputId === 'new-chat-input') return 260;
   if (inputId === 'project-chat-input') return 180;
+  if (inputId === 'auto-task-input') return 220;
   return 200;
 }
 
 function _chatRichRecipientChipId(inputId) {
   if (inputId === 'new-chat-input') return 'new-chat-recipient-chip';
   if (inputId === 'project-chat-input') return 'project-chat-recipient-chip';
+  if (inputId === 'auto-task-input') return 'auto-recipient-chip';
   if (inputId === 'chat-input') return 'chat-recipient-chip';
   return '';
 }
@@ -548,6 +596,10 @@ function _chatRichUploadPasteFiles(inputId, files) {
   }
   if (inputId === 'chat-input' && currentCid) {
     _chatAttachUpload(currentCid, files, 'paste');
+    return true;
+  }
+  if (inputId === 'auto-task-input' && typeof window._autoUploadFilesFromComposer === 'function') {
+    window._autoUploadFilesFromComposer(files, 'paste');
     return true;
   }
   return false;
@@ -718,6 +770,7 @@ function _chatRichCreateApi(textarea, editor) {
       }
     }
     if (e.key !== 'Enter') return;
+    if (textarea.id === 'auto-task-input') return;
     if (e.shiftKey || e.metaKey || e.ctrlKey) {
       e.preventDefault();
       _chatRichInsertText(editor, '\n');
@@ -821,6 +874,8 @@ function _initAllMentionMirrors() {
   if (newChatInput) _initMentionMirror(newChatInput);
   const projectChatInput = document.getElementById('project-chat-input');
   if (projectChatInput) _initMentionMirror(projectChatInput);
+  const autoTaskInput = document.getElementById('auto-task-input');
+  if (autoTaskInput) _initMentionMirror(autoTaskInput);
 }
 
 const CHAT_INPUT_RESERVE_FALLBACK = 140;
@@ -3936,6 +3991,7 @@ function _bindConversationSidebarItems(container, opts = {}) {
 }
 
 function renderConversationList() {
+  _conversationBucketDateKey = _conversationLocalDateKey();
   const container = document.getElementById('conversation-list');
   _sortConversationCacheForSidebar();
   // Conversations with a project_id are rendered nested under their project
@@ -6983,6 +7039,9 @@ function _eventProcessKind(evt, text) {
   if (!evt || typeof evt !== 'object') return _processKindOf(text);
   const stream = evt.stream;
   const data = evt.data || {};
+  const recoverableToolGuard = stream === 'tool'
+    && data.errorCode === 'E_COMPACTED_HISTORY_PLACEHOLDER'
+    && data.errorSeverity === 'recoverable';
   if (stream === 'lifecycle') {
     const p = data.phase;
     if (p === 'error') return 'err';
@@ -6991,7 +7050,7 @@ function _eventProcessKind(evt, text) {
   }
   if (stream === 'item') return 'think';
   if (stream === 'plan') return 'plan';
-  if (stream === 'tool') return data.isError ? 'err' : 'tool';
+  if (stream === 'tool') return data.isError && !recoverableToolGuard ? 'err' : 'tool';
   if (stream === 'command_output') return (!data.stdout && data.stderr) ? 'warn' : 'out';
   if (stream === 'patch') return 'patch';
   if (stream === 'approval') return 'warn';
@@ -7018,7 +7077,21 @@ function _eventProcessKind(evt, text) {
   return _processKindOf(text) || 'meta';
 }
 
-function _streamingAppendProgress(msg, text, kindHint) {
+// Tool name behind a process event, for both in-process (`stream:'tool'`) and
+// CLI-backed (`stream:'cli'` tool-event) shapes. '' for non-tool events. Used
+// to tag process lines so the `turn_silent` handler can tell a routing-only
+// trail (e.g. a lone `hand_off_to`) from real work worth keeping.
+function _processEventName(evt) {
+  if (!evt || typeof evt !== 'object') return '';
+  const data = evt.data || {};
+  if (evt.stream === 'tool') return String(data.name || data.toolName || '');
+  if (evt.stream === 'cli' && String(data.type || '').toLowerCase() === 'tool-event') {
+    return String(data.tool || '');
+  }
+  return '';
+}
+
+function _streamingAppendProgress(msg, text, kindHint, eventName) {
   // Keep the "thinking…" row visible alongside the process trace — hiding it
   // while only process info shows makes long tool runs look stuck. The row
   // is cleared when the final reply (or an error) arrives.
@@ -7037,6 +7110,7 @@ function _streamingAppendProgress(msg, text, kindHint) {
   const kind = kindHint || _processKindOf(text);
   line.className = 'stream-process-line' + (kind ? ' kind-' + kind : '');
   _setProcessLineContent(line, text, kind);
+  if (eventName) line.dataset.eventName = eventName;
   body.appendChild(line);
   if (innerWasAtBottom) body.scrollTop = body.scrollHeight;
   // Outer chat-history follows independently — its own sticky-bottom
@@ -8311,12 +8385,17 @@ function _finalizeActorPlaceholder(ph, gm, cid, archive) {
 // Group-chat bus event router. Each event is one of:
 //   { type: 'message', cid, msg: GroupMessage, turn_id? }
 //   { type: 'process', cid, actor, turn_id?, data: { type, text?, event? } }
+//   { type: 'agent_run_result', cid, actor, actor_type, turn_id?, data }
 //   { type: 'artifact_created', cid, actor, turn_id?, artifact: { id, title, agent_id } }
 //   { type: 'state_changed', cid, state: { status, in_flight }, active_turns? }
 //   { type: 'member_joined', cid, actor }
 //   { type: 'aborted', cid }
 function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {}) {
   if (!evData || typeof evData !== 'object') return;
+  if (evData.type === 'agent_run_result') {
+    _trackAgentRunResultTelemetry(cid, evData);
+    return;
+  }
   if (
     evData.type === 'process'
     || evData.type === 'artifact_created'
@@ -8506,7 +8585,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
         const evt = data.event || {};
         const line = evt.stream === 'tool' ? _formatEventLine(evt) : null;
         if (line && _processLineCount(target) <= before) {
-          _streamingAppendProgress(target, line, _eventProcessKind(evt, line));
+          _streamingAppendProgress(target, line, _eventProcessKind(evt, line), _processEventName(evt));
         }
         _streamingUpdateActivityFromEvent(target, evt);
       }
@@ -8523,7 +8602,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
         error: String(err && err.message || err),
       });
       if (fallback) {
-        try { _streamingAppendProgress(target, fallback, _eventProcessKind(evt, fallback)); } catch (_) {}
+        try { _streamingAppendProgress(target, fallback, _eventProcessKind(evt, fallback), _processEventName(evt)); } catch (_) {}
       }
     }
   } else if (evData.type === 'artifact_created') {
@@ -8650,8 +8729,20 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
       const ph = _consumeActorPlaceholder(cid, actorId, _eventTurnId(evData));
       if (ph) {
         const processBody = ph.querySelector('[data-role="process"]');
-        const hasProcess = !!processBody && processBody.children.length > 0;
-        if (hasProcess) {
+        const procLines = processBody ? Array.from(processBody.children) : [];
+        const hasProcess = procLines.length > 0;
+        // A silent turn whose ENTIRE process trail is the `hand_off_to`
+        // routing call carries nothing worth showing: the commander already
+        // announced the delegation in its own prose message, and the
+        // delegate's reply follows. Freezing it leaves a redundant,
+        // out-of-order process-only bubble (it settles at the silent turn's
+        // end — AFTER the delegate has already rendered — so it reads as the
+        // commander "speaking again" below the reply). Treat it like an empty
+        // turn and drop the bubble. Any real work in the trail (a plan_set,
+        // a read, a non-handoff tool) keeps the freeze path.
+        const handoffOnly = hasProcess
+          && procLines.every((el) => el.dataset && el.dataset.eventName === 'hand_off_to');
+        if (hasProcess && !handoffOnly) {
           // Freeze the bubble: hide thinking dots, leave process rail as
           // a folded "completed thinking" bubble. Empty final body = no main text.
           // `data-frozen-silent="1"` opts this bubble out of the stream-end
@@ -8666,7 +8757,7 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
           _convLog.info('turn_silent received (frozen)', { cid, actor: actorId });
         } else if (ph.parentElement) {
           ph.remove();
-          _convLog.info('turn_silent received (removed)', { cid, actor: actorId });
+          _convLog.info('turn_silent received (removed)', { cid, actor: actorId, handoffOnly });
         }
       }
     }
@@ -9163,6 +9254,7 @@ function _renderAgentEvent(msg, evt) {
   const line = _formatEventLine(evt);
   if (!line) return;
   const lineKind = _eventProcessKind(evt, line);
+  const evName = _processEventName(evt);
   // All tool result rows — CLI-backed AND in-process — are
   // click-to-expand. Two storage paths for the full body, decided per
   // event shape:
@@ -9198,11 +9290,11 @@ function _renderAgentEvent(msg, evt) {
     // reads better expanded anyway.
     const truncated = path || (fullOutput && fullOutput.replace(/\s+/g, ' ').trim().length > 160);
     if (truncated) {
-      _streamingAppendToolResultRow(msg, line, path, fullOutput, lineKind);
+      _streamingAppendToolResultRow(msg, line, path, fullOutput, lineKind, evName);
       return;
     }
   }
-  _streamingAppendProgress(msg, line, lineKind);
+  _streamingAppendProgress(msg, line, lineKind, evName);
 }
 
 /** Append a tool-event result row that can expand its full output. Two
@@ -9217,7 +9309,7 @@ function _renderAgentEvent(msg, evt) {
  *  and would double the memory). A delegated click handler set up once
  *  per bubble does the lookup so we don't bind a closure per row.
  */
-function _streamingAppendToolResultRow(msg, previewText, outputPath, fullOutput, kindHint) {
+function _streamingAppendToolResultRow(msg, previewText, outputPath, fullOutput, kindHint, eventName) {
   const container = msg.querySelector('[data-role="process-container"]');
   if (container) container.style.display = '';
   const body = msg.querySelector('[data-role="process"]');
@@ -9228,6 +9320,7 @@ function _streamingAppendToolResultRow(msg, previewText, outputPath, fullOutput,
   const kind = kindHint || _processKindOf(previewText);
   line.className = 'stream-process-line is-expandable' + (kind ? ' kind-' + kind : '');
   _setProcessLineContent(line, previewText, kind);
+  if (eventName) line.dataset.eventName = eventName;
   if (outputPath) line.dataset.toolResultPath = outputPath;
   if (fullOutput) line._fullOutput = fullOutput;
   line.title = t('chat.tool_result_expand_hint');

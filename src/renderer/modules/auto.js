@@ -106,6 +106,7 @@ let _autoCurrentConnector = null;   // { id, name } | null
 // Allocated lazily on first attach + on edit-mode entry (= task.id).
 let _autoCurrentTaskId = '';
 let _autoCurrentAttachments = []; // [{ name }]
+let _autoMarkdownToolbar = null;
 
 // Cached `_aiSelectMount` handles for the inline form. Set on first mount.
 let _autoFreqSel = null;
@@ -608,6 +609,22 @@ function _autoProjectOptions() {
   return opts;
 }
 
+function _autoProjectExists(projectId) {
+  const pid = String(projectId || '');
+  if (!pid) return false;
+  try {
+    if (typeof _projectsCache !== 'undefined' && Array.isArray(_projectsCache)) {
+      return _projectsCache.some((p) => p && p.project_id === pid);
+    }
+  } catch (_) { /* no project cache in this renderer/test context */ }
+  return true;
+}
+
+function _autoValidProjectId(projectId) {
+  const pid = String(projectId || '');
+  return pid && _autoProjectExists(pid) ? pid : '';
+}
+
 function _autoHasProjects() {
   try {
     return typeof _projectsCache !== 'undefined'
@@ -617,11 +634,37 @@ function _autoHasProjects() {
 }
 
 function _autoSelectedProjectId() {
-  if (_autoLockedProjectId) return _autoLockedProjectId;
+  if (_autoLockedProjectId) return _autoValidProjectId(_autoLockedProjectId);
   const projectRow = document.getElementById('auto-row-project');
   const projectRowVisible = projectRow && !projectRow.hidden;
-  if (projectRowVisible && _autoProjectSel) return _autoProjectSel.getValue() || '';
-  return _autoEditingTaskId ? (_autoEditingProjectId || '') : '';
+  if (projectRowVisible && _autoProjectSel) return _autoValidProjectId(_autoProjectSel.getValue() || '');
+  return _autoEditingTaskId ? _autoValidProjectId(_autoEditingProjectId || '') : '';
+}
+
+function _autoRefreshProjectScopedPicker() {
+  if (typeof window !== 'undefined' && typeof window.refreshAgentPickerContext === 'function') {
+    Promise.resolve(window.refreshAgentPickerContext('auto-recipient-chip')).catch(() => {});
+  }
+}
+
+function _autoRefreshProjectOptions(removedProjectId = '') {
+  const removedPid = String(removedProjectId || '');
+  if (removedPid && _autoLockedProjectId === removedPid) _autoLockedProjectId = '';
+  if (_autoLockedProjectId && !_autoProjectExists(_autoLockedProjectId)) _autoLockedProjectId = '';
+  if (removedPid && _autoEditingProjectId === removedPid) _autoEditingProjectId = '';
+  if (_autoEditingProjectId && !_autoProjectExists(_autoEditingProjectId)) _autoEditingProjectId = '';
+
+  const projectRow = document.getElementById('auto-row-project');
+  const showProjectRow = !_autoLockedProjectId && _autoHasProjects();
+  if (projectRow) projectRow.hidden = !showProjectRow;
+  if (_autoProjectSel) {
+    const current = _autoProjectSel.getValue() || '';
+    _autoProjectSel.setOptions(_autoProjectOptions(), { value: current });
+    if (!showProjectRow || !_autoValidProjectId(_autoProjectSel.getValue() || '')) {
+      _autoProjectSel.setValue('');
+    }
+  }
+  _autoRefreshProjectScopedPicker();
 }
 
 async function _autoClearRecipientIfOutsideProject() {
@@ -738,6 +781,7 @@ function _mountAutoForm() {
       value: '',
       onChange: () => {
         _autoTrackClick('auto_project_select', { has_project: !!(_autoProjectSel && _autoProjectSel.getValue()) });
+        _autoRefreshProjectScopedPicker();
         _autoClearRecipientIfOutsideProject().catch(() => {});
       },
     });
@@ -751,6 +795,7 @@ function _mountAutoForm() {
   }
 
   // Bind buttons.
+  const ta = document.getElementById('auto-task-input');
   const submitBtn = document.getElementById('auto-submit-btn');
   if (submitBtn && submitBtn.dataset.bound !== '1') {
     submitBtn.dataset.bound = '1';
@@ -771,6 +816,14 @@ function _mountAutoForm() {
     attachBtn.dataset.bound = '1';
     attachBtn.addEventListener('click', () => _autoPickAndUploadFiles());
   }
+  const toolbarEl = document.getElementById('auto-markdown-toolbar');
+  if (!_autoMarkdownToolbar && toolbarEl && ta && typeof window.mountMarkdownToolbarForTextarea === 'function') {
+    _autoMarkdownToolbar = window.mountMarkdownToolbarForTextarea({
+      toolbarEl,
+      textarea: ta,
+    });
+  }
+  _bindAutoDropAttach();
 
   // Keep i18n labels updating on lang switch.
   window.addEventListener('i18n-change', _autoRepaintLabels);
@@ -839,6 +892,70 @@ async function _autoUploadFiles(files, source = 'drop') {
     failed_count: failedCount,
   });
   _renderAutoAttachmentChips();
+}
+
+function _bindAutoDropAttach() {
+  const input = document.getElementById('auto-task-input');
+  const area = input ? input.closest('.new-chat-input-area') : null;
+  if (!area || area.dataset.autoDropBound === '1') return;
+  const isAttachDrag = (e) => {
+    const types = e.dataTransfer && e.dataTransfer.types;
+    if (!types) return false;
+    for (let i = 0; i < types.length; i++) {
+      if (types[i] === 'Files') return true;
+    }
+    return false;
+  };
+  const allow = (e) => {
+    if (!isAttachDrag(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  };
+  area.addEventListener('dragover', allow);
+  area.addEventListener('dragenter', allow);
+  area.addEventListener('drop', (e) => {
+    if (!isAttachDrag(e)) return;
+    e.preventDefault();
+    _autoUploadFiles(e.dataTransfer.files, 'drop');
+  });
+  area.dataset.autoDropBound = '1';
+}
+
+async function _autoAttachLibraryFile(ref) {
+  const taskId = await _ensureAutoDraftId();
+  if (!taskId) {
+    throw new Error('no_draft_id');
+  }
+  const scope = String(ref && ref.scope || 'global');
+  const rel = String(ref && ref.rel || '');
+  const projectId = _autoValidProjectId(ref && ref.projectId || '');
+  if (!rel) return;
+  if (scope === 'project' && !projectId) throw new Error('project_not_found');
+  const payload = {
+    taskId,
+    ...(scope === 'project'
+      ? { projectId, name: rel }
+      : { relPath: rel }),
+  };
+  const channel = scope === 'project'
+    ? 'autoTasks.attachments.attachProjectFile'
+    : 'autoTasks.attachments.attachContext';
+  _autoTrackClick('auto_library_attach', {
+    scope,
+    mode: _autoEditingTaskId ? 'edit' : 'create',
+    has_project: !!projectId,
+  });
+  try {
+    const data = await window.orkas.invoke(channel, payload);
+    const name = data && data.name;
+    if (!name) throw new Error((data && data.error) || 'attach_failed');
+    _autoCurrentAttachments = _autoCurrentAttachments.filter((a) => a.name !== name);
+    _autoCurrentAttachments.push({ name });
+    _renderAutoAttachmentChips();
+  } catch (err) {
+    _autoLog.warn('library attach failed', err);
+    throw err;
+  }
 }
 
 async function _autoPickAndUploadFiles() {
@@ -1060,7 +1177,7 @@ function openAutoTaskDialog(opts = {}) {
   if (!_autoFormMounted) _mountAutoForm();
   _refreshAutoSyncNotice().catch(() => {});
   const task = opts.task || null;
-  _autoLockedProjectId = (opts.projectId && typeof opts.projectId === 'string') ? opts.projectId : '';
+  _autoLockedProjectId = _autoValidProjectId((opts.projectId && typeof opts.projectId === 'string') ? opts.projectId : '');
   _autoOnSaved = (typeof opts.onSaved === 'function') ? opts.onSaved : null;
 
   // Project picker visibility:
@@ -1074,11 +1191,12 @@ function openAutoTaskDialog(opts = {}) {
   if (showProjectRow && _autoProjectSel) {
     _autoProjectSel.setOptions(_autoProjectOptions());
     // Seed: edit → task's current project_id; create → empty (none).
-    _autoProjectSel.setValue(task && task.project_id ? task.project_id : '');
+    _autoProjectSel.setValue(task && task.project_id ? _autoValidProjectId(task.project_id) : '');
   }
 
   if (task) _autoFillForm(task);
   else _autoResetForm();
+  _autoRefreshProjectOptions();
   _autoRepaintLabels();
   _showAutoDialog();
 }
@@ -1317,6 +1435,9 @@ if (typeof window !== 'undefined') {
   window.loadAutoList = loadAutoList;
   window.loadProjectAutoList = loadProjectAutoList;
   window.openAutoTaskDialog = openAutoTaskDialog;
+  window.refreshAutoProjectOptions = _autoRefreshProjectOptions;
+  window._autoUploadFilesFromComposer = _autoUploadFiles;
+  window._autoAttachLibraryFile = _autoAttachLibraryFile;
   document.addEventListener('DOMContentLoaded', () => {
     const addBtn = document.getElementById('auto-add-btn');
     if (addBtn && addBtn.dataset.bound !== '1') {
@@ -1338,14 +1459,37 @@ function startAutoEventsSubscription() {
   try {
     _autoEventsHandle = window.orkas.stream('autoTasks.events', {}, (ev) => {
       const inner = ev && ev.event;
-      if (!inner || inner.type !== 'conv_created') return;
-      _autoTrackEvent('auto_task_fire_result', {
-        result: 'success',
-        task_id: inner.taskId || inner.task_id || '',
-        conversation_id: inner.cid || inner.conversation_id || '',
-      });
-      if (typeof loadConversations === 'function') {
-        loadConversations().catch((err) => _autoLog.warn('reload after fire failed', err));
+      if (!inner) return;
+      if (inner.type === 'fire_failed') {
+        const taskId = inner.taskId || inner.task_id || '';
+        const cid = inner.cid || inner.conversation_id || '';
+        const errorCode = inner.error_code || 'unknown';
+        _autoTrackEvent('auto_task_fire_result', {
+          result: 'failure',
+          task_id: taskId,
+          conversation_id: cid,
+          duration_ms: Number(inner.duration_ms) || 0,
+          error_code: errorCode,
+        });
+        _autoTrackError('auto_task_fire', {
+          task_id: taskId,
+          conversation_id: cid,
+          error_type: 'runtime',
+          error_code: errorCode,
+          error_message: errorCode,
+        });
+      } else if (inner.type === 'conv_created') {
+        _autoTrackEvent('auto_task_fire_result', {
+          result: 'success',
+          task_id: inner.taskId || inner.task_id || '',
+          conversation_id: inner.cid || inner.conversation_id || '',
+          duration_ms: Number(inner.duration_ms) || 0,
+        });
+        if (typeof loadConversations === 'function') {
+          loadConversations().catch((err) => _autoLog.warn('reload after fire failed', err));
+        }
+      } else {
+        return;
       }
       // Refresh task last_run if the auto tab has been opened.
       if (_autoLoadedOnce) loadAutoList(true).catch(() => {});

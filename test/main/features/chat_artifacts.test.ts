@@ -100,6 +100,7 @@ describe('chat_artifacts › createArtifact', () => {
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.error).toContain('compacted conversation-history marker');
+    expect(r.error).toContain('not an artifact or preview limitation');
     expect(fs.existsSync(cidDir())).toBe(false);
   });
 

@@ -105,7 +105,7 @@
   "model.call_failed": "⚠️ Model call failed: {message}",
   "model.retrying": "Retrying",
   "model.retrying_n": "Retry attempt {attempt}",
-  "model.tool_loop_limit_reached": "(Tool loop limit reached)",
+  "model.tool_loop_limit_reached": "(Tool loop round limit reached)",
   "model.run_aborted": "Run aborted",
   "model.max_retries_exceeded": "Max retries exceeded",
   "model.empty_response": "empty response",

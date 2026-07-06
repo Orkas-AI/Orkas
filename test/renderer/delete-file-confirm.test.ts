@@ -270,6 +270,8 @@ describe('delete-file-confirm batching', () => {
     await card.querySelector('[data-delete-act="ok"]')!.click();
 
     expect(h.invokeCalls).toEqual([
+      { channel: 'delete_file.visible', payload: { confirm_id: 'tok-a' } },
+      { channel: 'delete_file.visible', payload: { confirm_id: 'tok-b' } },
       { channel: 'delete_file.respond', payload: { confirm_id: 'tok-a', granted: true } },
       { channel: 'delete_file.respond', payload: { confirm_id: 'tok-b', granted: true } },
     ]);
@@ -289,6 +291,8 @@ describe('delete-file-confirm batching', () => {
     await card.querySelector('[data-delete-act="cancel"]')!.click();
 
     expect(h.invokeCalls).toEqual([
+      { channel: 'delete_file.visible', payload: { confirm_id: 'tok-a' } },
+      { channel: 'delete_file.visible', payload: { confirm_id: 'tok-b' } },
       { channel: 'delete_file.respond', payload: { confirm_id: 'tok-a', granted: false } },
       { channel: 'delete_file.respond', payload: { confirm_id: 'tok-b', granted: false } },
     ]);

@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import path from "node:path";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -59,8 +59,9 @@ describe("Tools", () => {
       });
     });
 
-    it("compacts descriptions without changing schema semantics", () => {
+    it("keeps descriptions intact while warning on soft-budget overruns", () => {
       const longDescription = "Use this tool carefully. " + "detail ".repeat(120);
+      const modeDescription = "Choose execution mode. " + "extra ".repeat(80);
       const tool = defineTool({
         name: "schema_tool",
         description: longDescription,
@@ -72,7 +73,7 @@ describe("Tools", () => {
             mode: {
               type: "string",
               enum: ["fast", "safe"],
-              description: "Choose execution mode. " + "extra ".repeat(80),
+              description: modeDescription,
               examples: ["fast"],
             },
             count: { type: "number", minimum: 1, maximum: 10 },
@@ -84,21 +85,44 @@ describe("Tools", () => {
         },
       });
 
-      const def = toToolDefinition(tool);
-      expect(def.description.length).toBeLessThan(longDescription.length);
-      expect(def.inputSchema).toMatchObject({
-        type: "object",
-        required: ["mode"],
-        properties: {
-          mode: { type: "string", enum: ["fast", "safe"] },
-          count: { type: "number", minimum: 1, maximum: 10 },
-        },
-      });
-      expect(def.inputSchema).not.toHaveProperty("$schema");
-      expect(def.inputSchema).not.toHaveProperty("examples");
-      const modeSchema = (def.inputSchema.properties as Record<string, Record<string, unknown>>).mode;
-      expect(modeSchema.description).toEqual(expect.stringContaining("Choose execution mode."));
-      expect(modeSchema).not.toHaveProperty("examples");
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        const def = toToolDefinition(tool);
+        expect(def.description).toBe(longDescription.trim());
+        expect(def.inputSchema).toMatchObject({
+          type: "object",
+          required: ["mode"],
+          properties: {
+            mode: { type: "string", enum: ["fast", "safe"] },
+            count: { type: "number", minimum: 1, maximum: 10 },
+          },
+        });
+        expect(def.inputSchema).not.toHaveProperty("$schema");
+        expect(def.inputSchema).not.toHaveProperty("examples");
+        const modeSchema = (def.inputSchema.properties as Record<string, Record<string, unknown>>).mode;
+        expect(modeSchema.description).toBe(modeDescription.trim());
+        expect(modeSchema).not.toHaveProperty("examples");
+        expect(warn).toHaveBeenCalledWith(
+          "[tool-definitions]",
+          "tool definition description exceeds soft budget; sent untruncated",
+          expect.objectContaining({
+            tool: "schema_tool",
+            field: "tool description",
+            softBudget: 480,
+          }),
+        );
+        expect(warn).toHaveBeenCalledWith(
+          "[tool-definitions]",
+          "tool definition description exceeds soft budget; sent untruncated",
+          expect.objectContaining({
+            tool: "schema_tool",
+            field: "schema description at /inputSchema/properties/mode",
+            softBudget: 220,
+          }),
+        );
+      } finally {
+        warn.mockRestore();
+      }
     });
   });
 

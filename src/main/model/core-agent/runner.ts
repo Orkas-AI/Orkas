@@ -17,7 +17,8 @@
  * to the SDK's default-provider + env-var auth path.
  */
 
-import type { AgentTool, LLMProvider } from '#core-agent';
+import type { AgentTool, HistoryResource, LLMProvider } from '#core-agent';
+import * as path from 'node:path';
 
 import {
   pickChatEntryGroup,
@@ -56,6 +57,7 @@ import { createWebSearchOverrideTool } from './search-tools';
 import {
   agentEvolvedSkillsDir,
   agentPrivateSkillsDir,
+  artifactDir,
   userMarketplaceAgentSkillsDir,
   userSystemSkillsDir,
 } from '../../paths';
@@ -314,6 +316,37 @@ function splitRuntimeInjectionBlock(prompt: string): { stable: string; runtimeIn
   };
 }
 
+/**
+ * Peel the commander's `## Orchestration state` section out of the cached
+ * prefix. Its body renders the per-turn `orchestration_ledger` JSON (status,
+ * updated_at, interrupted_at, …), which changes every commander turn while an
+ * agent handoff / form / dispatch pause is live. Left in place — it sits near
+ * the TOP of chat_commander.md, far ahead of `## Runtime injection` — any
+ * ledger change invalidates the whole Anthropic cache prefix after it (~7-9K
+ * tokens re-billed at full input price per turn). Relocating the whole H2
+ * section to the volatile region keeps the cached prefix stable, matching the
+ * `### Current plan state` treatment and CLAUDE.md's "runtime-volatile prompt
+ * fields go in one trailing section" rule. The header is already H2 so no
+ * heading rewrite is needed.
+ */
+function splitCommanderOrchestrationBlock(prompt: string): { stable: string; orchestrationBlock: string } {
+  const marker = '\n\n## Orchestration state';
+  const idx = prompt.indexOf(marker);
+  if (idx < 0) return { stable: prompt, orchestrationBlock: '' };
+  const blockStart = idx + 2;
+  const nextSection = prompt.slice(blockStart + marker.trimStart().length).search(/\n\n#{2,3} /);
+  const blockEnd = nextSection < 0
+    ? prompt.length
+    : blockStart + marker.trimStart().length + nextSection;
+  return {
+    stable: `${prompt.slice(0, idx)}${prompt.slice(blockEnd)}`.trim(),
+    orchestrationBlock: prompt.slice(blockStart, blockEnd).trim(),
+  };
+}
+
+/** Exported for unit tests — see runner.test.ts. */
+export const _splitCommanderOrchestrationBlock = splitCommanderOrchestrationBlock;
+
 export async function buildRunner(params: BuildRunnerParams): Promise<{
   runner: AgentRunnerInstance;
   resolvedSystemPrompt: string;
@@ -414,6 +447,34 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const agentName = (params.agentName || (agentId ? agentDisplayNameById.get(agentId) : '') || agentId || '').trim();
   const injectedTools: AgentTool[] = [];
 
+  const recordHistoryResource = (resource: HistoryResource) => {
+    try {
+      session.addHistoryResource(resource);
+    } catch (err) {
+      log.warn('history resource registration failed', {
+        session_id: maskId(params.sessionId),
+        kind: resource.kind,
+        error: logErrorSummary(err),
+      });
+    }
+  };
+  const onArtifactCreatedForHistory = params.onArtifactCreated
+    ? (a: { id: string; title: string }) => {
+        try {
+          params.onArtifactCreated!(a);
+        } finally {
+          if (uid && params.cid) {
+            recordHistoryResource({
+              kind: 'final_output',
+              path: path.join(artifactDir(uid, params.cid, a.id), 'index.html'),
+              name: a.title || a.id,
+              note: 'Interactive app artifact entry point.',
+            });
+          }
+        }
+      }
+    : undefined;
+
   if (uid && memoryAgentScope) {
     // Cross-session memory. `agent` tier binds to THIS caller's scope so the
     // model can never reach another agent's store; `shared`/`user` are global.
@@ -476,7 +537,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     // fileTools below.
     ...(params.onFileWritten ? { onFileWritten: params.onFileWritten } : {}),
     ...(params.hasProducedPath ? { hasProducedPath: params.hasProducedPath } : {}),
-    ...(params.onArtifactCreated ? { onArtifactCreated: params.onArtifactCreated } : {}),
+    ...(onArtifactCreatedForHistory ? { onArtifactCreated: onArtifactCreatedForHistory } : {}),
   });
 
   // File-scoped tools (read_file override + search_files + grep_files).
@@ -684,8 +745,10 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
 
   // Finalize system prompt. Cache-friendly order:
   //   [base prompt] → [connectors] → [system skills] → [skills]
-  //   → [agents] → [runtime injection] → [memory] → [plan state]
-  //   → [volatile datetime tail].
+  //   → [agents] → [runtime injection] → [memory] → [orchestration state]
+  //   → [plan state] → [volatile datetime tail].
+  // Everything from [runtime injection] onward is the turn-volatile region;
+  // the stable prefix above it is what the provider prompt-cache reuses.
   // Tool list is no longer in the prompt (see toolsBlock removal note above)
   // because the SDK tool-use protocol delivers it via a separate API field.
   const parts: string[] = [];
@@ -693,7 +756,12 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   const { stable: stableWithoutAgents, agentsBlock } = splitCommanderAgentsBlock(stableSystemPrompt);
   const { stable: stableWithoutPlan, planStateBlock } = splitCommanderPlanStateBlock(stableWithoutAgents);
   const { stable: stableWithoutRuntime, runtimeInjectionBlock } = splitRuntimeInjectionBlock(stableWithoutPlan);
-  if (stableWithoutRuntime) parts.push(stableWithoutRuntime);
+  // Orchestration state carries the per-turn `orchestration_ledger` JSON; it
+  // must leave the cached prefix or it invalidates the whole prefix after it
+  // every commander turn a ledger is live. Peel it here and re-emit it in the
+  // volatile region below (matches plan state).
+  const { stable: stableWithoutOrchestration, orchestrationBlock } = splitCommanderOrchestrationBlock(stableWithoutRuntime);
+  if (stableWithoutOrchestration) parts.push(stableWithoutOrchestration);
   if (connectorBlock) parts.push(connectorBlock.trim());
   if (systemSkillsBlock) parts.push(systemSkillsBlock.trim());
   if (skillsBlock) parts.push(skillsBlock.trim());
@@ -706,6 +774,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // Re-read each turn — a mid-conversation write shows up next turn.
   const memoryBlock = (uid && memoryAgentScope) ? formatMemoryForSystemPrompt(uid, memoryAgentScope) : '';
   if (memoryBlock) parts.push(memoryBlock);
+  if (orchestrationBlock) parts.push(orchestrationBlock);
   if (planStateBlock) parts.push(planStateBlock);
   if (volatileTail) parts.push(volatileTail);
   const resolvedSystemPrompt = parts.join('\n\n');

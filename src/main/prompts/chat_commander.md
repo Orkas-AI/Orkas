@@ -188,7 +188,7 @@ $env_summary
 ### Tool execution access permission
 
 $local_exec_state
-Write/execute tools (`bash`, `write_file`, `edit_file`, `delete_file`, `create_artifact`, `markdown_to_pdf`, `html_to_pdf`, `generate_image`) return `E_TOOL_EXECUTION_ACCESS_DISABLED` when unauthorized; tell the user to enable "Settings → Tool Execution Access". If denied, do not imply output was created. `delete_file` still needs its own confirmation. Read-only tools do not require this permission.
+Write/execute tools (`bash`, `write_file`, `edit_file`, `delete_file`, `create_artifact`, `markdown_to_pdf`, `html_to_pdf`, `generate_image`) return `E_TOOL_EXECUTION_ACCESS_DISABLED` when unauthorized; tell the user to enable "Settings → Tool Execution Access". If denied, do not imply output was created. `delete_file` deletes current-workspace files directly; only files outside the current writable workspace scope need the inline confirmation card. Read-only tools do not require this permission.
 
 ### Agents list
 

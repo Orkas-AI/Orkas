@@ -308,7 +308,9 @@ export function createArtifact(
       if (compactedMarker) {
         return {
           ok: false,
-          error: `file "${rel}": contains compacted conversation-history marker ${compactedMarker}; regenerate the full artifact content before creating it`,
+          error:
+            `file "${rel}": contains compacted conversation-history marker ${compactedMarker}. ` +
+            'This is not an artifact or preview limitation; regenerate the complete artifact content before creating it.',
         };
       }
       buf = Buffer.from(f.content, 'utf8');

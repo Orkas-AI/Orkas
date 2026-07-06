@@ -8,6 +8,7 @@ function loadProjectsRenderer(options: {
   afterConversations: any[];
 }) {
   const setViewCalls: any[] = [];
+  const refreshAutoProjectCalls: string[] = [];
   const context: any = {
     console,
     setTimeout,
@@ -44,6 +45,7 @@ function loadProjectsRenderer(options: {
     window: {
       addEventListener() {},
       uiIconHtml: () => '',
+      refreshAutoProjectOptions: (pid: string) => { refreshAutoProjectCalls.push(pid); },
       orkas: {
         invoke: async (channel: string) => {
           if (channel === 'autoTasks.list') return { tasks: [] };
@@ -59,6 +61,7 @@ function loadProjectsRenderer(options: {
     vm.runInContext(`_projectsCache = ${JSON.stringify(projects)}`, context);
   };
   context.__setViewCalls = setViewCalls;
+  context.__refreshAutoProjectCalls = refreshAutoProjectCalls;
   vm.createContext(context);
   const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/projects.js'), 'utf8');
   vm.runInContext(source, context);
@@ -96,6 +99,7 @@ describe('project delete navigation', () => {
         opts: { entryPoint: 'project_delete_fallback' },
       },
     ]);
+    expect(context.__refreshAutoProjectCalls).toEqual(['p1']);
   });
 
   it('moves from the deleted detail page to a remaining task when no projects remain', async () => {
@@ -123,5 +127,6 @@ describe('project delete navigation', () => {
         opts: { entryPoint: 'project_delete_fallback' },
       },
     ]);
+    expect(context.__refreshAutoProjectCalls).toEqual(['p1']);
   });
 });

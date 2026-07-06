@@ -30,10 +30,10 @@ function buildDescription(limits?: { competence?: number; strategies?: number })
     compLimit && stratLimit
       ? [
           '',
-          `Limits (oversize writes are rejected):`,
+          `CONTENT LIMITS (oversize writes are rejected):`,
           `- competence: ${compLimit} characters`,
           `- strategies: ${stratLimit} characters`,
-          `Keep these files condensed living summaries, not logs.`,
+          `REJECTED writes must be shortened; CONDENSE these files into living summaries, not logs.`,
         ].join('\n')
       : '';
 

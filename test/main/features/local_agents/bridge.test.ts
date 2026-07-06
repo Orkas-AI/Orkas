@@ -199,6 +199,7 @@ describe('local_agents/bridge › auth + skills', () => {
       expect(secretEnv.ORKAS_BRIDGE_TOKEN).toBe(bridge.token);
       expect(secretEnv.ORKAS_BRIDGE_SOCKET).toBe(bridge.socketPath);
       expect(secretEnv.ORKAS_UID).toBe(TEST_UID);
+      expect(secretEnv.ORKAS_AGENT_ID).toBe('a1');
       expect(bridge.serverEnv.ORKAS_BRIDGE_TOKEN).toBeUndefined();
       expect(bridge.serverEnv.ORKAS_BRIDGE_SOCKET).toBeUndefined();
     } finally {

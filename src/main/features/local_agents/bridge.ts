@@ -278,6 +278,7 @@ export async function startBridge(opts: StartBridgeOpts): Promise<BridgeHandle> 
   const secretServerEnv: Record<string, string> = {
     ...opts.sandboxEnv,
     ORKAS_UID: opts.uid,
+    ORKAS_AGENT_ID: opts.agentId,
     ORKAS_BRIDGE_SOCKET: socketPath,
     ORKAS_BRIDGE_TOKEN: token,
   };

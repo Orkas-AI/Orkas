@@ -104,7 +104,7 @@
   "model.call_failed": "⚠️ Falha na chamada do modelo: {message}",
   "model.retrying": "Tentando novamente",
   "model.retrying_n": "Tentativa de repetição {attempt}",
-  "model.tool_loop_limit_reached": "(Limite do loop da ferramenta atingido)",
+  "model.tool_loop_limit_reached": "(Limite de rodadas do loop de ferramentas atingido)",
   "model.run_aborted": "Execução abortada",
   "model.max_retries_exceeded": "Máximo de tentativas excedido",
   "model.empty_response": "resposta vazia",

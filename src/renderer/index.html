@@ -1271,13 +1271,14 @@
             <div class="chat-input-overlay">
               <div class="chat-attachments" id="auto-task-attachments" style="display:none"></div>
             </div>
+            <div class="ctx-editor-toolbar auto-markdown-toolbar" id="auto-markdown-toolbar" role="toolbar"></div>
             <textarea id="auto-task-input" rows="2" maxlength="8000"
                       data-i18n-placeholder="auto.content_placeholder"
-                      placeholder="Type @ to choose agents, skills, connectors."></textarea>
+                      placeholder="Type @ to choose agents, skills, connectors, Library files."></textarea>
             <div class="chat-bottom-bar">
               <button type="button" class="chat-attach-btn" id="auto-attach-btn" data-i18n-title="new_chat.attach_title" title="Upload attachment">+</button>
               <span class="chat-composer-divider" aria-hidden="true"></span>
-              <button type="button" class="chat-recipient-chip" id="auto-recipient-chip" data-i18n-title="chat.recipient_picker_title" title="Choose agent">
+              <button type="button" class="chat-recipient-chip" id="auto-recipient-chip" data-i18n-title="chat.recipient_picker_title_with_library" title="Choose agent, skill, connector, or Library file">
                 <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
                 <span class="chat-recipient-name" id="auto-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
               </button>

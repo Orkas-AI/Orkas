@@ -49,6 +49,16 @@ describe('core-agent client skill sandbox env', () => {
     });
   });
 
+  it('adds the current agent id to bash skill invocations when provided', async () => {
+    const client = await import('../../../../src/main/model/core-agent/client');
+
+    expect(client.buildSkillSandboxEnv('u1', 'agent-a')).toMatchObject({
+      ORKAS_UID: 'u1',
+      ORKAS_AGENT_ID: 'agent-a',
+    });
+    expect(client.buildSkillSandboxEnv('u1', '../agent-a')).not.toHaveProperty('ORKAS_AGENT_ID');
+  });
+
   it('stops waiting for a wedged event stream when the abort signal fires', async () => {
     const client = await import('../../../../src/main/model/core-agent/client');
     const controller = new AbortController();

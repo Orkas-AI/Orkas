@@ -716,7 +716,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
         ...(opts.projectId ? { projectId: opts.projectId } : {}),
         runId: handle.runId,
         configDir: handle.dir,
-        sandboxEnv: buildSkillSandboxEnv(opts.uid),
+        sandboxEnv: buildSkillSandboxEnv(opts.uid, opts.agentId),
       });
       log.info('local agent bridge ready', runLogContext);
     } catch (err) {

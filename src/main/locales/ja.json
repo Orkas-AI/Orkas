@@ -105,7 +105,7 @@
   "model.call_failed": "⚠️ モデル呼び出しに失敗しました: {message}",
   "model.retrying": "再試行中",
   "model.retrying_n": "再試行 {attempt} 回目",
-  "model.tool_loop_limit_reached": "（ツール呼び出し回数が上限に達しました）",
+  "model.tool_loop_limit_reached": "（ツールループ回数が上限に達しました）",
   "model.run_aborted": "実行を中断しました",
   "model.max_retries_exceeded": "再試行回数が上限に達しました",
   "model.empty_response": "モデルから応答がありません",

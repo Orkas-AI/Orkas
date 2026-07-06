@@ -31,18 +31,22 @@ import { safeId } from '../../storage';
 // list is available.
 const TOKEN_CLASS = '[A-Za-z0-9_一-鿿-]+';
 const FALLBACK_MENTION_RE = /(^|[^A-Za-z0-9_一-鿿-])@([A-Za-z0-9_一-鿿-]+)/gu;
+const RESERVED_ACTOR_ALIASES = ['指挥官', 'commander', '用户', 'user'] as const;
 
 function _escapeForRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function _buildMentionRe(names?: readonly string[]): RegExp {
+function _buildMentionRe(names?: readonly string[], includeFallback = true): RegExp {
   if (!names || !names.length) return new RegExp(FALLBACK_MENTION_RE.source, 'gu');
   // Longest-first so multi-word names anchor before any single-word prefix
   // shared with another name. Two agents named "Foo" and "Foo Bar" both
   // match correctly when the longer alternative is tried first.
   const sorted = [...names].sort((a, b) => b.length - a.length);
   const namedAlt = sorted.map(_escapeForRegex).join('|');
+  if (!includeFallback) {
+    return new RegExp(`(^|[^A-Za-z0-9_一-鿿-])@(${namedAlt})`, 'gu');
+  }
   return new RegExp(`(^|[^A-Za-z0-9_一-鿿-])@(${namedAlt}|${TOKEN_CLASS})`, 'gu');
 }
 
@@ -52,11 +56,13 @@ function _buildMentionRe(names?: readonly string[]): RegExp {
  *  `fromKind` decides whether `@` counts as a dispatch signal:
  *    - `'user'` (or undefined, for back-compat) — full scan; a real
  *      user typing `@A` actually means "send to A".
- *    - `'commander'` / `'agent'` — return `[]` immediately; LLM prose
- *      like `**@A**` or `@A / @B` is training-data markdown decoration,
- *      not a dispatch signal. The only LLM-side dispatch channels are
- *      the `dispatch_to` (single agent) and `plan_set` (multi-actor)
- *      tools.
+ *    - `'commander'` — return `[]` immediately; commander LLM prose like
+ *      `**@A**` or `@A / @B` is training-data markdown decoration, not a
+ *      dispatch signal. The commander dispatch channels are the
+ *      `dispatch_to` (single agent) and `plan_set` (multi-actor) tools.
+ *    - `'agent'` — ignore arbitrary agent mentions for the same reason, but
+ *      still allow reserved user/commander aliases so an agent can explicitly
+ *      escalate with `@commander` / `@指挥官`.
  *  See docs/plans/dispatch-via-tool-call.md and CLAUDE.md §5.
  *
  *  `names` enables exact multi-word name matching: when a user types
@@ -71,7 +77,6 @@ export function parseMentions(
   opts?: { fromKind?: Actor['kind']; names?: readonly string[] },
 ): string[] {
   if (!text) return [];
-  if (opts?.fromKind && opts.fromKind !== 'user') return [];
   // Markdown blockquote lines (`> ...`) are context the user pulled in
   // from another bubble via the quote-reply feature. `@<name>` tokens
   // inside the quote belong to the original author's outgoing routing,
@@ -85,7 +90,11 @@ export function parseMentions(
     .filter((line) => !/^\s*>/.test(line))
     .join('\n');
   if (!routingText) return [];
-  const re = _buildMentionRe(opts?.names);
+  if (opts?.fromKind === 'commander') return [];
+  const reservedOnly = opts?.fromKind === 'agent';
+  const re = reservedOnly
+    ? _buildMentionRe(RESERVED_ACTOR_ALIASES, false)
+    : _buildMentionRe(opts?.names);
   const out: string[] = [];
   const seen = new Set<string>();
   let m: RegExpExecArray | null;
@@ -222,6 +231,8 @@ export function resolveRecipients(opts: ResolveOpts): RouteResolution {
     }
     // Try name → id (in current roster first, then global registry).
     const key = _normalizeNameKey(tok);
+    if (key === '指挥官') { resolved.push(COMMANDER_ID); continue; }
+    if (key === '用户') { resolved.push(USER_ID); continue; }
     const fromMembers = memberNameToId.get(key);
     if (fromMembers) { resolved.push(fromMembers); continue; }
     const fromGlobal = opts.agentNameToId?.get(key);

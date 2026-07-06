@@ -137,12 +137,21 @@ function buildSkillSandboxEnvStatic(): Record<string, string> {
  *   - `ORKAS_UID` = the turn's user id, so `bin/orkas-pkg.cjs` (and other
  *     bash-driven CLIs) resolve the right per-user data tree without
  *     parsing users.json.
+ *   - `ORKAS_AGENT_ID` = the current acting agent id, so `bin/run-skill.cjs`
+ *     can resolve agent-private installed skills from the per-user data tree.
    *   - `ORKAS_PATH_PREPEND` = bundled runtime bins plus enabled external
    *     package CLI dirs (`.bin`, package-local bin fallbacks) when present.
    *     Composed into PATH by the sandbox executor (see core-agent
    *     sandbox/executor.ts) so the augmented brew/system PATH is preserved.
  */
-export function buildSkillSandboxEnv(userId?: string): Record<string, string> {
+function safeAgentEnvId(agentId?: string): string {
+  const text = String(agentId || '').trim();
+  if (!text || text === '.' || text === '..') return '';
+  if (text.includes('/') || text.includes('\\') || text.includes('\0') || text.includes('..')) return '';
+  return text;
+}
+
+export function buildSkillSandboxEnv(userId?: string, agentId?: string): Record<string, string> {
   const env = { ...buildSkillSandboxEnvStatic(), ...bundledRuntimeEnv() };
   env.ORKAS_UI_LANG = getCurrentLang();
   env.ORKAS_VENV_ROOT = paths.VENV_ROOT;
@@ -167,6 +176,8 @@ export function buildSkillSandboxEnv(userId?: string): Record<string, string> {
   } catch { /* shared venv shims are created on demand */ }
   if (userId) {
     env.ORKAS_UID = userId;
+    const safeAgentId = safeAgentEnvId(agentId);
+    if (safeAgentId) env.ORKAS_AGENT_ID = safeAgentId;
     try {
       // Lazy require keeps module-load order safe (client.ts loads before
       // some features in boot paths) and avoids a static feature import in
@@ -535,7 +546,7 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
       stats.toolEnds += 1;
       const c = toolCounter(stats, e.name);
       c.ends += 1;
-      if (e.isError) {
+      if (e.isError && e.errorSeverity !== 'recoverable') {
         stats.toolErrors += 1;
         c.errors += 1;
       }
@@ -544,7 +555,7 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
         stats,
         'tool_end',
         nowMs,
-        `tool=${safeToolNameForLog(e.name)} call=${maskId(e.id)} error=${e.isError ? 'true' : 'false'}`,
+        `tool=${safeToolNameForLog(e.name)} call=${maskId(e.id)} error=${e.isError ? 'true' : 'false'}${e.errorSeverity ? ` severity=${e.errorSeverity}` : ''}`,
       );
       break;
     }
@@ -694,6 +705,93 @@ export function summarizeModelRunForLog(stats: ModelRunLogDiagnostics, nowMs = D
   };
 }
 
+function providerCategoryForTelemetry(providerId?: string): string {
+  const text = String(providerId || '').toLowerCase();
+  if (!text) return 'unknown';
+  const patterns: Array<[string, RegExp]> = [
+    ['openai', /\b(openai|chatgpt|gpt)\b/],
+    ['anthropic', /\b(anthropic|claude)\b/],
+    ['google', /\b(google|gemini|vertex)\b/],
+    ['xai', /\b(xai|grok)\b/],
+    ['deepseek', /\bdeepseek\b/],
+    ['qwen', /\b(qwen|dashscope|aliyun)\b/],
+    ['doubao', /\b(doubao|volc|bytedance)\b/],
+    ['moonshot', /\b(moonshot|kimi)\b/],
+    ['zhipu', /\b(zhipu|glm)\b/],
+    ['minimax', /\bminimax\b/],
+    ['mistral', /\bmistral\b/],
+    ['openrouter', /\bopenrouter\b/],
+    ['azure', /\bazure\b/],
+    ['bedrock', /\bbedrock\b/],
+    ['ollama', /\bollama\b/],
+    ['lmstudio', /\b(lmstudio|lm-studio)\b/],
+    ['siliconflow', /\bsiliconflow\b/],
+  ];
+  for (const [category, pattern] of patterns) {
+    if (pattern.test(text)) return category;
+  }
+  return 'custom';
+}
+
+function modelFamilyForTelemetry(modelId?: string, providerId?: string): string {
+  const text = `${String(providerId || '')} ${String(modelId || '')}`.toLowerCase();
+  if (!String(modelId || '').trim() && !String(providerId || '').trim()) return 'unknown';
+  const patterns: Array<[string, RegExp]> = [
+    ['gpt', /\b(gpt|o[1-9]|chatgpt)\b/],
+    ['claude', /\bclaude\b/],
+    ['gemini', /\bgemini\b/],
+    ['grok', /\bgrok\b/],
+    ['deepseek', /\bdeepseek\b/],
+    ['qwen', /\bqwen\b/],
+    ['doubao', /\bdoubao\b/],
+    ['kimi', /\b(kimi|moonshot)\b/],
+    ['glm', /\b(glm|zhipu)\b/],
+    ['minimax', /\bminimax\b/],
+    ['mistral', /\bmistral\b/],
+    ['llama', /\b(llama|llm)\b/],
+  ];
+  for (const [family, pattern] of patterns) {
+    if (pattern.test(text)) return family;
+  }
+  return 'other';
+}
+
+function toolCountBucketForTelemetry(count: number): string {
+  const n = Math.max(0, Math.floor(Number.isFinite(count) ? count : 0));
+  if (n === 0) return '0';
+  if (n <= 5) return '1-5';
+  if (n <= 20) return '6-20';
+  if (n <= 50) return '21-50';
+  return '51+';
+}
+
+function agentRunResultEventForTelemetry(input: {
+  status: 'completed' | 'aborted' | 'idle_timeout' | 'error' | 'empty';
+  durationMs: number;
+  providerId?: string;
+  modelId?: string;
+  toolCount: number;
+  nested: boolean;
+}): StreamEvent {
+  const result = input.status === 'completed'
+    ? 'success'
+    : (input.status === 'aborted' ? 'aborted' : 'failure');
+  const errorCode = input.status === 'completed'
+    ? ''
+    : (input.status === 'empty' ? 'empty_response' : input.status);
+  const data: Record<string, unknown> = {
+    result,
+    provider: providerCategoryForTelemetry(input.providerId),
+    model: modelFamilyForTelemetry(input.modelId, input.providerId),
+    duration_ms: Math.max(0, Math.round(input.durationMs)),
+    run_kind: input.nested ? 'nested' : 'top_level',
+    has_tools: input.toolCount > 0,
+    tool_count_bucket: toolCountBucketForTelemetry(input.toolCount),
+  };
+  if (errorCode) data.error_code = errorCode;
+  return { type: 'event', event: { stream: 'agent_run_result', data } };
+}
+
 export function modelTurnContextForLog(input: {
   userId?: string;
   sessionId?: string;
@@ -705,6 +803,7 @@ export function modelTurnContextForLog(input: {
   systemPrompt?: string;
   images?: readonly unknown[];
   attachmentMetadata?: { hasAttachments?: boolean; attachmentTypes?: readonly string[] };
+  historyResources?: readonly unknown[];
   idleTimeout?: number;
   streamIdleTimeout?: number;
   maxToolLoops?: number;
@@ -751,6 +850,7 @@ export function modelTurnContextForLog(input: {
     image_count: Array.isArray(input.images) ? input.images.length : 0,
     has_attachments: input.attachmentMetadata?.hasAttachments,
     attachment_types: input.attachmentMetadata?.attachmentTypes ? [...input.attachmentMetadata.attachmentTypes].slice(0, 20) : undefined,
+    history_resource_count: Array.isArray(input.historyResources) ? input.historyResources.length : 0,
     has_working_dir: !!input.workingDir,
     working_dir: input.workingDir ? logPathRef(input.workingDir) : undefined,
     idle_timeout_sec: input.idleTimeout,
@@ -782,6 +882,7 @@ export function modelTurnContextForLog(input: {
  * client so existing consumers don't care which backend is live.
  */
 export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<StreamEvent, void, unknown> {
+  const runStartedAt = Date.now();
   const {
     userId, message,
     sessionId = `anon-${genConversationId().slice(0, 8)}`,
@@ -790,6 +891,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     workingDir,
     images,
     attachmentMetadata,
+    historyResources,
     idleTimeout = 1800,
     streamIdleTimeout = 180,
     maxToolLoops,
@@ -828,6 +930,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     systemPrompt,
     images,
     attachmentMetadata,
+    historyResources,
     idleTimeout,
     streamIdleTimeout,
     maxToolLoops,
@@ -975,6 +1078,9 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   let finalText = '';
   let errText: string | null = null;
   let abortedFlag = false;
+  let activeProviderId = '';
+  let activeModelId = '';
+  let activeToolCount = 0;
 
   try {
 
@@ -1027,6 +1133,9 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       },
     });
     const { runner, providerId, modelId, resolvedSystemPrompt, profileId, entryId, toolDefs, skillDisplayNameById, agentDisplayNameById } = built;
+    activeProviderId = providerId || '';
+    activeModelId = modelId || '';
+    activeToolCount = toolDefs.length;
     turnLogContext = modelTurnContextForLog({
       userId,
       sessionId,
@@ -1038,6 +1147,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       systemPrompt,
       images,
       attachmentMetadata,
+      historyResources,
       idleTimeout,
       streamIdleTimeout,
       maxToolLoops,
@@ -1094,11 +1204,12 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
             attachmentTypes: [...(attachmentMetadata.attachmentTypes || [])],
           },
         } : {}),
+        ...(historyResources && historyResources.length ? { historyResourceCount: historyResources.length } : {}),
         ...(abortSignal ? { hasAbortSignal: true } : {}),
       },
     });
 
-    const sandboxEnv = buildSkillSandboxEnv(userId);
+    const sandboxEnv = buildSkillSandboxEnv(userId, agentId);
 
     log.info('model turn run start', turnLogContext);
     const rawEvents = runner.runStream({
@@ -1107,6 +1218,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       sandboxEnv,
       ...(workingDir ? { workingDir } : {}),
       ...(images && images.length ? { images } : {}),
+      ...(historyResources && historyResources.length ? { historyResources } : {}),
       ...(attachmentMetadata ? { requestMetadata: { attachmentMetadata } } : {}),
       ...(cacheRetention ? { cacheRetention } : {}),
       ...(thinkingLevel ? { thinkingLevel } : {}),
@@ -1247,6 +1359,14 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     const terminalStatus = abortedFlag
       ? 'aborted'
       : (errText ? (idleHit ? 'idle_timeout' : 'error') : (finalText ? 'completed' : 'empty'));
+    yield agentRunResultEventForTelemetry({
+      status: terminalStatus,
+      durationMs: Date.now() - runStartedAt,
+      providerId: diagnostics.provider || activeProviderId,
+      modelId: diagnostics.model || activeModelId,
+      toolCount: activeToolCount,
+      nested,
+    });
     log.info('model turn finish', {
       ...turnLogContext,
       status: terminalStatus,

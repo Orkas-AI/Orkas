@@ -76,9 +76,10 @@ function _findActiveChatContainer() {
     const el = document.getElementById(id);
     if (el && el.offsetParent !== null) return el;
   }
-  // Fallback: nothing visible — return chat-history anyway so the card
-  // exists in DOM (under a hidden parent it's still a DOM record); main
-  // will time out in 60 s and return denied if the user never finds it.
+  // Fallback: nothing visible — return chat-history anyway so the request
+  // has a DOM record for diagnostics. We deliberately do NOT ack visibility
+  // for hidden cards; main will fail closed and tell the model no card was
+  // shown, so the user is not asked to click something invisible.
   return document.getElementById('chat-history');
 }
 
@@ -211,6 +212,18 @@ function _addDeleteConfirmEntry(batch, payload) {
   batch.card.dataset.deleteConfirmCount = String(batch.entries.length);
   _renderDeleteConfirmBatch(batch);
   _scrollDeleteConfirmIntoView(batch.card);
+  _ackDeleteConfirmVisible(batch.card, confirmId);
+}
+
+function _ackDeleteConfirmVisible(card, confirmId) {
+  if (!confirmId || !card || card.offsetParent === null) return;
+  if (!window.orkas || typeof window.orkas.invoke !== 'function') return;
+  try {
+    window.orkas.invoke('delete_file.visible', { confirm_id: confirmId })
+      .catch((err) => _deleteFileLog.warn('visible ack failed: ' + ((err && err.message) || String(err))));
+  } catch (err) {
+    _deleteFileLog.warn('visible ack failed: ' + ((err && err.message) || String(err)));
+  }
 }
 
 function _refreshDeleteConfirmFallbackWindow(batch) {

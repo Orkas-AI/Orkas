@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+from html import unescape
 import http.client
 import json
 import os
@@ -40,6 +41,10 @@ MAX_REDIRECTS = 5
 MAX_BODY_BYTES = 5 * 1024 * 1024  # 5 MB cap; SEO pages are small, guard runaways.
 
 _WORD_RE = re.compile(r"\b[\w'-]+\b", re.UNICODE)
+_RAW_ANCHOR_HREF_RE = re.compile(
+    r"<a\b[^>]*\bhref\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'=<>`]+))",
+    re.IGNORECASE,
+)
 _SKIP_TEXT_TAGS = {"script", "style", "noscript", "template", "head", "svg"}
 _HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 
@@ -305,6 +310,11 @@ def _meta_get(metas, *, name=None, prop=None, http_equiv=None):
     return None
 
 
+def _raw_anchor_hrefs(html: str) -> list[str]:
+    """Best-effort href fallback for badly nested HTML that traps tags in text."""
+    return [unescape(next(v for v in m.groups() if v is not None)) for m in _RAW_ANCHOR_HREF_RE.finditer(html or "")]
+
+
 def extract_fields(html: str, page_url: str, *, status: int = 200,
                    response_time_ms: int = 0, redirect_chain=None,
                    headers=None, fetched_at: str = "") -> dict:
@@ -332,7 +342,8 @@ def extract_fields(html: str, page_url: str, *, status: int = 200,
 
     # links split by origin
     internal, external = [], []
-    for href in p.anchors:
+    anchors = p.anchors or _raw_anchor_hrefs(html or "")
+    for href in anchors:
         href = href.strip()
         if not href or href.startswith(("#", "mailto:", "tel:", "javascript:", "data:")):
             continue

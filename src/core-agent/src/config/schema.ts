@@ -64,7 +64,7 @@ export const AgentConfigSchema = z.object({
   /** Max retry attempts on transient errors. */
   maxRetries: z.number().int().min(0).default(3),
   /** Maximum number of tool-use loop iterations per run. */
-  maxToolLoops: z.number().int().positive().default(50),
+  maxToolLoops: z.number().int().positive().default(100),
   /** Max time a tool may run without completing or reporting substantive progress. */
   toolIdleTimeoutMs: z.number().int().positive().default(1_800_000),
   /** System prompt override or additions. */
