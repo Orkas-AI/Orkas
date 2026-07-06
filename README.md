@@ -6,8 +6,8 @@ Orkas is an open-source, local-first desktop app: a capable **commander agent** 
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![Stars](https://img.shields.io/github/stars/Orkas-AI/Orkas?style=social)](https://github.com/Orkas-AI/Orkas/stargazers)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-blue)](https://orkas.ai)
-[![Download](https://img.shields.io/badge/download-orkas.ai-black)](https://orkas.ai)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-blue)](https://orkas.ai?source=github)
+[![Download](https://img.shields.io/badge/download-orkas.ai-black)](https://orkas.ai?source=github)
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.gg/K8Eyvu7rD)
 [![X: @leochenpm](https://img.shields.io/badge/X-%40leochenpm-black?logo=x)](https://x.com/leochenpm)
 
@@ -39,13 +39,13 @@ Orkas is an open-source, local-first desktop app: a capable **commander agent** 
 - **Chat with your documents & run local data analysis** — drop files in, keep the data on your machine.
 - **Go beyond code — video, slides, and more** — the commander drives open-source tools like HyperFrames and hands off to CLI coding agents (Claude Code, Codex, OpenCode, Cline) and other local agents, so one chat produces code, research, video, and slide decks.
 
-**Explore use cases →** [research workflows](https://orkas.ai/use/researchers) · [data analysis](https://orkas.ai/use/data-analysis) · [chat with documents](https://orkas.ai/use/chat-with-documents) · [for developers](https://orkas.ai/use/developers) · [automate your workspace](https://orkas.ai/use/automate-workspace)
+**Explore use cases →** [research workflows](https://orkas.ai/use/researchers?source=github) · [data analysis](https://orkas.ai/use/data-analysis?source=github) · [chat with documents](https://orkas.ai/use/chat-with-documents?source=github) · [for developers](https://orkas.ai/use/developers?source=github) · [automate your workspace](https://orkas.ai/use/automate-workspace?source=github)
 
 ---
 
 ## Download
 
-- **Get the app** → [orkas.ai](https://orkas.ai) (macOS · Windows installers)
+- **Get the app** → [orkas.ai](https://orkas.ai?source=github) (macOS · Windows installers)
 - **Run from source** → see [Quick start](#quick-start) below
 
 ---
@@ -64,7 +64,7 @@ Orkas is an open-source, local-first desktop app: a capable **commander agent** 
 
 **Not for you if** you just want a single all-purpose chatbot, a fully hosted/cloud team where your data lives on a vendor's servers, or a pure code library to embed in your own app.
 
-**Full side-by-side comparisons →** [vs Claude Code](https://orkas.ai/compare/orkas-vs-claude-code) · [vs Cline](https://orkas.ai/compare/orkas-vs-cline) · [vs LangChain](https://orkas.ai/compare/orkas-vs-langchain) · [vs ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt) · [vs OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw)
+**Full side-by-side comparisons →** [vs Claude Code](https://orkas.ai/compare/orkas-vs-claude-code?source=github) · [vs Cline](https://orkas.ai/compare/orkas-vs-cline?source=github) · [vs LangChain](https://orkas.ai/compare/orkas-vs-langchain?source=github) · [vs ChatGPT](https://orkas.ai/compare/orkas-vs-chatgpt?source=github) · [vs OpenClaw](https://orkas.ai/compare/orkas-vs-openclaw?source=github)
 
 ---
 
@@ -86,7 +86,7 @@ The app is fully offline-capable — only the model calls need network. Point ag
 Yes. Beyond its own commander and sub-agents, Orkas can drive external CLI coding agents — Claude Code, Codex, OpenCode, Cline — as local subprocesses, and onboard open-source projects like HyperFrames, all directed from the same chat.
 
 **How is Orkas different from Claude Desktop / CrewAI / LangChain?**
-Claude Desktop is a single assistant; CrewAI and LangChain are code-first frameworks. Orkas is a no-code desktop app that commands a *team* of agents, keeps data and keys local, and gives each agent its own private skills and memory. See the [full comparisons](https://orkas.ai/compare/orkas-vs-langchain).
+Claude Desktop is a single assistant; CrewAI and LangChain are code-first frameworks. Orkas is a no-code desktop app that commands a *team* of agents, keeps data and keys local, and gives each agent its own private skills and memory. See the [full comparisons](https://orkas.ai/compare/orkas-vs-langchain?source=github).
 
 **Is Orkas free and open source?**
 Yes — MIT licensed. Bring your own model keys; you only ever pay your model providers.
@@ -97,9 +97,9 @@ Yes — MIT licensed. Bring your own model keys; you only ever pay your model pr
 
 Prefer the packaged app? Use the production installer links:
 
-- **macOS Apple Silicon** -> [Orkas-mac-arm64.dmg](https://orkas-sg-1367889399.cos.ap-singapore.myqcloud.com/public/products/mac/latest/Orkas-mac-arm64.dmg)
-- **macOS Intel** -> [Orkas-mac-x64.dmg](https://orkas-sg-1367889399.cos.ap-singapore.myqcloud.com/public/products/mac/latest/Orkas-mac-x64.dmg)
-- **Windows x64** -> [Orkas-Setup.exe](https://orkas-sg-1367889399.cos.ap-singapore.myqcloud.com/public/products/win/latest/Orkas-Setup.exe)
+- **macOS Apple Silicon** -> [Orkas-mac-arm64.dmg](https://orkas.ai/download/?source=github&os=mac&arch=arm64&download=1)
+- **macOS Intel** -> [Orkas-mac-x64.dmg](https://orkas.ai/download/?source=github&os=mac&arch=x64&download=1)
+- **Windows x64** -> [Orkas-Setup.exe](https://orkas.ai/download/?source=github&os=win&download=1)
 
 To run from source:
 
