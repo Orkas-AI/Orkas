@@ -1,4 +1,4 @@
-import type { MessageContent } from "../shared/types.js";
+import type { MessageContent, Usage } from "../shared/types.js";
 import {
   AuthError,
   ContextOverflowError,
@@ -99,6 +99,17 @@ function textFromContent(content: MessageContent[]): string {
     .filter((c) => c.type === "text")
     .map((c) => (c as { text: string }).text)
     .join("");
+}
+
+function usageForLog(usage?: Partial<Usage>): Record<string, number> | undefined {
+  if (!usage) return undefined;
+  return {
+    inputTokens: usage.inputTokens ?? 0,
+    outputTokens: usage.outputTokens ?? 0,
+    cacheReadTokens: usage.cacheReadTokens ?? 0,
+    cacheWriteTokens: usage.cacheWriteTokens ?? 0,
+    totalTokens: usage.totalTokens ?? 0,
+  };
 }
 
 function toolPreview(content: string, max = 220): string {
@@ -972,20 +983,42 @@ export class AgentRunner {
           // genuine overflow is still caught by ContextOverflowError below).
           const keptTailTokens = Math.min(this.session.estimateKeptTailTokens(), tokensBefore);
           const wouldFree = tokensBefore - keptTailTokens;
+          const compactionLog = {
+            phase: "context_window",
+            sessionId: this.session.getSessionId(),
+            model: contextModelId,
+            tokensBefore,
+            contextWindow,
+            keptTailTokens,
+            wouldFree,
+          };
           if (wouldFree > contextWindow * MIN_COMPACTION_SAVINGS_RATIO) {
-            log.info(`Context nearing limit (${tokensBefore}/${contextWindow}), compacting...`);
-            const compactResult = await this.compactSession(provider, modelId, systemPrompt, params.cacheRetention);
+            log.info("context compaction start", compactionLog);
+            let compactResult: { summary: string; usage?: Usage };
+            try {
+              compactResult = await this.compactSession(provider, modelId, systemPrompt, params.cacheRetention);
+            } catch (err) {
+              log.error("context compaction failed", { ...compactionLog, error: formatError(err) });
+              throw err;
+            }
             if (compactResult.usage) lastUsage = mergeUsage(lastUsage, compactResult.usage);
+            const tokensAfter = this.session.estimateModelTokens();
+            log.info("context compaction done", {
+              ...compactionLog,
+              tokensAfter,
+              usage: usageForLog(compactResult.usage),
+              summaryChars: compactResult.summary.length,
+            });
             compactionCount++;
             yield {
               type: "compaction",
               tokensBefore,
-              tokensAfter: this.session.estimateModelTokens(),
+              tokensAfter,
               summary: compactResult.summary || undefined,
               usage: compactResult.usage,
             };
           } else {
-            log.warn(`Context over threshold (${tokensBefore}/${contextWindow}) but the kept tail (${keptTailTokens}) dominates; skipping no-progress compaction`);
+            log.warn("context compaction skipped", { ...compactionLog, reason: "kept_tail_dominates" });
           }
         }
 
@@ -1041,20 +1074,51 @@ export class AgentRunner {
 
         if (err instanceof ContextOverflowError) {
           // Try compaction
+          let overflowLog: {
+            phase: string;
+            sessionId: string | undefined;
+            model: string;
+            tokensBefore: number;
+            overflowError: string;
+          } | undefined;
           try {
             const tokensBefore = this.session.estimateModelTokens();
+            overflowLog = {
+              phase: "context_overflow",
+              sessionId: this.session.getSessionId(),
+              model: modelId,
+              tokensBefore,
+              overflowError: formatError(err),
+            };
+            log.info("context compaction start", overflowLog);
             const overflowResult = await this.compactSession(provider, modelId, systemPrompt, params.cacheRetention);
             if (overflowResult.usage) lastUsage = mergeUsage(lastUsage, overflowResult.usage);
+            const tokensAfter = this.session.estimateModelTokens();
+            log.info("context compaction done", {
+              ...overflowLog,
+              tokensAfter,
+              usage: usageForLog(overflowResult.usage),
+              summaryChars: overflowResult.summary.length,
+            });
             compactionCount++;
             yield {
               type: "compaction",
               tokensBefore,
-              tokensAfter: this.session.estimateModelTokens(),
+              tokensAfter,
               summary: overflowResult.summary || undefined,
               usage: overflowResult.usage,
             };
             continue;
-          } catch {
+          } catch (compactErr) {
+            log.error("context compaction failed", {
+              ...(overflowLog || {
+                phase: "context_overflow",
+                sessionId: this.session.getSessionId(),
+                model: modelId,
+                overflowError: formatError(err),
+              }),
+              error: formatError(compactErr),
+            });
             const e = this.errorResult(startTime, modelId, provider.id, {
               kind: "context_overflow",
               message: err.message,
@@ -1157,6 +1221,15 @@ export class AgentRunner {
   ): AsyncIterable<AgentRunEvent> {
     const historyCandidate = this.session.getPendingHistoryArchive();
     if (historyCandidate) {
+      const historyLog = {
+        phase: "history_summary",
+        sessionId: this.session.getSessionId(),
+        turns: historyCandidate.turnIds.length,
+        rawTokens: historyCandidate.rawTokens,
+        summaryTokens: historyCandidate.summaryTokens,
+        tokensBefore: historyCandidate.rawTokens + historyCandidate.summaryTokens,
+      };
+      log.info("context compaction start", historyLog);
       yield {
         type: "context_status",
         phase: "history_summary_start",
@@ -1196,6 +1269,13 @@ export class AgentRunner {
         });
         if (summary.usage) onUsage?.(summary.usage);
         this.session.applyHistorySummary(summary.text, historyCandidate.turnIds);
+        const tokensAfter = this.session.estimateModelTokens();
+        log.info("context compaction done", {
+          ...historyLog,
+          tokensAfter,
+          usage: usageForLog(summary.usage),
+          summaryChars: summary.text.length,
+        });
         yield {
           type: "context_status",
           phase: "history_summary_done",
@@ -1208,17 +1288,26 @@ export class AgentRunner {
         yield {
           type: "compaction",
           tokensBefore: historyCandidate.rawTokens + historyCandidate.summaryTokens,
-          tokensAfter: this.session.estimateModelTokens(),
+          tokensAfter,
           summary: summary.text,
           usage: summary.usage,
         };
       } catch (err) {
-        log.warn(`history summary failed: ${formatError(err)}`);
+        log.warn("context compaction failed", { ...historyLog, error: formatError(err) });
       }
     }
 
     const activeCandidate = this.session.getPendingActiveCheckpoint();
     if (activeCandidate) {
+      const activeLog = {
+        phase: "active_checkpoint",
+        sessionId: this.session.getSessionId(),
+        groups: activeCandidate.groups.length,
+        tokensBefore: activeCandidate.tokensBefore,
+        estimatedTokensAfter: activeCandidate.estimatedTokensAfter,
+        checkpointThroughMessageIndex: activeCandidate.checkpointThroughMessageIndex,
+      };
+      log.info("context compaction start", activeLog);
       yield {
         type: "context_status",
         phase: "active_process_compaction_start",
@@ -1260,6 +1349,13 @@ export class AgentRunner {
         });
         if (summary.usage) onUsage?.(summary.usage);
         this.session.applyActiveCheckpointSummary(summary.text, activeCandidate.checkpointThroughMessageIndex);
+        const tokensAfter = this.session.estimateModelTokens();
+        log.info("context compaction done", {
+          ...activeLog,
+          tokensAfter,
+          usage: usageForLog(summary.usage),
+          summaryChars: summary.text.length,
+        });
         yield {
           type: "context_status",
           phase: "active_process_compaction_done",
@@ -1267,18 +1363,18 @@ export class AgentRunner {
           data: {
             groups: activeCandidate.groups.length,
             tokensBefore: activeCandidate.tokensBefore,
-            tokensAfter: this.session.estimateModelTokens(),
+            tokensAfter,
           },
         };
         yield {
           type: "compaction",
           tokensBefore: activeCandidate.tokensBefore,
-          tokensAfter: this.session.estimateModelTokens(),
+          tokensAfter,
           summary: summary.text,
           usage: summary.usage,
         };
       } catch (err) {
-        log.warn(`active checkpoint failed: ${formatError(err)}`);
+        log.warn("context compaction failed", { ...activeLog, error: formatError(err) });
       }
     }
   }

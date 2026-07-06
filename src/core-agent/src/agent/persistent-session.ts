@@ -6,7 +6,10 @@ import type {
   ToolResultContent,
   ToolUseContent,
 } from "../shared/types.js";
+import { createLogger } from "../shared/logger.js";
 import { Session, type HistoryResource, type SerializedSessionContextState } from "./session.js";
+
+const log = createLogger("persistent-session");
 
 /** Synthetic content written when a prior run aborted after the model
  * issued a tool_use but before the tool produced a tool_result. Both
@@ -428,7 +431,13 @@ export class PersistentSession extends Session {
     try {
       const raw = JSON.parse(fs.readFileSync(this.contextFile, "utf-8")) as SerializedSessionContextState;
       const repaired = this.restoreContextState(raw);
-      if (repaired) this.writeContextToDisk();
+      if (repaired) {
+        log.warn("context sidecar repaired", {
+          sessionId: this.getSessionId(),
+          contextFile: this.contextFile,
+        });
+        this.writeContextToDisk();
+      }
     } catch (err) {
       console.warn(`[persistent-session] failed to read context ${this.contextFile}: ${(err as Error).message}`);
       this.restoreContextState(null);
