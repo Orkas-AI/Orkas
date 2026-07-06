@@ -104,6 +104,27 @@ describe('local_agents/registry', () => {
     expect(r.available).toBe(true);
   });
 
+  it('uses the npm Codex package version when the wrapper has no --version output', async () => {
+    if (isWindows) return;
+    const pkgRoot = path.join(tmpDir, 'node_modules', '@openai', 'codex');
+    const binDir = path.join(pkgRoot, 'bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(path.join(pkgRoot, 'package.json'), JSON.stringify({
+      name: '@openai/codex',
+      version: '0.130.0',
+    }));
+    const fake = path.join(binDir, 'codex.js');
+    fs.writeFileSync(fake, '#!/bin/sh\necho ""\n');
+    fs.chmodSync(fake, 0o755);
+    process.env.PATH = '';
+    process.env.ORKAS_CODEX_PATH = fake;
+
+    const r = await detectOne('codex');
+    expect(r.path).toBe(fake);
+    expect(r.version).toBe('0.130.0');
+    expect(r.available).toBe(true);
+  });
+
   it('marks version_too_old when below minimum', async () => {
     if (isWindows) return;
     const fake = path.join(tmpDir, 'old-claude');

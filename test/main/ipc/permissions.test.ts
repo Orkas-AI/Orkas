@@ -31,6 +31,15 @@ beforeEach(async () => {
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   invokeHandler = null;
   vi.resetModules();
+  vi.doMock('../../../src/main/ipc/local_agents', () => ({
+    invokeHandlers: {
+      'localAgents.list': async () => ({
+        entries: [
+          { type: 'claude', path: '/usr/local/bin/claude', version: '2.1.148', available: true },
+        ],
+      }),
+    },
+  }));
 
   const users = await import('../../../src/main/features/users');
   users.activateUser(TEST_UID);
@@ -105,5 +114,15 @@ describe('ipc › permissions.* routes', () => {
     const res = await call('permissions.doesNotExist');
     expect(res.ok).toBe(false);
     expect(res.error).toMatch(/unknown channel/);
+  });
+});
+
+describe('ipc › localAgents.* routes', () => {
+  it('registers localAgents.list for the external CLI picker', async () => {
+    const res = await call('localAgents.list');
+    expect(res.ok).toBe(true);
+    expect(res.entries).toEqual([
+      { type: 'claude', path: '/usr/local/bin/claude', version: '2.1.148', available: true },
+    ]);
   });
 });

@@ -2448,6 +2448,10 @@ const invokeHandlers: Record<string, InvokeHandler> = {
 
   // Multi-device sync. Stripped from the open-source build (depends on account).
 
+  // Local coding CLI agents (Claude Code, Codex, etc.). Kept in the open-source
+  // build; the renderer's External Agent picker depends on localAgents.list.
+  ...localAgentsHandlers,
+
   // Quality validator — renderer reads persisted ValidationReports to display
   // why a spec write / marketplace install was rejected.
   ...qualityHandlers,

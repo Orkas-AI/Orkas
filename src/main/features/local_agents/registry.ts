@@ -18,7 +18,8 @@
 
 import { createLogger } from '../../logger.js';
 import { whichBin } from './which.js';
-import { checkMinVersion, detectVersion } from './version.js';
+import { checkMinVersion, detectVersion, parseSemver } from './version.js';
+import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -68,6 +69,29 @@ function defaultSearchDirs(type: LocalCliType): string[] {
     dirs.push('/Applications/Codex.app/Contents/Resources');
   }
   return dirs;
+}
+
+async function detectCodexPackageVersion(binPath: string): Promise<string | null> {
+  let dir: string;
+  try { dir = path.dirname(await fs.realpath(binPath)); }
+  catch { dir = path.dirname(binPath); }
+
+  for (let i = 0; i < 6; i += 1) {
+    const pkgPath = path.join(dir, 'package.json');
+    try {
+      const pkg = JSON.parse(await fs.readFile(pkgPath, 'utf8'));
+      if (pkg?.name === '@openai/codex' && typeof pkg.version === 'string') {
+        const sv = parseSemver(pkg.version);
+        if (sv) return `${sv.major}.${sv.minor}.${sv.patch}`;
+      }
+    } catch {
+      // Keep walking toward the npm package root.
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
 }
 
 /** Detection result for a single CLI. */
@@ -128,7 +152,12 @@ export async function detectOne(type: LocalCliType): Promise<LocalCliEntry> {
         : `${BIN_NAMES[type]} not found on PATH or standard CLI install locations`,
     };
   }
-  const version = await detectVersion(resolved);
+  // The npm @openai/codex wrapper can hang on `--version` in GUI-launched
+  // environments. Prefer its package.json version when available; fall back to
+  // the normal subprocess probe for standalone/non-npm installs.
+  const version = type === 'codex'
+    ? (await detectCodexPackageVersion(resolved)) || await detectVersion(resolved)
+    : await detectVersion(resolved);
   if (!version) {
     return {
       type, path: resolved, version: null, available: false,
