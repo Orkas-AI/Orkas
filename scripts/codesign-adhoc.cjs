@@ -1,12 +1,13 @@
 /**
- * electron-builder afterPack hook —— 在 macOS 包最终生成前,对整个 .app
- * bundle 跑 ad-hoc codesign。**Why**:没有 Apple Developer ID 时,
- * electron-builder 会跳过签名,产出的 .app 从 dmg 拷出来后被 macOS
- * Gatekeeper(13+)直接判"已损坏",连"无法验证开发者"对话框都跳过。
- * Ad-hoc 签名让 bundle 至少有一个完整的签名结构,Gatekeeper 退化成
- * "未验证开发者",用户右键 → 打开一次就放行。
+ * electron-builder afterPack hook.
  *
- * 依赖清理对 macOS / Windows 都生效;签名补救仅 darwin 平台生效。
+ * Native dependency pruning and validation run for macOS and Windows. The
+ * optional macOS ad-hoc codesign fallback is only a local distribution helper:
+ * without a Developer ID identity, unsigned .app bundles copied from a DMG can
+ * be reported as damaged by Gatekeeper. Ad-hoc signing gives the bundle a
+ * complete signature structure so users can still right-click and open it.
+ *
+ * Set ORKAS_SKIP_ADHOC_CODESIGN=1 for deliberately unsigned packages.
  */
 'use strict';
 
@@ -554,6 +555,10 @@ module.exports = async function afterPack(context) {
 
   if (targetPlatform !== 'darwin') return;
 
+  if (process.env.ORKAS_SKIP_ADHOC_CODESIGN === '1') {
+    console.log('[codesign-adhoc] disabled by ORKAS_SKIP_ADHOC_CODESIGN=1; leaving app unsigned');
+    return;
+  }
 
   if (process.env.ORKAS_FORCE_ADHOC_CODESIGN !== '1' && (process.env.CSC_LINK || process.env.CSC_NAME)) {
     console.log('[codesign-adhoc] formal signing env detected; skipping ad-hoc signing');
@@ -562,6 +567,6 @@ module.exports = async function afterPack(context) {
 
   console.log(`[codesign-adhoc] signing ${appPath}`);
   execSync(`codesign --force --deep --sign - "${appPath}"`, { stdio: 'inherit' });
-  // 校验签名(失败时直接 throw 中断 build,避免发出未签的包)
+  // Fail the build if the fallback signature is invalid.
   execSync(`codesign --verify --deep "${appPath}"`, { stdio: 'inherit' });
 };

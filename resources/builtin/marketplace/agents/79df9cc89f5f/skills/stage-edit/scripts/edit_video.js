@@ -160,6 +160,21 @@ function normalizeAudioSegments(raw) {
   });
 }
 
+function normalizeEditFailure(opts, result) {
+  const message = String(result && result.message || '');
+  if (
+    opts.op === 'burnsubs'
+    && /No such filter:\s*'subtitles'|No such filter:\s*"subtitles"|not found.*subtitles|subtitles.*not found/i.test(message)
+  ) {
+    return {
+      ...result,
+      errorCode: 'E_EDIT_BURNSUBS_UNSUPPORTED',
+      message: 'burnsubs is unavailable because the active ffmpeg runtime does not provide the subtitles filter. Do not hand-write a ffmpeg fallback; report this runtime blocker or use a packaged runtime with subtitle filter support.',
+    };
+  }
+  return result;
+}
+
 module.exports = async function editVideoScript({ args }) {
   const opts = parseArgs(args || []);
   if (opts.help) return help();
@@ -220,7 +235,7 @@ module.exports = async function editVideoScript({ args }) {
 
   const { requestedOutputAbsPath, outputRenamed, ...editParams } = params;
   const { editVideo } = require('./lib/video_edit_core.cjs');
-  const result = await editVideo(editParams);
+  const result = normalizeEditFailure(opts, await editVideo(editParams));
   if (result.ok === false) fail(result.errorCode, result.message);
 
   const payload = { ok: true, op: opts.op, ...result };

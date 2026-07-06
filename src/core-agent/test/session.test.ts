@@ -192,6 +192,8 @@ describe("Session", () => {
 
     session.beginUserTurn([{ type: "text", text: "Fresh task" }]);
     const serialized = JSON.stringify(session.getMessagesForModel());
+    expect(serialized).toContain("Older completed conversation turns have been summarized and omitted");
+    expect(serialized).toContain("re-read the relevant path/range with tools");
     expect(serialized).toContain("Summary through turn 12");
     expect(serialized).not.toContain("User 0");
     expect(serialized).not.toContain("Answer 0");
@@ -217,6 +219,8 @@ describe("Session", () => {
 
     const view = session.getMessagesForModel();
     const serialized = JSON.stringify(view);
+    expect(serialized).toContain("Earlier tool calls/results in this same user turn have been summarized");
+    expect(serialized).toContain("re-read the relevant path/range with tools");
     expect(serialized).toContain("Older tool work summarized");
     expect(serialized).not.toContain("call-0");
     expect(serialized).not.toContain("result-0");

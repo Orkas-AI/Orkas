@@ -248,7 +248,12 @@ export class Session {
           role: "user",
           content: [{
             type: "text",
-            text: `[Current turn progress summary]\n${active.checkpointSummary}`,
+            text:
+              "[Current turn checkpoint]\n" +
+              "Earlier tool calls/results in this same user turn have been summarized and omitted from the current model context.\n" +
+              "Use this checkpoint as progress memory, not as exact file/log/tool-output content.\n" +
+              "If exact file contents, command output, logs, or code/HTML/JSON snippets are needed before acting, re-read the relevant path/range with tools.\n\n" +
+              active.checkpointSummary,
           }],
         });
       }
@@ -466,12 +471,12 @@ export class Session {
     };
   }
 
-  restoreContextState(raw: SerializedSessionContextState | null | undefined): void {
+  restoreContextState(raw: SerializedSessionContextState | null | undefined): boolean {
     if (!raw || raw.version !== 1) {
       this.turnState = null;
-      return;
+      return false;
     }
-    this.turnState = {
+    const restored: TurnTrackingState = {
       version: 1,
       nextTurnId: Number.isFinite(raw.nextTurnId) && raw.nextTurnId > 0 ? raw.nextTurnId : 1,
       historySummary: raw.historySummary || "",
@@ -489,6 +494,20 @@ export class Session {
         ? raw.resources.filter((r) => typeof r.path === "string" && r.path).map((r) => ({ ...r }))
         : [],
     };
+    this.turnState = restored;
+    if (this.isTurnStateValid(restored)) return false;
+
+    this.turnState = this.rebuildTurnStateFromMessages({
+      historySummary: restored.historySummary,
+      summaryVersion: restored.summaryVersion,
+      summaryThroughTurnId: restored.summaryThroughTurnId,
+      resources: restored.resources,
+      nextTurnId: restored.nextTurnId,
+      preferActiveTail: !!restored.activeTurn,
+      activeCheckpointSummary: restored.activeTurn?.checkpointSummary,
+      activeCheckpointThroughMessageIndex: restored.activeTurn?.checkpointThroughMessageIndex,
+    });
+    return true;
   }
 
   /**
@@ -531,19 +550,53 @@ export class Session {
 
   private ensureTurnTracking(): TurnTrackingState {
     if (this.turnState) return this.turnState;
+    this.turnState = this.rebuildTurnStateFromMessages();
+    return this.turnState;
+  }
+
+  private rebuildTurnStateFromMessages(preserve?: {
+    historySummary?: string;
+    summaryVersion?: number;
+    summaryThroughTurnId?: number;
+    resources?: HistoryResource[];
+    nextTurnId?: number;
+    preferActiveTail?: boolean;
+    activeCheckpointSummary?: string;
+    activeCheckpointThroughMessageIndex?: number;
+  }): TurnTrackingState {
     const state: TurnTrackingState = {
       version: 1,
       nextTurnId: 1,
-      historySummary: "",
-      summaryVersion: 0,
+      historySummary: preserve?.historySummary || "",
+      summaryVersion: preserve?.summaryVersion || 0,
+      summaryThroughTurnId: preserve?.summaryThroughTurnId,
       completedTurns: [],
-      resources: [],
+      resources: (preserve?.resources || []).map((r) => ({ ...r })),
     };
-
     let currentUserIndex: number | null = null;
     let nextId = 1;
     const finishCurrent = (endExclusive: number) => {
       if (currentUserIndex === null) return;
+      const isTail = endExclusive === this.messages.length;
+      if (isTail && preserve?.preferActiveTail) {
+        const active: ActiveTurnRecord = {
+          id: nextId++,
+          userMessageIndex: currentUserIndex,
+          startIndex: currentUserIndex,
+        };
+        if (
+          preserve.activeCheckpointSummary
+          && preserve.activeCheckpointThroughMessageIndex !== undefined
+          && preserve.activeCheckpointThroughMessageIndex >= currentUserIndex
+          && preserve.activeCheckpointThroughMessageIndex < this.messages.length
+        ) {
+          active.checkpointSummary = preserve.activeCheckpointSummary;
+          active.checkpointThroughMessageIndex = preserve.activeCheckpointThroughMessageIndex;
+        }
+        state.activeTurn = active;
+        currentUserIndex = null;
+        return;
+      }
       let finalAssistantMessageIndex: number | undefined;
       for (let i = endExclusive - 1; i > currentUserIndex; i--) {
         if (this.messages[i]?.role === "assistant") {
@@ -573,8 +626,90 @@ export class Session {
     }
     finishCurrent(this.messages.length);
     state.nextTurnId = nextId;
-    this.turnState = state;
+    if (state.summaryThroughTurnId !== undefined) {
+      for (const turn of state.completedTurns) {
+        if (turn.id <= state.summaryThroughTurnId) turn.archived = true;
+      }
+    }
+    state.nextTurnId = Math.max(
+      state.nextTurnId,
+      Number.isFinite(preserve?.nextTurnId) && (preserve?.nextTurnId ?? 0) > 0
+        ? preserve!.nextTurnId!
+        : 1,
+    );
     return state;
+  }
+
+  private isTurnStateValid(state: TurnTrackingState): boolean {
+    const seenIds = new Set<number>();
+    let maxId = 0;
+    for (const turn of state.completedTurns) {
+      if (!isPositiveInteger(turn.id) || seenIds.has(turn.id)) return false;
+      seenIds.add(turn.id);
+      maxId = Math.max(maxId, turn.id);
+      if (!this.isValidCompletedTurn(turn)) return false;
+    }
+    const sortedCompleted = [...state.completedTurns].sort((a, b) => a.startIndex - b.startIndex);
+    let lastEnd = -1;
+    for (const turn of sortedCompleted) {
+      if (turn.startIndex <= lastEnd) return false;
+      lastEnd = turn.endIndex;
+    }
+    if (state.activeTurn) {
+      const active = state.activeTurn;
+      if (!isPositiveInteger(active.id) || seenIds.has(active.id)) return false;
+      maxId = Math.max(maxId, active.id);
+      if (!this.isValidActiveTurn(active)) return false;
+      if (active.startIndex <= lastEnd) return false;
+    }
+    return Number.isFinite(state.nextTurnId) && state.nextTurnId > maxId;
+  }
+
+  private isValidCompletedTurn(turn: CompletedTurnRecord): boolean {
+    if (
+      !isNonNegativeInteger(turn.userMessageIndex)
+      || !isNonNegativeInteger(turn.startIndex)
+      || !isNonNegativeInteger(turn.endIndex)
+      || turn.startIndex !== turn.userMessageIndex
+      || turn.endIndex < turn.startIndex
+      || turn.endIndex >= this.messages.length
+      || !isUserTurnStarter(this.messages[turn.userMessageIndex])
+    ) {
+      return false;
+    }
+    if (turn.finalAssistantMessageIndex !== undefined) {
+      if (
+        !isNonNegativeInteger(turn.finalAssistantMessageIndex)
+        || turn.finalAssistantMessageIndex < turn.startIndex
+        || turn.finalAssistantMessageIndex > turn.endIndex
+        || this.messages[turn.finalAssistantMessageIndex]?.role !== "assistant"
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private isValidActiveTurn(active: ActiveTurnRecord): boolean {
+    if (
+      !isNonNegativeInteger(active.userMessageIndex)
+      || !isNonNegativeInteger(active.startIndex)
+      || active.startIndex !== active.userMessageIndex
+      || active.startIndex >= this.messages.length
+      || !isUserTurnStarter(this.messages[active.userMessageIndex])
+    ) {
+      return false;
+    }
+    if (active.checkpointThroughMessageIndex !== undefined) {
+      if (
+        !isNonNegativeInteger(active.checkpointThroughMessageIndex)
+        || active.checkpointThroughMessageIndex < active.userMessageIndex
+        || active.checkpointThroughMessageIndex >= this.messages.length
+      ) {
+        return false;
+      }
+    }
+    return true;
   }
 
   private historyContextText(): string {
@@ -582,7 +717,13 @@ export class Session {
     if (!state) return "";
     const parts: string[] = [];
     if (state.historySummary) {
-      parts.push(`[Previous conversation summary]\n${state.historySummary}`);
+      parts.push(
+        "[Previous conversation checkpoint]\n" +
+        "Older completed conversation turns have been summarized and omitted from the current model context.\n" +
+        "Use this checkpoint as durable state memory, not as exact file/log/tool-output content.\n" +
+        "If exact file contents, command output, logs, code/HTML/JSON snippets, or prior tool results are needed before acting, re-read the relevant path/range with tools.\n\n" +
+        state.historySummary,
+      );
     }
     const resources = this.historyResourcesText();
     if (resources) parts.push(resources);
@@ -814,6 +955,14 @@ function isToolResultOnlyMessage(msg: Message): boolean {
 
 function isImageOnlyMessage(msg: Message): boolean {
   return msg.role === "user" && msg.content.length > 0 && msg.content.every((c) => c.type === "image");
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return Number.isInteger(value) && (value as number) > 0;
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return Number.isInteger(value) && (value as number) >= 0;
 }
 
 function isUserTurnStarter(msg: Message): boolean {

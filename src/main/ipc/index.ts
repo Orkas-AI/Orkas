@@ -1037,6 +1037,39 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { name: res.name };
   },
 
+  'autoTasks.attachments.import': async (payload = {}, ctx) => {
+    const taskId = (payload as any)?.taskId;
+    const sourcePath = (payload as any)?.path;
+    if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
+    if (typeof sourcePath !== 'string' || !sourcePath) throw new Error('missing path');
+
+    const norm = path.resolve(sourcePath);
+    const allowedRoots = await _ipcFileSandboxAllowedRoots(ctx.userId, payload);
+    if (!isPathAllowed(norm, allowedRoots)) {
+      throw new Error('path is outside the user workspace');
+    }
+
+    let st: fs.Stats;
+    try { st = fs.statSync(norm); }
+    catch { throw new Error('file not found'); }
+    if (!st.isFile()) throw new Error('file not found');
+
+    const displayName = typeof (payload as any)?.name === 'string' && (payload as any).name.trim()
+      ? (payload as any).name.trim()
+      : path.basename(norm);
+    const ext = path.extname(displayName).replace(/^\./, '').toLowerCase();
+    if (!CHAT_PICK_EXTENSIONS.includes(ext)) throw new Error('unsupported_format');
+
+    const res = await autoTasks.uploadAttachment(
+      ctx.userId,
+      taskId,
+      path.basename(displayName),
+      fs.readFileSync(norm),
+    );
+    if (!res.ok) throw new Error((res as { error: string }).error);
+    return { name: res.name };
+  },
+
   'autoTasks.attachments.pickAndUpload': async ({ taskId } = {}, ctx) => {
     if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
     const picked = await _pickLocalFiles('Choose files', CHAT_PICK_EXTENSIONS, true);

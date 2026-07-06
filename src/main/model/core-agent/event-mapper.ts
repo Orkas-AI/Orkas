@@ -435,7 +435,15 @@ export async function* mapCoreAgentEvents(
         yield {
           type: 'progress',
           text: `compacted ${ev.tokensBefore}→${ev.tokensAfter} tokens`,
-          event: ev.summary ? { stream: 'compaction', data: { summary: ev.summary } } : undefined,
+          event: {
+            stream: 'compaction',
+            data: {
+              tokensBefore: ev.tokensBefore,
+              tokensAfter: ev.tokensAfter,
+              ...(ev.summary ? { summary: ev.summary } : {}),
+              ...(ev.usage ? { usage: ev.usage as unknown as Record<string, unknown> } : {}),
+            },
+          },
         };
         break;
 

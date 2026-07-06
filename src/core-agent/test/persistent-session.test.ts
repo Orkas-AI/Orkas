@@ -83,6 +83,63 @@ describe("PersistentSession", () => {
     expect(model).not.toContain("call-1");
   });
 
+  it("repairs restored turn context when indexes point at tool process rows", () => {
+    fs.writeFileSync(
+      file,
+      [
+        JSON.stringify({ role: "user", content: [{ type: "text", text: "First task" }] }),
+        JSON.stringify({ role: "assistant", content: [{ type: "tool_use", id: "call-old", name: "bash", input: { command: "echo hidden" } }] }),
+        JSON.stringify({ role: "user", content: [{ type: "tool_result", toolUseId: "call-old", content: "old hidden output", isError: false }] }),
+        JSON.stringify({ role: "assistant", content: [{ type: "text", text: "First final answer" }] }),
+        JSON.stringify({ role: "user", content: [{ type: "text", text: "Current task" }] }),
+        JSON.stringify({ role: "assistant", content: [{ type: "tool_use", id: "call-current", name: "bash", input: { command: "echo current" } }] }),
+        JSON.stringify({ role: "user", content: [{ type: "tool_result", toolUseId: "call-current", content: "current output", isError: false }] }),
+      ].join("\n") + "\n",
+      "utf-8",
+    );
+    fs.writeFileSync(
+      `${file}.context.json`,
+      JSON.stringify({
+        version: 1,
+        nextTurnId: 99,
+        historySummary: "older summary",
+        summaryVersion: 2,
+        completedTurns: [{
+          id: 1,
+          userMessageIndex: 1,
+          finalAssistantMessageIndex: 3,
+          startIndex: 1,
+          endIndex: 3,
+          archived: false,
+        }],
+        activeTurn: {
+          id: 2,
+          userMessageIndex: 5,
+          startIndex: 5,
+        },
+        resources: [{ kind: "final_output", path: "/tmp/resource.mov", name: "resource.mov" }],
+      }),
+      "utf-8",
+    );
+
+    const s = new PersistentSession({ sessionFile: file });
+    const model = JSON.stringify(s.getMessagesForModel());
+
+    expect(model).toContain("older summary");
+    expect(model).toContain("resource.mov");
+    expect(model).toContain("First task");
+    expect(model).toContain("First final answer");
+    expect(model).toContain("Current task");
+    expect(model).toContain("call-current");
+    expect(model).toContain("current output");
+    expect(model).not.toContain("call-old");
+    expect(model).not.toContain("old hidden output");
+
+    const repaired = JSON.parse(fs.readFileSync(`${file}.context.json`, "utf-8"));
+    expect(repaired.completedTurns[0].userMessageIndex).toBe(0);
+    expect(repaired.activeTurn.userMessageIndex).toBe(4);
+  });
+
   it("tolerates corrupt + schema-invalid lines and keeps the valid ones", () => {
     // Mix of failure modes that show up in the wild: a half-written line
     // (process killed mid-append), an unknown role (older schema /

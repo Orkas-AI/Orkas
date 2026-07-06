@@ -49,6 +49,51 @@ function _autoAttachmentPayload(files, source) {
   };
 }
 
+const AUTO_ATTACH_ACCEPT = (typeof CHAT_ATTACH_ACCEPT !== 'undefined' && Array.isArray(CHAT_ATTACH_ACCEPT))
+  ? CHAT_ATTACH_ACCEPT
+  : [
+      '.md', '.markdown', '.txt', '.csv', '.tsv', '.json', '.yaml', '.yml', '.log',
+      '.pdf', '.docx', '.docm', '.xlsx', '.xlsm', '.pptx', '.pptm',
+      '.png', '.jpg', '.jpeg', '.webp', '.gif',
+      '.mp4', '.webm', '.mov', '.m4v', '.ogv',
+      '.mp3', '.wav', '.ogg', '.opus', '.m4a', '.aac', '.flac',
+    ];
+
+function _autoAttachBaseName(p) {
+  const parts = String(p || '').split(/[\\/]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : String(p || '');
+}
+
+function _autoAttachExtOf(name) {
+  if (typeof _chatAttachExtOf === 'function') return _chatAttachExtOf(name);
+  const i = String(name || '').lastIndexOf('.');
+  return i >= 0 ? String(name || '').slice(i).toLowerCase() : '';
+}
+
+function _autoAttachKindFromExt(ext) {
+  if (typeof _chatAttachKindFromExt === 'function') return _chatAttachKindFromExt(ext);
+  if (['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext)) return 'image';
+  if (['.mp4', '.webm', '.mov', '.m4v', '.ogv'].includes(ext)) return 'video';
+  if (['.mp3', '.wav', '.ogg', '.opus', '.m4a', '.aac', '.flac'].includes(ext)) return 'audio';
+  if (ext === '.pdf') return 'pdf';
+  if (ext === '.docx' || ext === '.docm') return 'docx';
+  if (ext === '.xlsx' || ext === '.xlsm') return 'spreadsheet';
+  if (ext === '.pptx' || ext === '.pptm') return 'presentation';
+  return 'text';
+}
+
+function _autoAttachKindForName(name, fallback = '') {
+  return fallback || _autoAttachKindFromExt(_autoAttachExtOf(name));
+}
+
+function _autoAttachTempId() {
+  return `auto-att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function _autoAttachDisplayName(item) {
+  return (item && (item.displayName || item.name)) || '';
+}
+
 let _autoTasks = [];           // last fetched global list
 let _autoLoadedOnce = false;
 let _autoEventsHandle = null;
@@ -98,15 +143,12 @@ let _autoCurrentRecipient = { kind: 'commander' };
 // Skill / connector pinned to this draft. Mirrors the commander composer's
 // single-chip slot: setting one clears the other (matches the bus-side
 // invariant that a single message can't pin both). Either may be null/empty.
-let _autoCurrentSkill = null;       // { id, name } | null
-let _autoCurrentConnector = null;   // { id, name } | null
 // Pre-allocated id used for attachments uploaded BEFORE the task record
 // exists. On submit, `autoTasks.create` adopts this id so the
 // already-uploaded files live under the right per-task dir from the start.
 // Allocated lazily on first attach + on edit-mode entry (= task.id).
 let _autoCurrentTaskId = '';
-let _autoCurrentAttachments = []; // [{ name }]
-let _autoMarkdownToolbar = null;
+let _autoCurrentAttachments = []; // [{ name, displayName?, kind?, bytes?, status? }]
 
 // Cached `_aiSelectMount` handles for the inline form. Set on first mount.
 let _autoFreqSel = null;
@@ -705,6 +747,66 @@ function _autoLocalDateInputValue(iso) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
+function _autoUseToken(ref, kind) {
+  if (!ref || !ref.id || typeof _chatUseTokenFor !== 'function') return '';
+  return _chatUseTokenFor({
+    kind,
+    id: String(ref.id),
+    name: String(ref.name || ref.id),
+  });
+}
+
+function _autoComposerValueForTask(task) {
+  const tokens = [];
+  const skill = task && task.skill && (task.skill.id || task.skill.name) ? task.skill : null;
+  const connector = task && task.connector && (task.connector.id || task.connector.name) ? task.connector : null;
+  const skillToken = _autoUseToken(skill, 'skill');
+  const connectorToken = _autoUseToken(connector, 'connector');
+  if (skillToken) tokens.push(skillToken);
+  if (connectorToken) tokens.push(connectorToken);
+  const content = String((task && task.content) || '');
+  return tokens.length ? `${tokens.join(' ')}${content ? ` ${content}` : ''}` : content;
+}
+
+function _autoSetComposerValue(value) {
+  const ta = document.getElementById('auto-task-input');
+  if (!ta) return;
+  ta.value = String(value || '');
+  try { ta.dispatchEvent(new Event('input', { bubbles: true })); } catch (_) {}
+  try {
+    if (typeof syncChatRichComposerFromTextarea === 'function') syncChatRichComposerFromTextarea(ta);
+  } catch (_) {}
+}
+
+function _autoReadComposerUseState() {
+  const selections = (typeof getChatUseSelections === 'function')
+    ? getChatUseSelections('auto')
+    : [];
+  const toRef = (sel) => sel ? { id: sel.id || sel.name, name: sel.name || sel.id } : null;
+  const skill = selections.find((sel) => sel && sel.kind === 'skill') || null;
+  const connector = selections.find((sel) => sel && sel.kind === 'connector') || null;
+  return {
+    skill: toRef(skill),
+    connector: toRef(connector),
+    selections,
+  };
+}
+
+function _autoStripComposerUseTokens(value) {
+  const text = String(value || '');
+  if (typeof _findChatUseTokens !== 'function') return text;
+  const tokens = _findChatUseTokens(text);
+  if (!tokens.length) return text;
+  let out = '';
+  let last = 0;
+  tokens.forEach((token) => {
+    out += text.slice(last, token.start);
+    last = token.end;
+  });
+  out += text.slice(last);
+  return out.replace(/[ \t]{2,}/g, ' ').replace(/^[ \t]+|[ \t]+$/g, '');
+}
+
 
 function _mountAutoForm() {
   const panel = document.getElementById('panel-auto');
@@ -716,26 +818,12 @@ function _mountAutoForm() {
   if (typeof bindRecipientAnchor === 'function') {
     bindRecipientAnchor('auto-recipient-chip', 'auto-task-input');
   }
-  // Picker dispatch hooks consumed by agents.js when the anchorId is
-  // 'auto-recipient-chip'. Three independent slots:
-  //   - recipient: agent OR commander ("给: …" chip on the left)
-  //   - skill: first-class chip field (`.chat-skill-chip` widget)
-  //   - connector: first-class chip field (same widget; one-at-a-time)
-  // Skill + connector share the chip slot, matching the commander
-  // composer's single-`_chatUse` invariant — picking one clears the other.
+  // Picker dispatch hook consumed by agents.js when the anchorId is
+  // 'auto-recipient-chip'. Skills/connectors use the shared inline
+  // chat-use token path, so they render inside the composer like Commander.
   window._autoOnRecipientPicked = (rec) => {
     _autoCurrentRecipient = rec && rec.kind ? rec : { kind: 'commander' };
     _repaintAutoRecipientChip();
-  };
-  window._autoOnSkillPicked = (ref) => {
-    _autoCurrentSkill = (ref && ref.id) ? { id: String(ref.id), name: String(ref.name || ref.id) } : null;
-    _autoCurrentConnector = null;
-    _repaintAutoUseChip();
-  };
-  window._autoOnConnectorPicked = (ref) => {
-    _autoCurrentConnector = (ref && ref.id) ? { id: String(ref.id), name: String(ref.name || ref.id) } : null;
-    _autoCurrentSkill = null;
-    _repaintAutoUseChip();
   };
   window._autoGetRecipient = () => _autoCurrentRecipient || { kind: 'commander' };
   // The picker scopes against the project currently locked by the host
@@ -816,13 +904,6 @@ function _mountAutoForm() {
     attachBtn.dataset.bound = '1';
     attachBtn.addEventListener('click', () => _autoPickAndUploadFiles());
   }
-  const toolbarEl = document.getElementById('auto-markdown-toolbar');
-  if (!_autoMarkdownToolbar && toolbarEl && ta && typeof window.mountMarkdownToolbarForTextarea === 'function') {
-    _autoMarkdownToolbar = window.mountMarkdownToolbarForTextarea({
-      toolbarEl,
-      textarea: ta,
-    });
-  }
   _bindAutoDropAttach();
 
   // Keep i18n labels updating on lang switch.
@@ -851,47 +932,157 @@ async function _ensureAutoDraftId() {
   return _autoCurrentTaskId;
 }
 
+function _autoSetAttachmentItems(items) {
+  _autoCurrentAttachments = Array.isArray(items) ? items : [];
+  _renderAutoAttachmentChips();
+}
+
+function _autoPushReadyAttachment(name, patch = {}) {
+  if (!name) return;
+  const next = _autoCurrentAttachments.filter((a) => a && a.name !== name);
+  next.push({
+    name,
+    displayName: patch.displayName || name,
+    kind: _autoAttachKindForName(name, patch.kind || ''),
+    bytes: patch.bytes || 0,
+    status: 'ready',
+  });
+  _autoSetAttachmentItems(next);
+}
+
+function _autoReplaceAttachmentByTempId(tempId, patch) {
+  const items = _autoCurrentAttachments.slice();
+  const idx = items.findIndex((it) => it && it.tempId === tempId);
+  if (idx < 0) return;
+  if (patch === null) {
+    items.splice(idx, 1);
+  } else {
+    const next = { ...items[idx], ...patch };
+    const dupIdx = next.name
+      ? items.findIndex((it, i) => i !== idx && it.name === next.name && it.status !== 'uploading')
+      : -1;
+    if (dupIdx >= 0) items.splice(idx, 1);
+    else items[idx] = next;
+  }
+  _autoSetAttachmentItems(items);
+}
+
+async function _autoAlertAttachmentFailures(rejected) {
+  if (!rejected || !rejected.length) return;
+  await uiAlert(t('chat.attach_rejected_prefix', { list: rejected.join('\n') }));
+}
+
+async function _autoPrepareUploadFiles(fileList) {
+  const files = Array.from(fileList || []).filter(Boolean);
+  const rejected = [];
+  const prepared = [];
+  for (const file of files) {
+    const name = file && file.name ? file.name : '';
+    const ext = _autoAttachExtOf(name);
+    if (!AUTO_ATTACH_ACCEPT.includes(ext)) {
+      rejected.push(t('chat.attach_unsupported', { name: name || 'file' }));
+      continue;
+    }
+    let buf;
+    try {
+      buf = await file.arrayBuffer();
+    } catch (err) {
+      rejected.push(t('chat.attach_upload_fail', {
+        name,
+        reason: (err && err.message) || t('chat.attach_upload_generic_fail'),
+      }));
+      continue;
+    }
+    prepared.push({ file, ext, buf });
+  }
+  return { prepared, rejected };
+}
+
 async function _autoUploadFiles(files, source = 'drop') {
+  const list = Array.from(files || []);
+  if (!list.length) return;
   const taskId = await _ensureAutoDraftId();
   if (!taskId) {
     await uiAlert(t('auto.save_failed', { reason: 'no_draft_id' }));
     return;
   }
-  const payload = _autoAttachmentPayload(files, source);
+  const payload = _autoAttachmentPayload(list, source);
   _autoTrackClick('auto_attachment_upload', payload);
-  let uploadedCount = 0;
-  let failedCount = 0;
-  for (const file of files) {
+  const { prepared, rejected } = await _autoPrepareUploadFiles(list);
+  if (!prepared.length) {
+    if (rejected.length) await _autoAlertAttachmentFailures(rejected);
+    _autoTrackEvent('auto_attachment_upload_result', {
+      ...payload,
+      result: rejected.length ? 'failure' : 'skipped',
+      uploaded_count: 0,
+      failed_count: rejected.length,
+    });
+    return;
+  }
+
+  const placeholders = [];
+  const current = _autoCurrentAttachments.slice();
+  for (const item of prepared) {
+    const { file, ext } = item;
+    const tempId = _autoAttachTempId();
+    const displayName = file.name;
+    const kind = _autoAttachKindFromExt(ext);
+    current.push({
+      tempId,
+      name: displayName,
+      displayName,
+      kind,
+      bytes: file.size || 0,
+      status: 'uploading',
+    });
+    placeholders.push({ ...item, tempId, displayName, kind });
+  }
+  _autoSetAttachmentItems(current);
+
+  let uploadFailed = 0;
+  await Promise.all(placeholders.map(async (ph) => {
     try {
-      const buf = await file.arrayBuffer();
-      const dataBase64 = _arrayBufferToBase64(buf);
+      const dataBase64 = _arrayBufferToBase64(ph.buf);
       const res = await window.orkas.invoke('autoTasks.attachments.upload', {
         taskId,
-        name: file.name,
+        name: ph.file.name,
         dataBase64,
       });
       if (res && res.name) {
-        // Dedupe — last upload for a given name wins (overwrite on the disk
-        // side too since uploadAttachment writes the file).
-        _autoCurrentAttachments = _autoCurrentAttachments.filter((a) => a.name !== res.name);
-        _autoCurrentAttachments.push({ name: res.name });
-        uploadedCount += 1;
+        _autoReplaceAttachmentByTempId(ph.tempId, {
+          name: res.name,
+          displayName: ph.displayName,
+          kind: _autoAttachKindForName(res.name, ph.kind),
+          bytes: ph.file.size || 0,
+          status: 'ready',
+        });
       } else {
-        failedCount += 1;
+        _autoReplaceAttachmentByTempId(ph.tempId, null);
+        uploadFailed += 1;
+        rejected.push(t('chat.attach_upload_fail', {
+          name: ph.file.name,
+          reason: t('chat.attach_upload_generic_fail'),
+        }));
       }
     } catch (err) {
-      failedCount += 1;
+      _autoReplaceAttachmentByTempId(ph.tempId, null);
+      uploadFailed += 1;
       _autoLog.warn('upload failed', err);
-      await uiAlert(t('auto.save_failed', { reason: (err && err.message) || err }));
+      rejected.push(t('chat.attach_upload_fail', {
+        name: ph.file.name,
+        reason: (err && err.message) || t('chat.attach_upload_generic_fail'),
+      }));
     }
-  }
+  }));
+  const uploadedCount = Math.max(0, placeholders.length - uploadFailed);
+  const failedCount = rejected.length;
   _autoTrackEvent('auto_attachment_upload_result', {
     ...payload,
     result: failedCount ? (uploadedCount ? 'partial_failure' : 'failure') : 'success',
     uploaded_count: uploadedCount,
     failed_count: failedCount,
   });
-  _renderAutoAttachmentChips();
+  if (rejected.length) await _autoAlertAttachmentFailures(rejected);
 }
 
 function _bindAutoDropAttach() {
@@ -903,6 +1094,7 @@ function _bindAutoDropAttach() {
     if (!types) return false;
     for (let i = 0; i < types.length; i++) {
       if (types[i] === 'Files') return true;
+      if (typeof ORKAS_FILE_DRAG_MIME !== 'undefined' && types[i] === ORKAS_FILE_DRAG_MIME) return true;
     }
     return false;
   };
@@ -910,15 +1102,96 @@ function _bindAutoDropAttach() {
     if (!isAttachDrag(e)) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = 'copy';
+    area.classList.add('drag-over');
   };
   area.addEventListener('dragover', allow);
   area.addEventListener('dragenter', allow);
+  area.addEventListener('dragleave', () => area.classList.remove('drag-over'));
   area.addEventListener('drop', (e) => {
     if (!isAttachDrag(e)) return;
     e.preventDefault();
+    area.classList.remove('drag-over');
+    const internalFiles = (typeof _chatAttachInternalDragItems === 'function')
+      ? _chatAttachInternalDragItems(e.dataTransfer)
+      : [];
+    if (internalFiles.length) {
+      _autoImportPaths(internalFiles, 'internal_drop');
+      return;
+    }
     _autoUploadFiles(e.dataTransfer.files, 'drop');
   });
   area.dataset.autoDropBound = '1';
+}
+
+async function _autoImportPaths(entries, source = 'internal_drop') {
+  const files = Array.isArray(entries) ? entries.filter((it) => it && it.path) : [];
+  if (!files.length) return;
+  const taskId = await _ensureAutoDraftId();
+  if (!taskId) {
+    await uiAlert(t('auto.save_failed', { reason: 'no_draft_id' }));
+    return;
+  }
+  const payload = _autoAttachmentPayload(files, source);
+  _autoTrackClick('auto_attachment_upload', payload);
+
+  const rejected = [];
+  const placeholders = [];
+  const current = _autoCurrentAttachments.slice();
+  for (const item of files) {
+    const displayName = item.name || _autoAttachBaseName(item.path);
+    const ext = _autoAttachExtOf(displayName);
+    if (!AUTO_ATTACH_ACCEPT.includes(ext)) {
+      rejected.push(t('chat.attach_unsupported', { name: displayName || item.path }));
+      continue;
+    }
+    const tempId = _autoAttachTempId();
+    current.push({
+      tempId,
+      name: displayName,
+      displayName,
+      kind: _autoAttachKindFromExt(ext),
+      bytes: 0,
+      status: 'uploading',
+    });
+    placeholders.push({ tempId, path: item.path, name: displayName });
+  }
+  _autoSetAttachmentItems(current);
+
+  let uploadFailed = 0;
+  await Promise.all(placeholders.map(async (ph) => {
+    try {
+      const data = await window.orkas.invoke('autoTasks.attachments.import', {
+        taskId,
+        path: ph.path,
+        name: ph.name,
+        projectId: _autoSelectedProjectId(),
+      });
+      const name = data && data.name;
+      if (!name) throw new Error((data && data.error) || 'attach_failed');
+      _autoReplaceAttachmentByTempId(ph.tempId, {
+        name,
+        displayName: ph.name,
+        kind: _autoAttachKindForName(name),
+        bytes: 0,
+        status: 'ready',
+      });
+    } catch (err) {
+      _autoReplaceAttachmentByTempId(ph.tempId, null);
+      uploadFailed += 1;
+      rejected.push(t('chat.attach_upload_fail', {
+        name: ph.name,
+        reason: (err && err.message) || t('chat.attach_upload_generic_fail'),
+      }));
+    }
+  }));
+  const uploadedCount = Math.max(0, placeholders.length - uploadFailed);
+  _autoTrackEvent('auto_attachment_upload_result', {
+    ...payload,
+    result: rejected.length ? (uploadedCount ? 'partial_failure' : 'failure') : 'success',
+    uploaded_count: uploadedCount,
+    failed_count: rejected.length,
+  });
+  if (rejected.length) await _autoAlertAttachmentFailures(rejected);
 }
 
 async function _autoAttachLibraryFile(ref) {
@@ -945,14 +1218,32 @@ async function _autoAttachLibraryFile(ref) {
     mode: _autoEditingTaskId ? 'edit' : 'create',
     has_project: !!projectId,
   });
+  const displayName = _autoAttachBaseName(rel);
+  const tempId = _autoAttachTempId();
+  _autoSetAttachmentItems([
+    ..._autoCurrentAttachments,
+    {
+      tempId,
+      name: displayName,
+      displayName,
+      kind: _autoAttachKindForName(displayName),
+      bytes: 0,
+      status: 'uploading',
+    },
+  ]);
   try {
     const data = await window.orkas.invoke(channel, payload);
     const name = data && data.name;
     if (!name) throw new Error((data && data.error) || 'attach_failed');
-    _autoCurrentAttachments = _autoCurrentAttachments.filter((a) => a.name !== name);
-    _autoCurrentAttachments.push({ name });
-    _renderAutoAttachmentChips();
+    _autoReplaceAttachmentByTempId(tempId, {
+      name,
+      displayName,
+      kind: _autoAttachKindForName(name),
+      bytes: 0,
+      status: 'ready',
+    });
   } catch (err) {
+    _autoReplaceAttachmentByTempId(tempId, null);
     _autoLog.warn('library attach failed', err);
     throw err;
   }
@@ -977,13 +1268,15 @@ async function _autoPickAndUploadFiles() {
       uploaded_count: 0,
       failed_count: 1,
     });
-    await uiAlert(t('auto.save_failed', { reason: (err && err.message) || err }));
+    await uiAlert(t('chat.attach_upload_fail', {
+      name: '',
+      reason: (err && err.message) || t('chat.attach_upload_generic_fail'),
+    }));
     return;
   }
   const names = Array.isArray(data && data.items) ? data.items : [];
   for (const name of names) {
-    _autoCurrentAttachments = _autoCurrentAttachments.filter((a) => a.name !== name);
-    _autoCurrentAttachments.push({ name });
+    _autoPushReadyAttachment(name, { displayName: name });
   }
   const failed = Array.isArray(data && data.failed) ? data.failed : [];
   _autoTrackEvent('auto_attachment_upload_result', {
@@ -994,11 +1287,11 @@ async function _autoPickAndUploadFiles() {
     file_count: names.length + failed.length,
   });
   if (failed.length) {
-    await uiAlert(t('auto.save_failed', {
-      reason: failed.map((x) => `${x.name || ''}: ${x.error || 'unknown'}`).join('\n'),
-    }));
+    await _autoAlertAttachmentFailures(failed.map((x) => t('chat.attach_upload_fail', {
+      name: x.name || '',
+      reason: x.error || t('chat.attach_upload_generic_fail'),
+    })));
   }
-  _renderAutoAttachmentChips();
 }
 
 function _arrayBufferToBase64(buf) {
@@ -1021,17 +1314,32 @@ function _renderAutoAttachmentChips() {
     return;
   }
   wrap.style.display = '';
-  wrap.innerHTML = _autoCurrentAttachments.map((a) => `
-    <div class="chat-attach-chip" data-name="${escapeHtml(a.name)}">
-      <span class="chat-attach-label">${escapeHtml(a.name)}</span>
-      <span class="chat-attach-remove" title="${escapeHtml(t('auto.delete_btn'))}">×</span>
-    </div>
-  `).join('');
+  wrap.innerHTML = _autoCurrentAttachments.map((a, idx) => {
+    const displayName = _autoAttachDisplayName(a);
+    const kind = _autoAttachKindForName(displayName, a && a.kind);
+    const icon = (typeof _chatFileIconHtml === 'function') ? _chatFileIconHtml(displayName, kind) : '';
+    const busy = a && a.status === 'uploading';
+    const label = escapeHtml(displayName);
+    const klass = `chat-attach-chip${busy ? ' is-uploading' : ''}`;
+    const spinner = busy ? `<span class="chat-attach-spinner" aria-label="${escapeHtml(t('chat.attach_uploading'))}"></span>` : '';
+    const removeBtn = busy
+      ? ''
+      : `<span class="chat-attach-remove" data-idx="${idx}" title="${escapeHtml(t('chat.attach_remove_title'))}">×</span>`;
+    return `
+    <div class="${klass}" data-idx="${idx}" data-name="${escapeHtml(a.name || '')}" title="${label}">
+      <span class="chat-attach-icon">${icon}</span>
+      <span class="chat-attach-label">${label}</span>
+      ${spinner}
+      ${removeBtn}
+    </div>`;
+  }).join('');
   for (const chip of wrap.querySelectorAll('.chat-attach-chip')) {
     const remove = chip.querySelector('.chat-attach-remove');
     if (!remove) continue;
     remove.addEventListener('click', async () => {
-      const name = chip.dataset.name;
+      const idx = Number(remove.dataset.idx);
+      const item = _autoCurrentAttachments[idx];
+      const name = item && item.name;
       if (!name || !_autoCurrentTaskId) return;
       try {
         await window.orkas.invoke('autoTasks.attachments.delete', {
@@ -1040,8 +1348,9 @@ function _renderAutoAttachmentChips() {
       } catch (err) {
         _autoLog.warn('delete attachment failed', err);
       }
-      _autoCurrentAttachments = _autoCurrentAttachments.filter((a) => a.name !== name);
-      _renderAutoAttachmentChips();
+      const next = _autoCurrentAttachments.slice();
+      next.splice(idx, 1);
+      _autoSetAttachmentItems(next);
     });
   }
 }
@@ -1071,53 +1380,6 @@ function _repaintAutoRecipientChip() {
   }
 }
 
-/** Show / hide the single `.chat-skill-chip` widget. Skill and connector
- *  share the slot — at most one populated at a time. Label uses the same
- *  `skills.use_label` / `connectors.use_label` i18n keys as the commander
- *  composer so the chip reads identically (`使用 X 技能` / `使用 X 连接器`). */
-function _repaintAutoUseChip() {
-  const chip = document.getElementById('auto-skill-chip');
-  if (!chip) return;
-  const skill = _autoCurrentSkill;
-  const connector = _autoCurrentConnector;
-  if (!skill && !connector) {
-    chip.style.display = 'none';
-    chip.classList.remove('is-skill', 'is-connector');
-    chip.innerHTML = '';
-    return;
-  }
-  chip.style.display = '';
-  chip.classList.remove('is-skill', 'is-connector');
-  let prefix, name, kindClass;
-  if (skill) {
-    name = skill.name;
-    prefix = t('skills.use_label', { skill: '' });
-    kindClass = 'is-skill';
-  } else {
-    name = connector.name;
-    prefix = t('connectors.use_label', { connector: '' });
-    kindClass = 'is-connector';
-  }
-  chip.classList.add(kindClass);
-  const fullLabel = (skill ? t('skills.use_label', { skill: name }) : t('connectors.use_label', { connector: name }));
-  const removeTitle = t('chat.chip_remove_title');
-  chip.innerHTML = `
-    <span class="chip-label" title="${escapeHtml(fullLabel)}"><span class="chip-label-prefix">${escapeHtml(prefix)}</span><span class="chip-label-name">${escapeHtml(name)}</span></span>
-    <button type="button" class="chip-close" title="${escapeHtml(removeTitle)}" aria-label="${escapeHtml(removeTitle)}">
-      <span data-ui-icon="x" data-ui-icon-class="chip-close-icon"></span>
-    </button>
-  `;
-  if (typeof hydrateUiIcons === 'function') hydrateUiIcons(chip);
-  const close = chip.querySelector('.chip-close');
-  if (close) {
-    close.addEventListener('click', () => {
-      _autoCurrentSkill = null;
-      _autoCurrentConnector = null;
-      _repaintAutoUseChip();
-    });
-  }
-}
-
 function _autoRepaintLabels() {
   const titleEl = document.getElementById('auto-task-dialog-title');
   if (titleEl) {
@@ -1138,12 +1400,9 @@ function _autoResetForm() {
   _autoEditingTaskId = null;
   _autoEditingProjectId = '';
   _autoCurrentRecipient = { kind: 'commander' };
-  _autoCurrentSkill = null;
-  _autoCurrentConnector = null;
   _autoCurrentTaskId = '';
   _autoCurrentAttachments = [];
-  const ta = document.getElementById('auto-task-input');
-  if (ta) ta.value = '';
+  _autoSetComposerValue('');
   const titleInput = document.getElementById('auto-title-input');
   if (titleInput) {
     titleInput.value = '';
@@ -1160,7 +1419,6 @@ function _autoResetForm() {
   if (_autoMinuteSel) _autoMinuteSel.setValue('0');
   _autoSyncFreqRows('daily');
   _repaintAutoRecipientChip();
-  _repaintAutoUseChip();
   _autoRepaintLabels();
   _renderAutoAttachmentChips();
 }
@@ -1226,18 +1484,17 @@ function _autoFillForm(task) {
   _autoEditingTaskId = task.id;
   _autoEditingProjectId = task.project_id || '';
   _autoCurrentTaskId = task.id;
-  _autoCurrentAttachments = (Array.isArray(task.attachments) ? task.attachments : []).map((name) => ({ name }));
+  _autoCurrentAttachments = (Array.isArray(task.attachments) ? task.attachments : [])
+    .map((name) => ({
+      name,
+      displayName: name,
+      kind: _autoAttachKindForName(name),
+      status: 'ready',
+    }));
   _autoCurrentRecipient = (task.recipient && task.recipient.kind)
     ? task.recipient
     : { kind: 'commander' };
-  _autoCurrentSkill = (task.skill && task.skill.id) ? { id: task.skill.id, name: task.skill.name } : null;
-  _autoCurrentConnector = (task.connector && task.connector.id) ? { id: task.connector.id, name: task.connector.name } : null;
-  if (_autoCurrentRecipient.kind === 'agent') {
-    _autoCurrentSkill = null;
-    _autoCurrentConnector = null;
-  }
-  const ta = document.getElementById('auto-task-input');
-  if (ta) ta.value = task.content || '';
+  _autoSetComposerValue(_autoComposerValueForTask(task));
   const titleInput = document.getElementById('auto-title-input');
   if (titleInput) {
     titleInput.value = task.title || '';
@@ -1270,7 +1527,6 @@ function _autoFillForm(task) {
   if (sched.type === 'weekly' && _autoWeekdaySel) _autoWeekdaySel.setValue(String(sched.weekday));
   if (sched.type === 'monthly' && _autoMonthlyDaySel) _autoMonthlyDaySel.setValue(String(sched.day));
   _repaintAutoRecipientChip();
-  _repaintAutoUseChip();
   _renderAutoAttachmentChips();
 }
 
@@ -1282,8 +1538,12 @@ async function _autoSubmitForm() {
   const dateInput = document.getElementById('auto-date-input');
   if (!ta || !submitBtn || !_autoFreqSel || !_autoHourSel || !_autoMinuteSel) return;
 
-  const content = (ta.value || '').trim();
+  const rawContent = (ta.value || '').trim();
+  const content = _autoStripComposerUseTokens(rawContent).trim();
   if (!content) { await uiAlert(t('auto.invalid_content')); return; }
+  const useState = _autoReadComposerUseState();
+  const skillField = useState.skill;
+  const connectorField = useState.connector;
 
   // HH + MM dropdowns shared across all schedule types.
   const hour = parseInt(_autoHourSel.getValue() || '0', 10);
@@ -1325,25 +1585,26 @@ async function _autoSubmitForm() {
 
   const projectId = _autoSelectedProjectId();
   const isUpdate = !!_autoEditingTaskId;
+  if (_autoCurrentAttachments.some((a) => a && a.status === 'uploading')) {
+    await uiAlert(t('chat.attach_still_uploading'));
+    return;
+  }
+  const readyAttachments = _autoCurrentAttachments
+    .filter((a) => a && a.name && a.status !== 'error' && a.status !== 'uploading');
   const startedAt = performance.now();
   _autoTrackClick(isUpdate ? 'auto_task_update_submit' : 'auto_task_create_submit', {
     schedule_type: type,
     recipient_type: _autoCurrentRecipient.kind || 'commander',
-    has_skill: !!_autoCurrentSkill,
-    has_connector: !!_autoCurrentConnector,
+    has_skill: !!skillField,
+    has_connector: !!connectorField,
     has_project: !!projectId,
-    attachment_count: _autoCurrentAttachments.length,
+    attachment_count: readyAttachments.length,
     content_length: content.length,
   });
 
   submitBtn.disabled = true;
   try {
-    const attachmentNames = _autoCurrentAttachments.map((a) => a.name);
-    // Build the chip refs explicitly so create/update can carry `null` for
-    // "remove chip" semantics. The backend treats null as "clear field"
-    // (only on update); create simply omits absent fields.
-    const skillField = _autoCurrentSkill;
-    const connectorField = _autoCurrentConnector;
+    const attachmentNames = readyAttachments.map((a) => a.name);
     const recipientField = _autoCurrentRecipient.kind === 'agent'
       ? {
           kind: 'agent',

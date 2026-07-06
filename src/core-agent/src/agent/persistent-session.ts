@@ -427,7 +427,8 @@ export class PersistentSession extends Session {
     }
     try {
       const raw = JSON.parse(fs.readFileSync(this.contextFile, "utf-8")) as SerializedSessionContextState;
-      this.restoreContextState(raw);
+      const repaired = this.restoreContextState(raw);
+      if (repaired) this.writeContextToDisk();
     } catch (err) {
       console.warn(`[persistent-session] failed to read context ${this.contextFile}: ${(err as Error).message}`);
       this.restoreContextState(null);

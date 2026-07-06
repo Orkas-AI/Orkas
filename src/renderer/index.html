@@ -328,7 +328,7 @@
           <div class="skills-grid-header">
             <span data-i18n="skills.title">Skills</span>
             <div class="header-actions">
-              <button class="btn btn-sm" id="create-skill-btn" data-i18n="skills.add">+ Add</button>
+              <button class="btn btn-sm" id="create-skill-btn" data-i18n="skills.add">+ Create</button>
               <button class="btn btn-sm" id="skills-more-btn" data-i18n="skills.more_btn">More</button>
             </div>
           </div>
@@ -658,7 +658,7 @@
                 <div class="project-detail-tab-panel" data-project-panel="auto" hidden>
                   <div class="project-auto-tab-head">
                     <span class="project-auto-tab-count" id="project-auto-tab-count"></span>
-                    <button type="button" class="btn btn-sm btn-primary" id="project-auto-add-btn" data-i18n="auto.add_btn">+ New task</button>
+                    <button type="button" class="btn btn-sm" id="project-auto-add-btn" data-i18n="auto.add_btn">+ Create</button>
                   </div>
                   <div class="auto-sync-note" id="project-auto-sync-note" hidden></div>
                   <div class="auto-list" id="project-auto-list"></div>
@@ -814,7 +814,7 @@
           <div class="auto-header">
             <span class="auto-title-text" data-i18n="auto.title">Auto</span>
             <span class="auto-header-count" id="auto-header-count"></span>
-            <button type="button" class="btn btn-sm btn-primary auto-header-add" id="auto-add-btn" data-i18n="auto.add_btn">+ New task</button>
+            <button type="button" class="btn btn-sm auto-header-add" id="auto-add-btn" data-i18n="auto.add_btn">+ Create</button>
           </div>
           <div class="auto-scroll">
             <div class="auto-sync-note" id="auto-sync-note" hidden></div>
@@ -1271,21 +1271,16 @@
             <div class="chat-input-overlay">
               <div class="chat-attachments" id="auto-task-attachments" style="display:none"></div>
             </div>
-            <div class="ctx-editor-toolbar auto-markdown-toolbar" id="auto-markdown-toolbar" role="toolbar"></div>
             <textarea id="auto-task-input" rows="2" maxlength="8000"
                       data-i18n-placeholder="auto.content_placeholder"
                       placeholder="Type @ to choose agents, skills, connectors, Library files."></textarea>
             <div class="chat-bottom-bar">
-              <button type="button" class="chat-attach-btn" id="auto-attach-btn" data-i18n-title="new_chat.attach_title" title="Upload attachment">+</button>
+              <button type="button" class="chat-attach-btn" id="auto-attach-btn" data-i18n-title="new_chat.attach_title" title="Upload attachment (text / PDF / Word / image / video)">+</button>
               <span class="chat-composer-divider" aria-hidden="true"></span>
               <button type="button" class="chat-recipient-chip" id="auto-recipient-chip" data-i18n-title="chat.recipient_picker_title_with_library" title="Choose agent, skill, connector, or Library file">
                 <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
                 <span class="chat-recipient-name" id="auto-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
               </button>
-              <div class="chat-skill-chip" id="auto-skill-chip" data-target="auto" style="display:none">
-                <span class="chip-label"></span>
-                <span class="chip-close" data-i18n-title="chat.chip_remove_title" title="Remove">×</span>
-              </div>
             </div>
           </div>
         </div>

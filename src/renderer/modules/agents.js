@@ -3546,42 +3546,23 @@ function _targetFromPickerAnchor(anchorId) {
 
 async function _triggerPickerItem(kind, itemId, itemName, anchorId, dataset) {
   const target = _targetFromPickerAnchor(anchorId);
-  // Auto form: skill / connector are first-class chip fields on the
-  // task record (`task.skill` / `task.connector`). Content stays clean —
-  // fire-time `_buildSeedText` in main composes the outgoing text from
-  // these refs + the `*.use_prefix` i18n templates, mirroring how the
-  // commander composer wraps text from its chip state.
-  if (target === 'auto' && kind === 'skill') {
-    _agentsTrackClick('auto_skill_select', { target, skill_id: String(itemId || itemName || '') });
-    if (typeof window !== 'undefined' && typeof window._autoOnSkillPicked === 'function') {
-      window._autoOnSkillPicked({ id: String(itemId || itemName), name: String(itemName || itemId) });
-    }
-    _consumeAtKeyChar();
-    _focusInput(document.getElementById('auto-task-input'));
-    return;
-  }
-  if (target === 'auto' && kind === 'connector') {
-    _agentsTrackClick('auto_connector_select', { target, connector_id: String(itemId || '') });
-    if (typeof window !== 'undefined' && typeof window._autoOnConnectorPicked === 'function') {
-      window._autoOnConnectorPicked({ id: String(itemId), name: String(itemName || itemId) });
-    }
-    _consumeAtKeyChar();
-    _focusInput(document.getElementById('auto-task-input'));
-    return;
-  }
   if (kind === 'skill') {
-    _agentsTrackClick('chat_skill_select', { target, skill_id: String(itemId || itemName || '') });
+    _agentsTrackClick(target === 'auto' ? 'auto_skill_select' : 'chat_skill_select', { target, skill_id: String(itemId || itemName || '') });
     _consumeAtKeyChar();
     setChatSkill(target, itemId, itemName || itemId);
-    const inputId = target === 'new-chat' ? 'new-chat-input' : (target === 'project' ? 'project-chat-input' : 'chat-input');
+    const inputId = target === 'new-chat'
+      ? 'new-chat-input'
+      : (target === 'project' ? 'project-chat-input' : (target === 'auto' ? 'auto-task-input' : 'chat-input'));
     _focusInput(document.getElementById(inputId));
     return;
   }
   if (kind === 'connector') {
-    _agentsTrackClick('chat_connector_select', { target, connector_id: String(itemId || '') });
+    _agentsTrackClick(target === 'auto' ? 'auto_connector_select' : 'chat_connector_select', { target, connector_id: String(itemId || '') });
     _consumeAtKeyChar();
     setChatConnector(target, itemId, itemName || itemId);
-    const inputId = target === 'new-chat' ? 'new-chat-input' : (target === 'project' ? 'project-chat-input' : 'chat-input');
+    const inputId = target === 'new-chat'
+      ? 'new-chat-input'
+      : (target === 'project' ? 'project-chat-input' : (target === 'auto' ? 'auto-task-input' : 'chat-input'));
     _focusInput(document.getElementById(inputId));
     return;
   }

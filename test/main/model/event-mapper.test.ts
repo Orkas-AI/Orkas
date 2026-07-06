@@ -23,6 +23,19 @@ type AgentRunEvent =
       errorCode?: string;
       errorSeverity?: 'recoverable' | 'error';
     }
+  | {
+      type: 'compaction';
+      tokensBefore: number;
+      tokensAfter: number;
+      summary?: string;
+      usage?: {
+        inputTokens: number;
+        outputTokens: number;
+        cacheReadTokens?: number;
+        cacheWriteTokens?: number;
+        totalTokens: number;
+      };
+    }
   | { type: 'retry'; attempt: number; reason: string }
   | {
       type: 'context_status';
@@ -109,6 +122,28 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
     expect(progressEvent.event.data.message).toBe('Waiting for image task (30s)');
     expect(progressEvent.event.data.progress_phase).toBe('poll');
     expect(progressEvent.event.data.progress_data).toEqual({ elapsedMs: 30000 });
+  });
+
+  it('compaction progress carries summary usage for archive diagnostics', async () => {
+    const out = await collect([
+      {
+        type: 'compaction',
+        tokensBefore: 20000,
+        tokensAfter: 3000,
+        summary: 'checkpoint summary',
+        usage: { inputTokens: 100, outputTokens: 20, cacheReadTokens: 40, totalTokens: 120 },
+      },
+      { type: 'done', result: { text: '', meta: { error: null } } },
+    ]);
+
+    const compaction = out.find((e) => e.type === 'progress' && e.event?.stream === 'compaction');
+    expect(compaction.text).toBe('compacted 20000→3000 tokens');
+    expect(compaction.event.data).toMatchObject({
+      tokensBefore: 20000,
+      tokensAfter: 3000,
+      summary: 'checkpoint summary',
+      usage: { inputTokens: 100, outputTokens: 20, cacheReadTokens: 40, totalTokens: 120 },
+    });
   });
 
   it('write_file tool input deltas surface a start event before execution starts', async () => {

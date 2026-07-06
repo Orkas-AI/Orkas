@@ -111,7 +111,7 @@ export type AgentRunEvent =
       errorCode?: string;
       errorSeverity?: "recoverable" | "error";
     }
-  | { type: "compaction"; tokensBefore: number; tokensAfter: number; summary?: string }
+  | { type: "compaction"; tokensBefore: number; tokensAfter: number; summary?: string; usage?: Usage }
   | {
       type: "context_status";
       phase:

@@ -23,6 +23,8 @@ Use these `run-skill` entry points whenever this document says `stage-edit edit_
 
 The scripts return JSON. A non-zero exit means the operation failed; fix the input/plan before proceeding.
 
+**Subtitle safety hard rule.** Burn captions only through `stage-edit edit_video --op burnsubs`; do not hand-write `ffmpeg` subtitle, `drawtext`, or PNG-overlay fallback commands. In particular, never use `ffmpeg -loop 1` image inputs for subtitle overlays from bash. If `burnsubs` fails with `E_EDIT_BURNSUBS_UNSUPPORTED` or an ffmpeg filter-support error, stop and report the blocker instead of improvising a custom ffmpeg graph.
+
 **If the task is to FIND / SELECT / REDUCE / CLEAN rather than run a known timecode edit** — remove dead air, drop fillers, pick highlights, cut a long recording down — read `stage-decide` first: it covers understanding the footage and producing an evidence-bearing rough cut (the deterministic auto-cuts `trim_silence` / `remove_fillers` and scene-candidate detection). This skill is for executing cuts you have already chosen.
 
 **Two assembly paths — pick by whether the result needs to stay re-editable:**
@@ -48,7 +50,7 @@ The scripts return JSON. A non-zero exit means the operation failed; fix the inp
 3. **Execute in order.**
    - `trim` each segment to its own file (`project/cuts/seg-1.mp4`, ...).
    - `concat` the cut files (in plan order) into one (`project/render/edited.mp4`).
-   - If subtitles: `burnsubs` the `.srt`/`.ass` onto the concatenated video.
+   - If subtitles: `burnsubs` the `.srt`/`.ass` onto the concatenated video. Do not bypass `burnsubs` with a manual ffmpeg subtitle/overlay command if the tool fails.
    - If an overlay (logo / lower-third image / PiP): `overlay` it at the planned position.
 4. **Publish** the final file.
 

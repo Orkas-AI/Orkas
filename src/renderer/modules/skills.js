@@ -200,7 +200,7 @@ function _skillNameSortKey(skill) {
 // the source of truth, so native selection / IME / undo keep working while the
 // send path can expand tokens into localized plain text.
 
-const _chatUse = { 'new-chat': null, 'conversation': null, project: null };
+const _chatUse = { 'new-chat': null, 'conversation': null, project: null, auto: null };
 const _CHAT_USE_TOKEN_OPEN = '@{';
 const _CHAT_USE_TOKEN_KINDS = new Set(['skill', 'connector']);
 const _CHAT_USE_TOKEN_START = '\u2063';
@@ -219,7 +219,7 @@ function bindSkillPicker() {
       if (chip) setChatUseSelection(chip.dataset.target, null);
     });
   });
-  ['new-chat-input', 'chat-input', 'project-chat-input'].forEach((id) => {
+  ['new-chat-input', 'chat-input', 'project-chat-input', 'auto-task-input'].forEach((id) => {
     const input = document.getElementById(id);
     if (!input || input.dataset.chatUseTokenBound === '1') return;
     input.dataset.chatUseTokenBound = '1';
@@ -261,11 +261,12 @@ function _normalizeChatUseSelections(value) {
 function _chatUseInputForTarget(target) {
   const id = target === 'new-chat'
     ? 'new-chat-input'
-    : (target === 'project' ? 'project-chat-input' : 'chat-input');
+    : (target === 'project' ? 'project-chat-input' : (target === 'auto' ? 'auto-task-input' : 'chat-input'));
   return document.getElementById(id);
 }
 
 function _chatUseAutoGrowMax(target) {
+  if (target === 'auto') return 220;
   return target === 'new-chat' ? 260 : (target === 'project' ? 180 : 200);
 }
 
@@ -481,6 +482,7 @@ function _renderChatUseChipLabel(labelEl, selection) {
 }
 
 function _renderChatUseChip(target) {
+  if (target === 'auto') return;
   const next = _normalizeChatUseSelection(_chatUse[target]);
   const chipId = target === 'new-chat'
     ? 'new-chat-skill-chip'
@@ -588,7 +590,7 @@ function setChatUseSelection(target, selection, opts = {}) {
   if (opts && opts.focus === false) return;
   const input = target === 'new-chat'
     ? document.getElementById('new-chat-input')
-    : (target === 'project' ? document.getElementById('project-chat-input') : document.getElementById('chat-input'));
+    : (target === 'project' ? document.getElementById('project-chat-input') : (target === 'auto' ? document.getElementById('auto-task-input') : document.getElementById('chat-input')));
   if (typeof focusChatRichComposer === 'function' && focusChatRichComposer(input)) return;
   input?.focus();
 }
@@ -741,7 +743,9 @@ function _deleteChatUseTokenAtCaret(input, direction) {
   else if (start > 0 && value.charAt(start - 1) === ' ') start -= 1;
   input.value = value.slice(0, start) + value.slice(end);
   try { input.setSelectionRange(start, start); } catch (_) {}
-  const target = input.id === 'new-chat-input' ? 'new-chat' : (input.id === 'project-chat-input' ? 'project' : 'conversation');
+  const target = input.id === 'new-chat-input'
+    ? 'new-chat'
+    : (input.id === 'project-chat-input' ? 'project' : (input.id === 'auto-task-input' ? 'auto' : 'conversation'));
   _chatUseDispatchInput(input, target);
   return true;
 }

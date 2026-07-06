@@ -2573,6 +2573,11 @@ body.model-not-configured .main-content { flex-direction: column; }
   background: #f8fbff;
 }
 
+.auto-composer-wrapper .new-chat-input-area.drag-over {
+  background: #f8fbff;
+  border-color: var(--primary);
+}
+
 .edit-chat-attachments {
   grid-column: 1 / -1;
   max-height: 74px;
@@ -12417,24 +12422,6 @@ body.model-not-configured .main-content { flex-direction: column; }
 .auto-task-dialog-title { margin-bottom: 14px; font-weight: 600; font-size: 15px; }
 .auto-task-dialog-title + .auto-task-dialog-sync-note { margin-top: -6px; margin-bottom: 12px; }
 .auto-task-dialog-body { display: flex; flex-direction: column; gap: 14px; }
-.auto-markdown-toolbar {
-  margin: 0;
-  padding: 0 4px 2px;
-  border: 0;
-  background: transparent;
-  border-radius: 0;
-  gap: 2px;
-}
-.auto-markdown-toolbar .btn-icon {
-  min-width: 26px;
-  width: 26px;
-  height: 24px;
-  padding: 0;
-}
-.auto-markdown-toolbar .ctx-editor-toolbar-sep {
-  height: 16px;
-  margin: 0 2px;
-}
 .auto-composer-wrapper .chat-rich-editor {
   min-height: 88px;
   max-height: 220px;

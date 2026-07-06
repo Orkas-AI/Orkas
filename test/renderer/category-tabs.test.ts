@@ -420,6 +420,23 @@ describe('agent and skill category tabs', () => {
     expect(calls).toEqual([{ scope: 'global', rel: 'brief.md', projectId: '' }]);
   });
 
+  it('routes auto task skill and connector picks through the shared inline chip path', async () => {
+    const { context } = loadCategoryRenderers();
+    context.pickedUseCalls = [];
+    vm.runInContext(`
+      setChatSkill = (target, id, name) => { pickedUseCalls.push(['skill', target, id, name]); };
+      setChatConnector = (target, id, name) => { pickedUseCalls.push(['connector', target, id, name]); };
+    `, context);
+
+    await context._triggerPickerItem('skill', 'research', 'Research', 'auto-recipient-chip');
+    await context._triggerPickerItem('connector', 'github', 'GitHub', 'auto-recipient-chip');
+
+    expect(context.pickedUseCalls).toEqual([
+      ['skill', 'auto', 'research', 'Research'],
+      ['connector', 'auto', 'github', 'GitHub'],
+    ]);
+  });
+
   it('renders project and global Library groups for the auto task picker when a project is active', async () => {
     const { context, el } = loadCategoryRenderers();
     context._projectsCache = [{ project_id: 'p1', name: 'Alpha' }];
