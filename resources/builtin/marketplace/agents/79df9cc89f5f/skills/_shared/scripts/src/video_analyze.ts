@@ -23,13 +23,27 @@ import {
   detectQuality,
 } from './video_edit';
 import type { QualityThresholds } from './video_decide';
-import { ocrImageText } from './ocr_runtime';
+import { ocrImageText, ocrImagesText } from './ocr_runtime';
 import { redactPaths } from './redact';
 import { createLogger } from './logger-shim';
 
 const log = createLogger('video-analyze');
 
 const round2 = (n: number): number => Math.round((Number.isFinite(n) ? n : 0) * 100) / 100;
+
+/** Minimum interval between forwarded transcribe output lines. */
+const TRANSCRIBE_LINE_EMIT_MIN_MS = 3_000;
+
+/** Best-effort progress JSONL on stderr (same protocol as video_edit); the
+ *  direct-CLI runner forwards these lines to the user-facing tool progress. */
+function emitAnalyzeProgress(op: AnalyzeOp, event: Record<string, unknown>): void {
+  const payload = { type: 'progress', source: 'video_analyze', op, phase: op, ...event };
+  try {
+    process.stderr.write(`${JSON.stringify(payload)}\n`);
+  } catch {
+    // Progress must never break the media operation.
+  }
+}
 
 export type AnalyzeOp = 'transcribe' | 'silence' | 'ocr' | 'scenes' | 'quality';
 
@@ -172,12 +186,25 @@ export async function analyzeMedia(p: AnalyzeParams): Promise<AnalyzeResult> {
     const args = ['transcribe', p.inputAbsPath, '--json'];
     if (p.model) args.push('--model', p.model);
     // Run in the input's dir so the emitted transcript.json lands in scope.
+    let lastLineEmitMs = 0;
     const r = await runHyperframesCapture(args, {
       cwd: path.dirname(p.inputAbsPath),
       ...(p.signal ? { signal: p.signal } : {}),
       // Generous: the first non-English transcribe downloads the large-v3 model
       // (~3GB) before processing; a tight timeout would fail mid-download.
       timeoutMs: 45 * 60 * 1000,
+      onHeartbeat: (elapsedSec) => emitAnalyzeProgress('transcribe', { status: 'heartbeat', elapsed_sec: elapsedSec }),
+      // Surface hyperframes' own progress lines (model download, transcribe
+      // stages) — stderr only; stdout is the JSON product.
+      onLine: (line, stream) => {
+        if (stream !== 'stderr') return;
+        const text = line.trim();
+        if (!text) return;
+        const now = Date.now();
+        if (now - lastLineEmitMs < TRANSCRIBE_LINE_EMIT_MIN_MS) return;
+        lastLineEmitMs = now;
+        emitAnalyzeProgress('transcribe', { status: 'output', detail: redactPaths(text).slice(0, 200) });
+      },
     });
     if (r.aborted) return { ok: false, errorCode: 'E_ANALYZE_ABORTED', message: 'transcribe aborted.' };
     if (r.timedOut) return { ok: false, errorCode: 'E_ANALYZE_TIMEOUT', message: 'transcribe timed out.' };
@@ -212,8 +239,9 @@ export async function analyzeMedia(p: AnalyzeParams): Promise<AnalyzeResult> {
       return { ok: true, op: 'ocr', summary: { op: 'ocr', engine: 'local:rapidocr-onnxruntime', kind: 'image', text: r.text } };
     }
 
-    // Video: sample frames across the timeline → OCR each → collapse identical
-    // consecutive reads into a per-slide timecode table.
+    // Video: sample frames across the timeline → ONE batch OCR (single Python
+    // process / single model load instead of a cold engine per frame) →
+    // collapse identical consecutive reads into a per-slide timecode table.
     const durationSec = (await probeMediaDurationSec(p.inputAbsPath, p.signal)) ?? 0;
     if (durationSec <= 0) {
       return { ok: false, errorCode: 'E_ANALYZE_FAILED', message: 'could not probe video duration for frame sampling.' };
@@ -221,24 +249,34 @@ export async function analyzeMedia(p: AnalyzeParams): Promise<AnalyzeResult> {
     const times = sampleTimecodes(durationSec, p.intervalSec ?? 2.5, p.maxFrames ?? 16);
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'orkas-ocr-'));
     try {
-      const frames: Array<{ tSec: number; text: string }> = [];
       let firstErr: { errorCode: string; message: string } | null = null;
+      const extracted: Array<{ tSec: number; framePath: string }> = [];
       for (const t of times) {
         if (p.signal?.aborted) return { ok: false, errorCode: 'E_ANALYZE_ABORTED', message: 'ocr aborted.' };
         const out = path.join(tmp, `f-${Math.round(t * 1000)}.png`);
         const ex = await extractFrameAt(p.inputAbsPath, t, out, p.signal);
         if (ex.ok === false) { if (!firstErr) firstErr = ex; continue; }
-        const r = await ocrImageText({ absPath: out, ...(p.signal ? { signal: p.signal } : {}) });
-        if (r.ok === false) {
-          // Runtime install/missing is fatal for the whole op — surface it so the
-          // workflow can apply its own fallback. A per-frame read error is not.
-          if (r.errorCode === 'E_OCR_RUNTIME_MISSING' || r.errorCode === 'E_OCR_INSTALL_FAILED') {
-            return { ok: false, errorCode: r.errorCode, message: r.message };
-          }
-          if (!firstErr) firstErr = r;
-          continue;
-        }
-        frames.push({ tSec: t, text: r.text });
+        extracted.push({ tSec: t, framePath: out });
+      }
+      if (!extracted.length) {
+        return { ok: false, errorCode: firstErr?.errorCode ?? 'E_ANALYZE_FAILED', message: firstErr?.message ?? 'ocr produced no frames.' };
+      }
+      emitAnalyzeProgress('ocr', { status: 'ocr_batch', frames: extracted.length });
+      const batch = await ocrImagesText({
+        absPaths: extracted.map((f) => f.framePath),
+        ...(p.signal ? { signal: p.signal } : {}),
+        onProgress: (ev) => emitAnalyzeProgress('ocr', { status: ev.phase, ...(ev.message ? { detail: ev.message } : {}) }),
+      });
+      if (batch.ok === false) {
+        // Runtime install/missing is surfaced as-is so the workflow can apply
+        // its own fallback; a whole-batch OCR failure is an analyze failure.
+        return { ok: false, errorCode: batch.errorCode, message: batch.message };
+      }
+      const frames: Array<{ tSec: number; text: string }> = [];
+      for (let i = 0; i < extracted.length; i++) {
+        const r = batch.results[i];
+        if (!r || r.error) { if (!firstErr && r?.error) firstErr = { errorCode: 'E_OCR_FAILED', message: r.error }; continue; }
+        frames.push({ tSec: extracted[i].tSec, text: r.text });
       }
       if (!frames.length) {
         return { ok: false, errorCode: firstErr?.errorCode ?? 'E_ANALYZE_FAILED', message: firstErr?.message ?? 'ocr produced no frames.' };

@@ -131,10 +131,12 @@ export function lintCompositionCraft(html: string, opts?: { canvasHeight?: numbe
 
 /** Render findings as a short text block to append to the QA findings the model
  *  reads. Empty string when there are none (so callers can concatenate freely). */
-export function formatCraftFindings(findings: CraftFinding[]): string {
+export function formatCraftFindings(findings: CraftFinding[], opts?: { strict?: boolean }): string {
   if (!findings.length) return '';
   return [
-    '[craft] static threshold checks (advisory, from the video-craft skill):',
+    opts?.strict
+      ? '[craft] static threshold checks (FONT_TOO_SMALL blocks under --strict-craft; PALETTE_LARGE is advisory):'
+      : '[craft] static threshold checks (advisory, from the video-craft skill):',
     ...findings.map((f) => `  - ${f.code}: ${f.message}`),
   ].join('\n');
 }

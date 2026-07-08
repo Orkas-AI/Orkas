@@ -1,6 +1,7 @@
 ---
 ownerAgent: 79df9cc89f5f
 name: stage-decide
+min_app_version: "1.5.1"
 description_zh: 真实素材的"决策层"——看懂素材→取舍→出带证据的粗剪。当 EDIT 任务是"找/选/缩/清理"（去静音、删填充词、长片选高光、1小时剪3分钟）而不是按已知时间码执行时用它；确定性自动剪（去静音/删填充/列镜头）可靠，叙事/情绪取舍是低置信、需人审的草稿。
 description_en: The decision layer for real footage — understand → select → produce an EVIDENCE-bearing rough cut. Use it when the EDIT task is "find / select / reduce / clean" (remove dead air, drop fillers, pick highlights, cut 1 hour to 3 minutes), not executing a known timecode edit. Deterministic auto-cuts are reliable; narrative/emotional selection is a low-confidence DRAFT for the user to review.
 category: creation
@@ -16,7 +17,7 @@ The hard, valuable part of editing real footage is not executing a cut you alrea
 Host-neutral: describe what to produce; the host provides the operations. In Orkas, use skill scripts:
 `stage-edit edit_video --op trim_silence` / `--op remove_fillers` (deterministic auto-cuts that return evidence),
 `stage-edit analyze_media --op scenes` (cut candidates), `--op quality` (blur/exposure/black/freeze flags),
-`--op transcribe` (word timings), `--op silence`.
+`video_studio` `op: "speech.transcribe"` for transcription, and `stage-edit analyze_media --op silence`.
 
 ## Use this when
 
@@ -29,7 +30,7 @@ skip this — that is plain `stage-edit`.
 
 1. **Understand the material first** (never decide against footage you have not measured):
    - `probe` for duration/resolution.
-   - Spoken footage → `transcribe` (word-level timings) so you cut on sentence/word boundaries, never mid-word.
+   - Spoken footage → use `video_studio` `op: "speech.transcribe"` so you cut on sentence/word boundaries, never mid-word.
    - Visual reduction → `scenes` for shot boundaries; bound the moments you keep on these candidates.
    - Dead air → `silence` to see the gaps.
 2. **Decide — deterministic first, judgment second:**

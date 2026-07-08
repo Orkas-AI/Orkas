@@ -56,7 +56,7 @@ For each shot, before generating it, assemble the reference images and bind them
 For a character-critical shot, generate the **first-frame image** first (cheap), check it, and only then drive the video from that locked frame — catching drift at the still is far cheaper than discovering it after paying to animate.
 
 - **Check the keyframe against the bible** on the identity axes, in priority order: 1) character — gender, age, ethnicity, facial features, body shape, hairstyle; 2) spatial — relative positions/perspective match the reference (left stays left); 3) accuracy — matches the shot's description. Read it yourself if multimodal; if you cannot see images, mark it unverified and lean harder on a strong locked reference.
-- **Re-roll the cheap image**, not the expensive video, until it matches; generate a few candidates and keep the most consistent one. Never hard-fail — pick the best and note its shortcoming.
+- **Re-roll the cheap image**, not the expensive video — at most 3 re-rolls per keyframe (each is billable), then keep the most consistent candidate. Never hard-fail — pick the best and note its shortcoming.
 
 ## 5. Carry-forward (continuity between shots)
 

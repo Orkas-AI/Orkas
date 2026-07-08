@@ -9,6 +9,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import * as fs from 'node:fs';
 
 import {
   bundledNodeExecutable,
@@ -46,6 +47,9 @@ export function buildHyperframesEnv(): NodeJS.ProcessEnv {
   if (ff.ffmpeg) env.HYPERFRAMES_FFMPEG_PATH = ff.ffmpeg;
   if (ff.ffprobe) env.HYPERFRAMES_FFPROBE_PATH = ff.ffprobe;
 
+  for (const dir of [paths.NODE_NPM_CACHE_DIR, paths.NODE_NPM_PREFIX_DIR, paths.NODE_NPM_GLOBAL_BIN_DIR]) {
+    try { fs.mkdirSync(dir, { recursive: true }); } catch { /* npm will surface a clearer error later */ }
+  }
   env.NPM_CONFIG_CACHE = paths.NODE_NPM_CACHE_DIR;
   env.NPM_CONFIG_PREFIX = paths.NODE_NPM_PREFIX_DIR;
   env.NPM_CONFIG_FUND = 'false';
@@ -65,13 +69,24 @@ export interface CaptureResult {
   aborted: boolean;
 }
 
+const CAPTURE_HEARTBEAT_MS = 15_000;
+
 /**
  * Run `npx hyperframes <args>` and capture stdout/stderr. For `--json` ops
  * (inspect / lint / transcribe) where the output is the product. Never rejects.
+ * `onLine` receives complete output lines as they stream (for progress
+ * surfacing); `onHeartbeat` fires periodically while the child is alive so
+ * long silent phases (e.g. a first-run model download) stay observable.
  */
 export function runHyperframesCapture(
   args: string[],
-  opts: { cwd?: string; signal?: AbortSignal; timeoutMs?: number },
+  opts: {
+    cwd?: string;
+    signal?: AbortSignal;
+    timeoutMs?: number;
+    onLine?: (line: string, stream: 'stdout' | 'stderr') => void;
+    onHeartbeat?: (elapsedSec: number) => void;
+  },
 ): Promise<CaptureResult> {
   const runner = resolveHyperframesRunner();
   if (!runner) {
@@ -93,15 +108,42 @@ export function runHyperframesCapture(
     const errChunks: string[] = [];
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, timeoutMs);
-    child.stdout?.on('data', (c: Buffer) => out.push(c.toString('utf8')));
-    child.stderr?.on('data', (c: Buffer) => errChunks.push(c.toString('utf8')));
+    const startedAtMs = Date.now();
+    const heartbeat = opts.onHeartbeat
+      ? setInterval(() => opts.onHeartbeat?.(Math.round((Date.now() - startedAtMs) / 1000)), CAPTURE_HEARTBEAT_MS)
+      : null;
+    (heartbeat as { unref?: () => void } | null)?.unref?.();
+    const lineBufs: Record<'stdout' | 'stderr', string> = { stdout: '', stderr: '' };
+    const pumpLines = (stream: 'stdout' | 'stderr', chunk: string) => {
+      if (!opts.onLine) return;
+      lineBufs[stream] += chunk;
+      let nl: number;
+      while ((nl = lineBufs[stream].indexOf('\n')) !== -1) {
+        const line = lineBufs[stream].slice(0, nl);
+        lineBufs[stream] = lineBufs[stream].slice(nl + 1);
+        try { opts.onLine(line, stream); } catch { /* progress is best-effort */ }
+      }
+      if (lineBufs[stream].length > 64 * 1024) lineBufs[stream] = lineBufs[stream].slice(-8 * 1024);
+    };
+    child.stdout?.on('data', (c: Buffer) => {
+      const s = c.toString('utf8');
+      out.push(s);
+      pumpLines('stdout', s);
+    });
+    child.stderr?.on('data', (c: Buffer) => {
+      const s = c.toString('utf8');
+      errChunks.push(s);
+      pumpLines('stderr', s);
+    });
     child.stdin?.end();
     child.on('error', (err) => {
       clearTimeout(timer);
+      if (heartbeat) clearInterval(heartbeat);
       resolve({ code: -1, stdout: out.join(''), stderr: err.message, timedOut, aborted: !!opts.signal?.aborted });
     });
     child.on('close', (code) => {
       clearTimeout(timer);
+      if (heartbeat) clearInterval(heartbeat);
       resolve({ code, stdout: out.join(''), stderr: errChunks.join(''), timedOut, aborted: !!opts.signal?.aborted });
     });
   });

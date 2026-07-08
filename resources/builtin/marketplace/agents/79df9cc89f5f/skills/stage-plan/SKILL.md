@@ -1,6 +1,7 @@
 ---
 ownerAgent: 79df9cc89f5f
 name: stage-plan
+min_app_version: "1.5.1"
 description_zh: 端到端视频编排的"摄入+计划"知识——先据实摄入用户素材，再把意图拆成一份跨模态 EDL（plan.json：剪辑/生成/合成/已提供 四类片段 + 旁白/音乐/字幕轨 + 交付承诺），用 stage-plan 的 video_plan 脚本校验后交 B 门审批；AUTO 端到端产线的核心。
 description_en: The "ingest + plan" knowledge for end-to-end video orchestration — ingest the user's material from evidence, then decompose intent into ONE cross-modal EDL (plan.json: edit / generate / compose / provided segments + narration/music/caption tracks + a delivery promise), validate it with the stage-plan video_plan script, and take it to gate B. Core of the AUTO end-to-end line.
 category: creation
@@ -12,16 +13,21 @@ How to turn "here is my material + here's the video I want" into a single, inspe
 
 ## How to call ingest scripts
 
-Use `stage-edit` scripts for factual ingest before writing the plan:
+Use `stage-edit` scripts for factual ingest before writing the plan, except transcription, which runs through the required built-in `video_studio` tool.
 
 ```bash
 "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit edit_video -- --op probe --input raw/clip.mp4
-"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit analyze_media -- --op transcribe --input raw/clip.mp4 --model large-v3
 "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit analyze_media -- --op ocr --input raw/screen-recording.mp4
 "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit edit_video -- --op extract_frame --input raw/clip.mp4 --start 3 --output project/frames/clip-3s.png
 ```
 
-These are script calls, not direct tool calls; their JSON output is the evidence for `project/ingest.json`.
+Call transcription directly as:
+
+```json
+{"op":"speech.transcribe","input_path":"raw/clip.mp4","transcript_path":"project/transcripts/clip.json","timestamps":"word"}
+```
+
+These script/tool calls return JSON. Their output is the evidence for `project/ingest.json`.
 
 ## How to call the plan validator
 
@@ -49,7 +55,7 @@ You cannot plan against material you have not looked at. For EVERY supplied clip
 
 1. **Probe** it (`stage-edit edit_video --op probe`) for real duration / resolution / fps / audio presence. A plan that cuts past the real duration breaks.
 2. **Read its content** the cheapest way that fits:
-   - spoken audio → `stage-edit analyze_media --op transcribe` (pass `--model large-v3` for non-English) → you now have timecoded words to cut on.
+   - spoken audio → call `video_studio` `op: "speech.transcribe"` with `timestamps: "word"` → you now have timecoded words to cut on.
    - silent / screen-recording / slideshow → `stage-edit analyze_media --op ocr` → per-timecode on-screen text. The audio being empty does NOT mean the screen is.
    - need to judge what a moment LOOKS like (is the hero shot usable? is the product right-side up?) → read frames: `stage-edit edit_video --op extract_frame` then look at them. If you are multimodal you read them directly; if you cannot see images, say so and plan on probe/transcript/OCR evidence alone — mark those judgments unverified, do not invent them.
 3. Record what each input is good for in `project/ingest.json`: `{input_id, duration, has_audio, content_summary, quality_risks:[...], usable_for:[...], planning_implications:[...]}`. This is the factual basis the plan cites — segments reference `input_id`s from here. Rules:
@@ -66,7 +72,7 @@ Pick ONE `delivery_promise.type` and make the whole plan keep it:
 - **compose_led** — designed HTML is the spine (explainer / data); footage/generation are accents.
 - **hybrid** — a deliberate mix (e.g. source hero + composed framing + generated opener).
 
-Set `motion_min_ratio` to the minimum share of runtime that must be real motion rather than static cards — this is the anti-slideshow guard. If you cannot hit it from the available material, say so at gate A instead of quietly shipping a slideshow. If `source_required` is true, at least one PRIMARY segment must be real footage (`source: edit | provided`).
+Set `motion_min_ratio` to the minimum share of runtime that must be real motion rather than static cards — this is the anti-slideshow guard. If you cannot hit it from the available material, say so at gate A instead of quietly shipping a slideshow. If `source_required` is true, at least one PRIMARY segment must be real footage (`source: edit | provided`) — the supplied footage must play in the rendered timeline, not merely appear as a still reference frame.
 
 ## Step 3 — Decompose into a cross-modal EDL
 
@@ -77,6 +83,8 @@ Write `project/plan.json`. Every segment declares HOW it is produced (`source`) 
 - `role`: MUST be exactly one of hook / body / proof / cta / transition — the schema rejects any other value (E_SEG_ROLE) and the plan fails validation. Narrative BEAT names from the arc ("payoff", "establishing", "climax", …) are NOT roles: map a payoff / closing / CTA beat to `cta`, an establishing / evidence beat to `proof`. Front-load the hook.
 
 Tracks are separate from the visual timeline: `tracks.narration` (a `voice` from the voice table + timed lines `{text, start_sec, target_sec}`; each line gets a `produced_path` once synthesized, so one line can be re-voiced alone), `tracks.music` (path + duck under narration), `tracks.captions` (`{ from?, style?, lines:[{text, start_sec, target_sec}] }` — captions live as DATA here, NOT burned into the picture, so a typo is a one-line edit re-burned at assemble). Put the billable-generation count in `cost_estimate` — gate C reads it.
+
+Fit narration in the plan before any TTS call: use natural cadence (about 2.2-2.7 English words/sec or 4-5 Chinese chars/sec), shorten over-budget lines here, and do not rely on repeated synthesis to discover timing.
 
 **Author plan.json in EXACTLY this shape (copy the field names — the `stage-plan video_plan --op validate` script rejects any other shape):**
 

@@ -100,6 +100,23 @@ function isFile(p: string): boolean {
   catch { return false; }
 }
 
+// A successful verify constructs RapidOCR (loads the ONNX models) — too heavy
+// to repeat per call. Once a venv verifies, remember it via a sentinel keyed by
+// OCR_RUNTIME_KEY (versions + platform), so version bumps re-verify naturally.
+function sentinelPath(venv: string): string {
+  return path.join(venv, '.orkas-ocr-verified');
+}
+
+function sentinelMatches(venv: string): boolean {
+  try { return fs.readFileSync(sentinelPath(venv), 'utf8').trim() === OCR_RUNTIME_KEY; }
+  catch { return false; }
+}
+
+function writeSentinel(venv: string): void {
+  try { fs.writeFileSync(sentinelPath(venv), `${OCR_RUNTIME_KEY}\n`); }
+  catch { /* best-effort; next call just re-verifies */ }
+}
+
 function runtimeEnv(): NodeJS.ProcessEnv {
   return {
     ...process.env,
@@ -168,9 +185,14 @@ async function verifyRuntime(python: string, onProgress?: ProgressFn): Promise<R
 async function ensureRuntime(onProgress?: ProgressFn): Promise<RuntimeResult> {
   const venv = venvDir();
   const python = venvPython(venv);
+  if (isFile(python) && sentinelMatches(venv)) {
+    onProgress?.({ phase: 'ocr_runtime_ready', message: 'Local OCR runtime is ready' });
+    return { ok: true, python, venv, installed: false };
+  }
   onProgress?.({ phase: 'ocr_runtime_check', message: 'Checking local OCR runtime' });
   const existingVerification = await verifyRuntime(python, onProgress);
   if (existingVerification.ok === true) {
+    writeSentinel(venv);
     onProgress?.({ phase: 'ocr_runtime_ready', message: 'Local OCR runtime is ready' });
     return { ok: true, python, venv, installed: false };
   }
@@ -255,6 +277,7 @@ async function ensureRuntime(onProgress?: ProgressFn): Promise<RuntimeResult> {
 
   const installedVerification = await verifyRuntime(python, onProgress);
   if (installedVerification.ok === true) {
+    writeSentinel(venv);
     onProgress?.({ phase: 'ocr_runtime_ready', message: 'Local OCR runtime installed and ready' });
     return { ok: true, python, venv, installed: true };
   }
@@ -271,10 +294,11 @@ async function runOcrProcess(
   payload: string,
   onProgress: ProgressFn | undefined,
   signal: AbortSignal | undefined,
+  timeoutMs: number = OCR_TIMEOUT_MS,
 ): Promise<string> {
   const res = await withHeartbeat(
     execFileAsync(python, ['-c', PYTHON_OCR_SCRIPT, payload], {
-      timeout: OCR_TIMEOUT_MS,
+      timeout: timeoutMs,
       env: runtimeEnv(),
       windowsHide: true,
       maxBuffer: 8 * 1024 * 1024,
@@ -517,6 +541,67 @@ export async function ocrImageText(input: {
   }
 }
 
+export type OcrImagesTextResult =
+  | { ok: true; results: Array<{ text: string; items: Array<{ text: string; score?: number }>; error?: string }> }
+  | {
+      ok: false;
+      errorCode: 'E_OCR_RUNTIME_MISSING' | 'E_OCR_INSTALL_FAILED' | 'E_OCR_UNSUPPORTED_FILE' | 'E_OCR_FAILED';
+      message: string;
+    };
+
+/**
+ * Batch OCR: many images through ONE Python process / ONE RapidOCR model load
+ * (the per-frame path paid a full engine load per image — the dominant local
+ * cost when sampling video frames). Results align with `absPaths` by index; a
+ * failed frame carries `error` and empty text instead of failing the batch.
+ */
+export async function ocrImagesText(input: {
+  absPaths: string[];
+  signal?: AbortSignal;
+  onProgress?: ProgressFn;
+}): Promise<OcrImagesTextResult> {
+  if (!input.absPaths.length) return { ok: true, results: [] };
+  const bad = input.absPaths.find((p) => extKind(p) !== 'image');
+  if (bad) {
+    return { ok: false, errorCode: 'E_OCR_UNSUPPORTED_FILE', message: `ocrImagesText needs image files: ${bad}` };
+  }
+  const runtime = await ensureRuntime(input.onProgress);
+  if (runtime.ok === false) {
+    return { ok: false, errorCode: runtime.errorCode, message: runtime.message };
+  }
+  const payload = JSON.stringify({ paths: input.absPaths, kind: 'images', pages: '', scale: 2 });
+  // One model load plus a per-frame budget; a single-image call keeps OCR_TIMEOUT_MS.
+  const timeoutMs = Math.max(OCR_TIMEOUT_MS, 60_000 + 10_000 * input.absPaths.length);
+  let stdout = '';
+  try {
+    stdout = await runOcrProcess(runtime.python, payload, input.onProgress, input.signal, timeoutMs);
+  } catch (err) {
+    return { ok: false, errorCode: 'E_OCR_FAILED', message: `Local OCR failed: ${(err as Error).message}` };
+  }
+  try {
+    const parsed = JSON.parse(stdout) as {
+      ok?: boolean;
+      error?: unknown;
+      pages?: Array<{ text?: string; items?: Array<{ text: string; score?: number }>; error?: string }>;
+    };
+    if (!parsed?.ok) {
+      return { ok: false, errorCode: 'E_OCR_FAILED', message: String(parsed?.error || 'Local OCR failed') };
+    }
+    const pages = Array.isArray(parsed.pages) ? parsed.pages : [];
+    const results = input.absPaths.map((_, i) => {
+      const page = pages[i] || {};
+      return {
+        text: String(page.text || '').trim(),
+        items: Array.isArray(page.items) ? page.items : [],
+        ...(page.error ? { error: String(page.error) } : {}),
+      };
+    });
+    return { ok: true, results };
+  } catch (err) {
+    return { ok: false, errorCode: 'E_OCR_FAILED', message: `Local OCR returned invalid output: ${(err as Error).message}` };
+  }
+}
+
 // Keep this script dependency-light and resilient across RapidOCR package API
 // changes. The pinned `rapidocr` package needs a string model_root_dir here:
 // passing its default pathlib.Path trips OmegaConf on some Python versions.
@@ -621,13 +706,22 @@ def run_ocr(engine, image_path):
 
 def main():
     args = json.loads(sys.argv[1])
-    src = args["path"]
+    src = args.get("path")
     kind = args["kind"]
     engine = load_engine()
     pages = []
     if kind == "image":
         r = run_ocr(engine, src)
         pages.append({"page": 1, **r})
+    elif kind == "images":
+        # Batch mode: OCR many images under ONE engine load. A bad frame must
+        # not fail the batch — report it per-item and keep going.
+        for idx, image_path in enumerate(args["paths"]):
+            try:
+                r = run_ocr(engine, image_path)
+                pages.append({"page": idx + 1, **r})
+            except Exception as exc:
+                pages.append({"page": idx + 1, "text": "", "items": [], "error": str(exc)})
     elif kind == "pdf":
         import pypdfium2 as pdfium
         pdf = pdfium.PdfDocument(src)

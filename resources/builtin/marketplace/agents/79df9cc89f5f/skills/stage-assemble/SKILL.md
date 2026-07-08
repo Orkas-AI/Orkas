@@ -1,6 +1,7 @@
 ---
 ownerAgent: 79df9cc89f5f
 name: stage-assemble
+min_app_version: "1.5.1"
 description_zh: 把已审批的跨模态 EDL（plan.json）确定性地装配成成片的知识——按序产出每个片段（剪辑/合成/生成/已提供，分别委派给对应产线），再按 ffmpeg 层级装配：主轨拼接→合成叠层→混旁白(覆盖校验)→烧字幕→响度核对；带断点续跑，交 D 门前做 QA。AUTO 端到端产线的装配核心。
 description_en: Knowledge for deterministically assembling an approved cross-modal EDL (plan.json) into a finished video — produce each segment (edit / compose / generate / provided, each delegated to its line), then assemble in ffmpeg tiers: concat the primary track → overlay composed layers → mix narration (with a coverage check) → burn captions → verify loudness; idempotent-resumable, with QA before gate D. The assembly core of the AUTO end-to-end line.
 category: creation
@@ -8,26 +9,25 @@ category: creation
 
 # stage-assemble
 
-How to execute a validated `project/plan.json` into one finished file. By the time you are here the plan passed the `stage-plan video_plan --op validate` script and the user approved it at gate B. Walk it; do not re-plan. Host-neutral: VideoStudio-specific media work runs through skill scripts (`stage-edit edit_video`, `stage-compose render_composition`, `stage-plan video_plan` via `bin/run-skill.cjs`); generic built-in capabilities remain `generate_video` / `generate_image` / `generate_speech`.
+How to execute a validated `project/plan.json` into one finished file. By the time you are here the plan passed the `stage-plan video_plan --op validate` script and the user approved it at gate B. Walk it; do not re-plan. Host-neutral: VideoStudio-specific edit/plan work runs through skill scripts (`stage-edit edit_video`, `stage-plan video_plan` via `bin/run-skill.cjs`), while composition and transcription run through the required built-in `video_studio` runtime; generic built-in capabilities remain `generate_video` / `generate_image` / `generate_speech`.
 
 ## Script calls used here
 
 ```bash
 "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit edit_video -- --op concat --inputs project/parts/a.mp4,project/parts/b.mp4 --output project/render/primary.mp4
 "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit edit_video -- --op mix --input project/render/primary.mp4 --audio-segments @project/audio_segments.json --output project/render/mixed.mp4
-"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit edit_video -- --op loudness --input project/render/draft.mp4
-"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-compose render_composition -- --op render --composition-dir project/composition --output project/parts/card.mp4 --quality draft
+"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit edit_video -- --op normalize_loudness --input project/render/draft.mp4 --output project/render/video.mp4
 ```
 
-When this document says `stage-edit edit_video --op ...`, call the matching `bin/run-skill.cjs` command above with the relevant paths. Do not call deprecated direct tools.
+When this document says `stage-edit edit_video --op ...`, call the matching `bin/run-skill.cjs` command above with the relevant paths. For compose/transcription work, call `video_studio` directly. Do not call deprecated direct tools.
 
 ## Step 1 — Produce each segment (delegate by source)
 
 Iterate segments in `order`. For each, produce its `produced_path` according to `source`, then write that path + `status:"done"` back into the segment so a resume never re-produces it:
 
 - **edit** → `stage-edit`: `stage-edit edit_video --op trim` the `input_id` to `[in_sec, out_sec]` → `project/cuts/<id>.mp4`.
-- **compose** → `stage-compose`: build a small composition for `spec.kind` (title card, lower-third, stat card, captions) → `stage-compose render_composition --op render` to `project/parts/<id>.mp4` (or keep as an overlay element for step 2).
-- **generate** → `stage-generate` (+ `stage-consistency` for recurring characters): only AFTER gate C. `generate_video`/`generate_image` → `project/assets/<id>.mp4`. Generate at most ~4 shots in flight (the `run_worker` fan-out cap — do not assume unlimited parallelism); a failed shot retries without blocking the batch. Per `stage-consistency`: feed each shot the segment's `refs` (locked portrait + the prior same-scene shot's last frame) and honor its `variation_type`, then extract this shot's last frame to carry the look forward so multi-shot characters do not drift.
+- **compose** → `stage-compose`: build a small visual-only composition for `spec.kind` (title card, lower-third, stat card, captions) under `project/compositions/<id>/` → call `video_studio` `op: "composition.draft"` to `project/parts/<id>.mp4` with `report_path: "project/reports/<id>-compose-report.json"`. This keeps compose segments on the same contract/source/inspect/video-QA path as standalone COMPOSE while still letting the assembler own narration and loudness.
+- **generate** → `stage-generate` (+ `stage-consistency` for recurring characters): only AFTER gate C. `generate_video`/`generate_image` → `project/assets/<id>.mp4`. Generate at most ~4 shots in flight (the `run_worker` fan-out cap — do not assume unlimited parallelism); a failed shot retries at most twice without blocking the batch, then stays failed with a note instead of burning further billable attempts. Per `stage-consistency`: feed each shot the segment's `refs` (locked portrait + the prior same-scene shot's last frame) and honor its `variation_type`, then extract this shot's last frame to carry the look forward so multi-shot characters do not drift.
 - **provided** → use `spec.asset_id` as-is (probe it first; conform aspect/fps if needed).
 
 Billable `generate` segments must not run before gate C has confirmed the count from `cost_estimate`. Produce cheap/free segments (edit, compose, provided) freely.
@@ -38,14 +38,14 @@ Assemble deterministically, bottom-up. This tiered order is the default; it is p
 
 1. **Primary track** — `stage-edit edit_video --op concat` the primary-layer `produced_path`s in `order` → `project/render/primary.mp4`. Conform aspect/fps on the way in if sources differ.
 2. **Overlays / bg** — for each overlay/bg segment, `stage-edit edit_video --op overlay` its part onto the primary over the window of the segment named in `over` (title cards, lower-thirds, logos). Composed layers are VISUAL-ONLY — they must not carry their own narration audio. **This includes a compose segment that IS the primary track (a full-video composition): render it SILENT — do not put a narration `<audio>` in its `index.html`. The assembler owns narration (tier 3), so a composition that bakes it in would mean narration is added TWICE (the "two voices" defect).**
-3. **Narration — added EXACTLY ONCE, here.** If `tracks.narration` exists, `generate_speech` each line with the planned `voice` and write each line's `produced_path` back (so a later edit can re-voice ONE line alone), then add them in ONE `stage-edit edit_video --op mix` call using `--audio-segments` — one entry per line, each at its `start_sec` — so each line is delayed onto its scene (per-line placement; do NOT pre-bake one continuous narration file, that destroys per-line alignment and separability). The mix DEFAULTS to `on_existing_audio:"reject"`: if the base already has an audio track it FAILS with `E_EDIT_BASE_HAS_AUDIO` — that means a compose segment baked narration into its render; go back and re-render that segment SILENT (remove its narration `<audio>`), then re-mix. RUN THE COVERAGE CHECK on the result: mix reports whether the voiceover covers the video and flags an uncovered tail or silent lead-in — fix a desync before the draft, do not ship a voiceover that quits halfway. For a clip that already has lip-synced speech (a talking-head generate clip), KEEP its built-in audio — never synthesize a narration over a speaking mouth; if you must add music under it, that is a deliberate layer (`--on-existing-audio mix`), not a second voice.
+3. **Narration — added EXACTLY ONCE, here.** If `tracks.narration` exists, re-check line length against `target_sec` before synthesis; shorten over-budget lines in `project/plan.json` while preserving meaning. Then `generate_speech` each line with the planned `voice` and write each line's `produced_path` back (so a later edit can re-voice ONE line alone). Aim for one TTS call per line; allow at most one shortened retry after a real fit failure. Add the produced lines in ONE `stage-edit edit_video --op mix` call using `--audio-segments` — one entry per line, each at its `start_sec` — so each line is delayed onto its scene (per-line placement; do NOT pre-bake one continuous narration file, that destroys per-line alignment and separability). The mix DEFAULTS to `on_existing_audio:"reject"`: if the base already has an audio track it FAILS with `E_EDIT_BASE_HAS_AUDIO` — that means a compose segment baked narration into its render; go back and re-render that segment SILENT (remove its narration `<audio>`), then re-mix. RUN THE COVERAGE CHECK on the result: mix reports whether the voiceover covers the video and flags an uncovered tail or silent lead-in — fix a desync before the draft, do not ship a voiceover that quits halfway. An INTENDED music-only or silent tail (e.g. a CTA end card) is allowed, but state it explicitly in the Gate D note as acceptable-or-change, never leave it as a surprise. For a clip that already has lip-synced speech (a talking-head generate clip), KEEP its built-in audio — never synthesize a narration over a speaking mouth; if you must add music under it, that is a deliberate layer (`--on-existing-audio mix`), not a second voice.
 4. **Music** — add `tracks.music` ducked under narration by the planned amount.
 5. **Captions** — turn `tracks.captions.lines` (`{text, start_sec, target_sec}`) into a `.srt`, then `stage-edit edit_video --op burnsubs`. Captions are DATA in the plan — burned ONLY here at assemble — so a later typo fix is a one-line edit re-burned, never a re-render of the picture. If `burnsubs` fails because the runtime ffmpeg lacks subtitle filter support, stop and report that blocker; do not hand-write a fallback `ffmpeg` graph, do not use `-loop 1` PNG subtitle overlays, and do not recompose the whole video just to fix captions.
-6. **Loudness** — `stage-edit edit_video --op loudness` and confirm the mix sits near the targets in `video-craft` §7 (~−14 LUFS integrated, true-peak ≤ ~−1 dBTP). Re-mix if it is off.
+6. **Loudness** — run `stage-edit edit_video --op normalize_loudness --input project/render/draft.mp4 --output project/render/video.mp4`. It normalizes to the `video-craft` §7 targets (~−14 LUFS integrated, true-peak ≤ ~−1 dBTP) and returns the measured loudness; only fall back to `--op loudness` when you are diagnosing an existing file without writing a deliverable.
 
 Apply the plan's `style_kit` for cohesion: composed layers (titles/captions/cards) use its `palette` + `fonts`. A single `lut` graded across all clips is what unifies tonally mixed sources — until a grade op is available, keep mixed sources close at capture/trim and lean on the shared palette + consistent captions for cohesion rather than promising a uniform grade.
 
-Output `project/render/draft.mp4`.
+Output `project/render/video.mp4` as the deliverable; `project/render/draft.mp4` is the pre-normalized intermediate.
 
 ## Director judgment (end-to-end assembly)
 
@@ -69,8 +69,8 @@ Before showing the draft, run the QA pass and write `project/render_report.json`
 - **technical_probe** — `stage-edit edit_video --op probe` the draft (real duration / resolution / fps / audio present); confirm it matches the plan's aspect + total.
 - **promise_preservation** — run `"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-plan video_plan -- --op promise_check --plan project/plan.json --probe-produced`. At gate D this probes each primary segment's `produced_path` and computes the REAL primary-track motion ratio vs. `motion_min_ratio` plus the `source_required` invariant; missing/unreadable produced media or a fail means **"slideshow / promise broken" — do not deliver**. Send it back (below). Do not eyeball this; let the numbers decide.
 - **visual_spotcheck** — extract ~4 frames across the draft (`stage-edit edit_video --op extract_frame`) and read them for upside-down / garbled-caption / empty / wrong-product frames. Read them yourself if you are multimodal; if you cannot see images, record the spot-check as `unverified` and proceed — do not invent what the frames show.
-- **audio_spotcheck** — the `op="loudness"` numbers + the narration coverage result from step 2 (uncovered tail / silent lead-in).
-- **transcript_comparison** (when there is narration) — optionally `stage-edit analyze_media --op transcribe` the draft and confirm the spoken words match the planned narration lines.
+- **audio_spotcheck** — the `op="normalize_loudness"` measured loudness numbers + the narration coverage result from step 2 (uncovered tail / silent lead-in).
+- **transcript_comparison** (when there is narration) — optionally transcribe the draft with `video_studio` `op: "speech.transcribe"`, then confirm the spoken words match the planned narration lines.
 
 Each section carries `pass` / `warn` / `fail` + a one-line reason. Then present the draft `[video]` + the report's headline findings at **gate D**.
 
