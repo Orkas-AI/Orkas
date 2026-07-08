@@ -220,7 +220,8 @@ describe("Session", () => {
     const view = session.getMessagesForModel();
     const serialized = JSON.stringify(view);
     expect(serialized).toContain("Earlier tool calls/results in this same user turn have been summarized");
-    expect(serialized).toContain("re-read the relevant path/range with tools");
+    expect(serialized).toContain("Do not re-read files, logs, screenshots, or skill documents merely to regain omitted context");
+    expect(serialized).toContain("prefer narrow ranges, grep/search/stat, or the existing artifact path over full-file reads");
     expect(serialized).toContain("Older tool work summarized");
     expect(serialized).not.toContain("call-0");
     expect(serialized).not.toContain("result-0");
@@ -306,6 +307,64 @@ describe("Session", () => {
       (m) => m.role === "user" && m.content.some((c) => c.type === "text" && (c as { text: string }).text.includes("TASK: build the whole thing")),
     );
     expect(hasTask).toBe(true);
+  });
+
+  it("rebuilds a restored active turn when a terminal assistant answer was followed by a new user turn", () => {
+    const session = new Session();
+    session.addMessage("user", [{ type: "text", text: "do the task" }]);
+    session.addMessage("assistant", [{ type: "tool_use", id: "c1", name: "noop", input: {} }]);
+    session.addMessage("user", [{ type: "tool_result", toolUseId: "c1", content: "ok", isError: false }]);
+    session.addMessage("assistant", [{ type: "text", text: "first final" }]);
+    session.addMessage("user", [{ type: "text", text: "new requirement" }]);
+
+    const rebuilt = session.restoreContextState({
+      version: 1,
+      nextTurnId: 2,
+      completedTurns: [],
+      activeTurn: { id: 1, userMessageIndex: 0, startIndex: 0 },
+      resources: [],
+    });
+
+    expect(rebuilt).toBe(true);
+    const context = session.getSerializedContextState();
+    expect(context?.completedTurns).toHaveLength(1);
+    expect(context?.completedTurns[0]).toMatchObject({
+      id: 1,
+      userMessageIndex: 0,
+      finalAssistantMessageIndex: 3,
+      startIndex: 0,
+      endIndex: 3,
+    });
+    expect(context?.activeTurn).toMatchObject({
+      id: 2,
+      userMessageIndex: 4,
+      startIndex: 4,
+    });
+  });
+
+  it("keeps a restored active turn when steer happens before a terminal answer", () => {
+    const session = new Session();
+    session.addMessage("user", [{ type: "text", text: "do the task" }]);
+    session.addMessage("assistant", [{ type: "tool_use", id: "c1", name: "noop", input: {} }]);
+    session.addMessage("user", [{ type: "tool_result", toolUseId: "c1", content: "ok", isError: false }]);
+    session.addMessage("user", [{ type: "text", text: "adjust the plan" }]);
+
+    const rebuilt = session.restoreContextState({
+      version: 1,
+      nextTurnId: 2,
+      completedTurns: [],
+      activeTurn: { id: 1, userMessageIndex: 0, startIndex: 0 },
+      resources: [],
+    });
+
+    expect(rebuilt).toBe(false);
+    const context = session.getSerializedContextState();
+    expect(context?.completedTurns).toHaveLength(0);
+    expect(context?.activeTurn).toMatchObject({
+      id: 1,
+      userMessageIndex: 0,
+      startIndex: 0,
+    });
   });
 
   it("does not drop completed turns still awaiting rolling-summary archival", () => {

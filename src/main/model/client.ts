@@ -75,11 +75,11 @@ export interface ChatOptions {
    *  (before the first stream event). Default 1800. core-agent's per-tool
    *  watchdog stays authoritative for tool stalls; this is the outer backstop. */
   idleTimeout?: number;
-  /** Short idle window (seconds) applied ONLY while waiting for the model to
-   *  stream tokens with NO tool in flight, after the first event has arrived.
-   *  Catches a provider stream that started then went silent mid-generation,
-   *  without false-killing long/silent tools (those run under `idleTimeout` +
-   *  the per-tool watchdog). Default 180. */
+  /** Short idle window (seconds) applied ONLY after ordinary assistant text
+   *  has begun streaming with NO tool in flight. Catches a provider stream
+   *  that started then went silent mid-generation, without false-killing
+   *  cold starts, post-tool model thinking, or long/silent tools (those run
+   *  under `idleTimeout` + the per-tool watchdog). Default 180. */
   streamIdleTimeout?: number;
   /** Max tool-call rounds in a single turn before the run is force-ended with
    *  "(Tool loop limit reached)". Undefined → core-agent default (100). Group

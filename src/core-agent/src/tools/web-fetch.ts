@@ -113,6 +113,48 @@ function extractTitle(html: string): string | undefined {
   return m ? htmlToText(m[1]).trim() : undefined;
 }
 
+export type FetchContentIssue = {
+  code: "WAF_OR_BOT_CHECK" | "PAGE_NOT_FOUND" | "JS_OR_NAV_SHELL";
+  message: string;
+};
+
+export function classifyFetchContent(url: string, title: string | undefined, raw: string, text: string): FetchContentIssue | null {
+  const head = `${title || ""}\n${raw.slice(0, 6000)}\n${text.slice(0, 3000)}`;
+  const compactText = text.replace(/\s+/g, "");
+
+  if (/_waf_[a-z0-9]+|captcha|cloudflare|access denied|bot detection|人机验证|安全验证|访问验证|验证码|反爬/i.test(head)) {
+    return {
+      code: "WAF_OR_BOT_CHECK",
+      message:
+        "The site returned an anti-bot/WAF challenge instead of readable page content. " +
+        "Do not retry the same web_fetch URL repeatedly; use search snippets, an accessible mirror/official source, or ask the user to provide the page text.",
+    };
+  }
+
+  if (/页面不见了|页面找不到了|你访问的页面不见了|内容不存在|该内容已删除|404\s*(?:not found|页面)|page not found/i.test(head)) {
+    return {
+      code: "PAGE_NOT_FOUND",
+      message:
+        "The site says the page is missing or unavailable. " +
+        "Do not keep fetching this URL; search for another copy or ask the user for a valid link/source.",
+    };
+  }
+
+  if (
+    /please enable javascript|enable javascript to continue|requires javascript|请启用javascript|需要javascript/i.test(head)
+    || (/cls\.cn/i.test(url) && /关于我们网站声明联系方式用户反馈网站地图帮助首页电报话题盯盘VIPFM投研下载/.test(compactText))
+  ) {
+    return {
+      code: "JS_OR_NAV_SHELL",
+      message:
+        "The site returned a JavaScript application shell/navigation page, not the article body. " +
+        "Do not treat this as source content; use a browser-rendered source, search snippets, an alternate source, or ask the user for the text.",
+    };
+  }
+
+  return null;
+}
+
 export const webFetchTool: AgentTool = defineTool({
   name: "web_fetch",
   executionMode: "parallel",
@@ -213,11 +255,15 @@ export const webFetchTool: AgentTool = defineTool({
         // HTML: extract text
         const title = extractTitle(raw);
         let text = htmlToText(raw);
+        const issue = classifyFetchContent(url, title, raw, text);
         if (text.length > maxChars) {
           text = text.slice(0, maxChars) + "\n...(truncated)";
         }
 
         const header = title ? `Title: ${title}\nURL: ${url}\n\n` : `URL: ${url}\n\n`;
+        if (issue) {
+          return { content: `${header}${issue.code}: ${issue.message}\n\nExtracted text preview:\n${text}`, isError: true };
+        }
         return { content: header + text };
       } finally {
         clearTimeout(timer);

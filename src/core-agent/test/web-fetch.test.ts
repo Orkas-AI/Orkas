@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { resolveCharset, decodeBytes } from "../src/tools/web-fetch.js";
+import { resolveCharset, decodeBytes, classifyFetchContent } from "../src/tools/web-fetch.js";
 
 describe("web-fetch › resolveCharset", () => {
   it("picks charset from Content-Type header when present", () => {
@@ -66,5 +66,51 @@ describe("web-fetch › decodeBytes", () => {
   it("unknown charset label falls back to utf-8 instead of throwing", () => {
     const buf = Buffer.from("hello", "utf-8");
     expect(decodeBytes(buf, "this-is-not-a-real-charset")).toBe("hello");
+  });
+});
+
+describe("web-fetch › classifyFetchContent", () => {
+  it("marks WAF challenge bodies as failed content", () => {
+    const issue = classifyFetchContent(
+      "https://xueqiu.com/3439096517/390394657",
+      undefined,
+      '{"_waf_bd8ce2ce37":"Pfachz2vL1SL0SmQA"}3EJP1NTyp9ak5NoRM',
+      '{"_waf_bd8ce2ce37":"Pfachz2vL1SL0SmQA"}',
+    );
+
+    expect(issue).toMatchObject({ code: "WAF_OR_BOT_CHECK" });
+  });
+
+  it("marks missing social pages as failed content", () => {
+    const issue = classifyFetchContent(
+      "https://www.xiaohongshu.com/discovery/item/deleted",
+      "小红书 - 你访问的页面不见了",
+      "<html><title>小红书 - 你访问的页面不见了</title></html>",
+      "小红书 - 你访问的页面不见了",
+    );
+
+    expect(issue).toMatchObject({ code: "PAGE_NOT_FOUND" });
+  });
+
+  it("marks known article navigation shells as failed content", () => {
+    const issue = classifyFetchContent(
+      "https://www.cls.cn/detail/xk/68a020e69b01344433be9032",
+      "财联社电报：7*24小时滚动播报股市资讯",
+      "<html><title>财联社电报：7*24小时滚动播报股市资讯</title></html>",
+      "关于我们 网站声明 联系方式 用户反馈 网站地图 帮助 首页 电报 话题 盯盘 VIP FM 投研 下载",
+    );
+
+    expect(issue).toMatchObject({ code: "JS_OR_NAV_SHELL" });
+  });
+
+  it("does not classify normal article text as failed content", () => {
+    const issue = classifyFetchContent(
+      "https://example.com/article",
+      "Quarterly results",
+      "<html><title>Quarterly results</title><article>Revenue grew 20 percent.</article></html>",
+      "Quarterly results\nRevenue grew 20 percent.",
+    );
+
+    expect(issue).toBeNull();
   });
 });

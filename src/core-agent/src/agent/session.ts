@@ -251,8 +251,10 @@ export class Session {
             text:
               "[Current turn checkpoint]\n" +
               "Earlier tool calls/results in this same user turn have been summarized and omitted from the current model context.\n" +
-              "Use this checkpoint as progress memory, not as exact file/log/tool-output content.\n" +
-              "If exact file contents, command output, logs, or code/HTML/JSON snippets are needed before acting, re-read the relevant path/range with tools.\n\n" +
+              "Use this checkpoint as progress memory and continue from it.\n" +
+              "Do not re-read files, logs, screenshots, or skill documents merely to regain omitted context.\n" +
+              "Only re-read when exact current bytes/lines are required for a quote, targeted edit, command input, or verification that cannot rely on the checkpoint.\n" +
+              "When re-reading is necessary, prefer narrow ranges, grep/search/stat, or the existing artifact path over full-file reads.\n\n" +
               active.checkpointSummary,
           }],
         });
@@ -660,9 +662,26 @@ export class Session {
       if (!isPositiveInteger(active.id) || seenIds.has(active.id)) return false;
       maxId = Math.max(maxId, active.id);
       if (!this.isValidActiveTurn(active)) return false;
+      if (this.activeTurnContainsTerminalSteer(active)) return false;
       if (active.startIndex <= lastEnd) return false;
     }
     return Number.isFinite(state.nextTurnId) && state.nextTurnId > maxId;
+  }
+
+  private activeTurnContainsTerminalSteer(active: ActiveTurnRecord): boolean {
+    let sawTerminalAssistant = false;
+    for (let i = active.userMessageIndex + 1; i < this.messages.length; i++) {
+      const msg = this.messages[i];
+      if (isUserTurnStarter(msg)) {
+        if (sawTerminalAssistant) return true;
+        continue;
+      }
+      if (msg.role !== "assistant") continue;
+      const hasToolUse = msg.content.some((c) => c.type === "tool_use");
+      const hasText = msg.content.some((c) => c.type === "text" && c.text.trim());
+      if (!hasToolUse && hasText) sawTerminalAssistant = true;
+    }
+    return false;
   }
 
   private isValidCompletedTurn(turn: CompletedTurnRecord): boolean {

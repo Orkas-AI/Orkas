@@ -4,10 +4,11 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 // Phase 1 (long-task-streaming-reliability): the model-stream idle watchdog is
-// phase-aware. While waiting for the MODEL to stream tokens (no tool in flight,
-// after the first event) it uses the SHORT `streamIdleTimeout` so a stream that
-// started then went silent recovers fast; while a TOOL is executing (and on cold
-// start) it uses the long `idleTimeout` so a long/silent download is not
+// phase-aware. While the MODEL is actively streaming text (no tool in flight)
+// it uses the SHORT `streamIdleTimeout` so a stream that started then went
+// silent recovers fast; while a TOOL is executing, on cold start, and after a
+// tool has finished but before the next text delta, it uses the long
+// `idleTimeout` so long/silent thinking and downloads are not
 // false-killed. Either way the turn must terminate cleanly (yield error/final +
 // done and RETURN — no wedge), so the bus worker can run its finally and accept
 // the next message.
@@ -81,7 +82,7 @@ async function drain(opts: Record<string, unknown>): Promise<{ events: Array<{ t
 
 describe('streamChatWithModel — phase-aware idle watchdog (Phase 1)', () => {
   it('SHORT model-stream window catches a stream that started then stalled (no long wait)', async () => {
-    // Stream emits one delta, then goes silent. After the first event, the
+    // Stream emits one delta, then goes silent. After the first text event, the
     // model-stream phase uses streamIdleTimeout (0.3s), NOT idleTimeout (10s).
     h.makeStream = () =>
       (async function* () {
@@ -115,6 +116,27 @@ describe('streamChatWithModel — phase-aware idle watchdog (Phase 1)', () => {
     expect(types).toContain('final');
     expect(events.find((e) => e.type === 'final')?.text || '').toContain('done downloading');
     // No idle timeout fired — the tool outlived the short window unharmed.
+    expect(events.some((e) => e.type === 'error' && /no response|exceeded/i.test(e.text || ''))).toBe(false);
+    expect(types[types.length - 1]).toBe('done');
+    expect(ms).toBeGreaterThanOrEqual(550);
+  }, 8000);
+
+  it('post-tool model thinking is NOT false-killed by the short window', async () => {
+    // Once a tool finishes, the next provider call can legitimately spend a
+    // while thinking before the first text token. That post-tool cold-start
+    // gap should use the long idle window until text starts streaming again.
+    h.makeStream = () =>
+      (async function* () {
+        yield { type: 'tool_start', id: 't1', name: 'bash', input: {} };
+        yield { type: 'tool_end', id: 't1', name: 'bash', result: 'downloaded', isError: false };
+        await delay(600);
+        yield { type: 'text_delta', text: 'final answer after thinking' };
+      })();
+
+    const { events, ms } = await drain({ streamIdleTimeout: 0.2, idleTimeout: 10 });
+    const types = events.map((e) => e.type);
+    expect(types).toContain('final');
+    expect(events.find((e) => e.type === 'final')?.text || '').toContain('final answer after thinking');
     expect(events.some((e) => e.type === 'error' && /no response|exceeded/i.test(e.text || ''))).toBe(false);
     expect(types[types.length - 1]).toBe('done');
     expect(ms).toBeGreaterThanOrEqual(550);
