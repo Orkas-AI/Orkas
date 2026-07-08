@@ -953,6 +953,15 @@ function _ctxHasHiddenPathSegment(name) {
   return String(name || '').split('/').some(part => part.startsWith('.'));
 }
 
+function _ctxUploadErrorCode(reason) {
+  const text = String(reason || '').toLowerCase();
+  if (text === 'ext') return 'ext';
+  if (text === 'hidden') return 'hidden';
+  if (/picker/.test(text)) return 'picker_failed';
+  if (/network|fetch|timeout|econn|enotfound|socket/.test(text)) return 'network';
+  return 'upload_failed';
+}
+
 async function handleCtxUpload(fileList, targetDir = '') {
   const files = Array.from(fileList || []);
   _contextsLog.info(`upload: ${files.length} file(s), targetDir="${targetDir || '(root)'}"`);
@@ -1015,7 +1024,7 @@ async function handleCtxUpload(fileList, targetDir = '') {
   const rejected = results.filter((r) => !r.ok);
   for (const r of rejected) {
     _contextsLog.warn('upload failed', r.name, r.reason);
-    if (window.Monitor) (() => {})('library_file_upload', { error_message: r.reason });
+    if (window.Monitor) (() => {})('library_file_upload', { error_message: _ctxUploadErrorCode(r.reason) });
   }
   const extRejected = rejected.filter((r) => r.reason === 'ext');
   const hiddenRejected = rejected.filter((r) => r.reason === 'hidden');

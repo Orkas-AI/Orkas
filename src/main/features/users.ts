@@ -139,9 +139,14 @@ function readRegistry(): UsersRegistry | null {
     migrated = true;
   }
   if (!hasUser(devCur)) {
-    // Migration: older files did not have dev_current_user_id. Seed it from
-    // current_user_id so dev starts from the same uid once, then diverges.
-    devCur = cur;
+    // Migration: older files did not have dev_current_user_id. A dev process may
+    // seed itself from the historical current pointer once; a prod process must
+    // not manufacture a dev pointer to the prod account during unrelated uid
+    // migrations.
+    devCur = CURRENT_USER_FIELD === 'dev_current_user_id' ? cur : ANONYMOUS_LOCAL_ID;
+    if (!hasUser(devCur)) {
+      users.push({ user_id: devCur, created_at: nowIso() });
+    }
     migrated = true;
   }
 
@@ -165,14 +170,25 @@ function recordForLocalId(localId: string): UserRecord {
   return reg?.users.find((u) => u.user_id === localId) || { user_id: localId, created_at: nowIso() };
 }
 
+function otherCurrentUserField(field: CurrentUserField): CurrentUserField {
+  return field === 'current_user_id' ? 'dev_current_user_id' : 'current_user_id';
+}
+
 function replaceCurrentLocalId(reg: UsersRegistry, from: string, to: string): UsersRegistry {
+  if (from === to) return reg;
   const fromRecord = reg.users.find((u) => u.user_id === from);
   const existingTarget = reg.users.find((u) => u.user_id === to);
-  const nextUsers = reg.users.filter((u) => u.user_id !== from && u.user_id !== to);
+  const otherField = otherCurrentUserField(CURRENT_USER_FIELD);
+  const nextCurrent = reg[CURRENT_USER_FIELD] === from ? to : reg[CURRENT_USER_FIELD];
+  const keepFrom = reg[otherField] === from || nextCurrent === from;
+  const nextUsers = reg.users.filter((u) => u.user_id !== to && (keepFrom || u.user_id !== from));
+  if (keepFrom && !nextUsers.some((u) => u.user_id === from)) {
+    nextUsers.push(fromRecord || { user_id: from, created_at: nowIso() });
+  }
   nextUsers.push(existingTarget || { user_id: to, created_at: fromRecord?.created_at || nowIso() });
   return {
-    current_user_id: reg.current_user_id === from ? to : reg.current_user_id,
-    dev_current_user_id: reg.dev_current_user_id === from ? to : reg.dev_current_user_id,
+    current_user_id: CURRENT_USER_FIELD === 'current_user_id' ? nextCurrent : reg.current_user_id,
+    dev_current_user_id: CURRENT_USER_FIELD === 'dev_current_user_id' ? nextCurrent : reg.dev_current_user_id,
     users: nextUsers,
   };
 }

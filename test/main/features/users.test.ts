@@ -225,7 +225,32 @@ describe('features/users › account uid', () => {
     expect(fs.readFileSync(path.join(tmpDir, rec.user_id, 'local', 'config', 'marker.txt'), 'utf8')).toBe('kept');
     const reg = JSON.parse(fs.readFileSync(path.join(tmpDir, 'users.json'), 'utf-8'));
     expect(reg.current_user_id).toBe(rec.user_id);
-    expect(reg.users.map((u: { user_id: string }) => u.user_id)).toEqual([rec.user_id]);
+    expect(reg.dev_current_user_id).toBe(users.ANONYMOUS_LOCAL_ID);
+    expect(reg.users.map((u: { user_id: string }) => u.user_id).sort()).toEqual([
+      rec.user_id,
+      users.ANONYMOUS_LOCAL_ID,
+    ]);
+  });
+
+  it('does not rewrite the dev pointer when prod adopts anonymous on login', async () => {
+    writeUsersJson({
+      current_user_id: 'anonymous',
+      dev_current_user_id: 'anonymous',
+      users: [{ user_id: 'anonymous', created_at: '2026-01-01T00:00:00' }],
+    });
+    const users = await import('../../../src/main/features/users');
+    users.initActiveUser({ defaultLocalId: users.ANONYMOUS_LOCAL_ID });
+    fs.writeFileSync(path.join(tmpDir, 'anonymous', 'local', 'config', 'marker.txt'), 'kept');
+
+    const rec = users.switchToAccountLocalId('A0653F11-9F05-4A8B-89CE-0026D809EAFC');
+
+    const reg = readUsersJson();
+    expect(reg.current_user_id).toBe(rec.user_id);
+    expect(reg.dev_current_user_id).toBe('anonymous');
+    expect(reg.users.map((u: { user_id: string }) => u.user_id).sort()).toEqual([
+      'A0653F11-9F05-4A8B-89CE-0026D809EAFC',
+      'anonymous',
+    ]);
   });
 
   it('rekeys auth-profiles when anonymous is renamed to the account uid', async () => {
@@ -317,7 +342,11 @@ describe('features/users › account uid', () => {
     expect(fs.existsSync(path.join(tmpDir, 'A0653F11-9F05-4A8B-89CE-0026D809EAFC', 'local', 'config', 'account.json'))).toBe(true);
     const reg = JSON.parse(fs.readFileSync(path.join(tmpDir, 'users.json'), 'utf-8'));
     expect(reg.current_user_id).toBe('A0653F11-9F05-4A8B-89CE-0026D809EAFC');
-    expect(reg.users).toEqual([{ user_id: 'A0653F11-9F05-4A8B-89CE-0026D809EAFC', created_at: '2026-01-01T00:00:00' }]);
+    expect(reg.dev_current_user_id).toBe(users.ANONYMOUS_LOCAL_ID);
+    expect(reg.users.map((u: { user_id: string }) => u.user_id).sort()).toEqual([
+      'A0653F11-9F05-4A8B-89CE-0026D809EAFC',
+      users.ANONYMOUS_LOCAL_ID,
+    ]);
   });
 
   it('migrates a legacy logged-in 8-digit directory to account uid at startup', async () => {
@@ -371,7 +400,11 @@ describe('features/users › account uid', () => {
     expect(fs.existsSync(path.join(tmpDir, 'A0653F11-9F05-4A8B-89CE-0026D809EAFC', 'local', 'config', 'account.json'))).toBe(true);
     const reg = JSON.parse(fs.readFileSync(path.join(tmpDir, 'users.json'), 'utf-8'));
     expect(reg.current_user_id).toBe('A0653F11-9F05-4A8B-89CE-0026D809EAFC');
-    expect(reg.users).toEqual([{ user_id: 'A0653F11-9F05-4A8B-89CE-0026D809EAFC', created_at: '2026-01-01T00:00:00' }]);
+    expect(reg.dev_current_user_id).toBe(users.ANONYMOUS_LOCAL_ID);
+    expect(reg.users.map((u: { user_id: string }) => u.user_id).sort()).toEqual([
+      'A0653F11-9F05-4A8B-89CE-0026D809EAFC',
+      users.ANONYMOUS_LOCAL_ID,
+    ]);
     const raw = fs.readFileSync(path.join(tmpDir, 'A0653F11-9F05-4A8B-89CE-0026D809EAFC', 'local', 'config', 'auth-profiles.json'), 'utf8');
     const json = localSecrets.decryptLocalSecret({
       namespace: 'auth.profiles',

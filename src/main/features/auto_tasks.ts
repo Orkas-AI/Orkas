@@ -850,6 +850,17 @@ function _tryClaimFireBoundary(uid: string, task: AutoTask, boundary: Date, now:
   }
 }
 
+function _releaseFireBoundaryClaim(uid: string, task: AutoTask, boundary: Date): void {
+  const file = _claimFile(uid, task.id, boundary);
+  try {
+    fs.unlinkSync(file);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return;
+    log.warn(`fire claim release failed uid=${uid} id=${task.id}: ${(err as Error).message}`);
+  }
+}
+
 // ── Dispatch ────────────────────────────────────────────────────────────
 
 function _formatSeedPrefix(
@@ -1180,6 +1191,14 @@ async function _onTimerFire(uid: string, taskId: string): Promise<void> {
         // Stamp last_run_at FIRST (and disable on one_time) so a slow fire
         // can't get re-picked by a future re-schedule.
         await _markRan(uid, taskId, now.toISOString(), task.schedule.type === 'one_time');
+      } catch (err) {
+        _releaseFireBoundaryClaim(uid, task, dueBoundary);
+        log.warn(`fire mark failed id=${taskId}: ${(err as Error).message}`);
+        const fresh = await _readOne(uid, taskId);
+        if (fresh) _scheduleTask(uid, fresh);
+        return;
+      }
+      try {
         await _fireTask(uid, task);
       } catch (err) {
         log.warn(`fire failed id=${taskId}: ${(err as Error).message}`);
