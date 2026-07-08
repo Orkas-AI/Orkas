@@ -16,6 +16,8 @@ export type ToolUseContent = {
   id: string;
   name: string;
   input: Record<string, unknown>;
+  /** Opaque provider state for replaying tool calls, notably Gemini thought signatures. */
+  thoughtSignature?: string;
 };
 
 export type ToolResultContent = {

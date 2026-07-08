@@ -1626,7 +1626,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // Detail endpoints (cache-first) — used by the marketplace panel's detail view to render
   // full content. Caller passes the list-row's (version, freshness timestamp) so we can short-circuit
   // on a hot cache. Sweep is invoked once per openMarketplace at the entry point.
-  'marketplace.detailAgent': async ({ id, version, published_at, updated_at }) => {
+  'marketplace.detailAgent': async ({ id, version, published_at, updated_at, min_app_version, minAppVersion, min_version, minVersion, min_pc_version, minPcVersion }) => {
     if (!id || typeof id !== 'string') throw new Error('id required');
     if (typeof version !== 'string' || typeof published_at !== 'number') {
       throw new Error('version + published_at required');
@@ -1634,10 +1634,16 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return marketplace.getAgentDetail(id, {
       version, published_at,
       ...(typeof updated_at === 'number' ? { updated_at } : {}),
+      ...(typeof min_app_version === 'string' ? { min_app_version } : {}),
+      ...(typeof minAppVersion === 'string' ? { minAppVersion } : {}),
+      ...(typeof min_version === 'string' ? { min_version } : {}),
+      ...(typeof minVersion === 'string' ? { minVersion } : {}),
+      ...(typeof min_pc_version === 'string' ? { min_pc_version } : {}),
+      ...(typeof minPcVersion === 'string' ? { minPcVersion } : {}),
     });
   },
 
-  'marketplace.detailSkill': async ({ id, version, published_at, updated_at }) => {
+  'marketplace.detailSkill': async ({ id, version, published_at, updated_at, min_app_version, minAppVersion, min_version, minVersion, min_pc_version, minPcVersion }) => {
     if (!id || typeof id !== 'string') throw new Error('id required');
     if (typeof version !== 'string' || typeof published_at !== 'number') {
       throw new Error('version + published_at required');
@@ -1645,10 +1651,16 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return marketplace.getSkillDetail(id, {
       version, published_at,
       ...(typeof updated_at === 'number' ? { updated_at } : {}),
+      ...(typeof min_app_version === 'string' ? { min_app_version } : {}),
+      ...(typeof minAppVersion === 'string' ? { minAppVersion } : {}),
+      ...(typeof min_version === 'string' ? { min_version } : {}),
+      ...(typeof minVersion === 'string' ? { minVersion } : {}),
+      ...(typeof min_pc_version === 'string' ? { min_pc_version } : {}),
+      ...(typeof minPcVersion === 'string' ? { minPcVersion } : {}),
     });
   },
 
-  'marketplace.installAgent': async ({ id, name, version, published_at, updated_at, force }) => {
+  'marketplace.installAgent': async ({ id, name, version, published_at, updated_at, min_app_version, minAppVersion, min_version, minVersion, min_pc_version, minPcVersion, force }) => {
     if (!id || typeof id !== 'string') throw new Error('id required');
     if (typeof version !== 'string' || typeof published_at !== 'number') {
       throw new Error('version + published_at required');
@@ -1656,10 +1668,16 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return marketplace.installMarketplaceAgent(id, {
       version, published_at,
       ...(typeof updated_at === 'number' ? { updated_at } : {}),
+      ...(typeof min_app_version === 'string' ? { min_app_version } : {}),
+      ...(typeof minAppVersion === 'string' ? { minAppVersion } : {}),
+      ...(typeof min_version === 'string' ? { min_version } : {}),
+      ...(typeof minVersion === 'string' ? { minVersion } : {}),
+      ...(typeof min_pc_version === 'string' ? { min_pc_version } : {}),
+      ...(typeof minPcVersion === 'string' ? { minPcVersion } : {}),
     }, { force: force === true, name: typeof name === 'string' ? name : undefined });
   },
 
-  'marketplace.installSkill': async ({ id, name, version, published_at, updated_at, force }) => {
+  'marketplace.installSkill': async ({ id, name, version, published_at, updated_at, min_app_version, minAppVersion, min_version, minVersion, min_pc_version, minPcVersion, force }) => {
     if (!id || typeof id !== 'string') throw new Error('id required');
     if (typeof version !== 'string' || typeof published_at !== 'number') {
       throw new Error('version + published_at required');
@@ -1667,6 +1685,12 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return marketplace.installMarketplaceSkill(id, {
       version, published_at,
       ...(typeof updated_at === 'number' ? { updated_at } : {}),
+      ...(typeof min_app_version === 'string' ? { min_app_version } : {}),
+      ...(typeof minAppVersion === 'string' ? { minAppVersion } : {}),
+      ...(typeof min_version === 'string' ? { min_version } : {}),
+      ...(typeof minVersion === 'string' ? { minVersion } : {}),
+      ...(typeof min_pc_version === 'string' ? { min_pc_version } : {}),
+      ...(typeof minPcVersion === 'string' ? { minPcVersion } : {}),
     }, { force: force === true, name: typeof name === 'string' ? name : undefined });
   },
 

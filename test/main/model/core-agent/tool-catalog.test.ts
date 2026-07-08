@@ -289,6 +289,13 @@ describe('tool-catalog', () => {
     expect(bashLine).toContain('local-execution permission');
     expect(readLine).not.toContain('local-execution permission');
   });
+
+  it('keeps delete_file confirmation guidance scoped to outside-workspace deletes', () => {
+    const out = getToolsSystemPromptBlock(['delete_file']);
+    expect(out).toContain('Files inside the current workspace/attachment/editor scope are deleted immediately');
+    expect(out).toContain('files outside that scope use an inline confirmation card');
+    expect(out).not.toContain('The first call shows an inline confirmation card');
+  });
 });
 
 describe('isToolVisibleToAgent (ownerAgent gate)', () => {

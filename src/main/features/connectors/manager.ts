@@ -155,7 +155,7 @@ async function _preserveEstablishedStateOnTransientFailure(
     error: (err as Error).message,
   });
   const current = registry.load(uid).connections[inst.id] || inst;
-  if (_isTransientStatusError(current)) {
+  if (current.status?.kind !== 'connected') {
     const healed = await _patchStatus(uid, current, (cur) => ({
       ..._asConnectedFromCache(cur),
       updated_at: _nowIso(),
@@ -538,8 +538,7 @@ function _shouldForceRefreshAfterConnectFailure(
   if (!entry) return false;
   if (!inst.oauth_grant?.server_grant_id || !inst.oauth_grant.server_managed) return false;
   const msg = (err as Error).message || '';
-  return /\b(401|403|unauthorized|AuthenticateToken|authentication failed|invalid_token|invalid access token|missing_token)\b/i.test(msg)
-    || _isTransientConnectorFailure(err);
+  return /\b(401|403|unauthorized|AuthenticateToken|authentication failed|invalid_token|invalid access token|missing_token)\b/i.test(msg);
 }
 
 export async function bootstrap(uid: string): Promise<void> {

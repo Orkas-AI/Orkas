@@ -63,6 +63,19 @@ vi.mock('../../../../src/main/model/client', () => ({
       yield { type: 'progress', text: 'active turn started' };
       await new Promise<void>((resolve) => { streamGate.releaseActiveTurn = resolve; });
     }
+    if (String(_opts?.message || '').includes('COMPACTION_EVENT_TEST')) {
+      yield {
+        type: 'progress',
+        text: 'compacted 20000→3000 tokens',
+        event: {
+          stream: 'compaction',
+          data: { tokensBefore: 20000, tokensAfter: 3000 },
+        },
+      };
+      yield { type: 'final', text: 'compaction recorded' };
+      yield { type: 'done' };
+      return;
+    }
     yield { type: 'final', text: '' };
     yield { type: 'done' };
   },
@@ -237,6 +250,56 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(stats.deliveries).toBe(1);
     expect(stats.failures).toBe(0);
     expect(stats.errors).toBe(0);
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${TEST_CID}.jsonl`);
+    const lines = fs.readFileSync(mainFile, 'utf-8').trim().split('\n').map((line) => JSON.parse(line));
+    const reply = lines.find((line) => line.from === 'commander');
+    expect(reply?.process).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'event',
+        event: expect.objectContaining({
+          stream: 'runtime',
+          data: expect.objectContaining({ duration_ms: expect.any(Number) }),
+        }),
+      }),
+    ]));
+  });
+
+  it('persists context compaction metadata in process history', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    const cid = 'cid-compaction-process';
+    const events: any[] = [];
+    bus.subscribe(TEST_UID, cid, (ev) => events.push(ev));
+    await bus.enqueue({
+      uid: TEST_UID, cid, fromActorId: 'user',
+      text: 'COMPACTION_EVENT_TEST',
+    });
+    await waitForQuiescent(TEST_UID, cid);
+
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const lines = fs.readFileSync(mainFile, 'utf-8').trim().split('\n').map((line) => JSON.parse(line));
+    const reply = lines.find((line) => line.from === 'commander');
+    expect(reply?.text).toBe('compaction recorded');
+    expect(reply?.process).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'progress',
+        text: 'compacted 20000→3000 tokens',
+        event: {
+          stream: 'compaction',
+          data: { tokensBefore: 20000, tokensAfter: 3000 },
+        },
+      }),
+      expect.objectContaining({
+        type: 'event',
+        event: expect.objectContaining({
+          stream: 'runtime',
+          data: expect.objectContaining({ duration_ms: expect.any(Number) }),
+        }),
+      }),
+    ]));
+    expect(events.some((e) => e.type === 'process' && e.data?.event?.stream === 'compaction')).toBe(true);
+    expect(events.some((e) => e.type === 'process' && e.data?.event?.stream === 'runtime')).toBe(true);
   });
 
   it('user → @<name> resolves to agent_id and auto-adds the agent to the roster', async () => {

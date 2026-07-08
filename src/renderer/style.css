@@ -7121,6 +7121,13 @@ body.model-not-configured .main-content { flex-direction: column; }
   transform: rotate(90deg);
 }
 .stream-process-label { font-weight: 600; }
+.stream-process-runtime {
+  color: #64748b;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.stream-process-runtime[hidden] { display: none; }
 
 .stream-process-body {
   max-height: 300px;

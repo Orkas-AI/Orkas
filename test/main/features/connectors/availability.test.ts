@@ -133,9 +133,11 @@ describe('Google connector remote switches', () => {
 
   it('filters disabled Google connectors from model-visible connector tools', async () => {
     await writeRemoteConfig({ google: 'enabled', gmail: 'disabled' });
+    const restoreComposioConnectionsFromServer = vi.fn(async () => 0);
+    const refreshStaleToolCaches = vi.fn(async () => 0);
     vi.doMock('../../../../src/main/features/connectors/manager', () => ({
-      restoreComposioConnectionsFromServer: vi.fn(async () => 0),
-      refreshStaleToolCaches: vi.fn(async () => 0),
+      restoreComposioConnectionsFromServer,
+      refreshStaleToolCaches,
       listInstances: vi.fn(() => [
         connectedInstance('google-workspace'),
         connectedInstance('gmail'),
@@ -154,5 +156,7 @@ describe('Google connector remote switches', () => {
 
     const visible = await toolsAdapter.resolveVisibleConnectors(TEST_UID, undefined);
     expect(visible.map((item) => item.instance.id).sort()).toEqual(['gcal', 'notion']);
+    expect(restoreComposioConnectionsFromServer).not.toHaveBeenCalled();
+    expect(refreshStaleToolCaches).not.toHaveBeenCalled();
   });
 });

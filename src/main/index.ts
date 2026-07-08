@@ -150,7 +150,8 @@ import { getRendererTables } from './i18n';
 import * as reflectionOrchestrator from './features/reflection-orchestrator';
 import * as autoTasks from './features/auto_tasks';
 import * as systemSkills from './features/system_skills';
-import * as builtinMarketplace from './features/builtin_marketplace';
+import * as builtinMarketplaceStartup from './features/builtin_marketplace_startup';
+import type { BuiltinMarketplaceSeedResult } from './features/builtin_marketplace';
 import * as chatAttachments from './features/chat_attachments';
 import * as chatArtifacts from './features/chat_artifacts';
 import * as savedApps from './features/saved_apps';
@@ -428,6 +429,45 @@ function subscribeMarketplaceReconcileStatus(m: typeof import('./features/market
   });
 }
 
+function broadcastBuiltinMarketplaceSeedChanged(result: BuiltinMarketplaceSeedResult): void {
+  const pulledAgents = Math.max(0, Number(result.seeded_agents || 0) + Number(result.manifest_agents || 0));
+  const pulledSkills = Math.max(0, Number(result.seeded_skills || 0) + Number(result.manifest_skills || 0));
+  const pulled = pulledAgents + pulledSkills;
+  if (!pulled) return;
+  const base = {
+    phase: 'default_seed' as const,
+    total: pulled,
+    total_agents: pulledAgents,
+    total_skills: pulledSkills,
+    pulled_agents: pulledAgents,
+    pulled_skills: pulledSkills,
+    failed: [] as string[],
+  };
+  ipc.broadcastToRenderer('marketplace:reconcile-status', {
+    ...base,
+    state: 'running',
+    pulled: 0,
+    updated_at: Date.now(),
+  });
+  ipc.broadcastToRenderer('marketplace:reconcile-status', {
+    ...base,
+    state: 'done',
+    pulled,
+    updated_at: Date.now(),
+  });
+}
+
+async function seedBuiltinMarketplaceForCurrentUser(
+  reason: string,
+  shouldContinue?: () => boolean,
+): Promise<void> {
+  await builtinMarketplaceStartup.seedBuiltinMarketplaceForActiveUser({
+    reason,
+    shouldContinue,
+    onChanged: broadcastBuiltinMarketplaceSeedChanged,
+  });
+}
+
 function marketplaceBootContextStillActive(uid: string): boolean {
   if (!uid || users.isAnonymousLocalId(uid)) return false;
   try { return users.getActiveUserId() === uid; }
@@ -504,6 +544,8 @@ async function runMarketplaceInstallReconcile(reason: string): Promise<void> {
       ]);
       marketplaceReconcileModule = m;
       subscribeMarketplaceReconcileStatus(m);
+
+      await seedBuiltinMarketplaceForCurrentUser(reason, shouldContinue);
 
       if (await mp.hasKnownDefaultInstallWork(uid)) {
         m.setDefaultInstallSeedStatus(true);
@@ -997,7 +1039,7 @@ if (!gotLock) {
       reflectionOrchestrator.startReflectionLoop(users.getActiveUserId());
     });
     registerDeferred('system-skills:reconcile', () => systemSkills.reconcileAllForActiveUserWithRetry({ retries: 2, reason: 'startup' }));
-    registerDeferred('builtin-marketplace:seed', () => builtinMarketplace.seedBuiltinMarketplaceForUser(users.getActiveUserId()));
+    registerDeferred('builtin-marketplace:seed', () => seedBuiltinMarketplaceForCurrentUser('startup'));
     registerDeferred('auto-tasks:scheduler', () => autoTasks.startScheduler());
 
     // Drive the immediate batch + schedule the deferred one.

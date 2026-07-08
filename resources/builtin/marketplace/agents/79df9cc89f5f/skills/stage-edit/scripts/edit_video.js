@@ -3,8 +3,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const OPS = new Set(['probe', 'trim', 'concat', 'burnsubs', 'overlay', 'extract_frame', 'loudness', 'mix', 'trim_silence', 'remove_fillers']);
-const OUTPUT_OPS = new Set(['trim', 'concat', 'burnsubs', 'overlay', 'extract_frame', 'mix', 'trim_silence', 'remove_fillers']);
+const OPS = new Set(['probe', 'trim', 'concat', 'burnsubs', 'overlay', 'extract_frame', 'loudness', 'normalize_loudness', 'mix', 'trim_silence', 'remove_fillers']);
+const OUTPUT_OPS = new Set(['trim', 'concat', 'burnsubs', 'overlay', 'extract_frame', 'normalize_loudness', 'mix', 'trim_silence', 'remove_fillers']);
 
 function fail(code, message, extra = {}) {
   process.stderr.write(JSON.stringify({ ok: false, code, message, ...extra }) + '\n');
@@ -241,6 +241,10 @@ module.exports = async function editVideoScript({ args }) {
   const payload = { ok: true, op: opts.op, ...result };
   if (opts.op === 'probe') payload.text = 'probe metadata is available in probe.';
   else if (opts.op === 'loudness') payload.text = 'loudness measurement is available in loudness.';
+  else if (opts.op === 'normalize_loudness') {
+    if (result.path) payload.media = `chat-media://local/${result.path}`;
+    payload.text = `normalize_loudness wrote ${result.path}; measured loudness is available in loudness.`;
+  }
   else if (result.path) {
     payload.media = `chat-media://local/${result.path}`;
     payload.text = `${opts.op} wrote ${result.path}${outputRenamed ? ` (renamed from ${requestedOutputAbsPath})` : ''}.`;

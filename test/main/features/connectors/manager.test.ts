@@ -168,6 +168,26 @@ function githubGrant() {
   };
 }
 
+function githubInstance() {
+  const now = new Date().toISOString();
+  return {
+    id: 'github',
+    display_name: 'GitHub',
+    transport: {
+      kind: 'streamable-http' as const,
+      url: 'https://api.githubcopilot.com/mcp/',
+      headers: { Authorization: 'Bearer ghu-token' },
+    },
+    enabled_subtools: null,
+    tools_cache: [{ name: 'github_search_repositories', description: '', input_schema: {} }],
+    tools_cached_at: Date.now(),
+    status: { kind: 'connected' as const, since: 1 },
+    oauth_grant: githubGrant(),
+    created_at: now,
+    updated_at: now,
+  };
+}
+
 function discordGrant() {
   return {
     access_token: 'discord-user-access-token',
@@ -536,15 +556,54 @@ describe('features/connectors/manager authorization recovery', () => {
     const tools = await manager.refreshTools(TEST_UID, 'notion');
 
     expect(tools).toEqual([{ name: 'notion_search', description: '', input_schema: {} }]);
-    // Despite every connect failing, the forced refresh ran and the established
-    // (connected, cached-tools) state is preserved rather than downgraded.
+    // Despite every connect failing, this is still a network problem, not an
+    // auth rejection. Keep the established state and do not force-refresh the
+    // server-managed grant just because the MCP endpoint was unreachable.
     expect(connectMock).toHaveBeenCalled();
-    expect(refreshDcrServerManaged).toHaveBeenCalledWith(
-      'notion',
-      expect.objectContaining({ server_grant_id: 'grant-1' }),
-      { force: true },
-    );
+    expect(refreshDcrServerManaged).not.toHaveBeenCalled();
     expect(registry.load(TEST_UID).connections.notion.status).toMatchObject({ kind: 'connected' });
+  });
+
+  it('preserves established GitHub state when transient MCP failures continue after retry', async () => {
+    const connectMock = vi.fn(async () => { throw new Error('fetch failed'); });
+    mocks.mcp.connect = connectMock;
+    mocks.mcp.close = vi.fn(async () => {});
+    mocks.oauth.refreshIfStale = vi.fn(async (_uid: string, _entry: unknown, grant: unknown) => ({
+      ...(grant as object),
+      access_token: 'forced-ghu-token',
+      expires_at: Date.now() + 60 * 60 * 1000,
+    }));
+
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    await registry.upsert(TEST_UID, githubInstance());
+    const tools = await manager.refreshTools(TEST_UID, 'github');
+
+    expect(tools).toEqual([{ name: 'github_search_repositories', description: '', input_schema: {} }]);
+    expect(connectMock).toHaveBeenCalled();
+    expect(mocks.oauth.refreshIfStale).not.toHaveBeenCalled();
+    expect(registry.load(TEST_UID).connections.github.status).toMatchObject({ kind: 'connected' });
+    expect(registry.load(TEST_UID).connections.github.oauth_grant?.access_token).toBe('ghu-token');
+  });
+
+  it('heals stale GitHub reconnect errors when the latest failure is transient', async () => {
+    const connectMock = vi.fn(async () => { throw new Error('fetch failed'); });
+    mocks.mcp.connect = connectMock;
+    mocks.mcp.close = vi.fn(async () => {});
+
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const manager = await import('../../../../src/main/features/connectors/manager');
+
+    const inst = githubInstance();
+    (inst as any).status = { kind: 'error', message: 'Authorization expired, reconnect required', at: Date.now() };
+    await registry.upsert(TEST_UID, inst);
+
+    const tools = await manager.refreshTools(TEST_UID, 'github');
+
+    expect(tools).toEqual([{ name: 'github_search_repositories', description: '', input_schema: {} }]);
+    expect(connectMock).toHaveBeenCalled();
+    expect(registry.load(TEST_UID).connections.github.status).toMatchObject({ kind: 'connected' });
   });
 
   it('heals persisted transient Notion errors with cached tools on list', async () => {

@@ -1525,6 +1525,15 @@ function _groupEventDedupeKey(evData) {
       const eventId = payload.id || payload.call_id || payload.tool_call_id || payload.request_id || '';
       const phase = payload.phase || payload.status || payload.type || '';
       const name = payload.name || payload.tool || payload.command || '';
+      if (evt.stream === 'compaction') {
+        return `process:event:${actor}:${turnId}:compaction:${payload.tokensBefore || ''}:${payload.tokensAfter || ''}`;
+      }
+      if (evt.stream === 'context') {
+        return `process:event:${actor}:${turnId}:context:${phase}:${payload.tokensBefore || ''}:${payload.tokensAfter || ''}`;
+      }
+      if (evt.stream === 'runtime') {
+        return `process:event:${actor}:${turnId}:runtime:${payload.duration_ms || payload.durationMs || payload.elapsedMs || ''}:${payload.status || ''}`;
+      }
       if (evt.stream === 'tool' && String(phase) === 'progress') {
         const progressPhase = String(payload.progress_phase || '');
         const message = String(payload.message || '').slice(0, 500);
@@ -5282,18 +5291,28 @@ function _renderPersistedProcess(msgDiv, items, { expanded = false } = {}) {
     <summary class="stream-process-summary">
       <span class="stream-process-caret" aria-hidden="true">${_uiIconHtml('chevron-right', 'ui-icon stream-process-caret-icon')}</span>
       <span class="stream-process-label">${escapeHtml(t('chat.process_info'))}</span>
+      <span class="stream-process-runtime" hidden></span>
     </summary>
     <div class="stream-process-body"></div>
   `;
   const body = details.querySelector('.stream-process-body');
+  _setProcessSummaryRuntime(details, _processSummaryRuntimeFromItems(items));
   for (const item of items) {
     let text = '';
-    if (item && item.type === 'progress') text = item.text || '';
-    else if (item && item.type === 'event') text = _formatEventLine(item.event) || '';
+    const itemEvent = item && item.type === 'event'
+      ? item.event
+      : (item && item.type === 'progress' ? item.event : null);
+    if (item && item.type === 'progress') {
+      const preferEventText = itemEvent && ['context', 'compaction', 'runtime'].includes(itemEvent.stream);
+      text = (preferEventText ? _formatEventLine(itemEvent) : '')
+        || item.text
+        || (itemEvent ? _formatEventLine(itemEvent) : '')
+        || '';
+    } else if (item && item.type === 'event') text = _formatEventLine(item.event) || '';
     if (!text) continue;
     const line = document.createElement('div');
-    const kind = item && item.type === 'event'
-      ? _eventProcessKind(item.event, text)
+    const kind = itemEvent
+      ? _eventProcessKind(itemEvent, text)
       : _processKindOf(text);
     line.className = 'stream-process-line' + (kind ? ' kind-' + kind : '');
     _setProcessLineContent(line, text, kind);
@@ -6198,6 +6217,12 @@ function _taskTurnRecordStreamEvent(cid, ev) {
   }
 }
 
+function _taskTurnVisibleModelFailure(text) {
+  const s = String(text || '');
+  if (!s) return false;
+  return /模型调用失败|Model (?:exceeded|failed|errored)|GenerateContentRequest|INVALID_ARGUMENT|Bad Request|ProviderError/i.test(s);
+}
+
 function _taskTurnFinish(cid, opts = {}) {
   const run = _taskTurnRun(cid);
   if (!run) return;
@@ -6949,6 +6974,7 @@ function _createStreamingAssistantMessage(container, opts = {}) {
         <summary class="stream-process-summary">
           <span class="stream-process-caret" aria-hidden="true">${_uiIconHtml('chevron-right', 'ui-icon stream-process-caret-icon')}</span>
           <span class="stream-process-label">${escapeHtml(t('chat.process_info'))}</span>
+          <span class="stream-process-runtime" hidden></span>
         </summary>
         <div class="stream-process-body" data-role="process"></div>
       </details>
@@ -7035,6 +7061,64 @@ function _processLineCount(msg) {
   return msg?.querySelectorAll?.('[data-role="process"] .stream-process-line')?.length || 0;
 }
 
+function _formatProcessDuration(ms) {
+  const totalSec = Math.max(0, Math.round((Number(ms) || 0) / 1000));
+  const hours = Math.floor(totalSec / 3600);
+  const minutes = Math.floor((totalSec % 3600) / 60);
+  const seconds = totalSec % 60;
+  if (hours > 0) return t('chat.stream.duration_hms', { h: hours, m: minutes, s: seconds });
+  if (minutes > 0) return t('chat.stream.duration_ms', { m: minutes, s: seconds });
+  return t('chat.stream.duration_s', { s: seconds });
+}
+
+function _runtimeDurationFromEvent(evt) {
+  if (!evt || typeof evt !== 'object' || evt.stream !== 'runtime') return '';
+  const data = evt.data && typeof evt.data === 'object' ? evt.data : {};
+  const duration = data.duration_ms ?? data.durationMs ?? data.elapsedMs;
+  const n = Number(duration);
+  if (!Number.isFinite(n)) return '';
+  return _formatProcessDuration(n);
+}
+
+function _runtimeDurationFromProcessItem(item) {
+  const evt = item && item.type === 'event'
+    ? item.event
+    : (item && item.type === 'progress' ? item.event : null);
+  return _runtimeDurationFromEvent(evt);
+}
+
+function _processSummaryRuntimeFromItems(items) {
+  if (!Array.isArray(items)) return '';
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    const duration = _runtimeDurationFromProcessItem(items[i]);
+    if (duration) return duration;
+  }
+  return '';
+}
+
+function _setProcessSummaryRuntime(root, durationText) {
+  const details = root && root.matches && root.matches('.stream-process')
+    ? root
+    : root?.querySelector?.('.stream-process');
+  const el = details?.querySelector?.('.stream-process-runtime');
+  if (!el) return;
+  const text = String(durationText || '').trim();
+  if (!text) {
+    el.textContent = '';
+    el.hidden = true;
+    if (details.dataset) delete details.dataset.runtimeDuration;
+    return;
+  }
+  el.textContent = text;
+  el.hidden = false;
+  if (details.dataset) details.dataset.runtimeDuration = text;
+}
+
+function _setProcessSummaryRuntimeFromEvent(root, evt) {
+  const duration = _runtimeDurationFromEvent(evt);
+  if (duration) _setProcessSummaryRuntime(root, duration);
+}
+
 function _eventProcessKind(evt, text) {
   if (!evt || typeof evt !== 'object') return _processKindOf(text);
   const stream = evt.stream;
@@ -7050,6 +7134,8 @@ function _eventProcessKind(evt, text) {
   }
   if (stream === 'item') return 'think';
   if (stream === 'plan') return 'plan';
+  if (stream === 'context' || stream === 'compaction') return 'info';
+  if (stream === 'runtime') return 'bound';
   if (stream === 'tool') return data.isError && !recoverableToolGuard ? 'err' : 'tool';
   if (stream === 'command_output') return (!data.stdout && data.stderr) ? 'warn' : 'out';
   if (stream === 'patch') return 'patch';
@@ -8006,7 +8092,9 @@ function createChatController(config) {
 
 function _handleStreamEvent(cid, msg, ev, { archive = false } = {}) {
   if (ev.type === 'progress') {
-    _streamingAppendProgress(msg, ev.text);
+    const evt = ev.event && ev.event.stream ? ev.event : null;
+    const line = evt ? (_formatEventLine(evt) || ev.text) : ev.text;
+    _streamingAppendProgress(msg, line, evt ? _eventProcessKind(evt, line) : undefined);
   } else if (ev.type === 'event') {
     const inner = ev.event || {};
     // Group-chat bus events arrive as `{stream:'group', data:GroupEvent}`.
@@ -8219,13 +8307,21 @@ function _consumeActorPlaceholder(cid, actorId, turnId) {
       _groupPlaceholders.delete(legacyK);
     }
   }
-  if (!ph && !tid) {
+  if (!ph) {
+    // Segment/final events should carry the same turn id that seeded the live
+    // placeholder, but reconnect/runtime recovery paths can leave the DOM with
+    // only actor identity. Do not strand a same-actor live bubble in "writing"
+    // state just because the exact key missed.
     for (const [key, val] of Array.from(_groupPlaceholders.entries())) {
       if (!key.startsWith(`${cid}:`)) continue;
       if (String(val?.dataset?.fromActor || '') !== String(actorId)) continue;
-      ph = val;
+      if (val?.dataset?.finalized === '1') continue;
+      if (val && val.parentElement) {
+        ph = val;
+        _groupPlaceholders.delete(key);
+        break;
+      }
       _groupPlaceholders.delete(key);
-      break;
     }
   }
   // Mark the consumed bubble as finalized so a later `_ensureActorPlaceholder`
@@ -8577,7 +8673,10 @@ function _handleGroupBusEvent(cid, streamingMsg, evData, { archive = false } = {
         _streamingAppendFinalDelta(target, data.text);
         _streamingUpdateActivity(target, t('chat.activity_writing'));
       } else if (data.type === 'progress' && data.text) {
-        _streamingAppendProgress(target, String(data.text));
+        const evt = data.event && data.event.stream ? data.event : null;
+        const line = evt ? (_formatEventLine(evt) || String(data.text)) : String(data.text);
+        if (evt) _setProcessSummaryRuntimeFromEvent(target, evt);
+        _streamingAppendProgress(target, line, evt ? _eventProcessKind(evt, line) : undefined);
         _streamingUpdateActivity(target, t('chat.activity_thinking'));
       } else if (data.type === 'event') {
         const before = _processLineCount(target);
@@ -9045,6 +9144,29 @@ function _formatEventLine(evt) {
     return t('chat.stream.plan', { p: phaseCn(data?.phase) }).trim();
   }
 
+  if (stream === 'context') {
+    const phase = String(data?.phase || '');
+    if (phase === 'history_summary_start') return t('chat.stream.context_history_start');
+    if (phase === 'history_summary_done') return t('chat.stream.context_history_done');
+    if (phase === 'active_process_compaction_start') return t('chat.stream.context_active_start');
+    if (phase === 'active_process_compaction_done') return t('chat.stream.context_active_done');
+    return t('chat.stream.context_update');
+  }
+
+  if (stream === 'compaction') {
+    const before = Number(data?.tokensBefore);
+    const after = Number(data?.tokensAfter);
+    if (Number.isFinite(before) && Number.isFinite(after)) {
+      return t('chat.stream.compaction_tokens', { before, after });
+    }
+    return t('chat.stream.compaction');
+  }
+
+  if (stream === 'runtime') {
+    const duration = data?.duration_ms ?? data?.durationMs ?? data?.elapsedMs;
+    return t('chat.stream.runtime_total', { duration: _formatProcessDuration(duration) });
+  }
+
   if (stream === 'tool') {
     const name = data?.name || data?.toolName || 'tool';
     const phase = data?.phase || data?.status;
@@ -9231,6 +9353,7 @@ function _renderAgentEvent(msg, evt) {
   if (!evt || typeof evt !== 'object') return;
   const { stream, data } = evt;
   if (!stream) return;
+  if (stream === 'runtime') _setProcessSummaryRuntimeFromEvent(msg, evt);
 
   if (stream === 'assistant') {
     const text = data?.text;

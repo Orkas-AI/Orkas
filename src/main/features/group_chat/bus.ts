@@ -321,6 +321,66 @@ const MAX_WORKER_TURNS = 100; // hard ceiling against runaway loops
 // (agents, ephemeral workers, one-shots) keep the default 50.
 const COMMANDER_MAX_TOOL_LOOPS = 120;
 
+type ProcessEvent = { stream: string; data?: unknown };
+type ProcessItem =
+  | { type: 'progress'; text: string; event?: ProcessEvent }
+  | { type: 'event'; event: ProcessEvent };
+
+function processEventForPersistence(raw: unknown): ProcessEvent | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const event = raw as { stream?: unknown; data?: unknown };
+  if (typeof event.stream !== 'string' || !event.stream) return null;
+  return { stream: event.stream, data: event.data };
+}
+
+function appendProcessItem(items: ProcessItem[], item: ProcessItem, opts: { forceLast?: boolean } = {}) {
+  if (items.length < MAX_PROCESS_ITEMS_PER_TURN) {
+    items.push(item);
+  } else if (opts.forceLast && items.length > 0) {
+    items[items.length - 1] = item;
+  }
+}
+
+function processItemEvent(item: ProcessItem): ProcessEvent | null {
+  if (!item) return null;
+  return item.type === 'event' ? item.event : (item.event || null);
+}
+
+function processItemsContainContextCompaction(items: ProcessItem[]): boolean {
+  return items.some((item) => {
+    const event = processItemEvent(item);
+    if (event?.stream === 'compaction') return true;
+    if (event?.stream === 'context') {
+      const data = event.data && typeof event.data === 'object'
+        ? event.data as { phase?: unknown }
+        : {};
+      const phase = String(data.phase || '');
+      return phase.includes('compaction') || phase.includes('history_summary');
+    }
+    if (item.type === 'progress') {
+      const text = item.text || '';
+      return /compacted \d+→\d+ tokens|上下文整理完成|正在整理.*上下文/.test(text);
+    }
+    return false;
+  });
+}
+
+function runtimeProcessItem(durationMs: number, status: AgentRunStatus, aborted: boolean, errored: boolean): ProcessItem {
+  return {
+    type: 'event',
+    event: {
+      stream: 'runtime',
+      data: {
+        phase: 'end',
+        duration_ms: Math.max(0, Math.round(durationMs)),
+        status,
+        aborted,
+        errored,
+      },
+    },
+  };
+}
+
 // ── Listener events (mirror the IPC streamEvents shape) ─────────────────
 
 export type GroupEvent =
@@ -1551,9 +1611,6 @@ async function runActorTurn(
   // history reload can rerender the rail (renderer accumulates it live, but
   // without persistence it vanishes on refresh). Cap the array so a runaway
   // tool storm can't bloat the jsonl. Skip `delta` and `assistant` events.
-  type ProcessItem =
-    | { type: 'progress'; text: string }
-    | { type: 'event'; event: { stream: string; data?: unknown } };
   const processItems: ProcessItem[] = [];
   if (item.attachments && item.attachments.length) {
     try {
@@ -1575,9 +1632,7 @@ async function runActorTurn(
       if (images.length) turnImages = images;
       if (skipped.length) {
         const skippedEvent = { stream: 'attachment', data: { phase: 'skipped', items: skipped } };
-        if (processItems.length < MAX_PROCESS_ITEMS_PER_TURN) {
-          processItems.push({ type: 'event', event: skippedEvent });
-        }
+        appendProcessItem(processItems, { type: 'event', event: skippedEvent });
         emit(state, {
           type: 'process',
           cid,
@@ -1905,13 +1960,16 @@ async function runActorTurn(
           // watchdog doesn't false-positive on a long CLI run. Self-throttled
           // + self-catching; fire-and-forget on the hot path.
           void touchActivity(uid, cid);
-          if (processItems.length < MAX_PROCESS_ITEMS_PER_TURN) {
-            if (data.type === 'progress' && typeof data.text === 'string' && data.text) {
-              processItems.push({ type: 'progress', text: data.text });
-            } else if (data.type === 'event' && data.event && typeof data.event === 'object') {
-              const inner = data.event as { stream?: string; data?: unknown };
-              if (inner.stream) processItems.push({ type: 'event', event: { stream: inner.stream, data: inner.data } });
-            }
+          if (data.type === 'progress' && typeof data.text === 'string' && data.text) {
+            const event = processEventForPersistence(data.event);
+            appendProcessItem(processItems, {
+              type: 'progress',
+              text: data.text,
+              ...(event ? { event } : {}),
+            });
+          } else if (data.type === 'event') {
+            const event = processEventForPersistence(data.event);
+            if (event) appendProcessItem(processItems, { type: 'event', event });
           }
           // For the live wire: `delta` streams into the placeholder
           // bubble (token-by-token); other shapes feed the process
@@ -2032,15 +2090,18 @@ async function runActorTurn(
         // place so both the persisted processItems and the live emit are
         // redacted. See `_redactDispatchToolResult`.
         if (ev.type === 'event') _redactDispatchToolResult((ev as { event?: unknown }).event);
-        if (processItems.length < MAX_PROCESS_ITEMS_PER_TURN) {
-          if (ev.type === 'progress') {
-            const text = (ev as { text?: string }).text;
-            if (text) processItems.push({ type: 'progress', text });
-          } else if (ev.type === 'event') {
-            const inner = (ev as { event?: { stream?: string; data?: unknown } }).event || {};
-            if (inner.stream && inner.stream !== 'assistant') {
-              processItems.push({ type: 'event', event: { stream: inner.stream, data: inner.data } });
-            }
+        if (ev.type === 'progress') {
+          const text = (ev as { text?: string }).text;
+          const event = processEventForPersistence((ev as { event?: unknown }).event);
+          if (text) appendProcessItem(processItems, {
+            type: 'progress',
+            text,
+            ...(event ? { event } : {}),
+          });
+        } else if (ev.type === 'event') {
+          const event = processEventForPersistence((ev as { event?: unknown }).event);
+          if (event && event.stream !== 'assistant') {
+            appendProcessItem(processItems, { type: 'event', event });
           }
         }
         // See the delta branch: anonymous workers don't surface to the UI.
@@ -2447,12 +2508,32 @@ async function runActorTurn(
     }
   }
 
+  if (outcome.kind === 'silent' && processItemsContainContextCompaction(processItems)) {
+    outcome = { kind: 'persist', text: '' };
+  }
+
   // G8b ephemeral worker: produces NO user-visible bubble. Its entire output
   // is handed back to the commander below (read from `workingText`), so force
   // silent here to skip the user-facing persist. The worker is internal — the
   // user sees the commander's synthesis, not the raw worker turn.
   if (actor.kind === 'worker') {
     outcome = { kind: 'silent' };
+  }
+
+  if (outcome.kind === 'persist') {
+    const runtimeItem = runtimeProcessItem(Date.now() - turnStartedAt, actorRunStatus, aborted, !!errText);
+    appendProcessItem(
+      processItems,
+      runtimeItem,
+      { forceLast: true },
+    );
+    emit(state, {
+      type: 'process',
+      cid,
+      actor: actor.id,
+      turn_id: item.turnId,
+      data: { type: 'event', event: runtimeItem.event },
+    });
   }
 
   let persistedMsg: GroupMessage | null = null;

@@ -18,9 +18,9 @@
  *     "no connectors" (intentionally stricter than `agent.skill_list`'s three-state — see
  *     PC/CLAUDE.md §6.5 "Per-agent scope"). Only a non-empty `string[]` grants access.
  *
- * Disconnected instances are still returned (with their stale `tools_cache` and current status)
- * so callers can surface the situation to the user; `manager.callTool` auto-reconnects on use,
- * but `list_connector_tools` refuses to advertise schemas for a non-`connected` instance.
+ * Visibility resolution is intentionally side-effect free. It only reads local connector state;
+ * Server/MCP restore, cache refresh, reconnect, and token checks happen during explicit connector
+ * management flows or when `manager.callTool` actually needs to use the connector.
  */
 import * as manager from './manager';
 import * as agents from '../agents';
@@ -63,12 +63,6 @@ export async function resolveVisibleConnectors(
   agentId: string | undefined,
 ): Promise<Array<{ instance: ConnectorInstance; tools: ToolSchema[] }>> {
   if (!uid) return [];
-  const maybeManager = manager as typeof manager & {
-    restoreComposioConnectionsFromServer?: (uid: string, reason: string) => Promise<number>;
-    refreshStaleToolCaches?: (uid: string, reason: string) => Promise<number>;
-  };
-  await maybeManager.restoreComposioConnectionsFromServer?.(uid, 'visible_connectors').catch(() => 0);
-  await maybeManager.refreshStaleToolCaches?.(uid, 'visible_connectors').catch(() => 0);
   const all = manager.listInstances(uid);
   if (!all.length) return [];
   // Live-state filter: only currently-connected instances surface to the LLM. A `connecting` /

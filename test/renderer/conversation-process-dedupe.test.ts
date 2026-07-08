@@ -50,6 +50,18 @@ function toolProgress(message: string, data: Record<string, unknown> = {}) {
   };
 }
 
+function processEvent(stream: string, data: Record<string, unknown>) {
+  return {
+    type: 'process',
+    actor: 'commander',
+    turn_id: 'turn-1',
+    data: {
+      type: 'event',
+      event: { stream, data },
+    },
+  };
+}
+
 describe('conversation process event dedupe', () => {
   it('keeps distinct progress messages for the same tool call renderable', () => {
     const key = loadDedupeKey();
@@ -64,6 +76,17 @@ describe('conversation process event dedupe', () => {
 
     expect(key(toolProgress('waiting 10s before poll 1', { elapsedMs: 10000 }))).toBe(
       key(toolProgress('waiting 10s before poll 1', { elapsedMs: 10000 })),
+    );
+  });
+
+  it('dedupes context compaction and runtime metadata events by stable payload', () => {
+    const key = loadDedupeKey();
+
+    expect(key(processEvent('compaction', { tokensBefore: 20000, tokensAfter: 3000 }))).toBe(
+      key(processEvent('compaction', { tokensBefore: 20000, tokensAfter: 3000 })),
+    );
+    expect(key(processEvent('runtime', { duration_ms: 65000, status: 'success' }))).toBe(
+      key(processEvent('runtime', { duration_ms: 65000, status: 'success' })),
     );
   });
 });

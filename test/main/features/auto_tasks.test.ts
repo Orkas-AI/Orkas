@@ -19,10 +19,12 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import {
   autoTaskAttachmentsDir,
+  autoTaskDir,
   autoTaskConfigFile,
   chatAttachmentDir,
   projectBindingsFile,
   projectMetaFile,
+  userLocalRoot,
   userRoot,
 } from '../../../src/main/paths';
 import {
@@ -451,6 +453,47 @@ describe('scheduler dispatch', () => {
     expect(autoRuntime.send).toHaveBeenCalledTimes(2);
     task = await getTask(TEST_UID, taskId);
     expect(task?.last_run_at).toBe(new Date(2026, 4, 23, 9, 0, 0).toISOString());
+  });
+
+  it('releases a claim and retries when marking last_run_at fails before dispatch', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
+
+    const taskId = 'at_99999999';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'daily retry',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    expect(created.ok).toBe(true);
+    stopScheduler();
+
+    vi.setSystemTime(new Date(2026, 4, 22, 9, 0, 0));
+    const boundary = new Date(2026, 4, 22, 9, 0, 0);
+    const claimFile = path.join(userLocalRoot(TEST_UID), 'auto_task_claims', taskId, `${boundary.getTime()}.json`);
+    const taskDir = autoTaskDir(TEST_UID, taskId);
+
+    fs.chmodSync(taskDir, 0o500);
+    try {
+      await _onTimerFireForTest(TEST_UID, taskId);
+    } finally {
+      fs.chmodSync(taskDir, 0o700);
+    }
+
+    expect(autoRuntime.createConversation).not.toHaveBeenCalled();
+    expect(autoRuntime.send).not.toHaveBeenCalled();
+    expect(fs.existsSync(claimFile)).toBe(false);
+    let task = await getTask(TEST_UID, taskId);
+    expect(task?.last_run_at).toBeUndefined();
+
+    stopScheduler();
+    await _onTimerFireForTest(TEST_UID, taskId);
+
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+    expect(fs.existsSync(claimFile)).toBe(true);
+    task = await getTask(TEST_UID, taskId);
+    expect(task?.last_run_at).toBe(boundary.toISOString());
   });
 });
 

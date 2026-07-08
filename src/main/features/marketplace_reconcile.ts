@@ -17,6 +17,8 @@ import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 
+import { app } from 'electron';
+
 import {
   userMarketplaceAgentDir, userMarketplaceAgentSkillsDir, userMarketplaceSkillDir,
   userMarketplaceAgentsDir, userMarketplaceSkillsDir,
@@ -40,10 +42,34 @@ import { extractBundleSafely, postJson } from './marketplace';
 import { withMarketplaceInstallLock } from './marketplace_locks';
 import { createLogger } from '../logger';
 import { fetchWithRetry } from '../util/retry';
+import {
+  minAppVersionFrom,
+  satisfiesMinAppVersion,
+  type MinAppVersionSource,
+} from '../util/app-version-compat';
 
 const log = createLogger('marketplace_reconcile');
 const MARKETPLACE_AGENT_JSON_DOWNLOAD_TIMEOUT_MS = 60_000;
 const MARKETPLACE_SKILL_BUNDLE_DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
+
+function _currentAppVersion(): string {
+  try { return app.getVersion(); } catch { return ''; }
+}
+
+function _normalizeMinAppVersion(...sources: Array<MinAppVersionSource | null | undefined>): string {
+  return minAppVersionFrom(...sources);
+}
+
+function _isAppCompatible(minAppVersion: string): boolean {
+  return satisfiesMinAppVersion(_currentAppVersion(), minAppVersion);
+}
+
+function _isInstallRowAppCompatible(row: ({ id?: string } & MinAppVersionSource), kind: 'agent' | 'skill'): boolean {
+  const min = minAppVersionFrom(row);
+  if (!min || _isAppCompatible(min)) return true;
+  log.info(`skip ${kind} ${row.id || ''}; requires Orkas >= ${min} (current ${_currentAppVersion() || 'unknown'})`);
+  return false;
+}
 
 /** Coarse-grained reconcile state for the UI banner. `idle` covers both pre-run and a finished
  *  run with nothing to pull (banner stays hidden in both cases). */
@@ -220,6 +246,9 @@ export async function checkServerUpdatesForInstalls(
       }
       continue;
     }
+    if (!_isInstallRowAppCompatible({ id: a.id, min_app_version: server.min_app_version }, 'agent')) {
+      continue;
+    }
     const contentChanged = server.version !== a.version || _freshnessAt(server) !== _freshnessAt(a);
     const defaultInstallChanged = typeof server.default_install === 'boolean'
       && a.default_install !== server.default_install;
@@ -227,7 +256,9 @@ export async function checkServerUpdatesForInstalls(
     const statusChanged = typeof server.status === 'string' && currentStatus !== server.status;
     const privateSkillsUrlChanged = typeof server.agent_skills_bundle_url === 'string'
       && a.agent_skills_bundle_url !== server.agent_skills_bundle_url;
-    if (contentChanged || defaultInstallChanged || statusChanged || privateSkillsUrlChanged) {
+    const minAppVersionChanged = typeof server.min_app_version === 'string'
+      && a.min_app_version !== server.min_app_version;
+    if (contentChanged || defaultInstallChanged || statusChanged || privateSkillsUrlChanged || minAppVersionChanged) {
       log.info(`server-update agent ${a.id}: v${a.version} → v${server.version} (freshness ${_freshnessAt(a)} → ${_freshnessAt(server)})`);
       try { _assertContinue(opts); } catch { return { updated_agents, updated_skills }; }
       // Replace the row in the manifest; reconcile will detect the version/freshness
@@ -241,12 +272,14 @@ export async function checkServerUpdatesForInstalls(
           : (typeof a.agent_skills_bundle_url === 'string' ? { agent_skills_bundle_url: a.agent_skills_bundle_url } : {})),
         ...(typeof server.default_install === 'boolean' ? { default_install: server.default_install } : {}),
         ...(typeof server.status === 'string' ? { status: server.status } : {}),
+        ...(typeof server.min_app_version === 'string' ? { min_app_version: server.min_app_version } : {}),
       });
-      if (!contentChanged && !privateSkillsUrlChanged && (defaultInstallChanged || statusChanged)) {
+      if (!contentChanged && !privateSkillsUrlChanged && (defaultInstallChanged || statusChanged || minAppVersionChanged)) {
         await withMarketplaceInstallLock(uid, 'agent', a.id, async () => {
           await _patchInstallMeta(userMarketplaceAgentDir(uid, a.id), {
             ...(typeof server.default_install === 'boolean' ? { default_install: server.default_install } : {}),
             ...(typeof server.status === 'string' ? { status: server.status } : {}),
+            ...(typeof server.min_app_version === 'string' ? { min_app_version: server.min_app_version } : {}),
           });
         });
       }
@@ -262,12 +295,17 @@ export async function checkServerUpdatesForInstalls(
       }
       continue;
     }
+    if (!_isInstallRowAppCompatible({ id: s.id, min_app_version: server.min_app_version }, 'skill')) {
+      continue;
+    }
     const contentChanged = server.version !== s.version || _freshnessAt(server) !== _freshnessAt(s);
     const defaultInstallChanged = typeof server.default_install === 'boolean'
       && s.default_install !== server.default_install;
     const currentStatus = s.status || s.state;
     const statusChanged = typeof server.status === 'string' && currentStatus !== server.status;
-    if (contentChanged || defaultInstallChanged || statusChanged) {
+    const minAppVersionChanged = typeof server.min_app_version === 'string'
+      && s.min_app_version !== server.min_app_version;
+    if (contentChanged || defaultInstallChanged || statusChanged || minAppVersionChanged) {
       log.info(`server-update skill ${s.id}: v${s.version} → v${server.version} (freshness ${_freshnessAt(s)} → ${_freshnessAt(server)})`);
       try { _assertContinue(opts); } catch { return { updated_agents, updated_skills }; }
       await addSkillInstall(uid, {
@@ -275,12 +313,14 @@ export async function checkServerUpdatesForInstalls(
         updated_at: server.updated_at, bundle_url: s.bundle_url, create_uid: s.create_uid,
         ...(typeof server.default_install === 'boolean' ? { default_install: server.default_install } : {}),
         ...(typeof server.status === 'string' ? { status: server.status } : {}),
+        ...(typeof server.min_app_version === 'string' ? { min_app_version: server.min_app_version } : {}),
       });
-      if (!contentChanged && (defaultInstallChanged || statusChanged)) {
+      if (!contentChanged && (defaultInstallChanged || statusChanged || minAppVersionChanged)) {
         await withMarketplaceInstallLock(uid, 'skill', s.id, async () => {
           await _patchInstallMeta(userMarketplaceSkillDir(uid, s.id), {
             ...(typeof server.default_install === 'boolean' ? { default_install: server.default_install } : {}),
             ...(typeof server.status === 'string' ? { status: server.status } : {}),
+            ...(typeof server.min_app_version === 'string' ? { min_app_version: server.min_app_version } : {}),
           });
         });
       }
@@ -339,6 +379,7 @@ interface _CatalogRow {
   default_install?: boolean;
   status?: string;
   agent_skills_bundle_url?: string;
+  min_app_version?: string;
 }
 
 /** Paginate the public `/marketplace/{kind}/list` endpoint and collapse to (id → version + ts).
@@ -350,7 +391,7 @@ async function _fetchServerCatalogMap(kind: 'agents' | 'skills', ids: string[]):
   const PAGE_SIZE = 100;
   const wanted = new Set(ids.filter(Boolean));
   for (let page = 1; page <= 20; page++) {
-    const r = await postJson<{ list: Array<{ id?: string; version?: string; published_at?: number; updated_at?: number; default_install?: boolean | number; status?: string; state?: string; agent_skills_bundle_url?: string }>; total?: number }>(
+    const r = await postJson<{ list: Array<{ id?: string; version?: string; published_at?: number; updated_at?: number; default_install?: boolean | number; status?: string; state?: string; agent_skills_bundle_url?: string; min_app_version?: string; minAppVersion?: string }>; total?: number }>(
       `/marketplace/${kind}/list`, { page, size: PAGE_SIZE, ids: [...wanted] },
     );
     const list = r.list || [];
@@ -370,6 +411,7 @@ async function _fetchServerCatalogMap(kind: 'agents' | 'skills', ids: string[]):
           ...(kind === 'agents' && typeof row.agent_skills_bundle_url === 'string'
             ? { agent_skills_bundle_url: row.agent_skills_bundle_url }
             : {}),
+          ...(_normalizeMinAppVersion(row) ? { min_app_version: _normalizeMinAppVersion(row) } : {}),
         });
       }
     }
@@ -404,8 +446,8 @@ export async function reconcileInstalls(
   }
   // Filter pull-needed up front so the banner's total is meaningful (it counts work the user
   // will actually see, not entries that short-circuit).
-  const agentsNeedingPull = manifest.agents.filter((r) => _agentNeedsPull(uid, r));
-  const skillsNeedingPull = manifest.skills.filter((r) => _skillNeedsPull(uid, r));
+  const agentsNeedingPull = manifest.agents.filter((r) => _isInstallRowAppCompatible(r, 'agent') && _agentNeedsPull(uid, r));
+  const skillsNeedingPull = manifest.skills.filter((r) => _isInstallRowAppCompatible(r, 'skill') && _skillNeedsPull(uid, r));
   const agentPullIds = new Set(agentsNeedingPull.map((r) => r.id));
   const skillPullIds = new Set(skillsNeedingPull.map((r) => r.id));
   let metadataPatches: MetadataPatchCounts;
@@ -590,6 +632,7 @@ async function _reconcileLocalOnlyInstalls(
         create_uid: meta.create_uid || '',
         ...(typeof meta.default_install === 'boolean' ? { default_install: meta.default_install } : {}),
         ...(meta.status ? { status: meta.status } : {}),
+        ...(meta.min_app_version ? { min_app_version: meta.min_app_version } : {}),
       });
       counts.restored_agents++;
       log.info(`restored local-only marketplace agent ${id} into installs manifest`);
@@ -620,6 +663,7 @@ async function _reconcileLocalOnlyInstalls(
         create_uid: meta.create_uid || '',
         ...(typeof meta.default_install === 'boolean' ? { default_install: meta.default_install } : {}),
         ...(meta.status ? { status: meta.status } : {}),
+        ...(meta.min_app_version ? { min_app_version: meta.min_app_version } : {}),
       });
       counts.restored_skills++;
       log.info(`restored local-only marketplace skill ${id} into installs manifest`);
@@ -638,6 +682,7 @@ async function _patchLocalMetadataForManifest(
   const counts: MetadataPatchCounts = { patched_agents: 0, patched_skills: 0 };
   for (const row of manifest.agents) {
     _assertContinue(opts);
+    if (!_isInstallRowAppCompatible(row, 'agent')) continue;
     if (agentPullIds.has(row.id) || !_agentContentExists(uid, row.id)) continue;
     const dir = userMarketplaceAgentDir(uid, row.id);
     if (_resourceSyncBlocksServerPull(dir)) continue;
@@ -653,6 +698,7 @@ async function _patchLocalMetadataForManifest(
   }
   for (const row of manifest.skills) {
     _assertContinue(opts);
+    if (!_isInstallRowAppCompatible(row, 'skill')) continue;
     if (skillPullIds.has(row.id) || !_skillContentExists(uid, row.id)) continue;
     const dir = userMarketplaceSkillDir(uid, row.id);
     if (_resourceSyncBlocksServerPull(dir)) continue;
@@ -821,8 +867,14 @@ async function _ensureAgentSkillDependencies(
         default_install?: boolean;
         status?: string;
         state?: string;
+        min_app_version?: string;
+        minAppVersion?: string;
       }>('/marketplace/skills/bundle', { id: skillId });
       _assertApprovedDependencySkill(skillId, meta);
+      const minAppVersion = _normalizeMinAppVersion(meta);
+      if (!_isAppCompatible(minAppVersion)) {
+        throw new Error(`dependency skill ${skillId} requires Orkas >= ${minAppVersion} (current ${_currentAppVersion() || 'unknown'})`);
+      }
       row = {
         id: skillId,
         version: meta.version || '1.0.0',
@@ -833,6 +885,7 @@ async function _ensureAgentSkillDependencies(
         create_uid: meta.create_uid || '',
         ...(typeof meta.default_install === 'boolean' ? { default_install: meta.default_install } : {}),
         ...((meta.status || meta.state) ? { status: meta.status || meta.state } : {}),
+        ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
       };
       await addSkillInstall(uid, row);
       manifestSkills.set(skillId, row);
@@ -914,6 +967,7 @@ interface InstallMeta {
   is_open_source?: boolean;
   status?: string;
   state?: string;
+  min_app_version?: string;
   seed_source?: string;
   /** sha256 (hex) of the spec's descriptive file at install / upload time —
    *  agent.json for agents, SKILL.md for skills. Used only by the dev-mode
@@ -966,6 +1020,7 @@ function _installMetaFromAgentRow(row: AgentInstall): Partial<InstallMeta> {
     create_uid: row.create_uid || '',
     ...(typeof row.default_install === 'boolean' ? { default_install: row.default_install } : {}),
     ...(_installStatus(row) ? { status: _installStatus(row) } : {}),
+    min_app_version: row.min_app_version || '',
   };
 }
 
@@ -979,6 +1034,7 @@ function _installMetaFromSkillRow(row: SkillInstall): Partial<InstallMeta> {
     create_uid: row.create_uid || '',
     ...(typeof row.default_install === 'boolean' ? { default_install: row.default_install } : {}),
     ...(_installStatus(row) ? { status: _installStatus(row) } : {}),
+    min_app_version: row.min_app_version || '',
   };
 }
 
@@ -994,9 +1050,10 @@ function _readInstallMeta(dir: string): InstallMeta | null {
   const f = path.join(dir, '_install.json');
   if (!fs.existsSync(f)) return null;
   try {
-    const j = JSON.parse(fs.readFileSync(f, 'utf8')) as Partial<InstallMeta>;
-    if (typeof j.version !== 'string' || typeof j.published_at !== 'number') return null;
-    return {
+      const j = JSON.parse(fs.readFileSync(f, 'utf8')) as Partial<InstallMeta> & MinAppVersionSource;
+      if (typeof j.version !== 'string' || typeof j.published_at !== 'number') return null;
+      const minAppVersion = minAppVersionFrom(j);
+      return {
       version: j.version,
       published_at: j.published_at,
       ...(typeof j.updated_at === 'number' ? { updated_at: j.updated_at } : {}),
@@ -1011,6 +1068,7 @@ function _readInstallMeta(dir: string): InstallMeta | null {
       ...(typeof j.status === 'string' ? { status: j.status } : (
         typeof j.state === 'string' ? { status: j.state } : {}
       )),
+      ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
       ...(typeof j.content_sha === 'string' ? { content_sha: j.content_sha } : {}),
       ...(typeof j.content_tree_hash === 'string' ? { content_tree_hash: j.content_tree_hash } : {}),
     };
@@ -1024,7 +1082,11 @@ async function _writeInstallMeta(dir: string, meta: InstallMeta): Promise<void> 
 async function _patchInstallMeta(dir: string, patch: Partial<InstallMeta>): Promise<void> {
   const meta = _readInstallMeta(dir);
   if (!meta) return;
-  await _writeInstallMeta(dir, { ...meta, ...patch });
+  const next = { ...meta, ...patch };
+  if (Object.prototype.hasOwnProperty.call(patch, 'min_app_version') && !patch.min_app_version) {
+    delete next.min_app_version;
+  }
+  await _writeInstallMeta(dir, next);
 }
 
 /** Fetch agent.json from the cloud URL recorded in the manifest, write to the per-machine
@@ -1053,7 +1115,10 @@ async function _pullAgentLocked(uid: string, row: AgentInstall, opts: Marketplac
       default_install?: boolean;
       status?: string;
       state?: string;
+      min_app_version?: string;
+      minAppVersion?: string;
     }>('/marketplace/agents/detail', { id: row.id });
+    const minAppVersion = _normalizeMinAppVersion(fresh, fresh.agent_json);
     current = {
       ...row,
       version: fresh.version,
@@ -1064,6 +1129,7 @@ async function _pullAgentLocked(uid: string, row: AgentInstall, opts: Marketplac
       create_uid: fresh.create_uid || row.create_uid,
       ...(typeof fresh.default_install === 'boolean' ? { default_install: fresh.default_install } : {}),
       ...((fresh.status || fresh.state) ? { status: fresh.status || fresh.state } : {}),
+      min_app_version: minAppVersion || '',
     };
     _assertContinue(opts);
     await addAgentInstall(uid, current);
@@ -1077,6 +1143,14 @@ async function _pullAgentLocked(uid: string, row: AgentInstall, opts: Marketplac
   // Validate it parses — manifest-stored URLs come from COS, treat as untrusted.
   const parsed = JSON.parse(text) as Record<string, unknown>;
   if (typeof parsed.agent_id !== 'string') throw new Error('agent.json missing agent_id');
+  const minAppVersion = _normalizeMinAppVersion(current, parsed);
+  if (minAppVersion && current.min_app_version !== minAppVersion) {
+    current = { ...current, min_app_version: minAppVersion };
+    await addAgentInstall(uid, current);
+  }
+  if (!_isAppCompatible(minAppVersion)) {
+    throw new Error(`agent ${row.id} requires Orkas >= ${minAppVersion} (current ${_currentAppVersion() || 'unknown'})`);
+  }
   await _ensureAgentSkillDependencies(uid, row.id, parsed, opts);
   const privateSkillsZip = await _fetchAgentPrivateSkillsBundle(row.id, current.agent_skills_bundle_url || '', opts);
 
@@ -1104,6 +1178,7 @@ async function _pullAgentLocked(uid: string, row: AgentInstall, opts: Marketplac
     create_uid: current.create_uid || '',
     ...(typeof current.default_install === 'boolean' ? { default_install: current.default_install } : {}),
     ...((current.status || current.state) ? { status: current.status || current.state } : {}),
+    ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
     ...(((): { content_sha?: string } => {
       const sha = sha256OfFile(agentJsonFile);
       return sha ? { content_sha: sha } : {};
@@ -1139,7 +1214,10 @@ async function _pullSkillLocked(uid: string, row: SkillInstall, opts: Marketplac
       default_install?: boolean;
       status?: string;
       state?: string;
+      min_app_version?: string;
+      minAppVersion?: string;
     }>('/marketplace/skills/bundle', { id: row.id });
+    const minAppVersion = _normalizeMinAppVersion(fresh);
     current = {
       ...row,
       version: fresh.version,
@@ -1149,6 +1227,7 @@ async function _pullSkillLocked(uid: string, row: SkillInstall, opts: Marketplac
       create_uid: fresh.create_uid || row.create_uid,
       ...(typeof fresh.default_install === 'boolean' ? { default_install: fresh.default_install } : {}),
       ...((fresh.status || fresh.state) ? { status: fresh.status || fresh.state } : {}),
+      min_app_version: minAppVersion || '',
     };
     _assertContinue(opts);
     await addSkillInstall(uid, current);
@@ -1160,6 +1239,10 @@ async function _pullSkillLocked(uid: string, row: SkillInstall, opts: Marketplac
   const ab = await res.arrayBuffer();
   _assertContinue(opts);
   const zip = new AdmZip(Buffer.from(ab));
+  const minAppVersion = _normalizeMinAppVersion(current);
+  if (!_isAppCompatible(minAppVersion)) {
+    throw new Error(`skill ${row.id} requires Orkas >= ${minAppVersion} (current ${_currentAppVersion() || 'unknown'})`);
+  }
 
   const dir = userMarketplaceSkillDir(uid, row.id);
   _assertContinue(opts);
@@ -1181,6 +1264,7 @@ async function _pullSkillLocked(uid: string, row: SkillInstall, opts: Marketplac
     create_uid: current.create_uid || '',
     ...(typeof current.default_install === 'boolean' ? { default_install: current.default_install } : {}),
     ...((current.status || current.state) ? { status: current.status || current.state } : {}),
+    ...(minAppVersion ? { min_app_version: minAppVersion } : {}),
     ...(((): { content_sha?: string } => {
       const sha = sha256OfFile(skillMdFile);
       return sha ? { content_sha: sha } : {};

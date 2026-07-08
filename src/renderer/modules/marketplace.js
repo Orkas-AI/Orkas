@@ -177,7 +177,20 @@ function _mpNormalizeInstallMeta(row) {
   const updated = row?.updated_at ?? row?.marketplace_updated_at;
   if (typeof published === 'number') meta.published_at = published;
   if (typeof updated === 'number') meta.updated_at = updated;
+  const minAppVersion = _mpMinAppVersion(row);
+  if (minAppVersion) meta.min_app_version = minAppVersion;
   return meta;
+}
+
+function _mpMinAppVersion(row) {
+  const value = row?.min_app_version
+    || row?.minAppVersion
+    || row?.min_version
+    || row?.minVersion
+    || row?.min_pc_version
+    || row?.minPcVersion
+    || '';
+  return typeof value === 'string' ? value.trim() : '';
 }
 function _mpInstallMetaRows(kind) {
   const ids = kind === 'agent' ? _mpState.installedAgentIds : _mpState.installedSkillIds;
@@ -1373,6 +1386,7 @@ async function _mpOpenDetail(kind, item, opts = {}) {
       const detail = await window.orkas.invoke('marketplace.detailAgent', {
         id: item.id, version: item.version,
         published_at: item.published_at, updated_at: item.updated_at,
+        min_app_version: _mpMinAppVersion(item),
       });
       if (!detail || detail.ok === false) throw _mpErrorFromResponse(detail, 'detail failed');
       _mpState.detailAgentJson = detail.agent_json;
@@ -1381,6 +1395,7 @@ async function _mpOpenDetail(kind, item, opts = {}) {
         const detail = await window.orkas.invoke('marketplace.detailSkill', {
           id: item.id, version: item.version,
           published_at: item.published_at, updated_at: item.updated_at,
+          min_app_version: _mpMinAppVersion(item),
         });
         if (!detail || detail.ok === false) throw _mpErrorFromResponse(detail, 'detail failed');
         const files = await window.orkas.invoke('marketplace.cacheSkillFiles', { id: item.id });
@@ -1819,6 +1834,7 @@ async function _mpInstall(kind, id, itemOverride = null) {
       id, name: item.name || '',
       version: item.version,
       published_at: item.published_at, updated_at: item.updated_at,
+      min_app_version: _mpMinAppVersion(item),
       ...(force ? { force: true } : {}),
     });
     if (!r || r.ok === false) throw _mpInstallErrorFromResponse(r);
@@ -1922,6 +1938,7 @@ function _mpMarkInstalled(kind, item) {
       version: item.version,
       published_at: item.published_at,
       updated_at: item.updated_at,
+      min_app_version: _mpMinAppVersion(item),
     }));
   }
 }

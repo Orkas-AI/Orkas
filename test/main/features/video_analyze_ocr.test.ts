@@ -1,6 +1,24 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi, beforeEach } from 'vitest';
 
-import { sampleTimecodes, collapseOcrSegments } from '../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_analyze';
+// Mock the OCR runtime and the ffmpeg helpers so the video OCR flow is
+// testable without Python/ffmpeg. The batch contract (ONE ocrImagesText call
+// per clip, index-aligned results, per-frame error tolerance) is the behavior
+// under test.
+vi.mock('../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/ocr_runtime', () => ({
+  ocrImageText: vi.fn(),
+  ocrImagesText: vi.fn(),
+}));
+vi.mock('../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_edit', () => ({
+  measureSilenceCoverage: vi.fn(),
+  assessVoiceoverCoverage: vi.fn(),
+  extractFrameAt: vi.fn(async () => ({ ok: true })),
+  probeMediaDurationSec: vi.fn(async () => 10),
+  detectSceneChanges: vi.fn(),
+  detectQuality: vi.fn(),
+}));
+
+import { sampleTimecodes, collapseOcrSegments, analyzeMedia } from '../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_analyze';
+import { ocrImagesText } from '../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/ocr_runtime';
 
 describe('sampleTimecodes', () => {
   it('samples mid-step across the clip, strictly increasing and inside duration', () => {
@@ -50,5 +68,82 @@ describe('collapseOcrSegments', () => {
     );
     expect(segs).toHaveLength(1);
     expect(segs[0].endSec).toBe(4);
+  });
+});
+
+describe('analyzeMedia › video ocr › batch contract', () => {
+  const mockedBatch = vi.mocked(ocrImagesText);
+  let fakeVideo: string;
+
+  beforeEach(async () => {
+    mockedBatch.mockReset();
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-ocr-batch-test-'));
+    fakeVideo = path.join(dir, 'clip.mp4');
+    fs.writeFileSync(fakeVideo, 'not-a-real-video'); // probe/extract are mocked
+  });
+
+  it('runs ONE batch OCR call for all sampled frames and maps results by index', async () => {
+    const expectedFrames = sampleTimecodes(10, 2.5, 16).length;
+    mockedBatch.mockImplementationOnce(async ({ absPaths }) => ({
+      ok: true as const,
+      results: absPaths.map((_, i) => ({
+        text: i < absPaths.length / 2 ? 'Slide A' : 'Slide B',
+        items: [],
+      })),
+    }));
+
+    const r = await analyzeMedia({ op: 'ocr', inputAbsPath: fakeVideo });
+    expect(r.ok, JSON.stringify(r)).toBe(true);
+    expect(mockedBatch).toHaveBeenCalledTimes(1);
+    expect(mockedBatch.mock.calls[0][0].absPaths).toHaveLength(expectedFrames);
+    if (r.ok === true) {
+      const summary = r.summary as { sampledFrames: number; segments: Array<{ text: string }> };
+      expect(summary.sampledFrames).toBe(expectedFrames);
+      expect(summary.segments.map((s) => s.text)).toEqual(['Slide A', 'Slide B']);
+    }
+  });
+
+  it('skips per-frame errors without failing the clip', async () => {
+    mockedBatch.mockImplementationOnce(async ({ absPaths }) => ({
+      ok: true as const,
+      results: absPaths.map((_, i) => (i === 0
+        ? { text: '', items: [], error: 'unreadable frame' }
+        : { text: 'Slide B', items: [] })),
+    }));
+
+    const r = await analyzeMedia({ op: 'ocr', inputAbsPath: fakeVideo });
+    expect(r.ok, JSON.stringify(r)).toBe(true);
+    if (r.ok === true) {
+      const summary = r.summary as { sampledFrames: number; segments: Array<{ text: string }> };
+      expect(summary.sampledFrames).toBe(sampleTimecodes(10, 2.5, 16).length - 1);
+      expect(summary.segments.map((s) => s.text)).toEqual(['Slide B']);
+    }
+  });
+
+  it('surfaces a runtime install failure as the op error', async () => {
+    mockedBatch.mockResolvedValueOnce({
+      ok: false as const,
+      errorCode: 'E_OCR_INSTALL_FAILED',
+      message: 'install failed',
+    });
+
+    const r = await analyzeMedia({ op: 'ocr', inputAbsPath: fakeVideo });
+    expect(r.ok).toBe(false);
+    if (r.ok === false) expect(r.errorCode).toBe('E_OCR_INSTALL_FAILED');
+  });
+
+  it('real ocrImagesText validates inputs before touching the runtime', async () => {
+    const actual = await vi.importActual<typeof import('../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/ocr_runtime')>(
+      '../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/ocr_runtime',
+    );
+    // Empty input → trivially ok with no python spawn.
+    await expect(actual.ocrImagesText({ absPaths: [] })).resolves.toEqual({ ok: true, results: [] });
+    // A non-image path is rejected before ensureRuntime.
+    const r = await actual.ocrImagesText({ absPaths: ['/tmp/a.png', '/tmp/not-an-image.mp4'] });
+    expect(r.ok).toBe(false);
+    if (r.ok === false) expect(r.errorCode).toBe('E_OCR_UNSUPPORTED_FILE');
   });
 });

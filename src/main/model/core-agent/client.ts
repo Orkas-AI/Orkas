@@ -1020,15 +1020,15 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
   // `assemblingToolCallIds` covers the model-side gap after a streamed tool
   // call begins but before core-agent has the complete JSON needed to emit
   // `tool_start`; large `write_file` payloads can legitimately be silent there.
-  // Only when we're waiting for the MODEL to stream ordinary tokens with no tool
-  // activity — and the stream has already started (`sawFirstEvent`, so a slow
-  // first token / cold start still gets the long window) — do we apply the short
-  // `streamIdleTimeout`, which catches a provider stream that started then went
-  // silent mid-generation. `idleHitWindow` records which window actually fired
+  // Only when ordinary assistant text has begun streaming with no tool activity
+  // do we apply the short `streamIdleTimeout`, which catches a provider stream
+  // that started then went silent mid-generation. Cold starts, post-tool model
+  // calls, and compaction/retry handoffs keep the long `idleTimeout` until the
+  // next text delta arrives. `idleHitWindow` records which window actually fired
   // for the surfaced error text.
   let toolDepth = 0;
   const assemblingToolCallIds = new Set<string>();
-  let sawFirstEvent = false;
+  let modelTextStreamActive = false;
   let idleHitWindow = idleTimeout;
   const activeAbortEntry: ActiveSessionAbort = {
     abort: () => {
@@ -1046,14 +1046,14 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     if (idleTimer) clearTimeout(idleTimer);
     const assemblingToolCall = assemblingToolCallIds.size > 0;
     const inToolPhase = toolDepth > 0 || assemblingToolCall;
-    const window = !inToolPhase && sawFirstEvent ? streamIdleTimeout : idleTimeout;
+    const window = !inToolPhase && modelTextStreamActive ? streamIdleTimeout : idleTimeout;
     idleTimer = setTimeout(() => {
       idleHit = true;
       idleHitWindow = window;
       log.warn('idle-watchdog fired; aborting and releasing locks', {
         session_id: maskedSessionId,
         idle_seconds: window,
-        phase: toolDepth > 0 ? 'tool' : (assemblingToolCall ? 'tool_input' : 'model'),
+        phase: toolDepth > 0 ? 'tool' : (assemblingToolCall ? 'tool_input' : (modelTextStreamActive ? 'model_text' : 'model_wait')),
       });
       controller.abort();
       releaseSlotOnce('idle-watchdog');
@@ -1235,19 +1235,23 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
         // so the idle watchdog uses the long window while a tool is in flight.
         // tool_start fires before the tool body awaits and tool_end after, so
         // toolDepth > 0 spans the whole (possibly silent) tool execution.
-        else if (ev.type === 'tool_delta') {
+        else if (ev.type === 'text_delta') {
+          modelTextStreamActive = true;
+        } else if (ev.type === 'tool_delta') {
+          modelTextStreamActive = false;
           assemblingToolCallIds.add(ev.id || 'stream_tool');
         } else if (ev.type === 'tool_start') {
+          modelTextStreamActive = false;
           assemblingToolCallIds.clear();
           toolDepth += 1;
         } else if (ev.type === 'tool_end') {
+          modelTextStreamActive = false;
           assemblingToolCallIds.delete(ev.id || 'stream_tool');
           toolDepth = Math.max(0, toolDepth - 1);
         }
         // Some raw events intentionally do not map to visible UI events
         // (e.g. an empty tool-input delta before a large write_file argument).
         // They are still provider activity and must refresh the watchdog.
-        sawFirstEvent = true;
         resetIdle();
         yield ev;
       }
@@ -1259,10 +1263,8 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     let eventCount = 0;
     const mappedEvents = mapCoreAgentEvents(captureResult(rawEvents), { userId, skillDisplayNameById, agentDisplayNameById });
     for await (const ev of stopStreamOnAbort(mappedEvents, controller.signal, turnTag)) {
-      // Mark BEFORE resetIdle so the short model-stream window applies once the
-      // stream has started (a slow first token still gets the long cold-start
-      // window — see resetIdle).
-      sawFirstEvent = true;
+      // The raw-event wrapper owns phase tracking. Reset here too because
+      // mapped UI events can be synthesized from accumulated raw state.
       resetIdle();
       eventCount += 1;
       recordModelStreamEventForLog(diagnostics, ev);

@@ -1,6 +1,7 @@
 ---
 ownerAgent: 79df9cc89f5f
 name: stage-edit
+min_app_version: "1.5.1"
 description_zh: 真实素材的确定性剪辑知识——读素材元数据、按明确时间点切片/拼接/烧字幕/叠加，规划 edit_decisions 时间线再执行；clip-factory / 蒙太奇 / 二次创作产线的核心。
 description_en: Deterministic editing knowledge for real footage — probe inputs, then trim/concat/burn-subtitles/overlay by explicit timecodes via an edit_decisions timeline; core of the clip-factory / montage / repurpose lines.
 category: creation
@@ -12,12 +13,11 @@ How to edit **real user-supplied footage** deterministically (cut / join / burn 
 
 ## How to call the media scripts
 
-Use these `run-skill` entry points whenever this document says `stage-edit edit_video --op ...` or `stage-edit analyze_media --op ...`:
+Use these `run-skill` entry points whenever this document says `stage-edit edit_video --op ...` or `stage-edit analyze_media --op ...`. Exception: transcription runs through the required built-in `video_studio` tool with `op: "speech.transcribe"`. Compatibility is handled by the marketplace `min_app_version` field before install.
 
 ```bash
 "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit edit_video -- --op probe --input raw/clip.mp4
 "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit edit_video -- --op trim --input raw/clip.mp4 --start 12 --duration 8 --output project/cuts/seg-1.mp4
-"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit analyze_media -- --op transcribe --input raw/clip.mp4 --model large-v3
 "$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-edit analyze_media -- --op ocr --input raw/screen-recording.mp4
 ```
 
@@ -56,7 +56,7 @@ The scripts return JSON. A non-zero exit means the operation failed; fix the inp
 
 ## Transcription-driven selection & localization
 
-When the user wants highlights / clips "about X" or a localized version, transcribe first with `stage-edit analyze_media --op transcribe`, which returns a word-level transcript with timestamps. The default model is English-only; for non-English / Chinese audio pass `large-v3` — but warn the user that `large-v3` downloads ~3GB on its FIRST use (only once, then cached), so the first non-English transcribe can take several minutes before any result:
+When the user wants highlights / clips "about X" or a localized version, transcribe first with `video_studio` `op: "speech.transcribe"` and `timestamps: "word"`:
 
 - **Highlight / clip selection:** read the transcript, choose the time ranges whose words match the requested topic/moment, and feed those `start`/`duration` into the `edit_decisions` segments. Now the timecodes are evidence-based, not guessed.
 - **Auto-captions:** turn the transcript into an `.srt`, then `burnsubs` it onto the video.
@@ -66,15 +66,17 @@ When the user wants highlights / clips "about X" or a localized version, transcr
 
 **HARD RULE — adding narration to ANY existing video. Plan-first, IN ORDER. The plan.json is authored BEFORE any speech is generated and DRIVES the generation; do not synthesize a blob first and describe it after. Skipping a step is the #1 failure (a voiceover "about the right topic" that does not track the screen, crammed into half the runtime):**
 
-1. **Analyze the video FIRST — never narrate from topic knowledge.** Probe duration, then: `stage-edit analyze_media --op ocr` for on-screen text AND `--op transcribe` for any spoken audio. A title-card / slideshow / screen-recording is the on-screen-text case → OCR is **mandatory, not the fallback**. Do NOT jump to reading frames-as-vision while OCR is available, and do NOT describe the product from memory.
+1. **Analyze the video FIRST — never narrate from topic knowledge.** Probe duration, then: `stage-edit analyze_media --op ocr` for on-screen text AND `video_studio` `op: "speech.transcribe"` for spoken audio. A title-card / slideshow / screen-recording is the on-screen-text case → OCR is **mandatory, not the fallback**. Do NOT jump to reading frames-as-vision while OCR is available, and do NOT describe the product from memory.
 2. **Author `project/plan.json` NOW (plan-first, not at the end) as the segments EDL** (copy `stage-plan`'s exact JSON skeleton — `source` is the method enum `edit`, NOT a file path (the clip goes in `spec.input_id`); use `target_sec`; `tracks` is an object), carrying ONLY what the user asked for — keep the picture, add narration — and nothing else:
    - one **primary `edit` segment** for the source spanning the whole timeline (`source:"edit"`, `layer:"primary"`, `target_sec` = clip length, `spec.input_id`/`in_sec`/`out_sec` covering the clip). Source-led keep — do NOT add crop/scale/reframe; you weren't asked to.
    - a **`tracks.narration`** track (voice from §2.6) with ONE LINE per on-screen beat: `{ text, start_sec, target_sec }`, the window and text derived from the OCR/transcript table — segmented and time-aligned to the picture BEFORE any TTS. One line per beat; never one paragraph for the whole clip.
    - `delivery_promise:{ type:"source_led", source_required:true }`; set `aspect` from the SOURCE's real probed dimensions (a landscape source is `16:9`, not the portrait default).
    Each narration line stays its own entry, so a later edit can re-voice ONE line without touching the rest.
 3. **Generate each beat FROM the plan, then record its `produced_path`.** `generate_speech` per narration line with `target_duration` = its `target_sec`; save the mp3 and write that line's `produced_path`. If the words don't fit at a natural pace, SHORTEN that line in the plan — never speed up past natural or let it run long/short. Coverage must span ~0→clip-end, not stop at the halfway mark.
-4. **Assemble with `stage-edit edit_video` — keep the picture untouched.** Pass the source video through (`-c:v copy`) and place the narration lines at their `start_sec` in ONE `stage-edit edit_video --op mix` call via `--audio-segments` (one entry per line — that is HOW per-line `start_sec` alignment happens), then `--op loudness`; burn captions from `tracks.captions.lines` (.srt → `burnsubs`) if present. The source footage usually already HAS audio, so `mix` rejects by default — choose `--on-existing-audio mix` to keep the original sound under the voiceover, or `replace` to drop it. Write each line's `produced_path` + `status` and the top-level `draft` back to plan.json so the record matches the result. Never pre-bake one big narration file — that destroys per-line separability.
-5. **Self-check before presenting:** `project/plan.json` validates (`"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-plan video_plan -- --op validate --plan project/plan.json`); every narration line has a `produced_path` and a window matching its OCR/transcript text; total coverage ≈ full clip length; `project/render/draft.mp4` exists. Then tell the user the draft is ready and they can ask for follow-up tweaks (re-voice a line, fix a caption) and you'll change only that.
+   - Save each line under `project/assets/narration/line-XX.mp3` (or another `project/...` path) so the audio stays in the workspace and can be mixed later. Do not leave generated line audio under `cloud/chat_attachments/...`.
+   - Do not use repeated TTS calls as a duration search loop. Estimate words/characters from the target window first, generate once, and if the tool reports a poor fit, shorten that line and retry once. Small residual timing differences should be handled in deterministic assembly, not by synthesizing many alternatives.
+4. **Assemble with `stage-edit edit_video` — keep the picture untouched.** Pass the source video through (`-c:v copy`) and place the narration lines at their `start_sec` in ONE `stage-edit edit_video --op mix` call via `--audio-segments` (one entry per line — that is HOW per-line `start_sec` alignment happens), then run `--op normalize_loudness` to write the deliverable and return measured loudness in the same step; burn captions from `tracks.captions.lines` (.srt → `burnsubs`) if present. The source footage usually already HAS audio, so `mix` rejects by default — choose `--on-existing-audio mix` to keep the original sound under the voiceover, or `replace` to drop it. Write each line's `produced_path` + `status` and the top-level `draft` / `video` paths back to plan.json so the record matches the result. Never pre-bake one big narration file — that destroys per-line separability.
+5. **Self-check before presenting:** `project/plan.json` validates (`"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/run-skill.cjs" stage-plan video_plan -- --op validate --plan project/plan.json`); every narration line has a `produced_path` and a window matching its OCR/transcript text; total coverage ≈ full clip length; `project/render/video.mp4` exists. Then tell the user the draft is ready and they can ask for follow-up tweaks (re-voice a line, fix a caption) and you'll change only that.
 
 When the clip has NO spoken audio, or its meaning lives in ON-SCREEN TEXT (a screen-recording, a slideshow, a captioned montage), transcription returns nothing — the content is in the pixels, not the audio. An empty audio track does NOT mean an empty screen. Read what is on screen instead of guessing, in this strict order (cost-first):
 
@@ -102,7 +104,7 @@ Per repurpose/montage line:
 - **Screen-demo** — zoom only for legibility/orientation, steady while the viewer reads; reset to wide context between phases; ≤ 2 attention cues at once; label sped-up sections; keep UI text sharp (higher bitrate), don't force an unreadable vertical crop.
 - **Localization** — treat each language as its own deliverable; dubbed audio won't match source timing, so plan holds to flex; re-render or cover any baked-in text per language; subtitle line lengths differ by language; lip-sync only where a close-up mouth mismatch would distract.
 - **Documentary-montage** — concrete sensory shot descriptions, not abstract themes; one grade/LUT across all clips is what unifies mixed sources; budget 2–3 hero slots longer holds; a music bed + an end-tag.
-- Before publishing, check the mix loudness against the targets in video-craft §7 (~−14 LUFS integrated, true-peak ≤ ~−1 dBTP). (Orkas: `stage-edit edit_video --op loudness`.)
+- Before publishing, normalize the mix against the targets in video-craft §7 (~−14 LUFS integrated, true-peak ≤ ~−1 dBTP). (Orkas: `stage-edit edit_video --op normalize_loudness`; use `--op loudness` only for diagnosis without writing an output.)
 
 ## Rules
 

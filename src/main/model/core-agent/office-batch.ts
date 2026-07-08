@@ -5,7 +5,7 @@
  * and piped to `officecli batch <file>` over stdin (one open/save cycle).
  *
  * Op shapes are exactly what `officecli` consumes (verified via `dump` and live
- * runs against v1.0.117):
+ * runs against v1.0.131):
  *   - docx / pptx body content → `add` ops: {command,parent,type,props}
  *   - xlsx cells               → `set` ops: {command,path,props}
  */

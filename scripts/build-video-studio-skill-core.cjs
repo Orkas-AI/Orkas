@@ -57,11 +57,11 @@ const bannedRuntimeDeps = [
   "require('electron')",
 ];
 
-async function buildOne(item) {
-  fs.mkdirSync(path.dirname(item.outfile), { recursive: true });
+async function buildOne(item, outfile = item.outfile) {
+  fs.mkdirSync(path.dirname(outfile), { recursive: true });
   await esbuild.build({
     entryPoints: [item.entry],
-    outfile: item.outfile,
+    outfile,
     bundle: true,
     platform: 'node',
     target: 'node20',
@@ -73,19 +73,34 @@ async function buildOne(item) {
     logLevel: 'silent',
   });
 
-  const text = fs.readFileSync(item.outfile, 'utf8');
+  const text = fs.readFileSync(outfile, 'utf8');
   const banned = bannedRuntimeDeps.find((needle) => text.includes(needle));
   if (banned) {
-    throw new Error(`${path.relative(pcDir, item.outfile)} still contains forbidden runtime dependency: ${banned}`);
+    throw new Error(`${path.relative(pcDir, outfile)} still contains forbidden runtime dependency: ${banned}`);
   }
 }
 
-(async () => {
+/** Build every core to `outfileFor(item)` (default: the committed path).
+ *  The freshness test builds to a temp dir and byte-compares. */
+async function buildTo(outfileFor = (item) => item.outfile) {
+  const built = [];
   for (const item of outputs) {
-    await buildOne(item);
-    console.log(`built ${path.relative(pcDir, item.outfile)}`);
+    const outfile = outfileFor(item);
+    await buildOne(item, outfile);
+    built.push({ item, outfile });
   }
-})().catch((err) => {
-  console.error(err.stack || String(err));
-  process.exit(1);
-});
+  return built;
+}
+
+module.exports = { outputs, buildTo, pcDir };
+
+if (require.main === module) {
+  buildTo()
+    .then((built) => {
+      for (const { outfile } of built) console.log(`built ${path.relative(pcDir, outfile)}`);
+    })
+    .catch((err) => {
+      console.error(err.stack || String(err));
+      process.exit(1);
+    });
+}

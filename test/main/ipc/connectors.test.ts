@@ -16,6 +16,9 @@ beforeEach(() => {
 afterEach(() => {
   if (prevWs === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
   else process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+  vi.doUnmock('../../../src/main/features/connectors');
+  vi.doUnmock('../../../src/main/features/component_enabled');
+  vi.doUnmock('../../../src/main/features/connectors/availability');
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -41,6 +44,33 @@ function baseInstance(transport: any): any {
 }
 
 describe('ipc/connectors renderer DTO', () => {
+  it('lists local connector state without triggering Composio restore', async () => {
+    const restoreComposioConnectionsFromServer = vi.fn(async () => 0);
+    vi.doMock('../../../src/main/features/connectors', () => ({
+      listInstances: vi.fn(() => [baseInstance({
+        kind: 'streamable-http',
+        url: 'https://example.com/mcp',
+        headers: {},
+      })]),
+      restoreComposioConnectionsFromServer,
+    }));
+    vi.doMock('../../../src/main/features/component_enabled', () => ({
+      isConnectorEnabled: vi.fn(() => true),
+      setConnectorEnabled: vi.fn(),
+    }));
+    vi.doMock('../../../src/main/features/connectors/availability', () => ({
+      catalogWithAvailability: vi.fn((catalog) => catalog),
+      isConnectorRuntimeEnabled: vi.fn(() => true),
+    }));
+
+    const { invokeHandlers } = await import('../../../src/main/ipc/connectors');
+    const out = await invokeHandlers['connectors.list']({}, { userId: 'u-ipc' });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    expect(out.instances.map((inst) => inst.id)).toEqual(['custom-secret']);
+    expect(restoreComposioConnectionsFromServer).not.toHaveBeenCalled();
+  });
+
   it('does not expose stdio argv/env secrets', async () => {
     const { _toClientInstanceForTest } = await import('../../../src/main/ipc/connectors');
     const dto = _toClientInstanceForTest(baseInstance({

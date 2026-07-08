@@ -1324,6 +1324,27 @@ function _agentMemoryNotSupportedForExternalResult() {
   return _agentMemoryUnsupportedResult('agent memory is not supported for external CLI agents');
 }
 
+async function _resolveAgentMemoryTarget(agentId: string): Promise<{
+  source: AgentSource;
+  file: string;
+  data: AgentRaw;
+} | null> {
+  for (const source of ['marketplace', 'custom'] as AgentSource[]) {
+    const file = isMarketplaceSource(source)
+      ? _platformAgentSpecFile(agentId)
+      : customAgentFile(agentId);
+    if (!fs.existsSync(file)) continue;
+    try {
+      const data = await readJson<AgentRaw>(file);
+      const norm = normalizeAgent(data, source);
+      if (norm?.agent_id === agentId) return { source, file, data };
+    } catch {
+      /* try the next source */
+    }
+  }
+  return null;
+}
+
 function _readAgentRuntimeStats(userId: string, agentId: string): AgentRuntimeStats | undefined {
   if (!safeId(agentId)) return undefined;
   try {
@@ -1864,10 +1885,9 @@ export async function appendAgentSkill(agentId: string, skillId: string): Promis
 
 export async function addCustomAgentMemory(agentId: string, content: string) {
   if (!agentId || !safeId(agentId)) return { ok: false, error: 'invalid agent_id', entries: [], usage: { current: 0, limit: 0 } };
-  const f = customAgentFile(agentId);
-  if (!fs.existsSync(f)) return { ok: false, error: 'agent not found or read-only', entries: [], usage: { current: 0, limit: 0 } };
-  const data = await readJson<AgentRaw>(f);
-  if (_normalizeRuntime(data.runtime)?.kind === 'cli') return _agentMemoryNotSupportedForExternalResult();
+  const target = await _resolveAgentMemoryTarget(agentId);
+  if (!target) return { ok: false, error: 'agent not found or read-only', entries: [], usage: { current: 0, limit: 0 } };
+  if (_normalizeRuntime(target.data.runtime)?.kind === 'cli') return _agentMemoryNotSupportedForExternalResult();
   const res = addAgentEntry(getActiveUserId(), agentId, content);
   if (res.ok) _invalidateAgentListCache();
   return res;
@@ -1875,17 +1895,18 @@ export async function addCustomAgentMemory(agentId: string, content: string) {
 
 export async function removeCustomAgentMemory(agentId: string, oldText: string) {
   if (!agentId || !safeId(agentId)) return { ok: false, error: 'invalid agent_id', entries: [], usage: { current: 0, limit: 0 } };
-  const f = customAgentFile(agentId);
-  if (!fs.existsSync(f)) return { ok: false, error: 'agent not found or read-only', entries: [], usage: { current: 0, limit: 0 } };
-  const data = await readJson<AgentRaw>(f);
-  if (_normalizeRuntime(data.runtime)?.kind === 'cli') return _agentMemoryNotSupportedForExternalResult();
+  const target = await _resolveAgentMemoryTarget(agentId);
+  if (!target) return { ok: false, error: 'agent not found or read-only', entries: [], usage: { current: 0, limit: 0 } };
+  if (_normalizeRuntime(target.data.runtime)?.kind === 'cli') return _agentMemoryNotSupportedForExternalResult();
 
   const fileRes = removeAgentEntry(getActiveUserId(), agentId, oldText);
   if (fileRes.ok) {
     _invalidateAgentListCache();
     return fileRes;
   }
+  if (target.source !== 'custom') return fileRes;
 
+  const data = target.data;
   const profile = normalizeAgentProfile(data);
   const memory = profile?.memory || [];
   const needle = String(oldText || '').trim();
@@ -1905,17 +1926,16 @@ export async function removeCustomAgentMemory(agentId: string, oldText: string) 
   }
   bumpAgentSpecRevision(data);
   data.updated_at = nowIso();
-  await writeJson(f, data);
+  await writeJson(target.file, data);
   _invalidateAgentListCache();
   return listAgentEntries(getActiveUserId(), agentId);
 }
 
 export async function updateCustomAgentMemory(agentId: string, oldText: string, content: string) {
   if (!agentId || !safeId(agentId)) return { ok: false, error: 'invalid agent_id', entries: [], usage: { current: 0, limit: 0 } };
-  const f = customAgentFile(agentId);
-  if (!fs.existsSync(f)) return { ok: false, error: 'agent not found or read-only', entries: [], usage: { current: 0, limit: 0 } };
-  const data = await readJson<AgentRaw>(f);
-  if (_normalizeRuntime(data.runtime)?.kind === 'cli') return _agentMemoryNotSupportedForExternalResult();
+  const target = await _resolveAgentMemoryTarget(agentId);
+  if (!target) return { ok: false, error: 'agent not found or read-only', entries: [], usage: { current: 0, limit: 0 } };
+  if (_normalizeRuntime(target.data.runtime)?.kind === 'cli') return _agentMemoryNotSupportedForExternalResult();
   const res = replaceAgentEntry(getActiveUserId(), agentId, oldText, content);
   if (res.ok) _invalidateAgentListCache();
   return res;

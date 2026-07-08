@@ -76,7 +76,7 @@ const MIN_TRIM_OUTPUT_SEC = 0.1;
 const RUN_PROGRESS_HEARTBEAT_MS = 15_000;
 const RUN_PROGRESS_MIN_EMIT_MS = 2_000;
 
-export type EditOp = 'probe' | 'trim' | 'concat' | 'burnsubs' | 'overlay' | 'extract_frame' | 'loudness' | 'mix' | 'trim_silence' | 'remove_fillers';
+export type EditOp = 'probe' | 'trim' | 'concat' | 'burnsubs' | 'overlay' | 'extract_frame' | 'loudness' | 'normalize_loudness' | 'mix' | 'trim_silence' | 'remove_fillers';
 
 /** ebur128 loudness measurement (video-craft §7 targets: ~-14 LUFS integrated,
  *  true-peak ≤ ~-1 dBTP). A field is null when the source is silent (ffmpeg
@@ -567,6 +567,23 @@ function ffmpegFailure(op: EditOp, r: { code: number | null; stderr: string; tim
   return fail('E_EDIT_FAILED', `${op} failed (exit ${r.code}). ${tail || 'No diagnostic output.'}`);
 }
 
+async function measureLoudness(
+  ffmpeg: string,
+  ffprobe: string,
+  inputAbsPath: string,
+  signal?: AbortSignal,
+): Promise<EditResult> {
+  const durationSec = await probeDurationSec(ffprobe, inputAbsPath, signal);
+  // ebur128 prints its Summary to stderr; -f null discards the decoded output.
+  const r = await run(ffmpeg, withFfmpegProgress([
+    '-hide_banner', '-nostats', '-i', inputAbsPath, '-af', 'ebur128=peak=true', '-f', 'null', '-',
+  ]), signal, { op: 'loudness', phase: 'analyze', durationSec });
+  if (r.code !== 0) return ffmpegFailure('loudness', r);
+  const loudness = parseEbur128Summary(r.stderr);
+  if (!loudness) return fail('E_EDIT_LOUDNESS_PARSE', 'Could not parse the ffmpeg ebur128 loudness summary.');
+  return { ok: true, op: 'loudness', loudness };
+}
+
 /** ffprobe a file's container duration (seconds), falling back to the first
  *  audio stream's duration. Returns 0 when neither is available. */
 async function probeDurationSec(ffprobe: string, input: string, signal?: AbortSignal): Promise<number> {
@@ -765,15 +782,7 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
 
   if (p.op === 'loudness') {
     if (!p.inputAbsPath) return fail('E_EDIT_ARG', 'loudness requires input_path');
-    const durationSec = await probeDurationSec(bins.ffprobe, p.inputAbsPath, p.signal);
-    // ebur128 prints its Summary to stderr; -f null discards the decoded output.
-    const r = await run(bins.ffmpeg, withFfmpegProgress([
-      '-hide_banner', '-nostats', '-i', p.inputAbsPath, '-af', 'ebur128=peak=true', '-f', 'null', '-',
-    ]), p.signal, { op: 'loudness', phase: 'analyze', durationSec });
-    if (r.code !== 0) return ffmpegFailure('loudness', r);
-    const loudness = parseEbur128Summary(r.stderr);
-    if (!loudness) return fail('E_EDIT_LOUDNESS_PARSE', 'Could not parse the ffmpeg ebur128 loudness summary.');
-    return { ok: true, op: 'loudness', loudness };
+    return measureLoudness(bins.ffmpeg, bins.ffprobe, p.inputAbsPath, p.signal);
   }
 
   if (!p.outputAbsPath) return fail('E_EDIT_ARG', `${p.op} requires output_path`);
@@ -797,6 +806,31 @@ export async function editVideo(p: EditParams): Promise<EditResult> {
     const checked = await validateTrimOutput(bins.ffprobe, p.outputAbsPath, p.signal);
     if (checked.ok === false) return fail(checked.errorCode, checked.message);
     return { ok: true, op: 'trim', path: p.outputAbsPath, bytes: checked.bytes };
+  }
+
+  if (p.op === 'normalize_loudness') {
+    if (!p.inputAbsPath) return fail('E_EDIT_ARG', 'normalize_loudness requires input_path');
+    const base = await probeBasic(bins.ffprobe, p.inputAbsPath, p.signal);
+    if (!base.hasAudio) return fail('E_EDIT_NO_AUDIO', 'normalize_loudness requires an input with an audio stream.');
+    const ln = `loudnorm=I=${MIX_LOUDNORM.I}:TP=${MIX_LOUDNORM.TP}:LRA=${MIX_LOUDNORM.LRA},aresample=${MIX_OUTPUT_SR}`;
+    const r = await run(bins.ffmpeg, withFfmpegProgress([
+      '-y', '-i', p.inputAbsPath,
+      '-map', '0:v?', '-map', '0:a:0',
+      '-c:v', 'copy',
+      '-filter:a:0', ln,
+      '-c:a', 'aac', '-ar', String(MIX_OUTPUT_SR),
+      '-movflags', '+faststart', p.outputAbsPath,
+    ]), p.signal, { op: 'normalize_loudness', phase: 'edit', durationSec: base.durationSec });
+    if (r.code !== 0) return ffmpegFailure('normalize_loudness', r);
+    const loudnessResult = await measureLoudness(bins.ffmpeg, bins.ffprobe, p.outputAbsPath, p.signal);
+    if (loudnessResult.ok === false) return loudnessResult;
+    return {
+      ok: true,
+      op: 'normalize_loudness',
+      path: p.outputAbsPath,
+      bytes: await statSize(p.outputAbsPath),
+      loudness: loudnessResult.loudness,
+    };
   }
 
   if (p.op === 'concat') {

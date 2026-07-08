@@ -17,6 +17,9 @@
 // "superseded" message is swallowed since it's caused by the user's own re-click).
 
 const _connectorsLog = createLogger('connectors');
+const _CONNECTORS_RENDER_CACHE_VERSION = 2;
+const _CONNECTORS_RENDER_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+let _connectorsLegacyCachePurged = false;
 
 function _connectorsTrackClick(action, data) {
 }
@@ -57,22 +60,97 @@ let _connectorsState = {
    *  stays clickable; re-click supersedes the prior flow (see comment in `_runConnect`). */
   connecting: new Set(),
 };
+let _connectorsLoadSeq = 0;
+
+function _connectorsRenderCacheKey() {
+  const uid = (typeof currentUserId === 'string' && currentUserId)
+    ? currentUserId
+    : ((typeof globalThis.currentUserId === 'string' && globalThis.currentUserId) ? globalThis.currentUserId : 'local');
+  return `orkas.connectors.renderCache.v${_CONNECTORS_RENDER_CACHE_VERSION}.${uid}`;
+}
+
+function _purgeLegacyConnectorsRenderCaches() {
+  if (_connectorsLegacyCachePurged) return;
+  _connectorsLegacyCachePurged = true;
+  try {
+    const prefix = 'orkas.connectors.renderCache.v';
+    const currentPrefix = `orkas.connectors.renderCache.v${_CONNECTORS_RENDER_CACHE_VERSION}.`;
+    const doomed = [];
+    for (let i = 0; i < localStorage.length; i += 1) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith(prefix) && !key.startsWith(currentPrefix)) doomed.push(key);
+    }
+    for (const key of doomed) localStorage.removeItem(key);
+  } catch (_) { /* localStorage unavailable / quota — skip */ }
+}
+
+function _sanitizeConnectorArray(value, options = {}) {
+  const arr = Array.isArray(value) ? value.filter((item) => item && typeof item === 'object') : [];
+  if (!options.dropErrored) return arr;
+  return arr.filter((item) => !(item.status && item.status.kind === 'error'));
+}
+
+function _hydrateConnectorsRenderCache() {
+  if (_connectorsState.catalog.length || _connectorsState.instances.length) return false;
+  try {
+    const raw = localStorage.getItem(_connectorsRenderCacheKey());
+    if (!raw) return false;
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.version !== _CONNECTORS_RENDER_CACHE_VERSION) return false;
+    if (Date.now() - Number(parsed.updated_at || 0) > _CONNECTORS_RENDER_CACHE_TTL_MS) return false;
+    const catalog = _sanitizeConnectorArray(parsed.catalog);
+    const instances = _sanitizeConnectorArray(parsed.instances, { dropErrored: true });
+    if (!catalog.length && !instances.length) return false;
+    _connectorsState.catalog = catalog;
+    _connectorsState.instances = instances;
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function _persistConnectorsRenderCache() {
+  if (!_connectorsState.catalog.length && !_connectorsState.instances.length) return;
+  try {
+    localStorage.setItem(_connectorsRenderCacheKey(), JSON.stringify({
+      version: _CONNECTORS_RENDER_CACHE_VERSION,
+      updated_at: Date.now(),
+      catalog: _connectorsState.catalog,
+      instances: _sanitizeConnectorArray(_connectorsState.instances, { dropErrored: true }),
+    }));
+  } catch (_) { /* localStorage unavailable / quota — skip */ }
+}
 
 async function loadConnectors() {
+  const seq = ++_connectorsLoadSeq;
+  _purgeLegacyConnectorsRenderCaches();
+  _hydrateConnectorsRenderCache();
   _connectorsState.loading = true;
   _renderConnectorsGrid();
   try {
     const [catRes, listRes] = await Promise.all([
-      window.orkas.invoke('connectors.catalog', {}),
-      window.orkas.invoke('connectors.list', {}),
+      window.orkas.invoke('connectors.catalog', {}).catch((err) => ({ ok: false, error: err })),
+      window.orkas.invoke('connectors.list', {}).catch((err) => ({ ok: false, error: err })),
     ]);
-    _connectorsState.catalog = (catRes && catRes.ok && Array.isArray(catRes.catalog)) ? catRes.catalog : [];
-    _connectorsState.instances = (listRes && listRes.ok && Array.isArray(listRes.instances)) ? listRes.instances : [];
+    if (seq !== _connectorsLoadSeq) return;
+    if (catRes && catRes.ok && Array.isArray(catRes.catalog)) {
+      _connectorsState.catalog = catRes.catalog;
+    } else {
+      _connectorsLog.warn('catalog failed', { error: catRes && (catRes.error && catRes.error.message || catRes.error) });
+    }
+    if (listRes && listRes.ok && Array.isArray(listRes.instances)) {
+      _connectorsState.instances = listRes.instances;
+    } else {
+      _connectorsLog.warn('list failed', { error: listRes && (listRes.error && listRes.error.message || listRes.error) });
+    }
+    _persistConnectorsRenderCache();
   } catch (err) {
     _connectorsLog.warn('list failed', { error: err && err.message });
   } finally {
-    _connectorsState.loading = false;
-    _renderConnectorsGrid();
+    if (seq === _connectorsLoadSeq) {
+      _connectorsState.loading = false;
+      _renderConnectorsGrid();
+    }
   }
 }
 

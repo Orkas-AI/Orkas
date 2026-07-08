@@ -52,6 +52,11 @@ function loadConversationRenderer() {
       'auto.title': 'Automation',
       'agents.use_label': `Agent: ${params?.agent || ''}`,
       'skills.use_label': `Skill: ${params?.skill || ''}`,
+      'chat.stream.compaction_tokens': `Context compressed: ${params?.before} -> ${params?.after} tokens`,
+      'chat.stream.runtime_total': `Total time ${params?.duration}`,
+      'chat.stream.duration_s': `${params?.s}s`,
+      'chat.stream.duration_ms': `${params?.m}m ${params?.s}s`,
+      'chat.stream.duration_hms': `${params?.h}h ${params?.m}m ${params?.s}s`,
       'sidebar.bucket.today': 'Today',
       'sidebar.bucket.last30': 'Last 30 days',
     }[key] || key),
@@ -850,6 +855,36 @@ describe('conversation process read_file resource labels', () => {
     });
 
     expect(line).toContain('Agent: 学习路径设计师 · agent.json');
+  });
+});
+
+describe('conversation process metadata formatting', () => {
+  it('formats compaction and total runtime events for the process pane', () => {
+    const context = loadConversationRenderer();
+
+    const compaction = context._formatEventLine({
+      stream: 'compaction',
+      data: { tokensBefore: 20000, tokensAfter: 3000 },
+    });
+    const runtime = context._formatEventLine({
+      stream: 'runtime',
+      data: { duration_ms: 65_000 },
+    });
+
+    expect(compaction).toBe('Context compressed: 20000 -> 3000 tokens');
+    expect(runtime).toBe('Total time 1m 5s');
+    expect(context._processSummaryRuntimeFromItems([
+      { type: 'progress', text: 'Context compressed', event: { stream: 'compaction', data: {} } },
+      { type: 'progress', text: 'Total time 1m 5s', event: { stream: 'runtime', data: { duration_ms: 65_000 } } },
+    ])).toBe('1m 5s');
+    expect(context._processSummaryRuntimeFromItems([
+      { type: 'event', event: { stream: 'runtime', data: { durationMs: 1_234 } } },
+    ])).toBe('1s');
+    expect(context._processSummaryRuntimeFromItems([
+      { type: 'progress', text: 'Context compressed', event: { stream: 'compaction', data: {} } },
+    ])).toBe('');
+    expect(context._eventProcessKind({ stream: 'compaction', data: {} }, compaction)).toBe('info');
+    expect(context._eventProcessKind({ stream: 'runtime', data: {} }, runtime)).toBe('bound');
   });
 });
 

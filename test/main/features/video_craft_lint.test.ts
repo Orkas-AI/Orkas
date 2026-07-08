@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { lintCompositionCraft, formatCraftFindings } from '../../../src/main/features/video_craft_lint';
+import { lintCompositionCraft, formatCraftFindings } from '../../../resources/builtin/marketplace/agents/79df9cc89f5f/skills/_shared/scripts/src/video_craft_lint';
 
 const codes = (html: string, opts?: { canvasHeight?: number }) =>
   lintCompositionCraft(html, opts).map((f) => f.code);
@@ -86,5 +86,19 @@ describe('formatCraftFindings', () => {
     const text = formatCraftFindings(lintCompositionCraft('<div style="font-size:12px">x</div>'));
     expect(text).toContain('[craft]');
     expect(text).toContain('FONT_TOO_SMALL');
+  });
+
+  it('labels only small text as blocking when strict craft mode is active', () => {
+    const text = formatCraftFindings(lintCompositionCraft('<div style="font-size:12px">x</div>'), { strict: true });
+    expect(text).toContain('FONT_TOO_SMALL blocks under --strict-craft');
+    expect(text).toContain('PALETTE_LARGE is advisory');
+  });
+
+  it('keeps palette-size findings advisory even in strict craft mode', () => {
+    const palette = ['#ff0000', '#00ff00', '#0000ff', '#ffff00', '#ff00ff', '#00ffff', '#ff8800', '#8800ff', '#0088ff'];
+    const html = palette.map((c) => `<div style="color:${c}">x</div>`).join('');
+    const text = formatCraftFindings(lintCompositionCraft(html), { strict: true });
+    expect(text).toContain('PALETTE_LARGE');
+    expect(text).toContain('PALETTE_LARGE is advisory');
   });
 });

@@ -70,6 +70,22 @@ function writeCustomAgent(agentId: string, fields: Partial<Record<string, any>> 
   fs.writeFileSync(path.join(dir, 'agent.json'), JSON.stringify(data));
 }
 
+function writePlatformAgent(agentId: string, fields: Partial<Record<string, any>> = {}): void {
+  const dir = path.join(builtinAgentsDir(), agentId);
+  fs.mkdirSync(dir, { recursive: true });
+  const data: Record<string, any> = {
+    agent_id: agentId,
+    name: fields.name ?? agentId,
+    description: fields.description ?? 'Platform agent',
+    category: fields.category ?? 'general',
+    workflow: fields.workflow ?? '',
+    created_at: '2026-04-18T10:00:00',
+    updated_at: '2026-04-18T10:00:00',
+  };
+  if ('runtime' in fields) data.runtime = fields.runtime;
+  fs.writeFileSync(path.join(dir, 'agent.json'), JSON.stringify(data));
+}
+
 function customSkillsDir(): string {
   return path.join(tmpDir, TEST_UID, 'cloud', 'skills');
 }
@@ -1423,6 +1439,32 @@ describe('agents › custom agent memory', () => {
     expect(fs.readFileSync(canonicalMemoryFile, 'utf8')).toContain('new delivery preference');
   });
 
+  it('lets platform-installed agents edit user memory without mutating the installed spec', async () => {
+    writePlatformAgent('platform-agent', { name: 'PlatformAgent' });
+    const specFile = path.join(builtinAgentsDir(), 'platform-agent', 'agent.json');
+    const beforeSpec = fs.readFileSync(specFile, 'utf8');
+    const a = await loadAgents();
+
+    const added = await a.addCustomAgentMemory('platform-agent', 'old platform preference');
+    expect(added.ok).toBe(true);
+    const canonicalMemoryFile = path.join(tmpDir, TEST_UID, 'cloud', 'memory', 'agents', 'platform-agent', 'MEMORY.md');
+    expect(fs.readFileSync(canonicalMemoryFile, 'utf8')).toContain('old platform preference');
+    expect(fs.readFileSync(specFile, 'utf8')).toBe(beforeSpec);
+
+    const updated = await a.updateCustomAgentMemory('platform-agent', 'old platform preference', 'new platform preference');
+    expect(updated.ok).toBe(true);
+    expect(updated.entries).toEqual(['new platform preference']);
+
+    const reread = await a.getAgent('platform-agent');
+    expect(reread?.source).toBe('marketplace');
+    expect(reread?.profile?.memory?.map((entry) => entry.title)).toEqual(['new platform preference']);
+
+    const removed = await a.removeCustomAgentMemory('platform-agent', 'new platform preference');
+    expect(removed.ok).toBe(true);
+    expect(removed.entries).toEqual([]);
+    expect(fs.readFileSync(specFile, 'utf8')).toBe(beforeSpec);
+  });
+
   it('does not expose or mutate detail memory for external CLI agents', async () => {
     writeCustomAgent('cli-agent', {
       name: 'CliAgent',
@@ -1440,6 +1482,20 @@ describe('agents › custom agent memory', () => {
     expect(added.ok).toBe(false);
     expect(added.error).toContain('external CLI');
     expect(fs.readFileSync(memoryFile, 'utf8')).toBe('existing external memory');
+  });
+
+  it('does not add memory for platform-installed external CLI agents', async () => {
+    writePlatformAgent('platform-cli', {
+      name: 'PlatformCli',
+      runtime: { kind: 'cli', cli: 'codex' },
+    });
+    const a = await loadAgents();
+
+    const added = await a.addCustomAgentMemory('platform-cli', 'new external memory');
+    expect(added.ok).toBe(false);
+    expect(added.error).toContain('external CLI');
+    const canonicalMemoryFile = path.join(tmpDir, TEST_UID, 'cloud', 'memory', 'agents', 'platform-cli', 'MEMORY.md');
+    expect(fs.existsSync(canonicalMemoryFile)).toBe(false);
   });
 });
 
