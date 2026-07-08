@@ -25,7 +25,7 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-async function buildEditTool(opts: { onFileWritten?: (p: string) => void; extraRoots?: string[] } = {}) {
+async function buildEditTool(opts: { onFileWritten?: (p: string) => void; extraRoots?: string[]; readOnlyExtraRoots?: string[] } = {}) {
   const localTools = await import('../../../../src/main/model/core-agent/local-tools');
   const ws = await import('../../../../src/main/features/user_workspace');
   const wsDir = path.join(tmpDir, 'ws');
@@ -37,13 +37,14 @@ async function buildEditTool(opts: { onFileWritten?: (p: string) => void; extraR
     cid: CID,
     ...(opts.onFileWritten ? { onFileWritten: opts.onFileWritten } : {}),
     ...(opts.extraRoots ? { extraRoots: opts.extraRoots } : {}),
+    ...(opts.readOnlyExtraRoots ? { readOnlyExtraRoots: opts.readOnlyExtraRoots } : {}),
   });
   const edit = tools.find((t) => t.name === 'edit_file');
   if (!edit) throw new Error('edit_file tool missing');
   return { edit, wsDir };
 }
 
-async function buildWriteTool(opts: { onFileWritten?: (p: string) => void; extraRoots?: string[] } = {}) {
+async function buildWriteTool(opts: { onFileWritten?: (p: string) => void; extraRoots?: string[]; readOnlyExtraRoots?: string[] } = {}) {
   const localTools = await import('../../../../src/main/model/core-agent/local-tools');
   const ws = await import('../../../../src/main/features/user_workspace');
   const wsDir = path.join(tmpDir, 'ws');
@@ -55,6 +56,7 @@ async function buildWriteTool(opts: { onFileWritten?: (p: string) => void; extra
     cid: CID,
     ...(opts.onFileWritten ? { onFileWritten: opts.onFileWritten } : {}),
     ...(opts.extraRoots ? { extraRoots: opts.extraRoots } : {}),
+    ...(opts.readOnlyExtraRoots ? { readOnlyExtraRoots: opts.readOnlyExtraRoots } : {}),
   });
   const write = tools.find((t) => t.name === 'write_file');
   if (!write) throw new Error('write_file tool missing');
@@ -202,8 +204,8 @@ describe('local-tools › edit_file › sandbox', () => {
     expect(fs.existsSync(outside)).toBe(false);
   });
 
-  it('does not allow delete_file under readOnlyExtraRoots', async () => {
-    await workspaceOnly();
+  it('does not allow delete_file under readOnlyExtraRoots, even in all-files mode', async () => {
+    await allFilesApproval();
     const readOnlyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-ro-delete-'));
     const p = path.join(readOnlyDir, 'keep.md');
     fs.writeFileSync(p, 'do not delete');
@@ -211,11 +213,49 @@ describe('local-tools › edit_file › sandbox', () => {
       const { del } = await buildDeleteTool({ readOnlyExtraRoots: [readOnlyDir] });
       const r = await run(del, { path: p });
       expect(r.isError).toBe(true);
-      expect(r.content).toContain('E_PATH_OUT_OF_SCOPE');
+      expect(r.content).toContain('E_PROTECTED_PATH_READ_ONLY');
       expect(fs.readFileSync(p, 'utf8')).toBe('do not delete');
     } finally {
       fs.rmSync(readOnlyDir, { recursive: true, force: true });
     }
+  });
+
+  it('blocks direct local-tool mutation of marketplace installs in all-files mode', async () => {
+    await allFilesApproval();
+    const paths = await import('../../../../src/main/paths');
+    const localTools = await import('../../../../src/main/model/core-agent/local-tools');
+    const skillDir = paths.userMarketplaceSkillDir(UID, 'platform-skill');
+    fs.mkdirSync(skillDir, { recursive: true });
+    const skillFile = path.join(skillDir, 'SKILL.md');
+    fs.writeFileSync(skillFile, 'original skill');
+
+    const tools = localTools.createLocalTools({ userId: UID, cid: CID });
+    const edit = tools.find((t) => t.name === 'edit_file');
+    const write = tools.find((t) => t.name === 'write_file');
+    const del = tools.find((t) => t.name === 'delete_file');
+    const bash = tools.find((t) => t.name === 'bash');
+    if (!edit || !write || !del || !bash) throw new Error('expected local tools missing');
+
+    const editRes = await run(edit, { path: skillFile, old_string: 'original', new_string: 'mutated' });
+    expect(editRes.isError).toBe(true);
+    expect(editRes.content).toContain('E_PROTECTED_PATH_READ_ONLY');
+    expect(fs.readFileSync(skillFile, 'utf8')).toBe('original skill');
+
+    const newFile = path.join(skillDir, 'notes.md');
+    const writeRes = await run(write, { path: newFile, content: 'new bytes' });
+    expect(writeRes.isError).toBe(true);
+    expect(writeRes.content).toContain('E_PROTECTED_PATH_READ_ONLY');
+    expect(fs.existsSync(newFile)).toBe(false);
+
+    const deleteRes = await run(del, { path: skillFile });
+    expect(deleteRes.isError).toBe(true);
+    expect(deleteRes.content).toContain('E_PROTECTED_PATH_READ_ONLY');
+    expect(fs.existsSync(skillFile)).toBe(true);
+
+    const bashRes = await run(bash, { command: `printf hacked > "${skillFile}"` });
+    expect(bashRes.isError).toBe(true);
+    expect(bashRes.content).toContain('E_PROTECTED_PATH_READ_ONLY');
+    expect(fs.readFileSync(skillFile, 'utf8')).toBe('original skill');
   });
 });
 
@@ -585,5 +625,50 @@ describe('local-tools › create_artifact › backend rejection surfaces as isEr
     expect(r.isError).toBe(true);
     expect(r.content).toMatch(/index\.html/);
     expect(created).toEqual([]);
+  });
+});
+
+describe('local-tools › direct CLI › script progress scanner', () => {
+  async function scannerModule() {
+    return import('../../../../src/main/model/core-agent/local-tools');
+  }
+
+  it('parses progress JSONL lines, including across chunk boundaries', async () => {
+    const { createScriptProgressScanner } = await scannerModule();
+    const scanner = createScriptProgressScanner();
+    const first = scanner.feed('{"type":"progress","source":"video_edit","op":"trim","status":"encoding"}\n{"type":"prog');
+    expect(first).toHaveLength(1);
+    expect(first[0]).toMatchObject({ source: 'video_edit', op: 'trim', status: 'encoding' });
+    // Second half of the split line arrives in the next chunk.
+    const second = scanner.feed('ress","source":"video_analyze","op":"transcribe","status":"heartbeat"}\n');
+    expect(second).toHaveLength(1);
+    expect(second[0]).toMatchObject({ source: 'video_analyze', op: 'transcribe' });
+  });
+
+  it('ignores non-progress stderr content and look-alike lines', async () => {
+    const { createScriptProgressScanner } = await scannerModule();
+    const scanner = createScriptProgressScanner();
+    const events = scanner.feed([
+      'ffmpeg version 6.0 stderr noise',
+      '{"ok":false,"code":"E_EDIT_FAILED","message":"boom"}',
+      '{"type":"progressive","source":"look-alike"}',
+      '{"type":"progress" broken json',
+      '"type":"progress" not an object line',
+      '{"type":"progress","source":"video_edit","status":"heartbeat"}',
+      '',
+    ].join('\n') + '\n');
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ type: 'progress', source: 'video_edit' });
+  });
+
+  it('formats a readable one-liner and prefers an explicit message', async () => {
+    const { formatScriptProgress } = await scannerModule();
+    expect(formatScriptProgress({ message: 'rendering scene 2/4' })).toBe('rendering scene 2/4');
+    const line = formatScriptProgress({ source: 'video_edit', op: 'trim', status: 'encoding', percent: 42.4, out_time_sec: 12.6 });
+    expect(line).toContain('video_edit');
+    expect(line).toContain('trim');
+    expect(line).toContain('42%');
+    expect(line).toContain('t=13s');
+    expect(formatScriptProgress({})).toBe('script progress');
   });
 });

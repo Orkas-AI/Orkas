@@ -69,7 +69,13 @@ import { uniquifyPath, renderRenameSignal } from '../../util/uniquify-path';
 import { isPathAllowed } from '../../util/path-sandbox';
 import { kindOf } from '../../features/file_indexer';
 import { getWorkspacePath } from '../../features/user_workspace';
-import { chatAttachmentDir, userMarketplaceSkillsDir, userSkillsDir } from '../../paths';
+import {
+  chatAttachmentDir,
+  userMarketplaceAgentsDir,
+  userMarketplaceSkillsDir,
+  userSystemSkillsDir,
+  userSkillsDir,
+} from '../../paths';
 import * as chatArtifacts from '../../features/chat_artifacts';
 import { finalizeProducedArtifact, producedDocumentFooterText } from '../../features/produced_output_hooks';
 import { readDisabledSets } from '../../features/component_enabled';
@@ -126,6 +132,10 @@ export interface LocalToolsOpts {
    *  on top of workspace + attachment. Used by skill-edit / agent-edit
    *  chats so the LLM can edit files inside the skill / agent dir. */
   extraRoots?: readonly string[];
+  /** Extra roots that read tools may expose but local execution must never
+   *  mutate. This is a deny-only lane: it does not make paths readable or
+   *  writable for localTools, and it overrides all-files access modes. */
+  readOnlyExtraRoots?: readonly string[];
   /** Fires with absolute path after every successful write (write_file,
    * edit_file, markdown_to_pdf, html_to_pdf). Lets chats.ts surface
    * produced files to the UI. */
@@ -370,6 +380,57 @@ function _repoDefaultDir(repo: string): string {
 function _sameOrInside(parent: string, candidate: string): boolean {
   const rel = path.relative(path.resolve(parent), path.resolve(candidate));
   return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+function _uniqueResolvedRoots(input: readonly string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const root of input) {
+    if (!root) continue;
+    const abs = path.resolve(root);
+    if (seen.has(abs)) continue;
+    seen.add(abs);
+    out.push(abs);
+  }
+  return out;
+}
+
+function protectedWriteRootsFor(opts: LocalToolsOpts): string[] {
+  const roots: string[] = [];
+  if (opts.userId) {
+    roots.push(
+      userMarketplaceAgentsDir(opts.userId),
+      userMarketplaceSkillsDir(opts.userId),
+      userSystemSkillsDir(opts.userId),
+    );
+  }
+  if (opts.readOnlyExtraRoots?.length) roots.push(...opts.readOnlyExtraRoots);
+  return _uniqueResolvedRoots(roots);
+}
+
+function protectedRootForPath(opts: LocalToolsOpts, abs: string): string | null {
+  const candidate = path.resolve(abs);
+  for (const root of protectedWriteRootsFor(opts)) {
+    if (_sameOrInside(root, candidate)) return root;
+  }
+  return null;
+}
+
+function protectedRootMentionedByCommand(opts: LocalToolsOpts, command: string): string | null {
+  if (!command) return null;
+  const normalized = command.replace(/\\([\\ "'$`])/g, '$1').replace(/\\/g, '/');
+  for (const root of protectedWriteRootsFor(opts)) {
+    const resolved = path.resolve(root).replace(/\\/g, '/');
+    if (normalized.includes(resolved)) return root;
+  }
+  return null;
+}
+
+function protectedWriteError(abs: string, root: string): string {
+  return errText(
+    'E_PROTECTED_PATH_READ_ONLY',
+    `path is inside a protected read-only Orkas resource root and cannot be modified by local tools: ${abs} (root: ${root}). Use the agent/skill edit or fork flow instead.`,
+  );
 }
 
 function _addDownloadDir(out: string[], root: string, target: string): void {
@@ -640,6 +701,50 @@ function parseOrkasCliInvocation(
   };
 }
 
+/** Minimum interval between forwarded script progress events; the 60s
+ *  heartbeat still carries the latest one in between. */
+const SCRIPT_PROGRESS_FORWARD_MIN_MS = 5_000;
+
+/**
+ * Incremental scanner for the skill-script progress protocol: scripts (video
+ * skills et al) write `{"type":"progress",...}` JSONL to stderr. feed() returns
+ * the parsed payloads of any complete progress lines in the chunk; other
+ * stderr content is ignored.
+ */
+export function createScriptProgressScanner(): { feed(chunk: string): Array<Record<string, unknown>> } {
+  let buf = '';
+  return {
+    feed(chunk: string) {
+      buf += chunk;
+      const events: Array<Record<string, unknown>> = [];
+      let nl: number;
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith('{') || !line.includes('"progress"')) continue;
+        try {
+          const parsed = JSON.parse(line) as Record<string, unknown>;
+          if (parsed && parsed.type === 'progress') events.push(parsed);
+        } catch { /* not a progress line */ }
+      }
+      // A stream that never emits a newline must not grow the buffer forever.
+      if (buf.length > 64 * 1024) buf = buf.slice(-8 * 1024);
+      return events;
+    },
+  };
+}
+
+/** One-line human summary of a script progress payload for the tool progress UI. */
+export function formatScriptProgress(p: Record<string, unknown>): string {
+  const s = (v: unknown) => (typeof v === 'string' && v ? v : '');
+  if (s(p.message)) return s(p.message);
+  const parts = [s(p.source), s(p.op), s(p.phase), s(p.status)].filter((v, i, a) => v && a.indexOf(v) === i);
+  const pct = typeof p.percent === 'number' && Number.isFinite(p.percent) ? ` ${Math.round(p.percent as number)}%` : '';
+  const t = typeof p.out_time_sec === 'number' && Number.isFinite(p.out_time_sec) ? ` t=${Math.round(p.out_time_sec as number)}s` : '';
+  const elapsed = typeof p.elapsed_sec === 'number' && Number.isFinite(p.elapsed_sec) ? ` (${Math.round(p.elapsed_sec as number)}s elapsed)` : '';
+  return parts.length ? `${parts.join(' ')}${pct}${t}${elapsed}` : 'script progress';
+}
+
 async function executeDirectOrkasCli(
   invocation: OrkasCliInvocation,
   input: Record<string, unknown>,
@@ -731,7 +836,24 @@ async function executeDirectOrkasCli(
     };
 
     child.stdout.on('data', (data: Buffer) => append('stdout', data));
-    child.stderr.on('data', (data: Buffer) => append('stderr', data));
+    const progressScanner = createScriptProgressScanner();
+    let lastScriptProgress: Record<string, unknown> | null = null;
+    let lastProgressForwardAt = 0;
+    child.stderr.on('data', (data: Buffer) => {
+      append('stderr', data);
+      if (!ctx.emitProgress) return;
+      for (const ev of progressScanner.feed(data.toString('utf8'))) {
+        lastScriptProgress = ev;
+        const now = Date.now();
+        if (now - lastProgressForwardAt < SCRIPT_PROGRESS_FORWARD_MIN_MS) continue;
+        lastProgressForwardAt = now;
+        ctx.emitProgress({
+          phase: 'running',
+          message: formatScriptProgress(ev),
+          data: { script_progress: ev },
+        });
+      }
+    });
 
     const timeout = setTimeout(() => {
       timedOut = true;
@@ -748,10 +870,16 @@ async function executeDirectOrkasCli(
     if (ctx.emitProgress) {
       heartbeat = setInterval(() => {
         const elapsedMs = Date.now() - startedAt;
+        const scriptNote = lastScriptProgress ? `; last: ${formatScriptProgress(lastScriptProgress)}` : '';
         ctx.emitProgress?.({
           phase: 'running',
-          message: `Command still running (${formatBashDuration(elapsedMs)} elapsed; timeout ${formatBashDuration(timeoutMs)})`,
-          data: { elapsedMs, timeoutMs, heartbeat: true },
+          message: `Command still running (${formatBashDuration(elapsedMs)} elapsed; timeout ${formatBashDuration(timeoutMs)})${scriptNote}`,
+          data: {
+            elapsedMs,
+            timeoutMs,
+            heartbeat: true,
+            ...(lastScriptProgress ? { script_progress: lastScriptProgress } : {}),
+          },
         });
       }, BASH_PROGRESS_INTERVAL_MS);
       if (typeof heartbeat.unref === 'function') heartbeat.unref();
@@ -826,6 +954,8 @@ function allowedRootsFor(opts: LocalToolsOpts): string[] {
 }
 
 function guardEditPath(opts: LocalToolsOpts, abs: string): string | null {
+  const protectedRoot = protectedRootForPath(opts, abs);
+  if (protectedRoot) return protectedWriteError(abs, protectedRoot);
   const roots = allowedRootsFor(opts);
   if (!roots.length && !localAccessAllowsOutsideWorkspace()) {
     return errText('E_NO_SCOPE', 'no visible roots for this conversation');
@@ -891,6 +1021,8 @@ async function gateEditPath(opts: LocalToolsOpts, abs: string, ctx?: ToolContext
 }
 
 function guardDeletePath(opts: LocalToolsOpts, abs: string): string | null {
+  const protectedRoot = protectedRootForPath(opts, abs);
+  if (protectedRoot) return protectedWriteError(abs, protectedRoot);
   const roots = allowedRootsFor(opts);
   if (!roots.length && !localAccessAllowsOutsideWorkspace()) {
     return errText('E_NO_SCOPE', 'no visible roots for this conversation');
@@ -1339,6 +1471,10 @@ function bashWritableRootsFor(opts: LocalToolsOpts, workingDir: string): string[
 }
 
 function guardBashScopedPath(opts: LocalToolsOpts, abs: string, workingDir: string, access: 'read' | 'write'): string | null {
+  if (access === 'write') {
+    const protectedRoot = protectedRootForPath(opts, abs);
+    if (protectedRoot) return protectedWriteError(abs, protectedRoot);
+  }
   const roots = bashScopedRootsFor(opts, workingDir);
   if (!roots.length) {
     return localAccessAllowsOutsideWorkspace()
@@ -1652,6 +1788,18 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
     async execute(input, ctx) {
       const mode = getLocalExecMode();
       const command = String(input.command ?? '');
+      const protectedMention = protectedRootMentionedByCommand(opts, command);
+      if (protectedMention) {
+        log.warn('bash protected root reject', {
+          user_id: maskId(opts.userId),
+          command_chars: command.length,
+          root: logPathRef(protectedMention),
+        });
+        return {
+          content: protectedWriteError(protectedMention, protectedMention),
+          isError: true,
+        };
+      }
       const oauthClientMismatchErr = guardGoogleWorkspaceOauthClientMismatchCommand(command, ctx.workingDir);
       if (oauthClientMismatchErr) {
         log.warn('bash google oauth client/scope mismatch reject', {
@@ -1766,6 +1914,18 @@ async function gateInteractiveCliStart(
   ctx?: ToolContext,
 ): Promise<ToolResult | null> {
   const mode = getLocalExecMode();
+  const protectedMention = protectedRootMentionedByCommand(opts, command);
+  if (protectedMention) {
+    log.warn('interactive_cli_start protected root reject', {
+      user_id: maskId(opts.userId),
+      command_chars: command.length,
+      root: logPathRef(protectedMention),
+    });
+    return {
+      content: protectedWriteError(protectedMention, protectedMention),
+      isError: true,
+    };
+  }
   const oauthClientMismatchErr = guardGoogleWorkspaceOauthClientMismatchCommand(command, settings?.workingDir);
   if (oauthClientMismatchErr) {
     log.warn('interactive_cli_start google oauth client/scope mismatch reject', {

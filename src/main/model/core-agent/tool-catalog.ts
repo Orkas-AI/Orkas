@@ -83,12 +83,14 @@ export const DEEP_RESEARCH_AGENT_IDS = [
   '7083ff63b398', // BrandResearcher
 ];
 
+export const VIDEO_STUDIO_AGENT_ID = '79df9cc89f5f';
+
 export const TOOL_CATALOG: ToolCatalogEntry[] = [
   // Files / workspace
   { name: 'read_file',     group: 'fs', summary: 'Read a slice of text from a workspace or attachment file (PDF/modern Office text or image as multimodal).' },
   { name: 'write_file',    group: 'fs', permission: 'localExec', summary: 'Write text/code/markdown into the workspace; resolves under $working_dir.' },
   { name: 'edit_file',     group: 'fs', permission: 'localExec', summary: 'In-place `old_string → new_string` replacement on an existing text file (instead of rewriting the whole file).' },
-  { name: 'delete_file',   group: 'fs', permission: 'localExec', summary: 'Delete a single file from the workspace / current attachment dir / extraRoots. The first call shows an inline confirmation card and returns a token; multiple deletes from the same turn are grouped in one card when possible. Use instead of `bash rm` for removals.' },
+  { name: 'delete_file',   group: 'fs', permission: 'localExec', summary: 'Delete a single file. Files inside the current workspace/attachment/editor scope are deleted immediately; files outside that scope use an inline confirmation card with a token, and multiple out-of-scope deletes from the same turn are grouped when possible. Use instead of `bash rm` for removals.' },
   { name: 'list_files',    group: 'fs', summary: 'List the workspace directory tree.' },
   { name: 'stat_file',     group: 'fs', summary: 'Trigger PDF/modern Office extraction and return total_chars; call before read_file.' },
   { name: 'ocr_file',      group: 'fs', summary: 'Run local OCR on PDF pages or image files when visual text is not available through read_file/stat_file.' },
@@ -127,6 +129,7 @@ export const TOOL_CATALOG: ToolCatalogEntry[] = [
 
   // Image
   { name: 'generate_image', group: 'image', permission: 'localExec', summary: 'Call the configured image-generation API and save the result into the workspace.' },
+  { name: 'video_studio', group: 'video', permission: 'localExec', ownerAgent: VIDEO_STUDIO_AGENT_ID, summary: 'VideoStudio-owned native runtime for HyperFrames-compatible HTML composition lint/inspect/render and speech transcription fallback orchestration.' },
 
   // Web (when a vendor-native search is available the framework picks it automatically; the two below are the fallback channel)
   { name: 'web_search',    group: 'web', summary: 'Built-in fallback web search (vendor-native search is preferred automatically when available).' },

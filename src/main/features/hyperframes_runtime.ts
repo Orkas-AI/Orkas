@@ -9,6 +9,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import * as fs from 'node:fs';
 
 import {
   bundledNodeExecutable,
@@ -46,6 +47,9 @@ export function buildHyperframesEnv(): NodeJS.ProcessEnv {
   if (ff.ffmpeg) env.HYPERFRAMES_FFMPEG_PATH = ff.ffmpeg;
   if (ff.ffprobe) env.HYPERFRAMES_FFPROBE_PATH = ff.ffprobe;
 
+  for (const dir of [paths.NODE_NPM_CACHE_DIR, paths.NODE_NPM_PREFIX_DIR, paths.NODE_NPM_GLOBAL_BIN_DIR]) {
+    try { fs.mkdirSync(dir, { recursive: true }); } catch { /* npm will surface a clearer error later */ }
+  }
   env.NPM_CONFIG_CACHE = paths.NODE_NPM_CACHE_DIR;
   env.NPM_CONFIG_PREFIX = paths.NODE_NPM_PREFIX_DIR;
   env.NPM_CONFIG_FUND = 'false';
